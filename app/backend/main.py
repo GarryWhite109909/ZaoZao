@@ -128,7 +128,7 @@ class VllmAnalyzeRequest(BaseModel):
 app = FastAPI(
     title="AI 漏洞扫描器",
     description="基于 LLM 的代码安全审计系统 API",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 app.add_middleware(

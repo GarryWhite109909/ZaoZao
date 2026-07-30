@@ -316,7 +316,7 @@ npm install        # 如有依赖
 
 ```bash
 cd app/vscode-extension
-npx vsce package   # 生成 vuln-scanner-0.2.0.vsix
+npx vsce package   # 生成 vuln-scanner-1.2.0.vsix
 # 在 VS Code 扩展面板 → ⋯ → 从 VSIX 安装
 ```
 

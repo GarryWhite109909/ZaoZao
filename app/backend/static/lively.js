@@ -12,8 +12,8 @@
   var hasHover = window.matchMedia('(hover: hover) and (pointer: fine)').matches;
 
   var TILT_SEL =
-    'article.glass-card, .kpi-card, .bento-card, .cwe-card, .chart-card, ' +
-    '.score-card, .stats-card, .posture-header, .remediation-table tbody tr, .results-panel > *';
+    'article.glass-card:not(.result-card), .kpi-card, .bento-card, .cwe-card, .chart-card, ' +
+    '.score-card, .stats-card, .posture-header, .remediation-table tbody tr, .results-panel > *:not(.result-card)';
   var MAG_SEL =
     'button, .filter-chip, .view-detail, nav[aria-label="主导航"] a, a[id^="cta-quick-"]';
   var DODGE_SEL =

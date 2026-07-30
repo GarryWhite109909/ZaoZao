@@ -202,6 +202,7 @@ def detect_hardware() -> dict:
     返回字典结构：
         {
             "has_nvidia_gpu": bool,
+            "has_amd_gpu": bool,
             "gpu_name": str | None,
             "vram_mb": int | None,
             "cpu_cores": int,
@@ -211,6 +212,7 @@ def detect_hardware() -> dict:
     """
     hardware: dict = {
         "has_nvidia_gpu": False,
+        "has_amd_gpu": False,
         "gpu_name": None,
         "vram_mb": None,
         "cpu_cores": os.cpu_count() or 4,
@@ -263,7 +265,122 @@ def detect_hardware() -> dict:
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             pass
 
-    # 4) RAM 检测：优先 psutil，否则平台特定回退
+    # 4) AMD/ROCm GPU 检测（Linux 优先 rocm-smi，再读 sysfs；Windows 用 wmic）
+    if not hardware["has_nvidia_gpu"] and not hardware["gpu_name"]:
+        if sys.platform.startswith("linux"):
+            # 4a) rocm-smi 是 ROCm 驱动自带的工具，最可靠
+            try:
+                result = subprocess.run(
+                    ["rocm-smi", "--showproductname"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    for line in result.stdout.strip().splitlines():
+                        line = line.strip()
+                        # 典型输出: "GPU[0]          : Card Series:          AMD Radeon RX 9060 XT"
+                        if "Card Series" in line:
+                            parts = line.split(":", 2)
+                            if len(parts) >= 3 and parts[2].strip():
+                                hardware["has_amd_gpu"] = True
+                                hardware["gpu_name"] = parts[2].strip()
+                                break
+                # 显存：rocm-smi --showmeminfo vram 输出为字节
+                if hardware["has_amd_gpu"]:
+                    try:
+                        mem_result = subprocess.run(
+                            ["rocm-smi", "--showmeminfo", "vram"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        if mem_result.returncode == 0 and mem_result.stdout.strip():
+                            for line in mem_result.stdout.strip().splitlines():
+                                if "Total Memory" in line:
+                                    parts = line.split(":", 2)
+                                    if len(parts) >= 3:
+                                        try:
+                                            hardware["vram_mb"] = int(parts[2].strip()) // 1024 // 1024
+                                        except ValueError:
+                                            pass
+                                    break
+                    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                        pass
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                pass
+
+            # 4b) rocm-smi 不存在时，读 sysfs 中的 AMD GPU 拓扑信息
+            if not hardware["has_amd_gpu"]:
+                try:
+                    kfd_nodes = Path("/sys/class/kfd/kfd/topology/nodes")
+                    if kfd_nodes.is_dir():
+                        for node_dir in sorted(kfd_nodes.iterdir()):
+                            props_path = node_dir / "properties"
+                            if not props_path.is_file():
+                                continue
+                            props = props_path.read_text(encoding="utf-8", errors="ignore")
+                            # vendor_id 0x1002 / 4098 为 AMD；跳过 vendor_id 0 的 CPU 节点
+                            if ("vendor_id 0x1002" in props or "vendor_id 4098" in props):
+                                # 显存大小在 mem_banks/0/properties 的 size_in_bytes 行
+                                vram_mb = None
+                                mem_props_path = node_dir / "mem_banks" / "0" / "properties"
+                                if mem_props_path.is_file():
+                                    try:
+                                        mem_props = mem_props_path.read_text(encoding="utf-8", errors="ignore")
+                                        for p in mem_props.splitlines():
+                                            if p.startswith("size_in_bytes "):
+                                                vram_mb = int(p.split(" ", 1)[1].strip()) // 1024 // 1024
+                                                break
+                                    except (ValueError, OSError):
+                                        pass
+                                hardware["has_amd_gpu"] = True
+                                hardware["gpu_name"] = "AMD GPU"
+                                hardware["vram_mb"] = vram_mb
+                                break
+                except (OSError, PermissionError):
+                    pass
+
+            # 4c) 若 sysfs 只给出通用名称，尝试用 lspci 获取具体型号
+            if hardware["has_amd_gpu"] and hardware["gpu_name"] == "AMD GPU":
+                try:
+                    result = subprocess.run(
+                        ["lspci", "-nn"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        for line in result.stdout.strip().splitlines():
+                            if "VGA" in line and ("AMD" in line or "Radeon" in line or "ATI" in line):
+                                # 提取方括号后的描述文本
+                                desc = line.split(":", 2)[-1].strip()
+                                # 去掉尾部的 [1002:xxxx] 设备 ID
+                                desc = desc.split(" [1002:")[0].strip()
+                                if desc:
+                                    hardware["gpu_name"] = desc
+                                    break
+                except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                    pass
+
+        elif sys.platform == "win32":
+            # Windows 下通过 wmic 查找 AMD 显卡
+            try:
+                result = subprocess.run(
+                    ["wmic", "path", "win32_VideoController",
+                     "get", "Name,AdapterRAM", "/format:csv"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    for line in result.stdout.strip().splitlines()[1:]:
+                        if "AMD" in line or "Radeon" in line:
+                            parts = line.split(",")
+                            if len(parts) >= 3:
+                                hardware["has_amd_gpu"] = True
+                                hardware["gpu_name"] = parts[-2].strip().strip('"')
+                                try:
+                                    hardware["vram_mb"] = int(parts[-1].strip().strip('"')) // 1024 // 1024
+                                except ValueError:
+                                    pass
+                            break
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                pass
+
+    # 5) RAM 检测：优先 psutil，否则平台特定回退
     try:
         import psutil  # type: ignore
         hardware["ram_gb"] = round(psutil.virtual_memory().total / 1024 ** 3, 1)
@@ -337,6 +454,27 @@ def recommend_config(hardware: dict) -> dict:
                 "mode": "cpu",
             }
 
+    # AMD/ROCm GPU 分支：Ollama 在 Linux 上支持 ROCm 后端，num_gpu=-1 表示尽量 offload
+    if hardware.get("has_amd_gpu") and hardware.get("vram_mb"):
+        vram = hardware["vram_mb"]
+        if vram >= 8192:
+            return {
+                "num_ctx": 8192, "num_gpu": -1, "num_thread": num_thread,
+                "quantization": "q4_k_m", "warning": None, "mode": "rocm",
+            }
+        elif vram >= 4096:
+            return {
+                "num_ctx": 4096, "num_gpu": -1, "num_thread": num_thread,
+                "quantization": "q4_k_m", "warning": None, "mode": "rocm",
+            }
+        else:
+            return {
+                "num_ctx": 2048, "num_gpu": 0, "num_thread": num_thread,
+                "quantization": "q4_k_m",
+                "warning": "AMD 显存较小，将使用 CPU 推理（速度较慢）",
+                "mode": "cpu",
+            }
+
     # Apple Silicon 分支：Metal 加速
     if is_apple_silicon:
         return {
@@ -357,10 +495,12 @@ def print_hardware_summary(hardware: dict, config: dict) -> None:
     """将硬件检测结果打印到控制台。"""
     if hardware.get("has_nvidia_gpu") and hardware.get("gpu_name"):
         print(f"[硬件检测] GPU: {hardware['gpu_name']} ({hardware['vram_mb']}MB)")
+    elif hardware.get("has_amd_gpu") and hardware.get("gpu_name"):
+        print(f"[硬件检测] GPU: {hardware['gpu_name']} ({hardware['vram_mb']}MB) [AMD/ROCm]")
     elif hardware.get("gpu_name") and "Apple M" in hardware["gpu_name"]:
         print(f"[硬件检测] GPU: {hardware['gpu_name']} (Apple Silicon)")
     else:
-        print("[硬件检测] GPU: 未检测到 NVIDIA GPU")
+        print("[硬件检测] GPU: 未检测到 NVIDIA/AMD GPU")
     print(f"[硬件检测] CPU: {hardware['cpu_cores']} 核")
     print(f"[硬件检测] 推理模式: {config['mode'].upper()} "
           f"(num_ctx={config['num_ctx']}, {config['quantization']})")
