@@ -189,56 +189,81 @@ def _hf_cache_repo_candidates(model_id: str) -> list[Path]:
     return out
 
 
-def _migrate_completed_hf_cache(model_id: str, local_dir: Path) -> bool:
-    """把 HF 默认 cache 里**已完整**的基座迁移到项目目录（剪切 + 清理缓存）。
+def _migrate_hf_cache_any(model_id: str, local_dir: Path) -> bool:
+    """把 C 盘 HF cache 里的基座文件（完整**或部分**）全部迁到项目目录。
 
     适用场景：学妹等老用户之前把 16GB 基座下到了 C 盘 HF cache，
-    项目切换到本地目录后应直接搬过来，避免重新下载。
+    项目切换到本地目录后应直接搬过来，避免重新下载；没下完的部分也搬走，
+    C 盘不留任何模型文件。
 
     安全规则：
-    - 只在本地目录缺失/不完整、且 cache 快照**权重完整**时执行；
-    - 缓存不完整（下载中）或不存在时不动，继续走 snapshot_download；
-    - 先迁移/复制，校验本地完整后才删除缓存仓库，避免误删。
+    - 完整快照：权重并入 local_dir（models/transformers/<repo>），删缓存仓库；
+    - 部分下载：整个缓存仓库搬到项目 HF_HOME/hub（保留结构，可续传）；
+    - 已在项目内（HF_HOME/hub 下）的仓库跳过，不重复搬。
     """
     if (local_dir / "config.json").is_file() and _local_dir_state(local_dir)[0] is True:
         return False  # 本地已完整，无需迁移
     for repo in _hf_cache_repo_candidates(model_id):
-        snapshots = repo / "snapshots"
-        if not snapshots.is_dir():
+        if not repo.is_dir():
             continue
-        candidates = sorted(
-            (p for p in snapshots.iterdir() if p.is_dir()),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        for snap in candidates:
-            ok, _ = _local_dir_state(snap)
-            if ok is not True:
-                continue
-            local_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                for item in snap.iterdir():
-                    dest = local_dir / item.name
-                    if dest.exists():
-                        continue
-                    if item.is_symlink():
-                        # Linux 缓存里是符号链接：复制内容，随后整体删除仓库
-                        shutil.copy2(item, dest)
-                    else:
-                        shutil.move(str(item), str(dest))
-            except Exception as e:  # noqa: BLE001
-                print(f"[TransformersClient] HF cache 迁移失败: {e}")
-                return False
-            if _local_dir_state(local_dir)[0] is True:
+        try:
+            if repo.resolve().is_relative_to(hf_home_dir().resolve()):
+                continue  # 已迁移到项目内，跳过
+        except Exception:  # noqa: BLE001
+            pass
+        # 完整快照：并入本地目录
+        snapshots = repo / "snapshots"
+        if snapshots.is_dir():
+            candidates = sorted(
+                (p for p in snapshots.iterdir() if p.is_dir()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for snap in candidates:
+                ok, _ = _local_dir_state(snap)
+                if ok is not True:
+                    continue
+                local_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    shutil.rmtree(repo, ignore_errors=True)
-                    print(
-                        f"[TransformersClient] 已从 HF cache 迁移基座到 {local_dir}，"
-                        "并清理了 C 盘缓存"
-                    )
+                    for item in snap.iterdir():
+                        dest = local_dir / item.name
+                        if dest.exists():
+                            continue
+                        if item.is_symlink():
+                            # Linux 缓存里是符号链接：复制内容，随后整体删除仓库
+                            shutil.copy2(item, dest)
+                        else:
+                            shutil.move(str(item), str(dest))
                 except Exception as e:  # noqa: BLE001
-                    print(f"[TransformersClient] 缓存清理失败（不影响使用）: {e}")
+                    print(f"[TransformersClient] HF cache 迁移失败: {e}")
+                    return False
+                if _local_dir_state(local_dir)[0] is True:
+                    try:
+                        shutil.rmtree(repo, ignore_errors=True)
+                        print(
+                            f"[TransformersClient] 已从 C 盘 HF cache 迁移基座到 {local_dir}，"
+                            "并清理了缓存"
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[TransformersClient] 缓存清理失败（不影响使用）: {e}")
+                    return True
                 return True
+        # 部分下载/其他残留：整个仓库搬到项目 HF_HOME/hub，C 盘不留任何模型文件
+        target_root = hf_home_dir() / "hub"
+        target = target_root / repo.name
+        try:
+            target_root.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                shutil.rmtree(repo, ignore_errors=True)  # 项目里已有，删 C 盘残留
+            else:
+                shutil.move(str(repo), str(target))
+            print(
+                f"[TransformersClient] 检测到 C 盘 HF 缓存（含未下载完的部分），"
+                f"已整体迁移到 {target}"
+            )
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"[TransformersClient] HF 部分缓存迁移失败: {e}")
             return False
     return False
 
@@ -362,8 +387,8 @@ class TransformersClient:
             if local_dir is not None and not Path(self.model_id).expanduser().is_dir():
                 if not (local_dir / "config.json").is_file():
                     # 老用户可能已把基座下到 HF 默认 cache（C 盘）：先尝试剪切迁移，
-                    # 迁移失败/缓存不完整才重新下载到项目目录。
-                    if not _migrate_completed_hf_cache(self.model_id, local_dir):
+                    # 迁移失败才重新下载到项目目录。
+                    if not _migrate_hf_cache_any(self.model_id, local_dir):
                         print(
                             f"[TransformersClient] 首次下载基座到 {local_dir}"
                             "（约 16GB，支持断点续传；可在设置页查看进度）..."

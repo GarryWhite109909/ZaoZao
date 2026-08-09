@@ -1,6 +1,11 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0\..\.."
+for %%I in ("%~dp0..\..") do set "VULN_PROJECT_ROOT=%%~fI"
+set "OLLAMA_MODELS=%VULN_PROJECT_ROOT%\models\ollama"
+set "HF_HOME=%VULN_PROJECT_ROOT%\models\transformers\.hf_home"
+if not exist "%OLLAMA_MODELS%" mkdir "%OLLAMA_MODELS%"
+if not exist "%HF_HOME%" mkdir "%HF_HOME%"
 echo Starting AI Vulnerability Scanner...
 
 REM =====================================================================

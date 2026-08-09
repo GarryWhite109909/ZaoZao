@@ -73,7 +73,7 @@ def migrate_ollama_models_to_project() -> Optional[str]:
 
     规则：
     - 候选源：OLLAMA_MODELS 指向的位置 + ~/.ollama/models（兼容默认 C 盘）；
-    - 只迁移 manifests 里有模型条目、且不在项目内的源（避免搬空目录）；
+    - 源目录有内容（含未下载完的 partial）就整体迁移，C 盘不留任何模型文件；
     - Ollama 服务正在运行时跳过并提示先退出（Windows 文件锁会失败/损坏运行中的服务）。
     OLLAMA_MODELS 由调用方在启动前锁定到项目目录，保证后续 pull 不写 C 盘。
     """
@@ -92,9 +92,8 @@ def migrate_ollama_models_to_project() -> Optional[str]:
                 continue
         except Exception:  # noqa: BLE001
             pass
-        manifests = src / "manifests"
-        has_models = manifests.is_dir() and any(p.is_file() for p in manifests.rglob("*"))
-        if not has_models:
+        # C 盘不允许出现任何模型文件：有内容（含未下完的 partial）就整体迁移
+        if not any(src.iterdir()):
             continue
 
         # Ollama 正在运行：Windows 上文件被占用，剪切会失败或破坏运行中的服务

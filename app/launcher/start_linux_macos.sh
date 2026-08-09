@@ -3,6 +3,11 @@ set -e
 cd "$(dirname "$0")/../.." || exit 1
 echo "Starting AI Vulnerability Scanner..."
 
+# 模型文件绝不落 C 盘/用户目录：Ollama 存储与 HuggingFace 缓存全部锁到项目 models/
+export OLLAMA_MODELS="$PWD/models/ollama"
+export HF_HOME="$PWD/models/transformers/.hf_home"
+mkdir -p "$OLLAMA_MODELS" "$HF_HOME"
+
 # 关键：先决定用哪个 python 解释器，再装依赖、跑启动器。
 # 这样 torch 匹配硬件（CUDA/ROCm）的环境会承载「全部」依赖（Web 层 + 分析引擎 +
 # tree-sitter + 推理），避免出现"torch 对了但缺 tree_sitter_python"这类环境分裂问题。
