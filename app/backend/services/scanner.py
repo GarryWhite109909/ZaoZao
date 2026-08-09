@@ -564,7 +564,7 @@ class Scanner:
             chunk_name=chunk_name,
             has_vulnerability=has_vuln,
             vulnerability_type=normalize_cwe_label(
-                verdict.get("vulnerability_type", "none"), result["text"]),
+                verdict.get("vulnerability_type", "none")),
             risk_level=verdict.get("risk_level", "None"),
             source=verdict.get("source", "N/A"),
             sink=verdict.get("sink", "N/A"),
