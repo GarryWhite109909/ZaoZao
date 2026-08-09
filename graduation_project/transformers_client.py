@@ -190,68 +190,21 @@ def _hf_cache_repo_candidates(model_id: str) -> list[Path]:
     return out
 
 
-def _migrate_hf_cache_any(model_id: str, local_dir: Path) -> bool:
-    """把 C 盘 HF cache 里的基座文件（完整**或部分**）全部迁到项目目录。
+def _migrate_hf_cache_any(model_id: str) -> bool:
+    """把 C 盘 HF cache 里的基座文件（完整**或部分**）整仓迁到项目 HF 缓存。
 
-    适用场景：学妹等老用户之前把 16GB 基座下到了 C 盘 HF cache，
-    项目切换到本地目录后应直接搬过来，避免重新下载；没下完的部分也搬走，
-    C 盘不留任何模型文件。
-
-    安全规则：
-    - 完整快照：权重并入 local_dir（models/transformers/<repo>），删缓存仓库；
-    - 部分下载：整个缓存仓库搬到项目 HF_HOME/hub（保留结构，可续传）；
-    - 已在项目内（HF_HOME/hub 下）的仓库跳过，不重复搬。
+    目标：models/transformers/.hf_home/hub/models--<repo>，与自动下载/加载同一位置；
+    完整、部分（未下完）都搬，C 盘不留任何模型文件；已在项目内的仓库跳过。
     """
-    if (local_dir / "config.json").is_file() and _local_dir_state(local_dir)[0] is True:
-        return False  # 本地已完整，无需迁移
+    target_root = hf_home_dir() / "hub"
     for repo in _hf_cache_repo_candidates(model_id):
         if not repo.is_dir():
             continue
         try:
-            if repo.resolve().is_relative_to(hf_home_dir().resolve()):
+            if repo.resolve().is_relative_to(target_root.resolve()):
                 continue  # 已迁移到项目内，跳过
         except Exception:  # noqa: BLE001
             pass
-        # 完整快照：并入本地目录
-        snapshots = repo / "snapshots"
-        if snapshots.is_dir():
-            candidates = sorted(
-                (p for p in snapshots.iterdir() if p.is_dir()),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            for snap in candidates:
-                ok, _ = _local_dir_state(snap)
-                if ok is not True:
-                    continue
-                local_dir.mkdir(parents=True, exist_ok=True)
-                try:
-                    for item in snap.iterdir():
-                        dest = local_dir / item.name
-                        if dest.exists():
-                            continue
-                        if item.is_symlink():
-                            # Linux 缓存里是符号链接：复制内容，随后整体删除仓库
-                            shutil.copy2(item, dest)
-                        else:
-                            shutil.move(str(item), str(dest))
-                except Exception as e:  # noqa: BLE001
-                    print(f"[TransformersClient] HF cache 迁移失败: {e}")
-                    return False
-                if _local_dir_state(local_dir)[0] is True:
-                    try:
-                        shutil.rmtree(repo, ignore_errors=True)
-                        print(
-                            f"[TransformersClient] 已从 C 盘 HF cache 迁移基座到 {local_dir}，"
-                            "并清理了缓存"
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        print(f"[TransformersClient] 缓存清理失败（不影响使用）: {e}")
-                    return True
-                return True
-        # 部分下载/其他残留：逐文件搬到项目 HF_HOME/hub，C 盘不留任何模型文件。
-        # 逐文件处理并对失败项重试，避免单个被占用文件导致整次迁移半途而废。
-        target_root = hf_home_dir() / "hub"
         target = target_root / repo.name
         target_root.mkdir(parents=True, exist_ok=True)
         failures: list[str] = []
@@ -346,7 +299,7 @@ def migrate_hf_cache_to_project(model_id: Optional[str] = None) -> bool:
     """
     _ensure_hf_home()
     model_id = model_id or resolve_base_model_path()
-    return _migrate_hf_cache_any(model_id, local_hf_model_dir(model_id))
+    return _migrate_hf_cache_any(model_id)
 
 
 class TransformersClient:
@@ -467,10 +420,7 @@ class TransformersClient:
             #  1. 扁平本地目录完整 → 离线加载（models/transformers/<repo>，手工放置兼容）
             #  2. 否则 → 走项目 HF 缓存（models/transformers/.hf_home/hub，可续传；
             #     从 C 盘迁移来的部分缓存也在这里，会被 from_pretrained 复用）
-            _migrate_hf_cache_any(
-                self.repo_id,
-                self._resolved_local_dir() or local_hf_model_dir(self.repo_id),
-            )
+            _migrate_hf_cache_any(self.repo_id)
             flat_dir = self._resolved_local_dir()
             load_model_id = self.repo_id
             if flat_dir is not None and _local_dir_state(flat_dir)[0] is True:
@@ -611,10 +561,7 @@ class TransformersClient:
     def migrate_cache_to_project(self) -> bool:
         """把 C 盘 HF 缓存（完整或未下完）迁移到项目目录（启动时主动调用）。"""
         _ensure_hf_home()
-        local_dir = self._resolved_local_dir()
-        if local_dir is None:
-            return False
-        return _migrate_hf_cache_any(self.model_id, local_dir)
+        return _migrate_hf_cache_any(self.repo_id)
 
     def model_availability(self) -> tuple[bool | None, str]:
         """查询基座模型下载状态（只检查项目本地目录，不再看 HF 默认 cache）。

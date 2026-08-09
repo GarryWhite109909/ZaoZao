@@ -69,8 +69,8 @@ from graduation_project.paths import (
     resolve_adapter_path,
     resolve_base_model_path,
     find_project_root,
-    local_hf_model_dir,
     local_hf_cache_dir,
+    hf_home_dir,
 )
 
 # ---------------------------------------------------------------------------
@@ -481,8 +481,8 @@ def _build_backend_info() -> dict:
         if model_available is False:
             info["download_hint"] = (
                 f"基座模型 {model_id} 未下载。"
-                f"首次分析或设置页下载时会自动拉取到 "
-                f"{local_hf_model_dir(model_id)}（约 16GB，支持断点续传）。"
+                f"首次分析或设置页下载时会自动拉取到项目 HF 缓存 "
+                f"{local_hf_cache_dir(model_id)}（约 16GB，支持断点续传）。"
             )
 
     elif backend == "llamacpp":
@@ -1444,16 +1444,9 @@ def models_local_resources():
     if cls_name == "TransformersClient":
         model_id = getattr(client, "model_id", "") or resolve_base_model_path()
         available, status = _detect_model_available("transformers", client)
-        # 下载/检测位置：扁平目录 models/transformers/<repo>（手工/离线兼容）
-        # 与项目 HF 缓存 models/transformers/.hf_home/hub（自动下载/续传/迁移落点）。
-        dest_dir = local_hf_model_dir(model_id)
+        # 下载/检测唯一位置：项目 HF 缓存 models/transformers/.hf_home/hub
+        # （自动下载、设置页下载按钮、迁移、就绪检测全部落这里）
         cache_dir = local_hf_cache_dir(model_id)
-        if (dest_dir / "config.json").is_file():
-            active_dir = dest_dir
-        elif cache_dir.is_dir() and any(cache_dir.iterdir()):
-            active_dir = cache_dir
-        else:
-            active_dir = dest_dir
         resources.append({
             "type": "huggingface",
             "id": model_id,
@@ -1462,7 +1455,7 @@ def models_local_resources():
             "available": available,
             "status": status,
             "download_endpoint": "/api/models/download-hf",
-            "download_path": str(active_dir),
+            "download_path": str(cache_dir),
             "mirror": HF_MIRROR,
         })
         adapter = resolve_adapter_path(getattr(client, "adapter", ""))
@@ -1520,9 +1513,10 @@ def models_local_resources():
 
 @app.post("/api/models/download-hf")
 async def models_download_hf(req: HfDownloadRequest):
-    """流式下载 HuggingFace 基座模型到 models/transformers/ 目录（NDJSON 进度）。
+    """流式下载 HuggingFace 基座模型到项目 HF 缓存（NDJSON 进度）。
 
-    使用 hf-mirror.com 镜像加速国内下载。下载完成后需重启后端使配置生效。
+    目标：models/transformers/.hf_home/hub/models--<repo>（与自动下载/续传同目录）。
+    使用 hf-mirror.com 镜像加速国内下载。
     """
     import queue as _q
     import threading
@@ -1531,9 +1525,8 @@ async def models_download_hf(req: HfDownloadRequest):
     if not model_id:
         return JSONResponse({"error": "model_id 不能为空"}, status_code=400)
 
-    # 下载目标：models/transformers/<model_id 最后一段>
-    dest_name = model_id.split("/")[-1]
-    dest_dir = _models_dir() / "transformers" / dest_name
+    # 下载目标：项目 HF 缓存（与 from_pretrained 自动下载/续传同一布局）
+    cache_dir = local_hf_cache_dir(model_id)
 
     chunk_queue: _q.Queue = _q.Queue()
     done_flag = {"done": False, "result": None, "error": None}
@@ -1560,7 +1553,7 @@ async def models_download_hf(req: HfDownloadRequest):
                 hf_hub_download(
                     repo_id=model_id,
                     filename=fname,
-                    local_dir=str(dest_dir),
+                    cache_dir=str(hf_home_dir()),
                 )
                 completed_files += 1
                 pct = int(completed_files / total_files * 100) if total_files else 0
@@ -1572,7 +1565,7 @@ async def models_download_hf(req: HfDownloadRequest):
                     "current_file": fname,
                 })
 
-            done_flag["result"] = {"dest": str(dest_dir), "model_id": model_id}
+            done_flag["result"] = {"dest": str(cache_dir), "model_id": model_id}
         except Exception as e:
             done_flag["error"] = f"{type(e).__name__}: {e}"
         finally:
