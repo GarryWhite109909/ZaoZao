@@ -110,9 +110,28 @@ def migrate_ollama_models_to_project() -> Optional[str]:
             running = False
         if running:
             print(f"[启动器] 检测到 Ollama 正在运行且模型存储仍在 {src}（可能在 C 盘）：")
-            print(f"  请先退出 Ollama，再运行本启动器，会自动剪切到 {dst} 并锁定 OLLAMA_MODELS；")
-            print("  否则本次拉取仍会写入 C 盘。")
-            return None
+            try:
+                ans = input("  是否自动退出 Ollama 完成迁移？[Y/n]: ").strip().lower()
+            except EOFError:
+                ans = "n"
+            if ans in ("y", "yes", ""):
+                _stop_ollama()
+                time.sleep(2)
+                try:
+                    resp2 = requests.get(
+                        "http://localhost:11434/api/tags", timeout=2,
+                        proxies={"http": None, "https": None},
+                    )
+                    still_running = resp2.status_code == 200
+                except Exception:  # noqa: BLE001
+                    still_running = False
+                if still_running:
+                    print("  Ollama 仍在运行，请手动退出（托盘 → Quit）后重试。")
+                    return None
+                print(f"[启动器] Ollama 已退出，开始迁移到 {dst} ...")
+            else:
+                print("  已取消迁移；请先退出 Ollama 再运行本启动器，否则本次拉取仍会写入 C 盘。")
+                return None
 
         dst.mkdir(parents=True, exist_ok=True)
         print(f"[启动器] 检测到 Ollama 模型存储 {src}，正在剪切到 {dst} ...")
@@ -135,6 +154,24 @@ def migrate_ollama_models_to_project() -> Optional[str]:
         print(f"[启动器] ✅ 已剪切 Ollama 模型到 {dst}")
         return str(dst)
     return None
+
+
+def _stop_ollama() -> bool:
+    """尝试退出 Ollama 进程（Windows taskkill / 其他平台 pkill）。"""
+    try:
+        if sys.platform == "win32":
+            r = subprocess.run(
+                ["taskkill", "/IM", "ollama.exe", "/F"],
+                capture_output=True, text=True, timeout=30,
+            )
+        else:
+            r = subprocess.run(
+                ["pkill", "-f", "ollama"],
+                capture_output=True, text=True, timeout=30,
+            )
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _recommend_backend_by_vram() -> tuple[str, str]:

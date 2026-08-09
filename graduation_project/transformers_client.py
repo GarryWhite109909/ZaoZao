@@ -84,6 +84,7 @@ from graduation_project.paths import (
     resolve_adapter_path,
     resolve_base_model_path,
     local_hf_model_dir,
+    local_hf_cache_dir,
     hf_home_dir,
 )
 
@@ -311,6 +312,33 @@ def _migrate_hf_cache_any(model_id: str, local_dir: Path) -> bool:
     return False
 
 
+def _project_cache_state(repo_id: str) -> Optional[tuple[bool | None, str]]:
+    """检查项目内 HF 缓存（models/transformers/.hf_home/hub）的下载状态。
+
+    Returns:
+        (是否完整, 状态描述)；项目缓存里什么都没有时返回 None。
+    """
+    repo = local_hf_cache_dir(repo_id)
+    if not repo.is_dir():
+        return None
+    snapshots = repo / "snapshots"
+    if snapshots.is_dir():
+        candidates = sorted(
+            (p for p in snapshots.iterdir() if p.is_dir()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for snap in candidates:
+            ok, reason = _local_dir_state(snap)
+            if ok is True:
+                return True, "已完整下载（项目 HF 缓存）"
+            if "分片" in reason:
+                return False, f"{reason}（项目 HF 缓存，可续传）"
+    if any(p.is_file() for p in repo.rglob("*")):
+        return False, "未下完（部分文件已在项目 HF 缓存，可续传）"
+    return False, "项目 HF 缓存目录为空"
+
+
 def migrate_hf_cache_to_project(model_id: Optional[str] = None) -> bool:
     """把 C 盘 HF 缓存（完整或未下完）迁移到项目目录。
 
@@ -347,6 +375,8 @@ class TransformersClient:
         merge: bool = True,
     ):
         self.model_id = resolve_base_model_path(model_id)
+        # 原始 HF 仓库 id：扁平本地目录不完整时，从项目 HF 缓存下载/续传用
+        self.repo_id = (model_id or "").strip() or "Qwen/Qwen3-8B"
         self.adapter = resolve_adapter_path(adapter)
         self.num_ctx = int(os.environ.get("VULN_SCANNER_NUM_CTX", str(num_ctx)))
         self.quantize = quantize if not os.environ.get("VULN_SCANNER_QUANTIZE") else (
@@ -433,23 +463,18 @@ class TransformersClient:
             # 保证模型权重/元数据完全不落 C 盘
             _ensure_hf_home()
 
-            # 基座统一下载到项目目录 models/transformers/<名称>（与设置页按钮、就绪检测一致）。
-            # 本地已有则直接使用；VULN_SCANNER_HF_LOCAL_DIR=0 可关闭本地化（走 HF 默认 cache）。
-            load_model_id = self.model_id
-            local_dir = self._resolved_local_dir()
-            if local_dir is not None and not Path(self.model_id).expanduser().is_dir():
-                if not (local_dir / "config.json").is_file():
-                    # 老用户可能已把基座下到 HF 默认 cache（C 盘）：先尝试剪切迁移，
-                    # 迁移失败才重新下载到项目目录。
-                    if not _migrate_hf_cache_any(self.model_id, local_dir):
-                        print(
-                            f"[TransformersClient] 首次下载基座到 {local_dir}"
-                            "（约 16GB，支持断点续传；可在设置页查看进度）..."
-                        )
-                        from huggingface_hub import snapshot_download
-                        snapshot_download(repo_id=self.model_id, local_dir=str(local_dir))
-                if (local_dir / "config.json").is_file():
-                    load_model_id = str(local_dir)
+            # 基座位置统一：
+            #  1. 扁平本地目录完整 → 离线加载（models/transformers/<repo>，手工放置兼容）
+            #  2. 否则 → 走项目 HF 缓存（models/transformers/.hf_home/hub，可续传；
+            #     从 C 盘迁移来的部分缓存也在这里，会被 from_pretrained 复用）
+            _migrate_hf_cache_any(
+                self.repo_id,
+                self._resolved_local_dir() or local_hf_model_dir(self.repo_id),
+            )
+            flat_dir = self._resolved_local_dir()
+            load_model_id = self.repo_id
+            if flat_dir is not None and _local_dir_state(flat_dir)[0] is True:
+                load_model_id = str(flat_dir)
 
             has_cuda = torch.cuda.is_available()
             is_rocm = bool(getattr(torch.version, "hip", None))
@@ -603,12 +628,22 @@ class TransformersClient:
             return True, "已加载到内存"
         if self._load_error:
             return False, f"加载失败：{self._load_error}"
-        local_dir = self._resolved_local_dir()
-        if local_dir is None:
+        flat_dir = self._resolved_local_dir()
+        if flat_dir is None:
             return False, "未配置本地基座下载目录（VULN_SCANNER_HF_LOCAL_DIR=0）"
-        if not local_dir.exists():
-            return False, f"未下载（首次分析/设置页将自动下载到 {local_dir}）"
-        return _local_dir_state(local_dir)
+        flat_reason: Optional[str] = None
+        if flat_dir.exists():
+            ok, reason = _local_dir_state(flat_dir)
+            if ok is True:
+                return True, reason
+            flat_reason = reason
+        # 项目 HF 缓存（迁移/续传的正式位置）与扁平目录都检查
+        cache_state = _project_cache_state(self.repo_id)
+        if cache_state is not None:
+            return cache_state
+        if flat_reason:
+            return False, flat_reason
+        return False, f"未下载（首次分析/设置页将下载到 {flat_dir} 或项目 HF 缓存）"
 
     def is_ready(self) -> bool:
         """进程内后端是否就绪：已加载，或本地基座 + adapter 资源齐全。

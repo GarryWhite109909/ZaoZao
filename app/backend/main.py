@@ -70,6 +70,7 @@ from graduation_project.paths import (
     resolve_base_model_path,
     find_project_root,
     local_hf_model_dir,
+    local_hf_cache_dir,
 )
 
 # ---------------------------------------------------------------------------
@@ -1443,9 +1444,16 @@ def models_local_resources():
     if cls_name == "TransformersClient":
         model_id = getattr(client, "model_id", "") or resolve_base_model_path()
         available, status = _detect_model_available("transformers", client)
-        # 下载/检测唯一位置：models/transformers/<model_id 最后一段>
-        # （自动下载、设置页下载按钮、就绪检测三处共用同一路径）
+        # 下载/检测位置：扁平目录 models/transformers/<repo>（手工/离线兼容）
+        # 与项目 HF 缓存 models/transformers/.hf_home/hub（自动下载/续传/迁移落点）。
         dest_dir = local_hf_model_dir(model_id)
+        cache_dir = local_hf_cache_dir(model_id)
+        if (dest_dir / "config.json").is_file():
+            active_dir = dest_dir
+        elif cache_dir.is_dir() and any(cache_dir.iterdir()):
+            active_dir = cache_dir
+        else:
+            active_dir = dest_dir
         resources.append({
             "type": "huggingface",
             "id": model_id,
@@ -1454,7 +1462,7 @@ def models_local_resources():
             "available": available,
             "status": status,
             "download_endpoint": "/api/models/download-hf",
-            "download_path": str(dest_dir),
+            "download_path": str(active_dir),
             "mirror": HF_MIRROR,
         })
         adapter = resolve_adapter_path(getattr(client, "adapter", ""))

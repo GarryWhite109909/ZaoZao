@@ -204,3 +204,13 @@ def hf_home_dir(project_root: Optional[Path] = None) -> Path:
     （模型权重、tokenizer、锁文件等）都不落 C 盘。
     """
     return (project_root or find_project_root()) / "models" / "transformers" / ".hf_home"
+
+
+def local_hf_cache_dir(repo_id: str, project_root: Optional[Path] = None) -> Path:
+    """项目内 HF 缓存仓库目录（models/transformers/.hf_home/hub/models--<repo>）。
+
+    这是 HF 下载/续传的正式位置：迁移来的 C 盘缓存、from_pretrained 自动下载
+    都落在这里；扁平目录 models/transformers/<repo> 仅作为离线手工放置的兼容位置。
+    """
+    name = repo_id.replace("/", "--")
+    return hf_home_dir(project_root) / "hub" / f"models--{name}"
