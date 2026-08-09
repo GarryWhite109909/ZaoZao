@@ -191,59 +191,69 @@ def _hf_cache_repo_candidates(model_id: str) -> list[Path]:
 
 
 def _migrate_hf_cache_any(model_id: str) -> bool:
-    """把 C 盘 HF cache 里的基座文件（完整**或部分**）整仓迁到项目 HF 缓存。
+    """把 C 盘 HF cache 里的基座文件（完整**或部分**）整仓迁到项目扁平基座目录。
 
-    目标：models/transformers/.hf_home/hub/models--<repo>，与自动下载/加载同一位置；
-    完整、部分（未下完）都搬，C 盘不留任何模型文件；已在项目内的仓库跳过。
+    目标：models/transformers/<repo 名>（与下载/加载/检测同一位置，调用路径一致）。
+    从 HF 缓存快照中把实际权重文件拷贝（跟随符号链接）到扁平目录；完整、部分（未
+    下完）都搬，C 盘不留任何模型文件；已在项目内的仓库跳过。
     """
-    target_root = hf_home_dir() / "hub"
+    flat_dir = local_hf_model_dir(model_id)
+    project_hub = (hf_home_dir() / "hub").resolve()
+    flat_dir.mkdir(parents=True, exist_ok=True)
+    migrated_any = False
     for repo in _hf_cache_repo_candidates(model_id):
         if not repo.is_dir():
             continue
         try:
-            if repo.resolve().is_relative_to(target_root.resolve()):
+            if repo.resolve().is_relative_to(project_hub):
                 continue  # 已迁移到项目内，跳过
         except Exception:  # noqa: BLE001
             pass
-        target = target_root / repo.name
-        target_root.mkdir(parents=True, exist_ok=True)
+        snapshots = repo / "snapshots"
+        if not snapshots.is_dir():
+            continue
+        snaps = sorted(
+            (p for p in snapshots.iterdir() if p.is_dir()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
         failures: list[str] = []
-        meta_warnings: list[str] = []
-        moved_any = False
-        for item in sorted(repo.iterdir()):
-            if item.name == ".no_exist":
-                # 哨兵元数据（标记“仓库里不存在某文件”），不是模型文件；
-                # 删不掉只警告，不阻断迁移
-                try:
-                    shutil.rmtree(item)
-                except Exception as e:  # noqa: BLE001
-                    meta_warnings.append(f".no_exist: {e}")
-                continue
-            dest = target / item.name
-            ok_item = False
-            for attempt in range(2):
-                try:
-                    if dest.exists():
-                        if item.is_dir():
-                            shutil.rmtree(item)
+        copied_any = False
+        for snap in snaps:
+            for f in sorted(snap.rglob("*")):
+                if not f.is_file():
+                    continue
+                rel = f.relative_to(snap)
+                dest = flat_dir / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                ok = False
+                for attempt in range(2):
+                    try:
+                        # dest 已存在且大小一致则跳过（避免重复复制/半程复制）
+                        if dest.is_file() and dest.stat().st_size == f.stat().st_size:
+                            ok = True
+                            break
+                        shutil.copy2(f, dest)
+                        ok = True
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        if attempt == 0:
+                            time.sleep(0.5)  # Windows 文件锁/杀软短暂占用：重试一次
                         else:
-                            item.unlink()
-                    else:
-                        shutil.move(str(item), str(dest))
-                    ok_item = True
-                    moved_any = True
-                    break
-                except Exception as e:  # noqa: BLE001
-                    if attempt == 0:
-                        time.sleep(0.5)  # Windows 文件锁/杀软短暂占用：重试一次
-                    else:
-                        failures.append(f"{item.name}: {e}")
-            if not ok_item:
-                continue
-        try:
-            repo.rmdir()  # 空壳清理；有残留失败项时自然失败
-        except OSError:
-            failures.append(f"{repo.name}: 目录仍有残留（文件被占用）")
+                            failures.append(f"{rel}: {e}")
+                if ok:
+                    copied_any = True
+        if copied_any:
+            migrated_any = True
+            print(
+                f"[TransformersClient] 检测到 C 盘 HF 缓存（含未下载完的部分），"
+                f"已迁移到 {flat_dir}"
+            )
+            # 迁移完成后清理 C 盘缓存目录
+            try:
+                shutil.rmtree(repo)
+            except OSError:
+                failures.append(f"{repo.name}: 目录清理失败（文件可能仍被占用）")
         if failures:
             print(f"[TransformersClient] C 盘 HF 缓存迁移未完全完成，以下内容被占用：")
             for f in failures[:8]:
@@ -252,17 +262,7 @@ def _migrate_hf_cache_any(model_id: str) -> bool:
                 "  可能是残留的下载进程仍占用这些文件（例如之前没下完的 python 进程），"
                 "请关闭它（或重启电脑）后重新启动本程序，会自动完成清理。"
             )
-            if meta_warnings:
-                print(f"  （另有 {len(meta_warnings)} 个 .no_exist 哨兵文件无法删除，不影响使用）")
-            return False
-        if moved_any:
-            print(
-                f"[TransformersClient] 检测到 C 盘 HF 缓存（含未下载完的部分），"
-                f"已迁移到 {target}"
-            )
-            return True
-        return False
-    return False
+    return migrated_any
 
 
 def _project_cache_state(repo_id: str) -> Optional[tuple[bool | None, str]]:

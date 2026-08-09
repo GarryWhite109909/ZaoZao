@@ -109,14 +109,13 @@ def migrate_ollama_models_to_project() -> Optional[str]:
         except Exception:  # noqa: BLE001
             running = False
         if running:
-            print(f"[启动器] 检测到 Ollama 正在运行且模型存储仍在 {src}（可能在 C 盘）：")
+            print(f"[启动器] 检测到 Ollama 正在运行且模型存储仍在 {src}：")
             try:
                 ans = input("  是否自动退出 Ollama 完成迁移？[Y/n]: ").strip().lower()
             except EOFError:
                 ans = "n"
             if ans in ("y", "yes", ""):
                 _stop_ollama()
-                time.sleep(2)
                 try:
                     resp2 = requests.get(
                         "http://localhost:11434/api/tags", timeout=2,
@@ -126,11 +125,15 @@ def migrate_ollama_models_to_project() -> Optional[str]:
                 except Exception:  # noqa: BLE001
                     still_running = False
                 if still_running:
-                    print("  Ollama 仍在运行，请手动退出（托盘 → Quit）后重试。")
+                    hint = (
+                        "托盘 → Quit 后重试" if sys.platform == "win32"
+                        else "关闭 Ollama 或 `pkill -f ollama` 后重试"
+                    )
+                    print(f"  Ollama 仍在运行，请手动退出（{hint}）。")
                     return None
                 print(f"[启动器] Ollama 已退出，开始迁移到 {dst} ...")
             else:
-                print("  已取消迁移；请先退出 Ollama 再运行本启动器，否则本次拉取仍会写入 C 盘。")
+                print("  已取消迁移；请先退出 Ollama 再运行本启动器，否则本次拉取仍会写入旧位置。")
                 return None
 
         dst.mkdir(parents=True, exist_ok=True)
@@ -157,19 +160,30 @@ def migrate_ollama_models_to_project() -> Optional[str]:
 
 
 def _stop_ollama() -> bool:
-    """尝试退出 Ollama 进程（Windows taskkill / 其他平台 pkill）。"""
+    """尝试停止 Ollama 服务（供迁移模型前使用），并轮询确认其真正退出。"""
     try:
         if sys.platform == "win32":
-            r = subprocess.run(
+            subprocess.run(
                 ["taskkill", "/IM", "ollama.exe", "/F"],
                 capture_output=True, text=True, timeout=30,
             )
         else:
-            r = subprocess.run(
-                ["pkill", "-f", "ollama"],
-                capture_output=True, text=True, timeout=30,
-            )
-        return r.returncode == 0
+            # 先温和退出，再强制 -9；随后轮询 /api/tags 确认真正停止
+            subprocess.run(["pkill", "-f", "ollama"], capture_output=True, text=True, timeout=15)
+            subprocess.run(["pkill", "-9", "-f", "ollama"], capture_output=True, text=True, timeout=15)
+        # 等待服务真正退出（最多 ~5s）
+        for _ in range(10):
+            try:
+                r = requests.get(
+                    "http://localhost:11434/api/tags", timeout=1,
+                    proxies={"http": None, "https": None},
+                )
+                if r.status_code != 200:
+                    return True
+            except Exception:
+                return True
+            time.sleep(0.5)
+        return False
     except Exception:  # noqa: BLE001
         return False
 
@@ -417,21 +431,46 @@ def kill_process_on_port(port: int) -> bool:
                 )
                 return stop.returncode == 0
         else:
-            # macOS/Linux：先尝试 lsof
-            result = subprocess.run(
-                ["lsof", "-ti", f"tcp:{port}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            pid = result.stdout.strip().splitlines()[0] if result.stdout.strip() else None
-            if pid:
-                print(f"[启动器] 端口 {port} 被 PID {pid} 占用。")
-                answer = input("该进程可能不是本程序（例如其他服务），是否强制结束？[y/N]: ").strip().lower()
-                if answer not in ("y", "yes"):
-                    print("[启动器] 已取消释放端口，请手动关闭占用程序后重试。")
-                    return False
-                print(f"[启动器] 尝试结束 PID {pid} ...")
-                stop = subprocess.run(["kill", "-9", pid], capture_output=True, text=True, timeout=5)
-                return stop.returncode == 0
+            # macOS/Linux：收集占用端口的**全部** PID（lsof 优先，fuser 兜底）。
+            # 端口可能同时被主进程 + worker 多个进程持有，必须全部结束才能释放。
+            pids: list[str] = []
+            try:
+                result = subprocess.run(
+                    ["lsof", "-ti", f"tcp:{port}"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                pids = [p for p in result.stdout.split() if p.isdigit()]
+            except Exception:
+                pids = []
+            if not pids:
+                try:
+                    result = subprocess.run(
+                        ["fuser", f"{port}/tcp"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    pids = [p for p in result.stdout.split() if p.isdigit()]
+                except Exception:
+                    pids = []
+            if pids:
+                print(f"[启动器] 端口 {port} 被 PID {', '.join(pids)} 占用。")
+                # 非交互式环境（CI/后台）无法确认，视为允许释放（通常就是本程序残留后端）
+                if sys.stdin.isatty():
+                    answer = input("该进程可能不是本程序（例如其他服务），是否强制结束？[y/N]: ").strip().lower()
+                    if answer not in ("y", "yes"):
+                        print("[启动器] 已取消释放端口，请手动关闭占用程序后重试。")
+                        return False
+                print(f"[启动器] 尝试结束 PID {', '.join(pids)} ...")
+                for pid in pids:
+                    subprocess.run(["kill", "-9", pid], capture_output=True, text=True, timeout=5)
+                # 兜底：fuser -k 清除端口上剩余持有进程（含进程组/worker）
+                try:
+                    subprocess.run(
+                        ["fuser", "-k", f"{port}/tcp"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                except Exception:
+                    pass
+                return True
     except Exception as e:
         print(f"[启动器] 释放端口 {port} 失败: {e}")
     return False
@@ -1141,24 +1180,22 @@ def main():
     use_ollama = backend == "ollama"
     print(f"[启动器] 推理后端: {backend}")
 
-    # 模型文件绝不落 C 盘：
-    #  - Ollama 存储锁定到项目 models/ollama（模型文件绝不落 C 盘）
-    #  - HuggingFace 缓存锁定到项目 models/transformers/.hf_home
+    # 模型存储锁定：后端已写死读取项目 models/ 下的模型，因此**任何平台**都把
+    # Ollama 存储锁到项目 models/ollama、并把旧位置（默认 ~/.ollama/models）已有
+    # 模型迁移过来，保证后端可访问。
     ollama_models_dir().mkdir(parents=True, exist_ok=True)
-    # 强制锁定：模型文件绝不落 C 盘（若确需自定义位置，请另行设置环境变量后改回 setdefault）
     os.environ["OLLAMA_MODELS"] = str(ollama_models_dir())
-    hf_home = hf_home_dir()
-    hf_home.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("HF_HOME", str(hf_home))
-
-    # 启动即迁移 C 盘 HF 缓存（完整/未下完都搬），任何后端都不允许 C 盘留模型文件
-    try:
-        migrate_hf_cache_to_project()
-    except Exception as e:  # noqa: BLE001
-        print(f"[启动器] HF 缓存迁移异常: {e}")
-
-    # C 盘/旧位置的 Ollama 模型也剪切到项目 models/ollama（**任何后端**都执行；
-    # Ollama 正在运行时会提示先退出，避免文件锁/损坏服务）
+    # HuggingFace 缓存：仅 Windows 需要强制迁离 C 盘；Linux/macOS 保持系统默认
+    # （~/.cache/huggingface），后端基座走本地 models/transformers，无需搬动。
+    if sys.platform == "win32":
+        hf_home = hf_home_dir()
+        hf_home.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("HF_HOME", str(hf_home))
+        try:
+            migrate_hf_cache_to_project()
+        except Exception as e:  # noqa: BLE001
+            print(f"[启动器] HF 缓存迁移异常: {e}")
+    # 把旧位置（默认 ~/.ollama/models）已有 Ollama 模型剪切到项目 models/ollama
     migrate_ollama_models_to_project()
 
     if use_ollama:
@@ -1285,13 +1322,14 @@ def main():
             print("  请手动关闭占用该端口的程序后重试。")
             input("\n按回车键退出...")
             return
-        # 等待端口释放
-        for _ in range(10):
+        # 等待端口释放（最长 ~15s，SIGKILL 后 socket 一般立即释放）
+        for _ in range(30):
             if not is_port_in_use(PORT):
                 break
             time.sleep(0.5)
         if is_port_in_use(PORT):
             print(f"\n[错误] 端口 {PORT} 释放后仍被占用，请手动检查。")
+            print("  可执行：lsof -i tcp:%d 或 fuser %d/tcp 查看占用进程后手动结束。" % (PORT, PORT))
             input("\n按回车键退出...")
             return
         print(f"[启动器] 端口 {PORT} 已释放。")

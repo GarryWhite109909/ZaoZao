@@ -29,6 +29,7 @@ _CWE_BY_KEYWORD: list[tuple[tuple[str, ...], str]] = [
     (("cross-site", "cross site", "xss", "跨站"), "CWE-79 Cross-Site Scripting"),
     (("path traversal", "directory traversal", "路径穿越", "path_traversal"), "CWE-22 Path Traversal"),
     (("server-side template injection", "模板注入", "ssti"), "CWE-94 Server-Side Template Injection"),
+    (("log injection", "日志注入", "logi"), "CWE-117 Improper Output Neutralization for Logs"),
 ]
 
 
@@ -68,7 +69,9 @@ if __name__ == "__main__":
         ("XSS", "CWE-79 Cross-Site Scripting"),
         ("Insecure Deserialization", "CWE-502 Deserialization of Untrusted Data"),
         ("Server-Side Template Injection", "CWE-94 Server-Side Template Injection"),
-        ("CWE-117 日志注入", "CWE-117 日志注入"),        # 表外长尾 → 原样保留
+        ("CWE-89 Log Injection", "CWE-117 Improper Output Neutralization for Logs"),  # 编号错 + 语义正确 → 纠正
+        ("日志注入", "CWE-117 Improper Output Neutralization for Logs"),
+        ("CWE-117 日志注入", "CWE-117 Improper Output Neutralization for Logs"),
         ("CSRF", "CSRF"),
         ("none", "none"),
         ("", "none"),

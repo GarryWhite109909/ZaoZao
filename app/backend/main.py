@@ -69,8 +69,7 @@ from graduation_project.paths import (
     resolve_adapter_path,
     resolve_base_model_path,
     find_project_root,
-    local_hf_cache_dir,
-    hf_home_dir,
+    local_hf_model_dir,
 )
 
 # ---------------------------------------------------------------------------
@@ -481,8 +480,8 @@ def _build_backend_info() -> dict:
         if model_available is False:
             info["download_hint"] = (
                 f"基座模型 {model_id} 未下载。"
-                f"首次分析或设置页下载时会自动拉取到项目 HF 缓存 "
-                f"{local_hf_cache_dir(model_id)}（约 16GB，支持断点续传）。"
+                f"首次分析或设置页下载时会自动拉取到项目基座目录 "
+                f"{local_hf_model_dir(model_id)}（约 16GB，支持断点续传）。"
             )
 
     elif backend == "llamacpp":
@@ -1444,9 +1443,9 @@ def models_local_resources():
     if cls_name == "TransformersClient":
         model_id = getattr(client, "model_id", "") or resolve_base_model_path()
         available, status = _detect_model_available("transformers", client)
-        # 下载/检测唯一位置：项目 HF 缓存 models/transformers/.hf_home/hub
-        # （自动下载、设置页下载按钮、迁移、就绪检测全部落这里）
-        cache_dir = local_hf_cache_dir(model_id)
+        # 下载/检测唯一位置：项目扁平基座目录 models/transformers/<名称>
+        # （自动下载、设置页下载按钮、迁移、就绪检测、加载全部落这里，与调用路径一致）
+        cache_dir = local_hf_model_dir(model_id)
         resources.append({
             "type": "huggingface",
             "id": model_id,
@@ -1525,8 +1524,9 @@ async def models_download_hf(req: HfDownloadRequest):
     if not model_id:
         return JSONResponse({"error": "model_id 不能为空"}, status_code=400)
 
-    # 下载目标：项目 HF 缓存（与 from_pretrained 自动下载/续传同一布局）
-    cache_dir = local_hf_cache_dir(model_id)
+    # 下载目标：项目扁平基座目录 models/transformers/<名称>
+    # （与加载/检测/迁移同一位置，调用路径一致；local_dir 直接写扁平文件，可续传）
+    cache_dir = local_hf_model_dir(model_id)
 
     chunk_queue: _q.Queue = _q.Queue()
     done_flag = {"done": False, "result": None, "error": None}
@@ -1553,7 +1553,7 @@ async def models_download_hf(req: HfDownloadRequest):
                 hf_hub_download(
                     repo_id=model_id,
                     filename=fname,
-                    cache_dir=str(hf_home_dir()),
+                    local_dir=str(cache_dir),
                 )
                 completed_files += 1
                 pct = int(completed_files / total_files * 100) if total_files else 0

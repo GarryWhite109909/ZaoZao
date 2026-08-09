@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 set -e
-cd "$(dirname "$0")/../.." || exit 1
+# 项目根目录：始终以脚本所在位置推导，不依赖用户调用时的 $PWD，
+# 保证 OLLAMA_MODELS/HF_HOME 与软件内 find_project_root() 解析一致。
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$PROJECT_ROOT"
 echo "Starting AI Vulnerability Scanner..."
 
-# 模型文件绝不落 C 盘/用户目录：Ollama 存储与 HuggingFace 缓存全部锁到项目 models/
-export OLLAMA_MODELS="$PWD/models/ollama"
-export HF_HOME="$PWD/models/transformers/.hf_home"
+# 模型存储统一到项目相对目录（与软件 ollama_models_dir()/hf_home_dir() 一致）：
+#   - Ollama 模型 → <项目>/models/ollama
+#   - HuggingFace 缓存 → <项目>/models/transformers/.hf_home
+export OLLAMA_MODELS="$PROJECT_ROOT/models/ollama"
+export HF_HOME="$PROJECT_ROOT/models/transformers/.hf_home"
 mkdir -p "$OLLAMA_MODELS" "$HF_HOME"
 
 # 关键：先决定用哪个 python 解释器，再装依赖、跑启动器。
