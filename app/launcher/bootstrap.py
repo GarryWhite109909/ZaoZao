@@ -34,7 +34,7 @@ from graduation_project.paths import (
     resolve_adapter_path,
     find_project_root,
     ollama_models_dir,
-    ollama_default_store,
+    hf_home_dir,
 )
 from graduation_project.transformers_client import is_transformers_runtime_compatible
 
@@ -69,65 +69,70 @@ def resolve_backend() -> str:
 
 
 def migrate_ollama_models_to_project() -> Optional[str]:
-    """把 Ollama 默认模型存储剪切到项目 models/ollama（现行分类标准）。
+    """把 C 盘/外部的 Ollama 模型存储剪切到项目 models/ollama（现行分类标准）。
 
     规则：
-    - 源 = OLLAMA_MODELS 环境变量，未设置时取 ~/.ollama/models；
-    - 只有源目录存在且 **manifests 里有模型条目** 才迁移（避免搬空目录）；
-    - 源已在项目内（OLLAMA_MODELS 已指向 models/ollama）时跳过；
+    - 候选源：OLLAMA_MODELS 指向的位置 + ~/.ollama/models（兼容默认 C 盘）；
+    - 只迁移 manifests 里有模型条目、且不在项目内的源（避免搬空目录）；
     - Ollama 服务正在运行时跳过并提示先退出（Windows 文件锁会失败/损坏运行中的服务）。
-    迁移成功后设置 OLLAMA_MODELS 指向项目目录，供本进程后续启动的 ollama serve 使用。
+    OLLAMA_MODELS 由调用方在启动前锁定到项目目录，保证后续 pull 不写 C 盘。
     """
     dst = ollama_models_dir()
-    src = ollama_default_store()
-    try:
-        if src.resolve() == dst.resolve():
-            return str(dst)
-    except Exception:
-        pass
-    if not src.is_dir():
-        return None
-    manifests = src / "manifests"
-    has_models = manifests.is_dir() and any(p.is_file() for p in manifests.rglob("*"))
-    if not has_models:
-        return None
+    candidates: list[Path] = []
+    env_val = os.environ.get("OLLAMA_MODELS", "").strip()
+    if env_val:
+        candidates.append(Path(env_val).expanduser())
+    candidates.append(Path.home() / ".ollama" / "models")
 
-    # Ollama 正在运行：Windows 上文件被占用，剪切会失败或破坏运行中的服务
-    try:
-        resp = requests.get(
-            "http://localhost:11434/api/tags", timeout=2,
-            proxies={"http": None, "https": None},
-        )
-        running = resp.status_code == 200
-    except Exception:
-        running = False
-    if running:
-        print(f"[启动器] 检测到 Ollama 正在运行且模型在 {src}，为避免破坏服务：")
-        print(f"  请先退出 Ollama（托盘图标 → Quit），再运行本启动器完成迁移到 {dst}")
-        return None
-
-    dst.mkdir(parents=True, exist_ok=True)
-    print(f"[启动器] 检测到 Ollama 模型存储 {src}，正在剪切到 {dst} ...")
-    try:
-        for item in sorted(src.iterdir()):
-            target = dst / item.name
-            if target.exists():
-                print(f"[启动器] {item.name} 已存在于目标目录，跳过")
+    for src in candidates:
+        if not src.is_dir():
+            continue
+        try:
+            if src.resolve() == dst.resolve():
                 continue
-            shutil.move(str(item), str(target))
-    except Exception as e:  # noqa: BLE001
-        print(f"[启动器] Ollama 模型迁移失败: {e}")
-        print("  请确认 Ollama 已完全退出后重试。")
-        return None
-    try:
-        src.rmdir()  # 内容已全部搬走，移除源目录空壳
-    except OSError:
-        pass
-    os.environ["OLLAMA_MODELS"] = str(dst)
-    print(f"[启动器] ✅ 已剪切 Ollama 模型到 {dst}")
-    print(f"[启动器] 后续 Ollama 使用项目目录（OLLAMA_MODELS={dst}）")
-    print(f"[启动器] 手动启动 Ollama 前请先执行: set OLLAMA_MODELS={dst}")
-    return str(dst)
+        except Exception:  # noqa: BLE001
+            pass
+        manifests = src / "manifests"
+        has_models = manifests.is_dir() and any(p.is_file() for p in manifests.rglob("*"))
+        if not has_models:
+            continue
+
+        # Ollama 正在运行：Windows 上文件被占用，剪切会失败或破坏运行中的服务
+        try:
+            resp = requests.get(
+                "http://localhost:11434/api/tags", timeout=2,
+                proxies={"http": None, "https": None},
+            )
+            running = resp.status_code == 200
+        except Exception:  # noqa: BLE001
+            running = False
+        if running:
+            print(f"[启动器] 检测到 Ollama 正在运行且模型存储仍在 {src}（可能在 C 盘）：")
+            print(f"  请先退出 Ollama，再运行本启动器，会自动剪切到 {dst} 并锁定 OLLAMA_MODELS；")
+            print("  否则本次拉取仍会写入 C 盘。")
+            return None
+
+        dst.mkdir(parents=True, exist_ok=True)
+        print(f"[启动器] 检测到 Ollama 模型存储 {src}，正在剪切到 {dst} ...")
+        try:
+            for item in sorted(src.iterdir()):
+                target = dst / item.name
+                if target.exists():
+                    print(f"[启动器] {item.name} 已存在于目标目录，跳过")
+                    continue
+                shutil.move(str(item), str(target))
+        except Exception as e:  # noqa: BLE001
+            print(f"[启动器] Ollama 模型迁移失败: {e}")
+            print("  请确认 Ollama 已完全退出后重试。")
+            return None
+        try:
+            src.rmdir()  # 内容已全部搬走，移除源目录空壳
+        except OSError:
+            pass
+        os.environ["OLLAMA_MODELS"] = str(dst)  # 迁移后锁定到项目目录
+        print(f"[启动器] ✅ 已剪切 Ollama 模型到 {dst}")
+        return str(dst)
+    return None
 
 
 def _recommend_backend_by_vram() -> tuple[str, str]:
@@ -1097,8 +1102,18 @@ def main():
     use_ollama = backend == "ollama"
     print(f"[启动器] 推理后端: {backend}")
 
+    # 模型文件绝不落 C 盘：
+    #  - Ollama 存储锁定到项目 models/ollama（模型文件绝不落 C 盘）
+    #  - HuggingFace 缓存锁定到项目 models/transformers/.hf_home
+    ollama_models_dir().mkdir(parents=True, exist_ok=True)
+    # 强制锁定：模型文件绝不落 C 盘（若确需自定义位置，请另行设置环境变量后改回 setdefault）
+    os.environ["OLLAMA_MODELS"] = str(ollama_models_dir())
+    hf_home = hf_home_dir()
+    hf_home.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HOME", str(hf_home))
+
     if use_ollama:
-        # Ollama 模型若还在 ~/.ollama/models（C 盘），先剪切到项目 models/ollama
+        # C 盘/旧位置已有模型则剪切到项目 models/ollama
         migrate_ollama_models_to_project()
 
         # 1. 检测 Ollama

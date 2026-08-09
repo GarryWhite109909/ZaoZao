@@ -195,3 +195,12 @@ def ollama_default_store() -> Path:
     if env_val:
         return Path(env_val).expanduser()
     return Path.home() / ".ollama" / "models"
+
+
+def hf_home_dir(project_root: Optional[Path] = None) -> Path:
+    """HuggingFace 缓存/元数据根目录（models/transformers/.hf_home）。
+
+    设置 HF_HOME 指向这里，保证 huggingface_hub 的任何缓存/元数据
+    （模型权重、tokenizer、锁文件等）都不落 C 盘。
+    """
+    return (project_root or find_project_root()) / "models" / "transformers" / ".hf_home"

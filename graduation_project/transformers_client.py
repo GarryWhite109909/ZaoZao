@@ -84,6 +84,7 @@ from graduation_project.paths import (
     resolve_adapter_path,
     resolve_base_model_path,
     local_hf_model_dir,
+    hf_home_dir,
 )
 
 
@@ -158,14 +159,34 @@ def _local_dir_state(local_dir: Path) -> tuple[bool | None, str]:
     return False, "本地基座缺少权重文件"
 
 
-def _hf_cache_repo_dir(model_id: str) -> Path:
-    """HF 默认 cache 中对应仓库的目录（如 .../hub/models--Qwen--Qwen3-8B）。"""
+def _ensure_hf_home() -> None:
+    """把 HF_HOME 锁到项目目录，保证 HuggingFace 相关文件（含模型权重）不落 C 盘。"""
+    if os.environ.get("HF_HOME") or os.environ.get("HF_HUB_CACHE"):
+        return
+    home = hf_home_dir()
+    home.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(home)
+
+
+def _hf_cache_repo_candidates(model_id: str) -> list[Path]:
+    """HF cache 中对应仓库的候选目录（默认 C 盘 + HF_HOME 指向的位置）。"""
+    name = f"models--{model_id.replace('/', '--')}"
+    roots: list[Path] = []
     try:
         from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
-        root = Path(HUGGINGFACE_HUB_CACHE)
+        roots.append(Path(HUGGINGFACE_HUB_CACHE))
     except Exception:  # noqa: BLE001
-        root = Path.home() / ".cache" / "huggingface" / "hub"
-    return root / f"models--{model_id.replace('/', '--')}"
+        pass
+    roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+    seen: set[str] = set()
+    out: list[Path] = []
+    for root in roots:
+        p = root / name
+        key = str(p).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
 
 
 def _migrate_completed_hf_cache(model_id: str, local_dir: Path) -> bool:
@@ -181,44 +202,44 @@ def _migrate_completed_hf_cache(model_id: str, local_dir: Path) -> bool:
     """
     if (local_dir / "config.json").is_file() and _local_dir_state(local_dir)[0] is True:
         return False  # 本地已完整，无需迁移
-    repo = _hf_cache_repo_dir(model_id)
-    snapshots = repo / "snapshots"
-    if not snapshots.is_dir():
-        return False
-    candidates = sorted(
-        (p for p in snapshots.iterdir() if p.is_dir()),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    for snap in candidates:
-        ok, _ = _local_dir_state(snap)
-        if ok is not True:
+    for repo in _hf_cache_repo_candidates(model_id):
+        snapshots = repo / "snapshots"
+        if not snapshots.is_dir():
             continue
-        local_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            for item in snap.iterdir():
-                dest = local_dir / item.name
-                if dest.exists():
-                    continue
-                if item.is_symlink():
-                    # Linux 缓存里是符号链接：复制内容，随后整体删除仓库
-                    shutil.copy2(item, dest)
-                else:
-                    shutil.move(str(item), str(dest))
-        except Exception as e:  # noqa: BLE001
-            print(f"[TransformersClient] HF cache 迁移失败: {e}")
-            return False
-        if _local_dir_state(local_dir)[0] is True:
+        candidates = sorted(
+            (p for p in snapshots.iterdir() if p.is_dir()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for snap in candidates:
+            ok, _ = _local_dir_state(snap)
+            if ok is not True:
+                continue
+            local_dir.mkdir(parents=True, exist_ok=True)
             try:
-                shutil.rmtree(repo, ignore_errors=True)
-                print(
-                    f"[TransformersClient] 已从 HF cache 迁移基座到 {local_dir}，"
-                    "并清理了 C 盘缓存"
-                )
+                for item in snap.iterdir():
+                    dest = local_dir / item.name
+                    if dest.exists():
+                        continue
+                    if item.is_symlink():
+                        # Linux 缓存里是符号链接：复制内容，随后整体删除仓库
+                        shutil.copy2(item, dest)
+                    else:
+                        shutil.move(str(item), str(dest))
             except Exception as e:  # noqa: BLE001
-                print(f"[TransformersClient] 缓存清理失败（不影响使用）: {e}")
-            return True
-        return False
+                print(f"[TransformersClient] HF cache 迁移失败: {e}")
+                return False
+            if _local_dir_state(local_dir)[0] is True:
+                try:
+                    shutil.rmtree(repo, ignore_errors=True)
+                    print(
+                        f"[TransformersClient] 已从 HF cache 迁移基座到 {local_dir}，"
+                        "并清理了 C 盘缓存"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    print(f"[TransformersClient] 缓存清理失败（不影响使用）: {e}")
+                return True
+            return False
     return False
 
 
@@ -330,6 +351,10 @@ class TransformersClient:
         peft = _lazy_import_peft()
 
         try:
+            # HuggingFace 缓存锁定到项目目录（models/transformers/.hf_home），
+            # 保证模型权重/元数据完全不落 C 盘
+            _ensure_hf_home()
+
             # 基座统一下载到项目目录 models/transformers/<名称>（与设置页按钮、就绪检测一致）。
             # 本地已有则直接使用；VULN_SCANNER_HF_LOCAL_DIR=0 可关闭本地化（走 HF 默认 cache）。
             load_model_id = self.model_id
