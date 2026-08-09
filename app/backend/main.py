@@ -329,7 +329,7 @@ def _detect_model_available(backend: str, client) -> tuple[bool | None, str]:
         load_err = getattr(client, "_load_error", None)
         if load_err:
             return False, f"加载失败：{load_err}"
-        # 本地目录路径（models/hf_models/...）→ 直接检查目录内 config.json
+        # 本地目录路径（models/transformers/...）→ 直接检查目录内 config.json
         local_dir = Path(model_id).expanduser()
         if local_dir.is_dir():
             if (local_dir / "config.json").is_file():
@@ -1409,7 +1409,7 @@ def models_activate(req: ModelActionRequest):
 
 
 # ---------------------------------------------------------------------------
-# 进程内后端模型下载（transformers / llamacpp）—— 下载到 models/ 目录
+# 进程内后端模型下载（transformers / llamacpp）—— 下载到 models/ 分类目录
 # ---------------------------------------------------------------------------
 
 # HuggingFace 镜像（国内加速）
@@ -1440,7 +1440,7 @@ def models_local_resources():
     if cls_name == "TransformersClient":
         model_id = getattr(client, "model_id", "") or resolve_base_model_path()
         available, status = _detect_model_available("transformers", client)
-        # 下载/检测唯一位置：models/hf_models/<model_id 最后一段>
+        # 下载/检测唯一位置：models/transformers/<model_id 最后一段>
         # （自动下载、设置页下载按钮、就绪检测三处共用同一路径）
         dest_dir = local_hf_model_dir(model_id)
         resources.append({
@@ -1459,7 +1459,7 @@ def models_local_resources():
             "type": "adapter",
             "path": str(adapter) if adapter else "",
             "available": bool(adapter) and Path(adapter).is_dir(),
-            "description": "LoRA adapter（训练产物，自动探测 models/ 目录）",
+            "description": "LoRA adapter（训练产物，自动探测 models/adapter/ 目录）",
         })
 
     elif cls_name == "LlamaCppClient":
@@ -1474,7 +1474,7 @@ def models_local_resources():
             "status": status,
             "description": "Q4 GGUF 基座文件",
             "download_endpoint": "/api/models/download-gguf",
-            "download_path": str(_models_dir()),
+            "download_path": str(_models_dir() / "ollama"),
             "default_url": gguf_url,
         })
         adapter = resolve_adapter_path(getattr(client, "adapter", ""))
@@ -1482,7 +1482,7 @@ def models_local_resources():
             "type": "adapter",
             "path": str(adapter) if adapter else "",
             "available": bool(adapter) and Path(adapter).is_dir(),
-            "description": "LoRA adapter（训练产物，自动探测 models/ 目录）",
+            "description": "LoRA adapter（训练产物，自动探测 models/adapter/ 目录）",
         })
 
     elif cls_name == "VLLMClient":
@@ -1509,7 +1509,7 @@ def models_local_resources():
 
 @app.post("/api/models/download-hf")
 async def models_download_hf(req: HfDownloadRequest):
-    """流式下载 HuggingFace 基座模型到 models/ 目录（NDJSON 进度）。
+    """流式下载 HuggingFace 基座模型到 models/transformers/ 目录（NDJSON 进度）。
 
     使用 hf-mirror.com 镜像加速国内下载。下载完成后需重启后端使配置生效。
     """
@@ -1520,9 +1520,9 @@ async def models_download_hf(req: HfDownloadRequest):
     if not model_id:
         return JSONResponse({"error": "model_id 不能为空"}, status_code=400)
 
-    # 下载目标：models/hf_models/<model_id 最后一段>
+    # 下载目标：models/transformers/<model_id 最后一段>
     dest_name = model_id.split("/")[-1]
-    dest_dir = _models_dir() / "hf_models" / dest_name
+    dest_dir = _models_dir() / "transformers" / dest_name
 
     chunk_queue: _q.Queue = _q.Queue()
     done_flag = {"done": False, "result": None, "error": None}
@@ -1621,7 +1621,7 @@ async def models_download_hf(req: HfDownloadRequest):
 
 @app.post("/api/models/download-gguf")
 async def models_download_gguf(req: GgufDownloadRequest):
-    """流式下载 GGUF 文件到 models/ 目录（NDJSON 进度）。
+    """流式下载 GGUF 文件到 models/ollama/ 目录（NDJSON 进度）。
 
     对 GitHub URL 自动加 ghproxy 镜像加速。下载完成后需重启后端使配置生效。
     """

@@ -11,7 +11,7 @@ LoRA 信号被一并重量化，导致 20 真实召回从 95%（全精度 LoRA�
 check_connection / list_models / unload_model / model），便于 Scanner 无缝切换。
 
 使用约定（环境变量）：
-    VULN_SCANNER_MODEL_ID   基座模型（默认项目本地 models/hf_models/Qwen3-8B，缺失回退 Qwen/Qwen3-8B）
+    VULN_SCANNER_MODEL_ID   基座模型（默认项目本地 models/transformers/Qwen3-8B，缺失回退 Qwen/Qwen3-8B）
     VULN_SCANNER_ADAPTER    LoRA adapter 目录（必填，含 adapter_model.safetensors）
     VULN_SCANNER_NUM_CTX    上下文长度（默认 6144，用户指定）
     VULN_SCANNER_QUANTIZE   是否 NF4 4bit 量化基座（默认 1）
@@ -330,7 +330,7 @@ class TransformersClient:
         peft = _lazy_import_peft()
 
         try:
-            # 基座统一下载到项目目录 models/hf_models/<名称>（与设置页按钮、就绪检测一致）。
+            # 基座统一下载到项目目录 models/transformers/<名称>（与设置页按钮、就绪检测一致）。
             # 本地已有则直接使用；VULN_SCANNER_HF_LOCAL_DIR=0 可关闭本地化（走 HF 默认 cache）。
             load_model_id = self.model_id
             local_dir = self._resolved_local_dir()
@@ -464,7 +464,7 @@ class TransformersClient:
     def _resolved_local_dir(self) -> Optional[Path]:
         """基座下载/检测目录：本地路径 > VULN_SCANNER_HF_LOCAL_DIR > 项目约定目录。
 
-        项目约定目录为 models/hf_models/<repo 名>（与设置页下载按钮、paths.local_hf_model_dir
+        项目约定目录为 models/transformers/<repo 名>（与设置页下载按钮、paths.local_hf_model_dir
         一致）；设 VULN_SCANNER_HF_LOCAL_DIR=0/none/off 可禁用本地目录下载。
         """
         p = Path(self.model_id).expanduser()

@@ -76,24 +76,22 @@ def discover_adapter_dir(project_root: Optional[Path] = None) -> Optional[Path]:
     """在项目约定目录中自动探测 LoRA adapter。
 
     搜索范围（按优先级分层，主位置永远优先于兜底位置）：
-        1. 主位置 project_root / "models"：
-           - 直接子目录
-           - models/ 本身（adapter 文件直接放 models/ 下）
+        1. 主位置 project_root / "models" / "adapter"（现行分类标准）
+           - 兼容旧布局：models/ 本身直接放 adapter 权重文件
         2. 兜底位置 project_root / "experiments" / "exp_06_finetune" / "outputs" / ** / "best"
 
-    仅当主位置 models/ 下没有任何合法 adapter 时，才回退到训练输出目录。
-    这样项目根 models/ 下直接放置的 adapter 不会被实验归档目录覆盖。
+    仅当主位置没有任何合法 adapter 时，才回退到训练输出目录。
     """
     root = (project_root or find_project_root()).resolve()
 
-    # 1) 主位置：models/（子目录 + 本身）
+    # 1) 主位置：models/adapter/（现行标准），兼容 models/ 根目录直接放置
     tier1: list[Path] = []
     models_dir = root / "models"
     if models_dir.is_dir():
-        for child in sorted(models_dir.iterdir()):
-            if child.is_dir() and is_valid_adapter_dir(child):
-                tier1.append(child)
-        # models/ 本身也可能直接放权重
+        adapter_dir = models_dir / "adapter"
+        if is_valid_adapter_dir(adapter_dir):
+            tier1.append(adapter_dir)
+        # 旧布局兼容：models/ 本身直接放权重
         if is_valid_adapter_dir(models_dir):
             tier1.append(models_dir)
     if tier1:
@@ -157,7 +155,7 @@ def resolve_base_model_path(explicit: str = "") -> str:
     解析优先级：
         1. explicit 参数（非空）
         2. VULN_SCANNER_MODEL_ID 环境变量（用户显式指定，可为 HF id 或本地路径）
-        3. 项目本地缓存 models/hf_models/Qwen3-8B（存在时优先本地，离线可用）
+        3. 项目本地缓存 models/transformers/Qwen3-8B（存在时优先本地，离线可用）
         4. 回退官方 HF id Qwen/Qwen3-8B
     """
     if explicit:
@@ -167,7 +165,7 @@ def resolve_base_model_path(explicit: str = "") -> str:
     if env_id:
         return env_id
 
-    local = find_project_root() / "models" / "hf_models" / "Qwen3-8B"
+    local = find_project_root() / "models" / "transformers" / "Qwen3-8B"
     if (local / "config.json").is_file():
         return str(local)
 
@@ -175,7 +173,7 @@ def resolve_base_model_path(explicit: str = "") -> str:
 
 
 def local_hf_model_dir(repo_id: str) -> Path:
-    """HF 仓库 id → 项目本地基座下载目录（models/hf_models/<名称>）。
+    """HF 仓库 id → 项目本地基座下载目录（models/transformers/<名称>）。
 
     这是 transformers 后端**唯一**的基座下载/检测位置：
     - 自动下载（首次加载）落到这里；
@@ -183,4 +181,17 @@ def local_hf_model_dir(repo_id: str) -> Path:
     - 就绪检测只检查这个目录。
     """
     name = repo_id.split("/")[-1] if "/" in repo_id else repo_id
-    return find_project_root() / "models" / "hf_models" / name
+    return find_project_root() / "models" / "transformers" / name
+
+
+def ollama_models_dir(project_root: Optional[Path] = None) -> Path:
+    """项目内 Ollama 模型存储目录（models/ollama）。"""
+    return (project_root or find_project_root()) / "models" / "ollama"
+
+
+def ollama_default_store() -> Path:
+    """Ollama 默认模型存储：优先 OLLAMA_MODELS 环境变量，否则 ~/.ollama/models。"""
+    env_val = os.environ.get("OLLAMA_MODELS", "").strip()
+    if env_val:
+        return Path(env_val).expanduser()
+    return Path.home() / ".ollama" / "models"

@@ -30,7 +30,12 @@ from pathlib import Path
 import requests
 
 from app.launcher import dependency_installer
-from graduation_project.paths import resolve_adapter_path, find_project_root
+from graduation_project.paths import (
+    resolve_adapter_path,
+    find_project_root,
+    ollama_models_dir,
+    ollama_default_store,
+)
 from graduation_project.transformers_client import is_transformers_runtime_compatible
 
 # 项目根目录（Graduation-Project/）
@@ -61,6 +66,68 @@ def resolve_backend() -> str:
         print(f"[启动器] 检测到 models/ LoRA adapter，但当前环境不适合 transformers 后端: {reason}")
         print("[启动器] 已自动回退 ollama（如确要用 transformers，请显式设置 VULN_SCANNER_BACKEND=transformers）")
     return "ollama"
+
+
+def migrate_ollama_models_to_project() -> Optional[str]:
+    """把 Ollama 默认模型存储剪切到项目 models/ollama（现行分类标准）。
+
+    规则：
+    - 源 = OLLAMA_MODELS 环境变量，未设置时取 ~/.ollama/models；
+    - 只有源目录存在且 **manifests 里有模型条目** 才迁移（避免搬空目录）；
+    - 源已在项目内（OLLAMA_MODELS 已指向 models/ollama）时跳过；
+    - Ollama 服务正在运行时跳过并提示先退出（Windows 文件锁会失败/损坏运行中的服务）。
+    迁移成功后设置 OLLAMA_MODELS 指向项目目录，供本进程后续启动的 ollama serve 使用。
+    """
+    dst = ollama_models_dir()
+    src = ollama_default_store()
+    try:
+        if src.resolve() == dst.resolve():
+            return str(dst)
+    except Exception:
+        pass
+    if not src.is_dir():
+        return None
+    manifests = src / "manifests"
+    has_models = manifests.is_dir() and any(p.is_file() for p in manifests.rglob("*"))
+    if not has_models:
+        return None
+
+    # Ollama 正在运行：Windows 上文件被占用，剪切会失败或破坏运行中的服务
+    try:
+        resp = requests.get(
+            "http://localhost:11434/api/tags", timeout=2,
+            proxies={"http": None, "https": None},
+        )
+        running = resp.status_code == 200
+    except Exception:
+        running = False
+    if running:
+        print(f"[启动器] 检测到 Ollama 正在运行且模型在 {src}，为避免破坏服务：")
+        print(f"  请先退出 Ollama（托盘图标 → Quit），再运行本启动器完成迁移到 {dst}")
+        return None
+
+    dst.mkdir(parents=True, exist_ok=True)
+    print(f"[启动器] 检测到 Ollama 模型存储 {src}，正在剪切到 {dst} ...")
+    try:
+        for item in sorted(src.iterdir()):
+            target = dst / item.name
+            if target.exists():
+                print(f"[启动器] {item.name} 已存在于目标目录，跳过")
+                continue
+            shutil.move(str(item), str(target))
+    except Exception as e:  # noqa: BLE001
+        print(f"[启动器] Ollama 模型迁移失败: {e}")
+        print("  请确认 Ollama 已完全退出后重试。")
+        return None
+    try:
+        src.rmdir()  # 内容已全部搬走，移除源目录空壳
+    except OSError:
+        pass
+    os.environ["OLLAMA_MODELS"] = str(dst)
+    print(f"[启动器] ✅ 已剪切 Ollama 模型到 {dst}")
+    print(f"[启动器] 后续 Ollama 使用项目目录（OLLAMA_MODELS={dst}）")
+    print(f"[启动器] 手动启动 Ollama 前请先执行: set OLLAMA_MODELS={dst}")
+    return str(dst)
 
 
 def _recommend_backend_by_vram() -> tuple[str, str]:
@@ -198,8 +265,8 @@ def check_inprocess_backend_ready(backend: str) -> bool:
         if not adapter:
             print("[错误] transformers 后端需要 LoRA adapter 目录")
             print("  （目录内需含 adapter_model.safetensors / adapter_model.bin）")
-            print(f"  推荐做法：将 adapter 放到 {models_dir}")
-            print("  示例: set VULN_SCANNER_ADAPTER=D:\\code\\Graduation-Project\\models\\v9max_lora")
+            print(f"  推荐做法：将 adapter 放到 {models_dir / 'adapter'}")
+            print("  示例: set VULN_SCANNER_ADAPTER=D:\\code\\Graduation-Project\\models\\adapter")
             ok = False
         elif not Path(adapter).is_dir():
             print(f"[错误] LoRA adapter 路径不存在: {adapter}")
@@ -212,14 +279,14 @@ def check_inprocess_backend_ready(backend: str) -> bool:
         adapter = resolve_adapter_path()
         if not gguf:
             print("[错误] llamacpp 后端需要 VULN_SCANNER_GGUF 指向 Q4 GGUF 文件")
-            print("  示例: set VULN_SCANNER_GGUF=D:\\models\\qwen3-8b-q4_k_m.gguf")
+            print("  示例: set VULN_SCANNER_GGUF=D:\\code\\Graduation-Project\\models\\ollama\\qwen3-8b-q4_k_m.gguf")
             ok = False
         elif not Path(gguf).is_file():
             print(f"[错误] GGUF 文件不存在: {gguf}")
             ok = False
         if not adapter:
             print("[错误] llamacpp 后端需要 FP16 LoRA adapter 目录")
-            print(f"  推荐做法：将 adapter 放到 {models_dir}")
+            print(f"  推荐做法：将 adapter 放到 {models_dir / 'adapter'}")
             ok = False
         elif not Path(adapter).is_dir():
             print(f"[错误] LoRA adapter 路径不存在: {adapter}")
@@ -1031,6 +1098,9 @@ def main():
     print(f"[启动器] 推理后端: {backend}")
 
     if use_ollama:
+        # Ollama 模型若还在 ~/.ollama/models（C 盘），先剪切到项目 models/ollama
+        migrate_ollama_models_to_project()
+
         # 1. 检测 Ollama
         if not check_ollama_installed():
             # 尝试自动安装
