@@ -248,24 +248,77 @@ def _migrate_hf_cache_any(model_id: str, local_dir: Path) -> bool:
                         print(f"[TransformersClient] 缓存清理失败（不影响使用）: {e}")
                     return True
                 return True
-        # 部分下载/其他残留：整个仓库搬到项目 HF_HOME/hub，C 盘不留任何模型文件
+        # 部分下载/其他残留：逐文件搬到项目 HF_HOME/hub，C 盘不留任何模型文件。
+        # 逐文件处理并对失败项重试，避免单个被占用文件导致整次迁移半途而废。
         target_root = hf_home_dir() / "hub"
         target = target_root / repo.name
+        target_root.mkdir(parents=True, exist_ok=True)
+        failures: list[str] = []
+        meta_warnings: list[str] = []
+        moved_any = False
+        for item in sorted(repo.iterdir()):
+            if item.name == ".no_exist":
+                # 哨兵元数据（标记“仓库里不存在某文件”），不是模型文件；
+                # 删不掉只警告，不阻断迁移
+                try:
+                    shutil.rmtree(item)
+                except Exception as e:  # noqa: BLE001
+                    meta_warnings.append(f".no_exist: {e}")
+                continue
+            dest = target / item.name
+            ok_item = False
+            for attempt in range(2):
+                try:
+                    if dest.exists():
+                        if item.is_dir():
+                            shutil.rmtree(item)
+                        else:
+                            item.unlink()
+                    else:
+                        shutil.move(str(item), str(dest))
+                    ok_item = True
+                    moved_any = True
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if attempt == 0:
+                        time.sleep(0.5)  # Windows 文件锁/杀软短暂占用：重试一次
+                    else:
+                        failures.append(f"{item.name}: {e}")
+            if not ok_item:
+                continue
         try:
-            target_root.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                shutil.rmtree(repo, ignore_errors=True)  # 项目里已有，删 C 盘残留
-            else:
-                shutil.move(str(repo), str(target))
+            repo.rmdir()  # 空壳清理；有残留失败项时自然失败
+        except OSError:
+            failures.append(f"{repo.name}: 目录仍有残留（文件被占用）")
+        if failures:
+            print(f"[TransformersClient] C 盘 HF 缓存迁移未完全完成，以下内容被占用：")
+            for f in failures[:8]:
+                print(f"    {f}")
+            print(
+                "  可能是残留的下载进程仍占用这些文件（例如之前没下完的 python 进程），"
+                "请关闭它（或重启电脑）后重新启动本程序，会自动完成清理。"
+            )
+            if meta_warnings:
+                print(f"  （另有 {len(meta_warnings)} 个 .no_exist 哨兵文件无法删除，不影响使用）")
+            return False
+        if moved_any:
             print(
                 f"[TransformersClient] 检测到 C 盘 HF 缓存（含未下载完的部分），"
-                f"已整体迁移到 {target}"
+                f"已迁移到 {target}"
             )
             return True
-        except Exception as e:  # noqa: BLE001
-            print(f"[TransformersClient] HF 部分缓存迁移失败: {e}")
-            return False
+        return False
     return False
+
+
+def migrate_hf_cache_to_project(model_id: Optional[str] = None) -> bool:
+    """把 C 盘 HF 缓存（完整或未下完）迁移到项目目录。
+
+    任何后端（ollama/transformers/...）都可在启动时调用，保证 C 盘不残留模型文件。
+    """
+    _ensure_hf_home()
+    model_id = model_id or resolve_base_model_path()
+    return _migrate_hf_cache_any(model_id, local_hf_model_dir(model_id))
 
 
 class TransformersClient:
@@ -529,6 +582,14 @@ class TransformersClient:
             return local_hf_model_dir(self.model_id)
         except Exception:  # noqa: BLE001
             return None
+
+    def migrate_cache_to_project(self) -> bool:
+        """把 C 盘 HF 缓存（完整或未下完）迁移到项目目录（启动时主动调用）。"""
+        _ensure_hf_home()
+        local_dir = self._resolved_local_dir()
+        if local_dir is None:
+            return False
+        return _migrate_hf_cache_any(self.model_id, local_dir)
 
     def model_availability(self) -> tuple[bool | None, str]:
         """查询基座模型下载状态（只检查项目本地目录，不再看 HF 默认 cache）。

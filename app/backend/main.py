@@ -106,16 +106,19 @@ def _trigger_transformers_warmup() -> None:
         if client._model is not None:
             _warmup_started = True
             return
-        # 基座权重未完整下载时跳过预热：避免启动即触发 16GB 下载。
-        # 下载完成后（设置页下载端点）会再次触发预热。
-        if not client.is_ready():
-            _, base_status = client.model_availability()
-            print(f"[Warmup] 基座未就绪，跳过预热（{base_status}）")
-            return
         _warmup_started = True
 
     def _warm():
         try:
+            # 启动即迁移 C 盘 HF 缓存（完整/未下完都搬），保证模型文件不落 C 盘
+            if hasattr(client, "migrate_cache_to_project"):
+                client.migrate_cache_to_project()
+            # 基座权重未完整下载时跳过预热：避免启动即触发 16GB 下载。
+            # 下载完成后（设置页下载端点）会再次触发预热。
+            if not client.is_ready():
+                _, base_status = client.model_availability()
+                print(f"[Warmup] 基座未就绪，跳过预热（{base_status}）")
+                return
             if not client.load_model():
                 print(f"[Warmup] transformers 模型加载失败: {client._load_error}")
         except Exception as e:

@@ -36,7 +36,10 @@ from graduation_project.paths import (
     ollama_models_dir,
     hf_home_dir,
 )
-from graduation_project.transformers_client import is_transformers_runtime_compatible
+from graduation_project.transformers_client import (
+    is_transformers_runtime_compatible,
+    migrate_hf_cache_to_project,
+)
 
 # 项目根目录（Graduation-Project/）
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -1110,6 +1113,12 @@ def main():
     hf_home = hf_home_dir()
     hf_home.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("HF_HOME", str(hf_home))
+
+    # 启动即迁移 C 盘 HF 缓存（完整/未下完都搬），任何后端都不允许 C 盘留模型文件
+    try:
+        migrate_hf_cache_to_project()
+    except Exception as e:  # noqa: BLE001
+        print(f"[启动器] HF 缓存迁移异常: {e}")
 
     if use_ollama:
         # C 盘/旧位置已有模型则剪切到项目 models/ollama
