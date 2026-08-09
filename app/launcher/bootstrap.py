@@ -1120,10 +1120,11 @@ def main():
     except Exception as e:  # noqa: BLE001
         print(f"[启动器] HF 缓存迁移异常: {e}")
 
-    if use_ollama:
-        # C 盘/旧位置已有模型则剪切到项目 models/ollama
-        migrate_ollama_models_to_project()
+    # C 盘/旧位置的 Ollama 模型也剪切到项目 models/ollama（**任何后端**都执行；
+    # Ollama 正在运行时会提示先退出，避免文件锁/损坏服务）
+    migrate_ollama_models_to_project()
 
+    if use_ollama:
         # 1. 检测 Ollama
         if not check_ollama_installed():
             # 尝试自动安装
