@@ -6,8 +6,10 @@ import json
 import re
 import statistics
 from collections import Counter, defaultdict
+from pathlib import Path
 
-DATA_FILE = "/home/zane/文档/code/毕业设计/experiments/exp_06_finetune/data/train_chatml_v9_augmented.jsonl"
+# 用真实用户主目录动态解析（不写死用户名）
+DATA_FILE = Path.home() / "文档/code/毕业设计/experiments/exp_06_finetune/data/train_chatml_v9_augmented.jsonl"
 
 # ==========================================
 # 读取数据

@@ -1,6 +1,7 @@
 import json, re, sys
 from collections import Counter
-sys.path.insert(0, "/home/zane/文档/code/毕业设计")
+from pathlib import Path
+sys.path.insert(0, str(Path.home() / "文档/code/毕业设计"))
 from graduation_project.schema import parse_verdict
 
 recs = [json.loads(l) for l in open("data/quality/final_train_chatml_quality.jsonl", encoding="utf-8") if l.strip()]

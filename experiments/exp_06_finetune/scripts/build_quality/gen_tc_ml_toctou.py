@@ -13,7 +13,7 @@
 配比：14 漏洞正样本 + 6 安全负样本（hard negative）。
 
 用法：
-  cd /home/zane/文档/code/毕业设计/experiments/exp_06_finetune
+  cd ~/文档/code/毕业设计/experiments/exp_06_finetune
   python3 scripts/build_quality/gen_tc_ml_toctou.py
 """
 import json

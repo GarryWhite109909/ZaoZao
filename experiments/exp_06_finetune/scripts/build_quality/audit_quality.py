@@ -3,11 +3,13 @@
 """审计：重建后正样本质量 vs 重建前基础数据。"""
 import sys, re, json
 from collections import Counter
-sys.path.insert(0, "/home/zane/文档/code/毕业设计")
+from pathlib import Path
+PROJECT_ROOT = Path.home() / "文档/code/毕业设计"
+sys.path.insert(0, str(PROJECT_ROOT))
 from graduation_project.schema import parse_verdict
 
-BASE = "/home/zane/文档/code/毕业设计/experiments/exp_06_finetune/data/quality/clean_base.jsonl"
-REBUILT = "/home/zane/文档/code/毕业设计/experiments/exp_06_finetune/data/quality/positives_rebuilt.jsonl"
+BASE = PROJECT_ROOT / "experiments/exp_06_finetune/data/quality/clean_base.jsonl"
+REBUILT = PROJECT_ROOT / "experiments/exp_06_finetune/data/quality/positives_rebuilt.jsonl"
 
 def load(p):
     return [json.loads(l) for l in open(p, encoding="utf-8") if l.strip()]

@@ -5,8 +5,10 @@
 import json
 import re
 from collections import Counter, defaultdict
+from pathlib import Path
 
-JSONL_PATH = "/home/zane/文档/code/毕业设计/experiments/exp_06_finetune/data/train_chatml_v9_augmented.jsonl"
+# 用真实用户主目录动态解析（不写死用户名）
+JSONL_PATH = Path.home() / "文档/code/毕业设计/experiments/exp_06_finetune/data/train_chatml_v9_augmented.jsonl"
 
 def extract_vulnerability_types():
     """从 JSONL 文件中提取所有 vulnerability_type 值"""

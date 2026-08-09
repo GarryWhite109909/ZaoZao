@@ -10,10 +10,11 @@ GLM 的 CWE 标号更规范，应保留并重建补行号+补丁，而非摒弃�
 """
 import json, re, sys, hashlib
 from pathlib import Path
-sys.path.insert(0, "/home/zane/文档/code/毕业设计")
+PROJECT_ROOT = Path.home() / "文档/code/毕业设计"
+sys.path.insert(0, str(PROJECT_ROOT))
 from graduation_project.schema import parse_verdict
 
-DATA = Path("/home/zane/文档/code/毕业设计/experiments/exp_06_finetune/data")
+DATA = PROJECT_ROOT / "experiments/exp_06_finetune/data"
 
 def code_hash(r):
     m = re.search(r"```\w*\n(.*?)```", r["messages"][1]["content"], re.DOTALL)

@@ -20,7 +20,7 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/home/zane/文档/code/毕业设计")
+sys.path.insert(0, str(Path.home() / "文档/code/毕业设计"))
 from graduation_project.prompts import BASE_PROMPT, build_user_prompt
 
 # ---------------------------------------------------------------------------
