@@ -110,9 +110,15 @@ def _resolve_model(args: argparse.Namespace) -> str:
     """解析基座模型：优先本地目录，其次 HF id。"""
     model = args.model.strip()
     if not model:
-        # 尝试自动探测本地 models/ 下的量化目录
-        from graduation_project.paths import find_project_root
+        # 尝试自动探测项目 models/vllm/ 下的量化目录（与 transformers 的 models/transformers 对齐）
+        from graduation_project.paths import find_project_root, local_vllm_model_dir
 
+        # 主位置：models/vllm/Qwen3-8B-AWQ（现行标准，与本地下载目录一致）
+        for repo_name in ("Qwen3-8B-AWQ", "Qwen3-8B-GPTQ"):
+            d = local_vllm_model_dir(repo_name)
+            if (d / "config.json").is_file():
+                return str(d)
+        # 兼容旧布局：models/ 根下的量化目录
         models_dir = find_project_root() / "models"
         candidates = ["vllm", "awq", "gptq", "Qwen3-8B-AWQ", "Qwen3-8B-GPTQ"]
         for cand in candidates:
@@ -121,7 +127,7 @@ def _resolve_model(args: argparse.Namespace) -> str:
                 return str(d)
         raise SystemExit(
             "[vllm_server] 未指定模型。请设置 VULN_SCANNER_VLLM_MODEL 或 --model "
-            "（HF id 或本地 AWQ/GPTQ 量化目录）。"
+            "（HF id 或本地 AWQ/GPTQ 量化目录，可先用设置页下载到 models/vllm/）。"
         )
 
     # 本地目录：校验存在且含 config.json
@@ -150,6 +156,13 @@ def _check_vllm_installed() -> tuple[bool, str]:
     return False, out or "vllm 未安装"
 
 
+def lora_module_name(served_model_name: str) -> str:
+    """从对外模型名派生 LoRA 模块名（去命名空间和 tag），保证服务端与客户端一致。"""
+    name = served_model_name.split("/")[-1]
+    name = name.split(":")[0]
+    return name or "lora"
+
+
 def build_serve_cmd(args: argparse.Namespace, model: str) -> list[str]:
     """组装 `python -m vllm serve ...` 命令。"""
     cmd = [sys.executable, "-m", "vllm", "serve", model]
@@ -173,7 +186,8 @@ def build_serve_cmd(args: argparse.Namespace, model: str) -> list[str]:
         lora_path = Path(args.lora).expanduser()
         if not lora_path.is_dir():
             raise SystemExit(f"[vllm_server] LoRA adapter 目录不存在: {args.lora}")
-        cmd += ["--enable-lora", "--lora-modules", f"v9max={lora_path}"]
+        lora_name = lora_module_name(args.served_model_name)
+        cmd += ["--enable-lora", "--lora-modules", f"{lora_name}={lora_path}"]
 
     return cmd
 
@@ -203,6 +217,11 @@ def wait_for_ready(port: int, timeout: int = 300, proc: subprocess.Popen | None 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    # vLLM 官方仅支持 Linux/WSL2；原生 Windows 直接拒绝启动，避免误导
+    if sys.platform == "win32":
+        print("[vllm_server] vLLM 官方不支持原生 Windows（仅支持 Linux / WSL2）。")
+        print("[vllm_server] 建议改用 Ollama / LlamaCPP 后端，或在 WSL2 / Linux 中运行本项目。")
+        return 1
     model = _resolve_model(args)
 
     # 1. vllm 依赖检查

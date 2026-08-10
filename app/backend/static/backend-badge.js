@@ -132,12 +132,21 @@
       if (info.adapter_path) rows.push(row('LoRA 路径', escapeHtml(info.adapter_path)));
       if (info.gguf_path) rows.push(row('GGUF 路径', escapeHtml(info.gguf_path)));
       if (info.server_url) rows.push(row('服务地址', escapeHtml(info.server_url)));
+      if (info.model_store) rows.push(row('存储位置', escapeHtml(info.model_store)));
 
       var noteClass = 'note';
       var note = info.precision_note || '';
       if (info.lora_quantized) {
         noteClass = 'note warn';
         note = '⚠ ' + note;
+      }
+
+      var methodBlocks = '';
+      if (info.detection_method) {
+        methodBlocks += '<div class="note"><b>检测逻辑</b><br>' + escapeHtml(info.detection_method).replace(/\n/g, '<br>') + '</div>';
+      }
+      if (info.download_method) {
+        methodBlocks += '<div class="note"><b>模型获取</b><br>' + escapeHtml(info.download_method).replace(/\n/g, '<br>') + '</div>';
       }
 
       // 模型未下载时追加醒目提醒
@@ -149,6 +158,7 @@
       return '<h4>' + escapeHtml(title) + ' 检测报告</h4>' +
         '<div class="rpt-header">' + statusBadge + '</div>' +
         rows.join('') +
+        methodBlocks +
         downloadAlert +
         '<div class="' + noteClass + '">' + escapeHtml(note).replace(/\n/g, '<br>') + '</div>';
     }

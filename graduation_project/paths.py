@@ -214,3 +214,22 @@ def local_hf_cache_dir(repo_id: str, project_root: Optional[Path] = None) -> Pat
     """
     name = repo_id.replace("/", "--")
     return hf_home_dir(project_root) / "hub" / f"models--{name}"
+
+
+def local_vllm_model_dir(model_id: str, project_root: Optional[Path] = None) -> Path:
+    """HF 仓库 id → 项目本地 vLLM 基座下载目录（models/vllm/<名称>）。
+
+    vLLM 后端下载/检测/加载的唯一位置：与 transformers 的 local_hf_model_dir
+    对齐，都落在项目 models/ 下，避免模型散落项目外路径。
+    """
+    name = model_id.split("/")[-1] if "/" in model_id else model_id
+    return (project_root or find_project_root()) / "models" / "vllm" / name
+
+
+def llamacpp_dir(project_root: Optional[Path] = None) -> Path:
+    """项目内 llama.cpp 后端 GGUF 基座目录（models/llamacpp）。
+
+    与 transformers 的 models/transformers、vLLM 的 models/vllm 对齐，
+    都落在项目 models/ 分类目录下，避免 GGUF 散落到 models/ 根目录。
+    """
+    return (project_root or find_project_root()) / "models" / "llamacpp"

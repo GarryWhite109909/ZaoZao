@@ -160,6 +160,10 @@ def _local_dir_state(local_dir: Path) -> tuple[bool | None, str]:
     return False, "本地基座缺少权重文件"
 
 
+# 国内下载镜像（与设置页 /api/models/download-hf 端点一致）
+HF_MIRROR = "https://hf-mirror.com"
+
+
 def _ensure_hf_home() -> None:
     """把 HF_HOME 锁到项目目录，保证 HuggingFace 相关文件（含模型权重）不落 C 盘。"""
     if os.environ.get("HF_HOME") or os.environ.get("HF_HUB_CACHE"):
@@ -416,15 +420,22 @@ class TransformersClient:
             # 保证模型权重/元数据完全不落 C 盘
             _ensure_hf_home()
 
-            # 基座位置统一：
-            #  1. 扁平本地目录完整 → 离线加载（models/transformers/<repo>，手工放置兼容）
-            #  2. 否则 → 走项目 HF 缓存（models/transformers/.hf_home/hub，可续传；
-            #     从 C 盘迁移来的部分缓存也在这里，会被 from_pretrained 复用）
-            _migrate_hf_cache_any(self.repo_id)
+            # 基座位置统一：扁平目录 models/transformers/<repo> 是下载/加载/检测/
+            # 迁移的唯一位置（与设置页下载端点同一目录），不再依赖 HF hub 缓存。
+            #  1. 扁平目录完整 → 离线加载
+            #  2. 否则 → 先迁移 C 盘已下载部分，再自动下载/续传到扁平目录，就地加载
             flat_dir = self._resolved_local_dir()
-            load_model_id = self.repo_id
-            if flat_dir is not None and _local_dir_state(flat_dir)[0] is True:
-                load_model_id = str(flat_dir)
+            if flat_dir is None:
+                # 用户显式关闭本地目录（VULN_SCANNER_HF_LOCAL_DIR=0/off）
+                load_model_id = self.repo_id
+            else:
+                _migrate_hf_cache_any(self.repo_id)
+                if _local_dir_state(flat_dir)[0] is True:
+                    load_model_id = str(flat_dir)
+                elif self._download_to_flat_dir(flat_dir):
+                    load_model_id = str(flat_dir)
+                else:
+                    return False
 
             has_cuda = torch.cuda.is_available()
             is_rocm = bool(getattr(torch.version, "hip", None))
@@ -557,6 +568,33 @@ class TransformersClient:
             return local_hf_model_dir(self.model_id)
         except Exception:  # noqa: BLE001
             return None
+
+    def _download_to_flat_dir(self, flat_dir: Path) -> bool:
+        """把基座仓库下载/续传到扁平目录 models/transformers/<repo>。
+
+        与设置页 /api/models/download-hf 端点同一位置，使自动下载与手动下载、
+        检测、加载、迁移路径完全统一。走 hf-mirror 镜像加速国内下载，
+        支持断点续传（复用已存在且完整的文件）。
+        """
+        if _local_dir_state(flat_dir)[0] is True:
+            return True
+        print(
+            f"[TransformersClient] 首次加载：基座未下载，自动下载到 {flat_dir} "
+            "（约 16GB，可断点续传）……"
+        )
+        try:
+            os.environ["HF_ENDPOINT"] = HF_MIRROR
+            from huggingface_hub import snapshot_download
+            snapshot_download(repo_id=self.repo_id, local_dir=str(flat_dir))
+            ok, reason = _local_dir_state(flat_dir)
+            if ok is True:
+                return True
+            self._load_error = f"基座下载未完整：{reason}"
+            return False
+        except Exception as e:  # noqa: BLE001
+            self._load_error = f"{type(e).__name__}: {e}"
+            print(f"[TransformersClient] 基座自动下载失败: {self._load_error}")
+            return False
 
     def migrate_cache_to_project(self) -> bool:
         """把 C 盘 HF 缓存（完整或未下完）迁移到项目目录（启动时主动调用）。"""

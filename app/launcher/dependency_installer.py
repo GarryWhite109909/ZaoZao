@@ -115,6 +115,18 @@ class InstallSpec:
     check_modules: List[str] = field(default_factory=list)
     # 额外的 pip 参数（如 --no-binary xx，用于强制源码编译）
     pip_extra_args: List[str] = field(default_factory=list)
+    # 当前平台/硬件组合不支持该后端时置为 True，安装前直接拦截并给出指引
+    blocked: bool = False
+    blocked_message: str = ""
+    # 安装后校验版本号必须包含的标记（如 CUDA 预编译 wheel 的 "+cu125"/"cu125"），
+    # 用于防止 pip 静默回退到 CPU wheel
+    version_marker: Optional[str] = None
+    # 安装后运行 GPU 能力探测代码（目标解释器执行，stdout 输出 TRUE/FALSE）。
+    # 用于验证预编译 GPU wheel 真的带 GPU 后端，而不是仅能 import
+    gpu_probe: Optional[str] = None
+    # 已安装的依赖与目标版本/构建不匹配时，先卸载再安装（同版本 CPU→GPU 替换
+    # 必须卸载，否则 pip 认为已满足而不覆盖）
+    cleanup_on_mismatch: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -661,72 +673,202 @@ def _transformers_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_execut
 
 
 def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable: str) -> List[InstallSpec]:
-    """llamacpp 后端：llama-cpp-python（按硬件加 CMAKE_ARGS）。"""
+    """llamacpp 后端：llama-cpp-python（按平台 + GPU 系别选预编译 wheel 或源码编译）。
+
+    设计原则：能用官方预编译 GPU wheel 就不源码编译——
+    - Windows + NVIDIA：abetlen 官方 cuXXX 预编译 CUDA wheel（避免源码解压长路径问题）
+    - macOS + Apple：官方 metal 预编译 wheel
+    - Linux + NVIDIA / AMD：源码编译（Linux 无 Windows 长路径问题）
+    - Windows + AMD / 纯 CPU：PyPI 预编译 CPU wheel
+    - 高级用户可 VULN_SCANNER_LLAMACPP_SOURCE_BUILD=1 强制源码编译，
+      或用 VULN_SCANNER_LLAMACPP_CMAKE_ARGS 完全自定义编译参数
+    """
     env: dict = {}
+    extra_index_url: Optional[str] = None
     description = "llama-cpp-python"
-    # GPU 平台必须从源码编译：llama-cpp-python 的 PyPI wheel 是 CPU-only，
-    # 直接 pip install 会用 wheel 而忽略 CMAKE_ARGS，导致 GPU offload 静默失效。
-    # 故用 --no-binary 强制走 sdist 源码编译，CMAKE_ARGS 才真正生效。
+    warning: Optional[str] = None
+    gpu_probe: Optional[str] = None
+    packages = ["llama-cpp-python"]
+    # GPU 平台若走源码编译，必须用 --no-binary 强制 sdist（PyPI wheel 是 CPU-only），
+    # 否则 pip 会用 wheel 而忽略 CMAKE_ARGS，导致 GPU offload 静默失效。
     pip_extra_args: List[str] = []
 
-    if gpu.vendor == "nvidia":
-        env = {"CMAKE_ARGS": "-DLLAMA_CUDA=on"}
+    # 用户显式覆盖编译参数（高级用户：如 Vulkan / OpenBLAS / 自定义 arch）
+    override_cmake = os.environ.get("VULN_SCANNER_LLAMACPP_CMAKE_ARGS", "").strip()
+    force_source = os.environ.get("VULN_SCANNER_LLAMACPP_SOURCE_BUILD", "").strip() == "1"
+
+    if override_cmake:
+        env = {"CMAKE_ARGS": override_cmake}
+        description = "llama-cpp-python (自定义 CMAKE_ARGS)"
+        pip_extra_args = ["--no-binary", "llama-cpp-python"]
+    elif force_source:
+        # 强制源码编译：按 GPU 系别给出默认参数
+        if gpu.vendor == "nvidia":
+            env = {"CMAKE_ARGS": "-DGGML_CUDA=on -DLLAMA_CUDA=on"}
+            description = "llama-cpp-python (CUDA 源码编译)"
+        elif gpu.vendor == "apple":
+            env = {"CMAKE_ARGS": "-DGGML_METAL=on -DLLAMA_METAL=on"}
+            description = "llama-cpp-python (Metal 源码编译)"
+        elif gpu.vendor == "amd":
+            env = {"CMAKE_ARGS": "-DGGML_HIP=ON"}
+            description = "llama-cpp-python (ROCm 源码编译)"
+        pip_extra_args = ["--no-binary", "llama-cpp-python"]
+        if platform_info.os_name == "windows":
+            warning = (
+                "Windows 源码编译 llama-cpp-python 需要启用 Windows 长路径支持，"
+                "否则解压源码时会报 'No such file or directory'（即刚才遇到的错误）；"
+                "并需安装匹配的 CUDA/ROCm/Vulkan 工具链。如非必要请改用预编译 wheel 或 Ollama。"
+            )
+    elif gpu.vendor == "nvidia" and platform_info.os_name == "windows":
+        # Windows + NVIDIA：官方预编译 CUDA wheel，免源码编译 / 免长路径问题
+        cuda_ver = os.environ.get("VULN_SCANNER_LLAMACPP_CUDA_VERSION", "cu125").strip().lower()
+        if not cuda_ver.startswith("cu"):
+            cuda_ver = "cu" + cuda_ver
+        ver = os.environ.get("VULN_SCANNER_LLAMACPP_VERSION", "0.3.34").strip()
+        extra_index_url = f"https://abetlen.github.io/llama-cpp-python/whl/{cuda_ver}"
+        description = f"llama-cpp-python {ver} (CUDA 预编译 {cuda_ver})"
+        packages = [f"llama-cpp-python=={ver}"]
+        gpu_probe = (
+            "import llama_cpp; "
+            "print('TRUE' if llama_cpp.llama_supports_gpu_offload() else 'FALSE')"
+        )
+        if cuda_ver in ("cu128", "cu129", "cu130"):
+            warning = (
+                f"官方预编译索引目前主要提供 cu121~cu125；{cuda_ver} 若无匹配 wheel，"
+                "可设置 VULN_SCANNER_LLAMACPP_CUDA_VERSION 改用其它版本，"
+                "或 VULN_SCANNER_LLAMACPP_SOURCE_BUILD=1 源码编译（需启用 Windows 长路径支持）。"
+            )
+    elif gpu.vendor == "nvidia":
+        # Linux + NVIDIA：源码编译 CUDA（Linux 无 Windows 长路径问题）
+        # 新版 llama.cpp 使用 GGML_CUDA；LLAMA_CUDA 为旧版兼容参数，同时传不冲突
+        env = {"CMAKE_ARGS": "-DGGML_CUDA=on -DLLAMA_CUDA=on"}
         description = "llama-cpp-python (CUDA)"
         pip_extra_args = ["--no-binary", "llama-cpp-python"]
     elif gpu.vendor == "apple":
-        env = {"CMAKE_ARGS": "-DLLAMA_METAL=on"}
-        description = "llama-cpp-python (Metal)"
-        pip_extra_args = ["--no-binary", "llama-cpp-python"]
+        # macOS + Apple Silicon：官方预编译 Metal wheel，免 Xcode/CMake 编译
+        ver = os.environ.get("VULN_SCANNER_LLAMACPP_VERSION", "0.3.34").strip()
+        extra_index_url = "https://abetlen.github.io/llama-cpp-python/whl/metal"
+        description = f"llama-cpp-python {ver} (Metal 预编译)"
+        packages = [f"llama-cpp-python=={ver}"]
+        gpu_probe = (
+            "import llama_cpp; "
+            "print('TRUE' if llama_cpp.llama_supports_gpu_offload() else 'FALSE')"
+        )
+        warning = (
+            "Metal 预编译 wheel 目前提供 cp311/cp312；若当前 Python 版本无对应 wheel，"
+            "安装会失败或回退 CPU 版（安装器会探测并报错）。建议使用 Python 3.11/3.12，"
+            "或设置 VULN_SCANNER_LLAMACPP_SOURCE_BUILD=1 源码编译（需 Xcode Command Line Tools）。"
+        )
     elif gpu.vendor == "amd" and platform_info.os_name == "linux":
         env = {"CMAKE_ARGS": "-DGGML_HIP=ON"}
         description = "llama-cpp-python (ROCm)"
         pip_extra_args = ["--no-binary", "llama-cpp-python"]
+    elif gpu.vendor == "amd":
+        warning = (
+            "Windows + AMD GPU：llama-cpp-python 的 PyPI 预编译包是 CPU 版，将按 CPU 安装。"
+            "如需 GPU 加速：优先用 Ollama（原生支持 ROCm）；或设置 "
+            "VULN_SCANNER_LLAMACPP_CMAKE_ARGS=\"-DGGML_VULKAN=on\" 并设 "
+            "VULN_SCANNER_LLAMACPP_SOURCE_BUILD=1 源码编译（需安装 Vulkan SDK 与长路径支持）。"
+        )
 
-    # Windows AMD / CPU：使用 PyPI 预编译 wheel，不额外传 CMAKE_ARGS
     return [InstallSpec(
         description=description,
-        packages=["llama-cpp-python"],
+        packages=packages,
+        extra_index_url=extra_index_url,
         env=env,
         pip_extra_args=pip_extra_args,
         check_modules=["llama_cpp"],
+        warning=warning,
+        gpu_probe=gpu_probe,
     )]
 
 
 def _vllm_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable: str) -> List[InstallSpec]:
-    """vllm 后端：torch + vllm。vLLM 自带对 CUDA 的依赖，常以一个巨型 wheel 安装。
+    """vllm 后端：按平台 + GPU 系别选择最合适的安装方式。
 
-    说明：
-    - vLLM 官方仅正式支持 NVIDIA CUDA 与 Apple Silicon（Metal）；AMD ROCm 属实验性。
-    - 为避免与 transformers 的 torch 构建冲突，这里不重复定义 torch 专用 spec，
-      由 vllm 的依赖自动解析 torch（vllm>=0.9 要求 torch>=2.5，与其解算的最小版本一致）。
+    vLLM 官方只完整支持 Linux（Windows 需 WSL2）；GPU 支持 NVIDIA CUDA、
+    AMD ROCm（实验性）与 Intel XPU。Windows 原生 / macOS / 纯 CPU 均无法
+    直接安装使用，默认拦截并给出替代方案，用户可设置 VULN_SCANNER_FORCE_VLLM=1 强制尝试。
     """
     platform_label = {
         "windows": "Windows", "linux": "Linux", "darwin": "macOS"
     }.get(platform_info.os_name, platform_info.os_name)
     gpu_label = gpu.vendor.upper() if gpu.vendor else "CPU"
+    force = os.environ.get("VULN_SCANNER_FORCE_VLLM", "").strip() == "1"
 
     warning: Optional[str] = None
-    if gpu.vendor == "apple":
-        warning = (
-            "vLLM 在 Apple Silicon 上支持 Metal，但安装与运行限制较多；"
-            "若失败可改用 llamacpp（Metal）或 ollama 后端。"
+    blocked = False
+    blocked_message = ""
+
+    # 1) 原生 Windows：vLLM 官方不支持，直接拦截（避免下载数 GB 后安装失败）
+    if platform_info.os_name == "windows":
+        blocked = not force
+        blocked_message = (
+            "vLLM 官方不支持原生 Windows（仅支持 Linux / WSL2），"
+            "在 Windows 上直接 pip install vllm 会安装失败或无法运行。"
+            "建议改用 Ollama / LlamaCPP 后端，或在 WSL2 / Linux 中运行本项目。"
         )
-    elif gpu.vendor == "amd":
-        warning = (
-            f"{platform_label} + {gpu_label} 的 vLLM/ROCm 支持属实验性，"
-            "安装与运行可能失败；建议优先 ollama（ROCm 支持最成熟）。"
+        warning = "如仍要强制尝试（不保证可用），请设置 VULN_SCANNER_FORCE_VLLM=1。"
+
+    # 2) Apple Silicon / macOS：官方不完整支持，默认拦截
+    elif gpu.vendor == "apple":
+        blocked = not force
+        blocked_message = (
+            "vLLM 官方仅完整支持 Linux；macOS 上即使安装也无法运行预编译内核"
+            "（MPS 属实验性，另有社区 vllm-metal 插件）。"
+            "建议 Apple Silicon 用户改用 LlamaCPP（Metal）或 Ollama 后端。"
         )
+        warning = "如仍要强制尝试（不保证可用），请设置 VULN_SCANNER_FORCE_VLLM=1。"
+
+    # 3) 纯 CPU / 未识别 GPU（含 Intel 常规核显）：vLLM 无法高效运行，默认拦截
     elif gpu.vendor is None:
+        blocked = not force
+        blocked_message = (
+            "未检测到受 vLLM 支持的 GPU（需要 Linux + NVIDIA CUDA / AMD ROCm / Intel XPU）。"
+            "纯 CPU 上 vLLM 无法高效运行，建议改用 Ollama 或 LlamaCPP 后端。"
+        )
+        warning = "如仍要强制尝试（不保证可用），请设置 VULN_SCANNER_FORCE_VLLM=1。"
+
+    # 4) NVIDIA + Linux：官方 PyPI CUDA 轮子
+    elif gpu.vendor == "nvidia":
         warning = (
-            "未检测到 NVIDIA GPU：vLLM 在纯 CPU 上无法高效运行，"
-            "强烈建议改用 ollama / llamacpp（支持 CPU）后端。"
+            "vLLM 官方 Linux 轮子基于 CUDA 12.8+，要求 NVIDIA 驱动支持对应 CUDA 版本；"
+            "如需其它 CUDA 版本可从源码构建。"
+        )
+
+    # 5) AMD + Linux：使用官方 ROCm 专用 wheel 索引
+    elif gpu.vendor == "amd":
+        rocm_version = os.environ.get("VULN_SCANNER_VLLM_VERSION", "").strip()
+        rocm_index = os.environ.get("VULN_SCANNER_VLLM_ROCM_INDEX", "").strip()
+        if not (rocm_version and rocm_index):
+            # 默认取官方文档中已验证的 ROCm 7.0 wheel；高级用户可用环境变量覆盖
+            rocm_version = "0.18.0+rocm700"
+            rocm_index = "https://wheels.vllm.ai/rocm/0.18.0/rocm700"
+        return [InstallSpec(
+            description=f"vLLM (ROCm {rocm_version}, Linux)",
+            packages=[f"vllm=={rocm_version}"],
+            extra_index_url=rocm_index,
+            check_modules=["vllm"],
+            warning=(
+                "AMD ROCm 版 vLLM 需 ROCm 6.3+/7.0 驱动（MI200/MI300/RX7900/RX9000 等），"
+                "安装与运行属实验性。若版本不匹配，可设置 VULN_SCANNER_VLLM_VERSION 与 "
+                "VULN_SCANNER_VLLM_ROCM_INDEX 指定官方 wheel；或改用 Ollama（ROCm 支持更成熟）。"
+            ),
+        )]
+
+    else:
+        warning = (
+            f"{platform_label} + {gpu_label} 的 vLLM 支持不明确，安装可能失败；"
+            "建议改用 Ollama / LlamaCPP。"
         )
 
     return [InstallSpec(
-        description=f"vLLM ({platform_label})",
-        packages=["vllm"],
+        description=f"vLLM ({platform_label} {gpu_label})",
+        packages=["vllm"] if not blocked else [],
         check_modules=["vllm"],
         warning=warning,
+        blocked=blocked,
+        blocked_message=blocked_message,
     )]
 
 
@@ -774,6 +916,99 @@ def check_module_installed(module: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _installed_package_version(python_executable: str, package: str) -> str:
+    """在目标解释器中读取已安装包的版本号（用于校验预编译 GPU wheel 是否真的装上）。"""
+    try:
+        code = (
+            "import importlib.metadata as m; "
+            f"print(m.version({package!r}))"
+        )
+        r = subprocess.run(
+            [python_executable, "-c", code],
+            capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
+        )
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _probe_gpu_support(python_executable: str, code: str) -> bool:
+    """在目标解释器中运行 GPU 能力探测代码，stdout 为 TRUE 表示 GPU 后端可用。"""
+    try:
+        r = subprocess.run(
+            [python_executable, "-c", code],
+            capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace",
+        )
+        return r.returncode == 0 and "TRUE" in r.stdout.upper()
+    except Exception:
+        return False
+
+
+def _spec_package_name(spec: InstallSpec) -> str:
+    """从安装包描述中提取 pip 包名（去掉 ==/>= 等版本约束）。"""
+    name = spec.packages[0].split("==")[0].split(">=")[0].split("<")[0].strip()
+    return name
+
+
+def _parse_requirement(req: str) -> tuple[str, Optional[str], Optional[str]]:
+    """解析 pip 包要求："pkg" / "pkg>=1.2" / "pkg==1.2" → (包名, 最低版本, 精确版本)。"""
+    name = req.strip()
+    min_version: Optional[str] = None
+    exact_version: Optional[str] = None
+    for op in (">=", "=="):
+        if op in name:
+            parts = name.split(op, 1)
+            name = parts[0].strip()
+            ver = parts[1].strip()
+            if op == "==":
+                exact_version = ver
+            else:
+                min_version = ver
+            break
+    return name, min_version, exact_version
+
+
+def _spec_status(
+    spec: InstallSpec,
+    python_executable: str,
+    torch_mismatch: bool,
+) -> tuple[str, str]:
+    """判断一条依赖规格的当前状态。
+
+    Returns:
+        (status, reason)，status 取值：
+            - "ok"       已安装且版本/构建匹配
+            - "missing"  未安装
+            - "outdated" 已安装但版本低于要求（pip --upgrade 即可）
+            - "mismatch" 已安装但版本/GPU 构建不匹配（需先卸载再重装）
+    """
+    if torch_mismatch and spec.check_modules == ["torch"]:
+        return "mismatch", "torch 构建与当前硬件不匹配"
+
+    for req in spec.packages:
+        name, min_version, exact_version = _parse_requirement(req)
+        ver = _package_version(python_executable, name)
+        if ver is None:
+            return "missing", f"{name} 未安装"
+        if exact_version and ver != exact_version:
+            return "mismatch", f"{name} 已装 {ver}，目标版本 {exact_version}"
+        if min_version and _version_lt(ver, min_version):
+            return "outdated", f"{name} 已装 {ver}，低于要求 {min_version}"
+
+    if spec.version_marker:
+        ver = _installed_package_version(python_executable, _spec_package_name(spec))
+        if spec.version_marker not in ver:
+            return "mismatch", f"版本 {ver or '未知'} 不含 GPU 标记 '{spec.version_marker}'"
+
+    if spec.gpu_probe:
+        if not _probe_gpu_support(python_executable, spec.gpu_probe):
+            return "mismatch", "GPU 探测失败（疑似 CPU-only 版本）"
+
+    return "ok", ""
 
 
 def get_missing_modules(backend: str) -> List[str]:
@@ -1209,12 +1444,29 @@ def install_backend_dependencies(
         True 表示依赖已就绪；False 表示有缺失且安装失败/被取消。
     """
     if auto_confirm is False:
-        # 仅检测模式
-        missing = get_missing_modules(backend)
-        if missing:
-            _emit(f"[检测] {backend} 后端缺少依赖: {', '.join(missing)}", callback)
-            return False
-        _emit(f"[检测] {backend} 后端依赖已就绪", callback)
+        # 仅检测模式：报告缺失 / 过旧 / 不匹配的完整状态
+        python_executable = python_executable or sys.executable
+        platform_info = detect_platform()
+        gpu = detect_gpu(platform_info)
+        specs = get_backend_requirements(backend, platform_info, gpu, python_executable)
+        torch_spec_idx = next(
+            (i for i, s in enumerate(specs) if s.check_modules == ["torch"]), None
+        )
+        torch_mismatch = (
+            torch_spec_idx is not None
+            and torch_needs_reinstall(platform_info, gpu, python_executable)
+        )
+        for spec in specs:
+            if not spec.required:
+                continue
+            if getattr(spec, "blocked", False):
+                _emit(f"[检测] ⛔ {spec.description}：{spec.blocked_message}", callback)
+                return False
+            status, reason = _spec_status(spec, python_executable, torch_mismatch)
+            if status != "ok":
+                _emit(f"[检测] {spec.description} -> {reason}", callback)
+                return False
+        _emit(f"[检测] {backend} 后端依赖已就绪（版本与硬件匹配）", callback)
         return True
 
     python_executable = python_executable or sys.executable
@@ -1224,6 +1476,19 @@ def install_backend_dependencies(
     _emit(f"[依赖安装] 后端: {backend} | 系统: {platform_info.os_name}/{platform_info.arch} | GPU: {gpu.vendor or '无'}", callback)
 
     specs = get_backend_requirements(backend, platform_info, gpu, python_executable)
+
+    # 当前平台/硬件不支持的后端（如 Windows 上的 vLLM）：直接拦截，不触发 pip
+    blocked_specs = [s for s in specs if getattr(s, "blocked", False)]
+    if blocked_specs:
+        for s in blocked_specs:
+            _emit(f"[依赖安装] ⛔ {s.description}", callback)
+            if s.blocked_message:
+                _emit(f"  {s.blocked_message}", callback)
+            if s.warning:
+                _emit(f"  {s.warning}", callback)
+        _emit("[依赖安装] 已取消安装。请更换后端（推荐 ollama / llamacpp），"
+              "或到支持该后端的平台上运行。", callback)
+        return False
 
     # torch 构建必须匹配当前硬件（CUDA/ROCm/CPU）。
     # 之前只检查"torch 是否已 import"，导致 CUDA 版 torch 在 AMD/ROCm 机器上被误判
@@ -1252,21 +1517,19 @@ def install_backend_dependencies(
             callback,
         )
 
-    # 先检查必须 spec 是否已全部就绪
+    # 先检查必须 spec 是否已全部就绪（含版本过旧 / GPU 构建不匹配）
     if not _force_reinstall():
         all_ready = True
         for spec in specs:
             if not spec.required:
                 continue
-            if torch_mismatch and spec.check_modules == ["torch"]:
+            status, reason = _spec_status(spec, python_executable, torch_mismatch)
+            if status != "ok":
                 all_ready = False
-                break
-            missing = [m for m in spec.check_modules if not check_module_installed(m)]
-            if missing:
-                all_ready = False
+                _emit(f"[依赖安装] 检测: {spec.description} -> {reason}", callback)
                 break
         if all_ready:
-            _emit(f"[依赖安装] {backend} 后端依赖已就绪，跳过安装", callback)
+            _emit(f"[依赖安装] {backend} 后端依赖已就绪（版本与硬件匹配），跳过安装", callback)
             return True
 
     if dry_run:
@@ -1319,16 +1582,28 @@ def install_backend_dependencies(
         if not spec.packages:
             continue
 
-        # 若该 spec 的校验模块已全部就绪且未强制重装，则跳过（避免重复下载 torch 等大包）
-        if not _force_reinstall():
-            if torch_mismatch and spec.check_modules == ["torch"]:
-                # torch 已装但构建不匹配硬件：必须重装，不能跳过
-                already_ok = False
-            else:
-                already_ok = all(check_module_installed(m) for m in spec.check_modules)
-            if already_ok:
-                _emit(f"[依赖安装] {spec.description} 已就绪，跳过", callback)
-                continue
+        # 统一检测：缺失 / 版本过旧 / 版本或 GPU 构建不匹配
+        status, reason = _spec_status(spec, python_executable, torch_mismatch)
+        if status == "ok" and not _force_reinstall():
+            _emit(f"[依赖安装] {spec.description} 已就绪且匹配，跳过", callback)
+            continue
+        if status != "ok":
+            _emit(f"[依赖安装] 检测: {spec.description} -> {reason}", callback)
+
+        # 已安装但版本/构建不匹配（或强制重装）时，先卸载旧包再安装。
+        # 同版本 CPU→GPU 替换必须卸载，否则 pip 认为已满足而不覆盖。
+        primary = _spec_package_name(spec)
+        primary_installed = _package_version(python_executable, primary) is not None
+        torch_handled = torch_mismatch and spec.check_modules == ["torch"]
+        skip_clean = os.environ.get("VULN_SCANNER_SKIP_CLEAN", "").strip() == "1"
+        if (
+            primary_installed
+            and spec.cleanup_on_mismatch
+            and not torch_handled
+            and not skip_clean
+            and (status == "mismatch" or _force_reinstall())
+        ):
+            _uninstall_packages(python_executable, [primary], callback)
 
         cmd = _build_pip_cmd(spec, python_executable)
         env = os.environ.copy()
@@ -1351,6 +1626,27 @@ def install_backend_dependencies(
                     break
             else:
                 _emit(f"[依赖安装] ✅ {spec.description} 安装完成", callback)
+                if spec.version_marker:
+                    ver = _installed_package_version(python_executable, _spec_package_name(spec))
+                    if spec.version_marker not in ver:
+                        _emit(
+                            f"[依赖安装] ❌ {spec.description} 安装后版本为 {ver or '未知'}，"
+                            f"未包含 GPU 标记 '{spec.version_marker}'，可能回退到了 CPU wheel",
+                            callback,
+                        )
+                        overall_ok = False
+                        if spec.required:
+                            break
+                if spec.gpu_probe:
+                    if not _probe_gpu_support(python_executable, spec.gpu_probe):
+                        _emit(
+                            f"[依赖安装] ❌ {spec.description} 安装后 GPU 探测失败"
+                            "（llama_supports_gpu_offload()=False），可能回退到了 CPU-only 版本",
+                            callback,
+                        )
+                        overall_ok = False
+                        if spec.required:
+                            break
         except Exception as e:
             _emit(f"[依赖安装] ❌ {spec.description} 安装异常: {e}", callback)
             overall_ok = False
@@ -1359,12 +1655,16 @@ def install_backend_dependencies(
 
     # 二次校验
     if overall_ok:
-        missing = get_missing_modules(backend)
-        if missing:
-            _emit(f"[依赖安装] ❌ 安装后仍无法导入: {', '.join(missing)}", callback)
-            overall_ok = False
-        else:
-            _emit(f"[依赖安装] ✅ {backend} 后端依赖全部就绪", callback)
+        for spec in specs:
+            if not spec.required:
+                continue
+            status, reason = _spec_status(spec, python_executable, torch_mismatch)
+            if status != "ok":
+                _emit(f"[依赖安装] ❌ 安装后校验失败: {spec.description} -> {reason}", callback)
+                overall_ok = False
+                break
+        if overall_ok:
+            _emit(f"[依赖安装] ✅ {backend} 后端依赖全部就绪（版本与硬件匹配）", callback)
     else:
         _emit(f"[依赖安装] 部分依赖安装失败，可尝试：", callback)
         _emit(f"  1. 设置 VULN_SCANNER_AUTO_INSTALL_DEPS=0 后手动安装", callback)

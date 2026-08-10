@@ -71,6 +71,9 @@ from graduation_project.paths import (
     resolve_base_model_path,
     find_project_root,
     local_hf_model_dir,
+    local_vllm_model_dir,
+    llamacpp_dir,
+    ollama_models_dir,
 )
 
 # ---------------------------------------------------------------------------
@@ -441,6 +444,15 @@ def _build_backend_info() -> dict:
                 "这会把原本 FP16 的 LoRA 增量再次量化，导致真实 CVE-fix 召回从 HF 管道的 0.95 掉到约 0.75~0.79。"
             ),
         })
+        info["detection_method"] = (
+            "请求 Ollama 服务 /api/tags 获取已安装模型列表，并与注册表 full_name 精确比对"
+            "（自动去掉 :latest）；服务不可达或列表中无当前模型即判为未就绪。"
+        )
+        info["download_method"] = (
+            "点击「拉取」调用 Ollama /api/pull 下载到 OLLAMA_MODELS 目录（当前 "
+            f"{ollama_models_dir()}），支持断点续传；已安装模型可切换或删除。"
+        )
+        info["model_store"] = str(ollama_models_dir())
 
     elif backend == "transformers":
         adapter = resolve_adapter_path(getattr(client, "adapter", ""))
@@ -477,6 +489,18 @@ def _build_backend_info() -> dict:
                 "只压缩基座，不压缩 LoRA，复现了 G0 冻结集 95% CVE-fix recall 的管道。"
             ),
         })
+        info["detection_method"] = (
+            "检查本地基座目录 "
+            f"{local_hf_model_dir(model_id)} "
+            "是否含 config.json 且权重分片齐全，并校验 LoRA adapter 目录；"
+            "模型已加载进内存则直接视为就绪。"
+        )
+        info["download_method"] = (
+            f"点击「下载」经 {HF_MIRROR} 镜像逐文件下载到 "
+            f"{local_hf_model_dir(model_id)}（约 16GB，支持断点续传）；"
+            "下载完成自动后台加载，首次扫描即可用。"
+        )
+        info["model_store"] = str(local_hf_model_dir(model_id))
         # 模型未下载时给出下载提示
         if model_available is False:
             info["download_hint"] = (
@@ -516,12 +540,26 @@ def _build_backend_info() -> dict:
                 "速度优于 transformers，但量化/反量化细节与 transformers 不同，召回需单独验证。"
             ),
         })
+        info["detection_method"] = (
+            "检查 VULN_SCANNER_GGUF 指定路径，或自动探测 "
+            f"{llamacpp_dir()} 下是否存在 *.gguf 文件；文件存在即就绪。"
+        )
+        info["download_method"] = (
+            f"点击「下载」输入 GGUF URL（GitHub 链接自动加 ghproxy 镜像）下载到 "
+            f"{llamacpp_dir()}；下载完成自动绑定当前后端，首次扫描即可加载。"
+        )
+        info["model_store"] = str(llamacpp_dir())
         if model_available is False:
-            info["download_hint"] = f"GGUF 文件不存在：{base_gguf or '未配置'}，请下载后设置 VULN_SCANNER_GGUF 环境变量。"
+            info["download_hint"] = (
+                f"GGUF 文件不存在：{base_gguf or '未配置'}。"
+                "可在「设置 → 模型管理」输入 GGUF URL 下载到 "
+                f"{llamacpp_dir()}，下载完成自动绑定；或设置 VULN_SCANNER_GGUF 后重启后端。"
+            )
 
     elif backend == "vllm":
         model = getattr(client, "model", os.environ.get("VULN_SCANNER_MODEL", ""))
         base_url = os.environ.get("VULN_SCANNER_VLLM_URL", "http://localhost:8000")
+        vllm_model_id = os.environ.get("VULN_SCANNER_VLLM_MODEL_ID", "Qwen/Qwen3-8B-AWQ")
         # 由 GGUF / AWQ / GPTQ 权重文件名推断量化位宽（仅供参考，实际由 vLLM 服务加载决定）
         q_label = "AWQ/GPTQ 4bit（常见）"
         info.update({
@@ -536,13 +574,25 @@ def _build_backend_info() -> dict:
             "precision_note": (
                 "vLLM 通过 OpenAI 兼容 API 提供高吞吐推理（PagedAttention + continuous batching）。"
                 "基座可用 AWQ/GPTQ 4bit 量化以适配 8GB 显存，LoRA 通过 --enable-lora 在运行时以 FP16 叠加。"
-                "需先用 app/launcher/vllm_server.py 启动服务。"
+                "需先用 app/launcher/vllm_server.py 启动服务（vLLM 仅支持 Linux/WSL2，Windows 原生不可用）。"
             ),
         })
+        info["detection_method"] = (
+            f"探测 {base_url}/v1/models 是否可访问，并检查服务已加载的模型列表；"
+            "服务不可达或未加载任何模型即判为未就绪。"
+        )
+        info["download_method"] = (
+            f"点击「下载基座」经 {HF_MIRROR} 镜像下载 AWQ/GPTQ 量化基座到 "
+            f"{local_vllm_model_dir(vllm_model_id)}；"
+            "之后用 app/launcher/vllm_server.py 启动服务加载。"
+        )
+        info["model_store"] = str(local_vllm_model_dir(vllm_model_id))
         if model_available is False:
             info["download_hint"] = (
-                f"vLLM 服务未运行或未加载模型。请先用 app/launcher/vllm_server.py "
-                f"启动服务（默认 {base_url}，--served-model-name 需与当前模型 {model or '设置 VULN_SCANNER_MODEL'} 一致）。"
+                f"vLLM 服务未运行或未加载模型。可在「设置 → 模型管理」先下载 AWQ 基座到 "
+                f"{local_vllm_model_dir(vllm_model_id)}，再用 app/launcher/vllm_server.py "
+                f"启动服务（默认 {base_url}，--served-model-name 需与当前模型 "
+                f"{model or '设置 VULN_SCANNER_MODEL'} 一致）。"
             )
 
     else:
@@ -597,7 +647,7 @@ def backend_options():
                 "recommended": False,
                 "precision_summary": "Q4 GGUF + 运行时 FP16 LoRA",
                 "pros": "llama.cpp 内核快，LoRA 精度保留",
-                "cons": "实验性，ROCm/Metal 需自行编译 llama-cpp-python",
+                "cons": "GPU 需源码编译（CUDA/Metal/ROCm）；Windows AMD 默认 CPU 预编译包",
             },
             {
                 "id": "vllm",
@@ -605,7 +655,7 @@ def backend_options():
                 "recommended": False,
                 "precision_summary": "AWQ/GPTQ 4bit 基座 + FP16 LoRA",
                 "pros": "PagedAttention/continuous batching，高吞吐批量推理",
-                "cons": "需单独启动 vLLM 服务进程，显存占用高",
+                "cons": "仅 Linux/WSL2 可用；Windows/macOS 原生不可用；需 NVIDIA/AMD(ROCm)/Intel GPU",
             },
         ],
     }
@@ -1233,8 +1283,12 @@ class ModelActionRequest(BaseModel):
 
 
 class HfDownloadRequest(BaseModel):
-    """HuggingFace 基座模型下载请求（transformers 后端）。"""
+    """HuggingFace 基座模型下载请求（transformers / vllm 后端）。
+
+    backend: "transformers" → models/transformers/<名称>；"vllm" → models/vllm/<名称>。
+    """
     model_id: str = Field(..., description="HuggingFace 模型 ID，如 Qwen/Qwen3-8B")
+    backend: str = Field("transformers", description="目标后端：transformers / vllm")
 
 
 class GgufDownloadRequest(BaseModel):
@@ -1479,7 +1533,7 @@ def models_local_resources():
             "status": status,
             "description": "Q4 GGUF 基座文件",
             "download_endpoint": "/api/models/download-gguf",
-            "download_path": str(_models_dir() / "ollama"),
+            "download_path": str(llamacpp_dir()),
             "default_url": gguf_url,
         })
         adapter = resolve_adapter_path(getattr(client, "adapter", ""))
@@ -1491,18 +1545,25 @@ def models_local_resources():
         })
 
     elif cls_name == "VLLMClient":
-        # vLLM 是独立服务进程，模型在服务端加载。这里只报告服务连接与模型状态，
-        # 不提供下载端点（模型由 vllm_server.py 的 --model 指向的本地路径/AWQ 目录提供）。
+        # vLLM 是独立服务进程，模型在服务端加载。这里报告服务连接状态，并
+        # 提供 AWQ/GPTQ 基座下载到项目 models/vllm/（与 transformers 对齐）。
         public = getattr(client, "base_url", "") or os.environ.get("VULN_SCANNER_VLLM_URL", "http://localhost:8000")
         available, status = _detect_model_available("vllm", client)
+        # 默认基座（AWQ 量化版，与 transformers 的 Qwen3-8B 同源、不同量化策略）
+        vllm_model_id = os.environ.get("VULN_SCANNER_VLLM_MODEL_ID", "Qwen/Qwen3-8B-AWQ")
+        vllm_dir = local_vllm_model_dir(vllm_model_id)
         resources.append({
             "type": "vllm_server",
+            "id": vllm_model_id,
             "path": public,
             "available": available,
             "status": status,
-            "description": "vLLM 服务（OpenAI 兼容 API）",
-            "download_endpoint": None,
-            "hint": "用 app/launcher/vllm_server.py 启动服务；--served-model-name 需与当前模型一致",
+            "description": "vLLM 服务（AWQ/GPTQ 4bit 基座 + FP16 LoRA）",
+            "download_endpoint": "/api/models/download-hf",
+            "download_path": str(vllm_dir),
+            "default_model_id": vllm_model_id,
+            "mirror": HF_MIRROR,
+            "hint": "用 app/launcher/vllm_server.py 启动服务；--model 指向 models/vllm/ 下的量化目录，--served-model-name 需与当前模型一致",
         })
 
     return {
@@ -1526,9 +1587,13 @@ async def models_download_hf(req: HfDownloadRequest):
     if not model_id:
         return JSONResponse({"error": "model_id 不能为空"}, status_code=400)
 
-    # 下载目标：项目扁平基座目录 models/transformers/<名称>
-    # （与加载/检测/迁移同一位置，调用路径一致；local_dir 直接写扁平文件，可续传）
-    cache_dir = local_hf_model_dir(model_id)
+    # 下载目标：按后端落到项目 models/ 分类目录（与加载/检测/迁移同一位置，调用路径一致）
+    #   - transformers → models/transformers/<名称>（扁平基座目录，可续传）
+    #   - vllm        → models/vllm/<名称>（AWQ/GPTQ 量化目录，与 transformers 对齐）
+    if (req.backend or "transformers").strip().lower() == "vllm":
+        cache_dir = local_vllm_model_dir(model_id)
+    else:
+        cache_dir = local_hf_model_dir(model_id)
 
     chunk_queue: _q.Queue = _q.Queue()
     done_flag = {"done": False, "result": None, "error": None}
@@ -1627,7 +1692,7 @@ async def models_download_hf(req: HfDownloadRequest):
 
 @app.post("/api/models/download-gguf")
 async def models_download_gguf(req: GgufDownloadRequest):
-    """流式下载 GGUF 文件到 models/ollama/ 目录（NDJSON 进度）。
+    """流式下载 GGUF 文件到项目 models/llamacpp/ 目录（NDJSON 进度）。
 
     对 GitHub URL 自动加 ghproxy 镜像加速。下载完成后需重启后端使配置生效。
     """
@@ -1647,7 +1712,9 @@ async def models_download_gguf(req: GgufDownloadRequest):
     if url.startswith("https://github.com/"):
         url = "https://mirror.ghproxy.com/" + url
 
-    dest_path = _models_dir() / filename
+    dest_dir = llamacpp_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / filename
     chunk_queue: _q.Queue = _q.Queue()
     done_flag = {"done": False, "result": None, "error": None}
 
@@ -1703,10 +1770,26 @@ async def models_download_gguf(req: GgufDownloadRequest):
             yield json.dumps({"status": "error", "error": done_flag["error"]}, ensure_ascii=False) + "\n"
         elif done_flag["result"]:
             r = done_flag["result"]
+            # 与 transformers 下载后自动加载对齐：llamacpp 下载完成直接绑定到当前客户端，
+            # 首次扫描即自动加载，无需重启后端
+            auto_bound = False
+            try:
+                client = scanner.client
+                if type(client).__name__ == "LlamaCppClient":
+                    client.base_gguf = r["dest"]
+                    client.model = r["dest"]
+                    auto_bound = True
+            except Exception:
+                auto_bound = False
+            msg = (
+                f"GGUF 已下载到 {r['dest']} 并已绑定到当前 llamacpp 后端，首次扫描将自动加载"
+                if auto_bound else
+                f"GGUF 已下载到 {r['dest']}，请重启后端以加载（设置 VULN_SCANNER_GGUF={r['dest']}）"
+            )
             yield json.dumps({
                 "status": "success", "completed": True,
                 "dest": r["dest"],
-                "message": f"GGUF 已下载到 {r['dest']}，请重启后端以加载（设置 VULN_SCANNER_GGUF={r['dest']}）",
+                "message": msg,
             }, ensure_ascii=False) + "\n"
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")

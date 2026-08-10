@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -35,6 +36,8 @@ from graduation_project.paths import (
     find_project_root,
     ollama_models_dir,
     hf_home_dir,
+    local_vllm_model_dir,
+    llamacpp_dir,
 )
 from graduation_project.transformers_client import (
     is_transformers_runtime_compatible,
@@ -99,8 +102,17 @@ def migrate_ollama_models_to_project() -> Optional[str]:
                 continue
         except Exception:  # noqa: BLE001
             pass
-        # C 盘不允许出现任何模型文件：有内容（含未下完的 partial）就整体迁移
-        if not any(src.iterdir()):
+        # C 盘不允许出现任何模型文件：有真实模型文件（含未下完的 partial）就整体迁移；
+        # 只有空目录残留（blobs/manifests 空壳）不算内容，顺手清掉即可
+        if not _has_model_files(src):
+            _remove_empty_model_dirs(src)
+            continue
+        # 源目录只剩“项目里已有完整版”的过期 partial / 重复文件时，不提示、不迁移，
+        # 直接清理干净（例如：alpha0 已在项目下完，C 盘只剩它的 partial 残留）
+        if not _needs_migration(src, dst):
+            print(f"[启动器] {src} 只剩项目里已存在的过期/重复文件，正在清理...")
+            _cleanup_redundant_src_files(src, dst)
+            _remove_empty_model_dirs(src)
             continue
 
         # Ollama 正在运行：Windows 上文件被占用，剪切会失败或破坏运行中的服务
@@ -141,34 +153,153 @@ def migrate_ollama_models_to_project() -> Optional[str]:
                 return None
 
         dst.mkdir(parents=True, exist_ok=True)
+        # 迁移前先清掉过期残留（项目已有完整版的 partial），避免无谓跨盘搬运
+        _cleanup_redundant_src_files(src, dst)
         print(f"[启动器] 检测到 Ollama 模型存储 {src}，正在剪切到 {dst} ...")
         try:
-            for item in sorted(src.iterdir()):
-                target = dst / item.name
+            # 逐文件按相对路径镜像搬移（blobs/、manifests/ 子目录结构保持），
+            # 避免“目标已有 blobs 目录就整包跳过”导致 C 盘文件永远搬不走
+            for item in sorted(src.rglob("*")):
+                if not item.is_file() or not item.exists():
+                    continue
+                rel = item.relative_to(src)
+                target = dst / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
                 if target.exists():
-                    print(f"[启动器] {item.name} 已存在于目标目录，跳过")
+                    # 同名文件：内容相同（同大小）视为重复副本，删源；不同则保留源并跳过
+                    try:
+                        same = item.stat().st_size == target.stat().st_size
+                    except OSError:
+                        same = False
+                    if same:
+                        print(f"[启动器] {item.name} 与项目内容相同，删除源副本")
+                        item.unlink()
+                    else:
+                        print(f"[启动器] {item.name} 已存在于目标目录且内容不同，跳过")
                     continue
                 shutil.move(str(item), str(target))
         except Exception as e:  # noqa: BLE001
             print(f"[启动器] Ollama 模型迁移失败: {e}")
             print("  请确认 Ollama 已完全退出后重试。")
             return None
-        try:
-            src.rmdir()  # 内容已全部搬走，移除源目录空壳
-        except OSError:
-            pass
+        _remove_empty_model_dirs(src)  # 内容已全部搬走，清理源目录空壳
         os.environ["OLLAMA_MODELS"] = str(dst)  # 迁移后锁定到项目目录
         print(f"[启动器] ✅ 已剪切 Ollama 模型到 {dst}")
         return str(dst)
     return None
 
 
+def _has_model_files(path: Path) -> bool:
+    """判断目录里是否有真正的模型文件（递归找文件；纯空目录不算内容）。"""
+    try:
+        for p in path.rglob("*"):
+            if p.is_file():
+                return True
+    except Exception:
+        return True  # 无法读取时保守视为有内容，避免误删
+    return False
+
+
+def _needs_migration(src: Path, dst: Path) -> bool:
+    """判断源目录是否还有**真正需要迁移**的内容。
+
+    不需要迁移的情况：
+        - 只有过期 partial（sha256-xxx-partial），而项目里已有完整 sha256-xxx；
+        - 只有与项目内容完全相同（同名且同大小）的重复文件；
+        - 只有空目录。
+    其余情况（未完成的 partial、项目里没有的模型等）都需要迁移。
+    """
+    try:
+        for p in src.rglob("*"):
+            if not p.is_file():
+                continue
+            name = p.name
+            # 源文件在 src 下的相对子目录（如 blobs/...）要镜像到 dst 的相同子目录
+            rel_dir = p.relative_to(src).parent
+            mirrored = dst / rel_dir / name
+            if name.endswith("-partial"):
+                # 项目里已有同名 partial（正在下载/续传）或完整文件时，源文件是冗余残留
+                if mirrored.exists() or (dst / rel_dir / name[: -len("-partial")]).exists():
+                    continue
+                return True
+            if "-partial-" in name:
+                # 分块标记：跟随主 partial 处理；项目里已有完整版则忽略
+                base = name.split("-partial-")[0]
+                if (dst / rel_dir / base).exists() or (dst / rel_dir / (base + "-partial")).exists():
+                    continue
+                return True
+            if mirrored.exists():
+                # 同名完整文件：大小一致视为内容重复，不需要迁移
+                try:
+                    if p.stat().st_size == mirrored.stat().st_size:
+                        continue
+                except OSError:
+                    pass
+            return True
+    except Exception:
+        return True  # 无法读取时保守视为需要迁移
+    return False
+
+
+def _cleanup_redundant_src_files(src: Path, dst: Path) -> None:
+    """清理源目录里项目已存在对应完整版的冗余文件（过期 partial / 重复文件）。"""
+    for item in list(src.rglob("*")):
+        if not item.is_file() or not item.exists():
+            continue
+        name = item.name
+        rel_dir = item.relative_to(src).parent
+        mirrored = dst / rel_dir / name
+        try:
+            if name.endswith("-partial") and (
+                mirrored.exists() or (dst / rel_dir / name[: -len("-partial")]).exists()
+            ):
+                item.unlink()
+                for sibling in (src / rel_dir).glob(name[: -len("-partial")] + "-partial-*"):
+                    try:
+                        sibling.unlink()
+                    except OSError:
+                        pass
+                print(f"[启动器] 已删除过期下载残留 {name}")
+            elif "-partial-" in name and item.is_file():
+                base = name.split("-partial-")[0]
+                if (dst / rel_dir / base).exists() or (dst / rel_dir / (base + "-partial")).exists():
+                    item.unlink()
+                    print(f"[启动器] 已删除过期分块标记 {name}")
+            elif item.is_file() and mirrored.exists():
+                if item.stat().st_size == mirrored.stat().st_size:
+                    item.unlink()
+                    print(f"[启动器] 已删除与项目重复的文件 {name}")
+        except OSError as e:
+            print(f"[启动器] 清理残留失败: {e}（不影响使用，可稍后手动清理）")
+
+
+def _remove_empty_model_dirs(path: Path) -> None:
+    """自底向上删除 path 下的空目录残留（不含任何文件的目录），最后删 path 本身。"""
+    try:
+        for p in sorted(path.rglob("*"), key=lambda x: len(x.parts), reverse=True):
+            if p.is_dir() and not _has_model_files(p):
+                p.rmdir()
+        if path.is_dir() and not _has_model_files(path):
+            path.rmdir()
+    except OSError:
+        pass
+
+
 def _stop_ollama() -> bool:
-    """尝试停止 Ollama 服务（供迁移模型前使用），并轮询确认其真正退出。"""
+    """尝试停止 Ollama（供迁移/接管前使用），并轮询确认其真正退出。
+
+    Windows 必须先结束托盘应用（ollama app.exe）：它会在 serve 被杀后立即
+    重新拉起一个默认存储（~/.ollama/models）的服务并抢占 11434，导致模型
+    下载落到 C 盘。结束 app 后再结束 serve 才能真正接管。
+    """
     try:
         if sys.platform == "win32":
             subprocess.run(
-                ["taskkill", "/IM", "ollama.exe", "/F"],
+                ["taskkill", "/IM", "ollama app.exe", "/T", "/F"],
+                capture_output=True, text=True, timeout=30,
+            )
+            subprocess.run(
+                ["taskkill", "/IM", "ollama.exe", "/T", "/F"],
                 capture_output=True, text=True, timeout=30,
             )
         else:
@@ -195,6 +326,31 @@ def _stop_ollama() -> bool:
         return False
     except Exception:  # noqa: BLE001
         return False
+
+
+def _listening_pid_on(port: int = 11434) -> Optional[str]:
+    """返回占用指定端口的进程 PID（跨平台）。"""
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True, text=True, timeout=5,
+                encoding="utf-8", errors="replace",
+            ).stdout
+            for line in out.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.split()
+                    if parts:
+                        return parts[-1]
+        else:
+            out = subprocess.run(
+                ["lsof", "-ti", f"tcp:{port}"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.split()
+            return out[0] if out else None
+    except Exception:
+        pass
+    return None
 
 
 def _recommend_backend_by_vram() -> tuple[str, str]:
@@ -280,23 +436,26 @@ def select_backend() -> str:
     print(f"  [{reason}]")
     print(f"  推荐: {label_map.get(recommended, recommended)}（按回车直接使用）")
     print("-" * 60)
-    for idx, bid in enumerate(("ollama", "transformers", "llamacpp", "vllm"), start=1):
+    # vLLM 官方仅支持 Linux/WSL2：Windows/macOS 上不提供该选项
+    is_linux = dependency_installer.detect_platform().os_name == "linux"
+    backend_order = ("ollama", "transformers", "llamacpp", "vllm") if is_linux else ("ollama", "transformers", "llamacpp")
+    if not is_linux:
+        print("  [说明] vLLM 仅支持 Linux/WSL2，当前平台已隐藏该选项")
+    for idx, bid in enumerate(backend_order, start=1):
         mark = "  ← 当前" if bid == default_backend else ""
         tag = label_map.get(bid, bid)
         print(f"  [{idx}] {tag:<13}—— {desc[bid]}{mark}")
     print("-" * 60)
     while True:
-        choice = input(f"请选择推理后端（回车=使用 {default_label}，1/2/3/4=切换）: ").strip()
+        choice = input(f"请选择推理后端（回车=使用 {default_label}，1-{len(backend_order)}=切换）: ").strip()
         if choice == "":
             return default_backend
-        if choice == "1":
-            return "ollama"
-        if choice == "2":
-            return "transformers"
-        if choice == "3":
-            return "llamacpp"
-        if choice == "4":
-            return "vllm"
+        try:
+            idx = int(choice)
+            if 1 <= idx <= len(backend_order):
+                return backend_order[idx - 1]
+        except ValueError:
+            pass
         print("[启动器] 无效输入，请重新选择。")
 
 
@@ -345,8 +504,17 @@ def check_inprocess_backend_ready(backend: str) -> bool:
         gguf = os.environ.get("VULN_SCANNER_GGUF", "").strip()
         adapter = resolve_adapter_path()
         if not gguf:
+            # 自动探测 models/llamacpp/ 下的 GGUF（与 llamacpp_client 一致）
+            ld = llamacpp_dir()
+            if ld.is_dir():
+                found = [p for p in sorted(ld.glob("*.gguf")) if p.is_file()]
+                if found:
+                    gguf = str(found[0])
+                    os.environ["VULN_SCANNER_GGUF"] = gguf
+        if not gguf:
             print("[错误] llamacpp 后端需要 VULN_SCANNER_GGUF 指向 Q4 GGUF 文件")
-            print("  示例: set VULN_SCANNER_GGUF=D:\\code\\Graduation-Project\\models\\ollama\\qwen3-8b-q4_k_m.gguf")
+            print(f"  推荐做法：将 GGUF 放到 {llamacpp_dir()}")
+            print(f"  示例: set VULN_SCANNER_GGUF=D:\\code\\Graduation-Project\\models\\llamacpp\\Qwen3-8B-Q4_K_M.gguf")
             ok = False
         elif not Path(gguf).is_file():
             print(f"[错误] GGUF 文件不存在: {gguf}")
@@ -362,9 +530,18 @@ def check_inprocess_backend_ready(backend: str) -> bool:
             os.environ["VULN_SCANNER_ADAPTER"] = adapter
     elif backend == "vllm":
         # vLLM 是独立服务，基座模型由 VULN_SCANNER_VLLM_MODEL 指定（HF id 或本地 AWQ/GPTQ 目录）。
-        # 优先自动探测 models/ 下的量化目录；未探测到时要求显式配置。
+        # 优先自动探测项目 models/vllm/ 下的量化目录（与 transformers 的 models/transformers 对齐）；
+        # 未探测到时要求显式配置。
         model = os.environ.get("VULN_SCANNER_VLLM_MODEL", "").strip()
         if not model:
+            for repo_name in ("Qwen3-8B-AWQ", "Qwen3-8B-GPTQ"):
+                d = local_vllm_model_dir(repo_name)
+                if (d / "config.json").is_file():
+                    model = str(d)
+                    os.environ["VULN_SCANNER_VLLM_MODEL"] = model
+                    break
+        if not model:
+            # 兼容旧布局：models/ 根下的量化目录
             candidates = ["vllm", "awq", "gptq", "Qwen3-8B-AWQ", "Qwen3-8B-GPTQ"]
             for cand in candidates:
                 d = models_dir / cand
@@ -375,8 +552,8 @@ def check_inprocess_backend_ready(backend: str) -> bool:
         if not model:
             print("[错误] vllm 后端需要 VULN_SCANNER_VLLM_MODEL 指向基座模型")
             print("  （HF id 或本地 AWQ/GPTQ 量化目录，需含 config.json）")
-            print(f"  示例: set VULN_SCANNER_VLLM_MODEL=D:\\models\\qwen3-8b-awq")
-            print(f"  或将量化目录放到 {models_dir}\\vllm")
+            print(f"  示例: set VULN_SCANNER_VLLM_MODEL=D:\\code\\Graduation-Project\\models\\vllm\\Qwen3-8B-AWQ")
+            print(f"  或将量化目录放到 {models_dir}\\vllm（设置页可下载 Qwen/Qwen3-8B-AWQ）")
             ok = False
         elif not (model.startswith("/") or ":" in model or "\\" in model or "." in model):
             # 看起来很可能是 HF id（如 Qwen/Qwen3-8B-AWQ），无需本地校验
@@ -488,6 +665,66 @@ def kill_process_on_port(port: int) -> bool:
 def check_ollama_installed() -> bool:
     """检测系统是否安装 Ollama。"""
     return shutil.which("ollama") is not None
+
+
+def _ollama_version() -> Optional[str]:
+    """读取 Ollama 版本号（如 '0.5.7'）；读取失败返回 None。"""
+    try:
+        r = subprocess.run(
+            ["ollama", "--version"],
+            capture_output=True, text=True, timeout=15,
+            encoding="utf-8", errors="replace",
+        )
+        if r.returncode != 0:
+            return None
+        m = re.search(r"(\d+\.\d+(?:\.\d+)?)", r.stdout + r.stderr)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _maybe_upgrade_ollama() -> None:
+    """检测 Ollama 版本是否过旧，过旧时提示并（交互式确认后）自动升级。
+
+    Ollama 0.30+ 才支持 Qwen3/QwQ 等模型的 think 参数；过旧版本会导致
+    这类模型的 response 为空或行为异常，因此启动时做一次版本检查。
+    """
+    ver = _ollama_version()
+    if not ver:
+        print("[启动器] 无法读取 Ollama 版本号（跳过版本检查）")
+        return
+    print(f"[启动器] Ollama 版本: {ver}")
+    if not dependency_installer._version_lt(ver, "0.30"):
+        return
+    print(f"[启动器] ⚠ Ollama {ver} 版本过旧：0.30+ 才支持 Qwen3 等模型的 think 参数。")
+    if not sys.stdin.isatty():
+        print("[启动器] 非交互环境，跳过自动升级；可手动执行 winget upgrade Ollama.Ollama")
+        return
+    try:
+        ans = input("[启动器] 是否自动升级 Ollama？[Y/n]: ").strip().lower()
+    except EOFError:
+        return
+    if ans in ("n", "no"):
+        print("[启动器] 跳过升级，继续启动（旧版可能影响 Qwen3 系列模型）")
+        return
+    print("[启动器] 正在升级 Ollama...")
+    try:
+        if sys.platform == "win32" and shutil.which("winget"):
+            subprocess.run(
+                ["winget", "upgrade", "Ollama.Ollama",
+                 "--accept-source-agreements", "--accept-package-agreements"],
+                timeout=1800,
+            )
+        elif sys.platform == "darwin" and shutil.which("brew"):
+            subprocess.run(["brew", "upgrade", "ollama"], timeout=1800)
+        else:
+            print("[启动器] 当前平台暂不支持自动升级，请手动升级：https://ollama.com/download")
+            return
+        print("[启动器] Ollama 升级完成，请重新运行本启动器以让新版本生效")
+    except subprocess.TimeoutExpired:
+        print("[启动器] Ollama 升级超时，请稍后重试或手动升级")
+    except Exception as e:
+        print(f"[启动器] Ollama 升级失败: {e}")
 
 
 def try_install_ollama() -> bool:
@@ -625,22 +862,30 @@ def ensure_ollama_running() -> bool:
             print("         或设置 VULN_SCANNER_KEEP_EXTERNAL_OLLAMA=1 直接复用现有服务。")
             return False
 
-    # 启动我们自己的 serve（继承本进程 OLLAMA_MODELS=项目目录）
-    print(f"[启动器] 启动 Ollama（模型存储: {want}）...")
-    try:
-        if sys.platform == "win32":
-            subprocess.Popen(
-                ["ollama", "serve"],
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        else:
-            subprocess.Popen(
-                ["ollama", "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+    # 启动我们自己的 serve（继承本进程 OLLAMA_MODELS=项目目录）。
+    # Windows 上必须确认 11434 由我们启动的进程监听：Ollama 桌面版（ollama app.exe）
+    # 会在 serve 被杀后立即重启默认存储的服务抢占端口，导致 pull 写到 C 盘。
+    for attempt in range(2):
+        print(f"[启动器] 启动 Ollama（模型存储: {want}）...")
+        try:
+            if sys.platform == "win32":
+                proc = subprocess.Popen(
+                    ["ollama", "serve"],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                proc = subprocess.Popen(
+                    ["ollama", "serve"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"[启动器] 启动 Ollama 失败: {e}")
+            return False
+
+        ok = False
         for _ in range(12):
             time.sleep(0.5)
             try:
@@ -650,13 +895,22 @@ def ensure_ollama_running() -> bool:
                     proxies={"http": None, "https": None},
                 )
                 if r.status_code == 200:
-                    return True
+                    pid = _listening_pid_on()
+                    if proc.poll() is None and pid is not None and str(proc.pid) == str(pid):
+                        ok = True
+                    break
             except Exception:  # noqa: BLE001
                 pass
-        return False
-    except Exception as e:  # noqa: BLE001
-        print(f"[启动器] 启动 Ollama 失败: {e}")
-        return False
+        if ok:
+            return True
+        # 端口被桌面版抢占：结束 app + serve 后重试一次
+        print("[启动器] 检测到 Ollama 桌面版抢占 11434（会导致模型落到 C 盘），正在结束桌面版后重试...")
+        _stop_ollama()
+
+    print("[启动器] 无法接管 Ollama：桌面版会自动重启并占用 11434。")
+    print("         请退出托盘中的 Ollama（右击图标 → Quit）后重新运行本启动器；")
+    print("         或设置 VULN_SCANNER_KEEP_EXTERNAL_OLLAMA=1 复用外部服务（模型会存到 C 盘）。")
+    return False
 
 
 def list_ollama_models() -> list[str]:
@@ -1297,6 +1551,7 @@ def main():
             return
 
         print("[2/5] Ollama 服务已运行")
+        _maybe_upgrade_ollama()
     else:
         # 进程内后端（transformers/llamacpp）与独立服务后端（vllm）：不依赖 Ollama，
         # 自动安装依赖并校验配置。自动识别匹配当前硬件（CUDA/ROCm）的 python 环境并

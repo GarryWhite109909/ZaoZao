@@ -35,7 +35,7 @@ from typing import Dict, List, Optional, Union
 
 from graduation_project.prompts import build_user_prompt
 from graduation_project.schema import parse_verdict, normalize_has_vulnerability
-from graduation_project.paths import resolve_adapter_path
+from graduation_project.paths import resolve_adapter_path, llamacpp_dir
 
 _LLAMA = None  # 延迟导入 llama_cpp
 
@@ -77,7 +77,7 @@ class LlamaCppClient:
         gpu_layers: int = -1,
         verbose: bool = False,
     ):
-        self.base_gguf = base_gguf or os.environ.get("VULN_SCANNER_GGUF", "")
+        self.base_gguf = base_gguf or os.environ.get("VULN_SCANNER_GGUF", "") or self._discover_gguf()
         self.adapter = resolve_adapter_path(adapter)
         self.num_ctx = int(os.environ.get("VULN_SCANNER_NUM_CTX", str(num_ctx)))
         self.gpu_layers = int(os.environ.get("VULN_SCANNER_GPU_LAYERS", str(gpu_layers)))
@@ -86,6 +86,28 @@ class LlamaCppClient:
         self._llm = None
         self._gen_lock = threading.Lock()
         self._load_error: Optional[str] = None
+
+    @staticmethod
+    def _discover_gguf() -> str:
+        """自动探测项目 models/llamacpp/ 下的 GGUF 基座文件（未设置 VULN_SCANNER_GGUF 时）。
+
+        与 transformers 的 models/transformers、vLLM 的 models/vllm 对齐，
+        GGUF 统一放 models/llamacpp/。多个文件时优先 Q4 量化。
+        """
+        d = llamacpp_dir()
+        if not d.is_dir():
+            return ""
+        gguFs = sorted(d.glob("*.gguf"))
+        if not gguFs:
+            return ""
+        # 优先 Q4，其次 Q5/Q6/Q8，最后任意
+        def _prio(p: Path) -> int:
+            low = p.name.lower()
+            for i, q in enumerate(("q8", "q6", "q5", "q4")):
+                if q in low:
+                    return i
+            return len(("q8", "q6", "q5", "q4"))
+        return str(sorted(gguFs, key=_prio)[0])
 
     # ------------------------------------------------------------------
     # 加载与生命周期

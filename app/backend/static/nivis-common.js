@@ -515,7 +515,7 @@
       var hintLine = r.hint ? '<div class="text-[11px] mt-0.5" style="color: var(--vuln-state-warning)">' + this.esc(r.hint) + '</div>' : '';
       var statusLine = r.status ? '<div class="text-[11px] mt-0.5" style="color: var(--vuln-ink-2)">' + this.esc(r.status) + '</div>' : '';
 
-      /* 下载按钮区：只有 huggingface / gguf 类型且未就绪时显示下载按钮；adapter / vllm_server 不可下载 */
+      /* 下载按钮区：huggingface / gguf / vllm_server（有 download_endpoint）且未就绪时显示下载按钮；adapter 不可下载 */
       var btnArea;
       var prog = this._dlProgress[rid];
       var isPulling = !!this._dlPulling[rid];
@@ -524,9 +524,18 @@
           ? '<span class="text-xs" style="color: var(--vuln-ink-3)">训练产物</span>'
           : '<span class="text-xs" style="color: var(--vuln-state-warning)">未找到</span>';
       } else if (r.type === 'vllm_server') {
-        btnArea = available
-          ? '<span class="text-xs" style="color: var(--vuln-state-success)">✓ 已连接</span>'
-          : '<span class="text-xs" style="color: var(--vuln-state-warning)">未连接</span>';
+        if (available) {
+          btnArea = '<span class="text-xs" style="color: var(--vuln-state-success)">✓ 已连接</span>';
+        } else if (isPulling) {
+          var p2 = prog || { pct: 0, status: '准备下载…' };
+          btnArea = this.renderProgress(p2.pct, p2.status, false);
+        } else if (prog && prog.error) {
+          btnArea = '<button data-dl-retry="' + this.esc(rid) + '" class="text-xs px-2.5 py-1 rounded-md transition-colors hover:opacity-80" style="background: var(--vuln-brand); color: #fff">重试</button>';
+        } else if (r.download_endpoint) {
+          btnArea = '<button data-dl-start="' + this.esc(rid) + '" class="text-xs px-2.5 py-1 rounded-md transition-colors hover:opacity-80" style="background: var(--vuln-brand); color: #fff">下载基座</button>';
+        } else {
+          btnArea = '<span class="text-xs" style="color: var(--vuln-state-warning)">未连接</span>';
+        }
       } else if (available) {
         btnArea = '<span class="text-xs" style="color: var(--vuln-state-success)">✓ 已就绪</span>';
       } else if (isPulling) {
@@ -534,6 +543,11 @@
         btnArea = this.renderProgress(p.pct, p.status, false);
       } else if (prog && prog.error) {
         btnArea = '<button data-dl-retry="' + this.esc(rid) + '" class="text-xs px-2.5 py-1 rounded-md transition-colors hover:opacity-80" style="background: var(--vuln-brand); color: #fff">重试</button>';
+      } else if (r.type === 'gguf' && r.download_endpoint) {
+        btnArea = '<div class="flex flex-col items-end gap-1.5">' +
+          '<input type="text" data-gguf-url="' + this.esc(rid) + '" placeholder="GGUF 下载 URL" value="' + (r.default_url ? this.esc(r.default_url) : '') + '" class="w-full text-[11px] px-2 py-1 rounded-md font-mono" style="background: var(--vuln-surface); border: 1px solid var(--vuln-line); color: var(--vuln-ink-2); outline: none;">' +
+          '<button data-dl-start="' + this.esc(rid) + '" class="text-xs px-2.5 py-1 rounded-md transition-colors hover:opacity-80 whitespace-nowrap" style="background: var(--vuln-brand); color: #fff">下载 GGUF</button>' +
+        '</div>';
       } else {
         btnArea = '<button data-dl-start="' + this.esc(rid) + '" class="text-xs px-2.5 py-1 rounded-md transition-colors hover:opacity-80" style="background: var(--vuln-brand); color: #fff">下载</button>';
       }
@@ -542,6 +556,7 @@
       var dlPath = r.download_path ? '<div class="text-[11px] mt-0.5 font-mono" style="color: var(--vuln-ink-3)">下载到: ' + this.esc(r.download_path) + '</div>' : '';
       var mirrorTag = r.mirror ? '<div class="text-[11px] mt-0.5" style="color: var(--vuln-ink-3)">镜像: ' + this.esc(r.mirror) + '</div>' : '';
       var errLine = (prog && prog.error) ? '<div class="text-[11px] mt-1" style="color: var(--vuln-state-error)">' + this.esc(prog.error) + '</div>' : '';
+      var actionsWidth = r.type === 'gguf' ? 'w-[240px]' : 'w-[120px]';
 
       return '<div class="p-3 rounded-lg" style="background: var(--vuln-surface-2);">' +
         '<div class="flex items-start justify-between gap-2">' +
@@ -551,7 +566,7 @@
             (desc ? '<div class="text-[11px] mt-0.5" style="color: var(--vuln-ink-3)">' + this.esc(desc) + '</div>' : '') +
             hintLine + statusLine + dlPath + mirrorTag + errLine +
           '</div>' +
-          '<div class="flex-shrink-0 w-[120px] flex items-start justify-end">' + btnArea + '</div>' +
+          '<div class="flex-shrink-0 ' + actionsWidth + ' flex items-start justify-end">' + btnArea + '</div>' +
         '</div>' +
       '</div>';
     },
@@ -568,6 +583,16 @@
         if (btn.__nivisBound) return; btn.__nivisBound = true;
         btn.addEventListener('click', function () { self.startResourceDownload(btn.getAttribute('data-dl-retry')); });
       });
+      drawer.querySelectorAll('input[data-gguf-url]').forEach(function (inp) {
+        if (inp.__nivisBound) return; inp.__nivisBound = true;
+        inp.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') {
+            var row = inp.closest('.p-3');
+            var btn = row && row.querySelector('[data-dl-start]');
+            if (btn) btn.click();
+          }
+        });
+      });
     },
 
     /* 解析 rid（hf:model_id / gguf:path），找到对应资源并启动下载 */
@@ -580,14 +605,24 @@
         res = resources.filter(function (r) { return r.type === 'huggingface' && r.id === id; })[0];
       } else if (rid.indexOf('gguf:') === 0) {
         res = resources.filter(function (r) { return r.type === 'gguf'; })[0];
+      } else if (rid.indexOf('vllm:') === 0) {
+        res = resources.filter(function (r) { return r.type === 'vllm_server'; })[0];
       }
       if (!res) { this.toast('未找到对应资源', true); return; }
 
       if (res.type === 'huggingface') {
-        this.streamDownload(rid, '/api/models/download-hf', { model_id: res.id });
+        this.streamDownload(rid, '/api/models/download-hf', { model_id: res.id, backend: 'transformers' });
+      } else if (res.type === 'vllm_server') {
+        /* vLLM 基座：下载 AWQ 量化模型到项目 models/vllm/ */
+        var mid = res.default_model_id || res.id || 'Qwen/Qwen3-8B-AWQ';
+        this.streamDownload(rid, '/api/models/download-hf', { model_id: mid, backend: 'vllm' });
       } else if (res.type === 'gguf') {
-        /* GGUF 需要 url + filename；url 优先资源里的 default_url，否则提示用户 */
-        var url = res.default_url || '';
+        /* GGUF 需要 url + filename；优先输入框内容，其次资源里的 default_url，否则提示用户 */
+        var url = '';
+        document.querySelectorAll('input[data-gguf-url]').forEach(function (inp) {
+          if (inp.getAttribute('data-gguf-url') === rid && inp.value.trim()) url = inp.value.trim();
+        });
+        if (!url) url = res.default_url || '';
         if (!url) {
           /* 用 prompt 让用户输入 GGUF 下载 URL */
           url = window.prompt('请输入 GGUF 下载 URL（GitHub 链接将自动加 ghproxy 镜像）：', '');
@@ -622,13 +657,14 @@
         var reader = resp.body.getReader();
         var decoder = new TextDecoder('utf-8');
         var buf = '';
+        var lastMessage = '';
         function pump() {
           reader.read().then(function (chunk) {
             if (chunk.done) {
               delete self._dlPulling[rid];
               delete self._dlProgress[rid];
               self.load();
-              self.toast('下载完成，请重启后端以加载');
+              self.toast(lastMessage || '下载完成');
               return;
             }
             buf += decoder.decode(chunk.value, { stream: true });
@@ -650,7 +686,10 @@
               if (obj.completed === true && obj.status === 'success') {
                 cur.pct = 100; cur.status = '完成';
               }
-              if (obj.message) { self._dlProgress[rid] = { status: obj.message, pct: 100 }; }
+              if (obj.message) {
+                lastMessage = obj.message;
+                self._dlProgress[rid] = { status: obj.message, pct: 100 };
+              }
             }
             if (hadError) {
               delete self._dlPulling[rid];
@@ -844,6 +883,9 @@
       rows.push(this.row('后端', name));
       if (info.model) rows.push(this.row('模型', info.model));
       if (info.model_status) rows.push(this.row('模型状态', info.model_status));
+      if (info.detection_method) rows.push(this.paraRow('检测逻辑', info.detection_method));
+      if (info.download_method) rows.push(this.paraRow('模型获取', info.download_method));
+      if (info.model_store) rows.push(this.paraRow('存储位置', info.model_store));
       if (info.base_quantization) rows.push(this.row('基座量化', info.base_quantization));
       if (info.lora_precision) rows.push(this.row('LoRA 精度', info.lora_precision));
       if (info.compute_dtype) rows.push(this.row('计算精度', String(info.compute_dtype).toUpperCase()));
@@ -876,6 +918,10 @@
 
     row: function (k, v) {
       return '<div class="flex justify-between gap-3 text-xs"><span style="color: var(--vuln-ink-3)">' + this.esc(k) + '</span><span class="text-right" style="color: var(--vuln-ink-2); word-break: break-all">' + this.esc(String(v)) + '</span></div>';
+    },
+
+    paraRow: function (k, v) {
+      return '<div class="text-xs"><div style="color: var(--vuln-ink-3); margin-bottom: 2px;">' + this.esc(k) + '</div><div style="color: var(--vuln-ink-2); word-break: break-all; white-space: pre-wrap; line-height: 1.6;">' + this.esc(String(v)) + '</div></div>';
     }
   };
 

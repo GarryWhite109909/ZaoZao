@@ -8,11 +8,14 @@ llama-cpp-python 在 PyPI 上的预编译 wheel 是 CPU-only。直接 pip instal
 pip 会用现成 wheel 而**忽略** CMAKE_ARGS，导致 GPU offload 静默失效（装了却没吃到显卡）。
 本脚本强制从源码编译，并按 OS/GPU 生成正确的 CMAKE_ARGS：
 
-    NVIDIA        -DLLAMA_CUDA=on     （需 CUDA Toolkit(nvcc) + C++ 编译器）
+    NVIDIA        -DGGML_CUDA=on（兼容旧参数 -DLLAMA_CUDA=on；需 CUDA Toolkit(nvcc) + C++ 编译器）
     AMD + Linux   -DGGML_HIP=ON       （需 /opt/rocm 的 hipcc + rocm-cmake）
     AMD + Windows -DGGML_HIP=ON       （ROCm-On-Windows，较折腾，尽力而为）
-    Apple Silicon -DLLAMA_METAL=on    （clang 自带 Metal，最省事）
+    Apple Silicon -DGGML_METAL=on（兼容旧参数 -DLLAMA_METAL=on；clang 自带 Metal，最省事）
     CPU           （直接装预编译 wheel，无需编译）
+
+注意：Windows 源码编译会解压超长路径文件，必须开启 Windows 长路径支持
+（LongPathsEnabled=1），否则报 "No such file or directory"。
 
 用法
 ----
@@ -82,11 +85,11 @@ def build_plan() -> Dict:
     vendor = gpu.vendor
     if vendor == "nvidia":
         plan.update(backend="nvidia", needs_build=True,
-                    cmake_args="-DLLAMA_CUDA=on",
+                    cmake_args="-DGGML_CUDA=on -DLLAMA_CUDA=on",
                     label=f"CUDA ({gpu.name})")
     elif vendor == "apple":
         plan.update(backend="apple", needs_build=True,
-                    cmake_args="-DLLAMA_METAL=on",
+                    cmake_args="-DGGML_METAL=on -DLLAMA_METAL=on",
                     label=f"Metal ({gpu.name})")
     elif vendor == "amd":
         # AMD 全程走 HIP；Linux 是官方支持，Windows/macOS 是尽力而为
