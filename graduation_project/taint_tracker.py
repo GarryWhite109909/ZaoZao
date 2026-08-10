@@ -81,8 +81,7 @@ _ARGUMENT_LIST_TYPES = {"argument_list", "arguments"}
 # 语句体节点（复合语句的子块）
 _BODY_TYPES = {"block", "statement_block", "compound_statement", "declaration_list"}
 
-# 单作用域最多收集/输出路径数
-_MAX_PATHS_COLLECT = 200
+# 单作用域最多输出路径数
 _MAX_PATHS_PER_SCOPE = 50
 
 
@@ -484,9 +483,10 @@ class TaintTracker:
                             ))
 
                 # 3b) 被调函数返回污点 → 赋值目标入污染集
-                if summary.returns_taint and self._assignment_targets(stmt, ts_lang, code_bytes):
+                targets = self._assignment_targets(stmt, ts_lang, code_bytes) if summary.returns_taint else []
+                if targets:
                     ret_origin, ret_line = summary.returns_taint[0]
-                    for target in self._assignment_targets(stmt, ts_lang, code_bytes):
+                    for target in targets:
                         tainted[target] = _Taint(ret_origin, ret_line, [target])
 
             # 4) return 污点（供上层摘要）
@@ -698,22 +698,42 @@ class TaintTracker:
             return False
         if re.fullmatch(r"[A-Za-z_$][\w$]*", var):
             return re.search(r"(?<![A-Za-z0-9_$])" + re.escape(var) + r"(?![A-Za-z0-9_$])", text) is not None
-        return re.escape(var) in text
+        # 属性/成员路径（如 self.data、this.state.q）：直接做子串匹配。
+        # 之前误用 re.escape(var)，产出带反斜杠的文本，永远匹配不到源码。
+        return var in text
 
     def _strip_string_literals(self, text: str) -> str:
         """剥离普通字符串字面量，保留 f-string（interpolation 是表达式，需参与污点匹配）。
 
         逐字符扫描，正确处理转义与单/双引号混合，避免跨字符串吞掉中间代码。
+        f-string 需要记住"当前在 f-string 内"，否则闭引号会被误判为新的开引号，
+        把 f"{a}" + "lit" 这类拼接中间的操作符吞掉。
         """
         out: list[str] = []
         i = 0
         n = len(text)
+        in_fstring = False
+        fstring_quote = ""
+        fstring_brace_depth = 0
         while i < n:
             ch = text[i]
+            if in_fstring:
+                out.append(ch)
+                if ch == fstring_quote and fstring_brace_depth == 0:
+                    in_fstring = False
+                elif ch == "{":
+                    fstring_brace_depth += 1
+                elif ch == "}":
+                    fstring_brace_depth = max(0, fstring_brace_depth - 1)
+                i += 1
+                continue
             if ch in "\"'":
                 # 前面紧挨 f/F 的是 f-string：整体保留（interpolation 是表达式）
                 if i > 0 and text[i - 1].lower() == "f":
                     out.append(ch)
+                    in_fstring = True
+                    fstring_quote = ch
+                    fstring_brace_depth = 0
                     i += 1
                     continue
                 quote = ch

@@ -510,10 +510,13 @@ def check_inprocess_backend_ready(backend: str) -> bool:
                 gguf = discovered
                 os.environ["VULN_SCANNER_GGUF"] = gguf
         if not gguf:
-            print("[错误] llamacpp 后端需要 VULN_SCANNER_GGUF 指向 Q4 GGUF 文件")
-            print(f"  推荐做法：将 GGUF 放到 {llamacpp_dir()}")
-            print(f"  示例: set VULN_SCANNER_GGUF=D:\\code\\Graduation-Project\\models\\llamacpp\\Qwen3-8B-Q4_K_M.gguf")
-            ok = False
+            # GGUF 未配置：不拦截启动。与 transformers 后端一致——允许先进应用，
+            # 在「设置 → 模型管理」下载 GGUF 到 models/llamacpp/（下载完成自动绑定），
+            # 首次扫描时再懒加载。真正扫描前若仍未就绪，LlamaCppClient 会在生成时报错。
+            print("[启动器] ⚠ llamacpp 后端未配置 GGUF 基座，可先进应用下载：")
+            print(f"  「设置 → 模型管理 → llamacpp」下载到 {llamacpp_dir()}")
+            print(f"  或设置 VULN_SCANNER_GGUF 后重启后端（示例: VULN_SCANNER_GGUF="
+                  f"{llamacpp_dir()}\\Qwen3-8B-Q4_K_M.gguf）")
         elif not Path(gguf).is_file():
             print(f"[错误] GGUF 文件不存在: {gguf}")
             ok = False

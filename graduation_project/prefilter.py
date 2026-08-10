@@ -28,7 +28,16 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
+
+
+# 需要做"配对括号内查找"的调用起点正则（各规则复用，避免重复编译）
+_CALL_START_PATTERNS = {
+    "open": re.compile(r"open\s*\(", re.IGNORECASE),
+    "os_system": re.compile(r"os\.system\s*\(", re.IGNORECASE),
+    "subprocess": re.compile(
+        r"subprocess\.(?:run|Popen|call|check_output|check_call)\s*\(", re.IGNORECASE),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +65,9 @@ class _Rule:
     # 高置信规则：即使同时命中安全特征也直接判漏洞（如 pickle.loads / yaml.load
     # 不存在"安全用法"，安全规则命中通常是同文件其他无关代码所致）
     high_confidence: bool = False
+    # 自定义匹配器（如配对括号扫描）。设置后作为 AND 条件参与判定：
+    # 必须先通过 match_func，再按 patterns/require_all 逻辑判定。
+    match_func: Optional[Callable[[str], bool]] = None
 
     def match(self, code: str) -> bool:
         """判断给定代码是否命中本规则。"""
@@ -63,6 +75,10 @@ class _Rule:
         for ex in self.exclude:
             if ex.search(code):
                 return False
+        if self.match_func is not None and not self.match_func(code):
+            return False
+        if not self.patterns:
+            return True
         if self.require_all:
             return all(p.search(code) for p in self.patterns)
         return any(p.search(code) for p in self.patterns)
@@ -130,6 +146,42 @@ class Prefilter:
     # ------------------------------------------------------------------
     # 规则构建
     # ------------------------------------------------------------------
+    def _call_arg_contains(self, code: str, pattern_key: str, token: str = "+") -> bool:
+        """定位调用起点后扫描到配对右括号，判断参数区内（含嵌套）是否出现 token。
+
+        替代 `[^)]*` 正则：嵌套括号（如 open(os.path.join(d, n) + s)）不会再提前终止。
+        跳过字符串字面量内容，open("a+b") 不会误命中。
+        """
+        for m in _CALL_START_PATTERNS[pattern_key].finditer(code):
+            # 正则已消费左括号，从参数区起点直接以 depth=1 扫描
+            depth = 1
+            in_str: Optional[str] = None
+            escaped = False
+            j = m.end()
+            while j < len(code):
+                ch = code[j]
+                if in_str is not None:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == in_str:
+                        in_str = None
+                    j += 1
+                    continue
+                if ch in ("'", '"'):
+                    in_str = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif depth >= 1 and ch == token:
+                    return True
+                j += 1
+        return False
+
     def _build_vuln_rules(self) -> list[_Rule]:
         """构建漏洞特征规则集。"""
         IC = re.IGNORECASE
@@ -153,10 +205,11 @@ class Prefilter:
         ))
 
         # --- 命令注入 ---
-        # os.system(... + 用户输入)
+        # os.system(... + 用户输入)；配对括号扫描，支持嵌套调用
         rules.append(_Rule(
             name="cmd_os_system_concat",
-            patterns=[re.compile(r"os\.system\s*\([^)]*\+", IC)],
+            patterns=[],
+            match_func=lambda code: self._call_arg_contains(code, "os_system"),
             category="vuln",
         ))
         # subprocess.*(..., shell=True) 且调用内含字符串拼接
@@ -166,9 +219,9 @@ class Prefilter:
             name="cmd_subprocess_shell_concat",
             patterns=[
                 re.compile(r"shell\s*=\s*True", IC),
-                re.compile(r"subprocess\.(?:run|Popen|call|check_output|check_call)\s*\([^)]*\+", IC),
             ],
             require_all=True,
+            match_func=lambda code: self._call_arg_contains(code, "subprocess"),
             category="vuln",
         ))
         # eval(request....) 远程代码执行
@@ -178,10 +231,11 @@ class Prefilter:
             category="vuln",
         ))
 
-        # --- 路径穿越：open(... + 用户输入) ---
+        # --- 路径穿越：open(... + 用户输入)；配对括号扫描，支持嵌套调用 ---
         rules.append(_Rule(
             name="path_traversal_open_concat",
-            patterns=[re.compile(r"open\s*\([^)]*\+", IC)],
+            patterns=[],
+            match_func=lambda code: self._call_arg_contains(code, "open"),
             category="vuln",
         ))
 

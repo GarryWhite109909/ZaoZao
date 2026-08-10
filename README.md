@@ -495,7 +495,7 @@ IntelliJ 插件提供编辑器内选中代码的扫描功能，结果以气球�
 
 ## 核心结果
 
-当前已发布最佳模型 **v9max**（Qwen3-8B-Instruct + 三模型蒸馏数据 7692 条，云端 A800 bf16 全精度 LoRA r=8 + rsLoRA 训练，Q4_K_M 量化部署）。
+当前已发布最佳模型 **v9max**（Qwen3-8B-Instruct + 双模型蒸馏数据 7692 条，云端 A800 bf16 全精度 LoRA r=8 + rsLoRA 训练，Q4_K_M 量化部署）。后续训练版本 **Nivis-α0**（8616 条数据，9.3h A800 训练）已完成但**尚无评估数据**，论文/展示请以 v9max 为基准。
 
 下表为 **HF 评估管道**（evaluate.py：NF4 4bit 基座 + FP16 LoRA 增量叠加）的结果：
 
@@ -521,7 +521,7 @@ CVE-fix recall(真实集):  baseline 0.375 → v5 0.571 → v9max 0.950（HF 管
 
 ## 当前状态与待决策
 
-> **截至 2026-08-07**：exp_01~05 零样本基线 + Prompt 消融已完成；exp_06 完成 P0 parse_fail 修复、P1 CVE-fix 真实集校准、P2 本地 SFT 迭代（v2~v9）、**三模型数据蒸馏 + 云端 A800 训练 v9max 并已发布**。**v9max 为当前已发布里程碑**；最终模型 **Nivis-alpha.1** 将在此基础上完成 DPO/GRPO、数据飞轮与 CoT 教学，收敛 FPR 与 CWE 归因。
+> **截至 2026-08-10**：exp_01~05 零样本基线 + Prompt 消融已完成；exp_06 完成 P0 parse_fail 修复、P1 CVE-fix 真实集校准、P2 本地 SFT 迭代（v2~v9）、**双模型 API 蒸馏 + 云端 A800 训练 v9max 并已发布**。**v9max 为当前已发布里程碑**。2026-08-09~10 完成后续版本 **Nivis-α0** 训练（8616 条，prompt 统一为 V3_PROMPT），但尚无评估数据，论文请以 v9max 为基准。最终模型 **Nivis-alpha.1** 将在此基础上完成 DPO/GRPO、数据飞轮与 CoT 教学，收敛 FPR 与 CWE 归因。
 
 > **2026-08-08 追加**：`fix_suggestion` 已从"完整可运行修复代码（``` 围栏）"改为
 > **行号锚定的单行局部修复建议**（如 `line 3: 应改为 ...`），原因：客户端 6K~8K
@@ -531,7 +531,8 @@ CVE-fix recall(真实集):  baseline 0.375 → v5 0.571 → v9max 0.950（HF 管
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| v9max 发布 | 三模型蒸馏 7692 条 → A800 bf16 训练 → Q4_K_M 发布为 Ollama 模型 | ✅ 已完成 |
+| v9max 发布 | 双模型蒸馏 7692 条 → A800 bf16 训练 → Q4_K_M 发布为 Ollama 模型 | ✅ 已完成 |
+| Nivis-α0 | 继续清洗 8616 条 + prompt 统一为 V3_PROMPT → A800 训练 9.3h | ✅ 已训练，待评估 |
 | Nivis-alpha.1 | DPO/GRPO 偏好优化 + 数据飞轮 + CoT 教学，收敛 FPR 0.423 与 CWE 归因 | ⏳ 后续计划 |
 
 ***
@@ -574,7 +575,7 @@ CVE-fix recall(真实集):  baseline 0.375 → v5 0.571 → v9max 0.950（HF 管
 | 训练 student(本地历史) | `Qwen/Qwen3-8B` + 4bit QLoRA (r=8, rsLoRA) | exp_06 P2 本地 SFT v5 |
 | 训练 student(历史) | Qwen2.5-Coder-7B-Base → KnItLM CPT (r=64) → merge 到 Instruct | exp_06 Phase 1-3(已归档) |
 | PD teacher(已暂缓) | `qwen3-coder:30b`（MoE） | exp_06 Phase 4(已归档) |
-| 蒸馏 teacher | DeepSeek V4-Flash / Kimi K3 / GLM-5.2 | 三模型数据蒸馏（7692 条） |
+| 蒸馏 teacher | DeepSeek V4-Flash / GLM-5.2（Kimi K3 未参与） | 双模型 API 蒸馏（7692 条） |
 | 对照模型 | `deepseek-coder-v2:16b` / `qwen2.5-coder:14b` / `gemma4:12b` / `gemma4:26b` / `gpt-oss:20b` | exp_04 多模型对比 |
 
 > 完整环境清单（Embedding 模型、向量库版本、传统工具版本等）见 [规划.md](规划.md) "实验环境"小节；训练与推理全链路技术栈见本文"技术架构与全栈"小节。
@@ -776,7 +777,7 @@ Graduation-Project/
 
 ## 当前进度
 
-> **总体状态**：零样本推理基线（exp_01~05）已全部完成；训练主线（exp_06）中，2026-07-22 切换至 Qwen3-8B 后完成 P0 parse_fail 修复、P1 CVE-fix 真实集校准、P2 SFT 数据迭代（v2→v6）。当前最佳模型为 **SFT v5**（合成集 recall 1.000 / FPR 0.231 / strict_recall 0.590；CVE-fix recall 0.571 / strict_recall 0.143）。P3 DPO 在本地 16GB GPU 上不可行（8bit OOM、4bit 梯度失效），v6 hard-negative SFT 失败已归档。后续待决策：云 GPU 跑 DPO、单个 FP micro-finetune、或停止微调进入系统开发。详细进度见 [规划.md](规划.md) "已完成事项"/"当前待办"与 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)。
+> **总体状态**：零样本推理基线（exp_01~05）已全部完成；训练主线（exp_06）中，2026-07-22 切换至 Qwen3-8B 后完成 P0 parse_fail 修复、P1 CVE-fix 真实集校准、P2 本地 SFT 迭代（v2→v9）、P3 双模型蒸馏 + 云端 A800 训练 **v9max**（当前已发布最佳）。2026-08-09~10 完成后续版本 **Nivis-α0** 训练（8616 条，prompt 统一为 V3_PROMPT），但尚无评估数据。G0 方法学修复（文件名泄漏等 9 项）已全量重跑。详细进度见 [规划.md](规划.md) 与 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)。
 
 ### ✅ 阶段一：LLM 漏洞检测能力摸底（exp_01，2026-06-28）
 
@@ -814,9 +815,9 @@ Graduation-Project/
 - **P3 DPO 本地不可行**：8bit OOM、4bit 梯度失效；DPO 数据保留待云 GPU 复用，成为"本地探索→云端放大"路线的转折点。
 - 详见 [规划.md](规划.md) §三/§四、[EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md) 与 [docs/论文/第5章_训练主线.md](docs/论文/第5章_训练主线.md)
 
-### ✅ 阶段七：三模型蒸馏 + 云端 A800 训练 v9max 发布（2026-08-02 ~ 08-07）
+### ✅ 阶段七：双模型蒸馏 + 云端 A800 训练 v9max 发布（2026-08-02 ~ 08-07）
 
-- **三模型数据蒸馏**：DeepSeek V4-Flash / Kimi K3 / GLM-5.2 三模型 API 蒸馏生成大规模训练数据，原始目标约 11200 条，经 CWE 归一化、泄漏审计、矛盾/重复清洗后最终 **7692 条**（漏洞 3493 / 安全 4199，安全占比 54.6%）。
+- **双模型 API 蒸馏**：DeepSeek V4-Flash / GLM-5.2 双模型 API 蒸馏生成大规模训练数据（Kimi K3 未参与实际蒸馏），原始约 10700 条，经 CWE 归一化、泄漏审计、矛盾/重复清洗后最终 **7692 条**（漏洞 3493 / 安全 4199，安全占比 54.6%）。计划配比 1:3，清洗后实际约 1:1.2。
 - **云端 A800 训练**：Qwen3-8B bf16 全精度 LoRA（r=8 + alpha=16 + dropout=0.1 + rsLoRA），train 6539 / dev 1153，2 epoch，lr=1e-4，max_seq 6144，1636 步，约 4.1h，train_loss ≈ 0.529。
 - **v9max 评估**（HF 管道：NF4 基座 + FP16 LoRA）：合成集 87 段 recall 1.000 / FPR 0.423 / strict_recall 0.607；真实 CVE-fix 20 段 recall 0.95 / strict_recall 0.65 / fix_extracted 17/20，大幅增强真实漏洞检出。
 - **G0 方法学修复重跑（2026-08-08）**：文件名泄漏修复后全量重跑。Ollama 发布形态（GGUF Q4_K_M 合并量化）CVE-fix recall 实测 0.75~0.79（base 15/19 含 1 parse_fail；combined 15/20），与 HF 管道 0.95 的缺口来自 LoRA 增量是否保 FP16 精度；exp_05 消融结论（combined 变体最优）在 v9max 合成集上成立（FPR 19.2%→7.7%），但不迁移到真实 CVE。详见 [docs/过程.md](docs/过程.md) 2026-08-08 节。
@@ -858,7 +859,7 @@ Graduation-Project/
 | P2 v8 | 对比 CoT SFT | 引入判别性对比 CoT | FN↑、FP 激增（判别焦虑 + 冲突信号） | 对比 CoT 得不偿失 |
 | P2 v9 | SFT 收敛 | 清洗冲突样本 + 多样安全代码 + 降 epoch | 数据到极限，转云端放大 | 本地数据量是硬瓶颈 |
 | P3 | DPO | `dpo_merged.jsonl` 104 条偏好对 | 本地 16GB GPU 不可行（8bit OOM、4bit 梯度失效） | 消费级 GPU 硬件约束 → 转云 |
-| **v9max** | **三模型蒸馏 + A800 训练** | 7692 条蒸馏数据 + bf16 LoRA(r=8,rsLoRA) | **合成集 recall 1.000 / FPR 0.423 / strict_recall 0.607；CVE-fix recall 0.95（HF 管道）；Ollama 发布形态 CVE-fix recall 0.75~0.79（G0 重跑）** | **本地探索 → 云端放大路线验证** |
+| **v9max** | **双模型蒸馏 + A800 训练** | 7692 条蒸馏数据 + bf16 LoRA(r=8,rsLoRA) | **合成集 recall 1.000 / FPR 0.423 / strict_recall 0.607；CVE-fix recall 0.95（HF 管道）；Ollama 发布形态 CVE-fix recall 0.75~0.79（G0 重跑）** | **本地探索 → 云端放大路线验证** |
 
 > 详细数据见 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)；方法体系见 [docs/方法.md](docs/方法.md) 与 [docs/论文/第5章_训练主线.md](docs/论文/第5章_训练主线.md)。
 

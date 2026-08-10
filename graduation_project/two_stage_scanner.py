@@ -195,12 +195,14 @@ _SEV_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "none":
 # ---------------------------------------------------------------------------
 # 裁决结果解析
 # ---------------------------------------------------------------------------
-def _extract_json_object(text: str) -> Optional[str]:
-    """从文本中提取第一个完整 JSON 对象（花括号平衡匹配）。
+def _extract_json_objects(text: str) -> list[str]:
+    """从文本中收集所有完整 JSON 对象候选（花括号平衡匹配）。
 
-    非贪婪 `\{.*?\}` 在 reason 等字段含 `}` 时会提前截断导致 JSON 解析失败，
-    这里从每个 `{` 起做括号深度匹配，取第一个能完整闭合的对象。
+    非贪婪 `{.*?}` 在 reason 等字段含 `}` 时会提前截断导致 JSON 解析失败，
+    这里从每个 `{` 起做括号深度匹配，收集所有能完整闭合的对象。
+    若第一个候选是伪 JSON（如"格式示例 {a: 1}"），调用方会继续尝试下一个。
     """
+    candidates: list[str] = []
     start = -1
     depth = 0
     in_str = False
@@ -224,8 +226,9 @@ def _extract_json_object(text: str) -> Optional[str]:
             if depth > 0:
                 depth -= 1
                 if depth == 0:
-                    return text[start:i + 1]
-    return None
+                    candidates.append(text[start:i + 1])
+                    start = -1
+    return candidates
 
 
 def parse_triage_verdict(raw_output: str) -> Optional[dict]:
@@ -240,15 +243,13 @@ def parse_triage_verdict(raw_output: str) -> Optional[dict]:
     fences = re.findall(r"```(?:json)?\s*(.*?)\s*```", raw_output, re.DOTALL)
     candidates = fences + [raw_output]
     for text in candidates:
-        obj = _extract_json_object(text)
-        if not obj:
-            continue
-        try:
-            parsed = json.loads(obj)
+        for obj in _extract_json_objects(text):
+            try:
+                parsed = json.loads(obj)
+            except json.JSONDecodeError:
+                continue
             if isinstance(parsed, dict) and "is_confirmed" in parsed:
                 return parsed
-        except json.JSONDecodeError:
-            continue
     # 字段级兜底
     m = re.search(r'"is_confirmed"\s*:\s*(true|false)', raw_output, re.IGNORECASE)
     if m:

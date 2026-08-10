@@ -1843,11 +1843,58 @@ async def models_download_gguf(req: GgufDownloadRequest):
     chunk_queue: _q.Queue = _q.Queue()
     done_flag = {"done": False, "result": None, "error": None}
 
+    # HuggingFace resolve 链接：/repo_id/resolve/<revision>/<file>
+    _HF_RESOLVE_RE = re.compile(r"^/(?P<repo>.+?)/resolve/(?P<rev>[^/]+)/(?P<file>.+)$")
+
     def run_download():
         try:
-            # 国内镜像直连、不走代理：避免代理秒断 + 白白消耗代理流量
-            _gguf_host = urlparse(url).hostname or ""
-            _no_proxy_for_mirrors(_gguf_host)
+            # HuggingFace resolve URL → 复用 huggingface_hub 的 hf_hub_download
+            # （断点续传 + 重试 + 走 HF_MIRROR 镜像），与 transformers 下载同栈，
+            # 避免裸 urlopen 直连 hf-mirror.com 大文件连接超时（WinError 10060）。
+            _hf_match = _HF_RESOLVE_RE.match(urlparse(url).path)
+            if _hf_match:
+                def _hf_download(_bypass_proxy: bool) -> str:
+                    # 直连回退时把镜像域名塞进 NO_PROXY，强制不走系统代理；
+                    # 首次（代理优先）保持环境原样，让 hf_hub_download 按
+                    # HTTP_PROXY/HTTPS_PROXY 走代理，失败再回退直连。
+                    if _bypass_proxy:
+                        _no_proxy_for_mirrors(urlparse(url).hostname or "")
+                    os.environ["HF_ENDPOINT"] = HF_MIRROR
+                    from huggingface_hub import hf_hub_download
+                    return hf_hub_download(
+                        repo_id=_hf_match.group("repo"),
+                        filename=_hf_match.group("file"),
+                        local_dir=str(dest_dir),
+                        local_dir_use_symlinks=False,
+                        resume_download=True,
+                        endpoint=HF_MIRROR,
+                        etag_timeout=60,
+                    )
+
+                chunk_queue.put({
+                    "status": "downloading",
+                    "message": f"正在连接镜像 {HF_MIRROR}…",
+                    "pct": 0,
+                })
+                try:
+                    # 1) 代理优先：不注入 NO_PROXY，走系统代理（无代理则直连）
+                    local = _hf_download(_bypass_proxy=False)
+                except Exception as _e:
+                    # 2) 直连回退：强制镜像直连再试一次
+                    print(f"[download-gguf] 走代理下载失败({type(_e).__name__}: {_e})，回退镜像直连", flush=True)
+                    local = _hf_download(_bypass_proxy=True)
+                actual = Path(local)
+                total = actual.stat().st_size
+                chunk_queue.put({
+                    "status": "downloading",
+                    "completed": total,
+                    "total": total,
+                    "pct": 100,
+                })
+                done_flag["result"] = {"dest": str(actual), "filename": actual.name}
+                return
+
+            # 非 HuggingFace URL（如 GitHub 大文件）：回退 urlopen，带重试避免偶发断连
             with urlopen(url, timeout=60) as resp, open(dest_path, "wb") as f:
                 total = int(resp.headers.get("content-length", 0))
                 downloaded = 0

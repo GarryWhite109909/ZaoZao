@@ -60,11 +60,24 @@ _FUNCTION_NODE_TYPES = {
     "javascript": {"function_declaration", "method_definition", "function_expression", "arrow_function"},
     "typescript": {"function_declaration", "method_definition", "function_expression", "arrow_function"},
     "java": {"method_declaration", "constructor_declaration"},
-    "php": {"function_definition", "method_declaration", "creation_expression"},
+    "php": {"function_definition", "method_declaration"},
 }
 
 # 类定义节点 type
 _CLASS_NODE_TYPES = {"class_declaration", "class_definition"}
+
+# 类体容器节点 type（各语言 tree-sitter）
+_CLASS_BODY_TYPES = {"block", "class_body", "declaration_list"}
+
+# 类体"字段级"直接子节点 type（docstring / 类字段 / 类级表达式 / 注释）。
+# 只保留类体的直接子节点，方法体内的赋值天然不在此列。
+_CLASS_FIELD_NODE_TYPES = {
+    "python": {"expression_statement", "comment"},
+    "java": {"field_declaration", "line_comment", "block_comment"},
+    "javascript": {"field_definition", "comment"},
+    "typescript": {"public_field_definition", "private_field_definition", "field_definition", "comment"},
+    "php": {"property_declaration", "const_declaration", "comment"},
+}
 
 # 顶层声明/导入节点 type（保留为上下文头）
 _TOPLEVEL_KEEP_TYPES = {
@@ -144,9 +157,11 @@ class CodeSlicer:
 
         # 统一用 UTF-8 字节切片（tree-sitter 偏移是字节，str 切片遇中文会错位）
         code_bytes = code.encode("utf-8")
+        # 解码一次供类骨架等按行取文本，避免 N 个类 N 次全量解码
+        code_text = code_bytes.decode("utf-8", errors="replace")
 
         # 提取上下文头（imports + 全局常量 + 顶层非函数声明）
-        header_lines = self._extract_context_header(tree.root_node, code_bytes, ts_lang)
+        header_lines = self._extract_context_header(tree.root_node, code_bytes, code_text, ts_lang)
 
         # 提取所有顶层函数 + 类方法
         func_nodes = self._collect_function_nodes(tree.root_node, ts_lang)
@@ -236,17 +251,21 @@ class CodeSlicer:
         return result
 
     def _node_name(self, node: Node) -> Optional[str]:
-        """从函数/类定义节点提取名字（找第一个 identifier 子节点）。"""
+        """从函数/类定义节点提取名字（找第一个 identifier 子节点；PHP 的 name 是叶节点）。"""
         for child in node.children:
             if child.type in ("identifier", "property_identifier", "type_identifier"):
                 return child.text.decode("utf-8")
+            if child.type == "name":
+                text = child.text.decode("utf-8", errors="replace")
+                if text:
+                    return text
         return None
 
     def _slice_node_text(self, node: Node, code_bytes: bytes) -> str:
         """提取节点的源代码文本（tree-sitter 偏移为字节，按字节切再解码）。"""
         return code_bytes[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
 
-    def _extract_context_header(self, root: Node, code_bytes: bytes, ts_lang: str) -> list[str]:
+    def _extract_context_header(self, root: Node, code_bytes: bytes, code_text: str, ts_lang: str) -> list[str]:
         """提取文件顶部的 imports / 全局常量 / 模块 docstring，作为每个切片的上下文头。
 
         策略：遍历 root 的直接子节点，凡是"非函数/非类"的顶层声明都保留。
@@ -264,7 +283,7 @@ class CodeSlicer:
                 # 装饰器定义：保留装饰器文本，内部定义走各自分支
                 inner = next((c for c in child.children if c.type in class_types), None)
                 if inner is not None:
-                    skeleton = self._class_skeleton(inner, code_bytes, ts_lang)
+                    skeleton = self._class_skeleton(inner, code_bytes, code_text, ts_lang)
                     if skeleton:
                         dec_text = code_bytes[child.start_byte:inner.start_byte].decode("utf-8", errors="replace")
                         header_parts.append(dec_text + skeleton)
@@ -274,7 +293,7 @@ class CodeSlicer:
                 continue  # 函数定义不进 header（切片本身）
             if t in class_types:
                 # 类骨架：class ClassName(...): + docstring，不含方法体
-                skeleton = self._class_skeleton(child, code_bytes, ts_lang)
+                skeleton = self._class_skeleton(child, code_bytes, code_text, ts_lang)
                 if skeleton:
                     header_parts.append(skeleton)
                 continue
@@ -289,55 +308,52 @@ class CodeSlicer:
 
         return header_parts
 
-    def _class_skeleton(self, class_node: Node, code_bytes: bytes, ts_lang: str) -> str:
-        """提取类骨架：class 头 + docstring + 字段声明，但不含方法体。"""
-        cls_name = self._node_name(class_node) or "AnonymousClass"
-        # 取类头第一行（class ClassName(Base):）
-        start_line = class_node.start_point[0]
-        end_line = class_node.end_point[0]
-        code = code_bytes.decode("utf-8", errors="replace")
-        lines = code.split("\n")[start_line:end_line + 1]
+    def _class_skeleton(self, class_node: Node, code_bytes: bytes, code_text: str, ts_lang: str) -> str:
+        """提取类骨架：class 头 + 类级 docstring/字段/注释，但不含方法体。
 
-        skeleton_lines: list[str] = []
-        # 第一行：class 定义头
-        skeleton_lines.append(lines[0])
-        # 找 docstring（Python）/ 第一个字段声明
-        body_started = False
-        for line in lines[1:]:
-            stripped = line.strip()
-            if not stripped:
-                skeleton_lines.append(line)
-                continue
-            # Python: 跳过方法定义（def ...）
-            if ts_lang == "python":
-                if stripped.startswith("def ") or stripped.startswith("async def "):
-                    continue
-                # 类字段（简单赋值）保留
-                if "=" in stripped and not stripped.startswith("@"):
-                    skeleton_lines.append(line)
-                # docstring 保留
-                elif stripped.startswith('"""') or stripped.startswith("'''"):
-                    skeleton_lines.append(line)
-                else:
-                    # 其他（装饰器、注释等）
-                    if stripped.startswith("#") or stripped.startswith("@"):
-                        skeleton_lines.append(line)
-            elif ts_lang == "java":
-                # Java 字段声明（不含方法体）：保留 ; 结尾的简单声明
-                if stripped.endswith(";") and "(" not in stripped:
-                    skeleton_lines.append(line)
-            elif ts_lang in ("javascript", "typescript"):
-                # JS 字段声明
-                if "=" in stripped and not stripped.startswith("function") and "(" not in stripped:
-                    skeleton_lines.append(line)
-            elif ts_lang == "php":
-                # PHP 类字段
-                if "=" in stripped and "function" not in stripped:
-                    skeleton_lines.append(line)
+        只遍历类体（block/class_body/declaration_list）的直接子节点，
+        方法体内的赋值、多行 docstring 的中间行不会混入骨架。
+        """
+        lines = code_text.split("\n")
+        start_line = class_node.start_point[0]
+        if start_line < len(lines):
+            header_line = lines[start_line]
+        else:
+            cls_name = self._node_name(class_node) or "AnonymousClass"
+            header_line = f"class {cls_name}:"
+
+        skeleton_lines: list[str] = [header_line]
+        field_types = _CLASS_FIELD_NODE_TYPES.get(ts_lang, set())
+        body = next((c for c in class_node.children if c.type in _CLASS_BODY_TYPES), None)
+        if body is not None:
+            for child in body.children:
+                if child.type in field_types:
+                    skeleton_lines.append(self._field_line_text(child, lines))
 
         # 末尾加注释说明
-        skeleton_lines.append(f"    # ... (其他方法见各切片)")
+        skeleton_lines.append("    # ... (其他方法见各切片)")
         return "\n".join(skeleton_lines)
+
+    @staticmethod
+    def _field_line_text(node: Node, lines: list[str]) -> str:
+        """按节点行号取整行文本，保留行首缩进（tree-sitter 节点文本不含缩进）。"""
+        start_l, start_c = node.start_point
+        end_l, end_c = node.end_point
+        if start_l >= len(lines):
+            return ""
+        if start_l == end_l:
+            text = lines[start_l][:end_c]
+            # JS/TS 的 field_definition 节点不含结尾分号，从原始行补回
+            if lines[start_l][end_c:].lstrip().startswith(";"):
+                text += ";"
+            return text
+        parts = [lines[start_l]]
+        parts.extend(lines[start_l + 1:end_l])
+        last = lines[end_l][:end_c]
+        if lines[end_l][end_c:].lstrip().startswith(";"):
+            last += ";"
+        parts.append(last)
+        return "\n".join(parts)
 
     def _assemble_chunk(self, header_lines: list[str], func_code: str, qualname: str, ts_lang: str) -> str:
         """组装单个切片：上下文头 + 当前函数。"""

@@ -46,7 +46,10 @@ _EXTRA_DANGER_PATTERNS = [
     re.compile(r"execute(?:Query|Update)\s*\([^)]*\+"),          # Java SQL 拼接
     re.compile(r"new\s+File(?:InputStream|OutputStream|Reader|Writer)?\s*\([^)]*\+"),  # Java 路径拼接
     re.compile(r"render_template_string\s*\([^)]*\+"),           # Flask SSTI 拼接
-    re.compile(r"hashlib\.(?:md5|sha1)\s*\("),                   # Python 弱哈希
+    # Python 弱哈希：只把"口令/密钥/盐/摘要"语境下的 md5/sha1 视为危险用法，
+    # 避免代码用 md5 做缓存 key/指纹时误判"危险模式仍存在"。
+    re.compile(r"(?i)hashlib\.(?:md5|sha1)\s*\([\s\S]{0,120}(?<![A-Za-z0-9])(?:password|passwd|pwd|secret|salt|digest)(?![A-Za-z0-9])"),
+    re.compile(r"(?i)(?<![A-Za-z0-9])(?:password|passwd|pwd|secret|salt|digest)(?![A-Za-z0-9])[\s\S]{0,120}hashlib\.(?:md5|sha1)\s*\("),
     re.compile(r"MessageDigest\.getInstance\(\s*\"(?:MD5|SHA-?1)\"", re.IGNORECASE),  # Java 弱哈希
     re.compile(r"urlopen\s*\([^)]*\+"),                          # Python SSRF 拼接
     re.compile(r"sendRedirect\s*\([^)]*\+"),                     # Java 开放重定向拼接
@@ -188,69 +191,147 @@ class FixVerifier:
             return (False, f"SyntaxError: {e.msg} (line {e.lineno})")
 
     def _verify_javascript(self, code: str) -> tuple[bool, Optional[str]]:
-        """JavaScript 语法校验：node --check 子进程。"""
-        try:
-            result = subprocess.run(
-                ["node", "--check", "-"],
-                input=code, text=True, encoding="utf-8", errors="replace",
-                capture_output=True, timeout=self.timeout,
-            )
-            if result.returncode == 0:
-                return (True, None)
-            return (False, result.stderr.strip() or "node --check 失败")
-        except FileNotFoundError:
-            return (True, None)  # node 未安装，跳过
-        except subprocess.TimeoutExpired:
-            return (False, f"node --check 超时（{self.timeout}s）")
+        """JavaScript 语法校验：node --check 子进程。
 
-    def _verify_java(self, code: str) -> tuple[bool, Optional[str]]:
-        """Java 语法校验：javac 编译临时文件（需提取 public 类名）。"""
-        # 提取 public class 名作为文件名
-        m = re.search(r"public\s+(?:final\s+)?class\s+(\w+)", code)
-        class_name = m.group(1) if m else "Main"
-        try:
-            # 文件名必须与 public class 名完全一致（含 .java 后缀），
-            # 否则 javac 报 "类 X 是公共的，应在名为 X.java 的文件中声明"
-            with tempfile.TemporaryDirectory(prefix="vuln_verify_java_") as tmpdir:
-                tmp_path = os.path.join(tmpdir, f"{class_name}.java")
-                with open(tmp_path, "w", encoding="utf-8") as tmp:
-                    tmp.write(code)
+        node --check 默认按 CJS 解析，import/export 会误报语法错误；
+        CJS 失败后用 --input-type=module（ESM）重试一次。
+        """
+        last_err: Optional[str] = None
+        for extra_args in ((), ("--input-type=module",)):
+            try:
                 result = subprocess.run(
-                    ["javac", "-Xlint:none", tmp_path],
-                    capture_output=True, text=True,
-                    encoding="utf-8", errors="replace",
-                    timeout=self.timeout,
+                    ["node", "--check", *extra_args, "-"],
+                    input=code, text=True, encoding="utf-8", errors="replace",
+                    capture_output=True, timeout=self.timeout,
                 )
                 if result.returncode == 0:
                     return (True, None)
-                return (False, result.stderr.strip() or "javac 编译失败")
-        except FileNotFoundError:
-            return (True, None)  # javac 未安装，跳过
-        except subprocess.TimeoutExpired:
-            return (False, f"javac 编译超时（{self.timeout}s）")
+                last_err = result.stderr.strip() or "node --check 失败"
+            except FileNotFoundError:
+                return (True, None)  # node 未安装，跳过
+            except subprocess.TimeoutExpired:
+                return (False, f"node --check 超时（{self.timeout}s）")
+        return (False, last_err)
+
+    def _verify_java(self, code: str) -> tuple[bool, Optional[str]]:
+        """Java 语法校验：javac 编译临时文件（需提取 public 类名）。
+
+        LLM 常输出方法/语句片段，javac 要求完整编译单元，直接编译几乎必挂；
+        因此片段会自动包壳再编译：声明类片段放进类体，语句片段放进
+        main 方法体，两种壳都失败才判语法不合法。
+        """
+        candidates = [code] if self._looks_like_java_unit(code) else self._java_wrappers(code)
+        last_err: Optional[str] = None
+        for unit_code in candidates:
+            # 提取 public class 名作为文件名
+            m = re.search(r"public\s+(?:final\s+)?class\s+(\w+)", unit_code)
+            class_name = m.group(1) if m else "Main"
+            try:
+                # 文件名必须与 public class 名完全一致（含 .java 后缀），
+                # 否则 javac 报 "类 X 是公共的，应在名为 X.java 的文件中声明"
+                with tempfile.TemporaryDirectory(prefix="vuln_verify_java_") as tmpdir:
+                    tmp_path = os.path.join(tmpdir, f"{class_name}.java")
+                    with open(tmp_path, "w", encoding="utf-8") as tmp:
+                        tmp.write(unit_code)
+                    result = subprocess.run(
+                        ["javac", "-Xlint:none", tmp_path],
+                        capture_output=True, text=True,
+                        encoding="utf-8", errors="replace",
+                        timeout=self.timeout,
+                    )
+                    if result.returncode == 0:
+                        return (True, None)
+                    last_err = result.stderr.strip() or "javac 编译失败"
+            except FileNotFoundError:
+                return (True, None)  # javac 未安装，跳过
+            except subprocess.TimeoutExpired:
+                return (False, f"javac 编译超时（{self.timeout}s）")
+        return (False, last_err)
+
+    @staticmethod
+    def _looks_like_java_unit(code: str) -> bool:
+        """判断代码是否已包含顶层类型声明（class/interface/enum/record）。"""
+        return re.search(
+            r"^\s*(?:public\s+|protected\s+|private\s+|abstract\s+|final\s+|"
+            r"strictfp\s+|static\s+)*(?:class|interface|enum|record)\s+\w+",
+            code,
+            re.MULTILINE,
+        ) is not None
+
+    @staticmethod
+    def _split_java_fragment(code: str) -> tuple[list[str], list[str]]:
+        """把片段拆成（import/package 头, 其余代码），import 需放在类外。"""
+        header: list[str] = []
+        body: list[str] = []
+        seen_code = False
+        for line in (code or "").split("\n"):
+            stripped = line.strip()
+            if not seen_code and (stripped.startswith("import ") or stripped.startswith("package ")):
+                header.append(line)
+                continue
+            if stripped:
+                seen_code = True
+            body.append(line)
+        # 去掉片段前导空行
+        while body and not body[0].strip():
+            body.pop(0)
+        return header, body
+
+    @staticmethod
+    def _indent_block(text: str, prefix: str) -> str:
+        return "\n".join(prefix + line if line.strip() else line for line in text.split("\n"))
+
+    @classmethod
+    def _java_wrappers(cls, code: str) -> list[str]:
+        """生成两个候选编译单元：声明放类体 / 语句放 main 方法体。"""
+        header, body = cls._split_java_fragment(code)
+        body_text = "\n".join(body).strip("\n")
+        parts: list[str] = []
+        if header:
+            parts.append("\n".join(header))
+
+        class_body = parts + [
+            "public class Main {",
+            cls._indent_block(body_text, "    "),
+            "}",
+        ]
+        method_body = parts + [
+            "public class Main {",
+            "    public static void main(String[] args) {",
+            cls._indent_block(body_text, "        "),
+            "    }",
+            "}",
+        ]
+        return ["\n".join(class_body), "\n".join(method_body)]
 
     # ------------------------------------------------------------------
     # 漏洞模式移除检查
     # ------------------------------------------------------------------
     def run_test(
-        self, original_code: str, fixed_code: str, language: str
+        self, original_code: str, fixed_code: str, language: str,
+        skip_syntax: bool = False,
     ) -> Optional[bool]:
         """基础测试：修复后代码能否解析 + 危险模式是否移除。
 
         判定逻辑：
-        1. 修复后代码若无法通过语法解析 → False
+        1. 修复后代码若无法通过语法解析 → False（skip_syntax=True 时跳过，由调用方先验）
         2. 原始代码命中危险模式 + 修复后代码不再命中 → True
         3. 原始代码命中危险模式 + 修复后代码仍命中 → False
         4. 原始代码未命中危险模式 → None（无法判定）
         5. 修复后代码无法解析（非已知语言）→ 仅做模式移除检查
 
+        Args:
+            skip_syntax: 语法校验是否已由调用方完成（verify_fix 会先验一次，
+                避免 JS/Java 修复代码起两次子进程）。默认 False 保持独立调用语义。
+
         Returns:
             True=修复有效，False=修复无效，None=无法判定
         """
-        # 修复后代码语法校验（已知语言）
-        syntax_ok, _ = self.verify_syntax(fixed_code, language)
-        if not syntax_ok:
-            return False
+        if not skip_syntax:
+            # 修复后代码语法校验（已知语言）
+            syntax_ok, _ = self.verify_syntax(fixed_code, language)
+            if not syntax_ok:
+                return False
 
         # 危险模式移除检查
         orig_has_vuln = self._has_vuln_pattern(original_code)
@@ -303,7 +384,7 @@ class FixVerifier:
 
         # 模式移除检查（仅在语法合法时进行）
         if syntax_ok:
-            tests_passed = self.run_test(original_code, fixed_code, language)
+            tests_passed = self.run_test(original_code, fixed_code, language, skip_syntax=True)
         else:
             tests_passed = False  # 语法不合法直接判失败
 

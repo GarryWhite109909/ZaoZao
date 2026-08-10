@@ -18,6 +18,8 @@ SQL 注入还是命令注入）通常正确，但 CWE *编号* 是纯记忆任�
 
 from __future__ import annotations
 
+import re
+
 # (关键词列表, 规范 CWE 标签)。按"更具体优先"排列，避免子串歧义。
 # 关键词同时覆盖中英文，均为较独特子串，不与其它类别互相包含。
 # 标签统一为 CWE 官方标准英文名（与旧管道模型输出风格一致）。
@@ -34,6 +36,10 @@ _CWE_BY_KEYWORD: list[tuple[tuple[str, ...], str]] = [
     (("server-side template injection", "模板注入", "ssti"), "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine"),
     (("log injection", "日志注入", "logi"), "CWE-117 Improper Output Neutralization for Logs"),
 ]
+
+# 短规则 ID 类关键词：裸子串会误命中 "logical"、"cmdi_xxx" 等上下文，
+# 用 \b 词边界收紧为独立词。
+_BOUNDED_KEYWORDS = frozenset({"cmdi", "codei", "logi"})
 
 
 def normalize_cwe_label(raw: str) -> str:
@@ -54,8 +60,12 @@ def normalize_cwe_label(raw: str) -> str:
         return "none"
     lowered = text.lower()
     for keywords, label in _CWE_BY_KEYWORD:
-        if any(k in lowered for k in keywords):
-            return label
+        for k in keywords:
+            if k in _BOUNDED_KEYWORDS:
+                if re.search(rf"\b{re.escape(k)}\b", lowered):
+                    return label
+            elif k in lowered:
+                return label
     return text
 
 
@@ -68,6 +78,11 @@ if __name__ == "__main__":
         ("SQL Injection", "CWE-89 SQL Injection"),
         ("命令注入", "CWE-78 Command Injection"),
         ("CWE-78 Command Injection", "CWE-78 Command Injection"),
+        ("cmdi", "CWE-78 Command Injection"),                        # 规则 ID 短词 → 词边界命中
+        ("codei", "CWE-94 Code Injection"),
+        ("logi", "CWE-117 Improper Output Neutralization for Logs"),
+        ("logical bug", "logical bug"),                              # "logi" 不应匹配 "logical"
+        ("cmdispatch", "cmdispatch"),                                # "cmdi" 不应匹配 "cmdispatch"
         ("Path Traversal", "CWE-22 Path Traversal"),
         ("XSS", "CWE-79 Cross-Site Scripting"),
         ("Insecure Deserialization", "CWE-502 Deserialization of Untrusted Data"),

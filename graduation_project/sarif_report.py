@@ -18,7 +18,9 @@ JetBrains Qodana 均原生支持），导出后前端与 CI 可直接消费。
 
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 from typing import Any, Optional
 
 SARIF_VERSION = "2.1.0"
@@ -51,25 +53,68 @@ def _rule_id_from_type(vuln_type: str) -> str:
     return vuln_type.split()[0] if vuln_type.split() else "unknown"
 
 
+def _load_source_text(r: Any) -> str:
+    """读取结果对应的源码文本，用于回填真实行号；文件不可读时返回空串。"""
+    filename = getattr(r, "filename", "") or ""
+    if not filename:
+        return ""
+    try:
+        return Path(filename).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _find_line(code: str, needle: str) -> Optional[int]:
+    """在源码中找包含 needle 的第一行；找不到返回 None。"""
+    needle = (needle or "").strip()
+    if not code or not needle:
+        return None
+    for idx, line in enumerate(code.splitlines(), 1):
+        if needle in line:
+            return idx
+    return None
+
+
+def _start_line(r: Any, code: str) -> int:
+    """优先用 sink 文本、其次 source 文本在原文件里搜真实行号，兜底第 1 行。"""
+    for field in ("sink", "source"):
+        line = _find_line(code, getattr(r, field, ""))
+        if line:
+            return line
+    return 1
+
+
+def _partial_fingerprints(rule_id: str, start_line: int, *keys: str) -> dict:
+    """生成稳定的 partialFingerprints（GitHub Code Scanning 用它跨扫描去重）。"""
+    payload = "|".join([rule_id, str(start_line), *(str(k) for k in keys)])
+    return {"primaryLocationLineHash": hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]}
+
+
 def single_result_to_sarif_result(r: Any) -> Optional[dict]:
     """SingleResult（旧管道）→ SARIF result。判非漏洞返回 None（不产出）。"""
     if getattr(r, "has_vulnerability", None) is not True:
         return None
     vuln_type = getattr(r, "vulnerability_type", "") or ""
     explanation = getattr(r, "explanation", "") or ""
+    source = getattr(r, "source", "") or ""
+    sink = getattr(r, "sink", "") or ""
+    code = _load_source_text(r)
+    line = _start_line(r, code)
+    rule_id = _rule_id_from_type(vuln_type)
     return {
-        "ruleId": _rule_id_from_type(vuln_type),
+        "ruleId": rule_id,
         "level": _RISK_TO_LEVEL.get((getattr(r, "risk_level", "") or "").lower(), "warning"),
         "message": {"text": f"[{vuln_type}] {explanation}".strip()},
         "locations": [{
             "physicalLocation": {
                 "artifactLocation": {"uri": getattr(r, "filename", "") or "unknown"},
-                "region": {"startLine": 1},
+                "region": {"startLine": line},
             }
         }],
+        "partialFingerprints": _partial_fingerprints(rule_id, line, source, sink),
         "properties": {
-            "source": getattr(r, "source", ""),
-            "sink": getattr(r, "sink", ""),
+            "source": source,
+            "sink": sink,
             "fix_suggestion": getattr(r, "fix_suggestion", ""),
             "pipeline": "single-stage",
         },
@@ -90,8 +135,11 @@ def two_stage_to_sarif_results(r: Any) -> list[dict]:
         confidence = getattr(adj, "confidence", None)
         f = finding.to_dict() if hasattr(finding, "to_dict") else dict(finding)
         line = f.get("sink_line") or f.get("source_line") or 1
+        source = f.get("source", "")
+        sink = f.get("sink", "")
+        rule_id = _rule_id_from_type(f.get("taint_type", ""))
         out.append({
-            "ruleId": _rule_id_from_type(f.get("taint_type", "")),
+            "ruleId": rule_id,
             "level": _level_from_confidence(confidence),
             "message": {
                 "text": f"[{f.get('taint_type', '')}] "
@@ -103,11 +151,12 @@ def two_stage_to_sarif_results(r: Any) -> list[dict]:
                     "region": {"startLine": max(1, int(line))},
                 }
             }],
+            "partialFingerprints": _partial_fingerprints(rule_id, max(1, int(line)), source, sink),
             "properties": {
                 "confidence": confidence,
                 "votes": f"{getattr(adj, 'votes_true', 0)}/{getattr(adj, 'votes_false', 0)}",
-                "source": f.get("source", ""),
-                "sink": f.get("sink", ""),
+                "source": source,
+                "sink": sink,
                 "propagation": f.get("path", []),
                 "fix_suggestion": getattr(adj, "fix_suggestion", ""),
                 "pipeline": "two-stage",

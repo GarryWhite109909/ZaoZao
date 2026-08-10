@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
 from urllib.parse import urlparse
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener, urlopen
 
 # Windows 默认 GBK 控制台：任何会 print 非 GBK 字符的脚本必须重新配置 stdout/stderr
 if sys.platform == "win32":
@@ -987,13 +987,51 @@ def _installed_package_version(python_executable: str, package: str) -> str:
         return ""
 
 
-def _probe_gpu_support(python_executable: str, code: str) -> bool:
-    """在目标解释器中运行 GPU 能力探测代码，stdout 为 TRUE 表示 GPU 后端可用。"""
+def _nvidia_runtime_dirs() -> list[str]:
+    """返回 pip 安装的 NVIDIA CUDA 运行时 DLL 所在目录（需加入 PATH 才能加载 llama.dll）。
+
+    llama_cpp 的 CUDA wheel 只自带 llama.dll，其依赖的 cudart64_12.dll / cublas64_12.dll
+    由 nvidia-cuda-runtime-cu12 / nvidia-cublas-cu12 等 pip 包提供。这些 DLL 不在系统 PATH
+    上，若探测子进程环境里没把它们加进去，import llama_cpp 会报
+    "Could not find module ... llama.dll (or one of its dependencies)"，导致
+    llama_supports_gpu_offload() 探测失败（误判为 CPU-only 版本）。
+    """
+    dirs: list[str] = []
     try:
+        import site
+        roots = []
+        for sp in site.getsitepackages():
+            cand = Path(sp) / "nvidia"
+            if cand.is_dir():
+                roots.append(cand)
+        user_dir = Path(site.getusersitepackages()) / "nvidia"
+        if user_dir.is_dir():
+            roots.append(user_dir)
+        for root in roots:
+            for pkg in ("cuda_runtime", "cublas", "cuda_nvrtc", "cuda_cudart"):
+                bin_dir = root / pkg / "bin"
+                if bin_dir.is_dir():
+                    dirs.append(str(bin_dir))
+    except Exception:
+        pass
+    return dirs
+
+
+def _probe_gpu_support(python_executable: str, code: str) -> bool:
+    """在目标解释器中运行 GPU 能力探测代码，stdout 为 TRUE 表示 GPU 后端可用。
+
+    探测前把 pip 安装的 NVIDIA 运行时 DLL 目录注入子进程 PATH，否则 llama.dll 加载
+    依赖失败会误判为 CPU-only 版本。
+    """
+    try:
+        env = os.environ.copy()
+        nvidia_dirs = _nvidia_runtime_dirs()
+        if nvidia_dirs:
+            env["PATH"] = os.pathsep.join(nvidia_dirs) + os.pathsep + env.get("PATH", "")
         r = subprocess.run(
             [python_executable, "-c", code],
             capture_output=True, text=True, timeout=60,
-            encoding="utf-8", errors="replace",
+            encoding="utf-8", errors="replace", env=env,
         )
         return r.returncode == 0 and "TRUE" in r.stdout.upper()
     except Exception:
@@ -1106,17 +1144,75 @@ def _add_pip_network_flags(cmd: List[str]) -> None:
         cmd.extend(["--progress-bar", PIP_PROGRESS_BAR])
 
 
-# llama-cpp-python 预编译 wheel 的 ghproxy 镜像前缀（避免国内直连 GitHub Releases 被掐断）
-_GH_PROXY_PREFIX = os.environ.get(
-    "VULN_SCANNER_GH_PROXY", "https://mirror.ghproxy.com/"
-).strip().rstrip("/") + "/"
+# llama-cpp-python 预编译 wheel 的 ghproxy 镜像前缀（避免国内直连 GitHub Releases 被掐断）。
+# 注意：各 ghproxy 公共镜像节点经常失效/宕机（如 mirror.ghproxy.com 已不可用），
+# 因此维护一个候选列表，下载时逐个探测直到成功，避免写死单一节点导致必挂。
+# 用户可用 VULN_SCANNER_GH_PROXY 显式指定首个候选。
+_GH_PROXY_CANDIDATES = [
+    os.environ.get("VULN_SCANNER_GH_PROXY", "").strip(),
+    "https://ghproxy.net/",
+    "https://gh-proxy.com/",
+    "https://ghproxy.link/",
+    "https://ghfast.top/",
+]
+# 去掉空项、去重、统一以 "/" 结尾；探测失败时会继续尝试下一个候选。
+_GH_PROXY_PREFIXES = [
+    p.rstrip("/") + "/"
+    for p in dict.fromkeys(c for c in _GH_PROXY_CANDIDATES if c and c.strip())
+]
+
+
+class _SlowMirrorError(Exception):
+    """镜像下载速度过低时抛出，用于中断当前镜像换下一个。"""
+
+
+# 镜像下载最低速度（B/s）：低于此值视为"慢镜像"并立即放弃。
+# 公共 ghproxy 回源 536MB 大文件经常只有 ~20KB/s，等 read 超时太久；
+# 这里以 8 秒窗口计速，低于 50KB/s 就换下一个。可用环境变量覆盖。
+WHEEL_MIN_SPEED = int(
+    os.environ.get("VULN_SCANNER_WHEEL_MIN_SPEED", "").strip() or (50 * 1024)
+)
+
+
+def _detect_system_proxy() -> str:
+    """探测可用的系统代理（优先环境变量，回退 Windows 注册表系统代理）。
+
+    返回形如 "http://127.0.0.1:7897" 的代理地址；未检测到时返回空字符串。
+    """
+    # 1) 环境变量（http_proxy / https_proxy / all_proxy），大小写都认
+    for var in ("https_proxy", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            if not val.lower().startswith(("http://", "https://")):
+                val = "http://" + val
+            return val
+    # 2) Windows 注册表系统代理（仅当开启了系统代理才读取）
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as key:
+                enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+                if enabled:
+                    server, _ = winreg.QueryValueEx(key, "ProxyServer")
+                else:
+                    server = ""
+            if server:
+                if not server.lower().startswith(("http://", "https://")):
+                    server = "http://" + server
+                return server
+        except Exception:  # noqa: BLE001
+            pass
+    return ""
 
 
 def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[str], None]] = None) -> Optional[Path]:
-    """把 spec.mirror_wheel_url 指定的 GitHub wheel 经 ghproxy 镜像下载到本地。
+    """把 spec.mirror_wheel_url 指定的 GitHub wheel 下载到本地。
 
-    返回本地 wheel 路径；未配置 mirror_wheel_url 或镜像不可用（含下载不完整）时返回 None，
-    调用方应回退到正常 pip（abetlen 索引）下载。
+    下载策略（按优先级）：
+        1. 若检测到系统代理 → 直接走代理连 GitHub（快，一次性，避免在慢镜像上死等）
+        2. 否则 → 逐个试 ghproxy 镜像（直连，不吃代理流量），配最低速度监控，
+           速度过慢立即放弃换下一个，不等 read 超时
+    返回本地 wheel 路径；全部失败返回 None，调用方回退 pip 直连。
     """
     url = (spec.mirror_wheel_url or "").strip()
     if not url:
@@ -1131,47 +1227,146 @@ def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[s
     cache_dir = _proj_root / "cache" / "wheels"
     cache_dir.mkdir(parents=True, exist_ok=True)
     dest = cache_dir / filename
-    if dest.is_file() and dest.stat().st_size > 0:
-        _emit(f"[依赖安装] 复用已缓存 wheel: {dest}", callback)
-        return dest
+    marker = cache_dir / (filename + ".ok")
+    # 缓存完整性用 sidecar 标记校验：只有上次下载完整成功写出 .ok 的 wheel 才可复用，
+    # 避免下载中断留下的残片（>0 字节但远小于完整大小）被误当有效缓存。
+    if marker.is_file():
+        try:
+            expected = int(marker.read_text(encoding="utf-8").strip())
+        except Exception:  # noqa: BLE001
+            expected = 0
+        if dest.is_file() and dest.stat().st_size == expected and expected > 0:
+            _emit(f"[依赖安装] 复用已缓存 wheel: {dest}", callback)
+            return dest
+        # 标记存在但文件缺失/不完整 → 视为损坏缓存，删除后重新下载
+        _emit(f"[依赖安装] ⚠️ 缓存损坏（残片 {dest}），删除并重新下载", callback)
+        dest.unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
 
-    mirror_url = _GH_PROXY_PREFIX + url
-    _emit(f"[依赖安装] 经镜像下载 llama-cpp-python wheel（避免 GitHub 断连）: {mirror_url}", callback)
-    try:
-        # 镜像直连、不走代理：避免代理秒断 + 白白消耗代理流量
-        _mirror_host = urlparse(mirror_url).hostname or ""
+    # —— 1) 优先走系统代理直连 GitHub（快且一次性，避免在慢镜像上死等）——
+    proxy_url = _detect_system_proxy()
+    if proxy_url:
+        _emit(f"[依赖安装] 检测到系统代理，直连 GitHub 下载（不经镜像）: {proxy_url}", callback)
+        try:
+            opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
+            with opener.open(url, timeout=60) as resp, open(dest, "wb") as f:
+                total = int(resp.headers.get("content-length", 0))
+                downloaded = 0
+                last_report = time.time()
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    # 进度上报：每 2 秒输出一次（下载 536MB 大文件时让用户看到实时进度）
+                    now = time.time()
+                    if now - last_report >= 2:
+                        _emit(
+                            f"[依赖安装] 代理下载中: {downloaded/1024/1024:.1f}MB / {total/1024/1024:.1f}MB"
+                            f" ({downloaded*100/total:.0f}%)"
+                            if total > 0
+                            else f"[依赖安装] 代理下载中: {downloaded/1024/1024:.1f}MB",
+                            callback,
+                        )
+                        last_report = now
+            if total > 0 and downloaded != total:
+                _emit(
+                    f"[依赖安装] ⚠️ 代理下载不完整 {downloaded}/{total} 字节，删缓存并回退 pip 直连",
+                    callback,
+                )
+                dest.unlink(missing_ok=True)
+                marker.unlink(missing_ok=True)
+                return None
+            marker.write_text(str(downloaded), encoding="utf-8")
+            _emit(f"[依赖安装] ✅ 代理直连 GitHub 下载完成: {dest}", callback)
+            return dest
+        except Exception as e:
+            _emit(
+                f"[依赖安装] ⚠️ 代理直连 GitHub 失败（{type(e).__name__}: {e}），回退走镜像",
+                callback,
+            )
+            dest.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+            # 代理失败不立即返回，落到下方镜像逻辑再试
+
+    # —— 2) 无代理 / 代理失败时，逐个试 ghproxy 镜像（直连，不吃代理流量）——
+    # 每个候选都设 NO_PROXY 直连。加速：最低速度监控，速度过低马上放弃换下一个，
+    # 避免在 20KB/s 的慢镜像上死等 read 超时（慢速但它不报超时）。
+    reflected_hosts = set()
+    for prefix in _GH_PROXY_PREFIXES:
+        mirror_url = prefix + url
+        mirror_host = urlparse(mirror_url).hostname or ""
+        if mirror_host:
+            reflected_hosts.add(mirror_host)
         _no_proxy = set(
             h.strip()
             for h in os.environ.get("NO_PROXY", "").replace(";", ",").split(",")
             if h.strip()
         )
-        if _mirror_host:
-            _no_proxy.add(_mirror_host)
+        _no_proxy |= reflected_hosts
         _no_proxy_val = ",".join(sorted(_no_proxy))
         os.environ["NO_PROXY"] = _no_proxy_val
         os.environ["no_proxy"] = _no_proxy_val
-        with urlopen(mirror_url, timeout=60) as resp, open(dest, "wb") as f:
-            total = int(resp.headers.get("content-length", 0))
-            downloaded = 0
-            while True:
-                chunk = resp.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-        if total > 0 and downloaded != total:
+
+        _emit(f"[依赖安装] 经镜像下载 llama-cpp-python wheel（避免 GitHub 断连）: {mirror_url}", callback)
+        try:
+            with urlopen(mirror_url, timeout=60) as resp, open(dest, "wb") as f:
+                total = int(resp.headers.get("content-length", 0))
+                downloaded = 0
+                window_started = time.time()
+                window_bytes = 0
+                last_report = time.time()
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    # 最低速度监控：以最近的 8 秒窗口计速，低于 50KB/s 视为"慢镜像"，
+                    # 立即中断换下一个（公共 ghproxy 回源大文件经常只有 20KB/s）。
+                    window_bytes += len(chunk)
+                    now = time.time()
+                    if now - window_started >= 8:
+                        speed = window_bytes / (now - window_started)
+                        if speed < WHEEL_MIN_SPEED:
+                            raise _SlowMirrorError(
+                                f"镜像下载过慢（{speed:.0f} B/s < {WHEEL_MIN_SPEED // 1024}KB/s），换下一个"
+                            )
+                        window_started = now
+                        window_bytes = 0
+                    # 进度上报：每 2 秒输出一次
+                    if now - last_report >= 2:
+                        _emit(
+                            f"[依赖安装] 镜像下载中: {downloaded/1024/1024:.1f}MB / {total/1024/1024:.1f}MB"
+                            f" ({downloaded*100/total:.0f}%)"
+                            if total > 0
+                            else f"[依赖安装] 镜像下载中: {downloaded/1024/1024:.1f}MB",
+                            callback,
+                        )
+                        last_report = now
+            if total > 0 and downloaded != total:
+                _emit(
+                    f"[依赖安装] ⚠️ 镜像下载不完整 {downloaded}/{total} 字节，换下一个镜像重试",
+                    callback,
+                )
+                dest.unlink(missing_ok=True)
+                marker.unlink(missing_ok=True)
+                continue
+            marker.write_text(str(downloaded), encoding="utf-8")
+            _emit(f"[依赖安装] ✅ 镜像下载完成: {dest}", callback)
+            return dest
+        except Exception as e:
             _emit(
-                f"[依赖安装] ⚠️ 镜像下载不完整 {downloaded}/{total} 字节，删缓存并回退 pip 直连",
+                f"[依赖安装] ⚠️ 镜像 {prefix} 下载失败（{type(e).__name__}: {e}），换下一个镜像",
                 callback,
             )
             dest.unlink(missing_ok=True)
-            return None
-        _emit(f"[依赖安装] ✅ 镜像下载完成: {dest}", callback)
-        return dest
-    except Exception as e:
-        _emit(f"[依赖安装] ⚠️ 镜像下载失败（{type(e).__name__}: {e}），回退 pip 直连", callback)
-        dest.unlink(missing_ok=True)
-        return None
+            marker.unlink(missing_ok=True)
+            continue
+
+    _emit(f"[依赖安装] ⚠️ 没有可用镜像，回退 pip 直连下载", callback)
+    return None
 
 
 def _run_pip_install(

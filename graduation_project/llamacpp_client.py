@@ -40,10 +40,53 @@ from graduation_project.paths import resolve_adapter_path, llamacpp_dir
 _LLAMA = None  # 延迟导入 llama_cpp
 
 
+def _ensure_cuda_runtime_on_path() -> None:
+    """把 pip 安装的 NVIDIA CUDA 运行时 DLL 目录加进 PATH。
+
+    背景：llama-cpp-python 的 CUDA 预编译 wheel（cu125 等）编译时链接
+    cudart64_12.dll / cublas64_12.dll，但 wheel 本身不打包这两个运行时，
+    需要系统有 CUDA Toolkit 或 pip 装 nvidia-cuda-runtime-cu12 / nvidia-cublas-cu12。
+    而 pip 是把这些 DLL 装到 site-packages/nvidia/*/bin/，不在 PATH 里；
+    若不加入 PATH，llama.dll 加载时会报 "Could not find module ... llama.dll
+    (or one of its dependencies)"，进而 llama_supports_gpu_offload() 返回 False、
+    回退 CPU。这里在 import llama_cpp 前把相关 bin 目录前置到 PATH 解决。
+    """
+    import site
+
+    nvidia_root = None
+    for sp in site.getsitepackages():
+        cand = Path(sp) / "nvidia"
+        if cand.is_dir():
+            nvidia_root = cand
+            break
+    if nvidia_root is None:
+        # 备选：用户级 site-packages（--user 安装）
+        user_dir = Path(site.getusersitepackages()) / "nvidia"
+        if user_dir.is_dir():
+            nvidia_root = user_dir
+    if nvidia_root is None:
+        return
+
+    bin_dirs = sorted(
+        (nvidia_root / pkg / "bin" for pkg in ("cuda_runtime", "cublas", "cuda_nvrtc", "cuda_cudart")),
+        key=lambda p: p.exists(),
+        reverse=True,  # 存在的排前面
+    )
+    existing = set(
+        p.rstrip("/\\").lower()
+        for p in os.environ.get("PATH", "").split(os.pathsep)
+        if p
+    )
+    new_bits = [str(b) for b in bin_dirs if b.is_dir() and str(b).rstrip("/\\").lower() not in existing]
+    if new_bits:
+        os.environ["PATH"] = os.pathsep.join(new_bits) + os.pathsep + os.environ.get("PATH", "")
+
+
 def _lazy_import_llama_cpp():
     """延迟导入 llama_cpp，避免未安装的环境 import 本模块即报错。"""
     global _LLAMA
     if _LLAMA is None:
+        _ensure_cuda_runtime_on_path()  # 先补 CUDA 运行时后再加载 llama.dll
         from llama_cpp import Llama
         _LLAMA = {"Llama": Llama}
     return _LLAMA
