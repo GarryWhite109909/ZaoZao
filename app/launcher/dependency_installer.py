@@ -687,6 +687,75 @@ def _transformers_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_execut
     return specs
 
 
+def _list_conda_lib_dirs() -> list[str]:
+    """收集候选 conda lib 目录（base + 各 env），供 ROCm 编译缺失库补齐用。"""
+    dirs: list[str] = []
+    # 当前解释器所在 conda 根的 lib（base 或 env 的 lib）
+    p = Path(sys.executable).resolve()
+    if p.parent.name == "bin" and (p.parent.parent / "lib").is_dir():
+        dirs.append(str(p.parent.parent / "lib"))
+    # 扫描 conda envs 目录下各 env 的 lib
+    envs_dir = _conda_envs_dir()
+    if envs_dir is not None:
+        # base 的 lib 在 envs 的父目录
+        base_lib = envs_dir.parent / "lib"
+        if base_lib.is_dir():
+            dirs.append(str(base_lib))
+        for env in sorted(envs_dir.iterdir()):
+            if env.is_dir():
+                lib = env / "lib"
+                if lib.is_dir():
+                    dirs.append(str(lib))
+    # 去重保序（base 的 lib 可能被分支 1 与 base_lib 各加一次）
+    return list(dict.fromkeys(dirs))
+
+
+def _rocm_toolchain_lib_paths() -> tuple[list[str], list[str]]:
+    """补齐 ROCm 源码编译工具链（clang++/lld）运行时缺失的系统库路径。
+
+    ROCm 7.x 的 lld 链接器编译时链接的是旧版 libxml2.so.2，而较新的发行版
+    （如 Ubuntu 24.04）把 libxml2 包改名成 libxml2-16（soname 从 .so.2 变 .so.16），
+    于是 HIP 源码编译时 clang++ 调用 lld 会报 "libxml2.so.2: cannot open shared
+    object file"（见 bug1.txt）。conda base/各 env 的 lib 目录仍带旧 ABI 的
+    libxml2.so.2，这里定位 ROCm 工具链的动态库缺失项，并从 conda lib 目录找同名
+    .so 补齐。
+
+    Returns:
+        (补齐目录列表, 缺失库名列表)。找不到可补齐目录时第一项为空，但第二项
+        会给出缺失库名，供调用方输出手动指引。
+    """
+    # 1) 定位 ROCm 工具链二进制（clang++ / lld）
+    rocm_bins: list[str] = []
+    for version_dir in [Path("/opt/rocm")] + sorted(Path("/opt").glob("rocm-*")):
+        for sub in ("lib/llvm/bin/clang++", "lib/llvm/bin/lld"):
+            b = version_dir / sub
+            if b.is_file():
+                rocm_bins.append(str(b))
+    if not rocm_bins:
+        return [], []
+
+    # 2) 用 ldd 找出 "not found" 的动态库名
+    missing: set[str] = set()
+    for b in rocm_bins:
+        code, out = _run_quiet(["ldd", b], timeout=5.0)
+        if code != 0:
+            continue
+        for line in out.splitlines():
+            if "not found" in line:
+                lib = line.split("=>", 1)[0].strip()
+                if lib:
+                    missing.add(lib)
+    if not missing:
+        return [], []
+
+    # 3) 从 conda lib 目录里找同名库补齐
+    dirs: list[str] = []
+    for d in _list_conda_lib_dirs():
+        if any((Path(d) / lib).exists() for lib in missing):
+            dirs.append(d)
+    return dirs, sorted(missing)
+
+
 def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable: str) -> List[InstallSpec]:
     """llamacpp 后端：llama-cpp-python（按平台 + GPU 系别选预编译 wheel 或源码编译）。
 
@@ -812,6 +881,31 @@ def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable
         env = {"CMAKE_ARGS": "-DGGML_HIP=ON"}
         description = "llama-cpp-python (ROCm)"
         pip_extra_args = ["--no-binary", "llama-cpp-python"]
+        # ROCm 源码编译要调用 clang++/lld；若其运行时依赖的系统库缺失（如
+        # Ubuntu 24.04 缺 libxml2.so.2），从 conda lib 目录补齐 LD_LIBRARY_PATH，
+        # 否则 lld 报 "cannot open shared object file" 导致编译失败。
+        rocm_libs, rocm_missing = _rocm_toolchain_lib_paths()
+        if rocm_libs:
+            prev = env.get("LD_LIBRARY_PATH", os.environ.get("LD_LIBRARY_PATH", ""))
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(rocm_libs) + (
+                os.pathsep + prev if prev else ""
+            )
+            warning = (
+                f"检测到 ROCm 工具链缺失系统库 {', '.join(rocm_missing)}，已从 "
+                f"{', '.join(rocm_libs)} 通过 LD_LIBRARY_PATH 补齐以完成编译。"
+            )
+        elif rocm_missing:
+            # conda 里也没有可补齐的库，给出手动指引（apt 已改名装不了旧 soname）
+            warning = (
+                f"检测到 ROCm 工具链缺失系统库 {', '.join(rocm_missing)}，且 conda 环境"
+                f"中未找到同名库。Ubuntu 24.04 已将 libxml2 包改名成 libxml2-16 "
+                f"（soname 变 .so.16），apt 无法安装旧版 {', '.join(rocm_missing)}。\n"
+                f"  请任选其一：\n"
+                f"  1) conda 安装旧 ABI 库：conda install -n base -c conda-forge libxml2\n"
+                f"  2) 手动建符号链接：sudo ln -s /usr/lib/x86_64-linux-gnu/libxml2.so.16 "
+                f"/usr/lib/x86_64-linux-gnu/libxml2.so.2\n"
+                f"  完成后再重试安装。"
+            )
     elif gpu.vendor == "amd":
         warning = (
             "Windows + AMD GPU：llama-cpp-python 的 PyPI 预编译包是 CPU 版，将按 CPU 安装。"

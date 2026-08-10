@@ -1527,6 +1527,22 @@ def _no_proxy_for_mirrors(*hosts: str) -> None:
     os.environ["no_proxy"] = val
 
 
+def _normalize_socks_proxy() -> None:
+    """把环境里裸 'socks://' 代理规范化为 'socks5://'。
+
+    clash/verge 等科学上网工具常把代理写成 socks://127.0.0.1:7897，但
+    urllib3/requests/PySocks 只认 socks5://、socks4://、socks5h://，裸的
+    socks:// 会在下载时抛 "ValueError: Unknown scheme for proxy URL"。
+    这里在发起网络下载前统一把 socks:// 修正为 socks5://。
+    """
+    for _var in ("ALL_PROXY", "all_proxy",
+                 "HTTP_PROXY", "http_proxy",
+                 "HTTPS_PROXY", "https_proxy"):
+        _val = os.environ.get(_var, "").strip()
+        if _val.lower().startswith("socks://"):
+            os.environ[_var] = "socks5://" + _val[len("socks://"):]
+
+
 def _models_dir() -> Path:
     """返回项目 models/ 目录（不存在则创建）。"""
     d = find_project_root() / "models"
@@ -1848,6 +1864,8 @@ async def models_download_gguf(req: GgufDownloadRequest):
 
     def run_download():
         try:
+            # 规范化裸 socks:// 代理，避免 urllib3 抛 Unknown scheme
+            _normalize_socks_proxy()
             # HuggingFace resolve URL → 复用 huggingface_hub 的 hf_hub_download
             # （断点续传 + 重试 + 走 HF_MIRROR 镜像），与 transformers 下载同栈，
             # 避免裸 urlopen 直连 hf-mirror.com 大文件连接超时（WinError 10060）。
@@ -1877,11 +1895,13 @@ async def models_download_gguf(req: GgufDownloadRequest):
                     "pct": 0,
                 })
                 try:
-                    # 1) 代理优先：不注入 NO_PROXY，走系统代理（无代理则直连）
-                    local = _hf_download(_bypass_proxy=False)
+                    # 强制镜像直连：hf-mirror 为国内镜像，直连最稳。走系统
+                    # socks 代理访问 hf-mirror 反而不稳定（httpx 走代理时
+                    # 报 LocalEntryNotFoundError），故不再"代理优先"。
+                    local = _hf_download(_bypass_proxy=True)
                 except Exception as _e:
-                    # 2) 直连回退：强制镜像直连再试一次
-                    print(f"[download-gguf] 走代理下载失败({type(_e).__name__}: {_e})，回退镜像直连", flush=True)
+                    # 直连偶发失败，重试一次
+                    print(f"[download-gguf] 镜像直连失败({type(_e).__name__}: {_e})，重试一次", flush=True)
                     local = _hf_download(_bypass_proxy=True)
                 actual = Path(local)
                 total = actual.stat().st_size

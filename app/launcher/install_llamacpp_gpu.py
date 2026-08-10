@@ -52,7 +52,11 @@ if sys.platform == "win32":
         pass
 
 # 复用启动器的平台/GPU 检测，保证口径一致
-from app.launcher.dependency_installer import detect_gpu, detect_platform
+from app.launcher.dependency_installer import (
+    detect_gpu,
+    detect_platform,
+    _rocm_toolchain_lib_paths,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +250,21 @@ def compile_install(plan: Dict, python_executable: str, dry_run: bool) -> bool:
     print(f"  CMAKE_ARGS = {plan['cmake_args']}")
 
     env = {"CMAKE_ARGS": plan["cmake_args"], "FORCE_CMAKE": "1"}
+    # ROCm 源码编译要调用 clang++/lld；若其运行时依赖系统库缺失（如 Ubuntu 24.04
+    # 缺 libxml2.so.2），从 conda lib 目录补齐 LD_LIBRARY_PATH，避免编译失败。
+    if plan["backend"] == "amd":
+        rocm_libs, rocm_missing = _rocm_toolchain_lib_paths()
+        if rocm_libs:
+            prev = os.environ.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(rocm_libs) + (
+                os.pathsep + prev if prev else ""
+            )
+            print(f"  [ROCm] 补齐编译库 LD_LIBRARY_PATH: {os.pathsep.join(rocm_libs)}"
+                  f" (缺失: {', '.join(rocm_missing)})")
+        elif rocm_missing:
+            print(f"  [ROCm] ⚠ 缺失系统库 {', '.join(rocm_missing)} 且 conda 无可补齐库。"
+                  f"Ubuntu 24.04 的 libxml2 已改名(so.2->so.16)，apt 装不了旧版，"
+                  f"请手动处理后再编译（见 dependency_installer 提示）。")
     cmd = [python_executable, "-m", "pip", "install", "--upgrade",
            "--no-cache-dir",
            "--no-binary", "llama-cpp-python",
