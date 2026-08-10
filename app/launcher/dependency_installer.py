@@ -1140,12 +1140,13 @@ def _build_satisfies(installed: str, required: str) -> bool:
 
     - cu 系列：数字 ≥ 要求即可（如 RTX 50 要求 cu128，已装 cu130 也满足）；
     - rocm 系列：主版本号 ≥ 要求即可（如要求 rocm6.2，已装 rocm7.2 也满足）；
-    - cpu：任何构建都能跑。
+    - cpu / 无构建后缀：彼此视为等价（官方 PyPI 版无 +cpu 后缀，但功能上是 CPU 版）。
     """
-    if not installed:
-        return False
     if installed == required:
         return True
+    # 无构建后缀的官方 PyPI 版：CPU 场景下视为满足；GPU 场景下因 required 为 cu/rocm，不满足
+    if not installed:
+        return required == "cpu"
     if installed.startswith("cu") and required.startswith("cu"):
         try:
             return int(installed[2:]) >= int(required[2:])
@@ -1162,6 +1163,20 @@ def _build_satisfies(installed: str, required: str) -> bool:
     return False
 
 
+def _build_eq(a: Optional[str], b: Optional[str]) -> bool:
+    """判断两个构建后缀是否等价（空字符串与 'cpu' 视为等价）。"""
+    if a == b:
+        return True
+    cpu_like = {"", "cpu"}
+    return a in cpu_like and b in cpu_like
+
+
+# 与 torch 共用 C++ ABI 的 PyTorch 官方生态包：从 PyTorch index 安装时版本号
+# 带 +cuXXX/+cpu 构建后缀，必须与 torch 一致，否则可能触发 Windows DLL 入口点错误。
+# 本项目不依赖它们，发现不一致时直接卸载。
+_TORCH_ABI_PACKAGES = ("torchvision", "torchaudio", "torchtext", "torchdata")
+
+
 def torch_needs_reinstall(
     platform_info: PlatformInfo,
     gpu: GPUInfo,
@@ -1175,9 +1190,12 @@ def torch_needs_reinstall(
         - 需要 cu/rocm 但已装构建不匹配 → 需要重装（例如 AMD 机器上装了 CUDA 版 torch，
           或 ROCm 机器上被误判成 NVIDIA 而要求 cu）
         - CPU 族 → 任何已装构建都能跑，不重装
+
+    使用 pip 元数据（_query_package_build）而非直接 import torch，避免在清理前
+    触发 ABI 不匹配的 .pyd 加载，导致 Windows 弹出 "无法定位程序输入点" 错误窗口。
     """
     required = _required_torch_family(platform_info, gpu)
-    installed = _torch_build(python_executable)
+    installed = _query_package_build(python_executable, "torch")
 
     if installed is None:
         return True
@@ -1268,51 +1286,27 @@ def _list_conda_env_pythons() -> List[str]:
     return pythons
 
 
-def _torch_build_in_process() -> Optional[str]:
-    """进程内获取当前解释器 torch 构建标识（如 'rocm7.2' / 'cu130' / '' / None）。
-
-    与 _query_torch_build 不同：直接 import torch，避免子进程在 GPU 初始化时
-    超时/失败导致误判（这是 re-exec 死循环的根因之一）。
-    """
-    try:
-        import torch  # type: ignore
-    except Exception:
-        return None
-    v = getattr(torch, "__version__", "")
-    if "+" in v:
-        return v.split("+", 1)[1].lower()
-    return "" if v else None
-
-
-def _torch_build(python_executable: str) -> Optional[str]:
-    """统一读取指定解释器的 torch 构建标识。
-
-    - 目标是当前进程的解释器：用进程内 import（可靠，不受 GPU 初始化子进程干扰）
-    - 目标是其他环境的解释器：用子进程查询
-    """
-    try:
-        same = os.path.realpath(python_executable) == os.path.realpath(sys.executable)
-    except Exception:
-        same = python_executable == sys.executable
-    if same:
-        return _torch_build_in_process()
-    return _query_torch_build(python_executable)
-
-
 def _query_package_build(python_executable: str, package: str) -> Optional[str]:
-    """查询指定包的构建后缀（如 torchvision 2.7.0+cu128 -> cu128）。"""
+    """查询指定包的构建后缀（如 torchvision 2.7.0+cu128 -> cu128）。
+
+    不 import 包，避免 ABI 不匹配的 .pyd 在 import 时弹出 DLL 入口点错误窗口。
+    直接从 pip 元数据读取版本号（包含 +cu128 等 local version）。
+    """
     try:
         r = subprocess.run(
-            [python_executable, "-c", f"import {package}; print({package}.__version__)"],
+            [python_executable, "-m", "pip", "show", package],
             capture_output=True, text=True, timeout=60,
             encoding="utf-8", errors="replace",
         )
         if r.returncode != 0:
             return None
-        ver = r.stdout.strip()
-        if "+" in ver:
-            return ver.split("+", 1)[1].lower()
-        return "" if ver else None
+        for line in r.stdout.splitlines():
+            if line.startswith("Version:"):
+                ver = line.split(":", 1)[1].strip()
+                if "+" in ver:
+                    return ver.split("+", 1)[1].lower()
+                return "" if ver else None
+        return None
     except Exception:
         return None
 
@@ -1355,48 +1349,56 @@ def build_cleanup_plan(
     原则：只在明确不匹配时才动，平时不卸载任何包。
     - torch 构建不满足当前显卡要求（如旧版本装了 cu126，RTX 50 需要 cu128，
       或 AMD 机器上装了 CUDA 版 torch）→ 卸载 torch + bitsandbytes；
-      若环境中还残留 torchvision/torchaudio 旧构建（ABI 与新 torch 不匹配），
-      也一并卸载，避免启动时弹 "无法定位程序输入点" DLL 错误；
+      若环境中还残留 torchvision/torchaudio/torchtext/torchdata 等旧构建
+      （ABI 与新 torch 不匹配），也一并卸载，避免启动时弹
+      "无法定位程序输入点" DLL 错误；
     - RTX 50 系且 bitsandbytes 版本过旧（<0.45.5，无 Blackwell 内核）→ 卸载 bnb；
-    - 不动 torchtext 等其他 torch 生态包，避免破坏环境里其他项目。
     可用 VULN_SCANNER_SKIP_CLEAN=1 完全关闭自动卸载。
+
+    全程使用 pip 元数据查询构建后缀，避免在主进程 import torch/torchvision，
+    防止 Windows 在清理前就弹出 DLL 入口点错误窗口。
     """
     if os.environ.get("VULN_SCANNER_SKIP_CLEAN", "").strip() == "1":
         return []
 
     plan: List[str] = []
     required = _required_torch_family(platform_info, gpu)
-    installed = _torch_build(python_executable)
+    # 子进程 / pip 元数据查询：不在主进程 import torch
+    installed = _query_package_build(python_executable, "torch")
 
+    # 1) torch 构建不匹配：卸载 torch + bnb + 所有 torch C++ 生态包
     if required != "cpu" and installed is not None and not _build_satisfies(installed, required):
         plan.append("torch")
         # torch 构建变了，bitsandbytes 的内核与 torch 绑定，必须一起重装
         if _package_version(python_executable, "bitsandbytes") is not None:
             plan.append("bitsandbytes")
-        # 环境里若存在 torchvision/torchaudio 的旧构建（如 cu126/cu121），与新 torch
+        # 环境里若存在 torchvision/torchaudio 等的旧构建（如 cu126/cu121），与新 torch
         # ABI 不匹配会导致启动时弹 "无法定位程序输入点" 错误；一并卸载让它们随新 torch
         # 重新解析或不再加载（本项目实际不需要它们）。
-        for pkg in ("torchvision", "torchaudio"):
+        for pkg in _TORCH_ABI_PACKAGES:
             if _package_version(python_executable, pkg) is not None:
                 plan.append(pkg)
 
+    # 2) RTX 50 系且 bitsandbytes 版本过旧（<0.45.5，无 Blackwell 内核）
     if gpu.vendor == "nvidia" and classify_gpu(gpu).family == "nvidia_50":
         bnb_ver = _package_version(python_executable, "bitsandbytes")
         if bnb_ver is not None and _version_lt(bnb_ver, "0.45.5"):
             plan.append("bitsandbytes")
 
-    # 即使 torch 本身已匹配当前硬件，若环境中残留的 torchvision/torchaudio 构建与
-    # torch 不一致（例如 torch 已升级到 cu128，但 torchvision 还是 cu126），import 时
-    # 会触发 DLL 入口点错误。这里把构建不一致的也清理掉。
-    torch_build = _torch_build(python_executable)
-    if torch_build is not None:
-        for pkg in ("torchvision", "torchaudio"):
+    # 3) 即使 torch 本身已匹配当前硬件，若环境中残留的 torch C++ 生态包构建与 torch
+    # 不一致（例如 torch 已升级到 cu128，但 torchvision 还是 cu126），import 时会触发
+    # DLL 入口点错误。这里把构建不一致的也清理掉。
+    # 若 torch 未装或查询失败，用 required 作为参考构建继续检测。
+    reference_build = installed if installed is not None else required
+    if reference_build:
+        for pkg in _TORCH_ABI_PACKAGES:
             if _package_version(python_executable, pkg) is None:
                 continue
             pkg_build = _query_package_build(python_executable, pkg)
-            # pkg_build 为 None 表示 import 失败；空字符串表示无构建后缀（PyPI 官方版）。
-            # 只要和 torch 构建后缀不同就清理，让 pip 后续从相同 index 重装匹配版本。
-            if pkg_build != torch_build:
+            if pkg_build is None:
+                continue
+            # 构建后缀必须与 torch 一致；空字符串与 "cpu" 视为等价
+            if not _build_eq(pkg_build, reference_build):
                 plan.append(pkg)
 
     return sorted(set(plan))
@@ -1448,17 +1450,17 @@ def discover_best_python(
 
     required = _required_torch_family(platform_info, gpu)
     # CPU 族不需要特定 torch 构建，无需切换环境
-    if required not in ("cu", "rocm"):
+    if not required.startswith(("cu", "rocm")):
         return None
 
-    # 当前解释器已匹配 → 无需切换（用进程内 import，可靠）
-    cur = _torch_build_in_process()
+    # 当前解释器已匹配 → 无需切换（用 pip 元数据查询，避免 import 触发 DLL 错误）
+    cur = _query_package_build(sys.executable, "torch")
     if cur is not None and cur.startswith(required):
         return sys.executable
 
-    # 扫描 conda 环境，找一个 torch 匹配的
+    # 扫描 conda 环境，找一个 torch 匹配的（同样用 pip 元数据，避免子进程 import 出窗）
     for env_py in _list_conda_env_pythons():
-        build = _query_torch_build(env_py)
+        build = _query_package_build(env_py, "torch")
         if build is not None and build.startswith(required):
             return env_py
     return None
@@ -1537,6 +1539,7 @@ def install_backend_dependencies(
     torch_spec_idx = next(
         (i for i, s in enumerate(specs) if s.check_modules == ["torch"]), None
     )
+    current_torch_build = _query_package_build(python_executable, "torch")
     torch_mismatch = (
         torch_spec_idx is not None
         and torch_needs_reinstall(platform_info, gpu, python_executable)
@@ -1545,11 +1548,12 @@ def install_backend_dependencies(
         _emit(
             f"[依赖安装] 检测到 torch 构建不匹配（本机需要 "
             f"{_required_torch_family(platform_info, gpu)}，当前 "
-            f"{_torch_build(python_executable) or '未安装'}），将重装为匹配本机硬件的版本",
+            f"{current_torch_build or '未安装'}），将重装为匹配本机硬件的版本",
             callback,
         )
-    # 旧版本留下的不兼容依赖：先卸载再装（只在明确不匹配时触发）
-    cleanup_plan = build_cleanup_plan(platform_info, gpu, python_executable) if torch_mismatch else []
+    # 旧版本留下的不兼容依赖：先卸载再装
+    # 即使 torch 本身已匹配，也可能残留 torchvision/torchaudio 旧构建导致 DLL 入口点错误
+    cleanup_plan = build_cleanup_plan(platform_info, gpu, python_executable)
     if cleanup_plan:
         _emit(
             f"[依赖安装] 检测到需清理的旧依赖: {', '.join(cleanup_plan)}"
@@ -1568,6 +1572,15 @@ def install_backend_dependencies(
                 all_ready = False
                 _emit(f"[依赖安装] 检测: {spec.description} -> {reason}", callback)
                 break
+        # 即使所有 required spec 都已就绪，若检测到有需清理的不兼容旧依赖
+        # （如 torchvision/torchaudio 构建与 torch 不匹配），仍要先卸载它们，
+        # 否则 import 时会触发 DLL 入口点错误。
+        if all_ready and cleanup_plan:
+            all_ready = False
+            _emit(
+                f"[依赖安装] 当前 torch 已匹配，但仍需先清理旧依赖: {', '.join(cleanup_plan)}",
+                callback,
+            )
         if all_ready:
             _emit(f"[依赖安装] {backend} 后端依赖已就绪（版本与硬件匹配），跳过安装", callback)
             return True
