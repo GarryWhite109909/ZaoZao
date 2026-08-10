@@ -171,8 +171,10 @@ class LlamaCppClient:
         p = Path(self.adapter)
         if not p.is_dir():
             return f"LoRA adapter 路径不存在: {self.adapter}"
-        # 与 paths.is_valid_adapter_dir 口径一致：safetensors/bin/gguf 任一即可
-        for name in ("adapter_model.safetensors", "adapter_model.bin", "adapter_model.gguf"):
+        # 与 paths.is_valid_adapter_dir 口径一致：safetensors/bin/gguf 任一即可。
+        # 注意：llama-cpp-python 0.3.34 加载 safetensors LoRA 推理会卡死(hang)，
+        # GGUF LoRA 是 llama.cpp 原生格式、推理正常，故优先选 GGUF。
+        for name in ("adapter_model.gguf", "adapter_model.safetensors", "adapter_model.bin"):
             f = p / name
             if f.is_file():
                 self._adapter_file = str(f)
@@ -231,6 +233,25 @@ class LlamaCppClient:
     # ------------------------------------------------------------------
     def check_connection(self) -> bool:
         return self._llm is not None
+
+    def is_ready(self) -> bool:
+        """进程内后端是否就绪：已加载，或基座 GGUF + LoRA adapter 资源齐全。
+
+        与 check_connection() 不同：check_connection() 仅表示模型是否已读入显存；
+        is_ready() 表示"引擎可用"——资源已就绪、首次扫描时才懒加载（8B Q4 GGUF
+        约 5GB），避免健康检查/前端每次强制加载拖慢启动。
+        """
+        if self._llm is not None:
+            return True
+        # 资源齐全：GGUF 基座存在 + adapter 目录含权重文件
+        if not self.base_gguf or not Path(self.base_gguf).is_file():
+            return False
+        if not self.adapter or not Path(self.adapter).is_dir():
+            return False
+        for name in ("adapter_model.gguf", "adapter_model.safetensors", "adapter_model.bin"):
+            if (Path(self.adapter) / name).is_file():
+                return True
+        return False
 
     def list_models(self) -> List[str]:
         return [self.model] if self._llm is not None else []

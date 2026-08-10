@@ -524,6 +524,14 @@ def _build_backend_info() -> dict:
     elif backend == "llamacpp":
         base_gguf = getattr(client, "base_gguf", "") or os.environ.get("VULN_SCANNER_GGUF", "")
         adapter = resolve_adapter_path(getattr(client, "adapter", ""))
+        # llamacpp 实际加载的是 adapter 目录内的单个 LoRA 文件（优先 GGUF，见
+        # LlamaCppClient._check_paths），这里解析出真实文件路径用于展示。
+        adapter_file = ""
+        try:
+            if not getattr(client, "_check_paths", lambda: None)():
+                adapter_file = getattr(client, "_adapter_file", "") or ""
+        except Exception:
+            adapter_file = ""
         gguf_name = Path(base_gguf).name if base_gguf else ""
         q_label = "GGUF Q4（常见）"
         if gguf_name:
@@ -540,7 +548,7 @@ def _build_backend_info() -> dict:
         info.update({
             "model": gguf_name or "未配置 GGUF",
             "gguf_path": base_gguf,
-            "adapter_path": adapter,
+            "adapter_path": adapter_file or adapter,
             "base_quantization": f"推理时将采用 {q_label} 量化基座",
             "lora_quantized": False,
             "lora_precision": "FP16（运行时通过 lora_path 叠加）",
