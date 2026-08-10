@@ -45,7 +45,7 @@ _REGISTRY: list[dict] = [
         "tag": "v9max",
         "full_name": f"{NAMESPACE}/{REPO}:v9max",
         "display_name": "Nivis v9max",
-        "description": "三模型蒸馏 + A800 云端训练，已被 Nivis-α0 取代。合成集 recall 1.0，CVE-fix recall 0.95。",
+        "description": "三模型蒸馏 + A800 云端训练，已被 Nivis-α0 取代。合成集 recall 1.0，CVE-fix recall 0.95（均为 HF NF4+FP16 LoRA 评估管道口径；Ollama Q4_K_M 发布形态下合成集 recall 0.951 / FPR 0.077，CVE-fix recall 0.75~0.79）。",
         "prompt_variant": "v3",
         "is_default": False,
         "deprecated": False,

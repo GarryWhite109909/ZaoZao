@@ -134,17 +134,18 @@ SYSTEM_PROMPT_LITE = (
 
 
 # ---------------------------------------------------------------------------
-# Base System Prompt —— exp_05 消融实验确定的最优 prompt（482 字符）
+# Base System Prompt（482 字符）—— 纯 base 变体（角色 + schema + 输出格式）
 # ---------------------------------------------------------------------------
-# 设计动机：exp_05_prompt_ablation 对 8+2 个变体做了严格对照实验，结论是
-# 纯 base prompt（角色 + schema + 输出格式）在 strict 准确率（CWE 归因）
-# 上最优（55.8%），任何额外规则维度都会干扰基座模型的原生 CWE 判断。
-# loose 准确率也达 90.7%（仅次于 +consistency 的 94.3%，但后者 strict 下降）。
+# 设计动机：exp_05_prompt_ablation 对多个变体做对照实验，base 作为最简基线。
+# 注意：旧注释声称"base 在 strict 准确率（CWE 归因）上最优（55.8%）"，
+# 该数字在仓库中无对应结果 JSON 存档（exp_05 v2 未持久化 vulnerability_type），
+# 属"结论未落库"，引用前需重算。
 #
-# 使用约定（全项目唯一 system prompt）：
-#   - exp_06 训练数据生成（distill_v2 STUDENT_SYSTEM）用 BASE_PROMPT
-#   - exp_06 推理评估（evaluate.py）也用 BASE_PROMPT（保持训练/推理一致）
-#   - 已有训练数据统一改造为 BASE_PROMPT
+# 使用约定（2026-08-10 起已变更）：
+#   - 全项目推理/评估入口已统一为 V3_PROMPT（SYSTEM_PROMPT + CoT + few-shot），
+#     不再按模型绑定 BASE_PROMPT（见 model_registry 决策 6 / git 72b5fa2）。
+#   - BASE_PROMPT 仅保留作为 evaluate.py --variant base 的对照基线与历史 v9max
+#     训练对齐参考，不再作为默认推理 prompt。
 # ---------------------------------------------------------------------------
 BASE_PROMPT = (
     "你是一名安全研究员，分析给定代码的安全漏洞。\n\n"

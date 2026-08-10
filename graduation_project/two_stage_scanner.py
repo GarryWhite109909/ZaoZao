@@ -727,7 +727,7 @@ class TwoStageScanner:
         """对单个 finding 做 N 次采样，返回自一致率裁决。
 
         N 次以 temperature>0 独立采样，多数票决定 confirmed，
-        置信度 = 多数方票数 / N。
+        置信度 = 多数方票数 / 有效票数（排除无效票）。
         """
         prompt = build_triage_prompt(
             finding, code_context, language=language,
@@ -772,12 +772,15 @@ class TwoStageScanner:
                 votes_false += 1
 
         final_confirmed = votes_true > votes_false
+        # 置信度分母用"有效票"（votes_true+votes_false）而非 self.n_samples：
+        # invalid 票（解析失败/推理出错）不代表"否决"，除以 n_samples 会稀释真实
+        # 自一致率。全部票无效时有效分母=1、confidence=0、confirmed=False，
+        # 由 _aggregate 的 all_invalid 分支判 None（需复核），避免把"全部解析失败"
+        # 误当成低置信"否决"——这就是 invalid 语义的统一入口。
+        valid_votes = votes_true + votes_false
         return AdjudicationVerdict(
             confirmed=final_confirmed,
-            # 置信度 = 多数方票数占比（而非恒取判真票）：否则 confirmed=False 时
-            # confidence 恒 ≤0.5，dismissed_safe（≥_CONF_AUTO）永远不可达，
-            # 所有被否决 finding 都会涌入人工复核队列
-            confidence=max(votes_true, votes_false) / max(self.n_samples, 1),
+            confidence=max(votes_true, votes_false) / max(valid_votes, 1),
             votes_true=votes_true,
             votes_false=votes_false,
             votes_invalid=votes_invalid,

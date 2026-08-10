@@ -266,6 +266,11 @@ _scan_stats: dict = {
     "recent_scans": [],  # 最近 20 条扫描记录
 }
 
+# _scan_stats / _last_batch 的读写防护锁：
+# 写入发生在 async handler（事件循环线程），而 get_stats 是普通 def（线程池线程）、
+# download_report 是 async，故存在跨线程读写，需加锁避免统计丢失/读撕。
+_stats_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # 健康检查
@@ -669,33 +674,34 @@ def _record_scan(batch: BatchResult, source: str = "batch") -> None:
         source: 扫描来源标记（"github" / "url" / "batch"），供前端按来源过滤
                 （如安全态势页只统计 GitHub 仓库扫描）。
     """
-    _scan_stats["total_scans"] += 1
-    _scan_stats["total_files"] += batch.total_files
-    _scan_stats["total_vulnerable"] += batch.vulnerable
-    _scan_stats["total_safe"] += batch.safe
-    _scan_stats["total_errors"] += batch.errors
-    # 记录最近 20 条
-    entry = {
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "source": source,
-        "total_files": batch.total_files,
-        "vulnerable": batch.vulnerable,
-        "safe": batch.safe,
-        "errors": batch.errors,
-        "duration": round(batch.total_duration, 2),
-        "results": [
-            {
-                "filename": r.filename,
-                "has_vulnerability": r.has_vulnerability,
-                "vulnerability_type": r.vulnerability_type,
-                "risk_level": r.risk_level,
-            }
-            for r in batch.results[:20]  # 最多保留 20 条文件结果
-        ],
-    }
-    _scan_stats["recent_scans"].insert(0, entry)
-    if len(_scan_stats["recent_scans"]) > 20:
-        _scan_stats["recent_scans"] = _scan_stats["recent_scans"][:20]
+    with _stats_lock:
+        _scan_stats["total_scans"] += 1
+        _scan_stats["total_files"] += batch.total_files
+        _scan_stats["total_vulnerable"] += batch.vulnerable
+        _scan_stats["total_safe"] += batch.safe
+        _scan_stats["total_errors"] += batch.errors
+        # 记录最近 20 条
+        entry = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "source": source,
+            "total_files": batch.total_files,
+            "vulnerable": batch.vulnerable,
+            "safe": batch.safe,
+            "errors": batch.errors,
+            "duration": round(batch.total_duration, 2),
+            "results": [
+                {
+                    "filename": r.filename,
+                    "has_vulnerability": r.has_vulnerability,
+                    "vulnerability_type": r.vulnerability_type,
+                    "risk_level": r.risk_level,
+                }
+                for r in batch.results[:20]  # 最多保留 20 条文件结果
+            ],
+        }
+        _scan_stats["recent_scans"].insert(0, entry)
+        if len(_scan_stats["recent_scans"]) > 20:
+            _scan_stats["recent_scans"] = _scan_stats["recent_scans"][:20]
 
 
 @app.get("/api/stats")
@@ -707,29 +713,30 @@ def get_stats():
     注意：此端点不调用 check_health（会阻塞等待 Ollama），健康状态由前端
     单独请求 /api/health/live 获取，避免拖慢仪表盘数据加载。
     """
-    recent = _scan_stats["recent_scans"]
+    with _stats_lock:
+        recent = _scan_stats["recent_scans"]
 
-    # 从最近扫描中提取漏洞列表（用于"最近动态"）
-    recent_findings = []
-    for scan in recent[:5]:
-        for r in scan.get("results", []):
-            if r.get("has_vulnerability") is True:
-                recent_findings.append({
-                    "filename": r["filename"],
-                    "vulnerability_type": r["vulnerability_type"],
-                    "risk_level": r["risk_level"],
-                    "timestamp": scan["timestamp"],
-                })
+        # 从最近扫描中提取漏洞列表（用于"最近动态"）
+        recent_findings = []
+        for scan in recent[:5]:
+            for r in scan.get("results", []):
+                if r.get("has_vulnerability") is True:
+                    recent_findings.append({
+                        "filename": r["filename"],
+                        "vulnerability_type": r["vulnerability_type"],
+                        "risk_level": r["risk_level"],
+                        "timestamp": scan["timestamp"],
+                    })
 
-    return {
-        "total_scans": _scan_stats["total_scans"],
-        "total_files": _scan_stats["total_files"],
-        "total_vulnerable": _scan_stats["total_vulnerable"],
-        "total_safe": _scan_stats["total_safe"],
-        "total_errors": _scan_stats["total_errors"],
-        "recent_scans": recent,
-        "recent_findings": recent_findings[:10],
-    }
+        return {
+            "total_scans": _scan_stats["total_scans"],
+            "total_files": _scan_stats["total_files"],
+            "total_vulnerable": _scan_stats["total_vulnerable"],
+            "total_safe": _scan_stats["total_safe"],
+            "total_errors": _scan_stats["total_errors"],
+            "recent_scans": recent,
+            "recent_findings": recent_findings[:10],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -901,7 +908,8 @@ async def batch_scan(
             }, ensure_ascii=False) + "\n"
 
         batch.total_duration = time.time() - batch_start
-        _last_batch = batch
+        with _stats_lock:
+            _last_batch = batch
         _record_scan(batch, source="batch")
         yield json.dumps({
             "type": "done",
@@ -984,7 +992,8 @@ async def url_scan(req: UrlScanRequest, request: Request):
     ]
     batch = await _scan_files_scheduled(files, req.use_rag, client_id)
     global _last_batch
-    _last_batch = batch
+    with _stats_lock:
+        _last_batch = batch
     _record_scan(batch, source="url")
 
     return {
@@ -1073,7 +1082,8 @@ async def github_scan(req: GithubScanRequest, request: Request):
 
         batch = await _scan_files_scheduled(code_files, req.use_rag, client_id)
         global _last_batch
-        _last_batch = batch
+        with _stats_lock:
+            _last_batch = batch
         _record_scan(batch, source="github")
 
         return {
@@ -1092,9 +1102,11 @@ async def github_scan(req: GithubScanRequest, request: Request):
 @app.get("/api/report")
 async def download_report():
     """下载最近一次批量扫描的 Markdown 报告。"""
-    if _last_batch is None:
+    with _stats_lock:
+        last_batch = _last_batch
+    if last_batch is None:
         return JSONResponse({"error": "暂无扫描结果，请先扫描"}, status_code=404)
-    md = render_batch_markdown(_last_batch)
+    md = render_batch_markdown(last_batch)
     return StreamingResponse(
         iter([md.encode("utf-8")]),
         media_type="text/markdown",
@@ -1262,7 +1274,10 @@ def vllm_analyze(req: VllmAnalyzeRequest):
         )
 
     # 与 /api/analyze 走同一套扫描流水线（预筛/切片/RAG/污点/约束解码兜底），
-    # 仅替换推理后端为 vLLM，避免绕过 Scanner 导致能力不一致
+    # 仅替换推理后端为 vLLM，避免绕过 Scanner 导致能力不一致。
+    # 注意：此处有意绕过优先级调度器——调度器是为 Ollama OLLAMA_NUM_PARALLEL=1 的
+    # 单并发显存约束设计；vLLM 自带 PagedAttention + continuous batching 高吞吐并发，
+    # 直接同步推理即可，不占用 Ollama 队列（避免 vLLM 任务被误排 LOW 拖慢）。
     vllm_scanner = Scanner(
         model=vllm_client.model,
         client=vllm_client,
@@ -1471,8 +1486,8 @@ def models_activate(req: ModelActionRequest):
 # 进程内后端模型下载（transformers / llamacpp）—— 下载到 models/ 分类目录
 # ---------------------------------------------------------------------------
 
-# HuggingFace 镜像（国内加速）
-HF_MIRROR = "https://hf-mirror.com"
+# HuggingFace 镜像（国内加速），可通过环境变量覆盖
+HF_MIRROR = os.environ.get("VULN_SCANNER_HF_MIRROR", "https://hf-mirror.com").strip() or "https://hf-mirror.com"
 
 
 def _models_dir() -> Path:
@@ -1575,13 +1590,14 @@ def models_local_resources():
 
 @app.post("/api/models/download-hf")
 async def models_download_hf(req: HfDownloadRequest):
-    """流式下载 HuggingFace 基座模型到项目 HF 缓存（NDJSON 进度）。
+    """流式下载 HuggingFace 基座模型到项目 models/ 目录（NDJSON 进度）。
 
-    目标：models/transformers/.hf_home/hub/models--<repo>（与自动下载/续传同目录）。
-    使用 hf-mirror.com 镜像加速国内下载。
+    目标：models/transformers/<名称>（与自动下载/检测/迁移同一位置）。
+    使用 hf-mirror.com 镜像加速国内下载；下载支持断点续传。
     """
     import queue as _q
     import threading
+    import traceback
 
     model_id = req.model_id.strip()
     if not model_id:
@@ -1598,30 +1614,74 @@ async def models_download_hf(req: HfDownloadRequest):
     chunk_queue: _q.Queue = _q.Queue()
     done_flag = {"done": False, "result": None, "error": None}
 
+    # 网络操作超时（秒）：列表/单文件元数据请求不宜过长，大文件传输由 hf_hub_download 内部管理
+    HF_NETWORK_TIMEOUT = 60
+
+    def _friendly_error(e: Exception, phase: str) -> str:
+        """把 huggingface_hub 异常转换成用户可操作的提示。"""
+        name = type(e).__name__
+        msg = str(e)
+        lower = (name + " " + msg).lower()
+        if "import" in lower and "huggingface_hub" in lower:
+            return "huggingface_hub 未安装，请运行启动器让依赖安装完成"
+        if any(k in lower for k in ("timeout", "timed out", "connecttimeout")):
+            return (
+                f"连接镜像超时（{phase}）：请检查能否访问 {HF_MIRROR}，"
+                "或尝试设置系统代理/HTTP_PROXY 后重试"
+            )
+        if any(k in lower for k in ("connection", "refused", "reset", "name or service not known", "getaddrinfo")):
+            return (
+                f"无法连接到镜像（{phase}）：请检查网络、代理设置，"
+                f"或尝试浏览器直接打开 {HF_MIRROR}/Qwen/Qwen3-8B"
+            )
+        if "401" in lower or "unauthorized" in lower or "access" in lower:
+            return f"访问仓库被拒绝（{phase}）：请检查 HuggingFace Token/权限"
+        if "404" in lower or "not found" in lower:
+            return f"仓库或文件不存在（{phase}）：{model_id}"
+        return f"{phase}失败 ({name}): {msg}"
+
     def run_download():
         try:
             os.environ["HF_ENDPOINT"] = HF_MIRROR
-            from huggingface_hub import list_repo_files, hf_hub_download
+            try:
+                from huggingface_hub import list_repo_files, hf_hub_download
+            except Exception as e:
+                raise RuntimeError(_friendly_error(e, "导入 huggingface_hub")) from e
+
+            # 立即报告开始连接镜像，让用户知道按钮已生效
+            chunk_queue.put({"status": "downloading", "message": f"正在连接镜像 {HF_MIRROR}…", "pct": 0})
 
             # 获取仓库文件列表（进度估算用）
+            files: list[str] = []
+            total_files = 0
             try:
-                files = list_repo_files(model_id)
-                # 过滤掉 .gitattributes 等无关紧要的小文件标记，但全量下载
+                files = list_repo_files(model_id, timeout=HF_NETWORK_TIMEOUT)
                 total_files = len(files)
-            except Exception:
-                files = []
-                total_files = 0
+            except Exception as e:
+                err = _friendly_error(e, "获取文件列表")
+                print(f"[download-hf] list_repo_files 失败: {err}", flush=True)
+                traceback.print_exc()
+                raise RuntimeError(err) from e
 
             chunk_queue.put({"status": "downloading", "total_files": total_files, "completed": 0, "pct": 0})
 
             # 逐文件下载，每完成一个文件报告进度（huggingface_hub 内部用 HF_ENDPOINT 镜像）
             completed_files = 0
             for fname in files:
-                hf_hub_download(
-                    repo_id=model_id,
-                    filename=fname,
-                    local_dir=str(cache_dir),
-                )
+                try:
+                    hf_hub_download(
+                        repo_id=model_id,
+                        filename=fname,
+                        local_dir=str(cache_dir),
+                        local_dir_use_symlinks=False,
+                        resume_download=True,
+                        timeout=HF_NETWORK_TIMEOUT,
+                    )
+                except Exception as e:
+                    err = _friendly_error(e, f"下载 {fname}")
+                    print(f"[download-hf] hf_hub_download 失败: {err}", flush=True)
+                    traceback.print_exc()
+                    raise RuntimeError(err) from e
                 completed_files += 1
                 pct = int(completed_files / total_files * 100) if total_files else 0
                 chunk_queue.put({
@@ -1634,7 +1694,7 @@ async def models_download_hf(req: HfDownloadRequest):
 
             done_flag["result"] = {"dest": str(cache_dir), "model_id": model_id}
         except Exception as e:
-            done_flag["error"] = f"{type(e).__name__}: {e}"
+            done_flag["error"] = str(e)
         finally:
             done_flag["done"] = True
             chunk_queue.put(None)
@@ -1687,7 +1747,14 @@ async def models_download_hf(req: HfDownloadRequest):
                 "message": msg,
             }, ensure_ascii=False) + "\n"
 
-    return StreamingResponse(stream(), media_type="application/x-ndjson")
+    return StreamingResponse(
+        stream(),
+        media_type="application/x-ndjson",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+        },
+    )
 
 
 @app.post("/api/models/download-gguf")
@@ -1792,7 +1859,14 @@ async def models_download_gguf(req: GgufDownloadRequest):
                 "message": msg,
             }, ensure_ascii=False) + "\n"
 
-    return StreamingResponse(stream(), media_type="application/x-ndjson")
+    return StreamingResponse(
+        stream(),
+        media_type="application/x-ndjson",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

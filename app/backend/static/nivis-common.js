@@ -688,7 +688,9 @@
               }
               if (obj.message) {
                 lastMessage = obj.message;
-                self._dlProgress[rid] = { status: obj.message, pct: 100 };
+                var cur = self._dlProgress[rid] || {};
+                cur.status = obj.message;
+                self._dlProgress[rid] = cur;
               }
             }
             if (hadError) {

@@ -514,22 +514,23 @@ function applyDiagnostics(doc, result) {
 
   for (const locator of locators) {
     if (located) break;
-    // 从描述中提取可能的标识符（函数名、关键字）
+    // 优先解析 `line N:` 行号锚点（模型输出的精确行号，比 token 匹配可靠）
+    const anchoredLine = extractLineAnchor(locator);
+    if (anchoredLine !== null) {
+      const i = anchoredLine - 1;
+      if (i >= 0 && i < lines.length) {
+        diagnostics.push(makeDiagnosticAtLine(i, lines, result, severity));
+        located = true;
+        break;
+      }
+    }
+    // 无有效锚点时才回退到 token 匹配（可能误标首个同名标识符行）
     const tokens = extractTokens(locator);
     for (const token of tokens) {
       if (located) break;
       for (let i = 0; i < lines.length; i++) {
         if (lines[i].includes(token)) {
-          const line = lines[i];
-          const startChar = line.indexOf(token);
-          const range = new vscode.Range(i, startChar, i, Math.min(startChar + token.length, line.length));
-          diagnostics.push(
-            new vscode.Diagnostic(
-              range,
-              `[${result.vulnerability_type}] ${result.risk_level} — ${result.explanation || result.sink}`,
-              severity
-            )
-          );
+          diagnostics.push(makeDiagnosticAtLine(i, lines, result, severity));
           located = true;
           break;
         }
@@ -550,6 +551,31 @@ function applyDiagnostics(doc, result) {
   }
 
   diagnosticCollection.set(doc.uri, diagnostics);
+}
+
+/**
+ * 从描述文本中解析 `line N:` 行号锚点（1 起始），解析失败返回 null。
+ * 模型输出的 sink/source 常带精确行号，用它定位比 token 匹配可靠。
+ */
+function extractLineAnchor(text) {
+  if (!text) return null;
+  const m = text.match(/line\s*:?\s*(\d+)/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/** 构造第 i 行（0 起始）的诊断对象。 */
+function makeDiagnosticAtLine(i, lines, result, severity) {
+  const line = lines[i] || "";
+  const startChar = line.search(/\S/);
+  const col = startChar >= 0 ? startChar : 0;
+  const range = new vscode.Range(i, col, i, line.length);
+  return new vscode.Diagnostic(
+    range,
+    `[${result.vulnerability_type}] ${result.risk_level} — ${result.explanation || result.sink}`,
+    severity
+  );
 }
 
 /**

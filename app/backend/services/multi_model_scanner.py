@@ -194,7 +194,7 @@ class MultiModelScanner:
 
         聚合规则：
         - has_vulnerability: 多数票决定（True 票数 vs False 票数）；
-          50/50 平票时返回 None（无法判定）
+          50/50 平票时返回 True（保守判定，宁误报不漏报）
         - consensus: 全票一致=unanimous，有少数派=majority，平票=split
         - agreement_ratio: 多数方票数 / 有效票数（排除 error 的 None 票）
         - vulnerability_type / risk_level / source / sink / fix_suggestion:
@@ -408,14 +408,14 @@ if __name__ == "__main__":
     assert r_b.consensus == "majority"
     assert abs(r_b.agreement_ratio - 2 / 3) < 1e-6
 
-    # 场景 C：平票（1 True 1 False → None）
+    # 场景 C：平票（1 True 1 False → 保守判定 True）
     r_c = MultiModelScanner._aggregate("c.py", "python", [
         ("modelA", make_result(True, "CWE-89", "High", "A 认为有漏洞")),
         ("modelB", make_result(False, "none", "None", "B 认为安全")),
     ])
     print(f"[C 平票] verdict={r_c.has_vulnerability} consensus={r_c.consensus} "
           f"ratio={r_c.agreement_ratio}")
-    assert r_c.has_vulnerability is None
+    assert r_c.has_vulnerability is True
     assert r_c.consensus == "split"
     assert r_c.agreement_ratio == 0.5
 

@@ -3,7 +3,7 @@
 解决长文件（如 hard_longfile_*）中 LLM 注意力衰减导致隐藏漏洞漏检的问题。
 
 切片策略：
-- 文件总行数 < min_lines（默认 200）→ 不切片，整文件作为单个 chunk 返回
+- 文件总行数 < min_lines（默认 150）→ 不切片，整文件作为单个 chunk 返回
 - 文件 >= min_lines → 按顶层函数 / 类方法切分，每个切片包含：
     * 顶部 imports / 全局常量 / 模块 docstring（"上下文头"）
     * 类定义骨架（class ClassName: + docstring，不含方法体）
@@ -358,8 +358,11 @@ _DEFAULT_SLICER = CodeSlicer()
 
 
 def slice_code(code: str, language: str, filename: str = "", min_lines: int = 150) -> SliceResult:
-    """便捷函数：用默认 CodeSlicer 切分代码。"""
-    slicer = CodeSlicer(min_lines=min_lines)
+    """便捷函数：切分代码。复用模块级单例 _DEFAULT_SLICER，仅自定义 min_lines 时新建实例。"""
+    if min_lines == _DEFAULT_SLICER.min_lines:
+        slicer = _DEFAULT_SLICER
+    else:
+        slicer = CodeSlicer(min_lines=min_lines)
     return slicer.slice(code, language=language, filename=filename)
 
 

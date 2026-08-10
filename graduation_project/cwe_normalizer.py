@@ -28,7 +28,10 @@ _CWE_BY_KEYWORD: list[tuple[tuple[str, ...], str]] = [
     (("insecure deserialization", "反序列化", "deserial", "pickle"), "CWE-502 Deserialization of Untrusted Data"),
     (("cross-site", "cross site", "xss", "跨站"), "CWE-79 Cross-Site Scripting"),
     (("path traversal", "directory traversal", "路径穿越", "path_traversal"), "CWE-22 Path Traversal"),
-    (("server-side template injection", "模板注入", "ssti"), "CWE-94 Server-Side Template Injection"),
+    # SSTI 统一归一到 CWE-1336（与 87 合成集 / CVE-fix 测试集的严格评估标注一致）。
+    # 注意：CWE-94（Code Injection）是 CWE-1336 的父类编号，旧归一曾用 CWE-94，
+    # 会造成 UI 显示层与严格评估层对"SSTI 正确编号"给出不同答案，故改为 1336。
+    (("server-side template injection", "模板注入", "ssti"), "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine"),
     (("log injection", "日志注入", "logi"), "CWE-117 Improper Output Neutralization for Logs"),
 ]
 
@@ -68,7 +71,7 @@ if __name__ == "__main__":
         ("Path Traversal", "CWE-22 Path Traversal"),
         ("XSS", "CWE-79 Cross-Site Scripting"),
         ("Insecure Deserialization", "CWE-502 Deserialization of Untrusted Data"),
-        ("Server-Side Template Injection", "CWE-94 Server-Side Template Injection"),
+        ("Server-Side Template Injection", "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine"),
         ("CWE-89 Log Injection", "CWE-117 Improper Output Neutralization for Logs"),  # 编号错 + 语义正确 → 纠正
         ("日志注入", "CWE-117 Improper Output Neutralization for Logs"),
         ("CWE-117 日志注入", "CWE-117 Improper Output Neutralization for Logs"),

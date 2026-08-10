@@ -42,6 +42,7 @@ from graduation_project.paths import (
 from graduation_project.transformers_client import (
     is_transformers_runtime_compatible,
     migrate_hf_cache_to_project,
+    resolve_default_backend,
 )
 
 # 项目根目录（Graduation-Project/）
@@ -63,19 +64,8 @@ PORT = 8765
 
 
 def resolve_backend() -> str:
-    """解析推理后端（规则与 scanner.py._resolve_default_backend 保持一致）。"""
-    backend = os.environ.get("VULN_SCANNER_BACKEND", "").strip().lower()
-    if backend:
-        return backend
-    if os.environ.get("VULN_SCANNER_ADAPTER", "").strip():
-        return "transformers"
-    if resolve_adapter_path():
-        ok, reason = is_transformers_runtime_compatible()
-        if ok:
-            return "transformers"
-        print(f"[启动器] 检测到 models/ LoRA adapter，但当前环境不适合 transformers 后端: {reason}")
-        print("[启动器] 已自动回退 ollama（如确要用 transformers，请显式设置 VULN_SCANNER_BACKEND=transformers）")
-    return "ollama"
+    """解析推理后端（委托 transformers_client.resolve_default_backend，与 scanner 共用）。"""
+    return resolve_default_backend()
 
 
 def migrate_ollama_models_to_project() -> Optional[str]:
@@ -129,7 +119,9 @@ def migrate_ollama_models_to_project() -> Optional[str]:
             try:
                 ans = input("  是否自动退出 Ollama 完成迁移？[Y/n]: ").strip().lower()
             except EOFError:
-                ans = "n"
+                # 非交互环境（无 stdin）无法等待用户确认：默认执行迁移，
+                # 与交互默认 [Y] 一致，避免模型文件继续落回 C 盘。
+                ans = "y"
             if ans in ("y", "yes", ""):
                 _stop_ollama()
                 try:
@@ -309,8 +301,10 @@ def _stop_ollama() -> bool:
                 ["systemctl", "stop", "ollama"],
                 capture_output=True, text=True, timeout=30,
             )
-            subprocess.run(["pkill", "-f", "ollama"], capture_output=True, text=True, timeout=15)
-            subprocess.run(["pkill", "-9", "-f", "ollama"], capture_output=True, text=True, timeout=15)
+            # 兜底：仅匹配 ollama serve 进程，避免 `pkill -f ollama` 误杀
+            # 命令行里恰好包含 "ollama" 字样的无关进程。
+            subprocess.run(["pkill", "-f", "ollama serve"], capture_output=True, text=True, timeout=15)
+            subprocess.run(["pkill", "-9", "-f", "ollama serve"], capture_output=True, text=True, timeout=15)
         # 等待服务真正退出（最多 ~5s）
         for _ in range(10):
             try:

@@ -68,7 +68,11 @@ MANIFEST_PATH = PROJECT_ROOT / "experiments/exp_04_hard_samples/samples/manifest
 SAMPLES_DIR = PROJECT_ROOT / "experiments/exp_04_hard_samples/samples"
 OUTPUT_DIR = PROJECT_ROOT / "experiments/exp_06_finetune/results"
 # 默认 LoRA 输出根目录，用于 --checkpoint 简写解析
-DEFAULT_LORA_ROOT = PROJECT_ROOT / "experiments/exp_06_finetune/outputs/lora_r16_a32_e3_s42/best"
+# 注意：原值 `lora_r16_a32_e3_s42/best` 是 Qwen2.5 时代的路径，已不存在。
+# Qwen3-8B 时代本地 SFT 输出命名统一为 `lora_r{r}_a{a}_e{e}_lr{lr}_s{seed}_rslora{...}`，
+# 此处指向最近一次本地 Qwen3 SFT 产物（lora_r8_a16_e3_lr0.0001_s42_rsloraqwen3_8b_sft_p2_v4/best）。
+# 云端蒸馏产物（v8/v9/v9max、α0）不在本地 outputs/ 下，需显式 --adapter-path 指定。
+DEFAULT_LORA_ROOT = PROJECT_ROOT / "experiments/exp_06_finetune/outputs/lora_r8_a16_e3_lr0.0001_s42_rsloraqwen3_8b_sft_p2_v4/best"
 
 
 # ---------------------------------------------------------------------------
@@ -335,8 +339,8 @@ def resolve_adapter_path(checkpoint: str | None, adapter_path: str | None) -> st
     if adapter_path:
         return adapter_path
     if checkpoint:
-        # checkpoint=final → .../lora_r16_a32_e3/final
-        # checkpoint=checkpoint-36 → .../lora_r16_a32_e3/checkpoint-36
+        # checkpoint=final → .../lora_r8_a16_e3_lr0.0001_s42_rsloraqwen3_8b_sft_p2_v4/best/final
+        # checkpoint=checkpoint-36 → .../.../best/checkpoint-36
         return str(DEFAULT_LORA_ROOT / checkpoint)
     return None
 

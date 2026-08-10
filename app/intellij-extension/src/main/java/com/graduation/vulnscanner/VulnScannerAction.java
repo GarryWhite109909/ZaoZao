@@ -289,7 +289,9 @@ public class VulnScannerAction extends AnAction {
                     case 'u':
                         if (i + 5 < json.length()) {
                             try {
-                                sb.append((char) Integer.parseInt(json.substring(i + 2, i + 6), 16));
+                                // 用 Character.toChars 展开码点，避免 (char) 单字符拆坏代理对（emoji 等 BMP 外字符）
+                                int codePoint = Integer.parseInt(json.substring(i + 2, i + 6), 16);
+                                sb.append(Character.toChars(codePoint));
                             } catch (NumberFormatException ignored) { /* 非法转义按原样跳过 */ }
                             i += 4;
                         }

@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from app.backend.services.scanner import BatchResult, SingleResult
+from graduation_project.result_types import BatchResult, SingleResult
 
 
 def render_single_markdown(r: SingleResult) -> str:

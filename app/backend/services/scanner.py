@@ -26,7 +26,7 @@ from graduation_project.prefilter import Prefilter, PrefilterResult
 from app.backend.services.model_registry import get_default_model, get_prompt_for_model
 from graduation_project.paths import resolve_adapter_path, resolve_base_model_path
 from graduation_project.result_types import SingleResult, BatchResult
-from graduation_project.transformers_client import is_transformers_runtime_compatible
+from graduation_project.transformers_client import is_transformers_runtime_compatible, resolve_default_backend
 
 # 默认模型：从环境变量读取，缺省为注册表中的默认模型（当前 v9max）
 DEFAULT_MODEL = os.environ.get("VULN_SCANNER_MODEL", get_default_model())
@@ -34,30 +34,8 @@ DEFAULT_MODEL = os.environ.get("VULN_SCANNER_MODEL", get_default_model())
 FALLBACK_MODEL = os.environ.get("VULN_SCANNER_FALLBACK_MODEL", "qwen3:8b")
 
 def _resolve_default_backend() -> str:
-    """解析默认推理后端，消除"scanner 默认 transformers vs 启动器纯 Ollama"的矛盾：
-
-    - VULN_SCANNER_BACKEND 显式设置时优先（transformers / llamacpp / ollama）
-    - 配置了 VULN_SCANNER_ADAPTER 环境变量，或项目根目录 models/ 下探测到合法 adapter 时，
-      自动选 transformers：Q4 基座（bitsandbytes NF4）+ FP16 LoRA 进程内推理，
-      复现 evaluate.py 95% 召回那套，LoRA 增量保持 FP16 精度（避免 GGUF 整体量化的精度损失）
-    - 否则回退 ollama：GGUF Q4_K_M 合并量化的发布模型，对应一键启动形态，
-      不要求 transformers/peft/bitsandbytes 依赖
-    """
-    backend = os.environ.get("VULN_SCANNER_BACKEND", "").strip().lower()
-    if backend:
-        return backend
-    if os.environ.get("VULN_SCANNER_ADAPTER", "").strip():
-        return "transformers"
-    if resolve_adapter_path():
-        # 自动探测到 models/ 下的 adapter：只有当前运行时确实能跑 transformers
-        # 才自动启用，否则回退 ollama——避免新机器/协作者一启动就撞上
-        # 'no kernel image'（显卡架构与 torch/bitsandbytes 内核不匹配）。
-        ok, reason = is_transformers_runtime_compatible()
-        if ok:
-            return "transformers"
-        print(f"[scanner] 检测到 models/ LoRA adapter，但当前环境不适合 transformers 后端: {reason}")
-        print("[scanner] 已自动回退 ollama（如确要用 transformers，请显式设置 VULN_SCANNER_BACKEND=transformers）")
-    return "ollama"
+    """解析默认推理后端（委托 transformes_client.resolve_default_backend，与启动器共用）。"""
+    return resolve_default_backend()
 
 
 DEFAULT_BACKEND = _resolve_default_backend()
@@ -122,8 +100,8 @@ class Scanner:
         self.use_structured_fallback = use_structured_fallback
         self.use_taint_tracking = use_taint_tracking
         self.keep_alive = keep_alive
-        # 从环境变量读取硬件适配配置（bootstrap.py 设置）
-        self._num_ctx = int(os.environ.get("VULN_SCANNER_NUM_CTX", "8192"))
+        # 从环境变量读取硬件适配配置（bootstrap.py 设置）；默认值与模块级常量统一
+        self._num_ctx = int(os.environ.get("VULN_SCANNER_NUM_CTX", str(DEFAULT_TRANSFORMERS_NUM_CTX)))
         self._num_gpu = int(os.environ.get("VULN_SCANNER_NUM_GPU", "-1"))
         self._num_thread = int(os.environ.get("VULN_SCANNER_NUM_THREAD", "0"))
         # system prompt 由 model_registry 自动选择（v9max→BASE_PROMPT, v5→LITE）

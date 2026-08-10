@@ -71,7 +71,12 @@ _STRUCTURED_OUTPUT_SCHEMA = {
 
 
 class OllamaClient:
-    def __init__(self, base_url: str = "http://localhost:11434", model: str = "garrywhite109909/graduation-vuln-scanner:v9max"):
+    def __init__(self, base_url: str = "http://localhost:11434", model: Optional[str] = None):
+        # 默认模型统一从注册表取（当前为 Nivis-α0），避免与 Web 默认模型漂移。
+        # 延迟导入避免顶层循环依赖。
+        if model is None:
+            from app.backend.services.model_registry import get_default_model
+            model = get_default_model()
         self.base_url = base_url
         self.model = model
         self.api_generate = f"{base_url}/api/generate"
@@ -442,7 +447,8 @@ class OllamaClient:
 
 
 if __name__ == "__main__":
-    client = OllamaClient(model="garrywhite109909/graduation-vuln-scanner:v9max")
+    from app.backend.services.model_registry import get_default_model
+    client = OllamaClient(model=get_default_model())
     
     # 检查连接
     if not client.check_connection():
