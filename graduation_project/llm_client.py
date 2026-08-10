@@ -14,6 +14,13 @@ from typing import Dict, List, Optional, Union
 from graduation_project.schema import VERDICT_SCHEMA, parse_verdict, normalize_has_vulnerability
 from graduation_project.prompts import SYSTEM_PROMPT, build_user_prompt
 
+
+def _strip_latest(name: str) -> str:
+    """去掉 Ollama 报告名称末尾的 :latest，统一为无标签形式（与注册表 full_name 对齐）。"""
+    if name.endswith(":latest"):
+        return name[: -len(":latest")]
+    return name
+
 __all__ = [
     "OllamaClient",
     "VERDICT_SCHEMA",
@@ -83,7 +90,8 @@ class OllamaClient:
         try:
             resp = requests.get(f"{self.base_url}/api/tags", timeout=10)
             data = resp.json()
-            return [m["name"] for m in data.get("models", [])]
+            # 去掉 :latest，与注册表 full_name（无标签）对齐，避免误判“未安装”
+            return [_strip_latest(m["name"]) for m in data.get("models", [])]
         except Exception as e:
             print(f"[OllamaClient] 获取模型列表失败: {e}")
             return []
@@ -397,7 +405,7 @@ class OllamaClient:
             resp = requests.get(f"{self.base_url}/api/tags", timeout=10)
             data = resp.json()
             for m in data.get("models", []):
-                if m.get("name") == model or m.get("model") == model:
+                if _strip_latest(m.get("name") or "") == model or m.get("model") == model:
                     details = m.get("details", {})
                     return details.get("size") or m.get("size")
             return None

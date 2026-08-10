@@ -31,12 +31,21 @@ REPO = "graduation-vuln-scanner"
 # ---------------------------------------------------------------------------
 _REGISTRY: list[dict] = [
     {
+        "tag": "alpha0",
+        "full_name": f"{NAMESPACE}/nivis-alpha0",
+        "display_name": "Nivis-α0",
+        "description": "Qwen3-8B + rsLoRA(r8) 训练的新发布模型，当前活动模型。",
+        "prompt_variant": "base",
+        "is_default": True,
+        "deprecated": False,
+    },
+    {
         "tag": "v9max",
         "full_name": f"{NAMESPACE}/{REPO}:v9max",
         "display_name": "Nivis v9max",
-        "description": "三模型蒸馏 + A800 云端训练，当前发布版。合成集 recall 1.0，CVE-fix recall 0.95。",
+        "description": "三模型蒸馏 + A800 云端训练，已被 Nivis-α0 取代。合成集 recall 1.0，CVE-fix recall 0.95。",
         "prompt_variant": "base",
-        "is_default": True,
+        "is_default": False,
         "deprecated": False,
     },
     {
@@ -91,3 +100,15 @@ def get_default_model() -> str:
 def is_allowed(full_name: str) -> bool:
     """判断模型是否在注册表中（前端只允许操作已登记模型）。"""
     return get_model_info(full_name) is not None
+
+
+def normalize_ollama_name(name: str) -> str:
+    """去掉 Ollama 报告名称末尾的 :latest 标签，统一为注册表使用的无标签形式。
+
+    例如 `garrywhite109909/nivis-alpha0:latest` → `garrywhite109909/nivis-alpha0`。
+    Ollama 对不带 tag 的模型（create/pull 时未指定）总是以 :latest 上报，
+    而注册表 full_name 不带 tag，导致各处精确匹配失效、误判“未安装”重复拉取。
+    """
+    if name.endswith(":latest"):
+        return name[: -len(":latest")]
+    return name

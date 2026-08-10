@@ -48,6 +48,7 @@ from app.backend.services.model_registry import (
     get_model_info,
     get_default_model,
     is_allowed,
+    normalize_ollama_name,
 )
 from app.backend.services.scheduler import (
     PRIORITY_HIGH,
@@ -360,7 +361,7 @@ def _detect_model_available(backend: str, client) -> tuple[bool | None, str]:
             resp = requests.get("http://localhost:11434/api/tags", timeout=3)
             if resp.status_code != 200:
                 return False, "Ollama 服务未运行"
-            models = [m.get("name", "") for m in resp.json().get("models", [])]
+            models = [normalize_ollama_name(m.get("name", "")) for m in resp.json().get("models", [])]
             if model in models:
                 return True, "已 pull 到本地"
             return False, f"未 pull，需运行 ollama pull {model}"
@@ -1285,6 +1286,7 @@ def models_installed():
     registry = {m["full_name"]: m for m in list_registry()}
     installed = []
     for name in scanner.client.list_models():
+        name = normalize_ollama_name(name)  # :latest → 无标签，与注册表 full_name 对齐
         if name in registry:
             info = dict(registry[name])
             info["installed"] = True

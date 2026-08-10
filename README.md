@@ -76,6 +76,17 @@ bash app/launcher/start_linux_macos.sh
 
 > 首次启动因需下载模型（约 5 GB）或后端依赖（torch 等约 2-4 GB），耗时取决于网速，请耐心等待。后续启动通常 10 秒内完成。
 
+> ⚠️ **Linux 用户：Ollama 模型存储统一到项目目录（只需一次）**
+>
+> 本项目把 Ollama 模型统一放在项目内 `models/ollama/`（后端调用路径，避免模型落系统目录）。但 Linux 上用官方脚本自动安装的 Ollama 会被注册成 **systemd 服务**（`ollama.service`），它开机自启、始终用系统默认存储（`~/.ollama/models`）占用 `11434` 端口，与项目存储冲突。首次使用前请执行一次：
+>
+> ```bash
+> sudo systemctl disable --now ollama
+> ```
+>
+> 之后启动器会自己用 `OLLAMA_MODELS=models/ollama` 启动 Ollama，模型全部落在项目目录，前端状态一致。
+> **Windows / macOS 无需此步骤**（winget/brew 安装不注册系统服务，启动器直接接管）。
+
 ### 路径二：开发者 / 复现实验
 
 适合需要复现实验、修改代码或参与开发的用户。需手动管理 conda 环境。
@@ -1318,6 +1329,7 @@ CI = [center - margin, center + margin]
 | 启动器提示 `Ollama 自动安装失败` | winget/brew 不可用或网络问题 | 手动从 [ollama.com/download](https://ollama.com/download) 下载安装，安装后重启终端再运行启动脚本 |
 | 启动器提示 `Ollama 已安装但不在 PATH 中` | 安装后 PATH 未刷新 | 重启终端；或手动将 Ollama 安装路径加入系统 PATH |
 | 后端启动超时 | 端口 8765 被占用 | 检查端口：`netstat -ano \| findstr 8765`（Windows）/ `lsof -i :8765`（Linux/macOS），杀掉占用进程后重试 |
+| Linux 上模型没统一到项目目录 / 前端状态不一致 | 系统级 `ollama.service`（systemd）仍用系统存储占用 11434 | 执行一次 `sudo systemctl disable --now ollama`，再由启动器用 `OLLAMA_MODELS=models/ollama` 启动（详见「快速开始」Linux 提示） |
 
 ### 模型相关
 

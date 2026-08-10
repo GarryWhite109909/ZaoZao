@@ -45,9 +45,13 @@ from graduation_project.transformers_client import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # 默认模型（从模型注册表读取当前默认版本，如 v9max；导入失败时回退到 v9max 全名）
 try:
-    from app.backend.services.model_registry import get_default_model as _get_default_model
+    from app.backend.services.model_registry import (
+        get_default_model as _get_default_model,
+        normalize_ollama_name as _normalize_ollama_name,
+    )
     DEFAULT_MODEL = os.environ.get("VULN_SCANNER_MODEL", _get_default_model())
 except Exception:
+    _normalize_ollama_name = lambda name: name  # noqa: E731
     DEFAULT_MODEL = os.environ.get("VULN_SCANNER_MODEL", "garrywhite109909/graduation-vuln-scanner:v9max")
 # 回退模型（官方 Qwen3-8B，未微调）
 FALLBACK_MODEL = os.environ.get("VULN_SCANNER_FALLBACK_MODEL", "qwen3:8b")
@@ -168,7 +172,12 @@ def _stop_ollama() -> bool:
                 capture_output=True, text=True, timeout=30,
             )
         else:
-            # 先温和退出，再强制 -9；随后轮询 /api/tags 确认真正停止
+            # 先尝试停 systemd 服务（sudo -n 免密时生效；无权限失败也无害），
+            # 再 pkill 兜底。轮询 /api/tags 确认真正停止。
+            subprocess.run(
+                ["systemctl", "stop", "ollama"],
+                capture_output=True, text=True, timeout=30,
+            )
             subprocess.run(["pkill", "-f", "ollama"], capture_output=True, text=True, timeout=15)
             subprocess.run(["pkill", "-9", "-f", "ollama"], capture_output=True, text=True, timeout=15)
         # 等待服务真正退出（最多 ~5s）
@@ -549,42 +558,105 @@ def try_install_ollama() -> bool:
         return False
 
 
+def _running_ollama_store() -> Optional[str]:
+    """尽力读取占用 11434 的 ollama 进程的 OLLAMA_MODELS 存储路径。
+
+    仅当运行用户与 ollama 进程同一用户（或 /proc 可读）时能读到；否则返回 None。
+    """
+    try:
+        pids = subprocess.run(
+            ["lsof", "-ti", "tcp:11434"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.split()
+    except Exception:  # noqa: BLE001
+        return None
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            env = Path(f"/proc/{pid}/environ").read_bytes().decode("utf-8", "ignore")
+            for kv in env.split("\x00"):
+                if kv.startswith("OLLAMA_MODELS="):
+                    return kv.split("=", 1)[1]
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 def ensure_ollama_running() -> bool:
-    """确保 Ollama 服务在运行。未运行则尝试启动。"""
+    """确保 Ollama 服务运行，且使用**项目目录** models/ollama 作为存储。
+
+    若检测到 11434 上已有 Ollama 服务但其存储不在项目目录（例如系统级 / 别的
+    用户起的 systemd ollama），则停掉它并用项目目录重启，保证后续 pull 落到
+    models/ollama。可用 VULN_SCANNER_KEEP_EXTERNAL_OLLAMA=1 关闭此强制接管。
+    """
+    want = str(ollama_models_dir())
+    # 探测当前 11434 上是否已有 ollama 在服务
     try:
         resp = requests.get(
             "http://localhost:11434/api/tags",
             timeout=3,
             proxies={"http": None, "https": None},
         )
-        return resp.status_code == 200
-    except Exception:
-        # 尝试后台启动 ollama serve
-        print("[启动器] Ollama 服务未运行，尝试启动...")
-        try:
-            if sys.platform == "win32":
-                subprocess.Popen(
-                    ["ollama", "serve"],
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            else:
-                subprocess.Popen(
-                    ["ollama", "serve"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            time.sleep(3)
-            resp = requests.get(
-                "http://localhost:11434/api/tags",
-                timeout=5,
-                proxies={"http": None, "https": None},
-            )
-            return resp.status_code == 200
-        except Exception as e:
-            print(f"[启动器] 启动 Ollama 失败: {e}")
+        up = resp.status_code == 200
+    except Exception:  # noqa: BLE001
+        up = False
+
+    if up:
+        store = _running_ollama_store()
+        same_store = (
+            store is not None
+            and os.path.realpath(os.path.expanduser(store)) == os.path.realpath(want)
+        )
+        if same_store:
+            return True  # 已是项目存储，直接复用
+        if os.environ.get("VULN_SCANNER_KEEP_EXTERNAL_OLLAMA", "0").strip() == "1":
+            print("[启动器] 检测到已运行的 Ollama（存储无法确认为项目目录），")
+            print("         因 VULN_SCANNER_KEEP_EXTERNAL_OLLAMA=1，直接复用，不强制接管。")
+            return True
+        print(
+            f"[启动器] 检测到 Ollama 已在运行，但其存储不在项目目录"
+            f"（{'未知' if store is None else store}）。"
+        )
+        print(f"[启动器] 需要停掉它并用项目目录 {want} 重启，以保证模型落在 models/ollama。")
+        if not _stop_ollama():
+            print("[启动器] 无法自动停止现有 Ollama 服务（可能无权限）。")
+            print("         请手动执行后重试：sudo systemctl stop ollama   （或 pkill -f ollama）")
+            print("         或设置 VULN_SCANNER_KEEP_EXTERNAL_OLLAMA=1 直接复用现有服务。")
             return False
+
+    # 启动我们自己的 serve（继承本进程 OLLAMA_MODELS=项目目录）
+    print(f"[启动器] 启动 Ollama（模型存储: {want}）...")
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(
+                ["ollama", "serve"],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        for _ in range(12):
+            time.sleep(0.5)
+            try:
+                r = requests.get(
+                    "http://localhost:11434/api/tags",
+                    timeout=1,
+                    proxies={"http": None, "https": None},
+                )
+                if r.status_code == 200:
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+    except Exception as e:  # noqa: BLE001
+        print(f"[启动器] 启动 Ollama 失败: {e}")
+        return False
 
 
 def list_ollama_models() -> list[str]:
@@ -596,7 +668,8 @@ def list_ollama_models() -> list[str]:
             proxies={"http": None, "https": None},
         )
         data = resp.json()
-        return [m["name"] for m in data.get("models", [])]
+        # 统一去掉 :latest，与注册表 full_name（无标签）对齐，避免误判“未安装”重复拉取
+        return [_normalize_ollama_name(m["name"]) for m in data.get("models", [])]
     except Exception:
         return []
 
