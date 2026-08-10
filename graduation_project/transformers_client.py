@@ -189,6 +189,11 @@ def _local_dir_state(local_dir: Path) -> tuple[bool | None, str]:
 
 # 国内下载镜像（与设置页 /api/models/download-hf 端点一致）
 HF_MIRROR = "https://hf-mirror.com"
+# huggingface_hub 的 endpoint 在「模块首次 import」时按 HF_ENDPOINT 固定。必须在任何
+# huggingface_hub import 之前设置，否则 snapshot_download 仍指向被墙的 huggingface.co。
+# 这里在模块最早期 setdefault（web 端 main.py 已设，其它入口也能生效）。
+if not os.environ.get("HF_ENDPOINT"):
+    os.environ["HF_ENDPOINT"] = HF_MIRROR
 
 
 def _ensure_hf_home() -> None:
@@ -611,6 +616,18 @@ class TransformersClient:
         )
         try:
             os.environ["HF_ENDPOINT"] = HF_MIRROR
+            # 国内镜像直连、不走代理：避免代理秒断 + 白白消耗代理流量
+            from urllib.parse import urlparse as _urlparse
+            _hf_host = _urlparse(HF_MIRROR).hostname or "hf-mirror.com"
+            _no_proxy = set(
+                h.strip()
+                for h in os.environ.get("NO_PROXY", "").replace(";", ",").split(",")
+                if h.strip()
+            )
+            _no_proxy.add(_hf_host)
+            _no_proxy_val = ",".join(sorted(_no_proxy))
+            os.environ["NO_PROXY"] = _no_proxy_val
+            os.environ["no_proxy"] = _no_proxy_val
             from huggingface_hub import snapshot_download
             snapshot_download(repo_id=self.repo_id, local_dir=str(flat_dir))
             ok, reason = _local_dir_state(flat_dir)

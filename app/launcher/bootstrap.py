@@ -498,13 +498,17 @@ def check_inprocess_backend_ready(backend: str) -> bool:
         gguf = os.environ.get("VULN_SCANNER_GGUF", "").strip()
         adapter = resolve_adapter_path()
         if not gguf:
-            # 自动探测 models/llamacpp/ 下的 GGUF（与 llamacpp_client 一致）
-            ld = llamacpp_dir()
-            if ld.is_dir():
-                found = [p for p in sorted(ld.glob("*.gguf")) if p.is_file()]
-                if found:
-                    gguf = str(found[0])
-                    os.environ["VULN_SCANNER_GGUF"] = gguf
+            # 自动探测 models/llamacpp/ 下的 GGUF。为保证与 llamacpp_client 的量化
+            # 优先级（Q4 优先）完全一致，直接复用其 _discover_gguf，避免 bootstrap 用
+            # 文件名首字母排序导致多 .gguf 时选到不同文件。
+            try:
+                from graduation_project.llamacpp_client import LlamaCppClient
+                discovered = LlamaCppClient._discover_gguf()
+            except Exception:
+                discovered = ""
+            if discovered and Path(discovered).is_file():
+                gguf = discovered
+                os.environ["VULN_SCANNER_GGUF"] = gguf
         if not gguf:
             print("[错误] llamacpp 后端需要 VULN_SCANNER_GGUF 指向 Q4 GGUF 文件")
             print(f"  推荐做法：将 GGUF 放到 {llamacpp_dir()}")
@@ -1613,6 +1617,23 @@ def main():
     os.environ["VULN_SCANNER_NUM_CTX"] = str(config["num_ctx"])
     os.environ["VULN_SCANNER_NUM_GPU"] = str(config["num_gpu"])
     os.environ["VULN_SCANNER_NUM_THREAD"] = str(config["num_thread"])
+    # LlamaCPP 后端：把硬件自适应映射到 n_gpu_layers（GPU/CPU 混合推理）。
+    # Ollama 用 VULN_SCANNER_NUM_GPU；llama-cpp-python 用 VULN_SCANNER_GPU_LAYERS，
+    # 两者语义不同，必须为 llamacpp 单独推导，否则落后于 Ollama 的自适应逻辑：
+    #   -1=全部层卸载到 GPU，0=纯 CPU，正整数=卸载前 N 层到 GPU、剩余层跑 CPU。
+    # 显存不足时用部分卸载（GPU 放得下几层就放几层，其余走 CPU），实现 GPU+CPU 合作，
+    # 而不是要么全 GPU（4G 卡 OOM）要么纯 CPU（浪费 GPU）。
+    if backend == "llamacpp":
+        gpu_layers = -1  # 默认全部卸载到 GPU
+        vram = hardware.get("vram_mb")
+        if config.get("mode") == "cpu":
+            # 显存装不下全量权重（<6G 走 CPU 档）：有独显则部分卸载做 GPU+CPU 混合。
+            # Q4 8B 权重约 4.7GB / ~40 层 ≈ 每层约 120MB，留 KV cache 余量按 150MB/层估。
+            if (hardware.get("has_nvidia_gpu") or hardware.get("has_amd_gpu")) and vram:
+                gpu_layers = max(1, vram // 150)
+            else:
+                gpu_layers = 0  # 纯 CPU，无 GPU 可用
+        os.environ["VULN_SCANNER_GPU_LAYERS"] = str(gpu_layers)
 
     print("[4/6] 硬件检测完成")
 

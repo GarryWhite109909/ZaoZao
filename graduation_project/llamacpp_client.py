@@ -86,6 +86,10 @@ class LlamaCppClient:
         self._llm = None
         self._gen_lock = threading.Lock()
         self._load_error: Optional[str] = None
+        # 运行时叠加的 LoRA 权重文件（从 adapter 目录内定位，llama.cpp 的
+        # lora_path 需要单个文件路径，而非目录；由 _check_paths 解析）
+        self._adapter_file: Optional[str] = None
+        self._adapter_file_mtime = 0.0
 
     @staticmethod
     def _discover_gguf() -> str:
@@ -100,20 +104,21 @@ class LlamaCppClient:
         gguFs = sorted(d.glob("*.gguf"))
         if not gguFs:
             return ""
-        # 优先 Q4，其次 Q5/Q6/Q8，最后任意
+        # 优先 Q4，其次 Q5/Q6/Q8（量化层次越深，越接近发布模型的 Q4 口径）
         def _prio(p: Path) -> int:
             low = p.name.lower()
-            for i, q in enumerate(("q8", "q6", "q5", "q4")):
+            for i, q in enumerate(("q4", "q5", "q6", "q8")):
                 if q in low:
                     return i
-            return len(("q8", "q6", "q5", "q4"))
+            return len(("q4", "q5", "q6", "q8"))
         return str(sorted(gguFs, key=_prio)[0])
 
     # ------------------------------------------------------------------
     # 加载与生命周期
     # ------------------------------------------------------------------
     def _check_paths(self) -> Optional[str]:
-        """校验基座 GGUF 与 LoRA adapter 路径。返回错误信息或 None。"""
+        """校验基座 GGUF 与 LoRA adapter 路径，并把 adapter 目录内的权重文件定位到
+        self._adapter_file（llama.cpp 的 lora_path 需要单个文件路径）。返回错误信息或 None。"""
         if not self.base_gguf:
             return "VULN_SCANNER_GGUF 未设置：需要 Q4 基座 GGUF 文件路径"
         if not Path(self.base_gguf).is_file():
@@ -123,11 +128,13 @@ class LlamaCppClient:
         p = Path(self.adapter)
         if not p.is_dir():
             return f"LoRA adapter 路径不存在: {self.adapter}"
-        has_weights = any(
-            (p / name).exists()
-            for name in ("adapter_model.safetensors", "adapter_model.bin")
-        )
-        if not has_weights:
+        # 与 paths.is_valid_adapter_dir 口径一致：safetensors/bin/gguf 任一即可
+        for name in ("adapter_model.safetensors", "adapter_model.bin", "adapter_model.gguf"):
+            f = p / name
+            if f.is_file():
+                self._adapter_file = str(f)
+                break
+        else:
             return f"LoRA adapter 目录缺少权重文件: {self.adapter}"
         return None
 
@@ -147,9 +154,11 @@ class LlamaCppClient:
         try:
             llama = _lazy_import_llama_cpp()
             gpu_layers = self.gpu_layers
-            # n_gpu_layers=-1 表示"尽量卸载到 GPU"；若当前 llama-cpp-python 编译时
-            # 未开启任何 GPU 后端，则传 -1 会报错，自动降级为 0（纯 CPU）。
-            if gpu_layers < 0:
+            # n_gpu_layers：-1 表示"尽量卸载到 GPU"，正整数表示卸载前 N 层到 GPU、其余跑 CPU。
+            # 无论哪种 GPU 模式，若当前 llama-cpp-python 编译时未开启任何 GPU 后端
+            # （CPU-only，如 AMD 回退、预编译 CPU wheel），传非 0 都会报错，
+            # 统一自动降级为 0（纯 CPU），避免加载失败。
+            if gpu_layers != 0:
                 try:
                     import llama_cpp
                     supports_gpu = getattr(llama_cpp, "llama_supports_gpu_offload", lambda: True)()
@@ -159,10 +168,10 @@ class LlamaCppClient:
                     pass
 
             print(f"[LlamaCppClient] 加载 GGUF 基座 {self.base_gguf} "
-                  f"(LoRA={self.adapter}, n_ctx={self.num_ctx}, gpu_layers={gpu_layers})")
+                  f"(LoRA={self._adapter_file}, n_ctx={self.num_ctx}, gpu_layers={gpu_layers})")
             self._llm = llama["Llama"](
                 model_path=self.base_gguf,
-                lora_path=self.adapter,   # 运行时叠加 FP16 LoRA，保留精度
+                lora_path=self._adapter_file,  # 运行时叠加 FP16 LoRA，保留精度
                 n_ctx=self.num_ctx,
                 n_gpu_layers=gpu_layers,
                 verbose=self.verbose,

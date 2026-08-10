@@ -41,10 +41,13 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 # Windows 默认 GBK 控制台：任何会 print 非 GBK 字符的脚本必须重新配置 stdout/stderr
 if sys.platform == "win32":
@@ -127,6 +130,14 @@ class InstallSpec:
     # 已安装的依赖与目标版本/构建不匹配时，先卸载再安装（同版本 CPU→GPU 替换
     # 必须卸载，否则 pip 认为已满足而不覆盖）
     cleanup_on_mismatch: bool = True
+    # 为 True 时，--index-url 强制使用 spec.index_url，忽略 VULN_SCANNER_PIP_INDEX。
+    # 用于 llama-cpp-python 的 CUDA/Metal 预编译 wheel：这类 wheel 必须从 abetlen 官方
+    # 索引取，若被全局镜像覆盖会静默回退到 PyPI 的 CPU wheel，导致 GPU offload 失效。
+    prefer_index_url: bool = False
+    # llama-cpp-python 预编译 wheel 实际托管在 GitHub Releases（abetlen 索引只有链接）。
+    # 国内直连 GitHub 大文件极易被掐断（ConnectionResetError 10054）。设置此项后，
+    # 安装前先经 ghproxy 镜像把该 wheel 下载到本地，再用本地文件安装，绕开 GitHub 直连。
+    mirror_wheel_url: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +540,11 @@ def _pip_index_args(spec: InstallSpec) -> List[str]:
         if spec.extra_index_url:
             args.extend(["--extra-index-url", spec.extra_index_url])
     else:
-        if global_index:
+        if spec.prefer_index_url and spec.index_url:
+            # 强制以 spec.index_url 为主索引（忽略全局镜像），保证 CUDA/Metal 预编译
+            # wheel 从 abetlen 官方索引取，避免回退到 PyPI 的 CPU wheel
+            args.extend(["--index-url", spec.index_url])
+        elif global_index:
             args.extend(["--index-url", global_index])
         elif spec.index_url:
             args.extend(["--index-url", spec.index_url])
@@ -684,11 +699,14 @@ def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable
       或用 VULN_SCANNER_LLAMACPP_CMAKE_ARGS 完全自定义编译参数
     """
     env: dict = {}
+    index_url: Optional[str] = None
     extra_index_url: Optional[str] = None
+    prefer_index_url = False
     description = "llama-cpp-python"
     warning: Optional[str] = None
     gpu_probe: Optional[str] = None
     packages = ["llama-cpp-python"]
+    mirror_wheel_url: Optional[str] = None
     # GPU 平台若走源码编译，必须用 --no-binary 强制 sdist（PyPI wheel 是 CPU-only），
     # 否则 pip 会用 wheel 而忽略 CMAKE_ARGS，导致 GPU offload 静默失效。
     pip_extra_args: List[str] = []
@@ -720,21 +738,50 @@ def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable
                 "并需安装匹配的 CUDA/ROCm/Vulkan 工具链。如非必要请改用预编译 wheel 或 Ollama。"
             )
     elif gpu.vendor == "nvidia" and platform_info.os_name == "windows":
-        # Windows + NVIDIA：官方预编译 CUDA wheel，免源码编译 / 免长路径问题
-        cuda_ver = os.environ.get("VULN_SCANNER_LLAMACPP_CUDA_VERSION", "cu125").strip().lower()
+        # Windows + NVIDIA：官方预编译 CUDA wheel，免源码编译 / 免长路径问题。
+        # 默认 CUDA 分支按 GPU 系别自动选择，确保不同显卡拿到匹配的 wheel：
+        #   RTX 50（Blackwell sm_120）→ cu128（必须 CUDA 12.8+/驱动≥570）
+        #   RTX 20/GTX 16（Turing）→ cu121
+        #   GTX 10（Pascal）→ cu118
+        #   其余 Ampere/Ada/数据中心/未知 → cu125（官方 wheel 覆盖最全，兼容性最好）
+        # 高级用户可用 VULN_SCANNER_LLAMACPP_CUDA_VERSION 显式覆盖。
+        family = classify_gpu(gpu).family
+        _default_cuda = {
+            "nvidia_50": "cu128",
+            "nvidia_40": "cu125",
+            "nvidia_30": "cu125",
+            "nvidia_20": "cu121",
+            "nvidia_10": "cu118",
+            "nvidia_dc": "cu125",
+            "nvidia_unknown": "cu125",
+        }.get(family, "cu125")
+        cuda_ver = os.environ.get(
+            "VULN_SCANNER_LLAMACPP_CUDA_VERSION", _default_cuda
+        ).strip().lower()
         if not cuda_ver.startswith("cu"):
             cuda_ver = "cu" + cuda_ver
         ver = os.environ.get("VULN_SCANNER_LLAMACPP_VERSION", "0.3.34").strip()
-        extra_index_url = f"https://abetlen.github.io/llama-cpp-python/whl/{cuda_ver}"
+        # 主索引指向 abetlen 官方 CUDA wheel，依赖（如 numpy 等）经 extra Pypi 拉取。
+        # 用 --index-url 而非 --extra-index-url，避免同版本 CPU wheel 被 pip 误选。
+        index_url = f"https://abetlen.github.io/llama-cpp-python/whl/{cuda_ver}"
+        extra_index_url = "https://pypi.org/simple"
+        prefer_index_url = True
         description = f"llama-cpp-python {ver} (CUDA 预编译 {cuda_ver})"
         packages = [f"llama-cpp-python=={ver}"]
+        # 预编译 wheel 实际在 GitHub Releases，标记镜像 URL：安装前经 ghproxy 下载到本地，
+        # 绕开国内 GitHub 大文件被掐断（ConnectionResetError 10054）的问题。
+        mirror_wheel_url = (
+            f"https://github.com/abetlen/llama-cpp-python/releases/download/"
+            f"v{ver}-{cuda_ver}/llama_cpp_python-{ver}-py3-none-win_amd64.whl"
+        )
         gpu_probe = (
             "import llama_cpp; "
             "print('TRUE' if llama_cpp.llama_supports_gpu_offload() else 'FALSE')"
         )
         if cuda_ver in ("cu128", "cu129", "cu130"):
             warning = (
-                f"官方预编译索引目前主要提供 cu121~cu125；{cuda_ver} 若无匹配 wheel，"
+                f"预编译索引 {cuda_ver} 需要较新的 NVIDIA 驱动（cu128 需 ≥570）；"
+                f"若机器为 RTX 50 系，这是自动选择的最匹配版本。若该索引无匹配 wheel，"
                 "可设置 VULN_SCANNER_LLAMACPP_CUDA_VERSION 改用其它版本，"
                 "或 VULN_SCANNER_LLAMACPP_SOURCE_BUILD=1 源码编译（需启用 Windows 长路径支持）。"
             )
@@ -747,7 +794,9 @@ def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable
     elif gpu.vendor == "apple":
         # macOS + Apple Silicon：官方预编译 Metal wheel，免 Xcode/CMake 编译
         ver = os.environ.get("VULN_SCANNER_LLAMACPP_VERSION", "0.3.34").strip()
-        extra_index_url = "https://abetlen.github.io/llama-cpp-python/whl/metal"
+        index_url = "https://abetlen.github.io/llama-cpp-python/whl/metal"
+        extra_index_url = "https://pypi.org/simple"
+        prefer_index_url = True
         description = f"llama-cpp-python {ver} (Metal 预编译)"
         packages = [f"llama-cpp-python=={ver}"]
         gpu_probe = (
@@ -774,7 +823,10 @@ def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable
     return [InstallSpec(
         description=description,
         packages=packages,
+        index_url=index_url,
         extra_index_url=extra_index_url,
+        prefer_index_url=prefer_index_url,
+        mirror_wheel_url=mirror_wheel_url,
         env=env,
         pip_extra_args=pip_extra_args,
         check_modules=["llama_cpp"],
@@ -1054,6 +1106,74 @@ def _add_pip_network_flags(cmd: List[str]) -> None:
         cmd.extend(["--progress-bar", PIP_PROGRESS_BAR])
 
 
+# llama-cpp-python 预编译 wheel 的 ghproxy 镜像前缀（避免国内直连 GitHub Releases 被掐断）
+_GH_PROXY_PREFIX = os.environ.get(
+    "VULN_SCANNER_GH_PROXY", "https://mirror.ghproxy.com/"
+).strip().rstrip("/") + "/"
+
+
+def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[str], None]] = None) -> Optional[Path]:
+    """把 spec.mirror_wheel_url 指定的 GitHub wheel 经 ghproxy 镜像下载到本地。
+
+    返回本地 wheel 路径；未配置 mirror_wheel_url 或镜像不可用（含下载不完整）时返回 None，
+    调用方应回退到正常 pip（abetlen 索引）下载。
+    """
+    url = (spec.mirror_wheel_url or "").strip()
+    if not url:
+        return None
+    filename = url.rsplit("/", 1)[-1].split("?", 1)[0].split("#", 1)[0]
+    if not filename:
+        return None
+    # 缓存到项目 D 盘目录（cache/wheels），避免 500MB+ wheel 占用系统盘 C 盘；
+    # 重复运行/重试时直接复用，避免反复下载。项目根通过依赖安装器所在
+    # app/launcher 向上两级定位（与 graduation_project.paths.find_project_root 一致）。
+    _proj_root = Path(__file__).resolve().parents[2]
+    cache_dir = _proj_root / "cache" / "wheels"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dest = cache_dir / filename
+    if dest.is_file() and dest.stat().st_size > 0:
+        _emit(f"[依赖安装] 复用已缓存 wheel: {dest}", callback)
+        return dest
+
+    mirror_url = _GH_PROXY_PREFIX + url
+    _emit(f"[依赖安装] 经镜像下载 llama-cpp-python wheel（避免 GitHub 断连）: {mirror_url}", callback)
+    try:
+        # 镜像直连、不走代理：避免代理秒断 + 白白消耗代理流量
+        _mirror_host = urlparse(mirror_url).hostname or ""
+        _no_proxy = set(
+            h.strip()
+            for h in os.environ.get("NO_PROXY", "").replace(";", ",").split(",")
+            if h.strip()
+        )
+        if _mirror_host:
+            _no_proxy.add(_mirror_host)
+        _no_proxy_val = ",".join(sorted(_no_proxy))
+        os.environ["NO_PROXY"] = _no_proxy_val
+        os.environ["no_proxy"] = _no_proxy_val
+        with urlopen(mirror_url, timeout=60) as resp, open(dest, "wb") as f:
+            total = int(resp.headers.get("content-length", 0))
+            downloaded = 0
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+        if total > 0 and downloaded != total:
+            _emit(
+                f"[依赖安装] ⚠️ 镜像下载不完整 {downloaded}/{total} 字节，删缓存并回退 pip 直连",
+                callback,
+            )
+            dest.unlink(missing_ok=True)
+            return None
+        _emit(f"[依赖安装] ✅ 镜像下载完成: {dest}", callback)
+        return dest
+    except Exception as e:
+        _emit(f"[依赖安装] ⚠️ 镜像下载失败（{type(e).__name__}: {e}），回退 pip 直连", callback)
+        dest.unlink(missing_ok=True)
+        return None
+
+
 def _run_pip_install(
     cmd: List[str],
     env: dict,
@@ -1068,6 +1188,14 @@ def _run_pip_install(
     Returns:
         (returncode, 完整输出文本)
     """
+    # Windows 下 pip 子进程默认按系统代码页（GBK/cp936）输出中文报错，
+    # 若按 utf-8 解读会变成乱码。这里强制子进程以 UTF-8 输出（Python 解释器
+    # 统一走 PYTHONUTF8/PYTHONIOENCODING），保证不同硬件/不同控制台编码下
+    # 中文错误消息都能被下面 encoding="utf-8" 正确解码。
+    env = dict(env)
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+
     lines: list[str] = []
     proc = subprocess.Popen(
         cmd, env=env,
@@ -1657,6 +1785,16 @@ def install_backend_dependencies(
             and (status == "mismatch" or _force_reinstall())
         ):
             _uninstall_packages(python_executable, [primary], callback)
+
+        # llama-cpp-python CUDA/Metal wheel 在 GitHub Releases，国内直连易被掐断。
+        # 若配置了 mirror_wheel_url，先经 ghproxy 镜像下载到本地，再用本地文件安装；
+        # 镜像失败时回退正常 pip（abetlen 索引），不阻断安装流程。
+        local_wheel = _download_wheel_via_mirror(spec, callback)
+        if local_wheel is not None:
+            spec.packages = [str(local_wheel)]
+            spec.index_url = None
+            spec.extra_index_url = None
+            spec.prefer_index_url = False
 
         cmd = _build_pip_cmd(spec, python_executable)
         env = os.environ.copy()

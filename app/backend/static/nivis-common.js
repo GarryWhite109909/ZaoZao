@@ -544,9 +544,12 @@
       } else if (prog && prog.error) {
         btnArea = '<button data-dl-retry="' + this.esc(rid) + '" class="text-xs px-2.5 py-1 rounded-md transition-colors hover:opacity-80" style="background: var(--vuln-brand); color: #fff">重试</button>';
       } else if (r.type === 'gguf' && r.download_endpoint) {
+        /* 与 transformers 后端对齐：llamacpp 只能下载固定基座（官方 Qwen3-8B-GGUF 未合并基座），
+           不再提供自由 URL 输入，杜绝把已合并 LoRA 的发布 GGUF 当基座导致二次叠加 */
+        var ggufUrl = r.default_url || '';
         btnArea = '<div class="flex flex-col items-end gap-1.5">' +
-          '<input type="text" data-gguf-url="' + this.esc(rid) + '" placeholder="GGUF 下载 URL" value="' + (r.default_url ? this.esc(r.default_url) : '') + '" class="w-full text-[11px] px-2 py-1 rounded-md font-mono" style="background: var(--vuln-surface); border: 1px solid var(--vuln-line); color: var(--vuln-ink-2); outline: none;">' +
-          '<button data-dl-start="' + this.esc(rid) + '" class="text-xs px-2.5 py-1 rounded-md transition-colors hover:opacity-80 whitespace-nowrap" style="background: var(--vuln-brand); color: #fff">下载 GGUF</button>' +
+          '<div class="w-full max-w-[220px] text-[11px] px-2 py-1 rounded-md font-mono truncate" style="background: var(--vuln-surface); border: 1px solid var(--vuln-line); color: var(--vuln-ink-2);" title="' + this.esc(ggufUrl) + '">' + this.esc(ggufUrl) + '</div>' +
+          '<button data-dl-start="' + this.esc(rid) + '" class="text-xs px-2.5 py-1 rounded-md transition-colors hover:opacity-80 whitespace-nowrap" style="background: var(--vuln-brand); color: #fff">下载基座 GGUF</button>' +
         '</div>';
       } else {
         btnArea = '<button data-dl-start="' + this.esc(rid) + '" class="text-xs px-2.5 py-1 rounded-md transition-colors hover:opacity-80" style="background: var(--vuln-brand); color: #fff">下载</button>';

@@ -32,6 +32,13 @@ import threading
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
+
+# huggingface_hub 的 endpoint 在「模块首次 import」时按 HF_ENDPOINT 固定，之后改环境变量无效。
+# 必须在进程内任何 huggingface_hub import（transformers 库内部懒加载）之前设置，否则模型下载
+# 实际仍指向被墙的 huggingface.co，list_repo_files 会秒失败。这里在 main.py 最顶部、任何
+# app/graduation_project 模块 import 之前设置，走国内镜像 hf-mirror.com（可用变量覆盖）。
+os.environ.setdefault("HF_ENDPOINT", os.environ.get("VULN_SCANNER_HF_MIRROR", "https://hf-mirror.com").strip() or "https://hf-mirror.com")
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -1487,7 +1494,37 @@ def models_activate(req: ModelActionRequest):
 # ---------------------------------------------------------------------------
 
 # HuggingFace 镜像（国内加速），可通过环境变量覆盖
+# （HF_ENDPOINT 已在文件顶部、任何 huggingface_hub import 之前设置，这里仅保留常量供界面展示）
 HF_MIRROR = os.environ.get("VULN_SCANNER_HF_MIRROR", "https://hf-mirror.com").strip() or "https://hf-mirror.com"
+
+# llamacpp 后端所需的"未合并基座" GGUF —— 官方 Qwen3-8B-GGUF 的 Q4_K_M（与 LoRA adapter 同源）。
+# 下载按钮固定指向它，与 transformers 后端"只能下载所需模型"对齐：基座 + models/adapter 的
+# LoRA 在运行时叠加（lora_path），绝不能下成已合并 LoRA 的发布 GGUF（否则二次叠加，结果错误）。
+LLAMACPP_BASE_GGUF_URL = (
+    os.environ.get(
+        "VULN_SCANNER_GGUF_URL",
+        "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
+    ).strip()
+    or "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
+)
+
+
+def _no_proxy_for_mirrors(*hosts: str) -> None:
+    """让指定的国内镜像域名直连、不走代理（写入并合并 NO_PROXY/no_proxy）。
+
+    用户机器常配置 HTTP_PROXY/HTTPS_PROXY（科学上网）。若 hf-mirror.com / ghproxy 等
+    镜像下载也走代理，既会秒断（代理对国内域名路由不佳），又会白白消耗代理流量
+    （几个 GB 的模型流量瞬间用光）。这里把镜像域名追加进 NO_PROXY，强制直连镜像。
+    """
+    no_proxy = set(
+        h.strip()
+        for h in os.environ.get("NO_PROXY", "").replace(";", ",").split(",")
+        if h.strip()
+    )
+    no_proxy |= {h for h in hosts if h and h.strip()}
+    val = ",".join(sorted(no_proxy))
+    os.environ["NO_PROXY"] = val
+    os.environ["no_proxy"] = val
 
 
 def _models_dir() -> Path:
@@ -1539,17 +1576,17 @@ def models_local_resources():
     elif cls_name == "LlamaCppClient":
         base_gguf = getattr(client, "base_gguf", "") or os.environ.get("VULN_SCANNER_GGUF", "")
         available, status = _detect_model_available("llamacpp", client)
-        # GGUF 下载 URL：优先环境变量，其次 GitHub releases 推断
-        gguf_url = os.environ.get("VULN_SCANNER_GGUF_URL", "")
+        # GGUF 固定基座：官方 Qwen3-8B-GGUF Q4_K_M（未合并基座，与 LoRA adapter 同源）。
+        # 与 transformers 后端固定 model_id 对齐，下载按钮只能拉取该基座，避免误下合并发布 GGUF。
         resources.append({
             "type": "gguf",
             "path": base_gguf,
             "available": available,
             "status": status,
-            "description": "Q4 GGUF 基座文件",
+            "description": "Q4 GGUF 未合并基座（官方 Qwen3-8B-GGUF）",
             "download_endpoint": "/api/models/download-gguf",
             "download_path": str(llamacpp_dir()),
-            "default_url": gguf_url,
+            "default_url": LLAMACPP_BASE_GGUF_URL,
         })
         adapter = resolve_adapter_path(getattr(client, "adapter", ""))
         resources.append({
@@ -1643,6 +1680,9 @@ async def models_download_hf(req: HfDownloadRequest):
     def run_download():
         try:
             os.environ["HF_ENDPOINT"] = HF_MIRROR
+            # 国内镜像直连、不走代理：避免代理秒断 + 白白消耗代理流量
+            _hf_host = urlparse(HF_MIRROR).hostname or "hf-mirror.com"
+            _no_proxy_for_mirrors(_hf_host)
             try:
                 from huggingface_hub import list_repo_files, hf_hub_download
             except Exception as e:
@@ -1652,10 +1692,13 @@ async def models_download_hf(req: HfDownloadRequest):
             chunk_queue.put({"status": "downloading", "message": f"正在连接镜像 {HF_MIRROR}…", "pct": 0})
 
             # 获取仓库文件列表（进度估算用）
+            # 注意：list_repo_files 不接受 timeout 参数（huggingface_hub 1.x 传入会抛
+            # TypeError 并被误判为"连接超时"），这里不带该参数；实际大文件传输由
+            # hf_hub_download 的 timeout 负责。
             files: list[str] = []
             total_files = 0
             try:
-                files = list_repo_files(model_id, timeout=HF_NETWORK_TIMEOUT)
+                files = list_repo_files(model_id)
                 total_files = len(files)
             except Exception as e:
                 err = _friendly_error(e, "获取文件列表")
@@ -1665,7 +1708,8 @@ async def models_download_hf(req: HfDownloadRequest):
 
             chunk_queue.put({"status": "downloading", "total_files": total_files, "completed": 0, "pct": 0})
 
-            # 逐文件下载，每完成一个文件报告进度（huggingface_hub 内部用 HF_ENDPOINT 镜像）
+            # 逐文件下载，每完成一个文件报告进度（显式 endpoint 指向镜像；
+            # huggingface_hub 1.x 的 hf_hub_download 不接受 timeout 参数，元数据用 etag_timeout 兜底）
             completed_files = 0
             for fname in files:
                 try:
@@ -1675,7 +1719,8 @@ async def models_download_hf(req: HfDownloadRequest):
                         local_dir=str(cache_dir),
                         local_dir_use_symlinks=False,
                         resume_download=True,
-                        timeout=HF_NETWORK_TIMEOUT,
+                        endpoint=HF_MIRROR,
+                        etag_timeout=HF_NETWORK_TIMEOUT,
                     )
                 except Exception as e:
                     err = _friendly_error(e, f"下载 {fname}")
@@ -1775,9 +1820,22 @@ async def models_download_gguf(req: GgufDownloadRequest):
     if "/" in filename or "\\" in filename or ".." in filename:
         return JSONResponse({"error": "filename 含非法字符"}, status_code=400)
 
-    # GitHub URL 自动加 ghproxy
+    # 只允许下载"未合并基座" GGUF：拒绝指向已合并 LoRA 的发布模型（URL/文件名含其标记）。
+    # 否则基座本身已带 LoRA，运行时再经 lora_path 叠加会二次叠加，结果错误。
+    _merged_markers = ("merged", "graduation-vuln-scanner", "graduation_vuln_scanner", "v9max")
+    _low_url = url.lower()
+    _low_name = filename.lower()
+    if any(m in _low_url for m in _merged_markers) or any(m in _low_name for m in _merged_markers):
+        return JSONResponse({
+            "error": "拒绝下载已合并 LoRA 的发布 GGUF。llamacpp 需要【未合并基座】（官方 Qwen3-8B-GGUF），"
+                     "基座 + models/adapter 的 LoRA 在运行时叠加；请下载官方基座。",
+        }, status_code=400)
+
+    # 国内加速：GitHub 加 ghproxy；HuggingFace 走 HF_MIRROR（与 transformers 下载口径一致）
     if url.startswith("https://github.com/"):
         url = "https://mirror.ghproxy.com/" + url
+    elif url.startswith("https://huggingface.co/"):
+        url = HF_MIRROR + url[len("https://huggingface.co"):]
 
     dest_dir = llamacpp_dir()
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1787,6 +1845,9 @@ async def models_download_gguf(req: GgufDownloadRequest):
 
     def run_download():
         try:
+            # 国内镜像直连、不走代理：避免代理秒断 + 白白消耗代理流量
+            _gguf_host = urlparse(url).hostname or ""
+            _no_proxy_for_mirrors(_gguf_host)
             with urlopen(url, timeout=60) as resp, open(dest_path, "wb") as f:
                 total = int(resp.headers.get("content-length", 0))
                 downloaded = 0
@@ -1808,6 +1869,9 @@ async def models_download_gguf(req: GgufDownloadRequest):
                             "pct": pct,
                         })
                         last_report = pct
+            # 完整性校验：content-length 与实际字节数不符视为下载失败，避免残缺文件被当作就绪模型
+            if total > 0 and downloaded != total:
+                raise ValueError(f"下载不完整: {downloaded}/{total} 字节")
             done_flag["result"] = {"dest": str(dest_path), "filename": filename}
         except Exception as e:
             done_flag["error"] = f"{type(e).__name__}: {e}"
