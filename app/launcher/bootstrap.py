@@ -1332,30 +1332,37 @@ def recommend_config(hardware: dict) -> dict:
     )
 
     # NVIDIA GPU 分支：按显存分档
-    # q4_k_m 量化的 8B 模型权重约 4.7GB，加上 num_ctx 的 KV cache：
-    #   ≥10GB → 全 GPU，num_ctx=8192
-    #   8-10GB→ 全 GPU，num_ctx=6144（8G 卡贴显存，6144 比 8192 稳）
-    #   6-8GB → 全 GPU，num_ctx=4096（6GB 勉强够 4.7GB 权重 + KV cache）
-    #   4-6GB → 显存装不下，降级 CPU（避免 Ollama 反复试错 offload 导致启动卡住）
-    #   <4GB  → CPU
+    # q4_k_m 量化的 8B 模型权重约 4.7GB，加上 num_ctx 的 KV cache。
+    # 注意：GPU 可用显存通常低于标称容量（RTX 5050 标 8G 实际报 8151MB；12G/16G 类似），
+    # 因此分档阈值按 名义容量×~0.95 取整，避免 8G/12G/16G 卡因不足标称而错档：
+    #   ≥15.5G(15872MB) → 全 GPU，num_ctx=16384（16K）
+    #   11.5-15.5G      → 全 GPU，num_ctx=12288（12K）
+    #   7.5-11.5G       → 全 GPU，num_ctx=9216（9K，覆盖 8G/10G/12G 档）
+    #   6-7.5G          → 全 GPU，num_ctx=6144（6K，6GB 勉强够 4.7GB 权重 + KV cache）
+    #   <6G             → 显存装不下，降级 CPU（避免 Ollama 反复试错 offload 导致启动卡住）
     if hardware.get("has_nvidia_gpu") and hardware.get("vram_mb"):
         vram = hardware["vram_mb"]
-        if vram >= 10240:
+        if vram >= 15872:
             return {
-                "num_ctx": 8192, "num_gpu": -1, "num_thread": num_thread,
+                "num_ctx": 16384, "num_gpu": -1, "num_thread": num_thread,
                 "quantization": "q4_k_m", "warning": None, "mode": "gpu",
             }
-        elif vram >= 8192:
+        elif vram >= 11776:
             return {
-                "num_ctx": 6144, "num_gpu": -1, "num_thread": num_thread,
+                "num_ctx": 12288, "num_gpu": -1, "num_thread": num_thread,
+                "quantization": "q4_k_m", "warning": None, "mode": "gpu",
+            }
+        elif vram >= 7680:
+            return {
+                "num_ctx": 9216, "num_gpu": -1, "num_thread": num_thread,
                 "quantization": "q4_k_m", "warning": None, "mode": "gpu",
             }
         elif vram >= 6144:
             return {
-                "num_ctx": 4096, "num_gpu": -1, "num_thread": num_thread,
+                "num_ctx": 6144, "num_gpu": -1, "num_thread": num_thread,
                 "quantization": "q4_k_m", "warning": None, "mode": "gpu",
             }
-        elif vram >= 4096:
+        else:
             return {
                 "num_ctx": 2048, "num_gpu": 0, "num_thread": num_thread,
                 "quantization": "q4_k_m",
@@ -1364,30 +1371,29 @@ def recommend_config(hardware: dict) -> dict:
                             f"GPU 仍可用于其他任务，模型推理走 CPU（速度较慢但稳定）。"),
                 "mode": "cpu",
             }
-        else:
-            return {
-                "num_ctx": 2048, "num_gpu": 0, "num_thread": num_thread,
-                "quantization": "q4_k_m",
-                "warning": "显存不足，将使用 CPU 推理（速度较慢）",
-                "mode": "cpu",
-            }
 
     # AMD/ROCm GPU 分支：Ollama 在 Linux 上支持 ROCm 后端，num_gpu=-1 表示尽量 offload
+    # 阈值同样按 名义容量×~0.95 取整（与 NVIDIA 一致）
     if hardware.get("has_amd_gpu") and hardware.get("vram_mb"):
         vram = hardware["vram_mb"]
-        if vram >= 10240:
+        if vram >= 15872:
             return {
-                "num_ctx": 8192, "num_gpu": -1, "num_thread": num_thread,
+                "num_ctx": 16384, "num_gpu": -1, "num_thread": num_thread,
                 "quantization": "q4_k_m", "warning": None, "mode": "rocm",
             }
-        elif vram >= 8192:
+        elif vram >= 11776:
+            return {
+                "num_ctx": 12288, "num_gpu": -1, "num_thread": num_thread,
+                "quantization": "q4_k_m", "warning": None, "mode": "rocm",
+            }
+        elif vram >= 7680:
+            return {
+                "num_ctx": 9216, "num_gpu": -1, "num_thread": num_thread,
+                "quantization": "q4_k_m", "warning": None, "mode": "rocm",
+            }
+        elif vram >= 6144:
             return {
                 "num_ctx": 6144, "num_gpu": -1, "num_thread": num_thread,
-                "quantization": "q4_k_m", "warning": None, "mode": "rocm",
-            }
-        elif vram >= 4096:
-            return {
-                "num_ctx": 4096, "num_gpu": -1, "num_thread": num_thread,
                 "quantization": "q4_k_m", "warning": None, "mode": "rocm",
             }
         else:
