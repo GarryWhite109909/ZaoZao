@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
-from graduation_project.prompts import build_user_prompt
+from graduation_project.prompts import V3_PROMPT, build_user_prompt
 from graduation_project.schema import parse_verdict, normalize_has_vulnerability
 from graduation_project.paths import resolve_adapter_path, llamacpp_dir
 
@@ -331,7 +331,9 @@ class LlamaCppClient:
         prompt = build_user_prompt(
             code=code, language=language, filename=filename, rag_context=rag_context
         )
-        return self.generate(prompt, system_prompt=os.environ.get("VULN_SCANNER_SYSTEM_PROMPT"))
+        # 优先允许环境变量覆盖（供消融实验/调试），否则默认对齐 v3 训练 prompt。
+        system_prompt = os.environ.get("VULN_SCANNER_SYSTEM_PROMPT") or V3_PROMPT
+        return self.generate(prompt, system_prompt=system_prompt)
 
 
 # 兼容工厂：与 create_llm_client 对齐

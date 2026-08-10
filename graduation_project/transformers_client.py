@@ -78,7 +78,7 @@ def _lazy_import_peft():
 # 统一输出 schema 的约束描述（与 scanner 的 CoT+JSON 模式一致；transformers 无 guided
 # decoding，结构化兜底靠模型训练时学会的 JSON 输出 + 解析层 parse_verdict 容错）。
 # 复用 graduation_project.prompts 的 build_user_prompt 组装 user prompt。
-from graduation_project.prompts import build_user_prompt
+from graduation_project.prompts import V3_PROMPT, build_user_prompt
 from graduation_project.schema import parse_verdict, normalize_has_vulnerability
 from graduation_project.paths import (
     resolve_adapter_path,
@@ -928,7 +928,9 @@ class TransformersClient:
         prompt = build_user_prompt(
             code=code, language=language, filename=filename, rag_context=rag_context
         )
-        return self.generate(prompt, system_prompt=os.environ.get("VULN_SCANNER_SYSTEM_PROMPT"))
+        # 优先允许环境变量覆盖（供消融实验/调试），否则默认对齐 v3 训练 prompt。
+        system_prompt = os.environ.get("VULN_SCANNER_SYSTEM_PROMPT") or V3_PROMPT
+        return self.generate(prompt, system_prompt=system_prompt)
 
 
 def tokenizer_apply_chat_template(tokenizer, messages, enable_thinking=False) -> str:

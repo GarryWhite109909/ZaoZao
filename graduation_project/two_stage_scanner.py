@@ -31,7 +31,7 @@
 
 本模块不直接调用 Ollama，而是复用调用方注入的 client（通常为
 app.backend.services.scanner.Scanner 的 client），保证与主扫描共享同一推理
-后端与 system_prompt（由 model_registry 选择，v9max→BASE_PROMPT）。
+后端与 system_prompt（由 model_registry 选择，统一为 v3 训练数据的 V3_PROMPT）。
 """
 
 from __future__ import annotations

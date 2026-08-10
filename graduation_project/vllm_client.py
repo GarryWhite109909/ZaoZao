@@ -18,7 +18,7 @@ import requests
 
 # schema 与 prompt 统一从 graduation_project.schema / graduation_project.prompts 导入（全项目唯一来源）。
 from graduation_project.schema import VERDICT_SCHEMA, parse_verdict, normalize_has_vulnerability
-from graduation_project.prompts import SYSTEM_PROMPT, build_user_prompt
+from graduation_project.prompts import V3_PROMPT, build_user_prompt
 
 __all__ = [
     "VLLMClient",
@@ -302,7 +302,7 @@ class VLLMClient:
             filename=filename,
             rag_context=rag_context,
         )
-        return self.generate(prompt, system_prompt=SYSTEM_PROMPT)
+        return self.generate(prompt, system_prompt=V3_PROMPT)
 
 
 def create_llm_client(backend: str = "ollama", **kwargs) -> Union["OllamaClient", "VLLMClient"]:

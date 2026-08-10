@@ -396,6 +396,13 @@ def _build_combined_prompt() -> str:
     return cot_system + "\n\n" + FEW_SHOT_EXAMPLES
 
 
+# v3 训练数据（final_train_chatml_v3.jsonl）使用的 system prompt。
+# 实测 v3 的 system prompt 长度为 4448 字符，对应 combined 变体：
+# SYSTEM_PROMPT + CoT 步骤 + 3 组 few-shot 示例。
+# 当前所有推理入口统一对齐到训练 prompt，避免训练/推理不一致。
+V3_PROMPT = _build_combined_prompt()
+
+
 def build_system_prompt_variant(variant: str) -> str:
     """根据变体名返回对应的 system prompt。
 
