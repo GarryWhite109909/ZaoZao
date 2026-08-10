@@ -1299,6 +1299,24 @@ def _torch_build(python_executable: str) -> Optional[str]:
     return _query_torch_build(python_executable)
 
 
+def _query_package_build(python_executable: str, package: str) -> Optional[str]:
+    """查询指定包的构建后缀（如 torchvision 2.7.0+cu128 -> cu128）。"""
+    try:
+        r = subprocess.run(
+            [python_executable, "-c", f"import {package}; print({package}.__version__)"],
+            capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace",
+        )
+        if r.returncode != 0:
+            return None
+        ver = r.stdout.strip()
+        if "+" in ver:
+            return ver.split("+", 1)[1].lower()
+        return "" if ver else None
+    except Exception:
+        return None
+
+
 def _package_version(python_executable: str, package: str) -> Optional[str]:
     """查询目标解释器里指定包的版本；未安装返回 None。"""
     try:
@@ -1337,8 +1355,10 @@ def build_cleanup_plan(
     原则：只在明确不匹配时才动，平时不卸载任何包。
     - torch 构建不满足当前显卡要求（如旧版本装了 cu126，RTX 50 需要 cu128，
       或 AMD 机器上装了 CUDA 版 torch）→ 卸载 torch + bitsandbytes；
+      若环境中还残留 torchvision/torchaudio 旧构建（ABI 与新 torch 不匹配），
+      也一并卸载，避免启动时弹 "无法定位程序输入点" DLL 错误；
     - RTX 50 系且 bitsandbytes 版本过旧（<0.45.5，无 Blackwell 内核）→ 卸载 bnb；
-    - 不动 torchvision/torchaudio/torchtext 等，避免破坏环境里其他项目。
+    - 不动 torchtext 等其他 torch 生态包，避免破坏环境里其他项目。
     可用 VULN_SCANNER_SKIP_CLEAN=1 完全关闭自动卸载。
     """
     if os.environ.get("VULN_SCANNER_SKIP_CLEAN", "").strip() == "1":
@@ -1353,11 +1373,31 @@ def build_cleanup_plan(
         # torch 构建变了，bitsandbytes 的内核与 torch 绑定，必须一起重装
         if _package_version(python_executable, "bitsandbytes") is not None:
             plan.append("bitsandbytes")
+        # 环境里若存在 torchvision/torchaudio 的旧构建（如 cu126/cu121），与新 torch
+        # ABI 不匹配会导致启动时弹 "无法定位程序输入点" 错误；一并卸载让它们随新 torch
+        # 重新解析或不再加载（本项目实际不需要它们）。
+        for pkg in ("torchvision", "torchaudio"):
+            if _package_version(python_executable, pkg) is not None:
+                plan.append(pkg)
 
     if gpu.vendor == "nvidia" and classify_gpu(gpu).family == "nvidia_50":
         bnb_ver = _package_version(python_executable, "bitsandbytes")
         if bnb_ver is not None and _version_lt(bnb_ver, "0.45.5"):
             plan.append("bitsandbytes")
+
+    # 即使 torch 本身已匹配当前硬件，若环境中残留的 torchvision/torchaudio 构建与
+    # torch 不一致（例如 torch 已升级到 cu128，但 torchvision 还是 cu126），import 时
+    # 会触发 DLL 入口点错误。这里把构建不一致的也清理掉。
+    torch_build = _torch_build(python_executable)
+    if torch_build is not None:
+        for pkg in ("torchvision", "torchaudio"):
+            if _package_version(python_executable, pkg) is None:
+                continue
+            pkg_build = _query_package_build(python_executable, pkg)
+            # pkg_build 为 None 表示 import 失败；空字符串表示无构建后缀（PyPI 官方版）。
+            # 只要和 torch 构建后缀不同就清理，让 pip 后续从相同 index 重装匹配版本。
+            if pkg_build != torch_build:
+                plan.append(pkg)
 
     return sorted(set(plan))
 
