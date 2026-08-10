@@ -9,35 +9,12 @@ if not exist "%HF_HOME%" mkdir "%HF_HOME%"
 echo Starting AI Vulnerability Scanner...
 
 REM =====================================================================
-REM Decide the interpreter FIRST, then use it for the whole flow.
-REM This way the torch-matched env (CUDA/ROCm) carries ALL deps
-REM (web + analysis + tree-sitter + inference), avoiding split-env issues
-REM (torch is right but tree_sitter_python is missing).
-REM Falls back to plain "python" when no matching env is found.
-REM
-REM NOTE: never inline this probe into a `( ... )` parenthesized block with `echo`.
-REM cmd treats the `(`/`)` inside e.g. `print(best or sys.executable)` as block
-REM delimiters and aborts the whole batch instantly (flash-close,
-REM "was unexpected at this time"). We write a temp .py line-by-line instead,
-REM mirroring the heredoc in start_linux_macos.sh.
+REM 依赖一律装进「当前解释器」python（sys.executable），并在同环境下跑启动器。
+REM 不再跨 conda 环境扫描 torch 构建并 re-exec 切换，避免"环境换来换去"导致依赖分裂
+REM （torch 对了却缺 tree_sitter_python / 安全工具装到别的环境）。缺 torch 时后续
+REM dependency_installer 会现场安装。
 REM =====================================================================
-set "PY="
-set "PROBE=%TEMP%\nivis_discover_python.py"
-REM Write the probe line-by-line with '>' then '>>' (NOT a parenthesized block).
-REM Inside a `( ... )` block, cmd treats the `(`/`)` inside e.g. `print(best or sys.executable)`
-REM as block delimiters and aborts the whole batch with "was unexpected at this time".
-REM Writing each line separately avoids that and mirrors the heredoc in start_linux_macos.sh.
->  "%PROBE%" echo import sys
->> "%PROBE%" echo import os
->> "%PROBE%" echo sys.path.insert(0, os.getcwd())
->> "%PROBE%" echo try:
->> "%PROBE%" echo     from app.launcher.dependency_installer import discover_best_python
->> "%PROBE%" echo     best = discover_best_python()
->> "%PROBE%" echo except Exception:
->> "%PROBE%" echo     best = None
->> "%PROBE%" echo print(best or sys.executable)
-for /f "delims=" %%i in ('python "%PROBE%" 2^>nul') do set "PY=%%i"
-del "%PROBE%" 2>nul
+set "PY=%PYTHON%"
 if "%PY%"=="" set "PY=python"
 echo [Setup] Using interpreter: %PY%
 

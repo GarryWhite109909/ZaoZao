@@ -809,14 +809,16 @@ def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable
     elif gpu.vendor == "nvidia" and platform_info.os_name == "windows":
         # Windows + NVIDIA：官方预编译 CUDA wheel，免源码编译 / 免长路径问题。
         # 默认 CUDA 分支按 GPU 系别自动选择，确保不同显卡拿到匹配的 wheel：
-        #   RTX 50（Blackwell sm_120）→ cu128（必须 CUDA 12.8+/驱动≥570）
+        #   RTX 50（Blackwell sm_120）→ cu130（官方唯一支持 Blackwell 的 Windows
+        #     索引；cu128/cu129 无 Windows wheel，选了会回退源码编译并在 Windows
+        #     长路径下崩溃）。需驱动 ≥580。
         #   RTX 20/GTX 16（Turing）→ cu121
         #   GTX 10（Pascal）→ cu118
         #   其余 Ampere/Ada/数据中心/未知 → cu125（官方 wheel 覆盖最全，兼容性最好）
         # 高级用户可用 VULN_SCANNER_LLAMACPP_CUDA_VERSION 显式覆盖。
         family = classify_gpu(gpu).family
         _default_cuda = {
-            "nvidia_50": "cu128",
+            "nvidia_50": "cu130",
             "nvidia_40": "cu125",
             "nvidia_30": "cu125",
             "nvidia_20": "cu121",
@@ -847,9 +849,9 @@ def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable
             "import llama_cpp; "
             "print('TRUE' if llama_cpp.llama_supports_gpu_offload() else 'FALSE')"
         )
-        if cuda_ver in ("cu128", "cu129", "cu130"):
+        if cuda_ver in ("cu130", "cu129", "cu128"):
             warning = (
-                f"预编译索引 {cuda_ver} 需要较新的 NVIDIA 驱动（cu128 需 ≥570）；"
+                f"预编译索引 {cuda_ver} 需要较新的 NVIDIA 驱动（cu130 需 ≥580）；"
                 f"若机器为 RTX 50 系，这是自动选择的最匹配版本。若该索引无匹配 wheel，"
                 "可设置 VULN_SCANNER_LLAMACPP_CUDA_VERSION 改用其它版本，"
                 "或 VULN_SCANNER_LLAMACPP_SOURCE_BUILD=1 源码编译（需启用 Windows 长路径支持）。"
@@ -1268,6 +1270,11 @@ WHEEL_MIN_SPEED = int(
 )
 
 
+# 常见本机代理端口（Clash/mihomo 7890/7897、v2ray 10809/1080、shadowsocks 1080）。
+# 环境变量与系统代理都未配置时，自动探测这些端口，避免退化成慢速直连 GitHub。
+_LOCAL_PROXY_PORTS: tuple[int, ...] = (7897, 7890, 10809, 1080)
+
+
 def _detect_system_proxy() -> str:
     """探测可用的系统代理（优先环境变量，回退 Windows 注册表系统代理）。
 
@@ -1296,6 +1303,18 @@ def _detect_system_proxy() -> str:
                 return server
         except Exception:  # noqa: BLE001
             pass
+    # 3) 本机常见代理端口兜底探测：环境变量与系统代理都未配置时，检查本机
+    #    localhost 上是否监听了常见代理端口（Clash 7890/7897、v2ray 10809/1080、
+    #    shadowsocks 1080、mihomo 7890 等）。这对"用户开了代理但没设环境变量"
+    #    的常见场景很有用——否则会退化成慢速直连 GitHub。
+    for port in _LOCAL_PROXY_PORTS:
+        try:
+            import socket
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                _emit(f"[依赖安装] 检测到本机代理端口 {port}，自动使用")
+                return f"http://127.0.0.1:{port}"
+        except Exception:  # noqa: BLE001
+            continue
     return ""
 
 
@@ -1970,7 +1989,11 @@ def install_backend_dependencies(
         )
     # 旧版本留下的不兼容依赖：先卸载再装
     # 即使 torch 本身已匹配，也可能残留 torchvision/torchaudio 旧构建导致 DLL 入口点错误
-    cleanup_plan = build_cleanup_plan(platform_info, gpu, python_executable)
+    # 注意：torch 相关清理只在"当前后端确实依赖 torch"时执行（transformers/vllm）。
+    # llamacpp 后端不依赖 torch，若因历史残留误触发 torch 清理，会造成"切后端来回删依赖"
+    # 的抖动 —— 用户切到 llamacpp 时 torch 被卸载，切回 transformers 又被装回。
+    needs_torch = any(s.check_modules == ["torch"] for s in specs)
+    cleanup_plan = build_cleanup_plan(platform_info, gpu, python_executable) if needs_torch else []
     if cleanup_plan:
         _emit(
             f"[依赖安装] 检测到需清理的旧依赖: {', '.join(cleanup_plan)}"
@@ -2171,6 +2194,25 @@ SECURITY_TOOLS_PIP_SPEC: dict[str, str] = {
     "pip-audit": "pip-audit>=2.10.1",
     "detect-secrets": "detect-secrets>=1.5.0",
 }
+# semgrep 的 opentelemetry 依赖冲突固定（2026-08 实测）。
+# semgrep 严格锁 opentelemetry 全家 ~=1.37.0，而 chromadb 会把自己的
+# grpc exporter 升到 1.44.0，导致 common/proto/sdk 被撕成 1.37/1.44 两半，
+# 轻则 pip check 报冲突，重则 chromadb import 崩
+# （ModuleNotFoundError: opentelemetry.exporter.otlp.proto.common._exporter_metrics）。
+# 修复：安装/重装 semgrep 时，把整个 opentelemetry 家族钉到 1.37.0——
+# semgrep 的严格约束满足，chromadb 的宽松约束（>=1.2.0）也满足。
+_SEMGREP_OTEL_PINS: list[str] = [
+    "opentelemetry-api==1.37.0",
+    "opentelemetry-sdk==1.37.0",
+    "opentelemetry-proto==1.37.0",
+    "opentelemetry-exporter-otlp-proto-common==1.37.0",
+    "opentelemetry-exporter-otlp-proto-http==1.37.0",
+    "opentelemetry-exporter-otlp-proto-grpc==1.37.0",
+    "opentelemetry-semantic-conventions==0.58b0",
+    "opentelemetry-instrumentation==0.58b0",
+    "opentelemetry-instrumentation-requests==0.58b0",
+    "opentelemetry-instrumentation-threading==0.58b0",
+]
 # 独立二进制工具（经系统包管理器安装，最佳努力：失败仅告警不阻断）
 SECURITY_TOOLS_BIN: dict[str, str] = {
     "gitleaks": "Gitleaks.Gitleaks",   # winget 包 ID（最新稳定：8.30.1）
@@ -2179,10 +2221,340 @@ SECURITY_TOOLS_BIN: dict[str, str] = {
 # 全部安全工具（供安装/卸载/状态汇总共用）
 SECURITY_TOOLS_ALL: list[str] = SECURITY_TOOLS_PIP + list(SECURITY_TOOLS_BIN.keys())
 
+# 独立二进制工具从 GitHub Releases 直接下载所需元数据。
+# 包管理器（apt/dnf/brew/winget）装不上时，自动按平台/架构从官方 Release 拉取
+# 单文件二进制，放到用户级 bin 目录（Linux ~/.local/bin / Windows %LOCALAPPDATA%\\bin）。
+# 注意 gitleaks 与 trivy 的资产命名规则不同，各自单独给出模板。
+_SECURITY_TOOLS_GH: dict[str, dict] = {
+    "gitleaks": {
+        "repo": "gitleaks/gitleaks",
+        "version": "v8.30.1",
+        # 资产名模板：{ver}=版本号(不带 v)、{goos}=linux/darwin/windows、{arch}=x64/arm64
+        "asset": "gitleaks_{ver}_{goos}_{arch}.{ext}",
+        "ext_map": {"linux": "tar.gz", "darwin": "tar.gz", "windows": "zip"},
+    },
+    "trivy": {
+        "repo": "aquasecurity/trivy",
+        "version": "v0.72.0",
+        # trivy 资产命名：Linux-64bit / Linux-ARM64 / windows-64bit
+        "asset": "trivy_{ver}_{os_arch}.{ext}",
+        "os_arch_map": {
+            ("linux", "x86_64"): "Linux-64bit",
+            ("linux", "aarch64"): "Linux-ARM64",
+            ("darwin", "x86_64"): "macOS-64bit",
+            ("darwin", "aarch64"): "macOS-ARM64",
+            ("windows", "x86_64"): "windows-64bit",
+        },
+        "ext_map": {"linux": "tar.gz", "darwin": "tar.gz", "windows": "zip"},
+    },
+}
+# 每个工具解压后的可执行文件名
+_SECURITY_TOOLS_EXE: dict[str, str] = {
+    "gitleaks": "gitleaks",
+    "trivy": "trivy",
+}
+
 
 def _tool_installed(name: str) -> bool:
     """判断命令行工具是否已安装（在 PATH 中）。"""
     return shutil.which(name) is not None
+
+
+# 各 pip 工具的冒烟测试参数（能验证其确可启动，而非仅存在于 PATH）。
+# 例如 base 环境的 semgrep 因 opentelemetry 版本冲突启动即 Traceback，
+# 但 PATH 里仍能找到它 —— 仅靠 _tool_installed 无法发现这种"坏依赖"。
+_TOOL_SMOKE_ARGS: dict[str, list[str]] = {
+    "bandit": ["--version"],
+    "semgrep": ["--version"],
+    "pip-audit": ["--version"],
+    "detect-secrets": ["--version"],
+}
+
+
+def _tool_smoke_ok(name: str) -> bool:
+    """冒烟测试：实际运行工具的 --version，判断其能否真正启动。
+
+    返回 True 表示可运行；工具缺失 / 启动即报错 / 超时均返回 False。
+    用于识别"存在但损坏"的依赖（如 Traceback 的 semgrep），从而触发自动修复。
+    """
+    exe = shutil.which(name)
+    if not exe:
+        return False
+    args = _TOOL_SMOKE_ARGS.get(name, ["--version"])
+    try:
+        r = subprocess.run(
+            [exe, *args],
+            capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _user_bin_dir() -> Path:
+    """返回用户级 bin 目录（Linux/macOS ~/.local/bin，Windows %LOCALAPPDATA%\\bin）。
+
+    无系统包管理器时，独立二进制工具下载解压到此处，并加入 PATH。
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "bin"
+    return Path.home() / ".local" / "bin"
+
+
+def _download_github_binary(
+    tool: str,
+    platform_info: PlatformInfo,
+    callback: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
+    """从 GitHub Releases 下载指定二进制工具，解压到用户级 bin 目录。
+
+    用于系统包管理器（apt/dnf/brew/winget）装不上时的兜底方案。按当前平台 + CPU
+    架构匹配官方 Release 资产，下载后解压出单文件可执行程序放到用户 bin 目录，
+    并返回可执行文件的绝对路径；任一环节失败返回 None（调用方仅告警）。
+
+    Returns:
+        成功返回可执行文件绝对路径；失败返回 None。
+    """
+    meta = _SECURITY_TOOLS_GH.get(tool)
+    if not meta:
+        return None
+    exe_name = _SECURITY_TOOLS_EXE.get(tool, tool)
+    goos = platform_info.os_name  # linux / darwin / windows
+    arch = platform_info.arch      # x86_64 / aarch64 / amd64 / arm64
+
+    # 归一化架构：Python 的 platform.machine() 可能返回 amd64/arm64（Windows）
+    # 或 x86_64/aarch64（Linux），统一映射到资产模板用的 x64/arm64 或 -64bit。
+    if arch in ("amd64", "x86_64"):
+        arch_key = "x86_64"
+    elif arch in ("arm64", "aarch64"):
+        arch_key = "aarch64"
+    else:
+        return None
+
+    # 构建资产文件名
+    if "asset" not in meta or "ext_map" not in meta:
+        return None
+    ext = meta["ext_map"].get(goos)
+    if not ext:
+        return None
+    ver = meta["version"].lstrip("v")
+    asset_name = meta["asset"].format(
+        ver=ver,
+        goos=goos,
+        arch="x64" if arch_key == "x86_64" else "arm64",
+        os_arch=meta.get("os_arch_map", {}).get((goos, arch_key), ""),
+        ext=ext,
+    )
+    if not asset_name or "{os_arch}" in asset_name and not meta.get("os_arch_map", {}).get((goos, arch_key)):
+        return None
+    url = f"https://github.com/{meta['repo']}/releases/download/{meta['version']}/{asset_name}"
+
+    # 下载到用户 bin 目录旁的临时文件后解压
+    bin_dir = _user_bin_dir()
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    dest_exe = bin_dir / (exe_name + (".exe" if sys.platform == "win32" else ""))
+    tmp_archive = bin_dir / f".{tool}_download.{ext}"
+    tmp_extract = bin_dir / f".{tool}_extract"
+
+    _emit(f"[安全工具] 包管理器未提供 {tool}，尝试从 GitHub 下载（{asset_name}）...", callback)
+    try:
+        # 下载（优先走系统代理，其次直连）
+        from urllib.request import Request
+        proxy_url = _detect_system_proxy()
+        if proxy_url:
+            _emit(f"[安全工具] 使用代理 {proxy_url} 下载 {tool}...", callback)
+            opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
+        else:
+            opener = build_opener()
+        req = Request(url, headers={"User-Agent": "vuln-scanner-bootstrap"})
+        try:
+            with opener.open(req, timeout=300) as resp, open(tmp_archive, "wb") as f:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        except Exception as e:
+            _emit(f"[安全工具] ⚠ {tool} 下载失败: {e}", callback)
+            return None
+        if not tmp_archive.is_file() or tmp_archive.stat().st_size == 0:
+            _emit(f"[安全工具] ⚠ {tool} 下载为空/失败", callback)
+            return None
+
+        # 解压
+        import zipfile
+        if tmp_extract.exists():
+            shutil.rmtree(tmp_extract, ignore_errors=True)
+        tmp_extract.mkdir(parents=True, exist_ok=True)
+        if ext == "zip":
+            with zipfile.ZipFile(tmp_archive, "r") as zf:
+                zf.extractall(tmp_extract)
+        else:  # tar.gz
+            import tarfile
+            with tarfile.open(tmp_archive, "r:gz") as tf:
+                tf.extractall(tmp_extract)
+
+        # 找到可执行文件并安装
+        found_exe = None
+        for candidate in tmp_extract.rglob(exe_name if sys.platform != "win32" else exe_name + ".exe"):
+            if candidate.is_file():
+                found_exe = candidate
+                break
+        if not found_exe:
+            _emit(f"[安全工具] ⚠ {tool} 解压后未找到可执行文件", callback)
+            return None
+        shutil.copy2(found_exe, dest_exe)
+        if sys.platform != "win32":
+            dest_exe.chmod(dest_exe.stat().st_mode | 0o111)
+        # 清理临时文件
+        tmp_archive.unlink(missing_ok=True)
+        shutil.rmtree(tmp_extract, ignore_errors=True)
+
+        # 确保 bin 目录在 PATH（进程内生效），使 shutil.which 立即可见
+        _add_to_path(str(bin_dir))
+        _emit(f"[安全工具] ✅ {tool} 已安装: {dest_exe}", callback)
+        return str(dest_exe)
+    except Exception as e:  # noqa: BLE001
+        _emit(f"[安全工具] ⚠ {tool} 安装失败: {e}", callback)
+        return None
+
+
+def _add_to_path(directory: str) -> None:
+    """把目录前置到当前进程 PATH（去重），供 shutil.which 立即可见。"""
+    directory = os.path.abspath(directory)
+    current = os.environ.get("PATH", "").split(os.pathsep) if os.environ.get("PATH") else []
+    if directory not in current:
+        current.insert(0, directory)
+        os.environ["PATH"] = os.pathsep.join(current)
+
+
+def _ensure_python_bin_on_path(python_executable: str) -> None:
+    """把 python 解释器所在的可执行目录加入 PATH（进程内）。
+
+    启动脚本可能用 /path/to/miniconda3/bin/python3 调用本模块，但 shell 的
+    PATH 未包含该目录（未 conda activate）。此时 shutil.which 找不到当前解释器
+    同目录下安装的工具（semgrep/bandit 等），导致把它们误判为"未安装"而重复
+    安装，或检测不到坏依赖。这里把解释器所在的可执行目录前置到 PATH，使工具
+    探测与当前解释器保持一致——"用什么 python 启动，就检测/修复哪个 python
+    环境里的工具"，从根上避免环境换来换去。
+
+    Windows 下 pip 的 CLI 工具装在 <python>/Scripts，Linux/macOS 装在
+    <python>/bin（解释器本就位于该目录），两者都覆盖。
+    """
+    p = Path(python_executable).resolve()
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        # 解释器可能位于 <python>/python.exe，工具在 <python>/Scripts
+        candidates.append(str(p.parent / "Scripts"))
+        candidates.append(str(p.parent))
+    else:
+        # 解释器位于 <python>/bin，工具同目录
+        candidates.append(str(p.parent))
+        # 兜底：若解释器不在 bin 下，取父目录
+        if p.parent.name != "bin":
+            candidates.append(str(p.parent.parent / "bin"))
+
+    current = os.environ.get("PATH", "").split(os.pathsep) if os.environ.get("PATH") else []
+    for cand in candidates:
+        if cand and cand not in current:
+            current.insert(0, cand)
+    os.environ["PATH"] = os.pathsep.join(current)
+
+
+# 应用级运行时依赖（无论用户选哪个 LLM 后端，扫描主流程都会用到）。
+# 这些库"装了但 import 崩"（如 opentelemetry 版本撕裂导致 chromadb import 失败）
+# 不会被工具冒烟测试覆盖，须单独做 import 冒烟。
+_RUNTIME_IMPORT_MODULES: list[str] = [
+    "chromadb",          # RAG 检索；opentelemetry 撕裂时 import 崩
+    "tree_sitter",       # AST 解析
+    "requests",          # 网络请求
+    "fastapi",           # 后端服务
+    "uvicorn",           # 后端服务
+    "pydantic",          # 数据模型
+]
+
+
+def _runtime_import_ok(module: str) -> bool:
+    """在目标解释器子进程中执行 import，判断运行时依赖是否真的可用。
+
+    用子进程而非当前进程 import，避免污染本进程的 importlib 状态，且能捕获
+    子进程级崩溃（如 opentelemetry 缺失子模块导致 ImportError）。
+    """
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", f"import {module}"],
+            capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace",
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+# semgrep 严格锁 opentelemetry 全家 ~=1.37.0，而 chromadb 的 grpc exporter 会被
+# 升到高版本，造成 common/proto/sdk 版本撕裂（chromadb import 崩）。此为对齐检查：
+# 只要 opentelemetry 家族版本不一致（撕裂），就按 _SEMGREP_OTEL_PINS 统一修复。
+def _otel_family_versions() -> dict[str, str]:
+    """读取当前 opentelemetry 家族的已装版本，返回 {包名: 版本}。"""
+    out: dict[str, str] = {}
+    for pkg in ("opentelemetry-api", "opentelemetry-sdk", "opentelemetry-proto",
+               "opentelemetry-exporter-otlp-proto-common",
+               "opentelemetry-exporter-otlp-proto-http",
+               "opentelemetry-exporter-otlp-proto-grpc"):
+        ver = _installed_package_version(sys.executable, pkg)
+        out[pkg] = ver
+    return out
+
+
+def _otel_family_torn() -> bool:
+    """判断 opentelemetry 家族是否版本撕裂（不同包版本不一致）。
+
+    全部包应处于同一版本线（如 1.37.0）。若出现多个不同主版本号（如 sdk=1.37、
+    grpc exporter=1.44），说明被撕成两半，chromadb import 会崩，需对齐修复。
+    """
+    vers = {v for v in _otel_family_versions().values() if v}
+    # 排除为空的（未装）；若 >1 个不同版本 → 撕裂
+    return len(vers) > 1
+
+
+def _fix_otel_alignment(
+    python_executable: str,
+    dry_run: bool,
+    callback,
+) -> bool:
+    """对齐 opentelemetry 家族版本，修复撕裂导致的 chromadb import 崩溃。
+
+    返回 True 表示已对齐或无需处理；False 表示修复失败。
+    """
+    if not _otel_family_torn():
+        return True
+    _emit("[安全工具] ⚠ opentelemetry 依赖版本撕裂（semgrep 与 chromadb 约束冲突），"
+          "将对齐到 1.37.0", callback)
+    if dry_run:
+        _emit(f"[安全工具] DRY-RUN: pip install {' '.join(_SEMGREP_OTEL_PINS)}", callback)
+        return True
+    if not _is_auto_install_enabled():
+        _emit("[安全工具] 自动安装已禁用，请手动: "
+              f"pip install {' '.join(_SEMGREP_OTEL_PINS)}", callback)
+        return False
+    cmd = _pip_base_cmd(python_executable) + list(_SEMGREP_OTEL_PINS)
+    cmd.append("--force-reinstall")
+    global_index = os.environ.get("VULN_SCANNER_PIP_INDEX", "").strip()
+    if global_index:
+        cmd.extend(["--index-url", global_index])
+    _add_pip_network_flags(cmd)
+    _emit(f"[安全工具] 正在对齐 opentelemetry: {' '.join(cmd)}", callback)
+    returncode, _output = _run_pip_install(cmd, os.environ.copy(), "opentelemetry 对齐", callback)
+    if returncode != 0:
+        _emit("[安全工具] ❌ opentelemetry 对齐失败", callback)
+        return False
+    if _otel_family_torn():
+        _emit("[安全工具] ❌ opentelemetry 对齐后仍撕裂", callback)
+        return False
+    _emit("[安全工具] ✅ opentelemetry 已对齐（1.37.0）", callback)
+    return True
 
 
 def _find_winget_install(tool: str) -> bool:
@@ -2292,11 +2664,15 @@ def _try_install_binary_tool(
                     _emit(f"[安全工具] ✓ {tool} 已安装（退出码 0），但未加入 PATH，"
                           f"请重启终端后再使用", callback)
                 else:
-                    _emit(f"[安全工具] ⚠ {tool} winget 安装未成功（退出码 {r[0]}），可手动安装", callback)
+                    _emit(f"[安全工具] ⚠ {tool} winget 安装未成功（退出码 {r[0]}），" 
+                          f"尝试从 GitHub 下载", callback)
+                    _download_github_binary(tool, platform_info, callback)
             except Exception as e:
-                _emit(f"[安全工具] ⚠ {tool} 安装异常: {e}", callback)
+                _emit(f"[安全工具] ⚠ {tool} 安装异常: {e}，尝试从 GitHub 下载", callback)
+                _download_github_binary(tool, platform_info, callback)
         else:
-            _emit(f"[安全工具] 未检测到 winget，请手动安装 {tool}（GitHub Releases）", callback)
+            _emit(f"[安全工具] 未检测到 winget，尝试从 GitHub 下载 {tool}...", callback)
+            _download_github_binary(tool, platform_info, callback)
 
     elif platform_info.os_name == "darwin":
         if shutil.which("brew"):
@@ -2334,6 +2710,9 @@ def _try_install_binary_tool(
                 except Exception:
                     pass
         if not installed:
+            # 包管理器装不上 → 从 GitHub Releases 直接下载二进制（不需要 root）
+            if _download_github_binary(tool, platform_info, callback):
+                return
             _emit(f"[安全工具] 请手动安装 {tool}（GitHub Releases / 系统包管理器）", callback)
 
 
@@ -2353,28 +2732,61 @@ def install_security_tools(
     python_executable = python_executable or sys.executable
     platform_info = detect_platform()
 
+    # 关键：把 python 解释器所在的可执行目录加入 PATH（进程内）。
+    # 启动脚本可能用 /path/to/miniconda3/bin/python3 调用本模块而 shell 未
+    # activate 该环境，导致 shutil.which 找不到当前解释器同目录的工具而被误判
+    # 为"未安装"。前置 PATH 后，工具探测/修复始终针对当前解释器所在环境。
+    _ensure_python_bin_on_path(python_executable)
+
     _emit("[安全工具] 检查新框架所需传统工具 "
           f"({', '.join(SECURITY_TOOLS_ALL)})...", callback)
 
-    # 1) pip 可安装工具
+    # 1) pip 可安装工具：区分「缺失」与「存在但损坏」，两者都触发安装/重装。
+    #    损坏检测用冒烟测试（实际跑 --version），避免 PATH 里能搜到但启动即
+    #    Traceback 的坏依赖（如 base 的 semgrep 因 opentelemetry 冲突）被误判为就绪。
     missing_pip = [t for t in SECURITY_TOOLS_PIP if not _tool_installed(t)]
-    missing_pip_spec = [SECURITY_TOOLS_PIP_SPEC.get(t, t) for t in missing_pip]
-    if missing_pip:
-        _emit(f"[安全工具] 缺失 pip 工具: {', '.join(missing_pip_spec)}", callback)
+    broken_pip = [
+        t for t in SECURITY_TOOLS_PIP
+        if _tool_installed(t) and not _tool_smoke_ok(t)
+    ]
+    fix_pip = missing_pip + broken_pip
+    fix_pip_spec = [SECURITY_TOOLS_PIP_SPEC.get(t, t) for t in fix_pip]
+    if broken_pip:
+        # 存在但损坏：提示并强制重装修复（--force-reinstall 保证覆盖坏版本）
+        _emit(f"[安全工具] ⚠ 检测到损坏工具: {', '.join(broken_pip)}"
+              f"（启动即报错），将自动重装修复", callback)
+    if fix_pip:
+        _emit(f"[安全工具] 需安装/修复 pip 工具: {', '.join(fix_pip_spec)}", callback)
         if dry_run:
-            _emit(f"[安全工具] DRY-RUN: pip install {' '.join(missing_pip_spec)}", callback)
+            _emit(f"[安全工具] DRY-RUN: pip install {' '.join(fix_pip_spec)}", callback)
         elif _is_auto_install_enabled():
-            cmd = _pip_base_cmd(python_executable) + missing_pip_spec
+            cmd = _pip_base_cmd(python_executable) + fix_pip_spec
+            has_broken = bool(broken_pip)
+            if has_broken:
+                # 重装修复需覆盖已安装的坏版本；--upgrade 已含于 _pip_base_cmd，
+                # 叠加 --force-reinstall 强制重装损坏工具
+                cmd.append("--force-reinstall")
+            # semgrep 与 chromadb 共享 opentelemetry 依赖，且 semgrep 严格锁 ~=1.37.0。
+            # 安装/重装 semgrep 时把整个 opentelemetry 家族对齐到 1.37.0，避免
+            # chromadb 误升 grpc exporter 到 1.44 造成 common/proto/sdk 版本撕裂
+            # （轻则 pip check 冲突，重则 chromadb import 崩溃）。
+            if "semgrep" in fix_pip:
+                cmd.extend(_SEMGREP_OTEL_PINS)
             global_index = os.environ.get("VULN_SCANNER_PIP_INDEX", "").strip()
             if global_index:
                 cmd.extend(["--index-url", global_index])
             _add_pip_network_flags(cmd)
-            _emit(f"[安全工具] 正在安装: {' '.join(cmd)}", callback)
+            _emit(f"[安全工具] 正在安装/修复: {' '.join(cmd)}", callback)
             returncode, output = _run_pip_install(
                 cmd, os.environ.copy(), "安全工具", callback,
             )
             if returncode == 0:
-                _emit("[安全工具] ✅ pip 工具安装完成", callback)
+                # 修复后复查冒烟测试，确认工具真的能跑了
+                still_broken = [t for t in fix_pip if not _tool_smoke_ok(t)]
+                if still_broken:
+                    _emit(f"[安全工具] ❌ 修复后仍损坏: {', '.join(still_broken)}", callback)
+                else:
+                    _emit("[安全工具] ✅ pip 工具安装/修复完成", callback)
             else:
                 _emit(f"[安全工具] ❌ pip 工具安装失败（退出码 {returncode}）", callback)
                 tail = output.strip()[-800:] if output else ""
@@ -2382,21 +2794,43 @@ def install_security_tools(
                     _emit(f"[安全工具] 日志尾部:\n{tail}", callback)
         else:
             _emit("[安全工具] 自动安装已禁用，请手动: "
-                  f"pip install {' '.join(missing_pip_spec)}", callback)
+                  f"pip install {' '.join(fix_pip_spec)}", callback)
     else:
         _emit("[安全工具] pip 工具已就绪", callback)
 
     # 2) 独立二进制工具（最佳努力）
     for tool in SECURITY_TOOLS_BIN:
-        if _tool_installed(tool):
+        if _tool_installed(tool) and _tool_smoke_ok(tool):
             _emit(f"[安全工具] {tool} 已就绪", callback)
+        elif _tool_installed(tool):
+            _emit(f"[安全工具] ⚠ {tool} 存在但损坏，尝试重装", callback)
+            _try_install_binary_tool(tool, platform_info, dry_run, callback)
         else:
             _try_install_binary_tool(tool, platform_info, dry_run, callback)
 
-    # 汇总：核心（pip）工具必须就绪；二进制缺失仅告警
-    missing_pip = [t for t in SECURITY_TOOLS_PIP if not _tool_installed(t)]
-    if missing_pip:
-        _emit(f"[安全工具] ⚠ 核心工具仍缺失: {', '.join(missing_pip)}（外部工具扫描会静默跳过）", callback)
+    # 3) opentelemetry 版本撕裂检查（semgrep 与 chromadb 共享依赖冲突）。
+    #    工具冒烟测试覆盖不到 chromadb 的 import 崩溃（chromadb 不是 CLI 工具），
+    #    这里独立检测并自动对齐修复。
+    if not _fix_otel_alignment(python_executable, dry_run, callback):
+        _emit("[安全工具] ⚠ opentelemetry 未对齐，chromadb 可能无法 import", callback)
+
+    # 4) 应用级运行时依赖 import 冒烟：chromadb/tree_sitter/requests 等。
+    #    这些库"装了但 import 崩"（如 opentelemetry 撕裂）不会被工具冒烟测试覆盖，
+    #    用子进程实际 import 验证，import 失败即视为坏依赖并触发重装。
+    broken_runtime = [m for m in _RUNTIME_IMPORT_MODULES if not _runtime_import_ok(m)]
+    if broken_runtime:
+        _emit(f"[安全工具] ⚠ 运行时依赖 import 失败: {', '.join(broken_runtime)}", callback)
+        if not dry_run and _is_auto_install_enabled():
+            _emit("[安全工具] ⚠ 运行时依赖损坏，建议重装相关包恢复（可运行 "
+                  "`pip install --force-reinstall <包>`）", callback)
+        # 运行时依赖损坏不阻断核心工具（避免启动被卡死），但显著提示
+    else:
+        _emit("[安全工具] ✅ 运行时依赖 import 正常", callback)
+
+    # 汇总：核心（pip）工具必须就绪（缺失或损坏都会计入）；二进制缺失仅告警
+    core_bad = [t for t in SECURITY_TOOLS_PIP if not _tool_installed(t) or not _tool_smoke_ok(t)]
+    if core_bad:
+        _emit(f"[安全工具] ⚠ 核心工具仍缺失/损坏: {', '.join(core_bad)}（外部工具扫描会静默跳过）", callback)
         return False
     _emit("[安全工具] ✅ 核心安全工具就绪", callback)
     return True

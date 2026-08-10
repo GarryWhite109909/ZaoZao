@@ -24,6 +24,10 @@ class SingleResult:
     language: str
     has_vulnerability: Optional[bool]
     vulnerability_type: str = "none"
+    # 模型对漏洞类型/CWE 编号的【原始】输出（未经 CWE Normalizer 纠正）。
+    # 当该值与 vulnerability_type 不一致时，说明查表工具纠正了模型标号，
+    # 前端据此展示"模型原始判断 → CWE Normalizer 纠正"过程。
+    raw_vulnerability_type: str = ""
     risk_level: str = "None"
     source: str = "N/A"
     sink: str = "N/A"
@@ -44,6 +48,7 @@ class SingleResult:
             "language": self.language,
             "has_vulnerability": self.has_vulnerability,
             "vulnerability_type": self.vulnerability_type,
+            "raw_vulnerability_type": self.raw_vulnerability_type,
             "risk_level": self.risk_level,
             "source": self.source,
             "sink": self.sink,

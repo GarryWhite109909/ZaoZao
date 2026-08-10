@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -54,6 +55,7 @@ _TAINT_TYPE_BY_RULE: dict[str, tuple[str, str]] = {
     "sqli": ("SQL Injection", "high"),
     "cmdi": ("Command Injection", "critical"),
     "codei": ("Code Injection", "critical"),  # CWE-95，勿并入 cmdi（CWE-78）
+    "xss": ("XSS", "medium"),                 # CWE-79，反射型/存储型跨站脚本
 }
 
 
@@ -214,6 +216,7 @@ class ExternalScanner:
         # 环境变量 <TOOL>_BIN（如 SEMGREP_BIN）可显式指定可执行文件路径，
         # 覆盖 PATH 探测（例如 semgrep 装在独立 venv、未加入 PATH 的场景）。
         self._installed: dict[str, str] = {}
+        conda_bins = self._conda_env_bin_dirs()
         for name in requested:
             if name not in _ALL_TOOLS:
                 continue  # 未知工具名，忽略
@@ -222,8 +225,46 @@ class ExternalScanner:
                 self._installed[name] = env_bin
                 continue
             resolved = shutil.which(name)
+            if not resolved:
+                # PATH 找不到时去 conda env 的 bin 搜索（如 semgrep 装在独立
+                # env、后端进程 PATH 未包含该 env 的场景）
+                resolved = self._search_in_dirs(name, conda_bins)
             if resolved:
                 self._installed[name] = resolved
+
+    @staticmethod
+    def _conda_env_bin_dirs() -> list[str]:
+        """收集当前解释器所在环境的 bin 目录，用于搜索 PATH 外的工具可执行文件。
+
+        只解析「当前环境」（sys.executable 所在 bin + CONDA_PREFIX 的 bin），
+        不再扫描其他 conda env —— 安全工具由启动器在运行它的那个环境里统一安装，
+        因此只需从该环境解析工具，避免"环境换来换去"导致用了别的环境的旧/损坏工具。
+        """
+        dirs: list[str] = []
+        # 1) 当前 python 解释器所在 bin（最权威：当前环境）
+        sp = Path(sys.executable).resolve()
+        if sp.parent.name == "bin":
+            dirs.append(str(sp.parent))
+        # 2) CONDA_PREFIX 的 bin（与 sys.executable 同环境，兜底）
+        prefix = os.environ.get("CONDA_PREFIX", "").strip()
+        if prefix:
+            bp = os.path.join(prefix, "bin")
+            if bp not in dirs and os.path.isdir(bp):
+                dirs.append(bp)
+        return list(dict.fromkeys(dirs))
+
+    @staticmethod
+    def _search_in_dirs(name: str, dirs: list[str]) -> Optional[str]:
+        """在候选目录中查找可执行文件 <name>，返回绝对路径或 None。"""
+        seen: set[str] = set()
+        for d in dirs:
+            if not d or d in seen:
+                continue
+            seen.add(d)
+            cand = os.path.join(d, name)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+        return None
 
     # ------------------------------------------------------------------
     # 公共 API
@@ -495,7 +536,8 @@ class ExternalScanner:
             taint_type, sev = _TAINT_TYPE_BY_RULE.get(
                 "sqli" if "sqli" in rule_id else (
                     "codei" if "codei" in rule_id else (
-                        "cmdi" if "cmdi" in rule_id else "")),
+                        "cmdi" if "cmdi" in rule_id else (
+                            "xss" if "xss" in rule_id else ""))),
                 ("Unknown", "medium"),
             )
             source, source_line = _extract_taint_endpoint(extra, "SOURCE")

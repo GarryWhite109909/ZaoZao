@@ -1561,25 +1561,10 @@ def main():
         _maybe_upgrade_ollama()
     else:
         # 进程内后端（transformers/llamacpp）与独立服务后端（vllm）：不依赖 Ollama，
-        # 自动安装依赖并校验配置。自动识别匹配当前硬件（CUDA/ROCm）的 python 环境并
-        # 切换到它，避免 base/graproj 装的是 CUDA 版 torch 导致 AMD/ROCm 机器上落到 CPU。
-        # VULN_SCANNER_REEXEC 守卫：只允许切换一次，防止环境间来回切换形成死循环。
-        best_python = dependency_installer.discover_best_python()
-        already_reexec = os.environ.get("VULN_SCANNER_REEXEC", "0") == "1"
-        if (
-            not already_reexec
-            and best_python
-            and os.path.realpath(best_python) != os.path.realpath(sys.executable)
-            and os.environ.get("VULN_SCANNER_FORCE_ENV", "1").strip() != "0"
-        ):
-            print(f"[启动器] 当前 Python ({sys.executable}) 的 torch 与硬件不匹配，")
-            print(f"          自动切换到已匹配的环境: {best_python}")
-            print(f"[启动器] 正在用该环境重新启动...\n")
-            # 用匹配的解释器重新执行本启动器（交互流程在子进程里再次进行）
-            env = os.environ.copy()
-            env["VULN_SCANNER_REEXEC"] = "1"
-            code = subprocess.call([best_python, "-m", "app.launcher.bootstrap", *sys.argv[1:]], env=env)
-            sys.exit(code)
+        # 自动安装依赖并校验配置。依赖一律装进「当前解释器」（sys.executable）——
+        # 不再跨 conda 环境扫描 torch 构建并 re-exec 切换，避免"环境换来换去"造成
+        # 依赖分裂（torch 对了却缺 tree_sitter_python / 工具装到别的环境）。
+        # 当前环境缺 torch 时由 install_backend_dependencies 现场安装。
 
         deps_ok = dependency_installer.install_backend_dependencies(
             backend,

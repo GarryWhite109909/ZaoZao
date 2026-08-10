@@ -517,6 +517,8 @@ class Scanner:
 
         verdict = parse_verdict(result["text"])
         has_vuln = normalize_has_vulnerability(verdict.get("has_vulnerability"))
+        # 模型原始输出的漏洞类型（纠正前），供界面展示 CWE Normalizer 的纠正过程
+        raw_vuln_type = str(verdict.get("vulnerability_type", "")).strip()
 
         # 约束解码兜底：CoT+JSON 解析失败时，用 Ollama format=json 重试
         if has_vuln is None and self.use_structured_fallback:
@@ -543,6 +545,7 @@ class Scanner:
             has_vulnerability=has_vuln,
             vulnerability_type=normalize_cwe_label(
                 verdict.get("vulnerability_type", "none")),
+            raw_vulnerability_type=raw_vuln_type,
             risk_level=verdict.get("risk_level", "None"),
             source=verdict.get("source", "N/A"),
             sink=verdict.get("sink", "N/A"),
