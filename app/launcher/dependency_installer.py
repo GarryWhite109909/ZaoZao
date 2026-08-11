@@ -851,11 +851,26 @@ def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable
         )
         if cuda_ver in ("cu130", "cu129", "cu128"):
             warning = (
-                f"预编译索引 {cuda_ver} 需要较新的 NVIDIA 驱动（cu130 需 ≥580）；"
-                f"若机器为 RTX 50 系，这是自动选择的最匹配版本。若该索引无匹配 wheel，"
-                "可设置 VULN_SCANNER_LLAMACPP_CUDA_VERSION 改用其它版本，"
-                "或 VULN_SCANNER_LLAMACPP_SOURCE_BUILD=1 源码编译（需启用 Windows 长路径支持）。"
+                f"预编译索引 {cuda_ver} 需要较新的 NVIDIA 驱动（cu130 需 ≥580）。"
+                f"⚠️ Windows 上 cu130 wheel 依赖 CUDA 13.0 运行时 DLL，"
+                f"但 PyPI 尚未提供 CUDA 13 的 Windows nvidia 运行时包；"
+                f"若未手动安装 CUDA 13.0 Toolkit，安装后 GPU 探测会失败并回退到 CPU。"
+                f"建议先安装 CUDA 13.0 Toolkit（https://developer.nvidia.com/cuda-downloads），"
+                f"或改用 Ollama 后端。"
             )
+            # 前置探测：系统 PATH 里是否有 CUDA 13 Toolkit 的 bin 目录；
+            # 没有则把警告升级为更明确的提示，避免安装完才报错。
+            if platform_info.os_name == "windows":
+                has_cuda13_bin = any(
+                    (Path(p) / "cudart64_130.dll").is_file()
+                    for p in os.environ.get("PATH", "").split(os.pathsep)
+                    if p.strip()
+                )
+                if not has_cuda13_bin:
+                    warning += (
+                        "\n[本次检测] 未在系统 PATH 中找到 CUDA 13.0 Toolkit 的 bin 目录，"
+                        "将继续安装，但 GPU 探测大概率失败。"
+                    )
     elif gpu.vendor == "nvidia":
         # Linux + NVIDIA：源码编译 CUDA（Linux 无 Windows 长路径问题）
         # 新版 llama.cpp 使用 GGML_CUDA；LLAMA_CUDA 为旧版兼容参数，同时传不冲突
@@ -1091,11 +1106,14 @@ def _nvidia_runtime_dirs() -> list[str]:
     上，若探测子进程环境里没把它们加进去，import llama_cpp 会报
     "Could not find module ... llama.dll (or one of its dependencies)"，导致
     llama_supports_gpu_offload() 探测失败（误判为 CPU-only 版本）。
+
+    这里递归收集 site-packages/nvidia/ 下所有 bin 目录（不限于固定列表），
+    以兼容 cu12/cu13 等不同命名（如 cuda_runtime_cu12、cuDNN、cuSPARSE 等）。
     """
     dirs: list[str] = []
     try:
         import site
-        roots = []
+        roots: list[Path] = []
         for sp in site.getsitepackages():
             cand = Path(sp) / "nvidia"
             if cand.is_dir():
@@ -1103,11 +1121,14 @@ def _nvidia_runtime_dirs() -> list[str]:
         user_dir = Path(site.getusersitepackages()) / "nvidia"
         if user_dir.is_dir():
             roots.append(user_dir)
+        seen = set()
         for root in roots:
-            for pkg in ("cuda_runtime", "cublas", "cuda_nvrtc", "cuda_cudart"):
-                bin_dir = root / pkg / "bin"
+            for bin_dir in root.rglob("bin"):
                 if bin_dir.is_dir():
-                    dirs.append(str(bin_dir))
+                    key = str(bin_dir.resolve())
+                    if key not in seen:
+                        seen.add(key)
+                        dirs.append(str(bin_dir))
     except Exception:
         pass
     return dirs
@@ -2144,9 +2165,24 @@ def install_backend_dependencies(
                     if not _probe_gpu_support(python_executable, spec.gpu_probe):
                         _emit(
                             f"[依赖安装] ❌ {spec.description} 安装后 GPU 探测失败"
-                            "（llama_supports_gpu_offload()=False），可能回退到了 CPU-only 版本",
+                            "（llama_supports_gpu_offload()=False），可能回退到了 CPU-only 版本。",
                             callback,
                         )
+                        # 对 Windows + cu130 给出具体原因和修复方案
+                        if "cu130" in spec.description and platform_info.os_name == "windows":
+                            _emit(
+                                "[依赖安装] 原因：Windows 上 cu130 wheel 需要 CUDA 13.0 运行时 DLL，"
+                                "但当前环境未找到（PyPI 未提供 Windows 版 CUDA 13 nvidia 运行时包）。",
+                                callback,
+                            )
+                            _emit(
+                                "[依赖安装] 修复方案（二选一）：\n"
+                                "  1) 手动安装 CUDA 13.0 Toolkit："
+                                "https://developer.nvidia.com/cuda-downloads，"
+                                "安装后重启终端再试；\n"
+                                "  2) 改用 Ollama 后端：设置 VULN_SCANNER_BACKEND=ollama",
+                                callback,
+                            )
                         overall_ok = False
                         if spec.required:
                             break
