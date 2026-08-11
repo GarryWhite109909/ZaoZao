@@ -20,6 +20,7 @@ from graduation_project.llm_client import OllamaClient
 from graduation_project.prompts import build_user_prompt
 from graduation_project.schema import parse_verdict, normalize_has_vulnerability
 from graduation_project.cwe_normalizer import normalize_cwe_label
+from graduation_project.line_normalizer import normalize_line_numbers
 from graduation_project.code_slicer import CodeSlicer, SliceResult
 from graduation_project.prefilter import Prefilter, PrefilterResult, PREFILTER_RULE_INFO
 from app.backend.services.model_registry import get_default_model, get_prompt_for_model
@@ -294,9 +295,19 @@ class Scanner:
     ) -> SingleResult:
         """扫描单段代码（与 switch_model 互斥，保证切片使用同一模型）。"""
         with self._model_lock:
-            return self._scan_code_impl(
+            result = self._scan_code_impl(
                 code, language=language, filename=filename, use_rag=use_rag,
             )
+            # 行号纠正（与 cwe_normalizer 同思路）：模型输出 source/sink/
+            # fix_suggestion 里的 `line N:` 行号是纯数行任务、容易数错，但
+            # 行文本内容可靠。这里用内容在源文件中定位真实行号并覆盖。
+            if result and result.source and result.source not in ("N/A", "no fix needed"):
+                result.source = normalize_line_numbers(result.source, code)
+            if result and result.sink and result.sink not in ("N/A", "no fix needed"):
+                result.sink = normalize_line_numbers(result.sink, code)
+            if result and result.fix_suggestion and result.fix_suggestion not in ("N/A", "no fix needed"):
+                result.fix_suggestion = normalize_line_numbers(result.fix_suggestion, code)
+            return result
 
     def _scan_code_impl(
         self,
