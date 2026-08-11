@@ -1653,6 +1653,19 @@ def main():
                 gpu_layers = 0  # 纯 CPU，无 GPU 可用
         os.environ["VULN_SCANNER_GPU_LAYERS"] = str(gpu_layers)
 
+    # Ollama 后端：与上面 llamacpp 的 GPU+CPU 混合卸载对齐。
+    # recommend_config 在 <6G 档返回 num_gpu=0（纯 CPU，GPU 闲置），
+    # 这里在检测到独显时按同样估算把前 N 层卸载到 GPU、其余层走 CPU，
+    # 让 4G 等低显存卡也能用上 GPU 分担，而不是一刀切纯 CPU。
+    if backend == "ollama" and config.get("mode") == "cpu":
+        vram = hardware.get("vram_mb")
+        if (hardware.get("has_nvidia_gpu") or hardware.get("has_amd_gpu")) and vram:
+            num_gpu = max(1, vram // 150)  # GPU 部分卸载 + CPU 分担
+        else:
+            num_gpu = 0  # 无 GPU 可用，纯 CPU
+        os.environ["VULN_SCANNER_NUM_GPU"] = str(num_gpu)
+        print(f"[硬件检测] Ollama 低显存(<6G)有独显：GPU 卸载前 {num_gpu} 层，其余层走 CPU")
+
     print("[4/6] 硬件检测完成")
 
     # 5. 确保模型可用（仅 Ollama 后端需要拉取；进程内后端在首次推理时懒加载）
