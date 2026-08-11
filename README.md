@@ -49,6 +49,14 @@
 | git（可选） | 任意版本 | 仅 GitHub 仓库扫描功能需要 |
 | 网络 | 首次需要联网 | 下载依赖包 + Ollama 模型；后续可离线运行 |
 
+> ⚠️ **RTX 50 系列显卡（Blackwell）需手动安装 CUDA Toolkit**
+>
+> NVIDIA RTX 50 系列（如 RTX 5050 / 5060 / 5090）使用的是 Blackwell 架构，需要 **CUDA 12.8+（推荐 13.x）** 的驱动与运行时才能正确编译/加载 `bitsandbytes`、`llama-cpp-python` 等 GPU 加速组件。若未安装对应版本的 CUDA Toolkit/Library，Transformers / LlamaCPP 后端会报 DLL / 编译类错误。
+>
+> 1. 从 [NVIDIA CUDA Toolkit 下载页](https://developer.nvidia.com/cuda-downloads) 下载并安装 **CUDA 12.8 或更高版本**；
+> 2. 安装后确认 `nvcc --version` 版本号 ≥ 12.8；
+> 3. 若只是使用默认的 **Ollama 后端**，Ollama 内置运行时已自带所需 CUDA 支持，通常无需额外安装；仅在切换 Transformers / LlamaCPP 进程内后端时才需要。
+
 ### 路径一：终端用户（只想用扫描器）
 
 适合只想使用漏洞扫描功能、不需要复现实验的用户。一条命令搞定。
@@ -1340,6 +1348,7 @@ CI = [center - margin, center + margin]
 | 扫描结果全为"无法判定" | 模型未正确加载或输出格式不匹配 | 运行 `python -m app.launcher.vuln_scanner_cli health` 检查模型可用性；确认模型名与 Ollama 中一致 |
 | 推理速度极慢（> 60s/文件） | 无 GPU 回退到 CPU 推理 | 检查启动日志中 `[硬件检测]` 行；CPU 模式约为 GPU 的 1/10 速度，属正常现象 |
 | OOM（显存溢出） | `num_ctx` 过大或显存不足 | 降低上下文窗口：创建 4K 版模型（见「模型部署与版本管理」§8GB 显存适配说明） |
+| Transformers/LlamaCPP 后端报 DLL / 编译类错误（RTX 50 系列） | Blackwell 架构缺少对应 CUDA Toolkit | 安装 CUDA 12.8+（见「快速开始」前置条件的提示），并确认 `nvcc --version` ≥ 12.8 |
 
 ### RAG / 向量库相关
 
