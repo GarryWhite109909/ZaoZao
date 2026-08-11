@@ -49,13 +49,14 @@
 | git（可选） | 任意版本 | 仅 GitHub 仓库扫描功能需要 |
 | 网络 | 首次需要联网 | 下载依赖包 + Ollama 模型；后续可离线运行 |
 
-> ⚠️ **RTX 50 系列显卡（Blackwell）需手动安装 CUDA Toolkit**
+> ⚠️ **Windows 下 LlamaCPP 后端暂不支持 RTX 50 系列与 AMD 显卡**
 >
-> NVIDIA RTX 50 系列（如 RTX 5050 / 5060 / 5090）使用的是 Blackwell 架构，需要 **CUDA 12.8+（推荐 13.x）** 的驱动与运行时才能正确编译/加载 `bitsandbytes`、`llama-cpp-python` 等 GPU 加速组件。若未安装对应版本的 CUDA Toolkit/Library，Transformers / LlamaCPP 后端会报 DLL / 编译类错误。
+> 受 Windows 上 `llama-cpp-python` 预编译二进制与编译工具链限制，**LlamaCPP 后端在 Windows 端暂不支持 RTX 50 系列（Blackwell）与 AMD 显卡**（易报 DLL / 编译类错误）。若你使用这两类显卡：
 >
-> 1. 从 [NVIDIA CUDA Toolkit 下载页](https://developer.nvidia.com/cuda-downloads) 下载并安装 **CUDA 12.8 或更高版本**；
-> 2. 安装后确认 `nvcc --version` 版本号 ≥ 12.8；
-> 3. 若只是使用默认的 **Ollama 后端**，Ollama 内置运行时已自带所需 CUDA 支持，通常无需额外安装；仅在切换 Transformers / LlamaCPP 进程内后端时才需要。
+> - **推荐改走默认 Ollama 后端**（兼容性最好，通常无需额外配置）；
+> - 或使用 **Linux** 系统运行 LlamaCPP / Transformers 后端（Linux 端支持性较好）。
+>
+> 完整平台支持见下方「[后端平台支持矩阵](#后端平台支持矩阵)」。
 
 ### 路径一：终端用户（只想用扫描器）
 
@@ -163,7 +164,23 @@ Windows 使用 `set` 代替 `export`。选择进程内后端后，启动器会�
 > ⚠️ **显存与平台说明**
 > - Transformers 后端推荐 NVIDIA/AMD 显存 ≥ 6GB；4GB 显存会被强制走 CPU，速度显著下降。
 > - `bitsandbytes` 已支持 NVIDIA CUDA、AMD ROCm（Linux 预览，部分 Windows 预览）、CPU-only（Windows/Linux/macOS）以及 Apple Silicon（慢速 CPU 路径）。启动器会自动安装，但 ROCm/Apple/CPU 上 4bit 速度远慢于 NVIDIA CUDA，追求速度请改用 Ollama 后端。
-> - LlamaCPP 后端可纯 CPU 运行（`n_gpu_layers=0`），也可按编译选项启用 CUDA/ROCm/Metal。
+> - LlamaCPP 后端可纯 CPU 运行（`n_gpu_layers=0`），也可按编译选项启用 CUDA/ROCm/Metal。**Windows 端暂不支持 RTX 50 系列与 AMD 显卡**（见上方提示）。
+
+#### 后端平台支持矩阵
+
+各推理后端在不同平台 / 显卡上的支持情况总结如下（**Windows 端限制较多，Linux 端支持性普遍较好**）：
+
+| 后端 | 平台 | NVIDIA CUDA | RTX 50 系（Blackwell） | AMD(ROCm) | Apple Silicon | 纯 CPU |
+|------|------|------------|----------------------|-----------|---------------|--------|
+| **Ollama**（默认） | Windows / Linux / macOS | ✅ | ✅（内置运行时自带 CUDA） | ✅ | ✅ | ✅ |
+| **Transformers** | Linux | ✅ | ✅ | ✅（ROCm 预览） | ✅（慢速 CPU 路径） | ✅ |
+| | Windows | ✅ | ⚠️ 需额外 CUDA Toolkit | ❌（不支持 AMD） | — | ✅ |
+| **LlamaCPP** | Linux | ✅ | ✅ | ✅ | ✅ | ✅ |
+| | Windows | ✅ | ❌（暂不支持） | ❌（暂不支持） | — | ✅ |
+
+> **结论**：追求设备兼容性优先选 **Ollama** 后端；确认要在 Windows 上使用进程内后端（Transformers / LlamaCPP）时，请先核对上表——**Transformers 的 Windows 端不支持 AMD，LlamaCPP 的 Windows 端暂不支持 RTX 50 系与 AMD**。若你使用上述受限组合，建议改用 Linux 或回退 Ollama。
+>
+> 💡 现有 RTX 5050 显卡在 Windows 上源码编译 LlamaCPP 均未成功。若你有编译成功经验（例如改用 **Ninja 生成器** 等方案），欢迎分享至 <3284263390@qq.com>。
 
 ### 环境变量配置
 
@@ -1348,7 +1365,7 @@ CI = [center - margin, center + margin]
 | 扫描结果全为"无法判定" | 模型未正确加载或输出格式不匹配 | 运行 `python -m app.launcher.vuln_scanner_cli health` 检查模型可用性；确认模型名与 Ollama 中一致 |
 | 推理速度极慢（> 60s/文件） | 无 GPU 回退到 CPU 推理 | 检查启动日志中 `[硬件检测]` 行；CPU 模式约为 GPU 的 1/10 速度，属正常现象 |
 | OOM（显存溢出） | `num_ctx` 过大或显存不足 | 降低上下文窗口：创建 4K 版模型（见「模型部署与版本管理」§8GB 显存适配说明） |
-| Transformers/LlamaCPP 后端报 DLL / 编译类错误（RTX 50 系列） | Blackwell 架构缺少对应 CUDA Toolkit | 安装 CUDA 12.8+（见「快速开始」前置条件的提示），并确认 `nvcc --version` ≥ 12.8 |
+| Transformers/LlamaCPP 后端报 DLL / 编译类错误（RTX 50 系列） | Blackwell 架构缺少对应 CUDA Toolkit | 在 Linux 上运行（Linux 端支持性较好），或改用默认 Ollama 后端；Windows 下 LlamaCPP 暂不支持 RTX 50 系列与 AMD 显卡（见「后端平台支持矩阵」） |
 
 ### RAG / 向量库相关
 
