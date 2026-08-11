@@ -120,9 +120,9 @@ class Scanner:
         backend 取值：
             - "transformers"（默认）：TransformersClient（NF4 基座 + FP16 LoRA 进程内推理）
             - "ollama"：OllamaClient（GGUF Q4_K_M 发布模型）
-            - "llamacpp"（实验性）：LlamaCppClient（Q4 GGUF 基座 + 运行时 FP16 LoRA，
+            - "llamacpp"：LlamaCppClient（Q4 GGUF 基座 + 运行时 FP16 LoRA，
               llama.cpp 内核快 + LoRA 保精度，需 llama-cpp-python 且 VULN_SCANNER_GGUF 指向基座）
-            - "vllm"：VLLMClient（OpenAI 兼容 API，PagedAttention + continuous batching 高吞吐，
+            - "vllm"（实验性）：VLLMClient（OpenAI 兼容 API，PagedAttention + continuous batching 高吞吐，
               需先用 app/launcher/vllm_server.py 启动 vLLM 服务，VULN_SCANNER_VLLM_URL 指向其地址）
         """
         backend = backend or DEFAULT_BACKEND

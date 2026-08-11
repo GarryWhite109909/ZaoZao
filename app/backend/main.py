@@ -487,19 +487,28 @@ def _build_backend_info() -> dict:
             device_type = "未知（未加载）"
 
         q_desc = "推理时将采用 bitsandbytes NF4 4bit 量化基座" if quantize else "推理时基座不量化（FP16/FP32 全精度）"
+        lora_merge = bool(getattr(client, "merge", True))
+        lora_precision = (
+            "FP16（合并进基座，保持 LoRA 精度）" if lora_merge
+            else "FP16（不合并，运行时叠加，精度最高）"
+        )
+        precision_note = (
+            "Transformers 管道：Base 用 bitsandbytes NF4 4bit 量化，LoRA 以 FP16 精度"
+            + ("合并进基座（VULN_SCANNER_MERGE=1，推理更快）。" if lora_merge else
+               "运行时叠加（VULN_SCANNER_MERGE=0，不合并以保留 FP16 LoRA 精度，推理更慢）。")
+            + "只压缩基座，不压缩 LoRA，复现了 G0 冻结集 95% CVE-fix recall 的管道。"
+        )
         info.update({
             "model": model_id,
             "adapter_path": adapter,
             "base_quantization": q_desc,
             "lora_quantized": False,
-            "lora_precision": "FP16（运行时叠加并合并，保持 LoRA 精度）",
+            "lora_merge": lora_merge,
+            "lora_precision": lora_precision,
             "compute_dtype": compute_dtype,
             "device_type": device_type,
             "num_gpu_layers": num_gpu if num_gpu >= 0 else None,
-            "precision_note": (
-                "Transformers 管道：Base 用 bitsandbytes NF4 4bit 量化，LoRA 以 FP16 精度在运行时叠加并合并。"
-                "只压缩基座，不压缩 LoRA，复现了 G0 冻结集 95% CVE-fix recall 的管道。"
-            ),
+            "precision_note": precision_note,
         })
         info["detection_method"] = (
             "检查本地基座目录 "

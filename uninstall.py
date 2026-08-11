@@ -78,7 +78,7 @@ PIP_OPTIONAL = [
     "pandas",
     "onnx",
     "ollama",
-    # 实验性 llamacpp 后端
+    # llamacpp 后端
     "llama-cpp-python",
     # 新框架（两阶段/外部扫描）pip 可安装的安全工具
     "bandit",

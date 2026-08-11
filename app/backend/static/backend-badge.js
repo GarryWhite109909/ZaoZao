@@ -125,6 +125,7 @@
       if (info.model_status) rows.push(row('模型状态', escapeHtml(info.model_status)));
       if (info.base_quantization) rows.push(row('基座量化', escapeHtml(info.base_quantization)));
       if (info.lora_precision != null) rows.push(row('LoRA 精度', escapeHtml(String(info.lora_precision))));
+      if (info.lora_merge != null) rows.push(row('LoRA 合并', escapeHtml(info.lora_merge ? '已合并（推理更快）' : '未合并（FP16 精度更高）')));
       if (info.compute_dtype) rows.push(row('计算精度', escapeHtml(info.compute_dtype.toUpperCase())));
       if (info.device_type) rows.push(row('运行设备', escapeHtml(info.device_type)));
       if (info.num_ctx) rows.push(row('上下文长度', escapeHtml(String(info.num_ctx))));

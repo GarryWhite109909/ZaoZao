@@ -5,7 +5,8 @@
     - transformers：配置了 VULN_SCANNER_ADAPTER 时启用（Q4 基座 + FP16 LoRA 进程内推理，
       复现 95% 召回管道），需要 transformers/peft/bitsandbytes，不依赖 Ollama
     - ollama：默认一键启动形态（GGUF Q4_K_M 发布模型），自动安装/启动 Ollama 并拉取模型
-    - llamacpp：实验性（Q4 GGUF 基座 + 运行时 FP16 LoRA），需要 llama-cpp-python
+    - llamacpp：Q4 GGUF 基座 + 运行时 FP16 LoRA，需要 llama-cpp-python
+    - vllm：实验性（暂无现成测试机器），AWQ/GPTQ 基座 + FP16 LoRA，仅 Linux/WSL2
     可用 VULN_SCANNER_BACKEND 显式覆盖。
 
 跨平台入口：
@@ -407,8 +408,8 @@ def select_backend() -> str:
     desc = {
         "ollama": "一键启动（兼容性最好，CPU/GPU 皆可）",
         "transformers": "进程内 NF4 基座 + FP16 LoRA（需 8GB+ 显存，精度最高）",
-        "llamacpp": "实验性，Q4 GGUF + 运行时 LoRA（需适配 CMAKE）",
-        "vllm": "独立服务，AWQ/GPTQ 基座 + FP16 LoRA（高吞吐，需 NVIDIA GPU）",
+        "llamacpp": "Q4 GGUF + 运行时 LoRA（需适配 CMAKE）",
+        "vllm": "实验性（暂无现成测试机器），AWQ/GPTQ 基座 + FP16 LoRA（高吞吐，需 NVIDIA GPU）",
     }
 
     # 显存推荐：只有未显式锁定后端时才用于覆盖默认值
@@ -451,6 +452,32 @@ def select_backend() -> str:
         except ValueError:
             pass
         print("[启动器] 无效输入，请重新选择。")
+
+
+def resolve_transformers_merge() -> str:
+    """选定 transformers 后端后，追加 LoRA 合并 / 不合并子选择。
+
+    返回 "1"=合并（默认，推理快） / "0"=不合并（LoRA 保持 FP16 精度、精度更高，但更慢）。
+    选择写入环境变量传给后端进程，后端启动后即固定，重启后端前无法更改。
+
+    非交互环境（stdin 非 tty）或已显式设置 VULN_SCANNER_MERGE 时直接沿用现有值，不重复询问。
+    """
+    existing = os.environ.get("VULN_SCANNER_MERGE", "").strip()
+    if existing in ("0", "1") or not sys.stdin.isatty():
+        return existing or "1"
+    print()
+    print("  Transformers 后端 · LoRA 合并方式")
+    print("-" * 60)
+    print("  [1] 合并 LoRA 进基座（默认，推理更快）")
+    print("  [2] 不合并，运行时叠加（LoRA 保持 FP16 精度，精度更高，但推理更慢）")
+    print("  ⚠ 该选择会写入后端配置；后端启动后固定，重启后端前无法更改。")
+    while True:
+        choice = input("请选择（回车=合并，1=合并，2=不合并）: ").strip()
+        if choice == "" or choice == "1":
+            return "1"
+        if choice == "2":
+            return "0"
+        print("[启动器] 无效输入，请输入 1 或 2。")
 
 
 def check_inprocess_backend_ready(backend: str) -> bool:
@@ -1511,6 +1538,9 @@ def main():
     # 0. 选择并锁定推理后端
     backend = select_backend()
     os.environ["VULN_SCANNER_BACKEND"] = backend
+    # transformers 后端追加 LoRA 合并 / 不合并子选择（写入环境变量，后端启动后固定）
+    if backend == "transformers":
+        os.environ["VULN_SCANNER_MERGE"] = resolve_transformers_merge()
     use_ollama = backend == "ollama"
     print(f"[启动器] 推理后端: {backend}")
 

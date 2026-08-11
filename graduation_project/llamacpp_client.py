@@ -1,5 +1,5 @@
 """
-llama-cpp-python 推理客户端 —— Q4 GGUF 基座 + 运行时加载独立 FP16 LoRA adapter（实验性后端）。
+llama-cpp-python 推理客户端 —— Q4 GGUF 基座 + 运行时加载独立 FP16 LoRA adapter。
 
 背景：Ollama 发布版是把 base+LoRA 合并后整体压进 GGUF Q4_K_M，LoRA 信号被一并重量化，
 导致 20 真实召回从 95%（全精度 LoRA）跌到 79%。TransformersClient 用
@@ -12,7 +12,7 @@ adapter 作为独立权重在运行时叠加（lora_path 参数），既拿到 l
 
 注意：
 - 依赖 llama-cpp-python：ROCm 需自行编译（CMAKE_ARGS="-DGGML_HIP=ON"），见项目文档。
-- 属实验性功能，默认不启用；通过 VULN_SCANNER_BACKEND=llamacpp 切换。
+- 通过 VULN_SCANNER_BACKEND=llamacpp 切换。
 - 模型管理（拉取/删除/切换）仍走 Ollama，本客户端只负责推理。
 
 接口与 OllamaClient / VLLMClient / TransformersClient 对齐（generate / generate_structured /
