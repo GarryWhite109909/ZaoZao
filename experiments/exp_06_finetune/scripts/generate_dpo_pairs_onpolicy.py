@@ -41,7 +41,7 @@ from graduation_project.schema import normalize_has_vulnerability, parse_verdict
 DATA_DIR = PROJECT_ROOT / "experiments/exp_06_finetune/data"
 OLLAMA_URL = "http://localhost:11434"
 
-# 压缩 CoT 模板（与《新蒸馏方法论》一致：8B 学不会长推理链，chosen 必须短）
+# 压缩 CoT 模板（与《docs/方法论_新蒸馏方法论》一致：8B 学不会长推理链，chosen 必须短）
 TEMPLATE_COT_VULN = (
     "分析：代码中 {source_desc} 的输入未经校验流入 {sink_desc}，"
     "构成 {cwe}。数据流路径可达且无任何消毒/参数化处理。"

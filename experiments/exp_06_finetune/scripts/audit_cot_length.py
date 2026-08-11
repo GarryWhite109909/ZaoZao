@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATA = ROOT / "experiments/exp_06_finetune/data/train_chatml_v9_augmented.jsonl"
 
-# 阈值（基于 DeepSeek-R1 蒸馏经验 + 文档《新蒸馏方法论》要求）
+# 阈值（基于 DeepSeek-R1 蒸馏经验 + 文档《docs/方法论_新蒸馏方法论》要求）
 DEFAULT_MAX_STEPS = 5
 DEFAULT_MAX_TOKENS = 590
 
