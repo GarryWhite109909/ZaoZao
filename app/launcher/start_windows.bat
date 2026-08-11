@@ -1,5 +1,12 @@
 @echo off
-chcp 65001 >nul
+REM NOTE: Do NOT use `chcp 65001` here. This batch file may live under a path
+REM containing non-ASCII characters (e.g. a Chinese folder name). Switching
+REM the code page to UTF-8 while cmd still parses the script (and the
+REM expanded %~dp0 path) with the system ANSI code page causes the parser to
+REM misread multi-byte characters and "eat" the tail of a command, producing
+REM errors like "'ec' is not recognized" or "'cy_installer' is not recognized".
+REM Keeping the default code page keeps the non-ASCII path self-consistent.
+REM All echo'd text in this file is ASCII, so no mojibake.
 cd /d "%~dp0\..\.."
 for %%I in ("%~dp0..\..") do set "VULN_PROJECT_ROOT=%%~fI"
 set "OLLAMA_MODELS=%VULN_PROJECT_ROOT%\models\ollama"
@@ -9,10 +16,11 @@ if not exist "%HF_HOME%" mkdir "%HF_HOME%"
 echo Starting AI Vulnerability Scanner...
 
 REM =====================================================================
-REM 依赖一律装进「当前解释器」python（sys.executable），并在同环境下跑启动器。
-REM 不再跨 conda 环境扫描 torch 构建并 re-exec 切换，避免"环境换来换去"导致依赖分裂
-REM （torch 对了却缺 tree_sitter_python / 安全工具装到别的环境）。缺 torch 时后续
-REM dependency_installer 会现场安装。
+REM Install ALL deps into the current interpreter (sys.executable) and run
+REM the launcher in that same environment. Do NOT scan conda envs for a torch
+REM build and re-exec across envs, to avoid dependency fragmentation (torch
+REM OK but missing tree_sitter / security tools installed elsewhere).
+REM dependency_installer will install missing torch on the fly.
 REM =====================================================================
 set "PY=%PYTHON%"
 if "%PY%"=="" set "PY=python"
