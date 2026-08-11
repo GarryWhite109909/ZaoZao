@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Optional
 
 from graduation_project.external_scanner import ExternalScanner
-from graduation_project.prefilter import Prefilter
+from graduation_project.prefilter import Prefilter, PREFILTER_RULE_INFO
 from graduation_project.prompts import build_triage_prompt, build_user_prompt
 from graduation_project.schema import normalize_has_vulnerability, parse_verdict
 from graduation_project.cwe_normalizer import normalize_cwe_label
@@ -893,29 +893,10 @@ _SEVERITY_BY_TYPE = {
     "Server-Side Template Injection": "high",
 }
 
-# Prefilter 规则 → taint_type / severity（与 scanner.py 的 _PREFILTER_VULN_INFO 对齐）
-_PREFILTER_TYPE = {
-    "sqli_string_concat": "SQL Injection",
-    "sqli_fstring": "SQL Injection",
-    "sqli_percent_format": "SQL Injection",
-    "cmd_os_system_concat": "Command Injection",
-    "cmd_subprocess_shell_concat": "Command Injection",
-    "rce_eval_request": "Code Injection",
-    "path_traversal_open_concat": "Path Traversal",
-    "deser_pickle_loads": "Insecure Deserialization",
-    "deser_yaml_unsafe_load": "Insecure Deserialization",
-}
-_PREFILTER_SEVERITY = {
-    "sqli_string_concat": "high",
-    "sqli_fstring": "high",
-    "sqli_percent_format": "high",
-    "cmd_os_system_concat": "critical",
-    "cmd_subprocess_shell_concat": "critical",
-    "rce_eval_request": "critical",
-    "path_traversal_open_concat": "high",
-    "deser_pickle_loads": "critical",
-    "deser_yaml_unsafe_load": "high",
-}
+# Prefilter 规则 → taint_type / severity（统一来自 prefilter.PREFILTER_RULE_INFO，
+# 与 scanner.py 的 _PREFILTER_VULN_INFO 同一数据源，避免两份映射漂移）
+_PREFILTER_TYPE = {name: meta["taint_type"] for name, meta in PREFILTER_RULE_INFO.items()}
+_PREFILTER_SEVERITY = {name: meta["severity"] for name, meta in PREFILTER_RULE_INFO.items()}
 
 
 # ---------------------------------------------------------------------------

@@ -375,6 +375,7 @@ async function runBatchScan(files, label, context) {
   let vulnerable = 0;
   let safe = 0;
   let errors = 0;
+  let skipped = 0; // 空文件（无可分析内容）计数，汇总时单列，避免"总文件"口径缩水
 
   await vscode.window.withProgress(
     {
@@ -410,7 +411,11 @@ async function runBatchScan(files, label, context) {
           continue;
         }
 
-        if (!code.trim()) continue;
+        if (!code.trim()) {
+          skipped++;
+          outputChannel.appendLine(`  [·] ${relName} — 空文件，跳过`);
+          continue;
+        }
 
         // 调用分析（复用 callAnalyzeApi，传入虚拟 doc；批量扫描标 batch 降为 LOW 优先级）
         const fakeDoc = { uri: fileUri, languageId: extToLangId(fileUri), getText: () => code };
@@ -451,7 +456,7 @@ async function runBatchScan(files, label, context) {
   outputChannel.appendLine("");
   outputChannel.appendLine(`────────────────────────────────────────`);
   outputChannel.appendLine(`  扫描汇总`);
-  outputChannel.appendLine(`  总文件: ${results.length}  漏洞: ${vulnerable}  安全: ${safe}  错误: ${errors}`);
+  outputChannel.appendLine(`  总文件: ${files.length}  漏洞: ${vulnerable}  安全: ${safe}  错误: ${errors}  跳过(空文件): ${skipped}`);
   if (vulnerable > 0) {
     outputChannel.appendLine("");
     outputChannel.appendLine(`  漏洞清单:`);

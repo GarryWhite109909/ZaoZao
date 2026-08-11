@@ -3,9 +3,8 @@
 LLM 推理 + 代码切片 + RAG 检索 + 传统规则预筛。
 
 关键设计：
-- SFT v5 用 SYSTEM_PROMPT_LITE 训练，推理也必须用 LITE（训练/推理一致）
-- OllamaClient.analyze_vulnerability 硬编码了完整版 SYSTEM_PROMPT，
-  本服务绕过它，直接调 client.generate 传入 LITE 版
+- system prompt 由 model_registry 统一选择（当前全部为 V3_PROMPT，
+  训练/推理一致，不再按模型区分 lite/base 变体）
 - RAG 可开关（Web 端默认开，插件端默认关）
 - 预筛层（prefilter）可开关：开启后对明显漏洞/安全样本直接短路，跳过 LLM
 """
@@ -18,17 +17,18 @@ import time
 from typing import Optional
 
 from graduation_project.llm_client import OllamaClient
-from graduation_project.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_LITE, BASE_PROMPT, build_user_prompt
+from graduation_project.prompts import build_user_prompt
 from graduation_project.schema import parse_verdict, normalize_has_vulnerability
 from graduation_project.cwe_normalizer import normalize_cwe_label
 from graduation_project.code_slicer import CodeSlicer, SliceResult
-from graduation_project.prefilter import Prefilter, PrefilterResult
+from graduation_project.prefilter import Prefilter, PrefilterResult, PREFILTER_RULE_INFO
 from app.backend.services.model_registry import get_default_model, get_prompt_for_model
 from graduation_project.paths import resolve_adapter_path, resolve_base_model_path
-from graduation_project.result_types import SingleResult, BatchResult
-from graduation_project.transformers_client import is_transformers_runtime_compatible, resolve_default_backend
+from graduation_project.result_types import SingleResult
+from graduation_project.transformers_client import resolve_default_backend
 
-# 默认模型：从环境变量读取，缺省为注册表中的默认模型（当前 v9max）
+# 默认模型：从环境变量读取，缺省为注册表中的默认模型（当前 α0，已训练未评估；
+# 论文口径当前已发布最佳仍为 v9max，二者区分见素材库「写作口径须知」）
 DEFAULT_MODEL = os.environ.get("VULN_SCANNER_MODEL", get_default_model())
 # 回退模型：官方 Qwen3-8B（未微调，用户首次未 pull 自定义模型时可用）
 FALLBACK_MODEL = os.environ.get("VULN_SCANNER_FALLBACK_MODEL", "qwen3:8b")
@@ -47,18 +47,11 @@ DEFAULT_TRANSFORMERS_NUM_CTX = int(os.environ.get("VULN_SCANNER_NUM_CTX", "6144"
 # Chroma 知识库集合名
 KNOWLEDGE_COLLECTION = "vuln_knowledge"
 
-# 预筛规则名 → (CWE 标签, 风险等级)：预筛短路时给出与 LLM 一致的信息格式
-# 标签统一为 CWE 官方标准英文名（与 cwe_normalizer / LLM 输出风格一致）
+# 预筛规则名 → (CWE 标签, 风险等级)：预筛短路时给出与 LLM 一致的信息格式。
+# 元数据统一来自 prefilter.PREFILTER_RULE_INFO，避免与两阶段扫描器两份映射漂移。
 _PREFILTER_VULN_INFO = {
-    "sqli_string_concat": ("CWE-89 SQL Injection", "High"),
-    "sqli_fstring": ("CWE-89 SQL Injection", "High"),
-    "sqli_percent_format": ("CWE-89 SQL Injection", "High"),
-    "cmd_os_system_concat": ("CWE-78 Command Injection", "Critical"),
-    "cmd_subprocess_shell_concat": ("CWE-78 Command Injection", "Critical"),
-    "rce_eval_request": ("CWE-94 Code Injection", "Critical"),
-    "path_traversal_open_concat": ("CWE-22 Path Traversal", "High"),
-    "deser_pickle_loads": ("CWE-502 Deserialization of Untrusted Data", "Critical"),
-    "deser_yaml_unsafe_load": ("CWE-502 Deserialization of Untrusted Data", "High"),
+    name: (meta["cwe"], meta["risk"])
+    for name, meta in PREFILTER_RULE_INFO.items()
 }
 
 
@@ -66,10 +59,11 @@ class Scanner:
     """漏洞扫描编排器。
 
     Args:
-        model: Ollama 模型名（默认注册表中的默认模型，当前 v9max）
+        model: Ollama 模型名（默认注册表中的默认模型，当前 α0）
         base_url: Ollama 服务地址
         use_rag: 是否启用 RAG 知识库增强
-        use_lite_prompt: 已废弃（保留参数兼容旧调用），prompt 现由 model_registry 自动选择
+        use_lite_prompt: 已废弃（保留参数兼容旧调用），prompt 现由 model_registry 自动选择，
+            全部登记模型统一为 V3_PROMPT
         use_prefilter: 是否启用传统规则预筛层（True 时对明显样本短路跳过 LLM）
         use_structured_fallback: 是否在 CoT+JSON 解析失败时用 Ollama format=json 约束解码兜底
         use_taint_tracking: 是否启用轻量污点分析（source→sink 路径注入 LLM 上下文）
@@ -93,7 +87,7 @@ class Scanner:
         if client is not None:
             self.client = client
         else:
-            self.client = self._build_default_client(model, backend)
+            self.client = self._build_default_client(model, backend, base_url)
         self.model = model
         self.use_rag = use_rag
         self.use_prefilter = use_prefilter
@@ -104,7 +98,7 @@ class Scanner:
         self._num_ctx = int(os.environ.get("VULN_SCANNER_NUM_CTX", str(DEFAULT_TRANSFORMERS_NUM_CTX)))
         self._num_gpu = int(os.environ.get("VULN_SCANNER_NUM_GPU", "-1"))
         self._num_thread = int(os.environ.get("VULN_SCANNER_NUM_THREAD", "0"))
-        # system prompt 由 model_registry 自动选择（v9max→BASE_PROMPT, v5→LITE）
+        # system prompt 由 model_registry 自动选择（当前全部登记模型统一为 V3_PROMPT）
         self.system_prompt = get_prompt_for_model(model)
         self.slicer = CodeSlicer(min_lines=150)
         self.prefilter = Prefilter() if use_prefilter else None
@@ -114,16 +108,20 @@ class Scanner:
         self._model_lock = threading.RLock()
 
     @staticmethod
-    def _build_default_client(model: str, backend: Optional[str]):
+    def _build_default_client(model: str, backend: Optional[str], base_url: str = "http://localhost:11434"):
         """按后端类型构建默认推理客户端。
 
         backend 取值：
-            - "transformers"（默认）：TransformersClient（NF4 基座 + FP16 LoRA 进程内推理）
+            - "transformers"：TransformersClient（NF4 基座 + FP16 LoRA 进程内推理，
+              自动探测到 models/adapter 且运行时兼容时作为默认）
             - "ollama"：OllamaClient（GGUF Q4_K_M 发布模型）
             - "llamacpp"：LlamaCppClient（Q4 GGUF 基座 + 运行时 FP16 LoRA，
               llama.cpp 内核快 + LoRA 保精度，需 llama-cpp-python 且 VULN_SCANNER_GGUF 指向基座）
             - "vllm"（实验性）：VLLMClient（OpenAI 兼容 API，PagedAttention + continuous batching 高吞吐，
               需先用 app/launcher/vllm_server.py 启动 vLLM 服务，VULN_SCANNER_VLLM_URL 指向其地址）
+
+        base_url 仅对 ollama / vllm 后端生效（transformers / llamacpp 为进程内推理，
+        无远端地址概念）。
         """
         backend = backend or DEFAULT_BACKEND
         if backend == "transformers":
@@ -142,17 +140,16 @@ class Scanner:
             )
         if backend == "vllm":
             from graduation_project.vllm_client import VLLMClient
-            base_url = os.environ.get("VULN_SCANNER_VLLM_URL", "http://localhost:8000")
-            return VLLMClient(base_url=base_url, model=model)
+            vllm_url = base_url or os.environ.get("VULN_SCANNER_VLLM_URL", "http://localhost:8000")
+            return VLLMClient(base_url=vllm_url, model=model)
         # 默认回退 Ollama
-        return OllamaClient(base_url="http://localhost:11434", model=model)
+        return OllamaClient(base_url=base_url or "http://localhost:11434", model=model)
 
     def switch_model(self, model: str) -> None:
         """运行时切换活动模型。队列中的待执行任务也会用新模型。
 
-        根据模型注册表自动选择对应的 system prompt：
-        - v9max → BASE_PROMPT（训练/推理一致）
-        - v5    → SYSTEM_PROMPT_LITE（训练/推理一致）
+        根据模型注册表自动选择对应的 system prompt（当前全部登记模型统一为
+        V3_PROMPT，训练/推理一致；未登记模型回退 BASE_PROMPT）。
 
         与 scan_code 互斥：正在执行的扫描不会在 chunk 中途切换模型，
         避免同一文件的前后切片使用不同模型/提示词导致结果撕裂。

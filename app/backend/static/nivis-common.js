@@ -586,16 +586,6 @@
         if (btn.__nivisBound) return; btn.__nivisBound = true;
         btn.addEventListener('click', function () { self.startResourceDownload(btn.getAttribute('data-dl-retry')); });
       });
-      drawer.querySelectorAll('input[data-gguf-url]').forEach(function (inp) {
-        if (inp.__nivisBound) return; inp.__nivisBound = true;
-        inp.addEventListener('keydown', function (e) {
-          if (e.key === 'Enter') {
-            var row = inp.closest('.p-3');
-            var btn = row && row.querySelector('[data-dl-start]');
-            if (btn) btn.click();
-          }
-        });
-      });
     },
 
     /* 解析 rid（hf:model_id / gguf:path），找到对应资源并启动下载 */
@@ -620,12 +610,9 @@
         var mid = res.default_model_id || res.id || 'Qwen/Qwen3-8B-AWQ';
         this.streamDownload(rid, '/api/models/download-hf', { model_id: mid, backend: 'vllm' });
       } else if (res.type === 'gguf') {
-        /* GGUF 需要 url + filename；优先输入框内容，其次资源里的 default_url，否则提示用户 */
-        var url = '';
-        document.querySelectorAll('input[data-gguf-url]').forEach(function (inp) {
-          if (inp.getAttribute('data-gguf-url') === rid && inp.value.trim()) url = inp.value.trim();
-        });
-        if (!url) url = res.default_url || '';
+        /* GGUF 固定下载后端配置的官方未合并基座（default_url），
+           不再提供自由 URL 输入；default_url 缺失时才提示用户手动输入 */
+        var url = res.default_url || '';
         if (!url) {
           /* 用 prompt 让用户输入 GGUF 下载 URL */
           url = window.prompt('请输入 GGUF 下载 URL（GitHub 链接将自动加 ghproxy 镜像）：', '');
@@ -751,7 +738,7 @@
 
     del: function (model) {
       var self = this;
-      if (!window.confirm('确认删除模型？\n' + model + '\n\n将从 ~/.ollama 目录彻底删除模型文件，释放磁盘空间。')) return;
+      if (!window.confirm('确认删除模型？\n' + model + '\n\n将从模型存储目录（默认项目 models/ollama）彻底删除模型文件，释放磁盘空间。')) return;
       fetch('/api/models/' + encodeURIComponent(model), { method: 'DELETE' })
         .then(function (r) { return r.json(); })
         .then(function (d) {

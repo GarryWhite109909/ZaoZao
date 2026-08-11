@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 
 from graduation_project.result_types import BatchResult, SingleResult
 

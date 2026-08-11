@@ -5,6 +5,7 @@
    - 跨标签页/窗口实时同步（storage 事件）
    - 图标随主题切换（月/日），即时更新
    - 统一管理右上角按钮和设置抽屉里的 [data-theme-btn] 选项
+   - 主题只由用户手动切换，不跟随系统 prefers-color-scheme（产品意图）
    - FOUC 防护由各 HTML <head> 内联脚本完成
    ====================================================================== */
 (function () {
@@ -15,9 +16,6 @@
   var LIGHT = 'light';
 
   /* ---- 工具 ---- */
-  function getStored() {
-    try { return localStorage.getItem(STORAGE_KEY); } catch (e) { return null; }
-  }
   function setStored(v) {
     try { localStorage.setItem(STORAGE_KEY, v); } catch (e) {}
   }
@@ -29,12 +27,6 @@
   function currentTheme() {
     return document.documentElement.classList.contains(DARK) ? DARK : LIGHT;
   }
-  function resolveInitial() {
-    var s = getStored();
-    if (s === DARK || s === LIGHT) return s;
-    return LIGHT;
-  }
-
   /* ---- 图标 ---- */
   var ICON_SUN =
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
@@ -154,17 +146,6 @@
       syncDrawerOpts();
     }
   });
-
-  /* ---- 系统主题变化：仅当用户未显式设置时跟随 ---- */
-  if (window.matchMedia) {
-    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
-      if (!getStored()) {
-        applyTheme(resolveInitial());
-        syncButton();
-        syncDrawerOpts();
-      }
-    });
-  }
 
   /* ---- DOM 就绪后绑定 ---- */
   if (document.readyState === 'loading') {

@@ -9,8 +9,6 @@ vLLM 通过 OpenAI 兼容 API 暴露服务（默认 http://localhost:8000/v1）�
 
 from __future__ import annotations
 
-import json
-import sys
 import time
 from typing import Dict, List, Optional, Union
 

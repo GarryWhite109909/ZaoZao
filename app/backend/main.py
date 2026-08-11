@@ -52,7 +52,6 @@ from app.backend.services.scanner import DEFAULT_MODEL, Scanner
 from graduation_project.result_types import SingleResult, BatchResult
 from app.backend.services.model_registry import (
     list_registry,
-    get_model_info,
     get_default_model,
     is_allowed,
     normalize_ollama_name,
@@ -71,8 +70,6 @@ from graduation_project.two_stage_scanner import TwoStageScanner, tool_recall_mo
 from graduation_project.fix_verifier import FixVerifier, validate_fix_suggestion
 from app.backend.services.multi_model_scanner import MultiModelScanner
 from graduation_project.vllm_client import VLLMClient
-from graduation_project.schema import parse_verdict, normalize_has_vulnerability
-from graduation_project.prompts import build_user_prompt
 from graduation_project.paths import (
     resolve_adapter_path,
     resolve_base_model_path,
@@ -80,7 +77,7 @@ from graduation_project.paths import (
     local_hf_model_dir,
     local_vllm_model_dir,
     llamacpp_dir,
-    ollama_models_dir,
+    ollama_default_store,
 )
 
 # ---------------------------------------------------------------------------
@@ -249,7 +246,6 @@ app.add_middleware(
 @app.on_event("startup")
 async def _bind_scheduler_loop() -> None:
     """启动时把事件循环绑定到调度器，使其能回填 asyncio.Future 结果。"""
-    import asyncio
     scheduler.bind_loop(asyncio.get_running_loop())
     # transformers 后端：若模型资源已就绪，后台预热加载基座并合并 LoRA，使首次分析立即可用
     _trigger_transformers_warmup()
@@ -373,7 +369,12 @@ def _detect_model_available(backend: str, client) -> tuple[bool | None, str]:
         model = getattr(client, "model", os.environ.get("VULN_SCANNER_MODEL", ""))
         try:
             import requests
-            resp = requests.get("http://localhost:11434/api/tags", timeout=3)
+            # 与 scanner._build_default_client 一致：优先客户端实际 base_url，
+            # 避免自定义 Ollama 地址（非默认端口/远程）时探测走错地址
+            base_url = (
+                getattr(client, "base_url", "") or "http://localhost:11434"
+            ).rstrip("/")
+            resp = requests.get(f"{base_url}/api/tags", timeout=3)
             if resp.status_code != 200:
                 return False, "Ollama 服务未运行"
             models = [normalize_ollama_name(m.get("name", "")) for m in resp.json().get("models", [])]
@@ -462,9 +463,9 @@ def _build_backend_info() -> dict:
         )
         info["download_method"] = (
             "点击「拉取」调用 Ollama /api/pull 下载到 OLLAMA_MODELS 目录（当前 "
-            f"{ollama_models_dir()}），支持断点续传；已安装模型可切换或删除。"
+            f"{ollama_default_store()}），支持断点续传；已安装模型可切换或删除。"
         )
-        info["model_store"] = str(ollama_models_dir())
+        info["model_store"] = str(ollama_default_store())
 
     elif backend == "transformers":
         adapter = resolve_adapter_path(getattr(client, "adapter", ""))
@@ -1247,8 +1248,22 @@ async def multi_model_scan(req: MultiModelRequest, request: Request):
     """多模型交叉验证扫描：顺序加载各模型 → 投票聚合 → 返回 VoteResult。
 
     前端需传入 ≥2 个模型名；任一时刻显存只驻留单模型（keep_alive=0）。
-    走 Ollama，纳入调度器（交互式 HIGH 优先级）。
+    仅 Ollama 后端可用（纳入调度器，交互式 HIGH 优先级）；transformers /
+    llamacpp / vllm 等进程内后端每次只能加载一个本地模型，多个模型名会指向
+    同一模型导致"假投票"，故直接返回 501 关闭通道。
     """
+    # 多模型投票专用 Ollama 通道：非 Ollama 后端（无运行时模型管理能力）直接关闭
+    if not scanner.model_management_capabilities().get("list"):
+        return JSONResponse(
+            {
+                "error": "多模型投票仅 Ollama 后端可用。当前后端（"
+                         f"{type(scanner.client).__name__}）每次只能加载一个本地模型，"
+                         "无法提供多模型交叉验证；如需使用请将推理后端切换为 Ollama，"
+                         "并在模型管理中拉取至少 2 个模型。",
+                "backend": type(scanner.client).__name__,
+            },
+            status_code=501,
+        )
     if len(req.models) < 2:
         return JSONResponse(
             {"error": "多模型投票至少需要 2 个模型，当前仅 " + str(len(req.models)) + " 个"},
@@ -1262,6 +1277,7 @@ async def multi_model_scan(req: MultiModelRequest, request: Request):
             models=req.models,
             use_prefilter=True,
             keep_alive=0,
+            backend="ollama",  # 强制 Ollama：避免默认后端为 transformers 时"三票同源"
         )
         return mms.scan_code(
             code=req.code,
@@ -1397,11 +1413,16 @@ async def models_pull(req: ModelActionRequest):
     """流式拉取模型（NDJSON 流，每行含 status / completed / total / digest）。
 
     拉取完成后模型即可使用（Modelfile 已内置 SYSTEM prompt 和推理参数）。
-    仅允许拉取注册表中的模型。
+    仅允许拉取注册表中的模型。下载目标为 OLLAMA_MODELS（启动器已锁定到项目
+    models/ollama，与自研模型同目录）：新拉取的官方库对照模型（gemma4 /
+    qwen3.5 等）直接落项目目录，可被 /api/tags 探测、被 scanner 调用，
+    无需二次迁移；若旧模型此前在 ~/.ollama/models，启动器迁移逻辑会在下次
+    启动时搬入项目目录。
     """
-    if not is_allowed(req.model):
+    model = normalize_ollama_name(req.model)
+    if not is_allowed(model):
         return JSONResponse(
-            {"error": f"模型 {req.model} 不在允许列表中"}, status_code=403,
+            {"error": f"模型 {model} 不在允许列表中"}, status_code=403,
         )
     gate = _model_mgmt_gate("pull")
     if gate is not None:
@@ -1418,7 +1439,7 @@ async def models_pull(req: ModelActionRequest):
             chunk_queue.put(chunk)
 
         def run_pull():
-            result = scanner.client.pull_model(req.model, stream_callback=callback)
+            result = scanner.client.pull_model(model, stream_callback=callback)
             done_flag["result"] = result
             done_flag["done"] = True
             chunk_queue.put(None)  # 哨兵，唤醒流式迭代
@@ -1443,7 +1464,11 @@ async def models_pull(req: ModelActionRequest):
 
         result = done_flag["result"] or {}
         if result.get("success"):
-            yield json.dumps({"status": "success", "completed": True}, ensure_ascii=False) + "\n"
+            yield json.dumps({
+                "status": "success",
+                "completed": True,
+                "store": str(ollama_default_store()),
+            }, ensure_ascii=False) + "\n"
         elif not result.get("error"):
             yield json.dumps({"status": result.get("final_status", "unknown"),
                               "error": "拉取未完成"}, ensure_ascii=False) + "\n"
@@ -1453,13 +1478,16 @@ async def models_pull(req: ModelActionRequest):
 
 @app.delete("/api/models/{model_name:path}")
 def models_delete(model_name: str):
-    """删除模型（从 ~/.ollama 目录彻底删除 blob 文件，释放磁盘空间）。
+    """删除模型（从模型存储目录彻底删除 blob 文件，释放磁盘空间）。
 
     模型全名含 / 与 :（如 garrywhite109909/graduation-vuln-scanner:v9max），
     故使用 :path 转换器匹配整段路径。前端需对模型名做 encodeURIComponent。
-    仅允许删除注册表中的模型。
+    仅允许删除注册表中的模型。存储目录 = OLLAMA_MODELS = 项目 models/ollama
+    （启动器锁定）；若删除的是当前活动模型，自动切换到其他已安装模型，
+    避免活动模型指向不存在的模型。
     """
     # URL 解码后的模型名可能含 / :，FastAPI path 参数已自动解码
+    model_name = normalize_ollama_name(model_name)
     if not is_allowed(model_name):
         return JSONResponse(
             {"error": f"模型 {model_name} 不在允许列表中"}, status_code=403,
@@ -1467,11 +1495,15 @@ def models_delete(model_name: str):
     gate = _model_mgmt_gate("delete")
     if gate is not None:
         return gate
-    # 如果删除的是当前活动模型，先切回默认模型
+    # 如果删除的是当前活动模型，先切换到其他已安装模型（默认模型优先，
+    # 其次任意已安装模型）；避免"默认模型即被删模型"时无回退的悬空指针
     if scanner.model == model_name:
+        installed = set(scanner.client.list_models()) - {model_name}
         default = get_default_model()
-        if default != model_name:
+        if default != model_name and default in installed:
             scanner.switch_model(default)
+        elif installed:
+            scanner.switch_model(sorted(installed)[0])
     result = scanner.client.delete_model(model_name)
     if result["success"]:
         return {"deleted": True, "model": model_name}
@@ -1485,25 +1517,25 @@ def models_delete(model_name: str):
 def models_activate(req: ModelActionRequest):
     """切换当前活动模型。队列中的待执行任务也会用新模型。
 
-    根据模型注册表自动切换 system prompt：
-    - v9max → BASE_PROMPT
-    - v5    → SYSTEM_PROMPT_LITE
+    根据模型注册表自动切换 system prompt（当前全部登记模型统一为 V3_PROMPT，
+    训练/推理一致）。模型名自动归一化 :latest，与已安装列表口径一致。
     """
-    if not is_allowed(req.model):
+    model = normalize_ollama_name(req.model)
+    if not is_allowed(model):
         return JSONResponse(
-            {"error": f"模型 {req.model} 不在允许列表中"}, status_code=403,
+            {"error": f"模型 {model} 不在允许列表中"}, status_code=403,
         )
     gate = _model_mgmt_gate("activate")
     if gate is not None:
         return gate
     # 检查模型是否已安装
     installed = scanner.client.list_models()
-    if req.model not in installed:
+    if model not in installed:
         return JSONResponse(
-            {"error": f"模型 {req.model} 未安装，请先拉取"}, status_code=409,
+            {"error": f"模型 {model} 未安装，请先拉取"}, status_code=409,
         )
-    scanner.switch_model(req.model)
-    return {"activated": True, "model": req.model}
+    scanner.switch_model(model)
+    return {"activated": True, "model": model}
 
 
 # ---------------------------------------------------------------------------
@@ -1579,6 +1611,8 @@ def _resumable_download(
     与 huggingface_hub / urlopen 相比，这里对断网/超时更稳：
       - 已下载的字节保存在 dest_path，下次调用从断点（Range: bytes=N-）续传；
       - 服务器不支持 Range 时自动退回从头下载（覆盖 .incomplete）；
+      - 目标文件已完整存在 / 断点恰好等于文件总长（416）时直接判完成，
+        避免"已下载完却因 Range 越界反复重试"的边界卡死；
       - 网络抖动时带退避自动重试，而不是一次失败就整个放弃。
 
     返回 (downloaded, total)；total<=0 表示无法得知总大小（仍可能下载成功）。
@@ -1609,6 +1643,21 @@ def _resumable_download(
                 url, headers=headers, stream=True,
                 timeout=60, proxies=proxies,
             )
+            if resp.status_code == 416 and resume_from > 0:
+                # Range 起点超出服务器文件总长：断点已等于/超过总大小。
+                # 目标文件若已存在则视为完整（下载已完成），否则断点损坏，清空从头下。
+                resp.close()
+                if dest_path.exists():
+                    size = dest_path.stat().st_size
+                    if progress_cb:
+                        progress_cb(size, size)
+                    return size, size
+                try:
+                    incomplete.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    pass
+                resume_from = 0
+                continue
             resp.raise_for_status()
 
             if resp.status_code == 206:

@@ -5,6 +5,9 @@
 - 逐个模型加载 → 扫描全部样本 → 立即卸载 → 加载下一个模型
 - 全部模型扫完后，按样本聚合投票，多数票决定最终结论
 - 牺牲速度换显存安全：任一时刻显存中只驻留一个模型
+- **仅 Ollama 后端**：多模型投票需要多个可独立拉取/加载的模型；
+  transformers / llamacpp / vllm 等进程内后端每次只能加载一个本地模型，
+  强制走 Ollama（backend="ollama"），否则会出现"多个模型名指向同一模型"的假投票。
 
 适用场景：
 - 需要多模型交叉验证提升判定可信度
@@ -21,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from graduation_project.result_types import SingleResult, BatchResult
+from graduation_project.result_types import SingleResult
 from app.backend.services.scanner import Scanner
 
 
@@ -61,6 +64,8 @@ class MultiModelScanner:
         use_rag: 是否启用 RAG 知识库增强
         use_prefilter: 是否启用传统规则预筛层
         keep_alive: 模型卸载策略（0=用完即卸，-1=常驻）
+        backend: 推理后端，固定 "ollama"（多模型投票专用 Ollama 通道，
+            调用方 /api/multi-model-scan 已按当前后端门控）
 
     Raises:
         ValueError: 模型数量 < 2
@@ -73,6 +78,7 @@ class MultiModelScanner:
         use_rag: bool = False,
         use_prefilter: bool = True,
         keep_alive=0,
+        backend: str = "ollama",
     ):
         if len(models) < 2:
             raise ValueError("多模型投票至少需要 2 个模型，当前仅 " + str(len(models)) + " 个")
@@ -81,6 +87,7 @@ class MultiModelScanner:
         self.use_rag = use_rag
         self.use_prefilter = use_prefilter
         self.keep_alive = keep_alive
+        self.backend = backend
 
     # ------------------------------------------------------------------
     # 核心扫描接口
@@ -114,6 +121,7 @@ class MultiModelScanner:
                 use_rag=rag_enabled,
                 use_prefilter=self.use_prefilter,
                 keep_alive=self.keep_alive,
+                backend=self.backend,
             )
             try:
                 result = scanner.scan_code(code, language, filename, use_rag=use_rag)
@@ -158,6 +166,7 @@ class MultiModelScanner:
                 use_rag=rag_enabled,
                 use_prefilter=self.use_prefilter,
                 keep_alive=self.keep_alive,
+                backend=self.backend,
             )
             try:
                 for i, (filename, language, code) in enumerate(files):

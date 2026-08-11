@@ -1,8 +1,15 @@
 """
-模型注册表 —— 定义 garrywhite109909 命名空间下允许管理的模型清单。
+模型注册表 —— 定义允许管理的模型清单。
 
 前端模型管理 UI（拉取 / 删除 / 切换）只能操作此处登记的模型，
 防止用户误操作其他无关模型。
+
+注册表包含两类模型：
+- 自研发布模型（garrywhite109909 命名空间）：alpha0 / v9max / v5 等微调模型
+- Ollama 官方库对照模型（gemma4 / qwen3.5 系列）：未微调的通用模型，供显存
+  充足的用户在 Ollama 后端做多模型交叉验证 / 对照实验。拉取时同样写入
+  OLLAMA_MODELS（启动器已锁定到项目 models/ollama），与自研模型同目录，
+  可被 /api/tags 探测、被 scanner 直接调用，无需二次迁移。
 
 每个模型条目包含：
 - tag: Ollama 模型标签（不含命名空间前缀）
@@ -10,15 +17,13 @@
 - display_name: 前端展示名
 - description: 模型描述
 - prompt_variant: 推理时使用的 system prompt 变体
-    "lite"  → SYSTEM_PROMPT_LITE（v5 训练/推理一致）
-    "base"  → BASE_PROMPT（v9max 训练/推理一致）
+    统一为 "v3" → V3_PROMPT（当前所有登记模型共用，训练/推理一致）
 - is_default: 是否为默认模型（首次启动时自动拉取）
 - deprecated: 是否已废弃（仍可拉取使用，但 UI 标记"已过时"）
 """
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 from graduation_project.prompts import V3_PROMPT
@@ -36,7 +41,8 @@ _REGISTRY: list[dict] = [
         "tag": "alpha0",
         "full_name": f"{NAMESPACE}/nivis-alpha0",
         "display_name": "Nivis-α0",
-        "description": "Qwen3-8B + rsLoRA(r8) 训练的新发布模型，当前活动模型。",
+        "description": "Qwen3-8B + rsLoRA(r8) 训练的新发布模型，当前活动模型。已训练未评估；"
+                       "基于数据口径（8616 条、二次蒸馏 + 全量 combined prompt）推断优于 v9max，待测评证实。",
         "prompt_variant": "v3",
         "is_default": True,
         "deprecated": False,
@@ -45,7 +51,7 @@ _REGISTRY: list[dict] = [
         "tag": "v9max",
         "full_name": f"{NAMESPACE}/{REPO}:v9max",
         "display_name": "Nivis v9max",
-        "description": "三模型蒸馏 + A800 云端训练，已被 Nivis-α0 取代。合成集 recall 1.0，CVE-fix recall 0.95（均为 HF NF4+FP16 LoRA 评估管道口径；Ollama Q4_K_M 发布形态下合成集 recall 0.951 / FPR 0.077，CVE-fix recall 0.75~0.79）。",
+        "description": "三模型蒸馏 + A800 云端训练。论文口径当前已发布最佳：合成集 recall 1.0，CVE-fix recall 0.95（均为 HF NF4+FP16 LoRA 评估管道口径；Ollama Q4_K_M 发布形态下合成集 recall 0.951 / FPR 0.077，CVE-fix recall 0.75~0.79）。默认活动模型已切换为 Nivis-α0（未评估）。",
         "prompt_variant": "v3",
         "is_default": False,
         "deprecated": False,
@@ -58,6 +64,65 @@ _REGISTRY: list[dict] = [
         "prompt_variant": "v3",
         "is_default": False,
         "deprecated": True,
+    },
+    # ------------------------------------------------------------------
+    # Ollama 官方库对照模型（未微调，供多模型交叉验证 / 对照实验）
+    # 拉取目标 = OLLAMA_MODELS = 项目 models/ollama（启动器锁定），
+    # 与自研模型同目录，探测 / 调用链路完全一致。
+    # ------------------------------------------------------------------
+    {
+        "tag": "gemma4",
+        "full_name": "gemma4",
+        "display_name": "Gemma 4（官方库）",
+        "description": "Google Gemma 4 8B（Ollama 官方库，未微调通用模型）。用于多模型交叉验证；下载到项目 models/ollama。",
+        "prompt_variant": "v3",
+        "is_default": False,
+        "deprecated": False,
+    },
+    {
+        "tag": "gemma4:12b",
+        "full_name": "gemma4:12b",
+        "display_name": "Gemma 4 12B（官方库）",
+        "description": "Google Gemma 4 12B（Ollama 官方库，未微调通用模型）。适合 16GB 以上显存；下载到项目 models/ollama。",
+        "prompt_variant": "v3",
+        "is_default": False,
+        "deprecated": False,
+    },
+    {
+        "tag": "qwen3.5:4b",
+        "full_name": "qwen3.5:4b",
+        "display_name": "Qwen3.5 4B（官方库）",
+        "description": "Qwen3.5 4B（Ollama 官方库，未微调通用模型）。低显存对照选项；下载到项目 models/ollama。",
+        "prompt_variant": "v3",
+        "is_default": False,
+        "deprecated": False,
+    },
+    {
+        "tag": "qwen3.5:9b",
+        "full_name": "qwen3.5:9b",
+        "display_name": "Qwen3.5 9B（官方库）",
+        "description": "Qwen3.5 9B（Ollama 官方库，未微调通用模型）。与 Qwen3-8B 同量级，适合 12GB 以上显存；下载到项目 models/ollama。",
+        "prompt_variant": "v3",
+        "is_default": False,
+        "deprecated": False,
+    },
+    {
+        "tag": "qwen3.5:27b",
+        "full_name": "qwen3.5:27b",
+        "display_name": "Qwen3.5 27B（官方库）",
+        "description": "Qwen3.5 27B（Ollama 官方库，未微调通用模型）。需 24GB 以上显存；下载到项目 models/ollama。",
+        "prompt_variant": "v3",
+        "is_default": False,
+        "deprecated": False,
+    },
+    {
+        "tag": "qwen3.5:35b-a3b",
+        "full_name": "qwen3.5:35b-a3b",
+        "display_name": "Qwen3.5 35B-A3B MoE（官方库）",
+        "description": "Qwen3.5 35B-A3B（MoE，官方库，未微调通用模型）。激活参数少，中等显存可跑；下载到项目 models/ollama。",
+        "prompt_variant": "v3",
+        "is_default": False,
+        "deprecated": False,
     },
 ]
 

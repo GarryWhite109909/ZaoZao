@@ -31,6 +31,69 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 
+# ---------------------------------------------------------------------------
+# 预筛规则统一元数据（全项目唯一来源）
+# ---------------------------------------------------------------------------
+# scanner.py 的短路终判与 two_stage_scanner.py 的候选生成共用本表，
+# 避免两份 rule_name → taint_type / CWE / 风险等级映射漂移。
+PREFILTER_RULE_INFO: dict[str, dict[str, str]] = {
+    "sqli_string_concat": {
+        "taint_type": "SQL Injection",
+        "cwe": "CWE-89 SQL Injection",
+        "risk": "High",
+        "severity": "high",
+    },
+    "sqli_fstring": {
+        "taint_type": "SQL Injection",
+        "cwe": "CWE-89 SQL Injection",
+        "risk": "High",
+        "severity": "high",
+    },
+    "sqli_percent_format": {
+        "taint_type": "SQL Injection",
+        "cwe": "CWE-89 SQL Injection",
+        "risk": "High",
+        "severity": "high",
+    },
+    "cmd_os_system_concat": {
+        "taint_type": "Command Injection",
+        "cwe": "CWE-78 Command Injection",
+        "risk": "Critical",
+        "severity": "critical",
+    },
+    "cmd_subprocess_shell_concat": {
+        "taint_type": "Command Injection",
+        "cwe": "CWE-78 Command Injection",
+        "risk": "Critical",
+        "severity": "critical",
+    },
+    "rce_eval_request": {
+        "taint_type": "Code Injection",
+        "cwe": "CWE-94 Code Injection",
+        "risk": "Critical",
+        "severity": "critical",
+    },
+    "path_traversal_open_concat": {
+        "taint_type": "Path Traversal",
+        "cwe": "CWE-22 Path Traversal",
+        "risk": "High",
+        "severity": "high",
+    },
+    "deser_pickle_loads": {
+        "taint_type": "Insecure Deserialization",
+        "cwe": "CWE-502 Deserialization of Untrusted Data",
+        "risk": "Critical",
+        "severity": "critical",
+    },
+    "deser_yaml_unsafe_load": {
+        "taint_type": "Insecure Deserialization",
+        "cwe": "CWE-502 Deserialization of Untrusted Data",
+        "risk": "High",
+        "severity": "high",
+    },
+}
+
+
 # 需要做"配对括号内查找"的调用起点正则（各规则复用，避免重复编译）
 _CALL_START_PATTERNS = {
     "open": re.compile(r"open\s*\(", re.IGNORECASE),
