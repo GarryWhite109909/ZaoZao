@@ -1567,6 +1567,103 @@ def _models_dir() -> Path:
     return d
 
 
+def _resumable_download(
+    url: str,
+    dest_path: Path,
+    mirror_host: str = "",
+    progress_cb=None,
+    max_retries: int = 5,
+) -> tuple[int, int]:
+    """用 HTTP Range 断点续传下载单个大文件到 dest_path（写入 .incomplete 后缀）。
+
+    与 huggingface_hub / urlopen 相比，这里对断网/超时更稳：
+      - 已下载的字节保存在 dest_path，下次调用从断点（Range: bytes=N-）续传；
+      - 服务器不支持 Range 时自动退回从头下载（覆盖 .incomplete）；
+      - 网络抖动时带退避自动重试，而不是一次失败就整个放弃。
+
+    返回 (downloaded, total)；total<=0 表示无法得知总大小（仍可能下载成功）。
+    下载中途失败会抛出异常，但 .incomplete 文件被保留，下次可续传。
+    """
+    import time as _time
+    import requests as _requests
+
+    incomplete = dest_path.with_name(dest_path.name + ".incomplete")
+    # 镜像域名在 NO_PROXY 中 → 强制直连镜像，不走系统代理（避免代理掐国内大流量）
+    proxies = None
+    no_proxy_all = os.environ.get("NO_PROXY", "") + os.environ.get("no_proxy", "")
+    if mirror_host and mirror_host in no_proxy_all:
+        proxies = {"http": None, "https": None}
+
+    # 已存在的 .incomplete 大小即断点位置
+    resume_from = incomplete.stat().st_size if incomplete.exists() else 0
+    if dest_path.exists():
+        # 旧版可能直写到了最终文件名；兼容续传
+        resume_from = max(resume_from, dest_path.stat().st_size)
+
+    for attempt in range(max_retries + 1):
+        try:
+            # 只对 .incomplete 做续传；最终文件在下载完成后统一移动
+            target = incomplete
+            headers = {"Range": f"bytes={resume_from}-"} if resume_from > 0 else {}
+            resp = _requests.get(
+                url, headers=headers, stream=True,
+                timeout=60, proxies=proxies,
+            )
+            resp.raise_for_status()
+
+            if resp.status_code == 206:
+                downloaded = resume_from
+                total = resume_from + int(resp.headers.get("Content-Length", 0) or 0)
+                mode = "ab"
+            elif resume_from > 0:
+                # 服务器不支持 Range：从头覆盖
+                downloaded = 0
+                total = int(resp.headers.get("Content-Length", 0) or 0)
+                mode = "wb"
+            else:
+                downloaded = 0
+                total = int(resp.headers.get("Content-Length", 0) or 0)
+                mode = "wb"
+
+            with open(target, mode) as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_cb:
+                        progress_cb(downloaded, total)
+
+            # 完整性校验：知道总大小时必须一致，否则视为断档重试
+            if total > 0 and downloaded != total:
+                raise RuntimeError(f"下载不完整: {downloaded}/{total} 字节")
+            # 完成：把 .incomplete 移动为最终文件名（覆盖旧文件）
+            if target.exists():
+                import shutil as _sh
+                _sh.move(str(target), str(dest_path))
+            return downloaded, total
+
+        except Exception as e:  # noqa: BLE001
+            # 记录进度，保留 .incomplete 供下次续传
+            if isinstance(e, RuntimeError) and "下载不完整" in str(e):
+                # 完整性问题：清掉从头来更稳
+                try:
+                    incomplete.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    pass
+                resume_from = 0
+            if attempt >= max_retries:
+                raise
+            wait = min(2 ** attempt, 10)
+            print(
+                f"[resumable] 下载失败({type(e).__name__}: {e})，{wait}s 后重试 "
+                f"({attempt + 1}/{max_retries})，已保留 {incomplete.name} 到断点",
+                flush=True,
+            )
+            _time.sleep(wait)
+    raise RuntimeError("下载失败")
+
+
 @app.get("/api/models/local-resources")
 def models_local_resources():
     """返回进程内后端（transformers/llamacpp）需要的本地资源及下载状态。
@@ -1843,7 +1940,6 @@ async def models_download_gguf(req: GgufDownloadRequest):
     """
     import queue as _q
     import threading
-    from urllib.request import urlopen
 
     url = req.url.strip()
     filename = req.filename.strip()
@@ -1883,44 +1979,38 @@ async def models_download_gguf(req: GgufDownloadRequest):
         try:
             # 规范化裸 socks:// 代理，避免 urllib3 抛 Unknown scheme
             _normalize_socks_proxy()
-            # HuggingFace resolve URL → 复用 huggingface_hub 的 hf_hub_download
-            # （断点续传 + 重试 + 走 HF_MIRROR 镜像），与 transformers 下载同栈，
-            # 避免裸 urlopen 直连 hf-mirror.com 大文件连接超时（WinError 10060）。
+            # 镜像域名强制直连（hf-mirror 为国内镜像，直连最稳；走代理反而秒断）
+            _no_proxy_for_mirrors(urlparse(url).hostname or "")
+            # HuggingFace resolve URL → 用 Range 断点续传下载单个 GGUF 文件
+            # （比 huggingface_hub / urlopen 对断网更稳：断点保留、自动重试、可续传）。
             _hf_match = _HF_RESOLVE_RE.match(urlparse(url).path)
             if _hf_match:
-                def _hf_download(_bypass_proxy: bool) -> str:
-                    # 直连回退时把镜像域名塞进 NO_PROXY，强制不走系统代理；
-                    # 首次（代理优先）保持环境原样，让 hf_hub_download 按
-                    # HTTP_PROXY/HTTPS_PROXY 走代理，失败再回退直连。
-                    if _bypass_proxy:
-                        _no_proxy_for_mirrors(urlparse(url).hostname or "")
-                    os.environ["HF_ENDPOINT"] = HF_MIRROR
-                    from huggingface_hub import hf_hub_download
-                    return hf_hub_download(
-                        repo_id=_hf_match.group("repo"),
-                        filename=_hf_match.group("file"),
-                        local_dir=str(dest_dir),
-                        local_dir_use_symlinks=False,
-                        resume_download=True,
-                        endpoint=HF_MIRROR,
-                        etag_timeout=60,
-                    )
-
                 chunk_queue.put({
                     "status": "downloading",
                     "message": f"正在连接镜像 {HF_MIRROR}…",
                     "pct": 0,
                 })
-                try:
-                    # 强制镜像直连：hf-mirror 为国内镜像，直连最稳。走系统
-                    # socks 代理访问 hf-mirror 反而不稳定（httpx 走代理时
-                    # 报 LocalEntryNotFoundError），故不再"代理优先"。
-                    local = _hf_download(_bypass_proxy=True)
-                except Exception as _e:
-                    # 直连偶发失败，重试一次
-                    print(f"[download-gguf] 镜像直连失败({type(_e).__name__}: {_e})，重试一次", flush=True)
-                    local = _hf_download(_bypass_proxy=True)
-                actual = Path(local)
+                actual = dest_dir / filename
+                last_pct = {"v": -1}
+
+                def _cb(done: int, total: int) -> None:
+                    pct = int(done / total * 100) if total else 0
+                    if pct - last_pct["v"] >= 1 or pct == 100:
+                        last_pct["v"] = pct
+                        chunk_queue.put({
+                            "status": "downloading",
+                            "completed": done,
+                            "total": total,
+                            "pct": pct,
+                            "current_file": filename,
+                        })
+
+                _resumable_download(
+                    url=url,
+                    dest_path=actual,
+                    mirror_host=urlparse(url).hostname or "",
+                    progress_cb=_cb,
+                )
                 total = actual.stat().st_size
                 chunk_queue.put({
                     "status": "downloading",
@@ -1928,34 +2018,27 @@ async def models_download_gguf(req: GgufDownloadRequest):
                     "total": total,
                     "pct": 100,
                 })
-                done_flag["result"] = {"dest": str(actual), "filename": actual.name}
+                done_flag["result"] = {"dest": str(actual), "filename": filename}
                 return
 
-            # 非 HuggingFace URL（如 GitHub 大文件）：回退 urlopen，带重试避免偶发断连
-            with urlopen(url, timeout=60) as resp, open(dest_path, "wb") as f:
-                total = int(resp.headers.get("content-length", 0))
-                downloaded = 0
-                chunk_size = 1024 * 1024  # 1MB
-                last_report = 0
-                while True:
-                    chunk = resp.read(chunk_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    pct = int(downloaded / total * 100) if total else 0
-                    # 每 2% 报告一次，避免队列爆炸
-                    if pct - last_report >= 2 or pct == 100:
-                        chunk_queue.put({
-                            "status": "downloading",
-                            "completed": downloaded,
-                            "total": total,
-                            "pct": pct,
-                        })
-                        last_report = pct
-            # 完整性校验：content-length 与实际字节数不符视为下载失败，避免残缺文件被当作就绪模型
-            if total > 0 and downloaded != total:
-                raise ValueError(f"下载不完整: {downloaded}/{total} 字节")
+            # 非 HuggingFace URL（如 GitHub 大文件）：同样走 Range 断点续传
+            last_report = {"v": -1}
+            def _cb2(done: int, total: int) -> None:
+                pct = int(done / total * 100) if total else 0
+                if pct - last_report["v"] >= 2 or pct == 100:
+                    last_report["v"] = pct
+                    chunk_queue.put({
+                        "status": "downloading",
+                        "completed": done,
+                        "total": total,
+                        "pct": pct,
+                    })
+            _resumable_download(
+                url=url,
+                dest_path=dest_path,
+                mirror_host=urlparse(url).hostname or "",
+                progress_cb=_cb2,
+            )
             done_flag["result"] = {"dest": str(dest_path), "filename": filename}
         except Exception as e:
             done_flag["error"] = f"{type(e).__name__}: {e}"

@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
 from urllib.parse import urlparse
-from urllib.request import ProxyHandler, build_opener, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 # Windows 默认 GBK 控制台：任何会 print 非 GBK 字符的脚本必须重新配置 stdout/stderr
 if sys.platform == "win32":
@@ -1350,6 +1350,63 @@ def _detect_system_proxy() -> str:
     return ""
 
 
+def _resumable_urlopen_download(
+    url: str,
+    dest: Path,
+    opener,
+    progress_emit: Optional[Callable[[int, int], None]] = None,
+    min_speed: int = 0,
+) -> tuple[int, int]:
+    """用 urllib + HTTP Range 断点续传下载单个大文件到 dest。
+
+    已存在的 dest 字节会作为断点（Range: bytes=N-），服务器不支持 Range 时自动从头覆盖。
+    返回 (downloaded, total)。中途失败抛异常，但已下载部分保留在 dest 供下次续传。
+    min_speed>0 时按 8 秒窗口计速，低于该值抛 _SlowMirrorError 以便换源。
+    """
+    resume_from = dest.stat().st_size if dest.exists() else 0
+    headers = {"Range": f"bytes={resume_from}-"} if resume_from > 0 else {}
+    req = Request(url, headers=headers)
+    with opener.open(req, timeout=60) as resp:
+        code = getattr(resp, "status", None) or resp.getcode()
+        if code == 206:
+            downloaded = resume_from
+            total = resume_from + int(resp.headers.get("Content-Length", 0) or 0)
+            mode = "ab"
+        elif resume_from > 0:
+            # 服务器不支持 Range：从头覆盖已存在的残片
+            downloaded = 0
+            total = int(resp.headers.get("Content-Length", 0) or 0)
+            mode = "wb"
+        else:
+            downloaded = 0
+            total = int(resp.headers.get("Content-Length", 0) or 0)
+            mode = "wb"
+        window_started = time.time()
+        window_bytes = 0
+        last_report = time.time()
+        with open(dest, mode) as f:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                window_bytes += len(chunk)
+                now = time.time()
+                if min_speed > 0 and now - window_started >= 8:
+                    speed = window_bytes / (now - window_started)
+                    if speed < min_speed:
+                        raise _SlowMirrorError(
+                            f"下载过慢（{speed:.0f} B/s < {min_speed // 1024}KB/s）"
+                        )
+                    window_started = now
+                    window_bytes = 0
+                if progress_emit and now - last_report >= 2:
+                    progress_emit(downloaded, total)
+                    last_report = now
+    return downloaded, total
+
+
 def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[str], None]] = None) -> Optional[Path]:
     """把 spec.mirror_wheel_url 指定的 GitHub wheel 下载到本地。
 
@@ -1394,35 +1451,25 @@ def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[s
         _emit(f"[依赖安装] 检测到系统代理，直连 GitHub 下载（不经镜像）: {proxy_url}", callback)
         try:
             opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
-            with opener.open(url, timeout=60) as resp, open(dest, "wb") as f:
-                total = int(resp.headers.get("content-length", 0))
-                downloaded = 0
-                last_report = time.time()
-                while True:
-                    chunk = resp.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    # 进度上报：每 2 秒输出一次（下载 536MB 大文件时让用户看到实时进度）
-                    now = time.time()
-                    if now - last_report >= 2:
-                        _emit(
-                            f"[依赖安装] 代理下载中: {downloaded/1024/1024:.1f}MB / {total/1024/1024:.1f}MB"
-                            f" ({downloaded*100/total:.0f}%)"
-                            if total > 0
-                            else f"[依赖安装] 代理下载中: {downloaded/1024/1024:.1f}MB",
-                            callback,
-                        )
-                        last_report = now
+            try:
+                downloaded, total = _resumable_urlopen_download(
+                    url, dest, opener,
+                    progress_emit=lambda d, t: _emit(
+                        f"[依赖安装] 代理下载中: {d/1024/1024:.1f}MB / {t/1024/1024:.1f}MB"
+                        f" ({d*100/t:.0f}%)" if t > 0
+                        else f"[依赖安装] 代理下载中: {d/1024/1024:.1f}MB",
+                        callback,
+                    ),
+                )
+            except _SlowMirrorError:
+                raise
             if total > 0 and downloaded != total:
                 _emit(
-                    f"[依赖安装] ⚠️ 代理下载不完整 {downloaded}/{total} 字节，删缓存并回退 pip 直连",
+                    f"[依赖安装] ⚠️ 代理下载不完整 {downloaded}/{total} 字节，保留残片转镜像重试",
                     callback,
                 )
-                dest.unlink(missing_ok=True)
                 marker.unlink(missing_ok=True)
-                return None
+                raise RuntimeError(f"代理下载不完整 {downloaded}/{total}")
             marker.write_text(str(downloaded), encoding="utf-8")
             _emit(f"[依赖安装] ✅ 代理直连 GitHub 下载完成: {dest}", callback)
             return dest
@@ -1431,7 +1478,7 @@ def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[s
                 f"[依赖安装] ⚠️ 代理直连 GitHub 失败（{type(e).__name__}: {e}），回退走镜像",
                 callback,
             )
-            dest.unlink(missing_ok=True)
+            # 保留 dest 残片（下次经镜像从断点续传），只清完成标记
             marker.unlink(missing_ok=True)
             # 代理失败不立即返回，落到下方镜像逻辑再试
 
@@ -1456,46 +1503,21 @@ def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[s
 
         _emit(f"[依赖安装] 经镜像下载 llama-cpp-python wheel（避免 GitHub 断连）: {mirror_url}", callback)
         try:
-            with urlopen(mirror_url, timeout=60) as resp, open(dest, "wb") as f:
-                total = int(resp.headers.get("content-length", 0))
-                downloaded = 0
-                window_started = time.time()
-                window_bytes = 0
-                last_report = time.time()
-                while True:
-                    chunk = resp.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    # 最低速度监控：以最近的 8 秒窗口计速，低于 50KB/s 视为"慢镜像"，
-                    # 立即中断换下一个（公共 ghproxy 回源大文件经常只有 20KB/s）。
-                    window_bytes += len(chunk)
-                    now = time.time()
-                    if now - window_started >= 8:
-                        speed = window_bytes / (now - window_started)
-                        if speed < WHEEL_MIN_SPEED:
-                            raise _SlowMirrorError(
-                                f"镜像下载过慢（{speed:.0f} B/s < {WHEEL_MIN_SPEED // 1024}KB/s），换下一个"
-                            )
-                        window_started = now
-                        window_bytes = 0
-                    # 进度上报：每 2 秒输出一次
-                    if now - last_report >= 2:
-                        _emit(
-                            f"[依赖安装] 镜像下载中: {downloaded/1024/1024:.1f}MB / {total/1024/1024:.1f}MB"
-                            f" ({downloaded*100/total:.0f}%)"
-                            if total > 0
-                            else f"[依赖安装] 镜像下载中: {downloaded/1024/1024:.1f}MB",
-                            callback,
-                        )
-                        last_report = now
+            downloaded, total = _resumable_urlopen_download(
+                mirror_url, dest, build_opener(),
+                progress_emit=lambda d, t: _emit(
+                    f"[依赖安装] 镜像下载中: {d/1024/1024:.1f}MB / {t/1024/1024:.1f}MB"
+                    f" ({d*100/t:.0f}%)" if t > 0
+                    else f"[依赖安装] 镜像下载中: {d/1024/1024:.1f}MB",
+                    callback,
+                ),
+                min_speed=WHEEL_MIN_SPEED,
+            )
             if total > 0 and downloaded != total:
                 _emit(
-                    f"[依赖安装] ⚠️ 镜像下载不完整 {downloaded}/{total} 字节，换下一个镜像重试",
+                    f"[依赖安装] ⚠️ 镜像下载不完整 {downloaded}/{total} 字节，保留残片换下一个镜像续传",
                     callback,
                 )
-                dest.unlink(missing_ok=True)
                 marker.unlink(missing_ok=True)
                 continue
             marker.write_text(str(downloaded), encoding="utf-8")
@@ -1503,10 +1525,10 @@ def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[s
             return dest
         except Exception as e:
             _emit(
-                f"[依赖安装] ⚠️ 镜像 {prefix} 下载失败（{type(e).__name__}: {e}），换下一个镜像",
+                f"[依赖安装] ⚠️ 镜像 {prefix} 下载失败（{type(e).__name__}: {e}），"
+                f"保留残片换下一个镜像续传",
                 callback,
             )
-            dest.unlink(missing_ok=True)
             marker.unlink(missing_ok=True)
             continue
 
@@ -2408,23 +2430,24 @@ def _download_github_binary(
     _emit(f"[安全工具] 包管理器未提供 {tool}，尝试从 GitHub 下载（{asset_name}）...", callback)
     try:
         # 下载（优先走系统代理，其次直连）
-        from urllib.request import Request
         proxy_url = _detect_system_proxy()
         if proxy_url:
             _emit(f"[安全工具] 使用代理 {proxy_url} 下载 {tool}...", callback)
             opener = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url}))
         else:
             opener = build_opener()
-        req = Request(url, headers={"User-Agent": "vuln-scanner-bootstrap"})
         try:
-            with opener.open(req, timeout=300) as resp, open(tmp_archive, "wb") as f:
-                while True:
-                    chunk = resp.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
+            _resumable_urlopen_download(
+                url, tmp_archive, opener,
+                progress_emit=lambda d, t: _emit(
+                    f"[安全工具] {tool} 下载中: {d/1024/1024:.1f}MB / {t/1024/1024:.1f}MB"
+                    if t > 0 else f"[安全工具] {tool} 下载中: {d/1024/1024:.1f}MB",
+                    callback,
+                ),
+            )
         except Exception as e:
-            _emit(f"[安全工具] ⚠ {tool} 下载失败: {e}", callback)
+            # 保留残片供下次续传
+            _emit(f"[安全工具] ⚠ {tool} 下载失败（{type(e).__name__}: {e}），已保留残片可续传", callback)
             return None
         if not tmp_archive.is_file() or tmp_archive.stat().st_size == 0:
             _emit(f"[安全工具] ⚠ {tool} 下载为空/失败", callback)
