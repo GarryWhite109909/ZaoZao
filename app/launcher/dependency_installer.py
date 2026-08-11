@@ -818,70 +818,63 @@ def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable
                 "可通过设置 VULN_SCANNER_LLAMACPP_CUDA_ARCH=sm_120 指定 CUDA 架构。"
             )
     elif gpu.vendor == "nvidia" and platform_info.os_name == "windows":
-        # Windows + NVIDIA：官方预编译 CUDA wheel，免源码编译 / 免长路径问题。
-        # 默认 CUDA 分支按 GPU 系别自动选择，确保不同显卡拿到匹配的 wheel：
-        #   RTX 50（Blackwell sm_120）→ cu130（官方唯一支持 Blackwell 的 Windows
-        #     索引；cu128/cu129 无 Windows wheel，选了会回退源码编译并在 Windows
-        #     长路径下崩溃）。需驱动 ≥580。
-        #   RTX 20/GTX 16（Turing）→ cu121
-        #   GTX 10（Pascal）→ cu118
-        #   其余 Ampere/Ada/数据中心/未知 → cu125（官方 wheel 覆盖最全，兼容性最好）
-        # 高级用户可用 VULN_SCANNER_LLAMACPP_CUDA_VERSION 显式覆盖。
         family = classify_gpu(gpu).family
-        _default_cuda = {
-            "nvidia_50": "cu130",
-            "nvidia_40": "cu125",
-            "nvidia_30": "cu125",
-            "nvidia_20": "cu121",
-            "nvidia_10": "cu118",
-            "nvidia_dc": "cu125",
-            "nvidia_unknown": "cu125",
-        }.get(family, "cu125")
-        cuda_ver = os.environ.get(
-            "VULN_SCANNER_LLAMACPP_CUDA_VERSION", _default_cuda
-        ).strip().lower()
-        if not cuda_ver.startswith("cu"):
-            cuda_ver = "cu" + cuda_ver
-        ver = os.environ.get("VULN_SCANNER_LLAMACPP_VERSION", "0.3.34").strip()
-        # 主索引指向 abetlen 官方 CUDA wheel，依赖（如 numpy 等）经 extra Pypi 拉取。
-        # 用 --index-url 而非 --extra-index-url，避免同版本 CPU wheel 被 pip 误选。
-        index_url = f"https://abetlen.github.io/llama-cpp-python/whl/{cuda_ver}"
-        extra_index_url = "https://pypi.org/simple"
-        prefer_index_url = True
-        description = f"llama-cpp-python {ver} (CUDA 预编译 {cuda_ver})"
-        packages = [f"llama-cpp-python=={ver}"]
-        # 预编译 wheel 实际在 GitHub Releases，标记镜像 URL：安装前经 ghproxy 下载到本地，
-        # 绕开国内 GitHub 大文件被掐断（ConnectionResetError 10054）的问题。
-        mirror_wheel_url = (
-            f"https://github.com/abetlen/llama-cpp-python/releases/download/"
-            f"v{ver}-{cuda_ver}/llama_cpp_python-{ver}-py3-none-win_amd64.whl"
-        )
-        gpu_probe = (
-            "import llama_cpp; "
-            "print('TRUE' if llama_cpp.llama_supports_gpu_offload() else 'FALSE')"
-        )
-        if cuda_ver in ("cu130", "cu129", "cu128"):
-            warning = (
-                f"预编译索引 {cuda_ver} 需要较新的 NVIDIA 驱动（cu130 需 ≥580）。"
-                f"⚠️ Windows 上 cu130 wheel 依赖 CUDA 13.0 运行时 DLL，"
-                f"但 PyPI 尚未提供 CUDA 13 的 Windows nvidia 运行时包；"
-                f"若未手动安装 CUDA 13.0 Toolkit，安装后 GPU 探测会失败并回退到 CPU。"
-                f"建议先安装 CUDA 13.0 Toolkit（https://developer.nvidia.com/cuda-downloads），"
-                f"或改用 Ollama 后端。"
-            )
-            # 前置探测：系统 PATH 里是否有 CUDA 13 Toolkit 的 bin 目录；
-            # 没有则把警告升级为更明确的提示，避免安装完才报错。
-            if platform_info.os_name == "windows":
-                has_cuda13_bin = any(
-                    (Path(p) / "cudart64_130.dll").is_file()
-                    for p in os.environ.get("PATH", "").split(os.pathsep)
-                    if p.strip()
+        # RTX 50（Blackwell sm_120）在 Windows 上走 cu130 预编译 wheel 时
+        # 频繁触发 0xc000001d（非法指令）——wheel 的 Blackwell kernel 与
+        # 实际驱动/运行时存在兼容性问题。改为默认强制源码编译，显式指定
+        # sm_120，并同时传 GGML_CUDA_ARCHITECTURES 与 CMAKE_CUDA_ARCHITECTURES
+        # 确保 CMake/NVCC 都 targeting Blackwell。用户仍可用环境变量改回预编译。
+        if family == "nvidia_50":
+            arch = os.environ.get("VULN_SCANNER_LLAMACPP_CUDA_ARCH", "sm_120")
+            env = {
+                "CMAKE_ARGS": (
+                    f"-DGGML_CUDA=on -DLLAMA_CUDA=on "
+                    f"-DGGML_CUDA_ARCHITECTURES={arch} "
+                    f"-DCMAKE_CUDA_ARCHITECTURES={arch}"
                 )
-                if not has_cuda13_bin:
-                    warning += (
-                        "\n[本次检测] 未在系统 PATH 中找到 CUDA 13.0 Toolkit 的 bin 目录，"
-                        "将继续安装，但 GPU 探测大概率失败。"
-                    )
+            }
+            description = f"llama-cpp-python (CUDA 源码编译 {arch})"
+            pip_extra_args = ["--no-binary", "llama-cpp-python"]
+            warning = (
+                "RTX 50 系（Blackwell）默认强制源码编译 llama-cpp-python，"
+                "以 targeting sm_120 避免预编译 wheel 的 0xc000001d 非法指令问题。"
+                "需要安装 CUDA 12.8+ Toolkit（含 nvcc）和 Visual Studio Build Tools。"
+                "如需回退预编译 wheel，请设置 VULN_SCANNER_LLAMACPP_CUDA_VERSION=cu130。"
+            )
+        else:
+            # Windows + NVIDIA 非 RTX 50：官方预编译 CUDA wheel，免源码编译。
+            # 默认 CUDA 分支按 GPU 系别自动选择：
+            #   RTX 40/30/数据中心/未知 → cu125
+            #   RTX 20/GTX 16（Turing）→ cu121
+            #   GTX 10（Pascal）→ cu118
+            # 高级用户可用 VULN_SCANNER_LLAMACPP_CUDA_VERSION 显式覆盖。
+            _default_cuda = {
+                "nvidia_40": "cu125",
+                "nvidia_30": "cu125",
+                "nvidia_20": "cu121",
+                "nvidia_10": "cu118",
+                "nvidia_dc": "cu125",
+                "nvidia_unknown": "cu125",
+            }.get(family, "cu125")
+            cuda_ver = os.environ.get(
+                "VULN_SCANNER_LLAMACPP_CUDA_VERSION", _default_cuda
+            ).strip().lower()
+            if not cuda_ver.startswith("cu"):
+                cuda_ver = "cu" + cuda_ver
+            ver = os.environ.get("VULN_SCANNER_LLAMACPP_VERSION", "0.3.34").strip()
+            index_url = f"https://abetlen.github.io/llama-cpp-python/whl/{cuda_ver}"
+            extra_index_url = "https://pypi.org/simple"
+            prefer_index_url = True
+            description = f"llama-cpp-python {ver} (CUDA 预编译 {cuda_ver})"
+            packages = [f"llama-cpp-python=={ver}"]
+            mirror_wheel_url = (
+                f"https://github.com/abetlen/llama-cpp-python/releases/download/"
+                f"v{ver}-{cuda_ver}/llama_cpp_python-{ver}-py3-none-win_amd64.whl"
+            )
+            gpu_probe = (
+                "import llama_cpp; "
+                "print('TRUE' if llama_cpp.llama_supports_gpu_offload() else 'FALSE')"
+            )
     elif gpu.vendor == "nvidia":
         # Linux + NVIDIA：源码编译 CUDA（Linux 无 Windows 长路径问题）
         # 新版 llama.cpp 使用 GGML_CUDA；LLAMA_CUDA 为旧版兼容参数，同时传不冲突
