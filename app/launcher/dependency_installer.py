@@ -791,8 +791,17 @@ def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable
     elif force_source:
         # 强制源码编译：按 GPU 系别给出默认参数
         if gpu.vendor == "nvidia":
-            env = {"CMAKE_ARGS": "-DGGML_CUDA=on -DLLAMA_CUDA=on"}
-            description = "llama-cpp-python (CUDA 源码编译)"
+            family = classify_gpu(gpu).family
+            if family == "nvidia_50":
+                # RTX 50（sm_120，Blackwell）：cu130 无 Windows 预编译且依赖 CUDA 13
+                # 运行时；改用 CUDA 12.8（支持 sm_120 的最低版本）源码编译，
+                # 并显式指定 CUDA arch 为 sm_120，避免 CMake 默认异构导致编译失败。
+                arch = os.environ.get("VULN_SCANNER_LLAMACPP_CUDA_ARCH", "sm_120")
+                env = {"CMAKE_ARGS": f"-DGGML_CUDA=on -DLLAMA_CUDA=on -DGGML_CUDA_ARCHITECTURES={arch}"}
+                description = f"llama-cpp-python (CUDA 源码编译 sm_{arch.replace('sm_','')})"
+            else:
+                env = {"CMAKE_ARGS": "-DGGML_CUDA=on -DLLAMA_CUDA=on"}
+                description = "llama-cpp-python (CUDA 源码编译)"
         elif gpu.vendor == "apple":
             env = {"CMAKE_ARGS": "-DGGML_METAL=on -DLLAMA_METAL=on"}
             description = "llama-cpp-python (Metal 源码编译)"
@@ -802,9 +811,11 @@ def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable
         pip_extra_args = ["--no-binary", "llama-cpp-python"]
         if platform_info.os_name == "windows":
             warning = (
-                "Windows 源码编译 llama-cpp-python 需要启用 Windows 长路径支持，"
-                "否则解压源码时会报 'No such file or directory'（即刚才遇到的错误）；"
-                "并需安装匹配的 CUDA/ROCm/Vulkan 工具链。如非必要请改用预编译 wheel 或 Ollama。"
+                "Windows 源码编译 llama-cpp-python 需要："
+                "1) 启用 Windows 长路径支持（否则解压源码报 'No such file or directory'）；"
+                "2) 安装 Visual Studio Build Tools（含 MSVC C++ 编译器）；"
+                "3) 安装匹配的 CUDA Toolkit（RTX 50 需 CUDA 12.8+，含 nvcc）。"
+                "可通过设置 VULN_SCANNER_LLAMACPP_CUDA_ARCH=sm_120 指定 CUDA 架构。"
             )
     elif gpu.vendor == "nvidia" and platform_info.os_name == "windows":
         # Windows + NVIDIA：官方预编译 CUDA wheel，免源码编译 / 免长路径问题。
