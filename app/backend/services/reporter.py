@@ -11,14 +11,21 @@ from datetime import datetime
 from graduation_project.result_types import BatchResult, SingleResult
 
 
-def render_single_markdown(r: SingleResult) -> str:
-    """单文件结果 → Markdown。"""
+def render_single_markdown(r) -> str:
+    """单文件结果 → Markdown。
+
+    兼容 SingleResult（旧单遍管线）与 TwoStageResult（两阶段管线）：
+    两阶段结果无 duration 属性，用 total_duration 兜底。
+    """
+    duration = getattr(r, "duration", None)
+    if duration is None:
+        duration = getattr(r, "total_duration", 0.0)
     lines = [
         f"# 漏洞分析报告：{r.filename}",
         "",
         f"**生成时间**：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"**语言**：{r.language}",
-        f"**耗时**：{r.duration:.2f}s",
+        f"**耗时**：{duration:.2f}s",
         "",
     ]
 

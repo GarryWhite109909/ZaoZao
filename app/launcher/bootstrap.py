@@ -1627,6 +1627,27 @@ def main():
         auto_confirm=None,  # 按 VULN_SCANNER_AUTO_INSTALL_DEPS 环境变量，默认自动安装
     )
 
+    # 3.5 Semgrep registry 规则本地化（models/semgrep_rules/，离线可用）
+    # 在线 registry 包（p/xxx）每次运行都重新下载、离线不可用，且包名不存在时
+    # 会导致每次扫描联网降级拖慢。这里拉取到项目目录（幂等，缺失才拉取），
+    # external_scanner 随后用 --config <本地 yaml> 完全离线运行。
+    # 需联网/代理：优先读 HTTPS_PROXY/HTTP_PROXY 环境变量。
+    print("[3.5/6] 检查 Semgrep registry 规则本地化...")
+    try:
+        import subprocess as _sp
+        _rules_script = PROJECT_ROOT / "tools" / "fetch_semgrep_rules.py"
+        _r = _sp.run([sys.executable, _rules_script, "--check"],
+                     capture_output=True, text=True, encoding="utf-8", errors="replace",
+                     timeout=120, cwd=os.getcwd())
+        if _r.returncode != 0:
+            print("  Semgrep registry 规则未本地化，尝试拉取（需联网；可设置 HTTPS_PROXY）...")
+            _sp.run([sys.executable, _rules_script],
+                    timeout=300, cwd=os.getcwd())
+        else:
+            print("  Semgrep registry 规则已本地化（models/semgrep_rules/）")
+    except Exception as e:
+        print(f"  Semgrep 规则本地化跳过: {type(e).__name__}: {e}")
+
     # 4. 硬件检测 + 自适应推理参数（在拉取/加载模型前完成，便于后续 scanner.py 读取）
     hardware = detect_hardware()
     config = recommend_config(hardware)

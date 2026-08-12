@@ -53,6 +53,7 @@ from graduation_project.prompts import build_triage_prompt, build_user_prompt
 from graduation_project.schema import normalize_has_vulnerability, parse_verdict
 from graduation_project.cwe_normalizer import normalize_cwe_label
 from graduation_project.code_slicer import CodeSlicer
+from graduation_project.line_normalizer import normalize_line_numbers
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +131,8 @@ class AdjudicationVerdict:
     fix_suggestion: str = ""        # 修复建议
     raw_outputs: list[str] = field(default_factory=list)  # N 次采样原始输出
     finding: Optional[dict] = None  # 关联的候选 finding（含 taint_type/severity/source/sink）
+    decision: str = ""              # 裁决档位（confirmed_vulnerability/dismissed_safe/
+                                    # confirmed_review/dismissed_review/direct）
 
     def to_dict(self) -> dict:
         return {
@@ -142,6 +145,7 @@ class AdjudicationVerdict:
             "fix_suggestion": self.fix_suggestion,
             "raw_outputs": self.raw_outputs,
             "finding": self.finding,
+            "decision": self.decision,
         }
 
 
@@ -163,6 +167,13 @@ class TwoStageResult:
     sink: str = ""                    # 文件级 sink（取已确认裁决 finding 的 sink）
     total_duration: float = 0.0
     error: Optional[str] = None
+    raw_vulnerability_type: str = ""  # 文件级漏洞类型原始输出（与 vulnerability_type 一致，
+                                      # 两阶段没有 LLM 直接输出 CWE 的环节，为前端兼容保留）
+    direct_findings: int = 0          # 直出档 finding（secret/sca）数量
+    prefilter_verdict: Optional[bool] = None   # 兼容前端字段（两阶段 prefilter 不短路，恒为 None）
+    sliced: bool = False              # 兼容前端字段（两阶段切片只用于裁决上下文，非全文件覆盖）
+    chunk_count: int = 1              # 兼容前端字段
+    raw_output: str = ""              # 兼容前端字段（两阶段裁决原始输出在 adjudications 内）
 
     def to_dict(self) -> dict:
         return {
@@ -174,12 +185,20 @@ class TwoStageResult:
             "adjudications": [a.to_dict() for a in self.adjudications],
             "reviewer_findings": self.reviewer_findings,
             "vulnerability_type": self.vulnerability_type,
+            "raw_vulnerability_type": self.raw_vulnerability_type,
             "risk_level": self.risk_level,
             "explanation": self.explanation,
             "fix_suggestion": self.fix_suggestion,
             "source": self.source,
             "sink": self.sink,
             "total_duration": round(self.total_duration, 2),
+            # 兼容字段（与 SingleResult 对齐，供前端/下游通用渲染）
+            "duration": round(self.total_duration, 2),
+            "direct_findings": self.direct_findings,
+            "prefilter_verdict": self.prefilter_verdict,
+            "sliced": self.sliced,
+            "chunk_count": self.chunk_count,
+            "raw_output": self.raw_output,
             "error": self.error,
         }
 
@@ -190,6 +209,13 @@ _CONF_MANUAL = 0.5
 
 # 严重度排序（用于文件级取最高风险 finding）
 _SEV_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "none": 0}
+
+# 外部工具分档（Stage 1 召回维度 → 裁决方式）：
+# - 裁决档（taint/prefilter/sast/iac）：误报率高、真伪难辨，进 LLM 裁决层（A/C 档）
+# - 直出档（secret/sca）：确定性工具自判即可，召回即作为已确认 finding，不消耗 LLM（B 档）
+#   secret=硬编码密钥（gitleaks/detect-secrets），sca=依赖漏洞（trivy fs/pip-audit）
+_ADJUDICATE_CATEGORIES = frozenset({"taint", "prefilter", "sast", "iac"})
+_DIRECT_CATEGORIES = frozenset({"secret", "sca"})
 
 
 # ---------------------------------------------------------------------------
@@ -284,10 +310,15 @@ class TwoStageScanner:
         temperature: 采样温度（>0 保证投票多样性，默认 0.7）。
         keep_alive: 模型卸载策略（透传给 client.generate）。
         num_ctx: 上下文长度（透传）。
-        use_rag: 是否对裁决注入 RAG 上下文（默认 False）。
+        use_rag: 是否对裁决注入 RAG 上下文（None=跟随 VULN_SCANNER_RAG 环境变量）。
         use_semgrep: 是否启用 Semgrep taint 召回（默认 True；未安装自动降级）。
         use_taint_tracker: 是否启用 TaintTracker 召回（默认 True）。
         use_prefilter: 是否启用 Prefilter 召回（默认 True）。
+        use_external: 是否启用外部位置型工具召回（secret/sca/sast/iac，默认 True；
+            未安装的工具自动降级）。secret/sca 直出不裁决，sast/iac 进裁决。
+        no_candidate_mode: 无候选文件的复核策略——"sampled"（默认，10% 抽样
+            LLM 复核，监控工具层漏报率）或 "full_recheck"（每个无候选文件都全量
+            LLM 复核，消除"无证据判安全"的静默放行，供安全关键场景）。
     """
 
     def __init__(
@@ -298,11 +329,13 @@ class TwoStageScanner:
         temperature: float = 0.7,
         keep_alive=0,
         num_ctx: Optional[int] = None,
-        use_rag: bool = False,
+        use_rag: Optional[bool] = None,
         use_semgrep: bool = True,
         use_taint_tracker: bool = True,
         use_prefilter: bool = True,
+        use_external: bool = True,
         sampling_rate: Optional[float] = None,
+        no_candidate_mode: str = "sampled",
     ):
         self.client = client
         self.system_prompt = system_prompt
@@ -310,12 +343,25 @@ class TwoStageScanner:
         self.temperature = temperature
         self.keep_alive = keep_alive
         self.num_ctx = num_ctx or int(os.environ.get("VULN_SCANNER_NUM_CTX", "8192"))
-        self.use_rag = use_rag
+        # RAG 默认跟随环境变量 VULN_SCANNER_RAG（与旧 Scanner 一致）；显式传参优先
+        self.use_rag = (
+            use_rag if use_rag is not None
+            else os.environ.get("VULN_SCANNER_RAG", "0") == "1"
+        )
         self.use_semgrep = use_semgrep
         self.use_taint_tracker = use_taint_tracker
         self.use_prefilter = use_prefilter
+        # 外部位置型工具召回（secret/sca/sast/iac）开关（B/C 档）
+        self.use_external = use_external
+        # 无候选文件的复核策略：
+        #   "sampled"     —— 10% 抽样 LLM 复核（监控工具层漏报率，省算力）
+        #   "full_recheck"—— 每个无候选文件都全量 LLM 复核（消除"无证据判安全"，
+        #                     供 URL/GitHub 等安全关键场景）
+        self.no_candidate_mode = (
+            no_candidate_mode if no_candidate_mode in ("sampled", "full_recheck") else "sampled"
+        )
 
-        self._external = ExternalScanner() if use_semgrep else None
+        self._external = ExternalScanner() if (use_semgrep or use_external) else None
         self._taint_tracker = None
         self._prefilter = Prefilter() if use_prefilter else None
         self._slicer = CodeSlicer(min_lines=150)
@@ -369,7 +415,8 @@ class TwoStageScanner:
         result.stage1 = self._stage1_stats(findings)
         result.stage1["recall_duration"] = round(time.time() - start, 2)
 
-        # 无候选 → 直接判安全，但按比例抽样复核（监控工具层召回漂移）
+        # 无候选 → 判安全但复核：sampled=按比例抽样复核（监控工具层召回漂移）；
+        # full_recheck=全量 LLM 复核（安全关键场景，消除"无证据判安全"的静默放行）
         if not findings:
             recheck = self._maybe_recheck(code, language)
             result.has_vulnerability = False
@@ -377,10 +424,13 @@ class TwoStageScanner:
             if recheck is not None:
                 result.stage1["recheck"] = recheck
                 if recheck.get("has_vulnerability") is True:
-                    # 抽样复核命中：工具层漏报，不直接采信 LLM 也不放行，转人工复核
+                    # 复核命中：工具层漏报，不直接采信 LLM 也不放行，转人工复核
                     result.has_vulnerability = None
                     result.stage1["decision"] = "recheck_hit_review"
-                    result.error = "抽样复核发现疑似漏洞（Stage 1 未召回），需人工复核"
+                    result.error = "复核发现疑似漏洞（Stage 1 未召回），需人工复核"
+                elif recheck.get("has_vulnerability") is False:
+                    # 复核判安全：LLM 全量确认无漏洞，采信为安全（full_recheck 路径）
+                    result.stage1["decision"] = "no_candidate_recheck_safe"
             result.total_duration = time.time() - start
             return result
 
@@ -394,7 +444,7 @@ class TwoStageScanner:
         result.reviewer_findings = reviewer
 
         # 聚合最终结论
-        self._aggregate(result)
+        self._aggregate(result, code=code)
         result.total_duration = time.time() - start
         return result
 
@@ -402,11 +452,17 @@ class TwoStageScanner:
     # Stage 1：工具召回（并行：semgrep taint / taint_tracker / prefilter）
     # ------------------------------------------------------------------
     def _stage1_recall(self, code: str, language: str, filename: str) -> list[ToolFinding]:
-        """并行调用三种工具召回候选 finding，合并去重 + 归一化。"""
+        """并行调用工具层召回候选 finding，合并去重 + 归一化。
+
+        召回维度：
+          - semgrep taint（整文件污点流） + TaintTracker（AST 轻量污点）→ 裁决档
+          - Prefilter（正则高置信命中）→ 裁决档
+          - 外部位置型工具（secret/sca/sast/iac）→ 按 _DIRECT_CATEGORIES 分档
+        """
         findings: list[ToolFinding] = []
 
         # 1) Semgrep taint（整文件，含污点路径）
-        if self._external is not None:
+        if self._external is not None and self.use_semgrep:
             findings.extend(self._semgrep_recall(code, language, filename))
 
         # 2) TaintTracker（AST 轻量污点，交叉验证）
@@ -417,17 +473,30 @@ class TwoStageScanner:
         if self._prefilter is not None:
             findings.extend(self._prefilter_recall(code, language))
 
+        # 4) 外部位置型工具（secret/sca/sast/iac，写临时文件后跑工具子进程）
+        if self._external is not None and self.use_external:
+            findings.extend(self._external_positional_recall(code, language, filename))
+
         return self._dedupe(findings)
 
     def _maybe_recheck(self, code: str, language: str) -> Optional[dict]:
-        """无候选文件的抽样复核：用主扫描 prompt 全量判一次，监控工具层漏报。
+        """无候选文件的 LLM 复核：监控 Stage 1 召回漂移，或全量复核消除静默放行。
 
-        这是 Stage 1 召回率的保险丝——"无候选直判安全"的上限由工具召回率
-        决定，抽样复核给出漏报率的在线估计（见 tool_recall_monitor_snapshot）。
+        - no_candidate_mode="sampled"：按 sampling_rate 抽样（默认 10%），用主扫描
+          prompt 全量判一次，给出工具层漏报率的在线估计（tool_recall_monitor_snapshot）。
+        - no_candidate_mode="full_recheck"：每个无候选文件都复核（采样率视为 1），
+          供 URL/GitHub 等安全关键场景——"无候选"不再直接判安全，先问一次 LLM。
+
+        Returns:
+            {"sampled": True, "has_vulnerability": bool|None}；未抽样时返回 None。
         """
         _monitor_incr("no_candidate_total")
-        if self.sampling_rate <= 0 or random.random() >= self.sampling_rate:
+        if self.no_candidate_mode == "full_recheck":
+            sampled = True
+        elif self.sampling_rate <= 0 or random.random() >= self.sampling_rate:
             return None
+        else:
+            sampled = True
         _monitor_incr("recheck_sampled")
         try:
             resp = self.client.generate(
@@ -451,6 +520,24 @@ class TwoStageScanner:
         """裁决/复核的模型驻留策略：keep_alive=0（每次卸载）在 N 次采样下会
         反复重载模型，延迟巨大；采样突发期内保持驻留（300s 后自动释放）。"""
         return 300 if self.keep_alive in (0, None) else self.keep_alive
+
+    @property
+    def model(self):
+        """当前推理模型名（透传 client，供 CLI/上层打印与展示）。"""
+        for attr in ("model", "model_id"):
+            val = getattr(self.client, attr, None)
+            if val:
+                return val
+        return ""
+
+    def unload(self) -> None:
+        """卸载模型释放显存（透传 client；无此能力的后端静默跳过）。"""
+        fn = getattr(self.client, "unload_model", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception as e:
+                print(f"[TwoStageScanner] 模型卸载失败: {e}")
 
     def _taint_tracker_enabled(self) -> bool:
         if not self.use_taint_tracker:
@@ -561,6 +648,67 @@ class TwoStageScanner:
             ))
         return findings
 
+    def _external_positional_recall(
+        self, code: str, language: str, filename: str,
+    ) -> list[ToolFinding]:
+        """外部位置型工具召回（secret/sca/sast/iac），作为污点/正则召回之外的补充维度。
+
+        与 taint 型召回（source→sink 证据链）不同，这些工具的产出是"文件+行+规则"
+        的位置型发现（ExternalFinding 无 source/sink）。按类别映射到 ToolFinding，
+        空证据候选由 _dedupe 的 rule_id 键分支处理，不与其他 finding 误合并。
+
+        分档：
+          - secret（gitleaks/detect-secrets）、sca（trivy fs/pip-audit）→ 直出档
+            （_DIRECT_CATEGORIES）：确定性工具自判即可，裁决层不消耗 LLM
+          - sast（bandit + semgrep 普通规则）、iac（trivy config）→ 裁决档：
+            误报率高、真伪难辨，进 LLM 裁决（与 taint 候选同规则）
+        """
+        findings: list[ToolFinding] = []
+        suffix = Path(filename).suffix.lower() or (".py" if language == "python" else ".txt")
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=suffix, delete=False, encoding="utf-8"
+            ) as tmp:
+                tmp.write(code)
+                tmp_path = tmp.name
+            # 按类别聚合，避免对同一份代码重复写临时文件
+            groups = {
+                "sast": self._external.scan_sast(tmp_path, language),
+                "secret": self._external.scan_secrets(tmp_path),
+                "sca": self._external.scan_sca(tmp_path),
+                "iac": self._external.scan_iac(tmp_path),
+            }
+        except Exception as e:
+            print(f"[TwoStageScanner] 外部位置型工具召回失败: {e}")
+            return []
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+        for category, items in groups.items():
+            for item in items:
+                sev = (item.severity or "medium").lower()
+                if sev not in _SEV_RANK:
+                    sev = "medium"
+                findings.append(ToolFinding(
+                    rule_id=item.rule_id or f"{item.tool}:unknown",
+                    category=category,
+                    source="",     # 位置型 finding：无 source/sink，留空由裁决层判定
+                    sink="",
+                    taint_type=item.rule_id or item.tool,  # 展示用（裁决档 LLM 关注 rule_id/evidence）
+                    source_line=int(item.line or 0),
+                    sink_line=int(item.line or 0),
+                    path=[],
+                    severity=sev,
+                    tool=item.tool,
+                    evidence=item.message or item.rule_id,
+                ))
+        return findings
+
     @staticmethod
     def _dedupe(findings: list[ToolFinding]) -> list[ToolFinding]:
         """按 (taint_type, normalized_source, normalized_sink) 去重。
@@ -625,8 +773,13 @@ class TwoStageScanner:
     @staticmethod
     def _stage1_stats(findings: list[ToolFinding]) -> dict:
         """统计各工具召回数量（合并项按工具集合拆分计数）。"""
-        counts = {"semgrep": 0, "taint_tracker": 0, "prefilter": 0}
+        counts = {
+            "semgrep": 0, "taint_tracker": 0, "prefilter": 0,
+            "bandit": 0, "semgrep_rules": 0, "gitleaks": 0,
+            "detect-secrets": 0, "trivy": 0, "pip-audit": 0,
+        }
         merged = 0
+        direct = 0
         for f in findings:
             tools = f.tool.split("+")
             if len(tools) > 1:
@@ -634,40 +787,76 @@ class TwoStageScanner:
             for t in tools:
                 if t in counts:
                     counts[t] += 1
+            if f.category in _DIRECT_CATEGORIES:
+                direct += 1
         return {
             "total_candidates": len(findings),
             "by_tool": counts,
             "merged_cross_tool": merged,
+            "direct_findings": direct,  # secret/sca 直出（不裁决）数量
         }
+
+    @staticmethod
+    def _is_direct_category(category: str) -> bool:
+        """该类别 finding 是否走直出（不裁决）：secret/sca 确定性工具自判即可。"""
+        return (category or "") in _DIRECT_CATEGORIES
 
     # ------------------------------------------------------------------
     # Stage 2：LLM 裁决（自一致率）
     # ------------------------------------------------------------------
     def _adjudicate_all(self, findings, code, language, filename, rag_context):
-        """对每个候选 finding 做 N 次采样裁决，返回 (adjudications, reviewer)。"""
+        """对每个候选 finding 做 N 次采样裁决，返回 (adjudications, reviewer)。
+
+        直出档 finding（secret/sca，确定性工具自判）不消耗 LLM 采样：
+        直接生成 confirmed=True 的直出裁决；裁决档（taint/prefilter/sast/iac）
+        照常走 N 采样自一致率裁决。
+        """
         adjudications: list[AdjudicationVerdict] = []
         reviewer: list[dict] = []
         for finding in findings:
-            code_context = self._slice_context(code, language, finding)
-            verdict = self._adjudicate_one(finding, code_context, language, filename, rag_context)
+            if self._is_direct_category(finding.category):
+                verdict = self._direct_adjudication(finding)
+            else:
+                code_context = self._slice_context(code, language, finding)
+                verdict = self._adjudicate_one(finding, code_context, language, filename, rag_context)
             # 关联回源 finding（含 taint_type/severity），供前端逐条展示投票与置信度
             verdict.finding = finding.to_dict()
-            verdict_dict = verdict.to_dict()
-            # 置信度映射到最终结论
-            if verdict.confirmed:
+            # 先定档位再 to_dict，保证 verdict_dict 携带 decision
+            if self._is_direct_category(finding.category):
+                verdict.decision = "direct"  # 直出档：确定性工具自判，无 LLM 采样
+            elif verdict.confirmed:
                 if verdict.confidence >= _CONF_AUTO:
-                    verdict_dict["decision"] = "confirmed_vulnerability"
+                    verdict.decision = "confirmed_vulnerability"
                 else:
-                    verdict_dict["decision"] = "confirmed_review"
-                    reviewer.append(verdict_dict)
+                    verdict.decision = "confirmed_review"
             else:
                 if verdict.confidence >= _CONF_AUTO:
-                    verdict_dict["decision"] = "dismissed_safe"
+                    verdict.decision = "dismissed_safe"
                 else:
-                    verdict_dict["decision"] = "dismissed_review"
-                    reviewer.append(verdict_dict)
+                    verdict.decision = "dismissed_review"
+            verdict_dict = verdict.to_dict()
+            if verdict.decision in ("confirmed_review", "dismissed_review"):
+                reviewer.append(verdict_dict)
             adjudications.append(verdict)
         return adjudications, reviewer
+
+    @staticmethod
+    def _direct_adjudication(finding: ToolFinding) -> AdjudicationVerdict:
+        """直出档 finding 的免 LLM 裁决（secret/sca 确定性工具自判）。
+
+        返回 confirmed=True（投票 1/1、置信度 1.0，等价于高置信确认），
+        但用 decision 显式标注 direct 语义，避免与 LLM 裁决混淆。
+        """
+        return AdjudicationVerdict(
+            confirmed=True,
+            confidence=1.0,
+            votes_true=1,
+            votes_false=0,
+            votes_invalid=0,
+            reasoning=f"确定性工具直出（{finding.tool}）：{finding.evidence}",
+            fix_suggestion="",
+            raw_outputs=[],
+        )
 
     def _slice_context(self, code: str, language: str, finding: ToolFinding) -> str:
         """切片源码，取包含 source/sink 行的所有 chunk 作为裁决上下文。
@@ -761,6 +950,25 @@ class TwoStageScanner:
             raw_outputs.append(text)
             parsed = parse_triage_verdict(text)
             confirmed = _normalize_confirmed(parsed.get("is_confirmed")) if parsed else None
+            # 解析失败兜底：client 支持约束解码（generate_structured）时重试一次，
+            # 消除"裁决输出 JSON 损坏"导致的无效票（与旧 Scanner 的 structured fallback 对齐）
+            if confirmed is None and hasattr(self.client, "generate_structured"):
+                try:
+                    structured_result = self.client.generate_structured(
+                        prompt=prompt,
+                        system_prompt=self.system_prompt,
+                        temperature=self.temperature,
+                        max_tokens=1024,
+                        num_ctx=self.num_ctx,
+                        keep_alive=self._effective_keep_alive(),
+                    )
+                except Exception:
+                    structured_result = {"text": "", "error": "structured retry failed"}
+                s_text = structured_result.get("text", "") if isinstance(structured_result, dict) else ""
+                if not (structured_result.get("error") if isinstance(structured_result, dict) else True) and s_text:
+                    raw_outputs.append(s_text)
+                    parsed = parse_triage_verdict(s_text)
+                    confirmed = _normalize_confirmed(parsed.get("is_confirmed")) if parsed else None
             if confirmed is None:
                 votes_invalid += 1
                 continue
@@ -821,7 +1029,7 @@ class TwoStageScanner:
     # ------------------------------------------------------------------
     # 聚合
     # ------------------------------------------------------------------
-    def _aggregate(self, result: TwoStageResult) -> None:
+    def _aggregate(self, result: TwoStageResult, code: str = "") -> None:
         """根据裁决聚合文件级 has_vulnerability。
 
         规则：
@@ -831,7 +1039,15 @@ class TwoStageScanner:
           → 保守判 None（需复核）
         同时从已确认的裁决中取最高严重度 finding，填充文件级
         vulnerability_type / risk_level（供前端展示真实类型与风险等级）。
+
+        code: 原始源码文本。用于对文件级 fix_suggestion（LLM 产出的行号锚定
+              文本）做行号纠正；source/sink 来自确定性工具层（行号准确），
+              不需要纠正。
         """
+        # 直出档（secret/sca）finding 数量：确定性工具直出，不消耗 LLM 采样
+        result.direct_findings = sum(
+            1 for f in result.findings if self._is_direct_category(f.category)
+        )
         # 文件级漏洞类型/风险：取已确认裁决中严重度最高的 finding
         confirmed = [a for a in result.adjudications if a.confirmed and a.finding]
         if confirmed:
@@ -840,12 +1056,14 @@ class TwoStageScanner:
             sev = ((top.finding or {}).get("severity") or "medium").lower()
             result.risk_level = sev.capitalize()
             taint_type = top.finding.get("taint_type") or ""
+            rule_id = top.finding.get("rule_id") or ""
             # 统一走 CWE 纠正工具（cwe_normalizer）：Path Traversal → CWE-22 路径穿越，
             # 无映射时回退到 taint_type / rule_id，保证与旧管道信息格式一致
             result.vulnerability_type = (
-                normalize_cwe_label(taint_type)
-                or (top.finding.get("rule_id") or "")
+                normalize_cwe_label(taint_type) or rule_id
             )
+            # 原始类型（纠正前）：前端据此展示"工具原始标注 → CWE Normalizer 纠正"过程
+            result.raw_vulnerability_type = taint_type or rule_id
             # 透出已确认裁决的 source/sink/分析/修复到文件级，供前端卡片收起态
             # 直接展示（与旧管道 r.source/r.sink/explanation/fix_suggestion 对齐）
             if not result.explanation:
@@ -856,6 +1074,13 @@ class TwoStageScanner:
                 result.source = top.finding.get("source") or ""
             if not result.sink:
                 result.sink = top.finding.get("sink") or ""
+            # 行号纠正（与旧 Scanner 同思路）：LLM 产出的 fix_suggestion 是
+            # "line N:" 锚定文本，行号容易数错但行文本内容可靠，用内容定位真实行号
+            if (result.fix_suggestion
+                    and result.fix_suggestion not in ("N/A", "no fix needed")
+                    and code):
+                result.fix_suggestion = normalize_line_numbers(
+                    result.fix_suggestion, code)
 
         if not result.adjudications:
             result.has_vulnerability = False
@@ -959,11 +1184,53 @@ if __name__ == "__main__":
     # 4) 端到端聚合：无候选 → 安全（sampling_rate=0 关闭抽样复核，避免自检随机化）
     ts = TwoStageScanner(client=FakeClient(outputs), system_prompt="sys", n_samples=3,
                          use_semgrep=False, use_taint_tracker=False, use_prefilter=False,
-                         sampling_rate=0)
+                         use_external=False, sampling_rate=0)
     r = ts.scan_code('x = 1\nprint(x)', "python", "safe.py")
     ok_safe = r.has_vulnerability is False and r.stage1["decision"] == "no_candidate_safe"
     print(f"[{'PASS' if ok_safe else 'FAIL'}] 无候选判安全: has_vuln={r.has_vulnerability}, "
           f"decision={r.stage1.get('decision')}")
 
-    print("\n", "=== 自检通过 ===" if all([ok_parse, ok_dedupe, ok_adjud, ok_safe])
-          else "=== 存在失败用例 ===")
+    # 5) 直出档裁决：secret/sca finding 不消耗 LLM 采样（直接判真，decision=direct）
+    direct = ToolFinding(rule_id="generic-api-key", category="secret", source="", sink="",
+                         taint_type="generic-api-key", source_line=3, sink_line=3,
+                         severity="high", tool="gitleaks",
+                         evidence="发现疑似 AWS Access Key")
+    d_verdict = ts._adjudicate_all([direct], 'code', "python", "", None)
+    d = d_verdict[0][0]
+    ok_direct = (d.confirmed is True and d.confidence == 1.0
+                 and d.decision == "direct" and d.votes_true == 1)
+    print(f"[{'PASS' if ok_direct else 'FAIL'}] 直出档裁决: confirmed={d.confirmed}, "
+          f"decision={d.decision}")
+
+    # 6) full_recheck 模式：无候选文件全量 LLM 复核（消除"无证据判安全"）。
+    # 复核走主扫描 prompt + 7 字段 verdict 解析，FakeClient 需返回该格式。
+    class FakeVerdictClient:
+        def __init__(self, outputs):
+            self.outputs = outputs
+            self.i = 0
+        def generate(self, **kwargs):
+            out = self.outputs[self.i % len(self.outputs)]
+            self.i += 1
+            return {"text": out, "error": None}
+
+    safe_verdict = '{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None"}'
+    ts2 = TwoStageScanner(client=FakeVerdictClient([safe_verdict]), system_prompt="sys", n_samples=3,
+                          use_semgrep=False, use_taint_tracker=False, use_prefilter=False,
+                          use_external=False, no_candidate_mode="full_recheck")
+    r2 = ts2.scan_code('x = 1\nprint(x)', "python", "safe2.py")
+    ok_full = r2.stage1["decision"] == "no_candidate_recheck_safe"
+    print(f"[{'PASS' if ok_full else 'FAIL'}] full_recheck 复核: decision={r2.stage1.get('decision')}, "
+          f"has_vuln={r2.has_vulnerability}")
+
+    # 7) RAG 默认跟随环境变量 VULN_SCANNER_RAG（不显式传参时）
+    import os as _os
+    _os.environ["VULN_SCANNER_RAG"] = "1"
+    ts_rag = TwoStageScanner(client=FakeClient(outputs), system_prompt="sys")
+    ok_rag_default = ts_rag.use_rag is True
+    _os.environ["VULN_SCANNER_RAG"] = "0"
+    ts_rag_off = TwoStageScanner(client=FakeClient(outputs), system_prompt="sys")
+    ok_rag_default = ok_rag_default and ts_rag_off.use_rag is False
+    print(f"[{'PASS' if ok_rag_default else 'FAIL'}] RAG 默认跟随环境变量: use_rag={ts_rag_off.use_rag}")
+
+    print("\n", "=== 自检通过 ===" if all([ok_parse, ok_dedupe, ok_adjud, ok_safe,
+          ok_direct, ok_full, ok_rag_default]) else "=== 存在失败用例 ===")

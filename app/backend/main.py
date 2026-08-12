@@ -53,6 +53,7 @@ from graduation_project.result_types import SingleResult, BatchResult
 from app.backend.services.model_registry import (
     list_registry,
     get_default_model,
+    get_prompt_for_model,
     is_allowed,
     normalize_ollama_name,
 )
@@ -88,6 +89,45 @@ scanner = Scanner(
     use_rag=os.environ.get("VULN_SCANNER_RAG", "0") == "1",
     use_prefilter=os.environ.get("VULN_SCANNER_PREFILTER", "1") != "0",  # 默认启用预筛
 )
+
+# ---------------------------------------------------------------------------
+# 全局两阶段扫描器（工具召回 + LLM 裁决）——系统唯一扫描路径
+# ---------------------------------------------------------------------------
+# 与 scanner 共享同一个 client / system_prompt / _model_lock（同一推理后端，
+# 避免重复加载模型）。/api/analyze、batch、url、github、report 全部走它；
+# 旧单遍 Scanner 保留为论文"纯 LLM 无工具基线"对照与多模型投票通道。
+# 注意：switch_model 会改写 scanner.system_prompt，调用前经 _two_stage_scan 同步。
+two_stage = TwoStageScanner(
+    client=scanner.client,
+    system_prompt=scanner.system_prompt,
+    keep_alive=scanner.keep_alive,
+    num_ctx=scanner._num_ctx,
+)
+
+
+def _two_stage_scan(
+    code: str,
+    language: str,
+    filename: str,
+    use_rag: Optional[bool] = None,
+    n_samples: Optional[int] = None,
+    no_candidate_mode: Optional[str] = None,
+):
+    """两阶段扫描统一入口。
+
+    复用全局 two_stage 实例（共享 scanner.client），在 scanner._model_lock 内执行
+    （与 switch_model 互斥，避免裁决中途切模型撕裂结果），并同步 switch_model 后的
+    system_prompt（字符串在 switch 时被重新赋值，实例需手动跟随）。
+    """
+    with scanner._model_lock:
+        two_stage.system_prompt = scanner.system_prompt
+        two_stage.client = scanner.client
+        if no_candidate_mode is not None:
+            two_stage.no_candidate_mode = no_candidate_mode
+        return two_stage.scan_code(
+            code=code, language=language, filename=filename,
+            n_samples=n_samples, use_rag=use_rag,
+        )
 
 # ---------------------------------------------------------------------------
 # transformers 后端后台预热（让首次分析立即可用）
@@ -781,13 +821,20 @@ async def _await_scan(future):
 
 @app.post("/api/analyze")
 async def analyze(req: AnalyzeRequest, request: Request):
+    """单文件扫描（两阶段：工具召回 + LLM 裁决）。
+
+    系统默认扫描路径：Stage 1 工具层召回候选 finding（污点流/正则/外部工具），
+    无候选文件按比例抽样或全量复核，有候选文件由 LLM 做 N 采样自一致率裁决。
+    返回 TwoStageResult 结构（顶层字段与旧 SingleResult 对齐，前端通用渲染兼容）。
+    旧单遍 Scanner 仅供论文基线对照与多模型投票通道使用。
+    """
     # 交互式单文件扫描：默认 HIGH 优先级；批量客户端可通过 X-Scan-Scope: batch 降级
     client_id = resolve_client_id(request.headers.get("x-client-type"))
     priority = resolve_priority(request.headers.get("x-scan-scope"), PRIORITY_HIGH)
 
     _, future = scheduler.submit(
         priority, client_id,
-        lambda: scanner.scan_code(
+        lambda: _two_stage_scan(
             code=req.code, language=req.language,
             filename=req.filename, use_rag=req.use_rag,
         ),
@@ -796,7 +843,10 @@ async def analyze(req: AnalyzeRequest, request: Request):
     result, err = await _await_scan(future)
     if err is not None:
         return err
-    return result.to_dict()
+    out = result.to_dict()
+    # 附带工具层召回监控（抽样复核计数），供前端/论文追踪 Stage 1 漏报率
+    out["tool_recall_monitor"] = tool_recall_monitor_snapshot()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -804,37 +854,22 @@ async def analyze(req: AnalyzeRequest, request: Request):
 # ---------------------------------------------------------------------------
 @app.post("/api/analyze/two-stage")
 async def analyze_two_stage(req: TwoStageRequest, request: Request):
-    """两阶段架构扫描：Stage 1 工具召回候选 + Stage 2 LLM 裁决（自一致率）。
+    """两阶段架构扫描（工具召回 + LLM 裁决）。
 
-    与旧 /api/analyze 的"LLM 为主、工具为辅"不同，本端点反转为"工具召回 +
-    LLM 裁决"：只有有候选的少数文件才触发 LLM，且 LLM 只做封闭二分类（判定
-    某 source→sink 证据链真伪），以 N 次采样自一致率作为置信度。
-
-    复用全局 scanner 的 client 与 system_prompt（同一推理后端，避免重复加载
-    模型），走调度器 HIGH 优先级（与旧 analyze 一致，避免抢占串行 Ollama）。
+    与 /api/analyze 同一扫描路径（统一走全局 two_stage），仅保留 n_samples
+    请求级覆盖与 SARIF 导出（GitHub Code Scanning / IDE 原生可消费）。
+    语义不变：Stage 1 工具召回候选 + Stage 2 LLM 自一致率裁决。
     """
     client_id = resolve_client_id(request.headers.get("x-client-type"))
     priority = resolve_priority(request.headers.get("x-scan-scope"), PRIORITY_HIGH)
 
-    def _run():
-        # 与 scan_code 互斥：N 次采样裁决期间不允许 switch_model，
-        # 否则中途切模型会出现"旧 system prompt + 新模型"的撕裂结果
-        with scanner._model_lock:
-            ts = TwoStageScanner(
-                client=scanner.client,
-                system_prompt=scanner.system_prompt,
-                n_samples=req.n_samples,
-                keep_alive=scanner.keep_alive,
-                num_ctx=scanner._num_ctx,
-                use_rag=False,      # 默认关闭；req.use_rag=True 时经 scan_code 参数启用（Chroma 不可用时自动降级）
-            )
-            return ts.scan_code(
-                code=req.code, language=req.language,
-                filename=req.filename, use_rag=req.use_rag,
-            )
-
     _, future = scheduler.submit(
-        priority, client_id, _run,
+        priority, client_id,
+        lambda: _two_stage_scan(
+            code=req.code, language=req.language,
+            filename=req.filename, use_rag=req.use_rag,
+            n_samples=req.n_samples,
+        ),
         description=f"two-stage:{req.filename}",
     )
     result, err = await _await_scan(future)
@@ -902,7 +937,7 @@ async def batch_scan(
             # 每个文件单独入队（LOW），交互式扫描可插队
             _, future = scheduler.submit(
                 PRIORITY_LOW, client_id,
-                lambda fn=filename, lg=lang, cd=code: scanner.scan_code(
+                lambda fn=filename, lg=lang, cd=code: _two_stage_scan(
                     cd, lg, fn, use_rag=rag,
                 ),
                 description=f"batch:{filename}",
@@ -957,14 +992,17 @@ async def _scan_files_scheduled(
 
     批量场景（URL / GitHub / 工作区）每个文件以 LOW 优先级入队，
     交互式扫描（HIGH）可随时插队，避免批量任务饿死单文件请求。
+    URL/GitHub 属于安全关键场景：走 full_recheck（无候选文件也全量 LLM 复核），
+    消除"工具层无候选 → 静默判安全"的漏报风险。
     """
     batch = BatchResult(total_files=len(files))
     batch_start = time.time()
     for filename, language, code in files:
         _, future = scheduler.submit(
             priority, client_id,
-            lambda fn=filename, lg=language, cd=code: scanner.scan_code(
+            lambda fn=filename, lg=language, cd=code: _two_stage_scan(
                 cd, lg, fn, use_rag=use_rag,
+                no_candidate_mode="full_recheck",
             ),
             description=f"scan:{filename}",
         )
@@ -1141,13 +1179,13 @@ async def download_report():
 
 @app.post("/api/report/single")
 async def download_single_report(req: AnalyzeRequest, request: Request):
-    """分析并返回单文件 Markdown 报告（与 /api/analyze 一样走调度器，避免插队）。"""
+    """分析并返回单文件 Markdown 报告（两阶段扫描，与 /api/analyze 同路径）。"""
     client_id = resolve_client_id(request.headers.get("x-client-type"))
     priority = resolve_priority(request.headers.get("x-scan-scope"), PRIORITY_HIGH)
 
     _, future = scheduler.submit(
         priority, client_id,
-        lambda: scanner.scan_code(
+        lambda: _two_stage_scan(
             code=req.code, language=req.language,
             filename=req.filename, use_rag=req.use_rag,
         ),
@@ -1169,10 +1207,12 @@ async def download_single_report(req: AnalyzeRequest, request: Request):
 # ---------------------------------------------------------------------------
 @app.post("/api/external-scan")
 def external_scan(req: ExternalScanRequest):
-    """调用传统安全工具对代码做 SAST/SCA/Secret/IaC 扫描。
+    """调用传统安全工具对代码做 SAST/SCA/Secret/IaC 扫描（纯工具直出，不经 LLM）。
 
-    将粘贴代码写入临时文件后运行 ExternalScanner，未安装的工具静默跳过。
-    返回 ExternalFinding 列表，供前端与 LLM 结果融合展示。
+    注意：此端点是"确定性工具直出"的独立入口，仅供需要原始工具结果（未裁决）
+    的场景使用。系统主扫描（/api/analyze、/api/analyze/two-stage、batch、url、
+    github）已内置同样的工具召回——其中 secret/sca 类 finding 直出、sast/iac
+    类 finding 进 LLM 裁决，无需另行并行调用本端点。
     """
     ext = ExternalScanner()
     suffix = Path(req.filename).suffix.lower() or ".py"
@@ -1313,18 +1353,17 @@ def vllm_analyze(req: VllmAnalyzeRequest):
             status_code=503,
         )
 
-    # 与 /api/analyze 走同一套扫描流水线（预筛/切片/RAG/污点/约束解码兜底），
-    # 仅替换推理后端为 vLLM，避免绕过 Scanner 导致能力不一致。
+    # 与 /api/analyze 走同一套两阶段流水线（工具召回 + LLM 裁决），仅替换推理
+    # 后端为 vLLM，避免绕过 TwoStageScanner 导致能力不一致。
     # 注意：此处有意绕过优先级调度器——调度器是为 Ollama OLLAMA_NUM_PARALLEL=1 的
     # 单并发显存约束设计；vLLM 自带 PagedAttention + continuous batching 高吞吐并发，
     # 直接同步推理即可，不占用 Ollama 队列（避免 vLLM 任务被误排 LOW 拖慢）。
-    vllm_scanner = Scanner(
-        model=vllm_client.model,
+    vllm_two_stage = TwoStageScanner(
         client=vllm_client,
-        use_rag=os.environ.get("VULN_SCANNER_RAG", "0") == "1",
-        use_prefilter=os.environ.get("VULN_SCANNER_PREFILTER", "1") != "0",
+        system_prompt=get_prompt_for_model(vllm_client.model),
+        num_ctx=int(os.environ.get("VULN_SCANNER_NUM_CTX", "6144")),
     )
-    return vllm_scanner.scan_code(
+    return vllm_two_stage.scan_code(
         code=req.code, language=req.language, filename=req.filename,
         use_rag=req.use_rag,
     ).to_dict()

@@ -80,12 +80,17 @@
 
 四类工具并行执行，产出统一的候选 finding 列表：
 
-| 工具 | 职责 | 产出 |
-| --- | --- | --- |
-| **Semgrep（taint mode）** | 单文件内跨函数 source→sink 追踪 | 带完整污点路径的 finding |
-| **TaintTracker（自研）** | AST 级轻量污点分析（Semgrep 的补充与交叉验证） | source→sink 路径 |
-| **Prefilter** | 高置信特征命中 + 明确安全样本放行 | 粗粒度候选/放行信号 |
-| **pip-audit / detect-secrets** | SCA 依赖漏洞 + 硬编码密钥 | 依赖级/密钥级 finding |
+| 工具 | 职责 | 产出 | 裁决方式 |
+| --- | --- | --- | --- |
+| **Semgrep（taint mode）** | 单文件内跨函数 source→sink 追踪 | 带完整污点路径的 finding | 裁决档 |
+| **TaintTracker（自研）** | AST 级轻量污点分析（Semgrep 的补充与交叉验证） | source→sink 路径 | 裁决档 |
+| **Prefilter** | 高置信特征命中 | 粗粒度候选（不短路，只产候选） | 裁决档 |
+| **Bandit / Semgrep 规则** | Python SAST / 多语言 SAST | 位置型 finding（文件+行+规则） | 裁决档（误报率高，真伪难辨） |
+| **Gitleaks / detect-secrets** | 硬编码密钥检测 | 密钥 finding | 直出档 |
+| **Trivy fs / pip-audit** | SCA 依赖漏洞 | 依赖漏洞 finding | 直出档 |
+| **Trivy config** | IaC 配置扫描 | 配置 finding | 裁决档 |
+
+**分档原则**：按"LLM 裁决增益"划分——密钥与依赖漏洞由确定性工具自判即可（数据库判定/高精度规则），召回即作为已确认 finding 直出，不消耗 LLM 采样；污点流、SAST、IaC 类误报率高、真伪依赖语义理解，进入 Stage 2 裁决。这一原则与全系统的哲学一致：**确定性工具能确定的，就别让 LLM 猜**。
 
 **Semgrep taint mode 顺带修复跨 chunk 割裂**：现有缺陷是长文件切片后 chunk A 的 source 与 chunk B 的 sink 被割裂。正确解法不是缝合 chunk，而是**对原始整文件跑一次 Semgrep taint**，将找到的完整污点路径注入对应 chunk 的裁决上下文。OSS 版 Semgrep 的 taint mode 支持单文件内跨函数追踪，无需付费的 Pro interfile 分析。
 
@@ -143,9 +148,12 @@ rules:
 
 统计依据：自一致率是多数表决的软化，与 `multi_model_scanner` 已有多数表决机制同构，基础设施可直接复用——只需把"表决结果"改为"表决比例"输出。
 
-### 3.4 抽样复核：工具层漏报的保险丝
+### 3.4 无候选兜底：抽样复核 + 全量复核双模式
 
-"无候选直接判安全"引入工具层漏报风险。缓解措施：对放行文件做 **5–10% 随机 LLM 复核**，持续监控工具层召回率漂移。复核发现的漏报案例回流为新的 Semgrep 规则/测试样本，形成闭环。
+"无候选直接判安全"引入工具层漏报风险（工具召回是封闭集合，漏洞是开放集合——"没召回"是 absence-of-evidence，不能当作"安全"的证明）。缓解措施分两档：
+
+- **抽样复核（默认）**：对放行文件做 **10% 随机 LLM 复核**（`VULN_SCANNER_RECHECK_RATE` 可调），持续监控工具层召回率漂移（`tool_recall_monitor` 在线估计漏报率）。复核发现的漏报案例回流为新的 Semgrep 规则/测试样本，形成闭环。
+- **全量复核（full_recheck）**：URL / GitHub 等安全关键入口对每个无候选文件都跑一次全量 LLM 复核（`no_candidate_mode="full_recheck"`），彻底消除"无证据判安全"的静默放行；复核判安全才采信，复核发现漏洞则转人工复核。
 
 ### 3.5 结构化输出：SARIF
 

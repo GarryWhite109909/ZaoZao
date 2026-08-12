@@ -37,11 +37,23 @@ _TOOL_TIMEOUT: int = 60  # 每个工具子进程超时（秒）
 _ALL_TOOLS: list[str] = ["bandit", "semgrep", "gitleaks", "trivy",
                          "pip-audit", "detect-secrets"]
 
-# Semgrep 固定规则集（保证 Stage 1 工具层结果可复现；自写 taint 规则文件可追加到此列表）
-_SEMGREP_CONFIGS: list[str] = [
-    "p/security-audit",
-    "p/owasp-top-10",
-]
+# Semgrep 固定规则集（保证 Stage 1 工具层结果可复现）。
+# 优先使用本地化的 registry 规则（models/semgrep_rules/*.yaml，离线可用，
+# 见 tools/fetch_semgrep_rules.py）；本地规则缺失时回退在线 registry 包
+# （需联网，且 p/owasp-top-10 实际不存在、会导致每次运行联网降级拖慢，
+# 正确包名为 p/owasp-top-ten）。自写 taint 规则文件追加到 _TAINT_RULES_DIR。
+def _resolve_semgrep_configs() -> list[str]:
+    """解析 Semgrep 规则配置：本地 yaml 优先，缺失时回退在线 registry。"""
+    from graduation_project.paths import semgrep_local_configs
+    local = semgrep_local_configs()
+    if local:
+        return local
+    # 回退：在线 registry 包（首次联网拉取；owasp-top-10 已在 semgrep.dev 404，
+    # 用正确包名 owasp-top-ten）
+    return ["p/security-audit", "p/owasp-top-ten"]
+
+
+_SEMGREP_CONFIGS: list[str] = _resolve_semgrep_configs()
 
 # 自研 Semgrep taint 规则目录（两阶段架构 Stage 1 召回）。
 # scan_taint() 对本目录下全部 *.yaml 规则做整文件 taint 扫描。

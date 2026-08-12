@@ -264,7 +264,12 @@ Windows 使用 `set` 代替 `export`。选择进程内后端后，启动器会�
 | 选项 | 说明 |
 |------|------|
 | 多模型投票 | 勾选后选择 ≥ 2 个模型，系统顺序加载各模型并投票聚合结果（更准但更慢） |
-| 外部工具扫描 | 勾选后同时调用 Bandit / Semgrep / Gitleaks / Trivy 做传统规则扫描，结果与 LLM 分析融合展示 |
+| 两阶段扫描 | 系统默认扫描路径（默认勾选）：工具召回候选 + LLM 自一致率裁决。关闭后回退旧单遍 LLM 管线（论文基线对照） |
+| 自一致率采样数 | 两阶段 LLM 裁决的采样次数（1~10，默认 5），用于自一致率置信度评估 |
+
+> 外部工具（Bandit / Semgrep / Gitleaks / Trivy）已内置于两阶段 Stage 1 工具召回，
+> 无需单独勾选：密钥（secret）与依赖漏洞（SCA）类发现由确定性工具直接报告，
+> SAST / IaC 类发现进入 LLM 裁决层判定真伪。
 
 #### 结果展示
 
@@ -286,11 +291,12 @@ Windows 使用 `set` 代替 `export`。选择进程内后端后，启动器会�
 |------|------|------|
 | GET | `/api/health` | 健康检查（Ollama + vLLM + 外部工具状态） |
 | GET | `/api/stats` | 仪表盘统计数据 |
-| POST | `/api/analyze` | 单文件分析（JSON body） |
+| POST | `/api/analyze` | 单文件分析（两阶段：工具召回 + LLM 裁决，JSON body） |
+| POST | `/api/analyze/two-stage` | 两阶段扫描（同 `/api/analyze`，保留 n_samples 与 SARIF 导出） |
 | POST | `/api/batch` | 批量扫描（文件上传，NDJSON 流式进度） |
-| POST | `/api/url-scan` | URL 抓取扫描 |
-| POST | `/api/github-scan` | GitHub 仓库扫描 |
-| POST | `/api/external-scan` | 外部工具扫描（Bandit/Semgrep/Gitleaks/Trivy） |
+| POST | `/api/url-scan` | URL 抓取扫描（无候选文件全量复核） |
+| POST | `/api/github-scan` | GitHub 仓库扫描（无候选文件全量复核） |
+| POST | `/api/external-scan` | 外部工具直出扫描（不经 LLM；主扫描已内置同款工具召回，仅需原始结果时用） |
 | POST | `/api/verify-fix` | 修复建议验证（语法校验 + 危险模式检查） |
 | POST | `/api/multi-model-scan` | 多模型投票扫描 |
 | POST | `/api/vllm-analyze` | vLLM 推理后端单文件分析 |
@@ -934,7 +940,7 @@ LLM 单样本推理耗时高于传统工具，但输出包含自然语言解释�
 
 #### 3. 答辩核心故事线
 
-> 传统静态分析工具在 CI/CD 流水线中表现优秀，但面对复杂业务逻辑、绕过式过滤、跨函数污点等场景时力不从心。本系统利用本地部署的开源大语言模型，通过 RAG 知识库增强、AST 代码切片与语义级代码理解建立基线；进一步切换至 Qwen3-8B，先在本地 16GB 消费级 GPU 上通过 QLoRA 快速迭代 SFT（v2~v9）打磨方法、数据与配置，再以 **DeepSeek V4-Flash / Kimi K3 / GLM-5.2 三模型蒸馏**产出 7692 条训练数据，迁移到**云端 A800 GPU bf16 全精度训练**，发布 **v9max** 模型。v9max 将合成集 strict_recall 从 0.459 提升至 0.607、recall 保持 1.000（0 FN），并将真实 CVE-fix recall 从 0.375 大幅提升至 0.950，同时保留了可解释的修复代码与自然语言解释。FPR 偏高（0.423）的收敛作为最终模型 Nivis-alpha.1（DPO/GRPO + 数据飞轮 + CoT 教学）的后继工作。实验证明了 LLM 在代码安全审计中的差异化价值，并验证了"本地探索→云端放大"的消费级 GPU 训练路线。
+> 传统静态分析工具在 CI/CD 流水线中表现优秀，但面对复杂业务逻辑、绕过式过滤、跨函数污点等场景时力不从心。本系统采用**两阶段架构**：Stage 1 工具层（Semgrep 污点流 / AST 轻量污点 / 正则预筛 / 外部密钥·依赖·SAST·IaC 工具）并行召回候选 finding；Stage 2 本地部署的开源大语言模型对候选做封闭二分类裁决（N 次采样自一致率置信度），辅以 RAG 知识库、代码切片与行号纠正。在模型侧，先在本地 16GB 消费级 GPU 上通过 QLoRA 快速迭代 SFT（v2~v9）打磨方法、数据与配置，再以 **DeepSeek V4-Flash / Kimi K3 / GLM-5.2 三模型蒸馏**产出 7692 条训练数据，迁移到**云端 A800 GPU bf16 全精度训练**，发布 **v9max** 模型。v9max 将合成集 strict_recall 从 0.459 提升至 0.607、recall 保持 1.000（0 FN），并将真实 CVE-fix recall 从 0.375 大幅提升至 0.950，同时保留了可解释的修复代码与自然语言解释。FPR 偏高（0.423）的收敛作为最终模型 Nivis-alpha.1（DPO/GRPO + 数据飞轮 + CoT 教学）的后继工作。实验证明了 LLM 在代码安全审计中的差异化价值，并验证了"本地探索→云端放大"的消费级 GPU 训练路线。
 
 ***
 
@@ -980,14 +986,16 @@ LLM 单样本推理耗时高于传统工具，但输出包含自然语言解释�
 | 加速 | **AOTRITON** attention、TunableOp 离线调优 | ROCm/RDNA4 上训练加速 | `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` |
 | 数据工程 | CoT 蒸馏、数据增强、泄漏审计、错题闭环 | 保证训练数据质量与可信度 | `build_dataset.py` / `audit_leakage_precise.py` / `generate_fp_dpo_pairs.py` |
 
-### 6.3 推理层：语义理解增强
+### 6.3 推理层：工具召回 + LLM 裁决（两阶段架构）
 
-| 模块 | 技术 | 说明 |
+| 层 | 技术 | 说明 |
 | --- | --- | --- |
-| 代码预处理 | tree-sitter + Python `ast` | 长文件按函数/块切片，缓解注意力衰减 |
-| 知识检索 | ChromaDB + `all-MiniLM-L6-v2` / `bge-small-en-v1.5` | 72 条 CWE/OWASP 知识，Top-K 注入 prompt |
-| LLM 服务 | Ollama（本地推理）、vLLM/llama.cpp（后续扩展） | 支持多模型横向对比与 teacher logits 预计算 |
-| Prompt 协议 | SYSTEM_PROMPT + 7 字段 JSON schema | 统一输出格式，支持 CoT / 安全白名单 / 自校验 |
+| Stage 1 工具召回 | Semgrep taint（整文件污点流）/ TaintTracker（AST 轻量污点）/ Prefilter（正则）| 并行召回候选 finding，含 source→sink 证据链与行号锚点 |
+| Stage 1 外部工具 | Gitleaks / detect-secrets（密钥）、Trivy fs / pip-audit（依赖）、Bandit / Semgrep 规则（SAST）、Trivy config（IaC）| 位置型发现；secret/sca 直出、sast/iac 进裁决 |
+| Stage 2 LLM 裁决 | 封闭二分类（is_confirmed）+ N 次采样自一致率置信度 | 只对候选 finding 判定真伪，非开放全文生成 |
+| 知识检索 | ChromaDB + `all-MiniLM-L6-v2` / `bge-small-en-v1.5` | 72 条 CWE/OWASP 知识，Top-K 注入裁决 prompt（`VULN_SCANNER_RAG` 控制） |
+| 无候选兜底 | 抽样复核（10%）/ `no_candidate_mode=full_recheck` 全量复核 | 监控工具层漏报率；安全关键场景消除"无证据判安全" |
+| Prompt 协议 | SYSTEM_PROMPT（7 字段）+ triage schema（is_confirmed/reason/fix_suggestion）| 主扫描与裁决层分离；解析失败走约束解码兜底 |
 
 ### 6.4 评估层
 
@@ -1007,11 +1015,11 @@ LLM 单样本推理耗时高于传统工具，但输出包含自然语言解释�
 | 前端界面 | 原生 HTML + Tailwind CSS (`app/backend/static/`) | ✅ 已上线 |
 | 批量扫描 | NDJSON 流式响应 + 前端 SSE 解析 | ✅ 已上线 |
 | 报告导出 | Markdown（`/api/report`、`/api/report/single`） | ✅ 后端已提供，前端待接入下载按钮 |
-| 污点流分析 | 同函数 source→sink 启发式匹配 (`graduation_project/taint_tracker.py`) | ✅ 已集成（默认关闭，可通过 `use_taint_tracking` 开启） |
+| 污点流分析 | 同函数 source→sink 启发式匹配 (`graduation_project/taint_tracker.py`) | ✅ 已集成（两阶段 Stage 1 默认启用） |
 | 修复建议验证 | 语法校验 + 危险模式移除检查 (`graduation_project/fix_verifier.py` + `/api/verify-fix`) | ✅ 已上线 |
-| 外部工具扫描 | Bandit / Semgrep / Gitleaks / Trivy (`graduation_project/external_scanner.py` + `/api/external-scan`) | ✅ 已上线（工具未安装时静默跳过） |
+| 外部工具召回 | Bandit / Semgrep / Gitleaks / Trivy / pip-audit / detect-secrets (`graduation_project/external_scanner.py`，内置于两阶段 Stage 1；`/api/external-scan` 保留为纯直出入口) | ✅ 已集成（工具未安装时静默跳过；secret/sca 直出、sast/iac 进裁决） |
 | 多模型投票 | `/api/multi-model-scan`（顺序加载 ≥2 模型投票聚合） | ✅ 已上线 |
-| vLLM 推理后端 | `/api/vllm-analyze`（OpenAI 兼容 API） | ✅ 已上线 |
+| vLLM 推理后端 | `/api/vllm-analyze`（OpenAI 兼容 API，走两阶段管线） | ✅ 已上线 |
 
 ### 6.6 系统架构（运行时）
 
@@ -1030,14 +1038,19 @@ LLM 单样本推理耗时高于传统工具，但输出包含自然语言解释�
                               ↓
 ┌──────────────────────────────────────────────────────────────┐
 │  核心分析引擎（`graduation_project/`）                          │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐    │
-│  │ AST 切片   │ │ RAG 检索   │ │ 预筛规则   │ │ 轻量污点追踪     │    │
-│  │tree-sitter│ │ Chroma   │ │Prefilter │ │ TaintTracker │    │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────────┘    │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │ Stage 1 工具召回（并行，近零成本）                          │ │
+│  │  Semgrep taint │ TaintTracker │ Prefilter │ 外部工具      │ │
+│  │  （污点流）      （AST 污点）    （正则）    （密钥/依赖/     │ │
+│  │                                │  SAST/IaC）             │ │
+│  └─────────────────────────────────────────────────────────┘ │
 │                              ↓                                │
 │  ┌─────────────────────────────────────────────────────────┐ │
-│  │ LLM 推理：Ollama（默认） / vLLM（可选） / 多模型投票        │ │
+│  │ Stage 2 LLM 裁决（N 次采样自一致率置信度）                   │ │
+│  │  候选 finding → 封闭二分类真伪判定 → 裁决分级               │ │
+│  │  无候选 → 抽样复核 / full_recheck 全量复核                 │ │
 │  └─────────────────────────────────────────────────────────┘ │
+│  辅助：CodeSlicer（裁决上下文切片）│ RAG 检索 │ 行号纠正       │
 └──────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────┐
@@ -1344,6 +1357,14 @@ CI = [center - margin, center + margin]
 ***
 
 ## 故障排查
+
+### Semgrep 规则本地化（离线可用，随仓库分发）
+
+系统使用的 Semgrep registry 规则包（`p/security-audit`、`p/owasp-top-ten`）已本地化为 **`models/semgrep_rules/`** 并随仓库入库（1.7MB 纯文本，MIT 开源，版本固定利于实验可复现）。扫描完全离线运行，克隆仓库即可用，无需联网拉取规则（在线 registry 包无持久缓存、离线不可用）。
+
+- **更新规则**（semgrep 社区更新时手动覆盖）：`python tools/fetch_semgrep_rules.py`（幂等，已存在则跳过；需联网，国内环境可设代理 `HTTPS_PROXY=http://127.0.0.1:7897`）
+- **校验状态**：`python tools/fetch_semgrep_rules.py --check`
+- 规则文件缺失时（如手动删除），`external_scanner` 自动降级为在线拉取（并提示）。
 
 ### 启动相关
 

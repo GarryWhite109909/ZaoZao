@@ -233,3 +233,32 @@ def llamacpp_dir(project_root: Optional[Path] = None) -> Path:
     都落在项目 models/ 分类目录下，避免 GGUF 散落到 models/ 根目录。
     """
     return (project_root or find_project_root()) / "models" / "llamacpp"
+
+
+def semgrep_rules_dir(project_root: Optional[Path] = None) -> Path:
+    """项目内 Semgrep registry 规则目录（models/semgrep_rules）。
+
+    与 models/transformers、models/ollama 等分类目录对齐：Semgrep 的
+    `p/xxx` registry 规则包（security-audit / owasp-top-ten）每次运行都从
+    semgrep.dev 重新下载到临时目录、无持久缓存，且离线不可用。这里把规则
+    主动拉取到项目目录，扫描时用 `--config <本地 yaml>` 完全离线运行，
+    避免每次扫描的联网开销与网络失败降级（曾有 p/owasp-top-10 404 拖慢 50s）。
+
+    结构：
+        models/semgrep_rules/security-audit.yaml
+        models/semgrep_rules/owasp-top-ten.yaml
+    由 tools/fetch_semgrep_rules.py 拉取（幂等，尊重 HTTPS_PROXY 代理）。
+    """
+    return (project_root or find_project_root()) / "models" / "semgrep_rules"
+
+
+def semgrep_local_configs(project_root: Optional[Path] = None) -> list[str]:
+    """项目内已本地化的 Semgrep registry 规则文件（绝对路径）。
+
+    返回 models/semgrep_rules/ 下实际存在的 *.yaml 规则文件列表，
+    供 external_scanner 用 `--config <文件>` 引用（离线可用）。
+    """
+    rules_dir = semgrep_rules_dir(project_root)
+    if not rules_dir.is_dir():
+        return []
+    return [str(p.resolve()) for p in sorted(rules_dir.glob("*.yaml"))]

@@ -103,6 +103,10 @@ def print_single_result(r, verbose: bool = False) -> None:
     """终端打印单文件扫描结果。"""
     risk_key = (r.risk_level or "none").lower()
     color = RISK_COLORS.get(risk_key, RISK_COLORS["none"])
+    # 兼容 SingleResult（duration）与 TwoStageResult（total_duration）
+    duration = getattr(r, "duration", None)
+    if duration is None:
+        duration = getattr(r, "total_duration", 0.0)
 
     if r.error:
         print(f"  {colorize('✗', RED)} {r.filename} — 错误: {r.error}")
@@ -115,7 +119,7 @@ def print_single_result(r, verbose: bool = False) -> None:
     else:
         status = colorize("? 无法判定", "\033[33m")
 
-    print(f"  {status}  {r.filename}  ({r.language}, {r.duration:.2f}s)")
+    print(f"  {status}  {r.filename}  ({r.language}, {duration:.2f}s)")
 
     if r.has_vulnerability is True:
         print(f"     类型: {colorize(r.vulnerability_type, color)}  风险: {colorize(r.risk_level, color)}")
@@ -177,17 +181,30 @@ def save_json(data: dict, output: str | None) -> None:
 
 
 def build_scanner(args: argparse.Namespace):
-    """根据命令行参数构建 Scanner 实例。"""
-    from app.backend.services.scanner import Scanner
+    """根据命令行参数构建两阶段扫描器（工具召回 + LLM 裁决，与后端统一路径）。
+
+    复用 app.backend.services.scanner.Scanner 负责 client 构建（推理后端探测/
+    模型解析），实际扫描走 TwoStageScanner（同一 client，避免重复加载模型）。
+    旧单遍 Scanner 仅供论文基线对照，不作为 CLI 扫描路径。
+    """
+    from app.backend.services.scanner import Scanner as _OldScanner
+    from graduation_project.two_stage_scanner import TwoStageScanner
+    from app.backend.services.model_registry import get_prompt_for_model
 
     model = getattr(args, "model", None) or os.environ.get("VULN_SCANNER_MODEL", DEFAULT_MODEL)
     base_url = getattr(args, "ollama_url", None) or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
     use_rag = getattr(args, "rag", False)
 
-    return Scanner(
+    # 用旧 Scanner 的构建逻辑拿到推理 client（同一后端探测/回退逻辑）
+    _old = _OldScanner(
         model=model,
         base_url=base_url,
         use_rag=use_rag,
+        keep_alive=0,
+    )
+    return TwoStageScanner(
+        client=_old.client,
+        system_prompt=get_prompt_for_model(model),
         keep_alive=0,
     )
 
@@ -225,8 +242,12 @@ def result_to_json(r) -> dict:
 # 命令实现
 # ---------------------------------------------------------------------------
 def cmd_health(args: argparse.Namespace) -> int:
-    """健康检查。"""
-    scanner = build_scanner(args)
+    """健康检查（推理引擎/模型状态，与扫描管线无关）。"""
+    from app.backend.services.scanner import Scanner
+
+    model = getattr(args, "model", None) or os.environ.get("VULN_SCANNER_MODEL", DEFAULT_MODEL)
+    base_url = getattr(args, "ollama_url", None) or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    scanner = Scanner(model=model, base_url=base_url, use_rag=False, keep_alive=0)
     print_header("健康检查")
     health = scanner.check_health()
 
