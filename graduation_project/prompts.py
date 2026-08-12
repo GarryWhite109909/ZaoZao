@@ -191,7 +191,80 @@ ANTI_FP_COT = (
 # 用途：在微调模型（v9max）上对照不同 prompt 策略，实证确定其最优 prompt。
 # 说明：exp_05 的结论（combined 最优）只在 qwen3:8b 基座 + SYSTEM_PROMPT 家族上
 # 成立，未在 v9max 上验证。本函数把候选 prompt 统一暴露给 evaluate.py 做对照。
-EVAL_SYSTEM_VARIANTS = ("base", "combined", "anti_fp_cot")
+EVAL_SYSTEM_VARIANTS = (
+    # ---- 历史独立分支（按时代/来源，全量纳入统一对照） ----
+    "base",              # 最简基线：角色+一句+schema（482字）
+    "lite",              # v5 精简版：角色+6条精简要求+schema（1108字）
+    "anti_fp_cot",       # v9max 减误报 CoT：安全研究员+5步自检（1030字）
+    "zero_shot",         # exp_05 基线：=SYSTEM_PROMPT 角色+要求6条+白名单+硬编码+schema（1981字）
+    "whitelist_only",    # exp_05：角色+范围+白名单+schema（2019字）
+    "cot",               # exp_05：zero_shot + 5步思维链（3348字）
+    "few_shot",          # exp_05：zero_shot + 3示例（4259字）
+    "combined",          # exp_05/训练：=V3_PROMPT zero_shot+CoT+few-shot（4448字）
+    # ---- α0 裁剪消融新变体（2026-08-12）----
+    "short",             # 最简+短CoT，检验"长 prompt→CoT 冗长/复读退化"（767字）
+    "no_rules",          # 去白名单+硬编码规则，检验规则是否已训练内化（3211字）
+    "strict_schema",     # combined+强 JSON 输出约束，救"格式跑偏"（5343字）
+)
+
+
+def _build_short_prompt() -> str:
+    """裁剪变体 short：最简 system prompt（角色 + 一句要求 + schema）。
+
+    检验 B 类假设：长 prompt（4448 字符的 V3_PROMPT）强制长 CoT，在难样本上
+    可能引发"想太多→循环复读打满 max_new_tokens"。极短 prompt 让模型轻装直接
+    给结论，若 short 不掉点且不再复读，则证明长 prompt 是冗余。
+    """
+    return (
+        "你是一名资深代码安全审计专家。分析给定代码片段，判断是否存在安全漏洞。\n"
+        "在回答的最后，必须严格输出一个 JSON 对象作为最终结论，"
+        "JSON 块用 ```json 包裹，字段如下（统一 schema，全项目一致）：\n"
+        + format_schema_for_prompt()
+        + "\n\n请先给出简短分析过程，然后在最后给出 JSON 结论。"
+    )
+
+
+def _build_no_rules_prompt() -> str:
+    """裁剪变体 no_rules：去掉白名单(W)与硬编码规则(H)，保留 角色+要求(A)+CoT(C)+few-shot(F)。
+
+    检验白名单/硬编码规则是否已被训练内化：若 no_rules 与 full 指标几乎一致，
+    说明这些规则已进入模型权重，长 prompt 中的显式规则条文是冗余的（精简空间）。
+    """
+    # CoT 版 SYSTEM_PROMPT：A + W + H + schema + CoT 步骤
+    cot_full = _apply_cot_to_system_prompt(SYSTEM_PROMPT)
+    # 用标题定位，剥离 W 块（【安全模式白名单…】）与 H 块（【硬编码凭证判定标准…】），
+    # 保留 要求(A) 、schema 与 CoT。不能用常量 replace（core 文本与常量字节级有差异）。
+    w_start = cot_full.find("【安全模式白名单")
+    h_end = cot_full.find("在回答的最后")  # schema 起始
+    if w_start != -1 and h_end != -1 and w_start < h_end:
+        base = cot_full[:w_start].rstrip() + cot_full[h_end:]
+    else:
+        base = cot_full  # 兜底：定位失败则原样返回
+    # 修正：要求#3/#6 仍引用"下文「安全模式白名单」/「硬编码凭证判定标准」"，但块已删，补充说明
+    base = base.replace(
+        "代码是否命中下文「安全模式白名单」中的任一安全写法？",
+        "代码是否命中安全写法（参数化查询、列表参数 subprocess、路径校验、转义等）？",
+    )
+    base = base.replace("（详见下文「硬编码凭证判定标准」）", "（字面量凭证即漏洞）")
+    return base + "\n\n" + FEW_SHOT_EXAMPLES
+
+
+def _build_strict_schema_prompt() -> str:
+    """裁剪/防御变体 strict_schema：在 V3_PROMPT（combined）基础上强化 JSON 输出约束。
+
+    救 A 类格式跑偏（hard_cve_02/typical_17/noise_03 分析正确但输出 ```fix 而非 ```json）：
+    显式禁止其它代码块、强制 has_vulnerability 字段、禁止把结论混在修复代码块中。
+    """
+    base = build_system_prompt_variant("combined")
+    schema_tail = format_schema_for_prompt()
+    return base + (
+        "\n\n【输出格式硬性要求（必须遵守）】\n"
+        "1. 最终结论**必须**是一个 ```json 代码块，禁止使用 ```fix、```python、```shell 等其他代码块承载结论。\n"
+        "2. JSON 中**必须**包含 has_vulnerability 字段（true/false），这是最终判定依据。\n"
+        "3. 修复建议/示例代码放在 fix_suggestion 字段的文本内，不要单独输出修复代码块。\n"
+        "4. 分析过程可以简短，但结论 JSON 必须完整、合法、可被 json.loads 解析。\n"
+        "5. JSON schema：\n" + schema_tail
+    )
 
 
 def get_eval_system_prompt(variant: str) -> str:
@@ -208,10 +281,26 @@ def get_eval_system_prompt(variant: str) -> str:
     """
     if variant == "base":
         return BASE_PROMPT
-    if variant == "combined":
-        return build_system_prompt_variant("combined")
+    if variant == "lite":
+        return SYSTEM_PROMPT_LITE
     if variant == "anti_fp_cot":
         return ANTI_FP_COT
+    if variant == "zero_shot":
+        return build_system_prompt_variant("zero_shot")
+    if variant == "whitelist_only":
+        return build_system_prompt_variant("whitelist_only")
+    if variant == "cot":
+        return build_system_prompt_variant("cot")
+    if variant == "few_shot":
+        return build_system_prompt_variant("few_shot")
+    if variant == "combined":
+        return build_system_prompt_variant("combined")
+    if variant == "short":
+        return _build_short_prompt()
+    if variant == "no_rules":
+        return _build_no_rules_prompt()
+    if variant == "strict_schema":
+        return _build_strict_schema_prompt()
     raise ValueError(f"未知评估变体: {variant}（合法值: {EVAL_SYSTEM_VARIANTS}）")
 
 

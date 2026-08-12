@@ -345,8 +345,14 @@ def resolve_adapter_path(checkpoint: str | None, adapter_path: str | None) -> st
     return None
 
 
-def load_model(mode: str, adapter_path: str | None, quantize_4bit: bool, model_id: str = MODEL_ID):
-    """加载模型 + tokenizer。"""
+def load_model(mode: str, adapter_path: str | None, quantize_4bit: bool, model_id: str = MODEL_ID,
+               merge: bool = True):
+    """加载模型 + tokenizer。
+
+    Args:
+        merge: True 时合并 LoRA 进基座（推理快，但 NF4 基座下 LoRA 增量精度有损）；
+            False 时保留 PeftModel 运行时叠加（LoRA FP16 精度最大，推理更慢）。
+    """
     print(f"加载 tokenizer: {model_id}")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -377,8 +383,11 @@ def load_model(mode: str, adapter_path: str | None, quantize_4bit: bool, model_i
     if mode == "finetuned" and adapter_path:
         print(f"加载 LoRA adapter: {adapter_path}")
         model = PeftModel.from_pretrained(model, adapter_path)
-        model = model.merge_and_unload()  # 合并 LoRA 权重加速推理
-        print("LoRA 已合并")
+        if merge:
+            model = model.merge_and_unload()  # 合并 LoRA 权重加速推理
+            print("LoRA 已合并")
+        else:
+            print("不合并 LoRA：保留 PeftModel 运行时叠加（FP16 精度最大，推理更慢）")
 
     model.eval()
     return model, tokenizer
@@ -422,6 +431,58 @@ def generate_response(
     input_len = inputs["input_ids"].shape[1]
     response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
     return response
+
+
+def generate_batch_response(model, tokenizer, messages_list,
+                            max_new_tokens=2048, num_ctx=8192,
+                            temperature=0.0, do_sample=False):
+    """批量生成回复（左 padding 对齐，返回与 generate_response 等价的列表）。
+
+    batch 只改变"几条序列并行解码"，贪心解码下每个序列逐 token argmax，
+    结果与单条逐条算逐 token 一致，准确率不变，仅摊薄权重读取提升功耗/吞吐。
+
+    num_ctx 越小、单批可容纳样本越多；反之须调小 batch。左 padding 下
+    取生成区需按 batch 逐行截断，行间长度可不同。
+    """
+    if not messages_list:
+        return []
+    # 用 apply_chat_template 逐条构造文本（与 generate_response 完全一致）
+    texts = []
+    for messages in messages_list:
+        texts.append(tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
+        ))
+    max_input = max(1, num_ctx - max_new_tokens)
+    old_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    enc = tokenizer(texts, return_tensors="pt", padding=True,
+                    truncation=True, max_length=max_input)
+    tokenizer.padding_side = old_side
+    enc = {k: v.to(model.device) for k, v in enc.items()}
+    gen_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": tokenizer.pad_token_id,
+    }
+    if do_sample and temperature > 0:
+        gen_kwargs["do_sample"] = True
+        gen_kwargs["temperature"] = temperature
+        gen_kwargs["top_p"] = 0.9
+    else:
+        gen_kwargs["do_sample"] = False
+    with torch.no_grad():
+        outputs = model.generate(**enc, **gen_kwargs)
+    padded_len = enc["input_ids"].shape[1]
+    eos = tokenizer.eos_token_id
+    responses = []
+    for i in range(len(messages_list)):
+        row = outputs[i][padded_len:]
+        if eos is not None:
+            pos = (row == eos).nonzero(as_tuple=True)[0]
+            if len(pos) > 0:
+                row = row[:pos[0]]
+        responses.append(tokenizer.decode(row, skip_special_tokens=True))
+    return responses
 
 
 def generate_response_ollama(
@@ -650,6 +711,139 @@ def evaluate(model, tokenizer, manifest_records,
     return results
 
 
+def _run_batch_with_retry(model, tokenizer, grp, num_ctx, temperature, do_sample):
+    """批量生成，OOM 时自动降级一半重试，避免整批被标记 parse_fail。
+
+    返回 (raw_outputs, error)：
+      - raw_outputs: 与 grp 等长的列表（每条 string 或 None）
+      - error: 若整批最终失败（含降级到 1 仍失败），返回错误串；否则 None
+    """
+    cur_batch = len(grp)
+    while cur_batch >= 1:
+        try:
+            msgs = [m for (m, *_ ) in grp[:cur_batch]]
+            out = generate_batch_response(
+                model, tokenizer, msgs,
+                max_new_tokens=2048, num_ctx=num_ctx,
+                temperature=temperature, do_sample=do_sample,
+            )
+            # 补足降级后缺失的位置为 None（调用方会按单条逐条处理）
+            return out + [None] * (len(grp) - cur_batch), None
+        except Exception as e:
+            low = str(e).lower()
+            oom = ("out of memory" in low
+                   or ("cuda" in low and "allocate" in low)
+                   or ("hip" in low and "allocate" in low))
+            if oom and cur_batch > 1:
+                new_batch = cur_batch // 2
+                print(f"  ⚠️ batch={cur_batch} OOM，降级为 batch={new_batch} 重试", flush=True)
+                torch.cuda.empty_cache()
+                cur_batch = new_batch
+                continue
+            # 非 OOM 或已降到 1 仍失败：整批失败
+            return [None] * len(grp), str(e)
+    return [None] * len(grp), "unknown batch error"
+
+
+def evaluate_batched(model, tokenizer, manifest_records,
+                     temperature=0.0, do_sample=False, run_seed=42,
+                     samples_dir=None, batch=4, num_ctx=8192,
+                     system_prompt=None):
+    """批量评估（HF 后端专用）—— 与 evaluate() 输出结构完全一致，仅推理走 batch。
+
+    将样本按 batch 分组，组内并行生成（generate_batch_response），贪心解码
+    结果与单条逐条算逐 token 一致，仅提速不降准确率。不支持 RAG / self-verify
+    （调用方已在 main() 拦截）。
+    """
+    if do_sample and run_seed is not None:
+        torch.manual_seed(run_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(run_seed)
+
+    results = []
+    code_samples_dir = samples_dir if samples_dir is not None else SAMPLES_DIR
+    total = len(manifest_records)
+    # 先构造全部样本的 (消息, 元数据)，再分批推理
+    items = []
+    for rec in manifest_records:
+        filename = rec["file"]
+        language = rec["language"]
+        code = read_sample_code(code_samples_dir, filename)
+        if code is None:
+            print(f"跳过 {filename}（代码不存在）")
+            continue
+        if "crossfile" in filename and filename.endswith("_sink.py"):
+            input_file = filename.replace("_sink.py", "_input.py")
+            input_code = read_sample_code(code_samples_dir, input_file)
+            if input_code:
+                code = f"# 相关代码上下文（同项目另一文件）\n{input_code}\n\n# 待分析的目标代码\n{code}"
+        user_prompt = build_user_prompt(code=code, language=language, filename=filename)
+        messages = [
+            {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        items.append((messages, rec, filename, language, code))
+
+    total = len(items)
+    idx = 0
+    while idx < total:
+        grp = items[idx:idx + batch]
+        t0 = time.time()
+        raw_outputs, batch_error = _run_batch_with_retry(
+            model, tokenizer, grp, num_ctx, temperature, do_sample,
+        )
+
+        for (messages, rec, filename, language, code), raw_output in zip(grp, raw_outputs):
+            expected_present = rec["expected_present"]
+            elapsed = time.time() - t0
+            if raw_output is None:
+                raw_output = f"ERROR: {batch_error}"
+                predicted = None
+                model_vulnerability_type = ""
+                model_fix_suggestion = ""
+            else:
+                verdict = parse_verdict(raw_output)
+                predicted = normalize_has_vulnerability(verdict.get("has_vulnerability") if verdict else None)
+                model_vulnerability_type = verdict.get("vulnerability_type", "") if verdict else ""
+                model_fix_suggestion = verdict.get("fix_suggestion", "") if verdict else ""
+
+            if predicted is None:
+                outcome = "parse_fail"
+            elif predicted == expected_present:
+                outcome = "TP" if expected_present else "TN"
+            else:
+                outcome = "FP" if not expected_present else "FN"
+
+            result = {
+                "file": filename,
+                "language": language,
+                "category": rec.get("category", ""),
+                "difficulty": rec.get("difficulty", ""),
+                "expected_present": expected_present,
+                "model_has_vulnerability": predicted,
+                "predicted": predicted,
+                "model_vulnerability_type": model_vulnerability_type,
+                "model_fix_suggestion": model_fix_suggestion,
+                "original_code": code,
+                "outcome": outcome,
+                "expected_vulnerability": rec.get("expected_vulnerability", ""),
+                "expected_cwe": rec.get("expected_cwe", ""),
+                "raw_output": raw_output,
+                "elapsed_seconds": round(elapsed, 2),
+                "elapsed": round(elapsed, 2),
+                "run_seed": run_seed,
+                "verify_output": None,
+                "verdict_corrected": False,
+                "verify_parse_fail": False,
+                "rag_retrieval": None,
+            }
+            results.append(result)
+            print(f"[{len(results)}/{total}] {filename} → {outcome} ({elapsed:.1f}s)", flush=True)
+        idx += batch
+
+    return results
+
+
 def aggregate_multiseed(all_runs: list[list[dict]]) -> dict:
     """聚合多种子评估结果，返回每个种子的单次指标 + 总体均值±标准差。
 
@@ -717,9 +911,13 @@ def main():
                         help="用 4bit 量化加载（默认启用，7B 需要；--no-4bit 禁用）")
     parser.add_argument("--no-4bit", action="store_false", dest="quantize_4bit",
                         help="禁用 4bit 量化，用 fp16（3B 模型可用）")
+    parser.add_argument("--no-merge", action="store_true",
+                        help="不合并 LoRA，运行时叠加（保留 adapter FP16 精度最大，推理更慢）")
     parser.add_argument("--model-id", type=str, default=MODEL_ID,
                         help=f"基座模型 ID（默认 {MODEL_ID}）")
     parser.add_argument("--limit", type=int, default=0, help="只评估前 N 个样本（0=全部）")
+    parser.add_argument("--start-index", type=int, default=0,
+                        help="从第 N 个样本开始评估（0=从头；>0 用于断点续跑，跳过已评估样本）")
     parser.add_argument("--manifest-path", type=str, default=None,
                         help="指定测试集 manifest 路径（默认 exp_04_hard_samples，可改为 CVE-fix）")
     parser.add_argument("--samples-dir", type=str, default=None,
@@ -755,6 +953,13 @@ def main():
                         help="RAG 检索 Top-K 条知识（默认 3）")
     parser.add_argument("--rag-collection", type=str, default="vulnerability_knowledge",
                         help="Chroma 知识库 collection 名（默认 vulnerability_knowledge，72 条 CWE 规则）")
+    # batch 推理（HF 后端专用，摊薄权重读取提升功耗/吞吐）
+    parser.add_argument("--batch", type=int, default=1,
+                        help="批量推理 batch size（默认 1=单条串行；>1 时 HF 后端按批生成，"
+                             "贪心解码结果与单条完全一致，仅提速不降准确率。16G 显存实测安全值≈4）")
+    parser.add_argument("--batch-num-ctx", type=int, default=8192,
+                        help="batch 模式下上下文窗口 token 数（默认 8192，与 batch_probe 实测对齐；"
+                             "num_ctx 越大单批可容纳样本越少，需相应调小 batch）")
     args = parser.parse_args()
 
     # 解析 adapter 路径
@@ -785,6 +990,9 @@ def main():
     samples_dir = Path(args.samples_dir) if args.samples_dir else None
     print(f"测试集 manifest: {manifest_path}")
     manifest, records = load_manifest(manifest_path)
+    if args.start_index > 0:
+        records = records[args.start_index:]
+        print(f"断点续跑：跳过前 {args.start_index} 个样本，从 index={args.start_index} 开始")
     if args.limit > 0:
         records = records[:args.limit]
     print(f"测试样本: {len(records)} 段")
@@ -803,7 +1011,8 @@ def main():
               f"{' [Qwen3: chat API + think:false]' if is_qwen3 else ''}")
         model, tokenizer = None, None
     else:
-        model, tokenizer = load_model(args.mode, adapter_path, args.quantize_4bit, args.model_id)
+        model, tokenizer = load_model(args.mode, adapter_path, args.quantize_4bit, args.model_id,
+                                      merge=not args.no_merge)
 
     # 多种子评估
     all_runs = []
@@ -825,21 +1034,33 @@ def main():
             rag_cm = None
 
     print(f"\n开始评估（mode={args.mode}, seeds={seed_list}, do_sample={do_sample}, temp={args.temperature}, self_verify={args.self_verify}, rag={rag_cm is not None}）...")
+    # batch 推理仅适用于 HF 后端且未启用 RAG/self-verify（它们依赖逐样本二次交互）
+    use_batch = (args.batch > 1 and not use_ollama and not args.self_verify and rag_cm is None)
+    if args.batch > 1 and not use_batch:
+        print(f"提示：--batch 仅适用于 HF 后端且未启用 RAG/self-verify，已回退单条串行(batch=1)")
     try:
         for run_idx, seed in enumerate(seed_list):
             print(f"\n===== Run {run_idx+1}/{args.seeds} (seed={seed}) =====")
-            run_results = evaluate(
-                model, tokenizer, records,
-                temperature=args.temperature, do_sample=do_sample, run_seed=seed,
-                samples_dir=samples_dir,
-                self_verify=args.self_verify,
-                ollama_num_gpu=args.num_gpu,
-                ollama_num_ctx=args.num_ctx,
-                rag_cm=rag_cm,
-                rag_collection=args.rag_collection,
-                rag_top_k=args.rag_top_k,
-                system_prompt=get_eval_system_prompt(args.variant),
-            )
+            if use_batch:
+                run_results = evaluate_batched(
+                    model, tokenizer, records,
+                    temperature=args.temperature, do_sample=do_sample, run_seed=seed,
+                    samples_dir=samples_dir, batch=args.batch, num_ctx=args.batch_num_ctx,
+                    system_prompt=get_eval_system_prompt(args.variant),
+                )
+            else:
+                run_results = evaluate(
+                    model, tokenizer, records,
+                    temperature=args.temperature, do_sample=do_sample, run_seed=seed,
+                    samples_dir=samples_dir,
+                    self_verify=args.self_verify,
+                    ollama_num_gpu=args.num_gpu,
+                    ollama_num_ctx=args.num_ctx,
+                    rag_cm=rag_cm,
+                    rag_collection=args.rag_collection,
+                    rag_top_k=args.rag_top_k,
+                    system_prompt=get_eval_system_prompt(args.variant),
+                )
             all_runs.append(run_results)
 
         # 用第一个 run 的结果作为"代表"保存（单种子时就是唯一结果）
