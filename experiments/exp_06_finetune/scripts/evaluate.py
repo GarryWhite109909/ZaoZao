@@ -918,6 +918,8 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="只评估前 N 个样本（0=全部）")
     parser.add_argument("--start-index", type=int, default=0,
                         help="从第 N 个样本开始评估（0=从头；>0 用于断点续跑，跳过已评估样本）")
+    parser.add_argument("--only-files", type=str, default=None,
+                        help="只评估指定文件名（逗号分隔，如 a.py,b.py；默认评估全部）用于 FN 冒烟验证")
     parser.add_argument("--manifest-path", type=str, default=None,
                         help="指定测试集 manifest 路径（默认 exp_04_hard_samples，可改为 CVE-fix）")
     parser.add_argument("--samples-dir", type=str, default=None,
@@ -995,6 +997,10 @@ def main():
         print(f"断点续跑：跳过前 {args.start_index} 个样本，从 index={args.start_index} 开始")
     if args.limit > 0:
         records = records[:args.limit]
+    if args.only_files:
+        keep = {f.strip() for f in args.only_files.split(",") if f.strip()}
+        records = [r for r in records if r.get("file") in keep]
+        print(f"--only-files 过滤：仅评估 {len(records)} 段（{args.only_files}）")
     print(f"测试样本: {len(records)} 段")
 
     # 加载模型
