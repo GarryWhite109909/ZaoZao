@@ -118,10 +118,13 @@ def _two_stage_scan(
     复用全局 two_stage 实例（共享 scanner.client），在 scanner._model_lock 内执行
     （与 switch_model 互斥，避免裁决中途切模型撕裂结果），并同步 switch_model 后的
     system_prompt（字符串在 switch 时被重新赋值，实例需手动跟随）。
+
+    2026-08-15 修复：改用 sync_runtime 统一同步——此前反事实验证器
+    （two_stage._counterfactual）在构造时捕获 prompt，切模型后 Layer 2 的翻转
+    判定永远用旧 prompt 跑（client 因原地 mutate 侥幸同对象，prompt 是真 bug）。
     """
     with scanner._model_lock:
-        two_stage.system_prompt = scanner.system_prompt
-        two_stage.client = scanner.client
+        two_stage.sync_runtime(client=scanner.client, system_prompt=scanner.system_prompt)
         if no_candidate_mode is not None:
             two_stage.no_candidate_mode = no_candidate_mode
         return two_stage.scan_code(
@@ -134,14 +137,14 @@ def _two_stage_scan(
 # ---------------------------------------------------------------------------
 # 进程内 transformers 后端默认是"首次扫描才懒加载"（8B NF4 约 6GB、加载约数十秒）。
 # 为免用户等第一次扫描干等，这里在「选完 transformers 且模型资源就绪」后、以及
-# 「基座模型下载完成」后，都主动在后台线程加载基座并合并 LoRA。
+# 「基座模型下载完成」后，都主动在后台线程加载基座与 LoRA adapter。
 # 用 VULN_SCANNER_PRELOAD=0 可关闭预加载。
 _warmup_lock = threading.Lock()
 _warmup_started = False
 
 
 def _trigger_transformers_warmup() -> None:
-    """后台加载 transformers 模型（基座 + 合并 LoRA），幂等、仅触发一次。"""
+    """后台加载 transformers 模型（基座 + LoRA adapter），幂等、仅触发一次。"""
     global _warmup_started
     if os.environ.get("VULN_SCANNER_PRELOAD", "1") == "0":
         return
@@ -287,7 +290,7 @@ app.add_middleware(
 async def _bind_scheduler_loop() -> None:
     """启动时把事件循环绑定到调度器，使其能回填 asyncio.Future 结果。"""
     scheduler.bind_loop(asyncio.get_running_loop())
-    # transformers 后端：若模型资源已就绪，后台预热加载基座并合并 LoRA，使首次分析立即可用
+    # transformers 后端：若模型资源已就绪，后台预热加载基座与 LoRA，使首次分析立即可用
     _trigger_transformers_warmup()
 
 
@@ -528,24 +531,18 @@ def _build_backend_info() -> dict:
             device_type = "未知（未加载）"
 
         q_desc = "推理时将采用 bitsandbytes NF4 4bit 量化基座" if quantize else "推理时基座不量化（FP16/FP32 全精度）"
-        lora_merge = bool(getattr(client, "merge", True))
-        lora_precision = (
-            "FP16（合并进基座，保持 LoRA 精度）" if lora_merge
-            else "FP16（不合并，运行时叠加，精度最高）"
-        )
+        # merge 通道已永久关闭：LoRA 恒以 FP16 精度运行时叠加（不合并），
+        # 此处不再暴露 lora_merge/lora_precision，前端也不展示。
         precision_note = (
             "Transformers 管道：Base 用 bitsandbytes NF4 4bit 量化，LoRA 以 FP16 精度"
-            + ("合并进基座（VULN_SCANNER_MERGE=1，推理更快）。" if lora_merge else
-               "运行时叠加（VULN_SCANNER_MERGE=0，不合并以保留 FP16 LoRA 精度，推理更慢）。")
-            + "只压缩基座，不压缩 LoRA，复现了 G0 冻结集 95% CVE-fix recall 的管道。"
+            "运行时叠加（不合并，保留 FP16 LoRA 精度）。"
+            "只压缩基座，不压缩 LoRA，复现了 G0 冻结集 95% CVE-fix recall 的管道。"
         )
         info.update({
             "model": model_id,
             "adapter_path": adapter,
             "base_quantization": q_desc,
             "lora_quantized": False,
-            "lora_merge": lora_merge,
-            "lora_precision": lora_precision,
             "compute_dtype": compute_dtype,
             "device_type": device_type,
             "num_gpu_layers": num_gpu if num_gpu >= 0 else None,

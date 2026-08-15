@@ -34,8 +34,14 @@ REPO = "graduation-vuln-scanner"
 # ---------------------------------------------------------------------------
 # 已登记模型（未来 Nivis-alpha.1 训练完后在此添加即可）
 # ---------------------------------------------------------------------------
-# 2026-08-09: 模型已统一用 v3 训练数据（final_train_chatml_v3.jsonl）的 CoT prompt
-# 训练，因此所有登记模型的推理 prompt 统一为 V3_PROMPT，不再按模型区分变体。
+# 2026-08-15: α0.5 训练数据（final_train_chatml_alpha05.jsonl）使用 ALPHA05_PROMPT，
+# 因此 α0.5 推理 prompt 切换为 ALPHA05_PROMPT（1467 字符，精简版）。
+# 注意：triage 裁决任务（two_stage_scanner）的 system prompt 由调用方决定，
+# 若使用本注册表默认 prompt，α0.5 在 triage 任务上会看到 ALPHA05_PROMPT（含
+# has_vulnerability schema），但 build_triage_prompt 的 user prompt 显式指定了
+# is_confirmed 格式，模型会优先遵循 user prompt 的显式指令。若实测发现格式
+# 冲突，对 triage 任务单独传入 get_eval_system_prompt("triage_default")。
+# 旧模型（v9max/v5）继续使用 V3_PROMPT，不受影响。
 _REGISTRY: list[dict] = [
     {
         "tag": "alpha0",
@@ -45,6 +51,17 @@ _REGISTRY: list[dict] = [
                        "基于数据口径（8616 条、二次蒸馏 + 全量 combined prompt）推断优于 v9max，待测评证实。",
         "prompt_variant": "v3",
         "is_default": True,
+        "deprecated": False,
+    },
+    {
+        "tag": "alpha05",
+        "full_name": f"{NAMESPACE}/nivis-alpha05",
+        "display_name": "Nivis-α0.5",
+        "description": "Qwen3-8B + rsLoRA(r8) 训练，数据 final_train_chatml_alpha05.jsonl（7953 条，"
+                       "统一 ALPHA05_PROMPT，含盲区/痛点/归因/真实CVE 补充，泄露门禁+审计 PASS）。"
+                       "精简 prompt(1467字) 替代 V3_PROMPT(4448字)，训练/推理一致。",
+        "prompt_variant": "alpha05",
+        "is_default": False,   # α0.5 训练完成并部署到 Ollama 后，再把默认切到此模型
         "deprecated": False,
     },
     {
@@ -131,13 +148,16 @@ def _get_prompt(variant: str) -> str:
     """根据变体名返回对应的 system prompt 文本。"""
     if variant == "v3":
         return V3_PROMPT
+    if variant == "alpha05":
+        from graduation_project.prompts import ALPHA05_PROMPT
+        return ALPHA05_PROMPT
     # 兼容旧配置（环境变量/历史配置仍可能写 lite/base）
     from graduation_project.prompts import BASE_PROMPT, SYSTEM_PROMPT_LITE
     if variant == "lite":
         return SYSTEM_PROMPT_LITE
     if variant == "base":
         return BASE_PROMPT
-    raise ValueError(f"未知 prompt 变体: {variant}（支持 'v3'/'base'/'lite'）")
+    raise ValueError(f"未知 prompt 变体: {variant}（支持 'v3'/'base'/'lite'/'alpha05'）")
 
 
 def list_registry() -> list[dict]:

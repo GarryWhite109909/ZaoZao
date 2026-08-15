@@ -371,12 +371,12 @@ class TransformersClient:
         self.quantize = quantize if not os.environ.get("VULN_SCANNER_QUANTIZE") else (
             os.environ.get("VULN_SCANNER_QUANTIZE", "1") != "0"
         )
-        # merge 开关：默认合并 LoRA 进基座（快、但 LoRA 增量会被折回 NF4 存储）。
-        # 设 VULN_SCANNER_MERGE=0 时不合并，LoRA 保持 FP16 精度、运行时叠加（更保精度）。
-        # ⚠ 不合并时推理会变慢（每层多一次 LoRA 矩阵乘，且单条 decode 本就带宽受限）。
-        self.merge = bool(
-            os.environ.get("VULN_SCANNER_MERGE", "1" if merge else "0") != "0"
-        )
+        # merge 通道已永久关闭：始终不合并 LoRA，运行时叠加（LoRA 保持 FP16 精度，
+        # 复现 G0 冻结集 95% CVE-fix recall 的管道）。
+        # ⚠ 强制 no-merge 的原因：在 NF4 4bit 基座上 merge_and_unload 会把 LoRA 增量
+        #    折回 4bit 存储，导致归因能力显著退化（strict 0.709 → 0.525）。为锁定
+        #    发布口径，VULN_SCANNER_MERGE 环境变量与构造参数 merge 均被忽略。
+        self.merge = False
         self.flash_attn = flash_attn if not os.environ.get("VULN_SCANNER_FLASH_ATTN") else (
             os.environ.get("VULN_SCANNER_FLASH_ATTN", "1") != "0"
         )
@@ -529,16 +529,9 @@ class TransformersClient:
 
             print(f"[TransformersClient] 加载 LoRA adapter: {self.adapter}")
             model = peft["PeftModel"].from_pretrained(model, self.adapter)
-            if self.merge:
-                # 合并 LoRA 权重加速推理（保留 FP16 精度，仅量化基座）。
-                # 注意：合并后归一化权重会折回 NF4 存储，LoRA 增量精度有损。
-                model = model.merge_and_unload()
-                print("[TransformersClient] LoRA 已合并（VULN_SCANNER_MERGE=1 默认）")
-            else:
-                # ⚠ 不合并模式：LoRA 保持 FP16 精度、运行时叠加，推理会变慢。
-                # 设 VULN_SCANNER_MERGE=0 开启；仅在需要极致 LoRA 精度时建议使用。
-                print("[TransformersClient] 不合并 LoRA，运行时叠加（VULN_SCANNER_MERGE=0）")
-                print("       ⚠ 推理会比合并模式更慢（每层多一次 LoRA 矩阵乘）")
+            # merge 通道已永久关闭：始终不合并，运行时叠加以保留 LoRA FP16 精度。
+            print("[TransformersClient] LoRA 运行时叠加（不合并，保留 FP16 精度）")
+            print("       ⚠ 推理比合并模式更慢（每层多一次 LoRA 矩阵乘）")
 
             # torch.compile：默认仅 NVIDIA CUDA 开启（reduce-overhead + CUDA graph）。
             # ROCm/CPU 默认关闭：ROCm 稳定性差，CPU 无收益。

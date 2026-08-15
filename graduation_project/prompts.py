@@ -590,6 +590,65 @@ def _build_triage_default_prompt() -> str:
 V3_PROMPT = _build_combined_prompt()
 
 
+# ---------------------------------------------------------------------------
+# α0.5 精简扫描 prompt —— 训练/推理统一候选
+# ---------------------------------------------------------------------------
+# 设计（2026-08-15 与用户对齐）：保留"角色 + 要求 + schema + 简短 CoT"，
+# 砍掉冗长的白名单/规则条文（这些由训练样本的 CoT 教，不靠 prompt 背），
+# 2-3 个 few-shot 示例放结尾。目标长度 ~800-1500 字符。
+# 用途：α0.5 训练数据统一 system prompt；推理侧是否启用，待 α0.5 训练后
+# 在"精简 vs combined"推理消融中验证（对应 no_rules 假设：规则内化后长 prompt 冗余）。
+# α0.5 精简 schema：只保留字段名 + 核心约束（行号锚定、单字符串、最小局部改正）。
+# 不用全量 format_schema_for_prompt()（630 字符）以控制 prompt 长度在 800-1500。
+# 模型输出格式由训练样本 assistant JSON 完整示范，本 schema 只作提醒。
+_ALPHA05_SCHEMA = (
+    "   - has_vulnerability: bool, true=有漏洞 false=无漏洞\n"
+    "   - vulnerability_type: str, 'CWE-编号 漏洞名'（单个字符串，如 'CWE-89 SQL Injection'）；无漏洞填 'none'\n"
+    "   - risk_level: Critical/High/Medium/Low；无漏洞填 'None'\n"
+    "   - source: str, 行号锚定的污染来源（如 'line 3: request.args.get(\"id\")'）；无漏洞填 'N/A'\n"
+    "   - sink: str, 行号锚定的危险点（如 'line 5: cursor.execute'）；无漏洞填 'N/A'\n"
+    "   - explanation: str, 数据流/成因（用 -> 描述）\n"
+    "   - fix_suggestion: str, 最小局部改正：只给应修改的具体行+改法即可（单行、行号须真实存在、禁止输出完整代码/补丁/代码块）；无漏洞填 'no fix needed'"
+)
+
+
+def _build_alpha05_prompt() -> str:
+    return (
+        "你是一名安全研究员，分析给定代码是否存在安全漏洞。\n\n"
+        "要求：\n"
+        "1. 仅用户可控输入到达危险 sink 才算漏洞；sink 前有有效防御（参数化/列表参数/白名单/转义）则判安全。\n"
+        "2. 硬编码字面量凭证（key/secret/password/token）本身就是漏洞。\n"
+        "3. 不得捏造代码中不存在的 API 参数或行为；JSON 结论须与分析一致。\n\n"
+        "分析步骤：\n"
+        "1. 找用户可控输入点，追踪其是否到达危险 sink（execute/system/open/eval 等）。\n"
+        "2. 检查防御是否有效，给出 CWE 编号与风险等级。\n\n"
+        "在回答最后，必须严格输出一个 JSON 对象作为最终结论，JSON 块用 ```json 包裹，字段如下：\n"
+        + _ALPHA05_SCHEMA
+        + "\n\n"
+        "【示例 1｜漏洞：SQL 注入】\n"
+        "```python\n"
+        "def query(user):\n"
+        "    cur.execute(\"SELECT * FROM users WHERE name='\" + user + \"'\")\n"
+        "```\n"
+        "分析：user 可控且未参数化，可注入。\n"
+        "```json\n"
+        "{\"has_vulnerability\": true, \"vulnerability_type\": \"CWE-89 SQL Injection\", \"risk_level\": \"Critical\", \"source\": \"line 2: user 参数\", \"sink\": \"line 2: cur.execute 拼接 SQL\", \"explanation\": \"user -> 拼接 SQL -> 注入\", \"fix_suggestion\": \"line 2: 改用参数化查询\"}\n"
+        "```\n\n"
+        "【示例 2｜安全：参数化查询】\n"
+        "```python\n"
+        "def query(user):\n"
+        "    cur.execute(\"SELECT * FROM users WHERE name=?\", (user,))\n"
+        "```\n"
+        "分析：参数化查询自动转义，无注入风险。\n"
+        "```json\n"
+        "{\"has_vulnerability\": false, \"vulnerability_type\": \"none\", \"risk_level\": \"None\", \"source\": \"N/A\", \"sink\": \"N/A\", \"explanation\": \"参数化查询已正确防护\", \"fix_suggestion\": \"no fix needed\"}\n"
+        "```\n"
+    )
+
+
+ALPHA05_PROMPT = _build_alpha05_prompt()
+
+
 def build_system_prompt_variant(variant: str) -> str:
     """根据变体名返回对应的 system prompt。
 
@@ -646,6 +705,21 @@ _TRIAGE_SCHEMA = """\
 {"is_confirmed": true/false, "vulnerability_type": "CWE-xxx 或漏洞类型名（is_confirmed=true 时必填，须基于代码实际分析而非工具标注）", "reason": "...", "fix_suggestion": "..."}
 """
 
+# 候选来源可信度标注（2026-08-15 防锚定）：同一份错误提示，Q4 后端 0/3 全票
+# 否决、bf16 后端 3/0 全票确认——"全票但错"说明模型对工具锚点过度顺从。
+# 应对：不是全局降低服从性（高信任污点链本该采信），而是**条件性服从**——
+# 低信任位置型规则（无数据流证据链）显式标注"可能是错的"，要求独立判定。
+# （与 two_stage_scanner 的确定性证据门互补：prompt 管推理层，证据门管聚合层）
+_TRUST_NOTES = {
+    "sast": "⚠ 此告警来自位置型规则（无 source→sink 数据流证据链），历史误报率高——"
+            "它的类型标注与可疑位置都可能是错的，请完全基于你自己的代码分析独立判定，"
+            "不要顺着工具标注的方向走。",
+    "iac": "⚠ 此告警来自位置型规则（无 source→sink 数据流证据链），历史误报率高——"
+           "它的类型标注与可疑位置都可能是错的，请完全基于你自己的代码分析独立判定。",
+    "prefilter": "（此告警来自正则规则命中，可信度中等，请独立核验数据流）",
+    "taint": "（此告警带有 source→sink 污点链证据，可信度较高）",
+}
+
 
 def build_triage_prompt(
     finding,
@@ -680,8 +754,10 @@ def build_triage_prompt(
     source_line = getattr(finding, "source_line", 0)
     sink_line = getattr(finding, "sink_line", 0)
     severity = getattr(finding, "severity", "medium")
+    category = getattr(finding, "category", "")
     path_chain = getattr(finding, "path", None) or []
     evidence = getattr(finding, "evidence", "")
+    trust_note = _TRUST_NOTES.get(category, "")
 
     # 传播链：source -> ... -> sink
     if path_chain:
@@ -697,7 +773,10 @@ def build_triage_prompt(
     parts.append("")
     parts.append("可疑数据流：")
     parts.append(f"- 规则: {rule_id}")
-    parts.append(f"- 漏洞类型: {taint_type}")
+    if trust_note:
+        parts.append(f"- 来源可信度: {trust_note}")
+    parts.append(f"- 漏洞类型: {taint_type}（工具猜测，仅供参考——若确认漏洞，"
+                 "vulnerability_type 必须来自你自己的分析）")
     parts.append(f"- 严重度: {severity}")
     parts.append(f"- 污染源: {source}  (line {source_line})")
     parts.append(f"- 危险点: {sink}  (line {sink_line})")
@@ -727,7 +806,10 @@ def build_triage_prompt(
                  "不是命令注入；被 int()/float() 转换后的数值插值不是 XSS；"
                  "render/render_template 的 kwargs 值插值（autoescape 开启）不是模板注入。")
     parts.append("4. 严禁捏造代码中不存在的 API 参数或行为；判定必须基于代码实际内容。")
-    parts.append("5. 若判定为真漏洞，输出 is_confirmed=true 并给出简洁 reason 与修复建议；否则 is_confirmed=false。")
+    parts.append("5. 漏洞类型独立判定：工具标注的漏洞类型/规则名是模式匹配的猜测，可能完全"
+                 "错误（如把鉴权缺失标成 XSS）。你确认漏洞后，vulnerability_type 必须基于"
+                 "你自己的代码分析给出（如鉴权缺失是 CWE-862，不是工具标的类型）。")
+    parts.append("6. 若判定为真漏洞，输出 is_confirmed=true 并给出简洁 reason 与修复建议；否则 is_confirmed=false。")
     parts.append("")
     parts.append("请先给出简短分析过程，然后在回答最后输出如下 JSON：")
     parts.append("```json")
