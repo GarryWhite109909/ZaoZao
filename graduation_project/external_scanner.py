@@ -622,11 +622,17 @@ class ExternalScanner:
     def _run_trivy_fs(self, path: str) -> list[ExternalFinding]:
         """运行 Trivy fs（SCA 依赖漏洞扫描）。
 
-        命令：trivy fs --format json <path>
+        命令：trivy fs --skip-db-update --format json <path>
         输出 JSON 含 Results 数组，每项含 Target / Vulnerabilities 数组。
         每个 Vulnerability 含 VulnerabilityID / Severity / Title / PkgName。
+
+        注意：必须带 --skip-db-update（离线，与 TRIVY_SKIP_DB_UPDATE 环境变量等价）——
+        trivy 首次运行联网下载漏洞库（约 100MB），无代理直连不通时会卡满 _TOOL_TIMEOUT。
+        漏洞库已随部署拉取到 ~/.cache/trivy/db（2026-08-13），离线扫描即可。
         """
-        out = self._run_subprocess(["trivy", "fs", "--format", "json", path])
+        out = self._run_subprocess(
+            ["trivy", "fs", "--skip-db-update", "--format", "json", path]
+        )
         if not out or not out.strip():
             return []
         try:
@@ -653,11 +659,17 @@ class ExternalScanner:
     def _run_trivy_config(self, path: str) -> list[ExternalFinding]:
         """运行 Trivy config（IaC 配置扫描）。
 
-        命令：trivy config --format json <path>
+        命令：trivy config --skip-policy-update --format json <path>
         输出 JSON 含 Results 数组，每项含 Target / Misconfigurations 数组 /
         CauseMetadata.StartLine。每个 Misconfiguration 含 ID / Severity / Message。
+
+        注意：必须带 --skip-policy-update（离线）——trivy config 每次启动都会联网
+        下载策略包（policy bundle），无代理直连不通时卡满 _TOOL_TIMEOUT（60s）。
+        2026-08-14 实测：带该参数 0.4s，不带 60.1s（一个样本白等 60 秒的根因）。
         """
-        out = self._run_subprocess(["trivy", "config", "--format", "json", path])
+        out = self._run_subprocess(
+            ["trivy", "config", "--skip-policy-update", "--format", "json", path]
+        )
         if not out or not out.strip():
             return []
         try:

@@ -63,6 +63,7 @@ _MONITOR = {
     "no_candidate_total": 0,    # 无候选直判安全的文件数
     "recheck_sampled": 0,       # 其中被抽样复核的次数
     "recheck_vuln_found": 0,    # 抽样复核发现工具层漏报的次数
+    "recheck_vuln_trusted": 0,  # 其中被 LLM 语义兜底采信为漏洞的次数（自适应闭环）
 }
 _MONITOR_LOCK = threading.Lock()
 
@@ -133,6 +134,9 @@ class AdjudicationVerdict:
     finding: Optional[dict] = None  # 关联的候选 finding（含 taint_type/severity/source/sink）
     decision: str = ""              # 裁决档位（confirmed_vulnerability/dismissed_safe/
                                     # confirmed_review/dismissed_review/direct）
+    vulnerability_type: str = ""    # 模型校正后的真实漏洞类型（is_confirmed 时输出）
+    conformal_set: str = ""         # 共形预测三分类（vulnerable/safe/uncertain）
+    counterfactual: Optional[dict] = None  # 反事实扰动验证结果（Layer 2）
 
     def to_dict(self) -> dict:
         return {
@@ -146,6 +150,9 @@ class AdjudicationVerdict:
             "raw_outputs": self.raw_outputs,
             "finding": self.finding,
             "decision": self.decision,
+            "vulnerability_type": self.vulnerability_type,
+            "conformal_set": self.conformal_set,
+            "counterfactual": self.counterfactual,
         }
 
 
@@ -209,6 +216,11 @@ _CONF_MANUAL = 0.5
 
 # 严重度排序（用于文件级取最高风险 finding）
 _SEV_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "none": 0}
+
+# 低信任候选类别（第 2.5 代）：位置型规则无语境证据链，是"工具提示不到点上→误导"
+# 的重灾区（bandit B 系列 / semgrep 普通规则 / trivy iac）。对它们的共形=vulnerable
+# 判定，须再过反事实验证（扰动不翻转 → 降级），防止"工具误报 + 模型全票被带偏"。
+_LOW_TRUST_CATEGORIES = frozenset({"sast", "iac"})
 
 # 外部工具分档（Stage 1 召回维度 → 裁决方式）：
 # - 裁决档（taint/prefilter/sast/iac）：误报率高、真伪难辨，进 LLM 裁决层（A/C 档）
@@ -336,6 +348,10 @@ class TwoStageScanner:
         use_external: bool = True,
         sampling_rate: Optional[float] = None,
         no_candidate_mode: str = "sampled",
+        trust_llm_recheck: bool = True,
+        use_conformal: bool = True,
+        use_signal_feedback: bool = True,
+        use_counterfactual: bool = True,
     ):
         self.client = client
         self.system_prompt = system_prompt
@@ -360,6 +376,37 @@ class TwoStageScanner:
         self.no_candidate_mode = (
             no_candidate_mode if no_candidate_mode in ("sampled", "full_recheck") else "sampled"
         )
+        # 自适应闭环（决策记录见 docs/方法论_工具模型自适应闭环.md）：
+        # 无候选复核判 True 时采信 LLM（语义兜底），而非转人工 review。
+        # 论文消融对比需关闭此开关复现旧行为。
+        self.trust_llm_recheck = trust_llm_recheck
+        # 第 2.5 代：共形预测门控（统计保证的置信度）+ 信号注册表（信任分级回填）
+        # 默认启用；论文消融可关闭（--no-signal-feedback 对应）。
+        self.use_conformal = use_conformal
+        self.use_signal_feedback = use_signal_feedback
+        self.use_counterfactual = use_counterfactual
+        self._conformal = None
+        self._signal_registry = None
+        self._counterfactual = None
+        if use_conformal:
+            try:
+                from graduation_project.conformal import ConformalPredictor
+                self._conformal = ConformalPredictor(alpha=0.1)
+            except Exception as e:
+                print(f"[TwoStageScanner] 共形预测器初始化失败（降级自一致率）: {e}")
+        if use_signal_feedback:
+            try:
+                from graduation_project.signal_registry import get_signal_registry
+                self._signal_registry = get_signal_registry()
+            except Exception as e:
+                print(f"[TwoStageScanner] 信号注册表初始化失败（降级无回填）: {e}")
+        if use_counterfactual:
+            try:
+                from graduation_project.counterfactual import CounterfactualVerifier
+                self._counterfactual = CounterfactualVerifier(
+                    client=client, system_prompt=system_prompt, num_ctx=self.num_ctx)
+            except Exception as e:
+                print(f"[TwoStageScanner] 反事实验证器初始化失败（降级无扰动验证）: {e}")
 
         self._external = ExternalScanner() if (use_semgrep or use_external) else None
         self._taint_tracker = None
@@ -424,10 +471,19 @@ class TwoStageScanner:
             if recheck is not None:
                 result.stage1["recheck"] = recheck
                 if recheck.get("has_vulnerability") is True:
-                    # 复核命中：工具层漏报，不直接采信 LLM 也不放行，转人工复核
-                    result.has_vulnerability = None
-                    result.stage1["decision"] = "recheck_hit_review"
-                    result.error = "复核发现疑似漏洞（Stage 1 未召回），需人工复核"
+                    if self.trust_llm_recheck:
+                        # 自适应闭环（方法论_工具模型自适应闭环.md 决策点 2）：工具层
+                        # 漏召（无候选）由 LLM 语义兜底，复核判 True 即采信为漏洞。
+                        # 依据：16 个工具盲区样本纯 LLM 判定正确 15/16——模型天然会，
+                        # 架构不应把模型能力锁死在工具之下。保留"漏召"标记供召回监控。
+                        result.has_vulnerability = True
+                        result.stage1["decision"] = "no_candidate_recheck_vuln"
+                        _monitor_incr("recheck_vuln_trusted")
+                    else:
+                        # 旧行为（保守）：复核命中转人工复核，不直接采信
+                        result.has_vulnerability = None
+                        result.stage1["decision"] = "recheck_hit_review"
+                        result.error = "复核发现疑似漏洞（Stage 1 未召回），需人工复核"
                 elif recheck.get("has_vulnerability") is False:
                     # 复核判安全：LLM 全量确认无漏洞，采信为安全（full_recheck 路径）
                     result.stage1["decision"] = "no_candidate_recheck_safe"
@@ -443,10 +499,87 @@ class TwoStageScanner:
         result.adjudications = adjudications
         result.reviewer_findings = reviewer
 
+        # Layer 2：反事实扰动验证（判中且高置信的 finding 施加防御扰动，验裁决翻转）
+        if self._counterfactual is not None and code:
+            self._counterfactual_pass(adjudications, code, language, filename)
+
         # 聚合最终结论
         self._aggregate(result, code=code)
         result.total_duration = time.time() - start
         return result
+
+    @staticmethod
+    def _infer_taint_type(finding: dict) -> str:
+        """推断 finding 的漏洞类型（反事实验证选防御模板用）。
+
+        优先取 taint_type；sast/iac 位置型候选的 taint_type 是 rule_id（如 "B602"），
+        从 rule_id/evidence 关键词推断真实类型（subprocess/os.system→命令注入，
+        execute/拼接→SQL，return f-string→XSS，open→路径穿越，from_string→SSTI）。
+        """
+        tt = (finding.get("taint_type") or "")
+        text = " ".join(str(x) for x in [
+            finding.get("taint_type"), finding.get("rule_id"),
+            finding.get("evidence"), finding.get("message"),
+        ] if x).lower()
+        # 语义类型名（如 "Command Injection"）直接用；规则号/长路径（B602、
+        # models.semgrep_rules.xxx）是工具内部标识，须按关键词推断真实类型。
+        is_semantic = tt and not re.fullmatch(r"B\d+|[\w.]+", tt) and " " in tt.strip()
+        if is_semantic and tt.lower() not in ("unknown", "detected"):
+            return tt
+        if "subprocess" in text or "os.system" in text or "command" in text \
+                or re.search(r"B60[2347]", text):
+            return "Command Injection"
+        if "execute" in text or "sql" in text or re.search(r"B608|B609", text):
+            return "SQL Injection"
+        if "format-string" in text or "html" in text or "xss" in text or "innerhtml" in text:
+            return "XSS"
+        if "open(" in text or "path" in text or "traversal" in text:
+            return "Path Traversal"
+        if "from_string" in text or "template" in text or "ssti" in text:
+            return "Server-Side Template Injection"
+        if "pickle" in text or "deserial" in text:
+            return "Insecure Deserialization"
+        return tt
+
+    def _counterfactual_pass(self, adjudications, code, language, filename) -> None:
+        """对高置信判中的 finding 做反事实扰动验证（Layer 2）。
+
+        触发条件（方案 1，防"工具误报+模型全票被带偏"）：
+          - 低信任类别（sast/iac 位置型规则，无语境证据链）：判中即触发（防
+            safe_08/safe_17 类——工具候选是误报、模型全票判中）。
+          - 高信任类别（taint/prefilter，有 source→sink 证据链）：仅共形=uncertain
+            时触发（报告二§四：共形筛不确定 → 反事实验证），高置信不重复验证。
+        扰动后裁决翻转 → 模型理解防御（真阳性）；不变 → 模式匹配（标记存疑）。
+        验证结果写回 adjudication.counterfactual，供聚合/回填决策使用。
+        """
+        for verdict in adjudications:
+            f = verdict.finding or {}
+            category = (f.get("category") or "")
+            low_trust = category in _LOW_TRUST_CATEGORIES
+            if not verdict.confirmed:
+                continue
+            if low_trust:
+                # 低信任类别（sast/iac 位置型规则）：confirmed 即触发反事实验证
+                # （不限置信度——低置信确认正是"模型没把握"最该验证的，safe_17 类
+                # format-string T2/F1 全靠它拦截）
+                pass
+            elif verdict.confidence >= _CONF_AUTO and verdict.conformal_set == "uncertain":
+                pass  # 高信任高置信 + 共形不确定：反事实验证
+            else:
+                continue  # 高信任且共形非不确定：不重复验证
+            taint_type = self._infer_taint_type(f)
+            sink_line = int(f.get("sink_line") or 0)
+            if not taint_type or sink_line <= 0:
+                continue
+            def _build_prompt(perturbed_code: str, language: str) -> str:
+                from graduation_project.prompts import build_user_prompt
+                return build_user_prompt(code=perturbed_code, language=language)
+            result = self._counterfactual.verify(
+                code=code, language=language, taint_type=taint_type,
+                sink_line=sink_line, build_prompt=_build_prompt,
+            )
+            if result.applicable:
+                verdict.counterfactual = result.to_dict()
 
     # ------------------------------------------------------------------
     # Stage 1：工具召回（并行：semgrep taint / taint_tracker / prefilter）
@@ -573,6 +706,15 @@ class TwoStageScanner:
 
         findings: list[ToolFinding] = []
         for item in raw:
+            evidence = item.get("evidence", "")
+            # P0.3/P0.4：给裁决层附加 sink/source 行上下文证据，使 LLM 能判断
+            # source 是否真用户可控（常量拼接）、sink 参数是否数值插值（int/float）。
+            # semgrep OSS taint JSON 不含 source/sink 元数据，行号=start 行=sink 行，
+            # 只能取 sink 行附近的真实代码供裁决参考；TaintTracker 路径已精确，
+            # 不需要此上下文。
+            ctx = self._line_context(code, int(item.get("sink_line", 0) or 0))
+            if ctx and item.get("tool") == "semgrep":
+                evidence = (evidence + "\n[sink 行上下文]\n" + ctx).strip()
             findings.append(ToolFinding(
                 rule_id=item.get("rule_id", "semgrep-taint"),
                 category="taint",  # semgrep taint 与 taint_tracker 同属污点召回
@@ -584,9 +726,26 @@ class TwoStageScanner:
                 path=list(item.get("path", []) or []),
                 severity=item.get("severity", "medium"),
                 tool=item.get("tool", "semgrep"),
-                evidence=item.get("evidence", ""),
+                evidence=evidence,
             ))
         return findings
+
+    @staticmethod
+    def _line_context(code: str, line: int, radius: int = 3) -> str:
+        """提取指定行前后 radius 行的代码文本（1-indexed），供裁决层判断 source 有效性。
+
+        用于 semgrep 这类只报 sink 行的工具：把 sink 行附近的真实代码（含可能
+        的常量赋值/数值转换/转义调用）交给 LLM，结合 build_triage_prompt 的判定
+        要求（source 有效性 / 数值插值），消解工具规则无语境匹配造成的误报。
+        """
+        if line <= 0 or not code:
+            return ""
+        lines = code.splitlines()
+        if line > len(lines):
+            return ""
+        lo = max(0, line - 1 - radius)
+        hi = min(len(lines), line + radius)
+        return "\n".join(f"{i + 1}:{t}" for i, t in enumerate(lines[lo:hi], start=lo + 1))
 
     def _taint_recall(self, code: str, language: str, filename: str) -> list[ToolFinding]:
         """用 TaintTracker 做 AST 级污点召回（Semgrep 的补充与交叉验证）。"""
@@ -672,13 +831,22 @@ class TwoStageScanner:
             ) as tmp:
                 tmp.write(code)
                 tmp_path = tmp.name
-            # 按类别聚合，避免对同一份代码重复写临时文件
-            groups = {
+            # 按文件类型分流（第 2.5 代调度优化，2026-08-14）：
+            #   secret：gitleaks 依赖 git 仓库，无 .git 时对单文件几乎不命中
+            #   sca：   trivy fs 只在路径含依赖清单（requirements.txt 等）时有意义
+            #   iac：   trivy config 只对 terraform/k8s/dockerfile 生效
+            # 代码文件（.py/.js/.java 等）直接跳过这三类，避免每次白跑
+            # trivy config 联网卡 60s 超时（已修 --skip-policy-update，双保险）
+            code_file_exts = {".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".java", ".php",
+                              ".c", ".h", ".cpp", ".cc", ".go", ".rb", ".rs", ".cs"}
+            groups: dict[str, list] = {
                 "sast": self._external.scan_sast(tmp_path, language),
-                "secret": self._external.scan_secrets(tmp_path),
-                "sca": self._external.scan_sca(tmp_path),
-                "iac": self._external.scan_iac(tmp_path),
             }
+            if suffix not in code_file_exts:
+                # 仅非代码文件才跑 secret/sca/iac（真实项目扫描时按需启用）
+                groups["secret"] = self._external.scan_secrets(tmp_path)
+                groups["sca"] = self._external.scan_sca(tmp_path)
+                groups["iac"] = self._external.scan_iac(tmp_path)
         except Exception as e:
             print(f"[TwoStageScanner] 外部位置型工具召回失败: {e}")
             return []
@@ -694,6 +862,13 @@ class TwoStageScanner:
                 sev = (item.severity or "medium").lower()
                 if sev not in _SEV_RANK:
                     sev = "medium"
+                evidence = item.message or item.rule_id
+                # P0.3：sast/iac 属裁决档且规则无语境匹配（bandit B608 等），
+                # 附加报告行附近的代码上下文，供 LLM 判断 source 是否真用户可控。
+                if category in ("sast", "iac"):
+                    ctx = self._line_context(code, int(item.line or 0))
+                    if ctx:
+                        evidence = (evidence + "\n[告警行上下文]\n" + ctx).strip()
                 findings.append(ToolFinding(
                     rule_id=item.rule_id or f"{item.tool}:unknown",
                     category=category,
@@ -705,7 +880,7 @@ class TwoStageScanner:
                     path=[],
                     severity=sev,
                     tool=item.tool,
-                    evidence=item.message or item.rule_id,
+                    evidence=evidence,
                 ))
         return findings
 
@@ -987,7 +1162,17 @@ class TwoStageScanner:
         # 由 _aggregate 的 all_invalid 分支判 None（需复核），避免把"全部解析失败"
         # 误当成低置信"否决"——这就是 invalid 语义的统一入口。
         valid_votes = votes_true + votes_false
-        return AdjudicationVerdict(
+        # 模型校正的真实漏洞类型：取首个判真采样的 vulnerability_type（is_confirmed=true 时）
+        corrected_type = ""
+        if final_confirmed:
+            for out in raw_outputs:
+                p = parse_triage_verdict(out)
+                if p and p.get("is_confirmed") is True:
+                    vt = (p.get("vulnerability_type") or "").strip()
+                    if vt and vt.lower() not in ("none", "n/a", "unknown"):
+                        corrected_type = vt[:60]
+                        break
+        verdict = AdjudicationVerdict(
             confirmed=final_confirmed,
             confidence=max(votes_true, votes_false) / max(valid_votes, 1),
             votes_true=votes_true,
@@ -998,7 +1183,27 @@ class TwoStageScanner:
             reasoning=reason if final_confirmed else "",
             fix_suggestion=fix if final_confirmed else "",
             raw_outputs=raw_outputs,
+            vulnerability_type=corrected_type,
         )
+
+        # 共形预测门控（Layer 1）：N 采样投票 → 三分类（带覆盖率保证的置信判断）
+        if self._conformal is not None and self._conformal.calibrated():
+            verdict.conformal_set = self._conformal.predict(
+                votes_true, votes_false, votes_invalid, self.n_samples)
+
+        # 信号回填（模型帮助工具，按信任分级门控）：
+        #   全票一致的判定才记录；高置信否定 → 抑制池；confirmed → 置信+类型校正
+        if self._signal_registry is not None:
+            rule_id = (finding.rule_id or "")
+            self._signal_registry.record(
+                rule_id=rule_id,
+                confirmed=final_confirmed and valid_votes == self.n_samples,
+                n=self.n_samples, votes_true=votes_true,
+                votes_false=votes_false, votes_invalid=votes_invalid,
+                file=filename, taint_type=finding.taint_type,
+                corrected_type=corrected_type,
+            )
+        return verdict
 
     def _retrieve_rag_context(self, code: str) -> Optional[str]:
         """检索裁决用 RAG 知识（与 Scanner 同一 Chroma 知识库）。
@@ -1057,10 +1262,18 @@ class TwoStageScanner:
             result.risk_level = sev.capitalize()
             taint_type = top.finding.get("taint_type") or ""
             rule_id = top.finding.get("rule_id") or ""
+            # 类型校正（第 2.5 代）：裁决层输出的真实漏洞类型优先于工具 rule_id 硬映射
+            # （工具泛规则常把越权/CSRF/IDOR 误标 XSS；模型校正后工具标注随之修正）
+            corrected = ""
+            if self._signal_registry is not None:
+                corrected = self._signal_registry.corrected_taint_type(rule_id)
+            if not corrected:
+                corrected = next((a.vulnerability_type for a in confirmed
+                                  if a.vulnerability_type), "")
             # 统一走 CWE 纠正工具（cwe_normalizer）：Path Traversal → CWE-22 路径穿越，
             # 无映射时回退到 taint_type / rule_id，保证与旧管道信息格式一致
             result.vulnerability_type = (
-                normalize_cwe_label(taint_type) or rule_id
+                corrected or normalize_cwe_label(taint_type) or rule_id
             )
             # 原始类型（纠正前）：前端据此展示"工具原始标注 → CWE Normalizer 纠正"过程
             result.raw_vulnerability_type = taint_type or rule_id
@@ -1090,10 +1303,46 @@ class TwoStageScanner:
         strong_confirmed = any(
             a.confirmed and a.confidence >= _CONF_AUTO for a in result.adjudications
         )
+        # Layer 2 反事实验证降级：**仅当原始代码已含同类防御（already_defended=True）**
+        # 才降级——模型没识别已有防御 = 误报（safe_08 类）。
+        # 未含防御（already_defended=False）的 finding 不做扰动降级：
+        #   真漏洞扰动后仍判漏洞（flipped=False）是正确行为，绝不能降级（2026-08-14
+        #   回归：13 个真漏洞被误降级 review）。扰动后判安全（flipped=True）是模型
+        #   理解防御的证据，更不降级。
+        cf_unflipped = any(
+            a.counterfactual
+            and a.counterfactual.get("already_defended")
+            and (a.finding or {}).get("category") in _LOW_TRUST_CATEGORIES
+            for a in result.adjudications
+        )
         any_confirmed = any(a.confirmed for a in result.adjudications)
         all_invalid = all(a.votes_invalid >= self.n_samples for a in result.adjudications)
-        if strong_confirmed:
+
+        # 共形集接管（第 2.5 代）：所有有共形集的裁决一致时优先采信（统计保证）。
+        # 共形预测的 {漏洞}/{安全} 是带 1-α 覆盖率保证的预测集——全部落入 {安全}
+        # 即高置信真阴性（个别低置信否决票不影响，统计上仍安全）；全部 {漏洞} 即
+        # 高置信真阳性。仅在校准后（calibrated）生效；未校准走旧投票逻辑。
+        cf_sets = [a.conformal_set for a in result.adjudications if a.conformal_set]
+        cf_unanimous = bool(cf_sets) and len(cf_sets) == len(result.adjudications) \
+            and all(s == cf_sets[0] for s in cf_sets)
+        if cf_unanimous and cf_sets[0] == "safe":
+            result.has_vulnerability = False
+            result.error = ""
+            return
+        # vulnerable 接管必须存在高置信判中（≥_CONF_AUTO）：共形会把 T2/F1(0.667)
+        # 也判 vulnerable（净化校准后阈值放宽），低置信判中不能直接判漏洞（safe_05
+        # 类 FP 根因），须走 strong_confirmed 分支（进 review 或反事实验证）。
+        if cf_unanimous and cf_sets[0] == "vulnerable" and strong_confirmed and not cf_unflipped:
             result.has_vulnerability = True
+            return
+
+        if strong_confirmed and not cf_unflipped:
+            result.has_vulnerability = True
+        elif strong_confirmed and cf_unflipped:
+            # 模式匹配存疑：保守转复核（论文口径"反事实验证存疑"）
+            result.has_vulnerability = None
+            if not result.error:
+                result.error = "反事实验证未翻转（模式匹配存疑），需人工复核"
         elif all_invalid:
             result.has_vulnerability = None
             if not result.error:

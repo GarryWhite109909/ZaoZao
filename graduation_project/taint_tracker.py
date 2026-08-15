@@ -142,6 +142,7 @@ _SINK_DEFINITIONS: list[tuple[str, str]] = [
     ("innerHTML", "XSS"),
     ("document.write(", "XSS"),
     # 模板注入
+    (".from_string(", "Server-Side Template Injection"),  # 模板来源含污点（env.from_string(用户串)）
     ("render(", "Server-Side Template Injection"),
     ("render_template(", "Server-Side Template Injection"),
 ]
@@ -439,6 +440,8 @@ class TaintTracker:
                         continue
                     if self._is_parameterized_sql(label, ttype, args, var, arg_clean):
                         continue  # 参数化查询：数据在绑定参数里，不报
+                    if self._context_safe_sink(label, ttype, args, var, code_bytes):
+                        continue  # 语境安全：列表参数 subprocess / 模板值插值 / autoescape
                     paths.append(TaintPath(
                         t.origin, label, ttype,
                         t.origin_line, stmt_line,
@@ -784,6 +787,86 @@ class TaintTracker:
         is_container = second.startswith(("(", "[", "{"))
         has_placeholder = _PARAM_PLACEHOLDER_RE.search(first) is not None
         return is_container or has_placeholder
+
+    def _context_safe_sink(
+        self, label: str, ttype: str, args: list[str], var: str, code_bytes: bytes,
+    ) -> bool:
+        """sink 语境安全判定（P0 修复，消灭工具规则误报）。
+
+        子串匹配 sink 不感知参数语境，导致下列误报；这里补上语境检查：
+
+        1. 命令注入：`subprocess.run(["ping","-c","1",host])`（列表参数）不经 shell
+           解析，不构成命令注入；`subprocess.run(f"cmd {x}")` 未传 shell=True 时
+           Python 同样不经过 shell。仅 **shell=True + 字符串拼接含污点** 才报。
+        2. 模板注入：`env.from_string("...{{ name }}")` 是**值插值**（name 进模板
+           上下文），而非把用户输入当模板体；`template.render(name=name)` /
+           `render_template("x.html", name=name)` 同理为 kwargs 值插值，安全。
+           模板来源（from_string/parse/render_template 位置参数）含污点才危险——
+           由 `.from_string(` sink 与 render_template 位置参数检查覆盖。
+        3. 值插值渲染的 autoescape 兜底：Jinja2 裸 Environment 默认 autoescape=False，
+           值插值渲染到 HTML 仍有 XSS 风险；仅在函数内显式开启 autoescape
+           （select_autoescape / autoescape=True）时才判定安全。
+
+        Args:
+            label: 匹配到的 sink 原 pattern（如 "subprocess.run("）
+            ttype: 漏洞类型
+            args: sink 调用参数文本列表（已有解析结果）
+            var: 当前污染变量名
+            code_bytes: 文件字节（用于检查 autoescape 语境）
+
+        Returns:
+            True = 语境安全（不应报）；False = 需进一步裁决/报告。
+        """
+        if ttype == "Command Injection" and label in ("subprocess.run(", "subprocess.Popen("):
+            if args and args[0].lstrip().startswith("["):
+                return True  # 列表参数：不经 shell，安全
+            joined = " ".join(args)
+            if not re.search(r"shell\s*=\s*True", joined):
+                return True  # 无 shell=True：subprocess 不解析命令，安全
+            return False
+
+        if ttype == "Server-Side Template Injection":
+            if label == "render_template(":
+                # 位置参数 = 模板名/模板体（危险）；kwargs = 值插值（Flask 默认 autoescape）
+                if not args:
+                    return True  # 无参数：值插值无从谈起（模板体已由 from_string 覆盖）
+                for a in args:
+                    is_kwarg = "=" in a and a.split("=", 1)[0].strip().isidentifier()
+                    if not is_kwarg and self._var_in_text(self._strip_string_literals(a), var):
+                        return False  # 模板名被污染 → 危险
+                return True
+            if label == "render(":
+                # 纯 kwargs（name=xxx）值插值：autoescape 开启才安全；无参数同样安全
+                if not args:
+                    return True
+                if all("=" in a for a in args):
+                    file_text = code_bytes.decode("utf-8", errors="replace")
+                    if re.search(
+                        r"select_autoescape|autoescape\s*=\s*(?:True|select_autoescape)",
+                        file_text,
+                    ):
+                        return True
+                    return False  # 无 autoescape 的值插值渲染 → 保守仍报
+                # 位置参数（render(template_str)）→ 模板体被污染，危险
+                return False
+
+        if ttype == "Path Traversal":
+            # open(污点路径) 但函数内存在完整防御链：白名单校验（filename in 集合）
+            # + abspath/realpath 归一化 + startswith 前缀校验 → 判安全（safe_04 类）。
+            # abspath 与 startswith 常跨行赋值（abs_target = abspath(...) 下一行
+            # abs_target.startswith(...)），故按同文件共存判定而非同行。
+            file_text = code_bytes.decode("utf-8", errors="replace")
+            has_whitelist = re.search(
+                r"(?:if|while)\s+[\w.]+\s+not\s+in\s+[\w.]+\s*:",
+                file_text,
+            )
+            has_abspath = re.search(r"(?:abspath|realpath)\s*\(", file_text)
+            has_startswith_guard = re.search(r"\.\s*startswith\s*\(", file_text)
+            if has_whitelist and has_abspath and has_startswith_guard:
+                return True
+            return False
+
+        return False
 
     # ------------------------------------------------------------------
     # 调用/摘要相关

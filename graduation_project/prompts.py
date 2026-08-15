@@ -205,6 +205,10 @@ EVAL_SYSTEM_VARIANTS = (
     "short",             # 最简+短CoT，检验"长 prompt→CoT 冗长/复读退化"（767字）
     "no_rules",          # 去白名单+硬编码规则，检验规则是否已训练内化（3211字）
     "strict_schema",     # combined+强 JSON 输出约束，救"格式跑偏"（5343字）
+    # ---- α1 漏报修复变体（2026-08-12）----
+    "combined_nosource", # combined+增强CoT：加"无 source 型漏洞自检"，救弱随机/授权/整数溢出 FN
+    # ---- 两阶段扫描裁决专用变体（2026-08-12）----
+    "triage_default",    # 裁决专用：封闭二分类判工具告警真伪，去找漏洞内容，聚焦压误报（~1500字）
 )
 
 
@@ -301,6 +305,10 @@ def get_eval_system_prompt(variant: str) -> str:
         return _build_no_rules_prompt()
     if variant == "strict_schema":
         return _build_strict_schema_prompt()
+    if variant == "combined_nosource":
+        return _build_combined_nosource_prompt()
+    if variant == "triage_default":
+        return _build_triage_default_prompt()
     raise ValueError(f"未知评估变体: {variant}（合法值: {EVAL_SYSTEM_VARIANTS}）")
 
 
@@ -430,6 +438,37 @@ COT_STEPS = """\
 注意：分析过程必须真实展现上述步骤，不能跳步直接给结论。"""
 
 
+# 思维链（CoT）增强版：在第 5 步前插入"无 source 型漏洞自检"。
+# 动机（2026-08-12，α0 漏报根因）：原 5 步 CoT 全部围绕"用户可控输入→危险函数"
+# 的污点流，会系统性漏掉 **不依赖 source 的漏洞**：
+#   - typical_19 弱随机（random 生成 token，7/11 变体漏）
+#   - typical_15 缺失授权 / IDOR（5/11 漏）
+#   - typical_29 整数溢出（8/11 漏，Java int 强类型被误判"无法注入"）
+#   - 硬编码凭证（CWE-798）
+# 这些漏洞无需"source→sink"数据流，旧 5 步 CoT 会直接判"无用户输入→安全"。
+COT_STEPS_NOSOURCE = """\
+【分析步骤要求（必须逐步执行）】
+请严格按以下 5 步分析后再下结论：
+1. 识别代码中所有用户可控输入点（source），如 request.args / 函数参数 / 文件读取等。
+2. 追踪这些输入的数据流，判断是否到达危险函数（sink），如 execute / system / open / pickle.loads 等。
+3. 检查 source 到 sink 之间是否存在防御措施（参数化查询、白名单校验、转义、abspath+startswith 等）。
+4. 若有防御措施，评估其是否有效（如参数化查询是有效的，简单 replace/strip 过滤通常无效）。
+5. **即使没有 source 或数据流不到 sink，也必须单独检查以下"无 source 型漏洞"**：
+   a. 弱随机数：用 random 模块（Mersenne Twister，可预测）生成 token/重置码/会话/密钥（CWE-330），
+      应改用 secrets；不能因"无用户输入"就判安全。
+   b. 弱密码学：MD5/SHA1 哈希密码、硬编码 IV/盐、弱加密（CWE-327）。
+   c. 授权/认证缺失：接口只校验登录（有 session）但未校验角色，任何登录用户均可访问管理功能
+      （CWE-862）；或用户可控对象 ID 未校验归属（IDOR，CWE-639）。
+   d. 整数溢出：**逐个检查源码中的算术运算（乘法/加法/减法/类型转换）**，判断用户可控数值输入
+      是否可能产生超出类型范围（如 Java/Python int 的 32 位范围）的结果。即使没有显式的
+      范围校验代码，只要存在"用户输入 × 用户输入"或"用户输入参与数值运算"，且运算结果再被
+      用于敏感用途（金额、索引、长度、分配），就应判定 CWE-190 整数溢出。强类型转换不等于
+      无漏洞，需检查数值范围与运算语义。
+   e. 硬编码凭证：源码字面量 key/secret/password/token（CWE-798）。
+6. 综合以上分析得出最终结论，并在 JSON 中体现 source/sink/explanation 字段。
+注意：分析过程必须真实展现上述步骤，不能跳步直接给结论。"""
+
+
 def _build_whitelist_only_prompt() -> str:
     """变体 2：仅角色 + 白名单 + schema（去掉其他规则）。"""
     return (
@@ -454,13 +493,17 @@ def _build_few_shot_prompt() -> str:
     )
 
 
-def _apply_cot_to_system_prompt(base: str) -> str:
+def _apply_cot_to_system_prompt(base: str, cot_steps: str = COT_STEPS) -> str:
     """把 SYSTEM_PROMPT 末尾的"请先给出分析过程..."替换为 CoT 步骤版本。
+
+    Args:
+        base: 基础 system prompt（通常为 SYSTEM_PROMPT）。
+        cot_steps: CoT 步骤文本，默认用 COT_STEPS；可传 COT_STEPS_NOSOURCE 等变体。
 
     内部辅助函数，供 _build_cot_prompt 与 _build_combined_prompt 复用。
     """
     cot_suffix = (
-        "\n\n" + COT_STEPS
+        "\n\n" + cot_steps
         + "\n\n请按上述步骤逐步分析，然后在最后给出 JSON 结论。"
     )
     old_tail = "请先给出分析过程，然后在最后给出 JSON 结论。"
@@ -484,6 +527,60 @@ def _build_combined_prompt() -> str:
     """
     cot_system = _apply_cot_to_system_prompt(SYSTEM_PROMPT)
     return cot_system + "\n\n" + FEW_SHOT_EXAMPLES
+
+
+def _build_combined_nosource_prompt() -> str:
+    """变体 combined_nosource：combined + 增强 CoT（加"无 source 型漏洞自检"）。
+
+    动机（2026-08-12）：α0 在 4 个顽固样本上漏报（typical_19 弱随机 7/11、
+    typical_29 整数溢出 8/11、typical_15 缺失授权 5/11、hard_crossfile_03 IDOR 5/11），
+    根因是旧 5 步 CoT 只覆盖"用户可控输入→危险函数"污点流，系统性漏掉弱随机/弱密码/
+    授权缺失/整数溢出/硬编码凭证等**不依赖 source 的漏洞**。本变体在 combined 基础上
+    用 COT_STEPS_NOSOURCE 替换 CoT 步骤，检验显式自检能否拉回这些 FN。
+    """
+    cot_system = _apply_cot_to_system_prompt(SYSTEM_PROMPT, cot_steps=COT_STEPS_NOSOURCE)
+    return cot_system + "\n\n" + FEW_SHOT_EXAMPLES
+
+
+def _build_triage_default_prompt() -> str:
+    """变体 triage_default：两阶段扫描裁决层专用 system prompt。
+
+    设计动机（2026-08-12）：两阶段扫描的 Stage 2 裁决任务与开放生成**本质不同**——
+    裁决层面对的是 Stage 1 工具已召回的**具体 finding**（build_triage_prompt 已注入
+    rule_id/source/sink/传播链/evidence + 切片代码），任务是"判定这条告警真伪"
+    （封闭二分类），而非"在全文中发现漏洞"（开放生成）。
+
+    因此不应沿用开放生成的 combined/combined_nosource（含找漏洞 few-shot、无 source
+    自检、5 步 CoT、开放 schema——对裁决冗余甚至冲突），而应精简为只保留对裁决
+    有用的部分：
+      - 角色（裁决视角，非找漏洞视角）
+      - 安全模式白名单（压误报的核心，裁决最关键）
+      - 硬编码凭证规则（防漏报）
+      - is_confirmed 一致性要求（与 user 侧 build_triage_prompt 的判定要求呼应）
+
+    显式删掉：找漏洞 few-shot、5 步 CoT、无 source 型漏洞自检、开放生成 schema。
+    长度目标 ~1500 字符（远短于 combined_nosource 的 5056）。
+    """
+    return (
+        "你是一名资深代码安全审计专家，负责裁决静态工具告警是否为真实漏洞。\n"
+        "你将收到一条工具报告的可疑数据流（污染源→危险点）与相关代码切片，"
+        "任务是判断该告警是否为真实可利用的漏洞。\n\n"
+        "判定要点：\n"
+        "1. 确认污染源（source）是否真的用户可控、危险点（sink）是否真的危险。\n"
+        "2. 检查 source→sink 之间是否有**有效**防御：参数化查询/占位符、subprocess 列表参数"
+        "（非字符串拼接）、shlex.quote 转义、os.path.abspath+startswith 白名单校验、"
+        "html.escape/模板自动转义、json.loads 而非 pickle.loads、yaml.safe_load 等。"
+        "若防御有效，该告警是误报，is_confirmed=false。\n"
+        "3. 严禁捏造代码中不存在的 API 参数（如 shell=True、debug=True）或扭曲代码事实"
+        "来支持告警成立；也不要把数据库名/文件名/表名等当成硬编码凭证。\n"
+        "4. 硬编码的字面量凭证（key/secret/password/token 字面量）本身就是漏洞，应 is_confirmed=true。\n"
+        "5. 结论一致性：is_confirmed 必须与分析过程一致。若分析中识别出风险，不得标 false；"
+        "若未识别出风险，不得标 true。\n\n"
+        "请先给出简短分析过程，然后输出如下 JSON（不要输出其他代码块）：\n"
+        "```json\n"
+        + _TRIAGE_SCHEMA +
+        "```"
+    )
 
 
 # v3 训练数据（final_train_chatml_v3.jsonl）使用的 system prompt。
@@ -546,7 +643,7 @@ def build_full_prompt_variant(
 # 并显式要求检查防御是否有效。system prompt 仍沿用 model_registry 选择的
 # system_prompt（v9max→BASE_PROMPT），与训练/主扫描保持一致。
 _TRIAGE_SCHEMA = """\
-{"is_confirmed": true/false, "reason": "...", "fix_suggestion": "..."}
+{"is_confirmed": true/false, "vulnerability_type": "CWE-xxx 或漏洞类型名（is_confirmed=true 时必填，须基于代码实际分析而非工具标注）", "reason": "...", "fix_suggestion": "..."}
 """
 
 
@@ -621,11 +718,16 @@ def build_triage_prompt(
 
     parts.append("")
     parts.append("判定要求：")
-    parts.append("1. 确认 source 是否真的用户可控、sink 是否真的危险。")
-    parts.append("2. 检查 source→sink 之间是否有**有效**防御（参数化查询/转义/白名单/列表参数 subprocess）。")
-    parts.append("   有效防御意味着该 finding 是误报，is_confirmed=false。")
-    parts.append("3. 严禁捏造代码中不存在的 API 参数或行为；判定必须基于代码实际内容。")
-    parts.append("4. 若判定为真漏洞，输出 is_confirmed=true 并给出简洁 reason 与修复建议；否则 is_confirmed=false。")
+    parts.append("1. 确认 source 是否真的用户可控、sink 是否真的危险。"
+                 "source 若来自常量赋值（非 request/外部输入链）则不是有效污染源，告警为误报。")
+    parts.append("2. 检查 source→sink 之间是否有**有效**防御（参数化查询/转义/白名单/"
+                 "subprocess 列表参数/模板值插值+autoescape）。有效防御意味着该 finding "
+                 "是误报，is_confirmed=false。")
+    parts.append("3. 注意工具规则无语境匹配导致的误报：subprocess.run 列表参数（无 shell=True）"
+                 "不是命令注入；被 int()/float() 转换后的数值插值不是 XSS；"
+                 "render/render_template 的 kwargs 值插值（autoescape 开启）不是模板注入。")
+    parts.append("4. 严禁捏造代码中不存在的 API 参数或行为；判定必须基于代码实际内容。")
+    parts.append("5. 若判定为真漏洞，输出 is_confirmed=true 并给出简洁 reason 与修复建议；否则 is_confirmed=false。")
     parts.append("")
     parts.append("请先给出简短分析过程，然后在回答最后输出如下 JSON：")
     parts.append("```json")
