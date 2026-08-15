@@ -115,8 +115,10 @@ def parse_args() -> argparse.Namespace:
                         help="关闭反事实扰动验证（Layer 2）")
     parser.add_argument("--calibrate-from", type=str, default=None,
                         help="共形校准源：历史评估结果 JSON（含 adjudications 投票 + expected）")
-    parser.add_argument("--no-calibrate-clean", action="store_true",
-                        help="校准集不做净化（保留判错样本，对照实验）")
+    parser.add_argument("--calibrate-clean", action="store_true",
+                        help="校准集做 only_correct 净化（剔除非一致判对样本；方法学上有泄漏风险，仅复现旧实验用）")
+    parser.add_argument("--export-calibration", type=str, default="models/conformal_calibration.json",
+                        help="校准拟合成功后导出路径（生产端 TwoStageScanner 自动加载；传 0 禁用导出）")
     # 工具开关（默认全开，复现 App 真实路径）
     parser.add_argument("--no-semgrep", action="store_true", dest="no_semgrep",
                         help="禁用 semgrep taint 召回")
@@ -144,16 +146,27 @@ def _hfv_to_str(hv) -> str:
     return "review"  # None = 需人工复核
 
 
-def _load_calibration_samples(history_json: str, only_correct: bool = True) -> list[dict]:
+def _load_calibration_samples(history_json: str, only_correct: bool = False) -> list[dict]:
     """从历史评估结果构建共形校准集。
 
-    每样本 = (某 finding 的投票统计, 该样本的真实标签)。标签取自 expected_present
-    （漏洞=True / 安全=False）；只有真实标签已知的投票才能校准共形阈值。
+    每样本 = (某 finding 的投票统计, 该 finding 的真实标签)。
 
-    净化（only_correct=True，方案 2）：排除"样本最终判错"的 adjudications——
-    工具误报 + 模型全票判中（safe_04/safe_08/safe_17 类）会让校准阈值偏向
-    "全票≈漏洞"，导致分布外误报被放行。只保留正确判定的投票，阈值才反映
-    "模型的真实判定质量"而非"误报样本的投票形态"。
+    标签判定（2026-08-15 修复标签噪声，原实现 `label=bool(expected_present)`
+    把文件级标签赋给该文件每条 adjudication——漏洞文件里被否决的误报 finding
+    也被标 True，校准集系统性带噪）：
+      - 安全文件（exp=False）：文件内所有 finding 均为误报 → label=False ✓
+      - 漏洞文件（exp=True）：文件有漏洞 ≠ 该 finding 是漏洞。仅"模型最终
+        判真"（votes_true > votes_false）的 finding 进 label=True；被否决的
+        finding 标签不可知（可能是真误报，也可能是漏判），**剔除出校准集**
+        而非武断标注。
+
+    only_correct 净化（2026-08-15 起默认关闭）：按"模型判对"筛选校准点直接
+    违反共形预测的 exchangeability 前提——过滤依赖 y，校准分布不再是真实
+    判定分布，1-α 覆盖率保证不成立。保留 --calibrate-clean 仅为复现旧实验
+    数字，开启时打印警告，论文中该配置下的覆盖率数字应降级表述。
+    泄漏警示：校准源若是同一测试集的历史运行结果（相同文件、标签同源），
+    属"用测试集校准再预测测试集"，报告的覆盖率有泄漏嫌疑——独立校准集
+    （不同样本）才是方法学正确的做法，此处打印警示提醒。
     """
     import glob
     paths = [history_json]
@@ -161,6 +174,7 @@ def _load_calibration_samples(history_json: str, only_correct: bool = True) -> l
         paths = sorted(glob.glob(history_json))
     samples: list[dict] = []
     seen = set()
+    n_dropped_unknown = 0
     for p in paths:
         try:
             d = json.load(open(p, encoding="utf-8"))
@@ -175,19 +189,36 @@ def _load_calibration_samples(history_json: str, only_correct: bool = True) -> l
                 pred = s.get("predicted")
                 ok = (exp is True and pred is True) or (exp is False and pred is False)
                 if not ok:
-                    continue  # 净化：排除判错样本
+                    continue  # 净化（违反 exchangeability，仅复现旧实验用）
             for a in s.get("adjudications", []):
                 key = (p, s.get("file"), a.get("rule_id"))
                 if key in seen:
                     continue
                 seen.add(key)
+                votes_true = int(a.get("votes_true", 0))
+                votes_false = int(a.get("votes_false", 0))
+                if exp is False:
+                    label = False          # 安全文件：所有 finding 均为误报
+                elif votes_true > votes_false:
+                    label = True           # 漏洞文件中模型判真的 finding
+                else:
+                    n_dropped_unknown += 1  # 漏洞文件中被否决的 finding：标签不可知，剔除
+                    continue
                 samples.append({
-                    "votes_true": int(a.get("votes_true", 0)),
-                    "votes_false": int(a.get("votes_false", 0)),
+                    "votes_true": votes_true,
+                    "votes_false": votes_false,
                     "votes_invalid": int(a.get("votes_invalid", 0)),
                     "n": int(s.get("n_samples", 3) or 3),
-                    "label": bool(exp),
+                    "label": label,
                 })
+    if n_dropped_unknown:
+        print(f"[conformal] 剔除标签不可知的 adjudication {n_dropped_unknown} 条"
+              f"（漏洞文件中被否决的 finding）")
+    print("[conformal] ⚠ 泄漏警示：校准源若为同一测试集的历史结果，覆盖率数字"
+          "有泄漏嫌疑；论文应使用独立校准集或如实标注此局限")
+    if only_correct:
+        print("[conformal] ⚠ only_correct 净化已开启：违反 exchangeability 前提，"
+              "1-α 覆盖率保证不成立（仅用于复现旧实验数字）")
     return samples
 
 
@@ -283,12 +314,19 @@ def main() -> None:
     )
     # 共形预测器校准：从历史评估结果（adjudications 的投票 + 已知标签）拟合阈值
     if not args.no_conformal and scanner._conformal is not None and args.calibrate_from:
-        calib = _load_calibration_samples(args.calibrate_from, only_correct=not args.no_calibrate_clean)
+        calib = _load_calibration_samples(args.calibrate_from, only_correct=args.calibrate_clean)
         if len(calib) >= 4:
             scanner._conformal.fit(calib)
             print(f"[conformal] 已从 {args.calibrate_from} 校准 "
-                  f"({len(calib)} 样本, clean={not args.no_calibrate_clean}, "
+                  f"({len(calib)} 样本, only_correct={args.calibrate_clean}, "
                   f"{scanner._conformal.thresholds()})")
+            if args.export_calibration and args.export_calibration != "0":
+                calib_path = Path(args.export_calibration)
+                if scanner._conformal.save_calibration(calib_path):
+                    print(f"[conformal] 校准已导出 → {calib_path}（生产端 TwoStageScanner 启动时自动加载；"
+                          f"覆盖率保证仅在评估分布 ≈ 生产分布时成立）")
+                else:
+                    print(f"[conformal] 校准导出失败 → {calib_path}")
         else:
             print(f"[conformal] 校准样本不足（{len(calib)}），共形门控保持未校准")
     print(f"工具链: semgrep={not args.no_semgrep}, taint_tracker={not args.no_taint_tracker}, "

@@ -131,3 +131,95 @@ class ConformalPredictor:
             "q_safe": self._q_safe,
             "n_calib": self._n_calib,
         }
+
+    # ------------------------------------------------------------------
+    # 校准持久化（2026-08-15：让生产路径能加载评估侧产出的校准阈值，
+    # Layer 1 不再只活在 exp_07 实验里）
+    # ------------------------------------------------------------------
+    def save_calibration(self, path) -> bool:
+        """把已拟合的校准阈值导出为 JSON（供生产端 TwoStageScanner 加载）。
+
+        仅保存阈值与元信息（不保存校准样本本身）；未校准时返回 False。
+        """
+        import json as _json
+        if not self.calibrated():
+            return False
+        from pathlib import Path as _Path
+        p = _Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_json.dumps({
+            "alpha": self.alpha,
+            "q_vulnerable": self._q_vuln,
+            "q_safe": self._q_safe,
+            "n_calib": self._n_calib,
+            "exported_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%S"),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+
+    def load_calibration(self, path) -> bool:
+        """从 JSON 加载校准阈值（与 save_calibration 对应）。
+
+        文件不存在/解析失败返回 False（调用方保持未校准状态，门控自动降级
+        为旧投票逻辑，行为安全）。
+        """
+        import json as _json
+        from pathlib import Path as _Path
+        p = _Path(path)
+        if not p.is_file():
+            return False
+        try:
+            d = _json.loads(p.read_text(encoding="utf-8"))
+            q_v, q_s = d.get("q_vulnerable"), d.get("q_safe")
+            if q_v is None or q_s is None:
+                return False
+            self.alpha = float(d.get("alpha", self.alpha))
+            self._q_vuln = float(q_v)
+            self._q_safe = float(q_s)
+            self._n_calib = int(d.get("n_calib", 0))
+            return True
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# 自检（离线，2026-08-15 新增：覆盖三分类 + 校准持久化往返）
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    print("=== 共形预测器自检（离线） ===\n")
+    cp = ConformalPredictor(alpha=0.1)
+
+    # 1) 未校准 → predict 全部 uncertain
+    ok1 = cp.predict(3, 0, 0, 3) == "uncertain" and not cp.calibrated()
+    print(f"[{'PASS' if ok1 else 'FAIL'}] 未校准降级: predict={cp.predict(3,0,0,3)}, calibrated={cp.calibrated()}")
+
+    # 2) 拟合后三分类
+    samples = ([dict(votes_true=3, votes_false=0, votes_invalid=0, n=3, label=True)] * 8
+               + [dict(votes_true=0, votes_false=3, votes_invalid=0, n=3, label=False)] * 8)
+    cp.fit(samples)
+    ok2 = (cp.calibrated()
+           and cp.predict(3, 0, 0, 3) == "vulnerable"
+           and cp.predict(0, 3, 0, 3) == "safe"
+           and cp.predict(2, 1, 0, 3) in ("uncertain", "vulnerable"))
+    print(f"[{'PASS' if ok2 else 'FAIL'}] 拟合三分类: vuln={cp.predict(3,0,0,3)}, "
+          f"safe={cp.predict(0,3,0,3)}, thresholds={cp.thresholds()}")
+
+    # 3) 校准持久化往返（生产接线的载体）
+    p = Path(tempfile.mkdtemp()) / "conformal_calibration.json"
+    ok3 = cp.save_calibration(p)
+    cp2 = ConformalPredictor(alpha=0.1)
+    ok3 = ok3 and cp2.load_calibration(p) and cp2.calibrated() \
+        and cp2.predict(3, 0, 0, 3) == "vulnerable" and cp2.predict(0, 3, 0, 3) == "safe"
+    print(f"[{'PASS' if ok3 else 'FAIL'}] 校准导出/加载往返: file={p.is_file()}, calibrated={cp2.calibrated()}")
+
+    # 4) 加载不存在文件 → 安全降级
+    cp3 = ConformalPredictor()
+    ok4 = not cp3.load_calibration(Path(tempfile.mkdtemp()) / "nope.json") and not cp3.calibrated()
+    print(f"[{'PASS' if ok4 else 'FAIL'}] 无校准文件降级: {not cp3.calibrated()}")
+
+    all_ok = all([ok1, ok2, ok3, ok4])
+    print(f"\n{'=== 自检通过 ===' if all_ok else '!!! 自检失败 !!!'}")
+    sys.exit(0 if all_ok else 1)

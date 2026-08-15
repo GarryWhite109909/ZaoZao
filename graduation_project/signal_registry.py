@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,28 +41,41 @@ class Signal:
     """单个信号（rule_id / 特征指纹）的置信记录。"""
     rule_id: str
     taint_type: str = ""
-    confirmed: int = 0            # 被 LLM 高置信确认的次数（跨样本）
-    rejected: int = 0             # 被 LLM 高置信否定的次数（跨样本）
+    confirmed: int = 0            # 被 LLM 高置信确认的总次数（含同文件重复扫描）
+    rejected: int = 0             # 被 LLM 高置信否定的总次数（含同文件重复扫描）
     confirmed_files: list[str] = field(default_factory=list)  # 确认样本（跨样本聚合用）
     rejected_files: list[str] = field(default_factory=list)   # 否定样本
     # 类型校正映射：rule_id → (真实漏洞类型, 样本数)（仅高置信且与工具标注冲突时更新）
     corrected_type: str = ""
     corrected_type_samples: int = 0
+    # 各候选类型的累计计数（多数投票决定 corrected_type，2026-08-15 修复"先到先得锁死"）：
+    # 首个类型不再永久锁死——更准的类型积累到更高票数后自然替换。
+    corrected_type_counts: dict[str, int] = field(default_factory=dict)
     suppressed: bool = False      # 是否被抑制（D 级，工具见到跳过）
     suppressed_samples: int = 0
 
+    def __post_init__(self) -> None:
+        # 旧持久化数据迁移：无 counts 时从 (corrected_type, samples) 初始化
+        if self.corrected_type and not self.corrected_type_counts:
+            self.corrected_type_counts = {self.corrected_type: max(1, self.corrected_type_samples)}
+
     @property
     def confidence(self) -> float:
-        """确认比例（跨样本），未回填前为候选置信。"""
-        total = self.confirmed + self.rejected
-        return self.confirmed / total if total else 0.0
+        """确认比例（按去重文件数），未回填前为候选置信。"""
+        a, b = len(self.confirmed_files), len(self.rejected_files)
+        return a / (a + b) if (a + b) else 0.0
 
     @property
     def ready(self) -> bool:
-        """是否达到回填条件：≥K 个独立样本一致确认，且未被抑制。"""
+        """是否达到回填条件：≥K 个**独立文件**一致确认，且未被抑制。
+
+        2026-08-15 修复：原实现用 confirmed 计数（同一文件重复扫描即 +1），
+        后端用户重复点扫描两次就 ready=True，"≥2 独立样本"门槛名存实亡。
+        现改用 confirmed_files 去重数判定。
+        """
         return (not self.suppressed
-                and self.confirmed >= MIN_AGREE_SAMPLES
-                and self.confirmed > self.rejected)
+                and len(self.confirmed_files) >= MIN_AGREE_SAMPLES
+                and len(self.confirmed_files) > len(self.rejected_files))
 
 
 class SignalRegistry:
@@ -91,15 +105,26 @@ class SignalRegistry:
             print(f"[SignalRegistry] 加载失败（从头开始）: {e}")
 
     def save(self) -> None:
+        """持久化到磁盘（原子写：先写临时文件再替换，避免并发/中断写坏）。
+
+        2026-08-15 修复：此前全仓库无任何调用方，"持久化到 models/signal_registry.json"
+        的承诺名存实亡——进程重启学习成果归零。现在 record()/add_to_learn_pool()
+        变更后自动保存。
+        """
         if not self._enabled:
             return
         with self._lock:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            data = {
-                "signals": {rid: s.__dict__ for rid, s in self._signals.items()},
-                "learn_pool": self._learn_pool,
-            }
-            self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                data = {
+                    "signals": {rid: s.__dict__ for rid, s in self._signals.items()},
+                    "learn_pool": self._learn_pool,
+                }
+                tmp = self._path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(tmp, self._path)
+            except Exception as e:
+                print(f"[SignalRegistry] 保存失败: {e}")
 
     # ------------------------------------------------------------------
     # 回填（模型裁决 → 工具记忆）
@@ -134,23 +159,30 @@ class SignalRegistry:
                 if file and file not in sig.confirmed_files:
                     sig.confirmed_files.append(file)
                 sig.confirmed += 1
-                # 类型校正（门控 4）：仅当 LLM 明确给出与工具不同的类型且工具未记录过时更新
-                if corrected_type and corrected_type != taint_type and not sig.corrected_type:
-                    sig.corrected_type = corrected_type
-                    sig.corrected_type_samples = 1
-                elif corrected_type and corrected_type == sig.corrected_type:
-                    sig.corrected_type_samples += 1
+                # 类型校正（门控 4，2026-08-15 重做）：按类型多数投票决定
+                # corrected_type——首个类型不再先到先得锁死，更准的类型积累到
+                # 更高票数后自然替换（counts 票数并列时保留先到者，稳定收敛）。
+                if corrected_type and corrected_type != taint_type:
+                    sig.corrected_type_counts[corrected_type] = \
+                        sig.corrected_type_counts.get(corrected_type, 0) + 1
+                    best = max(sig.corrected_type_counts.items(),
+                               key=lambda kv: kv[1])
+                    sig.corrected_type = best[0]
+                    sig.corrected_type_samples = best[1]
             else:
                 if file and file not in sig.rejected_files:
                     sig.rejected_files.append(file)
                 sig.rejected += 1
                 # 门控 3 + 抑制：高置信否定 → 若此前误回填则降权，D 级进抑制池
-                if suppress_on_neg and sig.confirmed >= MIN_AGREE_SAMPLES:
+                # （门槛按去重文件数判定，与 ready 一致）
+                if suppress_on_neg and len(sig.confirmed_files) >= MIN_AGREE_SAMPLES:
                     # 双向撤销：确认过又高置信否定，说明信号不可靠 → 降权
                     sig.confirmed = 0
                     sig.confirmed_files = []
                 sig.suppressed = True
                 sig.suppressed_samples += 1
+        # 变更后自动持久化（2026-08-15：此前 save() 全仓库无调用方，重启归零）
+        self.save()
 
     # ------------------------------------------------------------------
     # 查询（工具层扫描时使用）
@@ -193,6 +225,7 @@ class SignalRegistry:
             if any((p.get("file", ""), p.get("feature", "")) == key for p in self._learn_pool):
                 return
             self._learn_pool.append(entry)
+        self.save()
 
     def learn_pool_snapshot(self) -> list[dict]:
         with self._lock:
@@ -237,3 +270,63 @@ def reset_signal_registry(path: Optional[Path] = None, enabled: bool = True) -> 
     with _registry_lock:
         _registry = SignalRegistry(path=path, enabled=enabled)
     return _registry
+
+
+# ---------------------------------------------------------------------------
+# 自检（离线，2026-08-15 新增：此前无自检——正是 #2/#3/#4 长期未被发现的原因）
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import tempfile
+
+    print("=== 信号注册表自检（离线） ===\n")
+    tmp = Path(tempfile.mkdtemp()) / "signal_registry_test.json"
+    r = SignalRegistry(path=tmp, enabled=True)
+
+    # 1) 同一文件重复扫描不得 ready（≥2 独立样本门槛）
+    for _ in range(3):  # app.py 连扫 3 次
+        r.record("py.taint.sql", confirmed=True, n=3, votes_true=3,
+                 votes_false=0, votes_invalid=0, file="app.py", taint_type="CWE-89")
+    sig = r.get_signal("py.taint.sql")
+    ok1 = (sig.confirmed == 3 and len(sig.confirmed_files) == 1 and not sig.ready)
+    print(f"[{'PASS' if ok1 else 'FAIL'}] 同文件重复扫描: confirmed={sig.confirmed}, "
+          f"files={len(sig.confirmed_files)}, ready={sig.ready} (期望 ready=False)")
+
+    # 2) 第 2 个独立文件确认后 ready
+    r.record("py.taint.sql", confirmed=True, n=3, votes_true=3,
+             votes_false=0, votes_invalid=0, file="service.py", taint_type="CWE-89")
+    ok2 = sig.ready and r.boost_priority("py.taint.sql") > 1.0
+    print(f"[{'PASS' if ok2 else 'FAIL'}] 跨文件聚合: files={len(sig.confirmed_files)}, "
+          f"ready={sig.ready}, boost={r.boost_priority('py.taint.sql'):.2f}")
+
+    # 3) 高置信否定 → 抑制池 + is_suppressed 生效
+    r.record("py.taint.sql", confirmed=False, n=3, votes_true=0,
+             votes_false=3, votes_invalid=0, file="x.py")
+    ok3 = r.is_suppressed("py.taint.sql")
+    print(f"[{'PASS' if ok3 else 'FAIL'}] 抑制池: is_suppressed={ok3}")
+
+    # 4) 类型校正多数投票：首个类型可被更高票类型替换（不再先到先得）
+    r2 = SignalRegistry(path=tmp.with_name("t2.json"), enabled=True)
+    r2.record("b608", confirmed=True, n=3, votes_true=3, votes_false=0,
+              votes_invalid=0, file="a.py", taint_type="B608",
+              corrected_type="CWE-79 XSS")
+    first = r2.get_signal("b608").corrected_type
+    # C 级更准类型连续 2 个文件出现 → 应替换先到的 CWE-79
+    for f in ("b.py", "c.py"):
+        r2.record("b608", confirmed=True, n=3, votes_true=3, votes_false=0,
+                  votes_invalid=0, file=f, taint_type="B608",
+                  corrected_type="CWE-862 Missing Authorization")
+    sig2 = r2.get_signal("b608")
+    ok4 = first == "CWE-79 XSS" and sig2.corrected_type == "CWE-862 Missing Authorization"
+    print(f"[{'PASS' if ok4 else 'FAIL'}] 类型多数投票: {first!r} -> {sig2.corrected_type!r}")
+
+    # 5) 自动持久化 + 重启恢复（record 后无需手动 save）
+    ok5 = tmp.is_file()
+    r3 = SignalRegistry(path=tmp, enabled=True)  # 模拟进程重启
+    sig3 = r3.get_signal("py.taint.sql")
+    ok5 = ok5 and sig3 is not None and sig3.suppressed and len(sig3.confirmed_files) == 0
+    print(f"[{'PASS' if ok5 else 'FAIL'}] 自动持久化/重启恢复: file_exists={tmp.is_file()}, "
+          f"suppressed={sig3.suppressed if sig3 else None}")
+
+    all_ok = all([ok1, ok2, ok3, ok4, ok5])
+    print(f"\n{'=== 自检通过 ===' if all_ok else '!!! 自检失败 !!!'}")
+    sys.exit(0 if all_ok else 1)

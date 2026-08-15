@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -166,6 +167,18 @@ class CounterfactualVerifier:
         self._num_ctx = num_ctx
         self._injector = DefenseInjector()
 
+    def sync_runtime(self, client=None, system_prompt: Optional[str] = None) -> None:
+        """外部同步推理运行时（switch_model 后由 TwoStageScanner.sync_runtime 调用）。
+
+        2026-08-15 修复：此前实例在构造时捕获 client/system_prompt，后端切模型后
+        只同步主扫描器，本验证器永远停留在启动时的 prompt 上（client 侥幸因原地
+        mutate 是同一对象，prompt 是真 bug）。现在统一经 sync_runtime 跟随。
+        """
+        if client is not None:
+            self._client = client
+        if system_prompt is not None:
+            self._system_prompt = system_prompt
+
     def verify(
         self,
         code: str,
@@ -174,6 +187,7 @@ class CounterfactualVerifier:
         sink_line: int,
         build_prompt,
         temperature: float = 0.1,
+        source_line: int = 0,
     ) -> CounterfactualResult:
         """对判"有漏洞"的 finding 做反事实扰动验证。
 
@@ -182,8 +196,12 @@ class CounterfactualVerifier:
             language: 语言标签
             taint_type: finding 的漏洞类型（选择防御模板）
             sink_line: sink 行号（1-indexed，扰动锚点）
-            build_prompt: 构造开放判定 prompt 的 callable
+            build_prompt: 构造裁决 prompt 的 callable（建议 finding 级 triage prompt，
+                2026-08-15 修复：原开放扫描 prompt 问"整文件有无漏洞"——多 finding
+                文件修掉一个还剩另一个 → 不翻转 → 被误判"模式匹配"；finding 级
+                问句只裁决本 finding，消除该偏差）
             temperature: 翻转判定用低温（稳定，不采样）
+            source_line: 污点源行号（0=未知；用于限定 already_defended 检查范围）
 
         Returns:
             CounterfactualResult：flipped=True（模型理解防御→A级可回填）/
@@ -197,11 +215,18 @@ class CounterfactualVerifier:
             return CounterfactualResult(applicable=False)  # 无适用模板
 
         # 判定"原始代码是否已含同类防御"（区分 FP/TP：已含→模型没识别=误报；
-        # 未含→模型理解防御=真阳性）
+        # 未含→模型理解防御=真阳性）。
+        # 2026-08-15 修复：原实现全文搜索——文件任何位置一个 json.loads 就让全文件
+        # 的 pickle finding 标记"已防御"。防御必须在污点传播路径（source→sink）上
+        # 才可能拦截本 finding 的数据流；source 未知时退化为 sink 前 15 行窗口。
         already_defended = False
         sig = _DEFENSE_SIGNATURES.get(taint_type)
         if sig is not None:
-            already_defended = sig.search(code) is not None
+            lines = code.splitlines()
+            lo = source_line if source_line > 0 else max(1, sink_line - 15)
+            lo = max(1, min(lo, sink_line))
+            scope = "\n".join(lines[lo - 1:sink_line])
+            already_defended = sig.search(scope) is not None
 
         # 重跑单次裁决（低温），用扰动后的代码
         try:
@@ -246,3 +271,62 @@ class CounterfactualVerifier:
         else:
             result.flipped = None  # 解析失败：不作翻转判定
         return result
+
+
+# ---------------------------------------------------------------------------
+# 自检（离线，2026-08-15 新增：覆盖 already_defended 范围限定与 sync_runtime）
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("=== 反事实验证器自检（离线） ===\n")
+
+    from graduation_project.schema import parse_verdict  # noqa: F401
+
+    class FakeClient:
+        def __init__(self): self.calls = []
+        def generate(self, **kw):
+            self.calls.append(kw)
+            return {"text": '```json\n{"has_vulnerability": false}\n```'}
+
+    # 1) already_defended 只看 source→sink 区间：文件尾部无关的 json.loads
+    #    不得让 line 5 的 pickle.loads finding 标记"已防御"
+    code = "\n".join([
+        "import pickle",
+        "def load(data):",
+        "    return pickle.loads(data)  # L3 sink",
+        "x = 1",
+        "import json",
+        "cfg = json.loads(open('c.json').read())  # L6 无关防御",
+    ])
+    v = CounterfactualVerifier(client=FakeClient(), system_prompt="sys")
+    res = v.verify(code=code, language="python", taint_type="Insecure Deserialization",
+                   sink_line=3, source_line=3,
+                   build_prompt=lambda c, l: f"prompt:{l}")
+    ok1 = res.applicable and res.already_defended is False and res.flipped is True
+    print(f"[{'PASS' if ok1 else 'FAIL'}] already_defended 范围限定: "
+          f"applicable={res.applicable}, already_defended={res.already_defended}")
+
+    # 1b) 反例：sink 邻域真有 json.loads（防御在路径上）→ already_defended=True
+    code2 = "\n".join([
+        "import pickle, json",
+        "raw = open('f').read()",
+        "safe = json.loads(raw)  # L3 防御（在 source 前仍属传播路径窗口）",
+        "obj = pickle.loads(safe)  # L4 sink",
+    ])
+    res2 = v.verify(code=code2, language="python", taint_type="Insecure Deserialization",
+                    sink_line=4, source_line=2,
+                    build_prompt=lambda c, l: "p")
+    ok1b = res2.already_defended is True
+    print(f"[{'PASS' if ok1b else 'FAIL'}] 路径上真防御仍识别: already_defended={res2.already_defended}")
+
+    # 2) sync_runtime：切模型后 prompt/client 跟随
+    c2 = FakeClient()
+    v.sync_runtime(client=c2, system_prompt="new-prompt")
+    v.verify(code=code, language="python", taint_type="Insecure Deserialization",
+             sink_line=3, build_prompt=lambda c, l: "p")
+    ok2 = c2.calls and c2.calls[-1]["system_prompt"] == "new-prompt"
+    print(f"[{'PASS' if ok2 else 'FAIL'}] sync_runtime: system_prompt 已跟随 "
+          f"({c2.calls[-1]['system_prompt'] if c2.calls else '无调用'})")
+
+    all_ok = all([ok1, ok1b, ok2])
+    print(f"\n{'=== 自检通过 ===' if all_ok else '!!! 自检失败 !!!'}")
+    sys.exit(0 if all_ok else 1)

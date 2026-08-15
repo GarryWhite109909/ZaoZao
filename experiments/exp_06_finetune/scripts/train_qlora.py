@@ -13,6 +13,9 @@
   - EarlyStoppingCallback：dev loss 连续 patience 轮不降则停
   - load_best_model_at_end=True：训练结束自动回滚到 best checkpoint
   - 推荐 epochs=2, lr=1e-4（1万条蒸馏数据，rsLoRA r=8 + early stopping）
+  - 可选 --recycle-dev：阶段1（dev 分拆画 eval loss 曲线 + 选 best）确认健康后，
+    阶段2 把 dev 并回训练、用全量数据续训最终模型（final training on full data）。
+    注意：回收后 dev 的 eval_loss 不再代表泛化，最终指标须用独立测试集（如 testset_cve_fix）。
 
 用法（在 AI conda 环境中运行，需 GPU 访问）：
   # 自定义数据训练：与 v5 相同配置，仅数据不同
@@ -192,6 +195,14 @@ def main():
                              "用于 TunableOp recording 等短跑场景）")
     parser.add_argument("--resume", type=str, default="",
                         help="从 checkpoint 恢复训练（传入 checkpoint 目录路径）")
+    # 第 2 阶段：回收 dev 集（final training on full data）
+    parser.add_argument("--recycle-dev", action="store_true",
+                        help="阶段1（分 dev 看 eval loss 曲线 + 选 best）完成后，把 dev 集回收进训练，"
+                             "用全量数据续训最终模型。标准做法：train/dev 只用于模型选择，"
+                             "最终模型在全量数据上训练，避免宝贵的 dev 数据浪费。")
+    parser.add_argument("--recycle-epochs", type=float, default=1.0,
+                        help="回收阶段在全量数据上续训的 epochs（默认 1.0 = 全量过一遍；"
+                             "数据少时建议 1.0，过久易过拟合）")
     args = parser.parse_args()
 
     # 解析数据文件路径
@@ -396,6 +407,62 @@ def main():
     # 注意：load_best_model_at_end=True 时 model 已是 best，final 与 best 相同
     # 但 trainer_state 记录了完整训练过程
     print(f"（load_best_model_at_end=True，final 即 best）")
+
+    # ---- 第 2 阶段：回收 dev 集（--recycle-dev）----
+    # 方法论：train/dev 划分只用于「模型选择」（看 eval loss 曲线、early stopping、选 best epoch），
+    # 不是用来报告最终泛化的。确认曲线健康后把 dev 并回训练、用全量数据续训最终模型，
+    # 是标准的 "final training on full data"，避免宝贵的 dev 数据浪费。
+    # ⚠️ 边界：回收后 dev 的 eval_loss 不再代表泛化（模型已见过它）；最终指标必须来自
+    #    从未进过训练集的独立测试集（如 testset_cve_fix）。不要拿回收后的 dev loss 当泛化证据。
+    if args.recycle_dev and not short_run:
+        eff_batch = args.batch_size * args.grad_accum
+        full_len = len(full_dataset)
+        recycle_steps = max(1, int(round(args.recycle_epochs * full_len / eff_batch)))
+        recycled_dir = output_dir / "recycled"
+        print(f"\n[阶段2/回收dev] 把 {len(dev_dataset)} 条 dev 并回训练，全量 {full_len} 条续训 "
+              f"{args.recycle_epochs} epoch ≈ {recycle_steps} 步（从阶段1 best 继续，关闭 eval）")
+        sft_config2 = SFTConfig(
+            output_dir=str(recycled_dir),
+            num_train_epochs=args.recycle_epochs,
+            per_device_train_batch_size=args.batch_size,
+            gradient_accumulation_steps=args.grad_accum,
+            learning_rate=args.lr,
+            lr_scheduler_type="cosine",
+            warmup_ratio=args.warmup_ratio,
+            max_grad_norm=1.0,
+            logging_steps=args.logging_steps,
+            save_strategy="steps",
+            save_steps=args.save_steps,
+            save_total_limit=2,          # 回收阶段只留最后两个 checkpoint
+            bf16=False,
+            fp16=False,
+            gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+            optim="adamw_torch",
+            weight_decay=0.01,
+            seed=args.seed,
+            max_length=args.max_seq_length,
+            packing=False,
+            dataset_text_field=None,
+            assistant_only_loss=True,
+            report_to="none",
+            logging_dir=str(LOG_DIR),
+            eval_strategy="no",          # 曲线已在阶段1确认，回收阶段不再评估
+            dataloader_pin_memory=False,
+        )
+        # model 在阶段1结束时已回滚到 best（load_best_model_at_end=True）
+        trainer2 = SFTTrainer(
+            model=model,
+            args=sft_config2,
+            train_dataset=full_dataset,  # 全量（train + dev）
+            processing_class=tokenizer,
+        )
+        trainer2.train()
+        trainer2.save_model(str(recycled_dir))
+        trainer2.save_state()
+        print(f"[阶段2/回收dev] 全量续训完成，最终模型已保存到: {recycled_dir}")
+        print(f"   ⚠️ 此模型已见过 dev 数据：其泛化指标必须用独立测试集（如 testset_cve_fix）评估，")
+        print(f"      回收后的 dev eval_loss 不再代表泛化，仅能证明阶段1选型正确。")
 
     # 训练指标
     metrics = train_result.metrics

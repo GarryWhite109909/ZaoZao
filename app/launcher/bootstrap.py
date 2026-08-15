@@ -454,32 +454,6 @@ def select_backend() -> str:
         print("[启动器] 无效输入，请重新选择。")
 
 
-def resolve_transformers_merge() -> str:
-    """选定 transformers 后端后，追加 LoRA 合并 / 不合并子选择。
-
-    返回 "1"=合并（默认，推理快） / "0"=不合并（LoRA 保持 FP16 精度、精度更高，但更慢）。
-    选择写入环境变量传给后端进程，后端启动后即固定，重启后端前无法更改。
-
-    非交互环境（stdin 非 tty）或已显式设置 VULN_SCANNER_MERGE 时直接沿用现有值，不重复询问。
-    """
-    existing = os.environ.get("VULN_SCANNER_MERGE", "").strip()
-    if existing in ("0", "1") or not sys.stdin.isatty():
-        return existing or "1"
-    print()
-    print("  Transformers 后端 · LoRA 合并方式")
-    print("-" * 60)
-    print("  [1] 合并 LoRA 进基座（默认，推理更快）")
-    print("  [2] 不合并，运行时叠加（LoRA 保持 FP16 精度，精度更高，但推理更慢）")
-    print("  ⚠ 该选择会写入后端配置；后端启动后固定，重启后端前无法更改。")
-    while True:
-        choice = input("请选择（回车=合并，1=合并，2=不合并）: ").strip()
-        if choice == "" or choice == "1":
-            return "1"
-        if choice == "2":
-            return "0"
-        print("[启动器] 无效输入，请输入 1 或 2。")
-
-
 def check_inprocess_backend_ready(backend: str) -> bool:
     """校验进程内 / 独立服务的推理后端（transformers/llamacpp/vllm）的依赖与模型配置。
 
@@ -1538,9 +1512,8 @@ def main():
     # 0. 选择并锁定推理后端
     backend = select_backend()
     os.environ["VULN_SCANNER_BACKEND"] = backend
-    # transformers 后端追加 LoRA 合并 / 不合并子选择（写入环境变量，后端启动后固定）
-    if backend == "transformers":
-        os.environ["VULN_SCANNER_MERGE"] = resolve_transformers_merge()
+    # transformers 后端 LoRA 合并通道已永久关闭：TransformersClient 恒以运行时叠加
+    # （不合并，保留 FP16 精度）加载，不再设置 VULN_SCANNER_MERGE，也不询问用户。
     use_ollama = backend == "ollama"
     print(f"[启动器] 推理后端: {backend}")
 
