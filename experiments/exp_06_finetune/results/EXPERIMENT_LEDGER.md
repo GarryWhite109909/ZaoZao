@@ -892,13 +892,13 @@
 
 
 
-### v9max 三模型蒸馏 + 云端 A800 训练（2026-08-02 ~ 08-07，已发布为当前最佳）
+### v9max 双模型蒸馏 + 云端 A800 训练（2026-08-02 ~ 08-07，已发布为当前最佳）
 
 > 本地 SFT 数据到极限（v9）后转云端放大。详细过程见 docs/论文/第5章_训练主线.md 与 docs/过程.md。
 
 | 字段 | 值 |
 |---|---|
-| 训练数据 | 三模型 API 蒸馏（DeepSeek V4-Flash / Kimi K3 / GLM-5.2），清洗后 7692 条（漏洞 3493 / 安全 4199） |
+| 训练数据 | 双模型 API 蒸馏（DeepSeek V4-Flash / GLM-5.2；Kimi K3 脚本已编写但未启用、未产生数据），清洗后 7692 条（漏洞 3493 / 安全 4199） |
 | 训练配置 | Qwen3-8B bf16 全精度 LoRA（r=8, alpha=16, dropout=0.1, rsLoRA），A800，train 6539 / dev 1153，2 epoch，lr=1e-4，max_seq 6144，1636 步 ≈ 4.1h，train_loss ≈ 0.529 |
 | 发布形态 | base+LoRA 合并后 Q4_K_M 量化，发布为 Ollama 模型 `garrywhite109909/graduation-vuln-scanner:v9max` |
 
