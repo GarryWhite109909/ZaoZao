@@ -35,6 +35,9 @@ _CWE_BY_KEYWORD: list[tuple[tuple[str, ...], str]] = [
     # 归一后统一到 917，配合 cwe_family_match 的父子族宽松匹配（strict 口径）。
     (("expression language injection", "expression injection", "expression language", "spel", "ognl", "表达式注入"), "CWE-917 Improper Neutralization of Special Elements in Data Query Logic"),
     (("insecure deserialization", "反序列化", "deserial", "pickle"), "CWE-502 Deserialization of Untrusted Data"),
+    # 2026-08-18 补：CSRF 须在 "cross-site"（XSS）之前——"cross-site request
+    # forgery" 含 "cross-site" 子串，原顺序会把 CSRF 误归一为 CWE-79（应为 CWE-352）。
+    (("cross-site request forgery", "csrf", "跨站请求伪造"), "CWE-352 Cross-Site Request Forgery"),
     (("cross-site", "cross site", "xss", "跨站"), "CWE-79 Cross-Site Scripting"),
     (("path traversal", "directory traversal", "路径穿越", "path_traversal"), "CWE-22 Path Traversal"),
     # SSTI 统一归一到 CWE-1336（与 87 合成集 / CVE-fix 测试集的严格评估标注一致）。
@@ -42,17 +45,23 @@ _CWE_BY_KEYWORD: list[tuple[tuple[str, ...], str]] = [
     # 会造成 UI 显示层与严格评估层对"SSTI 正确编号"给出不同答案，故改为 1336。
     (("server-side template injection", "模板注入", "ssti"), "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine"),
     (("log injection", "日志注入", "logi"), "CWE-117 Improper Output Neutralization for Logs"),
+    # 2026-08-18 补：LDAP 注入（87 集 typical_24 / CVE-fix cve_fix_0002 均覆盖；
+    # 模型常语义对"LDAP注入"但编号记错成 CWE-89）。
+    (("ldap injection", "ldap注入", "ldap filter"), "CWE-90 Improper Neutralization of Special Elements used in an LDAP Statement"),
     # 认证/会话/凭证类（2026-08-17 补，供 normalize_with_evidence 从分析文本二次
     # 提取类型时使用——这些类型模型常分析对但标号记错或直接落工具 rule_id）：
-    (("cross-site request forgery", "csrf", "跨站请求伪造"), "CWE-352 Cross-Site Request Forgery"),
     (("session fixation", "会话固定"), "CWE-384 Session Fixation"),
-    (("hardcoded credential", "hardcoded secret", "hardcoded token", "硬编码凭据", "硬编码凭证"), "CWE-798 Use of Hard-Coded Credentials"),
+    (("hardcoded credential", "hard-coded credential", "hardcoded secret", "hard-coded secret", "hardcoded token", "hard-coded token", "硬编码凭据", "硬编码凭证"), "CWE-798 Use of Hard-Coded Credentials"),
     (("jwt", "json web token"), "CWE-347 Improper Verification of Cryptographic Signature"),
 ]
 
 # 短规则 ID 类关键词：裸子串会误命中 "logical"、"cmdi_xxx" 等上下文，
 # 用 \b 词边界收紧为独立词。
 _BOUNDED_KEYWORDS = frozenset({"cmdi", "codei", "logi"})
+
+# 字段中的 CWE 编号模式（normalize_with_evidence 守卫用：字段已有明确编号
+# 时不再用 evidence 做跨类型覆盖）。
+_CWE_NUM_RE = re.compile(r"CWE[- ]?\d+", re.IGNORECASE)
 
 
 def normalize_cwe_label(raw: str) -> str:
@@ -90,6 +99,9 @@ _CWE_PARENT_OF: dict[str, str] = {
     "CWE-917": "CWE-94",
     "CWE-1336": "CWE-94",
     "CWE-80": "CWE-79",
+    # 2026-08-18 补：CWE-95（Eval 注入）⊂ CWE-94（代码注入），官方树形分类
+    # 的直接父子关系；模型报 94 而测试集标 95（或反之）算同族命中。
+    "CWE-95": "CWE-94",
 }
 
 
@@ -103,9 +115,19 @@ def normalize_with_evidence(vulnerability_type: str, evidence: str = "") -> str:
 
     优先级（防覆盖模型明确判断）：
       1. 字段命中表内语义关键词 → 直接用规范标签（含同义纠正，如 "SQL注入"→89）；
-      2. 字段未命中（空/rule_id/表外如 CWE-639 Authorization Bypass）→ 用 evidence
-         关键词二次提取，命中返回规范标签；
-      3. 都未命中 → normalize_cwe_label 原样返回（不破坏性覆盖表外类型）。
+      2. 字段已含明确 CWE 编号（如 "CWE-798 Use of Hard-coded Credentials"）→
+         尊重模型给出的编号，原样返回，**不用 evidence 覆盖**（2026-08-18 守卫）；
+      3. 字段无编号（空/rule_id/none）→ 用 evidence 关键词二次提取，命中返回规范标签；
+      4. 都未命中 → normalize_cwe_label 原样返回（不破坏性覆盖表外类型）。
+
+    2026-08-18 守卫动机（v9max CVE-fix 实测误伤三例）：
+      - 字段 "CWE-798 Use of Hard-coded Credentials"（正确）——连字符 "hard-coded"
+        未命中关键词 "hardcoded credential"，字段查表失败落 evidence，evidence 中
+        出现 "sql" 被覆盖成 CWE-89（错）；
+      - 字段 "CWE-1336 Improper Neutralization ... Template Engine"（正确，全称
+        无 ssti 关键词）——被 evidence 的 "xss" 覆盖成 CWE-79（错）。
+    模型给出明确编号即是它的最终判断（错也暴露真实错误），evidence 只救
+    "模型没给出编号"的场景（空/rule_id），不做跨类型覆盖。
 
     Args:
         vulnerability_type: 模型输出的类型字段（可能为 ""/None/rule_id/乱码/表外编号）。
@@ -128,6 +150,8 @@ def normalize_with_evidence(vulnerability_type: str, evidence: str = "") -> str:
         for keywords, label in _CWE_BY_KEYWORD:
             if _hit(field, keywords):
                 return label  # 字段明确命中表内语义 → 用字段（不被 evidence 覆盖）
+        if _CWE_NUM_RE.search(field):
+            return field  # 字段已含明确编号 → 尊重模型判断，不进 evidence 兜底
     if evidence:
         for keywords, label in _CWE_BY_KEYWORD:
             if _hit(evidence, keywords):
