@@ -58,6 +58,8 @@ from experiments.utils import (
 
 MANIFEST_PATH = PROJECT_ROOT / "experiments/exp_04_hard_samples/samples/manifest.json"
 SAMPLES_DIR = PROJECT_ROOT / "experiments/exp_04_hard_samples/samples"
+CVE_FIX_MANIFEST = PROJECT_ROOT / "experiments/exp_06_finetune/testset_cve_fix/manifest.json"
+CVE_FIX_SAMPLES_DIR = PROJECT_ROOT / "experiments/exp_06_finetune/testset_cve_fix"
 OUTPUT_DIR = PROJECT_ROOT / "experiments/exp_07_two_stage_eval/results"
 DEFAULT_MODEL = "garrywhite109909/nivis-alpha0"
 
@@ -134,6 +136,10 @@ def parse_args() -> argparse.Namespace:
                         help="断点续跑：跳过已评估样本（按 file 匹配已有结果）")
     parser.add_argument("--output", type=str, default=None,
                         help="结果 JSON 输出路径（默认自动生成）")
+    parser.add_argument("--manifest-path", type=str, default=None,
+                        help=f"测试集 manifest 路径（默认 exp_04 87 段；CVE-fix 传 {CVE_FIX_MANIFEST}）")
+    parser.add_argument("--samples-dir", type=str, default=None,
+                        help="测试集代码样本目录（默认与 manifest 同目录）")
     return parser.parse_args()
 
 
@@ -285,8 +291,14 @@ def main() -> None:
     os.environ["HIP_VISIBLE_DEVICES"] = "0"
 
     # 1) 加载测试集
-    print(f"测试集 manifest: {MANIFEST_PATH}")
-    manifest, records = load_manifest(MANIFEST_PATH)
+    manifest_path = Path(args.manifest_path) if args.manifest_path else MANIFEST_PATH
+    samples_dir = Path(args.samples_dir) if args.samples_dir else None
+    if samples_dir is None:
+        # 默认与 manifest 同目录（87 段样本与 manifest 同目录；CVE-fix 亦同）
+        samples_dir = manifest_path.parent
+    print(f"测试集 manifest: {manifest_path}")
+    print(f"测试集样本目录: {samples_dir}")
+    manifest, records = load_manifest(manifest_path)
     if args.only_files:
         keep = {f.strip() for f in args.only_files.split(",") if f.strip()}
         records = [r for r in records if r.get("file") in keep]
@@ -395,7 +407,7 @@ def main() -> None:
         fname = rec.get("file", "")
         if fname in seen:
             continue
-        code = read_sample_code(SAMPLES_DIR, fname)
+        code = read_sample_code(samples_dir, fname)
         if code is None:
             continue
         lang = (rec.get("language") or "python").lower()
