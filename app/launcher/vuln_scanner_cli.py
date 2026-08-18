@@ -206,6 +206,9 @@ def build_scanner(args: argparse.Namespace):
         client=_old.client,
         system_prompt=get_prompt_for_model(model),
         keep_alive=0,
+        triage_aligned=True,  # 与后端一致，对齐论文 fixed5 组态
+        no_candidate_mode="full_recheck",
+        n_samples=3,
     )
 
 
