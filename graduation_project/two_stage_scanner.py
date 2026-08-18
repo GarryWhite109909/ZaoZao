@@ -909,7 +909,8 @@ class TwoStageScanner:
             )
             def _build_prompt(perturbed_code: str, language: str) -> str:
                 ctx = self._with_line_numbers(perturbed_code, 1)
-                return build_triage_prompt(finding_obj, ctx, language=language)
+                return build_triage_prompt(finding_obj, ctx, language=language,
+                                           aligned=self.triage_aligned)
             result = self._counterfactual.verify(
                 code=code, language=language, taint_type=taint_type,
                 sink_line=sink_line, build_prompt=_build_prompt,
@@ -1774,6 +1775,7 @@ class TwoStageScanner:
         prompt = build_triage_prompt(
             finding, code_context, language=language,
             filename=filename, rag_context=rag_context,
+            aligned=self.triage_aligned,
         )
         votes_true = votes_false = votes_invalid = 0
         raw_outputs: list[str] = []
