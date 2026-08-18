@@ -4,7 +4,7 @@
 
 [![最佳模型](https://img.shields.io/badge/最佳模型-v9max-blue)](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)
 [![基座](https://img.shields.io/badge/基座-Qwen3--8B--Instruct-green)](docs/方法.md)
-[![状态](https://img.shields.io/badge/状态-云端A800训练·v9max已发布-green)](规划.md)
+[![状态](https://img.shields.io/badge/状态-两阶段架构fixed5达标-green)](规划.md)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey)]()
 
 ## 目录
@@ -526,7 +526,23 @@ IntelliJ 插件提供编辑器内选中代码的扫描功能，结果以气球�
 
 ## 核心结果
 
-当前已发布最佳模型 **v9max**（Qwen3-8B-Instruct + 双模型蒸馏数据 7692 条，云端 A800 bf16 全精度 LoRA r=8 + rsLoRA 训练，Q4_K_M 量化部署）。后续训练版本 **Nivis-α0**（8616 条数据，9.3h A800 训练）已完成但**尚无评估数据**，论文/展示请以 v9max 为基准。
+### 两阶段系统级结果（exp_07，最新，2026-08-18）
+
+**两阶段架构（Stage 1 工具召回 + Stage 2 LLM 裁决 + 共形/反事实门控）在 Nivis-α0.5 上全量验证达标**（87 段测试集，干净环境 `--no-signal-feedback`，裁决式 prompt `triage_train_aligned`）：
+
+| 配置 | recall（不含 review） | FPR | accuracy | 明细 |
+|---|---|---|---|---|
+| 纯 LLM（α0.5，combined 变体） | 0.967 | 0.154 | 0.931 | 对照基线 |
+| 工具链 fixed3（历史，带污染） | 0.982 | 0.167 | 0.862 | 演进参考 |
+| **工具链 fixed5（当前，干净环境）** | **1.000** | **0.043** | **0.862** | TP=53 FN=0 TN=22 FP=1，review 11 |
+
+- 唯一 FP 为 `hard_crossfile_01_input`（CWE-441 缺失型漏洞，无确定性校验手段，已知可接受遗留，论文写局限）
+- **工具层提示质量审计**（五指标 A-E，`prompt_quality_audit.py`）：工具召回覆盖率 A 59.0% / 提示到点率 B 86.1% / 误导率 D 14.3%（剩余缺口=逻辑漏洞无专用规则，归训练侧 Nivis-α1）
+- 结果文件：`experiments/exp_07_two_stage_eval/results/exp_07_two_stage_eval.nivis-alpha0.triage_train_aligned.20260818_104203.json`；演进基线见 [docs/方法论_工具模型自适应闭环.md](docs/方法论_工具模型自适应闭环.md) §13.1b
+
+### 模型级结果（v9max，已发布形态）
+
+当前已发布最佳模型 **v9max**（Qwen3-8B-Instruct + 双模型蒸馏数据 7692 条，云端 A800 bf16 全精度 LoRA r=8 + rsLoRA 训练，Q4_K_M 量化部署）。后续版本 **Nivis-α0**（8616 条）与 **Nivis-α0.5**（两阶段训练：stage1 best + stage2 回收 dev 续训，7972 条）已完成训练并在 exp_07 两阶段评估中验证（见上表）。
 
 下表为 **HF 评估管道**（evaluate.py：NF4 4bit 基座 + FP16 LoRA 增量叠加）的结果：
 
@@ -552,7 +568,7 @@ CVE-fix recall(真实集):  baseline 0.375 → v5 0.571 → v9max 0.950（HF 管
 
 ## 当前状态与待决策
 
-> **截至 2026-08-10**：exp_01~05 零样本基线 + Prompt 消融已完成；exp_06 完成 P0 parse_fail 修复、P1 CVE-fix 真实集校准、P2 本地 SFT 迭代（v2~v9）、**双模型 API 蒸馏 + 云端 A800 训练 v9max 并已发布**。**v9max 为当前已发布里程碑**。2026-08-09~10 完成后续版本 **Nivis-α0** 训练（8616 条，prompt 统一为 V3_PROMPT），但尚无评估数据，论文请以 v9max 为基准。最终模型 **Nivis-alpha.1** 将在此基础上完成 DPO/GRPO、数据飞轮与 CoT 教学，收敛 FPR 与 CWE 归因。
+> **截至 2026-08-18**：exp_01~05 零样本基线 + Prompt 消融已完成；exp_06 完成训练主线并发布 **v9max**；后续 **Nivis-α0 / α0.5** 已完成训练。2026-08-12~18 完成 **exp_07 两阶段工具链架构**（工具召回 + LLM 裁决 + 共形/反事实门控 + 信号回填），α0.5 上 fixed5 全量验证达标（recall 1.000 / FPR 0.043，2026-08-18 已提交推送）。最终模型 **Nivis-alpha.1** 将完成 DPO/GRPO、数据飞轮与 CoT 教学，收敛 FPR 与 CWE 归因。
 
 > **2026-08-08 追加**：`fix_suggestion` 已从"完整可运行修复代码（``` 围栏）"改为
 > **行号锚定的单行局部修复建议**（如 `line 3: 应改为 ...`），原因：客户端 6K~8K
@@ -563,8 +579,9 @@ CVE-fix recall(真实集):  baseline 0.375 → v5 0.571 → v9max 0.950（HF 管
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | v9max 发布 | 双模型蒸馏 7692 条 → A800 bf16 训练 → Q4_K_M 发布为 Ollama 模型 | ✅ 已完成 |
-| Nivis-α0 | 继续清洗 8616 条 + prompt 统一为 V3_PROMPT → A800 训练 9.3h | ✅ 已训练，待评估 |
-| Nivis-alpha.1 | DPO/GRPO 偏好优化 + 数据飞轮 + CoT 教学，收敛 FPR 0.423 与 CWE 归因 | ⏳ 后续计划 |
+| Nivis-α0 / α0.5 | α0（8616 条，V3_PROMPT）→ α0.5 两阶段训练（7972 条，stage2 回收 dev） | ✅ 已训练并评估（exp_07） |
+| 两阶段架构验证 | 工具召回 + LLM 裁决 + 共形/反事实门控，α0.5 fixed5 全量达标（recall 1.000 / FPR 0.043） | ✅ 已完成（2026-08-18） |
+| Nivis-alpha.1 | DPO/GRPO 偏好优化 + 数据飞轮 + CoT 教学，收敛剩余 FPR 与 CWE 归因 | ⏳ 后续计划 |
 
 ***
 
@@ -808,7 +825,7 @@ Graduation-Project/
 
 ## 当前进度
 
-> **总体状态**：零样本推理基线（exp_01~05）已全部完成；训练主线（exp_06）中，2026-07-22 切换至 Qwen3-8B 后完成 P0 parse_fail 修复、P1 CVE-fix 真实集校准、P2 本地 SFT 迭代（v2→v9）、P3 双模型蒸馏 + 云端 A800 训练 **v9max**（当前已发布最佳）。2026-08-09~10 完成后续版本 **Nivis-α0** 训练（8616 条，prompt 统一为 V3_PROMPT），但尚无评估数据。G0 方法学修复（文件名泄漏等 9 项）已全量重跑。详细进度见 [规划.md](规划.md) 与 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)。
+> **总体状态**：零样本推理基线（exp_01~05）已全部完成；训练主线（exp_06）完成 v2→v9 本地迭代、**v9max** 发布与 **Nivis-α0/α0.5** 训练。2026-08-12~18 完成 **exp_07 两阶段工具链架构**评估并达标（fixed5：recall 1.000 / FPR 0.043）。G0 方法学修复已全量重跑。详细进度见 [规划.md](规划.md) 与 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)。
 
 ### ✅ 阶段一：LLM 漏洞检测能力摸底（exp_01，2026-06-28）
 
@@ -854,6 +871,15 @@ Graduation-Project/
 - **G0 方法学修复重跑（2026-08-08）**：文件名泄漏修复后全量重跑。Ollama 发布形态（GGUF Q4_K_M 合并量化）CVE-fix recall 实测 0.75~0.79（base 15/19 含 1 parse_fail；combined 15/20），与 HF 管道 0.95 的缺口来自 LoRA 增量是否保 FP16 精度；exp_05 消融结论（combined 变体最优）在 v9max 合成集上成立（FPR 19.2%→7.7%），但不迁移到真实 CVE。详见 [docs/过程.md](docs/过程.md) 2026-08-08 节。
 - **发布**：Q4_K_M 量化，发布为 Ollama 模型 `garrywhite109909/graduation-vuln-scanner:v9max`。
 - 详见 [docs/论文/第5章_训练主线.md](docs/论文/第5章_训练主线.md)、[docs/v9max_数据生成提示词.md](docs/v9max_数据生成提示词.md) 与 [docs/过程.md](docs/过程.md)
+
+### ✅ 阶段八：两阶段工具链架构评估与达标（exp_07，2026-08-12 ~ 08-18）
+
+- **对照实验触发方法论转变**：工具链修复前 recall 0.936 / FPR 0.191，26 个非正确样本归因显示 62% 为工具漏召（无 source 型漏洞纯 LLM 判对 15/16）→ 放弃"按漏洞类型补规则"，转向**自适应闭环**（工具定位 + LLM 语义兜底 + 裁决置信回填）。决策全集见 [docs/方法论_工具模型自适应闭环.md](docs/方法论_工具模型自适应闭环.md)。
+- **2.5 代架构**（共形预测统计门控 + 反事实反事实验证金标准门控 + 信号注册表回填，含信任分级/全票门槛/跨样本聚合/双向撤销）：α0 ollama 端五档演进 0.936/0.191 → **0.966/0.105**（recall/FPR），三维同时优于纯 LLM（0.934/0.154）。
+- **α0.5 + 裁决式 prompt（triage_train_aligned）fixed 系列演进**：fixed3 0.982/0.167（带跨跑污染，保留作对比）→ **fixed5 干净环境 1.000/0.043**（TP=53 FN=0 TN=22 FP=1，唯一 FP 为 CWE-441 缺失型已知遗留），2026-08-18 达标提交推送（`fcff343` + `b6fc7d6`）。
+- **提示质量审计固化**：五指标（召回覆盖率/到点率/噪音率/误导率/一致性）脚本 `prompt_quality_audit.py`，fixed5：A 59.0% / B 86.1% / D 14.3%，作为论文"工具层提示质量"证据。
+- **评估方法学教训落档**：抑制池跨跑污染（必须 `--no-signal-feedback`）、in-sample 共形校准泄漏、测试集反向拟合=答案泄漏（严禁）、归因分流铁律（工具问题本代修、模型问题归训练侧）。
+- 详见 [docs/过程.md](docs/过程.md) 2026-08-09~18 节、[docs/会话记忆匣_20260818.md](docs/会话记忆匣_20260818.md)
 
 ***
 
