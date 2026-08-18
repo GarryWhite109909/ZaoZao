@@ -91,21 +91,23 @@ _MAX_PATHS_PER_SCOPE = 50
 _SOURCE_PATTERNS: dict[str, list[str]] = {
     "python": [
         "request.args.get(", "request.form", "request.json", "request.data",
-        "request.GET", "request.POST", "request.headers", "request.COOKIES",
-        "request.META", "input(", "sys.argv", "os.environ",
+        "request.get_data(", "request.get_json(", "request.GET", "request.POST",
+        "request.headers", "request.COOKIES", "request.META", "request.files",
+        "input(", "sys.argv", "os.environ", "os.getenv(", "sys.stdin",
     ],
     "javascript": [
-        "req.query", "req.body", "req.params", "process.argv",
+        "req.query", "req.body", "req.params", "process.argv", "process.env",
         "location.hash", "document.URL", "document.referrer",
         "location.search", "window.name", "event.data",
     ],
     "typescript": [
-        "req.query", "req.body", "req.params", "process.argv",
+        "req.query", "req.body", "req.params", "process.argv", "process.env",
         "location.hash", "document.URL", "document.referrer",
         "location.search", "window.name", "event.data",
     ],
     "java": [
-        "request.getParameter", "request.getAttribute", "args[",
+        "request.getParameter", "request.getAttribute", "request.getHeader",
+        "System.getenv(", "args[",
     ],
     "php": [
         "$_GET", "$_POST", "$_REQUEST", "$_COOKIE", "$_FILES",
@@ -122,8 +124,11 @@ _SINK_DEFINITIONS: list[tuple[str, str]] = [
     ("executeQuery(", "SQL Injection"),
     ("executeUpdate(", "SQL Injection"),
     ("cursor.execute", "SQL Injection"),
-    # 命令注入（Java 的 Runtime.exec / Python 的 os.popen 等）
-    (".exec(", "Command Injection"),
+    # 命令注入（Java 的 Runtime.exec / Node child_process.exec / Python 的 os.popen 等）
+    # 2026-08-18 修正：原裸 ".exec(" 会命中 JS 的 RegExp.exec(pattern)（正则匹配不是
+    # 命令执行）→ 伪命令注入路径。收紧为具体的命令执行形态。
+    ("Runtime.getRuntime().exec(", "Command Injection"),
+    ("child_process.exec(", "Command Injection"),
     ("os.system(", "Command Injection"),
     ("system(", "Command Injection"),
     ("os.popen(", "Command Injection"),
@@ -135,20 +140,44 @@ _SINK_DEFINITIONS: list[tuple[str, str]] = [
     ("eval(", "Code Injection"),
     # 路径穿越
     ("open(", "Path Traversal"),
+    # 任意文件上传 / 解压路径穿越（CWE-434 / CWE-22）：
+    # - .save(  = 文件写入落盘方法（Flask FileStorage 的 file.save 等），参数含
+    #   request.files 派生的污点才构成路径——靠 taint 门（污染变量必须在 sink 参数）
+    #   区分真上传漏洞与 np.save/torch.save/model.save 等安全 API（2026-08-17 实证：
+    #   np.save 常量参数走真实链路 0 路径）。不能用窄匹配 file.save(——会漏
+    #   f.save/tgt.save 等任意变量名调用。
+    # - extractall( = tarfile/zipfile 解压入口（CVE-2025-4517 类，CWE-22）
+    (".save(", "Path Traversal"),
+    ("extractall(", "Path Traversal"),
     # 反序列化
     ("pickle.loads(", "Insecure Deserialization"),
     ("yaml.load(", "Insecure Deserialization"),
-    # XSS
+    # XSS（2026-08-18 补：insertAdjacentHTML/outerHTML/dangerouslySetInnerHTML 为
+    # 通用 JS/React HTML 注入形态；innerText/outerText 是纯文本赋值不算 sink）
     ("innerHTML", "XSS"),
     ("document.write(", "XSS"),
-    # 模板注入
+    ("insertAdjacentHTML", "XSS"),
+    ("outerHTML", "XSS"),
+    ("dangerouslySetInnerHTML", "XSS"),
+    # 模板注入（2026-08-18 补：render_template_string 是 Flask/Jinja2 最直接的
+    # 模板字符串渲染入口，此前漏召回）
     (".from_string(", "Server-Side Template Injection"),  # 模板来源含污点（env.from_string(用户串)）
+    ("render_template_string(", "Server-Side Template Injection"),
     ("render(", "Server-Side Template Injection"),
     ("render_template(", "Server-Side Template Injection"),
 ]
 
 _SINK_TAINT_TYPE: dict[str, str] = {pat: ttype for pat, ttype in _SINK_DEFINITIONS}
 _SINK_PATTERNS: list[str] = [pat for pat, _ in _SINK_DEFINITIONS]
+
+# sink 类型语言覆盖（2026-08-18）：同一调用名在不同语言生态语义不同——
+# JS/TS 中裸 exec() 来自 child_process 解构导入（Node 子进程执行；浏览器无 exec
+# 全局函数，RegExp.exec 是带点方法调用，裸 "exec(" 模式不会命中它）→ 命令注入；
+# Python 的 exec() 是代码执行，保持 Code Injection。typical_10_cmd_js 实测归因。
+_SINK_TYPE_LANG_OVERRIDE: dict[str, dict[str, str]] = {
+    "javascript": {"exec(": "Command Injection"},
+    "typescript": {"exec(": "Command Injection"},
+}
 
 # sink 危险度（用于截断时保留高危路径）
 _SINK_RANK: dict[str, int] = {
@@ -164,9 +193,14 @@ _SINK_RANK: dict[str, int] = {
 # 消毒函数（包裹污点变量后视为已消毒）。注意：
 # - 参数允许一层嵌套括号（如 int(request.args.get("id"))），配合迭代剥离可处理多层
 # - str 不在列表中：str() 只做字符串化，对 SQL/命令注入无消毒作用
+# - 2026-08-18 修正：原全局列表含 escape/quote/html.escape/urllib.quote/re.escape 等
+#   **只对特定漏洞类型有效**的消毒函数——`"SELECT ... " + html.escape(user)` 的 SQL
+#   路径被误判"已消毒"丢弃（跨类型漏报）；且 `escape(` 会匹配 `unescape(`（HTML 解码
+#   = 反防御）。现只保留类型无关的数值强制转换（int/float/bool 对 SQL/代码/路径的
+#   数值插值有效）+ shlex.quote（命令注入专用，误用场景罕见）。HTML/URL 编码类消毒
+#   交由 LLM 裁决层判断（生成为候选，不静默丢弃）。
 _SANITIZER_CALL_RE = re.compile(
-    r"(?:int|float|bool|escape|quote|html\.escape|htmlspecialchars|"
-    r"urllib\.quote|urllib\.quote_plus|shlex\.quote|re\.escape|intval|filter_var)"
+    r"(?:int|float|bool|shlex\.quote|intval|filter_var)"
     r"\s*\((?:[^()]|\([^()]*\))*\)",
     re.IGNORECASE,
 )
@@ -425,7 +459,8 @@ class TaintTracker:
                     sinks.append((label, [stmt_text], stmt_text))
 
             for label, args, arg_joined in sinks:
-                ttype = _SINK_TAINT_TYPE.get(label, "Unknown")
+                ttype = (_SINK_TYPE_LANG_OVERRIDE.get(ts_lang, {}).get(label)
+                         or _SINK_TAINT_TYPE.get(label, "Unknown"))
                 arg_clean = self._strip_string_literals(arg_joined)
 
                 # 直接 source 表达式出现在参数里（同语句流）；消毒包裹的不报

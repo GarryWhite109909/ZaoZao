@@ -170,6 +170,9 @@ class TwoStageResult:
     adjudications: list[AdjudicationVerdict] = field(default_factory=list)
     reviewer_findings: list[dict] = field(default_factory=list)   # 低置信需人工复核
     vulnerability_type: str = ""      # 文件级漏洞类型（取已确认裁决中最高严重度 finding）
+    vulnerability_types: list = field(default_factory=list)  # 多漏洞支持（2026-08-17）：
+                                      # 所有判真且过证据门的 finding 的规范化类型
+                                      # （去重保序）；vulnerability_type 保留为 top1 兼容
     risk_level: str = "None"          # 文件级风险等级（同样取最高严重度）
     explanation: str = ""             # 文件级分析说明（取已确认裁决的 reason）
     fix_suggestion: str = ""          # 文件级修复建议（取已确认裁决的 fix_suggestion）
@@ -195,6 +198,7 @@ class TwoStageResult:
             "adjudications": [a.to_dict() for a in self.adjudications],
             "reviewer_findings": self.reviewer_findings,
             "vulnerability_type": self.vulnerability_type,
+            "vulnerability_types": list(self.vulnerability_types),
             "raw_vulnerability_type": self.raw_vulnerability_type,
             "risk_level": self.risk_level,
             "explanation": self.explanation,
@@ -224,6 +228,80 @@ _SEV_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "none":
 # 的重灾区（bandit B 系列 / semgrep 普通规则 / trivy iac）。对它们的共形=vulnerable
 # 判定，须再过反事实验证（扰动不翻转 → 降级），防止"工具误报 + 模型全票被带偏"。
 _LOW_TRUST_CATEGORIES = frozenset({"sast", "iac"})
+
+# 标准漏洞语义类型白名单（无主告警剔除用，2026-08-17）：裁决层（triage prompt /
+# 证据门 / 反事实验证 / 类型校正）全部围绕这些类型工作。位置型规则（sast/iac）
+# 的 _infer_taint_type 若落不到白名单内（如 "request-data-write"、"B108" 等
+# 乱码/边缘语义），模型无从裁决，剔除出裁决队列交 LLM 全文件复核兜底。
+_STANDARD_TAINT_TYPES = frozenset({
+    "SQL Injection", "Command Injection", "Code Injection", "XSS",
+    "Server-Side Template Injection", "Path Traversal",
+    "Insecure Deserialization",
+})
+
+# 复核采信的确定性形态校验（2026-08-18 修正，替代 08-17 的类型白名单）：
+# 白名单内容曾被测试集结果反向拟合（FP 类型被排除、TP 类型被收录）——这是
+# 针对测试集调参，等同工具作弊，必须废弃。
+# 客观规则：复核判真（工具无证据、纯 LLM 全文件语义）采信前，校验"类型与代码
+# 形态是否匹配"。仅对**有确定性验证手段**的注入型漏洞做校验：
+#   ① 代码中必须存在该类型的标准 sink 特征（否则判的类型与代码不符，如
+#      "判 XSS 但代码无任何渲染点"）；
+#   ② sink 处不得已有该类型的标准防御（复用 counterfactual._DEFENSE_SIGNATURES，
+#      如 abspath 防路径穿越、参数化防 SQL——模型漏看已有防御 = 误判）。
+# 无确定性验证手段的类型（CSRF/认证缺失/弱密码/硬编码等缺失型漏洞）不设校验，
+# 全票采信——如实标注这是"模型语义兜底"，不是工具保证。
+# CWE 编号 → 语义类型（用于查 _DEFENSE_SIGNATURES；仅注入型，公共安全分类）
+_RECHECK_CWE_TO_TYPE = {
+    "CWE-78": "Command Injection", "CWE-77": "Command Injection",  # 77/78 命令注入同族编号
+    "CWE-94": "Code Injection",
+    "CWE-89": "SQL Injection", "CWE-79": "XSS", "CWE-80": "XSS",   # 80 为 XSS 子类
+    "CWE-22": "Path Traversal", "CWE-1336": "Server-Side Template Injection",
+    "CWE-502": "Insecure Deserialization",
+}
+
+# 语义类型 → 标准 sink 存在性特征（通用，任何语言代码适用）
+_RECHECK_SINK_RE = {
+    "Command Injection": re.compile(r"subprocess\.(?:run|Popen|call|check_output|check_call)\(|os\.system\(|os\.popen\(|Runtime\.getRuntime\(|ProcessBuilder|child_process"),
+    "Code Injection": re.compile(r"\beval\(|\bexec\(|SpelExpressionParser|ExpressionParser|Ognl|\.fromString\("),
+    "SQL Injection": re.compile(r"\.execute(?:Query|Update|Many)?\(|executemany\(|raw\(|session\.execute\("),
+    "XSS": re.compile(r"innerHTML|document\.write\(|insertAdjacentHTML|\.html\(|render(?:\(|_template)|return\s+[fF]['\"]|dangerouslySetInnerHTML|innerText\s*=|html\s*=\s*f['\"]|return\s+['\"][^'\"]*['\"]\s*\+"),
+    "Path Traversal": re.compile(r"open\(|\.save\(|extractall\(|\.extract\(|os\.path\.join|os\.path\.realpath|readFile|createReadStream|File\(|getResource\("),
+    "Server-Side Template Injection": re.compile(r"from_string\(|Environment\(|Template\(|render(?:\(|_template)|freemarker|velocity"),
+    "Insecure Deserialization": re.compile(r"pickle\.loads\(|yaml\.load\(|readObject\(|ObjectInputStream|json\.loads\(|parseObject\(|defineClass\("),
+}
+
+# 跨文件调用检测（2026-08-18）：提取 import 符号后检查其是否被调用
+#（f(...) 或 obj.f(...)）。被调函数的 sink 在当前文件不可见——形态校验无法
+# 静态否定"类型与代码不符"，因此视为"有外部 sink 语义依据"。仅定义 getter
+# 不调用导入函数的代码（如 crossfile_01 判 XSS）无任何 sink 依据，照常拦截。
+_IMPORT_RE = re.compile(
+    r"(?:from\s+[\w.]+\s+import\s+([\w,\s]+)|import\s+([\w.]+)(?:\s+as\s+[\w]+)?)",
+    re.MULTILINE,
+)
+
+# 函数/类定义检测（2026-08-18）：复核门 ③ 用它区分"纯顶层字面量脚本"
+#（无函数定义 → 无数据流接口 → 注入型判真需输入入口）与"有函数/类的代码"
+#（参数接口 = 潜在外部输入）。多语言覆盖（Python/JS/TS/Java/PHP）。
+_HAS_FUNCTION_DEF_RE = re.compile(
+    r"\b(?:def|function|class)\s+\w+|=>\s*\{|public\s+(?:static\s+)?[\w<>\[\],\s]+\s+\w+\s*\(",
+    re.MULTILINE,
+)
+
+
+def _has_cross_file_call(code: str) -> bool:
+    imported: set[str] = set()
+    for m in _IMPORT_RE.finditer(code):
+        if m.group(1):  # from x import a, b
+            imported.update(n.strip() for n in m.group(1).split(",") if n.strip())
+        elif m.group(2):  # import x / import x.y
+            imported.add(m.group(2).split(".")[0])
+    if not imported:
+        return False
+    for name in imported:
+        if re.search(rf"\b{re.escape(name)}\s*\(", code) or \
+                re.search(rf"\.{re.escape(name)}\s*\(", code):
+            return True
+    return False
 
 # 外部输入入口模式（确定性证据门用）：文件含任一模式即存在污点源可能；
 # 全无入口的模块级字面量脚本（如 noise_03：name = "admin" 硬编码拼接）不可能
@@ -367,9 +445,14 @@ class TwoStageScanner:
         use_conformal: bool = True,
         use_signal_feedback: bool = True,
         use_counterfactual: bool = True,
+        triage_aligned: bool = False,
     ):
         self.client = client
         self.system_prompt = system_prompt
+        # 训练对齐裁决（2026-08-17 推导）：triage_train_aligned 变体下，裁决 user prompt
+        # 输出 schema 用 has_vulnerability（对齐 α0.5 训练格式），而非 is_confirmed。
+        # 该标志同时让 _adjudicate_one 的解析走 has_vulnerability 优先（双格式兼容）。
+        self.triage_aligned = triage_aligned
         self.n_samples = max(1, min(int(n_samples), 10))
         self.temperature = temperature
         self.keep_alive = keep_alive
@@ -445,6 +528,11 @@ class TwoStageScanner:
             sampling_rate if sampling_rate is not None
             else os.environ.get("VULN_SCANNER_RECHECK_RATE", "0.1")
         )
+        # 抑制/剔除标记（2026-08-18 补回，08-16 审查 #4 修复在 git checkout 事故重建中
+        # 丢失）：本文件发生候选被抑制池跳过 / 无主告警剔除时置 True，无候选分支据此
+        # 强制 LLM 复核（否则生产 sampled 模式 90% 静默放行）。请求级使用，每次扫描
+        # 开始时复位。
+        self._last_suppressed = False
 
     # ------------------------------------------------------------------
     # 主入口
@@ -516,6 +604,9 @@ class TwoStageScanner:
             result.total_duration = time.time() - start
             return result
 
+        # 请求级复位抑制/剔除标记（候选被抑制池跳过或剔除 → 无候选分支强制复核）
+        self._last_suppressed = False
+
         # Stage 1：工具召回
         findings = self._stage1_recall(code, language, filename)
         result.findings = findings
@@ -523,9 +614,10 @@ class TwoStageScanner:
         result.stage1["recall_duration"] = round(time.time() - start, 2)
 
         # 无候选 → 判安全但复核：sampled=按比例抽样复核（监控工具层召回漂移）；
-        # full_recheck=全量 LLM 复核（安全关键场景，消除"无证据判安全"的静默放行）
+        # full_recheck=全量 LLM 复核（安全关键场景，消除"无证据判安全"的静默放行）。
+        # force=本文件发生抑制跳过/无主告警剔除（_last_suppressed）→ 强制复核
         if not findings:
-            recheck = self._maybe_recheck(code, language)
+            recheck = self._maybe_recheck(code, language, force=self._last_suppressed)
             result.has_vulnerability = False
             result.stage1["decision"] = "no_candidate_safe"
             if recheck is not None:
@@ -535,6 +627,22 @@ class TwoStageScanner:
                     votes_true = int(recheck.get("votes_true") or (1 if n == 1 else 0))
                     unanimous = n > 0 and votes_true == n
                     if self.trust_llm_recheck and unanimous:
+                        # 复核采信门（2026-08-18 修正）：无候选复核是全凭 LLM 的
+                        # 最高置信采信路径。注入型漏洞必须与代码形态匹配（sink 存在
+                        # + 无标准防御），否则转 review——客观规则，非测试集拟合
+                        # （safe_04 有 abspath 防御仍判 CWE-22、noise_05 参数化仍判
+                        # CWE-89、crossfile_01 无渲染点仍判 CWE-79 由此拦截）。
+                        vt_raw = recheck.get("vulnerability_type") or ""
+                        plausible, reject_reason = self._recheck_type_plausible(
+                            code, language, vt_raw)
+                        if not plausible:
+                            result.has_vulnerability = None
+                            result.stage1["decision"] = "recheck_unverified_type_review"
+                            result.error = (f"复核全票判 {vt_raw[:40]}，但代码形态不匹配"
+                                            f"（{reject_reason}），转人工复核")
+                            result.stage1["recheck"] = recheck
+                            result.total_duration = time.time() - start
+                            return result
                         # 自适应闭环（方法论_工具模型自适应闭环.md 决策点 2）：工具层
                         # 漏召（无候选）由 LLM 语义兜底，复核判 True 即采信为漏洞。
                         # 依据：16 个工具盲区样本纯 LLM 判定正确 15/16——模型天然会，
@@ -597,6 +705,10 @@ class TwoStageScanner:
                                 "file": filename or "inline",
                                 "feature": f"llm_only:{(vt or 'unknown')}",
                                 "evidence": (recheck.get("explanation") or "")[:200],
+                                # 2026-08-18 补：无候选采信路径本就全票门（votes_true==n），
+                                # 与兜底分支（has_candidate_recheck_vuln）一致带 unanimous 标记，
+                                # 否则 add_to_learn_pool 的门控直接 return（死写入）。
+                                "unanimous": True,
                             })
                     elif self.trust_llm_recheck:
                         # 多数判漏洞但非全票：不采信，转人工（防过度自信后端 recheck 误报）
@@ -611,6 +723,14 @@ class TwoStageScanner:
                 elif recheck.get("has_vulnerability") is False:
                     # 复核判安全：LLM 全量确认无漏洞，采信为安全（full_recheck 路径）
                     result.stage1["decision"] = "no_candidate_recheck_safe"
+                else:
+                    # 复核结果未知（推理异常/平票/解析失败）（2026-08-18 补回，
+                    # 08-16 审查 #2 修复在 git checkout 事故重建中丢失）：既未判真
+                    # 也未判安全，不能静默停在 no_candidate_safe，转人工复核。
+                    result.has_vulnerability = None
+                    result.stage1["decision"] = "recheck_unknown_review"
+                    result.error = (recheck.get("error")
+                                    or "复核结果未知（异常或平票），需人工复核")
             result.total_duration = time.time() - start
             return result
 
@@ -633,6 +753,79 @@ class TwoStageScanner:
 
         # 聚合最终结论
         self._aggregate(result, code=code)
+        # 裁决全否决兜底（2026-08-17 修复）：全部候选 finding 被裁决否决时，
+        # 文件被判安全——但裁决式任务只问"工具告警是否为真"，模型不会自主发现
+        # 工具没召回的漏洞（规则覆盖不可能 100%），工具盲区在裁决路径上被静默放行。
+        # 复用无候选复核通道（_maybe_recheck：开放式 build_user_prompt + system_prompt
+        # 全文件分析 + 双格式解析 + N 票全票门）对判安全文件做一次全文件复核，
+        # 命中且全票判真 → 采信为漏洞（与无候选 trust_llm_recheck 同门槛）。
+        if (result.has_vulnerability is False and result.adjudications
+                and self.trust_llm_recheck and code):
+            recheck = self._maybe_recheck(code, language, force=True, count_monitor=False)
+            if recheck is not None and recheck.get("has_vulnerability") is True:
+                n = int(recheck.get("n") or 1)
+                votes_true = int(recheck.get("votes_true") or (1 if n == 1 else 0))
+                if n > 0 and votes_true == n:
+                    # 复核采信门（2026-08-18，与无候选分支同因同标准）：客观形态校验，
+                    # 非测试集拟合（见 _recheck_type_plausible 注释）。
+                    vt_raw = recheck.get("vulnerability_type") or ""
+                    plausible, reject_reason = self._recheck_type_plausible(
+                        code, language, vt_raw)
+                    if not plausible:
+                        result.stage1["decision"] = "has_candidate_recheck_unverified_review"
+                        result.error = (f"兜底复核全票判 {vt_raw[:40]}，但代码形态不匹配"
+                                        f"（{reject_reason}），转人工复核")
+                        result.stage1["recheck"] = recheck
+                        result.total_duration = time.time() - start
+                        return result
+                    # 全票判真才采信（与 no_candidate 分支的 trust_llm_recheck 门槛一致）
+                    result.has_vulnerability = True
+                    result.stage1["decision"] = "has_candidate_recheck_vuln"
+                    _monitor_incr("recheck_vuln_trusted")
+                    vt = normalize_cwe_label(vt_raw) or vt_raw
+                    if vt:
+                        result.vulnerability_type = vt
+                        result.raw_vulnerability_type = vt_raw
+                    if recheck.get("risk_level"):
+                        result.risk_level = recheck["risk_level"]
+                    if recheck.get("explanation") and not result.explanation:
+                        result.explanation = recheck["explanation"]
+                    fix = recheck.get("fix_suggestion") or ""
+                    if fix and not result.fix_suggestion:
+                        result.fix_suggestion = (
+                            normalize_line_numbers(fix, code) if code else fix
+                        )
+                    src = recheck.get("source") or ""
+                    snk = recheck.get("sink") or ""
+                    synthetic = ToolFinding(
+                        rule_id="llm_recheck", category="llm",
+                        source=src or (recheck.get("explanation") or "LLM 复核判真（裁决全否决，工具未召回）")[:80],
+                        sink=snk or "（见 explanation：全文件语义分析）",
+                        taint_type=vt or "Unknown",
+                        source_line=0, sink_line=0, path=[],
+                        severity=(recheck.get("risk_level") or "medium").lower(),
+                        tool="llm_recheck",
+                        evidence=recheck.get("explanation") or "裁决全否决后全文件复核全票判真",
+                    )
+                    result.findings.append(synthetic)
+                    result.adjudications.append(AdjudicationVerdict(
+                        confirmed=True, confidence=1.0,
+                        votes_true=votes_true,
+                        votes_false=int(recheck.get("votes_false") or 0),
+                        votes_invalid=int(recheck.get("votes_invalid") or 0),
+                        reasoning=recheck.get("explanation") or "",
+                        fix_suggestion=result.fix_suggestion,
+                        finding=synthetic.to_dict(),
+                        decision="confirmed_vulnerability",
+                        vulnerability_type=vt or "",
+                    ))
+                    if self._signal_registry is not None:
+                        self._signal_registry.add_to_learn_pool({
+                            "file": filename or "inline",
+                            "feature": f"llm_only:{(vt or 'unknown')}",
+                            "evidence": (recheck.get("explanation") or "")[:200],
+                            "unanimous": True,
+                        })
         result.total_duration = time.time() - start
         return result
 
@@ -736,8 +929,12 @@ class TwoStageScanner:
             （复用 counterfactual._DEFENSE_SIGNATURES：参数化 execute / shlex.quote /
             html.escape / realpath / autoescape / json.loads）。模型没识别已有防御
             → 疑似模式匹配误报（noise_02 类：参数化正确的查询被泛规则命中后全票确认）。
-          - no_input_entry：全文件无任何外部输入入口（request/input/argv/environ/
-            函数定义），污点无从产生 → 疑似误报（noise_03 类：字面量拼接被 B608 命中）。
+          - no_input_entry：纯顶层字面量脚本且无外部输入入口（request/input/argv/
+            environ）——2026-08-18 起不再把"函数定义"计入入口（08-15 已从正则删除，
+            注释过期已修正），且与复核门③对齐：仅对**无任何函数/类定义的模块级
+            脚本**应用本门（noise_03/06 类：字面量拼接被 B608 命中）。有函数/类接口
+            的代码视参数为潜在外部输入（longfile_01 的 export_report(table) 由外部
+            调用方传入），本门不拦——否则真漏洞被误降级 review。
 
         命中不否决（不判 False），仅把该 finding 排除出"直接判漏洞"依据，转人工
         复核——门是保守的：宁可 review 不错杀 TP（真漏洞的 sink 邻域不会出现
@@ -753,6 +950,10 @@ class TwoStageScanner:
             return
         lines = code.splitlines()
         has_entry = bool(_INPUT_ENTRY.search(code))
+        # 2026-08-18：与复核门③（_recheck_type_plausible）对齐——仅对"无任何函数/
+        # 类定义的纯顶层脚本"应用 no_input_entry。有函数/类接口的代码视函数参数为
+        # 潜在外部输入（调用方可能传入外部数据），污点可能有源头，本门不拦。
+        has_func_def = bool(_HAS_FUNCTION_DEF_RE.search(code))
         for verdict in adjudications:
             if not verdict.confirmed or verdict.evidence_gate:
                 continue
@@ -768,8 +969,8 @@ class TwoStageScanner:
                 if sig.search("\n".join(lines[lo:hi])):
                     verdict.evidence_gate = "sink_defended"
                     continue
-            # 门 2：全文件无外部输入入口 → 污点无从产生
-            if not has_entry:
+            # 门 2：纯顶层字面量脚本且无外部输入入口 → 污点无从产生
+            if not has_entry and not has_func_def:
                 verdict.evidence_gate = "no_input_entry"
 
     # ------------------------------------------------------------------
@@ -821,7 +1022,136 @@ class TwoStageScanner:
                     findings.extend(fut.result())
                 except Exception as e:
                     print(f"[TwoStageScanner] 召回维度失败（已跳过）: {e}")
+        findings = self._drop_irrelevant_positional(findings)
         return self._dedupe(self._apply_signal_registry(findings))
+
+    # ------------------------------------------------------------------
+    # 无主告警剔除（2026-08-17）：工具不会的就别让它瞎说
+    # ------------------------------------------------------------------
+    def _drop_irrelevant_positional(self, findings: list[ToolFinding]) -> list[ToolFinding]:
+        """裁决前剔除无主告警：语义类型不在标准漏洞分类内的位置型规则。
+
+        背景（2026-08-17 工具盲区实锤）：hard_cve_03 被 "request-data-write"、
+        hard_owasp_01 被与文件上传无关的 format-string 告警命中——位置型规则
+        （sast/iac）命中的常是**文件里真实存在但与主漏洞无关**的代码特征，其
+        rule_id 是乱码级语义（如 request-data-write），不属于本项目裁决层可
+        裁决的漏洞分类（SQL/Command/Code/XSS/SSTI/PathTraversal/反序列化）。
+        triage prompt 的 taint_type 直接填这种乱码 → 模型无从裁决只会瞎投票，
+        且无关告警会锁死裁决式 prompt 的注意力、掩盖真实漏洞。
+
+        剔除策略（保守）：仅对位置型规则（sast/iac）按"语义类型白名单"过滤，
+        直出档（secret/sca）、带证据链的 taint/prefilter 一律不动。被剔除的
+        文件若因此落入无候选 → 强制复核（_last_suppressed=True 复用抑制语义，
+        见 _maybe_recheck force 分支）→ 开放式全文件 LLM 分析兜底真实漏洞。
+        """
+        dropped: list[str] = []
+        kept: list[ToolFinding] = []
+        for f in findings:
+            if f.category in ("sast", "iac"):
+                claimed = self._infer_taint_type(f.to_dict())
+                if claimed not in _STANDARD_TAINT_TYPES:
+                    dropped.append(f.rule_id or claimed or "")
+                    continue
+            kept.append(f)
+        if dropped:
+            # 复用抑制语义：本文件发生"候选被剔除"，无候选分支必须强制复核，
+            # 防止生产 sampled 模式下 90% 静默放行（与审查 #4 同机制）
+            self._last_suppressed = True
+            print(f"[TwoStageScanner] 剔除无主告警 {len(dropped)} 条"
+                  f"（{sorted(set(dropped))[:6]}）→ 交 LLM 全文件复核兜底")
+        return kept
+
+    # ------------------------------------------------------------------
+    # 复核采信的形态校验（2026-08-18）
+    # ------------------------------------------------------------------
+    def _recheck_type_plausible(self, code: str, language: str, vt_raw: str) -> tuple[bool, str]:
+        """客观校验复核判真类型与代码形态是否匹配（无候选/兜底复核采信前调用）。
+
+        设计原则（用户 2026-08-18 明令）：不得针对测试集拟合规则——白名单式的
+        "某某类型可采信"已被废弃（内容受测试集结果反向影响）。本方法只用**公共
+        安全知识**做确定性校验，对任何代码一视同仁：
+
+        - 注入型漏洞（SQL/命令/代码/XSS/路径穿越/SSTI/反序列化——有标准 sink 和
+          标准防御的）：复核判真必须满足
+            ① 代码中存在该类型的标准 sink 特征（_RECHECK_SINK_RE）；
+            ② sink 处没有该类型的标准防御（counterfactual._DEFENSE_SIGNATURES，
+               复用确定性证据门同一张防御表——abspath 防路径穿越、参数化防 SQL、
+               autoescape 防 SSTI、shlex.quote/列表参数防命令注入等）。
+          任一不满足 → 判的类型与代码不符（如"判 XSS 但无渲染点"、"有 abspath
+          防御仍判路径穿越"），转人工复核，不得采信。
+        - 缺失型/其他漏洞（CSRF/认证缺失/弱密码/硬编码/竞态/XXE 等——无确定性
+          验证手段的）：不做形态校验，全票采信。**如实标注**：这是"模型语义
+          兜底"，不是工具保证；其可靠度由全票门（3/3）支撑。
+
+        Args:
+            code: 被复核的完整源码。
+            language: 语言标签（仅做可校验性判定，规则本身与语言无关）。
+            vt_raw: 模型复核输出的 vulnerability_type 原串。
+
+        Returns:
+            (plausible, reason)。plausible=True 表示可采信；False 时 reason 说明
+            形态不匹配的具体原因（注入型且不满足 ①/②）。
+        """
+        _m = re.search(r"CWE[- ]?(\d+)", vt_raw or "")
+        if not _m:
+            return True, ""  # 无 CWE 编号：不做校验（评估侧另有类型纠正）
+        vt_num = f"CWE-{_m.group(1)}"
+        ttype = _RECHECK_CWE_TO_TYPE.get(vt_num)
+        if ttype is None:
+            # 缺失型/其他类型：无确定性校验手段，全票采信（模型语义兜底）
+            return True, ""
+        sink_re = _RECHECK_SINK_RE.get(ttype)
+        if sink_re is None:
+            return True, ""
+        if not code or not code.strip():
+            return False, "无代码内容"
+        # ① 标准 sink 必须存在：本文件 sink 特征，或调用了导入的外部函数
+        #（跨文件样本的 sink 在外部文件，如 hard_crossfile_02 的 safe_read_file
+        #  定义在另一文件——本文件只有调用点。"调用导入函数"= 可能存在外部
+        #  sink，是通用语义依据，非针对样本；仅定义 getter 不调用导入函数的
+        #  代码（如 crossfile_01 判 XSS）无任何 sink 依据，照常拦截。）
+        has_sink = bool(sink_re.search(code))
+        if not has_sink:
+            has_sink = _has_cross_file_call(code)
+        if not has_sink:
+            return False, f"代码中无 {ttype} 的标准 sink 特征"
+        # ③ 无输入入口检查（2026-08-18）：**仅对无任何函数/类定义的纯顶层脚本**
+        # 应用——顶层脚本无 request/input/env 输入且无函数参数接口时，注入型
+        # 判真不可信（noise_03 字面量拼 SQL、noise_06 硬编码串跑 subprocess）。
+        # 有函数/类定义的代码视为"存在数据流接口"（参数可能来自外部调用，
+        # 如 longfile_01 的 export_report(table) 由外部传入、cve_05 的 Spring
+        # 数据绑定），跳过本门——与确定性证据门 2 的"模块级字面量脚本"语义
+        # 一致（证据门 2 同样只对无函数定义脚本判 no_input_entry）。
+        if not _HAS_FUNCTION_DEF_RE.search(code) and not _INPUT_ENTRY.search(code):
+            return False, "纯顶层字面量脚本且无外部输入入口，注入型判定无污点来源"
+        # ② 标准防御检查（复用确定性证据门的防御签名表）。复核门判的是**文件级
+        # 漏洞存在性**：只要存在**一个**无防御的该类型 sink，该类型漏洞就可能
+        # 成立（longfile_01 有 15 处 execute，参数化行虽多但 L318 的拼接 query
+        # 无防御 → 模型判真合理）；仅当**所有**该类型 sink 都带防御时，才是
+        # "模型漏看已有防御"（误判，如 safe_01 唯一 execute 参数化）。
+        # 防御检查限定在 sink 邻域（±8 行），全文件搜索会把长文件里其他函数
+        # 的参数化误当"该 sink 已防御"。
+        try:
+            from graduation_project.counterfactual import _DEFENSE_SIGNATURES
+            sig = _DEFENSE_SIGNATURES.get(ttype)
+            if sig is not None:
+                sink_lines = [i for i, ln in enumerate(code.split("\n")) if sink_re.search(ln)]
+                lines = code.split("\n")
+                undefended_exist = False
+                all_defended = True
+                for sl in sink_lines:
+                    lo = max(0, sl - 8)
+                    hi = min(len(lines), sl + 9)
+                    if sig.search("\n".join(lines[lo:hi])):
+                        continue  # 该 sink 有防御
+                    undefended_exist = True
+                    all_defended = False
+                    break
+                if all_defended and sink_lines:
+                    return False, f"所有 {ttype} 的标准 sink 均已防御（模型漏看已有防御）"
+        except Exception:
+            pass
+        return True, ""
 
     # ------------------------------------------------------------------
     # 信号注册表接线（2026-08-15：自适应闭环此前"只写不读"，本方法是读取端）
@@ -850,22 +1180,32 @@ class TwoStageScanner:
         if skipped:
             for _ in skipped:
                 _monitor_incr("suppressed_skipped")
+            # 候选被抑制池跳过 → 本文件可能落入无候选：标记强制复核（08-16 审查 #4，
+            # 2026-08-18 补回：抑制跳过后若不再产生候选，无候选分支须 force 复核）
+            self._last_suppressed = True
         kept.sort(key=lambda f: -reg.boost_priority(f.rule_id or ""))
         return kept
 
-    def _maybe_recheck(self, code: str, language: str) -> Optional[dict]:
+    def _maybe_recheck(self, code: str, language: str, force: bool = False,
+                       count_monitor: bool = True) -> Optional[dict]:
         """无候选文件的 LLM 复核：监控 Stage 1 召回漂移，或全量复核消除静默放行。
 
         - no_candidate_mode="sampled"：按 sampling_rate 抽样（默认 10%），用主扫描
           prompt 全量判一次，给出工具层漏报率的在线估计（tool_recall_monitor_snapshot）。
         - no_candidate_mode="full_recheck"：每个无候选文件都复核（采样率视为 1），
           供 URL/GitHub 等安全关键场景——"无候选"不再直接判安全，先问一次 LLM。
+        - force=True（审查 #4，2026-08-16）：本文件发生抑制跳过时强制复核。
+        - count_monitor=False（裁决全否决兜底调用）：该场景文件有候选，不算
+          "无候选"文件，no_candidate_total 是召回监控指标，不能被污染。
 
         Returns:
             {"sampled": True, "has_vulnerability": bool|None}；未抽样时返回 None。
         """
-        _monitor_incr("no_candidate_total")
-        if self.no_candidate_mode == "full_recheck":
+        if count_monitor:
+            _monitor_incr("no_candidate_total")
+        if force:
+            sampled = True
+        elif self.no_candidate_mode == "full_recheck":
             sampled = True
         elif self.sampling_rate <= 0 or random.random() >= self.sampling_rate:
             return None
@@ -1356,7 +1696,64 @@ class TwoStageScanner:
                 parts.append("# ---- 文件级上下文（imports/全局量，仅供参考） ----")
                 parts.extend(header)
             parts.append(self._with_line_numbers("\n".join(body_lines), c.start_line))
+            # 调用点证据链（2026-08-17 修复）：长文件切片只含目标函数体，被切掉的
+            # 调用方是"函数参数是否用户可控"的关键证据——如 B608 命中
+            # StatsService.export_report(table) 的拼接 SQL，但调用方在另一函数，
+            # 模型无法确认 table 来自外部输入 → 1/2 判假（hard_longfile_01 FN 根因）。
+            # 本函数级切片（函数名可见于切片头）裁剪出对 target 函数的调用行。
+            call_lines = self._find_call_lines(orig_lines, c, language, code)
+            if call_lines:
+                parts.append("# ---- 该函数的外部调用点（函数参数来源证据，关键于判定是否用户可控） ----")
+                parts.append(self._with_line_numbers("\n".join(call_lines), 1))
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _find_call_lines(orig_lines: list[str], chunk, language: str, code: str) -> list[str]:
+        """收集对切片目标函数的显式调用行（无命名上下文时返回空）。"""
+        name = getattr(chunk, "name", None)
+        if not name or getattr(chunk, "is_full_file", False):
+            return []  # 整文件已在上下文中，无需补调用点
+        target_name = name.split(".")[-1]
+        # 定义行识别（2026-08-18 补 Java）：`def/class 名(`（Python）或
+        # 修饰符开头的方法声明 `public/private/static ... 名(`（Java）。排除
+        # "定义行"不被误当调用点——此前 Java 方法声明行会被收集进调用点证据。
+        def _is_def_line(ln: str) -> bool:
+            return re.match(
+                r"(?:\s*(?:def|class)\s+"
+                r"|\s*(?:(?:public|private|protected|static|final|abstract|synchronized)\s+)+"
+                r"[\w<>,.\[\]\s]*\s)"
+                + re.escape(target_name) + r"\s*\(",
+                ln,
+            ) is not None
+        # 排除目标函数自身的定义行，避免把 def 行误当调用
+        body_lines = orig_lines[chunk.start_line - 1:chunk.end_line]
+        body_def = next(
+            (ln for ln in body_lines if _is_def_line(ln)),
+            None,
+        )
+        calls: list[str] = []
+        seen: set[str] = set()
+        for i, raw in enumerate(orig_lines):
+            ln = raw.strip()
+            if not ln or ln.startswith("#") or ln.startswith("//"):
+                continue
+            # 精确匹配调用点：`target_name(`（可带对象/self/类前缀），
+            # 且不是 def/class/方法声明定义行、不是 target_name 自身的函数体行
+            if not re.search(r"\b" + re.escape(target_name) + r"\s*\(", ln):
+                continue
+            if _is_def_line(ln):
+                continue
+            if body_def is not None and re.search(
+                    r"\b" + re.escape(target_name) + r"\s*\(", ln) and \
+                    chunk.start_line - 1 <= i < chunk.end_line:
+                continue  # 目标函数体内部的行（含递归/其他调用）
+            if ln in seen:
+                continue
+            seen.add(ln)
+            calls.append(f"L{i + 1}: {ln}")
+            if len(calls) >= 6:
+                break
+        return calls
 
     @staticmethod
     def _with_line_numbers(code: str, start_line: int) -> str:
@@ -1583,6 +1980,22 @@ class TwoStageScanner:
             result.vulnerability_type = (
                 corrected or normalize_cwe_label(taint_type) or rule_id
             )
+            # 多漏洞收集（2026-08-17）：所有判真且过证据门的 finding 的类型
+            # （模型校正 > 工具 taint > rule_id），去重保序，供前端展示全部确认
+            # 漏洞（如 SSTI 样本同时确认 XSS + SSTI）。vulnerability_type 仍是 top1。
+            types: list[str] = []
+            for a in confirmed:
+                if a.evidence_gate:
+                    continue  # 与 _aggregate 底部 majority_confirm 的 evidence_gate 门一致
+                fd = a.finding or {}
+                t = (a.vulnerability_type or "").strip()
+                if not t:
+                    t = normalize_cwe_label(fd.get("taint_type") or "") or ""
+                if not t or t.lower() in ("none", "unknown", "detected"):
+                    t = str(fd.get("rule_id") or "")
+                if t and t not in types:
+                    types.append(t)
+            result.vulnerability_types = types
             # 原始类型（纠正前）：前端据此展示"工具原始标注 → CWE Normalizer 纠正"过程
             result.raw_vulnerability_type = taint_type or rule_id
             # 透出已确认裁决的 source/sink/分析/修复到文件级，供前端卡片收起态
@@ -1606,9 +2019,15 @@ class TwoStageScanner:
         if not result.adjudications:
             result.has_vulnerability = False
             return
-        # 高置信确认（≥_CONF_AUTO）才能直接判漏洞；低置信确认已进入复核队列，
-        # 文件级不能输出确定性 True（否则"需复核"信号在汇总层被掩盖）。
-        # 证据门拦截的判中同样排除（sink 已防御/无输入入口 → 疑似模式匹配误报）
+        # 文件级 True 的两条通道（2026-08-18 注释修正，消除与底部 majority_confirm 的
+        # 表面矛盾）：
+        #   (a) 高置信确认（≥_CONF_AUTO）：单条 finding 的高置信判中直接判 True；
+        #   (b) 存在性多数判真（底部 majority_confirm）：漏洞判定是存在性的——任一
+        #       finding 多数票判真（votes_true > votes_false）即文件存在该漏洞。
+        # 低置信确认（0.5~0.8）虽计入 reviewer_findings（前端展示"需复核"），但只要
+        # 存在性成立，文件级仍输出 True（2026-08-16 修复，避免无关 finding 否决票
+        # 对冲掉提示到点的判真）。两通道都排除 evidence_gate 拦截的判中（sink 已防御/
+        # 无输入入口 → 疑似模式匹配误报）。
         strong_confirmed = any(
             a.confirmed and a.confidence >= _CONF_AUTO and not a.evidence_gate
             for a in result.adjudications
@@ -1661,18 +2080,40 @@ class TwoStageScanner:
             result.has_vulnerability = None
             if not result.error:
                 result.error = "所有 finding 裁决解析失败，需人工复核"
-        elif any_confirmed or result.reviewer_findings:
-            # 低置信确认 / 平票 / 低置信否决 / 证据门拦截 → 需复核，文件级判 None
-            result.has_vulnerability = None
-            if not result.error:
-                gated = sorted({a.evidence_gate for a in result.adjudications
-                                if a.confirmed and a.evidence_gate})
-                if gated:
-                    result.error = "证据门拦截（%s）：sink 已防御或无可信污点源，疑似模式匹配误报，需人工复核" % "/".join(gated)
-                else:
-                    result.error = "存在低置信或平票裁决，需人工复核"
         else:
-            result.has_vulnerability = False
+            # 多数判真采信（2026-08-16/17 修复，存在性判定）：漏洞判定是存在性的——
+            # 文件里只要有任一工具召回 finding 多数票判真（votes_true > votes_false）
+            # 就该报 True，不该被无关 finding 的否决票对冲（hard_cve_03 的 B108 T2/F1
+            # 判真 + django T1/F2 判假、typical_13 的 taint XSS 判真 + flask 判假等
+            # 4 个 review 全是"提示到点的 finding 判真 + 无关 finding 判假"对冲）。
+            # 数据佐证：判真 finding 19 条全在漏洞样本、安全样本 0 条（工具召回类）。
+            # 排除 category=="llm" 的合成 finding（recheck 复核路径，走 trust_llm_recheck
+            # 全票门槛，不参与本存在性判定——混入会把 crossfile 安全样本的复核误判
+            # 放大成 FP）。
+            # 2026-08-17 修复：排除 evidence_gate 拦截的判真。safe_03 实锤：subprocess
+            # 列表参数 3 个 finding 全命中 sink_defended，但原实现 majority_confirm
+            # 只查 confirmed 绕过 evidence_gate → FP。与 strong_confirmed 的
+            # `not a.evidence_gate` 对齐（证据门拦截 = 疑似模式匹配误报）。
+            _confirmed_cnt = sum(
+                1 for a in result.adjudications
+                if a.confirmed and a.votes_true > a.votes_false
+                and (a.finding or {}).get("category") != "llm"
+                and not a.evidence_gate
+            )
+            if _confirmed_cnt > 0:
+                result.has_vulnerability = True
+            elif any_confirmed or result.reviewer_findings:
+                # 低置信确认 / 平票 / 低置信否决 / 证据门拦截 → 需复核，文件级判 None
+                result.has_vulnerability = None
+                if not result.error:
+                    gated = sorted({a.evidence_gate for a in result.adjudications
+                                    if a.confirmed and a.evidence_gate})
+                    if gated:
+                        result.error = "证据门拦截（%s）：sink 已防御或无可信污点源，疑似模式匹配误报，需人工复核" % "/".join(gated)
+                    else:
+                        result.error = "存在低置信或平票裁决，需人工复核"
+            else:
+                result.has_vulnerability = False
 
 
 # 各 taint_type 映射到默认严重度（与 design 草稿一致）

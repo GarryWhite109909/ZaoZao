@@ -328,7 +328,11 @@ class ExternalScanner:
             SAST 发现列表（category="sast"）
         """
         findings: list[ExternalFinding] = []
-        if language == "python" and "bandit" in self._installed:
+        # 2026-08-16 修复：language 大小写兜底——manifest.json 用 'Python'（大写），
+        # 直接 == "python" 会静默跳过 bandit（typical_18/19 只靠 bandit 召回时工具
+        # 失效）。调用方应传小写，但这里内部兜底更稳。
+        lang = (language or "").lower()
+        if lang == "python" and "bandit" in self._installed:
             findings.extend(self._run_bandit(path))
         if "semgrep" in self._installed:
             findings.extend(self._run_semgrep(path))

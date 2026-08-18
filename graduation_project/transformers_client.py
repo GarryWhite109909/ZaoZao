@@ -472,6 +472,15 @@ class TransformersClient:
             has_cuda = torch.cuda.is_available()
             is_rocm = bool(getattr(torch.version, "hip", None))
 
+            # 量化降级（2026-08-17，跨品牌适配）：bitsandbytes 4bit 是 CUDA/HIP
+            # 专属路径，CPU-only（无 GPU 的 Windows/Linux/云 CPU 环境）上
+            # BitsAndBytesConfig 会加载失败或走不可靠的 CPU 4bit 内核。
+            # 无 GPU 时自动禁用量化，用 fp32 全精度（内存换稳定）。
+            if self.quantize and not has_cuda:
+                print("[TransformersClient] ⚠ 未检测到 CUDA/HIP 设备，自动禁用 4bit 量化"
+                      "（bitsandbytes 需 GPU），使用 fp32 全精度加载")
+                self.quantize = False
+
             # 计算精度：
             #   - ROCm→bf16（fp16 在部分 CDNA 卡上慢）
             #   - NVIDIA→fp16（消费级 2x 速率）
@@ -695,12 +704,26 @@ class TransformersClient:
             try:
                 del self._model
                 self._model = None
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                self._reclaim_cache()
                 return True
             except Exception:
                 return False
         return True
+
+    @staticmethod
+    def _reclaim_cache() -> None:
+        """归还推理缓存给驱动（跨品牌安全，2026-08-17）。
+
+        - CUDA（NVIDIA）/ ROCm（AMD）：empty_cache 把 HIPCachingAllocator 缓存的
+          峰值块归还驱动，防碎片累积导致的 OOM/硬件异常（长期 N 采样实验）。
+        - CPU（无 CUDA 构建）：torch.cuda 不可用，empty_cache 会抛
+          "Torch not compiled with CUDA enabled"——必须按 is_available() 短路。
+        - Mac MPS：本项目 transformers 后端未支持 MPS 加载（device_map 只认
+          cuda/cpu），不在此路径；MPS 的 empty_cache 语义也不在此处理。
+        """
+        torch = _lazy_import_torch()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def generate(
         self,
@@ -769,7 +792,7 @@ class TransformersClient:
                 response = self._tokenizer.decode(generated, skip_special_tokens=True)
                 duration = time.time() - start_time
 
-                return {
+                result = {
                     "text": response,
                     "duration": duration,
                     "tokens": {
@@ -780,7 +803,19 @@ class TransformersClient:
                     "meta": {"backend": "transformers", "model": self.model_id},
                     "error": None,
                 }
+                # 显存回收（2026-08-17）：HIPCachingAllocator 会缓存推理峰值块，
+                # 长期多轮采样（N 采样 + 复核 + 反事实）后碎片累积到 free=0，
+                # 下一次请求 new block 触发映射失败 → ROCm 硬件异常崩溃
+                # （expandable_segments 下尤甚）。推理后立即释放大张量并归还驱动。
+                # _reclaim_cache 内部按 torch.cuda.is_available() 判品牌，CPU 安全跳过。
+                del inputs, outputs, generated
+                self._reclaim_cache()
+                return result
             except Exception as e:
+                try:
+                    self._reclaim_cache()
+                except Exception:
+                    pass
                 return {
                     "text": "",
                     "duration": time.time() - start_time,
@@ -906,6 +941,21 @@ class TransformersClient:
             finally:
                 if hasattr(self._tokenizer, "padding_side"):
                     self._tokenizer.padding_side = old_padding_side
+                # 显存回收（2026-08-17，与 generate 同因）：批量解码峰值更大，
+                # 释放 batch 张量并归还驱动，防碎片累积导致的 ROCm 崩溃。
+                # 逐个 del：tokenize 失败路径 enc 可能未定义，单独吞掉。
+                try:
+                    del enc
+                except NameError:
+                    pass
+                try:
+                    del outputs
+                except NameError:
+                    pass
+                try:
+                    self._reclaim_cache()
+                except Exception:
+                    pass
 
         if batch_error is not None:
             # 批量失败（如 OOM）逐条回退（锁外执行，self.generate 会重新取锁），

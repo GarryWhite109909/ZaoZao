@@ -64,15 +64,21 @@ _DEFENSE_TEMPLATES: dict[str, list[tuple[re.Pattern, str]]] = {
          lambda line: _wrap_concat_vars(line, "shlex.quote")),
     ],
     "SQL Injection": [
-        # execute 内联拼接（execute("..." + x)）→ 参数化
-        (re.compile(r"\.execute\(\s*['\"][^'\"]*['\"]\s*\+\s*([\w.\[\]]+)\s*\)"),
+        # execute 内联拼接（execute("..." + x)）→ 参数化（保留原查询字符串，最小扰动。
+        # 2026-08-18 修正：原实现把查询整体改写为 'SELECT 1 WHERE ?=1'，破坏语义且
+        # 非最小扰动——模型看到查询被改会误判"换了查询逻辑"而非"加了参数化"）
+        (re.compile(r"\.execute\(\s*((['\"])[^'\"]*\2)\s*\+\s*([\w.\[\]]+)\s*\)"),
          lambda line: re.sub(
-             r"\.execute\(\s*(['\"][^'\"]*['\"])\s*\+\s*([\w.\[\]]+)\s*\)",
-             r".execute('SELECT 1 WHERE ?=1', (\2,))", line)),
-        # 字符串拼接含单引号（"'" + x + "'"）→ 单引号转义（经典 SQL 转义修复，模型认识）
-        (re.compile(r"[+=]\s*([A-Za-z_$][\w$]*)\s*\+"),
-         lambda line: re.sub(r"\+(\s*[A-Za-z_$][\w$]*)\s*\+",
-                             lambda m: f"+ {m.group(1)}.replace('\"', \"''\") +", line)),
+             r"\.execute\(\s*((['\"])[^'\"]*\2)\s*\+\s*([\w.\[\]]+)\s*\)",
+             r".execute(\1, (\3,))", line)),
+        # 字符串拼接含单引号（"'" + x + "'"）→ 单引号转义（经典 SQL 转义修复，模型认识）。
+        # 2026-08-18 修正：(a) 原转义字符写错——replace('"', "''") 替换的是双引号，
+        # SQL 单引号转义应为 replace("'", "''")；(b) 锚点要求 `+` 前有引号字符
+        # （'或"），避免把算术 a + b + c 误当字符串拼接扰动
+        (re.compile(r"['\"]\s*\+\s*[A-Za-z_$][\w$]*\s*\+"),
+         lambda line: re.sub(
+             r"(['\"])(\s*\+\s*)([A-Za-z_$][\w$]*)(\s*\+)",
+             lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}.replace(\"'\", \"''\"){m.group(4)}", line)),
     ],
     "XSS": [
         # return f-string 插值 → html.escape 包裹插值
@@ -109,9 +115,16 @@ _VERIFIABLE_LANGS = {"python", "py", "javascript", "js", "typescript", "ts"}
 # 若原始无防御，扰动后判安全 → 模型真理解防御 → 真阳性（TP）。
 _DEFENSE_SIGNATURES: dict[str, re.Pattern] = {
     "Command Injection": re.compile(r"shlex\.quote|subprocess\.run\(\s*\[|shell\s*=\s*False"),
-    "SQL Injection": re.compile(r"\?\s*,\s*\(|%(?:s|d)\s*,\s*\(|execute\(\s*['\"][^'\"]*['\"]\s*,\s*\("),
-    "XSS": re.compile(r"html\.escape|markupsafe|escape\("),
-    "Path Traversal": re.compile(r"abspath|realpath"),
+    "SQL Injection": re.compile(r"\?\s*,\s*\(|%(?:s|d)\s*,\s*\(|execute\(\s*['\"][^'\"]*['\"]\s*,\s*\(|prepareStatement\(|setString\(|setInt\(|setLong\("),
+    # 2026-08-18 修正：原 `escape\(` 会误匹配 html.unescape(（HTML 解码=反防御）和
+    # re.escape(（正则转义≠输出编码）。加负向后顾排除 un/re. 前缀；import 行
+    # （from markupsafe import escape）不含 "escape(" 自然不再命中。
+    "XSS": re.compile(r"html\.escape|markupsafe|(?<!un)(?<!re\.)escape\("),
+    "Path Traversal": re.compile(r"\.startswith\(|startswith\("),
+    # 2026-08-18 审查修正：abspath/realpath 单独调用不是路径穿越防御——
+    # 它们只是规范化路径，真正的防御是白名单前缀校验（abs_target.startswith(abs_base)）
+    # 或 realpath+前缀比较。原规则把任何用 abspath 的代码都当"已防御"，
+    # 会误拦真漏洞（如 open(os.path.abspath(用户路径)) 无前缀校验仍可穿越）。
     "Server-Side Template Injection": re.compile(r"autoescape\s*=\s*(?:True|select_autoescape)"),
     "Insecure Deserialization": re.compile(r"json\.loads|yaml\.safe_load"),
 }

@@ -209,6 +209,25 @@ EVAL_SYSTEM_VARIANTS = (
     "combined_nosource", # combined+增强CoT：加"无 source 型漏洞自检"，救弱随机/授权/整数溢出 FN
     # ---- 两阶段扫描裁决专用变体（2026-08-12）----
     "triage_default",    # 裁决专用：封闭二分类判工具告警真伪，去找漏洞内容，聚焦压误报（~1500字）
+    # ---- 工具链裁决消融变体（2026-08-16）----
+    # 任务错位实证：stage2 工具链用 combined(开放找洞式) recall 0.864 < 纯LLM 0.967，
+    # 因为裁决收到的是"局部切片+可疑点证据链"而非全文。以下变体专为裁决任务设计，
+    # 在 triage_default(裁决式) 基础上做梯度 + 防误导强化：
+    "triage_cot",        # 裁决 + 简短 CoT 步骤：先独立核验数据流再判定（~1000字）
+    "triage_min",        # 极简裁决：只留角色+判定要点（~400字），内化假设
+    "triage_independent",# 强化独立判定：显式警告"工具标注可能误导，须独立分析"（~1100字）
+    # ---- 训练对齐裁决变体（2026-08-17 推导）----
+    # α0.5 训练用 ALPHA05_PROMPT 的 has_vulnerability 7 字段格式，模型权重内化
+    # has_vulnerability；triage_* 用 is_confirmed 是训练从未见过的格式 → 裁决
+    # 自一致漂移（分析对但投假，recall 0.676 根因）。此变体 system=ALPHA05_PROMPT
+    # （训练原样）+ 输出 schema 对齐 has_vulnerability。
+    "triage_train_aligned",  # 训练格式对齐裁决（system=ALPHA05_PROMPT + has_vulnerability schema）
+    # ---- α0.5 精简 prompt 消融（2026-08-15）----
+    # α0.5 训练统一用 ALPHA05_PROMPT（1495 字）。假设：SFT 已内化要求，推理 prompt
+    # 过长反而注意力稀释。三档梯度验证：原样(1495) → 精简(~800) → 极简(~400)。
+    "alpha05",           # = ALPHA05_PROMPT 训练原样（1495字），基线
+    "alpha05_lite",      # 去示例+压缩要求（~800字），假设推理可更短
+    "alpha05_min",       # 只留角色+schema（~400字），最强内化假设
 )
 
 
@@ -309,6 +328,20 @@ def get_eval_system_prompt(variant: str) -> str:
         return _build_combined_nosource_prompt()
     if variant == "triage_default":
         return _build_triage_default_prompt()
+    if variant == "triage_cot":
+        return _build_triage_cot_prompt()
+    if variant == "triage_min":
+        return _build_triage_min_prompt()
+    if variant == "triage_independent":
+        return _build_triage_independent_prompt()
+    if variant == "triage_train_aligned":
+        return ALPHA05_PROMPT  # 训练原样 system（has_vulnerability 格式，对齐裁决 schema）
+    if variant == "alpha05":
+        return ALPHA05_PROMPT
+    if variant == "alpha05_lite":
+        return _build_alpha05_lite_prompt()
+    if variant == "alpha05_min":
+        return _build_alpha05_min_prompt()
     raise ValueError(f"未知评估变体: {variant}（合法值: {EVAL_SYSTEM_VARIANTS}）")
 
 
@@ -583,6 +616,78 @@ def _build_triage_default_prompt() -> str:
     )
 
 
+def _build_triage_cot_prompt() -> str:
+    """裁决 + 简短 CoT：先独立核验数据流，再判定 is_confirmed（~1000字）。
+
+    相比 triage_default 增加"独立核验→判定"的显式步骤：模型须先确认 source 是否
+    真用户可控、sink 是否真危险、防御是否有效，再给结论。防止模型被工具标注
+    （rule_id/taint_type）带偏，也防止"看到告警就机械附和"。
+    """
+    return (
+        "你是一名资深代码安全审计专家，负责裁决静态工具告警是否为真实漏洞。\n"
+        "你将收到一条工具报告的可疑数据流（污染源→危险点）与相关代码切片，"
+        "任务是判断该告警是否为真实可利用的漏洞。\n\n"
+        "判定步骤（必须逐步执行）：\n"
+        "1. 独立核验污染源：source 是否真的用户可控？还是常量/受限输入？\n"
+        "2. 独立核验危险点：sink 是否真的危险？工具标注的漏洞类型是否可信？\n"
+        "3. 检查 source→sink 之间是否有有效防御（参数化/列表参数/shlex.quote/白名单/"
+        "autoescape 等）。若防御有效，该告警是误报，is_confirmed=false。\n"
+        "4. 硬编码字面量凭证本身就是漏洞；不得捏造代码中不存在的 API 参数。\n\n"
+        "请先给出简短分析过程，然后输出如下 JSON（不要输出其他代码块）：\n"
+        "```json\n"
+        + _TRIAGE_SCHEMA +
+        "```"
+    )
+
+
+def _build_triage_min_prompt() -> str:
+    """极简裁决：只留角色 + 判定要求（~450字），假设 SFT 已内化裁决能力。
+
+    与 alpha05_min 对应但面向裁决任务：砍掉白名单/硬编码条文（模型训练已内化），
+    只保留"判定告警真伪"的核心指令，检验极简 prompt 在裁决任务上是否足够。
+    """
+    return (
+        "你是一名资深代码安全审计专家，负责裁决静态工具告警是否为真实漏洞。\n"
+        "你将收到一条工具报告的可疑数据流（污染源→危险点）与相关代码切片，"
+        "任务是判断该告警是否为真实可利用的漏洞。\n\n"
+        "判定要点：\n"
+        "1. 确认 source 是否真的用户可控、sink 是否真的危险。\n"
+        "2. 检查 source→sink 之间是否有有效防御（参数化/转义/白名单/列表参数）。"
+        "若防御有效，该告警是误报，is_confirmed=false。\n"
+        "3. 不得捏造代码中不存在的 API 参数或行为；结论须与分析一致。\n\n"
+        "请先给出简短分析过程，然后输出如下 JSON（不要输出其他代码块）：\n"
+        "```json\n"
+        + _TRIAGE_SCHEMA +
+        "```"
+    )
+
+
+def _build_triage_independent_prompt() -> str:
+    """强化独立判定：显式警告工具标注可能误导（~1200字）。
+
+    针对"提示没到点上→误导"分支（hard_bypass_03/hard_cve_04/typical_14/typical_31
+    被工具 3:0 否决或带偏的实证）：强调工具告警只是候选，须完全基于代码独立判定，
+    工具的类型标注/可疑位置/证据链都可能错，禁止顺着工具方向附和或逆反。
+    """
+    return (
+        "你是一名资深代码安全审计专家，负责裁决静态工具告警是否为真实漏洞。\n"
+        "你将收到一条工具报告的可疑数据流（污染源→危险点）与相关代码切片。\n\n"
+        "重要：工具告警只是候选线索，不是结论。工具的类型标注、可疑位置、证据链"
+        "都可能出错（位置型规则误报率高、污点链可能跨文件断裂）。\n\n"
+        "你必须完全基于代码切片独立判定，不要被工具标注的方向带偏（既不盲目附和，"
+        "也不因工具提示而逆反否定真实漏洞）：\n"
+        "1. 独立核验 source 是否真的用户可控、sink 是否真的危险。\n"
+        "2. 检查 source→sink 之间是否有有效防御（参数化/列表参数/shlex.quote/白名单/"
+        "autoescape 等）。若防御有效，该告警是误报，is_confirmed=false。\n"
+        "3. 硬编码字面量凭证本身就是漏洞；不得捏造代码中不存在的 API 参数。\n"
+        "4. 结论须与分析一致：识别出风险不得标 false，未识别出不得标 true。\n\n"
+        "请先给出简短分析过程，然后输出如下 JSON（不要输出其他代码块）：\n"
+        "```json\n"
+        + _TRIAGE_SCHEMA +
+        "```"
+    )
+
+
 # v3 训练数据（final_train_chatml_v3.jsonl）使用的 system prompt。
 # 实测 v3 的 system prompt 长度为 4448 字符，对应 combined 变体：
 # SYSTEM_PROMPT + CoT 步骤 + 3 组 few-shot 示例。
@@ -649,6 +754,38 @@ def _build_alpha05_prompt() -> str:
 ALPHA05_PROMPT = _build_alpha05_prompt()
 
 
+def _build_alpha05_lite_prompt() -> str:
+    """α0.5 精简变体：去 few-shot 示例、压缩分析步骤（~800 字）。
+
+    验证"训练内化后推理可更短"假设的中间档：保留角色/要求/schema，
+    砍掉 2 个示例（模型已从训练样本学会 JSON 格式）。
+    """
+    return (
+        "你是一名安全研究员，分析给定代码是否存在安全漏洞。\n\n"
+        "要求：\n"
+        "1. 仅用户可控输入到达危险 sink 才算漏洞；sink 前有有效防御（参数化/列表参数/白名单/转义）则判安全。\n"
+        "2. 硬编码字面量凭证（key/secret/password/token）本身就是漏洞。\n"
+        "3. 不得捏造代码中不存在的 API 参数或行为；JSON 结论须与分析一致。\n\n"
+        "分析步骤：找用户可控输入点→追踪是否到达危险 sink（execute/system/open/eval）→"
+        "检查防御是否有效，给出 CWE 编号与风险等级。\n\n"
+        "在回答最后，必须严格输出一个 JSON 对象作为最终结论，JSON 块用 ```json 包裹，字段如下：\n"
+        + _ALPHA05_SCHEMA
+    )
+
+
+def _build_alpha05_min_prompt() -> str:
+    """α0.5 极简变体：只留角色 + schema（~400 字），最强内化假设。
+
+    假设 SFT 已把"要求/分析步骤/JSON 格式"全部内化到权重，推理只需角色唤醒
+    + schema 提醒（模型照训练格式输出）。
+    """
+    return (
+        "你是一名安全研究员，分析给定代码是否存在安全漏洞。\n\n"
+        "在回答最后，必须严格输出一个 JSON 对象作为最终结论，JSON 块用 ```json 包裹，字段如下：\n"
+        + _ALPHA05_SCHEMA
+    )
+
+
 def build_system_prompt_variant(variant: str) -> str:
     """根据变体名返回对应的 system prompt。
 
@@ -705,6 +842,15 @@ _TRIAGE_SCHEMA = """\
 {"is_confirmed": true/false, "vulnerability_type": "CWE-xxx 或漏洞类型名（is_confirmed=true 时必填，须基于代码实际分析而非工具标注）", "reason": "...", "fix_suggestion": "..."}
 """
 
+# 训练对齐的裁决 schema（2026-08-17 推导）：α0.5 训练用 ALPHA05_PROMPT 的
+# has_vulnerability 7 字段格式，模型权重内化的是 has_vulnerability。裁决时逼它输出
+# 训练从未见过的 is_confirmed 会导致格式不适配 → 3 次采样自一致漂移 → 分析对但投假
+# （triage_default recall 0.676 的根因，10 个 FN 全"reason 写对、票投假"）。
+# 本 schema 保留工具裁决的 has_vulnerability 字段（对齐训练），并复用训练 7 字段。
+_TRIAGE_ALIGNED_SCHEMA = """\
+{"has_vulnerability": true/false, "vulnerability_type": "CWE-编号 漏洞名（true 时必填，须基于代码分析而非工具标注；false 填 none）", "explanation": "数据流/成因（用 -> 描述）", "fix_suggestion": "最小局部改正；false 填 no fix needed"}
+"""
+
 # 候选来源可信度标注（2026-08-15 防锚定）：同一份错误提示，Q4 后端 0/3 全票
 # 否决、bf16 后端 3/0 全票确认——"全票但错"说明模型对工具锚点过度顺从。
 # 应对：不是全局降低服从性（高信任污点链本该采信），而是**条件性服从**——
@@ -727,6 +873,7 @@ def build_triage_prompt(
     language: str = "python",
     filename: str = "",
     rag_context: Optional[str] = None,
+    aligned: bool = False,
 ) -> str:
     """构造 finding 裁决 prompt：封闭二分类，带证据链锚点。
 
@@ -735,6 +882,11 @@ def build_triage_prompt(
     1. source 是否真的用户可控、sink 是否真的危险；
     2. source→sink 之间是否有**有效**防御（参数化查询/转义/白名单/列表参数）；
     3. 输出 is_confirmed=true/false 及 reason 与修复建议。
+
+    aligned=True（2026-08-17 推导）：输出 schema 换成训练格式 has_vulnerability
+    （α0.5 训练用 ALPHA05_PROMPT 的 7 字段，权重内化的是 has_vulnerability。
+    is_confirmed 是训练从未见过的格式，导致裁决自一致漂移——分析对但投假）。
+    配合 system_prompt=ALPHA05_PROMPT 使用，实现"训练/推理格式对齐"。
 
     Args:
         finding: ToolFinding（含 rule_id/source/sink/taint_type/source_line/
@@ -769,7 +921,7 @@ def build_triage_prompt(
     parts = []
     parts.append("【安全分析任务：裁决一个静态工具告警是否为真漏洞】")
     parts.append("")
-    parts.append("静态工具报告了一个可疑代码流，请判定它是否为真实漏洞（is_confirmed）。")
+    parts.append("静态工具报告了一个可疑代码流，请判定它是否为真实漏洞。")
     parts.append("")
     parts.append("可疑数据流：")
     parts.append(f"- 规则: {rule_id}")
@@ -799,21 +951,33 @@ def build_triage_prompt(
     parts.append("判定要求：")
     parts.append("1. 确认 source 是否真的用户可控、sink 是否真的危险。"
                  "source 若来自常量赋值（非 request/外部输入链）则不是有效污染源，告警为误报。")
-    parts.append("2. 检查 source→sink 之间是否有**有效**防御（参数化查询/转义/白名单/"
-                 "subprocess 列表参数/模板值插值+autoescape）。有效防御意味着该 finding "
-                 "是误报，is_confirmed=false。")
+    parts.append("2. 检查 source→sink 之间是否有**有效防御**（参数化查询/白名单精确允许集/"
+                 "类型强制转换/subprocess 列表参数/模板值插值+autoescape）。"
+                 "**有防御代码 ≠ 防御有效**：黑名单/正则/字符串替换类过滤通常可被绕过"
+                 "（URL 编码 %2e%2e%2f、路径分隔符变体 ..\\\\、双重编码、大小写、null 字节、"
+                 "间接拼接绕过），被绕过的过滤不算防御，该 finding 仍是漏洞。"
+                 "仅当防御能完整覆盖攻击面时，该 finding "
+                 f"才是误报，{'has_vulnerability' if aligned else 'is_confirmed'}=false。")
     parts.append("3. 注意工具规则无语境匹配导致的误报：subprocess.run 列表参数（无 shell=True）"
                  "不是命令注入；被 int()/float() 转换后的数值插值不是 XSS；"
-                 "render/render_template 的 kwargs 值插值（autoescape 开启）不是模板注入。")
+                 "render/render_template 的 kwargs 值插值（autoescape 开启）不是模板注入。"
+                 "但注意：**正则/黑名单过滤（如 re.search(r'\\\\.\\\\./')）不是有效防御**——"
+                 "它可被编码/分隔符变体绕过（%2e%2e%2f、..\\\\、....//、双重编码），"
+                 "被绕过仍是漏洞，不得仅因存在过滤代码就判安全。"
+                 "对 subprocess.run(\"ping\", arg) 这类列表参数调用，若证据链是"
+                 "**列表形式（无 shell=True）**，该 finding **必为误报**——列表形式不经"
+                 " shell 解释，注入载荷只会成为普通 argv 参数，不得判真（除非另有 "
+                 "shell=True 或字符串拼接的证据）。")
     parts.append("4. 严禁捏造代码中不存在的 API 参数或行为；判定必须基于代码实际内容。")
     parts.append("5. 漏洞类型独立判定：工具标注的漏洞类型/规则名是模式匹配的猜测，可能完全"
                  "错误（如把鉴权缺失标成 XSS）。你确认漏洞后，vulnerability_type 必须基于"
                  "你自己的代码分析给出（如鉴权缺失是 CWE-862，不是工具标的类型）。")
-    parts.append("6. 若判定为真漏洞，输出 is_confirmed=true 并给出简洁 reason 与修复建议；否则 is_confirmed=false。")
+    parts.append(f"6. 若判定为真漏洞，输出 {'has_vulnerability' if aligned else 'is_confirmed'}=true"
+                 "并给出简洁说明与修复建议；否则输出 false。")
     parts.append("")
     parts.append("请先给出简短分析过程，然后在回答最后输出如下 JSON：")
     parts.append("```json")
-    parts.append(_TRIAGE_SCHEMA)
+    parts.append(_TRIAGE_ALIGNED_SCHEMA if aligned else _TRIAGE_SCHEMA)
     parts.append("```")
 
     return "\n".join(parts)

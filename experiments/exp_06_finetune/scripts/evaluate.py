@@ -54,6 +54,7 @@ from graduation_project.prompts import (
 )
 from graduation_project.schema import parse_verdict, normalize_has_vulnerability
 from graduation_project.fix_verifier import FixVerifier, extract_line_refs, has_code_fence
+from graduation_project.cwe_normalizer import normalize_cwe_label, normalize_with_evidence, cwe_family_match  # strict CWE 编号纠正（2026-08-16/17）
 from experiments.utils import (
     load_manifest, read_sample_code, compute_detection_metrics,
     compute_repeat_metrics, save_results_json,
@@ -126,13 +127,15 @@ def cwe_matches(model_cwe: str, expected_cwe: str) -> bool:
 
     预期为 "N/A" 或空时（安全样本），不参与 CWE 匹配，返回 True。
     支持分号分隔的多 CWE 预期值（如 "CWE-434; CWE-22"），匹配任一即可。
+    2026-08-17：改用 cwe_family_match 做父子族宽松（CWE-917 ⊂ CWE-94 等），
+    模型报子类而测试集标父类（或反之）不再误判不匹配。
     """
     if not expected_cwe or expected_cwe.upper() == "N/A":
         return True
     if not model_cwe:
         return False
     expected_cwes = [c.strip().upper() for c in expected_cwe.split(";") if c.strip()]
-    return model_cwe in expected_cwes
+    return any(cwe_family_match(model_cwe, ec) for ec in expected_cwes)
 
 
 def compute_strict_metrics(results: list[dict]) -> dict:
@@ -153,7 +156,19 @@ def compute_strict_metrics(results: list[dict]) -> dict:
             # 漏洞样本且模型也判 True → 检查 CWE
             model_vt = r.get("model_vulnerability_type", "")
             expected_cwe = r.get("expected_cwe", "")
-            model_cwe = extract_cwe(model_vt)
+            # 2026-08-16 修复：先过 cwe_normalizer 再提取编号——normalizer 的设计
+            # 意图就是"模型输出后确定性纠正编号记忆错误"（docstring：CWE 编号是
+            # 纯记忆任务易记错，如 CWE-77 vs CWE-78 同为命令注入）。此前 strict
+            # 计算直接 extract 原始编号，纠正工具形同虚设——模型语义分类正确
+            # （"Command Injection"）却因编号差异被记 cwe_mismatch，冤枉分析能力。
+            # 现在：语义分类对 + normalizer 编号纠正 → strict_tp。
+            # 2026-08-17：vulnerability_type 落规则 ID/表外时，用模型原始输出
+            # （raw_output 含分析文本）二次提取类型（normalize_with_evidence）——
+            # 模型分析写对（"构成 CSRF"）但类型字段记错（CWE-639）的样本由此救回。
+            evidence = r.get("raw_output", "") or ""
+            model_cwe = extract_cwe(
+                normalize_with_evidence(model_vt, evidence) if evidence else normalize_cwe_label(model_vt)
+            )
             if cwe_matches(model_cwe, expected_cwe):
                 strict_tp += 1
             else:
