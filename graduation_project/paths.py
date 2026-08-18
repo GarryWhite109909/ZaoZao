@@ -63,7 +63,8 @@ def _pick_best(candidates: list[Path]) -> Path:
     """
     if len(candidates) == 1:
         return candidates[0]
-    score_map = {"v9max": 3, "best": 2, "adapter": 1}
+    # stage2（回收 dev 数据续训的上线物）最优先，其次 stage1/v9max 等训练轮次产物
+    score_map = {"stage2": 4, "stage1": 3, "v9max": 3, "best": 2, "adapter": 1}
 
     def _score(p: Path) -> int:
         lowered = p.name.lower()
@@ -94,6 +95,11 @@ def discover_adapter_dir(project_root: Optional[Path] = None) -> Optional[Path]:
         # 旧布局兼容：models/ 本身直接放权重
         if is_valid_adapter_dir(models_dir):
             tier1.append(models_dir)
+        # 本项目发布形态：models/adapter_alpha05_stage2 等分类子目录（保留 LoRA FP16 精度）
+        for sub in sorted(models_dir.iterdir()):
+            if sub.is_dir() and sub.name.startswith("adapter") and sub != adapter_dir:
+                if is_valid_adapter_dir(sub):
+                    tier1.append(sub)
     if tier1:
         return _pick_best(tier1)
 

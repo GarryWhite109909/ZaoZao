@@ -36,11 +36,9 @@ REPO = "graduation-vuln-scanner"
 # ---------------------------------------------------------------------------
 # 2026-08-15: α0.5 训练数据（final_train_chatml_alpha05.jsonl）使用 ALPHA05_PROMPT，
 # 因此 α0.5 推理 prompt 切换为 ALPHA05_PROMPT（1467 字符，精简版）。
-# 注意：triage 裁决任务（two_stage_scanner）的 system prompt 由调用方决定，
-# 若使用本注册表默认 prompt，α0.5 在 triage 任务上会看到 ALPHA05_PROMPT（含
-# has_vulnerability schema），但 build_triage_prompt 的 user prompt 显式指定了
-# is_confirmed 格式，模型会优先遵循 user prompt 的显式指令。若实测发现格式
-# 冲突，对 triage 任务单独传入 get_eval_system_prompt("triage_default")。
+# 2026-08-19: 两阶段裁决已切 triage_aligned=True（main.py 构造 TwoStageScanner 传入），
+# 裁决 user prompt 用 has_vulnerability（_TRIAGE_ALIGNED_SCHEMA），与 ALPHA05_PROMPT 的
+# has_vulnerability 格式一致，不再需要旧注释的 is_confirmed/triage_default 补偿。
 # 旧模型（v9max/v5）继续使用 V3_PROMPT，不受影响。
 _REGISTRY: list[dict] = [
     {
@@ -50,7 +48,7 @@ _REGISTRY: list[dict] = [
         "description": "Qwen3-8B + rsLoRA(r8) 训练的新发布模型，当前活动模型。已训练未评估；"
                        "基于数据口径（8616 条、二次蒸馏 + 全量 combined prompt）推断优于 v9max，待测评证实。",
         "prompt_variant": "v3",
-        "is_default": True,
+        "is_default": False,   # α0.5 已上线为默认（transformers 形态保持 LoRA FP16 精度），α0 降为过渡对照
         "deprecated": False,
     },
     {
@@ -61,7 +59,7 @@ _REGISTRY: list[dict] = [
                        "统一 ALPHA05_PROMPT，含盲区/痛点/归因/真实CVE 补充，泄露门禁+审计 PASS）。"
                        "精简 prompt(1467字) 替代 V3_PROMPT(4448字)，训练/推理一致。",
         "prompt_variant": "alpha05",
-        "is_default": False,   # α0.5 训练完成并部署到 Ollama 后，再把默认切到此模型
+        "is_default": True,    # 默认已切 α0.5：transformers 进程内 + LoRA adapter（保留最大精度，见 discover_adapter_dir）
         "deprecated": False,
     },
     {

@@ -102,7 +102,11 @@ two_stage = TwoStageScanner(
     system_prompt=scanner.system_prompt,
     keep_alive=scanner.keep_alive,
     num_ctx=scanner._num_ctx,
+    triage_aligned=True,  # 对齐 α0.5 训练裁决格式（has_vulnerability），复现论文 fixed5 组态
 )
+
+# 稳健项：sync_runtime 只覆盖 system_prompt，不覆盖 triage_aligned；显式置位确保切模型后不回退
+two_stage.triage_aligned = True
 
 
 def _two_stage_scan(
