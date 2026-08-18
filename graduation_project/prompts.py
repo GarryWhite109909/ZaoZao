@@ -137,9 +137,11 @@ SYSTEM_PROMPT_LITE = (
 # Base System Prompt（482 字符）—— 纯 base 变体（角色 + schema + 输出格式）
 # ---------------------------------------------------------------------------
 # 设计动机：exp_05_prompt_ablation 对多个变体做对照实验，base 作为最简基线。
-# 注意：旧注释声称"base 在 strict 准确率（CWE 归因）上最优（55.8%）"，
-# 该数字在仓库中无对应结果 JSON 存档（exp_05 v2 未持久化 vulnerability_type），
-# 属"结论未落库"，引用前需重算。
+# 注（2026-08-18 落档）：旧注释声称"base 在 strict 准确率（CWE 归因）上最优（55.8%）"
+# 无结果 JSON 存档。已从 exp_05 v2 原始输出按 CWE 纠正口径离线重算补存：
+#   experiments/exp_05_prompt_ablation/results/exp_05_v2_strict_metrics.json
+#   （base strict_recall=0.6066 / strict_acc=0.6667，非最优；+scope 0.7213 最优）。
+#   55.8% 旧值无档案支撑，禁止再引用。
 #
 # 使用约定（2026-08-10 起已变更）：
 #   - 全项目推理/评估入口已统一为 V3_PROMPT（SYSTEM_PROMPT + CoT + few-shot），

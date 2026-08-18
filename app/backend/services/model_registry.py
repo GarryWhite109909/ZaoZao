@@ -45,8 +45,9 @@ _REGISTRY: list[dict] = [
         "tag": "alpha0",
         "full_name": f"{NAMESPACE}/nivis-alpha0",
         "display_name": "Nivis-α0",
-        "description": "Qwen3-8B + rsLoRA(r8) 训练的新发布模型，当前活动模型。已训练未评估；"
-                       "基于数据口径（8616 条、二次蒸馏 + 全量 combined prompt）推断优于 v9max，待测评证实。",
+        "description": "Qwen3-8B + rsLoRA(r8) 训练，数据 final_train_chatml_v3.jsonl（8616 条，"
+                       "二次蒸馏 + 全量 combined prompt）。已评估（87 段合成集 merge+few_shot "
+                       "acc 95.3% / fpr 3.8%，详见素材库 1.1.12）；现为过渡对照模型。",
         "prompt_variant": "v3",
         "is_default": False,   # α0.5 已上线为默认（transformers 形态保持 LoRA FP16 精度），α0 降为过渡对照
         "deprecated": False,
