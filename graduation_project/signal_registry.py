@@ -51,6 +51,9 @@ class Signal:
     # 各候选类型的累计计数（多数投票决定 corrected_type，2026-08-15 修复"先到先得锁死"）：
     # 首个类型不再永久锁死——更准的类型积累到更高票数后自然替换。
     corrected_type_counts: dict[str, int] = field(default_factory=dict)
+    # 类型校正去重（审查 #5，2026-08-16）：(file, corrected_type) 键集合，同文件重扫不再
+    # 累计——与 confirmed_files/rejected_files 的去重口径一致，防"同文件凑满 ≥K 门槛"。
+    corrected_type_files: list[str] = field(default_factory=list)
     suppressed: bool = False      # 是否被抑制（D 级，工具见到跳过）
     suppressed_samples: int = 0
 
@@ -159,27 +162,60 @@ class SignalRegistry:
                 if file and file not in sig.confirmed_files:
                     sig.confirmed_files.append(file)
                 sig.confirmed += 1
-                # 类型校正（门控 4，2026-08-15 重做）：按类型多数投票决定
-                # corrected_type——首个类型不再先到先得锁死，更准的类型积累到
-                # 更高票数后自然替换（counts 票数并列时保留先到者，稳定收敛）。
+                # 抑制池双向可撤销（审查 #3，2026-08-16 修复）：
+                # 原实现确认分支无任何 suppressed=False 路径——候选被丢弃→该规则
+                # 不再产生裁决→永无 record 复活它，模型的两次全票假阴性（纯模型
+                # 能力问题）就能永久杀死一条规则召回（"模型能力问题写进工具"的
+                # 主通道）。修复：高置信确认 ≥K 独立文件且确认数 > 否定数 →
+                # 解除抑制（模型的正确判定可覆盖此前的误判）。
+                if sig.suppressed:
+                    if (len(sig.confirmed_files) >= MIN_AGREE_SAMPLES
+                            and len(sig.confirmed_files) > len(sig.rejected_files)):
+                        sig.suppressed = False
+                        sig.suppressed_samples = 0
+                # 类型校正（门控 3，2026-08-16 按原则修正）：
+                # 仅当「模型输出类型 ≠ 工具标注类型」且该校正类型累计 ≥ MIN_AGREE_SAMPLES
+                # 独立样本时才生效——防"模型判对但标号错（B 级）污染工具类型映射"。
+                # 原实现纯票数多数即改（corrected_type_counts 首个高票就锁），
+                # 违反文档 §10.3 原则 3「类型回填分离：标号回填只采与工具 rule_id
+                # 冲突且模型高置信的情形」。未达门槛时保留工具原标注。
+                # 审查 #5 修复：counts 按文件去重（同一文件重扫不再累计，与
+                # confirmed_files/rejected_files 的去重口径一致——§11.12"读端写端一致"）。
                 if corrected_type and corrected_type != taint_type:
-                    sig.corrected_type_counts[corrected_type] = \
-                        sig.corrected_type_counts.get(corrected_type, 0) + 1
-                    best = max(sig.corrected_type_counts.items(),
-                               key=lambda kv: kv[1])
-                    sig.corrected_type = best[0]
-                    sig.corrected_type_samples = best[1]
+                    key = (file, corrected_type)
+                    if key not in sig.corrected_type_files:
+                        sig.corrected_type_files.append(key)
+                        sig.corrected_type_counts[corrected_type] = \
+                            sig.corrected_type_counts.get(corrected_type, 0) + 1
+                    best_type, best_cnt = max(sig.corrected_type_counts.items(),
+                                              key=lambda kv: kv[1])
+                    if best_cnt >= MIN_AGREE_SAMPLES:
+                        sig.corrected_type = best_type
+                        sig.corrected_type_samples = best_cnt
+                    else:
+                        # 未达跨样本门槛：不锁死，保留工具原标注（防 B 级污染）
+                        sig.corrected_type = ""
+                        sig.corrected_type_samples = best_cnt
             else:
                 if file and file not in sig.rejected_files:
                     sig.rejected_files.append(file)
                 sig.rejected += 1
-                # 门控 3 + 抑制：高置信否定 → 若此前误回填则降权，D 级进抑制池
-                # （门槛按去重文件数判定，与 ready 一致）
-                if suppress_on_neg and len(sig.confirmed_files) >= MIN_AGREE_SAMPLES:
-                    # 双向撤销：确认过又高置信否定，说明信号不可靠 → 降权
-                    sig.confirmed = 0
-                    sig.confirmed_files = []
-                sig.suppressed = True
+                # 门控 3 + 抑制：高置信否定 → 若此前误回填则降权，D 级进抑制池。
+                # Bug 修复（2026-08-16）：原实现无条件 suppressed=True，单次全票
+                # 否决就把规则永久抑制（suppressed_samples=1），与 is_suppressed
+                # 读取端"≥2 独立文件"语义不一致——评估跨样本累积导致工具召回被
+                # 系统性过滤（triage_default 轮 recall 崩塌至 0.25 的根因）。
+                # 修复：仅当"否定文件数 ≥ MIN_AGREE_SAMPLES"才进抑制池；单次否定
+                # 只累加计数（供后续跨样本聚合），不立即抑制。
+                if suppress_on_neg:
+                    # 双向可撤销（原则 4）：只要被高置信否定过，就撤销已积累的
+                    # 确认记录——防"确认1次+否定1次+再确认1次"凑满 ready 门槛的
+                    # 污染信号（D 级误报被回填的典型路径）。
+                    if sig.confirmed > 0:
+                        sig.confirmed = 0
+                        sig.confirmed_files = []
+                    if len(sig.rejected_files) >= MIN_AGREE_SAMPLES:
+                        sig.suppressed = True
                 sig.suppressed_samples += 1
         # 变更后自动持久化（2026-08-15：此前 save() 全仓库无调用方，重启归零）
         self.save()
@@ -216,9 +252,20 @@ class SignalRegistry:
     # 待学习池（工具漏召 + LLM 判中的代码特征，供指纹级召回）
     # ------------------------------------------------------------------
     def add_to_learn_pool(self, entry: dict) -> None:
-        """收录"工具漏召但 LLM 判中"的代码特征（recheck_vuln_trusted 路径）。"""
+        """收录"工具漏召但 LLM 判中"的代码特征（recheck_vuln_trusted 路径）。
+
+        独立验证集门控（原则 5，2026-08-16 补齐）：
+          - 只收 `recheck_vuln_trusted`（工具漏召 + LLM 全票判中）的条目，
+            且必须带 `unanimous=True` 标记（全票门槛，防 C 级碰巧对）。
+          - 待学习池特征不直接参与召回，须经 `approve_learn_pool`（独立验证集
+            复验）才转正。原实现无任何门控，仅去重即入库——违反文档 §10.3
+            原则 5「独立验证集门控：待学习池新增信号须在独立验证集上复验，
+            误报爆炸的候选直接淘汰」。
+        """
         if not self._enabled:
             return
+        if not entry.get("unanimous"):
+            return  # 非全票判中：可能是 C 级碰巧对，不入池
         with self._lock:
             # 简单去重：同 file + 同特征不重复收录
             key = (entry.get("file", ""), entry.get("feature", ""))
@@ -226,6 +273,28 @@ class SignalRegistry:
                 return
             self._learn_pool.append(entry)
         self.save()
+
+    def approve_learn_pool(self, predicate) -> int:
+        """独立验证集门控：按 predicate 审批待学习池条目（转正/淘汰）。
+
+        用法：调用方在独立验证集（真实 CVE 仓库，非 87 段）上复验每条特征，
+        predicate 返回 True 的转正（approved）、False 的淘汰（removed）。
+        返回转正数。误报爆炸的候选直接淘汰，绝不进工具召回。
+        """
+        if not self._enabled:
+            return 0
+        approved = 0
+        with self._lock:
+            kept = []
+            for p in self._learn_pool:
+                if predicate(p):
+                    approved += 1
+                    p["approved"] = True
+                    kept.append(p)  # approved 条目保留（可被工具层消费）
+                # else: 淘汰（不保留）
+            self._learn_pool = kept
+        self.save()
+        return approved
 
     def learn_pool_snapshot(self) -> list[dict]:
         with self._lock:
@@ -298,26 +367,34 @@ if __name__ == "__main__":
     print(f"[{'PASS' if ok2 else 'FAIL'}] 跨文件聚合: files={len(sig.confirmed_files)}, "
           f"ready={sig.ready}, boost={r.boost_priority('py.taint.sql'):.2f}")
 
-    # 3) 高置信否定 → 抑制池 + is_suppressed 生效
+    # 3) 高置信否定 → 抑制池（2026-08-16 门槛修正后：单次否决只累计计数，
+    #    仅 ≥2 独立文件一致否决才进抑制池——防跨样本偶然性误杀规则）
     r.record("py.taint.sql", confirmed=False, n=3, votes_true=0,
              votes_false=3, votes_invalid=0, file="x.py")
-    ok3 = r.is_suppressed("py.taint.sql")
-    print(f"[{'PASS' if ok3 else 'FAIL'}] 抑制池: is_suppressed={ok3}")
+    ok3a = not r.is_suppressed("py.taint.sql")  # 单次否决不抑制
+    r.record("py.taint.sql", confirmed=False, n=3, votes_true=0,
+             votes_false=3, votes_invalid=0, file="y.py")
+    ok3 = ok3a and r.is_suppressed("py.taint.sql")  # 第 2 个独立文件否决 → 抑制
+    print(f"[{'PASS' if ok3 else 'FAIL'}] 抑制池(≥2独立文件): "
+          f"单次={not r.is_suppressed('py.taint.sql')}")
 
-    # 4) 类型校正多数投票：首个类型可被更高票类型替换（不再先到先得）
+    # 4) 类型校正多数投票：首个类型可被更高票类型替换（不再先到先得）。
+    #    门槛（2026-08-16 修正后）：单文件校正不生效（< MIN_AGREE_SAMPLES=2 时
+    #    保留工具原标注防 B 级污染），≥2 独立文件一致才提交。
     r2 = SignalRegistry(path=tmp.with_name("t2.json"), enabled=True)
     r2.record("b608", confirmed=True, n=3, votes_true=3, votes_false=0,
               votes_invalid=0, file="a.py", taint_type="B608",
               corrected_type="CWE-79 XSS")
     first = r2.get_signal("b608").corrected_type
-    # C 级更准类型连续 2 个文件出现 → 应替换先到的 CWE-79
+    # C 级更准类型连续 2 个文件出现 → 应提交 CWE-862 并替换先到候选
     for f in ("b.py", "c.py"):
         r2.record("b608", confirmed=True, n=3, votes_true=3, votes_false=0,
                   votes_invalid=0, file=f, taint_type="B608",
                   corrected_type="CWE-862 Missing Authorization")
     sig2 = r2.get_signal("b608")
-    ok4 = first == "CWE-79 XSS" and sig2.corrected_type == "CWE-862 Missing Authorization"
-    print(f"[{'PASS' if ok4 else 'FAIL'}] 类型多数投票: {first!r} -> {sig2.corrected_type!r}")
+    ok4 = first == "" and sig2.corrected_type == "CWE-862 Missing Authorization"
+    print(f"[{'PASS' if ok4 else 'FAIL'}] 类型多数投票(≥2独立文件): "
+          f"单文件={first!r} -> {sig2.corrected_type!r}")
 
     # 5) 自动持久化 + 重启恢复（record 后无需手动 save）
     ok5 = tmp.is_file()

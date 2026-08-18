@@ -240,12 +240,13 @@ def _build_client(args):
                                  model=args.model if args.model != DEFAULT_MODEL else None)
     if backend == "transformers":
         from graduation_project.paths import resolve_base_model_path, resolve_adapter_path
+        # 注：transformers_client 已强制 no-merge（NF4 基座 merge 会掉 LoRA 精度），
+        # 不传 merge 参数避免死参数误导（2026-08-17 修复）
         return create_llm_client(
             "transformers",
             model_id=args.base_model or resolve_base_model_path("models/transformers/Qwen3-8B"),
             adapter=args.adapter or resolve_adapter_path("models/adapter"),
             num_ctx=args.num_ctx,
-            merge=True,
         )
     if backend == "llamacpp":
         from graduation_project.paths import resolve_adapter_path
@@ -277,6 +278,12 @@ def _client_ready(client, backend: str) -> bool:
 def main() -> None:
     args = parse_args()
 
+    # 0) 设备锁定（2026-08-17 修复）：setdefault 在 shell 已有同名变量时不生效，
+    #    多 GPU 机器上进程会落到核显（512MB）→ 单样本 OOM 死循环。此处强制覆写，
+    #    进程内一次性锁死 GPU 0（评估脚本仅支持单卡，模型加载前必须完成）。
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["HIP_VISIBLE_DEVICES"] = "0"
+
     # 1) 加载测试集
     print(f"测试集 manifest: {MANIFEST_PATH}")
     manifest, records = load_manifest(MANIFEST_PATH)
@@ -293,6 +300,30 @@ def main() -> None:
     client = _build_client(args)
     if not _client_ready(client, args.backend):
         sys.exit(1)
+
+    # 2.5) 评估环境隔离（2026-08-18，方法学硬性约束）：
+    #   a) 信号注册表：禁止读写生产 models/signal_registry.json——历史教训是抑制池
+    #      跨跑污染（fixed3 期间 B608 等 10+ 规则被两次全票否决入池，fixed4 加载后
+    #      候选在进裁决前被吞，结果依赖样本顺序、工具链被反馈回路架空）。
+    #      - --no-signal-feedback：评估纯静态管线，注册表整体禁用（不读不写）；
+    #      - 启用 feedback 时：每轮隔离到输出目录下的独立注册表文件（跨跑不共享，
+    #        且不污染生产），并打印警示。
+    #   b) 共形校准：未显式 --calibrate-from 时，禁用 TwoStageScanner 启动时自动加载
+    #      models/conformal_calibration.json——该文件是 08-16 在**同一 87 段测试集**上
+    #      的历史结果拟合的（in-sample 泄漏，覆盖率保证不成立）。显式给源才校准。
+    from graduation_project.signal_registry import reset_signal_registry
+    if args.no_signal_feedback:
+        reset_signal_registry(enabled=False)
+    else:
+        iso_reg = Path(args.output or OUTPUT_DIR).parent / (
+            f"signal_registry.{Path(args.output or 'eval').stem}.json")
+        reset_signal_registry(path=iso_reg)
+        print(f"[eval] ⚠ signal_feedback 启用：使用隔离注册表 {iso_reg}"
+              f"（跨跑不共享，不污染生产；论文建议 --no-signal-feedback 测纯静态管线）")
+    if args.calibrate_from is None:
+        os.environ["VULN_SCANNER_CONFORMAL_CALIB"] = "0"
+        print("[eval] 未显式 --calibrate-from：禁用生产共形校准自动加载"
+              "（防 in-sample 泄漏；需要覆盖率保证请用独立 dev 集校准）")
 
     # 3) 构建两阶段扫描器（复现 App 真实工具链）
     scanner = TwoStageScanner(
@@ -311,6 +342,7 @@ def main() -> None:
         use_conformal=not args.no_conformal,
         use_signal_feedback=not args.no_signal_feedback,
         use_counterfactual=not args.no_counterfactual,
+        triage_aligned=(args.variant == "triage_train_aligned"),
     )
     # 共形预测器校准：从历史评估结果（adjudications 的投票 + 已知标签）拟合阈值
     if not args.no_conformal and scanner._conformal is not None and args.calibrate_from:
