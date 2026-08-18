@@ -97,12 +97,19 @@ scanner = Scanner(
 # 避免重复加载模型）。/api/analyze、batch、url、github、report 全部走它；
 # 旧单遍 Scanner 保留为论文"纯 LLM 无工具基线"对照与多模型投票通道。
 # 注意：switch_model 会改写 scanner.system_prompt，调用前经 _two_stage_scan 同步。
+# 组态对齐论文 fixed5（exp_07 triage_train_aligned.20260818_104203）：
+#   triage_aligned=True（has_vulnerability 裁决格式）+ no_candidate_mode=full_recheck
+#   （无候选文件全量 LLM 复核，消除"无证据判安全"静默放行）+ n_samples=3。
+#   use_signal_feedback 保持默认 True：自适应闭环是生产特性，评估隔离（--no-signal-feedback）
+#   仅用于测量静态能力，不属生产组态。
 two_stage = TwoStageScanner(
     client=scanner.client,
     system_prompt=scanner.system_prompt,
     keep_alive=scanner.keep_alive,
     num_ctx=scanner._num_ctx,
     triage_aligned=True,  # 对齐 α0.5 训练裁决格式（has_vulnerability），复现论文 fixed5 组态
+    no_candidate_mode="full_recheck",
+    n_samples=3,
 )
 
 # 稳健项：sync_runtime 只覆盖 system_prompt，不覆盖 triage_aligned；显式置位确保切模型后不回退
@@ -269,7 +276,7 @@ class TwoStageRequest(BaseModel):
     code: str = Field(..., max_length=MAX_CODE_CHARS)
     language: str = "python"
     filename: str = "pasted_code.py"
-    n_samples: int = Field(5, ge=1, le=10)   # 自一致率采样次数
+    n_samples: int = Field(3, ge=1, le=10)   # 自一致率采样次数（对齐 fixed5 组态）
     use_rag: Optional[bool] = None
 
 
@@ -993,8 +1000,8 @@ async def _scan_files_scheduled(
 
     批量场景（URL / GitHub / 工作区）每个文件以 LOW 优先级入队，
     交互式扫描（HIGH）可随时插队，避免批量任务饿死单文件请求。
-    URL/GitHub 属于安全关键场景：走 full_recheck（无候选文件也全量 LLM 复核），
-    消除"工具层无候选 → 静默判安全"的漏报风险。
+    URL/GitHub 属于安全关键场景：显式 full_recheck（现为全局默认，此处保留
+    显式传参以文档化意图），消除"工具层无候选 → 静默判安全"的漏报风险。
     """
     batch = BatchResult(total_files=len(files))
     batch_start = time.time()
@@ -1363,6 +1370,9 @@ def vllm_analyze(req: VllmAnalyzeRequest):
         client=vllm_client,
         system_prompt=get_prompt_for_model(vllm_client.model),
         num_ctx=int(os.environ.get("VULN_SCANNER_NUM_CTX", "6144")),
+        triage_aligned=True,  # 与全局 two_stage 一致，对齐论文 fixed5 组态
+        no_candidate_mode="full_recheck",
+        n_samples=3,
     )
     return vllm_two_stage.scan_code(
         code=req.code, language=req.language, filename=req.filename,
