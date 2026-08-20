@@ -43,10 +43,20 @@ for i, v in enumerate(VERSIONS):
                 textcoords="offset points", xytext=(0, -14), ha="center",
                 fontsize=8.5, color="#9a6700")
 
-ax.annotate("v4/v6/v8 失败版本（泄漏/负迁移/FP 激增）",
-            xy=(3, 0.429), xytext=(1.2, 0.14),
-            fontsize=9, color="#d64545",
-            arrowprops=dict(arrowstyle="->", color="#d64545", lw=1.2))
+# 失败版本标注：放在 v4 正下方，短箭头，不穿越图表
+ax.annotate("v4/v6/v8 失败版本\n（泄漏/负迁移/FP 激增）",
+            xy=(3, 0.429), xytext=(3, 0.28),
+            fontsize=9, color="#d64545", ha="center", va="top",
+            arrowprops=dict(arrowstyle="->", color="#d64545", lw=1.2,
+                            connectionstyle="arc3,rad=0.1"))
+
+# 在 v6 和 v8 加小标记，保持视觉一致性
+ax.annotate("", xy=(5, 0.429), xytext=(5, 0.32),
+            arrowprops=dict(arrowstyle="->", color="#d64545", lw=1.2,
+                            connectionstyle="arc3,rad=0.1"))
+ax.annotate("", xy=(7, 0.750), xytext=(7, 0.64),
+            arrowprops=dict(arrowstyle="->", color="#d64545", lw=1.2,
+                            connectionstyle="arc3,rad=0.1"))
 
 ax.annotate("SFT 收益集中在判别与格式：\nCVE-fix recall 0.375→0.950",
             xy=(8, 0.950), xytext=(5.6, 0.90),

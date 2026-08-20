@@ -10,13 +10,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from pathlib import Path
 
 plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "Microsoft YaHei", "SimHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
-versions = ["fixed1", "fixed2", "fixed3\n(带污染)", "fixed4\n(弃用)", "fixed5\n(干净)"]
-recall = [0.949, 0.949, 0.982, None, 1.000]
-fpr = [0.217, 0.154, 0.167, None, 0.043]
+versions = ["fixed1", "fixed2\n(中断)", "fixed3\n(带污染)", "fixed4\n(弃用)", "fixed5\n(干净)"]
+recall = [0.949, None, 0.982, None, 1.000]
+fpr = [0.217, None, 0.167, None, 0.043]
 
 fig, ax = plt.subplots(figsize=(12, 6.5))
 
@@ -32,7 +33,10 @@ for i, (r, f) in enumerate(zip(recall, fpr)):
     if f is not None:
         ax.text(i, f - 0.03, f"{f:.3f}", ha="center", va="top", fontsize=9, color="#d62728", fontweight="bold")
 
-# fixed4 标注
+# fixed2 / fixed4 标注
+ax.text(1, 0.55, "fixed2 中断\n（21/87，无有效指标）", ha="center", va="center", fontsize=9,
+        color="#888888", fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", edgecolor="#888888"))
 ax.text(3, 0.55, "fixed4 弃用\n（抑制池跨跑污染）", ha="center", va="center", fontsize=9,
         color="#d62728", fontweight="bold",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="#ffeeee", edgecolor="#d62728"))
@@ -51,5 +55,6 @@ ax.text(4, -0.15, "干净阶段（fixed5）\nrecall 1.000 / FPR 0.043", ha="cent
         color="#2ca02c", fontweight="bold")
 
 fig.tight_layout()
-fig.savefig("fixed_convergence.png", dpi=170)
-print("已生成: fixed_convergence.png")
+OUT = Path(__file__).resolve().parent / "fixed_convergence.png"
+fig.savefig(OUT, dpi=170)
+print(f"已生成: {OUT}")
