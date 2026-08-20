@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""α0.5 stage1 训练收敛曲线图（2026-08-19）。
+"""α0.5 stage1 训练收敛曲线图（2026-08-20 修正数据源）。
 
-数据来源：/home/zane/下载/train_log_cloud_r8_e2_lr0.0001_s42_rslora.json
-  （cloud_train 输出，train 6777 / dev 1195，2 epoch ≈ 1694 步，LR=1e-4 warmup+cosine，
+数据来源：D:\code\yunduan\train_log_cloud_r8_e2_lr0.0001_s42_rslora (1).json
+  （cloud_train 输出，train 6777 / dev 1195，2 epoch ≈ 1696 步，LR=1e-4 warmup+cosine，
    bf16 LoRA r8/a16/rsLoRA，A800）。
   stage2（回收 dev 续训 1 epoch）为另一运行，不在本日志内。
 
@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "Microsoft YaHei", "SimHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
-LOG = Path("/home/zane/下载/train_log_cloud_r8_e2_lr0.0001_s42_rslora.json")
+LOG = Path(r"D:\code\yunduan\train_log_cloud_r8_e2_lr0.0001_s42_rslora (1).json")
 OUT = Path(__file__).resolve().parent / "alpha05_stage1_train_curve.png"
 
 d = json.loads(LOG.read_text(encoding="utf-8"))
@@ -46,7 +46,7 @@ ax = axes[0][0]
 ax.plot(steps, loss, color="#1f77b4", lw=1.2, label="train loss", alpha=0.9)
 ax.plot(e_steps, e_loss, color="#d62728", marker="o", ms=4, lw=1.8, label="eval loss（dev 最优选型）")
 ax.set_xlabel("step"); ax.set_ylabel("loss")
-ax.set_title("Loss 收敛：1.63 → 0.49（train）/ 0.742 → 0.574（eval）")
+ax.set_title("Loss 收敛：1.63 → ~0.58（train，末步 0.584）/ 0.742 → 0.574（eval）")
 ax.legend(); ax.grid(alpha=0.3)
 ax.annotate("stage1 best\n(eval 0.574)", xy=(e_steps[-1], e_loss[-1]),
             xytext=(e_steps[-1] - 350, e_loss[-1] + 0.06),

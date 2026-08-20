@@ -429,7 +429,7 @@ class TwoStageScanner:
         client: 推理客户端（复用 Scanner.client，须有 generate(text,
                 system_prompt=..., temperature=...) 接口）。
         system_prompt: 裁决层 system prompt（通常为 Scanner.system_prompt）。
-        n_samples: 自一致率采样次数 N（默认 5）。
+        n_samples: 自一致率采样次数 N（默认 3，与生产/评估 fixed5 组态对齐）。
         temperature: 采样温度（>0 保证投票多样性，默认 0.7）。
         keep_alive: 模型卸载策略（透传给 client.generate）。
         num_ctx: 上下文长度（透传）。
@@ -448,7 +448,7 @@ class TwoStageScanner:
         self,
         client,
         system_prompt: str,
-        n_samples: int = 5,
+        n_samples: int = 3,
         temperature: float = 0.7,
         keep_alive=0,
         num_ctx: Optional[int] = None,

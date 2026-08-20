@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
-"""数据可信度保障体系图（2026-08-20 第二版，正式比赛风格）。
+"""数据可信度保障体系图（2026-08-20 修复截断与重叠版）。
 
-重跑：AI 环境 python gen_data_credibility_system.py
+修复：
+- 第三个红色框 line1 被截断：hbox 文字位置调整，确保所有 line 在框内
+- 紫色结果框与蓝色 parse_fail 框重叠：紫色框下移 + 压缩中列间距
+
+重跑：AI 环境 cd figures && python gen_data_credibility_system.py
 """
 
 import matplotlib
@@ -20,82 +24,109 @@ ax.axis("off")
 
 ax.set_title("数据可信度保障体系", fontsize=16, fontweight="bold", pad=20, color="#1a1a1a")
 
-
+# ---------- 辅助函数 ----------
 def hbox(ax, x, y, w, h, title, lines, facecolor, edgecolor, title_fs=10, text_fs=8.5):
     patch = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.02,rounding_size=0.1",
                            facecolor=facecolor, edgecolor=edgecolor, linewidth=1.5, alpha=0.95)
     ax.add_patch(patch)
-    ax.text(x + w / 2, y + h - 0.28, title, ha="center", va="center",
+    # 文字位置收紧，确保所有行在框内（底部留白 ≥0.10）
+    ax.text(x + w / 2, y + h - 0.22, title, ha="center", va="center",
             fontsize=title_fs, fontweight="bold", color="white")
     for i, line in enumerate(lines):
-        ax.text(x + w / 2, y + h - 0.62 - i * 0.30, line, ha="center", va="center",
+        ax.text(x + w / 2, y + h - 0.50 - i * 0.28, line, ha="center", va="center",
                 fontsize=text_fs, color="white", linespacing=1.2)
-    return x, y, w, h
+    return {"x": x, "y": y, "w": w, "h": h,
+            "cx": x + w / 2, "cy": y + h / 2,
+            "top": y + h, "bottom": y}
 
 
-def varr(ax, x1, y1, x2, y2, color="#4a4a4a"):
+def make_arrow(ax, x1, y1, x2, y2, color="#4a4a4a", lw=1.4):
     ax.add_patch(FancyArrowPatch((x1, y1), (x2, y2),
                                  arrowstyle="->,head_width=0.22,head_length=0.14",
-                                 color=color, linewidth=1.4,
+                                 color=color, linewidth=lw,
                                  connectionstyle="arc3,rad=0"))
 
 
-def harr(ax, x1, y1, x2, y2, color="#4a4a4a"):
-    ax.add_patch(FancyArrowPatch((x1, y1), (x2, y2),
-                                 arrowstyle="->,head_width=0.22,head_length=0.14",
-                                 color=color, linewidth=1.4,
-                                 connectionstyle="arc3,rad=0"))
+# ---------- 三列标题 ----------
+ax.text(2.3, 7.35, "问题发现", ha="center", va="center", fontsize=12,
+        fontweight="bold", color="#c62828")
+ax.text(7.0, 7.35, "审计与验证机制", ha="center", va="center", fontsize=12,
+        fontweight="bold", color="#1565c0")
+ax.text(11.7, 7.35, "评估隔离", ha="center", va="center", fontsize=12,
+        fontweight="bold", color="#2e7d32")
 
+# ---------- 三列 box ----------
+BOX_W = 3.6
+BOX_H = 0.82
 
-# 三列标题
-col_titles = [
-    ("问题发现", 2.3, "#c62828"),
-    ("审计与验证机制", 7.0, "#1565c0"),
-    ("评估隔离", 11.7, "#2e7d32"),
+# 左列：3 项
+left_x = 0.5
+left_boxes = [
+    ("样本注释泄露", ["100% 准确率假象", "删除 47 个文件"]),
+    ("训练-测试 Jaccard 泄漏", ["v4 整版废弃", "63 个样本重叠 30%+"]),
+    ("反向拟合规则", ["类型白名单对着测试集推", "建立独立推导铁律"]),
 ]
-for title, x, color in col_titles:
-    ax.text(x, 7.35, title, ha="center", va="center", fontsize=12,
-            fontweight="bold", color=color)
+left_ys = [5.95, 4.78, 3.61]
+left_objs = []
+for (title, lines), y in zip(left_boxes, left_ys):
+    left_objs.append(hbox(ax, left_x, y, BOX_W, BOX_H, title, lines, "#c62828", "#c62828"))
 
-# 问题发现列
-hbox(ax, 0.5, 5.65, 3.6, 1.15, "样本注释泄露", ["100% 准确率假象", "删除 47 个文件"], "#c62828", "#c62828")
-hbox(ax, 0.5, 4.25, 3.6, 1.15, "训练-测试 Jaccard 泄漏", ["v4 整版废弃", "63 个样本重叠 30%+"], "#c62828", "#c62828")
-hbox(ax, 0.5, 2.85, 3.6, 1.15, "反向拟合规则", ["类型白名单对着测试集推", "建立独立推导铁律"], "#c62828", "#c62828")
+# 中列：5 项（压缩间距，避免与底部结果框碰撞）
+center_x = 5.2
+center_boxes = [
+    ("Jaccard 行级重叠审计", ["30% 相似阈值触发复核"]),
+    ("合成集 vs CVE-fix 双测试集", ["合成集虚高 59.2pp 实证"]),
+    ("Bootstrap 显著性检验", ["v7 vs v5 无显著差异"]),
+    ("CWE 纠正口径", ["关键词归一 + evidence 守卫 + 父子族"]),
+    ("parse_fail 计入漏报", ["避免解析失败被分母剔除"]),
+]
+center_ys = [5.95, 4.78, 3.61, 2.44, 1.30]
+center_objs = []
+for (title, lines), y in zip(center_boxes, center_ys):
+    center_objs.append(hbox(ax, center_x, y, BOX_W, BOX_H, title, lines, "#1565c0", "#1565c0"))
 
-# 审计机制列
-hbox(ax, 5.2, 5.95, 3.6, 0.85, "Jaccard 行级重叠审计", ["30% 相似阈值触发复核"], "#1565c0", "#1565c0")
-hbox(ax, 5.2, 4.90, 3.6, 0.85, "合成集 vs CVE-fix 双测试集", ["合成集虚高 59.2pp 实证"], "#1565c0", "#1565c0")
-hbox(ax, 5.2, 3.85, 3.6, 0.85, "Bootstrap 显著性检验", ["v7 vs v5 无显著差异"], "#1565c0", "#1565c0")
-hbox(ax, 5.2, 2.80, 3.6, 0.85, "CWE 纠正口径", ["关键词归一 + evidence 守卫 + 父子族"], "#1565c0", "#1565c0")
-hbox(ax, 5.2, 1.75, 3.6, 0.85, "parse_fail 计入漏报", ["避免解析失败被分母剔除"], "#1565c0", "#1565c0")
+# 右列：4 项
+right_x = 9.9
+right_boxes = [
+    ("抑制池跨跑隔离", ["--no-signal-feedback 干净评估"]),
+    ("共形校准独立集", ["禁用 in-sample 校准泄漏"]),
+    ("答案泄漏零容忍", ["文件名标签 / 反向规则审计"]),
+    ("归因分流再修复", ["工具/模型责任分离"]),
+]
+right_ys = [5.95, 4.78, 3.61, 2.44]
+right_objs = []
+for (title, lines), y in zip(right_boxes, right_ys):
+    right_objs.append(hbox(ax, right_x, y, BOX_W, BOX_H, title, lines, "#2e7d32", "#2e7d32"))
 
-# 评估隔离列
-hbox(ax, 9.9, 5.95, 3.6, 0.85, "抑制池跨跑隔离", ["--no-signal-feedback 干净评估"], "#2e7d32", "#2e7d32")
-hbox(ax, 9.9, 4.90, 3.6, 0.85, "共形校准独立集", ["禁用 in-sample 校准泄漏"], "#2e7d32", "#2e7d32")
-hbox(ax, 9.9, 3.85, 3.6, 0.85, "答案泄漏零容忍", ["文件名标签 / 反向规则审计"], "#2e7d32", "#2e7d32")
-hbox(ax, 9.9, 2.80, 3.6, 0.85, "归因分流再修复", ["工具/模型责任分离"], "#2e7d32", "#2e7d32")
-
-# 横向箭头：问题 → 审计 → 隔离
-for y in [6.22, 5.17, 4.12]:
-    harr(ax, 4.1, y, 5.2, y)
-for y in [6.22, 5.17, 4.12, 3.07, 2.02]:
-    harr(ax, 8.8, y, 9.9, y)
-
-# 底部结果
-result_box = FancyBboxPatch((3.8, 0.55), 6.4, 0.85, boxstyle="round,pad=0.03,rounding_size=0.12",
+# ---------- 底部结果框（下移消除重叠） ----------
+RB_X = 3.8
+RB_Y = 0.25
+RB_W = 6.4
+RB_H = 0.85
+result_box = FancyBboxPatch((RB_X, RB_Y), RB_W, RB_H, boxstyle="round,pad=0.03,rounding_size=0.12",
                             facecolor="#5e35b1", edgecolor="#5e35b1", linewidth=1.5, alpha=0.95)
 ax.add_patch(result_box)
-ax.text(7.0, 0.98, "fixed5 干净评估结果", ha="center", va="center",
+ax.text(7.0, 0.68, "fixed5 干净评估结果", ha="center", va="center",
         fontsize=11, fontweight="bold", color="white")
-ax.text(7.0, 0.72, "recall 1.000  /  FPR 0.043  /  strict_recall 0.811", ha="center", va="center",
+ax.text(7.0, 0.42, "recall 1.000  /  FPR 0.043  /  strict_recall 0.811", ha="center", va="center",
         fontsize=9.5, color="white")
 
-# 从隔离列底部指向结果
-varr(ax, 11.7, 2.75, 11.7, 1.45)
-harr(ax, 9.9, 1.45, 10.2, 1.45)
+rb_top = RB_Y + RB_H        # = 1.10
+rb_left = RB_X              # = 3.8
+rb_right = RB_X + RB_W      # = 10.2
+rb_cx = RB_X + RB_W / 2     # = 7.0
 
-# 底部说明
-ax.text(7.0, 0.18, '核心原则：任何指标提升须先经「删除泄露后重跑」验证；数据可信度优先于指标绝对值。',
+# ---------- 汇聚线（直角折线） ----------
+make_arrow(ax, left_objs[-1]["cx"], left_objs[-1]["bottom"], left_objs[-1]["cx"], rb_top, color="#999999", lw=1.2)
+make_arrow(ax, left_objs[-1]["cx"], rb_top, rb_left, rb_top, color="#999999", lw=1.2)
+
+make_arrow(ax, center_objs[-1]["cx"], center_objs[-1]["bottom"], center_objs[-1]["cx"], rb_top, color="#999999", lw=1.2)
+
+make_arrow(ax, right_objs[-1]["cx"], right_objs[-1]["bottom"], right_objs[-1]["cx"], rb_top, color="#999999", lw=1.2)
+make_arrow(ax, right_objs[-1]["cx"], rb_top, rb_right, rb_top, color="#999999", lw=1.2)
+
+# ---------- 底部说明 ----------
+ax.text(7.0, 0.08, "核心原则：任何指标提升须先经「删除泄露后重跑」验证；数据可信度优先于指标绝对值。",
         ha="center", va="center", fontsize=9.5, color="#4a4a4a")
 
 fig.tight_layout()
