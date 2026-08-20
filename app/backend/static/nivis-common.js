@@ -273,9 +273,15 @@
             .then(function (rh) { return isJson(rh) ? rh.json() : null; })
             .then(function (h) {
               if (!h) { set('warn', '后端已连接 · 引擎检测失败'); return; }
-              if (h.ollama_connected || h.vllm_connected) {
+              /* 引擎就绪判定按后端类型分派（后端 /api/health 已按各后端算好 model_available）：
+                 - transformers/llamacpp：model_available = 本地基座 + adapter 是否齐全/已加载
+                 - ollama：model_available = 模型是否已 pull（ollama_connected 仅表示服务连通）
+                 - vllm：model_available = 服务是否运行且模型已加载
+                 一律以 model_available 为准；ollama/vllm 额外展示模型名。 */
+              if (h.model_available) {
                 var m = h.model || (h.vllm_connected ? 'vLLM' : 'unknown');
-                set('ok', '后端已连接 · 引擎就绪 · ' + m);
+                var label = h.backend === 'OllamaClient' ? '' : (h.backend === 'TransformersClient' ? ' · ' + (h.base_model || h.model || '') : '');
+                set('ok', '后端已连接 · 引擎就绪' + (h.ollama_connected || h.vllm_connected ? ' · ' + m : label));
               } else {
                 set('warn', '后端已连接 · 引擎未就绪');
               }
