@@ -2937,7 +2937,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.target == "tools":
-        ok = install_security_tools(python_executable=args.python, dry_run=args.dry_run)
+        try:
+            ok = install_security_tools(python_executable=args.python, dry_run=args.dry_run)
+        except Exception as e:  # noqa: BLE001 —— 工具安装异常不静默退出，明确提示
+            import traceback
+            print(f"[安全工具] ❌ 工具安装过程异常: {e}")
+            print("  详细堆栈：")
+            traceback.print_exc()
+            print("  可设置 VULN_SCANNER_SKIP_TOOLS=1 跳过工具安装后重试。")
+            ok = False
     else:
         ok = install_backend_dependencies(args.target, python_executable=args.python, dry_run=args.dry_run)
     sys.exit(0 if ok else 1)
