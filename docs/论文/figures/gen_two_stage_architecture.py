@@ -133,10 +133,8 @@ ax.text(13.4, 1.1, "输出：漏洞判定 + CWE + 修复建议\n（或 review / 
 arrow(ax, 12.85, 1.1, 13.05, 1.1)
 
 # 顶部说明
-ax.text(8, 9.5, "当前 fixed5 实际架构：两阶段骨架 + 2.5 代信任层 + 复核兜底",
+ax.text(8, 9.25, "当前 fixed5 实际架构：两阶段骨架 + 2.5 代信任层 + 复核兜底",
         ha="center", va="center", fontsize=14, fontweight="bold", color="#333333")
-ax.text(8, 9.05, "不再标称'80% 文件不调用 LLM'——两阶段未做实测统计；复核/兜底路径保证工具盲区不被静默放行",
-        ha="center", va="center", fontsize=9, color="#d32f2f")
 
 fig.tight_layout()
 fig.savefig("two_stage_architecture.png", dpi=170)
