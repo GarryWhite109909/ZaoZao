@@ -363,10 +363,16 @@ def _extract_json_objects(text: str) -> list[str]:
 
 
 def parse_triage_verdict(raw_output: str) -> Optional[dict]:
-    """从裁决模型输出中解析 is_confirmed JSON。
+    """从裁决模型输出中解析判定 JSON。
 
-    兼容 ```json ... ``` 围栏与裸 JSON。返回含 is_confirmed 的 dict；
-    解析失败返回 None。
+    双格式兼容（2026-08-20 修复）：
+      - is_confirmed 格式（triage_default 系 prompt）
+      - has_vulnerability 格式（triage_train_aligned：system=ALPHA05_PROMPT + aligned schema，
+        与 α0.5 训练格式一致）——此前只认 is_confirmed，aligned 模式下模型按 prompt 输出
+        has_vulnerability 时全被判 invalid → 候选裁决全转 review（真实 CVE 集 11/11 实锤）。
+        注释长期声称"双格式兼容"但代码从未实现，现已补齐。
+
+    兼容 ```json ... ``` 围栏与裸 JSON。解析失败返回 None。
     """
     if not raw_output:
         return None
@@ -379,12 +385,24 @@ def parse_triage_verdict(raw_output: str) -> Optional[dict]:
                 parsed = json.loads(obj)
             except json.JSONDecodeError:
                 continue
-            if isinstance(parsed, dict) and "is_confirmed" in parsed:
-                return parsed
-    # 字段级兜底
+            if isinstance(parsed, dict):
+                if "is_confirmed" in parsed:
+                    return parsed
+                if "has_vulnerability" in parsed:
+                    # 归一化为 is_confirmed 语义（_adjudicate_one 统一消费）
+                    return {"is_confirmed": parsed["has_vulnerability"],
+                            "has_vulnerability": parsed.get("has_vulnerability"),
+                            "reason": parsed.get("reason", ""),
+                            "vulnerability_type": parsed.get("vulnerability_type", ""),
+                            "fix_suggestion": parsed.get("fix_suggestion", "")}
+    # 字段级兜底（双格式）
     m = re.search(r'"is_confirmed"\s*:\s*(true|false)', raw_output, re.IGNORECASE)
     if m:
         return {"is_confirmed": m.group(1).lower() == "true"}
+    m = re.search(r'"has_vulnerability"\s*:\s*(true|false)', raw_output, re.IGNORECASE)
+    if m:
+        return {"is_confirmed": m.group(1).lower() == "true",
+                "has_vulnerability": m.group(1).lower() == "true"}
     return None
 
 
