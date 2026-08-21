@@ -29,11 +29,11 @@ def hbox(ax, x, y, w, h, title, lines, facecolor, edgecolor, title_fs=10, text_f
     patch = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.02,rounding_size=0.1",
                            facecolor=facecolor, edgecolor=edgecolor, linewidth=1.5, alpha=0.95)
     ax.add_patch(patch)
-    # 文字位置收紧，确保所有行在框内（底部留白 ≥0.10）
-    ax.text(x + w / 2, y + h - 0.22, title, ha="center", va="center",
+    # 文字位置收紧，确保所有行在框内（title 顶格、sub 紧贴上/下）
+    ax.text(x + w / 2, y + h - 0.26, title, ha="center", va="center",
             fontsize=title_fs, fontweight="bold", color="white")
     for i, line in enumerate(lines):
-        ax.text(x + w / 2, y + h - 0.50 - i * 0.28, line, ha="center", va="center",
+        ax.text(x + w / 2, y + h - 0.52 - i * 0.26, line, ha="center", va="center",
                 fontsize=text_fs, color="white", linespacing=1.2)
     return {"x": x, "y": y, "w": w, "h": h,
             "cx": x + w / 2, "cy": y + h / 2,
@@ -55,9 +55,11 @@ ax.text(7.0, 7.35, "审计与验证机制", ha="center", va="center", fontsize=1
 ax.text(11.7, 7.35, "评估隔离", ha="center", va="center", fontsize=12,
         fontweight="bold", color="#2e7d32")
 
-# ---------- 三列 box ----------
+# ---------- 三列 box（每列从同一顶部起，等距分布，底部对齐，文字不溢出） ----------
 BOX_W = 3.6
-BOX_H = 0.82
+BOX_H = 0.85        # 需容纳 title + 2 行 sub
+COL_TOP = 6.1       # 三列顶部统一
+COL_BOTTOM = 1.7    # 三列底部统一（等分区间，避免文字溢出）
 
 # 左列：3 项
 left_x = 0.5
@@ -66,12 +68,12 @@ left_boxes = [
     ("训练-测试 Jaccard 泄漏", ["v4 整版废弃", "63 个样本重叠 30%+"]),
     ("反向拟合规则", ["类型白名单对着测试集推", "建立独立推导铁律"]),
 ]
-left_ys = [5.95, 4.78, 3.61]
+left_ys = [COL_TOP - i * (COL_TOP - COL_BOTTOM - BOX_H) / 2 for i in range(3)]
 left_objs = []
 for (title, lines), y in zip(left_boxes, left_ys):
     left_objs.append(hbox(ax, left_x, y, BOX_W, BOX_H, title, lines, "#c62828", "#c62828"))
 
-# 中列：5 项（压缩间距，避免与底部结果框碰撞）
+# 中列：5 项
 center_x = 5.2
 center_boxes = [
     ("Jaccard 行级重叠审计", ["30% 相似阈值触发复核"]),
@@ -80,7 +82,7 @@ center_boxes = [
     ("CWE 纠正口径", ["关键词归一 + evidence 守卫 + 父子族"]),
     ("parse_fail 计入漏报", ["避免解析失败被分母剔除"]),
 ]
-center_ys = [5.95, 4.78, 3.61, 2.44, 1.30]
+center_ys = [COL_TOP - i * (COL_TOP - COL_BOTTOM - BOX_H) / 4 for i in range(5)]
 center_objs = []
 for (title, lines), y in zip(center_boxes, center_ys):
     center_objs.append(hbox(ax, center_x, y, BOX_W, BOX_H, title, lines, "#1565c0", "#1565c0"))
@@ -93,7 +95,7 @@ right_boxes = [
     ("答案泄漏零容忍", ["文件名标签 / 反向规则审计"]),
     ("归因分流再修复", ["工具/模型责任分离"]),
 ]
-right_ys = [5.95, 4.78, 3.61, 2.44]
+right_ys = [COL_TOP - i * (COL_TOP - COL_BOTTOM - BOX_H) / 3 for i in range(4)]
 right_objs = []
 for (title, lines), y in zip(right_boxes, right_ys):
     right_objs.append(hbox(ax, right_x, y, BOX_W, BOX_H, title, lines, "#2e7d32", "#2e7d32"))

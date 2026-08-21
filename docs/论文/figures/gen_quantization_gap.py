@@ -44,15 +44,10 @@ for b, v in zip(bars2, left_fpr):
 ax1.set_xticks(x[:2])
 ax1.set_xticklabels(left_pipes, fontsize=11)
 ax1.set_ylim(0, 1.2)
-ax1.set_title("合成集 87 段：两种 4-bit 管道", fontsize=14, fontweight="bold")
+ax1.set_title("合成集 87 段：两种 4-bit 管道\n（recall 与 FPR 对比）", fontsize=13, fontweight="bold")
 ax1.set_ylabel("指标值")
 ax1.legend(loc="upper right")
 ax1.grid(axis="y", alpha=0.25)
-# 关键结论标注
-ax1.text(1, 1.05, "recall 1.000→0.951\n（量化噪声影响存在性判别）", ha="center", va="bottom",
-         fontsize=9, color="#1f77b4")
-ax1.text(1, 0.45, "FPR 42.3%→7.7%\n（合并量化抹平过度敏感模式）", ha="center", va="bottom",
-         fontsize=9, color="#d62728")
 
 # ============ 右图：CVE-fix 20（recall，HF vs Ollama base vs combined） ============
 right_pipes = ["HF NF4+FP16\nLoRA", "Ollama Q4_K_M\nbase", "Ollama Q4_K_M\ncombined"]
