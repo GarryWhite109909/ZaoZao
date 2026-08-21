@@ -22,16 +22,32 @@ fpr = [0.217, None, 0.167, None, 0.043]
 fig, ax = plt.subplots(figsize=(12, 6.5))
 
 # 阶梯线：recall 蓝色，fpr 红色
+# 注意：fixed2/fixed4 无数据，须断开连线（不能让 step 把 None 点贯穿，误导成有数据）。
 x = list(range(len(versions)))
-ax.step(x, recall, where="mid", color="#1f77b4", linewidth=2.5, marker="o", markersize=8, label="recall")
-ax.step(x, fpr, where="mid", color="#d62728", linewidth=2.5, marker="s", markersize=8, label="FPR")
+# 有数据的索引
+recall_pts = [(i, v) for i, v in enumerate(recall) if v is not None]
+fpr_pts = [(i, v) for i, v in enumerate(fpr) if v is not None]
+
+# 分段画实线：仅连相邻都有数据的点
+def draw_segmented(pts, color, marker, label):
+    for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
+        if x2 - x1 > 1:
+            # 中间隔着缺失点，不连线（断开）
+            continue
+        ax.plot([x1, x2], [y1, y2], color=color, linewidth=2.5, zorder=2)
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    ax.plot(xs, ys, linestyle="", color=color, marker=marker, markersize=8, zorder=3, label=label)
+
+draw_segmented(recall_pts, "#1f77b4", "o", "recall")
+draw_segmented(fpr_pts, "#d62728", "s", "FPR")
 
 # 标注数据点
 for i, (r, f) in enumerate(zip(recall, fpr)):
     if r is not None:
-        ax.text(i, r + 0.03, f"{r:.3f}", ha="center", va="bottom", fontsize=9, color="#1f77b4", fontweight="bold")
+        ax.text(i, r + 0.03, f"{r:.3f}", ha="center", va="bottom", fontsize=9, color="#1f77b4", fontweight="bold", zorder=4)
     if f is not None:
-        ax.text(i, f - 0.03, f"{f:.3f}", ha="center", va="top", fontsize=9, color="#d62728", fontweight="bold")
+        ax.text(i, f - 0.03, f"{f:.3f}", ha="center", va="top", fontsize=9, color="#d62728", fontweight="bold", zorder=4)
 
 # fixed2 / fixed4 标注
 ax.text(1, 0.55, "fixed2 中断\n（21/87，无有效指标）", ha="center", va="center", fontsize=9,

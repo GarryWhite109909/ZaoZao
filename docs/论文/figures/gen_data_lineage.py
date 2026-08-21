@@ -55,10 +55,11 @@ for bar, size in zip(bars, sizes):
     ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 80,
             f"{size}", ha="center", va="bottom", fontsize=10, fontweight="bold")
 
-# 标注
-ax.annotate("云端蒸馏突破\n（双模型 API，约 100 元）", xy=(8, 7692), xytext=(8, 8000),
-            ha="center", fontsize=10, color="#2ca02c", fontweight="bold")
-ax.annotate("当前训练主线\n（两阶段）", xy=(10, 7972), xytext=(10, 9100),
+# 标注——移到柱子上方空白处，避免遮挡柱顶数字
+ax.annotate("云端蒸馏突破\n（双模型 API，约 100 元）", xy=(8, 7692), xytext=(8.6, 8600),
+            ha="center", fontsize=10, color="#2ca02c", fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color="#2ca02c"))
+ax.annotate("当前训练主线\n（两阶段）", xy=(10, 7972), xytext=(10, 9600),
             ha="center", fontsize=10, color="#9467bd", fontweight="bold",
             arrowprops=dict(arrowstyle="->", color="#9467bd"))
 
