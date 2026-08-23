@@ -190,11 +190,18 @@ def compute_metrics(records: list[dict]) -> dict:
     strict_accuracy_decided = (strict_tp + tn) / strict_decided if strict_decided else None
 
     # 判"漏洞"(True) 子集准确率：prefilter 判 True 会直接报告漏洞
+    # strict 分母同样剔除"无法校验 CWE"的样本（全部落在 decided_true 内），
+    # 与上方 strict_accuracy_decided 的剔除规则一致；原先分母不剔除会导致
+    # 这些样本既不计对也未剔除，被重复惩罚
+    strict_decided_true = decided_true - strict_unverifiable
     true_loose_accuracy = tp / decided_true if decided_true else None
-    true_strict_accuracy = strict_tp / decided_true if decided_true else None
+    true_strict_accuracy = strict_tp / strict_decided_true if strict_decided_true else None
     # 判"安全"(False) 子集准确率：prefilter 判 False 会直接放行（短路 LLM，风险更高）
+    # strict 口径对这一侧没有可剔除项：CWE 校验只作用于判 True 的漏洞样本
+    # （strict_unverifiable 全部在 decided_true 内），因此严格≡宽松，显式标注
+    # 避免误以为存在两种口径
     false_loose_accuracy = tn / decided_false if decided_false else None
-    false_strict_accuracy = tn / decided_false if decided_false else None
+    false_strict_accuracy = false_loose_accuracy
 
     # 覆盖率 / 短路率
     coverage = decided / n if n else None

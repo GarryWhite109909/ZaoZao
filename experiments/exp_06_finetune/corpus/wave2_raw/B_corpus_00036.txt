@@ -1,0 +1,92 @@
+LANG: php
+```code
+# === file: app/Controller/StoreController.php ===
+<?php
+declare(strict_types=1);
+
+namespace Plugin\MineAdmin\AppStore\Controller;
+
+use App\Http\Common\Result;
+use Hyperf\HttpServer\Annotation\Controller;
+use Hyperf\HttpServer\Annotation\PostMapping;
+use Plugin\MineAdmin\AppStore\Service\DownloadService;
+
+#[Controller(prefix: 'admin/plugin/store')]
+class StoreController
+{
+    public function __construct(private DownloadService $downloadService)
+    {
+    }
+
+    #[PostMapping('download')]
+    public function download(): Result
+    {
+        // 用户输入的包名直接传入服务层，未做任何校验（source）
+        $packageName = $this->request->input('package');
+        $result = $this->downloadService->fetchPackage($packageName);
+        return $this->success(['result' => $result]);
+    }
+}
+
+# === file: app/Service/DownloadService.php ===
+<?php
+declare(strict_types=1);
+
+namespace Plugin\MineAdmin\AppStore\Service;
+
+use Plugin\MineAdmin\AppStore\Support\PathResolver;
+
+class DownloadService
+{
+    public function __construct(private PathResolver $pathResolver)
+    {
+    }
+
+    public function fetchPackage(string $packageName): array
+    {
+        // 仅做了简单 trim，看似净化实则不完整，未过滤 ../ 等路径穿越字符
+        $name = trim($packageName);
+        $localPath = $this->pathResolver->resolve($name);
+        return ['path' => $localPath];
+    }
+}
+
+# === file: app/Support/PathResolver.php ===
+<?php
+declare(strict_types=1);
+
+namespace Plugin\MineAdmin\AppStore\Support;
+
+class PathResolver
+{
+    private string $baseDir = BASE_PATH . '/runtime/packages';
+
+    public function resolve(string $name): string
+    {
+        // 直接拼接后用于文件读取，存在路径穿越（sink）
+        $target = $this->baseDir . '/' . $name;
+        if (! is_file($target)) {
+            throw new \RuntimeException('package not found');
+        }
+        return file_get_contents($target);
+    }
+}
+```
+
+分析步骤：
+1. L1:app/Controller/StoreController.php:22-24 — `download()` 从 `$this->request->input('package')` 获取用户输入并直接传给 `DownloadService::fetchPackage()`，构成污点 source。
+2. L2:app/Service/DownloadService.php:17-19 — `fetchPackage()` 只执行 `trim()`，未过滤 `../`、绝对路径等穿越字符，属于“净化看似发生实则不完整”的中间传递层。
+3. L3:app/Support/PathResolver.php:14-21 — `resolve()` 将传入名称直接拼接到 `baseDir` 后调用 `file_get_contents()` 读取任意路径文件，构成 sink。
+4. 整条调用链 Controller → Service → Resolver 中无任何对 `..`、`/` 或白名单的完整校验，攻击者可通过 `package=../../.env` 读取服务器任意文件。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22",
+  "source": "L1:line 23: request->input('package') 用户可控的包名参数",
+  "sink": "L3:line 16: file_get_contents($target) 拼接用户输入后的文件读取",
+  "propagation_path": "L1:line 24 fetchPackage($packageName) -> L2:line 18 trim($packageName) -> L2:line 19 resolve($name) -> L3:line 15 拼接到 baseDir -> L3:line 20 file_get_contents",
+  "sanitizer_present": false,
+  "notes": "中间层仅做 trim 处理，未过滤路径穿越字符，调用链上无完整防御"
+}
+```

@@ -1,0 +1,39 @@
+LANG: python
+```python
+from fastapi import FastAPI, Request, Body
+import yaml
+
+app = FastAPI()
+
+def load_yaml_config(raw: str):
+    """Central YAML loader used across the app.
+
+    If a 'strict mode' flag is set in app state, limits are applied;
+    otherwise falls back to plain yaml.load with default Loader.
+    """
+    strict = getattr(app.state, "yaml_strict", None)
+    if strict is not None and (strict.max_aliases or strict.code_point_limit):
+        return yaml.load(raw, Loader=yaml.SafeLoader)
+    # fallback: default (unsafe) full-constructor loader
+    return yaml.load(raw, Loader=yaml.Loader)
+
+@app.post("/deploy/cloudformation")
+async def deploy_cloudformation(request: Request, template: str = Body(...)):
+    parsed = load_yaml_config(template)
+    return {"status": "accepted", "resources": parsed.get("Resources", {})}
+
+@app.post("/baking/cloudfoundry")
+async def bake_cloudfoundry(request: Request, manifest: str = Body(...)):
+    parsed = load_yaml_config(manifest)
+    return {"status": "baked", "apps": parsed.get("applications", [])}
+```
+
+1. 第 20 行与第 25 行：FastAPI 路由通过 `Body(...)` 接收外部用户提交的 YAML 字符串，这是 source（等价于原代码中 CloudFormation 部署 / CF Baking 的输入入口）。
+2. 第 9-10 行：防御逻辑依赖 `app.state.yaml_strict` 是否被配置；若未在任何启动流程中设置该属性，`getattr` 返回 `None`，直接落入不安全的 fallback 分支——与原代码“未配置 YamlParserProperties 时回退到默认 Yaml()”的绕过结构完全一致。
+3. 第 13 行：sink 为 `yaml.load(raw, Loader=yaml.Loader)`，PyYAML 的完整 `Loader` 支持构造任意 Python 对象（如 `!!python/object/apply:os.system`），即反序列化导致任意代码执行。
+4. 即使 strict 模式生效，第 11 行使用 `SafeLoader` 仅在两个标志同时存在时才可达，且该开关由服务端全局状态控制而非强制默认，攻击者只需在未初始化 strict 的部署路径上提交恶意 YAML 即可触发 sink。
+5. 因此 source → sink 之间不存在有效且强制的防御，漏洞语义与原始 CWE-502 完全对应。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 不安全反序列化：YAML 全构造器加载任意 Python 对象", "risk_level": "critical", "source": "line 20/25: Body 接收的外部 YAML 字符串 template 与 manifest", "sink": "line 13: yaml.load(raw, Loader=yaml.Loader)", "explanation": "外部请求体中的 YAML 文本 -> 未配置 strict 状态时回退到默认 Loader -> 反序列化任意对象导致远程代码执行", "fix_suggestion": "line 13: 始终使用 yaml.safe_load(raw) 或显式指定 SafeLoader，并将安全加载设为唯一路径而非可绕过的回退分支"}
+```

@@ -1,0 +1,54 @@
+LANG: go
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+// SessionState 是从缓存/客户端恢复的会话聚合状态，
+// 与原 Java 侧从远端缓存读取后直接反序列化的结构等价。
+type SessionState struct {
+	UserID   string
+	Roles    []string
+	Payload  map[string]interface{}
+}
+
+func restoreSession(c *gin.Context) {
+	// source: 客户端提交的原始序列化字节，未做任何校验
+	body, err := c.GetRawData()
+	if err != nil {
+		c.String(http.StatusBadRequest, "bad body")
+		return
+	}
+
+	var state SessionState
+	// sink: 直接对不可信字节流执行 gob 反序列化，无类型白名单、无签名校验
+	dec := gob.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(&state); err != nil {
+		c.String(http.StatusInternalServerError, "decode failed")
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"user": state.UserID, "roles": state.Roles})
+}
+
+func main() {
+	r := gin.Default()
+	r.POST("/session/restore", restoreSession)
+	r.Run(":8080")
+}
+```
+
+1. 第 22 行：`c.GetRawData()` 直接读取请求体原始字节，这是外部输入入口（source），内容完全由客户端控制。
+2. 第 27 行：`gob.NewDecoder(...).Decode(&state)` 对该不可信字节流执行反序列化（sink），gob 解码过程中会按流内类型信息构造任意已注册类型的对象，可触发恶意类型的构造逻辑，等价于 Java 中 `ObjectInputStream.readObject` 无 `ObjectInputFilter` 的场景。
+3. 全程没有签名/HMAC 校验、没有解码前的 schema 校验、也没有限制可实例化类型的白名单——防御与原漏洞一样完全缺失。
+4. 若改为 JSON + 显式结构体字段绑定（`c.ShouldBindJSON`）或对 payload 先验签再解，即可消除该风险。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 不受信数据反序列化（gob 等价物）", "risk_level": "high", "source": "line 22: c.GetRawData() 获取客户端可控的原始序列化字节", "sink": "line 27: gob.NewDecoder(...).Decode(&state) 直接反序列化不可信数据", "explanation": "客户端可控字节 -> 未校验直接 gob 反序列化 -> 可构造恶意对象触发任意代码执行", "fix_suggestion": "line 27: 改用 c.ShouldBindJSON 绑定到固定结构体，或对请求体先做 HMAC 签名校验并使用类型白名单后再解码"}
+```

@@ -1,0 +1,80 @@
+LANG: go
+```code
+# === file: plugin/input.go ===
+package plugin
+
+import (
+	"os"
+	"strings"
+)
+
+// GetPluginOutputPath 从用户请求中提取插件输出文件路径（source：外部输入）
+func GetPluginOutputPath() string {
+	req := os.Getenv("PLUGIN_OUTPUT_REQUEST")
+	// 仅做简单前缀清理，未校验路径穿越
+	cleaned := strings.TrimPrefix(req, "plugin=")
+	return cleaned
+}
+
+# === file: plugin/manager.go ===
+package plugin
+
+import (
+	"io"
+	"os"
+	"path/filepath"
+)
+
+// ResolveOutputFile 中间层：看似做了 filepath.Join 归一化，
+// 但 Join 不会消除 `..`，攻击者可用 ../../ 写出任意位置
+func ResolveOutputFile(userPath string) string {
+	base := filepath.Join(os.TempDir(), "outputs")
+	return filepath.Join(base, userPath)
+}
+
+// WriteOutput sink：将内容写入由用户输入解析出的路径
+func WriteOutput(resolved string, content []byte) error {
+	f, err := os.Create(resolved)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err = f.Write(content)
+	return err
+}
+
+# === file: cmd/run.go ===
+package main
+
+import (
+	"example.com/app/plugin"
+)
+
+func main() {
+	// source 在 input.go，sink 在 manager.go，跨文件污点传播
+	userPath := plugin.GetPluginOutputPath()
+	resolved := plugin.ResolveOutputFile(userPath)
+	_ = plugin.WriteOutput(resolved, []byte("report data"))
+}
+```
+
+1. `input.go:11` 的 `GetPluginOutputPath` 直接返回环境变量 `PLUGIN_OUTPUT_REQUEST`，是外部可控的 source，仅做 TrimPrefix 前缀剥离，无路径校验。
+2. 污点值经 `cmd/run.go:9` 传入 `manager.go:10` 的 `ResolveOutputFile`。
+3. `manager.go:12-13` 使用 `filepath.Join(base, userPath)`，Join 只做词法拼接，不清理 `..` 序列，属于“看似净化实则不完整”的中间层。
+4. 污染后的 resolved 路径传入 `manager.go:18` 的 `WriteOutput`，在 `manager.go:20` 由 `os.Create(resolved)` 打开任意可写路径并写入内容，构成 sink。
+5. 调用链上无任何对 `..`、绝对路径或白名单目录的完整防御，source 与 sink 分处不同文件，构成跨文件 CWE-22 路径遍历写漏洞。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22",
+  "source": "L1:line 11: GetPluginOutputPath 返回外部可控的环境变量 PLUGIN_OUTPUT_REQUEST",
+  "sink": "L2:line 20: os.Create(resolved) 以污染路径创建并写入文件",
+  "propagation": "L1:line 11 返回值 -> L3:line 9 userPath -> L2:line 13 filepath.Join 拼接 -> L3:line 10 resolved -> L2:line 18 WriteOutput 参数",
+  "sanitizer": "L2:line 12-13 filepath.Join 仅做拼接归一化，未过滤 .. 或绝对路径，净化不完整",
+  "reason": "用户输入经中间层 Join 后直接作为 os.Create 的目标路径，攻击者可通过 ../.. 实现任意文件写入"
+}
+```

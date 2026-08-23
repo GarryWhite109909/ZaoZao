@@ -242,12 +242,17 @@ def github_request(url: str, token: str, accept: str = "application/vnd.github+j
     return 0, {}, None
 
 
-def search_nvd_by_cwe(cwe_id, proxy=None, max_results=20):
+def search_nvd_by_cwe(cwe_id, proxy=None, max_results=20,
+                      pub_start=None, pub_end=None, api_key=None):
     """用 NVD API 按 CWE 搜索 CVE。
 
     URL: https://services.nvd.nist.gov/rest/json/cves/2.0?cweId={cwe_id}&resultsPerPage={max_results}
     支持代理（urllib.request.ProxyHandler）。
     NVD 无 API key 时限速 5 req/30s，调用方应自行 sleep（保守 7s）。
+    pub_start/pub_end（ISO8601，如 "2023-06-01T00:00:00.000"）限定发布窗口：
+      不带日期时 NVD 按发布时间升序返回，会拿到前 GitHub 时代（<2012 年）的
+      老 CVE——它们没有 commit 链接；无 key 时单窗口跨度上限 120 天。
+    api_key：NVD_API_KEY 时走 50 req/30s 限额。
 
     返回 list of dict:
       [{"cve_id": "CVE-XXXX-XXXX", "cwe_id": "CWE-89",
@@ -256,9 +261,14 @@ def search_nvd_by_cwe(cwe_id, proxy=None, max_results=20):
     descriptions（取英文）、references。
     """
     url = f"{NVD_API}?cweId={cwe_id}&resultsPerPage={max_results}"
+    if pub_start and pub_end:
+        url += f"&pubStartDate={pub_start}&pubEndDate={pub_end}"
     proxy_handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy}) if proxy else None
     opener = urllib.request.build_opener(proxy_handler) if proxy else urllib.request.build_opener()
-    req = urllib.request.Request(url, headers={"User-Agent": "graduation-project-cve-fix-fetcher"})
+    headers = {"User-Agent": "graduation-project-cve-fix-fetcher"}
+    if api_key:
+        headers["apiKey"] = api_key
+    req = urllib.request.Request(url, headers=headers)
     try:
         with opener.open(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))

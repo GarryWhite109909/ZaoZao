@@ -11,6 +11,23 @@ from datetime import datetime
 from graduation_project.result_types import BatchResult, SingleResult
 
 
+def _md_cell(value) -> str:
+    """表格单元格转义：裸 | 会断列，换行会断行。"""
+    return str(value if value is not None else "").replace("|", "\\|").replace("\r", "").replace("\n", " ")
+
+
+def _md_fence(text: str) -> str:
+    """为内容选取不会被其内部 ``` 围栏截断的反引号围栏（模型输出常含代码块）。"""
+    longest = run = 0
+    for ch in text:
+        if ch == "`":
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    return "`" * max(3, longest + 1)
+
+
 def render_single_markdown(r) -> str:
     """单文件结果 → Markdown。
 
@@ -38,10 +55,10 @@ def render_single_markdown(r) -> str:
         lines.append("")
         lines.append(f"| 字段 | 值 |")
         lines.append(f"|---|---|")
-        lines.append(f"| 漏洞类型 | {r.vulnerability_type} |")
-        lines.append(f"| 风险等级 | {r.risk_level} |")
-        lines.append(f"| 污染来源 | {r.source} |")
-        lines.append(f"| 触发点 | {r.sink} |")
+        lines.append(f"| 漏洞类型 | {_md_cell(r.vulnerability_type)} |")
+        lines.append(f"| 风险等级 | {_md_cell(r.risk_level)} |")
+        lines.append(f"| 污染来源 | {_md_cell(r.source)} |")
+        lines.append(f"| 触发点 | {_md_cell(r.sink)} |")
         lines.append("")
         lines.append("### 说明")
         lines.append(r.explanation or "（无）")
@@ -57,12 +74,13 @@ def render_single_markdown(r) -> str:
         lines.append(r.error or "模型输出无法解析。")
 
     if r.raw_output:
+        fence = _md_fence(r.raw_output)
         lines.append("")
         lines.append("<details><summary>模型原始输出（CoT 分析过程）</summary>")
         lines.append("")
-        lines.append("```")
+        lines.append(fence)
         lines.append(r.raw_output)
-        lines.append("```")
+        lines.append(fence)
         lines.append("</details>")
 
     return "\n".join(lines)
@@ -93,7 +111,8 @@ def render_batch_markdown(batch: BatchResult, title: str = "批量扫描报告")
         lines.append("|---|---|---|---|")
         for r in vuln_files:
             lines.append(
-                f"| {r.filename} | {r.vulnerability_type} | {r.risk_level} | {r.sink} |"
+                f"| {_md_cell(r.filename)} | {_md_cell(r.vulnerability_type)} | "
+                f"{_md_cell(r.risk_level)} | {_md_cell(r.sink)} |"
             )
         lines.append("")
 

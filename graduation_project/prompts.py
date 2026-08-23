@@ -720,16 +720,29 @@ _ALPHA05_SCHEMA = (
 
 
 def _build_alpha05_prompt() -> str:
+    # α0.6 起口径更新（2026-08-22，与 final_train_chatml_alpha06 同步）：
+    # 1) 防御清单删除"列表参数"——列表形式默认安全但 argv 含 shell/解释器/执行语义
+    #    参数时仍是注入（实测 sh -c 真注入被旧口径系统性漏报，见 docs/训练优化计划.md 六.5）；
+    # 2) 补"黑名单/正则过滤不是有效防御"否定面；
+    # 3) 分析步骤加入防御有效性逐条验证与第二入口检查（针对过度信任防御与 CWE-441 型 FN）；
+    # 4) few-shot 例 2 换为"形似实安全"边界例（拼接后作为占位符参数 ≠ 拼接进 SQL）。
     return (
         "你是一名安全研究员，分析给定代码是否存在安全漏洞。\n\n"
         "要求：\n"
-        "1. 仅用户可控输入到达危险 sink 才算漏洞；sink 前有有效防御（参数化/列表参数/白名单/转义）则判安全。\n"
+        "1. 仅用户可控输入到达危险 sink 才算漏洞；sink 前有有效防御（参数化查询/白名单精确允许集/"
+        "转义/框架自动防护）则判安全。注意：黑名单或正则过滤通常可被绕过，不算有效防御；"
+        "subprocess 列表形式通常不经 shell 是安全的，但 argv 中出现 shell/解释器"
+        "（如 [\"sh\", \"-c\", 用户输入]）或执行语义参数（find -exec、git --upload-pack 等）时仍是命令注入。\n"
         "2. 硬编码字面量凭证（key/secret/password/token）本身就是漏洞。\n"
         "3. 不得捏造代码中不存在的 API 参数或行为；JSON 结论须与分析一致。\n\n"
         "分析步骤：\n"
-        "1. 找用户可控输入点，追踪其是否到达危险 sink（execute/system/open/eval 等）。\n"
-        "2. 检查防御是否有效，给出 CWE 编号与风险等级。\n\n"
-        "在回答最后，必须严格输出一个 JSON 对象作为最终结论，JSON 块用 ```json 包裹，字段如下：\n"
+        "1. 枚举所有用户可控输入点，逐一追踪是否到达危险 sink（execute/system/open/eval 等）。\n"
+        "2. 对每条 source→sink 数据流验证防御有效性：确认防御类型、位置能否完整覆盖该条流；"
+        "黑名单/正则过滤视为可绕过，不算有效防御。\n"
+        "3. 检查是否存在第二入口或替代通道（其他路由/参数/间接调用/备用通道）。\n"
+        "4. 若存在漏洞，给出 CWE 编号与风险等级。\n\n"
+        "在回答最后，必须严格输出一个 JSON 对象作为最终结论，JSON 块用 ```json 包裹，"
+        "字段按以下顺序输出：\n"
         + _ALPHA05_SCHEMA
         + "\n\n"
         "【示例 1｜漏洞：SQL 注入】\n"
@@ -741,14 +754,18 @@ def _build_alpha05_prompt() -> str:
         "```json\n"
         "{\"has_vulnerability\": true, \"vulnerability_type\": \"CWE-89 SQL Injection\", \"risk_level\": \"Critical\", \"source\": \"line 2: user 参数\", \"sink\": \"line 2: cur.execute 拼接 SQL\", \"explanation\": \"user -> 拼接 SQL -> 注入\", \"fix_suggestion\": \"line 2: 改用参数化查询\"}\n"
         "```\n\n"
-        "【示例 2｜安全：参数化查询】\n"
+        "【示例 2｜安全：看似拼接实为参数化】\n"
         "```python\n"
-        "def query(user):\n"
-        "    cur.execute(\"SELECT * FROM users WHERE name=?\", (user,))\n"
+        "def search(request):\n"
+        "    q = request.args.get(\"q\", \"\")\n"
+        "    like = \"%'\" + q + \"%'\"\n"
+        "    cur.execute(\"SELECT * FROM users WHERE name LIKE ?\", (like,))\n"
         "```\n"
-        "分析：参数化查询自动转义，无注入风险。\n"
+        "分析：第 4 行虽出现字符串拼接，但 like 是作为占位符 `?` 的绑定参数传入 execute（第 5 行），"
+        "值不会进入 SQL 语法层，无法注入。判断依据是值的传递方式，而非代码里是否出现 + 号——此类"
+        "\"形似实安全\"不得误报。\n"
         "```json\n"
-        "{\"has_vulnerability\": false, \"vulnerability_type\": \"none\", \"risk_level\": \"None\", \"source\": \"N/A\", \"sink\": \"N/A\", \"explanation\": \"参数化查询已正确防护\", \"fix_suggestion\": \"no fix needed\"}\n"
+        "{\"has_vulnerability\": false, \"vulnerability_type\": \"none\", \"risk_level\": \"None\", \"source\": \"N/A\", \"sink\": \"N/A\", \"explanation\": \"q -> 拼接构造 LIKE 值 -> 作为占位符绑定参数传入 execute -> 不进入 SQL 语法层\", \"fix_suggestion\": \"no fix needed\"}\n"
         "```\n"
     )
 
@@ -961,15 +978,16 @@ def build_triage_prompt(
                  "仅当防御能完整覆盖攻击面时，该 finding "
                  f"才是误报，{'has_vulnerability' if aligned else 'is_confirmed'}=false。")
     parts.append("3. 注意工具规则无语境匹配导致的误报：subprocess.run 列表参数（无 shell=True）"
-                 "不是命令注入；被 int()/float() 转换后的数值插值不是 XSS；"
+                 "通常不是命令注入——列表形式不经 shell 解释，注入载荷只会成为普通 argv 参数；"
+                 "被 int()/float() 转换后的数值插值不是 XSS；"
                  "render/render_template 的 kwargs 值插值（autoescape 开启）不是模板注入。"
+                 "**但列表形式不等于安全**：若 argv 中出现 shell/解释器（sh、bash、zsh、"
+                 "powershell 等后接 -c/-f 类执行参数），或携带执行语义参数（find 的 -exec/-execdir、"
+                 "git 的 --upload-pack/--receive-pack、python -c / perl -e / node -e 等），"
+                 "载荷会被该解释器执行，仍是命令注入，不得仅因列表形式判安全。"
                  "但注意：**正则/黑名单过滤（如 re.search(r'\\\\.\\\\./')）不是有效防御**——"
                  "它可被编码/分隔符变体绕过（%2e%2e%2f、..\\\\、....//、双重编码），"
-                 "被绕过仍是漏洞，不得仅因存在过滤代码就判安全。"
-                 "对 subprocess.run(\"ping\", arg) 这类列表参数调用，若证据链是"
-                 "**列表形式（无 shell=True）**，该 finding **必为误报**——列表形式不经"
-                 " shell 解释，注入载荷只会成为普通 argv 参数，不得判真（除非另有 "
-                 "shell=True 或字符串拼接的证据）。")
+                 "被绕过仍是漏洞，不得仅因存在过滤代码就判安全。")
     parts.append("4. 严禁捏造代码中不存在的 API 参数或行为；判定必须基于代码实际内容。")
     parts.append("5. 漏洞类型独立判定：工具标注的漏洞类型/规则名是模式匹配的猜测，可能完全"
                  "错误（如把鉴权缺失标成 XSS）。你确认漏洞后，vulnerability_type 必须基于"

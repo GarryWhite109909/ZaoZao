@@ -1,0 +1,67 @@
+LANG: node.js/javascript
+```javascript
+const express = require('express');
+const mysql = require('mysql2/promise');
+
+const app = express();
+app.use(express.json());
+
+const pool = mysql.createPool({
+  host: 'localhost',
+  user: 'root',
+  password: 'secret',
+  database: 'pimcore_clone'
+});
+
+// POST /api/composite-indices/:table
+// body: { type: 'query', compositeIndices: [{ index_type, index_key, index_columns: [] }] }
+app.post('/api/composite-indices/:table', async (req, res) => {
+  const table = req.params.table;
+  const { type, compositeIndices } = req.body;
+
+  try {
+    // fetch existing indices
+    const [existingRaw] = await pool.query(
+      `SHOW INDEXES FROM \`${table}\` WHERE Key_name LIKE 'c\\_%'`
+    );
+    const existingMap = {};
+    for (const item of existingRaw) {
+      (existingMap[item.Key_name] ||= []).push(item.Column_name);
+    }
+    for (const key of Object.keys(existingMap)) {
+      existingMap[key] = existingMap[key].join(',');
+    }
+
+    const newMap = {};
+    for (const idx of compositeIndices.filter(i => i.index_type === type)) {
+      newMap['c_' + idx.index_key] = idx.index_columns.join(',');
+    }
+
+    for (const key of Object.keys(existingMap)) {
+      if (!(key in newMap) || existingMap[key] !== newMap[key]) {
+        await pool.query(`ALTER TABLE \`${table}\` DROP INDEX \`${key}\``);
+      }
+    }
+    for (const [key, cols] of Object.entries(newMap)) {
+      if (!(key in existingMap) || existingMap[key] !== cols) {
+        await pool.query(`ALTER TABLE \`${table}\` ADD INDEX \`${key}\` (${cols})`);
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.listen(3000);
+```
+
+1. 第 17 行：`req.params.table` 直接取自 URL 路径参数，是外部输入 source，无任何白名单/正则校验。
+2. 第 24 行：`table` 被模板字符串直接拼进 `SHOW INDEXES FROM ...` 查询，攻击者可用反引号闭合注入任意 SQL。
+3. 第 40、44 行：`table` 再次拼入 `ALTER TABLE` DDL 语句；同时第 39 行的 `key` 来自请求体中的 `index_key`（第 33 行），同样未过滤，可注入如 `` x`; DROP TABLE users;-- `` 形式的载荷。
+4. 全程仅使用 `pool.query` 拼接而非参数化占位符（DDL 本身虽难参数化表名，但至少应做标识符白名单校验），防御完全缺失，与原 PHP 代码中 `$table`、`$key`、`$columnName` 未转义即拼接的漏洞语义一一对应。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "critical", "source": "line 17: req.params.table 以及 line 15 req.body 中的 index_key/index_columns", "sink": "line 24/40/44: pool.query 模板字符串拼接 ALTER TABLE 与 SHOW INDEXES", "explanation": "外部输入 table 和 index_key 未经验证 -> 直接拼入 SQL/DDL 字符串 -> 攻击者可通过反引号闭合执行任意 SQL", "fix_suggestion": "line 17: 对 table 使用 /^[a-zA-Z0-9_]+$/ 白名单校验，对 index_key 同样限制字符集，并对标识符使用 mysql2 的 identifier 转义工具"}
+```

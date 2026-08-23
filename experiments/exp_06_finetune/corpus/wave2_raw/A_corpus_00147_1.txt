@@ -1,0 +1,45 @@
+LANG: node.js/javascript
+```code
+const express = require('express');
+const libxmljs = require('libxmljs');
+const app = express();
+
+// 中间件链：解析上传的 CIM/RDF XML 模型文件
+app.use(express.text({ type: ['application/xml', 'text/xml'] }));
+
+function parseFullModel(xmlText) {
+    // 未禁用外部实体：noent 为 true 且未设置 NOENT/非网络选项
+    const doc = libxmljs.parseXml(xmlText, { noent: true, dtdload: true });
+    const root = doc.root();
+    if (!root || root.name() !== 'FullModel') {
+        throw new Error('invalid model');
+    }
+    return {
+        id: root.attr('about') ? root.attr('about').value() : null,
+        scenarioTime: root.get('ScenarioTime') ? root.get('ScenarioTime').text() : null,
+        version: root.get('version') ? parseInt(root.get('version').text(), 10) : null,
+        profiles: root.find('profile').map((n) => n.text())
+    };
+}
+
+app.post('/cgmes/model', (req, res) => {
+    try {
+        const model = parseFullModel(req.body);   // source: 请求体直接进入解析器
+        res.json(model);
+    } catch (e) {
+        res.status(400).json({ error: e.message });
+    }
+});
+
+app.listen(3000);
+```
+
+1. 第 4 行 `express.text` 中间件把请求体中的原始 XML 文本原样放入 `req.body`，这是外部输入入口（source），攻击者完全可控其内容。
+2. 第 10 行 `libxmljs.parseXml` 以 `{ noent: true, dtdload: true }` 调用，显式开启实体替换与 DTD 加载，等价于原 Java 代码中未做 XXE 防护的 `XMLInputFactory`（且原代码虽设置了 ACCESS_EXTERNAL_DTD，此处连这类缓解都没有）。
+3. 第 11~17 行对解析结果取属性和子节点文本，若 DTD 中定义了外部实体（如 `<!ENTITY xxe SYSTEM "file:///etc/passwd">` 或 http URL），实体会在解析阶段被展开，形成 SSRF/文件读取。
+4. 第 22 行把 `req.body` 直接传入 `parseFullModel`，source 到 sink 之间没有任何校验、白名单或禁用外部实体的配置，防御完全缺失。
+5. 第 23 行将解析出的字段以 JSON 返回，攻击者可通过回显读取本地文件内容，构成可利用的 CWE-611。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 XML外部实体注入(XXE)/SSRF", "risk_level": "high", "source": "line 22: req.body 即 POST /cgmes/model 的原始XML请求体", "sink": "line 10: libxmljs.parseXml 开启 noent 与 dtdload 解析不可信XML", "explanation": "line 22 的用户可控XML -> line 10 解析时展开外部实体 -> 读取本地文件或发起SSRF -> line 23 回显泄露数据", "fix_suggestion": "line 10: 改为 libxmljs.parseXml(xmlText, { noent: false, dtdload: false, dtdvalid: false }) 禁用DTD与实体替换，或在中间件层拒绝包含 DOCTYPE/ENTITY 声明的输入"}
+```

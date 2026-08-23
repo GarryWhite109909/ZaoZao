@@ -854,6 +854,13 @@ class TaintTracker:
         """
         if ttype == "Command Injection" and label in ("subprocess.run(", "subprocess.Popen("):
             if args and args[0].lstrip().startswith("["):
+                # 列表参数默认不经 shell（安全），但 argv 含 shell/解释器或
+                # 执行语义参数（["sh","-c",x]、find -exec、git --upload-pack）
+                # 时载荷会被解释器执行，仍需上报——2026-08-22 修正，此前一律
+                # return True 吞掉此类真注入。口径与 shell_safety 唯一定义保持一致。
+                from graduation_project.shell_safety import list_argv_has_exec_semantics
+                if list_argv_has_exec_semantics(",".join(args)):
+                    return False
                 return True  # 列表参数：不经 shell，安全
             joined = " ".join(args)
             if not re.search(r"shell\s*=\s*True", joined):

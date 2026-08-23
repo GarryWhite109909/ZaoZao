@@ -1,0 +1,48 @@
+LANG: python
+```python
+# cache_frontend/views.py
+import pickle
+from django.http import JsonResponse, HttpResponseBadRequest
+from django.views.decorators.csrf import csrf_exempt
+from django.core.cache import cache
+from django.conf import settings
+
+
+@csrf_exempt
+def cache_entry(request, entry_identifier):
+    if request.method == 'POST':
+        if not entry_identifier.isalnum():
+            return HttpResponseBadRequest('invalid cache entry identifier')
+        data = request.body
+        tags = request.POST.getlist('tags')
+        lifetime = request.POST.get('lifetime')
+
+        # invoke registered signal hooks before storing (mirrors TYPO3 hook dispatch)
+        for hook_path in settings.CACHE_SET_HOOKS:
+            module_name, func_name = hook_path.rsplit('.', 1)
+            __import__(module_name)
+            getattr(__import__(module_name), func_name)(data)
+
+        # persistent backend: serialize with pickle for storage
+        payload = pickle.dumps({'data': data, 'tags': tags})
+        cache.set(entry_identifier, payload, timeout=lifetime or None)
+        return JsonResponse({'status': 'stored'})
+
+    elif request.method == 'GET':
+        raw = cache.get(entry_identifier)
+        if raw is None:
+            return JsonResponse({'found': False})
+        # sink: unpickle attacker-influenced bytes without integrity check
+        obj = pickle.loads(raw)
+        return JsonResponse({'found': True, 'data': obj['data']})
+```
+
+1. 第 22 行：`request.body` 作为外部输入入口（source），攻击者可通过 POST 直接写入任意字节，仅第 19 行对 `entry_identifier` 做了校验，对 body 内容无任何限制。
+2. 第 24 行：pickle 序列化后经 `cache.set` 持久化到共享缓存后端；若缓存后端可被其他租户/进程写入（如 Redis 未鉴权），攻击者可替换该条目。
+3. 第 33 行：GET 分支从缓存取出原始字节后直接执行 `pickle.loads(raw)`（sink），这是反序列化危险操作。
+4. 防御缺失分析：全程没有 HMAC 签名、没有 `RestrictedUnpickler` 类白名单、没有版本/完整性校验，与原 PHP 代码中 `unserialize($rawResult)` 无 `allowed_classes` 的结构完全等价——source 到 sink 之间不存在有效防御。
+5. 利用路径：攻击者写入恶意 pickle 载荷 → 缓存命中 → `pickle.loads` 触发 `__reduce__` 实现任意代码执行。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data", "risk_level": "critical", "source": "line 22: request.body 作为外部输入写入缓存", "sink": "line 33: pickle.loads 对缓存中的原始字节进行反序列化", "explanation": "攻击者可控制写入缓存的字节内容 -> 取出时未经完整性校验直接 pickle.loads -> 触发任意代码执行", "fix_suggestion": "line 33: 改用 RestrictedUnpickler 白名单类或改用 JSON 序列化，并对存储载荷附加 HMAC 签名校验"}
+```

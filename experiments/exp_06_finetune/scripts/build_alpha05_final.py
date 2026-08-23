@@ -13,13 +13,16 @@
   3. 统一 system prompt 为 ALPHA05_PROMPT；
   4. 组装写出并打印统计。
 """
-import json, re, sys, hashlib
+import json, re, sys, hashlib, os
 from collections import Counter
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-ROOT = Path(r"D:\code\毕业设计\Graduation-Project")
+# 仓库根 = 本脚本（experiments/exp_06_finetune/scripts/）向上三级；
+# 可用环境变量 GRAD_ROOT 覆盖（脚本被拷到别处运行时）。原先硬编码
+# D:\code\... Windows 绝对路径，Linux 上无法运行
+ROOT = Path(os.environ.get("GRAD_ROOT") or Path(__file__).resolve().parents[3])
 sys.path.insert(0, str(ROOT))
 from graduation_project.prompts import ALPHA05_PROMPT
 

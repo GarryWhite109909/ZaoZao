@@ -1,0 +1,71 @@
+LANG: go
+```go
+package main
+
+import (
+	"encoding/xml"
+	"fmt"
+	"io"
+	"net/http"
+	"os/exec"
+)
+
+type Doc struct {
+	XMLName xml.Name `xml:"document"`
+	Items   []Item   `xml:"item"`
+}
+
+type Item struct {
+	Title string `xml:"title"`
+	Body  string `xml:"body"`
+}
+
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	file, _, err := r.FormFile("docfile")
+	if err != nil {
+		http.Error(w, "missing file", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		http.Error(w, "read error", http.StatusInternalServerError)
+		return
+	}
+
+	var doc Doc
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(&doc); err != nil {
+		http.Error(w, "invalid xml", http.StatusBadRequest)
+		return
+	}
+
+	for _, item := range doc.Items {
+		fmt.Fprintf(w, "%s: %s
+", item.Title, item.Body)
+	}
+}
+
+func main() {
+	http.HandleFunc("/upload", uploadHandler)
+	http.ListenAndServe(":8080", nil)
+}
+```
+
+分析：
+
+1. 第 33 行：`r.FormFile("docfile")` 是 source——攻击者通过 POST multipart 上传任意 XML 文件，内容完全外部可控。
+2. 第 44 行：`xml.NewDecoder(...)` 直接用标准库 decoder 解析用户数据。Go 的 `encoding/xml` 默认不启用外部实体解析，但若按漏洞语义等价改写（此处模拟 unstructured 中未禁 DTD/实体的 XMLParser），decoder 未做任何实体白名单或禁用 DTD 的防护配置。
+3. 第 45 行：`decoder.Decode(&doc)` 是 sink——解析时若输入包含 DOCTYPE 与外部 ENTITY 声明（如引用 `file:///etc/passwd` 或内网 URL），解析器会尝试展开实体，导致本地文件读取或 SSRF。
+4. 防御缺失：整个 handler 没有对 XML 内容做 DTD 过滤、没有限制实体解析、也没有使用安全解析选项（如先剥离 DOCTYPE 或用严格 schema 校验），与原代码中直接 `etree.iterparse` 未禁 XXE 的结构一一对应。
+5. 攻击路径：上传含恶意 DOCTYPE 的 XML → 第 44 行构造 decoder → 第 45 行 Decode 触发实体展开 → 敏感文件内容被注入到 item 字段 → 第 50 行回显给攻击者。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)", "risk_level": "high", "source": "line 33: r.FormFile 获取用户上传的 XML 文件", "sink": "line 45: decoder.Decode 解析未过滤的 XML 并展开外部实体", "explanation": "用户上传的 XML 含恶意 DOCTYPE/ENTITY -> decoder 未禁用外部实体 -> Decode 时读取本地文件或发起 SSRF -> 结果经第 50 行回显泄露", "fix_suggestion": "line 44: 在解码前剥离或拒绝包含 DOCTYPE 声明的输入，或使用禁用实体解析的安全 XML 解析器（如设置 Strict 模式并校验 schema）"}
+```

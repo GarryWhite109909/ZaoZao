@@ -1,0 +1,40 @@
+LANG: node.js/javascript
+```code
+const express = require('express');
+const serialize = require('node-serialize');
+const app = express();
+
+app.use(express.json());
+
+// 模拟 CopyOnWriteList 的反序列化 Converter：直接信任请求体中的序列化配置
+app.post('/config/import', (req, res) => {
+  const rawConfig = req.body.config;          // source：攻击者完全可控
+  if (!rawConfig) {
+    return res.status(400).json({ error: 'missing config' });
+  }
+  try {
+    // sink：无类型白名单，任意对象图（含 IIFE）都会被还原执行
+    const restored = serialize.unserialize(rawConfig);
+    req.app.locals.pluginState = restored;
+    res.json({ ok: true, count: Array.isArray(restored.items) ? restored.items.length : 0 });
+  } catch (e) {
+    res.status(500).json({ error: 'unmarshal failed' });
+  }
+});
+
+app.get('/config', (req, res) => {
+  res.json(req.app.locals.pluginState || {});
+});
+
+app.listen(8080);
+```
+
+1. 第 9 行是 source：`req.body.config` 来自 POST `/config/import` 的请求体，攻击者可发送任意序列化字符串，等价于原漏洞中攻击者控制的 `config.xml`。
+2. 第 16 行是 sink：`serialize.unserialize(rawConfig)` 直接还原任意对象类型；node-serialize 在遇到 `_$$ND_FUNC$$_` 标记的函数时会立即调用该函数，等价于 XStream `readItem` 无限制实例化任意类。
+3. 防御缺失分析：第 10~13 行只做了非空检查，第 15 行的 try/catch 只捕获异常而非阻止危险类型，全程没有类型白名单或 schema 校验，等价于原代码中 ConverterImpl 对 `readItem` 返回类型的放任。
+4. 攻击路径：source（第 9 行）→ unserialize（第 16 行）→ 恶意 payload 中内嵌的立即执行函数在反序列化瞬间运行 → 结果写入 `req.app.locals.pluginState`（第 17 行）持久化到应用全局状态，实现 RCE 与状态污染。
+5. 修复建议：第 16 行应改为仅接受纯 JSON 并做严格 schema 校验（如 `JSON.parse` + zod 白名单字段），禁止任何支持函数/自定义类还原的反序列化库处理不可信输入。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 反序列化不可信数据（Deserialization of Untrusted Data）", "risk_level": "critical", "source": "line 9: req.body.config 攻击者可控的序列化配置字符串", "sink": "line 16: serialize.unserialize(rawConfig) 无类型白名单地还原任意对象并执行内嵌函数", "explanation": "攻击者通过 POST /config/import 提交恶意序列化串 -> unserialize 还原时立即执行内嵌函数实现 RCE -> 结果写入 app.locals 造成持久化污染", "fix_suggestion": "line 16: 改用 JSON.parse 加 schema 白名单校验，禁止对不可信输入使用支持函数还原的反序列化库"}
+```

@@ -1,0 +1,56 @@
+LANG: node.js/javascript
+```javascript
+const express = require('express');
+const path = require('path');
+const fs = require('fs');
+
+const app = express();
+
+// 模拟 ingress rewrite-target：把 /files/<capture> 重写到静态目录
+// 管理员配置的重写模板，例如 '/var/www/static/$1'
+const REWRITE_TARGET = process.env.REWRITE_TARGET || '/var/www/static/$1';
+const REWRITE_REGEX = new RegExp('^/files/(.*)$', 'i');
+
+app.get(/^\/files\/(.*)$/, (req, res) => {
+  const currentPath = decodeURIComponent(req.path);
+
+  if (!REWRITE_REGEX.test(currentPath)) {
+    return res.status(404).send('not found');
+  }
+
+  // 用捕获组替换模板中的 $1 —— 与 ingress-nginx rewrite-target 行为一致
+  let newTarget = REWRITE_TARGET.replace('$1', currentPath.replace(REWRITE_REGEX, '$1'));
+
+  if (newTarget === '') {
+    return res.status(500).send('internal error');
+  }
+
+  // 若重写目标是绝对 URL 则 302 跳转（保留原查询串）
+  if (/^https?:\/\//.test(newTarget)) {
+    const parsed = new URL(newTarget);
+    if (!parsed.search && req.url.includes('?')) {
+      parsed.search = req.url.split('?')[1];
+    }
+    return res.redirect(302, parsed.toString());
+  }
+
+  // 直接把重写结果当作文件路径读取并返回
+  const filePath = path.normalize(newTarget);
+  fs.readFile(filePath, (err, data) => {
+    if (err) return res.status(500).send('internal error');
+    res.type(path.extname(filePath) || 'text/plain').send(data);
+  });
+});
+
+app.listen(8080);
+```
+
+分析：
+1. 第 8-9 行定义了管理员配置的正则与重写模板 `REWRITE_TARGET`（如 `/var/www/static/$1`），模拟 Traefik/ingress-nginx 的 rewrite-target 注解语义。
+2. 第 12 行是 source：`req.path` 来自用户请求 URL，经 `decodeURIComponent` 解码后进入处理流程——外部输入入口。
+3. 第 17 行用 `$1` 把用户控制的捕获组内容拼进目标路径，等价于原代码的 `ReplaceAllString(currentPath, rt.replacement)`；正则 `(.*)` 无任何字符白名单过滤。
+4. 第 33 行是 sink：`path.normalize` 只做规范化并不限制在基目录内，用户传入 `/files/..%2F..%2Fetc%2Fpasswd` 解码后为 `/files/../../etc/passwd`，替换后得到 `/var/www/static/../../etc/passwd`，`normalize` 后逃逸出 `/var/www/static`，随后第 34 行 `fs.readFile` 读取任意文件。整个链路没有任何基于根目录的前缀校验或 `path.resolve` 后的 containment 检查，防御完全缺失，与原代码 CWE-22 语义结构一致。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal via rewrite-target capture group", "risk_level": "high", "source": "line 12: 用户请求路径 req.path 经 decodeURIComponent 进入重写逻辑", "sink": "line 34: fs.readFile(filePath) 以拼接后的路径读取任意文件", "explanation": "用户可控的捕获组内容通过 $1 替换注入到文件路径 -> path.normalize 不做目录约束 -> ../ 序列逃逸静态根目录 -> 任意文件读取", "fix_suggestion": "line 33: 用 path.resolve 得到绝对路径后校验其必须以配置的静态根目录前缀开头，否则返回 403"}
+```

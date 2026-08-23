@@ -1,0 +1,71 @@
+# alpha06 训练集构建报告
+
+- 输入：旧 7972 | 蒸馏 574 | triage 24
+- 清洗剔除：无语言 160 | 弱防御安全理由 132
+- 泄漏门剔除（≥0.3）：30
+- **最终：8316 条** → `final_train_chatml_alpha06.jsonl`
+- 断言错误：55（全部阻断不入集）
+
+## 泄漏明细
+- #254 vs 87seg/typical_03_cmd.py J=0.125 C=0.5
+- #387 vs cve20/cve_fix_0012.py J=0.171 C=0.5
+- #465 vs 87seg/safe_03_subprocess_list.py J=0.143 C=0.5
+- #523 vs 87seg/hard_bypass_02_cmd_strip.py J=0.118 C=0.5
+- #571 vs 87seg/typical_03_cmd.py J=0.138 C=0.5
+- #597 vs 87seg/typical_03_cmd.py J=0.143 C=0.5
+- #624 vs 87seg/typical_03_cmd.py J=0.108 C=0.5
+- #2465 vs cve20/cve_fix_0021.java J=0.294 C=0.526
+- #2468 vs 87seg/typical_12_open_redirect.py J=0.167 C=0.5
+- #5911 vs 87seg/typical_09_xss_php.php J=0.111 C=0.5
+- #6095 vs 87seg/hard_bypass_02_cmd_strip.py J=0.2 C=0.5
+- #6097 vs 87seg/hard_bypass_02_cmd_strip.py J=0.174 C=0.5
+- #6108 vs 87seg/typical_11_yaml.py J=0.267 C=0.5
+- #6240 vs 87seg/hard_cve_05_spring4shell.java J=0.214 C=0.5
+- #6351 vs 87seg/safe_14_xxe_defused.py J=0.261 C=0.5
+- #6666 vs 87seg/typical_12_open_redirect.py J=0.158 C=0.5
+- #6668 vs 87seg/typical_12_open_redirect.py J=0.15 C=0.5
+- #7334 vs 87seg/hard_crossfile_02_input.py J=0.273 C=0.6
+- #7356 vs 87seg/typical_09_xss_php.php J=0.071 C=0.5
+- #7357 vs 87seg/typical_09_xss_php.php J=0.067 C=0.5
+- #7478 vs 87seg/hard_owasp_01_file_upload.py J=0.3 C=0.462
+- #7502 vs 87seg/hard_bypass_01_sql_replace.py J=0.312 C=0.5
+- #7506 vs 87seg/typical_07_ssrf.py J=0.286 C=0.5
+- #7518 vs 87seg/noise_03_harden_string_concat.py J=0.286 C=0.571
+- #7528 vs 87seg/typical_03_cmd.py J=0.25 C=0.5
+- #7544 vs 87seg/typical_15_missing_authz.py J=0.263 C=0.625
+- #7568 vs 87seg/typical_07_ssrf.py J=0.211 C=0.5
+- #7599 vs 87seg/typical_05_pickle.py J=0.294 C=0.625
+- #7600 vs 87seg/typical_07_ssrf.py J=0.222 C=0.5
+- #7605 vs 87seg/typical_36_java_spel.java J=0.375 C=0.545
+
+## 断言错误样例
+- #63[old] 行号越界 [80]
+- #267[old] 行号越界 [42]
+- #305[old] 行号越界 [64]
+- #351[old] 行号越界 [80]
+- #438[old] 行号越界 [43]
+- #550[old] 行号越界 [44]
+- #712[old] 行号越界 [64]
+- #928[old] 行号越界 [78]
+- #1068[old] 行号越界 [85]
+- #1347[old] 行号越界 [26, 25]
+- #1349[old] 行号越界 [22]
+- #1451[old] 行号越界 [17]
+- #1458[old] 行号越界 [18]
+- #1527[old] 行号越界 [44]
+- #1557[old] 行号越界 [55]
+- #1939[old] 行号越界 [280, 283, 282]
+- #1943[old] 行号越界 [17]
+- #1966[old] 行号越界 [280, 281]
+- #1986[old] 行号越界 [6]
+- #2028[old] 行号越界 [16, 15]
+- #2089[old] 行号越界 [6]
+- #2090[old] 行号越界 [7]
+- #2132[old] 行号越界 [13]
+- #2140[old] 行号越界 [7]
+- #2144[old] 行号越界 [6]
+- #2153[old] 行号越界 [11]
+- #2280[old] 行号越界 [14]
+- #2330[old] 行号越界 [17]
+- #2436[old] 行号越界 [15]
+- #2445[old] 行号越界 [15]

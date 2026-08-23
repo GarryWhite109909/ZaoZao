@@ -415,10 +415,13 @@ def main() -> None:
         exp_cwe = rec.get("expected_cwe", "")
 
         t0 = time.time()
+        err = None
         try:
             r = scanner.scan_code(code=code, language=lang, filename=fname)
-        except Exception as e:
-            print(f"[异常] {fname}: {e}")
+        except Exception as exc:
+            # except 块结束后 e 被隐式删除，必须先存下错误信息供 record 使用
+            err = f"{type(exc).__name__}: {exc}"
+            print(f"[异常] {fname}: {err}")
             r = None
         dur = time.time() - t0
 
@@ -426,7 +429,7 @@ def main() -> None:
             record = {
                 "file": fname, "language": lang,
                 "expected_present": exp, "expected_cwe": exp_cwe,
-                "predicted": None, "decision": "exception", "error": str(e),
+                "predicted": None, "decision": "exception", "error": err,
                 "duration": round(dur, 2), "stage1_new": 0, "tools_hit": [],
                 "adjudications": [], "reviewer_findings": [],
             }
@@ -509,11 +512,12 @@ def main() -> None:
     # 7a) 去重（resume 叠加可能产生重复样本，保留每文件最新一条）
     seen_final: set[str] = set()
     dedup_results = []
-    for s in results:
+    for s in reversed(results):
         if s["file"] in seen_final:
             continue
         seen_final.add(s["file"])
         dedup_results.append(s)
+    dedup_results.reverse()
     if len(dedup_results) != len(results):
         print(f"[resume] 去重：{len(results)} → {len(dedup_results)} 条")
         results = dedup_results

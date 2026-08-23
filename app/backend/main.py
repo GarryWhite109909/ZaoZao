@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -84,6 +85,8 @@ from graduation_project.paths import (
 # ---------------------------------------------------------------------------
 # 全局 Scanner 实例（单例，避免重复初始化 Chroma/OllamaClient）
 # ---------------------------------------------------------------------------
+logger = logging.getLogger("uvicorn.error")  # 复用 uvicorn 的 handler，输出与访问日志同通道
+
 scanner = Scanner(
     model=os.environ.get("VULN_SCANNER_MODEL", DEFAULT_MODEL),
     use_rag=os.environ.get("VULN_SCANNER_RAG", "0") == "1",
@@ -206,8 +209,11 @@ EXT_TO_LANG = {
     ".py": "python", ".js": "javascript", ".ts": "typescript",
     ".jsx": "javascript", ".tsx": "typescript",
     ".java": "java", ".php": "php", ".go": "go",
+    ".c": "c", ".cpp": "cpp", ".cs": "csharp", ".rb": "ruby",
     ".html": "html", ".htm": "html",
-    ".vue": "javascript", ".svelte": "javascript",
+    # vue/svelte 是模板组件（HTML + 内嵌脚本），整体并非合法 JS，
+    # 按 javascript 解析会失败；按 html 处理交给工具/LLM 更接近真实
+    ".vue": "html", ".svelte": "html",
 }
 
 # ---------------------------------------------------------------------------
@@ -824,6 +830,9 @@ async def _await_scan(future):
     try:
         return await future, None
     except Exception as e:
+        # 503 只告诉客户端"暂时不可用"，真实故障（内部 bug / 模型崩溃）必须留栈，
+        # 否则主线扫描完全不可观测
+        logger.exception("扫描任务失败: %s", e)
         return None, JSONResponse({"error": str(e)}, status_code=503)
 
 
@@ -1483,16 +1492,22 @@ async def models_pull(req: ModelActionRequest):
         import threading
 
         chunk_queue: _q.Queue = _q.Queue()
-        done_flag = {"done": False, "result": None}
+        done_flag = {"done": False, "result": None, "error": None}
 
         def callback(chunk):
             chunk_queue.put(chunk)
 
         def run_pull():
-            result = scanner.client.pull_model(model, stream_callback=callback)
-            done_flag["result"] = result
-            done_flag["done"] = True
-            chunk_queue.put(None)  # 哨兵，唤醒流式迭代
+            # 与 download-hf/download-gguf 同纪律：异常也必须置位 done 并投递
+            # 哨兵，否则消费循环每秒超时后无限 continue，前端进度条永久卡住
+            try:
+                done_flag["result"] = scanner.client.pull_model(model, stream_callback=callback)
+            except Exception as e:
+                done_flag["error"] = f"拉取失败 ({type(e).__name__}): {e}"
+                print(f"[models/pull] {model} 异常: {done_flag['error']}", flush=True)
+            finally:
+                done_flag["done"] = True
+                chunk_queue.put(None)  # 哨兵，唤醒流式迭代
 
         thread = threading.Thread(target=run_pull, daemon=True)
         thread.start()
@@ -1512,6 +1527,9 @@ async def models_pull(req: ModelActionRequest):
             if chunk.get("error"):
                 break
 
+        if done_flag["error"]:
+            yield json.dumps({"status": "error", "error": done_flag["error"]}, ensure_ascii=False) + "\n"
+            return
         result = done_flag["result"] or {}
         if result.get("success"):
             yield json.dumps({
@@ -1938,7 +1956,9 @@ async def models_download_hf(req: HfDownloadRequest):
             chunk_queue.put({"status": "downloading", "total_files": total_files, "completed": 0, "pct": 0})
 
             # 逐文件下载，每完成一个文件报告进度（显式 endpoint 指向镜像；
-            # huggingface_hub 1.x 的 hf_hub_download 不接受 timeout 参数，元数据用 etag_timeout 兜底）
+            # huggingface_hub 1.x 的 hf_hub_download 不接受 timeout 参数，元数据用 etag_timeout 兜底。
+            # 注意：local_dir_use_symlinks / resume_download 在 1.x 已移除，传入会直接
+            # TypeError——1.x 的 local_dir 默认直存文件、断点续传默认开启，无需等价参数）
             completed_files = 0
             for fname in files:
                 try:
@@ -1946,8 +1966,6 @@ async def models_download_hf(req: HfDownloadRequest):
                         repo_id=model_id,
                         filename=fname,
                         local_dir=str(cache_dir),
-                        local_dir_use_symlinks=False,
-                        resume_download=True,
                         endpoint=HF_MIRROR,
                         etag_timeout=HF_NETWORK_TIMEOUT,
                     )
@@ -2004,8 +2022,10 @@ async def models_download_hf(req: HfDownloadRequest):
                 if type(client).__name__ == "TransformersClient":
                     if Path(r["dest"]).name == (client.model_id or "").split("/")[-1]:
                         if (Path(r["dest"]) / "config.json").is_file():
-                            client.model_id = str(Path(r["dest"]))
-                            client.model = client.model_id
+                            # 与 switch_model 同锁：避免在途扫描 chunk 中途被换基座
+                            with scanner._model_lock:
+                                client.model_id = str(Path(r["dest"]))
+                                client.model = client.model_id
                             _trigger_transformers_warmup()
                             auto_loaded = True
             except Exception:
@@ -2173,8 +2193,10 @@ async def models_download_gguf(req: GgufDownloadRequest):
             try:
                 client = scanner.client
                 if type(client).__name__ == "LlamaCppClient":
-                    client.base_gguf = r["dest"]
-                    client.model = r["dest"]
+                    # 与 switch_model 同锁：避免在途扫描 chunk 中途被换基座
+                    with scanner._model_lock:
+                        client.base_gguf = r["dest"]
+                        client.model = r["dest"]
                     auto_bound = True
             except Exception:
                 auto_bound = False
