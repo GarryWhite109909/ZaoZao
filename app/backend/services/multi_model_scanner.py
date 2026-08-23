@@ -234,7 +234,9 @@ class MultiModelScanner:
 
         # 判定最终 has_vulnerability 与共识类型
         # 平票时倾向 True（保守判定为漏洞：安全审计场景宁误报不漏报）。
-        # 与 experiments/utils.py 的 majority_vote 语义一致（>= 触发平票→True）。
+        # 与 experiments/utils.py 的 majority_vote 在"平票→True"上一致；差异：
+        # 产品路径不设有效票过半的法定人数（有效票即表决），utils.py 为论文
+        # 聚合口径要求有效票 > 总票数一半，两次 parse_fail 时不承认唯一票多数。
         majority_side: list[tuple[str, SingleResult]] = []
         if total_valid == 0:
             # 所有模型都失败

@@ -366,11 +366,18 @@ def wilson_score_interval(successes: int, total: int, z: float = 1.96) -> Option
 def majority_vote(verdicts: list) -> Optional[bool]:
     """对多次判定的二值结果做多数表决。
 
-    None 值（解析失败）会被排除。平票时倾向 True（保守判定为漏洞）。
+    None 值（解析失败）不参与投票，但计入法定人数：有效票必须超过总票数的
+    一半，表决才成立，否则返回 None（弃权/需复核）——防止 [True, None, None]
+    这类两次解析失败、仅剩唯一有效票的结果被当成"多数表决"结论。
+    平票时倾向 True（保守判定为漏洞）。
     """
+    if not verdicts:
+        return None
     valid = [v for v in verdicts if v is not None]
     if not valid:
         return None
+    if len(valid) <= len(verdicts) / 2:
+        return None  # 有效票未过半，表决不成立
     true_count = sum(1 for v in valid if v)
     return true_count >= len(valid) / 2
 

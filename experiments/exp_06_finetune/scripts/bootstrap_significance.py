@@ -62,15 +62,24 @@ def load_samples(path: Path) -> list[list[dict]]:
 
 
 def compute_metrics(samples: list[dict]) -> dict:
-    """从样本列表计算 recall/accuracy/fpr。
+    """从样本列表计算 recall/accuracy/fpr（宽松 + 严格两套口径）。
 
-    parse_fail 不计入分母（按惯例视为模型失效，单列统计）。
+    宽松口径：parse_fail 不计入分母（单列统计），与历史结果兼容。
+    严格口径（*_with_parse_fail）：parse_fail 按真值分流计入分母——
+    漏洞样本解析失败计漏报、安全样本解析失败计错误，与 experiments/utils.py
+    compute_detection_metrics 的严格口径定义一致（论文主结论优先引用严格口径）。
+    若基线与微调的 parse_fail 率不同，只看宽松口径的显著性结论可能翻转。
     """
     tp = sum(1 for s in samples if s["outcome"] == "TP")
     fp = sum(1 for s in samples if s["outcome"] == "FP")
     fn = sum(1 for s in samples if s["outcome"] == "FN")
     tn = sum(1 for s in samples if s["outcome"] == "TN")
-    pf = sum(1 for s in samples if s["outcome"] == "parse_fail")
+    # parse_fail 按真值分流（evaluate.py 样本带 expected_present 字段）
+    pf_vuln = sum(1 for s in samples
+                  if s["outcome"] == "parse_fail" and s.get("expected_present") is True)
+    pf_safe = sum(1 for s in samples
+                  if s["outcome"] == "parse_fail" and s.get("expected_present") is not True)
+    pf = pf_vuln + pf_safe
 
     pos = tp + fn  # 真实正例
     neg = fp + tn  # 真实负例
@@ -79,9 +88,17 @@ def compute_metrics(samples: list[dict]) -> dict:
     recall = tp / pos if pos > 0 else None
     accuracy = (tp + tn) / total if total > 0 else None
     fpr = fp / neg if neg > 0 else None
+    # 严格口径：分母含 parse_fail（漏洞侧计漏报，全部样本计错误）
+    pos_strict = pos + pf_vuln
+    total_strict = total + pf
+    recall_strict = tp / pos_strict if pos_strict > 0 else None
+    accuracy_strict = (tp + tn) / total_strict if total_strict > 0 else None
     return {
         "tp": tp, "fp": fp, "fn": fn, "tn": tn, "parse_fail": pf,
+        "parse_fail_vuln": pf_vuln, "parse_fail_safe": pf_safe,
         "recall": recall, "accuracy": accuracy, "fpr": fpr,
+        "recall_with_parse_fail": recall_strict,
+        "accuracy_with_parse_fail": accuracy_strict,
     }
 
 
@@ -134,7 +151,12 @@ def bootstrap_paired(
             )
 
     rng = random.Random(seed)
-    metrics_list = ["recall", "accuracy", "fpr"]
+    # 严格口径（*_with_parse_fail）与宽松口径同时 bootstrap：
+    # parse_fail 率不同的两组在两种口径下的显著性结论可能不同
+    metrics_list = [
+        "recall", "accuracy", "fpr",
+        "recall_with_parse_fail", "accuracy_with_parse_fail",
+    ]
     diff_dist = {m: [] for m in metrics_list}
 
     base_flat = [s for blk in baseline_samples for s in blk]
@@ -152,9 +174,9 @@ def bootstrap_paired(
         for m in metrics_list:
             if b_metrics[m] is None or f_metrics[m] is None:
                 continue
-            # recall/accuracy: 微调 - 基线（>0 表示微调更好）
-            # fpr: 基线 - 微调（>0 表示微调更好，因为 fpr 下降）
-            if m == "fpr":
+            # recall/accuracy（含严格口径）：微调 - 基线（>0 表示微调更好）
+            # fpr：基线 - 微调（>0 表示微调更好，因为 fpr 下降）
+            if "fpr" in m:
                 diff_dist[m].append(b_metrics[m] - f_metrics[m])
             else:
                 diff_dist[m].append(f_metrics[m] - b_metrics[m])
@@ -182,10 +204,10 @@ def bootstrap_paired(
         p_one_side = min(n_le_zero, n_ge_zero) / n_diff
         p_value = min(1.0, 2 * p_one_side)
 
-        # 微调更好的方向：recall/accuracy 差>0 好，fpr 差>0 好（已转换）
+        # 微调更好的方向：recall/accuracy（含严格口径）差>0 好，fpr 差>0 好（已转换）
         base_val = base_m[m]
         fine_val = fine_m[m]
-        if m == "fpr":
+        if "fpr" in m:
             diff_point = base_val - fine_val if base_val is not None and fine_val is not None else None
             better = (diff_point is not None and diff_point > 0)
         else:
@@ -246,13 +268,21 @@ def main():
     print("\n" + "=" * 72)
     print("Bootstrap 显著性检验结果（配对，双尾）")
     print("=" * 72)
-    print(f"{'指标':<12} {'基线':>8} {'微调':>8} {'差值':>8} "
+    print(f"{'指标':<14} {'基线':>8} {'微调':>8} {'差值':>8} "
           f"{'95% CI':>22} {'p值':>8} {'显著?':>8}")
     print("-" * 72)
-    for m in ["recall", "accuracy", "fpr"]:
-        s = summary[m]
+    # 严格口径在前（论文主结论优先引用严格口径，见 experiments/utils.py 约定）
+    display = [
+        ("recall_with_parse_fail", "recall(严格)"),
+        ("accuracy_with_parse_fail", "acc(严格)"),
+        ("recall", "recall(宽松)"),
+        ("accuracy", "acc(宽松)"),
+        ("fpr", "fpr(宽松)"),
+    ]
+    for key, label in display:
+        s = summary[key]
         if s is None:
-            print(f"{m:<12}  (无数据)")
+            print(f"{label:<14}  (无数据)")
             continue
         ci_str = f"[{s['ci_low']:+.4f}, {s['ci_high']:+.4f}]"
         sig_str = "✓" if s["significant"] else "✗"
@@ -262,7 +292,7 @@ def main():
             dir_mark = " ▲"
         elif s["direction"] == "finetuned_worse":
             dir_mark = " ▼"
-        print(f"{m:<12} {s['baseline_mean']:>8.4f} {s['finetuned_mean']:>8.4f} "
+        print(f"{label:<14} {s['baseline_mean']:>8.4f} {s['finetuned_mean']:>8.4f} "
               f"{s['diff_mean']:>+8.4f} {ci_str:>22} {s['p_value']:>8.4f} "
               f"{sig_str:>8}{dir_mark}")
 
@@ -270,13 +300,15 @@ def main():
     print("  - 差值 = 微调 - 基线（recall/accuracy 越大越好，fpr 越小越好）")
     print("  - 95% CI 不含 0 ⇒ p < 0.05 ⇒ 显著")
     print("  - ▲ 微调更好，▼ 微调更差")
+    print("  - 严格口径把 parse_fail 计入分母（漏洞侧计漏报、安全侧计错误），")
+    print("    论文主结论优先引用严格口径；parse_fail 率不同时两口径结论可能不同")
 
-    # 整体结论
-    recall_sig = summary.get("recall", {}).get("significant", False) if summary.get("recall") else False
-    acc_sig = summary.get("accuracy", {}).get("significant", False) if summary.get("accuracy") else False
+    # 整体结论（以严格口径为准，宽松口径并列展示）
+    recall_sig = summary.get("recall_with_parse_fail", {}).get("significant", False) if summary.get("recall_with_parse_fail") else False
+    acc_sig = summary.get("accuracy_with_parse_fail", {}).get("significant", False) if summary.get("accuracy_with_parse_fail") else False
     fpr_sig = summary.get("fpr", {}).get("significant", False) if summary.get("fpr") else False
     n_sig = sum([recall_sig, acc_sig, fpr_sig])
-    print(f"\n整体：{n_sig}/3 项指标显著（p<0.05）")
+    print(f"\n整体（严格口径）：{n_sig}/3 项指标显著（p<0.05）")
 
     if args.output:
         out_path = Path(args.output)

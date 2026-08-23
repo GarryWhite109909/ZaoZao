@@ -1,0 +1,88 @@
+LANG: php
+```code
+# === file: src/Controller/TemplateImportController.php ===
+<?php
+namespace App\Controller;
+
+use App\Service\TemplateLoaderService;
+use Symfony\Component\HttpFoundation\Request;
+
+class TemplateImportController {
+	private TemplateLoaderService $loader;
+
+	public function __construct(TemplateLoaderService $loader) {
+		$this->loader = $loader;
+	}
+
+	// 用户通过 GET 参数指定模板流地址，直接透传给服务层
+	public function importAction(Request $request): string {
+		$streamName = $request->query->get('tpl');
+		return $this->loader->loadTemplate($streamName);
+	}
+}
+# === file: src/Service/TemplateLoaderService.php ===
+<?php
+namespace App\Service;
+
+use Smarty\Template\Source;
+use Smarty\Resource\StreamPlugin;
+
+class TemplateLoaderService {
+	/**
+	 * 中间层：仅做字符串拼接与简单前缀检查，
+	 * 未阻止 file:// / php:// 等危险协议，属于不完整净化
+	 */
+	public function loadTemplate(?string $name): string {
+		if (strpos($name, '://') === false) {
+			$name = 'custom:' . $name; // 伪净化：只补协议，未校验协议类型
+		}
+		$source = new Source();
+		$source->setResourceName($name);
+		$plugin = new StreamPlugin();
+		return (string)$plugin->getContent($source);
+	}
+}
+# === file: src/Smarty/Resource/StreamPlugin.php ===
+<?php
+namespace Smarty\Resource;
+
+use Smarty\Template\Source;
+
+class StreamPlugin extends RecompiledPlugin {
+	public function getContent(Source $source) {
+		if (strpos($source->getResourceName(), '://') !== false) {
+			$filepath = $source->getResourceName();
+		} else {
+			$filepath = str_replace(':', '://', $source->getFullResourceName());
+		}
+		$t = '';
+		$fp = fopen($filepath, 'r+'); // sink: 路径来自用户输入，可读任意文件
+		if ($fp) {
+			while (!feof($fp) && ($current_line = fgets($fp)) !== false) {
+				$t .= $current_line;
+			}
+			fclose($fp);
+			return $t;
+		}
+		return false;
+	}
+}
+```
+
+分析步骤：
+1. `src/Controller/TemplateImportController.php:16`（source）：`$request->query->get('tpl')` 直接取用户可控的 GET 参数，无任何过滤即传入 `loadTemplate()`。
+2. `src/Service/TemplateLoaderService.php:14-17`（中间层）：仅当缺少 `://` 时拼接 `custom:` 前缀；攻击者传入 `file:///etc/passwd` 或 `php://filter/...` 时原样放行，净化不完整。
+3. `src/Smarty/Resource/StreamPlugin.php:11-15`：资源名被赋给 `$filepath`，中间层未做协议白名单或路径规范化。
+4. `src/Smarty/Resource/StreamPlugin.php:18`（sink）：`fopen($filepath, 'r+')` 打开任意流/文件并逐行读取返回，构成跨文件的 CWE-22 路径遍历/任意文件读取链。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22: Path Traversal via user-controlled stream resource name",
+  "source": "L1:line 16: $request->query->get('tpl') 用户可控模板流名称",
+  "sink": "L3:line 18: fopen($filepath, 'r+') 以未校验路径打开任意流",
+  "taint_flow": "L1:16 -> L2:15 loadTemplate() 不完整净化 -> L3:12 getResourceName() -> L3:18 fopen",
+  "sanitizer": "L2:line 14-17 仅补 custom: 前缀，未限制 file:// 或 php:// 协议，防御不完整",
+  "exploit_scenario": "请求 /import?tpl=file:///etc/passwd 时，参数经服务层原样传递至 StreamPlugin::getContent，fopen 直接读取系统敏感文件并回显"
+}
+```

@@ -1,0 +1,65 @@
+LANG: php
+```php
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+
+class PostRenderController extends Controller
+{
+    /**
+     * Force-rerender a post: fill in missing image dimensions
+     * by fetching image metadata from the URL stored on the card.
+     */
+    public function rerender(Request $request, int $postId)
+    {
+        $post = Post::findOrFail($postId);
+        $mobiledoc = json_decode($post->mobiledoc, true);
+
+        foreach ($mobiledoc['cards'] as &$card) {
+            [$cardName, $payload] = $card;
+
+            if ($cardName !== 'image' || empty($payload['src'])) {
+                continue;
+            }
+            if (!empty($payload['width']) && !empty($payload['height'])) {
+                continue;
+            }
+
+            try {
+                // SSRF: fetches whatever URL is stored on the card
+                $response = Http::timeout(10)->get($payload['src']);
+                $size = getimagesizefromstring($response->body());
+
+                if ($size !== false) {
+                    $payload['width'] = $size[0];
+                    $payload['height'] = $size[1];
+                }
+            } catch (\Throwable $e) {
+                Log::error($e->getMessage());
+            }
+
+            $card[1] = $payload;
+        }
+
+        $post->mobiledoc = json_encode($mobiledoc);
+        $post->save();
+
+        return response()->json(['ok' => true]);
+    }
+}
+```
+
+分析：
+1. 第 16 行：`$post->mobiledoc` 是持久化的文章内容，其中 image 卡片的 `src` 字段可由作者/编辑通过编辑器自由写入，属于攻击者可控的外部输入（source）。
+2. 第 22-27 行：仅检查卡片名是否为 `image`、`src` 是否非空以及宽高是否缺失，没有任何对 URL 的 scheme/host 校验。
+3. 第 31 行：`Http::get($payload['src'])` 直接对用户提供的 URL 发起服务端出站 HTTP 请求（sink），未限制目标为可信图片域名，也未禁止内网地址。
+4. 第 32 行：响应体被进一步解析（`getimagesizefromstring`），放大了 SSRF 影响——攻击者可用内网服务返回的数据探测内部网络。
+5. 整个流程中不存在 allowlist、IP 黑名单或重定向校验等防御，与原 Ghost 漏洞语义结构一致：source（卡片 src）→ sink（服务端发起的任意 HTTP GET）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF)", "risk_level": "high", "source": "line 16: post mobiledoc 中攻击者可控的 image 卡片 payload.src", "sink": "line 31: Http::timeout(10)->get($payload['src']) 对任意 URL 发起服务端请求", "explanation": "攻击者将 image 卡片的 src 设为内网地址 -> 重渲染时服务器无条件向该地址发起 HTTP GET 并读取响应体 -> 可探测内网、访问云元数据端点，且无任何 URL 白名单或 IP 校验", "fix_suggestion": "line 31: 在请求前校验 src 必须匹配受信任的图片域名白名单，解析 DNS 后拒绝私网/环回/链路本地 IP，并禁用跨协议重定向跟随"}
+```

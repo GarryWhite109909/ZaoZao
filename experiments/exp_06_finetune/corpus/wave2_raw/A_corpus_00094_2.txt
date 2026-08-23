@@ -1,0 +1,61 @@
+LANG: java
+```java
+package com.example.devproxy;
+
+import org.springframework.boot.web.servlet.server.ServletWebServerFactory;
+import org.springframework.http.*;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.messaging.handler.annotation.MessageMapping;
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.*;
+
+import javax.servlet.http.HttpServletRequest;
+import java.net.URI;
+
+@Controller
+public class ProxyController {
+
+    // 用户在配置文件中指定的代理目标，例如 application.yml: proxy.target=http://localhost:8081
+    @Value("${proxy.target}")
+    private String proxyTarget;          // source: 外部可控的代理目标
+
+    private final RestTemplate restTemplate = new RestTemplate(new SimpleClientHttpRequestFactory());
+
+    // 宽泛的 catch-all 路由：拦截除静态资源外的所有请求并转发到 proxyTarget
+    @RequestMapping(value = "/{path:(?!static).*}", method = {RequestMethod.GET, RequestMethod.POST})
+    public ResponseEntity<byte[]> forward(HttpServletRequest request, @PathVariable String path) {
+        URI upstream = URI.create(proxyTarget + "/" + path);   // sink: 未校验目标即转发
+        if (!mayProxy(path)) {
+            return ResponseEntity.notFound().build();
+        }
+        HttpHeaders headers = new HttpHeaders();
+        // 与原版一致：把 Origin 改写为代理目标以规避 CORS 检查
+        headers.set(HttpHeaders.ORIGIN, proxyTarget);
+        HttpEntity<byte[]> entity = new HttpEntity<>(headers);
+        return restTemplate.exchange(upstream, HttpMethod.resolve(request.getMethod()), entity, byte[].class);
+    }
+
+    // WebSocket 握手同样被宽泛上下文捕获并转发（ws: true 的等价语义）
+    @MessageMapping("/{path:.+}")
+    public void relaySocket(@DestinationVariable String path) {
+        URI wsUpstream = URI.create(proxyTarget.replaceFirst("^http", "ws") + "/" + path);
+        // 直接建立到用户指定目标的 WebSocket 连接，包括开发服务器自身的 HMR 端点
+        new SimpleClientHttpRequestFactory(); // 连接逻辑省略，转发目标同上
+    }
+
+    private boolean mayProxy(String pathname) {
+        return !new java.io.File("public/" + pathname).exists();
+    }
+}
+```
+
+分析：
+1. 第 19 行 `@Value("${proxy.target}")` 是 source：代理目标来自外部可写的配置（package.json/yml），开发者可填入宽泛值。
+2. 第 24 行 `@RequestMapping(value = "/{path:(?!static).*}")` 使用几乎全捕获的路由上下文，等价于原代码的宽 context `/`，连框架自身的 HMR/WebSocket 升级请求也会命中第 38 行的 `@MessageMapping` 中继。
+3. 第 27 行直接用未经验证的 `proxyTarget` 拼接上游 URI 并在第 31 行发起转发，这是 sink：没有任何对目标主机、协议或路径的白名单校验。
+4. 第 29-30 行主动将 `Origin` 头改写为代理目标，与原漏洞一致地绕过 CORS/来源检查，使浏览器侧的同源防护失效。
+5. 防御缺失：`mayProxy` 只排除静态文件，不限制 WebSocket/HMR 路径；因此攻击者诱导的连接会被转发到非预期的内部端点，构成 CWE-441 Unintended Proxy。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-441 Unintended Proxy / Intermediary", "risk_level": "high", "source": "line 19: 用户可配置的 proxy.target 注入为代理目标", "sink": "line 27-31: 将任意请求(含WebSocket握手)转发至未经校验的 proxyTarget 并改写 Origin 头", "explanation": "外部可控的宽泛代理配置 -> 全捕获路由与WebSocket中继 -> 未校验目标且改写Origin -> 开发服务器自身HMR等流量被劫持转发到非预期主机", "fix_suggestion": "line 24: 收窄路由上下文并对 proxyTarget 增加协议与主机白名单校验，排除框架自身的 WebSocket/HMR 端点"}
+```

@@ -166,6 +166,7 @@ class TwoStageResult:
     language: str
     has_vulnerability: Optional[bool]
     stage1: dict = field(default_factory=dict)                    # 工具层统计
+    stage1_ctx_warning: bool = False                              # P5 守卫：输入超上下文告警
     findings: list[ToolFinding] = field(default_factory=list)     # 全部候选
     adjudications: list[AdjudicationVerdict] = field(default_factory=list)
     reviewer_findings: list[dict] = field(default_factory=list)   # 低置信需人工复核
@@ -194,6 +195,7 @@ class TwoStageResult:
             "language": self.language,
             "has_vulnerability": self.has_vulnerability,
             "stage1": self.stage1,
+            "stage1_ctx_warning": self.stage1_ctx_warning,
             "findings": [f.to_dict() for f in self.findings],
             "adjudications": [a.to_dict() for a in self.adjudications],
             "reviewer_findings": self.reviewer_findings,
@@ -622,6 +624,14 @@ class TwoStageScanner:
             result.total_duration = time.time() - start
             return result
 
+        # P5 守卫（2026-08-23）：粗估 token（代码/中文混合 ~2 字符/token），
+        # 超过上下文窗口 90% 时告警——ollama 会静默截断输入导致漏检。
+        est_tokens = len(code) // 2 + code.count("\n")
+        if est_tokens > self.num_ctx * 0.9:
+            print(f"[ctx 守卫] {filename or 'inline'}: 约 {est_tokens} tokens "
+                  f"> num_ctx {self.num_ctx}×0.9，输入可能被静默截断", flush=True)
+            result.stage1_ctx_warning = True
+
         # 请求级复位抑制/剔除标记（候选被抑制池跳过或剔除 → 无候选分支强制复核）
         self._last_suppressed = False
 
@@ -677,6 +687,11 @@ class TwoStageScanner:
                         if vt:
                             result.vulnerability_type = normalize_cwe_label(vt) or vt
                             result.raw_vulnerability_type = vt
+                        # P3（2026-08-23）：多漏洞聚合——其余判真票类型不再丢失
+                        for t in (recheck.get("types") or []):
+                            nt = normalize_cwe_label(t) or t
+                            if nt and nt not in (result.vulnerability_types or []):
+                                result.vulnerability_types.append(nt)
                         if recheck.get("risk_level"):
                             result.risk_level = recheck["risk_level"]
                         if recheck.get("explanation") and not result.explanation:
@@ -804,6 +819,10 @@ class TwoStageScanner:
                     if vt:
                         result.vulnerability_type = vt
                         result.raw_vulnerability_type = vt_raw
+                    for t in (recheck.get("types") or []):
+                        nt = normalize_cwe_label(t) or t
+                        if nt and nt not in (result.vulnerability_types or []):
+                            result.vulnerability_types.append(nt)
                     if recheck.get("risk_level"):
                         result.risk_level = recheck["risk_level"]
                     if recheck.get("explanation") and not result.explanation:
@@ -1238,6 +1257,8 @@ class TwoStageScanner:
         n = max(1, min(3, self.n_samples))
         votes_true = votes_false = votes_invalid = 0
         true_verdict: Optional[dict] = None  # 首个判真票的完整 verdict（类型/等级/说明）
+        true_types: list = []  # P3 修复（2026-08-23）：收集全部判真票类型——此前只取首票，
+                               # 多漏洞文件走复核通道时其余漏洞类型被静默丢弃
         try:
             for _ in range(n):
                 resp = self.client.generate(
@@ -1247,7 +1268,7 @@ class TwoStageScanner:
                     # 多票采样需要足够温度打破同模态重复（取配置与 0.7 的较大值），
                     # 单票直接用调用方配置（默认低温稳定）。
                     temperature=(max(self.temperature, 0.7) if n > 1 else self.temperature),
-                    max_tokens=1024,
+                    max_tokens=int(os.environ.get("VULN_SCANNER_MAX_TOKENS", "2048")),
                     num_ctx=self.num_ctx,
                     keep_alive=self._effective_keep_alive(),
                 )
@@ -1256,8 +1277,13 @@ class TwoStageScanner:
                 hv_i = normalize_has_vulnerability(verdict.get("has_vulnerability")) if verdict else None
                 if hv_i is True:
                     votes_true += 1
-                    if true_verdict is None and verdict:
-                        true_verdict = verdict
+                    if verdict:
+                        if true_verdict is None:
+                            true_verdict = verdict
+                        vt_i = (verdict.get("vulnerability_type") or "").strip()
+                        if vt_i and vt_i.lower() not in ("none", "n/a", "unknown") \
+                                and vt_i not in true_types:
+                            true_types.append(vt_i)
                 elif hv_i is False:
                     votes_false += 1
                 else:
@@ -1277,6 +1303,8 @@ class TwoStageScanner:
         out = {"sampled": True, "has_vulnerability": hv,
                "votes_true": votes_true, "votes_false": votes_false,
                "votes_invalid": votes_invalid, "n": n}
+        if true_types:
+            out["types"] = true_types  # 全部判真票类型，供多漏洞聚合（P3）
         # 透传首个判真票的类型信息（2026-08-15 修复：此前 recheck 采信为漏洞
         # 但丢失 vulnerability_type/risk_level，11 个盲区样本 strict_recall 被
         # 工程缺陷吞掉——判定对了标号没了）
@@ -1806,7 +1834,7 @@ class TwoStageScanner:
                     prompt=prompt,
                     system_prompt=self.system_prompt,
                     temperature=self.temperature,
-                    max_tokens=1024,
+                    max_tokens=int(os.environ.get("VULN_SCANNER_MAX_TOKENS", "2048")),
                     num_ctx=self.num_ctx,
                     keep_alive=self._effective_keep_alive(),
                 )
@@ -1830,7 +1858,7 @@ class TwoStageScanner:
                         prompt=prompt,
                         system_prompt=self.system_prompt,
                         temperature=self.temperature,
-                        max_tokens=1024,
+                        max_tokens=int(os.environ.get("VULN_SCANNER_MAX_TOKENS", "2048")),
                         num_ctx=self.num_ctx,
                         keep_alive=self._effective_keep_alive(),
                     )

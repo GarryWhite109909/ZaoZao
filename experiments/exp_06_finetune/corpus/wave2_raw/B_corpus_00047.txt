@@ -1,0 +1,120 @@
+LANG: go
+```code
+# === file: router/config.go ===
+package router
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/middlewares/rewritetarget"
+)
+
+// LoadRewriteHandler builds the rewrite-target handler from dynamic config.
+// The replacement template may contain capture group references like $1.
+func LoadRewriteHandler(ctx context.Context, next http.Handler, cfg dynamic.RewriteTarget, name string) (http.Handler, error) {
+	return rewritetarget.New(ctx, next, cfg, name)
+}
+
+# === file: router/middleware.go ===
+package router
+
+import (
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+
+	"github.com/traefik/traefik/v3/pkg/middlewares"
+)
+
+var replacementRegex = regexp.MustCompile(`\$[0-9]+`)
+
+type rewriteTarget struct {
+	name                string
+	next                http.Handler
+	regexp              *regexp.Regexp
+	replacement         string
+	absoluteURLRedirect bool
+}
+
+func newInternal(next http.Handler, re *regexp.Regexp, replacement string) *rewriteTarget {
+	parsed, _ := url.Parse(replacement)
+	return &rewriteTarget{
+		name:                "rewrite",
+		next:                next,
+		regexp:              re,
+		replacement:         strings.TrimSpace(replacement),
+		absoluteURLRedirect: parsed != nil && parsed.Scheme != "",
+	}
+}
+
+func (rt *rewriteTarget) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	logger := middlewares.GetLogger(req.Context(), rt.name, "RewriteTarget")
+
+	currentPath := req.URL.RawPath // source: attacker-controlled request path
+	if currentPath == "" {
+		currentPath = req.URL.EscapedPath()
+	}
+	if rt.regexp != nil && !rt.regexp.MatchString(currentPath) {
+		rt.next.ServeHTTP(rw, req)
+		return
+	}
+
+	var newTarget string
+	if rt.regexp != nil {
+		newTarget = rt.regexp.ReplaceAllString(currentPath, rt.replacement)
+	} else {
+		newTarget = replacementRegex.ReplaceAllString(rt.replacement, "")
+	}
+	if newTarget == "" {
+		http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+
+	if rt.absoluteURLRedirect {
+		newTargetURL, err := url.Parse(newTarget)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if newTargetURL.RawQuery == "" && req.URL.RawQuery != "" {
+			newTargetURL.RawQuery = req.URL.RawQuery
+		}
+		http.Redirect(rw, req, newTargetURL.String(), http.StatusFound) // sink: open redirect via tainted path
+		return
+	}
+
+	req.URL.RawPath = newTarget
+	var err error
+	req.URL.Path, err = url.PathUnescape(req.URL.RawPath)
+	if err != nil {
+		logger.Error().Msgf("Unable to unescape URL RawPath %q: %v", req.URL.RawPath, err)
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	req.RequestURI = req.URL.RequestURI()
+	rt.next.ServeHTTP(rw, req)
+}
+```
+
+分析：
+1. L1（config.go）第 12-14 行：`LoadRewriteHandler` 将动态配置中的 `cfg.Replacement`（含 `$1` 等捕获组引用）原样传入 `rewritetarget.New`，无任何过滤。
+2. L2（middleware.go）第 33-37 行：`currentPath := req.URL.RawPath` 直接取自用户请求，是污点 source；仅做了空值回退，未做路径规范化或白名单校验。
+3. 第 44-48 行：`regexp.ReplaceAllString(currentPath, rt.replacement)` 把攻击者控制的路径拼入重写结果 `newTarget`，看似正则替换是净化，但替换模板本身含 `$1` 捕获组引用，攻击者路径内容被完整注入，净化不完整。
+4. 第 55-63 行：当模板为绝对 URL 时，`newTargetURL.String()` 被直接传给 `http.Redirect`（sink），携带用户可控的捕获组内容与查询串，构成 CWE-22 路径操纵/开放重定向。
+5. 调用链 config.go → middleware.go 上没有任何对最终重定向目标的 scheme/host 白名单校验，防御不完整。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22",
+  "source": "L2:line 33: req.URL.RawPath 攻击者可控的请求路径",
+  "sink": "L2:line 62: http.Redirect(rw, req, newTargetURL.String(), http.StatusFound)",
+  "taint_flow": "L1:line 13 LoadRewriteHandler 传递 Replacement -> L2:line 45 ReplaceAllString 注入捕获组 -> L2:line 57 newTargetURL.RawQuery 合并请求查询串 -> L2:line 62 Redirect",
+  "sanitizer": "L2:line 55-60 仅在解析失败时报错，未校验目标 host/scheme，净化不完整",
+  "files": ["router/config.go", "router/middleware.go"],
+  "cwe_id": "CWE-22"
+}
+```

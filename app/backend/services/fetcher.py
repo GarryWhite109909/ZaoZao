@@ -169,6 +169,11 @@ def fetch_url(url: str, timeout: int = 15) -> FetchResult:
         status = e.response.status_code if e.response is not None else "?"
         result.error = f"HTTP {status}"
         return result
+    except requests.RequestException as e:
+        # 正文流式读取阶段的中断（ChunkedEncodingError / ConnectionError 等）
+        # 原先只捕 HTTPError，这类异常会穿透成 url-scan 500
+        result.error = f"读取中断 ({type(e).__name__})"
+        return result
     finally:
         resp.close()
 
@@ -209,7 +214,8 @@ def fetch_url(url: str, timeout: int = 15) -> FetchResult:
                 language="javascript",
                 content=_read_limited(js_resp),
             ))
-        except requests.HTTPError:
+        except requests.RequestException:
+            # HTTPError / ChunkedEncodingError / ConnectionError 统统跳过该外链
             continue
         finally:
             js_resp.close()

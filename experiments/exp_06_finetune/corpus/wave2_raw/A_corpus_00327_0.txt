@@ -1,0 +1,49 @@
+LANG: python
+```python
+import os
+import subprocess
+
+from django.http import JsonResponse, HttpResponseBadRequest
+from django.views.decorators.http import require_POST
+
+
+# packages/<name>/bin/<script> is made executable after install,
+# mirroring how a package manager processes declared bin entries.
+@require_POST
+def install_package_bin(request):
+    pkg_name = request.POST.get("package")
+    bin_script = request.POST.get("bin")
+
+    if not pkg_name or not bin_script:
+        return HttpResponseBadRequest("package and bin are required")
+
+    # resolve the installed package directory from its lock record
+    lock_path = os.path.join("/var/lib/pkgmgr/locks", pkg_name + ".lock")
+    if not os.path.exists(lock_path):
+        return HttpResponseBadRequest("unknown package")
+
+    with open(lock_path) as f:
+        install_dir = f.read().strip()
+
+    # build path to the declared executable
+    target = os.path.join(install_dir, "bin", bin_script)
+
+    # chmod the file so it can be executed like composer does for bin entries
+    if not os.path.exists(target):
+        return HttpResponseBadRequest("bin entry not found")
+
+    os.chmod(target, 0o755)
+    subprocess.run([target], check=False)
+
+    return JsonResponse({"installed": pkg_name, "bin": bin_script})
+```
+
+1. 第 15-16 行是 source：`request.POST.get("package")` 和 `request.POST.get("bin")` 直接取用户提交的包名与 bin 脚本名，均为完全可控的外部输入。
+2. 第 20 行用 `pkg_name` 拼接锁文件路径，第 24 行用其内容作为安装目录——攻击者可通过 `../` 穿越读取任意 `.lock` 文件内容当作目录。
+3. 第 28 行 `os.path.join(install_dir, "bin", bin_script)` 是关键拼接点：`bin_script` 含 `../../etc/passwd` 之类值时直接逃出 `bin` 目录，且全程无 `realpath` 校验或前缀检查。
+4. 第 35 行 `os.chmod(target, 0o755)` 与第 36 行 `subprocess.run([target])` 是 sink：对任意穿越后的路径赋可执行权限并执行，等价于原漏洞中“对 bin 条目改文件模式”的语义。
+5. 防御缺失：仅检查文件是否存在（第 33 行），存在性检查不构成路径规范化防御，与原始代码中未校验 dist URL 域名外的引用替换同理，可被绕过。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal in bin script resolution", "risk_level": "high", "source": "line 15: request.POST.get('bin') user-controlled bin script name", "sink": "line 35: os.chmod(target, 0o755) on unvalidated joined path", "explanation": "user-supplied bin name -> os.path.join without normalization -> arbitrary filesystem path -> chmod+execute", "fix_suggestion": "line 28: resolve realpath and verify it stays under the package install dir before chmod/exec"}
+```

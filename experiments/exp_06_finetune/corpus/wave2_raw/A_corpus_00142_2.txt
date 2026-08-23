@@ -1,0 +1,70 @@
+LANG: go
+```go
+package main
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+// POST /validate — body: {"invoice": "<xml...>", "schematron": "PEPPOL-EN16931-UBL.xsl"}
+func validateHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Invoice    string `json:"invoice"`
+		Schematron string `json:"schematron"`
+	}
+	body, _ := io.ReadAll(r.Body)
+	json.Unmarshal(body, &req)
+
+	// resolve schematron: fall back to bundled dir if not an absolute path
+	xslPath := req.Schematron
+	if _, err := os.Stat(xslPath); err != nil {
+		xslPath = filepath.Join("data", "sendpeppol-schematron", req.Schematron)
+	}
+
+	// SaxonC-HE via command line: saxonb-xslt parses the XML with the
+	// JVM default SAX parser, which resolves external entities (no
+	// -opt:-dtd / secure processing flag is set).
+	cmd := exec.Command("saxonb-xslt",
+		"-s:-", // read source XML from stdin
+		"-xsl:"+xslPath,
+	)
+	cmd.Stdin = strings.NewReader(req.Invoice)
+	out, err := cmd.Output()
+	if err != nil {
+		http.Error(w, "validation failed", http.StatusBadRequest)
+		return
+	}
+
+	// extract failed-assert entries from SVRL output and return them
+	var results []map[string]string
+	for _, line := range strings.Split(string(out), "
+") {
+		if strings.Contains(line, "failed-assert") {
+			results = append(results, map[string]string{"svrl": strings.TrimSpace(line)})
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
+}
+
+func main() {
+	http.HandleFunc("/validate", validateHandler)
+	http.ListenAndServe(":8080", nil)
+}
+```
+
+1. 第 17–21 行：source——HTTP POST body 中的 `invoice`（任意 XML 文本）与 `schematron`（XSL 路径）由攻击者完全控制，无任何输入校验或白名单。
+2. 第 24–27 行：schematron 路径解析仅做存在性检查，未限制目录穿越，攻击者可指向任意 XSL 文件（次要问题）。
+3. 第 31–36 行：sink——将攻击者提供的 XML 直接通过 stdin 喂给 `saxonb-xslt` 命令行处理器；该处理器默认启用外部实体解析（等价于原代码中 Saxon 未做 XXE 加固配置），`<!DOCTYPE ... SYSTEM "file:///etc/passwd">` 会被读取。
+4. 第 43–48 行：SVRL 输出（含被解析出的实体内容）被原样编码进 JSON 响应返回给远程调用者，完成文件内容外泄——与原漏洞“远程读取文件并暴露内容”的语义完全一致。
+5. 全程无 DTD 禁用、无 secure processing、无实体白名单等防御，与原始代码防御同样缺失。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 XXE: Improper Restriction of XML External Entity Reference", "risk_level": "high", "source": "line 17: HTTP body 中的 invoice XML 字符串（攻击者可控输入）", "sink": "line 35: exec.Command saxonb-xslt 以默认配置解析该 XML，外部实体未被禁用", "explanation": "攻击者提交带外部实体的 XML -> saxonb-xslt 默认解析并读取本地文件 -> 实体内容进入 SVRL 输出 -> 第 48 行 JSON 响应回传给远程攻击者", "fix_suggestion": "line 31: 为 saxon 调用添加安全处理参数（如 -opt:-dtd 或 JVM 端设置 http://apache.org/xml/features/disallow-doctype-decl 为 true），或先用启用 DTD 禁用的解析器预检/清洗输入 XML"}
+```

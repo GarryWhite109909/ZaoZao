@@ -1,0 +1,38 @@
+LANG: python
+```python
+from flask import Flask, request, render_template_string
+
+app = Flask(__name__)
+
+@app.route("/agent-config", methods=["GET"])
+def agent_config():
+    # operator-supplied fields come straight from the query string
+    listen_host = request.args.get("listen_host", "0.0.0.0")
+    tun_device = request.args.get("tun_device", "nebula0")
+    mtu = request.args.get("mtu", "1300")
+    unsafe_routes = request.args.get("unsafe_routes", "")
+
+    # template interpolates raw user input -> SSTI (CWE-94)
+    TEMPLATE = """
+listen:
+  host: {{ listen_host }}
+punch: true
+tun:
+  dev: {{ tun_device }}
+  mtu: {{ mtu }}
+unsafe_routes:
+  - route: {{ unsafe_routes }}
+"""
+    return render_template_string(TEMPLATE, listen_host=listen_host,
+                                  tun_device=tun_device, mtu=mtu,
+                                  unsafe_routes=unsafe_routes)
+```
+
+1. 第 8-11 行：source——`request.args.get` 直接从 HTTP 查询串读取 `listen_host`、`tun_device`、`mtu`、`unsafe_routes`，与原代码中 `GeneratorInput` 的操作员可控字段等价，且无任何白名单/格式校验。
+2. 第 14-22 行：sink——模板字符串以字面量拼接用户输入，随后第 23 行 `render_template_string` 对其执行 Jinja2 渲染。由于占位符写在模板文本内部而非作为变量传入，Jinja2 会把注入的 `{{ ... }}` 当作模板表达式求值。
+3. 防御缺失分析：Flask 的安全做法是把用户数据作为上下文变量传入（如本例表面上的写法），但这里输入被嵌入模板源码本身，任何形如 `{{ ''.__class__.__mro__ }}` 的载荷都会被求值，等同于原 Go 代码把 `ListenHost` 原样插进 `text/template` 的结构，防御同样缺失。
+4. 数据流闭环：request.args（source）→ 未过滤 → TEMPLATE 字符串插值 → render_template_string 执行（sink），与原漏洞 source→sink 语义一一对应。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-94 服务端模板注入（SSTI）", "risk_level": "严重", "source": "line 8: request.args.get 获取 listen_host/tun_device 等外部输入", "sink": "line 23: render_template_string 渲染含用户输入的模板字符串", "explanation": "line 8 外部输入未经校验 -> line 14-22 直接拼入模板源码 -> line 23 Jinja2 将注入的 {{ }} 表达式求值，攻击者可执行任意 Python 表达式实现 RCE", "fix_suggestion": "line 23: 不要将用户输入拼入模板源码；改用固定模板文件并将输入仅作为渲染上下文变量传入，并对 listen_host 等字段做 IP/设备名格式白名单校验"}
+```

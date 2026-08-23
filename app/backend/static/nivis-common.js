@@ -680,7 +680,11 @@
                 self._dlProgress[rid] = cur;
               }
               if (obj.completed === true && obj.status === 'success') {
+                /* 成功行常单独到达（后端最后一行不带 pct），必须重新取值；
+                   否则 cur 为 undefined → TypeError 终止 pump，按钮卡在"下载中" */
+                var cur = self._dlProgress[rid] || {};
                 cur.pct = 100; cur.status = '完成';
+                self._dlProgress[rid] = cur;
               }
               if (obj.message) {
                 lastMessage = obj.message;

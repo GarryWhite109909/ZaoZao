@@ -1,0 +1,78 @@
+LANG: go
+```code
+# === file: handlers.go ===
+package api
+
+import (
+	"net/http"
+)
+
+// HandleParam 提取用户请求参数，作为污点源头
+func HandleParam(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")   // source: 用户可控参数名
+	value := r.URL.Query().Get("value") // source: 用户可控参数值
+	ve := &ValidationError{
+		Title:  "parameter " + name + " is invalid",
+		Detail: value,
+	}
+	PassToEncoder(ve)
+}
+
+// ValidationError 携带未净化的用户输入
+type ValidationError struct {
+	Status int
+	Title  string
+	Detail string
+}
+
+// === file: encoder.go ===
+package api
+
+import (
+	"strings"
+)
+
+// PassToEncoder 中间层：看似做了过滤，实则不完整
+func PassToEncoder(ve *ValidationError) {
+	// 仅替换单引号，未处理反斜杠、注释符等
+	detail := strings.ReplaceAll(ve.Detail, "'", "")
+	detail = strings.ReplaceAll(detail, """, "")
+	BuildQuery(ve.Title, detail) // 污点继续传递到 sink 文件
+}
+
+// === file: db.go ===
+package api
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+var db *sql.DB
+
+// BuildQuery 直接拼接 SQL —— sink：CWE-89 SQL 注入
+func BuildQuery(paramName, detail string) {
+	query := fmt.Sprintf("SELECT * FROM params WHERE name = '%s' AND detail = '%s'", paramName, detail)
+	rows, _ := db.Query(query)
+	defer rows.Close()
+}
+```
+
+分析：
+1. L1:handlers.go 第 8-9 行从 `r.URL.Query().Get` 获取用户可控的 name 与 value，构成污点 source。
+2. L1:handlers.go 第 10-14 行将原始输入写入 `ValidationError.Title/Detail`，无任何净化后传入下一文件。
+3. L2:encoder.go 第 6-11 行仅做了单引号与双引号替换，属于不完整净化——攻击者可用反斜杠、`--`、十六进制编码等绕过，污点仍存活。
+4. L3:db.go 第 8-12 行用 `fmt.Sprintf` 将 Title 与 Detail 直接拼入 SQL 字符串并执行 `db.Query`，构成 sink。
+5. 整条调用链上不存在参数化查询或完整转义，source 到 sink 的污点路径完整可达。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-89: SQL 注入",
+  "source": "L1:line 8: r.URL.Query().Get(name) 用户可控的查询参数",
+  "propagation": "L1:line 14 写入 ValidationError.Detail 后经 L2:line 11 不完整引号过滤传递至 BuildQuery",
+  "sink": "L3:line 9: fmt.Sprintf 拼接 SQL 后传入 db.Query 执行",
+  "sanitizer": "L2:lines 8-10: strings.ReplaceAll 仅移除引号，可被反斜杠与注释符绕过，防御不完整",
+  "reason": "跨文件调用链上用户输入未经完整净化即被拼接进 SQL 语句，存在可利用的注入点"
+}
+```

@@ -336,10 +336,16 @@ def _detect_safe_pattern(code: str) -> Optional[str]:
             and _SAFE_EXECUTE_CALL_PATTERN.search(code)):
         return "parameterized_query"
 
-    # 安全模式 2：列表参数 subprocess + 输入校验
+    # 安全模式 2：列表参数 subprocess + 输入校验（argv 不含 shell/解释器/执行语义参数——
+    # ["sh","-c",x]、find -exec、git --upload-pack 等列表形式仍是注入，2026-08-22 修正）
     if (_SAFE_SUBPROCESS_LIST_PATTERN.search(code)
             and _SAFE_INPUT_VALIDATION_PATTERN.search(code)):
-        return "subprocess_list_with_validation"
+        from graduation_project.shell_safety import list_argv_has_exec_semantics
+        for m in _SAFE_SUBPROCESS_LIST_PATTERN.finditer(code):
+            if list_argv_has_exec_semantics(code[m.end():m.end() + 400]):
+                break
+        else:
+            return "subprocess_list_with_validation"
 
     # 安全模式 3：abspath + startswith 路径校验
     if (_SAFE_PATH_ABSPATH_PATTERN.search(code)

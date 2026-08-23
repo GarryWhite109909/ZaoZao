@@ -1,0 +1,54 @@
+LANG: node.js/javascript
+```code
+const express = require('express');
+const nunjucks = require('nunjucks');
+const multer = require('multer');
+const upload = multer({ dest: '/tmp/uploads' });
+
+const app = express();
+app.use(express.json());
+
+// 用户上传的 docx 模板直接用用户可控数据渲染
+const env = new nunjucks.Environment(
+  new nunjucks.FileSystemLoader('/srv/templates'),
+  { autoescape: false }   // 关闭转义，允许原始表达式
+);
+
+function registerFilters() {
+  env.addFilter('datefmt', (value, fmt) => {
+    if (!value) return '';
+    const d = new Date(value);
+    return d.toLocaleDateString(undefined, { dateStyle: fmt || 'medium' });
+  });
+  env.addFilter('default', (value, def) => value == null ? (def || '') : value);
+}
+
+registerFilters();
+
+// source: 模板名与渲染上下文均来自请求
+app.post('/api/reports/generate', upload.single('template'), (req, res) => {
+  const templateName = req.body.templateName;      // 外部输入：模板路径/名称
+  let context;
+  try {
+    context = JSON.parse(req.body.context);        // 外部输入：完整渲染上下文
+  } catch (e) {
+    return res.status(400).json({ error: 'invalid context' });
+  }
+
+  // sink: 未做任何白名单校验，直接将用户上下文交给模板引擎执行表达式
+  const rendered = env.render(templateName + '.docx.njk', context);
+  res.type('application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+  res.send(rendered);
+});
+
+app.listen(3000);
+```
+
+1. 第 22 行 `req.body.templateName` 与第 24 行 `JSON.parse(req.body.context)` 是外部输入入口（source），攻击者完全控制模板选择与渲染上下文。
+2. 第 31 行 `env.render(templateName + '.docx.njk', context)` 是 sink：Nunjucks 在非沙箱模式下会求值模板中的任意表达式，配合 `{{ c.constructor.constructor("return process.mainModule.require")() }}` 类 payload 可实现 RCE，等价于原代码 Jinja2 Environment 直接加载用户可控模板的 SSTI 结构。
+3. 防御缺失分析：第 12 行 `autoescape: false` 关闭了输出转义；全程没有对 `templateName` 做白名单校验（存在路径拼接风险），也没有使用 `nunjucks.configure` 的沙箱环境（`nunjucks.render` vs `SafeEnvironment` 等价物）。
+4. 原 Python 代码中 `get_jinja_env` 用 `settings.DOCXTEMPLATE_JINJA_EXTENSIONS` 构造 Environment 且未启用 SandboxedEnvironment；改写后同样未使用 Nunjucks 的沙箱化预编译或模板内容校验，防御同样可绕过。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 服务端模板注入 SSTI", "risk_level": "critical", "source": "line 22: req.body.templateName 与 line 24: JSON.parse(req.body.context)", "sink": "line 31: env.render(templateName + '.docx.njk', context)", "explanation": "用户完全控制模板名与渲染上下文 -> Nunjucks 非 autoescape 且非沙箱模式直接执行模板内任意表达式 -> 攻击者可通过构造器链调用 require 实现 RCE", "fix_suggestion": "line 31: 对 templateName 做严格白名单校验并禁止路径穿越，同时使用 nunjucks 沙箱环境（如禁用 constructor 访问、开启 autoescape、仅渲染服务端预置模板而非用户提交的模板文件）"}
+```

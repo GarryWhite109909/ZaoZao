@@ -1,0 +1,54 @@
+LANG: java
+```java
+package com.example.fetch;
+
+import org.springframework.web.bind.annotation.*;
+import org.springframework.http.*;
+import java.net.*;
+import java.util.regex.*;
+
+@RestController
+@RequestMapping("/api/fetch")
+public class UrlFetchController {
+
+    // 检查 IP 是否为内网地址（与原代码相同的私有段判断）
+    private boolean isPrivateIp(String addr) {
+        if (addr == null || addr.isEmpty()) return true;
+        try {
+            InetAddress ia = InetAddress.getByName(addr);
+            if (ia.isLoopbackAddress() || ia.isSiteLocalAddress()
+                || ia.isLinkLocalAddress() || ia.isAnyLocalAddress()) return true;
+        } catch (UnknownHostException e) { return true; }
+        return false;
+    }
+
+    @GetMapping
+    public ResponseEntity<String> fetch(@RequestParam String url) throws Exception {
+        // 仅做格式校验，未做 scheme/host 白名单
+        if (!Pattern.matches("^https?://[\\w.:-]+.*", url)) {
+            return ResponseEntity.badRequest().body("invalid url");
+        }
+        URL target = new URL(url);
+        // TOCTOU：此处解析 DNS 得到的 IP 与后续真实连接时解析的 IP 可以不同（DNS rebinding）
+        if (isPrivateIp(target.getHost())) {
+            return ResponseEntity.status(403).body("private ip blocked");
+        }
+        // sink：直接发起出站请求，连接时重新解析 DNS，可被 rebinding 绕过
+        HttpURLConnection conn = (HttpURLConnection) target.openConnection();
+        conn.setConnectTimeout(5000);
+        try (var in = conn.getInputStream()) {
+            return new ResponseEntity<>(new String(in.readAllBytes()), HttpStatus.OK);
+        }
+    }
+}
+```
+
+1. 第 24 行：`@RequestParam String url` 是 source，外部用户完全可控的 URL 参数进入处理流程。
+2. 第 25-27 行：仅用正则做格式校验，没有 scheme 或 host 白名单，等价于原代码 `errorIfInvalidUrl` 的弱校验。
+3. 第 30 行：`isPrivateIp(target.getHost())` 只在请求前解析一次 DNS 做私有段检查，与原代码 `errorIfHostnameResolvesToPrivateIp` 一样是 check-then-use 模式。
+4. 第 35 行：`target.openConnection()` 是 sink，真实建立连接时 JVM 会重新解析 DNS，攻击者通过 DNS rebinding 让首次解析返回公网 IP、连接时返回内网 IP（如 169.254.169.254），SSRF 防御被绕过。
+5. 修复建议：在第 35 行改用先解析 IP、再以字面 IP 建立连接并固定 Host/SNI 校验（自定义 SocketFactory 校验 `InetAddress`），或使用解析结果直接构造连接，消除 TOCTOU 窗口。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (DNS rebinding bypass)", "risk_level": "high", "source": "line 24: @RequestParam String url", "sink": "line 35: target.openConnection()", "explanation": "外部可控 URL -> 仅正则格式校验 -> 请求前一次性 DNS 解析做私有 IP 检查 -> openConnection 时重新解析 DNS，rebinding 使检查失效 -> 请求打到内网地址", "fix_suggestion": "line 35: 先 InetAddress 解析并校验所有返回 IP 均非私有，再用该 IP 字面量建立连接并校验证书 Host，消除 TOCTOU 窗口"}
+```

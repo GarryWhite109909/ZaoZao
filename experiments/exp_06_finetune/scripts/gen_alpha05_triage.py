@@ -16,7 +16,7 @@ import json, re, sys
 from pathlib import Path
 from types import SimpleNamespace
 
-ROOT = Path(r"D:\code\毕业设计\Graduation-Project")
+ROOT = Path(__file__).resolve().parents[3]
 DATA = ROOT / "experiments" / "exp_06_finetune" / "data"
 OUT = DATA / "supplement_alpha05_triage.jsonl"
 

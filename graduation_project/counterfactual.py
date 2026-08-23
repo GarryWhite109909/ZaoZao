@@ -113,8 +113,21 @@ _VERIFIABLE_LANGS = {"python", "py", "javascript", "js", "typescript", "ts"}
 # 防御特征 → 检测正则：用于判定"原始代码是否已含该防御"。
 # 若原始已含注入的防御，说明模型之前没识别已有防御 → 该 finding 是误报（FP）；
 # 若原始无防御，扰动后判安全 → 模型真理解防御 → 真阳性（TP）。
+from graduation_project.shell_safety import LIST_FORM_DEFENSE_LOOKAHEADS as _LIST_FORM_LOOKAHEADS
+
 _DEFENSE_SIGNATURES: dict[str, re.Pattern] = {
-    "Command Injection": re.compile(r"shlex\.quote|subprocess\.run\(\s*\[|shell\s*=\s*False"),
+    # 2026-08-22 修正：原 `subprocess\.run\(\s*\[` 把任何列表形式当防御，
+    # ["sh","-c",user]、find -exec、git --upload-pack 等经解释器执行载荷的
+    # 真注入在证据门/复核门被系统性拦截（实测见 docs/训练优化计划.md 六.5）。
+    # 现列表形式默认仍视为防御，但 argv 含 shell/解释器/执行语义参数时不算
+    # （前瞻模式与 shell_safety.EXEC_SEMANTICS_PATTERNS 保持同一口径）。
+    # 覆盖面从 run 扩展到 run/Popen/call/check_output/check_call——同语义家族。
+    "Command Injection": re.compile(
+        r"shlex\.quote"
+        r"|subprocess\.(?:run|Popen|call|check_output|check_call)\(\s*\["
+        + _LIST_FORM_LOOKAHEADS +
+        r"|shell\s*=\s*False"
+    ),
     "SQL Injection": re.compile(r"\?\s*,\s*\(|%(?:s|d)\s*,\s*\(|execute\(\s*['\"][^'\"]*['\"]\s*,\s*\(|prepareStatement\(|setString\(|setInt\(|setLong\("),
     # 2026-08-18 修正：原 `escape\(` 会误匹配 html.unescape(（HTML 解码=反防御）和
     # re.escape(（正则转义≠输出编码）。加负向后顾排除 un/re. 前缀；import 行

@@ -4,16 +4,21 @@
   - 去掉 ROCm 特性（HIP bug 规避、fp32 提升、eager attention 等）
   - 使用 bf16 原生混合精度（A100+ 支持，比 fp16 更稳，无 GradScaler，不会 NaN）
   - 不用 bitsandbytes 4bit 量化（本地 16GB 才需要；云端 80GB 直接跑 bf16）
-  - max_seq_length 默认 6144：覆盖最终数据全部 7692 条（max≈5000 tokens），无需截断
-  - batch_size 默认 4 + grad_accum 2 = 有效 batch 8，梯度更稳
+  - max_seq_length 默认 6144：覆盖最终数据全部样本（v3 8616 条实测 avg≈2952 / max≈4900 tokens；α0.5 7972 条同量级），无需截断
+  - batch_size 默认 8 + grad_accum 1 = 有效 batch 8（80GB 显存宽裕，单卡直放）
 
 方法：LoRA（默认 r=8, alpha=16, rsLoRA 默认开启）+ 梯度检查点
-数据：final_train_chatml_quality_final.jsonl（与脚本同目录，7692 条，归一化 CWE + 统一 prompt + 60 hard samples）
+数据：final_train_chatml_alpha05.jsonl（与脚本同目录，7972 条，α0.5 最终训练集：
+      统一 ALPHA05_PROMPT(1467字符) + 泄露门禁 + 全量审计 PASS；
+      含盲区/痛点/归因/真实CVE 补充。triage 独立在 supplement_alpha05_triage.jsonl，
+      配 triage_default prompt，供裁决任务单独微调，勿混入主扫描训练）
 
 云端用法（已装 torch/transformers/trl/peft/datasets）：
   python train_qlora_cloud.py
   python train_qlora_cloud.py --subset 50 --max-steps 5   # 快速验证
   python train_qlora_cloud.py --data-file /path/to/other.jsonl
+  python train_qlora_cloud.py --recycle-dev              # 阶段1看 eval loss 曲线 + 选 best，
+                                                         # 阶段2把 dev 回收进全量续训（final training on full data）
 
 说明：
   - 脚本和数据文件放在同一目录即可，无需特定文件夹结构
@@ -24,6 +29,8 @@
   - 数据太大可选 --subset 限制条数做快速验证
   - assistant_only_loss=True 需要 chat_template 包含 {% generation %} 标签，
     Qwen3 默认模板不含此标签，脚本已自动注入修改后的模板
+  - --recycle-dev 注意：回收后 dev 的 eval_loss 不再代表泛化（模型已见过），
+    最终泛化指标必须用独立测试集（如 testset_cve_fix）评估
 """
 
 import argparse
@@ -49,7 +56,7 @@ from trl import SFTConfig, SFTTrainer
 
 # ── 路径：基于脚本自身所在目录，云端随意放，不依赖项目目录结构 ──
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATA_FILE = SCRIPT_DIR / "final_train_chatml_quality_final.jsonl"
+DATA_FILE = SCRIPT_DIR / "final_train_chatml_alpha05.jsonl"
 OUTPUT_DIR = SCRIPT_DIR / "outputs"
 LOG_DIR = SCRIPT_DIR / "logs"
 MODEL_ID = "Qwen/Qwen3-8B"
@@ -160,8 +167,8 @@ def split_train_dev(dataset: Dataset, dev_ratio: float, seed: int = 42):
 def main():
     parser = argparse.ArgumentParser(description="云端 LoRA 微调 Qwen3-8B（bf16 原生）")
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--batch-size", type=int, default=4, help="每设备 batch size（云端 80GB，默认 4）")
-    parser.add_argument("--grad-accum", type=int, default=2, help="梯度累积（默认 2，有效 batch=8）")
+    parser.add_argument("--batch-size", type=int, default=8, help="每设备 batch size（云端 80GB，默认 8，显存宽裕）")
+    parser.add_argument("--grad-accum", type=int, default=1, help="梯度累积（默认 1，有效 batch=8）")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lora-r", type=int, default=8)
     parser.add_argument("--lora-alpha", type=int, default=16)
@@ -169,7 +176,7 @@ def main():
     parser.add_argument("--no-rslora", action="store_true",
                         help="禁用 rsLoRA（默认开启：Phase1 sweep 表明 lr=1e-4 + rsLoRA(r=8) 最优）")
     parser.add_argument("--max-seq-length", type=int, default=6144,
-                        help="默认 6144，覆盖最终数据全部(实测 max约5000 tokens，旧值 4096 会截断尾部 JSON)")
+                        help="默认 6144，覆盖最终数据全部 final_train_chatml_v3.jsonl(实测 max≈4900 tokens，旧值 4096 会截断尾部 JSON)")
     parser.add_argument("--save-steps", type=int, default=200)
     parser.add_argument("--eval-steps", type=int, default=None)
     parser.add_argument("--logging-steps", type=int, default=5)
@@ -187,6 +194,14 @@ def main():
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"],
                         help="混合精度（A100+ 用 bf16；旧卡无 bf16 用 fp16）")
+    # 第 2 阶段：回收 dev 集（final training on full data）
+    parser.add_argument("--recycle-dev", action="store_true",
+                        help="阶段1（分 dev 看 eval loss 曲线 + 选 best）完成后，把 dev 集回收进训练，"
+                             "用全量数据续训最终模型。标准做法：train/dev 只用于模型选择，"
+                             "最终模型在全量数据上训练，避免宝贵的 dev 数据浪费。")
+    parser.add_argument("--recycle-epochs", type=float, default=1.0,
+                        help="回收阶段在全量数据上续训的 epochs（默认 1.0 = 全量过一遍；"
+                             "数据少时建议 1.0，过久易过拟合）")
     args = parser.parse_args()
 
     data_file = Path(args.data_file) if args.data_file else DATA_FILE
@@ -203,7 +218,9 @@ def main():
 
     print(f"训练数据: {data_file}")
     full_dataset = load_chatml_dataset(data_file, args.subset)
-    train_dataset, dev_dataset = split_train_dev(full_dataset, args.dev_ratio, seed=42)
+    # train/dev 划分种子跟随 --seed（原先硬编码 42，改 seed 只影响训练采样
+    # 不影响划分，复现实验时划分会悄悄漂移）
+    train_dataset, dev_dataset = split_train_dev(full_dataset, args.dev_ratio, seed=args.seed)
 
     print(f"加载 tokenizer: {args.model_id}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
@@ -322,6 +339,62 @@ def main():
         print(f"\n（--no-load-best：model 为 final 状态）LoRA adapter 已保存到: {best_dir}")
     else:
         print(f"\nBest LoRA adapter（按 dev_loss 选）已保存到: {best_dir}")
+
+    # ---- 第 2 阶段：回收 dev 集（--recycle-dev）----
+    # 方法论：train/dev 划分只用于「模型选择」（看 eval loss 曲线、early stopping、选 best epoch），
+    # 不是用来报告最终泛化的。确认曲线健康后把 dev 并回训练、用全量数据续训最终模型，
+    # 是标准的 "final training on full data"，避免宝贵的 dev 数据浪费。
+    # ⚠️ 边界：回收后 dev 的 eval_loss 不再代表泛化（模型已见过它）；最终指标必须来自
+    #    从未进过训练集的独立测试集（如 testset_cve_fix）。
+    if args.recycle_dev and not short_run:
+        eff_batch = args.batch_size * args.grad_accum
+        full_len = len(full_dataset)
+        recycle_steps = max(1, int(round(args.recycle_epochs * full_len / eff_batch)))
+        recycled_dir = output_dir / "recycled"
+        print(f"\n[阶段2/回收dev] 把 {len(dev_dataset)} 条 dev 并回训练，全量 {full_len} 条续训 "
+              f"{args.recycle_epochs} epoch ≈ {recycle_steps} 步（从阶段1 best 继续，关闭 eval）")
+        sft_config2 = SFTConfig(
+            output_dir=str(recycled_dir),
+            num_train_epochs=args.recycle_epochs,
+            per_device_train_batch_size=args.batch_size,
+            gradient_accumulation_steps=args.grad_accum,
+            learning_rate=args.lr,
+            lr_scheduler_type="cosine",
+            warmup_ratio=args.warmup_ratio,
+            max_grad_norm=1.0,
+            logging_steps=args.logging_steps,
+            save_strategy="steps",
+            save_steps=args.save_steps,
+            save_total_limit=2,          # 回收阶段只留最后两个 checkpoint
+            bf16=use_bf16,
+            fp16=not use_bf16,
+            gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+            optim="adamw_torch",
+            weight_decay=0.01,
+            seed=args.seed,
+            max_length=args.max_seq_length,
+            packing=False,
+            dataset_text_field=None,
+            assistant_only_loss=True,
+            report_to="none",
+            logging_dir=str(LOG_DIR),
+            eval_strategy="no",          # 曲线已在阶段1确认，回收阶段不再评估
+            dataloader_pin_memory=False,
+        )
+        # model 在阶段1结束时已回滚到 best（load_best_model_at_end=True）
+        trainer2 = SFTTrainer(
+            model=model,
+            args=sft_config2,
+            train_dataset=full_dataset,  # 全量（train + dev）
+            processing_class=tokenizer,
+        )
+        trainer2.train()
+        trainer2.save_model(str(recycled_dir))
+        trainer2.save_state()
+        print(f"[阶段2/回收dev] 全量续训完成，最终模型已保存到: {recycled_dir}")
+        print(f"   ⚠️ 此模型已见过 dev 数据：其泛化指标必须用独立测试集（如 testset_cve_fix）评估，")
+        print(f"      回收后的 dev eval_loss 不再代表泛化，仅能证明阶段1选型正确。")
 
     metrics = train_result.metrics
     print("\n训练指标:")

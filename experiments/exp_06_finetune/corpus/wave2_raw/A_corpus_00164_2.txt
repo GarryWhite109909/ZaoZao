@@ -1,0 +1,70 @@
+LANG: go
+```go
+// mcp_auth_server.go — simplified MCP authorization server (Go net/http)
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"sync"
+)
+
+type Session struct {
+	ClientID string
+	Scope    string
+	Resource string // RFC 8707 audience
+}
+
+var (
+	mu       sync.RWMutex
+	sessions = map[string]*Session{} // sessionID -> session
+)
+
+// POST /introspect — token introspection endpoint for Resource Servers (RFC 7662)
+func introspectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		json.NewEncoder(w).Encode(map[string]bool{"active": false})
+		return
+	}
+	token := r.FormValue("token")
+	if token == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]bool{"active": false})
+		return
+	}
+	mu.RLock()
+	sess, ok := sessions[token]
+	mu.RUnlock()
+	if !ok {
+		json.NewEncoder(w).Encode(map[string]bool{"active": false})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"active":     true,
+		"client_id":  sess.ClientID,
+		"scope":      sess.Scope,
+		"token_type": "Bearer",
+		"aud":        sess.Resource,
+	})
+}
+
+func main() {
+	http.HandleFunc("/introspect", introspectHandler)
+	log.Println("MCP Authorization Server running on :9000")
+	log.Fatal(http.ListenAndServe(":9000", nil))
+}
+```
+
+1. 第 27 行：source —— `r.FormValue("token")` 直接从外部请求表单中取出会话标识符，这是唯一用于定位会话的输入。
+2. 第 33-35 行：sink —— `sessions[token]` 仅凭该标识符在全局 map 中查找并返回完整会话信息（client_id、scope、aud）。
+3. 查找过程只校验 key 是否存在，没有将 token 与请求方身份做任何绑定或归属校验，也没有对调用方（Resource Server）做认证。
+4. 因此任何知道/猜测到他人 session ID 的客户端都能通过 `/introspect` 获取该会话的授权属性，与原 Python 版本“仅按 session id 路由而不验证请求归属”的 CWE-639 语义完全一致。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key", "risk_level": "high", "source": "line 27: r.FormValue('token') 从外部请求读取会话标识符", "sink": "line 34: sessions[token] 仅凭用户提供的 key 返回会话授权信息", "explanation": "外部可控的 token 作为 map 键直接索引会话 -> 未校验该会话是否属于当前请求方或调用方已认证 -> 攻击者可枚举/猜测他人 session ID 并获取其 client_id 与 audience 授权数据", "fix_suggestion": "line 34: 在查找后校验会话归属，例如要求调用方 Resource Server 使用客户端凭证认证，并将 token 绑定到签发时的 client_id/resource 做一致性检查"}
+```
