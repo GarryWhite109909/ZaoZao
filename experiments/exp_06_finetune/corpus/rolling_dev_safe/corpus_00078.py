@@ -1,0 +1,309 @@
+"""
+.. module: lemur.certificates.verify
+    :platform: Unix
+    :copyright: (c) 2018 by Netflix Inc., see AUTHORS for more
+    :license: Apache, see LICENSE for more details.
+.. moduleauthor:: Kevin Glisson <kglisson@netflix.com>
+"""
+import ipaddress
+import requests
+import socket
+import subprocess
+from collections import OrderedDict
+from urllib.parse import urlparse
+from flask import current_app
+from requests.exceptions import ConnectionError, InvalidSchema, Timeout
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from sentry_sdk import capture_exception
+from subprocess import TimeoutExpired
+
+from lemur.utils import mktempfile
+from lemur.common.utils import parse_certificate
+from lemur.extensions import metrics
+
+_CRL_CACHE_MAX_SIZE = 1000
+crl_cache: OrderedDict = OrderedDict()
+
+
+def _validate_revocation_url(url, config_key):
+    """
+    Reject URLs that point at private/loopback/link-local destinations (SSRF prevention).
+    If config_key is present in app config, also enforce a hostname allowlist.
+
+    Returns the resolved IP string so callers can pin the connection and prevent DNS rebinding.
+    Raises ValueError with a descriptive message if the URL is not permitted.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Disallowed URL scheme '{parsed.scheme}': {url}")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"URL has no hostname: {url}")
+
+    allowed_hosts = current_app.config.get(config_key, [])
+    if allowed_hosts and hostname not in allowed_hosts:
+        raise ValueError(f"Host '{hostname}' is not in {config_key} allowlist: {url}")
+
+    # Always block internal destinations regardless of allowlist to defeat DNS rebinding
+    # and misconfigured allowlists.
+    try:
+        addr = ipaddress.ip_address(socket.gethostbyname(hostname))
+    except (socket.gaierror, ValueError) as e:
+        raise ValueError(f"Unable to resolve host '{hostname}': {e}")
+
+    if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+        raise ValueError(f"URL resolves to a disallowed internal address ({addr}): {url}")
+
+    return str(addr)
+
+
+def _pin_url_to_ip(url, resolved_ip):
+    """
+    Return url with the hostname replaced by resolved_ip to prevent DNS rebinding.
+    Only applied for http:// URLs; https:// relies on TLS certificate validation for
+    hostname binding and replacing the hostname would break SNI/cert verification.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "http":
+        return url
+    port = parsed.port
+    netloc = f"{resolved_ip}:{port}" if port else resolved_ip
+    return parsed._replace(netloc=netloc).geturl()
+
+
+def _host_header(url):
+    """Return the correct Host header value for the given URL (hostname[:port])."""
+    parsed = urlparse(url)
+    if parsed.port:
+        return f"{parsed.hostname}:{parsed.port}"
+    return parsed.hostname
+
+
+def ocsp_verify(cert, cert_path, issuer_chain_path):
+    """
+    Attempts to verify a certificate via OCSP. OCSP is a more modern version
+    of CRL in that it will query the OCSP URI in order to determine if the
+    certificate has been revoked
+
+    :param cert:
+    :param cert_path:
+    :param issuer_chain_path:
+    :return bool: True if certificate is valid, False otherwise
+    """
+    command = ["openssl", "x509", "-noout", "-ocsp_uri", "-in", cert_path]
+    p1 = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    url_bytes, err = p1.communicate()
+
+    if not url_bytes:
+        current_app.logger.debug(
+            f"No OCSP URL in certificate {cert.serial_number}"
+        )
+        return None
+
+    url = url_bytes.decode("utf-8").strip()
+
+    try:
+        resolved_ip = _validate_revocation_url(url, "LEMUR_TRUSTED_OCSP_HOSTS")
+    except ValueError as e:
+        current_app.logger.warning(
+            f"OCSP URL rejected for certificate {cert.serial_number:02X}: {e}"
+        )
+        return None
+
+    # Use the pinned IP to prevent DNS rebinding between validation and fetch.
+    # Pass the original hostname via -header Host so the OCSP server can route correctly.
+    pinned_url = _pin_url_to_ip(url, resolved_ip)
+    p2 = subprocess.Popen(
+        [
+            "openssl",
+            "ocsp",
+            "-issuer",
+            issuer_chain_path,
+            "-cert",
+            cert_path,
+            "-url",
+            pinned_url,
+            "-header",
+            "Host",
+            _host_header(url),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        message, err = p2.communicate(timeout=6)
+    except TimeoutExpired:
+        try:
+            p2.kill()
+        except OSError:
+            # Ignore 'no such process' error
+            pass
+        raise Exception(f"OCSP lookup timed out: {url}, certificate serial number {cert.serial_number:02X}")
+
+    p_message = message.decode("utf-8")
+
+    if "unauthorized" in p_message:
+        # indicates the OCSP server does not know this certificate. this is a retriable error.
+        metrics.send("check_revocation_ocsp_verify", "counter", 1, metric_tags={"status": "unauthorized", "url": url})
+        current_app.logger.warning(f"OCSP unauthorized error: {url}, "
+                                   f"certificate serial number {cert.serial_number:02X}. Response: {p_message}")
+        return None
+
+    elif "error" in p_message or "Error" in p_message:
+        metrics.send("check_revocation_ocsp_verify", "counter", 1, metric_tags={"status": "error", "url": url})
+        raise Exception(f"Got error when parsing response from OCSP url: {url}, certificate serial number "
+                        f"{cert.serial_number:02X}. Response: {p_message}")
+
+    elif "revoked" in p_message:
+        current_app.logger.debug(
+            f"OCSP reports certificate revoked, serial number: {cert.serial_number:02X}"
+        )
+        return False
+
+    elif "good" not in p_message:
+        raise Exception(f"Did not receive a valid OCSP response from url: {url}, "
+                        f"certificate serial number {cert.serial_number:02X}")
+
+    return True
+
+
+def crl_verify(cert, cert_path):
+    """
+    Attempts to verify a certificate using CRL.
+
+    :param cert:
+    :param cert_path:
+    :return: True if certificate is valid, False otherwise
+    :raise Exception: If certificate does not have CRL
+    """
+    try:
+        distribution_points = cert.extensions.get_extension_for_oid(
+            x509.OID_CRL_DISTRIBUTION_POINTS
+        ).value
+    except x509.ExtensionNotFound:
+        current_app.logger.debug(
+            f"No CRLDP extension in certificate {cert.serial_number}"
+        )
+        return None
+
+    for p in distribution_points:
+        point = p.full_name[0].value
+
+        if point not in crl_cache:
+            try:
+                resolved_ip = _validate_revocation_url(point, "LEMUR_TRUSTED_CRL_HOSTS")
+            except ValueError as e:
+                current_app.logger.warning(
+                    f"CRL URL rejected for certificate {cert.serial_number:02X}: {e}"
+                )
+                continue
+
+            current_app.logger.debug(f"Retrieving CRL: {point}, serial {cert.serial_number:02X}")
+            # Pin to the already-validated IP (prevents DNS rebinding) and disable redirect
+            # following (prevents redirect-based SSRF bypass).
+            pinned_url = _pin_url_to_ip(point, resolved_ip)
+            try:
+                response = requests.get(
+                    pinned_url,
+                    timeout=(3.05, 6),
+                    allow_redirects=False,
+                    headers={"Host": _host_header(point)},
+                )
+
+                if response.status_code != 200:
+                    raise Exception(f"Unable to retrieve CRL: {point}, serial {cert.serial_number:02X}")
+            except InvalidSchema:
+                # Unhandled URI scheme (like ldap://); skip this distribution point.
+                continue
+            except (ConnectionError, Timeout):
+                raise Exception(f"Unable to retrieve CRL: {point}, serial {cert.serial_number:02X}")
+
+            if len(crl_cache) >= _CRL_CACHE_MAX_SIZE:
+                crl_cache.popitem(last=False)
+
+            crl_cache[point] = x509.load_der_x509_crl(
+                response.content, backend=default_backend()
+            )
+        else:
+            current_app.logger.debug(f"CRL point is cached {point}")
+
+        for r in crl_cache[point]:
+            if cert.serial_number == r.serial_number:
+                try:
+                    reason = r.extensions.get_extension_for_class(x509.CRLReason).value
+                    # Handle "removeFromCRL" revoke reason as unrevoked;
+                    # continue with the next distribution point.
+                    # Per RFC 5280 section 6.3.3 (k):
+                    #  https://tools.ietf.org/html/rfc5280#section-6.3.3
+                    if reason == x509.ReasonFlags.remove_from_crl:
+                        break
+                except x509.ExtensionNotFound:
+                    pass
+
+                current_app.logger.debug(
+                    "CRL reports certificate " "revoked: {}".format(cert.serial_number)
+                )
+                return False
+
+    return True
+
+
+def verify(cert_path, issuer_chain_path):
+    """
+    Verify a certificate using OCSP and CRL
+
+    :param cert_path:
+    :param issuer_chain_path:
+    :return: True if valid, False otherwise
+    """
+    with open(cert_path) as c:
+        try:
+            cert = parse_certificate(c.read())
+        except ValueError as e:
+            current_app.logger.error(e)
+            return None
+
+    # OCSP is our main source of truth, in a lot of cases CRLs
+    # have been deprecated and are no longer updated
+    verify_result = None
+    ocsp_err = 0
+    crl_err = 0
+    try:
+        verify_result = ocsp_verify(cert, cert_path, issuer_chain_path)
+    except Exception as e:
+        capture_exception()
+        current_app.logger.warning(e)
+        ocsp_err = 1
+
+    if verify_result is None:
+        try:
+            verify_result = crl_verify(cert, cert_path)
+        except Exception as e:
+            capture_exception()
+            current_app.logger.warning(e)
+            crl_err = 1
+
+    if verify_result is None:
+        current_app.logger.warning(f"Failed to verify {cert.serial_number}")
+
+    return verify_result, ocsp_err, crl_err
+
+
+def verify_string(cert_string, issuer_string):
+    """
+    Verify a certificate given only it's string value
+
+    :param cert_string:
+    :param issuer_string:
+    :return: True if valid, False otherwise
+    """
+    with mktempfile() as cert_tmp:
+        with open(cert_tmp, "w") as f:
+            f.write(cert_string)
+        with mktempfile() as issuer_tmp:
+            with open(issuer_tmp, "w") as f:
+                f.write(issuer_string)
+            status, ocsp_err, crl_err = verify(cert_tmp, issuer_tmp)
+    return status, ocsp_err, crl_err
