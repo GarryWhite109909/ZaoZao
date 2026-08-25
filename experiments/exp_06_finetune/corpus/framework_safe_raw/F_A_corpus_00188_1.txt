@@ -1,0 +1,73 @@
+LANG: java
+```java
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.client.RestTemplate;
+import java.util.*;
+import java.util.regex.*;
+
+@RestController
+@RequestMapping("/api/alerts")
+public class AlertActionController {
+
+    private final Map<String, String> alertStatus = new HashMap<>();
+
+    // 白名单：仅允许预定义的告警动作模板，禁止任意命令
+    private static final Map<String, List<String>> ALLOWED_ACTIONS = new HashMap<>();
+    static {
+        // key: stat, value: 允许的命令模板（固定 argv，不含 shell 元字符）
+        ALLOWED_ACTIONS.put("cpu", Arrays.asList("echo", "top", "ps"));
+        ALLOWED_ACTIONS.put("mem", Arrays.asList("echo", "free"));
+        ALLOWED_ACTIONS.put("disk", Arrays.asList("echo", "df"));
+    }
+
+    // POST /api/alerts/run?stat=cpu&crit=CRITICAL&cmd=echo {{procName}}
+    // Body: {"procName": "nginx | rm -rf /tmp/x"}
+    @PostMapping("/run")
+    public String run(@RequestParam String stat,
+                      @RequestParam String crit,
+                      @RequestParam String cmd,
+                      @RequestBody Map<String, String> mustacheVars) {
+        // dedup: skip if same stat/criticality already fired
+        if (crit.equals(alertStatus.get(stat))) {
+            return "skipped";
+        }
+
+        // Render {{var}} placeholders with stats values
+        String rendered = cmd;
+        for (Map.Entry<String, String> e : mustacheVars.entrySet()) {
+            rendered = rendered.replace("{{" + e.getKey() + "}}", e.getValue());
+        }
+
+        // 修复：不再经 /bin/sh -c 解释；改为白名单校验 + 无 shell 的直接进程执行
+        String[] argv = rendered.trim().split("\\s+");
+        if (argv.length == 0) {
+            return "error: empty command";
+        }
+        List<String> allowed = ALLOWED_ACTIONS.get(stat);
+        if (allowed == null || !allowed.contains(argv[0])) {
+            return "error: command not allowed for stat: " + stat;
+        }
+        // 参数值作为单个 argv 元素传递，shell 元字符（| && ; 等）失去解释语义
+        try {
+            Process p = new ProcessBuilder(Arrays.asList(argv)).start();
+            p.waitFor();
+        } catch (Exception ex) {
+            return "error: " + ex.getMessage();
+        }
+
+        alertStatus.put(stat, crit);
+        return "executed: " + rendered;
+    }
+}
+```
+
+1. 第 16-17 行枚举用户可控输入点：`@RequestParam` 绑定的 `stat`、`crit`、`cmd`，以及 `@RequestBody` 绑定的 `mustacheVars`（第 18 行），全部来自 HTTP 请求，均为攻击者可控。
+2. 第 27-30 行的 `{{var}}` 渲染把攻击者可控值注入 `rendered`，原代码在第 34 行将其交给 `/bin/sh -c`，构成 CWE-78 完整数据流：source 为请求参数与 body，sink 为 `ProcessBuilder("/bin/sh","-c",rendered)`。
+3. 防御类型正确性：修复采用白名单精确允许集（第 21-28 行 `ALLOWED_ACTIONS`，按 `stat` 维度限定可执行程序名）+ 去除 shell 解释层。`argv[0]` 必须命中白名单，攻击者无法引入新程序；这是精确允许集而非黑名单/正则过滤。
+4. 攻击面覆盖完整性：第 40 行改为 `new ProcessBuilder(Arrays.asList(argv))` 直接 exec，不经 `/bin/sh -c`，因此即使 `procName` 含 `| rm -rf /tmp/x`，它也只是单个 argv 元素被传给白名单程序的参数，管道/分号等元字符不再被解释；同时白名单在渲染之后、执行之前生效（第 35-39 行），覆盖了渲染引入的所有可控内容。
+5. 位置正确性：校验位于 sink 前的最后一步且针对最终执行的完整 argv，而非对输入做前置过滤，避免绕过编码/拼接变体。
+6. 第二入口检查：`stat` 仅用于 HashMap 键与白名单查找、`crit` 仅用于去重比较并回写内存 map（第 24 行、第 47 行），均不进入进程执行或任何外部 sink；无其他命令执行通道，结论为无残留漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-78 OS Command Injection：请求参数 cmd 与 body mustacheVars 经模板渲染后传入 /bin/sh -c 执行；修复采用按 stat 维度的命令名白名单精确允许集，并以 ProcessBuilder 直接 argv 执行替代 shell 解释，使元字符失去语义；其余数据流（crit 去重写内存 map、stat 作键）不触及外部 sink，保持原样", "fix_suggestion": "line 34-40: 移除 /bin/sh -c 包装，新增 ALLOWED_ACTIONS 白名单校验 argv[0]，改用 new ProcessBuilder(Arrays.asList(argv)).start() 直接执行"}
+```

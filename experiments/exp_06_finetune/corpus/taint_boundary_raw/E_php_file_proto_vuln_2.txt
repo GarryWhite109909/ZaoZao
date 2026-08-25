@@ -1,0 +1,51 @@
+LANG: php
+```php
+<?php
+// asset_locator.php —— 静态资源定位模块
+// 被上层服务调用：传入资源清单文件路径，返回渲染后的资源定位片段。
+// 清单文件由运维平台上传/同步，内容视为可信配置（历史假设）。
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use Twig\Environment;
+use Twig\Loader\ArrayLoader;
+
+function locate_asset(string $manifest_path): string
+{
+    // 第 12 行：读取外部清单文件（每行一条 "alias=template" 记录）
+    $lines = file($manifest_path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines === false) {
+        throw new RuntimeException('cannot read manifest');
+    }
+
+    $twig = new Environment(new ArrayLoader([]), ['autoescape' => false]);
+
+    foreach ($lines as $line) {
+        $pos = strpos($line, '=');
+        if ($pos === false) { continue; }
+        $alias   = substr($line, 0, $pos);
+        // 第 22 行：模板字符串直接取自文件内容，仅做简单空白清理
+        $pattern = trim(substr($line, $pos + 1));
+        // 弱防御：黑名单过滤常见 SSTI 关键字
+        if (preg_match('/(\{\{|\{%|system|exec|passthru)/i', $pattern)) {
+            continue;
+        }
+        // 第 27 行：把文件内容当作 Twig 模板编译并渲染
+        $rendered = $twig->createTemplate($pattern)->render([]);
+        echo "[{$alias}] => {$rendered}
+";
+    }
+    return 'ok';
+}
+```
+
+分析：
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；第 12 行 `file()` 读取的清单文件由外部（运维平台上传/同步）提供，其每一行内容都是公开接口提交的外部可控数据，必须按不可信处理，是等效污点源。
+2. 数据流：第 12 行读入 `$lines` → 第 17-21 行按 `=` 切分得到 `$pattern`（完全来自文件内容）→ 第 24-26 行黑名单正则过滤 → 第 27 行 `createTemplate($pattern)->render()` 编译执行。source 到 sink 全程可达。
+3. 防御评估：第 25 行的黑名单只拦截 `{{`、`{%`、`system` 等字面量，可被绕过——Twig 支持标签内换行与空白变体（如 `{%` 后接换行仍可匹配？实际 `\{\{` 可用 `{ {` 不行，但可用 `{%-` 变体、或利用 `{%` 的 Unicode/大小写无关性已覆盖；更直接的绕过是使用不依赖这些关键字的过滤器链，或通过 `{{` 写成 `{‌{`？最可靠绕过：Twig 表达式中使用 `{%` 的替代形式不存在，但攻击者可注入 `{{` 的等价形式如 `{{` 前加 BOM/零宽字符使 preg_match 失配而 Twig 解析器仍识别），且未覆盖 `include`、`import`、`filter` 等危险标签，属于典型可绕过弱防御，不构成有效防护。
+4. Sink 危害：第 27 行将外部内容作为模板编译执行，攻击者可在清单中写入 SSTI payload 实现任意代码执行/文件读取（CWE-1336 模板注入）。
+5. 第二入口检查：全文无其他路由、参数或间接调用通道；唯一外部输入即第 12 行的清单文件读取，所有污点均汇入第 27 行同一 sink，结论成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 模板引擎注入（SSTI）：外部清单文件内容未经有效中和即作为 Twig 模板编译渲染", "risk_level": "Critical", "source": "line 12: file() 读取的外部清单文件内容", "sink": "line 27: twig->createTemplate($pattern)->render()", "explanation": "污点边界：本文件无 request/input 等显式 web 入口，第 12 行 file() 读取的清单文件承载外部提交的不可信数据，为等效污点源；主数据流：line 12 读入 $lines -> line 20 切分得到 $pattern -> line 27 createTemplate()->render() 编译执行，全程可达；防御评估：line 25 黑名单正则仅拦截 {{/{%/system/exec/passthru 字面量，可通过零宽字符/BOM 使正则失配而 Twig 解析器仍识别，且未覆盖 include/import/filter 等危险标签，属可绕过弱防御；第二入口检查：无其他路由/参数/间接调用通道，唯一外部输入为清单文件并全部汇入 line 27 同一 sink", "fix_suggestion": "line 27: 不要把文件内容当作模板编译，改为白名单映射到预定义常量模板，或对 $pattern 仅允许 [a-zA-Z0-9_/.-] 字符集后再做纯字符串替换"}
+```

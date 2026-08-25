@@ -1,0 +1,36 @@
+LANG: python
+```python
+# cache_codec.py — 缓存编解码模块
+# 由消息队列消费者回调调用，处理缓存同步事件（payload 为外部提交的序列化数据）
+import pickle
+
+def on_cache_event(payload):
+    """消费者回调：payload 来自上游队列（外部客户端可投递）"""
+    # 弱防御：仅黑名单过滤危险 pickle 全局名（可绕过）
+    blacklist = ["os.system", "subprocess", "builtins.eval"]
+    for bad in blacklist:
+        if bad in payload:
+            return None  # 简单丢弃
+
+    # 反序列化外部数据 -> 缓存条目
+    entry = pickle.loads(payload)          # sink: CWE-502
+    key = entry["key"]
+    value = entry["value"]
+
+    # 写入本地缓存表
+    _CACHE[key] = value
+    return key
+
+_CACHE = {}
+```
+
+1. 第 6 行：污点边界——本文件无 request/input/environ 等显式 web 入口；唯一入口是第 7 行回调参数 `payload`，它是消息队列消费者收到的消息体，由外部客户端投递，必须按不可信数据处理，是等效污点源。
+2. 第 9-12 行：唯一的“防御”是基于子串匹配的黑名单，仅覆盖 `os.system`、`subprocess`、`builtins.eval` 三个字面量。绕过方式极多：pickle opcode 可通过 `__reduce__` 调用任意可导入对象，如 `eval` 的别名、`os.popen`、`posix.system`、`importlib` 动态导入、或用 base64/拼接构造属性链（如 `o.s.system` 不命中但经 getattr 解析后等价），黑名单完全无法枚举。
+3. 第 15 行：污点数据 `payload` 未经验证直接进入 `pickle.loads()`——这是 CWE-502 的经典危险 sink，反序列化不可信数据允许攻击者通过 `__reduce__` 执行任意代码（RCE）。
+4. 第 16-21 行：反序列化结果进一步写入全局 `_CACHE` 并返回 key，污染扩散到缓存层，后续读取该缓存的模块也会消费被污染对象，扩大影响面。
+5. 第二入口检查：全文仅一个函数、一个回调参数，无其他路由/参数/间接调用通道；所有外部数据均汇聚于 `payload -> pickle.loads` 这一条主链，可达性确认无疑。
+6. 结论：存在漏洞，source 到 sink 无任何有效防御。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data", "risk_level": "Critical", "source": "line 7: 回调参数 payload（消息队列消息体，外部可控）", "sink": "line 15: pickle.loads(payload)", "explanation": "主链: line 7 payload -> line 9-12 子串黑名单（仅三个字面量, 可用 os.popen/posix.system/importlib/getattr 属性链等绕过）-> line 15 pickle.loads 反序列化执行任意 __reduce__ 代码; 污染结果经 line 16-21 写入全局 _CACHE 扩散到缓存层; 第二入口检查: 全文仅此一个回调参数入口, 无其他路由或替代通道, 所有外部数据均汇入该 sink", "fix_suggestion": "line 15: 将 pickle 替换为 json.loads 或使用 hmac 签名校验 + restricted unpickler 白名单类"}
+```

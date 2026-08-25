@@ -1,0 +1,49 @@
+LANG: php
+```php
+<?php
+// src/Ops/ReportRenderer.php
+// 运维报告渲染模块：被上层调度服务调用，模板内容来自外部提交的工单附件
+
+namespace Ops;
+
+use Twig\Environment;
+use Twig\Loader\ArrayLoader;
+
+class ReportRenderer
+{
+    private Environment $twig;
+
+    public function __construct()
+    {
+        // 使用 ArrayLoader，模板字符串完全由调用方传入
+        $this->twig = new Environment(new ArrayLoader([]), [
+            'autoescape' => false,
+            'sandbox' => false,
+        ]);
+    }
+
+    /**
+     * 渲染一份运维巡检报告。
+     * @param string $template 上层服务从工单系统/消息队列取出的模板内容（不可信）
+     * @param array  $vars     渲染变量
+     */
+    public function renderReport(string $template, array $vars = []): string
+    {
+        // 弱防御：仅拦截明显的 system/exec 关键字，可被 {{['id']|filter('system')}} 等变体绕过
+        if (preg_match('/\b(system|exec|passthru)\b/i', $template)) {
+            throw new \RuntimeException('blocked keyword');
+        }
+        return $this->twig->createTemplate($template)->render($vars);
+    }
+}
+```
+
+1. 第 1 行污点边界：本文件无 request/argv/stdin 等显式 web 入口；污点源是第 24 行公开方法 `renderReport(string $template, ...)` 的参数 `$template`——注释已说明其来自工单系统/消息队列的外部提交内容，按不可信数据处理，是等效污点源。
+2. 第 33 行存在弱防御：正则仅匹配 `system|exec|passthru` 字面词。Twig 沙箱未启用（第 16 行 `'sandbox' => false`），攻击者可用 `{{['cat /etc/passwd']|sort|join}}{{['sh','_']|join}}`、`|map('system')` 变体或 `{{_self.env.registerUndefinedFilterCallback("exec")}}` 等方式绕过黑名单，防御无效。
+3. 第 35 行 `createTemplate($template)` 将参数直接作为 Twig 模板编译并执行，`$template` 从第 24 行参数未经有效净化直达该 sink，构成完整的 source→sink 数据流，实现服务端模板注入（SSTI），可导致任意代码执行。
+4. 防御覆盖面核查：全文仅有第 33 行一处过滤，且为可绕过黑名单；`$vars` 数组经正常变量渲染不直接进入模板编译层，非主要风险通道。
+5. 第二入口检查：文件内无路由注册、无 HTTP 处理器、无其他读取外部数据的语句；唯一替代通道是构造函数外的类复用（同一 sink），结论不变——漏洞成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 服务端模板注入(SSTI)：Twig createTemplate 直接编译不可信模板字符串", "risk_level": "Critical", "source": "line 24: renderReport 的参数 $template（上层工单/队列传入的外部数据）", "sink": "line 35: $this->twig->createTemplate($template)->render($vars)", "explanation": "主链：line 24 参数 $template -> line 33 正则黑名单(仅拦 system/exec/passthru 字面词，可用 |map/filter/registerUndefinedFilterCallback 等变体绕过) -> line 35 createTemplate 编译执行 -> SSTI 任意代码执行；防御核查：全文仅 line 33 一处弱黑名单且 sandbox 关闭(line 16)，无有效净化；第二入口检查：文件内无路由/HTTP 处理器/其他外部读取点，替代通道仅为同一 sink 的其他调用方，不影响结论", "fix_suggestion": "line 35: 不将外部字符串作为模板编译，改用固定模板+白名单变量渲染，或启用 Twig Sandbox 扩展并以白名单策略限制标签/过滤器/函数"}
+```

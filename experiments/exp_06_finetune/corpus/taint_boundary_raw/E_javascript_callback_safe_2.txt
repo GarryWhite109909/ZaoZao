@@ -1,0 +1,62 @@
+LANG: javascript
+```javascript
+// report-export-worker.js
+// 报表导出工具：由上层 API 服务通过消息队列下发导出任务，
+// 本模块作为消费者回调处理任务消息，不直接暴露任何网络入口。
+'use strict';
+
+const path = require('path');
+const fs = require('fs');
+const { worker } = require('./mq-client'); // 内部消息队列客户端
+
+// 允许导出的报表类型白名单（唯一合法的模板标识集合）
+const ALLOWED_REPORTS = new Set(['sales', 'inventory', 'finance']);
+
+// 导出文件统一存放目录，禁止逃逸
+const EXPORT_ROOT = path.resolve(__dirname, 'exports');
+
+worker.consume('report.export', async (task) => {
+  // task = { reportId: string, requestId: string }，来自外部提交的任务载荷
+  const { reportId, requestId } = task;
+
+  // 防御 1：白名单校验模板标识，非法值直接拒绝
+  if (typeof reportId !== 'string' || !ALLOWED_REPORTS.has(reportId)) {
+    throw new Error(`unknown reportId: ${reportId}`);
+  }
+
+  // 防御 2：requestId 仅允许字母数字与连字符，阻断路径分隔符与 .. 序列
+  if (!/^[A-Za-z0-9-]{1,64}$/.test(requestId)) {
+    throw new Error('invalid requestId');
+  }
+
+  const safeName = `${reportId}-${requestId}.csv`;
+  const targetPath = path.join(EXPORT_ROOT, safeName);
+
+  // 防御 3：解析后确认最终路径仍位于导出根目录内（防符号链接/拼接绕过）
+  if (!path.resolve(targetPath).startsWith(EXPORT_ROOT + path.sep)) {
+    throw new Error('path traversal detected');
+  }
+
+  const rows = await generateReport(reportId); // 内部查询，参数为白名单值
+  fs.writeFileSync(targetPath, rows.join('
+'));
+});
+```
+
+分析：
+
+1. **污点边界**：本文件没有任何 request/argv/stdin 等显式入口；第 17 行 `worker.consume('report.export', async (task) => {...})` 的回调参数 `task` 是消息队列消费者收到的外部任务载荷，承载上层服务转发的用户可控数据（`reportId`、`requestId`），必须按不可信输入处理，是本文件的等效污点源。
+
+2. **Source→Sink 数据流**：第 18 行解构出 `reportId` 与 `requestId`，二者在第 28 行拼入 `safeName`，经 `path.join` 到达第 36 行 `fs.writeFileSync(targetPath, ...)` 这一任意文件写入 sink。若无防御，攻击者可提交 `reportId = '../../etc/cron.d/x'` 或 `requestId = '..\\..\\evil'` 实现路径穿越写文件（CWE-22）。
+
+3. **防御有效性——白名单**：第 22 行对 `reportId` 使用 `Set` 精确匹配三个合法枚举值，属于白名单校验而非黑名单/正则过滤，无法被编码、截断或大小写变体绕过；位置在数据进入路径拼接之前，覆盖了 `reportId` 的全部攻击面。
+
+4. **防御有效性——严格格式校验**：第 26 行对 `requestId` 使用锚定正则 `^[A-Za-z0-9-]{1,64}$`，字符集不含 `/`、`\`、`.`，从构造上排除 `..` 与路径分隔符；虽是正则，但因完全锚定且字符集极小，不存在绕过空间，且长度上限防止超长名攻击。
+
+5. **防御有效性——规范化后路径 containment 检查**：第 31 行在写入前用 `path.resolve` 解析最终绝对路径并验证其仍位于 `EXPORT_ROOT` 下，作为纵深防御兜底，即使前两层校验被未来修改破坏也能拦截逃逸；三层防御串联，覆盖完整攻击面。
+
+6. **第二入口检查**：全文仅此一个消费者回调入口，无其他路由、定时器或间接调用点；`generateReport(reportId)` 接收的是已过白名单的值且为内部函数非 sink；无替代通道可绕过上述防御，故不存在 CWE-22 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第17行消息队列回调参数 task 中的 reportId 与 requestId，流向第36行 fs.writeFileSync 的路径拼接; reportId 经第22行 Set 白名单精确枚举校验，非黑名单不可绕过; requestId 经第26行全锚定正则限定为字母数字连字符，排除路径分隔符与 .. 序列; 第31行 path.resolve 后 containment 检查作为纵深防御确保最终路径不逃逸 EXPORT_ROOT; 三层防御位置均在 sink 之前且覆盖全部输入字段; 全文仅此一个队列消费入口，无其他路由或间接调用通道，不存在可绕过的第二入口", "fix_suggestion": "no fix needed"}
+```

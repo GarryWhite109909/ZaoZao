@@ -1,0 +1,67 @@
+LANG: php
+```php
+<?php
+declare(strict_types=1);
+
+namespace Acme\Webhook;
+
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+
+/**
+ * 出站 Webhook 发送器。
+ * 被上层服务调用：上层从消息队列取出任务后，将目标地址与载荷传入本模块。
+ */
+final class OutboundSender
+{
+    /** 允许的通知类型白名单（第 16 行） */
+    private const ALLOWED_EVENTS = ['order.created', 'order.paid', 'user.signup'];
+
+    private Client $http;
+
+    public function __construct(?Client $client = null)
+    {
+        $this->http = $client ?? new Client(['timeout' => 5]);
+    }
+
+    /**
+     * @param string $event 事件名（外部可控）
+     * @param array<string,mixed> $payload 载荷（外部可控）
+     * @return bool 是否成功投递
+     */
+    public function send(string $event, array $payload): bool
+    {
+        // 白名单校验：事件名必须命中固定集合，否则直接拒绝（第 31 行）
+        if (!in_array($event, self::ALLOWED_EVENTS, true)) {
+            return false;
+        }
+        // 目标 URL 由服务端配置决定，不取自参数；载荷仅作为 JSON body 序列化，
+        // 不参与 URL 拼接、不进入任何反序列化/命令执行 sink
+        try {
+            $this->http->post(
+                'https://hooks.example.internal/notify',
+                ['json' => ['event' => $event, 'data' => $payload]]
+            );
+            return true;
+        } catch (GuzzleException) {
+            return false;
+        }
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是公开方法 `send()` 的两个参数 `$event` 与 `$payload`（第 27-28 行），它们承载上层调用者从队列/外部提交的内容，必须按不可信数据处理。
+
+2. 数据流一：`$event` → 第 31 行 `in_array($event, self::ALLOWED_EVENTS, true)` 白名单严格比较 → 通过后仅写入第 40 行 `'json'` 数组。Guzzle 的 `json` 选项使用 `json_encode` 原生序列化，数据只作为 HTTP body 的 JSON 字符串传输，不会拼接进 URL、不会被 eval/unserialize 执行——CWE-502 所需的反序列化 sink 根本不存在。
+
+3. 数据流二：`$payload` 未做任何过滤直接进入第 40 行 JSON body，但同样仅被 `json_encode` 安全编码为字符串字面量，攻击者无法借此改变请求目标或注入可执行结构；不存在 `unserialize()`、`yaml_parse()` 等危险反序列化调用。
+
+4. 防御有效性：白名单校验位于第 31 行，处于参数入口到唯一对外动作之间，位置正确；采用 `true` 严格模式排除类型混淆绕过；集合为编译期常量而非黑名单/正则，无法枚举绕过，覆盖了 `$event` 的全部攻击面；`$payload` 无需校验因其不触达任何代码执行 sink。
+
+5. 第二入口检查：文件内无路由注册、无全局变量读取、无其他公开方法；构造函数的 `$client` 仅用于依赖注入测试替身，不承载外部业务数据；因此不存在替代污点通道。
+
+6. 结论：外部可控数据全部终止于原生安全的 JSON 编码 API，无反序列化 sink 可达，CWE-502 不成立。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界为 send() 的参数 event 与 payload（第 27-28 行），等效于外部提交内容；流一：event 经第 31 行 in_array 严格白名单校验后进入第 40 行 Guzzle json 选项，由 json_encode 原生安全编码，不触达 unserialize/eval 等 CWE-502 sink；流二：payload 直接进入 json body，同样仅被 json_encode 序列化为字符串，无法改变请求目标或注入可执行结构；防御为编译期常量白名单且开启严格模式，非黑名单/正则，不可绕过，位置在入口与 sink 之间覆盖完整攻击面；第二入口检查：文件无路由注册、无全局输入读取、无其他公开方法，构造函数 client 仅作依赖注入，不存在替代污点通道", "fix_suggestion": "no fix needed"}
+```

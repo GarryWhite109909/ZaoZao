@@ -1,0 +1,60 @@
+LANG: javascript
+```javascript
+// ops-runner.js —— 运维命令封装库，被上层服务调用：消费任务队列消息并执行白名单运维命令，
+// 执行结果会渲染进内部状态页（HTML），因此输出侧必须防 XSS。
+'use strict';
+
+const { execFile } = require('child_process');
+const EventEmitter = require('events');
+
+const COMMAND_WHITELIST = {
+  'disk-usage': ['df', ['-h']],
+  'service-status': ['systemctl', ['status']],
+  'log-tail': ['tail', ['-n', '100']],
+};
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+class OpsRunner extends EventEmitter {}
+
+const runner = new OpsRunner();
+
+// 队列消费者回调：message.payload 为外部提交的任务内容，必须按不可信数据处理
+runner.on('job', (message) => {
+  const task = message && message.payload;
+  if (!task || typeof task.name !== 'string') return;
+
+  const entry = COMMAND_WHITELIST[task.name]; // 第 26 行：白名单精确匹配，任意命令名直接被丢弃
+  if (!entry) {
+    runner.emit('error', new Error(`unknown command: ${task.name}`));
+    return;
+  }
+
+  // 参数数组形式执行，不经 shell 解析；额外参数仅允许字母数字，防止注入
+  const extraArgs = Array.isArray(task.args)
+    ? task.args.filter((a) => /^[A-Za-z0-9._/-]+$/.test(String(a)))
+    : [];
+
+  execFile(entry[0], entry[1].concat(extraArgs), { shell: false }, (err, stdout) => {
+    const html = `<pre>${escapeHtml(stdout || '')}</pre>`; // 输出进 HTML 前做完整实体转义
+    runner.emit('report', html);
+  });
+});
+
+module.exports = runner;
+```
+
+1. 污点边界：本文件没有任何 request/input 等显式 web 入口；第 22 行 `runner.on('job', ...)` 的回调参数 `message` 是队列消费者收到的消息体，其 `payload.name`、`payload.args` 由外部提交方控制，是等效污点源，必须按不可信处理。
+2. 数据流一（命令执行）：第 24 行 `task.name` → 第 26 行白名单查表。该防御为白名单校验，类型正确（只接受枚举键，未命中即拒绝）；位置正确（在到达 `execFile` 的 sink 之前）；覆盖完整——命令名不可能携带注入载荷进入执行路径。
+3. 数据流二（额外参数）：第 31 行 `task.args` 经字符白名单正则 `/^[A-Za-z0-9._/-]+$/.test(...)` 过滤后拼入参数数组；且第 33 行使用 `execFile` 参数数组形式并显式 `shell: false`，不经过 shell 解释器，分号、反引号、管道等元字符既被输入过滤排除，也无解释层可利用，双重防御覆盖完整攻击面。
+4. 数据流三（XSS/CWE-79 方向）：第 34 行命令 stdout 被嵌入 HTML 字符串，这是本文件唯一的 CWE-79 相关 sink；第 35 行 `escapeHtml` 对 `& < > " '` 五类危险字符全部实体转义，属于正确转义型防御，位置在拼接前、覆盖 stdout 全部内容，攻击者无法通过命令输出注入脚本标签或事件属性。
+5. 第二入口检查：文件仅注册一个 `job` 监听器，无其他事件名、无导出的可变配置接口、无间接调用路径；`COMMAND_WHITELIST` 为模块内常量不可被外部篡改。所有 source→sink 流均被有效防御覆盖，不存在绕过通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第22行队列消费回调的 message.payload（name与args均为外部可控）；流一 task.name 在第26行经白名单精确匹配后才进入 execFile，类型/位置/覆盖均正确；流二 task.args 经第31行字符白名单过滤并以第33行 execFile 参数数组加 shell:false 执行，无 shell 解释层可利用；流三 stdout 在第35行嵌入 HTML 前经 escapeHtml 对五类危险字符完整转义，CWE-79 攻击面被完全覆盖；第二入口检查确认全文件仅有 job 一个监听器、白名单为模块常量不可篡改，无替代通道", "fix_suggestion": "no fix needed"}
+```

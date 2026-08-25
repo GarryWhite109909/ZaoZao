@@ -1,0 +1,53 @@
+LANG: javascript
+```javascript
+// config-ingest.js — 消费配置提交队列消息，解析并应用外部提交的 YAML 配置
+const { execFileSync } = require('child_process');
+const yaml = require('js-yaml');
+
+// 允许通过配置触发的部署钩子命令白名单（仅限内部脚本名，不接受任意字符串）
+const ALLOWED_HOOKS = new Set(['lint', 'validate', 'schema-check']);
+// 钩子脚本所在目录固定，且白名单值不参与路径拼接
+const HOOK_DIR = '/opt/deploy/hooks/';
+
+function handleConfigMessage(message) {
+  // message.body 为外部提交的配置文件内容（不可信）
+  const body = message.body;
+  if (typeof body !== 'string' || body.length > 65536) {
+    throw new Error('invalid config payload');
+  }
+
+  const manifest = yaml.safeLoad(body); // safeLoad 不实例化任意对象
+
+  const hook = manifest && manifest.post_deploy_hook;
+  if (typeof hook !== 'string') {
+    return { applied: false, reason: 'no hook' };
+  }
+
+  // 白名单校验：hook 必须完全匹配预定义集合成员
+  if (!ALLOWED_HOOKS.has(hook)) {
+    throw new Error('hook not allowed');
+  }
+
+  // execFileSync 使用数组参数形式，不经 shell 解析；
+  // 且参数已被白名单约束为固定枚举值
+  execFileSync(HOOK_DIR + 'run-hook.sh', [hook], {
+    shell: false,
+    timeout: 30000,
+  });
+
+  return { applied: true };
+}
+
+module.exports = { handleConfigMessage };
+```
+
+1. 第 12 行：本文件没有 request/input 等显式 web 入口；污点边界是消息队列消费者回调 `handleConfigMessage(message)` 的 `message.body`（第 13 行），它承载外部提交的配置文件内容，属于公开接口的等效污点源，必须按不可信处理。
+2. 第 15-17 行：先做类型与长度校验，随后第 20 行 `yaml.safeLoad` 安全解析——safeLoad 不构造任意 JS 对象，消除了反序列化注入面。
+3. 第 22-27 行：从 `manifest.post_deploy_hook` 提取的污点数据流向 sink 前经过第 30 行的白名单校验：`ALLOWED_HOOKS.has(hook)` 要求完全匹配预定义枚举集合，非字符串直接拒绝。这是白名单型防御，类型正确（精确集合匹配而非黑名单/正则/替换）；位置正确（位于第 34 行 sink 之前、所有数据流必经之处）；覆盖完整攻击面——hook 是唯一进入命令参数的外部字段，manifest 其他字段未被使用。
+4. 第 34 行 sink：`execFileSync` 以数组形式传参且 `shell: false`，即使有残留特殊字符也不会经 shell 解释；叠加白名单后实际可传入的值只有三个固定脚本名，无命令注入可能。
+5. 第二入口检查：模块仅导出 `handleConfigMessage` 一个函数，无其他路由/参数/间接调用通道；`HOOK_DIR` 与白名单均为硬编码常量，无替代污染路径。
+6. 结论：source→sink 数据流被白名单 + 无 shell 数组执行双重防御覆盖，不存在可达的 CWE-78 注入链。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点是队列回调 message.body（第13行），经 yaml.safeLoad 安全解析后取 post_deploy_hook 字段流向 execFileSync（第34行）；该流在第30行被 ALLOWED_HOOKS 精确白名单校验覆盖，非成员直接抛错，且 execFileSync 采用数组参数加 shell:false 不经 shell 解释，防御类型正确、位于 sink 前必经路径、覆盖全部攻击面；模块无第二入口或替代调用通道，白名单与目录均为硬编码常量，故不存在 CWE-78 可达链", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,47 @@
+LANG: go
+```go
+// Package cachecode 提供缓存条目的编解码与落盘能力。
+// 上层服务在消费队列消息后调用本包函数，参数内容来自外部提交的数据。
+package cachecode
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// DecodeAndPersist 将缓存键对应的值解码后写入磁盘快照目录。
+// key 为缓存键（可能由客户端提交的会话标识派生），val 为缓存值。
+func DecodeAndPersist(key, val string) error {
+	// 弱防御：仅拦截路径分隔符，未处理反斜杠、编码变体与绝对路径
+	if strings.Contains(key, "/") {
+		key = strings.ReplaceAll(key, "/", "_")
+	}
+	snapshotDir := filepath.Join(os.TempDir(), "cache-snapshots")
+	target := filepath.Join(snapshotDir, key+".json")
+	return os.WriteFile(target, []byte(val), 0o644)
+}
+
+// LoadSnapshot 按缓存键读取磁盘上的历史快照并返回内容。
+func LoadSnapshot(key string) ([]byte, error) {
+	if strings.Contains(key, "..") {
+		return nil, os.ErrNotExist // 黑名单式检查，可被 URL 编码或嵌套绕过
+	}
+	p := filepath.Join(os.TempDir(), "cache-snapshots", key)
+	return os.ReadFile(p)
+}
+```
+
+1. 第 1 步——污点边界：本文件无 request/environ/stdin 等显式 web 入口，但第 12 行 `DecodeAndPersist(key, val)` 与第 22 行 `LoadSnapshot(key)` 是公开导出函数，注释明确其参数承载上层服务消费的外部提交数据，故 `key`/`val` 为等效污点源，必须按不可信处理。
+
+2. 第 2 步——流一：第 12 行参数 `key` → 第 15 行仅做 `/` 替换（可绕过：Windows 反斜杠 `\`、`%2F` 解码变体、绝对路径如 `C:\evil` 均不受影响）→ 第 17 行拼入 `target` → 第 18 行 `os.WriteFile(target, ...)` 为 CWE-22 写 sink；攻击者可用 `..\..\x` 或反斜杠将任意文件覆盖。`val` 同样直接写入该可控路径。
+
+3. 第 3 步——流二：第 22 行参数 `key` → 第 23 行黑名单仅检查字面量 `..`（可绕过：URL 编码 `%2e%2e%2f` 在上层解码后传入、或使用 `....//` 等嵌套形式、或直接传绝对路径）→ 第 26 行 `filepath.Join` 不清洗 `..` → 第 27 行 `os.ReadFile(p)` 为 CWE-22 读 sink，可读取任意文件。
+
+4. 第 4 步——防御评估：两处防御均为黑名单/字符串替换类弱防御，位置在拼接前但覆盖面不足（未校验最终路径是否仍在 snapshotDir 内），不构成有效防御。
+
+5. 第 5 步——第二入口检查：文件内无路由注册、HTTP 处理器或其他输入通道；唯一替代通道是两个导出函数的参数本身，二者均可达各自 sink，故确认存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径遍历/任意文件读写", "risk_level": "High", "source": "line 12: DecodeAndPersist 的 key 参数; line 22: LoadSnapshot 的 key 参数", "sink": "line 18: os.WriteFile(target, ...) ; line 27: os.ReadFile(p)", "explanation": "流一: key 经第15行仅替换正斜杠的弱过滤(反斜杠/绝对路径/编码变体可绕过)后于第17行拼入 target 并在第18行写入, 可实现任意文件覆盖; 流二: key 经第23行仅检查字面量 .. 的黑名单(URL编码/嵌套序列/绝对路径可绕过)后经第26行 Join 于第27行读取, 可实现任意文件读取; 文件内无其他入口, 两条导出函数参数即全部污点源且均可达 sink", "fix_suggestion": "line 17: 对 key 先做白名单字符校验(仅允许字母数字下划线), 再用 filepath.Rel 验证最终路径仍位于 snapshotDir 内, 否则拒绝"}
+```

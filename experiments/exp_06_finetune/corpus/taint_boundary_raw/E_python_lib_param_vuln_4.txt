@@ -1,0 +1,51 @@
+LANG: python
+```python
+"""report_exporter.py — 报表导出工具模块。
+
+被上层 API 服务调用：服务层将用户提交的筛选条件（含自定义聚合规则）
+序列化后传入本模块，本模块负责反序列化并执行导出。
+"""
+
+import pickle
+import base64
+import logging
+
+logger = logging.getLogger(__name__)
+
+# 允许的报表类型白名单（仅用于日志记录，不参与安全校验）
+KNOWN_REPORTS = {"sales", "inventory", "finance"}
+
+
+def export_report(report_type: str, filter_blob: str) -> bytes:
+    """导出报表。filter_blob 是上层服务透传的 base64 编码的筛选条件对象。"""
+    if report_type not in KNOWN_REPORTS:
+        logger.warning("unknown report type requested: %s", report_type)
+
+    # 解码并还原筛选条件对象
+    raw = base64.b64decode(filter_blob)
+    filters = pickle.loads(raw)  # 反序列化用户可控数据
+
+    # 简单字段过滤：剔除已知的危险键（可绕过）
+    if isinstance(filters, dict):
+        for bad_key in ("__reduce__", "__class__"):
+            filters.pop(bad_key, None)
+
+    return _render(report_type, filters)
+
+
+def _render(report_type: str, filters) -> bytes:
+    """按类型渲染报表字节流（示意实现）。"""
+    payload = f"REPORT:{report_type}|FILTERS:{filters!r}".encode("utf-8")
+    return base64.b64encode(payload)
+```
+
+1. **污点边界**：本文件没有任何 request/input/environ 等显式 web 入口；但第 16 行 `export_report(report_type, filter_blob)` 是公开接口，`filter_blob` 由上层 API 服务从用户请求透传而来，属于等效污点源，必须按不可信数据处理。
+2. **source→sink 数据流**：第 16 行参数 `filter_blob` → 第 22 行 `base64.b64decode` 得到 `raw` → 第 23 行 `pickle.loads(raw)` 直接反序列化，到达 CWE-502 危险 sink。pickle 反序列化会执行对象中的 `__reduce__` 等构造逻辑，攻击者构造恶意 pickle 字节码即可实现任意代码执行。
+3. **防御分析**：第 20 行的 `KNOWN_REPORTS` 检查只作用于 `report_type` 且仅用于日志告警，不阻断流程，不构成对 `filter_blob` 的防御；第 26-28 行对反序列化结果做危险键删除——这是典型的无效防御：pickle 的代码执行发生在 `pickle.loads` 内部（第 23 行），早于第 26 行的键清理执行，时序上完全无法拦截；且恶意类可通过属性名变体、嵌套对象、`__setstate__` 等方式绕过黑名单。
+4. **覆盖面结论**：全程无任何有效防御（无签名校验、无 safe unpickler、无 schema 校验），source 到 sink 直达。
+5. **第二入口/替代通道检查**：文件内唯一公开函数为 `export_report`，`_render` 为内部函数且其参数 `filters` 已是污染后的数据；不存在其他路由或入口，但单一入口即足以构成完整漏洞链。
+6. **最终结论**：存在 CWE-502 反序列化不可信数据漏洞，风险等级 Critical（可导致远程代码执行）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data", "risk_level": "Critical", "source": "line 16: export_report 参数 filter_blob（上层服务透传的用户可控数据）", "sink": "line 23: pickle.loads(raw)", "explanation": "主链：line 16 filter_blob -> line 22 b64decode -> line 23 pickle.loads 触发任意代码执行；防御缺失：line 20 白名单只覆盖 report_type 且不阻断；line 26-28 黑名单删键发生在反序列化之后且可被 __setstate__/嵌套对象绕过，均非有效防御；第二入口检查：文件内无其他路由或公开入口，_render 仅接收已污染数据，单一入口即可完成攻击链", "fix_suggestion": "line 23: 用 json.loads 替代 pickle.loads，或改用 hmac 签名校验 + 受限 Unpickler 白名单类"}
+```

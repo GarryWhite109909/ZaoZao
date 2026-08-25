@@ -1,0 +1,49 @@
+LANG: java
+```java
+package com.cachehub.codec;
+
+import freemarker.template.Configuration;
+import freemarker.template.Template;
+import java.io.*;
+import java.nio.file.*;
+
+/**
+ * 缓存编解码模块：从磁盘上的缓存快照文件恢复键值条目。
+ * 快照由上层同步服务写入，内容来自远端集群，视为不可信数据。
+ */
+public class SnapshotCodec {
+
+    private final Configuration fmCfg = new Configuration(Configuration.VERSION_2_3_31);
+
+    // 恢复单个缓存条目：value 中若含模板占位符则渲染后写回
+    public String decodeEntry(Path snapshotFile, String key) throws Exception {
+        byte[] raw = Files.readAllBytes(snapshotFile);          // 外部可控：快照文件内容
+        String payload = new String(raw, "UTF-8");
+        int idx = payload.indexOf(key + "=");
+        if (idx < 0) return null;
+        int start = idx + key.length() + 1;
+        int end = payload.indexOf('
+', start);
+        if (end < 0) end = payload.length();
+        String value = payload.substring(start, end).trim();
+
+        // 弱防御：仅剔除字面 ${ 与 <# 字样（可被 ${'${'} 或 <#assign 拼接绕过）
+        value = value.replace("${", "").replace("<#", "");
+
+        Template tpl = new Template("entry", new StringReader(value), fmCfg); // 污点进入模板
+        StringWriter out = new StringWriter();
+        tpl.process(null, out);                                  // CWE-1336: SSTI 执行任意指令
+        return out.toString();
+    }
+}
+```
+
+1. 第 1 步（污点边界）：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 15 行 `Files.readAllBytes(snapshotFile)` 读入的缓存快照文件内容——该快照由外部集群同步产生、承载外部提交的缓存值，按不可信数据处理，是等效污点源。
+2. 第 2 步：第 16-23 行对文件内容做字符串切分得到 `value`，污点原样传递，无任何校验。
+3. 第 3 步：第 26 行的 `replace("${","").replace("<#","")` 是可绕过的弱防御——FreeMarker 支持 `${'${'}`、`${"<"+"#"}` 等表达式拼接重构出被过滤序列，或直接使用 `[#ftl]` 方括号语法完全避开 `<#` 前缀。
+4. 第 4 步：第 28 行将未净化的 `value` 构造为 FreeMarker `Template`，第 30 行 `tpl.process` 触发模板执行，攻击者可通过快照注入 `<#assign ex="freemarker.template.utility.Execute"?new()>${ex("id")}` 实现任意命令执行，构成 CWE-1336 模板注入。
+5. 第 5 步（第二入口检查）：全文件唯一入口为 `decodeEntry(Path,String)`，无其他路由/参数/间接调用通道；但任何调用方传入的快照路径均可携带恶意内容，替代通道即快照文件本身，结论成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 FreeMarker 服务端模板注入", "risk_level": "Critical", "source": "line 15: Files.readAllBytes 读取的外部快照文件内容", "sink": "line 30: tpl.process 执行含污点数据的模板", "explanation": "主链：line 15 读取不可信快照 -> line 23 提取 value -> line 26 仅做 replace 弱过滤，可用 ${'${'} 拼接或 [#ftl] 方括号语法绕过 -> line 28 构造 Template -> line 30 process 渲染导致任意代码执行；第二入口检查：文件内无其他入口，替代通道为快照文件本身承载的外部数据，可达性确认", "fix_suggestion": "line 28: 不将不可信数据作为模板编译，改为将 value 作为数据模型变量传入固定模板，或使用 StringTemplateOutput/纯文本渲染"}
+```

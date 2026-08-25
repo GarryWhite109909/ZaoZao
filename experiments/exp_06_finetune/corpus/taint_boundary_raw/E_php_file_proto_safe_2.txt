@@ -1,0 +1,56 @@
+LANG: php
+```php
+<?php
+declare(strict_types=1);
+
+namespace App\Asset;
+
+/**
+ * 静态资源定位模块：读取资源清单文件（由运维平台导出、经文件通道投递），
+ * 将清单中的模板行渲染为服务器上的实际路径。被上层服务调用。
+ */
+class AssetLocator
+{
+    private const ALLOWED_KEYS = ['asset_name', 'version', 'env'];
+    private const NAME_RE = '/^[A-Za-z0-9_][A-Za-z0-9_.\/-]{0,127}$/';
+
+    public function locate(string $manifestPath): array
+    {
+        $results = [];
+        foreach (file($manifestPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+            // 清单行格式：key=value;key=value
+            $pairs = [];
+            foreach (explode(';', $line) as $kv) {
+                [$k, $v] = array_pad(explode('=', $kv, 2), 2, '');
+                if (!in_array($k, self::ALLOWED_KEYS, true)) {
+                    continue; // 白名单键：清单中未声明的键一律丢弃，杜绝注入额外占位符
+                }
+                $pairs[$k] = $v;
+            }
+            if (!isset($pairs['asset_name']) || preg_match(self::NAME_RE, $pairs['asset_name']) !== 1) {
+                continue;
+            }
+            // 不做任何字符串拼接 eval/模板求值；仅做固定格式插值 + 路径规范化校验
+            $base = rtrim('/srv/static/' . $pairs['env'] ?? 'prod', '/');
+            $candidate = $base . '/' . ltrim($pairs['asset_name'], '/');
+            $real = realpath($candidate);
+            if ($real === false || !str_starts_with($real, '/srv/static/')) {
+                continue; // 目录穿越防御：解析后必须仍位于静态根目录内
+            }
+            $results[] = $real;
+        }
+        return $results;
+    }
+}
+```
+
+1. 第 12 行 `locate(string $manifestPath)` 与第 16 行 `file($manifestPath, ...)`：本文件没有任何 request/input/environ 等显式 web 入口；污点边界是被解析的清单文件内容——该文件由外部渠道投递，其每一行都承载外部可控数据，必须按不可信处理。
+2. 第 16–24 行：`$line`（污点）被拆分为键值对，第 21 行用 `in_array($k, self::ALLOWED_KEYS, true)` 做严格白名单过滤，非白名单键直接丢弃——这是白名单型防御而非黑名单/正则替换，类型正确且位置在数据进入后续处理之前。
+3. 第 26 行：值 `$pairs['asset_name']` 经第 27 行 `preg_match('/^[A-Za-z0-9_][A-Za-z0-9_.\/-]{0,127}$/')` 校验，字符集不含引号、花括号、反斜杠等模板/元字符，杜绝 CWE-1336 模板表达式注入所需的任何语法元素；不匹配即整行跳过，覆盖完整攻击面。
+4. 第 29–33 行：候选路径不做任何动态求值或字符串拼接到危险函数（无 eval/include/unlink），仅做纯数据插值；第 33–34 行 `realpath` + `str_starts_with($real, '/srv/static/')` 规范化后前缀校验，封死 `../` 目录穿越。sink 为返回给上层服务的路径数组，到达 sink 前已通过白名单+正则+路径规范化三重有效防御。
+5. 第二入口检查：文件内无其他函数、无 include 动态加载、无对外暴露的替代参数通道；唯一 source 是第 16 行读入的清单文件内容，所有派生变量均经过上述防御后才流向 sink。
+6. 结论：source→sink 全链路防御类型正确（白名单+白名单正则+realpath 前缀断言）、位置正确（均在 sink 之前）、覆盖完整（键与值两个维度均已覆盖），不存在可绕过路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第16行 file() 读入的清单文件内容（无显式web入口，等效外部可控输入）；流1：清单行键名在第21行经 ALLOWED_KEYS 严格白名单过滤，非白名单键丢弃；流2：asset_name 值在第27行经白名单字符集正则校验，不含模板元字符，阻断CWE-1336模板注入语法；流3：候选路径在第33-34行经 realpath 规范化加 /srv/static/ 前缀断言，阻断目录穿越；全链路无 eval/include 等动态求值 sink；第二入口检查：文件内无其他函数或替代参数通道，唯一 source 即清单文件内容且全部受防御覆盖", "fix_suggestion": "no fix needed"}
+```

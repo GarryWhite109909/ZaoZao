@@ -1,0 +1,52 @@
+LANG: php
+```php
+<?php
+declare(strict_types=1);
+
+namespace App\Logging;
+
+use PhpAmqpLib\Message\AMQPMessage;
+use Symfony\Component\Process\Process;
+
+/**
+ * 日志格式化消费者：消费 audit.log.format 队列消息，
+ * 将外部提交的富文本渲染为终端日志并归档。
+ * 由上层队列服务调用，本文件不含任何 HTTP 入口。
+ */
+final class LogFormatConsumer
+{
+    /** 允许的渲染器白名单（第 20 行） */
+    private const RENDERERS = ['plain', 'ansi', 'html'];
+
+    public function __invoke(AMQPMessage $message): void
+    {
+        $payload = json_decode($message->getBody(), true, 512, JSON_THROW_ON_ERROR);
+        $text    = (string)($payload['text'] ?? '');
+        $mode    = (string)($payload['renderer'] ?? 'plain');
+
+        // 白名单校验：仅允许固定枚举值，杜绝注入
+        if (!in_array($mode, self::RENDERERS, true)) {
+            throw new \InvalidArgumentException('unsupported renderer');
+        }
+
+        // 文本内容不进入命令行，仅写入文件；文件名由服务端生成
+        $file = sprintf('/var/log/audit/%s.log', bin2hex(random_bytes(8)));
+        file_put_contents($file, strip_tags($text) . PHP_EOL);
+
+        // 唯一命令执行点：参数数组形式，不经 shell，无拼接
+        $process = new Process(['logger', '-t', 'audit-render', '--', $mode]);
+        $process->run();
+    }
+}
+```
+
+1. 污点边界：本文件没有 request/input 等显式 web 入口；唯一外部数据通道是第 24 行回调签名中的 AMQPMessage 参数——消息体是外部生产者提交的载荷，必须按不可信数据处理，等效污点源。
+2. 第 25 行 json_decode 解出 text 与 renderer 两个字段，均为外部可控。追踪到 sink：第 36-37 行 Process 构造函数是唯一命令执行 sink。
+3. 数据流验证：text 仅流向第 32 行 file_put_contents（写文件，非命令 sink），且经 strip_tags 清理；renderer 流向第 37 行命令参数，但第 29-31 行使用 in_array 严格比较对常量数组 RENDERERS=['plain','ansi','html'] 做白名单校验，任何含 shell 元字符的值都会抛异常终止，类型正确（枚举白名单而非黑名单/正则）、位置正确（sink 之前、所有分支必经）、覆盖完整（renderer 是到达该 sink 的唯一变量）。
+4. 第 37 行采用 Process 的参数数组形式，Symfony 底层不经 shell 解释、不做字符串拼接，即使参数被污染也无法注入额外命令，属于原生安全 API 的第二层防御。
+5. 第二入口检查：文件内无其他函数、无静态可调入口、无全局状态读取；__invoke 是唯一公开方法，text 与 renderer 之外不存在替代参数或间接调用路径。
+6. 结论：source→sink 全部链路均被白名单 + 参数数组执行双重防御覆盖，无可达注入路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界为第24行回调参数 AMQPMessage 消息体，解出 text 与 renderer 两个外部可控字段；text 仅流向第32行 file_put_contents 写文件且经 strip_tags 清理，不触及命令 sink；renderer 在第29-31行经 in_array 对常量白名单严格校验后才流向第37行 Process，类型为枚举白名单、位置在 sink 前必经路径、覆盖该 sink 唯一变量；第37行 Process 采用参数数组形式不经 shell 无拼接，构成原生安全 API 二层防御；文件内无第二入口、无其他路由或间接调用通道，全部链路防御有效", "fix_suggestion": "no fix needed"}
+```

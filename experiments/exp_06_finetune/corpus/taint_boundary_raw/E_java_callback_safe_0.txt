@@ -1,0 +1,53 @@
+LANG: java
+```java
+package com.opslib.cmd;
+
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+
+/**
+ * 运维命令封装库 —— 队列消费者回调模块。
+ * 被上层服务调用：从消息队列消费 XML 格式的运维任务描述，
+ * 解析后封装为受控命令执行。本文件仅含回调处理器本身。
+ */
+public final class OpsTaskConsumer {
+
+    /** 消息队列消费者回调：messageBody 为队列投递的外部载荷（不可信）。 */
+    public void onMessage(byte[] messageBody) throws Exception {
+        // 防御 XXE（CWE-611）：构建前显式关闭 DTD 与外部实体解析
+        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+        dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
+        dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+        dbf.setXIncludeAware(false);
+        dbf.setExpandEntityReferences(false);
+
+        Document doc = dbf.newDocumentBuilder()
+                          .parse(new java.io.ByteArrayInputStream(messageBody));
+        Element root = doc.getDocumentElement();
+        String taskName = root.getAttribute("task");
+        // taskName 仅用于白名单查找，不进入任何文件路径或实体展开
+        if (!ALLOWED_TASKS.contains(taskName)) {
+            throw new IllegalArgumentException("unknown task: " + taskName);
+        }
+        dispatch(taskName);
+    }
+
+    private static final java.util.Set<String> ALLOWED_TASKS =
+            java.util.Set.of("backup", "cleanup", "healthcheck");
+
+    private void dispatch(String task) { /* 内部固定命令映射，无外部数据 */ }
+}
+```
+
+1. 第 12 行 `onMessage(byte[] messageBody)` 是污点边界：本文件没有任何 request/input/environ 等显式 web 入口，但该回调参数是消息队列投递的事件载荷，承载外部提交的 XML 内容，按公开接口参数同等不可信处理，是等效污点源。
+2. 第 20 行 `parse(...)` 是 CWE-611 的 sink——XML 解析器在默认配置下会展开外部实体（file://、http://），攻击者可在载荷中注入 DOCTYPE 实现任意文件读取/SSRF。
+3. 第 15–19 行构成有效防御：`disallow-doctype-decl=true` 从语法层直接拒绝任何 DOCTYPE 声明，使实体定义根本无法存在；`external-general-entities=false` 与 `external-parameter-entities=false` 双重关闭内外部实体解析；`setXIncludeAware(false)` 与 `setExpandEntityReferences(false)` 封堵 XInclude 与引用展开旁路。这是原生安全 API 型防御（非黑名单/正则/字符串替换），类型正确。
+4. 防御位置正确且覆盖完整：四项特性全部设置在 `DocumentBuilderFactory` 上（第 15–19 行），先于第 20 行 `newDocumentBuilder().parse()` 执行，即 sink 使用的是已加固的工厂产物；DOCTYPE 禁用覆盖了所有 XXE 变体（一般实体、参数实体、 Billion Laughs 嵌套展开均需 DOCTYPE）。
+5. 第 24–27 行对解析出的 `task` 属性再做白名单校验后仅用于内部分发，不回流到 XML 解析或文件系统路径，无二次污染链。
+6. 第二入口检查：本文件无其他方法接收外部字节流，`dispatch` 为私有且不接触载荷；替代通道（如 SAX/StAX 直接解析）在本模块不存在。结论：source→sink 全链路被加固工厂阻断，无 XXE 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点是第12行消息队列回调参数 messageBody（事件载荷，等效污点源）；其流向第20行 DocumentBuilder.parse 这一 XXE sink 前，在第15-19行通过 disallow-doctype-decl、关闭 general/parameter external entities、禁用 XInclude 与 entity expansion 的原生安全 API 加固了 DocumentBuilderFactory，防御类型正确（非黑名单/正则）、位置正确（sink 使用加固工厂产物）、覆盖完整（DOCTYPE 禁用阻断全部实体变体）；第24-27行白名单校验 task 属性仅内部使用无回流；第二入口与替代通道检查：无其他接收外部数据的方法，dispatch 私有不触载荷，故不存在可绕过路径", "fix_suggestion": "no fix needed"}
+```

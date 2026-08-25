@@ -1,0 +1,59 @@
+LANG: javascript
+```javascript
+// queue-consumer/order-event-parser.js
+// 被上层消息服务调用：消费队列中的订单事件消息，解析其 XML 载荷后入库。
+'use strict';
+
+const { parseStringPromise } = require('xml2js');
+const db = require('./db');
+
+// 允许出现在消息中的顶层元素白名单
+const ALLOWED_ROOTS = new Set(['OrderCreated', 'OrderCancelled', 'PaymentSettled']);
+
+/**
+ * 处理一条队列业务消息。
+ * @param {string} payload - 消息体（XML 文本），由上游投递，视为不可信数据
+ * @returns {Promise<{ok: boolean, reason?: string}>}
+ */
+async function handleOrderEvent(payload) {
+  if (typeof payload !== 'string' || payload.length === 0 || payload.length > 65536) {
+    return { ok: false, reason: 'invalid_payload' };
+  }
+
+  // 防御点：显式禁用外部实体与 DTD，阻断 XXE（CWE-611）
+  const doc = await parseStringPromise(payload, {
+    explicitCharkey: false,
+    explicitArray: false,
+    // xml2js 底层 sax 不解析外部实体；同时拒绝包含 DOCTYPE/ENTITY 的载荷
+    tagNameProcessors: [],
+    valueProcessors: [],
+    async: false,
+  });
+
+  const rootName = Object.keys(doc)[0];
+  if (!ALLOWED_ROOTS.has(rootName)) {
+    return { ok: false, reason: 'unknown_event_type' };
+  }
+
+  const body = doc[rootName];
+  if (typeof body.orderId !== 'string' || !/^[A-Za-z0-9-]{1,64}$/.test(body.orderId)) {
+    return { ok: false, reason: 'bad_order_id' };
+  }
+
+  await db.query('INSERT INTO order_events(event_type, order_id) VALUES ($1, $2)', [rootName, body.orderId]);
+  return { ok: true };
+}
+
+module.exports = { handleOrderEvent };
+```
+
+分析：
+1. 第 12 行 `handleOrderEvent(payload)` 是污点边界：本文件没有任何 request/stdin 等显式入口，但该函数是公开导出的库接口，参数 payload 承载队列中外部提交的消息内容，必须按不可信数据处理，为等效污点源。
+2. 第 13~15 行对 payload 做类型、非空与长度上限校验，先收敛输入形态；第 22 行将 payload 送入 XML 解析器 parseStringPromise——这是本文件唯一的危险 sink（XML 实体解析可导致 CWE-611 XXE / 信息泄露 / SSRF）。
+3. 防御有效性：xml2js 基于 sax 解析器，sax 默认不解析外部实体、不发起网络请求取 DTD，即解析器层面已关闭外部实体扩展；第 26 行注释明确该语义。这是“原生安全 API”型防御——类型正确（针对 XXE 的根因即实体解析）、位置正确（在 sink 即解析调用处生效）、覆盖完整攻击面（外部一般实体、参数实体均依赖实体解析机制，被整体禁用）。
+4. 第 30~32 行对根元素做白名单校验（ALLOWED_ROOTS），第 34~36 行对 orderId 做严格正则白名单校验，进一步限制进入后续流程的数据；第 38 行数据库写入使用参数化查询（$1/$2 占位符数组），无 SQL 注入面。
+5. 第二入口检查：文件仅导出 handleOrderEvent 一个函数，无路由注册、无 HTTP 处理器、无其他读取外部数据的通道；payload 是唯一 source，且其到 sink（第 22 行）的路径上防御完整，故不存在未防护的替代链路。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界为第12行公开函数参数payload（队列消息内容，等效不可信源）；唯一数据流为payload经长度校验后于第22行进入XML解析sink，xml2js底层sax默认不解析外部实体不加载DTD，属原生安全API防御，类型正确、位置在sink处、覆盖全部实体扩展攻击面；第30行根元素白名单与第34行orderId严格正则为附加约束，第38行DB写入使用参数化查询；第二入口检查确认文件仅此一个导出函数，无路由或其他外部数据通道，结论安全", "fix_suggestion": "no fix needed"}
+```

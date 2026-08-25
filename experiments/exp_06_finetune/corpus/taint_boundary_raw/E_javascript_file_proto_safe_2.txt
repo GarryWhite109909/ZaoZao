@@ -1,0 +1,45 @@
+LANG: javascript
+```javascript
+// richTextFormatter.js — 富文本/日志格式化模块
+// 被上层服务调用：传入外部提交的 .rtf/.log 文件路径，解析后写入审计数据库
+const fs = require('fs');
+const { Pool } = require('pg');
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// 允许的日志级别白名单（唯一合法取值）
+const ALLOWED_LEVELS = ['INFO', 'WARN', 'ERROR', 'DEBUG'];
+
+async function formatAndStore(logFilePath) {
+  // 第 12 行：读取外部提交的日志文件，内容视为不可信输入
+  const raw = fs.readFileSync(logFilePath, 'utf8');
+
+  for (const line of raw.split('
+')) {
+    if (!line.trim()) continue;
+    const [ts, level, ...msgParts] = line.split('|');
+    // 第 17 行：白名单校验——level 必须精确匹配枚举值，否则丢弃该行
+    if (!ALLOWED_LEVELS.includes(level)) continue;
+    const message = msgParts.join('|').slice(0, 2000);
+
+    // 第 20 行：参数化查询（预编译占位符），消息内容仅作为绑定参数传递，
+    // 不参与 SQL 文本拼接，注入载荷无法改变查询结构
+    await pool.query(
+      'INSERT INTO audit_logs (ts, level, message) VALUES ($1, $2, $3)',
+      [ts, level, message]
+    );
+  }
+}
+
+module.exports = { formatAndStore };
+```
+
+1. 污点边界：本文件没有 request/input 等显式 web 入口；第 12 行 `fs.readFileSync(logFilePath)` 读取的文件内容由外部提交产生（上层服务接收用户上传的日志文件后落盘），其全部字节是等效污点源，必须按不可信处理。
+2. 数据流：第 14 行按行拆分 → 第 15 行按 `|` 解析出 ts/level/message → 第 18 行截断 → 第 21-22 行进入 sink `pool.query`。攻击者可在文件中植入形如 `x|INFO|'); DROP TABLE audit_logs;--` 的注入载荷。
+3. 防御验证（类型）：第 20-22 行使用 pg 驱动的参数化查询（$1/$2/$3 占位符 + 绑定数组），SQL 文本与数据彻底分离，驱动对绑定值做类型安全的转义/编码，属于有效防御而非黑名单/正则过滤。
+4. 防御验证（位置与覆盖面）：防御位于 sink 调用点本身，覆盖所有到达该 INSERT 的数据；第 17 行的白名单进一步保证 level 只能是四个枚举值之一，即使绕过也无法注入。message 中任何引号、分号、注释符都只作为字面量存储。
+5. 第二入口检查：模块仅导出 `formatAndStore` 一个函数，无路由、无 CLI 参数、无环境变量读取的报文通道；除该函数的 logFilePath 参数外不存在其他 source→sink 通路，pool 连接串来自部署配置非用户可控。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界：无显式web入口，第12行readFileSync读取的外部提交日志文件内容为等效污点源；数据流：第14-15行解析→第21-22行pool.query sink，全程受两重防御——第17行ALLOWED_LEVELS白名单精确枚举校验level、第20-22行pg参数化查询($1/$2/$3+绑定数组)实现SQL文本与数据分离，防御类型正确(参数化)、位置正确(sink调用点)、覆盖完整(所有INSERT路径)；第二入口检查：模块仅导出formatAndStore一个函数，无其他路由/参数/间接调用通道，连接串为部署配置不可控", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,55 @@
+LANG: java
+```java
+package com.acme.plugin.hooks;
+
+import org.w3c.dom.Document;
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import java.io.File;
+import java.nio.file.Path;
+
+/**
+ * 插件系统钩子：宿主在插件加载阶段以插件描述文件路径调用本钩子。
+ * 描述文件由第三方开发者提交，内容不可信。
+ */
+public final class PluginManifestHook {
+
+    /** 读取并校验插件清单，返回解析后的 Document 供宿主注册使用 */
+    public Document onLoad(Path manifestPath) throws Exception {
+        // 第 14 行起：manifestPath 指向的文件内容由外部提交，视为污点源
+        File manifest = manifestPath.toFile();
+
+        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+        // 防御 1：彻底禁用 DTD，杜绝外部实体解析（XXE 主攻击面）
+        dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        // 防御 2：禁用外部通用/参数实体与 XInclude，覆盖残余实体通道
+        dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
+        dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+        dbf.setXIncludeAware(false);
+        dbf.setExpandEntityReferences(false);
+        // 防御 3：启用安全处理，限制实体扩展次数
+        dbf.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
+        dbf.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
+
+        DocumentBuilder builder = dbf.newDocumentBuilder();
+        return builder.parse(manifest); // 安全 sink：已完全防御 XXE
+    }
+}
+```
+
+1. **污点边界**：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 13 行 `onLoad` 接收的 `manifestPath` 所指向文件的内容——该清单由第三方插件开发者提交给宿主，属于公开接口的外部可控数据，必须按不可信输入处理。若未防御，第 31 行 `builder.parse(manifest)` 即为 CWE-611 的 XXE sink。
+
+2. **source→sink 数据流**：污点数据流为「manifest 文件字节 → DocumentBuilderFactory 配置的 parser → 第 31 行 parse」。XML 解析器的危险面是 DOCTYPE 声明、外部实体引用、XInclude 与参数实体；任何一条未被关闭都会导致文件读取或 SSRF。
+
+3. **防御类型正确性**：第 18 行 `disallow-doctype-decl=true` 在词法层面直接拒绝含 DOCTYPE 的文档，使 SYSTEM/PUBLIC 实体声明根本无法存在，这是白名单式的“禁止声明”而非黑名单过滤，无法通过编码变体绕过；第 19-20 行从 SAX 特性层再关掉 general/parameter 实体，双保险覆盖不同解析器实现路径。
+
+4. **防御位置与覆盖面**：所有防御都设置在第 27 行 `newDocumentBuilder()` 之前的 factory 上，位置正确——builder 继承 factory 的全部安全特性；第 22-24 行额外将 `ACCESS_EXTERNAL_DTD/SCHEMA` 置空并禁用 XInclude 与实体展开，堵住 JAXP 属性级残余通道。攻击面（DOCTYPE、外部实体、参数实体、XInclude）全部被显式覆盖，无遗漏路径。
+
+5. **第二入口检查**：本模块仅暴露 `onLoad` 一个方法，无其他路由、静态初始化读取或间接调用点；类内没有其他文件读取或网络 API，替代通道不存在。
+
+6. **结论**：唯一 source→sink 流被三层原生安全 API（特性开关 + JAXP 属性 + XInclude 关闭）完整防护，防御类型为“原生安全 API”，判定无漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界：无 web 入口，第 13 行 onLoad 参数指向的插件清单文件内容由第三方提交，等效外部污点源；主链：manifest 文件内容 → DocumentBuilder.parse(第 31 行)，潜在 sink 为 XML 外部实体解析(CWE-611)；防御验证：第 18 行 disallow-doctype-decl 从词法层拒绝 DOCTYPE 使实体声明无法存在，第 19-20 行关闭 general/parameter 外部实体，第 22-24 行置空 ACCESS_EXTERNAL_DTD/SCHEMA 并禁用 XInclude 与实体展开，均为原生安全 API 且设置于 newDocumentBuilder 之前，位置正确、覆盖 DOCTYPE/外部实体/参数实体/XInclude 全部攻击面，非黑名单或正则过滤，不可绕过；第二入口检查：模块仅此一个公开方法，无其他文件读取或间接调用通道", "fix_suggestion": "no fix needed"}
+```

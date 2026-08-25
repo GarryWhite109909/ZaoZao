@@ -1,0 +1,59 @@
+LANG: javascript
+```javascript
+// asset-locator.js — 静态资源定位工具模块
+// 被上层服务调用：上层将用户提交的资源名传入 resolveAsset()，
+// 本模块负责把名字安全地映射为服务器上的文件路径。
+'use strict';
+
+const path = require('path');
+const fs = require('fs');
+
+// 允许访问的静态资源目录白名单（部署时配置）
+const ASSET_ROOT = '/srv/app/static';
+
+// 已注册资源清单，作为严格白名单
+const REGISTERED_ASSETS = new Set([
+  'logo.png', 'banner.jpg', 'style.css', 'app.js',
+]);
+
+/**
+ * 根据外部传入的资源名定位服务器文件。
+ * @param {string} assetName - 上层调用者传入的外部可控资源名
+ * @returns {Promise<string>} 解析后的绝对路径
+ */
+async function resolveAsset(assetName) {
+  // 防御 1：白名单校验——只允许预注册的精确资源名，
+  // 任何包含 ../、绝对路径或 URL 的输入都无法命中集合。
+  if (typeof assetName !== 'string' || !REGISTERED_ASSETS.has(assetName)) {
+    throw new Error('asset not registered');
+  }
+
+  const resolved = path.resolve(ASSET_ROOT, assetName);
+
+  // 防御 2：路径前缀双重确认（纵深防御）
+  if (!resolved.startsWith(ASSET_ROOT + path.sep)) {
+    throw new Error('path traversal blocked');
+  }
+
+  await fs.promises.access(resolved, fs.constants.R_OK);
+  return resolved;
+}
+
+module.exports = { resolveAsset };
+```
+
+1. 污点边界：本文件没有任何 request/argv/stdin 等显式 web 入口；污点源是第 22 行公开函数 `resolveAsset(assetName)` 的参数——上层服务会把外部提交的资源名直接传入，按不可信数据处理，是等效污点源。
+
+2. 数据流追踪：第 22 行参数 `assetName` → 第 31 行白名单判断 → 第 36 行 `path.resolve(ASSET_ROOT, assetName)` → 第 41 行 `fs.promises.access(resolved)` 与返回值被上层用于读取文件。sink 是基于该路径的文件系统访问（CWE-918 场景下对应 SSRF 式任意资源定位）。
+
+3. 防御有效性（类型）：第 31 行 `REGISTERED_ASSETS.has(assetName)` 是精确字符串白名单，不是黑名单、正则或字符串替换，无法通过编码变体、`..%2f`、双写等绕过——任何未逐字注册的名字一律抛错，类型正确。
+
+4. 防御有效性（位置与覆盖面）：白名单位于参数进入后、`path.resolve` 与 `fs.promises.access` 之前的唯一数据流必经点（第 31 行），覆盖了从 source 到 sink 的全部攻击面；第 38 行的前缀检查作为纵深防御兜底。白名单通过后 `assetName` 只能是四个固定文件名之一，不含 `/`、`\` 或 scheme，不可能构造出指向内网地址或任意文件的路径。
+
+5. 第二入口检查：模块仅导出 `resolveAsset` 一个函数（第 46 行），无路由注册、无事件监听、无队列消费回调；`REGISTERED_ASSETS` 为硬编码常量不可被外部修改；不存在其他参数或间接调用通道可绕过白名单到达 sink。
+
+6. 结论：source→sink 唯一链路被位置正确、类型正确的白名单完全覆盖，无第二入口，判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一污点源为第22行公开函数resolveAsset的参数assetName，承载上层传入的外部资源名；唯一数据流为参数经第31行白名单校验后进入第36行path.resolve与第41行fs.promises.access；防御为精确字符串白名单REGISTERED_ASSETS.has，非黑名单/正则/替换过滤，不可绕过，且位于source到sink的唯一必经点，覆盖全部攻击面；第38行前缀检查提供纵深防御；模块仅导出resolveAsset一个函数，无路由、无队列回调、无常量可被外部篡改，不存在第二入口或替代通道", "fix_suggestion": "no fix needed"}
+```

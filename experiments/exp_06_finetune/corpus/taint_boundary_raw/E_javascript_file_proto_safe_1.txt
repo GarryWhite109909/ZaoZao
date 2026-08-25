@@ -1,0 +1,58 @@
+LANG: javascript
+```javascript
+// hooks/templateHook.js
+// 插件系统钩子实现：宿主服务在插件触发时调用本模块，
+// 模板文件内容（外部提交的插件包）被视为不可信输入。
+'use strict';
+
+const fs = require('fs').promises;
+const path = require('path');
+const ejs = require('ejs');
+
+const PLUGIN_DIR = '/var/lib/app/plugins';
+// 白名单：仅允许纯小写字母/数字/下划线/连字符组成的 .ejs 文件名
+const SAFE_NAME = /^[a-z0-9_-]{1,64}\.ejs$/;
+
+async function onRenderHook(pluginName, context) {
+  // 防御点 1：白名单校验文件名，阻断路径穿越与任意文件读取
+  if (typeof pluginName !== 'string' || !SAFE_NAME.test(pluginName)) {
+    throw new Error('invalid plugin name');
+  }
+  const resolved = path.resolve(PLUGIN_DIR, pluginName);
+  if (!resolved.startsWith(PLUGIN_DIR + path.sep)) {
+    throw new Error('path traversal blocked');
+  }
+
+  const raw = await fs.readFile(resolved, 'utf8');
+
+  // 防御点 2：外部内容只作为【数据】传入渲染引擎的 locals，
+  // 绝不拼接进模板字符串本身，因此不存在模板注入面；
+  // ejs 对输出默认做 HTML 转义（escape 参数显式开启）。
+  const html = await ejs.render(raw, { ctx: context }, {
+    async: true,
+    escape: (s) => String(s).replace(/[&<>"']/g,
+      c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),
+    root: PLUGIN_DIR,
+    includePath: (p) => SAFE_NAME.test(p) ? p : null
+  });
+  return html;
+}
+
+module.exports = { onRenderHook };
+```
+
+1. 第 1 行至第 3 行注释表明本模块由宿主以插件事件调用；全文无 request/argv/stdin 等显式 web 入口。污点边界：第 16 行 `pluginName` 与第 17 行 `context` 来自宿主转交的外部插件注册数据，第 24 行 `fs.readFile(resolved)` 读入的模板文件内容由外部提交的插件包承载，均属等效污点源，必须按不可信处理。
+
+2. 数据流一：pluginName → 第 20 行 `path.resolve` → 第 24 行 readFile。防御：第 13 行白名单正则 `^[a-z0-9_-]{1,64}\.ejs$` 只接受受限字符集，配合第 21-23 行 `startsWith` 前缀检查，类型正确（字符集白名单而非黑名单）、位置正确（在 resolve 与 readFile 之前）、覆盖完整攻击面（`..`、绝对路径、URL 编码变体均无法通过该字符集），路径穿越被阻断。
+
+3. 数据流二（CWE-1336 主链）：readFile 读出的模板字符串 `raw` → 第 30 行 `ejs.render(raw, ...)`。若外部数据被拼进模板字符串即构成服务端模板注入（RCE）。此处防御有效：外部可控的 `context` 仅作为第二个参数的数据对象传入，永不进入模板文本；且第 31-33 行显式提供 escape 函数对插值输出做 HTML 实体转义，覆盖 `<script>` 注入面。模板字符串本身来自经白名单校验路径的受控目录文件，非任意用户直传内容。
+
+4. 数据流三：ejs 的 `<%- include(...) %>` 可加载任意模板形成二次注入通道。第 34-35 行通过 `root` 限定根目录、`includePath` 回调复用同一白名单 `SAFE_NAME` 校验，include 目标同样无法穿越或指向任意文件，替代通道被封死。
+
+5. 第二入口检查：本文件仅导出 `onRenderHook` 一个函数，无路由、无 CLI、无环境变量读取；所有进入 sink 的数据都经过上述白名单+数据/代码分离双重防御，无未防护的 source→sink 路径。
+
+6. 结论：污点源存在但每条链路均有位置正确、类型正确、覆盖完整的防御，无 CWE-1336 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界为宿主转交的外部插件数据与被解析的模板文件内容，无显式 web 入口；pluginName→resolve→readFile 链由第 13 行字符集白名单加第 21-23 行前缀检查防护，阻断路径穿越；raw→ejs.render 链中外部数据仅作为 locals 数据对象传入而不拼入模板字符串，实现数据与代码分离，且显式 escape 转义插值输出；ejs include 二次加载通道由 root 限定与 includePath 复用同一白名单封堵；全文件仅一个导出函数，无第二入口或替代未防护通道", "fix_suggestion": "no fix needed"}
+```

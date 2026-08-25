@@ -1,0 +1,52 @@
+LANG: python
+```python
+"""插件系统钩子：宿主在收到外部事件后调用本模块的 on_event 钩子。
+
+被上层插件管理器调用，event 载荷来自外部提交的 webhook 通知内容，
+必须按不可信数据处理。
+"""
+import ipaddress
+import socket
+from urllib.parse import urlparse
+
+from .http_client import fetch  # 项目内部封装的 HTTP 客户端
+
+# 仅允许回调的目标主机白名单（内部服务清单）
+ALLOWED_HOSTS = {"metrics.internal", "audit.internal"}
+ALLOWED_SCHEMES = {"https"}
+
+
+def on_event(event: dict) -> None:
+    """钩子入口：event 为宿主传入的外部事件载荷。"""
+    target_url = event.get("callback_url")
+    if not isinstance(target_url, str):
+        raise ValueError("callback_url must be a string")
+
+    parsed = urlparse(target_url)
+
+    # 白名单校验 scheme 与 host，杜绝任意 SSRF 目标
+    if parsed.scheme not in ALLOWED_SCHEMES:
+        raise ValueError("scheme not allowed")
+    if parsed.hostname not in ALLOWED_HOSTS:
+        raise ValueError("host not in whitelist")
+
+    # 解析 DNS 后校验 IP，防止 DNS rebinding / 内网地址绕过
+    addr_info = socket.getaddrinfo(parsed.hostname, None)
+    for family, _, _, _, sockaddr in addr_info:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if not ip.is_global:
+            raise ValueError("resolved address is not public")
+
+    fetch(target_url, payload={"event_id": event.get("id")})
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；第 22 行 `on_event(event)` 的 `event` 参数是宿主以外部事件载荷调用的钩子签名，承载外部可控数据，是等效污点源（公开接口参数必须按不可信处理）。
+2. 第 23 行取出 `event["callback_url"]` 作为污点数据，流向第 44 行 `fetch(target_url, ...)` 这一 CWE-918 危险 sink（发起出站请求）。若直接透传即构成 SSRF（可探测内网、访问云元数据）。
+3. 防御一（第 28–32 行）：`urlparse` 后对 scheme 施加严格白名单 `{https}`、对 hostname 施加白名单 `{metrics.internal, audit.internal}`——这是白名单校验而非黑名单/正则/字符串替换，类型正确；位置位于 sink 之前、所有使用之前，覆盖完整攻击面（任何不在白名单内的目标 URL 均被拒绝）。
+4. 防御二（第 35–40 行）：对白名单内域名做 `getaddrinfo` 解析并用 `ipaddress.ip_address(...).is_global` 校验每个解析结果，防止攻击者通过 DNS rebinding 或将白名单域名解析到内网 IP 绕过第一层防御；该防御同样位于 sink 前，覆盖全部解析出的地址族与地址。
+5. 第二入口检查：文件中不存在其他函数或替代通道，`fetch` 的 payload 仅含 `event.get("id")` 且作为结构化字段传递不参与 URL 构造；唯一 source→sink 链已被上述两层防御完整覆盖。
+6. 结论：无漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "第22行钩子参数 event 为外部事件载荷等效污点源; 第23行 callback_url 流向第44行 fetch 出站请求为唯一 source-sink 链; 第28-32行对 scheme 与 hostname 施加白名单校验类型正确且位于 sink 前覆盖全部 URL 攻击面; 第35-40行 getaddrinfo 解析后用 is_global 校验全部解析 IP 阻断 DNS rebinding 与内网地址绕过; 文件无第二入口或替代通道 payload 字段 id 不参与 URL 构造; 故无 CWE-918 漏洞", "fix_suggestion": "no fix needed"}
+```

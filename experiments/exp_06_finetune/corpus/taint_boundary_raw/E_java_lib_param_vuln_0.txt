@@ -1,0 +1,46 @@
+LANG: java
+```java
+package com.acme.etl.adapter;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.List;
+
+/**
+ * 数据导入适配器：被上层同步服务调用，用于把外部系统推送的记录
+ * 落地到本地临时目录后再触发解析脚本。参数内容由上游队列消费方传入。
+ */
+public class RecordImportAdapter {
+
+    // 弱防御：仅拦截分号与管道符（可被 &&、反引号、$() 等绕过）
+    private static String sanitize(String s) {
+        return s.replace(";", "").replace("|", "");
+    }
+
+    /**
+     * 导入一批外部记录。tenantId 与 recordName 均来自外部系统提交内容。
+     */
+    public void importRecords(String tenantId, List<String> recordNames) throws IOException, InterruptedException {
+        File dir = new File("/data/import/" + sanitize(tenantId));
+        dir.mkdirs();
+        for (String name : recordNames) {
+            String safe = sanitize(name);
+            ProcessBuilder pb = new ProcessBuilder("sh", "-c",
+                    "parse_tool --tenant " + tenantId + " --file " + safe);
+            pb.inheritIO();
+            pb.start().waitFor();
+        }
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/environ/stdin 等显式 web 入口；但第 17 行公开方法 `importRecords(String tenantId, List<String> recordNames)` 的两个参数承载上层调用者/外部系统提交的数据，按不可信处理，是等效污点源。
+2. 第 12-14 行 `sanitize` 仅做字符串替换删除 `;` 和 `|`，属于黑名单式弱防御：攻击者可用 `&&`、`$(...)`、反引号或换行符注入命令，且第 22 行拼接 `tenantId` 时甚至未经过任何过滤。
+3. 数据流一：`tenantId`（第 17 行）→ 第 21 行直接拼入 shell 命令字符串 → 第 22-23 行 `ProcessBuilder("sh","-c", ...)` 执行，无任何校验，完全可达。
+4. 数据流二：`recordNames` 元素（第 20 行）→ 第 21 行 `sanitize(name)` 弱过滤后拼入同一命令字符串 → 同一 sink，绕过方式为使用未被过滤的元字符如 `&& id`。
+5. 防御覆盖面验证：唯一的防御是第 13 行的 replace 黑名单，位置在 sink 前，但覆盖面不足（未处理 `&`、`` ` ``、`$`、换行），且对 tenantId 完全缺失，两条链均判定为无有效防御。
+6. 第二入口检查：文件内无路由注册、无其他公开读取外部数据的方法；替代通道仅为同类公开方法的参数入口，结论不变——存在 CWE-78 OS 命令注入。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "Critical", "source": "line 17: importRecords 参数 tenantId 与 recordNames（外部系统提交内容）", "sink": "line 23: ProcessBuilder sh -c 执行拼接的命令字符串", "explanation": "流一: line 17 tenantId 未做任何过滤 -> line 21 直接拼接 -> line 23 经 sh -c 执行; 流二: line 20 recordNames 元素 -> line 21 sanitize 仅删除 ; 和 | 属可绕过黑名单（可用 && $( ) 反引号换行绕过）-> line 23 同一 sink; 文件内无第二显式入口，替代通道仅为公开方法参数，均确认可达", "fix_suggestion": "line 22: 改用参数数组形式 new ProcessBuilder('parse_tool','--tenant',tenantId,'--file',name) 避免经 shell 解释，并对 tenantId/name 做白名单校验"}
+```

@@ -1,0 +1,68 @@
+LANG: python
+```python
+"""report_exporter.py — 报表导出工具模块，被上层 API 服务以用户筛选条件调用。"""
+
+import json
+import logging
+import pickle
+from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
+
+# 允许的报表类型白名单
+_ALLOWED_REPORT_TYPES = {"sales_summary", "inventory", "user_activity"}
+
+# 各报表类型对应的固定查询模板（占位符由数据库驱动参数化绑定）
+_QUERY_TEMPLATES = {
+    "sales_summary": "SELECT region, SUM(amount) FROM sales WHERE created_at >= %s GROUP BY region",
+    "inventory": "SELECT sku, quantity FROM inventory WHERE warehouse = %s",
+    "user_activity": "SELECT user_id, action, COUNT(*) FROM activity_log WHERE day >= %s GROUP BY user_id",
+}
+
+
+def export_report(report_type: str, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """导出指定类型的报表。
+
+    report_type 与 filters 均来自上层服务透传的用户筛选条件，
+    按不可信数据处理。
+    """
+    # 白名单校验：report_type 必须命中预定义集合，杜绝任意 SQL 片段拼接
+    if report_type not in _ALLOWED_REPORT_TYPES:
+        raise ValueError(f"unsupported report type: {report_type}")
+
+    template = _QUERY_TEMPLATES[report_type]
+
+    # 仅提取该报表模板声明的过滤键，未知键一律丢弃
+    allowed_keys = _FILTER_KEYS[report_type]
+    clean_filters = {k: v for k, v in filters.items() if k in allowed_keys}
+
+    with _get_cursor() as cur:
+        # 参数化查询：用户数据只经 %s 占位符由驱动转义绑定，不进入 SQL 文本
+        cur.execute(template, (clean_filters.get("since", "1970-01-01"),))
+        rows = [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
+
+    return rows
+
+
+def deserialize_payload(raw: bytes) -> Dict[str, Any]:
+    """反序列化上层消息队列投递的导出任务载荷。"""
+    # 使用 json 而非 pickle：json 解析器不会实例化任意对象，无代码执行面
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError("payload must be a JSON object")
+    return payload
+```
+
+1. **污点边界**：本文件无 request/input/environ 等显式入口；但 `export_report` 的 `report_type`、`filters`（第 22 行）与 `deserialize_payload` 的 `raw`（第 41 行）均为公开接口参数，承载上层服务透传的用户筛选条件与队列消息内容，按不可信外部数据处理，是等效污点源。
+
+2. **流一（SQL sink）**：`report_type` → 第 27 行白名单校验 `_ALLOWED_REPORT_TYPES`（集合精确匹配，非黑名单/正则），未命中即抛异常；通过后仅用于从 `_QUERY_TEMPLATES` 字典查取**预写死的常量 SQL 模板**（第 12–16 行），污点值本身永不进入 SQL 文本——这是白名单+间接查找的双重防御，位置在 sink 之前，覆盖完整。
+
+3. **流二（filters → execute 参数）**：`filters` 经第 30–31 行按 `_FILTER_KEYS` 白名单过滤后，其值在第 35 行作为 `%s` 占位符的**参数元组**传入 `cur.execute`，由 psycopg2 驱动做类型感知转义与预编译绑定，属于参数化查询防御；即使值含引号/分号也不会改变 SQL 结构，攻击面（注入）被完整覆盖。
+
+4. **流三（反序列化 sink）**：`raw` 在第 44 行经 `json.loads` 解析——JSON 解析器只产生原生 dict/list/str 等安全类型，不会像 `pickle.loads` 那样触发任意对象构造与代码执行（CWE-502 的经典 sink 已被原生安全 API 替代）；第 45–46 行再校验顶层为 dict，防止后续误用。
+
+5. **第二入口检查**：文件内无路由注册、无环境变量/stdin 读取、无模块级副作用；两个公开函数是仅有的外部数据通道，且均已分析。替代通道方面不存在其他调用 `execute` 或反序列化的路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "无显式 web 入口，污点边界为公开函数参数 export_report(report_type, filters) 与 deserialize_payload(raw)，均按不可信外部数据处理; 流一: report_type 在第 27 行经集合白名单精确匹配校验，且仅用于字典间接查找预写死的 SQL 常量模板，污点值不进入 SQL 文本，防御类型正确(白名单)、位置正确(sink 前)、覆盖完整; 流二: filters 经第 30-31 行键白名单过滤后于第 35 行作为 %s 参数元组传入 cur.execute，由驱动参数化绑定转义，注入攻击面被完整覆盖; 流三: raw 于第 44 行经 json.loads 反序列化，仅生成原生安全类型，规避了 pickle 类 CWE-502 任意对象实例化风险，并辅以第 45-46 行类型校验; 第二入口检查: 文件内无路由注册、无环境变量或标准输入读取、无模块级副作用，两函数为仅有外部数据通道且均有有效防御，结论为安全", "fix_suggestion": "no fix needed"}
+```

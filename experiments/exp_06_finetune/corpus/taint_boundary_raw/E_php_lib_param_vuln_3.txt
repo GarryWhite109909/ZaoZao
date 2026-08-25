@@ -1,0 +1,57 @@
+LANG: php
+```php
+<?php
+// src/Report/Exporter.php
+// 报表导出工具模块：被上层 API 服务以用户筛选条件调用，
+// 也可由后台队列消费者传入任务参数。
+
+namespace App\Report;
+
+use GuzzleHttp\Client;
+
+class Exporter
+{
+    private Client $http;
+
+    public function __construct(Client $http)
+    {
+        $this->http = $http;
+    }
+
+    /**
+     * 导出报表：$webhookUrl 为上层服务根据用户配置生成的回调地址，
+     * $format 由用户在筛选面板选择（csv/pdf/xlsx）。
+     */
+    public function export(string $reportId, string $webhookUrl, string $format): array
+    {
+        // 弱防御：仅拦截内网常见主机名，可被 IP 直连或 DNS rebinding 绕过
+        $blocked = ['localhost', '127.0.0.1', '169.254.169.254'];
+        $host = parse_url($webhookUrl, PHP_URL_HOST) ?: '';
+        foreach ($blocked as $bad) {
+            if (strcasecmp($host, $bad) === 0) {
+                throw new \RuntimeException('blocked host');
+            }
+        }
+
+        // 拼接查询参数后直接发起服务端 HTTP 请求（SSRF sink）
+        $target = rtrim($webhookUrl, '/') . '/reports/' . rawurlencode($reportId) . '?format=' . $format;
+        $resp = $this->http->get($target, ['timeout' => 5]);
+
+        return [
+            'status' => $resp->getStatusCode(),
+            'body'   => (string) $resp->getBody(),
+        ];
+    }
+}
+```
+
+分析：
+1. 第 20 行 `export()` 的三个参数 `$reportId`、`$webhookUrl`、`$format` 是污点边界：本文件没有任何 request/input/environ 等显式 web 入口，但该公开方法被上层 API 服务以用户提交的筛选条件与用户配置的回调地址调用，参数内容必须按不可信外部数据处理，是等效污点源。
+2. 第 24-31 行为唯一防御：基于 `parse_url` 取 host 后对三个固定字符串做黑名单比较。绕过方式明确——攻击者可将 `$webhookUrl` 设为云元数据 IP `100.100.100.200`、任意内网 IP（如 `10.0.0.5`）、`0x7f000001` 等十进制/十六进制 IP 形式，或使用 attacker.com 做 DNS rebinding；黑名单既不覆盖 IP 段也不校验 scheme，属可绕过弱防御。
+3. 第 34 行将 `$webhookUrl` 直接拼入目标 URL，第 35 行 `$this->http->get($target)` 即 SSRF sink：服务器向攻击者完全控制的地址发起 GET，响应体还通过返回值回传给调用方（第 37-40 行），形成可读取响应的完整 SSRF，可用于探测内网、窃取云凭证。`rawurlencode($reportId)` 只编码路径段，不影响 host 可控性。
+4. 防御覆盖面核查：黑名单仅作用于 host 字符串精确匹配，未限制协议（file/gopher 经 Guzzle 不适用但 http 任意端口可用）、未解析并拒绝私网 IP、未走代理出口，覆盖面不足以构成有效防御。
+5. 第二入口检查：文件内无路由注册、无 HTTP 处理器、无队列消费代码；`export()` 是唯一公开入口，`__construct` 仅注入客户端不承载业务数据。替代通道不存在，结论成立：函数参数即污点源且可达 sink。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 服务端请求伪造(SSRF)", "risk_level": "High", "source": "line 20: export() 参数 webhookUrl/reportId/format 承载上层服务传入的用户可控数据", "sink": "line 35: http->get($target) 向拼接后的 URL 发起服务端请求", "explanation": "主链: line 20 参数 webhookUrl -> line 26 parse_url 提取 host -> line 28-30 黑名单仅匹配 localhost/127.0.0.1/169.254.169.254 三个字符串, 可用内网 IP 直连(如 10.x)、十六进制 IP 或 DNS rebinding 绕过 -> line 34 拼接 target -> line 35 Guzzle GET 触发 SSRF, 且 line 38 将响应体回传给调用方形成可读 SSRF; reportId/format 仅经 rawurlencode 与拼接进入 query 部分, 不影响 host 可控性; 文件内无其他入口或替代通道, export() 为唯一公开接口", "fix_suggestion": "line 24: 解析 host 后用 dns_get_record/gethostbyname 解析为 IP 并强制校验其不属于私网/环回/链路本地网段, 同时白名单限定 https 协议与允许的域名后缀"}
+```

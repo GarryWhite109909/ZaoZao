@@ -1,0 +1,54 @@
+LANG: java
+```java
+package com.acme.cache.codec;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import org.owasp.html.PolicyFactory;
+import org.owasp.html.Sanitizers;
+
+/**
+ * 缓存编解码模块：被上层缓存服务调用，读取磁盘上的缓存快照文件
+ * （由对端节点通过同步协议落盘，内容视为不可信外部数据），
+ * 解析出 key/value 并写入管理后台的 HTML 渲染缓冲。
+ */
+public final class CacheSnapshotCodec {
+
+    // OWASP HTML Sanitizer 白名单策略：仅允许纯文本与基础格式标签
+    private static final PolicyFactory POLICY = Sanitizers.FORMATTING
+            .and(Sanitizers.BLOCKS)
+            .and(Sanitizers.LINKS);
+
+    /**
+     * 解析缓存快照文件并返回可直接安全渲染的 value。
+     * 快照文件格式：每行 "key<TAB>value"，value 可能来自外部节点提交。
+     */
+    public String decodeValue(Path snapshotFile, String key) throws IOException {
+        for (String line : Files.readAllLines(snapshotFile, StandardCharsets.UTF_8)) { // 第 24 行：污点源
+            int tab = line.indexOf('\t');
+            if (tab <= 0) continue;
+            String k = line.substring(0, tab);
+            if (!k.equals(key)) continue;                       // 第 27 行：键匹配
+            String rawValue = line.substring(tab + 1);          // 第 28 行：外部可控 value
+            return POLICY.sanitize(rawValue);                   // 第 29 行：sink 前白名单净化
+        }
+        throw new IOException("key not found: " + key);
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 24 行 `Files.readAllLines` 读取的缓存快照文件——该文件由对端节点经同步协议落盘，其内容（尤其是 TAB 之后的 value 字段）承载外部提交数据，必须按不可信处理，是等效污点源。
+
+2. 数据流追踪：第 24 行读入全部行 → 第 25-26 行按 `\t` 切分并做 key 匹配 → 第 28 行取出 `rawValue`（完全继承文件内容的可控性）→ 第 29 行作为返回值流向调用方的 HTML 渲染 sink。source→sink 路径完整可达。
+
+3. 防御验证：第 29 行在返回前调用 OWASP Java HTML Sanitizer 的 `POLICY.sanitize()`。该防御类型正确——它不是黑名单或正则替换，而是基于解析后 DOM 的白名单策略（FORMATTING/BLOCKS/LINKS），所有非白名单标签、属性（含 onerror/onclick 等事件处理器与 javascript: 协议）均被结构性移除；位置正确——位于污点数据离开本模块、进入渲染 sink 之前的唯一出口；覆盖完整——模块内不存在任何绕过 sanitize 直接返回 rawValue 的分支（第 30 行异常路径不携带污点数据），因此 CWE-79 注入面被完整封堵。
+
+4. 第二入口检查：本类仅有一个公共方法 `decodeValue`，无其他路由、无静态可变状态、无间接回调；key 参数仅用于等值比较，不进入输出。替代通道（如直接读原始字节返回）不存在。
+
+5. 结论：唯一 source（快照文件内容）到 sink（HTML 渲染）的数据流在第 29 行被白名单 sanitizer 有效拦截，防御类型、位置、覆盖面均满足要求，不存在漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界为第24行 Files.readAllLines 读取的缓存快照文件内容，属协议落盘的外部可控数据；唯一数据流为第28行 rawValue 到第29行返回值供上层 HTML 渲染，第29行 OWASP HTML Sanitizer 白名单策略在出口处移除全部非白名单标签、事件属性与危险协议，防御类型正确且为本模块唯一出口、覆盖完整；第二入口检查确认类中仅有 decodeValue 一个公共方法，key 仅做等值比较不入输出，无其他路由或间接通道", "fix_suggestion": "no fix needed"}
+```

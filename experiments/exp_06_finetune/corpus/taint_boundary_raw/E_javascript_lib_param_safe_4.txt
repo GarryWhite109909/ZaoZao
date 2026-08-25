@@ -1,0 +1,55 @@
+LANG: javascript
+```javascript
+// archive-indexer.js — 归档索引工具模块，被上层服务调用（如消费队列消息后传入归档名）
+'use strict';
+
+const { Pool } = require('pg');
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// 允许写入索引表的归档类型白名单
+const ALLOWED_TYPES = new Set(['zip', 'tar', 'tar.gz', 'tgz']);
+
+/**
+ * 将外部提交的归档元数据登记到索引库。
+ * archiveName / archiveType 均来自上层调用者（不可信数据）。
+ */
+async function registerArchive(archiveName, archiveType, sizeBytes) {
+  if (typeof archiveName !== 'string' || archiveName.length === 0 || archiveName.length > 255) {
+    throw new Error('invalid archive name');
+  }
+  // 白名单校验：archiveType 必须命中预定义集合，杜绝注入
+  if (!ALLOWED_TYPES.has(archiveType)) {
+    throw new Error('unsupported archive type');
+  }
+  const size = Number(sizeBytes);
+  if (!Number.isFinite(size) || size < 0) {
+    throw new Error('invalid size');
+  }
+  // 参数化查询：$1/$2/$3 占位符由 pg 驱动安全绑定，值不会拼入 SQL 文本
+  await pool.query(
+    'INSERT INTO archives (name, type, size_bytes) VALUES ($1, $2, $3)',
+    [archiveName, archiveType, Math.floor(size)]
+  );
+}
+
+module.exports = { registerArchive };
+```
+
+分析：
+
+1. **污点边界**：本文件没有任何 request/argv/stdin 等显式入口，但第 16 行公开函数 `registerArchive(archiveName, archiveType, sizeBytes)` 的参数承载上层服务（消费队列消息）传入的外部可控数据，按不可信处理，是等效污点源。
+
+2. **source→sink 数据流**：`archiveName`、`archiveType`、`sizeBytes` 从第 16 行参数流向第 33 行 `pool.query(...)` 这一 SQL 执行 sink。若直接字符串拼接即构成 CWE-89 注入。
+
+3. **防御一（位置正确）**：第 32-34 行使用 pg 驱动的参数化查询 `$1/$2/$3` 占位符 + 数组绑定。这是类型正确的原生安全 API——值经驱动转义为独立查询参数，永不拼入 SQL 文本，攻击者无法通过 `archiveName` 内容改变语句结构。
+
+4. **防御二（纵深覆盖）**：第 21-23 行对 `archiveType` 施加白名单校验（预定义 Set 精确匹配），非黑名单/正则过滤，无绕过面；第 17-19、26-28 行对名称长度与数值做类型与范围校验，进一步收窄输入空间。
+
+5. **覆盖完整性**：到达 sink 的全部三个外部值均被参数化绑定覆盖，不存在任何拼接进 SQL 字符串字面量的路径；SQL 模板本身为常量字符串，无动态构造。
+
+6. **第二入口检查**：文件仅导出 `registerArchive` 一个函数，无路由注册、无回调间接调用、无其他 sink（无 exec/fs 写入）；模块内不存在替代通道绕过上述防御。结论：无漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一入口为第16行公开函数registerArchive的三个参数，承载上层服务传入的外部数据；三条数据流均汇入第33行pool.query的SQL执行sink；防御有效：第32-34行采用pg驱动参数化查询($1/$2/$3占位符+数组绑定)，值为独立绑定参数不参与SQL文本拼接，类型正确且位置紧邻sink；第21-23行对archiveType施加预定义Set白名单精确匹配，第17-19行与第26-28行对名称和大小做类型/长度/范围校验作为纵深；SQL模板为常量字符串无动态构造，所有外部值均被参数化覆盖；文件仅导出单一函数，无路由注册、无其他sink、无间接调用等第二入口或替代通道", "fix_suggestion": "no fix needed"}
+```

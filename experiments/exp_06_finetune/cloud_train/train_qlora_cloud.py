@@ -4,7 +4,7 @@
   - 去掉 ROCm 特性（HIP bug 规避、fp32 提升、eager attention 等）
   - 使用 bf16 原生混合精度（A100+ 支持，比 fp16 更稳，无 GradScaler，不会 NaN）
   - 不用 bitsandbytes 4bit 量化（本地 16GB 才需要；云端 80GB 直接跑 bf16）
-  - max_seq_length 默认 6144：覆盖最终数据全部样本（v3 8616 条实测 avg≈2952 / max≈4900 tokens；α0.5 7972 条同量级），无需截断
+  - max_seq_length 默认 12288：与 alpha06 构建脚本 TRAIN_MAX_LEN 对齐（全量样本实测 max≈10336 tokens），无需截断
   - batch_size 默认 8 + grad_accum 1 = 有效 batch 8（80GB 显存宽裕，单卡直放）
 
 方法：LoRA（默认 r=8, alpha=16, rsLoRA 默认开启）+ 梯度检查点
@@ -175,8 +175,10 @@ def main():
     parser.add_argument("--lora-dropout", type=float, default=0.1)
     parser.add_argument("--no-rslora", action="store_true",
                         help="禁用 rsLoRA（默认开启：Phase1 sweep 表明 lr=1e-4 + rsLoRA(r=8) 最优）")
-    parser.add_argument("--max-seq-length", type=int, default=6144,
-                        help="默认 6144，覆盖最终数据全部 final_train_chatml_v3.jsonl(实测 max≈4900 tokens，旧值 4096 会截断尾部 JSON)")
+    parser.add_argument("--max-seq-length", type=int, default=12288,
+                        help="默认 12288：与 build_alpha06_final_v2_1/v2_2 的 TRAIN_MAX_LEN 对齐"
+                             "（alpha06 实测全量样本 max≈10336 tokens；旧默认 6144 会把 6144~10336 "
+                             "的样本截断在 JSON 中段，恰好违反构建侧长度守门初衷）")
     parser.add_argument("--save-steps", type=int, default=200)
     parser.add_argument("--eval-steps", type=int, default=None)
     parser.add_argument("--logging-steps", type=int, default=5)

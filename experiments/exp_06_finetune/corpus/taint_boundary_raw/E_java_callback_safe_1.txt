@@ -1,0 +1,54 @@
+LANG: java
+```java
+package com.acme.webhook.dispatch;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.net.URI;
+import java.util.Set;
+
+/**
+ * 出站 Webhook 派发器：由消息队列消费者回调本类的 onMessage，
+ * 消息体为上游业务事件（JSON 载荷），载荷中的 targetUrl 指向客户登记的回调地址。
+ */
+public class OutboundWebhookDispatcher {
+
+    private static final Set<String> ALLOWED_HOSTS =
+            Set.of("hooks.customer-a.example.com", "hooks.customer-b.example.com");
+    private static final Set<String> ALLOWED_SCHEMES = Set.of("https");
+
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    // 队列消费者回调入口：messageBody 为外部提交的事件载荷，必须按不可信数据处理
+    public void onMessage(String messageBody) throws Exception {
+        JsonNode payload = mapper.readTree(messageBody);
+        String targetUrl = payload.path("targetUrl").asText("");
+
+        URI uri = URI.create(targetUrl);
+        if (!ALLOWED_SCHEMES.contains(uri.getScheme())
+                || !ALLOWED_HOSTS.contains(uri.getHost())) {
+            throw new IllegalArgumentException("target host not allowlisted: " + uri.getHost());
+        }
+
+        java.net.http.HttpClient client = java.net.http.HttpClient.newHttpClient();
+        client.send(java.net.http.HttpRequest.newBuilder()
+                        .uri(uri)
+                        .header("Content-Type", "application/json")
+                        .POST(java.net.http.HttpRequest.BodyPublishers.ofString(
+                                mapper.writeValueAsString(payload.get("body"))))
+                        .build(),
+                java.net.http.HttpResponse.BodyHandlers.discarding());
+    }
+}
+```
+
+1. 第 17 行 `onMessage(String messageBody)` 是污点边界：本文件没有任何 request/argv/environ 等显式 web 入口，但该回调参数承载消息队列投递的外部事件载荷（含客户可配置的 `targetUrl`），属于等效污点源，必须按不可信处理。
+2. 第 19 行从载荷提取 `targetUrl`，第 21 行解析为 `URI`；若不加防御，该值将在第 28 行 `.uri(uri)` 处直接作为出站请求目标——这是 CWE-918 SSRF 的 sink（攻击者可指向内网元数据地址如 169.254.169.254）。
+3. 防御分析：第 22-26 行在数据到达 sink 之前执行白名单校验——scheme 必须属于 `ALLOWED_SCHEMES`（仅 https），host 必须精确匹配 `ALLOWED_HOSTS` 中的已登记域名。这是白名单校验型防御：类型正确（精确集合成员判断，非黑名单、非正则、非字符串替换，无法通过 `@evil.com`、`https://good.com@evil.com` 等绕过，因为 `URI.getHost()` 已剥离 userinfo/port 后做全等比较）；位置正确（校验发生在 sink 使用之前，且校验对象与最终传给 `.uri()` 的是同一个不可变 `URI` 实例）；覆盖完整（sink 唯一，即第 28 行的请求构造，无其他使用 `targetUrl` 的路径）。
+4. 请求体部分（第 29-31 行）经 Jackson 序列化为 JSON 字符串后发送，Jackson 默认转义控制字符与引号，不构成注入面；响应被 `discarding()` 丢弃，不存在回显型信息泄露。
+5. 第二入口检查：本文件仅有一个公开方法 `onMessage`，无其他路由、静态字段或间接调用点可将外部数据引入；`ALLOWED_HOSTS` 为编译期常量，不可被外部影响。所有 source→sink 流均经过同一白名单防御。
+6. 结论：不存在可达的 SSRF 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点为第17行队列回调参数 messageBody, 其中 targetUrl 在第28行 .uri() 处构成 SSRF sink; 第22-26行在到达 sink 前对 scheme 与 host 执行精确白名单校验(URI.getHost 全等比较, 排除 userinfo/port 绕过), 校验对象与最终使用的 URI 为同一实例, 类型正确且位置正确; 请求体经 Jackson 序列化自动转义, 无注入面; 本文件无第二入口或替代通道, 仅 onMessage 一个公开方法, 故无可达漏洞", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,47 @@
+LANG: javascript
+```javascript
+// cache-codec.js — 缓存编解码模块，被上层缓存服务调用，
+// 从磁盘上的缓存快照文件读取键值并按需重建索引。
+'use strict';
+
+const fs = require('fs');
+const { execFile } = require('child_process');
+
+// 允许被重建的索引类型白名单（第 12 行）
+const ALLOWED_INDEXERS = new Set(['text', 'meta', 'blob']);
+
+function rebuildIndex(snapshotPath) {
+  // 快照文件由外部系统写入，内容视为不可信输入（污点源）
+  const raw = fs.readFileSync(snapshotPath, 'utf8');
+  const entry = JSON.parse(raw);
+
+  const key = String(entry.key || '');
+  const indexer = String(entry.indexer || '');
+
+  // 防御：严格白名单校验，不在集合内的类型直接拒绝（第 21-22 行）
+  if (!ALLOWED_INDEXERS.has(indexer)) {
+    throw new Error(`unsupported indexer: ${indexer}`);
+  }
+  // 缓存键仅允许安全字符集，防止注入额外参数或 shell 元字符（第 25-27 行）
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(key)) {
+    throw new Error('invalid cache key');
+  }
+
+  // sink：execFile 不经过 shell，参数以数组传递，key/indexer 无法被解释为命令（第 30 行）
+  execFile('/usr/local/bin/cache-indexer', ['--type', indexer, '--key', key],
+    (err) => { if (err) console.error('rebuild failed:', err.message); });
+}
+
+module.exports = { rebuildIndex };
+```
+
+分析：
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 16 行 `fs.readFileSync` 读入的缓存快照文件内容——该文件由外部系统写入，其 JSON 字段 key 与 indexer 属于外部可控数据，必须按不可信处理，构成等效污点边界。
+2. 数据流一：第 16 行文件内容 → 第 17 行 JSON.parse → entry.indexer → 第 21-22 行白名单校验（`ALLOWED_INDEXERS.has`）→ 第 30 行作为 execFile 参数数组元素。防御为枚举白名单，类型正确（只允许三个固定字面量），位置正确（在到达 sink 前的最后检查点），覆盖完整（任何非白名单值直接抛错，无绕过路径）。
+3. 数据流二：entry.key → 第 25-27 行正则 `^[A-Za-z0-9._:-]{1,128}$` 白名单字符集校验（非黑名单、非字符串替换过滤，无法通过编码/截断绕过；长度上限防参数溢出拼接）→ 第 30 行传入 execFile。即使校验被假设突破，execFile 本身不派生 shell，参数以数组逐项传递，CWE-78 的命令注入面在 API 层即被消除，形成双重防御。
+4. sink 确认：第 30 行 execFile 是本文件唯一命令执行 sink；两条数据流均先经白名单再进入无 shell 的原生安全 API，攻击面完全覆盖。
+5. 第二入口检查：模块仅导出 rebuildIndex 一个函数，无其他路由、回调或间接调用通道；snapshotPath 虽来自上层调用方，但污点判定基于文件内容而非路径，且路径不参与命令构造。结论：不存在未防御的 source→sink 路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第16行 readFileSync 读入的外部快照文件内容（key/indexer 字段）；流一 indexer 经第21-22行枚举白名单校验后进入第30行 execFile，白名单类型正确、位于 sink 前最后检查点、覆盖全部取值；流二 key 经第25-27行白名单字符集正则校验（非黑名单/替换过滤，不可绕过）；sink 使用 execFile 数组传参且不经 shell，API 层消除 CWE-78 注入面，形成双重防御；第二入口检查：模块仅导出 rebuildIndex，无路由/回调等替代通道，路径参数不参与命令构造，故无可达漏洞链。", "fix_suggestion": "no fix needed"}
+```

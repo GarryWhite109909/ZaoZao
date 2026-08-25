@@ -1,0 +1,52 @@
+LANG: python
+```python
+# logfmt.py — 富文本/日志格式化模块
+# 由上层服务消费消息队列（如 RabbitMQ）后调用本模块的回调处理外部提交的文本
+import logging
+from logging import Formatter
+
+logger = logging.getLogger("audit")
+
+# 允许的占位符白名单（弱防御：仅做字符级过滤）
+_ALLOWED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_{}")
+
+
+def sanitize_placeholder(text):
+    """移除不在白名单内的字符——可被绕过：攻击者只需使用白名单内字符构造 payload"""
+    return "".join(c for c in text if c in _ALLOWED)
+
+
+def on_message(body):
+    """队列消费者回调：body 为外部提交的 JSON 消息体，包含待格式化的日志文本"""
+    # body: {"event": "login", "template": "{user} performed {action}"}
+    template = body.get("template", "")
+    user = body.get("user", "anonymous")
+    action = body.get("action", "unknown")
+
+    # 弱防御：对模板做字符白名单过滤，但 {} 均在白名单内，
+    # 攻击者可提交 template="{__init__.__globals__[SECRET]}" 之类的注入串
+    safe_template = sanitize_placeholder(template)
+
+    fmt = Formatter(safe_template)
+    record = logging.LogRecord(
+        name="audit", level=logging.INFO,
+        pathname=__file__, lineno=1,
+        msg=safe_template, args=(user, action), exc_info=None,
+    )
+    # sink: 用户可控的 format 字符串进入 Formatter.format，
+    # 触发 str.format 风格的属性遍历（CWE-1336 格式串注入）
+    rendered = fmt.format(record)
+    logger.info(rendered)
+    return rendered
+```
+
+1. 第 16 行 `on_message(body)` 是污点边界：本文件没有任何 request/input/environ 等显式 web 入口，但该函数是消息队列消费者回调，`body` 为外部提交的消息体载荷，公开接口传入的内容必须按不可信数据处理，是等效污点源。
+2. 第 19 行 `body.get("template")` 提取外部可控模板字符串；第 20-21 行 `user`、`action` 同样来自消息体，均为污染数据。
+3. 第 13 行 `sanitize_placeholder` 是唯一防御：字符白名单过滤。但它把 `{}`、`.`、`_`、字母数字全部放行，攻击者可提交形如 `{user.__init__.__globals__}` 的 payload 完整通过过滤，属于可绕过的弱防御，不构成有效防护。
+4. 第 28 行将污染的 `safe_template` 同时作为 `Formatter` 的格式串与 `LogRecord.msg`；第 36 行 `fmt.format(record)` 是危险 sink——logging 的 Formatter 使用 `str.format` 语义渲染 msg，用户可控格式串可触发属性链遍历，泄露内部对象/敏感全局变量（CWE-1336）。
+5. 数据流汇总：line 16 回调参数 body → line 19 template → line 26 safe_template（弱过滤可绕过）→ line 28 Formatter/LogRecord.msg → line 36 fmt.format(record) sink；user/action 经 args 传入亦在同一渲染路径中。
+6. 第二入口检查：文件内无其他路由、HTTP handler 或间接调用点，`on_message` 是唯一入口；但任何向该队列投递消息的外部生产者均可触达 sink，替代通道即消息队列本身，故确认存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 日志格式化字符串注入（Format String Injection via logging.Formatter）", "risk_level": "High", "source": "line 16: 回调参数 body（消息体载荷，外部可控）", "sink": "line 36: fmt.format(record) 使用用户可控格式串渲染日志", "explanation": "主链：line 16 回调参数 body -> line 19 body.get('template') -> line 26 sanitize_placeholder 白名单过滤（{}._与字母数字均放行，可用 {user.__init__.__globals__} 类 payload 绕过）-> line 28 Formatter(safe_template) 与 LogRecord.msg -> line 36 fmt.format(record) 触发 str.format 属性遍历泄露敏感信息；防御分析：仅第 13 行字符白名单为黑名单式弱防御，位置在 source 之后、sink 之前，覆盖面不足且可绕过，非有效防御；第二入口检查：文件内无其他路由或 HTTP 入口，on_message 为唯一入口，但消息队列本身即为替代通道，任何外部生产者均可投递恶意 template 触达 sink", "fix_suggestion": "line 36: 不将外部数据用作格式串，改为固定模板常量并以参数化方式记录（如 logger.info('user=%s action=%s', user, action)），或在渲染前用 re.fullmatch 校验 template 仅含预定义占位符集合"}
+```

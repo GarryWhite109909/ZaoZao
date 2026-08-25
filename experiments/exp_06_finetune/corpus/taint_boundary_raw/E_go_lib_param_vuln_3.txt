@@ -1,0 +1,67 @@
+LANG: go
+```go
+// Package richtext 提供富文本/日志格式化能力。
+// 本模块被上层服务调用：上层将外部提交的文本内容传入后，
+// 内部会解析其中的内嵌 XML 片段（如自定义表情/附件元数据）并渲染为 HTML。
+package richtext
+
+import (
+	"encoding/xml"
+	"fmt"
+	"strings"
+)
+
+// RenderText 接收外部提交的富文本，提取 [xml]...[/xml] 标记内的
+// XML 元数据片段进行解析，用于生成附件摘要。
+func RenderText(content string) (string, error) {
+	var out strings.Builder
+	rest := content
+	for {
+		start := strings.Index(rest, "[xml]")
+		if start < 0 {
+			out.WriteString(rest)
+			break
+		}
+		end := strings.Index(rest[start:], "[/xml]")
+		if end < 0 {
+			out.WriteString(rest)
+			break
+		}
+		out.WriteString(rest[:start])
+		frag := rest[start+len("[xml]") : start+end]
+
+		// 弱防御：仅拒绝包含 DOCTYPE 的片段
+		if strings.Contains(strings.ToUpper(frag), "DOCTYPE") {
+			frag = strings.ReplaceAll(frag, "DOCTYPE", "")
+		}
+
+		var meta AttachmentMeta
+		d := xml.NewDecoder(strings.NewReader(frag))
+		if err := d.Decode(&meta); err != nil {
+			return "", fmt.Errorf("parse meta: %w", err)
+		}
+		fmt.Fprintf(&out, "<b>%s</b> (%d bytes)", meta.Name, meta.Size)
+		rest = rest[start+end+len("[/xml]"):]
+	}
+	return out.String(), nil
+}
+
+type AttachmentMeta struct {
+	Name string `xml:"name"`
+	Size int    `xml:"size"`
+}
+```
+
+1. 第 14 行 `RenderText(content string)` 是污点边界：本文件没有任何 request/input 等显式 web 入口，但该公开函数的参数承载上层服务传入的外部提交文本，按不可信数据处理，是等效污点源。
+
+2. 第 20-27 行循环扫描 `[xml]...[/xml]` 标记，第 26 行将标记内片段赋给 `frag`——参数 `content` 的子串直接进入 `frag`，污点传播成立。
+
+3. 第 30-32 行是唯一防御：检测到 `DOCTYPE` 时用 `strings.ReplaceAll` 删除。这是可绕过的弱防御——攻击者可用大小写混合之外的变体如 `<!DOCTYPExxx>` 拆分、XML 注释包裹 `<!--DOCTYPE-->`、或利用实体展开（billion laughs）等无需 DOCTYPE 的 XXE 向量；且未设置 `d.Entity = xml.HTMLEntity` 或禁用实体解析。
+
+4. 第 35-37 行 `xml.NewDecoder(...).Decode(&meta)` 是 CWE-611 sink：Go 标准库 `encoding/xml` 默认会解析内部实体定义与外部 DTD 引用，攻击者构造含恶意实体/外部 DTD 的片段即可触发 XXE（信息泄露或 SSRF）。
+
+5. 第二入口检查：文件中无路由注册、无 HTTP 处理器、无其他读取外部数据的通道；唯一入口即第 14 行函数参数，所有数据流汇聚于第 36 行 Decode，结论成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 XML 外部实体引用不当（XXE）", "risk_level": "High", "source": "line 14: RenderText 函数参数 content（上层传入的外部提交文本）", "sink": "line 36: xml.NewDecoder(...).Decode 解析外部可控 XML 片段", "explanation": "主链：line 14 参数 content -> line 26 frag 子串 -> line 31 ReplaceAll 弱过滤 -> line 36 Decode 触发 XXE；防御分析：line 30-32 仅删除 DOCTYPE 字符串，属黑名单式弱防御，可通过 XML 注释包裹、实体展开等无需 DOCTYPE 的向量绕过，且未禁用实体解析；第二入口检查：本文件无路由/web 处理器/其他外部通道，唯一入口为函数参数，全部流向同一 sink", "fix_suggestion": "line 35: 使用 xml.Decoder 并设置 d.Strict 与白名单实体（d.Entity 仅保留预定义实体），或改用禁止 DTD 的安全解析器"}
+```

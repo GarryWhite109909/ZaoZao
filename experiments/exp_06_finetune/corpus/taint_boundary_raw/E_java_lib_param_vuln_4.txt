@@ -1,0 +1,43 @@
+LANG: java
+```java
+package com.acme.etl.adapter;
+
+import org.w3c.dom.Document;
+import javax.xml.parsers.DocumentBuilderFactory;
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * 外部记录导入适配器：被上层同步服务调用，参数 record 为外部系统推送的原始报文。
+ */
+public class RecordImportAdapter {
+
+    /** 弱防御：仅做关键字黑名单替换，可被大小写/嵌套实体绕过 */
+    private static String sanitize(String raw) {
+        return raw.replace("ENTITY", "").replace("entity", "");
+    }
+
+    public ImportResult parseRecord(String record) {
+        try {
+            String cleaned = sanitize(record);
+            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+            // 未禁用 DTD 与外部实体
+            Document doc = dbf.newDocumentBuilder()
+                    .parse(new ByteArrayInputStream(cleaned.getBytes(StandardCharsets.UTF_8)));
+            return new ImportResult(doc.getDocumentElement().getTagName(), true);
+        } catch (Exception e) {
+            return new ImportResult("parse_error", false);
+        }
+    }
+}
+```
+
+1. 第 1 行（污点边界）：本文件无 request/input/environ 等显式 web 入口，但第 14 行公开方法 `parseRecord(String record)` 的参数承载上层服务传入的外部系统报文，按不可信数据处理，是等效污点源。
+2. 第 10-12 行的 `sanitize` 仅为字符串黑名单替换，攻击者可用 `<!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>` 中 `ENTITY` 拆分写法（如利用 XML 注释、CDATA 或大小写混合变体如 `EntITY`）绕过，且未覆盖 DOCTYPE/SYSTEM 等关键字，属可绕过弱防御，非有效防护。
+3. 第 16-18 行：污点字符串经 `cleaned` 直接进入 `DocumentBuilderFactory.newInstance()` 创建的解析器并 `parse(...)`；第 17 行未调用 `setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)`，也未禁用外部实体与外部 DTD 加载，构成 XXE sink。
+4. 数据流验证：record(第14行) → sanitize(第11行) → cleaned → parse(第18行)，全程无有效防御，外部实体声明可在解析时触发本地文件读取或内网 SSRF。
+5. 第二入口检查：文件内无路由注册、无其他公开方法接收数据，唯一通道是 `parseRecord` 参数；但该公开接口本身即等效入口，结论成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 Improper Restriction of XML External Entity Reference", "risk_level": "High", "source": "line 14: parseRecord 的参数 record（上层服务传入的外部报文）", "sink": "line 18: DocumentBuilder.parse 解析含外部实体的 XML", "explanation": "主链: line 14 参数 record -> line 11 sanitize 黑名单替换 -> line 18 parse 触发 XXE; 防御分析: line 10-12 仅对 ENTITY 关键字做字符串替换, 可通过大小写混合/拆分构造及 DOCTYPE/SYSTEM 未过滤绕过, 且解析器未禁用 doctype-decl 与外部实体; 第二入口检查: 文件无路由或其他公开数据入口, 唯一通道为 parseRecord 参数, 该公开接口即等效污点边界, 结论为存在漏洞", "fix_suggestion": "line 17: 调用 setFeature 禁用 disallow-doctype-decl 并关闭 external-general-entities/external-parameter-entities"}
+```

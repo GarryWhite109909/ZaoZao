@@ -1,0 +1,46 @@
+LANG: php
+```php
+<?php
+// ArchiveExtractor.php — 归档解包模块，被上层后台服务调用（消费归档处理队列）
+// 职责：读取外部提交的 .xml 归档清单文件并按清单恢复文件
+
+namespace App\Archive;
+
+class ArchiveExtractor
+{
+    // $manifestPath 为外部提交的归档包内清单文件路径
+    public function extract(string $manifestPath): void
+    {
+        if (!file_exists($manifestPath)) {
+            throw new \RuntimeException('manifest missing');
+        }
+        // 读取归档内 manifest.xml —— 内容完全由外部提交者控制
+        $raw = file_get_contents($manifestPath);
+
+        // 弱防御：仅做字符串替换，试图去掉 DOCTYPE 声明，可被大小写/空白/编码绕过
+        $raw = str_ireplace(['<!DOCTYPE', '<!ENTITY'], '', $raw);
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        // XXE：未禁用外部实体加载
+        $dom->loadXML($raw, LIBXML_NOENT);
+
+        foreach ($dom->getElementsByTagName('entry') as $entry) {
+            $name = $entry->getAttribute('path');
+            $data = $entry->textContent;
+            file_put_contents('/var/archive/restore/' . basename($name), $data);
+        }
+    }
+}
+```
+
+1. 污点边界：本文件无 request/input/environ 等显式 web 入口；污点源是第 15 行 `file_get_contents($manifestPath)` 读取的归档内 manifest.xml——该文件来自外部提交者上传的归档包，其全部字节内容必须按不可信数据处理，是等效污点源。
+2. 第 20 行 `str_ireplace(['<!DOCTYPE','<!ENTITY'],...)` 是黑名单式弱防御：可绕过方式包括 `<!DOCTYPE` 内插入空白/换行（如 `<! DOCTYPE`）、使用 `<?xml-stylesheet?>` 引导、UTF-16 编码使替换不匹配、或用参数实体嵌套定义实体规避字面量 `<!ENTITY`。
+3. 第 24 行 `$dom->loadXML($raw, LIBXML_NOENT)` 未传 `LIBXML_NONET|LIBXML_NOENT` 之外的禁用外部加载标志，也未先调用 `libxml_disable_entity_loader(true)`（PHP<8.0）或设置 `LIBXML_DTDLOAD` 排除项；`LIBXML_NOENT` 反而会展开实体。污点数据直达 sink。
+4. Sink 可达性确认：攻击者构造 manifest 如 `<!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r><e>&xxe;</e></r>`，经替换后仍可解析（如编码变体），实体内容被读出并写入 `/var/archive/restore/` 文件或通过错误信息外泄，形成 CWE-611 完整链路。
+5. 第二入口检查：本类仅一个公开方法 `extract()`，无其他路由、参数或间接调用通道；唯一外部数据通道就是被解析的 manifest.xml 文件内容，结论成立。
+6. 防御覆盖面总结：仅第 20 行一处可绕过过滤，无 DTD 禁用、无白名单校验，全程无有效防御。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 XML External Entity Injection (XXE)", "risk_level": "Critical", "source": "line 15: file_get_contents 读取外部提交归档内的 manifest.xml 内容", "sink": "line 24: loadXML 解析未禁用外部实体的 XML", "explanation": "主链：line 15 读取不可信 manifest.xml -> line 20 str_ireplace 黑名单过滤（可用大小写混合空白、UTF-16 编码、参数实体嵌套绕过）-> line 24 loadXML 且启用 LIBXML_NOENT 未禁用外部实体 -> 实体展开读取本地文件并经 line 28 写入磁盘外泄；第二入口检查：本类仅有 extract 一个公开方法，无其他路由或间接调用通道，唯一外部数据通道即被解析的归档清单文件", "fix_suggestion": "line 24: 使用 DOMDocument 并传入 LIBXML_NONET | LIBXML_COMPACT 且不使用 LIBXML_NOENT，同时 PHP>=8.0 默认禁用实体加载，或改用安全解析器并在解析前校验文档不含 DOCTYPE"}
+```

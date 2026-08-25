@@ -1,0 +1,35 @@
+## 编号分析
+
+**入口点枚举（全文通读）**
+
+1. **第 29 行**：唯一对外入口 `parseSignature(signature)`，参数为字符串。该字符串在 JSONata 中来自用户编写的表达式里自定义函数的签名定义（如 `<f:s(n)-:n>`），即攻击者若能提交 JSONata 表达式，即可完全控制此字符串内容。
+2. **第 37–142 行**：逐字符解析循环，是所有数据流的起点。
+3. **第 149 行起**：`getSymbol`、`validate`、`throwValidationError` 为运行时回调，接收的是已验证参数，非外部直接输入。
+
+**source→sink 数据流逐一验证**
+
+- **流 1：choice → 字符类注入**
+  - 第 117–118 行：`findClosingBracket` 定位括号后，`choice = signature.substring(position+1, endParen)`，内容完全由攻击者控制。
+  - 第 121 行：`param.regex = '[' + choice + 'm]'` —— **无任何转义或白名单校验**，攻击者可注入 `]`、`*`、`+`、`{n,m}` 等正则元字符。
+  - Sink：第 148 行 `new RegExp(regexStr)` 将其编译进最终正则。
+
+- **流 2：prevParam.regex → contextRegex**
+  - 第 107–108 行：`new RegExp(prevParam.regex)` 直接用拼接出的片段构造正则；由于流 1 可污染 `param.regex`，此处同样被污染。
+
+- **流 3：整体签名 → 主正则**
+  - 第 143–148 行：`regexStr` 由各 `param.regex` 拼接后 `new RegExp(regexStr)`。攻击者可通过嵌套 `(())`、`+`、`?` 组合制造灾难性回溯模式（如 `((((a+)*)*)*)+` 类结构）。
+
+- **流 4：throwValidationError 增量匹配**
+  - 约第 210–230 行：循环中 `badSig.match(partialPattern)` 对逐步增长的正则反复执行，配合被污染的正则可放大回溯开销。
+
+**防御有效性检查**
+
+- 全文对 `signature` 内容**没有任何字符白名单、黑名单或转义处理**；唯一的限制是第 119 行拒绝含 `<` 的 choice（且仅抛错，不防注入）。
+- 第 132–135 行的 subtype 提取同样未净化，但仅用于类型比较，不进入正则，风险较低。
+- 无第二入口/替代通道：本文件仅导出 `parseSignature`（末尾 `module.exports`），所有污染路径均汇聚于上述三个 `new RegExp` 调用点。
+
+**结论**：存在真实漏洞——攻击者可控字符串未经转义直接拼入 `RegExp` 构造器，导致正则注入与潜在 ReDoS（JSONata 官方后续版本已加入转义修复）。前提是应用允许执行不可信 JSONata 表达式，故实际风险取决于部署场景，定为中等偏低。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1333 正则特殊元素低效解析(ReDoS)/CWE-185 不正确正则", "risk_level": "medium", "source": "line 29: parseSignature 的 signature 参数, 来自用户自定义 JSONata 函数签名, 攻击者可控", "sink": "line 121 与 line 148: param.regex 拼接进字符类后传入 new RegExp(regexStr); 另有 line 108 new RegExp(prevParam.regex)", "explanation": "攻击者控制的签名字符串在第 118 行被截取为 choice 后, 于第 121 行以 [ + choice + m ] 形式未加任何转义拼入正则字符类, 最终在第 148 行经 new RegExp 编译; 注入 ] * + {n,m} 等元字符可改变正则语义并构造嵌套量词引发灾难性回溯, 且 throwValidationError 中增量 match 会放大回溯成本 -> 当应用执行不可信 JSONata 表达式时可造成 CPU 耗尽型 DoS 或类型校验绕过", "fix_suggestion": "在第 121 行拼接前对 choice 做正则元字符转义(如替换为反斜杠转义形式), 并对整个 signature 施加字符白名单校验, 仅允许 s n b l o a f j x - ? + ( ) < > : 等合法符号"}
+```

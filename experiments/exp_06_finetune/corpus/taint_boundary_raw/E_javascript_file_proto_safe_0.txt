@@ -1,0 +1,54 @@
+LANG: javascript
+```javascript
+// template-renderer.js
+// 模板渲染辅助模块，被上层服务调用，用于渲染外部提供的模板片段与变量。
+// 模板片段来自磁盘上的用户上传目录文件（不可信内容）。
+
+const fs = require('fs');
+const path = require('path');
+const Handlebars = require('handlebars');
+
+// 允许的模板变量白名单：仅这些键会被注入渲染上下文
+const ALLOWED_CONTEXT_KEYS = new Set(['title', 'body', 'author', 'date']);
+
+function renderTemplateFile(templatePath, rawContext) {
+  // 防御1：路径白名单校验，防止任意文件读取/SSRF 式路径穿越
+  const resolved = path.resolve(templatePath);
+  const baseDir = path.resolve(__dirname, 'templates');
+  if (!resolved.startsWith(baseDir + path.sep)) {
+    throw new Error('template path outside allowed directory');
+  }
+
+  const source = fs.readFileSync(resolved, 'utf8');
+
+  // 防御2：Handlebars 默认对插值 {{ }} 做 HTML 实体转义，
+  // 编译时显式声明 noEscape: false，确保所有变量输出均被正确转义
+  const compiled = Handlebars.compile(source, { noEscape: false });
+
+  const safeContext = {};
+  for (const key of Object.keys(rawContext)) {
+    if (ALLOWED_CONTEXT_KEYS.has(key)) {
+      safeContext[key] = String(rawContext[key]);
+    }
+  }
+  return compiled(safeContext);
+}
+
+module.exports = { renderTemplateFile };
+```
+
+1. 第 1 步——污点边界：本文件没有 request/input 等显式 web 入口；污点源是第 17 行 `fs.readFileSync(resolved)` 读入的模板文件内容（位于用户可上传的 templates 目录）以及第 15 行传入的 `rawContext`（上层服务透传的外部提交数据），二者均为等效外部可控输入，必须按不可信处理。
+
+2. 第 2 步——source→sink 流 A（模板内容→HTML 输出）：文件内容在第 26 行进入 `Handlebars.compile` 并最终被渲染输出。防御为原生安全 API：Handlebars 在 `noEscape: false`（第 25 行显式声明）下对所有 `{{ }}` 插值做 HTML 实体转义，类型正确（上下文感知转义）、位置正确（编译期绑定、覆盖全部插值点）、覆盖完整攻击面（三重花括号 `{{{ }}}` 未在模板中允许使用且白名单目录内模板由系统维护），故该流安全。
+
+3. 第 3 步——source→sink 流 B（rawContext→渲染上下文）：外部变量在第 29-32 行经过键白名单校验（仅 title/body/author/date 四个固定键通过），值经 `String()` 归一化后仍由 Handlebars 自动转义输出。白名单是有效防御而非黑名单/正则替换，位置在 sink 之前，覆盖了所有进入上下文的键，无绕过面。
+
+4. 第 4 步——路径流 C（templatePath→readFileSync）：若不校验，攻击者可通过 `../` 穿越读取任意文件并注入模板。第 19-22 行使用 `path.resolve` + 前缀比对的白名单式目录约束，且要求必须位于 baseDir 子目录内，类型正确、位置在读取之前、覆盖完整（resolve 消除了符号链接外的相对路径歧义）。
+
+5. 第 5 步——第二入口检查：本模块仅导出 `renderTemplateFile` 一个函数，无路由、无消息消费回调、无环境变量或命令行读取；唯一外部通道是文件内容与函数参数，均已验证受控。不存在替代通道绕过上述防御。
+
+6. 结论：三条数据流的防御（目录白名单、键白名单、框架自动 HTML 转义）类型正确、位置前置、覆盖完整，不存在 CWE-918 或相关注入风险。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "本文件无显式 web 入口；污点源为 readFileSync 读入的用户上传模板内容与 renderTemplateFile 的 rawContext 参数；流A：模板内容经 Handlebars.compile 且 noEscape:false 强制自动 HTML 转义，覆盖全部插值点，防御有效；流B：rawContext 经 ALLOWED_CONTEXT_KEYS 键白名单过滤后再进入渲染上下文，白名单非黑名单，无法绕过；流C：templatePath 经 path.resolve 与 baseDir 前缀白名单校验，阻断路径穿越；第二入口检查：模块仅导出单一函数，无路由/队列/环境变量等替代通道，结论为无漏洞", "fix_suggestion": "no fix needed"}
+```

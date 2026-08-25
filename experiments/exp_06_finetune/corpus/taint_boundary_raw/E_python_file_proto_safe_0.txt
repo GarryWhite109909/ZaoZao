@@ -1,0 +1,47 @@
+LANG: python
+```python
+"""数据导入适配器：解析外部系统导出的记录文件并写入数据库。
+
+本模块由上层导入服务调用，传入待处理的导出文件路径。
+"""
+
+import csv
+import os
+import sqlite3
+
+# 允许导入的表名白名单（外部系统约定的目标表）
+ALLOWED_TABLES = {"customers", "orders", "products"}
+
+DB_PATH = "/var/lib/importer/app.db"
+
+
+def import_records(file_path: str, target_table: str) -> int:
+    """解析 CSV 导出文件，将记录批量插入目标表，返回导入条数。"""
+    if target_table not in ALLOWED_TABLES:
+        raise ValueError("unsupported table")
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        with open(file_path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            rows = []
+            for record in reader:
+                rows.append((record.get("id"), record.get("name")))
+        # 使用参数化占位符执行插入，表名来自白名单
+        sql = f"INSERT INTO {target_table} (ext_id, name) VALUES (?, ?)"
+        conn.executemany(sql, rows)
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 21 行 `open(file_path)` 解析的外部系统导出 CSV 文件内容——`record` 的字段值由被解析的文件承载，属于等效不可信输入（外部提交的内容必须按攻击者可控处理），同时第 20 行参数 `target_table` 也可能受上游影响。
+2. 数据流一（文件内容 → SQL）：第 23-24 行把 `record.get("id")/record.get("name")` 收集进 `rows`，第 27 行经 `conn.executemany(sql, rows)` 进入 SQL 执行 sink。防御为第 27 行 SQL 中的 `?` 占位符参数化查询：值始终作为绑定参数传递给驱动，永不拼入 SQL 文本，类型正确（sqlite3 原生预编译机制）、位置正确（在 sink 执行前最后一步）、覆盖完整（rows 中所有字段全部走参数通道，无任何字符串拼接）。
+3. 数据流二（target_table → SQL 表名）：表名无法参数化，但第 22 行先做严格白名单校验 `if target_table not in ALLOWED_TABLES`，不匹配即抛异常终止；只有集合内三个固定标识符能到达第 26 行 f-string，属于白名单校验型有效防御，位置在 sink 之前、覆盖该参数的全部使用点。
+4. 无其他 sink：文件仅以只读方式打开（第 21 行），未调用 os.system/subprocess/os.remove 等危险操作；`file_path` 本身只用于读取，不参与命令或路径删除类操作，故 CWE-22 相关的任意文件读/删面不存在。
+5. 第二入口检查：模块无路由、无全局可变状态接收外部数据，唯一入口是 `import_records` 的两个参数；两条 source→sink 流均被上述防御完整覆盖，替代通道不存在。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第21行解析的外部CSV文件内容及第20行target_table参数；流一：记录字段经executemany的?占位符参数化进入SQL，驱动层预编译保证值不拼接进语句，防御类型/位置/覆盖均正确；流二：表名经第22行ALLOWED_TABLES白名单校验后方可进入f-string，非白名单值直接抛异常；文件仅只读打开，无os.remove/subprocess等CWE-22相关sink；第二入口检查确认无其他路由或间接调用通道，所有数据流均有有效防御。", "fix_suggestion": "no fix needed"}
+```

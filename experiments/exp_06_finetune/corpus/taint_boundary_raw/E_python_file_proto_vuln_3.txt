@@ -1,0 +1,42 @@
+LANG: python
+```python
+# asset_locator.py — 静态资源定位工具
+# 被上层服务调用：传入客户端上传的 manifest 文件路径，解析后定位服务器上的静态资源。
+import os
+import xml.etree.ElementTree as ET
+
+ASSET_ROOT = "/srv/static"
+
+def locate_assets(manifest_path):
+    # manifest 为外部提交的 XML 文件，内容不可信
+    tree = ET.parse(manifest_path)          # 第 9 行: source — 解析外部文件
+    root = tree.getroot()
+
+    results = []
+    for entry in root.findall("asset"):
+        name = entry.get("name")            # 第 13 行: 外部可控属性
+        # 弱防御：仅拒绝包含 ".." 的名字，可用编码/绝对路径绕过
+        if ".." in name:
+            continue                        # 第 15 行: 可绕过黑名单
+        target = os.path.join(ASSET_ROOT, name)
+        with open(target, "rb") as f:       # 第 17 行: sink — XXE 读取本地文件
+            data = f.read()
+        results.append((name, len(data)))
+    return results
+
+def parse_index(index_bytes):
+    # 协议报文入口：上层把收到的索引报文字节直接交给本函数
+    import io
+    root = ET.fromstring(index_bytes)       # 第 24 行: source — 报文内嵌 DTD 可触发 XXE
+    return [e.text for e in root.iter("file")]
+```
+
+1. 第 1 步（污点边界）：本文件没有任何 request/input/environ 等显式 web 入口；污点边界是被解析的文件与协议报文——manifest_path 指向的 XML 文件（第 9 行）和 index_bytes 报文（第 24 行）均来自外部提交，必须按不可信数据处理，是等效污点源。
+2. 第 2 步：第 9 行 `ET.parse` 使用标准库 xml.etree 解析外部 XML。Python 的 ElementTree 默认不解析外部实体，但若部署环境替换为 lxml（默认 resolve_entities=True）或代码演进引入 defusedxml 缺失的解析器，DTD 中定义的外部实体（如 `<!ENTITY xxe SYSTEM "file:///etc/passwd">`）会被展开，实体内容随后经第 13 行进入业务数据流。
+3. 第 3 步：第 15 行的黑名单只检查 `".." in name`，属于可绕过弱防御——攻击者可用绝对路径 `/etc/passwd`、URL 形式 `file:///etc/shadow` 或实体展开结果绕过；且该检查完全不覆盖 XXE 实体展开路径，实体值在属性读取前已被替换，黑名单形同虚设。
+4. 第 4 步：第 17 行 `open(target, "rb")` 是 CWE-611 相关 sink 链的落点：XXE 展开的实体作为 name 进入路径拼接并读取任意本地文件，长度信息回传给调用方形成回显通道；第 24 行 `ET.fromstring` 同理直接消费报文中的 DTD，无任何禁用 DOCTYPE/实体的配置。
+5. 第 5 步（第二入口检查）：除 manifest 文件外，第 24 行的报文解析构成第二条独立污点通道，两条链均无有效防御（无 defusedxml、无禁用 DTD、黑名单可绕过），支撑结论：存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 XML 外部实体引用 (XXE)", "risk_level": "High", "source": "line 9: ET.parse(manifest_path) 解析外部提交的 XML 文件; line 24: ET.fromstring(index_bytes) 解析外部协议报文", "sink": "line 17: open(target, 'rb') 以实体展开结果拼接路径读取本地文件", "explanation": "主链: line 9 解析外部 XML -> line 13 读取可控属性 name -> line 15 黑名单仅拦 '..' 可被绝对路径 file:/// 绕过且不覆盖实体展开 -> line 16 join -> line 17 open 读取任意文件; 第二链: line 24 fromstring 直接消费报文内 DTD, 无禁用实体配置, 展开结果经 iter('file') 返回调用方形成回显; 全程无 defusedxml/禁用 DTD 等有效防御", "fix_suggestion": "line 9 与 line 24: 改用 defusedxml.ElementTree.parse/fromstring 禁用 DTD 与外部实体, 并对 name 做白名单字符校验"}
+```

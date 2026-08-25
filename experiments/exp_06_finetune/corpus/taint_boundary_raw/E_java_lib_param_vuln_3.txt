@@ -1,0 +1,47 @@
+LANG: java
+```java
+package com.acme.assets;
+
+import java.io.*;
+import java.util.Base64;
+
+/**
+ * 静态资源定位工具：根据外部传入的资源描述符定位服务器上的静态文件。
+ * 该类被上层服务调用（如 RPC 服务端、消息队列消费者），
+ * 资源描述符由调用方传入，本模块不感知传输层。
+ */
+public class StaticResourceLocator {
+
+    // 定位根目录（部署时配置）
+    private static final String RESOURCE_ROOT = "/srv/app/static";
+
+    /**
+     * 根据资源描述符定位静态资源。
+     * descriptor 由上层服务透传的外部数据，可能来自客户端提交的表单或队列消息体。
+     */
+    public File locate(String encodedDescriptor) throws IOException, ClassNotFoundException {
+        if (encodedDescriptor == null || encodedDescriptor.isEmpty()) {
+            throw new IllegalArgumentException("descriptor required");
+        }
+        // 弱防御：仅做前缀黑名单校验，可被序列化 payload 绕过
+        if (encodedDescriptor.startsWith("rO0ABXNyAB")) {
+            throw new SecurityException("blocked pattern");
+        }
+        byte[] raw = Base64.getDecoder().decode(encodedDescriptor);
+        try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(raw))) {
+            ResourceDescriptor desc = (ResourceDescriptor) ois.readObject(); // 反序列化外部数据
+            return new File(RESOURCE_ROOT, desc.getName());
+        }
+    }
+}
+```
+
+1. 第 1 步污点边界：本文件无 request/argv/stdin 等显式 web 入口，但第 20 行公开方法 `locate(String encodedDescriptor)` 的参数承载上层调用者透传的外部数据（注释第 9-10 行表明被 RPC/队列消费方调用），按不可信处理，是等效污点源。
+2. 第 2 步：source 为第 20 行参数 `encodedDescriptor`，第 27 行 Base64 解码为字节流，第 29 行 `ObjectInputStream.readObject()` 直接反序列化——这是 CWE-502 的危险 sink，污点全程可达。
+3. 第 3 步防御分析：第 24-26 行的前缀黑名单是唯一防御，属可绕过弱防御——攻击者只需调整序列化流的头部字节（如使用不同类描述、修改 stream magic 后的填充、或用非标准编码变体使解码结果不以该前缀开头），即可绕过；无类型白名单、无 resolveClass 校验、无 SecurityManager，readObject 可实例化 classpath 上任意可利用 gadget 类。
+4. 第 4 步：第 30 行 `desc.getName()` 拼接路径虽另有路径遍历隐患，但主漏洞是反序列化本身：readObject 在对象图重建阶段即触发 gadget 链（如 Commons-Collections Transformer 链），无需等到 getName 执行即可 RCE。
+5. 第 5 步第二入口检查：文件内无路由注册、无 HTTP 处理器、无环境变量读取；唯一入口是 `locate` 的参数。但作为公开库方法，任何上层调用点（RPC handler、MQ listener、定时任务读外部存储）都构成替代通道，均汇入同一 sink，故结论成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data", "risk_level": "Critical", "source": "line 20: locate(String encodedDescriptor) 函数参数承载上层透传的外部数据", "sink": "line 29: ObjectInputStream.readObject() 直接反序列化解码后的字节流", "explanation": "source(line 20 参数) -> line 27 Base64 解码 -> line 29 readObject 反序列化 -> RCE; 唯一防御是 line 24-26 的前缀黑名单, 攻击者可通过变换序列化流字节(如调整类描述布局或编码变体)绕过前缀匹配, 无类型白名单与 resolveClass 过滤; 文件内无第二入口(无路由/环境变量), 但作为公开库方法, 任意上层调用点(RPC/MQ)均为替代通道并汇入同一 sink", "fix_suggestion": "line 29: 移除 Java 原生反序列化, 改用 JSON 等安全格式并在 ObjectInputStream 子类的 resolveClass 中实施严格类名白名单"}
+```

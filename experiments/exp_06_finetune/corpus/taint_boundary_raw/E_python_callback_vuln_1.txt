@@ -1,0 +1,46 @@
+LANG: python
+```python
+"""template_worker.py — 模板渲染辅助模块，被上层服务作为队列消费者调用"""
+import xml.etree.ElementTree as ET
+from celery import Celery
+
+app = Celery('render', broker='redis://localhost:6379/0')
+
+
+def _sanitize_fragment(fragment: str) -> str:
+    """弱防御：仅剔除已知的 XXE 关键字（可绕过）"""
+    for kw in ("<!DOCTYPE", "SYSTEM", "ENTITY"):
+        fragment = fragment.replace(kw, "")
+    return fragment
+
+
+@app.task(name="render.template_fragment")
+def render_template_fragment(message_body: dict) -> str:
+    """消费消息队列：message_body 由外部生产者提交，承载模板片段与变量"""
+    template = message_body.get("template", "")
+    variables = message_body.get("variables", {})
+
+    # 弱过滤：大小写变体 / 编码实体即可绕过字符串替换
+    cleaned = _sanitize_fragment(template)
+
+    # 将外部模板片段包装为 XML 文档后解析
+    wrapped = f"<root>{cleaned}</root>"
+    root = ET.fromstring(wrapped)  # sink: 默认解析器未禁用外部实体
+    node = root.find("content")
+    text = node.text if node is not None else ""
+
+    # 变量同样来自消息体，直接拼入渲染结果
+    rendered = text.format(**variables)
+    return rendered
+```
+
+1. **污点边界**：本文件没有任何 request/input/environ 等显式 web 入口；第 15 行 `render_template_fragment(message_body)` 是 Celery 消息队列消费者回调，`message_body` 即事件载荷，由外部生产者提交到 broker，属于公开接口参数，必须按不可信数据处理，是等效污点源。
+2. **source→sink 主链**：第 16-17 行从 `message_body` 取出 `template` 与 `variables`；第 24 行将 `template` 包进 XML 字符串，第 25 行 `ET.fromstring(wrapped)` 为危险 sink——Python 的 xml.etree.ElementTree 默认不禁止 DTD/实体处理，攻击者注入 DOCTYPE/ENTITY 可读取本地文件或触发实体爆炸。
+3. **防御验证**：第 10-13 行 `_sanitize_fragment` 仅做精确字符串替换，属黑名单式弱防御：大小写变体（`<!doctype`）、空白混淆（`<! DOCTYPE`）、XML 字符引用（`&#83;YSTEM`）均可绕过；且该函数只作用于 `template`，对 `variables` 完全未覆盖。无任何有效防御（如 defusedxml、禁用 DTD 解析器）。
+4. **第二数据流**：第 28 行 `text.format(**variables)` 中 `variables` 同样源自回调载荷，若模板文本含 `{__init__...}` 类格式串可进一步泄露对象属性，但主漏洞链仍为 XXE。
+5. **第二入口检查**：本文件仅有一个入口即该 task 回调；无其他路由、CLI 参数或间接调用通道，所有污点均汇聚于 `message_body`，可达性唯一且确认。
+6. **结论**：外部可控模板片段未经有效净化直接进入 XML 解析器，构成 CWE-611 XXE。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 XML External Entity (XXE) Injection", "risk_level": "High", "source": "line 15: render_template_fragment 回调参数 message_body（消息队列事件载荷，外部生产者提交）", "sink": "line 25: ET.fromstring(wrapped) 使用默认解析器解析含外部模板片段的 XML", "explanation": "主链：line 17 message_body['template'] -> line 24 wrapped -> line 25 ET.fromstring 触发 XXE；防御分析：line 10-13 _sanitize_fragment 为精确字符串替换黑名单，可用大小写变体、空白插入、XML 字符引用编码绕过，且未覆盖 variables；第二入口检查：本文件仅有该 task 回调一个入口，无其他路由或间接通道，全部污点经 message_body 到达 sink", "fix_suggestion": "line 25: 改用 defusedxml.ElementTree.fromstring 或配置禁用 DTD 与外部实体的解析器"}
+```

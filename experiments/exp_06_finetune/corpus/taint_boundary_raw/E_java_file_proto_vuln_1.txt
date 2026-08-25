@@ -1,0 +1,44 @@
+LANG: java
+```java
+package com.acme.render;
+
+import java.io.*;
+import java.util.*;
+
+/**
+ * 模板渲染辅助类：从磁盘加载模板片段并反序列化其中的变量载荷。
+ * 被上层服务调用（模板文件由外部用户上传/同步到 templates 目录）。
+ */
+public class TemplateRenderer {
+
+    private static final String TEMPLATE_DIR = "/var/app/templates/";
+
+    public String render(String templateName) throws Exception {
+        File tpl = new File(TEMPLATE_DIR + templateName);
+        try (ObjectInputStream ois = new ObjectInputStream(
+                new BufferedInputStream(new FileInputStream(tpl)))) {
+            // 模板文件头部为变量载荷（Java 序列化格式），直接反序列化
+            Map<String, Object> vars = (Map<String, Object>) ois.readObject();
+            StringBuilder sb = new StringBuilder();
+            for (Map.Entry<String, Object> e : vars.entrySet()) {
+                sb.append(e.getKey()).append("=").append(e.getValue());
+            }
+            return sb.toString();
+        }
+    }
+}
+```
+
+1. 第 1 行污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 12 行 `render(templateName)` 接收的模板名与第 14-16 行从 `/var/app/templates/` 读取的文件内容——该目录下的模板文件由外部用户上传/同步，属于公开接口提交的内容，必须按不可信数据处理，是等效污点源。
+
+2. 第 15-16 行：`FileInputStream` 直接按拼接路径打开文件，`templateName` 未做任何规范化校验，存在路径穿越（如 `../../etc/cron.d/x`），扩大了攻击者可控制的文件范围。
+
+3. 第 17-19 行：文件字节流被直接交给 `ObjectInputStream.readObject()`，这是 CWE-502 的经典 sink。全程没有任何反序列化过滤器（无 `ObjectInputFilter`、无白名单校验），攻击者只需在可写目录放置一个 gadget 链序列化对象即可触发 RCE。
+
+4. 防御检查：代码中不存在黑名单、正则或字符串替换等弱防御，即也不存在“看似有防御实则可绕过”的情况；防御完全缺失，source→sink 直达可达。
+
+5. 第二入口检查：本模块仅暴露 `render(String)` 一个方法，无其他路由或间接调用；但该方法被上层服务消费，且模板目录本身即为替代通道——任何能写入该目录的外部通道（上传接口、共享挂载）都能注入恶意序列化载荷，结论成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 反序列化不可信数据", "risk_level": "Critical", "source": "line 12: render(templateName) 参数及 line 14-16 从外部可控 templates 目录读取的文件字节流", "sink": "line 19: ObjectInputStream.readObject() 反序列化", "explanation": "主链: 外部上传的模板文件内容 -> FileInputStream -> ObjectInputStream.readObject -> 任意类实例化/RCE; 路径穿越: line 15 拼接 templateName 未规范化, 攻击者可用 ../ 指向任意可读文件; 防御检查: 全程无 ObjectInputFilter 或类型白名单, 无黑名单/正则等弱防御, source 到 sink 无任何拦截; 第二入口: 本文件仅 render 一个入口, 但模板目录写入通道(上传/挂载)构成等效替代注入通道, 结论不变", "fix_suggestion": "line 17-19: 使用 ObjectInputFilter 白名单限制反序列化类型, 或改用 JSON 等安全格式存储变量载荷, 并对 templateName 做 getCanonicalPath 前缀校验防穿越"}
+```

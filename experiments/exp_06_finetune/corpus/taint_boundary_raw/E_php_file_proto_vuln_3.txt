@@ -1,0 +1,51 @@
+LANG: php
+```php
+<?php
+// src/Import/RecordAdapter.php
+// 数据导入适配器：由后台导入服务调用，处理外部系统推送的 JSONL 记录文件
+
+namespace App\Import;
+
+use PDO;
+
+class RecordAdapter
+{
+    private PDO $db;
+
+    public function __construct(PDO $db)
+    {
+        $this->db = $db;
+    }
+
+    // 上层导入服务传入外部系统生成的记录文件路径
+    public function importFromFile(string $filePath): int
+    {
+        $count = 0;
+        foreach (file($filePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+            $record = json_decode($line, true);
+            if (!is_array($record) || !isset($record['external_id'], $record['category'])) {
+                continue; // 跳过格式非法的行
+            }
+            // 弱防御：仅过滤单引号，攻击者可用反斜杠/双引号绕过
+            $category = str_replace("'", '', $record['category']);
+            $sql = "SELECT id FROM records WHERE external_id = '{$record['external_id']}' AND category = '$category'";
+            $stmt = $this->db->query($sql); // sink: 拼接 SQL 直接执行
+            if ($stmt && $stmt->fetchColumn() !== false) {
+                $count++;
+            }
+        }
+        return $count;
+    }
+}
+```
+
+1. 第 1 行污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 20 行 `file($filePath)` 读取的记录文件内容——该文件由外部系统生成并投递，属于公开接口接收的外部提交内容，必须按不可信数据处理，等效污点源成立。
+2. 第 21-23 行：每行经 `json_decode` 解析为数组，`$record['external_id']` 与 `$record['category']` 均直接来自被解析文件内容，无任何类型或内容校验（仅检查键存在），污点确立。
+3. 第 25 行：对 `$category` 仅做 `str_replace("'", '')` 的字符串替换——这是可绕过的弱防御：攻击者使用双引号闭合、反斜杠转义或 `'` 编码变体即可注入；且 `$record['external_id']` 完全未经过滤。
+4. 第 26-27 行：两个污点值直接拼入 SQL 字符串并在第 28 行 `$this->db->query($sql)` 执行，构成 source→sink 完整可达链，CWE-89 成立。攻击者可在文件中写入如 `{"external_id":"x' OR '1'='1","category":"a"}` 或利用 category 双引号注入实现任意查询乃至堆叠注入（视驱动配置）。
+5. 防御覆盖面核查：全链仅第 25 行一处弱过滤，位置在 sink 前但只覆盖 category 且方式可绕过；external_id 无任何处理；无参数化查询、无白名单校验，防御无效。
+6. 第二入口/替代通道检查：本模块唯一数据通道是 importFromFile 的文件内容解析，无其他路由、参数或间接调用点；即便如此，单条主链已足以确认漏洞存在。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL 注入", "risk_level": "Critical", "source": "line 20: file() 读取的外部系统记录文件内容（json_decode 后的 external_id/category 字段）", "sink": "line 28: db->query() 执行拼接的 SQL", "explanation": "流1: line 20 文件内容 -> line 22 json_decode -> line 26 external_id 未过滤直接拼入 SQL -> line 28 query 执行; 流2: line 20 文件内容 -> line 25 category 经 str_replace 单引号替换（可用双引号/反斜杠绕过） -> line 26 拼入 SQL -> line 28 query 执行; 全程无参数化查询或有效校验，第二入口检查确认本文件仅有文件解析这一条外部通道，但该通道已构成完整可达注入链", "fix_suggestion": "line 26: 改用预处理语句 prepare('SELECT id FROM records WHERE external_id = ? AND category = ?') 并 execute([$record['external_id'], $record['category']])"}
+```

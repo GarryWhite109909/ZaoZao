@@ -1,0 +1,47 @@
+LANG: javascript
+```javascript
+// ops-runner.js —— 运维命令封装库，被上层服务调用；消费 RabbitMQ 运维任务队列
+const amqp = require('amqplib');
+const { exec } = require('child_process');
+const fs = require('fs');
+
+// 将任务执行结果渲染进运维状态页（status.html 由内部仪表盘加载）
+function renderStatusPage(taskId, taskName, output) {
+  const html = `<html><body><h3>Task ${taskId}: ${taskName}</h3><pre>${output}</pre></body></html>`;
+  fs.writeFileSync('/var/www/dashboard/status.html', html);
+}
+
+async function startConsumer() {
+  const conn = await amqp.connect('amqp://localhost');
+  const ch = await conn.createChannel();
+  await ch.assertQueue('ops.tasks');
+  // 回调参数 msg 即消息体载荷，承载外部提交的任务内容
+  ch.consume('ops.tasks', (msg) => {
+    const payload = JSON.parse(msg.content.toString());
+    const taskId = payload.id;
+    const taskName = payload.name;            // 外部可控：任务名
+    const cmd = payload.command;              // 外部可控：待执行命令
+
+    // 弱防御：仅黑名单过滤 <script> 字面量（大小写敏感、可被编码绕过）
+    const safeName = String(taskName).replace(/<script>/gi, '');
+
+    exec(cmd, { timeout: 30000 }, (err, stdout) => {
+      if (err) return;
+      renderStatusPage(taskId, safeName, stdout);
+    });
+    ch.ack(msg);
+  });
+}
+
+module.exports = { startConsumer };
+```
+
+1. 第 1 行注释表明本模块由上层服务调用；第 20 行 `ch.consume('ops.tasks', (msg) => {...})` 是消息队列消费者回调。本文件没有任何 request/input 等显式 web 入口，但回调参数 `msg` 的消息体即外部提交的任务内容，是等效污点源，必须按不可信处理。
+2. 第 22-24 行从消息体解出 `payload.name` 与 `payload.command`，均为攻击者通过向 `ops.tasks` 队列投递消息即可完全控制的外部数据。
+3. 第 27 行对 `taskName` 仅做 `<script>` 字面量黑名单替换：可用 `<SCRIPT >`、`<img src=x onerror=...>`、HTML 实体编码等方式轻松绕过，属可绕过弱防御，不构成有效防护；且该过滤只覆盖 name，未覆盖任何其他字段。
+4. 第 30 行命令执行结果与第 28 行的 `safeName` 一并传入第 9 行 `renderStatusPage`；第 10 行用模板字符串将 `taskName` 与 `output` 直接拼入 HTML 并写入 `/var/www/dashboard/status.html`，无任何 HTML 转义——内部仪表盘加载该页面即触发存储型 XSS。source→sink 链：line 23 `payload.name` → line 27 弱过滤 → line 31 → line 9 → line 10 拼接写入；stdout 虽非直接外部输入，但任务名已足以注入。
+5. 第二入口检查：本文件仅有一个消费回调入口，无其他路由或导出的直接调用点（`module.exports` 只暴露 `startConsumer`），替代通道不存在；但单一入口即可完成污点注入，结论成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 存储型跨站脚本（XSS）：消息体字段未经转义拼入 HTML 状态页", "risk_level": "High", "source": "line 22: 消息队列回调参数 msg 解析出的 payload.name（外部可控消息体）", "sink": "line 10: renderStatusPage 中模板字符串拼接后 writeFileSync 写入 status.html", "explanation": "污点边界：本文件无 request/input 等显式 web 入口，但 line 20 消费者回调的消息体即外部提交内容，为等效污点源；主链 line 22 JSON.parse(msg.content) -> line 23 payload.name -> line 27 仅做 <script> 字面量黑名单替换（大小写敏感，可用 <img onerror> 或实体编码绕过）-> line 31 传入 renderStatusPage -> line 10 未转义拼入 HTML 写盘，仪表盘加载即触发存储型 XSS；stdout 流经同一 sink 但非主要可控源；第二入口检查：文件仅暴露 startConsumer 一个消费入口，无其他路由或间接调用通道，单入口即可完成注入", "fix_suggestion": "line 10: 对 taskName 与 output 统一做 HTML 实体转义（如 escape-html 库）后再拼入模板，移除无效的黑名单替换"}
+```

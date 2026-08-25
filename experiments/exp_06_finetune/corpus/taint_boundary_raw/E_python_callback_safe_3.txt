@@ -1,0 +1,50 @@
+LANG: python
+```python
+"""日志格式化插件：消费消息队列中的富文本格式化任务。
+
+被上层服务调用：worker 从队列拉取消息后调用 on_message。
+"""
+
+import logging
+from string import Template
+
+logger = logging.getLogger("fmt_worker")
+
+# 仅允许的模板占位符白名单
+_ALLOWED_FIELDS = frozenset({"title", "body", "author"})
+
+
+def _sanitize(value: str) -> str:
+    """转义 $ 字符，阻断 Template 占位符注入（CWE-1336）。"""
+    return value.replace("$", "$$")
+
+
+def on_message(payload: dict) -> str:
+    """队列消费者回调：payload 为外部提交的格式化任务消息体。"""
+    template_str = payload.get("template", "")
+    fields = payload.get("fields", {})
+
+    # 白名单校验：丢弃未知占位符，防止攻击者引入额外 substitution 点
+    clean_fields = {k: v for k, v in fields.items() if k in _ALLOWED_FIELDS}
+
+    # 防御点：对模板字符串本身做 $ 转义，使外部文本无法形成 ${...} 占位符
+    safe_template = Template(_sanitize(template_str))
+
+    rendered = safe_template.safe_substitute(clean_fields)
+    logger.info("rendered log entry: %s", rendered)
+    return rendered
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；第 22 行 `on_message(payload)` 的回调参数 `payload` 是消息队列消费者收到的外部消息体，承载外部可控数据，必须按不可信处理，是等效污点源。source→sink 可达性：`payload` 经第 23-24 行取出 `template_str` 与 `fields`，流向第 31 行 `Template(...)` 构造与第 33 行 `safe_substitute`，链路完整可达，CWE-1336 的危险 sink 即 Template 占位符求值。
+
+2. 数据流一（template → Template）：第 30 行 `_sanitize(template_str)` 将所有 `$` 替换为 `$$`（Template 的字面量转义语义），使外部文本无法构造 `${expr}` 或 `$identifier` 占位符。该防御类型正确——利用的是目标 API 自身的官方转义机制而非黑名单/正则过滤；位置正确——在进入 `Template()` 构造之前、污点数据首次接触 sink 语义处执行；覆盖完整——Template 注入的唯一触发字符就是 `$`，全量替换后无残留攻击面。
+
+3. 数据流二（fields → safe_substitute）：第 27 行以 `_ALLOWED_FIELDS` 白名单过滤键，仅保留 title/body/author 三个合法字段，攻击者无法通过消息体新增 substitution 键去匹配被转义后的模板；同时第 33 行使用 `safe_substitute` 而非 `substitute`，即使出现未匹配占位符也原样保留而不抛异常或执行求值。值本身不参与占位符解析，无二次注入路径。
+
+4. 替代通道检查：文件内唯一入口是第 22 行回调签名；logger.info 使用 `%s` 延迟格式化参数而非 f-string/`%` 拼接用户数据，日志注入面也被规避；不存在其他函数导出、模块级执行或间接调用路径可绕过第 30/27 行防御。
+
+5. 结论：两条 source→sink 流均在到达 sink 前被原生安全 API（`$$` 转义 + 白名单 + safe_substitute）完整防护，无可绕过路径，判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "回调参数 payload 是消息队列消费者收到的外部消息体，为等效污点源；流一 template 经第 30 行 _sanitize 将 $ 全量替换为 $$ 后才传入 Template，属目标 API 官方转义机制，位置与覆盖均正确；流二 fields 经第 27 行白名单过滤且第 33 行使用 safe_substitute，无法新增占位符或触发求值；第二入口检查确认文件仅有该回调一个入口，logger 采用 %s 延迟格式化，无替代通道可绕过防御", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,57 @@
+LANG: javascript
+```javascript
+// logFormatter.js — 富文本/日志格式化模块
+// 被上层服务调用：传入外部提交的日志文件路径，解析后格式化入库
+const fs = require('fs');
+const db = require('./db'); // 内部封装 mysql 连接池
+
+// 弱防御：仅过滤常见 SQL 关键字（可被大小写混合、注释符、编码绕过）
+const BLACKLIST = /select|insert|update|delete|drop|;/gi;
+
+function sanitize(value) {
+  return String(value).replace(BLACKLIST, '');
+}
+
+/**
+ * 解析外部提交的日志文件并写入检索表。
+ * 文件由用户上传后落盘，内容完全不可信。
+ */
+function importLogFile(filePath) {
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const lines = raw.split('
+');
+
+  for (const line of lines) {
+    // 日志行格式: [LEVEL] user=<name> msg=<text>
+    const m = line.match(/^\[(\w+)\]\s+user=(\S*)\s+msg=(.*)$/);
+    if (!m) continue;
+
+    const level = m[1];
+    const user = sanitize(m[2]);
+    const msg = sanitize(m[3]);
+
+    const sql =
+      `INSERT INTO formatted_logs (level, username, message) ` +
+      `VALUES ('${level}', '${user}', '${msg}')`;
+
+    db.query(sql); // 危险 sink：拼接 SQL 直接执行
+  }
+}
+
+module.exports = { importLogFile };
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 15 行 `fs.readFileSync(filePath)` 读取的日志文件内容——该文件来自外部提交（用户上传的富文本/日志），其字节内容必须按不可信数据处理，是等效污点源。`filePath` 参数本身也由上层以外部提交为依据传入。
+
+2. 第 16 行 `raw.split('
+')` 与第 20 行正则匹配将文件每行拆出 level/user/msg 三段，污点数据进入 `m[1]/m[2]/m[3]`，可达性成立：三段均流入第 30-31 行的字符串模板拼接。
+
+3. 防御分析：第 9-11 行 `sanitize` 是黑名单正则替换，属典型可绕过弱防御——(a) 大小写绕过虽被 `/i` 覆盖，但可用内联注释 `user=ad'/**/min'` 或 URL/hex 编码 `%27` 绕过；(b) 黑名单不含 `'`、反引号、`OR`、`UNION` 等，攻击者只需在 msg 中注入单引号即可闭合第 30 行 VALUES 字符串。level 字段（m[1]）甚至未经过 sanitize，直接拼入 SQL。
+
+4. Sink 确认：第 33 行 `db.query(sql)` 将含污点的拼接 SQL 原样执行，构成 CWE-89 SQL 注入，全程无参数化查询或转义等有效防御。
+
+5. 第二入口检查：本模块仅导出 `importLogFile` 一个函数，无其他路由/参数通道；但任何调用方传入的外部落盘文件都会触发同一污点链，替代通道即“更换被解析文件内容”，不改变结论——漏洞存在。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL 注入", "risk_level": "High", "source": "line 15: fs.readFileSync(filePath) 读取的外部提交日志文件内容", "sink": "line 33: db.query(sql) 执行拼接 SQL", "explanation": "主链: line 15 文件内容 -> line 20 正则拆分 level/user/msg -> line 30-31 模板拼接 -> line 33 db.query 执行; 防御: line 9-11 sanitize 为黑名单正则替换, 可用内联注释 /**/ 、编码 %27 及未列入黑名单的单引号/OR/UNION 绕过, 且 level 字段完全未过滤; 第二入口: 仅 importLogFile 单一入口, 无其他路由或间接调用, 但任意替换被解析文件内容即可触发同一链路, 结论不变", "fix_suggestion": "line 33: 改用参数化查询 db.query('INSERT INTO formatted_logs (level, username, message) VALUES (?, ?, ?)', [level, user, msg])"}
+```

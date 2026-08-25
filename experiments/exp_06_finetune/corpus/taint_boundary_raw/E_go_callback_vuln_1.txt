@@ -1,0 +1,61 @@
+LANG: go
+```go
+package consumer
+
+import (
+	"fmt"
+	"text/template"
+)
+
+// order_event_consumer.go
+// 被上层服务调用：订阅业务队列，消费订单事件消息。
+// 消息体由外部生产方提交，内容不可信。
+
+type OrderEvent struct {
+	OrderID   string `json:"order_id"`
+	UserEmail string `json:"user_email"`
+	Amount    string `json:"amount"`
+}
+
+// OnMessage 是消息队列消费者的回调处理器，
+// payload 为外部提交的事件载荷（等效污点源）。
+func (c *Consumer) OnMessage(payload []byte) error {
+	event, err := parseEvent(payload)
+	if err != nil {
+		return fmt.Errorf("bad event: %w", err)
+	}
+
+	// 弱防御：仅做简单字符串替换过滤尖括号（可绕过）
+	email := sanitizeEmail(event.UserEmail)
+
+	tpl, err := template.New("notify").Parse(
+		"<div>订单 " + event.OrderID + " 已支付，通知: " + email + "</div>")
+	if err != nil {
+		return err
+	}
+	return tpl.Execute(c.notifier, map[string]string{
+		"order_id": event.OrderID,
+	})
+}
+
+// sanitizeEmail 仅替换 '<' 与 '>'，未处理其他模板注入向量
+func sanitizeEmail(s string) string {
+	s = replaceAll(s, "<", "")
+	s = replaceAll(s, ">", "")
+	return s
+}
+```
+
+1. **污点边界**：本文件无 request/input/environ 等显式 web 入口；第 16 行回调 `OnMessage(payload []byte)` 的消息体参数承载外部生产方提交的队列载荷，属公开接口数据，必须按不可信处理，是等效污点源。
+
+2. **source→sink 主链**：第 17 行 `parseEvent(payload)` 将载荷解析为 `event`（第 8-12 行结构体），其中 `UserEmail`、`OrderID` 均为外部可控字段。第 26-28 行将 `event.OrderID` 与经弱过滤的 `email` 直接拼接进模板字符串，第 29 行 `tpl.Execute(...)` 执行——这是 CWE-1336 模板注入 sink：攻击者控制的消息字段可注入 `{{...}}` 动作（如 `{{.Env}}`、方法调用），在 Execute 时被求值。
+
+3. **防御分析**：第 34-39 行 `sanitizeEmail` 仅删除 `<`/`>`，对模板注入完全无效——注入向量是 `{{ }}` 而非 HTML 标签；且该函数只覆盖 `UserEmail` 字段，第 27 行拼接的 `event.OrderID` 完全未经任何过滤。黑名单式字符替换可被大小写变体、编码或直接使用其他字段绕过，不构成有效防御。
+
+4. **可达性确认**：payload → parseEvent → event.OrderID/UserEmail → 第 26-28 行字符串拼接进模板源码 → 第 29 行 Execute 求值，全程无白名单校验、无模板转义，链路完整可达。
+
+5. **第二入口检查**：文件内无其他路由、HTTP handler 或间接调用通道；唯一入口即第 16 行回调参数，但该单入口已足以构成完整漏洞链，结论成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 模板注入：外部可控数据拼入 text/template 模板源码后执行", "risk_level": "Critical", "source": "line 16: OnMessage 回调参数 payload（外部提交的队列消息体）", "sink": "line 29: tpl.Execute 将含攻击者注入 {{...}} 动作的模板求值执行", "explanation": "主链：line 16 payload -> line 17 parseEvent -> line 27/28 OrderID/UserEmail 拼入模板字符串 -> line 29 Execute 执行注入动作；防御分析：line 34-39 sanitizeEmail 仅删除尖括号，对 {{}} 注入无效且未覆盖 OrderID 字段，属可绕过弱防御；第二入口检查：文件无其他路由或替代通道，仅此回调入口但足以构成完整漏洞链", "fix_suggestion": "line 26: 不要将用户数据拼入模板源码，改为预编译固定模板并通过模板变量传入数据（如 Parse 固定文本后以 data map 提供 order_id/email）"}
+```

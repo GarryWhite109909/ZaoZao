@@ -1,0 +1,47 @@
+LANG: java
+```java
+package com.acme.plugin.hooks;
+
+import org.w3c.dom.Document;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import java.io.File;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
+/**
+ * 插件系统钩子实现：宿主在插件加载阶段以插件包内的 manifest.xml 调用本钩子。
+ * manifest.xml 由第三方开发者上传，内容完全外部可控。
+ */
+public class ManifestHook {
+
+    // 被宿主服务调用：传入已解压插件目录中的清单文件路径
+    public void onLoad(Path pluginDir) throws Exception {
+        Path manifest = pluginDir.resolve("manifest.xml");
+        File f = manifest.toFile();
+
+        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+        // 弱防御：仅禁用 doctype 声明关键字过滤（可被绕过）
+        String raw = new String(java.nio.file.Files.readAllBytes(f.toPath()));
+        if (raw.contains("<!DOCTYPE")) {
+            throw new IllegalStateException("doctype not allowed");
+        }
+
+        DocumentBuilder db = dbf.newDocumentBuilder();
+        Document doc = db.parse(f); // 第 27 行：解析外部可控 XML
+
+        String hookClass = doc.getElementsByTagName("hook-class").item(0).getTextContent();
+        System.out.println("loading hook: " + hookClass);
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 20 行读取、第 27 行解析的 `manifest.xml`——它是第三方开发者上传到插件市场的文件内容，属于公开接口接收的外部提交物，必须按不可信数据处理，是等效污点源。
+2. 数据流：第 22~24 行存在弱防御——仅对原始字节做 `contains("<!DOCTYPE")` 黑名单检查。绕过方式：使用 UTF-16/UTF-7 编码使 `<!DOCTYPE` 字节序列不匹配字符串检查，或用 XML 实体拆分（`<!DOC&#84;YPE` 不合法但可用 BOM/编码变换），更直接的是利用 XXE 的替代形态：外部 DTD 可通过处理指令或默认实体展开触发。该检查位于解析之前、覆盖面仅限字面量，属可绕过黑名单，非有效防御。
+3. Sink：第 27 行 `db.parse(f)` 时 `DocumentBuilderFactory.newInstance()` 未调用 `setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)`，也未禁用 external-general-entities / external-parameter-entities，攻击者构造带外部实体的 manifest 即可在解析时发起 SSRF 或读取本地文件（file:///etc/passwd 经实体回显到日志/错误信息）。
+4. 防御验证：全文唯一防御即第 23 行字符串包含检查，类型为黑名单、位置在解析前、覆盖面不含编码变体与参数实体通道，判定无效。
+5. 第二入口检查：本模块无其他路由/参数/间接调用；`onLoad` 仅由宿主以插件目录路径调用，外部数据唯一通道就是被解析的 manifest.xml 文件内容，结论成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)", "risk_level": "High", "source": "line 20: 读取外部上传的 manifest.xml 文件内容", "sink": "line 27: db.parse(f) 未禁用外部实体的 XML 解析", "explanation": "主链：第三方上传的 manifest.xml 内容 -> line 23 contains 黑名单(可经 UTF-16 编码变体绕过) -> line 27 DocumentBuilder.parse 触发外部实体解析 -> SSRF/本地文件读取; 全文无其他入口, 外部数据唯一通道为被解析文件", "fix_suggestion": "line 25: 在 parse 前调用 dbf.setFeature 禁用 DOCTYPE 与外部实体(disallow-doctype-decl=true, external-general-entities=false, external-parameter-entities=false)"}
+```

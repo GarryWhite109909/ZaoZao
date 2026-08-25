@@ -1,0 +1,79 @@
+LANG: go
+```go
+// Package archiver 处理归档任务队列消息，由上层服务投递。
+package archiver
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+)
+
+// ArchiveEvent 是队列消息体，由外部提交方生成，字段内容不可信。
+type ArchiveEvent struct {
+	ArchiveURL string `json:"archive_url"`
+}
+
+// HandleArchiveEvent 是消息队列消费者回调（被 worker 注册为 handler），
+// 外部数据仅通过 event 参数进入本函数。
+func HandleArchiveEvent(event ArchiveEvent) error {
+	u, err := url.Parse(event.ArchiveURL)
+	if err != nil {
+		return fmt.Errorf("invalid url: %w", err)
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return fmt.Errorf("scheme not allowed")
+	}
+	host := u.Hostname()
+	if !isAllowedHost(host) {
+		return fmt.Errorf("host not allowed")
+	}
+	ip, err := net.LookupIP(host)
+	if err != nil || len(ip) == 0 {
+		return fmt.Errorf("dns resolve failed")
+	}
+	for _, a := range ip {
+		if isPrivate(a) {
+			return fmt.Errorf("private address blocked")
+		}
+	}
+	resp, err := http.Get(u.String()) // sink：发起出站请求
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return fetchArchive(resp)
+}
+
+// 白名单：仅允许合作方归档存储域名
+func isAllowedHost(host string) bool {
+	for _, h := range []string{"archives.partner-cdn.com", "files.trusted-mirror.org"} {
+		if strings.EqualFold(host, h) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPrivate(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()
+}
+
+func fetchArchive(resp *http.Response) error { return nil }
+```
+
+1. 污点边界：本文件无 request/argv/stdin 等显式入口；第 14 行 `ArchiveEvent` 结构体与第 20 行回调参数 `event` 承载队列消息体，由外部提交方构造，属等效污点源，必须按不可信处理。`event.ArchiveURL`（第 22 行）是唯一外部输入点。
+
+2. 数据流追踪：第 22 行取 `event.ArchiveURL` → 第 23 行 `url.Parse` 解析 → 第 27–29 行 scheme 校验、第 31–33 行主机白名单校验 → 第 35–42 行 DNS 解析并逐 IP 检查私网地址 → 第 44 行 `http.Get(u.String())` sink。
+
+3. 防御有效性——类型正确：采用「白名单 + DNS 解析后 IP 黑名单」双重防御，而非黑名单/正则/字符串替换这类可绕过过滤；白名单精确匹配 `EqualFold` 域名，杜绝任意目标。
+
+4. 位置正确且覆盖完整攻击面：校验位于 sink（第 44 行）之前的数据流必经路径上；DNS 解析后检查 IP（第 38–41 行）覆盖了 DNS rebinding 与内网地址直连（如解析到 127.0.0.1/10.x/169.254.x）的绕过路径；scheme 限制排除 file/gopher 等替代协议。三道防线共同保证到达 sink 的 URL 只能指向白名单域名的公网地址。
+
+5. 第二入口检查：文件中无其他函数接收外部数据，`fetchArchive` 仅消费已验证的响应对象；无路由注册、无环境变量读取、无其他参数通道，唯一 source→sink 流已被完整防御。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界：无显式 web 入口，第 20 行回调参数 event 为队列消息体承载外部可控数据，event.ArchiveURL 是唯一外部输入点；数据流 event.ArchiveURL -> url.Parse -> http.Get(第 44 行)，防御为 scheme 白名单(第 27 行)+域名白名单 EqualFold 精确匹配(第 31-33 行)+DNS 解析后逐 IP 私网黑名单(第 38-41 行)，类型正确非黑名单正则替换类可绕过过滤，位置在 sink 前必经路径，覆盖 DNS rebinding 与内网直连攻击面；第二入口检查：文件内无其他外部数据通道或间接调用，结论安全", "fix_suggestion": "no fix needed"}
+```

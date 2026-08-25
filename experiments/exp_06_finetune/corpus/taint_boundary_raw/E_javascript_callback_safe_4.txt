@@ -1,0 +1,74 @@
+LANG: javascript
+```javascript
+// outbound-webhook-dispatcher.js
+// 被上层服务调用：消费消息队列中的 webhook 投递任务
+const amqp = require('amqplib');
+const crypto = require('crypto');
+const { URL } = require('url');
+
+// 允许投递的目标主机白名单（由运维配置，非外部可控）
+const ALLOWED_HOSTS = new Set(['hooks.partner-a.com', 'hooks.partner-b.com']);
+const ALLOWED_SCHEMES = new Set(['https']);
+
+async function startConsumer() {
+  const conn = await amqp.connect(process.env.AMQP_URL);
+  const channel = await conn.createChannel();
+  await channel.assertQueue('webhook.outbound', { durable: true });
+
+  channel.consume('webhook.outbound', async (msg) => {
+    // msg.content 是外部提交方写入队列的载荷，必须按不可信数据处理
+    const payload = JSON.parse(msg.content.toString());
+    // payload: { targetUrl, body, signature }
+
+    // 防御 1：签名校验（HMAC），防止伪造任务
+    const expected = crypto.createHmac('sha256', process.env.SIGNING_KEY)
+      .update(payload.body).digest('hex');
+    if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(payload.signature))) {
+      channel.nack(msg, false, false);
+      return;
+    }
+
+    // 防御 2：白名单校验目标地址（scheme + host 双重校验）
+    let parsed;
+    try {
+      parsed = new URL(payload.targetUrl);
+    } catch {
+      channel.nack(msg, false, false);
+      return;
+    }
+    if (!ALLOWED_SCHEMES.has(parsed.protocol.replace(':', '')) ||
+        !ALLOWED_HOSTS.has(parsed.hostname)) {
+      channel.nack(msg, false, false);
+      return;
+    }
+
+    // sink：向校验后的地址发起出站请求；body 仅作为 JSON 字符串化数据传输，
+    // 不进入任何命令执行/反序列化/模板引擎
+    const res = await fetch(parsed.href, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: payload.body })
+    });
+    if (res.ok) channel.ack(msg);
+    else channel.nack(msg, false, true);
+  }, { noAck: false });
+}
+
+module.exports = { startConsumer };
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口（第 17 行的 process.env 仅为部署配置密钥与队列地址，非业务外部输入）；唯一的外部数据通道是第 20 行 `channel.consume` 回调的 `msg` 参数——消息体载荷由任意能向该队列发布消息的外部提交方写入，等效于公开接口参数，必须按不可信处理。污点源即 `msg.content` → `payload`。
+
+2. 数据流一：`payload.targetUrl`（第 24 行）→ 第 33 行 `new URL()` 解析 → 第 38-40 行白名单校验 → 第 48 行 `fetch(parsed.href, ...)`（sink）。防御为 scheme 白名单 + hostname 精确集合匹配：类型正确（Set 精确等值比较，非黑名单/正则/字符串替换，无法通过 `hooks.partner-a.com.evil.com`、大小写、userinfo、重定向编码绕过——URL 构造器已规范化 hostname）；位置正确（在 fetch 之前、所有分支路径上）；覆盖完整（protocol 与 hostname 均被强制约束，端口虽未限制但同主机白名单下风险可忽略）。
+
+3. 数据流二：`payload.signature`（第 25 行）→ 第 28-29 行 HMAC-SHA256 计算与 `timingSafeEqual` 比较（第 30-34 行）。防御类型正确：恒定时间比较防时序侧信道，密钥来自部署环境而非消息体；位置正确（在任何副作用发生前）；覆盖完整——未通过签名的消息在第 31 行即被 nack 丢弃，无法到达 fetch。
+
+4. 数据流三：`payload.body`（第 25 行参与 HMAC 计算）→ 第 51 行 `JSON.stringify({ data: payload.body })` 作为 HTTP body 发送。JSON.stringify 保证输出为合法 JSON 字符串字面量，body 不进入 eval、child_process、反序列化或模板渲染等危险操作，故此流不构成 CWE-502 反序列化路径。
+
+5. 第二入口检查：文件仅注册一个消费者回调（第 20 行），无其他路由、定时器、事件监听或导出的直接调用点（module.exports 仅暴露 startConsumer 启动函数，不含接收载荷的函数）；fetch 的 URL 完全来自经双重校验的 payload.targetUrl，无替代通道可将未校验数据送达 sink。
+
+6. 结论：所有 source→sink 流均被 HMAC 签名校验 + scheme/host 白名单有效拦截，不存在 CWE-502 或 SSRF 类可达漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界：无显式 web 入口，第 20 行 consume 回调的 msg.content 为外部可控载荷，等效污点源；流一 payload.targetUrl 经第 33 行 URL 解析后受第 38-40 行 scheme+hostname 白名单精确校验才到达第 48 行 fetch，防御类型正确（Set 等值匹配非黑名单）、位置正确（sink 前）、覆盖完整（URL 已规范化，无法用后缀域名/userinfo 绕过）；流二 signature 经第 28-30 行 HMAC-SHA256 与 timingSafeEqual 校验失败即丢弃，恒定时间比较且密钥非外部可控；流三 body 仅经 JSON.stringify 作为请求体传输，不进入反序列化/命令执行类 sink；第二入口检查：全文件仅一个消费者回调，exports 无接收载荷的直接入口，无替代通道将未校验数据送达 sink", "fix_suggestion": "no fix needed"}
+```

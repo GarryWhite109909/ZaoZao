@@ -1,0 +1,31 @@
+## 编号分析（全文通读）
+
+1. **第 1–30 行，常量与入口点枚举**：本文件是 Atlantis 的 raw 配置解析层。入口点是 YAML 仓库配置文件（atlantis.yaml）中的 `Project` 结构体字段：`Name`、`Dir`、`Branch`、`Workspace`、`Workflow` 等。Source 即仓库内 PR 可修改的 atlantis.yaml。
+
+2. **第 96–110 行 `validDir`**：对 `dir` 做黑名单检查 `strings.Contains(dir, "..")`。虽然按规则“黑名单视为可绕过”，但此处配合第 168 行 `filepath.Clean("./" + *p.Dir)` 强制相对化，且绝对路径经 Clean 后也会被剥掉前导 `/`，路径穿越在 dir 字段上被有效阻断。含 `..` 的 glob 模式同样被该子串检查拦截。
+
+3. **第 111–121 行 `validName` / 第 213–219 行 `validProjectName`**：关键缺陷点。注释明确说明 name “肯定会被用于文件中”。校验逻辑是先把 `/` 全部替换为 `-` 再做 URL-escape 比较。攻击者可提交 `name: "../../evil"`：替换后为 `"...-..-evil"`，`url.QueryEscape` 不改变它，校验通过——但原始字符串中的 `..` 和 `/` 完整保留在第 24 行的 `p.Name` 中并透传到 `ToValid()` 第 205 行 `v.Name = p.Name`。这是典型的“先变换再校验”绕过，导致带路径穿越序列的名称流入下游文件系统操作（如锁文件、日志路径）。
+
+4. **第 122–135 行 `branchValid` / 第 170–174 行**：用户正则被编译使用。Go 使用 RE2，无灾难性回溯，ReDoS 风险低；正则仅用于分支匹配，不构成命令注入 sink。
+
+5. **第 137–139 行 `DependsOn`**：空校验器，恒返回 nil，任何内容通过；但 DependsOn 仅用于排序依赖，非危险 sink。
+
+6. **第 141–152 行 glob/name 交叉校验与第 233–240 行 `ContainsGlobPattern`/`ValidateGlobPattern`**：glob 只做语法校验不做语义限制。模式如 `*` 展开结果来自目录列举，且经第 168 行 Clean 相对化，穿越面有限；但注意 `validName` 允许的名称若同时用于 glob 展开结果的命名，会放大第 3 点问题。
+
+7. **第 176–180 行 Workspace**：完全未校验，任意字符串直接进入 `v.Workspace`。workspace 在 Atlantis 下游会拼进 plan/apply 文件路径，是第二入口/替代通道，本文件未设防。
+
+8. **第 182–212 行 `ToValid()` 其余字段**：requirements 白名单严格（第 221–251 行），distribution 白名单严格（第 253–259 行），TerraformVersion 经版本解析失败即置 nil，均安全。
+
+**结论**：最可靠的可证漏洞是 `validProjectName`（第 213–219 行）因先替换 `/` 再校验，放行包含 `..` 与 `/` 的项目名，结合注释自述 name 用于文件路径，构成路径注入/穿越数据流：YAML `name` 字段（source）→ Validate 通过 → ToValid 第 205 行透传（sink）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 路径遍历 / CWE-807 校验绕过",
+  "risk_level": "中",
+  "source": "line 24: Project.Name 来自用户可控的 atlantis.yaml 配置",
+  "sink": "line 205: v.Name = p.Name 将未净化的名称透传给下游文件操作",
+  "explanation": "validProjectName 先把斜杠替换为连字符再做 url.QueryEscape 比较，导致形如 ../../evil 的名称在校验时变为 ...-..-evil 从而通过检查，而原始字符串中的 .. 和 / 被完整保留并经 ToValid 透传；代码注释自述 name 会用于文件和 URL，下游拼接路径时可逃逸出预期目录",
+  "fix_suggestion": "line 213: 应对原始 name 直接拒绝包含 .. 或以 / 开头的值，或先校验原始字符串再允许受控的斜杠替换"
+}
+```

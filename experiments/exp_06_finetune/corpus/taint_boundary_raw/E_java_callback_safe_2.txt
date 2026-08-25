@@ -1,0 +1,52 @@
+LANG: java
+```java
+package com.acme.confighub.parser;
+
+import org.apache.velocity.app.VelocityEngine;
+import org.apache.velocity.VelocityContext;
+import org.apache.velocity.Template;
+import java.io.StringWriter;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * 配置清单渲染模块：由消息队列消费者回调触发，
+ * 消费 config.submitted 主题，载荷为外部提交的 YAML/JSON 清单内容。
+ */
+public class ManifestRenderService {
+
+    // 仅允许渲染内置模板，禁止外部指定模板名或模板体
+    private static final Set<String> ALLOWED_TEMPLATES = Set.of("service-default", "job-default", "cron-default");
+
+    private final VelocityEngine engine;
+    private final TemplateStore templateStore; // 内部只读模板仓库
+
+    public ManifestRenderService(VelocityEngine engine, TemplateStore templateStore) {
+        this.engine = engine;
+        this.templateStore = templateStore;
+    }
+
+    // 消息队列消费者回调入口：payload 为外部提交的配置清单（不可信数据）
+    public void onConfigSubmitted(String payload) {
+        Map<String, Object> fields = ConfigYaml.safeParse(payload);   // 第 24 行：解析为纯键值对
+        String tplName = String.valueOf(fields.getOrDefault("template", "service-default"));
+        if (!ALLOWED_TEMPLATES.contains(tplName)) {                    // 第 26 行：白名单校验
+            throw new IllegalArgumentException("template not allowed: " + tplName);
+        }
+        VelocityContext ctx = new VelocityContext(fields);             // 外部字段仅作为数据变量
+        Template tpl = templateStore.loadSigned(tplName);              // 模板来自签名校验的内部仓库
+        StringWriter out = new StringWriter();
+        engine.evaluate(ctx, out, "manifest", tpl.getData());          // 第 32 行：sink
+    }
+}
+```
+
+1. **污点边界**：本文件没有任何 request/input/environ 等显式 web 入口；唯一外部通道是第 23 行消息队列消费者回调 `onConfigSubmitted(String payload)`，payload 是外部用户提交的配置清单内容，必须按不可信污点源处理。
+2. **source→sink 流**：第 24 行将 payload 解析为纯键值 Map；第 25–28 行对外部可控的 `template` 字段做白名单校验（`ALLOWED_TEMPLATES`），不在集合内即抛异常终止，外部无法注入任意模板名。
+3. **sink 防御有效性**：第 32 行 `engine.evaluate` 是 CWE-1336（Velocity 模板注入）的危险 sink——若模板文本来自外部则可执行 `$class.forName(...)` 等 SSTI。此处模板文本来自第 31 行 `templateStore.loadSigned(tplName)`，即内部签名校验的只读模板仓库，外部 payload 只进入 `VelocityContext` 作为**数据变量**而非模板指令，类型正确（数据与代码分离）、位置正确（在 sink 前完成）、覆盖完整攻击面（模板名白名单 + 模板体来源受控）。
+4. **无绕过路径**：防御采用白名单 + 受信模板源，非黑名单/正则/字符串替换等可绕过过滤；即使 payload 中含 `#set`、`$runtime` 等 Velocity 语法，也只会被当作普通字符串值渲染，不会被执行。
+5. **第二入口检查**：文件中不存在其他公开方法、静态初始化读取外部数据或间接调用链；构造函数参数来自内部装配。结论：无 CWE-1336 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点是第23行消息队列回调 onConfigSubmitted 的 payload 参数, 属于等效污点源; 数据流 payload -> 第24行 safeParse -> 第25-28行白名单校验 template 字段 -> 第31行 loadSigned 从签名内部仓库加载模板 -> 第32行 engine.evaluate; 该 sink 对 CWE-1336 的防御有效: 外部数据仅作为 VelocityContext 数据变量而非模板指令, 模板名经白名单限制且模板体来自签名校验的内部只读仓库, 类型正确(数据与代码分离), 位置正确(sink之前), 覆盖完整攻击面(模板名与模板体均受控); 未使用黑名单/正则/字符串替换等可绕过过滤; 第二入口检查: 文件内无其他公开方法或间接调用可引入外部数据, 结论安全", "fix_suggestion": "no fix needed"}
+```

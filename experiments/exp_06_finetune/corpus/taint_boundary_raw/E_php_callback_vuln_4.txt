@@ -1,0 +1,52 @@
+LANG: php
+```php
+<?php
+// src/Render/TemplateRenderWorker.php
+// 消息队列消费者：由上层服务投递渲染任务消息，本类仅作为队列回调处理器被调用
+
+namespace App\Render;
+
+use PhpAmqpLib\Message\AMQPMessage;
+
+class TemplateRenderWorker
+{
+    private array $allowedTags = ['b', 'i', 'em', 'strong'];
+
+    // 队列回调：$msg->getBody() 为外部提交的 JSON 载荷 {template, vars}
+    public function onMessage(AMQPMessage $message): void
+    {
+        $payload = json_decode($message->getBody(), true);
+        if (!is_array($payload) || empty($payload['template'])) {
+            return;
+        }
+
+        $template = (string)$payload['template'];
+        $vars     = is_array($payload['vars'] ?? null) ? $payload['vars'] : [];
+
+        // 弱防御：黑名单剥离 <script>，可被 <ScRiPt>、<img onerror>、<svg onload> 绕过
+        foreach ($this->allowedTags as $tag) {
+            $template = str_replace(['<' . $tag, '</' . $tag], '', $template);
+        }
+        $template = str_ireplace('<script', '', $template);
+
+        // 变量替换：直接拼接，未做任何转义
+        foreach ($vars as $key => $value) {
+            $template = str_replace('{{' . $key . '}}', (string)$value, $template);
+        }
+
+        // sink：渲染结果写入 HTML 响应片段缓存，前端原样输出
+        file_put_contents('/var/cache/rendered/' . md5($template) . '.html', $template);
+    }
+}
+```
+
+1. 第 12 行：污点边界——本文件没有任何 request/input/environ 等显式 web 入口；唯一数据通道是第 13 行队列回调参数 `$message`（消息体载荷），其内容由外部提交方（公开 API 上游）写入，必须按不可信数据处理，是等效污点源。
+2. 第 14 行 `json_decode($message->getBody(), true)` 将消息体解析为 `$payload`，其中 `template` 与 `vars` 均为外部可控字符串/数组，可达性确认：两者均流入后续处理。
+3. 第 22-26 行为弱防御：黑名单仅删除 `<script`（大小写不敏感）与白名单标签前缀，绕过方式包括 `<img src=x onerror=alert(1)>`、`<svg onload=...>`、`<iframe>`、事件属性注入等，均不在黑名单覆盖面内；且未做 HTML 实体编码，属可绕过过滤而非有效防御。
+4. 第 29-31 行变量替换：`vars` 的值未经任何转义直接 `str_replace` 拼入模板，攻击者通过消息提交 `{"vars":{"name":"<img src=x onerror=alert(1)>"}}` 即完成注入。
+5. 第 34 行 sink：拼接后的 HTML 片段被写入渲染缓存文件，前端按 text/html 原样输出，构成存储型 XSS（CWE-79），source→sink 全程无有效净化。
+6. 第二入口检查：本文件无其他路由/HTTP 参数或间接调用入口，唯一外部通道即队列回调载荷；但该通道本身即可直达 sink，故结论为存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 存储型跨站脚本（XSS）：队列消息载荷未转义拼入 HTML 渲染结果", "risk_level": "High", "source": "line 13: 队列回调参数 message 的消息体（json_decode 后的 template 与 vars 字段）", "sink": "line 34: file_put_contents 将含外部数据的 HTML 片段写入渲染缓存供前端原样输出", "explanation": "流1：line 13 回调参数 -> line 14 json_decode 取 template -> line 22-26 黑名单 str_replace 仅删 script 标签与白名单标签前缀，可用 img/svg/iframe 事件属性绕过 -> line 34 写入 HTML 缓存；流2：line 15 取 vars -> line 29-31 str_replace 直接拼接未转义 -> line 34 同一 sink；两路均无 HTML 实体编码等有效防御；第二入口检查：文件内无其他路由/参数/间接调用通道，唯一外部通道即队列回调载荷且可直接到达 sink", "fix_suggestion": "line 34: 在写入缓存前对 template 及所有 vars 值使用 htmlspecialchars($value, ENT_QUOTES|ENT_HTML5) 编码，并改用白名单标签解析器而非黑名单删除"}
+```

@@ -1,0 +1,40 @@
+LANG: python
+```python
+"""模板渲染辅助模块：由消息队列消费者回调触发，渲染外部提交的模板片段。"""
+import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as SafeET
+
+
+class TemplateRenderer:
+    """渲染外部提供的 XML 模板片段，供上层服务消费队列消息后调用。"""
+
+    ALLOWED_TAGS = {"section", "title", "body", "item"}
+
+    def render_fragment(self, payload):
+        # payload 为消息体（事件载荷），承载外部可控的模板 XML 字符串
+        if not isinstance(payload, str) or len(payload) > 65536:
+            raise ValueError("invalid template payload")
+
+        # 使用 defusedxml 解析：禁用外部实体解析，杜绝 XXE（CWE-611）
+        root = SafeET.fromstring(payload)
+
+        # 白名单校验：仅允许业务定义的标签结构
+        for elem in root.iter():
+            tag = elem.tag.split('}')[-1]
+            if tag not in self.ALLOWED_TAGS:
+                raise ValueError("disallowed template tag: %s" % tag)
+            if any(k.startswith(('xmlns', 'xsi', 'entity')) for k in elem.attrib):
+                raise ValueError("namespace/entity attributes not allowed")
+
+        return ET.tostring(root, encoding="unicode")
+```
+
+1. 第 9 行 `render_fragment(self, payload)` 是污点边界：本文件没有任何 request/input/environ 等显式 web 入口，但该回调签名中的 `payload` 参数承载消息队列投递的消息体（外部用户提交的模板内容），按公开接口参数必须视为不可信外部数据，是等效污点源。
+2. 第 12 行对 `payload` 做类型与长度校验，属前置输入约束；第 16 行使用 `defusedxml.ElementTree.fromstring` 解析——这是原生安全 API：defusedxml 默认禁用外部实体、DTD 加载与实体扩展，从解析器层面阻断 XXE 攻击面。
+3. 第 19-24 行白名单校验进一步限制可出现的标签与属性命名空间，防止解析后的树被注入异常结构；防御位置在 sink（任何后续序列化/使用）之前，覆盖了 payload 中全部内容（所有元素与属性均被遍历检查）。
+4. 数据流验证：`payload` → 第 16 行安全解析 → 第 20-24 行白名单过滤 → 第 26 行 `tostring` 输出。唯一 source→sink 链上，XXE 类攻击（外部实体引用、 Billion Laughs）在第 16 行即被 defusedxml 拒绝，黑名单/正则类可绕过方案未被采用。
+5. 第二入口/替代通道检查：文件内无其他函数接收外部数据，无全局状态、无间接调用路径；`ALLOWED_TAGS` 为硬编码常量不可被污染。结论：无 CWE-611 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "回调参数 payload 为消息体承载的外部可控数据，是等效污点源；其流向 tostring 的唯一链路上，第 16 行 defusedxml 禁用外部实体与 DTD 从解析层阻断 XXE，第 20-24 行白名单校验标签与命名空间属性，防御类型正确且位于 sink 之前并覆盖全部元素与属性；文件无第二入口或替代通道，无全局可污染状态", "fix_suggestion": "no fix needed"}
+```

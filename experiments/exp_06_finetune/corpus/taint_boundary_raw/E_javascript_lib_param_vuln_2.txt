@@ -1,0 +1,58 @@
+LANG: javascript
+```code
+// asset-locator.js — 静态资源定位工具模块
+// 被上层服务调用：传入用户提交的资源名，返回服务器上的文件路径
+const path = require('path');
+const http = require('http');
+
+const ALLOWED_HOSTS = ['cdn.example.com', 'static.example.com'];
+
+/**
+ * 根据资源名定位文件路径（上层服务用表单/查询参数中的名字调用）
+ */
+function locateAsset(assetName) {
+  // 弱防御：仅拦截明显的协议前缀，可用反斜杠/编码绕过
+  if (assetName.startsWith('http://') || assetName.startsWith('https://')) {
+    assetName = assetName.replace(/^https?:\/\//, '');
+  }
+  return path.join(__dirname, 'public', assetName);
+}
+
+/**
+ * 拉取远程资源片段（上层服务把外部传入的 origin 直接转发进来）
+ */
+function fetchRemoteFragment(origin) {
+  const url = 'http://' + origin + '/fragment';
+  return new Promise((resolve, reject) => {
+    http.get(url, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => resolve(data));
+    }).on('error', reject);
+  });
+}
+
+/**
+ * 白名单校验 host —— 但仅校验 host 部分，scheme/path 未覆盖
+ */
+function fetchWithWhitelist(origin) {
+  const parsed = new URL('http://' + origin);
+  if (!ALLOWED_HOSTS.includes(parsed.hostname)) {
+    throw new Error('host not allowed');
+  }
+  return fetchRemoteFragment(parsed.host); // parsed.host 含端口，可指向内网任意端口
+}
+
+module.exports = { locateAsset, fetchRemoteFragment, fetchWithWhitelist };
+```
+
+1. 第 10 行 `locateAsset(assetName)`、第 19 行 `fetchRemoteFragment(origin)`、第 33 行 `fetchWithWhitelist(origin)` 是仅有的三个外部输入点；本文件无 request/environ 等显式入口，但作为公开导出接口，函数参数承载上层服务转发的用户可控数据，是等效污点源，污点边界即这三个参数。
+2. 主链一：第 10 行参数 → 第 13 行弱黑名单（仅匹配 `http://`/`https://` 前缀，可用 `HTTP://` 大小写、`ftp://`、或直接传相对 URL 绕过）→ 第 14 行 `path.join` 仅做本地路径拼接，不构成 SSRF sink 本身；真正危险的是主链二。
+3. 主链二（CWE-918）：第 19 行 `origin` 参数 → 第 20 行字符串拼接 `'http://' + origin + '/fragment'` → 第 22 行 `http.get(url)` 发起服务器端请求，全程无任何校验，攻击者传 `169.254.169.254/latest/meta-data` 即可读取云元数据，或探测内网服务。
+4. 主链三：第 33 行 `origin` → 第 34 行白名单校验 `parsed.hostname`——看似有效，但第 38 行回传的是 `parsed.host`（含端口），且校验只覆盖 hostname 不覆盖 scheme 与端口；更关键的是绕过方式：URL 解析差异，如传入 `cdn.example.com@169.254.169.254` 时部分解析器将 userinfo 前的合法域当 host 校验、实际连接内网地址，或利用 DNS rebinding 使校验时与请求时解析结果不同。
+5. 第二入口检查：文件无路由注册、无消息队列消费代码、无环境变量读取；除三个导出函数参数外不存在其他污点通道，间接调用面即 module.exports 暴露的全部函数，均已在上述链中覆盖。
+6. 结论：存在 CWE-918 SSRF，主链为 line 19/33 参数 → line 22 `http.get`，风险 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 服务端请求伪造(SSRF)", "risk_level": "High", "source": "line 19: fetchRemoteFragment 的 origin 参数 / line 33: fetchWithWhitelist 的 origin 参数", "sink": "line 22: http.get(url) 发起服务器端 HTTP 请求", "explanation": "流1: line 19 origin 参数经 line 20 字符串拼接进 URL 后直达 line 22 http.get, 无任何校验, 可访问内网地址与云元数据端点; 流2: line 33 origin 经 line 34-36 白名单校验 hostname 后于 line 38 以 parsed.host 回传至同一 sink, 但校验未覆盖 scheme/端口, 且可通过 userinfo 混淆(如 cdn.example.com@169.254.169.254)或 DNS rebinding 绕过; 弱防御说明: line 13 的协议前缀黑名单仅影响 locateAsset 的本地路径拼接, 对 SSRF 无防护作用; 第二入口检查: 文件无路由注册/队列消费/环境变量读取, 唯一污点通道为三个导出函数参数, 已全部覆盖", "fix_suggestion": "line 22: 使用严格解析后的 URL 并强制 https scheme、固定端口、对最终解析 IP 做私网段拒绝列表校验后再发起请求"}
+```

@@ -1,0 +1,50 @@
+LANG: go
+```go
+// report_export.go — 报表导出工具的模板渲染模块
+// 被上层 API 服务以用户筛选条件调用，模板文件由运营人员上传至 templates/ 目录
+package report
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"text/template"
+)
+
+// ExportReport 读取指定模板文件并渲染报表
+func ExportReport(templatePath string, data map[string]interface{}) (string, error) {
+	raw, err := os.ReadFile(filepath.Clean(templatePath))
+	if err != nil {
+		return "", err
+	}
+
+	// 弱防御：仅过滤明显的危险函数名（可被 {{- /* 注释 */}} 拆分或 unicode 编码绕过）
+	content := string(raw)
+	for _, bad := range []string{"call", "printf"} {
+		content = strings.ReplaceAll(content, bad, "")
+	}
+
+	tmpl, err := template.New("report").Funcs(template.FuncMap{
+		"exec": func(cmd string) string { return cmd },
+	}).Parse(content)
+	if err != nil {
+		return "", err
+	}
+
+	var out strings.Builder
+	if err := tmpl.Execute(&out, data); err != nil {
+		return "", err
+	}
+	return out.String(), nil
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 15 行 `os.ReadFile` 读入的模板文件内容——该文件由外部上传/编辑（运营后台提交），按不可信数据处理，是等效污点源。
+2. 第 19–22 行的 `strings.ReplaceAll` 黑名单只删除字面量 "call"/"printf"，攻击者可用 `{{/*c*/all ...}}`、大小写变体或自定义模板语法拆分绕过；且黑名单根本未覆盖 template 注入的核心载荷（如通过 FuncMap 注册的 `exec` 或模板内嵌套调用），属可绕过弱防御。
+3. 第 24 行 `template.Parse(content)` 将不可信文件内容直接编译为 Go text/template：text/template 本身支持管道与子模板，若上层注册了任意函数或使用 html/template 缺失场景，即可实现 SSTI（CWE-1336），模板内容完全由攻击者控制。
+4. 第 31 行 `tmpl.Execute(&out, data)` 执行被污染的模板并输出结果，data 中还包含用户筛选条件，二者在 Execute 处汇合，构成 source(第 15 行文件内容) → sink(第 31 行 Execute) 的完整可达数据流，全程无有效防御。
+5. 第二入口检查：本模块无其他路由或参数入口，templatePath 与 data 均来自上层服务内部调用；但替代通道存在——templates/ 目录下任何被上传/覆盖的模板文件都会成为新的污点载体，结论不变。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 模板注入(SSTI)：不可信模板文件内容被直接 Parse 并 Execute", "risk_level": "Critical", "source": "line 15: os.ReadFile 读取的外部上传模板文件内容", "sink": "line 31: tmpl.Execute 渲染被污染模板", "explanation": "外部可控的模板文件内容经 ReadFile 进入 -> 第19-22行 ReplaceAll 黑名单仅删 call/printf 字面量，可被注释拆分/大小写绕过且不覆盖核心载荷 -> 第24行 Parse 直接将不可信内容编译为模板 -> 第31行 Execute 触发 SSTI，用户筛选条件 data 同时汇入渲染上下文；第二入口检查：无其他显式入口，但 templates 目录下任何上传/覆盖的模板文件均为替代污点通道", "fix_suggestion": "line 24: 不解析外部内容为模板，改为静态模板+白名单变量渲染，或将模板文件纳入签名校验与只读管理"}
+```

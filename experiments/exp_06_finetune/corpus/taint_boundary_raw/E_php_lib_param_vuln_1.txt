@@ -1,0 +1,46 @@
+LANG: php
+```php
+<?php
+// src/Outbound/WebhookSender.php
+// 出站 webhook 发送器：由上层服务在消费队列消息后调用，payload 为外部提交的原始内容。
+
+namespace App\Outbound;
+
+use GuzzleHttp\Client;
+
+class WebhookSender
+{
+    private Client $http;
+
+    public function __construct(Client $http = null)
+    {
+        $this->http = $http ?? new Client(['timeout' => 5]);
+    }
+
+    /**
+     * 将事件分发到目标地址。$targetUrl 与 $payload 均来自队列消息体，
+     * 由上游直接透传，本模块不做来源校验。
+     */
+    public function dispatch(string $targetUrl, string $payload): void
+    {
+        // 弱防御：仅拦截内网字面量主机名（可被十进制 IP / DNS rebinding 绕过）
+        if (preg_match('/(localhost|127\.0\.0\.1|10\.\d+\.\d+\.\d+)/', $targetUrl)) {
+            throw new \RuntimeException('blocked target');
+        }
+        $event = json_decode($payload, true);
+        // 危险 sink：反序列化外部可控数据 -> CWE-502
+        $data = unserialize($event['body'] ?? '');
+        $this->http->post($targetUrl, ['json' => ['event' => $data]]);
+    }
+}
+```
+
+1. 第 16 行 `dispatch(string $targetUrl, string $payload)`：本文件无 request/argv 等显式 web 入口，污点边界即公开函数参数——注释明确其承载队列消息透传的外部提交内容，必须按不可信处理。
+2. 第 26 行 `json_decode($payload)` 后第 27 行取 `$event['body']`，外部数据一路无净化传递。
+3. 第 28 行 `unserialize($event['body'])` 是 CWE-502 危险 sink：攻击者构造的序列化对象可触发 POP 链（如 Monolog/RCE gadget），实现任意代码执行。
+4. 第 23-25 行黑名单仅匹配 localhost/127.0.0.1/10.x 字面量，可用 `2130706433`、`0x7f000001`、`0177.0.0.1` 或 DNS rebinding 绕过；且该防御只作用于 `$targetUrl`，对进入 `unserialize` 的 `$payload` 完全无覆盖。
+5. 第二入口检查：文件内无路由注册、无其他函数读取外部数据；唯一替代通道是同类公开方法被上层以不同参数调用，但污点路径同构，均汇入同一 sink，故确认存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 反序列化不可信数据", "risk_level": "Critical", "source": "line 16: dispatch() 的 $payload 参数（队列消息透传的外部内容）", "sink": "line 28: unserialize($event['body'])", "explanation": "$payload 参数经 json_decode 提取 body 字段后直达 unserialize，全程无有效净化；第 23-25 行黑名单仅防护 $targetUrl 且可被十进制 IP/DNS rebinding 绕过，对反序列化链零覆盖；文件内无第二入口或替代路由，所有公开参数路径均汇入同一 sink", "fix_suggestion": "line 28: 用 json_decode 替代 unserialize，若必须反序列化则使用 allowed_classes=false 并校验签名"}
+```

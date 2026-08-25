@@ -1,0 +1,42 @@
+LANG: python
+```python
+"""report_exporter 插件钩子：宿主插件系统在收到外部事件时调用 on_event。"""
+import json
+import urllib.request
+from plugin_sdk import PluginHook
+
+
+class ReportExporterHook(PluginHook):
+    """导出报表插件：宿主以事件载荷调用本钩子，载荷来自外部提交的报表任务。"""
+
+    def on_event(self, event_type, payload):
+        # payload 形如 {"action": "export", "callback_url": "...", "report_id": "R123"}
+        if event_type != "report.export":
+            return {"status": "ignored"}
+
+        data = json.loads(payload)
+        callback_url = data.get("callback_url", "")
+        report_id = data.get("report_id", "")
+
+        # 弱防御：仅黑名单拦截内网关键字，可被十进制 IP / DNS rebinding 绕过
+        blocked = ("127.0.0.1", "localhost", "169.254", "10.", "192.168.")
+        if any(b in callback_url for b in blocked):
+            return {"status": "blocked"}
+
+        export_url = "{}/reports/{}".format(callback_url.rstrip("/"), report_id)
+        with urllib.request.urlopen(export_url, timeout=5) as resp:  # SSRF sink
+            body = resp.read()
+
+        return {"status": "ok", "bytes": len(body)}
+```
+
+1. 第 1 行至第 14 行：本文件没有任何 request/input/environ 等显式 web 入口；污点边界是第 13 行的回调参数 `payload`——宿主插件系统以外部提交的事件载荷调用 `on_event`，该消息体承载外部可控数据，必须按不可信处理。
+2. 第 15 行 `json.loads(payload)` 将外部载荷解析为 dict；第 16-17 行取出 `callback_url` 与 `report_id`，两者均为攻击者完全可控的外部数据。
+3. 第 20-22 行的黑名单仅做子串匹配：可用十进制 IP（`2130706433`）、IPv6（`[::1]`）、`0x7f000001`、重定向跳转或 DNS rebinding 轻松绕过，且未覆盖 `0.0.0.0`、云元数据地址变体等，属可绕过弱防御，不构成有效防护。
+4. 第 23 行将可控 `callback_url` 拼入 URL，第 24 行 `urllib.request.urlopen(export_url)` 直接发起请求，即 CWE-918 的危险 sink；攻击者可借此访问内网服务、云元数据接口（169.254.169.254 的变体写法）或任意主机。
+5. 数据流总结：line 13 `payload` → line 15 解析 → line 16 `callback_url` → line 21 黑名单（可绕过）→ line 23 拼接 → line 24 `urlopen` 发起请求，全程无有效防御。
+6. 第二入口检查：文件中不存在其他路由、参数或间接调用通道，唯一外部输入点就是第 13 行回调参数 `payload`，其可达性已确认直达 sink，故判定存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 SSRF（服务端请求伪造）", "risk_level": "High", "source": "line 13: 回调参数 payload（宿主注入的外部事件载荷）", "sink": "line 24: urllib.request.urlopen(export_url)", "explanation": "主链：line 13 payload -> line 15 json.loads -> line 16 callback_url -> line 21 黑名单（仅子串匹配，可用十进制IP/IPv6/DNS rebinding/重定向绕过）-> line 23 拼接 export_url -> line 24 urlopen 发起请求；防御分析：唯一防御为第 20-22 行内网关键字黑名单，覆盖面不足且可绕过，非有效防御；第二入口检查：文件无其他路由、参数或间接调用通道，唯一外部输入为回调参数 payload 且已确认可达 sink", "fix_suggestion": "line 24: 对 callback_url 做严格校验——仅允许 https 协议、通过 socket.getaddrinfo 解析后校验全部解析结果均属公网白名单网段并禁用重定向跟随，再发起请求"}
+```

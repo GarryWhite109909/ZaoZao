@@ -1,0 +1,55 @@
+LANG: go
+```go
+package consumer
+
+import (
+	"database/sql"
+	"encoding/json"
+	"log"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+// OrderEventConsumer 消费订单队列消息，由上层服务注册到 MQ broker。
+// 回调参数 payload 为外部提交的消息体，必须按不可信数据处理。
+
+type OrderEvent struct {
+	OrderID string `json:"order_id"`
+	Status  string `json:"status"`
+}
+
+type Consumer struct {
+	db *sql.DB
+}
+
+func NewConsumer(db *sql.DB) *Consumer { return &Consumer{db: db} }
+
+func (c *Consumer) HandleMessage(payload []byte) {
+	var ev OrderEvent
+	if err := json.Unmarshal(payload, &ev); err != nil {
+		log.Printf("invalid message dropped: %v", err)
+		return
+	}
+	allowed := map[string]bool{"created": true, "paid": true, "shipped": true, "cancelled": true}
+	if !allowed[ev.Status] {
+		log.Printf("illegal status rejected")
+		return
+	}
+	if _, err := c.db.Exec(
+		"UPDATE orders SET status = ? WHERE order_id = ?", ev.Status, ev.OrderID,
+	); err != nil {
+		log.Printf("update failed: %v", err)
+	}
+}
+```
+
+1. 第 20 行回调签名 `HandleMessage(payload []byte)` 是本文件唯一数据入口：没有 request/argv/environ 等显式 web 入口，但 payload 来自 MQ broker，是外部用户可投递的消息体，属等效污点源，必须按不可信处理。
+2. 第 24 行 `json.Unmarshal` 将 payload 反序列化为结构体，`ev.OrderID` 与 `ev.Status` 均为外部可控字符串，构成 source。
+3. 数据流一：第 33-35 行 `ev.Status`、`ev.OrderID` 流向 `db.Exec` 的 SQL sink。防御有两层：第 30-32 行对 Status 做白名单校验（仅允许四个枚举值），杜绝其携带 SQL 元字符；第 33-34 行使用占位符 `?` 参数化查询，OrderID 作为绑定参数传递，驱动负责转义，不进入 SQL 文本拼接。参数化查询类型正确（预编译语句与数据分离）、位置正确（sink 调用处）、覆盖完整（该语句无任何字符串拼接参与）。
+4. 白名单校验本身不是唯一防线且不可绕过：即使绕过校验（假设新增状态值），参数化仍保证注入无效；两层防御互为冗余。
+5. 第二入口检查：文件内无其他函数读取外部数据，无全局变量、无环境变量、无文件读取；`db` 为内部依赖注入对象非污点源。所有可达 sink 仅第 33 行一处，已被完整覆盖。
+6. 结论：source→sink 全链路存在有效防御，无可利用路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "本文件无显式 web 入口，唯一污点源为第 20 行回调参数 payload（MQ 外部消息体）；经 json.Unmarshal 后 ev.Status 与 ev.OrderID 流向第 33 行 db.Exec SQL sink；防御为第 30-32 行 Status 白名单校验加第 33-34 行占位符参数化查询，类型正确（预编译与数据分离）、位置正确（sink 处）、覆盖完整（无字符串拼接）；第二入口检查：无其他外部输入通道或间接调用，结论安全", "fix_suggestion": "no fix needed"}
+```

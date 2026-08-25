@@ -1,0 +1,34 @@
+LANG: python
+```python
+# consumer_worker.py — 消息消费者业务处理器
+# 被上层服务调用：从队列拉取业务消息，消息体为序列化后的任务对象
+import pickle
+import subprocess
+
+
+def handle_message(payload: bytes):
+    """消费队列中的业务消息，payload 为消息体字节流（外部生产者提交的内容）"""
+    # 弱防御：仅做黑名单关键字检查，拦截明显的危险命令词
+    blacklist = [b"rm -rf", b"shutdown", b"reboot"]
+    for kw in blacklist:
+        if kw in payload:
+            raise ValueError("blocked keyword in message")
+
+    task = pickle.loads(payload)  # 反序列化外部可控数据
+
+    if task.get("type") == "shell":
+        cmd = task["command"]
+        # 二次弱校验：字符串替换过滤分号与反引号
+        cmd = cmd.replace(";", "").replace("`", "")
+        subprocess.run(cmd, shell=True)
+```
+
+1. 第 8 行 `handle_message` 接收队列消息体 `payload` 字节流。本文件没有任何 request/input/environ 等显式 web 入口，但该消息体由外部生产者提交、经队列投递，属于公开接口参数，必须按不可信数据处理——被解析的协议报文/消息内容即等效污点源，污点边界在此确立。
+2. 第 11-14 行的黑名单仅匹配 `rm -rf`、`shutdown`、`reboot` 三个字面量，攻击者可用 `rm -r -f`、`/sbin/shutdown`、base64 编码后经命令替换执行等方式绕过；且黑名单在 pickle.loads 之前，根本无法阻止反序列化阶段的对象注入。
+3. 第 16 行 `pickle.loads(payload)` 是 CWE-502 的核心 sink 前置点：pickle 协议允许还原任意可调用对象，攻击者构造带 `__reduce__` 的恶意对象即可在反序列化瞬间执行任意代码，此处的污点直接转化为代码执行，无需到达后续 shell 分支。
+4. 第 19-22 行的二次校验仅为字符串替换删除 `;` 与反引号，可被 `$()` 命令替换、换行符、环境变量展开等绕过；第 23 行 `subprocess.run(cmd, shell=True)` 构成第二条 source→sink 数据流（消息字段 command → shell 执行），全程无有效防御。
+5. 第二入口/替代通道检查：本文件无其他函数、无路由或间接调用入口，唯一外部通道是第 8 行的消息体参数；两条数据流均从该单一污点源出发且均可达危险 sink，防御全部为可绕过的弱过滤，故确认存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data", "risk_level": "Critical", "source": "line 8: handle_message 参数 payload，来自队列的外部业务消息体", "sink": "line 16: pickle.loads(payload)；line 23: subprocess.run(cmd, shell=True)", "explanation": "流1: line 8 消息体 -> line 16 pickle.loads 直接反序列化不可信数据，pickle 可还原任意 __reduce__ 对象实现 RCE，前置黑名单无法阻止；流2: line 8 -> line 19-22 仅做分号/反引号字符串替换（可被 $() 或换行绕过）-> line 23 shell=True 命令注入；第二入口检查: 文件内无其他路由或调用入口，唯一外部通道为消息体，两条链均可达 sink 且无有效防御", "fix_suggestion": "line 16: 改用 json.loads 解析消息并禁用 pickle，line 23: 改用列表形式 subprocess.run([cmd], shell=False) 并白名单校验命令"}
+```

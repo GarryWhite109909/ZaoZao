@@ -1,0 +1,59 @@
+LANG: javascript
+```javascript
+// archive-extractor.js — 归档解包工具模块，被上层服务调用（如消费队列消息后传入归档名）
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { execFile } = require('child_process');
+
+// 允许的归档扩展名白名单
+const ALLOWED_EXTENSIONS = new Set(['.zip', '.tar', '.tar.gz', '.tgz']);
+
+/**
+ * 解包外部提交的归档文件。
+ * @param {string} archiveName - 上层调用者传入的外部归档名（不可信）
+ * @param {string} destDir     - 目标解压目录
+ */
+function extractArchive(archiveName, destDir) {
+  // 防御 1：扩展名白名单校验，阻断非归档/伪装参数
+  const ext = path.extname(archiveName).toLowerCase();
+  const isTarGz = archiveName.toLowerCase().endsWith('.tar.gz') || archiveName.toLowerCase().endsWith('.tgz');
+  if (!isTarGz && !ALLOWED_EXTENSIONS.has(ext)) {
+    throw new Error(`unsupported archive type: ${ext}`);
+  }
+
+  // 防御 2：路径规范化 + 目录逃逸检查，阻断 ../ 注入
+  const resolved = path.resolve(destDir, path.basename(archiveName));
+  if (!resolved.startsWith(path.resolve(destDir) + path.sep)) {
+    throw new Error('path traversal detected');
+  }
+  if (!fs.existsSync(resolved)) {
+    throw new Error('archive not found');
+  }
+
+  // 防御 3：execFile 数组传参，不经 shell 解释，无命令注入面
+  if (isTarGz) {
+    execFile('tar', ['-xzf', resolved, '-C', destDir], (err) => {
+      if (err) throw err;
+    });
+  } else {
+    execFile('unzip', ['-o', resolved, '-d', destDir], (err) => {
+      if (err) throw err;
+    });
+  }
+}
+
+module.exports = { extractArchive };
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；第 15 行 `extractArchive(archiveName, destDir)` 的函数参数承载上层服务/队列消息传入的外部归档名，属公开接口参数，必须按不可信污点源处理。
+2. 数据流追踪：`archiveName` → 第 20-23 行扩展名白名单（`ALLOWED_EXTENSIONS` Set，仅放行 .zip/.tar/.tar.gz/.tgz）→ 第 26-29 行 `path.basename` 剥离目录成分并做 `startsWith` 目录逃逸检查 → 第 38/40 行进入 `execFile` 的参数数组。这是唯一 source→sink 路径。
+3. 防御有效性：白名单为枚举式正向校验而非黑名单/正则过滤，不可绕过；`basename`+前缀检查完整覆盖 `../`、绝对路径、符号化名称等路径攻击面；`execFile` 不经 shell，参数以数组传递，即使残留特殊字符也不会被解释为 shell 元字符——三重防御类型正确、位置在 sink 之前、覆盖全部攻击面。
+4. 反序列化面（CWE-502）：本模块不调用任何反序列化 API（无 eval、Function、JSON.parse 到对象执行、node-serialize 等），归档内容仅由 tar/unzip 原生工具处理，不存在将不可信数据还原为可执行对象的通道。
+5. 第二入口检查：文件仅导出 `extractArchive` 一个函数，无路由注册、无事件监听、无环境变量读取；`destDir` 参数同样经过 resolve+startsWith 校验且不直接拼接进 shell 字符串。无替代污染通道。
+6. 结论：所有 source→sink 流均有有效防御，无 CWE-502 或其他漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入为第15行函数参数 archiveName 与 destDir，承载上层服务传入数据，等效污点源; 流1: archiveName 经第20-23行扩展名白名单(Set正向枚举)、第26-29行 basename+resolve+startsWith 目录逃逸检查后进入第38/40行 execFile 参数数组，防御类型正确(白名单+原生安全API)、位置在 sink 前、覆盖路径穿越与命令注入全攻击面; 全文无任何反序列化 API(eval/Function/node-serialize)，不存在 CWE-502 还原通道; 第二入口检查: 仅导出 extractArchive 一个函数，无路由/监听器/环境变量读取，destDir 同样受 resolve+startsWith 校验且不入 shell 字符串，无替代污染通道", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,61 @@
+LANG: php
+```php
+<?php
+// ArchiveExtractor.php — 归档解包模块，被上层后台服务调用（消费任务队列消息）
+declare(strict_types=1);
+
+namespace App\Archive;
+
+class ArchiveExtractor
+{
+    // 允许解包的归档扩展名白名单
+    private const ALLOWED_EXT = ['zip', 'tar', 'tgz'];
+
+    /**
+     * 处理一个归档文件：$archivePath 由队列消息携带的外部提交归档名解析而来，
+     * 归档内部条目名同样视为不可信外部数据。
+     */
+    public function extract(string $archivePath, string $destDir): void
+    {
+        $ext = strtolower(pathinfo($archivePath, PATHINFO_EXTENSION));
+        if (!in_array($ext, self::ALLOWED_EXT, true)) {
+            throw new \InvalidArgumentException('unsupported archive type');
+        }
+
+        $realArchive = realpath($archivePath);
+        if ($realArchive === false || !is_file($realArchive)) {
+            throw new \RuntimeException('archive not found');
+        }
+
+        $za = new \ZipArchive();
+        if ($za->open($realArchive) !== true) {
+            throw new \RuntimeException('cannot open archive');
+        }
+
+        for ($i = 0; $i < $za->numFiles; $i++) {
+            $entry = $za->getNameIndex($i);          // 外部可控：归档内条目名
+            $safe  = basename(str_replace('\', '/', $entry)); // 去目录穿越
+            if ($safe === '' || str_starts_with($safe, '.')) {
+                continue;                              // 拒绝隐藏/相对路径条目
+            }
+            $target = rtrim($destDir, '/') . '/' . $safe;
+            if (!str_starts_with(realpath(dirname($target)) ?: '', realpath($destDir))) {
+                continue;                              // 二次确认不逃逸目标目录
+            }
+            copy('zip://' . $realArchive . '#' . rawurlencode($entry), $target);
+        }
+        $za->close();
+    }
+}
+```
+
+1. 第 1 行污点边界：本文件无 request/argv/stdin 等显式 web 入口；污点源是第 20 行参数 `$archivePath`（由上层服务从被解析的队列消息/外部提交归档名获得）以及第 33 行 `$za->getNameIndex()` 返回的归档内条目名——两者均为公开接口承载的外部可控数据，必须按不可信处理。
+2. 第 21–23 行对归档类型做严格白名单校验（`in_array` + `true` 严格比较），非 zip/tar/tgz 直接抛异常，阻断非预期格式进入后续流程。
+3. 第 34–37 行对条目名先统一斜杠再 `basename()` 剥离任何目录成分，并拒绝空名与点开头条目，消除 `../../etc/passwd` 式路径穿越；这是基于规范化后的结构性校验，而非黑名单或可绕过的字符串替换。
+4. 第 39–41 行在拼接目标路径后用 `realpath(dirname($target))` 与真实目标目录做前缀比对，二次确认解压落点不会逃逸 `$destDir`，覆盖符号链接与残余穿越变体。
+5. 第 42 行 sink 为 `copy()` 的目标路径与 `zip://` 流包装器；由于第 3、4 步的防御位于 source（第 33 行）到 sink（第 42 行）之间的必经路径上且覆盖全部循环迭代条目，攻击面完整闭合。命令执行类 CWE-78 在本模块不存在：全程未调用 `exec/shell_exec/system/passthru/backtick`。
+6. 第二入口检查：本文件仅有一个公共方法 `extract()`，无其他路由、静态入口或间接调用点；所有数据流均经过上述同一组校验，故不存在绕过通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界：无显式 web 入口，外部数据经队列消息携带的归档路径(第20行)与 ZipArchive 条目名 getNameIndex(第33行)进入，等效不可信源；流1 archivePath→copy 目标路径：第21-23行扩展名白名单(in_array严格比较)+第25-27行 realpath 存在性校验，类型为白名单、位置在入口处、覆盖全部调用；流2 条目名→copy 目标路径：第34-35行 basename 规范化剥离目录成分并拒绝点开头条目，第39-41行 realpath 前缀二次确认防逃逸，均为结构化白名单校验而非黑名单/正则过滤，位置在 source 与 sink(第42行 copy)之间必经路径，覆盖循环内全部条目；本文件不含 exec/system/shell_exec 等命令执行 sink，CWE-78 不成立；第二入口检查：仅有 extract 一个公共方法，无替代路由或间接调用，结论安全", "fix_suggestion": "no fix needed"}
+```

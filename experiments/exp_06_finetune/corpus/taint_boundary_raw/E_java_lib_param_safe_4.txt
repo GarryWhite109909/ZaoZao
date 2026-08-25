@@ -1,0 +1,57 @@
+LANG: java
+```java
+package com.acme.etl.adapter;
+
+import org.w3c.dom.Document;
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilderFactory;
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * 数据导入适配器：被上层同步服务调用，将外部系统推送的记录
+ * （以 XML 字符串形式经参数传入）解析为内部 Document 对象。
+ */
+public final class RecordImportAdapter {
+
+    /**
+     * 解析一条外部记录。recordXml 由上游队列消费者/外部系统调用方传入，
+     * 内容完全不可信。
+     */
+    public static Document parseRecord(String recordXml) throws Exception {
+        if (recordXml == null || recordXml.isEmpty()) {
+            throw new IllegalArgumentException("empty record");
+        }
+        if (recordXml.length() > 1 << 20) {
+            throw new IllegalArgumentException("record too large");
+        }
+
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        // 禁用 DTD，彻底阻断 XXE（CWE-611）
+        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+        factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+        factory.setXIncludeAware(false);
+        factory.setExpandEntityReferences(false);
+
+        return factory.newDocumentBuilder()
+                .parse(new ByteArrayInputStream(recordXml.getBytes(StandardCharsets.UTF_8)));
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/environ/stdin 等显式 web 入口；唯一外部数据通道是第 15 行公开方法 `parseRecord(String recordXml)` 的参数——上层服务消费外部系统消息后传入的 XML 内容必须按不可信数据处理，构成等效污点源。
+
+2. 数据流追踪：第 16~21 行做非空与大小校验（防 DoS），随后 recordXml 在第 33 行经 `getBytes` 进入 `ByteArrayInputStream`，于第 34 行流向危险 sink `DocumentBuilder.parse(...)`。XML 解析器默认会解析 DOCTYPE 与外部实体，若未加固即为 CWE-611 的经典 XXE sink。
+
+3. 防御类型正确性：第 24 行 `disallow-doctype-decl=true` 直接拒绝任何 DOCTYPE 声明，使实体定义根本无法存在；这是白名单式的结构性禁用而非黑名单/正则过滤，攻击者无法通过编码、嵌套或参数实体绕过。
+
+4. 防御位置与覆盖面：防御设置在 `DocumentBuilderFactory` 上，位于 parse 调用之前、作用于本次解析全过程，位置正确；同时第 25~27 行关闭一般实体与参数实体解析，第 28~29 行禁用 XInclude 与实体展开，形成纵深覆盖，覆盖了 XXE 的全部已知攻击面（文件读取、SSRF、billion laughs）。
+
+5. 第二入口检查：文件内无路由注册、无静态可变状态、无其他公开方法或间接调用路径；`parseRecord` 是唯一入口且其全部污点流均经过上述加固后的同一 factory 配置，不存在绕过通道。
+
+6. 结论：source→sink 链路具备类型正确、位置正确、覆盖完整的防御，不构成漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点是第 15 行公开方法 parseRecord 的参数 recordXml, 承载上层服务传入的外部 XML 记录, 属等效污点源; 该数据在第 34 行流向 DocumentBuilder.parse 这一 XXE 危险 sink, 但第 24 行 disallow-doctype-decl 从结构上禁止 DOCTYPE 使实体无法定义, 第 25-29 行进一步关闭一般实体/参数实体/XInclude/实体展开, 属白名单式结构性禁用而非可绕过的黑名单或正则过滤, 位置在 parse 之前且覆盖全部解析过程; 文件内无路由注册、无其他公开方法或间接调用, 不存在第二入口或替代通道, 故无 CWE-611 漏洞", "fix_suggestion": "no fix needed"}
+```

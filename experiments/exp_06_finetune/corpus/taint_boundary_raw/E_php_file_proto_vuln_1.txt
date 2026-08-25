@@ -1,0 +1,51 @@
+LANG: php
+```php
+<?php
+// modules/queue/OrderNotifyConsumer.php
+// 消息消费者业务处理器：由后台 worker 从队列拉取消息后调用 handle()，
+// 消息体为 JSON 报文，本模块不接收任何 HTTP 请求。
+
+namespace App\Modules\Queue;
+
+class OrderNotifyConsumer
+{
+    // worker 进程消费到一条订单通知消息时调用
+    public function handle(string $messageFile): void
+    {
+        $raw = file_get_contents($messageFile);          // 第14行：读取队列落盘的报文文件（外部可控）
+        if ($raw === false) {
+            return;
+        }
+        $msg = json_decode($raw, true);                  // 第18行：解析协议报文
+        if (!is_array($msg) || !isset($msg['callback_url'])) {
+            return;
+        }
+
+        $url = trim($msg['callback_url']);               // 第23行：污点数据进入业务变量
+
+        // 弱防御：仅黑名单拦截内网关键字段名，可被 URL 编码/十进制 IP 绕过
+        $blocked = ['169.254', '127.0.0.1', 'localhost', '10.', '192.168.'];
+        foreach ($blocked as $bad) {
+            if (stripos($url, $bad) !== false) {
+                return;
+            }
+        }
+
+        $ch = curl_init();                               // 第33行
+        curl_setopt($ch, CURLOPT_URL, $url);             // 第34行：SINK —— SSRF (CWE-918)
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_exec($ch);
+        curl_close($ch);
+    }
+}
+```
+
+1. **污点边界**：本文件无 request/input/environ 等显式 web 入口；第 14 行 `file_get_contents` 读取的报文文件与第 18 行 `json_decode` 解析出的内容承载外部提交的队列消息，属等效污点源，必须按不可信处理。
+2. **输入点枚举**：唯一外部输入点为第 14 行读取的报文文件内容；`$msg['callback_url']`（第 20 行取出、第 23 行赋值）直接来自该报文，可达第 34 行 sink，链路完整无中断。
+3. **防御验证**：第 27–31 行仅是字符串黑名单（`stripos` 匹配固定子串），可绕过：如使用十进制 IP `http://2130706433/`、IPv6 `[::1]`、DNS 重绑定域名或大小写变体 `LOCALHOST` 均不在名单中；非有效防御。
+4. **Sink**：第 34 行 `curl_setopt(CURLOPT_URL, $url)` 使攻击者可让服务器向任意地址发起请求，构成 CWE-918 SSRF，可探测内网元数据服务。
+5. **第二入口检查**：全文无其他路由、参数或间接调用通道；`handle()` 仅由队列 worker 以文件路径调用，结论不受其他入口影响。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 服务端请求伪造(SSRF)", "risk_level": "High", "source": "line 14: file_get_contents 读取的外部队列报文文件内容", "sink": "line 34: curl_setopt CURLOPT_URL", "explanation": "报文文件内容经 json_decode 解析出 callback_url -> 黑名单子串匹配可被十进制IP/DNS重绑定绕过 -> 未校验直接传入 curl_setopt CURLOPT_URL 发起任意请求; 全文无第二入口或替代通道, 唯一外部数据源即被解析的报文文件", "fix_suggestion": "line 34: 在传入前解析 URL 主机并做 DNS 解析, 校验解析结果 IP 属于允许出网的白名单网段且禁止重定向"}
+```

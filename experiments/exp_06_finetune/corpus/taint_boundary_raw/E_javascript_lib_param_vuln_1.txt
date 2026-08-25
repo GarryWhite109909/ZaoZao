@@ -1,0 +1,51 @@
+LANG: javascript
+```javascript
+// lib/messageHandlers.js
+// 消息消费者业务处理器：由上层队列消费服务调用，payload 为外部提交的消息体
+const { execFile } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+// 弱防御：仅黑名单过滤，可被编码/拼接绕过
+function sanitizeTopic(topic) {
+  const blacklist = ['..', '/', '\', ';', '|'];
+  let cleaned = topic;
+  for (const bad of blacklist) {
+    cleaned = cleaned.split(bad).join('');
+  }
+  return cleaned;
+}
+
+/**
+ * 处理来自消息队列的业务消息（如订单归档任务）
+ * @param {string} topic - 消息主题，由上游生产者写入，视为不可信
+ * @param {object} payload - 消息负载，含 archiveDir 字段
+ */
+function handleArchiveMessage(topic, payload) {
+  const safeTopic = sanitizeTopic(topic); // 第 20 行：弱防御点
+  const targetDir = path.join('/data/archives', safeTopic);
+  const manifest = path.join(targetDir, 'manifest.xml');
+
+  // 将 payload 内容写入 XML 清单文件
+  const xml = `<?xml version="1.0"?><archive><topic>${safeTopic}</topic>` +
+    `<dir>${payload.archiveDir}</dir></archive>`;
+  fs.writeFileSync(manifest, xml);
+
+  // 使用系统工具解析生成的 XML 清单
+  execFile('xmllint', ['--noout', manifest], (err) => {
+    if (err) console.error('archive validation failed:', err.message);
+  });
+}
+
+module.exports = { handleArchiveMessage };
+```
+
+1. **污点边界**：本文件无 request/input 等显式 web 入口；第 16 行 `handleArchiveMessage(topic, payload)` 的参数承载上层队列消费服务传入的外部消息内容，公开接口参数必须按不可信处理，是等效污点源。
+2. **数据流一**：第 20 行 `topic` 经 `sanitizeTopic` 黑名单清洗后进入第 21 行 `targetDir`、第 24 行 XML 字符串。该黑名单仅删除 `../` 等字面量，攻击者可用 URL 编码 `%2e%2e%2f`（若上层未解码则直接以字面量进入 XML）、或双重写法 `....//`（删除一层后还原为 `../`）绕过，属可绕过弱防御。
+3. **数据流二**：第 25 行 `payload.archiveDir` 完全未经过任何校验直接拼入 XML 文档并写入文件，随后第 30 行被 `xmllint` 解析——这是 CWE-611 的核心 sink：若 payload 中包含 `<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>` 与实体引用，xmllint 默认支持外部实体解析，导致任意文件读取/SSRF。
+4. **防御覆盖面验证**：全部防御仅为第 12-18 行的黑名单字符串替换，作用于 `topic` 且不覆盖 `payload.archiveDir`；无 DTD 禁用、无实体白名单、无 schema 校验，防御缺失。
+5. **第二入口检查**：模块仅导出 `handleArchiveMessage` 一个函数，文件内无路由注册、无环境变量/stdin 读取；替代通道即该导出函数的两个参数本身，均可达 sink，支撑漏洞成立结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 XML 外部实体引用不当（XXE）", "risk_level": "High", "source": "line 16: 函数参数 topic 与 payload（队列消息内容，外部可控）", "sink": "line 30: execFile 调用 xmllint 解析含 payload.archiveDir 的 XML 清单文件", "explanation": "流一：line 16 topic -> line 20 黑名单清洗（可被 ....// 或编码绕过）-> line 24 拼入 XML -> line 27 写入 manifest.xml -> line 30 xmllint 解析；流二：line 16 payload.archiveDir 无任何校验 -> line 25 直接拼入 XML -> line 27 写盘 -> line 30 被 xmllint 解析，DOCTYPE/ENTITY 注入触发外部实体读取本地文件或 SSRF；全文件无 DTD 禁用等有效防御，仅有可绕过黑名单且不覆盖 payload；第二入口检查：模块仅此一个导出函数，无路由或其他输入通道，两参数即为唯一等效污点源且均可达 sink", "fix_suggestion": "line 30: 改用安全 XML 解析方式，如为 xmllint 增加 --noent --nonet 并禁用 DTD（--dtdvalid 或使用 --xpath 前先以 noxinclude/noent 处理），或在生成端拒绝包含 DOCTYPE/ENTITY 的内容并对 payload.archiveDir 做严格白名单校验"}
+```

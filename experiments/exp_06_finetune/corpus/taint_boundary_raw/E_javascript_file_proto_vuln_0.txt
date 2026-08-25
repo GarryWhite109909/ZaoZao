@@ -1,0 +1,64 @@
+LANG: javascript
+```code
+// template-renderer.js
+// 模板渲染辅助模块，被上层服务调用：传入模板片段文件路径与变量字典文件路径。
+// 变量字典由外部合作方通过共享目录投递（JSON 文件），内容不可信。
+const fs = require('fs');
+const http = require('http');
+const url = require('url');
+
+const BLOCKED_HOSTS = ['169.254.169.254', 'metadata.google.internal'];
+
+function loadVars(varsFile) {
+  // 第 10 行：读取外部投递的 JSON 变量文件 —— 外部可控数据进入点
+  const raw = fs.readFileSync(varsFile, 'utf8');
+  return JSON.parse(raw);
+}
+
+function renderTemplate(templateFile, varsFile) {
+  const vars = loadVars(varsFile);
+  let tpl = fs.readFileSync(templateFile, 'utf8');
+
+  for (const [key, value] of Object.entries(vars)) {
+    const placeholder = new RegExp('\\{\\{\\s*' + key + '\\s*\\}\\}', 'g');
+    tpl = tpl.replace(placeholder, String(value));
+  }
+  return tpl;
+}
+
+function fetchRemoteSnippet(target) {
+  // 弱防御：仅黑名单过滤元数据地址，可用 DNS 重绑定 / 十进制 IP / 302 跳转绕过
+  const parsed = url.parse(target);
+  if (BLOCKED_HOSTS.includes(parsed.hostname)) {
+    throw new Error('blocked host');
+  }
+  return new Promise((resolve, reject) => {
+    http.get(target, res => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => resolve(body));
+    }).on('error', reject);
+  });
+}
+
+async function renderWithRemote(templateFile, varsFile) {
+  const vars = loadVars(varsFile);           // 第 38 行：再次解析外部文件
+  if (vars.remote_snippet_url) {             // 攻击者控制的 URL 字段
+    const snippet = await fetchRemoteSnippet(vars.remote_snippet_url); // 第 40 行：SSRF sink
+    return renderTemplate(templateFile, varsFile).replace('{{SNIPPET}}', snippet);
+  }
+  return renderTemplate(templateFile, varsFile);
+}
+
+module.exports = { renderTemplate, renderWithRemote };
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；第 10 行 `fs.readFileSync(varsFile)` 解析的变量字典文件由外部合作方经共享目录投递，其内容（尤其 `remote_snippet_url` 字段）承载外部可控数据，是等效污点源，必须按不可信处理。
+2. 数据流一：第 10-11 行解析出的 vars 对象 → 第 38 行再次加载 → 第 39 行取出 `vars.remote_snippet_url` → 第 40 行传入 `fetchRemoteSnippet` → 第 31 行 `http.get(target)` 发起任意主机请求，构成完整 source→sink 链。
+3. 防御验证：第 27-29 行仅用主机名黑名单拦截两个元数据地址；可被 DNS 重绑定、十进制/八进制 IP 编码（如 `http://2852039166/`）、开放重定向或 IPv6 写法轻易绕过，且未限制端口、协议与内网网段，属无效弱防御。第 15-17 行的占位符替换仅影响渲染输出，不涉及网络请求路径，无任何防护作用。
+4. 可达性确认：`renderWithRemote` 是模块导出函数，上层服务以文件路径调用即可触发；只要投递的 JSON 含 `remote_snippet_url` 即命中 sink，无前置条件阻断。
+5. 第二入口检查：本文件仅暴露 `renderTemplate` 与 `renderWithRemote` 两个导出；`renderTemplate` 不触网，无其他路由/参数/间接调用通道，唯一污点链即上述文件内容→`http.get`，结论成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 SSRF（服务端请求伪造）", "risk_level": "High", "source": "line 10: fs.readFileSync(varsFile) 解析的外部投递 JSON 变量文件内容", "sink": "line 31: http.get(target) 向攻击者控制的主机发起请求", "explanation": "污点边界：无显式 web 入口，但第 10 行解析的合作方投递 JSON 文件是等效污点源；主链：line 10 读文件 -> line 11 JSON.parse -> line 38 再次加载 -> line 39 取 remote_snippet_url -> line 40 传入 fetchRemoteSnippet -> line 31 http.get 触发 SSRF；防御分析：line 27-29 主机名黑名单可被 DNS 重绑定、十进制 IP、IPv6 或重定向绕过，且未限协议端口内网段，属可绕过弱防御；第二入口检查：模块仅导出 renderTemplate 与 renderWithRemote，renderTemplate 不触网，无其他替代通道，唯一可达链即为上述文件内容到 http.get 的数据流", "fix_suggestion": "line 40: 对 remote_snippet_url 做严格校验——仅允许 https 协议、解析后强制为白名单域名并先解析 IP 拒绝私网/链路本地/回环地址，禁用重定向跟随"}
+```

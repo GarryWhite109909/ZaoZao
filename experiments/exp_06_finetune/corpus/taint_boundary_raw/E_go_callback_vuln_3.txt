@@ -1,0 +1,52 @@
+LANG: go
+```go
+// Package importer 实现外部系统数据导入适配器。
+// 本模块作为消息队列消费者被上层服务注册，处理来自导入队列的记录消息。
+package importer
+
+import (
+	"fmt"
+	"os/exec"
+	"strings"
+)
+
+// RecordMessage 是导入队列中一条记录的载荷，由上游反序列化后传入 OnRecord。
+type RecordMessage struct {
+	SourceSystem string // 来源系统标识
+	TableName    string // 目标表名
+	RecordID     string // 记录 ID
+	Payload      []byte
+}
+
+// weakSanitize 仅做黑名单过滤：剔除分号与空格（可绕过）。
+func weakSanitize(s string) string {
+	s = strings.ReplaceAll(s, ";", "")
+	return strings.ReplaceAll(s, " ", "")
+}
+
+// OnRecord 是队列消费者回调，由消费者框架在收到消息时调用。
+func OnRecord(msg *RecordMessage) error {
+	table := weakSanitize(msg.TableName)
+	cmd := exec.Command("sh", "-c",
+		fmt.Sprintf("psql -c "INSERT INTO %s VALUES ('%s')"", table, msg.RecordID))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("import failed: %v: %s", err, out)
+	}
+	return nil
+}
+```
+
+1. 污点边界：本文件没有任何 request/argv/environ 等显式入口；唯一外部数据通道是第 24 行回调参数 `msg *RecordMessage`——它是消息队列载荷，承载外部系统提交的内容，必须按不可信数据处理，是等效污点源。
+
+2. 第 25 行 `table := weakSanitize(msg.TableName)` 将污点数据 `msg.TableName` 传入弱防御 `weakSanitize`（第 17-20 行）：仅做字符串替换删除分号和空格。攻击者可用反引号、`$(...)` 命令替换、`&&`、`||`、换行符等元字符绕过，例如 TableName 为 ``x;`` 的变体或直接使用 `$()`——该黑名单不构成有效防御。
+
+3. 第 26-27 行 sink：`exec.Command("sh", "-c", fmt.Sprintf(...))` 通过 shell 执行拼接命令，污点字段 `msg.TableName` 直接进入 `-c` 字符串，实现 OS 命令注入（CWE-78）。同时第 27 行 `msg.RecordID` 未经任何处理也拼入 SQL 字符串，虽主要风险仍是 shell 注入，但同样未验证。
+
+4. 防御覆盖面核查：全文件唯一的"防御"就是第 17-20 行的黑名单替换，位置在 source 与 sink 之间，但覆盖面极窄（只处理两个字符），且对 shell 元字符完全无效，属于可绕过弱防御，无有效净化。
+
+5. 第二入口检查：文件内不存在其他函数签名接收外部数据，也没有 HTTP 路由、环境变量读取或文件读取等替代通道；`OnRecord` 是唯一入口，且其参数到 sink 的路径完整可达，故漏洞确认成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "Critical", "source": "line 24: 回调参数 msg *RecordMessage（消息队列载荷，外部可控）", "sink": "line 26: exec.Command('sh', '-c', fmt.Sprintf(...)) 拼接执行", "explanation": "主链: line 24 msg.TableName -> line 25 weakSanitize 黑名单替换(仅删分号和空格, 可用 $() 反引号 && || 等元字符绕过) -> line 26-27 exec.Command sh -c 拼接, 实现 OS 命令注入; 附加流: line 24 msg.RecordID 未做任何处理直接经 Sprintf 拼入命令字符串, 同样可达 sink; 全文件无其他输入点, 无有效防御", "fix_suggestion": "line 26: 不通过 sh -c 执行, 改用 exec.Command('psql', '-c', ...) 参数数组形式并使用占位符参数化 SQL, 对 TableName 做白名单校验"}
+```

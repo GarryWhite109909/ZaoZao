@@ -1,0 +1,75 @@
+LANG: java
+```java
+package com.acme.etl.adapter;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+
+/**
+ * 数据导入适配器：被上层同步服务调用，将外部系统推送的记录
+ * 转换为本地归档文件。本模块不感知任何传输协议。
+ */
+public final class RecordImportAdapter {
+
+    /** 允许的目标数据集白名单（与后端注册表一致） */
+    private static final Set<String> ALLOWED_DATASETS =
+            Set.of("customers", "orders", "inventory");
+
+    /**
+     * 导入一条外部记录。dataset 与 payload 均来自外部系统，
+     * 必须按不可信数据处理。
+     *
+     * @param dataset 目标数据集标识
+     * @param payload 记录内容（已由上层反序列化为纯文本）
+     * @return 归档文件路径
+     */
+    public File importRecord(String dataset, String payload) throws IOException {
+        // 防御：严格白名单校验，仅允许预注册的数据集名
+        if (dataset == null || !ALLOWED_DATASETS.contains(dataset.toLowerCase(Locale.ROOT))) {
+            throw new IllegalArgumentException("unknown dataset: " + dataset);
+        }
+        String safeDataset = dataset.toLowerCase(Locale.ROOT);
+
+        List<String> command = new ArrayList<>();
+        command.add("/usr/local/bin/ingest");
+        command.add("--dataset");
+        command.add(safeDataset);
+        command.add("--data");          // 参数数组形式，payload 不经过 shell 解析
+        command.add(payload == null ? "" : payload);
+
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.redirectErrorStream(true);
+        Process proc = pb.start();
+        try {
+            int code = proc.waitFor();
+            if (code != 0) {
+                throw new IOException("ingest failed with exit code " + code);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted during ingest", e);
+        }
+        return new File("/var/lib/etl/archive/" + safeDataset + ".dat");
+    }
+}
+```
+
+1. 污点边界：本文件无 request/argv/stdin 等显式入口，但第 24 行公开方法 `importRecord(String dataset, String payload)` 的两个参数承载外部系统传入的数据，是等效污点源，必须按不可信处理。
+
+2. 数据流一：`dataset`（第 24 行参数）→ 第 30-32 行白名单校验 `ALLOWED_DATASETS.contains(...)` → 第 33 行 `safeDataset` → 第 37、39 行作为命令独立元素传入 `ProcessBuilder`。防御类型为白名单校验，位置在 sink 之前且覆盖所有使用点；即使绕过校验也不可能（集合为编译期固定值），且 `ProcessBuilder` 以参数数组执行、不经 shell 解析，无注入面。
+
+3. 数据流二：`payload`（第 24 行参数）→ 第 41-42 行直接放入命令参数列表第 5 个元素 → 第 45 行 `pb.start()` 执行。防御为原生安全 API：`ProcessBuilder(List<String>)` 将每个元素作为独立 argv 传递，操作系统层面不会经 `/bin/sh` 解释，分号、管道、反引号等元字符均被当作字面量，攻击面被完整覆盖。
+
+4. 返回路径：第 55 行文件路径拼接使用的是白名单化后的 `safeDataset` 而非原始参数，路径遍历同样不可达。
+
+5. 第二入口检查：全文无路由注册、无静态字段缓存跨请求数据、无其他公开方法或间接调用点；`ALLOWED_DATASETS` 为不可变常量，不存在替代污染通道。
+
+6. 结论：两条 source→sink 流均有类型正确、位置正确、覆盖完整的防御（白名单 + 参数数组命令执行），无 CWE-78 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界为 importRecord 的 dataset/payload 参数（等效外部输入）；dataset 经第30行固定白名单校验后才进入 ProcessBuilder，白名单为编译期不可变集合无法绕过；payload 以参数数组元素传入 ProcessBuilder，不经 shell 解析，命令注入面完整覆盖；返回路径仅使用白名单化后的 safeDataset，无路径遍历；全文无第二入口或替代通道", "fix_suggestion": "no fix needed"}
+```

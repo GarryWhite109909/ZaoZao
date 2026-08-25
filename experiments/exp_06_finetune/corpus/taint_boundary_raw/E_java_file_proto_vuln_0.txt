@@ -1,0 +1,53 @@
+LANG: java
+```java
+package com.acme.cache.codec;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * 缓存编解码模块：从磁盘上的缓存快照文件恢复键值对。
+ * 快照由上层同步服务按行写入，格式为 key=value，value 为 HTML 片段。
+ * 本模块被缓存预热任务调用。
+ */
+public final class SnapshotCodec {
+
+    public static Map<String, String> decode(Path snapshotFile) throws IOException {
+        Map<String, String> cache = new HashMap<>();
+        for (String line : Files.readAllLines(snapshotFile, StandardCharsets.UTF_8)) {
+            int idx = line.indexOf('=');
+            if (idx <= 0) continue;
+            String key = line.substring(0, idx);
+            // 弱防御：仅剔除 <script> 字面量
+            String value = line.substring(idx + 1).replace("<script>", "");
+            cache.put(key, value);
+        }
+        return cache;
+    }
+
+    /** 渲染缓存条目到管理端页面片段 */
+    public static String render(String key, Map<String, String> cache) {
+        return "<div class='entry'>" + cache.get(key) + "</div>";
+    }
+}
+```
+
+1. 第 1 行污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 19 行 `Files.readAllLines(snapshotFile)` 读取的快照文件内容——该快照由外部同步服务按公开协议写入，其 value 字段承载外部提交的任意文本，必须按不可信数据处理，属等效污点源。
+
+2. 第 19-24 行：每行被解析为 key=value，第 23 行 `line.substring(idx + 1)` 取出的 value 直接来自文件字节，污点成立并进入 map。
+
+3. 第 22 行存在弱防御：`replace("<script>", "")` 仅做字面量替换。绕过方式明确：`<SCRIPT>`（大小写）、`<script >`、嵌套 `<scr<script>ipt>`、或直接使用 `<img src=x onerror=...>` 等非 script 向量均可完整通过，不构成有效防御。
+
+4. 第 31 行 sink：`render` 将 `cache.get(key)` 以字符串拼接嵌入 HTML 返回值，无任何输出编码（未用 OWASP Encoder/HtmlUtils.htmlEscape），污点数据直达 CWE-79 危险 sink。
+
+5. 可达性确认：decode 的返回 map 被调用方传入 render 是模块内既定契约（注释表明渲染管理端页面），source→sink 全程可达且无有效净化。
+
+6. 第二入口检查：本文件仅有一个入口——snapshotFile 参数指向的被解析文件；不存在其他路由、参数或间接调用通道；key 同样源自文件但仅作 map 查找，主链为 value 流向 render 拼接点。结论：存在存储型 XSS 风险漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (XSS)", "risk_level": "High", "source": "line 19: Files.readAllLines(snapshotFile) 解析的外部快照文件内容", "sink": "line 31: render 中字符串拼接 cache.get(key) 进 HTML 返回值", "explanation": "污点边界：本文件无任何显式 web 入口，但第 19 行读取的快照文件由外部同步服务按协议写入，value 承载外部可控文本，等效于不可信输入；数据流 line 19 -> line 23 substring 提取 value -> line 24 存入 cache -> line 31 拼入 HTML；防御分析：line 22 仅 replace 剔除 <script> 字面量，可被大小写变体、嵌套拆分及 img/svg/onerror 等非 script 向量完全绕过，且 sink 处无输出编码，属可绕过弱防御而非有效防御；第二入口检查：全文件唯一外部通道是该被解析文件，无其他路由/参数/间接调用，故确认单链路 source->sink 可达，存在存储型 XSS", "fix_suggestion": "line 31: 使用 HtmlUtils.htmlEscape(cache.get(key)) 或 OWASP Encoder.forHtml 对插值进行上下文相关输出编码"}
+```

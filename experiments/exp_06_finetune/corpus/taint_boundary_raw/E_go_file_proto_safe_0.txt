@@ -1,0 +1,57 @@
+LANG: go
+```go
+// Package jobctl 提供运维命令封装：从任务描述文件加载命令并安全执行。
+// 上层调度服务会调用 LoadAndRun，任务文件由外部提交，内容必须视为不可信。
+package jobctl
+
+import (
+	"encoding/json"
+	"fmt"
+	"os/exec"
+)
+
+// allowedCommands 是命令白名单：仅允许执行这些固定运维工具。
+var allowedCommands = map[string]bool{
+	"systemctl": true,
+	"df":        true,
+	"uptime":    true,
+}
+
+type Task struct {
+	Cmd  string   `json:"cmd"`
+	Args []string `json:"args"`
+}
+
+// LoadAndRun 读取任务文件（外部提交），解析后执行。
+func LoadAndRun(path string) (string, error) {
+	data, err := osReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var t Task
+	if err := json.Unmarshal(data, &t); err != nil {
+		return "", fmt.Errorf("bad task: %w", err)
+	}
+	if !allowedCommands[t.Cmd] { // 白名单校验：命令名必须命中固定集合
+		return "", fmt.Errorf("command not allowed: %s", t.Cmd)
+	}
+	out, err := exec.Command(t.Cmd, t.Args...).CombinedOutput() // 参数数组形式，不经 shell 解析
+	return string(out), err
+}
+```
+
+1. 污点边界：本文件没有 request/input 等显式 web 入口；第 24 行 `LoadAndRun` 接收的任务文件路径指向外部提交的文件，第 25 行读取其字节内容即等效污点源——公开接口提交的内容必须按不可信处理。
+
+2. 第 25 行读入文件 → 第 28 行 `json.Unmarshal` 反序列化为 `Task` 结构体，`t.Cmd` 与 `t.Args` 均为攻击者可控字段。
+
+3. 数据流追踪：`t.Cmd`/`t.Args` 流向第 36 行 `exec.Command(t.Cmd, t.Args...)` 这一危险 sink。防御一：第 34 行白名单校验 `allowedCommands[t.Cmd]`，采用正向枚举而非黑名单，未命中直接拒绝，类型正确（精确集合匹配）、位置正确（sink 之前）、覆盖完整（所有到达 sink 的路径都必须经过该校验）。
+
+4. 防御二：第 36 行使用参数数组形式的 `exec.Command`，不经过 shell 解释器拼接，即使 `Args` 含分号、反引号、管道符等元字符也不会被 shell 执行，消除了命令注入面；且 `Cmd` 已被白名单限定为三个无参或低危工具。
+
+5. 第二入口检查：文件内仅有一个入口函数 `LoadAndRun`，无其他路由、导出变量或间接调用可绕过白名单；`Task` 字段全部经过上述两层防御才抵达 sink。
+
+6. 结论：source→sink 全部路径均被白名单 + 无 shell 的参数化执行覆盖，不存在可绕过通道，判定为安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "LoadAndRun 读取的外部提交任务文件内容(第25行)", "sink": "exec.Command(t.Cmd, t.Args...)(第36行)", "explanation": "污点边界：无 web 入口，被解析的任务文件内容为等效污点源；流1：文件字节→json.Unmarshal→t.Cmd/t.Args→exec.Command，防御为第34行正向白名单校验(类型正确、位于 sink 前、覆盖唯一路径)加第36行参数数组式 exec.Command 不经 shell 解析，消除元字符注入面；第二入口检查：文件内仅此一个入口函数，无其他路由或间接调用可绕过防御，结论安全", "fix_suggestion": "no fix needed"}
+```

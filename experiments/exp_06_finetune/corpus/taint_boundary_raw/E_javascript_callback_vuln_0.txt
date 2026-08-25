@@ -1,0 +1,46 @@
+LANG: javascript
+```javascript
+// outbound-webhook-dispatcher.js
+// 被上层服务调用：消费 'webhook.dispatch' 队列消息，向客户注册的回调地址发起出站请求
+const amqp = require('amqplib');
+const { Pool } = require('pg');
+const axios = require('axios');
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// 弱防御：仅拦截常见 SQL 关键字，可被注释/编码绕过
+function sanitize(value) {
+  return String(value).replace(/(select|insert|update|delete|drop|;|--)/gi, '');
+}
+
+async function startConsumer() {
+  const conn = await amqp.connect('amqp://localhost');
+  const ch = await conn.createChannel();
+  await ch.assertQueue('webhook.dispatch');
+  ch.consume('webhook.dispatch', async (msg) => {
+    // msg.content 为外部提交的载荷，payload.tenantId / payload.eventType 均不可信
+    const payload = JSON.parse(msg.content.toString());
+    const tenantId = sanitize(payload.tenantId);
+    const eventType = payload.eventType;
+    const query = `SELECT endpoint_url, secret FROM webhook_endpoints WHERE tenant_id = '${tenantId}' AND event_type = '${eventType}'`;
+    const { rows } = await pool.query(query); // CWE-89: 拼接进 SQL
+    for (const row of rows) {
+      await axios.post(row.endpoint_url, { type: eventType }, { headers: { 'X-Signature': row.secret } });
+    }
+    ch.ack(msg);
+  });
+}
+
+startConsumer();
+```
+
+1. 第 14 行 `ch.consume` 的回调参数 `msg` 是污点边界：本文件没有任何 request/input 等显式 web 入口，但消息体 `msg.content` 由外部生产者投递到队列，属于公开接口承载的外部可控数据，必须按不可信处理。
+2. 第 17 行 `JSON.parse(msg.content)` 后，`payload.tenantId` 与 `payload.eventType` 完全由攻击者控制；第 18 行对 `tenantId` 的 `sanitize` 仅做关键字黑名单替换，可用内联注释（如 `'/**/OR/**/1=1--'` 拆分关键字）、URL 编码或大小写变体绕过，且第 19 行的 `eventType` 完全未经过滤。
+3. 第 20 行将两个污点值直接模板字符串拼接进 SQL，第 21 行 `pool.query(query)` 以字符串形式执行——这是 CWE-89 危险 sink，攻击者可通过构造 `eventType = "' OR '1'='1"` 等载荷读取任意租户的 endpoint_url 与 secret。
+4. 数据流验证：source（第 14/17 行回调载荷）→ 无有效防御（第 18 行黑名单可绕过、eventType 未过滤）→ sink（第 21 行 pool.query 字符串拼接），全程无参数化查询或白名单校验。
+5. 第二入口检查：本文件仅有一个入口即队列回调，无其他路由、HTTP handler 或间接调用通道；但同一队列可被任何能向 RabbitMQ 投递消息的主体写入，替代通道成立，进一步确认漏洞可达。
+6. 结论：存在 CWE-89 SQL 注入漏洞，风险等级 High（可跨租户拖取 webhook 密钥并伪造签名外发请求）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "High", "source": "line 14: ch.consume 回调参数 msg（line 17 JSON.parse 得到 payload.tenantId/payload.eventType）", "sink": "line 21: pool.query(query) 执行拼接 SQL", "explanation": "主链：line 14 回调消息体 -> line 17 解析为 payload -> line 18 sanitize 黑名单替换（可用注释拆分/编码绕过）且 eventType 未过滤 -> line 20 模板字符串拼接 SQL -> line 21 pool.query 执行，构成注入；防御分析：sanitize 为可绕过黑名单，不覆盖 eventType，无参数化查询；第二入口检查：本文件唯一入口为队列回调，但任何可向该队列投递消息的外部主体均可触发，替代通道成立", "fix_suggestion": "line 20: 改用参数化查询 pool.query('SELECT endpoint_url, secret FROM webhook_endpoints WHERE tenant_id = $1 AND event_type = $2', [tenantId, eventType])"}
+```

