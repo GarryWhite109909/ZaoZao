@@ -1,0 +1,50 @@
+LANG: java
+```java
+package com.example.ghost.controller;
+
+import org.springframework.stereotype.Controller;
+import org.springframework.ui.Model;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.jdbc.core.JdbcTemplate;
+
+@Controller
+@RequestMapping("/admin/posts")
+public class PostHistoryController {
+
+    private final JdbcTemplate jdbc;
+
+    public PostHistoryController(JdbcTemplate jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    // 查看历史修订：将数据库中存储的 revision html 原样注入模板
+    @GetMapping("/{postId}/history")
+    public String history(@PathVariable Long postId, Model model) {
+        var revisions = jdbc.queryForList(
+            "SELECT id, title, html FROM post_revisions WHERE post_id = ? ORDER BY created_at DESC", postId);
+        model.addAttribute("revisions", revisions);
+        return "post-history"; // Thymeleaf 模板中使用 th:utext="${r['html']}" 渲染
+    }
+
+    // 恢复修订：把任意 staff 用户提交的 revision html 写回当前帖子的正文
+    @PostMapping("/{postId}/restore")
+    @ResponseBody
+    public String restore(@PathVariable Long postId, @RequestParam("revisionId") long revisionId) {
+        String html = jdbc.queryForObject(
+            "SELECT html FROM post_revisions WHERE id = ? AND post_id = ?", String.class, revisionId, postId);
+        // 无任何净化/白名单校验，直接持久化为帖子正文，其他 staff 打开该帖即触发
+        jdbc.update("UPDATE posts SET html = ? WHERE id = ?", html, postId);
+        return "restored";
+    }
+}
+```
+
+1. 第 22 行 `@GetMapping` 的 `history` 是外部输入入口之一（路径变量 postId），第 26 行直接查询并经第 27 行 `model.addAttribute` 传给模板；若模板用 `th:utext`（对应原代码中 `innerHTML` 的语义）渲染，存储型 XSS 即可达 sink。
+2. 第 32 行 `restore` 是第二入口：`@RequestParam("revisionId")` 由请求体/查询串控制，第 34-35 行据此取出任意历史版本的 html。
+3. 第 38 行将该 html 直接 `UPDATE posts SET html = ?`——与原代码 `setEditorState`/`innerHTML` 赋值等价，是危险 sink；全程无 HTML 白名单、无转义、无 CSP 类防御，黑名单/正则替换类过滤也不存在。
+4. 攻击者只需先通过创建修订接口存入含 `<script>` 或 `<img onerror>` 的 html，再诱导其他 staff 访问 `/admin/posts/{id}/history` 或被恢复后的帖子页，即可劫持其 Admin 会话（等价于原始 CWE-79 提权链）。
+5. 替代通道确认：除 history 渲染外，restore 后的帖子详情页同样消费同一字段，两条通道均未做输出编码，故漏洞成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (Stored XSS)", "risk_level": "Critical", "source": "line 32: restore 接口的 revisionId 请求参数及第 22 行 history 的路径参数", "sink": "line 38: jdbc.update 将未净化的 html 持久化并由第 27 行 model 经 th:utext 输出", "explanation": "流一：line 22 路径参数 -> line 26 查询 -> line 27 model -> 模板 utext 渲染，无输出编码；流二：line 32 revisionId -> line 34 取出 html -> line 38 直接写回 posts.html，任何 staff 可注入脚本，后续被其他 staff 浏览即会话劫持提权；全程无白名单净化或上下文转义，正则/黑名单类过滤亦不存在；替代通道为恢复后的帖子详情页，同样消费该字段且无防御", "fix_suggestion": "line 38: 在持久化前使用 OWASP Java HTML Sanitizer (PolicyFactory.sanitize) 对 html 做白名单净化，并在模板侧改用 th:text 或对富文本仅允许安全标签"}
+```

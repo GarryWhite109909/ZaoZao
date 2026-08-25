@@ -1,0 +1,50 @@
+LANG: java
+```java
+package com.example.web.config;
+
+import org.springframework.stereotype.Component;
+import org.springframework.web.servlet.HandlerInterceptor;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
+@Component
+public class TemplateFetchInterceptor implements HandlerInterceptor {
+
+    // 模板白名单目录，本应限制在 /var/app/templates 内
+    private static final Path TEMPLATE_ROOT = Paths.get("/var/app/templates");
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws IOException {
+        String templateName = request.getParameter("template");   // source: 外部输入入口
+        if (templateName == null) {
+            response.sendError(400, "missing template param");
+            return false;
+        }
+
+        // 防御：仅做字符串替换，把 ../ 替换为空 —— 可通过 ....// 或 ..%2f 绕过，属无效防御
+        String sanitized = templateName.replace("../", "");
+
+        // 拼接路径并直接读取文件：sink
+        Path target = TEMPLATE_ROOT.resolve(sanitized).normalize();
+        byte[] content = Files.readAllBytes(target);
+
+        response.setContentType("text/plain");
+        response.getOutputStream().write(content);
+        return false;
+    }
+}
+```
+
+1. 第 21 行 `request.getParameter("template")` 是唯一外部输入点（source），攻击者可通过 GET 请求直接控制该值；第 22 行虽判空但未做任何安全校验，数据流可达第 31 行的 `Files.readAllBytes(target)`（sink），完成任意文件读取。
+2. 第 27 行的防御仅是 `replace("../", "")` 字符串替换过滤——按规则属于可绕过防御：输入 `....//....//etc/passwd` 在替换后还原为 `../../etc/passwd`；且未校验协议式前缀或绝对路径，输入 `/etc/passwd` 经 `resolve` 后直接指向绝对路径。
+3. 第 29 行的 `normalize()` 不构成防御：它只规范化路径形态，不检查结果是否仍在 `TEMPLATE_ROOT` 之内（缺少 `startsWith(TEMPLATE_ROOT)` 的 containment 校验），因此穿越后的路径原样传给 sink。
+4. 第二入口分析：该拦截器注册于全局拦截器链，任何匹配 `/template/**` 的路由都会触发同一 `preHandle`；此外若其他 Controller 通过 `request.getAttribute("template")` 复用该参数值，则形成替代通道。所有通道均汇聚到同一 sink，均无有效防御。
+5. 综上：source→sink 数据流完整、防御为可绕过的字符串替换，存在 CWE-22 路径穿越/任意文件读取漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal: arbitrary file read via interceptor parameter", "risk_level": "High", "source": "line 21: request.getParameter('template')", "sink": "line 31: Files.readAllBytes(target)", "explanation": "主链: line 21 外部参数 -> line 24 replace('../','') 仅字符串替换可被 ....// 或 ..%2f 绕过 -> line 29 resolve+normalize 未做 startsWith(TEMPLATE_ROOT) 包含性校验 -> line 31 readAllBytes 读取任意文件; 第二入口: 该拦截器作用于全部 /template/** 路由, 其他 Controller 若复用同名请求属性亦汇入同一 sink, 均无有效防御", "fix_suggestion": "line 29: resolve 后增加 if (!target.normalize().startsWith(TEMPLATE_ROOT)) { response.sendError(403); return false; } 并拒绝含路径分隔符与绝对路径的输入"}
+```

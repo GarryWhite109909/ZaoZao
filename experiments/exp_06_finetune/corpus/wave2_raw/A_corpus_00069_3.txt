@@ -1,0 +1,71 @@
+LANG: java
+```java
+package com.example.auth;
+
+import javax.servlet.*;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.crypto.Cipher;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.IOException;
+import java.util.Base64;
+
+public class TokenAuthFilter implements Filter {
+
+    // 与原代码 supportedSecurityProfiles = ['V2', 'V2_AND_LEGACY'] 同构：
+    // 保留 'LEGACY' 配置即重新启用已被弃用的弱算法
+    private static final String SECURITY_PROFILE = System.getenv("SECURITY_PROFILE"); // V2 | LEGACY
+    private static final byte[] LEGACY_KEY = "0123456789abcdef".getBytes();
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+        HttpServletRequest request = (HttpServletRequest) req;
+        HttpServletResponse response = (HttpServletResponse) res;
+
+        String token = request.getHeader("X-Auth-Token");
+        if (token == null || token.isEmpty()) {
+            response.sendError(401, "missing token");
+            return;
+        }
+
+        try {
+            String userId;
+            if ("V2".equals(SECURITY_PROFILE)) {
+                userId = verifyV2(token);          // AES-GCM + 签名校验
+            } else {
+                userId = decryptLegacy(token);     // 兜底走弱算法
+            }
+            request.setAttribute("userId", userId);
+            chain.doFilter(req, res);
+        } catch (Exception e) {
+            response.sendError(401, "invalid token");
+        }
+    }
+
+    private String decryptLegacy(String token) throws Exception {
+        // CWE-327：AES/ECB 无认证、确定性加密，可被重放与块替换攻击
+        Cipher cipher = Cipher.getInstance("AES/ECB/PKCS5Padding");
+        cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(LEGACY_KEY, "AES"));
+        return new String(cipher.doFinal(Base64.getDecoder().decode(token)));
+    }
+
+    private String verifyV2(String token) throws Exception {
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(LEGACY_KEY, "AES"));
+        return new String(cipher.doFinal(Base64.getDecoder().decode(token)));
+    }
+}
+```
+
+分析：
+
+1. **Source（第 22 行）**：`request.getHeader("X-Auth-Token")` 是外部输入入口，攻击者完全可控；该值直接进入解密逻辑，可达性确认。
+2. **Sink（第 45 行）**：`Cipher.getInstance("AES/ECB/PKCS5Padding")` 使用 ECB 模式且无任何 MAC/GCM 认证标签，是危险密码学操作；第 46-47 行直接用该结果作为身份 `userId` 放入请求属性，供下游鉴权使用。
+3. **防御验证（第 31 行）**：唯一的“防御”是按环境变量 `SECURITY_PROFILE` 分支选择算法。该开关默认/兜底路径为 LEGACY（第 33 行 else 分支），且 profile 由部署配置而非强制常量决定——等价于原代码中 `V2_AND_LEGACY` 安全配置档：名义上支持强算法，实际保留了可切换到弱算法的通道。无白名单、无签名校验、无重放防护。
+4. **第二入口**：除 `X-Auth-Token` 头外不存在其他路由或参数通道进入本过滤器；但过滤器注册在全局链上时所有受保护端点共享此入口，单点缺陷覆盖面即为全部 API。此外第 51 行的 GCM 分支同样硬编码密钥，属次要弱点但非主链。
+5. **结论**：source→sink 数据流上没有任何有效密码学防御（分支开关本身即是漏洞语义），构成 CWE-327。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-327 Use of a Broken or Risky Cryptographic Algorithm", "risk_level": "High", "source": "line 22: request.getHeader('X-Auth-Token') 外部可控令牌输入", "sink": "line 45: Cipher.getInstance('AES/ECB/PKCS5Padding') 弱模式解密并直接产出身份", "explanation": "主链: line 22 头部令牌 -> line 33 LEGACY 分支 -> line 45 AES/ECB 解密 -> line 47 结果作为 userId 写入请求属性供下游鉴权; 唯一防御是 line 31 的 SECURITY_PROFILE 分支开关, 其兜底路径为弱算法, 等价于原漏洞中的 V2_AND_LEGACY 兼容配置档, 属可绕过伪防御; 第二入口排查: 仅 X-Auth-Token 一个输入点, 但过滤器作用于全局链, 所有受保护路由共用此缺陷; 另 line 51 GCM 分支硬编码密钥为次要点", "fix_suggestion": "line 31: 移除 LEGACY 分支, 强制仅允许强算法路径并拒绝旧格式令牌"}
+```

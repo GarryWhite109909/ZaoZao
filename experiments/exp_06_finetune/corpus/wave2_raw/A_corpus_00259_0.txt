@@ -1,0 +1,51 @@
+LANG: python
+```python
+import re
+
+from django.db import connection
+from django.http import JsonResponse
+from django.views.decorators.http import require_POST
+
+
+@require_POST
+def column_config(request):
+    """Builds a custom report query from user-supplied SQL fragments."""
+    config = request.POST.get("sql", "")
+    from_clause = request.POST.get("from", "")
+    where_clause = request.POST.get("where", "")
+    group_by = request.POST.get("groupby", "")
+
+    sql = "SELECT "
+    if not config.strip().upper().startswith("SELECT"):
+        sql += "*"
+    else:
+        sql += config.strip()
+    if from_clause:
+        sql += " FROM " + from_clause
+    if where_clause:
+        cleaned = re.sub(r"^\s*WHERE\s*", "", where_clause, flags=re.I)
+        sql += " WHERE (" + cleaned + ")"
+    if group_by:
+        sql += " GROUP BY " + group_by
+
+    # blacklist check: only blocks DML keywords followed by a space
+    if re.search(r"(ALTER|CREATE|DROP|RENAME|TRUNCATE|UPDATE|DELETE) ", sql, re.I):
+        return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
+
+    with connection.cursor() as cursor:
+        cursor.execute(sql)
+        row = cursor.fetchone()
+
+    columns = list(row.keys()) if row else []
+    return JsonResponse({"columns": columns})
+```
+
+1. 第 11-14 行：`request.POST.get(...)` 是 Django 惯用的外部输入入口，攻击者可完全控制 `sql`、`from`、`where`、`groupby` 四个片段，全部直接进入查询拼装流程，可达性成立。
+2. 第 16-25 行：各片段仅做 `startswith('SELECT')` 前缀检查和 `^\s*WHERE\s*` 正则剥离（与原 PHP 逻辑等价），随后用字符串拼接进 `sql`，无参数化、无标识符引用——防御位置在拼接之前且类型为黑名单/正则，可绕过。
+3. 第 28 行：黑名单正则 `(ALTER|CREATE|DROP|...) ` 只匹配后跟空格的关键字，可用注释截断（如 `DELETE/**/FROM t`）、换行、或 UNION 注入读取任意表绕过；且 SELECT 本身允许堆叠前的子查询注入，属于可绕过过滤。
+4. 第 32 行：`cursor.execute(sql)` 将完整拼接串作为单条语句执行，是明确的 sink；Django cursor 不做任何自动转义当语句以字符串整体传入时。
+5. 第二入口分析：本文件仅此一个视图函数，无其他路由或间接调用通道；但同一 POST 端点内四条 source→sink 数据流（sql/from/where/groupby）均未设防，任一条均可完成注入，故结论为存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection via user-supplied SQL fragments in report configuration endpoint", "risk_level": "Critical", "source": "line 11-14: request.POST.get('sql'/'from'/'where'/'groupby') external input", "sink": "line 32: cursor.execute(sql) executes fully attacker-controlled concatenated string", "explanation": "flow 1: line 11 'sql' fragment -> line 17-22 concatenation -> line 32 execute; flow 2: line 12 'from' -> line 23 -> line 32; flow 3: line 13 'where' -> line 24-25 (regex strip only) -> line 32; flow 4: line 14 'groupby' -> line 26-27 -> line 32; defenses are prefix checks and a keyword blacklist regex (line 28) that is bypassable via comment truncation like DELETE/**/ or newline and does not stop UNION-based data exfiltration within allowed SELECT; no parameterization or identifier quoting anywhere; second entry analysis: single route in file but four independent unfiltered sources all reach the same sink", "fix_suggestion": "line 32: replace raw string execution with parameterized queries using placeholders for values and a strict allowlist parser for identifiers/fragments instead of the line 28 blacklist"}
+```

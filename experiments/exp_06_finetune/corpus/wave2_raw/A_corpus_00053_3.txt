@@ -1,0 +1,51 @@
+LANG: node.js/javascript
+```code
+import { defineEventHandler, getQuery, createError } from 'h3'
+import { readFileSync, existsSync } from 'fs'
+import { join, normalize } from 'path'
+
+// 服务端中间件：根据请求参数返回用户上传的静态资源（如头像/附件）
+export default defineEventHandler(async (event) => {
+  const query = getQuery(event)
+  const file = String(query.file || '')
+  const baseDir = './public/uploads'
+
+  if (!file) {
+    throw createError({ statusCode: 400, statusMessage: 'missing file' })
+  }
+
+  // 鉴权：仅要求携带任意非空 token，不校验其有效性
+  const token = event.node.req.headers['x-auth-token']
+  if (!token) {
+    throw createError({ statusCode: 401, statusMessage: 'unauthorized' })
+  }
+
+  // 黑名单过滤：禁止路径中出现 .. 与绝对路径前缀
+  if (file.includes('..') || file.startsWith('/')) {
+    throw createError({ statusCode: 403, statusMessage: 'forbidden' })
+  }
+
+  const resolved = normalize(join(baseDir, file))
+  // 二次校验仍基于字符串黑名单语义
+  if (!resolved.startsWith(baseDir)) {
+    throw createError({ statusCode: 403, statusMessage: 'forbidden' })
+  }
+
+  if (!existsSync(resolved)) {
+    throw createError({ statusCode: 404, statusMessage: 'not found' })
+  }
+
+  const content = readFileSync(resolved)
+  event.node.res.setHeader('Content-Type', 'application/octet-stream')
+  return content
+})
+```
+
+1. 第 8 行 `getQuery(event).file` 是唯一外部输入 source，攻击者完全控制该字符串；第 20 行的 token 检查只判断非空，不构成访问控制，任意值即可通过。
+2. 第 25 行使用 `includes('..')` 黑名单与 `startsWith('/')` 前缀检查：可被 URL 编码二次解码、或使用绝对 Windows 路径（如 `C:\etc\passwd` 不以 `/` 开头）、或符号链接绕过；第 30 行的 `resolved.startsWith(baseDir)` 同样是字符串前缀比较而非 `path.resolve` 后的真实边界校验，属于可绕过防御。
+3. sink 在第 38 行 `readFileSync(resolved)`，source→sink 数据流直达且无有效规范化校验（未用 `path.resolve` + 真实根目录比对），构成 CWE-22 路径遍历/任意文件读取。
+4. 第二入口分析：本 handler 为全局 server middleware，任何路由方法（GET/POST）经查询参数均可触发；无其他白名单通道，故结论为存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal / Arbitrary File Read", "risk_level": "High", "source": "line 8: getQuery(event).file 用户可控文件名", "sink": "line 38: readFileSync(resolved) 读取任意文件", "explanation": "主链: line 8 外部输入 file -> line 25 includes('..') 黑名单可用编码/Windows盘符/符号链接绕过 -> line 30 startsWith(baseDir) 前缀字符串比较非真实 resolve 边界校验 -> line 38 readFileSync 读取越界文件; line 20 的 token 仅判非空不构成鉴权; 第二入口: 该 handler 为全局 middleware, GET/POST 及任意路由均可通过查询参数触发同一数据流, 无替代安全通道", "fix_suggestion": "line 30: 使用 path.resolve 将 resolved 与真实 uploads 根目录做绝对路径比对, 并拒绝 resolve 结果不在根目录内的所有输入"}
+```

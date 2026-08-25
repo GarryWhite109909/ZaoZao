@@ -1,0 +1,52 @@
+LANG: node.js/javascript
+```code
+// middleware.ts — Next.js 静态资源代理白名单鉴权链
+import { NextRequest, NextResponse } from 'next/server';
+import { readFile } from 'fs/promises';
+import path from 'path';
+
+const ALLOWED_PREFIX = path.resolve(process.env.ASSETS_ROOT || './public/assets');
+
+export async function middleware(req: NextRequest) {
+  const assetPath = req.nextUrl.searchParams.get('asset') || '';
+
+  // 白名单鉴权：仅允许 /assets 路由访问该处理器
+  if (!req.nextUrl.pathname.startsWith('/api/assets')) {
+    return NextResponse.json({ error: 'forbidden' }, { status: 403 });
+  }
+
+  const resolved = path.resolve(path.join(ALLOWED_PREFIX, assetPath.replace(/^\/+/, '')));
+  const insideRoot = resolved.startsWith(ALLOWED_PREFIX);
+
+  if (!insideRoot) {
+    return NextResponse.json({ error: 'not found' }, { status: 404 });
+  }
+
+  // 兼容旧客户端：路径不存在时尝试 URL 解码后重试（漏洞点：解码发生在校验之后）
+  let target = resolved;
+  try {
+    await readFile(target);
+  } catch {
+    target = decodeURIComponent(resolved);
+  }
+
+  try {
+    const buf = await readFile(target);
+    return new NextResponse(buf, { headers: { 'content-type': 'application/octet-stream' } });
+  } catch {
+    return NextResponse.json({ error: 'not found' }, { status: 404 });
+  }
+}
+
+export const config = { matcher: '/api/assets' };
+```
+
+1. 第 10 行 `req.nextUrl.searchParams.get('asset')` 是唯一外部输入 source，攻击者可传 `?asset=%2e%2e%2f%2e%2e%2fetc%2fpasswd`，直接可达第 27 行 `readFile(target)` 这个 sink，数据流完整。
+2. 第 17-19 行的防御是 `path.resolve` + `startsWith` 前缀检查，但此时输入尚未解码；`%2e%2e` 字面量不含真实 `..`，resolve 后仍落在白名单目录内，前缀检查通过——防御位置在解码之前，与原 thumbor 漏洞同构。
+3. 第 22-25 行先探测文件存在，失败则执行 `decodeURIComponent(resolved)` 把 `%2e%2e` 还原为 `..` 后重试读取，等价于原代码中 unquote 发生在 abspath/startswith 校验之后，构成可绕过。
+4. 第二入口核查：config matcher 仅匹配 `/api/assets`，无其他路由进入本 handler；但 query 参数 `asset` 本身即替代通道，且第 22 行的首次 readFile 失败是触发解码重试的必要条件，不存在的合法文件名与编码遍历序列均可触发。
+5. 结论：黑名单/前缀字符串检查加解码后置属于可绕过防御，存在 CWE-22 路径穿越。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal (post-validation URL decoding)", "risk_level": "High", "source": "line 10: req.nextUrl.searchParams.get('asset') 外部可控查询参数", "sink": "line 27: readFile(target) 以解码后的路径读取任意文件", "explanation": "主数据流 line 10 -> line 16 resolve/join -> line 18 startsWith 校验 -> line 24 decodeURIComponent 重解码 -> line 27 readFile; 防御为前缀 startsWith 字符串检查且位于解码之前, 编码的 %2e%2e 通过校验后在 line 24 解码为 .. 完成穿越; 第二入口核查: matcher 仅暴露 /api/assets 一条路由, 但同一 query 参数 asset 即全部攻击面, 且 line 22 首次读取失败是触发解码重试的条件通道", "fix_suggestion": "line 24: 在 resolve 与 startsWith 校验之前先对 assetPath 执行 decodeURIComponent, 并校验解码结果中不含 .. 序列后再拼接"}
+```

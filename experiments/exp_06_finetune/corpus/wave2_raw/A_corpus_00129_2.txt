@@ -1,0 +1,57 @@
+LANG: go
+```go
+package main
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+type OAuth2Client struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+	Name         string `json:"name"`
+	RedirectURL  string `json:"redirect_url"`
+}
+
+var clients = map[string]OAuth2Client{
+	"app1": {ClientID: "app1", ClientSecret: "s3cret", RedirectURL: "https://app.example.com/callback"},
+}
+
+func authorizeHandler(c *gin.Context) {
+	clientID := c.Query("client_id")
+	redirectURI := c.Query("redirect_uri")
+
+	client, ok := clients[clientID]
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown client"})
+		return
+	}
+
+	if strings.HasPrefix(redirectURI, client.RedirectURL) {
+		c.Redirect(http.StatusFound, redirectURI)
+		return
+	}
+	c.JSON(http.StatusForbidden, gin.H{"error": "illegal_redirect_uri"})
+}
+
+func main() {
+	r := gin.Default()
+	r.GET("/oauth2/authorize", authorizeHandler)
+	r.Run(":8080")
+}
+```
+
+分析：
+
+1. 第 18-19 行是 source：`c.Query("client_id")` 与 `c.Query("redirect_uri")` 直接从 HTTP 请求查询参数读取外部输入，无任何白名单或规范化处理。
+2. 第 21-26 行确认可达性：任意请求者可携带已知 client_id（如 app1）到达该 handler，redirect_uri 完全由攻击者控制，直达第 28 行的校验逻辑。
+3. 第 28 行是 sink 前的“防御”：仅用 `strings.HasPrefix(redirectURI, client.RedirectURL)` 做前缀匹配。这是 CWE-601 的经典缺陷——前缀匹配不等于 URL 匹配：注册的 redirect_url 为 `https://app.example.com/callback` 时，攻击者提交 `https://app.example.com/callback.attacker.com/steal` 即可通过校验（前缀成立但域名不同）。
+4. 第 29 行为 sink：`c.Redirect(http.StatusFound, redirectURI)` 将未充分验证的外部 URI 作为 302 Location 输出，授权码可被引导至攻击者控制的站点，与原 Java 代码中 `startsWith` 校验后放行的语义结构完全等价，防御同样缺失。
+5. 第二入口核查：本文件仅有 `/oauth2/authorize` 一个路由、一个 source→sink 数据流；不存在其他路由或间接调用通道，因此结论由上述单一链路支撑。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-601 开放重定向（OAuth2 redirect_uri 前缀匹配绕过）", "risk_level": "High", "source": "line 18-19: c.Query 获取 client_id 与 redirect_uri", "sink": "line 29: c.Redirect 使用未经严格验证的 redirect_uri 发起 302 重定向", "explanation": "source 到 sink 可达：任何请求者携带合法 client_id 与恶意 redirect_uri 即进入 handler；line 28 仅使用 strings.HasPrefix 前缀匹配作为唯一防御，攻击者可用 https://app.example.com/callback.attacker.com 等子串欺骗前缀校验；文件内无第二路由或替代调用通道，单一数据流即构成开放重定向", "fix_suggestion": "line 28: 改为解析后的精确比较，如 u, err := url.Parse(redirectURI); reg, _ := url.Parse(client.RedirectURL)，要求 scheme/host/port 完全相等且 path 前缀以 / 为界"}
+```

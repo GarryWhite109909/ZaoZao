@@ -1,0 +1,22 @@
+**步骤 1｜枚举用户可控输入点与 sink**
+
+- source：外部传入的 `options.url`（用户提供的待请求 URL），在 line 96 `new URL(options.url.href)`、line 100 `dnsPromises.lookup(options.url.hostname)` 被解析。
+- sink：`got.extend(gotOpts)`（line 148）发起的出站 HTTP 请求，`beforeRequest`/`beforeRedirect` 钩子（line 143–145）是唯一的 SSRF 防线。
+
+**步骤 2｜验证防御有效性——DNS rebinding TOCTOU**
+
+`errorIfHostnameResolvesToPrivateIp`（line 92–110）在 `beforeRequest` 中调用 `dnsPromises.lookup(options.url.hostname)` 解析并检查 `isPrivateIp(result.address)`。但该检查与 got 实际建立 TCP 连接是两个独立时刻：攻击者控制权威 DNS，第一次查询返回公网 IP 通过检查，连接时 DNS 缓存过期/再次解析返回内网 IP（如 169.254.169.254 或 10.x.x.x），即经典 DNS rebinding 绕过。检查发生在“请求前”而非“连接的 socket IP 上”，无法完整覆盖该数据流。
+
+另外 line 97–99：`requestUrl.host === siteUrl.host` 直接放行到本地 Ghost 实例，若攻击者能构造 host 相同字符串（如大小写/端口差异或配置 url 指向内部名）也可绕过；且 development 环境直接 return（line 94）。
+
+**步骤 3｜第二入口/替代通道**
+
+`beforeRedirect`（line 145）复用同一有缺陷函数，重定向链同样受 rebinding 影响；无其他独立防御层（如固定已验证 IP 重连）。
+
+**步骤 4｜结论**
+
+存在漏洞：SSRF（CWE-918），通过 DNS rebinding 绕过私网 IP 黑名单检查，风险 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF) via DNS Rebinding", "risk_level": "High", "source": "line 96: options.url.href 用户可控的外部请求 URL", "sink": "line 148: got.extend 发起出站请求（钩子 line 143-145 仅做请求前 DNS 检查）", "explanation": "用户可控 URL -> errorIfHostnameResolvesToPrivateIp 在 beforeRequest 中 dnsPromises.lookup 解析并检查 isPrivateIp -> 但 got 实际建连时会再次独立解析域名 -> 攻击者用 DNS rebinding 使两次解析结果不同 -> 第一次返回公网 IP 通过检查 -> 第二次解析为内网 IP -> 服务器向内部网络发起请求", "fix_suggestion": "line 100: 将 lookup 得到的已验证 IP 固定用于实际连接（如自定义 agent 按 IP 建连并校验 SNI/Host），或在 socket 连接层面校验对端地址而非仅请求前检查"}
+```

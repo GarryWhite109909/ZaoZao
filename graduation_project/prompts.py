@@ -970,30 +970,65 @@ def build_triage_prompt(
     parts.append("判定要求：")
     parts.append("1. 确认 source 是否真的用户可控、sink 是否真的危险。"
                  "source 若来自常量赋值（非 request/外部输入链）则不是有效污染源，告警为误报。")
-    parts.append("2. 检查 source→sink 之间是否有**有效防御**（参数化查询/白名单精确允许集/"
-                 "类型强制转换/subprocess 列表参数/模板值插值+autoescape）。"
-                 "**有防御代码 ≠ 防御有效**：黑名单/正则/字符串替换类过滤通常可被绕过"
-                 "（URL 编码 %2e%2e%2f、路径分隔符变体 ..\\\\、双重编码、大小写、null 字节、"
-                 "间接拼接绕过），被绕过的过滤不算防御，该 finding 仍是漏洞。"
-                 "仅当防御能完整覆盖攻击面时，该 finding "
-                 f"才是误报，{'has_vulnerability' if aligned else 'is_confirmed'}=false。")
-    parts.append("3. 注意工具规则无语境匹配导致的误报：subprocess.run 列表参数（无 shell=True）"
-                 "通常不是命令注入——列表形式不经 shell 解释，注入载荷只会成为普通 argv 参数；"
-                 "被 int()/float() 转换后的数值插值不是 XSS；"
-                 "render/render_template 的 kwargs 值插值（autoescape 开启）不是模板注入。"
-                 "**但列表形式不等于安全**：若 argv 中出现 shell/解释器（sh、bash、zsh、"
-                 "powershell 等后接 -c/-f 类执行参数），或携带执行语义参数（find 的 -exec/-execdir、"
-                 "git 的 --upload-pack/--receive-pack、python -c / perl -e / node -e 等），"
-                 "载荷会被该解释器执行，仍是命令注入，不得仅因列表形式判安全。"
-                 "但注意：**正则/黑名单过滤（如 re.search(r'\\\\.\\\\./')）不是有效防御**——"
-                 "它可被编码/分隔符变体绕过（%2e%2e%2f、..\\\\、....//、双重编码），"
-                 "被绕过仍是漏洞，不得仅因存在过滤代码就判安全。")
-    parts.append("4. 严禁捏造代码中不存在的 API 参数或行为；判定必须基于代码实际内容。")
-    parts.append("5. 漏洞类型独立判定：工具标注的漏洞类型/规则名是模式匹配的猜测，可能完全"
-                 "错误（如把鉴权缺失标成 XSS）。你确认漏洞后，vulnerability_type 必须基于"
-                 "你自己的代码分析给出（如鉴权缺失是 CWE-862，不是工具标的类型）。")
-    parts.append(f"6. 若判定为真漏洞，输出 {'has_vulnerability' if aligned else 'is_confirmed'}=true"
-                 "并给出简洁说明与修复建议；否则输出 false。")
+    if path_chain:
+        # 2026-08-24：rolling_dev 实测切片裁决 4/5 推翻工具污点链（00056/67/68/78，
+        # 见 docs/弱点挖掘报告 第十节）——模型写一句"已有过滤"就整体否定链路。
+        # 修复不是盲从工具，而是要求把链路当作必须逐段回应的证据：要么确认每跳成立，
+        # 要么指认具体断点行与断因。"泛泛说有防御"不再构成有效否定。
+        parts.append("2. **证据链逐段核验（强制）**：上方「传播链」是工具给出的完整数据流，"
+                     "你必须在分析中逐段回应它——逐跳确认输入确实可达，或者明确指出"
+                     "**链断在哪一行、断因是什么**（该行变量被改写为常量/该处存在覆盖全部流量的有效防御）。"
+                     "只笼统写「代码中存在过滤/校验」而指不出具体断点行的，视为没有完成核验，"
+                     "不得据此判 false；")
+        parts.append("3. 检查 source→sink 之间是否有**有效防御**（参数化查询/白名单精确允许集/"
+                     "类型强制转换/subprocess 列表参数/模板值插值+autoescape）。"
+                     "**有防御代码 ≠ 防御有效**：黑名单/正则/字符串替换类过滤通常可被绕过"
+                     "（URL 编码 %2e%2e%2f、路径分隔符变体 ..\\\\、双重编码、大小写、null 字节、"
+                     "间接拼接绕过），被绕过的过滤不算防御，该 finding 仍是漏洞。"
+                     "仅当防御能完整覆盖攻击面时，该 finding "
+                     f"才是误报，{'has_vulnerability' if aligned else 'is_confirmed'}=false。")
+        parts.append("4. 注意工具规则无语境匹配导致的误报：subprocess.run 列表参数（无 shell=True）"
+                     "通常不是命令注入——列表形式不经 shell 解释，注入载荷只会成为普通 argv 参数；"
+                     "被 int()/float() 转换后的数值插值不是 XSS；"
+                     "render/render_template 的 kwargs 值插值（autoescape 开启）不是模板注入。"
+                     "**但列表形式不等于安全**：若 argv 中出现 shell/解释器（sh、bash、zsh、"
+                     "powershell 等后接 -c/-f 类执行参数），或携带执行语义参数（find 的 -exec/-execdir、"
+                     "git 的 --upload-pack/--receive-pack、python -c / perl -e / node -e 等），"
+                     "载荷会被该解释器执行，仍是命令注入，不得仅因列表形式判安全。"
+                     "但注意：**正则/黑名单过滤（如 re.search(r'\\\\.\\\\./')）不是有效防御**——"
+                     "它可被编码/分隔符变体绕过（%2e%2e%2f、..\\\\、....//、双重编码），"
+                     "被绕过仍是漏洞，不得仅因存在过滤代码就判安全。")
+        parts.append("5. 严禁捏造代码中不存在的 API 参数或行为；判定必须基于代码实际内容。")
+        parts.append("6. 漏洞类型独立判定：工具标注的漏洞类型/规则名是模式匹配的猜测，可能完全"
+                     "错误（如把鉴权缺失标成 XSS）。你确认漏洞后，vulnerability_type 必须基于"
+                     "你自己的代码分析给出（如鉴权缺失是 CWE-862，不是工具标的类型）。")
+        parts.append(f"7. 若判定为真漏洞，输出 {'has_vulnerability' if aligned else 'is_confirmed'}=true"
+                     "并给出简洁说明与修复建议；否则输出 false。")
+    else:
+        parts.append("2. 检查 source→sink 之间是否有**有效防御**（参数化查询/白名单精确允许集/"
+                     "类型强制转换/subprocess 列表参数/模板值插值+autoescape）。"
+                     "**有防御代码 ≠ 防御有效**：黑名单/正则/字符串替换类过滤通常可被绕过"
+                     "（URL 编码 %2e%2e%2f、路径分隔符变体 ..\\\\、双重编码、大小写、null 字节、"
+                     "间接拼接绕过），被绕过的过滤不算防御，该 finding 仍是漏洞。"
+                     "仅当防御能完整覆盖攻击面时，该 finding "
+                     f"才是误报，{'has_vulnerability' if aligned else 'is_confirmed'}=false。")
+        parts.append("3. 注意工具规则无语境匹配导致的误报：subprocess.run 列表参数（无 shell=True）"
+                     "通常不是命令注入——列表形式不经 shell 解释，注入载荷只会成为普通 argv 参数；"
+                     "被 int()/float() 转换后的数值插值不是 XSS；"
+                     "render/render_template 的 kwargs 值插值（autoescape 开启）不是模板注入。"
+                     "**但列表形式不等于安全**：若 argv 中出现 shell/解释器（sh、bash、zsh、"
+                     "powershell 等后接 -c/-f 类执行参数），或携带执行语义参数（find 的 -exec/-execdir、"
+                     "git 的 --upload-pack/--receive-pack、python -c / perl -e / node -e 等），"
+                     "载荷会被该解释器执行，仍是命令注入，不得仅因列表形式判安全。"
+                     "但注意：**正则/黑名单过滤（如 re.search(r'\\\\.\\\\./')）不是有效防御**——"
+                     "它可被编码/分隔符变体绕过（%2e%2e%2f、..\\\\、....//、双重编码），"
+                     "被绕过仍是漏洞，不得仅因存在过滤代码就判安全。")
+        parts.append("4. 严禁捏造代码中不存在的 API 参数或行为；判定必须基于代码实际内容。")
+        parts.append("5. 漏洞类型独立判定：工具标注的漏洞类型/规则名是模式匹配的猜测，可能完全"
+                     "错误（如把鉴权缺失标成 XSS）。你确认漏洞后，vulnerability_type 必须基于"
+                     "你自己的代码分析给出（如鉴权缺失是 CWE-862，不是工具标的类型）。")
+        parts.append(f"6. 若判定为真漏洞，输出 {'has_vulnerability' if aligned else 'is_confirmed'}=true"
+                     "并给出简洁说明与修复建议；否则输出 false。")
     parts.append("")
     parts.append("请先给出简短分析过程，然后在回答最后输出如下 JSON：")
     parts.append("```json")

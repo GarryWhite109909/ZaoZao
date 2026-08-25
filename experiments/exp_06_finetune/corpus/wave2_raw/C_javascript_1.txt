@@ -1,51 +1,58 @@
 ```code
 // static-route-validator.js
-// 常量路由表驱动的静态校验模块 —— 无任何外部输入入口
+// 常量路由表驱动的静态校验模块（无任何外部输入入口）
 
-const fs = require('fs');
-const { exec } = require('child_process');
+const ROUTE_TABLE = {
+  '/health': { cmd: 'echo ok', timeout: 3 },
+  '/version': { cmd: 'node --version', timeout: 3 },
+  '/cleanup-tmp': { cmd: 'rm -rf /tmp/app-cache', timeout: 10 }
+};
 
-// 全部为编译期写死的常量，不读取 env / argv / 网络
-const ROUTE_TABLE = Object.freeze({
-  '/health':   { handler: 'noop',      cmd: 'echo ok' },
-  '/version':  { handler: 'readMeta',  file: './config/version.json' },
-  '/metrics':  { handler: 'readMeta',  file: './config/metrics.json' }
-});
+const ALLOWED_HOSTS = ['127.0.0.1'];
+const LOG_PATH = '/var/log/app/validator.log';
 
-const ALLOWED_CMDS = new Set(['echo ok']);
-const ALLOWED_FILES = new Set(['./config/version.json', './config/metrics.json']);
-
-function readMeta(route) {
-  const cfg = ROUTE_TABLE[route];
-  if (!cfg || !ALLOWED_FILES.has(cfg.file)) return null;
-  return JSON.parse(fs.readFileSync(cfg.file, 'utf8'));
-}
-
-function runDiagnostics() {
-  const cmd = ROUTE_TABLE['/health'].cmd; // 字面量 'echo ok'
-  if (!ALLOWED_CMDS.has(cmd)) throw new Error('blocked');
-  exec(cmd, (err, stdout) => {
-    if (err) console.error('diag failed');
-    else console.log(stdout.trim());
-  });
-}
-
-function validateRoute(route) {
-  if (typeof route !== 'string' || !Object.prototype.hasOwnProperty.call(ROUTE_TABLE, route)) {
-    return { ok: false };
+function runRoute(routeName) {
+  const entry = ROUTE_TABLE[routeName];
+  if (!entry) {
+    console.log('unknown route: ' + routeName);
+    return false;
   }
-  const entry = ROUTE_TABLE[route];
-  return { ok: true, handler: entry.handler };
+  // 危险 API：child_process.exec，实参为路由表常量
+  require('child_process').exec(entry.cmd, { timeout: entry.timeout * 1000 },
+    (err, stdout) => {
+      if (err) console.error(err.message);
+      else console.log(stdout);
+    });
+  return true;
 }
 
-module.exports = { validateRoute, runDiagnostics, readMeta };
+function openLog() {
+  // 危险 API：fs.open，路径为模块级常量，只读模式
+  const fd = require('fs').openSync(LOG_PATH, 'r');
+  const buf = Buffer.alloc(1024);
+  require('fs').readSync(fd, buf, 0, 1024, 0);
+  require('fs').closeSync(fd);
+  return buf.toString();
+}
+
+function checkHost(host) {
+  // 危险 API：eval 仅用于校验内置白名单表达式
+  const expr = "ALLOWED_HOSTS.includes('" + host + "')";
+  return ALLOWED_HOSTS.includes(host) && eval(expr) === true;
+}
+
+// 模块自检：仅以字面量调用，不导出任何可被外部传参的入口
+runRoute('/health');
+openLog();
+checkHost('127.0.0.1');
+module.exports = Object.freeze({});
 ```
 
-1. 第 20 行 `exec(cmd)`：`cmd` 来自第 19 行 `ROUTE_TABLE['/health'].cmd`，即第 8 行字面量 `'echo ok'`，且第 21 行白名单 `ALLOWED_CMDS`（第 11 行常量集合）二次校验。模块未导出任何修改 `ROUTE_TABLE` 的途径，`Object.freeze` 保证不可变，故实参恒为常量。
-2. 第 16 行 `fs.readFileSync(cfg.file)`：`cfg.file` 只能取自第 9–10 行的字面量路径，且第 15 行 `ALLOWED_FILES.has()` 白名单拦截；无任何函数参数可注入该值。
-3. 污点来源核查：全文件仅使用 `require`、字面量与冻结常量表，不存在 `request`、`argv`、`process.env`、网络/标准输入读取等入口；导出的三个函数中 `validateRoute` 仅做查表返回布尔结果，`runDiagnostics` 无参调用，均无法把外部数据引入 sink。
-4. 结论：所有危险 API（`exec`、`fs.readFileSync`）的实参均为封闭常量集合成员，污点不可达，样本安全。
+1. 第20行 `exec(entry.cmd, ...)`：`entry` 来自第4-8行硬编码的 `ROUTE_TABLE` 字面量；`runRoute` 的调用点仅在第41行且实参为字符串字面量 `'/health'`，函数未被导出（第44行导出冻结空对象），不存在外部可控参数传入的通道。
+2. 第29行 `openSync(LOG_PATH, 'r')`：`LOG_PATH` 为第10行模块级常量，`openLog` 无参数、无返回污点传播，仅读取固定日志文件。
+3. 第37行 `eval(expr)`：`expr` 由白名单常量 `ALLOWED_HOSTS` 与 `host` 拼接；而 `checkHost` 仅在第43行被字面量 `'127.0.0.1'` 调用，且第38行的 `includes(host)` 白名单前置校验使 eval 表达式恒为 `'ALLOWED_HOSTS.includes('127.0.0.1')'`，无注入空间。
+4. 全文无 request/argv/env/stdin/socket 等污染源，无网络读取，无第二入口或替代调用通道（module.exports 为冻结空对象），故所有危险 sink 的实参均为编译期可知常量，不可利用。
 
 ```json
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "exec 与 readFileSync 的实参均来自冻结的常量路由表并经白名单校验 -> 无污点来源 -> 不可利用", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "line 20 exec 实参为 ROUTE_TABLE 字面量; line 29 open 路径为常量 LOG_PATH 只读; line 37 eval 表达式由白名单常量与字面量拼接且经 includes 前置校验; runRoute/checkHost 未导出仅以字面量调用, module.exports 为冻结空对象, 不存在第二入口或替代通道 -> 各危险点实参均为常量 -> 无污点来源 -> 不可利用", "fix_suggestion": "no fix needed"}
 ```

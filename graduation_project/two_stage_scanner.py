@@ -1224,6 +1224,100 @@ class TwoStageScanner:
         kept.sort(key=lambda f: -reg.boost_priority(f.rule_id or ""))
         return kept
 
+    # ------------------------------------------------------------------
+    # 无候选长文件分块预筛（P5 升级，2026-08-24）
+    # ------------------------------------------------------------------
+    # 通用安全词表（语言习语级，来源为公开漏洞知识而非任何测试样本；登记 P6 表：
+    # 层=无候选分块预筛 / 触发=est_tokens > num_ctx*0.45 / 依据=弱点挖掘报告 第九、十节）。
+    _PRESCREEN_SINK_RE = re.compile(
+        r"(\.execute\(|\.executemany\(|\.query\(|\.queryrow\(|queryrow\(|"
+        r"os\.system\(|subprocess\.|popen\(|runtime\.getruntime\(\)|processbuilder|"
+        r"child_process|execcommand|\beval\(|new function\(|settimeout\(\s*['\"]|"
+        r"unserialize\(|pickle\.loads\(|objectinputstream|readobject\(|"
+        r"xmlparserfactory|documentbuilderfactory|saxparserfactory|"
+        r"external-general-entities|xpath\.evaluate\(|xpathcompile\(|"
+        r"sendredirect\(|redirect\(\s*[a-z_]|urlfetch|httpclient\.(get|post)|requests\.(get|post)|"
+        r"\bmd5\b|\bsha1\b|\bdes\b|\becb\b|cipher\.getinstance|"
+        r"open\(\s*[^)]*\+|readfile\(|file_get_contents|os\.open\(|ioutil\.readfile)", re.I)
+    _PRESCREEN_SOURCE_RE = re.compile(
+        r"(request\.|\bparams\b|\bargs\b\[|query_params|getparameter\(|headers\[|header\(|"
+        r"\bbody\b|form\[|formdata|cookies?\[|argv|stdin|environ|os\.args|r\.url|"
+        r"reader\.readline|scanner\.|bufferedreader|inputstream)", re.I)
+    _PRESCREEN_ENTRY_RE = re.compile(
+        r"(@app\.route|@router\.|@restcontroller|@requestmapping|@getmapping|@postmapping|"
+        r"@api_view|@csrf_exempt|func\s+\w*handler|http\.responsewriter|app\.(get|post|use)\(|"
+        r"router\.(get|post)\(|def (do_get|do_post)\(|public .*\(\s*(httpservletrequest|context))", re.I)
+
+    def _prescreen_chunks(self, code: str, language: str):
+        """长文件无候选复核前的确定性分块预筛。
+
+        函数级切块 → 每块按通用词表打分（sink 命中×3 + 外部源×2 + 入口点×1，
+        单模式计次封顶 5 防单行刷分）→ 取 top-k 块拼成复核上下文。
+        纯确定性：同码必同选；全部零分时取前 k 块保底。失败返回 (None, None)
+        回退整文件行为。返回 (切片文本列表, 可观测信息)。
+        """
+        info = {"engaged": True}
+        try:
+            sl = self._slicer.slice(code, language=language)
+            chunks = [c for c in sl.chunks if not getattr(c, "is_full_file", False)]
+        except Exception as e:
+            info["fallback"] = f"slicer_error:{e}"
+            return None, info
+        if not chunks:
+            # 无函数结构（顶层脚本/巨型函数）→ 固定行窗保底切分（150 行/窗），
+            # 不回退整文件——那正是静默截断的老路
+            lines_all = code.split("\n")
+            win = 150
+
+            class _Win:
+                pass
+
+            chunks = []
+            for i in range(0, len(lines_all), win):
+                w = _Win()
+                w.name = f"window_L{i + 1}-{min(i + win, len(lines_all))}"
+                w.start_line = i + 1
+                w.end_line = min(i + win, len(lines_all))
+                w.code = "\n".join(lines_all[i:w.end_line])
+                chunks.append(w)
+        scored = []
+        for c in chunks:
+            text = c.code
+            n_sink = sum(min(len(p.findall(text)), 5) * w for p, w in
+                         ((self._PRESCREEN_SINK_RE, 3),))
+            n_src = sum(min(len(p.findall(text)), 5) * w for p, w in
+                        ((self._PRESCREEN_SOURCE_RE, 2),))
+            n_ent = sum(min(len(p.findall(text)), 5) * w for p, w in
+                        ((self._PRESCREEN_ENTRY_RE, 1),))
+            scored.append((n_sink + n_src + n_ent, c))
+        # 正分块优先；全零时才按原顺序取前 k（保底）
+        k = max(1, int(os.environ.get("VULN_SCANNER_PRESCREEN_TOPK", "3")))
+        positive = [t for t in scored if t[0] > 0]
+        pool = sorted(positive, key=lambda t: (-t[0], getattr(t[1], "start_line", 0))) \
+            if positive else scored[:k]
+        budget = int(self.num_ctx * 0.45)  # 复核输入 token 预算（≈2字符/token）
+        parts, picked_info, used = [], [], 0
+        for score, c in pool[:k]:
+            body_lines = code.split("\n")[getattr(c, "start_line", 1) - 1:
+                                          getattr(c, "end_line", 0)]
+            body = "\n".join(body_lines)
+            est = len(body) // 2
+            if used + est > budget and parts:
+                break
+            used += est
+            name = getattr(c, "name", "") or "chunk"
+            parts.append(f"# ==== 预筛切片 {name}（L{c.start_line}-L{c.end_line}，"
+                         f"信号分 {score}）====\n"
+                         + self._with_line_numbers(body, c.start_line))
+            picked_info.append({"chunk": name, "start": c.start_line,
+                                "end": c.end_line, "score": score})
+        if not parts:
+            info["fallback"] = "empty_pick"
+            return None, info
+        info["picked"] = picked_info
+        info["n_chunks_total"] = len(chunks)
+        return parts, info
+
     def _maybe_recheck(self, code: str, language: str, force: bool = False,
                        count_monitor: bool = True) -> Optional[dict]:
         """无候选文件的 LLM 复核：监控 Stage 1 召回漂移，或全量复核消除静默放行。
@@ -1255,6 +1349,18 @@ class TwoStageScanner:
         # 根因之一）；投票后仅全票一致的"有漏洞"才具备被采信（trust_llm_recheck）
         # 的资格，多数但非全票 → 转人工复核。
         n = max(1, min(3, self.n_samples))
+        # P5 升级（2026-08-24，rolling_dev 实测）：长文件无候选复核此前整文件进 LLM——
+        # transformers 后端 OOM、ollama 静默截断后"自信判安全"（00071/00074 实锤，
+        # 见 docs/弱点挖掘报告 第十节）。改为确定性分块预筛：函数级切块、通用安全
+        # 词表打分（sink/外部源/入口点，语言习语级知识，无任何测试样本拟合），
+        # 只复核 top-k 块；复核判真后的类型形态门仍用原文件全文校验。
+        recheck_code, prescreen_info = code, None
+        est_tokens = len(code) // 2 + code.count("\n")
+        if est_tokens > self.num_ctx * 0.45:
+            picked, prescreen_info = self._prescreen_chunks(code, language)
+            if picked:
+                recheck_code = "\n\n".join(picked)
+                _monitor_incr("recheck_prescreened")
         votes_true = votes_false = votes_invalid = 0
         true_verdict: Optional[dict] = None  # 首个判真票的完整 verdict（类型/等级/说明）
         true_types: list = []  # P3 修复（2026-08-23）：收集全部判真票类型——此前只取首票，
@@ -1262,7 +1368,7 @@ class TwoStageScanner:
         try:
             for _ in range(n):
                 resp = self.client.generate(
-                    prompt=build_user_prompt(code=code, language=language),
+                    prompt=build_user_prompt(code=recheck_code, language=language),
                     system_prompt=self.system_prompt,
                     # 2026-08-15 修复：不再硬编码 0.7 无视 self.temperature——
                     # 多票采样需要足够温度打破同模态重复（取配置与 0.7 的较大值），
@@ -1291,7 +1397,8 @@ class TwoStageScanner:
         except Exception as e:
             return {"sampled": True, "has_vulnerability": None, "error": str(e),
                     "votes_true": votes_true, "votes_false": votes_false,
-                    "votes_invalid": votes_invalid, "n": n}
+                    "votes_invalid": votes_invalid, "n": n,
+                    "prescreen": prescreen_info}
         if votes_true > votes_false:
             hv = True
         elif votes_false > votes_true:
@@ -1303,6 +1410,8 @@ class TwoStageScanner:
         out = {"sampled": True, "has_vulnerability": hv,
                "votes_true": votes_true, "votes_false": votes_false,
                "votes_invalid": votes_invalid, "n": n}
+        if prescreen_info:
+            out["prescreen"] = prescreen_info  # 预筛可观测：选了哪些块、分数多少
         if true_types:
             out["types"] = true_types  # 全部判真票类型，供多漏洞聚合（P3）
         # 透传首个判真票的类型信息（2026-08-15 修复：此前 recheck 采信为漏洞

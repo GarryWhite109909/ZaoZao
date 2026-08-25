@@ -1,0 +1,48 @@
+LANG: java
+```java
+package com.example.artifact.controller;
+
+import org.springframework.web.bind.annotation.*;
+import org.springframework.http.ResponseEntity;
+import java.io.File;
+import java.nio.file.*;
+
+@RestController
+@RequestMapping("/api/artifacts")
+public class ArtifactMirrorController {
+
+    private final Path lockDir = Paths.get("/var/lib/repo/locks");
+
+    // GET /api/artifacts/{group}/lockfile?name=xxx
+    @GetMapping("/{group}/lockfile")
+    public ResponseEntity<byte[]> getLockFile(@PathVariable String group,
+                                              @RequestParam("name") String name) throws Exception {
+        Path base = lockDir.resolve(group).normalize();
+        if (!Files.exists(base)) {
+            return ResponseEntity.notFound().build();
+        }
+
+        // mirror refresh: rewrite dist url hash inside the requested lock file
+        Path target = base.resolve(name);
+        if (!Files.exists(target)) {
+            return ResponseEntity.notFound().build();
+        }
+
+        byte[] content = Files.readAllBytes(target);
+        String text = new String(content);
+        text = text.replaceAll("(?<=sha=)[a-f0-9]{40}", "0000000000000000000000000000000000000000");
+        Files.write(target, text.getBytes());
+        return ResponseEntity.ok(Files.readAllBytes(target));
+    }
+}
+```
+
+1. 第 18 行 `@RequestParam("name")` 与第 17 行 `@PathVariable group` 是全部外部输入点；`name` 直接进入第 26 行 `base.resolve(name)`，`group` 进入第 20 行 `resolve(group)`，二者均可到达 sink。
+2. 第 21 行仅检查目录存在性，第 27 行仅检查文件存在性，全程没有对 `..`、绝对路径或规范化后前缀的校验，`name=../../etc/passwd` 或 `name=/etc/shadow`（Java 的 resolve 对绝对路径直接替换）均可达。
+3. 第 28 行 `Files.readAllBytes(target)` 为任意文件读取 sink；第 31-32 行 `replaceAll` 只替换 40 位十六进制哈希，属黑名单式内容改写，不构成路径防御且可被绕过；第 33 行 `Files.write(target, ...)` 更构成任意文件写入（可覆盖任意可写文件）。
+4. 第二入口：`{group}` 路径变量同样未校验，`GET /api/artifacts/../etc/lockfile?name=passwd` 是等价的替代通道；此外 Spring 默认不会拒绝 URL 编码的 `%2e%2e%2f`，形成第二条可达流。
+5. 结论：source→sink 数据流完全无有效防御，存在 CWE-22 路径遍历（读+写）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal (arbitrary file read/write)", "risk_level": "Critical", "source": "line 17-18: @PathVariable group 与 @RequestParam name 外部输入", "sink": "line 28: Files.readAllBytes(target) 与 line 33: Files.write(target, ...)", "explanation": "line 18 的 name 经 line 26 base.resolve(name) 直达 line 28 读取与 line 33 写入，未做 normalize 后前缀校验，../ 或绝对路径即可逃逸; line 17 的 group 同样未校验，构成第二入口 /api/artifacts/../etc/lockfile; line 31-32 的 replaceAll 仅重写哈希内容，属可绕过的内容过滤而非路径防御", "fix_suggestion": "line 26: 对 resolve 结果执行 toAbsolutePath().normalize() 并校验 startsWith(lockDir.toAbsolutePath().normalize())，同时拒绝 name/group 中的路径分隔符"}
+```

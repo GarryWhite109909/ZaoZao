@@ -1,0 +1,59 @@
+LANG: go
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+// TaskConfig 模拟 Jenkins 中可被反序列化的核心类型
+type TaskConfig struct {
+	Name    string
+	Handler func() // 可执行载荷字段
+}
+
+type PluginEntry struct {
+	Plugin string
+	Config interface{}
+}
+
+func loadConfig(c *gin.Context) {
+	raw, err := c.GetRawData()
+	if err != nil {
+		c.String(http.StatusBadRequest, "read body failed")
+		return
+	}
+
+	var entry PluginEntry
+	dec := gob.NewDecoder(bytes.NewReader(raw))
+	if err := dec.Decode(&entry); err != nil { // sink: 反序列化不可信数据到任意类型
+		c.String(http.StatusBadRequest, "decode failed")
+		return
+	}
+
+	if tc, ok := entry.Config.(TaskConfig); ok && tc.Handler != nil {
+		tc.Handler()
+	}
+	c.String(http.StatusOK, "loaded")
+}
+
+func main() {
+	r := gin.Default()
+	r.POST("/config", loadConfig)
+	r.Run(":8080")
+}
+```
+
+1. 第 24 行 `c.GetRawData()` 是唯一 source：攻击者完全控制 POST /config 的请求体字节流；第 40 行路由注册确认该 handler 直接暴露于网络，可达性成立。
+2. 第 31 行 `gob.NewDecoder(...).Decode(&entry)` 是 sink：gob 在解码 `interface{}` 字段（第 19 行 Config）时会根据流中携带的类型名在全局类型注册表中查找并实例化任意已注册类型，等价于 Java XStream 反序列化任意类的语义。
+3. 防御验证：代码中不存在任何白名单、类型校验或输入过滤；`entry.Config.(TaskConfig)` 只是事后断言而非防御，且 gob 解码阶段任意类型的构造已经发生（含自定义 GobDecode 副作用），黑名单式后置检查可绕过。
+4. 第二入口分析：本文件仅 /config 一个路由，无其他参数通道；但任何通过 `gob.Register` 注册了带危险行为的类型（如包含 func 或实现 GobDecoder）的插件包都会自动扩大攻击面，与 Jenkins 插件生态同理。
+5. 结论：source→sink 数据流完整且无有效防御，构成 CWE-502 不受信数据反序列化漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data", "risk_level": "Critical", "source": "line 24: c.GetRawData() 读取攻击者完全控制的请求体", "sink": "line 31: gob Decoder.Decode 将不可信字节流反序列化为含 interface{} 字段的任意注册类型", "explanation": "主链: line 24 GetRawData -> line 30-31 gob Decode 到 entry.Config(interface{}) -> gob 按流内类型名实例化任意已注册类型 -> line 34 类型断言触发已构造对象; 无任何白名单或类型校验, 后置断言不阻止解码期副作用; 第二入口: 文件内仅此一路由, 但任何 gob.Register 过的危险类型均扩大攻击面; 综合判定存在反序列化漏洞", "fix_suggestion": "line 31: 禁止将不可信数据解码为含 interface{} 的结构, 改用固定具体类型(如 entry.Config 改为 map[string]string)并在解码前校验内容"}
+```

@@ -1,0 +1,60 @@
+LANG: python
+```python
+import ipaddress
+import socket
+from urllib.parse import urlparse
+
+import requests
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+BLOCKED_NETS = [
+    ipaddress.ip_network('10.0.0.0/8'),
+    ipaddress.ip_network('172.16.0.0/12'),
+    ipaddress.ip_network('192.168.0.0/16'),
+    ipaddress.ip_network('127.0.0.0/8'),
+    ipaddress.ip_network('169.254.0.0/16'),
+    ipaddress.ip_network('100.64.0.0/10'),
+    ipaddress.ip_network('0.0.0.0/8'),
+    ipaddress.ip_network('240.0.0.0/4'),
+]
+
+
+def is_private_ip(addr):
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return True
+    return any(ip in net for net in BLOCKED_NETS)
+
+
+@app.route('/fetch')
+def fetch_url():
+    target = request.args.get('url', '')
+    parsed = urlparse(target)
+    if not parsed.hostname:
+        return jsonify(error='invalid url'), 400
+
+    # SSRF guard: resolve hostname and reject private addresses
+    resolved = {ai[4][0] for ai in socket.getaddrinfo(parsed.hostname, None)}
+    if any(is_private_ip(a) for a in resolved):
+        return jsonify(error='blocked host'), 403
+
+    resp = requests.get(target, timeout=5)
+    return jsonify(status=resp.status_code, body=resp.text[:2000])
+
+
+if __name__ == '__main__':
+    app.run()
+```
+
+1. 第 30 行 `request.args.get('url')` 是唯一外部输入点（source），第 31-33 行解析后取 hostname，直接进入后续流程，无白名单校验。
+2. 第 36 行用 `socket.getaddrinfo` 做私有 IP 检查，属于“先解析校验、后请求”的 TOCTOU 结构：第 39 行 `requests.get(target)` 会重新发起一次独立的 DNS 解析，两次解析之间攻击者可用 DNS rebinding 让第二次解析返回内网地址（如 169.254.169.254），检查被完全绕过。
+3. 黑名单式 `is_private_ip` 仅覆盖固定网段，且不拦截重定向：若目标返回 302 跳转到内网地址，requests 默认跟随重定向时不再经过任何检查。
+4. 第二入口分析：应用仅注册 `/fetch` 一个路由，无其他参数或间接调用通道；但同一 source 经由重定向可形成替代数据流到达同一 sink。
+5. 结论：存在 CWE-918 SSRF，主链为 第30行 url 参数 → 第33行 hostname → 第39行 requests.get 发起请求，防御因 DNS rebinding 与重定向而无效。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF) via DNS rebinding", "risk_level": "High", "source": "line 30: request.args.get('url') 外部可控 URL 参数", "sink": "line 39: requests.get(target) 服务端发起任意 HTTP 请求", "explanation": "数据流: line 30 url 参数 -> line 31 urlparse 取 hostname -> line 36 getaddrinfo 校验 -> line 39 requests.get 实际请求; 防御失效一: line 36 的 DNS 解析与 line 39 requests 内部再次解析之间存在 TOCTOU 窗口, DNS rebinding 可使第二次解析指向内网 IP, 黑名单检查被绕过; 防御失效二: is_private_ip 为黑名单且未禁用重定向, 目标 302 跳转至内网地址时不再经过任何检查; 第二入口: 应用仅有 /fetch 一个路由无其他入口, 但重定向构成同一 source 到同一 sink 的替代通道", "fix_suggestion": "line 39: 使用自定义 transport 在连接建立后校验对端真实 IP(或禁用重定向并将解析到的 IP 直接用于请求), 消除校验与请求间的二次 DNS 解析"}
+```

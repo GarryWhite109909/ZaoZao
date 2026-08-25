@@ -8,20 +8,36 @@ import (
 )
 
 // IsSameSite 判断给定 URL 是否属于本站（用于 redirect_to 校验）。
-func IsSameSite(raw string) bool {
-	if raw == "" {
-		return false
-	}
-	if strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//") {
-		return true
-	}
-	u, err := url.Parse(raw)
+func IsSameSite(rawURL string) bool {
+	u, err := url.Parse(rawURL)
 	if err != nil {
 		return false
 	}
-	host := u.Hostname()
-	// 缺陷：仅做后缀匹配，攻击者可用 evil-github.com 或 github.com.evil.com 绕过
-	return strings.HasSuffix(host, "github.com")
+	if u.IsAbs() {
+		return u.Host == "github.com"
+	}
+	return true
+}
+
+func TestIsSameSite(t *testing.T) {
+	tests := []struct {
+		url  string
+		want bool
+	}{
+		{url: "//github.com", want: false},
+		{url: "http://github.com", want: false},
+		{url: "https://github.com", want: false},
+		{url: "/\\github.com", want: false},
+
+		{url: "/admin", want: true},
+		{url: "/user/repo", want: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.url, func(t *testing.T) {
+			assert.Equal(t, test.want, IsSameSite(test.url))
+		})
+	}
 }
 ```
 ```code-safe
@@ -33,47 +49,55 @@ import (
 )
 
 // IsSameSite 判断给定 URL 是否属于本站（用于 redirect_to 校验）。
-func IsSameSite(raw string) bool {
-	if raw == "" {
-		return false
-	}
-	if strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//") {
-		return true
-	}
-	u, err := url.Parse(raw)
+func IsSameSite(rawURL string) bool {
+	u, err := url.Parse(rawURL)
 	if err != nil {
 		return false
 	}
-	host := u.Hostname()
-	// 修正：改为精确主机名白名单校验，杜绝子域/后缀混淆绕过
-	return host == "github.com" || strings.HasSuffix(host, ".github.com")
+	if u.IsAbs() || strings.HasPrefix(u.Path, "//") || strings.Contains(rawURL, "\") {
+		return u.Host == "github.com" && (u.Scheme == "" || u.Scheme == "http" || u.Scheme == "https")
+	}
+	return true
+}
+
+func TestIsSameSite(t *testing.T) {
+	tests := []struct {
+		url  string
+		want bool
+	}{
+		{url: "//github.com", want: false},
+		{url: "http://github.com", want: false},
+		{url: "https://github.com", want: false},
+		{url: "/\\github.com", want: false},
+
+		{url: "/admin", want: true},
+		{url: "/user/repo", want: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.url, func(t *testing.T) {
+			assert.Equal(t, test.want, IsSameSite(test.url))
+		})
+	}
 }
 ```
 
 **vuln 版分析**
-1. 攻击者提交 `redirect_to=https://evil-github.com`。
-2. `url.Parse` 成功解析，host 为 `evil-github.com`。
-3. `strings.HasSuffix(host, "github.com")` 返回 true，校验被绕过。
-4. 用户被重定向到任意外部站点，构成开放重定向。
+1. 输入点：`redirect_to` 查询参数直达 `IsSameSite`；相对路径输入 `/\\evil.com` 经 `url.Parse` 后 Host 为空、非绝对 URL，直接返回 true。
+2. 防御验证：仅对 `u.IsAbs()` 分支校验 Host；协议相对地址 `//evil.com` 虽被拦截，但反斜杠变体绕过——浏览器将 `\` 规范化为 `/`，实际跳转至外部站。
+3. 第二入口检查：API 层若同样调用此函数校验 OAuth 回跳或登录后重定向，均复用同一缺陷；无其他白名单兜底。
+4. 结论：信任边界缺陷成立，攻击者可注入外部重定向目标。
 
 ```json
-{
-  "is_vulnerable": true,
-  "cwe": "CWE-601",
-  "reason": "使用 HasSuffix 后缀匹配校验跳转目标主机，攻击者可构造 evil-github.com 绕过信任边界，导致开放重定向"
-}
+{"has_vulnerability": true, "vulnerability_type": "CWE-601 Open Redirect via backslash-prefixed relative path bypassing same-site check", "risk_level": "High", "source": "HTTP query parameter redirect_to passed to IsSameSite", "sink": "HTTP Location header / client-side redirect target", "explanation": "input redirect_to reaches IsSameSite; url.Parse treats backslash as path char so /\\evil.com is not absolute and returns true; browser normalizes backslash to slash causing off-site redirect; second entry points such as login and oauth callbacks reuse the same validator so all are bypassable", "fix_suggestion": "line 14: reject inputs containing backslash or protocol-relative paths before trusting relative-URL branch"}
 ```
 
 **safe 版分析**
-1. 校验改为精确比较 `host == "github.com"`，或以 `.github.com` 结尾的合法子域。
-2. `evil-github.com` 既不等于精确值也不以 `.github.com` 开头作为子域后缀，返回 false。
-3. 相对路径仍由前导 `/` 且非 `//` 的检查覆盖，协议相对 URL 被拒绝。
-4. 该修正完整覆盖攻击面：所有外部主机均无法通过精确白名单匹配。
+1. 输入点：同一 `redirect_to` 参数，解析路径不变。
+2. 修正点（唯一语义变更）：在判断分支中增加 `strings.Contains(rawURL, "\")` 与 `strings.HasPrefix(u.Path, "//")` 检查，含反斜杠或协议相对路径的输入一律落入 Host 白名单校验。
+3. 攻击面覆盖：所有绕过变体（`/\evil.com`、`/\../\evil.com`、`//evil.com`）都包含反斜杠或以 `//` 开头，均被强制进入白名单分支而返回 false；纯站内路径不含这些字符仍走原逻辑。
+4. 第二入口结论：任何调用方使用本函数即获得一致防护，无遗漏通道。
 
 ```json
-{
-  "is_vulnerable": false,
-  "cwe": "CWE-601",
-  "reason": "改用精确主机名加受控子域白名单校验跳转目标，消除后缀匹配绕过，开放重定向缺陷已修复"
-}
+{"has_vulnerability": false, "vulnerability_type": "", "risk_level": "Low", "source": "HTTP query parameter redirect_to passed to IsSameSite", "sink": "HTTP Location header / client-side redirect target", "explanation": "single semantic fix adds backslash and protocol-relative detection forcing such inputs into host whitelist check; all known bypass variants contain backslash or leading double slash so attack surface fully covered; second entry points inherit the fixed validator uniformly", "fix_suggestion": "line 14: add strings.Contains(rawURL, backslash) and HasPrefix(u.Path, //) guard before returning true"}
 ```

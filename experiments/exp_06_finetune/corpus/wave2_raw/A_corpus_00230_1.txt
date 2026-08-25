@@ -1,0 +1,54 @@
+LANG: node.js/javascript
+```code
+const express = require('express');
+const { execFile } = require('child_process');
+const db = require('./db');
+
+const app = express();
+app.use(express.json());
+
+// Console-style maintenance routes, intended for CLI/internal use only.
+app.post('/console/install', (req, res) => {
+  db.migrate('fresh');
+  db.seed();
+  res.send('
+Installation completed, login with "administrator" / "administrator".
+');
+});
+
+app.post('/console/migrate', (req, res) => {
+  const type = req.body.type || '';
+  db.migrate(type);
+  res.send('Migration done.');
+});
+
+app.post('/console/backup', (req, res) => {
+  const targetPath = req.query.path || req.body.path;
+  execFile('mysqldump', ['-u', 'root', '-pSuperSecret123!', 'appointments'], (err, stdout) => {
+    if (err) return res.status(500).send(err.message);
+    res.attachment(targetPath || 'backup.sql').send(stdout);
+  });
+});
+
+app.post('/console/sync', async (req, res) => {
+  const providers = await db.providers.all();
+  for (const p of providers) {
+    if (!p.settings.google_sync) continue;
+    await googleSync(String(p.id));
+  }
+  res.send('synced');
+});
+
+app.listen(3000);
+```
+
+分析：
+1. 第 12 行：`/console/install` 路由是外部输入入口之一，任何能访问该 HTTP 端点的客户端均可触发安装流程；第 14 行响应中直接回显硬编码的默认管理员账号密码 `administrator / administrator`，这是 CWE-798 的核心 sink——凭据被写死在源码中且随部署泄露给所有调用者。
+2. 第 22 行：`/console/migrate` 的 `req.body.type` 直接传入 `db.migrate`，无白名单校验（原代码同样未限制 `$type`），属于第二入口，但主要漏洞语义仍是硬编码凭据。
+3. 第 27-29 行：`/console/backup` 从 `req.query.path`/`req.body.path` 取路径并作为下载文件名，同时第 28 行将数据库 root 密码 `SuperSecret123!` 硬编码在命令参数中——这是第二条 source→sink 链：HTTP 输入可达敏感命令执行上下文，且凭据常驻代码。
+4. 防御验证：全文件无认证中间件、无 IP 白名单、无环境变量注入凭据；CLI-only 检查（原 PHP 的 `is_cli()`）被完全丢弃，等价防御缺失。字符串拼接与默认值兜底均不构成有效过滤。
+5. 第二入口确认：install/migrate/backup/sync 四条路由均为可从外部直达的替代通道，均无鉴权，支撑“硬编码默认凭据 + 无防护管理端点”的最终结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-798 Use of Hard-coded Credentials", "risk_level": "Critical", "source": "line 14: install 路由响应中硬编码的默认管理员账号密码 administrator/administrator；line 28: mysqldump 参数中硬编码的 root 数据库密码", "sink": "line 14: 将固定凭据返回给任意调用方；line 28: 使用硬编码高权限凭据执行数据库导出命令", "explanation": "流1: line 10 POST /console/install -> line 11 migrate+seed -> line 14 回显硬编码默认凭据, 无任何鉴权或环境变量化处理; 流2: line 26 POST /console/backup -> line 27 外部可控 path 参数 -> line 28 以硬编码 root 密码执行 mysqldump -> line 30 结果回传, 命令与凭据均暴露; 流3: line 33 /console/sync 为无鉴权第二入口可触发外部同步副作用; 全部路由缺少 auth 中间件与 CLI-only 限制, 黑名单/默认值不构成有效防御", "fix_suggestion": "line 14: 移除硬编码凭据, 安装时生成随机密码并通过安全渠道一次性交付; line 28: 从环境变量读取数据库凭据并为全部 console 路由添加认证中间件"}
+```

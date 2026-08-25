@@ -1,0 +1,65 @@
+LANG: go
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"encoding/json"
+	"io/ioutil"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+// 模拟一个可被 gob 反序列化的执行器类型
+type TaskRunner struct {
+	Cmd string
+}
+
+func (t *TaskRunner) Run() { /* exec t.Cmd */ }
+
+func init() {
+	gob.Register(&TaskRunner{})
+}
+
+func graphqlHandler(c *gin.Context) {
+	body, _ := ioutil.ReadAll(c.Request.Body)
+	var req map[string]interface{}
+	json.Unmarshal(body, &req)
+
+	// 从请求中取出 variables 字段（base64 编码的 gob 数据）
+	rawVars, ok := req["variables"].(string)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing variables"})
+		return
+	}
+	decoded, err := base64Decode(rawVars)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad encoding"})
+		return
+	}
+
+	var runner *TaskRunner
+	gob.NewDecoder(bytes.NewReader(decoded)).Decode(&runner) // sink
+	runner.Run()
+
+	c.JSON(http.StatusOK, gin.H{"data": "ok"})
+}
+
+func main() {
+	r := gin.Default()
+	r.POST("/graphql", graphqlHandler)
+	r.Run(":8080")
+}
+```
+
+1. 第 27 行：`c.Request.Body` 是唯一外部输入入口，POST /graphql 的 JSON body 中 `variables` 字段完全由攻击者控制，是 source。
+2. 第 33 行：仅做类型断言检查字段是否为字符串，第 38 行仅校验 base64 可解码——两者都不是安全防御，只保证格式合法，不限制反序列化类型。
+3. 第 46 行：`gob.Decode` 直接对用户数据反序列化，gob 支持注册类型的任意实例化（gob.Register 注册的 `&TaskRunner`），攻击者可构造恶意对象，是 sink（CWE-502）。
+4. 第 47 行：反序列化结果立即调用 `runner.Run()` 触发行为，无任何白名单/类型校验，source→sink 数据流完整可达。
+5. 第二入口分析：路由表中仅有 /graphql 一个 POST 路由，无其他 handler 或间接调用通道；但该单一入口已足以完成攻击，且黑名单/正则过滤（若加在 rawVars 上）均可通过编码绕过，故确认存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data", "risk_level": "Critical", "source": "line 27: c.Request.Body 中的 variables 字段", "sink": "line 46: gob.NewDecoder(...).Decode 反序列化用户输入", "explanation": "外部输入经 line 33 类型断言和 line 38 base64 校验后直接进入 line 46 的 gob 反序列化；两处检查均为格式校验而非安全防御，正则或字符串过滤亦可被编码绕过；gob.Register 已注册可实例化类型，攻击者可注入恶意对象并在 line 47 Run() 中触发任意代码执行；路由表中无第二入口，但单一 /graphql 入口的数据流已完整可达", "fix_suggestion": "line 46: 禁止对用户输入使用 gob 反序列化，改用 json.Unmarshal 到固定结构体并显式校验字段值"}
+```

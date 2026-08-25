@@ -4,46 +4,51 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-translations = {}
+# 全局翻译/配置字典，模拟 i18next 的 json 输出对象
+TRANSLATIONS = {}
 
-def deep_assign(container, path, value, separator='##'):
-    keys = path.split(separator)
-    node = container
-    for k in keys[:-1]:
-        if not hasattr(node, '__setitem__'):
-            return
-        if k not in node or not isinstance(node[k], dict):
-            node[k] = {}
-        node = node[k]
-    node[keys[-1]] = value
+def deep_assign(target, key, value, separator='##'):
+    # 与原版 gettext2json 相同：按分隔符切分 key，逐段动态写入嵌套 dict
+    segments = key.split(separator)
+    node = target
+    for seg in segments[:-1]:
+        if not isinstance(node.get(seg), dict):
+            node[seg] = {}
+        node = node[seg]
+    node[segments[-1]] = value
 
-@app.route('/api/convert', methods=['POST'])
-def convert():
-    payload = request.get_json(force=True)
-    locale = payload.get('locale', 'en')
-    entries = payload.get('entries', [])
-    result = {}
+@app.route('/import', methods=['POST'])
+def import_translations():
+    payload = request.get_json(force=True) or {}
+    separator = payload.get('keyseparator') or '##'
+    entries = payload.get('translations')
+    if not isinstance(entries, list):
+        return jsonify({'error': 'translations must be a list'}), 400
+
     for entry in entries:
         key = entry.get('key', '')
         value = entry.get('value', '')
-        if key == '':
+        if len(key) == 0:
             continue
-        ctx = entry.get('context', '')
-        target_key = f'{key}_{ctx}' if ctx else key
-        deep_assign(result, target_key, value)
-    translations[locale] = result
-    return jsonify({'status': 'ok', 'count': len(result)})
+        # 无任何键名白名单/黑名单校验，直接进入 deep_assign
+        deep_assign(TRANSLATIONS, key, value, separator)
+
+    return jsonify({'ok': True})
+
+@app.route('/config/<name>')
+def get_config(name):
+    return jsonify({name: TRANSLATIONS.get(name)})
 
 if __name__ == '__main__':
     app.run()
 ```
 
-1. 第 15 行 `request.get_json(force=True)` 是 source：攻击者完全控制 POST JSON 中的 `key` 字段，无任何白名单或格式校验。
-2. 第 22 行将用户提供的 `key` 原样传入 `deep_assign`，与原代码中按 `##` 分隔符拆分嵌套键的逻辑等价。
-3. 第 6~13 行的 `deep_assign` 是 sink：逐段把用户字符串作为字典键写入，未过滤 `__class__`、`__init__`、`__globals__` 等危险键名——Python 中污染对象属性可通过 `__class__.__init__.__globals__` 链触及全局命名空间，等价于 JS 的 prototype pollution（CWE-1336）。
-4. 第 10 行仅检查 `isinstance(node[k], dict)`，但首次写入时直接创建普通 dict 并继续用用户键索引，防御形同虚设；且对已存在的非 dict 节点直接覆盖，可劫持已有结构。
-5. 全链路（第 15 → 22 → 12 行）没有任何键名黑名单、路径规范化或不可变容器保护，source 到 sink 完全贯通。
+1. 第 22 行 `request.get_json()` 是唯一外部输入入口，`payload['translations']` 中每条 `entry['key']` 与 `entry['value']` 完全由攻击者控制，第 33 行直接传入 `deep_assign`，可达性成立。
+2. 第 6-14 行 `deep_assign` 按分隔符 `##` 切分后逐段 `node[seg] = {}` / `node[segments[-1]] = value` 动态写键；全程无任何对段名的白名单、正则或替换过滤（第 20-21 行仅取默认分隔符），防御缺失。
+3. Python 类污染等价 sink：攻击者提交 key 为 `__class__##__init__##__globals__##SECRET`（或指向全局 `app.config`、其他模块属性）的条目，即可沿对象图写入任意可变属性——与 JS 原型污染语义结构完全一致：source（JSON 键）→ 动态键赋值 sink。
+4. 第二入口确认：`get_config` 路由只读不写，无替代污染通道；但污染一旦发生即影响进程内所有共享该对象的代码路径，且 `/import` 本身就是唯一也是充分的写入口。
+5. 结论：存在 CWE-1336 等价漏洞（Python class/global pollution），风险 High。
 
 ```json
-{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Python 字典键路径注入导致的全局命名空间污染", "risk_level": "high", "source": "line 15: request.get_json 获取攻击者可控的 key 字段", "sink": "line 12: deep_assign 中 node[keys[-1]] = value 以用户输入作为动态键写入", "explanation": "攻击者在 key 中传入 __class__##__init__##__globals__ 等分段 -> deep_assign 逐段作为字典键导航并赋值 -> 污染模块级 globals 或敏感配置对象", "fix_suggestion": "line 6: 在 deep_assign 中加入键名黑名单校验，拒绝以双下划线开头结尾的键段，并对每段使用 re.fullmatch 限制为安全字符集"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine (Python class/dict pollution via dynamic key assignment)", "risk_level": "High", "source": "line 22: request.get_json() 中 translations[].key 攻击者可控", "sink": "line 13: deep_assign 内 node[segments[-1]] = value 动态键写入", "explanation": "主链: line 22 JSON body -> line 30 entry.key -> line 33 deep_assign -> line 13 逐段动态赋值; 防御分析: 全程无键名白名单/黑名单/正则过滤, 分隔符默认 ## 可被利用构造任意深度路径; 第二入口: get_config 只读无写通道, 但污染影响全局共享对象", "fix_suggestion": "line 9: 对每个 segment 校验仅允许 [A-Za-z0-9_-] 且拒绝 __dunder__ 与保留键后再赋值"}
 ```

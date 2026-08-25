@@ -1,0 +1,57 @@
+LANG: go
+```code
+package middleware
+
+import (
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+// StaticFileAuth 鉴权中间件：校验 token 后按 X-Target-Path 头返回受保护目录下的文件
+func StaticFileAuth(protectedRoot string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		token := c.GetHeader("X-Access-Token")
+		if token != "expected-session-token" {
+			c.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
+
+		// 从请求头取目标文件路径（source）
+		target := c.GetHeader("X-Target-Path")
+		if target == "" {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+
+		// 仅做表面清洗：去掉 "<" 和 ">"，未处理 ".." 或绝对路径
+		cleaned := strings.ReplaceAll(target, "<", "")
+		cleaned = strings.ReplaceAll(cleaned, ">", "")
+
+		// 直接与根目录拼接后读取文件（sink）
+		full := filepath.Join(protectedRoot, cleaned)
+		data, err := os.ReadFile(full)
+		if err != nil {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+		c.Data(http.StatusOK, "application/octet-stream", data)
+	}
+}
+
+func RegisterRoutes(r *gin.Engine) {
+	r.GET("/protected/file", StaticFileAuth("/var/app/protected"))
+}
+```
+
+1. 第 17 行 `c.GetHeader("X-Access-Token")` 是鉴权入口，但仅做固定 token 比对，通过后不再约束后续路径；第 19 行 `X-Target-Path` 是外部输入 source，攻击者完全可控。
+2. 第 27–28 行的防御仅是 `strings.ReplaceAll` 删除 `<`/`>`，属于黑名单式字符串替换，不处理 `..`、URL 编码或绝对路径，可被 `../../etc/passwd` 直接绕过，不构成有效防御；且没有使用 `filepath.Clean` 后的前缀校验（如 `strings.HasPrefix(filepath.Clean(full), protectedRoot)`）。
+3. 第 31 行 `filepath.Join(protectedRoot, cleaned)` 会规范化并接受含 `..` 的相对段，第 32 行 `os.ReadFile(full)` 是 sink，直接以任意路径读文件，source→sink 数据流无任何有效拦截。
+4. 第二入口核查：路由表中 `/protected/file` 是唯一注册该 handler 的路由，但同一 handler 可被挂到任意方法（POST 等），且 `filepath.Join` 对 `..` 的合并行为使任何携带该头的请求均可触达 sink；结论为存在 CWE-22 路径穿越（任意文件读取），风险 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal (arbitrary file read)", "risk_level": "High", "source": "line 19: c.GetHeader('X-Target-Path') 外部可控请求头", "sink": "line 32: os.ReadFile(full) 以拼接后的未校验路径读取文件", "explanation": "主数据流: line 19 请求头 X-Target-Path -> line 27-28 仅 ReplaceAll 去除尖括号的字符串替换过滤(黑名单式, 可用 ../ 绕过, 不算有效防御) -> line 31 filepath.Join 合并 .. 段 -> line 32 os.ReadFile 任意文件读取; 第二入口核查: 该 handler 仅注册于 /protected/file 一处, 但鉴权(line 17 固定 token)通过后对路径无任何白名单或前缀校验, 任何持有合法 token 的调用方均可触发, 无其他缓解通道", "fix_suggestion": "line 31: 使用 filepath.Clean 后校验 strings.HasPrefix(cleanedAbs, protectedRoot+string(os.PathSeparator)) 并拒绝包含 .. 的输入, 否则返回 400"}
+```

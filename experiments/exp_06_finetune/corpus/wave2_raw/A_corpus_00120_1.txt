@@ -1,0 +1,46 @@
+LANG: node.js/javascript
+```javascript
+const express = require('express');
+const serialize = require('node-serialize');
+
+const app = express();
+app.use(express.json());
+
+// 会话状态仓库：将 exchange 状态对象序列化后存入内存缓存（模拟聚合仓库）
+const sessionStore = new Map();
+
+// 写入路由：序列化任意 JSON 体并存储
+app.post('/session/:id', (req, res) => {
+  const payload = req.body.state;                 // 外部输入点 1
+  const blob = serialize.serialize(payload);
+  sessionStore.set(req.params.id, blob);
+  res.status(201).json({ stored: true });
+});
+
+// 读回路由：反序列化存储的 blob —— 危险 sink
+app.get('/session/:id', (req, res) => {
+  const blob = sessionStore.get(req.params.id);
+  if (!blob) return res.status(404).json({ error: 'not found' });
+  const state = serialize.unserialize(blob);      // CWE-502 sink
+  res.json({ state });
+});
+
+// 第二入口：客户端可直接提交 base64 编码的 blob，绕过写入路由直接进入 unserialize
+app.post('/session/import', (req, res) => {
+  const raw = Buffer.from(req.body.blob, 'base64').toString('utf8'); // 外部输入点 2
+  const state = serialize.unserialize(raw);       // 同一 sink 的替代通道
+  res.json({ imported: true, keys: Object.keys(state || {}) });
+});
+
+app.listen(3000);
+```
+
+1. 第 12 行与第 22 行是两个外部输入点：第 12 行取 `req.body.state`（POST /session/:id 的 JSON 体），第 22 行取 `req.body.blob`（import 路由的 base64 字符串），两者均为攻击者完全可控的外部数据。
+2. 主数据流：第 12 行 source → 第 13 行 `serialize.serialize` → 第 19 行 `serialize.unserialize`。node-serialize 的 `unserialize` 会对 `_$$ND_FUNC$$_` 标记的函数字段执行 `eval`/`Function` 构造，攻击者可注入 IIFE 实现远程代码执行；中间无任何类型校验、白名单或 schema 验证。
+3. 防御检查：整条链路没有任何过滤、黑名单或正则校验；即使对 `state` 做字符串替换/黑名单（如删除关键字段）也可通过嵌套键或编码绕过，不构成有效防御——本代码连这类弱防御都不存在。
+4. 第二入口验证：第 21–25 行 import 路由提供替代通道，攻击者无需经过写入路由，可直接把恶意序列化串 base64 后 POST 到 `/session/import`，在第 24 行直达同一 sink，证明漏洞面不止一条路径且均可低权限利用。
+5. 结论：source→sink 可达性在两条路径上均成立，等价于原 Java 代码中 `ObjectInputStream.readObject` 对不可信字节的直接反序列化，属 CWE-502 不受信数据反序列化。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data", "risk_level": "Critical", "source": "line 12: req.body.state 与 line 22: req.body.blob", "sink": "line 19 与 line 24: serialize.unserialize()", "explanation": "主链: line 12 外部JSON体 -> line 13 serialize -> line 19 unserialize, node-serialize 对函数标记字段执行 eval 导致 RCE; 替代链: line 22 base64 输入 -> line 24 直接 unserialize 绕过写入路由; 全程无 schema 校验、白名单或类型约束, 黑名单类过滤在此生态亦可被嵌套键绕过故视为无效; 两条入口均可达同一 sink, 低权限攻击者即可利用", "fix_suggestion": "line 19: 移除 node-serialize.unserialize, 改用 JSON.parse 并以显式 schema 校验恢复状态对象"}
+```

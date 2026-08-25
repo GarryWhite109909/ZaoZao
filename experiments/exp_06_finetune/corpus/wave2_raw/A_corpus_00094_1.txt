@@ -1,0 +1,56 @@
+LANG: php
+```php
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
+
+class DevProxyController extends Controller
+{
+    // config/proxy.php: 'routes' => ['/' => 'http://backend.internal:3000'], 'ws' => true
+    public function proxy(Request $request)
+    {
+        $context = $request->route('context', '/');
+        $target = config("proxy.routes.{$context}", config('proxy.routes./'));
+
+        if (!$target) {
+            abort(404);
+        }
+
+        // Any request not matching a local static file is forwarded,
+        // including the app's own /broadcasting/auth and websocket handshake.
+        $localPath = public_path(ltrim($request->path(), '/'));
+        if (file_exists($localPath)) {
+            return response()->file($localPath);
+        }
+
+        $forward = Http::withHeaders(
+            collect($request->headers->all())
+                ->except(['host'])
+                ->map(fn ($v) => $v[0])
+                ->toArray()
+        );
+
+        // ws:true semantics: Upgrade requests are also relayed to the target,
+        // so the dev server's own HMR socket gets hijacked by the upstream.
+        if (strtolower($request->header('upgrade', '')) === 'websocket') {
+            $forward->withHeaders(['upgrade' => 'websocket', 'connection' => 'Upgrade']);
+        }
+
+        return $forward
+            ->send($request->method(), rtrim($target, '/') . '/' . ltrim($request->path(), '/'),
+                $request->getMethod() === 'GET' ? [] : $request->post());
+    }
+}
+```
+
+1. 第 13 行：source 为外部 HTTP 请求（`$request`），路由 `Route::any('/{context?}/{path?}', ...)` 使任意路径与任意 context 均可达 `proxy()`，第 14-15 行直接用用户可控的 context 查配置，未命中时回退到根 `/` 的宽泛代理目标。
+2. 第 19 行：唯一的“防御”是本地静态文件存在性检查，仅覆盖磁盘上真实存在的文件；对 API 路径、`/broadcasting/auth`、WebSocket 握手等全部放行，等价于原代码的 `mayProxy` 启发式，可轻易绕过。
+3. 第 27-33 行：将客户端请求头（含 Origin）原样转发到目标，且第 30-33 行显式把 `Upgrade: websocket` 请求也转发——这正是 CWE-441 的语义：本应服务自身 HMR/broadcasting WebSocket 的端点被中间层劫持转发给上游 target。
+4. 第 35-38 行：sink 为 `Http::send()` 将完整请求体与头转发至 `$target`，从 source 到 sink 无任何白名单、域校验或上下文排除；第二入口方面，`/{context?}` 通配路由本身即替代通道，任何方法（GET/POST/WS 升级）均命中同一控制器，故漏洞成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-441 Unintended Proxy or Intermediary", "risk_level": "High", "source": "line 13: 外部 Request 输入（path/context/headers/upgrade 头）", "sink": "line 36: Http::send() 将请求连同 WebSocket 升级头整体转发至上游 target", "explanation": "主链：line 13 用户请求 -> line 15 宽泛回退 target -> line 19 仅本地文件存在性检查可绕过 -> line 30 显式转发 websocket 升级 -> line 36 转发至上游，导致应用自身的 HMR/broadcasting WebSocket 被代理目标截获；防御分析：唯一过滤是 line 19 file_exists 黑名单式静态文件判断，不覆盖动态路由与 WS 握手，无 origin/host 白名单；第二入口：通配路由 {context?} 允许任意方法任意路径进入同一控制器，构成替代通道并强化结论", "fix_suggestion": "line 19: 增加显式上下文白名单并在检测到 Upgrade: websocket 时拒绝转发（或排除框架内部 WS 端点），仅代理明确声明的 API 前缀"}
+```

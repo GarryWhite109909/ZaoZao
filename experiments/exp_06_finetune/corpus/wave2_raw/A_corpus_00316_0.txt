@@ -1,0 +1,42 @@
+LANG: node.js/javascript
+```javascript
+const express = require('express');
+const { Sequelize, DataTypes } = require('sequelize');
+const nunjucks = require('nunjucks');
+
+const app = express();
+app.use(express.json());
+const db = new Sequelize('sqlite::memory:');
+const MessagingTemplate = db.define('MessagingTemplate', {
+  type: { type: DataTypes.STRING, allowNull: false },
+  content: { type: DataTypes.JSON, allowNull: false },
+  isEnabled: { type: DataTypes.BOOLEAN, defaultValue: false }
+});
+
+// Renders stored template content with user-controlled variables (e.g. {{code}})
+function renderTemplate(templateBody, vars) {
+  return nunjucks.renderString(templateBody, vars); // no sandbox / autoescape config
+}
+
+// PUT /api/messaging-templates/:id — update template and render preview
+app.put('/api/messaging-templates/:id', async (req, res) => {
+  const template = await MessagingTemplate.findByPk(req.params.id);
+  if (!template) return res.status(404).json({ error: 'not found' });
+  const { content } = req.body; // attacker-controlled subject/body strings
+  template.content = content;
+  await template.save();
+  const preview = renderTemplate(content.body, req.query); // sink: SSTI via query params merged as context
+  res.json({ id: template.id, preview });
+});
+app.listen(3000);
+```
+
+1. 第 21 行 `req.body.content` 与第 22 行 `req.query` 是全部外部输入点：body 中的模板字符串与 query 中的上下文变量都直接来自 HTTP 请求，无任何鉴权/白名单校验，可达性确认。
+2. 第 23 行把攻击者完全控制的 `content.body` 存入数据库并原样保存——存储阶段没有任何对 Jinja/Nunjucks 语法的黑名单、正则过滤或字符串替换；即便有（如过滤 `{{`），也可用 `{%` 表达式或 `{%raw%}`/unicode 转义绕过，属可绕过防御。
+3. 第 25 行 `nunjucks.renderString(content.body, req.query)` 是 sink：renderString 默认非沙箱环境，配合 query 注入的上下文，攻击者可通过模板表达式访问原型链（如 `{{c.constructor.constructor("return process.mainModule.require('child_process').execSync('id')")()}}`）实现 RCE。
+4. 数据流验证：source(第 21 行 body) → 存储 → 第 25 行渲染为一条完整流；第二条流 source(第 22 行 req.query) 作为渲染上下文直接进入 sink。两条流之间及入口处均无有效防御（无输入校验、无 nunjucks 沙箱配置、无 Environment 白名单）。
+5. 第二入口检查：本文件仅此一个路由，但同一 `content.body` 若被其他路由（如邮件发送服务读取该表渲染）复用，构成替代通道；且 PUT 更新接口本身即完整暴露漏洞面，支撑 has_vulnerability=true 结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Server-Side Template Injection", "risk_level": "Critical", "source": "line 21: req.body.content 攻击者可控的模板内容; line 22: req.query 作为渲染上下文", "sink": "line 25: nunjucks.renderString(content.body, req.query) 非沙箱渲染", "explanation": "主链: 第21行 body 中模板字符串经第23行存储后于第25行 renderString 渲染, 全程无语法过滤或沙箱限制 -> SSTI/RCE; 第二条流: 第22行 req.query 直接作为渲染上下文传入 sink -> 可注入模板变量参与表达式求值; 黑名单/正则类过滤均可通过 {%...%} 语句块或编码绕过故视为无有效防御; 替代通道: 该模板存库后可被其他消费方(如邮件发送)再次渲染形成间接调用入口", "fix_suggestion": "line 25: 使用 nunjucks.configure 创建受限 Environment 并禁用 loader/原型访问, 或改用 Mustache 等无逻辑模板引擎并对 content.body 做严格白名单校验"}
+```

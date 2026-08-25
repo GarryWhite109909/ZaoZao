@@ -1,0 +1,25 @@
+**步骤 1：枚举用户可控输入点**
+
+- 第 71 行 `run(self, stat_name, criticality, commands, repeat, mustache_dict=None)`：`mustache_dict` 来自各插件的统计数据（如进程 `cmdline`、容器名、挂载点），可被攻击者控制（如创建名为含管道符的进程）。
+- 第 82 行 `for cmd in commands`：`commands` 来自管理员配置文件 glances.conf，属于受信配置，但其中模板变量会被可控数据填充。
+
+**步骤 2：追踪 source→sink 数据流并验证防御**
+
+- 流 A：第 71 行 `mustache_dict`（攻击者可控，如进程 cmdline 列表）→ 第 85 行 `_sanitize_mustache_dict(mustache_dict)` → 第 86 行 `chevron.render(cmd, safe_dict)` → 第 94 行 `secure_popen(cmd_full, ...)`。
+- 防御分析：第 20-21 行 `_SHELL_OPERATORS = ('&&', '|', '>>', '>')` 是一个黑名单；第 27-31 行 `_sanitize_value` 仅做字符串替换。按规则，黑名单/字符串替换过滤属于可绕过防御：
+  - 未覆盖 `<`（输入重定向）、`;`、反引号、`$()` 等操作符；
+  - 替换顺序可被组合绕过，如值中构造 `> >` 或 `| |`（替换后仍残留单个 `>` / `|`？不——单字符也会被替换，但形如 `>&`、`<&`、`>|` 等复合操作符不在列表内，替换 `>` 后剩余部分仍可能重组语义）；更直接地，`<` 完全未被处理，`cmd < /etc/passwd` 类注入可行；
+  - 第 96 行 `allow_operators=self.allow_operators()` 默认返回 True（第 68 行），即默认允许 shell 操作符，sanitize 失效时无第二层防护。
+- 结论：该黑名单过滤不能完整覆盖数据流，污染值可到达第 94 行 `secure_popen` 的命令行并被 shell 解释。
+
+**步骤 3：检查第二入口或替代通道**
+
+- 无其他路由；唯一执行点是第 94 行 `secure_popen`。但同一 sink 存在多条填充通道：任何插件暴露的嵌套 dict/list 值（第 33-39 行递归处理仅覆盖字符串类型，非字符串经 Mustache 渲染为字符串后不再经过 sanitize）均可作为替代通道——例如数值/None 类型在第 40 行原样返回，渲染成字符串后其中的操作符从未被过滤。
+
+**步骤 4：结论**
+
+存在命令注入漏洞（CWE-78）：黑名单式操作符替换 + 类型遗漏导致过滤可绕过，且默认 `allow_operators=True`，攻击者通过控制进程名/cmdline 等统计值将 shell 元字符注入 on-alert 命令行。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "High", "source": "line 71: run(..., mustache_dict=None) 中来自插件统计的攻击者可控值（如进程 cmdline）", "sink": "line 94: secure_popen(cmd_full, allow_operators=...)", "explanation": "攻击者可控的 mustache_dict 值 -> line 85 _sanitize_mustache_dict 黑名单字符串替换（仅覆盖 && | >> > 四个操作符，未覆盖 < ; 反引号 $() 等，且非字符串类型在 line 40 原样返回、渲染后才成为命令文本而未经消毒）-> line 86 chevron.render 拼入命令模板 -> line 94 secure_popen 且 line 68 allow_operators 默认 True 允许 shell 操作符 -> 命令注入", "fix_suggestion": "line 94: 改用不经 shell 的参数化执行方式（将命令与参数拆分为 argv 列表传入且禁用 shell 解释），而非依赖黑名单替换"}
+```

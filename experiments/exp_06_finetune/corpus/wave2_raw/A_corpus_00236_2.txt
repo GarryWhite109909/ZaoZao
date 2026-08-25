@@ -1,0 +1,61 @@
+LANG: php
+```php
+<?php
+// auth.php - JWT 签发与校验（原生 PHP，firebase/php-jwt 风格）
+require_once __DIR__ . '/vendor/autoload.php';
+
+use Firebase\JWT\JWT;
+use Firebase\JWT\Key;
+
+const JWT_SECRET = 'BytesOverTheWire'; // 第 8 行：硬编码密钥
+
+function create_user_jwt(string $username, array $networks, bool $isAdmin): string {
+    $issuedAt = time();
+    $payload = [
+        'iss' => 'netmaker-api',
+        'sub' => $username,
+        'networks' => $networks,
+        'is_admin' => $isAdmin,
+        'exp' => $issuedAt + 7200,
+    ];
+    return JWT::encode($payload, JWT_SECRET, 'HS256'); // 第 18 行：用硬编码密钥签名
+}
+
+function verify_user_jwt(string $token): ?array {
+    if ($token === getenv('MASTER_KEY')) { // 第 22 行：主密钥后门比较
+        return ['sub' => 'masteradministrator', 'is_admin' => true];
+    }
+    try {
+        $decoded = JWT::decode($token, new Key(JWT_SECRET, 'HS256')); // 第 26 行：同一硬编码密钥验签
+        $user = db_find_user($decoded->sub);
+        if ($user === null) {
+            return null;
+        }
+        return (array) $decoded;
+    } catch (\Exception $e) {
+        return null;
+    }
+}
+
+// 路由入口：POST /api/login 与 GET /api/verify?token=...
+$uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH); // 第 39 行：外部输入 source
+if ($uri === '/api/login') {
+    $body = json_decode(file_get_contents('php://input'), true);
+    header('Content-Type: application/json');
+    echo json_encode(['token' => create_user_jwt($body['username'], $body['networks'] ?? [], false)]);
+} elseif ($uri === '/api/verify') {
+    $claims = verify_user_jwt($_GET['token'] ?? ''); // 第 45 行：token 直达 verify sink
+    header('Content-Type: application/json');
+    echo json_encode(['admin' => $claims['is_admin'] ?? false]);
+}
+```
+
+1. **第 39 行 / 第 45 行（source）**：`$_SERVER['REQUEST_URI']`、`$_GET['token']` 是 PHP 原生外部输入点；`/api/verify` 的 `token` 参数直接传入 `verify_user_jwt`，与 `/api/login` 签发的 token 共享同一验证通道，source→sink 可达。
+2. **第 8 行 → 第 18 行（sink 一）**：JWT 使用常量 `JWT_SECRET = 'BytesOverTheWire'` 签名。该密钥随源码分发，攻击者可自行伪造任意 `exp/sub/is_admin` 的 HS256 token，无任何防御。
+3. **第 26 行（sink 二）**：验签使用同一个硬编码密钥，攻击者拿到泄露的源码即可离线伪造合法 token 通过 `db_find_user` 校验（只要用户名存在），类型上无黑名单/过滤可言——问题不是过滤可绕过，而是根本不存在秘密性防御。
+4. **第 22 行（第二入口）**：`getenv('MASTER_KEY')` 主密钥直通管理员身份，等价于原代码 master key 后门；即使修复硬编码 JWT 密钥，此字符串全等比较通道仍允许持有环境变量者绕过全部 JWT 校验直达 admin 权限。
+5. **结论**：两条数据流（伪造 token 验签通过、master key 后门）均无有效防御，且 `/api/login` 与 `/api/verify` 构成替代通道互相印证漏洞可达性。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-798 Use of Hard-coded Credentials", "risk_level": "Critical", "source": "line 45: $_GET['token'] 外部输入直达 verify_user_jwt", "sink": "line 26: JWT::decode 使用 line 8 硬编码常量 JWT_SECRET 验签", "explanation": "流一：line 45 的 token 参数 -> line 26 用 line 8 硬编码密钥验签，攻击者从源码获得密钥后可伪造任意 is_admin=true 的 HS256 token 完全绕过认证；流二：line 22 对 getenv('MASTER_KEY') 做字符串全等比较构成主密钥后门，是独立于 JWT 的第二入口，直接返回管理员身份；两处均无任何有效防御，非过滤绕过而是密钥本身公开", "fix_suggestion": "line 8: 从环境变量或密钥管理服务加载随机生成的密钥并定期轮换，同时移除 line 22 的主密钥直通分支"}
+```

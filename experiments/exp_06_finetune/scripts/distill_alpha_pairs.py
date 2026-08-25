@@ -43,7 +43,7 @@ SCHEMA_SAFE = ('{"has_vulnerability": false, "vulnerability_type": "none", '
                '"explanation": "...", "fix_suggestion": "no fix needed"}')
 
 
-def call_teacher(key: str, user_prompt: str, max_tokens: int = 6000,
+def call_teacher(key: str, user_prompt: str, max_tokens: int = 8000,
                  temperature: float = 0.4, retries: int = 5) -> str:
     import requests
     payload = {
@@ -75,9 +75,13 @@ def call_teacher(key: str, user_prompt: str, max_tokens: int = 6000,
                 raise ValueError(f"non-json body: {resp.text[:120]!r}")
             msg = data["choices"][0]["message"]
             content = msg.get("content")
-            if not content and msg.get("reasoning"):
-                # 推理模型偶发只回 reasoning：重试
-                raise ValueError("empty content (reasoning only)")
+            if not content and (msg.get("reasoning") or msg.get("reasoning_content")):
+                # 推理模型偶发只回 reasoning（2026-08-25 长清单 prompt 实测）：
+                # 正文为空时从 reasoning 兜底提取——结论 JSON 通常在思维链尾部
+                rc = msg.get("reasoning") or msg.get("reasoning_content") or ""
+                if re.search(r"```json|has_vulnerability", rc):
+                    return rc
+                raise ValueError("empty content (reasoning only, no json)")
             return content or ""
         except Exception as e:
             wait = 20 * (attempt + 1)

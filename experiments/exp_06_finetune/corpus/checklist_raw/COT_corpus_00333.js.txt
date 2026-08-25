@@ -1,0 +1,22 @@
+## 漏洞分析
+
+**步骤 1：枚举用户可控输入点**
+- `options.algorithm`（第 88 行进入 `header.alg`）：调用方可控；
+- `secretOrPrivateKey`（第 99、103 行）：调用方可控，可为 falsy 值；
+- `payload` 与其他 options：经 schema 校验。
+
+**步骤 2：追踪 source→sink 数据流与防御有效性**
+- 第 7 行 `SUPPORTED_ALGS` 白名单中包含 `'none'`；第 16 行的 `algorithm` 校验器使用 `includes.bind(null, SUPPORTED_ALGS)`，即白名单精确允许集——但该允许集本身把 `'none'` 列为合法算法，属于“白名单内容错误”，防御无效。
+- 第 99 行 `if (!secretOrPrivateKey && options.algorithm !== 'none')`：当 `algorithm === 'none'` 时明确放行空密钥。
+- 第 115–127 行的算法分支检查：第 117 行正则 `/^(?:RS|PS|ES)/` 不匹配 `'none'`，HS 分支也不匹配，因此 `'none'` 算法完全绕过密钥类型与强度检查。
+- 最终到达 sink：第 213 行 `jws.createSign({header, privateKey, ...})` 或第 227 行 `jws.sign({header, ...})`，以 `alg: 'none'` 生成无签名 JWT。整条流上没有任何防御能阻止 `'none'` 被选中并签名。
+
+**步骤 3：第二入口检查**
+存在两条并行路径：回调式（第 210–225 行 `jws.createSign`）与同步式（第 226–233 行 `jws.sign`），二者均接受同一 `header.alg='none'`，均无额外校验；两条通道都可达。
+
+**步骤 4：结论**
+攻击者可调用本函数以 `alg:'none'` 且空密钥签发“无签名”令牌；若下游验证端（如背景所述 <=8.5.1 的 `jwt.verify()` 在未显式指定算法时默认信任 token 头）接受该令牌，即构成签名验证绕过。属算法选择不当（CWE-327），风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-327 Use of a Broken or Risky Cryptographic Algorithm", "risk_level": "High", "source": "line 88: options.algorithm 进入 header.alg（调用方可控）", "sink": "line 227: jws.sign 以 alg=none 无签名生成令牌（line 213: jws.createSign 同样可达）", "explanation": "options.algorithm -> 第 7 行白名单含 'none' -> 第 99 行对 algorithm==='none' 放行空密钥 -> 第 117 行正则不匹配 'none' 绕过密钥类型/强度检查 -> 第 227 行 jws.sign 以 alg=none 输出无签名 JWT -> 下游 verify 未固定算法时可被伪造令牌绕过签名验证", "fix_suggestion": "line 7: 从 SUPPORTED_ALGS 中移除 'none'，禁止无签名算法"}
+```

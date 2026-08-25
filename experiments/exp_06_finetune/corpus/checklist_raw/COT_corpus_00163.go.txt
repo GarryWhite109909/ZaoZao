@@ -1,0 +1,19 @@
+**分析**
+
+1. **用户可控输入点枚举**：
+   - 第 231 行：`ctx.PathParam("uuid")` → 传入 `ServeAttachment`（第 135 行），作为 `uuid` 查询附件（第 136 行 `GetAttachmentByUUID`）。
+   - 第 83 行：`ctx.FormString("file")` → 删除接口，但第 95 行校验 `attach.RepoID == ctx.Repo.Repository.ID`，且第 100-122 行有上传者/写权限/管理员多分支授权，删除流被完整覆盖。
+   - 上传接口（第 53、61-65 行）：文件名仅作存储元数据，不进入命令/SQL sink，安全。
+
+2. **source→sink 数据流验证（核心漏洞流）**：
+   - 路径：第 231 行 `PathParam("uuid")` → 第 136 行按 UUID 取附件 → 第 153 行 `GetAttachmentLinkedTypeAndRepoID` 得到 `unitType=TypeReleases` → 第 187 行仅检查 `perm.CanRead(unitType)`。
+   - 该检查只验证用户对 Releases 单元有**读权限**，未校验附件所属 Release 是否为 **draft（草稿）**。背景说明：草稿 Release 的访问控制只在 API 层路由强制，web 层的 `ServeAttachment` 缺失该检查——拥有仓库读权限的用户可通过直接猜测/获取 UUID 访问草稿 Release 的附件内容（第 221 行 `Open` → 第 226 行回传文件内容）。第 148 行的 legacy 截断检查只防跨仓库直链，不覆盖草稿状态；第 192-196 行 token scope 检查也不涉及草稿。
+   - 防御缺口：无任何针对 `attach.ReleaseID` 对应 Release 的 `IsDraft` / 写权限校验，防御不完整。
+
+3. **第二入口检查**：`GetAttachment`（第 230-232 行）是唯一 web 入口，与 API 层 `/assets` 子路由共享同一附件存储；API 层有草稿校验而 web 层没有，构成绕过通道本身，而非额外受影响入口。删除/上传入口均有有效授权，不受影响。
+
+4. **结论**：存在 CWE-639 授权绕过——通过 UUID 直接访问本应受限（草稿 Release）的附件资源，风险等级 High（需知道或枚举 UUID，UUID 为随机值降低可利用性，故非 Critical）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key", "risk_level": "High", "source": "line 231: ctx.PathParam(\"uuid\")", "sink": "line 187: perm.CanRead(unitType) 后于 line 221 storage.Attachments.Open 返回附件内容", "explanation": "用户可控 uuid -> line 136 GetAttachmentByUUID 取得附件 -> line 153 得到 unitType=TypeReleases -> line 187 仅检查 CanRead(Releases)，未校验附件所属 Release 是否为草稿 -> 拥有读权限者可经 line 221 Open 与 line 226 回传读取草稿 Release 附件；web 层缺失 API 层已有的草稿访问控制", "fix_suggestion": "line 187 前增加：当 unitType 为 TypeReleases 时查询 attach.ReleaseID 对应 Release 并在 IsDraft 且无 CanWrite(TypeReleases) 时返回 404"}
+```

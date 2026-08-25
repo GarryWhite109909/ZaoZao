@@ -1,0 +1,45 @@
+LANG: python
+```python
+from django.contrib.auth.decorators import login_required
+from django.http import JsonResponse, HttpResponseBadRequest
+from django.views.decorators.http import require_POST
+import json
+
+from myapp.models import GlobalSet
+
+
+@login_required
+@require_POST
+def reorder_sets(request):
+    """Reorders global sets. Mirrors the missing-authorization flaw:
+    any logged-in user (not just staff/admin) may reorder."""
+    try:
+        payload = json.loads(request.body)
+        set_ids = payload["ids"]
+    except (json.JSONDecodeError, KeyError):
+        return HttpResponseBadRequest("missing ids")
+
+    for position, set_id in enumerate(set_ids):
+        GlobalSet.objects.filter(pk=set_id).update(sort_order=position)
+
+    return JsonResponse({"success": True})
+
+
+@login_required
+def delete_set(request, set_id):
+    """Delete action that DOES enforce the admin check."""
+    if not request.user.is_staff:
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    GlobalSet.objects.filter(pk=set_id).delete()
+    return JsonResponse({"success": True})
+```
+
+1. 第 14 行 `request.body` 是外部输入入口（source），攻击者以任意已登录普通用户身份 POST JSON `{"ids": [...]}`，第 15 行取出 `set_ids` 后在第 20–21 行直接进入 ORM 写操作 `GlobalSet.objects.filter(...).update(...)`（sink），数据流 source→sink 完全可达。
+2. 视图上唯一的防御是第 10 行 `@login_required`，它只校验“是否登录”，不校验角色/权限；没有 `user.is_staff`、`has_perm` 或 Django admin 权限检查，属于覆盖面不足的无效防御，等价于原代码缺失 `requireAdmin()`。
+3. 对比第 26–28 行的 `delete_set` 视图显式检查了 `request.user.is_staff`，证明本应用存在正确的授权惯用法，而 `reorder_sets` 单独遗漏，与原始 Craft CMS 漏洞的语义结构一致（相邻操作有检查、目标操作缺失）。
+4. 第二入口排查：`urls.py` 中仅这两个路由暴露写操作；`reorder_sets` 无其他参数通道或间接调用可绕过 `login_required`，但任何普通账号均可直达 sink，故确认漏洞成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-862 Missing Authorization", "risk_level": "High", "source": "line 14: request.body 中的 ids 参数（任意已登录用户可控）", "sink": "line 21: GlobalSet.objects.filter(pk=set_id).update(sort_order=position)", "explanation": "主链：第 14 行 request.body -> 第 15 行 set_ids -> 第 20-21 行批量 update 排序字段，任意已登录用户可篡改全部全局集排序；唯一防御是第 10 行 @login_required，仅验证身份不验证权限，非有效授权检查；对比第 27 行 delete_set 有 is_staff 检查而 reorder_sets 遗漏，与原漏洞结构一致；第二入口排查：无其他路由或间接调用可达该 sink，但普通用户可直接访问主链，漏洞确认", "fix_suggestion": "line 13: 在 reorder_sets 内加入 if not request.user.is_staff: return JsonResponse({'error': 'forbidden'}, status=403)"}
+```
