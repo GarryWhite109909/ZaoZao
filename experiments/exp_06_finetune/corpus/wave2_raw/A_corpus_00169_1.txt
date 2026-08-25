@@ -1,0 +1,59 @@
+LANG: node.js/javascript
+```code
+// routes/playlists.js
+const express = require('express');
+const router = express.Router();
+const fs = require('fs');
+const path = require('path');
+
+// 模拟数据库: { id: { owner, dir } }
+const playlists = {
+  'pl-1': { owner: 'alice', dir: '/data/media/alice/pl-1' },
+  'pl-2': { owner: 'bob',   dir: '/data/media/bob/pl-2' },
+};
+
+const sessions = { tokenA: 'alice', tokenB: 'bob' };
+
+function getUser(req) {
+  return sessions[req.headers['x-auth-token']];
+}
+
+// 检查路径是否在用户目录前缀内 —— 与原 HasPrefix 等价
+function hasPathPrefix(p, prefix) {
+  return p === prefix || p.startsWith(path.normalize(prefix) + path.sep);
+}
+
+// GET /playlists/:id/tracks?file=xxx
+router.get('/playlists/:id/tracks', (req, res) => {
+  const user = getUser(req);
+  const pl = playlists[req.params.id];
+  if (!user || !pl) return res.status(404).json({ error: 'not found' });
+
+  // 仅做字符串前缀校验，未比对 pl.owner 是否等于 user（CWE-639）
+  const base = pl.dir;
+  const requested = req.query.file || '';
+  const target = path.join(base, requested);
+
+  if (!hasPathPrefix(target, base)) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  // sink：以任意已认证用户身份读取他人播放列表文件
+  fs.readFile(target, 'utf8', (err, data) => {
+    if (err) return res.status(500).json({ error: 'read failed' });
+    res.type('text/plain').send(data);
+  });
+});
+
+module.exports = router;
+```
+
+1. 第 24 行 `req.params.id` 与第 26 行 `req.headers['x-auth-token']` 是外部输入入口；第 27 行 `req.query.file` 也是外部输入。三者均可到达第 38 行的 `fs.readFile`，可达性成立。
+2. 第 31–33 行的前缀校验只验证路径落在 `pl.dir` 下，属于黑名单/字符串匹配式防御，可被 `../` 编码或符号链接绕过；更关键的是全程未比较 `pl.owner` 与当前 `user`（第 28 行后直接进入路径拼接），授权检查完全缺失——任何持有合法 token 的用户传 `id=pl-2` 即可读 bob 的文件。
+3. 数据流一：`req.query.file` → 第 30 行 `path.join(base, requested)` → 第 32 行弱校验 → 第 38 行 `fs.readFile`，无有效防御；数据流二：`req.params.id` → 第 25 行查表取得他人资源对象 → 同一 sink，同样无属主校验。
+4. 第二入口确认：本文件仅此一条路由，无其他 handler 或中间件执行属主校验；但同一 sink 可通过两条参数通道（query.file 与 params.id）触达，且 `path.join` 对 `..` 的规范化发生在校验之前语义上仍可构造越界（如绝对路径 `path.join('/a','/etc/passwd')` 返回 `/etc/passwd`，被前缀校验拦截，故主要风险是水平越权而非穿越）。
+5. 结论：存在 CWE-639 授权缺失漏洞，风险为 High（跨用户读取私有播放列表内容）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key", "risk_level": "High", "source": "line 24: req.params.id 与 line 27: req.query.file 外部输入", "sink": "line 38: fs.readFile(target)", "explanation": "流一: req.params.id -> line 25 查 playlists 表取得他人资源 -> 未比对 pl.owner 与当前 user -> line 38 读文件; 流二: req.query.file -> line 30 path.join 拼接 -> line 31-33 仅字符串前缀校验(可绕过, 非有效防御) -> line 38 读文件; 第二入口核查: 文件内无其他路由或中间件做属主校验, 但同一 sink 存在 id 与 file 两条参数通道, 均无授权防护", "fix_suggestion": "line 28 后增加 if (pl.owner !== user) return res.status(403)... 并在 line 31 用 fs.realpath 解析后重新校验前缀"}
+```

@@ -1,0 +1,32 @@
+LANG: python
+```python
+from fastapi import FastAPI, Request
+import redis
+import pickle
+
+app = FastAPI()
+rds = redis.Redis(host="localhost", port=6379, db=0)
+
+@app.get("/cache/{key}")
+async def get_cached_aggregate(key: str):
+    raw = rds.get(key)
+    if raw is None:
+        return {"error": "not found"}
+    obj = pickle.loads(raw)
+    return {"result": str(obj)}
+
+@app.post("/cache/{key}")
+async def put_cached_aggregate(key: str, request: Request):
+    body = await request.body()
+    rds.set(key, body)
+    return {"status": "stored"}
+```
+
+1. 第 10 行 `@app.get("/cache/{key}")` 是外部输入入口（source）：URL 路径参数 key 完全由客户端控制，直接传入第 11 行 `rds.get(key)` 读取远程缓存内容。
+2. 第 14 行 `pickle.loads(raw)` 是 sink：对从 Redis 取回的字节流做无条件反序列化，等价于原漏洞中 `ObjectInputStream.readObject` 未套用 ObjectInputFilter 的语义——反序列化前没有任何类型白名单或校验。
+3. 防御验证：整条链路（第 10→11→12→14 行）不存在任何过滤、签名校验、类型限制；`if raw is None` 仅判空，不构成防御。攻击者只要能写入 Redis（如通过第 17-20 行的 POST 路由，body 原样落库），即可注入恶意 pickle payload 实现 RCE。
+4. 第二入口确认：第 17 行 POST `/cache/{key}` 接受任意请求体并原样存入同一缓存键空间，构成完整的“投毒→触发”双通道；此外任何其他能写该 Redis db 的组件也是替代通道。因此结论为存在 CWE-502 反序列化不可信数据漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data", "risk_level": "Critical", "source": "line 10: GET /cache/{key} 路径参数 key 由外部控制并用于读取缓存", "sink": "line 14: pickle.loads(raw) 对缓存字节流无限制反序列化", "explanation": "主链: line 10 外部可控 key -> line 11 rds.get -> line 14 pickle.loads, 全程无类型白名单/签名/过滤; line 17 POST /cache/{key} 将任意请求体原样写入同一缓存, 构成第二入口使攻击者可自投毒再触发; 判空检查不构成有效防御, 黑名单/替换类方案同样可绕过", "fix_suggestion": "line 14: 改用 hmac 签名校验 + pickle.loads(raw, RestrictedUnpickler) 限制可加载类型, 或改用 JSON 等安全序列化格式"}
+```

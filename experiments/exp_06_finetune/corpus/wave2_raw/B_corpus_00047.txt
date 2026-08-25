@@ -1,120 +1,120 @@
 LANG: go
 ```code
-# === file: router/config.go ===
+# === file: router/handler.go ===
 package router
 
 import (
-	"context"
 	"net/http"
-
-	"github.com/traefik/traefik/v3/pkg/config/dynamic"
-	"github.com/traefik/traefik/v3/pkg/middlewares/rewritetarget"
+	"strings"
 )
 
-// LoadRewriteHandler builds the rewrite-target handler from dynamic config.
-// The replacement template may contain capture group references like $1.
-func LoadRewriteHandler(ctx context.Context, next http.Handler, cfg dynamic.RewriteTarget, name string) (http.Handler, error) {
-	return rewritetarget.New(ctx, next, cfg, name)
+// handler.go: 提取请求路径并写入上下文，作为污点 source。
+type ctxKey string
+
+const PathKey ctxKey = "rawPath"
+
+func ExtractPathHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		p := req.URL.RawPath
+		if p == "" {
+			p = req.URL.EscapedPath()
+		}
+		// 仅做 trim，未做任何路径规范化或白名单校验
+		req = req.WithContext(req.Context().With(ctxKey(PathKey), strings.TrimSpace(p)))
+		next.ServeHTTP(rw, req)
+	})
+}
+```
+# === file: rewrite/rewrite.go ===
+```go
+package rewrite
+
+import (
+	"context"
+	"errors"
+	"regexp"
+	"strings"
+
+	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+)
+
+// rewrite.go: 纯传递/不完整净化层。对路径做正则替换，
+// 但 replacement 来自配置，替换结果未做前缀/穿越校验。
+var replacementRegex = regexp.MustCompile(`\$[0-9]+`)
+
+type Rewriter struct {
+	regexp      *regexp.Regexp
+	replacement string
 }
 
-# === file: router/middleware.go ===
-package router
+func New(_ context.Context, config dynamic.RewriteTarget) (*Rewriter, error) {
+	if config.Replacement == "" {
+		return nil, errors.New("replacement cannot be empty")
+	}
+	var re *regexp.Regexp
+	if config.Regex != "" {
+		var err error
+		re, err = regexp.Compile("(?i)" + strings.TrimSpace(config.Regex))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &Rewriter{regexp: re, replacement: strings.TrimSpace(config.Replacement)}, nil
+}
+
+// Rewrite 仅做字符串替换；当 regexp 为空时直接透传 replacement 去掉捕获组引用。
+// 不检查结果是否包含 ../ 或绝对 URL，净化不完整。
+func (rw *Rewriter) Rewrite(currentPath string) string {
+	if rw.regexp != nil {
+		return rw.regexp.ReplaceAllString(currentPath, rw.replacement)
+	}
+	return replacementRegex.ReplaceAllString(rw.replacement, "")
+}
+```
+# === file: rewrite/sink.go ===
+```go
+package rewrite
 
 import (
 	"net/http"
 	"net/url"
-	"regexp"
-	"strings"
-
-	"github.com/traefik/traefik/v3/pkg/middlewares"
 )
 
-var replacementRegex = regexp.MustCompile(`\$[0-9]+`)
-
-type rewriteTarget struct {
-	name                string
-	next                http.Handler
-	regexp              *regexp.Regexp
-	replacement         string
-	absoluteURLRedirect bool
+// sink.go: 污点汇聚点。将重写后的目标直接用于 302 重定向与内部转发，
+// 未校验 scheme/host/path，可被注入绝对 URL 或路径穿越序列。
+type Redirector struct {
+	Rewriter *Rewriter
+	Next     http.Handler
 }
 
-func newInternal(next http.Handler, re *regexp.Regexp, replacement string) *rewriteTarget {
-	parsed, _ := url.Parse(replacement)
-	return &rewriteTarget{
-		name:                "rewrite",
-		next:                next,
-		regexp:              re,
-		replacement:         strings.TrimSpace(replacement),
-		absoluteURLRedirect: parsed != nil && parsed.Scheme != "",
-	}
-}
-
-func (rt *rewriteTarget) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	logger := middlewares.GetLogger(req.Context(), rt.name, "RewriteTarget")
-
-	currentPath := req.URL.RawPath // source: attacker-controlled request path
-	if currentPath == "" {
-		currentPath = req.URL.EscapedPath()
-	}
-	if rt.regexp != nil && !rt.regexp.MatchString(currentPath) {
-		rt.next.ServeHTTP(rw, req)
-		return
-	}
-
-	var newTarget string
-	if rt.regexp != nil {
-		newTarget = rt.regexp.ReplaceAllString(currentPath, rt.replacement)
-	} else {
-		newTarget = replacementRegex.ReplaceAllString(rt.replacement, "")
-	}
+func (rd *Redirector) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	currentPath, _ := req.Context().Value("rawPath").(string)
+	newTarget := rd.Rewriter.Rewrite(currentPath)
 	if newTarget == "" {
 		http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
-
-	if rt.absoluteURLRedirect {
-		newTargetURL, err := url.Parse(newTarget)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if newTargetURL.RawQuery == "" && req.URL.RawQuery != "" {
-			newTargetURL.RawQuery = req.URL.RawQuery
-		}
-		http.Redirect(rw, req, newTargetURL.String(), http.StatusFound) // sink: open redirect via tainted path
-		return
-	}
-
-	req.URL.RawPath = newTarget
-	var err error
-	req.URL.Path, err = url.PathUnescape(req.URL.RawPath)
+	targetURL, err := url.Parse(newTarget)
 	if err != nil {
-		logger.Error().Msgf("Unable to unescape URL RawPath %q: %v", req.URL.RawPath, err)
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
-	req.RequestURI = req.URL.RequestURI()
-	rt.next.ServeHTTP(rw, req)
+	if targetURL.RawQuery == "" && req.URL.RawQuery != "" {
+		targetURL.RawQuery = req.URL.RawQuery
+	}
+	// sink 1: 用户可控路径拼接进 Location 头（开放重定向 / 路径注入）
+	http.Redirect(rw, req, targetURL.String(), http.StatusFound)
+	// sink 2: 未净化的 newTarget 直接写回 RawPath 供下游转发
+	req.URL.RawPath = newTarget
+	rd.Next.ServeHTTP(rw, req)
 }
 ```
 
-分析：
-1. L1（config.go）第 12-14 行：`LoadRewriteHandler` 将动态配置中的 `cfg.Replacement`（含 `$1` 等捕获组引用）原样传入 `rewritetarget.New`，无任何过滤。
-2. L2（middleware.go）第 33-37 行：`currentPath := req.URL.RawPath` 直接取自用户请求，是污点 source；仅做了空值回退，未做路径规范化或白名单校验。
-3. 第 44-48 行：`regexp.ReplaceAllString(currentPath, rt.replacement)` 把攻击者控制的路径拼入重写结果 `newTarget`，看似正则替换是净化，但替换模板本身含 `$1` 捕获组引用，攻击者路径内容被完整注入，净化不完整。
-4. 第 55-63 行：当模板为绝对 URL 时，`newTargetURL.String()` 被直接传给 `http.Redirect`（sink），携带用户可控的捕获组内容与查询串，构成 CWE-22 路径操纵/开放重定向。
-5. 调用链 config.go → middleware.go 上没有任何对最终重定向目标的 scheme/host 白名单校验，防御不完整。
+1. 外部输入点枚举：唯一入口是 `router/handler.go` L18-19 的 `req.URL.RawPath` / `EscapedPath()`（HTTP 请求路径，攻击者完全可控），经 context key `rawPath` 传给 `rewrite/sink.go` L17 的 `ServeHTTP`，可达性成立；配置项 `config.Replacement` 为运维侧输入，非本次污点主链。
+2. 数据流验证：流1 `handler.go:L19 → sink.go:L17 → sink.go:L18(Rewrite) → sink.go:L30 http.Redirect`——中间层 `rewrite.go:L31-36` 的正则替换只是模板展开，`replacementRegex` 仅删除 `$n` 引用，既不拦截 `../`、`%2e%2e%2f`，也不限制 scheme/host，属可绕过的字符串级过滤，非有效防御；流2 同一 `newTarget` 在 `sink.go:L36` 写回 `req.URL.RawPath` 造成内部转发路径穿越，同样无防御。
+3. 第二入口：`sink.go:L36-37` 将污点值继续传给 `rd.Next.ServeHTTP`，构成替代通道（下游代理按 RawPath 转发）；此外无其他路由读取该 context key，但两条 sink 共享同一未净化变量，均可达。
+4. 结论：source 与 sink 分离于不同文件，调用链上无任何完整路径规范化、scheme 白名单或前缀校验，CWE-22 路径操纵成立。
 
 ```json
-{
-  "has_vulnerability": true,
-  "vulnerability_type": "CWE-22",
-  "source": "L2:line 33: req.URL.RawPath 攻击者可控的请求路径",
-  "sink": "L2:line 62: http.Redirect(rw, req, newTargetURL.String(), http.StatusFound)",
-  "taint_flow": "L1:line 13 LoadRewriteHandler 传递 Replacement -> L2:line 45 ReplaceAllString 注入捕获组 -> L2:line 57 newTargetURL.RawQuery 合并请求查询串 -> L2:line 62 Redirect",
-  "sanitizer": "L2:line 55-60 仅在解析失败时报错，未校验目标 host/scheme，净化不完整",
-  "files": ["router/config.go", "router/middleware.go"],
-  "cwe_id": "CWE-22"
-}
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径遍历/URL 重写注入", "risk_level": "High", "source": "L1:line 19: handler.go 中 req.URL.EscapedPath 提取的攻击者可控请求路径", "sink": "L3:line 30: sink.go 中 http.Redirect 使用未净化 newTarget 构造 Location", "explanation": "流1: handler.go L19 提取 RawPath 经 context 传入 sink.go L17-L18, 由 rewrite.go L31-L36 正则替换生成 newTarget, 该替换仅做 $n 引用删除且不校验 ../ 或绝对 URL, 属可绕过过滤; 最终在 sink.go L30 进入 http.Redirect 形成开放重定向/路径注入; 流2: 同一 newTarget 在 sink.go L36 写回 req.URL.RawPath 并经 L37 Next 转发, 构成第二入口替代通道, 下游按污染路径路由导致内部路径穿越; 全链无 scheme 白名单、无前缀校验、无路径规范化", "fix_suggestion": "line 30: 在 http.Redirect 前校验 targetURL 的 Scheme 与 Host 必须匹配配置的允许域, 且对相对路径做 path.Clean 后拒绝包含 .. 段的结果"}
 ```

@@ -1,0 +1,24 @@
+分析：
+
+1. **用户可控输入点枚举**：`resolve_url` 的 `$url` 参数（line 55）来自 HTML 中 `<img src>` 等属性，最终由 dompdf 渲染时解析，属于用户可控输入。该值经 `Helpers::build_url`（line 61）、`Helpers::explode_url`（line 67）处理后继续流转。
+
+2. **数据流追踪与防御验证**：
+   - 流 A：`$url -> $full_url -> file:// 协议分支（line 82）-> $resolved_url 直接作为本地路径返回`。协议白名单（line 74-76）允许配置中注册的协议，但 `file://` 分支直接返回 URL 作为文件路径，未做路径规范化/目录限制，可读取任意本地文件。
+   - 流 B：`$url -> data: URI 分支（line 96-99）-> parse_data_uri 取出内容 -> file_put_contents 写入临时文件（line 111）`。随后 line 117-120 用 `dompdf_getimagesize` 检测类型并白名单校验（gif/png/jpeg/bmp/svg/webp）。关键点：当类型为 **svg** 时，内容被放行并交给 SVG 解析器渲染；dompdf 的 SVG 解析基于 XML，历史上未禁用外部实体加载（libxml 未设置 `LIBXML_NOENT` 屏蔽或实体加载限制），攻击者可在 `<img src="data:image/svg+xml,...">` 中嵌入包含外部实体的 SVG。
+   - 防御评估：协议白名单仅约束传输协议，不校验 SVG 内容中的 DTD/ENTITY 声明；图片类型白名单反而**明确允许 svg**，因此对 XXE 无任何有效防御。
+
+3. **第二入口/替代通道**：除 data URI 外，远程 URL 下载的 SVG 文件同样进入同一类型白名单通道（line 96-100 的 `getFileContent` 分支），构成替代注入通道；两条流最终都汇入同一 sink——SVG 内容被下游 XML/SVG 解析器解析。
+
+4. **结论**：存在 CWE-611 XXE。攻击者通过可控的 SVG 图片内容声明外部实体，XML 解析器加载外部实体导致 SSRF（读取内网资源、file:// 读本地文件）及潜在反序列化攻击（结合 PHP phar 等 wrapper）。风险等级 High。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)",
+  "risk_level": "High",
+  "source": "line 55: resolve_url($url, ...) 参数，来自 HTML img 标签等用户可控的图片 URL/data URI",
+  "sink": "line 119: 类型白名单放行 svg 后，SVG 内容交由下游 XML/SVG 解析器解析",
+  "explanation": "$url -> build_url/explode_url -> 协议白名单仅校验传输协议不校验内容 -> data URI 或远程下载的 SVG 经 file_put_contents 写入临时文件 -> dompdf_getimagesize 白名单明确允许 svg -> 含外部实体声明的 SVG 进入 XML 解析器且未禁用实体加载 -> XXE 导致 SSRF 与反序列化攻击",
+  "fix_suggestion": "在解析 SVG/XML 前禁用外部实体加载：对 libxml 使用 LIBXML_NONET|LIBXML_NOENT 并调用 libxml_disable_entity_loader(true)（PHP<8.0），或在 dompdf_getimagesize 放行前剥离 SVG 中的 DOCTYPE/ENTITY 声明"
+}
+```

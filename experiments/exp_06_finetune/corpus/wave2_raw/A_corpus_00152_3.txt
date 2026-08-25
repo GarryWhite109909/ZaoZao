@@ -1,0 +1,53 @@
+LANG: node.js/javascript
+```code
+// middleware.ts —— Next.js 中间件：路由白名单 + 鉴权 + XML 文本抽取（模拟 partition_xml）
+import { NextRequest, NextResponse } from 'next/server';
+import { parseXmlString } from 'libxmljs';
+
+const ROUTE_WHITELIST = new Set(['/api/xml/partition']);
+const TOKEN_WHITELIST = new Set(['svc-internal-2024']);
+
+async function extractLeafTexts(xmlBody: string): Promise<string[]> {
+  // 直接使用 libxmljs 默认解析器：未禁用外部实体（noent 未关闭、未设置非 DTD 模式）
+  const doc = parseXmlString(xmlBody);
+  const nodes = doc.find('//*[text()]');
+  return nodes.map((n) => n.text().trim()).filter(Boolean);
+}
+
+export async function middleware(req: NextRequest) {
+  const pathname = req.nextUrl.pathname;
+
+  if (!ROUTE_WHITELIST.has(pathname)) {
+    return NextResponse.json({ error: 'not found' }, { status: 404 });
+  }
+
+  const token = req.headers.get('x-api-token') ?? '';
+  if (!TOKEN_WHITELIST.has(token)) {
+    return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+  }
+
+  if (req.method !== 'POST') {
+    return NextResponse.json({ error: 'method not allowed' }, { status: 405 });
+  }
+
+  const rawXml = await req.text();
+  const elements = await extractLeafTexts(rawXml);
+
+  return NextResponse.json({ elements });
+}
+
+export const config = {
+  matcher: ['/api/xml/:path*'],
+};
+```
+
+分析：
+1. 第 26 行 `req.nextUrl.pathname` 与第 29 行 `x-api-token` 头是仅有的外部输入点；第 37 行 `await req.text()` 将请求体完整读入，是主数据流的 source。
+2. 第 38 行把原始请求体直接传入 `extractLeafTexts`，第 11 行 `parseXmlString(xmlBody)` 是 sink——libxmljs 默认解析会处理 DOCTYPE 与外部实体定义，攻击者可在 body 中内嵌 `<!ENTITY xxe SYSTEM 'file:///etc/passwd'>` 并在叶节点文本中引用，实现任意文件读取/SSRF。
+3. 白名单与 token 校验（第 27、31 行）只作用于“是否允许进入处理逻辑”，属于鉴权层防御，对请求体内容不做任何类型或结构校验；source 到 sink 之间没有任何针对 DOCTYPE/ENTITY 的过滤、禁用参数或 schema 校验，防御覆盖面为零。
+4. 第二入口确认：matcher 配置（第 45 行）只匹配 `/api/xml/*`，白名单内唯一路由即 `/api/xml/partition`；不存在其他路由或间接调用绕过路径，但这也意味着该唯一入口就是完整的可达链路，结论不受影响。
+5. 综上：外部输入（POST body）→ 无净化 → 危险 XML 解析，与原代码中 lxml `iterparse` 接收用户文件并默认展开实体的漏洞语义结构完全等价。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)", "risk_level": "High", "source": "line 37: await req.text() 读取的 POST 请求体", "sink": "line 11: parseXmlString(xmlBody) 使用 libxmljs 默认配置解析 XML", "explanation": "数据流一：line 37 req.text() 获取用户可控 XML -> line 38 原样传入 extractLeafTexts -> line 11 parseXmlString 默认解析器处理 DOCTYPE 与外部实体 -> 实体在 line 13 n.text() 展开进响应，可读取本地文件或发起 SSRF；防御分析：line 27 路由白名单与 line 31 token 校验仅为访问控制，不校验请求体内容，source 到 sink 之间无任何实体/DTD 过滤或安全解析选项；第二入口：matcher 仅暴露 /api/xml/* 且白名单唯一路由即本入口，无替代通道，但唯一入口即为完整可达链路", "fix_suggestion": "line 11: 改为 parseXmlString(xmlBody, { noent: false, dtdload: false, dtdattr: false, dtdvalidate: false }) 或改用默认拒绝 DTD 的 sax/fast-xml-parser 等解析器"}
+```

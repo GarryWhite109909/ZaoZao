@@ -1,6 +1,6 @@
 LANG: php
 ```code
-# === file: app/Controller/StoreController.php ===
+# === file: app/Controller/AppStoreController.php ===
 <?php
 declare(strict_types=1);
 
@@ -9,26 +9,29 @@ namespace Plugin\MineAdmin\AppStore\Controller;
 use App\Http\Common\Result;
 use Hyperf\HttpServer\Annotation\Controller;
 use Hyperf\HttpServer\Annotation\PostMapping;
-use Plugin\MineAdmin\AppStore\Service\DownloadService;
+use Plugin\MineAdmin\AppStore\Service\AppService;
 
 #[Controller(prefix: 'admin/plugin/store')]
-class StoreController
+class AppStoreController
 {
-    public function __construct(private DownloadService $downloadService)
-    {
-    }
+    public function __construct(private AppService $service) {}
 
     #[PostMapping('download')]
     public function download(): Result
     {
-        // 用户输入的包名直接传入服务层，未做任何校验（source）
-        $packageName = $this->request->input('package');
-        $result = $this->downloadService->fetchPackage($packageName);
+        // source: HTTP 请求参数直接进入服务层，无任何校验
+        $params = $this->request->all();
+        $result = $this->service->downloadPackage($params);
         return $this->success(['result' => $result]);
+    }
+
+    private function success(array $data = []): Result
+    {
+        return new Result($data);
     }
 }
 
-# === file: app/Service/DownloadService.php ===
+# === file: app/Service/AppService.php ===
 <?php
 declare(strict_types=1);
 
@@ -36,18 +39,18 @@ namespace Plugin\MineAdmin\AppStore\Service;
 
 use Plugin\MineAdmin\AppStore\Support\PathResolver;
 
-class DownloadService
+class AppService
 {
-    public function __construct(private PathResolver $pathResolver)
-    {
-    }
+    public function __construct(private PathResolver $resolver) {}
 
-    public function fetchPackage(string $packageName): array
+    public function downloadPackage(array $params): array
     {
-        // 仅做了简单 trim，看似净化实则不完整，未过滤 ../ 等路径穿越字符
-        $name = trim($packageName);
-        $localPath = $this->pathResolver->resolve($name);
-        return ['path' => $localPath];
+        $identifier = (string) ($params['identifier'] ?? '');
+        // 看似净化：仅做字符串替换过滤 ../ 与 ..\ —— 黑名单替换可被嵌套绕过（....//）
+        $cleaned = str_replace(['../', '..\'], '', $identifier);
+        // 纯传递：将"净化后"的值交给路径解析器
+        $path = $this->resolver->resolveDownloadPath($cleaned);
+        return ['file' => $path];
     }
 }
 
@@ -59,34 +62,25 @@ namespace Plugin\MineAdmin\AppStore\Support;
 
 class PathResolver
 {
-    private string $baseDir = BASE_PATH . '/runtime/packages';
+    private string $baseDir = BASE_PATH . '/runtime/appstore/';
 
-    public function resolve(string $name): string
+    public function resolveDownloadPath(string $name): string
     {
-        // 直接拼接后用于文件读取，存在路径穿越（sink）
-        $target = $this->baseDir . '/' . $name;
-        if (! is_file($target)) {
-            throw new \RuntimeException('package not found');
+        // sink: 拼接后直接用于文件读取，无 realpath 前缀校验
+        $full = $this->baseDir . $name;
+        if (!is_file($full)) {
+            throw new \RuntimeException('app package not found');
         }
-        return file_get_contents($target);
+        return file_get_contents($full);
     }
 }
 ```
 
-分析步骤：
-1. L1:app/Controller/StoreController.php:22-24 — `download()` 从 `$this->request->input('package')` 获取用户输入并直接传给 `DownloadService::fetchPackage()`，构成污点 source。
-2. L2:app/Service/DownloadService.php:17-19 — `fetchPackage()` 只执行 `trim()`，未过滤 `../`、绝对路径等穿越字符，属于“净化看似发生实则不完整”的中间传递层。
-3. L3:app/Support/PathResolver.php:14-21 — `resolve()` 将传入名称直接拼接到 `baseDir` 后调用 `file_get_contents()` 读取任意路径文件，构成 sink。
-4. 整条调用链 Controller → Service → Resolver 中无任何对 `..`、`/` 或白名单的完整校验，攻击者可通过 `package=../../.env` 读取服务器任意文件。
+1. 外部输入点枚举与可达性：唯一入口为 `AppStoreController.php` L17 的 POST /admin/plugin/store/download，`$this->request->all()` 取得 identifier 参数，经 L19 传入 service；该路由无中间件鉴权且无输入白名单，直达 sink 可达。
+2. 数据流防御验证：主链 L17→L19→AppService.php L15→L18。L18 的 `str_replace(['../','..\'],'')` 是黑名单字符串替换，`....//` 替换后还原为 `../`，可绕过；PathResolver.php L13-L20 无 `realpath()` 前缀比对、无扩展名限制，防御不完整，判定无有效防御。
+3. 第二入口确认：本组文件中无其他路由或间接调用通道（uploadLocalApp/install 未拆入），故结论仅基于单一 download 链，但该链 source 与 sink 分离于不同文件且跨两层传递，构成完整 CWE-22 路径遍历读文件链。
+4. 结论：攻击者提交 identifier=`....//....//etc/passwd` 即可读取任意文件，风险 Critical。
 
 ```json
-{
-  "has_vulnerability": true,
-  "vulnerability_type": "CWE-22",
-  "source": "L1:line 23: request->input('package') 用户可控的包名参数",
-  "sink": "L3:line 16: file_get_contents($target) 拼接用户输入后的文件读取",
-  "propagation_path": "L1:line 24 fetchPackage($packageName) -> L2:line 18 trim($packageName) -> L2:line 19 resolve($name) -> L3:line 15 拼接到 baseDir -> L3:line 20 file_get_contents",
-  "sanitizer_present": false,
-  "notes": "中间层仅做 trim 处理，未过滤路径穿越字符，调用链上无完整防御"
-}
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径遍历", "risk_level": "Critical", "source": "L1:line 17: AppStoreController.download 中 request->all() 的 identifier 参数", "sink": "L3:line 16: PathResolver.resolveDownloadPath 中 file_get_contents 拼接路径读取", "explanation": "流1: Controller L17 request->all() 取 identifier 经 L19 传入 AppService; 流2: AppService L18 仅用 str_replace 黑名单删除 ../ 与 ..\\, 可被 ....// 嵌套绕过, 属无效净化; 流3: AppService L20 将未净化的相对路径传入 PathResolver; sink 处 PathResolver L14 直接 baseDir 拼接并 file_get_contents, 无 realpath 前缀校验; 全链无有效防御; 组内无第二入口或其他替代路由, 单一 download 链即构成完整跨文件污点传播", "fix_suggestion": "line 14: 对拼接结果执行 realpath 并校验其以 realpath(baseDir) 为前缀, 同时对 name 使用白名单正则 ^[a-zA-Z0-9._-]+$ 校验"}
 ```

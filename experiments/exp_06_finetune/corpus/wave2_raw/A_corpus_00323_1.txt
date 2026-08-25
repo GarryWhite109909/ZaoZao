@@ -1,0 +1,59 @@
+LANG: java
+```java
+package com.example.notify;
+
+import org.springframework.web.bind.annotation.*;
+import org.springframework.stereotype.Controller;
+import java.util.*;
+import java.text.MessageFormat;
+
+@Controller
+public class NotifyController {
+
+    // 模板注册表：允许通过 /spec 接口动态注册格式化器（等价于 add_format_spec）
+    private final Map<String, java.util.function.Function<Object, String>> formatSpecs = new HashMap<>();
+
+    @PostMapping("/template/register")
+    public String registerSpec(@RequestParam String name, @RequestParam String expr) {
+        // 注册一个基于 MessageFormat 的自定义格式化函数，expr 为用户可控的格式模式
+        formatSpecs.put(name, value -> new MessageFormat(expr).format(new Object[]{value}));
+        return "registered";
+    }
+
+    // 外部输入入口：用户提交模板字符串与渲染参数
+    @GetMapping("/notify/render")
+    public String render(@RequestParam String template, @RequestParam Map<String, String> params) {
+        StringBuilder out = new StringBuilder();
+        int i = 0;
+        while (true) {
+            int start = template.indexOf('{', i);
+            if (start < 0) { out.append(template.substring(i)); break; }
+            int end = template.indexOf('}', start);
+            if (end < 0) { out.append(template.substring(i)); break; }
+            out.append(template, i, start);
+            String field = template.substring(start + 1, end);
+            Object value = params.get(field);
+            // sink：将用户可控字段名/值直接交给 MessageFormat 渲染，
+            // 未限制可访问的对象图（如 {env.X}、{systemProperties} 类占位符），
+            // 也未对 formatSpecs 中用户注册的 expr 做任何白名单校验
+            if (value != null) {
+                out.append(new MessageFormat(field).format(new Object[]{value}));
+            } else {
+                out.append("{" + field + "}");
+            }
+            i = end + 1;
+        }
+        return out.toString();
+    }
+}
+```
+
+1. 第 24 行 `@GetMapping("/notify/render")` 的 `@RequestParam String template` 与 `Map<String,String> params` 是全部外部输入点；第 17 行 `/template/register` 允许用户注册任意 `MessageFormat` 表达式作为第二入口。两条通道均可达第 38 行的 `new MessageFormat(...).format(...)`。
+2. 第 33-41 行的字段解析循环没有任何黑名单、正则或转义过滤：`field` 直接作为 `MessageFormat` 的 pattern 使用，`params` 的值也未经校验直接进入格式化参数数组；`MessageFormat` 对 `{index}` 之外的元素索引/子格式（如 choice、date 子模式）不做对象访问隔离，配合用户在第 18 行注册的任意 `expr`，攻击者可通过精心构造的占位符探测内部状态并泄露环境信息。
+3. 第 15 行的 `formatSpecs` 注册表本身无鉴权与表达式校验，属于第二个 source→sink 通道：注册的 `expr` 在每次渲染时被原样编译执行。
+4. 不存在其他替代防御路径：代码中没有对 `template` 或 `field` 做字符集限制（如禁止 `{0,` 等子格式语法），也没有使用只接受纯文本的安全拼接 API。
+5. 结论：source（第 24 行请求参数 / 第 17-19 行注册接口）→ sink（第 38 行 `MessageFormat.format`），防御完全缺失，构成 CWE-1336 模板注入导致的信息泄露。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Template Injection via user-controlled format string", "risk_level": "High", "source": "line 24: @RequestParam template 与 params 以及 line 17: /template/register 的 expr 参数", "sink": "line 38: new MessageFormat(field).format(...) 将用户可控内容作为格式化模式执行", "explanation": "主链：line 24 请求参数 -> line 30 解析出 field -> line 38 MessageFormat.format 无任何过滤执行；第二链：line 17-19 用户注册任意 MessageFormat 表达式存入 formatSpecs，渲染时同样进入 line 38 执行；两链均无黑名单/白名单/转义防御，攻击者可构造含子格式的占位符泄露环境变量等敏感信息", "fix_suggestion": "line 38: 用固定安全模式渲染，仅将用户数据作为参数传入（new MessageFormat('{0}').format(value)），并对 line 18 的 expr 注册增加严格白名单校验"}
+```

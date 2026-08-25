@@ -1,12 +1,30 @@
 LANG: go
 ```code
-# === file: middleware/replacepathregex.go ===
-package replacepathregex
+# === file: router/config.go ===
+package router
+
+import (
+	"github.com/traefik/traefik/v2/pkg/config/dynamic"
+)
+
+// LoadRouteConfig 从外部动态配置（HTTP provider / 文件 provider）加载路由规则。
+// config.Regex 与 config.Replacement 均为外部可控输入，未经任何校验直接透传。
+func LoadRouteConfig(raw dynamic.ReplacePathRegex) dynamic.ReplacePathRegex {
+	// 仅做 TrimSpace，属于纯传递，不构成防御
+	return dynamic.ReplacePathRegex{
+		Regex:       raw.Regex,
+		Replacement: raw.Replacement,
+	}
+}
+
+# === file: middlewares/replacepathregex.go ===
+package middlewares
 
 import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -22,7 +40,6 @@ type replacePathRegex struct {
 	name        string
 }
 
-// New creates a new replace path regex middleware.
 func New(ctx context.Context, next http.Handler, config dynamic.ReplacePathRegex, name string) (http.Handler, error) {
 	exp, err := regexp.Compile(strings.TrimSpace(config.Regex))
 	if err != nil {
@@ -43,72 +60,45 @@ func (rp *replacePathRegex) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 	}
 	if rp.regexp != nil && rp.regexp.MatchString(currentPath) {
 		req.URL.RawPath = rp.regexp.ReplaceAllString(currentPath, rp.replacement)
+		var err error
+		req.URL.Path, err = url.PathUnescape(req.URL.RawPath)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		req.RequestURI = req.URL.RequestURI()
 	}
 	rp.next.ServeHTTP(rw, req)
 }
-```
-```code
-# === file: router/pathutil.go ===
-package router
 
-import (
-	"net/http"
-	"net/url"
-)
-
-// NormalizeURL 试图规范化 URL，但只处理 Path 字段，
-// 未校验 RawPath，也未阻止 `..` 段，属于不完整的净化。
-func NormalizeURL(req *http.Request) {
-	p := req.URL.Path
-	for len(p) > 1 && p[len(p)-1] == '/' {
-		p = p[:len(p)-1]
-	}
-	req.URL.Path = p
-	// RawPath 保持原样（可能含 %2e%2e 等编码穿越段）
-	_ = url.PathEscape(p)
-}
-```
-```code
-# === file: handler/file.go ===
-package handler
+# === file: server/files.go ===
+package server
 
 import (
 	"net/http"
 	"os"
 	"path/filepath"
-
-	"github.com/traefik/traefik/v2/pkg/log"
 )
 
-// FileHandler 直接使用请求 URL 的 RawPath 定位文件，
-// 中间件改写后的 RawPath 与未净化的 Path 均可携带 `..`。
-func (h *FileHandler) ServeFile(rw http.ResponseWriter, req *http.Request) {
-	target := filepath.Join(h.RootDir, req.URL.RawPath)
-	data, err := os.ReadFile(target)
-	if err != nil {
-		log.FromContext(req.Context()).Error(err)
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	rw.Write(data)
+// FileHandler 使用被中间件改写后的 req.URL.Path 直接拼接磁盘路径并读取文件。
+func FileHandler(root string) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		target := filepath.Join(root, filepath.Clean("/"+req.URL.Path))
+		data, err := os.ReadFile(target)
+		if err != nil {
+			http.Error(rw, "not found", http.StatusNotFound)
+			return
+		}
+		rw.Write(data)
+	})
 }
 ```
 
-分析：
-1. source：L1:31-33 `ServeHTTP` 从 `req.URL.RawPath` / `EscapedPath()` 取得用户可控的请求路径。
-2. L1:34-36 用正则替换后写回 `req.URL.RawPath`，replacement 来自配置但路径本身仍是攻击者输入；随后调用 `rp.next.ServeHTTP` 传递请求。
-3. L2:9-19 `NormalizeURL` 看似净化，但仅裁剪尾部斜杠并转义 Path，未解码/校验 RawPath 中的 `%2e%2e%2f` 等编码穿越序列，防御不完整。
-4. sink：L3:13 `filepath.Join(h.RootDir, req.URL.RawPath)` 将未净化的 RawPath 拼入文件系统路径，并在 L3:14 被 `os.ReadFile` 使用，构成跨文件目录遍历（CWE-22）。
+1. 外部输入点枚举与可达性：①`router/config.go:14-17` 的 `raw.Regex`/`raw.Replacement` 来自动态配置（HTTP/file provider，攻击者可注入），经 `LoadRouteConfig` 纯透传给 `middlewares.New`；②HTTP 请求路径本身在 `middlewares/replacepathregex.go:33-36` 进入。两条输入最终都汇入 `server/files.go:12` 的 `os.ReadFile`，可达性成立。
+2. 数据流验证：流A：config.go:L16(L17) → replacepathregex.go:L27(L28) 编译为正则/替换串 → L37 `ReplaceAllString(currentPath, rp.replacement)` 将请求路径改写为任意值（如 `%2e%2e%2f%2e%2e%2fetc%2fpasswd`）→ files.go:L12 拼接读取。流B：原始请求路径未经改写时同样直达 sink。防御检查：config.go 仅有 TrimSpace（非防御）；replacepathregex.go 无路径白名单、无 `..` 过滤；files.go 的 `filepath.Clean("/"+path)` 只清理形如 `/../` 的前缀穿越，但中间件已将 RawPath 解码进 URL.Path，且 replacement 可注入 `%252F` 二次编码绕过 Clean 后仍含 `..`——字符串级清洗视为可绕过，不构成有效防御。
+3. 第二入口/替代通道：除主配置流外，未改写路径的普通请求（流B）也进入同一 handler；此外任何注册了该中间件的其他路由均复用同一 sink，替代通道存在。
+4. 结论：source 与 sink 分离于不同文件，调用链上无完整防御，CWE-22 路径遍历成立。
 
 ```json
-{
-  "has_vulnerability": true,
-  "vulnerability_type": "CWE-22",
-  "source": "L1:line 31: req.URL.RawPath 用户可控的请求路径",
-  "sink": "L3:line 14: os.ReadFile(filepath.Join(h.RootDir, req.URL.RawPath))",
-  "propagation": "L1:36 写回 RawPath 后经 next.ServeHTTP 传递 -> L2:NormalizeURL 不完整净化 -> L3:Join 拼接",
-  "defense_status": "中间层 NormalizeURL 仅处理 Path 且未消除编码穿越段，无完整防御",
-  "trigger_condition": "发送包含 %2e%2e%2f 或 ../ 的请求路径且匹配中间件正则"
-}
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径遍历", "risk_level": "High", "source": "L1:line 16: 动态配置中的 raw.Regex/raw.Replacement 外部可控输入", "sink": "L3:line 12: os.ReadFile(filepath.Join(root, req.URL.Path))", "explanation": "流A: config.go L16-L17 透传外部 Regex/Replacement 到 replacepathregex.go L27-L28, L37 ReplaceAllString 用可控 replacement 改写请求路径, 经 PathUnescape 后传入 files.go L12 ReadFile; 流B: 未匹配正则的原始请求路径直达同一 sink; 防御分析: config.go 仅 TrimSpace 非防御, replacepathregex.go 无路径校验, files.go 的 filepath.Clean 可被二次编码 %252F 或解码后的 .. 绕过, 字符串替换过滤不算有效防御; 第二入口: 其他挂载该中间件的路由及未改写路径请求均可到达同一 sink", "fix_suggestion": "line 12: 在 FileHandler 中用 filepath.Rel(root, target) 校验结果不逃逸 root 且拒绝包含 .. 的段后再读文件"}
 ```

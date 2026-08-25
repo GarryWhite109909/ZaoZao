@@ -1,78 +1,111 @@
 LANG: go
 ```code
-# === file: handlers.go ===
+# === file: internal/api/handlers.go ===
 package api
 
 import (
 	"net/http"
+
+	"example.com/app/internal/service"
 )
 
-// HandleParam 提取用户请求参数，作为污点源头
-func HandleParam(w http.ResponseWriter, r *http.Request) {
-	name := r.URL.Query().Get("name")   // source: 用户可控参数名
-	value := r.URL.Query().Get("value") // source: 用户可控参数值
-	ve := &ValidationError{
-		Title:  "parameter " + name + " is invalid",
-		Detail: value,
+// UserHandler 处理用户查询请求（source 所在文件）
+type UserHandler struct {
+	Svc *service.UserService
+}
+
+// GetUser 直接把 URL 查询参数 name 透传给服务层，无任何校验
+func (h *UserHandler) GetUser(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name") // SOURCE: 外部输入点1
+	result, err := h.Svc.FindUserByName(r.Context(), name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	PassToEncoder(ve)
+	w.Write([]byte(result))
 }
 
-// ValidationError 携带未净化的用户输入
-type ValidationError struct {
-	Status int
-	Title  string
-	Detail string
+// ListUsers 第二入口：排序字段同样来自外部且未校验
+func (h *UserHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
+	sortBy := r.URL.Query().Get("sort") // SOURCE: 外部输入点2
+	rows, err := h.Svc.ListUsers(r.Context(), sortBy)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Write([]byte(rows))
 }
-
-// === file: encoder.go ===
-package api
+```
+# === file: internal/service/user.go ===
+package service
 
 import (
+	"context"
 	"strings"
+
+	"example.com/app/internal/db"
 )
 
-// PassToEncoder 中间层：看似做了过滤，实则不完整
-func PassToEncoder(ve *ValidationError) {
-	// 仅替换单引号，未处理反斜杠、注释符等
-	detail := strings.ReplaceAll(ve.Detail, "'", "")
-	detail = strings.ReplaceAll(detail, """, "")
-	BuildQuery(ve.Title, detail) // 污点继续传递到 sink 文件
+type UserService struct {
+	DB *db.Store
 }
 
-// === file: db.go ===
-package api
+// FindUserByName 看似做了过滤：仅做字符串替换去除单引号，
+// 属黑名单式净化，可用双写/编码绕过，防御不完整。
+func (s *UserService) FindUserByName(ctx context.Context, name string) (string, error) {
+	cleaned := strings.ReplaceAll(name, "'", "") // 不完整净化
+	return s.DB.QueryUser(ctx, cleaned)          // 传递到 sink
+}
+
+// ListUsers 纯传递，无任何处理
+func (s *UserService) ListUsers(ctx context.Context, sortBy string) (string, error) {
+	return s.DB.QueryUsersOrdered(ctx, sortBy)
+}
+```
+# === file: internal/db/store.go ===
+package db
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
+
+	"github.com/jmoiron/sqlx"
 )
 
-var db *sql.DB
+type Store struct {
+	DB *sqlx.DB
+}
 
-// BuildQuery 直接拼接 SQL —— sink：CWE-89 SQL 注入
-func BuildQuery(paramName, detail string) {
-	query := fmt.Sprintf("SELECT * FROM params WHERE name = '%s' AND detail = '%s'", paramName, detail)
-	rows, _ := db.Query(query)
-	defer rows.Close()
+// QueryUser 使用 fmt.Sprintf 拼接 SQL —— SINK: CWE-89
+func (s *Store) QueryUser(ctx context.Context, name string) (string, error) {
+	q := fmt.Sprintf("SELECT id, email FROM users WHERE name = '%s'", name)
+	var out []byte
+	if err := s.DB.GetContext(ctx, &out, q); err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// QueryUsersOrdered 排序字段无法参数化，直接拼接 —— SINK: CWE-89
+func (s *Store) QueryUsersOrdered(ctx context.Context, orderBy string) (string, error) {
+	q := "SELECT id, name FROM users ORDER BY " + orderBy
+	var out []byte
+	if err := s.DB.SelectContext(ctx, &out, q); err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 ```
 
 分析：
-1. L1:handlers.go 第 8-9 行从 `r.URL.Query().Get` 获取用户可控的 name 与 value，构成污点 source。
-2. L1:handlers.go 第 10-14 行将原始输入写入 `ValidationError.Title/Detail`，无任何净化后传入下一文件。
-3. L2:encoder.go 第 6-11 行仅做了单引号与双引号替换，属于不完整净化——攻击者可用反斜杠、`--`、十六进制编码等绕过，污点仍存活。
-4. L3:db.go 第 8-12 行用 `fmt.Sprintf` 将 Title 与 Detail 直接拼入 SQL 字符串并执行 `db.Query`，构成 sink。
-5. 整条调用链上不存在参数化查询或完整转义，source 到 sink 的污点路径完整可达。
+1. 外部输入点枚举：handlers.go L17 `r.URL.Query().Get("name")` 与 L25 `r.URL.Query().Get("sort")` 均为 HTTP 查询参数，直接进入调用链，可达 db.go 的两个拼接点；此外 `w.Write` 回显错误信息构成次要信息泄露通道，但不改变主污点路径。
+2. 数据流验证：
+   - 流A：handlers.go L17 → user.go L16 `strings.ReplaceAll(name,"'","")` → store.go L15 `fmt.Sprintf`。该净化为黑名单式单引号删除，攻击者可用 `'`、URL 编码或注释符 `--` 组合绕过（如输入 `\` 使转义失效），非有效防御；到达 sink 时污点未消除。
+   - 流B：handlers.go L25 → user.go L21 纯传递 → store.go L24 字符串拼接 ORDER BY。全程零处理，直接可注入 `id; DROP TABLE users--` 类载荷。
+3. 防御位置与覆盖面：唯一处理位于中间层 user.go L16，类型为字符串替换（明确视为可绕过）；ORDER BY 路径完全无防御；两处 sink 均使用拼接而非占位符。
+4. 第二入口确认：存在——ListUsers/sort 参数是独立路由入口，绕过中间层仅有的不完整净化直达 sink，证明单点修复 ReplaceAll 无法闭合漏洞面。
+5. 结论：跨文件 source→sink 链成立，CWE-89 SQL 注入，风险 High（需认证与否未知但注入可读写数据库）。
 
 ```json
-{
-  "has_vulnerability": true,
-  "vulnerability_type": "CWE-89: SQL 注入",
-  "source": "L1:line 8: r.URL.Query().Get(name) 用户可控的查询参数",
-  "propagation": "L1:line 14 写入 ValidationError.Detail 后经 L2:line 11 不完整引号过滤传递至 BuildQuery",
-  "sink": "L3:line 9: fmt.Sprintf 拼接 SQL 后传入 db.Query 执行",
-  "sanitizer": "L2:lines 8-10: strings.ReplaceAll 仅移除引号，可被反斜杠与注释符绕过，防御不完整",
-  "reason": "跨文件调用链上用户输入未经完整净化即被拼接进 SQL 语句，存在可利用的注入点"
-}
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL注入", "risk_level": "High", "source": "L1:line 17: r.URL.Query().Get(name) 外部HTTP查询参数", "sink": "L3:line 15: fmt.Sprintf拼接SQL的QueryUser及line 24 ORDER BY拼接", "explanation": "流A: handlers.go L17 name经user.go L16 strings.ReplaceAll去单引号后传入store.go L15 fmt.Sprintf拼接, 黑名单替换可被反斜杠/编码/注释符绕过, 净化无效; 流B: handlers.go L25 sort参数经user.go L21纯传递到store.go L24 ORDER BY直接拼接, 全程无任何防御; 第二入口: sort路由独立于name路由, 绕过中间层唯一的不完整净化直达sink, 证明单点修复不足以闭合; 两处sink均未使用参数化占位符", "fix_suggestion": "line 15: 改用DB.GetContext配合命名占位符 :name 传参, ORDER BY改用白名单映射到固定列名"}
 ```

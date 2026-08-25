@@ -1,0 +1,20 @@
+**分析**
+
+1. **用户可控输入点枚举**：
+   - 第 79 行：`request.query_params.get("state")`（/login 路由，GET 参数）；
+   - 第 88 行：`oauth_provider.handle_login_callback(request)`（POST 表单体）；
+   - 第 100-101 行：`form = await request.form(); token = form.get("token")`（/introspect 路由）；
+   - 第 152 行：`--port` 命令行参数（运维侧，非远程攻击面）。
+
+2. **数据流验证**：
+   - 第 79 行的 `state` 仅传入 `get_login_page` 用于渲染登录页并回传 state，本文件内未到达 execute/system/eval 等危险 sink；但 state 未做签名校验，若下游将其与授权码绑定则存在 CSRF 风险（依赖 simple_auth_provider 实现）。
+   - 第 100-101 行的 `token` 是核心问题流：第 104 行 `load_access_token(token)` 直接按用户提供的 token 查询并返回该 token 的归属信息。**/introspect 端点没有任何调用方身份认证**——RFC 7662 要求资源服务器使用自身凭证访问此端点，而此处任何匿名请求者只要拿到/猜到合法 token 字符串即可探测其 active 状态、client_id、scope、过期时间、audience（第 106-115 行）。这是“以对象键（token 值）直接索引受保护资源且不校验请求者是否有权访问该对象”的典型模式，即基于 ID 的授权绕过（CWE-639）：token 本身被当作唯一授权依据，缺乏第二重（调用方客户端凭证）校验。
+   - 该流无防御覆盖：无认证中间件、无白名单、无速率限制，仅做了非空字符串类型检查（第 102 行），不构成有效防御。
+
+3. **替代通道检查**：除 /introspect 外，/login 与 /login/callback 的处理逻辑封装在 provider 内部，本文件未见直接泄漏敏感数据的 sink；/introspect 是唯一在本文件内可见的未鉴权敏感查询入口，CORS 中间件（第 118 行）只放行方法，不提供认证。
+
+4. **结论**：存在漏洞——未鉴权的令牌内省端点允许任意调用方枚举/探测令牌有效性及元数据，属于基于对象引用缺失授权校验（CWE-639），风险为 High（信息泄露 + 辅助令牌滥用，需先获得 token 值故非 Critical）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key", "risk_level": "High", "source": "line 101: form.get('token')", "sink": "line 104: oauth_provider.load_access_token(token) 并在 line 106-115 返回令牌元数据", "explanation": "攻击者控制的 token -> 无任何调用方认证的 /introspect 端点 -> load_access_token 按 token 值直接索引 -> 返回 active/client_id/scope/exp/aud -> 以用户可控键访问受保护对象且缺少对请求者身份的授权校验", "fix_suggestion": "line 99: 在 introspect_handler 开头增加对调用方客户端凭证的强制认证（如校验 Basic/Bearer 资源服务器凭证），未通过则返回 401"}
+```

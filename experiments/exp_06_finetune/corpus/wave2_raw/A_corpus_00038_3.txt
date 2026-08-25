@@ -1,0 +1,67 @@
+LANG: go
+```go
+package main
+
+import (
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+)
+
+// 插件管理服务：从用户指定的 URL/名称下载并安装插件到插件根目录
+var pluginRoot = "/srv/app/plugins"
+
+func installHandler(w http.ResponseWriter, r *http.Request) {
+	// source：外部输入 —— 插件名直接来自查询参数
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "missing plugin name", http.StatusBadRequest)
+		return
+	}
+
+	resp, err := http.Get("https://registry.example.com/plugins/" + name + ".zip")
+	if err != nil {
+		http.Error(w, "download failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// sink：未做路径清洗，直接拼接写入文件系统（CWE-22）
+	dest := filepath.Join(pluginRoot, name+".zip")
+	f, err := os.Create(dest)
+	if err != nil {
+		http.Error(w, "create failed", http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+	io.Copy(f, resp.Body)
+	w.WriteHeader(http.StatusOK)
+}
+
+func listHandler(w http.ResponseWriter, r *http.Request) {
+	// 第二入口：同样以未校验的参数读取任意路径下的"插件清单"
+	name := r.URL.Query().Get("name")
+	data, err := os.ReadFile(filepath.Join(pluginRoot, name, "manifest.json"))
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Write(data)
+}
+
+func main() {
+	http.HandleFunc("/plugins/install", installHandler)
+	http.HandleFunc("/plugins/list", listHandler)
+	http.ListenAndServe(":8080", nil)
+}
+```
+
+1. 第 16 行 `r.URL.Query().Get("name")` 是唯一外部输入入口；第 30 行 `filepath.Join(pluginRoot, name+".zip")` 直接将其拼入文件系统路径并经第 31 行 `os.Create` 写盘——source 到 sink 无任何过滤可达。
+2. 全链路不存在任何防御：没有 `filepath.Base()`、没有拒绝 `..` 的黑名单、没有白名单校验。攻击者传 `?name=../../../etc/cron.d/pwn` 即可把下载内容写到插件根目录之外，与原漏洞“manifest 元数据未验证即构造插件根下路径”的语义结构等价。
+3. 第二入口确认存在：第 39 行 `listHandler` 用同一查询参数在第 41 行 `os.ReadFile(filepath.Join(pluginRoot, name, ...))` 读文件，构成独立的任意文件读取通道（如 `?name=../../../../etc/passwd&...`），进一步支撑结论。
+4. 替代通道排查：两个路由均无中间件鉴权或参数规范化层，`filepath.Join` 虽会清理冗余斜杠但不会消除 `../` 的越界效果，因此两条数据流均判定为可利用。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal in plugin path construction", "risk_level": "High", "source": "line 16: r.URL.Query().Get('name') 外部查询参数", "sink": "line 30-31: filepath.Join(pluginRoot, name+'.zip') 后 os.Create 写入", "explanation": "install 流：line 16 参数未经任何校验直接进入 line 30 的 filepath.Join 拼接，Join 不消除 ../ 越界，line 31 os.Create 完成任意路径写; 第二流：listHandler line 41 以同一参数 os.ReadFile 构成任意文件读; 两路由均无鉴权中间件、无 Base 清洗、无黑名单/白名单，防御完全缺失", "fix_suggestion": "line 30: 先取 base := filepath.Base(name)，校验 base == name 且不含路径分隔符后再 Join，并对最终路径执行 strings.HasPrefix(filepath.Clean(dest), pluginRoot) 边界检查"}
+```

@@ -1,35 +1,43 @@
 LANG: python
-```python
-from flask import Flask, request, render_template_string
+```code
+from flask import Flask, request, jsonify
+import re
 
 app = Flask(__name__)
 
-# 模拟一个内容净化插件：默认关闭，开启后应移除用户 SVG 中的 <script> 标签
-SANITIZE_ENABLED = False
-
+# 依赖此净化函数的下游会直接渲染返回的 SVG（信任其已无脚本）
 def sanitize_svg(svg_text):
-    # 仅在开关打开时尝试净化，且只删除 <script>...</script> 字面片段
-    if SANITIZE_ENABLED:
-        return svg_text.replace('<script>', '').replace('</script>', '')
-    return svg_text
+    # 仅移除 <script>...</script> 标签块，黑名单式过滤
+    cleaned = re.sub(r'<script\b[^>]*>.*?</script\s*>', '', svg_text, flags=re.IGNORECASE | re.DOTALL)
+    return cleaned
 
-@app.route('/render', methods=['GET'])
-def render_svg():
-    # source: 用户通过查询参数提交任意 SVG 内容
-    user_svg = request.args.get('svg', '')
-    cleaned = sanitize_svg(user_svg)
-    # sink: 未转义直接嵌入响应模板
-    return render_template_string('<div id="viewer">' + cleaned + '</div>')
+@app.route('/api/svg/clean', methods=['POST'])
+def clean_svg():
+    svg_text = request.form.get('svg', '')
+    if not svg_text:
+        return jsonify({'error': 'missing svg field'}), 400
+    result = sanitize_svg(svg_text)
+    return result, 200, {'Content-Type': 'image/svg+xml'}
 
-if __name__ == '__main__':
-    app.run(debug=True)
+@app.route('/view/<doc_id>')
+def view_doc(doc_id):
+    # 第二入口：从存储读取并直接内联渲染用户上传的 SVG 片段
+    snippet = load_user_snippet(doc_id)  # 假设来自数据库的用户内容
+    return f'<div class="embed">{snippet}</div>'
+
+def load_user_snippet(doc_id):
+    import sqlite3
+    conn = sqlite3.connect('docs.db')
+    row = conn.execute('SELECT body FROM snippets WHERE id=?', (doc_id,)).fetchone()
+    conn.close()
+    return row[0] if row else ''
 ```
 
-1. 第 15 行是 source：`request.args.get('svg', '')` 是 Flask 地道的外部输入入口，攻击者可完全控制传入的 SVG 文本。
-2. 第 9~13 行的 `sanitize_svg` 是与原 SVGO 插件等价的“可绕过防御”：仅做字面字符串替换，`<ScRiPt>`、`<img onerror=...>`、大小写/空白变体均可绕过，且 `SANITIZE_ENABLED=False` 时完全不处理——对应原漏洞中“依赖该插件进行消毒但脚本仍残留”。
-3. 第 19 行是 sink：`render_template_string` 将拼接后的字符串作为模板渲染，未使用 `|e` 转义或 `Markup` 白名单，注入的 HTML/JS 原样进入响应体。
-4. 从第 15 行到第 19 行之间没有任何基于解析器或白名单的有效过滤，source 直达 sink，构成存储型/反射型 XSS（CWE-79）。
+1. 第 12 行 `request.form.get('svg')` 是外部输入 source；第 13 行进入 `sanitize_svg` 后于第 16 行经正则黑名单过滤，第 19 行以 `image/svg+xml` 直接回给浏览器渲染——source 到 sink（浏览器执行 SVG 内脚本）可达。
+2. 第 15-16 行的防御是黑名单 + 正则字符串删除：仅匹配 `<script>` 标签对，无法覆盖 `<svg onload=alert(1)>`、`<foreignObject>` 内嵌 HTML、`<use href="data:...">`、大小写/空白变体如 `<scr<script>ipt>` 拼接绕过等，与原 SVGO 插件“只删 script 元素、其余可执行向量残留”的缺陷语义一致，属可绕过防御。
+3. 第 23-26 行是第二入口 `/view/<doc_id>`：从数据库取出的用户片段在第 25 行未经任何净化直接拼入 HTML 模板，构成独立的存储型 XSS 通道，进一步证明净化缺失不是单点疏漏。
+4. 综上两条数据流均无有效防御，结论为存在 CWE-79。
 
 ```json
-{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (XSS) via unescaped template rendering", "risk_level": "high", "source": "line 15: request.args.get('svg') 用户可控输入", "sink": "line 19: render_template_string 直接渲染拼接的用户输入", "explanation": "line 15 的外部输入 -> line 10-12 可被大小写/标签变体绕过的字符串替换净化(或直接跳过) -> line 19 未转义嵌入模板响应", "fix_suggestion": "line 19: 使用 bleach 等白名单库对 SVG 内容做基于解析器的净化, 并以 |e 过滤器或 Markup 转义后再嵌入模板"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 跨站脚本（XSS）：SVG 净化黑名单不完整导致脚本残留", "risk_level": "high", "source": "line 12: request.form.get('svg') 用户提交的 SVG 内容", "sink": "line 19: 以 image/svg+xml 返回给浏览器渲染 / line 25: 未净化的 snippet 拼入 HTML", "explanation": "line 12 外部输入 -> line 16 仅删除 <script> 标签的黑名单正则 -> line 19 原样回显为 SVG 文档，onload 等事件属性与 foreignObject 等向量残留 -> 浏览器执行任意脚本；line 23-25 第二路由同样未净化直接拼接渲染", "fix_suggestion": "line 15: 改用白名单解析器（如 lxml + allowlist 属性/标签，或 bleach/inspecsvg 类库）仅保留安全元素与属性，剥离全部事件处理器和 javascript: URI，并对 line 25 的模板输出做自动转义"}
 ```

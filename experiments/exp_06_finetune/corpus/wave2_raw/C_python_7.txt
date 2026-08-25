@@ -1,60 +1,42 @@
 ```code
 #!/usr/bin/env python3
-"""deploy.py - 固定流程部署脚本，所有命令均为硬编码常量。"""
+"""deploy.py - 固定流程的本地部署脚本，无外部输入。"""
 
 import subprocess
-import logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOG = logging.getLogger("deploy")
+LOG_DIR = "/var/log/myapp"
+APP_USER = "svc-app"
+SERVICE_NAME = "myapp.service"
+BACKUP_CMD = ["tar", "-czf", "/backup/app.tar.gz", "/opt/myapp"]
 
-# 部署目标与命令序列：全部为编译期可确定的字面量常量
-DEPLOY_DIR = "/opt/myapp"
-SERVICES = ("myapp-api", "myapp-worker")
+def rotate_logs():
+    # 危险点1: subprocess.run, 实参全部为模块级常量拼接的字面量列表
+    subprocess.run(["logrotate", "-f", "/etc/logrotate.d/myapp"], check=True)
 
-BUILD_CMD = ["git", "-C", DEPLOY_DIR, "pull", "--ff-only"]
-INSTALL_CMD = ["pip", "install", "-r", "/opt/myapp/requirements.txt", "--no-input"]
-RESTART_CMD = ["systemctl", "restart"] + list(SERVICES)
-HEALTH_CMD = ["curl", "-fsS", "--max-time", "10", "http://127.0.0.1:8080/health"]
+def backup():
+    # 危险点2: subprocess.call, 实参为常量列表 BACKUP_CMD
+    return subprocess.call(BACKUP_CMD, check=False)
 
-PIPELINES = {
-    "build": BUILD_CMD,
-    "install": INSTALL_CMD,
-    "restart": RESTART_CMD,
-    "health": HEALTH_CMD,
-}
-
-
-def run_step(name: str) -> int:
-    """执行固定流水线中的一步；name 仅来自下方硬编码循环。"""
-    cmd = PIPELINES[name]
-    LOG.info("running step %s: %s", name, cmd)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    if result.returncode != 0:
-        LOG.error("step %s failed:
-%s", name, result.stderr)
-    return result.returncode
-
-
-def main() -> int:
-    for step in ("build", "install", "restart", "health"):
-        if run_step(step) != 0:
-            return 1
-    LOG.info("deployment finished successfully")
-    return 0
-
+def restart_service():
+    # 危险点3: subprocess.check_output, 命令与参数均为硬编码字面量/常量
+    out = subprocess.check_output(
+        ["systemctl", "restart", SERVICE_NAME],
+        text=True,
+        timeout=30,
+    )
+    print(out.strip())
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    rotate_logs()
+    backup()
+    restart_service()
 ```
 
-分析：
-
-1. 第 30 行 `subprocess.run(cmd, ...)` 是本文件唯一的危险 sink。其实参 `cmd` 来自第 29 行 `cmd = PIPELINES[name]`。
-2. `PIPELINES`（第 20-25 行）的四个值全部由模块级字面量列表拼接而成（第 12-17 行），元素均为字符串常量，如 `"git"`、`"/opt/myapp"`、`"http://127.0.0.1:8080/health"` 等，无任何运行时拼接外部数据。
-3. 索引变量 `name` 仅来源于第 41 行 `for step in ("build", "install", "restart", "health")` 的元组字面量迭代，经 `run_step(step)` 传入，取值集合封闭且有限，不存在用户输入、环境变量、网络或文件读取等污点来源。
-4. 全文未出现 `request|argv|input(|environ|stdin|socket` 等任何污染源 API，因此从 source 到 sink 不存在可达污点路径，该脚本不可利用。
+1. 第13行 `subprocess.run`：命令列表为硬编码字面量 `["logrotate", "-f", ...]`，路径 `/etc/logrotate.d/myapp` 为字符串常量；文件内不存在任何读取外部数据的语句（无 input/argv/env/socket/request），故该实参在编译期即确定。
+2. 第18行 `subprocess.call`：实参为第8行定义的模块级常量列表 `BACKUP_CMD`，其元素均为字符串字面量，赋值后从未被修改，无污点可达路径。
+3. 第23-25行 `subprocess.check_output`：命令元素来自字面量与常量 `SERVICE_NAME`（第7行），且 `timeout=30`、`text=True` 亦为常量；函数仅在本文件 `__main__` 块中以零参数方式调用，不存在第二入口或被外部以可控参数调用的替代通道。
+4. 结论：所有危险 sink 的实参来源均为常量/字面量，污点源集合为空，任何 sink 均不可达污点数据。
 
 ```json
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "subprocess.run 的实参 cmd 来自 PIPELINES 常量字典，索引 name 来自硬编码元组迭代 -> 全部实参为常量 -> 无污点来源 -> 不可利用", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "line 13 subprocess.run 实参为硬编码字面量列表; line 18 subprocess.call 实参为模块级常量 BACKUP_CMD; line 23-25 subprocess.check_output 实参为字面量与常量 SERVICE_NAME; 文件内无 request/argv/input/environ/stdin/socket 等污点来源; 函数仅在 __main__ 中以固定方式调用, 无第二入口或可控参数通道 -> 各危险点实参均为常量 -> 无污点来源 -> 不可利用", "fix_suggestion": "no fix needed"}
 ```

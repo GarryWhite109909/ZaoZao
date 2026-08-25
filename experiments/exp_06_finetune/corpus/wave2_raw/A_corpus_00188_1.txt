@@ -1,0 +1,73 @@
+LANG: java
+```code
+import org.springframework.web.bind.annotation.*;
+import java.util.*;
+
+@RestController
+@RequestMapping("/api/alerts")
+public class AlertActionController {
+
+    // 模拟管理员在配置中注册的告警命令模板（含 {{mustache}} 占位符）
+    private final Map<String, String> alertCommands = new HashMap<>();
+
+    private final Map<String, String> lastStatus = new HashMap<>();
+
+    public AlertActionController() {
+        alertCommands.put("cpu_critical", "logger -t glances 'CPU critical on host {{hostname}}' >> /var/log/glances.log");
+    }
+
+    /** 外部输入点1：监控探针上报的指标数据（含进程 cmdline、主机名等攻击者可控字段） */
+    @PostMapping("/trigger")
+    public Map<String, Object> trigger(@RequestBody Map<String, Object> stats) {
+        String statName = (String) stats.get("stat_name");
+        String criticality = (String) stats.get("criticality");
+        String cmdTemplate = alertCommands.get(statName);
+        if (cmdTemplate == null) {
+            return Map.of("ran", false);
+        }
+        if (criticality.equals(lastStatus.get(statName))) {
+            return Map.of("ran", false); // 去重，等价 repeat=false
+        }
+        // 黑名单过滤：仅替换顶层字符串值中的 shell 操作符（可绕过）
+        for (Map.Entry<String, Object> e : stats.entrySet()) {
+            if (e.getValue() instanceof String s) {
+                for (String op : new String[]{"&&", "|", ">>", ">"}) {
+                    s = s.replace(op, " ");
+                }
+                stats.put(e.getKey(), s);
+            } else if (e.getValue() instanceof List<?> list) {
+                // 嵌套列表（如进程 cmdline）未递归清洗，直接透传
+                stats.put(e.getKey(), list);
+            }
+        }
+        String cmd = cmdTemplate;
+        for (Map.Entry<String, Object> e : stats.entrySet()) {
+            cmd = cmd.replace("{{" + e.getKey() + "}}", String.valueOf(e.getValue()));
+        }
+        // sink：经 /bin/sh 解释执行，管道/重定向生效
+        try {
+            Process p = new ProcessBuilder("/bin/sh", "-c", cmd).start();
+            p.waitFor();
+        } catch (Exception ignored) {}
+        lastStatus.put(statName, criticality);
+        return Map.of("ran", true);
+    }
+
+    /** 第二入口：同一模板渲染逻辑被 /api/processes 间接复用 */
+    @PostMapping("/processes/report")
+    public Map<String, Object> report(@RequestBody Map<String, Object> procStats) {
+        procStats.put("stat_name", "cpu_critical");
+        return trigger(procStats);
+    }
+}
+```
+
+1. 第 20 行 `@PostMapping("/trigger")` 的 `@RequestBody Map<String,Object>` 是 source：外部监控探针可直接 POST 攻击者可控的 hostname、嵌套的 processes 列表等字段；第 21-22 行取出 stat_name/criticality 后在第 24 行查到模板并继续向下，可达 sink。
+2. 第 31-41 行的黑名单防御仅对顶层 String 值做 `replace`：黑名单字符集不全（漏掉反引号、`$()`、分号），且第 38-40 行对 List 类型（如进程 cmdline）不递归清洗直接透传——对应原代码 GHSA 中“嵌套值未覆盖”的可绕过缺陷，属无效防御。
+3. 第 43-45 行把可控值直接替换进命令模板，第 49 行 `new ProcessBuilder("/bin/sh","-c",cmd)` 是 sink：`sh -c` 完整解释管道与重定向，注入的 `| touch /tmp/pwn` 等载荷原样执行。
+4. 第二入口确认：第 58-62 行 `/api/processes/report` 将任意请求体塞入 stat_name 后转发到同一 handler，构成替代通道，攻击者无需直连 /trigger 即可触达同一 sink。
+5. 结论：source→sink 全链无有效防御（黑名单可绕过+嵌套未覆盖），存在两条路由均可达，判定为真实 CWE-78。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection via shell-interpreted template rendering", "risk_level": "Critical", "source": "line 20: @PostMapping('/trigger') 的 @RequestBody Map<String,Object> 外部指标数据", "sink": "line 49: new ProcessBuilder('/bin/sh','-c',cmd).start()", "explanation": "主链: line 20 请求体 -> line 24 取模板 -> line 31-41 仅顶层字符串做黑名单 replace(缺反引号/$()/分号且 line 38-40 对 List 嵌套值如进程 cmdline 不递归清洗) -> line 43-45 拼入模板 -> line 49 sh -c 执行; 第二入口: line 58-62 /api/processes/report 把任意请求体改写 stat_name 后调用同一 trigger 方法, 同样到达 line 49 的 sink; 黑名单字符串替换属可绕过过滤不算有效防御, 故整条链无有效防护", "fix_suggestion": "line 49: 移除 /bin/sh -c, 将命令拆分为参数数组直接传给 ProcessBuilder, 并对模板变量做白名单校验(如 hostname 仅允许 [a-zA-Z0-9.-])后递归清洗所有嵌套容器"}
+```

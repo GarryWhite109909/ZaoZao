@@ -1,0 +1,62 @@
+LANG: node.js/javascript
+```javascript
+// sandbox-render.js — express 中间件链上的"沙箱模板渲染"服务
+const express = require('express');
+const app = express();
+app.use(express.json());
+
+// 模拟原 JinjavaBeanELResolver 的受限属性黑名单
+const RESTRICTED_PROPS = new Set([
+  'constructor', 'prototype', '__proto__', 'process',
+  'require', 'eval', 'Function', 'module', 'global'
+]);
+
+// 路径解析：支持点号与括号两种写法，如 user.name 或 user['name']
+function resolvePath(root, path) {
+  let cur = root;
+  for (const seg of path.split('.')) {
+    const bracket = seg.match(/^\[\s*(.+?)\s*\]$/);
+    let key;
+    if (bracket) {
+      key = bracket[1].slice(1, -1); // 去引号；带引号的键被视为数据字面量，跳过黑名单检查
+    } else {
+      key = seg;
+      if (RESTRICTED_PROPS.has(key)) throw new Error('blocked property: ' + key);
+    }
+    if (cur == null) return '';
+    cur = cur[key];
+  }
+  return cur;
+}
+
+// 中间件：把用户提交的 template 渲染后挂到 res.locals
+app.use('/api/render', (req, res, next) => {
+  const { template } = req.body; // source：外部输入入口
+  try {
+    res.locals.output = template.replace(/\{\{\s*(.+?)\s*\}\}/g, (_, expr) => {
+      const call = expr.match(/^(.*?)\(\)\s*$/); // 支持 {{ expr() }} 零参调用
+      let val = resolvePath(req.body.context || {}, call ? call[1] : expr);
+      if (call && typeof val === 'function') val = val(); // sink：执行任意函数
+      return String(val);
+    });
+    next();
+  } catch (e) {
+    res.status(400).send('render error: ' + e.message);
+  }
+});
+
+app.post('/api/render', (req, res) => {
+  res.json({ rendered: res.locals.output });
+});
+
+app.listen(3000);
+```
+
+1. 第 27 行 `POST /api/render` 的请求体 `template` 与 `context` 是全部外部输入点（source），经第 29 行正则提取 `{{ ... }}` 表达式后传入第 18 行 `resolvePath`，可达性直接成立。
+2. 第 23 行黑名单仅对**点号段**生效；第 20–21 行对括号写法只做去引号处理并注释为“数据字面量”，完全跳过 `RESTRICTED_PROPS` 检查——这是位置性防御缺口（黑名单本身也属可绕过过滤）。攻击者用 `x['constructor']` 即可取到构造函数。
+3. 拿到 `constructor.constructor` 即全局 `Function` 后，第 31 行 `val = val()`（sink）执行零参调用，配合 `Function('return process...')()` 形态完成 RCE，等价于原代码绕过 `DEFAULT_RESTRICTED_METHODS` 后调用任意方法。
+4. 第二入口确认：无其他路由或替代通道；但同一中间件对 `context` 内嵌套对象同样适用该解析逻辑，且黑名单是静态集合、不支持配置扩展，覆盖面不足支撑“可被绕过”的最终结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 模板表达式沙箱逃逸导致 RCE", "risk_level": "Critical", "source": "line 27: req.body.template 与 req.body.context", "sink": "line 31: val = val() 执行从 context 解析出的任意函数", "explanation": "source 为 POST /api/render 请求体中的 template 与 context 字段; 数据流 template -> 第29行正则提取 {{expr}} -> 第18行 resolvePath -> 第31行函数执行; 防御分析: 第23行黑名单仅拦截点号标识符段, 第20行括号键跳过检查且黑名单本身属静态字符串匹配可绕过, 攻击者以 x['constructor']['constructor']('return process...') 取得 Function 并在 sink 处零参调用实现沙箱逃逸 RCE; 第二入口: 无其他路由, 但 context 嵌套对象走同一解析路径, 结论为存在可利用漏洞", "fix_suggestion": "line 20: 对括号键同样施加 RESTRICTED_PROPS 白名单校验, 并将黑名单改为属性访问白名单, 禁止任何形式的函数调用求值"}
+```

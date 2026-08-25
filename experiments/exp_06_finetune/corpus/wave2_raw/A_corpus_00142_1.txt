@@ -1,0 +1,56 @@
+LANG: java
+```code
+package com.example.invoice;
+
+import java.io.StringReader;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.springframework.web.bind.annotation.*;
+import org.w3c.dom.Document;
+import org.xml.sax.InputSource;
+
+@RestController
+@RequestMapping("/api/invoices")
+public class InvoiceValidationController {
+
+    // POST /api/invoices/validate  body: raw XML invoice (UBL/Peppol style)
+    @PostMapping(value = "/validate", consumes = "application/xml")
+    public String validateInvoice(@RequestBody String invoiceXml,
+                                  @RequestParam(required = false) boolean includeWarnings) {
+        try {
+            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+            // No setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+            // No setExpandEntityReferences(false), no secure processing enabled
+            DocumentBuilder builder = dbf.newDocumentBuilder();
+            Document doc = builder.parse(new InputSource(new StringReader(invoiceXml)));
+
+            String buyerName = doc.getElementsByTagName("BuyerReference")
+                                 .item(0).getTextContent();
+            String total = doc.getElementsByTagName("TaxInclusiveAmount")
+                              .item(0).getTextContent();
+
+            if (!includeWarnings && buyerName.startsWith("WARN")) {
+                return "{"status":"skipped"}";
+            }
+            return "{"status":"valid","buyer":"" + buyerName + "","total":"" + total + ""}";
+        } catch (Exception e) {
+            return "{"status":"error","message":"" + e.getMessage() + ""}";
+        }
+    }
+
+    // Second entry point: same sink via file upload route
+    @PostMapping("/upload")
+    public String uploadInvoice(@RequestBody byte[] rawBytes) throws Exception {
+        return validateInvoice(new String(rawBytes), false);
+    }
+}
+```
+
+1. 第 22 行 `@RequestBody String invoiceXml` 是外部输入入口（source），攻击者可提交含 DOCTYPE 与外部实体的 XML；第 41 行 `/upload` 路由把上传字节转字符串后调用同一方法，构成第二入口，两条流均可达 sink。
+2. 第 26-28 行使用默认配置的 `DocumentBuilderFactory`：未设置 disallow-doctype-decl、未关闭外部实体扩展、未启用 FEATURE_SECURE_PROCESSING，与原代码中 Saxon 默认解析器允许实体展开的语义等价。
+3. 第 30 行 `builder.parse(...)` 是 sink（XXE 触发点），source 到 sink 之间没有任何过滤或校验；错误消息（第 37 行）会把异常内容回显给客户端，使文件读取结果可通过报错外带，对应原漏洞“暴露内容给远程方”的语义。
+4. 防御覆盖面验证：`includeWarnings` 参数仅控制响应内容（第 33-35 行），不阻断实体解析；无黑名单/正则过滤输入，因此不存在任何有效防御。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)", "risk_level": "Critical", "source": "line 22: @RequestBody String invoiceXml 外部XML输入（另见 line 41 /upload 第二入口）", "sink": "line 30: builder.parse(new InputSource(new StringReader(invoiceXml))) 使用默认配置解析XML", "explanation": "主链：line 22 接收原始XML -> line 26-28 默认DocumentBuilderFactory未禁用DOCTYPE和外部实体 -> line 30 parse触发XXE读取本地文件 -> line 37 异常消息回显实现数据外带；第二入口：line 41 /upload 将byte[]转String后复用同一方法，同样可达sink；防御分析：includeWarnings仅影响响应过滤不阻断实体解析，全程无doctype黑名单、无secure processing、无正则过滤，故无有效防御", "fix_suggestion": "line 27: 设置 dbf.setFeature('http://apache.org/xml/features/disallow-doctype-decl', true) 并启用 dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)"}
+```

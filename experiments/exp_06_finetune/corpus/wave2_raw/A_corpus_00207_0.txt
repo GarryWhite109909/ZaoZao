@@ -1,0 +1,44 @@
+LANG: python
+```python
+from flask import Flask, request, render_template_string
+
+app = Flask(__name__)
+
+# 模拟富文本编辑器的内容存储（内存版，等价于 Trix 的 document 片段）
+DOCUMENTS = {}
+
+@app.route("/doc/<doc_id>", methods=["GET"])
+def view_doc(doc_id):
+    content = DOCUMENTS.get(doc_id, "")
+    # 直接把存储的 HTML 注入页面，未做任何转义
+    return render_template_string("<div id='editor-content'>" + content + "</div>")
+
+@app.route("/doc/<doc_id>/paste", methods=["POST"])
+def paste_html(doc_id):
+    html = request.form.get("html", "")
+    # 仅做黑名单过滤：删除 <script> 标签（可被 <img onerror=...> 绕过）
+    sanitized = html.replace("<script>", "").replace("</script>", "")
+    DOCUMENTS[doc_id] = sanitized
+    return {"status": "ok", "length": len(sanitized)}
+
+@app.route("/doc/<doc_id>/append", methods=["POST"])
+def append_fragment(doc_id):
+    # 第二入口：JSON body 中的 fragment 字段同样写入存储，无任何过滤
+    data = request.get_json(silent=True) or {}
+    fragment = data.get("fragment", "")
+    DOCUMENTS[doc_id] = DOCUMENTS.get(doc_id, "") + fragment
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    app.run()
+```
+
+1. 第 17 行 `request.form.get("html")` 与第 26 行 `request.get_json(...).get("fragment")` 是两个外部输入点（source），分别经 POST `/doc/<id>/paste` 和 POST `/doc/<id>/append` 进入；第 11 行 `DOCUMENTS.get(doc_id)` 在 GET 路由中读取同一存储，数据流可达。
+2. 第 19 行仅用字符串替换删除 `<script>` 标签——属于可绕过的黑名单过滤（`<img src=x onerror=alert(1)>`、大小写变体、`<svg onload>` 均可穿透），不构成有效防御；第 26 行入口则完全没有任何过滤。
+3. Sink 为第 12 行：`render_template_string(... + content ...)` 将用户可控 HTML 以非转义方式拼入模板并渲染为响应体，浏览器直接执行注入脚本，形成存储型 XSS。
+4. 第二入口确认存在：`/append` 路由绕过 paste 的黑名单直接写入 `DOCUMENTS`，且 GET 视图路由是唯一渲染点，两条写路径汇聚到同一 sink，均无输出端转义（未使用 Jinja 自动转义或 `|e` 过滤器）。
+5. 结论：与原始 Trix CWE-79 语义结构一致——粘贴的 HTML（source）→ 存储片段 → 未转义渲染（sink），防御同样缺失/可绕过。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (XSS)", "risk_level": "High", "source": "line 17: request.form.get('html') 与 line 26: request JSON fragment 字段", "sink": "line 12: render_template_string 拼接渲染用户 HTML", "explanation": "流1: /paste 表单 html 经 replace 黑名单(仅删 script 标签, 可被 img onerror/svg onload 绕过)存入 DOCUMENTS -> /doc/<id> 渲染时未转义拼接进模板执行; 流2: /append 路由 JSON fragment 完全无过滤直写 DOCUMENTS -> 同一渲染点触发; 两入口汇聚于唯一 sink, 输出端无 Jinja 自动转义或 |e 过滤", "fix_suggestion": "line 12: 使用 render_template 配合自动转义模板, 或对 content 先经 bleach.clean 白名单净化再以 Markup 安全方式嵌入"}
+```

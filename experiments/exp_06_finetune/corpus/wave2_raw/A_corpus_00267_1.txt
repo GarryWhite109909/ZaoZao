@@ -1,0 +1,50 @@
+LANG: node.js/javascript
+```code
+const express = require('express');
+const ldap = require('ldapjs');
+
+const app = express();
+app.use(express.json());
+
+const client = ldap.createClient({ url: 'ldap://directory.internal:389' });
+const BASE_DN = 'ou=people,dc=corp,dc=example,dc=com';
+
+// POST /api/auth/login  { username, password }
+app.post('/api/auth/login', (req, res) => {
+  const username = req.body.username;   // source
+  const password = req.body.password;
+
+  // filter built by raw string interpolation of user input (CWE-90)
+  const filter = `(&(objectClass=person)(uid=${username}))`;
+
+  client.search(BASE_DN, { filter: filter, scope: 'sub', attributes: ['dn'] }, (err, searchRes) => {
+    if (err) return res.status(500).json({ error: 'search failed' });
+
+    let entries = [];
+    searchRes.on('searchEntry', (entry) => entries.push(entry));
+    searchRes.on('error', () => res.status(500).json({ error: 'search error' }));
+    searchRes.on('end', () => {
+      if (entries.length !== 1) {
+        return res.status(401).json({ error: 'unknown credentials' });
+      }
+      const userDN = entries[0].objectName;
+      client.bind(userDN, password, (bindErr) => {
+        if (bindErr) return res.status(401).json({ error: 'unknown credentials' });
+        res.json({ ok: true, user: userDN });
+      });
+    });
+  });
+});
+
+app.listen(3000);
+```
+
+1. 第 12 行 `req.body.username` 是外部输入入口（POST JSON body），直接流入第 16 行的模板字符串，无任何转义或校验。
+2. 第 16 行将用户名原样拼进 LDAP 过滤器 `(uid=${username})`，攻击者可注入如 `*)(|(uid=*` 使过滤器变为 `(&(objectClass=person)(uid=*)(|(uid=*)))`，匹配任意条目——等价于原代码中 `strings.ReplaceAll(a.filterTemplate, "{username}", username)` 的 sink。
+3. 防御检查：全程没有调用 `ldap.parseFilter`、`ldapjs` 的过滤转义工具或任何白名单/编码处理；`entries.length !== 1` 只是结果数量判断，不阻止注入后的单条目匹配（攻击者可用精确 DN 注入仍返回一条），属于无效防御。
+4. 第二入口：本文件仅 `/api/auth/login` 一个路由；但同一 `filter` 构造模式若被复制到其他查询路由同样可达 sink。主链 source→sink 可达性确认成立。
+5. 结论：存在 CWE-90 LDAP 注入，风险 High（可绕过认证/枚举目录）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-90 LDAP Injection", "risk_level": "High", "source": "line 12: req.body.username from POST /api/auth/login JSON body", "sink": "line 16: template string interpolation into ldapjs search filter passed to client.search at line 18", "explanation": "username flows unescaped into the LDAP filter string via template literal; no parseFilter or escaping is applied anywhere; the entries.length check does not prevent injection since a crafted filter can still match exactly one entry; only one route exists in this file but the same interpolation pattern would be vulnerable in any other query path -> attacker can alter filter logic to authenticate as arbitrary users or enumerate directory entries", "fix_suggestion": "line 16: use ldap.parseFilter or escape special characters (* ( ) \\ NUL) in username before building the filter"}
+```

@@ -1,0 +1,47 @@
+LANG: node.js/javascript
+```code
+const express = require('express');
+const crypto = require('crypto');
+const app = express();
+app.use(express.json());
+
+// Legacy audit-log digest endpoint: combines multiple user-supplied
+// values into a single digest used as an integrity commitment.
+function legacyDigest(parts) {
+  const hash = crypto.createHash('sha1'); // weak/broken algorithm retained for "compatibility"
+  let data = Buffer.alloc(0);
+  const countBuf = Buffer.alloc(8);
+  countBuf.writeUInt32LE(parts.length, 0);
+  data = Buffer.concat([data, countBuf]);
+  for (const p of parts) {
+    const bz = Buffer.from(String(p), 'utf8');
+    data = Buffer.concat([data, bz]);
+    data = Buffer.concat([data, Buffer.from('$')]); // safety delimiter
+    data = Buffer.concat([data, Buffer.from(String(bz.length))]); // length suffix
+  }
+  hash.update(data);
+  return hash.digest('hex');
+}
+
+app.post('/audit/commit', (req, res) => {
+  const { fields } = req.body; // external input: arbitrary JSON array from client
+  if (!Array.isArray(fields) || fields.length === 0) {
+    return res.status(400).json({ error: 'fields required' });
+  }
+  const digest = legacyDigest(fields); // flows into integrity commitment
+  res.json({ digest });
+});
+
+app.listen(3000);
+```
+
+分析：
+1. 第 27 行 `req.body.fields` 是唯一外部输入点（POST /audit/commit 的 JSON 数组），第 30 行直接传入 `legacyDigest`，source→sink 可达。
+2. 第 13 行 sink 使用 `crypto.createHash('sha1')`——SHA-1 已被证明存在碰撞攻击（SHAttered 等），属于使用弱/破损哈希算法（CWE-327），且代码未提供任何算法选择校验或升级路径。
+3. 第 20-22 行的 `$` 分隔符 + 长度后缀仅是域分隔的拼接技巧，与原 tss-lib 相同：它不能弥补哈希函数本身的碰撞弱点；对字段内容无任何过滤或白名单（也不需要——问题在算法层）。
+4. 无第二入口：文件中只有 `/audit/commit` 一个路由，`legacyDigest` 仅被该 handler 调用；但该单一路由已足以让任意客户端构造碰撞摘要，破坏审计完整性承诺。
+5. 结论：存在漏洞，风险为 High（完整性承诺可被碰撞伪造）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-327 Use of a Broken or Risky Cryptographic Algorithm (SHA-1)", "risk_level": "High", "source": "line 27: req.body.fields 外部JSON数组输入", "sink": "line 13: crypto.createHash('sha1') 弱哈希生成完整性摘要", "explanation": "主数据流: line 27 req.body.fields -> line 30 legacyDigest(fields) -> line 13 createHash('sha1') -> line 24 digest 返回给客户端作为审计完整性承诺; 该流上不存在有效防御: 第20-22行的分隔符与长度后缀只是域分离拼接手段, 无法修复SHA-1本身已被实际碰撞攻击攻破的问题, 且无算法白名单或版本协商机制; 第二入口排查: 文件内仅有 /audit/commit 一个路由且 legacyDigest 仅被其调用, 不存在替代通道, 但单一路由即可让攻击者构造碰撞对伪造相同审计摘要", "fix_suggestion": "line 13: 将 crypto.createHash('sha1') 替换为 crypto.createHash('sha256') 并在输出中加入算法标识以便后续迁移"}
+```

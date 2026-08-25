@@ -1,0 +1,47 @@
+LANG: python
+```python
+from flask import Flask, request, jsonify
+import jinja2
+
+app = Flask(__name__)
+
+env = jinja2.Environment(
+    loader=jinja2.FileSystemLoader("/app/templates"),
+    undefined=jinja2.Undefined,
+)
+
+@app.route("/api/template/render", methods=["POST"])
+def render_template():
+    data = request.get_json(silent=True) or {}
+    template_str = data.get("template", "")
+    try:
+        # 直接用用户提交的字符串编译并渲染模板 —— SSTI sink
+        result = env.from_string(template_str).render()
+        return jsonify({"code": 0, "data": {"content": result}})
+    except jinja2.TemplateError as e:
+        return jsonify({"code": -1, "msg": str(e)}), 200
+
+@app.route("/api/template/render_file", methods=["POST"])
+def render_template_file():
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "")
+    try:
+        # 第二入口：模板名同样来自外部输入，经同一环境渲染
+        tpl = env.get_template(name)
+        return jsonify({"code": 0, "data": {"content": tpl.render()}})
+    except jinja2.TemplateError as e:
+        return jsonify({"code": -1, "msg": str(e)}), 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=6806)
+```
+
+1. 第 15 行 `request.get_json()` 取出 `template` 字段，是唯一主 source；第 20 行 `env.from_string(template_str)` 将其直接编译为 Jinja2 模板并渲染，source 到 sink 一行直达。
+2. 全链路无任何过滤/白名单：没有对 `{{ }}`、`{% %}`、`config`、`__class__` 等做黑名单或正则拦截，也没有使用沙箱环境（应为 `jinja2.sandbox.SandboxedEnvironment`），攻击者可注入如 `{{ ''.__class__.__mro__[1].__subclasses__() }}` 类 payload 实现任意对象访问乃至 RCE。
+3. 错误分支仅捕获 `TemplateError` 回显异常信息，不构成防御，反而泄露内部结构辅助利用。
+4. 存在第二入口：第 28 行 `/api/template/render_file` 中 `name` 同样来自请求体，虽经 `get_template` 按文件名加载，但配合路径穿越或上传可控模板文件时仍可达同一渲染 sink，且该路由与主链共用同一非沙箱 `env`，替代通道成立。
+5. 结论：与原 Go/Sprig 版本语义等价——外部输入直接进入服务端模板引擎渲染，SSTI 成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 服务端模板注入 (SSTI)", "risk_level": "Critical", "source": "line 15: request.get_json() 中的 template 字段", "sink": "line 20: env.from_string(template_str).render()", "explanation": "主链: line 15 外部 JSON 输入 template -> line 20 from_string 编译渲染, 无任何过滤或沙箱; 防御分析: 无黑名单/正则/白名单, 且未用 SandboxedEnvironment, 异常回显仅泄露信息不构成防御; 第二入口: line 28 /api/template/render_file 的 name 参数经同一非沙箱 env 渲染, 构成替代通道, 支持存在漏洞的结论", "fix_suggestion": "line 20: 改用 jinja2.sandbox.SandboxedEnvironment 并禁止 from_string 接收用户字符串, 仅允许加载预置白名单模板文件"}
+```

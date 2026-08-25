@@ -1,58 +1,44 @@
 ```code
 <?php
-/**
- * nightly_maintenance.php — 每晚由 cron 调用的数据库维护脚本
- * 用法: php /opt/scripts/nightly_maintenance.php
- */
-
+// maintenance_cleanup.php — 每日定时维护脚本（crontab 调用，无任何外部输入）
 define('DB_HOST', '127.0.0.1');
-define('DB_USER', 'maintenance_bot');
-define('DB_PASS', 'S3cure!Rotate#2024');
-define('DB_NAME', 'app_production');
+define('DB_USER', 'maint_bot');
+define('DB_PASS', 'S3cure!Pass#2024');
+define('DB_NAME', 'app_logs');
 
-$mysqli = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
-if ($mysqli->connect_error) {
-    error_log('DB connect failed: ' . $mysqli->connect_error);
+// 危险点 1：硬编码 SQL，全部为字面量拼接的常量字符串
+$cleanup_sql = "DELETE FROM access_log WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY)";
+$archive_sql = "INSERT INTO archive_log SELECT * FROM access_log WHERE created_at < DATE_SUB(NOW(), INTERVAL 90 DAY)";
+
+$conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
+if ($conn->connect_error) {
+    error_log('DB connect failed: ' . $conn->connect_error);
     exit(1);
 }
 
-// 1) 清理 90 天前的过期会话（固定字面量 SQL）
-$sql_purge = "DELETE FROM sessions WHERE expires_at < NOW() - INTERVAL 90 DAY";
-if (!$mysqli->query($sql_purge)) {
-    error_log('purge failed: ' . $mysqli->error);
+// 危险点 2：exec 执行固定归档命令，实参为纯字面量
+exec('/usr/bin/gzip -f /var/log/app/archive.log', $out, $code);
+if ($code !== 0) {
+    error_log('gzip failed with code ' . $code);
 }
 
-// 2) 归档旧审计日志到磁盘（路径为硬编码常量）
-$archive_path = '/var/log/app/audit_archive.sql';
-$stmt = $mysqli->prepare("SELECT id, payload FROM audit_log WHERE created_at < DATE_SUB(NOW(), INTERVAL 1 YEAR)");
-$stmt->execute();
-$res = $stmt->get_result();
+// 危险点 3：eval 仅用于解析内置常量表达示，实参为字面量
+$result = eval('return 7 * 24 * 3600;');
+echo "Retention window seconds: {$result}
+";
 
-$fh = fopen($archive_path, 'w');
-while ($row = $res->fetch_assoc()) {
-    fwrite($fh, json_encode($row) . PHP_EOL);
-}
-fclose($fh);
-
-// 3) 压缩归档文件（命令完全为字面量，无任何拼接）
-exec('gzip -f /var/log/app/audit_archive.sql', $out, $rc);
-error_log("archive gzip rc={$rc}");
-
-// 4) 更新统计缓存表
-$mysqli->query("UPDATE stats_cache SET refreshed_at = NOW() WHERE cache_key = 'daily_summary'");
-
-$mysqli->close();
-echo "maintenance done
+$conn->query($archive_sql);
+$conn->query($cleanup_sql);
+$conn->close();
+echo "Maintenance done.
 ";
 ```
 
-分析：
-
-1. 第 22 行 `$mysqli->query($sql_purge)`：`$sql_purge` 在第 21 行被赋值为纯字符串字面量 `DELETE FROM sessions ...`，无任何变量插值或拼接；文件中不存在 request/argv/env 等输入入口，故该 sink 的实参恒为常量。
-2. 第 30 行 `fopen($archive_path, 'w')` 与第 33 行 `fwrite`：`$archive_path` 为第 29 行的硬编码常量 `/var/log/app/audit_archive.sql`；写入内容来自数据库查询结果，而查询语句本身是 prepare 的常量 SQL，无外部输入可影响其结果路径之外的内容形态，且写目标不可控。
-3. 第 38 行 `exec(...)`：第一个参数是完全的字面量字符串 `'gzip -f /var/log/app/audit_archive.sql'`，未拼接任何变量；`$out`、`$rc` 是输出参数而非输入。不存在可达污点路径，无法注入 shell 命令。
-4. 全文扫描：无 `$_GET/$_POST/$_REQUEST/$argv/getenv/file_get_contents(php://input)/socket` 等污染源函数调用；所有危险 API（query/exec/fopen）实参均为字面量或配置常量，污点传播图为空。
+1. 第 10-11 行与第 26-27 行：SQL 字符串完全由字面量构成，mysqli::query 的实参不含任何变量插值或外部输入；文件中不存在 $_GET/$_POST/argv/stdin 等读取入口，污点源集合为空。
+2. 第 18 行：exec 的唯一实参是字面量命令字符串 '/usr/bin/gzip -f /var/log/app/archive.log'，$out 与 $code 为输出参数而非输入；无可控数据进入 shell。
+3. 第 23 行：eval 的实参是纯字面量表达式 'return 7 * 24 * 3600;'，不引用任何变量。
+4. 第二入口排查：本文件定义的所有语句均在顶层顺序执行，未定义可被外部以可控参数调用的函数或回调注册点；该脚本仅由 crontab 触发，不存在 HTTP、CLI 参数或其他替代通道，因此所有危险 API 均不可利用。
 
 ```json
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "各危险点实参均为常量 -> 无污点来源 -> 不可利用", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "line 10-11, 26-27: mysqli query 实参为纯字面量 SQL 常量; line 18: exec 实参为字面量命令; line 23: eval 实参为字面量表达式; 文件无 request/argv/env/stdin 等污染源且无可被外部以可控参数调用的函数入口 -> 无污点来源 -> 不可利用", "fix_suggestion": "no fix needed"}
 ```

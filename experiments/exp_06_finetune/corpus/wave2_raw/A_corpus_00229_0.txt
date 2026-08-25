@@ -1,0 +1,38 @@
+LANG: python
+```python
+# app.py
+from fastapi import FastAPI, HTTPException, Depends, Header
+from pydantic import BaseModel
+import httpx
+
+app = FastAPI()
+
+# 内部系统用户凭据，硬编码在源码中（等价于原 Java 模块的 system user）
+INTERNAL_ADMIN_USER = "mod-export-system"
+INTERNAL_ADMIN_PASSWORD = "SystemUser#2023!"
+
+def require_internal_auth(x_internal_user: str = Header(None),
+                          x_internal_pass: str = Header(None)):
+    if x_internal_user != INTERNAL_ADMIN_USER or x_internal_pass != INTERNAL_ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return {"user": x_internal_user}
+
+class ExportJob(BaseModel):
+    dataset: str
+    target_url: str
+
+@app.post("/internal/export")
+async def create_export(job: ExportJob, _=Depends(require_internal_auth)):
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(job.target_url, json={"dataset": job.dataset})
+    return {"status": resp.status_code}
+```
+
+1. 第 10-11 行是硬编码凭据（CWE-798 本体），第 15-19 行的 `require_internal_auth` 直接与这两个常量比较，任何拿到源码或反编译产物的人都能伪造内部调用头，认证形同虚设。
+2. 外部输入点一：第 22-25 行 `ExportJob` 模型的 `target_url` 与 `dataset` 字段，由请求体 JSON 提供；第 28 行将其直接传入 `client.post` 的 URL 参数，构成 source→sink（SSRF）可达路径，且无任何白名单/域名校验。
+3. 防御验证：唯一的“防御”是第 15-19 行的 Header 比较，但它依赖硬编码常量，属于可绕过（凭据泄露即全绕过），且对 `target_url` 完全没有过滤——黑名单/字符串过滤均不存在。
+4. 第二入口：`/internal/export` 是唯一路由，但凭据本身可被用于直接构造对其他内部接口的调用；此外 `dataset` 原样转发到目标服务，构成间接注入通道。结论：漏洞成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-798 硬编码凭据（Hard-coded Credentials）", "risk_level": "Critical", "source": "line 22-25: 请求体 ExportJob 的 target_url/dataset 字段及 line 16-17 可被伪造的内部认证头", "sink": "line 28-29: httpx.AsyncClient.post 使用攻击者可控的 target_url 发起内部请求", "explanation": "数据流一：请求体 target_url -> line 28 client.post -> SSRF，无任何域名白名单校验；数据流二：line 10-11 硬编码的 INTERNAL_ADMIN_USER/PASSWORD 被 line 18 用于认证比较，凭据随源码泄露即可完全绕过内部认证；第二入口分析：/internal/export 为唯一路由，但泄露的硬编码凭据可作为替代通道访问其他受同一机制保护的内部接口，dataset 字段原样转发亦构成间接注入通道", "fix_suggestion": "line 10-11: 移除硬编码凭据，改为从环境变量或密钥管理服务注入，并对 target_url 增加内部域名白名单校验"}
+```

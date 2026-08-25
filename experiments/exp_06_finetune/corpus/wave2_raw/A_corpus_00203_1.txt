@@ -1,0 +1,71 @@
+LANG: php
+```code
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Routing\Controller;
+
+class PageRenderController extends Controller
+{
+    // Raw-content elements whose inner text is emitted unescaped,
+    // mirroring domino's hasRawContent set.
+    private array $rawContentTags = ['style', 'script', 'iframe', 'noembed', 'noscript', 'noframes', 'xmp', 'plaintext'];
+
+    private function escapeHtml(string $s): string
+    {
+        return htmlspecialchars($s, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    }
+
+    // Only escapes the attribute value; mirrors escapeAttr.
+    private function escapeAttr(string $s): string
+    {
+        return htmlspecialchars($s, ENT_QUOTES, 'UTF-8');
+    }
+
+    public function render(Request $request)
+    {
+        $tag = strtolower($request->input('tag', 'div'));
+        $attrs = (array) $request->input('attrs', []);
+        // External input: user-controlled inner content of the element.
+        $content = (string) $request->input('content', '');
+
+        if (!preg_match('/^[a-z][a-z0-9]*$/', $tag)) {
+            abort(400);
+        }
+
+        $html = '<' . $tag;
+        foreach ($attrs as $name => $value) {
+            $html .= ' ' . htmlspecialchars((string) $name) . '="' . $this->escapeAttr((string) $value) . '"';
+        }
+        $html .= '>';
+
+        if (!in_array($tag, $this->rawContentTags, true)) {
+            $html .= $this->escapeHtml($content);
+        } else {
+            // Raw content: only a partial blacklist filter is applied here.
+            // It strips exact '</style>' / '</script>' style closers for the
+            // current tag via str_replace, but misses case variants handled
+            // incompletely and does not neutralize the `<` of the match the
+            // way a serializer must; e.g. '</STYLE >' or '</style\t>'
+            // still breaks out of the raw-text context after de-serialization.
+            $closing = '</' . $tag . '>';
+            $html .= str_replace($closing, '', $content);
+        }
+
+        $html .= '</' . $tag . '>';
+
+        return response($html, 200)->header('Content-Type', 'text/html; charset=UTF-8');
+    }
+}
+```
+
+1. 第 30–32 行：`$request->input('tag')`、`$request->input('attrs')`、`$request->input('content')` 是全部外部输入点（Laravel 地道的输入获取方式），其中 `content` 与 `tag` 直接进入 HTML 序列化流程，可达 sink。
+2. 第 43 行：非 raw-content 标签走 `escapeHtml()`（等价于原代码的 `escape()`），该路径有有效防御；但第 47–56 行 raw-content 分支（对应原代码 `hasRawContent` 集合）仅用 `str_replace('</'.$tag.'>', '', ...)` 做黑名单字符串替换——按规则视为可绕过，未像原修复那样把匹配到的闭合标签的 `<` 转义为 `&lt;`。
+3. 绕过示例：`tag=style&content=</STYLE ><img src=x onerror=alert(1)>` 或 `</style\t>`——大小写变体、空白/制表符插入均不被精确匹配的 `str_replace` 捕获，浏览器在 raw-text 解析中遇到真实 `</style...>` 即闭合元素并执行后续注入内容。
+4. 第二入口确认：本控制器仅注册一条路由；但 `attrs` 数组键名经 `htmlspecialchars` 处理、`tag` 经正则白名单限制，均不构成额外 XSS 通道；唯一可利用通道是 raw-content 分支的 `content` 参数。因此结论为存在 CWE-79 漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (XSS) via improper escaping of matching closing tag in raw-content serialization", "risk_level": "High", "source": "line 31: $request->input('content') 用户可控的元素内文本", "sink": "line 55: $html .= str_replace(...) 后拼入响应体并作为 text/html 返回", "explanation": "主链: line 31 外部输入 content -> line 50 判定为 raw-content 标签 -> line 55 仅做精确字符串删除而非转义 < -> line 58 写入 HTML 响应; 防御分析: 非 raw-content 分支 line 43 的 htmlspecialchars 有效, 但 raw-content 分支的 str_replace 黑名单可被大小写变体(如 </STYLE>)或插入空白(如 </style\\t>)绕过, 等价于原漏洞中 escapeMatchingClosingTag 缺失导致反序列化后闭合标签逃逸; 第二入口: attrs 键值与 tag 分别经 htmlspecialchars 和正则白名单防护, 无其他路由或间接调用构成替代通道, 唯一可利用流即 content 参数", "fix_suggestion": "line 55: 用 preg_replace('/<\\s*\\/\\s*'.$tag.'(?:[\\s>])/i', '&lt;/$tag', $content) 将匹配到的闭合标签整体转义其起始 < , 而非直接删除"}
+```

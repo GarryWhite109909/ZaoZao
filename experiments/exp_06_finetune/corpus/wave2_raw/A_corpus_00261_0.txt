@@ -1,0 +1,46 @@
+LANG: python
+```code
+# faq/views.py
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.db import connection
+
+
+@csrf_exempt
+def rewrite_base(request):
+    """Adjusts the RewriteBase and ErrorDocument 404 entries for the user's environment."""
+    if request.method != 'POST':
+        return JsonResponse({'error': 'method not allowed'}, status=405)
+
+    server_path = request.POST.get('server_path', '/')
+    error_code = request.POST.get('error_code', '404')
+
+    with connection.cursor() as cursor:
+        # Look up the current rewrite base record for this installation path
+        cursor.execute(
+            "SELECT id, rewrite_base FROM setup_htaccess WHERE server_path = '" + server_path + "'"
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return JsonResponse({'error': 'no htaccess config found'}, status=404)
+
+        # Update the rewrite base and the matching ErrorDocument directive
+        new_404_path = server_path.rstrip('/') + '/index.php?action=404'
+        cursor.execute(
+            "UPDATE setup_htaccess SET rewrite_base = '%s', "
+            "error_document = '%s' WHERE server_path = '%s'"
+            % (server_path, error_code + ' ' + new_404_path, server_path)
+        )
+
+    return JsonResponse({'status': 'ok'})
+```
+
+1. 第 14 行 `request.POST.get('server_path')` 与第 15 行 `request.POST.get('error_code')` 是全部外部输入点（source），均为攻击者可控的 POST 参数，无任何白名单/路径校验。
+2. 第 19-21 行：`server_path` 通过字符串拼接直接进入 `cursor.execute` 的 SELECT 语句（sink），中间没有任何转义、参数化或过滤，单引号闭合即可注入额外 SQL。
+3. 第 27-30 行：`server_path`、`error_code` 再次通过 `%` 格式化拼进 UPDATE 语句（第二处 sink），同样未用参数占位符；Django ORM 未被使用，`connection.cursor()` 原生执行不提供自动防护。
+4. 第二入口核查：本文件仅注册一个路由视图，但同一 `server_path` 同时流入 SELECT 和 UPDATE 两条数据流，且 `error_code` 也直达 UPDATE，构成多条可达的注入通道；无其他防御层兜底。
+5. 结论：source→sink 完全可达且防御缺失，属于经典 SQL 注入。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "Critical", "source": "line 14-15: request.POST.get('server_path') / request.POST.get('error_code')", "sink": "line 20-21 and line 28-30: cursor.execute string concatenation", "explanation": "server_path 从 POST 直达第 20 行 SELECT 的拼接 SQL; 同一 server_path 与 error_code 又在第 28 行经 % 格式化进入 UPDATE; 全程无参数化查询或转义, 黑名单/替换类过滤也不存在; 文件仅此一个路由入口, 但两条语句构成两个可达 sink, 注入均可绕过", "fix_suggestion": "line 20: 改用参数化查询 cursor.execute(sql, [server_path]) 并对 UPDATE 同样使用占位符"}
+```

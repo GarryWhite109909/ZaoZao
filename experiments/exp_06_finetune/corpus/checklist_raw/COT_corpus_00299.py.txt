@@ -1,0 +1,24 @@
+## 漏洞分析
+
+**步骤 1：枚举用户可控输入点并追踪数据流**
+
+- 入口 `create_privacy_filter_pipeline(model_name)`（第 247 行）：`model_name` 为用户可控字符串。
+- 数据流 A：第 254 行 `select_privacy_filter_backend(model_name)` → 第 202 行 `"mlx" in name_lc` 子串匹配 → 第 212–213 行返回 `"mlx"` → 第 259 行 `create_mlx_pipeline(actual_model)`（模型加载/执行 sink）。
+- 数据流 B：第 255 行 `resolve_privacy_filter_model(model_name, backend)` → 第 231 行同样以 `"mlx" in ...` 子串判断 → 第 232 行 `_torch_fallback_for`（第 181–184 行仍是子串匹配）→ 第 262 行 `PrivacyFilterTorchPipeline(actual_model)`。
+
+**步骤 2：防御有效性验证**
+
+- 唯一的“防护”是第 202、231 行的子串匹配（`"mlx" in name_lc`）以及第 182–183 行的家族标记子串匹配。这属于黑名单/启发式过滤：攻击者只需在模型名中包含 `mlx` 子串即可将任意模型路由到 MLX 加载路径；反之，不含 `mlx` 的恶意名会走 Torch 路径。子串匹配既不校验仓库归属白名单，也不验证工件签名，无法完整覆盖任何一条流，视为可绕过、非有效防御。
+- 后续 sink（第 259 行 `create_mlx_pipeline`、第 262 行 `PrivacyFilterTorchPipeline`）直接用未经验证的 `actual_model` 触发模型下载与反序列化加载，加载路径中若含不可信代码（自定义代码/pickle 工件）即构成远程代码执行。
+
+**步骤 3：第二入口检查**
+
+- 存在替代通道：`get_backend(name)`（第 115 行）对 `name` 有精确白名单 `_BACKENDS`（第 130 行），该入口安全；但 privacy-filter 分发器（第 247 行）是独立公开入口，绕过了白名单逻辑，直接以子串匹配决定加载哪个后端与工件，构成第二入口漏洞通道。
+
+**步骤 4：结论**
+
+用户可控 `model_name` 经可绕过的子串匹配路由至模型加载 sink，无白名单/签名校验，存在 CWE-94 代码注入（通过不可信模型加载实现 RCE），风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-94 Code Injection via Untrusted Model Loading", "risk_level": "High", "source": "line 247: create_privacy_filter_pipeline(model_name) 用户可控模型名", "sink": "line 259: create_mlx_pipeline(actual_model)；line 262: PrivacyFilterTorchPipeline(actual_model)", "explanation": "model_name -> 第202/231行 'mlx' 子串匹配(可绕过的启发式过滤, 非白名单) -> 第254/255行路由 -> 第259/262行以未验证名称触发模型下载与反序列化加载 -> 攻击者可用含 mlx 子串的任意仓库名诱导加载不可信工件实现代码执行", "fix_suggestion": "line 202 与 line 231: 将 'mlx' in name_lc 子串匹配改为精确允许集(如 model_name in 已知 MLX 工件白名单)并在加载前校验仓库归属"}
+```

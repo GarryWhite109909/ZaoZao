@@ -2,50 +2,44 @@ LANG: php
 ```php
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Admin;
 
-use Illuminate\Http\Request;
+use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Storage;
-use App\Models\Post;
-use App\Models\Tag;
+use Illuminate\Support\Facades\Artisan;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class DbController extends Controller
 {
-    // routes/web.php: Route::post('/db/export', [DbController::class, 'exportContent']);
-    public function exportContent(Request $request)
+    // GET /admin/db/export?filename=xxx.zip
+    public function exportContent(\Illuminate\Http\Request $request)
     {
-        $filename = $request->input('filename');
+        $filename = $request->query('filename');
 
         if ($filename) {
-            // 直接用用户提供的文件名拼接磁盘路径，未做 basename/白名单校验
-            $path = 'backups/' . $filename;
-
-            if (!Storage::disk('local')->exists($path)) {
+            if (!Storage::disk('backups')->exists($filename)) {
                 abort(404);
             }
 
-            return response()->download(
-                Storage::disk('local')->path($path),
-                basename($filename)
-            );
+            return new StreamedResponse(function () use ($filename) {
+                echo Storage::disk('backups')->get($filename);
+            }, 200, [
+                'Content-Type' => 'application/zip',
+                'Content-Disposition' => 'attachment; filename="' . basename($filename) . '"'
+            ]);
         }
 
-        return response()->streamDownload(function () {
-            echo json_encode([
-                'posts' => Post::all()->toArray(),
-                'tags' => Tag::all()->toArray()
-            ]);
-        }, 'content-export-' . now()->format('YmdHis') . '.json');
+        Artisan::call('db:backup');
+        return response()->json(['ok' => true]);
     }
 }
 ```
 
-1. 第 15 行：`$request->input('filename')` 是外部输入入口（source），攻击者可传入任意字符串如 `../../.env`。
-2. 第 19 行：直接将用户输入拼接到存储相对路径 `'backups/' . $filename`，没有调用 `basename()`、`realpath()` 或白名单校验。
-3. 第 21 行：`Storage::exists($path)` 会跟随 `../` 解析到 backups 目录之外的文件，仅作为存在性检查而非防御。
-4. 第 23-26 行：`response()->download(Storage::path($path))` 是 sink——将解析后的绝对路径交给下载响应，攻击者可读取服务器上任意可读文件（路径遍历）。
-5. 整个链路中 Laravel 的 Storage 抽象本身不阻止 `..` 序列，且控制器层无任何中间件或输入过滤拦截该参数，防御完全缺失。
+1. 第 12 行：`$request->query('filename')` 是外部输入入口（source），攻击者可通过 URL 查询参数传入任意字符串，如 `../../.env`。
+2. 第 14-16 行：`Storage::disk('backups')->exists($filename)` 仅做存在性检查，Laravel 的 local 磁盘驱动在路径解析时不会阻止 `../` 越出配置的 root 目录，因此该检查不构成路径遍历防御。
+3. 第 18-21 行：`Storage::disk('backups')->get($filename)` 直接以用户输入作为相对路径读取文件内容并流式返回（sink），`basename()` 只用于响应头文件名，未作用于实际读取路径，无任何白名单或 realpath 校验。
+4. 第二入口分析：本控制器中无其他路由读取该磁盘；但同一 disk 若被其他控制器复用则同样可被利用；`Artisan::call('db:backup')` 分支不含用户输入，不可达 sink。主链 source→sink 完整可达且防御缺失。
 
 ```json
-{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径遍历（Improper Limitation of a Pathname to a Restricted Directory）", "risk_level": "high", "source": "line 15: $request->input('filename') 用户可控的文件名参数", "sink": "line 24: response()->download(Storage::disk('local')->path($path)) 使用未净化的路径读取并下载文件", "explanation": "用户提供的 filename -> 拼接为 backups/$filename -> 未做 basename/realpath/白名单校验 -> Storage::path 解析 ../ 后交由 download() 输出任意文件内容", "fix_suggestion": "line 19: 对 filename 调用 basename() 剥离目录成分，并用正则白名单（如 /^[A-Za-z0-9_-]+\.(json|zip)$/）校验后再拼接路径"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "High", "source": "line 12: $request->query('filename') 外部查询参数", "sink": "line 19: Storage::disk('backups')->get($filename) 文件读取", "explanation": "第12行用户可控 filename -> 第14行 exists() 仅存在性检查且 Laravel local 磁盘不拦截 ../ -> 第19行 get() 按相对路径读取任意文件并经 StreamedResponse 回显; 无白名单/realpath/黑名单校验, 字符串过滤类防御均视为可绕过; 第二入口排查: 同控制器其余分支与 Artisan 调用不含用户输入不可达 sink, 但共享 backups 磁盘的其他路由构成替代通道, 不影响主链结论", "fix_suggestion": "line 13: 对 $filename 执行 basename() 并用白名单正则(如 /^[a-zA-Z0-9_-]+\\.zip$/)校验, 或用 realpath 确认解析后路径仍位于备份根目录内"}
 ```

@@ -1,0 +1,16 @@
+**步骤 1：枚举用户可控输入点与 sink**
+- 第 100 行 `get_body(url=...)` 的 `url` 参数为用户可控输入；第 118 行 `_validate_url_for_fetch(current_url)` 为校验点，第 122-129 行 `httpx.get(current_url, ...)` 为网络请求 sink（SSRF 危险操作）。`headers`/`query_parameters` 仅作为请求头/参数传递，不构成 SSRF 注入面。
+
+**步骤 2：追踪 source→sink 数据流并验证防御**
+- url → 第 119 行循环内每次重定向都调用 `_validate_url_for_fetch`（第 155-190 行），校验 scheme 白名单（http/https）、localhost 黑名单、并通过 `_get_ips_from_host`（第 88-105 行）自行解析 IP 后用 `_is_safe_ip`（ip.is_global）判断。
+- 防御缺陷：校验使用的是代码自己调用 `socket.getaddrinfo` 得到的 IP，而第 122 行 `httpx.get` 连接时由 httpx **独立进行第二次 DNS 解析**。两次解析之间无绑定（未固定 IP、未复用解析结果），攻击者可通过 DNS rebinding / 多 A 记录轮换，使第一次解析返回公网 IP 通过校验、第二次解析返回内网地址（如 169.254.169.254、10.x.x.x），绕过全部防护到达 sink。这是典型的 TOCTOU 校验-使用不一致。
+
+**步骤 3：检查第二入口/替代通道**
+- 重定向路径（第 141-143 行）虽每跳重新校验，但同样受上述双重解析问题影响；`allow_private_network=True` 时直接跳过校验属显式开关，不算漏洞通道。`join_url` 不发起请求，非 sink。因此唯一有效入口即 `url` → `httpx.get`，但该流的防御无效。
+
+**步骤 4：结论**
+存在 SSRF 漏洞（CWE-918）：DNS 解析结果未与实际连接绑定，校验可被 rebinding 绕过。风险等级 High（可访问云元数据/内网服务，需用户输入 URL 触发）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 SSRF (Server-Side Request Forgery)", "risk_level": "High", "source": "line 100: get_body(url) 用户可控 URL", "sink": "line 122: httpx.get(current_url) 独立二次 DNS 解析后连接", "explanation": "url -> _validate_url_for_fetch 用 socket.getaddrinfo 自行解析并校验 is_global -> httpx.get 连接时再次独立解析 DNS -> 两次解析结果未绑定 -> DNS rebinding 使首查公网 IP 过检、实连内网 IP -> SSRF", "fix_suggestion": "line 122: 将校验阶段解析出的安全 IP 固定用于连接（如通过自定义 transport/pin 或改用已验证的 IP 直连并设置 Host 头），消除二次解析"}
+```
