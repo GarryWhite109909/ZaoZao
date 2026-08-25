@@ -1,0 +1,63 @@
+LANG: java
+```java
+package com.ops.exec;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * 运维命令封装库：被消息队列消费者调用，处理部署/巡检指令消息。
+ * 消息体为 JSON 载荷，由上层消费者反序列化后传入 handle()。
+ */
+public class OpsCommandRunner {
+
+    // 仅允许的运维操作白名单，每个操作绑定固定的参数模板
+    private static final Map<String, List<String>> ALLOWED = Map.of(
+        "disk_usage",  List.of("df", "-h"),
+        "service_status", List.of("systemctl", "status"),
+        "log_tail",    List.of("tail", "-n", "100")
+    );
+
+    private static final Set<String> VALID_UNITS =
+        Set.of("nginx", "redis", "postgres", "app-server");
+
+    /**
+     * 回调入口：message 为队列消息体（外部提交的载荷），不可信。
+     * message 结构: {"action": "...", "target": "..."}
+     */
+    public String handle(Map<String, String> message) throws Exception {
+        String action = message.get("action");
+        String target = message.get("target");
+
+        List<String> template = ALLOWED.get(action);          // 第 27 行：白名单查表
+        if (template == null) {
+            throw new IllegalArgumentException("unknown action");
+        }
+        if (!VALID_UNITS.contains(target)) {                  // 第 31 行：目标白名单
+            throw new IllegalArgumentException("invalid target");
+        }
+
+        ProcessBuilder pb = new ProcessBuilder();             // 第 35 行
+        pb.command(appendArg(template, target));              // 参数数组，无 shell 解析
+        pb.redirectErrorStream(true);
+        Process p = pb.start();
+        return new String(p.getInputStream().readAllBytes());
+    }
+
+    private static List<String> appendArg(List<String> t, String arg) {
+        return new java.util.ArrayList<>(t) {{ add(arg); }};
+    }
+}
+```
+
+1. 污点边界：本文件无 request/input/environ 等显式 web 入口；第 22 行回调参数 `message` 是消息队列消息体载荷，承载外部可控数据，属等效污点源，必须按不可信处理。
+2. 数据流一：`message.get("action")`（第 25 行）→ 第 27 行 `ALLOWED.get(action)` 精确匹配固定命令模板，未命中即抛异常；action 不进入任何 shell 字符串拼接，仅作查表键，攻击面为零。
+3. 数据流二：`message.get("target")`（第 26 行）→ 第 31 行 `VALID_UNITS.contains(target)` 白名单校验，仅允许四个预定义服务名，任何含分号、反引号、空格、`$()` 的注入载荷均无法通过；通过后于第 36 行作为 `ProcessBuilder.command(...)` 参数数组的最后一个元素传入——参数数组形式不经过 `/bin/sh`，即使值含元字符也仅作为字面参数，构成原生安全 API 防御。
+4. 防御评估：类型正确（白名单 + 无 shell 的参数数组执行，非黑名单/正则/字符串替换）；位置正确（校验位于 source 与 sink 之间、sink 之前）；覆盖完整——两条污点流（action、target）均被覆盖，且 sink 本身不解析 shell 元字符，双保险。
+5. 第二入口检查：文件内唯一公开方法为 `handle(Map)`，无其他路由、静态字段可变状态或间接调用点；`appendArg` 为私有纯函数，不引入新通道。
+6. 结论：source→sink 全部路径均受有效防御保护，不存在 CWE-78 命令注入。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "回调参数 message 为队列消息体等效污点源；流一 action 经第 27 行固定模板白名单查表且不参与命令拼接；流二 target 经第 31 行白名单校验后以参数数组形式传入 ProcessBuilder.command，不经 shell 解析；防御类型正确、位置在 sink 前、覆盖全部两条数据流；第二入口检查确认文件内仅有 handle 一个公开入口，无替代通道", "fix_suggestion": "no fix needed"}
+```

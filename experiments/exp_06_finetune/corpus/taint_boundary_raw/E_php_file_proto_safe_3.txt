@@ -1,0 +1,65 @@
+LANG: php
+```php
+<?php
+declare(strict_types=1);
+
+namespace App\Import\Adapter;
+
+use PDO;
+
+/**
+ * 外部系统记录导入适配器。
+ * 由上层导入服务调用：传入上游系统投递的 JSONL 批次文件路径，
+ * 每行是一条外部提交的记录（字段名与值均不可信）。
+ */
+final class RecordImportAdapter
+{
+    /** 允许写入的列白名单，防止解析出的任意键进入 SQL。 */
+    private const ALLOWED_COLUMNS = ['external_id', 'name', 'email', 'status'];
+
+    public function __construct(private readonly PDO $db) {}
+
+    public function import(string $batchFilePath): int
+    {
+        $count = 0;
+        foreach (file($batchFilePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+            $record = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
+            if (!is_array($record)) {
+                continue;
+            }
+            // 白名单过滤键 + 仅保留标量值
+            $cols = array_values(array_intersect(array_keys($record), self::ALLOWED_COLUMNS));
+            if ($cols === []) {
+                continue;
+            }
+            $placeholders = implode(', ', array_fill(0, count($cols), '?'));
+            $stmt = $this->db->prepare(
+                'INSERT INTO imported_records (' . implode(', ', $cols) . ') VALUES (' . $placeholders . ')'
+            );
+            $values = [];
+            foreach ($cols as $c) {
+                $values[] = is_scalar($record[$c]) ? (string) $record[$c] : '';
+            }
+            $stmt->execute($values);
+            $count++;
+        }
+        return $count;
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/argv 等显式 web 入口；污点源是第 21 行 `file()` 读入的批次文件内容——该文件由外部系统投递、上层服务透传路径而来，其中每行 JSON 的键与值都是外部可控数据，必须按不可信处理。
+
+2. 第 22 行 `json_decode` 将文件内容解析为关联数组，攻击者完全控制数组键名与值；若直接把 `$record` 的键拼进 SQL 即构成 CWE-89 注入面。
+
+3. 防御一（位置正确）：第 26 行 `array_intersect(array_keys($record), self::ALLOWED_COLUMNS)` 对进入 SQL 列名的部分做白名单校验——只有常量集合中的四个合法列名能存活，注入载荷作为键名会被直接丢弃；白名单属于类型正确的防御（非黑名单/正则/字符串替换），且位于拼接点之前，覆盖了全部列名攻击面。
+
+4. 防御二（类型正确）：第 29-31 行构造的 SQL 中所有值均以 `?` 占位符出现，第 34 行 `$stmt->execute($values)` 走 PDO 预编译参数绑定，值不参与 SQL 文法解析，单引号、注释符等注入手法全部失效；占位符数量由白名单后的 `$cols` 决定，二者一致，无遗漏通道。
+
+5. 唯一动态拼接进 SQL 字符串的是第 30 行 `implode(', ', $cols)`，其元素已被第 26 行白名单约束为四个字面量之一，因此拼接结果恒为安全子集；无其他 sink（无 eval/exec/include）。
+
+6. 第二入口检查：本模块仅暴露 `import(string $batchFilePath)` 一个公开方法，无其他路由、属性注入或间接调用可绕过白名单或预编译；文件内容是唯一数据来源且全程受控。结论：不存在 CWE-89 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一污点源为第21行file()读入的外部批次文件内容，经json_decode后键值均不可信; 列名流经第26行array_intersect对常量白名单ALLOWED_COLUMNS的交集过滤后才在第30行拼接进SQL，白名单属类型正确且位置在拼接点之前的防御，覆盖全部键名攻击面; 所有值通过第31行?占位符与第34行execute参数绑定进入PDO预编译语句，值不参与SQL文法解析，注入失效; 无eval/exec/include等其他sink; 第二入口检查: 模块仅暴露import一个方法，无其他路由或间接调用可绕过防御，结论安全", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,63 @@
+LANG: go
+```go
+// Package webhookconf 解析出站 webhook 配置文件（由运维平台下发到本地磁盘），
+// 上层投递服务调用 LoadAndDispatch 消费解析结果并向目标地址发送事件。
+package webhookconf
+
+import (
+	"encoding/xml"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+type HookConfig struct {
+	XMLName xml.Name `xml:"hook"`
+	URL     string   `xml:"url"`
+	Event   string   `xml:"event"`
+}
+
+var allowedEvents = map[string]bool{"build": true, "deploy": true, "alert": true}
+
+// LoadAndDispatch 读取配置文件并触发一次出站 webhook。
+func LoadAndDispatch(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var cfg HookConfig
+	if err := xml.Unmarshal(raw, &cfg); err != nil { // 第 24 行：解析外部可控的文件内容
+		return fmt.Errorf("parse hook config: %w", err)
+	}
+	if !allowedEvents[cfg.Event] { // 第 27 行：白名单校验
+		return fmt.Errorf("event not allowed: %s", cfg.Event)
+	}
+	u := strings.TrimSpace(cfg.URL)
+	if !strings.HasPrefix(u, "https://") { // 第 30 行：协议白名单，仅允许 https
+		return fmt.Errorf("url scheme rejected")
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(u, "application/json", strings.NewReader(`{"event":"`+cfg.Event+`"}`))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+```
+
+1. 污点边界：本文件没有任何 request/argv/environ 等显式 web 入口；污点源是第 22 行 os.ReadFile 读入、第 24 行 xml.Unmarshal 解析的配置文件内容。该文件由外部平台下发，属于公开接口提交的内容，必须按不可信数据处理，是等效污点源。
+
+2. 数据流追踪：cfg.URL（第 25 行）→ 第 30 行协议白名单 → 第 35 行 client.Post 的目标地址（sink：向外部地址发起请求）；cfg.Event → 第 27 行白名单 → 第 36 行拼入请求体。
+
+3. CWE-611（XXE）防御有效性：Go 标准库 encoding/xml 的 Unmarshal 不解析 DTD、不处理外部实体（无 entity expansion / external entity resolution），第 24 行即使文件内嵌 `<!DOCTYPE ... SYSTEM "file:///etc/passwd">` 或 billion-laughs 实体也不会被展开，属于原生安全 API 级别的结构性防御，类型正确且覆盖全部实体攻击面。
+
+4. SSRF/出站方向防御：第 30 行强制 https 前缀白名单，阻止 file://、gopher:// 等危险 scheme；第 27 行事件白名单保证进入请求体的字段只能是枚举值，不存在注入面。两处校验均位于 sink 之前、作用于最终值本身，非黑名单或可绕过的字符串替换过滤。
+
+5. 第二入口检查：包内唯一导出函数为 LoadAndDispatch，path 参数来自上层服务传入的固定配置路径，无其他路由、参数或间接调用通道；除该文件内容外无其他外部数据来源。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第22行读取并由第24行xml.Unmarshal解析的外部下发配置文件，等效于不可信外部输入；CWE-611方面Go标准库encoding/xml不解析DTD与外部实体，实体注入在语言层面被结构性阻断，属原生安全API防御且覆盖全部实体攻击面；URL流向第35行client.Post前经第30行https协议白名单校验，Event流向请求体前经第27行枚举白名单校验，均为位置正确、类型正确的白名单防御；全文件仅LoadAndDispatch一个入口，无第二入口或替代数据通道，故不构成漏洞", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,51 @@
+LANG: php
+```php
+<?php
+declare(strict_types=1);
+
+namespace Acme\PluginSystem\Hooks;
+
+use PDO;
+use Acme\PluginSystem\EventPayload;
+
+/**
+ * 订单状态变更钩子：宿主插件管理器在订单事件触发时，
+ * 以外部提交的事件载荷调用本钩子（EventPayload 由消息体反序列化而来）。
+ */
+class OrderStatusHook
+{
+    private const ALLOWED_STATUSES = ['pending', 'paid', 'shipped', 'refunded', 'cancelled'];
+
+    public function __construct(private PDO $db) {}
+
+    public function handle(EventPayload $payload): void
+    {
+        $orderId = (string) $payload->get('order_id');
+        $status  = (string) $payload->get('new_status');
+
+        // 白名单校验：仅允许预定义的合法状态值，杜绝载荷注入
+        if (!in_array($status, self::ALLOWED_STATUSES, true)) {
+            return;
+        }
+        if (!ctype_digit($orderId)) {
+            return;
+        }
+
+        $stmt = $this->db->prepare(
+            'UPDATE orders SET status = :status WHERE id = :id'
+        );
+        $stmt->execute([':status' => $status, ':id' => (int) $orderId]);
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；唯一外部数据通道是第 17 行回调签名中的 `EventPayload $payload`——宿主以外部提交的事件载荷调用钩子，`$payload->get(...)` 返回的内容必须按不可信外部数据处理，是等效污点源。
+2. 第 18-19 行从载荷取出 `order_id` 与 `new_status`，构成两条 source→sink 数据流，均流向第 29 行 `$stmt->execute()` 触发的 SQL 更新（sink）。
+3. 防御一（类型/位置/覆盖）：第 22-24 行对 `new_status` 做严格白名单校验（`in_array ... true`），只放行五个预定义字面量，任何注入载荷都无法通过；这是白名单校验而非黑名单/正则过滤，不可绕过。
+4. 防御二：第 26-28 行使用 PDO `prepare` 参数化查询，占位符 `:status`、`:id` 在驱动层与 SQL 语法分离，即使有残余污点也无法改变语句结构；同时第 21 行 `ctype_digit` + 第 29 行 `(int)` 强转保证 id 为纯数字。两道防御位置均位于 sink 之前的必经路径，覆盖全部攻击面。
+5. 第二入口检查：文件内无其他函数入口、无 include 动态调用、无全局变量读取；`handle()` 是唯一公开方法，且其全部数据流都经过上述白名单+参数化双重防御。
+6. 结论：所有 source→sink 路径均被有效防御覆盖，不存在可利用的 SQL 注入。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点是第17行回调参数 EventPayload 承载的外部事件载荷; 流1 new_status 经第22-24行严格白名单(in_array strict)校验后进入第29行 execute, 注入载荷无法通过白名单; 流2 order_id 经第21行 ctype_digit 校验并在第29行强转为 int 后作为绑定参数传入; 第26-28行 PDO prepare 参数化查询使数据与 SQL 语法在驱动层分离, 两道防御均为类型正确(白名单+预编译)、位置正确(sink 前必经路径)、覆盖完整(无绕过路径); 第二入口检查: 文件无其他公开方法/动态调用/全局读取, handle 为唯一入口且全路径受防御", "fix_suggestion": "no fix needed"}
+```

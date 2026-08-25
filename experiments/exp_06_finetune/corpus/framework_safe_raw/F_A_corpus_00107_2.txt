@@ -1,0 +1,83 @@
+LANG: java
+```code
+package com.example.cache;
+
+import org.springframework.web.bind.annotation.*;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.*;
+
+@RestController
+@RequestMapping("/api/cache")
+public class CacheEntryController {
+
+    private final RedisTemplate<String, byte[]> redisTemplate;
+    // whitelist of allowed cacheable types: only safe DTOs may be stored/restored
+    private static final java.util.Set<String> ALLOWED_TYPES =
+            java.util.Set.of("com.example.cache.CacheEntryDTO");
+
+    public CacheEntryController(RedisTemplate<String, byte[]> redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
+
+    @PostMapping("/{entryId}")
+    public void set(@PathVariable String entryId,
+                    @RequestParam(required = false) Integer lifetime,
+                    @RequestBody String json) throws IOException {
+        if (entryId == null || entryId.isBlank()) {
+            throw new IllegalArgumentException("invalid cache entry identifier");
+        }
+        // validate payload is a whitelisted type before persisting
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.activateDefaultTyping(
+                new com.fasterxml.jackson.databind.jsontype.impl.LaissezFaireSubTypeValidator() {
+                    @Override
+                    public boolean validateSubType(Class<?> subType, com.fasterxml.jackson.databind.JavaType baseType) {
+                        return ALLOWED_TYPES.contains(subType.getName());
+                    }
+                },
+                ObjectMapper.DefaultTyping.NON_FINAL);
+        Object value = mapper.readValue(json, Object.class);
+        redisTemplate.opsForValue().set(entryId, mapper.writeValueAsBytes(value));
+    }
+
+    @GetMapping("/{entryId}")
+    public Object get(@PathVariable String entryId) throws IOException, ClassNotFoundException {
+        if (entryId == null || entryId.isBlank()) {
+            throw new IllegalArgumentException("invalid cache entry identifier");
+        }
+        byte[] raw = redisTemplate.opsForValue().get(entryData(entryId));
+        if (raw == null) {
+            return null;
+        }
+        // replace native Java deserialization with JSON + strict subtype whitelist
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.activateDefaultTyping(
+                new com.fasterxml.jackson.databind.jsontype.impl.LaissezFaireSubTypeValidator() {
+                    @Override
+                    public boolean validateSubType(Class<?> subType, com.fasterxml.jackson.databind.JavaType baseType) {
+                        return ALLOWED_TYPES.contains(subType.getName());
+                    }
+                },
+                ObjectMapper.DefaultTyping.NON_FINAL);
+        return mapper.readValue(raw, Object.class);
+    }
+
+    private String entryData(String entryId) {
+        return entryId; // key unchanged, kept for clarity
+    }
+}
+```
+
+1. 第 22-24 行：用户可控输入点为 `@PathVariable entryId`、`@RequestParam lifetime`、`@RequestBody`（原为 `byte[] data`，现改为 `String json`），GET 入口的可控输入为第 44 行的 `entryId`。
+2. 第 55 行（原代码）：sink 是 `ObjectInputStream.readObject()`，直接反序列化攻击者写入 Redis 的任意字节流，构成 CWE-502 完整链路：POST 写入 → Redis → GET 读取 → readObject。
+3. 第 57-63 行：修复采用框架原生安全 API——Jackson 的 `activateDefaultTyping` 配合自定义 `validateSubType` 白名单精确允许集（仅 `com.example.cache.CacheEntryDTO`），任何不在白名单内的类型在反序列化时直接抛异常；这是白名单精确允许集而非黑名单/正则过滤，符合有效防御要求。
+4. 类型正确性：白名单校验发生在 `readValue` 内部、对象实例化之前，攻击面覆盖完整——即使 payload 中嵌入 `["com.example.cache.Evil", {...}]` 形式的多态类型标记也会被拒绝；同时移除了 `ObjectInputStream`，彻底消除原生 Java 反序列化 gadget 链。
+5. 位置正确性：防御位于 sink 所在的读取路径（get 方法）与写入路径（set 方法）两处，数据流走向、路由注册、依赖注入、RedisTemplate 用法均保持不变，仅替换反序列化机制这一最小改动。
+6. 第二入口检查：GET 路径是唯一反序列化入口，已同样加固；`lifetime` 参数未参与反序列化，`entryId` 仅作 Redis 键使用且无拼接注入风险，无其他替代通道可达 sink。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞链路：POST 请求体字节经 RedisTemplate 存入 Redis 后由 GET 读取并经 ObjectInputStream.readObject 反序列化不可信数据（CWE-502）；修复后移除原生 Java 序列化，改用 Jackson activateDefaultTyping 加严格子类白名单（仅允许 CacheEntryDTO），写入与读取两条路径均受白名单约束，无残留反序列化入口", "fix_suggestion": "line 55-63: 将 ObjectInputStream.readObject 替换为基于 Jackson 白名单类型校验的反序列化"}
+```

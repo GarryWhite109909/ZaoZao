@@ -1,0 +1,64 @@
+LANG: php
+```php
+<?php
+declare(strict_types=1);
+
+namespace Acme\Config;
+
+/**
+ * 配置/清单文件解析模块。
+ * 被上层服务调用：上层从消息队列/CLI 工具拿到用户提交的配置文件内容后，
+ * 将其作为字符串参数传入本模块解析。
+ */
+final class ManifestParser
+{
+    /** 允许的配置文件格式白名单 */
+    private const ALLOWED_FORMATS = ['json', 'yaml'];
+
+    /**
+     * 解析外部提交的清单内容。
+     * $rawContent 为不可信数据（外部提交），$format 由调用方声明。
+     */
+    public function parse(string $rawContent, string $format): array
+    {
+        // 防御点：格式白名单校验，仅允许 json/yaml 两种声明格式
+        if (!in_array($format, self::ALLOWED_FORMATS, true)) {
+            throw new \InvalidArgumentException('unsupported manifest format');
+        }
+
+        // 防御点：使用原生安全 API —— libxml 关闭实体加载，
+        // 从根上禁用 XXE（CWE-611），而非黑名单过滤
+        $prev = libxml_disable_entity_loader(true);
+        try {
+            $doc = new \DOMDocument();
+            // LIBXML_NONET 禁止网络访问，LIBXML_NOENT 不启用实体替换
+            $doc->loadXML($rawContent, LIBXML_NONET | LIBXML_PARSE_HUGE);
+            return $this->toArray($doc);
+        } finally {
+            libxml_disable_entity_loader($prev);
+        }
+    }
+
+    private function toArray(\DOMDocument $doc): array
+    {
+        $out = [];
+        foreach ($doc->documentElement->childNodes as $node) {
+            if ($node instanceof \DOMElement) {
+                $out[$node->nodeName] = trim($node->textContent);
+            }
+        }
+        return $out;
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口，但第 21 行公开方法 `parse(string $rawContent, string $format)` 的两个函数参数承载上层服务传入的外部提交配置内容，按不可信数据处理，是等效污点源。
+2. 数据流追踪：`$rawContent`（第 21 行）→ 第 33 行 `loadXML()`，这是 XML 解析 sink，若未防护则外部 DTD/实体可导致 CWE-611（XXE）。
+3. 防御一（类型正确）：第 27 行 `libxml_disable_entity_loader(true)` 在 PHP 层面全局关闭外部实体加载器，属于原生安全 API 而非黑名单/正则过滤，无法通过构造 DOCTYPE 绕过；且置于 `try` 前并在 `finally` 中恢复，异常路径下也不会留下不安全状态。
+4. 防御二（位置正确、覆盖完整攻击面）：第 32 行 `loadXML(..., LIBXML_NONET | LIBXML_PARSE_HUGE)`——`LIBXML_NONET` 阻止解析期间任何网络请求（覆盖远程 DTD/SSO 类 XXE 变体）；注意此处未传 `LIBXML_NOENT`，即不进行实体替换，配合实体加载器关闭，本地文件读取与 SSRF 两条 XXE 攻击面均被阻断。防御位于 sink 调用前一行，位置紧贴且无绕过分支。
+5. `$format` 参数流向 `in_array` 白名单严格比较（第 25 行）仅决定是否抛异常，不进入任何危险 sink，本身无风险；`toArray` 仅遍历已安全解析后的 DOM 文本节点，无二次 sink。
+6. 第二入口检查：全文件仅一个公开方法 `parse`，私有方法 `toArray` 只接收内部已净化的 DOMDocument；不存在其他路由、回调或间接调用通道将未净化数据送达 `loadXML`。结论：无漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点是 parse 方法的 rawContent 与 format 函数参数（等效污点源）；rawContent 流向 loadXML 前，先经 libxml_disable_entity_loader(true) 关闭实体加载（原生安全 API，非黑名单可绕过），再以 LIBXML_NONET|LIBXML_PARSE_HUGE 标志解析并刻意不启用 LIBXML_NOENT，同时阻断本地文件读取与远程 DTD/SSRF 两条 XXE 攻击面，防御类型正确、位置紧贴 sink、覆盖完整；format 参数仅经 in_array 严格白名单校验用于抛异常，不达任何危险 sink；第二入口检查确认全文件无其他公开方法或间接调用可将未净化数据送达 loadXML，故无 CWE-611 漏洞。", "fix_suggestion": "no fix needed"}
+```

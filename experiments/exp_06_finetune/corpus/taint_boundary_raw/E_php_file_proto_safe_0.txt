@@ -1,0 +1,55 @@
+LANG: php
+```php
+<?php
+declare(strict_types=1);
+
+namespace ArchiveTool\Parser;
+
+/**
+ * 归档清单解析模块：被上层归档服务调用，处理外部提交的归档包内 manifest.xml。
+ * manifest.xml 来自不可信上传方，其内容按污点数据处理。
+ */
+class ManifestParser
+{
+    private const ALLOWED_ACTIONS = ['extract', 'verify', 'list'];
+
+    public function parse(string $manifestPath): array
+    {
+        $raw = file_get_contents($manifestPath);
+        if ($raw === false) {
+            throw new \RuntimeException('manifest unreadable');
+        }
+
+        // 防御 1：禁用外部实体加载，阻断 XXE（CWE-611）
+        $prev = libxml_disable_entity_loader(true);
+
+        // 防御 2：LIBXML_NONET 禁止网络取 DTD；不替换实体
+        $doc = new \DOMDocument();
+        $loaded = $doc->loadXML($raw, LIBXML_NONET | LIBXML_NOERROR);
+        libxml_disable_entity_loader($prev);
+        if (!$loaded) {
+            throw new \RuntimeException('invalid manifest');
+        }
+
+        $action = (string)$doc->getElementsByTagName('action')->item(0)?->nodeValue;
+        $target = (string)$doc->getElementsByTagName('target')->item(0)?->nodeValue;
+
+        // 防御 3：白名单校验 action，杜绝任意操作分发
+        if (!in_array($action, self::ALLOWED_ACTIONS, true)) {
+            throw new \InvalidArgumentException('action not allowed');
+        }
+        return ['action' => $action, 'target' => basename($target)];
+    }
+}
+```
+
+1. 污点边界：本文件无 request/argv/stdin 等显式 web 入口；第 14 行 `parse($manifestPath)` 与第 15 行 `file_get_contents` 读入的 manifest.xml 由上层服务传入、源自外部提交的归档包，其文件内容是等效污点源，必须按不可信处理。
+2. 数据流：第 15 行读入 `$raw` → 第 24 行 `loadXML` 解析 → 第 29-30 行提取 `action`/`target` 节点值。若解析器允许外部实体，攻击者可在 manifest 中嵌入 `<!ENTITY xxe SYSTEM "file:///etc/passwd">` 或 `php://filter` 包装器，使解析结果携带本地文件内容并流向后续分发逻辑。
+3. 防御一（位置正确）：第 22 行在 `loadXML` 调用之前设置 `libxml_disable_entity_loader(true)`，从类型上直接禁用外部实体加载器，XXE 攻击面在解析阶段即被切断；第 26 行恢复原值，不影响其他模块。
+4. 防御二（覆盖完整）：第 24 行 `loadXML` 的 flags 含 `LIBXML_NONET`，即使实体加载器配置因 PHP 版本差异失效，也禁止解析器发起网络请求获取远程 DTD/实体，双保险覆盖本地与远程两类 XXE 向量。
+5. 防御三（sink 前白名单）：第 35-37 行对解析出的 `action` 做 `in_array(..., ALLOWED_ACTIONS, true)` 严格白名单校验，非法值抛异常；第 39 行对 `target` 取 `basename()` 剥离路径分隔符，防止解析结果流向任意路径操作。黑名单/正则过滤不算有效防御，此处为原生白名单+安全 API，类型正确。
+6. 第二入口检查：全文件仅一个公共方法 `parse()`，无其他路由、参数或间接调用通道；所有污点数据均经过上述三层防御才返回给调用方，故不存在绕过路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第15行file_get_contents读入的外部提交归档包内manifest.xml内容; 流1: raw→第24行loadXML, 由第22行libxml_disable_entity_loader(true)+LIBXML_NONET双重防御, 在解析阶段禁用外部实体与网络DTD加载, 类型正确且位于sink之前, 完整覆盖本地文件读取与远程SSRF两类XXE向量; 流2: 解析出的action/target节点值→返回给调用方分发, 经第36行严格白名单in_array校验及第39行basename()剥离路径, 无任意操作或路径穿越面; 第二入口检查: 全文件仅parse()一个公共方法, 无其他路由/参数/间接调用通道, 不存在绕过路径", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,50 @@
+LANG: javascript
+```code
+// report-export-worker.js
+// 报表导出工具：由上层 API 服务通过消息队列下发导出任务，
+// 本模块作为消费者回调处理任务消息。
+const { Worker } = require('bullmq');
+const fs = require('fs');
+const path = require('path');
+
+const connection = { host: '127.0.0.1', port: 6379 };
+
+const worker = new Worker('report-export', async (job) => {
+  // job.data 由上层服务写入，包含用户提交的筛选条件与目标文件名
+  const { filters, fileName } = job.data;
+
+  // 弱防御：仅拦截路径穿越关键字（可被 URL 编码/双重编码绕过）
+  if (fileName.includes('../') || fileName.includes('..\')) {
+    throw new Error('illegal file name');
+  }
+
+  const exportDir = '/var/reports/exports';
+  const targetPath = path.join(exportDir, fileName);
+
+  const csv = buildCsv(filters);
+  fs.writeFileSync(targetPath, csv);
+  return { path: targetPath };
+}, { connection });
+
+function buildCsv(filters) {
+  const header = Object.keys(filters).join(',');
+  const rows = Object.values(filters).map(v => String(v));
+  return header + '
+' + rows.join('
+');
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；第 11 行消费者回调签名中的 `job` 参数承载队列消息体，`job.data` 是上层 API 服务透传的用户提交内容，必须按不可信外部数据处理，是等效污点源。第 12 行解构出的 `filters` 与 `fileName` 均为外部可控数据。
+
+2. 第 16-18 行是唯一防御：黑名单仅检查字面量 `../` 与 `..\`，覆盖面极窄——攻击者可用 URL 编码 `%2e%2e%2f`、双重编码 `%252e%252e%252f`、或绝对路径 `/etc/cron.d/x` 直接绕过；且未做规范化校验，属于典型可绕过弱防御，不构成有效防护。
+
+3. 第 21 行 `path.join(exportDir, fileName)`：当 `fileName` 为绝对路径时 `path.join` 会直接采用该绝对路径，污染数据未经任何净化进入 `targetPath`。
+
+4. 第 24 行 `fs.writeFileSync(targetPath, csv)` 为 CWE-22 危险 sink：任意路径文件写入，攻击者可控 fileName 覆盖系统文件（如 crontab、SSH authorized_keys），实现 RCE 链。source→sink 全程无有效防御，可达性成立。
+
+5. 第二入口检查：本文件仅注册一个队列消费者回调，无其他路由、参数或间接调用通道；`buildCsv` 的 filters 数据不流向 sink，非漏洞链。唯一入口即第 11 行回调，结论成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal (Arbitrary File Write)", "risk_level": "Critical", "source": "line 12: job.data 解构出的 fileName（队列消息体，外部可控）", "sink": "line 24: fs.writeFileSync(targetPath, csv)", "explanation": "主链：line 12 fileName 来自队列消息体 -> line 17 黑名单仅匹配字面 ../ 与 ..\\，可被 %2e%2e%2f 或双重编码绕过 -> line 21 path.join 对绝对路径直接采纳 -> line 24 任意路径写文件；第二入口检查：全文件仅此一个消费者回调，无其他路由或间接调用通道，filters 不流向 sink", "fix_suggestion": "line 21: 先对 fileName 做 path.basename 并用 path.resolve 后校验结果前缀必须等于 exportDir，拒绝一切越界路径"}
+```

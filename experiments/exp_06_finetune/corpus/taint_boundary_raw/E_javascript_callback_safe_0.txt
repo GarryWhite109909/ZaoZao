@@ -1,0 +1,49 @@
+LANG: javascript
+```javascript
+// outbound-webhook-dispatcher.js
+// 被上层服务调用：消费消息队列中的 webhook 投递任务
+const { Pool } = require('pg');
+const axios = require('axios');
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// 队列消费者回调：message.body 为外部提交的 webhook 配置载荷（不可信）
+async function handleDelivery(message) {
+  const { tenantId, eventType, payload } = message.body;
+
+  // 白名单校验：eventType 只允许预定义集合，杜绝注入面
+  const ALLOWED_EVENTS = ['order.created', 'order.refunded', 'user.signup'];
+  if (!ALLOWED_EVENTS.includes(eventType)) {
+    throw new Error(`event type not permitted: ${eventType}`);
+  }
+
+  // 参数化查询：tenantId 与 eventType 作为占位符参数传入，永不拼接 SQL
+  const { rows } = await pool.query(
+    'SELECT endpoint_url, secret FROM webhook_endpoints WHERE tenant_id = $1 AND event_type = $2',
+    [tenantId, eventType]
+  );
+
+  for (const row of rows) {
+    await axios.post(row.endpoint_url, payload, {
+      headers: { 'X-Webhook-Signature': signPayload(payload, row.secret) }
+    });
+  }
+}
+
+function signPayload(body, secret) {
+  return require('crypto').createHmac('sha256', secret).update(JSON.stringify(body)).digest('hex');
+}
+
+module.exports = { handleDelivery };
+```
+
+1. 污点边界：本文件没有任何 request/argv/stdin 等显式入口；唯一外部数据通道是第 12 行队列消费者回调参数 `message`，其 `body` 中的 `tenantId`、`eventType`、`payload` 由外部提交方写入消息队列，属等效污点源，必须按不可信处理。
+2. 数据流一：第 13 行解构出的 `eventType` → 第 17 行白名单校验（仅允许三个枚举值）→ 第 24 行作为 `$2` 占位符参数进入 SQL。白名单为封闭集合比较，无正则/黑名单可绕过问题，类型正确。
+3. 数据流二：`tenantId` → 第 24 行 `$1` 占位符参数化查询。pg 驱动将参数以独立协议字段发送给 PostgreSQL，服务端预编译执行计划，用户数据永不被解析为 SQL 语法，防御类型正确。
+4. 防御位置与覆盖面：两处防御均位于 sink（第 23–24 行 `pool.query`）之前的必经路径上，且覆盖了到达该 SQL 的全部变量——查询语句本身是常量字符串，不存在任何字符串拼接分支，攻击面完整闭合。
+5. `payload` 不进入 SQL，仅在第 29–30 行作为 JSON body 外发并经 HMAC 签名，不构成 CWE-89 面；`endpoint_url` 来自数据库而非回调载荷，非本次污点源。
+6. 第二入口检查：文件仅导出 `handleDelivery` 一个函数，无路由注册、无其他导出或间接调用路径；所有到 `pool.query` 的数据流均经过上述白名单与参数化防御，故不存在未防护通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一污点源为第12行队列回调 message.body（tenantId/eventType/payload）；eventType 经第17行封闭白名单校验后与 tenantId 一同于第23-24行以 $1/$2 占位符参数化查询进入 pg 驱动，SQL 文本为常量、无任何拼接，防御类型正确且位于 sink 前必经路径，覆盖全部攻击面；payload 仅作外发 body 并经 HMAC 签名，不入 SQL；endpoint_url 取自数据库非回调载荷；文件仅导出 handleDelivery 一个入口，无第二入口或替代通道，结论安全", "fix_suggestion": "no fix needed"}
+```

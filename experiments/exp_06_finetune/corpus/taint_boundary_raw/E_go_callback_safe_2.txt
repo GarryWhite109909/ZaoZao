@@ -1,0 +1,72 @@
+LANG: go
+```go
+// Package assetloc 提供静态资源定位服务，作为消息队列消费者被上层服务调用。
+package assetloc
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+)
+
+// AssetEvent 是队列消息载荷，由外部系统投递（如 CDN 预热/清理任务）。
+type AssetEvent struct {
+	AssetName string `json:"asset_name"`
+	Env       string `json:"env"`
+}
+
+// Locator 负责根据资源名查询数据库定位服务器文件路径。
+type Locator struct {
+	db *sql.DB
+}
+
+// HandleAssetEvent 是消息队列消费者回调：broker 将消息体反序列化后调用本函数，
+// e 的字段完全来自外部提交内容，必须按不可信数据处理。
+func (l *Locator) HandleAssetEvent(e AssetEvent) error {
+	// 白名单校验：资源名仅允许字母数字与点、下划线、连字符；环境限定枚举值。
+	if !isSafeName(e.AssetName) {
+		return fmt.Errorf("invalid asset name")
+	}
+	switch e.Env {
+	case "prod", "staging", "dev":
+	default:
+		return fmt.Errorf("unknown env")
+	}
+	// 参数化查询：占位符由驱动预编译绑定，外部值永不拼接进 SQL 文本。
+	const q = "SELECT server_path FROM assets WHERE name = ? AND env = ?"
+	var path string
+	if err := l.db.QueryRow(q, e.AssetName, e.Env).Scan(&path); err != nil {
+		log.Printf("asset lookup failed: %v", err)
+		return err
+	}
+	log.Printf("resolved asset %s to %s", e.AssetName, path)
+	return nil
+}
+
+func isSafeName(s string) bool {
+	for _, r := range s {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-'
+		if !ok {
+			return false
+		}
+	}
+	return len(s) > 0 && len(s) < 128
+}
+```
+
+1. 第 17 行定义回调签名 `HandleAssetEvent(e AssetEvent)`：本文件没有 request/input 等显式 web 入口，但该参数是消息队列消费者回调的消息体，字段 `AssetName`、`Env` 由 broker 从外部系统反序列化而来，是等效污点源（公开接口的参数/外部提交的内容必须按不可信处理）。
+
+2. 第 30-31 行与第 33-38 行构成第一道防御——白名单校验：`isSafeName` 只放行字母数字及 `. _ -`，长度限制在 1~127；`Env` 用 switch 枚举白名单限定为 prod/staging/dev。这是白名单而非黑名单/正则替换，无法通过编码、截断或注入元字符绕过。
+
+3. 第 41-42 行是 sink 所在的 SQL 查询。数据流为：第 18 行消息体 → 第 30/34 行校验 → 第 42 行 `QueryRow(q, e.AssetName, e.Env)`。查询使用 `?` 占位符，database/sql 驱动将两个外部值作为独立参数预编译绑定，值永远不会拼入 SQL 文本，因此即使校验被绕过也无法改变语句结构——参数化查询属于类型正确、位置正确（紧邻 sink）、覆盖完整攻击面（两个外部字段均绑定）的防御。
+
+4. 防御覆盖面核查：污点字段只有 `AssetName` 与 `Env` 两个，二者在第 42 行均以参数形式传入，无任何字符串拼接、fmt.Sprintf 组装 SQL 或二次格式化的旁路；第 43 行 Scan 结果 `path` 仅用于日志输出，不回流到 SQL。
+
+5. 第二入口/替代通道检查：文件内无 HTTP handler、无 os.Args/environ/stdin、无其他导出函数接收外部数据；`Locator.db` 由包外注入，不构成污点源。唯一外部通道即回调参数，且已被完整防御。
+
+6. 结论：source→sink 全部路径均受白名单+参数化双重防护，不存在可利用的 SQL 注入路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "本文件无显式 web 入口，唯一污点源是第 18 行消息队列消费者回调参数 AssetEvent 的 AssetName 与 Env 字段，属外部可控数据；两条 source→sink 数据流（AssetName→QueryRow、Env→QueryRow）先经第 30-38 行白名单校验（字符集白名单加枚举 switch，非黑名单/正则替换，不可绕过），再于第 42 行以 ? 占位符参数化绑定进入 SQL，驱动预编译保证外部值永不拼接进语句文本，防御类型正确、位置紧邻 sink、覆盖全部外部字段；文件内无第二入口或替代通道（无 HTTP handler、无 os.Args/environ/stdin、无其他导出污点函数），Scan 结果 path 仅写日志不回流 SQL，故不存在 CWE-89 注入风险", "fix_suggestion": "no fix needed"}
+```

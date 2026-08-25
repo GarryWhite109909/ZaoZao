@@ -1,0 +1,60 @@
+LANG: java
+```java
+package com.opslib.cmd;
+
+import javax.jms.Message;
+import javax.jms.MessageListener;
+import javax.jms.TextMessage;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.w3c.dom.Document;
+import org.w3c.dom.NodeList;
+
+/**
+ * 运维命令封装库：消费运维指令队列消息，解析 XML 指令并执行。
+ * 被上层服务部署为队列消费者，本模块不直接暴露任何网络入口。
+ */
+public class OpsCommandListener implements MessageListener {
+
+    @Override
+    public void onMessage(Message message) {
+        try {
+            TextMessage tm = (TextMessage) message;
+            String xmlPayload = tm.getText(); // 外部提交的 XML 指令
+
+            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+            // 弱防御：仅做格式校验，未禁用外部实体
+            DocumentBuilder db = dbf.newDocumentBuilder();
+            Document doc = db.parse(new org.xml.sax.InputSource(
+                    new java.io.StringReader(xmlPayload)));
+
+            NodeList nodes = doc.getElementsByTagName("command");
+            for (int i = 0; i < nodes.getLength(); i++) {
+                String cmd = nodes.item(i).getTextContent().trim();
+                if (cmd.contains("rm ") || cmd.contains("shutdown")) {
+                    continue; // 黑名单过滤，可被大小写/编码/拼接绕过
+                }
+                Runtime.getRuntime().exec(cmd);
+            }
+        } catch (Exception e) {
+            // 记录日志后吞掉异常，不影响消费者存活
+        }
+    }
+}
+```
+
+1. 第 14 行 `onMessage(Message message)` 是污点边界：本文件没有任何 request/input 等显式 web 入口，但该回调由消息中间件投递触发，`message` 携带外部用户通过队列提交的消息体，属于等效污点源，必须按不可信数据处理。
+
+2. 第 18 行 `tm.getText()` 取出消息体字符串 `xmlPayload`，这是外部完全可控的 XML 文本；第 22-24 行将其交给 `DocumentBuilder.parse` 解析。`DocumentBuilderFactory.newInstance()` 使用默认配置，未调用 `setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)` 等任何禁用外部实体的设置——XXE 防御完全缺失。
+
+3. 攻击者可提交形如 `<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]> <command>&xxe;</command>` 的消息体，实体在 parse 阶段即被展开（可读本地文件），或使用 `http://` 外部实体做 SSRF 探测；若展开结果进入第 31 行 `Runtime.getRuntime().exec(cmd)` 还会进一步造成命令注入。第 29-30 行的黑名单仅匹配 `rm `/`shutdown` 子串，可通过 `RM -rf`、`r\m`、`shut${IFS}down`、base64+管道等方式轻易绕过，不构成有效防御。
+
+4. 覆盖面检查：全文仅此一条 source→sink 主链（第 18 行 → 第 24 行 parse → 第 31 行 exec）；黑名单位于 exec 之前但对 XXE 本身毫无作用，因为实体展开发生在第 24 行 parse 时，早于任何过滤逻辑。
+
+5. 第二入口排查：文件中无其他方法、无静态初始化读取外部数据、无替代构造路径；唯一入口是 `onMessage` 回调。但由于队列 topic 若为公开订阅或权限宽松，任何能向该队列发消息的主体都是攻击面，结论成立。
+
+6. 综合结论：存在漏洞，XXE（CWE-611）为主，附带命令注入风险，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 XML External Entity Injection (XXE)", "risk_level": "Critical", "source": "line 18: tm.getText() 从回调参数 message 中取出的消息体文本", "sink": "line 24: db.parse(...) 解析未禁用外部实体的 XML", "explanation": "主链：line 18 回调消息体 -> line 23-24 默认配置的 DocumentBuilder 解析 -> 实体展开导致任意文件读取/SSRF；line 29-30 黑名单仅拦截 rm 与 shutdown 子串且位于 parse 之后，对 XXE 无效，可用大小写、IFS、编码拼接绕过；第二入口检查：文件内无其他方法或静态入口，唯一通道是 onMessage 回调，但队列消息对外部提交者开放，故结论成立", "fix_suggestion": "line 21-24: 在创建 DocumentBuilderFactory 后立即 setFeature 禁用 DTD 与外部实体（disallow-doctype-decl=true、external-general-entities=false、external-parameter-entities=false），并对命令改用白名单校验"}
+```

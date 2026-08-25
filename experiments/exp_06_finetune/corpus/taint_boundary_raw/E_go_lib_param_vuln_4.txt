@@ -1,0 +1,50 @@
+LANG: go
+```go
+// Package cachecode 提供缓存条目的编解码与回源辅助。
+// 本模块被上层服务调用：缓存值中可能携带外部提交的回调地址，
+// 用于缓存未命中时向源站发起 HTTP 回源请求。
+package cachecode
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+)
+
+// DecodeAndRefresh 解码缓存键对应的值，并在值携带 callback_url 时回源拉取。
+// key 与 payload 均来自上层调用方（如消息队列消费者），视为外部数据。
+func DecodeAndRefresh(key, payload string) (string, error) {
+	parts := strings.SplitN(payload, "|", 2)
+	if len(parts) != 2 {
+		return "", fmt.Errorf("bad payload for key %s", key)
+	}
+	callback := parts[1]
+	// 弱防御：仅拦截内网常见前缀，攻击者可用十进制 IP、
+	// 0.0.0.0、DNS rebinding 或 169.254.169.254 等绕过
+	if strings.HasPrefix(callback, "http://127.") || strings.HasPrefix(callback, "http://10.") {
+		return "", fmt.Errorf("blocked host")
+	}
+	resp, err := http.Get(callback)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	return key + ":" + resp.Status, nil
+}
+```
+
+1. 第 1 行污点边界说明：本文件无任何 request/environ/stdin 等显式 web 入口，但第 15 行 `DecodeAndRefresh(key, payload string)` 的两个参数由上层服务/队列消费者传入，承载外部可控数据，属等效污点源，必须按不可信处理。
+
+2. 第 20 行 `strings.SplitN(payload, "|", 2)` 将 payload 拆分后取 `parts[1]` 赋给第 21 行 `callback`，污点数据从参数完整传递到局部变量，全程无净化。
+
+3. 第 23-26 行为弱防御：仅用 `strings.HasPrefix` 黑名单拦截 `http://127.` 与 `http://10.` 两种前缀。覆盖面极窄——`http://0x7f000001`、`http://2130706433`（十进制整数 IP）、`http://[::1]`、云元数据地址 `http://169.254.169.254/latest/meta-data/` 以及 DNS rebinding 域名均可绕过；且黑名单位于 sink 前，属于可绕过的字符串前缀过滤，不构成有效防御。
+
+4. 第 27 行 `http.Get(callback)` 为 CWE-918 SSRF 危险 sink：污点变量 `callback` 直接作为目标 URL 发起服务端请求，攻击者可借此探测内网、访问云元数据接口，导致敏感信息泄露或内网横向。
+
+5. 第二入口/替代通道检查：文件内仅有一个导出函数 `DecodeAndRefresh`，无路由注册、无其他公开函数；key 参数仅用于错误信息拼接与返回值，不流向 sink。替代通道不存在，但唯一入口即已构成完整的 source→sink 可达链。
+
+6. 结论：存在漏洞，主链为 第 15 行参数 payload → 第 21 行 callback → 第 27 行 http.Get，风险等级 High（SSRF 可达云元数据）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 服务端请求伪造(SSRF)", "risk_level": "High", "source": "line 15: 函数参数 payload(上层调用方传入的外部可控缓存载荷)", "sink": "line 27: http.Get(callback)", "explanation": "污点流一: line 15 参数 payload -> line 20 SplitN 取 parts[1] -> line 21 callback -> line 27 http.Get 直接作为请求 URL; 防御分析: line 23-26 仅用 HasPrefix 黑名单拦截 127./10. 前缀, 可被十六进制/十进制整数 IP、IPv6 [::1]、169.254.169.254 云元数据及 DNS rebinding 绕过, 属可绕过弱防御非有效防护; 第二入口检查: 文件无路由注册或其他导出函数, key 参数不流向 sink, 唯一入口即构成完整可达 SSRF 链", "fix_suggestion": "line 27: 在调用 http.Get 前解析 callback 的主机并校验解析后的 IP 属于公网白名单网段(拒绝环回/私网/链路本地地址), 并禁用重定向跟随"}
+```

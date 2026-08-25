@@ -1,0 +1,56 @@
+LANG: go
+```go
+// Package tmplutil 提供模板渲染辅助函数，被上层服务调用以渲染外部提交的模板片段。
+package tmplutil
+
+import (
+	"html/template"
+	"strings"
+)
+
+// RenderFragment 渲染上层调用者传入的模板片段与变量。
+// fragment 与 vars 均来自外部提交内容，必须按不可信数据处理。
+func RenderFragment(fragment string, vars map[string]string) (string, error) {
+	// 白名单校验：仅允许纯文本片段，拒绝任何模板动作语法，
+	// 防止攻击者通过 {{...}} 注入模板指令（SSTI）进而触发 XSS。
+	if strings.ContainsAny(fragment, "{}") {
+		return "", ErrUnsafeFragment
+	}
+
+	tmpl, err := template.New("fragment").Parse(fragment)
+	if err != nil {
+		return "", err
+	}
+
+	// html/template 在执行时对插入值做上下文感知自动转义，
+	// vars 中的不可信数据经 {{.}} 输出时会被正确 HTML 转义。
+	var sb strings.Builder
+	if err := tmpl.Execute(&sb, vars); err != nil {
+		return "", err
+	}
+	return sb.String(), nil
+}
+
+// ErrUnsafeFragment 表示片段包含被禁止的模板语法。
+var ErrUnsafeFragment = errorString("fragment contains forbidden template syntax")
+
+type errorString string
+
+func (e errorString) Error() string { return string(e) }
+```
+
+1. 污点边界：本文件无 request/environ 等显式 web 入口，但第 14 行 `RenderFragment(fragment string, vars map[string]string)` 的两个参数承载上层服务传入的外部可控数据（外部提交的模板片段与变量），是等效污点源，必须按不可信处理。
+
+2. 数据流一：第 14 行 `fragment` → 第 18 行白名单校验 `strings.ContainsAny(fragment, "{}")` → 第 23 行 `template.Parse(fragment)`。防御类型为白名单：任何含 `{` 或 `}` 的字符都会导致返回 `ErrUnsafeFragment`，而 Go 模板动作语法必然依赖花括号，因此所有 SSTI/模板注入路径被完全阻断；该防御位于 sink（Parse）之前，位置正确，且为全量字符级检查，不存在绕过面。
+
+3. 数据流二：第 14 行 `vars` → 第 30 行 `tmpl.Execute(&sb, vars)`。html/template 是 Go 标准库的原生安全 API，在 Execute 时对所有插值做上下文感知自动转义（HTML body、属性、JS、URL 上下文分别处理），即使 vars 含 `<script>` 等载荷也会被转义为无害文本，CWE-79 攻击面被完整覆盖。
+
+4. 无其他危险 sink：文件中不存在 `text/template`、`template.HTML` 类型转换或 `unsafe` 使用，输出仅为已转义的字符串拼接结果，无第二 sink。
+
+5. 第二入口检查：文件内无路由注册、HTTP 处理器、全局可变状态或包级 init 读取外部数据的代码；唯一入口即第 14 行公开函数参数，两条数据流均已被有效防御覆盖，故不存在未防护通道。
+
+6. 结论：污点源到 sink 的全部路径均有类型正确、位置正确、覆盖完整的防御（白名单 + 自动转义），不构成 CWE-79 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "fragment 参数流至 template.Parse 前经第 18 行 ContainsAny 花括号白名单拦截，模板动作语法无法进入，防御类型正确且位于 sink 前，覆盖完整; vars 参数流至第 30 行 tmpl.Execute 时由 html/template 上下文感知自动转义处理，属原生安全 API，XSS 攻击面完整覆盖; 文件内无 text/template、template.HTML 或其他危险 sink; 全文无路由注册或 HTTP 处理器，唯一入口为公开函数参数且均已防护，无第二入口或替代通道", "fix_suggestion": "no fix needed"}
+```

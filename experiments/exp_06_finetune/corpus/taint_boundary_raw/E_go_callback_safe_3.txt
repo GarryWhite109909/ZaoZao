@@ -1,0 +1,61 @@
+LANG: go
+```go
+// Package importer 实现外部系统记录导入适配器。
+// 本模块作为消息队列消费者回调，被上层服务注册后消费导入任务消息。
+package importer
+
+import (
+	"fmt"
+	"os/exec"
+	"strings"
+)
+
+// ImportEvent 是外部系统推送的导入事件载荷（由队列反序列化而来）。
+type ImportEvent struct {
+	RecordType string   // 记录类型，如 csv / json
+	FilePath   string   // 待导入文件路径
+	Tags       []string // 附加标签
+}
+
+// HandleImport 是队列消费者回调：event 承载外部可控数据，按不可信处理。
+func HandleImport(event ImportEvent) error {
+	// 白名单校验 RecordType，仅允许已知类型
+	switch event.RecordType {
+	case "csv", "json", "xml":
+	default:
+		return fmt.Errorf("unsupported record type: %s", event.RecordType)
+	}
+
+	// 校验 FilePath 必须位于受控导入目录内且无路径穿越
+	if !strings.HasPrefix(event.FilePath, "/data/incoming/") ||
+		strings.Contains(event.FilePath, "..") {
+		return fmt.Errorf("invalid file path")
+	}
+
+	// 使用参数数组形式 exec.Command：文件路径与标签均作为独立参数传递，
+	// 不经过 shell 解释，杜绝命令注入（CWE-78）。
+	args := []string{"--type", event.RecordType, "--file", event.FilePath}
+	for _, t := range event.Tags {
+		args = append(args, "--tag", t)
+	}
+	cmd := exec.Command("/opt/etl/importer", args...)
+	cmd.Stdout = nil
+	return cmd.Run()
+}
+```
+
+1. 第 14-18 行定义回调载荷 `ImportEvent`，第 21 行 `HandleImport(event)` 为队列消费者回调签名。本文件没有 request/input 等显式 web 入口，但 `event` 的字段（RecordType、FilePath、Tags）来自外部系统提交的队列消息体，是等效污点源，必须按不可信处理。
+
+2. 外部输入点共三个：`event.RecordType`、`event.FilePath`、`event.Tags`。三者最终都汇入第 38 行 `exec.Command` 构造的命令执行 sink，可达性成立——若不设防即为 CWE-78 命令注入链。
+
+3. 防御一（第 24-29 行）：对 `RecordType` 做白名单校验，仅放行 csv/json/xml 三个枚举值，任何注入载荷在进入 sink 前即被拒绝；白名单属于类型正确、位置正确（sink 前最后校验点）、覆盖完整该字段的防御。
+
+4. 防御二（第 32-35 行）：对 `FilePath` 做前缀限定加 `..` 检查，限制在受控目录内；配合防御三（第 37-42 行）：`exec.Command` 采用参数数组形式直接调用目标二进制，不经 shell 解析，即使某字段含 `; | && $(...)` 等元字符也只会被当作单个普通参数传给 importer 程序，从机制上消除命令注入面。三重防御覆盖了全部三个污点字段到 sink 的所有路径。
+
+5. 第二入口检查：本文件仅暴露 `HandleImport` 一个导出函数，无其他路由、HTTP handler 或间接调用通道；`ImportEvent` 只能经此回调进入，替代通道不存在。
+
+6. 结论：source→sink 全部数据流均有有效防御（白名单 + 目录约束 + 参数数组免 shell），不构成漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界为第21行回调参数 event（队列消息体），其字段 RecordType/FilePath/Tags 为外部可控数据并流向第38行 exec.Command 命令执行 sink; RecordType 经第24-29行白名单校验仅放行枚举值，类型正确且位置在 sink 前; FilePath 经第32-35行目录前缀与穿越检查约束在受控目录; exec.Command 采用参数数组形式不经 shell 解释，注入元字符无法生效，三重防御覆盖全部 source→sink 路径; 第二入口检查：文件仅导出 HandleImport 一个入口，无路由或其他调用通道，替代通道不存在", "fix_suggestion": "no fix needed"}
+```

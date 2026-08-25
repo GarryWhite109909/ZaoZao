@@ -1,0 +1,63 @@
+LANG: go
+```go
+// Package configparse 解析外部提交的部署清单文件（YAML）。
+// 本模块被上层服务调用，用于消费上传的配置文件并预取其中的资源地址。
+package configparse
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+type Manifest struct {
+	ResourceURL string `yaml:"resource_url"`
+}
+
+// 允许拉取资源的内部镜像域名白名单
+var allowedHosts = map[string]bool{
+	"artifacts.internal.example.com": true,
+	"mirror.internal.example.com":    true,
+}
+
+func LoadAndFetch(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read manifest: %w", err)
+	}
+	var m Manifest
+	if err := yaml.Unmarshal(data, &m); err != nil {
+		return fmt.Errorf("parse manifest: %w", err)
+	}
+	u, err := url.Parse(m.ResourceURL) // 第 30 行：解析外部可控 URL
+	if err != nil {
+		return fmt.Errorf("invalid url: %w", err)
+	}
+	if u.Scheme != "https" || !allowedHosts[strings.ToLower(u.Hostname())] { // 第 34 行：白名单校验
+		return fmt.Errorf("host not allowed")
+	}
+	resp, err := http.Get(u.String()) // 第 37 行：sink
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 22 行 `os.ReadFile(path)` 读入的外部提交的 YAML 清单内容——公开接口提交的配置文件必须按不可信处理，其中 `resource_url` 字段是等效污点源。
+2. 数据流：第 26 行 `yaml.Unmarshal` 将文件内容反序列化为 `Manifest` 结构体；`m.ResourceURL`（第 30 行）完全由攻击者通过清单文件控制。
+3. 防御验证：第 31-33 行先做严格解析失败即拒绝；第 34 行执行双重校验——scheme 必须为 https（阻断 file://、gopher://、http 重定向降级等），且主机名经小写归一后必须在 `allowedHosts` 白名单内。这是白名单校验型防御：类型正确（基于解析后的结构化 URL 而非原始字符串匹配，无法用 `@`、反斜杠、八进制 IP 等混淆绕过）；位置正确（位于 sink 之前、所有分支必经）；覆盖完整（唯一进入 sink 的值就是通过校验的 `u.String()`）。
+4. Sink 分析：第 37 行 `http.Get` 是 CWE-918 的典型 sink，但仅接收白名单内的 https 内部镜像地址，攻击者无法将请求引向元数据服务（169.254.169.254）、内网 IP 或任意域名。
+5. 第二入口检查：全文仅有一个读取点（第 22 行）和一个网络 sink（第 37 行），无其他路由、参数或间接调用可绕过第 34 行校验；`url.Parse` 失败路径直接返回错误不触达 sink。
+6. 结论：source→sink 链路存在完整有效防御，不存在 SSRF 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界：无显式 web 入口，第 22 行 os.ReadFile 读取的外部提交 YAML 清单为等效污点源；数据流：第 26 行 yaml.Unmarshal 提取 resource_url 至第 30 行 url.Parse，随后第 34 行执行 scheme==https 且主机名白名单校验后才于第 37 行 http.Get 触达 sink；防御类型正确（基于结构化 URL 的白名单而非字符串匹配）、位置正确（sink 前唯一必经路径）、覆盖完整（唯一 sink 输入均经校验）；第二入口检查：全文仅一个文件读取点与一个网络 sink，无替代通道可绕过校验，故不存在 CWE-918 漏洞", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,68 @@
+LANG: go
+```go
+// Package archiver 处理来自消息队列的归档解包任务。
+// 上层服务消费队列消息后调用本模块的 HandleArchiveEvent。
+package archiver
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// ArchiveEvent 是消息载荷，由外部提交方生成，内容不可信。
+type ArchiveEvent struct {
+	TaskID   string
+	FileName string // 外部提交的归档文件名
+}
+
+var allowedExts = map[string]bool{
+	".zip": true, ".tar": true, ".tar.gz": true, ".tgz": true,
+}
+
+// HandleArchiveEvent 是队列消费者回调入口（污点边界）。
+func HandleArchiveEvent(ev ArchiveEvent) error {
+	name := ev.FileName
+	if name == "" || strings.ContainsAny(name, "\x00") {
+		return fmt.Errorf("task %s: empty or invalid filename", ev.TaskID)
+	}
+	clean := filepath.Base(name) // 剥离任何路径分隔符与 .. 组件
+	ext := strings.ToLower(filepath.Ext(clean))
+	if ext == ".gz" && strings.HasSuffix(strings.ToLower(clean), ".tar.gz") {
+		ext = ".tar.gz"
+	}
+	if !allowedExts[ext] { // 白名单校验：仅允许归档扩展名
+		return fmt.Errorf("task %s: extension not allowed", ev.TaskID)
+	}
+	dest := filepath.Join("/srv/archive/incoming", clean)
+	if !strings.HasPrefix(dest, "/srv/archive/incoming/") {
+		return fmt.Errorf("task %s: path escape blocked", ev.TaskID)
+	}
+	f, err := os.Open(dest)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return extract(f, dest)
+}
+
+func extract(f *os.File, dest string) error {
+	fmt.Println("extracting", dest)
+	return nil
+}
+```
+
+1. 污点边界：本文件无 request/os.Args 等显式入口；第 20 行回调参数 `ev ArchiveEvent` 为消息队列载荷，其中第 17 行 `FileName` 由外部提交方写入，属等效污点源，必须按不可信处理。可达性确认：`ev.FileName` → 第 24 行 `name` → 第 27 行 `clean` → 第 40 行 `dest` → 第 44 行 `os.Open(dest)` 与 `extract`，source 到 sink 路径完整可达。
+
+2. 防御一（位置正确）：第 28 行 `filepath.Base(clean)` 在进入路径拼接前剥离目录组件，使 `../../etc/passwd` 类输入退化为纯文件名；该操作位于 source 之后、sink 之前，类型正确（规范化而非黑名单过滤）。
+
+3. 防御二（白名单）：第 30–36 行对扩展名做白名单校验，仅放行 `.zip/.tar/.tar.gz/.tgz`，拒绝任意可执行或隐藏文件；白名单属于清单要求认可的有效防御类型，且覆盖了扩展名这一攻击面维度。
+
+4. 防御三（前缀复核）：第 39–41 行在 `filepath.Join` 后用 `strings.HasPrefix(dest, "/srv/archive/incoming/")` 复核最终落盘路径仍在受控根目录内，构成纵深防御；即使 Base 逻辑被未来改动破坏，此处仍拦截逃逸。三条防御串联覆盖了路径遍历（../、绝对路径、空字节）全部已知攻击面，无绕过路径。
+
+5. 第二入口检查：本文件唯一导出入口为 `HandleArchiveEvent`，无其他路由/HTTP handler/间接调用点；`extract` 仅接收已验证的 `dest`，不构成替代污点通道。结论：不存在未防御的外部输入到危险操作的路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第 20 行回调参数 ArchiveEvent 的 FileName 字段（外部提交的归档名）；数据流 FileName→name(24)→clean(27)→dest(40)→os.Open(44)，链路可达但被三层有效防御阻断：filepath.Base 规范化剥离路径组件、扩展名白名单校验、Join 后的前缀复核，均为类型正确且位置正确的防御，非黑名单/正则/字符串替换等可绕过手段；第二入口检查确认本文件仅有 HandleArchiveEvent 一个导出回调入口，extract 不引入新污点通道，故无 CWE-22 路径遍历漏洞", "fix_suggestion": "no fix needed"}
+```

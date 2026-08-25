@@ -1,0 +1,45 @@
+LANG: python
+```python
+"""数据导入适配器：解析外部系统导出的 JSONL 记录文件并回填回调地址。
+
+本模块由上层导入服务调用，传入外部系统投递的记录文件路径。
+"""
+import json
+import urllib.request
+
+
+def _resolve_callback(raw):
+    # 弱防御：仅拦截内网常见前缀，攻击者可用十进制 IP、DNS 重绑定绕过
+    blocked = ("127.", "10.", "192.168.", "169.254.")
+    for p in blocked:
+        if raw.startswith(p):
+            return None
+    return raw
+
+
+def import_records(path):
+    """读取外部系统导出的记录文件，逐行解析并向记录中的 callback_url 发送确认。"""
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)  # 第 24 行：文件内容即污点源
+            url = record.get("callback_url", "")
+            safe_url = _resolve_callback(url)
+            if safe_url is None:
+                continue
+            req = urllib.request.Request(safe_url, method="POST")  # 第 29 行：SSRF sink
+            urllib.request.urlopen(req, timeout=5)  # 第 30 行：发起请求
+    return True
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是被上层服务传入的 `path` 所指向的外部系统记录文件——第 22 行 `open` 读取后，第 24 行 `json.loads(line)` 解析出的字段承载外部可控数据，按不可信处理，构成等效污点边界。
+2. 数据流：第 26 行 `record.get('callback_url')` 取出攻击者完全控制的 URL 字符串，直接进入 `_resolve_callback`。
+3. 防御分析：第 16-21 行的黑名单仅用 `startswith` 匹配四个前缀，覆盖面极窄——可被 `0x7f000001` 十进制 IP、`[::ffff:127.0.0.1]` IPv6 映射地址、DNS 域名（重绑定到内网）、或 `http://user@127.0.0.1@evil.com` 式混淆轻易绕过，属可绕过弱防御，不构成有效防护。
+4. Sink 可达：第 29 行将未净化的 URL 构造为 Request，第 30 行 `urllib.request.urlopen` 实际发起网络请求，污点数据无任何有效校验直达 sink，形成完整 source→sink 链。
+5. 第二入口检查：全文仅 `import_records(path)` 一个函数入口，无其他路由/参数/间接调用通道；唯一替代路径仍是同一文件内容的不同字段，均汇入同一 sink，不影响结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 SSRF（服务端请求伪造）", "risk_level": "High", "source": "line 24: json.loads(line) 解析外部记录文件得到的 callback_url 字段", "sink": "line 30: urllib.request.urlopen(req)", "explanation": "文件内容经 json.loads 解析 -> record.get('callback_url') -> _resolve_callback 黑名单（startswith 仅匹配四前缀，可被十进制 IP/DNS 重绑定/IPv6 映射绕过）-> urllib.request.Request -> urlopen 发起请求，全程无有效防御；第二入口检查：仅 import_records 一个入口，无其他路由或参数通道，结论成立", "fix_suggestion": "line 26: 对 callback_url 使用白名单域名+强制 HTTPS 并在 urlopen 前解析 DNS 校验目标 IP 不属于私有网段"}
+```

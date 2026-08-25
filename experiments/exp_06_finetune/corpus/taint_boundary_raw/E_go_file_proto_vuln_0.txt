@@ -1,0 +1,59 @@
+LANG: go
+```go
+// Package opcmd 提供运维命令封装：从任务文件加载待执行命令。
+// 该模块被上层调度服务调用，任务文件由外部系统投递到共享目录。
+package opcmd
+
+import (
+	"encoding/gob"
+	"os"
+	"os/exec"
+)
+
+// TaskFile 是 gob 编码的任务描述，由外部运维平台写入 /var/run/opagent/tasks/
+type TaskFile struct {
+	Name    string
+	Args    []string
+	Timeout int
+}
+
+// RunTask 解析指定路径的任务文件并执行其中定义的命令
+func RunTask(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var t TaskFile
+	if err := gob.NewDecoder(f).Decode(&t); err != nil { // 第 24 行：污点源——被解析的文件内容
+		return err
+	}
+
+	// 弱防御：仅拦截 rm 与 shutdown 关键字
+	for _, a := range append([]string{t.Name}, t.Args...) {
+		if a == "rm" || a == "shutdown" {
+			return os.ErrPermission
+		}
+	}
+
+	cmd := exec.Command(t.Name, t.Args...) // 第 36 行：sink——反序列化数据直接进入命令执行
+	return cmd.Run()
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；第 24 行 `gob.NewDecoder(f).Decode(&t)` 解析的文件内容承载外部可控数据（任务文件由外部系统投递到共享目录），按不可信处理，是等效污点源。t.Name、t.Args 自此成为污点。
+
+2. 数据流追踪：第 24 行解码得到 t.Name/t.Args → 第 31-34 行仅做黑名单校验（只比较字符串是否等于 "rm"/"shutdown"）→ 第 36 行 `exec.Command(t.Name, t.Args...)` 直接作为命令与参数执行。source 到 sink 全程可达。
+
+3. 防御分析：唯一防御是第 32-33 行的黑名单等值比较。绕过方式极多：(a) Name 传 `/bin/sh`、Args 传 `-c` 加任意载荷；(b) 使用未列入黑名单的等效危险命令如 `dd`、`mkfs`、`curl | sh` 组合；(c) 路径变体如 `./rm` 或 `rm\x00` 类编码。该防御既非白名单也非语法级校验，属可绕过弱防御，不构成有效防护。
+
+4. 无任何编码/类型约束：gob 反序列化对字段内容无限制，攻击者可完全控制 Name 与 Args 的字节内容，直接映射为 exec 的 argv[0] 与后续参数。
+
+5. 第二入口/替代通道检查：全文仅有一个入口函数 RunTask，无其他路由、参数或间接调用路径；但该单一入口即已构成完整 source→sink 链，且 gob 文件本身可被任何能写共享目录的主体替换，替代通道即"篡改任务文件"，结论不变。
+
+6. 结论：存在 CWE-502 反序列化不可信数据导致任意命令执行的漏洞，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data leading to Arbitrary Command Execution", "risk_level": "Critical", "source": "line 24: gob.NewDecoder(f).Decode(&t) 从外部投递的任务文件反序列化出 t.Name/t.Args", "sink": "line 36: exec.Command(t.Name, t.Args...)", "explanation": "主链: line 24 gob 反序列化文件内容 -> t.Name/t.Args -> line 36 exec.Command 执行; 唯一防御为 line 32-33 黑名单等值比较, 可通过 /bin/sh -c、未列入黑名单的 dd/mkfs 等命令或路径变体绕过, 不构成有效防御; 第二入口检查: 全文仅 RunTask 一个入口, 无其他路由或间接调用, 但篡改共享目录中的任务文件即为替代通道, 结论不变", "fix_suggestion": "line 36: 改用固定命令白名单(按 t.Name 映射到预注册的 exec.Cmd 构造器), 禁止将反序列化的 Name/Args 直接传入 exec.Command"}
+```

@@ -1,0 +1,47 @@
+LANG: python
+```python
+"""archive_report.py — 归档解包模块，被上层批处理服务调用，处理外部提交的归档文件。"""
+import os
+import tarfile
+import html
+
+REPORT_DIR = "/var/lib/archiver/reports"
+
+
+def extract_and_report(archive_path: str) -> str:
+    """解包归档并生成 HTML 清单报告；归档内条目名来自外部提交，视为不可信。"""
+    entries = []
+    with tarfile.open(archive_path, "r:*") as tar:
+        for member in tar.getmembers():
+            # 防御：白名单校验条目名，仅允许字母数字/下划线/连字符/点，
+            # 同时阻断路径穿越与任何可注入 HTML 的字符（< > & " ' 均不在白名单内）
+            if not member.name or not all(
+                c.isalnum() or c in "-_." for c in member.name.split("/")
+            ):
+                continue  # 拒绝可疑条目，不写入报告
+            target = os.path.join("/srv/extract", *member.name.split("/"))
+            tar.extract(member, path=target)
+            entries.append(member.name)
+
+    rows = "
+".join(
+        f"<li>{html.escape(name)}</li>" for name in entries
+    )
+    report = f"<html><body><h1>Archive Contents</h1><ul>{rows}</ul></body></html>"
+
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    out = os.path.join(REPORT_DIR, "index.html")
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(report)
+    return out
+```
+
+1. 第 1 步污点边界：本文件无 request/input/environ 等显式 web 入口；污点源是第 12 行 `archive_path` 指向的归档文件内容——外部提交的归档中每个成员名 `member.name`（第 15 行）承载攻击者完全可控的字符串，按不可信数据处理。
+2. 数据流一：`member.name` → 第 17-19 行白名单校验 → 第 21-22 行 `tar.extract` 路径拼接（同时消除路径穿越）→ 第 26 行进入 HTML 报告字符串 → 第 33 行 `fh.write` 写入 index.html（存储型 XSS sink）。防御为白名单校验 + `html.escape` 双层：白名单只放行 `[A-Za-z0-9._/-]`，从源头排除 `< > & "` 等全部 HTML 元字符，属于类型正确（白名单而非黑名单）、位置正确（sink 前最后校验点）、覆盖完整（所有进入报告的名字都经过同一分支，未通过者直接 continue 不入报告）的防御。
+3. 数据流二兜底：即使未来白名单放宽，第 27 行 `html.escape(name)` 对已收集的所有名字做上下文正确的实体转义（默认 quote=True 覆盖属性上下文），确保写入 `<li>` 文本上下文时无法闭合标签——原生安全 API，覆盖完整攻击面。
+4. 无其他 sink：第 22 行 extract 的路径由白名单字符构成且经 split 后逐段 join，`..` 因含两个点仍可通过字符检查，但 `os.path.join("/srv/extract", "..", ...)` 仅上跳一级且 tar.extract 自身会拒绝逃逸目标目录之外的成员路径；即便如此该路径是文件系统操作而非 HTML 输出，不构成 CWE-79 面。
+5. 第二入口检查：全文件唯一外部数据通道是被解析的 tar 归档内容；无其他路由、参数、间接调用或全局可变状态引入额外污点源，函数签名仅接受本地文件路径，由上层受控服务传入。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第 12 行参数指向的归档文件中被解析的成员名 member.name（第 15 行），属外部提交内容等效污点；主链 member.name 到第 33 行写 HTML 报告的 sink 之间存在两层有效防御：第 17-19 行白名单仅放行字母数字与 -_. 字符、从源头排除全部 HTML 元字符且未通过者不入报告，第 27 行 html.escape 对所有入报告名字做上下文正确转义作为兜底，二者类型正确、位置在 sink 前、覆盖全部数据流；extract 路径拼接为文件系统操作非 XSS sink 且受白名单约束；第二入口检查确认全文件唯一外部通道为被解析归档内容，无路由/参数/间接调用等替代通道", "fix_suggestion": "no fix needed"}
+```

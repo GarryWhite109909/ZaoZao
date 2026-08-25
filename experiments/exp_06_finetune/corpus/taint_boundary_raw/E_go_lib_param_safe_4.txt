@@ -1,0 +1,79 @@
+LANG: go
+```go
+// Package cachecodec 提供缓存条目的编解码与回源校验能力。
+// 本模块被上层服务调用（如缓存刷新 worker、消息队列消费者），
+// 外部数据通过函数参数传入，本文件不注册任何路由或 HTTP 处理器。
+package cachecodec
+
+import (
+	"fmt"
+	"net"
+	"net/url"
+	"strings"
+)
+
+// CacheEntry 表示一条待回源校验的缓存记录。
+type CacheEntry struct {
+	Key   string
+	Value []byte
+}
+
+// allowedSchemes 是回源地址的协议白名单。
+var allowedSchemes = map[string]bool{"http": true, "https": true}
+
+// ValidateOrigin 校验缓存条目中携带的回源 URL，并对其发起探测请求。
+// entry.Key / entry.Value 由上层从外部数据反序列化而来，视为不可信输入。
+func ValidateOrigin(entry CacheEntry) (string, error) {
+	raw := strings.TrimSpace(string(entry.Value))
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid origin url: %w", err)
+	}
+	// 防御 1：协议白名单，仅允许 http/https，阻断 file/gopher/dict 等 SSRF 常用协议
+	if !allowedSchemes[u.Scheme] {
+		return "", fmt.Errorf("scheme not allowed: %s", u.Scheme)
+	}
+	host := u.Hostname()
+	// 防御 2：主机白名单，仅允许内部回源域名后缀，且拒绝直接使用 IP 字面量
+	if host == "" || net.ParseIP(host) != nil || !strings.HasSuffix(host, ".internal.example.com") {
+		return "", fmt.Errorf("host not allowed: %s", host)
+	}
+	// 防御 3：解析后的 IP 必须落在内网网段，防止 DNS rebinding 指向公网/元数据地址
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return "", fmt.Errorf("resolve failed: %w", err)
+	}
+	for _, ip := range ips {
+		if !ip.IsPrivate() {
+			return "", fmt.Errorf("resolved ip not private: %s", ip.String())
+		}
+	}
+	return probe(u.String())
+}
+
+// probe 使用标准库 http 客户端访问已通过三重校验的 URL。
+func probe(target string) (string, error) {
+	resp, err := httpGet(target)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	return "ok", nil
+}
+```
+
+1. **污点边界**：本文件无 request/environ 等显式 web 入口；第 24 行 `ValidateOrigin(entry CacheEntry)` 的参数 `entry` 由上层服务/队列消费者传入，承载外部可控的缓存值，是等效污点源。污点流：第 26 行 `entry.Value` → `raw` → 第 27 行 `url.Parse` → `u` → 第 44 行 `probe(u.String())`。
+
+2. **防御类型正确性**：sink 是基于 URL 的出站请求（SSRF/CWE-918）。第 31-33 行采用**协议白名单**（非黑名单、非字符串替换），仅放行 http/https，结构性排除 gopher/file/dict 等危险 scheme——白名单属于清单认可的有效防御类别。
+
+3. **防御位置正确性**：三道校验全部位于第 44 行 sink 调用之前的同一条路径上，且 `u` 在校验后才被序列化为最终请求目标，不存在校验后重新拼接原始字符串绕过校验的情况。
+
+4. **覆盖完整性**：scheme 白名单 + 主机后缀白名单并拒绝 IP 字面量（第 35-38 行，防 `http://169.254.169.254/` 直连）+ 解析后 IP 必须 `IsPrivate()`（第 41-45 行，覆盖 DNS rebinding 与多 A 记录场景），覆盖了 SSRF 的全部主要攻击面：协议切换、直连 IP、域名解析到公网/链路本地地址。
+
+5. **第二入口检查**：文件内唯一导出函数为 `ValidateOrigin`，`probe` 为私有辅助函数且其参数 `target` 仅来自已校验的 `u.String()`，不构成独立污点入口；无其他路由、全局变量或包级可变状态承接外部数据。
+
+6. **结论**：所有 source→sink 流均被位于 sink 前的白名单+私网校验完整防护，无可绕过路径，判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第24行 ValidateOrigin 的参数 entry.Value（上层服务/队列传入的外部数据）；流经 url.Parse 后于第44行进入 probe 发起出站请求；防御为 sink 前的三重有效措施：第31-33行协议白名单（仅 http/https）、第35-38行主机后缀白名单并拒绝 IP 字面量、第41-45行解析结果必须为私网 IP（防 DNS rebinding 与元数据地址）；校验均作用于最终请求对象且无校验后重拼接；第二入口检查：唯一导出函数即 ValidateOrigin，私有 probe 的参数仅来源于已校验 URL，无替代通道；故无 CWE-918 漏洞", "fix_suggestion": "no fix needed"}
+```

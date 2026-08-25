@@ -1,0 +1,51 @@
+LANG: java
+```java
+package com.example.archive;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.regex.Pattern;
+
+/**
+ * 归档解包工具模块，被上层服务调用（例如消费队列消息后传入归档名）。
+ * 负责将外部提交的归档文件安全地解压到指定目录。
+ */
+public final class ArchiveExtractor {
+
+    private static final Pattern SAFE_NAME = Pattern.compile("^[A-Za-z0-9._-]{1,128}$");
+    private static final Path BASE_DIR = Paths.get("/var/archive/incoming").toAbsolutePath().normalize();
+
+    /**
+     * archiveName 为外部提交的归档名，必须按不可信数据处理。
+     */
+    public static Path extract(String archiveName) throws IOException {
+        if (archiveName == null || !SAFE_NAME.matcher(archiveName).matches()) {
+            throw new IllegalArgumentException("illegal archive name");
+        }
+        Path target = BASE_DIR.resolve(archiveName).normalize();
+        if (!target.startsWith(BASE_DIR)) {
+            throw new SecurityException("path traversal blocked");
+        }
+        return Files.createFile(target);
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/argv/stdin 等显式 web 入口；第 19 行公开方法 `extract(String archiveName)` 的参数承载上层调用者传入的外部可控数据（如队列消息中的归档名），是等效污点源，必须按不可信处理。
+
+2. 第 20 行对 `archiveName` 施加白名单正则 `^[A-Za-z0-9._-]{1,128}$`：字符集不含 `/`、`\`、`..` 序列所需的点号组合也无法构成路径分隔符，长度上限防截断类绕过。这是白名单校验型防御，类型正确（拒绝而非过滤替换）。
+
+3. 第 23 行 `BASE_DIR.resolve(archiveName).normalize()` 后第 24 行做 `startsWith(BASE_DIR)` 前缀校验——这是原生安全 API 式的规范化+边界检查双保险，位置在 sink（第 27 行 `Files.createFile`）之前，覆盖了绝对路径注入（resolve 遇绝对路径会丢弃 base）与 `..` 回溯两类攻击面。
+
+4. 数据流验证：source（第 19 行参数）→ 白名单（第 20 行）→ resolve/normalize + 前缀校验（第 23-24 行）→ sink（第 27 行）。即使白名单被未来放宽，前缀校验仍独立兜底，两层防御互为冗余，无单点失效。
+
+5. 第二入口检查：文件内仅一个公开方法，无其他路由注册、静态初始化读取外部配置或间接调用通道；`BASE_DIR` 为编译期常量不可控。所有外部数据只能经 `extract` 参数进入且必经双重校验。
+
+6. 结论：CWE-22 路径遍历攻击面被白名单与规范化前缀校验完整覆盖，不存在可达的 source→sink 未防护路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第19行 extract 方法参数 archiveName（上层服务传入的外部归档名）；流1：参数→第20行白名单正则^[A-Za-z0-9._-]{1,128}$（不含路径分隔符，白名单型有效）→第23行 resolve+normalize→第24行 startsWith 前缀校验（原生安全API，防绝对路径与..回溯）→第27行 Files.createFile sink，双层防御互为冗余；第二入口检查：文件仅此一个公开方法，无路由/环境变量/间接调用等替代通道，BASE_DIR 为常量不可控，全部攻击面已覆盖", "fix_suggestion": "no fix needed"}
+```

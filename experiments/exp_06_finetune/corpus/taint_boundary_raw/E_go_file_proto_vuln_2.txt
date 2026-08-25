@@ -1,0 +1,60 @@
+LANG: go
+```go
+// Package manifest 解析外部提交的部署清单文件。
+// 本模块被上层服务调用：服务从对象存储/上传目录取出清单路径后交给 ParseManifest。
+package manifest
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"gopkg.in/yaml.v3"
+)
+
+type Manifest struct {
+	Hooks []struct {
+		Name string `yaml:"name"`
+		URL  string `yaml:"url"`
+	} `yaml:"hooks"`
+}
+
+// ParseManifest 读取并解析外部提交的 YAML 清单，随后触发 webhook 回调。
+func ParseManifest(path string) error {
+	data, err := os.ReadFile(path) // 第 20 行：读取外部提交的清单文件
+	if err != nil {
+		return err
+	}
+	var m Manifest
+	if err := yaml.Unmarshal(data, &m); err != nil { // 第 25 行：解析不可信内容
+		return err
+	}
+	client := &http.Client{}
+	for _, h := range m.Hooks {
+		// 弱防御：仅拒绝以 "file://" 开头的 URL
+		if len(h.URL) > 7 && h.URL[:7] == "file://" {
+			continue
+		}
+		resp, err := client.Get(h.URL) // 第 33 行：SSRF sink（CWE-918）
+		if err != nil {
+			fmt.Println("hook failed:", err)
+			continue
+		}
+		resp.Body.Close()
+	}
+	return nil
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 20 行 os.ReadFile 读入的外部提交的 YAML 清单文件——上层服务把用户上传的清单落盘后传入 path，文件内容必须按不可信数据处理，是等效污点源。
+
+2. 数据流：第 20 行读入字节 → 第 25 行 yaml.Unmarshal 反序列化到 Manifest 结构 → hooks[].URL 字段完全由攻击者控制的清单文本决定，无任何 schema 白名单约束。
+
+3. 防御分析：第 31-32 行仅做前缀黑名单检查，拒绝以 'file://' 开头的 URL。绕过方式：直接使用 http://169.254.169.254/latest/meta-data/ 访问云元数据；或使用大小写变体、'FILE://0x7f000001/'、重定向跳转等。该黑名单既不覆盖内网 IP，也不覆盖其他 scheme，属于可绕过的弱防御，不构成有效防护。
+
+4. Sink 可达性：第 33 行 client.Get(h.URL) 直接发起请求，污点 URL 无校验直达网络出口，source→sink 全程可达，构成 CWE-918 SSRF。
+
+5. 第二入口检查：本模块唯一数据通道是被解析的清单文件；无路由参数、环境变量或队列报文等其他入口，但清单本身即外部可控，单入口已足以确认漏洞成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF)", "risk_level": "High", "source": "line 20: os.ReadFile 读取外部提交的 YAML 清单文件内容", "sink": "line 33: client.Get(h.URL) 使用清单中的 URL 发起 HTTP 请求", "explanation": "污点边界为被解析的清单文件而非 web 参数；line 20 读入 -> line 25 yaml.Unmarshal -> hooks[].URL 完全由攻击者控制 -> line 33 直接请求；line 31-32 仅前缀黑名单拒绝 file://，可用 http://169.254.169.254 云元数据地址或大小写/编码变体轻易绕过，属无效防御；全文件无第二入口或其他替代通道，唯一通道即清单文件，漏洞可达性成立", "fix_suggestion": "line 31: 移除黑名单，改为对 h.URL 做 scheme 白名单(仅 https)并用 net/url 解析后校验目标 IP 不在私网/环回/链路本地段，且禁用重定向跟随"}
+```

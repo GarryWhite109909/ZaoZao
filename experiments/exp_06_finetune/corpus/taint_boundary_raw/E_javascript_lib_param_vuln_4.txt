@@ -1,0 +1,42 @@
+LANG: javascript
+```code
+// archive-index.js — 归档索引工具模块，被上层服务调用（上层负责从消息队列/任务系统取归档名后传入）
+const { Pool } = require('pg');
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// 弱防御：仅拦截常见 SQL 关键字，可被注释符/大小写/编码绕过
+function sanitizeName(name) {
+  const blacklist = ['select', 'insert', 'update', 'delete', 'drop', ';'];
+  let cleaned = name;
+  for (const kw of blacklist) {
+    cleaned = cleaned.replace(new RegExp(kw, 'gi'), '');
+  }
+  return cleaned;
+}
+
+/**
+ * 为指定归档生成索引记录。
+ * @param {string} archiveName - 上层传入的外部提交的归档文件名（不可信）
+ * @param {string} ownerTag   - 调用方提供的标签，同样来自外部提交内容
+ */
+async function indexArchive(archiveName, ownerTag) {
+  // 弱过滤：只做黑名单替换，攻击者可用 'SELSELECTECT' 嵌套或 '--' 注释绕过
+  const safeName = sanitizeName(archiveName);
+  const query = `INSERT INTO archives (name, tag) VALUES ('${safeName}', '${ownerTag}')`;
+  await pool.query(query); // sink：字符串拼接进 SQL
+}
+
+module.exports = { indexArchive };
+```
+
+1. 第 1 行至第 22 行为本文件全部内容；本文件没有任何 request/input/environ 等显式 web 入口，污点边界在第 17-18 行的函数参数 `archiveName` 与 `ownerTag`——它们由上层服务传入、承载外部提交的归档名与标签，公开接口参数必须按不可信数据处理，是等效污点源。
+2. 数据流一：第 18 行 `archiveName` → 第 20 行 `sanitizeName(archiveName)` → 第 21 行拼入模板字符串 `query` → 第 22 行 `pool.query(query)` 直达 CWE-89 危险 sink。
+3. 防御验证：第 9-15 行的黑名单+正则替换是唯一防御，类型为黑名单字符串替换，位置在 source 与 sink 之间，但覆盖面不足——嵌套关键字（如 'SELSELECTECT' 删除中间词后还原）、SQL 注释符 `--`、十六进制编码均可绕过，且未处理单引号闭合，属可绕过弱防御，不构成有效防护。
+4. 数据流二：第 18 行 `ownerTag` 完全未经任何过滤，直接在第 21 行拼接进 VALUES 子句，source→sink 无任何防御，攻击者可通过 `'--` 直接闭合并注入任意 SQL。
+5. 第二入口检查：全文无路由注册、无 HTTP 处理器、无环境变量/stdin 读取；唯一外部通道即导出函数 `indexArchive` 的两个参数，但该函数为公开 API，任何调用方传入的不可信数据均可到达 sink，替代通道不存在不影响结论。
+6. 综合结论：两条数据流均可达 sink 且防御无效，存在 SQL 注入漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "Critical", "source": "line 18: 函数参数 archiveName 与 ownerTag（外部可控）", "sink": "line 22: pool.query(query) 拼接执行", "explanation": "流一：line 18 archiveName 经 line 20 黑名单替换后于 line 21 拼接进 SQL 并在 line 22 执行，黑名单可被嵌套关键字与 -- 注释绕过，非有效防御；流二：line 18 ownerTag 未经过滤直接在 line 21 拼接，无任何防御；第二入口检查：文件内无路由/HTTP 处理器/stdin/env 读取，唯一外部通道为导出函数参数，但作为公开接口其参数必须按不可信处理，故确认存在 SQL 注入", "fix_suggestion": "line 21: 改用参数化查询 pool.query('INSERT INTO archives (name, tag) VALUES ($1, $2)', [archiveName, ownerTag])"}
+```

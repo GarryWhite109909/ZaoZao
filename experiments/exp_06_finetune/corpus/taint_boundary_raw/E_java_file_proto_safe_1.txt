@@ -1,0 +1,57 @@
+LANG: java
+```java
+package com.acme.render;
+
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+
+/**
+ * 模板渲染辅助类：从磁盘上的模板描述文件加载变量映射，
+ * 供上层渲染服务消费（文件由外部提交方上传，内容不可信）。
+ */
+public final class TemplateContextLoader {
+
+    // 白名单：仅允许这些模板变量名进入渲染上下文
+    private static final Set<String> ALLOWED_KEYS =
+            new HashSet<>(java.util.Arrays.asList("title", "body", "footer", "user.name"));
+
+    /**
+     * 读取 base64 编码的序列化属性文件并构建只读上下文。
+     */
+    public static java.util.Map<String, String> load(Path file) throws IOException {
+        byte[] raw = Base64.getMimeDecoder().decode(Files.readAllBytes(file)); // 第 24 行：污点源
+        java.util.Properties props = new java.util.Properties();
+        props.load(new java.io.ByteArrayInputStream(raw));                     // 第 26 行：解析不可信内容
+
+        java.util.Map<String, String> ctx = new java.util.HashMap<>();
+        for (String name : props.stringPropertyNames()) {                      // 第 28 行
+            if (!ALLOWED_KEYS.contains(name)) {                                // 第 29 行：白名单校验
+                continue;                                                      // 丢弃未授权键
+            }
+            String value = props.getProperty(name, "");
+            if (value.length() > 4096) {                                       // 长度上限
+                throw new IOException("template variable too large");
+            }
+            ctx.put(name, value);                                              // 仅白名单键入上下文
+        }
+        return Collections.unmodifiableMap(ctx);
+    }
+}
+```
+
+1. **污点边界**：本文件没有任何 request/input/environ 等显式 web 入口；第 24 行 `Files.readAllBytes(file)` 读取的文件由外部提交方上传、内容完全外部可控，属于等效污点源。注意代码刻意使用 `Properties.load` 而非 `ObjectInputStream` 反序列化——若用原生 Java 序列化将直接构成 CWE-502，此处设计上已规避。
+2. **数据流追踪**：第 24 行字节 → Base64 解码 → 第 26 行 `Properties.load` 解析为键值对 → 第 28-33 行遍历所有属性名 → 第 38 行写入返回的上下文 Map，最终被上层渲染引擎消费。
+3. **防御验证（类型正确）**：第 29 行采用**白名单校验**（`ALLOWED_KEYS` 固定集合），而非黑名单或正则过滤——黑名单可被编码变体绕过，白名单是默认拒绝语义，无法通过构造新键绕过；这是 CWE 推荐的有效防御类型。
+4. **防御验证（位置与覆盖面）**：校验位于 source（第 24/26 行）与 sink（第 38 行 put）之间，且作用于循环内每一个属性名，覆盖全部攻击面；同时第 34 行对值施加长度上限，防止资源耗尽型滥用。即使攻击者注入任意键如 `exec` 或 `class`，也会在第 30 行被丢弃，永远到不了 sink。
+5. **第二入口检查**：类中唯一公开方法是 `load(Path)`，无其他重载、无静态初始化读取外部数据、无常驻监听；`ALLOWED_KEYS` 为编译期常量不可篡改。不存在替代通道使未校验数据到达 sink。
+6. **结论**：source→sink 链路存在位置正确、类型正确、覆盖完整的白名单防御，且反序列化风险在 API 选型层面已被消除，判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第24行 Files.readAllBytes 读取的外部上传模板描述文件, 经 Base64 解码后由第26行 Properties.load 解析; 数据流: 文件字节→解码字节→Properties 键值对→第28行遍历→第38行写入上下文 Map; 防御为第29行固定集合白名单校验, 属于默认拒绝型有效防御(非黑名单/正则), 位于 source 与 sink 之间且对每个属性名逐一校验, 覆盖全部攻击面, 未授权键在第30行被丢弃; 另有第34行长度上限缓解资源滥用; 刻意选用 Properties 解析而非 ObjectInputStream 原生反序列化, 从 API 层面消除了 CWE-502 反序列化执行链; 第二入口检查: 类中仅有 load(Path) 一个公开方法, 无其他路由/参数/间接调用通道, 无静态初始化外部读取, 不存在绕过路径", "fix_suggestion": "no fix needed"}
+```

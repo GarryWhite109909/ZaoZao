@@ -1,0 +1,45 @@
+LANG: java
+```java
+package com.acme.deploy.config;
+
+import org.apache.velocity.app.VelocityEngine;
+import org.apache.velocity.VelocityContext;
+import java.io.StringWriter;
+import java.util.Map;
+
+/**
+ * 配置清单渲染模块：由消息队列消费者回调触发，
+ * 消费 config.submission 队列中外部用户提交的 YAML/模板配置载荷。
+ */
+public class ConfigManifestRenderer {
+
+    private final VelocityEngine engine = new VelocityEngine();
+
+    // 被上层消费者服务调用；payload 为队列消息体（外部提交的配置内容）
+    public String onConfigMessage(Map<String, Object> payload) {
+        Object rawTemplate = payload.get("manifest_template");
+        Map<String, Object> vars = (Map<String, Object>) payload.get("variables");
+
+        // 弱防御：仅拦截包含 #set / #foreach 的明显指令，可被 #evaluate、$runtime 等绕过
+        String template = rawTemplate.toString()
+                .replace("#set", "")
+                .replace("#foreach", "");
+
+        VelocityContext ctx = new VelocityContext(vars);
+        StringWriter out = new StringWriter();
+        engine.evaluate(ctx, out, "manifest", template); // CWE-1336: 模板注入
+        return out.toString();
+    }
+}
+```
+
+1. 第 1 行污点边界：本文件无 request/input/environ 等显式 web 入口；第 17 行回调参数 `payload`（MQ 消息体）承载外部提交的配置内容，属等效污点源，必须按不可信处理。
+2. 第 18-19 行从消息体取出 `manifest_template` 与 `variables`，均为攻击者完全可控的外部数据。
+3. 第 22-24 行的"防御"仅为字符串替换删除 `#set`/`#foreach` 两个指令字面量——黑名单式弱防御，可通过大小写变体、空白插入（如 `# set`）、或直接使用 `$obj.class.forName(...)`、`#evaluate`、Velocity 工具引用等绕过，不构成有效过滤。
+4. 第 27 行 `engine.evaluate(...)` 直接以未净化的攻击者字符串作为模板求值，source→sink 全程无有效防御，构成 CWE-1336 模板注入（SSTI），可导致任意代码执行。
+5. 第二入口检查：本文件唯一方法即该回调，无其他路由/参数/间接调用通道；但同一 sink 若上层复用该方法处理其他队列主题，风险面等同扩大。
+6. 结论：存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 模板注入（Velocity SSTI）", "risk_level": "Critical", "source": "line 17: 回调参数 payload（MQ 消息体中的 manifest_template 与 variables）", "sink": "line 27: engine.evaluate(ctx, out, 'manifest', template)", "explanation": "数据流：line 17 payload -> line 18-19 取出 manifest_template/variables -> line 22-24 仅做 #set/#foreach 字符串替换的黑名单弱防御（可用大小写变体、空白插入或 $class 反射、#evaluate 绕过）-> line 27 evaluate 以攻击者可控字符串为模板求值，实现任意代码执行；第二入口检查：本文件仅有该回调一个入口，无其他路由或替代通道，但任何复用此方法的调用方均同样暴露", "fix_suggestion": "line 22: 不将外部内容作为模板执行，改用 SecureUberspector 并禁用反射类方法，或将用户数据仅作为 VelocityContext 变量传入固定内部模板"}
+```

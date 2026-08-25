@@ -1,0 +1,48 @@
+LANG: java
+```java
+package com.acme.report.export;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Component;
+
+/**
+ * 报表导出消费者：上层 API 服务将用户筛选条件发布到 report.export 队列，
+ * 本组件消费消息并执行导出查询。
+ */
+@Component
+public class ReportExportConsumer {
+
+    private final JdbcTemplate jdbcTemplate;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public ReportExportConsumer(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    @RabbitListener(queues = "report.export")
+    public void onExportMessage(String messageBody) {
+        try {
+            JsonNode payload = objectMapper.readTree(messageBody);
+            String region = payload.path("region").asText();
+            String sql = "SELECT order_id, amount FROM orders WHERE region = ?";
+            jdbcTemplate.query(sql, rs -> rs.getLong("order_id"), region);
+        } catch (Exception e) {
+            // 记录并丢弃非法消息，避免毒丸消息阻塞队列
+        }
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/argv/stdin 等显式 web 入口；第 24 行 `onExportMessage(String messageBody)` 是 RabbitMQ 队列 `report.export` 的回调签名，消息体由外部（上层服务转发的用户筛选条件）提交，属于等效污点源，必须按不可信数据处理。
+2. 第 27 行 `objectMapper.readTree(messageBody)` 解析消息体，第 28 行取出 `region` 字段——这是唯一的外部输入点，污点从回调参数进入局部变量 `region`。
+3. 追踪数据流：`messageBody → payload → region`，随后在第 30 行作为第 4 个实参传入 `jdbcTemplate.query(sql, ..., region)`。SQL 语句在第 29 行硬编码为 `"SELECT ... WHERE region = ?"` 占位符形式，未做任何字符串拼接。
+4. 防御验证：JdbcTemplate 的占位符 `?` 由 JDBC PreparedStatement 实现，驱动层对参数做类型化绑定与转义，用户输入永远不会被解析为 SQL 语法——这是参数化查询，类型正确；防御位于 sink 调用处（第 30 行），位置正确；该查询的全部动态部分只有 `region` 一个值且被完整覆盖为绑定参数，无任何拼接路径绕过，覆盖完整攻击面。非字符串拼接的过滤方案（黑名单/正则/替换）均不存在，无需担心可绕过过滤。
+5. 第二入口检查：文件中仅有一个 `@RabbitListener` 回调方法，无其他监听器、定时任务或间接调用路径；`jdbcTemplate` 仅在此处使用，不存在其他 sink 或替代通道。
+6. 结论：source→sink 唯一链路全程受参数化查询保护，无 SQL 注入风险。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点是第24行RabbitMQ回调参数messageBody（队列report.export的消息体，承载外部用户筛选条件）；污点流经第27行readTree解析、第28行提取region字段后于第30行传入jdbcTemplate.query；第29行SQL使用?占位符并由PreparedStatement参数化绑定，防御类型正确（数据库驱动级转义）、位置正确（sink调用处）、覆盖完整（全部动态数据均为绑定参数，无拼接路径）；第二入口检查：文件仅此一个监听器回调，jdbcTemplate无其他调用点，不存在替代通道", "fix_suggestion": "no fix needed"}
+```

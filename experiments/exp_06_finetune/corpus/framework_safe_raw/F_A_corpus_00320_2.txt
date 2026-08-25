@@ -1,0 +1,73 @@
+LANG: go
+```go
+package main
+
+import (
+	"html/template"
+	"net/http"
+	"os"
+)
+
+var reportTmpl = `<!DOCTYPE html>
+<html><body>
+<h1>Report for {{.Name}}</h1>
+{{.Body}}
+</body></html>`
+
+// 白名单：仅允许内置模板，禁止任何用户提供的模板源
+var allowedTemplates = map[string]string{
+	"default": reportTmpl,
+}
+
+func renderHandler(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	body := r.URL.Query().Get("body")
+
+	tmplSrc := os.Getenv("REPORT_TEMPLATE")
+	if tmplSrc == "" {
+		tmplSrc = reportTmpl
+	}
+
+	// 修复：不再接受 ?template= 覆盖模板内容；
+	// 仅允许通过白名单选择预定义模板，杜绝 SSTI
+	tmplKey := r.URL.Query().Get("template")
+	if tmplKey != "" {
+		src, ok := allowedTemplates[tmplKey]
+		if !ok {
+			http.Error(w, "unknown template", http.StatusBadRequest)
+			return
+		}
+		tmplSrc = src
+	}
+
+	t, err := template.New("report").Parse(tmplSrc)
+	if err != nil {
+		http.Error(w, "invalid template", http.StatusBadRequest)
+		return
+	}
+
+	data := map[string]string{"Name": name, "Body": body}
+	if err := t.Execute(w, data); err != nil {
+		http.Error(w, "render error", http.StatusInternalServerError)
+		return
+	}
+}
+
+func main() {
+	http.HandleFunc("/report", renderHandler)
+	http.ListenAndServe(":8080", nil)
+}
+```
+
+分析：
+
+1. 第 26–27 行枚举用户可控输入点：`r.URL.Query().Get("name")`、`Get("body")`，以及第 33 行的 `Get("template")`。前两者作为数据传入模板（由 html/template 自动上下文转义），本身不构成 SSTI；真正的漏洞源是 `template` 参数。
+2. 原代码第 35–37 行将用户输入直接赋给 `tmplSrc` 并在第 41 行 `Parse(tmplSrc)` 编译执行——这是 sink：攻击者可注入 `{{printf "%s" (call .Exec ...)}}` 等模板动作实现服务端模板注入（CWE-1336）。
+3. 修复采用【白名单精确允许集】：第 17–20 行定义 `allowedTemplates` 映射，仅包含内置 `default` 模板；第 34–40 行将用户输入从“模板内容”降级为“模板键名”，只有命中白名单才取用对应内容，否则返回 400。类型正确性：映射查找保证 `tmplSrc` 只能是编译期固定的字符串常量，不可能含攻击者控制的模板语法。
+4. 位置正确性：防御位于数据进入 `Parse` 之前的唯一汇合点（第 34 行），覆盖了所有经 `?template=` 到达 sink 的路径；环境变量 `REPORT_TEMPLATE`（第 24 行）属部署侧受信配置，保持原样符合 minimal pair 要求。
+5. 攻击面覆盖完整性：即使攻击者绕过参数名大小写、重复传参或空值技巧，`allowedTemplates[tmplKey]` 精确匹配使任何未注册键都失败，不存在部分匹配或前缀绕过空间；`name`/`body` 数据流仍走 html/template 的自动转义，与原代码一致。
+6. 第二入口/替代通道检查：路由仅注册 `/report` 一个 handler（第 55 行），无其他 handler 或中间件读取 `template` 参数；`os.Getenv("REPORT_TEMPLATE")` 为运维控制面而非 HTTP 可控面，故无第二入口残留。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-1336 服务端模板注入：第 33 行 r.URL.Query().Get('template') 用户可控模板内容直接流入第 41 行 template.Parse(tmplSrc) 执行；修复采用白名单精确允许集 allowedTemplates，用户输入仅作键名选择预定义模板，未命中即拒绝，模板内容永远不可被用户控制；name 与 body 数据流保持原样，由 html/template 自动上下文转义处理，非本次修复目标", "fix_suggestion": "line 34: 将 ?template= 参数改为 allowedTemplates 白名单键名查找，禁止用户提交的字符串作为模板源传入 Parse"}
+```

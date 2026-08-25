@@ -1,0 +1,44 @@
+LANG: java
+```java
+package com.shop.notify.consumer;
+
+import org.jsoup.Jsoup;
+import org.jsoup.safety.Safelist;
+
+/**
+ * 消息消费者业务处理器：由上层服务从队列拉取业务消息后调用，
+ * payload 为外部提交的消息内容，本模块不做入口校验。
+ */
+public class OrderNotifyHandler {
+
+    /** 渲染订单通知页片段，body 由消息队列中的业务消息携带 */
+    public String renderNotification(String orderId, String body) {
+        // 弱防御：仅做黑名单关键字剔除，可被大小写/编码变体绕过
+        String cleaned = body
+                .replace("script", "")
+                .replace("SCRIPT", "")
+                .replace("onerror", "");
+        return "<div class='order' data-id='" + orderId + "'>" + cleaned + "</div>";
+    }
+
+    /** 生成站内信 HTML 并写入通知存储（下游直接以 HTML 渲染） */
+    public void saveInboxMessage(String userId, String title, String htmlBody) {
+        // 看似使用 Jsoup 清洗，但 Safelist.none() 只保留纯文本，
+        // 这里却把结果再拼回富文本模板并保留调用方传入的 title 原文
+        String sanitized = Jsoup.clean(htmlBody, Safelist.none());
+        String page = "<h3>" + title + "</h3><div>" + sanitized + "</div>";
+        InboxStore.persist(userId, page);
+    }
+}
+```
+
+1. 第 1 行 package、第 10/16 行两个公开方法即污点边界：本文件没有任何 request/input/environ 等显式 web 入口，但 `renderNotification(String orderId, String body)` 与 `saveInboxMessage(...)` 的参数承载上层消费者从队列取出的外部可控数据，公开接口参数必须按不可信处理，是等效污点源。
+2. 第 12-14 行对 body 做 script/onerror 关键字黑名单替换：可绕过——`<ScRiPt>`、`<img src=x onerr\u006Fr=...>`、HTML 实体编码 `&#111;nerror`、或直接改用 `<svg onload>` 等未列入黑名单的向量均可穿透；第 15 行将未净化的 body 与 orderId 直接拼入 HTML 字符串返回给上层渲染，形成 source(第 10 行 body/orderId) → sink(第 15 行字符串拼接进 HTML) 的 XSS 流。
+3. 第 18-22 行第二条流：htmlBody 经 `Jsoup.clean(..., Safelist.none())` 已被净化为纯文本，该段本身不构成注入；但同行的 title 参数完全未经任何处理，第 21 行被原样拼入 `<h3>` 标签，title 含 `<img src=x onerror=alert(1)>` 即可在下游渲染时执行，source(第 17 行 title) → sink(第 21 行拼接)。
+4. 防御覆盖面验证：黑名单字符串替换（第 12-14 行）类型为可绕过弱防御，位置在 sink 前，覆盖面仅限三个字面量且区分大小写处理不完整；Jsoup 清洗只作用于 htmlBody 一个参数，未覆盖 title 与 renderNotification 的全部参数，属于部分覆盖而非有效防御。
+5. 第二入口检查：文件内无路由注册、无 HTTP 处理器、无环境变量/stdin 读取；替代通道仅为两个公开方法的参数（orderId/body/userId/title/htmlBody），其中 userId 仅作存储键不进入 HTML。所有可达 sink 的通道均已被上述两条流覆盖。
+6. 结论：存在 CWE-79 跨站脚本漏洞，主链为第 10 行 body 参数经可绕过黑名单后于第 15 行拼入 HTML；次链为第 17 行 title 未净化直通第 21 行。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (XSS)", "risk_level": "High", "source": "line 10: renderNotification 的 body/orderId 参数与 line 17: saveInboxMessage 的 title 参数（队列消息携带的外部可控数据）", "sink": "line 15: 拼接进返回的 HTML 片段; line 21: title 拼接进 <h3> 后持久化并由下游渲染", "explanation": "流1: line 10 body -> line 12-14 黑名单 replace(script/onerror) 可被 <ScRiPt> 大小写混合、onerr\\u006Fr、实体编码及 svg onload 等向量绕过 -> line 15 拼入 HTML 返回上游渲染触发存储型/反射型 XSS; 流2: line 17 title 无任何过滤 -> line 21 直接拼入 <h3> 写入 InboxStore 由前端渲染执行; Jsoup.clean(Safelist.none()) 仅覆盖 htmlBody 不覆盖 title, 属部分覆盖非有效防御; 文件无路由/HTTP/env 入口, 替代通道仅为两个公开方法参数, 已全部枚举", "fix_suggestion": "line 15: 对 orderId/body 及 line 21 的 title 统一使用 Jsoup.clean(value, Safelist.none()) 或 OWASP Java Encoder 的 Encode.forHtml 进行上下文相关输出编码后再拼接"}
+```

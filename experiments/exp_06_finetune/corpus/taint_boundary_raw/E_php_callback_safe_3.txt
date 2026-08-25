@@ -1,0 +1,49 @@
+LANG: php
+```php
+<?php
+declare(strict_types=1);
+
+namespace App\Cache\Codec;
+
+use PhpAmqpLib\Message\AMQPMessage;
+
+/**
+ * 缓存编解码模块：消费缓存同步队列消息，将外部节点推送的
+ * 缓存条目落盘到本地快照目录。由上层 Worker 服务注册为消费者回调。
+ */
+final class CacheSnapshotConsumer
+{
+    private const ALLOWED_KEYS = ['user_profile', 'session_index', 'config_blob'];
+
+    public function __construct(private string $snapshotDir) {}
+
+    /** 队列消费者回调：$message 的 body 承载外部节点提交的缓存载荷 */
+    public function __invoke(AMQPMessage $message): void
+    {
+        $payload = json_decode($message->getBody(), true);
+        if (!is_array($payload)) {
+            return;
+        }
+
+        $key = (string)($payload['cache_key'] ?? '');
+        // 白名单校验：仅允许预定义的缓存键，杜绝路径穿越
+        if (!in_array($key, self::ALLOWED_KEYS, true)) {
+            error_log('rejected cache key: ' . bin2hex($key));
+            return;
+        }
+
+        $target = $this->snapshotDir . DIRECTORY_SEPARATOR . $key . '.json';
+        file_put_contents($target, json_encode($payload['value'] ?? null, JSON_THROW_ON_ERROR));
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；第 20 行 `__invoke(AMQPMessage $message)` 是消息队列消费者回调，`$message->getBody()`（第 22 行）承载外部节点提交的缓存载荷，属于等效污点源，必须按不可信数据处理。
+2. 数据流一：第 22 行 body → 第 23 行 json_decode → 第 26 行取出 `cache_key` → 第 30 行拼入 `$target` → 第 35 行 `file_put_contents` 写文件，这是 CWE-22 路径穿越的潜在 sink。
+3. 防御验证：第 29-32 行使用严格白名单 `in_array($key, self::ALLOWED_KEYS, true)`——类型正确（白名单而非黑名单/正则/字符串替换，攻击者无法构造 `../`、绝对路径或空字节绕过，因为键必须是三个枚举值之一）；位置正确（校验发生在拼接 `$target` 与 sink 之前）；覆盖完整（`$payload['value']` 仅经 json_encode 序列化写入固定后缀文件内容，不参与路径构成，无其他污点分支到达 sink）。
+4. 第二入口检查：本类唯一公开方法是回调 `__invoke`，无其他路由、参数或间接调用通道；`$snapshotDir` 为构造函数注入的服务端配置，非外部可控。
+5. 结论：source→sink 唯一链路被前置白名单完全阻断，不存在可利用的路径穿越。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点是第20行队列回调参数message的body（第22行），经json_decode后cache_key流向第35行file_put_contents的路径拼接；第29-32行采用严格白名单in_array校验，类型上属白名单而非黑名单/正则/替换过滤，不可被../或空字节绕过，位置在拼接与sink之前，覆盖全部到达sink的数据流；payload.value仅作为文件内容且经json_encode序列化，不参与路径构成；第二入口检查：类内无其他公开方法、路由或间接调用，snapshotDir为服务端注入配置，结论为无可利用漏洞", "fix_suggestion": "no fix needed"}
+```

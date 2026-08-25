@@ -1,0 +1,52 @@
+LANG: java
+```java
+package com.acme.report.export;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.stereotype.Component;
+
+/**
+ * 报表导出消费者：上层 API 服务将用户筛选条件序列化后投递到 report.export 队列，
+ * 本组件消费消息并执行导出查询。
+ */
+@Component
+public class ReportExportConsumer {
+
+    private final Connection connection;
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    public ReportExportConsumer(Connection connection) {
+        this.connection = connection;
+    }
+
+    @RabbitListener(queues = "report.export")
+    public void onExportMessage(String messageBody) throws Exception {
+        JsonNode payload = mapper.readTree(messageBody);
+        String filter = payload.get("filter").asText();
+        // 简单防御：拦截常见 SQL 关键字
+        String cleaned = filter.replaceAll("(?i)(select|union|;|--)", "");
+        String sql = "SELECT id, name, amount FROM orders WHERE region = '" + cleaned + "'";
+        try (Statement stmt = connection.createStatement(); ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                System.out.println(rs.getString("name"));
+            }
+        }
+    }
+}
+```
+
+1. 第 22 行的 `onExportMessage(String messageBody)` 是 RabbitMQ 消费者回调，本文件没有任何 request/argv 等显式 web 入口；但该消息体由上层 API 服务转发自外部用户提交的筛选条件，属于公开接口参数的等效污点源，必须按不可信数据处理。
+2. 第 23 行 `mapper.readTree(messageBody)` 解析消息体，第 24 行取出 `filter` 字段——这是唯一的外部输入点，污点从回调参数进入 `filter` 变量。
+3. 第 26 行使用黑名单正则 `replaceAll("(?i)(select|union|;|--)", "")` 做弱过滤：可被大小写混合嵌套绕过（如 `selselectect` 删除后还原为 `select`），且未覆盖 `'`、`or`、`and`、注释符 `#`、`/**/` 等，不构成有效防御。
+4. 第 27 行将未净化的 `cleaned` 直接字符串拼接进 SQL 语句，第 28 行 `stmt.executeQuery(sql)` 是 CWE-89 危险 sink：攻击者提交 filter 为 `x' OR '1'='1` 即可拖库，或用堆叠/盲注进一步利用。
+5. 全链路 source→sink 仅此一条（messageBody → payload.filter → cleaned → sql → executeQuery），无 PreparedStatement 参数化、无白名单校验、无类型约束。
+6. 第二入口检查：本文件仅有一个 @RabbitListener 回调方法，无其他路由、定时任务或间接调用通道；但队列本身是持久化入口，任何能向 report.exchange 发布消息的主体均可触达同一 sink，故确认存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL注入", "risk_level": "Critical", "source": "line 24: 从回调消息体解析出的 filter 字段", "sink": "line 28: stmt.executeQuery 拼接 SQL 执行", "explanation": "污点边界：本文件无显式 web 入口，第 22 行 RabbitMQ 回调参数 messageBody 承载上层服务转发的用户筛选条件，为等效污点源；数据流：第 24 行取 filter -> 第 26 行黑名单正则替换（可用 selselectect 还原 select 或改用 or/#//**/ 绕过，非有效防御）-> 第 27 行字符串拼接进 SQL -> 第 28 行 executeQuery 触发注入；第二入口检查：文件内仅有这一个 @RabbitListener 回调，无其他路由或间接调用，但队列对外部发布者开放，单一入口即可稳定利用", "fix_suggestion": "line 27: 改用 PreparedStatement 的 ? 占位符并 setString 绑定 filter，删除拼接逻辑"}
+```

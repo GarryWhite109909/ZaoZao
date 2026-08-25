@@ -1,0 +1,48 @@
+LANG: php
+```php
+<?php
+// CacheCodecWorker.php — 缓存编解码模块的队列消费者
+// 被上层服务调用：从 Redis Stream 消费缓存同步消息，回调签名中的载荷承载外部数据
+
+declare(strict_types=1);
+
+namespace App\Cache;
+
+class CacheCodecWorker
+{
+    private \Redis $redis;
+
+    public function __construct(\Redis $redis)
+    {
+        $this->redis = $redis;
+    }
+
+    // 队列消费者回调：$payload 为消息体（外部提交方写入，按不可信处理）
+    public function onCacheMessage(array $payload): void
+    {
+        // 弱防御：仅黑名单过滤目录分隔符（可被 URL 编码 %2e%2e%2f 或 ..\ 绕过）
+        $key = str_replace(['../', '..\'], '', (string)($payload['cache_key'] ?? ''));
+
+        // 缓存值可能落盘为本地文件（编解码快照）
+        if (($payload['op'] ?? '') === 'snapshot') {
+            $dir = '/var/cache/codec/' . $key;
+            file_put_contents($dir . '/snapshot.bin', serialize($payload['value'] ?? ''));
+        }
+
+        // 解码时同样用 key 读取归档
+        if (($payload['op'] ?? '') === 'restore') {
+            include '/var/cache/codec/' . $key . '/meta.php';
+        }
+    }
+}
+```
+
+1. 第 16 行 `onCacheMessage(array $payload)` 是污点边界：本文件没有任何 request/input/environ 等显式 web 入口，但该回调由消息队列消费触发，`$payload` 是外部提交的消息体载荷，公开接口提交的内容必须按不可信处理，等效污点源。
+2. 第 20 行 `$payload['cache_key']` 为 source；第 21 行仅做 `str_replace` 黑名单替换 `../` 与 `..\`，属可绕过弱防御——攻击者可用 `%2e%2e%2f`（若上游未解码则原样通过、下游解码后生效）、嵌套 `....//`、或纯 `..` 配合绝对路径片段绕过。
+3. 第 25 行将污染后的 `$key` 拼入路径并传给 `file_put_contents`（第 26 行），构成第一条 source→sink 流：可任意写文件（配合截断/覆盖写 webshell 或覆盖配置）。
+4. 第 31 行同一污染 key 拼入 `include` 路径（第 32 行），构成第二条流：路径穿越 + 本地文件包含，可加载任意 `.php` 文件执行代码。两条流全程无规范化（无 `realpath`、无白名单前缀校验）。
+5. 第二入口检查：本文件唯一入口是该回调方法，无其他路由/参数/间接调用通道；但同一 `$key` 同时流向两个 sink，且 `str_replace` 对两条流均无效，故确认存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径遍历（任意文件写入与本地文件包含）", "risk_level": "Critical", "source": "line 20: 回调参数 payload['cache_key']（外部消息体载荷）", "sink": "line 26: file_put_contents 与 line 32: include", "explanation": "流1: line 20 cache_key -> line 21 str_replace 黑名单（可被 ....// 、URL编码或 ..\\ 变体绕过）-> line 25-26 file_put_contents 任意文件写; 流2: 同一污染 key -> line 31-32 include 本地文件包含导致代码执行; 第二入口检查: 文件内无其他路由或参数入口, 唯一通道为队列回调, 但其载荷完全外部可控且两处 sink 均无有效防御", "fix_suggestion": "line 21: 改为 realpath 规范化后校验前缀在 /var/cache/codec/ 内并使用白名单字符集校验 key"}
+```

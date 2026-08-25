@@ -1,0 +1,72 @@
+LANG: go
+```go
+// Package assets 提供静态资源定位服务，由消息队列消费者回调触发。
+package assets
+
+import (
+	"database/sql"
+	"fmt"
+)
+
+// AssetLocator 被上层服务注册为队列消费者，
+// 每条消息的载荷（JSON 事件体）承载外部提交的资源名。
+type AssetLocator struct {
+	DB *sql.DB
+}
+
+// OnMessage 是队列消费回调，payload 为外部事件载荷，内容不可信。
+func (l *AssetLocator) OnMessage(payload []byte) error {
+	name := extractName(payload) // 从事件体解析资源名
+
+	// 弱防御：仅拦截分号与注释符，可被绕过
+	for _, bad := range []string{";", "--", "/*"} {
+		if contains(name, bad) {
+			return fmt.Errorf("invalid name")
+		}
+	}
+
+	query := "SELECT path FROM static_assets WHERE name = '" + name + "'"
+	var path string
+	if err := l.DB.QueryRow(query).Scan(&path); err != nil {
+		return err
+	}
+	fmt.Println("resolved:", path)
+	return nil
+}
+
+func extractName(p []byte) string {
+	s := string(p)
+	start, end := indexOf(s, ""name":""), 0
+	if start < 0 {
+		return s
+	}
+	start += len(""name":"")
+	end = indexOf(s[start:], """)
+	if end < 0 {
+		return s[start:]
+	}
+	return s[start : start+end]
+}
+
+func contains(s, sub string) bool { return len(sub) > 0 && indexOf(s, sub) >= 0 }
+func indexOf(s, sub string) int   { return len([]rune(s)) - len([]rune(trimPrefix(s, sub))) }
+
+func trimPrefix(s, sub string) string {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return s[i+len(sub):]
+		}
+	}
+	return s
+}
+```
+
+1. 第 14 行 `OnMessage(payload []byte)` 即污点边界：本文件没有任何 request/argv/environ 等显式 web 入口，但该函数是消息队列消费者回调，`payload` 承载外部提交的事件体，按不可信外部数据处理，为等效污点源。
+2. 第 16 行 `extractName(payload)` 将载荷解析为资源名 `name`，污点从回调参数进入字符串变量；第 24 行将其直接拼接进 SQL：`"SELECT path FROM static_assets WHERE name = '" + name + "'"`。
+3. 第 19-23 行的黑名单仅拦截 `;`、`--`、`/*` 三种子串，覆盖面极窄且可绕过：攻击者可用单引号闭合后构造 `' OR '1'='1`（无需分号或注释），或利用 `UNION SELECT` 注入列——例如 payload 中 name 值为 `x' UNION SELECT '/etc/passwd' FROM static_assets WHERE 'a'='a`，即可完全绕过黑名单并控制返回路径。无参数化查询、无白名单校验，防御无效。
+4. 第 25 行 `l.DB.QueryRow(query)` 直接执行拼接后的 SQL，即 CWE-89 危险 sink；污点数据未经任何有效净化直达 sink，注入成立。
+5. 第二入口检查：本文件仅有一个导出方法 `OnMessage`，辅助函数 `extractName/contains/indexOf` 仅处理内部数据，不存在其他路由、HTTP 参数或间接调用通道；唯一外部输入即回调载荷，故结论唯一且确定。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "High", "source": "line 14: OnMessage 回调参数 payload（外部事件载荷）", "sink": "line 25: l.DB.QueryRow(query) 拼接 SQL 查询", "explanation": "第 14 行回调参数 payload 为等效污点源；第 16 行解析出资源名后于第 24 行直接字符串拼接进 SQL，第 25 行 QueryRow 执行；第 19-23 行黑名单仅拦 ; -- /*，可用单引号闭合加 OR/UNION 构造绕过，属无效弱防御；全文件无第二入口或替代通道，唯一外部输入即该回调载荷", "fix_suggestion": "line 24: 改用参数化查询 l.DB.QueryRow('SELECT path FROM static_assets WHERE name = ?', name)，并对资源名做白名单字符校验"}
+```

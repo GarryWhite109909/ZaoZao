@@ -1,0 +1,63 @@
+LANG: go
+```go
+// Package outbound: webhook 出站发送器配置加载模块。
+// 上层服务消费投递队列消息后调用 LoadWebhookConfig 加载各租户的推送端点定义。
+package outbound
+
+import (
+	"encoding/xml"
+	"io/ioutil"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+)
+
+// WebhookConfig 描述一个出站 webhook 端点（由租户上传的 XML 定义文件）。
+type WebhookConfig struct {
+	URL     string `xml:"url"`
+	Event   string `xml:"event"`
+	Secret  string `xml:"secret"`
+}
+
+var dtdRe = regexp.MustCompile(`(?s)<!DOCTYPE[^>]*SYSTEM\s+"([^"]+)"`)
+
+func LoadWebhookConfig(path string) (*WebhookConfig, error) {
+	raw, err := ioutil.ReadFile(path) // 第 24 行：读取租户上传的 XML 文件，内容不可信
+	if err != nil {
+		return nil, err
+	}
+	doc := string(raw)
+	if m := dtdRe.FindStringSubmatch(doc); len(m) > 1 { // 第 28 行：提取外部 DTD 声明
+		entityURL := strings.TrimSpace(m[1])
+		resp, err := http.Get(entityURL) // 第 30 行：SINK——按文件内声明的地址发起出站请求
+		if err == nil {
+			body, _ := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			doc = strings.Replace(doc, m[0], string(body), 1) // 弱防御式“内联化”，未校验来源
+		}
+	}
+	var cfg WebhookConfig
+	if err := xml.Unmarshal([]byte(doc), &cfg); err != nil { // 第 38 行：解析结果进入后续使用
+		return nil, err
+	}
+	if cfg.URL == "" {
+		cfg.URL = os.Getenv("DEFAULT_HOOK") // 兜底默认值，非污点路径
+	}
+	return &cfg, nil
+}
+```
+
+1. 污点边界：本文件没有任何 request/environ/stdin 等显式入口；第 24 行 `ioutil.ReadFile(path)` 读取的是租户通过控制台上传、由队列任务落盘的 XML webhook 定义文件。该文件内容属于外部提交的数据，必须按不可信处理，是等效污点源。
+
+2. 数据流：第 24 行读入的原始字节转为字符串 `doc` 后，第 28 行用正则 `dtdRe` 提取 `<!DOCTYPE ... SYSTEM "url">` 中攻击者完全可控的 SYSTEM 标识符，赋给 `entityURL`。
+
+3. Sink 可达性：第 30 行 `http.Get(entityURL)` 直接以文件内容派生的字符串作为请求目标发起出站 HTTP 请求，source→sink 全程无任何校验，可达性成立。这正是 CWE-611 的核心危害面：外部实体声明被服务端解析并主动取回，可指向内网元数据地址（如 169.254.169.254）或 file:// 变体实现 SSRF/信息外带。
+
+4. 防御分析：第 27 行的正则仅用于“识别并内联”外部 DTD，属于黑名单式的弱处理而非白名单校验——它不限制协议 scheme、不限制目标网段，且第 33 行 `strings.Replace` 把取回的外部实体内容原样拼回文档再交给 `xml.Unmarshal`，等于把不可信内容二次注入解析器；正则本身也可被 `PUBLIC` 声明、参数实体或编码混淆绕过。因此不存在有效防御。
+
+5. 第二入口检查：函数唯一参数是文件路径，由上层队列消费者传入；文件内不存在其他路由、环境变量或网络监听入口（第 42 行 `os.Getenv("DEFAULT_HOOK")` 仅在 cfg.URL 为空时兜底，且不参与本次污点流）。替代通道仅为同一文件的变体写法，结论不变：存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 XML 外部实体引用不当（XXE 导致服务端按攻击者指定地址发起出站请求）", "risk_level": "High", "source": "line 24: ioutil.ReadFile 读取租户上传的 XML webhook 定义文件，内容为外部可控数据", "sink": "line 30: http.Get(entityURL) 以文件内 DOCTYPE SYSTEM 声明的地址发起出站请求", "explanation": "主链：line 24 ReadFile 得到不可信 XML -> line 28 正则提取 SYSTEM 实体 URL -> line 30 http.Get 直接请求该 URL -> line 33 将取回内容 Replace 回文档 -> line 38 xml.Unmarshal 再次解析；防御分析：line 27 的正则与 line 33 的字符串替换属可绕过弱防御，未限制 scheme 与目标网段，PUBLIC 声明/参数实体/编码混淆均可绕过，无有效防御；第二入口检查：除该文件内容外无其他路由或参数通道，os.Getenv 兜底值不在污点流上，结论成立", "fix_suggestion": "line 28: 删除外部 DTD 处理逻辑，改用禁用实体的严格解析（拒绝任何含 DOCTYPE/ENTITY 的文档），并对最终 cfg.URL 做 scheme 白名单与目标网段校验后再发起请求"}
+```

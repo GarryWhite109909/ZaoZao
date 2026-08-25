@@ -1,0 +1,47 @@
+LANG: python
+```python
+"""cache_codec.py — 缓存编解码模块，被上层服务调用以消费缓存同步队列消息。"""
+import json
+import logging
+
+import redis
+
+logger = logging.getLogger(__name__)
+
+# 允许反序列化的载荷类型白名单（仅纯数据结构）
+ALLOWED_TYPES = {"snapshot", "counter", "manifest"}
+
+_pool = redis.ConnectionPool(host="127.0.0.1", port=6379, db=0)
+_client = redis.Redis(connection_pool=_pool)
+
+
+def on_cache_message(payload: bytes) -> None:
+    """消息队列消费者回调：payload 为外部提交的缓存同步消息体。"""
+    try:
+        message = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        logger.warning("malformed cache message dropped")
+        return
+
+    # 白名单校验：只接受已知类型，且载荷必须是 dict
+    if not isinstance(message, dict) or message.get("type") not in ALLOWED_TYPES:
+        logger.warning("rejected cache message type")
+        return
+
+    key = "cache:%s:%s" % (message["type"], str(message.get("key", ""))[:128])
+    value = json.dumps(message.get("value"), ensure_ascii=True)
+
+    _client.set(key, value)
+```
+
+分析：
+
+1. **污点边界**：本文件没有任何 request/input/environ 等显式 web 入口；第 17 行 `on_cache_message(payload: bytes)` 是消息队列消费者回调，`payload` 即消息体，承载外部可控数据，按不可信处理，是本文件的等效污点源。
+2. **source→sink 数据流**：第 18-22 行对 `payload` 先做 UTF-8 解码 + `json.loads` 严格解析（解析失败即丢弃），保证进入后续逻辑的是结构化数据而非原始字节；第 25-27 行进行白名单校验——`message` 必须是 `dict` 且 `type` 必须命中 `ALLOWED_TYPES`（第 8 行定义的固定集合 `{"snapshot","counter","manifest"}`），不满足直接 return 拒绝。这是**白名单校验型防御**，类型正确（枚举合法值而非排除非法值，无绕过面）、位置正确（位于所有 sink 使用之前）、覆盖完整攻击面（唯一入口 payload 的全部下游使用都经过该校验）。
+3. **sink 分析**：sink 为第 33 行 `_client.set(key, value)`。`key` 由已通过白名单的 `type` 与截断到 128 字符的字符串化 `key` 字段拼接；`value` 经 `json.dumps(ensure_ascii=True)` 序列化为纯 JSON 文本。Redis 的 SET 是键值存储操作，不存在命令注入/代码执行语义；即使恶意载荷进入，也只能写入一个格式受限的缓存条目，不会触发反序列化执行（全程未使用 `pickle.loads`/`eval` 等 CWE-502 危险反序列化 API）。
+4. **CWE-502 视角**：该漏洞类型的典型触发是 `pickle.loads(payload)` 直接反序列化不可信字节导致任意对象实例化。本模块刻意选用 `json.loads`（只能产生 dict/list/str/int 等原生类型）+ 白名单类型过滤，从根上消除了对象反序列化路径，防御有效且完整。
+5. **第二入口检查**：全文仅有一个函数入口 `on_cache_message`，无其他路由、定时任务或间接调用点；模块级 `_pool`/`_client` 初始化不含任何外部输入。不存在替代通道，结论成立。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点是第17行回调参数payload即消息体; 第18-22行json.loads严格解析失败即丢弃; 第25-27行白名单校验限定type必须属于固定集合且message为dict, 属于位置正确覆盖完整的有效防御; 第33行redis set为键值存储sink, 无反序列化执行语义, 全程未使用pickle等危险API, 不构成CWE-502; 第二入口检查确认全文无其他路由或间接调用通道", "fix_suggestion": "no fix needed"}
+```

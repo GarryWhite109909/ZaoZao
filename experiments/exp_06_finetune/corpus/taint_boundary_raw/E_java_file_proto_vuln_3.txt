@@ -1,0 +1,58 @@
+LANG: java
+```java
+package com.acme.richtext.render;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * 富文本渲染模块：读取外部提交的 .md 渲染任务文件（由上游服务投递到共享目录），
+ * 将其中的图片链接占位符替换为服务端代理抓取结果。
+ * 本类被上层定时任务/消息消费者调用，文件内容来自不可信的外部提交。
+ */
+public final class MarkdownImageRenderer {
+
+    // 匹配 ![alt](url) 形式的图片语法
+    private static final Pattern IMG = Pattern.compile("!\\[([^\\]]*)\\]\\(([^)]+)\\)");
+
+    public String render(Path taskFile) throws IOException {
+        String content = new String(Files.readAllBytes(taskFile), StandardCharsets.UTF_8);
+
+        Matcher m = IMG.matcher(content);
+        StringBuilder out = new StringBuilder();
+        while (m.find()) {
+            String url = m.group(2).trim();
+            // 弱防御：仅拦截内网关键字，可被 DNS rebinding / 十进制 IP / 重定向绕过
+            if (url.contains("127.0.0.1") || url.contains("localhost") || url.contains("169.254")) {
+                continue;
+            }
+            String replacement = "<img src="/proxy/fetch?u=" + java.net.URLEncoder.encode(url, "UTF-8") + "">";
+            m.appendReplacement(out, Matcher.quoteReplacement(replacement));
+        }
+        m.appendTail(out);
+        return out.toString();
+    }
+}
+```
+
+分析：
+
+1. **污点边界**：本文件没有任何 request/input/environ 等显式 web 入口；第 17 行 `render(Path taskFile)` 接收的文件由上层服务从公开接口落盘（外部用户提交的富文本），第 20 行 `Files.readAllBytes(taskFile)` 读取的文件内容即承载外部可控数据，是等效污点源。
+
+2. **Source**：第 20 行读入的 `content` 完全来自被解析的文件，攻击者可在提交的 markdown 中写入任意 `![x](http://attacker-or-internal-host/...)`。
+
+3. **数据流**：第 22–23 行正则 `IMG` 提取 group(2) 得到 `url`（第 24 行），该值直接进入第 31 行拼接进 `<img src="/proxy/fetch?u=...">`。该 URL 随后被前端加载时触发 `/proxy/fetch` 服务端抓取——这是 SSRF 的经典间接 sink：服务端代理会向该 URL 发起请求。
+
+4. **防御分析**：第 26–28 行是黑名单式弱防御，仅字符串匹配 `127.0.0.1`、`localhost`、`169.254`。绕过方式：十进制 IP `http://2130706433/`、IPv6 `[::1]`、八进制 `0177.0.0.1`、DNS rebinding（域名先解析公网再切内网）、302 跳转到内网地址、或利用云元数据地址 `http://100.100.100.200/` 均不在黑名单内。无协议白名单、无解析后 IP 校验、无重定向限制，防御无效。
+
+5. **Sink 可达性确认**：`url` → 第 31 行拼入代理 fetch 参数 → 服务端代理对任意 host:port 发起 GET，可探测内网、读取云元数据凭据，CWE-918 成立。
+
+6. **第二入口检查**：本文件唯一入口是 `render(Path)`，唯一数据通道是被解析的任务文件；不存在其他路由、参数或间接调用改变结论。综合判定：存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 SSRF via parsed file content", "risk_level": "High", "source": "line 20: Files.readAllBytes(taskFile) 读取的外部提交富文本文件内容", "sink": "line 31: 攻击者控制的 url 拼入 /proxy/fetch 参数，触发服务端代理对外发起请求", "explanation": "主链：line 20 文件内容 -> line 22 正则提取图片链接 -> line 24 url 变量 -> line 31 拼接进代理抓取 URL -> 服务端向任意目标发请求；防御为 line 26-28 黑名单字符串匹配，可被十进制 IP、IPv6 [::1]、0177.0.0.1、DNS rebinding、302 重定向及云元数据地址绕过，属无效防御；第二入口检查：本文件仅有 render(Path) 一个入口且唯一数据通道为被解析文件，无其他路由或参数通道，不影响结论", "fix_suggestion": "line 26: 删除黑名单，改为解析 URL 后强制 https 协议白名单并解析主机 IP，拒绝私网/环回/链路本地/元数据网段，禁止跟随重定向"}
+```

@@ -1,0 +1,64 @@
+LANG: go
+```go
+// Package reportexport 报表导出模块：被上层 API 服务以用户筛选条件调用，
+// 从磁盘读取报表模板配置文件并渲染导出。
+package reportexport
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"text/template"
+)
+
+// allowedTemplates 是模板白名单：只允许预置的报表模板名，
+// 模板文件本身由运维部署，不来自外部提交内容。
+var allowedTemplates = map[string]bool{
+	"sales_summary.tmpl":   true,
+	"inventory_daily.tmpl": true,
+}
+
+// ExportReport 读取指定模板名的配置文件，用筛选数据渲染后返回导出字节流。
+func ExportReport(templateName string, filters map[string]string) ([]byte, error) {
+	// 防御点：白名单校验，拒绝任何不在白名单内的模板名
+	if !allowedTemplates[templateName] {
+		return nil, fmt.Errorf("template not allowed: %s", templateName)
+	}
+	// 二次防御：路径净化，阻断目录穿越拼接
+	clean := filepath.Base(filepath.Clean("/etc/report/templates/" + templateName))
+	if strings.Contains(clean, "..") || !strings.HasSuffix(clean, ".tmpl") {
+		return nil, fmt.Errorf("invalid template path")
+	}
+	raw, err := os.ReadFile(clean)
+	if err != nil {
+		return nil, err
+	}
+	tpl, err := template.New("report").Parse(string(raw))
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, filters); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+```
+
+1. 第 1 步污点边界：本文件没有 request/input 等显式 web 入口；外部可控数据通过两个通道进入——第 20 行参数 `templateName`（上层服务透传的用户筛选条件）与第 27 行 `os.ReadFile` 读入的模板配置文件内容。按不可信处理，二者均为等效污点源。
+
+2. 第 21-23 行是第一道防御：`allowedTemplates` 白名单为 map 精确匹配，非黑名单、非正则、非字符串替换，无法被编码绕过；只有两个预置模板名可通过，任意注入的模板表达式（如 `{{. | exec}}` 类构造）根本到不了 Parse。
+
+3. 第 24-28 行是第二道防御：`filepath.Clean + filepath.Base` 将路径规范化并截断目录部分，再校验不含 `..` 且必须以 `.tmpl` 结尾，覆盖了路径穿越攻击面，保证 ReadFile 只能命中受控目录下的白名单文件。
+
+4. 第 29 行读到的文件内容在第 33 行被 `text/template.Parse`——这是 CWE-1336 的核心 sink（模板解析即代码执行面）。但由于第 21 行白名单已限定只能加载运维部署的受信模板文件，外部数据无法控制被解析的模板文本，污点在到达 sink 前已被完全隔离。
+
+5. 第 36 行 `tpl.Execute(&buf, filters)` 中 `filters` 作为数据传入而非模板源，text/template 的 Execute 对数据值自动转义上下文外的执行语义，不构成模板注入 sink。
+
+6. 第二入口/替代通道检查：本文件仅有一个导出函数，无其他路由、全局变量初始化读取或间接调用点；`filters` 只流向 Execute 数据槽位而非 Parse。所有 source→sink 路径均被白名单+路径净化双重防御覆盖，结论：安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界：无 web 入口，外部数据经第 20 行 templateName 参数与第 29 行 ReadFile 文件内容进入；流1：templateName→第 21 行白名单精确匹配（map 等值比较，非黑名单/正则/替换，不可绕过）→仅放行两个预置模板名；流2：ReadFile 内容→第 33 行 template.Parse（CWE-1336 sink），但白名单保证仅受信部署模板可被解析，污点在 sink 前被隔离；第 25-28 行 filepath.Clean/Base 加后缀校验阻断路径穿越作为纵深防御；filters 仅流入第 36 行 Execute 数据槽位，text/template 不将数据当模板解析；第二入口检查：单函数模块，无路由/间接调用/替代通道，全部 source→sink 路径防御类型正确、位置在 sink 前、覆盖完整攻击面", "fix_suggestion": "no fix needed"}
+```

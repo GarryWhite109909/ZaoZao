@@ -1,0 +1,47 @@
+LANG: python
+```python
+"""report_export.py — 报表导出工具模块，被上层 API 服务以用户筛选条件调用。"""
+import sqlite3
+
+
+def export_orders_report(db_path, start_date, end_date, category, order_by="created_at"):
+    """导出订单报表：上层服务把用户提交的筛选条件直接传入本函数。
+
+    返回 (columns, rows) 元组。
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        # 拼接排序字段（白名单缺失），日期与分类走参数化
+        sql = (
+            "SELECT id, amount, created_at FROM orders "
+            "WHERE created_at >= ? AND created_at <= ? AND category = ? "
+            "ORDER BY " + order_by
+        )
+        cur = conn.execute(sql, (start_date, end_date, category))
+        columns = [d[0] for d in cur.description]
+        return columns, cur.fetchall()
+    finally:
+        conn.close()
+
+
+def export_summary(db_path, group_field):
+    """按字段汇总：group_by 字段同样由调用方透传用户输入。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        sql = "SELECT %s, COUNT(*) FROM orders GROUP BY %s" % (group_field, group_field)
+        cur = conn.execute(sql)
+        return cur.fetchall()
+    finally:
+        conn.close()
+```
+
+1. 第 4 行 `export_orders_report` 与第 20 行 `export_summary` 是污点边界：本文件没有任何 request/input/environ 等显式 web 入口，但作为公开库函数，参数由上层 API 服务以用户筛选条件透传，必须按不可信外部数据处理，是等效污点源。
+2. 数据流一：第 4 行 `order_by` → 第 12 行字符串拼接进 SQL 的 `ORDER BY` 子句 → 第 14 行 `conn.execute(sql, ...)` sink。日期与分类虽用 `?` 参数化，但 `order_by` 完全未防御。
+3. 数据流二：第 20 行 `group_field` → 第 24 行 `%` 格式化两处拼入 SELECT 列名与 GROUP BY 子句 → 第 25 行 `conn.execute(sql)` sink，全程无任何过滤或白名单校验。
+4. 防御检查：两条链均无黑名单/正则/替换等弱防御，也无标识符白名单；攻击者可传 `amount; DROP TABLE orders--` 或 `(SELECT ...)` 类注入载荷直达 sink，属于完全无防御的 CWE-89 注入点。
+5. 第二入口检查：文件内仅这两个公开函数，无路由注册、无队列消费、无其他间接通道；但两个函数各自构成独立入口，且 `export_orders_report` 中参数化部分不能保护拼接部分，故确认存在漏洞。
+6. 结论：source 为第 4/20 行函数参数，sink 为第 14/25 行 execute，可达性完整，判定存在 CWE-89 SQL 注入。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "Critical", "source": "line 4: order_by 参数; line 20: group_field 参数", "sink": "line 14: conn.execute(sql); line 25: conn.execute(sql)", "explanation": "流一: line 4 order_by 经 line 12 拼接进 ORDER BY 后于 line 14 执行, 无任何校验; 流二: line 20 group_field 经 line 24 格式化拼入 SELECT/GROUP BY 后于 line 25 执行, 无任何校验; 文件无显式 web 入口, 函数参数即等效污点源; 两处均未使用标识符白名单, 参数化的 ? 占位符不覆盖拼接片段, 攻击者可注入任意 SQL 片段; 第二入口检查: 仅这两个公开函数为入口, 各自独立构成注入通道", "fix_suggestion": "line 12/24: 对列名使用硬编码白名单映射(如 ALLOWED_COLUMNS dict)后再拼接, 非法值抛出 ValueError"}
+```

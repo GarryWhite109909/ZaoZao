@@ -1,0 +1,52 @@
+LANG: javascript
+```javascript
+// crm-import-adapter.js
+// 数据导入适配器：被上层同步服务调用，将外部 CRM 系统推送的记录写入报表模板。
+const fs = require('fs');
+const path = require('path');
+
+const ALLOWED_TEMPLATES = ['summary', 'detail', 'monthly'];
+
+/**
+ * 导入一批外部记录并按模板渲染报表文件。
+ * @param {Array<Object>} records - 上层服务从外部 CRM 拉取的原始记录
+ * @param {string} templateName - 外部系统指定的模板名
+ */
+function importRecords(records, templateName) {
+  // 弱防御：黑名单校验，仅拦截已知危险字符
+  if (/[<>|]/.test(templateName)) {
+    throw new Error('illegal character in template name');
+  }
+  const safe = templateName.replace(/\.\./g, ''); // 可绕过：'....//' -> '..//' -> '../'
+  const tplPath = path.join(__dirname, 'templates', `${safe}.html`);
+
+  let body = '';
+  for (const rec of records) {
+    // 记录字段直接拼入 HTML，未做任何转义
+    body += `<tr><td>${rec.name}</td><td>${rec.email}</td></tr>`;
+  }
+
+  const html = fs.readFileSync(tplPath, 'utf8').replace('<!--ROWS-->', body);
+  const outPath = path.join('/var/reports', `${safe}-${Date.now()}.html`);
+  fs.writeFileSync(outPath, html);
+  return outPath;
+}
+
+module.exports = { importRecords };
+```
+
+分析：
+
+1. 第 12 行 `importRecords(records, templateName)` 是污点边界：本文件没有任何 request/input 等显式 web 入口，但该函数是公开导出的接口，参数由上层服务传入、承载外部 CRM 系统可控数据，必须按不可信处理，是等效污点源。
+
+2. 流 A（路径穿越）：第 16 行黑名单正则 `/[<>|]/` 只拦三个字符，不覆盖 `..` 与 `/`；第 17 行 `replace(/\.\./g, '')` 是可绕过的字符串替换——输入 `....//` 删除中间 `..` 后重组为 `../`。污染值流入第 18 行 `path.join(...)` 构造模板路径，最终到达第 26 行 `fs.readFileSync(tplPath)`，攻击者可读取任意文件内容并被拼进输出报表。
+
+3. 流 B（HTML 注入/CWE-1336 特征）：records 中每个对象的 `name`/`email` 字段在第 22-23 行未经任何转义直接拼入 HTML 字符串，随后经第 25 行 `replace('<!--ROWS-->', body)` 注入模板，写入第 27 行 `fs.writeFileSync` 生成的报表文件。下游用户在浏览器打开报表即触发存储型 XSS，且 `String.prototype.replace` 的替换串中 `$&` 等模式还会被特殊解释，进一步放大注入面。
+
+4. 防御覆盖面核查：全部防御仅有第 16 行黑名单与第 17 行替换，均针对流 A 且可绕过；流 B 完全无防御。无编码/白名单目录校验/HTML 转义等有效措施。
+
+5. 第二入口检查：文件内无路由注册、无 HTTP 处理器、无环境变量或标准输入读取；唯一替代通道是 `module.exports` 暴露的同一函数的不同调用方，均汇入相同 sink，不改变结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Template Injection / 路径穿越与存储型 XSS", "risk_level": "High", "source": "line 12: 函数参数 records 与 templateName（上层服务传入的外部可控数据）", "sink": "line 26: fs.readFileSync(tplPath)；line 27: fs.writeFileSync(outPath)", "explanation": "流A：templateName 经 line 17 的 replace(/\.\./g,'') 弱过滤可被 '....//' 绕过重组为 '../'，流入 line 18 path.join 构造路径，至 line 26 fs.readFileSync 造成任意文件读取；流B：records 的 name/email 字段在 line 22-23 未转义拼入 HTML，经 line 25 replace 注入模板后由 line 27 writeFileSync 落盘为报表，形成存储型 XSS，且 replace 替换串中 $& 等模式被特殊解释放大注入；防御仅为 line 16 黑名单与 line 17 字符串替换，均可绕过，无有效防御；第二入口检查：文件无路由/web处理器/stdin/environ，仅 module.exports 暴露同一函数供不同调用方使用，所有通道汇入相同 sink", "fix_suggestion": "line 18: 对 templateName 使用严格白名单校验（如 ALLOWED_TEMPLATES.includes(templateName)）拒绝非法值，并在 line 22-23 对 rec.name/rec.email 做 HTML 实体转义后再拼接"}
+```

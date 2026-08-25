@@ -1,0 +1,60 @@
+LANG: php
+```php
+<?php
+declare(strict_types=1);
+
+namespace App\Consumer;
+
+use App\Service\HttpCallbackClient;
+
+/**
+ * 消息消费者业务处理器：消费队列中的业务消息。
+ * 消息体为 JSON 协议报文，由上层服务投递，本模块仅负责解析与处理。
+ */
+final class WebhookNotifyConsumer
+{
+    private const ALLOWED_EVENTS = ['order.paid', 'order.refunded', 'user.registered'];
+
+    public function __construct(private HttpCallbackClient $client) {}
+
+    /** @param string $payload 队列消息原始字节（协议报文，外部可控） */
+    public function handle(string $payload): void
+    {
+        $msg = json_decode($payload, true, 512, JSON_THROW_ON_ERROR);
+        $event = (string)($msg['event'] ?? '');
+        if (!in_array($event, self::ALLOWED_EVENTS, true)) {
+            return; // 白名单校验事件类型
+        }
+        $url = filter_var((string)($msg['callback_url'] ?? ''), FILTER_VALIDATE_URL);
+        if ($url === false) {
+            return;
+        }
+        $host = parse_url($url, PHP_URL_HOST);
+        $ip = gethostbyname((string)$host);
+        // SSRF 防御：仅允许公网地址，拒绝内网/环回/链路本地等保留段
+        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+            return;
+        }
+        $this->client->post($url, ['event' => $event, 'data' => $msg['data'] ?? []]);
+    }
+}
+```
+
+分析：
+
+1. **污点边界**：本文件没有任何 request/input/environ 等显式 web 入口；第 17 行 `handle(string $payload)` 接收的队列协议报文是被解析的外部数据（由上层服务从消息中间件投递），等效于外部可控污点源，必须按不可信处理。
+
+2. **输入点枚举**：唯一外部输入点是第 17 行的 `$payload`。第 18 行 `json_decode` 解析后产生 `$msg['event']`、`$msg['callback_url']`、`$msg['data']` 三个派生污点值。
+
+3. **source→sink 数据流**：sink 为第 33 行 `$this->client->post($url, ...)` 发起的出站 HTTP 回调（CWE-918 关注点）。`$url` 来自攻击者完全可控的 `callback_url` 字段，若无防御可指向 `http://169.254.169.254/`、`http://127.0.0.1:6379/` 等内网/元数据端点构成 SSRF。
+
+4. **防御验证**：
+   - 第 20-22 行：事件名白名单（`in_array ... strict`）——白名单校验，类型正确；
+   - 第 23-26 行：`FILTER_VALIDATE_URL` 保证 URL 结构合法；
+   - 第 27-31 行：DNS 解析后用 `FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE` 校验目标 IP，拒绝私网、环回、链路本地及保留地址——这是针对 SSRF 的位置正确的核心防御（在解析后、请求前对最终连接目标校验），且先解析域名再校验 IP，覆盖了 DNS rebinding 到内网 IP 的主要攻击面；非 IP 结果（解析失败返回原主机名字符串）无法通过 IP 校验而被拒绝。三重防御串联，覆盖完整攻击面，非黑名单/正则替换类可绕过方案。
+
+5. **第二入口检查**：本文件无其他公开方法、无路由/CLI/环境变量通道；`handle()` 是唯一入口且已完整防御；`HttpCallbackClient::post` 内部若使用 cURL 也只接收已校验 URL。结论：不存在未防护的替代通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入为第17行队列协议报文payload，经json_decode派生出event/callback_url/data三个污点值；主数据流 callback_url -> 第33行 client->post 出站HTTP回调存在有效SSRF防御：第20-22行事件白名单、第23-26行 FILTER_VALIDATE_URL 结构校验、第27-31行 DNS 解析后以 NO_PRIV_RANGE|NO_RES_RANGE 校验最终IP，拒绝内网/环回/元数据端点，防御类型正确（白名单+原生安全API）、位置正确（请求前对最终连接目标校验）、覆盖完整攻击面（含解析后IP校验阻断rebinding到内网）；全文件无路由/参数/间接调用等第二入口或替代通道", "fix_suggestion": "no fix needed"}
+```

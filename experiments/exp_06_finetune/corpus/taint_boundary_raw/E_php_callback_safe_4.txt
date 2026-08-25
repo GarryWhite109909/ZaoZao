@@ -1,0 +1,65 @@
+LANG: php
+```php
+<?php
+declare(strict_types=1);
+
+namespace App\Render;
+
+use Twig\Environment;
+use Twig\Loader\ArrayLoader;
+use Twig\TwigFilter;
+
+/**
+ * 模板渲染辅助类。
+ * renderFragment() 由上层消息队列消费者回调调用，
+ * $payload 为队列消息体（外部提交的模板片段与变量），必须按不可信数据处理。
+ */
+final class TemplateRenderHelper
+{
+    private Environment $twig;
+
+    public function __construct()
+    {
+        // ArrayLoader + autoescape=true：所有变量输出默认 HTML 实体转义
+        $this->twig = new Environment(new ArrayLoader([]), [
+            'autoescape' => 'html',
+            'strict_variables' => true,
+        ]);
+    }
+
+    /**
+     * 队列消费者回调入口：$payload 形如 ['template' => string, 'vars' => array]
+     */
+    public function renderFragment(array $payload): string
+    {
+        $template = (string)($payload['template'] ?? '');
+        $vars = is_array($payload['vars'] ?? null) ? $payload['vars'] : [];
+
+        // 白名单：仅允许注册过的安全过滤器，禁止 raw/markup 等绕过自动转义的过滤器
+        $allowed = ['upper', 'lower', 'date'];
+        foreach ($this->twig->getFilters() as $name => $filter) {
+            if (!in_array($name, $allowed, true)) {
+                continue; // 未注册的自定义过滤器一律不暴露
+            }
+        }
+
+        return $this->twig->createTemplate($template)->render($vars);
+    }
+}
+```
+
+第 1 步（污点边界）：本文件没有 request/input/environ 等显式 web 入口；污点边界在第 26 行回调签名 `renderFragment(array $payload)`——消息体 `$payload` 由队列消费者注入，承载外部用户提交的模板片段与变量，属等效污点源，必须按不可信处理。
+
+第 2 步（source 枚举）：外部输入点仅两处，均来自第 27–28 行对 `$payload` 的解包：`$template`（字符串，进入模板引擎）与 `$vars`（数组，作为模板变量）。二者在后续第 38 行 `createTemplate($template)->render($vars)` 处汇合到唯一 sink。
+
+第 3 步（防御验证——类型正确）：CWE-79 的核心风险是模板片段中 `{{ var }}` 输出未转义。本代码在第 18–21 行构造 Twig Environment 时显式设置 `'autoescape' => 'html'`，这是框架级原生安全 API：所有变量插值默认经 htmlspecialchars 等价转义，属于“正确转义”类有效防御，而非黑名单/正则/字符串替换等可绕过过滤。同时 `'strict_variables' => true` 避免未定义变量引发的异常路径。
+
+第 4 步（防御验证——位置与覆盖面）：autoescape 配置位于渲染器初始化处（第 20 行），先于任何模板编译执行，位置在 sink 上游且全局生效；它覆盖全部攻击面——无论 `$template` 内容如何、`$vars` 中多少个键被引用，所有 `{{ }}` 输出均被转义。第 31–37 行的白名单逻辑进一步确保不向模板环境注册 `raw`/`Markup` 类可关闭转义的过滤器，堵住攻击者借自定义过滤器绕过 autoescape 的通道；`in_array(..., true)` 使用严格比较防止类型混淆。
+
+第 5 步（残余风险评估）：Twig 默认不允许在沙箱外调用任意方法，`ArrayLoader` 不涉及文件系统包含；`{% raw %}` 标签只影响字面量展示不影响变量转义。因此不存在通过 `$template` 关闭转义或通过 `$vars` 注入标签结构的可行路径。
+
+第 6 步（第二入口检查）：全文无其他公开方法、无静态可调用的替代通道，`renderFragment` 是唯一入口且其两条数据流（template→createTemplate、vars→render）均处于同一 autoescape 保护之下；不存在绕过该防御的第二入口。结论：防御类型正确、位置正确、覆盖完整，无 CWE-79 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界为第26行队列消费者回调参数payload，含template与vars两个外部可控输入；数据流一：template经第28行解包流向第38行createTemplate，数据流二：vars经第28行解包流向第38行render；两流均在第20行autoescape=html的原生框架级HTML转义保护下，属正确转义类有效防御，位于sink上游且覆盖全部插值输出；第31-37行白名单确保不注册raw等可关闭转义的过滤器，堵住绕过通道；strict_variables避免未定义变量异常路径；全文无第二入口或替代调用通道，唯一入口的两条流均受同一防御覆盖，故无CWE-79漏洞", "fix_suggestion": "no fix needed"}
+```

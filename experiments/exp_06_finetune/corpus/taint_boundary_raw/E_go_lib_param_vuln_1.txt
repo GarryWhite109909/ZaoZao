@@ -1,0 +1,46 @@
+LANG: go
+```go
+// Package render 提供模板片段渲染辅助函数，被上层服务调用，
+// 上层将外部提交的模板内容与变量传入本模块。
+package render
+
+import (
+	"html/template"
+	"strings"
+)
+
+// RenderFragment 渲染调用方提供的模板片段并注入变量。
+// fragment 与 vars 均来自外部提交，必须按不可信数据处理。
+func RenderFragment(fragment string, vars map[string]string) (string, error) {
+	// 弱防御：仅过滤 <script> 标签，可被大小写/编码绕过
+	fragment = strings.ReplaceAll(fragment, "<script>", "")
+	fragment = strings.ReplaceAll(fragment, "<SCRIPT>", "")
+
+	tmpl, err := template.New("frag").Parse(fragment)
+	if err != nil {
+		return "", err
+	}
+
+	var sb strings.Builder
+	if err := tmpl.Execute(&sb, vars); err != nil {
+		return "", err
+	}
+	return sb.String(), nil
+}
+
+// RenderEmailBody 渲染邮件正文模板，body 由上层从消息队列取出后传入。
+func RenderEmailBody(body string) (string, error) {
+	return RenderFragment(body, nil)
+}
+```
+
+1. 污点边界：本文件无 request/environ 等显式 web 入口；第 13 行 `RenderFragment` 的参数 `fragment`、`vars` 以及第 30 行 `RenderEmailBody` 的参数 `body` 是公开接口参数，承载上层服务传入的外部提交数据（模板片段/队列消息），按不可信处理，为等效污点源。
+2. 第 16-17 行仅做 `<script>` 字符串替换的黑名单弱防御：可用 `<ScRiPt>`、`<script >`、`<img src=x onerror=...>`、`javascript:` 等 payload 轻松绕过，不构成有效防御。
+3. 数据流一：第 13 行 `fragment` → 第 19 行 `template.New("frag").Parse(fragment)`。fragment 作为模板文本被解析，攻击者可注入 `{{...}}` 动作或直接注入 HTML 片段；若上层以非 html/template 输出结果或 fragment 含未转义上下文，形成存储型 XSS。
+4. 数据流二：第 13 行 `vars` → 第 24 行 `tmpl.Execute(&sb, vars)`。若 fragment 中存在 `{{.key}}` 且该位置处于 HTML 属性/JS 上下文（如 `href="{{.url}}"`），html/template 会做上下文转义，但若 fragment 本身由攻击者控制（数据流一），其可构造绕过转义上下文的模板动作，两流叠加导致 CWE-79。
+5. 第二入口检查：文件内无路由注册、HTTP 处理器或其他 I/O 读取；替代通道仅有第 30 行 `RenderEmailBody` 将 `body` 参数转发至同一 sink，属同一污点链的第二入口，进一步确认可达性。
+6. 结论：存在漏洞，source 为公开函数参数，sink 为 Parse/Execute 渲染输出。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 XSS（模板注入/跨站脚本）", "risk_level": "High", "source": "line 13: RenderFragment 参数 fragment/vars 及 line 30: RenderEmailBody 参数 body", "sink": "line 19: template.Parse(fragment) 与 line 24: tmpl.Execute(&sb, vars)", "explanation": "流一: line 13 fragment 经 line 16-17 仅删除 script 标签的字符串替换弱防御（大小写/属性型标签如 img onerror 可绕过）-> line 19 Parse 注入模板动作与 HTML; 流二: line 13 vars -> line 24 Execute, 攻击者控制的 fragment 可构造绕过上下文转义的模板; 替代通道: line 30 body 转发至同一 sink, 文件内无其他入口", "fix_suggestion": "line 16: 移除字符串黑名单, 对 fragment 使用白名单校验或改用 text/template 并在输出端强制 html/template 转义, 禁止渲染外部提供的原始模板文本"}
+```

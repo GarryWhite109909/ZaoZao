@@ -1,0 +1,45 @@
+LANG: python
+```python
+# cache_codec.py — 缓存编解码模块
+# 由上层缓存同步服务消费 Redis Pub/Sub 消息时注册为回调（被上层服务调用）
+import json
+import redis
+
+_pool = redis.ConnectionPool(host="127.0.0.1", port=6379, db=0)
+_r = redis.Redis(connection_pool=_pool)
+
+# 弱防御：仅拦截常见注释与分号，可被内联注释/编码绕过
+_BLACKLIST = ("--", ";", "/*", "*/")
+
+def _sanitize(value: str) -> str:
+    for token in _BLACKLIST:
+        value = value.replace(token, "")
+    return value
+
+def on_cache_message(message):
+    # message['data'] 为外部发布方提交的原始字节载荷（不可信）
+    payload = json.loads(message["data"].decode("utf-8"))
+    key = payload.get("cache_key", "")
+    table_hint = payload.get("table_hint", "")
+
+    cleaned = _sanitize(table_hint)
+    sql = (
+        "SELECT v FROM cache_entries WHERE k = '%s' "
+        "AND tbl = '%s'" % (key, cleaned)
+    )
+    row = _r.execute_command("EVAL", "return redis.call('GET', KEYS[1])", 1, key)
+    cursor = _r.execute_command("SQLX", sql)  # 伪分布式 SQL 网关命令
+    return cursor, row
+```
+
+分析：
+
+1. **污点边界**：本文件没有任何 request/input/environ/argv 等显式 web 入口；第 15 行 `def on_cache_message(message)` 是消息队列消费者回调，`message["data"]` 由外部发布方提交，属于消息体承载的外部可控数据，必须按不可信处理，是等效污点源。
+2. **输入点枚举**：唯一外部输入点是第 16 行 `json.loads(message["data"])` 解析出的 `payload`；其中 `cache_key`（第 18 行）与 `table_hint`（第 19 行）均直接来自消息体。两条流均可达 sink：第 25-27 行的字符串拼接 SQL 与第 29 行 `execute_command("SQLX", sql)`。
+3. **数据流验证**：主链为 第 19 行 `table_hint` → 第 22 行 `_sanitize` → 第 26 行拼接进 SQL → 第 29 行执行。`_sanitize` 仅做黑名单字符串替换（删除 `--`、`;`、`/*`、`*/`），攻击者可用 `' OR '1'='1' --` 变体如使用 URL 编码 `%2D%2D` 或利用单引号闭合后注入布尔条件（无需注释符）绕过，例如 `x' OR 'a'='a` 即可篡改查询语义——弱防御无效。
+4. **第二数据流**：第 18 行 `key` 未经过任何过滤，直接在第 25-26 行拼入 SQL 的第一个占位位置，且同时传入第 28 行 `execute_command(..., key)` 作为 Redis 键参数，构成第二条未防御的注入路径。
+5. **第二入口/替代通道检查**：本文件无其他函数签名或路由；但 `_r.execute_command` 的通用命令透传（第 28-29 行）本身构成替代危险通道，任何能向该 Pub/Sub 频道发布的进程都可触发同一 sink；结论维持存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL 注入（消息队列回调载荷拼接 SQL）", "risk_level": "High", "source": "line 16: json.loads(message['data']) 解析的外部消息体字段 cache_key/table_hint", "sink": "line 29: execute_command('SQLX', sql) 执行拼接 SQL", "explanation": "流1: line 19 table_hint 经 line 22 黑名单替换（仅删 -- ; /* */，可用编码或无注释符的引号闭合绕过）后于 line 26 拼入 SQL 并在 line 29 执行; 流2: line 18 cache_key 完全未过滤，line 26 直接拼接且 line 28 作为命令参数透传; 全文件无其他显式入口，但 execute_command 透传与 Pub/Sub 发布权限构成替代触发通道，故确认漏洞成立", "fix_suggestion": "line 25: 改用参数化查询/预编译语句绑定 cache_key 与 table_hint，禁止字符串拼接，并对 execute_command 使用白名单命令封装"}
+```

@@ -1,0 +1,51 @@
+LANG: go
+```go
+// Package hookmgr 提供插件系统的钩子注册与执行能力。
+// 宿主服务在收到外部提交的插件配置后，通过本包的公开函数加载并执行钩子。
+package hookmgr
+
+import (
+	"fmt"
+	"os/exec"
+)
+
+// AllowedPlugins 是经过安全评审的插件白名单，仅允许执行这些已签名的钩子程序。
+var AllowedPlugins = map[string]bool{
+	"backup":    true,
+	"notify":    true,
+	"compress":  true,
+	"reportgen": true,
+}
+
+// RunHook 由宿主上层调用：hookName 与 payload 来自外部提交的插件配置，
+// 必须按不可信数据处理。payload 作为参数数组传递给钩子进程，不做 shell 拼接。
+func RunHook(hookName string, payload []string) error {
+	// 白名单校验：拒绝任何不在评审清单内的钩子名，阻断任意命令注入面。
+	if !AllowedPlugins[hookName] {
+		return fmt.Errorf("hook %q not allowed", hookName)
+	}
+
+	// exec.Command 使用原生 API，不经过 shell 解释；
+	// payload 以独立参数元素传入，即使包含分号、反引号、$() 等元字符也只会被当作字面量。
+	cmd := exec.Command(hookName, payload...)
+	cmd.Dir = "/var/lib/hooks"
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("hook failed: %v: %s", err, out)
+	}
+	return nil
+}
+```
+
+1. 第 1 行至第 22 行构成污点边界：本文件没有任何 request、environ、os.Args 等显式 web 入口，但第 21 行公开函数 `RunHook(hookName string, payload []string)` 的两个参数承载宿主从外部提交的插件配置，属于等效污点源，必须按不可信处理。
+
+2. 第 21 行的 `hookName` 是 source 之一，流向第 30 行 `exec.Command(hookName, ...)` 这一命令执行 sink；可达性成立——若不校验，攻击者可传入 `sh` 或任意二进制路径。
+
+3. 防御验证（hookName 流）：第 26-28 行使用白名单校验 `AllowedPlugins[hookName]`，类型正确（精确集合匹配而非黑名单/正则/字符串替换），位置正确（位于 sink 之前的唯一数据流必经点），覆盖完整——所有到达 `exec.Command` 第一参数的取值都必须命中白名单键，未命中即提前返回错误，无绕过路径。
+
+4. 防御验证（payload 流）：第 21 行的 `payload []string` 流向第 30 行 `exec.Command(hookName, payload...)`；Go 的 `exec.Command` 原生 API 不经 shell 解释，参数以 argv 数组逐元素传递，shell 元字符（`;`、`` ` ``、`$()`）均被当作字面量，属于原生安全 API 类防御，位置在 sink 本身，覆盖全部参数元素的攻击面。
+
+5. 第二入口/替代通道检查：文件内仅有一个导出函数 `RunHook`，无其他路由、全局变量写入点或间接调用可绕过第 26 行白名单直接触达 sink；`AllowedPlugins` 为只读映射且内容为固定字面量，不可被外部污染。结论：source→sink 全部数据流均有有效防御，不存在 CWE-502 反序列化或命令注入风险。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界为第21行RunHook的两个参数hookName与payload，承载宿主传入的外部插件配置；流1：hookName流向第30行exec.Command第一参数，防御为第26行白名单精确集合校验，类型正确（非黑名单/正则）、位置在sink前唯一必经点、覆盖全部取值，未命中即返回错误；流2：payload流向第30行exec.Command变长参数，Go原生exec.Command不经shell解释，argv逐元素传递使shell元字符失效，属原生安全API防御，覆盖完整；第二入口检查：文件仅有此一个导出函数，无其他通道可绕过白名单触达sink，AllowedPlugins为固定只读字面量不可污染，故无CWE-502漏洞", "fix_suggestion": "no fix needed"}
+```

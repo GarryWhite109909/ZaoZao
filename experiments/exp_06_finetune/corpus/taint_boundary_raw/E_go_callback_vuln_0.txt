@@ -1,0 +1,75 @@
+LANG: go
+```go
+// Package archiver 处理归档任务队列消息，由 worker 服务消费。
+package archiver
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+)
+
+// ArchiveEvent 是消息队列载荷，由外部提交方写入（如用户上传归档后触发）。
+type ArchiveEvent struct {
+	ArchiveName string `json:"archive_name"`
+	CallbackURL string `json:"callback_url"`
+}
+
+// HandleArchiveEvent 是队列消费者回调：broker 每收到一条消息即调用本函数，
+// event 字段完全来自外部提交内容，必须视为不可信数据。
+func HandleArchiveEvent(event ArchiveEvent) error {
+	// 弱防御：仅黑名单拒绝内网常见地址前缀
+	blocked := []string{"127.0.0.1", "localhost", "169.254", "10.", "192.168."}
+	for _, b := range blocked {
+		if contains(event.CallbackURL, b) {
+			return fmt.Errorf("blocked callback host")
+		}
+	}
+
+	// 归档名仅用于日志/存储路径，回调地址直接发起通知请求
+	target, err := url.Parse(event.CallbackURL)
+	if err != nil {
+		return err
+	}
+	q := target.Query()
+	q.Set("archive", event.ArchiveName)
+	target.RawQuery = q.Encode()
+
+	// sink：使用外部可控 URL 发起服务端请求 —— SSRF
+	resp, err := http.Get(target.String())
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && (func() bool {
+		for i := 0; i+len(sub) <= len(s); i++ {
+			if s[i:i+len(sub)] == sub {
+				return true
+			}
+		}
+		return false
+	})()
+}
+```
+
+分析：
+
+1. **污点边界**：本文件没有任何 HTTP handler、request、os.Args 等显式入口；唯一外部通道是第 17 行的队列消费者回调参数 `event ArchiveEvent`。该消息体由外部提交方写入 broker，`CallbackURL` 与 `ArchiveName` 均为外部可控数据，按不可信处理，构成等效污点源。
+
+2. **source 确认**：第 13 行结构体字段 `CallbackURL` / 第 14 行 `ArchiveName` 经 JSON 反序列化填充，第 18 行函数签名处进入处理逻辑，污点自此传播。
+
+3. **防御评估**：第 21–26 行的黑名单仅做子串匹配，可轻易绕过——攻击者可使用 `0x7f000001`、`2130706433`（十进制 IP）、DNS rebinding 域名、`http://[::1]`、或重定向到内网；且未校验 scheme（可用 `file://` 之外的任意 http 变体）、未解析后再判断主机。属于可绕过弱防御，非有效防护。
+
+4. **source→sink 数据流**：`event.CallbackURL` → 第 29 行 `url.Parse` → 第 30–32 行拼接查询参数（`ArchiveName` 也随之注入）→ 第 36 行 `http.Get(target.String())` 危险 sink，服务端向攻击者指定地址发起 GET，可达云元数据端点（如 169.254.169.254 的变体写法）等内网资源。
+
+5. **第二入口检查**：本模块无其他导出函数接收外部数据，`contains` 为内部工具；替代通道仅为同一消息体的另一字段 `ArchiveName`，它同样流入 sink 的查询串（参数注入），进一步佐证漏洞成立。
+
+6. **结论**：存在 CWE-918 SSRF，风险 High（可探测内网、读取云凭证元数据）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF)", "risk_level": "High", "source": "line 18: 队列消费者回调参数 event.ArchiveEvent 的 CallbackURL 与 ArchiveName 字段（外部提交的消息载荷）", "sink": "line 36: http.Get(target.String())", "explanation": "污点边界：本文件无 request/os.Args 等显式入口，回调参数 event 即等效污点源；主链 event.CallbackURL -> line 29 url.Parse -> line 30-32 拼接查询 -> line 36 http.Get 发起服务端请求；防御仅有 line 21-26 子串黑名单，可通过十六进制/十进制 IP、IPv6 [::1]、DNS rebinding、重定向等方式绕过，且未限制 scheme 与解析后主机；次要流 event.ArchiveName 经 line 31 注入回调 URL 查询参数造成参数注入；第二入口检查：模块无其他导出入口，仅同一消息体另一字段为替代通道，结论不变", "fix_suggestion": "line 29: 解析后校验 scheme 仅允许 https 且对主机做 DNS 解析并验证结果 IP 不属于私有/链路本地/回环网段，禁止跟随重定向"}
+```

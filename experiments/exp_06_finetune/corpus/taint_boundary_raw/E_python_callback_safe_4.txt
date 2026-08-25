@@ -1,0 +1,56 @@
+LANG: python
+```python
+"""cache_codec.py — 缓存编解码模块，被上层服务调用以消费缓存同步队列消息。"""
+import json
+import sqlite3
+import logging
+
+logger = logging.getLogger(__name__)
+
+# 允许被解码的缓存命名空间白名单
+_ALLOWED_NAMESPACES = {"session", "profile", "cart"}
+
+_conn = sqlite3.connect("cache_meta.db", check_same_thread=False)
+
+
+def on_cache_message(message: dict) -> None:
+    """消息队列消费者回调：message 为外部提交的载荷，必须按不可信数据处理。"""
+    namespace = message.get("namespace")
+    key = message.get("key")
+
+    # 防御 1：白名单校验命名空间（类型正确、位置在 sink 前、覆盖全部插值点）
+    if not isinstance(namespace, str) or namespace not in _ALLOWED_NAMESPACES:
+        logger.warning("rejected unknown cache namespace: %r", namespace)
+        return
+
+    # 防御 2：键名严格字符集校验，杜绝引号/分号等 SQL 元字符
+    if not isinstance(key, str) or not key.isascii() or not all(
+        c.isalnum() or c in "-_." for c in key
+    ):
+        logger.warning("rejected malformed cache key: %r", key)
+        return
+
+    # 防御 3：参数化查询，值不参与 SQL 文本拼接
+    row = _conn.execute(
+        "SELECT encoded_value FROM cache_entries WHERE ns = ? AND cache_key = ?",
+        (namespace, key),
+    ).fetchone()
+
+    if row is None:
+        logger.info("cache miss for %s/%s", namespace, key)
+        return
+
+    payload = json.loads(row[0])
+    logger.debug("decoded cache entry for %s/%s", namespace, key)
+```
+
+1. 第 9 行 `on_cache_message(message)` 是本文件唯一入口：没有 request/input/environ 等显式 web 入口，但回调参数 `message` 承载外部提交的消息体载荷，属等效污点源，必须按不可信处理。第 10-11 行从中取出 `namespace` 与 `key`，二者是仅有的外部输入点。
+2. 数据流一：`namespace` → 第 15-17 行白名单校验 → 第 30 行参数化查询第一个占位符。防御为集合白名单（非黑名单/正则/字符串替换），位置在 sink 之前，且第 30 行 SQL 中该值的唯一出现点是 `?` 占位符，攻击面完全覆盖。
+3. 数据流二：`key` → 第 19-23 行字符集校验（仅字母数字与 `-_.`）→ 第 31 行第二个占位符。该校验为正向白名单式字符过滤，SQL 元字符（引号、分号、注释符）均无法通过；同时第 29-31 行使用 sqlite3 参数化查询，即使校验失效，值也不会进入 SQL 文本，构成双重防御。
+4. 防御类型正确性：sqlite3 的 `execute(sql, params)` 将参数作为绑定值传递，驱动层保证不做 SQL 词法解析，属于原生安全 API；两条数据流的全部 sink 插值点（第 30-31 行）均被绑定参数覆盖，无任何 f-string/`%`/`+` 拼接残留。
+5. 第二入口检查：本文件无其他函数签名接收外部数据，模块级 `_conn` 为内部状态，`json.loads(row[0])`（第 38 行）的数据来自数据库而非回调参数，不构成替代污点通道；不存在其他路由或间接调用路径。
+6. 结论：所有 source→sink 路径均有白名单 + 参数化双重有效防御，无可达注入。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入为第9行回调参数message中的namespace与key; 流一namespace经第15-17行集合白名单校验后进入第30行参数化查询占位符; 流二key经第19-23行正向字符集校验后进入第31行占位符; 两处sink均为sqlite3绑定参数, 值不参与SQL文本拼接, 白名单+参数化双重防御类型正确且覆盖全部插值点; 无第二入口或替代通道, json.loads数据源自数据库非回调参数", "fix_suggestion": "no fix needed"}
+```

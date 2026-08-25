@@ -1,0 +1,37 @@
+LANG: python
+```python
+# data_import/adapter.py
+# 数据导入适配器：被上层导入服务调用，处理外部系统投递的记录文件。
+import os
+import json
+
+BASE_DIR = "/srv/import/inbox"
+
+def _sanitize(name):
+    # 弱防御：仅黑名单过滤路径分隔符与 ..（可被 URL 编码/绝对路径绕过）
+    return name.replace("..", "").replace("/", "").replace("\", "")
+
+def import_records(filename):
+    """解析外部系统推送的记录文件并归档。"""
+    clean = _sanitize(filename)
+    src = os.path.join(BASE_DIR, clean)          # 第 12 行：污点进入路径拼接
+    with open(src, "r", encoding="utf-8") as f:  # 第 13 行：读取外部文件
+        payload = json.load(f)
+    archive = payload.get("archive_path")        # 第 15 行：污点源——文件内容字段
+    target = _sanitize(archive)                  # 第 16 行：弱黑名单过滤
+    dest = "/var/archive/" + target              # 第 17 行：污点进入目标路径
+    with open(src, "rb") as fin, open(dest, "wb") as fout:  # 第 18-19 行：sink
+        fout.write(fin.read())
+    os.remove(src)
+    return {"imported": len(payload.get("records", [])), "archived": dest}
+```
+
+1. 污点边界：本文件无 request/input/environ 等显式 web 入口；第 13 行 `open(src)` 读取的记录文件由外部系统投递，其 JSON 内容（尤其 `archive_path` 字段，第 15 行）承载外部可控数据，按不可信处理，是等效污点源。
+2. 数据流一（主链）：第 15 行 `payload.get("archive_path")` → 第 16 行 `_sanitize` 弱过滤 → 第 17 行字符串拼接 `/var/archive/` + target → 第 19 行 `open(dest, "wb")` 写入 sink。`_sanitize` 仅做字符串替换删除 `..` 与斜杠，可被嵌套绕过：`....//` 删除一层后还原为 `../`，或直接传绝对路径如 `etc/cron.d/pwn`（无前导斜杠也命中拼接），实现任意目录写入（CWE-22）。
+3. 数据流二：第 10 行 `filename` 参数同样经 `_sanitize` 后在第 12 行参与 `os.path.join` 并于第 13 行被 `open` 读取。由于 `os.path.join` 遇到含盘符或以 `/` 开头的成分会丢弃前缀，且 `_sanitize` 的替换可被 `..%2F` 类二次解码内容（若上层未解码则原样保留、若解码则绕过）穿透，攻击者可通过文件名穿越读取任意文件内容并经数据流一回写外泄。
+4. 防御评估：全文唯一的“防御”是第 9-10 行的黑名单字符串替换，属于典型可绕过弱防御（嵌套序列 `....//`、编码变体、绝对路径），无白名单校验、无 `realpath` 归一化比对、无目录边界检查，故两条链均无有效防御。
+5. 第二入口检查：本模块仅暴露 `import_records` 一个函数，无其他路由/参数/间接调用通道；但该函数被上层服务消费队列消息调用，队列消息即文件名来源，构成同一污点的替代触发通道，不影响结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径遍历（任意文件写入/读取）", "risk_level": "Critical", "source": "line 15: payload.get('archive_path') 外部记录文件内容字段（辅链 line 10 filename 参数）", "sink": "line 19: open(dest, 'wb') 任意路径写入（辅链 line 13 open(src) 任意文件读取）", "explanation": "主链：line 15 文件内容字段 archive_path -> line 16 黑名单替换 -> line 17 拼接 /var/archive/ -> line 19 open 写入，_sanitize 可用 ....// 嵌套或绝对路径绕过；辅链：line 10 filename -> line 12 os.path.join -> line 13 open 读取，join 对绝对路径成分丢前缀导致穿越读；全文仅有可绕过的字符串替换弱防御，无 realpath 校验或白名单；第二入口检查：模块仅 import_records 单入口，无其他路由或间接调用，替代通道为上层队列消息传入文件名，结论不变", "fix_suggestion": "line 16: 改为 os.path.realpath 后校验结果必须位于允许目录前缀内（startswith(os.path.realpath(BASE_DIR))），并对 archive_path 使用白名单字符集校验，拒绝任何包含 .. 或绝对路径的值"}
+```

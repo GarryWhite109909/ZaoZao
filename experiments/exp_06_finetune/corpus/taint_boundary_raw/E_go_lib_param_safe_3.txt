@@ -1,0 +1,54 @@
+LANG: go
+```go
+// Package richtext 提供富文本/日志格式化能力，被上层服务调用，
+// 上层将外部提交的文本内容作为参数传入本模块。
+package richtext
+
+import (
+	"encoding/xml"
+	"fmt"
+	"strings"
+)
+
+// RenderXML 将用户提交的富文本片段渲染为 XML 日志条目。
+// title 与 body 均为外部提交内容，必须按不可信数据处理。
+func RenderXML(title, body string) (string, error) {
+	// 白名单校验：仅允许有限长度的标题，拒绝包含控制字符的内容
+	if len(title) > 128 || len(body) > 8192 {
+		return "", fmt.Errorf("content too long")
+	}
+	for _, r := range title + body {
+		if r < 0x20 && r != '
+' && r != '\t' {
+			return "", fmt.Errorf("illegal control character")
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("<entry>")
+	// xml.EscapeText 对 & < > ' " 及非法字符做完整转义，
+	// 阻断通过闭合标签注入任意 XML/XXE 实体的路径
+	sb.WriteString("<title>" + xml.EscapeText([]byte(title)) + "</title>")
+	sb.WriteString("<body>" + xml.EscapeText([]byte(body)) + "</body>")
+	sb.WriteString("</entry>")
+
+	// 使用 encoding/xml 解码器做最终结构校验（禁用外部实体解析）
+	dec := xml.NewDecoder(strings.NewReader(sb.String()))
+	dec.Strict = true
+	var probe map[string]interface{}
+	if err := dec.Decode(&probe); err != nil {
+		return "", fmt.Errorf("rendered xml invalid: %w", err)
+	}
+	return sb.String(), nil
+}
+```
+
+1. 污点边界：本文件无 request/stdin 等显式入口；第 14 行 `RenderXML(title, body string)` 的两个函数参数承载上层服务传入的外部提交文本，是等效污点源，公开接口参数必须按不可信处理。
+2. 第 16-23 行为白名单校验：长度上限与控制字符过滤，先于任何 sink 执行，属于位置正确的输入约束层。
+3. 数据流追踪：第 28 行 `xml.EscapeText([]byte(title))`、第 29 行对 body 同样处理——`encoding/xml` 的 `EscapeText` 是原生安全 API，对 `& < > ' "` 五类字符及非法 Unicode 做完整实体转义，类型正确（针对 XML 上下文的专用转义而非通用字符串替换），覆盖了标签闭合、属性逃逸与实体注入全部攻击面，随后才拼入 `sb` 字符串 sink。
+4. 第 33-37 行使用 `encoding/xml.Decoder` 做最终结构校验；Go 标准库解码器默认不解析外部 DTD/实体（无 XXE 处理路径），即使前序转义被绕过也无法触发 CWE-611 的外部实体展开。
+5. 第二入口检查：文件内仅此一个导出函数，无路由注册、无全局变量承接数据、无其他间接调用通道；两条 source→sink 流均被 EscapeText + 结构校验双重防御覆盖，防御有效且完整。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界为第14行 RenderXML 的 title/body 函数参数（上层服务传入的外部提交文本）；流1: title 经第16-23行长度与控制字符白名单校验后于第28行经 xml.EscapeText 完整实体转义再拼入 XML 字符串；流2: body 同样校验后于第29行经 EscapeText 转义；两流的转义均为 XML 上下文专用原生安全 API，覆盖标签闭合/属性逃逸/实体注入全部攻击面；第33-37行 encoding/xml 解码器默认不解析外部 DTD 实体，构成第二道防线阻断 XXE；文件内无第二入口或替代通道，仅一个导出函数，所有数据流防御有效", "fix_suggestion": "no fix needed"}
+```

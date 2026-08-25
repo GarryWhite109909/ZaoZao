@@ -1,0 +1,69 @@
+LANG: python
+```python
+"""ops_runner.py — 运维命令封装库，被上层服务/任务队列 worker 调用。
+
+公开接口的参数承载上层传入的外部数据（如工单系统提交的主机名、
+队列消息中的服务名），必须按不可信输入处理。
+"""
+
+import shlex
+import subprocess
+
+# 允许执行的运维命令白名单
+_ALLOWED_COMMANDS = {"systemctl", "journalctl", "df", "uptime"}
+
+# 各命令允许的参数模式（白名单校验）
+_ARG_PATTERNS = {
+    "systemctl": ("status", "restart", "stop"),
+    "journalctl": ("-u", "-n"),
+}
+
+
+def run_ops_command(command: str, args: list[str]) -> str:
+    """执行白名单内的运维命令并返回输出。
+
+    command 与 args 均来自上层调用者（可能源自外部提交），
+    在到达 subprocess 执行前经过严格白名单校验。
+    """
+    if command not in _ALLOWED_COMMANDS:
+        raise ValueError(f"command not allowed: {command}")
+
+    for arg in args:
+        if arg.startswith("-") and arg not in _ARG_PATTERNS.get(command, ()):
+            raise ValueError(f"option not allowed: {arg}")
+        if any(ch in arg for ch in ";|&$`\"):
+            raise ValueError(f"illegal character in argument: {arg}")
+
+    # 使用参数数组形式执行：shell=False，参数不经 shell 解析，
+    # 即使校验遗漏也不会产生命令注入
+    result = subprocess.run(
+        [command, *args],
+        capture_output=True,
+        text=True,
+        shell=False,
+        timeout=30,
+        check=True,
+    )
+    return result.stdout
+
+
+def quote_for_log(raw: str) -> str:
+    """供日志模块使用的安全引用工具。"""
+    return shlex.quote(raw)
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式入口，但第 24 行 `run_ops_command(command, args)` 是公开库函数，参数由上层服务/队列 worker 传入、可携带外部可控数据，属等效污点源；第 44 行 `quote_for_log` 的参数同理但仅用于转义输出。
+
+2. 数据流追踪：`command`（第 24 行）→ 第 29 行白名单 `_ALLOWED_COMMANDS` 精确匹配（集合成员判断，非黑名单/正则），不在名单内直接抛异常，无法流向 sink；`args` → 第 33-37 行双重校验：选项必须命中 `_ARG_PATTERNS` 白名单，且拒绝 `;|&$\`` 等 shell 元字符。
+
+3. 防御类型正确性：白名单为枚举精确匹配而非黑名单或字符串替换，攻击者无法构造绕过变体；位置在 sink（第 40 行 `subprocess.run`）之前，覆盖全部进入执行路径的数据。
+
+4. 纵深防御：即使假设校验被绕过，第 42-43 行采用参数数组 + `shell=False`，参数不经过 `/bin/sh` 解析，CWE-78 的注入机制（shell 解释元字符）从根本上不存在，属于原生安全 API。
+
+5. 第二入口检查：文件内无路由注册、无环境变量/标准输入读取、无全局可变状态承接外部数据；`quote_for_log` 不触达任何危险 sink（仅返回转义字符串）。唯一外部数据通道即两个函数参数，且均被防御覆盖。
+
+6. 结论：source→sink 全链路存在类型正确、位置正确、覆盖完整的白名单校验与 shell=False 参数化执行双重防御，无 CWE-78 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界为第24行 run_ops_command 的 command/args 参数（上层服务传入的外部可控数据）；流1: command 经第29行 _ALLOWED_COMMANDS 集合白名单精确匹配后才能到达第40行 subprocess.run，非白名单值抛异常；流2: args 经第33-37行选项白名单加 shell 元字符拒绝双重校验后进入 sink；两处防御均为枚举白名单而非黑名单/正则/替换，不可绕过，且位于 sink 之前覆盖全部输入；纵深上第42-43行使用参数数组加 shell=False，参数不经 shell 解析，注入机制根本不存在；第二入口检查：文件内无路由、无 environ/stdin/argv 读取、无其他函数触达危险 sink，quote_for_log 仅做 shlex 转义返回，故无漏洞", "fix_suggestion": "no fix needed"}
+```

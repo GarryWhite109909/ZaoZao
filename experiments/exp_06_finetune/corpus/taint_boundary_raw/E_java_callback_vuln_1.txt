@@ -1,0 +1,49 @@
+LANG: java
+```java
+package com.acme.webhook.dispatch;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.http.HttpMethod;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestTemplate;
+
+/**
+ * 出站 Webhook 发送器：消费 Kafka 主题 webhook.outbound 的消息，
+ * 按消息体中的 targetUrl 回调外部订阅方。
+ */
+@Component
+public class OutboundWebhookConsumer {
+
+    private final RestTemplate restTemplate = new RestTemplate();
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    // 由 Kafka 监听容器调用，payload 为外部业务方提交的 JSON
+    public void onMessage(ConsumerRecord<String, String> record) {
+        try {
+            JsonNode body = mapper.readTree(record.value());
+            String targetUrl = body.path("targetUrl").asText();
+            // 弱防御：仅拦截内网关键字，可被 DNS rebinding / 十进制 IP 绕过
+            if (targetUrl.contains("169.254") || targetUrl.contains("localhost")) {
+                return;
+            }
+            String payload = body.path("data").toString();
+            restTemplate.exchange(targetUrl, HttpMethod.POST,
+                    new org.springframework.http.HttpEntity<>(payload), String.class);
+        } catch (Exception ignored) {
+        }
+    }
+}
+```
+
+1. 第 20 行 `onMessage(ConsumerRecord<String, String> record)` 是污点边界：本文件没有任何 request/argv/environ 等显式 web 入口，但 Kafka 消息体由外部业务方投递，`record.value()` 承载完全不可信的外部数据，是等效污点源。
+2. 第 23 行 `mapper.readTree(record.value())` 将消息体解析为 JsonNode；第 24 行 `body.path("targetUrl")` 提取 URL 字符串——source 为第 24 行，外部可控。
+3. 第 26-28 行为弱防御：仅黑名单检查字符串是否包含 `169.254` 或 `localhost`。可绕过方式：使用十进制整数 IP（如 `http://2130706433/`）、IPv6 环回（`[::1]`）、DNS rebinding（域名先解析到公网再切换到内网）、或重定向跟随，均不命中关键字。
+4. 第 31 行 `restTemplate.exchange(targetUrl, ...)` 是 CWE-918 sink：未经校验的攻击者可控 URL 被服务端发起请求，可探测云元数据端点（169.254.169.254）、内网服务等。RestTemplate 默认跟随重定向，进一步扩大 SSRF 面。
+5. 第二入口检查：本文件仅此一个回调方法，无其他路由、参数或间接调用通道；唯一数据流即 消息体.targetUrl → exchange，结论成立。
+6. 防御覆盖面总结：黑名单位于 sink 前但覆盖面极窄（仅两个子串），不构成有效防御。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF)", "risk_level": "Critical", "source": "line 24: body.path('targetUrl').asText() 从 Kafka 消息体提取的外部可控 URL", "sink": "line 31: restTemplate.exchange(targetUrl, ...) 以攻击者可控 URL 发起服务端请求", "explanation": "主链：line 20 回调参数 record.value() -> line 23 readTree 解析 -> line 24 提取 targetUrl -> line 31 exchange 发起请求；防御分析：line 26-28 黑名单仅匹配 '169.254' 与 'localhost' 子串，可用十进制 IP、[::1]、DNS rebinding 或重定向绕过，非有效防御；第二入口检查：文件内无其他路由/参数/间接调用通道，唯一入口即该回调，SSRF 成立", "fix_suggestion": "line 26: 替换黑名单为解析后的 IP 白名单校验——用 URI 解析 host，DNS 解析后校验所有 A 记录均为公网地址并禁用重定向"}
+```

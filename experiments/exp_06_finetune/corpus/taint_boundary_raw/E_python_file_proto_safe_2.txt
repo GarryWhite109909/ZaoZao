@@ -1,0 +1,50 @@
+LANG: python
+```python
+# consumer/message_handler.py
+# 消息消费者业务处理器：由上层服务从队列拉取业务消息后调用本模块处理。
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+# 允许执行的业务动作白名单（第 10 行）
+ALLOWED_ACTIONS = {"refresh_cache", "sync_inventory", "send_report"}
+
+# 动作到内部处理函数的映射，全部为模块内静态函数（第 13 行）
+ACTION_HANDLERS = {
+    "refresh_cache": lambda payload: logger.info("cache refreshed: %s", payload.get("scope")),
+    "sync_inventory": lambda payload: logger.info("inventory synced: %s", payload.get("warehouse")),
+    "send_report": lambda payload: logger.info("report sent: %s", payload.get("report_id")),
+}
+
+
+def handle_message(raw_bytes: bytes) -> None:
+    """处理队列消息体（字节流），消息内容视为不可信外部输入。"""
+    try:
+        # 第 21 行：反序列化外部消息体 —— 污点源
+        message = json.loads(raw_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        logger.warning("malformed message dropped")
+        return
+
+    action = message.get("action")
+    # 第 27 行：白名单校验，未在 ALLOWED_ACTIONS 中的动作直接拒绝
+    if not isinstance(action, str) or action not in ALLOWED_ACTIONS:
+        logger.warning("action rejected: %r", action)
+        return
+
+    handler = ACTION_HANDLERS[action]
+    # 第 33 行：仅调用白名单映射出的静态函数，payload 只进入日志/业务参数
+    handler(message.get("payload") or {})
+```
+
+1. 第 1 步（污点边界）：本文件没有任何 request/input/environ 等显式 web 入口；污点边界在第 21 行——`json.loads(raw_bytes...)` 解析的队列消息体是外部提交的内容，等效于公开接口参数，必须按不可信数据处理。source 为第 20 行入参 `raw_bytes`。
+2. 数据流追踪：raw_bytes → 第 21 行 json.loads → message → 第 25 行 `message.get('action')` → 第 27-29 行白名单校验 → 第 32 行 `ACTION_HANDLERS[action]` → 第 34 行 `handler(payload)`。潜在 sink 是“按 action 名分发执行”这一动态调用点。
+3. 防御验证（类型）：第 27 行采用**白名单校验**——`action not in ALLOWED_ACTIONS`，只允许三个预定义字符串通过；这是清单中认可的有效防御类型，非黑名单/正则/字符串替换。
+4. 防御验证（位置与覆盖面）：校验位于第 32 行查表分发**之前**、紧邻 source 之后，位置正确；任何不在白名单内的值（包括 `__import__`、`eval`、属性链等注入载荷）都在第 28-29 行被拦截并 return，覆盖了到达动态分发 sink 的全部攻击面。且第 13 行的 `ACTION_HANDLERS` 本身只映射模块内静态 lambda，即使白名单被命中也不存在任意代码执行路径，双重收敛。
+5. 第二入口检查：全文件唯一外部输入点是第 20 行 `handle_message` 的字节流参数；无其他路由、参数或间接调用可绕过第 27 行白名单直接触达第 34 行的分发调用。结论：不存在 CWE-502 反序列化导致的不可信分发漏洞。
+6. 补充说明：第 21 行使用 `json.loads` 而非 `pickle.loads`/`yaml.load`，本身不产生对象实例化副作用，进一步排除反序列化 gadget 风险。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "line 20 handle_message 参数 raw_bytes（队列消息体）", "sink": "line 34 handler(message.get('payload')) 动态分发调用", "explanation": "污点源为第 21 行 json.loads 解析的外部消息体；数据流 raw_bytes→message→action→第 27 行白名单校验→第 32 行 ACTION_HANDLERS 查表→第 34 行调用；防御为白名单校验（ALLOWED_ACTIONS），类型正确（非黑名单/正则/替换），位置正确（位于查表分发之前），覆盖完整攻击面（所有非法 action 均被拒绝）；且 ACTION_HANDLERS 仅映射模块内静态函数，无任意代码执行路径；第二入口检查：全文件唯一外部输入为该字节流参数，无其他路由或间接通道可绕过白名单，故不存在 CWE-502 漏洞", "fix_suggestion": "no fix needed"}
+```

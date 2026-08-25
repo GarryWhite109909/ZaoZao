@@ -1,0 +1,46 @@
+LANG: php
+```php
+<?php
+// plugins/audit/hooks/AuditLogHook.php
+// 插件系统钩子：宿主在收到外部事件（如第三方系统推送的审计事件）时调用本钩子
+declare(strict_types=1);
+
+namespace Plugins\Audit\Hooks;
+
+use PDO;
+
+class AuditLogHook implements \PluginSystem\HookInterface
+{
+    private PDO $db;
+
+    public function __construct(PDO $db)
+    {
+        $this->db = $db;
+    }
+
+    // 宿主回调：$payload 为外部提交的事件载荷（JSON 字符串）
+    public function onEvent(string $eventName, string $payload): void
+    {
+        // 弱防御：仅做黑名单关键字替换，可被大小写/编码绕过
+        $cleaned = str_ireplace(['drop table', 'union select', '--'], '', $payload);
+        $data = json_decode($cleaned, true);
+        if (!is_array($data) || !isset($data['actor'], $data['resource'])) {
+            return;
+        }
+
+        $sql = "INSERT INTO audit_log (event, actor, resource, created_at) "
+             . "VALUES ('" . $eventName . "', '" . $data['actor'] . "', '" . $data['resource'] . "', NOW())";
+        $this->db->exec($sql); // 危险 sink：字符串拼接 SQL 直接执行
+    }
+}
+```
+
+1. 第 20 行 `onEvent(string $eventName, string $payload)` 是污点边界：本文件没有任何 request/input/environ 等显式 web 入口，但该钩子由宿主以外部事件载荷调用，`$eventName` 与 `$payload` 承载外部可控数据，必须按不可信处理，是等效污点源。
+2. 第 23 行对 `$payload` 做 `str_ireplace` 黑名单替换，仅覆盖 'drop table'、'union select'、'--' 三个字面量；攻击者可用 `'UNION/**/SELECT`、双写 `uniunion selecton select`、或直接注入单引号闭合语句等方式绕过，且 `$eventName` 完全未经过滤。该弱过滤不构成有效防御。
+3. 第 24-27 行将载荷 JSON 解码后取出 `actor`、`resource` 字段，未做任何类型校验或转义，直接进入第 28-29 行的字符串拼接 SQL。
+4. 第 30 行 `$this->db->exec($sql)` 是 CWE-89 sink：拼接后的 SQL 被直接执行，攻击者通过构造 `resource` 值如 `x', NOW()); DROP TABLE audit_log; --` 即可实现堆叠注入或任意数据篡改，source→sink 全程无有效防御，可达性确认。
+5. 第二入口检查：本文件仅有 `onEvent` 一个公开方法作为外部数据通道，构造函数的 `$db` 来自内部依赖注入不可控；不存在其他路由、参数或间接调用路径，结论唯一成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL 注入", "risk_level": "Critical", "source": "line 20: onEvent 回调参数 $eventName 与 $payload（外部事件载荷）", "sink": "line 30: $this->db->exec($sql)", "explanation": "主链：line 20 回调参数 -> line 23 黑名单替换（str_ireplace 仅过滤三个字面量，可用注释符/双写/大小写变体及未过滤的 $eventName 绕过）-> line 26-27 取出 actor/resource 未转义 -> line 28-29 拼接进 SQL -> line 30 exec 执行，全程无参数化或有效转义；第二入口检查：文件内唯一外部通道为 onEvent 回调签名，PDO 依赖为内部注入不可控，无其他替代入口", "fix_suggestion": "line 28: 改用预处理语句 $stmt = $this->db->prepare('INSERT INTO audit_log (event, actor, resource, created_at) VALUES (?, ?, ?, NOW())') 并 execute([$eventName, $data['actor'], $data['resource']])"}
+```

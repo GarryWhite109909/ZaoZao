@@ -1,0 +1,74 @@
+LANG: go
+```go
+// Package cachecodez 提供缓存条目的编解码与落盘能力。
+// 本模块被上层服务调用：上层将外部提交的缓存键/值传入后，
+// 由本包负责校验、编码并写入磁盘缓存文件。
+package cachecodez
+
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
+// allowedKeyChars 是缓存键的白名单字符集（字母、数字、下划线、点）。
+const allowedKeyChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_."
+
+// SaveCacheEntry 将 key/value 编码后写入缓存目录下的对应文件。
+// key 与 value 均来自上层调用者，视为不可信数据。
+func SaveCacheEntry(baseDir, key, value string) error {
+	if !validKey(key) {
+		return fmt.Errorf("invalid cache key")
+	}
+	// filepath.Base 消除任何路径分隔符残留，双重防御
+	safeName := filepath.Base(key)
+	path := filepath.Join(baseDir, safeName)
+	return writeFile(path, []byte(value))
+}
+
+func validKey(k string) bool {
+	if k == "" || len(k) > 64 {
+		return false
+	}
+	for _, c := range k {
+		if !strings.ContainsRune(allowedKeyChars, c) {
+			return false
+		}
+	}
+	return true
+}
+
+func writeFile(path string, data []byte) error {
+	f, err := osCreate(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(data)
+	return err
+}
+
+// osCreate 为可测试性抽象的 os.Create 包装。
+var osCreate = func(p string) (*osFile, error) { return osOpenFile(p) }
+```
+
+分析：
+
+1. **污点边界**：本文件没有任何 request/environ/stdin 等显式 web 入口；但第 17 行 `SaveCacheEntry(baseDir, key, value string)` 的三个函数参数承载上层调用者传入的外部可控数据（如外部提交的缓存键），按公开接口约定必须视为不可信污点源。
+
+2. **source→sink 数据流**：第 18 行先调用 `validKey(key)` 白名单校验；第 21 行 `filepath.Base(key)` 再次剥离路径分隔符；第 22 行 `filepath.Join(baseDir, safeName)` 生成最终路径，随后传入第 33 行 `writeFile` → 第 34 行 `osCreate(path)`（os.Create 类 sink）。污点从参数到 sink 的链路完整可达。
+
+3. **防御有效性**：
+   - **类型正确**：`validKey`（第 26–32 行）是白名单校验——只允许字母/数字/下划线/点，显式拒绝 `/`、`\`、`..` 所需的全部字符，非黑名单或正则替换，不可绕过；
+   - **位置正确**：校验位于参数进入后的第一行（第 18 行），早于所有路径拼接与 sink 调用；
+   - **覆盖完整攻击面**：CWE-22 的攻击载荷必须包含路径分隔符或 `..` 序列，而白名单字符集使 `..` 无法构成（`.` 允许但 `/`、`\` 被拒，`..` 无分隔符无法穿越目录）；即使假设校验被绕过，第 21 行 `filepath.Base` 作为第二层防御仍会剥离目录成分。双层防御覆盖了全部攻击面。
+
+4. **value 参数**：value 仅作为文件内容写入（第 35 行 `f.Write`），不参与路径构造，不构成 CWE-22 风险面。
+
+5. **第二入口检查**：本文件仅导出 `SaveCacheEntry` 一个入口函数，无其他导出函数、init 副作用或间接 sink；`baseDir` 由上层固定配置而非外部提交，且即便 baseDir 可控，Join 后仍在 baseDir 下。无替代通道绕过防御。
+
+6. **结论**：唯一 source→sink 流（key→path→os.Create）在 sink 前有位置正确、类型正确、覆盖完整的白名单+Base 双重防御，不存在漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点是第17行SaveCacheEntry的key参数，流向第34行os.Create类sink；第18行validKey白名单仅允许字母数字下划线点，拒绝全部路径分隔符，使..序列无法构成，校验位于数据流最前端且类型为白名单而非黑名单/正则替换，不可绕过；第21行filepath.Base作为第二层防御剥离任何残留目录成分，双层覆盖完整攻击面；value仅作文件内容不参与路径构造；全文件仅一个导出入口，无第二入口或替代通道", "fix_suggestion": "no fix needed"}
+```

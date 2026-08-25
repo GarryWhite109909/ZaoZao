@@ -1,0 +1,47 @@
+LANG: python
+```python
+"""config_loader.py — 解析外部提交的 YAML 配置清单，渲染为 HTML 报告片段。
+被上层服务调用：服务从消息队列/上传目录取出配置文件内容后传入本模块。"""
+
+import html
+from xml.sax.saxutils import escape
+
+
+def parse_config(raw_text: str) -> dict:
+    """解析原始配置文本，返回键值对。"""
+    config = {}
+    for line in raw_text.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        # 弱防御：仅过滤 <script> 字面量（大小写不敏感），可被 <img onerror>、<svg onload> 等绕过
+        value = value.replace("<script", "").replace("</script", "")
+        config[key.strip()] = value.strip()
+    return config
+
+
+def render_config_report(config: dict, title: str) -> str:
+    """将配置渲染为 HTML 片段，供上层页面直接嵌入。"""
+    parts = [f"<h2>{title}</h2><ul>"]
+    for key, value in config.items():
+        # 漏洞点：value 未做 HTML 转义，直接拼入 HTML
+        parts.append(f"<li>{key} = {value}</li>")
+    parts.append("</ul>")
+    return "".join(parts)
+
+
+def build_report(raw_text: str, title: str = "Config Report") -> str:
+    """公开入口：上层把外部提交的配置文件内容原样传入。"""
+    return render_config_report(parse_config(raw_text), title)
+```
+
+1. 第 12 行 `parse_config(raw_text)` 与第 27 行 `render_config_report(config, title)`、第 33 行 `build_report` 均为公开函数参数；本文件无 request/input/environ 等显式 web 入口，但按污点边界约定，函数参数承载上层调用者传入的外部提交配置内容，必须视为不可信污点源。
+2. 数据流一：第 12 行 `raw_text` → 第 18 行逐行 partition 出 `value` → 第 19 行弱防御仅做字符串替换删除 `<script`/`</script` 字面量 → 存入 `config` → 第 24 行返回 → 第 29 行 f-string 直接拼入 `<li>` 标签内。该替换可绕过：`<img src=x onerror=alert(1)>`、`<svg onload=...>`、`<ScRiPt>`（大小写混合虽匹配但可用 `< script` 或事件属性完全避开）等均不含被删字面量，属可绕过黑名单，非有效防御。
+3. 数据流二：第 27 行 `title` 参数无任何处理，经第 28 行 f-string 直接进入 `<h2>` 标签，是零防御直达 sink 的第二路径。
+4. 防御覆盖面核查：文件 import 了 `html.escape` 和 `escape`（第 4-5 行）但从未调用，说明作者意识到需转义却遗漏；全部 sink（第 28、29 行）均无有效编码。
+5. 第二入口检查：除 `build_report` 外，`parse_config`/`render_config_report` 本身也是导出的公开接口，上层可直接以未清洗数据调用 `render_config_report` 绕过弱过滤层，构成替代通道；无其他路由或间接 sink。
+6. 结论：两条 source→sink 流均可达且无有效防御，构成存储型/反射型 XSS（CWE-79）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 跨站脚本(XSS)：外部可控配置内容未经转义拼入 HTML", "risk_level": "High", "source": "line 12: 参数 raw_text 与 line 27: 参数 title（上层传入的外部提交配置）", "sink": "line 29: f-string 将 value 直接拼入 <li> 标签；line 28: title 直接拼入 <h2>", "explanation": "流一：line 12 raw_text -> line 18 partition 取 value -> line 19 仅 replace 删除 <script 字面量（可被 <img onerror>/<svg onload>/大小写变体绕过）-> line 24 返回 -> line 29 拼入 HTML；流二：line 27 title 无任何处理 -> line 28 直达 <h2>；防御缺失：html.escape 已导入但从未使用，两处 sink 均无输出编码；第二入口：render_config_report 作为公开函数可被上层直接调用，绕过 parse_config 的弱过滤，构成替代通道", "fix_suggestion": "line 28-29: 对所有插值统一调用 html.escape(key/value/title) 后再拼入 HTML"}
+```

@@ -1,0 +1,66 @@
+LANG: php
+```php
+<?php
+declare(strict_types=1);
+
+namespace Acme\Reporting;
+
+use GuzzleHttp\Client;
+
+/**
+ * 报表导出工具模块。
+ * 由上层 API 服务在用户提交筛选条件后调用，或由队列消费者传入任务参数。
+ * 本模块不感知 HTTP 层，仅接收已解析的参数。
+ */
+class ReportExporter
+{
+    private Client $http;
+
+    /** 允许导出的数据源白名单（第 20 行） */
+    private const ALLOWED_SOURCES = [
+        'sales'    => 'https://internal-ds.local/api/sales',
+        'finance'  => 'https://internal-ds.local/api/finance',
+        'hr'       => 'https://internal-ds.local/api/hr',
+    ];
+
+    public function __construct(Client $http)
+    {
+        $this->http = $http;
+    }
+
+    /**
+     * 导出报表：$source 为用户选择的数据源标识，
+     * $params 为筛选条件，将作为查询串转发给内部数据服务。
+     */
+    public function export(string $source, array $params): string
+    {
+        // 白名单校验：source 必须命中预定义键，否则拒绝（第 38 行）
+        if (!array_key_exists($source, self::ALLOWED_SOURCES)) {
+            throw new \InvalidArgumentException('unknown data source');
+        }
+
+        $url = self::ALLOWED_SOURCES[$source];
+
+        // 筛选条件仅允许已知字段名，值经原生 http_build_query 编码（第 44 行）
+        $allowedFields = ['from', 'to', 'region', 'department'];
+        $clean = array_intersect_key($params, array_flip($allowedFields));
+
+        $response = $this->http->get($url, ['query' => $clean]);
+        return (string) $response->getBody();
+    }
+}
+```
+
+1. 污点边界：本文件无 request/input 等显式 web 入口；但 `export()` 的 `$source` 与 `$params` 由上层 API 服务以用户筛选条件传入，属于公开接口参数承载的外部可控数据，必须按不可信处理，是等效污点源。
+
+2. 数据流一：`$source`（第 36 行形参）→ 第 38-40 行 `array_key_exists` 严格白名单校验 → 第 42 行仅从常量数组 `ALLOWED_SOURCES` 取出预定义 URL。攻击者无法注入主机、路径或 scheme，因为最终 URL 完全来自代码内常量映射，外部输入只充当查找键而非 URL 组成部分——这是白名单校验，类型正确（精确匹配枚举）、位置正确（在任何网络请求之前）、覆盖完整（未命中即抛异常，无默认回退路径）。
+
+3. 数据流二：`$params`（第 36 行形参）→ 第 44-45 行 `array_intersect_key` 字段名白名单过滤 → 第 48 行作为 Guzzle `query` 选项传入。Guzzle 会用原生 `http_build_query` 对键值做完整 URL 编码，杜绝通过查询串注入 `#`、`?` 或 CRLF 改变请求目标；且 query 参数无法改变请求的 host/path，SSRF 的核心攻击面（目标地址）不受影响。
+
+4. sink 分析：唯一网络 sink 是第 48 行 `$this->http->get()`。到达该 sink 的 URL 仅由白名单常量决定，两路污点数据均被有效防御拦截，不存在拼接进 URL 字符串的路径。
+
+5. 第二入口检查：文件中无路由注册、无其他公开方法、无常量之外的 URL 来源；构造函数注入的 `Client` 由可信容器提供 base 配置。替代通道不存在，结论成立。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为 export() 的 source 与 params 参数（上层服务传入的用户筛选数据）；流一 source 经第 38 行 array_key_exists 白名单校验后仅用于查 ALLOWED_SOURCES 常量表取预定义 URL，外部输入不构成 URL 任何组成部分，防御类型正确、位于请求前、覆盖全部输入；流二 params 经第 44 行字段名白名单过滤后由 Guzzle query 选项以 http_build_query 原生编码传输，无法篡改 host/path 或注入分隔符；唯一 sink 为第 48 行 http get，URL 全部来自代码常量；第二入口检查确认无路由注册、无其他公开方法、无其他 URL 来源，故无 CWE-918 风险", "fix_suggestion": "no fix needed"}
+```

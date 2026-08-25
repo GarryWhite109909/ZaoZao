@@ -1,0 +1,49 @@
+LANG: javascript
+```javascript
+// template-renderer.js
+// 模板渲染辅助模块，被上层服务调用：上层从消息队列消费任务，
+// 将模板片段文件路径与变量清单文件路径传入本模块。
+const fs = require('fs');
+const path = require('path');
+
+// 弱防御：仅拦截绝对路径与 .. 序列（可被 URL 编码/双重编码绕过）
+function sanitize(p) {
+  return p.replace(/\.\./g, '').replace(/^\/+/, '');
+}
+
+// 渲染指定模板文件；模板路径来自外部提交的 manifest 文件内容
+function renderTemplate(manifestPath) {
+  // manifest 文件由外部用户上传后落盘，内容不可信
+  const raw = fs.readFileSync(manifestPath, 'utf8');
+  const manifest = JSON.parse(raw);           // 第 15 行：解析不可信 JSON
+
+  const tplName = sanitize(manifest.template); // 第 17 行：可绕过的黑名单过滤
+  const tplFile = path.join(__dirname, 'templates', tplName);
+
+  // sink：用未充分校验的路径读取任意文件
+  const content = fs.readFileSync(tplFile, 'utf8'); // 第 21 行：CWE-22
+
+  const vars = manifest.vars || {};
+  let out = content;
+  for (const k of Object.keys(vars)) {
+    out = out.split('{{' + k + '}}').join(String(vars[k]));
+  }
+  return out;
+}
+
+module.exports = { renderTemplate };
+```
+
+1. 污点边界：本文件没有 request/input/environ 等显式 web 入口；第 14 行 `manifestPath` 指向的 manifest 文件由外部用户上传后落盘，第 15 行 `JSON.parse` 解析出的 `manifest.template`、`manifest.vars` 承载外部可控数据，是等效污点源，必须按不可信处理。
+
+2. 数据流追踪：第 16 行读取并解析文件 → 第 17 行取出 `manifest.template` → 第 18 行拼入 `path.join` → 第 21 行 `fs.readFileSync` 执行文件读取，source 到 sink 全程可达。
+
+3. 防御分析：第 17 行 `sanitize` 仅做字符串替换删除 `..` 与前导 `/`。绕过方式一：URL/百分号编码 `%2e%2e%2f` 不含字面 `..`，若上游曾解码则还原为遍历序列；绕过方式二：`....//` 删除 `..` 后残留 `../`；且该过滤不校验最终路径是否仍位于 templates 目录内，属于可绕过弱防御，非有效防护。`path.join` 本身会规范化路径但不限制根目录，无法阻止逃逸。
+
+4. 第二入口检查：本模块仅导出 `renderTemplate` 一个函数，无其他路由、参数或间接调用通道；但 `manifest.vars` 的键同样来自不可信 JSON，虽只参与字符串替换不构成路径注入，替代通道不存在，结论维持存在漏洞。
+
+5. 结论：CWE-22 路径遍历成立，攻击者通过上传恶意 manifest 可读取服务器任意文件（如配置、密钥），风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "High", "source": "line 15: JSON.parse 解析外部上传的 manifest 文件内容", "sink": "line 21: fs.readFileSync(tplFile) 使用未充分校验的路径读文件", "explanation": "主链：line 15 解析不可信 manifest -> line 17 取 manifest.template 经可绕过的 sanitize -> line 18 path.join 拼接 -> line 21 fs.readFileSync 任意文件读取；防御缺失：sanitize 仅字符串替换删除 '..' 与前导 '/'，可用 %2e%2e%2f 编码或 '....//' 绕过，且未做路径规范化白名单校验；第二入口检查：模块仅导出 renderTemplate 单函数，无其他路由或间接调用通道，vars 键仅用于字符串替换不构成额外路径流", "fix_suggestion": "line 18: 对拼接结果调用 path.resolve 后强制断言其位于 templates 目录内（startsWith 校验），并对 manifest.template 做严格白名单（如 /^[a-zA-Z0-9_-]+\\.html$/）"}
+```

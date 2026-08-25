@@ -1,0 +1,42 @@
+LANG: python
+```python
+from flask import Flask, request, jsonify, Markup
+import bleach
+
+app = Flask(__name__)
+
+# 白名单精确允许集：仅允许 SVG 安全子集标签与属性
+ALLOWED_TAGS = ['svg', 'g', 'path', 'circle', 'rect', 'line', 'ellipse', 'polygon', 'polyline', 'text', 'defs', 'use', 'title', 'desc']
+ALLOWED_ATTRS = {'*': ['id', 'class', 'd', 'fill', 'stroke', 'stroke-width', 'cx', 'cy', 'r', 'x', 'y', 'width', 'height', 'transform', 'viewBox', 'xmlns', 'points', 'x1', 'x2', 'y1', 'y2']}
+
+@app.route('/sanitize-svg', methods=['POST'])
+def sanitize_svg():
+    svg_content = request.form.get('svg', '')
+    if not svg_content:
+        return jsonify({'error': 'missing svg field'}), 400
+
+    # 防御：基于白名单的净化，剥离所有非白名单标签/属性（含 script、on* 事件处理器）
+    cleaned = bleach.clean(svg_content, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, strip=True)
+
+    # 清洗后的 SVG 存库，供其他用户页面内联渲染
+    db.execute("INSERT INTO svgs (content) VALUES (?)", (cleaned,))
+    return jsonify({'status': 'sanitized'}), 200
+
+@app.route('/svg/<int:svg_id>')
+def render_svg(svg_id):
+    row = db.execute("SELECT content FROM svgs WHERE id = ?", (svg_id,)).fetchone()
+    # sink：以 image/svg+xml MIME 类型返回，浏览器不会将其作为 HTML 执行内联脚本
+    resp = app.response_class(row['content'], mimetype='image/svg+xml')
+    resp.headers['Content-Security-Policy'] = "default-src 'none'; style-src 'unsafe-inline'"
+    return resp
+```
+
+1. 第 15 行：用户可控输入点为 `request.form.get('svg')`，即 POST 表单字段 svg，是本漏洞数据流唯一 source；第 26 行 `svg_id` 来自路由 int 转换器，被参数化查询使用，无注入风险。
+2. 第 21 行：原修复用正则黑名单删除 `<script>` 标签，属黑名单过滤，可被 `<scr<script>ipt>` 拆分、`<img onerror=...>`、`javascript:` href 等绕过，不构成有效防御。
+3. 第 22 行：改用 `bleach.clean` 基于白名单精确允许集（ALLOWED_TAGS/ALLOWED_ATTRS）净化，strip=True 移除一切非白名单内容，包括 script 标签与所有 on* 事件属性，类型正确（输出编码级净化）、位置正确（入库前，覆盖存储型 XSS 的持久化点）、攻击面完整（白名单天然覆盖未知向量）。
+4. 第 29-31 行：sink 处将 mimetype 从 text/html 改为 image/svg+xml 并附加 CSP `default-src 'none'`，即使库中残留恶意内容，浏览器也不会将其作为 HTML 解析执行，形成纵深防御。
+5. 第二入口检查：第 27 行 SELECT 使用参数化查询无 SQL 注入；第 23 行 INSERT 已参数化；除 /sanitize-svg 外无其他写入通道，存储型 XSS 链路 source→DB→sink 全部阻断。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-79 存储型 XSS：第 15 行表单字段 svg 为 source，经第 21 行正则黑名单（可绕过）后于第 22 行存库，最终在第 29 行以 text/html 未转义返回构成 sink；修复采用 bleach 白名单净化（第 22 行）并将响应改为 image/svg+xml 加 CSP（第 30-31 行），链路已完全阻断", "fix_suggestion": "no fix needed"}
+```

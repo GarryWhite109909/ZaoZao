@@ -1,0 +1,67 @@
+LANG: python
+```python
+"""数据导入适配器：解析外部系统导出的 JSONL 记录文件。
+
+本模块由上层导入服务调用，传入待处理的文件路径；
+文件内容来自外部合作方系统，必须按不可信数据处理。
+"""
+
+import json
+import ipaddress
+import socket
+from urllib.parse import urlparse
+
+# 允许回调通知的目标主机白名单（运维配置，非用户输入）
+ALLOWED_HOSTS = {"partner-a.internal.example.com", "partner-b.internal.example.com"}
+
+
+def notify_partner(record: dict) -> None:
+    """向记录中指定的回调地址发送确认（模拟）。"""
+    raw_url = record.get("callback_url", "")
+    parsed = urlparse(raw_url)
+    host = parsed.hostname
+    if not host or host not in ALLOWED_HOSTS:
+        raise ValueError("callback host not allowed")
+    # 防御 DNS 重绑定：解析后校验 IP 是否为内网段
+    ip = socket.gethostbyname(host)
+    if not ipaddress.ip_address(ip).is_private:
+        raise ValueError("resolved address is not internal")
+    # 仅使用白名单主机名重建 URL，端口/路径取自白名单常量
+    safe_url = f"https://{host}/ack"
+    _http_post(safe_url, payload=json.dumps({"id": record.get("id")}))
+
+
+def _http_post(url: str, payload: str) -> None:
+    sock = socket.create_connection((urlparse(url).hostname, 443), timeout=5)
+    try:
+        sock.sendall(f"POST / HTTP/1.1\r
+Host: {urlparse(url).hostname}\r
+\r
+{payload}".encode())
+    finally:
+        sock.close()
+
+
+def process_import_file(path: str) -> int:
+    """逐行解析外部记录文件并触发回调。"""
+    count = 0
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            record = json.loads(line)
+            notify_partner(record)
+            count += 1
+    return count
+```
+
+分析：
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 41 行 `open(path)` 读取的外部记录文件内容——该文件由外部合作方系统生成，其中每行 JSON 的 `callback_url` 字段（第 17 行 `record.get("callback_url")`）是外部可控数据，等效于不可信输入，最终流向第 27-28 行的 `_http_post` 网络请求 sink（CWE-918 SSRF 关注点）。
+2. 数据流追踪：文件内容 → 第 42 行 `json.loads` → 第 43 行 `notify_partner(record)` → 第 17 行取出 `callback_url` → 第 18 行 `urlparse` 提取 hostname → 第 20-21 行白名单校验 → 第 24-28 行发起连接。若缺少防御，攻击者可在文件中写入 `http://169.254.169.254/latest/meta-data/` 或 `http://127.0.0.1:8080/admin` 实现内网探测。
+3. 防御有效性（类型正确）：第 19-21 行采用【白名单校验】——`ALLOWED_HOSTS` 是硬编码常量集合，仅允许两个已知内部合作方主机名，任何其他 scheme/host 一律抛异常；白名单属于清单要求认可的有效防御类型，而非黑名单或正则过滤，不存在绕过面（无法通过编码、大小写、子域等技巧命中白名单外的目标）。
+4. 防御有效性（位置与覆盖完整）：校验位于第 20 行，即 sink 调用（第 28 行）之前的唯一必经路径上，且在 DNS 解析（第 23 行）之后追加 IP 私网段复核（第 24-25 行），覆盖了 DNS 重绑定这一 SSRF 经典绕过；scheme 未被信任（第 26 行强制以 `https://{host}/ack` 常量模板重建 URL），攻击者控制的端口、路径、userinfo、fragment 全部被丢弃，攻击面被完整覆盖。
+5. 第二入口检查：全文件仅有一个数据入口（`process_import_file` 的文件参数及其内容）；`_http_post` 为私有辅助函数且其 url 参数只来自第 26 行的白名单重建结果，不存在其他路由、环境变量、队列报文或间接调用通道可将未校验数据送达 sink。
+6. 结论：source→sink 主链上防御类型正确、位置前置、覆盖全部攻击面，无 CWE-918 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点边界：无显式web入口，第41行open读取的外部记录文件内容为等效污点源，其中callback_url字段外部可控；主链：第42行json.loads→第43行notify_partner→第17行取callback_url→第28行_http_post网络请求sink；防御为第19-21行硬编码主机名白名单（类型正确的有效防御，非黑名单/正则），位于sink前唯一必经路径（位置正确），并在DNS解析后追加第24-25行私网IP复核防重绑定，第26行以常量模板重建URL丢弃攻击者可控的端口/路径/userinfo（覆盖完整攻击面）；第二入口检查：全文件仅此一个文件内容入口，_http_post的url仅来自白名单重建结果，无替代通道", "fix_suggestion": "no fix needed"}
+```

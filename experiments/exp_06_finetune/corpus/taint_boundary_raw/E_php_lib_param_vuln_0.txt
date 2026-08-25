@@ -1,0 +1,44 @@
+LANG: php
+```php
+<?php
+// ops/CommandRunner.php — 运维命令封装库，被上层调度服务与消息队列消费者调用
+
+namespace Ops;
+
+class CommandRunner
+{
+    /**
+     * 执行一条运维命令并返回带格式的执行报告（HTML 片段）。
+     * $command 由上层服务透传（可能来自工单系统、队列消息等外部提交内容）。
+     */
+    public function run(string $command): string
+    {
+        // 弱防御：仅拦截分号与管道符，防止命令拼接
+        if (strpos($command, ';') !== false || strpos($command, '|') !== false) {
+            return '<div class="error">illegal chars</div>';
+        }
+
+        exec($command . ' 2>&1', $outputLines, $exitCode);
+
+        // 将命令原文回显进 HTML 报告，未做任何 HTML 转义
+        $report = "<h3>Command: {$command}</h3><pre>";
+        foreach ($outputLines as $line) {
+            $report .= htmlspecialchars($line) . "
+";
+        }
+        $report .= "</pre><p>exit={$exitCode}</p>";
+
+        return $report;
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口，但第 14 行公开方法 `run(string $command)` 的参数承载上层调用者传入的外部数据（注释表明来自工单系统、队列消息），按不可信处理，是等效污点源。
+2. 第 17-19 行是弱防御：仅用 `strpos` 黑名单拦截 `;` 和 `|`，可被反引号、`$()`、换行符、`&&` 等方式绕过，且该防御针对的是命令注入而非 XSS，对污点流向 sink 无阻断作用。
+3. 第 21 行 `exec($command ...)` 是命令执行 sink（附带风险），但本条目标为 CWE-79：第 24 行将未经转义的 `$command` 直接内插到 `<h3>` 标签中；对比第 27 行对输出行做了 `htmlspecialchars`，说明开发者有转义意识但覆盖面不全——只转义了命令输出，漏掉了命令本身。
+4. 数据流验证：`$command`（第 14 行参数）→ 通过黑名单检查（第 18 行，可绕过）→ 第 24 行进入 HTML 字符串 → 作为返回值交给上层渲染到页面。全程无 `htmlspecialchars`/`htmlentities` 处理，攻击者提交形如 `<img src=x onerror=alert(1)>` 的"命令"即可存储型 XSS。
+5. 第二入口检查：文件内无路由注册、无 HTTP 处理器、无其他公开方法；唯一通道是 `run()` 的参数，但任何上层调用方（HTTP 控制器、CLI、队列消费者）都会把外部数据经此参数送入同一 sink，故结论成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (XSS) via unescaped command echo", "risk_level": "High", "source": "line 14: run() 参数 $command（上层服务/队列透传的外部可控数据）", "sink": "line 24: 未转义内插进 <h3> HTML 报告字符串并返回渲染", "explanation": "主链：$command 经 strpos 黑名单（仅拦 ; 与 |，可用反引号/$()/&&/换行绕过，且不针对 XSS）后于 line 24 直接拼入 HTML，无 htmlspecialchars 转义 -> 存储型 XSS；line 27 对命令输出做了 htmlspecialchars 但覆盖面不全，漏掉命令本身；第二入口检查：文件内无路由/web 处理器/其他公开方法，唯一通道即 run() 参数，所有上层调用方均汇入同一 sink，结论成立", "fix_suggestion": "line 24: 改为 htmlspecialchars($command, ENT_QUOTES, 'UTF-8') 后再拼入 HTML"}
+```

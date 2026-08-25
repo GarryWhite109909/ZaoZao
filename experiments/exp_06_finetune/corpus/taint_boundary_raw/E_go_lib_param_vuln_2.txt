@@ -1,0 +1,64 @@
+LANG: go
+```go
+// Package pluginhook 提供插件系统的钩子实现。
+// 宿主服务在消费外部提交的插件配置/事件载荷后，以参数形式调用本模块的公开函数。
+package pluginhook
+
+import (
+	"fmt"
+	"plugin"
+	"strings"
+)
+
+// HookPayload 由宿主从消息队列/配置中心读取后传入
+type HookPayload struct {
+	PluginPath string // 插件 so 文件路径，来自外部提交的插件注册请求
+	Symbol     string // 钩子符号名
+}
+
+var allowedPrefixes = []string{"plugins/", "hooks/"}
+
+// LoadHook 加载并调用外部指定的插件钩子（被上层服务调用）
+func LoadHook(p HookPayload) (string, error) {
+	// 弱防御：仅做前缀黑名单式校验，可被 ../ 或绝对路径绕过
+	for _, pre := range allowedPrefixes {
+		if strings.HasPrefix(p.PluginPath, pre) {
+			goto load
+		}
+	}
+	if !strings.Contains(p.PluginPath, "..") {
+		return "", fmt.Errorf("plugin path rejected: %s", p.PluginPath)
+	}
+load:
+	// 危险 sink：反序列化/加载任意共享对象，CWE-502
+	hook, err := plugin.Open(p.PluginPath)
+	if err != nil {
+		return "", err
+	}
+	sym, err := hook.Lookup(p.Symbol)
+	if err != nil {
+		return "", err
+	}
+	fn, ok := sym.(func() string)
+	if !ok {
+		return "", fmt.Errorf("bad hook signature")
+	}
+	return fn(), nil
+}
+```
+
+1. 污点边界：本文件无 request/input 等显式 web 入口；污点源是第 12-15 行 `HookPayload` 结构体字段与第 19 行公开函数 `LoadHook` 的参数 `p`——注释已表明宿主从消息队列/配置中心读取外部数据后传入，公开接口参数承载的外部可控数据必须按不可信处理。
+
+2. 第 20-27 行为弱防御：仅用 `strings.HasPrefix` 前缀白名单加 `..` 子串检查。绕过方式：路径形如 `hooks/../../tmp/evil.so` 虽含 `..` 但命中前缀直接 goto load；或使用绝对路径 `/lib/x/evil.so` 不含 `..` 且不命中前缀时……实际逻辑缺陷在于命中任一前缀即跳过全部检查，攻击者只需让路径以 `plugins/` 开头再接 `../` 即可逃逸目录。
+
+3. 第 30 行 `plugin.Open(p.PluginPath)` 是 CWE-502 对应的危险 sink：加载并执行外部指定的任意共享对象代码，等价于不受信反序列化；污点数据从第 19 行参数未经有效净化直达此处。
+
+4. 第 33 行 `Lookup(p.Symbol)` 同样受外部控制，可指向插件内任意导出符号，扩大攻击面；第 36 行类型断言失败仅返回错误，不构成对加载行为的防御。
+
+5. 第二入口检查：文件内无路由注册、无 HTTP 处理器、无环境变量/stdin 读取；唯一入口是 `LoadHook` 参数，但该函数为包级公开 API，任何上层服务（CLI、队列消费者、RPC handler）均可将不可信数据传入，替代通道成立，漏洞可达性确认。
+
+6. 结论：存在 CWE-502 漏洞，风险等级 Critical（远程代码执行）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data", "risk_level": "Critical", "source": "line 19: LoadHook 函数参数 p.HookPayload.PluginPath（宿主从消息队列/配置中心传入的外部数据）", "sink": "line 30: plugin.Open(p.PluginPath) 加载执行任意共享对象", "explanation": "主链：line 19 参数 p -> line 21 前缀校验 -> line 30 plugin.Open -> line 33 Lookup 执行外部代码；防御分析：line 20-27 的 HasPrefix 前缀白名单与 .. 子串检查为弱防御，命中 plugins/ 或 hooks/ 前缀即跳过 .. 检查，构造 hooks/../../tmp/evil.so 即可绕过；第二入口检查：文件内无路由/web处理器/stdin，唯一通道是公开函数参数，但作为包级公开 API 可被任意上层调用方以不可信数据调用，替代通道成立；Lookup 符号名同样外部可控，扩大攻击面", "fix_suggestion": "line 30: 移除运行时动态加载外部 so 的设计，改为编译期注册表映射插件名到内部实现；若必须动态加载，先用 filepath.Clean + filepath.IsAbs 校验并确保结果严格位于受控插件目录内且拒绝任何 .. 分量"}
+```

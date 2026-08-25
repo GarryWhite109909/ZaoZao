@@ -1,0 +1,26 @@
+## 编号分析（全文通读）
+
+**入口点枚举**
+1. `yourls_stats_countries_map()`（第 9 行）：`$countries`、`$id` 为外部传入参数；
+2. `yourls_stats_pie()`（第 41 行）：`$data`、`$limit`、`$size`、`$id` 外部可控；
+3. `yourls_build_list_of_days()`（第 93 行）：`$dates` 来自数据库统计结果；
+4. `yourls_stats_line()`（第 171 行）：`$values`、`$id` 外部传入；
+5. `yourls_get_domain()/get_favicon_url()`（第 234/256 行）：`$url` 来自 referrer 等外部数据；
+6. `yourls_apply_filter()` 回调点（第 27、77、196 行等）：插件可篡改 `$options/$map`；
+7. 底层输出函数 `yourls_google_array_to_data_table()`（第 313 行）与 `yourls_google_viz_code()`（第 342 行）是所有图表的公共 sink。
+
+**数据流验证**
+
+- 流 A：统计数据（如 referrer 域名、国家码、日期标签，均含攻击者可控内容，例如点击短链时的 `Referer` 头被存库）→ 第 18/80/183 行传入 `yourls_google_array_to_data_table()` → 第 319 行 `$str .= "\t['$label',";` 与第 324 行 `$str .= "$value";` **无任何 HTML/JS 转义**，仅在第 321 行判断是否加引号（黑名单式：以 `[` 或 `{` 开头则不加引号，反而扩大注入面）→ 第 29/82/198 行拼入 `$code` → 第 30/84/200 行 `echo` 输出。防御无效，构成存储型 XSS。
+- 流 B：`$id` 参数（调用方可传用户输入）→ 第 343 行 `'yourls_graph' . $id` → 第 344/345/359/363 行直接插入 `<script>` 属性、JS 函数名和 HTML `id`，无转义 → XSS。
+- 流 C：`$options` 数组（第 20–26、68–76、185–195 行定义后经第 27/77/196 行过滤器可被插件修改）→ 第 350–354 行仅做“是否加引号”的黑名单判断（第 351 行），值未转义即写入 JS 对象字面量。
+- 流 D：`$graph_type`（第 342 行）→ 第 359 行 `new google.visualization.$graph_type` 直接拼接，无白名单校验。
+- 流 E：`yourls_get_domain()`（第 234–247 行）对畸形 URL 用 `@parse_url` 静默失败并回退到 `path`（第 241–242 行），无净化；但该结果仅用于 favicon URL（第 257 行），风险较低。
+
+**第二通道**：即使输入端做了部分过滤，`yourls_apply_filter` 过滤器回调（第 27/77/196 行）可在输出前替换整个 `$map/$pie/$lineChart` 字符串，属于替代注入通道；且所有 sink 共享同一无转义的拼接逻辑，单点修复无法覆盖。
+
+**结论**：全文不存在任何 `htmlspecialchars`/`json_encode`/`addslashes` 类转义，source→sink 链完整且防御无效。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 跨站脚本(XSS)，内联 JavaScript/HTML 上下文注入", "risk_level": "高", "source": "line 18/80/183: 统计数据数组(含数据库中攻击者可控的 referrer 域名、国家码等)及外部传入的 $id/$options/$graph_type", "sink": "line 319/324: $str .= '\t['$label',' 与 $str .= '$value'; 以及 line 344/354/359/363: 直接拼入 script 标签、JS 函数名与 div id 后于 line 30/84/200 被 echo", "explanation": "攻击者通过访问短链携带恶意 Referer 或污染统计标签 -> 数据存入数据库 -> 图表函数将数据传入 yourls_google_array_to_data_table -> 第 321 行仅做以 [ 或 { 开头是否加引号的黑名单判断，无任何转义 -> 恶意 payload 经第 324 行拼入 JS 数据表 -> 经 yourls_google_viz_code 第 347 行嵌入 <script> -> 第 30/84/200 行 echo 输出到管理页面 -> 存储型 XSS，可窃取管理员会话；$id(line 343)、$options(line 354)、$graph_type(line 359) 同样未转义，构成额外注入点", "fix_suggestion": "line 313-330 与 342-364: 使用 json_encode( $value, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT ) 输出所有标签与数值，HTML 属性与 id 用 htmlspecialchars( $id, ENT_QUOTES ) 转义，$graph_type 改为白名单校验(array('GeoChart','PieChart','LineChart'))，并对 yourls_apply_filter 的返回结果在最终 echo 前统一转义"}
+```

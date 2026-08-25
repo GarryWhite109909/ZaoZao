@@ -1,0 +1,70 @@
+LANG: java
+```java
+package com.acme.richtext;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.regex.Pattern;
+
+/**
+ * 富文本渲染模块：被上层服务调用，读取外部提交的富文本草稿文件并渲染为 HTML。
+ * 草稿文件由外部用户通过离线渠道上传后落盘，内容必须按不可信数据处理。
+ */
+public final class RichTextRenderer {
+
+    // 仅允许安全标签与 href 属性；URL 协议白名单
+    private static final Pattern ALLOWED_TAG = Pattern.compile("^(b|i|em|strong|p|br|ul|li)$");
+    private static final Pattern URL_SCHEME = Pattern.compile("^(https?://).+");
+
+    public String renderDraft(Path draftFile) throws IOException {
+        String raw = Files.readString(draftFile, StandardCharsets.UTF_8); // 第 20 行：污点源
+
+        StringBuilder out = new StringBuilder();
+        for (String line : raw.split("
+")) {
+            if (line.startsWith("[link]")) {
+                String url = line.substring(6).trim();
+                if (!URL_SCHEME.matcher(url).matches()) {   // 第 25 行：协议白名单校验
+                    continue;                                // 拒绝 file://、gopher:// 等 SSRF 向量
+                }
+                String host = extractHost(url);
+                if (!isAllowedHost(host)) {                  // 第 28 行：主机白名单（SSRF 防御）
+                    continue;
+                }
+                out.append("<a href="").append(escapeHtml(url)).append("">link</a>");
+            } else {
+                out.append("<p>").append(escapeHtml(line)).append("</p>");
+            }
+        }
+        return out.toString();
+    }
+
+    private static String extractHost(String url) {
+        int s = url.indexOf("://") + 3;
+        int e = Math.min(url.indexOf('/', s) == -1 ? url.length() : url.indexOf('/', s), url.length());
+        return url.substring(s, e);
+    }
+
+    private static boolean isAllowedHost(String host) {
+        return host.equals("cdn.example.com") || host.endsWith(".example.com");
+    }
+
+    private static String escapeHtml(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace(""", "&quot;");
+    }
+}
+```
+
+1. **污点边界**：本文件没有任何 request/input/environ 等显式 web 入口；污点源是第 20 行 `Files.readString(draftFile)` 读取的草稿文件内容——该文件承载外部用户提交的富文本，按不可信处理，是等效污点源。
+2. **数据流追踪**：`raw` → split 后逐行处理。`[link]` 行提取出 `url`（第 23 行），这是唯一可能触发服务端发起网络请求的数据（若后续用于资源抓取即构成 CWE-918 SSRF 面）。
+3. **防御一（类型正确）**：第 25 行使用**协议白名单**（仅 http/https），从源头排除 `file://`、`ftp://`、`gopher://`、`jar://` 等非 HTTP SSRF/本地文件读取向量；白名单属于有效防御类别，非黑名单或字符串替换过滤。
+4. **防御二（位置正确、覆盖完整）**：第 28 行在 URL 进入任何下游使用前对解析出的 host 做**域名白名单**校验（仅 example.com 及其子域），位置处于 sink 之前的必经路径；同时第 31 行输出时经 `escapeHtml` 转义，覆盖 XSS 攻击面。攻击者无法构造绕过：host 提取基于 `://` 与首个 `/` 的标准切分，且白名单为精确/后缀匹配而非子串匹配。
+5. **第二入口检查**：本类无其他公开方法接收字符串参数，`renderDraft(Path)` 是唯一入口；不存在替代路由、间接调用或反射通道将未校验 URL 送入网络请求 sink。
+6. **结论**：所有 source→sink 路径均被协议白名单 + 主机白名单双重覆盖，防御类型正确、位置前置、攻击面完整，判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为第 20 行 Files.readString 读取的外部提交草稿文件内容, 无显式 web 入口; 唯一潜在 SSRF 面是 [link] 行提取的 url, 在进入任何下游网络操作前于第 25 行经 https? 协议白名单校验, 排除 file/gopher/jar 等 SSRF 向量, 并于第 28 行经主机白名单 isAllowedHost 校验, 白名单属有效防御类别而非可绕过的黑名单或字符串替换; 输出侧第 31 行 escapeHtml 覆盖 XSS 面且与 SSRF 防御互补; 第二入口检查: renderDraft 为唯一公开方法, 无其他路由/参数/反射通道可将未校验 URL 送入网络请求 sink", "fix_suggestion": "no fix needed"}
+```

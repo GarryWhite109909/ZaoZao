@@ -1,0 +1,53 @@
+LANG: go
+```go
+// Package archiver: 消费归档任务队列，处理外部提交的归档文件名。
+package archiver
+
+import (
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+// ArchiveTask 是消息队列载荷，由上游服务投递（外部用户提交的归档名）。
+type ArchiveTask struct {
+	ArchiveName string `json:"archive_name"`
+	DestDir     string `json:"dest_dir"`
+}
+
+// HandleArchiveTask 为队列消费者回调，msg 载荷承载外部可控数据。
+func HandleArchiveTask(msg []byte) error {
+	task, err := parseTask(msg)
+	if err != nil {
+		return err
+	}
+	name := task.ArchiveName
+	// 弱防御：仅拦截路径分隔符 "/"，未处理反斜杠与 ".." 组合
+	if strings.Contains(name, "/") {
+		log.Printf("rejected archive name: %s", name)
+		return nil
+	}
+	// 外部数据直接拼入目标路径
+	target := filepath.Join(task.DestDir, name)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	cmd := exec.Command("tar", "-xf", "/srv/inbox/"+name, "-C", target)
+	return cmd.Run()
+}
+
+func parseTask(msg []byte) (*ArchiveTask, error) { /* json.Unmarshal */ return nil, nil }
+```
+
+1. 污点边界：本文件无 request/argv/stdin 等显式入口；第 14 行 `HandleArchiveTask(msg []byte)` 的回调参数 msg 即队列消息体，承载外部用户提交的归档名与目标目录，按不可信数据处理，是等效污点源。
+2. 第 19 行 parseTask 将 msg 反序列化为 ArchiveTask，`task.ArchiveName`、`task.DestDir` 均为外部可控字符串。
+3. 第 23-26 行为弱防御：仅黑名单检查是否包含 `/`。绕过方式：Windows 反斜杠 `..\..\etc\crontab`、URL 编码变体由上层解码后还原、或纯 `..` 在无 `/` 时配合 tar 的成员路径穿越；且 DestDir 完全未校验。
+4. 第 29 行 `filepath.Join(task.DestDir, name)` 将污点拼入目标路径——Join 会清理 `..` 但仅限已含 `/` 的形式被拦后剩余形态仍可经 tar 解包时二次穿越；第 34 行 `exec.Command("tar", "-xf", "/srv/inbox/"+name, ...)` 中 name 直接拼接进命令参数，若 name 含 `--checkpoint-action=...` 等 tar 参数注入亦可达成任意文件写入。
+5. 防御覆盖面评估：唯一过滤是第 24 行的 `/` 黑名单，位置在 source 之后 sink 之前，但仅覆盖一种分隔符，不构成有效防御；无 filepath.Clean 后的前缀校验、无白名单。
+6. 第二入口/替代通道检查：全文仅此一个回调入口，无其他路由或间接调用；但同一污点经两条流到达危险操作（os.MkdirAll 的路径派生 + exec.Command 参数），结合 tar 解包时的路径穿越，确认存在 CWE-22 漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal via queue message payload", "risk_level": "High", "source": "line 14: 回调参数 msg (队列消息体, 含外部提交的 ArchiveName/DestDir)", "sink": "line 34: exec.Command('tar', '-xf', '/srv/inbox/'+name, '-C', target)", "explanation": "主链: line 14 msg -> line 19 parseTask -> line 29 filepath.Join(DestDir, name) -> line 34 tar 命令参数; 唯一防御是 line 24 的 '/' 黑名单, 可用反斜杠 '..\' 或不含 '/' 的 '..' 序列及 tar 成员内嵌 '../' 绕过, DestDir 完全未校验; 第二入口检查: 全文无其他路由/参数/间接调用, 仅此单一回调入口, 但污点同时流向 MkdirAll 与 exec.Command 两处危险操作, 确认可达", "fix_suggestion": "line 24: 改用 filepath.Base(name) 归一化后与原值比对并拒绝包含 '..' 或分隔符的名称, 同时对 DestDir 做 filepath.Clean 后的允许目录前缀校验"}
+```

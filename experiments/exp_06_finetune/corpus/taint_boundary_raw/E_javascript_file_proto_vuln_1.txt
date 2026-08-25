@@ -1,0 +1,45 @@
+LANG: javascript
+```javascript
+// plugin-hooks.js — 插件系统钩子加载器，被宿主服务在启动/热更新时调用
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+
+// 钩子清单文件由插件市场下载后落盘，内容为外部提交的 JSON
+function loadHooks(manifestPath) {
+  const raw = fs.readFileSync(manifestPath, 'utf8');           // 第 7 行：污点源
+  const manifest = JSON.parse(raw);                            // 第 8 行
+  const hooks = {};
+
+  for (const [event, def] of Object.entries(manifest.hooks)) {
+    // 弱防御：仅黑名单过滤危险全局名（可被编码/拼接绕过）
+    let code = String(def.script || '');
+    if (/process|require\(|child_process/.test(code)) {        // 第 13 行：可绕过黑名单
+      continue;
+    }
+    // 模板化包装：把钩子脚本拼进沙箱模板
+    const wrapper = `(function(ctx){ ${code} })(__ctx__);`;    // 第 16 行：拼接进代码字符串
+
+    const sandbox = {
+      __ctx__: () => ({ event, data: def.data }),
+      log: console.log,
+      db: { query: (sql) => global.__pool.query(sql) }         // 第 19 行：暴露 DB 句柄
+    };
+    vm.createContext(sandbox);
+    hooks[event] = () => vm.runInContext(wrapper, sandbox);    // 第 22 行：sink — 执行外部可控代码
+  }
+  return hooks;
+}
+
+module.exports = { loadHooks };
+```
+
+1. **第 1 步（污点边界）**：本文件没有任何 request/input/environ 等显式 web 入口；第 7 行 `fs.readFileSync(manifestPath)` 读取的钩子清单文件是插件市场下载后落盘的外部提交内容，按不可信数据处理，是等效污点源。
+2. **第 2 步**：第 8 行 `JSON.parse` 后，`manifest.hooks[*].script` 完全继承文件内容的可控性；攻击者只需向插件市场提交一个含恶意 script 字段的清单即可注入任意载荷。
+3. **第 3 步**：第 13 行的黑名单正则 `/process|require\(|child_process/` 是可绕过的弱防御——可用 `this.constructor.constructor('return process')().mainModule.require('child_process')`、Unicode 转义 `\u0070rocess` 或属性拼接等方式绕过；且未覆盖 `Function` 构造器、原型链逃逸等路径。
+4. **第 4 步**：第 16 行将可控 `code` 直接字符串拼接入 wrapper，随后第 22 行 `vm.runInContext` 执行。Node 的 `vm` 模块并非安全沙箱：通过 `this.constructor.constructor` 可拿到宿主 `Function`，进而访问 `process` 实现任意命令执行；第 19 行还主动把数据库查询句柄挂入沙箱，扩大危害面。source→sink 全程无有效防御，可达性成立。
+5. **第 5 步（第二入口检查）**：本模块仅导出 `loadHooks` 一个函数，manifestPath 由上层服务传入；除该文件读取通道外不存在其他路由或参数入口，但同一污点可经多个事件钩子条目（hooks 对象的每个 value）重复到达 sink，属同源多路径而非独立入口。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine / Code Injection via externally-supplied hook manifest", "risk_level": "Critical", "source": "line 7: fs.readFileSync 读取的插件清单文件内容（外部提交数据）", "sink": "line 22: vm.runInContext 执行拼接后的钩子代码", "explanation": "污点边界：文件无显式 web 入口，但第 7 行读取的清单文件承载外部可控数据，为等效污点源；流1：line 7 文件内容 -> line 8 JSON.parse -> line 16 拼接进 wrapper -> line 22 runInContext 执行，全程无有效防御；防御分析：line 13 黑名单正则仅匹配 process/require(/child_process，可通过 this.constructor.constructor 原型链逃逸、Unicode 转义或属性拼接绕过，且 Node vm 非安全沙箱，line 19 还将 DB 句柄暴露给沙箱放大危害；第二入口检查：模块仅 loadHooks 单一入口，无其他路由或参数通道，但 hooks 对象每个条目均可重复触达 sink", "fix_suggestion": "line 22: 移除基于 vm.runInContext 的动态代码执行，改为声明式钩子注册表（仅允许引用白名单内的预置函数），并对清单文件做签名校验"}
+```

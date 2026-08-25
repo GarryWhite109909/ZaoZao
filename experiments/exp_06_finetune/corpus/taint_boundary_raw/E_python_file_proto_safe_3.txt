@@ -1,0 +1,41 @@
+LANG: python
+```python
+"""静态资源定位工具：解析资源索引 XML，按名称定位服务器上的文件。
+
+本模块由上层后台服务调用（传入上传/同步目录中的索引文件路径），
+XML 内容来自外部提交，必须视为不可信输入。
+"""
+import os
+import posixpath
+from defusedxml.ElementTree import parse as safe_parse
+
+ASSET_ROOT = "/srv/static/assets"
+ALLOWED_EXT = {".png", ".jpg", ".css", ".js", ".woff2"}
+
+
+def locate_asset(index_path: str) -> str:
+    """解析索引 XML 并返回目标资源文件的绝对路径。"""
+    # defusedxml 禁用外部实体与 DTD 展开，从根上阻断 XXE（CWE-611）
+    tree = safe_parse(index_path)
+    name = tree.getroot().get("name") or ""
+    ext = posixpath.splitext(name)[1].lower()
+
+    if ext not in ALLOWED_EXT:
+        raise ValueError("unsupported asset type")
+
+    resolved = os.path.realpath(os.path.join(ASSET_ROOT, name))
+    if not resolved.startswith(os.path.realpath(ASSET_ROOT) + os.sep):
+        raise ValueError("path traversal rejected")
+
+    return resolved
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；外部可控数据通过第 14 行 `safe_parse(index_path)` 解析的 XML 文件内容进入——该文件由上层服务从外部提交渠道落盘，其内容（包括 DOCTYPE、ENTITY 声明）等效于公开接口参数，必须按不可信处理。
+2. 数据流追踪：若使用标准库 `xml.etree.ElementTree.parse`，攻击者可在 XML 头部声明 `<!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>`，实体在解析时被展开并进入 `name` 属性，随后流向第 24 行的路径拼接与后续文件读取 sink——这是 CWE-611 的经典 source→sink 链。
+3. 防御验证（类型正确）：第 13 行采用 defusedxml 的 `safe_parse`，它在底层禁用了 DTD 处理、外部实体解析与实体展开（forbid_dtd / forbid_entities 默认开启），属于"原生安全 API"类防御；XXE 攻击面完全位于 XML 解析器内部，防御位置在污点进入程序的第一道关口（第 14 行），先于任何属性读取，覆盖完整——不存在绕过路径，因为恶意实体根本不会被实例化。
+4. 补充防御：即使解析结果被污染，第 20 行扩展名白名单与第 23-25 行 realpath+前缀校验也阻断了路径穿越型二次利用，形成纵深防御。
+5. 第二入口检查：模块仅暴露 `locate_asset` 一个函数，唯一参数是文件路径，无其他路由、参数或间接调用通道；`ASSET_ROOT` 为编译期常量不可控。所有 source→sink 路径均被第 14 行的解析器级防御拦截，故判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "污点源为被解析的外部提交 XML 索引文件内容（第 14 行 safe_parse），潜在 XXE sink 为实体展开后进入的文件路径拼接与读取；防御为 defusedxml 在解析器层禁用 DTD 与外部实体（原生安全 API，位置在污点入口第一行，覆盖全部实体攻击面）；另有扩展名白名单与 realpath 前缀校验作为纵深防御；第二入口检查确认模块仅有 locate_asset 单一函数入口，无其他路由或间接调用通道，结论为无漏洞。", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,67 @@
+LANG: go
+```go
+// Package opscmd 运维命令封装库：从任务清单文件读取待执行命令并登记到审计库。
+// 本模块被上层调度服务调用，任务文件由运维人员通过工单系统上传。
+package opscmd
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+type TaskEntry struct {
+	Name    string `json:"name"`
+	Command string `json:"command"`
+	Owner   string `json:"owner"`
+}
+
+// LoadTasks 解析任务清单 JSON 文件，并将每条任务写入审计表。
+func LoadTasks(db *sql.DB, path string) error {
+	data, err := os.ReadFile(path) // 第 20 行：污点源，文件内容外部可控
+	if err != nil {
+		return err
+	}
+	var tasks []TaskEntry
+	if err := json.Unmarshal(data, &tasks); err != nil { // 第 24 行：解析不可信内容
+		return err
+	}
+	for _, t := range tasks {
+		owner := sanitize(t.Owner) // 第 27 行：弱防御，仅黑名单替换
+		q := fmt.Sprintf("INSERT INTO audit_tasks(name, cmd, owner) VALUES('%s','%s','%s')",
+			t.Name, t.Command, owner) // 第 29 行：字符串拼接构造 SQL
+		if _, err := db.Exec(q); err != nil { // 第 31 行：sink，SQL 执行
+			return err
+		}
+	}
+	return nil
+}
+
+// sanitize 黑名单过滤单引号，可被双写绕过
+func sanitize(s string) string {
+	out := ""
+	for _, c := range s {
+		if c != ''' {
+			out += string(c)
+		}
+	}
+	return out
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；第 20 行 `os.ReadFile(path)` 读取的任务清单文件由上层服务接收的外部上传内容落盘而来，其字节内容承载【外部可控数据】，是等效污点源，必须按不可信处理。
+
+2. 第 20→24 行：文件字节流经 `json.Unmarshal` 反序列化为 `TaskEntry`，`Name`、`Command`、`Owner` 三个字段全部继承污点；JSON 解析不构成任何安全防御。
+
+3. 第 27 行：仅对 `Owner` 调用 `sanitize` 做黑名单过滤（删除单引号字符），该防御类型为字符黑名单、位置在拼接前、覆盖面只覆盖 Owner 一个字段——Name 与 Command 完全未过滤；且即便对 Owner，攻击者也可通过 JSON Unicode 转义 `\u0027` 或依赖字段间组合注入绕过，属于可绕过弱防御。
+
+4. 第 29 行：`fmt.Sprintf` 将未净化的 `t.Name`、`t.Command` 直接拼入 INSERT 语句的字符串字面量中，无参数化占位符；Name 字段值如 `a','b','c');DROP TABLE audit_tasks;--` 即可闭合引号改变语句结构。
+
+5. 第 31 行：`db.Exec(q)` 直接执行拼接后的 SQL，是 CWE-89 的危险 sink；source（第 20 行文件内容）到 sink（第 31 行）全程无有效防御，可达性成立。
+
+6. 第二入口检查：本文件唯一外部数据通道是被解析的任务清单文件；不存在其他路由、参数或间接调用路径，但该单一通道已足以将污点送达 sink。结论：存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL 注入", "risk_level": "High", "source": "line 20: os.ReadFile 读取的外部上传任务清单文件内容", "sink": "line 31: db.Exec 执行拼接的 SQL", "explanation": "文件内容经 json.Unmarshal 进入 Name/Command/Owner 三字段; line 29 用 fmt.Sprintf 将未净化的 Name 与 Command 直接拼入 INSERT 语句; line 27 的 sanitize 仅对 Owner 做单引号黑名单删除, 类型为字符黑名单, 覆盖面不含 Name/Command 且可通过 JSON unicode 转义等手段绕过, 不构成有效防御; 无参数化查询; 第二入口检查: 本文件除被解析文件外无其他路由/参数/间接调用通道, 单一文件通道即可达 sink", "fix_suggestion": "line 29: 改用参数化查询 INSERT INTO audit_tasks(name,cmd,owner) VALUES(?,?,?) 并以 db.Exec(q, t.Name, t.Command, t.Owner) 传参"}
+```

@@ -1,0 +1,44 @@
+LANG: php
+```php
+<?php
+// config_loader.php — 配置/清单文件解析模块
+// 被上层服务调用：上层将外部提交的配置文件内容传入 parseConfig()
+
+namespace App\Config;
+
+class ConfigLoader
+{
+    /**
+     * 解析 XML 格式的配置清单。
+     * $rawXml 由调用方提供（外部提交的配置文件内容），按不可信数据处理。
+     */
+    public static function parseConfig(string $rawXml): array
+    {
+        // 弱防御：仅做字符串替换，试图去掉 DOCTYPE 声明（可绕过）
+        $cleaned = str_ireplace(['<!DOCTYPE', '<!doctype'], '', $rawXml);
+
+        libxml_use_internal_errors(true);
+        $dom = new \DOMDocument();
+        // 第 24 行：污点数据直接进入 XML 解析器，未禁用外部实体加载
+        $dom->loadXML($cleaned, LIBXML_NOENT | LIBXML_DTDLOAD);
+
+        $result = [];
+        foreach ($dom->getElementsByTagName('entry') as $node) {
+            $key = $node->getAttribute('name');
+            $result[$key] = $node->nodeValue;
+        }
+        return $result;
+    }
+}
+```
+
+1. 污点边界：本文件没有任何 request/input/environ 等显式 web 入口；第 15 行公开静态方法 `parseConfig(string $rawXml)` 的参数承载上层服务传入的外部提交配置内容，是等效污点源，必须按不可信处理。
+2. 数据流：`$rawXml`（第 15 行）→ `$cleaned`（第 20 行）→ `loadXML($cleaned, ...)`（第 24 行），污点直达 sink。
+3. 防御分析：第 20 行 `str_ireplace` 移除 `<!DOCTYPE` 属于黑名单式弱防御——攻击者可用 `<!DOCTYPE` 大小写混合变体、XML 注释包裹、或使用 `<?xml ... [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>` 内部子集且不写 DOCTYPE 关键字的其他编码/换行拆分方式绕过；且第 24 行显式启用 `LIBXML_NOENT | LIBXML_DTDLOAD`，主动允许实体展开与 DTD 加载，构成 CWE-611 XXE 的完整条件。
+4. Sink 可达性：`DOMDocument::loadXML` 在上述 flag 下会解析并展开 `<!ENTITY>` 外部实体，可读取本地文件（file://）、发起 SSRF（http://），返回值经第 27-29 行进入 `$result` 回传给调用方，泄露路径完整可达。
+5. 第二入口检查：文件内无路由注册、无其他公开方法、无间接回调入口；唯一通道即 `parseConfig` 参数，但该参数即为污点源，故结论成立。
+6. 结论：存在 CWE-611 XXE 漏洞，风险 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 XML External Entity (XXE) Injection", "risk_level": "High", "source": "line 15: parseConfig 函数参数 $rawXml 承载外部提交的配置文件内容", "sink": "line 24: DOMDocument::loadXML($cleaned, LIBXML_NOENT | LIBXML_DTDLOAD)", "explanation": "主链: line 15 参数 $rawXml -> line 20 str_ireplace 弱过滤 -> line 24 loadXML 解析; line 20 的黑名单式 str_ireplace 仅移除 <!DOCTYPE 字面量, 可通过大小写变体、换行拆分、内部实体子集等方式绕过; line 24 显式启用 LIBXML_NOENT 与 LIBDTDLOAD 允许 DTD 加载与实体展开, 攻击者可注入外部实体读取本地文件或发起 SSRF; 文件内无路由或其他入口, 唯一数据通道为函数参数本身, 该参数即污点源", "fix_suggestion": "line 24: 移除 LIBXML_NOENT 和 LIBXML_DTDLOAD 标志, 并在解析前调用 libxml_disable_entity_loader(true) 或使用 LIBXML_NONET, 从根本上禁用外部实体与网络访问"}
+```

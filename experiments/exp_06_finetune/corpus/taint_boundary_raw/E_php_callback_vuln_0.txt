@@ -1,0 +1,52 @@
+LANG: php
+```php
+<?php
+// app/Support/TemplateRenderer.php
+// 被队列消费者调用：处理异步模板渲染任务消息
+
+namespace App\Support;
+
+use Twig\Environment;
+use Twig\Loader\ArrayLoader;
+
+class TemplateRenderer
+{
+    private Environment $twig;
+
+    public function __construct()
+    {
+        // ArrayLoader 允许直接以字符串作为模板源，而非文件路径
+        $this->twig = new Environment(new ArrayLoader([]), [
+            'autoescape' => false,
+        ]);
+    }
+
+    /**
+     * 队列回调：$payload 为外部提交的渲染任务消息体（JSON）
+     * 形如 {"template": "Hello {{ user.name }}", "vars": {...}}
+     */
+    public function handleRenderJob(array $payload): string
+    {
+        $template = (string)($payload['template'] ?? '');
+        $vars = is_array($payload['vars'] ?? null) ? $payload['vars'] : [];
+
+        // 弱防御：仅拦截明显的 eval/系统函数关键字，可被 {{ ['id'][0] }} 或
+        // 拼接绕过；且未限制沙箱环境
+        if (preg_match('/(system|exec|passthru|shell_exec)/i', $template)) {
+            throw new \RuntimeException('blocked keyword');
+        }
+
+        return $this->twig->createTemplate($template)->render($vars);
+    }
+}
+```
+
+1. 第 22 行 `handleRenderJob(array $payload)` 是污点边界：本文件没有任何 request/input/environ 等显式 web 入口，但该方法是消息队列消费者的回调签名，`$payload` 承载外部用户提交的渲染任务消息体，必须按不可信数据处理，是等效污点源。
+2. 第 24 行 `$payload['template']` 与第 25 行 `$payload['vars']` 是两个外部输入点，均无来源校验，直接进入后续流程。
+3. 第 31-33 行的正则黑名单只匹配 system/exec/passthru/shell_exec 四个字面量，Twig 的 SSTI 可通过 `{{ ['calc']['0'] }}`、属性拼接、`_self.env` 访问、过滤器链等大量方式绕过，属于可绕过弱防御，不构成有效防护。
+4. 第 35 行 `$this->twig->createTemplate($template)` 将外部可控字符串直接编译为 Twig 模板并立即 `render()`——这是 CWE-1336（模板引擎注入）的典型 sink：攻击者注入的模板表达式在服务端执行，配合非沙箱 Environment（第 14-17 行）可读取任意文件或执行代码。`$vars` 同样未经白名单约束传入 render，扩大可控面。
+5. 第二入口检查：本文件除该回调外无其他路由、HTTP handler 或间接公开方法；构造函数不接收外部数据。唯一外部通道即 `$payload`，其到 sink 的可达性完整成立，故确认存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 模板引擎注入(Twig SSTI)", "risk_level": "Critical", "source": "line 22: 队列回调参数 payload 中的 template 与 vars 字段", "sink": "line 35: twig->createTemplate($template)->render($vars)", "explanation": "数据流一: line 24 payload[template] -> line 31 正则黑名单(仅拦四个函数名, 可用 _self.env/属性访问/过滤器链绕过) -> line 35 createTemplate 编译执行, 构成服务端模板注入; 数据流二: line 25 payload[vars] -> line 35 render($vars) 无键名白名单, 攻击者可覆盖模板上下文变量; 全程无非沙箱限制(line 14-17 autoescape=false 且未使用 Twig Sandbox), 弱正则不算有效防御; 第二入口检查: 文件内无其他路由/HTTP入口/间接调用, 唯一外部通道为回调参数 payload, 到 sink 可达", "fix_suggestion": "line 35: 不将外部字符串作为模板源, 改为预置模板名引用(ArrayLoader 预注册), 并使用 Twig\\Extension\\SandboxExtension 配合白名单 policy 限制标签/过滤器/方法"}
+```

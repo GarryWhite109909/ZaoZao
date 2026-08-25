@@ -1,0 +1,56 @@
+LANG: go
+```go
+// Package opscmd: 运维命令封装库，被上层调度服务调用。
+// 从任务清单文件读取待执行命令并登记到审计数据库。
+package opscmd
+
+import (
+	"database/sql"
+	"os/exec"
+	"strings"
+)
+
+type Runner struct {
+	DB *sql.DB // 审计库连接
+}
+
+// RunFromFile 解析任务清单文件（每行一条命令），内容视为不可信外部数据。
+func (r *Runner) RunFromFile(path string) error {
+	data, err := readFile(path)
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(data), "
+") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line) // 拆分为参数数组
+		// sink1: 命令执行 —— 使用参数数组形式，不经 shell 解释
+		cmd := exec.Command(fields[0], fields[1:]...)
+		if err := cmd.Run(); err != nil {
+			return err
+		}
+		// sink2: 审计入库 —— 预编译参数化查询，文件内容仅作绑定参数
+		if _, err := r.DB.Exec(
+			"INSERT INTO audit_log(cmdline, status) VALUES (?, ?)",
+			line, "ok",
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+```
+
+分析：
+1. 第 17 行 `RunFromFile` 接收文件路径并在第 18 行读取：本文件没有 request/input 等显式 web 入口，但被解析的任务清单文件承载外部可控数据（运维人员或上游系统提交的内容），是等效污点源，必须按不可信处理。
+2. 数据流一：第 18 行文件字节 → 第 24 行 `strings.Fields` 拆分 → 第 28 行 `exec.Command(fields[0], fields[1:]...)`。防御类型正确：Go 的 `exec.Command` 参数数组形式不经过 shell（无 `/bin/sh -c` 拼接），文件内容中的分号、反引号、管道符均被当作普通参数字面量，无法注入元字符；位置正确：在到达 sink 前已脱离 shell 解释层；覆盖完整攻击面：命令注入的唯一途径即 shell 元字符解释，该 API 从根本上消除了这一面。
+3. 数据流二：第 18 行文件字节 → 第 25 行 `line` → 第 33-35 行 `DB.Exec("INSERT ... VALUES (?, ?)", line, "ok")`。防御类型正确：database/sql 的占位符预编译/参数化查询使文件内容只作为绑定值传输，永不参与 SQL 文法解析；位置正确：在 SQL sink 调用点直接参数化；覆盖完整攻击面：`line` 中任何引号、注释符、分号都只是数据，不存在拼接路径。
+4. 黑名单/正则/字符串替换均未使用，也不需要——两处 sink 均采用原生安全 API（参数数组执行 + 预编译查询），不存在可绕过的过滤逻辑。
+5. 第二入口检查：文件内无其他函数读取外部数据，`readFile` 仅由第 18 行调用一次；除该文件解析路径外无路由、环境变量、标准输入等替代通道；两条 source→sink 流均有有效防御且覆盖全部攻击面。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "RunFromFile 第18行读取的任务清单文件内容", "sink": "第28行 exec.Command 与 第33行 DB.Exec", "explanation": "污点边界为被解析的清单文件内容，等效于外部提交数据；流一经 strings.Fields 拆分后以参数数组传入 exec.Command，不经 shell 解释，元字符注入面被原生安全 API 完全消除；流二以占位符参数化查询写入审计表，文件内容仅作绑定值，SQL 注入面被预编译完全消除；两条流防御类型正确、位于 sink 调用点、覆盖全部攻击面；全文件无第二入口或替代通道（无其他读取点、无间接调用），故判定安全", "fix_suggestion": "no fix needed"}
+```
