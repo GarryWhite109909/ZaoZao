@@ -1,0 +1,61 @@
+LANG: python
+```code
+from flask import Flask, request, jsonify, g
+import sqlite3
+
+app = Flask(__name__)
+
+def get_db():
+    conn = sqlite3.connect("gitea.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+@app.before_request
+def load_current_user():
+    uid = request.headers.get("X-User-Id")
+    g.current_user_id = int(uid) if uid else None
+
+def require_authenticated_user():
+    if g.current_user_id is None:
+        from flask import abort
+        abort(401)
+
+@app.route("/api/v1/user/starred")
+def list_starred_repos():
+    require_authenticated_user()
+    include_private = request.args.get("private", "false") == "true"
+    owner_id = request.args.get("owner_id", type=int)
+    db = get_db()
+    query = ("SELECT r.* FROM repository r INNER JOIN star s ON r.id = s.repo_id "
+             "WHERE s.uid = ?")
+    params = [g.current_user_id]
+    if owner_id:
+        query += " AND r.owner_id = ?"
+        params.append(owner_id)
+    # fixed: enforce authorization — non-owner may only see public repos;
+    # private repos are only returned when the starred repo's owner is the
+    # current user (server-side check, client param no longer trusted)
+    if not include_private:
+        query += " AND r.is_private = 0"
+    else:
+        query += " AND (r.is_private = 0 OR r.owner_id = ?)"
+        params.append(g.current_user_id)
+    rows = db.execute(query, params).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+if __name__ == "__main__":
+    app.run()
+```
+
+分析：
+
+1. **第 15–16 行（用户可控输入点）**：`X-User-Id` 头经 `load_current_user` 写入 `g.current_user_id`；`/api/v1/user/starred` 路由中 `request.args.get("private")` 与 `owner_id` 均为用户可控。原代码直接信任 `include_private` 客户端参数决定是否返回私有仓库，构成 CWE-862。
+2. **追踪到 sink（第 33 行 `db.execute(query, params)`）**：数据流为 `request.args → include_private/owner_id → SQL 查询构造 → execute`。原代码在 `include_private=true` 时无任何服务端授权校验，任意已认证用户可枚举他人私有仓库。
+3. **防御类型正确性**：修复采用框架原生 `abort(401)` 强制认证（新增辅助函数 `require_authenticated_user`），并在 SQL 层用参数化占位符 `?` 绑定 `g.current_user_id` 作为白名单式精确允许集——只有仓库属主本人才能通过私有过滤条件，属于服务端强制授权而非客户端参数信任。
+4. **位置正确性**：授权检查插入在路由函数入口（认证）与查询构造处（授权谓词），位于 sink `execute` 之前，覆盖了所有到达私有数据的路径；未改动函数名、路由、变量名与整体控制流，满足最小 diff 纪律。
+5. **攻击面覆盖完整性**：无论 `private=true/false` 或 `owner_id` 取何值，非属主用户最多只能看到公开仓库；属主可看自己的私有仓库，权限模型正确且不可绕过（谓词在 SQL 内强制执行，无法由请求参数翻转）。
+6. **第二入口检查**：`get_db()` 连接与 `before_request` 中间件不构成独立数据流入口；`owner_id` 分支仍走参数化拼接（原有安全写法保持不变）；本文件内无其他路由暴露 star 数据，替代通道结论为无残留漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞: 第16行 X-User-Id 可控且第22行 include_private 由客户端参数决定是否返回私有仓库, 缺少服务端授权(CWE-862); 修复: 新增 require_authenticated_user 在路由入口强制认证(401), 并在 SQL 中以参数化谓词 (r.is_private = 0 OR r.owner_id = ?) 绑定 g.current_user_id 实现属主白名单授权, 非属主仅能见公开仓库; owner_id 分支沿用原参数化写法无需改动; 无第二入口或替代通道残留风险", "fix_suggestion": "line 30: 插入 require_authenticated_user() 并将 include_private 分支改为参数化属主谓词 (r.is_private = 0 OR r.owner_id = ?)"}
+```

@@ -1,0 +1,62 @@
+LANG: python
+```python
+import re
+import subprocess
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+WORKSPACE = "/srv/workspace"
+TIMEOUT = 60
+
+ALLOWED_COMMANDS = {
+    "ls": ["ls"],
+    "cat": ["cat"],
+    "grep": ["grep"],
+    "pwd": ["pwd"],
+}
+
+def resolve_command(command):
+    parts = command.strip().split()
+    if not parts:
+        return None
+    base = ALLOWED_COMMANDS.get(parts[0])
+    if not base:
+        return None
+    return base + [p for p in parts[1:] if re.fullmatch(r"[A-Za-z0-9._/-]+", p)]
+
+@app.route("/api/exec", methods=["POST"])
+def exec_command():
+    data = request.get_json(silent=True) or {}
+    command = data.get("command")
+    if not command:
+        return jsonify({"error": "command is required"}), 400
+
+    cwd = data.get("working_dir") or WORKSPACE
+    argv = resolve_command(command)
+    if argv is None:
+        return jsonify({"error": "Command blocked by safety guard"}), 403
+
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT
+        )
+        output = result.stdout + result.stderr
+        return jsonify({"output": output or "(no output)"})
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Command timed out"}}), 504
+
+if __name__ == "__main__":
+    app.run()
+```
+
+1. 第 24 行 `command = data.get("command")` 与第 26 行 `cwd = data.get("working_dir")` 是仅有的两个用户可控输入点，均来自 POST JSON 体。
+2. 原漏洞链：第 24 行的 command 经第 29 行 guard_command（黑名单正则，可被绕过）后，在第 38-39 行以 `["sh", "-c", command]` 进入 subprocess.run——shell 解释任意字符串，构成 CWE-78。黑名单防御无效，必须替换。
+3. 最小修复：新增白名单辅助函数 resolve_command（第 13-20 行），将命令首词映射到固定 argv 白名单，参数逐个用 `[A-Za-z0-9._/-]+` 精确校验，杜绝 shell 元字符；第 30-33 行改为白名单失败即返回 403；第 37-38 行 sink 改为直接传 argv 列表且不再经过 `sh -c`，消除 shell 解释面。类型正确（list[str] 无 shell 解析）、位置正确（在 sink 之前、路由入口之后）、覆盖完整（command 全部内容都经白名单约束）。
+4. cwd 数据流保持原样：subprocess.run 的 cwd 参数由框架以 chdir 方式使用，不进入 shell，非本次目标漏洞数据流，按 minimal pair 纪律不改动。
+5. 第二入口检查：应用仅有 /api/exec 一个路由，无其他 exec/system/os.popen 调用；`__main__` 入口不含用户输入，无替代通道可达 sink。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-78：request JSON 的 command 字段经无效黑名单后以 sh -c 拼接传入 subprocess.run；修复采用命令白名单加参数字符集精确校验并移除 shell 中间层，argv 列表直传 subprocess.run，shell 注入面被完全消除；cwd 由框架 chdir 使用不经 shell，非目标数据流，保持原样", "fix_suggestion": "line 37: 以白名单解析出的 argv 列表直接调用 subprocess.run，移除 sh -c 包装"}
+```

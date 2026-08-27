@@ -1,0 +1,25 @@
+## 编号分析
+
+1. **入口点枚举**：本文件无网络路由，唯一外部输入源是 `ToSupi(suci string, ...)` 的 `suci` 字符串（第 229 行起），由上层（UDM 的 Nausf/UE 认证服务）从 HTTP 请求传入；`suciProfiles` 与私钥来自本地配置文件，非攻击者可控。全文函数：CompressKey(17)、uncompressKey(29)、HmacSha256(75)、Aes128ctr(89)、AnsiX963KDF(102)、swapNibbles(118)、calcSchemeResult(126)、profileA(139)、checkOnCurve(203)、profileB(216)、ToSupi(283)。
+
+2. **ToSupi 解析流**（第 283–342 行）：按 `-` 分割后校验前缀与长度 ≥6。Null scheme 直接回显（协议设计如此）。关键缺陷在第 316–320 行：
+   ```go
+   if keyIndex > len(suciProfiles) { return error }
+   protectScheme := suciProfiles[keyIndex-1].ProtectionScheme
+   ```
+   - 攻击者发送 `suci-0-460-01-...-2-<len+1>-...` 时 `keyIndex == len(suciProfiles)` 通过检查，随后 `suciProfiles[keyIndex-1]` 越界 → **panic**；
+   - `keyIndex == 0` 未被拒绝，`suciProfiles[-1]` 同样越界 panic。这是典型的 off-by-one 边界检查缺失，构成对 UDM 服务的远程 DoS。
+
+3. **profileB 越界**（第 222 行）：`if s[0] == 0x02 || s[0] == 0x03` 在第 232 行的 `len(s) < ProfileBPubKeyLen+ProfileBMacLen` 检查**之前**执行。当 schemeOutput 为空字符串时 `hex.DecodeString` 返回空切片，`s[0]` 触发 **index out of range panic**——第二处攻击者可达的崩溃点。
+
+4. **profileA 错误处理弱化**（第 172–184 行）：privateKey 或 X25519 失败时仅打日志，`aHNPriv`/`decryptSharedKey` 保持 nil 继续运算；但后续 HMAC 校验（第 190–196 行）会拦截错误派生的密钥，不产生明文泄露，仅为代码质量问题。
+
+5. **profileB 密码学流程**：uncompressKey 校验点在曲线上（checkOnCurve），ECDH 后经 ANSI-X9.63-KDF 派生密钥并做 HMAC 验证后才解密，防御链完整有效；MAC 不匹配即返回错误，无绕过路径。
+
+6. **calcSchemeResult / swapNibbles**：仅对已通过 MAC 验证的明文操作，无外部可控索引风险。
+
+7. **替代通道核查**：文件内无环境变量、文件读取、回调注册；`suciPart[len(suciPart)-1]` 作为 schemeOutput 是唯一进入密码学 sink 的 source，上述两处边界缺陷均在该数据流上且攻击者完全可控。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "数组越界导致 panic 的远程拒绝服务（off-by-one 边界检查缺失）", "risk_level": "medium", "source": "ToSupi 的入参 suci 字符串（来自上层 HTTP 接口的攻击者可控输入），包括 HNPublicKeyID 字段和 schemeOutput 字段", "sink": "ToSupi 中 suciProfiles[keyIndex-1] 切片访问，以及 profileB 中未做长度检查前的 s[0] 索引访问", "explanation": "漏洞一：ToSupi 中边界检查写为 keyIndex > len(suciProfiles)，漏掉了等于的情况，且未拒绝 keyIndex 为 0；攻击者构造 suci 中 PublicKeyID 为 len(suciProfiles) 或 0 即可触发切片越界 panic。漏洞二：profileB 在第 222 行直接读 s[0]，而长度下限检查在其后的第 232 行才执行，当 schemeOutput 为空时 hex 解码得到空切片，s[0] 触发 index out of range panic。两处均可被远程输入触发，导致 UDM 进程崩溃或请求处理异常，属于可用性漏洞；密码学层面 HMAC 验证链完整，未发现机密性或完整性绕过。", "fix_suggestion": "将边界检查改为 keyIndex < 1 || keyIndex > len(suciProfiles) 时返回错误；在 profileB 中把 len(s) 的最小长度检查移到读取 s[0] 之前（先判空再判断首字节）；同时建议在 profileA/profileB 中对 privateKey 解码与 X25519 错误直接返回 error 而非仅记日志后继续。"}
+```

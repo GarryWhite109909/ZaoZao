@@ -1,0 +1,30 @@
+## 编号分析（全文逐函数）
+
+1. **第 253–300 行 `ToSupi` 入口**：外部输入 `suci` 字符串按 `-` 分割，是唯一 source。前缀为 `imsi`/`nai` 时直接回显（透传，无净化但仅拼接返回）。
+
+2. **第 276–282 行 keyIndex 边界检查**：`if keyIndex > len(suciProfiles)` —— 经典**差一错误（off-by-one）**：
+   - 当 `keyIndex == len(suciProfiles)` 时通过检查；
+   - 第 285 行 `suciProfiles[keyIndex-1]` 访问最后一个合法元素——此处恰好不越界；
+   - 但当 `keyIndex == 0` 时（攻击者构造 `suci-0-460-00-0-1-0-<output>` 中 HNPublicKeyID 为 `0`），`Atoi` 成功、`0 > len` 为假，检查通过，随后 `suciProfiles[0-1]` 即 **`suciProfiles[-1]` 触发 panic**。这是可达的拒绝服务：SUCI 由 UE/攻击者完全控制。
+
+3. **第 197–200 行 `profileB` 空切片访问**：`s[0]` 在长度检查（第 214 行）之前执行。若 schemeOutput 为空字符串则 `hex.DecodeString` 返回空切片，`s[0]` 直接 **index out of range panic**。同样由外部输入触发。
+
+4. **第 165–175 行 `profileA` 错误路径继续执行**：`hex.DecodeString(privateKey)` 或 `curve25519.X25519` 失败时仅打日志，`aHNPriv`/`decryptSharedKey` 保持 nil 继续向下；nil 共享密钥进入 KDF 后 `kdfKey` 长度不足，第 178–180 行切片会 panic。不过 privateKey 来自配置文件而非网络输入，实际可触发性取决于配置错误，属次级缺陷。
+
+5. **加密正确性核查（非漏洞）**：Profile A/B 均先验证 HMAC（第 183、243 行）再解密，MAC 覆盖密文，密钥经 X25519+ECC-KDF 派生，无 ECB/nonce 重用问题；`uncompressKey` 对无效点返回 nil 并被检查（第 226 行）。密码学流程本身符合 TS 33.501。
+
+6. **Null scheme 透传（第 273 行）**：scheme=0 时直接把最后一段拼入 SUPI 返回，无格式校验，可能让非法字符进入下游 IMSI 处理逻辑，属输入校验不足的次要问题。
+
+**结论**：主要漏洞为 ToSupi 第 276 行边界检查遗漏 `keyIndex == 0` 及 profileB 第 199 行先取 `s[0]` 后查长度，均为外部可控输入导致的运行时 panic（DoS），CWE-125/CWE-787 类越界（此处表现为负索引/空索引 panic）。
+
+```json
+{
+ "has_vulnerability": true,
+ "vulnerability_type": "CWE-125 越界读取 / CWE-20 输入校验不当（导致 panic 拒绝服务）",
+ "risk_level": "中",
+ "source": "line 253: ToSupi 的外部输入 suci 字符串（来自 UE/网络的 SUCI）",
+ "sink": "line 285: suciProfiles[keyIndex-1] 与 line 199: profileB 中 s[0]",
+ "explanation": "line 276 的检查 if keyIndex > len(suciProfiles) 未排除 keyIndex==0；攻击者发送 HNPublicKeyID 为 0 的 SUCI 时 Atoi 成功且检查通过，line 285 访问 suciProfiles[-1] 触发 index out of range panic。另外 line 199 在 line 214 长度检查之前访问 s[0]，当 schemeOutput 为空时 hex 解码得到空切片同样 panic。两者均可由远程输入稳定触发进程崩溃（DoS）。错误路径上 line 165-175 失败后继续用 nil 密钥运算也可能引发切片越界。",
+ "fix_suggestion": "line 276 改为 if keyIndex < 1 || keyIndex > len(suciProfiles) 返回错误；profileB 将 s[0] 的判断移到 len(s) 长度校验之后并增加 len(s)==0 检查；profileA/profileB 中 hex.DecodeString 与 X25519 出错时应立即 return err 而非仅记录日志后继续"
+}
+```

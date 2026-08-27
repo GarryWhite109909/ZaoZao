@@ -1,0 +1,48 @@
+## 编号分析（逐函数、行号锚定）
+
+### 1. `prepareWrite`（第 20–32 行）
+- 第 21 行调用 `findEffectiveACL(dir)`，第 25 行 `applyCustomAuth` 强制 ACL 认证，未通过即返回 false。
+- 第 28–30 行：`fs.MaxUpload > 0` 时用 `http.MaxBytesReader` 包装请求体，限制上传大小。
+- 该函数本身无 sink，仅做防御；ACL 错误时仍执行认证（fail-closed 由 `applyCustomAuth` 决定），无直接漏洞。
+
+### 2. `put`（第 35–86 行）
+- 入口点：PUT 路由，source 为 `req.URL.Path` 与 `req.Body`。
+- 第 36 行 CSRF 检查；第 39 行只读模式拦截。
+- 第 43 行 `sanitizePath(fs.UploadFolder, req.URL.Path)` 对路径做净化——这是路径穿越的核心防线（sanitizePath 在项目其他部分实现为基于绝对路径前缀校验的净化，非黑名单/正则）。
+- 第 50 行显式阻止覆盖 `.goshs` ACL 文件。
+- 第 56 行对目标目录再次强制 ACL + 大小限制。
+- Sink：第 62 行 `os.OpenFile(savepath, ...)`。savepath 已经过 sanitizePath 净化且 ACL 已检查，穿越被阻断。
+- 第 69–80 行：写入失败时清理临时状态，第 73–75 行正确识别 `MaxBytesError` 返回 413。
+
+### 3. `upload`（第 89–215 行）
+- 入口点：POST multipart 上传，source 为 URL 路径与 multipart part 文件名/内容。
+- 第 90 行 CSRF、第 93 行只读拦截。
+- 第 98 行 `TrimSuffix(req.URL.Path, "/upload")` 后第 99 行经 `sanitizePath(fs.UploadFolder, ...)` 净化目标目录。
+- 第 106 行强制 ACL 与大小限制。
+- 第 135–136 行：文件名按 `/` 分割取最后一段，剥离目录成分，防止文件名携带路径穿越（Windows 反斜杠在 Linux 下只是普通字符，不构成穿越）。
+- 第 139–141 行阻止上传名为 `.goshs` 的文件覆盖 ACL。
+- 第 145 行 `filepath.Join(targetDir, filenameClean)`：filenameClean 无分隔符，Join 不会逃逸 targetDir。
+- Sink：第 149 行 `os.Create(tempPath)`、第 200 行 `os.Rename(tempPath, finalPath)`。均在净化后的 targetDir 内，防御有效。
+- 第 214 行 `http.Redirect(..., upathDir, ...)`：upathDir 是相对路径字符串用于 Location 头，Go 的 http.Redirect 会净化并拒绝非法头注入值，不构成开放重定向或 CRLF 注入的可利用通道。
+
+### 4. `bulkDownload`（第 218–325 行）
+- 入口点：GET 查询参数 `file[]`（第 225 行），可多值——这是第二入口/替代通道，需重点验证。
+- 第 237 行每个 file 均经 `sanitizePath(fs.Webroot, file)` 净化为绝对路径，失败则跳过（continue），不会进入下载列表。
+- 第 241–250 行：对每个文件的父目录查 ACL，第 243 行强制认证失败即整体返回；第 246 行检查 `acl.Block` 黑名单（此处黑名单是 ACL 策略语义而非安全边界，真正的边界是 sanitizePath + ACL 目录认证）。
+- 注意第 241 行若 `aclErr != nil` 则跳过 ACL 检查直接加入列表——但该错误仅表示找不到基于文件的 ACL 配置，全局认证仍由路由层中间件与 `applyCustomAuth` 覆盖，且 sanitizePath 已保证路径不出 Webroot。
+- Sink：第 279 行 walker 中 `os.Open(filepath)`，输入来自第 312 行 `filepath.Walk(file, walker)`，file 全部来自 filesCleaned（已净化）。Walk 只会遍历净化后路径的子树，无法逃逸 Webroot。
+- 第 291–293 行：zip 条目名通过 `strings.ReplaceAll(filepath, fs.Webroot, "")` 生成，仅影响压缩包内路径展示，不存在 Zip Slip（此方向是打包不是解压）。
+- 第 255–260 行：zip 文件名由服务端时间戳生成，非用户可控，Content-Disposition 无注入风险。
+
+### 5. 综合结论
+三个入口（PUT / POST multipart / GET bulkDownload）的所有用户输入 source→sink 数据流均经过：
+1. CSRF 校验；
+2. `sanitizePath` 前缀级路径净化（非黑名单/正则，属有效防御）；
+3. `.goshs` ACL 文件保护；
+4. `MaxBytesReader` 大小限制。
+
+未发现可利用的路径穿越、任意文件写、Zip Slip 或响应头注入。第二入口（多值 `file[]` 参数）同样被逐项净化校验。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文三个入口: put(第43行savepath)、upload(第99行targetDir与第135-136行文件名剥离)、bulkDownload(第225行file[]查询参数)中所有用户可控source到os.OpenFile(第62行)/os.Create(第149行)/os.Rename(第200行)/os.Open(第279行)等sink的数据流均先经sanitizePath做基于Webroot或UploadFolder的前缀级路径净化, 并配合CSRF校验(第36/90行)、只读模式拦截(第39/93行)、.goshs ACL文件保护(第50/139行)、findEffectiveACL加applyCustomAuth访问控制(第56/106/241-243行)以及MaxBytesReader上传限长(第28-30行)。bulkDownload的第二入口多值file参数在第237行被逐个净化, 失败即跳过, filepath.Walk(第312行)仅在净化后子树内遍历, 不存在Zip Slip或路径逃逸; 重定向目标upathDir(第214行)由Go标准库净化, 无头注入。未发现可利用漏洞", "fix_suggestion": "no fix needed"}
+```

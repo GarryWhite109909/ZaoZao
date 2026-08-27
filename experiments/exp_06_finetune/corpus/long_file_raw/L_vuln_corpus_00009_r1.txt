@@ -1,0 +1,97 @@
+## 逐函数编号分析（全文通读，行号锚定）
+
+### 入口点枚举
+
+本文件是 ESM 模块（第 1-3 行 import），唯一导出入口是第 46 行的默认导出函数 `function (js, options = {})`。入口数据面有两个：
+
+1. **`js` 参数**：一个已解析的 gettext/PO 转换中间对象，包含 `js.translations` 与 `js.headers.Language`。其内容最终来自外部 `.po` 文件内容（msgid/msgstr/comments.reference 均为翻译文件中攻击者可控的任意字符串）。
+2. **`options` 参数**：调用方传入的配置对象（keyseparator、locale、keyasareference、skipUntranslated、compatibilityJSON、persistMsgIdPlural、ignoreCtx 等），部分字段可被上游 CLI/API 间接控制。
+
+辅助依赖：第 1 行 `getPlurals(options)`（options.js）、第 2 行 `cldrConv`（静态表）。以下逐一分析。
+
+---
+
+### 函数 1：`isFuzzy`（第 5 行）
+
+`(translation) => !!translation.comments && translation.comments.flag === 'fuzzy'`
+
+只读比较，无赋值 sink。`comments.flag` 是 source 可控字符串，但仅用于布尔判断，无数据流到危险操作。**无漏洞**。
+
+### 函数 2：`toArrayIfNeeded`（第 7 行）
+
+依据 `value.indexOf('\n')` 决定是否 `split('\n')`。纯字符串处理，返回值流向后续对象值位置（见函数 4/6），不作为键使用。**无漏洞**。
+
+### 函数 3：`emptyOrObject`（第 11-21 行）
+
+关键点在第 19 行与第 16 行：
+
+```js
+return { [key]: toArrayIfNeeded(key/value, options) }
+```
+
+`key` 在两条调用路径上分别来自：
+- 第 30 行 `emptyOrObject(targetKey, ...)` —— 非复数路径；
+- 第 43 行 `emptyOrObject(pkey, ...)` —— 复数路径，`pkey = targetKey + pluralSuffix`。
+
+而 `targetKey` 的来源链是本漏洞的核心（见函数 6 分析）：它直接取自 `data[ctx][key]` 的 **key**，即 PO 文件中的 `msgid`，或经 `keyseparator` 切分后的最后一段，或拼接 ctx。**source（PO 文件中的 msgid 字符串）→ 计算属性名 `{[key]: ...}` → 第 66 行 `Object.assign(appendTo, newValues)`**。`Object.assign` 使用 `[[Set]]` 语义，当 key 为 `'__proto__'` 时会触发目标对象的原型 setter——这是第一条污染通道。
+
+### 函数 4：`getI18nextPluralExtension`（第 23-25 行）
+
+根据 `ext.numbers.length` 返回 `''` / `'_plural'` / `` `_${i}` ``。`ext` 来自 `plurals[locale...]`（第 34 行），是静态 CLDR 表查询结果，不可控注入键名。**无漏洞**。
+
+### 函数 5：`getGettextValues`（第 27-45 行）
+
+- 第 28 行 `values = value.msgstr`：source 数据（翻译内容）。
+- 第 33-35 行：`locale.toLowerCase()`、`locale.split(/_|-/)[0]` 仅用于查表索引，查不到则回落 `plurals.dev`，无写入。
+- 第 36-44 行循环：`pluralSuffix` 由静态表推导；第 38-41 行 compatibilityJSON v4 分支同样只读 `cldrConv[locale]`，查不到就保持原 suffix，无绕过写路径。
+- 第 42 行 `pkey = targetKey + pluralSuffix`：targetKey 未净化地进入 pkey。
+- 第 43 行进入 `emptyOrObject` → 计算键。
+
+**结论：本函数是 source→sink 流水线的中间站，未做任何键名过滤/白名单校验。**
+
+### 函数 6：默认导出主函数（第 46-91 行）——核心漏洞区
+
+**入口解析：**
+- 第 47 行 `JSON.parse(JSON.stringify(js.translations))`：深拷贝，但拷贝的是普通数据结构，不消除后续污染风险（反而说明作者意识到结构来自外部）。
+- 第 48-72 行 `options.keyasareference` 分支：
+  - 第 51 行遍历 `Object.keys(data[ctx])`，key 即 msgid（source）。
+  - 第 53 行 `comments.reference.split(/\r?\n|\r/)` 得到 `id` 数组——**reference 注释是完全由 PO 文件作者控制的第二入口**。
+  - 第 55 行 `data[ctx][id] = x`：以未净化的 `id` 作为属性名写入对象。若 `id === '__proto__'`，此处即向该对象的 `__proto__` 属性赋值（`[[Set]]` 触发原型 setter），把整个翻译条目对象挂到原型链上——**这是第二条独立污染通道，且早于主循环执行**。
+  - 第 57-63 行对 `x.msgstr[i]` 的回填（空串替换为 msgid/msgid_plural）只是值修改，不构成额外 sink。
+  - 第 68-70 行删除旧键，防御无效性说明：`delete data[c][k]` 只清理原键，不能撤销第 55 行已经发生的原型写入。
+
+**主循环（第 74-89 行）：**
+- 第 78-79 行：`separator = options.keyseparator || '##'`，`ctxSeparator` 同理。分隔符本身来自 options，但真正的问题在于切分后的片段被当作对象路径使用。
+- 第 85-94 行：`key.indexOf(separator) > -1` 时 `key.split(separator)`，随后 while 循环：
+
+```js
+appendTo[keys[x]] = appendTo[keys[x]] || {}
+appendTo = appendTo[keys[x]]
+```
+
+这是经典的**递归下降式对象路径写入**。当 PO 文件中某条 msgid 形如 `a##__proto__##polluted`（在 separator 为默认 `##` 时），第二次迭代 `keys[x] === '__proto__'`：读取 `appendTo['__proto__']` 得到 `Object.prototype`（truthy，故不会覆盖），然后 `appendTo = Object.prototype`；最后一次迭代把 `targetKey` 设为 `'polluted'`，第 66 行 `Object.assign(appendTo, newValues)` 即执行 `Object.prototype.polluted = <msgstr 内容>` ——**全局原型污染达成**。攻击者可进一步污染 `Object.prototype` 上的功能性属性（如某些库检查的配置项），在 Node 服务进程中造成 RCE 或逻辑绕过（取决于下游消费方）。
+
+- 第 88 行 ctx 拼接 `${ctxSeparator}${m}`：ctx 同样来自 PO 文件的 msgctxt，可作为前缀注入更多路径段，属替代通道。
+- 第 90-93 行 `persistMsgIdPlural` 分支：`targetKey = ${msgid}|#|${msgid_plural}`，msgid_plural 也是 source 可控，再次汇入同一 sink。
+- 第 65-66 行：`getGettextValues(...)` 结果 `Object.assign(appendTo, newValues)` —— 最终汇聚 sink，同时具备计算键 `'__proto__'`（来自 emptyOrObject 的 `{[key]:...}`）与显式路径写入两条污染机制。
+
+**防御有效性核查：**
+- 全文无任何对 `__proto__`、`constructor`、`prototype` 的黑名单校验；
+- 无 `Object.create(null)`、无 `Map` 替代、无 `hasOwnProperty` 检查；
+- `JSON.parse(JSON.stringify(...))` 不阻止后续以字符串键写入原型；
+- 正则仅用于换行/分隔符切分，非安全过滤。
+按分析要求，即便存在此类黑名单也不视为有效防御——此处连黑名单都没有。
+
+**第二入口与替代通道确认：**
+1. `comments.reference`（第 53-55 行）→ `data[ctx][id] = x`：独立于 keyseparator 通道；
+2. msgctxt（第 88 行）拼入 targetKey；
+3. `persistMsgIdPlural`（第 92 行）用 msgid_plural 重写 targetKey；
+4. options.keyseparator 若被外部设为含 `.` 等字符亦可构造路径，但默认 `##` 已足够利用。
+
+三条通道全部汇入第 66 行 `Object.assign(appendTo, ...)` 这同一个 sink，均无净化。
+
+---
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1321 Prototype Pollution", "risk_level": "high", "source": "line 51/53/85: PO 文件可控的 msgid、msgctxt、comments.reference 字符串（以及 line 92 的 msgid_plural）", "sink": "line 66: Object.assign(appendTo, newValues)，配合 line 87-88 的 appendTo[keys[x]] 路径写入与 line 55 的 data[ctx][id] = x", "explanation": "PO 文件中的 msgid 经 keyseparator 切分后逐段作为对象路径下降（appendTo[keys[x]] = appendTo[keys[x]] || {}），当片段为 __proto__ 时 appendTo 变为 Object.prototype，最终 Object.assign 将攻击者控制的 msgstr 写入全局原型；此外 comments.reference 拆分出的 id 直接作为属性名执行 data[ctx][id] = x，构成第二条独立污染通道；persistMsgIdPlural 与 msgctxt 拼接为替代通道。全文无任何 __proto__/constructor 黑名单、无 Object.create(null)、无 hasOwnProperty 校验，JSON.parse(JSON.stringify) 深拷贝也不能阻止后续字符串键的原型写入，防御完全缺失。", "fix_suggestion": "line 87-88 与 line 55: 对每个路径片段和动态键名校验其不属于 ['__proto__','constructor','prototype']，或改用 Object.create(null) 创建中间对象并用 Map 存储键，或在赋值处使用 Object.defineProperty 配合 enumerable/writable 控制并拒绝危险键"}
+```

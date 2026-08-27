@@ -1,0 +1,30 @@
+## 编号分析
+
+1. **第 1–30 行**：包声明、导入、错误类型定义，无外部输入入口。
+2. **第 32–50 行（GenerateScratchToken）**：使用 `util.CryptoRandomBytes(6)` 生成 scratch token，盐用 `CryptoRandomString`，哈希用 PBKDF2-SHA256（第 56 行 HashToken），随机性与存储均安全。
+3. **第 58–64 行（VerifyScratchToken）**：比较使用 `subtle.ConstantTimeCompare`，无时序侧信道；token 长度检查存在。无漏洞。
+4. **第 66–69 行（getEncryptionKey）——关键点**：加密密钥由 `md5.Sum([]byte(setting.SecretKey))` 派生。
+   - source：全局配置 `setting.SecretKey`；
+   - sink：第 74 行 `SetSecret` 中 `secret.AesEncrypt(t.getEncryptionKey(), ...)` 及第 90 行 `ValidateTOTP` 的 `AesDecrypt`。
+   - 问题：MD5 输出仅 128 位，作为 AES 密钥强度不足（若 AES-256 则密钥被截断/填充）；MD5 已被视为弱哈希，且直接对低熵配置密钥做单轮快速哈希派生，无 KDF（如 PBKDF2/scrypt/HKDF），易受离线暴力破解——一旦数据库泄露（2FA Secret 列为密文），攻击者可低成本爆破 SECRET_KEY 解出所有用户 TOTP 种子，完全绕过 2FA。
+5. **第 71–77 行（SetSecret）**：AES 加密后 base64 存储，加密本身实现正确，但依赖上述弱密钥。
+6. **第 79–93 行（ValidateTOTP）**：解密失败有明确错误返回，无 panic 或绕过路径；TOTP 校验交给 `totp.Validate`，无重放限制但 `LastUsedPasscode` 字段未在此文件使用（重放防护在调用方，不在本文件证据范围内）。
+7. **第 95–120 行（NewTwoFactor / UpdateTwoFactor / GetTwoFactorByUID / HasTwoFactorByUID）**：参数化查询（`Where("uid=?", uid)`），无 SQL 注入；uid 为 int64，无注入面。
+8. **第 122–130 行（DeleteTwoFactorByID）**：删除条件同时绑定 `id` 与 `UID: userID`，防止越权删除他人记录，防御有效。
+9. **第 132–139 行（HasTwoFactorOrWebAuthn）**：纯查询组合，无风险。
+
+**替代通道核查**：本文件无 HTTP 路由、无环境变量读取、无回调；唯一外部影响源是 `setting.SecretKey`（配置文件/环境）。全文无黑名单/正则过滤类伪防御。
+
+**结论**：唯一实质弱点是第 104 行用 MD5 直接派生 AES 加密密钥（弱 KDF / 弱原语，CWE-327/CWE-916），属加密实现缺陷而非可远程利用漏洞，风险中低。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-327 (Use of a Broken or Risky Cryptographic Algorithm) / CWE-916 (Weak Password Recovery Key Derivation)",
+  "risk_level": "medium",
+  "source": "line 104: setting.SecretKey 全局配置密钥",
+  "sink": "line 74 SetSecret 的 AesEncrypt 与 line 90 ValidateTOTP 的 AesDecrypt",
+  "explanation": "getEncryptionKey 用单轮 md5.Sum 对 setting.SecretKey 派生 AES 密钥 -> 无 PBKDF2/scrypt 等慢 KDF 且 MD5 仅 128 位 -> 数据库泄露后攻击者可离线高速爆破 SECRET_KEY 并解密所有用户的 TOTP 种子 -> 完全绕过双因素认证",
+  "fix_suggestion": "line 104: 改用标准 KDF 如 pbkdf2.Key([]byte(setting.SecretKey), salt, 高迭代次数, 32, sha256.New) 或 HKDF 派生 256 位密钥，并为每条记录使用独立随机盐"
+}
+```

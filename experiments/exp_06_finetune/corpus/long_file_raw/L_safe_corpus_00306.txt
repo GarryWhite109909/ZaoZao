@@ -1,0 +1,20 @@
+## 编号分析
+
+1. **第 96-103 行 `processWithCache`**：以 `templateName` 从配置的 TemplateLoader 取模板并执行。模板来源是 `templateLoaders`（第 76-79 行初始化为 `XDocReportEntryTemplateLoader`），即从上传文档（docx/odt）内部条目读取内容作为 FreeMarker 模板。**source：用户可上传/控制的文档内容；sink：`process()` 中 `environment.process()`（第 141 行）执行模板指令。**
+
+2. **第 105-113 行 `processNoCache`**：直接把传入 Reader（同样来自文档条目）包装成 `Template` 并执行，是同一数据流的第二入口，无任何过滤。
+
+3. **防御验证（第 195-206 行）**：`setFreemarkerConfiguration` 中设置 `NEW_BUILTIN_CLASS_RESOLVER_KEY = "safer"`，阻止 `?new` 实例化危险类（如 `freemarker.template.utility.Execute`）。但：
+   - 该设置仅在调用 `setFreemarkerConfiguration` 时生效；若调用方自行构造并直接使用 `getFreemarkerConfiguration()` 返回的默认配置，默认路径（第 226-236 行 `getDefaultConfiguration`）确实会走到该设置，此点覆盖；
+   - 第 203-205 行 `catch (Exception e) {}` 静默吞掉异常——在旧版 FreeMarker 不支持该 key 时，防护完全失效且无任何告警；
+   - `"safer"` 解析器只限制 `?new`，不阻止其他 SSTI 利用面：模板内 `?eval`/`?interpret`、通过 BeansWrapper 访问对象方法链、文件读取类内建操作等仍可能被滥用；且模板本身来自不可信文档内容，属于典型的模板注入面。
+
+4. **第 118-131 行 `getReader` 与第 243-263 行 `process(String,...)`**：前者只是拼接 escape 指令，不构成安全边界；后者从 classpath 资源加载 `.ftl`，资源名由代码拼接，非外部可控路径，无路径穿越问题。
+
+5. **第 160-183 行 `extractFields`/`extractVariables`**：仅解析 AST 提取字段名，不执行模板，无 sink。
+
+6. **结论**：存在真实漏洞——不可信文档内容被当作 FreeMarker 模板执行（SSTI）。现有 `"safer"` 缓解降低了 RCE 直接可达性，但静默失败与残余攻击面使其不能视为有效防御。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "SSTI 服务端模板注入", "risk_level": "high", "source": "用户上传文档(docx/odt)内的文本内容, 经 XDocReportEntryTemplateLoader 或 processNoCache 的 Reader 进入", "sink": "第141行 environment.process() 执行模板指令", "explanation": "processWithCache(第96行)与 processNoCache(第105行)均把文档条目内容当作 FreeMarker 模板解析执行, 攻击者可在上传文档中嵌入 [#assign ...] 等指令实现模板注入。第195-206行的 safer 类解析器仅拦截 ?new 内建, 且第203-205行静默吞掉配置异常导致旧版本下防护完全失效; ?eval/?interpret 及对象方法链等替代通道未被阻断, 黑名单式缓解不构成有效防御。", "fix_suggestion": "升级到支持 NEW_BUILTIN_CLASS_RESOLVER 的 FreeMarker 版本并将解析器设为 unsafe 之外的严格模式(如 WhitelistTemplateClassResolver); 对配置失败抛出异常而非吞掉; 若业务不需要在文档中执行模板指令, 应禁用从文档内容提取模板的功能或对文档正文做指令字符白名单校验; 同时考虑改用非图灵完备的占位符引擎处理不可信文档。"}
+```

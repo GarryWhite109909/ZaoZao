@@ -1,0 +1,27 @@
+## 编号分析
+
+1. **第 1–20 行（模块头与导入）**：仅导入类型与内部模块，无网络、文件、子进程等危险 sink。
+
+2. **第 22–40 行（Experimental 数据类）**：字段 `task_metadata`、`_client_capabilities`、`_session`、`_task_support` 均为框架注入的上下文对象，非直接用户输入 source。
+
+3. **第 42–110 行（validate_task_mode / validate_for_tool / can_use_tool）**：纯校验逻辑，比较枚举值 `TASK_REQUIRED`/`TASK_FORBIDDEN`，无数据流进入危险操作；错误消息为固定字符串，不含用户输入，无格式化注入。
+
+4. **第 112–200 行（run_task 前半：参数校验）**：
+   - 第 152–160 行：检查 `_task_support`、`_session`、`task_metadata` 非空，防御有效。
+   - 第 165 行：`support.store.create_task(self.task_metadata, task_id)` —— `task_id` 由调用方传入，但本文件未做任何校验/授权检查。若上层允许客户端指定任意 task_id 且 store 未隔离会话，可能存在任务越权/覆盖（IDOR 类），但该风险取决于 `store.create_task` 实现，本文件内无法证实，不作为确定漏洞。
+
+5. **第 167–172 行（ServerTaskContext 构造）**：传递 session/queue/handler 引用，无 sink。
+
+6. **第 174–183 行（execute 后台协程）**：
+   - 第 176–178 行：执行 `work(task_ctx)` 并在非终态时 `complete(result)` —— result 来自开发者提供的回调，非原始用户输入直通 sink。
+   - **第 179–181 行**：`except Exception as e: await task_ctx.fail(str(e))` —— 将任意异常的完整消息字符串发送给客户端。异常消息常包含内部路径、SQL 片段、堆栈相关细节，构成 source（内部异常）→ sink（返回给客户端的任务状态）的信息泄露流，且无任何脱敏/白名单处理。对应 CWE-209。
+
+7. **第 185–190 行（model_immediate_response → meta）**：调用方传入的字符串放入 `_meta[MODEL_IMMEDIATE_RESPONSE_KEY]` 返回给客户端。这是回显自身 API 参数，属于设计内透传，除非上游把不可信数据传入，否则不构成独立漏洞；但若服务端将客户端可控内容填入此参数并回显，需注意反射型注入由上层负责。
+
+8. **第二入口核查**：本文件唯一对外行为是 `run_task` 的返回值与后台任务状态更新；无路由、文件、环境变量读取，替代通道仅为 `task_id` 与 `str(e)` 两处，已覆盖。
+
+结论：全文最可证实的缺陷是第 180 行将原始异常文本透传给客户端（信息泄露）；`task_id` 无授权校验为潜在但依赖外部实现的次级问题。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-209", "risk_level": "low", "source": "line 179: except Exception as e 捕获的内部异常对象", "sink": "line 180: await task_ctx.fail(str(e)) 将异常原文写入返回给客户端的任务状态", "explanation": "后台 execute 协程捕获所有异常后未经脱敏直接把 str(e) 发送给客户端 -> 异常消息可能包含内部路径、依赖版本、查询语句等敏感实现细节 -> 造成信息泄露", "fix_suggestion": "line 180: 向客户端返回通用错误消息如 task failed, 仅将完整异常记录到服务端日志, 并对 task_id 增加会话归属校验"}
+```

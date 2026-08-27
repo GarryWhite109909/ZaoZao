@@ -1,0 +1,39 @@
+## 编号分析（全文逐函数）
+
+1. **第 33–60 行：三个黑名单常量**。全部为黑名单模式：`DEFAULT_RESTRICTED_PROPERTIES` 仅含 `class`；`DEFAULT_RESTRICTED_METHODS` 含 8 个方法名；`DEFERRED_EXECUTION_RESTRICTED_METHODS` 是延迟模式下可变操作黑名单。黑名单按题目要求视为可绕过，不构成有效防御。
+
+2. **第 62–78 行：构造器**。无输入，无风险。
+
+3. **第 80–99 行：getType / getValue**。source 为模板可控的 `property`（第 81、88 行），经 `validatePropertyName`（第 168 行）做精确名匹配后传入 `super.getValue`（第 90 行，sink）。防御仅是单元素黑名单；且 `getValue` 对返回结果做了 `instanceof Class ? null`（第 91 行）的兜底。但注意：属性名先经 `transformPropertyName`（第 183 行）做下划线转驼峰——若受限名单中的名字存在蛇形变体（如配置方写入 `restricted_properties` 而实际访问用驼峰，或反之），转换前后不一致即可绕过；且黑名单本身不完备（如未覆盖静态字段访问路径）。
+
+4. **第 101–110 行：isReadOnly / setValue**。同样依赖 `validatePropertyName` 的黑名单，写路径（setValue 第 108 行）在 readOnly=false 时允许模板修改任意非受限 bean 属性，属设计性风险。
+
+5. **第 112–152 行：invoke（核心入口）**。
+   - source：`method`、`base`、`params` 均来自模板表达式求值（EL 解析器回调）。
+   - 第 116–122 行：方法名黑名单检查，但仅在 `interpreter != null` 时才叠加用户配置的黑名单；若当前线程无 interpreter（异步/嵌套求值场景），自定义限制完全失效。
+   - 第 127–140 行：延迟执行黑名单，遗漏大量等效变异方法（如 `compute`、`computeIfAbsent`、`offer`、`addFirst`、`setLength` 等），可绕过。
+   - 第 142 行：`super.invoke(...)` 为最终 sink，反射调用任意公开方法。
+   - 第 144–149 行：对结果做 `isRestrictedClass` 检查，封堵了直接拿到 `Class`/`Method`/`ClassLoader` 等对象的链路——这是本类最有效的防御，但它只拦截“返回值”，不拦截调用过程本身的副作用。
+
+6. **第 154–186 行：findMethod 重写**。存在两个真实缺陷：
+   - 第 178–181 行：当参数类型都不匹配时，回退到 `potentialMethods.stream().findAny()`——即**任意挑选一个同名重载并调用**，参数类型不匹配也会进入 `super.invoke`，可能触发非预期的重载（类型混淆）；
+   - 第 174–176 行：varArgs 方法被选中时完全不校验实参类型与形参的可赋值性。
+   - 另外第 165 行 `checkAssignableParameterTypes` 中，若 `params.length < method.getParameterTypes().length` 会抛 `ArrayIndexOutOfBoundsException`（第 167 行 `params[i]`），构成可由模板触发的异常/DoS 点。
+
+7. **第 188–221 行：isRestrictedClass**。基于包名前缀 + 类型 instanceof 判断。包名前缀判断可用自定义包名或内部类路径规避（如通过第三方库对象间接持有 reflect 对象），属可绕过防御。
+
+## 数据流结论
+
+主数据流：模板表达式（source，EL 回调的 `method`/`base`/`params`）→ 黑名单精确匹配（无效防御，CWE-184 不完备黑名单）→ `super.invoke` 反射调用任意 public 方法（sink，第 142 行）。`isRestrictedClass` 只能阻断以 Class/reflect 对象为中转的经典链，无法阻断黑名单遗漏的方法名（尤其延迟模式变异方法、interpreter 为 null 时自定义限制失效），也无法阻断 `findAny` 导致的错误重载调用。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-184 不完备黑名单导致的沙箱绕过 / CWE-693 防护机制失效",
+  "risk_level": "高",
+  "source": "line 112-115: invoke 入口处来自模板表达式的 method/base/params 参数",
+  "sink": "line 142: super.invoke 反射调用任意公开方法",
+  "explanation": "模板可控的方法名经第 117-125 行黑名单精确匹配后被放行至第 142 行 super.invoke 执行反射调用。该防御为纯黑名单且不完备: (1) 第 128-139 行延迟执行黑名单遗漏 compute/computeIfAbsent/offer/addFirst/setLength 等等效变异方法; (2) 第 119-121 行当 JinjavaInterpreter.getCurrent 返回 null 时用户自定义受限方法完全不生效; (3) 第 155-185 行 findMethod 在参数不匹配时通过 findAny 任意选择同名重载并在 varArgs 分支跳过类型校验, 造成类型混淆与非预期调用; (4) 第 188-220 行 isRestrictedClass 基于包名前缀和 instanceof, 可被第三方对象中转绕过。攻击者可通过黑名单外的危险方法实现沙箱逃逸",
+  "fix_suggestion": "line 117: 将方法与属性过滤从黑名单改为白名单机制, 显式枚举允许调用的方法; 同时修复 findMethod 移除 findAny 回退分支并对 varArgs 强制参数类型校验"
+}
+```

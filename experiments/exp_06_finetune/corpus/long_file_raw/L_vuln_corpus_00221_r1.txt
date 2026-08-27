@@ -1,0 +1,32 @@
+## 编号分析（逐函数，锚定行号）
+
+1. **第 9–16 行 `VaultStatus` 结构体**：纯数据结构，`Name` 为外部可传入字段（来自控制器/配置），无任何校验逻辑。这是后续所有日志 sink 的 source。
+
+2. **第 18–21 行 `Key()`**：直接返回 `status.Name`，未做长度限制、字符白名单或转义。
+
+3. **第 24–32 行 `LogCreate()`**：第 25–27 行将未经校验的 `status.Name` 作为 `NewLogObject` 的 displayName 与 `status.LogKey()` 传入日志系统；若 `Name` 含换行符或控制字符，可注入伪造日志条目（CWE-117 日志注入）。防御：仅判空 `logObject == nil`，对内容零过滤——无效防御。
+
+4. **第 35–52 行 `LogModify()`**：
+   - 第 41–43 行：类型断言失败时调用 `Fatalf` 直接终止进程。若上游（如 zedagent 反序列化路径）传入错误类型对象，构成可触发的进程崩溃（CWE-248 未捕获异常/拒绝服务）。
+   - 第 45 行：`cmp.Diff(oldStatus, status)` 将完整状态差异写入日志，可能把敏感字段（加密密钥相关状态）落入持久化日志。
+   - 第 48–50 行：`errAndTime.Error` 原样拼入日志字段，同样无净化。
+
+5. **第 55–62 行 `LogDelete()` + 第 64–66 行 `LogKey()`**：与 LogCreate 同一模式，`Name` 直通日志 key 与消息，同一注入面。
+
+6. **第 69–77 行 `EncryptedVaultKeyFromDevice` 及其 Key()/LogCreate()/LogModify()/LogDelete()/LogKey()（第 79–116 行）**：`EncryptedVaultKey []byte` 是密钥材料；`LogCreate/LogDelete` 虽只打印名称不打印密钥本体，但 `Name` 同样未校验直通日志；`LogModify` 第 100–102 行同样的 `Fatalf` 崩溃点。
+
+7. **第 119–166 行 `EncryptedVaultKeyFromController` 全套方法**：完全重复上述模式——`Name` 未校验进入日志（第 129、139、149、159、164 行），`LogModify` 第 148–150 行存在同型 `Fatalf` 崩溃点。该类型经 zedagent 从控制器侧接收（注释明示），是远程可达的入口通道。
+
+**数据流汇总**：source = 控制器下发的 `Name` 字段（第 14、71、121 行等）→ 无任何过滤 → sink = 日志系统（`Noticef`、`AddField`、`LogKey` 拼接，多处）；次要流：错误类型对象 → `Fatalf` 进程退出。全文无黑名单/正则，也无有效防御，符合“黑名单视为无效”的验证要求。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-117 日志注入 / CWE-248 未处理异常导致拒绝服务",
+  "risk_level": "低",
+  "source": "line 14/71/121: 来自控制器经 zedagent 下发的 Name 字段及反序列化得到的接口对象",
+  "sink": "line 25-27/48-50/100-102/129-164: NewLogObject/EnsureLogObject 的 Noticef、AddField 及 LogKey 拼接，以及 LogModify 中的 Fatalf",
+  "explanation": "各类型的 Name 字段未经任何校验或转义即作为日志显示名和 LogKey 拼接进日志系统，攻击者控制的含换行符的 Name 可伪造日志条目掩盖审计痕迹 -> 同时 LogModify 在类型断言失败时直接 Fatalf 终止进程，若上游反序列化路径可注入错误类型对象则造成设备代理崩溃",
+  "fix_suggestion": "line 25 等: 对 Name 做字符白名单校验和长度限制后再用于日志与 LogKey，并将 Fatalf 改为记录错误后安全返回"
+}
+```

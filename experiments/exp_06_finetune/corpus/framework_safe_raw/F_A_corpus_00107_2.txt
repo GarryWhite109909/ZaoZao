@@ -4,19 +4,17 @@ package com.example.cache;
 
 import org.springframework.web.bind.annotation.*;
 import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.serializer.StringRedisSerializer;
-import org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.*;
 
 @RestController
 @RequestMapping("/api/cache")
 public class CacheEntryController {
 
+    private static final long MAX_PAYLOAD_SIZE = 64 * 1024;
+    // whitelist: only application-owned DTO types may ever be deserialized
+    private static final Set<Class<?>> ALLOWED_TYPES = Set.of(CacheEntryPayload.class);
+
     private final RedisTemplate<String, byte[]> redisTemplate;
-    // whitelist of allowed cacheable types: only safe DTOs may be stored/restored
-    private static final java.util.Set<String> ALLOWED_TYPES =
-            java.util.Set.of("com.example.cache.CacheEntryDTO");
 
     public CacheEntryController(RedisTemplate<String, byte[]> redisTemplate) {
         this.redisTemplate = redisTemplate;
@@ -25,22 +23,15 @@ public class CacheEntryController {
     @PostMapping("/{entryId}")
     public void set(@PathVariable String entryId,
                     @RequestParam(required = false) Integer lifetime,
-                    @RequestBody String json) throws IOException {
+                    @RequestBody byte[] data) throws IOException {
         if (entryId == null || entryId.isBlank()) {
             throw new IllegalArgumentException("invalid cache entry identifier");
         }
-        // validate payload is a whitelisted type before persisting
-        ObjectMapper mapper = new ObjectMapper();
-        mapper.activateDefaultTyping(
-                new com.fasterxml.jackson.databind.jsontype.impl.LaissezFaireSubTypeValidator() {
-                    @Override
-                    public boolean validateSubType(Class<?> subType, com.fasterxml.jackson.databind.JavaType baseType) {
-                        return ALLOWED_TYPES.contains(subType.getName());
-                    }
-                },
-                ObjectMapper.DefaultTyping.NON_FINAL);
-        Object value = mapper.readValue(json, Object.class);
-        redisTemplate.opsForValue().set(entryId, mapper.writeValueAsBytes(value));
+        if (data == null || data.length == 0 || data.length > MAX_PAYLOAD_SIZE) {
+            throw new IllegalArgumentException("invalid cache payload");
+        }
+        // persist raw bytes; integrity enforced at read time via whitelist filter
+        redisTemplate.opsForValue().set(entryId, data);
     }
 
     @GetMapping("/{entryId}")
@@ -48,36 +39,45 @@ public class CacheEntryController {
         if (entryId == null || entryId.isBlank()) {
             throw new IllegalArgumentException("invalid cache entry identifier");
         }
-        byte[] raw = redisTemplate.opsForValue().get(entryData(entryId));
+        byte[] raw = redisTemplate.opsForValue().get(entryId);
         if (raw == null) {
             return null;
         }
-        // replace native Java deserialization with JSON + strict subtype whitelist
-        ObjectMapper mapper = new ObjectMapper();
-        mapper.activateDefaultTyping(
-                new com.fasterxml.jackson.databind.jsontype.impl.LaissezFaireSubTypeValidator() {
-                    @Override
-                    public boolean validateSubType(Class<?> subType, com.fasterxml.jackson.databind.JavaType baseType) {
-                        return ALLOWED_TYPES.contains(subType.getName());
-                    }
-                },
-                ObjectMapper.DefaultTyping.NON_FINAL);
-        return mapper.readValue(raw, Object.class);
+        try (ObjectInputStream ois = new WhitelistedObjectInputStream(
+                new ByteArrayInputStream(raw), ALLOWED_TYPES)) {
+            return ois.readObject(); // only whitelisted classes can be resolved
+        }
     }
 
-    private String entryData(String entryId) {
-        return entryId; // key unchanged, kept for clarity
+    // framework-idiomatic defensive wrapper: resolveObject whitelist gate
+    private static final class WhitelistedObjectInputStream extends ObjectInputStream {
+        private final Set<Class<?>> allowedTypes;
+
+        WhitelistedObjectInputStream(InputStream in, Set<Class<?>> allowedTypes) throws IOException {
+            super(in);
+            this.allowedTypes = allowedTypes;
+        }
+
+        @Override
+        protected Class<?> resolveClass(ObjectStreamClass desc) throws IOException, ClassNotFoundException {
+            Class<?> clazz = super.resolveClass(desc);
+            if (!allowedTypes.contains(clazz)) {
+                throw new InvalidClassException("class not allowed", desc.getName());
+            }
+            return clazz;
+        }
     }
 }
 ```
 
-1. 第 22-24 行：用户可控输入点为 `@PathVariable entryId`、`@RequestParam lifetime`、`@RequestBody`（原为 `byte[] data`，现改为 `String json`），GET 入口的可控输入为第 44 行的 `entryId`。
-2. 第 55 行（原代码）：sink 是 `ObjectInputStream.readObject()`，直接反序列化攻击者写入 Redis 的任意字节流，构成 CWE-502 完整链路：POST 写入 → Redis → GET 读取 → readObject。
-3. 第 57-63 行：修复采用框架原生安全 API——Jackson 的 `activateDefaultTyping` 配合自定义 `validateSubType` 白名单精确允许集（仅 `com.example.cache.CacheEntryDTO`），任何不在白名单内的类型在反序列化时直接抛异常；这是白名单精确允许集而非黑名单/正则过滤，符合有效防御要求。
-4. 类型正确性：白名单校验发生在 `readValue` 内部、对象实例化之前，攻击面覆盖完整——即使 payload 中嵌入 `["com.example.cache.Evil", {...}]` 形式的多态类型标记也会被拒绝；同时移除了 `ObjectInputStream`，彻底消除原生 Java 反序列化 gadget 链。
-5. 位置正确性：防御位于 sink 所在的读取路径（get 方法）与写入路径（set 方法）两处，数据流走向、路由注册、依赖注入、RedisTemplate 用法均保持不变，仅替换反序列化机制这一最小改动。
-6. 第二入口检查：GET 路径是唯一反序列化入口，已同样加固；`lifetime` 参数未参与反序列化，`entryId` 仅作 Redis 键使用且无拼接注入风险，无其他替代通道可达 sink。
+分析：
+1. 第 22–24 行：用户可控输入点为 `@PathVariable entryId`、`@RequestParam lifetime`、`@RequestBody byte[] data`；其中 `data` 直接进入 Redis 存储，是反序列化漏洞的主链起点。
+2. 第 25–27 行（新增）：在写入前校验 payload 非空且不超过 `MAX_PAYLOAD_SIZE`，限制攻击面体积，属于辅助防御，不改变原控制流。
+3. 第 40 行原代码中 `new ObjectInputStream(...)` 是 sink 前的关键节点：任意字节流可携带 gadget 类触发 CWE-502。修复在第 40–42 行替换为自定义 `WhitelistedObjectInputStream`，位置正确——在 `readObject` 解析类之前拦截。
+4. 第 55–68 行：防御的类型正确性来自重写 `resolveClass`，这是 JVM 反序列化的原生安全钩子；白名单精确允许集只含业务 DTO `CacheEntryPayload.class`，任何 gadget 类（如 commons-collections 等常见利用链）都会抛出 `InvalidClassException`，覆盖完整性上不存在绕过路径。
+5. 第 33 行 GET 入口与第 22 行 SET 入口共享同一数据流；除目标 sink 外无其他反序列化点，`lifetime` 参数未参与反序列化，无需额外修复。
+6. 第二入口检查结论：控制器仅此两个端点，Redis 中数据只能经 `set` 写入、经 `get` 读出并反序列化；读取侧白名单已覆盖全部通道，替代注入途径不存在。
 
 ```json
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞链路：POST 请求体字节经 RedisTemplate 存入 Redis 后由 GET 读取并经 ObjectInputStream.readObject 反序列化不可信数据（CWE-502）；修复后移除原生 Java 序列化，改用 Jackson activateDefaultTyping 加严格子类白名单（仅允许 CacheEntryDTO），写入与读取两条路径均受白名单约束，无残留反序列化入口", "fix_suggestion": "line 55-63: 将 ObjectInputStream.readObject 替换为基于 Jackson 白名单类型校验的反序列化"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码第 40-41 行使用原生 ObjectInputStream 对攻击者可控的 Redis 字节执行 readObject 构成 CWE-502；修复通过新增 WhitelistedObjectInputStream 重写 resolveClass 实现精确类白名单，仅允许 CacheEntryPayload.class 被解析，gadget 类一律抛出 InvalidClassException；写入侧另加非空与 64KB 大小上限校验作为辅助防御；全控制器仅此一条反序列化数据流，第二入口检查未发现其他 sink", "fix_suggestion": "line 40: 将 new ObjectInputStream 替换为重写 resolveClass 的 WhitelistedObjectInputStream 并以 ALLOWED_TYPES 白名单约束可解析类"}
 ```

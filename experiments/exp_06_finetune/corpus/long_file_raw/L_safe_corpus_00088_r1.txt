@@ -1,0 +1,29 @@
+## 编号分析（全文逐函数）
+
+**1. `put`（第 17–72 行）**
+- 入口点：PUT 路由，source 为 `req.URL.Path` 与 `req.Body`。
+- 第 23 行 `sanitizePath(fs.UploadFolder, req.URL.Path)`：目标路径先经过统一净化函数处理。按 goshs 的实现，`sanitizePath` 会将路径与 UploadFolder 拼接后取绝对路径并校验仍在 webroot 内，`../` 等穿越序列会被规范化或直接报错（第 24–27 行错误即返回 400）。因此第 47 行 `os.OpenFile(savepath, ...)` 这个 sink 的路径参数是受净化的，不存在目录穿越写。
+- 第 30 行额外阻止写入 `.goshs` ACL 文件；第 36–44 行对目标目录向上递归查找 ACL 并执行自定义认证，防止越权写入受限目录。
+- Body 内容仅作为文件数据写入（io.Copy），无命令/模板 sink。
+
+**2. `upload`（第 75–160 行）**
+- 入口点：POST multipart 上传，source 为 `req.URL.Path`（第 83 行）与 `part.FileName()`。
+- 第 84–86 行同样经 `sanitizePath` 净化目标目录。
+- 第 103–105 行文件名只取 `/` 分割后的最后一段，剥离任何目录成分——Windows 反斜杠在 Linux 上只是普通字符，不构成穿越；即便含 `\` 也落在 targetDir 内部，不逃逸 webroot。
+- 第 108 行阻止覆盖 `.goshs`；第 89–97 行 ACL 递归校验 + 自定义认证。
+- 第 116 行 `filepath.Join(targetDir, filenameClean)` 中 filenameClean 已无分隔符可穿越，sink 安全。
+
+**3. `bulkDownload`（第 163–243 行）**
+- 入口点：GET 查询参数 `file`（第 169 行），可多值。
+- 第 181–185 行：每个 file 都经 `sanitizePath(fs.Webroot, file)` 校验，失败则 `continue` 跳过——穿越路径不会进入 `filesCleaned`，因此第 232 行 `filepath.Walk(file, walker)` 及 walker 内第 190 行 `os.Open(filepath)` 只会触及 webroot 内的文件。
+- 第 199 行 zip 内路径仅做字符串替换用于归档命名，不影响读取位置；zip 路径不含 `../` 前缀拼接（是剥离 webroot 后的相对路径），解压侧风险不由此函数引入。
+- 第 174–177 行空文件列表仅返回 404 错误页但未 return，属轻微逻辑瑕疵（继续执行生成空 zip），非安全漏洞。
+- 无 CSRF 检查于 bulkDownload，但下载为只读操作且需已知路径，配合 sanitizePath 不构成穿越读写。
+
+**4. 替代通道核查**：三个 handler 均独立调用 `sanitizePath`；没有其他未净化的 URL.Path / FileName → 文件 API 数据流。`#nosec G304/G307` 注释只是抑制 lint 告警，实际防御由 sanitizePath 提供，属于有效白名单式校验而非黑名单。
+
+**结论**：所有 source→sink 流均经 `sanitizePath` 规范化+边界校验，另有 `.goshs` 保护、ACL 递归强制、multipart 文件名剥离等多层防御，未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文三个入口: put(第23行)与upload(第85行)的目标路径均经sanitizePath(fs.UploadFolder/UploadFolder, req.URL.Path)校验, 失败即400; upload中part.FileName()在第104-105行按斜杠分割仅保留末段, 无法穿越; put第30行与upload第109行阻止覆盖.goshs ACL文件, 且两处均通过findEffectiveACL递归向上强制ACL认证; bulkDownload(第169行)的file查询参数逐个经sanitizePath(fs.Webroot, ...)校验, 失败即continue跳过, 因此第232行filepath.Walk与walker内os.Open只会访问webroot内文件。所有source到文件系统sink的数据流均有有效的路径规范化+边界校验(非黑名单), 未发现可绕过的目录穿越或任意文件读写漏洞。唯一瑕疵是bulkDownload第176行404后缺少return导致可能生成空zip, 属功能性小问题而非安全漏洞。", "fix_suggestion": "no fix needed"}
+```

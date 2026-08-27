@@ -1,0 +1,23 @@
+## 编号分析（全文通读，行号锚定）
+
+1. **第 1–2 行**：`/*jshint node: true*/` 与 `module.exports = {`——这是一个 Grunt 构建配置文件（Gruntfile 片段），导出 `build.files` 与 `build.options`。文件本身不含运行时业务逻辑。
+
+2. **第 4–10 行**：`files` 数组使用 Grunt 模板变量 `<%= meta.cwd %>`、`<%= meta.source %>`、`<%= meta.build %>` 作为路径 source。这些值来自构建脚本自身的 `meta` 配置，非外部用户输入；且此处仅是 grunt-contrib-concat/copy 类任务的声明式配置，不存在 `eval`、`child_process.exec`、动态 `require` 等 sink。路径注入在此上下文中不构成可利用漏洞。
+
+3. **第 11–16 行（"index" 配置）与第 17–23 行（"crypto-js" 打包配置）**：这是关键发现点。"index" 全局入口将 `"components"` 列表中的全部组件一次性打包并挂到全局 `CryptoJS` 对象上，其中包括：
+   - 第 20 行：`"mode-ecb"`（ECB 模式，CWE-327 语义上的不安全密码模式）；
+   - 第 21 行：`"rc4"`、第 22 行 `"rabbit"`、第 23 行 `"rabbit-legacy"`（RC4 为已破译的流密码，RFC 7465 明确禁用于 TLS）；
+   - 第 19 行：`"md5"`、`"tripledes"`（DES/3DES 弱算法）。
+   由于默认入口把所有弱原语全部导出为 `CryptoJS.RC4`、`CryptoJS.mode.ECB` 等可直接调用的 API，下游使用者极易误选弱算法，属于“默认暴露不安全加密原语”的供应链级弱点（对应 CWE-327：使用已被证明存在缺陷的加密算法）。
+
+4. **第 24–100+ 行（各 hash/hmac/pbkdf2 单项配置）**：逐一核对每个条目，均为静态字符串数组，无拼接、无用户可控字段；`exports` 值如 `"CryptoJS.MD5"` 仅作为命名导出映射，不进入任何执行 sink。
+
+5. **第 101–130 行（cipher 区块 aes/blowfish/tripledes/rc4/rabbit）**：注意 `"aes"` 的依赖链包含 `"md5"` + `"evpkdf"`（第 103 行），意味着 CryptoJS 默认的 OpenSSL KDF 使用 MD5 派生密钥——弱 KDF 也是 CWE-327/CWE-916 范畴的问题，但同样源于库设计而非本文件的输入处理缺陷。
+
+6. **第 131 行至文件末尾（core/lib/format/enc/mode/pad 各区块）**：逐项检查完毕，全部是静态声明式配置，没有回调函数、路由、环境变量读取（`process.env`）、文件系统读写或网络操作。全文不存在第二入口或替代通道（无 HTTP handler、无 CLI 参数解析）。
+
+7. **source→sink 验证结论**：全文唯一的“动态”元素是第 6–8 行的 `<%= meta.* %>` 模板占位符，其值由仓库内其他构建配置静态提供，到 Grunt 任务执行之间没有外部输入汇入，防御问题无从谈起。真正有证据支撑的安全问题是第 11–23 行默认打包入口对 RC4/ECB/MD5/DES 等弱算法的全量导出。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-327", "risk_level": "medium", "source": "line 11-23: 默认 index 入口的 components 列表", "sink": "line 15: global CryptoJS 将全部组件导出为可调用 API", "explanation": "第 11-23 行的 index/crypto-js 打包配置把 rc4(第22行)、mode-ecb(第21行)、md5、tripledes、rabbit 等已破译或不安全的加密原语一次性打包并通过全局 CryptoJS 对象全量导出 -> 下游应用开发者可直接调用 CryptoJS.RC4 或 CryptoJS.mode.ECB 等弱原语而无需额外引入 -> 属于默认暴露不安全加密算法的供应链级弱点，易导致终端产品选用被禁用算法", "fix_suggestion": "line 11-23: 从默认 index 入口的 components 列表中移除 rc4、rabbit、rabbit-legacy、mode-ecb、tripledes、md5 等弱算法，仅在显式请求时提供独立构建产物，并在文档中标注弃用警告"}
+```

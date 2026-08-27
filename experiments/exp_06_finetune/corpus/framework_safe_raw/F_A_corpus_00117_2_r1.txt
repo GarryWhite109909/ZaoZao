@@ -1,0 +1,71 @@
+LANG: go
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+// SessionState 是从缓存/客户端恢复的会话聚合状态，
+// 与原 Java 侧从远端缓存读取后直接反序列化的结构等价。
+type SessionState struct {
+	UserID   string
+	Roles    []string
+	Payload  map[string]interface{}
+}
+
+// verifyHMAC 使用服务端密钥对序列化字节做签名校验，
+// 防止客户端伪造/篡改 gob 载荷（防御 sink 前的唯一校验点）。
+func verifyHMAC(body []byte) bool {
+	mac := hmac.New(sha256.New, []byte(serverSecret))
+	mac.Write(body)
+	expected := mac.Sum(nil)
+	sig := extractSig(body)
+	return hmac.Equal(expected, sig)
+}
+
+func restoreSession(c *gin.Context) {
+	// source: 客户端提交的原始序列化字节，未做任何校验
+	body, err := c.GetRawData()
+	if err != nil {
+		c.String(http.StatusBadRequest, "bad body")
+		return
+	}
+
+	// 防御：反序列化前先做 HMAC 签名校验，拒绝不可信载荷
+	if !verifyHMAC(body) {
+		c.String(http.StatusForbidden, "invalid signature")
+		return
+	}
+
+	var state SessionState
+	// sink: 对已通过签名的可信字节流执行 gob 反序列化
+	dec := gob.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(&state); err != nil {
+		c.String(http.StatusInternalServerError, "decode failed")
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"user": state.UserID, "roles": state.Roles})
+}
+
+func main() {
+	r := gin.Default()
+	r.POST("/session/restore", restoreSession)
+	r.Run(":8080")
+}
+```
+
+1. 第 22 行 `c.GetRawData()` 是唯一用户可控输入点，原始请求体完全由客户端控制。
+2. 第 30-33 行新增 HMAC 校验（框架原生 crypto/hmac + hmac.Equal 恒定时间比较），位于 source 与 sink 之间、gob 解码之前，位置正确。
+3. 第 37-38 行 sink 保持原样（gob.NewDecoder/Decode），但因前置签名校验，只有持有服务端密钥签名的载荷才会到达解码器；类型正确性由签名绑定完整字节流保证，任何篡改都会导致 hmac.Equal 失败。
+4. 攻击面覆盖：GetRawData 返回全部请求体，无其他分支绕过校验直达 sink，覆盖完整。
+5. 第二入口检查：main 中仅注册 `/session/restore` 一个路由指向 restoreSession，无其他反序列化通道，结论为无遗漏。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原 CWE-502 数据流：第 22 行 GetRawData 请求体 -> 第 38 行 gob Decode 已被修复；修复方式为在解码前插入 HMAC-SHA256 服务端密钥签名校验（hmac.Equal 恒定时间比较），未通过则返回 403，函数名、路由路径、变量名与控制流均保持不变", "fix_suggestion": "line 30: 在 gob 反序列化前新增 verifyHMAC(body) 签名校验，失败即拒绝"}
+```

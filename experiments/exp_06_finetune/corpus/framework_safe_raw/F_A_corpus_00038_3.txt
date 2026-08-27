@@ -1,0 +1,100 @@
+LANG: go
+```go
+package main
+
+import (
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// 插件管理服务：从用户指定的 URL/名称下载并安装插件到插件根目录
+var pluginRoot = "/srv/app/plugins"
+
+// 白名单精确允许集：仅允许合法插件名（字母、数字、连字符，且不含路径分隔符）
+func isSafePluginName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	if strings.ContainsAny(name, "/\") || strings.Contains(name, "..") {
+		return false
+	}
+	for _, c := range name {
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func installHandler(w http.ResponseWriter, r *http.Request) {
+	// source：外部输入 —— 插件名直接来自查询参数
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "missing plugin name", http.StatusBadRequest)
+		return
+	}
+	// 防御：白名单校验 + filepath.Base 归一化，阻断 ../ 等路径穿越载荷
+	if !isSafePluginName(name) {
+		http.Error(w, "invalid plugin name", http.StatusBadRequest)
+		return
+	}
+	name = filepath.Base(name)
+
+	resp, err := http.Get("https://registry.example.com/plugins/" + name + ".zip")
+	if err != nil {
+		http.Error(w, "download failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// sink：写入前再次用 filepath.Rel 校验最终路径仍在插件根目录内
+	dest := filepath.Join(pluginRoot, name+".zip")
+	rel, err := filepath.Rel(pluginRoot, dest)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		http.Error(w, "invalid destination", http.StatusBadRequest)
+		return
+	}
+	f, err := os.Create(dest)
+	if err != nil {
+		http.Error(w, "create failed", http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+	io.Copy(f, resp.Body)
+	w.WriteHeader(http.StatusOK)
+}
+
+func listHandler(w http.ResponseWriter, r *http.Request) {
+	// 第二入口：同样以未校验的参数读取任意路径下的"插件清单"
+	name := r.URL.Query().Get("name")
+	data, err := os.ReadFile(filepath.Join(pluginRoot, name, "manifest.json"))
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Write(data)
+}
+
+func main() {
+	http.HandleFunc("/plugins/install", installHandler)
+	http.HandleFunc("/plugins/list", listHandler)
+	http.ListenAndServe(":8080", nil)
+}
+```
+
+分析：
+
+1. 第 30 行：用户可控输入点为 `r.URL.Query().Get("name")`（installHandler 的 source），以及第 62 行 listHandler 中同样的查询参数绑定。
+2. 第 36-38 行：在 source 之后立即插入白名单精确允许集 `isSafePluginName`——只允许 `[a-zA-Z0-9_-]` 且显式拒绝含 `/`、`\`、`..` 的名称。这是白名单而非黑名单/正则过滤，符合有效防御要求；类型正确（string 判定），位置正确（进入下载 URL 拼接与文件路径拼接之前）。
+3. 第 39 行：`filepath.Base(name)` 对已通过白名单的名称做归一化，消除任何残留的目录成分。
+4. 第 48-52 行：sink 前增加纵深防御——`filepath.Rel(pluginRoot, dest)` 计算相对路径，若结果以 `..` 开头则拒绝写入，确保最终写盘路径必然位于插件根目录内，完整覆盖 `../../etc/cron.d/x.zip` 类攻击面。
+5. 第 66 行：第二入口 listHandler 仍存在未修复的路径穿越（按 minimal pair 要求仅修复目标数据流，保持局部对照性）——该流不在本次修复范围内，结论中如实记录。
+6. 替代通道检查：installHandler 中下载 URL 拼接（第 41 行）因 name 已被白名单约束而不再可注入路径穿越载荷；无其他 sink。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "installHandler 数据流：第 30 行查询参数 name 为 source，经第 36-38 行白名单精确允许集校验与第 39 行 filepath.Base 归一化后，再于第 48-52 行通过 filepath.Rel 验证最终写盘路径仍在 pluginRoot 内，才到达第 54 行 os.Create sink，路径穿越被完全阻断；第二入口 listHandler 第 66 行 os.ReadFile 仍保留原始未修复代码，属于刻意保留的对照差异，不在本次修复目标范围内", "fix_suggestion": "line 36: 插入白名单函数 isSafePluginName 校验并在 line 39 用 filepath.Base 归一化，line 49 写入前用 filepath.Rel 验证目标路径仍在插件根目录内"}
+```

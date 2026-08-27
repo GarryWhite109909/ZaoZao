@@ -1,0 +1,28 @@
+# 编号分析
+
+**入口点枚举（全文）**
+1. `render_token`（第 27 行）：分发所有 token，是唯一入口；text 来自用户 Markdown 的 `raw` 或递归渲染的 `children`。
+2. 各渲染方法：`link`(第 62 行)、`image`(第 70 行)、`inline_html`(第 92 行)、`block_html`(第 116 行)、`heading`(第 101 行)、`block_code`(第 110 行)、`list`(第 126 行) 等。
+3. 配置入口：构造函数的 `escape`、`allow_harmful_protocols`（第 40–43 行）。
+
+**逐条数据流验证**
+
+1. **文本流**：`text()` 第 56 行：`_escape=True` 时 `escape_text`，否则 `safe_entity`。两者均转义 `<>&"'`，有效。
+
+2. **URL 流（核心）**：`link`/`image` → `safe_url`（第 48 行）→ 黑名单 `HARMFUL_PROTOCOLS` + `_unquote_url` 三次解码（第 139 行）→ 通过后仅 `escape_text(url)`。
+   - 防御性质：纯黑名单 + 前缀匹配，按要求视为可绕过。
+   - **绕过证据 A（控制字符）**：浏览器会剥离 URL 中的 TAB/LF/CR。输入 `java\tscript:alert(1)`：`unquote` 不处理 `\t`，`.lower()` 后仍不匹配任何黑名单前缀；`escape_text` 只转义 `&<>"'`，`\t` 原样保留进入 `href`。浏览器解析时删除 `\t` 得到 `javascript:` —— **确认可利用的 XSS**。
+   - 绕过证据 B：嵌套百分号编码超过 3 层（第 138 行循环上限）可残留被过滤形态。
+   - 绕过证据 C：`allow_harmful_protocols` 为列表时按前缀放行（第 52 行），如允许 `data:` 会连带放行任意 `data:text/html,...`。
+
+3. **image alt 流**：第 74 行 `alt = striptags(text)` 直接拼入属性且未转义。当 `_escape=False` 时 children 文本含原始引号，striptags 只删标签不删引号 → 可注入 `"` 突破 alt 属性造成 XSS（第二入口）。`_escape=True` 时文本已含 `&quot;` 实体，风险较低但依赖配置。
+
+4. **inline_html / block_html**（第 92、116 行）：`_escape=False` 时原样输出——这是文档声明的信任模式，不算缺陷。
+
+5. **其余 sink**：`heading` 的 id 用 `escape_text`（第 104 行）、`block_code` 的 lang 用 `safe_entity`（第 113 行）、title 用 `safe_entity`，均有效。
+
+**结论**：存在真实漏洞 —— `safe_url` 黑名单对控制字符类协议混淆无效，导致 `href`/`src` 注入 `javascript:` 型 XSS；另有 `_escape=False` 时 alt 属性注入的第二通道。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "XSS（URL 协议黑名单绕过 / 属性注入）", "risk_level": "high", "source": "render_token 中用户可控的 link/image url 与 alt 文本（token attrs/raw）", "sink": "safe_url 拼接进 href/src 属性（第 63、72 行），以及 image 的 alt 属性拼接（第 75 行）", "explanation": "safe_url 采用黑名单加三次 unquote 解码，但未剥离或校验 URL 中的控制字符。形如 java\\tscript:alert(1) 的地址经 unquote 与 lower 后不匹配 HARMFUL_PROTOCOLS 前缀，escape_text 又只转义 &<>\"' 而保留制表符，最终写入 href 后浏览器解析时会删除 TAB 还原为 javascript: 协议，造成存储型 XSS。此外超过三层的嵌套百分号编码也可绕过解码次数限制；allow_harmful_protocols 为列表时按前缀放行同样可被滥用。次要问题：image 的 alt 使用 striptags 后未经实体转义直接拼入属性，在 escape=False 配置下可用双引号突破属性边界注入事件处理器。", "fix_suggestion": "改为协议白名单校验：先剥离 URL 中所有 ASCII 控制字符与空白（含 \\t \\n \\r），再解析 scheme 并仅允许 http/https/mailto 等白名单协议，拒绝一切无法解析出安全 scheme 的相对或畸形 URL；同时循环解码应改为解码至稳定而非固定 3 次。alt 属性应使用 safe_entity 或 escape_text 转义后再拼接。"}
+```

@@ -1,0 +1,27 @@
+## 编号分析
+
+1. **第 41 行 `JwtSigKey`**：JWT 签名密钥硬编码为公开字符串 `signature_hmac_secret_shared_key`，且为包级变量无任何配置覆盖。攻击者可用该密钥伪造任意用户（含管理员）的 JWT，属于 CWE-798/CWE-321 硬编码凭证。这是全文最严重的漏洞。
+
+2. **第 165–180 行 Login 的 jwt 分支**：MFA 校验（`Approved: false`，第 152 行）在密码验证后、签发 token 前并未阻断——即使 `u.Mfa.Enable == true` 且未通过二次认证，`jwt` 分支仍直接 `Sign(profile)` 返回 token。持有有效密码的攻击者可绕过 MFA 获得 JWT，属 CWE-308/CWE-287 认证绕过。
+
+3. **第 236–248 行 GetProfile**：从数据库重建 profile 后直接 `session.Set("profile", p)`，新构造的 `p` 未携带 `Mfa` 字段（零值 Enable=false）。若在 MFA 待审批状态下调用 GET /sessions（GetProfile 无 MFA 检查），会话中的 Mfa 标志被清空，后续 `IsLogin`（第 60–66 行）判定 `p.Mfa.Enable==false` 直接放行并续期会话——第二条 MFA 绕过通道。
+
+4. **第 258–262、286–290 行 ListUserNamespace / GetClusterProfile**：`profile := u.(UserProfile)` 无 ok 判断，未登录时 u 为 nil，类型断言 panic 导致 DoS（CWE-476），且这两个入口依赖外层中间件做鉴权，本文件内无防御。
+
+5. **第 96 行 saveLoginLog**：goroutine 中使用请求 ctx 取 RemoteAddr，ctx 复用风险低；qqwry 加载失败后仍调用 `qqWry.Find` 可能 nil 解引用 panic（第 100–103 行），仅影响日志 goroutine。
+
+6. **第 118–160 行 aggregateResourcePermissions**：`errors.As(err, &storm.ErrNotFound)` 用法错误（应为 errors.Is），ErrNotFound 时返回错误导致登录失败，属功能缺陷非安全漏洞。
+
+主要可利用链：攻击者读取开源代码获得硬编码密钥 → 自行 HS256 签发 `IsAdministrator:true` 的 UserProfile JWT → 以管理员身份访问所有接口。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-798 (硬编码凭证) 与 CWE-308/CWE-287 (MFA 绕过)",
+  "risk_level": "严重",
+  "source": "line 41: 硬编码 JwtSigKey; line 152: Mfa.Approved 为 false",
+  "sink": "line 176-178: h.jwtSigner.Sign(profile) 签发 token; line 247: session.Set 覆盖 Mfa 状态",
+  "explanation": "第 41 行将 JWT HMAC 密钥硬编码在开源代码中，任何人可用它伪造 IsAdministrator 为 true 的任意用户 token 实现完全接管 -> 第 176 行 jwt 分支在 Mfa.Enable 为 true 且 Approved 为 false 时仍签发 token，绕过 MFA -> 第 247 行 GetProfile 重建 profile 时丢失 Mfa 字段并写回会话，使 IsLogin 的 MFA 校验失效，构成第二绕过通道",
+  "fix_suggestion": "line 41: 从环境变量或配置文件加载随机生成的签名密钥并定期轮换; line 176: 在 jwt 分支前校验 Mfa.Enable 时拒绝签发直至二次认证完成; line 247: 重建 profile 时保留原会话中的 Mfa 状态"
+}
+```

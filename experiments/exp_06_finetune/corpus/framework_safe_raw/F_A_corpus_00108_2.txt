@@ -1,0 +1,75 @@
+LANG: go
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"encoding/json"
+	"io/ioutil"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+// 模拟一个可被 gob 反序列化的执行器类型
+type TaskRunner struct {
+	Cmd string
+}
+
+func (t *TaskRunner) Run() { /* exec t.Cmd */ }
+
+func init() {
+	gob.Register(&TaskRunner{})
+}
+
+// 安全版本：variables 不再接受 base64 的 gob 序列化对象，
+// 改为接收纯 JSON 结构，仅提取白名单字段构造 TaskRunner，
+// 彻底移除对不可信数据的 gob 反序列化（CWE-502）。
+func graphqlHandler(c *gin.Context) {
+	body, _ := ioutil.ReadAll(c.Request.Body)
+	var req map[string]interface{}
+	json.Unmarshal(body, &req)
+
+	// 从请求中取出 variables 字段（JSON 对象而非编码的二进制数据）
+	rawVars, ok := req["variables"].(map[string]interface{})
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing variables"})
+		return
+	}
+
+	// 白名单精确允许集：只读取已知安全的字段
+	cmdVal, ok := rawVars["cmd"].(string)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad variables"})
+		return
+	}
+
+	runner := &TaskRunner{Cmd: cmdVal}
+	runner.Run()
+
+	c.JSON(http.StatusOK, gin.H{"data": "ok"})
+}
+
+func main() {
+	r := gin.Default()
+	r.POST("/graphql", graphqlHandler)
+	r.Run(":8080")
+}
+```
+
+1. 第 27-30 行是用户可控输入点：`c.Request.Body` 被整体读入并 `json.Unmarshal` 到 `req`，其中 `variables` 字段完全由攻击者控制；第 32-37 行将其断言为 string 后经 `base64Decode` 解码，仍是不可信字节流。
+
+2. 原代码第 43 行 `gob.NewDecoder(...).Decode(&runner)` 是 sink：gob 解码器会根据数据中携带的类型信息实例化任意已注册类型（第 22 行 `gob.Register(&TaskRunner{})` 扩大了可实例化集合），随后第 44 行 `runner.Run()` 执行反序列化出来的对象方法，构成 CWE-502 完整链路：请求体 → variables → base64 解码 → gob.Decode → Run。
+
+3. 修复采用框架无关的白名单精确允许集方案：第 33 行将类型断言从 `string` 改为 `map[string]interface{}`，拒绝任何编码二进制载荷进入后续流程；第 39-43 行只按字段名白名单提取 `cmd` 并做类型检查后手工构造 `TaskRunner`，数据不再经过 gob 解码器，反序列化通道被彻底移除。
+
+4. 类型正确性：`map[string]interface{}` 断言保证只有合法 JSON 对象能通过；`rawVars["cmd"].(string)` 保证字段类型精确。位置正确性：校验发生在 sink 之前、数据进入业务逻辑之前，属于入口处防御。攻击面覆盖完整性：gob 类型注入、多态对象替换、字段走私等所有依赖 Decode 的路径均被消除，因为不再存在解码调用。
+
+5. 最小 diff 纪律核对：函数名 `graphqlHandler`、路由 `/graphql`、结构体 `TaskRunner` 及其 `Run` 方法、`init` 注册、控制流骨架全部保留；仅删除了 `base64Decode`/gob 解码语句并插入白名单构造语句，未重写其他逻辑。
+
+6. 第二入口/替代通道检查：本文件仅有 `/graphql` 一个路由与一个 handler；`init` 中的 `gob.Register` 保留但无任何 Decode 调用点引用它，不构成可达 sink；`json.Unmarshal` 本身只产生基础类型，不实例化用户指定类型，非漏洞通道。结论：无可达的反序列化 sink 残留。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原链路为请求体 variables 经 base64 解码后送入 gob.NewDecoder().Decode() 实例化不可信对象并调用其 Run 方法，属 CWE-502；安全版本移除 gob 反序列化，改为 JSON 对象白名单提取 cmd 字段手工构造 TaskRunner，反序列化通道不复存在；文件内无第二入口或替代可达 sink", "fix_suggestion": "line 33: 将 variables 断言改为 map[string]interface{} 并以白名单字段手工构造 TaskRunner，删除 base64Decode 与 gob.Decode 调用"}
+```

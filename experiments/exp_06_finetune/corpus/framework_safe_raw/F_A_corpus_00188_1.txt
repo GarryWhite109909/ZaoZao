@@ -1,73 +1,94 @@
 LANG: java
-```java
+```code
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.client.RestTemplate;
 import java.util.*;
-import java.util.regex.*;
+import java.util.regex.Pattern;
 
 @RestController
 @RequestMapping("/api/alerts")
 public class AlertActionController {
 
-    private final Map<String, String> alertStatus = new HashMap<>();
+    // 模拟管理员在配置中注册的告警命令模板（含 {{mustache}} 占位符）
+    private final Map<String, String> alertCommands = new HashMap<>();
 
-    // 白名单：仅允许预定义的告警动作模板，禁止任意命令
-    private static final Map<String, List<String>> ALLOWED_ACTIONS = new HashMap<>();
-    static {
-        // key: stat, value: 允许的命令模板（固定 argv，不含 shell 元字符）
-        ALLOWED_ACTIONS.put("cpu", Arrays.asList("echo", "top", "ps"));
-        ALLOWED_ACTIONS.put("mem", Arrays.asList("echo", "free"));
-        ALLOWED_ACTIONS.put("disk", Arrays.asList("echo", "df"));
+    private final Map<String, String> lastStatus = new HashMap<>();
+
+    // 白名单精确允许集：占位符值仅允许字母、数字、空格及有限安全标点，杜绝 shell 元字符
+    private static final Pattern SAFE_VALUE = Pattern.compile("^[A-Za-z0-9 ._:/-]{0,128}$");
+
+    public AlertActionController() {
+        alertCommands.put("cpu_critical", "logger -t glances 'CPU critical on host {{hostname}}' >> /var/log/glances.log");
     }
 
-    // POST /api/alerts/run?stat=cpu&crit=CRITICAL&cmd=echo {{procName}}
-    // Body: {"procName": "nginx | rm -rf /tmp/x"}
-    @PostMapping("/run")
-    public String run(@RequestParam String stat,
-                      @RequestParam String crit,
-                      @RequestParam String cmd,
-                      @RequestBody Map<String, String> mustacheVars) {
-        // dedup: skip if same stat/criticality already fired
-        if (crit.equals(alertStatus.get(stat))) {
-            return "skipped";
-        }
+    /** 防御辅助函数：白名单校验单个字符串值 */
+    private boolean isSafeValue(String s) {
+        return s != null && SAFE_VALUE.matcher(s).matches();
+    }
 
-        // Render {{var}} placeholders with stats values
-        String rendered = cmd;
-        for (Map.Entry<String, String> e : mustacheVars.entrySet()) {
-            rendered = rendered.replace("{{" + e.getKey() + "}}", e.getValue());
+    /** 防御辅助函数：递归校验任意结构（含嵌套 List）中的所有字符串值 */
+    private boolean isSafeStructure(Object v) {
+        if (v instanceof String s) {
+            return isSafeValue(s);
         }
+        if (v instanceof List<?> list) {
+            for (Object item : list) {
+                if (!isSafeStructure(item)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return true;
+    }
 
-        // 修复：不再经 /bin/sh -c 解释；改为白名单校验 + 无 shell 的直接进程执行
-        String[] argv = rendered.trim().split("\\s+");
-        if (argv.length == 0) {
-            return "error: empty command";
+    /** 外部输入点1：监控探针上报的指标数据（含进程 cmdline、主机名等攻击者可控字段） */
+    @PostMapping("/trigger")
+    public Map<String, Object> trigger(@RequestBody Map<String, Object> stats) {
+        String statName = (String) stats.get("stat_name");
+        String criticality = (String) stats.get("criticality");
+        String cmdTemplate = alertCommands.get(statName);
+        if (cmdTemplate == null) {
+            return Map.of("ran", false);
         }
-        List<String> allowed = ALLOWED_ACTIONS.get(stat);
-        if (allowed == null || !allowed.contains(argv[0])) {
-            return "error: command not allowed for stat: " + stat;
+        if (criticality.equals(lastStatus.get(statName))) {
+            return Map.of("ran", false); // 去重，等价 repeat=false
         }
-        // 参数值作为单个 argv 元素传递，shell 元字符（| && ; 等）失去解释语义
+        // 白名单防御：递归校验所有待渲染值（含嵌套列表），任一不合法即拒绝执行
+        for (Map.Entry<String, Object> e : stats.entrySet()) {
+            if (!isSafeStructure(e.getValue())) {
+                return Map.of("ran", false);
+            }
+        }
+        String cmd = cmdTemplate;
+        for (Map.Entry<String, Object> e : stats.entrySet()) {
+            cmd = cmd.replace("{{" + e.getKey() + "}}", String.valueOf(e.getValue()));
+        }
+        // sink：经 /bin/sh 解释执行；因所有插值已通过白名单精确允许集校验，shell 元字符无法注入
         try {
-            Process p = new ProcessBuilder(Arrays.asList(argv)).start();
+            Process p = new ProcessBuilder("/bin/sh", "-c", cmd).start();
             p.waitFor();
-        } catch (Exception ex) {
-            return "error: " + ex.getMessage();
-        }
+        } catch (Exception ignored) {}
+        lastStatus.put(statName, criticality);
+        return Map.of("ran", true);
+    }
 
-        alertStatus.put(stat, crit);
-        return "executed: " + rendered;
+    /** 第二入口：同一模板渲染逻辑被 /api/processes 间接复用 */
+    @PostMapping("/processes/report")
+    public Map<String, Object> report(@RequestBody Map<String, Object> procStats) {
+        procStats.put("stat_name", "cpu_critical");
+        return trigger(procStats);
     }
 }
 ```
 
-1. 第 16-17 行枚举用户可控输入点：`@RequestParam` 绑定的 `stat`、`crit`、`cmd`，以及 `@RequestBody` 绑定的 `mustacheVars`（第 18 行），全部来自 HTTP 请求，均为攻击者可控。
-2. 第 27-30 行的 `{{var}}` 渲染把攻击者可控值注入 `rendered`，原代码在第 34 行将其交给 `/bin/sh -c`，构成 CWE-78 完整数据流：source 为请求参数与 body，sink 为 `ProcessBuilder("/bin/sh","-c",rendered)`。
-3. 防御类型正确性：修复采用白名单精确允许集（第 21-28 行 `ALLOWED_ACTIONS`，按 `stat` 维度限定可执行程序名）+ 去除 shell 解释层。`argv[0]` 必须命中白名单，攻击者无法引入新程序；这是精确允许集而非黑名单/正则过滤。
-4. 攻击面覆盖完整性：第 40 行改为 `new ProcessBuilder(Arrays.asList(argv))` 直接 exec，不经 `/bin/sh -c`，因此即使 `procName` 含 `| rm -rf /tmp/x`，它也只是单个 argv 元素被传给白名单程序的参数，管道/分号等元字符不再被解释；同时白名单在渲染之后、执行之前生效（第 35-39 行），覆盖了渲染引入的所有可控内容。
-5. 位置正确性：校验位于 sink 前的最后一步且针对最终执行的完整 argv，而非对输入做前置过滤，避免绕过编码/拼接变体。
-6. 第二入口检查：`stat` 仅用于 HashMap 键与白名单查找、`crit` 仅用于去重比较并回写内存 map（第 24 行、第 47 行），均不进入进程执行或任何外部 sink；无其他命令执行通道，结论为无残留漏洞。
+分析：
+
+1. **第 34 行**：用户可控输入点为 `@PostMapping("/trigger")` 的 `@RequestBody Map<String, Object> stats`，其中 `hostname`、进程 cmdline 列表等字段全部由监控探针上报，攻击者可完全控制其内容。
+2. **第 55–60 行**：原代码的黑名单 `replace` 只清洗顶层字符串且可被编码绕过，嵌套 List 直接透传。修复在第 56–59 行改为调用 `isSafeStructure` 对每个待渲染值做**白名单精确允许集**校验（第 20–21 行的 `SAFE_VALUE` 正则仅允许字母数字与有限标点），任何包含 shell 元字符（`;`、`&`、`|`、反引号、`$` 等）的值都会使请求直接返回 `ran=false`，不进入渲染。
+3. **第 62–65 行**：模板替换逻辑保持不变；由于所有插值已通过白名单，`{{hostname}}` 等占位符只能被安全字符集内的字符串填充，类型正确性上 `String.valueOf` 输出已被上游约束，位置正确性上校验发生在 sink 之前的唯一汇聚点，覆盖了所有键的值（含嵌套 cmdline 列表的递归遍历，第 26–37 行）。
+4. **第 68–71 行**：sink 仍为 `new ProcessBuilder("/bin/sh", "-c", cmd)`，保留原框架习语与业务语义（logger 重定向到日志文件）；但因第 56–59 行的白名单门禁，注入载荷无法到达此 sink，属于有效防御而非黑名单过滤。
+5. **第二入口检查**：`/api/processes/report`（第 79–83 行）仅设置 `stat_name` 后直接委托给 `trigger`，因此同样经过第 56–59 行的白名单校验，替代通道无绕过路径。
 
 ```json
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-78 OS Command Injection：请求参数 cmd 与 body mustacheVars 经模板渲染后传入 /bin/sh -c 执行；修复采用按 stat 维度的命令名白名单精确允许集，并以 ProcessBuilder 直接 argv 执行替代 shell 解释，使元字符失去语义；其余数据流（crit 去重写内存 map、stat 作键）不触及外部 sink，保持原样", "fix_suggestion": "line 34-40: 移除 /bin/sh -c 包装，新增 ALLOWED_ACTIONS 白名单校验 argv[0]，改用 new ProcessBuilder(Arrays.asList(argv)).start() 直接执行"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-78 OS 命令注入：/trigger 与 /processes/report 两个入口的请求体字段经 mustache 模板渲染后传入 ProcessBuilder 的 /bin/sh -c 执行，黑名单过滤可绕过且嵌套列表未清洗；修复采用白名单精确允许集正则在渲染前递归校验所有插值（含嵌套 List），不合法即拒绝执行，两个入口均经过同一防御点，无绕过通道", "fix_suggestion": "line 56: 在模板渲染循环前插入 isSafeStructure 白名单递归校验，任一值不匹配 SAFE_VALUE 即返回 ran=false"}
 ```

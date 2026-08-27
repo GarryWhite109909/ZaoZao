@@ -1,0 +1,33 @@
+## 逐函数行号级分析
+
+**1. `_run`（第 88–150 行）— 命令入口点**
+- 入口参数：`-i`（第 60 行）、`-o`（第 62 行）、`-lut`、`-elp`、`-ssp`、`-p` 等，全部来自 CLI。
+- 第 96–97 行将 `args.input`/`args.output` 转为 Path，未在此处做规范化，但后续 sink 处有校验（见下）。
+- 第 103–105 行：LUT 路径 `pathlib.Path.cwd() / lut_table` 直接拼接后交给 `load_LUT`。该路径仅用于读取 YAML，且命令本身是本地开发者工具，读取用户自己指定的文件不构成跨信任边界的数据流；且 `YAML()` 默认为 safe loader（第 158 行），不存在反序列化 RCE。
+
+**2. `load_LUT`（第 157–166 行）**
+- 第 159 行 `yaml.load(path.open(...))`：ruamel 的默认 `YAML()` 是 safe 模式，只构造基础类型，无任意对象实例化 sink。
+- 第 161–163 行 prefix 循环只是把自身 dict 嵌套引用回写键名，纯内存操作，无文件/命令 sink。
+
+**3. `jinja_ify`（第 169–221 行）— 主渲染路径**
+- 第 172–174 行：`template_folder = pathlib.Path.cwd()`，`Environment(loader=FileSystemLoader(template_folder))`（经 `_create_jinja_environment`，第 253–257 行）。source 为 CLI 参数 `r_input_file`，sink 为 `get_template(str(r_input_file))`（第 175 行）。关键防御：Jinja2 的 `FileSystemLoader` 内部会拒绝包含 `..` 或绝对路径逃逸出搜索根的模板路径，因此即使传入 `../../etc/passwd` 也无法加载搜索目录之外的文件作为模板——输入侧遍历被框架层阻断。
+- SSTI 面：模板本身是受信的开发者提供的本地文件（第 256 行注释明确说明 trusted Jinja environment）；不可信数据仅通过 `lut` 作为变量在 `render_template`（第 261–263 行）一次性渲染，注释亦说明避免递归 SSTI。lut 内容来自 safe-YAML 与 OSCAL 模型数据，不含可执行模板字符串通道。
+- 输出侧：第 207 行 `output_file = trestle_root / r_output_file` 后立即调用 `PathSecurityValidator.validate_local_path(output_file, trestle_root)`（第 208 行），再于第 212–213 行写入。写入前校验有效，路径遍历被阻断。
+- 第 181–184 行：ssp/profile 必须成对出现，否则抛错；模型加载走 `load_validate_model_name`，均在 trestle_root 管辖内。
+
+**4. `jinja_multiple_md`（第 224–250 行）— 第二入口**
+- 第 236–241 行：对每个子目录逐层做 `PathSecurityValidator.validate_local_path(full_group_dir, trestle_root)` 后才 `mkdir`（第 243–245 行），目录创建前校验到位。
+- 第 251–253 行（实际第 248–250 区域）：最终输出文件再次 `validate_local_path` 校验后才 `open('w')` 写入。两条替代写入通道均有前置校验。
+- 模板加载与单文件路径相同，受 `FileSystemLoader` 根约束保护。
+
+**5. `_create_jinja_environment` / `render_template`（第 253–263 行）**
+- `autoescape=True`、扩展来自项目内置 `extensions()`（非用户可控），环境固定为受信配置；渲染仅一次，lut 变量不会二次进入模板引擎解析，SSTI 链路闭合。
+
+**6. `_number_captions`（第 266–284 行）**
+- 仅对已渲染的字符串做正则匹配与字符串替换后 join 返回，无文件、命令或求值 sink，纯文本变换。
+
+**综合结论**：全部 source（CLI 参数 input/output/lut）到 sink（get_template、open('w')、mkdir）的数据流均有有效防御：输出侧由 `PathSecurityValidator.validate_local_path` 在每次写入/建目录前校验；输入模板侧由 `FileSystemLoader` 的根目录逃逸检查兜底；YAML 加载为 safe loader；模板环境受信且 lut 数据不进入二次模板解析。黑名单式绕过担忧不适用，因为校验是基于规范化后的真实路径归属判断而非字符串过滤。全文证据支持无漏洞结论。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认所有入口点均受有效防御：CLI 参数 output 经 PathSecurityValidator.validate_local_path 在每次 open 写入和 mkdir 之前校验（jinja_ify 第 207-208 行、jinja_multiple_md 第 240-245 行及最终写出处）；input 模板由 FileSystemLoader 的根目录逃逸检查阻止越界加载；LUT 通过 ruamel 默认 safe YAML 加载无反序列化风险；Jinja 环境为受信配置且 autoescape 开启，lut 变量仅在 render_template 中一次性渲染，不构成 SSTI 链路；_number_captions 为纯文本处理无危险 sink。未发现可利用的 source 到 sink 数据流。", "fix_suggestion": "no fix needed"}
+```

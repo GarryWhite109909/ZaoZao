@@ -1,0 +1,60 @@
+# 逐函数安全分析（行号锚定全文证据）
+
+## 一、入口点枚举（覆盖全文）
+
+本文件是一个 Python-Markdown 扩展，无 HTTP 路由/CLI 入口。全部入口点如下：
+
+1. **配置入口**：第 118-120 行 `B64Extension.__init__` 中 `self.config = {'base_path': [...]}`；第 128 行 `b64.config = self.getConfigs()` —— `base_path` 由宿主应用传入，属于受信任的部署方配置。
+2. **文档内容入口（核心 source）**：第 108-113 行 `B64Postprocessor.run(self, text)` 的参数 `text` 是待渲染的 Markdown 文档内容。在典型使用场景（如静态站点生成器、Web 应用渲染用户提交的 Markdown）中，`text` 可包含攻击者控制的 `<img src="...">` 标签。
+3. **正则匹配入口**：第 40-56 行 `RE_TAG_HTML` 与第 58-66 行 `RE_TAG_LINK_ATTR`，用于从 `text` 中提取 img 标签及 src 属性。
+4. **回调入口**：第 114-116 行 `RE_TAG_HTML.sub(lambda m: repl(m, basepath), text)` 与第 79 行 `RE_TAG_LINK_ATTR.sub(lambda m2: repl_path(m2, base_path), ...)`。
+
+## 二、source→sink 数据流逐条验证
+
+### 数据流 1：text → repl → repl_path → open()（主链路）
+
+- **Source**：第 109 行 `run(self, text)` 的 `text` 中攻击者可控的 `<img src="/etc/passwd">` 或 `<img src="../../secrets.png">`。
+- 第 40-56 行 `RE_TAG_HTML` 匹配任意 `<img ...>` 开标签及其属性串（`(?P<attr>...)`），无任何白名单校验 src 内容。
+- 第 58-66 行 `RE_TAG_LINK_ATTR` 提取 `src="..."` 的路径值，同样无过滤——只要求引号包裹，`"`[^"]*"` 即可容纳任意路径字符串。
+- 进入第 69-95 行 `repl_path`：
+  - 第 71 行调用 `util.parse_url(...)` 判断是否 URL；
+  - 第 73-76 行：若非绝对路径则 `os.path.join(base_path, path)`，否则直接使用 `path`；
+  - **关键缺陷**：第 75-76 行对相对路径仅做 `os.path.normpath(os.path.join(base_path, path))`。`normpath` 只做词法规范化，**不会限制结果仍在 base_path 之内**。攻击者提交 `src="../../../../etc/passwd.png"`（或配合符号链接、或绝对路径 `src="/etc/passwd"`）即可逃逸 base 目录。
+  - 第 77-78 行 `os.path.exists(file_name)` 仅检查存在性，非防御。
+  - 第 80-84 行扩展名白名单：`.png/.jpg/.jpeg/.gif/.svg`。这是黑/白名单式后缀过滤，按分析要求视为可绕过：攻击者可 (a) 上传一个内容为敏感数据但命名为 `.png` 的文件；(b) 利用 Linux 上 `/proc/self/environ` 等无后缀路径不可行，但在允许上传的站点上重命名绕过完全现实；(c) 若目标系统存在 `.svg` 文件包含机密（SVG 为文本格式，常被用于存储内嵌脚本/凭据的模板），可直接读取。
+  - 第 81-83 行 `open(file_name, "rb")` + `base64.b64encode(f.read())` —— **sink：任意文件读取**，读取结果被嵌入输出 HTML 的 data URI 中，直接回显给攻击者。
+- 第 92-94 行 `except Exception: pass` 吞掉所有异常，不构成防御，反而隐藏错误。
+
+### 数据流 2：绝对路径通道（第二入口/替代通道）
+
+第 72-74 行：当 `parse_url` 返回 `is_absolute=True` 时，`file_name = os.path.normpath(path)`，即攻击者可直接写 `src="/etc/shadow"`（Windows 下还可写 `src="C:/Windows/win.ini"`）。这条通道**完全跳过 base_path 拼接**，是比相对路径穿越更直接的任意文件读取通道。注意第 38 行 `RE_SLASH_WIN_DRIVE` 已定义却从未使用——说明作者曾意识到需要处理此类路径但未落实防御。
+
+### 数据流 3：avoid 分支
+
+第 96-101 行 `repl` 中，`m.group('avoid')` 匹配 script/style/注释块时原样返回，不做替换。这只是避免破坏代码块的功能逻辑，与安全无关，且不阻止其他位置的 img 处理。
+
+## 三、防御有效性总结
+
+| 防御措施 | 位置 | 有效性 |
+|---|---|---|
+| 扩展名白名单 | 第 80-84 行 | 无效：可上传伪装后缀文件或利用 .svg |
+| os.path.exists | 第 77 行 | 非防御 |
+| normpath | 第 75-76 行 | 词法规范化，不限制根目录，可被 `../` 穿越 |
+| try/except pass | 第 92-94 行 | 异常吞噬，非防御 |
+| 未使用的 RE_SLASH_WIN_DRIVE | 第 38 行 | 证明绝对路径防护缺失 |
+
+## 四、结论
+
+存在 **CWE-22 路径穿越导致任意文件读取**（并伴随 CWE-73 外部控制文件路径）。前提条件：宿主应用将不可信 Markdown 交给该扩展渲染，且渲染结果可被攻击者看到。风险等级取决于部署场景：多用户 Markdown 渲染服务中为高危。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22",
+  "risk_level": "高",
+  "source": "line 109: B64Postprocessor.run 的 text 参数中攻击者可控的 img src 属性",
+  "sink": "line 82: open(file_name, 'rb') 读取文件并以 base64 回显至输出 HTML",
+  "explanation": "攻击者在 Markdown 中写入 img 标签 -> RE_TAG_HTML 与 RE_TAG_LINK_ATTR 无过滤提取 src -> repl_path 中相对路径经 normpath(join(base_path,path)) 不限制在 base 内可被 ../ 穿越 -> 绝对路径分支 line 74 直接采用 path 完全绕过 base_path -> 扩展名白名单 line 80-84 可通过上传伪装后缀文件或读取 svg 绕过 -> 文件内容 base64 编码后嵌入 data URI 返回给攻击者，实现任意文件读取",
+  "fix_suggestion": "line 75-78: 在打开文件前用 os.path.realpath 解析后强制校验其位于 base_path 之内（如 commonpath 检查），拒绝绝对路径输入，并对解析失败情况显式拒绝而非 except pass"
+}
+```

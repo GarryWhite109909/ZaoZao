@@ -1,0 +1,34 @@
+## 编号分析（全文通读）
+
+**入口点枚举**
+1. `parse()`（第 108 行）：外部传入的 InputStream（OOXML/ODF 文档），攻击者完全可控的 ZIP 内容 —— 主入口。
+2. `handleZipStream()`（第 160 行）：流式遍历所有 ZIP 条目，条目名与内容均来自不可信输入。
+3. `handleZipFile()`（第 186 行）：文件式遍历，同样遍历全部条目。
+4. 配置入口：`setMetaParser/setContentParser/setExtractMacros`（第 88–105 行）—— 服务端配置，非攻击者直接可控。
+
+**逐条数据流验证**
+
+- 流 A：`mimetype` 条目内容 → 第 199 行 `IOUtils.toString` → 仅写入 Metadata，无危险 sink，安全。
+- 流 B：`manifest.xml` → 第 208 行 `checkForEncryption` → `XMLReaderUtils.parseSAX`。Tika 的 `XMLReaderUtils` 默认启用 secure processing 并禁用外部实体，且 handler 为自有 ManifestHandler，不回显内容，XXE 防御有效。
+- 流 C：`meta.xml/content.xml/styles.xml` → 委托给内部解析器，XML 解析走同一套加固配置。
+- 流 D（关键）：第 218 行起，任意未匹配条目若名称含 `Thumbnails/` 或 `Pictures/`：
+  - 第 222 行 `embeddedName = entry.getName()` —— **source：ZIP 条目名，攻击者完全可控**；
+  - 第 225 行将其原样写入 `RESOURCE_NAME_KEY`，**没有任何路径规范化、去除 `../`、去除绝对路径前缀或字符白名单校验**；
+  - 第 243 行 `embeddedDocumentUtil.parseEmbedded(...)` —— **sink**：默认 `EmbeddedDocumentExtractor` 会基于该 resource name 在输出目录下构造落盘文件名（如 `<outputDir>/<name>`）。当条目名为 `Pictures/../../../../tmp/evil` 或含绝对路径时，构成经典 Zip Slip 路径穿越写文件（CWE-22/CWE-409 组合）。
+  - 黑名单式判断（仅看是否包含 `Thumbnails/`、`Pictures/` 子串）不能阻止名字中夹带穿越序列；`contains` 匹配甚至允许 `xThumbnails/../../..` 这类绕过。
+- 流 E：宏处理（第 258 行 `maybeHandleMacro`）：`ignoreScriptFile` 是黑名单（仅排除两个具体文件名），其余 `Basic/` 下任意文件被送入 SAX 解析；解析本身受 Tika 加固配置保护，但黑名单逻辑脆弱（如新增脚本文件类型即被放行），属次要问题。
+- 第二通道确认：`handleZipFile` 与 `handleZipStream` 都会到达同一条流 D，无遗漏替代入口；`handleZipFile` 中 manifest 被重复解析一次仅为功能冗余。
+
+**结论**：存在真实漏洞——ZIP 条目名未经净化即作为嵌入式资源名传递给可落盘的嵌入文档提取器。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 路径穿越（Zip Slip）/ CWE-409 不完整输入清理",
+  "risk_level": "中",
+  "source": "line 218-225: entry.getName() 写入 RESOURCE_NAME_KEY",
+  "sink": "line 243: embeddedDocumentUtil.parseEmbedded 将该名称用于嵌入资源落盘",
+  "explanation": "攻击者构造 ODF/ZIP 文件，将恶意条目命名为 Pictures/../../evil.sh 等含穿越序列的名字 -> handleZipEntry 用 contains 判断后不做任何路径规范化 -> 名称经 embeddedMetadata 传给默认 EmbeddedDocumentExtractor 按原名拼接输出路径写入磁盘 -> 造成任意路径文件写入",
+  "fix_suggestion": "line 225 处对 entry.getName() 进行净化：取最后一段文件名、拒绝包含 ../ 与绝对路径前缀、使用白名单字符集后再设置 RESOURCE_NAME_KEY"
+}
+```

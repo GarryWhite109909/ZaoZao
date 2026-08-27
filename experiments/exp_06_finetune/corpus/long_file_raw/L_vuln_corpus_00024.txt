@@ -1,0 +1,33 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. 第 27–33 行：模块加载时注册 jinja 过滤器（os.path 函数），无风险。
+2. `_parse_conf_data`（第 265 行起）：解析以 `@` 开头的字符串，来源包括环境变量、配置文件、`.env`，是核心 source。
+3. `converters` 字典（第 216–247 行）：`@format`/`@jinja`/`@get` 等标记触发延迟求值。
+4. `Merge`（第 60 行起）、`Insert`（第 118 行起）：处理 `@merge`/`@insert` 值。
+5. `Lazy.__call__`（第 190 行）：求值时调用 formatter 并注入 `context = {"env": os.environ, "this": settings}`（第 184 行）。
+6. `add_converter`（第 288 行）：允许外部注册自定义 converter。
+
+**source→sink 数据流验证**
+
+流 A：环境变量/配置文件值如 `DYNACONF_X='@jinja {{ ... }}'` → `_parse_conf_data` 第 265 行匹配前缀 → 第 296 行 `apply_converter` → converters 第 222 行 `Lazy(value, formatter=Formatters.jinja_formatter)` → 求值时 `_jinja_formatter`（第 152 行）执行 `jinja_env.from_string(value).render(**context)`。**防御检查**：全文无任何对 value 内容的白名单或转义；jinja_env 是默认 `Environment()` 而非沙箱 `SandboxedEnvironment`。攻击者若能控制任一配置项（污染的 .env 文件、CI 环境变量、可写配置文件），即可进行 Jinja2 SSTI：通过 context 中暴露的 `settings` 对象链式访问属性（如 `{{ this.__class__.__mro__ }}` 类 payload），结合非沙箱环境可达任意对象属性遍历，最终可能实现任意代码执行。这是真实存在的已知漏洞模式（dynaconf 官方后来在文档中警告并收紧了该行为）。
+
+流 B：python_formatter（第 213 行 `str.format`）：格式化字符串攻击可通过 `{this.__class__}` 遍历属性，但 str.format 无法调用方法，危害限于信息泄露，属次要问题。
+
+流 C：`_get_formatter`（第 157 行）、`Merge` 的 JSON/KV 解析（第 74–100 行）、`Insert` 的 int 解析（第 141 行）：仅做解析与查表，无危险 sink；`int()` 异常会抛出但无注入面。
+
+流 D：`parse_with_toml`（第 249 行）：tomllib 解析为数据结构，无代码执行。
+
+**第二通道确认**：除环境变量外，TOML/YAML/JSON 配置文件中的字符串值同样经 `parse_conf_data` 递归进入同一 sink（第 341 行递归 dict/list），构成替代入口；`AUTO_CAST_FOR_DYNACONF` 默认开启（第 270–274 行），无法靠默认配置阻断。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-1336 (SSTI), 可导致 CWE-94/CWE-78 任意代码执行",
+  "risk_level": "高危",
+  "source": "line 265: _parse_conf_data 接收来自环境变量及配置文件的攻击者可控字符串，如 @jinja 开头的值",
+  "sink": "line 152: _jinja_formatter 中 jinja_env.from_string(value).render(**context)，且 line 30 使用非沙箱 Environment",
+  "explanation": "攻击者控制的环境变量或配置项（如 DYNACONF_X=@jinja {{payload}}）经 parse_conf_data 递归传递到 Lazy 对象，求值时在未加沙箱的 jinja Environment 中渲染，context 还暴露了 settings 与 os.environ 对象，可进行属性链遍历实现模板注入乃至任意代码执行；全文无白名单、无 SandboxedEnvironment、AUTO_CAST 默认开启，黑名单式防护不存在",
+  "fix_suggestion": "line 30: 将 jinja_env 改为使用 jinja2.sandbox.SandboxedEnvironment 创建，并在渲染前对不可信输入禁用或显式启用 @jinja 功能（如要求 JINJA_ENABLED_FOR_DYNACONF 显式开启）；同时避免将 settings/os.environ 整体注入模板上下文"
+}
+```

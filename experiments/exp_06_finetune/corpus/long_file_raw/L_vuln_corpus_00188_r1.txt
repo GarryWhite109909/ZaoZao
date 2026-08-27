@@ -1,0 +1,38 @@
+## 编号分析（全文通读，行号按代码块顺序锚定）
+
+**1. 入口点枚举（第 1–160 行全文件）**
+- 唯一外部入口：`GlancesActions.run()`（第 108 行起），由各告警插件调用；参数 `commands`（来自 glances.conf 配置）与 `mustache_dict`（插件实时统计数据，含进程 cmdline、容器名、挂载点等攻击者可控内容）。
+- 无 HTTP 路由/文件/环境变量入口；第二通道即配置文件中的命令模板 + 运行时统计值。
+
+**2. `_SHELL_OPERATORS` 黑名单（第 22–24 行）**
+仅包含 `'&&', '|', '>>', '>'`。这是典型黑名单过滤：
+- 未覆盖 `;`（命令分隔）
+- 未覆盖 `` ` `` 反引号、`$(` 命令替换
+- 未覆盖 `<` 输入重定向
+- 未覆盖换行符 `\n`
+
+按要求，黑名单视为可绕过，不构成有效防御。
+
+**3. `_sanitize_value` / `_sanitize_mustache_dict`（第 27–68 行）**
+递归清洗修复了嵌套 list/dict（如 cmdline argv 列表）的遗漏（注释自述 GHSA-73wf-9vmv-5pv9），但递归只是扩大了黑名单的覆盖面，黑名单本身不完备的问题依旧存在。字符串中残留的 `;`、`$()`、反引号会原样进入渲染结果。
+
+**4. `run()` 数据流验证（第 108–152 行）**
+- source：第 117 行 `mustache_dict`（进程 cmdline 等攻击者可控值）。
+- 渲染：第 133–135 行 `chevron.render(cmd, safe_dict)`——Mustache 不做 shell 转义，仅 HTML 转义部分字符，`;`、`$`、`` ` `` 均原样通过。
+- sink：第 143 行 `secure_popen(cmd_full, allow_operators=self.allow_operators())`。
+- 防御有效性：`allow_operators()`（第 88–98 行）仅在用户启用 `--disable-config-exec` 时禁用操作符，默认为 True，即默认放行 shell 操作符解释。因此 `cmdline` 中形如 `foo; touch /tmp/pwned` 或 `foo$(id)` 的值经渲染后可被 secure_popen 解释执行。
+
+**5. 结论**
+source→sink 链完整存在：攻击者控制的进程名/cmdline → mustache_dict → chevron.render → secure_popen，中间仅有可绕过的字符黑名单。属于不完整的命令注入修复（与文件内注释引用的历史 CVE 同族）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-78 (OS Command Injection), incomplete-fix variant",
+  "risk_level": "high",
+  "source": "line 117: run() 参数 mustache_dict, 含攻击者可控的进程 cmdline/容器名等统计数据",
+  "sink": "line 143: secure_popen(cmd_full, allow_operators=self.allow_operators())",
+  "explanation": "攻击者可控的统计值(如恶意进程的 cmdline)经 line 134 chevron.render 嵌入配置中的动作命令行后传入 secure_popen。line 22-24 的 _SHELL_OPERATORS 黑名单只过滤 && | >> > 四个操作符, 未覆盖分号、反引号、$() 命令替换、< 与换行符; 黑名单过滤按规则视为可绕过。且 allow_operators()(line 88-98) 默认返回 True 放行 shell 操作符解释。因此 cmdline 含 foo;id 或 foo$(id) 之类载荷时可实现任意命令注入",
+  "fix_suggestion": "line 22-24 与 line 143: 弃用字符黑名单, 默认以列表形式传参(shell=False)直接 execve 执行, 或对 mustache 值使用 shlex.quote 白名单式转义; 同时将 allow_operators 默认改为 False"
+}
+```

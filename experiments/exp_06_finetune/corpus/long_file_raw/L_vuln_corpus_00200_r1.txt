@@ -1,0 +1,52 @@
+## 逐函数行号级分析
+
+**1. 类结构与静态字段（第 22–27 行）**
+- 第 23 行：`static final TagSet HtmlTagSet = initHtmlDefault();` —— 静态共享的默认标签集，只读初始化。
+- 第 25–26 行：`tags` 映射与 `source` 回退引用、`customizers` 回调列表。均为进程内数据结构。
+
+**2. 构造函数（第 29–52 行）**
+- 第 30–32 行：私有构造，仅赋值。
+- 第 38–51 行：拷贝构造。第 41 行注释明确说明：懒加载回退只从根 source（HTML 默认集）拉取，不会写回 template —— 即模板不会被解析过程污染。第 45–49 行对每个 Tag 做 `clone()` 后放入新 map，无别名泄漏。
+
+**3. add / doAdd（第 60–77 行）**
+- 第 61–62 行：`add()` 设置 Known 标志后调用 `doAdd`。
+- 第 64–76 行：`doAdd` 执行 customizer 回调（第 65–68 行）、`tag.setParserOptions()`（第 69 行），然后写入本实例的 map（第 71–72 行）。注意：写入的是 **this 实例**，不是静态 `HtmlTagSet`；而 `Parser.htmlParser().tagSet()` 返回的是 `Html()` 的可变副本（第 31 行）。因此 HTML 解析中出现的任意攻击者可控标签名（source）虽然会流入 `valueOf → doAdd → tags.put`（sink），但只污染该次解析私有的副本，不跨请求/跨文档持久化。
+
+**4. get（第 85–106 行）**
+- 第 88–94 行：查本实例。
+- 第 97–102 行：未命中时从 source 克隆并 `doAdd` 到本实例 —— 同样只写本实例，静态默认集不被修改。tag 名作为 HashMap key 使用，不存在注入 sink（无 SQL/命令/路径拼接）。
+
+**5. valueOf 系列（第 108–155 行）**
+- 第 110–137 行：核心方法。tagName 来自解析器 token（外部输入 source），经 `trim`（第 113 行）和 `ParseSettings.normalName` 归一化后用于 map 查找/插入（第 116、122、131 行）。HashMap key 不构成注入点；无文件、网络、反射、反序列化 sink。
+- 第 124–128 行：preserveTagCase 时克隆改名，纯内存操作。
+
+**6. onNewTag（第 172–180 行）**
+- 注册 Consumer 回调。回调由**调用方代码**提供，属于受信任的开发者输入，不是外部不可信通道。若开发者注册了恶意/有缺陷的 customizer，那是应用层问题，不是本类的漏洞。
+
+**7. equals/hashCode（第 182–191 行）**
+- 基于 map 比较，无逻辑漏洞。
+
+**8. initHtmlDefault / setupTags（第 199–262 行）**
+- 全部为硬编码字符串数组常量（第 203–232 行），无外部输入。第 247–260 行逐个创建并设置标志位，纯初始化。
+
+**Source→Sink 汇总验证：**
+| source | sink | 防御 | 结论 |
+|---|---|---|---|
+| 解析器 token 的 tagName（valueOf 第 110 行） | `tags.put`（第 72 行） | 写入解析器私有 TagSet 副本（第 31 行 `Html()` 拷贝 + 拷贝构造深 clone） | 无跨上下文污染 |
+| customizer 回调（第 65–68 行） | Tag 状态修改 | 回调来自受信任调用方代码 | 非不可信输入 |
+
+全文无 I/O、无反射、无反序列化、无 SQL/命令执行、无路径操作。唯一理论上的“污染”是未知标签名进入 map，但其作用域被构造函数设计严格限制在单次解析内，且 jsoup 对未知标签的处理（generic Tag，默认非自闭合等）本身是安全的。
+
+```json
+{
+  "has_vulnerability": false,
+  "vulnerability_type": "CWE-N/A",
+  "risk_level": "none",
+  "source": "line 110: valueOf 接收来自 HTML 解析 token 的任意标签名",
+  "sink": "line 72: doAdd 中 tags.computeIfAbsent(...).put(tag.tagName, tag)",
+  "explanation": "通读全文所有入口点后确认：唯一的动态输入是解析过程中的标签名，其流向为 valueOf -> get/doAdd -> 本实例 tags map。由于 Html() 返回静态 HtmlTagSet 的深拷贝副本（line 31 与拷贝构造 line 45-49 的 clone），且懒加载回退 get 只从根 source 克隆到自身（line 97-102），攻击者可控标签名无法污染静态默认集或其他解析会话。customizer 回调（line 172-180）由受信任的应用代码注册，不属于不可信输入通道。全文件无网络、文件、命令、SQL、反射或反序列化类 sink，HashMap 键插入不构成注入点。",
+  "fix_suggestion": "无需修复。如需加固，可在 line 72 处对超长或含非法字符的 tagName 增加防御性校验以防止极端情况下的内存膨胀，但这属于健壮性改进而非安全漏洞修复。"
+}
+```
+
+需要说明的是：我重新通读了全文并对每个函数做了行号级分析，但基于证据，这段代码确实不包含可利用的安全漏洞——它是纯内存数据结构，所有外部输入的作用域都被副本机制正确隔离。我不能为了迎合预设方向而虚构一个不存在的漏洞；如果您掌握某个具体的 PoC 或上游 CVE 编号，请提供，我可以针对性复核。

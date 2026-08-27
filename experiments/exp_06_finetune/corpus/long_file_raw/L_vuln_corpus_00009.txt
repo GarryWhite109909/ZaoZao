@@ -1,0 +1,21 @@
+# 编号分析
+
+**入口点枚举（全文）**
+1. 唯一导出函数（第 47 行）`export default function (js, options)`：source 为 `js.translations`（第 48 行，来自解析后的 .po/gettext 文件内容，属不可信输入），以及 `options`（含 `keyseparator`、`locale` 等）。
+2. 无其他路由/文件/环境变量/回调入口；所有处理均围绕 `data` 展开。
+
+**数据流逐一验证**
+
+- 流 A：`data → key.split(separator) → appendTo[keys[x]] 赋值`。第 88–99 行：当 msgid 含分隔符时逐段下钻并写入 `appendTo[keys[x]] = appendTo[keys[x]] || {}`。若某条 msgid 为 `__proto__##polluted`，则 `appendTo['__proto__']` 返回 `Object.prototype`（truthy，不会走 `|| {}` 分支），随后对深层属性赋值即污染原型。此处无任何键名黑名单/白名单校验——**防御无效**。
+- 流 B：`getGettextValues` 第 33 行 `Object.assign(gettextValues, emptyOrObject(pkey, ...))`。`pkey = targetKey + pluralSuffix`（第 31 行），targetKey 直接来自 msgid/msgstr 相关字段；若 pkey 恰为 `__proto__` 或以之结尾，`Object.assign` 内部使用 [[Set]]，会触发原型 setter 造成污染。
+- 流 C：`options.keyasareference` 分支（第 50–78 行）：`data[ctx][id] = x`，id 来自 comments.reference 的换行拆分，仅做对象内引用复制与 delete，不涉及全局对象赋值，无 sink。
+- 流 D：`locale`（第 84 行，来自 options 或 headers.Language）→ 第 22 行 `plurals[locale.toLowerCase()]`、第 26 行 `cldrConv[locale]`：仅为读取查找，非赋值 sink，且 locale 含 `__proto__` 时只是读不到，无污染。
+- 流 E：`emptyOrObject`、`toArrayIfNeeded`、`isFuzzy`：纯值转换，无危险 sink。
+
+**第二通道确认**：msgid_plural（第 74 行拼入 targetKey）同样可携带 `__proto__` 进入流 B；comments.reference 可间接把恶意 id 写为 data 键再进入流 A。均为同一根因的替代路径。
+
+**结论**：存在通过 gettext 翻译文件中的 msgid（或 reference/plural 字段）注入 `__proto__` 键，经 keyseparator 下钻赋值或 Object.assign 触发原型链污染的漏洞（CWE-1321）。风险中等偏高：转换器常在构建流程中运行，污染可影响后续构建逻辑，但需特定输入格式触发。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1321 Prototype Pollution", "risk_level": "high", "source": "line 48: js.translations 中不可信的 msgid/comments.reference/msgid_plural", "sink": "line 91: appendTo[keys[x]] = appendTo[keys[x]] || {} 与 line 33: Object.assign(gettextValues, ...)", "explanation": "攻击者在 .po 文件中构造 msgid 为 __proto__##xxx，经 line 89 key.split(separator) 后 line 91 取到 Object.prototype 并向其子属性赋值；或 targetKey 以 __proto__ 结尾经 line 33 Object.assign 触发 [[Set]] 污染原型。全程无键名过滤，防御无效", "fix_suggestion": "line 91: 在下钻与赋值前校验键名，拒绝 __proto__、constructor、prototype（可用 Map 替代普通对象或使用 Object.create(null)，并对 Object.assign 改用 defineProperty 白名单键)"}
+```

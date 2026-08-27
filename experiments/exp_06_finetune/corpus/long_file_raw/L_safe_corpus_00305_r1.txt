@@ -1,0 +1,41 @@
+## 编号分析
+
+**1. 第 22–27 行：DEFAULT_RESTRICTED_PROPERTIES**
+黑名单仅含 `class`，但配合第 145–147 行的 `isRestrictedClass`（`o instanceof Class` 返回受限），即使属性名绕过黑名单，返回的 Class 对象也会被拦截，形成双重防御。
+
+**2. 第 29–42 行：DEFAULT_RESTRICTED_METHODS**
+黑名单包含 `class/clone/hashCode/getClass/getDeclaringClass/forName` 等，封堵了经典的 `getClass().forName()` 反射 RCE 链入口。虽然黑名单形式上可枚举绕过，但需结合后续 sink 检查。
+
+**3. 第 44–62 行：DEFERRED_EXECUTION_RESTRICTED_METHODS**
+仅在延迟执行模式下限制集合修改类方法（put/add/remove 等），属于一致性防护而非安全边界，不构成漏洞面。
+
+**4. 第 74–79 行 getType / 第 81–87 行 getValue**
+getValue 先经 `isRestrictedClass(base)` 拦截（第 83 行），再经 `validatePropertyName` 过滤属性名（第 85 行），且结果若为 Class 类型直接置 null（第 86 行）。source（模板传入的 property）到 sink（反射属性读取）的数据流有双重校验。
+
+**5. 第 89–95 行 isReadOnly / 第 97–101 行 setValue**
+均强制经过 `validatePropertyName`，写路径同样受属性名过滤约束；且构造器支持 readOnly 模式。
+
+**6. 第 103–141 行 invoke（核心入口）**
+- 第 108–113 行：方法名命中 DEFAULT_RESTRICTED_METHODS 或用户配置 restrictedMethods 时抛异常；
+- 第 115–119 行：base 为受限类（反射/Jackson 包、Class、ClassLoader、Thread、Method、Field、Constructor、Interpreter）时抛异常；
+- 第 121–130 行：延迟模式限制；
+- 第 132–138 行：**关键后置校验**——即使 invoke 成功，若返回值是受限类实例（如通过其他途径拿到 Class/Method 对象），也抛异常。这堵住了「先获取危险对象再调用」的二阶链路。
+- 注意第 110 行 `method.toString()` 在 method 非 null 时才执行（第 109 行短路），无 NPE 问题。
+
+**7. 第 143–172 行 findMethod**
+仅做方法匹配与 varArgs 处理，不做额外过滤，但其调用方 invoke 已完成前置/后置双重校验，此处不是独立入口。
+
+**8. 第 174–187 行 checkAssignableParameterTypes / 第 189–203 行 pickMoreSpecificMethod**
+纯类型匹配辅助逻辑，无外部输入直达的危险 sink。
+
+**9. 第 205–221 行 validatePropertyName + transformPropertyName**
+snake_case 转换属功能逻辑；黑名单可被大小写变体绕过，但如第 4 点所述，属性读取的结果还会被 `instanceof Class` 检查兜底，且真正危险的静态方法调用走 invoke 路径受第 6 点约束。
+
+**10. 第 223–247 行 isRestrictedClass**
+包前缀检查覆盖 `java.lang.reflect` 与 `com.fasterxml.jackson.databind`，加上 instanceof 白名单式拦截核心危险类型。虽基于包名前缀可能被自定义类绕过，但模板沙箱中用户可控对象通常不携带此类引用，且该文件本身不含网络/文件/命令执行 sink——它只是 EL 解析器的属性/方法访问守卫层。
+
+**结论依据：** 全文所有 source（EL 属性名、方法名）到 sink（反射 getValue/invoke）的数据流均有前置黑名单 + 后置类型拦截双重防御；文件内不存在直接的命令执行、文件 IO、反序列化 sink；第二通道（findMethod 直调）在库内仅由 invoke 调用，不构成旁路。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文通读后确认: 该类是 Jinjava EL 解析器的 Bean 访问守卫层, 所有入口点(getType/getValue/isReadOnly/setValue/invoke)均经过 validatePropertyName 属性名过滤和 isRestrictedClass 类型拦截; invoke 方法(第103-141行)实现了前置方法名黑名单检查、受限基类检查以及关键的后置返回值检查(第132-138行), 阻断了 getClass().forName() 等经典反射逃逸链; 黑名单虽理论上可枚举绕过, 但 instanceof Class/ClassLoader/Method 等白名单式类型检查和返回值二次校验构成了有效纵深防御; 文件内不存在命令执行、文件IO或反序列化等直接危险sink; findMethod 仅被 invoke 内部调用, 不构成绕过通道", "fix_suggestion": "no fix needed"}
+```

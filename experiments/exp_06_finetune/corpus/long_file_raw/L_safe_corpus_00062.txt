@@ -1,0 +1,24 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. 第 55–64 行：`GET /` 列出终端服务器，仅依赖认证用户与组权限，无 sink。
+2. 第 71–170 行：`/{server_id}/{path:path}` HTTP 代理，主要攻击面。
+3. 第 178–247 行：`_resolve_authenticated_connection`，首消息 JWT 认证 + 权限校验。
+4. 第 250–360 行：`ws_terminal` WebSocket 代理。
+
+**数据流逐一验证**
+
+- **路径遍历/SSRF（source=`path` → sink=`target_url`）**：第 20–48 行 `_sanitize_proxy_path` 迭代 unquote 至稳定（最多 8 次），仍有残留编码则 fail-closed（第 33–34 行）；随后 `posixpath.normpath` 归一化并 lstrip('/')（第 37–38 行），拒绝以 `..` 开头或等于 `.` 的结果。双重编码 `%252e%252e`、`..%2f`、`%2e%2e/` 等变体均被迭代解码覆盖；反斜杠在 posixpath 下不作为分隔符，且上游为 POSIX 场景。base_url 来自管理员配置而非用户输入，用户无法控制主机，故无用户侧 SSRF。
+- **查询串透传**：第 96 行直接拼接 `request.query_params`，Starlette 已解析再序列化，无 CRLF 注入面；aiohttp 对非法头值会抛错，非绕过。
+- **头注入**：第 103–106 行转发客户端 `x-session-id` 为 `X-Session-Id`——单值头，aiohttp 拒绝含换行的头值，无请求走私/CRLF。
+- **Cookie/token 转发**：第 116–127 行按 auth_type 转发 cookie 或 bearer token 到管理员配置的同一连接 URL，属设计内行为；`request.state.token.credentials` 在 `get_verified_user` 依赖后必然存在。
+- **响应头过滤**：第 145–149 行剥离 hop-by-hop 头（transfer-encoding/connection/content-encoding/content-length），防止解压不一致问题；`TERMINAL_PROXY_HEADERS` 为管理员配置。
+- **错误信息泄露**：第 168–169 行把异常字符串回给客户端（502 响应含 `{error}`），可能泄露内网 URL 细节——低危信息泄露，非可利用漏洞。
+- **WebSocket 入口**：第 261–286 行先完成 JWT 认证、服务器存在性与组权限校验后才建连，防御有效。`session_id`（第 296–300 行）拼入上游 URL：Starlette 单段路径参数不含 `/`，无法构造 `../` 遍历；理论上 `%3F` 解码后的 `?` 可改变上游查询串，但上游仍要求其自有 auth（第 310–313 行 bearer key），影响仅为参数扰动，不构成越权。
+- **第二通道检查**：WS 与 HTTP 共用同一连接配置与权限模型，无绕过路径；`policy_id` 分支只是前缀拼接，safe_path 已消毒。
+
+**结论**：核心 source→sink 流（path→URL、header→header、token→upstream）均有有效防御；仅有低危的异常信息回显与非可利用的 session_id 字符扰动，不构成安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文三个入口点：列表接口仅做权限过滤；HTTP 代理中用户可控的 path 经 _sanitize_proxy_path 迭代解码至稳定并 fail-closed，再用 posixpath.normpath 归一化并拒绝 .. 前缀，双重编码等绕过被覆盖，base_url 由管理员配置故无用户侧 SSRF；x-session-id 单值转发由 aiohttp 头校验防 CRLF；hop-by-hop 响应头已剥离；WebSocket 入口先完成 JWT 首消息认证与组权限校验才连上游，session_id 为单段路径参数无法构造遍历，且上游另有 API key 认证。仅存在低危的异常信息回显（502 响应包含内部错误详情）与 session_id 中特殊字符对上游查询串的非可利用扰动，均不构成可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,45 @@
+## 编号分析（全文通读）
+
+1. **第 1–40 行（常量/接口定义）**：无输入处理，仅类型声明。
+
+2. **第 96–130 行 `New()`**：仅对 BatchSize/Concurrency/MessageRate 做下限修正，配置来自服务端文件，非攻击者可控入口。
+
+3. **第 133–141 行 `AddMessenger` / 第 144–160 行 `PushMessage` / 第 163–176 行 `PushCampaignMessage`**：消息入队，超时保护存在；`PushCampaignMessage` 调用 `attachMedia`（第 511–524 行），从 store 按 ID 取附件——附件的 `Filename` 字段来自媒体上传记录（管理员上传），是本文件的潜在 source。
+
+4. **第 179–196 行 `HasMessenger/HasRunningCampaigns/GetCampaignStats`**：只读查询，无 sink。
+
+5. **第 199–247 行 `Run()` / 第 283–318 行 `scanCampaigns`**：后台扫描 DB，campaign 数据来自数据库（管理员创建），进入 pipe 处理，无直接外部参数拼接。
+
+6. **第 250–279 行模板缓存函数**：`CacheTpl` 缓存 tx 模板，模板内容为管理员编辑，属受信内容；`Safe` 函数（第 494–496 行）显式标记任意字符串为 `template.HTML`，但输入来自管理员编写的模板本身，属于设计上的信任边界内功能。
+
+7. **第 321–372 行 `TemplateFuncs`**：`TrackView` 用 `fmt.Sprintf(m.cfg.ViewTrackURL, ...)` 拼 HTML img 标签——URL 来自订阅者 UUID（DB 生成的 UUID）与配置，不可控注入。`UnsubscribeURL/OptinURL/MessageURL` 均基于配置 URL 模板与 UUID。
+
+8. **第 396–479 行 `worker()`**：关键区段。
+   - 第 441–446 行：自定义 headers `for hdr, val := range set { h.Add(hdr, val) }` —— Campaign.Headers 来自管理员在后台设置的邮件头。若值中含 CRLF，`h.Add` 后由 messenger 写出时可能注入额外邮件头（CWE-93）。这是第二入口，但需要管理员权限。
+   - 第 456 行：`m.messengers[msg.Campaign.Messenger].Push(out)` —— Messenger 名来自 DB，若不存在会 panic（map 越界返回 nil 接口调用），属可用性问题而非安全漏洞。
+
+9. **第 482–508 行 `trackLink`**：url 来自模板中的链接（管理员编写），做缓存与 DB 注册，失败回退原 URL；无过滤但 source 受信。
+
+10. **第 527–543 行 `MakeAttachmentHeader(filename, encoding, contentType)`**：**核心问题点**。filename 直接拼入：
+    - `Content-Disposition: attachment; filename=` + filename
+    - `Content-Type: ...; name="` + filename + `"`
+    
+    无任何转义/校验（未过滤 CR/LF、引号、分号）。filename 源于媒体库上传的文件名（经 `attachMedia` → `store.GetAttachment` 进入 `c.Attachments`，最终随邮件发送）。攻击路径：拥有媒体上传权限的低权用户上传文件名为 `a.pdf"\r\nBcc: victim@x.com\r\n...` 的附件 → 邮件头注入（CWE-93/CWE-74）。即使仅限管理员，也违反最小信任；且历史上该函数确实缺少净化。
+
+11. **第 486–500 行 `makeGnericFuncMap`**：加载 sprig 全量函数到模板环境——sprig 含 `env`、`exec` 等危险函数，扩大了模板注入的影响面（若模板可被低权用户编辑则为 CWE-1336 放大器），但模板默认仅管理员可编辑。
+
+12. **并发检查**：links/tpls/pipes 的锁使用正确；`Close()` 关闭 channel 可能与 worker 冲突，属健壮性问题。
+
+**结论**：最明确的安全缺陷是第 527–543 行 `MakeAttachmentHeader` 对 filename 未做任何头部字符净化，构成邮件头注入（source：附件文件名，sink：Content-Disposition/Content-Type 头）；次要风险为第 441–446 行自定义 header 未验证 CRLF。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-93: Improper Neutralization of CRLF Sequences in HTTP Headers (Email Header Injection)",
+  "risk_level": "medium",
+  "source": "line 511-524: attachMedia 从 store.GetAttachment 加载的附件 Filename（源于媒体上传的文件名）",
+  "sink": "line 536-538: MakeAttachmentHeader 将 filename 未转义直接拼入 Content-Disposition 与 Content-Type 头",
+  "explanation": "附件文件名 -> attachMedia -> c.Attachments -> 邮件构建时调用 MakeAttachmentHeader -> filename 直接拼接进 Content-Disposition: attachment; filename= 和 Content-Type name= 字段，全程无 CR LF 引号等字符过滤，恶意文件名可注入任意邮件头（如 Bcc 或覆盖 Subject），实现邮件头注入",
+  "fix_suggestion": "line 536: 对 filename 做净化，剥离或编码 CR LF 及引号分号等特殊字符（例如 strings.ReplaceAll 去除 \\r \\n 并对双引号转义），或改用 mime.FormatMediaType 构造头部值"
+}
+```

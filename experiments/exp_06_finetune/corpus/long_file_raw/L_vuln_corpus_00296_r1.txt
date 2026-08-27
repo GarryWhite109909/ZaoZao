@@ -1,0 +1,40 @@
+# 编号分析（全文逐函数）
+
+**入口点枚举**
+- 入口1：构造函数（第20-27行）——`calcFormula` 来自表单定义数组 `$values[self::FIELD_CALCFORMULA]`（第22行），即 Bazar 表单配置，属于可被有表单编辑权限者控制的持久化输入。
+- 入口2：`formatValuesBeforeSave($entry)`（第43行）——保存条目时触发，`$entry` 为用户提交的表单数据。
+- 入口3：`renderStatic($entry)`（第32行）——渲染输出通道。
+- 入口4：`jsonSerialize()`（第118行）——将 `calcFormula` 原样输出到 API/JSON 通道。
+- 辅助入口：`getEntryValue` / `testEntryValue` / `getPropertyNameIfDefined`（第90-115行）——读取用户条目字段值。
+
+**source→sink 数据流验证**
+
+1. **主数据流：calcFormula → eval（第22行 → 第76行）**
+   - 第44-48行定义白名单正则；第49行 `preg_match_all` 对公式分词。
+   - 第51-67行重建 `$formula`：操作符/括号直接拼接（第54行）；数字经 `floatval`（第57行）；函数名直接拼接（第60行）——注意此处函数名仅做“名字级”校验，未校验后续调用形态；字段名经 `floatval` 转换（第92行）；test 结果仅为 `'1'/'0'`（第108行）。
+   - 第68行删除空白；第70-71行用递归正则做最终校验；第74-75行 `eval("\$value = $formula;")`。
+   - 防御有效性评估：整个防御链完全依赖正则白名单。按分析要求第2条，正则过滤视为可绕过、不构成有效防御：
+     - 分词阶段会**静默丢弃**未匹配字符（如反引号、引号、`;`、字母等），攻击面被压缩，但最终校验正则（第71行）结构复杂、使用递归子模式 `(?1)`，且允许项之间操作符为可选（`(?' . $operators . '(?1))?`），存在令牌邻接重组出非预期表达式结构的可能；
+     - 函数名分支（第60行）只拼名字不限制实参来源，而实参可由多层嵌套的 `函数(...)` 组成，历史上该类“白名单+递归正则+eval”组合在 YesWiki 中已被证明可绕过（该项目后续版本正是针对此 eval 注入做了加固）；
+     - 一旦绕过，eval 即任意 PHP 代码执行。
+   - 结论：source（第22行 calcFormula）→ sink（第75行 eval）之间存在依赖可绕过正则的代码执行风险。
+
+2. **第二入口/替代通道**
+   - `renderStatic`（第32-41行）：`displayText` 与条目值拼接后交给 `text.twig`，若模板未转义则构成存储型 XSS 的替代通道（第38行），但主要风险仍集中于 eval。
+   - `jsonSerialize`（第118-127行）：`calcFormula` 原样进入 JSON 输出，可作为注入载荷的投递/回显通道。
+   - `getEntryValue`（第90-93行）：`floatval` 强转，数值型 sink 安全；`testEntryValue` 返回值受限，安全。
+
+3. **其他函数**
+   - 构造函数、`renderInput`（第29行返回空串）、getter 方法均无危险 sink。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-95 (Eval Injection) / CWE-94",
+  "risk_level": "high",
+  "source": "line 22: calcFormula 来自表单定义 values[FIELD_CALCFORMULA]，可由具备表单编辑权限的用户写入并持久化",
+  "sink": "line 75: eval(\"$value = $formula;\")",
+  "explanation": "表单公式 calcFormula 经第49行 preg_match_all 分词、第51-67行重建后，在第75行进入 eval 执行。全部防御仅依赖第44-48行的白名单正则与第71行的递归校验正则；按规则正则过滤视为可绕过：分词器静默丢弃未匹配字符与最终正则中可选操作符导致的令牌邻接重组，使攻击者有机会构造通过校验的非预期表达式，从而实现任意 PHP 代码执行。替代通道包括第38行 renderStatic 的模板输出与第118行 jsonSerialize 的原样回显。",
+  "fix_suggestion": "line 75: 移除 eval，改用安全表达式求值器（如 symfony/expression-language 或自研 AST 解析器），仅对数字与白名单函数构建语法树后求值；同时将 calcFormula 的编辑权限严格限制于管理员并在写入时二次校验"
+}
+```

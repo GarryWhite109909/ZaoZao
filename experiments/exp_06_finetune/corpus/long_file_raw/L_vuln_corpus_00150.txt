@@ -1,0 +1,23 @@
+# 逐点分析
+
+**入口点枚举（全文）：**
+
+1. **构造函数 `TableChatAgent.__init__`（第 96-120 行）**：接收 `config.data`（文件路径/URL/DataFrame，第 84 行），经 `read_tabular_data` 加载数据。数据来源若为用户可控 URL/文件，属于外部输入 source；但仅用于构建 DataFrame，无直接危险 sink。
+
+2. **系统消息格式化（第 106 行）**：`config.system_message.format(summary=summary)` —— summary 来自 `dataframe_summary(df)`（第 42-90 行），其中分类列的唯一值直接拼入字符串。若数据内容含 `{...}` 格式化占位符可引发 format 异常或注入提示词，但影响限于 LLM 提示，非代码执行 sink。
+
+3. **核心 sink：`pandas_eval` 方法（第 137-176 行）**：
+   - **source**：第 143 行 `exprn = msg.expression` —— 表达式由 LLM 通过 `PandasEvalTool` 工具调用生成，而 LLM 输出可被用户查询间接操控（prompt injection），也可被恶意数据集内容（如单元格文本诱导 LLM）操控。
+   - **sink**：第 155 行 `pd.eval(exprn, local_dict=local_vars)`。
+   - **防御验证**：代码对表达式**没有任何过滤、白名单、AST 校验或沙箱隔离**。`pd.eval` 使用 numexpr/pandas 引擎，虽不直接支持任意 Python 调用，但 pandas 文档明确警告不可对不可信输入使用；且当表达式触发 fallback 到 Python 引擎（如使用 `@local_var` 或复杂语法时），可实现更广的求值能力。此外第 149-153 行重定向 `sys.stdout` 且在异常路径下若 `pd.eval` 抛出非 Exception 基类错误（如 KeyboardInterrupt/SystemExit），`sys.stdout` 永不恢复——这是次要缺陷。
+   - 结论：source→sink 数据流无有效防御，LLM 可生成（被用户或数据投毒诱导的）表达式在宿主进程上下文中执行，存在代码执行风险。
+
+4. **第二通道确认**：`handle_message_fallback`（第 178-194 行）与 `user_response`（第 125-133 行）不引入新的执行 sink；工具消息处理框架将 LLM 的 `pandas_eval` 工具调用直接路由到该方法，即 LLM 输出是唯一但完全无防护的表达式来源。
+
+5. **替代通道**：无环境变量读取、无回调注册、无文件写入。唯一危险 sink 即 `pd.eval`。
+
+**结论**：存在漏洞 —— 不可信 LLM 生成表达式未经校验直接传入 `pd.eval` 执行（CWE-95 漏洞代码求值 / Eval Injection）。风险等级：高（取决于部署是否暴露给不可信用户/数据）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-95", "risk_level": "high", "source": "line 143: exprn = msg.expression, 由 LLM 生成的工具调用参数, 可被用户 prompt injection 或恶意数据集内容间接操控", "sink": "line 155: pd.eval(exprn, local_dict=local_vars) 在宿主进程内动态求值", "explanation": "LLM 生成的 expression 字符串 -> 无任何白名单/AST校验/沙箱 -> 直接传入 pd.eval 动态执行, 攻击者可通过提示词注入或投毒数据集诱导 LLM 生成恶意表达式实现任意代码执行; 另外第 149-153 行 sys.stdout 重定向在异常路径下可能无法恢复", "fix_suggestion": "line 155: 移除 pd.eval, 改用受限 DSL(如只允许列选择/聚合的白名单解析器), 或在独立沙箱子进程/容器中执行并对表达式做 AST 白名单校验, 同时用 try-finally 保证 sys.stdout 恢复"}
+```

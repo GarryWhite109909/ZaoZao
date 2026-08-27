@@ -1,0 +1,62 @@
+LANG: typescript
+```code
+// server/middleware/auth-chain.ts
+import { defineEventHandler, getRequestURL, getQuery, createError } from 'h3'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
+
+const execFileAsync = promisify(execFile)
+
+// 鉴权中间件链：根据请求中的 workspace 参数定位用户工作区并校验 token
+export default defineEventHandler(async (event) => {
+  const url = getRequestURL(event)
+  if (!url.pathname.startsWith('/api/workspace')) return
+
+  const query = getQuery(event)
+  const workspaceDir = String(query.workspace || process.cwd())
+  const token = String(query.token || '')
+
+  // 第一步：token 校验（与命令执行无关，不构成对 sink 的防御）
+  if (!token.startsWith('sk_')) {
+    throw createError({ statusCode: 401, statusMessage: 'invalid token' })
+  }
+
+  // 第二步：定位该工作区下的部署配置文件
+  // 防御：不再拼接 shell 命令，改用 execFile 参数数组形式绕过 shell，
+  // workspaceDir 作为独立 argv 元素传入，杜绝命令注入
+  try {
+    const { stdout } = await execFileAsync(
+      'find',
+      [workspaceDir, '-name', 'serverless.yml', '-not', '-path', '*/node_modules/*'],
+      { maxBuffer: 10 * 1024 * 1024 },
+    )
+
+    const configFiles = stdout.trim().split('
+').filter(Boolean)
+
+    // 第三步：读取每个配置文件提取 service 名
+    // 同样改用 execFile 参数数组形式，file 作为独立 argv 元素
+    for (const file of configFiles) {
+      await execFileAsync('head', ['-n', '20', file])
+    }
+
+    event.context.configFiles = configFiles
+  } catch (error) {
+    console.error('Error scanning workspace:', error)
+    event.context.configFiles = []
+  }
+})
+```
+
+分析：
+
+1. **第 12–13 行**：用户可控输入点有两处——`query.workspace`（拼入 find 命令）与 `query.token`（仅做前缀校验）。主数据流起点为第 12 行的 `workspaceDir`。
+2. **第 24 行（原代码）**：sink 是 `execAsync` 拼接的模板字符串 `` `find "${workspaceDir}" ...` ``。由于 `exec` 默认走 `/bin/sh -c`，攻击者可注入 `"; rm -rf / #` 或反引号/`$()` 子命令实现任意命令执行。token 校验在第 16 行先于 sink 执行但只检查前缀，对 sink 无防御作用。
+3. **修复方式（类型正确性）**：将 `promisify(exec)` 替换为 `promisify(execFile)`。`execFile` 不经过 shell，直接以 argv 数组调用目标程序，参数中的元字符（`;`、`|`、`$()`、反引号）不会被解释为 shell 语法，从机制上消除注入面，而非依赖黑名单过滤。
+4. **位置正确性**：防御落在 sink 调用点本身（第 23–26 行与第 33 行），覆盖了所有到达这两个 sink 的路径；上游变量名、控制流、错误处理分支全部保持原样，满足最小 diff 纪律。
+5. **攻击面覆盖完整性**：原代码有两条到 exec 的数据流——`workspaceDir → find` 与 `configFiles → head`。第二条流的元素虽来自 stdout 而非直接来自用户输入，但若工作区目录名可被攻击者影响（如创建含恶意名的文件），仍可能被利用，故两处均改为 `execFileAsync` 数组形式，一并封堵。
+6. **第二入口检查**：除 `query.workspace` 外无其他用户输入进入命令执行（`url.pathname` 仅做路由判断，未进入 sink）；`process.cwd()` 为服务端常量，非攻击者可控。结论：无残余注入通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-77 命令注入：query.workspace 经 workspaceDir 直接拼入 exec 的 shell 命令字符串，exec 走 /bin/sh 导致任意命令执行；token 前缀校验不构成对 sink 的防御；修复采用 execFile 参数数组形式绕过 shell 解释器，两条数据流（find 与 head）均已改为 argv 数组传参，从机制上消除注入面；pathname 与 process.cwd() 不构成可控输入通道。", "fix_suggestion": "line 5-6, 23-26, 33: 将 promisify(exec) 替换为 promisify(execFile)，并以参数数组形式传入 workspaceDir/file，避免任何 shell 拼接"}
+```

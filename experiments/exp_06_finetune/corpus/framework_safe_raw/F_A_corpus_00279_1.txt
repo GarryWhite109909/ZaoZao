@@ -1,0 +1,127 @@
+LANG: php
+```php
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use App\Models\Post;
+
+class PostRenderController extends Controller
+{
+    /**
+     * Force-rerender a post and backfill missing image dimensions
+     * by fetching the image URL stored on each image card payload.
+     */
+    public function rerender(Request $request, int $postId)
+    {
+        $post = Post::findOrFail($postId);
+
+        $mobiledoc = json_decode($post->mobiledoc_json, true);
+        if (!is_array($mobiledoc) || !isset($mobiledoc['cards'])) {
+            return response()->json(['error' => 'invalid mobiledoc'], 422);
+        }
+
+        foreach ($mobiledoc['cards'] as $card) {
+            [$cardName, $payload] = $card;
+
+            if ($cardName !== 'image' || empty($payload['src'])) {
+                continue;
+            }
+            if (!empty($payload['width']) && !empty($payload['height'])) {
+                continue;
+            }
+
+            try {
+                // fetch the remote image to read its dimensions (SSRF-hardened)
+                $url = $this->validateImageUrl((string) $payload['src']);
+                if ($url === null) {
+                    Log::warning('image url rejected by allowlist', ['url' => $payload['src']]);
+                    continue;
+                }
+                // follow redirects but re-validate each hop against the allowlist
+                $response = Http::timeout(5)
+                    ->withOptions(['allow_redirects' => ['on_redirect' => function ($req, $res, $uri) {
+                        if (!$this->isAllowedHost(parse_url((string) $uri, PHP_URL_HOST))) {
+                            throw new \RuntimeException('redirect to disallowed host');
+                        }
+                    }]])
+                    ->get($url);
+                if ($response->successful()) {
+                    $size = getimagesizefromstring($response->body());
+                    if ($size !== false) {
+                        $payload['width'] = $size[0];
+                        $payload['height'] = $size[1];
+                    }
+                }
+            } catch (\Throwable $e) {
+                Log::error('image size fetch failed', ['url' => $payload['src']]);
+            }
+        }
+
+        $post->update(['mobiledoc_json' => json_encode($mobiledoc)]);
+
+        return response()->json(['status' => 'ok']);
+    }
+
+    /**
+     * Defense: strict scheme+host allowlist before any outbound request.
+     * Returns the validated URL string or null when rejected.
+     */
+    private function validateImageUrl(string $rawUrl): ?string
+    {
+        $parts = parse_url($rawUrl);
+        if ($parts === false || !isset($parts['scheme'], $parts['host'])) {
+            return null;
+        }
+        // only https is allowed; no http, no file/data/gopher/dict schemes
+        if (strtolower($parts['scheme']) !== 'https') {
+            return null;
+        }
+        // reject userinfo tricks like https://evil@internal-host/
+        if (!empty($parts['user']) || !empty($parts['pass'])) {
+            return null;
+        }
+        // reject port-based bypasses except default 443
+        if (isset($parts['port']) && $parts['port'] !== 443) {
+            return null;
+        }
+        if (!$this->isAllowedHost($parts['host'])) {
+            return null;
+        }
+        return $rawUrl;
+    }
+
+    /**
+     * Exact-match allowlist of permitted image CDN hosts.
+     */
+    private function isAllowedHost(?string $host): bool
+    {
+        if ($host === null || $host === '') {
+            return false;
+        }
+        $host = strtolower(rtrim($host, '.'));
+        static $allowed = [
+            'cdn.example.com',
+            'images.example.com',
+            'media.example-cdn.net',
+        ];
+        return in_array($host, $allowed, true);
+    }
+}
+```
+
+分析：
+
+1. 第 24 行 `rerender(Request $request, int $postId)`：用户可控输入点为框架路由参数 `$postId`（用于 ORM 查找，无注入面）与存储于数据库的 `$post->mobiledoc_json` 中每张 image 卡片的 `payload['src']`——该字段由作者/编辑者写入，属于间接用户可控输入，是 SSRF 主链起点。
+2. 第 33–37 行：控制流保持原样，仅筛选缺尺寸的 image 卡片；第 40 行起进入原 sink 所在 try 块。原代码第 42 行直接 `Http::timeout(5)->get($payload['src'])`，将未校验 URL 交给 HTTP 客户端发起出站请求，构成 CWE-918 的 sink。
+3. 第 43–46 行插入防御第一层：新增辅助函数 `validateImageUrl` 在请求发出前对 URL 做 scheme 精确白名单（仅允许 `https`，拒绝 `http/file/data/gopher` 等）、拒绝 userinfo（`https://evil@internal/` 绕过）、拒绝非 443 端口绕过；类型正确性体现在入参强制 `(string)` 转换、返回 `?string`，null 即拒绝并记录 warning 后 continue，不中断其余卡片处理，位置正确性体现在校验位于 sink 调用之前、数据流必经点。
+4. 第 47–53 行防御第二层：通过 Guzzle 原生 `allow_redirects.on_redirect` 回调在每次重定向跳转时重新调用 `isAllowedHost` 校验目标 host，覆盖重定向导致的攻击面逃逸；第 55–62 行 `isAllowedHost` 使用 `in_array(..., true)` 对固定 CDN 主机列表做严格精确匹配（白名单精确允许集），并做小写化与尾部点号归一化防止大小写/FQDN 尾点混淆，杜绝子串匹配与黑名单式绕过。
+5. 防御有效性论证：修复采用「scheme 白名单 + host 精确白名单 + 重定向逐跳复检」三重框架原生安全 API 组合，非黑名单/正则过滤/str_replace；内网地址（169.254.169.254 元数据端点、10.x/127.0.0.1 等）因不在允许集内一律被拒，DNS rebinding 因重定向回调按最终 URI 复检而受限；业务逻辑（尺寸回填、mobiledoc 更新）与数据流走向完全不变。
+6. 第二入口/替代通道检查：`$postId` 经 Eloquent `findOrFail` 参数化查询，无 SQL 注入；`json_encode` 输出经 `response()->json()` 自动转义，无 XSS 注入面；除 `Http::get($url)` 外代码中不存在其他出站请求或文件读取通道，SSRF 数据流唯一，已全部覆盖。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-918 SSRF：数据库中 mobiledoc 卡片 payload 的 src 字段（间接用户可控）未经校验直接传入 Http::get 发起出站请求；修复采用 https scheme 白名单加 CDN host 精确 in_array 允许集，并在重定向 on_redirect 回调中逐跳复检 host，拒绝 userinfo 与非标端口绕过；postId 走 Eloquent findOrFail 参数化查询无注入，JSON 输出走 response()->json 自动转义，无其他出站请求通道", "fix_suggestion": "line 43: 在 Http::get 调用前插入 validateImageUrl 白名单校验并以校验后的 url 发起请求"}
+```

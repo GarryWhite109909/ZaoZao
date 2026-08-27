@@ -1,0 +1,56 @@
+LANG: python
+```python
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+from urllib.parse import urlencode
+import html
+
+app = FastAPI()
+
+@app.get("/oauth2/authorize/consent", response_class=HTMLResponse)
+async def consent_page(request: Request):
+    params = dict(request.query_params)
+    client_name = params.get("client_name", "")
+    client_desc = params.get("client_description", "")
+    user_name = params.get("user_name", "")
+    scopes = params.get("scopes", "").split()
+
+    # build redirect target from raw request path + query string (escaped)
+    target = request.url.path
+    if request.url.query:
+        target = target + "?" + request.url.query
+
+    scope_items = "".join(
+        f"<li>{html.escape(s)}</li>" for s in scopes
+    )
+
+    # FIXED: escape all interpolated values with html.escape before
+    # inserting into the HTML template; escape the URL for attribute context
+    page = f"""
+    <html><body>
+      <h1>Authorize {html.escape(client_name)}</h1>
+      <p>{html.escape(client_desc)}</p>
+      <p>Logged in as: {html.escape(user_name)}</p>
+      <ul>{scope_items}</ul>
+      <form method="post" action="/oauth2/authorize/decision?target={urlencode({'target': target})}">
+        <input type="hidden" name="csrf" value="">
+        <button type="submit">Allow</button>
+      </form>
+    </body></html>
+    """
+    return HTMLResponse(content=page)
+```
+
+1. 第 6-11 行：用户可控输入点为 `request.query_params` 中的 `client_name`、`client_description`、`user_name`、`scopes`，以及第 15-18 行的 `request.url.path` 与 `request.url.query`，全部为攻击者可完全控制的反射输入。
+
+2. 第 27-29 行 sink 分析：原代码将 `client_name`、`client_desc`、`user_name` 直接插入 HTML 元素上下文（h1/p 标签之间），无任何转义。修复采用 `html.escape()`（默认 quote=True），对 `<>&'"` 全部实体化，类型正确——输出上下文是 HTML body 文本节点，HTML 实体编码是该上下文的唯一正确防御；位置正确——在插值点即 sink 处转义，覆盖所有进入模板的路径。
+
+3. 第 33 行 action 属性 sink：原代码把未转义的 `target` 拼入双引号包裹的 URL 属性，攻击者可通过注入 `" onmouseover=...` 或 `"><script>` 突破属性边界。修复改用框架生态标准的 `urlencode({'target': target})` 做百分号编码，`"`、`<`、`>`、空格等均被编码为 `%22` 等，属性边界无法被突破，且不改变 URL 语义（服务端解析时还原）。
+
+4. 攻击面覆盖完整性检查：模板中所有动态插值共四处——三个文本上下文用 `html.escape`、一个属性上下文用 `urlencode`，逐一对应各自的输出上下文类型，无遗漏的原始插值；`scope_items` 在第 24-26 行原本已正确转义，保持不变以满足最小 diff 纪律。
+
+5. 第二入口/替代通道检查：本路由仅此一个 HTML 渲染 sink；`target` 仅用于 form action，无后续重定向拼接或日志注入通道；POST `/oauth2/authorize/decision` 不在本函数数据流内。结论：所有 XSS 反射链路均已闭合。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-79 反射型 XSS：query 参数 client_name/client_description/user_name 未转义直接插入 HTML 文本上下文，target 由 request.url.path+query 拼接后未编码插入 form action 双引号属性上下文，均可被攻击者构造恶意链接触发脚本执行；修复后文本上下文统一使用 html.escape(quote=True) 实体化，属性上下文使用 urlencode 百分号编码，四条插值链路全部闭合，已转义的 scope_items 保持原样，构成 minimal pair 对照。", "fix_suggestion": "line 28-30: 对 client_name/client_desc/user_name 包裹 html.escape(); line 34: 将 target 改为 urlencode({'target': target}) 后再拼入 action 属性"}
+```

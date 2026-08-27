@@ -1,0 +1,29 @@
+## 编号分析（全文逐函数）
+
+**1. `GetUser`（第 15–44 行）——入口点：容器镜像/运行时传入的 `username` 字符串**
+- 第 16–19 行：`username == ""` 时置为 `"0"` 并标记 `isDefault`，随后第 38–40 行在解析失败时回退为 `(0,0,nil)`。此路径本身语义是“默认 root”，但结合下游调用方（如 buildkit/moby 中镜像未声明 USER 时）会静默以 root 运行，属于已知的提权类缺陷模式。
+- 第 22–24 行：调用 `ParseUIDGID(username)` 走快速路径。
+
+**2. `ParseUIDGID`（第 47–62 行）——漏洞核心 sink**
+- 第 48–50 行：**当 `str == ""` 时直接返回 `(0, 0, nil)`，即空字符串被解释为 UID=0/GID=0（root），且无错误**。这是一个明确的 source→sink 数据流：
+  - source：外部可控的 user 字符串（镜像配置 `User` 字段、API 参数等，经 `GetUser` 第 22 行或直接调用进入）；
+  - 过滤验证：无任何校验，空串被当作合法的 “0”；
+  - sink：第 50 行返回 uid=0/gid=0，最终经 `WithUIDGID`（第 72–78 行）写入 `s.Process.User.UID/GID`（第 75–76 行），进程以 root 运行。
+- 这正是 CVE-2023-27561（moby/buildkit 系）的模式：攻击者控制构建输入使 user 解析结果为空串时，容器以 root 而非预期非特权用户运行，绕过 USER 指令的非特权约束。
+
+**3. `openUserFile`（第 65–71 行）**
+- 使用 `fs.RootPath(root, p)` 做路径规整防逃逸，p 为常量 `/etc/passwd`、`/etc/group`，root 来自调用方；此处无注入面，防御有效。
+
+**4. `parseUID`（第 74–81 行）**
+- 仅接受 `"root"` 或纯数字，`ParseUint` 严格解析，无绕过。
+
+**5. `WithUIDGID` / `setProcess` / `ensureAdditionalGids`（第 84–110 行）**
+- 将上游返回的 uid/gid/sgids 直接写入 OCI Spec 的 Process.User，无二次校验——上游 `ParseUIDGID` 返回的 (0,0) 会原样落盘到运行时 spec，构成完整可达链路。
+
+**第二入口/替代通道**：`ParseUIDGID` 是导出函数，除 `GetUser` 外可被其他包直接调用（历史上 moby `daemon/oci_linux.go` 即如此），空串通道独立于 `GetUser` 的 `isDefault` 回退逻辑存在，两处均无法拦截“显式空 user → root”。
+
+## 结论
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-250: Execution with Unnecessary Privileges", "risk_level": "high", "source": "line 47-50: ParseUIDGID 接收的外部可控 user 字符串（空串分支）", "sink": "line 50 返回 (0,0)，经 line 22 GetUser 快速路径及 line 75-76 WithUIDGID 写入 s.Process.User.UID/GID", "explanation": "外部传入的空 user 字符串 -> ParseUIDGID 在 line 49 对空串不报错而是返回 uid=0 gid=0 -> GetUser line 23 直接采纳该快速路径结果 -> WithUIDGID 将其写入 OCI spec，容器进程以 root 运行，绕过镜像 USER 非特权约束（对应 CVE-2023-27561 类问题）；文件内无任何针对空串的有效防御", "fix_suggestion": "line 48-50: 当 str 为空时应返回错误而非 (0,0,nil)，例如改为 if str == '' { return 0, 0, errors.New('empty user') }，由调用方显式决定默认用户语义"}
+```

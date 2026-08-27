@@ -1,0 +1,73 @@
+# MessageTemplate 安全分析
+
+## 一、文件结构通读与入口点枚举
+
+本文件是 nonebot2 的 `MessageTemplate` 类（`string.Formatter` 子类），无网络路由、无文件 IO、无环境变量读取。所有潜在攻击面集中在**模板字符串本身**与**格式化参数**两条通道上。
+
+### 1. `__init__`（第 36-40 行）
+- 入口点：`template: Union[str, TM]` 与 `factory`。
+- 仅做赋值，不执行格式化，无 sink。
+
+### 2. `__repr__`（第 42-43 行）
+- 使用 f-string 输出 `self.template!r`，repr 转义防止注入，且仅用于调试输出，非安全 sink。
+
+### 3. `add_format_spec`（第 45-50 行）
+- 入口点：`spec` 函数与可选 `name`。
+- 若 `name` 已存在则抛错（第 48 行），防重复注册；注册的函数后续在 `format_field` 中被调用——这是**回调型 sink**，但函数由开发者代码注册，非用户可控，除非应用层把用户输入直接作为 spec 名传入（见第五节）。
+
+### 4. `format` / `format_map` / `_format`（第 52-88 行）
+- 入口点：`*args, **kwargs` 或 `mapping`。
+- 第 66-75 行：若 template 是 str，调用 `_vformat`；若是 Message 实例，对每个文本段逐个 `_vformat(str(seg), ...)`（第 73 行）——注意这里把消息段的**文本内容**作为格式串传入，构成第二入口：若上游将用户输入拼进 Message 文本段再交给模板格式化，同样触发下述漏洞。
+- 第 77 行 `check_unused_args` 未在本类重写，为 Formatter 默认空实现，无防御作用。
+
+### 5. `vformat`（第 90-97 行）
+- 直接 raise NotImplementedError，堵死了父类 `vformat` 直调路径，属于有效防御（防止绕过 `_format` 的封装）。
+
+### 6. `_vformat`（第 99-152 行）——核心数据流
+- source：`format_string` 参数（来自第 65/73 行的 `self.template` 或消息段文本）。
+- 第 106 行 `self.parse(format_string)` 解析出 field_name。
+- 第 118-133 行处理自动/手动索引切换，仅是编号逻辑校验，非安全防御。
+- 第 136 行 `obj, arg_used = self.get_field(field_name, args, kwargs)`：field_name 来自模板字符串，可含属性访问语法如 `{0.__class__.__init__.__globals__}` —— 这是经典 Python format-string 注入的读取原语。
+- 第 141-146 行：`convert_field`、`format_field(obj, format_spec)` 处理结果。
+
+### 7. `format_field`（第 154-163 行）——关键 sink
+```python
+formatter = self.format_specs.get(format_spec)
+if formatter is None and not issubclass(self.factory, str):
+    segment_class = self.factory.get_segment_class()
+    method = getattr(segment_class, format_spec, None)   # 第 158 行
+    if callable(method) and not method.__name__.startswith("_"):
+        formatter = getattr(segment_class, format_spec)
+return super().format_field(value, format_spec) if formatter is None else formatter(value)  # 第 162 行
+```
+- source→sink 流：模板中的 `{value:spec}` → `getattr(segment_class, spec)` → `formatter(value)`。
+- 防御分析：
+  - 黑名单仅排除以 `_` 开头的方法名（第 160 行），按题目要求黑名单视为可绕过：Python 对象上大量公开方法可被滥用（如适配器上的发送/请求方法、`get` 类方法等），取决于具体 MessageSegment 子类暴露了哪些公开方法。
+  - 若 `factory` 为 `str`（默认），该分支关闭，回落到 `super().format_field`，后者只做标准 `format(value, spec)`，无代码执行，仅有信息泄露风险。
+- 另一条流：`get_field` 支持任意属性链遍历（继承自 `Formatter.get_field`），配合 `{0.__class__...}` 可读取进程内对象图，造成敏感信息泄露（CWE-134/CWE-200）。本类未像某些框架那样覆写 `get_field` 限制访问深度或字段白名单——确认全文无此防御。
+
+### 8. `_add`（第 165-168 行）
+- 纯拼接逻辑，TypeError 时转 str 相加，无注入面。
+
+## 二、source→sink 汇总验证
+
+| # | source | sink | 防御 | 结论 |
+|---|--------|------|------|------|
+| 1 | 用户可控模板字符串（第 37 行存入 self.template） | 第 136 行 `get_field` 属性遍历 | 无任何限制 | 信息泄露可达 |
+| 2 | 模板中 format_spec（第 106 行 parse 产出） | 第 158-162 行 getattr+调用 | 仅 `_` 前缀黑名单 | 可绕过（黑名单无效） |
+| 3 | Message 文本段作为模板（第 73 行） | 同 #1/#2 | 无 | 第二入口成立 |
+| 4 | `vformat` 绕过路径 | — | 第 97 行显式 raise | 有效封堵 |
+
+需要说明：这不是远程 RCE 的直接链——`formatter(value)` 只能调用 MessageSegment 类上的公开方法，实际危害取决于具体子类；而属性遍历泄露（#1）在默认 `str` factory 下即可达。综合判定存在真实漏洞（格式化字符串注入，CWE-134），风险等级中危（信息泄露为主，特定 adapter 下可能升级）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-134 Format String Injection",
+  "risk_level": "medium",
+  "source": "line 37: __init__ 接收外部可控的 template 字符串; line 73: Message 文本段作为第二入口进入 _vformat",
+  "sink": "line 136: get_field 支持任意属性链遍历导致信息泄露; line 158-162: getattr(segment_class, format_spec) 后 formatter(value) 回调执行",
+  "explanation": "模板字符串经 parse 解析后, field_name 未做白名单限制即传入 get_field, 攻击者可用 {0.__class__.__mro__} 等属性链遍历对象图窃取敏感数据; format_spec 仅用下划线前缀黑名单过滤(line 160), 黑名单可绕过, 当 factory 非 str 时可调用 MessageSegment 上任意公开方法并传入攻击者控制的 value, 构成受限的任意方法调用; check_unused_args 为空实现无防御, vformat 直调路径已被 line 97 封堵",
+  "fix_suggestion": "line 136: 重写 get_field 限制字段名为白名单标识符并禁止属性/索引访问; line 158: 将 format_spec 改为显式白名单(仅允许已注册的 format_specs), 移除基于 getattr 的动态方法查找"
+}
+```

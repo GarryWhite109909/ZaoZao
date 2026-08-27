@@ -1,0 +1,86 @@
+# 全文逐函数安全分析
+
+## 0. 前置事实：gitcmd 的防御原语（判定依据）
+
+本文件所有命令构造都经过 `gitea.dev/modules/git/gitcmd`。该包的关键语义（Gitea 上游真实实现）：
+- `AddArguments`：仅用于硬编码可信参数；
+- `AddDynamicArguments`：接受外部输入，但**拒绝以 `-` 开头的参数**（防选项注入），且所有参数经 `exec` 以 argv 数组传递、不经 shell（无命令拼接注入面）；
+- `AddDashesAndList`：在用户参数前强制插入 `--` 分隔符（防“参数被解释为选项/路径”）。
+
+以下逐函数验证。
+
+## 1. 第 21–28 行 `ShowPrettyFormatLogToList`
+
+- 入口点：`revisionRange` 参数（上游调用者来自分支名/标签名等用户可控输入，是本文件最主要的 source）。
+- 数据流：第 25 行 `AddDynamicArguments(revisionRange)` → 第 26 行 `RunStdBytes` 执行 `git log --pretty=format:%H <revisionRange> --`。
+- 防御验证：
+  - 无 shell 拼接 → 不存在命令注入；
+  - `revisionRange` 若以 `-` 开头（如 `--output=/tmp/x` 或 `--exec` 类选项注入尝试），会被 `AddDynamicArguments` 的破折号检查直接拒绝；
+  - 尾部第 26 行的 `"--"` 进一步把后续内容限定为路径占位。
+- 结论：source→sink 链上双重有效防御，无可利用注入。
+
+## 2. 第 31–48 行 `parsePrettyFormatLogToList`
+
+- 输入为第 23 行 git 自身输出的 commit hash 字节流，仅做 `bytes.SplitSeq` 与 `GetCommit(string(commitID))`。
+- commitID 来自 `%H` 格式输出（40/64 位十六进制），非用户直控；即使异常值传入 `GetCommit`，该函数内部同样走 gitcmd 的动态参数防护。
+- 无 sink 风险。
+
+## 3. 第 51–55 行 `IsRepoURLAccessible`
+
+- 入口点：`url` 参数（上游用于迁移表单校验，用户可控）。
+- 数据流：第 53 行 `AddDynamicArguments(url, "HEAD")` → `git ls-remote -q -h <url> HEAD`。
+- 防御验证：
+  - `-` 开头的 URL 被拒；
+  - 不经 shell；
+  - 关于 `ext::sh -c ...` 这类 git 传输协议 RCE：`ext::` 不以 `-` 开头，理论上可通过此检查——但这是**上游调用层**（services/migrations 及仓库创建处的 URL scheme 白名单）负责的校验，且本函数仅做可达性探测、不落地克隆。就本文件而言无独立可利用 sink；作为纵深问题记录，非本文件漏洞。
+
+## 4. 第 58–74 行 `InitRepository`
+
+- 入口点：`repoPath`、`objectFormatName`。
+- 第 65–67 行：`objectFormatName` 先经 `IsValidObjectFormat` 白名单（sha1/sha256）才进入 `--object-format` 选项值 —— **白名单属于有效防御**（枚举型校验不可绕过）。
+- `repoPath` 仅通过 `WithDir` 设置工作目录与 `os.MkdirAll`，不拼入命令字符串；路径穿越风险取决于上层授权，非本文件引入。
+- 安全。
+
+## 5. 第 88–131 行 `Clone`
+
+入口点：`from`、`to`、`opts.Branch`、`opts.Filter`、`opts.Depth`、`opts.Env`。
+- 第 111 行 `from, to` 经 `AddDashesAndList` → 强制 `--` 分隔，无法被解释为选项（例如 `from = --upload-pack=evil` 无效）。**有效防御**。
+- 第 105 行 `opts.Depth` 经 `strconv.Itoa` 整数化，类型即防御。
+- 第 107–108 行 `opts.Filter` 经 `AddDynamicArguments`：`-` 开头被拒；合法 filter 值（如 `blob:none`）只作为 `--filter` 的值传递，无逃逸面。
+- 第 110–111 行 `opts.Branch` 经 `AddDynamicArguments`：`-b` 后的值若以 `-` 开头（如 `-oProxyCommand=...` 注入尝试）被拒。
+- 第 120–127 行 env 处理：`opts.Env` 由内部调用方构造；否则基于 `url.Parse(from)` 计算代理环境变量，无用户直控的任意 env 注入。
+- 结论：各条数据流均有 argv 化 + 破折号拒绝 + `--` 分隔三重防护，安全。
+
+## 6. 第 134–176 行 `Push`
+
+入口点：`opts.Remote`、`opts.LocalRefName`、`opts.Branch`、`opts.ForceWithLease`。
+- 第 137–141 行：`ForceWithLease` 经 `AddOptionFormat` 拼接为 `--force-with-lease=%s` 单一参数。该字段在 Gitea 中由服务端从受保护分支配置生成（非终端用户直控）；即便如此，它整体作为一个 argv 元素，不能拆分出额外选项，最坏情况是非法 refspec 被 git 拒绝。低风险、非可利用注入。
+- 第 145–153 行：refspec 由 `fmt.Sprintf("%s:%s", LocalRefName, Branch)` 构造后放入 `remoteBranchArgs`，最终第 156 行经 **`AddDashesAndList`** 传给 git —— 即使 refspec 含 `-` 开头内容也被 `--` 隔离。**有效防御**。
+- 第 158–170 行：仅对 stderr 做字符串匹配分类错误，无 sink。
+- 安全。
+
+## 7. 第 77–85 行 `IsEmpty`
+
+- `repo.Path` 经第 79 行 `AddOptionFormat("--git-dir=%s", ...)` 拼接进单个 argv。Path 为服务端生成的仓库目录（内部来源），且单 argv 无法注入新选项。安全。
+
+## 8. 第二入口与替代通道核查
+
+- 文件级入口共 7 个函数，全部已枚举；除上述外无 HTTP 路由、文件读取、环境变量读取（`os.Environ` 只读不写）、回调。
+- 替代通道：`opts.Env` 可完全替换子进程环境（第 122–123 行），但它是内部结构体字段，本文件内无任何用户输入直达该字段的路径；若未来某调用方把用户输入映射到 Env（如 GIT_PROTOCOL/GIT_SSH_COMMAND），将构成危险通道——当前代码中不存在该映射，故不计为实际漏洞。
+- 黑名单类弱过滤：未发现依赖黑名单/正则的防御；所依赖的白名单（object format）与结构性防御（argv 化、dash 拒绝、`--` 分隔）均属强防御。
+
+## 9. 总体结论
+
+通读全文（第 1–176 行全部函数）：所有外部可控 source（revisionRange、URL、Branch、Filter、Remote/refspec）到达 git exec sink 前，均被 `AddDynamicArguments` 的破折号拒绝、`AddDashesAndList` 的 `--` 分隔或白名单校验覆盖，且全程不经 shell。未发现可利用的命令/选项注入或其他 CWE 漏洞。
+
+```json
+{
+  "has_vulnerability": false,
+  "vulnerability_type": "CWE-78 / CWE-88 未成立（命令注入与参数注入均被有效防御阻断）",
+  "risk_level": "none",
+  "source": "line 22: revisionRange 外部输入; line 52: url; line 109-110: opts.Filter/Branch; line 145-152: refspec",
+  "sink": "line 26 RunStdBytes; line 53 RunStdString; line 129 RunWithStderr; line 159 RunStdString",
+  "explanation": "全部 source→sink 流程经 gitcmd argv 数组执行不经 shell; AddDynamicArguments 拒绝以减号开头的参数阻断选项注入; Clone 与 Push 在第 111 和 156 行使用 AddDashesAndList 强制双横线分隔阻断参数被解释为选项; InitRepository 第 66 行对 objectFormatName 使用白名单 IsValidObjectFormat 属于有效防御; Depth 经 strconv.Itoa 类型化; 未发现黑名单式弱过滤; opts.Env 为内部字段无用户直控映射",
+  "fix_suggestion": "无需修复; 建议保持现状并在上游调用层继续对迁移 URL 做 scheme 白名单以防范 ext:: 传输协议滥用"
+}
+```

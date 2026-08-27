@@ -1,0 +1,27 @@
+## 编号分析
+
+**入口点枚举（全文通读）**
+- 入口 1：`SetCookie`/`setCookie`（第 33–88 行）——响应写 cookie，值来自上游 JWT，非攻击者直接控制。
+- 入口 2：`Cookie(r)`（第 91–133 行）——**读取请求中所有 cookie**，攻击者完全可控（cookie 名与值均可由客户端任意设置）。
+- 入口 3：`ClearCookie`（第 136–160 行）——遍历请求 cookie 名做前缀匹配后回写删除。
+- 入口 4：`SameSite()`/`Configure()`——仅读配置文件，非外部输入。
+
+**数据流验证**
+
+流 A：`Cookie()` 第 100 行起遍历 `r.Cookies()`。第 106–107 行解析形如 `<name>_xofy` 的分段 cookie 名：
+- 第 109–112 行：`numParts = strconv.Atoi(xyArray[1])` —— **未校验上界或合理性**；
+- 第 113 行：`cookieParts = make([]string, numParts)` —— 攻击者发送如 `vouch_999999999of999999999=1` 即可触发一次性分配约 8GB 切片（每元素为 string 头 16 字节），造成内存耗尽/OOM，属典型 CWE-770/CWE-400 资源分配无限制。黑名单式防御不存在；此处完全无防御。
+- 第 119–121 行：`i = Atoi(xyArray[0])` 后第 122 行 `cookieParts[i-1] = ...`：
+  - 若 `xyArray[0] == "0"` 或负数 → `i-1 < 0` → **索引越界 panic**；
+  - 若 `i > numParts`（例如先发 `vouch_5of3=a` 再发 `vouch_1of3=b`）→ 同样越界 panic。
+  - Go 中 HTTP handler 内 panic 默认被 net/http recover 为连接断开，但持续发送可造成 CPU/日志消耗，且在部分自定义中间件下可放大为进程级故障。此为第二缺陷（CWE-787/CWE-248 边界检查缺失）。
+
+流 B：`splitCookie`（第 176–189 行）：输入来自服务端生成的 JWT，长度受控；`r--` 回退 RuneStart 有终止条件（l==r 时 r 不再前进？实际当整段均为多字节边界时可能死循环风险极低），且 val 非攻击者直接构造，风险低。
+
+流 C：`ClearCookie` 第 143 行前缀匹配 `cfg.Cfg.Cookie.Name`——仅回显删除头，值固定为 'delete'，无注入面。
+
+**结论**：核心漏洞在 `Cookie()` 分段重组逻辑，source 为第 101 行 `r.Cookies()`（攻击者可控的请求 cookie 名），sink 为第 113 行 `make([]string, numParts)` 与第 122 行 `cookieParts[i-1]`，无任何有效性防御。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-770 / CWE-787", "risk_level": "high", "source": "line 101: r.Cookies() 返回的攻击者可控 cookie 名", "sink": "line 113: make([]string, numParts) 以及 line 122: cookieParts[i-1]", "explanation": "攻击者发送形如 vouch_99999999of99999999=x 的 cookie -> 第109行 Atoi 解析出超大 numParts -> 第113行一次性分配巨型切片导致 OOM 拒绝服务; 另外发送 vouch_0of3 或 vouch_5of3 -> 第122行 i-1 为 -1 或超出切片范围 -> 索引越界 panic, 可被反复触发形成 DoS", "fix_suggestion": "line 109-113: 对 numParts 设置合理上限(如 <=10)并拒绝非正值; line 119-122: 校验 i>=1 且 i<=numParts 后再写入, 并对 xyArray 长度做检查防止越界"}
+```

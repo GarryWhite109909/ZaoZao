@@ -1,0 +1,21 @@
+## 编号分析（全文通读）
+
+1. **构造函数（第 76–85 行）**：入口点 1 —— `keyDirectoryPath` 来自外部配置/环境，直接 `Paths.get` 并 `createDirectories`，无路径规范化校验；随后 `loadExistingKeys()` 扫描目录。
+
+2. **loadExistingKeys（第 316–334 行）**：入口点 2 —— 遍历目录下所有 `.metadata` 文件，文件名（即 keyId）来自磁盘内容，作为后续 `getKeyMetadata(keyId)` 的输入。**文件名本身是攻击者可控的 source**（若攻击者能写入该目录）。
+
+3. **getKey / getKeyMetadata（第 194–232 行）**：keyId 经 `getMetadataFile` 等 `resolve(keyId + ".xxx")` 拼接路径。若 keyId 含 `../`，可发生**路径穿越**读写任意 `.metadata/.json/.key` 文件。代码中无任何对 keyId 的白名单或字符校验——这是 sink 前缺失的有效防御。
+
+4. **migrateLegacyKey（第 276–297 行）与 migrateLegacyMetadata（第 304–320 行）**：核心 sink —— `new ObjectInputStream(...).readObject()` 直接反序列化磁盘上的遗留文件并强转为 `KeyPair`/`KeyMetadata`。这是典型的 **Java 反序列化漏洞（CWE-502）**：只要攻击者能向密钥目录写入一个以非 `{` 开头的恶意序列化文件（如通过路径穿越、共享目录、上传通道），且 classpath 存在 gadget chain（Camel 项目依赖丰富），即可 RCE。格式探测仅靠 `content.trim().startsWith("{")` 判断，二进制 payload 必然落入 legacy 分支，等于把反序列化作为默认回退路径。
+
+5. **readStandardKeyPair（第 258–274 行）**：JSON + Base64 + PKCS8/X509 解析，相对安全；但 algorithm 字段来自文件内容，传入 `KeyFactory.getInstance(algorithmName)`，若 provider 为 null 且算法名被篡改，可能加载任意 JCA 算法（低风险）。
+
+6. **storeKey / updateKeyMetadata / deleteKey（第 148–246 行）**：写文件 sink 同样受未校验 keyId 影响，可穿越覆盖任意同名后缀文件。
+
+7. **第二入口验证**：`importKey`、`rotateKey`、`revokeKey` 的 reason/description 仅进入 JSON 与日志，无注入 sink；Jackson 使用默认 ObjectMapper 绑定简单 record/class，未开启多态类型（无 `@JsonTypeInfo`），不存在 Jackson 反序列化 RCE。
+
+8. **防御有效性结论**：全文没有任何对 keyId 的过滤/白名单，也没有对反序列化的对象图限制（如 ObjectInputFilter / resolveClass 白名单）。`@SuppressWarnings("java:S4508")` 只是压制告警而非修复。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "unsafe java deserialization and path traversal via keyId", "risk_level": "high", "source": "legacy .key/.metadata files in keyDirectory (attacker-writable) and unvalidated keyId parameter", "sink": "ObjectInputStream.readObject() in migrateLegacyKey and migrateLegacyMetadata; Files.readString/writeString/deleteIfExists with keyDirectory.resolve(keyId)", "explanation": "migrateLegacyKey and migrateLegacyMetadata directly deserialize attacker-controllable files on disk without any ObjectInputFilter or class whitelist; the format check content.trim().startsWith only routes binary payloads into the deserialization branch. Additionally keyId is concatenated into file paths without validation, allowing traversal to read/write/delete arbitrary files with matching suffixes.", "fix_suggestion": "add a strict ObjectInputFilter allowing only KeyPair and KeyMetadata classes during legacy migration, validate keyId against an allowlist regex such as [A-Za-z0-9_-]+ before resolving paths, and eventually remove the Java serialization migration path entirely"}
+```

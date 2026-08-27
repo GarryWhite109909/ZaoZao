@@ -1,0 +1,52 @@
+LANG: python
+```code
+# scheduler/views.py
+from django.http import HttpResponse
+from django.contrib.auth.models import User
+from django.core.management import call_command
+from django.views.decorators.csrf import csrf_exempt
+import os
+
+
+@csrf_exempt
+def console(request):
+    """Console operations endpoint (invoked via CLI-style HTTP calls)."""
+    action = request.GET.get('action', '')
+
+    if action == 'install':
+        call_command('migrate')
+        # Seed the initial administrator account using credentials from the environment.
+        admin_password = os.environ.get('SCHEDULER_ADMIN_PASSWORD')
+        if not admin_password:
+            return HttpResponse('Installation aborted: SCHEDULER_ADMIN_PASSWORD not configured.')
+        if not User.objects.filter(username='administrator').exists():
+            User.objects.create_superuser(
+                username='administrator',
+                email=os.environ.get('SCHEDULER_ADMIN_EMAIL', 'admin@example.com'),
+                password=admin_password,
+            )
+        return HttpResponse('Installation completed.')
+
+    if action == 'backup':
+        target_dir = request.GET.get('path', '/tmp')
+        os.system('pg_dump scheduler > %s/backup.sql' % target_dir)
+        return HttpResponse('Backup created in %s' % target_dir)
+
+    if action == 'sync':
+        from .google import sync_all_calendars
+        sync_all_calendars()
+        return HttpResponse('Sync finished.')
+
+    return HttpResponse('Usage: ?action=install|backup|sync')
+```
+
+1. 第 12 行 `request.GET.get('action', '')` 与第 20 行 `request.GET.get('path', ...)` 是用户可控输入点；但本样本的目标漏洞是 CWE-798 硬编码凭据，其 source 并非请求参数，而是第 17 行源码中写死的字符串 `'administrator'` 与第 19 行的 `'administrator'` 密码字面量。
+2. 第 19 行 `password='administrator'` 是主 sink：任何拿到源码/反编译产物/公开仓库的人都能直接以超级管理员身份登录，属于框架习语中的“种子管理员”数据流（源码常量 → ORM create_superuser → 数据库凭据）。
+3. 修复在第 16-18 行插入 `os.environ.get('SCHEDULER_ADMIN_PASSWORD')`：这是框架原生的环境配置读取 API，属于有效防御手段；类型正确性——`os.environ.get` 返回 str 或 None，与 `create_superuser(password=...)` 的 str 参数兼容；位置正确性——在调用 sink 之前完成校验，缺失时第 18-19 行提前返回，杜绝用默认值兜底。
+4. 攻击面覆盖完整性：第 21 行返回消息原先泄露 `administrator / administrator` 明文组合，现改为不含任何凭据的 'Installation completed.'；邮箱同样改为可由环境变量覆盖（第 23 行），消除第二处硬编码敏感值。
+5. 第二入口检查：backup 分支（第 27-30 行）存在命令注入问题，sync 分支无输入依赖，均与本目标漏洞（CWE-798）无关；按 minimal pair 局部对照纪律保持原样，不在此样本中修复。
+6. 结论：修复后代码中不再存在硬编码凭据，install 数据流的凭据来源全部收敛到部署时注入的环境变量。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码第 17-19 行将管理员用户名与密码硬编码为 administrator/administrator 字面量并通过 create_superuser 写入数据库，且第 21 行响应体直接回显该凭据组合，构成 CWE-798 Use of Hard-coded Credentials；修复后密码与邮箱改从环境变量 SCHEDULER_ADMIN_PASSWORD/SCHEDULER_ADMIN_EMAIL 读取并在缺失时拒绝执行，响应不再包含任何凭据信息；backup 分支的命令注入与 csrf_exempt 属于其他漏洞类型，按最小对照原则未改动", "fix_suggestion": "line 16: 将硬编码密码替换为 os.environ.get('SCHEDULER_ADMIN_PASSWORD') 并在缺失时提前返回，同时移除响应中的凭据回显"}
+```

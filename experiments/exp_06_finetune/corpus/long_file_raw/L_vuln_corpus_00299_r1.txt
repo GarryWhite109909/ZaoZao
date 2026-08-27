@@ -1,0 +1,31 @@
+# 编号分析（全文通读）
+
+**1. 入口点枚举**
+- 第 55-77 行 `HuggingFaceBackend.create_pipeline`：接收外部传入的 `model_name`，直接传给 `ModelLoader._create_hf_pipeline`。
+- 第 80-102 行 `MLXBackend.create_pipeline`：同样接收 `model_name`，传给 `create_mlx_pipeline`。
+- 第 105-140 行 `get_backend`：`name` 参数经 `_BACKENDS` 白名单校验（第 113 行），此处防御有效，仅限 `"hf"`/`"mlx"`。
+- 第 143-190 行 `_torch_fallback_for` / `select_privacy_filter_backend` / `resolve_privacy_filter_model`：对 `model_name` 做子串匹配（`"mlx" in name_lc`、family marker 子串），这些只是路由逻辑，不构成安全边界。
+- 第 192-216 行 `create_privacy_filter_pipeline`：文件的实际对外入口，将调用方提供的 `model_name` 原样传递。
+
+**2. source→sink 数据流验证**
+
+数据流 A：
+- source：第 193 行参数 `model_name`（来自上层 API/用户配置，未做任何校验、无 allowlist）。
+- 中间处理：第 195-196 行仅用于选择后端；第 198-201 行在 MLX 分支下原样返回 `model_name`；torch 分支下可能被替换为固定 fallback（第 178-189 行），但若名称不含 `"mlx"` 则第 189 行原样返回。
+- sink：第 200 行 `create_mlx_pipeline(actual_model)` 或第 215 行 `PrivacyFilterTorchPipeline(actual_model)` —— 最终触发从模型仓库下载并加载模型工件。HuggingFace/MLX 工件加载默认涉及 pickle 反序列化（pytorch_model.bin 等），攻击者可指向恶意仓库实现任意代码执行。
+
+防御有效性检查：
+- 第 113 行的 `_BACKENDS` 白名单只校验后端名，不校验模型名；
+- 第 160-161、176 行的子串匹配是路由逻辑而非输入校验，且黑名单/子串式判断按规则视为可绕过；
+- 全文没有任何对 `model_name` 的格式、来源或仓库白名单校验。
+
+**3. 第二入口与替代通道**
+- 第 55-77 行与第 80-102 行构成第二入口：绕过 `create_privacy_filter_pipeline` 直接经 `get_backend(...).create_pipeline(model_name)` 同样到达同一 sink，且完全没有任何过滤。
+- 自动检测路径（第 128-133 行）最终仍以用户可控 `model_name` 调用 sink。
+
+**4. 结论依据**
+全文证据显示：用户可控字符串 `model_name` 在两条入口路径上均未经校验直达模型下载/反序列化加载点，属于不可信输入导致的任意模型加载/代码执行风险（供应链型）。判定存在漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 (Deserialization of Untrusted Data) / CWE-20", "risk_level": "high", "source": "line 193: create_privacy_filter_pipeline(model_name) 外部可控的 model_name 参数（另见 line 56 与 line 84 的 create_pipeline 第二入口）", "sink": "line 200: create_mlx_pipeline(actual_model) 与 line 215: PrivacyFilterTorchPipeline(actual_model)，最终触发远程模型工件下载与 pickle 反序列化加载", "explanation": "用户可控的 model_name 从 line 193 进入后，全文仅存在 line 113 的后端名白名单和 line 160/176 的子串路由判断，均不约束模型标识本身；line 189 与 line 198 在多数分支下原样返回该值，随后在 line 200/215 直达模型加载 sink。攻击者可指定恶意模型仓库，导致反序列化时执行任意代码 -> 任意代码执行（供应链投毒/模型仓库劫持）", "fix_suggestion": "line 193: 对 model_name 增加严格校验——使用受信任组织前缀加仓库名的白名单（如仅允许 OpenMed 官方命名空间），拒绝包含路径穿越字符、URL scheme 或非官方来源的标识；并在 line 200/215 加载时强制使用 safetensors 等安全格式、禁用 pickle 反序列化"}
+```

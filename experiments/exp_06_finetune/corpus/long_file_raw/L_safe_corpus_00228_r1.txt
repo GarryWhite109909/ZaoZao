@@ -1,0 +1,40 @@
+## 编号分析（全文逐函数）
+
+**1. 常量定义（第 17–22 行）**
+`ALL_NETWORK_ACCESS`、`master_uname`、错误消息均为静态常量，无用户输入参与，无风险。
+
+**2. SecurityCheck（第 25–63 行）**
+- 第 31 行：从 `Authorization` 头取 bearerToken —— source。
+- 第 33–39 行：DNS 特例路径。仅当 URI 含 `/dns` 且方法为 GET 且 `authenticateDNSToken` 校验通过（第 141–147 行要求 token 精确等于服务端配置的 DNSKey，且 DNSKey 非空）才放行，并显式覆写 `user`/`networks` 头为受控值。攻击者无法伪造该头绕过。
+- 第 41–43 行：取路由变量 networkname/network，仅用于权限判断，不进入 sink。
+- 第 45 行：调用 `UserPermissions` 统一鉴权；失败即返回 401（第 46–49 行），不会 fall-through。
+- 第 55–57 行：`r.Header.Set("user", ...)` 与 `Set("networks", ...)` 为**无条件覆写**，客户端传入的同名头被覆盖，下游 handler 读到的身份不可被请求方伪造。
+
+**3. NetUserSecurityCheck（第 66–117 行）**
+- 第 73–82 行：token 必须形如 `Bearer xxx`，否则 401。
+- 第 84–89 行：master token 比对通过后设置 `ismaster=yes` 并放行——token 来自服务端配置（servercfg.GetMasterKey），非用户可控。
+- 第 91–95 行：`VerifyUserToken` 验签失败即拒绝。
+- 第 97–100 行：admin 直接放行（设计如此）。
+- 第 102–113 行：非 admin 时按 isNodes/isClients 检查 pro 层 AccessLevel，或要求 `netUserName == userName`（第 114 行），不匹配即 401。所有分支要么放行要么 return，无逻辑漏洞。
+- 第 72 行同样无条件覆写 `user` 头。
+
+**4. UserPermissions（第 120–153 行）**
+- 第 124–130 行：token 格式校验。
+- 第 132–134 行：master token 全权放行（受控常量比对）。
+- 第 136–139 行：JWT 验签失败返回未授权。
+- 第 141–143 行：reqAdmin 且非 admin 拒绝。
+- 第 149–151 行：非 admin 访问具名网络时必须其 networks 列表包含该网络且网络存在（authenticateNetworkUser，第 156–163 行，先验证 NetworkExists 再 StringSliceContains）。EE 分支（第 152–154 行）再叠加 IsUserNetAdmin 检查。防御链完整：验签 → 角色 → 网络 → EE 二次校验，无黑名单/可绕过正则。
+
+**5. authenticateMaster / authenticateDNSToken（第 137–139、140–148 行）**
+- 使用 `==` 字符串比较而非 constant-time 比较，理论上存在时序侧信道，但 master key/DNS key 为高熵长随机串，实际可利用性极低，属代码质量建议而非可利用漏洞。
+- 第 145 行：DNSKey 为空时直接返回 false，防止空密钥默认放行。
+
+**6. ContinueIfUserMatch（第 150–166 行）**
+- 第 159 行比较 `params["username"]` 与 `r.Header.Get("user")`。该头的可信性依赖前置中间件（SecurityCheck/NetUserSecurityCheck）在第 55/72 行的无条件 `Set` 覆写。在本文件所示中间件链下，客户端注入的 `user` 头会被覆写，无法伪造。若某路由单独挂载此中间件而无前置鉴权则存在头伪造风险，但本文件内不存在这种挂载方式，且任务限定基于本文件证据。
+
+**7. 入口点枚举**
+入口仅两类：(a) Authorization 头（三处读取）；(b) mux 路由参数 networkname/network/networkuser/username。所有 source 均流向鉴权比较或 JWT 验证函数，最终 sink 是 `next.ServeHTTP` 的放行决策；每条数据流均有验签+角色+资源归属三层校验，未发现可绕过路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认：SecurityCheck、NetUserSecurityCheck、UserPermissions 三条鉴权链均先做 JWT 验签或服务端密钥精确比对，失败即返回 401 无 fall-through；下游信任的 user 和 networks 请求头在放行前被 r.Header.Set 无条件覆写，客户端无法伪造身份头；非 admin 用户访问具名网络需同时通过 NetworkExists、StringSliceContains 及 EE 的 IsUserNetAdmin 三重校验；ContinueIfUserMatch 的头比较依赖的前置覆写在文件内所有中间件组合中均成立。authenticateMaster 使用非常量时间比较仅为低风险的代码质量改进点，不构成可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

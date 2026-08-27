@@ -1,0 +1,26 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `put`（第 24 行起）：PUT 上传，source 为 `req.URL.Path`（第 32 行），sink 为 `os.OpenFile(savepath,...)`（第 49 行）。
+2. `upload`（第 71 行起）：multipart POST，source 为 `req.URL.Path`（第 79 行）与 `part.FileName()`（第 110 行），sink 为 `os.Create(tempPath)`（第 122 行）与 `os.Rename(tempPath, finalPath)`（第 152 行）。
+3. `bulkDownload`（第 160 行起）：GET 查询参数 `req.URL.Query()["file"]`（第 168 行），sink 为 `filepath.Walk(file, walker)` + `os.Open(walkPath)`（第 252 行）。
+
+**逐条数据流验证**
+
+- **put**：`sanitizePath(fs.UploadFolder, req.URL.Path)` 归一化路径，随后显式阻断 `.goshs` 覆盖（第 39 行），ACL 与大小限制在写前执行。防御看起来完整；唯一残留风险是符号链接竞争（TOCTOU），但代码未提供可证实的利用面。
+- **upload**：目录经 `sanitizePath` 处理；文件名仅按 `/` 分割取最后一段（第 110-112 行）。在 Linux 上反斜杠不是分隔符，安全；但在 Windows 上 `..\..\x` 会通过过滤并被 `filepath.Join` 解析为遍历——这是条件性 CWE-22。`.goshs` 阻断存在（第 115 行）。
+- **bulkDownload（关键漏洞）**：第 185-199 行，对每个 file 参数调用 `findEffectiveACL(governing)`，**只有当 `aclErr == nil` 时才执行 `applyCustomAuth` 认证和 Block 列表检查**；若读取 `.goshs` 出错（权限、IO、格式损坏），代码直接落到第 200 行 `filesCleaned = append(filesCleaned, absPath)`——**fail-open**：未认证的文件仍被打包进 zip 返回给客户端。walker 内部第 216-222 行同样只在 `aclErr == nil` 时检查，错误时静默包含文件。攻击者无需凭据即可请求受保护路径下的文件；若能诱发 `.goshs` 读取失败（如通过上传接口制造权限异常的目录结构），即稳定绕过。
+
+**第二入口/替代通道**：`upload` 可写入任意目录内容但不能创建 `.goshs`；`put` 同样被阻断。因此绕过主要依赖 ACL 文件读取失败这一错误通道，与 walker 的 fail-open 叠加构成完整绕过链。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-863 (Incorrect Authorization / fail-open ACL bypass), 附带条件性 CWE-22",
+  "risk_level": "high",
+  "source": "line 168: req.URL.Query()['file'] 攻击者可控的下载文件列表",
+  "sink": "line 200: filesCleaned = append(filesCleaned, absPath) 未认证即收集; line 252: filepath.Walk 后 line 262 os.Open 打包返回",
+  "explanation": "bulkDownload 中 findEffectiveACL 返回错误时 (aclErr != nil) 完全跳过 applyCustomAuth 认证与 Block 黑名单检查, 文件仍被加入打包列表 -> 错误处理为 fail-open; walker 内部 (line 216-222) 同样仅在 aclErr == nil 时校验, 错误时静默包含 -> 攻击者可在 .goshs 读取失败的情况下未经认证下载受限文件; 另 upload 的文件名清洗 (line 110) 仅按 '/' 分割, 在 Windows 上 '..\\\\' 形式可造成路径遍历",
+  "fix_suggestion": "line 185-200: 将 aclErr != nil 视为拒绝访问 (fail-closed), 对无法确定 ACL 的文件跳过并记录日志而非加入 filesCleaned; walker 中 line 216 同样改为 aclErr != nil 时 return nil 跳过该文件; line 110: 同时按 '/' 和 '\\\\' 以及 filepath.Base 清洗文件名以覆盖 Windows 分隔符"
+}
+```

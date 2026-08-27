@@ -1,0 +1,28 @@
+## 编号分析（全文通读）
+
+**入口点枚举**
+1. `__init__`（第 44–63 行）：`template`、`prompt_examples` 等由 spaCy 配置系统/工厂传入，属外部可控配置。
+2. `generate_prompts`（第 66 行起）：核心渲染入口，第 73 行 `jinja2.Environment()`，第 74 行 `environment.from_string(self._template)`，第 88–92 行 `_template.render(text=shard.text, ...)`。
+3. `set_cfg`（第 168–174 行）：`from_bytes`（第 200–216 行）与 `from_disk`（第 229–246 行）反序列化时调用，`srsly.json_loads` 后逐键 `setattr(self, key, value)`。
+4. `_set_prompt_examples`（第 183–189 行）：msgpack 反序列化后 `parse_obj` 重建示例。
+
+**数据流验证**
+
+- **流 A（SSTI/模板注入）**：source = 配置文件或序列化字节中的 `template` 字段 → `set_cfg` 第 173 行 `setattr(self, 'template', ...)` 或构造函数直接赋值 → sink = 第 74 行 `from_string(self._template)` + 第 90 行 `render()`。防御检查：全程无任何模板来源校验、无 `SandboxedEnvironment`、无白名单。若模型包/配置来自不可信来源（spaCy 模型常从第三方下载），攻击者可注入 `{{ ''.__class__.__mro__[1].__subclasses__() }}` 类 payload 实现任意代码执行。黑名单式过滤不存在——即完全无过滤。**有效漏洞链成立**（CWE-1336 / CWE-94）。
+- **流 B（任意属性覆盖）**：`set_cfg` 第 172–173 行对 cfg 中所有 key 无白名单地 `setattr`，可覆盖 `_parse_responses`、`_shard_reducer` 等内部回调为任意值，配合 pickle/msgpack 场景可扩大攻击面；但单独看需先有不可信反序列化前提，作为流 A 的放大器。
+- **流 C（doc 文本注入 prompt）**：第 90 行 `text=shard.text` 将用户文本嵌入模板变量位置——这是正常的数据插值而非模板编译，不构成 SSTI；仅可能导致提示词注入（LLM 层面风险，非代码执行）。
+- **其余函数**：`_initialize`、`add_label`、`to_bytes/to_disk`、`_tee_2d_iterable` 等未发现额外 source→sink 危险流。
+
+**第二通道确认**：除配置文件外，`from_bytes`/`from_disk` 加载的序列化任务对象同样能改写 `_template`，是替代入口，结论一致。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-1336: Improper Neutralization of Special Elements Used in a Template Engine (SSTI), leading to CWE-94 code execution",
+  "risk_level": "high",
+  "source": "line 173: set_cfg 通过 setattr 从反序列化的 cfg 覆盖 self._template（或构造时传入的不可信 template 配置）；替代入口 line 205-215 from_bytes",
+  "sink": "line 74 environment.from_string(self._template) 与 line 90 _template.render(...) 使用默认非沙箱 jinja2.Environment() 编译并渲染",
+  "explanation": "模板字符串完全来自外部配置且无任何校验 -> 经 set_cfg/setattr 写入 _template -> 在 generate_prompts 中用默认 Environment 的 from_string 编译 -> render 时执行模板内表达式，攻击者可在恶意模型包或配置中植入 {{...}} payload 实现任意代码执行；同时 set_cfg 可覆盖 _parse_responses 等内部属性放大影响",
+  "fix_suggestion": "line 73 改用 jinja2.sandbox.SandboxedEnvironment 并启用 autoescape；同时对 set_cfg 增加属性白名单（仅允许 _cfg_keys 内的合法键），并在加载不可信模型/配置时校验 template 来源"
+}
+```

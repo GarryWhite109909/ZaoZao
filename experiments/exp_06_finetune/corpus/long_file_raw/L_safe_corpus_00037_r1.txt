@@ -1,0 +1,58 @@
+# 逐函数行号级分析
+
+## 入口点枚举（全文共 9 个路由入口）
+
+1. `mobsfy`（第 47–68 行）
+2. `execute_adb`（第 74–94 行）
+3. `get_component`（第 100–111 行）
+4. `run_apk`（第 117–130 行）
+5. `take_screenshot`（第 136–158 行）
+6. `screen_cast`（第 163–176 行）
+7. `touch`（第 181–226 行）
+8. `mobsf_ca`（第 231–249 行）
+9. `global_proxy`（第 254–271 行）
+
+所有入口均受三层装饰器保护：`@login_required`、`@permission_required(Permissions.SCAN)`、`@require_http_methods(['POST'])`，即仅限已认证且具备扫描权限的用户通过 POST 访问。
+
+## 逐条 source→sink 数据流验证
+
+**1. mobsfy（第 52–57 行）**：source 为 `request.POST['identifier']`。第 53–58 行先调用 `cmd_injection_check(identifier)` 做命令注入检测，命中即拒绝；随后经 `docker_translate_localhost` 处理后传入 `Environment` 类。该类内部对 identifier 做格式校验与白名单化处理（连接虚拟机/模拟器实例），并非直接拼接 shell 命令字符串执行。防御链完整。
+
+**2. execute_adb（第 78–88 行）**：source 为 `request.POST['cmd']`，sink 为第 82–85 行的 `subprocess.Popen(args + cmd.split(' '))`。表面看用户输入进入子进程参数列表，但需注意：
+- 参数以 **list 形式**传递且未设 `shell=True`，不存在 shell 元字符注入；
+- 执行的是固定二进制 `get_adb()` 加 `-s get_device()`，用户只能控制 adb 子命令；
+- 该接口的设计意图就是允许授权用户在动态分析沙箱 VM/AVD 内执行 adb 调试命令（代码注释第 83 行明确标注 Expected），adb 命令作用于隔离的模拟器环境而非 MobSF 宿主机；
+- 前置有认证 + SCAN 权限双重门禁。
+因此这是功能设计内的受控调试通道，不构成对宿主机的命令注入漏洞。
+
+**3. get_component（第 103–107 行）**：`component` 经 `is_attack_pattern` 攻击模式检测，`hash` 经 `is_md5` 严格十六进制 32 位校验后才传入 `env.android_component`。md5 白名单化使路径/命令注入均不可行。
+
+**4. run_apk（第 120–127 行）**：`hash` 经 `is_md5` 校验，再经 `get_package_name`（第 33–44 行）从数据库或 `packages.json` 取出包名——包名来自服务端可信数据源，非用户可控，随后传给 `env.run_app`。无注入面。
+
+**5. take_screenshot（第 140–152 行）**：`bin_hash` 经 `is_md5` 校验（第 142 行）后才用于第 145 行的 `os.path.join(settings.UPLD_DIR, bin_hash + '/screenshots-apk/')`。由于 md5 正则限定为纯十六进制字符，无法包含 `../`、`/` 等路径穿越字符；随机数文件名亦不可控。路径穿越被有效阻断。
+
+**6. screen_cast（第 165–173 行）**：无任何用户输入参与数据流，仅调用 `env.screen_stream()` 返回截图 base64。无攻击面。
+
+**7. touch（第 185–221 行）**：多分支验证：
+- `event == 'text'` 分支：第 194 行使用 `shlex.quote(x)` 对文本做 shell 安全引用后再作为 adb list 参数，防注入到位；
+- 其余分支：第 196–199 行强制 `is_number` 校验 x/y/max_x/max_y，坐标均为数字，第 202–203 行还做了 min 上限裁剪；
+- event 本身走 if/elif 白名单匹配（第 205–218 行），未匹配时落入默认 tap 且 x/y 已验数字。
+所有到达 `env.adb_command` 的参数均经过数字校验或 shlex.quote，防御有效。
+
+**8. mobsf_ca（第 235–245 行）**：`action` 仅在等于字面量 `'install'` 或 `'remove'` 时才传入 `env.install_mobsf_ca`，否则返回不支持。等价于白名单，无可控 sink。
+
+**9. global_proxy（第 258–266 行）**：同上，`action` 仅接受 `'set'`/`'unset'` 字面量，代理地址由 `env.set_global_proxy(version)` 内部固定生成，用户无法控制代理值。
+
+## 第二入口与替代通道核查
+
+- 所有视图同时支持 API 模式（`api=False` 参数），但 API 路径同样经过相同的认证/权限装饰器与相同校验逻辑，无绕过通道。
+- `get_package_name`（第 36–43 行）读取 `packages.json`，其键为 md5 校验和，内容为静态分析阶段写入的服务端数据，非运行时用户可控。
+- 异常分支（如第 66、109 行）将 `str(exp)` 回显给用户，属信息泄露低危问题，但不含敏感凭据且非本文件引入的可利用漏洞。
+
+## 结论
+
+全文所有用户输入要么被严格格式校验（is_md5/is_number/is_attack_pattern/cmd_injection_check/shlex.quote）拦截，要么走白名单分支，要么以 list 形式传参且无 shell=True；唯一看似危险的 `execute_adb` 是设计内授权调试功能，作用域限于隔离沙箱设备。未发现可利用的安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文9个入口点: 所有路由均有 login_required 加 permission_required(SCAN) 加 POST 方法限制。mobsfy 第53-58行对 identifier 先做 cmd_injection_check 再交由 Environment 内部校验; execute_adb 第82-85行虽将用户 cmd 拼入 subprocess.Popen, 但为 list 形式无 shell=True, 仅限 adb 子命令且属设计内的沙箱调试功能; get_component 与 run_apk 对 hash 做 is_md5 严格校验; take_screenshot 第142行 is_md5 校验阻断了 UPLD_DIR 路径穿越; touch 第194行用 shlex.quote 包裹文本, 第196-199行对所有坐标做 is_number 校验, event 走白名单分支; mobsf_ca 与 global_proxy 的 action 仅接受 install/remove/set/unset 字面量。所有 source 到 sink 的数据流防御均有效, 未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,41 @@
+# 逐行分析
+
+## 入口点枚举（全文）
+
+1. **CLI 参数**（第 118-120 行）：`--port`，仅用于端口绑定，无 sink 风险。
+2. **GET /login**（第 60-64 行）：query 参数 `state` → `oauth_provider.get_login_page(state)`。
+3. **POST /login/callback**（第 67-70 行）：表单体 → `oauth_provider.handle_login_callback(request)`。
+4. **POST /introspect**（第 73-100 行）：form 字段 `token` → `load_access_token(token)`。
+5. **环境/配置**：`SimpleAuthSettings()`（第 113 行）——文档注释明确说明使用硬编码演示凭据。
+
+## 数据流验证
+
+### 流 A：state → get_login_page（第 61-63 行）
+- source：`request.query_params.get("state")`
+- 仅校验非空，无格式校验；sink 在外部文件 `simple_auth_provider.py` 的 `get_login_page`。本文件内无法确认是否将 state 直接嵌入 HTML/重定向 URL。若嵌入登录页隐藏字段或 redirect_uri 拼接，存在开放重定向/XSS 可能性——但本文件内证据不足，不能断言。
+
+### 流 B：token → load_access_token（第 82-86 行）
+- 校验了类型为 str 且非空，随后作为 token 查找键。查找型 sink，注入风险取决于 provider 实现，本文件内无拼接 SQL/命令的证据。返回的 introspection 响应字段均来自服务端存储对象，非用户可控反射。此流在本文件范围内安全。
+
+### 流 C：硬编码凭据（第 113 行 + 第 116-117 行 docstring）
+- `SimpleAuthSettings()` 默认构造即加载演示用硬编码凭据，代码自身注释承认 "Uses simple hardcoded credentials for demo purposes" 且 "not a production-ready implementation"。这是明确的 CWE-798（硬编码凭据）模式：凭据随源码分发，任何获取代码的人可绕过 OAuth 认证直接登录，进而获取有效 access token。防御不存在——没有环境变量覆盖或强制修改机制。
+
+### 其他检查
+- CORS 中间件（第 96-99 行）：introspect 端点允许跨域 POST，token 以 form 提交；RFC 7662 要求客户端认证（client_id/client_secret），此处完全未校验调用者身份，任何来源均可探测任意 token 的有效性（token 枚举/信息泄露辅助面）。这是次要问题，主因仍是硬编码凭据。
+- 无路径遍历、SSRF、反序列化 sink 出现在本文件。
+
+## 结论
+
+主要漏洞：硬编码演示凭据作为默认认证机制（CWE-798），叠加 introspect 端点缺少客户端认证（CWE-306）。source 为第 113 行默认配置加载，sink 为整个认证流程。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-798 (Use of Hard-coded Credentials) / CWE-306 (Missing Authentication on Introspection Endpoint)",
+  "risk_level": "high",
+  "source": "line 113: SimpleAuthSettings() 默认加载硬编码演示凭据",
+  "sink": "line 70: handle_login_callback 认证流程与 line 84: load_access_token 令牌签发/校验",
+  "explanation": "第 113 行以默认方式实例化 SimpleAuthSettings, 其内部为硬编码凭据(第 116 行 docstring 自认 uses simple hardcoded credentials), 无环境变量覆盖或强制修改机制 -> 攻击者读取开源代码即可获得合法凭据, 通过 POST /login/callback 完成认证并获取有效 access token, 完全绕过 OAuth 保护; 另外第 73-100 行 /introspect 端点未按 RFC 7662 要求对 Resource Server 做客户端认证, 且经 cors_middleware 允许跨域, 任意第三方可批量探测 token 有效性并读取 client_id/scope/exp 等信息",
+  "fix_suggestion": "line 113: 从环境变量或密钥管理系统加载凭据并在检测到默认值时拒绝启动; 同时在 line 84 的 introspect 处理中强制校验 client_id 与 client_secret (HTTP Basic 或 client_credentials)"
+}
+```

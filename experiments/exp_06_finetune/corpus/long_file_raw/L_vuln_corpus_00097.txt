@@ -1,0 +1,27 @@
+## 编号分析
+
+1. **第 30-90 行 插件初始化**：opts 全部来自开发者配置（base、undici、cacheURLs 等），非用户输入，无直接风险。`LruMap` 缓存启用与否取决于 `disableCache`。
+
+2. **第 92 行 `fastify.decorateReply('from', ...)`**：核心入口。`reply.from(source)` 是开发者调用的 API，但默认路径引入用户输入。
+
+3. **第 103-105 行 source 默认值**：`if (!source) { source = req.url }` —— 当开发者未显式传 source 时，**source 直接取自客户端请求行 `req.url`**，这是完全攻击者可控的 source。
+
+4. **第 108-113 行 buildURL 与缓存**：
+   - `const cacheKey = dest + source`，字符串拼接无分隔符。若 `getUpstream` 返回动态 upstream（多租户场景），存在键碰撞：`dest='http://a/'` + `source='x'` 与 `dest='http://a'` + `source='/x'` 产生相同 key 但不同 URL 对象，缓存对象被跨配置复用 → 缓存投毒/CWE-444。
+   - `buildURL(source, dest)` 未对 source 做路径规范化或白名单校验，`/../`、`//evil.com`、绝对 URI 形式的 source 可改变上游请求目标语义 → 指向任意上游路径甚至其他主机（视 buildURL 实现），构成受限 SSRF（CWE-918）。
+
+5. **第 116-117 行 headers**：`filterPseudoHeaders` 过滤 h2 伪头；随后 `headers.host = url.host` 强制覆盖 host，防止了 Host 头注入，此防御有效。
+
+6. **第 118 行 getQueryString（第 253-270 行）**：`reqUrl.indexOf('?')` 后原样切片转发查询串，未编码校验；但查询串注入影响有限（仍是同一上游），属低危参数污染通道（第二入口）。
+
+7. **第 121-155 行 body 处理**：`opts.body` 为开发者传入；`this.request.body` 来自 Fastify body 解析器，经 `contentTypesToEncode` 判断后 JSON 序列化或透传，content-length 用 `Buffer.byteLength` 重算——无注入 sink。GET/HEAD 带 body 抛错（第 165-172 行），防御有效。
+
+8. **第 175-215 行重试逻辑与响应回调**：错误分类映射到固定错误码；`onError`/`onResponse`/`rewriteHeaders` 均为开发者回调，非用户可控。`copyHeaders` 转发上游头，若上游不可信则存在头注入面，但那是上游信任问题。
+
+9. **第 217-247 行 onClose/onReady 及辅助函数**：无用户输入汇入敏感操作。
+
+**结论**：主要漏洞是第 104 行 `source = req.url` 将原始客户端 URL 未经规范化/校验直接拼入上游请求 URL（第 109 行 buildURL、第 213 行 requestImpl 的 url 参数），可被用于路径穿越式 SSRF/访问上游内部端点；次要是第 110 行缓存键拼接歧义导致的潜在缓存投毒。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 (SSRF) / CWE-444 (缓存键歧义)", "risk_level": "中", "source": "line 104: source = req.url（客户端完全可控的原始请求 URL）", "sink": "line 109 与 line 213: buildURL(source, dest) 结果作为 requestImpl 的 url 发往上游", "explanation": "当开发者调用 reply.from() 不传 source 时，客户端请求行中的原始 URL 被直接用作上游路径，未做路径规范化、编码校验或前缀白名单；攻击者可用 ../ 或绝对 URI 形式改写最终请求目标，访问上游服务上本不应暴露的内部端点，形成受限 SSRF。另外 line 110 的 cacheKey 由 dest 与 source 直接字符串拼接且无分隔符，在动态 upstream 场景下可构造键碰撞导致缓存对象跨配置复用（缓存投毒）。headers.host 被 line 117 强制覆盖，Host 注入已被有效防御；查询串透传（line 118、263-266）仅造成参数污染，风险较低。", "fix_suggestion": "对 source 先 decodeURI 并 path.normalize 后强制限定在上游允许的前缀内（拒绝包含 ../、反斜杠及绝对 URI 的输入）；缓存键改为使用带分隔符的结构化拼接如 dest + '|' + source，或直接以解析后的完整 URL 字符串作键。"}
+```

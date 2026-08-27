@@ -1,0 +1,66 @@
+# 全文逐函数安全分析
+
+## 1. 文件结构总览与入口点枚举（通读全文）
+
+本文件共约 160 行，包含以下主要部分：
+- 第 1–9 行：模块文档字符串，明确声明这是演示用途、非生产就绪实现；
+- 第 10–24 行：导入；
+- 第 27–34 行：`AuthServerSettings` 配置模型；
+- 第 37–44 行：`SimpleAuthProvider` 类定义；
+- 第 46 行起：`create_authorization_server` 工厂函数，内含三个内联路由处理器；
+- 第 118 行起：`run_server`；
+- 第 133 行起：CLI 入口 `main`。
+
+HTTP 入口点完整清单（逐一枚举）：
+1. `create_auth_routes(...)` 生成的标准 OAuth 路由（第 66–73 行）：authorize、token、register、revoke 等；
+2. `GET /login`（第 76–80 行注册，处理器在第 77–80 行）；
+3. `POST /login/callback`（第 83–86 行）；
+4. `POST/OPTIONS /introspect`（第 89–115 行定义，第 116–122 行注册）；
+5. CLI 参数入口：`--port`（第 135 行），影响监听端口与 server_url。
+
+## 2. 逐条 source→sink 数据流验证
+
+### 数据流 A：`/login` 的 state 参数
+- source：第 78 行 `request.query_params.get("state")`；
+- sink：第 80 行传入 `oauth_provider.get_login_page(state)`。
+- 防御验证：仅做了非空检查（第 79 行），无格式校验。state 值最终进入登录页渲染。若 provider 将 state 回显进 HTML 且未转义，存在反射型 XSS 风险；但该逻辑在 `simple_auth_provider.py` 中，本文件内无法证实 sink 的具体处理方式，且标准 OAuth state 通常由 SDK 内部校验与会话绑定。本文件范围内**证据不足，不下定论**。
+
+### 数据流 B：`/login/callback` 表单数据
+- source：第 85 行整个 `request` 对象（POST body 凭据）；
+- sink：`oauth_provider.handle_login_callback(request)`。
+- 防御：完全委托给 provider 实现，本文件不可见。凭据为硬编码演示凭据（见第 141 行注释及第 143 行 `SimpleAuthSettings()` 默认值），属于已知演示弱点而非本文件代码缺陷。
+
+### 数据流 C：`/introspect` 的 token 参数 —— **核心发现**
+- source：第 94–95 行，`form = await request.form(); token = form.get("token")`——攻击者完全可控的外部输入；
+- sink：第 99 行 `await oauth_provider.load_access_token(token)`，随后第 101–110 行将 token 的 client_id、scope、exp、aud 等元数据以 JSON 返回给调用方。
+- 防御有效性分析：
+  - 第 96–97 行仅做非空与类型检查，不构成访问控制；
+  - 第 116–117 行的 `cors_middleware(introspect_handler, ["POST", "OPTIONS"])` 只是 CORS 处理，**不是认证**，CORS 只约束浏览器跨域读取，curl 等非浏览器客户端可任意调用；
+  - 整个 handler 内没有任何对调用方的客户端认证（RFC 7662 要求 introspection 端点必须保护，如 client credentials/basic auth）。
+- 结论：**未认证的 token introspection 端点（CWE-306: Missing Authentication for Critical Function）**。攻击者可批量提交猜测的 token 值，通过响应中 `active: true/false` 枚举有效令牌，并直接窃取已泄露/截获令牌的全部元数据（client_id、scope、audience、过期时间）。由于 `load_access_token` 是简单内存查找（演示 provider 无速率限制迹象），token 暴力枚举在时间侧信道上也更易实施。
+
+### 第二入口与替代通道核查
+- 标准 OAuth 路由（第 66–73 行）由 MCP SDK `create_auth_routes` 生成，其 authorize/token 端点有各自的 PKCE/state 校验，本文件未削弱它们；
+- `/login` 与 `/login/callback` 是登录链路，但真正暴露令牌元数据的替代通道就是 `/introspect` 本身——它同时是唯一绕过 OAuth 流程直接查询令牌状态的通道，且恰是无保护的；
+- CLI 层面（第 134–147 行）：host 固定为 localhost（第 139 行），默认仅本地监听，缓解了外部利用面；但 `--port` 可配，且部署时改 host 即暴露公网。此为部署缓解因素，不改变代码层缺陷成立。
+
+### 其他检查项
+- 第 111 行 `logger.info(f"...{server_settings.server_url}")`：f-string 记录的是配置 URL，非用户输入，无日志注入；
+- 第 30–31 行默认值 `http://localhost:9000`：配置层面无注入点；
+- 无 SQL、无命令执行、无文件路径拼接 sink，排除注入类漏洞。
+
+## 3. 最终判定
+
+基于全文证据，最确凿的漏洞是 `/introspect`（第 89–122 行）缺少任何形式的客户端认证，违反 RFC 7662 对受保护 introspection 端点的要求，构成 CWE-306。风险等级评为高（可导致令牌枚举与元数据泄露），但因默认绑定 localhost 且属演示代码，实际暴露取决于部署方式。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-306",
+  "risk_level": "high",
+  "source": "line 95: form.get('token') 攻击者可控输入",
+  "sink": "line 99: oauth_provider.load_access_token(token) 并于 line 101-110 返回令牌元数据",
+  "explanation": "/introspect 处理器 line 89-115 仅校验 token 非空(line 96-97)，line 116-117 的 cors_middleware 只是 CORS 处理并非认证，整个端点无任何客户端凭证校验即执行 load_access_token 并回显 active/client_id/scope/exp/aud。攻击者可用 curl 直接调用该端点暴力枚举有效令牌并窃取令牌全部元数据，违反 RFC 7662 要求。localhost 绑定(line 139)仅为部署缓解，不消除代码缺陷。",
+  "fix_suggestion": "line 89-115: 为 introspect_handler 增加客户端认证(如 HTTP Basic 或 bearer 凭证校验，对照 RFC 7662)，拒绝未经认证的请求后再调用 load_access_token"
+}
+```

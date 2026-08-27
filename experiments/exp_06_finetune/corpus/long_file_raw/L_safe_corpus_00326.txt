@@ -1,0 +1,36 @@
+## 编号分析
+
+1. **第 12-17 行 `slashClean`**：对用户输入先补 `/` 再做 `gopath.Clean`，能消除 `..`、多余斜杠等遍历序列，是有效的路径规范化（Clean 后结果不可能以 `..` 开头逃逸）。
+
+2. **第 19-36 行 `parseQueryFiles`（source：`r.URL.Query().Get("files")`）**：
+   - 第 27 行将 `+` 替换为 `%2B` 再 QueryUnescape，防止 `+` 被解码为空格导致文件名歧义——这是正确性修复而非漏洞。
+   - 第 31-32 行：每个名字经 `slashClean` 清洗后与 `f.Path` 做 `filepath.Join`。Join 会再次清理，且 name 已被 Clean 成绝对形式后 Join 的行为受控，无法构造 `../` 逃逸出 `f.Path`。
+
+3. **第 38-59 行 `parseQueryAlgorithm`**：白名单 switch，仅允许固定归档格式，default 拒绝其他值。无注入面。
+
+4. **第 61-72 行 `setContentDisposition`**：`file.Name` 经 `url.PathEscape` 编码后才拼入响应头，防 HTTP 头注入/换行注入；attachment/inline 分支均编码。
+
+5. **第 74-101 行 `rawHandler`（入口点）**：
+   - 第 76 行检查 `d.user.Perm.Download` 权限。
+   - 第 78-84 行：路径 source 为 `r.URL.Path`，传入 `files.NewFileInfo` 且带 `Checker: d`（即 `d.Check`），由框架层校验路径是否在用户 Fs 根内；越权访问会被拒绝并返回错误。
+
+6. **第 103-152 行 `getFiles`（sink：归档条目名 NameInArchive / 文件读取）**：
+   - 第 104 行 `d.Check(path)` 对每个递归路径二次校验，防御有效。
+   - 第 111-127 行：`nameInArchive` 由 TrimPrefix 得到；第 119-120 行把 `\` 替换为 `_`，防止 Windows 解压端把反斜杠当分隔符造成 ZipSlip；第 124-126 行再用 `gopath.Clean("/"+name)` 与原值比对，任何残留的 `..` 序列都会直接报错拒绝。双重防御，Zip-Slip 被阻断。
+   - 第 137 行递归用 `filepath.Join(path, name)`，name 来自 Readdirnames（真实目录项），非用户可控。
+
+7. **第 154-196 行 `rawDirHandler`**：
+   - 第 158/164 行解析参数失败返回错误。
+   - 第 168 行 CommonPrefix 计算公共前缀用于裁剪归档内相对名，配合 getFiles 内部清洗。
+   - 第 178-190 行：下载文件名取 `filepath.Base(commonDir)` 并经 `url.PathEscape` 写入头，无 CRLF 注入。
+   - 第 195 行 `archiver.Archive` 输出到响应体，条目名已被上述两层净化。
+
+8. **第 198-212 行 `rawFileHandler`**：打开的是已通过 Checker 校验的 `file.Path`；第 205-207 行设置 `CSP script-src 'none'`、`nosniff`，缓解内联渲染导致的存储型 XSS（HTML/SVG 上传后预览场景）。
+
+9. **第二入口/替代通道核查**：本文件唯一路由入口为 `rawHandler`（withUser 包装，强制认证）；`getFiles` 仅被 `rawDirHandler` 调用；无环境变量、回调或额外文件读取通道。所有 sink（Fs.Open/Stat、归档条目名、响应头）均有对应有效防御。
+
+结论：未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文共三个入口相关函数：rawHandler 接收 r.URL.Path 与查询参数 files/algo/inline。路径类数据流：URL.Path 和 files 参数均经过 slashClean(gopath.Clean) 规范化，再经 filepath.Join 与 d.Check(Checker) 双重校验，无法逃逸用户 Fs 根目录；getFiles 递归时对每条路径再次调用 d.Check，且归档条目名将反斜杠替换为下划线并用 gopath.Clean 校验不逃逸归档根，阻断 Zip-Slip。algo 参数为白名单 switch。所有写入 Content-Disposition 的文件名均经 url.PathEscape 编码，无 CRLF 注入。rawFileHandler 设置 nosniff 与 CSP script-src none 缓解内联渲染风险。未发现可绕过的黑名单式过滤或未防护的 source 到 sink 数据流。", "fix_suggestion": "no fix needed"}
+```

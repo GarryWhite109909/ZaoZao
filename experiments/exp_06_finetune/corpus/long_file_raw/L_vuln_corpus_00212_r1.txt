@@ -1,0 +1,34 @@
+## 编号分析（全文逐函数）
+
+1. **第 44–52 行 `supports()`**：仅按字段 FQCN 判断，无用户输入，无风险。
+
+2. **第 54–160 行 `configure()`（主入口）**：
+   - 第 57–63 行：`OPTION_FLYSYSTEM_STORAGE` 等均来自开发者配置（Field 自定义选项），非 HTTP 输入；`resolveFlysystemStorage`（第 162–172 行）仅做服务定位器查找并抛异常，无注入面。
+   - 第 65–75 行：`$field->getValue()` 来自数据库实体属性——这是**第二入口（存储型）**：若该值曾被攻击者写入（如通过其他表单），会进入 `getFilePath()` / `getFlysystemFilePath()`。但两处仅做字符串拼接用于展示 URL，且模板层会转义，正则 `/^(http[s]?|\/\/)/i` 只影响是否加前缀，不构成可利用 sink。
+   - 第 78–90 行：`upload_filename` 回调由开发者定义，非本文件可控。
+   - **第 96–127 行（关键路径）**：
+     - 第 100–103 行：Flysystem 分支把 `$relativeUploadDir` 规范化后作为 `upload_dir` 表单选项；
+     - **第 105–113 行 `upload_new` 闭包：`$path = rtrim($uploadDir, '/').'/'.$fileName; ... $filesystem->writeStream($path, $stream);` —— `$fileName` 由表单组件传入，当未配置 `upload_filename` 模式时即为客户端上传文件的原始文件名（攻击者可控），此处未做任何 basename()/路径规范化处理。若底层 Flysystem 使用 LocalFilesystem 且未做前缀强制，`../../` 类文件名可写出上传目录（CWE-22 路径穿越 + CWE-434 不受限文件上传）。**
+     - 第 115–121 行 `upload_delete`：`$file->getPathname()`/`getFilename()` 同样来自表单提交的现有文件名，直接传给 `$filesystem->delete($path)`，异常被吞（第 119 行），存在任意文件删除的替代通道（需配合表单反序列化 FlysystemFile 的场景）。
+     - 第 123–136 行 `upload_validate`：只做重名追加 `_N`，不清洗目录分隔符，反而以含穿越符的名字继续拼接。
+   - 第 138–146 行：本地分支用 `FILTER_VALIDATE_URL` 判断流包装器——开发者配置值，且 `ensureStart(projectDir)` 只在非 URL 时生效；`php://`、`data://` 等多数不通过 VALIDATE_URL，但此值非用户输入，风险有限。
+
+3. **第 174–197 行 `getFilesPaths/getFilePath`**：source 为 DB 值，sink 为展示字符串；`str_replace` 去除 projectDir 仅是展示修正，无文件系统操作，不可利用。
+
+4. **第 199–236 行 Flysystem 路径生成**：同上，纯展示层，`publicUrl(ltrim(...))` 无写操作。
+
+5. **第 238–282 行 mime/maxSize 约束装配**：约束来自开发者配置并转为 Symfony Validator 约束，属有效防御（但仅在配置了 mimeTypes/maxSize 时才存在——默认无任何内容级校验，进一步支持 CWE-434 结论）。
+
+**数据流结论**：HTTP 上传请求（multipart 文件名）→ Symfony 表单 FileType → `configure()` 注入的 `upload_new` 闭包参数 `$fileName`（未过滤）→ 第 110 行 `writeStream($path)` / 第 118 行 `delete($path)`。黑名单/正则缺失，`upload_validate` 不构成有效防御。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 路径穿越 / CWE-434 不受限文件上传",
+  "risk_level": "高",
+  "source": "line 106: upload_new 闭包参数 fileName, 来源于客户端上传文件的原始名称(未设置 upload_filename 模式时)",
+  "sink": "line 110: filesystem->writeStream(rtrim(uploadDir).'/'.$fileName); 以及 line 118: filesystem->delete($file->getPathname())",
+  "explanation": "客户端可控的文件名未经 basename 或路径规范化处理即与 uploadDir 拼接后写入存储, 含 ../ 的文件名在使用本地适配器时可逃逸上传目录写入任意路径; upload_delete 通道同样直接使用表单回传的路径删除文件且异常被吞, 构成第二入口",
+  "fix_suggestion": "line 108: 对 fileName 先执行 basename() 并校验不含目录分隔符与空字节(如 preg_match('/^[A-Za-z0-9._-]+$/', $fileName)), 同时为 Flysystem 本地适配器配置前缀限定; line 117: delete 前同样规范化路径并校验其位于允许的 uploadDir 前缀内"
+}
+```

@@ -1,0 +1,68 @@
+# DictPromptTemplate 安全分析
+
+## 一、文件结构总览与入口点枚举
+
+本文件是 langchain_core 中的字典提示词模板实现，共定义以下函数/方法，逐一分析：
+
+1. `DictPromptTemplate.validate_template`（第 26-29 行）
+2. `input_variables` 属性（第 32-34 行）
+3. `format`（第 36-45 行）
+4. `aformat`（第 47-53 行）
+5. `invoke`（第 55-65 行）
+6. `_prompt_type`（第 67-69 行）
+7. `_serialized`（第 71-73 行）
+8. `is_lc_serializable` / `get_lc_namespace`（第 75-84 行）
+9. `pretty_repr`（第 86-95 行）
+10. 模块级 `_get_input_variables`（第 98-113 行）
+11. 模块级 `_insert_input_variables`（第 116-145 行）
+
+## 二、逐函数数据流分析
+
+### 1. validate_template（第 26-29 行）
+Pydantic model_validator，构造时调用 `_get_input_variables(self.template, self.template_format)`。该调用仅用于**校验模板结构合法性**（提取变量名），返回值被丢弃。source 是用户传入的 template dict，sink 是字符串解析（`get_template_variables`），不产生格式化执行、不触达任何危险 sink。无漏洞。
+
+### 2. input_variables 属性（第 32-34 行）
+直接转发到 `_get_input_variables`，纯读取操作，无副作用。无漏洞。
+
+### 3. format（第 36-45 行）
+核心入口：接收 `**kwargs` 作为 source，sink 为 `_insert_input_variables(self.template, kwargs, self.template_format)`。
+
+关键点：这里使用的是 `DEFAULT_FORMATTER_MAPPING` 中注册的 f-string/mustache formatter——langchain 的 f-string formatter 基于 `string.Formatter().vformat` 的**安全子集实现**（仅做 `{var}` 占位替换，不调用 Python 的 `.format()` 原生方法），因此不存在经典 f-string format-string 注入（如 `{0.__class__}` 属性遍历）问题。变量名在构造时已由 validate_template 校验过。kwargs 值只作为替换内容注入字符串，不会被执行。无注入 sink。
+
+### 4. aformat（第 47-53 行）
+直接同步委托给 `self.format(**kwargs)`，行为与 format 完全一致，无新增攻击面。
+
+### 5. invoke（第 55-65 行）
+将输入 dict 经 `_call_with_config` 包装后传入 `lambda x: self.format(**x)`。source 是 invoke 的 input 参数，sink 与 format 相同。注意：`**x` 解包时若 x 含非字符串键可能报错，但这是功能性问题非安全问题。config 仅用于 tracing 元数据。无漏洞。
+
+### 6. _prompt_type / _serialized / is_lc_serializable / get_lc_namespace（第 67-84 行）
+`_serialized` 调用 `dumpd(self)` 做序列化导出，输出为 JSON 兼容结构，不含代码执行 sink；反序列化安全性由 langchain load 层的 allowlist 机制另行保障，不在本文件内。这些均为元数据方法，无攻击面。
+
+### 7. pretty_repr（第 86-95 行）
+直接 `raise NotImplementedError`，未实现即不可达，无漏洞。
+
+### 8. _get_input_variables（第 98-113 行）
+递归遍历 dict/list/tuple 中的字符串并提取变量名。注意第 104-105 行：list/tuple 内的嵌套 dict 会递归处理，但 **dict 的 key 从不被解析**（文档已声明）。此函数只读不写，返回值为 list[str]，无 sink。
+
+### 9. _insert_input_variables（第 116-145 行）— 重点审查
+递归格式化：
+- 第 121 行：字符串值 → `formatter(v, **inputs)`，同前述安全 formatter，无原生 str.format 注入。
+- 第 122-129 行：嵌套 dict → 递归。此处存在一个值得讨论的点：第 124-128 行对 `k == "image_url" and "path" in v` 的情况发出 `warnings.warn` 提示文件路径风险，但**并未阻止渲染**。
+- 第 130-140 行：list/tuple → 逐元素处理，保留原容器类型。
+- 第 141-142 行：其他类型原样透传。
+
+关于 image_url/path 分支的评估：这是一个**防御性降级设计**——旧版本曾允许通过 path 直接读本地文件作为图片输入（本地文件读取漏洞），本版本移除了实际读取逻辑，仅保留警告。当前代码中 path 字段只是被递归格式化后作为普通 dict 值返回，本文件内没有任何文件 I/O、网络请求或 eval/exec sink。真正的路径消费发生在下游（如消息渲染层），且下游已有相应防护。因此在本文件范围内不构成可利用漏洞。
+
+## 三、第二入口与替代通道检查
+
+- 反序列化通道：类声明 `is_lc_serializable() == True`，恶意 payload 需经 langchain load 的白名单校验，本文件未引入新的可实例化危险属性（template/template_format 类型受限）。
+- 变量名注入：validate_template 在构造时强制解析全部变量，运行时 formatter 对未知变量抛 KeyError 而非静默拼接。
+- 无环境变量、文件、网络、回调注册等其他入口。
+
+## 四、结论
+
+全文通读后，所有 source→sink 流均终止于安全的占位符替换 formatter 或纯数据透传，无代码执行、路径遍历、注入类 sink 在本文件内可达。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文11个函数/方法:所有用户输入(kwargs/invoke的input)最终进入DEFAULT_FORMATTER_MAPPING中的安全占位符formatter,基于string.Formatter安全子集实现,不支持属性遍历,无format注入;_insert_input_variables中image_url+path分支(第124-128行)仅发warning不做文件读取,本文件内无任何文件IO/eval/exec/网络sink;序列化经dumpd输出纯数据,加载侧由langchain白名单防护;validate_template在构造期强制校验全部变量名;无第二入口或替代通道可达危险sink", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,45 @@
+LANG: python
+```python
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import hashlib
+
+app = FastAPI()
+
+# 模拟构件签名服务：对上传的制品计算摘要并生成签名记录
+ARTIFACT_STORE = {}
+SIGNED_LOG = []
+
+@app.post("/artifacts/sign")
+async def sign_artifact(
+    file: UploadFile = File(...),
+    key_id: str = Form(...)
+):
+    content = await file.read()
+
+    # 使用 SHA-256 计算制品摘要（强哈希）
+    digest = hashlib.sha256(content).hexdigest()
+    signature = f"sig-{key_id}-{digest}"
+
+    ARTIFACT_STORE[digest] = {"filename": file.filename, "content": content}
+    SIGNED_LOG.append(signature)
+
+    return {"artifact_digest": digest, "signature": signature}
+
+@app.get("/artifacts/{digest}")
+async def get_artifact(digest: str):
+    artifact = ARTIFACT_STORE.get(digest)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"filename": artifact["filename"], "size": len(artifact["content"])}
+```
+
+1. 第 10-12 行：用户可控输入点为 `file: UploadFile`（文件内容，第 15 行 `await file.read()` 读入 `content`）与 `key_id: str = Form(...)`；二者均由框架参数绑定直接进入业务逻辑。
+2. 第 18 行为漏洞 sink：原代码使用 `hashlib.sha1(content)` 计算制品摘要。SHA-1 已被证实存在碰撞攻击（SHAttered 等），用于构件完整性/签名场景属于 CWE-327 弱密码学算法。
+3. 防御类型正确性：修复采用框架无关的标准库强哈希 API `hashlib.sha256`，SHA-256 目前无实用碰撞攻击，满足完整性校验的密码学强度要求，且接口签名一致（接受 bytes 返回 hash 对象），替换无副作用。
+4. 位置正确性：仅在第 18 行将 `sha1` 替换为 `sha256`，摘要值同时作为存储键（第 21 行）与签名组成（第 19 行），单点替换即覆盖整条数据流：content → sha256 → digest → ARTIFACT_STORE/SIGNED_LOG/响应体。
+5. 攻击面覆盖完整性：所有依赖 digest 的下游消费点（第 22 行 GET 路由按 digest 查询、第 20 行签名日志）均基于同一 digest 变量，替换后自动使用强哈希输出，无需额外修改；控制流、函数名、路由路径与变量名全部保持不变，符合最小 diff 纪律。
+6. 第二入口检查：第 26-31 行 `/artifacts/{digest}` 路由仅做字典查询并返回元数据，不涉及任何密码学运算，无其他弱算法调用点；全文件仅第 18 行一处 hashlib 使用，替代通道检查通过。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞位于第18行使用 hashlib.sha1 计算制品摘要，属 CWE-327 弱密码学算法，SHA-1 存在已知碰撞攻击可伪造构件签名记录；修复方式为将该行替换为 hashlib.sha256 强哈希，digest 作为唯一中间变量覆盖存储键、签名与响应体全部下游消费点；第二入口 /artifacts/{digest} 仅做字典查询无密码学运算，无其他风险流", "fix_suggestion": "line 18: 将 hashlib.sha1(content) 替换为 hashlib.sha256(content)"}
+```

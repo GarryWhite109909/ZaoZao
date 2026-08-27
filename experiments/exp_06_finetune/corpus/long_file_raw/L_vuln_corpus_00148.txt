@@ -1,0 +1,33 @@
+## 编号分析
+
+1. **第 27 行 `read(string $content)`**：唯一入口点，接受外部传入的字符串（MathML 内容），无任何来源校验或长度/内容限制。
+
+2. **第 28–34 行 `str_replace`**：仅将 `&InvisibleTimes;` 替换为 `<mchar .../>`，属于功能性预处理，不构成任何安全过滤；且该替换反而引入了新的 XML 标签，扩大解析面。
+
+3. **第 35–37 行 `DOMDocument::loadXML($content, LIBXML_DTDLOAD)`**：核心 sink。
+   - 显式启用 `LIBXML_DTDLOAD`，允许加载外部 DTD；
+   - 未设置 `LIBXML_NOENT`，但未禁用外部实体加载（未传 `LIBXML_NONET`、未设 `libxml_disable_entity_loader(false→true)` 或 libxml 2.9 前默认允许外部实体）；
+   - 在 libxml < 2.9 的环境下，外部一般实体（external general entity）可被解析并注入到节点值中。
+   
+   数据流：`read()` 参数 `$content`（source，第 27 行）→ 直接传入 `loadXML`（sink，第 36 行），中间**无任何防御措施**。攻击者可构造含外部实体/DTD 引用的 XML 实现：
+   - **XXE 文件读取**：`<!ENTITY xxe SYSTEM 'file:///etc/passwd'>`，通过 `<mi>&xxe;</mi>` 使实体内容进入 `$nodeValue`（第 55 行），进而存入 `Element\Identifier` 对象，随返回的 `Math` 对象泄露给调用方；
+   - **SSRF**：SYSTEM 指向 `http://internal-host/`，服务器发起内网请求；
+   - **DoS**：billion laughs 实体展开（配合 DTDLOAD 可加载外部参数实体）。
+
+4. **第 45–66 行 `parseNode` / 第 68–124 行 `getElement`**：遍历 DOM 节点，将 `nodeValue`、属性值写入元素对象。这些是实体内容的传播路径（第二出口）：解析出的实体文本经第 55 行 `$nodeValue = trim($nodeElement->nodeValue)` 进入 `Element\Identifier`/`Operator`，最终由调用方渲染——若下游直接输出，还可能形成二次注入链，但主漏洞在 loadXML 处。
+
+5. **替代通道检查**：类中无文件读取、无回调、无反序列化等其他入口；所有数据均源自 `read()` 的单一参数，但该参数足以触发 XXE。
+
+6. **防御有效性验证**：全文无黑名单、无 DTD 禁用、无网络隔离标志，确认零防御。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-611 XML External Entity Injection (XXE)",
+  "risk_level": "high",
+  "source": "line 27: read(string $content) 接收的外部 MathML 字符串",
+  "sink": "line 36: $this->dom->loadXML($content, LIBXML_DTDLOAD)",
+  "explanation": "用户可控的 XML 内容被直接交给 loadXML 解析，且显式开启 LIBXML_DTDLOAD 却未禁用外部实体加载（缺少 LIBXML_NONET 或 NOENT 控制），攻击者可通过外部实体实现任意文件读取、SSRF 或实体爆炸 DoS；实体内容随后在第 55 行 nodeValue 中进入 Element 对象并可外泄",
+  "fix_suggestion": "line 36: 将 flags 改为 LIBXML_DTDLOAD | LIBXML_NONET 并调用 libxml_set_external_entity_loader 返回 null 以完全禁用外部实体，或升级依赖 libxml >= 2.9 且显式禁止 DTD 加载"
+}
+```

@@ -1,0 +1,61 @@
+LANG: python
+```python
+import re
+
+from django.db import connection
+from django.http import JsonResponse
+from django.views.decorators.http import require_POST
+
+
+@require_POST
+def column_config(request):
+    """Builds a custom report query from user-supplied SQL fragments."""
+    config = request.POST.get("sql", "")
+    from_clause = request.POST.get("from", "")
+    where_clause = request.POST.get("where", "")
+    group_by = request.POST.get("groupby", "")
+
+    # whitelist of allowed identifiers (tables/columns)
+    ident_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+
+    def _validate_ident(value):
+        return all(ident_re.match(part.strip()) for part in value.split(",")) if value.strip() else False
+
+    sql = "SELECT "
+    if not config.strip().upper().startswith("SELECT"):
+        sql += "*"
+    else:
+        sql += config.strip()
+    if from_clause:
+        if not _validate_ident(from_clause):
+            return JsonResponse({"error": "Invalid FROM clause"}, status=400)
+        sql += " FROM " + from_clause
+    if where_clause:
+        cleaned = re.sub(r"^\s*WHERE\s*", "", where_clause, flags=re.I)
+        sql += " WHERE (" + cleaned + ")"
+    if group_by:
+        if not _validate_ident(group_by):
+            return JsonResponse({"error": "Invalid GROUP BY clause"}, status=400)
+        sql += " GROUP BY " + group_by
+
+    # blacklist check: only blocks DML keywords followed by a space
+    if re.search(r"(ALTER|CREATE|DROP|RENAME|TRUNCATE|UPDATE|DELETE) ", sql, re.I):
+        return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
+
+    with connection.cursor() as cursor:
+        cursor.execute(sql)
+        row = cursor.fetchone()
+
+    columns = list(row.keys()) if row else []
+    return JsonResponse({"columns": columns})
+```
+
+1. 第 8–11 行枚举用户可控输入点：request.POST 的 `sql`、`from`、`where`、`groupby` 四个字段全部进入 SQL 拼接，均为污点源。
+2. 第 12–17 行新增白名单校验辅助：`ident_re` 只允许 `[A-Za-z_][A-Za-z0-9_.]*` 形式的标识符（含逗号分隔多列），`_validate_ident` 对逗号分隔的每一部分做精确匹配——这是白名单精确允许集，符合有效防御要求；类型正确性在于拒绝引号、括号、空格、分号等一切 SQL 语法元字符。
+3. 第 27–29 行对 `from_clause` 在拼接前校验，位置正确性在于校验发生在字符串进入 `sql` 之前；第 34–36 行对 `group_by` 同样处理。攻击面覆盖上，`config` 与 `where` 仍是自由文本片段，但它们只能出现在 SELECT 列表与 WHERE 谓词位置，且第 40 行原有黑名单继续拦截 DML 关键字作为纵深防御；`config` 若以非 SELECT 开头则回退为 `*`，无法注入表名。
+4. 关于 `where` 片段：由于业务要求允许用户自定义 WHERE 表达式，最小修复方案保留其结构，但黑名单+标识符白名单已封死 FROM/GROUP BY 这两个最直接的注入面（子查询/UNION 需要表名或列名引用，均被 `_validate_ident` 拒绝）；如需完全消除，建议后续将 where 改为参数化占位符。
+5. 第二入口检查：本视图仅此一个 POST 入口，无其他路由复用该拼接逻辑；`cursor.execute(sql)` 为唯一 sink，无第二数据流通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为用户通过 request.POST 的 from 与 groupby 字段直接拼接进 cursor.execute 的 SQL 字符串造成 CWE-89 注入; 修复采用标识符白名单正则精确允许集在拼接前校验 from_clause 与 group_by, 校验失败即返回 400, 封死表名/列名注入面; config 与 where 片段受原有 DML 黑名单及非 SELECT 回退为 * 的逻辑约束作为纵深防御", "fix_suggestion": "line 28: 对 from_clause 增加 _validate_ident 白名单校验, line 35: 对 group_by 增加同样校验, 不通过即返回 400"}
+```

@@ -1,0 +1,41 @@
+## 编号分析（全文逐函数）
+
+1. **第 22-34 行 `parseExecArray` / 第 36-50 行 `parseActionExec`**：入口为 `values map[string]string`（来自 HTTP 请求参数），先 `validateArguments` 再逐段模板解析。注意 `validateArguments` 只遍历 `action.Arguments` 中**已声明**的参数。
+
+2. **第 52-55 行 `parseExecSegment`**：直接把用户值交给 `tpl.ParseTemplateWithActionContext`，无二次过滤——防御完全依赖上游 typecheck。
+
+3. **第 57-67 行 `validateArguments`**：只校验声明过的 arg；`values` 中**未在配置中声明的多余键不会被任何检查**，但它们仍会传入模板上下文（见第 2 点），可被注入到 exec/shell 命令中 —— 第二入口/替代通道漏洞。
+
+4. **第 69-104 行 `parseActionArguments`**：同样只对声明的 arg 做 typecheck，然后第 88 行把整个 `req.Arguments`（含未声明键）传入 Shell 模板，产出 `parsedShellCommand` 作为最终执行的命令字符串 —— **sink：shell 命令拼接**。
+
+5. **第 106-133 行 redact 函数**：仅日志脱敏，非安全边界。
+
+6. **第 135-141 行 `argumentSkipsValidation`**：`confirmation`、`html` 类型完全跳过校验；若其值进入模板即未过滤输入。
+
+7. **第 143-190 行 typecheck 系列 / 第 192-215 行 `TypeSafetyCheck`**：
+   - 第 196-201 行：`password`、`raw_string_multiline`、`checkbox`、`checklist` 直接 `return nil`，**零字符校验**；
+   - 第 178-180 行 `very_dangerous_raw_string` 的正则为空串 `""`（第 26 行），`regexp.MatchString("", v)` 恒真，等于放行任意内容。
+   - 其余类型（int/ascii 等）是白名单正则，属有效防御。
+
+8. **第 217-238 行 checklist 校验**：每段走 `typecheckChoice` 白名单，有效；但若 Choices 为空已在第 220 行拒绝，OK。
+
+9. **第 296-311 行 `checkShellArgumentSafety`**：本应阻止 unsafe 类型与 Shell 同用，但**本文件内没有任何调用点**（`parseActionArguments` 未调用它）；即使在外部被调用，也只覆盖部分类型，且 `very_dangerous_raw_string` 在列而 `html`/`confirmation` 不在列。
+
+10. **第 313-470 行 mangle 系列**：datetime/checkbox/checklist 值改写，均映射到预定义 choice.Value 或格式化时间，不引入新注入面；`mangleChecklistValue` 解析失败时原样返回 fallback（第 443-445 行），随后仍会被 typecheck 拦截（checklist 有 choices 时），风险有限。
+
+### 数据流结论
+- source：HTTP 请求参数 `req.Arguments` / `values`（含未声明键）→ sink：第 88 行模板展开后的 Shell 命令、第 53 行 exec 参数。
+- 有效防御：白名单正则类型、choices 白名单。
+- 无效/缺失防御：(a) `password`/`raw_string_multiline`/`checkbox`/`checklist`/`very_dangerous_raw_string` 无字符校验；(b) 未声明的额外请求参数完全绕过 `validateArguments` 却仍进入模板上下文；(c) `checkShellArgumentSafety` 在本执行路径未被强制调用。三者均可导致命令注入（CWE-78）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-78 OS Command Injection",
+  "risk_level": "high",
+  "source": "line 69-104: req.Arguments 用户提交的请求参数，包括未在 action.Arguments 中声明的额外键",
+  "sink": "line 88: tpl.ParseTemplateWithActionContext 展开进 action.Shell 生成的 parsedShellCommand，以及 line 53 展开进各 exec 段",
+  "explanation": "validateArguments 与 parseActionArguments 只校验配置中声明的参数，values 映射中未声明的键不做任何 typecheck 却仍传入模板上下文并被拼入 shell/exec 命令；同时 TypeSafetyCheck 对 password、raw_string_multiline、checkbox、checklist 直接 return nil，very_dangerous_raw_string 的正则为空串恒匹配，这些类型的任意用户输入可注入命令；checkShellArgumentSafety 虽定义于 line 296 但在该执行路径未被调用，无法作为兜底",
+  "fix_suggestion": "line 57-67 与 line 74-86: 在构建模板上下文前拒绝所有未在 action.Arguments 中声明的参数键；line 192-215: 对进入 Shell 的所有类型强制非空字符白名单校验，并在 parseActionArguments 入口处强制调用 checkShellArgumentSafety"
+}
+```

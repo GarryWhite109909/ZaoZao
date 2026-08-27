@@ -1,0 +1,19 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：本文件为 CLI 工具，入口均为 cobra 子命令：`add`（第 60 行起）、`remove`（第 105 行）、`edit`（第 150 行）、`list`（第 200 行）、`run`（第 245 行）、`test`（第 270 行）；外部输入源包括命令行参数 `args`、flag `hookType/hookSource`、环境变量 `UNIGET_EDITOR/EDITOR`、viper 配置 `prefix`。sink 为 `os.Remove`、`os.Chmod`、`exec.Command`、文件复制。
+
+2. **addHooksCmd**：`hookFileName` 取自 `--source` 路径最后一段，但未过滤 `..`——若 source 以 `/` 结尾或路径如 `/tmp/../x.sh`，basename 可能为 `..` 或含恶意名；不过目标目录由固定类型决定，且需本地文件存在，风险低。
+
+3. **removeHooksCmd（第 105–160 行）**：`hookFileName := args[0]` 直接拼接进 `hookFile`，随后仅用 `strings.HasPrefix(hookFileAbs, hooksDir)` 做前缀校验（约第 130 行）。该检查缺少尾部分隔符，存在经典绕过：若 `hooksDir = /var/lib/uniget/config/hooks`，传入 `../hooks-evil/target` 得到 `/var/lib/uniget/config/hooks-evil/target`，通过前缀检查却位于目录之外 → **任意文件删除**。
+
+4. **editHooksCmd（第 150–215 行）**：同样的 `HasPrefix` 弱校验（约第 185 行），可绕过后将任意路径交给 `exec.Command(editor, hookFile)` 编辑并 chmod 0700 → **越权写/改权限**。另外符号链接检测逻辑写反：`if err == nil { return "is a symlink" }`（Lstat 对普通文件也返回 nil），导致任何已存在的合法 hook 都被拒绝——这是功能性缺陷，反而使 edit 实际难以命中已存在文件，但不构成防御。
+
+5. **testHookCmd（第 270–300 行）**：`hookName := args[0]` 未做任何路径校验即拼入 `hookFile` 并直接 `runHook` 执行（`exec.Command(hookFile, args...)`）。无 prefix 检查、无 symlink 检查 → 可执行文件系统上任意程序（第二入口/替代通道）。
+
+6. **processHooks/runHooks/runHook**：目录内容来自磁盘；symlink 检查同样逻辑反置（`err == nil` 即报错），意味着 processHooks 会拒绝所有存在的常规文件——功能损坏而非漏洞；若按作者本意（err != nil 才报错）修复后，hook 目录内被植入的 symlink 将被执行，属设计信任边界问题。
+
+7. **综合**：最严重的是 remove/edit 的 `strings.HasPrefix` 目录逃逸绕过与 test 的无校验执行路径。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "path_traversal_leading_to_arbitrary_file_deletion_write_and_command_execution", "risk_level": "medium", "source": "removeHooksCmd/editHooksCmd/testHookCmd 的位置参数 args[0] 以及 --source flag", "sink": "os.Remove、exec.Command(editor, hookFile)、exec.Command(hookFile, args...)、os.Chmod", "explanation": "remove 与 edit 子命令使用 strings.HasPrefix(hookFileAbs, hooksDir) 校验路径边界，未附加路径分隔符，攻击者可用兄弟目录名（如 ../hooks-evil/x）绕过前缀检查，实现 hooksDir 之外的任意文件删除（os.Remove）或编辑加 chmod 0700；test 子命令对 args[0] 完全无校验，可直接拼入 hookFile 并经 runHook 用 exec.Command 执行任意本地程序；此外 processHooks 与 edit 中 os.Lstat 符号链接检查条件写反（err==nil 即判为 symlink），导致正常文件被拒，属于功能性缺陷而非有效防御", "fix_suggestion": "使用 filepath.Rel 或 filepath.EvalSymlinks 后校验相对路径不以 .. 开头且严格位于 hooksDir 内（比较时附加分隔符或使用 filepath.Join 后的规范路径）；修正 Lstat 判断为 err != nil 时才允许继续并对常规文件模式做 ModeSymlink 位检查；对 test 子命令的 hookName 做 basename 白名单校验"}
+```

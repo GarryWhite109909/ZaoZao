@@ -1,0 +1,78 @@
+# Easy!Appointments Booking_settings 控制器安全分析
+
+## 一、文件结构总览与入口点枚举
+
+本文件是 CodeIgniter 4 框架控制器（第1行 `defined('BASEPATH')` 防止直接脚本访问），类 `Booking_settings` 继承自 `EA_Controller`（第20行）。通过通读全文，该控制器共暴露 **2 个 HTTP 路由入口点**（CI4 自动将 public 方法映射为路由）：
+
+- **入口点 1**：`index()`（第38–63行），GET 渲染设置页面；
+- **入口点 2**：`save()`（第68–110行），POST 保存设置。
+
+构造函数（第27–36行）仅加载模型与库，不接收任何用户输入，不构成入口。`$allowed_setting_fields`（第22行）与 `$optional_setting_fields`（第24行）为硬编码常量数组，非用户可控。
+
+以下逐一分析。
+
+## 二、入口点 1：`index()`（第38–63行）
+
+**数据流分析：**
+
+- 第40行 `method('get')` 强制 GET，防 CSRF 状态变更滥用。
+- 第42行 `session(['dest_url' => site_url('booking_settings')])` —— 参数是**硬编码字符串**，非用户输入，无开放重定向风险。
+- 第44行 `$user_id = session('user_id')` —— source 为会话数据。会话由服务端在登录时写入，用户无法直接伪造（除非会话劫持，属传输层问题而非本代码缺陷）。
+- 第46–53行权限检查：`cannot('view', PRIV_SYSTEM_SETTINGS)` 时，已登录则 `abort(403)`，未登录则跳转登录页。这是**有效防御**——基于角色权限模型（roles_model 已加载），非黑名单/正则式可绕过过滤。
+- 第55行 `script_vars([... 'booking_settings' => filter_sensitive_settings($this->settings_model->get_batch())])` —— sink 为前端 JS 变量注入。关键防御是 `filter_sensitive_settings()`：对设置批量数据做敏感字段脱敏后再输出。即使数据库中存在含 HTML 的设置值（如富文本设置），此处输出到 script_vars 是否存在 XSS 取决于框架对该函数的 JSON 编码处理；EA_Controller/script_vars 底层使用 JSON 编码并置于 `<script>` 标签内，JSON 编码本身阻止了标签逃逸（`</script>` 会被转义为 `<\/script>`）。此外能到达此处的用户已通过 `view PRIV_SYSTEM_SETTINGS` 权限校验，属于高权限管理员场景，风险面极小。
+- 第58–62行 `html_vars` 与视图加载：`lang('settings')`、`PRIV_SYSTEM_SETTINGS`、`$this->accounts->get_user_display_name($user_id)` 均为服务端数据/受控值。`get_user_display_name` 返回的显示名若含恶意字符，取决于视图层是否做 `html_escape`——但该值的来源是管理员自己账户的 first_name/last_name 字段，且查看者同样是具备系统设置权限的管理员，属于低危的自存储场景，非匿名攻击者可达。
+
+**结论**：index() 无可达漏洞。
+
+## 三、入口点 2：`save()`（第68–110行）
+
+这是核心写入口。source→sink 数据流如下：
+
+**Source**：第79行 `$settings = request('booking_settings', [])` —— 用户 POST 体中的 `booking_settings` 数组，完全用户可控。前置防御：
+
+- 第74行 `method('post')` 限定 POST；
+- 第76–78行 `cannot('edit', PRIV_SYSTEM_SETTINGS)` 权限门禁——只有拥有系统设置编辑权的角色才能进入后续逻辑。这是第一道有效防线；
+- 第80行 `check('booking_settings', 'array|null')` 类型校验，防止类型混淆攻击。
+
+**Sink 1：SQL 查询（第82行）**
+`$this->settings_model->query()->where('name', $setting['name'])->get()->row_array()`
+`$setting['name']` 是用户可控 source，sink 是查询条件。CodeIgniter Query Builder 的 `where('name', $value)` 两参数形式默认执行参数绑定/转义，**不是字符串拼接**，因此 SQL 注入被框架层有效阻断。无原始 SQL 拼接（无 `$this->db->query("...{$x}...")` 形态）。✅ 有效防御。
+
+**Sink 2：任意设置名覆盖（第82–88行 + 第104行 save）**
+
+这是最值得深挖的点：循环遍历用户提交的每个 `$setting`，以 `$setting['name']` 作为键写入 settings 表。攻击者能否借此覆盖**敏感设置项**？
+
+逐项验证防御：
+1. **权限前提**：能调用 save() 者必须已有 `edit PRIV_SYSTEM_SETTINGS` 权限——即系统设置本来就是该角色的合法管理范围，覆盖任意设置项在其授权范围内，不构成提权。
+2. **白名单字段约束**：第102行 `$this->settings_model->only($setting, $this->allowed_setting_fields)`，其中 `$allowed_setting_fields = ['id', 'name', 'value']`（第22行，硬编码）。`only()` 会剥离白名单之外的键，防止攻击者注入额外列（如直接改 user 表其他字段——虽然这里操作的是 settings 表本身，列固定）。✅ 有效防御（白名单，非黑名单）。
+3. **针对 XSS 输出的净化**：
+   - 第90–94行：名称以 `label_custom_field_` 开头的设置，其 value 经 `strip_tags()` 处理——这些 label 会在公开预订页面渲染，strip_tags 移除标签防存储型 XSS。注意：strip_tags 不处理属性型向量（如未加引号事件属性需标签才生效，故纯文本输出下基本安全）；若前端以 HTML 方式渲染且允许属性残留……实际上 strip_tags 后不存在标签，属性无从附着。✅ 对其目标场景有效。
+   - 第96–101行：富文本设置（`disable_booking_message`）经 `pure_html()` 净化——该函数在 EA 项目中基于 HTML 净化器（HTMLPurifier 类白名单机制），保留安全标签、剥离脚本/事件属性。✅ 有效防御（白名单式净化器，非正则黑名单）。
+4. **关键缺口检验——其他设置名的 value 未净化**：除上述两类外，其余任意 name 的 value 原样入库。这些值会在哪里渲染？
+   - 管理端：由 index() 经 `filter_sensitive_settings()` 脱敏后经 script_vars 以 JSON 输出——JSON 编码防上下文逃逸；
+   - 公开端（booking 页面）：公司名、地址等设置确实会输出到公开页面。但这些设置的编辑权本身就是 PRIV_SYSTEM_SETTINGS 持有者的合法职能（管理员本来就要配置公司名），且能改它们的人已是最高权限管理员——这属于“受信管理员输入”而非越权漏洞。真正需要净化的公开面字段（custom field labels、booking message）已分别覆盖。因此不构成可利用漏洞。
+5. **id 注入检验（第84–86行）**：若 `existing_setting` 非空则强制 `$setting['id'] = $existing_setting['id']`，用数据库查得的 id 覆盖用户提交的 id——防止了通过伪造 id 更新/覆盖**其他记录**（如把 id 指向别的表行造成跨记录篡改）。若 setting 不存在则走 insert（id 由用户传入与否取决于 only() 后仍保留 id 键——但新插入时 id 通常被模型忽略或自增）。✅ 有效防御。
+6. **CSRF**：CI4 默认启用 CSRF 过滤器（全局过滤器配置中 `csrf` 应用于 POST），且项目基类 EA_Controller 继承体系包含该保护；即便假设未启用，本操作要求已认证的高权限会话，CSRF 影响有限。按项目实际配置（config/Filters.php 中 csrf 全局启用）判定已防护。
+
+**第二入口与替代通道检查**：
+- CLI 入口：CI4 spark 命令不映射此控制器方法为 HTTP，无替代通道。
+- 其他控制器是否也写 settings 表？项目中 `Settings` 控制器同样管理设置，但其有独立的同等权限校验，且与本文件无关；本文件范围内不存在绕过路径。
+- API v1 路由：Easy!Appointments 的 /api/v1 设置接口走独立的 api 控制器并要求 Basic/API 认证，与本控制器逻辑独立，不构成本文件的绕过通道。
+- 构造函数加载的库（google_sync、notifications 等）在本文件中未被调用，无可达 sink。
+
+## 四、总结
+
+全部 source→sink 流：
+| # | source | sink | 防御 | 判定 |
+|---|--------|------|------|------|
+| 1 | session('user_id') → script_vars | 前端 JS | 服务端会话+权限+JSON编码 | 安全 |
+| 2 | POST booking_settings[].name → where() | SQL | Query Builder 参数绑定 | 安全 |
+| 3 | POST value(label_custom_field_*) | 公开页渲染 | strip_tags | 安全 |
+| 4 | POST value(富文本) | 公开页渲染 | pure_html 白名单净化 | 安全 |
+| 5 | POST id/name/value → save | DB 写入 | 权限门禁+only() 白名单+id 服务端覆写 | 安全 |
+
+未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文两个入口 index 与 save 均先执行 method 限定与 cannot 权限门禁。save 中用户可控的 booking_settings 数组流向三类 sink：Query Builder where 参数绑定防 SQL 注入；label_custom_field_ 前缀值经 strip_tags、富文本值经 pure_html 白名单净化防存储型 XSS；only 白名单限定 id,name,value 三字段且已存在记录时用数据库 id 覆盖用户提交 id 防跨记录篡改。index 输出经 filter_sensitive_settings 脱敏并以 JSON 编码嵌入。未发现可绕过路径或第二入口。", "fix_suggestion": "no fix needed"}
+```

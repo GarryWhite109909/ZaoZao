@@ -1,0 +1,36 @@
+## 编号分析（全文通读）
+
+**入口点枚举**
+1. `generate()` 第 130 行：`$name`、`$parameters`（含 `_locale`、`_fragment` 及任意额外键）为外部可控 source；路由定义来自 `RouteCollection`（开发者配置，非直接用户输入）。
+2. `doGenerate()` 第 165 行：接收上述参数，另从 `$this->context` 取 `getParameters()/getHost()/getScheme()/getBaseUrl()/getPathInfo()`——RequestContext 通常由请求的 Host 头等构造，属第二入口。
+3. 无文件操作、无回调执行点、无环境变量读取；`getRelativePath()` 为纯函数。
+
+**逐条 source→sink 数据流**
+
+A. 路径变量注入（第 208–224 行）：变量值先经路由 requirement 正则校验（第 210 行），再拼入 `$url`，随后第 227 行 `rawurlencode($url)` 全量编码，仅回解码白名单字符（`%2F→/` 等）。若开发者 requirement 过宽（如允许 `/`），可产生路径穿越式 URL，但这是配置问题而非本类缺陷；默认防御有效。
+
+B. **Host 变量注入（第 252–276 行）**：`$routeHost = $token[1].$mergedParams[$token[3]].$routeHost` —— host 占位符的值**未做任何 percent-encoding**，仅依赖 requirement 正则。若某路由 host 定义如 `{subdomain}.example.com` 且 requirement 宽松（或 strictRequirements 关闭时第 263 行直接返回空串尚可），攻击者传入含 `@`、`#`、`?` 的值即可改写 authority（如 `evil.com#@good.com`），导致开放重定向/钓鱼链接生成。此为真实历史缺陷模式（Symfony 后续版本对 host 做了编码加固）。防御有效性：正则黑名单式校验按题设视为可绕过；且第 259 行校验仅在 `strictRequirements !== null` 时执行，`setStrictRequirements(false)` 时完全跳过校验但仍拼接 URL（第 224 行路径部分同样）。
+
+C. RequestContext host（第 238 行 `$this->context->getHost()`）：来自请求 Host 头，直接拼入 `$schemeAuthority .= $host.$port`（第 296 行）。Symfony 框架层在构造 RequestContext 时已验证 Host 合法性，故在本类范围内不构成独立漏洞。
+
+D. 查询串（第 320–322 行）：`http_build_query(..., PHP_QUERY_RFC3986)` 全量编码后仅回解码无歧义字符，防御有效。
+
+E. Fragment（第 325–328 行）：`rawurlencode($fragment)` 编码充分，防御有效。
+
+F. `getRelativePath()`（第 346–386 行）：纯字符串运算，输出以 `./` 防护冒号前缀段，无 sink。
+
+**第二入口核查**：`$parameters['_locale']`（第 131 行）仅用于路由名查找与 locale 回退循环（strstr 截断），无法注入 URL 结构。`$defaults['_fragment']` 来自路由定义而非用户输入。
+
+**结论**：唯一基于全文证据成立的缺陷是 B —— host 占位符值未经编码直接进入 URL authority 组件，依赖开发者提供的 requirement 正则作为唯一防线；当 requirement 宽松或 strictRequirements 被关闭时，外部可控参数可篡改生成的 URL 主机部分。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-20 (输入校验不足导致 URL authority 篡改 / 开放重定向)",
+  "risk_level": "中",
+  "source": "line 165: doGenerate 的 parameters 参数(用户可控的路由占位符值)",
+  "sink": "line 264: $routeHost = $token[1].$mergedParams[$token[3]].$routeHost 未编码拼入主机名",
+  "explanation": "路径变量经 rawurlencode 编码(第227行)但 host 占位符值直接拼接进 authority 组件且不做任何编码，唯一防线是路由 requirement 正则；当正则宽松或通过 setStrictRequirements(false) 关闭校验时，含 @ # ? 等字符的值可改写生成 URL 的主机部分，造成开放重定向或钓鱼链接",
+  "fix_suggestion": "line 264: 对 host 变量值先做 rawurlencode 并限制允许字符集，或在 strictRequirements 为 false 时也强制拒绝包含 @ / ? # 等分隔符的值"
+}
+```

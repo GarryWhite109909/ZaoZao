@@ -1,0 +1,33 @@
+## 编号分析（全文通读）
+
+1. **第 60-63 行 / 68-70 行**：定义默认模板 `defaultChangePasswordStatement`、`defaultExpirationStatement`，使用 `{{username}}`、`{{password}}`、`{{expiration}}` 占位符——这些占位符由模板引擎做**文本替换**，不是数据库参数绑定。
+
+2. **入口点枚举**：
+   - `Initialize`（第 88 行起）：source 为 `req.Config` 的 `username_template`、`password_authentication`；
+   - `UpdateUser`（第 122 行）：source 为 `req.Username`、`req.Password`、`req.Expiration`；
+   - `NewUser`（第 224 行）：source 为 `req.UsernameConfig`（含 DisplayName/RoleName）、`req.Password`、`req.Statements`；
+   - `DeleteUser`（第 283 行）：source 为 `req.Username`、`req.Statements`。
+
+3. **数据流 1：NewUser**。第 233 行 `p.usernameProducer.Generate(req.UsernameConfig)` 由管理员自定义模板生成用户名；若模板直接引用 `.DisplayName` 或 `.RoleName` 而不加转义/truncate，攻击者可控的显示名可携带单引号。第 246-252 行将 `username`、`req.Password` 放入 map `m`；第 272/280 行 sink `dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query)` —— 该函数对语句做文本插值后直接执行，**无任何引号转义或参数化**。防御缺失：全文没有对 `{{name}}`/`{{password}}` 值做 `QuoteLiteral`/单引号加倍处理。
+
+4. **数据流 2：changeUserPassword**（第 141-206 行）。第 144 行取 `changePass.NewPassword`（可能来自带密码策略的请求），第 190-194 行 map 注入，第 199 行 sink 同上。SCRAM 分支（第 182 行）会哈希密码从而消除注入字符，但默认的 `passwordAuthenticationPassword` 模式下密码原样插入 `ALTER ROLE ... PASSWORD '{{password}}'`，密码含 `'` 即可逃逸字符串字面量实现 SQL 注入。
+
+5. **数据流 3：changeUserExpiration**（第 208-262 行）。`expirationStr` 由服务端时间格式化生成（第 230 行），不可控，此流安全。
+
+6. **数据流 4：DeleteUser/defaultDeleteUser**（第 283-395 行）。第 337/341/355-371/383 行均使用 `dbutil.QuoteIdentifier` 包裹 `username`/`schema`/`dbname` 后拼接——这是有效的标识符引用防御，此路径相对安全。但 `customDeleteUser`（第 296 行）走与 NewUser 相同的无转义插值 sink（第 316/330 行）。
+
+7. **第二入口/替代通道**：`containsMultilineStatement`（第 409 行）存在逻辑缺陷——第 424 行 `strings.ReplaceAll(stmt, literal, "")` 应作用于 `stmtWithoutLiterals` 却反复替换原 `stmt`，导致含引号字面量的多行 PL/pgSQL 语句可能被误判为单行并按分号拆分执行，属于正确性缺陷但非独立注入源。
+
+8. **结论**：核心漏洞是所有动态值经模板文本插值进入 SQL 而未做字面量转义（CWE-89 / CWE-564），在默认密码认证模式下可通过含单引号的密码或（自定义用户名模板下的）DisplayName 触发注入。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-89 / CWE-564 (SQL Injection via template interpolation)",
+  "risk_level": "high",
+  "source": "line 144: changePass.NewPassword 与 line 233: p.usernameProducer.Generate(req.UsernameConfig) 生成的 username",
+  "sink": "line 199 与 line 272/280: dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query) 对 {{name}}/{{password}} 做文本插值后直接执行",
+  "explanation": "NewUser 和 changeUserPassword 将 username/password 放入 map 后交给 ExecuteTxQueryDirect, 该函数用模板引擎把值以纯文本形式拼进 ALTER ROLE ... PASSWORD '{{password}}' 等语句, 全文没有任何单引号转义或参数化查询; 默认 passwordAuthentication=password 模式下密码原样嵌入, 含单引号即可逃逸字面量注入任意 SQL; 自定义 username_template 直接引用 DisplayName 时同理; DeleteUser 默认路径虽有 QuoteIdentifier 防护, 但 customDeleteUser 复用同一无防护 sink",
+  "fix_suggestion": "line 199/272: 对插入值调用 dbutil.QuoteLiteral(即单引号加倍) 或改用 pgx 的参数绑定 $1/$2 传递 username/password/expiration, 并修复 line 424 的 ReplaceAll 使其作用于 stmtWithoutLiterals"
+}
+```

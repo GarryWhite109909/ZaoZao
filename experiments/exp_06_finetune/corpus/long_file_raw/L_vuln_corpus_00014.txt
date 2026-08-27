@@ -1,0 +1,39 @@
+## 编号分析（全文通读）
+
+1. **第 40 行起：类定义与配置属性**。`$fileTypes`、`$mimeTypes`、`$maxFilesize` 等均来自 YAML 配置（开发者定义），非用户输入，不构成 source。
+
+2. **第 88–115 行 `init()`**：`fillFromConfig` 从字段配置读取，非请求输入；无漏洞。
+
+3. **第 118–124 行 `render()` / `prepareVars()`**：仅渲染，输出经 `e()` 转义（见 `getPromptText()` 第 262–272 行），XSS 面已被覆盖。
+
+4. **第 176–189 行 `getFileRecord()` —— 关键 source 点**：
+   ```php
+   $record = $this->getRelationModel()->find(post('file_id')) ?: false;
+   ```
+   `post('file_id')` 是完全由客户端控制的 POST 参数（source）。此处用 `find()` 直接按主键查询关联模型 `System\Models\File`，**没有将查询限定在当前父模型的关联集合内**（未加 `where($parentKey)` 或通过 `$this->getRelationObject()` 查询）。任何能访问该表单部件 AJAX handler 的后端登录用户，可传入任意 `file_id` 操作不属于其权限范围的文件记录。
+
+5. **第 296–301 行 `onRemoveAttachment()`（sink #1）**：调用 `getFileRecord()` 后直接 `$this->getRelationObject()->remove($file, ...)` 删除任意 ID 的附件 → **IDOR / 越权删除**。
+
+6. **第 322–333 行 `onLoadAttachmentConfig()`（sink #2）**：同样使用 `getFileRecord()`，可读取任意文件记录的标题、路径等元数据并渲染返回 → 信息泄露。
+
+7. **第 340–358 行 `onSaveAttachmentConfig()`（sink #3）**：`$formWidget->model` 来自 `getConfigFormWidget()` 第 199 行的 `getFileRecord() ?: $this->getRelationModel()`；随后 `prepareModelsToSave` + `save()` 将表单数据写入该文件模型 → 可篡改任意文件的 title/description 等字段。
+
+8. **第 306–315 行 `onSortAttachments()`**：`post('sortOrder')` 的键直接传入 `setSortableOrder($ids, $orders)`，同样未校验 ID 归属，可越权重排他人附件排序（低危）。
+
+9. **第 372–425 行 `onUpload()`**：上传走 `Input::file('file_data')`，有 `max:`、`extensions:` 校验（第 391–398 行）；扩展名黑/白名单虽可能被绕过（如 SVG 存储 XSS），但最终存储名与 MIME 由框架处理，且需后端权限，风险次要。事件钩子（第 385 行）是合法扩展点。
+
+10. **第二入口核查**：`onSortAttachments` 与 `onUpload` 均为独立 AJAX 入口；三者共享同一缺陷根因——基于 `post('file_id')` 的对象引用缺少归属（authorization）校验。防御有效性结论：代码中不存在任何对 `file_id` 所属关系的所有权检查，属缺失型漏洞而非过滤绕过。
+
+**结论**：存在 CWE-639（Authorization Bypass Through User-Controlled Key / IDOR），影响后端已认证用户横向越权操作任意附件，风险中高。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-639",
+  "risk_level": "medium-high",
+  "source": "line 182: post('file_id') 用户可控的 POST 参数",
+  "sink": "line 299: getRelationObject()->remove($file) 以及 line 341-350 onSaveAttachmentConfig 对任意文件模型的保存",
+  "explanation": "getFileRecord 使用 getRelationModel()->find(post('file_id')) 按主键查找文件记录，未将查询范围限定在当前父模型的关联集合内，也未校验该文件属于当前会话或授权的父记录 -> 攻击者（任意后端认证用户）可通过伪造 file_id 在 onRemoveAttachment 删除任意附件、在 onLoadAttachmentConfig 读取任意附件元数据、在 onSaveAttachmentConfig 篡改任意附件属性 -> 水平越权（IDOR）",
+  "fix_suggestion": "line 182: 将查询改为经由关系对象执行，例如 $record = $this->getRelationObject()->withDeferred($this->sessionKey)->where('id', post('file_id'))->first()，或在 find 之后校验 $file 属于当前父模型的关联集合，否则返回 false"
+}
+```

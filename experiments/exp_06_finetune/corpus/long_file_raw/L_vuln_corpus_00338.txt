@@ -1,0 +1,21 @@
+## 编号分析
+
+1. **第 6–11 行 `__construct`**：直接复制传入 JWT 的 header、claims、signature、raw，无任何校验。header 中的 `alg` 完全由攻击者可控的 token 决定（source）。
+
+2. **第 47–52 行 `verify`**：调用 `_verify($public_key_or_secret, $alg)`，若调用方未显式传 `$alg`（常见用法 `$jws->verify($public_key)`），则进入第 74–76 行：`$expected_alg = $this->header['alg']` —— 即**算法由攻击者签名的 token 头部决定**。
+
+3. **第 78–92 行 `_verify` 的 HMAC 分支**：当 header 声明 `HS256/384/512` 时，把传入的 `$public_key_or_secret` 直接当作 HMAC 密钥使用（第 80 行）。这是典型的 **RS256→HS256 算法混淆攻击**：攻击者拿到 RSA 公钥（公钥本来就是公开的），将 token 的 alg 改为 HS256，用公钥作为 HMAC secret 签名；服务端用同一公钥对象验证 HMAC 即可通过。
+
+4. **第 54–72 行 `digest()`**：摘要算法同样取自 `$this->header['alg']`（第 57 行），即使上层传入了 `$expected_alg`，HMAC 分支中 `hash_hmac($this->digest(), ...)` 仍读 header——防御不一致，但主要问题仍是分支本身未强制非对称算法。
+
+5. **第 33–43 行 `rsa()`**：对 JWK/RSA/字符串密钥的处理本身无明显缺陷；`setSaltLength(false)` 是针对 phpseclib bug 的兼容处理，不构成漏洞。
+
+6. **第 85 行签名比较**：使用严格比较 `===`，避免了时序/松散比较问题——此处是有效防御。
+
+7. **第二入口检查**：`sign()`（第 22–37 行）仅用于生成签名，`toJson()` 无危险 sink；全文唯一安全敏感 sink 是第 80 行的 `hash_hmac` 与第 86/89 行的 rsa verify。除算法混淆外，未发现注入、反序列化等其他数据流。
+
+8. **结论**：核心漏洞为签名验证时信任 token 内的 `alg` 字段且允许用非对称公钥走对称 HMAC 分支（CWE-347 不当签名验证 / CWE-327 算法混淆），前提是应用以默认参数调用 `verify($public_key)` 且公钥可被攻击者获取（公钥天然公开，条件通常成立）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-347 (algorithm confusion, CWE-327)", "risk_level": "high", "source": "line 75: expected_alg = this->header[alg], attacker-controlled JWT header", "sink": "line 80: hash_hmac(this->digest(), signature_base_string, public_key_or_secret, true)", "explanation": "attacker-controlled JWT header alg -> verify() defaults to header alg when caller omits $alg -> HS* branch treats the RSA public key as an HMAC secret -> attacker signs forged token with the public key and passes verification", "fix_suggestion": "line 74: require callers to pass an explicit expected_alg, reject HS* algorithms when a public/asymmetric key object is supplied, or pin allowed algorithms server-side instead of trusting header alg"}
+```

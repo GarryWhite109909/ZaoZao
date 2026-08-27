@@ -1,0 +1,21 @@
+## 编号分析
+
+1. **第 24–33 行：硬编码默认密钥**。`DEFAULT_SECRET_KEY` 是写死在源码中的字符串，且是开源项目，任何攻击者都能读到该值。
+
+2. **第 46–49 行：静态初始化块**。默认情况下 `secretKey` 即由该公开密钥派生（HMAC-SHA）。
+
+3. **第 152–156 行：`issueJwtAll` 的防护**。若未配置自定义密钥（`isUsedDefault == true`），签发直接抛异常——这阻止了用默认密钥**签发**新 token，是一层有效防御。
+
+4. **第 213–218 行：`parseJwt` 无对应防护**。`parseJwt` 直接使用静态 `secretKey` 验签，**没有检查 `isUsedDefault`**。source→sink 数据流：外部请求携带的 JWT 字符串（source，由调用方如认证过滤器传入）→ `parseJwt(jwt)` → `Jwts.parserBuilder().setSigningKey(secretKey)`（sink）。由于密钥值在开源代码中公开可得，攻击者可自行用该默认密钥伪造任意 claims（subject、roles、perms、过期时间）的合法签名 token，绕过整个认证/授权体系。这是典型的“硬编码加密密钥 + 验证路径未拦截”漏洞；`issueJwtAll` 的抛异常只封堵了签发通道，未封堵验证通道（第二入口/替代通道）。
+
+5. **第 197–208 行：`isNotJsonWebToken`**。仅做格式正则判断且注释明言不验签，本身不算安全边界，但配合第 4 点意味着格式合法的伪造 token 会顺利进入 `parseJwt`。
+
+6. **第 220–226 行：`setDefaultSecretKey`**。非同步方法修改共享静态字段 `secretKey` 与 `isUsedDefault`，存在竞态：初始化窗口期内可能先用默认密钥签发/验签；另外若传入弱/短密钥仅依赖 `Keys.hmacShaKeyFor` 抛错兜底。属次要问题。
+
+7. **其余重载 `issueJwt` 系列（第 60–140 行）** 均最终汇聚到 `issueJwtAll`，无独立 sink，无额外风险点。
+
+结论：存在漏洞——硬编码默认 HMAC 密钥且 `parseJwt` 未阻止默认密钥验签，可导致任意 token 伪造、认证绕过。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "hardcoded cryptographic key leading to JWT forgery and authentication bypass", "risk_level": "critical", "source": "external request-supplied JWT string passed into parseJwt", "sink": "Jwts.parserBuilder().setSigningKey(secretKey) in parseJwt using the publicly known DEFAULT_SECRET_KEY", "explanation": "The DEFAULT_SECRET_KEY at line 24-33 is embedded in open-source code and thus public knowledge. Although issueJwtAll (line 152-156) throws when isUsedDefault is true to block token issuance with the default key, parseJwt (line 213-218) has no such guard and verifies incoming tokens against the same static default-derived secretKey. An attacker can therefore forge a fully signed JWT with arbitrary subject, roles, perms and expiration claims using the leaked key, and it will pass signature verification, bypassing authentication and authorization entirely. Secondary issues: setDefaultSecretKey mutates shared static state without synchronization, allowing a race window where the default key is still in use.", "fix_suggestion": "Refuse to verify tokens when no custom secret has been configured: add an isUsedDefault check inside parseJwt that throws ExtSurenessException, mirroring issueJwtAll; additionally remove any usable default key from source, require explicit configuration at startup, and make setDefaultSecretKey synchronized or initialize the key immutably via configuration."}
+```

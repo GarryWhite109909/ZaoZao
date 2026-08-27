@@ -1,0 +1,41 @@
+# 逐行分析
+
+## 文件概览
+`JsonWebTokenUtil`（sureness 项目 JWT 工具类），主要函数：静态初始化块、多个 `issueJwt` 重载、`issueJwtAll`、`isNotJsonWebToken`、`parseJwt`、`setDefaultSecretKey`。
+
+## 编号分析
+
+1. **第 24–30 行：硬编码默认密钥 `DEFAULT_SECRET_KEY`**
+   这是一个内置的 HMAC 密钥字符串。但注意第 96–98 行 `issueJwtAll` 开头：`if (isUsedDefault) throw new ExtSurenessException(...)` —— 只要未调用 `setDefaultSecretKey`，签发功能直接抛异常，**默认密钥无法用于实际签发 token**，属于强制配置的防御设计，不构成可利用漏洞。
+
+2. **第 38–41 行：静态初始化块**
+   用默认密钥初始化 `secretKey`，仅为满足字段非空；配合上述 `isUsedDefault` 拦截，不会产生真实签名操作。
+
+3. **第 50–100 行：各 `issueJwt` 重载 → 第 137–180 行 `issueJwtAll`**
+   - 参数来源为服务端内部调用（登录成功后由业务代码传入 subject/roles 等），非直接 HTTP 输入。
+   - 第 141–172 行对 id/subject/issuer/period/audience/payload/notBefore/headerMap/customClaimMap 均做 null 判断后设置到 builder，最终经 `signWith(secretKey)` 签名。claims 内容被 HMAC 完整保护，接收端解析时验签，注入 claims 不构成漏洞。
+   - 第 174 行 `compressWith(CompressionCodecs.DEFLATE)` 为标准压缩，无解压炸弹风险（解析端 jjwt 自动处理）。
+
+4. **第 189–205 行：`isNotJsonWebToken`**
+   仅格式预判（三段式 + BASE64 正则），注释明确说明“no verification”，真正的安全校验在 `parseJwt` 的签名验证中完成。此函数不做授权判断，正则宽松不影响安全性。
+
+5. **第 214–224 行：`parseJwt`**
+   使用 `Jwts.parserBuilder().setSigningKey(secretKey).build().parseClaimsJws(jws)`：
+   - 固定指定 HMAC 密钥验签，**不存在 algorithm confusion / none 算法绕过**（jjwt 0.11+ parserBuilder 强制校验算法与密钥类型匹配）；
+   - 未调用 `setSigningKeyResolver` 接受外部 key，密钥不可被攻击者控制；
+   - 过期校验由 jjwt 默认执行并抛出 `ExpiredJwtException`。
+   source 是外部传入的 jwt 字符串，sink 是验签解析器——防御（固定密钥 HMAC 验签）有效。
+
+6. **第 230–235 行：`setDefaultSecretKey`**
+   由应用启动时配置调用（如 sureness.jwt.secret 配置项），将 `isUsedDefault` 置 false。若传入弱密钥可能强度不足，但这是部署配置问题而非代码缺陷，且 `Keys.hmacShaKeyFor` 对过短密钥会抛异常（要求 ≥256 位），有下限保护。
+
+## 第二入口/替代通道检查
+- 无文件、环境变量、网络回调等其他入口；唯一外部输入是 `parseJwt(String jwt)` 与 `setDefaultSecretKey(String)`，前者有强验签防御，后者是管理员配置接口。
+- 全文无反序列化、SQL、路径拼接等 sink。
+
+## 结论
+所有数据流均经过有效的 HMAC 固定密钥验签或强制自定义密钥拦截，未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文通读后确认：第96-98行的 isUsedDefault 拦截确保硬编码默认密钥不能用于签发；第214-224行 parseJwt 使用 parserBuilder 固定 HMAC 密钥验签，jjwt 会拒绝算法混淆和 none 算法，过期时间默认校验；第189-205行 isNotJsonWebToken 仅做格式预判且注释声明不做验证，安全决策依赖 parseJwt 的验签；setDefaultSecretKey 要求足够长度的密钥否则抛异常。所有 issueJwt 入口参数来自服务端内部调用且输出均经签名保护，未发现可利用的安全漏洞。", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,27 @@
+# 编号分析
+
+**入口点枚举（全文）：**
+1. 构造函数 `ConsulRegistry(String hostname)` / `(hostname, port)` / Builder —— hostname/port 来自配置，拼入 URL（第 55、62 行），属 SSRF 面，但通常由部署者配置，非不可信输入。
+2. `lookupByName(String key)`（第 74–84 行）—— key 来自 Camel bean 查找调用方；`key.replace('$','/')` 后直接作为 Consul KV 键读取。
+3. `lookupByNameAndType`（第 87–98 行）—— 委托 lookupByName。
+4. `findByTypeWithName` / `findByType`（第 101–145 行）—— 遍历键后再次调用 `lookupByName`。
+5. `bind` / `put(String key, Object object)`（第 147–190 行）—— 写入路径。
+6. `remove(String key)`（第 160–177 行）—— 删除路径。
+
+**source→sink 数据流验证：**
+
+- **流 A（反序列化）**：任何通过 Consul KV 存储的值 → `lookupByName` 第 79 行 `decodeBase64(result)` → 第 80 行 `ConsulRegistryUtils.deserialize(postDecodedValue)`。`deserialize`（第 224–231 行）使用原生 `ObjectInputStream.readObject()`，无 ObjectInputFilter、无白名单校验。Base64/黑名单式防御不存在——这里连过滤都没有。若攻击者能写 Consul KV（共享 KV 存储、KV 泄露的 ACL token、或经由 `put` 的其他租户），即可注入恶意序列化 gadget 触发 RCE。这是典型 CWE-502。
+
+- **流 B（put 路径）**：`put` 第 183 行将任意对象 Java 序列化 + Base64 后写入 KV。写入本身不执行反序列化，但为流 A 提供了投毒通道（第二入口/替代通道：写 KV → 读时触发）。
+
+- **流 C（remove）**：第 169 行 `lookupByName(key)` 同样走反序列化 sink。
+
+- **流 D（键注入）**：key 未做路径字符过滤，可操纵 KV 层级（如 bookmark 键），影响有限，非主要漏洞。
+
+- **流 E（hostname 拼接）**：仅构造期配置，风险低。
+
+**结论**：核心漏洞是 lookupByName 对不受信的 KV 数据做无防护的原生 Java 反序列化；黑名单/正则类防御缺失，且 put/remove 提供了替代投毒通道。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 不受信数据反序列化", "risk_level": "高危", "source": "line 82: kvClient.getValueAsString(key) 从 Consul KV 读取的值（以及 line 183 put 写入的任意对象构成的投毒通道）", "sink": "line 80 与 line 230: ConsulRegistryUtils.deserialize 中 ObjectInputStream.readObject()", "explanation": "lookupByName 将 KV 中 Base64 解码后的字节直接交给原生 Java 反序列化，无 ObjectInputFilter 或类型白名单；任何能向该 Consul KV 写入数据的主体（共享存储、泄露 ACL token、经 put/bind 的替代通道）都可植入恶意 gadget 链导致远程代码执行；findByTypeWithName 和 remove 也复用同一 sink", "fix_suggestion": "line 230: 在 ObjectInputStream 上启用 resolveClass 白名单校验或改用 JSON 等安全格式存储对象，并对 KV 访问实施最小权限 ACL"}
+```

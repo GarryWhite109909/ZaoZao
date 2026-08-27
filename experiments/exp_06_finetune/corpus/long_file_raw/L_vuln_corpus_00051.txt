@@ -1,0 +1,38 @@
+## 编号分析
+
+**入口点枚举（全文）**
+- 第 71–90 行 `init()`：命令行 flag（OptionsInfo 全部选项）+ RC 回调 `cmdserve.AddRc`（第 76 行，可经 RC 接口动态创建 server，第 87 行 `newServer`），已正确禁止 `--stdio` 经 RC 使用（第 83–85 行）。
+- 第 186–217 行 `Run`：CLI 入口，`args` 仅作 remote 根路径（第 189 行），非攻击面。
+- 第 230–258 行 `WithRemote` 中间件：所有路由的前置 source，取 `RoutePath`/`URL.Path`（第 234–237 行）。
+- 第 321–340 行 `bind`：GET/POST/HEAD/DELETE 四类路由，全部通配 `/*`。
+- 第 384、404、435、490、539 行：五个 handler，均从 context 取 remote。
+
+**数据流验证**
+
+1. **路径遍历（source 第 234–237 行 → sink 第 375/421/458 行的 fs 操作）**：第 241 行用 `path.Clean(urlpath) != urlpath` 拒绝非规范路径，能拦截 `..` 形式穿越。但注意：该检查只针对 `/` 分隔符；在 Windows 本地后端中 `\` 也是分隔符，`path.Clean` 不处理反斜杠，`data\..\..\secrets` 可通过校验。此为条件性漏洞（仅 Windows+local 后端）。此外 chi 通配符参数解码行为与 `r.URL.Path` 不一致，是下面漏洞的根源。
+
+2. **append-only 删除绕过（核心漏洞）**：
+   - 防御：第 441–449 行，append-only 时要求 `strings.Split(r.URL.Path, "/")` 倒数第二段等于 `locks`。
+   - source：请求路径 `/locks/a%2Fb`。Go 的 `net/http` 在 `r.URL.Path` 中保留 `%2F` 为字面量（不提前解码），故第 442 行切分结果为 `["", "locks", "a%2Fb"]`，倒数第二段恰为 `locks`，**检查通过**。
+   - sink：而第 234–235 行 chi 的 `RoutePath`/通配符参数是解码后的，remote 变为 `locks/a/b`（经第 255 行写入 context），第 458 行 `o.Remove` 实际删除的是 `a/b`——任意对象删除，绕过 append-only 保护（append-only 本应只允许删 locks）。同理可伪造任意前缀，如 `/locks/snapshots%2Fx` 删除快照数据。这是真实存在的 rclone 安全通告（GHSA，serve restic append-only 绕过）。
+   - 该防御属于“黑名单式后缀匹配”，且在未解码字符串上做判断、在已解码字符串上执行操作，判定无效。
+
+3. **checkPrivate（第 261–271 行）**：`user == userID` 精确比较，无前缀混淆问题；`{userID}` 路由段与通配符独立，未见绕过证据。
+
+4. **postObject append-only（第 410–419 行）**：基于实际 remote 查询存在性，逻辑一致，无同类不一致问题。
+
+5. **createRepo / listObjects**：remote 来自同一中间件，Mkdir/ListR 无额外 sink；`create=true` 参数仅作开关。
+
+**第二通道核查**：RC 回调（第 76 行）只能改配置不能注入路径；stdio 模式复用同一 router 与中间件，同样受影响。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22/CWE-863 (路径混淆导致授权保护绕过)",
+  "risk_level": "高",
+  "source": "line 234-235: chi RoutePath 解码后的 URL 路径作为 remote 写入 context",
+  "sink": "line 458: o.Remove(r.Context()) 按 context 中的 remote 执行删除",
+  "explanation": "line 442 的 append-only 防御使用未解码的 r.URL.Path 按 / 切分并要求倒数第二段为 locks，而 line 234-235 的 remote 来自 chi 已解码的 RoutePath。发送 DELETE /locks/a%2Fb 时，line 445 检查通过（倒数第二段字面量为 locks），但 context 中的 remote 为 locks/a/b，line 458 实际删除任意对象，完全绕过 append-only 只允许删除 locks 的保护；同理可用 %2F 伪造任意目录层级删除快照等关键数据。",
+  "fix_suggestion": "line 442: 改用与执行时一致的已解码路径做校验，例如对 context 中或 chi.URLParam 得到的 remote 用 path 包解析（如 path.Dir(remote) == 'locks' 或按 '/' 分割解码后的 remote），而不是分割原始 r.URL.Path；同时可在 line 241 补充拒绝包含反斜杠的路径以防 Windows 后端穿越。"
+}
+```

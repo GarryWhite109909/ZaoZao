@@ -1,0 +1,28 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `ServeGetPlaylists`（第 20 行起）：列出全部播放列表，按 `UserID`/`IsPublic` 过滤（第 33 行），有权限检查。
+2. `ServeGetPlaylist`（第 47 行起）：source 为请求参数 `id/playlistId`（第 50 行），经 `playlistIDDecode`（第 88-92 行，base64 解码、错误被忽略）得到任意路径字符串，直接传入 `c.playlistStore.Read(...)`（第 53 行）。**无任何属主或路径前缀校验**——可读取他人私有播放列表（信息泄露），且解码路径未限制在存储目录内。
+3. `ServeCreateOrUpdatePlaylist`（第 62 行起）：source 同上（第 66 行）。第 68-73 行读取已有播放列表；第 76 行有属主检查；但关键在第 100-103 行：当 `playlistPath != ""` 时直接使用用户解码出的 `playlistPath` 调用 `playlistStore.Write(playlistPath, ...)`。若攻击者构造 base64 编码的相对/绝对路径（如 `../../x.m3u` 或绝对路径），即构成**任意文件写入**（CWE-22）。属主检查只对已存在的 `playlist.UserID != 0` 生效，对不存在的目标路径无效。
+4. `ServeUpdatePlaylist`（第 110 行起）：同样以解码路径 `Read`（第 118 行）并 `Write`（第 158 行）；属主不匹配时静默返回（第 125 行），但配合 CreateOrUpdate 的写入原语仍可达。
+5. `ServeDeletePlaylist`（第 165 行起）：**完全没有属主检查**，任何认证用户可用任意 id 删除任意播放列表文件（第 171 行），且路径同样来自不可信的 base64 解码。
+6. `playlistRender`（第 196 行起）：仅渲染，`Lookup`/DB 查询均参数化，无注入。
+
+**防御有效性验证**
+- 唯一“防御”是第 76 行与第 125 行的 `playlist.UserID != user.ID` 检查：仅覆盖更新场景，且对新建路径（UserID==0）放行；对删除（ServeDeletePlaylist）完全缺失。
+- `playlistIDDecode` 忽略 base64 错误（第 90 行），无路径规范化、无目录白名单校验 → 黑盒透传到文件系统 sink（Read/Write/Delete），属于无效防御。
+- 第二通道：`songIdToAdd`/`songId` 经 `specidpaths.Locate` 定位后取 `AbsPath()` 写入 Items，受 DB 约束，风险较低；主要漏洞通道是 `id` 参数本身。
+
+**结论**：存在路径遍历导致的任意文件读/写/删（CWE-22），以及越权删除（CWE-862）。核心 source→sink：第 50/66/168 行的 `id` 参数 → 第 89 行 `playlistIDDecode` → 第 53/101/158/171 行的 `Read/Write/Delete`。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 Path Traversal / CWE-862 Missing Authorization",
+  "risk_level": "high",
+  "source": "line 50/66/168: 用户可控的 id 或 playlistId 请求参数",
+  "sink": "line 101/158: c.playlistStore.Write(playlistPath) 与 line 171: c.playlistStore.Delete(playlistIDDecode(playlistID))",
+  "explanation": "playlistIDDecode 在 line 88-92 仅做 base64 解码且忽略错误，返回值未做目录白名单或路径规范化校验，直接作为文件路径传给 playlistStore 的 Read/Write/Delete。攻击者可构造编码后的相对或绝对路径实现任意文件写入或删除；同时 ServeDeletePlaylist 全程无属主校验，任何认证用户可删除他人播放列表。",
+  "fix_suggestion": "在 line 88-92 的 playlistIDDecode 后增加路径校验：使用 filepath.Clean 并确保结果位于 playlistStore 根目录内（如 strings.HasPrefix(cleaned, storeRoot+separator)），拒绝绝对路径与 .. 片段；并在 ServeDeletePlaylist line 165 中先 Read 播放列表并校验 playlist.UserID == user.ID 后再执行删除。"
+}
+```

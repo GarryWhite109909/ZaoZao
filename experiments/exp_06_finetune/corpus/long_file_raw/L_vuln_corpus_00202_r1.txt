@@ -1,0 +1,49 @@
+## 编号分析（逐函数、行号锚定）
+
+**1. 第 1–8 行：导入与依赖**
+仅引入 Ember/Glimmer 组件、模态框与工具，无网络/文件入口。无独立风险。
+
+**2. 第 10–22 行：`checkFinishedRendering(element, done)`**
+- 入口：传入的 DOM 元素（第 11 行取 `element.innerHTML`）。
+- 逻辑：轮询比较 innerHTML 是否稳定后回调 `done`。
+- 注意：它读取的是**已渲染进 DOM 的原始 HTML 字符串**，后续被原样传递（见第 6 点），是本文件数据流的中间节点。
+
+**3. 第 24–33 行：构造器**
+- 入口：`this.args.model.post / editorAPI / secondaryEditorAPI / toggleSettingsMenu`——全部来自父组件注入的模型对象，属于受信任的内部 API 句柄，不构成外部 source。
+
+**4. 第 35–70 行：`selectedRevision` / `currentTitle` / `revisionList` getter**
+- **关键 source 在此**：第 38 行 `revision.get('lexical')`、第 41 行 `revision.get('title')`、第 44–46 行 feature_image 等字段均来自 `postRevisions` 模型，即**服务端持久化的文章修订记录**。修订内容本质上是作者（或任何有文章编辑权限的低权角色）写入的富文本/JSON，属于攻击者可影响的持久化数据源。
+- 这些字段未经任何净化直接进入组件状态。
+
+**5. 第 72–92 行：生命周期与键盘处理**
+- `onInsert` 注册全局 keydown，`willDestroy` 对称移除；`handleKeyDown` 仅响应 Escape 调用 `closeModal`。无 DOM 写入、无 eval。无漏洞。
+
+**6. 第 94–102 行：`handleClick(index)` → `updateSelectedHTML()`（第 141–166 行）**
+- 数据流：`this.selectedRevision.lexical`（source，第 145 行）→ `parseEditorState` 注入编辑器实例渲染到 `.gh-post-history-hidden-lexical.current` 容器 → 第 158 行 `current.innerHTML` 取回原始 HTML → 第 160 行 `this.stripInitialPlaceholder(...)` → 第 161 行赋给 tracked 属性 `this.selectedHTML`。
+- **防御验证**：第 130–134 行的 `stripInitialPlaceholder` 只是一个针对固定占位文案的单条正则替换，既非安全过滤也无净化语义，按规则视为无效防御。
+- **sink**：`selectedHTML` 是 tracked 属性，在配套 HBS 模板中以三花括号 `{{{selectedHTML}}}` 渲染（Ghost 该组件模板即如此），即**未转义 HTML 注入点**。
+- 攻击路径：恶意/被入侵的文章作者在修订内容中嵌入 `<img src=x onerror=...>` 或含 raw HTML 的节点 → Lexical 渲染进隐藏容器 → innerHTML 原样读回 → 三花括号输出 → 存储型 XSS，可在其他管理员预览历史时触发（打管理员 cookie/执行特权操作）。
+
+**7. 第 104–126 行：`registerSelectedEditorApi` 等 register 回调 + `closeModal`**
+- 回调参数为内部编辑器 API 对象，由模板 `{{register-x}}` 传入，非用户可控字符串。无 sink。
+
+**8. 第 128–139 行：`restoreRevision(index)`**
+- `index` 来自 UI 点击，用于数组索引越界只会得到 undefined，无原型污染写法。
+- `updateTitle` 用 `set(this.post,'titleScratch', revision.title)`——title 同样来自修订 source，但最终仍经编辑器/模板转义路径渲染，主风险集中在第 6 点的 HTML 直通链路。
+
+**9. 第 136–140 行：`cardConfig`**
+- 仅包装 args.model，无新数据流。
+
+**第二入口核查**：除 `handleClick/updateSelectedHTML` 外，`restoreRevision` 的 `setEditorState(parseEditorState(revision.lexical))` 是同一 source 的替代通道（Lexical 解析器对非法 HTML 有一定约束，但历史版本中曾允许通过序列化 JSON 夹带 raw HTML 节点），进一步佐证 source 可达性。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-79",
+  "risk_level": "high",
+  "source": "line 38: revision.get('lexical') 来自服务端 postRevisions 的攻击者可控修订内容",
+  "sink": "line 161: this.selectedHTML = this.stripInitialPlaceholder(current.innerHTML)，经模板三花括号未转义渲染",
+  "explanation": "攻击者将含 raw HTML 的内容存入文章修订 -> handleClick 触发 updateSelectedHTML -> parseEditorState 渲染进 .gh-post-history-hidden-lexical.current -> 第 158 行读取 innerHTML 原样取回 -> stripInitialPlaceholder(第 130-134 行)仅为占位符正则、非安全净化 -> selectedHTML 以未转义方式输出 -> 存储型 XSS，可在管理员查看历史时窃取会话",
+  "fix_suggestion": "line 161: 不要将 innerHTML 直接赋给 selectedHTML 用于未转义渲染；改为保存结构化状态并在模板中用双花括号转义输出，或在赋值前使用 DOMPurify 等白名单净化器清理 current.innerHTML"
+}
+```

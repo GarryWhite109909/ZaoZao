@@ -1,0 +1,25 @@
+## 编号分析
+
+1. **第 30–33 行 `_SHELL_OPERATORS` 定义**：包含 `&&`、`|`、`>>`、`>`、单 `&`。注释说明这是 secure_popen 会解释的全部 shell 操作符集合；单 `&` 的加入堵住了相邻两个 Mustache 变量渲染后拼接出 `&&` 的绕过（GHSA-qcpp-8x79-hhp3）。由于替换是逐个进行且多字符操作符在前，`&&` 先坍缩为空格，不会残留半个操作符再被二次拼接。
+
+2. **第 36–56 行 `_sanitize_value`**：对 str 做全量替换；对 list/tuple/dict **递归**处理，覆盖了进程 `cmdline` 这类攻击者可控的嵌套 argv 列表（修复 GHSA-73wf-9vmv-5pv9）。非字符串类型原样返回，无注入面。递归无深度限制但数据来自插件 stats，不构成安全问题。
+
+3. **第 59–66 行 `_sanitize_mustache_dict`**：复制整个 mustache_dict 并逐值清洗，覆盖所有键值；`if not mustache_dict` 时原样返回 None/空 dict，后续 chevron.render 对空 dict 渲染只保留模板字面量。
+
+4. **第 69–100 行 `__init__` / `allow_operators` / get/set**：`allow_operators()` 第 88 行读取 `args.disable_config_exec`，与 AMP 的配置执行开关联动——当用户加固配置后，config 来源的命令行中即使含操作符也会被 secure_popen 拒绝（对应 GHSA-59fj-m2j6-hcxh）。get/set 仅管理去重状态字典，无外部输入直接进入执行路径。
+
+5. **第 102–140 行 `run()`（唯一 sink 入口）**：
+   - source：`commands` 来自 glances.conf 的告警动作行（本地配置文件），`mustache_dict` 来自各插件的监控 stats（可含攻击者可控的进程名/cmdline/容器名等）。
+   - 第 122–125 行：chevron 可用时先 `_sanitize_mustache_dict` 再渲染；不可用时 `cmd_full = cmd` 直接用模板原文——此时模板来自本地配置文件而非远程数据，且无 Mustache 数据注入通道。
+   - 第 131 行 sink：`secure_popen(cmd_full, allow_operators=...)`。双重防御：(a) 所有 Mustache 插值已被剥除全部 shell 操作符字符，无法在渲染后重构；(b) 配置来源的操作符受 `disable_config_exec` 开关约束，由 secure_popen 在 sink 处强制拒绝。
+   - 第 127–129 行仅捕获 OSError 记日志，异常路径不改变命令内容。
+
+6. **替代通道核查**：全文无网络路由、无环境变量读取、无文件读写、无回调注册；`status` 字典键为 stat_name（内部插件名）；Timer 仅做启动延迟。除 `run()` 外无其他到达 `secure_popen` 的路径。黑名单式替换虽形式上是过滤，但此处被替换的是 secure_popen 实际解释的**完整操作符字符集**（含跨变量边界的单 `&`），且 sink 端还有 allow_operators 强制校验作为第二道防线，不属于“可绕过的无效防御”。
+
+7. **残余风险**：`;`、反引号、`$()`、换行符不在 `_SHELL_OPERATORS` 中，但代码注释明确这些不是 secure_popen 解释的 shell 操作符（secure_popen 非解释型 shell 执行），故不构成注入点。
+
+结论：source→sink 数据流上的两层防御（递归清洗 + sink 端操作符开关）均有效，未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "run() 是唯一到达 secure_popen 的入口。Mustache 插值的攻击者可控数据（进程名、cmdline 等）经 _sanitize_mustache_dict 递归清洗，_SHELL_OPERATORS 覆盖 secure_popen 解释的全部操作符并额外剥离单个 & 以阻断跨变量边界拼接 && 的绕过；嵌套 list/dict 也被递归处理。配置来源命令中的操作符另受 args.disable_config_exec 控制的 allow_operators 在 sink 端强制拦截。全文无其他入口点（无路由、环境变量、文件或回调通道），两层防御均有效，未发现可利用的命令注入或其他漏洞。", "fix_suggestion": "no fix needed"}
+```

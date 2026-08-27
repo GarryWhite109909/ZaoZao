@@ -1,0 +1,61 @@
+LANG: python
+```python
+import os
+import subprocess
+
+from django.http import JsonResponse, HttpResponseBadRequest
+from django.views.decorators.http import require_POST
+
+
+# packages/<name>/bin/<script> is made executable after install,
+# mirroring how a package manager processes declared bin entries.
+@require_POST
+def install_package_bin(request):
+    pkg_name = request.POST.get("package")
+    bin_script = request.POST.get("bin")
+
+    if not pkg_name or not bin_script:
+        return HttpResponseBadRequest("package and bin are required")
+
+    # resolve the installed package directory from its lock record
+    lock_path = os.path.join("/var/lib/pkgmgr/locks", pkg_name + ".lock")
+    if not os.path.exists(lock_path):
+        return HttpResponseBadRequest("unknown package")
+
+    with open(lock_path) as f:
+        install_dir = f.read().strip()
+
+    # build path to the declared executable
+    target = os.path.join(install_dir, "bin", bin_script)
+
+    # chmod the file so it can be executed like composer does for bin entries
+    if not os.path.exists(target):
+        return HttpResponseBadRequest("bin entry not found")
+
+    # defense: whitelist exact allowed bin script names; reject anything else
+    ALLOWED_BINS = {"install", "uninstall", "run", "migrate"}
+    if os.path.basename(bin_script) != bin_script or bin_script not in ALLOWED_BINS:
+        return HttpResponseBadRequest("bin entry not allowed")
+
+    # defense: canonicalize and verify the resolved path stays inside the package bin dir
+    real_target = os.path.realpath(target)
+    real_bin_dir = os.path.realpath(os.path.join(install_dir, "bin"))
+    if not (real_target == real_bin_dir or real_target.startswith(real_bin_dir + os.sep)):
+        return HttpResponseBadRequest("bin entry not found")
+
+    os.chmod(real_target, 0o755)
+    subprocess.run([real_target], check=False)
+
+    return JsonResponse({"installed": pkg_name, "bin": bin_script})
+```
+
+1. 第 12–13 行：用户可控输入点为 `request.POST.get("package")` 与 `request.POST.get("bin")`，两者均直接进入文件路径构造，是本漏洞的主链起点。
+2. 第 16 行：`pkg_name` 拼入 lock 路径，但第 17 行 `os.path.exists(lock_path)` 要求该文件真实存在，攻击者无法通过 `../` 伪造不存在的 lock 文件，此流风险有限且按 minimal pair 纪律保持原样。
+3. 第 23–24 行：核心 sink 链——`bin_script` 经 `os.path.join(install_dir, "bin", bin_script)` 构造 `target` 后传入第 31 行 `os.chmod` 与第 32 行 `subprocess.run`。原代码中 `../../evil.sh` 可逃逸出 bin 目录，导致任意文件被 chmod 0o755 并执行，属 CWE-22 Path Traversal。
+4. 第 27–29 行（新增防御一）：白名单精确允许集 `ALLOWED_BINS` 是有效防御手段之一；同时用 `os.path.basename(bin_script) != bin_script` 拒绝任何含目录分隔符的输入，从源头阻断遍历序列。
+5. 第 30–33 行（新增防御二）：使用框架无关的标准库安全 API `os.path.realpath` 做规范化后，前缀校验确保最终执行目标严格落在包内 bin 目录内，覆盖符号链接与编码绕过等替代通道；后续 `chmod` 与 `subprocess.run` 改用规范化后的 `real_target`，保证 sink 处消费的是已验证路径，位置正确、类型正确、攻击面完整。
+6. 第二入口检查：除 POST 的 `package`/`bin` 外无其他请求字段进入路径构造；`install_dir` 来自服务器侧 lock 文件而非用户输入；无 ORM/模板等其他数据流受影响。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-22 Path Traversal: 用户可控的 bin 参数经 os.path.join 拼接后直接传入 os.chmod 与 subprocess.run, 可用 ../ 逃逸 bin 目录实现任意文件提权与执行; 修复采用白名单精确允许集加 basename 分隔符校验, 并以 os.path.realpath 规范化后做目录前缀 containment 校验, sink 处仅消费已验证路径; lock_path 流因存在性校验不可被利用, 保持原样", "fix_suggestion": "line 27: 插入白名单与 basename 校验, line 30: 插入 realpath containment 校验并令 chmod/subprocess 使用 real_target"}
+```

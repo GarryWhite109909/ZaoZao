@@ -1,0 +1,23 @@
+## 编号分析
+
+1. **第 84–95 行（login，remember_key 自动登录）**：source 为 `$_COOKIE['remember_key']`，直接传入 `getByRememberKey()` 作数据库查询参数。若 Store 层使用 PDO 参数绑定（PHPCensor 惯例），无 SQL 注入；但该查询是逐字面匹配数据库令牌，无 HMAC/过期机制，且第 122 行 `md5(random_bytes(64))` 生成的令牌熵足够（MD5 仅截断到 128 位，仍可接受）。风险：cookie 未设 `secure` 标志（第 126–132 行第 6 参为 `null`），可经明文 HTTP 泄露实现会话固定式接管。属配置弱点。
+
+2. **第 96–160 行（login 表单处理）**：有 `Csrf('login_form')` 校验（第 104 行）；`$email` 经 `getByEmailOrName` 参数化查询；密码验证委托 provider。`$values` 回填表单时依赖 Form 组件的 HTML 转义，PHPCensor 的 Text 元素默认 escape，未见明显 XSS sink。
+
+3. **第 168–196 行（forgotPassword）**：POST 无 CSRF 令牌（与 login 不一致），可被跨站触发发送重置邮件——骚扰级问题。更关键的是**用户枚举**：第 175 行对不存在邮箱返回明确错误提示 `reset_no_user_exists`，攻击者可批量枚举有效账号。
+
+4. **第 203–233 行（resetPassword）——核心漏洞点**：
+   - 第 205 行先调用 `$this->userStore->getById($userId)` 并在第 206 行立即解引用 `$user->getHash()`，而空值检查 `empty($user)` 在第 208 行才执行——**顺序颠倒，任意非法 `$userId` 触发对 null 调用方法，导致致命错误/500**（第二入口：`$userId` 来自路由参数，未验证类型）。
+   - 第 206 行重置令牌为 `md5(date('Y-m-d') . $user->getHash())`：令牌完全由日期+密码哈希派生，**同一天内同一用户的令牌恒定、可离线预测**；一旦哈希泄露（如数据库备份、`$2y$` 弱口令可被离线爆破后反推），或攻击者拿到任一当日有效链接即可在当天内重复使用。且第 209 行用松散比较 `!=` 而非 `hash_equals`，存在时序侧信道。
+   - 第 224–227 行：重置成功后直接 `$_SESSION['php-censor-user-id'] = $user->getId()` 自动登录，配合上述弱令牌等于链接即凭证。
+   - 该流程同样缺少 CSRF 防护。
+
+5. **第 239–247 行（getLoginRedirect）**：redirect 前缀固定 `APP_URL`，值来自服务端 session 而非请求参数，非开放重定向。
+
+6. **logout（第 158–176 行）**：仅销毁 session 与 remember cookie，无未授权操作风险。
+
+**结论**：主要漏洞位于 `resetPassword()`——null 解引用 DoS + 可预测/可重放的重置令牌 + 松散比较；次要为 forgotPassword 用户枚举与缺失 CSRF。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "weak_password_reset_token_and_null_dereference", "risk_level": "high", "source": "路由参数 userId 与 key（resetPassword 第二入口）", "sink": "md5(date('Y-m-d') . $user->getHash()) 令牌生成与会话赋值 $_SESSION['php-censor-user-id']", "explanation": "resetPassword 中第206行在 empty($user) 检查之前就解引用 $user->getHash()，任意非法 userId 触发致命错误；重置令牌 md5(日期+密码哈希) 同日恒定可预测，第209行用松散比较 != 而非 hash_equals 存在时序侧信道；第224行凭该弱令牌重置后自动登录，链接等同凭证，可被重放接管账号。另 forgotPassword 对不存在邮箱返回明确错误造成用户枚举，且该 POST 缺少 CSRF 令牌。", "fix_suggestion": "将 getById 判空移到 getHash 调用之前；改用 random_bytes 生成一次性、带过期时间且存储于数据库的重置令牌；比较使用 hash_equals；重置成功后要求重新登录而非自动置会话；统一各表单的 CSRF 防护并模糊化用户不存在提示；remember_key cookie 增加 secure 标志"}
+```

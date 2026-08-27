@@ -1,0 +1,22 @@
+## 编号分析
+
+1. **入口点枚举（全文）**
+   - 第 60–100 行 `__init__`：`custom_code` 字符串作为 source，构造时立即编译执行。
+   - 第 104–170 行 `_compile_custom_code`：核心 sink —— 第 137 行 `exec(compile(self.custom_code, "<guardrail>", "exec"), exec_globals)`。
+   - 第 172–260 行 `apply_guardrail`：运行期入口，第 216 行调用已编译的用户函数；输入来自请求文本/响应文本，但仅作为函数参数传入沙箱，不构成直接 sink。
+   - 第 262–300 行 `_prepare_safe_request_data`：白名单式裁剪 request_data，防御有效。
+   - 第 302–400 行 `_process_result`：对返回值做类型检查与 action 分派，block/modify 路径无注入 sink。
+   - 第 402–470 行 `update_custom_code`：第二入口 —— 热更新通道，同样在第 437 行附近再次 `exec(compile(self.custom_code...))`，且允许运行时替换代码。
+
+2. **source→sink 数据流验证**
+   - 流 A：`custom_code`（管理员配置/UI 提交）→ `validate_custom_code`（第 131 行）→ `exec`（第 137、437 行）。`validate_custom_code` 属于模式/黑名单校验（模块 docstring 明言 'No imports allowed'，靠禁止模式实现），按分析要求黑名单/正则视为可绕过。Python 中空 `__builtins__` 并非真沙箱：可通过字面量对象属性链（如 `().__class__.__mro__`、`object.__subclasses__`）触达 `os`、`subprocess` 等，无需 import。因此该流为 **任意代码执行（RCE）**。
+   - 流 B：请求 inputs → 用户函数参数 → 返回 dict → `_process_result`。结果只被读取字段并回填 texts/images/tool_calls，最终进入 LLM 请求体；无 eval/exec/format 注入点，此流本身不构成漏洞。
+   - 流 C：`update_custom_code` 第二通道：验证在锁外先行（第 411 行），随后重置状态再编译；失败有回滚逻辑，逻辑正确，但它扩大了 RCE 触发面（运行时无需重启即可换码）。
+
+3. **替代通道检查**：除两条 exec 外全文无其他危险 sink（无 pickle、os.system、open 等）；日志拼接（第 246、253 行）为 f-string 写日志，非注入。
+
+4. **缓解因素**：`custom_code` 通常由代理管理员配置，非终端用户直接控制；但若管理面（UI/API key 配置接口）暴露或存在越权，则升级为高危 RCE。沙箱声明（'sandboxed environment'）与实际防护强度不符，属于防御失效。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "sandbox_escape_arbitrary_code_execution", "risk_level": "high", "source": "custom_code parameter supplied via guardrail configuration and update_custom_code hot-reload entry point", "sink": "exec(compile(self.custom_code, ...)) at lines 137 and 437", "explanation": "The module claims a sandbox but relies on validate_custom_code pattern blocking plus an empty __builtins__ dict. Blacklist-style validation is bypassable, and empty builtins do not prevent reaching dangerous modules via dunder attribute chains on literal objects (e.g. object subclass traversal to os/subprocess). Both the constructor compile path and the update_custom_code hot-reload path execute attacker-influenced code with full interpreter capabilities, contradicting the documented no-file-IO no-network guarantee.", "fix_suggestion": "Replace exec-based sandboxing with a real isolation boundary such as a subprocess/container sandbox, WASM runtime, or RestrictedPython with audited AST transformation; deny by default all attribute access outside an explicit allowlist, and restrict who can set or hot-update custom_code."}
+```

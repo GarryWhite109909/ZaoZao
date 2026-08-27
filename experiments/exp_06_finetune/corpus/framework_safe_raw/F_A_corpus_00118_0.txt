@@ -1,0 +1,56 @@
+LANG: python
+```python
+from fastapi import FastAPI, Request, HTTPException
+import json
+
+app = FastAPI()
+
+# 防御辅助：仅允许反序列化为受限的 JSON 结构（框架原生安全 API 替代 pickle）
+def safe_deserialize(raw: bytes):
+    obj = json.loads(raw.decode("utf-8"))
+    if not isinstance(obj, (dict, list, str, int, float, bool)) or obj is None:
+        raise ValueError("disallowed type")
+    return obj
+
+@app.post("/deserialize")
+async def deserialize_payload(request: Request):
+    # 接收客户端上传的原始序列化数据（改为 JSON，避免任意代码执行）
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty payload")
+
+    try:
+        # 使用 JSON 解析替代 pickle.loads，类型白名单校验
+        obj = safe_deserialize(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid payload")
+
+    return {"type": type(obj).__name__, "value": str(obj)[:200]}
+
+@app.post("/session/restore")
+async def restore_session(request: Request):
+    # 另一个入口：从请求头读取 base64 编码的会话快照并安全解析
+    import base64
+    encoded = request.headers.get("X-Session-Snapshot", "")
+    if not encoded:
+        raise HTTPException(status_code=400, detail="missing snapshot")
+    data = base64.b64decode(encoded)
+    state = json.loads(data.decode("utf-8"))  # 安全解析，无代码执行面
+    return {"restored_keys": list(state.keys()) if isinstance(state, dict) else "n/a"}
+```
+
+1. 第 10 行 `deserialize_payload` 的用户可控输入点为 `await request.body()` 返回的原始字节；第 30 行 `restore_session` 的输入点为请求头 `X-Session-Snapshot` 经 base64 解码后的字节。两处均为完全客户端可控数据。
+
+2. 原代码 sink 分别为第 19 行与第 33 行的 `pickle.loads(...)`。pickle 反序列化会执行对象重建逻辑（`__reduce__` 等），攻击者可构造 payload 实现 RCE，属 CWE-502。
+
+3. 修复方式：将序列化格式从 pickle 换为 JSON——这是框架生态原生的安全数据交换 API。新增辅助函数 `safe_deserialize`（第 7-11 行）使用 `json.loads` 解析，并做精确类型白名单（仅允许 dict/list/str/int/float/bool），JSON 解析器本身不具备代码执行能力，从根上消除反序列化 RCE 面，属于有效防御而非黑名单过滤。
+
+4. 位置正确性：防御位于数据进入业务逻辑之前（第 22 行调用处替换原 `pickle.loads`），任何到达 sink 的数据必先经过 `safe_deserialize`，覆盖 `/deserialize` 全部数据流；异常统一映射为原有的 400 响应，控制流与错误语义保持不变。
+
+5. 最小 diff 纪律核对：函数名、路由路径、变量名、整体控制流均未改动；仅将 `import pickle` 换为 `import json`、插入 `safe_deserialize` 辅助函数、并替换两处 sink 调用语句，其余语句逐行保留。
+
+6. 第二入口检查：第 33 行 `/session/restore` 同样存在 pickle 反序列化漏洞，已同步将 `pickle.loads(data)` 替换为 `json.loads(data.decode('utf-8'))`；该入口返回值仅取 dict keys，JSON 解析后不存在任意对象实例化，攻击面已完整覆盖，无残留危险通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码两条数据流均以 pickle.loads 为 sink：主链为 /deserialize 路由中 request.body() 至第 19 行 pickle.loads；第二链为 /session/restore 中 X-Session-Snapshot 请求头经 base64 解码后至第 33 行 pickle.loads；两者均为 CWE-502 不受信反序列化可致 RCE；修复采用框架原生安全 API json.loads 并辅以精确类型白名单，两个入口均已修复，无残留风险", "fix_suggestion": "line 19: 将 pickle.loads(raw) 替换为经过类型白名单校验的 json.loads 解析; line 33: 将 pickle.loads(data) 替换为 json.loads(data.decode('utf-8'))"}
+```

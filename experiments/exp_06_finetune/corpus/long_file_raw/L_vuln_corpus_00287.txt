@@ -1,0 +1,36 @@
+# 编号分析
+
+**入口点枚举（全文通读）**
+1. `get_body(url, headers, ignore_tls, query_parameters, timeout, allow_private_network)`（约第 163 行起）——唯一网络入口，`url` 为外部可控 source。
+2. 重定向循环：`_get_redirect_url`（约第 152 行）从响应 `Location` 头取新 URL，回灌进 `current_url`，构成第二入口（攻击者控制的中间服务器可注入任意重定向目标）。
+3. `join_url(url, ref)`（约第 218 行起）——本地 file:// 路径拼接，`ref` 可含 `../`。
+4. 无环境变量、回调等其他通道。
+
+**逐条数据流验证**
+
+① `url` → `_validate_url_for_fetch`（约第 113–150 行）→ `httpx.get(current_url)`（约第 178 行）：
+- scheme 白名单仅 http/https（有效）；
+- localhost 黑名单 + `.localhost` 后缀（黑名单式，本身可绕过，但后续 IP 校验兜底）；
+- `_get_ips_from_host`（约第 79 行）：先直接 `ip_address()` 解析字面量，再走 legacy 十六进制/八进制整数解析（覆盖 `0x7f000001` 等混淆），最后 `getaddrinfo` 解析全部结果并要求 **all(is_global)**——防御设计较完整。
+
+② **缺陷 A：IPv4-mapped IPv6 绕过。** `_get_ips_from_host` 第一步 `ip_address(normalized_host)` 会接受 `[::ffff:127.0.0.1]` 这类字面量；而 CPython 中 `IPv6Address('::ffff:127.0.0.1').is_global` 返回 `True`（Python 的 `_private_networks` 未把 `::ffff:0:0/96` 整体列为私有，且未对 `ipv4_mapped` 做递归检查）。于是 `_is_safe_ip`（第 40 行）放行，`httpx.get` 实际连接 127.0.0.1 —— 校验与连接目标是同一地址，无 TOCTOU，绕过稳定可复现。同理 `::ffff:169.254.169.254`（云元数据）。
+
+③ **缺陷 B：DNS 解析失败即放行。** `_get_ips_from_host` 在 `OSError` 时返回空元组，`_validate_url_for_fetch` 中 `if not ips: return`（约第 138 行）直接通过。配合 DNS rebinding：校验时解析失败/返回公网 IP，`httpx.get` 内部再次独立解析时返回内网 IP —— 校验用 DNS 与请求用 DNS 是两次独立查询（TOCTOU，CWE-367），重定向每一跳同样如此。
+
+④ 重定向链：每跳都重新调用 `_validate_url_for_fetch`（第 174 行），防御意图正确，但受 ②③ 影响同样可被绕过；上限 20 跳防了无限循环。
+
+⑤ `ignore_tls=True` 关闭证书校验（第 179 行），属降级选项而非漏洞本体。
+
+⑥ `join_url` 的 file:// 分支：`..` 弹出受 `min_depth` 保护（有 netloc 时为 1，防止逃出 SMB 共享根；无 netloc 时无法越过根），未见路径穿越逃逸到任意盘符/绝对路径的可行流（`ref_path.startswith("/")` 只是替换相对部分，仍限于同一 netloc）。未发现可利用 sink。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-918",
+  "risk_level": "中危",
+  "source": "get_body() 的 url 参数及重定向 Location 头（第二入口）",
+  "sink": "httpx.get(current_url) 发起实际网络请求",
+  "explanation": "_validate_url_for_fetch 的 IP 安全校验存在两个可绕过点：(A) IPv4-mapped IPv6 字面量如 [::ffff:127.0.0.1] 经 ip_address() 解析后其 .is_global 为 True（CPython 未对 ipv4_mapped 递归判定），_is_safe_ip 放行后 httpx 直连环回/内网地址；(B) _get_ips_from_host 在 DNS 解析失败时返回空元组，校验逻辑 if not ips: return 直接放行，且校验用 getaddrinfo 与 httpx 内部解析是两次独立 DNS 查询，存在 DNS rebinding TOCTOU。二者均可经初始 url 或重定向 Location 触达内网/云元数据端点。",
+  "fix_suggestion": "在 _is_safe_ip 中先检查 ip.ipv4_mapped 并对其映射的 IPv4 重新做 is_global 判定；将 'ips 为空' 视为校验失败而非放行；在校验通过后将域名固定为已验证的 IP 建立连接（或使用自定义 transport 按 IP 连接并复用同一次解析结果），消除 DNS rebinding 窗口"
+}
+```

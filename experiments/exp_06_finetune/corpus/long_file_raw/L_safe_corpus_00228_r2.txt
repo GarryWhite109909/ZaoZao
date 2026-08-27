@@ -1,0 +1,72 @@
+# 逐函数安全分析
+
+## 1. 常量与全局（第 14–21 行）
+
+- 第 16 行 `ALL_NETWORK_ACCESS = "THIS_USER_HAS_ALL"`：哨兵字符串，用于标记全网络权限。
+- 第 18 行 `master_uname = "masteradministrator"`：master token 的虚拟用户名，仅内部使用，不构成入口点。
+
+## 2. SecurityCheck（第 24–60 行）
+
+**入口点**：所有经过此中间件的路由；source 为：
+- 第 29 行 `r.Header.Get("Authorization")`（HTTP 头）；
+- 第 30 行 `mux.Vars(r)` 路径参数（`networkname`/`network`）；
+- 第 31 行 `r.RequestURI`。
+
+**数据流 1：DNS 特例通道（第 32–39 行）**
+- 条件：URI 包含 `/dns` 且方法为 GET 且 `authenticateDNSToken(bearerToken)` 通过。
+- `authenticateDNSToken`（第 137–143 行）：按空格 split，要求 `tokens[1] == servercfg.GetDNSKey()` 且 DNS key 非空。这是精确比较而非黑名单/正则，防御有效——前提是部署者配置了强随机 DNS key。若未配置（空 key），第 141 行 `len(...) > 0` 拦截，无绕过。
+- 通过后第 35–37 行将 user 设为 `nameserver`、networks 设为 ALL_NETWORK_ACCESS 并放行。风险点：该通道仅限 GET `/dns` 路径，攻击面受限；但注意 `strings.Contains(r.RequestURI, "/dns")` 是子串匹配，理论上 `/foo/dnsbar` 也命中——不过仍需持有有效 DNS token，故不构成未授权绕过，只是匹配面略宽。
+
+**数据流 2：常规鉴权（第 40–58 行）**
+- 第 41–44 行取 networkname/network 参数传入 `UserPermissions`。
+- `UserPermissions`（第 84–113 行）：
+  - 第 88–93 行：token 必须形如 `<scheme> <token>`，否则拒绝；
+  - 第 95–97 行：`authenticateMaster` 精确比对 master key（第 117–119 行），且要求 master key 非空，防默认值绕过；
+  - 第 99–101 行：`VerifyUserToken` 验签 JWT（外部实现），失败即拒；
+  - 第 103–105 行：非 admin 但端点要求 admin → 拒绝；
+  - 第 107–111 行：非 admin 访问指定网络时，校验网络存在且在用户网络列表内（`authenticateNetworkUser`，第 121–128 行，先查库确认网络存在再查列表，无 TOCTOU 实际危害）；EE 下还叠加 `pro.IsUserNetAdmin` 双重校验。
+- 结论：source→sink 流上每条分支都有有效防御，无黑名单式可绕过过滤。
+
+## 3. NetUserSecurityCheck（第 62–82 行）
+
+**入口点**：network-user 相关路由；source：路径参数 `networkuser`/`network`（第 67–68 行）、Authorization 头（第 70 行）。
+
+数据流验证：
+- 第 73–79 行：token 必须 split 出第二段，否则拒绝；
+- 第 81–86 行：master token 精确比对通过则放行并标记 ismaster=yes——合法管理员通道；
+- 第 88–91 行：JWT 验证失败即拒；
+- 第 94–96 行：admin 直接放行（合理，admin 全权）；
+- 第 98–112 行：非 admin 时按 isNodes/isClients 取所需 AccessLevel（NODE_ACCESS / CLIENT_ACCESS / 默认 NET_ADMIN），从 pro 存储取用户实际 AccessLevel 比较，不足即拒；
+- 第 113–115 行：既非节点也非客户端的端点，要求路径中的 `netUserName` 与 token 用户名一致（自我访问原则）。
+
+注意第 110 行 `u.AccessLevel > necessaryAccess` 拒绝——语义为“实际等级必须 ≤ 所需等级”（数值越小权限越高），逻辑自洽，无越权方向颠倒问题。
+
+## 4. UserPermissions（第 84–113 行）
+
+已在 §2 数据流 2 中逐行覆盖。补充：第 100 行失败时返回 `username` 与错误，调用方（第 47 行）只使用 err 判断，不泄露信息。第 109 行 EE 校验失败返回空 username，同样只走统一 401 响应，无用户枚举差异。
+
+## 5. authenticateMaster / authenticateDNSToken / authenticateNetworkUser（第 116–128、136–143 行）
+
+- 第 118 行：`tokenString == servercfg.GetMasterKey() && servercfg.GetMasterKey() != ""` —— 精确比较 + 非空守卫，防止空 master key 导致任意空串匹配。注释“Consider a more secure way”提示设计顾虑（静态共享密钥），但非本代码可利用漏洞。
+- 第 121–128 行：先确认网络存在再检查列表成员，防御完整。
+- 第 136–143 行：DNS token 同样精确比较 + 非空守卫。
+
+## 6. ContinueIfUserMatch（第 145–158 行）
+
+- source：路径参数 `username`（第 149 行）与中间件注入的头 `r.Header.Get("user")`（第 150 行）。
+- 关键点：`user` 头由 SecurityCheck/NetUserSecurityCheck 在鉴权成功后服务端写入（第 53、76、89 行），不信任客户端输入。需确认上游是否有直接暴露的 handler 允许客户端伪造 `user` 头——在本文件范围内不存在这样的 sink；Go http 会规范化注入头，客户端无法覆盖服务端 Set 的值。因此第 150 行的比较是可信的，防御有效。
+
+## 7. 第二入口与替代通道排查
+
+- 替代通道 A：DNS GET 特例（第 32 行）——已验证需独立 DNS key，非绕过。
+- 替代通道 B：master token 直通（第 82–86、95–97 行）——需持 master key 本身。
+- 替代通道 C：EE 的 `pro.IsUserNetAdmin` 叠加校验（第 108–111 行）是收紧而非放宽。
+- 未发现任何以客户端可控头（如自定义 X-User）作为身份 source 的流；所有身份均源自 Authorization 头经密码学验证或密钥精确比对。
+
+## 结论
+
+全文所有 source→sink 数据流的防御均为精确密钥比较或 JWT 验签 + 显式授权矩阵，无黑名单/正则类可绕过过滤；两个特例通道均需独立秘密。唯一可提的设计性弱点是静态共享 master/DNS key（代码注释自身亦承认），属部署加固建议而非可判定漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后逐一验证了 SecurityCheck、NetUserSecurityCheck、UserPermissions、ContinueIfUserMatch 及三个认证辅助函数的全部数据流：所有身份判断均基于 master key 或 DNS key 的精确字符串比较（且带非空守卫）或 JWT 验签，配合显式的角色和网络归属校验，不存在黑名单或正则类可绕过过滤；DNS GET 特例与 master token 直通两条替代通道均需持有对应秘密方可进入；ContinueIfUserMatch 依赖的 user 头由服务端在鉴权成功后写入，客户端无法伪造。未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,35 @@
+## 编号分析
+
+1. **第 1–14 行（包与导入）**：纯配置定义，无网络入口、无路由、无文件/环境读取。本文件不直接处理请求，source/sink 均为间接（配置被下游 auth 中间件消费）。
+
+2. **第 16–44 行（SecretName 常量）**：仅是密钥名称字符串，非密钥值本身；`#nosec` 注释只是抑制扫描器告警，不是漏洞。
+
+3. **第 46–120 行 DefaultConfig**：关键点在第 100 行附近——静态客户端 `flytepropeller` 的 `Secret` 字段硬编码了一个真实的 bcrypt 哈希，注释明文写出对应口令为 `foobar`。这是可被任何知道该开源代码的攻击者直接使用的客户端凭证（client_credentials 授权流），属于 CWE-798 硬编码凭证 / CWE-259 硬编码密码。虽然 `flytepropeller` 的 RedirectURIs 是 localhost，但该客户端走的是 client_credentials 流，不需要 redirect_uri，攻击者可直接向 Admin 的 token endpoint 用 `flytepropeller` + `foobar` 换取带 `all` scope 的 access token。
+
+4. **第 121–130 行 cfgSection 注册**：配置可通过 pflag/config 文件覆盖，属正常机制。
+
+5. **第 133–170 行 Config 结构体**：`DisableForHTTP`/`DisableForGrpc` 若运维误开会导致认证整体关闭，但需管理员显式配置，不算代码缺陷级漏洞；`AuthorizedURIs` 未设置时按请求 URL 推断 issuer（注释说明），存在 issuer 可被 Host 头影响的潜在风险，但验证逻辑在下游文件，本文件无法证实可利用性——不下结论。
+
+6. **第 172–210 行 AuthorizationServer**：密钥名可覆盖但取自 K8s Secret，非硬编码值。
+
+7. **第 212–300 行 ExternalAuthorizationServer / OAuth2Options / UserAuthConfig**：均为声明式配置字段，无过滤逻辑、无 sink。
+
+8. **第 302–330 行 CookieSettings / OpenIDOptions**：`DeprecatedClientSecretFile` 为遗留字段；Cookie Domain 默认空串意味着 cookie 不限子域，属弱默认但非确定漏洞。
+
+9. **第 332–345 行 GetConfig / MustParseURL**：`MustParseURL` 仅在 init 时解析 `/console` 常量，panic 风险仅限启动期，无外部输入。
+
+**第二入口核查**：全文唯一确定的 source→sink 是「源码公开 → 攻击者读取 → token endpoint 使用硬编码哈希对应的口令」。替代通道（config 覆盖 StaticClients）反而可用于修复而非利用。
+
+**结论**：存在真实漏洞——硬编码客户端凭证，且注释泄露明文口令。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-798 (Use of Hard-coded Credentials) / CWE-259",
+  "risk_level": "high",
+  "source": "line 100: flytepropeller 客户端硬编码 bcrypt Secret 及注释泄露明文 foobar",
+  "sink": "OAuth2 SelfAuthServer 的 token endpoint 在 client_credentials 授权时校验该静态客户端口令",
+  "explanation": "DefaultConfig 第 100 行将 flytepropeller 客户端的 Secret 设为公开源码中的固定 bcrypt 哈希, 且相邻注释直接写出口令等于 foobar。任何能访问 Admin 服务的人都可以用这对凭证通过 client_credentials 流获取带 all scope 的 access token, 无需 redirect_uri 参与, 因此 localhost 限制不起作用 -> 完全绕过应用认证。",
+  "fix_suggestion": "删除第 100 行硬编码 Secret 与明文注释, 将 flytepropeller 客户端改为从 Kubernetes Secret 或部署时注入的配置中读取随机生成的强口令, 并在升级文档中要求所有已部署实例轮换该凭证。"
+}
+```

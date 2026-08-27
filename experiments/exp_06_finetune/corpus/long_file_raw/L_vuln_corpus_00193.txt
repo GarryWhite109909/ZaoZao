@@ -1,0 +1,31 @@
+# 编号分析
+
+**入口点枚举（全文）**
+
+1. `run(cmd)`（第 27-35 行）：将任意字符串交给 bash 执行 —— 命令注入 sink。
+2. `runWinCmd(cmd)`（第 40-42 行）：`execAsync('powershell.exe -Command "' + cmd + '"')` —— 双引号包裹的 PowerShell 命令，未转义。
+3. `spawnDetachedCommand`（第 47-83 行）：数组形式 spawn，无 shell 拼接，参数化安全。
+4. `getFolderSizeWin/getFolderSize`（第 86-96 行）：`folderPath` 直接拼入 `"${folderPath}"` 双引号内。
+5. `rmrf`（第 101-107 行）：路径拼入 `rm -rf "..."` / PowerShell 单引号。
+6. `mv/cp`（第 112-130 行）：路径拼入单引号/双引号 shell 命令。
+7. `openFile`（第 135-147 行）：已修复版本——Windows 用 base64 环境变量传递路径，非 Windows 用参数数组 spawn，安全。
+8. `zipFolder`（第 152-165 行）：文件名来自 `uid()`，cwd/basename 来自调用方但仅用于 tar 库 API，非 shell。
+9. `handleWindowsDrive/unzipFile`（第 168-193 行）：tar 解压到目标目录；tar 库本身存在 Zip Slip 风险面，但目标目录由调用方控制，且此处为本地文件操作。
+10. `listWindowsRootPath`（第 196-217 行）：硬编码命令，无外部输入。
+11. `readCustom/writeCustom/openCustom/closeCustom/statCustom`（第 220-252 行）：透传 fd 与数据，fd 由上层管理。
+12. `fsExport`（第 255-311 行）：readdirAsync/readFile/writeFile 等直接透传路径给 fs API —— 路径遍历风险取决于上层是否校验。
+
+**source→sink 数据流验证**
+
+- **D1：`rmrf/mv/cp/getFolderSize` 的路径 → shell 字符串拼接。** 无任何转义或校验。Unix 下 `mv -r 'a'; rm -rf /' b'` 类单引号逃逸即可注入；Windows 下双引号内可被 `$(...)` 子表达式或反引号绕过。黑名单/过滤不存在，防御无效。这是典型 CWE-78。
+- **D2：`openFile`** 已通过 base64+env 或参数数组修复，不构成漏洞（对比旧版直接拼 cmd）。
+- **D3：`unzipFile`** 使用 tar 库 API 而非 shell，主要风险是解压条目路径穿越（CWE-22），tar 库默认会拒绝绝对路径/`..` 条目，且输入为本地文件选择结果，证据不足以判定。
+- **D4：`fsExport.writeFile/readdirAsync`** 直接透传，属设计上受信任的内部 IPC 面，本文件内无独立 source。
+
+**第二入口检查**：所有 shell sink 的输入均来自模块导出函数的参数，即渲染进程经 IPC 可控；同一 source 同时到达多个 sink（rmrf、mv、cp、getFolderSize），任一均可注入。
+
+**结论**：存在命令注入漏洞，核心在第 40-42 行 `runWinCmd` 与第 27-35 行 `run` 及其上游拼接点（第 88-89、103-105、115-117、124-126 行），无任何有效防御。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "high", "source": "line 101-130: rmrf/mv/cp 函数参数 localFolderPath/from/to, 以及 line 86-96 getFolderSize 的 folderPath, 均由上层 IPC 调用方控制", "sink": "line 27-35 run() 将字符串交 bash 执行; line 40-42 runWinCmd 通过 execAsync 以 powershell.exe -Command 执行拼接字符串", "explanation": "路径参数未经任何转义或校验即拼入 shell 命令: Unix 分支使用单引号包裹(如 mv '${from}' '${to}'), 攻击者可在路径中包含单引号实现引号逃逸并追加任意命令; Windows 分支使用双引号包裹后嵌入 powershell.exe -Command, 可通过子表达式或引号闭合注入任意 PowerShell 代码; rm -rf 场景下还可实现任意目录删除; openFile 已用 base64 环境变量和参数数组修复可作为正确做法参照", "fix_suggestion": "line 101-130: 参照 line 135-147 openFile 的做法, 改用 spawn 参数数组形式传递路径, 或对路径做严格的 shell 元字符转义; 更优方案是用 fs.rm/fs.rename/fs.cp 等 Node 原生 API 替代 shell 命令"}
+```

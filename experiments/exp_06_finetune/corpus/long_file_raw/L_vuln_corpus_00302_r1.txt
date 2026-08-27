@@ -1,0 +1,37 @@
+## 编号分析（逐函数、逐入口点、逐数据流）
+
+### 一、文件结构与入口点枚举（全文通读）
+
+本文件共约 129 行，定义一个类 `DictPromptTemplate` 与两个模块级私有函数。逐一枚举所有可被外部触达的入口点：
+
+1. **第 24–27 行 `input_variables` 属性**：调用 `_get_input_variables(self.template, ...)`，source 是 `self.template`（构造时传入的字典）。
+2. **第 29–34 行 `format(**kwargs)`**：外部直接传入任意关键字参数 `kwargs`，进入 `_insert_input_variables`。这是**第一入口点**。
+3. **第 36–40 行 `aformat(**kwargs)`**：异步包装，第 40 行直接委托 `self.format(**kwargs)`，与入口 1 完全同源同 sink——这是**第二入口/替代通道**，防御逻辑不会因走异步路径而改变。
+4. **第 42–52 行 `invoke(input, config, **kwargs)`**：Runnable 标准入口。第 46 行 lambda 将整个 `input` 字典解包为 `self.format(**x)` 的参数。source 为 `input` 中任意键值，最终同样汇入 `_insert_input_variables`。注意第 51 行的 `**kwargs` 仅透传给 `_call_with_config`，不参与格式化。
+5. **第 82–97 行 `_get_input_variables`**：递归遍历 dict/list/tuple，对每个字符串调用 `get_template_variables`（来自 langchain_core.prompts.string）。仅做变量名提取，无格式化执行，本身不是 sink，但决定了哪些变量被“声明”。
+6. **第 99–129 行 `_insert_input_variables`**：核心 sink 所在。第 105 行取 `DEFAULT_FORMATTER_MAPPING[template_format]`；第 108、121 行是两处格式化执行点。
+
+### 二、source→sink 数据流逐条验证
+
+**流 A（主漏洞流）：用户输入 → str.format**
+- source：`format(**kwargs)` 第 29 行的 `kwargs`，或经 `invoke` 第 46 行 `lambda x: self.format(**x)` 注入的 `input` 字典值。
+- 传播：第 34 行 → 第 108 行 `formatter(v, **inputs)` / 第 121 行 `formatter(x, **inputs)`。
+- sink 验证：`DEFAULT_FORMATTER_MAPPING["f-string"]` 在 langchain_core 中绑定的是 `str.format`（即 `v.format(**inputs)`）。Python 的 `str.format` 支持属性链与索引访问，如 `{a.__init__.__globals__[secret_key]}`。模板字符串 `v` 来自 `self.template`，若攻击者能控制模板内容（例如通过 LangChain 序列化加载——第 62–65 行明确声明 `is_lc_serializable() == True`，第 58–60 行 `dumpd(self)` 表明对象会被序列化传输/存储），则可将恶意占位符写入模板，再用普通输入触发格式化，导致**格式化字符串注入**：读取进程内任意可达对象的属性、环境变量、密钥等并渲染进 prompt 输出。该路径上没有任何过滤、白名单或沙箱——第 107/120 行只做 `isinstance(v, str)` 类型判断，不构成有效防御。
+- mustache 分支风险较低（string.Template 不支持属性遍历），但 f-string 是默认常用选项且类型未强制校验来源。
+
+**流 B：递归结构遍历**
+- 第 109–116 行与第 117–126 行分别对嵌套 dict 和 list/tuple 递归调用自身，最终仍落到第 116/121/124 行的同一 formatter。递归深度无限制，超深嵌套可造成 RecursionError 拒绝服务（次要问题），但主要危害仍是流 A 的注入面随嵌套扩大。
+
+**流 C：image_url/path 警告（第 110–115 行）**
+- 当键为 `image_url` 且子 dict 含 `path` 时仅 `warnings.warn`，**不阻断、不脱敏**。虽然此处 `path` 位于模板而非用户输入，但黑名单式检查（只认字面量键 `"image_url"`）可被别名结构绕过（如嵌套在 list 内的第 121 行格式化路径完全不受此检查约束）。按分析要求，此类警告型防御视为无效。
+
+**流 D：序列化通道（第 58–71 行）**
+- `dumpd(self)` 会把 `template` 原样导出；配合 `is_lc_serializable()==True`，恶意模板可通过合法的 LangChain 加载/共享流程进入受害进程，构成流 A 的第二入口（供应链/反序列化侧信道）。
+
+### 三、结论
+
+有效防御缺失确认：全文无任何对格式化占位符的白名单校验、无对 `inputs` 键的访问控制、无递归深度限制；唯一的安全措施（第 110–115 行）为可绕过的警告。核心漏洞为 CWE-134 格式化字符串注入（f-string 经由 `str.format` 的属性遍历信息泄露）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-134 格式化字符串注入（str.format 属性遍历导致敏感信息泄露）", "risk_level": "高", "source": "line 29/43: format(**kwargs) 与 invoke(input) 的用户可控输入；line 62-65 可序列化使恶意 template 可经加载通道注入", "sink": "line 108: formatter(v, **inputs)；line 121: formatter(x, **inputs)，f-string 映射到 str.format", "explanation": "攻击者通过 invoke 或 format 提供输入，或在模板中预置形如 {a.__init__.__globals__} 的占位符 -> DEFAULT_FORMATTER_MAPPING 的 f-string 分支调用 str.format 执行属性链遍历 -> 进程内密钥、环境变量等被渲染进 prompt 输出；第 110-115 行的 image_url 警告仅为告警不阻断，且 list 分支完全不受其约束，属无效防御", "fix_suggestion": "line 105-108: 对 f-string 分支改用安全格式化器（如 string.Formatter 子类禁止属性/索引访问，或仅允许已声明的 input_variables 占位符）；同时对 template 来源做校验，并将第 110-115 行的警告改为硬性拒绝"}
+```

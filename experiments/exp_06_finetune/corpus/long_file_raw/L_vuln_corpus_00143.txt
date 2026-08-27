@@ -1,0 +1,19 @@
+## 编号分析（全文逐函数）
+
+1. **第 63–73 行 `parse(File)` / 第 82–91 行 `parse(byte[])` / 第 100–109 行 `parse(URL)` / 第 118–127 行 `parse(Reader)`**：四个反序列化入口，source 分别为文件、字节数组、URL、Reader（外部可控 XML）。sink 均为 `xstream.fromXML(...)`。关键防御在 `createXStream()`。
+
+2. **第 226–262 行 `createXStream()`**：使用 `StaxDriver`。XStream 的 StAX 驱动默认禁用 DTD 与外部实体（`XMLInputFactory.SUPPORT_DTD=false`），XXE 路径基本关闭；且解析前未调用 `validate()` 强制校验，但反序列化安全性取决于类型白名单。
+
+3. **第 252–256 行**：`XStream.setupDefaultSecurity(xstream)` 后 `allowTypesByWildcard(new String[]{"org.cyclonedx.model.**"})` —— 这是**白名单**而非黑名单/正则，仅允许本项目 model 包类型反序列化，阻断了经典的 XStream 反序列化 RCE gadget 链（如 `EventHandler`、`ProcessBuilder` 等均不在白名单内）。该防御有效。（注：旧版 XStream <1.4.10 中 `setupDefaultSecurity` 行为有差异，但代码本身意图与机制正确。）
+
+4. **第 129–171 行 `validate(File, Version)`**：source 为外部文件，sink 为 `validator.validate(xmlFile)`。Schema 来自本地打包资源（父类 `getXmlSchema`），非用户可控，无 SSRF/XSLT 注入面。**但第 167–169 行 `catch (IOException | SAXException e) { // throw it away }` 是缺陷**：若 schema 加载失败或 IO 异常，异常被吞掉后返回空列表，导致 `isValid()`（第 180、189 行）误判为 true——验证绕过（fail-open），属低危逻辑漏洞（CWE-755/CWE-20）。
+
+5. **第 173–222 行映射方法**：纯静态枚举映射，无外部输入参与，无风险。
+
+6. **第二入口核查**：无其他路由/回调/环境变量入口；`parse(URL)` 的 URL 由调用方提供，本类不做网络请求配置变更，SSRF 责任在调用方且非本文件引入。
+
+**结论**：反序列化有有效白名单防护，无 RCE/XXE 可利用路径；唯一实际问题是 validate 异常吞掉导致的 fail-open 校验绕过，风险低。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-755 异常处理不当导致验证绕过(fail-open)", "risk_level": "low", "source": "line 129: 外部传入的待校验 BoM 文件", "sink": "line 167-169: catch(IOException|SAXException) 吞掉异常后返回空列表", "explanation": "validate() 中若 schema 加载失败或发生 IO/SAX 异常, 第 167-169 行直接丢弃异常并返回空的 exceptions 列表, 使 isValid()(line 180/189) 在校验根本未执行的情况下返回 true, 攻击者可借助触发加载失败的环境使非法 BoM 通过校验 -> 校验结果不可信", "fix_suggestion": "line 167-169: 不应吞掉异常, 应将 IOException/SAXException 记录日志并向调用方抛出 ParseException 或在失败时返回非空错误列表, 保证 fail-closed"}
+```

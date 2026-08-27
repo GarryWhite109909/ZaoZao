@@ -1,0 +1,67 @@
+LANG: python
+```python
+import os
+from flask import Flask, request, render_template_string
+
+app = Flask(__name__)
+
+TEMPLATE = """listen:
+  host: {{ listen_host }}
+  port: 4242
+punchy: {{ punchy }}
+tun:
+  dev: {{ tun_device }}
+"""
+
+ALLOWED_TUN_DEVICES = {"nebula1", "nebula2", "nebula3"}
+
+def _validate_listen_host(value):
+    # whitelist exact allow-set for listen_host: IPv4 literal only
+    parts = value.split(".")
+    if len(parts) != 4:
+        return None
+    try:
+        octets = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if any(o < 0 or o > 255 for o in octets):
+        return None
+    return ".".join(str(o) for o in octets)
+
+def _validate_punchy(value):
+    # whitelist exact allow-set for punchy boolean field
+    return value if value in ("true", "false") else None
+
+@app.route("/configgen", methods=["POST"])
+def configgen():
+    # operator-supplied fields validated against strict whitelists before templating
+    listen_host = _validate_listen_host(request.form.get("listen_host", "0.0.0.0"))
+    tun_device = request.form.get("tun_device", "nebula1")
+    if tun_device not in ALLOWED_TUN_DEVICES:
+        return "invalid tun_device", 400
+    punchy = _validate_punchy(request.form.get("punchy", "true"))
+    if listen_host is None or punchy is None:
+        return "invalid input", 400
+    rendered = render_template_string(TEMPLATE, listen_host=listen_host,
+                                      tun_device=tun_device, punchy=punchy)
+    with open(os.path.join("/etc/nebula", "config.yml"), "w") as f:
+        f.write(rendered)
+    return rendered
+
+@app.route("/preview", methods=["GET"])
+def preview():
+    # second entry: same sink via query params, now fixed by rendering a static template instead of user text
+    snippet = request.args.get("snippet", "")
+    safe_snippet = render_template_string("{{ snippet }}", snippet=snippet)
+    return safe_snippet
+```
+
+1. 第 20 行与第 33-35 行枚举用户可控输入点：`request.form.get` 取得 listen_host、tun_device、punchy，`request.args.get` 取得 snippet，均为攻击者完全可控的字符串。
+2. 第 38 行是主链 sink：原代码将用户输入作为模板变量传入 `render_template_string` 本身尚可（变量经 Jinja 转义上下文渲染），但真正的 SSTI 风险在于模板内容可被注入的路径——第 47 行 `render_template_string(snippet)` 直接把用户文本当模板编译，`{{ }}`/`{% %}` 内可执行任意表达式（如 `__import__('os').popen(...)`），构成 CWE-94。修复采用框架原生安全 API：将用户数据作为模板**变量**而非模板**源码**传入（第 48 行），Jinja 对变量值只做文本渲染、绝不二次求值，类型上保证任何输入都退化为纯字符串输出。
+3. 第 39-41 行对 listen_host 施加 IPv4 字面量白名单精确允许集校验，第 42-44 行对 tun_device 使用集合白名单 `ALLOWED_TUN_DEVICES`，第 45-46 行对 punchy 仅允许 `true/false`；三处校验位于 sink 之前的数据流必经位置，位置正确，且拒绝而非过滤，杜绝绕过。
+4. 攻击面覆盖完整性：/configgen 的三个字段全部经过白名单后仅以变量形式进入固定 TEMPLATE 常量（第 8-15 行），模板源码不再含任何用户可控成分；/preview 的 snippet 同样降级为变量渲染，两条数据流的模板注入通道均被封闭。
+5. 第二入口检查结论：/preview 已由直接渲染用户文本改为变量化渲染，替代通道（query 参数）无残留 sink；文件写入路径 `/etc/nebula/config.yml` 为硬编码常量，无路径注入问题，保持原样符合最小 diff 纪律。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "/configgen 流：listen_host 经 IPv4 白名单校验、tun_device 经集合白名单 ALLOWED_TUN_DEVICES 校验、punchy 仅允许 true/false，随后全部作为模板变量传入固定的 TEMPLATE 常量，模板源码不含用户可控成分，SSTI 通道封闭；/preview 流：原代码第 47 行直接将 query 参数 snippet 作为模板源码传给 render_template_string 构成 CWE-94，现改为将其作为变量传入静态模板字符串进行渲染，Jinja 只做文本替换不二次求值，注入被消除；文件写入路径为硬编码常量，无其他漏洞", "fix_suggestion": "line 48: 将 render_template_string(snippet) 改为 render_template_string('{{ snippet }}', snippet=snippet)，并在 line 39-46 为 /configgen 各字段增加白名单精确允许集校验"}
+```

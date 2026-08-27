@@ -1,0 +1,27 @@
+## 编号分析
+
+1. **第 19–73 行 `put`**：source 为 `req.URL.Path`（第 27 行），经 `sanitizePath(fs.UploadFolder, ...)` 净化后作为 sink `os.OpenFile`（第 53 行）的路径。净化函数未在本文给出，无法验证其有效性；但代码对 `.goshs` 覆盖、ACL 均有防护，且注释表明项目以 sanitizePath 作为统一防穿越手段。基于全文证据暂不能断言可绕过。
+
+2. **第 76–160 行 `upload`**：source 为 multipart 的 `part.FileName()`（第 106 行）。防御是仅按 `/` 切分取最后一段（第 107–108 行）。该黑名单式过滤存在缺口：
+   - 未处理反斜杠，Windows 上 `..\..\evil.txt` 可实现目录穿越写入；
+   - 若 FileName 恰为 `..`，`filepath.Join(targetDir, "..")` 会逃逸目标目录（rename 到目录会失败，但 `tempPath = finalPath + "~"` 的 `os.Create` 在父目录创建文件成功）。
+   属于可绕过的过滤，非有效防御。
+
+3. **第 163–253 行 `bulkDownload`**：
+   - source 为 `req.URL.Query()["file"]`（第 170 行），经 `sanitizePath(fs.Webroot, ...)` 校验，失败即跳过（第 179–182 行），穿越下载本身被拦截。
+   - **关键缺陷**：对比 `put`（第 39–48 行）与 `upload`（第 90–97 行）都执行了 `findEffectiveACL` + `applyCustomAuth` 强制 `.goshs` 目录级访问控制，而 `bulkDownload` 全文（第 163–253 行）完全没有调用这两个函数。攻击者可通过 `?file=` 参数打包下载任意被 `.goshs` ACL 保护目录内的文件，构成认证/授权绕过（CWE-862/CWE-200）。
+   - 另外第 213 行 `strings.ReplaceAll(filepath, fs.Webroot, "")` 可能误替换路径中段出现的 webroot 字符串导致 zip 内路径混乱，属轻微信息泄露/正确性问题。
+
+4. **第二入口核查**：`upload` 与 `put` 是同一写功能的替代通道；`bulkDownload` 是独立读通道且缺少与写通道一致的 ACL 检查，符合“替代通道遗漏防护”模式。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "broken access control / authorization bypass (CWE-862)",
+  "risk_level": "high",
+  "source": "req.URL.Query()['file'] in bulkDownload",
+  "sink": "filepath.Walk + zip streaming of arbitrary sanitized paths without ACL enforcement",
+  "explanation": "put 与 upload 均通过 findEffectiveACL 和 applyCustomAuth 强制执行 .goshs 目录级访问控制，但 bulkDownload 全文未调用任何 ACL 或认证检查，攻击者可用 ?file= 参数将受 .goshs 保护目录中的文件打包下载，绕过目录级授权。次要问题：upload 中文件名仅按 '/' 切分，未处理反斜杠与 '..'，在 Windows 上可目录穿越。",
+  "fix_suggestion": "在 bulkDownload 中对每个待打包路径调用 findEffectiveACL 并执行 applyCustomAuth；同时增强 upload 文件名净化，使用 filepath.Base 并拒绝 '..' 及包含反斜杠的文件名。"
+}
+```

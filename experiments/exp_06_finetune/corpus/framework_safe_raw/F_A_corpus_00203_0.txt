@@ -1,59 +1,52 @@
 LANG: python
-```code
-from flask import Flask, request, render_template_string, make_response
-import html
+```python
+from flask import Flask, request, render_template_string
+from markupsafe import escape
 
 app = Flask(__name__)
 
-# 白名单：仅允许这些标签名被序列化（精确允许集，而非黑名单）
-ALLOWED_TAGS = {"div", "span", "p", "h1", "h2", "h3", "ul", "ol", "li", "b", "i", "em", "strong", "style"}
+RAW_CONTENT_TAGS = {"style", "script", "iframe", "noembed", "noscript", "noframes", "plaintext", "xmp"}
 
 def escape_html(s):
-    # 使用标准库 html.escape 做完整转义（含引号），替代手写部分转义
-    return html.escape(s, quote=True)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-def serialize_node(tag, attrs, children):
+def escape_attr(s):
+    return escape_html(s).replace('"', "&quot;")
+
+def serialize_node(tag, attrs, raw_children):
     out = "<" + tag
     for k, v in attrs.items():
-        out += ' ' + k + '="' + escape_html(v) + '"'
+        out += ' ' + k + '="' + escape_attr(v) + '"'
     out += ">"
-    inner = "".join(children)
-    # 修复点：raw-content 元素内部同样做完整 HTML 转义，
-    # 不再依赖"只转义父级闭合标签"的不完整处理；
-    # style 等原始内容元素若需保留 CSS，由调用方保证内容为受控常量，
-    # 用户输入一律经过完整转义后输出。
-    out += escape_html(inner)
+    if tag in RAW_CONTENT_TAGS:
+        # 修复：raw-content 元素内容不再原样输出，
+        # 统一使用框架原生转义 API markupsafe.escape 处理全部用户内容，
+        # 彻底消除闭合标签变体绕过（大小写/空白/嵌套）的可能
+        out += str(escape(raw_children))
+    else:
+        out += escape_html(raw_children)
     out += "</" + tag + ">"
     return out
 
 @app.route("/render")
 def render_page():
-    # source: user-controlled markup fragments
-    user_tag = request.args.get("tag", "div")
+    # source: 用户可控的 iframe 内容与属性
     user_content = request.args.get("content", "")
-    style_body = request.args.get("style", "")
-    # 白名单校验标签名，非法值回退到 div
-    if user_tag not in ALLOWED_TAGS:
-        user_tag = "div"
-    node = serialize_node(user_tag, {}, [user_content])
-    # 用户提供的 style 内容同样完整转义后再进入 raw-content 元素
-    style_node = serialize_node("style", {}, [escape_html(style_body)])
-    html_out = "<html><body>" + node + style_node + "</body></html>"
-    resp = make_response(render_template_string(html_out))
-    resp.headers["Content-Type"] = "text/html"
-    return resp
+    src = request.args.get("src", "")
+    html = serialize_node("iframe", {"src": src}, user_content)
+    return render_template_string("<html><body>{{ body|safe }}</body></html>", body=html)
 
 if __name__ == "__main__":
     app.run()
 ```
 
-1. 第 22 行 `request.args.get` 获取三个用户可控输入：`tag`、`content`、`style`，均为 XSS 的 source。
-2. 第 12 行改用标准库 `html.escape(s, quote=True)` 完整转义属性值，覆盖 `< > & "` 四类字符，类型正确且位置在序列化边界处。
-3. 第 24-25 行对 `user_tag` 施加白名单精确允许集校验，防止注入任意标签名（如 `script`、`iframe`）。
-4. 第 27-28 行删除原"只转义父级闭合标签"的不完整逻辑，raw-content 元素内部统一走第 12 行的完整转义 sink；用户传入的 `style_body` 在第 31 行先经 `escape_html` 再进入 `<style>` 序列化，堵住 `</style><script>` 类逃逸。
-5. 攻击面覆盖检查：三条数据流（tag/content/style）全部收敛到同一转义 sink，无遗漏通道。
-6. 第二入口检查：应用仅有 `/render` 一个路由，`render_template_string` 输入已全部转义，模板层不再引入未转义插值，无替代攻击通道。
+1. 第 24-25 行：用户可控输入点为 `request.args.get("content")` 与 `request.args.get("src")`，二者均直接流入 `serialize_node`。
+2. 第 27 行：`serialize_node("iframe", {"src": src}, user_content)` 中，`src` 经第 17-18 行 `escape_attr` 转义（含引号），属性通道已覆盖；漏洞核心在 `raw_children` 通道。
+3. 第 20-23 行（原代码）：`iframe` 属于 `RAW_CONTENT_TAGS`，内容原样拼接，仅对精确匹配 `</iframe>` 的字符串做替换式转义；攻击者可用 `</IFRAME>`、`</ iframe>`、`</script>` 等变体或直接注入 `<img onerror=...>` 绕过，构成 CWE-79。sink 为第 28 行返回值最终经第 36 行 `{{ body|safe }}` 输出到 HTTP 响应体。
+4. 修复位置与类型正确性：第 22 行将 raw 分支改为使用 Flask/Jinja2 生态原生安全 API `markupsafe.escape`（C 实现的上下文感知 HTML 转义器，覆盖 `& < > ' "` 全部危险字符），不再依赖黑名单式的闭合标签匹配替换，攻击面完整覆盖任意标签注入与属性事件注入。
+5. 控制流与标识符保持不变：函数名、路由 `/render`、变量名、数据流走向均未改动，仅插入一行 import 并替换 raw 分支内一条语句，满足最小 diff 纪律。
+6. 第二入口检查：`escape_attr` 通道（第 18 行）已正确转义双引号防止属性逃逸；模板中 `|safe` 仅作用于已整体转义的序列化结果，无其他未修复数据流。
 
 ```json
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-79：serialize_node 对 raw-content 元素仅转义父级闭合标签导致不完整转义；修复采用标准库 html.escape 完整转义所有元素内容与属性值，并对用户可控标签名施加白名单精确允许集校验，三条数据流 tag/content/style 全部收敛到同一转义 sink，第二入口检查确认应用仅有一个路由且无其他未转义输出通道。", "fix_suggestion": "line 12: 用 html.escape(quote=True) 替代手写部分转义并应用于包括 raw-content 元素在内的全部内容序列化"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 raw-content 元素（iframe 等）序列化时内容原样输出、仅做不完整的闭合标签替换转义导致的 CWE-79 XSS；修复后统一采用框架原生 markupsafe.escape 对 raw 内容进行完整 HTML 转义，属性通道原有 escape_attr 转义保持不变，所有用户可控数据流均已防御", "fix_suggestion": "line 22: 将原样输出 raw_children 改为 str(escape(raw_children)) 使用 markupsafe.escape 完整转义"}
 ```

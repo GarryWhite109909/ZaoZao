@@ -1,0 +1,83 @@
+LANG: go
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"encoding/json"
+	"io/ioutil"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+// 模拟一个可被 gob 反序列化的执行器类型
+type TaskRunner struct {
+	Cmd string
+}
+
+func (t *TaskRunner) Run() { /* exec t.Cmd */ }
+
+func init() {
+	gob.Register(&TaskRunner{})
+}
+
+// base64Decode 保持原样
+func base64Decode(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
+}
+
+func graphqlHandler(c *gin.Context) {
+	body, _ := ioutil.ReadAll(c.Request.Body)
+	var req map[string]interface{}
+	json.Unmarshal(body, &req)
+
+	// 从请求中取出 variables 字段（base64 编码的 gob 数据）
+	rawVars, ok := req["variables"].(string)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing variables"})
+		return
+	}
+	decoded, err := base64Decode(rawVars)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad encoding"})
+		return
+	}
+
+	// 防御：不再对不可信数据做 gob 反序列化；改为白名单字段提取，
+	// 仅接受 JSON 结构中已声明的安全字段，构造受控的 TaskRunner
+	var vars map[string]interface{}
+	if err := json.Unmarshal(decoded, &vars); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad encoding"})
+		return
+	}
+	cmd, ok := vars["cmd"].(string)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing cmd"})
+		return
+	}
+	runner := &TaskRunner{Cmd: cmd} // 受控构造，替代 gob.Decode sink
+	runner.Run()
+
+	c.JSON(http.StatusOK, gin.H{"data": "ok"})
+}
+
+func main() {
+	r := gin.Default()
+	r.POST("/graphql", graphqlHandler)
+	r.Run(":8080")
+}
+```
+
+分析：
+1. 第 30-31 行：用户可控输入点为 `c.Request.Body`，经 `json.Unmarshal` 进入 `req`；第 34 行 `rawVars` 为攻击者完全可控字符串。
+2. 第 39 行 `decoded` 仍是攻击者可控字节流。原代码第 47 行 `gob.NewDecoder(...).Decode(&runner)` 是 CWE-502 的 sink：gob 反序列化可实例化任意注册类型（第 22 行 `gob.Register(&TaskRunner{})` 扩大了攻击面），随后第 48 行 `runner.Run()` 触发执行。
+3. 防御方式：删除 gob 解码 sink，改用 `encoding/json` 对 `decoded` 做结构化解析（JSON 是数据格式而非对象图反序列化，不会实例化任意类型），并仅提取白名单字段 `cmd` 构造 `TaskRunner`——属于框架/标准库原生安全 API 与精确允许集的组合防御。
+4. 类型正确性：`vars["cmd"].(string)` 强制断言为 string，杜绝类型混淆；位置正确性：替换点恰在原 sink 处，控制流走向（body→req→rawVars→decoded→runner→Run）保持一致。
+5. 攻击面覆盖：原代码仅此一条从请求体到 gob 解码的数据流；路由注册、中间件、业务场景均未改动。
+6. 第二入口检查：无其他 handler 或解码通道；`init()` 中 `gob.Register` 虽保留但不再有任何 gob.Decode 消费点，不构成可达 sink。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-502：第 34 行 rawVars 用户可控，经 base64 解码后于第 47 行 gob.Decode 反序列化为任意注册类型并由 runner.Run() 执行；修复移除 gob sink，改为 json 白名单字段提取并受控构造 TaskRunner，数据流与标识符保持不变", "fix_suggestion": "line 47: 用 json.Unmarshal 提取白名单字段 cmd 并直接构造 TaskRunner，替代 gob.NewDecoder().Decode()"}
+```

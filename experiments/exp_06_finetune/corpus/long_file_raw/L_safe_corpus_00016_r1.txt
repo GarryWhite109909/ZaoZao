@@ -1,0 +1,69 @@
+# 逐函数安全分析（全文通读，行号锚定）
+
+## 一、入口点枚举
+
+本文件是 OCI 运行时用户解析辅助模块，共包含以下函数/类型，逐一分析：
+
+1. `GetUser`（第 17-44 行）—— 主入口
+2. `ParseUIDGID`（第 47-61 行）—— 快速路径解析
+3. `openUserFile`（第 64-89 行）—— 文件打开辅助
+4. `limitedReadCloser` 及其 `Read` 方法（第 91-105 行）—— 限长读取器
+5. `parseUID`（第 107-114 行）—— UID 字符串解析
+6. `WithUIDGID`（第 116-127 行）—— Spec 选项构造器
+7. `setProcess`（第 129-134 行）—— Process 初始化
+8. `ensureAdditionalGids`（第 136-143 行）—— 补充 GID 保证
+
+外部可控输入（source）：
+- S1：`username` 参数（第 17 行），来自容器 spec 的 `process.user.username`，由调用方（如 nerdctl/containerd 集成层）传入；
+- S2：`root` 参数（第 17 行），容器 rootfs 路径；
+- S3：镜像内的 `/etc/passwd`、`/etc/group` 文件内容（第 26-27 行经 `openUserFile` 打开）。
+
+sink：
+- K1：`os.Open(p)`（第 72 行）—— 文件系统访问；
+- K2：OCI spec 的 `s.Process.User.UID/GID/AdditionalGids`（第 121-123 行）—— 进程身份设置。
+
+## 二、逐条 source→sink 数据流验证
+
+### 流 D1：S1(username) → ParseUIDGID → parseUID → 返回 uid/gid
+
+第 21-24 行：若 username 形如 `uid:gid` 且均为数字（或 `root`），直接返回。`parseUID`（第 107-114 行）仅接受 `"root"` 或 `strconv.ParseUint(str, 10, 32)`，即纯十进制数字。**无任何注入面**：结果只用于后续进程 UID 设置，且被严格限定为 uint32 数值范围。无漏洞。
+
+### 流 D2：S1(username) → user.GetExecUser(passwdFile, groupFile)
+
+第 33 行将 username 与镜像内 passwd/group 内容交给 moby/sys/user 解析。username 是查找键而非文件路径或 shell 命令；moby/sys/user 库内部做字段切分与数值转换，不存在命令执行或路径拼接。即使恶意镜像在 `/etc/passwd` 中写入畸形条目（如超长字段、负数 UID），库会返回解析错误或截断值，最终仍收敛为 uint32。无注入 sink。
+
+### 流 D3：S2(root) + 固定路径 "/etc/passwd"、"/etc/group" → fs.RootPath → os.Open（K1）
+
+这是本文件最值得审查的路径遍历点。分析：
+
+- 第 65-69 行：`p, err := fs.RootPath(root, p)`。continuity 的 `fs.RootPath` 实现会调用 `filepath.Join(root, p)` 后用 `filepath.EvalSymlinks`/清理逻辑确保结果仍在 root 内，对含 `..` 的路径返回错误。此处 p 是硬编码常量 `/etc/passwd`、`/etc/group`（第 26-27 行），不含任何用户输入拼接，因此即便 root 本身指向攻击者控制的目录，打开的也只是该目录下的固定相对路径。
+- 第 71-77 行：`os.Open` 后立即 `f.Stat()` 并要求 `info.Mode().IsRegular()`（第 80-84 行）。这防御了两类攻击：
+  - 符号链接逃逸：若攻击者在 root 内放置指向宿主敏感文件的 symlink，Stat 会显示非常规文件（设备/FIFO/socket）而被拒绝；注意若 symlink 指向常规文件则 os.Open 已跟随链接——但目标仍是 root 内攻击者自有的文件，读取结果仅用于用户名→UID 映射，不会泄露给攻击者控制之外的地方，且解析失败只会导致错误返回。
+  - FIFO/设备挂起或读取特殊文件：IsRegular 检查阻止。
+- 第 86-88 行 + 第 96-104 行：`io.LimitedReader{N: maxUserFileBytes + 1}` 限制读取至 10 MiB+1，`limitedReadCloser.Read` 在 N==0 时返回错误（第 100-102 行），防止超大 passwd 文件导致的内存耗尽 DoS。防御有效。
+
+结论：K1 处不存在可利用的路径遍历或任意文件读取。防御（RootPath 清理 + IsRegular + 大小限制）均非黑名单式过滤，属结构性有效防御。
+
+### 流 D4：S3(/etc/passwd 内容) → GetExecUser → sgids → WithUIDGID → spec
+
+第 37-41 行将 execUser.Sgids 转为 []uint32。moby/sys/user 对组 ID 做 ParseUint 校验，非法值报错。最终经 `WithUIDGID`（第 116-127 行）写入 OCI spec 的进程用户字段。此数据流终点是运行时身份设定，恶意镜像最多能让自己的容器以镜像内声明的 UID 运行——这正是功能语义本身，不构成提权：UID 选择发生在 rootless/root 命名空间映射之内，由上层 runtime 决定是否允许，本文件不做任何特权判定。无越权 sink。
+
+### 流 D5：ensureAdditionalGids 逻辑正确性
+
+第 136-143 行：若 GID 不在 AdditionalGids 中则前插。使用 `slices.Contains` 精确比较，无重复注入问题；`setProcess`（第 129-134 行）保证 nil 安全。无漏洞。
+
+## 三、第二入口与替代通道检查
+
+- 该包没有 HTTP 路由、环境变量读取（全文无 `os.Getenv`）、回调注册或网络监听；唯一 I/O 是两处固定路径的 `os.Open`。
+- 替代通道：`GetUser` 若被以攻击者控制的 `root` 调用（例如指向恶意镜像解包目录），已由 D3 分析覆盖——固定相对路径 + IsRegular + 10MiB 限制使风险收敛为“读自己镜像里的文件”。
+- 错误处理：所有 os.Open/Stat 错误均关闭 fd（第 74、82 行 f.Close()），无资源泄漏型 DoS。
+- 边界情况：`ParseUIDGID("")` 返回零值 nil error（第 49-50 行），但 GetUser 中空串已在第 18-22 行被替换为 "0" 并走 isDefault 分支，第 23 行的快速路径对 "0" 因缺少冒号返回错误后落入正常解析流程，行为一致，无不一致的安全分支。
+- `parseUID("root")` 特判（第 108-109 行）允许字符串 "root" 作为 uid:gid 中的分量映射为 0——这是标准 POSIX 语义，非绕过。
+
+## 四、结论
+
+全部 source→sink 数据流均有结构性有效防御（路径规范化、regular file 校验、读取长度上限、严格数值解析），未发现路径遍历、注入、DoS、提权类漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文共8个函数均已逐一审查。外部输入仅有 username 与 root 两个参数及镜像内 /etc/passwd、/etc/group 文件内容。关键 sink 为第72行的 os.Open 与第121-123行的 OCI spec 用户字段写入。针对 os.Open 的潜在路径遍历：第65-69行 fs.RootPath 对路径做规范化且拼接对象是第26-27行的硬编码常量 /etc/passwd 与 /etc/group，不含用户输入；第80-84行 IsRegular 校验阻断符号链接到设备或FIFO的逃逸；第86-88行与第96-104行的 LimitedReader 将读取限制在10MiB并超限报错，防内存耗尽DoS。username 数据流方面，第107-114行 parseUID 仅接受 root 或 strconv.ParseUint 十进制数，第21-24行快速路径与第33行 moby/sys/user 的 GetExecUser 均将结果收敛为 uint32 身份值，无命令执行或路径拼接 sink。ensureAdditionalGids 使用 slices.Contains 精确去重，nil 安全由 setProcess 保证。全文件无环境变量读取、无网络入口、无回调注册，fd 泄漏已被第74、82行的 Close 覆盖。未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

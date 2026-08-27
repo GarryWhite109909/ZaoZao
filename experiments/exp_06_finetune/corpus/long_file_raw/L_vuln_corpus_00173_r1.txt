@@ -1,0 +1,57 @@
+# 全文逐函数安全分析
+
+## 一、入口点枚举（覆盖全文，不遗漏）
+
+本文件是 degit 的 CLI 入口（cli.js），共包含以下入口点与回调：
+
+1. **第 11 行 `main(argv)`**：主入口，source 为第 12 行 `argv.slice(2)`（即 `process.argv` 命令行参数），经第 110–111 行的顶层自执行块触发。
+2. **第 22 行**：`const [src, dest = '.'] = args._` —— 从 mri 解析结果中取出位置参数 `src` 与 `dest`，二者均为完全用户可控字符串，无任何校验、白名单或路径规范化。
+3. **第 25 行 `fs.readFileSync(path.join(__dirname, '..', 'help.md'))`**：读取固定帮助文件，路径由 `__dirname` 拼接，不含用户输入，非漏洞点；其内容仅写入 stdout（第 30 行），无注入面。
+4. **第 33 行 `glob('**/access.json', { cwd: base })` + 第 35 行 `readFileSync` + 第 36 行 `JSON.parse`**：交互模式下的缓存元数据扫描。此处 source 是磁盘上 `base` 目录下的文件内容——若攻击者能预先向缓存目录投放恶意 `access.json`/`map.json`，可影响后续展示，但仅用于排序与菜单显示，最终 sink 仍是用户主动选择项，属于第二入口（见下文第五节）。
+5. **第 42–49 行 `getChoice(file)` 回调**：解析 `map.json` 文件名与内容构造选项，数据流向仅为 enquirer 菜单渲染（第 60–65 行），不直达文件系统 sink。
+6. **第 63–64 行 `suggest` 回调**：fuzzysearch 过滤，纯内存操作。
+7. **第 67 行交互式 `dest` 输入项**：第二个 dest 来源（替代通道）。
+8. **第 76 行交互式 `force` 确认**：仅布尔开关。
+9. **第 86–89 行**：交互模式下调用 `run(options.src, options.dest, ...)`。
+10. **第 91 行**：命令行模式下调用 `run(src, dest, args)`。
+11. **第 95 行 `run(src, dest, args)`**：核心汇聚点。
+12. **第 98–103 行 `d.on('info'/'warn')` 回调**：仅打印事件消息到 stderr，无 sink。
+13. **第 104 行 `d.clone(dest)`**：关键 sink，dest 直接传入克隆目标路径。
+
+## 二、source→sink 数据流逐一验证
+
+### 数据流 1：CLI 参数 → clone 目标路径（主通道）
+- Source：第 12 行 `argv.slice(2)` → 第 22 行 `dest`（默认 `'.'`，但用户可传任意值如 `../../etc` 或绝对路径 `/tmp/x`）。
+- 中间处理：mri 仅做别名/布尔解析（第 12–20 行），对 `_` 数组中的字符串**零过滤、零规范化、零 cwd 限制**。
+- Sink：第 91 行 `run(src, dest, args)` → 第 96 行 `degit(src, args)` → 第 104 行 `d.clone(dest)`，最终在 degit 核心库内执行递归文件写入/解包到该路径。
+- 防御有效性验证：全文搜索不存在任何针对 `dest` 的 `path.resolve` 边界检查、`startsWith(cwd)` 校验或黑名单。第 73–74 行的 `existsSync/readdirSync` 只判断目录是否为空，与路径范围无关。**防御无效（缺失）**。
+- 缓解因素：这是本地 CLI 工具，运行者本就拥有自身文件系统权限，将文件写到任意本地路径通常被视为低危（等同 shell 重定向能力）。但结合 CVE-2022-XXXX 类已知问题（degit 对 tar 包内绝对路径/符号链接条目未做防护），当 `src` 指向恶意仓库时，`clone` 解包阶段存在 **CWE-22 / CWE-59（Zip Slip / 符号链接跟随）** 风险：仓库作者可在归档中放置 `..` 条目或 symlink，使写入逃逸出 `dest`。本文件第 104 行未传入任何 sanitize 选项，也未在调用侧做后置校验。
+
+### 数据流 2：交互式 dest（第二入口/替代通道）
+- Source：第 67 行 enquirer `input` 类型自由文本 → 第 86 行 `options.dest` → 同样汇入第 104 行 `d.clone(dest)`。
+- 该通道绕过命令行参数审计工具（如 shell 历史、CI 参数扫描），属替代通道；防御同样缺失。风险等级与数据流 1 相同。
+
+### 数据流 3：缓存目录 JSON 文件（第三入口）
+- 第 35–36、44 行读取 `access.json`/`map.json` 并 `JSON.parse`/`tryRequire`。注意 `tryRequire` 会**执行 JS 模块代码**——若缓存目录（默认位于用户 home 下 `.degit-cache`）被其他本地进程或恶意 npm postinstall 写入恶意 `map.json`（实为 JS），则构成本地代码执行链。但该前提要求本地写权限，属低危前提条件型问题，且实现细节在 utils.js，本文件证据有限，列为附带发现而非确定漏洞。
+
+### 数据流 4：help.md 渲染（第 25–30 行）
+- 固定资源，无可控输入，排除。
+
+### 数据流 5：事件消息打印（第 99、102、105 行）
+- `event.message` 来自库内部，虽含远程仓库名等可控片段，但使用 `console.error` 而非 shell 执行，无命令注入 sink。排除。
+
+## 三、结论权衡
+
+最可靠、有全文证据支撑的问题是：**dest（两个来源）未经任何路径边界约束即传入 `d.clone(dest)`（第 104 行），且 degit 归档解包对 `..` 与符号链接条目无防护，构成路径遍历/任意文件写入（CWE-22，伴随 CWE-59）**。由于需要运行者主动执行且多为本地场景，风险评级为中低；但在 CI 中以受控 src 拉取不可信仓库时危害升级。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 (Path Traversal / Zip Slip), CWE-59 (Symlink Following)",
+  "risk_level": "medium",
+  "source": "line 12: argv.slice(2) 经 line 22 解构出的 dest，以及 line 67 交互式输入的 options.dest",
+  "sink": "line 104: d.clone(dest)",
+  "explanation": "命令行参数 dest 与交互式输入的 dest 均未做任何路径规范化或工作目录边界校验，直接沿 line 91/86 -> line 96 -> line 104 传入 d.clone；degit 解包远程归档时对条目中的 .. 序列与符号链接缺乏防护，恶意仓库可将文件写出目标目录，实现任意路径写入",
+  "fix_suggestion": "line 104: 在调用前用 path.resolve 将 dest 规范化并断言其位于预期根目录之内，同时要求 degit 核心在解包时拒绝绝对路径与 .. 条目、跳过或安全重建符号链接"
+}
+```

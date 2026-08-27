@@ -1,0 +1,40 @@
+## 编号分析
+
+1. **入口点枚举（全文通读）**
+   - 唯一外部入口：`processSASLBind(BindOperation)`（约第 105 行起），source 为 `bindOperation.getSASLCredentials()`（第 109 行附近），即客户端 LDAP Bind 请求中的 SASL PLAIN 凭据字符串。
+   - 次要入口：配置回调 `applyConfigurationChange` / `isConfigurationChangeAcceptable`（文件末尾），仅读取管理端配置的 identity mapper DN，无用户可控数据流入危险 sink，且 `isConfigurationChangeAcceptable` 直接返回 true 属于宽松但非可利用漏洞（mapper DN 由管理员配置）。
+
+2. **凭据解析数据流**
+   - 第 116–150 行：按 `\u0000` 切分出 authzID、authcID、password。边界检查完整（缺 NULL、空 authcID、空密码均拒绝），无越界或注入问题。切分结果只进入 DN 解析、identity mapper 查询和密码比较，不进入命令/SQL/反序列化 sink。
+
+3. **authcID 处理**
+   - `dn:` 分支（第 160 行起）：`DN.valueOf` 解析失败即拒绝；root DN 被显式拒绝；`getActualRootBindDN` 归一化后取条目。取不到条目即失败。无绕过路径。
+   - 否则走 `identityMapper.getEntryForID(authcID)`，异常/null 均拒绝。
+
+4. **authzID 处理（关键授权检查）**
+   - `dn:` 分支：若 authzDN ≠ 认证用户 DN，则构造临时 InternalClientConnection 并强制校验 `PROXIED_AUTH` 特权（第 245 行附近），缺失即拒绝——防御有效。
+   - `u:` 分支：空 idStr 置 authZEntry=null，但随后第 300 行附近的 `authZEntry == null || !equals(...)` 同样触发特权校验——防御有效。
+   - 结论：不存在未授权的代理身份切换（无 CWE-285 可利用路径）。
+
+5. **口令验证**
+   - 第 330 行附近：先检查账户禁用，再 `authState.passwordMatches(...)` 使用策略层比较（内部为哈希比较），明文口令未落日志（错误消息不含 password）。无时序旁路可在此文件层面确认的高危问题。
+
+6. **次要观察（非可利用漏洞）**
+   - 第 205 行附近在口令验证**之前**调用 `setSASLAuthUserEntry(userEntry)`，理论上把候选条目提前挂到操作对象上；但后续任何失败路径均返回 INVALID_CREDENTIALS，且该值仅在 bind 成功语义下被消费，不构成认证绕过。
+   - `isSecure` 返回 false，正确提示需 TLS 保护，属设计声明而非缺陷。
+
+7. **第二入口/替代通道**：无其他读环境变量、文件、回调参数的通道；全文仅上述入口。
+
+综合：所有 source→sink 流均有有效防御（结构化解析 + 特权强制校验 + 策略层口令比较），未发现可利用的安全漏洞。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-208 (信息泄露/时序侧信道, 低危观察项)",
+  "risk_level": "low",
+  "source": "line ~109: bindOperation.getSASLCredentials() 客户端提供的 SASL PLAIN 凭据",
+  "sink": "line ~205: 口令验证前调用 bindOperation.setSASLAuthUserEntry(userEntry) 提前暴露候选用户条目",
+  "explanation": "逐条验证了全部数据流：凭据解析边界检查完整；authcID 的 dn 与 u 分支均正确处理异常与空条目；authzID 的 dn 与 u 分支在身份不一致时均强制校验 PROXIED_AUTH 特权，无法未授权代理；口令经 AuthenticationPolicyState.passwordMatches 安全比较且不写入日志。唯一可指出的弱点是 setSASLAuthUserEntry 在口令验证之前执行，可能向下游监听器提前泄露候选条目引用并引入轻微时序差异，但不构成认证绕过",
+  "fix_suggestion": "line ~205: 将 bindOperation.setSASLAuthUserEntry(userEntry) 移至 passwordMatches 校验成功之后再调用，确保仅在认证成功时暴露用户条目"
+}
+```

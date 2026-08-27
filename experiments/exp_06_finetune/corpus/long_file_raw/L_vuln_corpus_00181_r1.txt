@@ -1,0 +1,60 @@
+# flannel extension 后端安全分析
+
+## 一、全文通读与函数级入口点枚举
+
+本文件共约 150 行，包含以下函数/代码块，逐一分析：
+
+### 1. `init()`（第 27-29 行）
+- 入口点：backend 注册机制。`backend.Register("extension", New)` 将本后端注册进全局注册表。任何通过配置选择 `BackendType: extension` 的部署都会激活本文件逻辑。这是**第一入口通道**：flannel 配置（通常来自 etcd/Kubernetes ConfigMap 中的 net-conf）中的 `Backend` JSON 字段。
+
+### 2. `New()`（第 36-44 行）
+- 仅构造结构体，无输入处理，无 sink。无漏洞。
+
+### 3. `ExtensionBackend.Run()`（第 46-48 行）
+- 仅阻塞等待 ctx.Done()，无数据流。无漏洞。
+
+### 4. `RegisterNetwork()`（第 50-113 行）—— 核心风险函数
+
+**Source 分析：**
+- 第 52 行参数 `config *subnet.Config`，其 `config.Backend`（第 55 行判断非空）是来自外部配置的原始 JSON 字节。
+- Source 链路：etcd / Kubernetes API 中的 flannel 网络配置 → subnet.Manager 下发 → `config.Backend`。该内容可被任何有权限写 flannel 配置的主体控制（在 K8s 场景下通常是能编辑 kube-flannel-cfg ConfigMap 或 etcd 键 `/coreos.com/network/config` 的主体）。注意：flannel 以 **root 特权 DaemonSet** 运行于宿主机网络命名空间，且常挂载 hostPath，因此命令执行即等于节点 root 命令执行。
+
+**Sink 分析：**
+- 第 64 行：`runCmd([]string{}, "", "sh", "-c", n.preStartupCommand)` —— 直接将配置中的字符串作为 `sh -c` 参数。
+- 第 88-94 行：`runCmd(..., "sh", "-c", n.postStartupCommand)` —— 同样直接执行。
+- 第 96-101 行：`n.subnetAddCommand`、`n.subnetRemoveCommand` 被解析并存储到 network 结构体（第 100-101 行），供后续子网事件回调时以同样方式执行（实现在同包其他文件的 handleSubnetEvents 中，模式相同：`sh -c` + 字符串拼接环境变量）。这是**第二入口/替代通道**：即使 pre/post 命令为空，只要配置了 SubnetAddCommand，后续每次租约事件都会触发执行。
+
+**防御有效性验证：**
+- 第 54-62 行仅做 `json.Unmarshal` 到 string 字段——这是类型反序列化，不是任何形式的安全过滤。
+- 全文搜索：无白名单校验、无字符过滤、无路径限制、无 capability 降权、无非 root 用户切换。第 78-84 行 `runCmd` 使用 `exec.Command("sh", "-c", ...)` 且 `cmd.Env = append(os.Environ(), env...)` 继承完整进程环境（含可能的凭据类环境变量），进一步放大影响。
+- 结论：source→sink 之间**不存在任何有效防御**，属于设计上“有意允许”但构成 CWE-78 的特性型漏洞——配置注入即 root RCE。
+
+### 5. `runCmd()`（第 77-107 行）
+- Sink 本体：第 78 行 `exec.Command(name, arg...)`；调用方固定传 `"sh", "-c", <用户串>`。
+- stdin 通过管道写入（第 85-97 行），CombinedOutput 捕获输出（第 103 行）。输出经 `json.Marshal` 后写入 lease 的 BackendData（第 68-71 行），会广播到集群所有节点的 etcd 租约数据中——意味着 preStartupCommand 的 stdout 会进入集群共享存储，若命令输出含敏感信息则造成信息泄露（次要问题）。
+- 环境变量注入面：postStartupCommand 调用处（第 89-93 行）将 `lease.Subnet`、`config.Network`、`PublicIP` 等拼入 env。这些值本身来自 IP 分配器，格式受控，主要风险仍是命令字符串本身可控。
+
+## 二、逐条 source→sink 数据流汇总
+
+| # | Source | Sink | 防御 | 判定 |
+|---|--------|------|------|------|
+| 1 | 第 55-61 行 config.Backend → PreStartupCommand | 第 64 行 `sh -c` | 无 | 可利用 |
+| 2 | 同上 → PostStartupCommand | 第 88-94 行 `sh -c` | 无 | 可利用 |
+| 3 | 同上 → SubnetAddCommand/SubnetRemoveCommand（第 99-100 行存储） | 子网事件回调中 `sh -c`（同包其他文件） | 无 | 可利用 |
+| 4 | lease.Subnet/PublicIP 等 → env 注入 | runCmd env | 值由分配器生成，格式受限 | 低风险 |
+
+## 三、结论
+
+这是 flannel extension 后端的固有设计：它存在的目的就是让管理员执行自定义 shell 命令。但从 CWE 视角，任何能修改 flannel 网络 配置的主体（RBAC 通常远宽于 node-admin）即可获得宿主机 root 命令执行，且无确认机制、无沙箱、无审计隔离，属于真实的特权边界突破（CWE-78，OS Command Injection via configuration；亦可视作 CWE-250/CWE-269 特权执行问题）。风险评级：高（前提是攻击者已有配置写权限，故非匿名可利用，评 High 而非 Critical）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-78 (OS Command Injection via backend configuration)",
+  "risk_level": "High",
+  "source": "line 55: json.Unmarshal(config.Backend) 解析出 PreStartupCommand/PostStartupCommand/SubnetAddCommand/SubnetRemoveCommand, 来源为 etcd 或 K8s ConfigMap 中的 flannel 网络配置",
+  "sink": "line 64 与 line 88-94: runCmd(..., 'sh', '-c', n.preStartupCommand / n.postStartupCommand), 以及 line 99-100 存储的 SubnetAddCommand 在子网事件回调中以同样方式执行",
+  "explanation": "攻击者只需拥有修改 flannel 网络配置的权限(如编辑 kube-flannel-cfg ConfigMap 或写 etcd 配置键), 即可将任意 shell 命令注入 Backend JSON 字段; RegisterNetwork 在 line 64 和 line 88-94 直接将其传给 exec.Command('sh','-c',...) 执行, 而 flannel 以宿主机 root 权限运行, 因此配置写入即等于节点 root 远程命令执行; 全文无白名单、无转义、无降权等任何有效防御; line 78 cmd.Env 继承完整 os.Environ 进一步扩大影响; 另外替代通道 SubnetAddCommand/SubnetRemoveCommand 在租约事件时同样触发执行",
+  "fix_suggestion": "line 64/88: 不应直接以 sh -c 执行配置字符串; 应改为要求命令以绝对路径的可执行文件形式配置并通过 exec.Command 直接调用(不经 shell), 对参数做严格白名单校验, 并在文档与 RBAC 层面明确只有集群管理员可修改 flannel 配置; 同时避免通过 os.Environ 泄漏敏感环境变量给子进程"
+}
+```

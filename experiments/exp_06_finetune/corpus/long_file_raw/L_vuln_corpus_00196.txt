@@ -1,0 +1,31 @@
+# 编号分析
+
+**入口点枚举（全文）**
+
+1. **第 41–56 行 `ProcessMergeDriver.merge`**：source 为参数 `ancestor/ours/theirs/path/marker_size`，以及构造函数传入的 `self.command`。
+2. **第 128–139 行 `register_driver` / 第 141–150 行 `register_factory`**：程序内注册 API，非外部输入直接入口。
+3. **第 152–172 行 `get_driver(name)`**：name 可来自外部（如 merge 配置中的 driver 名）。
+4. **第 174–196 行 `_create_from_config`**：source 为 git 配置文件中 `merge.<name>.driver` 的值——仓库内的 `.git/config` 或用户/系统配置，攻击者可通过恶意仓库或诱导配置注入命令字符串。
+5. **第 199–221 行 `get_merge_driver_registry`**：全局单例；注意若先以无 config 调用创建，后续传入的 config 会替换 `_config`（第 209 行），属配置污染通道。
+
+**数据流验证**
+
+- 流 A：配置文件 `merge.<name>.driver` 值（第 186 行）→ `ProcessMergeDriver(command)` → 第 96–103 行占位符替换 → **第 106 行 `subprocess.run(cmd, shell=True)`**。该命令字符串完全来自配置，无任何校验、白名单或转义。攻击者控制配置即可执行任意 shell 命令（如 `merge.foo.driver = "rm -rf ~; %O"`）。占位符替换不构成防御：`%O/%A/%B` 是临时目录路径（不可控），但 `%P` 替换的 `path` 若含 shell 元字符同样注入；更根本的是命令本身即任意代码。
+- 流 B：`path` 参数（第 44 行）→ 第 102 行 `cmd.replace("%P", path)` → 同一 sink。path 来自被合并文件名，可含 `; $(...)` 等，shell=True 下直接命令注入。
+- 流 C：`marker_size`（第 45 行）→ 第 101 行替换为数字，风险低，但类型未强制。
+- 黑名单/过滤检查：全文无任何输入过滤、引号转义或 `shlex.quote`，故不存在“看似有效”的伪防御需要绕过——是直接的缺失防护。
+- 第二通道确认：`get_driver` 从 config 惰性创建驱动（第 180–184 行），意味着任何读取仓库配置并触发合并的调用链都会到达 sink；与 git 自身行为一致（git 也从配置读 driver），但在 dulwich 作为库被嵌入应用时，恶意仓库配置即可驱动宿主任意命令执行。
+
+**结论**：存在 CWE-78（OS Command Injection）/ CWE-77，本质是配置驱动的任意命令执行 + `%P` 注入，风险高。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-78 (OS Command Injection) / CWE-77",
+  "risk_level": "high",
+  "source": "line 186: self._config.get(('merge', name), 'driver') 配置值, 以及 line 44: 外部传入的 path 参数",
+  "sink": "line 106: subprocess.run(cmd, shell=True)",
+  "explanation": "配置中的 merge.<name>.driver 字符串未经任何校验即作为 shell 命令在 line 106 以 shell=True 执行, 攻击者通过恶意仓库配置可实现任意命令执行; 另外 line 102 将 path 直接 replace 进命令, path 含分号或反引号等元字符时构成第二注入通道; 全文无 shlex.quote 或白名单等有效防御",
+  "fix_suggestion": "line 106: 避免 shell=True, 使用列表形式 subprocess.run(shlex.split(cmd)) 并对 %O/%A/%B/%L/%P 占位符值用 shlex.quote 转义; 同时建议仅信任显式注册的驱动或对配置来源(系统/全局 vs 仓库级)做信任分级"
+}
+```

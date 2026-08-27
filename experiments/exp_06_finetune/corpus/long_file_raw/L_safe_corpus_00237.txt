@@ -1,0 +1,19 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：
+   - `Metadata()`：无外部输入，redirectURL 来自集群内 Route 资源，namespace 来自 ServiceAccount 文件——均为受信来源。
+   - `getOAuthAuthorizationServer()` / `GetUserInfo(token)`：token 作为 HTTP Header 值传入 `request()`，Header 注入风险低（Go 的 http.NewRequest 会校验 header 值中的非法字符）。
+   - `Logout(token)`：token 来自调用方（HTTP 层的 OAuth cookie），是外部可控输入。
+   - `request(method, url, auth)`：将 url 拼接到固定前缀 `serverPrefix` 后发起请求。
+
+2. **source→sink 数据流验证**：
+   - 流 A：`Logout` 的参数 `token`（source：外部用户可控）→ 第 105 行附近 `fmt.Sprintf("apis/oauth.openshift.io/v1/oauthaccesstokens/%v", token)` → 未经任何编码/校验直接拼入请求路径 → `http.NewRequest` 发出（sink）。**无有效防御**：没有 `url.PathEscape`、没有字符白名单。
+   - 攻击者可将 cookie/token 设为含 `../` 的值，例如 `..%2Fapis%2Fapps%2Fv1%2Fnamespaces%2Fdefault%2Fdeployments%2Fmyapp` 或直接注入多级路径，使携带 Kiali ServiceAccount 高权限 BearerToken 的 DELETE 请求打到任意 Kubernetes API 路径，实现越权删除资源（SSRF/路径穿越式提权）。
+
+3. **第二入口与替代通道**：`GetUserInfo` 中 token 仅进 Header，Go 标准库会拒绝含 CRLF 的值，且不进入 URL，不可利用；`Metadata` 的输入均来自集群内部对象，攻击面有限。唯一可利用通道即 `Logout`。
+
+4. **结论**：存在漏洞——用户可控 token 未做 URL 编码即拼入带特权凭证的 API 请求路径，属于路径穿越导致的越权操作（对应 Kiali 历史 CVE 类问题）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "path_traversal_leading_to_unauthorized_api_request", "risk_level": "high", "source": "Logout 函数的外部可控参数 token（来自用户会话 cookie）", "sink": "request 函数中 fmt.Sprintf 拼接后经 http.NewRequest 发出的 DELETE 请求 URL", "explanation": "Logout 将未做 url.PathEscape 编码的 token 直接拼入 apis/oauth.openshift.io/v1/oauthaccesstokens/%v 路径，并附带 Kiali ServiceAccount 的高权限 BearerToken。攻击者可通过构造含 ../ 的 token 使该 DELETE 请求命中任意 Kubernetes API 端点，造成越权资源删除或对内网 API 的 SSRF。其余入口（GetUserInfo 的 token 仅用于 Header、Metadata 输入均来自集群内部对象）经验证不存在可利用数据流。", "fix_suggestion": "在拼接前使用 url.PathEscape(token) 对 token 进行路径转义，并增加字符白名单校验（仅允许合法 token 字符），拒绝包含斜杠、点号序列等路径控制字符的输入。"}
+```

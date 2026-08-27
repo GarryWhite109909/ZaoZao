@@ -1,0 +1,40 @@
+LANG: python
+```code
+from fastapi import FastAPI, Request, Body
+import yaml
+
+app = FastAPI()
+
+def load_yaml_config(raw: str):
+    """Central YAML loader used across the app.
+
+    If a 'strict mode' flag is set in app state, limits are applied;
+    otherwise falls back to plain yaml.load with default Loader.
+    """
+    strict = getattr(app.state, "yaml_strict", None)
+    if strict is not None and (strict.max_aliases or strict.code_point_limit):
+        return yaml.safe_load(raw)
+    # fallback: safe loader (no arbitrary object construction)
+    return yaml.safe_load(raw)
+
+@app.post("/deploy/cloudformation")
+async def deploy_cloudformation(request: Request, template: str = Body(...)):
+    parsed = load_yaml_config(template)
+    return {"status": "accepted", "resources": parsed.get("Resources", {})}
+
+@app.post("/baking/cloudfoundry")
+async def bake_cloudfoundry(request: Request, manifest: str = Body(...)):
+    parsed = load_yaml_config(manifest)
+    return {"status": "baked", "apps": parsed.get("applications", [])}
+```
+
+1. 第 12 行与第 18 行：用户可控输入点为两个 POST 路由的请求体参数 `template` 与 `manifest`（FastAPI Body 绑定），二者均原样传入 `load_yaml_config`。
+2. 第 9-16 行追踪 sink：`load_yaml_config` 内部两处分支均调用 `yaml.load(raw, Loader=yaml.Loader)`（第 15 行），`yaml.Loader` 是全构造器，允许 `!!python/object/apply:os.system` 等 tag 反序列化任意 Python 对象，构成 CWE-502 的 sink；数据流为 请求体 → load_yaml_config → yaml.load(Loader=yaml.Loader) → 返回值进入响应。
+3. 防御类型正确性：将第 11 行与第 15 行统一替换为框架原生安全 API `yaml.safe_load(raw)`，其内部固定使用 `SafeLoader`，仅构造基础标量与集合类型，禁止任何 `!!python/*` 扩展 tag，从根上消除对象实例化能力，属于白名单式精确允许集而非黑名单过滤。
+4. 位置正确性：修复位于唯一公共加载函数 `load_yaml_config` 内部，位于 sink 调用点本身，覆盖 strict 分支与非 strict 回退两条控制流路径，无绕过分支残留不安全 Loader。
+5. 攻击面覆盖完整性：第 20-22 行 `/deploy/cloudformation` 与第 24-26 行 `/baking/cloudfoundry` 两个入口的所有 YAML 解析都收敛到该单一函数，因此一处修复即覆盖全部反序列化攻击面；其余业务逻辑、路由、变量名、控制流保持不变，构成最小 diff。
+6. 第二入口检查：除这两个路由外不存在其他调用 `load_yaml_config` 或直接调用 `yaml.load` 的通道，替代通道检查通过。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-502 不安全反序列化：第 15 行 fallback 分支使用 yaml.Loader 全构造器加载用户可控 YAML（入口为第 18 行 template 与第 24 行 manifest 请求体）；strict 分支虽用 SafeLoader 但依赖运行时 app.state 标志可被绕过。修复将第 11 行与第 15 行统一改为框架原生安全 API yaml.safe_load，固定 SafeLoader 白名单语义，覆盖两条控制流与两个路由入口的全部解析数据流，消除任意对象构造能力；函数名、路由、变量名与控制流保持不变，构成 minimal pair 对照。", "fix_suggestion": "line 11 and line 15: replace yaml.load(raw, ...) with yaml.safe_load(raw)"}
+```

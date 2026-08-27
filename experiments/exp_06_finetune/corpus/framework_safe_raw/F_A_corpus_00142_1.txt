@@ -1,0 +1,68 @@
+LANG: java
+```java
+package com.example.invoice;
+
+import java.io.StringReader;
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.springframework.web.bind.annotation.*;
+import org.w3c.dom.Document;
+import org.xml.sax.InputSource;
+
+@RestController
+@RequestMapping("/api/invoices")
+public class InvoiceValidationController {
+
+    // POST /api/invoices/validate  body: raw XML invoice (UBL/Peppol style)
+    @PostMapping(value = "/validate", consumes = "application/xml")
+    public String validateInvoice(@RequestBody String invoiceXml,
+                                  @RequestParam(required = false) boolean includeWarnings) {
+        try {
+            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+            // XXE hardening: disable DTDs entirely, disable external entities, enable secure processing
+            dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
+            dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+            dbf.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+            dbf.setXIncludeAware(false);
+            dbf.setExpandEntityReferences(false);
+            dbf.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
+            dbf.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
+            dbf.setAttribute(XMLConstants.ACCESS_EXTERNAL_STYLESHEET, "");
+            dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            DocumentBuilder builder = dbf.newDocumentBuilder();
+            Document doc = builder.parse(new InputSource(new StringReader(invoiceXml)));
+
+            String buyerName = doc.getElementsByTagName("BuyerReference")
+                                 .item(0).getTextContent();
+            String total = doc.getElementsByTagName("TaxInclusiveAmount")
+                              .item(0).getTextContent();
+
+            if (!includeWarnings && buyerName.startsWith("WARN")) {
+                return "{"status":"skipped"}";
+            }
+            return "{"status":"valid","buyer":"" + buyerName + "","total":"" + total + ""}";
+        } catch (Exception e) {
+            return "{"status":"error","message":"" + e.getMessage() + ""}";
+        }
+    }
+
+    // Second entry point: same sink via file upload route
+    @PostMapping("/upload")
+    public String uploadInvoice(@RequestBody byte[] rawBytes) throws Exception {
+        return validateInvoice(new String(rawBytes), false);
+    }
+}
+```
+
+1. 第 18-19 行：用户可控输入点为 `@RequestBody String invoiceXml`（POST /api/invoices/validate 的原始 XML 报文），以及第 51 行 `@RequestBody byte[] rawBytes`（/upload 上传通道，最终汇入同一方法）。
+2. 第 22-23 行：原代码 `DocumentBuilderFactory.newInstance()` 后未做任何 DTD/外部实体限制即调用 `newDocumentBuilder()`，随后第 26 行 `builder.parse(...)` 是 XXE sink——攻击者可通过 DOCTYPE 声明注入外部实体读取本地文件或发起 SSRF。
+3. 第 24-34 行：插入框架原生安全 API 防御——`setFeature(FEATURE_SECURE_PROCESSING)`、`disallow-doctype-decl=true` 从根上拒绝 DTD 声明；同时关闭 external-general/parameter-entities、load-external-dtd、XInclude 与 expandEntityReferences，并将 ACCESS_EXTERNAL_DTD/SCHEMA/STYLESHEET 属性置空字符串形成白名单式精确允许集（仅允许内部实体）。防御位置正确：全部作用于 factory，在 `newDocumentBuilder()` 之前生效，覆盖 parse 的所有实体解析路径。
+4. 类型正确性：所有 setFeature/setAttribute 调用均为 DocumentBuilderFactory 的标准 JAXP API，参数为常量字符串与 boolean，无类型风险；业务逻辑（BuyerReference/TaxInclusiveAmount 提取、返回 JSON）与控制流完全未改动。
+5. 攻击面覆盖完整性：DOCTYPE 禁用使外部实体声明语法层面不可达；即使实现忽略该 feature，external-entity 双关闭加 ACCESS_EXTERNAL_* 空白名单仍阻断文件/网络解析；FEATURE_SECURE_PROCESSING 兜底限制扩展。三层互为冗余。
+6. 第二入口检查：第 50-52 行 `/upload` 路由将 rawBytes 转为字符串后直接复用已加固的 validateInvoice 方法，数据流汇入同一受保护 sink，无需额外修复；两条通道均安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-611 XXE：validateInvoice 中 DocumentBuilderFactory 未禁用 DTD 与外部实体即 parse 用户提交的 XML；修复通过 setFeature(disallow-doctype-decl)、关闭 external-general/parameter-entities 与 load-external-dtd、setExpandEntityReferences(false)、ACCESS_EXTERNAL_DTD/SCHEMA/STYLESHEET 置空白名单及 FEATURE_SECURE_PROCESSING 实现有效防御；第二入口 /upload 复用同一加固后的方法，数据流同样被覆盖", "fix_suggestion": "line 24: 在 newDocumentBuilder() 前对 DocumentBuilderFactory 启用 disallow-doctype-decl、关闭外部实体特性并启用 FEATURE_SECURE_PROCESSING"}
+```

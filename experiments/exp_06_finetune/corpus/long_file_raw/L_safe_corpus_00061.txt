@@ -1,0 +1,24 @@
+## 编号分析
+
+**入口点枚举（全文）**
+- 第 18–22 行：`FsRecursiveMove`，POST body 参数 `src_dir`、`dst_dir`、`conflict_policy`。
+- 第 100 行附近：`FsBatchRename`，参数 `src_dir`、`rename_objects[]`（`src_name`/`new_name`）。
+- 第 150 行附近：`FsRegexRename`，参数 `src_dir`、`src_name_regex`、`new_name_regex`。
+
+**数据流与防御验证**
+
+1. `FsRecursiveMove`：source 为 JSON body，经 `user.JoinPath` 归一化（第 26、41 行），并做 `CanWrite(srcMeta/dstMeta)` 检查（第 34、47 行）。sink 为 `fs.Move`（第 121 行）。但注意函数注释明确写着“individual item permission checks skipped for performance”：递归遍历子目录时（第 78–85 行）仅调用 `fs.List`，不再对每个子目录执行 `GetNearestMeta` + `CanWrite`。若 src 子树中存在嵌套 meta（如设置了写保护或隐藏的子目录），其内容仍会被整体搬移到 dst——绕过基于 meta 的细粒度权限控制。这是真实的越权（授权绕过）问题，且注释自证是有意为之的性能取舍。
+
+2. 冲突策略逻辑缺陷：第 90–99 行，仅当文件名命中 `existingFileNames` 时才处理 CANCEL/SKIP；若 `ConflictPolicy` 传入非法值（非 OVERWRITE/CANCEL/SKIP），行为等同 OVERWRITE，静默覆盖目标同名文件，违背最小惊讶原则，可被低权限用户利用造成数据覆盖。
+
+3. `FsBatchRename`：`JoinPath` + `CanWrite` 后，对每个 `SrcName` 与 `NewName` 均调用 `checkRelativePath`（第 128–135 行），阻止 `..` 等路径穿越，防御有效。sink `fs.Rename` 的两个路径成分均受控。未发现有效绕过。
+
+4. `FsRegexRename`：`src_name_regex` 经 `regexp.Compile`（Go RE2，线性时间，无经典 ReDoS 回溯风险）；新名字来自 `ReplaceAllString` 结果并通过 `checkRelativePath` 校验（第 185 行附近），穿越被拦截。旧文件名来自服务端列表，不可控。无有效漏洞。唯一小问题是用户可控正则编译可能消耗内存，属低危 DoS 面。
+
+5. 第二入口/替代通道：三个 handler 权限门为 `CanMove`/`CanRename` + `CanWrite`，均从 context 取 user，无匿名旁路；meta 写检查在根目录层面存在，缺陷仅在递归场景下不逐项复查（见第 1 点）。
+
+**结论**：核心问题是第 1 点的授权绕过（嵌套 meta 权限被跳过），叠加第 2 点的默认覆盖语义。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "authorization_bypass / broken access control", "risk_level": "medium", "source": "HTTP POST body 参数 src_dir 与 dst_dir（FsRecursiveMove）", "sink": "fs.Move 递归搬移子树内容", "explanation": "FsRecursiveMove 仅在源目录和目标目录根部做 GetNearestMeta+CanWrite 检查，递归遍历子目录时不复查各子目录自身的 meta 写权限或隐藏规则（代码注释自述 skipped for performance），持有移动权限的用户可将受 meta 保护（如写保护）的子目录内容整体搬出，构成细粒度权限绕过。另外当 conflict_policy 传入非法值时既非 CANCEL 也非 SKIP，冲突文件会被静默覆盖，等效于 OVERWRITE。FsBatchRename 与 FsRegexRename 因对 SrcName/NewName 均执行了 checkRelativePath，未发现路径穿越或越权。", "fix_suggestion": "在递归遍历每个子目录时同样调用 GetNearestMeta 并校验 CanWrite（可缓存已校验路径以降低开销）；对 ConflictPolicy 做白名单校验，非法值直接返回 400 而不是回退到覆盖行为。"}
+```

@@ -1,0 +1,34 @@
+## 编号分析（全文通读）
+
+1. **入口点枚举**：
+   - `readResults`（第 88 行附近）：接收 `directory` 参数，由 Allure 命令行/框架调用，指向用户提供的 results 目录。
+   - `listResults`（第 253 行附近）：用 glob `*.xml` 枚举目录下所有文件——**任何**放入该目录的 XML 都会被解析，这是不受信任的第二入口。
+   - 无 HTTP 路由/环境变量回调；所有数据均来自磁盘上的结果文件。
+
+2. **数据流 1：XML 文件 → DocumentBuilder.parse（XXE）**
+   - source：第 90 行 `listResults(directory)` 返回的攻击者可控 XML 文件。
+   - 第 106-108 行：`DocumentBuilderFactory.newInstance()` 后直接 `factory.newDocumentBuilder()`，**未调用** `setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)`、未设置 `XMLConstants.ACCESS_EXTERNAL_DTD/SCHEMA`、未启用 `FEATURE_SECURE_PROCESSING`。
+   - sink：第 109 行 `builder.parse(parsedFile.toFile())`。
+   - 防御验证：全文无任何 DTD/外部实体过滤，无白名单。默认 JDK 配置允许外部实体解析（JAXP 默认不禁用 doctype）。→ **CWE-611 XXE 成立**：可读取本地文件（经 system-out/failure 等元素回显到报告中）、SSRF、潜在 DoS（billion laughs）。
+
+3. **数据流 2：className 属性 → getLogFile 路径拼接（路径穿越）**
+   - source：第 137 行 `testCaseElement.getAttribute(CLASS_NAME_ATTRIBUTE_NAME)`，完全由 XML 内容控制。
+   - 第 176-183 行 `getLogFile`：`resultsDirectory.resolve(className + ".txt")`。`resolve` 接受绝对路径或 `..` 序列时会**替换/逃逸**出 resultsDirectory；仅捕获 `InvalidPathException`（Windows 非法字符），对 `../../secret.txt` 或 `/etc/passwd.txt` 这类合法但恶意的路径无效。
+   - sink：第 146 行 `visitor.visitAttachmentFile(...)` 会读取该文件并作为附件嵌入报告。
+   - 黑名单式防御（仅异常捕获）按规则视为无效。→ **CWE-22 路径穿越成立**（前提是报告生成可被第三方投喂结果文件，如 CI 上传场景）。
+
+4. **其余函数核查**：`parseTestSuite`/`createStatuslessTestResult`/`setStatusDetails`/`setParameters` 仅将字符串存入实体并最终以 HTML 转义方式渲染于前端模板（Allure 报告端处理），本插件内无命令执行、反序列化或 SQL sink；`getTime` 的解析有 try/catch 兜底，无安全问题。
+
+5. **结论**：存在两个真实漏洞，主报 XXE（CWE-611），次报路径穿越（CWE-22）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-611 XXE (Improper Restriction of XML External Entity Reference); 次要: CWE-22 Path Traversal",
+  "risk_level": "high",
+  "source": "line 90: listResults(directory) 枚举的攻击者可控 *.xml 结果文件",
+  "sink": "line 109: builder.parse(parsedFile.toFile()) 未禁用 DTD 与外部实体; 次要 sink: line 146 visitor.visitAttachmentFile(getLogFile 用 line 180 resultsDirectory.resolve(className + .txt) 拼接)",
+  "explanation": "readResults -> listResults 收集任意 xml -> parseRootElement 中 DocumentBuilderFactory.newInstance() 后未设置 disallow-doctype-decl 或 ACCESS_EXTERNAL_* 特性即 builder.parse 解析, 外部实体可被展开并通过 system-out/statusTrace 回显到报告, 造成本地文件读取/SSRF/DoS; 另一通道: testcase 的 classname 属性经 getLogFile 直接 resolve, ../ 或绝对路径可逃逸 resultsDirectory, visitAttachmentFile 将任意 .txt 文件读入报告",
+  "fix_suggestion": "line 107: 在 newDocumentBuilder 前设置 factory.setFeature(http://apache.org/xml/features/disallow-doctype-decl, true) 并 setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD/ACCESS_EXTERNAL_SCHEMA, 空串), 启用 FEATURE_SECURE_PROCESSING; 同时在 getLogFile 中对 resolve 结果做 normalize 后 startsWith(resultsDirectory.normalize()) 校验, 拒绝越界路径"
+}
+```

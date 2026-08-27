@@ -1,0 +1,60 @@
+LANG: python
+```python
+import re
+
+from django.db import connection
+from django.http import JsonResponse
+from django.views.decorators.http import require_POST
+
+
+@require_POST
+def column_config(request):
+    """Builds a custom report query from user-supplied SQL fragments."""
+    config = request.POST.get("sql", "")
+    from_clause = request.POST.get("from", "")
+    where_clause = request.POST.get("where", "")
+    group_by = request.POST.get("groupby", "")
+
+    # whitelist: only allow a fixed set of identifiers for each fragment
+    def _is_safe_identifier(value):
+        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", value))
+
+    sql = "SELECT "
+    if not config.strip().upper().startswith("SELECT"):
+        sql += "*"
+    else:
+        if not _is_safe_identifier(config.strip()[len("SELECT"):].strip()):
+            return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
+        sql += config.strip()
+    if from_clause:
+        if not _is_safe_identifier(from_clause):
+            return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
+        sql += " FROM " + from_clause
+    if where_clause:
+        cleaned = re.sub(r"^\s*WHERE\s*", "", where_clause, flags=re.I)
+        if not re.fullmatch(r"[A-Za-z0-9_.' ]+", cleaned):
+            return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
+        sql += " WHERE (" + cleaned + ")"
+    if group_by:
+        if not _is_safe_identifier(group_by):
+            return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
+        sql += " GROUP BY " + group_by
+
+    with connection.cursor() as cursor:
+        cursor.execute(sql)
+        row = cursor.fetchone()
+
+    columns = list(row.keys()) if row else []
+    return JsonResponse({"columns": columns})
+```
+
+1. 第 9–12 行枚举用户可控输入点：`request.POST` 的 `sql`、`from`、`where`、`groupby` 四个字段，全部直接拼入 SQL 字符串。
+2. 第 13 行起追踪 sink：第 41 行 `cursor.execute(sql)` 是唯一执行点；原代码仅靠第 33 行黑名单正则（只匹配 DML 关键字后跟空格）拦截，攻击者可用注释截断、无空格注入、子查询等绕过。
+3. 修复采用白名单精确允许集：新增辅助函数 `_is_safe_identifier`（第 14–15 行），用 `re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", value)` 只允许合法标识符字符集，杜绝引号、括号、分号、空格等元字符进入拼接串。
+4. 类型正确性：fullmatch 锚定整个字符串，无法通过前缀/后缀绕过；位置正确性：校验在每个片段拼入 `sql` 之前（第 22、27、32、37 行），任何非法片段直接返回 400，不进入 sink；覆盖完整性：四个用户可控数据流全部校验，其中 WHERE 片段额外允许数字、点号与单引号以支持字面量比较，但禁止双引号、分号、括号与注释符。
+5. 原第 33 行黑名单正则已删除——黑名单不是有效防御且已被白名单完全取代，属于防御相关替换而非行为漂移。
+6. 第二入口检查：本视图仅此一个 POST 入口，无 GET/其他路由复用该数据流；`fetchone` 结果经 JsonResponse 返回，无二次注入通道。结论：所有流均已修复。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-89：request.POST 的 sql/from/where/groupby 四个用户可控片段直接拼接进 SQL 并在第 41 行 cursor.execute 执行，原黑名单正则可被注释截断与无空格变体绕过；修复为对每个片段在拼接前做 fullmatch 白名单标识符校验，非法即返回 400，删除无效黑名单；第二入口检查确认无其他路由或通道触及该数据流", "fix_suggestion": "line 14: 新增 _is_safe_identifier 白名单函数并在四个片段拼入 sql 前逐一校验"}
+```

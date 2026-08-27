@@ -1,0 +1,67 @@
+# AcuityAds 适配器安全分析（逐函数、行号级）
+
+## 一、入口点枚举（全文通读结论）
+
+本文件是 prebid-server 的竞价适配器，共有以下入口点：
+
+1. **Builder（第 20-29 行）**：入口参数为 `config.Endpoint`（来自服务端配置文件，非用户可控），`config`/`server` 均为运维侧配置。此处 `template.Parse(config.Endpoint)` 若配置被污染可致模板注入，但 source 属于受信配置面，通常不视为外部攻击面。
+2. **MakeRequests（第 47-79 行）**：入口为 `openRTBRequest *openrtb2.BidRequest`——这是**完全由外部请求方（DSP 客户端）构造的 OpenRTB 请求体**，是本文件最核心的不可信输入源。
+3. **getImpressionExt（第 81-96 行）**：解析 `imp.Ext` → `bidderExt.Bidder`，即请求方在 `imp[].ext.bidder` 中提交的任意 JSON。
+4. **buildEndpointURL（第 98-102 行）**：将上一步得到的 `params.Host`、`params.AccountID` 注入 endpoint 模板并执行宏替换。
+5. **getHeaders（第 31-45 行）**：从 `request.Device.UA / IPv6 / IP` 取值写入出站 HTTP 头。
+6. **checkResponseStatusCodes（第 104-125 行）**：仅消费响应状态码，无外部输入进入敏感操作。
+7. **MakeBids（第 127-172 行）**：消费 bidder 返回体 `bidderRawResponse.Body`，经 `jsonutil.Unmarshal` 反序列化；后续 `getMediaTypeForImp`（第 174-188 行）仅做字符串匹配。
+
+## 二、source→sink 数据流逐一验证
+
+### 数据流 1：`imp.Ext.bidder.Host/AccountID` → 出站请求 URL（SSRF，核心问题）
+
+- **Source**：第 84-95 行。`jsonutil.Unmarshal(imp.Ext, &bidderExt)` 后再解 `bidderExt.Bidder` 到 `openrtb_ext.ExtAcuityAds`。该结构中的 `Host`、`AccountID` 字段完全由请求方控制，**没有任何白名单校验、格式校验或域名限制**（第 81-96 行全文可见，仅有两次反序列化错误处理）。
+- **传播**：第 62-65 行 `buildEndpointURL(acuityAdsExt)` → 第 99-101 行 `macros.EndpointTemplateParams{Host: params.Host, AccountID: params.AccountID}` → `macros.ResolveMacros(a.endpoint, ...)` 将其填入模板占位符（典型形如 `http://{{.Host}}/...?account={{.AccountID}}`）。
+- **Sink**：第 76 行 `Uri: url`，即适配器将向该 URL 发起真实的服务端 HTTP POST 请求（第 68-77 行的 `adapters.RequestData`）。
+- **防御有效性验证**：
+  - 第 84-89 行的错误分支只覆盖“JSON 解析失败”，不构成对 Host 内容的任何约束；
+  - 全文未出现对 `Host` 的域名白名单、协议校验、内网 IP 段过滤或字符集校验；
+  - `text/template` 的宏替换不做 URL 编码或转义，攻击者可将 `Host` 设为 `169.254.169.254`、内网地址、或含 `@`/`#` 的字符串篡改 URL 语义（凭据注入/路径穿越），甚至借助模板中 host 位于 authority 部分的特点直接指定任意目标主机与端口。
+- **结论**：这是教科书式的**服务端请求伪造（SSRF, CWE-918）**：外部请求参数 → 服务端出站 HTTP 请求目标，且黑盒无有效防御。prebid-server 中此类漏洞的标准修复是在 Builder 或 buildEndpointURL 处对 Host 做**白名单校验**（如 `openrtb_ext.BidderParamValidator` / `endpoint` 白名单机制），本文件缺失。
+
+### 数据流 2：`Device.UA/IP/IPv6` → 出站请求头（次要问题）
+
+- **Source**：第 33-43 行，`request.Device.UA`、`request.Device.IPv6`、`request.Device.IP` 均来自外部请求体。
+- **Sink**：第 38、41、43 行 `headers.Add("User-Agent"/"X-Forwarded-For", ...)`。
+- **防御验证**：仅做了 `len(...) > 0` 判空（第 37、40、42 行），无格式校验。Go 的 `http.Header.Add` 会拒绝含非法头字符的值（底层 `textproto` 校验），因此**头注入（CRLF）风险较低**；但 `X-Forwarded-For` 可被请求方伪造为任意值并透传给 bidder，属于信任边界上的 IP 欺骗辅助向量，风险低、且为 RTB 生态常见做法，不单独定级为主要漏洞。
+
+### 数据流 3：`config.Endpoint` → `template.Parse`（第 23-26 行）
+
+- Source 为服务器配置文件，非外部用户输入；若部署者使用受信配置则不可利用。但需注意：一旦 endpoint 模板本身允许通过管理接口修改，将与数据流 1 叠加放大 SSRF。当前文件范围内不构成独立漏洞。
+
+### 数据流 4：bidder 响应体 → `openrtb2.BidResponse`（第 143-149 行）
+
+- Source 是上游 bidder 的响应（半可信）。`jsonutil.Unmarshal` 使用安全的解码方式（防大数/防未知字段膨胀视库实现而定）；解析失败返回 `BadServerResponse`（第 145-148 行）。结果仅用于构造内部 bid 对象，未进入命令执行、文件系统或再次作为 URL 目标，**无 sink 到危险操作的数据流**。
+
+### 数据流 5：`getMediaTypeForImp`（第 174-188 行）
+
+- 仅做 `imp.ID == impId` 字符串比较并选择枚举值，无越界、无注入，安全。
+
+## 三、第二入口与替代通道检查
+
+- 除 `MakeRequests` 外，`MakeBids` 不产生新的出站请求，无第二 SSRF sink；
+- `Imp[0]`（第 58 行）只取第一个 impression，属逻辑缺陷而非安全问题；
+- 无环境变量、文件读取、回调注册等其他入口；
+- 替代通道确认：SSRF 只能经由 `ext.bidder.acuityads.host/accountID` 这一条路径触发，但该路径**每次竞价请求都可触发**，攻击成本低、可稳定探测内网与云元数据端点（169.254.169.254 等），故风险定为高。
+
+## 四、最终判定
+
+主要漏洞：**CWE-918 SSRF**——第 84-95 行的外部可控 `Host`（及 `AccountID`）未经白名单校验，经第 99-101 行宏替换后成为第 76 行出站请求的 `Uri`。次要注意点：X-Forwarded-For 可伪造（低危）、`Imp[0]` 索引在空 Imp 时会 panic（可用性小缺陷，非本判定主项）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-918",
+  "risk_level": "high",
+  "source": "line 84-95: getImpressionExt 解析外部请求 imp.Ext.bidder 中的 Host 与 AccountID 字段",
+  "sink": "line 76: MakeRequests 将 buildEndpointURL 生成的 url 直接作为出站 HTTP 请求的 Uri",
+  "explanation": "外部竞价请求方完全控制 ext.bidder.acuityads.host -> 经 macros.ResolveMacros(第99-101行) 填入 endpoint 模板 -> 成为服务端发起的真实出站请求目标(第76行)。全文对该 Host 无任何白名单、协议或内网地址校验, 攻击者可将请求导向内网服务或云元数据端点(如 169.254.169.254), 构成 SSRF; AccountID 同样未编码, 可通过特殊字符篡改 URL 路径或查询语义",
+  "fix_suggestion": "在 buildEndpointURL(第98-102行) 或 Builder(第20-29行) 中对 params.Host 执行严格域名白名单校验(仅允许 acuityads 官方域名), 对 AccountID 做 URL 编码与字符集白名单(字母数字), 并禁止解析结果指向私有/链路本地 IP 段"
+}
+```

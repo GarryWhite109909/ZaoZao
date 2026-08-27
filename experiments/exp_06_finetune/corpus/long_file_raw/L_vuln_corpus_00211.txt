@@ -1,0 +1,42 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：
+   - 第 88–92 行：`gpc_get_string('type_page')`、`gpc_get_string('search')`、`gpc_get_int('offset')`、`gpc_get_string('export')`、`gpc_get_bool('show_flag')` —— HTTP GET/POST 参数。
+   - 第 111 行：`gpc_get_int('page_number', 1)`。
+   - 隐式入口：当前用户的过滤器状态（`filter_get_bug_rows`，第 115 行）、数据库中的 bug/bugnote/附件数据（第 130 行起主循环）。
+
+2. **访问控制**：第 86–87 行 `auth_ensure_user_authenticated()` + `access_ensure_project_level(print_reports_threshold)`，认证与授权有效，非未授权访问问题。
+
+3. **`$f_export` / `$f_show_flag` 数据流**：第 128 行 `explode(',', $f_export)` 后仅用于 `in_array($t_id, ...)` 比较（第 143 行），不进入输出，无注入。
+
+4. **`$f_type_page`**：仅做等值比较决定 header 与分支（第 95–107 行），不拼接进输出，安全。
+
+5. **导出文件名**：第 97–99 行黑名单正则 `[\/:*?"<>|]` 剥离后传入 `http_content_disposition_header()`。按分析要求黑名单视为可绕过；但该函数内部通常再做编码，且文件名来自服务器配置而非用户输入，风险低。
+
+6. **bug 字段输出**：`string_display_line` / `string_display_links` / `get_enum_element` 均为框架转义函数，`$t_id` 为整数，基本安全（`string_display_links` 有意允许部分 HTML，属设计行为）。
+
+7. **附件区块（关键）**：第 415–437 行附近，`$c_filename`、`$c_download_url` 都经过 `string_display_line` / `htmlspecialchars` 转义；但最后图像预览分支：
+
+   ```php
+   echo '<br /><img src="', $c_download_url, '" alt="', $t_attachment['alt'], '" /><br />';
+   ```
+
+   `$t_attachment['alt']` 来自数据库（附件元数据，由上传者可控的文件名/描述派生），**未经任何转义直接拼入 HTML 属性**。攻击者上传 alt 含 `" onerror=alert(1) x=" 的图片附件，任何查看该导出页（word/html 模式下 html 分支才触发，需 `$f_type_page == 'html'`）的用户浏览器将执行脚本 → 存储型 XSS（CWE-79）。这是真实历史漏洞模式（MantisBT 曾修复过同类 alt 未转义问题）。
+
+8. **第二入口验证**：同一数据亦在 bug 视图页显示（那里已修复转义），但本文件的替代通道（打印导出页）遗漏了转义——正是典型的“第二入口遗漏”漏洞。
+
+9. **bugnote 区块**：`prepare_user_name` 输出用户名，框架内会转义；`string_display_links($t_bugnote->note)` 同上，属设计内富文本。
+
+10. **结论**：存在一处存储型 XSS，其余入口均有有效防御或不可控。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-79",
+  "risk_level": "中",
+  "source": "数据库附件元数据 $t_attachment['alt']（由上传者控制的文件名/描述派生），经 file_get_visible_attachments 返回",
+  "sink": "echo '<br /><img src=', $c_download_url, ' alt=', $t_attachment['alt'], ' /> —— alt 属性未转义直接拼入 HTML",
+  "explanation": "攻击者上传 alt 字段含双引号闭合与事件属性（如 onerror）的图片附件 -> 其他具有 print_reports_threshold 权限的用户以 type_page=html 访问本导出页时，未转义的 alt 被写入 img 标签 -> 浏览器执行注入的 JavaScript，形成存储型 XSS，可窃取会话 Cookie 或执行任意操作",
+  "fix_suggestion": "对该行改为 htmlspecialchars( $t_attachment['alt'], ENT_QUOTES ) 后再输出，或统一使用 string_attribute() 包裹所有动态 HTML 属性值"
+}
+```

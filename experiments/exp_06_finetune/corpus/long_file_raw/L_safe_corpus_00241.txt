@@ -1,0 +1,35 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `put`：PUT 请求，source 为 `req.URL.Path` 与 `req.Body`。
+2. `upload`：POST multipart，source 为 `req.URL.Path`、每个 part 的 `FileName()` 与内容。
+3. `bulkDownload`：GET 查询参数 `file[]`，source 为查询串。
+
+**逐条数据流验证**
+
+1. **put（第 22–27 行）**：`req.URL.Path` 经 `sanitizePath(fs.UploadFolder, ...)` 清洗后作为 `os.OpenFile` 的 sink。假设 `sanitizePath` 正确处理 `..`（项目核心函数），该流有效防御；另有 `.goshs` 覆盖黑名单（第 30 行）与 CSRF、ReadOnly、ACL、MaxBytesReader 防护。✅
+
+2. **upload 的目录部分（第 55–60 行）**：URL 路径经 `sanitizePath` 得到 `targetDir`，同上有效。✅
+
+3. **upload 的文件名部分（第 84–86 行）——存在缺陷**：
+   ```go
+   filenameSlice := strings.Split(part.FileName(), "/")
+   filenameClean := filenameSlice[len(filenameSlice)-1]
+   ```
+   - 仅按 `/` 分割取最后一段，**未过滤 `..` 本身、未处理反斜杠 `\`**。
+   - 若客户端发送 `FileName()` 为 `..`，则 `filepath.Join(targetDir, "..")` 解析为 `targetDir` 的父目录。随后 `tempPath = finalPath + "~"` 变成父目录下的 `~` 文件，`os.Create(tempPath)` 即在目标目录之外创建文件（第 92 行 sink），实现向上一级目录写入（配合多级 `..` 受限于 Join 清洗后仍可逃逸一级；在 Windows 上 `\..\\..\\evil.exe` 因 Join 将 `\` 视为分隔符，可实现任意路径写入）。
+   - 这是黑名单式/不完整清洗，按要求视为可绕过，不构成有效防御。
+
+4. **upload 其余防护**：`.goshs` 黑名单（第 89 行）、MaxBytesReader、临时文件+原子 rename 均正常，但无法弥补第 3 点。
+
+5. **bulkDownload（第 118–160 行）**：
+   - 每个 `file` 参数经 `sanitizePath(fs.Webroot, ...)`，失败则跳过；ACL 与 Block 名单检查在写响应头之前完成（第 130–140 行），逻辑正确。✅
+   - 第 172 行 `zippath := strings.ReplaceAll(filepath, fs.Webroot, "")` 后 `zippath[1:]`：若 walker 进入的路径不含 `Webroot` 前缀（如符号链接指向外部），`zippath` 可能为空或长度不足导致 panic / 泄露绝对路径结构；但文件本身已被 sanitizePath 约束在 webroot 内，属低危健壮性问题而非可利用漏洞。
+
+6. **第二入口/替代通道**：`put` 与 `upload` 是两条独立写通道，`put` 路径清洗完整，但 `upload` 的文件名清洗是薄弱的第二入口，攻击者可绕过 `put` 的限制改用 multipart 上传触发问题 3。
+
+**结论**：multipart 上传的文件名清洗不充分（未拒绝 `..`、未处理 `\`），构成路径遍历/越目录写入漏洞（CWE-22/CWE-23），中高危。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "path_traversal_via_unsanitized_multipart_filename", "risk_level": "high", "source": "multipart part FileName() header supplied by client in upload handler", "sink": "os.Create(tempPath) and os.Rename(tempPath, finalPath) built from filepath.Join(targetDir, filenameClean)", "explanation": "upload 处理器仅用 strings.Split(part.FileName(), '/') 取最后一段来清洗文件名，既没有拒绝 '..' 也没有处理反斜杠。当客户端把文件名设为 '..' 时，filepath.Join(targetDir, '..') 会解析到上传目录的父目录，随后 tempPath = finalPath + '~' 使 os.Create 在目标目录之外创建文件；在 Windows 平台上包含反斜杠的文件名经 filepath.Join 会被当作路径分隔符，可实现任意目录写入。这是黑名单式的不完整过滤，属于可绕过防御。其余入口（put 的 URL 路径、bulkDownload 的 file 参数）均经过 sanitizePath 且 ACL 检查顺序正确，未见同类问题；bulkDownload 中 zippath[1:] 在路径不含 Webroot 前缀时可能 panic，属低危健壮性问题。", "fix_suggestion": "对 part.FileName() 同时按 '/' 和 '\\' 分割并取最后一段，显式拒绝结果为 '.' 或 '..' 或为空的文件名，最好再用 filepath.Base 加白名单字符校验（如仅允许字母数字及有限符号），并校验最终 finalPath 的 Clean 结果仍以 targetDir 为前缀；同时修复 bulkDownload 中 zippath 切片前先判断 strings.HasPrefix(filepath, fs.Webroot)。"}
+```

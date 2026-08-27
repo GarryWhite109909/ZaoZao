@@ -1,0 +1,31 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. 第 41 行 `New`：配置来源（动态配置 Regex / Replacement / XForwardedPrefix），属受信运维输入，但与用户路径组合后产生风险。
+2. 第 76 行 `ServeHTTP`：唯一请求入口。source 为第 68–71 行的 `req.URL.RawPath` / `EscapedPath()`——完全由客户端控制的原始请求路径。
+3. 无其他文件/环境/回调通道。
+
+**数据流逐一验证**
+
+- **流 A（第 68→85 行）**：currentPath → `rt.regexp.ReplaceAllString(currentPath, rt.replacement)` 得到 newTarget。捕获组内容完全来自用户 URL，无任何字符白名单/编码校验。
+- **流 B（第 88 行）**：newTarget 为空时返回 500，仅是可用性检查，非安全防御。
+- **流 C（第 91–110 行，absoluteURLRedirect 分支）**：newTarget 经 `url.Parse` 后直接交给 `http.Redirect`。防御缺陷：`url.Parse` 只验证语法合法性，不阻止 userinfo 混淆。若 Replacement 形如 `https://trusted.example/$1`，攻击者请求 `//attacker.com@x/` 使捕获组为 `@attacker.com/...`，拼出 `https://trusted.example@attacker.com/...`，浏览器解析 host 为 attacker.com —— 开放重定向。第 103–107 行附加查询串不改变此结论。
+- **流 D（第 112–116 行 XForwardedPrefix）**：捕获组内容写入 Header。Go 的 `Header.Set` 会拒绝含 CR/LF 的值，故无 CRLF 注入；但注入的任意前缀可能误导下游基于该头的路由/鉴权逻辑（次要风险）。
+- **流 E（第 122–130 行）**：newTarget 直接赋给 `req.URL.RawPath` 并 `PathUnescape` 成 Path 转发下游。未过滤 `..` 或二次编码，配合宽松的正则（如 `/(.*)`）可让请求逃出预期前缀、命中内部其他路由（路径混淆/越权访问内部端点），且第 129 行 `req.RequestURI` 同步被污染。
+- **黑名单评估**：全文唯一的“过滤”是第 20 行 `replacementRegex` 去除 `$N`，仅作用于无正则时的静态模板，对上述流均无效；不存在有效白名单。
+
+**第二入口/替代通道**：`XForwardedPrefix` 头（流 D）与转发后的 `URL.Path/RawPath`（流 E）均为同一 source 的替代 sink。
+
+**结论**：主漏洞为流 C 的开放重定向（CWE-601），辅以流 E 的路径混淆（CWE-22 类）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-601 开放重定向（伴随 CWE-22 路径混淆）",
+  "risk_level": "中高",
+  "source": "line 68-71: 客户端完全可控的 req.URL.RawPath/EscapedPath 作为正则捕获组内容",
+  "sink": "line 109: http.Redirect(rw, req, newTargetURL.String(), ...) 以及 line 122-129 将未校验的 newTarget 写入 req.URL.RawPath/Path 转发下游",
+  "explanation": "第 85 行 ReplaceAllString 把用户可控路径捕获组拼入替换模板；当 Replacement 是绝对 URL 时第 96 行 url.Parse 仅做语法校验，无法阻止捕获组注入 @userinfo，例如模板 https://trusted.example/$1 配合请求 //evil.com@x/ 生成 https://trusted.example@evil.com/x/ 导致 302 重定向到攻击者域名 -> 开放重定向；非绝对 URL 分支中捕获组可含 .. 或双重编码序列，经第 124-127 行直接进入 RawPath/Path 未做规范化校验，可逃逸预期前缀访问内部路由",
+  "fix_suggestion": "在 line 96-109 对解析结果校验 Host/Scheme 必须等于 Replacement 模板自身的 Host/Scheme 且禁止携带 userinfo（parsed.User == nil），否则返回 500；在 line 122 前对 newTarget 做 path.Clean 并拒绝包含 .. 、%2e%2e 或控制字符的结果"
+}
+```

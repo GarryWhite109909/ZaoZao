@@ -1,0 +1,21 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：本文件共 5 个 HTTP 入口：`ServeGetPlaylists`（第 17 行）、`ServeGetPlaylist`（第 47 行）、`ServeCreateOrUpdatePlaylist`（第 68 行）、`ServeUpdatePlaylist`（第 110 行）、`ServeDeletePlaylist`（第 160 行）。所有入口均从 `r.Context()` 取 `params.Params` 与 `CtxUser`，即用户参数是唯一外部 source。
+
+2. **关键 sink：playlistIDDecode（第 185-189 行）**：`playlistIDDecode` 将用户传入的 `id`/`playlistId` 参数做 base64 URL 解码，**未做任何路径格式校验、无前缀白名单、无 `filepath.Clean`/`..` 检查**，直接返回字符串作为文件系统路径。
+
+3. **数据流 1 — ServeGetPlaylist（第 52-56 行）**：`params.GetFirstID("id","playlistId")` → `playlistIDDecode` → `c.playlistStore.Read(path)`。攻击者可构造含 `../` 的 base64 路径读取任意文件；虽然第 57 行有属主检查，但检查发生在 `Read` 之后，且错误信息 `"playlist with id %s not found"` 只回显编码 ID 不回显内容，任意读的直接泄露有限——但 Read 本身已是越权文件访问 sink。
+
+4. **数据流 2 — ServeUpdatePlaylist（第 113-152 行）**：解码路径 → `Read` → 属主检查（第 124 行）→ `Write(playlistPath, playlist)`（第 150 行）。若目标路径不存在或解析失败，`Read` 返回 err 直接退出（第 121 行），此路对不存在文件不可写。但对已存在且 `UserID==0` 的文件（如其他格式的既有文件被当作 playlist 读出、UserID 为零值），属主检查通过，随后写入攻击者控制的 Name/Comment/Items 内容 —— **任意文件覆盖写**。
+
+5. **数据流 3 — ServeDeletePlaylist（第 163-176 行）**：同样模式，`UserID==0` 的任意可读文件可通过属主检查后被 `Delete(playlistPath)` 删除 —— **任意文件删除**。
+
+6. **数据流 4 — ServeCreateOrUpdatePlaylist（第 70-105 行）**：第 73-78 行逻辑为 `err != nil && pl != nil` 时才采用旧 playlist，条件疑似写反（正常应为 `err == nil`）；当目标路径无法读出有效 UserID 时，`playlist.UserID` 为 0，第 83 行检查放行，第 100-102 行以攻击者解码出的任意 `playlistPath` 调用 `Write` —— **创建模式下可直接对任意路径写入 m3u 内容**，这是最强的一条利用链。
+
+7. **第二入口/替代通道核查**：`songIdToAdd`/`songId` 均经 `specidpaths.Locate/Lookup` 定位到库内真实路径（第 133、90 行），无注入；`playlistRender` 中查询均使用参数化 `Where("id=?")`（第 199、211 行），无 SQL 注入；输出经 XML 序列化，无 XSS 注入点。唯一未防御通道就是 base64 解码后的路径。
+
+8. **防御有效性评估**：全文对该路径 source→sink 链上没有任何校验（黑名单都没有），属主检查因 `UserID==0` 缺省放行而失效，故判定无效。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "path_traversal_arbitrary_file_write_delete", "risk_level": "high", "source": "HTTP 参数 id 或 playlistId 经 params.GetFirstID 获取", "sink": "playlistIDDecode 后未经校验的路径传入 c.playlistStore 的 Read、Write、Delete", "explanation": "playlistIDDecode 仅做 base64 解码，未校验路径是否位于播放列表目录或包含 .. 等穿越序列。在 ServeCreateOrUpdatePlaylist 中，若解码路径无法读出有效 UserID，属主检查因 UserID 为零值而放行，随后 Write 可向任意路径写入攻击者控制的内容；ServeUpdatePlaylist 与 ServeDeletePlaylist 对 UserID 为 0 的已有文件同样可越权覆盖或删除，构成认证后用户的任意文件写与删。", "fix_suggestion": "在 playlistIDDecode 之后对路径进行规范化并强制校验其必须位于 playlistStore 根目录之内且匹配合法文件名格式（如仅允许数字、连字符和 .m3u 后缀），拒绝任何包含路径分隔符或 .. 的输入；同时修复 ServeCreateOrUpdatePlaylist 中 err != nil && pl != nil 的反向条件判断。"}
+```

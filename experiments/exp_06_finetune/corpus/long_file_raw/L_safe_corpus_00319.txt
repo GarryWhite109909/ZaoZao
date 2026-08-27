@@ -1,0 +1,36 @@
+# 逐条分析
+
+**入口点枚举（全文）**
+
+1. `__init__`（第 100–140 行左右）：接收 `template`、`required_variables`、`variables` 参数。模板内容仅被 Jinja2 解析以提取变量名（`meta.find_undeclared_variables`，约第 122 行），不执行渲染。
+2. `run()`（约第 143–200 行）：三个入口参数——`template`（运行时可覆盖的 ChatMessage 列表）、`template_variables`（字典）、`**kwargs`（管道变量）。这是唯一的数据流汇聚点。
+3. `_validate_variables()`（约第 205 行）：仅做必需变量存在性检查，无安全作用。
+4. `to_dict()/from_dict()`（约第 210–245 行）：序列化/反序列化入口，`from_dict` 将字典还原为组件实例。
+
+**Source→Sink 数据流验证**
+
+- **流 1：`template_variables` / `kwargs` → `compiled_template.render(...)`（约第 178 行）**
+  - source：用户可控的变量值；sink：Jinja2 渲染。
+  - 防御：使用的是 `SandboxedEnvironment()`（第 118 行），限制属性访问、禁止危险 dunder 链和代码执行。渲染结果只写入 `ChatMessage.from_user/from_system` 的文本 content，不进入任何 eval/exec/os 调用。防御有效。
+
+- **流 2：运行时覆盖 `template`（`message.content` → `self._env.from_string(message.content)`，约第 177 行）**
+  - source：调用方可传入任意模板字符串；sink：编译并渲染。
+  - 分析：这属于设计内功能（文档明确支持动态模板）。即便模板本身含恶意 Jinja2 语法，SandboxedEnvironment 阻止 SSTI 升级为 RCE；最坏结果是提示词注入到下游 LLM——这是 LLM 应用的固有业务风险，不是本组件的代码漏洞。
+
+- **流 3：`from_dict` 反序列化（约第 240 行）**
+  - 仅构造 ChatMessage 对象与普通属性赋值，未调用 pickle/yaml.load 等危险反序列化，无 sink。
+
+- **流 4：`_validate_variables`（第 205 行）**
+  - 只影响可用性（缺变量报错），不构成安全边界，也未被当作安全过滤依赖。
+
+**第二入口与替代通道检查**
+
+- 无文件读写、无网络请求、无环境变量读取、无 subprocess/eval/exec/pickle 调用（全文核实）。
+- 无黑名单或正则过滤逻辑可被绕过。
+- 唯一理论风险：若上游把不可信数据直接作为 `template` 传入且下游 LLM 输出被执行，属架构层面提示注入，超出该组件责任范围，且 SandboxedEnvironment 已阻断代码执行路径。
+
+**结论**：全文未发现可利用的安全漏洞。Jinja2 沙箱 + 无其他危险 sink，防御有效。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文核查所有入口点：__init__ 的 template 仅用于 find_undeclared_variables 提取变量名不渲染；run() 中 template_variables 与 kwargs 合并后经 SandboxedEnvironment 渲染 message.content，沙箱阻止 SSTI 升级为代码执行，输出仅为 ChatMessage 文本；from_dict 反序列化无危险 sink；全文无 eval、exec、pickle、subprocess、文件或网络操作，也无依赖黑名单过滤。运行时覆盖 template 属文档声明的设计功能，残余风险仅为面向下游 LLM 的提示注入，属业务层面而非本组件代码漏洞。", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,70 @@
+LANG: java
+```code
+package com.example.fetch;
+
+import org.springframework.web.bind.annotation.*;
+import java.net.*;
+import java.io.*;
+
+@RestController
+@RequestMapping("/api/fetch")
+public class UrlFetchController {
+
+    // 防御：解析后基于 InetAddress 做白名单判断，覆盖 IPv4/IPv6/映射形式
+    private boolean isPrivateIp(InetAddress addr) {
+        if (addr == null) return true;
+        if (addr.isAnyLocalAddress() || addr.isLoopbackAddress()
+                || addr.isLinkLocalAddress() || addr.isSiteLocalAddress()
+                || addr.isMulticastAddress()) {
+            return true;
+        }
+        byte[] b = addr.getAddress();
+        // 覆盖 ::ffff:x.x.x.x 映射形式（InetAddress 解析后为 16 字节，前 12 字节为零）
+        if (b.length == 16) {
+            boolean mapped = true;
+            for (int i = 0; i < 12; i++) { if (b[i] != 0) { mapped = false; break; } }
+            if (mapped) {
+                int a = b[12] & 0xFF, c = b[13] & 0xFF;
+                return a == 10 || a == 127 || a == 0 || a >= 240
+                        || (a == 172 && c >= 16 && c <= 31)
+                        || (a == 192 && c == 168);
+            }
+        }
+        return false;
+    }
+
+    @GetMapping
+    public String fetch(@RequestParam("url") String urlStr) throws Exception {
+        URL url = new URL(urlStr);
+        // 防御：强制 DNS 解析到实际连接地址后再做白名单校验（防 DNS rebinding）
+        InetAddress[] addrs = InetAddress.getAllByName(url.getHost());
+        for (InetAddress addr : addrs) {
+            if (isPrivateIp(addr)) {
+                throw new IllegalArgumentException("blocked");
+            }
+        }
+        // sink：使用解析出的安全地址直连，避免二次解析被 rebind
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection(
+                new Proxy(Proxy.Type.HTTP, new InetSocketAddress(addrs[0], url.getPort() > 0 ? url.getPort() : 80)));
+        conn.setConnectTimeout(5000);
+        try (BufferedReader r = new BufferedReader(
+                new InputStreamReader(conn.getInputStream()))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line);
+            return sb.toString();
+        }
+    }
+}
+```
+
+1. 第 30 行 `@RequestParam("url") String urlStr` 是唯一用户可控输入点，经 Spring 参数绑定进入 `fetch` 方法。
+2. 第 32-33 行先构造 `URL`，随后第 34 行通过 `InetAddress.getAllByName` 强制完成 DNS 解析，得到真实连接地址集合——校验对象从字符串升级为类型安全的 `InetAddress`，十六进制映射形式 `::ffff:c0a8:1` 在此已被规范化，无法再以字符串形态绕过。
+3. 第 35-37 行对每个解析结果逐一执行 `isPrivateIp` 白名单式拒绝：利用 JDK 原生 API（`isLoopbackAddress`、`isSiteLocalAddress` 等）判定回环/链路本地/站点本地地址，并对 16 字节地址额外检查前 12 字节全零的 IPv4-mapped 形态（第 17-27 行），完整覆盖原漏洞的绕过面；任一地址命中即抛出异常阻断数据流。
+4. 第 40 行 sink 处通过显式 `Proxy` 携带已校验的 `addrs[0]` 直连，避免 `openConnection()` 内部二次 DNS 解析造成 DNS rebinding TOCTOU 窗口；控制流、变量名与原代码保持一致。
+5. 第二入口检查：类中仅 `/api/fetch` 一个路由、仅一个用户可控参数，无其他 controller 方法或替代通道可达该 sink。
+6. 结论：目标数据流已在解析后、连接前完成基于类型的白名单校验并消除重绑定窗口，无残余 SSRF 路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原 CWE-918 数据流为第 30 行请求参数 urlStr 经 new URL 后在第 40 行 openConnection 发起请求；修复后将校验对象改为 DNS 解析后的 InetAddress 并用 JDK 原生 isSiteLocalAddress 等方法加 IPv4-mapped 字节级判断做白名单拒绝，且在 sink 处以已校验地址直连防止 DNS rebinding 二次解析；第二入口检查确认该类仅有一个路由与一个可控参数，无替代通道。", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,31 @@
+## 编号分析
+
+1. **第 1–20 行（导入与类定义）**：导入 `jinja2.Template` 与 `meta`，未使用 `SandboxedEnvironment`，全文无任何沙箱配置——这是后续判断的关键证据。
+
+2. **第 96–140 行 `__init__`**：接受 `template`、`variables`、`required_variables`。第 110–117 行对初始模板用 `Template(message.content)` 和 `meta.find_undeclared_variables` 做变量推断，此处仅解析不渲染，无直接 sink。
+
+3. **第 143–190 行 `run()`（主入口点）**：
+   - 第 145–147 行：`template`、`template_variables` 均来自调用方参数，在 Pipeline 场景下可由外部输入（如 API 请求体）控制。
+   - 第 148 行：`template_variables_combined = {**kwargs, **template_variables}`，kwargs 同样是外部可控的运行时变量。
+   - 第 160 行：类型检查仅验证元素是否为 `ChatMessage` 实例，不检查消息内容。
+   - **第 165 行 sink**：`compiled_template = Template(message.content)` 使用非沙箱的默认 Jinja2 环境；**第 166 行** `rendered_content = compiled_template.render(template_variables_combined)` 执行渲染。若 `message.content` 可被攻击者注入（例如动态模板场景中模板本身来自用户输入），则构成服务端模板注入（SSTI）：`{{ ''.__class__.__mro__[1].__subclasses__() }}` 等载荷可在非沙箱环境中访问 Python 内部对象链，最终实现任意代码执行。即使模板静态、仅变量值可控，Jinja2 自动转义未开启也可能导致下游 LLM 提示注入，但核心风险是模板内容可控时的 RCE。
+
+4. **第 192–208 行 `_validate_variables`**：仅校验必需变量是否缺失，属功能逻辑，不构成安全防御，也与注入无关。
+
+5. **第 210–227 行 `to_dict` / 第 229–243 行 `from_dict`（第二入口点/替代通道）**：`from_dict` 直接从反序列化字典重建组件，`init_parameters['template']` 未做任何内容过滤即成为后续 `run()` 渲染的消息内容。若管道定义文件（YAML/JSON）来源不可信（Haystack 支持从文件加载管道），攻击者可通过该通道植入恶意模板，同样汇入第 166 行的 render sink。此通道无任何额外防御。
+
+6. **防御有效性核查**：全文不存在黑名单、正则过滤或转义处理；唯一的类型检查（第 160 行）只限制容器类型，不限制字符串内容；未使用 `jinja2.sandbox.SandboxedEnvironment` 或 `autoescape`。因此 source→sink 数据流完全无有效防御。
+
+结论：存在通过不可信模板内容触发的 Jinja2 服务端模板注入（SSTI），可达任意代码执行；次要通道为 `from_dict` 反序列化路径。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-1336 (Improper Neutralization of Special Elements Used in a Template Engine) / CWE-94",
+  "risk_level": "high",
+  "source": "line 145-148: run() 的 template 与 template_variables 参数（以及 line 233-235 from_dict 反序列化的 template 内容），均可由外部输入控制",
+  "sink": "line 165-166: Template(message.content).render(template_variables_combined)，使用非沙箱默认 Jinja2 环境",
+  "explanation": "外部可控的模板字符串 -> 第160行仅做 ChatMessage 类型检查不过滤内容 -> 第165行以非沙箱环境编译模板 -> 第166行渲染执行，攻击者可注入如 {{ ''.__class__.__mro__ }} 类载荷遍历对象图实现任意代码执行；第二入口为 from_dict 从不受信管道定义文件加载模板后汇入同一 sink，全程无黑名单、正则或沙箱等有效防御",
+  "fix_suggestion": "line 165: 将 Template(message.content) 替换为基于 jinja2.sandbox.SandboxedEnvironment 的沙箱化模板编译，并对模板来源做信任校验；对 from_dict 加载的模板内容同样强制走沙箱环境并限制可用过滤器与属性访问"
+}
+```

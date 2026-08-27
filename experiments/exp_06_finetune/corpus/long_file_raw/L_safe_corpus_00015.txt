@@ -1,0 +1,23 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `SetCookie`/`setCookie`（第 33–70 行）：source 为 `r.Host` 与配置值，sink 为 `http.SetCookie`；`domains.Matches` + 配置覆盖，无注入面。
+2. `Cookie(r)`（第 72–117 行）：source 为 `r.Cookies()`（攻击者完全可控的请求头），sink 为字符串拼接返回给上层 JWT 校验。
+3. `ClearCookie`（第 119–143 行）：回显 cookie 名到 Set-Cookie 头，Go 标准库会编码，无头注入。
+4. `SameSite`（第 149–166 行）：仅消费配置文件值，非外部输入。
+5. `splitCookie`（第 170–183 行）：内部函数，输入来自服务端生成的 val。
+
+**数据流验证：`Cookie()` 分片重组**
+- 第 82–84 行：匹配前缀 `cfg.Cfg.Cookie.Name_` 的任意请求 cookie 都会被当作分片处理——cookie 名与值均为攻击者可控 source。
+- 第 89–93 行：`numParts` 限制在 1–32，有效。
+- 第 99–101 行：只校验 `i > numParts`，**未校验 `i < 1`**。
+- 第 103 行：`cookieParts[i-1] = cookie.Value`——当攻击者发送形如 `Cookie: vouch_0of1=AAAA` 的请求时，`i=0` 通过全部检查，`cookieParts[-1]` 触发 Go 运行时 `panic: runtime error: index out of range [-1]`。
+- 该函数在认证主路径上被调用，panic 若未被 recover 将导致整个进程崩溃，构成**无需认证的远程拒绝服务**。黑名单式的前缀匹配无法防御，因为问题在于索引边界而非名称过滤。
+
+**第二通道核查**：`ClearCookie` 只做删除不取索引；`setCookie` 中 `splitCookie` 输入为服务端 JWT，长度受控且 RuneStart 回退有界（第 176–178 行），无死循环风险。
+
+**结论**：存在真实漏洞——`Cookie()` 第 103 行对分片序号缺少下界校验，攻击者可用单个恶意 cookie 请求使进程 panic 崩溃。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "remote denial of service (unauthenticated panic)", "risk_level": "high", "source": "attacker-controlled request cookie name in Cookie(), e.g. vouch_0of1", "sink": "cookieParts[i-1] assignment at line 103 with i=0 causing negative slice index panic", "explanation": "In func Cookie, the part index i parsed from the cookie suffix is only checked against i > numParts; a value of 0 passes all checks and causes cookieParts[-1], a runtime panic that crashes the process on any unauthenticated request.", "fix_suggestion": "Add a lower bound check such as if i < 1 { return error } before writing to cookieParts[i-1]"}
+```

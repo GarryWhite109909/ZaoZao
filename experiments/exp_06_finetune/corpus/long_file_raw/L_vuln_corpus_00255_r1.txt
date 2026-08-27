@@ -1,0 +1,42 @@
+## 编号分析（全文逐函数）
+
+**1. findByUid（约第 40–56 行）**
+- Source：参数 `$uid`，已声明为 `int`（strict_types 下无法传入字符串注入）。
+- Sink：`createNamedParameter($uid, ParameterType::INTEGER)` —— 参数化查询，防御有效。无漏洞。
+
+**2. findAll / findAllForListing（约第 63–105 行）**
+- Source：`SearchCriteria $criteria`（DTO，非原始请求输入）。
+- `applySearchCriteria` 中 searchTerm 经 `escapeLikeWildcards()` 转义 `%`/`_` 后再经 `createNamedParameter` 绑定；LIKE 通配符被正确转义，且仍是预编译参数，非黑名单式过滤。limit 走 `setMaxResults(int)`。无 SQL 注入。
+
+**3. existsByFormIdentifier / findUidByFormIdentifier（约第 112–145 行）**
+- 字符串参数均通过 `createNamedParameter` 绑定。无漏洞。
+
+**4. add()（约第 152–181 行）—— 关键问题点**
+- Source：`$persistenceIdentifier` 为外部可控字符串（在 FormEngine/FormModule 场景中通常来自请求的持久化标识符）。
+- Sink：第 158–165 行将其直接作为 DataHandler datamap 的**记录键**：
+  ```php
+  self::TABLE_NAME => [ $persistenceIdentifier => [...] ]
+  ```
+- 数据流验证：TYPO3 DataHandler 的约定是——键为 `NEW...` 前缀时执行 INSERT，键为**数字字符串（已有 uid）**时执行 **UPDATE**。此处代码未对 `$persistenceIdentifier` 做 `NEW` 前缀校验或整数化处理。若调用链上游将该值透传自用户请求（如保存表单时的 persistenceIdentifier 参数），攻击者可传入一个已存在记录的 uid 数字串，使本应“新建”的操作变成对任意 form_definition 记录的**越权覆盖更新**（label/identifier/configuration 全部被替换），绕过调用方预期的 create-only 语义。这是典型的 IDOR/未授权数据篡改模式（CWE-639 / CWE-284），依赖上层是否复检权限，而本仓库层未做任何防御。
+
+**5. addRaw()（约第 190–212 行）**
+- 使用 Doctrine `insert()` 的关联数组形式，值为数组时会按 DBAL 类型自动序列化，全部为绑定参数。无 SQL 注入；但同样不检查 identifier 冲突以外的授权（由调用方负责）。
+
+**6. remove() / update()（约第 219–265 行）**
+- `$uid` 为 int，DataHandler cmdmap/datamap 键为整数 uid，语义明确（update 本就是更新操作）。删除/更新的权限检查依赖 DataHandler 的 BE 用户 access 检查。本身无注入。
+
+**第二入口核查**：文件内无直接读取 `$_GET/$_POST/$_FILES/php://input` 的入口，所有 source 均为方法参数；真正的外部输入汇入点集中在 `add()` 的 `$persistenceIdentifier` 键位用法上。替代通道（Install Tool 的 addRaw）无用户直连输入。
+
+**结论**：唯一可成立的漏洞是 `add()` 中未校验的 `$persistenceIdentifier` 作为 DataHandler 记录键导致的插入/更新语义混淆与潜在越权写。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-639 (Authorization Bypass Through User-Controlled Key) / CWE-284",
+  "risk_level": "中高",
+  "source": "line 153: add(string $persistenceIdentifier, ...) 外部可控的持久化标识符参数",
+  "sink": "line 158-165: DataHandler datamap 中 self::TABLE_NAME => [ $persistenceIdentifier => [...] ] 后 process_datamap()",
+  "explanation": "$persistenceIdentifier 未做 NEW 前缀或格式校验即作为记录键传入 DataHandler -> 当其值为已存在记录的数字 uid 时, DataHandler 将 INSERT 语义变为对该记录的 UPDATE -> 攻击者可覆盖任意 form_definition 记录的 label/identifier/configuration, 造成越权数据篡改",
+  "fix_suggestion": "line 158: 在构造 datamap 前强制校验 $persistenceIdentifier 必须匹配 NEW 前缀(如 preg_match('/^NEW/')), 否则拒绝或重新生成内部标识符, 确保该方法只执行插入"
+}
+```

@@ -1,0 +1,71 @@
+# gorush router/http_server.go 全文安全分析
+
+## 一、文件结构总览
+
+本文件共包含 5 个函数，全部属于 HTTP 服务器生命周期管理：
+
+1. `RunHTTPServer`（第 17–79 行）— 服务器初始化与 TLS 配置
+2. `listenAndServe`（第 81–96 行）— 明文监听 + 优雅关闭
+3. `listenAndServeTLS`（第 98–113 行）— TLS 监听 + 优雅关闭
+4. `startServer`（第 115–122 行）— 分发到上述两个函数
+
+注意：路由注册逻辑在 `routerEngine(cfg, q)`（第 31 行调用），其实现位于同包其他文件（如 route.go），不在本次分析范围内。因此本文件的“入口点”是**配置驱动的服务器启动入口**，而非用户请求处理入口。
+
+## 二、逐函数分析
+
+### 函数 1：`RunHTTPServer`（第 17–79 行）
+
+**入口点枚举：**
+- 配置文件/环境变量：`cfg.Core.Enabled`（第 21 行）、`cfg.Core.Address` / `cfg.Core.Port`（第 30 行）、`cfg.Core.AutoTLS.Enabled`（第 38 行）、`cfg.Core.SSL`（第 40 行）、证书路径 `CertPath`/`KeyPath`（第 48 行）、base64 证书 `CertBase64`/`KeyBase64`（第 55–56 行）。这些全部来自管理员控制的配置，非外部用户输入。
+
+**数据流验证：**
+
+- **流 1：`cfg.Core.CertPath` → `tls.LoadX509KeyPair`（第 48–49 行）**
+  source 是配置项，sink 是本地证书加载。攻击者若能控制该路径可读取任意 PEM 文件并作为 TLS 证书返回——但前提是已能修改服务端配置文件，此时已是完全沦陷状态，不构成独立漏洞。防御上无过滤，但威胁模型内不算有效攻击面。
+
+- **流 2：`cfg.Core.CertBase64` / `cfg.Core.KeyBase64` → base64 解码 → `tls.X509KeyPair`（第 55–66 行）**
+  同样为管理员配置输入，解码失败有错误检查并返回（第 57、61 行），无注入或内存安全问题。
+
+- **流 3：`cfg.Core.Address + ":" + cfg.Core.Port` → `http.Server.Addr`（第 30 行）**
+  字符串拼接构造监听地址。若 Port 含非法字符，`ListenAndServe` 会报错返回，不会产生注入。配置来源可信。
+
+**关键发现 —— 弱 TLS 协议版本（第 41–43 行）：**
+```go
+config := &tls.Config{
+    MinVersion: tls.VersionTLS10,
+}
+```
+显式将最低 TLS 版本设为 **TLS 1.0**。TLS 1.0/1.1 已被 RFC 8996 正式废弃，存在 BEAST、降级攻击等已知弱点，且不符合 PCI-DSS 等合规要求。Go 标准库默认 MinVersion 为 TLS 1.2（新版本默认 1.2），此处是主动降级。这是本文件最实质的安全缺陷，对应 **CWE-327（使用已被攻破或有风险的加密算法/协议）** 或 CWE-757（算法选择降级）。风险等级：中低——需要启用 SSL 模式且攻击者处于中间人位置才能利用。
+
+### 函数 2：`listenAndServe`（第 81–96 行）
+
+两个 goroutine：
+- 第 84–89 行：等待 ctx 取消后按 `cfg.Core.ShutdownTimeout` 优雅关闭。timeout 来自配置；若配置为负值，`context.WithTimeout` 会立即过期导致强制关闭，属可用性小问题而非安全漏洞。
+- 第 90–94 行：`s.ListenAndServe()`，错误处理正确排除了 `http.ErrServerClosed`。
+
+无用户输入数据流，无 sink 风险。
+
+### 函数 3：`listenAndServeTLS`（第 98–113 行）
+
+结构与函数 2 对称：
+- 第 101–106 行：优雅关闭逻辑相同。
+- 第 107–111 行：`s.ListenAndServeTLS("", "")` — 空参数表示使用 `server.TLSConfig` 中已加载的证书（由 RunHTTPServer 第 67 行设置），逻辑一致，无问题。
+
+### 函数 4：`startServer`（第 115–122 行）
+
+仅依据 `s.TLSConfig == nil` 分发（第 117–121 行），纯控制流，无数据流风险。
+
+## 三、第二入口与替代通道核查
+
+- **替代通道 1：AutoTLS 路径（第 39 行）** — `autoTLSServer(cfg, q)` 在其他文件实现（基于 lego/acme），不走本文件 TLS 配置，不受 MinVersion 影响。
+- **替代通道 2：注入的 server 参数（第 26 行 `s ...*http.Server`）** — 若调用方传入自定义 server 且带自己的 TLSConfig，则绕过第 41 行弱配置；但传入方仍需经过 startServer 的分发，无新增风险。
+- **lambda 构建标签（第 1–2 行）** — `!lambda` 表示 lambda 部署下此文件被排除，替代实现在别处，不影响本文件结论。
+- **请求级入口**：本文件不含任何 handler，HTTP 请求入口在 `routerEngine` 引用的其他文件，超出本文证据范围，不作猜测。
+
+## 四、结论汇总
+
+通读全文后确认：本文件不存在可被远程未授权攻击者利用的经典注入类漏洞；唯一实质性问题是第 42 行显式允许 TLS 1.0 作为最低协议版本，属于密码学协议强度不足（CWE-327），利用条件为中间人攻击场景。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-327", "risk_level": "medium", "source": "line 40: cfg.Core.SSL 开启 HTTPS 后进入 TLS 配置分支", "sink": "line 42: tls.Config{MinVersion: tls.VersionTLS10} 应用于 server.TLSConfig 并经 line 108 ListenAndServeTLS 生效于所有 HTTPS 连接", "explanation": "line 41-43 显式将最低 TLS 版本设为 TLS 1.0，低于 Go 默认的 TLS 1.2；所有经由 line 40 SSL 分支建立的 HTTPS 连接均可被协商降级到已废弃的 TLS 1.0/1.1，使中间人攻击者可利用 BEAST 等已知攻击破坏机密性与完整性；其余数据流（line 48 CertPath、line 55-64 Base64 证书、line 30 Addr 拼接）均源自可信管理配置且有错误检查，不构成可利用漏洞", "fix_suggestion": "line 42: 将 MinVersion 改为 tls.VersionTLS12（建议直接采用 tls.VersionTLS13 或至少 1.2），删除对 TLS 1.0 的显式支持"}
+```

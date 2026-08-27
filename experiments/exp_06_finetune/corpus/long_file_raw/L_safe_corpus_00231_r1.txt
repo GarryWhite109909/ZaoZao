@@ -1,0 +1,42 @@
+## 编号分析（逐函数、行号锚定）
+
+**1. NewHandler / 全局（第 27–45 行）**
+- `jwtMaxAge = 10 * time.Minute`，HS256 签名密钥来自 `server.Config().Spec.Jwt.Key`。无硬编码密钥问题（密钥外部配置）。
+
+**2. IsLogin（第 47–70 行）**
+- 会话型登录检查：MFA 未批准返回 401（第 55–58 行），否则续期会话。会话通道的 MFA 防线有效。
+
+**3. Login（第 77–160 行）— 关键入口点**
+- Source：`ctx.ReadJSON(&loginCredential)`（第 80 行），含 `Username`、`Password`、`AuthMethod`。
+- 密码验证：LDAP 用户走 `ldapService.Login`（第 92–97 行），本地用户走 bcrypt 比对（第 99–103 行），失败统一报错，无明显用户枚举差异。
+- **漏洞点**：`profile.Mfa.Approved = false`（第 122 行），随后 `switch authMethod` 中当 `authMethod == "jwt"` 时（第 130–137 行），**未做任何 MFA/TOTP 校验就直接 `h.jwtSigner.Sign(profile)` 签发 JWT 并返回**。对比会话路径：default 分支存入 session 后由 `IsLogin` 的 `p.Mfa.Enable && !p.Mfa.Approved` 检查拦截；而 JWT 路径完全绕过了这层防线。攻击者只需知道用户名+密码（无需第二因子），即可拿到合法签名的 10 分钟 JWT，构成 **MFA 绕过 / 认证不完整（CWE-308/CWE-303）**。
+- 另外第 133–135 行签名出错时只设置 message 未 return，会继续执行到 `ctx.Values().Set("token", token)` 返回空 token——属次要缺陷。
+
+**4. saveLoginLog（第 162–175 行）**
+- `ctx.RemoteAddr()` 写入日志并查 IP 库，无注入 sink；goroutine 中使用 ctx 有轻微竞态风险但非安全漏洞。
+
+**5. aggregateResourcePermissions（第 177–216 行）**
+- 纯内部权限聚合，输入为已认证用户名，输出权限映射；逻辑正确。
+
+**6. Logout（第 218–233 行）**
+- 删除 session profile 并清理终端会话；JWT 路径下 logout 无法吊销已签发 token（10 分钟内仍有效），属于 JWT 无黑名单的常见弱点，风险低。
+
+**7. GetProfile（第 235–270 行）**
+- 从 session 取 profile 后回查数据库刷新；注意重建的 `UserProfile` 未携带 `Mfa` 字段（零值 Enable=false），写回 session 后会使 MFA 状态丢失——若配合流程可能弱化 MFA 门禁，但主判定依据仍是第 3 点。
+
+**8. ListUserNamespace（第 272–295 行）**
+- `u := session.Get("profile")` 后直接 `u.(UserProfile)`（第 283 行）无 ok 检查，未登录时 nil 断言导致 panic（DoS/500）。依赖路由前置中间件兜底，属健壮性问题。
+
+**9. GetClusterProfile（第 297–360 行）**
+- 同样存在裸断言 `u.(UserProfile)`（第 315 行）。管理员分支直接放行；非管理员按 label 过滤 ClusterRoleBinding，label 含用户名拼接但走 k8s API label selector，非注入 sink。namespace 参数仅用于 RoleBindings 列表查询，无越权写。
+
+**10. Install 路由注册（第 362–372 行）**
+- 入口点枚举：POST /sessions（Login）、DELETE /sessions、GET /sessions、GET /sessions/:cluster_name、GET /sessions/status、GET /sessions/:cluster_name/namespaces、PUT /sessions、PUT /sessions/password。所有入口均依赖全局中间件做会话/JWT 校验；JWT 校验通过即视为已认证——这正是第 3 点 MFA 绕过能成立的原因（第二入口替代通道：攻击者用同一凭据切换 AuthMethod=jwt 即可绕过会话通道的 MFA 检查）。
+
+## 结论
+
+核心数据流：`loginCredential.AuthMethod == "jwt"`（source，第 80 行请求体）→ 跳过 MFA 校验 → `h.jwtSigner.Sign(profile)`（sink，第 132 行）→ 返回可用的认证令牌。防御（IsLogin 的 MFA 检查）仅覆盖 session 通道，对 JWT 通道无效，构成真实可利用的 MFA 绕过。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "MFA绕过导致的认证不完整（CWE-308/CWE-303）", "risk_level": "high", "source": "POST /sessions 请求体中的 AuthMethod=jwt 字段（Login 函数 ctx.ReadJSON 处，约第 80 行）", "sink": "h.jwtSigner.Sign(profile) 签发并返回 JWT（约第 130-137 行），以及后续中间件对该 JWT 的信任", "explanation": "Login 构造 UserProfile 时将 Mfa.Approved 固定为 false 且从未校验 TOTP 第二因子。当请求携带 AuthMethod=jwt 时，代码在 switch 分支中直接调用 jwtSigner.Sign 签发合法 JWT 并返回给客户端，完全跳过了会话通道中由 IsLogin 实施的 Mfa.Enable && !Mfa.Approved 拦截（第 55-58 行）。攻击者仅需用户名和密码即可获得有效期为 10 分钟的签名令牌，形成完整的第二入口替代通道绕过 MFA。次要问题包括：签名失败后缺少 return 导致继续执行；ListUserNamespace 与 GetClusterProfile 中对 session 值的无保护类型断言可引发 panic；Logout 无法吊销已签发的 JWT。", "fix_suggestion": "在 jwt 分支签发令牌前强制执行 MFA 校验：若 u.Mfa.Enable 为真，要求请求提供 TOTP code 并验证通过后将 Approved 置 true 再签名，或拒绝为启用 MFA 的用户签发 JWT；同时修复签名失败分支缺失 return 的问题，并为所有 session 取值处增加安全的类型断言检查。"}
+```

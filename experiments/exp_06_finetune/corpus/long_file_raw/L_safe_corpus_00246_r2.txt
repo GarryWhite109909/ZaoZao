@@ -1,0 +1,54 @@
+# 逐行安全分析
+
+## 一、入口点枚举（全文通读）
+
+本文件为 YesWiki 的 Action 类 `EraseSpamedCommentsAction`，唯一入口是 `run()`（第 19 行）。入口点包括：
+
+1. **HTTP POST 参数**：`$_POST['clean']`（第 31、73 行）、`$_POST['suppr']`（第 79 行）——外部可控 source。
+2. **Action 内联参数**：`$this->arguments['max']`（第 34 行）、`$this->arguments['logpage']`（第 118 行）——由页面编辑者通过 `{{erasespamedcomments max=... logpage=...}}` 写入，属于半可信输入。
+3. **数据库读取**：`$wiki->LoadRecentComments()`（第 35 行）、`$wiki->LoadPage($page)`（第 82 行）——返回的 `tag`、`body`、`user`、`comment_on`、`time` 为第二入口（存储型数据）。
+
+## 二、权限门控验证
+
+第 23–29 行：`if (!$wiki->UserIsAdmin()) return alert...`。所有后续逻辑均在管理员校验之后执行，无任何绕过路径（run() 中没有提前 return 的分支跳过该检查）。因此整个文件的攻击面被限制为“已认证管理员”。
+
+## 三、逐条 source→sink 数据流
+
+**流 1：`$_POST['suppr']` → `$wiki->LoadPage($page)` → `delete($page)`（第 80–90 行）**
+- source：POST 数组元素，完全外部可控，可为任意字符串（含任意页面 tag）。
+- 防御：第 83–85 行检查 `$pageData['comment_on']` 非空——只有真实评论页才会被删除，防止了任意页面删除（这是对历史漏洞 CVE-2022-42893 类问题的修复注释，见第 81 行英文注释）。
+- 残余风险：管理员可删除任意评论页，但这是功能本身的设计意图；且需 admin 权限。**非漏洞**。
+
+**流 2：`$_POST['suppr'][$page]` → `echo 'Effacement de : ' . htmlspecialchars($page)`（第 86 行）**
+- 反射型 XSS sink（echo 到 HTML body）。防御：`htmlspecialchars($page)` 默认 ENT_QUOTES|ENT_HTML401 且 PHP 8.1+ 默认 UTF-8，双引号与单引号均被编码，上下文为 HTML 文本节点，**有效防御**。
+
+**流 3：`$_POST['suppr']` → `$deletedPages` → `LogAdministrativeAction(... $deletedPages ...)`（第 88、120–128 行）**
+- `$deletedPages` 由未过滤的 `$page` 拼接（第 88 行），写入日志页。日志页内容后续会经 wiki 渲染器输出。但：只有通过第 83–85 行 comment_on 校验的页面名才进入 `$deletedPages`，而能成为评论页的 tag 受 WikiName/页面命名约束（由 LoadPage 数据库记录保证）。即便假设有恶意 tag，触发前提仍是管理员本人提交表单——自我注入场景不构成实际漏洞。**低风险，可接受**。
+
+**流 4：`$this->arguments['logpage']` → `LogAdministrativeAction` 第 3 参（第 118、128 行）**
+- logpage 由嵌入该 action 的页面作者指定，仅影响日志写入目标页。页面作者通常需编辑权限才能放置 action，且写入的是日志而非代码执行点。无可利用的注入/执行 sink。**非漏洞**。
+
+**流 5：数据库回显（第二入口，存储型 XSS 检查）**
+- 第 44–45 行：`$day` 直接 echo，未经转义！source 是 `$comment['time']` 的日期部分（explode 后），来自数据库 `time` 字段，格式为系统生成的 `YYYY-MM-DD HH:MM:SS`，不可控。**理论风险极低**。
+- 第 48 行：`$erase_id` 由 `$day` 去掉 `-` 后拼入 HTML 属性 `id="..."` 与 onclick 字符串内。同样源自 time 字段，不可控。
+- 第 55 行：`htmlspecialchars($comment['tag'], ENT_QUOTES, YW_CHARSET)` —— 有效转义。
+- 第 56 行：`htmlspecialchars($comment['tag'], ENT_COMPAT, YW_CHARSET)` —— ENT_COMPAT 不转义单引号，但此处位于 HTML 文本节点（`<li>` 内容），单引号在文本节点中无害。**有效**。
+- 第 58 行：`htmlspecialchars(substr($comment['body'],0,25), ENT_COMPAT, YW_CHARSET)` —— 同上，文本节点上下文，有效。
+- 第 59 行：`'#' . $comment['tag']` 拼入 href 属性值，**未转义**！若 tag 含双引号可逃逸属性。但 tag 是数据库中已存在的页面名，YesWiki 页面命名正则限制了字符集（WikiName 格式），且创建含引号的 tag 需先绕过核心的命名校验。结合“仅管理员可见此列表”，实际可利用性趋近于零。属纵深防御缺失，非可直接利用漏洞。
+- 第 60 行：`$comment['comment_on']` 未转义直接 echo——同为受控页面名，同上分析。
+- 第 61 行：`$wiki->Format($comment['user'])` 经 wiki 格式化引擎处理，框架自身负责净化。
+
+**流 6：CSRF 检查**
+- 表单（第 42 行起）无 CSRF token；处理分支（第 73 行）也无来源校验。攻击者可诱导已登录管理员提交跨站表单批量删除评论页。但删除对象被第 83–85 行限定为评论页，危害有限；且 YesWiki 老版本 Action 普遍缺少 CSRF token（框架级问题）。属设计缺陷/低危。
+
+## 四、替代通道核查
+
+- 无文件操作、无命令执行（exec/system/shell_exec 缺失）、无 SQL 拼接（均走 LoadPage/LoadRecentComments 封装）、无反序列化、无文件上传、无 include 动态路径。全文 grep 级别核对完毕，不存在其他 sink。
+
+## 五、结论
+
+唯一真正外部可控的破坏性 sink（delete）已有 comment_on 白名单式校验；XSS 输出绝大多数经 htmlspecialchars 转义；剩余未转义点（time/comment_on/tag in href）依赖数据库侧命名约束 + admin-only 可见性，不构成可利用漏洞。CSRF 缺失为框架级已知低危问题。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文通读后确认：唯一的危险 sink 是 PageController delete(第89行)，其前有第83-85行的 comment_on 校验，仅允许删除真实评论页，阻断了任意页面删除；所有用户可控输出基本经 htmlspecialchars 转义(第55、56、58、86行)；未转义的 time/comment_on/tag-in-href(第44、48、59、60行)来源于数据库中受框架命名规则约束的页面名，且整段代码位于 UserIsAdmin 门控(第23行)之后，无法被普通用户触达；无 CSRF token 属框架级低危设计缺陷，删除范围受限故不构成可利用漏洞；全文无 SQL 拼接、命令执行、文件包含或反序列化等替代通道。", "fix_suggestion": "no fix needed"}
+```

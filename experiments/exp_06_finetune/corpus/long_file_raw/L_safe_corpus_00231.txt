@@ -1,0 +1,23 @@
+## 编号分析
+
+1. **第 60-90 行 `IsLogin`**：从 session 取 profile，若 `p.Mfa.Enable && !p.Mfa.Approved` 则 401。这是 MFA 中间态拦截点之一。
+
+2. **第 92-170 行 `Login`**：source 为 `ctx.ReadJSON(&loginCredential)`（用户名/密码）。密码校验后构造 `profile`，其中 `Mfa.Approved: false`（第 130 行附近）。随后按 `authMethod` 分支：
+   - **`jwt` 分支（第 145-152 行）**：直接 `h.jwtSigner.Sign(profile)` 并返回 token，**完全没有检查 `u.Mfa.Enable`**。即启用了 MFA 的用户，只要密码正确即可拿到有效 JWT，绕过 TOTP 二次验证。
+   - default 分支写入 session，`Approved=false`，由后续接口拦截——但见下条。
+
+3. **第 205-245 行 `GetProfile`**：从 session 取出 profile 后，用数据库用户重建 `UserProfile`，**新结构体未携带任何 Mfa 字段**（零值：Enable=false）。然后 `session.Set("profile", p)` 覆盖原 profile。攻击路径：用户正常登录（session 中 profile 为 Mfa.Enable=true, Approved=false）→ 在未完成 MFA 验证前调用 `GET /sessions`（GetProfile）→ session 中 profile 的 Mfa 字段被清零 → 所有依赖 `p.Mfa.Enable` 判断的中间件/接口视为无需 MFA。**完整的 MFA 绕过链，第二入口即替代通道。**
+
+4. **第 247-270 行 `ListUserNamespace`**：`u.(UserProfile)` 无 ok 检查，未登录时 panic（DoS），属健壮性问题而非注入漏洞。
+
+5. **第 272-345 行 `GetClusterProfile`**：`namespace` URL 参数仅用于 RoleBindings 查询的命名空间限定，label selector 由服务端拼接用户名，无越权读取；管理员直接放行是设计行为。
+
+6. **第 347-360 行 `Install`**：路由注册确认上述入口均可被外部访问（`GET /sessions`、`POST /sessions` 带 authMethod=jwt）。
+
+7. **`saveLoginLog`（第 172-188 行）**：IP 来自 RemoteAddr，仅落库，无 sink 风险。
+
+结论：存在认证绕过类漏洞（MFA 可被绕过），source 是登录凭据/session profile，sink 是 JWT 签发与会话 profile 写回。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "authentication_bypass_mfa_bypass", "risk_level": "high", "source": "POST /sessions 登录凭据与 session 中的 UserProfile", "sink": "jwtSigner.Sign 签发 token 以及 GetProfile 中 session.Set(profile) 写回会话", "explanation": "两处缺陷构成 MFA 绕过链：其一，Login 函数中 authMethod 为 jwt 的分支在签发 token 前未检查 u.Mfa.Enable，启用 MFA 的用户凭密码即可获得有效 JWT；其二，GetProfile 用数据库用户重建 UserProfile 时丢失了 Mfa 字段（零值 Enable=false），并覆盖写回 session，使处于待 MFA 验证状态的会话通过调用 GET /sessions 即可清除 MFA 要求，绕过 IsLogin 等处的二次验证拦截", "fix_suggestion": "在 Login 的 jwt 分支中当 u.Mfa.Enable 且未验证通过时拒绝签发 token；GetProfile 重建 profile 时保留原有 Mfa.Secret、Enable、Approved 字段；同时对 ListUserNamespace 等处的类型断言增加 ok 检查避免 panic"}
+```

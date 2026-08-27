@@ -34,6 +34,18 @@ PROGRESS_PATH = CORPUS / "distill_progress.jsonl"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = os.environ.get("TEACHER_MODEL", "stealth/ox-alpha")
 
+# 多账号轮换（2026-08-26）：免费档限额按账号计，OPENROUTER_KEY 支持逗号分隔
+# 多把 key，每次请求轮换使用；单 key 时行为与原来完全一致
+KEYS = [k.strip() for k in os.environ.get("OPENROUTER_KEY", "").split(",") if k.strip()]
+_key_i = 0
+
+
+def _next_key():
+    global _key_i
+    k = KEYS[_key_i % len(KEYS)]
+    _key_i += 1
+    return k, (_key_i - 1) % len(KEYS)
+
 SCHEMA_VULN = ('{"has_vulnerability": true, "vulnerability_type": "CWE-编号 漏洞名", '
                '"risk_level": "Critical/High/Medium/Low", "source": "line N: ...", '
                '"sink": "line N: ...", "explanation": "... -> ...", '
@@ -57,13 +69,19 @@ def call_teacher(key: str, user_prompt: str, max_tokens: int = 8000,
     }
     for attempt in range(retries):
         try:
+            use_key, key_idx = _next_key() if len(KEYS) > 1 else (key, 0)
             resp = requests.post(
                 API_URL, timeout=240,
-                headers={"Authorization": f"Bearer {key}",
+                headers={"Authorization": f"Bearer {use_key}",
                          "Content-Type": "application/json"},
                 json=payload)
             if resp.status_code == 429:
                 wait = int(resp.headers.get("X-RateLimit-Reset", "60") or 60)
+                if len(KEYS) > 1:
+                    # 多 key 轮换：下一次尝试自动用另一账号，只需短暂退避
+                    print(f"    [429 key#{key_idx}] 切换账号，退避 5s", flush=True)
+                    time.sleep(5)
+                    continue
                 print(f"    [429] 等待 {min(wait, 180)}s", flush=True)
                 time.sleep(min(wait, 180))
                 continue

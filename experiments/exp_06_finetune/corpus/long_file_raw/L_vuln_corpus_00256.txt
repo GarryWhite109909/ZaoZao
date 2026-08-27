@@ -1,0 +1,37 @@
+## 编号分析（全文通读）
+
+1. **第 22-30 行 getTemplate / mustGetTemplate**：模板名来自硬编码字符串常量，embed.FS 只读，无风险。
+
+2. **第 44-52 行 IngestRvtoolsQuery / IngestSqliteQuery**：`filePath` 参数直接放入 `ingestParams{FilePath: filePath}`，未做任何转义，注入模板。若模板中以字符串字面量形式拼接文件路径（典型写法 `read_xlsx('...')`），则构成 source→sink 注入路径。
+
+3. **第 66-90 行 VMQuery**：`filters.Cluster`、`filters.OS`、`filters.PowerState`、`filters.VmId` 原样赋给 params，无任何转义/参数化。对比之下 `VMListFilter` 在第 372-376 行做了单引号双写转义——说明作者知道需要转义，但 Cluster/OS/PowerState/VmId 被遗漏，属不一致防御，强烈暗示这些字段在模板中被直接拼入 SQL 字符串字面量 → SQL 注入（CWE-89）。
+
+4. **第 92-130 行 DatastoreQuery/NetworkQuery/HostQuery/OsQuery**：同样直接透传 `filters.Cluster`，无转义。
+
+5. **第 148-153 行 ClusterFeaturesQuery**：调用了 `escapeSQLString(clusterName)`，再次证明其他调用点缺少同等处理是缺陷而非设计。
+
+6. **第 155-460 行其余 Query 函数**：均透传 `filters.Cluster` 与 `buildVMListFilter(filters.VMList)`；后者有引号转义但按题目要求，黑名单式/简单替换过滤视为可绕过（如反斜杠+引号场景取决于 DuckDB 字符串语义），不算强防御；Cluster 等完全无防御。
+
+7. **第 462-482 行 MigrationIssuesQuery**：`category` 参数原样进入 params，与 Cluster 同为未净化外部输入。
+
+8. **第 497-540 行 generateOSCaseClauses 等**：数据来自编译期内置 map（complexity 包常量），非用户可控，安全。
+
+9. **第 542-570 行 buildVMListFilter**：仅做 `'` → `''` 替换，属可绕过的弱过滤（且若上游允许反斜杠转义或编码绕过则失效）。
+
+10. **第 572-584 行 buildQuery**：text/template 直接文本展开，无 HTML/SQL 自动转义，所有注入的占位符原样落入最终 SQL —— sink 确认。
+
+11. **第二入口/替代通道**：`Filters` 结构体字段（Cluster/OS/PowerState/VmId/VMList）通常来自 HTTP 查询参数解析层；`filePath` 来自上传/导入流程；`category` 来自 API 参数。多个入口汇聚到同一 sink（buildQuery 生成的 SQL 文本被执行）。
+
+**结论**：存在 SQL 注入漏洞。最确凿的证据链：外部 filter 字符串（如 `filters.Cluster`）→ 未净化传入 queryParams → text/template 文本展开 → 最终 SQL 执行。同文件中 `escapeSQLString` 的选择性使用证明这是遗漏。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-89 SQL Injection",
+  "risk_level": "high",
+  "source": "line 74: filters.Cluster / line 78: filters.VmId / line 46: IngestRvtoolsQuery(filePath) / line 468: category",
+  "sink": "line 579: tmpl.Execute 将未转义参数拼入最终 SQL 文本",
+  "explanation": "外部可控的 Cluster、OS、PowerState、VmId、category、FilePath 等字符串未经任何转义直接写入 queryParams 并由 text/template 文本展开进 SQL；对比第 152 行 ClusterFeaturesQuery 使用了 escapeSQLString、第 372 行对 VMList 做了引号转义，证明这些字段被遗漏防护，攻击者可通过 filter 参数注入任意 SQL",
+  "fix_suggestion": "line 74: 对所有字符串参数统一调用 escapeSQLString 或改为数据库驱动参数化查询（占位符绑定），禁止将用户输入经 template 直接拼入 SQL"
+}
+```

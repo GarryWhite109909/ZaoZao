@@ -1,0 +1,61 @@
+# 全文逐函数安全分析
+
+## 0. 文件结构总览
+
+本文件为 Easy!Appointments 的 `Booking_settings` 控制器，全文共两个公开入口方法：`index()`（第 44-70 行）与 `save()`（第 75-113 行），外加构造函数（第 30-41 行）。以下逐一枚举入口点与数据流。
+
+## 1. 构造函数（第 30-41 行）
+
+- 入口点：无直接用户输入；仅加载模型与库。
+- 注意第 32-37 行加载了 `appointments_model`、`customers_model`、`services_model`、`providers_model`、`roles_model`、`settings_model`，以及 `google_sync`、`notifications`、`synchronization` 等库。这些在本文件中除 `settings_model` 与 `accounts` 外均未被实际调用，属于冗余加载，不构成数据流，但说明该控制器权限模型依赖 `roles_model`/`accounts` 的会话态。
+
+## 2. `index()`（第 44-70 行）—— 渲染入口 / 输出侧 sink
+
+- 入口点：
+  - 第 46 行 `method('get')` 强制 GET；
+  - 第 48 行写入会话 `dest_url`；
+  - 第 50 行从会话读取 `user_id`；
+  - 第 54 行权限检查 `cannot('view', PRIV_SYSTEM_SETTINGS)`：未登录跳转 login，已登录但无权限 abort(403)。这是有效的认证+授权防御（基于服务端会话角色，非客户端可控）。
+- 数据流 A（sink 定位）：第 63-65 行
+  ```php
+  'booking_settings' => filter_sensitive_settings($this->settings_model->get_batch()),
+  ```
+  将**数据库中全部设置记录**经 `filter_sensitive_settings` 过滤后注入 `script_vars(...)`。`script_vars` 在 EA 框架中是把 PHP 数组序列化为内联 `<script>` 中的 JS 变量输出到 HTML 页面。关键问题：`filter_sensitive_settings` 只剔除敏感键（如密码类设置名），**不做 HTML/JS 上下文转义**；而 `script_vars` 输出的是 JS 字符串上下文，若值中含 `</script><img src=x onerror=...>` 类载荷，且框架未做 json_encode + HTML 实体双重编码，即构成存储型 XSS 的 sink。EA 历史版本中 `script_vars` 使用 `json_encode` 后直接嵌入 script 标签，`</script>` 可闭合标签逃逸——json_encode 不转义 `/`（除非 JSON_HEX_TAG 标志）。因此第 64 行是真实 sink。
+- 数据流 B：第 68 行 `lang('settings')`、第 69 行 `get_user_display_name($user_id)` 进入视图，均为服务端受控或会话数据，风险低。
+- 结论：`index()` 本身无新增 source，但它是 `save()` 写入数据的**第二入口/替代通道**的展示端 sink。
+
+## 3. `save()`（第 75-113 行）—— 写入入口 / source→sink 主链
+
+- 入口点：第 78 行 `method('post')`；第 84 行 `check('booking_settings', 'array|null')` 仅校验**类型为数组**，不校验内容；第 85 行 `$settings = request('booking_settings', [])` —— **source：HTTP POST 体完全用户可控**。
+- 权限防御：第 80-82 行 `cannot('edit', PRIV_SYSTEM_SETTINGS)` 抛异常。有效，但只限制为“系统设置编辑者”（通常是管理员），漏洞影响面为管理员自身的存储 XSS / 设置篡改，仍属缺陷但权限门槛高。
+- 逐条数据流验证：
+
+  **流 1（第 87-101 行循环）**：对每个用户提交的 `$setting`：
+  - 第 88-90 行按 `name` 查询已有设置并回填 id —— `$setting['name']` 直接进入查询构建器 `where('name', ...)`,CI3 查询构建器自动参数化，**无 SQL 注入**。
+  - 第 92-96 行：
+    ```php
+    if (!empty($setting['name']) && str_starts_with($setting['name'], 'label_custom_field_')) {
+        $setting['value'] = strip_tags($setting['value'] ?? '');
+    }
+    ```
+    这是**前缀黑名单式过滤**：只有名字以 `label_custom_field_` 开头的设置值才被 `strip_tags`。按分析要求，“黑名单/正则过滤视为可绕过”——攻击者只需提交任意其他设置名（如 `company_name`、`google_analytics_code`、甚至自造新名 `evil_setting_x`），即可让含 `<script>`/事件属性的 value **原样入库**。且 `strip_tags` 本身也不处理属性内 JS 或编码绕过。此防御无效。
+  - 第 98-100 行 `only($setting, ['id','name','value'])` 只做字段白名单裁剪（防 mass assignment 多余列），但 `name` 与 `value` 本身均在白名单内且未消毒——白名单不构成对内容的防御。
+  - 第 101 行 `settings_model->save($setting)` —— **sink：任意设置名/值持久化写入 settings 表**。可覆盖框架关键设置（如 `company_link`、回调相关配置），亦可注入恶意 HTML 值。
+
+- 第二入口核查：全文无其他写 settings 的路径；`index()` 是被污染数据的读取展示通道（见上）。替代通道：settings 表还会被其他页面（如预约页显示公司名/自定义字段标签）读取渲染，扩大 XSS 触发面。
+
+## 4. 综合判定
+
+完整链路：POST `booking_settings`（第 85 行，source）→ 前缀条件过滤被绕过（第 93 行）→ `settings_model->save` 持久化（第 101 行）→ `index()` 第 64 行 `script_vars` 将污染值嵌入内联脚本（sink，JS 上下文未做标签闭合防护）→ 存储型 XSS（CWE-79）；同时任意设置项覆盖构成不当访问控制下的配置篡改（次要 CWE-284/CWE-15，因已有管理员权限校验，降级为次生风险）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-79 (Stored XSS via settings injection)",
+  "risk_level": "medium",
+  "source": "line 85: request('booking_settings', []) 用户可控 POST 数组",
+  "sink": "line 101: settings_model->save($setting) 持久化; line 64: script_vars 输出到内联 script",
+  "explanation": "save() 中第 93 行仅对以 label_custom_field_ 开头的设置名执行 strip_tags, 属于可绕过的前缀黑名单; 攻击者提交其他任意 name 及含 </script> 或事件属性的 value 即可原样入库, 随后 index() 第 64 行通过 script_vars 将 get_batch() 结果未经 HTML/JS 上下文转义地嵌入页面内联脚本, 形成存储型 XSS; 第 98 行 only() 白名单仅裁剪字段不消毒内容, 不构成有效防御",
+  "fix_suggestion": "line 93: 移除前缀条件, 对所有 setting['name'] 和 setting['value'] 统一执行 strip_tags 加 htmlspecialchars(ENT_QUOTES) 白名单校验; 同时在 index() 第 64 行确保 script_vars 以 JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_HEX_AMP 编码输出"
+}
+```

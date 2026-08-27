@@ -1,0 +1,23 @@
+## 编号分析（全文逐函数）
+
+1. **第 44–47 行：默认反序列化过滤器**。`deserializationFilter = "java.**;org.apache.camel.**;!*"`，即默认白名单仅允许 JDK 与 Camel 包，其余全部拒绝。这是 JEP 290 的 `ObjectInputFilter` 白名单机制，不是黑名单/正则，属于结构性有效防御。
+
+2. **构造函数（第 49–66 行）与 Builder（第 158–180 行）**：仅设置 hostname/port/filter，hostname/port 只用于拼接 Consul 连接 URL，无外部请求入口直接触达 sink；filter 可由部署者显式配置，属受信配置面。
+
+3. **`lookupByName`（第 69–78 行）**：source 为 Consul KV 中 `key` 对应的字符串值 → `decodeBase64`（第 194 行）→ `deserialize(postDecodedValue, deserializationFilter)`（sink，第 77 行）。数据流唯一进入 `readObject()` 的路径，且每次调用都强制套用过滤器（第 213–215 行），过滤器为空时才跳过——而字段有非空默认值，正常路径不可能为空。KV 数据来自受认证的 Consul 服务端，攻击者需先攻陷 Consul 才能投毒。
+
+4. **`lookupByNameAndType`（第 81–92 行）**：复用 `lookupByName`，额外做 `type.cast` 类型校验，无新增 sink。
+
+5. **`findByTypeWithName` / `findByType`（第 95–141 行）**：遍历 KV 键后仍走同一 `lookupByName` 路径，同样经过过滤器，无旁路通道。
+
+6. **`bind`/`put`/`remove`（第 143–156、159–186 行）**：写路径。`put` 中 `clone`（第 221–226 行）对自身刚序列化的可信对象做过滤反序列化，不引入外部 source；`remove` 仅删除键。无新增攻击面。
+
+7. **`ConsulRegistryUtils.deserialize`（第 211–222 行）**：唯一 sink。防御有效性评估：`!*` 拒绝所有未列出的包，常见 gadget 链（Commons-Collections、C3P0 等）均不在 `java.**`/`org.apache.camel.**` 内，会被拒绝。JDK 内部纯 JDK gadget 在现代 JDK 上基本不可用，且该默认策略是 Camel 官方文档化的安全基线。
+
+8. **第二入口/替代通道检查**：文件内无 HTTP 端点、无环境变量读取、无回调注册；所有反序列化均收敛到同一个带过滤的 `deserialize` 方法，不存在绕过过滤器的第二条 readObject 路径。
+
+结论：存在反序列化 sink，但被 JEP 290 白名单过滤器有效防护，且 source（Consul KV）本身需服务端信任前提；无可利用漏洞。残余风险仅为部署者通过 `setDeserializationFilter` 自行放宽白名单（如加入 `*`）时的配置错误，不属于本代码缺陷。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文唯一的反序列化 sink 位于 ConsulRegistryUtils.deserialize(第211-222行)，所有读取路径(lookupByName 第69-78行、lookupByNameAndType 第81-92行、findByType/findByTypeWithName 第95-141行)均收敛于此并强制应用 JEP 290 ObjectInputFilter 白名单(默认 java.**;org.apache.camel.**;!*, 第44行)。该过滤器为白名单而非黑名单或正则，常见 gadget 类包均被 !* 拒绝，属有效防御。put/remove/bind 写路径(第143-186行)只处理自身序列化的可信对象，不构成外部 source。文件中不存在其他入口点(HTTP路由/环境变量/回调)可绕过该过滤器直达 readObject。source 为受信任的 Consul KV 存储，攻击前提是已攻陷 Consul 服务端。因此基于全文证据判定无可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

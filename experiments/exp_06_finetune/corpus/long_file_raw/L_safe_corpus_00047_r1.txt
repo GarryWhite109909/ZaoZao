@@ -1,0 +1,57 @@
+# 编号分析（全文通读，逐函数行号级）
+
+## 一、文件结构与入口点枚举
+
+本文件是 Traefik 的 `rewritetarget` 中间件（ingress-nginx 兼容的 rewrite-target 实现），仅包含三个函数：
+
+1. **`New`（第 41–80 行）**：配置加载入口。Source 为**运维人员提供的静态配置** `dynamic.RewriteTarget`（第 43 行 `config.Replacement`、第 51 行 `config.Regex`、第 74 行 `config.XForwardedPrefix`），不是请求级用户输入。
+2. **`GetTracingInformation`（第 82–84 行）**：仅返回中间件名与类型名（第 83 行），无任何 source/sink。
+3. **`ServeHTTP`（第 86 行起）**：唯一运行时入口。Source 是 HTTP 请求的路径 `req.URL.RawPath` / `EscapedPath()`（第 89–92 行）与查询串 `req.URL.RawQuery`（第 122 行）；Sink 包括：302 重定向目标（第 131 行 `http.Redirect`）、内部转发路径 `req.URL.RawPath/Path`（第 141–142 行）、响应头 `X-Forwarded-Prefix`（第 137 行）、错误响应体（第 105、112、146 行）。
+
+## 二、`New` 函数防御逻辑（第 41–80 行）
+
+- 第 44–46 行：Replacement 为空直接拒绝，防止空重写。
+- 第 48–50 行：用 `url.Parse` 判断 replacement 是否带 scheme，置 `absoluteURLRedirect` 标志——这是区分“外部跳转”与“内部改写”的关键开关。
+- 第 52–58 行：正则强制加 `(?i)` 前缀并 `TrimSpace` 后编译，编译失败即返回错误（第 56–57 行），不存在 ReDoS 配置注入面（配置本身受信）。
+- 第 61–67 行：当 replacement 是绝对 URL 且正则无捕获组时追加 `.*`，修复 issue #12931 提到的未匹配后缀泄漏——这是对已知漏洞的补丁证据。
+
+## 三、`ServeHTTP` 数据流逐一验证
+
+**流 A：用户路径 → 正则替换 → 绝对 URL 302 跳转（开放重定向风险面）**
+- Source：第 89–92 行 `currentPath`（攻击者完全可控）。
+- Sink：第 131 行 `http.Redirect(rw, req, newTargetURL.String(), ...)`。
+- 防御链：
+  1. 第 100–103 行：只有 replacement 模板本身带 scheme 才走此分支；若模板无 scheme（如 `//$1`），`absoluteURLRedirect=false`，不会产生外部跳转，落入流 B 的内部改写分支——无法借“scheme 相对 URL”绕过进入跳转分支。
+  2. 第 110–118 行：替换结果整体重新 `url.Parse`，host 由模板固定部分决定。即使捕获组内容形如 `evil.com` 或 `%2F%2Fevil.com`，它只会落在 path/query 部分，无法覆盖已解析出的 authority（Go 的 `url.Parse` 中 host 先于 path 解析，path 中的 `//` 不改变 host）。解析失败则 500（第 111–113 行）。
+  3. 第 120–125 行：query 透传仅在 `newTargetURL.RawQuery == ""` 时进行，且 `req.URL.RawQuery` 本身已被 Go 标准库解析校验过，不含裸 CR/LF。
+  4. `http.Redirect` 内部还会对 Location 值做 HTML/控制字符净化，CRLF 注入到响应头不可行。
+- 结论：该流的开放重定向与头注入均被有效阻断。
+
+**流 B：用户路径 → 正则替换 → 内部转发路径（路径穿越/规范化混淆风险面）**
+- Sink：第 141 行 `req.URL.RawPath = newTarget`，第 143 行 `url.PathUnescape`。
+- 防御链：
+  1. 第 149–153 行：`JoinPath()` 触发 `path.Clean` 规范化；
+  2. 第 155–159 行：**关键防御**——若清洗后的路径与原路径不一致（如出现 `..`、多余斜杠导致的语义变化），直接 400 拒绝。这封死了经典的“RawPath 与 Path 不一致导致后端路由混淆”攻击（如 `/safe/../admin`、编码斜杠 `%2F..%2F` 变体）。
+  3. 第 145–148 行：unescape 失败即 500 拒绝，不降级放行。
+  4. 第 161 行同步修正 `RequestURI`，避免下游读到旧值造成不一致。
+- 结论：路径混淆有显式校验兜底，非黑名单式过滤。
+
+**流 C：用户路径 → X-Forwarded-Prefix 头（头注入风险面）**
+- 第 134–139 行：prefix 来自静态配置或经同一正则替换生成；即便含特殊字符，`req.Header.Set` 在写入时会剥离非法头字符，且 `currentPath` 取自 `EscapedPath()`，原始 CRLF 已被转义。无可利用注入。
+
+**流 D：错误信息回显**
+- 第 146 行 `http.Error(rw, err.Error(), ...)` 回显的是 `url.PathUnescape` 的标准库错误（如 `invalid URL escape`），可能包含攻击者输入的片段，但属低危信息泄露且 Traefik 上游接受此行为；第 105、112、150 行均为固定文本，无注入。
+
+## 四、第二入口与替代通道核查
+
+- 全文无环境变量读取、无文件 IO、无回调注册、无其他路由；`New` 只在配置加载时执行一次，配置来源为受信的动态配置（非请求面）。
+- `replacementRegex`（第 19 行）仅用于删除无正则时的 `$N` 引用（第 102 行），方向是消除而非引入注入。
+- 未发现任何绕过上述三条防御链的第二通道。
+
+## 五、结论
+
+所有 source→sink 流均有结构性防御（scheme 开关 + url.Parse 固定 authority + JoinPath 规范化一致性校验 + 标准库头净化），非黑名单式可绕过滤。基于全文证据，未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文三处函数后确认无漏洞。流A(用户路径经第89-92行进入, 经第110-118行url.Parse后于第131行http.Redirect输出): 仅当replacement模板自带scheme才走跳转分支, 且authority由模板固定部分决定, 捕获组内容只能落入path部分, 无法构造开放重定向或CRLF注入; 流B(第141-143行内部路径改写): 第149-159行通过JoinPath规范化并与原路径比对, 不一致即400拒绝, 封死路径混淆; 流C(X-Forwarded-Prefix, 第134-139行): 头值经Header.Set写入被标准库净化, 无头注入; 错误回显(第146行)仅为低危信息泄露。配置入口New(第41-80行)只接受受信动态配置, 无第二入口或替代通道可绕过上述防御。", "fix_suggestion": "no fix needed"}
+```

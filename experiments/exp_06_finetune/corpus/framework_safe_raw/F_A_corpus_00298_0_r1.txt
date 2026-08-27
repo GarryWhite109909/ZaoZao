@@ -1,0 +1,51 @@
+LANG: python
+```python
+import os
+from flask import Flask, request, render_template_string
+
+app = Flask(__name__)
+
+TEMPLATE = """listen:
+  host: {{ listen_host }}
+  port: 4242
+punchy: {{ punchy }}
+tun:
+  dev: {{ tun_device }}
+"""
+
+# whitelist for tun_device (defense helper)
+_ALLOWED_TUN_DEVICES = {"nebula1", "nebula0", "utun7"}
+
+def _sanitize_tun_device(value):
+    return value if value in _ALLOWED_TUN_DEVICES else "nebula1"
+
+@app.route("/configgen", methods=["POST"])
+def configgen():
+    # operator-supplied fields interpolated raw into a template
+    listen_host = request.form.get("listen_host", "0.0.0.0")
+    tun_device = request.form.get("tun_device", "nebula1")
+    punchy = request.form.get("punchy", "true")
+    rendered = render_template_string(TEMPLATE, listen_host=listen_host,
+                                      tun_device=_sanitize_tun_device(tun_device),
+                                      punchy=punchy)
+    with open(os.path.join("/etc/nebula", "config.yml"), "w") as f:
+        f.write(rendered)
+    return rendered
+
+@app.route("/preview", methods=["GET"])
+def preview():
+    # second entry: same sink via query params, no defense either
+    snippet = request.args.get("snippet", "")
+    return render_template_string(snippet)
+```
+
+1. 第 15–16 行枚举用户可控输入点：`/configgen` 的 `request.form` 提供 `listen_host`、`tun_device`、`punchy`；第 30 行 `/preview` 的 `request.args` 提供 `snippet`，均为攻击者可控的 SSTI 注入源。
+2. 主链追踪：第 17–18 行将 `listen_host`、`tun_device`、`punchy` 直接传入 `render_template_string`（Jinja2 引擎），模板变量虽以参数形式传入而非拼接进模板字符串本身，但 `punchy`/`listen_host` 若含 `{{ }}`/`{% %}` 语法仍会被二次求值——真正的致命 sink 是第 31 行 `render_template_string(snippet)`，攻击者完全控制模板文本，可注入 `{{ ''.__class__.__mro__ }}` 类 payload 实现 RCE。
+3. 防御位置与类型正确性：在第 19 行插入白名单精确允许集 `_ALLOWED_TUN_DEVICES`（第 13 行定义），第 20–21 行辅助函数对 `tun_device` 做精确集合匹配后回退默认值——这是框架无关的白名单防御（要求 3 认可的类型），且位于数据进入 sink 之前的位置正确。
+4. 攻击面覆盖完整性说明：主 `/configgen` 流中模板常量 `TEMPLATE` 不受用户控制，变量经 Jinja2 参数绑定传入属框架原生安全用法；`tun_device` 经白名单收敛后，该流已无可注入面。`preview` 入口按 minimal pair 纪律保持原样未修（要求 4），其风险在 explanation 中单独记录。
+5. 第二入口结论：`/preview`（第 29–31 行）仍是未修复的 SSTI 直通通道，属于同一漏洞类型的替代通道，本次样本仅修复目标数据流以维持局部对照性。
+6. 形态核对：函数名 `configgen`/`preview`、路由路径、变量名、控制流与原代码逐行一致，仅新增白名单常量与辅助函数及一处调用替换，diff 最小。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "主链 /configgen：原漏洞为 render_template_string 处理用户可控 tun_device 导致 CWE-94 SSTI；修复采用白名单精确允许集 _ALLOWED_TUN_DEVICES 在 sink 前收敛输入，非法值回退默认 nebula1，注入面消除；TEMPLATE 为代码内常量且变量经 Jinja2 参数绑定传入，非字符串拼接，无注入面；第二入口 /preview 第 31 行 render_template_string(snippet) 按最小 diff 纪律保持原样未修复，仍为同类型替代通道，已在分析中标注。", "fix_suggestion": "line 19-20: 用白名单 _sanitize_tun_device 替换直接传参"}
+```

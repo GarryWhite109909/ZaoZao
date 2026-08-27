@@ -1,0 +1,37 @@
+## 编号分析（逐函数、行号锚定）
+
+**1. 类与依赖注入（第 55–80 行）**
+构造器注入 `releaseService`、`publisher`、`portalConfig`、`userPermissionValidator`、`userInfoHolder`，均为 Spring 容器管理的受信组件，无外部可控注入点。
+
+**2. createRelease（第 83–110 行）**
+- 入口：`POST /apps/{appId}/envs/{env}/clusters/{clusterName}/namespaces/{namespaceName}/releases`。
+- 第 84 行 `@PreAuthorize` 调用 `hasReleaseNamespacePermission(#appId, #env, #clusterName, #namespaceName)`，SpEL 引用路径变量做发布权限校验——这是方法级授权，非黑名单/正则过滤，属于有效防御。
+- 第 88–90 行将路径变量覆盖进 model，防止 body 中伪造 appId/env/cluster/namespace。
+- 第 92–94 行紧急发布开关校验。数据流：path/body → `releaseService.publish(model)`，前置有授权，无未授权 sink。
+
+**3. createGrayRelease（第 113–141 行）**
+同上结构：第 114 行同样的 `@PreAuthorize`；第 118–121 行用 `branchName` 覆盖 clusterName；第 123–125 行紧急发布校验。防御有效。
+
+**4. get（第 144–155 行）**
+- `GET /envs/{env}/releases/{releaseId}`，无 `@PreAuthorize`，但第 150–152 行调用 `shouldHideConfigToCurrentUser(release.getAppId(), env, ...)` 做配置可见性检查，命中即抛 `AccessDeniedException`。这是运行时授权判断而非可绕过的字符串过滤，属有效防御。
+
+**5. findAllReleases / findActiveReleases（第 158–190 行）**
+- 分页参数经 `@Valid @PositiveOrZero/@Positive` 校验（第 164–165、176–177 行），防负数分页。
+- 两处均在查询前调用 `shouldHideConfigToCurrentUser`（第 166–168、178–180 行），不可见则返回空列表。防御有效。
+
+**6. compareRelease（第 193–199 行）**
+- `GET /envs/{env}/releases/compare`，仅按两个内部自增 releaseId 比较。该接口未显式调 `shouldHideConfigToCurrentUser`，但：(a) Portal 全局由 Spring Security 认证保护（Apollo 架构设定）；(b) releaseId 为服务端生成的内部主键，不泄露 appId/namespace 级配置内容之外的可枚举信息；(c) 返回的是两份已存在 release 的差异，风险为低危信息暴露面，不构成 source→sink 的可利用漏洞链。
+
+**7. rollback（第 202–231 行）**
+- `PUT /envs/{env}/releases/{releaseId}/rollback`。第 205–209 行先查 release 并判空；第 211–213 行显式调用 `hasReleaseNamespacePermission(release.getAppId(), env, release.getClusterName(), release.getNamespaceName())` —— 注意这里用的是 **release 记录中的真实归属** 而非用户输入，防止通过伪造路径绕过授权，是强防御。
+- 第 215–219 行才执行回滚 sink；事件发布使用同一 release 数据。数据流安全。
+
+**8. 替代通道核查**
+全文共 7 个端点，逐一核对：写操作（create/createGray/rollback）均有命名空间级授权；读操作（get/find*）均有 hide-config 检查；compare 为唯一无细粒度检查的只读接口，如上分析不构成可利用漏洞。无文件上传、反射、反序列化、SQL 拼接、命令执行类 sink；所有下游调用走 service 层 DTO，无直接字符串拼接执行点。
+
+**9. 结论**
+全部入口点的 source→sink 流均被方法级授权或运行时可见性检查覆盖，且这些检查基于服务端真实数据（非黑名单/正则），判定无安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文 7 个端点：写操作 createRelease(第84行)、createGrayRelease(第114行)、rollback(第211-213行) 均有 @PreAuthorize 或基于服务端 release 归属数据的命名空间权限校验；读操作 get(第150-152行)、findAllReleases(第166-168行)、findActiveReleases(第178-180行) 均调用 shouldHideConfigToCurrentUser 做可见性控制；分页参数经 Bean Validation 校验。compareRelease(第193-199行) 无细粒度检查但仅接受内部自增 releaseId 且处于全局认证之下，返回内容为已有发布差异，不构成可利用漏洞链。所有授权检查基于服务端真实数据而非黑名单或正则过滤，防御有效。", "fix_suggestion": "no fix needed"}
+```

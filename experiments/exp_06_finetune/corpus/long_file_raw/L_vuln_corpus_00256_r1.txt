@@ -1,0 +1,29 @@
+## 编号分析（全文逐函数，行号锚定）
+
+**入口点枚举**：本文件是 SQL 查询构造库，入口点为各 `*Query` 方法的参数（filters.Cluster / filters.OS / filters.PowerState / filters.VmId / filters.VMList / category / clusterName / filePath），sink 为各模板执行后的 SQL 字符串。
+
+1. **第 17–24 行 getTemplate/mustGetTemplate**：仅读 embed.FS 内嵌文件，name 为硬编码字面量（如第 49、96 行），无外部输入，无漏洞。
+2. **第 53–54 行 IngestRvtoolsQuery / 第 58 行 IngestSqliteQuery**：filePath 注入 ingestParams 模板。若模板中直接拼接路径则存在注入面，但需模板内容佐证；此处 filePath 通常来自服务端上传文件路径，风险较低，标记为次要观察点。
+3. **第 86–95 行 VMQuery**：第 88 行 `ClusterFilter: filters.Cluster`、第 89 行 OSFilter、第 90 行 PowerStateFilter、第 91 行 VmIdFilter **均未做任何转义/参数化**，直接交给 text/template 渲染进 SQL —— 典型 source→sink 无防御数据流。
+4. **第 100–127 行 DatastoreQuery/NetworkQuery/HostQuery**：第 102、112、122 行同样将 filters.Cluster 原样注入。
+5. **第 129–136 行 OsQuery**：第 132 行 ClusterFilter 未转义；第 133 行走 buildVMListFilter（有防御）。
+6. **第 153–157 行 ClusterFeaturesQuery**：第 155 行使用 `escapeSQLString(clusterName)`，是全文唯一对字符串入参做转义的位置（但按规则单靠转义函数仍属弱防御，且其他调用点不一致）。
+7. **第 159–369 行 各统计类 Query**（VMCountQuery 第 162–163、PowerStateCountsQuery 第 172–173、CPUTierQuery 第 189–190、MigrationIssuesQuery 第 340–343 等）：所有 `ClusterFilter: filters.Cluster` 与第 342 行 `Category: category` 全部未转义直接拼接。
+8. **第 371–386 行 generateOSCaseClauses**：keyword 来自编译期常量 complexity.OSDifficultyScores，非外部输入，安全。
+9. **第 392–433 行 generateComplexityMatrixCaseClauses**：全部来自编译期常量与映射表，安全。
+10. **第 444–468 行 buildVMListFilter**：第 457 行用 `ReplaceAll(vmID, "'", "''")` 转义单引号后于第 458/467 行拼 IN 子句。这是黑名单式/单字符转义，可被反斜杠等方言特性绕过，且与 ClusterFilter 的“完全不转义”形成不一致——说明作者知道需要转义却只覆盖了 VMList 一条通道（第二入口未防护）。
+11. **第 470–480 行 buildQuery**：text/template 默认不做 SQL 上下文转义，Execute 后直接返回最终 SQL 字符串供下游执行，确认 sink。
+
+**结论**：filters.Cluster（约 30 处）、filters.OS、PowerState、VmId（第 88–91 行）及 category（第 342 行）从外部 filter 结构体直达 SQL 字符串拼接，无任何有效防御；buildVMListFilter 的单引号转义不足以覆盖其余通道。构成 SQL 注入（CWE-89）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-89",
+  "risk_level": "high",
+  "source": "line 88: ClusterFilter: filters.Cluster 以及 line 89-91 的 OSFilter/PowerStateFilter/VmIdFilter 和 line 342 的 Category: category",
+  "sink": "line 476: tmpl.Execute 将未转义的过滤值渲染进 SQL，经 line 479 返回待执行查询",
+  "explanation": "外部传入的 filters.Cluster 等字段在 VMQuery/DatastoreQuery/OsQuery/MigrationIssuesQuery 等约三十个构造函数中未经任何转义或参数化，直接通过 text/template 拼接为 SQL 字符串；text/template 不提供 SQL 上下文转义，攻击者可通过 cluster 或 category 过滤参数注入任意 SQL。唯一做了处理的 buildVMListFilter(line 457) 仅替换单引号，属于可绕过的弱转义，且未覆盖 Cluster/OS/PowerState/VmId/Category 等替代通道，防御不一致进一步证实注入可行。",
+  "fix_suggestion": "line 88: 改用数据库驱动参数占位符（duckdb driver 的 ? 占位符配合 args），或将 escapeSQLString 统一应用于所有字符串入参并改用白名单校验枚举值，禁止直接把 filters 字段拼入模板"
+}
+```

@@ -1,0 +1,20 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：本文件是 jsonwebtoken 的 `sign` 模块，唯一导出函数签名在第 63 行 `module.exports = function (payload, secretOrPrivateKey, options, callback)`。所有外部输入 source 为四个参数；sink 为第 168 行 `jws.createSign(...)` 与第 178 行 `jws.sign(...)`。无路由/文件/环境变量等其他通道，但存在“第二入口”：`options.header`（第 70-73 行）与 `callback`（第 66-69 行、第 167-176 行）。
+
+2. **算法白名单验证的覆盖缺口**：`SUPPORTED_ALGS`（第 9 行）含 `'none'`；`validateOptions`（第 111 行）只校验 `options.algorithm` 是否在白名单内（第 16 行 schema）。但第 70-73 行构造 header 时用 `Object.assign({alg: options.algorithm || 'HS256', ...}, options.header)` —— **`options.header` 中的 `alg` 会覆盖已校验的 `options.algorithm`，且从未被任何 schema 校验**。`sign_options_schema.header` 仅要求 `isPlainObject`（第 17 行），不检查其内容。
+
+3. **source→sink 数据流验证**：
+   - 路径 A：攻击者可控的 `options.header = {alg: 'none'}` → 第 73 行覆盖 `header.alg` → 第 88 行 `header.alg.startsWith('HS')` 为 false，第 90 行 `/^(?:RS|PS|ES)/` 不匹配 → 绕过全部密钥类型/长度检查（第 88-104 行）→ 第 130 行 `validateAsymmetricKey(header.alg, ...)` 同样接收被污染的 alg，但其防御基于同一被绕过的值 → 到达第 178 行 `jws.sign`，生成 `alg: none` 的未签名 token。
+   - 路径 B：即使库的使用方正确传入强密钥并指定 `RS256`，调用者仍可通过 `options.header.alg = 'none'` 让库签出无签名 JWT。下游 verify 端若信任该 token，即构成经典 JWT 算法混淆/none 攻击。黑名单式正则 `/^(?:RS|PS)/`（第 172、180 行）只用于签名长度检查，对 none 无防御作用。
+
+4. **其他次要问题（非独立漏洞）**：
+   - 第 79 行 `!secretOrPrivateKey` 允许空字符串密钥配合非 none 算法通过前置检查（HS256 + 空密钥可被 createSecretKey 接受），属弱配置风险；
+   - 第 137 行 `payload.iat || timestamp` 对 iat=0 处理不当，仅影响时间戳语义；
+   - callback 经 `once` 包装（第 167 行）无注入面；payload 校验（registered_claims_schema，allowUnknown=true）不影响安全属性。
+
+5. **结论**：核心漏洞为 `options.header.alg` 未经验证即可覆盖白名单算法（包括 `none`），构成有效的 source→sink 可利用数据流。此问题对应 jsonwebtoken 历史修复（后续版本将 header.alg 纳入校验并默认拒绝 none）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "JWT algorithm confusion / none-algorithm bypass via unvalidated options.header", "risk_level": "high", "source": "options.header parameter at line 70-73", "sink": "jws.sign / jws.createSign at lines 168 and 178", "explanation": "validateOptions 只校验 options.algorithm 是否属于 SUPPORTED_ALGS 白名单（第 16 行、第 111 行），但第 70-73 行使用 Object.assign 将 options.header 合入 header，其 alg 字段可覆盖已校验值且从不被再次校验。攻击者传入 options.header={alg:'none'} 即可绕过第 88-104 行的全部密钥类型与强度检查以及第 130 行的 validateAsymmetricKey，最终在第 168 或 178 行生成 alg 为 none 的未签名 JWT。下游若按常规方式验证该 token，即导致认证绕过。", "fix_suggestion": "在合并 options.header 后重新校验 header.alg 必须等于 options.algorithm 且属于 SUPPORTED_ALGS，或直接禁止通过 options.header 覆盖 alg 字段；同时考虑从 SUPPORTED_ALGS 中移除 none 或要求显式 opt-in。"}
+```

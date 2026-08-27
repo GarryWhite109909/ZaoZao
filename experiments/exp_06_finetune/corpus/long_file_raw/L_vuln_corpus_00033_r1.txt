@@ -1,0 +1,27 @@
+## 编号分析（全文通读）
+
+**入口点枚举**
+- 本模块无网络路由/环境变量/回调，唯一外部输入通道是两个公开函数的参数：`decode(data, size)` 与 `encode(data)`。在 psd_tools 的真实调用链中，`data` 来自不可信的 PSD 文件字节流，`size` 来自文件头中攻击者可控的通道长度字段——即 source 均为攻击者控制的文件内容。
+
+**1. `decode`（第 47 行起）逐分支验证**
+- 第 55–58 行：`length == 1` 时仅接受 `128`，安全。
+- 第 60 行：主循环 `while i < length`。
+- 第 62–68 行（repeat 分支）：有边界检查 `if j + 1 + bit > size: raise`（第 64 行），防止结果缓冲越界写；但注意该分支**未校验 `i < length`**，若头字节是最后一个字节，`data[i:i+1]` 为空切片，`extend(空 * n)` 不报错但 `j += 1+bit` 虚增计数，最终由第 78 行的长度一致性检查兜底——不构成内存破坏。
+- 第 69–75 行（literal 分支）：第 70 行同时校验了读越界（`i + 1 + bit > length`）与写越界（`j + 1 + bit > size`），防御有效。
+- 第 77–79 行：最终长度校验有效。
+
+结论：`decode` 对**越界读写**的防御是完备的；但整个解码过程中 `result` 按攻击者指定的 `size` 逐步扩容（第 52、66、72 行），且 `bytearray(data)`（第 53 行）复制整份输入。PSD 文件中的 `size` 字段可被设为 GB 级，攻击者用极小的压缩数据即可令进程分配并填充海量内存——这是典型的解压炸弹/资源耗尽问题，且纯 Python 实现放大了 CPU 开销。
+
+**2. `encode`（第 85 行起）**
+- 输入为程序自身产生的原始像素数据，非直接攻击者控制；循环内所有索引均在 `0 <= i,j < length` 内推进，第 100、107 行的 break 保证不越界。无可利用漏洞。
+
+**3. 第二入口/替代通道**
+- Cython 版 `_rle.pyx` 是替代实现，但本文件是独立回退路径，其安全性需独立评估；本文件内无其他隐藏入口。
+
+**4. 综合判定**
+- 内存破坏类漏洞：不存在（边界检查齐全）。
+- 但存在由不可信 `size` 驱动的无上限内存分配：source = 攻击者构造的 PSD 中 RLE 通道数据及声明的解压后长度；sink = 第 52/66/72 行对 `result` 的按 `size` 扩容。属 CWE-409（解压炸弹导致资源耗尽）/CWE-770。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-409 / CWE-770 解压炸弹与不受限资源分配", "risk_level": "中", "source": "line 47: decode(data, size) 的 data 与 size 参数，来自不可信 PSD 文件中攻击者可控的压缩数据及声明的解压后长度", "sink": "line 52-72: result = bytearray() 及 result.extend(...) 按 size 无上限扩容，另 line 53 bytearray(data) 复制全部输入", "explanation": "攻击者构造 PSD 文件，将某通道声明长度 size 设为数 GB，而实际 RLE 数据极小 -> decode 各分支虽正确防御了越界读写，但缺少对 size 的合理性上限校验 -> 循环按 size 逐步分配并填充 result，造成内存耗尽与 CPU 放大（DoS）", "fix_suggestion": "line 47: 在 decode 入口处对 size 增加基于图像尺寸推导的上限校验（如不超过 width*height*channels 的合理倍数），超限立即抛出 ValueError，并对单次解码内存设置硬性配额"}
+```

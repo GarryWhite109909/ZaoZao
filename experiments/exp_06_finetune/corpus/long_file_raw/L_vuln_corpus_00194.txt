@@ -1,0 +1,32 @@
+## 编号分析
+
+1. **第 96-99 行 `generate()`**：入口点，接受 `$input`、`$output`、`$options`，直接传入 `getCommand()` 后由 `executeCommand()` 执行。无任何输入校验。
+
+2. **第 108-113 行 `generateFromHtml()` / 第 130-134 行 `getOutputFromHtml()`**：HTML 内容写入临时文件（第 276-297 行 `createTemporaryFile`），文件名由 `uniqid` 生成，不可控；但 `$html` 内容本身进入 WeasyPrint 处理（SSRF/本地文件读取风险属于下游工具语义，非本类注入点）。
+
+3. **第 141-170 行 `buildCommand()` —— 核心 sink**：
+   - 第 143-144 行：`$escapedBinary = escapeshellarg($binary); $command = is_executable($escapedBinary) ? $escapedBinary : $binary;`。`is_executable()` 对带引号的字符串（如 `'weasyprint'`）几乎恒为 false，因此实际走的是**未转义的原始 `$binary`** 直接拼入命令行。若 `$binary` 来自用户/配置可控（第 205-210 行 `setBinary` 是 public setter，无任何过滤），即构成命令注入。
+   - 第 146-158 行：选项的 **key（`--' . $key`）未做任何转义**，只有 value 经过 `escapeshellarg`（第 155、157 行）。攻击者可通过 `setOption('x; id > /tmp/p; echo', true)` 或在 `generate()` 的 `$options` 数组中注入 shell 元字符。
+   - 第 159 行：`$input` 与 `$output` 均经 `escapeshellarg`，此路径有效。
+
+4. **第 178-181 行 `executeCommand()`**：`Process::fromShellCommandline()` 明确经 shell 解释执行，是最终 sink。
+
+5. **第 190-216 行 `prepareOutput()`**：仅拦截 `phar://` 前缀（黑名单式防御，可绕过——如 `compress.zlib://`、绝对路径写任意目录）；`$output` 路径本身无白名单限制，存在任意路径文件写入/覆盖（配合 `overwrite=true` 可删除任意可写文件，第 208 行 `unlink`）。但该路径最终被 `escapeshellarg` 转义，不构成命令注入。
+
+6. **第二入口**：`setOption()`（第 316-330 行）、`setOptions()`（构造函数第 68 行也调用）、`mergeOptions()`（第 394-410 行，`generate()` 的 `$options` 也汇入同一 sink）、`setTemporaryFolder()`（第 262-265 行，影响临时文件路径）、`setDefaultExtension()`（第 242-245 行，拼入临时文件名）。所有这些均无校验，且注释（第 305-309 行）明确承认“option values are NOT validated”。
+
+7. **替代通道**：环境变量 `$env`（第 70 行、第 179 行）传入 Process；日志记录完整命令（第 101-105 行），可能泄露敏感路径。均为次要风险。
+
+8. **结论依据**：全文唯一的强 sink 是第 178-181 行的 shell 执行；source 为 public API `setBinary` / `generate($options)` / `setOption`；防御上仅 value 有 `escapeshellarg`，binary 路径因 `is_executable(escaped)` 判断缺陷而完全未转义，option key 完全未转义。构成真实命令注入面（前提是应用层将用户输入传入这些参数——本库文档明确要求调用方自行验证，但 binary 未转义属库自身缺陷）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-78 (OS Command Injection), 次要 CWE-22 (Path Traversal)",
+  "risk_level": "high",
+  "source": "line 205-210 setBinary() 以及 line 96-99 generate()/line 316-330 setOption() 接收的外部可控参数",
+  "sink": "line 178-181 executeCommand() 中 Process::fromShellCommandline() 经 shell 执行",
+  "explanation": "line 143-144 先对 binary 做 escapeshellarg 再用 is_executable 判断, 带引号字符串恒不可执行, 导致实际拼接的是未转义的原始 binary -> 命令注入; line 146-158 选项名 key 直接以 --key 形式拼接且未经 escapeshellarg, 仅 value 被转义 -> 通过 setOption 或 generate 的 options 参数可注入 shell 元字符; line 190-216 prepareOutput 仅用 phar:// 黑名单且 output 路径无白名单, 配合 overwrite 可任意删改文件",
+  "fix_suggestion": "line 144 应改为对原始 binary 调用 is_executable($binary) 后再使用 escapeshellarg($binary); line 146-158 对选项 key 使用 escapeshellarg('--'.$key) 或白名单校验 key 格式; line 195 将输出路径限制为预配置目录并使用 realpath 校验"
+}
+```

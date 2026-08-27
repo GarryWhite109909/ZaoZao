@@ -1,0 +1,53 @@
+## 全文逐函数分析（行号锚定）
+
+### 一、入口点枚举（覆盖全文）
+
+本文件是 Traefik 的 `rewritetarget` 中间件，全部代码仅含两个函数：`New`（第 33–72 行）与 `ServeHTTP`（第 79–137 行），另有 `GetTracingInformation`（第 74–76 行，无数据流）。入口点逐一列举：
+
+1. **HTTP 请求路径**：第 77–81 行 `req.URL.RawPath` / `req.URL.EscapedPath()` —— 攻击者完全可控的 source。
+2. **HTTP 查询串**：第 116–119 行 `req.URL.RawQuery` 被复制进重定向目标 —— 攻击者可控的第二个 source。
+3. **静态配置**：`config.Replacement`、`config.Regex`、`config.XForwardedPrefix`（第 38–70 行）—— 由运维/Ingress CRD 提供，属于半可信输入（多租户场景下可被低权限用户通过 Ingress 注解影响）。
+4. 无文件、环境变量、回调等其他通道；`rt.next.ServeHTTP` 是内部转发而非对外出口。
+
+### 二、source→sink 数据流逐条验证
+
+**流 A：请求路径 → 正则替换 → 内部转发路径（第 77→89→128–131 行）**
+- source：第 78 行 `currentPath := req.URL.RawPath`（未解码原始路径，攻击者可控）。
+- 处理：第 89 行 `newTarget = rt.regexp.ReplaceAllString(currentPath, rt.replacement)`；无正则时走第 91 行分支，剥离 `$N` 引用。
+- sink：第 128–131 行写入 `req.URL.RawPath` 并 `url.PathUnescape` 后赋给 `req.URL.Path`，交给后端。
+- 防御评估：这是中间件的**设计功能**（rewrite 本身就是允许改写路径），且注释明确说明不处理多重编码。若运维配置了宽松正则（如 ingress-nginx 迁移场景常见的 `/(.*)`），攻击者可通过编码字符（如 `%2e%2e%2f`）在替换结果中注入穿越序列，绕过后端路由前缀隔离。但该行为与 ingress-nginx 兼容语义一致，属于配置层面的固有风险，非本代码引入的逻辑缺陷。**记为低危备注**。
+
+**流 B：请求路径 → 替换 → X-Forwarded-Prefix 头（第 122–126 行）**
+- source 同上（currentPath），sink 为第 125 行 `req.Header.Set(xForwardedPrefix, prefix)`。
+- 若 `xForwardedPrefix` 模板含 `$1` 且正则捕获了含 `\r\n` 的内容，理论上可注入头。防御评估：Go 的 `net/http` 在写出响应/转发请求时会拒绝或清洗非法头值字符（`httpguts.ValidHeaderFieldValue`），注入会在传输层失败而非被利用。**不可利用**。
+
+**流 C：请求路径 + 查询串 → 302 重定向 Location（核心漏洞，第 84→89→112→121 行）**
+- 第 44–46 行：仅在**配置加载时**对静态模板 `config.Replacement` 做 `url.Parse` 判断是否绝对 URL，置 `absoluteURLRedirect = true`。该检查只验证模板字面前缀有 scheme，**完全没有考虑 replacement 中的捕获组引用 `$1`、`$2` 在运行期会被请求路径内容填充**。
+- 第 55–61 行：仅当 `NumSubexp() == 0 && absoluteURLRedirect` 时才追加 `.*` 强制整体匹配——即开发者意识到了“未匹配后缀泄漏”问题并修复了无捕获组的情况，但对**存在捕获组**的情形没有任何防护。
+- 运行期：第 89 行 `ReplaceAllString(currentPath, rt.replacement)` 将攻击者可控的 `currentPath` 片段填入 `$1` 等占位符，得到 `newTarget`。
+- 第 112–113 行：仅做 `url.Parse` 错误检查，**不校验结果 URL 的 scheme/host 是否仍属于配置意图**。
+- 第 121 行：`http.Redirect(rw, req, newTargetURL.String(), http.StatusFound)` —— sink。
+- **攻击示例**：运维配置 `regex: /legacy/(.*)`、`replacement: https://$1`（意图是把子域传入）。攻击者请求 `/legacy/evil.com/path`，第 89 行产出 `https://evil.com/path`，第 121 行返回 302 至任意外部域名 → **开放重定向（CWE-601）**。同理 `replacement: https://internal/$1` 时虽 host 固定，但配合第 117–119 行把 `req.URL.RawQuery` 原样透传，可携带任意查询参数用于钓鱼或 token 泄漏。
+- 防御有效性判定：第 44–46 行的 scheme 检查只针对静态模板，属“黑名单式/前置式”弱校验，无法约束运行期拼接结果；第 112 行的 Parse 仅查语法错误。**均无效**。
+
+### 三、第二入口与替代通道核查
+
+- 第二 source（RawQuery，第 117–119 行）：无条件并入重定向目标，放大流 C 的钓鱼/token 外泄面；在非 absoluteURLRedirect 分支中 RawQuery 不参与，无影响。
+- 替代通道：`GetTracingInformation` 无数据流；`New` 中两次 `regexp.Compile` 使用用户配置的正则，Go RE2 无灾难性回溯，无 ReDoS。
+- 非 absoluteURLRedirect 分支（第 123–136 行）不会产生对外重定向，主要风险已在上文流 A 记为低危。
+
+### 四、结论
+
+唯一确认的可利用漏洞为流 C：当 `Replacement` 为含捕获组引用的绝对 URL 且 `Regex` 含捕获组时，请求路径内容可控最终 302 目标，构成开放重定向。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-601 开放重定向",
+  "risk_level": "中危",
+  "source": "line 78: currentPath 取自 req.URL.RawPath，攻击者完全可控；line 117: req.URL.RawQuery 亦被并入重定向目标",
+  "sink": "line 121: http.Redirect(rw, req, newTargetURL.String(), http.StatusFound)",
+  "explanation": "line 44-46 仅在配置加载期对静态模板 config.Replacement 做 url.Parse 判断是否存在 scheme 并置 absoluteURLRedirect=true，该检查完全不覆盖 replacement 中形如 $1 的捕获组引用在运行期会被请求路径内容填充的情形；line 55-61 只针对 NumSubexp()==0 的情况追加 .* 防止后缀泄漏，对含捕获组的正则无任何防护；运行期 line 89 ReplaceAllString(currentPath, rt.replacement) 把攻击者可控的路径片段写入 newTarget，line 112 的 url.Parse 仅校验语法合法性而不校验结果的主机或 scheme 是否符合配置意图，最终 line 121 发出 302。例如配置 regex=/legacy/(.*) 与 replacement=https://$1 时，请求 /legacy/evil.com/x 即被重定向到 https://evil.com/x，构成任意开放重定向；同时 line 117-119 将请求查询串原样透传到重定向目标，可被用于携带 token 或增强钓鱼可信度 -> 攻击者控制的重定向目标",
+  "fix_suggestion": "line 112 之后增加结果校验：当 absoluteURLRedirect 为真时，解析 newTargetURL 后必须比对其 Scheme 与 Host 和配置模板解析出的固定 Scheme/Host 完全一致（或在 New 阶段禁止含捕获组引用的绝对 URL replacement，强制要求捕获组仅出现在路径部分），不一致时返回 500 或降级为内部路径处理；同时对透传的 RawQuery 做白名单化或至少记录审计日志"
+}
+```

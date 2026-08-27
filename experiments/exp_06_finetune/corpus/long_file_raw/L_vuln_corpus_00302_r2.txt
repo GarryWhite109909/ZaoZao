@@ -1,0 +1,36 @@
+## 编号分析（逐函数、逐行证据）
+
+**1. 文件级入口点枚举（第 1–130 行全文通读）**
+
+本文件是 langchain-core 中的 `DictPromptTemplate`（第 15 行类定义），属于库代码而非应用代码，因此不存在 HTTP 路由、CLI 参数、环境变量读取等直接外部入口。其全部“入口点”为以下公开 API，逐一列出：
+
+- E1：构造器 `DictPromptTemplate(template=..., template_format=...)`（第 16–18 行字段声明），template 内容与 template_format 均由调用方传入；
+- E2：`format(**kwargs)`（第 27–35 行），kwargs 为用户可控输入变量；
+- E3：`aformat(**kwargs)`（第 37–42 行），异步包装，内部直接委托 `self.format`（第 42 行）；
+- E4：`invoke(input, config, **kwargs)`（第 49–58 行），input dict 经 `self._call_with_config(lambda x: self.format(**x), ...)`（第 50 行）进入 format；
+- E5：模块级 `_get_input_variables`（第 74 行起）与 `_insert_input_variables`（第 95 行起），被上述方法间接调用。
+
+**2. 逐条 source→sink 数据流验证**
+
+流 A：E2/E3/E4 的 kwargs（source）→ 第 33 行 `_insert_input_variables(self.template, kwargs, ...)` → 第 103/113/119 行 `formatter(v, **inputs)`（sink）。sink 是 `DEFAULT_FORMATTER_MAPPING[template_format]`（第 100 行），即 f-string 的 `string.Formatter` 或 mustache 格式化器。f-string Formatter 只做占位符替换，**不执行任意表达式**（不同于 `str.format` 链式属性访问的潜在风险面，此处输入作为值传入而非模板字符串本身；模板字符串来自第 17 行的 `template` 字段，由开发者定义）。若攻击者能同时控制 template 与 inputs，则等价于任意代码执行前提已成立（能控制模板即能控制输出），不构成本文件新增漏洞。防御有效性：无过滤依赖，无黑名单可绕过问题。
+
+流 B：递归遍历。`_get_input_variables`（第 74–93 行）处理 str/dict/list/tuple 三类分支（第 78/80/83–88 行）；`_insert_input_variables`（第 95–130 行）对应处理（第 102/106/111–122 行），非字符串非容器值原样复制（第 124–125 行）。两处递归均无深度限制——理论上超深嵌套 dict 可致 RecursionError（可用性小问题），但这是 DoS 边界情况且需要调用方主动构造，通常不计为安全漏洞。
+
+流 C：image_url/path 警告分支（第 107–112 行）。当模板 dict 中出现键 `image_url` 且子 dict 含 `path` 时仅发出 `warnings.warn`（第 112 行）。关键事实：**该分支只警告，不做任何阻断或脱敏**，随后仍走第 114 行正常格式化。但需注意 sink 分析：本文件中该 path 值不会被用于任何文件 I/O——文件内没有任何 `open`、`os.path`、文件加载调用；历史上 langchain 曾在格式化时自动将 image_url.path 读入 base64（构成 CWE-22/CWE-73 本地文件读取链），而当前版本该自动加载工具已被移除（警告文案第 108–110 行明确说明 utility has been removed）。因此在本文件范围内，path 仅作为普通字符串被替换进输出 dict，真正的文件读取责任转移给下游消费者。此警告是对下游集成者的提示性防御，不是本文件的 sink。
+
+流 D：序列化通道。`_serialized`（第 62–63 行）经 `dumpd(self)`（第 63 行）生成；`is_lc_serializable` 返回 True（第 68 行）。反序列化安全性由 langchain_core.load 的 allowlist 机制保证，不在本文件引入新风险。`pretty_repr`（第 81 行起）直接 raise NotImplementedError（第 90 行），无可达逻辑。
+
+**3. 第二入口与替代通道核查**
+
+- `aformat`（第 42 行）与 `invoke`（第 50 行）最终都收敛到同一 `format`→`_insert_input_variables` 路径，无绕过主路径的替代实现。
+- `input_variables` 属性（第 21–23 行）只做提取，无副作用、无 sink。
+- 模块级两个私有函数虽可直接 import 调用，但行为与经由公开 API 一致。
+- 全文 grep 级检查：无 `eval`/`exec`/`subprocess`/`open`/网络调用/环境变量读取；唯一外部交互是 `warnings.warn` 与 `dumpd`。
+
+**4. 结论**
+
+所有数据流的 sink 均为纯字符串格式化，无命令执行、路径遍历、注入类 sink 在本文件内可达。image_url/path 分支的“仅警告不阻断”在历史版本语境下曾关联本地文件读取漏洞，但当前代码中该危险 sink 已移除，剩余风险取决于下游是否自行实现文件加载——不属于本文件的可判定漏洞。故判定：不存在可确认的安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "无（历史关联 CWE-22 已在上游移除触发点）", "risk_level": "低", "source": "line 27/49: format 与 invoke 的用户可控 kwargs 及 template 字段", "sink": "line 103/113/119: DEFAULT_FORMATTER_MAPPING 中格式化器的纯占位符替换", "explanation": "全文逐函数核查后未发现可达的危险 sink：formatter 仅做字符串插值不执行表达式；line 107-112 对 image_url+path 仅 warnings.warn 不阻断，但本文件内无任何 open/os.path/文件加载调用，历史版本借此实现的本地文件读取链已被上游移除（见 line 108-110 警告文案）；aformat(line 42) 与 invoke(line 50) 均收敛到同一条 format 路径，无第二入口绕过；递归遍历无深度限制最多导致 RecursionError 类可用性问题", "fix_suggestion": "line 107-114: 若需彻底防御，可在检测到 image_url 含 path 键时抛出异常或剥离该键而非仅发出警告，防止下游集成者误用旧版自动文件加载行为"}
+```

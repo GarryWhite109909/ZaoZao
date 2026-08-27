@@ -1,0 +1,41 @@
+LANG: python
+```code
+from fastapi import FastAPI, Request
+import redis
+import json
+
+app = FastAPI()
+rds = redis.Redis(host="localhost", port=6379, db=0)
+
+ALLOWED_AGGREGATE_KEYS = {"daily_summary", "weekly_summary", "monthly_report"}
+
+@app.get("/cache/{key}")
+async def get_cached_aggregate(key: str):
+    if key not in ALLOWED_AGGREGATE_KEYS:
+        return {"error": "not found"}
+    raw = rds.get(key)
+    if raw is None:
+        return {"error": "not found"}
+    obj = json.loads(raw.decode("utf-8"))
+    return {"result": str(obj)}
+
+@app.post("/cache/{key}")
+async def put_cached_aggregate(key: str, request: Request):
+    if key not in ALLOWED_AGGREGATE_KEYS:
+        return {"error": "invalid key"}
+    body = await request.body()
+    json.loads(body.decode("utf-8"))
+    rds.set(key, body)
+    return {"status": "stored"}
+```
+
+1. 第 9 行：用户可控输入点为路径参数 `key`（GET/POST 两条路由），第 20 行 POST 的 `request.body()` 为第二个可控输入点，二者均直接进入 Redis 存取链路。
+2. 原代码第 14 行 `pickle.loads(raw)` 是反序列化 sink：攻击者可通过 POST 写入恶意 pickle 字节流（如 `__reduce__` 执行任意命令），再经 GET 触发反序列化，构成完整 CWE-502 链。
+3. 修复机制一——白名单精确允许集：第 8 行定义 `ALLOWED_AGGREGATE_KEYS` 精确集合，第 11 行与第 22 行对 `key` 做 membership 校验，拒绝任意键写入/读取，收窄攻击面到固定键名。
+4. 修复机制二——框架无关的安全序列化 API 替换：第 16 行将 `pickle.loads` 替换为 `json.loads`（JSON 解析器不执行对象构造，无代码执行原语）；第 26 行在写入前用 `json.loads(body.decode('utf-8'))` 强制校验存储内容必须是合法 JSON，确保 GET 侧永远只会解析 JSON 而非 pickle 载荷。位置上覆盖了写入口与读出口两端，类型正确性由 JSON 文本格式保证。
+5. 控制流、函数名、路由路径、变量名均保持不变，仅插入白名单校验语句并替换反序列化调用，符合最小 diff 纪律；业务场景（聚合结果缓存读写）不变。
+6. 第二入口检查：POST 入口经第 22 行白名单 + 第 26 行 JSON 校验双重防御，无法再注入 pickle 字节流；Redis 中历史遗留的旧数据若非合法 JSON，会在第 16 行被 `json.loads` 拒绝而抛错返回，不会触发反序列化执行，替代通道已闭合。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞链：POST /cache/{key} 将请求体原样写入 Redis，GET /cache/{key} 用 pickle.loads 反序列化读取，攻击者可植入恶意 pickle 实现任意代码执行（CWE-502）；修复采用白名单精确允许集限制 key，并用 json.loads 替换 pickle.loads 且在写入前强制 JSON 校验，双端覆盖写入口与读出口", "fix_suggestion": "line 16: 以 json.loads(raw.decode('utf-8')) 替换 pickle.loads 并配合第 8 行白名单 ALLOWED_AGGREGATE_KEYS 与第 26 行写入前 JSON 校验"}
+```

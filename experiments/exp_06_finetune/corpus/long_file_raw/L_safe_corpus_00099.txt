@@ -1,0 +1,23 @@
+## 编号分析
+
+1. **入口点枚举（全文）**
+   - `New()`（约第 130 行）：外部传入 `DownloadRequest{Directory, URL, FileName, UseHeader}`，URL 与 FileName 均为用户可控 source。
+   - `Execute()`（约第 160 行起）：发起 HTTP 请求；`Content-Disposition` 头的 `filename` 参数（第 190 行附近）是第二入口（响应头注入的文件名）。
+   - URL 路径最后一段作为文件名回退（第 205 行附近）。
+   - `Path()`（第 245 行附近）：`filepath.Join(dl.req.Directory, dl.path)` 为 sink 前置拼接。
+   - `Write(p, r, ...)`（第 225 行附近）：最终磁盘写入 sink。
+   - 无其他环境变量/回调入口；`ByID/ByServer/remove` 仅是缓存查询。
+
+2. **SSRF 数据流验证**
+   - 防御一：自定义 `DialContext`（init 中），在真实连接建立后解析 `RemoteAddr`，阻断 loopback/link-local 及 `internalRanges`（10/8、172.16/12、192.168/16、169.254/16、::1、fe80::/10、fc00::/7）。该检查基于实际拨号 IP，天然免疫 DNS 重绑定（TOCTOU）——这是有效防御。
+   - 防御二：`CheckRedirect` 返回 `ErrUseLastResponse`，完全不跟随重定向，杜绝重定向绕过——有效。
+   - **缺口**：黑名单未包含 `0.0.0.0`（未指定地址）。在 Linux 上向 `0.0.0.0` 拨号等价于连接本机回环/本地服务；`0.0.0.0` 不属于 loopback、link-local，也不在 `internalRanges` 任何段内，检查全部放行。用户提交 `http://0.0.0.0:PORT/` 即可触达宿主机本地监听服务，构成 SSRF 绕过。此外也未覆盖广播/组播等其他特殊地址（如 `100.64.0.0/10` CGNAT、`::` 未指定地址），但 `0.0.0.0` 是最直接可利用项。
+
+3. **路径穿越数据流验证（第二入口）**
+   - `dl.path` 可来自：(a) 用户提供的 `FileName`；(b) 远端服务器完全控制的 `Content-Disposition: filename`（第 190 行附近）；(c) URL 末段。三者均未做任何 `..` 或分隔符清洗，随后进入 `filepath.Join(dl.req.Directory, dl.path)`。`Join` 只做词法清理不限制向上跳转，`filename=../../../etc/passwd` 形式的值可逃逸目标目录。最终依赖 `Filesystem().Write` 的内部校验（本文件不可见），若该层校验存在则风险被兜底，否则构成任意路径写入。就本文件证据而言，source→sink 链上无有效防御。
+
+4. **其他通道**：重定向被禁用，故无法通过 302 使其访问内网；下载进度/取消逻辑无安全影响；缓存 map 有锁保护，无并发问题。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "SSRF bypass via 0.0.0.0 and potential path traversal via unsanitized filename", "risk_level": "high", "source": "用户提供的 DownloadRequest.URL / FileName 以及远端响应头 Content-Disposition 的 filename 参数", "sink": "自定义 DialContext 发起的出站连接（SSRF）与 Filesystem().Write 的磁盘写入（路径拼接 filepath.Join(dl.req.Directory, dl.path)）", "explanation": "第一，DialContext 中对内网地址的黑名单检查遗漏了 0.0.0.0：该地址既非 loopback 也非 link-local，也不在 internalRanges 任一 CIDR 内，但在 Linux 上向其拨号会连到本机服务，攻击者提交 http://0.0.0.0:<port>/ 即可探测和访问宿主机本地监听端口，绕过全部 SSRF 防护（重定向已被禁用、DNS 重绑定因基于实际 RemoteAddr 校验而无效，但 0.0.0.0 是直接缺口）。第二，文件名来源有三处且均未过滤：用户传入的 FileName、远端服务器完全控制的 Content-Disposition filename、以及 URL 末段，随后直接经 filepath.Join 拼接并写入磁盘，含 ../ 的值可目录穿越；仅当下游 Filesystem().Write 自带根目录约束时才被缓解，而本文件内无任何净化逻辑。", "fix_suggestion": "在 DialContext 中额外拒绝 ip.IsUnspecified() 以及 0.0.0.0、100.64.0.0/10、:: 等特殊地址，或改为白名单只允许公网单播地址；对 dl.path 调用 filepath.Base 并显式拒绝包含路径分隔符或 .. 的文件名，同时确保写入前用 filepath.Rel 验证最终路径仍位于服务器数据目录内。"}
+```

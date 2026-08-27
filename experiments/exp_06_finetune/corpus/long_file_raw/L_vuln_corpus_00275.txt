@@ -1,0 +1,29 @@
+## 编号分析
+
+**入口点枚举（全文）**
+
+1. `deliver_webhook`（第284行）：事件触发通道，payload 来自内部事件，store 提供的 webhook 列表（含用户注册的 URL/secret）。
+2. `test_webhook`（第303行）：测试通道，`webhook` 对象（含任意 `url`）直接传入。
+3. 环境变量：`MLFLOW_WEBHOOK_*`、`MLFLOW_ENABLE_WORKSPACES`（第27–32行）——仅影响行为参数，非攻击面。
+
+**数据流验证**
+
+- 流 A：用户注册的 `webhook.url` → 第141行 `_validate_webhook_url(webhook.url)` → 第177行 `session.post(webhook.url, ...)`。防御为单一校验函数；按规则黑名单/正则类过滤视为可绕过（典型实现基于 scheme 白名单+内网 IP 黑名单，可被 DNS rebinding、重定向至内网、IPv6/十进制 IP 等绕过）。且重试配置（第76–85行）跟随 3xx 重定向时无 re-validation。**SSRF 成立（CWE-918）**。
+- 流 B：`test_webhook`（第303行）→ 第315行 `_send_webhook_request` → 第177行 POST 任意 URL → 第321–324行将 `response.text` 完整回传给调用者。这是**全读型 SSRF**：攻击者可读取内网服务（如云元数据 169.254.169.254、内部管理接口）的响应体并原样返回，危害高于盲打。
+- 流 C：HMAC 签名（第109–125行）使用 `hmac.new` 常量时间比较不适用（这里是生成端），签名覆盖 delivery_id/timestamp/payload，防篡改与重放设计正确，无漏洞。
+- 流 D：缓存（第189–245行）TTLCache + 双检锁，线程安全处理正确；但注意第273–281行：URL 校验发生在投递时而非注册时，配合缓存意味着绕过校验的 URL 可在 TTL 内反复触发。
+- 流 E：异常日志（第181、185、257行）记录完整 URL 与错误，可能泄露内网拓扑到日志，属低风险信息泄露。
+
+**第二入口确认**：`test_webhook` 是独立于投递流程的第二入口，且返回响应体，是最严重的利用路径。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-918 SSRF (Server-Side Request Forgery)",
+  "risk_level": "high",
+  "source": "line 303: test_webhook 接收含任意 url 的 webhook 对象 / 用户注册的 webhook.url",
+  "sink": "line 177: session.post(webhook.url, ...) 以及 line 324: response_body=response.text 回传给调用者",
+  "explanation": "用户可控的 webhook.url 经第141行 _validate_webhook_url 校验后于第177行发起服务器端请求；该单点校验属于黑名单式防御可被 DNS rebinding 或重定向绕过，且 test_webhook 在第324行把目标响应体完整返回给调用者，构成全读型 SSRF，可探测并窃取内网服务如云元数据接口的数据",
+  "fix_suggestion": "在注册和发送时均做严格校验：解析 URL 后禁止私网/链路本地/环回地址段，禁用自动重定向或对每次重定向重新校验目标 IP，并对 test_webhook 的 response_body 做长度限制与内容脱敏"
+}
+```

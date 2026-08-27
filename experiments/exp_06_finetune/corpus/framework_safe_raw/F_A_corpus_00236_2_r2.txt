@@ -1,0 +1,65 @@
+LANG: php
+```php
+<?php
+// auth.php - JWT 签发与校验（原生 PHP，firebase/php-jwt 风格）
+require_once __DIR__ . '/vendor/autoload.php';
+
+use Firebase\JWT\JWT;
+use Firebase\JWT\Key;
+
+function get_jwt_secret(): string {
+    $secret = getenv('JWT_SECRET'); // 第 8 行：从环境变量读取密钥，不再硬编码
+    if ($secret === false || strlen($secret) < 32) {
+        throw new RuntimeException('JWT secret not configured');
+    }
+    return $secret;
+}
+
+function create_user_jwt(string $username, array $networks, bool $isAdmin): string {
+    $issuedAt = time();
+    $payload = [
+        'iss' => 'netmaker-api',
+        'sub' => $username,
+        'networks' => $networks,
+        'is_admin' => $isAdmin,
+        'exp' => $issuedAt + 7200,
+    ];
+    return JWT::encode($payload, get_jwt_secret(), 'HS256'); // 第 24 行：改用环境变量密钥签名
+}
+
+function verify_user_jwt(string $token): ?array {
+    try {
+        $decoded = JWT::decode($token, new Key(get_jwt_secret(), 'HS256')); // 第 30 行：删除主密钥后门比较，统一走 JWT 验签
+        $user = db_find_user($decoded->sub);
+        if ($user === null) {
+            return null;
+        }
+        return (array) $decoded;
+    } catch (\Exception $e) {
+        return null;
+    }
+}
+
+// 路由入口：POST /api/login 与 GET /api/verify?token=...
+$uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH); // 第 45 行：外部输入 source
+if ($uri === '/api/login') {
+    $body = json_decode(file_get_contents('php://input'), true);
+    header('Content-Type: application/json');
+    echo json_encode(['token' => create_user_jwt($body['username'], $body['networks'] ?? [], false)]);
+} elseif ($uri === '/api/verify') {
+    $claims = verify_user_jwt($_GET['token'] ?? ''); // 第 51 行：token 直达 verify sink
+    header('Content-Type: application/json');
+    echo json_encode(['admin' => $claims['is_admin'] ?? false]);
+}
+```
+
+1. 第 45、51 行为用户可控输入点：`$uri` 来自 `$_SERVER['REQUEST_URI']`，`$body['username']`/`$body['networks']` 来自 POST JSON 体，`$_GET['token']` 来自查询串；这些入口与原代码完全一致。
+2. 漏洞数据流追踪：硬编码常量 `JWT_SECRET = 'BytesOverTheWire'` 在第 18 行（原）被 `create_user_jwt` 用于签名（sink 1），并在第 26 行（原）被 `verify_user_jwt` 用于验签（sink 2）；任何拿到源码或泄露该常量字符串的攻击者均可伪造任意 admin token。
+3. 防御类型正确性：新增辅助函数 `get_jwt_secret()`（第 7-12 行）通过框架无关的原生安全 API `getenv()` 从部署环境注入密钥，并校验存在性与最小长度（≥32 字符），失败即抛异常拒绝签发/验签——这是密钥管理的标准做法，而非黑名单/正则过滤。
+4. 防御位置正确性：替换发生在两个 sink 的直接调用处（第 24 行 encode、第 30 行 decode），覆盖了硬编码凭据的全部使用点；同时第 29 行（原第 22 行）的 `getenv('MASTER_KEY')` 后门比较被整体删除，消除绕过 JWT 校验直取 admin 身份的第二条认证旁路。
+5. 攻击面覆盖完整性：签名与验签共用同一运行时注入的密钥来源，伪造者无法再从代码仓库、镜像层或反编译产物中获得密钥；后门比较移除后，唯一认证路径是密码学验签。
+6. 第二入口检查：`/api/login` 与 `/api/verify` 两条路由的数据流走向、函数名、路由路径、控制流均与原代码保持一致，仅密钥来源与后门比较两处做了防御性最小修改；无其他残留硬编码凭据。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-798 硬编码凭据：第 8 行硬编码 JWT_SECRET 常量在第 18 行签名与第 26 行验签两处 sink 被使用，且第 22 行存在 getenv('MASTER_KEY') 后门比较可绕过验签直取 admin；修复将密钥改为 getenv('JWT_SECRET') 运行时注入并校验长度，删除 MASTER_KEY 后门比较，两条路由数据流与标识符均保持不变", "fix_suggestion": "line 8: 删除硬编码常量，新增 get_jwt_secret() 以 getenv 注入密钥并在 line 24/line 30 两处调用；同时删除 line 22 的 MASTER_KEY 后门比较"}
+```

@@ -1,0 +1,42 @@
+## 编号分析（逐函数、逐入口点）
+
+**文件结构总览**：本文件只有一个 HTTP 中间件 `rewriteTarget`，入口点唯一：`ServeHTTP`（第 62 行起），source 是请求行中的 URL 路径（用户完全可控），配置项（Replacement/Regex/XForwardedPrefix）来自运维配置，视为受信输入。
+
+**1. New（第 33–60 行）—— 配置解析与关键判定**
+- 第 35–38 行：Replacement 非空校验。
+- 第 40–42 行：`url.Parse(config.Replacement)`，仅以 `parsed.Scheme != ""` 判定 `absoluteURLRedirect`。注意：协议相对地址 `//host` 的 Scheme 为空，不会进入重定向分支；而带捕获组的绝对 URL 模板会进入重定向分支。
+- 第 45–47 行：正则以 `(?i)` 编译，未做长度/复杂度限制（潜在 ReDoS 面，但 Go regexp 为 RE2 线性引擎，不构成实际漏洞）。
+- 第 50–56 行：仅在 `NumSubexp()==0 且 absoluteURLRedirect` 时追加 `.*` 防止后缀泄漏。**该防护只覆盖无捕获组场景，有捕获组时完全不设防。**
+
+**2. ServeHTTP（第 62 行起）—— 唯一请求入口**
+- 第 64–69 行：`currentPath := req.URL.RawPath`，为空则取 `EscapedPath()`。这是攻击者 source：路径的原始转义形式，可包含 `%2F`、`%40`(即 @)、`.`、`//` 等。
+- 第 71–75 行：正则不匹配直接放行；匹配即继续。
+- 第 78–82 行：`ReplaceAllString(currentPath, rt.replacement)` —— 用户可控路径内容被拼入 `newTarget`。
+- 第 85–88 行：空结果返回 500。
+- 第 91–110 行：absoluteURLRedirect 分支。第 92 行 `url.Parse(newTarget)` 只检查能否解析，**未校验 Host 是否等于模板中配置的主机**；第 104–108 行还把请求查询串原样带入 `http.Redirect(..., StatusFound)`。这就是 sink：302 Location 完全由拼接结果决定。
+- 第 112–117 行：XForwardedPrefix 头注入分支 —— `Header.Set` 由 Go 标准库拒绝含 CR/LF 的值，且路径本身不能含换行，故头注入不可达（替代通道已排除）。
+- 第 119–131 行：内部改写分支 —— `RawPath`/`PathUnescape` 仅影响上游路由，非安全 sink。
+
+**3. 数据流验证（source→sink）**
+source：第 66 行 `req.URL.RawPath/EscapedPath()`（攻击者可控）→ 第 79 行 `ReplaceAllString` 拼接 → 第 92 行 `url.Parse`（仅语法校验）→ 第 107 行 `http.Redirect`。
+
+防御有效性核查：
+- 第 41 行的 Scheme 判定只约束『模板本身』是否为绝对 URL，无法阻止捕获组内容改变最终 URL 的语义；
+- 第 92 行 `url.Parse` 成功不代表主机未被篡改 —— 它不做 allowlist 校验，属弱防御；
+- 注释声称『防止用户可控捕获组注入绝对 URL 重定向』，但该声明对含捕获组的配置不成立。
+
+**4. 具体绕过 PoC**
+配置：Regex=`/old/(.*)`，Replacement=`https://sso.example.com/$1`（absoluteURLRedirect=true）。
+攻击者请求路径：`/old/%40evil.com/`（或直接 `/old/@evil.com/`）。
+拼接结果：`https://sso.example.com/@evil.com/`？——若模板为 `https://$1.example-corp.com` 形式更典型：Replacement=`https://$1.sso.example.com`，Regex=`/(.*)\.login`，攻击者传 `/evil.com%23.login` 或利用 `@`：Regex=`/redirect(.*)`，Replacement=`https://portal.example.com$1`，请求 `/redirect@evil.com/` → newTarget=`https://portal.example.com@evil.com/`，`url.Parse` 将 `portal.example.com` 解析为 userinfo，Host=**evil.com**，第 107 行签发 302 至外部域。浏览器跟随即构成开放重定向（CWE-601），可用于钓鱼/OAuth token 截获。
+
+**5. 第二入口与替代通道**
+- 查询串透传（第 105–107 行）：放大重定向危害但非独立漏洞。
+- XForwardedPrefix 分支：无 CRLF 可达性，排除。
+- 内部改写分支：仅路由影响，排除。
+
+结论：存在漏洞 —— 有捕获组 + 绝对 URL 替换模板时，用户可控路径经 `@`/`#`/`//` 等字符注入改变重定向目标主机，绕过第 91 行注释所述防护。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-601 开放重定向", "risk_level": "中高", "source": "line 66: req.URL.RawPath / EscapedPath 攻击者可控请求路径", "sink": "line 107: http.Redirect(rw, req, newTargetURL.String(), http.StatusFound)", "explanation": "当 Replacement 为绝对 URL 且 Regex 含捕获组时，line 79 的 ReplaceAllString 将用户可控路径内容拼入 newTarget；line 92 的 url.Parse 仅做语法校验而不验证目标主机是否属于配置域，攻击者可用 @ 字符把配置主机降级为 userinfo，例如 Regex=/redirect(.*) 且 Replacement=https://portal.example.com$1 时请求 /redirect@evil.com/ 会生成 https://portal.example.com@evil.com/ 并在 line 107 返回 302 跳转到 evil.com，line 41 的 Scheme 判定与 line 50 的 .* 追加均无法覆盖此场景", "fix_suggestion": "line 92 之后应解析模板自身得到期望 Host，再对 newTarget 解析后的 Host 做严格白名单比对，不一致时返回 400；或禁止 Replacement 含捕获组引用时启用绝对 URL 重定向"}
+```

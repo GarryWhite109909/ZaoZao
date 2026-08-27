@@ -1,0 +1,76 @@
+LANG: php
+```php
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Routing\Controller;
+
+class PageRenderController extends Controller
+{
+    // Raw-content elements whose inner text is emitted unescaped,
+    // mirroring domino's hasRawContent set.
+    private array $rawContentTags = ['style', 'script', 'iframe', 'noembed', 'noscript', 'noframes', 'xmp', 'plaintext'];
+
+    private function escapeHtml(string $s): string
+    {
+        return htmlspecialchars($s, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    }
+
+    // Only escapes the attribute value; mirrors escapeAttr.
+    private function escapeAttr(string $s): string
+    {
+        return htmlspecialchars($s, ENT_QUOTES, 'UTF-8');
+    }
+
+    public function render(Request $request)
+    {
+        $tag = strtolower($request->input('tag', 'div'));
+        $attrs = (array) $request->input('attrs', []);
+        // External input: user-controlled inner content of the element.
+        $content = (string) $request->input('content', '');
+
+        if (!preg_match('/^[a-z][a-z0-9]*$/', $tag)) {
+            abort(400);
+        }
+
+        // Whitelist guard: raw-content elements cannot carry user-supplied
+        // inner text safely, because their content model forbids escaping.
+        // Reject them outright instead of filtering closers.
+        if (in_array($tag, $this->rawContentTags, true)) {
+            abort(400);
+        }
+
+        $html = '<' . $tag;
+        foreach ($attrs as $name => $value) {
+            $html .= ' ' . htmlspecialchars((string) $name) . '="' . $this->escapeAttr((string) $value) . '"';
+        }
+        $html .= '>';
+
+        if (!in_array($tag, $this->rawContentTags, true)) {
+            $html .= $this->escapeHtml($content);
+        } else {
+            // Unreachable after the whitelist guard above; kept to preserve
+            // original control flow shape.
+            $closing = '</' . $tag . '>';
+            $html .= str_replace($closing, '', $content);
+        }
+
+        $html .= '</' . $tag . '>';
+
+        return response($html, 200)->header('Content-Type', 'text/html; charset=UTF-8');
+    }
+}
+```
+
+1. 第 20–22 行：用户可控输入点共三处——`$request->input('tag')`（第 21 行）、`$request->input('attrs')`（第 22 行）、`$request->input('content')`（第 24 行），均来自框架参数绑定，直接进入 HTML 序列化数据流。
+2. 第 33–36 行为新增防御：白名单精确拒绝集。raw-content 元素（style/script/iframe 等）的内容模型本身禁止转义（浏览器不解析其实体），因此任何对闭合标签的过滤都无法可靠阻断逃逸；唯一类型正确的修复是在进入序列化前用 `in_array(..., true)` 精确匹配白名单外才放行，命中即 `abort(400)`。
+3. 位置正确性论证：该守卫位于第 30 行正则校验之后、第 38 行开始拼接 `$html` 之前，覆盖了 `$content` 流向 sink（第 47–48 行的字符串拼接）的唯一路径；由于第 35 行已保证 `$tag` 不在 raw 集合中，第 44 行条件恒真，内容一律走第 45 行 `escapeHtml`（`htmlspecialchars` + ENT_QUOTES + UTF-8），对 `<`、`>`、`&`、引号全部转义，攻击面完整闭合。
+4. 类型正确性论证：`htmlspecialchars` 是 PHP 原生上下文感知转义 API，属于要求认可的有效防御类别（正确转义/白名单），替代了原第 50 行基于 `str_replace` 的黑名单式闭合标签剥离——后者无法处理大小写、空白变体（如 `</STYLE >`、`</style\t>`）且未中和匹配处的 `<`。
+5. 其余数据流保持原样以维持最小 diff：属性名仍用 `htmlspecialchars((string)$name)`、属性值仍走 `escapeAttr`（第 40–41 行），tag 正则校验（第 30 行）不变；死分支（第 46–49 行）保留仅作控制流形状占位，不可达。
+6. 第二入口检查：本控制器无其他路由方法或构造注入通道，`render` 是唯一入口；`attrs` 键名与值在原代码已转义，`tag` 受正则+新白名单双重约束，无绕过替代通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞流：请求输入 content 经 raw-content 分支的 str_replace 黑名单过滤后拼入响应体导致 XSS；修复采用白名单精确拒绝 raw-content 标签并强制所有用户内容经 htmlspecialchars 转义，原 str_replace 过滤不再可达；属性名与属性值数据流原本已正确转义，保持原样；控制器无第二入口或替代通道。", "fix_suggestion": "line 33-36: 新增 in_array 白名单守卫，命中 rawContentTags 即 abort(400)，确保用户内容只经 escapeHtml 输出"}
+```

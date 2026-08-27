@@ -1,0 +1,43 @@
+LANG: python
+```code
+import hashlib
+import json
+
+from flask import Flask, request, jsonify
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.exceptions import InvalidSignature
+
+app = Flask(__name__)
+
+TRUSTED_PUBKEY = serialization.load_pem_public_key(open("signer_pub.pem", "rb").read())
+
+
+def verify_and_decode(data: bytes):
+    """Verify a detached signature over data and return the payload."""
+    signature = bytes.fromhex(request.headers.get("X-Signature", ""))
+    # Defense: pin the signature to a strong hash algorithm (SHA-256) and PSS padding.
+    TRUSTED_PUBKEY.verify(signature, data, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
+    return json.loads(data)
+
+
+@app.route("/api/manifest/verify", methods=["POST"])
+def verify_manifest():
+    raw = request.get_data()  # source: attacker-controlled signed manifest
+    try:
+        payload = verify_and_decode(raw)
+    except (InvalidSignature, ValueError):
+        return jsonify({"error": "invalid signature"}), 403
+    return jsonify({"verified": True, "payload": payload})
+```
+
+1. 第 16 行 `request.get_data()` 与第 12 行 `X-Signature` 头是用户可控输入点：攻击者可提交任意 manifest 字节与对应签名。
+2. 数据流：raw → verify_and_decode（第 11 行）→ 第 15 行 `TRUSTED_PUBKEY.verify(...)`，即 sink；原代码使用 SHA-1 + PKCS1v15 验签，构成 CWE-327：SHA-1 已被证明存在碰撞/前缀构造攻击，PKCS1v15 也缺乏随机化，攻击者可为恶意 payload 伪造或迁移合法签名。
+3. 修复类型正确性：第 15 行将哈希精确固定为 `hashes.SHA256()`，填充改为带 MGF1-SHA256 的 PSS——这是 cryptography 库的原生强算法 API，属于白名单式精确允许集（只接受一种强算法组合），而非黑名单过滤；签名若用其他任何哈希生成都会因 InvalidSignature 被第 22 行捕获并返回 403。
+4. 位置正确性：修复位于 sink 调用处本身，即验签发生的确切位置，所有进入该函数的数据（唯一入口为第 21 行路由）都必然经过此校验，无绕过路径。
+5. 攻击面覆盖完整性：`verify` 是全等比较语义的密码学验证，固定算法后不存在降级协商空间；JSON 解析（第 16 行）仅在验签成功后执行，数据流顺序未变。
+6. 第二入口检查：文件中仅 `/api/manifest/verify` 一个路由、一个数据流；TRUSTED_PUBKEY 加载与响应序列化不涉及哈希选择，无需修改。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-327：第 15 行使用 SHA-1 与 PKCS1v15 验证攻击者可控 manifest 的签名，允许碰撞伪造；最小修复将验签固定为 SHA-256 + PSS(MGF1-SHA256) 的白名单式强算法组合，控制流、标识符与路由结构均保持不变。", "fix_suggestion": "line 15: 将 padding.PKCS1v15() 替换为 padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH)，并将 hashes.SHA1() 替换为 hashes.SHA256()"}
+```

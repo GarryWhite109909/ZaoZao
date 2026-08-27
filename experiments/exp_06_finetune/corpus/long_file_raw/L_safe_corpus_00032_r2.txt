@@ -1,0 +1,39 @@
+## 编号分析（逐函数、行号锚定）
+
+**1. 文件整体结构（第 1–30 行）**
+本文件是 mDNS/zeroconf 服务模拟器（zerogod）的监听器组件。`TCP_HANDLERS`（第 15–29 行）定义了 `_ipp/_ipps/_http/_https` 四种服务到处理器的映射，均为内置静态注册，无外部输入参与选择逻辑之外的分发。
+
+**2. `NewAcceptor`（第 66–99 行）——构造入口**
+- 参数 `service/srvHost/port/tlsConfig/ippAttributes/httpPaths` 全部来自模块自身配置或 mDNS 发现的服务描述（上游代码），非直接网络攻击者可控的原始字节。
+- 第 70 行：`proto` 由 `strings.Contains(service, "_tcp")` 决定，仅影响 tcp/udp 分支，无 sink。
+- 第 85–92 行：用 `strings.Contains(service, svcName)` 匹配 handler。注意这是子串包含而非精确匹配（如 `_https` 也包含 `_http`），但 map 遍历顺序不定可能导致 `_http` handler 抢先匹配 `_https` 服务——这是一个功能性缺陷（handler 误选），但两个 handler 最终都是 `httpClientHandler` 或带 TLS 的同一函数，且不构成可利用的安全漏洞，仅是行为不确定性。
+
+**3. `startTCP`（第 101–143 行）——网络入口 #1**
+- 第 104 行绑定 `0.0.0.0:port`，即对所有接口开放——这是该工具的设计目的（模拟/诱捕服务），属预期行为而非漏洞；风险取决于部署环境（应提示用户勿暴露于不可信网络）。
+- 第 110–137 行：Accept 循环。每个连接进入 goroutine（第 118 行起），HandlerContext 携带的 `client conn` 是攻击者完全可控的 source。
+- 关键防御点：第 133–136 行有 `defer recover()`，保证 handler panic 不会击穿进程——对不可信输入触发的崩溃具有兜底防护。
+- 实际数据处理被委托给 `ippClientHandler/httpClientHandler/handleGenericTCP`（定义在文件外），本文件内不存在将连接数据写入危险 sink（命令执行、路径拼接、SQL 等）的代码。
+
+**4. `startUDP`（第 145–172 行）——网络入口 #2**
+- 第 148 行同样绑 `0.0.0.0`。
+- 第 158 行：固定 4096 字节缓冲读取 UDP 包，`ReadFromUDP` 天然限制单包大小，无溢出风险（Go 切片安全）。
+- 第 163 行：`Dump(buffer[0:n])` 将攻击者可控字节交给日志/Dump 函数。潜在问题是日志注入（伪造换行污染日志）与终端转义序列注入（若 Dump/tui 未过滤 ANSI 序列）。这属于低危的日志完整性问题，且依赖文件外的 `Dump` 实现；在本文件范围内无法证实为可利用漏洞，只能作为加固建议。
+
+**5. `Start` / `Stop`（第 174–193 行）——生命周期控制**
+- `Stop` 中 TCP 分支先 `ctxCancel()` 并等待 context Done 再 Close listener（第 187–189 行），UDP 分支直接 Close（第 191 行）。逻辑正确，无竞态导致的 use-after-close 崩溃面（即便有，goroutine 内 Accept 错误已被第 113–116 行的条件判断吞掉）。
+- 无任何来自网络的信号能触发 Stop，故不存在远程关闭/DoS 入口。
+
+**6. 第二入口与替代通道核查**
+- 本文件入口仅有：TCP 连接（startTCP）、UDP 数据报（startUDP）、以及构造参数（NewAcceptor，来自内部配置）。
+- 无环境变量、无文件读写、无回调执行、无 `exec`/`os.Open`/反射调用等 sink 出现在全文。
+- `ippAttributes/httpPaths` 仅作透传给 HandlerContext（第 84–85、125–126 行），本文件内未被消费。
+
+**7. 数据流汇总**
+- source：远端 client conn 字节（TCP）、UDP 报文字节。
+- sink：仅 `Dump()` 日志输出（第 163 行）与 Debug/Info/Error 日志中的 `RemoteAddr()`（第 113、120 行）。
+- 防御：recover 兜底 + Go 内存安全 + 只读 dump，无黑名单/正则类可绕过过滤被当作唯一防线的情况。
+- 结论：本文件范围内不存在可达的危险 sink，无可确认的安全漏洞；仅存在两项低危加固点（ANSI/日志注入、0.0.0.0 全接口监听的部署风险）。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认：该文件仅为 zerogod 的监听器封装。全部入口为 startTCP(第101行)接受的TCP连接与 startUDP(第145行)接收的UDP数据报，攻击者可控字节仅流向 recover 保护的 handler goroutine(第133-136行)以及 Dump/日志输出(第163行)。文件内不存在命令执行、文件操作、路径拼接等危险 sink；NewAcceptor(第66行)的参数均来自内部配置而非原始网络输入。第85行的子串匹配导致 _https 可能误选 _http handler 属功能缺陷而非漏洞；0.0.0.0 监听是该工具的设计目的。因此基于全文证据判定无安全漏洞。", "fix_suggestion": "no fix needed"}
+```

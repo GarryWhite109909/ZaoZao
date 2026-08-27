@@ -1,0 +1,30 @@
+LANG: python
+```python
+import io
+from fastapi import FastAPI, UploadFile, File
+from lxml import etree
+
+app = FastAPI()
+
+@app.post("/api/documents/preprocess")
+async def preprocess_docx_entry(file: UploadFile = File(...)):
+    xml_bytes = await file.read()
+    parser = etree.XMLParser(resolve_entities=False, load_dtd=False, no_network=True)
+    try:
+        tree = etree.parse(io.BytesIO(xml_bytes), parser)
+    except etree.XMLSyntaxError:
+        return {"error": "invalid xml entry"}
+    result = tree.getroot()
+    return {"entry": etree.tostring(result, encoding="unicode")}
+```
+
+1. 第 7 行：用户可控输入点为框架参数绑定的 `file: UploadFile = File(...)`，第 8 行 `await file.read()` 将攻击者完全控制的 XML 字节读入 `xml_bytes`，这是唯一数据流的起点。
+2. 第 9 行构造 `etree.XMLParser` 并在第 11 行传入 `etree.parse(io.BytesIO(xml_bytes), parser)`——sink 是 XML 解析器对不可信字节的解析过程。原代码中 `resolve_entities=True, load_dtd=True, no_network=False` 允许解析 DTD、展开外部实体并发起网络请求，构成 CWE-611 XXE 主链：`file.read()` → parser → `etree.parse`。
+3. 防御类型正确性：lxml 官方推荐的安全配置是禁用 DTD 处理与实体解析（`resolve_entities=False, load_dtd=False, no_network=True`），属于框架原生安全 API 级别的防御，而非黑名单或字符串过滤；实体不再被展开，外部 DTD 不被加载，网络取回被禁止。
+4. 位置正确性：防御作用于第 9 行 parser 构造处，位于 sink（第 11 行 `etree.parse`）之前，覆盖了从字节流到解析器的全部路径。
+5. 攻击面覆盖完整性：XXE 的三类利用面——本地文件读取（file:// 外部实体）、SSRF（http(s) 外部实体）、Billion Laughs 实体膨胀——分别由 `no_network=True`、`load_dtd=False/resolve_entities=False` 组合阻断；内部实体不展开也阻断了实体膨胀放大。仅修改第 9 行三个关键字参数，函数名、路由、变量名与控制流保持最小 diff。
+6. 第二入口检查：本路由仅有一个入口 `/api/documents/preprocess`，无其他中间件或依赖注入引入额外 XML 解析通道；返回值 `etree.tostring(result)` 仅序列化已安全解析的树，不构成新的注入 sink。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞链为第 8 行 file.read() 获取用户可控 XML 字节，经第 9 行 resolve_entities=True 且 load_dtd=True 且 no_network=False 的 parser，在第 11 行 etree.parse 解析时触发 XXE；修复将第 9 行改为 resolve_entities=False、load_dtd=False、no_network=True，禁用实体展开与 DTD 加载并禁止网络访问，覆盖文件读取、SSRF 与实体膨胀全部攻击面；全应用无第二 XML 解析入口。", "fix_suggestion": "line 9: 将 etree.XMLParser 参数改为 resolve_entities=False, load_dtd=False, no_network=True"}
+```

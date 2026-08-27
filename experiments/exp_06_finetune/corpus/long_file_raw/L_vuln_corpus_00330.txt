@@ -1,0 +1,24 @@
+## 编号分析
+
+1. **第 33–47 行 `load()` / 第 49–56 行 `load_async()`**：入口点，接受任意文件路径，`resolve()` 后检查存在性即交给 `load_prompty`。路径本身由调用方提供，属正常 API 语义，不构成漏洞。
+
+2. **第 59–78 行 `default_save_context()`**：仅删除 `__` 前缀元数据键，纯数据清洗，无 sink。
+
+3. **第 85–103 行 `_build_agent()`**：将 `path` 写入 metadata（第 100 行），并构造 `_pre_process(path)` 回调（第 96 行）。此处把 `.prompty` 文件所在目录作为后续 `${file:}` 解析的基准目录。
+
+4. **第 110–152 行 `_pre_process().process()`**：
+   - 第 122–133 行 `env:` 协议：读取环境变量（第 127 行），值直接写入 data。这是读取而非注入 sink；若后续被模板渲染使用属于设计行为，本文件内无危险 sink。
+   - 第 134–140 行 `file:` 协议：**source 是 `.prompty` 文件内容中的 `${file:relative/path}` 字符串（第 135 行 val）**，第 136 行执行 `(agent_file.parent / val).resolve()`。关键点：`Path / "../../etc/passwd"` 在 Python 中会正确拼接相对路径，`resolve()` 会解析出父目录之外的绝对路径，**没有任何校验结果是否仍位于 `agent_file.parent` 之内**（无 `relative_to` 检查、无黑名单/白名单）。随后第 141 行调用 `_load_file_content(relative_path)`。
+   - 防御有效性评估：唯一的“防御”是第 137–139 行的存在性检查，这只确认文件存在，不能阻止目录穿越。
+
+5. **第 143–151 行 `_load_file_content()`**：sink 为第 145 行 `open(path)` + `json.load` / `yaml.safe_load` / `f.read()`。YAML 使用 `safe_load`（第 148 行），无反序列化 RCE；但 `open` 可读取任意可读文件内容，且读取结果会被注入到 Prompty 对象中（可能进入 prompt、配置等），造成敏感信息泄露（如 `/etc/shadow` 若进程有权限、应用密钥文件、`.env` 等）。
+
+6. **第二入口/替代通道**：`load_async`（第 51 行）走同一 `_pre_process` 管道，同样受影响；`${file:}` 也可能出现在嵌套 dict 的任意键值中（process 递归遍历传入的整个 frontmatter dict），攻击面覆盖所有字段。
+
+7. **前提条件**：利用需要攻击者能控制 `.prompty` 文件内容（如用户上传 prompt 模板、仓库加载不可信 prompt 的场景）。在“只加载开发者自己编写的文件”场景下风险有限，故定为中危。
+
+结论：存在 CWE-22 路径穿越导致任意文件读取。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal leading to Arbitrary File Read", "risk_level": "medium", "source": "line 135: 攻击者可控的 .prompty 文件中的 ${file:../../secret} 引用值 val", "sink": "line 145: open(relative_path) 后 json.load / yaml.safe_load / f.read() 将任意文件内容读入对象", "explanation": ".prompty 文件内容 -> process() 解析 ${file:val} -> line 136 (agent_file.parent / val).resolve() 未校验结果仍在基准目录内(缺少 relative_to 检查) -> line 141 _load_file_content -> line 145 open() 读取父目录之外的任意可读文件(如密钥、.env、系统文件), 内容被注入 Prompty 配置造成信息泄露; load_async 与嵌套字段为替代通道; line 137 仅检查存在性, 不构成有效防御", "fix_suggestion": "line 136: resolve 后增加 base = agent_file.parent.resolve(); if not relative_path.is_relative_to(base): raise ValueError(...) 以拒绝逃逸出基准目录的引用"}
+```

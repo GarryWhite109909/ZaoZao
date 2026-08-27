@@ -1,0 +1,67 @@
+# Vouch Proxy cookie 包安全分析（逐函数、逐行）
+
+## 0. 文件概览与入口点枚举
+
+本文件是 vouch-proxy 的 cookie 处理包，共 6 个导出/内部函数：`Configure()`（第 32 行）、`SetCookie()`（第 38 行）、`setCookie()`（第 42 行）、`Cookie()`（第 82 行）、`ClearCookie()`（第 122 行）、`SameSite()`（第 148 行）、`splitCookie()`（第 170 行）。入口点来源：
+
+- **HTTP 请求头 Cookie**（`r.Cookies()`，第 87 行与第 124 行）——攻击者可控 source；
+- **HTTP Host 头**（`r.Host`，第 44 行、第 123 行）——攻击者可控 source；
+- **配置文件**（`cfg.Cfg.Cookie.*`）——管理员控制，非外部攻击面；
+- **sink**：`http.SetCookie(w, &cookie)`（第 66、69、75、135 行），即写回响应头的 Set-Cookie。
+
+## 1. `Configure()`（第 32–35 行）
+
+仅将全局 logger 与 sameSite 初始化，无输入、无 sink。无风险。
+
+## 2. `SetCookie()` / `setCookie()`（第 38–79 行）
+
+数据流：`val`（JWT，由上游认证流程生成，非直接用户输入）→ 构造 `http.Cookie{...}`（第 48–56 行）→ `http.SetCookie`。
+
+关键点逐一验证：
+
+- **Domain 来源**：第 44 行 `domains.Matches(r.Host)`——Host 头是攻击者可控的。若 `domains.Matches` 对未匹配域名返回空串或严格白名单匹配，则无 cookie 注入到任意域的风险；且 Go 标准库 `http.Cookie.String()` 会拒绝含非法字符的 Domain（含空格/逗号等会触发 sanitize 或忽略该字段）。此外第 45–47 行允许配置覆盖 domain，属管理员信任边界内。
+- **Value 来源**：`val` 为 JWT 字符串，Go 的 `http.SetCookie` 内部会对 Value 做 `sanitizeCookieValue`，非法字符会被丢弃或报错，不存在 header 注入（CRLF 注入在 net/http 层已被防御）。
+- **分片路径**（第 60–72 行）：当 cookie 超过 4000 字节时拆分为 `Name_iOFn` 多个 cookie。`len(cookieParts)` 由 `splitCookie` 根据 val 长度决定，非用户可控数量，无循环炸弹。
+- **属性继承**：Secure/HttpOnly/SameSite 均来自配置（第 57–59 行），分片时同一 `cookie` 结构复用，属性一致。
+
+结论：此函数 sink 无可被外部输入污染的注入路径。唯一理论弱点是若 `cfg.Cfg.Cookie.Domain` 配置过宽（如 `.example.com`）导致子域共享，但这是部署配置问题而非代码漏洞。
+
+## 3. `Cookie()`（第 82–119 行）——重点审查
+
+source：`r.Cookies()` 全量请求 cookie，完全攻击者可控。sink：返回值拼接为 JWT 后交由上游 JWT 校验（本文件外）。
+
+逐行验证：
+
+- 第 88–91 行：优先查找完整名 cookie 直接返回——正常路径。
+- 第 92–93 行：前缀匹配 `cfg.Cfg.Cookie.Name + "_"`。
+- 第 95–96 行：`strings.Split(xOFy, "of")` 取 `xyArray[1]` 解析总片数。
+- **第 98–103 行（防御点 1）**：`strconv.Atoi` 失败即返回错误；`numParts < 1 || numParts > maxCookieParts(32)` 拒绝超大分片数——有效防御了内存耗尽（否则 `make([]string, numParts)` 可被 `name_999999999of...` 触发大分配）。注意 Atoi 本身对超长数字也返回错误，双重防护。
+- **第 108–111 行（防御点 2）**：解析索引 i，失败报错；`i > numParts` 拒绝越界。
+- **潜在缺陷检查：`i == 0`？** 若攻击者发送名为 `vouchjwt_0of3` 的 cookie：numParts=3 通过校验，i=0，则第 113 行 `cookieParts[i-1]` 即 `cookieParts[-1]` → **panic: index out of range**！这是一个真实缺陷。需确认可达性：任何携带该恶意 cookie 的请求到达调用 `Cookie(r)` 的 handler 都会导致进程 panic。Go http server 默认 recover 每个 connection 的 panic（net/http 的 conn.serve 有 defer recover），因此是单连接 DoS 而非全服崩溃——严重性降级为低危 DoS/健壮性缺陷，而非 RCE。另外 `xyArray[1]` 在名字形如 `name_of` 时 xyArray 长度为 2？`"of"` split `"xof"` 得 `["x",""]`，Atoi("") 报错被捕获；名字形如 `name_o` 则 split 结果长度为 1，`xyArray[1]` 会 index out of range panic——同类问题。这两处均缺下界校验（应加 `i < 1` 与 `len(xyArray) < 2` 检查）。
+- 拼接后（第 116–118 行）交由 JWT 签名校验，伪造内容无法通过签名，故不构成认证绕过。
+
+## 4. `ClearCookie()`（第 122–145 行）
+
+遍历请求 cookie，凡以配置名开头者回发过期 Set-Cookie（第 135 行）。cookie.Name 来自客户端，但作为 Set-Cookie 的 Name 输出——Go 标准库 `sanitizeCookieName` 会过滤非法字符，无 header 注入。Domain 同第 2 节分析。无有效漏洞。
+
+## 5. `SameSite()`（第 148–168 行）
+
+仅消费配置字符串，switch 白名单式映射，默认 SameSite(0)（不发属性）。第 159–161 行对 none+非 secure 仅告警不阻断——配置失误告警，非代码漏洞。
+
+## 6. `splitCookie()`（第 170–184 行）
+
+按 maxLen 切分并用 `utf8.RuneStart` 回退保证 UTF-8 边界。maxLen 来自第 63 行计算值恒正；val 为服务端生成 JWT。无可控注入。极端情况下若 val 为空，循环体不执行，append 空串，无害。
+
+## 7. 第二入口与替代通道核查
+
+- 替代通道：除 Cookie 头外无其他 source 进入本包；Host 头仅经 `domains.Matches` 与配置覆盖，最终进 Domain 字段并被标准库净化。
+- 上游校验兜底：`Cookie()` 返回值必须通过 JWT 签名验证才生效，拼接篡改不可利用于绕过认证。
+- panic 类问题（`_0ofN`、`_o`）受 net/http per-connection recover 限制，影响为单请求错误/日志噪音，不升级为高危。
+
+## 结论
+
+全文证据显示：无注入、无认证绕过、无内存耗尽类高危漏洞；存在一处低危健壮性缺陷（`Cookie()` 中分片索引缺少下界与数组长度校验，可致 panic，实际影响限于单连接）。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后未发现可利用的安全漏洞。所有 sink 均为 http.SetCookie，其 Name、Value、Domain 均经过 Go 标准库 sanitizeCookieName/sanitizeCookieValue 净化，不存在 HTTP 头注入。Cookie() 函数中 multipart 分片解析虽有 strconv.Atoi 与 numParts 上限 32 校验防止内存耗尽，且拼接结果须通过上游 JWT 签名验证，伪造不可绕过认证。唯一发现的缺陷是低危健壮性问题：第 113 行 cookieParts[i-1] 未校验 i 下界（如 cookie 名为 name_0of3 时 i=0 导致负索引 panic），以及第 96 行 xyArray[1] 未校验切片长度（如 name_o 时越界 panic）；由于 net/http 对每个连接有 recover，实际影响仅为单连接错误而非服务崩溃，故不判定为安全漏洞。", "fix_suggestion": "no fix needed"}
+```

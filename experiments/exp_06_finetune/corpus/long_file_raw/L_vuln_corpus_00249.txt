@@ -1,0 +1,27 @@
+## 编号分析（逐函数、逐数据流）
+
+1. **第 44-77 行 `sendMessage`**：source 为 `$message`（string 参数，最终来自 HTTP 入口）。sink 在第 53 行拼入 INSERT。防御：`$senderId/$recipientId/$nextId` 均为 `int` 类型声明（strict_types），`$message` 经第 55 行 `$this->configuration->getDb()->escape()` 处理。escape 属于参数化转义（非黑名单），对引号类注入有效；但**依赖底层驱动实现正确性**，且未用预处理语句，属于弱于 prepared statement 的做法。单看本文件无直接可利用注入。
+
+2. **第 84-110 行 `getConversation`**：全部参数为 `int`，`%d` 格式化，安全。
+
+3. **第 118-200 行 `getConversationList`**：`$userId` 为 int；`$partnerIds` 来自数据库查询结果并在第 141 行 `(int)` 强转后 implode，第 146 行拼入 IN 子句——数据流闭合，无外部输入直达 sink。
+
+4. **第 208-247 行 `markAsRead`/`markConversationAsRead`/`getUnreadCount`**：全 int + `%d`，安全。
+
+5. **第 255-268 行 `getNewMessages`**：int + `%d`，安全。
+
+6. **第 276-310 行 `searchUsers`**：source 为 `$searchTerm`（用户可控搜索词）。第 278 行仅做 `mb_strtolower` + `escape()`——escape 只处理引号/反斜杠等 SQL 字符串边界字符，**不中和 LIKE 通配符 `%` 和 `_`**。第 289 行 `'%%%s%%'` 直接拼接，攻击者可注入 `%`/`_` 通配符进行模式匹配枚举：如提交 `%a%` 可遍历匹配任意子串，逐字符探测其他用户的 display_name，造成用户信息枚举/信息泄露。这是真实可利用的缺陷（通配符注入，属 SQL 注入语义滥用一类）。
+
+7. **第 318-345 行 `messageToArray`/`messagesToArray`**：将 `$message->getMessage()` 原样放入数组供 JSON 输出。消息内容是用户可控的存储型数据，若前端/SSE 消费端未做 HTML 转义则存在存储型 XSS 风险；但本文件内无 HTML 输出 sink，责任在调用方，此处只能记为潜在二次注入风险点。
+
+8. **第 356-396 行 `getBatchUserInfo`/`getUserInfo`**：第 364 行 `array_map('intval', ...)` 有效强转；`getUserInfo` 参数为 int。安全。
+
+9. **第二入口检查**：本文件无路由、文件、环境变量、回调入口；所有 source 均为方法参数，由上层控制器传入。唯一字符串型用户输入即 `$message` 与 `$searchTerm`，前者有 escape 防御，后者存在通配符未过滤问题。
+
+## 结论
+
+主要可确认漏洞：`searchUsers` 的 LIKE 通配符注入导致用户枚举（低危）。另记录两点弱化项：全文依赖 `escape()` 而非预处理语句；聊天消息原样透出存在存储型 XSS 的下游风险。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 (SQL LIKE 通配符注入导致信息泄露)", "risk_level": "low", "source": "line 276: searchUsers(string $searchTerm, ...) 用户可控搜索词", "sink": "line 289: LOWER(ud.display_name) LIKE '%%%s%%' 直接拼接", "explanation": "第 278 行仅做 mb_strtolower 和 escape()，escape 只转义引号类字符，不中和 LIKE 通配符 % 和 _ -> 攻击者提交含 % 或 _ 的搜索词即可按任意模式匹配 display_name，通过逐字符探测枚举系统内全部活跃用户的显示名，造成用户信息泄露", "fix_suggestion": "line 278: 在 escape 前对 $searchTerm 显式转义通配符，例如 addcslashes($term, '%_\\\\') 或改用参数化查询并同样处理通配符；同时建议全文改用数据库预处理语句替代 escape() 拼接"}
+```

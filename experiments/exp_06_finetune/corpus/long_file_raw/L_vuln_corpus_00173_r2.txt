@@ -1,0 +1,74 @@
+## 编号分析（逐函数、逐入口点、逐数据流）
+
+### 0. 文件总体结构
+本文件是 degit 的 CLI 入口（`cli.js`），全文共约 90 行，包含三个主要部分：
+- `main(argv)`：第 6–79 行，解析命令行参数并分发；
+- 交互式分支：第 21–70 行，无参数时的 enquirer 向导；
+- `run(src, dest, args)`：第 81–94 行，构造 degit 实例并执行克隆；
+- 自动执行块：第 96–101 行，非 VITEST 环境下直接调用 `main(process.argv)`。
+
+外部依赖：`mri`（参数解析）、`tiny-glob`（文件枚举）、`enquirer`（交互输入）、`./index.js` 的 `degit()`（核心克隆逻辑）、`./utils.js` 的 `base/tryRequire`。核心 sink 在被导入的 `degit` 模块内部（执行 git 命令与文件写入），但数据流从本文件的 source 出发，必须在本文件层面验证是否存在任何净化。
+
+---
+
+### 1. 入口点逐一枚举
+
+**E1 — 命令行 argv（第 6 行 `main(argv)`、第 7–14 行 mri 解析）**
+`process.argv` 在第 98 行传入 `main`。第 7 行 `mri(argv.slice(2))` 解析出位置参数 `args._`。第 17 行解构 `const [src, dest = '.'] = args._;` —— **这是第一个 source**：`src` 与 `dest` 均为攻击者完全可控的字符串，且**没有任何校验、白名单或正则过滤**。
+
+**E2 — 交互式 prompt（第 44–62 行 enquirer.prompt）**
+当无 `src` 时，enquirer 收集三个输入：
+- 第 45–53 行：`src` 选择器，choices 来自 `glob('**/map.json')` + `tryRequire` 读出的内容（第 33–42 行）。choices 的 `value` 由磁盘上缓存目录下的 map.json 内容拼接而成（`${host}:${user}/${repo}#${ref}`）——若攻击者能污染 degit 缓存目录（`base` 下任意可写位置，或通过一次恶意克隆写入缓存），此处 value 即为受控字符串；fuzzysearch 过滤（第 55 行）只是 UI 搜索过滤，**不是安全防御**。
+- 第 59–63 行：`dest` 为自由文本 input，完全可控。
+- 第 64–68 行：`cache` toggle。
+这些在第 71 行以 `run(options.src, options.dest, ...)` 进入同一 sink —— **第二入口/替代通道确认**。
+
+**E3 — 缓存目录文件（第 22–30、33–42 行）**
+`glob('**/access.json' / '**/map.json', { cwd: base })` 枚举缓存目录下所有 JSON 并 `JSON.parse` / `tryRequire`。`tryRequire` 本质是 require 执行 JS —— 若缓存目录中存在攻击者写入的恶意 `map.json`（degit 会把远端仓库内容写入缓存），则构成**代码执行的第二通道**。路径由固定 `base` 拼接，glob 模式本身不可控，但**文件内容不可信**。
+
+**E4 — help.md 读取（第 19–25 行）**
+`fs.readFileSync(path.join(__dirname, '..', 'help.md'))` 路径硬编码，仅做 chalk 渲染后写 stdout，无可控注入点，安全。
+
+**E5 — 环境变量（第 97 行 `process.env.VITEST`）**
+仅作布尔判断决定是否自动运行，不进入数据流，安全。
+
+---
+
+### 2. Source → Sink 数据流验证
+
+**流 D1：argv.src → run(src,...) → degit(src, args) → d.clone(dest)（第 17 行 → 第 82 行 → 第 91 行）**
+- 第 17 行取得 `src` 后，第 77 行直接 `run(src, dest, args)`；
+- 第 81–83 行 `run` 中 `const d = degit(src, args)` 无任何过滤；
+- 第 91 行 `d.clone(dest)` 将 `dest` 直接交给 degit 写文件。
+- 防御检查：main/run 全文**不存在任何对 src/dest 的校验**（无正则、无黑名单、无协议限制）。已知 degit 核心实现将 `src` 解析为 `host/user/repo#ref` 后用于拼装 git 命令（如 `git ls-remote` 取 ref 时以 shell 方式执行）；当用户传入形如 `` `whoami` `` 或 `$(cmd)` 作为 ref/分支名时，命令元字符直达 shell —— 这是公开记录的 degit 命令注入问题（rich-harris/degit 相关 issue/CVE）。即便只看本文件，`src` 未净化地流入执行 git 子进程的库，防御缺失成立。
+- 结论：**D1 有效漏洞流**。
+
+**流 D2：argv.dest → d.clone(dest)（第 17 行 → 第 91 行）**
+`dest` 完全可控，可为绝对路径或 `../../..` 形式。配合 `force`（第 13 行 boolean 别名 `-f`，或交互分支第 66–69 行强制 `force: true`），degit 会向任意指定目录写入/覆盖文件 —— 任意路径文件写入/覆盖。第 48–58 行的“目录非空需确认”仅在交互分支生效，CLI 直传 `-f` 可绕过该确认逻辑（确认逻辑是 UX 防护而非安全边界）。**D2 有效漏洞流**。
+
+**流 D3：交互分支 choices（map.json 内容）→ options.src → run（第 36–41 行 → 第 71 行）**
+缓存目录中的 map.json 若被前一次恶意克隆污染（degit 把远端 tar 内容写入 `${base}/${host}/${user}/${repo}`），其 `ref/hash` 字段即受控，随后作为 `src` 进入 D1 同一 sink。这是**第二入口/替代通道**，使“仅本地使用、不传参”的场景同样暴露。**D3 有效漏洞流**。
+
+**流 D4：tryRequire(`${base}/${file}`)（第 34、39 行）**
+`file` 来自 glob 结果，模式固定为 `**/map.json`，路径段不可控（不含 `..` 注入可能，因为 glob 匹配真实存在的文件）。风险不在路径遍历，而在 **require 执行不可信 JSON/JS 内容**（tryRequire 对 .js 文件会执行代码）。归入缓存污染通道 D3 的变体。
+
+**流 D5：help.md 渲染回调（第 20–24 行 replaceAll 回调）**
+回调输出仅进 stdout，无可控 source，安全。
+
+**流 D6：error/info/warn 消息回显（第 84–89 行）**
+`event.message.replace('options.','--')` 后经 console.error 输出到 stderr，终端转义序列注入理论存在（chalk 不消毒上游消息），但影响限于显示层，属低危，不计为主要结论。
+
+---
+
+### 3. 第二入口与替代通道核查汇总
+- 交互式 prompt（E2/D3）：确认存在，绕过“必须显式传参”的假设；
+- 缓存目录污染（E3/D4）：确认存在，跨会话持久化攻击面；
+- `-f/--force` 绕过空目录确认（第 13 行 alias + 第 91 行 force 传递）：确认存在；
+- 无其他隐藏入口（无 HTTP、无 IPC、无子进程回调注入点）。
+
+### 4. 最终判定
+基于全文证据：`src`（第 17 行）与 `dest`（第 17 行）两个完全未净化的 source，分别流向 degit 内部的 shell 命令执行 sink（第 82 行 `degit(src, args)`，第 91 行 `d.clone` 触发）与任意路径文件写入 sink。主漏洞定性为 CWE-78（OS 命令注入，经由 ref/repo 字符串进入 git 子进程），伴随 CWE-22（目标路径可控导致任意目录写入）。风险等级：高（本地开发者工具，但可通过恶意仓库 README/issue 中诱导的复制粘贴命令、或被污染的共享缓存触发）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection (with CWE-22 Path Traversal as secondary)", "risk_level": "high", "source": "line 17: const [src, dest = '.'] = args._ 以及 line 71: 交互式 enquirer prompt 返回的 options.src/options.dest", "sink": "line 82: degit(src, args) 与 line 91: d.clone(dest)，最终进入 degit 内部以 shell 方式执行的 git 子进程及文件写入", "explanation": "process.argv 经 mri 解析后（line 7-17），src 与 dest 全程未经任何校验或净化，于 line 77 直传 run()，在 line 82 构造 degit 实例并在 line 91 调用 clone；degit 内部将 src 解析出的 host/user/repo/ref 拼入 git 命令并以 shell 执行，含反引号或 $() 的 ref 即可执行任意命令；dest 可为任意绝对或相对路径，配合 -f 强制覆盖实现任意目录写入；替代通道：line 33-42 从缓存目录读取的 map.json 内容（可被先前恶意克隆污染）经 line 36-41 构成 choices，再经 line 71 进入同一 sink，且 line 34/39 的 tryRequire 会执行缓存目录内脚本形成第二条代码执行链", "fix_suggestion": "在 line 17 之后对 src 施加严格白名单校验（仅允许 [A-Za-z0-9._/-] 且拒绝反引号、$、;、|、&、换行等元字符），对 dest 做 path.resolve 后限定在工作目录内并拒绝 .. 穿越；同时在 degit 内部改用 execFile 数组参数形式调用 git 以避免 shell 解析"}
+```

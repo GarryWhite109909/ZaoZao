@@ -1,0 +1,29 @@
+## 编号分析
+
+**入口点枚举（全文通读）**
+
+1. **第 108–115 行 `processNoCache(String templateName, IContext context, Reader reader, Writer writer)`** —— 核心入口。`reader` 是外部传入的模板内容流（在 XDocReport 框架中，该 reader 来自用户上传的 docx/odt 文档内嵌的模板指令，即第二入口：文档文件内容本身作为 source）。
+2. **第 112 行 `new Template( templateName, getReader( reader ), getFreemarkerConfiguration() )`** —— 将 reader 内容直接编译为 FreeMarker 模板并执行。
+3. **第 98–105 行 `processWithCache`** —— 第 102 行按名称从缓存取模板执行；templateName 来自注册表条目（文档内部 entry 名），同样源自上传文档。
+4. **第 270–291 行 `process(String templateName, ...)`** —— 第 275 行 `getResourceAsStream( templateName + ".ftl" )`，templateName 若含 `../` 可造成类路径资源读取（次要），随后第 280 行同样编译执行。
+5. **第 190–204 行 `extractFields(Reader, ...)`** —— 第 195 行将外部 reader 编译为模板用于字段提取，解析阶段同样会触发模板解析。
+6. **第 75–79 行构造器 / 第 301–304 行 `addTemplateLoader`** —— 允许注入任意 TemplateLoader，属配置面攻击面。
+7. **环境/回调通道**：无直接读取环境变量或 HTTP 参数的代码，但所有 Reader 均为框架上游透传的用户文档内容。
+
+**数据流验证**
+
+- 流 A：上传文档 → 框架提取 entry 内容为 Reader → 第 112 行 `new Template(...)` → 第 154–155 行 `createProcessingEnvironment(...).process()` 执行。
+- 防御检查：第 124–137 行 `getReader` 仅在 `forceModifyReader && isEscapeTemplate()` 时包裹 `[#escape x as xml]` 指令——这是**输出转义**，不阻止模板指令本身（如 `<#assign value="freemarker.template.utility.Execute"...>` / `?api` / ObjectConstructor）被解析执行；且默认 `forceModifyReader=false`、configuration 为 null 时完全不生效。无任何模板指令白名单、无 sandbox（未设置 `setNewBuiltinClassResolver(TemplateClassResolver.SAFER_RESOLVER)`）、DefaultObjectWrapper（第 240 行）暴露反射能力。**防御无效**。
+- 结论：source（用户可控文档中的模板文本）→ sink（第 155 行 `environment.process()` 模板执行），构成 FreeMarker 服务端模板注入（SSTI），可 RCE。此即 XDocReport 已知漏洞（CVE-2018-1000643 类，FreemarkerTemplateEngine SSTI）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-1336 服务端模板注入(SSTI)导致远程代码执行",
+  "risk_level": "严重(Critical)",
+  "source": "line 108-111: processNoCache 接收的外部 Reader, 其内容来自用户上传文档(docx/odt)中的模板文本; 另有 line 102 processWithCache 与 line 195 extractFields 的同类入口",
+  "sink": "line 154-155: template.createProcessingEnvironment(context, writer).process() 将不可信文本作为 FreeMarker 模板编译并执行; line 112 与 line 280 的 new Template(...) 为中间汇聚点",
+  "explanation": "用户上传文档内的模板指令文本经 Reader 直达 line 112/280 的 new Template 编译, 最终在 line 155 environment.process() 中执行 -> getReader(line 124-137)仅在 forceModifyReader 且 escapeXML 时追加 [#escape] 输出转义, 不拦截模板指令解析, 默认配置下完全失效 -> 未设置 SAFER_RESOLVER, line 240 使用 DefaultObjectWrapper 暴露反射与类加载能力 -> 攻击者可在文档中嵌入 Execute/ObjectConstructor 等内置方法实现任意命令执行(RCE)",
+  "fix_suggestion": "line 112/280: 在 Configuration 上调用 setNewBuiltinClassResolver(TemplateClassResolver.ALLOW_NOTHING_RESOLVER 或 SAFER_RESOLVER), 禁用 ?new/?api 与危险内置方法, 并对文档内提取的模板文本做指令白名单校验后再编译"
+}
+```

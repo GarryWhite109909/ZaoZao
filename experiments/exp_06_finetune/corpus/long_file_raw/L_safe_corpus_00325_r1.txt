@@ -1,0 +1,77 @@
+# 全文逐函数安全分析
+
+## 1. 模块导入与初始化（第 1–17 行）
+
+第 1–13 行仅导入标准库与 Home Assistant 内部模块（`tarfile`、`json`、`pathlib` 等），无动态导入、无 `eval/exec/pickle`、无网络库。第 17 行 `async_get_backup_agents` 是代理工厂入口：第 18 行通过 `is_hassio(hass)` 判断环境，仅在非 HassIO（Core/Container）安装时返回 `CoreLocalBackupAgent`（第 20 行）。该入口不接收用户可控参数，无数据流。
+
+## 2. `__init__`（第 23–31 行）
+
+第 29 行 `self._backup_dir = Path(hass.config.path("backups"))`，路径来自 HA 配置目录拼接固定子目录 `"backups"`，不含任何外部输入。`self._backups` 字典初始为空。此函数无 source→sink 流。
+
+## 3. `_load_backups` / `_read_backups`（第 33–51 行）
+
+- 第 35 行：通过 executor 在线程池中调用 `_read_backups`，避免阻塞事件循环。
+- 第 42 行：`self._backup_dir.glob("*.tar")` 仅枚举备份目录下 `.tar` 后缀文件；glob 模式为硬编码常量，不受用户控制。
+- 第 44 行 `read_backup(backup_path)` 是关键 sink 候选——它解析 tar 文件内容。但需注意：
+  - **source**：磁盘上的 tar 文件本身。能放置文件的攻击者已具备本地文件写权限（本地攻击前提），且这些文件正是系统自身创建的备份。
+  - **防御**：第 45–50 行用宽泛的 `except (OSError, TarError, json.JSONDecodeError, KeyError, InvalidBackupFilename)` 捕获解析失败并降级为日志告警，恶意/损坏文件不会导致崩溃或被采纳为有效备份条目（除非其元数据合法可解析）。`read_backup` 内部（util 模块）负责校验文件名合法性并抛出 `InvalidBackupFilename`，此处正确处理了该异常。
+  - 解析结果仅写入内存字典 `backups[backup.backup_id]`（第 46 行），key 为 backup_id 而非路径，后续取路径均经由字典回查。
+
+## 4. `async_download_backup`（第 53–58 行）
+
+直接 `raise NotImplementedError`（第 58 行）。Core 安装不支持下载流，无 sink。注意这同时消除了“按 backup_id 直接读任意路径文件”的通道——下载功能不存在于本 agent。
+
+## 5. `async_upload_backup`（第 60–68 行）
+
+入口点：接收 `open_stream` 回调、`AgentBackup` 对象、进度回调。第 67 行将 `(backup, self.get_new_backup_path(backup))` 写入 `self._backups` 字典。这里存在一个值得审视的点：
+
+- **潜在路径注入点**：`get_new_backup_path` 由 `suggested_filename(backup)` 生成文件名，而 `backup.backup_id` 与名称可能来自上传请求（API 层的 source）。
+- **防御验证**：见下文对 `get_new_backup_path` 的分析——第 106–110 行有显式的父目录一致性校验，拒绝逃逸出备份目录的候选路径。因此即使 `suggested_filename` 不剥离分隔符（代码注释第 105 行明确承认这一点），路径穿越也会在第 108–110 行被拦截并抛出 `InvalidBackupFilename`。
+- 另外注意：本函数只更新内存映射，实际写盘由上层 manager 完成，且写入目标已被约束在 `self._backup_dir` 内。
+
+## 6. `async_list_backups`（第 70–74 行）
+
+懒加载后返回元数据列表，无参数、无文件操作 sink。
+
+## 7. `async_get_backup`（第 76–97 行）
+
+入口参数 `backup_id`（source，来自 API 层）。数据流：
+
+1. 第 82 行：`if backup_id not in self._backups: raise BackupNotFound` —— 字典键查找，键只能来自第 46 行从真实磁盘文件解析出的 `backup.backup_id`，攻击者无法注入任意键。
+2. 第 87 行：`backup_path.exists()` 经 executor 执行，路径来自字典值而非 backup_id 拼接，**不存在由 backup_id 直达文件系统的字符串拼接**。
+3. 第 89–95 行：文件缺失时清理缓存并抛异常，逻辑一致。
+
+结论：backup_id → 路径的间接映射是闭合的，无任意文件读取。
+
+## 8. `get_backup_path`（第 99–107 行）
+
+同样经 `self._backups[backup_id][1]` 字典回查（第 104 行），KeyError 转 `BackupNotFound`。sink 是“返回路径”，但路径来源受限于 `_read_backups` 枚举结果或 `get_new_backup_path` 校验后的产物。
+
+## 9. `get_new_backup_path`（第 109–117 行）——核心防御点
+
+- 第 112 行：`candidate = self._backup_dir / suggested_filename(backup)`。注释明确指出 `suggested_filename` **不会剥离分隔符**，即若 filename 含 `../../evil.tar` 或绝对路径成分，`Path.__truediv__` 对绝对路径会直接替换整个前缀。
+- 第 113–116 行：`if candidate.parent != self._backup_dir: raise InvalidBackupFilename(...)`。这是白名单式校验而非黑名单/正则：
+  - 相对穿越 `../../x.tar` → parent 变为上级目录 → 被拒；
+  - 绝对路径 `/etc/x.tar` → parent 为 `/etc` ≠ 备份目录 → 被拒；
+  - 含 `..` 单层如 `backups/../backups/x.tar` 归一化后 parent 恰等于备份目录，落点仍在目录内，无害。
+  - 该比较基于 `Path` 语义等价性，绕过空间仅限“最终仍落在备份目录内”的等价拼写，不构成漏洞。
+
+## 10. `async_delete_backup`（第 119–129 行）
+
+入口参数 `backup_id`（source）。第 125 行 `backup_path.unlink(True)` 是删除类 sink。路径获取走 `get_backup_path`（第 124 行），即必须先存在于 `_read_backups` 枚举出的合法 `.tar` 集合中，无法构造任意路径删除。第 127 行 pop 缓存保持一致性。
+
+## 11. 第二入口与替代通道核查
+
+- **替代写入通道**：除 `get_new_backup_path` 外全文无其他路径构造点（grep 级检查：`Path(` 仅出现在第 29 行和第 112 行）。
+- **下载通道**：被 NotImplementedError 封死。
+- **HassIO 环境**：第 18 行直接返回空列表，本 agent 完全不注册。
+- **竞态条件**：上传与删除间理论上存在 TOCTOU 窗口，但影响限于备份目录内的备份文件，属低危设计权衡而非可利用漏洞。
+- **异常面**：所有解析异常均被捕获记录，无未处理崩溃导致的 DoS 面。
+
+## 总结
+
+全部 source（backup_id、上传元数据、磁盘 tar 内容）到 sink（文件读写删）的数据流均经过字典闭合映射或 Path 父目录白名单校验，黑名单式过滤不存在，未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文逐函数核查：backup_id 类 source 均经 _backups 字典闭合映射到路径（第 82、104、124 行），无法拼接任意路径；唯一路径构造点 get_new_backup_path（第 109-117 行）使用 candidate.parent != self._backup_dir 的白名单式校验拦截路径穿越与绝对路径注入，非黑名单不可绕过；_read_backups（第 42-50 行）仅枚举硬编码 glob *.tar 且异常全捕获；download 通道被 NotImplementedError 封死；HassIO 下 agent 不注册。未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

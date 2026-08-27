@@ -1,0 +1,34 @@
+## 编号分析
+
+**入口点枚举（全文）**
+本文件是 LFS 存储后端，对外暴露两个数据入口：
+- `Upload`（第 61 行）：source 为网络请求体 `rc` 与参数 `oid`；
+- `Download`（第 121 行）：source 为参数 `oid`，sink 为 `os.Open(fpath)` + `io.Copy(w, r)`（第 127、133 行）。
+无路由、环境变量、回调等其他通道。
+
+**逐函数分析**
+
+1. `storagePath`（第 53–59 行）：仅检查 `len(oid) < 2` 返回空串（第 54 行），随后直接 `filepath.Join(s.Root, string(oid[0]), string(oid[1]), string(oid))`（第 58 行）。**未做任何字符白名单校验**。若 `oid` 含 `/` 或 `..`，`filepath.Join` 会做路径清理，导致最终路径逃逸出 `s.Root`。
+
+2. `Upload`（第 61–119 行）：第 62 行调用 `ValidOID(oid)` 拦截非法 OID，因此第 66 行 `fpath` 不可能包含遍历序列——Upload 路径安全。内容哈希校验（第 83、111 行）防止 OID 绑定攻击与不完整文件发布，临时文件+Rename（第 96、115 行）防并发竞态，逻辑正确。
+
+3. `Download`（第 121–138 行）：**没有调用 `ValidOID`**（对比第 62 行）。第 122 行直接用 `storagePath(oid)` 计算路径；由于 `storagePath` 只挡了长度不足的情况，攻击者传入形如 `../../../etc/passwd` 的 OID 时：`oid[0]='.'`、`oid[1]='.'`，Join 结果为 `Root/../../../../etc/passwd`，逃逸根目录。第 123 行 `osx.IsFile` 只判断存在性，不是防御；第 127 行 `os.Open` 即为任意文件读取 sink。
+
+**防御有效性核验**
+- 唯一的有效防御是 `ValidOID`（第 62 行），但它只覆盖 Upload；
+- `len(oid) < 2`（第 54 行）、`IsFile`（第 123 行）均非安全边界；
+- 黑名单/正则类过滤不存在，无需按可绕过处理。
+
+**第二入口核查**：文件内无其他调用 `storagePath` 或 `Download` 的代码，但 `Download` 是导出的接口方法，任何上层路由若将用户提供的 OID 直接传入即触发漏洞；在本文件范围内该缺口客观存在。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "path_traversal_arbitrary_file_read",
+  "risk_level": "high",
+  "source": "Download 函数的入参 oid（外部可控的 LFS 对象标识符）",
+  "sink": "Download 第 127 行 os.Open(storagePath(oid)) 后经 io.Copy 读出文件内容",
+  "explanation": "storagePath 第 58 行使用 filepath.Join 拼接且仅在第 54 行检查长度，未校验 oid 字符集；Upload 在第 62 行通过 ValidOID 防御了该问题，但 Download（第 121-138 行）缺少同样的校验。攻击者传入含 ../ 的 oid 可使 fpath 逃逸 s.Root，配合 IsFile 探测实现任意文件读取。",
+  "fix_suggestion": "在 Download 开头增加与 Upload 相同的 ValidOID 校验，或在 storagePath 中对 oid 强制十六进制字符白名单后再拼接路径"
+}
+```

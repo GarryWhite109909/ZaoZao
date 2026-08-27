@@ -1,0 +1,72 @@
+# JOSE_JWS 全文安全分析
+
+## 一、文件结构总览
+
+本文件为 JWT/JWS 签名与验签实现，共 4 个公有方法（`__construct`、`toJson`、`sign`、`verify`）和 5 个私有方法（`rsa`、`digest`、`_sign`、`_verify`）。逐一分析如下。
+
+## 二、逐函数入口点与数据流枚举
+
+### 1. `__construct($jwt)` — 第 3-8 行
+- **入口**：外部传入的 `$jwt` 对象。
+- **数据流**：第 4-7 行直接将 `$jwt->header`、`$jwt->claims`、`$jwt->signature`、`$jwt->raw` 原样复制到本对象，**无任何校验**。这意味着 header 中的 `alg` 字段完全由调用方/攻击者构造的 JWT 决定——这是后续算法混淆漏洞的关键 source。
+
+### 2. `toJson($syntax)` — 第 10-25 行
+- 仅做 JSON 序列化输出，无 sink（不涉及 eval/include/SQL 等），无独立漏洞。
+
+### 3. `sign(...)` — 第 27-41 行
+- 第 28 行将 `$algorithm` 写入 `$this->header['alg']`；签名方自行指定算法属正常设计。
+- 第 30-34 行：JWK 的 `kid` 直接进入 header，仅影响输出 JSON，非危险 sink。
+
+### 4. `verify($public_key_or_secret, $alg)` — 第 43-50 行
+- **关键点：`$alg = null` 默认值（第 43 行）**。当调用方不显式传算法时，进入 `_verify` 后由 token 自身的 header 决定验证算法——这是经典的 **JWT 算法混淆（algorithm confusion / CWE-347）** 入口。
+
+### 5. `digest()` — 第 62-77 行
+- 白名单 switch，只接受 HS/RS/ES/PS 系列，拒绝 `none` 等未知算法。此白名单本身有效，但注意它**按 header['alg'] 选择哈希**，而 header 可被攻击者控制（见数据流 D1）。
+
+### 6. `_verify()` — 第 100-124 行（核心）
+- 第 101 行：`explode('.', $this->raw)` 取前两段作为待验签串。
+- 第 102-105 行：**若 `$expected_alg` 为空，则采用 `$this->header['alg']`** —— 攻击者可控字段直接决定密码学分支。
+- 第 107-109 行（HS 分支）：`hash_hmac($this->digest(), $signature_base_string, $public_key_or_secret, true)`。
+- 第 110-112 / 117-119 行（RS/PS 分支）：交给 phpseclib RSA 验证。
+- 第 113-115 行：ES 系列抛异常，不支持，无风险。
+
+### 7. `rsa()` — 第 52-60 行
+- 接受 JWK/RSA 实例/字符串密钥并加载，无路径或命令注入 sink。
+
+## 三、source→sink 数据流验证
+
+### D1（核心漏洞）：header['alg'] → _verify 的 HMAC 密钥
+- **Source**：第 7 行 `__construct` 中 `$this->header = $jwt->header`（攻击者可构造任意 alg）+ 第 104 行 `$expected_alg = $this->header['alg']`。
+- **Sink**：第 108 行 `hash_hmac(..., $public_key_or_secret, true)`。
+- **防御有效性检查**：
+  - `digest()`（第 62-77 行）只是把 HS256 映射到 sha256，**没有阻止 RS256→HS256 的降级**；
+  - 第 43 行 `$alg = null` 默认参数意味着库自身鼓励调用方省略显式算法；
+  - 无任何“密钥类型与算法匹配”校验（例如未检查传入的是否为 RSA 公钥对象就允许走 HMAC 分支）。
+- **攻击路径**：应用以 RSA 公钥调用 `$jws->verify($public_key)`（未传第二参）。攻击者将 token 的 alg 改为 `HS256`，用该 RSA 公钥的 PEM 文本作为 HMAC 密钥自签 payload。第 104 行取到 `HS256`，第 108 行用公钥字符串做 HMAC 密钥计算，与攻击者签名比对通过 → **伪造任意 claims**。这是真实存在的 CVE 类漏洞（本项目 JOSE 库历史上即存在此问题）。
+- 黑名单/正则类过滤在此不存在，白名单 switch 不构成对混淆的有效防御。
+
+### D2：显式传 `$alg` 时
+- 若调用方写死 `verify($key, 'RS256')`，第 102-105 行不会读 header，混淆被阻断。但这依赖调用方纪律，库默认路径不安全。
+
+### D3：`_sign` 路径
+- 第 84-96 行按 header['alg'] 分支，但 alg 由签名者自己设置（第 28 行），非攻击者输入，无混淆问题。
+
+### 第二入口/替代通道检查
+- `raw` 属性（第 7 行）是另一条注入通道：`_verify` 第 101 行解析的是 `$this->raw` 而非当前 header/signature 对象属性，若 raw 与 header/signature 不同步，可能出现“验 A 验 B”的不一致；但在标准用法中二者同源于一个 JWT，主要风险仍是 D1。
+- `toJson`、`rsa`、`digest` 无其他可达的危险 sink（无反序列化、文件操作、SQL）。
+
+## 四、结论
+
+存在漏洞：JWT 算法混淆（RS→HS），CWE-347（对密码学签名的不当验证）/ CWE-327 相关。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-347",
+  "risk_level": "critical",
+  "source": "line 7: __construct 中 $this->header = $jwt->header, alg 由攻击者构造的 JWT 控制; line 104: $expected_alg = $this->header['alg']",
+  "sink": "line 108: hash_hmac($this->digest(), $signature_base_string, $public_key_or_secret, true)",
+  "explanation": "verify 默认 $alg=null -> _verify 在未显式指定算法时信任 token 自身 header 的 alg -> digest() 白名单不阻止 RS256 降级为 HS256 -> 攻击者用 RSA 公钥 PEM 作为 HMAC 密钥自签 token 即可通过 verify, 伪造任意 claims",
+  "fix_suggestion": "line 43: 移除 $alg=null 默认值, 强制调用方显式传入期望算法; 并在 line 102-105 处校验 expected_alg 与 header['alg'] 一致, 且 HS 分支要求密钥为对称秘密而非公钥对象"
+}
+```

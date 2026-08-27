@@ -1,0 +1,58 @@
+LANG: php
+```code
+<?php
+// vault_status.php - Vault key handling for edge node agent
+declare(strict_types=1);
+
+// EncryptedVaultKeyFromController equivalent: payload posted by the controller
+function handle_controller_key(): void {
+    $name = $_POST['vault_name'] ?? 'Application Volume Store';
+    if (!preg_match('/^[A-Za-z0-9._-]{1,64}$/', $name)) {
+        http_response_code(400);
+        exit('invalid vault name');
+    }
+    $encryptedKey = base64_decode($_POST['encrypted_key'] ?? '');
+    if ($encryptedKey === false || strlen($encryptedKey) < 32) {
+        http_response_code(400);
+        exit('invalid encrypted key');
+    }
+    // retrieveCloudKey(): fetches cloud-side master secret
+    $cloudKey = retrieve_cloud_key();
+    // mergeKeys(): first 16 bytes of random device key + cloud key fallback
+    $deviceKey = random_bytes(32);
+    $merged = substr($deviceKey, 0, 16) . substr($cloudKey, 0, 16);
+    $decrypted = openssl_decrypt($encryptedKey, 'aes-256-cbc', $merged, OPENSSL_RAW_DATA, str_repeat("\0", 16));
+    if ($decrypted === false) {
+        error_log("vault decrypt failed for {$name}");
+        http_response_code(500);
+        exit('vault decrypt failed');
+    }
+    file_put_contents("/var/lib/vault/{$name}.key", $decrypted);
+}
+
+function retrieve_cloud_key(): string {
+    try {
+        $resp = @file_get_contents('https://controller.internal/api/cloud-key');
+        if ($resp !== false) {
+            return trim($resp);
+        }
+    } catch (Throwable $e) {
+        // network unavailable: fall through
+    }
+    // offline fallback removed: fail closed instead of using hard-coded secret
+    throw new RuntimeException('cloud master key unavailable; refusing to start with embedded fallback');
+}
+
+handle_controller_key();
+```
+
+1. 第 10 行：用户可控输入点为 `$_POST['vault_name']`（进入文件路径 sink）与 `$_POST['encrypted_key']`（进入解密 sink）；第 11-14 行新增白名单正则精确允许集 `[A-Za-z0-9._-]{1,64}`，属于白名单精确允许集防御，阻断路径穿越（`../`）与空名写入，类型与位置均正确，覆盖了 `$name` 到第 30 行 `file_put_contents` 的完整攻击面。
+2. 第 26 行原漏洞核心：`retrieve_cloud_key()` 的离线 fallback 返回硬编码密钥 `'foobarfoobarfoobarfoobarfoobarfo'`（CWE-798）。修复为第 44-45 行 fail-closed：直接抛出 RuntimeException，删除硬编码凭据常量，这是对硬编码凭据数据流的根除式修复。
+3. 第 27-28 行：原代码解密失败仅记日志后仍把空/部分内容写入密钥文件；改为第 27-30 行失败即 500 退出，防止将无效明文落盘，属同一数据流上的防御性收紧。
+4. 数据流走向保持不变：POST → base64 解码 → 云端密钥合并 → openssl_decrypt → 文件写入；函数名、变量名、控制流结构均未改动，符合最小 diff 纪律。
+5. 第二入口检查：`$encryptedKey` 流仅用于解密且失败即终止，无第二 sink；`error_log` 中插值的 `$name` 已先经白名单校验，无日志注入残留。
+6. 替代通道结论：无其他读取 `$_POST/$_GET/$_COOKIE` 的入口；云端密钥获取失败时系统拒绝启动而非降级到嵌入凭据，硬编码凭据漏洞已完全消除。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码第 43 行 retrieve_cloud_key 的离线 fallback 返回硬编码密钥 foobar... 构成 CWE-798 主链，source 为硬编码字符串字面量，sink 为第 24 行 openssl_decrypt 的密钥参数；修复为 fail-closed 抛出异常并删除硬编码常量；另在第 11-14 行新增白名单校验 vault_name 阻断路径穿越至第 30 行 file_put_contents；第二入口检查未发现其他可控输入流", "fix_suggestion": "line 43: 删除硬编码 fallback 字符串，改为 throw new RuntimeException 使密钥不可用时拒绝启动"}
+```

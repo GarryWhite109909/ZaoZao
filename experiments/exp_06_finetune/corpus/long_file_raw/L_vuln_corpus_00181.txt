@@ -1,0 +1,44 @@
+# 编号分析
+
+**1. 入口点枚举（全文）**
+- 第 30 行：`init()` 注册 `extension` 后端 —— 唯一入口。
+- 第 47-49 行：`New()` 仅赋值，无风险。
+- 第 51-53 行：`Run()` 空实现。
+- 第 55-115 行：`RegisterNetwork()` 是核心逻辑。
+- 第 117-146 行：`runCmd()` 工具函数。
+
+**2. Source 分析**
+- Source 1：第 59-70 行，`config.Backend`（JSON 配置）反序列化出 4 个命令字符串：`PreStartupCommand`、`PostStartupCommand`、`SubnetAddCommand`、`SubnetRemoveCommand`。该配置来自 flannel 的网络配置（通常存储于 etcd/Kubernetes API），由集群管理员/有配置写权限者控制。
+- Source 2：第 92-97 行，环境变量值来自 `config.Network`、`lease.Subnet`、`lease.IPv6Subnet`、`attrs.PublicIP/PublicIPv6`。
+
+**3. Sink 分析**
+- Sink 1：第 75 行 `runCmd(..., "sh", "-c", n.preStartupCommand)` —— 直接以 shell 执行配置中的字符串。
+- Sink 2：第 100 行 `runCmd(env, "", "sh", "-c", n.postStartupCommand)` —— 同样以 `sh -c` 执行配置字符串。
+
+**4. 数据流验证**
+
+流 A：`config.Backend`(source, line 60) → JSON 解码 → `n.preStartupCommand`(line 68) → 无任何过滤/校验 → `"sh", "-c", n.preStartupCommand`(line 75)。中间无黑名单、无白名单、无转义——这是**设计如此**的功能：extension 后端本来就允许管理员指定任意命令。命令注入的“攻击面”取决于谁有权修改该配置。
+
+流 B：同上 → `n.postStartupCommand`(line 69) → line 100 执行。此外注意 `n.subnetAddCommand` / `n.subnetRemoveCommand`（line 71-72）在本文件中**未被使用**（network 结构体定义在其它文件，那里会执行它们——属于第二入口，本文件未展示其执行点，但字段确实被解析并存储）。
+
+流 C：line 92-96 将 lease/IP 数据作为**环境变量**传入（非拼接进命令字符串），因此即使 Subnet 含特殊字符也不会破坏引号或产生额外命令——env 方式是相对安全的传递方式。但若 postStartupCommand 本身恶意，则无意义。
+
+**5. 防御有效性评估**
+- 全文没有任何对命令内容的校验、白名单或沙箱（runCmd 直接 `exec.Command("sh","-c",...)`，继承完整 `os.Environ()`，line 121）。
+- 黑名单/正则不存在；即便存在也视为可绕过。
+
+**6. 结论定性**
+
+这属于“by-design 的任意命令执行”功能：flannel extension 后端文档明确说明会执行用户配置的命令。真正的安全问题是**信任边界**：如果该配置可由低权限用户（如能写 Kubernetes NetworkAttachmentConfig / flannel ConfigMap 的租户）修改，则构成 CWE-78（OS 命令注入）/ CWE-94 提权至节点 root（flannel 以特权运行）。在多租户场景下这是真实漏洞；在单管理员场景下是预期功能。鉴于代码本身零校验且以 `sh -c` 执行外部可控配置字符串，判定存在 CWE-78 漏洞（条件为配置源不可信时）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-78 (OS Command Injection via untrusted backend configuration executed with sh -c)",
+  "risk_level": "high (conditional: high if config source is tenant-writable; informational if admin-only)",
+  "source": "line 60: json.Unmarshal(config.Backend) 提取 PreStartupCommand/PostStartupCommand/SubnetAddCommand/SubnetRemoveCommand",
+  "sink": "line 75 与 line 100: runCmd(..., 'sh', '-c', cmd) 直接执行; runCmd 内部 line 120 exec.Command 且 line 121 继承全部 os.Environ",
+  "explanation": "config.Backend -> json.Unmarshal -> preStartupCommand/postStartupCommand -> 无任何过滤或白名单 -> sh -c 任意执行; subnetAddCommand/subnetRemoveCommand 在 line 71-72 被解析存储但本文件未执行, 属于其他文件中的第二入口; lease.Subnet 等通过环境变量传递(line 92-96)相对安全但无法阻止命令本身恶意",
+  "fix_suggestion": "限制后端配置仅由高权限管理员写入(如 RBAC 校验), 或避免 sh -c 改用 exec.Command 分离参数并加白名单校验命令路径, 同时不继承完整 os.Environ"
+}
+```

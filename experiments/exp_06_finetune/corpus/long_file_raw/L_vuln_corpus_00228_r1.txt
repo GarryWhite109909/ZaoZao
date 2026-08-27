@@ -1,0 +1,68 @@
+# 全文逐函数安全分析
+
+## 1. SecurityCheck（第 22–56 行）
+
+**入口点**：所有经过该中间件的路由；source 为 `r.Header.Get("Authorization")`（第 27 行）与 `mux.Vars(r)` 中的 `networkname`/`network`（第 33–35 行）。
+
+**数据流 A：DNS 特殊通道（第 28–36 行）**
+- 条件：URI 含 `/dns` 且方法为 GET 且 `authenticateDNSToken(bearerToken)` 通过。
+- `authenticateDNSToken`（第 118–124 行）将 token 按空格切分后取 `tokens[1] == servercfg.GetDNSKey()`。防御有效性取决于 DNS key 是否为强随机值且非空——此处**没有空值检查**。若部署中 `DNSKey` 未配置（默认空字符串），则任何发送 `Authorization: Bearer `（即第二段为空串）的请求都能通过比较，获得 `ALL_NETWORK_ACCESS` 权限并注入 header `user=nameserver`、`networks=["THIS_USER_HAS_ALL"]`（第 31–34 行）。对比第 84 行的 `authenticateMaster` 显式检查了 `servercfg.GetMasterKey() != ""`，而 DNS 路径缺失同样的空值守卫，这是明显的防御不对称，构成可利用的认证绕过（CWE-287 / CWE-476 逻辑缺陷）。此外匹配方式是 `strings.Contains(r.RequestURI, "/dns")` 子串匹配而非路由精确匹配，攻击面被放大。
+
+**数据流 B：常规路径（第 37–55 行）**
+- `UserPermissions(reqAdmin, networkName, bearerToken)` 返回 networks/username 后直接写入响应头 `user` 与 `networks`（第 51–52 行），再交给 next handler。
+- 注意：header 值来自 token 解析出的 username/networks 列表。若 username 或网络名包含换行符 `\n` 或 `\r`，Go 的 `Header.Set` 会拒绝含非法字符的值（Go net/http 会过滤），故 HTTP 头注入风险有限，但下游以这些 header 作为信任依据（见 ContinueIfUserMatch）。
+
+## 2. NetUserSecurityCheck（第 58–107 行）
+
+**入口点**：network user 相关路由；source：`params["networkuser"]`、`params["network"]`（第 64–65 行）、Authorization 头（第 67 行）。
+
+**数据流 C：master token 短路（第 76–81 行）**
+- `authenticateMaster(authToken)`（第 83–85 行）使用 `==` 进行非常量时间字符串比较，存在时序侧信道（CWE-208），但实际可利用性低；更重要的是它正确检查了 master key 非空，此路径本身无绕过。
+- 通过后设置 `ismaster=yes` 并放行，不校验 network 参数——符合设计意图。
+
+**数据流 D：普通用户路径（第 83–105 行）**
+- `VerifyUserToken` 校验 JWT；isadmin 直接放行（第 89–92 行）。
+- isNodes/isClients 分支（第 93–103 行）：取 `u.AccessLevel > necessaryAccess` 则拒绝。注意语义：AccessLevel **大于**所需级别被拒，意味着权限数值越小权限越大（NET_ADMIN < NODE_ACCESS < CLIENT_ACCESS 的数值约定），逻辑自洽但脆弱。
+- else 分支（第 104 行）：`netUserName != userName` 才拒绝——即用户只能操作自己的记录，防御有效。
+- **替代通道问题**：当 `isNodes=false && isClients=false && isadmin=false` 时，只要 URL 中 `networkuser` 参数等于自己用户名即可放行，而 `network` 参数完全不校验该用户是否属于该网络——若下游 handler 用 `network` 参数做资源定位，普通用户可通过指定任意 network 配合自身用户名越权访问其他网络的自身名义资源（潜在 IDOR/BOLA，CWE-639），需结合下游路由确认，但中间件层确实未做网络归属校验。
+
+## 3. UserPermissions（第 109–139 行）
+
+**入口点**：被 SecurityCheck 调用；source：token 字符串、netname。
+
+**数据流 E**：
+- 第 113–117 行：token 必须形如 `Bearer xxx`，否则拒绝——有效。
+- 第 119–121 行：master token → ALL_NETWORK_ACCESS，检查了非空（第 84 行），有效。
+- 第 123–126 行：JWT 验证失败返回错误——有效。
+- 第 128–130 行：reqAdmin 且非 admin 拒绝——有效。
+- 第 134–136 行：非 admin 用户若未提供 netname（`len(netname)==0`）则**跳过网络归属检查**，直接返回其全部 networks。这意味着不带 network 参数的路由对普通用户放行其自有网络列表，属设计行为，但若某敏感路由恰好没有 networkname 路径参数，普通用户即可通过（第二入口风险）。
+- 第 137–138 行：EE 分支要求 IsUserNetAdmin，注意失败时返回 `nil, "", err`，username 丢失但仅用于错误路径，无影响。
+
+## 4. authenticateMaster / authenticateNetworkUser / authenticateDNSToken（第 141–152、154–160、162–168 行）
+
+- 第 143 行：`tokenString == servercfg.GetMasterKey() && servercfg.GetMasterKey() != ""` —— 非常量时间比较（CWE-208，低危）；空 key 守卫存在，主路径无空值绕过。
+- 第 155–159 行：先验证网络存在再做成员比对，防御有效。
+- 第 163–167 行：**关键缺陷**——`return tokens[1] == servercfg.GetDNSKey()` 无空 key 检查。若 DNSKey 为空（未配置或默认零值），`Authorization: Bearer ` 即可通过，配合第 28 行的 `/dns` 子串匹配 + GET 条件，形成无需任何密钥的认证绕过，攻击者获得全网络访问身份 `nameserver`。这是全文最明确的漏洞链：source 第 27 行 Authorization 头 → sink 第 29 行 `authenticateDNSToken` 放行 → 第 31–34 行注入特权 header → next handler 以 ALL_NETWORK_ACCESS 执行。
+
+## 5. ContinueIfUserMatch（第 170–182 行）
+
+- 比较 `params["username"]` 与 `r.Header.Get("user")`（第 175 行）。信任来源是上游中间件写入的 header。在标准部署中 header 由服务端设置不可伪造；但若存在任何反代/内部转发场景允许客户端携带 `user` 头透传（Go http.Client 转发等），则可伪造身份（CWE-345）。单看本文件，防御依赖部署假设，标记为条件性弱点。
+
+## 第二入口与替代通道汇总
+
+1. `/dns` GET 通道绕过主认证（空 DNSKey）；
+2. NetUserSecurityCheck 中非 nodes/clients 路径不校验 network 归属；
+3. UserPermissions 在 netname 为空时跳过归属检查；
+4. master/DNS key 均用 `==` 明文比较，存在时序泄露面。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-287 认证绕过 (空密钥比较) / CWE-639 越权",
+  "risk_level": "高危",
+  "source": "line 27: r.Header.Get(Authorization) 经 line 28 的 /dns 子串匹配进入 DNS 特殊通道",
+  "sink": "line 29: authenticateDNSToken -> line 166: tokens[1] == servercfg.GetDNSKey() 缺少非空检查, line 31-34 注入 user=nameserver 与 ALL_NETWORK_ACCESS 后于 line 36 放行",
+  "explanation": "当服务器未配置 DNSKey(默认空串)时, 攻击者发送 Authorization: Bearer 加空尾随段即可使 line 166 的相等比较成立, 绕过全部认证, 获得对 /dns 下所有 GET 接口的全网络访问权限; 对比 line 84 的 authenticateMaster 有 GetMasterKey() != 空守卫, 此处防御缺失; 另 line 104 的 NetUserSecurityCheck 非 nodes/clients 分支不校验 network 参数归属, 存在 BOLA 第二入口",
+  "fix_suggestion": "line 166: 改为 tokens[1] == servercfg.GetDNSKey() && servercfg.GetDNSKey() != 空, 并在启动时强制生成非空随机 DNSKey; 同时 line 104 增加 authenticateNetworkUser(network, userNetworks) 校验, 并将密钥比较改为 constant time 比较"
+}
+```

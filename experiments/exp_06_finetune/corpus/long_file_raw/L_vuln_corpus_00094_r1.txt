@@ -1,0 +1,42 @@
+# 全文通读与编号分析
+
+## 入口点枚举（全文）
+
+1. **模块入口 `prepareProxy(proxy, appPublicFolder)`（第 17 行）**：`proxy` 来自项目 package.json 的配置（开发者可控，非远程攻击者直接可控）；`appPublicFolder` 为固定路径。
+2. **HTTP 请求入口（间接）**：返回的代理配置被 webpack-dev-server 使用，每个进入 dev server 的请求都会触发：
+   - `context(pathname, req)` 回调（第 44 行）——攻击者可控 `pathname`、`req.method`、`req.headers.accept`；
+   - `onProxyReq(proxyReq, req, res)`（第 62 行）——攻击者可控请求头（如 `origin`）；
+   - `onError` 回调即 `onProxyError(target)` 返回的函数（第 88 行）——攻击者可控 `req.url`、`req.headers.host`。
+3. **环境/平台通道**：第 41 行 `process.platform === 'win32'` 触发 `resolveLoopback`；无其他环境变量读取。
+
+## 逐函数数据流分析
+
+### 1. `prepareProxy`（第 17–100 行）
+- 第 19–34 行：类型校验，非法则退出。防御有效（仅影响开发者配置）。
+- 第 84–89 行：字符串型 proxy 必须匹配 `/^http(s)?:\/\//`——这是**格式校验而非安全边界**，且 source 是本地 package.json，不构成远程注入面。
+
+### 2. `mayProxy(pathname)`（第 36–40 行）
+- `path.resolve(appPublicFolder, pathname.slice(1))`：`pathname` 形如 `/..%2f..` 时，http-proxy-middleware 传入的是解码后的路径，`../` 可使 resolve 跳出 public 目录。但该函数的用途只是“判断文件是否存在以决定是否走代理”——存在目录穿越探测的可能性（通过响应差异区分文件是否存在），但仅限 dev server 本地场景，且不产生文件读取 sink。属低危信息泄露面，非本次主要结论。
+
+### 3. `createProxyEntry`（第 39–80 行）
+- 第 45–58 行 context 判断：`req.headers.accept.indexOf('text/html')` 仅是路由启发式，无 sink。
+- 第 63–67 行：将 `origin` 头改写为 `target`——`target` 来自配置，无外部拼接。
+
+### 4. `resolveLoopback`（第 103–126 行）
+- 仅处理 hostname 为 localhost 的情形，输出经 `url.format`，无注入点。
+
+### 5. `onProxyError(proxy)`（第 129–152 行）★ 关键 sink
+- **source**：第 131 行 `const host = req.headers && req.headers.host` —— HTTP `Host` 请求头，完全由客户端控制；第 132 行 `req.url` —— 客户端控制的请求 URL。
+- **sink 1（日志）**：第 133–139 行拼入 console.log —— 终端注入，低危。
+- **sink 2（HTTP 响应体）**：第 149–151 行 `res.end('Proxy error: Could not proxy request ' + req.url + ' from ' + host + ...)` —— 攻击者可通过发送带恶意 `Host` 头或恶意 URL 的请求（只要能令代理出错，例如 target 不可达），使 payload 原样回显到响应体。若错误页被浏览器渲染为 HTML（dev server 场景下 Content-Type 常为 text/html），`Host: <script>alert(1)</script>` 即构成**反射型 XSS**；同时未编码的头部内容还可能造成响应拆分风险（CWE-113）。中间没有任何 HTML 编码/校验防御。
+- **sink 3**：第 143 行 `res.writeHead(500)` 未传 statusMessage，故头注入主要落在响应体路径。
+
+## 第二入口验证
+- 替代通道：`req.url` 同样在第 137、150 行被反射，即使 Host 头被前端代理规范化，URL 路径（含 `<`、`"` 等）仍可达同一 sink，构成第二入口，证实漏洞不可通过单点过滤消除。
+
+## 结论
+全文唯一确认的 source→sink 无防御数据流是：客户端可控的 `Host` 头 / `req.url`（第 131–132 行）→ 字符串拼接 → `res.end`（第 150 行）响应体，无任何转义，形成反射型 XSS / 响应注入。这是 create-react-app 的已知问题类别（dev server 错误页反射）。其余路径（package.json 配置、loopback 处理）均为开发者本地输入，不构成远程可利用面。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 反射型XSS / CWE-113 响应注入", "risk_level": "中", "source": "line 131-132: req.headers.host 与 req.url 由客户端请求完全控制", "sink": "line 149-151: res.end 直接字符串拼接 req.url 与 host 写入 HTTP 响应体", "explanation": "攻击者向 dev server 发送携带恶意 Host 头或含 HTML 元素的 URL 的请求并令代理出错(如 target 不可达) -> onProxyError 被回调 -> 第 150 行将未编码的 host 与 req.url 拼接进 500 错误响应体 -> 浏览器按 text/html 渲染时执行脚本; 第二入口: req.url 在第 137 与 150 行均被反射, 无法靠单一过滤消除; 全文无任何 HTML 编码或白名单校验", "fix_suggestion": "line 149-151: 对 req.url 与 host 做 HTML 实体编码后再拼接, 或改为 res.end(JSON.stringify({error: err.code})) 等结构化输出并设置 Content-Type 为 application/json"}
+```

@@ -1,0 +1,22 @@
+## 编号分析
+
+1. **入口点枚举**：
+   - `authenticate(form)`（第 47 行起）：source 为 `form.data['email']`（第 49 行）与 `form.data['password']`（第 50 行），来自登录表单的用户输入。
+   - `connect()`（第 96 行）、`login()`（第 145 行）、`__auto_create_user()`（第 168 行）：均为内部消费，无新外部输入。
+   - `_configure_server()`（第 224 行）与 `__configure_tls()`（第 205 行）：仅读 config（管理员配置，非用户输入），TLS 校验在无证书时为 `CERT_NONE`（第 209 行），属配置问题但非用户可控。
+   - `search_ldap_user()`（第 251 行）：sink 所在。
+
+2. **数据流验证**：
+   - 第 49 行 `self.username = form.data['email']` → 未做任何过滤/转义 → 第 262 行 `search_filter = "({0}={1})".format(config.LDAP_USERNAME_ATTRIBUTE, self.username)` → 第 270 行 `self.conn.search(search_filter=search_filter, ...)`。用户输入直接拼接进 LDAP 过滤器，**无任何防御**（没有 ldap3 的 `escape_filter_chars` 调用）。攻击者可注入如 `*)(uid=*))(|uid=*` 绕过用户过滤、枚举任意 LDAP 条目，或配合 `LDAP_AUTO_CREATE_USER` 以任意 DN 的 mail 属性创建本地账户。这是经典 LDAP 注入（CWE-90），真实存在于 pgAdmin（CVE-2022-4223 同类问题即在此处）。
+   - 密码流：第 50 行 password 仅用于 bind（第 91 行），bind 失败会返回错误，不构成注入 sink。
+   - `user_dn` 拼接（第 66–71 行）：同样用 username 拼 BIND DN，可造成 DN 注入/bind 到任意条目，但需先通过 bind 认证，风险次之，同源同根因。
+   - `login()` 中 username 用于 SQLAlchemy 参数化查询（第 152–156 行），安全。
+   - `__auto_create_user` 用 ORM filter_by，安全；email 来自 LDAP 返回值，间接受注入影响。
+
+3. **第二入口/替代通道**：无其他路由或文件输入；config 值虽拼入过滤器（第 262 行 LDAP_USERNAME_ATTRIBUTE），但为管理员控制，不算漏洞 source。
+
+4. **结论**：存在 LDAP 注入，风险高（认证绕过/目录枚举，前提是实例使用 LDAP 认证）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-90 LDAP Injection", "risk_level": "high", "source": "line 49: self.username = form.data['email']", "sink": "line 262-271: search_filter 拼接后传入 self.conn.search(search_filter=...)", "explanation": "登录表单中的 email 字段未经过滤或转义，直接在第 262 行 format 进 LDAP 搜索过滤器并在第 270 行执行查询，攻击者可注入如 *)(uid=*))(|uid=* 等载荷绕过用户过滤、枚举任意 LDAP 条目；若开启 LDAP_AUTO_CREATE_USER 还可能以伪造的 mail 属性自动创建本地账户；同类问题也存在于第 66-71 行的 BIND DN 拼接", "fix_suggestion": "line 262: 使用 ldap3.utils.conv.escape_filter_chars 对 self.username 进行转义后再拼接过滤器，同时对 BIND DN 使用 escape_dn_chars；并建议在 TLS 场景默认启用证书校验而非 ssl.CERT_NONE"}
+```

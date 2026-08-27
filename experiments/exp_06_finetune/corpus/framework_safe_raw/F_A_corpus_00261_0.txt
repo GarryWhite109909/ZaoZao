@@ -1,0 +1,48 @@
+LANG: python
+```code
+# faq/views.py
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.db import connection
+
+
+@csrf_exempt
+def rewrite_base(request):
+    """Adjusts the RewriteBase and ErrorDocument 404 entries for the user's environment."""
+    if request.method != 'POST':
+        return JsonResponse({'error': 'method not allowed'}, status=405)
+
+    server_path = request.POST.get('server_path', '/')
+    error_code = request.POST.get('error_code', '404')
+
+    with connection.cursor() as cursor:
+        # Look up the current rewrite base record for this installation path
+        cursor.execute(
+            "SELECT id, rewrite_base FROM setup_htaccess WHERE server_path = %s",
+            [server_path]
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return JsonResponse({'error': 'no htaccess config found'}, status=404)
+
+        # Update the rewrite base and the matching ErrorDocument directive
+        new_404_path = server_path.rstrip('/') + '/index.php?action=404'
+        cursor.execute(
+            "UPDATE setup_htaccess SET rewrite_base = %s, "
+            "error_document = %s WHERE server_path = %s",
+            [server_path, error_code + ' ' + new_404_path, server_path]
+        )
+
+    return JsonResponse({'status': 'ok'})
+```
+
+1. 第 14-15 行：用户可控输入点为 `request.POST.get('server_path')` 与 `request.POST.get('error_code')`，两者均为攻击者可完全控制的 POST 参数。
+2. 第 18-20 行（原漏洞版）：`server_path` 通过字符串拼接进入 `cursor.execute` 的 SELECT 语句，构成第一条注入链，sink 为 SQL 执行点。
+3. 第 27-30 行（原漏洞版）：`server_path`、`error_code` 经 `%` 格式化拼入 UPDATE 语句，构成第二条注入链；两条链均已在修复版中改为 Django 数据库 API 原生参数化形式——SQL 模板中仅保留占位符 `%s`，参数以列表作为 `execute` 的第二个实参传入。
+4. 类型正确性：参数化查询由数据库驱动负责转义与类型绑定，用户输入永远不参与 SQL 文本解析，无法逃逸引号改变语句结构；位置正确性：防御位于 sink 调用处，覆盖从第 14-15 行到两个 execute 的全部数据流路径。
+5. 攻击面覆盖完整性：SELECT 与 UPDATE 两处 execute 均已参数化，无残留拼接或 `%` 格式化的 SQL 片段；业务逻辑、变量名、控制流与原代码完全一致，仅替换了 SQL 构造方式。
+6. 第二入口检查：本视图仅此一个函数入口，除 POST body 外无 GET/headers/Cookie 等其他用户输入通道进入 SQL；`new_404_path` 由 `server_path` 派生但同样经参数化绑定，无替代注入通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码存在两处 CWE-89 SQL 注入流: 第一条为第 14 行 request.POST.get('server_path') 经字符串拼接流入第 19 行 SELECT 的 cursor.execute; 第二条为第 14-15 行的 server_path 与 error_code 经百分号格式化流入第 28-31 行 UPDATE 的 cursor.execute; 修复采用 Django connection.cursor 原生参数化查询, SQL 模板仅含 %s 占位符, 用户输入作为参数列表传入, 输入不再参与 SQL 解析, 两条注入链均被消除; 无第二入口或其他未修复数据流", "fix_suggestion": "line 19: 将 SELECT 改为参数化 execute('...WHERE server_path = %s', [server_path]); line 28: 将 UPDATE 改为参数化 execute('...', [server_path, error_code + ' ' + new_404_path, server_path])"}
+```

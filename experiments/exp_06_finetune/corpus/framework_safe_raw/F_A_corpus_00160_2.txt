@@ -1,0 +1,76 @@
+LANG: php
+```php
+<?php
+// share.php — 文件分享访问入口（原生 PHP + PDO）
+declare(strict_types=1);
+
+$pdo = new PDO('sqlite:/var/data/app.db');
+$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+function getShareById(PDO $pdo, string $id): ?array {
+    $stmt = $pdo->prepare('SELECT * FROM shares WHERE id = :id');
+    $stmt->execute([':id' => $id]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    return $row ?: null;
+}
+
+// 防御辅助：将路径规范化为绝对形式，供归属校验使用（新增，仅防御用途）
+function resolveUnderRoot(string $root, string $relative): ?string {
+    $base = realpath($root);
+    if ($base === false) { return null; }
+    $target = realpath($base . '/' . ltrim($relative, '/'));
+    if ($target === false) { return null; }
+    // 前缀校验：目标必须严格位于根目录之内（分隔符感知）
+    if ($target !== $base && strpos($target, $base . DIRECTORY_SEPARATOR) !== 0) {
+        return null;
+    }
+    return $target;
+}
+
+// source: 用户通过 GET 参数传入分享 ID 与要访问的子路径
+$shareId = $_GET['share_id'] ?? '';
+$subPath = $_GET['path'] ?? '/';
+
+$share = getShareById($pdo, $shareId);
+if ($share === null) {
+    http_response_code(404);
+    exit('share not found');
+}
+
+$files = json_decode($share['files_raw'], true) ?? [];
+
+if (count($files) === 1) {
+    // sink: 拼接根目录与用户路径后，先做规范化+前缀归属校验再读取
+    $realPath = rtrim($share['root_dir'], '/') . '/' . ltrim($subPath, '/');
+} else {
+    $child = explode('/', trim($subPath, '/'))[0];
+    $rest  = implode('/', array_slice(explode('/', trim($subPath, '/')), 1));
+    $mapPath = '';
+    foreach ($files as $f) {
+        if (basename($f) === $child) { $mapPath = $f; break; }
+    }
+    if ($mapPath === '') { http_response_code(403); exit('not allowed'); }
+    $realPath = $mapPath . '/' . $rest;
+}
+
+// sink: 规范化后校验最终路径仍位于分享根目录内，越界则拒绝
+$finalPath = resolveUnderRoot('/srv/storage/' . rtrim($share['root_dir'], '/'), substr($realPath, strlen(rtrim($share['root_dir'], '/'))));
+if ($finalPath === null || !is_file($finalPath)) {
+    http_response_code(403);
+    exit('not allowed');
+}
+
+header('Content-Type: application/octet-stream');
+readfile($finalPath);
+```
+
+1. 第 22–23 行是用户可控输入点：`$_GET['share_id']` 与 `$_GET['path']`；其中 `share_id` 走第 10–11 行 PDO 预编译参数绑定，无 SQL 注入风险；`subPath` 是本次目标漏洞的唯一污染源。
+2. 第 44 行（单文件分支）与第 54 行（多文件分支）把 `subPath` 拼入 `$realPath`，原代码未做任何归属校验，`../` 可逃逸出 `/srv/storage/<root_dir>`。
+3. 防御类型正确性：新增辅助函数 `resolveUnderRoot` 使用 PHP 原生 `realpath()` 做规范化（消除 `../`、符号链接、冗余分隔符），再用分隔符感知的前缀比较（`$base . DIRECTORY_SEPARATOR`）确认目标严格位于根目录内——这是白名单式精确允许集校验，而非黑名单/正则过滤。
+4. 位置正确性：校验放在第 60–63 行、即所有分支汇合之后、`readfile()` 之前，覆盖单文件与多文件两条拼接路径的公共汇聚点，攻击面完整。
+5. 边界处理：`strpos(..., $base . DIRECTORY_SEPARATOR)` 保证 `/srv/storage/shareA_evil` 这类同前缀目录不会被误放行；`is_file()` 进一步排除目录与非常规文件；校验失败统一返回 403，不泄露路径信息。
+6. 第二入口检查：`getShareById` 的查询已参数化，无需改动；`json_decode` 结果仅用于白名单匹配 `basename`，不直接进入文件系统路径的未校验部分（其产物同样经过最终 `resolveUnderRoot` 校验）；除目标数据流外未改动其他逻辑，满足 minimal pair 对照。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-639：用户可控 path 参数经第 44 行或第 54 行拼接到真实路径并在第 66 行 readfile 读取，可借助 ../ 逃逸分享根目录造成任意文件读取；修复通过新增 resolveUnderRoot 辅助函数，在 readfile 前用 realpath 规范化加分隔符感知前缀校验，确保最终路径严格位于 /srv/storage/<root_dir> 内，越界即返回 403；SQL 查询本已参数化，无需修改", "fix_suggestion": "line 60: 在 readfile 前插入 resolveUnderRoot 规范化与前缀归属校验，失败时返回 403"}
+```

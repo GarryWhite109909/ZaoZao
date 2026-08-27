@@ -1,0 +1,32 @@
+## 编号分析（全文逐函数）
+
+**1. 入口点枚举（第 165–190 行，`ai_vision_analyze`）**
+- 参数入口：`image_path`、`image_url`、`prompt`、`provider`、`model`、`api_key`、`max_tokens`、`detail`（第 166–173 行），全部来自 `context['params']`。
+- 环境入口：第 179–184 行 `os.getenv('OPENAI_API_KEY'/'ANTHROPIC_API_KEY')`，仅读取固定键名，无注入面。
+- 网络出口：仅两个硬编码端点 `https://api.openai.com/v1/chat/completions`（第 288 行）与 `https://api.anthropic.com/v1/messages`（第 388 行）。
+
+**2. `image_path` 数据流（第 193–203 行）**
+- source：用户参数；sink：`open(image_path,'rb')` 后 base64 编码送入 LLM API。
+- 防御：模块元数据声明 `required_permissions=['filesystem.read', 'ai.api']`（第 60 行），即任意文件读取是该工作流模块的显式授权能力，且读取结果只发往官方 API 域名，不回传给调用方之外的位置。属设计意图内的能力，非越权漏洞。
+
+**3. `image_url` 数据流——Anthropic 分支（第 352–364 行）**
+- source：用户控制的 URL；sink：`session.get(image_url)` 服务端下载。
+- 防御：第 357–360 行在请求前调用 `enforce_outbound_url(image_url)`，捕获 `SSRFError` 并转为 `ModuleError`。SSRF 守卫位于 sink 之前且不可绕过（异常直接中断流程），防御有效。代码注释亦引用对应 GHSA 编号表明该问题已被修复。
+
+**4. `image_url` 数据流——OpenAI 分支（第 233–243 行）**
+- 该分支未做本地下载，而是把 URL 直接放进 payload 由 OpenAI 服务端拉取（第 288 行请求发往 api.openai.com）。本进程不发起对该 URL 的出站连接，因此不构成本地网络的 SSRF。与 Anthropic 分支的守卫不一致属于健壮性瑕疵，但无本地可利用的 sink。
+
+**5. 凭据处理（第 176–190、285–287、384–386 行）**
+- API key 仅放入 Authorization / x-api-key 头发往对应官方域名，无日志输出、无错误信息回显 key；错误消息（第 296–297、392–393 行）只包含 API 返回的 message，不含凭据。
+
+**6. 其余函数 `_call_openai_vision` / `_call_anthropic_vision`**
+- 无 eval/exec/反序列化/路径拼接等危险 sink；响应字段按结构化方式提取并返回，无注入点。`media_type` 来自 `mimetypes.guess_type` 或响应头 Content-Type 截断（第 363 行），仅作为字符串传入 JSON payload，无头部注入可能（aiohttp json 序列化）。
+
+**7. 第二入口与替代通道检查**
+- 全文件仅一个注册入口 `ai_vision_analyze`；两个辅助函数均为内部调用，不接受外部直接路由。无回调、无子进程、无模板渲染。
+
+**结论**：唯一历史上存在的 SSRF 问题已通过 `enforce_outbound_url` 在 sink 前有效拦截；其余数据流均无未防护的危险 sink。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文：入口仅有 ai_vision_analyze 的 params 与环境变量。image_url 在 anthropic 分支于 session.get 之前经 enforce_outbound_url 校验并可阻断 SSRF（第 357-360 行）；openai 分支将 URL 交由 OpenAI 服务端拉取，本进程不出站，无本地 SSRF sink。image_path 读取受 required_permissions=filesystem.read 授权且结果仅发往官方 API 域名。API key 仅写入发往官方域名的请求头，无泄露。全文件无 eval、反序列化、路径拼接等其他危险 sink。", "fix_suggestion": "no fix needed"}
+```

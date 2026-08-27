@@ -1,0 +1,53 @@
+# 全文逐段分析（domino 库 NodeUtils.js 序列化模块）
+
+**入口点枚举（全文通读）**
+本文件无网络路由，其“入口”是所有进入序列化器的 DOM 数据：元素标签名、属性名/值、文本节点 data、注释 data、PI 的 target 与 data、DOCTYPE name。调用方通常是 `innerHTML`/`outerHTML`/XMLSerializer 类接口，输入可来自不可信 HTML 解析或 `createProcessingInstruction` 等 DOM 构造 API。
+
+**1. 第 15–24 行 `hasRawContent` 表 + 第 27–44 行 `emptyElements` 表**
+静态白名单，无用户输入，安全。
+
+**2. 第 46–66 行 `escape(s)`**
+正则 `/[&<>\u00A0]/g` 覆盖文本上下文全部危险字符，switch 分支与正则字符集一一对应，防御有效。
+
+**3. 第 68–88 行 `escapeAttr(s)`**
+属性值用双引号包裹（第 176 行附近 `'"' + escapeAttr(a.value) + '"'`），转义了 `& < > "` 和 U+00A0，双引号上下文下防御有效。
+
+**4. 第 90–104 行 `attrname(a)`**
+已知命名空间走前缀映射；未知命名空间回退到 `a.name` 原样拼接。属性名来自解析器（受 Name 产生式约束）时风险低，但若通过 DOM API（如 `setAttributeNS` 用非常规命名空间 URI）注入含空格或 `=` 的名字，则无任何转义——次要隐患。
+
+**5. 第 106–130 行 `escapeMatchingClosingTag(rawText, parentTag)`**
+快路径用 `toLowerCase().includes()` 判断，替换用大小写不敏感正则，且注释明确说明已修复 astral 字符导致的偏移错位问题（原 CVE 场景），当前版本防御有效。`parentTag` 来自解析后的 localName，不含正则元字符。
+
+**6. 第 132–146 行 `escapeClosingCommentTag(rawContent)`**
+处理 `-->` 与 `--!>`，覆盖注释闭合的所有合法形式，防御有效。
+
+**7. 第 148–155 行 `escapeProcessingInstructionContent(rawContent)`**
+对内容中的 `>` 做 `replaceAll('>', '&gt;')`，内容侧防御有效。
+
+**8. 第 157–215 行 `serializeOne` —— 关键 sink 所在**
+
+- **case 7（第 199–203 行附近）PROCESSING_INSTRUCTION_NODE**：
+  ```js
+  s += '<?' + kid.target + ' ' + content + '?>';
+  ```
+  `kid.target` **完全未做任何转义或校验**即拼入输出。数据流：source = 用户可控的 `document.createProcessingInstruction(target, data)` 的 target 参数（DOM 规范仅要求非空，不禁止 `>`、`?` 等字符）→ sink = 第 201 行字符串拼接进序列化结果。攻击者传入 target 为 `foo?><img src=x onerror=alert(1)>` 时，输出为 `<?foo?><img src=x onerror=alert(1)> ...?>`，重新解析后注入任意标记/XSS。这是明确的 source→sink 无防御路径。
+  
+- **case 3/4 文本节点（第 185–196 行）**：raw content 父元素内原文输出是 HTML 规范行为，且配合第 106–130 行的闭合标签转义，闭环成立。
+
+- **case 10 DOCTYPE（第 205–213 行）**：publicID/systemId 拼接位于 `if (false)` 死代码内，不可达。
+
+- **case 1 元素（第 160–183 行）**：tagname 来自解析器受限字符集；属性经 escapeAttr；子内容递归并按需转义，整体有效。
+
+**第二入口/替代通道核查**：除 PI target 外，其余通道（文本、注释、属性、style/script 内容）均有对应转义函数且被正确调用；未发现其他未防护拼接点。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-79 (Improper Neutralization of User Input During Web Page Generation, XSS via ProcessingInstruction target)",
+  "risk_level": "medium",
+  "source": "line 201: kid.target, 用户可通过 document.createProcessingInstruction(target, data) 控制的 PI 目标名",
+  "sink": "line 201: s += '<?' + kid.target + ' ' + content + '?>', 未转义直接拼入序列化输出",
+  "explanation": "escapeProcessingInstructionContent 只转义了 PI 的 data 部分, 而 kid.target 原样拼接; 攻击者在 target 中注入 ?> 即可提前闭合处理指令并注入任意 HTML/脚本标记, 序列化结果被浏览器重新解析时形成 XSS",
+  "fix_suggestion": "line 201: 对 kid.target 进行校验或转义, 例如拒绝包含 > 或 ? 的 target, 或参照 XML 规范限制 target 仅由字母开头加名称字符组成后再拼接"
+}
+```

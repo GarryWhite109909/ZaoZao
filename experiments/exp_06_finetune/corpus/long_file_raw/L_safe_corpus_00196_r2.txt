@@ -1,0 +1,28 @@
+## 编号分析
+
+**1. `_shell_quote`（第 55–64 行）—— 唯一的防御原语**
+- POSIX 分支（第 63 行）：使用 `shlex.quote`，对 shell 元字符做单引号包裹，是标准有效防御。
+- Windows 分支（第 58–61 行）：拒绝 `\r\n\x00` 后用双引号包裹并将内部 `"` 翻倍为 `""`。cmd.exe 在双引号内不解释 `&`、`|`、`<`、`>` 等，且已阻断换行注入。属于合理有效的转义。
+
+**2. `ProcessMergeDriver.merge`（第 67–130 行）—— 核心 sink 所在**
+- Source：`ancestor/ours/theirs`（文件内容，第 82–88 行）只写入临时文件，路径由 `tempfile.TemporaryDirectory` 生成（第 81 行），不可控。
+- `%O/%A/%B/%L` 替换（第 91–94 行）：占位符被 `_shell_quote` 包裹的临时路径替换，临时路径不含攻击者可控字符。
+- `%P` 替换（第 95–99 行）：`path` 是外部可控 source（来自仓库中的文件名）。代码先调用 `_shell_quote(path)`，若含不可转义字符则直接返回 `ours, False` 放弃合并（第 97–98 行），否则以引号包裹形式插入命令。这是对 CVE-2026-42563 的修复：此前 `%P` 未加引号可导致命令注入；现在经 `shlex.quote` / Windows 双引号转义后，注入元字符被中和。
+- Sink：`subprocess.run(cmd, shell=True)`（第 102–107 行）。虽然使用 `shell=True`，但所有插值均已转义，剩余部分 `self.command` 来自配置，属受信任输入（见下条）。
+- 残余注意点：`cmd.replace("%P", ...)` 若命令中多次出现占位符会全部替换，但每次都同样转义，无影响。`%` 字符本身在 cmd.exe 中用于变量展开，但仅当攻击者能控制命令模板时才相关，而模板不受攻击者控制。
+
+**3. `MergeDriverRegistry.get_driver` / `_create_from_config`（第 133–193 行）—— 第二入口**
+- Driver 名 `name` 只用作 config 节名查找（第 187 行），不进入命令字符串。
+- 命令来源是 git 配置 `merge.<name>.driver`（第 188 行）。该配置与真实 git 行为一致：git 本身就允许仓库配置定义任意 merge driver 命令并执行，这是设计语义而非漏洞；且 dulwich 作为库，config 由调用方提供。即便视为半可信 source，`%P` 插值已被转义，模板本身的执行权在配置控制者手中，等同 git 上游行为。
+
+**4. `get_merge_driver_registry`（第 200–214 行）—— 全局单例**
+- 仅缓存 registry 并更新 `_config` 引用，无 sink，无数据流风险。
+
+**5. 其他通道核查**
+- 无网络入口、无回调、无环境变量读取；临时目录内文件读写均为固定文件名，无路径穿越面；`marker_size` 经 `_shell_quote(str(...))` 数字化处理。
+
+**结论**：唯一危险流 `path → %P → subprocess.run(shell=True)` 已通过 `_shell_quote`（POSIX 用 `shlex.quote`，Windows 用引号包裹+拒绝换行/NUL）在到达 sink 前完全中和，且不可转义时安全失败返回。全文未发现其他 source→sink 流。判定：无漏洞（本版本即 CVE-2026-42563 的修复版）。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文通读后确认:唯一的敏感数据流是 merge() 中外部可控的 path 参数经 %P 占位符进入 subprocess.run(shell=True) 执行(第95-107行)。该流已在 sink 前经过 _shell_quote 防御:POSIX 平台使用 shlex.quote 标准转义,Windows 平台拒绝 \\r\\n\\x00 并将双引号翻倍后整体引号包裹,cmd.exe 不解释双引号内的元字符;遇到不可转义字符时安全失败直接返回 ours 与冲突标志(第97-98行)。%O/%A/%B/%L 均为 tempfile 生成的固定路径或数字,不可控。driver 命令模板来自 git 配置,与上游 git 的 merge driver 设计语义一致,属受信任输入。其余函数(register_driver/get_driver/get_merge_driver_registry)无 shell 执行或文件写入 sink。本文件即为 CVE-2026-42563 的修复版本,未发现可绕过该防御的替代通道。", "fix_suggestion": "no fix needed"}
+```

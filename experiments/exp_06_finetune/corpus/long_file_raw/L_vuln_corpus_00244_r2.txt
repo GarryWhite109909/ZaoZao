@@ -1,0 +1,29 @@
+## 编号分析（全文通读）
+
+**1. StarredReposOptions / WatchedReposOptions（第 15–76 行）**
+- 字段 `StarrerID`、`RepoOwnerID`、`IncludePrivate` 均为 int64/bool，由调用方传入，经 `builder.Eq` 参数化拼接（第 33–35、58–66 行），无 SQL 注入风险。
+- 权限控制：`ApplyPublicOnly`（第 20、53 行）在 publicOnly 时强制关闭 IncludePrivate，防御有效；但该函数依赖调用方正确传参——若上游路由未调用 ApplyPublicOnly 且直接置 IncludePrivate=true，可越权列出私有仓库。本文件内无法证实存在此调用路径，不能据此定罪。
+
+**2. GetStarredRepos / GetWatchedRepos（第 79–95 行）**
+- 纯数据访问层，source 为 opts 结构体，sink 为 db.Find；参数化查询，无注入。
+
+**3. GetRepoAssignees（第 98–137 行）**
+- 第 110–113 行：`repo.ID`、`perm.AccessModeWrite` 参数化。
+- 第 127–131 行：`e.In("id", uniqueUserIDs.Values())` 参数化。
+- 无外部字符串输入进入 SQL，无漏洞。逻辑上返回有写权限用户及组织团队成员，属正常业务。
+
+**4. GetIssuePostersWithSearch（第 140–166 行）——重点**
+- **入口点/source**：`search` 参数（第 141 行），来自上层路由的用户搜索输入（Gitea 中对应 issue 列表页的 poster 搜索框），是本文件唯一的外部可控字符串 source。
+- **数据流**：
+  - 第 154 行：`builder.Like{"lower_name", strings.ToLower(search) + "%"}` —— xorm 的 Like 条件值作为绑定参数传递，**不存在经典 SQL 注入**；
+  - 但 `search` 中的 LIKE 通配符 `%` 与 `_` **未做转义**（对比：Gitea 正确实现应使用 `db.BuildCaseInsensitiveLike` 或对 `%`/`_` 转义）。攻击者提交 `%` 即可匹配全部 poster，绕过前缀匹配语义，枚举仓库所有 issue 作者（含已停用过滤之外的活跃用户名单）；
+  - 第 155 行：`db.BuildCaseInsensitiveLike("full_name", "%"+search+"%")` 同样未转义通配符，且此处是子串匹配，进一步放大枚举面。
+- **sink**：第 158–165 行 `db.GetEngine(ctx).Where(cond)...Find(&users)`。
+- **影响**：LIKE 通配符注入（CWE-178 / CWE-89 变体）：信息泄露——通过逐字符探测（如 `a%`、`ab%`）可盲枚举任意用户的 name/full_name，即使其不希望被搜索到；同时破坏前缀搜索的业务语义。风险等级低。
+- **第二入口核查**：本文件其余函数均无字符串型外部输入；`isPull` 为 bool，`repo.ID` 为内部 ID，无替代通道。
+
+## 结论
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-178: Improper Handling of Case Sensitivity / LIKE 通配符注入（SQL 注入变体）", "risk_level": "low", "source": "line 141: 函数入参 search（来自上层路由的用户搜索输入）", "sink": "line 154-155: builder.Like 与 db.BuildCaseInsensitiveLike 的模式串构造，最终于 line 158-165 进入 Find 查询", "explanation": "用户可控的 search 字符串在 line 154 以 strings.ToLower(search) + % 直接拼入 LIKE 模式，line 155 又以 % + search + % 拼入第二个 LIKE 模式，两处均未转义 % 和 _ 通配符。虽然使用了参数绑定不会产生经典 SQL 注入，但攻击者可通过提交 % 或逐字符前缀（如 a%、ab%）绕过前缀匹配语义，盲枚举仓库全部 issue/PR 作者的用户名与全名，造成用户信息泄露并破坏搜索业务逻辑", "fix_suggestion": "line 154-155: 对 search 中的 % 与 _ 进行转义（例如使用 EscapeLikeString 类工具函数将 \\\\%、\\\\_ 写入模式并配合 ESCAPE 子句），或统一改用项目内已有的安全模糊匹配辅助函数构造两个条件"}
+```

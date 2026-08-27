@@ -1,0 +1,26 @@
+## 编号分析
+
+**入口点枚举（全文通读）**
+1. `init()` 第 33 行：注册 backend，无外部输入。
+2. `New()` 第 41-49 行：仅构造结构体。
+3. `RegisterNetwork()` 第 55-135 行：唯一实质入口。外部数据来源为：
+   - `config.Backend`（第 60 行）——来自 flannel 的启动配置文件/etcd 配置，由集群管理员控制；
+   - `config.Network`、`lease.Subnet`、`lease.IPv6Subnet`、`PublicIP`（第 110-115 行）——由 subnet manager 分配的 IP/网段值。
+
+**数据流逐一验证**
+
+- **流 1**：`cfg.PreStartupCommand`（第 66 行）→ `strings.Fields` 拆分 → `runCmd` → `exec.Command`（第 152 行）。source 是管理员配置的命令字符串本身；该后端的设计意图就是执行管理员指定的命令（文档化功能），且配置不来自不可信用户输入。无有效攻击者可控 source。
+- **流 2**：`PostStartupCommand` 同理（第 108-116 行）。
+- **流 3**：环境变量注入检查——`NETWORK=%s` 等使用 `fmt.Sprintf` 拼接 env 值（第 111-115 行）。关键防御：`exec.Command` 不经过 shell（代码注释第 145-147 行也明确说明），env 值中的 shell 元字符不会被执行；变量展开 `expandVars`（第 149-156 行）只做字面替换进参数列表。因此即使 `lease.Subnet` 含特殊字符也不会产生命令注入。
+- **流 4**：`runCmd` 内部（第 141-180 行）：stdin 仅写入固定空串+换行；输出经 `CombinedOutput` 返回并 json.Marshal 后存入 `BackendData`（第 100-104 行），随后广播到 etcd——这是设计行为，非漏洞。
+- **第二通道检查**：无 HTTP 路由、无文件读取、无回调；`os.Environ` 合并（第 139-146 行）只是透传进程自身环境。
+
+**其他发现**
+- 第 78-79 行：若 `preStartupCommand` 为纯空白字符串（如 `" "`），`len>0` 成立但 `strings.Fields` 返回空切片，`preArgs[0]` 会 panic——这是健壮性缺陷，非安全漏洞。
+- 黑名单/正则：本文件未使用任何过滤逻辑，无需评估绕过问题。
+
+**结论**：所有 sink（exec.Command）的 source 均为受信任的管理员配置或内部分配的 IP 值，且无 shell 参与，不存在可利用的安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文仅有两个外部数据源: 管理员控制的 flannel backend 配置(第60行)与 subnet manager 分配的网络参数(第111-115行)。这些值最终流入 exec.Command(第152行), 但 exec.Command 不经过 shell, env 变量与 $VAR 展开均为字面量传递, 无法构成命令注入。执行管理员显式配置的命令是该 extension 后端的文档化设计意图, 不属于漏洞。另发现第78行对纯空白命令串会因 preArgs[0] 越界而 panic, 属健壮性缺陷而非安全问题。", "fix_suggestion": "no fix needed"}
+```

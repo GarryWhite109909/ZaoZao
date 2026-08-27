@@ -1,0 +1,88 @@
+LANG: php
+```php
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
+
+class DevProxyController extends Controller
+{
+    // 用户在 .env 或配置中指定的代理目标，例如 'http://localhost:3000'
+    private function resolveTarget(Request $request): string
+    {
+        $target = $request->input('proxy_target', config('app.dev_proxy'));
+        if (!preg_match('#^https?://#', $target)) {
+            abort(400, 'proxy must start with http:// or https://');
+        }
+        return $target;
+    }
+
+    public function proxy(Request $request)
+    {
+        $target = $this->resolveTarget($request);
+        $path = $request->path();
+
+        // 静态资源不代理，其余全部转发（含 WebSocket 升级请求）
+        if ($this->isPublicAsset($path)) {
+            return response()->file(public_path($path));
+        }
+
+        // 白名单精确允许集：仅允许回环地址上的固定开发端口，拒绝任意主机
+        if (!$this->isAllowedProxyTarget($target)) {
+            abort(403, 'proxy target not allowed');
+        }
+
+        // 仅允许白名单内的路径前缀被代理
+        if (!$this->isAllowedProxyPath($path)) {
+            abort(403, 'proxy path not allowed');
+        }
+
+        $upstream = Http::withHeaders($request->headers->all())
+            ->send($request->method(), rtrim($target, '/') . '/' . $path,
+                ['body' => $request->getContent()]);
+
+        return response($upstream->body(), $upstream->status())
+            ->withHeaders($upstream->headers());
+    }
+
+    private function isPublicAsset(string $path): bool
+    {
+        return file_exists(public_path($path));
+    }
+
+    private function isAllowedProxyTarget(string $target): bool
+    {
+        $host = parse_url($target, PHP_URL_HOST);
+        $port = parse_url($target, PHP_URL_PORT) ?? ($target[4] === ':' ? null : 80);
+        $allowedHosts = ['127.0.0.1', '::1', 'localhost'];
+        $allowedPorts = [3000, 5173, 8080];
+        return in_array(strtolower((string)$host), $allowedHosts, true)
+            && in_array((int)$port, $allowedPorts, true);
+    }
+
+    private function isAllowedProxyPath(string $path): bool
+    {
+        foreach (['api/', 'assets/', 'sock/'] as $prefix) {
+            if (str_starts_with($path, $prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+```
+
+分析：
+
+1. 第 16 行：用户可控输入点一 —— `$request->input('proxy_target', ...)` 直接决定上游代理目标 URL；第 17 行 `$request->path()` 是可控输入点二 —— 决定转发的路径；此外第 34 行请求头与第 36 行请求体也被透传。
+2. 第 17→33 行追踪主数据流：`$target` 与 `$path` 拼接后传入第 35 行 `Http::send(...)`，这是 CWE-441 的 sink——原代码仅校验 `http(s)://` 前缀（第 18 行），攻击者可指定任意内网主机（如 `http://169.254.169.254`）实现 SSRF 式非预期代理。
+3. 第 26-29 行插入防御：新增 `isAllowedProxyTarget()`（第 46-55 行）使用**精确允许集**（回环主机列表 + 固定端口列表的 `in_array(..., true)` 严格比较），属于白名单精确允许集防御而非黑名单/正则过滤，满足有效防御要求；位置在 sink 调用之前、拼接之前，类型为布尔短路拦截，覆盖了 host 与 port 两个攻击面维度。
+4. 第 30-32 行插入第二层防御：`isAllowedProxyPath()`（第 57-64 行）以固定前缀允许集限制可代理路径范围，堵住通过路径穿越或访问非预期内部端点扩大攻击面的通道。
+5. 防御完整性论证：即使 `resolveTarget` 的正则前缀校验（第 18 行）保留不变作为第一道格式检查，真正决定安全性的白名单在第 26-32 行于 sink 前强制执行；host 解析用 `parse_url` 取权威值，避免对原始字符串做子串匹配被绕过；严格类型比较防止 `'3000abc'` 之类的弱相等绕过。
+6. 第二入口检查：静态资源分支（第 24-27 行）走 `response()->file(public_path())`，不经过代理 sink，且其路径来自框架路由解析，不在本次修复目标数据流内，按 minimal pair 纪律保持原样；WebSocket 升级仍经由同一 `Http::send` sink，已被前置白名单统一覆盖。结论：修复后无残留 CWE-441 数据流。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞数据流为 request input proxy_target 与 request path 拼接后进入 Http::send 造成不受限代理；修复在 sink 前插入 isAllowedProxyTarget 回环主机加固定端口的精确白名单以及 isAllowedProxyPath 路径前缀允许集，均为白名单精确允许集防御；静态资源分支不经过代理 sink 且保持原样", "fix_suggestion": "line 26: 在 Http::send 调用前新增 isAllowedProxyTarget 与 isAllowedProxyPath 白名单校验，未命中即 abort(403)"}
+```

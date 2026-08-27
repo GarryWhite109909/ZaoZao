@@ -1,0 +1,27 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `save(file_path)`（约第 108 行）：将内存 cookie 以 JSON 写入本地文件。sink 为文件写入，source 是自身 cookie 存储，无外部输入直接进入，无注入面。
+2. `load(file_path)`（约第 124 行）：**主要外部数据入口**，读取本地文件，先试 JSON，失败则回退到 pickle（受限反序列化）。
+3. `update_cookies(cookies, response_url)`（约第 233 行）：第二入口，接受服务器 Set-Cookie 数据。
+4. `filter_cookies(request_url)`（约第 300 行）：出口，决定向哪个主机发送哪些 cookie。
+5. `_parse_date`、`_is_domain_match`、`_build_morsel`：内部辅助。
+
+**数据流逐一验证**
+
+- **pickle 反序列化流（load → _RestrictedCookieUnpickler.load）**：这是经典 RCE sink。防御为白名单 `_ALLOWED_CLASSES`（第 44–56 行），仅允许 SimpleCookie/Morsel/defaultdict/tuple/set/frozenset/dict。关键点：
+  - `os.system`、`builtins.eval` 等危险全局均不在白名单，`find_class` 直接抛 `UnpicklingError`；
+  - `defaultdict` 的工厂参数在 pickle 流中必须通过 GLOBAL 操作码引用可调用对象，同样被白名单拦截；
+  - 白名单中没有任何带危险 `__reduce__`/`__setstate__` 副作用的类型（Morsel 的 `__setstate__` 仅赋值字典字段）。该白名单是**有效防御**，非黑名单/正则。
+- **JSON 加载流（load → _load_json_data）**：`morsel.__setstate__` 绕过校验（第 160 行附近），攻击者若控制该本地文件可写入任意 key/value/domain/path/secure 属性，例如伪造 `domain=com` 的 cookie，使后续请求向任意站点发送注入的 Cookie 头（cookie 注入/会话固定辅助）。但前提是攻击者能写本地 cookie 文件——与能改 pickle 文件的威胁模型相同，且不产生代码执行；属低风险残留问题，非可利用漏洞。
+- **健壮性问题**：`compound_key.split("|", 1)` 若无 `|` 抛 ValueError，会被外层 except 捕获转入 pickle 分支再抛 UnpicklingError——仅异常行为混乱，非安全漏洞。
+- **update_cookies 流**：跨域设置被 `_is_domain_match` 拦截（第 262 行），IP 来源 cookie 被 `_unsafe=False` 默认拒绝；尾部点域名已清除；path 推导符合 RFC 6265。逻辑正确。
+- **filter_cookies 流**：host-only 校验（`(domain,name) in self._host_only_cookies and domain != hostname`）、secure 属性与 https/wss 判断、路径长度边界检查均存在；`treat_as_secure_origin` 由开发者显式配置，非外部输入。
+- **_parse_date**：纯解析，输出经 MAX_TIME 钳制（max-age 路径 min(time+delta, MAX_TIME)），year<1601 拒绝，无溢出/注入。
+- **DummyCookieJar**：全部空实现，无攻击面。
+
+**结论**：全文唯一的强危险 sink（pickle.load）已被类型白名单有效封堵；其余入口均为本地文件或受域匹配保护的内存操作。仅存低风险设计注意点（加载不可信 cookie 文件可实现 cookie 注入），不构成实际安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文唯一高危 sink 是 load() 回退分支的 pickle 反序列化，但 _RestrictedCookieUnpickler 使用严格类型白名单（仅允许 SimpleCookie/Morsel/defaultdict 及基础容器），os.system、eval 等全局及 defaultdict 工厂所需的 GLOBAL 引用均被 find_class 拦截，防御有效而非黑名单式过滤。update_cookies 有域匹配和 IP 拒绝保护，filter_cookies 正确执行 host-only、secure 与路径匹配。残留的低风险点：_load_json_data 通过 __setstate__ 绕过校验，若攻击者可篡改本地 cookie 文件可注入任意 domain 的 cookie（cookie 注入），但不涉及代码执行且威胁模型等同于篡改 pickle 文件本身，不构成独立可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

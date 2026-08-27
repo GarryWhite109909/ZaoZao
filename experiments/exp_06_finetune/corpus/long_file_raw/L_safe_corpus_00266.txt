@@ -1,0 +1,23 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：
+   - 构造函数 `X509LDAPCertStoreSpi(params)`（第 60 行左右）：接收 `CertStoreParameters`，其中含 `ldapURL`、`baseDN`、各属性名——这些直接进入 JNDI 连接与搜索。
+   - `engineGetCertificates(selector)`：外部传入的 `X509CertSelector`。
+   - `engineGetCRLs(selector)`：外部传入的 `X509CRLSelector`，其 issuer 名列表被逐条处理。
+   - `connectLDAP()`：使用 `params.getLdapURL()` 作为 PROVIDER_URL。
+
+2. **source→sink 数据流一（证书路径）**：`engineGetCertificates` → `certSubjectSerialSearch` → `subject = xselector.getSubjectAsString()` 或由 certificate/bytes 派生的 DN 字符串 → `LDAPUtils.parseDN(subject, ...)` → `"*" + attrValue + "*"` → 传入 `search(attrName, attributeValue, attrs)`。在 `search()` 中第 ~300 行：`String filter = attributeName + "=" + attributeValue;` 随后拼成 `"(&(" + filter + ")(" + temp[0] + "=*))"` 直接交给 `ctx.search(...)`。**全程无任何转义/过滤**（无 LDAP 过滤器转义函数）。若调用方将用户输入放入 selector 的 subject，攻击者可注入 `)(...)(&` 等片段篡改过滤器，造成 LDAP 注入（信息泄露/绕过查询约束）。
+
+3. **数据流二（CRL 路径）**：`engineGetCRLs` 中对每个 issuer 名执行同样的 parseDN + `"*"+attrValue+"*"` 拼接 → 同一 `search()` sink，同样未转义。这是第二入口/替代通道，结论一致。
+
+4. **序列号通道**：`serial = getSerialNumber().toString()` 为纯数字，风险低；但 subject/issuer DN 通道不受此限制。
+
+5. **其他检查**：`connectLDAP()` 使用固定 provider 与 "none" 认证级别（明文 LDAP，属配置弱点但非注入）；反序列化侧仅解析 X.509，异常均捕获；`params.getLdapURL()` 来自参数对象而非运行时用户请求，通常为受信配置。
+
+6. **防御有效性评估**：代码中不存在任何黑名单或正则过滤，即“零防御”，拼接型 sink 直接可达。
+
+**结论**：存在 LDAP 过滤器注入漏洞（BouncyCastle 历史上确实修复过此类问题），source 为 CertSelector/CRLSelector 中攻击者可控的 DN 字符串，sink 为 `ctx.search` 的过滤器字符串。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "LDAP Filter Injection", "risk_level": "medium", "source": "X509CertSelector 的 subject 字符串以及 X509CRLSelector 的 issuer 名称（可能来自应用层用户输入）", "sink": "search 方法中 ctx.search(params.getBaseDN(), filter2, constraints) 的 LDAP 过滤器字符串拼接", "explanation": "search 方法以 attributeName + '=' + attributeValue 方式构造过滤器，attributeValue 来自 certSubjectSerialSearch 和 engineGetCRLs 中经 LDAPUtils.parseDN 处理的 DN 字符串并包裹通配符，parseDN 不做 LDAP 特殊字符转义，全文亦无任何过滤或编码防御；两个入口 engineGetCertificates 和 engineGetCRLs 均可到达该 sink，攻击者可通过构造含 ')' '(' '&' '|' 等字符的 DN 篡改查询过滤器，导致 LDAP 注入、绕过查询条件或泄露目录中其他条目", "fix_suggestion": "对插入过滤器的属性值进行 RFC 4515 转义（转义 * ( ) \\ \\0 等特殊字符），或使用支持参数化的 LDAP API；同时建议启用 LDAPS 并避免匿名绑定"}
+```

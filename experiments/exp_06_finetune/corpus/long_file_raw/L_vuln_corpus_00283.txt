@@ -1,0 +1,39 @@
+# 编号分析
+
+**入口点枚举（全文通读）**
+
+1. **第 60-63 行 `parseVaultConfig` 入口**：source 为 `obj.GetAnnotations()`（第 64 行）——即 Kubernetes 对象上的用户可控注解，以及 viper 环境变量/配置（如第 70、76 行 `viper.GetString(...)`，第 470 行 `viper.AutomaticEnv()`）。注解由任何能创建/修改 Pod 的用户控制。
+2. **第 66-69 行**：`MutateAnnotation == "skip"` 仅是跳过逻辑，无 sink。
+3. **第 71-79 行 Addr / Role / Path / AuthMethod**：注解值直接写入配置。这些值后续会被 vault-env 用于构造 Vault 连接与登录路径——攻击者可指定任意 Vault 地址或 auth path，将 Pod 的 JWT 发往攻击者控制的端点（凭据外泄），但该文件本身不含 sink，需结合调用方判断。
+4. **第 80-83 行 SkipVerify**：注解可直接置 `vault_skip_verify=true`，禁用 TLS 校验，配合攻击者 Vault 地址可无证书劫持。
+5. **第 84-87 行 TLSSecret**：注解可指向任意 Secret 名，但仍在同 namespace 内解析（取决于调用方）。
+6. **第 88-95 行 ClientTimeout / UseAgent / EnvDaemon / EnvDelay**：仅数值解析，低风险。
+7. **第 96-99 行 CtConfigMap**：注解可指定任意 ConfigMap 名称作为 consul-template 配置源；若 webhook 挂载该 ConfigMap 内容进 Pod 并执行模板，攻击者可在自己 namespace 内注入模板执行（受 RBAC 限制，通常限于自身权限内）。
+8. **第 100-107 行 ServiceAccountTokenVolumeName / CtImage**：`CtImage` 注解允许指定**任意容器镜像**，webhook 会将其注入 Pod——攻击者只能影响自己的 Pod，属自伤面。
+9. **第 108-115 行 IgnoreMissingSecrets / EnvPassThrough / ConfigfilePath**：`ConfigfilePath` 注解控制 secrets 挂载路径，可写任意路径（如 `/etc`），在自身 Pod 内影响有限。
+10. **第 116-127 行 PullPolicy / CtOnce / CPU / Memory**：`getPullPolicy`（第 455-467 行）用白名单 switch，安全；quantity 解析失败有默认值，安全。
+11. **第 128-155 行 ShareProcess / PSP / RunAsUser / RunAsGroup / ReadOnlyRootFs / RegistrySkipVerify**：注解可开启 `PspAllowPrivilegeEscalation`、设 `RunAsUser=0` 等，放宽自身 Pod 安全上下文——在多租户集群中若 PSP/PSA 本应禁止，则构成安全策略绕过通道（CWE-250/CWE-732 类），但仍是作用于请求者自己的 Pod。
+12. **第 156-175 行 LogLevel / TransitKeyID / TransitPath / AgentConfigMap**：TransitPath 注解可改 transit 后端路径，可能越权读取其他 mount 下的 key（取决于 Vault 策略）。
+13. **第 176-215 行 Agent 资源/镜像/EnvVariables**：`AgentImage`（第 208-211 行）与 `AgentEnvVariables`（第 216-218 行）注解均可控；env 变量若被拼入 agent 启动命令存在注入面，但本文件无拼接代码。
+14. **第 219-246 行 EnvImage / EnvLogServer / VaultNamespace / TokenAuthMount / VaultEnvFromPath**：`VaultEnvFromPath` 注解可让 vault-env 从任意文件路径读内容注入 env（文件路径注入，CWE-22 面，取决于下游实现）；`TokenAuthMount` 可改 auth mount 路径。
+15. **第 262-269 行 TransitBatchSize**：`strconv.ParseInt(val,10,32)` 忽略错误，溢出时为 0，无内存安全问题。
+16. **第 271 行 Token = viper.GetString("vault_token")**：来自环境变量而非注解，不可被普通用户直接控制。
+
+**数据流验证结论**
+
+- 所有 source（Pod 注解）→ sink 均在本文件终止于结构体字段，真正危险消费发生在其他文件（mutator 注入容器）。就本文件而言：
+  - 最实质的问题是**信任边界缺失**：任何能创建带注解 Pod 的用户可通过注解覆盖 `vault_addr`、`skip_verify`、`transit_path`、`vault_image`、`configfile_path`、`vault_env_from_path`、run-as-user/特权等安全相关设置，且没有任何 namespace/RBAC 校验或注解白名单（对比：项目后来引入了 configmap 级别限制）。这是典型的“用户可控注解驱动安全敏感配置”（CWE-15 外部可控系统配置 / CWE-20 输入未验证）。
+  - 无黑名单/正则依赖；`getPullPolicy` 白名单有效但只保护 pull policy 一个字段。
+  - 第二入口：viper `AutomaticEnv()`（第 470 行）使所有键也可由环境变量提供，但那是部署者控制的，非漏洞。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-15: 外部可控的系统配置（用户注解覆盖安全敏感 webhook 配置）",
+  "risk_level": "中",
+  "source": "line 64: obj.GetAnnotations() 从 AdmissionReview 对象读取的用户可控 Kubernetes 注解",
+  "sink": "line 71-269: vaultConfig.Addr/SkipVerify/TransitPath/AgentImage/ConfigfilePath/VaultEnvFromPath/RunAsUser/PspAllowPrivilegeEscalation 等安全敏感字段未经校验直接赋值",
+  "explanation": "parseVaultConfig 将任意 Pod 注解直接映射到 Vault 地址、TLS 校验开关、auth/transit 路径、注入镜像、secrets 挂载路径、vault_env_from_path 文件路径以及 run_as_user=0 和 allow_privilege_escalation 等安全上下文字段，全程无来源校验、无白名单、无 namespace 或 RBAC 检查 -> 能创建 Pod 的攻击者可将 JWT 凭据导向自建 Vault 端点（配合 skip_verify 绕过 TLS）、篡改 transit/auth mount 路径尝试越权、通过 vault_env_from_path 指向任意文件路径注入环境变量，并放宽自身 Pod 的安全上下文以规避集群策略",
+  "fix_suggestion": "对安全敏感注解增加强制校验：仅信任特定 namespace/serviceaccount 的注解或要求注解值匹配严格白名单（如 vault_addr 限定为已知域名、configfile_path 与 from_path 限定前缀目录、禁止注解覆盖 run_as_user=0 与 privilege_escalation），并在 webhook 层依据创建者身份做 RBAC 授权检查"
+}
+```

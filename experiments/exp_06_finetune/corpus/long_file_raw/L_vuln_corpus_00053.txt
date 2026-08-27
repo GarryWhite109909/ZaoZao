@@ -1,0 +1,26 @@
+## 编号分析
+
+**入口点枚举（全文通读）**
+
+1. **第 8–19 行 `constructor`**：入口为 `css` 字符串与 `opts`（`opts.map.prev`、`opts.from`、`opts.unsafeMap`）。`css` 通常来自用户可控的样式文件内容，`opts.from` 为 CSS 文件路径。
+2. **第 51–66 行 `loadAnnotation(css)`**：source→sink 起点。从 `css` 内容中提取最后一个 `/* # sourceMappingURL=... */` 注释的值到 `this.annotation`。攻击者只要能注入 CSS 内容（如上传/处理不可信 CSS），即可完全控制该注释内容。
+3. **第 68–86 行 `loadFile(path, cssFile, trusted)`**：防御逻辑所在。当 `trusted=false` 且未设 `unsafeMap` 时：要求路径以 `.map` 结尾；若提供了 `cssFile`，用 `relative()` 检查不得逃出目录、不得为绝对路径。
+4. **第 88–130 行 `loadMap(file, prev)`**：核心数据流汇聚点。
+   - 第 108 行：`prev` 为字符串时直接返回——但 `prev` 来自构建工具配置，属受信输入。
+   - 第 122–124 行：`this.inline` 时走 `decodeInline`，仅解析 data URI，无文件读取。
+   - **第 126–128 行（关键）**：`map = this.annotation`；`if (file) map = join(dirname(file), map)`；随后第 129 行以 `trusted=false` 调用 `loadFile(map, file, false)`。
+
+**逐条 source→sink 验证**
+
+- **流 A（inline 注释 → 文件读取）**：source = 第 55 行攻击者控制的 `annotation`；sink = 第 84 行 `readFileSync(path)`。
+  - 若 `file`（即 `opts.from`）存在：`join(dirname(file), map)` 后进入第 72–80 行检查。注意 `join` 会规范化 `../`，但攻击者可用足够多的 `../` 逃出后仍相对；此时 `relative(dirname(cssFile), path)` 会得到 `'..' + sep` 开头而被拦截；绝对路径被 `isAbsolute` 拦截。**此分支防御基本有效**（Windows 上 `..%5c` 类编码在文件系统层不生效，`join` 已规范化，故主要绕过面有限）。
+  - **若 `file` 为空（第二入口/替代通道）**：第 127 行条件不成立，`map` 直接等于攻击者控制的 `annotation` 原文；第 73 行 `cssFile` 为 falsy，整个目录约束检查被跳过，只剩 `/\.map$/i` 黑名单式后缀校验。攻击者可传任意绝对路径如 `/etc/passwd.map` 或 `C:\secret.map`，直接命中第 84 行 `readFileSync`，实现**任意 `.map` 后缀文件读取**，且读取结果会进入 source map 处理流程并可能回显（错误信息、sourcesContent 等）。这是黑名单式校验（按题目要求视为可绕过/不足），且缺少 `cssFile` 时防御完全失效。
+- **流 B（decodeInline，第 27–44 行）**：仅内存内解码，无 sink，无漏洞。
+- **流 C（prev 回调，第 97–105 行）**：`trusted=true` 绕过检查，但 `prev` 是开发者配置，非外部输入，不算漏洞。
+- **第 45–49 行 `getAnnotationURL` / trim**：无过滤，注释内容原样成为路径，确认 source 可控性。
+
+**结论**：存在已知形态的漏洞（对应 postcss 的 CVE-2023-44270 同类问题）：当 `opts.from` 缺失或攻击者可影响调用方式时，CSS 内 `sourceMappingURL` 注释可作为任意文件读取（限 `.map` 后缀）的 source，直达 `readFileSync` sink；即使 `from` 存在，`.map` 后缀这一唯一强制约束也属弱黑名单。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal / Arbitrary File Read", "risk_level": "medium", "source": "line 55: loadAnnotation 从不可信 CSS 内容提取的 this.annotation", "sink": "line 84: readFileSync(path, 'utf-8')", "explanation": "攻击者控制 CSS 中的 sourceMappingURL 注释 -> loadMap 第 127 行仅在 file 存在时才做 join 与目录约束 -> 当 opts.from 缺失时 cssFile 为空, loadFile 第 72-80 行的目录逃逸检查整体跳过, 仅剩 /\.map$/i 黑名单后缀校验 -> 攻击者传入绝对路径如 /etc/passwd.map 即可读取任意 .map 后缀文件, 内容经 JSON.parse/consumer 可能泄露于 sourcesContent", "fix_suggestion": "line 68: 在 cssFile 缺失时应拒绝加载非受信注解映射, 或要求显式 opts.unsafeMap; 同时将 .map 后缀黑名单改为基于受信根目录的白名单解析"}
+```

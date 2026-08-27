@@ -1,0 +1,77 @@
+# 逐函数安全分析（含行号锚定）
+
+## 入口点枚举（全文通读）
+
+本文件共定义以下入口点，全部为 HTTP 路由处理函数：
+1. `UploadIssueAttachment`（第 30-33 行）→ 委托 `uploadAttachment`
+2. `UploadReleaseAttachment`（第 36-39 行）→ 委托 `uploadAttachment`
+3. `uploadAttachment`（第 42-73 行）— 文件上传
+4. `DeleteAttachment`（第 76-116 行）— 删除附件
+5. `ServeAttachment`（第 119-190 行）— 按 UUID 提供文件下载
+6. `GetAttachment`（第 193-196 行）— 从路径参数取 UUID 后委托 `ServeAttachment`
+
+## 函数一：uploadAttachment（第 42-73 行）
+
+**Source**：第 49 行 `ctx.Req.FormFile("file")`，用户上传的 multipart 文件；第 58 行 `header.Filename` 作为附件名。
+
+**Sink**：第 59-61 行 `uploadFunc(ctx, uploaderFile, ...)` → `attachment.UploadAttachmentForIssue/ForRelease` 服务层落盘。
+
+**防御验证**：
+- 第 44-47 行：全局开关 `setting.Attachment.Enabled` 检查。
+- 第 60 行：`NewLimitedUploaderKnownSize(file, header.Size)` 限制大小。
+- 第 63-68 行：`IsErrFileTypeForbidden` 表明服务层做了扩展名白名单校验（Gitea 的 `AllowedTypes` 机制），非法类型返回 400。注意 `header.Filename` 仅作为元数据存储于 DB 并在下载时经 `ServeHeaderOptions{Filename}` 输出（第 187 行），httplib 的 ServeUserContentByFile 会做 header 编码，不构成 header 注入。
+- 权限：路由层（未在本文件）要求登录及对应 unit 写权限；`RepoID` 取自 `ctx.Repo.Repository.ID`（第 31、38 行），非用户可控，无 IDOR。
+
+**结论**：无有效攻击面。文件名不直接拼入文件系统路径（UUID 为存储键，见第 189 行 `attach.RelativePath()` 由 UUID 派生）。
+
+## 函数二：DeleteAttachment（第 76-116 行）
+
+**Source**：第 77 行 `ctx.FormString("file")` — 用户可控的 UUID 字符串。
+
+**Sink**：第 114 行 `repo_model.DeleteAttachment(ctx, attach, true)` 删除记录及物理文件。
+
+**数据流验证**：
+- 第 78-83 行：UUID 必须在数据库中存在，否则 400。任意字符串无法注入 SQL（参数化查询）。
+- 第 85-88 行：必须已登录。
+- 第 90-93 行：**关键横向越权检查** — `attach.RepoID != ctx.Repo.Repository.ID` 则拒绝，防止跨仓库删除。
+- 第 95-110 行：若操作者非上传者，按 IssueID / ReleaseID / 其他三种情况分别要求 `CanWriteIssuesOrPulls`、`CanWrite(TypeReleases)`、或仓库 Admin/Owner 权限。分支覆盖完整：IssueID>0、ReleaseID>0、else 兜底拒绝（仅 admin/owner 可删），无遗漏分支。
+- UUID 本身是随机生成的存储键，不可预测、不可伪造。
+
+**结论**：权限矩阵完备，无越权删除漏洞。
+
+## 函数三：ServeAttachment（第 119-190 行）
+
+这是最敏感的函数（信息泄露风险），逐条验证：
+
+**Source**：第 120 行参数 `uuid`（来自第 195 行 `ctx.PathParam("uuid")` 或其他路由回调）。
+
+**Sink 1 - 越权读取**：第 121 行 `GetAttachmentByUUID` → 第 188-189 行读取并回传文件内容。
+
+**防御链验证**：
+1. 第 128-132 行：若附件创建时间晚于 cutoff 且当前仓库 ID 与附件所属仓库不一致，直接 404 —— 防止通过另一仓库上下文访问他人附件（旧版绕过通道已被封堵）。
+2. 第 134-137 行：解析附件关联的 unitType 与 repoID。
+3. 第 139-145 行：**未关联附件（unitType == TypeInvalid）** 仅允许上传者本人访问，匿名/他人一律 404。
+4. 第 146-167 行：已关联附件 —— 若 ctx 中无仓库上下文则按 repoID 加载仓库并计算 Doer 权限（第 150-158 行）；随后第 165-167 行强制 `perm.CanRead(unitType)`，私有仓库无读权限者被拒。
+5. 第 169-180 行：**草稿 Release 防泄露** —— 即使有读权限，若无 Releases 写权限且该 release 是草稿（`rel.IsDraft`），仍返回 404。注释明确说明这是为了堵住 UUID URL 泄露导致的草稿附件泄露，与 API 端 canAccessReleaseDraft 对齐。此前的版本存在此漏洞，本代码已修复。
+6. 第 182-186 行：API token 场景下校验 AccessTokenScope（issue/repo 读 scope），scope 不足时中断响应。
+
+**Sink 2 - SSRF/开放重定向**：第 172-178 行 `ServeDirectURL` 重定向到对象存储签名 URL。URL 由服务端基于 `attach.RelativePath()`（UUID 派生，非用户可控字符串拼接）生成，且仅在配置了 S3 直连时触发，无用户可控 host，不构成开放重定向。
+
+**Sink 3 - 路径遍历**：第 189 行 `storage.Attachments.Open(attach.RelativePath())`。RelativePath 由内部 UUID 构成，而 uuid 参数必须先命中 DB 记录（第 121 行），DB 中的 UUID 由系统生成（第 71 行返回 `attach.UUID`），用户无法注入 `../` 类路径成分。
+
+**Sink 4 - 缓存投毒/header 注入**：第 184 行 ETag 基于 UUID 与时间戳构造，均为受控值；第 187 行 Filename 经 httplib 安全编码输出。
+
+## 第二入口与替代通道核查
+
+- `GetAttachment`（第 193-196 行）与可能存在的回调式路由共用 `ServeAttachment`，两条通道走完全相同的鉴权链，无旁路。
+- 上传侧第二通道：`UploadIssueAttachment` 与 `UploadReleaseAttachment` 仅 uploadFunc 不同，均绑定 `ctx.Repo.Repository.ID`，无法指定任意 repoID。
+- Delete 无 API v1 独立实现于本文件；即使有，也复用同一模型层校验。
+- 匿名访问公开仓库附件：CanRead 对公开仓库放行属预期行为；草稿 release 已由第 169-180 行单独保护。
+
+## 综合结论
+
+全文所有 source→sink 数据流均有有效防御：UUID 必须存在于 DB（阻断注入与遍历）、仓库归属校验（阻断 IDOR）、unit 读权限 + 草稿 release 写权限双重门禁（阻断未授权读取）、token scope 校验（阻断 API 滥用）。黑名单类可绕过过滤不存在；所有错误路径均 fail-closed（404/403）。未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文六个函数后未发现可利用漏洞。上传入口(第49行FormFile)经大小限制与类型白名单防护，RepoID取自服务端上下文不可控；删除入口(第77行表单file参数)依次经过存在性校验、登录校验、仓库归属校验(第90-93行)及分角色写权限校验(第95-110行)，分支覆盖完整；下载入口ServeAttachment(第119-190行)对uuid参数先查库(第121行)，再经跨仓库访问拦截(第128-132行)、未关联附件仅上传者可见(第139-145行)、CanRead单元权限(第165-167行)、草稿release需写权限(第169-180行)、AccessToken scope校验(第182-186行)五层门禁，全部fail-closed。存储路径由系统生成UUID派生，用户输入无法构成路径遍历；S3直连重定向URL由服务端签名生成，无开放重定向风险。", "fix_suggestion": "no fix needed"}
+```

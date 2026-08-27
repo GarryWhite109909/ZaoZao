@@ -1,0 +1,22 @@
+## 编号分析
+
+1. **第 30–80 行 `getReactions()`**：从 TripleStore 读取数据并 json_decode，`$pageTag`、`$ids`、`$user` 均为调用方传入。此处仅做数组组装，无直接 SQL/HTML sink；但 `$v['value']` 内容（含用户可控的 idReaction/date）原样返回给上层渲染，若上层未转义存在二阶 XSS 风险（本文件内无法证实）。
+
+2. **第 82–90 行 `getReactionsCount($tag)`**：`$tag` 经 `$this->dbService->escape()` 后拼入 SQL，有转义防御，基本有效（LIKE 通配符 `%`/`_` 未过滤，仅属轻微通配注入）。
+
+3. **第 92–160 行参数读取函数**：`getActionParametersFromPage/FromEntry` 从页面正文/表单字段解析 `{{reactions ...}}` 参数，属于内容解析逻辑，无外部输入直达 sink。
+
+4. **第 162–225 行 `appendParamsFromActionDefinition()`**：正则解析 action 参数，`\URLify::slug()` 生成 id，图片经 twig 渲染。无 SQL 拼接。
+
+5. **第 227–238 行 `addUserReaction()`**：要求登录用户，值经 `json_encode` 存入 tripleStore，无拼接 SQL。
+
+6. **第 240–262 行 `deleteUserReaction()` —— 关键漏洞点**：
+   - 第 244–252 行：权限校验要求管理员或 `$user === 当前登录名`，但 `$reactionId` 与 `$id` 完全来自调用方（API 层的请求参数），未被校验。
+   - **第 255–259 行**（entry + reactionField 分支）：`$user`、`$id` 经 `escape()` 转义后拼入 LIKE 子句——转义基本有效。
+   - **第 260–262 行 else 分支**：`'value LIKE \'%user:"' . $user . '","idReaction":"' . $reactionId . '","id":"' . $id . '"%\''` —— `$reactionId` 和 `$id` **未经任何转义**直接拼入 SQL 字符串。攻击者只需登录任意普通用户，传入形如 `" OR (SELECT ...) -- ` 的 `$reactionId` 即可闭合引号注入任意 SQL（tripleStore->delete 底层执行原始查询）。这是明确的 CWE-89 SQL 注入，且是认证后可利用的第二入口通道（与已转义的第一分支形成对比，证明开发者遗漏了 else 分支）。
+
+7. **全文核查**：文件中其余数据库操作均走 escape 或参数化；无文件写入、命令执行、反序列化入口。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "high", "source": "line 240-243: deleteUserReaction 的参数 reactionId 与 id 来自上层控制器/API 请求参数", "sink": "line 261-262: tripleStore->delete 中 value LIKE '%user:\"...\",\"idReaction\":\"{$reactionId}\",\"id\":\"{$id}\"%' 直接字符串拼接", "explanation": "deleteUserReaction 接收请求参数 reactionId 与 id 后，在 else 分支（非 entry 或 reactionId 非 reactionField 时）未调用 dbService->escape，直接将二者与 $user 拼接进 SQL LIKE 子句；攻击者只需以任意普通登录用户身份构造含单引号的 reactionId/id 即可闭合引号并注入任意 SQL，实现数据篡改或删除。对比第一个分支（line 256-259）使用了 escape，说明该分支防御被遗漏。", "fix_suggestion": "line 261-262: 对 $user、$reactionId、$id 一律使用 {$this->dbService->escape(...)} 转义后再拼接，最好改为参数化查询绑定变量"}
+```

@@ -1,0 +1,27 @@
+## 编号分析（逐函数、行号锚定）
+
+1. **第 27–38 行 `newOAuth2Manager`**：仅根据 `isShared` 参数选择内存或数据库实现，不接收任何外部输入，无 source。
+
+2. **第 40–49 行 `oauth2PendingAuth` 结构体与 `newOAuth2PendingAuth`**：`State` 由 `util.GenerateOpaqueString()` 服务端生成（随机不透明值），`RedirectURL/ClientID/ClientSecret` 来自调用方（管理端 API 的管理员配置流程），本文件不做任何拼接进命令、路径或 SQL 的操作。
+
+3. **第 59–89 行 `memoryOAuth2Manager`**：
+   - `addPendingAuth`（63–68 行）：以服务端生成的 `State` 为 key 写入 map，key 不可被攻击者控制。
+   - `removePendingAuth`（70–74 行）：按 state 删除 map 条目，仅为内存删除，无注入面。
+   - `getPendingAuth`（76–87 行）：map 查找 + 时间有效性校验（`diff > authStateValidity` 即拒绝），防重放/过期会话，防御有效且非黑名单式。
+   - `cleanup`（83–89 行附近）：遍历删除过期项，纯内部维护。
+
+4. **第 91–130 行 `dbOAuth2Manager`**：
+   - `addPendingAuth`（93–105 行）：先对 secret 调用 `Encrypt()`（KMS 封装），再通过 `dataprovider.AddSharedSession` 存储；数据以结构化 Session 对象传递，非字符串拼接 SQL，无注入 sink。
+   - `removePendingAuth`（107–110 行）：`DeleteSharedSession(state)`，state 作为会话键查找；即使 state 来自回调参数（第二入口），最坏后果是删除一条待定 OAuth2 会话——而该 state 必须先由服务端生成并存储才存在，攻击者无法枚举或伪造有效 state 造成实际影响。
+   - `getPendingAuth`（112–124 行）：取回 session 后做时间戳过期检查（122–124 行），与内存实现一致的有效防御。
+   - `decodePendingAuthData`（126–135 行）：对 `[]byte` 做 `json.Unmarshal` 到固定结构体，随后 `TryDecrypt()`。反序列化目标为私有结构体，无多态/接口字段，不存在反序列化 RCE 面。错误时返回通用错误，不泄露敏感信息。
+
+5. **入口点枚举**：本文件不含任何 HTTP 路由注册、handler、表单/查询参数解析、文件读取或环境变量读取；它只是被 `httpd` 包其他文件（OAuth2 回调 handler）调用的存储层。回调入口的 state 校验逻辑在调用方完成，本文件的 `getPendingAuth` 通过「state 必须命中服务端生成的随机 key + 有效期检查」提供了正确的 CSRF state 验证支撑。`nolint:errcheck` 处（104、109 行）忽略的是日志型错误，失败会导致 pending auth 不存在，后续 `getPendingAuth` 自然拒绝，属 fail-safe 方向。
+
+6. **替代通道检查**：secret 在 DB 模式下加密存储（94 行），内存模式下仅驻留进程内存；无日志打印 secret 或 redirect URL 的代码路径。
+
+结论：全文未发现可控 source 到危险 sink 的数据流，防御均为白名单式（随机 state 匹配 + 时间窗），无漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "该文件是 OAuth2 待定授权请求的存储管理层，不含任何路由、handler 或直接外部输入解析。state 由 util.GenerateOpaqueString 服务端随机生成，作为 map 键或共享会话键使用，不可被攻击者预测或伪造；getPendingAuth 在两种实现中均执行有效期校验，构成有效的防重放防御。dbOAuth2Manager 对 ClientSecret 先 Encrypt 后存储，读取时 TryDecrypt，secret 不落明文也不写日志。decodePendingAuthData 仅将字节反序列化到固定的私有结构体 oauth2PendingAuth，无多态反序列化风险。所有 nolint:errcheck 忽略的错误均导致 fail-safe（查不到会话即拒绝）。未发现可控 source 到危险 sink 的数据流。", "fix_suggestion": "no fix needed"}
+```

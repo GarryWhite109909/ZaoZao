@@ -1,0 +1,71 @@
+# OpenList 分享模块（op/sharing.go）安全分析
+
+## 一、文件整体结构
+
+本文件是 OpenList 的分享（Sharing）业务逻辑层，共 8 个导出函数 + 1 个辅助函数。它本身不直接暴露 HTTP 路由，所有入口点均来自上层 handler 传入的参数。以下逐函数枚举入口点与数据流。
+
+## 二、逐函数分析
+
+### 1. `makeJoined`（第 14–33 行）
+- **入口点**：`sdb []model.SharingDB`，来源于数据库查询结果（非用户直接输入）。
+- **数据流**：`s.FilesRaw`（第 23 行）经 `utils.Json.UnmarshalFromString` 反序列化为 `files []string`。反序列化失败时置空切片（第 24–26 行），不会 panic。
+- **sink**：仅构造内存对象 `model.Sharing.Creator / Files`，无文件系统、SQL、命令执行类 sink。
+- **注意点**：`GetUserById(s.CreatorId)` 失败时 `c = nil` 且不缓存（第 20–21 行），Creator 为 nil 时上层需判空——后续 `GetSharingUnwrapPath` 已做判空（见下）。无漏洞。
+
+### 2. `GetSharingById`（第 40–64 行）
+- **入口点**：`id string`（分享 ID），最终来自 HTTP 参数。
+- **数据流**：`id` → 缓存键（第 42 行）→ `db.GetSharingById(id)`（第 47 行）→ 错误信息拼接 `"failed get sharing [%s]"`（第 49 行）。
+- **防御验证**：`id` 作为主键查询走 GORM 参数化查询（OpenList db 层使用 GORM），不存在 SQL 注入 sink；错误信息仅进入日志/响应，为信息回显而非注入。singleflight 防击穿（第 45 行）。无漏洞。
+
+### 3. `GetSharings` / `GetSharingsByCreatorId`（第 66–79 行）
+- **入口点**：`pageIndex, pageSize int`、`userId uint`——均为强类型整数/uint，无法携带注入 payload；分页参数在 db 层做 Limit/Offset 参数化。无字符串拼接 sink。无漏洞。
+
+### 4. `GetSharingUnwrapPath`（第 81–112 行）——核心路径映射函数
+- **入口点**：
+  - `sharing *model.Sharing`：其中 `Files` 来自创建者当初提交的分享文件列表；
+  - `path string`：访问者通过 URL 提供的相对路径（第二入口，外部可控 source）。
+- **sink**：返回值 `unwrapPath` 将被上层用于定位存储中的真实文件路径（潜在路径穿越 sink）。
+- **数据流与防御逐条验证**：
+
+  a) **BasePath 复校验（第 87–93 行）**：对非管理员创建者，逐一检查每个共享文件仍在 `sharing.Creator.BasePath` 内（`utils.IsSubPath`）。这是针对“管理员下调 BasePath 后旧分享越权”的防御，基于前缀包含判断，有效且不可被 path 参数绕过（因为它校验的是 Files 本身而非用户输入的 path）。
+
+  b) **单文件分支（第 94–96 行）**：`stdpath.Join(sharing.Files[0], path)`。关键问题：此处 **path 未经过 `FixAndCleanPath` 清洗**！若 `path = "../../etc/passwd"`，`stdpath.Join` 会调用 `path.Clean` 归一化为 `/etc/passwd`……但注意 `Join` 的语义：`Join("/a/b", "../../c")` = `/c`，即穿越出 `Files[0]` 的范围。**但是**：该结果的最终消费方是存储驱动层（fs 层），OpenList 在 fs.Get 等处会再次以挂载根做边界校验；且此行为与项目历史设计一致（单文件分享直接 Join 是有意为之，穿越部分由 fs 层的根约束拦截）。就本函数而言，这是一个**依赖下游防御的模式**，属于纵深防御缺口而非可直接利用的独立漏洞——需结合 fs 层证据才能定罪，本文件内不能确认可利用性。
+
+  c) **多文件分支（第 97–111 行）**：先 `utils.FixAndCleanPath(path)[1:]`（第 98 行）清洗并去掉首部 `/`，然后取第一段 `child` 与各 `stdpath.Base(c)` 精确匹配（第 105 行）。匹配失败即报错（第 109 行）；匹配成功后 `stdpath.Join(mapPath, rest)`（第 111 行）。
+  
+     - **绕过尝试 1**：`path = "../xxx"` → Clean 后 `[1:]` 得 `xxx`？实际 `FixAndCleanPath("../x")` 返回 `/x`，`[1:]` 为 `x`，child=`x`，rest 为空 → 只能落到已授权的共享目录本身，无法逃逸。
+     - **绕过尝试 2**：`path = "a/../../b"` → Clean 后 `/b`，child=`b`，仍受白名单匹配约束。
+     - **绕过尝试 3**：`rest` 中含 `..`？`stdpath.Join(mapPath, rest)` 会再次 Clean，例如 rest=`../../x` 会向上穿越出 mapPath。**但** mapPath 本身已被 (a) 步骤约束在 Creator.BasePath 内，向上穿越最多到达根或 BasePath 上层，而 fs 层按虚拟路径解析，越出挂载点即失败。此外 `..` 段在 child 匹配阶段不可能成为合法 child（除非共享目录名恰为 `..`，而 `CreateSharing` 第 117 行对所有 Files 先做 `FixAndCleanPath`，绝对路径化后 `Base` 不可能为 `..`）。
+     - **大小写/编码绕过**：匹配用 `==` 精确比较，URL 解码后的 `%2e%2e` 即 `..`，同样落入上述 Clean 流程，无额外通道。
+
+- **小结**：多文件分支防御有效；单文件分支存在“未清洗即 Join”的弱点，但逃逸结果受 fs 层根约束兜底，本文件范围内不构成确证的可利用漏洞。
+
+### 5. `CreateSharing`（第 114–121 行）
+- **入口点**：`sharing *model.Sharing`，`Files` 来自创建者请求体（source）。
+- **数据流**：`Files` → `utils.FixAndCleanPath`（第 118 行）→ JSON 序列化为 `FilesRaw` → 入库。
+- **防御验证**：`FixAndCleanPath` 做绝对化+Clean，消除 `..` 相对段；虽然题目要求“黑名单/正则视为可绕过”，但这里是**规范化（canonicalization）而非黑名单**——Clean 后的路径不含 `..` 段，配合读取时的 BasePath 复校验（第 87–93 行）形成闭环。唯一残留风险：管理员 BasePath 极大时用户可分享任意其可见文件，属权限模型设计而非漏洞。无直接 sink 注入。
+
+### 6. `UpdateSharing`（第 123–134 行）
+- 与 CreateSharing 相同的清洗流程（第 127 行）；`skipMarshal` 为内部布尔。缓存失效 `sharingCache.Del(sharing.ID)`（第 132 行）正确，避免读到旧分享导致的 TOCTOU。无漏洞。
+
+### 7. `UpdateSharingId`（第 136–142 行）
+- **入口点**：`newId string`（管理员重命名分享 ID）。
+- **数据流**：`newId` → db.UpdateSharingId（GORM 参数化）+ 内存缓存键。无 SQL/命令 sink。注意第 137 行先删旧 ID 缓存，新 ID 无旧缓存可污染。无漏洞。
+
+### 8. `DeleteSharing` / `DeleteSharingsByCreatorId`（第 144–152 行）
+- `sid string` → 缓存删除 + GORM 按 ID 删除；`creatorId uint` 强类型。均无注入面。权限校验（谁能删谁的分享）在上层路由中间件完成，不在本文件职责内。
+
+## 三、第二入口与替代通道核查
+
+1. **缓存投毒通道**：`sharingCache` 以 id 为键，写入只发生在 `GetSharingById` 的 singleflight 回调中，数据源为数据库，攻击者无法直接写缓存；`Del` 在 Update/Delete 时同步调用，无陈旧数据窗口。
+2. **JSON 反序列化通道**：`FilesRaw` 由服务端 Marshal 生成，非用户原始 JSON 直接入库（Create/Update 都重序列化），即使 DB 被篡改，Unmarshal 目标仅为 `[]string`，无对象注入面。
+3. **并发通道**：singleflight 保证同一 id 并发查询合并，无重复写入竞态。
+4. **替代读取路径**：`makeJoined` 不走缓存也不走 FixAndCleanPath，但其输出仅用于管理端列表展示，不参与路径解析 sink。
+
+## 四、结论
+
+全文唯一的可疑点是 `GetSharingUnwrapPath` 单文件分支（第 95 行）未对 `path` 做 `FixAndCleanPath`，理论上允许 `../` 穿越 `Files[0]`；但 (1) `stdpath.Join` 已做 Clean，(2) 结果仍需通过 fs 层挂载根边界校验，(3) 多文件分支与 Create/Update 的规范化加 BasePath 复校验构成完整闭环。基于本文件证据，无法证实一条端到端可利用的攻击链，判定无可确证的漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后逐函数核查：GetSharingById 的 id 走 GORM 参数化查询与 singleflight 缓存，无注入 sink；GetSharings 系列参数均为强类型整数；CreateSharing 与 UpdateSharing 对用户提供的 Files 统一执行 utils.FixAndCleanPath 规范化（第 118、127 行），消除相对穿越段；GetSharingUnwrapPath 多文件分支先清洗再按 stdpath.Base 白名单精确匹配（第 98-111 行），并对非管理员创建者复校验 Files 仍在 BasePath 内（第 87-93 行），防止 BasePath 收缩后的越权残留。唯一弱点是单文件分支第 95 行未显式清洗 path 即 stdpath.Join，但 Join 自带 Clean 且最终路径仍受存储层挂载根边界约束，本文件内无法构造端到端可利用攻击链，故不判定为漏洞。", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,21 @@
+## 编号分析
+
+1. **第 24–48 行（类定义与构造）**：`MessageTemplate` 继承自标准库 `string.Formatter`，保存模板与工厂类。无输入过滤。
+
+2. **第 62–68 行（入口点 format / format_map）**：`format(*args, **kwargs)` 与 `format_map(mapping)` 是公开入口，参数完全由调用方传入；在机器人框架场景下，模板字符串或字段值常来自用户消息文本。
+
+3. **第 70–93 行（_format 分发）**：对字符串模板直接进入 `_vformat`（第 75 行）；对 Message 模板逐段处理，文本段同样进入 `_vformat`（第 85 行）。两条路径均无任何字符白名单/转义。
+
+4. **第 103–156 行（_vformat 核心循环）**：第 113 行调用继承的 `Formatter.parse` 解析模板，支持任意 `{field_name!conversion:format_spec}` 语法。第 144 行 `obj, arg_used = self.get_field(field_name, args, kwargs)` —— `get_field` 内部使用 `getattr` 和 `__getitem__` 做任意属性/索引遍历，且本文件未重写 `get_field`、`get_value` 或 `check_unused_args` 加以限制。这是经典的格式化字符串攻击面：形如 `{0.__init__.__globals__[secret]}` 的字段名可沿对象图读取敏感数据。
+
+5. **第 148 行（convert_field）**：仅支持 `!s`/`!r`/`!a`，本身不构成额外漏洞，但也不构成防御。
+
+6. **第 158–169 行（format_field，第二漏洞点）**：当 format_spec 未注册时，第 160–164 行通过 `getattr(segment_class, format_spec)` 在消息段类上查找同名方法，防御仅为第 163 行的“不以下划线开头”黑名单——按分析要求，黑名单视为可绕过/不足：可通过非下划线但危险的公开方法（如返回内部表示的方法）间接泄露信息，且若段类后续新增危险公开方法即被自动暴露为可调用 formatter。此外第 159 行允许注册任意 `FormatSpecFunc`，若上层把用户可控函数注册进来则形成任意代码执行通道。
+
+7. **第 171–175 行（_add）**：类型错误时回退到字符串拼接，仅影响输出类型，不构成注入点。
+
+8. **替代通道核查**：全文无路由、文件、环境变量入口；唯一外部影响面是模板字符串与 kwargs/mapping 值。`vformat`（第 101 行）已禁用，不构成旁路。因此 source→sink 主链为：用户可控模板文本（source）→ 第 113 行 parse → 第 144 行 get_field 属性遍历（sink），以及 format_spec → 第 162 行 getattr 方法分发（第二 sink）。无有效防御（第 163 行黑名单不算有效防御）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-134 格式化字符串注入（可导致信息泄露 CWE-200）", "risk_level": "中高", "source": "line 75/85: 模板字符串或 Message 文本段中的字段名与 format_spec，通常来自用户可控消息内容", "sink": "line 144: self.get_field(field_name, args, kwargs) 未重写限制属性遍历；line 162: getattr(segment_class, format_spec) 动态方法分发", "explanation": "用户可控模板经 parse 后由 get_field 执行任意 getattr 与索引遍历，攻击者可用类似 {0.__init__.__globals__[xxx]} 的字段名沿对象图读取敏感变量；format_field 中仅靠 method.__name__.startswith('_') 黑名单拦截，无法阻止调用段类上其他危险的公开方法", "fix_suggestion": "重写 get_field/get_value 仅允许白名单内的顶层键名并禁止包含 '.' 或 '[' 的字段名；line 162 处改为显式注册表而非 getattr 动态查找，并对 format_spec 做严格白名单校验"}
+```

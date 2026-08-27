@@ -1,0 +1,75 @@
+# 全文逐函数安全分析
+
+## 0. 文件概览与入口点枚举
+
+本文件导出唯一函数 `launchEditor`（第 41 行），被外部（如 webpack-dev-server 的 error overlay）调用。全文共包含以下函数/逻辑块，逐一分析：
+
+- 第 11–25 行：`wrapErrorCallback`
+- 第 27–35 行：`isTerminalEditor`
+- 第 36–46 行：`positionRE` 与 `parseFile`
+- 第 48–49 行：模块级状态 `_childProcess`
+- 第 51 行起：主函数 `launchEditor`（含第 53–56 行解析、第 58–60 行存在性检查、第 62–65 行回调参数重载、第 67–71 行编辑器猜测、第 73–80 行 WSL 分支、第 88–107 行 Windows 白名单校验、第 109–113 行参数拼装、第 115–121 行终端编辑器互斥、第 123–135 行进程启动 sink、第 137–150 行子进程事件回调）
+
+**入口点清单**：
+1. 参数 `file`（第 51 行）——来自 HTTP 请求中报错堆栈的文件路径，属攻击者可控的 **source**；
+2. 参数 `specifiedEditor`（第 51 行）——通常来自开发者配置或环境变量；
+3. 环境变量——经 `guessEditor`（第 69 行）读取 `VISUAL`/`EDITOR` 等；
+4. 回调 `onErrorCallback`（第 51、64 行）；
+5. 子进程事件（第 137、144 行）。
+
+## 1. wrapErrorCallback（第 11–25 行）
+
+仅做字符串拼接并输出到控制台（第 14、19、23 行），`fileName` 经 `path.basename` 处理后进入 `console.log`。控制台输出不是命令执行 sink，无注入风险；回调透传（第 24 行）不改变数据流安全性。
+
+## 2. isTerminalEditor（第 27–35 行）
+
+纯白名单 switch 判断 vim/emacs/nano，返回布尔值，仅用于第 116 行决定是否 kill 旧进程，不参与任何 sink 拼接，无漏洞。
+
+## 3. parseFile（第 36–46 行）
+
+用正则 `/:(\d+)(:(\d+))?$/` 剥离行号列号（第 38 行）。注意：正则只匹配**结尾**的 `:数字` 形式，`fileName` 本体未做任何净化即返回。若攻击者传入 `evil.js:100` 则行号被剥离；但形如 `a&calc.js` 的内容原样保留在 `fileName` 中流向后续 sink。此函数是 source 到 sink 链路的起点之一，本身无防御。
+
+## 4. launchEditor 主函数
+
+### 4.1 存在性检查（第 58–60 行）
+`fs.existsSync(fileName)` 仅确认文件存在，不是安全防御——攻击者可让报错指向真实存在的文件名，或利用 WSL/Windows 路径差异。
+
+### 4.2 WSL 分支（第 73–80 行）
+当 Linux + `/mnt/` 前缀 + Microsoft 内核时执行 `path.relative('', fileName)`（第 79 行）。这只是路径形式转换，不做字符过滤，转换后的 `fileName` 继续流向 sink。
+
+### 4.3 Windows 白名单校验（第 88–107 行）——关键防御点评估
+第 89 行定义白名单正则，允许字母、数字、`. - \ / _ + 空格 [ ]` 及可选盘符。第 94–97 行仅在 `win32` 且校验失败时打印信息并 return。
+
+按分析规则，**基于正则的过滤视为可绕过、不算有效防御**，理由有实据：
+- 该正则**显式放行空格**。而第 125–127 行使用 `spawn('cmd.exe', ['/C', editor].concat(args))`，Node 在 Windows 上对 `cmd.exe` 的参数拼接不做可靠的元字符转义（Node 官方文档明确警告 cmd 批处理场景下参数可被重新解释）。文件名中的空格配合 cmd 对未加引号参数的分词，历史上已出现多次绕过（create-react-app PR #4866/#5431 正是对此类问题的补丁，且后续仍有变体绕过报告）。
+- 校验对象是 `fileName.trim()`（第 96 行），而真正进入 args 的是未 trim 的 `fileName`（第 112 行），首尾空白差异构成校验对象与实际使用对象不一致的缝隙。
+- 放行的 `[ ]` 在部分 shell 通配场景下具有特殊语义。
+- 该校验**只在 win32 生效**；WSL 分支（第 73–80 行）把绝对路径转为相对路径后，若平台判定与实际 shell 环境不一致（如通过 interop 调用 Windows 编辑器），可完全跳过该校验——这是第二入口/替代通道。
+
+### 4.4 参数拼装（第 109–113 行）
+`getArgumentsForPosition(editor, fileName, lineNumber, columnNumber)` 的返回值直接 push 进 args（第 111 行）；无行号时直接 push `fileName`（第 112 行）。`fileName` 未做引号包裹或转义，携带原始攻击载荷继续流动。
+
+### 4.5 进程启动 sink（第 123–135 行）
+- **Windows 分支（第 125–128 行）**：`spawn('cmd.exe', ['/C', editor].concat(args), {stdio:'inherit'})`。`cmd.exe /C` 会将后续参数拼接为一条命令行由 cmd 解释，`fileName` 中未被白名单拦下的任何可被 cmd 解释的结构（结合空格分词、校验对象不一致、interop 旁路）即可实现命令注入 → **source（第 51 行 file 参数）→ sink（第 126–127 行）的完整可达链路**。
+- **非 Windows 分支（第 129–131 行）**：`spawn(editor, args)` 不经过 shell，数组参数模式无注入风险。
+
+### 4.6 第二入口与替代通道核查
+- `specifiedEditor`（第 62–71 行）：若为函数则重载为回调；否则传给 `guessEditor`。它最终成为第 125 行 `['/C', editor]` 的组成部分——若该值源自可被影响的环境变量/配置文件而非硬编码，构成第二个注入通道；默认情况下多为开发者本地配置，风险次级。
+- `_childProcess` 复用与 SIGKILL（第 115–121 行）：仅进程管理，无数据流风险。
+- 错误回调（第 137–149 行）：`errorCode`/`message` 仅回显，无 sink。
+
+## 5. 结论性证据链
+
+source：调用方传入的 `file`（第 51 行）→ `parseFile` 无净化（第 38–45 行）→ WSL 相对化不改字符集（第 79 行）→ Windows 白名单正则为可绕过的正则防御且 trim 不一致（第 89–96 行）→ 直接 push 入 args（第 111–112 行）→ sink：`spawn('cmd.exe', ['/C', editor].concat(args))`（第 125–127 行）→ cmd 解释拼接命令行 → 远程代码执行。非 Windows 平台因不走 shell 而不受影响，故风险定级为高（Windows 开发环境、dev server 场景下攻击者可通过构造报错文件名触发）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-78 OS命令注入",
+  "risk_level": "高",
+  "source": "line 51: launchEditor 的 file 参数（来自请求报错堆栈的文件名，攻击者可控）",
+  "sink": "line 125-127: childProcess.spawn('cmd.exe', ['/C', editor].concat(args))",
+  "explanation": "file -> parseFile(第38-45行,仅剥离尾部行号,无净化) -> WSL分支path.relative(第79行,不改字符集) -> Windows白名单正则(第89-96行)属正则类过滤视为可绕过,且校验的是trim后的值而实际入参为未trim的fileName,并放行空格与方括号 -> fileName未经转义push进args(第111-112行) -> spawn以cmd.exe /C方式拼接命令行(第125-127行),cmd对参数重新解释导致任意命令执行;替代通道:specifiedEditor经guessEditor进入同一sink(第69行与第125行)",
+  "fix_suggestion": "line 125-127: Windows下避免经由cmd.exe解释,改用shell:false的可执行文件直启方式(如spawn解析出的编辑器绝对路径并对每个参数做Windows引号转义),或对fileName做严格规范化后加双引号包裹,同时统一trim前后的校验对象并移除对空格和方括号的放行"
+}
+```

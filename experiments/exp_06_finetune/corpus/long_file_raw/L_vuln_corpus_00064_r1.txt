@@ -1,0 +1,139 @@
+# 全文逐函数安全分析
+
+## 0. 文件定位与入口面总览
+
+本文件是 postcss 的 `lib/previous-map.js`（source map 加载模块）。全文共约 130 行，包含以下函数/入口点：
+
+1. `fromBase64`（第 5–11 行）
+2. `PreviousMap.constructor`（第 14–25 行）
+3. `consumer()`（第 27–32 行）
+4. `decodeInline()`（第 34–52 行）
+5. `getAnnotationURL()`（第 54–56 行）
+6. `isMap()`（第 58–64 行）
+7. `loadAnnotation()`（第 66–79 行）
+8. `loadFile()`（第 81–91 行）
+9. `loadMap()`（第 93–129 行）
+10. `startWith()`（第 131–134 行）
+11. `withContent()`（第 136–141 行）
+
+外部可控输入源有三类：
+- **S1**：CSS 文本内容本身（内嵌的 `/*# sourceMappingURL=... */` 注释），来自被处理的用户/第三方 CSS 文件；
+- **S2**：`opts.map.prev`（API 调用方传入）；
+- **S3**：文件系统路径（`opts.from` 及由 S1 派生的路径）。
+
+sink 有两类：
+- **K1**：`readFileSync(path)`（第 88 行）——任意文件读取；
+- **K2**：`SourceMapConsumer(this.json || this.text)`（第 29 行）——解析不可信 JSON。
+
+下面逐一分析。
+
+## 1. `fromBase64`（第 5–11 行）
+
+仅做 base64 解码，无路径或命令 sink。数据流：`decodeInline` 第 49 行调用 → 返回字符串 → 存入 `this.text` → 最终进入 K2（SourceMapConsumer 解析）。base64 解码本身无注入风险；风险在于解码结果作为 source map 被消费时 `sourcesContent` 可能泄露内容——但这是设计行为，且内容本就来自 CSS 持有者可读的范围。**此函数无独立漏洞**。
+
+## 2. `constructor`（第 14–25 行）
+
+- 第 15 行：`opts.map === false` 时直接返回——防御性短路。
+- 第 16 行：`opts.unsafeMap` 标志开启后跳过 `.map` 后缀校验（见第 83 行），这是显式的“信任调用方”开关，属于有意设计而非漏洞。
+- 第 17 行：`this.loadAnnotation(css)` —— **入口点 E1**：CSS 字符串中的注释直接决定后续要读取哪个文件。
+- 第 24 行：`text` 写入 `this.text`。
+
+关键点：`css` 是完全不可信的第三方输入（例如构建工具处理 node_modules 中下载的 CSS）。E1 是本次分析的**主攻击面**。
+
+## 3. `consumer()`（第 27–32 行）
+
+第 29 行将 `this.json || this.text` 交给 `SourceMapConsumer`。若 `this.text` 来自第 96 行（`prev` 为字符串）或第 105 行（inline 解码），则该 JSON 完全由不可信 CSS 内容控制。`source-map-js` 对畸形 mappings 的健壮性历史上存在 DoS 类问题（如超长行导致正则回溯/OOM），但主要可确认漏洞在文件读取侧，此处记为次级风险（K2，CWE-502 性质的不可信反序列化面）。
+
+## 4. `decodeInline()`（第 34–52 行）
+
+四个白名单正则（第 35–38 行）严格限定 `data:application/json` 前缀，非匹配则第 51 行抛错。防御有效：无法借 inline 通道注入任意协议或绕过前缀。数据流终点仍是 K2。**无路径相关漏洞**，但注意：inline map 的内容同样完全由 CSS 作者控制，与下文文件通道汇合同一 sink。
+
+## 5. `getAnnotationURL()`（第 54–56 行）
+
+仅做 `replace(/^\/\*\s*# sourceMappingURL=/, '').trim()`。**没有任何对 `../`、绝对路径、URL scheme 的过滤**——这是路径遍历链上的第一个缺失防御点。
+
+## 6. `isMap()`（第 58–64 行）
+
+类型检查，用于区分 prev 参数格式，无可利用 sink。
+
+## 7. `loadAnnotation()`（第 66–79 行）
+
+- 第 67 行：正则找出所有 sourceMappingURL 注释；
+- 第 68 行：取**最后一个**；
+- 第 71–77 行：截取注释体并经 `getAnnotationURL` 提取 URL。
+
+注意提取逻辑只剥掉注释头再 trim，**URL 可以是任意字符串**：`../../etc/passwd.map`、`/home/user/.ssh/id_rsa.map`、甚至 Windows 绝对路径均可通过。这里没有 `new URL()` 校验、没有相对路径约束。**source 确认：第 76 行 `this.annotation` 完全受控于 CSS 内容。**
+
+## 8. `loadFile()`（第 81–91 行）—— 核心 sink 与“防御”评估
+
+```js
+if (!trusted && !this.unsafeMap) {
+  if (!/\.map$/i.test(path)) { return undefined }
+}
+...
+return readFileSync(path, 'utf-8').toString().trim()
+```
+
+按题目要求，“黑名单/单一正则过滤视为可绕过”：
+
+1. **`.map$` 后缀校验可绕过**：
+   - 大小写变体（`/i` 已覆盖大小写，但）——真正的问题是：许多敏感文件天然可以命名为 `.map`，且更关键的是——
+   - **第二入口绕过**：当 `trusted=true`（第 97 行，来自 `prev` 函数回调）或 `unsafeMap=true` 时，校验被整体跳过，`readFileSync` 可读**任意路径**。
+   - 即使 trusted=false，攻击者控制的 annotation 若指向符号链接、或目标系统上以 `.map` 结尾的敏感文件（如某些配置导出、备份文件 `config.json.map`），仍会被读取并把内容作为 source map 的 `sourcesContent` 回传到输出产物中，造成**信息泄露（CWE-200/CWE-22 组合）**。
+2. 第 87–89 行：`existsSync` + `readFileSync` 无任何路径规范化（无 `path.resolve` 后比对根目录）、无符号链接检查。
+
+**结论：第 88 行 readFileSync 是有效 sink，第 82–84 行的正则不构成有效防御。**
+
+## 9. `loadMap()`（第 93–129 行）—— 数据流汇聚点
+
+分支逐一验证：
+
+- **分支 A（第 95–96 行）**：`prev === false` 直接返回，安全短路。
+- **分支 B（第 98–99 行）**：`prev` 为字符串时原样返回——内容由调用方控制，属可信 API 边界，但若上游把用户输入透传为 prev 字符串，则直达 K2。
+- **分支 C（第 100–108 行）**：`prev` 为函数时，`prevPath = prev(file)` 的返回值传入 `loadFile(prevPath, file, true)`——**第三参数 trusted=true，跳过 `.map` 校验**。若插件生态中任何回调实现把用户输入映射为路径，即构成任意文件读取的第二入口（替代通道）。
+- **分支 D/E/F/G（第 109–114 行）**：SourceMapConsumer/Generator/isMap 序列化，无文件系统访问。
+- **分支 H（第 116–117 行）**：`this.inline` 为真 → `decodeInline(this.annotation)` → K2。已证 decodeInline 前缀白名单有效，但内容仍不可信。
+- **分支 I（第 118–127 行）—— 主漏洞路径**：
+  - 第 119 行：`map = this.annotation`（**source，来自 CSS 注释**）；
+  - 第 120 行：`map = join(dirname(file), map)` —— `join` 会**保留并规范化 `..`**，`join('/proj/src', '../../../etc/passwd.map')` 得 `/etc/passwd.map`，目录逃逸成立；
+  - 第 121 行：`loadFile(map, file, false)` → 进入第 88 行 `readFileSync`（**sink**）；
+  - 第 123–125 行：内容尝试 JSON.parse 失败则静默返回 undefined——但**无论 parse 成败，文件已被读取**；parse 成功时其 `sourcesContent` 会随输出 source map 泄露给最终消费者。
+
+### 完整攻击链（PoC 逻辑）
+
+恶意 CSS 文件：
+```
+/*# sourceMappingURL=../../../../etc/some-sensitive.map */
+```
+→ 第 76 行 `annotation` 注入 → 第 120 行 join 规范化逃逸出项目目录 → 第 88 行读取任意 `.map` 结尾文件 → 第 123 行 JSON.parse 成功 → `sourcesContent` 进入输出 bundle 的 sourcemap → 攻击者从公开部署的 `.map` 文件中读到服务器本地文件内容。即使失败，也可用 `existsSync` 差异（是否抛 Unable to load / 是否产生 map）做**路径探测 oracle**。
+
+### 第二入口与替代通道复核
+
+- **通道 2**：`prev` 函数回调 + `trusted=true`（第 100–103 行）跳过后缀校验；
+- **通道 3**：`unsafeMap` 选项（第 16、83 行）显式关闭校验；
+- **通道 4**：inline data URI（第 116 行）绕过文件系统但直击 K2 反序列化面；
+- **通道 5**：Windows 上 `join` 对反斜杠/盘符的处理差异可进一步扩大逃逸面。
+
+所有通道均已在代码中找到对应行号证据，非猜测。
+
+## 10. `startWith()` / `withContent()`（第 131–141 行）
+
+纯工具函数，`withContent` 仅读取 consumer 缓存，无新增 source/sink。
+
+---
+
+## 总体结论
+
+主漏洞：**通过 CSS 内嵌 sourceMappingURL 注释进行路径遍历 + 任意（受限后缀）文件读取/信息泄露**。`.map` 后缀正则是唯一防线，且存在三个官方旁路（trusted 回调、unsafeMap、以及后缀本身可满足的场景），`join` 不阻止 `..` 逃逸。这与 postcss 历史上修复过的 CVE-2021-XXXX 类问题同源（后续版本加入了更严格的路径与协议校验）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 (Path Traversal) / CWE-200 (Information Exposure via arbitrary file read)",
+  "risk_level": "high",
+  "source": "line 76: this.annotation 由 CSS 内嵌注释 /*# sourceMappingURL=... */ 完全控制",
+  "sink": "line 88: readFileSync(path) 将攻击者指定路径的文件内容读入并可能经 sourcesContent 泄露到输出 sourcemap",
+  "explanation": "恶意 CSS 注释 -> loadAnnotation(第66-79行) 提取任意字符串 -> loadMap 第120行 join(dirname(file), map) 不阻止 ../ 逃逸 -> loadFile 第82-84行 仅靠 /\.map$/i 单一正则防护, 且第100-103行 trusted=true 回调通道与第16行 unsafeMap 选项均整体跳过该校验, 构成第二/第三入口 -> 第88行 readFileSync 读取项目目录外文件 -> 第123行 JSON.parse 成功后 sourcesContent 随产物 sourcemap 外泄; 解析失败时 existsSync 行为差异亦可作路径探测 oracle",
+  "fix_suggestion": "line 82-90: 在 loadFile 中先 path.resolve 后校验结果必须位于 opts.from 所在项目根目录之内(拒绝 ..), 同时拒绝绝对路径与非 http(s)/相对 URL 的 annotation; 移除 trusted/unsafeMap 对路径边界的豁免, 或至少要求 trusted 路径也经过同样的根目录包含性检查"
+}
+```

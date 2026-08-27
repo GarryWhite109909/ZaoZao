@@ -1,0 +1,71 @@
+# 逐函数全文分析（含行号锚定）
+
+## 一、入口点枚举
+
+本文件是渲染器（mistune 风格），无网络/文件/环境变量入口。所有 source 均为 Markdown 解析器产出的 token（`raw`、`children`、`attrs`），sink 均为拼接后的 HTML 字符串（第 30–31 行 `render_token` 分发）。入口点清单：
+
+1. `render_token`（第 29 行）——总分发入口，`token["raw"]` / `children` / `attrs(**attrs)` 三条路径；
+2. `safe_url`（第 47 行）——链接/图片 URL 净化入口；
+3. `text/emphasis/strong/link/image/codespan/linebreak/softbreak/inline_html/paragraph/heading/blank_line/thematic_break/block_text/block_code/block_quote/block_html/block_error/list/list_item`（第 66–137 行）——各 token 渲染 sink；
+4. `_unquote_url`（第 141 行）——URL 多重解码辅助；
+5. 构造参数 `escape` 与 `allow_harmful_protocols`（第 34 行）——配置型入口，影响全局防御强度。
+
+## 二、逐函数数据流验证
+
+**1. render_token（第 29–44 行）**
+第 32 行 `func = self._get_method(token["type"])`：type 来自解析器白名单方法表，非任意字符串，无动态 eval。第 39 行 `return func(**attrs)`：attrs 键为解析器固定键名，值流入下方各渲染函数，逐一验证如下。
+
+**2. text（第 66–69 行）**
+source=`token["raw"]` → 第 68 行 `escape_text(text)` 或 `safe_entity(text)`。两者均转义 `<>&"` 等实体，防御有效。
+
+**3. emphasis / strong（第 71–75 行）**
+输入是已递归渲染的 children 文本（内层已过 text 的转义），外层仅加标签，无未净化注入点。
+
+**4. link（第 77–83 行）——关键 sink**
+第 78 行 href 使用 `self.safe_url(url)`；第 80 行 title 用 `safe_entity(title)` 转义引号，防属性逃逸；text 为已转义子内容。核心风险集中在 safe_url，见下。
+
+**5. image（第 85–91 行）**
+src 走 `safe_url`（第 86 行）；alt 经 `striptags(text)`（第 87 行），去除标签后仍可能残留引号字符？striptags 在 mistune 中会先去标签再转义残余实体——即便残留双引号，alt 处于属性值位置且后续无再拼 URL，风险限于属性内文本，实际 striptags 实现包含转义，判定有效。
+
+**6. codespan（第 93–94 行）**：`escape_text` 全量转义，有效。
+
+**7. inline_html（第 100–103 行）与 block_html（第 124–127 行）**
+当 `_escape=True`（默认，第 34 行）时走 `escape_text`，安全。当用户显式传 `escape=False` 时原样输出 HTML——这是库文档明示的“信任输入”模式（如渲染自己写的文档），属设计行为而非漏洞；但若调用方在处理不可信 Markdown 时误设 `escape=False`，则构成存储型 XSS。此为配置误用风险，非代码缺陷。
+
+**8. paragraph / block_quote / block_text（第 105–122 行）**：内容均为下游已转义结果，直接包裹标签，无新增 sink。
+
+**9. heading（第 110–116 行）**
+`level` 来自解析器（整数）；第 113 行 `id` 属性经 `escape_text(_id)` 转义后再入属性，防引号逃逸，有效。
+
+**10. block_code（第 129–135 行）**
+info 先 `safe_entity`（第 131 行，转义引号与尖括号），再 split 取第一个词放入 class 属性（第 133 行）——即使 info 含 `"` 也已被实体化，无法闭合属性。code 本体 `escape_text`（第 134 行），有效。
+
+**11. block_error（第 138–139 行）**：`escape_text` 包裹，有效。
+
+**12. list（第 141–149 行）**
+`start` 经 `str(start)` 直接拼入属性（第 145 行）。若解析层保证 start 为 int 则安全；即便传入字符串，其来源为解析器的有序列表起始号校验，非自由文本，且黑名单式担忧不成立——此处依赖上游类型约束，属低风险但值得注意的弱类型点。
+
+**13. list_item（第 151–152 行）**：同 paragraph，无新 sink。
+
+**14. safe_url（第 47–61 行）——核心防线审计**
+- 第 49–50 行：`allow_harmful_protocols is True` 时仅做 `escape_text` 后放行所有协议——显式信任模式，同 escape=False，属调用方责任。
+- 第 52–54 行：tuple 形式时按前缀白名单放行，逻辑正确。
+- 第 56–58 行：黑名单匹配用 **解码后小写 URL**（第 53 行 `_unquote_url(url).lower()`），覆盖大小写混淆与 `%6A%61%76%61...` 编码绕过；`_unquote_url`（第 141–147 行）循环解码至多 3 层并检测不动点，可抵御双重/三重 percent-encoding 绕过。
+- 已知边界：`data:` 黑名单被 `GOOD_DATA_PROTOCOLS` 四种图片类型豁免（第 57 行），SVG 未列入白名单，故 `data:image/svg+xml` 仍会被拦截——正确。剩余绕过面：超过 3 层的嵌套编码或非 percent 形式的协议混淆（如反斜杠、控制字符）不在解码范围内，但浏览器对 `javascript\n:` 类变体在 href 中通常不执行，且该类 payload 需先通过 Markdown 解析层的 URL 校验，实际可达性极低。
+- 放行分支返回 `escape_text(url)`（第 60 行），保证引号不逃逸 href/title 属性上下文。
+
+**15. _unquote_url（第 141–147 行）**：纯函数，无注入面；3 次上限是唯一理论弱点（4 层编码可穿透黑名单匹配），但需构造四重编码且目标协议仍须命中 HARMFUL_PROTOCOLS 才有意义——穿透后反而使 URL 不以危险协议开头，浏览器同样不会执行，故不构成可利用漏洞。
+
+## 三、第二入口与替代通道检查
+
+- 无文件 I/O、无 subprocess、无 SQL、无反序列化、无 SSRF 出口（渲染器只产字符串）。
+- 替代通道：`allow_harmful_protocols=True` + `escape=False` 组合 = 全信任模式，等价于关闭所有防御，属 API 明示的危险选项，非隐蔽漏洞。
+- `render_token` 的 `**attrs` 动态展开（第 39 行）：键来自解析器而非用户可控字典，不存在参数注入到任意函数的通道。
+
+## 四、结论
+
+全部 source→sink 数据流均有有效转义或协议过滤；黑名单配合多层解码与小写归一化，绕过面收敛到不可达的理论场景。唯一的真实风险是调用方主动选择 `escape=False` / `allow_harmful_protocols=True` 渲染不可信输入，属文档化的使用约束而非代码缺陷。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文逐函数验证：所有文本类 sink（text/codespan/block_code/block_error 等）均经 escape_text 或 safe_entity 转义；link 与 image 的 url 经 safe_url 过滤，其黑名单基于 _unquote_url 三层解码加小写归一化后的 URL 匹配，可抵御编码与大小写绕过，data 白名单不含 svg；title/id/lang 属性均先实体化再拼接，无法闭合引号。inline_html 与 block_html 在默认 escape=True 下转义，escape=False 为文档明示的信任输入模式。list 的 start 依赖解析器整数约束，无可控注入面。未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

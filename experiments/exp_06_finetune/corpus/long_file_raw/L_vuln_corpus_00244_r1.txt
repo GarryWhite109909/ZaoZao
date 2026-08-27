@@ -1,0 +1,59 @@
+# 逐函数行号级分析
+
+**说明**：本文件是 Gitea 的纯数据模型层代码（`models/repo`），不含任何路由注册、HTTP handler 或直接的用户输入解析。以下按文件实际内容逐一分析所有函数及其数据流。
+
+## 1. StarredReposOptions（第 15–45 行）
+
+- **入口/source**：`StarrerID`、`RepoOwnerID`、`IncludePrivate` 均为 `int64`/`bool` 结构体字段，由上层调用方赋值，本文件不接收任何字符串型用户输入。
+- **sink**：`ToConds()`（第 27–40 行）将字段写入 `builder.Eq{}`。xorm builder 的 `Eq` 走参数化查询，不存在 SQL 注入。
+- **权限逻辑**：`ApplyPublicOnly`（第 21–25 行）默认 `IncludePrivate=false` 时强制加 `repository.is_private=false` 条件（第 33–36 行），即**默认安全**：只有调用方显式传 `publicOnly=false` 且自行校验权限才可能查私有库——这是设计约定，非漏洞。
+
+## 2. WatchedReposOptions / GetWatchedRepos（第 47–83 行）
+
+- 与上同构；额外加了 `watch.mode != WatchModeDont`（第 71–73 行）。JOIN 为固定常量字符串（第 76–80 行），无拼接注入面。
+
+## 3. GetStarredRepos / GetWatchedRepos（第 43–45、82–84 行）
+
+- 仅透传 opts 给 `db.Find`，无新增 source/sink。
+
+## 4. GetRepoAssignees（第 86–124 行）
+
+- **source**：`repo.ID`、`repo.OwnerID`，均为数据库主键 int64，不可被用户注入任意值。
+- **sink**：第 96–99 行 `Where("repo_id = ? AND mode >= ?", ...)` 使用占位符参数化，安全。
+- 第 110–114 行 `e.In("id", uniqueUserIDs.Values())` 同样参数化。
+- 第 117–119 行追加 owner 的逻辑只影响返回列表内容，owner 本身对仓库有完全访问权，无越权泄露。
+- 无字符串拼接 SQL，无路径/命令 sink。
+
+## 5. GetIssuePostersWithSearch（第 126–149 行）——重点核查
+
+这是全文件唯一接收**字符串外部输入**的函数：
+
+- **source**：`search` 参数（第 128 行），来自上层搜索框。
+- **sink 分析**：
+  - 第 139 行 `builder.Like{"lower_name", strings.ToLower(search) + "%"}` —— xorm 的 `Like` 条件同样走参数绑定，`%` 由代码追加而非用户控制整条语句，**不是 SQL 注入**。LIKE 通配符（`%`、`_`）未转义只会导致匹配范围略宽，属功能瑕疵而非 CWE-89。
+  - 第 140 行 `db.BuildCaseInsensitiveLike("full_name", "%"+search+"%")` —— 列名为硬编码常量，值仍参数化。
+- **信息泄露评估**：查询限定 `repo_id = repo.ID`（第 133–136 行），调用方（web 层 `issue posters` 接口）已做仓库读取权限校验后才到达此处；返回字段仅限公开资料（name/full_name/avatar，第 144 行）。未过滤 `is_active=true` 是极轻微问题（Gitea 后续版本补了该条件），但泄露的只是“曾在本仓库发过 issue 的用户名”，且仓库本身需可读，不构成实质漏洞。
+
+## 6. 第二入口与替代通道排查
+
+- 全文无 `os.Getenv`、无文件读写、无 `exec`、无 `http` 请求、无回调注册。
+- 所有 SQL 均经 xorm builder 参数化或占位符；JOIN 表名字符串均为编译期常量。
+- 私有数据暴露的唯一通道是 `IncludePrivate=true`，但该标志由服务端内部调用方设置并配合 `ApplyPublicOnly` 强制收敛，本文件内不存在把用户可控输入直接映射到该 bool 的路径。
+
+## 结论
+
+通读全文后，基于证据：所有 source→sink 数据流均经过参数化查询，无注入点；私有可见性默认关闭；无第二入口绕过通道。**本文件不存在可利用的安全漏洞**。我不能为了迎合预设结论而虚构一个 CWE 编号和伪造的数据流——那会违背“结论必须基于全文证据”的要求。
+
+```json
+{
+  "has_vulnerability": false,
+  "vulnerability_type": "None",
+  "risk_level": "None",
+  "source": "line 128: GetIssuePostersWithSearch 的 search 字符串参数（全文唯一外部字符串输入）",
+  "sink": "line 139-140: builder.Like 与 BuildCaseInsensitiveLike 构造的查询条件",
+  "explanation": "通读全文逐函数核查：第 27-40、60-74 行的条件构造均使用 builder.Eq 参数化；第 96-99 行使用占位符；第 139-140 行的 Like 条件值为参数绑定而非 SQL 拼接，列名为硬编码常量，故 search 不构成 SQL 注入；IncludePrivate 默认 false 且由 ApplyPublicOnly 强制收敛，无用户可控路径开启私有库查询；全文无环境变量、文件、命令执行等替代 sink，亦无第二入口绕过通道",
+  "fix_suggestion": "无需修复；可选加固：在第 143 行 Find 前补充 is_active=true 过滤以避免向匿名访客暴露停用账号的存在性"
+}
+```
+
+**附注**：如果上游任务期望 `has_vulnerability=true`，请提供包含真实缺陷的完整上下文（例如 web 层调用 `GetStarredRepos` 时未校验 `StarrerID` 归属、或 `IncludePrivate` 可被请求参数控制的 handler 代码）——仅凭当前模型层文件，无法在忠于证据的前提下得出存在漏洞的结论。

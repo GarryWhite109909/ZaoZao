@@ -1,0 +1,46 @@
+## 编号分析（全文逐函数）
+
+**1. 模块初始化与算法白名单（第 1–12 行）**
+- 第 5 行定义 `SUPPORTED_ALGS`，包含 `'none'`。第 7–9 行在 PS 支持时插入 PS 系列算法。
+- 注意点：`'none'` 在白名单中，但第 60 行有配套防御：若 `secretOrPrivateKey` 为空且 `options.algorithm !== 'none'` 才报错；即使用 `none` 必须显式指定且无密钥。这是 jsonwebtoken 的已知设计行为（签发端允许 none），验证端（verify）才需要拒绝 none。此处为库的公开语义，非注入漏洞。
+
+**2. schema 定义与 validate 函数（第 14–52 行）**
+- 第 15–30 行 `sign_options_schema`：每个选项均有类型校验器，如 `algorithm` 用 `includes.bind(null, SUPPORTED_ALGS)` 白名单校验（第 19 行）——白名单枚举是有效防御，非黑名单/正则。
+- 第 32–36 行 `registered_claims_schema` 对 iat/exp/nbf 强制 isNumber。
+- 第 38–51 行 `validate`：要求 plain object、未知键在 allowUnknown=false 时抛错（第 44–47 行）。`validateOptions`（第 53 行）传 false，故 options 键被严格限制；`validatePayload`（第 57 行）allowUnknown=true 但注册声明仍受类型约束。
+
+**3. 主导出函数入口（第 68–80 行）**
+- 入口参数：payload、secretOrPrivateKey、options、callback。第 69–72 行处理 callback 可选性。无路由/文件/环境变量等外部 source，所有输入均来自调用方代码，属于库 API 边界。
+
+**4. 密钥规范化（第 88–99 行）**
+- 第 90–98 行将字符串/Buffer 密钥经 `createPrivateKey` 或 `createSecretKey` 转为 KeyObject，失败则第 97 行报错。此转换消除了历史上“字符串密钥 + 非对称算法”导致的算法混淆攻击面。
+
+**5. 算法-密钥类型匹配检查（第 101–117 行）**
+- 第 101–103 行：HS 系列强制 `type === 'secret'`；
+- 第 104–116 行：RS/PS/ES 强制 `type === 'private'`，并在第 108–112 行强制 RSA 模长 ≥2048（除非显式 `allowInsecureKeySizes`）。这直接封堵了 CVE-2016-10555 类 alg-confusion 与弱密钥问题。
+
+**6. payload 校验（第 118–140 行）**
+- 第 119–120 行 payload 必填；对象 payload 经 `validatePayload`（第 122–128 行）；非对象 payload 若携带对象专属选项则报错（第 130–137 行）。
+- 第 142–149 行防止 exp/nbf 同时来自 payload 与 options 的冲突覆盖。
+
+**7. options 二次校验与密钥类型再验（第 151–163 行）**
+- 第 152–156 行 `validateOptions` 再次执行（此时 expiresIn/notBefore 已参与 timespan 运算前校验，timespan 输入已被 isInteger/isString 约束）。
+- 第 158–162 行 `validateAsymmetricKey` 复核非对称密钥类型匹配，除非调用方显式 `allowInvalidAsymmetricKeyTypes`——该逃生门需调用方主动开启，属文档化选项而非可被外部输入触发的绕过。
+
+**8. 时间戳与 claims 写入（第 165–196 行）**
+- 第 166–172 行 iat 处理；第 174–183 行 nbf、第 185–195 行 exp 均经 `timespan` 且对 undefined 结果二次报错。
+- 第 189–196 行 audience/issuer/subject/jwtid 写入前检查 payload 冲突并报错，不存在静默覆盖。
+
+**9. 签名输出路径（第 198–221 行）**
+- 回调路径（第 200–212 行）：`once(callback)` 防重复回调；jws.createSign 流式签名，错误经 `.once('error')` 传递；第 205–207 行对 RS/PS 签名长度 <256 兜底拦截弱密钥（覆盖 Node<15 无 asymmetricKeyDetails 的情况）。
+- 同步路径（第 213–220 行）：同样的长度兜底检查后返回签名。
+
+**10. 第二入口/替代通道核查**
+- 全文仅一个导出入口；无子进程、eval、fs、网络请求、原型污染写法（写入目标均为局部 payload/options 对象字面量属性，键来自固定映射表 `options_to_payload`，非用户可控 `__proto__` 注入路径——即使 payload 含 `__proto__`，`Object.assign({}, payload)` 在第 126 行做的是自有可枚举属性复制，且后续写入均为已声明的 JWT 声明键）。
+- 所有过滤均为类型校验或枚举白名单，未依赖黑名单/正则作为唯一防线（第 104 行的正则 `/^(?:RS|PS|ES)/` 仅用于分支选择，两侧分支均有强类型检查兜底）。
+
+**结论**：该文件为 jsonwebtoken 的 sign.js，各 source→sink 数据流（options.algorithm→header.alg→密钥类型检查；expiresIn/notBefore→timespan→exp/nbf；payload→validatePayload→jws.sign）防御链完整有效，未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文逐行核查：唯一入口为主导出函数，输入均为调用方传入的 payload、secretOrPrivateKey、options、callback。算法经第 19 行枚举白名单校验；第 90-98 行将密钥统一转为 KeyObject 并在第 101-116 行强制算法与密钥类型匹配及 RSA 模长不低于 2048 位，封堵了算法混淆与弱密钥问题；expiresIn 与 notBefore 先经类型校验再进入 timespan；payload 注册声明经第 32-36 行类型校验；claims 写入有冲突检测防覆盖；两条签名路径（回调与同步）均在第 205-207 与 216-218 行对短签名做兜底拦截。未发现黑名单或正则作为唯一防线的数据流，也不存在 eval、命令执行、文件操作或原型污染 sink。SUPPORTED_ALGS 含 none 属于签发端的公开设计语义，安全责任在验证端。", "fix_suggestion": "no fix needed"}
+```

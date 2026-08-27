@@ -47,7 +47,11 @@ RAW_DIR = CORPUS / "framework_safe_raw"
 STRONG_DEFENSE_EV = re.compile(
     r"参数化|白名单|转义|escape|预编译|prepare|placeholder|allowlist"
     r"|whitelist|escapeshellarg|shlex|ENT_QUOTES|参数数组|execFile|参数绑定"
-    r"|realpath|resolve\(|参数化查询|PreparedStatement", re.I)
+    r"|realpath|resolve\(|参数化查询|PreparedStatement"
+    # 密码学类 CWE-327/798 的强防御形态（2026-08-26 补：原词表缺位导致
+    # 弱哈希样本的 safe 侧无论怎么修都过不了证据门）
+    r"|hmac|sha-?256|bcrypt|argon2|password_hash|scrypt|随机盐"
+    r"|compare_digest|getenv|os\.environ\b", re.I)
 
 
 def shingle(code: str, n=8):
@@ -64,10 +68,11 @@ def build_prompt(lang, vuln_code, cwe_hint):
 ```
 
 【硬性要求——违反任一条即废】
-1. 保持原代码的框架习语与整体结构：同框架（路由注册/中间件/依赖注入/ORM 用法不变）、同业务场景、同数据流走向；只做"把漏洞修掉"的最小改动语义（可以重构个别函数，但不得换框架、换业务、换漏洞类型场景）。
-2. 修复必须是【有效防御】：参数化查询/预编译、白名单精确允许集、正确转义、框架原生安全 API 之一；黑名单、正则过滤、str_replace 不算有效防御，禁止作为修复手段。
-3. 若原代码有多个数据流，只要求修复目标漏洞所在数据流，其余保持原样（保持 minimal pair 的局部对照性）。
-4. {SCHEMA_LOCK}
+1. 保持原代码的框架习语与整体结构：同框架（路由注册/中间件/依赖注入/ORM 用法不变）、同业务场景、同数据流走向；不得换框架、换业务、换漏洞类型场景。
+2. 【最小 diff 纪律】函数名、路由路径、类名、变量名与整体控制流必须与原代码保持一致（防御必需的新增辅助函数/参数除外），只允许插入或替换防御相关语句；整段重写、更换标识符都会导致样本直接废弃。
+3. 修复必须是【有效防御】：参数化查询/预编译、白名单精确允许集、正确转义、框架原生安全 API 之一；黑名单、正则过滤、str_replace 不算有效防御，禁止作为修复手段。
+4. 若原代码有多个数据流，只要求修复目标漏洞所在数据流，其余保持原样（保持 minimal pair 的局部对照性）。
+5. {SCHEMA_LOCK}
 
 【输出格式】
 LANG: <语言，小写>
@@ -86,6 +91,8 @@ LANG: <语言，小写>
 
 def load_seeds():
     seeds = []
+    seen = set()  # wave2 meta 的 task_key 有重复（2026-08-26 实测 97 条仅 79 唯一），
+                  # 不去重会同一种子并发蒸馏多次、输出重复样本
     for line in SEED.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -100,8 +107,12 @@ def load_seeds():
         obj = json.loads(re.findall(r"```json\s*(\{.*?\})\s*```",
                                     next(x["content"] for x in d["messages"]
                                          if x["role"] == "assistant"), re.S)[-1])
+        key = "F:" + (m.get("task_key") or str(len(seeds)))
+        if key in seen:
+            continue
+        seen.add(key)
         seeds.append({
-            "key": "F:" + (m.get("task_key") or str(len(seeds))),
+            "key": key,
             "lang": m.get("out_lang") or detect_lang(user, "python"),
             "code": cm.group(1),
             "cwe": obj.get("vulnerability_type", "CWE-78"),
@@ -112,7 +123,10 @@ def load_seeds():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pilot", action="store_true")
-    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--resume", action="store_true",
+                    help="兼容旧用法：断点续跑已是默认行为")
+    ap.add_argument("--fresh", action="store_true",
+                    help="清空输出/进度文件从头重跑（默认总是追加，防止误截断已完成样本）")
     ap.add_argument("--workers", type=int, default=4)
     args = ap.parse_args()
 
@@ -132,7 +146,7 @@ def main():
         tasks = tasks[:2]
 
     done = set()
-    if args.resume and PROGRESS_PATH.exists():
+    if not args.fresh and PROGRESS_PATH.exists():
         for line in PROGRESS_PATH.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 try:
@@ -145,8 +159,9 @@ def main():
     RAW_DIR.mkdir(exist_ok=True)
     lock = threading.Lock()
     stats = {"ok": 0, "reject": 0, "no_defense": 0, "drift": 0}
-    out_f = open(OUT_PATH, "a" if args.resume else "w", encoding="utf-8")
-    prog_f = open(PROGRESS_PATH, "a" if args.resume else "w", encoding="utf-8")
+    mode = "w" if args.fresh else "a"
+    out_f = open(OUT_PATH, mode, encoding="utf-8")
+    prog_f = open(PROGRESS_PATH, mode, encoding="utf-8")
 
     def emit(sample):
         with lock:
@@ -157,7 +172,7 @@ def main():
         def regen_or_fail(msg, stat_key):
             with lock:
                 stats[stat_key] += 1
-            return ("regen", msg) if attempt == 0 else ("fail", msg)
+            return ("regen", msg) if attempt < 2 else ("fail", msg)
 
         _, code = largest_code_block(text)
         if not code or len(code) < 200 or "\n" not in code:
@@ -187,16 +202,30 @@ def main():
 
     def run_task(t):
         t0 = time.time()
+        prompt = t["prompt"]
         for attempt in range(3):
             try:
-                text = call_teacher(key, t["prompt"])
+                text = call_teacher(key, prompt)
             except RuntimeError as e:
                 with lock:
                     stats["reject"] += 1
                 return f"✗ {t['key']}: {str(e)[:60]}"
-            (RAW_DIR / f"{t['key'].replace(':', '_')}.txt").write_text(
+            suffix = "" if attempt == 0 else f"_r{attempt}"
+            (RAW_DIR / f"{t['key'].replace(':', '_')}{suffix}.txt").write_text(
                 text or "", encoding="utf-8")
             status, msg = process_output(t, text, attempt)
+            if status == "regen":
+                # 把拒绝原因回灌给教师，避免同 prompt 盲抽（2026-08-25 实测
+                # 同 prompt 重试 12/12 仍漂移）；按失败类型给针对性指令
+                reason = msg.split(': ', 1)[-1]
+                extra = ("重新生成时必须保留原代码的函数名、路由路径、变量名与控制流，"
+                         "只做防御相关的最小修改；与原代码形态差异过大将被直接废弃。")
+                if "无强防御证据" in reason:
+                    extra = ("修复必须采用强防御机制，并在代码与分析中明确写出机制名称"
+                             "（参数化查询/预编译、白名单精确允许集、输出转义、"
+                             "框架原生安全 API）；黑名单或正则过滤不算有效防御。")
+                prompt = t["prompt"] + \
+                    f"\n\n【重生成要求——上一次输出因「{reason}」被拒】{extra}"
             if status == "ok":
                 with lock:
                     prog_f.write(json.dumps({"key": t["key"]}) + "\n")

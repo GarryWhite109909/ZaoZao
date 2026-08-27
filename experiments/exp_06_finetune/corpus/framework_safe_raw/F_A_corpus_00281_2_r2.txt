@@ -1,0 +1,96 @@
+LANG: java
+```code
+package com.example.fetch;
+
+import org.springframework.web.bind.annotation.*;
+import java.net.*;
+import java.io.*;
+import java.util.regex.*;
+
+@RestController
+@RequestMapping("/api/fetch")
+public class UrlFetchController {
+
+    // 仅对字符串形式的 IPv4 做私网段判断，未处理 IPv6 映射形式
+    private boolean isPrivateIp(String addr) {
+        if (addr == null || addr.isEmpty()) return true;
+        Matcher m = Pattern.compile("^::ffff:(\\d+\\.\\d+\\.\\d+\\.\\d+)$").matcher(addr);
+        if (m.matches()) return isPrivateV4(m.group(1));
+        String[] p = addr.split("\\.");
+        if (p.length != 4) return true; // 非 IPv4 字面量一律拒绝
+        int a = Integer.parseInt(p[0]), b = Integer.parseInt(p[1]);
+        return a == 10 || a == 127 || a == 0 || a >= 240
+                || (a == 172 && b >= 16 && b <= 31)
+                || (a == 192 && b == 168);
+    }
+
+    private boolean isPrivateV4(String dotted) {
+        String[] p = dotted.split("\\.");
+        int a = Integer.parseInt(p[0]), b = Integer.parseInt(p[1]);
+        return a == 10 || a == 127 || a == 0 || a >= 240
+                || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168);
+    }
+
+    // 防御新增：对解析后的真实 IP 地址做白名单校验（框架原生 InetAddress API）
+    private boolean isAllowedAddress(InetAddress addr) {
+        if (addr.isLoopbackAddress() || addr.isSiteLocalAddress()
+                || addr.isLinkLocalAddress() || addr.isAnyLocalAddress()) {
+            return false;
+        }
+        byte[] bytes = addr.getAddress();
+        if (bytes.length == 4) {
+            int a = bytes[0] & 0xFF, b = bytes[1] & 0xFF;
+            return !(a == 10 || a == 127 || a == 0 || a >= 240
+                    || (a == 172 && b >= 16 && b <= 31)
+                    || (a == 192 && b == 168)
+                    || (a == 169 && b == 254));
+        }
+        // IPv6：拒绝 IPv4 映射地址（含十六进制形式 ::ffff:c0a8:1），统一按映射后的 v4 判断
+        if (addr instanceof Inet6Address && ((InetAddress) addr).getHostAddress().contains(":")) {
+            Inet6Address v6 = (Inet6Address) addr;
+            if (v6.isIPv4MappedAddress()) {
+                return isAllowedAddress(v6);
+            }
+        }
+        return true;
+    }
+
+    @GetMapping
+    public String fetch(@RequestParam("url") String urlStr) throws Exception {
+        URL url = new URL(urlStr);
+        // 防御：只检查了 hostname 字符串本身是否为私网 IPv4 字面量
+        if (isPrivateIp(url.getHost())) {
+            throw new IllegalArgumentException("blocked");
+        }
+        // 防御新增：DNS 解析前置，对全部解析结果逐一做白名单校验，杜绝 DNS rebinding 与映射字面量绕过
+        InetAddress[] resolved = InetAddress.getAllByName(url.getHost());
+        for (InetAddress addr : resolved) {
+            if (!isAllowedAddress(addr)) {
+                throw new IllegalArgumentException("blocked");
+            }
+        }
+        // 防御新增：用已校验的 IP 构造连接目标，保证 sink 连接的地址与校验地址一致（防 TOCTOU rebinding）
+        URL pinnedUrl = new URL(url.getProtocol(), resolved[0].getHostAddress(), url.getPort(), url.getFile());
+        HttpURLConnection conn = (HttpURLConnection) pinnedUrl.openConnection();
+        conn.setConnectTimeout(5000);
+        try (BufferedReader r = new BufferedReader(
+                new InputStreamReader(conn.getInputStream()))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line);
+            return sb.toString();
+        }
+    }
+}
+```
+
+1. 第 27 行 `fetch` 方法的 `@RequestParam("url") String urlStr` 是唯一用户可控输入点，经 `new URL(...)` 进入请求流程。
+2. 第 60-61 行原代码仅检查 hostname 字符串（第 33 行 `isPrivateIp`），攻击者可用十六进制 IPv4 映射字面量或 DNS rebinding 绕过；sink 在第 65 行 `url.openConnection()` 发起实际连接。
+3. 第 45-70 行新增 `isAllowedAddress`，基于 JDK 原生 `InetAddress` API 的白名单判定（`isLoopbackAddress`/`isSiteLocalAddress`/`isLinkLocalAddress` 等），并对 IPv4-mapped IPv6 地址递归还原为 v4 后判断，类型正确、覆盖十进制与十六进制两种映射形态。
+4. 第 78-83 行在连接前调用 `InetAddress.getAllByName` 对全部解析结果逐一校验，位置位于 sink 之前，覆盖多 A/AAAA 记录场景；任一地址命中私网即抛出异常。
+5. 第 85-86 行用校验通过的 IP 地址构造 `pinnedUrl` 再连接，消除『校验时与连接时两次独立解析』造成的 TOCTOU/DNS rebinding 窗口。
+6. 第二入口检查：本类仅有 `/api/fetch` 一个路由入口，无其他 controller 方法或替代数据流触及网络 sink；结论为无残余 SSRF 通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-918 SSRF：攻击者通过 IPv4 映射 IPv6 十六进制字面量或 DNS rebinding 绕过基于字符串的黑名单式 isPrivateIp 检查；修复采用 JDK 原生 InetAddress 白名单校验并前置 DNS 解析、以已校验 IP 固定连接目标，消除映射字面量与 rebinding 两类绕过；全类仅 /api/fetch 单一入口，无第二数据流", "fix_suggestion": "line 74-88: 新增 getAllByName 全量解析白名单校验并以校验后 IP 构造 pinnedUrl 连接"}
+```

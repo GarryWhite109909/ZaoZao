@@ -1,0 +1,24 @@
+## 编号分析（全文通读）
+
+**入口点枚举**
+1. 第 437–505 行 `get_body(url, headers, ignore_tls, query_parameters, timeout, allow_private_network)`：主入口，source 为外部传入的 url/headers/query_parameters，sink 为 HTTP 请求与返回的 response.text。
+2. 第 507–570 行 `join_url(url, ref)`：URL 拼接辅助函数。
+3. 隐式入口：重定向 Location 头（第 421–435 行 `_get_redirect_url`）。
+
+**数据流逐条验证**
+
+- **初始 URL 校验**：第 385–420 行 `_validate_url_for_fetch` 强制 scheme 仅限 http/https（第 392–397 行），拒绝无 host、无法 IDNA 归一化的 host；`allow_private_network=False` 时检查 localhost 名单（第 405–412 行）、解析失败 fail-closed（第 414–419 行）、所有解析结果必须 `is_global`（第 425–430 行）。这是白名单式（仅公网地址）而非黑名单，防御有效。
+- **遗留 IPv4 字面量绕过**：第 258–296 行专门处理 `127.1`、`2130706433`、`0x7f000001` 等变体，堵住 `ip_address()` 拒绝但网络栈接受的拼写。第 273–289 行 match 分支范围约束正确（如两段形式 b ≤ 0xFFFFFF）。未发现可绕过的拼写：带前导零的非法八进制会返回 None 落入 DNS 解析，而 DNS 结果仍受 `is_global` 约束。
+- **DNS rebinding / TOCTOU**：第 298–338 行解析出精确地址集后，第 340–410 行 `_PinnedNetworkBackend.connect_tcp` 强制请求 host 与校验 host 一致（ASCII/punycode 归一化比较），且只对已校验 IP 发起 TCP 连接，杜绝“校验时公网、连接时内网”的重绑定。第 412–486 行 `_build_pinned_transport` 将其注入 httpcore 连接池。
+- **重定向通道（第二入口）**：第 455–462 行手动处理重定向（`follow_redirects=False`），每个 Location 经 `httpx.URL.join` 绝对化后在循环顶部重新走 `_validate_url_for_fetch` 并重新 pin，最多 20 次（第 444–476 行），超限抛错。替代通道被有效覆盖。
+- **TLS**：`ignore_tls=True` 时禁用证书验证（第 494–500 行），但这是调用者显式选择且不影响 SSRF 面，属已知功能开关而非漏洞。
+- **Unix socket 旁路**：第 400–410 行 `connect_unix_socket` 直接委托，但 scheme 白名单已排除任何能触发 unix socket 的 URL 形态，不可达。
+- **`join_url` 的 file:// 路径处理**（第 512–562 行）：`..` 回溯受 `min_depth` 限制不会越过根，绝对路径 ref 直接替换——该函数本身不做文件读取，仅拼字符串，且本地文件访问是 file:// 协议的设计语义，不构成安全边界突破。
+- **响应侧**：第 480–486 行检查状态码 ≥400 与 text/html 内容类型；HTML 检查依赖 Content-Type 头可能被服务器规避，但这属于内容格式健壮性问题，不构成 source→sink 安全漏洞（输出交由 schema 解析器，非 eval/exec）。
+- **信息泄露**：错误消息含 URL 与解析 IP（第 342–361 行），面向 CLI 用户，风险极低。
+
+**结论**：全部 source→sink 流均经过 scheme 白名单 + 公网 IP 白名单 + DNS pinning 三层有效防御，重定向与遗留 IP 拼写等绕过路径均已封堵，未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文审查了 get_body、_validate_url_for_fetch、_get_redirect_url、_PinnedNetworkBackend、join_url 等全部函数。外部 URL 作为唯一 source，经 scheme 白名单（仅 http/https）、localhost 名单、DNS 解析后 is_global 公网地址白名单三重校验；遗留 IPv4 拼写（127.1、十六进制等）被专门归一化以防绕过；DNS rebinding 通过将校验所得 IP 集合 pin 进自定义 httpcore 网络后端并在 TCP 连接时强制 host 匹配来阻断；重定向采用手动跟随并对每个 Location 重新校验和重新 pin，最多 20 次；unix socket 委托路径因 scheme 白名单不可达；join_url 仅做字符串拼接不触达文件系统。未发现有效的 source 到危险 sink 数据流。", "fix_suggestion": "no fix needed"}
+```

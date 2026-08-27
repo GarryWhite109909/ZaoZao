@@ -1,0 +1,23 @@
+## 编号分析
+
+1. **第 44–48 行（构造函数）**：入口点之一。`name`、`secretKey`、`password` 由外部传入（Gradle signing 插件中通常来自 `gradle.properties` 或环境变量）。password 仅用于解密私钥，未做日志输出或持久化，无泄漏 sink。
+
+2. **第 61–72 行（sign 方法）**：对外入口。接收 `InputStream toSign` 与 `OutputStream signatureDestination`，均为调用方提供的流。数据流：toSign → feedGeneratorWith → generator.update → generate → writeSignatureTo。全程在内存/流内处理签名，无文件路径拼接、命令执行、反序列化或 SQL sink。异常处理（第 66–69 行）仅包装为 Unchecked 异常，不泄露敏感信息。
+
+3. **第 74–78 行（getKeyId）**：`PgpKeyId.getAsHex()` 输出十六进制 key id；若该值被拼入日志或 XML 签名元数据，hex 编码本身无注入面。
+
+4. **第 80–88 行（feedGeneratorWith）**：注意 `read > 0` 循环条件——当 `read == 0` 时会死循环（阻塞流场景），属于可用性缺陷而非安全漏洞。
+
+5. **第 90–96 行（writeSignatureTo）**：BCPGOutputStream 包装写签名，flush 但不 close（注释说明由调用方负责），无路径控制 sink。
+
+6. **第 98–108 行（createSignatureGenerator）——关键发现**：第 100 行硬编码使用 `PGPUtil.SHA1` 作为摘要算法生成 PGP 签名。SHA-1 已被证明存在碰撞攻击（SHAttered, 2017；chosen-prefix collision 对 PGP 签名构成实际威胁），现代 GnuPG 默认已拒绝 SHA-1 签名。这是弱哈希算法问题（CWE-327），且此处是硬编码，外部无法配置升级，所有经此签名的制品均使用 SHA-1。
+
+7. **第 110–117 行（createPrivateKey）**：密码以 `char[]` 传入 PBESecretKeyDecryptor，符合安全实践；但字符串形式的 password 在 JVM 字符串池中不可清除，属轻微弱点，非可利用漏洞。
+
+8. **第二入口/替代通道检查**：本类无网络路由、无文件读取、无环境变量直接读取；唯一外部影响点是构造参数与 sign 的流参数。全文无其他 source→sink 流。
+
+结论：无注入类漏洞；存在硬编码 SHA-1 弱哈希签名缺陷。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-327 使用已破解或有风险的加密哈希算法", "risk_level": "中", "source": "line 98: createSignatureGenerator 中硬编码的摘要算法选择", "sink": "line 100: new BcPGPContentSignerBuilder(secretKey.getPublicKey().getAlgorithm(), PGPUtil.SHA1)", "explanation": "第 100 行将签名摘要算法硬编码为 SHA1，导致该 signatory 生成的所有 PGP 签名均基于已被实际碰撞攻击攻破的 SHA-1，且外部无法通过配置升级算法；现代验证方（如 GnuPG 新版本）会拒绝此类签名，同时削弱制品签名的防篡改保证 -> 所有经由 sign() 方法产出的签名都受影响", "fix_suggestion": "line 100: 将 PGPUtil.SHA1 替换为更强的摘要算法如 PGPUtil.SHA256 或 PGPUtil.SHA512，并可通过配置项允许用户指定算法"}
+```

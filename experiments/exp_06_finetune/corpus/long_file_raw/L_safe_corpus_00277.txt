@@ -1,0 +1,28 @@
+## 编号分析（全文逐函数）
+
+**入口点枚举**
+- E1：`MakeWithHTTPClient`（第 47 行起）——source 为 `remote_pb.RemoteConf`（S3Endpoint/AccessKey/SecretKey/Region），由管理员通过 filer 远程存储配置写入，非外部用户直接可控。
+- E2：`Traverse` / `ListDirectory` / `StatFile` / `ReadFile*` / `DeleteFile` / `UpdateFileMetadata`——source 为 `RemoteStorageLocation.Bucket/Path`，来自 filer 元数据中已映射的远程路径。
+- E3：`WriteFile`（第 193 行起）——source 除 loc 外还有 `entry.Extended`（用户文件扩展属性，普通客户端可写）。
+- E4：`CreateBucket/DeleteBucket/ListBuckets`——bucket 名来自上层调用。
+
+**数据流验证**
+
+1. `loc.Path[1:]` → S3 Key（第 221、246、289、296、305 行等）：S3 key 是扁平命名空间，`../` 无路径穿越语义；且 path 来自 filer 已验证的映射。无有效漏洞。
+2. `conf.S3Endpoint` → HTTP 请求目标（第 55 行）：SSRF 面，但配置仅管理员可设，且代码注释明确支持受控 DialContext 防护；不算用户可达漏洞。
+3. 空 AccessKey+SecretKey → `AnonymousCredentials`（第 63–65 行）：有意设计，无凭据泄露。
+4. **`entry.Extended` → Tagging 字符串拼接（第 214–222 行）**：
+   ```go
+   tags = tags + k + "=" + string(v)
+   ```
+   key/value 均未做 URL 编码或转义，分隔符为 `&` 和 `=`。攻击者控制文件扩展属性即可注入额外 tag 对（如 value 含 `&admin=true`），篡改远端对象标签，或注入破坏 S3 tagging 解析的字符导致上传失败/标签污染。这是真实的注入缺陷（对比同文件第 236 行 `toTagging` 用结构化 API 则安全）。风险低：影响限于对象元数据标签，不涉及数据读写越权。
+5. `ReadFileWithConcurrency` 第 250 行：size=0 时 Range 头非法，属健壮性 bug 非安全问题。
+6. 错误信息回显 bucket/path（多处 `%v`）：仅返回给发起配置的管理员，无敏感凭据泄漏。
+
+**第二入口/替代通道检查**：`UpdateFileMetadata` 走结构化 `toTagging`，不受拼接问题影响；其余通道均经同一 loc 校验路径。
+
+结论：存在一处低危的 S3 Tagging 注入（WriteFile 中扩展属性未编码拼接）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "header/tag injection due to unencoded string concatenation", "risk_level": "low", "source": "entry.Extended user-controlled extended attributes in WriteFile", "sink": "S3 UploadInput.Tagging string built at lines 214-222 via concatenation with & and = separators", "explanation": "在 WriteFile 中, 文件扩展属性的 key 和 value 直接用 & 和 = 拼接成 tagging 字符串, 未做任何 URL 编码或转义。普通客户端可写 entry.Extended, 因此可注入额外的 tag 键值对或破坏 tagging 解析, 造成远端对象标签污染或上传异常。同文件的 toTagging 函数使用结构化 API 不受影响, 说明正确做法已在代码库中存在。其余入口点(路径到 S3 Key 的映射、管理员配置的 endpoint、匿名凭据逻辑)经全文核查未发现可利用的安全问题。", "fix_suggestion": "对 tagging 字符串中的 key 和 value 使用 url.QueryEscape 或等价编码后再拼接, 或改用已有的 toTagging 结构化方式配合 PutObjectTagging 设置标签"}
+```

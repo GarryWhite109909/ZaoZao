@@ -1,0 +1,24 @@
+## 编号分析
+
+1. **入口点枚举（全文）**
+   - `readResults`（约第 100 行）：接收 results 目录，`listResults` 枚举 `*.xml` 文件 —— 唯一入口是结果目录中的 XML 文件内容。
+   - `parseRootElement`：用 `DocumentBuilderFactory` 解析每个 XML 文件。
+   - `parseTestSuite` / `parseTestCase` / `createStatuslessTestResult`：从 XML 属性提取 `name`、`classname`、`hostname`、`timestamp` 等。
+   - `getLogFile`（约第 190 行）：以 XML 中的 `classname` 拼接路径。
+   - 无其他入口（无网络回调、无环境变量读取）。
+
+2. **XXE 检查**：`DocumentBuilderFactory.newInstance()` 未禁用 DTD/外部实体，但第 116 行设置了 `builder.setEntityResolver(new ClasspathEntityResolver())`，外部实体解析被重定向到 classpath，无法发起 SSRF 或读本地文件。防御有效。
+
+3. **source→sink 数据流验证（关键漏洞）**
+   - source：XML 中 `<testcase classname="...">` 的属性值，完全由结果文件作者控制（第 152 行 `getAttribute(CLASS_NAME_ATTRIBUTE_NAME)`）。
+   - sink：`getLogFile` 第 193-196 行执行 `resultsDirectory.resolve(className + ".txt")`。`Path.resolve` 对绝对路径（如 `/etc/passwd.txt`）或含 `../` 的相对路径会逃逸出结果目录；随后 `Files::exists` 过滤后调用 `visitor.visitAttachmentFile(...)` 读取该文件并作为附件嵌入生成的 HTML 报告。
+   - 防御评估：仅有 `InvalidPathException` catch（只防非法路径字符，不防遍历）和 `Files::exists`（反而成为文件存在性探测原语）。无任何规范化/前缀校验（如 `startsWith(resultsDirectory)`）。黑名单式异常捕获不算有效防御。
+   - 结论：**任意本地文件读取（路径穿越）**——攻击者提交恶意 junit XML 即可把宿主机上任意 `.txt` 结尾文件（配合目录探测可扩展）注入报告外泄。
+
+4. **第二入口/替代通道**：同一 `classname` 还流入 `historyId`、标签等仅作展示字段，无额外 sink；`system-out`、`failure` 内容进入报告文本，属预期功能。替代通道不改变结论。
+
+5. **其余函数**（`getStatus`、`setParameters`、`getTime`、`isFlaky`、`splitLines`）均为纯数据映射，无危险 sink。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "path_traversal_arbitrary_file_read", "risk_level": "high", "source": "XML 结果文件中 testcase 元素的 classname 属性（攻击者可控的测试结果文件）", "sink": "getLogFile 方法中 resultsDirectory.resolve(className + '.txt') 后经 visitor.visitAttachmentFile 读取文件内容并嵌入报告", "explanation": "getLogFile 直接将 XML 中的 classname 与 '.txt' 拼接后调用 Path.resolve，未做规范化或目录前缀校验；绝对路径或包含 ../ 的值可逃逸结果目录，Files.exists 过滤后文件内容作为附件写入 Allure 报告，导致任意本地文件读取与信息泄露。仅有的 InvalidPathException 捕获不构成有效防御。", "fix_suggestion": "对解析后的路径做 normalize 并校验其以 resultsDirectory 为前缀（startsWith），拒绝越界路径；同时限制 classname 字符集（如仅允许字母数字点下划线）。"}
+```

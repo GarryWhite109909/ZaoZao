@@ -1,0 +1,33 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `getData()` 第24–57行：接收 filters/sort/dir/offset/limit/fields/drillDownFilters，最终在第40、53行执行 `$baseQuery` 拼接后的 SQL。
+2. `getColumns()` 第59–78行：接收外部 `?stdClass $configuration`，第63行传入 `buildQueryString`，第69行 `fetchAssociative($sql)` 直接执行。
+3. `buildQueryString()` 第80–131行：将配置对象的 `sql`（第88行）、`from`（第99行）、`where`（第106行）、`groupby`（第113行）**原样字符串拼接**进查询。
+4. `getBaseQuery()` 第133–209行：第138行调用 buildQueryString；第190行黑名单正则后于第193/197/199行拼接子查询。
+5. `getAvailableOptions()` 第211–227行：第218行执行拼好的 SQL。
+
+**逐条 source→sink 验证**
+
+- **D1：`$config['sql']/from/where/groupby` → 执行**。source 是报告配置对象（来自管理端自定义报表配置，可由有权限用户写入）。防御仅有：(a) 第85/96/103/110行的前缀检查（仅决定是否补关键字，不消毒）；(b) 第66、190行的黑名单正则 `(ALTER|CREATE|DROP|RENAME|TRUNCATE|UPDATE|DELETE)` 后必须跟**一个空格**——可被注释绕过（如 `UPDATE/**/`）、制表符绕过（`UPDATE\t`），且 `SELECT ... INTO OUTFILE/DUMPFILE`、堆叠注入等完全不在名单内。**无效防御**。sink：第69、53、218行执行。→ SQL 注入成立。
+- **D2：`$sort`（第45行）** 经 `quoteIdentifier`，`$dir` 白名单化为 ASC/DESC——有效。
+- **D3：`$offset/$limit`（第50行）** 为 int 类型参数——安全。
+- **D4：filters 的 value（第142–184行）** 均经 `$db->quote()`，property 经 `quoteIdentifier`——有效。
+- **D5：drillDownFilters（第119–121行）** field/value 均加引号——有效。
+- **D6：`$selectField`（第91行）、`$field`（第217行）、fields 数组（第196行）** 均 quoteIdentifier——有效。
+
+**第二入口确认**：`getColumns()` 的 `$configuration` 与 `getData()` 走的 `$this->config` 是同一类攻击面；即使运行时 filters 安全，配置中的 where/groupby 仍可携带任意表达式（如 `(SELECT ... )` 子查询、`INTO OUTFILE`）。
+
+**结论**：核心漏洞是自定义 SQL 配置经黑名单校验后被直接执行，黑名单可绕过，构成 CWE-89 SQL 注入（Pimcore 实际历史漏洞即在此处）。利用前提通常需要具备报表配置权限的后台用户，风险评级中高。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-89",
+  "risk_level": "high",
+  "source": "line 82-113: buildQueryString 中外部配置的 sql/from/where/groupby 字段原样进入字符串拼接",
+  "sink": "line 69 fetchAssociative($sql)、line 53 fetchAllAssociative($sql)、line 218 fetchAllAssociative($sql)",
+  "explanation": "配置中的任意 SQL 片段直接拼入查询并执行 -> 唯一防御是 line 66 和 line 190 的黑名单正则，其要求关键字后跟空格，可用 UPDATE/**/ 或制表符绕过，且未覆盖 INTO OUTFILE 等写操作 -> 构成可利用的 SQL 注入",
+  "fix_suggestion": "line 66/190: 移除黑名单方案，改为强制只允许单条 SELECT 语句（如解析 AST 校验语句类型与顶层结构），并对配置中的标识符使用 quoteIdentifier、对值统一使用预编译参数绑定"
+}
+```

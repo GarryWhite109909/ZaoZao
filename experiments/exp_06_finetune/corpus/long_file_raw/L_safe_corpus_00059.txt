@@ -1,0 +1,21 @@
+## 编号分析
+
+1. **put（第 27–76 行）**：source 为 `req.URL.Path`，sink 为 `os.OpenFile(savepath)`。经 `sanitizePath(fs.UploadFolder, ...)` 清洗（第 35 行），并有 `.goshs` 覆盖拦截（第 41 行）、ACL 检查与 MaxBytesReader（prepareWrite）。若 sanitizePath 正确拒绝 `..` 逃逸，则无路径穿越。防御依赖 sanitizePath 实现，但同文件其他路径均复用它，且 upload 中还有纵深校验佐证其语义。
+
+2. **upload（第 79–190 行）**：source 为 multipart 的 `part.FileName()`，sink 为 `os.Create(tempPath)`/`os.Rename`。文件名先按 `/` 取末段（第 111–113 行），显式拒绝空、`.`、`..`（第 115 行），并阻止 `.goshs`（第 122 行）；随后第 131 行再用 `sanitizePath(targetDir, filenameClean)` 做纵深校验，确保解析结果不逃逸 targetDir。反斜杠在 Linux 上非分隔符，即使 Windows 场景也会被第 131 行的 sanitize 拦截。ACL 在写前对 targetDir 生效（第 90 行）。未发现有效绕过链。
+
+3. **bulkDownload（第 193 行起）**：source 为 `req.URL.Query()["file"]`，sink 为 `os.Open(walkPath)` 与 zip 打包。
+   - 每个 file 经 `sanitizePath(fs.Webroot, file)` 校验（第 205 行），失败即跳过；
+   - 对选中项执行 ACL（applyCustomAuth + Block 列表，第 216–226 行）；
+   - walker 内对每个实际打包文件再次执行 `findEffectiveACL` + `aclSatisfied` + Block 检查（第 262–270 行），并排除 `.goshs` 本身（第 254 行），防止嵌套目录中受限文件泄露及凭据哈希外泄；
+   - 目录递归不会逃出 Webroot，因为入口已被 sanitizePath 限制。
+
+4. **次要观察**：walker 中 `findEffectiveACL` 出错时（aclErr != nil）会跳过检查直接打包（fail-open），以及 `zippath[1:]` 在 Webroot 异常时可能产生错误相对路径——均为健壮性问题而非可利用漏洞；ACL 缺失视为允许是该类工具的常见设计。
+
+5. **第二入口核查**：put 与 upload 是仅有的两个写入口，均受 CSRF、ReadOnly、ACL、大小限制约束；bulkDownload 是唯一批量读入口，已双重 ACL 校验。未发现替代通道绕过。
+
+结论：全文未见可利用的 source→sink 漏洞；关键清洗点均有纵深防御。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "逐行审查了 put、upload、bulkDownload 三个入口。上传路径经 sanitizePath 清洗且文件名有黑名单加 sanitizePath 纵深双重校验；.goshs ACL 文件在写入和打包两条通道均被阻断；bulkDownload 对每个查询文件做 sanitizePath 校验并在 walker 内对每个实际打包文件二次执行 ACL 与 Block 检查，防止嵌套目录越权读取。唯一弱点是 findEffectiveACL 出错时 walker 采用 fail-open 策略跳过检查，以及 aclErr 时仍将文件加入打包列表，但这属于设计取舍与健壮性问题，在无法证明可利用的前提下不构成确认漏洞。", "fix_suggestion": "no fix needed"}
+```

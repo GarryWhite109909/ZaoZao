@@ -1,0 +1,33 @@
+## 编号分析
+
+1. **入口点枚举（全文）**
+   - 第 246-253 行 `open_session`：source 为 HTTP Cookie `request.cookies.get(SESSION_COOKIE_NAME)`，拆出 `sid` 与 `digest`。
+   - 第 268-277 行 `save_session`：将 `session.sid!hmac_digest` 写回 Cookie（sink：响应头）。
+   - 第 178-203 行 `FileBackedSessionManager.get`：以 `sid` 拼路径并 `open(fname,'rb')` 后 **pickle 反序列化**（第 187 行 `load(f)`）——这是全文最危险的 sink。
+   - 第 205-234 行 `put`：将 `dict(session)` pickle 写入文件；session 内容源自用户可控的会话数据。
+   - 第 239-240 行：`eval(config.SESSION_DIGEST_METHOD)` —— 配置驱动的 eval sink。
+   - 第 236-285 行 `pga_unauthorised`：`request.url` 进入 `login_url(...)` 重定向，Flask 的 login_url 会校验 next 参数，属低风险开放重定向面。
+   - 第 288-315 行 `cleanup_session_files`：仅删除过期会话文件，无用户输入参与路径。
+
+2. **source→sink 数据流验证**
+   - **sid 路径遍历**：第 179、185、207、229 行均使用 `safe_join(self.path, sid)`。`safe_join` 会拒绝 `..`、绝对路径与盘符，属于有效防御（非黑名单），路径遍历不成立。
+   - **Cookie digest 校验**：第 197 行 `if hmac_digest != digest: return self.new_session()`。注意此处比较的是**文件中存储的 hmac 与 Cookie 中携带的 digest**，并未用 `self.secret` 重新计算 HMAC（代码注释第 190-192 行明确承认这一点）。这意味着完整性完全依赖“会话文件不可被攻击者写入”这一假设——一旦攻击者能向 `SESSION_DB_PATH` 写入任意文件（如通过符号链接、共享目录、其他漏洞链），即可伪造 `randval/hmac_digest/data` 三元组，配合 Cookie 完成会话伪造。
+   - **pickle 反序列化（核心漏洞）**：第 187 行 `load(f)` 直接反序列化磁盘文件内容。pickle 反序列化可执行任意代码（CWE-502）。防御仅有两点：(a) 文件必须存在于受保护目录；(b) HMAC 比对发生在反序列化**之后**（先 load 再比对），因此恶意 pickle 在校验前已被执行——HMAC 防御对该 sink 无效。若部署环境允许本地低权限用户写入该目录（pgAdmin 常见桌面/单机部署，SESSION_DB_PATH 位于用户数据目录），则可提权为运行 pgAdmin 的用户身份执行任意命令。
+   - **eval(config.SESSION_DIGEST_METHOD)**（第 239-240 行）：source 是配置文件而非请求输入，正常部署下不可被远程控制；但配置文件被篡改即 RCE，属纵深防御缺失，风险较低。
+   - **缓存管理器**（第 60-140 行）：`get` 中 digest 不匹配时从缓存剔除并回落到父管理器，逻辑一致，无绕过；skip_paths 仅影响存储，不影响认证。
+
+3. **第二入口/替代通道**：`save_session` 将用户可控的 session dict 内容写入文件（第 230-233 行），意味着任何能注入会话键值的功能（如某些把输入存入 session 的路由）都可能污染会话文件内容，但 pickle 元组结构固定，主要利用面仍是直接写文件。
+
+4. **结论**：存在真实漏洞——基于 pickle 的会话存储在反序列化时未先验证 HMAC，且依赖目录不可写假设，构成 CWE-502 反序列化漏洞（可升级为 RCE）；次要问题为第 239 行 eval。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-502 (Deserialization of Untrusted Data), secondary CWE-95 (Eval Injection)",
+  "risk_level": "high",
+  "source": "line 186-187: open(fname, 'rb') 后 load(f)，fname 由 Cookie 中的 sid 经 safe_join 定位到 SESSION_DB_PATH 下的会话文件",
+  "sink": "line 187: from pickle import load; load(f) 对磁盘文件执行 pickle 反序列化",
+  "explanation": "open_session 从 Cookie 取 sid -> FileBackedSessionManager.get 打开对应会话文件 -> 第 187 行在 HMAC 校验（第 197 行）之前就执行 pickle.load，恶意 pickle 在任何完整性检查前已触发任意代码执行；且第 190-192 行注释表明服务端从不重新计算 HMAC，完整性完全依赖会话目录不可写的假设，一旦攻击者可通过符号链接、共享目录或其他漏洞向 SESSION_DB_PATH 写入文件即可伪造会话或 RCE",
+  "fix_suggestion": "line 187: 用 json 替代 pickle 存储会话（dump/load 改为 json.dump/json.load），或在反序列化前先读取原始字节并用 _calc_hmac 以 self.secret 重新计算并与 Cookie digest 比对通过后再解析；同时移除 line 240 的 eval，改为白名单映射 hashlib 算法名"
+}
+```

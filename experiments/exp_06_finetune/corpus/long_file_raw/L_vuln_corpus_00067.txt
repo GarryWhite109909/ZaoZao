@@ -1,0 +1,34 @@
+## 编号分析
+
+**入口点枚举（全文通读）**
+1. `build(X509CertificateHolder)`（约第 48 行）→ `helper.convertCertificate`，证书内容为外部可控 source。
+2. `build(X509Certificate)`（第 53 行）→ 匿名 `ContentVerifierProvider.get(algorithm)`，algorithm 由上层协议（如 CMS/CMSSignedData）解析自攻击者构造的签名数据。
+3. `build(PublicKey)`（第 96 行）→ 同上，algorithm 可控。
+4. `build(SubjectPublicKeyInfo)`（第 168 行）→ 转换后同 3。
+5. 隐式第二入口：`verify(byte[] expected)` 的参数即签名字节，直接来自被验证的签名结构，是攻击者完全可控的 source。
+
+**数据流逐一验证**
+
+- 流 A：`get(algorithm)` → `createCompositeVerifier`（第 175–215 行）。当 publicKey 不是 `CompositePublicKey` 时异常被吞掉置 null，防御尚可；但当是 `CompositePublicKey` 时（第 182–193 行），循环以 `keySeq.size()`（来自攻击者可控的 algorithm 参数）为界访问 `pubKeys.get(i)`——若攻击者让复合算法参数中的签名算法数量大于公钥分量数，`pubKeys.get(i)` 抛出 `IndexOutOfBoundsException`，未被捕获，属于未检查的异常条件（CWE-754/CWE-787 越界读取），可造成 DoS。
+
+- 流 B：`CompositeVerifier.verify(byte[] expected)`（第 352–377 行）。expected 即攻击者可控的签名字节。两个问题：
+  1. 循环 `for i < sigSeq.size()` 访问 `sigs[i]`：若攻击者提交的复合签名 SEQUENCE 元素个数多于初始化时的 `sigs.length`，抛出未捕获的 `ArrayIndexOutOfBoundsException` → 拒绝服务。
+  2. **验证逻辑缺陷**：若 `sigs[i] == null`（对应分量算法创建失败或缺失），该分量的验证被直接跳过且不影响结果。攻击者可构造只包含能通过的分量子签名的复合签名（省略 null 对应分量），使 `failed` 保持 false 而 verify 返回 true——即“缺分量仍通过”的签名验证绕过。此外 `ASN1BitString.getInstance` 对错误类型元素会抛 `RuntimeException` 未捕获。
+  
+  中间没有任何长度校验（如 `sigSeq.size() != sigs.length` 检查）作为有效防御，故该流成立。
+
+- 流 C：`SigVerifier/RawSigVerifier`（第 267–330 行）：标准 JCA Signature 用法，无 sink 问题；RawSigVerifier 中 finally 里再调一次 verify 仅影响 PKCS11 会话清理，不构成安全漏洞。
+
+**结论**：主要漏洞在复合签名验证路径，source 为攻击者可控的 algorithm 参数与签名字节，sink 为数组索引与 verify 判定逻辑。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-754 不正确的异常条件检查 与 CWE-347 签名验证不当",
+  "risk_level": "中危",
+  "source": "line 178 与 line 355: 攻击者可控的 AlgorithmIdentifier 参数及待验证签名字节数组 expected",
+  "sink": "line 188: pubKeys.get(i) 越界访问; line 360: sigs[i] 越界访问; line 361: sigs[i] 为 null 时跳过验证仍返回 true",
+  "explanation": "攻击者构造的复合签名算法参数中元素数多于公钥分量数时, createCompositeVerifier 第 188 行 pubKeys.get(i) 抛出未捕获的 IndexOutOfBoundsException 造成 DoS; 在 CompositeVerifier.verify 第 358 行循环以上层传入的 sigSeq.size() 为界访问 sigs[i], 签名序列更长时同样越界; 更严重的是第 361 行对 null 分量直接跳过且不计入 failed, 攻击者可省略无法伪造的子签名、仅提交可通过分量的部分复合签名即可通过整体验证, 构成签名验证绕过",
+  "fix_suggestion": "在 line 185 前增加 keySeq.size() 与 pubKeys.size() 的一致性校验并拒绝不一致输入; 在 line 358 循环前校验 sigSeq.size() == sigs.length 否则返回 false 或抛出明确异常; 将 null 分量视为验证失败而非跳过, 并捕获 ASN.1 解析产生的 RuntimeException"
+}
+```

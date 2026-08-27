@@ -1,0 +1,19 @@
+## 编号分析
+
+1. **路由注册（RegisterRoutes，约第 88–140 行）**：枚举全部入口点——`/v1/config`（GET，无认证）、`/v1/oauth/tokens`（POST，无认证）、namespaces/tables 的 CRUD 路由（均经 `s.Auth` 包装）、带 `{prefix}` 的第二组等价路由、以及 catch-all 404。无遗漏的未认证数据面端点；config 与 oauth/tokens 无认证属设计使然。
+
+2. **路径遍历防御（约第 96–100 行）**：注册了 `validateRequestPath` 中间件，注释明确说明因 router 使用 `SkipClean(true)` 需在 handler 前拒绝 `..`/`.`/NUL。该中间件实现体不在本段代码中，无法验证其有效性，但设计意图正确且先于所有 handler 执行。注意：若按题目规则“黑名单过滤视为可绕过”，此处属黑名单式校验，但被拒绝的是字面 `..` 段而非模式匹配，且文件被截断无法证伪，不能据此断言漏洞。
+
+3. **日志中间件（loggingMiddleware，约第 142–165 行）**：对 `Authorization` 头仅在 `len(value) > 20` 时部分脱敏（首 20 + 尾 10 字符）；**长度 ≤20 的凭证会被完整写入日志**（第 152 行 else 分支）。这是一个真实的信息泄露缺陷：短 Bearer token / 短签名会明文落入 glog 日志。风险较低（需日志访问权 + 特定短凭证），但确为 source→sink 数据流：HTTP 头 → glog 文件，脱敏逻辑存在条件性失效。
+
+4. **Auth 中间件（约第 178–230 行）**：三条通道：(a) Bearer token 经 `authenticateBearer`；(b) S3 签名经 `authenticator.AuthenticateRequest`；(c) **失败但 `DefaultAllow()` 为真时放行且不设 identity**（第 197–200 行）。(c) 是显式的部署配置语义（匿名允许），非代码缺陷，但在开启 DefaultAllow 的部署中等同于关闭 Iceberg 目录的授权边界——属于配置性风险提示而非本文件漏洞。
+
+5. **第二入口检查**：带 `{prefix}` 的重复路由组与主路由共用同一 Auth 包装和同一 validateRequestPath 中间件，无旁路。catch-all 仅返回 404 并记录 URI（URI 含潜在敏感 query 参数进入 V(2) 级调试日志，默认不输出）。
+
+6. **截断声明**：handlers（handleLoadTable 等）、validateRequestPath、authenticateBearer 的实现不在给定片段内，其内部 source→sink 无法基于证据判定；结论仅覆盖所给全文。
+
+综合：唯一可证实的问题是第 3 点的 Authorization 头条件性脱敏失败（≤20 字符时全量记录）。其余入口均有 Auth 或设计上无需认证，未见可利用的注入/遍历/越权数据流。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "low", "source": "HTTP Authorization header", "sink": "glog.V(2).Infof debug log", "explanation": "通读全文后：所有数据面路由均经 s.Auth 认证包装，/v1/config 与 /v1/oauth/tokens 无认证属设计使然；带 {prefix} 的第二组路由复用相同中间件无旁路；路径遍历由 validateRequestPath 在 handler 前统一拦截（实现体不在片段内）。唯一可证实的缺陷是 loggingMiddleware 对 Authorization 头仅当长度大于 20 时才脱敏，长度不超过 20 的凭证会被完整写入调试日志，构成低风险信息泄露；DefaultAllow 放行是显式配置语义而非代码漏洞。", "fix_suggestion": "将 Authorization 头一律完全脱敏或仅记录 scheme（如 Bearer ***），不依赖长度阈值；同时建议补充 validateRequestPath 实现以确认拒绝逻辑覆盖编码变体"}
+```

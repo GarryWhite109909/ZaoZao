@@ -1,0 +1,84 @@
+# 全文逐函数安全分析（mistune HTMLRenderer）
+
+## 0. 总体入口点枚举
+
+本文件是渲染器，无网络路由；所有“入口点”即各 render 方法接收的 Markdown 文档内容（token 的 `raw` / `children` / `attrs`），最终 sink 均为拼接进 HTML 字符串。逐一分析如下。
+
+## 1. `render_token`（第 24–37 行）
+
+将 token 分发到对应方法。`token["raw"]`（第 28 行）与 `token["children"]` 渲染结果、以及 `**attrs`（第 32–36 行）都是不可信输入的直接通道。此处无过滤，安全性完全依赖下游各方法。注意第 32 行 `func(**attrs)`：`attrs` 中任意键值会作为关键字参数传入渲染函数，若某方法存在未转义参数（见下文 `image.alt`），则构成第二入口。
+
+## 2. `safe_url`（第 39–52 行）—— 协议黑名单，可绕过
+
+- 第 44–45 行：`allow_harmful_protocols=True` 时仅做 `escape_text`，不阻止任何协议 —— 配置性放行。
+- 第 47–48 行：当 `allow_harmful_protocols` 为非布尔真值（如列表）时，只允许其中列出的“有害协议”，其余仍走黑名单。逻辑自洽但依赖调用方正确配置。
+- 第 50–51 行：核心防御是 `_url.startswith(self.HARMFUL_PROTOCOLS)`，这是**前缀黑名单 + 仅小写化**。绕过方式：
+  - **控制字符/空白注入**：浏览器在解析 URL 时会剥离 tab、换行等字符。输入 `jav\tascript:alert(1)` 或 `java\nscript:alert(1)`，`_url.lower()` 后并不以 `javascript:` 开头，黑名单匹配失败，第 53 行原样返回（`escape_text` 只转义 `& < > "` 等实体，不删除 `\t \n`），最终写入 `href` 后浏览器执行 JS。这是真实的 source→sink 流：Markdown 链接 URL（source，第 28 行 raw / attrs.url）→ `link()` 第 57 行 `self.safe_url(url)` → 第 58 行拼入 `href="..."`（sink）。防御无效。
+  - 大小写混合已被 `.lower()` 覆盖，但 Unicode 同形字符或 `&#106;avascript:` 在属性中经实体解码后同样可达（取决于上层是否二次解码）。
+- 结论：协议过滤属于题目定义的“黑名单视为可绕过”类别，不构成有效防御。
+
+## 3. `text`（第 55–58 行）
+
+`escape=True` 时走 `escape_text`，否则 `safe_entity`（仍转义实体）。此路径防御有效。
+
+## 4. `emphasis` / `strong`（第 60–64 行）
+
+仅包裹标签，内容来自已转义的子渲染结果，无独立 sink。
+
+## 5. `link`（第 66–71 行）
+
+- `url` → `safe_url`（如上，可被控制字符绕过）→ 拼入 `href`（sink，第 57 行）。
+- `title` 经 `safe_entity`（第 69 行）：`safe_entity` 会转义引号，属性逃逸被阻断，有效。
+- `text` 来自子节点渲染（已转义），有效。
+
+## 6. `image`（第 73–79 行）—— **确认漏洞点**
+
+- 第 74 行 `src = self.safe_url(url)`：同上可绕过。
+- **第 75 行 `alt = striptags(text)`：`striptags` 只剥离 HTML 标签，不转义双引号**。攻击者构造 alt 文本含 `"` onmouseover=alert(1) x="`，经第 76 行 `'<img src="' + src + '" alt="' + alt + '"'` 拼接后即可闭合 `alt` 属性并注入新属性/事件处理器，形成存储型 XSS。数据流：Markdown 图片替代文本（source，第 28 行 token raw）→ 子渲染 → `striptags`（无效防御：剥标签但留引号）→ 第 76 行字符串拼接（sink）。对比同文件 `title` 用了 `safe_entity`（第 78 行），证明作者知道需转义引号，`alt` 处属遗漏。
+- 第二入口验证：`render_token` 第 32–36 行的 `func(**attrs)` 可直接把含引号的文本送入同一 sink，无需特定 Markdown 结构。
+
+## 7. `codespan`（第 81–82 行）、`linebreak`/`softbreak`（第 84–88 行）
+
+`escape_text` 包裹，有效；后两者为常量输出。
+
+## 8. `inline_html`（第 90–93 行）
+
+`escape=False` 时原始 HTML 直接返回（第 93 行）。这是文档声明的配置行为（信任输入模式），默认 `escape=True` 安全；但在默认关闭场景下构成设计上的 XSS 通道，风险归为配置责任而非缺陷。
+
+## 9. `paragraph` / `block_text` / `block_quote` / `list_item`（第 95–105、119–120 行）
+
+纯包裹，内容依赖上游转义，无新增 sink。
+
+## 10. `heading`（第 107–113 行）
+
+`level` 为整数（第 108 行 `str(level)` 无注入）；`id` 经 `escape_text`（第 111 行）转义引号，有效。
+
+## 11. `block_code`（第 122–129 行）
+
+`info` 经 `safe_entity`（第 125 行）后再取第一个词作 class（第 127 行），引号被转义，无法逃逸属性；`code` 经 `escape_text`（第 128 行），有效。
+
+## 12. `block_html`（第 131–134 行）
+
+与 `inline_html` 同理：`escape=False` 时原文输出（第 134 行），配置性通道。
+
+## 13. `block_error`（第 136–137 行）、`list`（第 139–147 行）、`thematic_break`/`blank_line`
+
+`escape_text` 有效；`list` 的 `start` 为整数强转（第 143 行），无注入。
+
+## 综合结论
+
+两条真实可利用流：
+1. **image alt 属性注入 XSS**：`striptags` 不转义引号 → 属性逃逸（CWE-79）。
+2. **safe_url 黑名单绕过**：URL 中嵌入 `\t`/`\n` 等控制字符绕过 `startswith` 前缀检查，`javascript:` 方案进入 `href`（CWE-79，黑名单型防御失效）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-79",
+  "risk_level": "high",
+  "source": "line 28: token['raw'] 即用户可控的 Markdown 图片替代文本与链接 URL",
+  "sink": "line 76: '<img src=' + src + ' alt=' + alt 拼接；line 58: href 拼接",
+  "explanation": "流一：图片 alt 文本 -> line 75 striptags 只剥标签不转义双引号 -> line 76 直接拼入 alt 属性，可用双引号闭合属性注入 onerror 等事件处理器导致 XSS；流二：链接 URL -> line 46 lower 后 line 50 startswith 前缀黑名单可被 jav\\tascript: 等内嵌制表符或换行绕过（escape_text 不删除控制字符而浏览器解析时会剥离）-> line 58 写入 href 执行 javascript 方案",
+  "fix_suggestion": "line 75: 将 striptags(text) 改为 escape_text(striptags(text)) 以转义引号；line 50: 在 startswith 检查前先移除 URL 中的控制字符与空白（如 re.sub(r'[\\x00-\\x20]', '', url).lower()）再做协议判断"
+}
+```

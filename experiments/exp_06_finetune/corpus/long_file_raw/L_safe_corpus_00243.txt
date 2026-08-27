@@ -1,0 +1,29 @@
+## 编号分析（全文逐函数）
+
+1. **第 1–30 行（包声明与错误类型）**：仅定义 `ErrTwoFactorNotEnrolled`，`Error()` 用 `%d` 格式化 int64，无格式化字符串注入面。
+
+2. **第 38–48 行 `GenerateScratchToken`**：使用 `util.CryptoRandomBytes(6)`（CSPRNG）生成 8 字符 base32 恢复码，熵约 40 bit，对在线暴力破解足够；盐用 `CryptoRandomString(10)` 随机生成。无硬编码或可预测值。安全。
+
+3. **第 51–54 行 `HashToken`**：PBKDF2-SHA256，10000 轮，50 字节输出，带随机盐。恢复码以哈希存储而非明文，防库泄露后直接使用。轮数偏低但可接受（Gitea 上游实现）。安全。
+
+4. **第 57–62 行 `VerifyScratchToken`**：先做长度检查（非防御性黑名单，仅快速失败），比较使用 `subtle.ConstantTimeCompare`，消除时序侧信道。source 为用户输入 token，sink 为哈希比较——防御有效。安全。
+
+5. **第 64–66 行 `getEncryptionKey`**：`md5.Sum(setting.SecretKey)` 派生 AES 密钥。MD5 作 KDF 是弱点（16 字节截断、无盐、无迭代），但这属于设计权衡而非本文件可利用漏洞：攻击前提是已获取数据库密文 + 已知 SECRET_KEY；SECRET_KEY 本身即根秘密，攻击者持有它时 MD5 不降低安全性。不构成独立可利用漏洞。
+
+6. **第 69–76 行 `SetSecret` / 第 79–90 行 `validateTOTP`**：TOTP 种子经 AES 加密后 base64 存库，解密失败返回错误而非 panic/泄露。错误信息含底层错误但不包含敏感数据（不含 secret 明文）。安全。
+
+7. **第 92–110 行 `ValidateAndConsumeTOTP`（重放防护）**：这是本文件核心逻辑。采用条件 UPDATE：`Where(IsNull OR Neq last_used_passcode)` 且 `Cols("last_used_passcode")`，仅当存储值不同才更新。并发请求下数据库行锁串行化，第二个相同 passcode 的 UPDATE 影响 0 行被拒绝，闭合了 read-validate-write TOCTOU 窗口。`Update(t)` 只写指定列，不会覆盖 Secret 等字段。逻辑正确。注意：该函数是注释声明的唯一消费入口，本文件内无其他绕过路径调用 `validateTOTP`（小写私有方法未对外导出）。
+
+8. **第 113–124 行 `NewTwoFactor` / `UpdateTwoFactor`**：xorm 参数化查询，无 SQL 注入面。`AllCols().Update(t)` 由调用方控制结构体内容，本文件无用户输入直达此处。
+
+9. **第 127–141 行 `GetTwoFactorByUID` / `HasTwoFactorByUID`**：`uid` 以占位符参数传入（`uid=?`），无拼接。安全。
+
+10. **第 144–155 行 `DeleteTwoFactorByID`**：删除条件同时绑定 `id` 与 `UID: userID`（属主校验），防止越权删除他人 2FA 记录；影响行数不为 1 时报错。授权检查到位。安全。
+
+11. **第 158–167 行 `HasTwoFactorOrWebAuthn`**：组合查询，均参数化。安全。
+
+**入口点枚举结论**：本文件为 models/auth 层代码，无 HTTP 路由、无文件/环境变量读取、无回调注册；所有外部输入（token、passcode、uid、id）均来自上层调用方，且在本层内全部经过参数化查询、常量时间比较或原子条件更新处理。第二入口与替代通道核查：`validateTOTP` 为私有方法且仅被 `ValidateAndConsumeTOTP` 调用，无绕过重放防护的替代通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文：所有外部输入（scratch token、passcode、uid、id）均通过 xorm 占位符参数化查询处理，无 SQL 注入；VerifyScratchToken 使用 subtle.ConstantTimeCompare 防时序攻击；恢复码由 CryptoRandomBytes 生成并以 PBKDF2 加盐哈希存储；ValidateAndConsumeTOTP 通过条件 UPDATE 加行锁原子化记录已用 passcode，闭合了 TOCTOU 重放窗口，且私有方法 validateTOTP 无其他调用通道可绕过；DeleteTwoFactorByID 同时校验 id 与 userID 防越权删除。getEncryptionKey 使用 md5 派生 AES 密钥属于设计权衡而非可独立利用的漏洞（攻击前提是攻击者已持有根 SECRET_KEY）。", "fix_suggestion": "no fix needed"}
+```

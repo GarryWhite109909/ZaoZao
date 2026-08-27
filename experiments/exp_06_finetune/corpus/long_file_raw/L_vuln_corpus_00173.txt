@@ -1,0 +1,23 @@
+## 编号分析
+
+1. **入口点枚举（全文通读）**
+   - 第 3 行 `main(argv)`：`process.argv`（第 108 行）作为命令行参数入口。
+   - 第 8 行 `mri(argv.slice(2))`：解析出 `src`、`dest`、`force`、`cache` 等，全部为用户可控 source。
+   - 第 20–24 行：`glob('**/access.json', {cwd: base})` + `fs.readFileSync` + `JSON.parse` —— 第二入口：缓存目录下由先前下载内容生成的 JSON 文件，其键值进入 `accessLookup`，仅用于排序，未流向文件系统写操作，风险低但属于不可信数据来源。
+   - 第 30–37 行 `getChoice`：读取 `**/map.json`（同样是缓存产物），其 `hash` 作为 `name`、`ref` 拼接进 `value`（第 34–35 行），最终成为 `options.src`。
+   - 第 39–58 行：enquirer 交互式提示，`options.dest`（第 47–50 行）为第二输入通道的任意路径；`options.src` 来自 map.json 缓存数据。
+   - 第 60–70 行：非空目录检查与 force 覆盖确认——仅是提示，不构成防御。
+   - 第 72–77 行：`run(options.src, options.dest, ...)` 与第 79 行 `run(src, dest, args)` 汇合。
+
+2. **source→sink 数据流**
+   - **流 A**：argv `src`/`dest`（第 17 行）→ 第 79 行 `run(src, dest, args)` → 第 84 行 `degit(src, args)` → 第 93 行 `d.clone(dest)`。`src` 由 degit 内部做 host 白名单校验（github/gitlab/bitbucket 等固定域名），可视为有效防御；但 **`dest` 无任何校验**，直接传入 `clone()`，tar 解包目标为用户指定任意绝对/相对路径，配合仓库内符号链接或 `../` 条目可实现越界写入（CWE-22 / CWE-59）。黑名单式 host 校验不能约束 dest。
+   - **流 B（第二通道）**：map.json 缓存（第 31 行）→ choices → `options.src`（第 72 行）→ 同样进入 `degit()`。若攻击者能污染缓存目录（如通过恶意仓库写入的缓存文件），可注入伪造 `host:user/repo#ref` 值；不过 degit 的 host 白名单仍会拦截非法 host，此通道风险次之。
+   - **流 C**：`options.dest`（第 50 行）→ 第 72 行 `run(...)` → 第 93 行 `d.clone(dest)`，与流 A 等价的任意写 sink，且绕过了命令行参数形式。
+
+3. **替代通道核查**：`help.md` 读取（第 21 行）为只读固定路径；`process.stdout.write` 为输出型 sink，无危害。唯一危险 sink 是第 93 行 `d.clone(dest)`。
+
+4. **结论**：存在漏洞。dest 完全未经验证即交给解包逻辑，命令行与交互两条通道均可触达；结合 degit 已知的 tar 符号链接/路径穿越问题（GHSA 记录在案），构成任意文件写入。因需本地执行 CLI 且 src 受白名单限制，风险评级为中。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 / CWE-59", "risk_level": "中", "source": "line 17: mri 解析的用户可控 dest 参数；line 50: enquirer 提示的 options.dest（第二入口）", "sink": "line 93: d.clone(dest)", "explanation": "argv 或交互式输入的 dest 未做任何路径合法性校验 -> 直接传入 d.clone() 进行 tar 解包写入 -> 攻击者可通过绝对路径或仓库内 ../ 及符号链接条目实现目录外任意文件写入/覆盖", "fix_suggestion": "line 93: 在调用 d.clone(dest) 前用 path.resolve 归一化并校验 dest 不含 .. 且位于预期工作目录内，同时在解包层拒绝或重写符号链接条目"}
+```

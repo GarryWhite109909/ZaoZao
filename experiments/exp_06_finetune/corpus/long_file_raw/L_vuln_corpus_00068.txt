@@ -1,0 +1,27 @@
+## 编号分析（全文通读）
+
+**入口点枚举**
+- E1: `deserialize_compact(s,...)` 第 84 行 —— 外部传入的紧凑序列化字符串。
+- E2: `deserialize_json(obj,...)` 第 178 行 —— 外部传入的 dict/JSON 字符串，含 `payload`、`signatures` 数组、每项的 `protected/header/signature`。
+- E3: `deserialize(s,...)` 第 246 行 —— 自动分发到 E1/E2（第 252-255 行按 `{...}` 判断）。
+- E4: 回调通道：第 152 行 `key = key(header, payload)`，key 可为可调用对象；以及 `decode` 回调（第 106、188 行）。
+
+**逐条数据流验证**
+
+1. **alg 混淆/算法降级**：source 为攻击者可控的 protected header 中 `alg`（第 90 行 `_extract_header`），sink 为第 265-274 行 `_prepare_algorithm_key`。防御：第 270 行白名单 `self._algorithms`（若调用方未传则为 None，跳过该检查），但第 272 行仍受 `ALGORITHMS_REGISTRY` 限制。若应用注册了弱算法且实例化时未限制白名单，则可被选用——这是配置依赖风险，非本文件必然漏洞。无经典 RS256→HS256 混淆路径（key 类型由 `prepare_key` 校验，不在本文件内绕过）。
+
+2. **crit 头注入（unprotected header）**：JSON 序列化中攻击者可在非保护 `header` 放置任意参数。防御有效：第 313 行 `_reject_unprotected_crit` 直接拒绝 `crit` 出现在非保护头（第 296-300 行）；protected 的 crit 由第 315 行 `_validate_crit_headers` 强制类型与注册名校验（第 286-297 行），并要求列出的名字必须存在于 header。此为有效防御，非黑名单正则类可绕过过滤。
+
+3. **多签名 JSON 绕过**：第 216-226 行对每个签名逐一验证，`is_valid` 要求全部通过才返回，否则抛 `BadSignatureError`。不存在“任一签名通过即放行”的缺陷。
+
+4. **签名前解码副作用**：第 106、188 行在验证签名**之前**执行 `decode(payload)` 与 `_extract_payload`。虽然成功路径要求验证通过，但 `BadSignatureError(rv)`（第 172、239 行）携带已解码 payload 返回给调用方——若上层把异常对象内容回显，存在对未验证数据的暴露面。属低危、依赖调用方行为。
+
+5. **长度限制不一致（确认的问题）**：第 82 行 `deserialize_compact` 有 `MAX_CONTENT_LENGTH=256000` 检查；但 `deserialize_json`（第 178 行起）及 `deserialize` 的 JSON 分支（第 252-253 行）**没有任何长度上限**。`ensure_dict`、base64 解码、多签名循环均在无界输入上进行。经 `deserialize` 入口，攻击者以 `{` 开头的超大 JSON 即可绕过 256000 限制，造成资源消耗（CWE-400 / CWE-770）。source：第 252 行外部输入 s；sink：第 179 行 `ensure_dict` 及后续解析。
+
+6. **compact 分段解析**：第 86-91 行用 `rsplit/split(b".",1)`，payload 段可含额外点号导致 base64 解码差异，仅影响严格性，不构成可利用漏洞。
+
+**第二入口核查**：E3 是 E1/E2 的聚合入口，上述第 5 条正是经由 E3 到达 E2 的替代通道，使本应生效的长度防御失效。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-770 / CWE-400 资源分配缺乏限制（输入长度校验不一致）", "risk_level": "低", "source": "line 246-255: deserialize 入口接收外部字符串并以 startswith 判断后进入 deserialize_json", "sink": "line 178-190: deserialize_json 对无长度上限的输入执行 ensure_dict 与 base64 解码及多签名循环", "explanation": "deserialize_compact 在 line 82 有 MAX_CONTENT_LENGTH 上限检查，但 deserialize_json 及其经由 deserialize 的分发路径完全没有等价检查 -> 攻击者提交以花括号包裹的超大 JSON 或含海量 signatures 数组的对象即可绕过 256000 字节限制，触发无界的解析与循环处理，造成内存或 CPU 资源耗尽；其余数据流（alg 白名单、crit 非保护头拒绝、全签名必须通过）经验证防御有效", "fix_suggestion": "在 deserialize_json 入口处（约 line 180 ensure_dict 之前）增加与 deserialize_compact 相同的总长度检查，并对 obj 中 signatures 数组长度与各分段长度设置上限"}
+```

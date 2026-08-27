@@ -1,0 +1,85 @@
+# 全文逐函数安全分析
+
+## 0. 文件定位与攻击面总览
+
+本文件是一个 OCI 运行时 spec 构建辅助包（与 containerd/nerdctl 的 `pkg/oci` 一致），共 123 行，包含 6 个函数：`GetUser`（第 18–51 行）、`ParseUIDGID`（第 54–69 行）、`openUserFile`（第 71–77 行）、`parseUID`（第 79–87 行）、`WithUIDGID`（第 93–102 行）、`setProcess`（第 107–111 行）、`ensureAdditionalGids`（第 116–122 行）。
+
+本文件自身**不注册任何路由、不监听端口、不读取环境变量、不处理 HTTP 参数**。它的入口点只有两类：
+1. **函数参数**：`root`（容器根目录路径）、`username`（用户名字符串，来自镜像配置或调用方传入的 `--user` 类参数）；
+2. **文件系统**：通过 `openUserFile` 打开容器 rootfs 内的 `/etc/passwd` 与 `/etc/group`。
+
+sink 只有两类：`os.Open`（第 76 行，路径打开）和 OCI spec 的 `Process.User` 字段赋值（第 97–99 行）。下面逐一分析每条 source→sink 数据流。
+
+## 1. `GetUser`（第 18–51 行）
+
+**Source**：`root`（第 18 行参数）、`username`（第 18 行参数）。
+
+**数据流 A：username → ParseUIDGID 快速路径（第 25–28 行）**
+若 `username` 形如 `"uid:gid"`，直接走 `ParseUIDGID`。该函数内部用 `strconv.ParseUint(str, 10, 32)`（第 83 行）严格解析为无符号 32 位整数，非数字输入返回错误。解析结果最终经 `WithUIDGID` 写入 `s.Process.User.UID/GID/AdditionalGids`（第 97–99 行）。uint32 类型天然约束了取值范围，不存在越界或注入可能。此流无漏洞。
+
+**数据流 B：username → user.GetExecUser（第 39 行）**
+当快速路径失败时，`username` 连同 passwd/group 文件句柄交给 `moby/sys/user.GetExecUser`。这是上游成熟库，其内部对用户名做查表匹配而非 shell 拼接或 SQL 拼接，不存在命令注入面。即便 `username` 含特殊字符，结果也只是“查不到用户”而返回错误（第 44 行），不会逃逸到 sink。注意第 41–43 行：默认用户名（空串被替换为 `"0"`）查找失败时静默回退到 `uid=0/gid=0`——这继承了 Docker/containerd 长期以来的语义（空 user 即 root），是设计行为而非缺陷；且仅当调用方未显式指定用户名时触发，攻击者无法借此提权到自己本无权获得的身份。
+
+**数据流 C：root → openUserFile（第 30、34 行）**
+`root` 是容器 rootfs 路径，固定拼接 `/etc/passwd` 与 `/etc/group` 字面量后进入 `fs.RootPath`。见下文对 `openUserFile` 的分析——路径是硬编码的，不含任何用户可控分量，因此即使 `root` 本身来自不可信输入，攻击者也只能控制“在哪个根目录下读固定的两个文件”，无法控制读任意路径。此流无漏洞。
+
+**第二入口检查**：本函数没有其他通道（无环境变量、无回调、无 goroutine 共享状态）；`sgids` 仅由 passwd/group 文件内容推导（第 46–49 行），写入 spec 前经 `uint32(g)` 显式转换，类型安全。
+
+## 2. `ParseUIDGID`（第 54–69 行）
+
+**Source**：`str`（即上游 `username`）。
+- 第 55–57 行：空串返回 `(0,0,nil)`——注意这里错误为 nil 且 uid=0，意味着空串会被当作合法的 `"0:0"`？实际上第 20–22 行已保证进入 `GetUser` 时 `username` 至少为 `"0"`，而 `ParseUIDGID` 要求含冒号才成功（第 59–61 行），所以空串在此返回 `(0,0,nil)` 后，`GetUser` 第 26–27 行会以 `(0,0,nil,nil)` 提前返回。这与默认 root 语义一致，且只有调用方显式传空串才可达，非提权通道。
+- 第 58 行 `SplitN(str, ":", 2)`：最多两段，多余冒号归入 gid 段，随后被 `ParseUint` 拒绝（第 65–66 行），无绕过空间。
+- 输出仅为 uint32 数值，无字符串 sink，无注入面。**结论：无漏洞。**
+
+## 3. `openUserFile`（第 71–77 行）
+
+**Source**：`root`、`p`。**Sink**：第 76 行 `os.Open(p)`。
+
+这是本文件唯一涉及文件系统路径操作的 sink，需重点验证路径穿越防御：
+- `p` 在所有调用点均为硬编码字面量 `/etc/passwd`（第 30 行）与 `/etc/group`（第 34 行），**不含任何用户可控分量**；
+- 即便假设未来有人传入可控 `p`，第 72 行调用的 `fs.RootPath(root, p)` 是 continuity 库的标准防护函数：它先 `filepath.Clean`，再确保结果仍位于 `root` 前缀之内，能阻断 `../../etc/shadow` 类穿越；
+- 打开方式为只读 `os.Open`，无写、无执行、无 symlink 解包逻辑（symlink 风险属于解包层如 archive 包的职责，不在本文件）。
+
+**替代通道检查**：本文件中不存在第二个 `os.Open`/`os.Create`/`os.Remove` 调用点；全文 grep 级别核对 import（第 3–16 行）也确认没有引入 `io/ioutil`、`exec`、`net` 等危险能力。**结论：路径 sink 有 RootPath 防护 + 硬编码路径双重保障，无漏洞。**
+
+## 4. `parseUID`（第 79–87 行）
+
+第 80–82 行将字面量 `"root"` 映射为 0，等价于标准 Unix 语义；其余输入走 `strconv.ParseUint(str, 10, 32)`（第 83 行），bitSize=32 限制上限为 4294967295，负数、超范围、非数字均报错。输出为 uint32，无下游字符串拼接。**无漏洞。**
+
+## 5. `WithUIDGID`（第 93–102 行）
+
+**Source**：`uid`、`gid`、`sgids`（均来自 `GetUser` 的 uint32 输出）。**Sink**：OCI spec 的 `s.Process.User.*`（第 97–99 行）。
+
+验证要点：
+- 类型上全部是 uint32，runc 对这些字段按数值消费，不存在格式化注入；
+- 第 95 行 `defer ensureAdditionalGids(s)` 保证主 GID 进入附加组列表，修复的是 containerd 上游缺失 supplementary GID 的兼容问题（第 89–91 行 FIXME 注释佐证），属功能补丁；
+- 该 opt 直接覆盖 `AdditionalGids`（第 99 行）而非追加，若调用方先前设置了额外组会被丢弃——这是行为覆盖问题，不是安全问题（不会扩大权限，只会收窄）；
+- 无锁、无共享可变状态，spec 由调用方持有，无并发竞争导致的权限混淆窗口。
+
+**无漏洞。**
+
+## 6. `setProcess`（第 107–111 行）与 `ensureAdditionalGids`（第 116–122 行）
+
+`setProcess` 仅做 nil 保护初始化空 `specs.Process{}`，零值 UID/GID 为 0（root）——但仅在调用链已决定使用某 uid/gid 之后作为兜底结构创建，不会把已设定的非零身份重置为 0。`ensureAdditionalGids` 第 118 行用 `slices.Contains` 去重后前置插入主 GID（第 121 行），纯列表操作，数值来源仍是已验证的 uint32。两者均无可控字符串 sink、无外部 I/O。**无漏洞。**
+
+## 7. 综合判定
+
+通读全文 123 行后确认：
+1. 所有入口点仅有函数参数 `root`/`username`，无网络、环境变量、回调等第二入口；
+2. 唯一文件系统 sink（第 76 行）受 `fs.RootPath`（第 72 行）保护且路径硬编码；
+3. 唯一权限相关 sink（第 97–99 行）输入全部经过 `ParseUint(…, 32)` 强类型校验；
+4. 黑名单/正则类可绕过过滤在本文件中根本不存在，无需评估其有效性；
+5. 未发现任何一条从可控 source 到危险 sink 且缺乏有效防御的数据流。
+
+```json
+{
+  "has_vulnerability": false,
+  "vulnerability_type": "CWE-None",
+  "risk_level": "none",
+  "source": "line 18: 函数参数 root 与 username",
+  "sink": "line 76: os.Open(p) 以及 line 97-99: s.Process.User.UID/GID/AdditionalGids 赋值",
+  "explanation": "全文通读后未发现可利用数据流。username 经 ParseUIDGID 或 strconv.ParseUint 位宽32严格校验后才写入 OCI spec 用户字段，类型安全；root 到 os.Open 的路径为硬编码的 /etc/passwd 与 /etc/group，且经过 fs.RootPath 清洗防穿越；GetExecUser 为查表匹配无注入面；文件内不存在黑名单或正则过滤依赖，也不存在网络、环境变量等第二入口。",
+  "fix_suggestion": "无需修复。可选加固：line 26 快速路径失败时可记录日志便于审计；line 42 默认回退 root 的行为可加注释明确其为兼容 Docker 语义的设计选择。"
+}
+```

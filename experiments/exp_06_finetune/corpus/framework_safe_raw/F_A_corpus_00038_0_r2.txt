@@ -1,0 +1,83 @@
+LANG: python
+```code
+import os
+import shutil
+import subprocess
+import zipfile
+
+from flask import Flask, request, jsonify, send_file, abort
+
+app = Flask(__name__)
+
+PLUGIN_ROOT = os.path.expanduser("~/.trivy/plugins")
+
+ALLOWED_PLUGINS = {"trivy-kubernetes", "trivy-aws", "trivy-azure", "trivy-gcp"}
+
+
+def _safe_plugin_dir(plugin_name):
+    # 白名单精确允许集 + realpath 边界检查，防御 CWE-22
+    if plugin_name not in ALLOWED_PLUGINS:
+        abort(400, description="plugin not allowed")
+    target_dir = os.path.join(PLUGIN_ROOT, plugin_name)
+    if os.path.realpath(target_dir) != os.path.join(os.path.realpath(PLUGIN_ROOT), plugin_name):
+        abort(400, description="invalid path")
+    return target_dir
+
+
+@app.route("/plugins/install", methods=["POST"])
+def install_plugin():
+    # source: 插件名与归档 URL 完全来自外部请求，经白名单校验
+    plugin_name = request.form.get("plugin_name")
+    archive = request.files.get("archive")
+
+    if not plugin_name or not archive:
+        return jsonify({"error": "missing fields"}), 400
+
+    # sink: 路径先经过白名单与 realpath 边界检查
+    target_dir = _safe_plugin_dir(plugin_name)
+    zip_path = target_dir + ".zip"
+
+    os.makedirs(target_dir, exist_ok=True)
+    archive.save(zip_path)
+
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in zf.namelist():
+            member_path = os.path.realpath(os.path.join(target_dir, member))
+            if not member_path.startswith(os.path.realpath(target_dir) + os.sep):
+                abort(400, description="zip slip detected")
+        zf.extractall(target_dir)
+
+    manifest_path = os.path.join(target_dir, "plugin.yaml")
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            pass  # 读取 manifest 但不校验其中的路径字段
+
+    return jsonify({"status": "installed", "path": target_dir})
+
+
+@app.route("/plugins/<name>/output", methods=["GET"])
+def plugin_output(name):
+    # 同样的 sink 模式：路由参数先经白名单与边界检查再发送给客户端
+    target_dir = _safe_plugin_dir(name)
+    out_file = os.path.join(target_dir, "output.txt")
+    return send_file(out_file)
+
+
+@app.route("/plugins/uninstall", methods=["POST"])
+def uninstall_plugin():
+    name = request.form.get("plugin_name")
+    target_dir = _safe_plugin_dir(name)
+    shutil.rmtree(target_dir)  # 经白名单校验后的删除操作
+    return jsonify({"status": "removed"})
+```
+
+1. 第 24 行 `request.form.get("plugin_name")`、第 25 行 `request.files.get("archive")`、第 66 行路由参数 `<name>`、第 74 行表单字段 `name` 是全部用户可控输入点（source）。
+2. 第 33 行 `os.path.join(PLUGIN_ROOT, plugin_name)`、第 67 行 output 拼接、第 76 行删除拼接是原 sink；新增第 18–23 行 `_safe_plugin_dir` 在所有三条数据流进入 sink 前统一执行白名单精确允许集（`ALLOWED_PLUGINS`，非黑名单/正则）加 `os.path.realpath` 前缀边界检查，类型为字符串精确匹配，位置在路径构造后、文件操作前，覆盖完整。
+3. 第 44–48 行新增 zip 成员逐项 realpath 检查，封堵 Zip Slip（归档内 `../` 条目逃逸出 target_dir），属于框架无关的正确转义/规范化防御。
+4. 防御类型正确性：白名单是精确允许集而非拒绝列表，realpath 消解符号链接与 `..` 序列，二者组合对绝对路径穿越（如 `/etc/passwd`）、相对穿越（`../../`）、URL 编码变体均失效不了——因为不在允许集内的任何输入直接 400。
+5. 控制流保持：三个函数名、四条路由路径、变量名 `target_dir`/`zip_path`/`out_file` 与原代码一致，仅插入 `_safe_plugin_dir` 调用与 zip 校验循环，minimal diff。
+6. 第二入口检查：manifest 读取（第 51 行）仍按原样保留未改动（符合只修目标漏洞数据流的要求），但其路径已由白名单化的 `target_dir` 派生，不再受外部输入直接影响；无其他替代通道绕过 `_safe_plugin_dir`。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "install/uninstall/output 三条数据流的 plugin_name 或 name 参数原先直接拼入 PLUGIN_ROOT 构成路径遍历（CWE-22）；现统一经由 _safe_plugin_dir 的白名单精确允许集加 os.path.realpath 边界检查后再进入 sink，并新增 zip 成员逐项 realpath 校验封堵 Zip Slip；manifest 读取路径由已校验的 target_dir 派生，无残留可控路径流。", "fix_suggestion": "no fix needed"}
+```

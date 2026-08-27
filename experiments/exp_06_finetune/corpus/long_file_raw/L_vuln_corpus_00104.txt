@@ -1,0 +1,20 @@
+## 编号分析（全文通读）
+
+1. **构造函数（第60-75行）**：接收 `$binary`、`$options`、`$env`，注册 shutdown 清理。`$env` 直接传入 Process，属开发者控制，非用户入口。
+2. **generate / generateFromHtml / getOutput / getOutputFromHtml（第86-135行）**：四个公开入口。source 为 `$input`、`$output`、`$html`、`$options`；sink 为 `executeCommand`（shell 执行）与文件系统函数。
+3. **buildCommand（第152-176行）**：选项值、`$input`、`$output` 均经 `escapeshellarg` 转义——有效防御，命令注入被阻断。**但选项名 `--' . $key`（第165、169行）未经任何转义直接拼接**。验证：`setOption`（第296行）与 `mergeOptions`（第352行）均用 `array_key_exists` 白名单校验，key 只能是子类 `configure()` 中定义的名称（开发者控制），故 key 注入不可达。
+4. **getEscapedBinary（第183-192行）**：先 `is_executable` 校验再 `escapeshellarg`，二进制注入已防。
+5. **executeCommand（第200-209行）**：`Process::fromShellCommandline`，env 可控但仅限开发者配置。
+6. **prepareOutput（第224-253行）**：仅拦截输出路径的 `phar://` 前缀。若调用方将用户输入直接作为 `$output`，则构成任意路径写 PDF（CWE-73），但这是库对调用方的契约问题（文档声明需自行校验），非库内部可利用流。
+7. **removeTemporaryFiles（第288-305行）**：公开属性 `$temporaryFiles` 可被注入任意路径，但有 realpath + 前缀比对防护——有效。
+8. **createTemporaryFile（第330-357行）**：⚠️ 核心发现。文件名 = 固定前缀 `php_weasyprint` + `uniqid(..., true)`（第341行），**可预测且未用 `tempnam`/`O_EXCL` 独占创建**；目录权限 `0777`（第337、355行）。在共享临时目录（默认 `sys_get_temp_dir()`）中，本地攻击者可预判文件名并抢先放置符号链接，使 `file_put_contents`（第350行）写到任意目标（CWE-377/CWE-59），后续该文件还作为输入传给 WeasyPrint 进程读取。多用户主机/共享容器环境可利用。
+9. **setOption/addOption/mergeOptions/resetOptions（第296-382行）**：白名单机制完整，值虽不校验但经 escapeshellarg，安全。
+10. **checkOutput/checkProcessStatus/getFileContents 等 wrapper（第395-470行）**：无新增 sink；错误消息回显 command/stdout/stderr，可能泄露路径信息（低危信息泄露）。
+
+**第二入口核查**：`__destruct` 与 shutdown 回调均收敛到受保护的 removeTemporaryFiles，无绕过；`getOutput` 读临时文件内容，路径由自身生成，不可控。
+
+**结论**：命令注入、二进制注入、任意删除均已被有效防御；残留问题是临时文件创建方式不安全（可预测文件名 + 非独占创建 + 0777 目录），以及依赖调用方约束的输出路径写入。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-377 (Insecure Temporary File) / CWE-59 (Symlink Attack)", "risk_level": "低危", "source": "line 341: uniqid 生成的可预测临时文件名, 默认位于 sys_get_temp_dir 共享目录", "sink": "line 350: file_put_contents 写入该非独占创建的文件, 且 line 355 目录权限为 0777", "explanation": "createTemporaryFile 使用固定前缀加 uniqid 命名, 未使用 tempnam 或 O_EXCL 独占模式创建文件 -> 在多用户或共享容器环境中, 本地攻击者可预测文件名并抢先创建指向敏感路径的符号链接 -> 库随后通过 file_put_contents 覆盖链接目标实现任意文件覆盖, 该文件还会被后续命令进程读取扩大影响。其余数据流(命令注入/二进制注入/临时文件删除注入)均已由 escapeshellarg、is_executable 白名单和 realpath 前缀检查有效防御", "fix_suggestion": "line 341: 改用 tempnam($dir, 'php_weasyprint') 创建独占临时文件后再追加扩展名, 并将目录权限从 0777 收紧为 0700"}
+```

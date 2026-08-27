@@ -1,0 +1,62 @@
+LANG: java
+```java
+package com.example.web.config;
+
+import org.springframework.stereotype.Component;
+import org.springframework.web.servlet.HandlerInterceptor;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Set;
+
+@Component
+public class TemplateFetchInterceptor implements HandlerInterceptor {
+
+    // 模板白名单目录，本应限制在 /var/app/templates 内
+    private static final Path TEMPLATE_ROOT = Paths.get("/var/app/templates");
+
+    // 防御：白名单精确允许集（框架原生安全模式：显式枚举允许的模板名）
+    private static final Set<String> ALLOWED_TEMPLATES = Set.of(
+        "index.html", "login.html", "dashboard.html", "error.html"
+    );
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws IOException {
+        String templateName = request.getParameter("template");   // source: 外部输入入口
+        if (templateName == null) {
+            response.sendError(400, "missing template param");
+            return false;
+        }
+
+        // 防御：白名单精确匹配，拒绝任何不在允许集中的值（含 ../、....//、URL 编码变体）
+        if (!ALLOWED_TEMPLATES.contains(templateName)) {
+            response.sendError(403, "template not allowed");
+            return false;
+        }
+
+        // 拼接路径并读取文件：sink（此时 templateName 已被白名单约束）
+        Path target = TEMPLATE_ROOT.resolve(templateName).normalize();
+        byte[] content = Files.readAllBytes(target);
+
+        response.setContentType("text/plain");
+        response.getOutputStream().write(content);
+        return false;
+    }
+}
+```
+
+分析：
+
+1. 第 24 行是唯一用户可控输入点：`request.getParameter("template")` 直接取自 HTTP 请求参数，攻击者完全可控。
+2. 原代码第 29 行用 `replace("../", "")` 做黑名单式清洗，可被 `....//`、`..%2f` 等编码/嵌套变体绕过，属无效防御；随后第 32 行 `TEMPLATE_ROOT.resolve(sanitized)` 后直接 `Files.readAllBytes(target)` 构成任意文件读 sink。
+3. 修复在第 18-22 行插入白名单精确允许集 `ALLOWED_TEMPLATES`，并在第 31-34 行做精确匹配校验：类型正确性上，比较对象为原始字符串与常量集合，无解码歧义；位置正确性上，校验位于 source 之后、resolve/read sink 之前，覆盖完整数据流。
+4. 攻击面覆盖完整性：白名单采用全等匹配而非子串过滤，任何含路径分隔符、`..`、URL 编码或空字节的输入都无法命中允许集，直接返回 403，无法到达第 37 行的文件读取 sink。
+5. normalize 调用保留在 sink 前（第 38 行）作为纵深防御，但主防御已由白名单完成——即使 resolve 结果异常，normalize 后仍限于 TEMPLATE_ROOT 内且文件名来自固定集合。
+6. 第二入口检查：本类仅此一个 preHandle 入口，无其他请求字段参与数据流；响应写出通道不变。结论：无残留漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-22 路径穿越任意文件读：第 24 行 getParameter 为 source，经无效的 replace 黑名单清洗后于第 32 行 resolve 并 readAllBytes 构成 sink；修复采用白名单精确允许集全等匹配，位于 source 与 sink 之间，任何穿越载荷均被拒绝，数据流其余部分保持原样", "fix_suggestion": "line 18: 新增 ALLOWED_TEMPLATES 白名单集合，并在 line 31 对 templateName 做 contains 精确校验，未命中即返回 403"}
+```

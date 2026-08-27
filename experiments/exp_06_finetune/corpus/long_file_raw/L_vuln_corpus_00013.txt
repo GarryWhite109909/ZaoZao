@@ -1,0 +1,31 @@
+## 编号分析
+
+**入口点枚举（全文）**
+
+1. **第 41 行 `details(request, slug)`**：slug 来自 URL 路由；`request.META['QUERY_STRING']`（第 76、131 行）被拼接到 `redirect_url` 后。redirect_url 来源为 `page.get_redirect()`（管理员在后台配置）或内部计算出的 `page_path`，均为站内路径，且经 `_clean_redirect_url`（第 27–33 行）只对以 `/` 开头的值加语言前缀。QUERY_STRING 原样拼接只影响查询串，不改变跳转目标 host——非开放重定向。
+2. **缓存分支（第 47–60 行）**：`get_page_cache` 返回服务端生成内容，无用户输入直接进 sink。
+3. **小写 slug 重定向（第 70–78 行）**：`reverse()` 生成的 URL 为站内绝对路径，安全。
+4. **第 118–127 行 `login(request)`**：source 是 `request.GET[REDIRECT_FIELD_NAME]`（第 119 行）。防御为 `url_has_allowed_host_and_scheme(url=redirect_to, allowed_hosts=request.get_host())`（第 121 行）。注意：Django 的该函数当 `allowed_hosts` 非空时要求 URL 的 host 必须匹配——但**相对 URL（如 `//evil.com`）会被拒绝**吗？`//evil.com` 的 netloc 为 evil.com，不在 allowed_hosts 中，会被拒。然而这里传的是 `request.get_host()` 单个主机；若站点部署在 Host 头可被伪造的环境（无 ALLOWED_HOSTS 保护时），攻击者可通过污染 Host 使校验通过，实现开放重定向。但在 Django 正常配置下（ALLOWED_HOSTS 强制），此校验有效。此外 `quote(redirect_to)` 只做编码，不影响安全性。结论：常规部署下非漏洞，属于依赖部署配置的弱点。
+5. **第 134 行起 `render_object_structure(request, content_type_id, object_id)`**：source 为 URL 参数 `content_type_id`/`object_id`。通过 ContentType 反查任意模型并按 pk 取对象（第 141、146 行），随后直接渲染 `cms/toolbar/structure.html` 并暴露对象内容（第 149–154 行）。**全文未见任何权限检查**：没有 `request.user.is_staff` / `has_view_permission` / login_required 装饰器。任何匿名用户可枚举 content_type_id + object_id 读取未发布草稿（PageContent._base_manager 包含草稿）、其他模型数据。
+6. **第 176 行起 `render_object_endpoint(...)`**：同样无认证/授权检查。虽有 `is_editable_model` 与 `toolbar_enabled_models` 白名单（第 226 行），但这只是"哪些模型可渲染"的白名单，不是访问控制；`require_editable=False` 的 preview 端点（第 246 行）连编辑性检查都没有。第 180–183 行取 PageContent 用 `admin_manager`（含草稿），未发布内容可被匿名读取。第 190–196 行还会把请求转发给 apphook 视图。第 231–233 行将对象的 `redirect` 字段写入 toolbar.redirect_url，间接可控响应。
+7. **第 242–246 行 `render_object_preview`**：`require_editable=False`，是替代通道，绕过 edit 端点的 editable 检查。
+
+**source→sink 汇总**
+
+- 流 A：URL 参数 object_id/content_type_id → `ContentType.objects.get_for_id` → `.get(pk=object_id)`（第 141/146、180/205 行）→ TemplateResponse 渲染（第 154、239 行）：**越权读取（IDOR/缺失授权）**，黑名单式白名单（toolbar_enabled_models）不能替代权限检查。
+- 流 B：GET redirect_to → HttpResponseRedirect（第 128 行）：有 host 校验，正常部署下有效。
+- 流 C：QUERY_STRING 拼接 redirect_url（第 131 行）：目标受控于站内页面配置，非开放重定向。
+
+真实漏洞即 django-cms 已知的 CVE-2024-27679 类问题：preview/structure 端点缺少权限检查导致未发布内容泄露。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-862 Missing Authorization / CWE-639 IDOR",
+  "risk_level": "high",
+  "source": "line 134 and line 176: URL parameters content_type_id, object_id",
+  "sink": "line 154 and line 239: rendering of arbitrary fetched objects via TemplateResponse / render_func without permission checks",
+  "explanation": "render_object_structure and render_object_endpoint fetch any model instance by attacker-controlled content_type_id and object_id using draft-inclusive managers such as PageContent._base_manager at line 141 and admin_manager at line 180, then render its content. No authentication or authorization check exists anywhere in these functions; the toolbar_enabled_models whitelist at line 226 only limits which models are renderable, not who may read them. An anonymous user can enumerate ids to read unpublished page drafts and other registered models; render_object_preview at line 245 further bypasses the editable check via require_editable=False.",
+  "fix_suggestion": "Add explicit permission enforcement inside render_object_structure and render_object_endpoint, e.g. verify request.user.is_staff and model-level view/change permission for the fetched object before rendering, and restrict PageContent lookups to published content unless the user has draft-view permission."
+}
+```

@@ -1,0 +1,60 @@
+# Shopware Context 类安全分析
+
+## 一、文件性质判定
+
+本文件是 `Shopware\Core\Framework\Context`（第 12 行），一个纯领域模型/值对象类，不是 HTTP 控制器或路由入口。它不包含任何直接接收用户输入的代码，但作为贯穿全框架的上下文对象，其内部逻辑的正确性直接影响权限与规则判定，因此仍需逐函数审计。
+
+## 二、逐函数枚举与分析
+
+### 1. 构造函数（第 39–62 行）
+- 入口点：`ContextSource $source`、`$ruleIds`、`$currencyId`、`$languageIdChain`、`$versionId`、`$currencyFactor`、`$taxState`、`$rounding`。这些参数在真实调用链中多来自请求解析层（如 SalesChannel context 工厂），属于间接 source。
+- 第 52–54 行：仅当 `$source instanceof SystemSource` 时设置 SYSTEM_SCOPE——正确，不会因外部传入伪造 scope 字符串而提权。
+- 第 56–61 行：`array_filter($languageIdChain)` 去空 + `array_flip(array_keys(...))` 去重，保证非空数组。注意：**没有验证元素是否为合法 UUID**。若上游未校验，恶意 languageId 可进入 DAL 查询条件；但 DAL 使用预编译 SQL 参数绑定，不构成 SQL 注入 sink，最多导致查不到数据。
+- 无危险 sink（无 eval、无文件操作、无反序列化）。
+
+### 2. createDefaultContext（第 65–70 行）
+- 仅接受可选的 `ContextSource` 类型化参数，默认 SystemSource。无外部字符串直通，无漏洞。
+
+### 3. getSource / getVersionId / getLanguageId / getCurrencyId / getCurrencyFactor / getRuleIds / getLanguageIdChain（第 72–103 行）
+- 纯 getter。getRuleIds 返回原始数组——若调用方将其拼入日志或 HTML 而不做转义，是调用方问题；本类内无 sink。
+
+### 4. createWithVersionId（第 105–121 行）
+- 将现有字段复制进新实例，`$versionId` 为 string 直通。versionId 在 DAL 中作为参数绑定使用，且上游 VersionService 会校验存在性。本函数自身无过滤也无 sink，防御责任在上游；不构成本文件的独立漏洞。
+
+### 5. scope()（第 123–140 行）
+- 接受任意 string `$scope` 并临时覆盖。scope 用于内部逻辑分支（如 system scope 判断），不是权限判定依据本身；真正的权限判定走 isAllowed→AdminApiSource。try/finally 保证恢复，无状态泄漏型漏洞。
+
+### 6. getScope / considerInheritance / setConsiderInheritance / getTaxState / setTaxState（第 142–160 行）
+- setTaxState 未白名单校验（应限 GROSS/NET/FREE）。恶意 taxState 可能影响税费计算逻辑分支，但 CartPrice 计算端有枚举匹配兜底，未知值落入默认分支，属低危健壮性问题而非可利用漏洞。
+
+### 7. isAllowed（第 162–168 行）— 关键权限点
+- 仅当 source 是 AdminApiSource 时委托其 isAllowed，否则返回 true。这是设计意图：SalesChannel/System 来源本就不受 ACL 限制，ACL 只管 Admin API。第二入口检查：若攻击者能注入伪造 AdminApiSource？该对象只能由内核鉴权流程构造，token 解析后生成，外部无法通过 HTTP 参数直接指定 source 实例。无可利用路径。
+
+### 8. setRuleIds（第 170–177 行）
+- 防御：第 172–174 行 rulesLocked 检查抛 ContextRulesLockedException，防止销售渠道上下文规则在请求中途被篡改（防购物车规则绕过）。`array_filter(array_values())` 清理空值。这是有效的状态机防御。残余风险：未去重、未校验 UUID 格式，但 ruleIds 匹配走数据库 IN 绑定查询，无注入面。
+
+### 9. enableInheritance / disableInheritance（第 179–205 行）
+- 模板方法模式，临时切换 considerInheritance 标志。无输入 sink。
+
+### 10. getApiAlias / getRounding / setRounding / lockRules（第 207–221 行）
+- lockRules 与 setRuleIds 的锁配合构成完整防御对；setRounding 类型强制为 CashRoundingConfig，无法注入任意数据。
+
+## 三、Source→Sink 数据流汇总
+
+| 流 | source | sink | 防御 | 结论 |
+|---|---|---|---|---|
+| languageIdChain → DAL 查询 | 请求头 sw-language-id 等 | SQL 条件 | 参数绑定 + 上游 UUID 校验 | 安全 |
+| ruleIds → 规则匹配 | 上下文构建 | DB IN 查询 | 参数绑定 + rulesLocked 锁 | 安全 |
+| versionId → DAL | API 版本机制 | SQL | 参数绑定 | 安全 |
+| taxState → 价格计算 | 上下文工厂 | 分支逻辑 | 枚举兜底 | 低危健壮性 |
+| scope → 内部判断 | scope() 调用方 | 分支 | 不用于鉴权 | 安全 |
+
+替代通道检查：无文件上传、无反序列化（extensions 虽标注 #[Ignore] 不参与序列化输出，但 Struct 反序列化由框架类型映射控制）、无命令执行、无 SSRF 面。
+
+## 四、结论
+
+全文未发现可利用漏洞。仅有两处健壮性建议：taxState 白名单校验、languageIdChain/ruleIds 的 UUID 格式校验（纵深防御）。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "该文件为 Shopware 的 Context 值对象类，不含直接用户输入入口或危险 sink。所有外部可控值如 languageIdChain、ruleIds、versionId 最终进入 DAL 时均经参数绑定，无 SQL 注入面；isAllowed 正确地将 ACL 判定委托给 AdminApiSource，伪造 source 无法通过 HTTP 注入；setRuleIds 受 rulesLocked 状态锁保护防止规则中途篡改；SystemSource 才能获得 SYSTEM_SCOPE，避免 scope 提权。仅有 taxState 缺少枚举白名单和 ID 缺少格式校验两处低危健壮性改进点，不构成可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

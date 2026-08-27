@@ -1,0 +1,48 @@
+## 编号分析
+
+1. **第 1–15 行（入口/初始化）**：构造函数加载 pg 驱动，读取 `sequelize.config.native`、`sequelize.config.port`。配置来自应用层传入的 Sequelize 实例配置，属于受信任程度取决于调用方的输入。
+
+2. **第 17–66 行 `_refreshTypeParser`**：仅操作内部 OID 映射表与类型解析器，数据来自数据库系统目录查询结果（第 224 行起），无用户可控字符串进入 SQL，安全。
+
+3. **第 68–71 行 `_clearTypeParser` / 第 73–77 行 `getTypeParser`**：纯内存 Map 查找，无 sink。
+
+4. **第 79–135 行 `connect` 配置组装**：`_.pick(config.dialectOptions, [...])` 白名单挑选连接选项（ssl、options、stream 等），直接交给 pg Client。这是配置面而非注入点；白名单本身限制了可传递键，但 `options` 键可携带任意 Postgres 会话参数——这属于有意设计的能力（需持有数据库凭据者才能设置），不算独立漏洞。
+
+5. **第 137–190 行 连接事件处理**：`parameterHandler` 处理服务器返回的 `server_version`、`standard_conforming_strings`，仅存内存标志，不拼接 SQL，安全。
+
+6. **第 191–200 行**：错误分类包装，无 sink。
+
+7. **★ 第 205–208 行 `standard_conforming_strings` 处理**：若服务器未开启则发送固定字符串 `SET standard_conforming_strings=on;`，常量拼接，不可注入。
+
+8. **★ 第 216–221 行 `client_min_messages` 注入点（sink）**：
+   ```js
+   const clientMinMessages = config.dialectOptions && config.dialectOptions.clientMinMessages || ... || 'warning';
+   query += `SET client_min_messages TO ${clientMinMessages};`;
+   ```
+   `config.dialectOptions.clientMinMessages` 直接模板字符串拼入 SQL，无任何校验/转义。source 是应用传入的 dialectOptions 配置。虽然通常由开发者配置，但在多租户/SaaS 场景下若该值来自租户可控配置或环境变量，攻击者可注入如 `warning; DROP TABLE x;--` 造成 SQL 注入（CWE-89）。防御缺失：无正则校验、无参数化。
+
+9. **★ 第 223–230 行 `timezone` 注入点（sink）**：
+   ```js
+   query += `SET TIME ZONE '${this.sequelize.options.timezone}';`;
+   ```
+   唯一“防御”是 `momentTz.tz.zone(...)` 判断是否为合法时区名——但这只是分流到两个分支，**两个分支都直接插值**：非法时区名会落入 INTERVAL 分支同样被拼接。单引号包裹可被 `'` 闭合绕过，例如 timezone 为 `UTC'; DROP TABLE users;--` 时生成 `SET TIME ZONE 'UTC'; DROP TABLE users;--'`。黑名单式/存在性检查不构成有效防御。
+
+10. **第 231–238 行 动态 OID 刷新触发**：条件判断后调用 `_refreshDynamicOIDs`，查询语句为硬编码常量（第 244–254 行），安全。
+
+11. **第 240–283 行 `_refreshDynamicOIDs`**：SQL 全为字面量；结果行仅写入内存映射，随后 `refreshTypeParser` 使用。注意第 258 行 `row.typname` 作为对象键来自数据库目录，理论上恶意数据库名可造成原型污染键如 `__proto__`，但前提是已连接受控数据库，风险极低且非本文件主漏洞。
+
+12. **第二入口核查**：`disconnect`/`validate` 无外部输入；`getTypeParser` 被 pg 库回调调用但只做查表。全文唯一 source→sink 流即第 8、9 步所述的配置项→SQL 字符串拼接。
+
+13. **结论**：存在真实漏洞——对应 Sequelize 历史 CVE-2023-22578 类问题（postgres 方言连接初始化 SQL 拼接）。主要可利用点是 `timezone` 与 `clientMinMessages` 未转义插值。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-89 (SQL Injection via unescaped string interpolation in connection setup)",
+  "risk_level": "中高",
+  "source": "line 217: config.dialectOptions.clientMinMessages 以及 line 224: this.sequelize.options.timezone, 均来自应用层传入的连接配置",
+  "sink": "line 220: query += SET client_min_messages TO ${clientMinMessages}; 以及 line 227/229: SET TIME ZONE ...${this.sequelize.options.timezone}... 直接模板字符串拼接进 SQL 后于 line 237 由 connection.query 执行",
+  "explanation": "connect 函数将用户可配置的 clientMinMessages 和 timezone 未经校验或转义直接拼接到初始化 SQL 中 -> momentTz.tz.zone 仅用于分支选择而非过滤, 两个分支均执行插值, 单引号可被闭合 -> 若这些配置项来自多租户配置/环境变量等间接可控通道, 攻击者可通过 timezone 值如 UTC'; DROP TABLE x;-- 注入任意 SQL",
+  "fix_suggestion": "对 line 217-230 的 clientMinMessages 与 timezone 使用白名单校验(如仅允许 /^[A-Za-z0-9_+\\-:\\/]+$/) 或改用参数化查询/pg 的 escapeIdentifier 类工具进行转义后再拼接"
+}
+```
