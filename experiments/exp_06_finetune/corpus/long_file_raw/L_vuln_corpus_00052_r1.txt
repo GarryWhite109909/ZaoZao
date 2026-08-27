@@ -1,0 +1,31 @@
+# 编号分析（全文逐函数）
+
+**1. 入口点枚举（全文）**
+- 第 12–24 行 `backupContent`：入口参数为 options `include`、`filename`，第 21 行将 `frame.options.withRelated` 合入 include 后传入 `dbBackup.backup(frame.options)`。
+- 第 25–50 行 `exportContent`：options 同上；第 31–37 行当 `frame.options.filename` 存在时调用 `dbBackup.readBackup(frame.options.filename)`——这是本文件最关键的 source→sink 数据流。
+- 第 51–72 行 `importContent`：source 为 `frame.file`（上传文件），sink 为第 71 行 `importer.importFromFile(frame.file, ...)`。
+- 第 73–87 行 `inlineMedia`：source 为 `frame.data.domains`，sink 为第 86 行 `mediaInliner.api.startMediaInliner(frame.data.domains)`。
+- 第 88–121 行 `deleteAllContent`：无外部参数，纯内部事务删除。
+
+**2. 逐条数据流防御验证**
+
+- **流 A（第 32 行 → 第 33 行）**：`frame.options.filename` 直接作为实参传给 `readBackup`。该 controller 层的 `validation` 块（第 28–33 行）只校验了 `include` 的取值白名单，对 `filename` **没有任何格式/路径校验、无正则约束、无目录限制**。若下游 `readBackup` 仅做简单的路径拼接（如 `path.join(backupDir, filename)`），攻击者可用 `../../` 序列穿越到备份目录之外读取任意文件。黑名单式过滤不存在，等于零防御。此即 Ghost 历史 CVE（db 导出接口任意文件读取）的形态。
+- **流 B（第 71 行 importFromFile）**：`frame.file` 来自 multipart 上传，importer 内部有解压与内容解析，风险主要取决于 importer 实现；controller 层未见额外校验，但主要防线在 importer 内部，此处不判定为直接漏洞。
+- **流 C（第 86 行 startMediaInliner(frame.data.domains)）**：domains 完全由请求方控制，媒体内联器会向这些域名发起 HTTP 请求，存在 SSRF 面；但第 78 行权限绑定到 `importContent`（仅管理员可调用），且属于第二入口/替代通道，风险降级。
+- **流 D（backupContent / deleteAllContent）**：include 有 `values: exporter.BACKUP_TABLES` 白名单（第 19–22 行），属有效防御；deleteAllContent 无用户输入。
+
+**3. 第二入口确认**：`exportContent` 同时支持默认导出分支（第 39–43 行）与 filename 分支（第 31–37 行）；filename 分支是绕过导出逻辑直接读文件的替代通道，且 `permissions: true` 仅要求具备 db 导出权限的已认证用户（如管理员/被降权账号），不构成对路径穿越的防御。
+
+**4. 结论**：唯一成立的高危漏洞是流 A——`filename` 未净化直达文件读取 sink。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 路径穿越导致任意文件读取",
+  "risk_level": "高危",
+  "source": "line 31-32: frame.options.filename 由 API 请求方完全可控",
+  "sink": "line 33: dbBackup.readBackup(frame.options.filename)",
+  "explanation": "exportContent 的 validation 只对 include 做了 values 白名单校验, 对 filename 没有任何路径规范化或目录限定; 攻击者传入形如 ../../etc/passwd 或 ../../content/data/ghost-local.db 的 filename 即可穿越备份目录读取服务器任意可读文件, permissions true 仅要求已认证的管理类角色, 不阻止路径穿越",
+  "fix_suggestion": "line 31-33: 在调用 readBackup 前用 path.basename 提取纯文件名并校验扩展名, 再用 path.resolve 后断言结果仍位于备份根目录内, 否则抛出 ValidationError"
+}
+```

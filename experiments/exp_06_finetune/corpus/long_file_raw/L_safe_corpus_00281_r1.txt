@@ -1,0 +1,41 @@
+## 编号分析（全文逐函数）
+
+1. **第 1–9 行**：引入 got/net/dns/errors/config/validator。入口点为模块导出的 `externalRequest`（got 实例），所有 SSRF 防御集中在 got 的 hooks 中。
+
+2. **第 12–24 行 `normalizeIPv4`**：用 WHATWG URL 解析器把十进制/八进制/十六进制/整数形式的 IPv4 归一化为点分十进制，再由 `net.isIPv4` 严格校验。这是对经典绕过手法（如 `2130706433`、`0x7f000001`）的有效防御。
+
+3. **第 27–41 行 `normalizeIPv6`**：同样用 URL 解析器归一化 IPv6，防御 `[::ffff:127.0.0.1]` 等展开形式。
+
+4. **第 44–100 行 `isPrivateIPv4`**：覆盖 10/8、172.16/12、192.168/16、127/8、169.254/16、100.64/10、198.18/15、0/8、240/4。范围判断基于已归一化的点分地址，逻辑正确，无遗漏常见内网段。
+
+5. **第 102–163 行 `isPrivateIp`**：
+   - 第 106 行空值 fail-closed；
+   - 第 109–117 行处理 `::ffff:x.x.x.x` 点分映射；
+   - 第 120–129 行处理 `::ffff:7f00:1` 十六进制映射；
+   - 第 132–136 行先走 IPv4 归一化路径；
+   - 第 138–160 行处理 IPv6：loopback/unspecified/fc00::/7/fe80::/10，并对归一化后的 v4-mapped 形式二次检查；
+   - 第 162 行未识别格式 fail-closed。
+   该函数对格式混淆类绕过防御充分。
+
+6. **第 165–187 行 `errorIfHostnameResolvesToPrivateIp`（核心 sink 前守卫）**：
+   - 第 167–169 行 development 环境直接放行——生产环境不触发，属可接受配置项；
+   - 第 171–174 行与站点自身 URL 比较——host 含端口比较，仅放行 Ghost 自身，合理；
+   - **第 176 行 `dnsPromises.lookup(options.url.hostname)` 默认 `{all:false}` 只取一条解析结果**；若域名返回多条 A 记录（一公一私），可能取到公网记录而实际连接到私网记录；
+   - **TOCTOU/DNS rebinding**：此处查询结果并未固定（无 pinning），got 在 hook 之后真正建连时会再次独立解析，两次解析之间 DNS 可被重绑定指向 127.0.0.1/169.254.169.254。beforeRedirect hook（第 193 行）只覆盖重定向链，不能防首次请求的 rebinding。
+
+7. **第 189–200 行 `errorIfInvalidUrl`**：hostname 存在性 + validator.isURL 校验，辅助过滤畸形输入，非安全主防线但无害。
+
+8. **第 202–208 行 `disableRetries`**：仅测试环境禁用重试并设超时，无安全问题。
+
+9. **第 210–222 行 gotOpts 装配**：
+   - `beforeRequest: [errorIfInvalidUrl, errorIfHostnameResolvesToPrivateIp]`（第 217 行）覆盖初始请求；
+   - `beforeRedirect: [errorIfHostnameResolvesToPrivateIp]`（第 218 行）覆盖重定向链每一跳——重定向到 `file:`/其他协议由 got 自身协议限制兜底；
+   - 未设置 `lookup` 自定义解析器做 IP pinning，也未用 `{all:true}` 检查全部记录。
+
+## 结论
+
+代码对格式混淆（进制变体、IPv4-mapped IPv6）、重定向跳转均有系统性防御且 fail-closed，整体质量高。剩余风险为：(a) DNS rebinding TOCTOU（hook 校验与 got 实际连接间未 pinning IP）；(b) 多 A 记录场景下 `lookup` 仅校验单条结果。这两者属于已知难完全消除的残余面，需通过自定义 `lookup` 选项在连接层复用同一解析结果才能根治；就本文件而言可判定存在低风险缺陷而非可直接利用的高危漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "SSRF（DNS rebinding / TOCTOU 残余风险）", "risk_level": "low", "source": "第 217-218 行 hooks 接收的外部请求 URL（options.url）", "sink": "got 发起的对外 HTTP 连接", "explanation": "全文通读后确认：normalizeIPv4/isPrivateIp 对进制混淆和 IPv4-mapped IPv6 的防御有效且 fail-closed，beforeRedirect 覆盖了重定向链。但第 176 行 dnsPromises.lookup 默认只返回单条解析结果且未将 IP 固定到后续连接，校验与 got 实际建连之间存在时间窗，攻击者可通过 DNS rebinding 使首连命中内网地址（如 127.0.0.1 或云元数据 169.254.169.254）；多 A 记录场景下也可能只校验到公网记录。development 环境旁路与 siteUrl host 放行均为合理设计，不构成漏洞。", "fix_suggestion": "通过 got 的 lookup 选项注入自定义解析器：使用 dnsPromises.lookup(hostname, {all: true}) 获取全部地址并逐一执行 isPrivateIp 校验，同时将校验通过的 IP 固定传给底层 socket 建连，消除校验与连接之间的二次解析窗口。"}
+```

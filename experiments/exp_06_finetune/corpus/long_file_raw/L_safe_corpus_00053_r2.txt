@@ -1,0 +1,44 @@
+## 编号分析（全文逐函数）
+
+**1. 入口点枚举（第 1–10 行依赖与工具函数）**
+- 文件导出类 `PreviousMap`（末尾 `module.exports`），入口点为：构造函数接收的 `css` 字符串、`opts.from`、`opts.map`（含 `prev` 回调/对象）、以及 CSS 内嵌的 `/* # sourceMappingURL= */` 注释。
+- 外部可控 source 归纳为三类：(a) CSS 文本中的注释内容；(b) 注释指向的 `.map` 文件路径；(c) 调用方显式传入的 `prev`。
+
+**2. `fromBase64`（第 5–11 行）**
+- 仅做 base64 解码，sink 是字符串转换，无文件系统或代码执行 sink。无漏洞。
+
+**3. 构造函数（第 14–28 行）**
+- 第 15 行 `opts.map === false` 提前返回；第 16 行 `unsafeMap` 是调用方显式的信任声明；第 17 行解析注释；第 21 行加载 map。数据流：css→annotation→loadMap→loadFile→readFileSync。防御见第 6 步。
+
+**4. `decodeInline`（第 38–56 行）**
+- 四个白名单正则严格限定 `data:application/json[,;charset=utf-8][;base64],` 前缀，随后解码。这是**白名单**而非黑名单，且输出仅进入 `JSON.parse` / `SourceMapConsumer`（内存内解析），不触达文件系统或 eval。无路径穿越面。
+
+**5. `getAnnotationURL` / `isMap`（第 58–72 行）**
+- `getAnnotationURL` 只剥离前缀并 trim，返回值后续仅用于 `join(dirname(file), map)` 与 `loadFile` 的路径检查；`isMap` 是类型判断。均非 sink。
+
+**6. `loadAnnotation`（第 74–88 行）—— 关键 source**
+- 用正则找到最后一个 sourceMappingURL 注释，截取到 `*/` 之间作为 annotation。攻击者可注入任意相对/绝对路径（如 `../../etc/x.map` 或 `/abs/path.map`）。此为第一入口。
+
+**7. `loadFile`（第 90–105 行）—— 核心防御**
+- 第 91 行：非信任模式下要求路径以 `.map` 结尾（大小写不敏感）；
+- 第 94–97 行：用 `relative(dirname(cssFile), path)` 计算相对路径，若为 `..`、以 `..+sep` 开头、或是绝对路径则拒绝读取。
+- 这是基于 `path.relative` 的规范化比较，不是黑名单/正则黑名单过滤，属于有效防御：`../../secret.map` 会得到以 `../` 开头的 rel 而被拦截；绝对路径 `isAbsolute(rel)` 拦截。Windows 下 `sep` 为 `\` 同样覆盖。替代编码（如 `%2e%2e`）在此无效，因为 annotation 不经 URL 解码，直接是文件名字符串，`join` 后仍被 `relative` 规范化比对。
+- 唯一绕过通道是 `trusted=true` 或 `unsafeMap`（第 16 行），但两者均为开发者显式传入，属受信任配置而非外部输入。
+
+**8. `loadMap`（第 107–147 行）**
+- `prev` 为字符串时直接返回（第 113 行）——source 是调用方自身传入的 API 参数，等价于直接给库内容，不属于跨信任边界。
+- `prev` 为函数时（第 116–125 行）：回调返回路径后以 `trusted=true` 调 `loadFile`——同样是调用方显式授权。
+- 第 128–131 行：annotation 分支先 `join(dirname(file), annotation)` 再走 `trusted=false` 的 `loadFile`，即受第 7 步防御保护。
+- 第 133–136 行：读到的内容经 `JSON.parse`（去掉 `)]}'` 前缀），失败仅返回 undefined，无原型污染写操作、无动态执行。
+
+**9. 第二入口与替代通道核查**
+- inline data URI 通道：被 `decodeInline` 白名单约束，且不触达 readFileSync。
+- `prev` 对象/Generator 通道：仅序列化为字符串，无 sink。
+- 无环境变量、子进程、网络入口；全文唯一危险 sink 是第 104 行 `readFileSync(path)`，其所有到达路径要么经过 `relative` 防御检查，要么来自显式信任标志。
+
+**10. 结论**
+该版本已包含针对历史 CVE-2023-44270（sourceMappingURL 相对路径穿越读取任意 `.map`）的修复（`relative` + `..` 前缀 + 绝对路径三重检查）。在默认（非 unsafeMap）配置下未发现可利用的 source→sink 数据流。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文唯一敏感 sink 是 loadFile 第 104 行的 readFileSync。可达路径有三条：inline data URI（被 decodeInline 第 39-42 行的白名单正则限制且不触达文件系统）、annotation 相对路径（经 join 后在第 94-97 行由 path.relative 结果做 .. 前缀与绝对路径三重校验，属规范化比较而非可绕过的黑名单）、以及调用方显式传入的 prev 回调或 unsafeMap/trusted 标志（属同信任边界的显式授权）。历史 CVE-2023-44270 的路径穿越问题在本版本已被上述修复覆盖，未发现可利用数据流。", "fix_suggestion": "no fix needed"}
+```

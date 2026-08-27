@@ -1,0 +1,27 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：本控制器共 3 个公开方法：`index()`（第 33 行）、`getComments()`（第 38 行）、`saveCommentEdit()`（第 55 行）；私有辅助 `__report_for_spam()`（第 152 行）仅被内部调用。数据来源均为 `$request`（`all()`、`get()`）。类继承 `AdminController`，默认有后台认证中间件，故为已认证后台接口。
+
+2. **getComments（第 38–54 行）**：`$request->all()` 传入 Eloquent 的 `filter($filter)`（第 45 行），该 scope 通常按白名单字段构建 where 条件；`paginate/appends` 使用查询构建器参数绑定。未发现直接拼接 SQL 的 sink，此路径无有效注入点。
+
+3. **saveCommentEdit — 大规模赋值/字段覆盖（第 60 行起）**：`$data = $request->all();` 后仅做少量逻辑修正，最终第 148 行 `mw()->database_manager->save('comments', $data)` 将请求中任意键写入 comments 表。攻击者（后台低权限用户或被 CSRF 的管理员会话）可注入/覆盖任意列：如 `is_moderated=0` 绕过审核、伪造 `created_by`/`user_id`、篡改 `rel_id`/`rel_type` 将评论挂到任意内容上、写入 `user_ip`/`comment_email` 等本应由服务端生成的字段。第 88–96 行的校验只检查 `rel_type/rel_id` 是否存在，不限制其他字段。
+
+4. **saveCommentEdit — 存储型 XSS 链（第 133–145 行）**：`comment_body` 经 `HTMLClean::onlyTags()` 清洗（第 137 行），随后若 `format == 'markdown'` 再经 `Markdown::convertToHtml()`（第 141 行）。清洗在前、Markdown 渲染在后，Markdown 可重新引入原始 HTML 或危险链接协议（如 `[x](javascript:...)`），且第 144 行强制 `allow_html = '1'`，前端将按 HTML 渲染——基于黑名单/标签过滤的防御视为可绕过，构成存储型 XSS，受害者为查看评论的后台用户。
+
+5. **delete 分支（第 110–114 行）**：`intval($data['id'])` 强制转型后删除，无越权问题（后台操作），无注入。
+
+6. **__report_for_spam（第 152 行起）**：上报 URL 为硬编码常量（第 156 行），POST 数据来自数据库中已有评论字段，非用户可控 URL，不构成 SSRF；但会把评论者 IP/邮箱等 PII 发往第三方服务（隐私问题，非漏洞主体）。
+
+7. **第二通道核查**：`reply_to_comment_id` 分支（第 66–79 行）从库内取 `rel_type/rel_id`，属安全做法；`action` 分支经 `strtolower` + switch 白名单，安全。主要风险集中在第 3、4 条所述两条数据流。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "mass_assignment_and_stored_xss",
+  "risk_level": "high",
+  "source": "$request->all() in saveCommentEdit",
+  "sink": "mw()->database_manager->save at line 148 and comment_body rendered as HTML with allow_html=1",
+  "explanation": "saveCommentEdit passes the entire request array to the database save layer without a field whitelist, allowing arbitrary column injection or override on the comments table such as is_moderated, created_by, rel_id, enabling moderation bypass and record tampering. Additionally comment_body is cleaned by HTMLClean::onlyTags before Markdown conversion, so Markdown rendering can reintroduce dangerous markup, and allow_html is forced to 1, resulting in stored XSS against admin users viewing comments.",
+  "fix_suggestion": "Use an explicit whitelist of allowed fields before saving, force server-side values for is_moderated, created_by, user_ip, rel_id and rel_type, convert Markdown before sanitizing or sanitize after all transformations with an allowlist-based cleaner, and re-evaluate forcing allow_html to 1."
+}
+```

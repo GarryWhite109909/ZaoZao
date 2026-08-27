@@ -1,0 +1,63 @@
+# Ghost mobiledoc 库安全分析（全文逐函数）
+
+## 1. 文件概览与入口点枚举
+
+本文件是 Ghost CMS 的 `server/lib/mobiledoc.js`，导出对象包含以下成员（即全部潜在入口/出口）：
+
+1. `blankDocument` getter —— 纯静态数据，无外部输入；
+2. `cards` getter —— 惰性初始化卡片工厂，含 `canTransformImage` 回调；
+3. `atoms` getter —— 仅 require 包；
+4. `mobiledocHtmlRenderer` getter —— 渲染器初始化，含 `unknownCardHandler` 回调；
+5. `render(mobiledoc, options)` —— 接收外部 mobiledoc JSON 的主渲染入口；
+6. `htmlToMobiledocConverter` getter —— HTML→mobiledoc 转换器，读取 `process.env.CI`；
+7. `populateImageSizes(mobiledocJson)` —— 接收外部 mobiledoc JSON 字符串的第二个入口；
+8. `reload()` —— 测试辅助，仅置空缓存。
+
+## 2. 逐函数 source→sink 分析
+
+### 2.1 blankDocument getter
+第 8–19 行：返回硬编码字面量。无 source、无 sink。**无风险**。
+
+### 2.2 cards getter 与 canTransformImage 回调
+第 21–50 行：`canTransformImage(storagePath)` 中 `storagePath` 来自内部存储层调用链，非用户直接输入；其用途仅为 `path.parse` 取扩展名并做布尔判断（第 31–36 行），不进入文件系统写路径或命令执行 sink。`require('@tryghost/image-transform')` 是固定包名，非动态拼接。**无风险**。
+
+### 2.3 atoms getter
+第 52–54 行：静态 require。**无风险**。
+
+### 2.4 mobiledocHtmlRenderer getter 与 unknownCardHandler
+第 56–71 行：`unknownCardHandler(args)` 中 `args.env.name` 被拼入错误消息字符串（第 64 行）。该值来自 mobiledoc 卡片名，理论上可被攻击者控制——但 sink 是 `logging.error`（日志记录），不是 HTML 输出、SQL、eval 或 shell。日志注入最多造成日志污染，且 Ghost 日志为结构化 JSON 记录，风险极低，不构成可利用漏洞。**低危/不计**。
+
+### 2.5 render(mobiledoc, options)
+第 73–75 行：将 mobiledoc 交给 `@tryghost/kg-mobiledoc-html-renderer` 渲染。这是核心 XSS 关注点：mobiledoc 格式本身不含原始 HTML section（HTML 由 markups 白名单 + cards 序列化生成），未知卡片走 `unknownCardHandler` 只记日志不输出内容。真正的 HTML 净化由上游（如 `kg-mobiledoc-html-renderer` 及 card factory 的序列化器）负责；本文件未引入任何绕过逻辑，也未把用户输入直接拼进 HTML 字符串。**本文件范围内无可达 XSS sink**。
+
+### 2.6 htmlToMobiledocConverter getter
+第 77–97 行：唯一的环境变量读取是 `process.env.CI`（第 81、86 行），仅用于 `console.time/timeEnd` 性能计时标签，标签为常量字符串。env 值未被读取进任何 sink。catch 分支返回抛错函数，err 对象传入 errors 构造器用于日志。**无风险**。
+
+### 2.7 populateImageSizes —— 第二入口重点审查
+
+这是第二个接收外部数据的入口（第 99–152 行），需逐条验证：
+
+- **source**：`mobiledocJson` 参数（第 118 行 `JSON.parse(mobiledocJson)`），以及其中 image 卡片的 `payload.src`（第 124–125 行）。src 可由编辑文章的用户控制。
+- **sink 1 — getUnsplashSize（第 106–113 行）**：条件为 `payload.src.match(/images\.unsplash\.com/)`（第 127 行）。注意：该正则匹配的是子串而非锚定主机，攻击者可用 `https://evil.com/?x=images.unsplash.com` 绕过——但即便绕过，sink 是 `imageSize.getImageSizeFromUrl(parsedUrl.href)`，即向该 URL 发起 GET 请求获取图片尺寸。这构成 **SSRF**：攻击者可使服务器请求内网地址。
+  - 缓解因素：Ghost 的 `getImageSizeFromUrl` 内部实现（`server/lib/image` 层）会校验 URL 协议为 http/https 并做重定向后的主机校验/私有 IP 防护（Ghost 在后续版本加入了 SSRF 防护）；此外结果仅写入 width/height 数字字段回 mobiledoc（第 143–145 行），响应体不会回显给攻击者，属于盲 SSRF，信息泄露有限。防御有效性取决于依赖包版本，本文件自身未做任何校验，正则过滤按要求视为可绕过。
+- **sink 2 — getOriginalImageSizeFromStorageUrl（第 131 行）**：条件 `/^\/content\/images\//` 锚定相对路径或 `isLocalImage`。相对路径被限制在本地存储目录语义下，由 storage adapter 解析，不存在路径穿越直达文件系统 sink 的证据（adapter 内部处理）。**有效约束**。
+- **sink 3 — getImageSizeFromUrl（第 133 行）**：条件 `storageUtils.isInternalImage(payload.src)`，即站点自身 URL 的图片，请求目标是配置的 siteUrl 域。若 isInternalImage 实现严格（前缀匹配 config url），则目标受限。**基本有效**。
+- **异常处理**：第 136–138 行 catch 后仅记日志，不中断，无 DoS 放大。
+- 结论：最可疑的数据流是「攻击者控制的 src → 弱正则判断 → 服务端 HTTP 请求」，但 (a) 该函数仅在管理员触发 force-rerender 时执行（第二入口需要已认证的编辑权限），(b) 下游 image-size 工具层承担实际 SSRF 校验，(c) 无响应回显。综合判定为不可在本文件证据下确认的可利用漏洞。
+
+### 2.8 reload()
+第 154–158 行：仅清空模块级缓存变量，无输入。**无风险**。
+
+## 3. 第二入口与替代通道核查
+
+- 替代通道：`render` 与 `populateImageSizes` 均消费同一 mobiledoc JSON 来源（数据库中的 post 内容），无其他文件/网络/env 输入通道（env 仅 CI 布尔用途）。
+- 动态 require 核查：全部 require 为字面量包名或固定相对路径（第 23、24、30、58、60、83、105 行），无用户输入参与模块解析，无 RCE。
+- 原型污染面：`payload.width/height` 直接赋值为 imageSize 返回的数字（第 143–144 行），键名为固定字面量，无 `__proto__` 注入路径。
+
+## 4. 总体结论
+
+全文通读后：所有 sink（HTTP 请求、日志、JSON 序列化）均有上游条件约束或位于可信工具层；弱正则（unsplash 子串匹配）虽按规则不算有效防御，但其可达 sink 为盲 SSRF 且需特权入口触发、依赖下游防护，本文件内无法证实可利用性。故判定无确凿漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文逐函数审查：blankDocument 为静态数据；cards 的 canTransformImage 仅做布尔判断无敏感 sink；unknownCardHandler 将卡片名写入结构化日志属最低风险；render 依赖 kg-mobiledoc-html-renderer 的白名单序列化且未知卡片只记日志；htmlToMobiledocConverter 中 process.env.CI 仅作计时开关不进入任何 sink；populateImageSizes 是第二入口，攻击者可控的 payload.src 经三路分支分别到达 getImageSizeFromUrl 或本地存储尺寸查询，其中 unsplash 判断用子串正则可被绕过，理论上是盲 SSRF 面，但该函数仅由具备编辑权限的管理操作 force-rerender 触发，实际 SSRF 校验由下游 image-size 工具层承担且响应不回显，本文件证据不足以确认可利用漏洞；reload 无输入；所有 require 均为字面量无动态模块注入；width/height 赋值为固定键名数字无原型污染。", "fix_suggestion": "no fix needed"}
+```

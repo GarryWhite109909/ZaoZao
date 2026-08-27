@@ -1,0 +1,47 @@
+## 编号分析（全文逐函数）
+
+**1. 第 14–27 行：TCP_HANDLERS 注册表**
+四个处理器：`_ipp`、`_ipps`（TLS）、`_http`、`_https`（TLS）。注意 `_ipp` 与 `_ipps`、`_http` 与 `_https` 互为前缀包含关系，这为后面的匹配逻辑埋下隐患。
+
+**2. 第 63–95 行：NewAcceptor —— 核心缺陷点**
+第 82–90 行：
+```go
+for svcName, svcHandler := range TCP_HANDLERS {
+    if strings.Contains(service, svcName) {
+```
+- Go 的 map 迭代顺序是**刻意随机化**的。对于服务名 `_ipps._tcp.local.`，`strings.Contains(service, "_ipp")` 与 `Contains(service, "_ipps")` **同时为真**；同理 `_https._tcp.local.` 同时命中 `_http` 与 `_https`。
+- 命中哪个完全取决于随机迭代顺序：若先命中非 TLS 版本（`_ipp`/`_http`），则第 85–87 行不会设置 `acceptor.tlsConfig`，本应加密的服务将以**明文 TCP** 处理（TLS 剥离/降级）；且协议解析器也可能错配（如把 IPPS 流量交给按明文 IPP 解析的 handler）。
+- 这是典型的“用子串包含做安全相关分发”缺陷（黑名单/模糊匹配式判断不可靠），且结果不确定——同一服务每次启动行为可能不同。
+
+**3. 第 97–101 行：兜底 handler**
+未匹配时使用通用 dump 处理器，本身无注入面（仅记录）。
+
+**4. 第 103–140 行：startTCP**
+- 第 107 行绑定 `0.0.0.0:%d`，监听所有网卡。该工具本质是局域网欺骗/仿真工具，暴露面是设计使然，但结合缺陷 2，攻击者可主动连上被错误地以明文处理的“应为 TLS”的端口。
+- 第 122–135 行：每条连接无条件 `go a.handler.Handle(...)`，**无并发上限、无速率限制、无连接数上限**，远程攻击者可通过大量并发连接造成 goroutine/内存耗尽（CWE-770 资源分配无限制，DoS）。handler 内部逻辑不在本文件，但入口处的无限派生是本文件可证实的。
+
+**5. 第 142–172 行：startUDP**
+- 第 152 行固定 4096 字节缓冲读取，`Dump(buffer[0:n])` 仅用于日志输出；n 由 ReadFromUDP 保证 ≤4096，无越界。日志注入（伪造换行）属低危记录问题。
+
+**6. 第 174–181 行：Start**
+仅按 proto 分发，无新问题。
+
+**7. 第 183–199 行：Stop**
+`ctxCancel` 后等待 `context.Done()` 再 Close listener，关闭顺序正确，无 use-after-close 竞态窗口（Accept 错误由 running 标志抑制）。此函数未见漏洞。
+
+**数据流小结**
+- source：网络服务名字符串（mDNS 发现结果，外部可控）→ sink：第 82–88 行 handler/TLS 选择。中间仅有 `strings.Contains` 模糊匹配这一道“防线”，可被前缀构造绕过且具不确定性 → 无效防御。
+- source：任意远端 TCP 连接 → sink：第 124 行无限 goroutine 派生 → 资源耗尽。
+- UDP 通道为替代入口，但仅 dump 日志，本文件内无可利用 sink。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-1188 初始安全决策采用不安全/不确定的匹配方式（子串包含导致 TLS 配置丢失），伴随 CWE-770 无限制连接派生",
+  "risk_level": "中",
+  "source": "line 82: 外部可控的 mDNS 服务名字符串 service 作为匹配输入",
+  "sink": "line 85-88: strings.Contains 随机 map 迭代决定 tlsConfig 与 handler 的分配",
+  "explanation": "对 _ipps 或 _https 服务，_ipp/_http 与 _ipps/_https 同时满足 Contains 匹配，Go map 迭代顺序随机导致可能命中非 TLS 条目 -> 本应 TLS 加密的服务被以明文 TCP 接受并交给错误的协议解析器（TLS 剥离/降级，结果不确定）；另外 line 124 对每条入站连接无条件 go Handle 且无并发或速率上限 -> 远程攻击者可 goroutine/内存耗尽造成拒绝服务",
+  "fix_suggestion": "line 82-90: 改为精确匹配服务类型而非 strings.Contains 子串匹配，例如按 service 的第一段做精确等值比较或优先匹配更长名称（先 _ipps 后 _ipp、先 _https 后 _http）并保证 TLS 服务必然绑定 tlsConfig；line 124: 引入带缓冲的 worker 池或信号量限制并发 handler 数量并对单源地址限速"
+}
+```

@@ -1,0 +1,61 @@
+LANG: python
+```code
+# app.py
+from fastapi import FastAPI, HTTPException, Depends, Header
+from pydantic import BaseModel
+import httpx
+import os
+import secrets
+
+app = FastAPI()
+
+# 修复 CWE-798：凭据不再硬编码，改为从环境变量/密钥管理服务读取，
+# 并使用 secrets.compare_digest 做恒定时间比较（框架无关的密码学安全 API）
+INTERNAL_ADMIN_USER = os.environ["INTERNAL_ADMIN_USER"]
+INTERNAL_ADMIN_PASSWORD = os.environ["INTERNAL_ADMIN_PASSWORD"]
+
+def require_internal_auth(x_internal_user: str = Header(None),
+                          x_internal_pass: str = Header(None)):
+    if not x_internal_user or not x_internal_pass:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    # 白名单精确允许集：仅允许内部系统用户名，且用恒定时间比较防时序侧信道
+    if not secrets.compare_digest(x_internal_user, INTERNAL_ADMIN_USER) or \
+       not secrets.compare_digest(x_internal_pass, INTERNAL_ADMIN_PASSWORD):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return {"user": x_internal_user}
+
+class ExportJob(BaseModel):
+    dataset: str
+    target_url: str
+
+# 白名单精确允许集：仅允许向已注册的内部数据接收端导出
+ALLOWED_EXPORT_TARGETS = {
+    "https://data-warehouse.internal.example.com/api/ingest",
+    "https://analytics.internal.example.com/api/ingest",
+}
+
+@app.post("/internal/export")
+async def create_export(job: ExportJob, _=Depends(require_internal_auth)):
+    # 强防御：对用户可控的 target_url 施加白名单精确允许集校验，阻止 SSRF 外带凭据/内网探测
+    if job.target_url not in ALLOWED_EXPORT_TARGETS:
+        raise HTTPException(status_code=400, detail="target not allowed")
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(job.target_url, json={"dataset": job.dataset})
+    return {"status": resp.status_code}
+```
+
+1. 第 22–23 行（`ExportJob` 的 `dataset`、`target_url` 字段）与第 15–16 行（请求头 `x_internal_user`、`x_internal_pass`）是全部用户可控输入点；第 10–11 行硬编码的 `INTERNAL_ADMIN_USER` / `INTERNAL_ADMIN_PASSWORD` 是漏洞源头，任何拿到源码或反编译产物的人可直接获得内部系统凭据。
+
+2. 主链追踪：源码常量（第 10–11 行）→ `require_internal_auth` 内的比较（第 18 行）→ 认证放行 → `/internal/export` 的 sink。这是典型的 CWE-798：sink 是认证决策点，攻击者无需猜测即可通过比对绕过。修复采用【框架原生安全 API + 环境变量注入】：第 10–11 行改为 `os.environ[...]` 从部署环境/密钥管理系统读取，凭据不落盘于代码仓库。
+
+3. 类型与位置正确性：`os.environ[...]` 在进程启动时即取值，缺失时直接抛错（fail-fast），保证不会静默回退到默认弱口令；比较处使用 `secrets.compare_digest`（密码学安全 API）做恒定时间比较，同时消除时序侧信道这一替代通道——即使凭据已外置，逐字符短路比较也可能泄露前缀信息。
+
+4. 攻击面覆盖完整性：除硬编码凭据外，第 33–35 行新增【白名单精确允许集】`ALLOWED_EXPORT_TARGETS` 校验 `job.target_url`。原代码中该 URL 完全由请求体控制且携带内部数据集外发，属于同一数据流上的 SSRF/数据外带风险；白名单精确匹配（非黑名单、非正则）确保只能发往两个注册的内部端点，类型上为字符串集合成员判定，位置在 sink 调用之前，完整封堵任意 URL 注入。
+
+5. 最小 diff 纪律核对：函数名、路由路径 `/internal/export`、类名、变量名、控制流均未改动；仅替换第 10–11 行赋值来源、在 `require_internal_auth` 与 `create_export` 内插入防御语句，其余业务逻辑（httpx 异步 POST、返回结构）保持原样。
+
+6. 第二入口检查：全文件无其他路由或中间件读取这两个凭据常量；`require_internal_auth` 是唯一认证入口，已被恒定时间比较覆盖；`dataset` 字段仅作为 JSON body 发往白名单端点，无注入面。结论：安全版本无残留漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码第10至11行将内部系统用户名与密码硬编码于源码构成CWE-798主链，经require_internal_auth第18行比较到达认证决策sink；安全版改用os.environ从密钥管理注入并以secrets.compare_digest恒定时间比较消除时序侧信道；另对用户可控的job.target_url在第33至35行施加白名单精确允许集校验封堵SSRF外带；第二入口检查确认无其他路由读取凭据常量", "fix_suggestion": "line 10: 将硬编码凭据替换为 os.environ 读取并使用 secrets.compare_digest 恒定时间比较"}
+```

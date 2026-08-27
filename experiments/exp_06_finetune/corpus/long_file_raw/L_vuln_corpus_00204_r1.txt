@@ -1,0 +1,47 @@
+## 编号分析（全文逐函数）
+
+**1. 模块配置与字段定义（第 1–70 行）**
+- 第 8 行引入 `streamProxy`，这是后续代理请求的 sink 依赖。
+- 字段均为 schema 化定义（slug、attachment、creditUrl 为 url 类型），无直接注入面。
+
+**2. `getAllUrlMetadata`（第 78–83 行）**
+- 返回硬编码空对象，无数据流，无风险。
+
+**3. `getPrettyUrlBase`（第 85–96 行）**
+- 使用 `req.prefix` 或 `apos.url.getBaseUrl`，均来自框架内部状态，非用户可控 source。
+
+**4. `getPrettyPath`（第 98–107 行）**
+- `doc.slug.replace(self.options.slugPrefix || '', '')`：字符串形式 replace 只替换首次出现。但该函数的输入是数据库中的 doc.slug，且路由侧会重新拼接 prefix，此处不构成用户直接输入到路径的通道；即便 slug 含特殊字符，后续路由有独立校验。防御不依赖此函数。
+
+**5. `addUrls`（第 109–120 行）**
+- URL 拼接基于 DB 中 attachment 元数据，输出到 `_url` 属性用于展示，非执行 sink。
+
+**6. `applyPrettyUrlPaths`（第 122–170 行）**
+- 直接 DB 查询使用 `req.locale`/`req.mode` 作为等值匹配条件（第 138–139 行），非操作符注入；`batchIds` 来自内部 attachmentMeta。无用户可控查询操作符，无注入。
+
+**7. 路由 `GET /files/*`（第 173–213 行）——核心入口点**
+
+Source→sink 数据流：
+- **source**：第 177 行 `req.params[0]`（URL 通配路径）与第 194 行 `req.get('host')`。
+- **过滤验证**：
+  - 第 178 行正则 `/^([^.]+)\.\w+$/`：排除点号和扩展名特殊字符；
+  - 第 182 行黑名单检查 `slug.includes('..') || slug.includes('/')`：按要求，黑名单视为可绕过级别的弱防御——但注意此处 slug 随后被用作**数据库查询键**（第 185 行 `slug: \`${prefix}${slug}\``），而非文件系统路径，因此路径穿越不成立；NoSQL 操作符也因正则要求纯文本而无法注入。
+- **关键数据流 A（SSRF）**：第 189 行 `uglyUrl = apos.attachment.url(file.attachment)` 来自数据库附件记录；第 192–194 行当其为相对路径时拼接 `${req.protocol}://${req.get('host')}${uglyUrl}`；第 196 行传入 `streamProxy` 发起服务端请求。
+  - `req.get('host')` 完全由客户端 `Host` 头控制（若部署在未严格校验 Host 的反向代理后），攻击者可将自请求重定向到任意主机/内网地址 —— 服务端请求伪造（CWE-918）。
+  - `req.protocol` 可受 `X-Forwarded-Proto` 影响，进一步可控协议上下文。
+  - 路径部分虽固定为 uploads 路径，但目标主机完全受控，足以探测内网（如访问云元数据端点的任意路径不可行，但端口扫描/内网 GET 探测可行）。
+- **第二入口/替代通道**：`applyPrettyUrlPaths` 生成的 `entry.base` 也来自 `getPrettyUrlBase`（内部值），不受 Host 头影响，故替代通道安全；唯一受控入口即本路由的 Host 头。
+
+**结论**：存在漏洞——通过 `Host` 头注入实现 SSRF，风险等级中低（需特定部署条件：本地 uploadfs 相对 URL + 未校验 Host 的代理）。修复建议：对 `req.get('host')` 做白名单校验，或改用服务器自身配置的 origin 常量。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-918 Server-Side Request Forgery",
+  "risk_level": "medium",
+  "source": "line 194: req.get('host') 与 line 192: req.protocol 均由客户端请求头控制",
+  "sink": "line 196: streamProxy(req, proxyUrl) 发起服务端 HTTP 请求",
+  "explanation": "攻击者发送带恶意 Host 头的请求到 /files/<slug>.pdf -> 第 189 行 uglyUrl 为相对路径时 -> 第 194 行拼接为 http://attacker-or-intranet-host/uploads/... -> 第 196 行 streamProxy 向攻击者指定主机发起服务端请求，可用于内网探测；第 178/182 行的正则与黑名单仅保护 slug 查询参数，对 Host 头无任何防御",
+  "fix_suggestion": "line 194: 不使用 req.get('host')，改为使用服务器配置的可信 origin 常量，或对 Host 头实施白名单校验后再拼接 proxyUrl"
+}
+```

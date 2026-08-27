@@ -1,0 +1,39 @@
+## 编号分析（逐函数通读全文）
+
+**1. 第 15–44 行 `StarredReposOptions` / `ApplyPublicOnly` / `ToConds`**
+- 数据流：`StarrerID`、`RepoOwnerID`、`IncludePrivate` → `builder.Eq{...}` → SQL 条件。
+- xorm 的 `builder.Eq` 生成参数化查询（占位符 + 参数绑定），int64 类型字段无注入面。
+- `IncludePrivate` 是 bool，由调用方通过 `ApplyPublicOnly` 收敛；本文件内不直接接收 HTTP 输入，权限过滤逻辑本身正确（非私有则强制加 `is_private=false`）。防御有效。
+
+**2. 第 46–56 行 `ToJoins`**
+- JOIN 表名/条件均为硬编码常量字符串，无用户输入拼接。安全。
+
+**3. 第 58–62 行 `GetStarredRepos`**
+- 仅透传 opts 给 `db.Find`，依赖第 33–43 行的参数化条件。无 sink 风险。
+
+**4. 第 64–93、95–105、107–110 行 `WatchedReposOptions` 系列**
+- 与 Starred 结构对称：`WatcherID`、`RepoOwnerID` 均为 int64 走参数化；`watch.mode != WatchModeDont` 为常量比较。无注入、无越权过滤缺失。
+
+**5. 第 112–155 行 `GetRepoAssignees`**
+- source：`repo.ID`、`repo.OwnerID`（数据库内部值）→ sink：第 122–123 行 `Where("repo_id = ? AND mode >= ?", ...)` 使用占位符参数化，安全。
+- 第 138–140 行 `e.In("id", uniqueUserIDs.Values())` —— xorm `In` 对切片同样参数化。列名 `"id"` 为硬编码。
+- 第 147–149 行追加 owner 逻辑为内存操作。无漏洞。
+
+**6. 第 157–178 行 `GetIssuePostersWithSearch`**（关键审查点）
+- source：`search` 字符串（上游来自路由查询参数，如 `/issues/posters?q=`），sink：第 168–169 行：
+  - `builder.Like{"lower_name", strings.ToLower(search) + "%"}` —— xorm builder 对 Like 的值做参数化转义，`%` 由代码固定追加而非用户可控位置注入额外通配符结构；即使搜索词含 `%`/`_` 也只是匹配语义问题（信息泄露面极小，且结果仍受 repo_id 约束），不构成 SQL 注入。
+  - `db.BuildCaseInsensitiveLike("full_name", "%"+search+"%")` —— 同样走 builder 参数化，列名硬编码。
+- 第 161–166 行子查询全部使用 `builder.Eq` 参数化，`repo.ID` 为内部 ID。
+- 第 172–177 行 `Cols`/`OrderBy`/`Limit` 均为硬编码常量。无动态排序字段注入。
+
+**7. 第二入口与替代通道检查**
+- 全文件无 HTTP handler、无环境变量、无文件读取、无回调注册；所有外部可达输入最终收敛为 int64 或经 builder 参数化的字符串。未发现绕过通道。
+
+**8. 黑名单/正则类防御核查**
+- 文件中不存在黑名单或正则过滤；唯一“过滤”是 `IncludePrivate` 布尔收敛与 `is_active=true` 条件，均属结构性白名单式约束，有效。
+
+**结论**：全文所有 source→sink 数据流均经 xorm builder 参数化处理，无字符串拼接 SQL，无动态列名/表名/排序名，无权限过滤缺失。未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "None", "risk_level": "None", "source": "line 157: GetIssuePostersWithSearch 的 search 参数及各 Options 的 int64 字段", "sink": "line 168-169 与 line 122-123: builder.Like 与 Where 查询", "explanation": "全文所有用户可控输入均通过 xorm builder 以参数化占位符方式进入 SQL，无字符串拼接、无动态表名列名排序名；私有仓库过滤由 ApplyPublicOnly 结构性保证，未发现可利用的注入或越权数据流", "fix_suggestion": "无需修复；建议保持 builder 参数化风格并继续禁止在 OrderBy/Cols 中引入动态字符串"}
+```

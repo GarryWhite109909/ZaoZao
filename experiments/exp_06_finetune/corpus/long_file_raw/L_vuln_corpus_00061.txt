@@ -1,0 +1,32 @@
+## 编号分析
+
+**入口点枚举（全文三个 handler，均为 POST JSON body）**
+1. `FsRecursiveMove`：`src_dir`、`dst_dir`、`conflict_policy`。
+2. `FsBatchRename`：`src_dir` + `rename_objects[].src_name / new_name`。
+3. `FsRegexRename`：`src_dir`、`src_name_regex`、`new_name_regex`。
+
+**逐函数数据流验证**
+
+- **FsRecursiveMove（第 26–148 行）**：第 38 行 `user.JoinPath(req.SrcDir)` 与第 54 行对 `DstDir` 做路径归一化与用户根目录约束；后续所有被移动文件路径（第 101、105 行）均来自 `fs.List` 返回的真实目录项拼接，不直接采信用户输入的文件名。冲突策略仅影响覆盖/跳过逻辑，无 sink 可控注入。结论：无路径穿越。
+
+- **FsBatchRename（第 159–204 行）**：
+  - 第 172 行 `user.JoinPath(req.SrcDir)` 有效约束了目录基路径；
+  - 第 192 行只对 `NewName` 调用了 `checkRelativePath` 防穿越；
+  - **第 189 行仅检查 `SrcName == ""`，随后第 197 行 `filePath := fmt.Sprintf("%s/%s", reqPath, renameObject.SrcName)` 直接拼接，未做任何相对路径校验**；
+  - 第 198 行 `fs.Rename(ctx, filePath, ...)` 为 sink。攻击者传 `src_name: "../../../../etc/target"` 即可重命名用户授权范围之外的文件（source→sink 全程无有效防御，`JoinPath` 只作用于 `req.SrcDir`，不覆盖逐项 `SrcName`）。这是典型的第二入口遗漏：同一结构体中一个字段过滤、另一个字段漏过滤。
+
+- **FsRegexRename（第 214–271 行）**：第 256 行由正则替换生成的新名在第 257 行经过 `checkRelativePath` 校验，防御有效（假设该函数拒绝 `..`）；源路径第 262 行来自真实列出的文件名，不可控。注意第 243 行 `regexp.Compile` 使用 Go RE2，无 ReDoS。结论：此函数安全。
+
+**替代通道检查**：三个接口权限位不同（move/rename），但都要求写权限；批量重命名接口是唯一存在未校验 source 的通道，无法被其他两个接口的防御间接弥补。
+
+```json
+{
+ "has_vulnerability": true,
+ "vulnerability_type": "CWE-22 Path Traversal (improper limitation of a pathname to a restricted directory)",
+ "risk_level": "high",
+ "source": "line 153: 用户可控的 rename_objects[].src_name，仅在第 189 行做空串检查",
+ "sink": "line 197-198: filePath := fmt.Sprintf(`%s/%s`, reqPath, renameObject.SrcName) 后传入 fs.Rename",
+ "explanation": "FsBatchRename 中第 172 行 JoinPath 只约束了 req.SrcDir 基目录，第 192 行仅对 NewName 调用 checkRelativePath，而 SrcName 未做任何相对路径校验即在第 197 行拼入文件路径并作为 fs.Rename 的源路径执行，攻击者可用形如 ../../.. 的 src_name 重命名其授权目录之外的任意文件，造成越权写操作；对比同文件 FsRegexRename 第 257 行对新名做了校验，证明此处属遗漏",
+ "fix_suggestion": "line 197 之前对 renameObject.SrcName 同样调用 checkRelativePath 并在失败时返回 403，或改用安全的路径拼接函数拒绝包含 .. 及绝对路径成分的输入"
+}
+```

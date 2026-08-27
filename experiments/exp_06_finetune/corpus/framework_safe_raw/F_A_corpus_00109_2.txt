@@ -1,0 +1,79 @@
+LANG: go
+```go
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+// TaskConfig 安全版本：移除可执行载荷字段，仅保留数据字段
+type TaskConfig struct {
+	Name    string
+	Timeout int
+}
+
+type PluginEntry struct {
+	Plugin string
+	Config json.RawMessage
+}
+
+// allowedPlugins 白名单精确允许集：只接受已注册的插件类型
+var allowedPlugins = map[string]bool{
+	"task": true,
+}
+
+func decodeConfig(plugin string, raw []byte) (interface{}, error) {
+	if !allowedPlugins[plugin] { // 白名单校验插件名
+		return nil, http.ErrBodyNotAllowed
+	}
+	var tc TaskConfig
+	if err := json.Unmarshal(raw, &tc); err != nil { // sink 已改为安全的 JSON 反序列化到固定结构体
+		return nil, err
+	}
+	return tc, nil
+}
+
+func loadConfig(c *gin.Context) {
+	raw, err := c.GetRawData()
+	if err != nil {
+		c.String(http.StatusBadRequest, "read body failed")
+		return
+	}
+
+	var entry PluginEntry
+	if err := json.Unmarshal(raw, &entry); err != nil { // 外层同样使用 JSON 到固定结构体
+		c.String(http.StatusBadRequest, "decode failed")
+		return
+	}
+
+	cfg, err := decodeConfig(entry.Plugin, entry.Config)
+	if err != nil || cfg == nil {
+		c.String(http.StatusBadRequest, "invalid plugin or config")
+		return
+	}
+	if _, ok := cfg.(TaskConfig); ok {
+		// 仅使用反序列化出的数据字段，不再调用任何函数指针
+	}
+	c.String(http.StatusOK, "loaded")
+}
+
+func main() {
+	r := gin.Default()
+	r.POST("/config", loadConfig)
+	r.Run(":8080")
+}
+```
+
+1. 第 27 行 `c.GetRawData()` 是唯一用户可控输入点，请求体完全由攻击者控制。
+2. 原代码第 33 行用 `gob.NewDecoder` 将不可信字节流解码为含 `interface{}` 与 `func()` 字段的任意类型，是 CWE-502 的 sink；gob 可还原函数值并触发任意代码执行。修复后第 22 行与第 45 行均改为 `encoding/json` 的 `Unmarshal`，JSON 无法表达函数/接口多态，只能填充固定结构体的数据字段，从机制上消除反序列化 RCE。
+3. 第 17-19 行将 `TaskConfig.Handler func()` 替换为纯数据字段 `Timeout int`，删除了可执行载荷的落点，保证即使反序列化成功也不存在可调用目标。
+4. 第 21-23 行新增 `allowedPlugins` 白名单精确允许集（非黑名单），在 `decodeConfig` 入口处先校验插件名再进入反序列化，覆盖了插件分发这一攻击面分支。
+5. 防御位置正确性：校验位于 sink 之前、数据进入业务逻辑之前，且对内外两层解码都生效，无绕过路径——原代码中 `entry.Config.(TaskConfig)` 的类型断言 + `tc.Handler()` 调用链已被彻底切断。
+6. 第二入口检查：路由仅有 `/config` 一个 POST 端点，无其他读取请求体或反序列化的通道；结论为修复完整。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞链：第 27 行 GetRawData 获取不可信请求体 -> 第 33 行 gob.Decode 解码到含 interface{} 与 func() 字段的 PluginEntry/TaskConfig -> 第 38-40 行类型断言后调用 tc.Handler() 触发任意代码执行（CWE-502）；修复方式：gob 全部替换为 encoding/json 固定结构体反序列化，删除 Handler 函数字段，并在 decodeConfig 中以 allowedPlugins 白名单精确允许集校验插件名后再解码；第二入口检查：仅存在 /config 单一 POST 端点，无其他反序列化通道，防御覆盖完整", "fix_suggestion": "line 33: 将 gob.NewDecoder(...).Decode(&entry) 替换为 json.Unmarshal(raw, &entry)，并将 Config 类型改为 json.RawMessage，经白名单校验后仅反序列化为不含函数字段的固定结构体"}
+```

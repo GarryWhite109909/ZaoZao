@@ -1,0 +1,27 @@
+## 编号分析
+
+1. **第 1–4 行（入口/依赖）**：模块依赖 fs、path、source-map-js。入口点是构造函数接收的 `css` 字符串与 `opts`。
+
+2. **第 27–43 行 `decodeInline`**：处理内联 data URI source map。仅做 base64/URI 解码，无文件系统访问，不构成 sink。
+
+3. **第 45–47 行 `getAnnotationURL`**：仅做前缀剥离和 trim，**没有任何路径规范化、协议过滤或目录穿越检查**。
+
+4. **第 49–62 行 `loadAnnotation(css)`**：source 入口。从外部传入的 CSS 文本中用正则匹配 `/* # sourceMappingURL=` 注释，取最后一个注释内容作为 `this.annotation`。该值完全由不可信输入（CSS 文件内容）控制。
+
+5. **第 64–75 行 `loadFile(path, cssFile, trusted)`**：sink 所在。当 `trusted=false` 且未设 `unsafeMap` 时，唯一防御是 `/\.map$/i.test(path)` —— 这是黑名单式后缀校验：
+   - 可被绕过：攻击者可指向任意以 `.map` 结尾的敏感文件；
+   - 更关键的是**没有对 `..` 目录穿越做任何校验**：`join(dirname(file), map)`（第 96 行）会保留 `../` 序列。
+   - 通过后即执行 `readFileSync(path)`（第 72 行）读取任意文件并返回其内容。
+
+6. **第 77–113 行 `loadMap(file, prev)`**：
+   - 第 80–83 行：`prev` 为字符串时直接返回，属开发者显式提供，不算漏洞通道；
+   - 第 84–92 行：`prev` 为函数时走 `trusted=true` 路径跳过后缀检查——同样是开发者信任边界内，非外部可控；
+   - 第 100–112 行（第二入口/替代通道）：`this.annotation` 非内联时，`map = join(dirname(file), this.annotation)` 后调用 `loadFile(map, file, false)`。这是主要攻击流：CSS 中写 `/*# sourceMappingURL=../../../../etc/sensitive.map */` 即可让 `readFileSync` 读到该文件；随后内容经 `JSON.parse` 失败虽返回 undefined，但文件内容已在 `unknown` 中被上层流程消费（作为 source map 文本），造成信息泄露。
+
+7. **第 115–118 行 `startWith` / 第 120–125 行 `withContent`**：纯字符串判断，无风险。
+
+8. **全文核查结论**：除上述流外无其他 sink（无 eval、child_process、网络请求）。核心问题即 CVE-2023-44270 同类问题：外部 CSS 注释中的相对路径注解可穿越目录读取任意 `.map` 后缀文件，且 `.map` 后缀限制本身可通过符号链接、命名巧合或结合其他缺陷进一步扩大影响；即便严格限定 `.map`，任意路径读取仍违反最小权限原则。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal / CWE-200 Information Exposure", "risk_level": "medium", "source": "line 55: loadAnnotation 从外部 CSS 注释提取的 this.annotation", "sink": "line 72: loadFile 中 readFileSync(path) 读取注解指向的文件", "explanation": "外部可控 CSS 内容 -> loadAnnotation 提取 sourceMappingURL -> loadMap 第 96 行 join(dirname(file), map) 未过滤 ../ -> loadFile 仅用 /\.map$/i 黑名单后缀校验（可绕过且不防目录穿越）-> readFileSync 读取服务器上任意以 .map 结尾或经路径构造可达的文件内容并作为 source map 返回给调用方，导致任意文件读取/信息泄露", "fix_suggestion": "在 loadFile 或 getAnnotationURL 中对解析后的绝对路径做规范化并与允许的根目录比对（如 path.resolve 后强制 startsWith 项目根），拒绝包含 .. 的注解路径，同时将后缀黑名单改为白名单校验"}
+```

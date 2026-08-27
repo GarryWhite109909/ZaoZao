@@ -94,7 +94,10 @@ def detect_lang_of(path: Path, code: str) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pilot", action="store_true")
-    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--resume", action="store_true",
+                    help="兼容旧用法：断点续跑已是默认行为")
+    ap.add_argument("--fresh", action="store_true",
+                    help="清空输出/进度文件从头重跑（默认总是追加，防止误截断已完成样本）")
     ap.add_argument("--workers", type=int, default=2,
                     help="长文件分析耗 token，建议 2~3 防限流")
     ap.add_argument("--min-lines", type=int, default=120,
@@ -133,7 +136,7 @@ def main():
         tasks = tasks[:2]
 
     done = set()
-    if args.resume and PROGRESS_PATH.exists():
+    if not args.fresh and PROGRESS_PATH.exists():
         for line in PROGRESS_PATH.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 try:
@@ -146,8 +149,9 @@ def main():
     RAW_DIR.mkdir(exist_ok=True)
     lock = threading.Lock()
     stats = {"ok": 0, "reject": 0, "too_short": 0, "too_long": 0}
-    out_f = open(OUT_PATH, "a" if args.resume else "w", encoding="utf-8")
-    prog_f = open(PROGRESS_PATH, "a" if args.resume else "w", encoding="utf-8")
+    mode = "w" if args.fresh else "a"
+    out_f = open(OUT_PATH, mode, encoding="utf-8")
+    prog_f = open(PROGRESS_PATH, mode, encoding="utf-8")
 
     def emit(sample):
         with lock:
@@ -158,7 +162,7 @@ def main():
         def regen_or_fail(msg, stat_key):
             with lock:
                 stats[stat_key] += 1
-            return ("regen", msg) if attempt == 0 else ("fail", msg)
+            return ("regen", msg) if attempt < 2 else ("fail", msg)
 
         analysis = clean_analysis(text)
         rec, err = validate(normalize_verdict_json(analysis if "```json" in analysis
@@ -190,17 +194,38 @@ def main():
 
     def run_task(t):
         t0 = time.time()
+        prompt = t["prompt"]
         # 长文件：max_tokens 提到 10000（分析篇幅 + 推理模型思考预算）
         for attempt in range(3):
             try:
-                text = call_teacher(key, t["prompt"], max_tokens=10000)
+                text = call_teacher(key, prompt, max_tokens=10000)
             except RuntimeError as e:
                 with lock:
                     stats["reject"] += 1
                 return f"✗ {t['key']}: {str(e)[:60]}"
-            (RAW_DIR / f"{t['key'].replace(':', '_')}.txt").write_text(
+            suffix = "" if attempt == 0 else f"_r{attempt}"
+            (RAW_DIR / f"{t['key'].replace(':', '_')}{suffix}.txt").write_text(
                 text or "", encoding="utf-8")
             status, msg = process_output(t, text, attempt)
+            if status == "regen":
+                # 把拒绝原因回灌给教师（2026-08-25 实测：过短/方向错在同
+                # prompt 盲抽下会复现）
+                reason = msg.split(': ', 1)[-1]
+                extra = ("重新生成时必须通读全文，对文件里每个主要函数逐一给出行号级"
+                         "分析；结论方向必须与任务设定一致。")
+                mshort = re.search(r"est~(\d+) tok", reason)
+                if mshort:
+                    # 过短拒绝占失败大头（2026-08-26 实测 ~20%）：模糊的
+                    # "别太短"对推理模型无效，给出按缺口算的具体字符数目标
+                    need = min(8000, max(0, MIN_TOKEN * 3 - len(ALPHA05_PROMPT)
+                                         - len(t["code"])) + 400)
+                    extra = (f"上一次全文仅约 {mshort.group(1)} token，未达最低要求。"
+                             f"重新生成时分析部分（```json 结论之前）不得少于 "
+                             f"{need} 字符：逐函数枚举入口点、逐条 source→sink 数据流"
+                             "验证防御有效性、检查第二入口与替代通道；每个函数都要有"
+                             "行号级证据，不得合并或省略任何函数。")
+                prompt = t["prompt"] + \
+                    f"\n\n【重生成要求——上一次输出因「{reason}」被拒】{extra}"
             if status == "ok":
                 with lock:
                     prog_f.write(json.dumps({"key": t["key"]}) + "\n")

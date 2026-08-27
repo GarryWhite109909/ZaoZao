@@ -1,0 +1,37 @@
+## 编号分析（全文逐函数）
+
+1. **第 1–40 行（imports 与类声明）**：引入 Netty、Jackson XML（Woodstox）、反射工具等。注意第 15 行 `WstxInputFactory`、第 24 行 `XMLInputFactory` —— 这是本文件中唯一与“解析不可信输入”相关的组件，后续用于构造全局共享的 `XmlMapper`。
+
+2. **第 60–88 行（`start()`）**：启动 Netty 服务，`.childHandler(new HttpServerInitializer(executorGroup, LocalS3RouterFactory.create(serviceFactory)))`（约第 74 行）。这是**网络入口点**：所有 HTTP 请求经 router 分发到各 handler。router 由 `serviceFactory` 提供，其中包含下述 `XmlMapper` —— 即该 mapper 会被用于处理外部请求体中的 XML（如 S3 协议的 CreateBucketConfiguration、CompleteMultipartUpload 等请求）。入口确认存在。
+
+3. **第 90–118 行（`createServiceFactory()`）—— 关键 sink**：
+   - 第 104 行：`XMLInputFactory input = new WstxInputFactory();`
+   - 第 105 行：仅设置了 `IS_NAMESPACE_AWARE = FALSE`；
+   - **未设置任何安全属性**：没有 `XMLInputFactory.SUPPORT_DTD = false`、没有 `IS_SUPPORTING_EXTERNAL_ENTITIES = false`、没有 `XMLInputFactory.SUPPORT_DTDPP = false`；
+   - 第 106 行：用该 factory 构造 `XmlMapper`；第 107–110 行只配置了反序列化行为和模块注册，均与 XXE 无关；
+   - 第 111 行：将此 `XmlMapper` 注册进 `ServiceFactory`，供所有 HTTP handler 使用。
+   - Woodstox 默认 `P_SUPPORT_DTD=true` 且支持外部实体解析，因此通过该 mapper 反序列化用户提交的 XML 时，攻击者可注入 DOCTYPE/外部实体，读取服务器本地文件或发起 SSRF。source→sink 链路：HTTP 请求体（第 74 行入口）→ router/handler → 共享 `XmlMapper`（第 111 行注册）→ `readValue` 解析 → XXE。无任何有效防御（namespace-aware 不是防御措施）。
+
+4. **第 120–143 行（`shutdown()` / `shutdownEventExecutorsGroupIfNeeded()`）**：资源清理逻辑，无外部输入参与，无漏洞。
+
+5. **第 145–160 行（getter）**：纯读取器，无风险。
+
+6. **第 162–268 行（`Builder`）**：所有 setter 的 source 是**编程式 API 调用方**（开发者代码），非网络输入；`dataPath()` 直接转 `Paths.get(dataPath)`，但调用方可信（嵌入式库用法），不构成不可信数据流。`findFreeTcpPort()` 无风险。
+
+7. **第 253–267 行（`build()`）**：使用反射复制字段，字段来源仍是 Builder 自身，无不可信输入注入面。
+
+8. **第 270–285 行（`NamingThreadFactory`）**：线程命名工具，无风险。
+
+**替代通道核查**：文件中唯一对外入口是第 74 行的 HTTP server；唯一解析外部数据的组件是第 104–111 行的 XML 栈；无环境变量、无文件回调等其他通道。结论基于全文证据成立：存在 XXE 漏洞。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-611 (XXE, Improper Restriction of XML External Entity Reference)",
+  "risk_level": "High",
+  "source": "line 74: HttpServerInitializer 接收的外部 HTTP 请求体 XML",
+  "sink": "line 106-111: 未禁用 DTD 和外部实体的 WstxInputFactory 构造的 XmlMapper 被注册并用于反序列化用户 XML",
+  "explanation": "start() 在第 74 行建立 HTTP 入口并将 serviceFactory 提供给路由; createServiceFactory() 在第 104-105 行创建 WstxInputFactory 时仅设置 IS_NAMESPACE_AWARE, 未设置 SUPPORT_DTD=false 或 IS_SUPPORTING_EXTERNAL_ENTITIES=false, Woodstox 默认允许 DTD 与外部实体; 该 XmlMapper 在第 111 行注册后供全部 handler 解析请求体, 攻击者可提交带 DOCTYPE 的 XML 触发本地文件读取或 SSRF",
+  "fix_suggestion": "line 104-105: 创建 input 后补充设置 input.setProperty(XMLInputFactory.SUPPORT_DTD, Boolean.FALSE) 与 input.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, Boolean.FALSE), 并禁用 DTDPP"
+}
+```

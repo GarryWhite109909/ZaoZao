@@ -1,0 +1,38 @@
+## 编号分析（逐函数、行号锚定）
+
+**入口点枚举**：本控制器暴露 4 个可路由动作 —— `login()`、`logout()`、`forgotPassword()`、`resetPassword($userId, $key)`；外部输入源包括 `$_COOKIE['remember_key']`（第 66 行）、POST 参数 `email/password/remember_me/password`（第 88-91、152、175 行）、路由参数 `$userId/$key`（第 168 行）、会话变量 `php-censor-login-redirect`（第 208 行）。以下逐一核对 source→sink。
+
+**1. login() 第 65-77 行 —— Cookie 认证路径**
+`$_COOKIE['remember_key']` 直接进入 `getByRememberKey()` 做 DB 精确匹配查询（参数化，无注入）。Cookie 值本身由第 116 行 `md5(random_bytes(64))` 生成，128-bit 熵，不可预测、不可枚举。setcookie（第 118-125 行）第 8 参为 `true` 即 HttpOnly。无 XSS sink（值不回显）。此路径无有效攻击流。
+
+**2. login() 第 87-135 行 —— 表单登录**
+- CSRF：第 74 行 `Csrf('login_form')`，第 90 行 `validate()` 校验，防御有效。
+- `$email` 进入 `getByEmailOrName()`（Store 层参数化查询），无拼接 SQL。
+- 密码验证委托 provider 的 `verifyPassword()`（第 102 行），无比较绕过。
+- 登录成功后 `RedirectResponse` 目标来自 `getLoginRedirect()`（第 203-212 行），其值取自服务端 session `php-censor-login-redirect`，并强制前缀拼接 `APP_URL`（第 209 行），非用户可控的开放重定向。
+
+**3. logout() 第 141-159 行**
+仅销毁会话与 cookie，无输入参与任何 sink。注意 cookie 未带 Secure 标志属加固建议而非可利用漏洞。
+
+**4. forgotPassword() 第 167-194 行**
+- `$email` 仅用于 `getByEmail()` 参数化查询与 `Email` 发送对象，不进入 eval/include/header/shell 等 sink。
+- 用户枚举（第 174-177 行对不存在邮箱返回不同提示）属低危信息泄露弱点，非可直接利用漏洞。
+- 该 POST 无 CSRF 字段，但发送重置邮件本身对攻击者收益极低（token 见下）。
+
+**5. resetPassword() 第 202-227 行 —— 重点核查**
+- 重置令牌算法（第 172 / 205 行）：`md5(date('Y-m-d') . $user->getHash())`。日期可猜，但 `$user->getHash()` 是 `password_hash()` 的 bcrypt 输出（第 176 行可见新哈希生成方式），含随机盐，未登录者无法推算令牌。令牌当日有效、次日失效，且成功改密后哈希更新使旧令牌立即作废（第 178 行）—— 不存在长期重放窗口。
+- 比较使用 `!=` 而非 `hash_equals`（第 207 行）：md5 十六进制串上存在理论时序侧信道，但该比较对象是服务器端派生值的字符串比较，PHP 引擎下实际不可利用。
+- 缺陷：第 204-205 行在 `empty($user)` 判断之前就调用 `$user->getHash()`，传入无效 `$userId` 会触发 PHP 致命错误（空指针），这是可用性/健壮性 bug，不是安全漏洞（不泄露数据、不提权）。
+- 新密码经 `password_hash(..., PASSWORD_DEFAULT)` 处理后存储，安全。
+- 成功重置即自动登录（第 181 行）依赖持有效令牌，符合重置流程语义。
+
+**6. 输出编码**
+所有用户相关数据回显均经由 `Form::render()` 与视图层（PHPCensor 视图默认 HTML 转义），本文件内无 `echo`/`print` 原始输出、无 `unserialize`、无文件操作、无命令执行 sink。
+
+**第二入口/替代通道核查**：`getLoginRedirect` 只读 session（服务端）；`remember_key` 可被同域 XSS 窃取，但本文件无 XSS sink，且 cookie 为 HttpOnly。未发现替代可达的危险 sink。
+
+**结论**：全文四个动作中，所有外部输入要么进入参数化查询，要么进入密码学安全的验证流程，唯一的 redirect 目标被 APP_URL 白名单式前缀约束。存在的仅为低危弱点（用户枚举提示差异、cookie 未设 Secure、resetPassword 空指针顺序错误、`!=` 比较），均构不成可利用的安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全部四个动作：cookie remember_key 由 random_bytes(64) 高熵生成且 HttpOnly；SQL 访问均为 Store 层参数化查询；登录表单含 Csrf 校验；重定向目标强制拼接 APP_URL 前缀防开放重定向；重置令牌 md5(日期+bcrypt哈希) 因哈希含盐不可预测且改密后即时失效；新密码经 password_hash 安全存储。仅存低危弱点：forgotPassword 存在用户枚举提示差异、cookie 未设 Secure 标志、resetPassword 在 empty 判断前调用 getHash 导致无效 id 时致命错误（可用性缺陷）、令牌比较用 != 而非 hash_equals，均不构成可利用安全漏洞。", "fix_suggestion": "no fix needed"}
+```

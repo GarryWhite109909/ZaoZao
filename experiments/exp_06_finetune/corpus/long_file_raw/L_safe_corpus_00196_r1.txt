@@ -1,0 +1,26 @@
+## 编号分析
+
+**1. `_shell_quote`（第 57–64 行）**
+- POSIX 分支用 `shlex.quote`，单引号包裹，安全。
+- Windows 分支：拒绝 `\r\n\x00` 后用双引号包裹并把 `"` 替换为 `""`。但 **cmd.exe 并不把引号内的 `""` 当作转义**——`""` 会被解析为“关闭再重新打开引号”。例如 path 为 `x" & calc & "y` 时输出 `"x"" & calc & ""y"`，cmd 解析后 `& calc` 脱离引号被执行。该黑名单式检查（仅过滤三个字符）按分析要求视为可绕过，不构成有效防御。
+
+**2. `ProcessMergeDriver.merge`（第 67–130 行）**
+- Source：`path` 参数（来自被合并文件的仓库内路径，攻击者可通过恶意仓库文件名控制）；`ancestor/ours/theirs` 写入临时文件（第 82–89 行），内容不进入命令行，无注入。
+- Sink：第 116 行 `subprocess.run(cmd, shell=True)`。
+- 数据流：`path` → `_shell_quote`（Windows 下可绕过）→ `cmd.replace("%P", ...)`（第 110–114 行）→ `shell=True` 执行。POSIX 上防御有效；Windows 上存在命令注入。
+- 替代通道：`%O/%A/%B` 是临时目录内固定名路径（tmpdir 由 tempfile 生成），不可控；`%L` 是 int。均安全。
+- 注意替换顺序：先替换 `%O/%A/%B/%L` 再插入 `%P`，若 path 含字面 `%A` 不会再被二次展开，无占位符回注问题。
+
+**3. `MergeDriverRegistry.get_driver` / `_create_from_config`（第 158–196 行）**
+- 第二入口：driver 命令来自 `config.get(("merge", name), "driver")`（第 190 行）。git 配置可来自仓库本地 `.git/config`（克隆恶意仓库即植入），随后作为 `shell=True` 命令执行。这与 git 自身行为一致（设计如此），但对把 dulwich 用于自动合并不可信仓库的服务而言是固有 RCE 面，需调用方知情。
+
+**4. `get_merge_driver_registry`（第 205–216 行）**
+- 全局单例 + 允许后续覆盖 `_config`，多租户场景下可能让一个调用者的配置影响全局，属次要设计隐患。
+
+## 结论
+
+主要漏洞：Windows 平台下 `%P` 的引号转义方式对 cmd.exe 无效，攻击者通过恶意仓库中的文件名（经 `path` 传入）可实现命令注入。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "command injection", "risk_level": "high", "source": "merge() 的 path 参数（第 68 行），来自被合并文件的仓库内路径，可由恶意仓库名控制", "sink": "subprocess.run(cmd, shell=True)（第 116 行）", "explanation": "ProcessMergeDriver.merge 将攻击者可控的 path 经 _shell_quote 引用后拼入命令并以 shell=True 执行。POSIX 分支使用 shlex.quote 防御有效；但 Windows 分支（第 60-63 行）采用双引号加双写引号的转义，而 cmd.exe 不将引号内的双写引号视为转义，攻击者可用形如 x<quote> & calc & <quote>y 的文件名突破引号执行任意命令。对 \\r\\n\\x00 的黑名单检查不足以阻止此类绕过。此外 _create_from_config（第 190 行）允许仓库本地 .git/config 中的 merge.<name>.driver 作为 shell 命令执行，属于继承自 git 的固有风险面，自动化处理不可信仓库时构成第二入口。", "fix_suggestion": "Windows 下避免 shell 拼接：改用列表形式参数并经 subprocess 的 list2cmdline 或直接以 args 列表调用（配合 shell=False 与 cmd /c）；或对 path 中所有 cmd 元字符（含引号、&、|、^、% 等）做严格校验/拒绝。同时建议文档明确声明加载仓库本地 merge driver 配置的信任边界，并在服务化场景默认禁用。"}
+```

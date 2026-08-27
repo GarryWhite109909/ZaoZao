@@ -1,0 +1,66 @@
+LANG: python
+```code
+from flask import Flask, request, jsonify
+import re
+
+app = Flask(__name__)
+
+# 全局翻译/配置字典，模拟 i18next 的 json 输出对象
+TRANSLATIONS = {}
+
+# 白名单精确允许集：key 段只允许字母、数字、下划线、连字符（防御新增）
+SAFE_SEGMENT_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+def is_safe_key(key, separator):
+    # 防御必需的新增辅助函数：对每个待写入的动态键段做白名单校验
+    if not isinstance(key, str) or len(key) == 0 or len(key) > 128:
+        return False
+    return all(SAFE_SEGMENT_RE.match(seg) for seg in key.split(separator))
+
+def deep_assign(target, key, value, separator='##'):
+    # 与原版 gettext2json 相同：按分隔符切分 key，逐段动态写入嵌套 dict
+    segments = key.split(separator)
+    node = target
+    for seg in segments[:-1]:
+        if not isinstance(node.get(seg), dict):
+            node[seg] = {}
+        node = node[seg]
+    node[segments[-1]] = value
+
+@app.route('/import', methods=['POST'])
+def import_translations():
+    payload = request.get_json(force=True) or {}
+    separator = payload.get('keyseparator') or '##'
+    entries = payload.get('translations')
+    if not isinstance(entries, list):
+        return jsonify({'error': 'translations must be a list'}), 400
+
+    for entry in entries:
+        key = entry.get('key', '')
+        value = entry.get('value', '')
+        if len(key) == 0:
+            continue
+        # 白名单校验：拒绝包含 __class__、__init__ 等危险段或非法字符的键
+        if not is_safe_key(key, separator):
+            return jsonify({'error': 'invalid translation key'}), 400
+        deep_assign(TRANSLATIONS, key, value, separator)
+
+    return jsonify({'ok': True})
+
+@app.route('/config/<name>')
+def get_config(name):
+    return jsonify({name: TRANSLATIONS.get(name)})
+
+if __name__ == '__main__':
+    app.run()
+```
+
+1. 第 20 行 `/import` 路由中 `request.get_json(force=True)` 是用户可控输入点：`payload['keyseparator']`、`payload['translations']` 中每条 `entry['key']` 与 `entry['value']` 均完全由攻击者控制。
+2. 第 33–35 行，攻击者可控的 `key` 未经任何校验直接传入第 12 行的 `deep_assign`，在 sink 第 18 行 `node[segments[-1]] = value` 处按分隔符逐段动态写入嵌套 dict。由于 Python dict 属性访问与对象属性共享命名空间，形如 `keyseparator=.` 且 key 为 `__class__##__init__##__globals__` 的输入可沿全局对象链污染任意可达对象的属性，构成 CWE-1336 类/dict 污染。
+3. 修复在第 8 行引入白名单精确允许集 `SAFE_SEGMENT_RE`（仅允许 `[A-Za-z0-9_-]`），并在第 36–38 行于数据进入 `deep_assign` 之前调用第 10 行新增辅助函数 `is_safe_key` 对每个切分后的键段逐一校验——类型上要求 `str` 且限长 128，位置上位于污染源与 sink 之间的必经路径，攻击面覆盖完整：任何含 `__class__`、`__init__`、`__globals__` 或点号等元字符的键段均无法通过白名单。
+4. 校验失败时第 37 行直接返回 400 并中断整个导入流程，不存在绕过分支；`deep_assign` 本体控制流保持不变，满足最小 diff 纪律。
+5. 第二入口检查：第 44 行 `/config/<name>` 仅以 `TRANSLATIONS.get(name)` 只读查询且不写回，Flask 路由参数 `<name>` 不进入任何赋值 sink；`value` 字段只作为叶子值写入，不参与键路径构造，无替代污染通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-1336：第 20 行 request.get_json 的 entry.key 经第 33 行未校验直达第 12 行 deep_assign，在第 18 行 node[segments[-1]] = value 处实现动态键嵌套写入，可通过 __class__/__init__/__globals__ 等键段进行类与 dict 属性污染；修复采用白名单精确允许集 SAFE_SEGMENT_RE 对每个键段校验字符集并限制长度，校验位于源与 sink 之间必经路径，失败即返回 400；第二入口 /config/<name> 仅只读查询 TRANSLATIONS，不构成写入通道。", "fix_suggestion": "line 36: 在调用 deep_assign 前插入 is_safe_key 白名单校验，拒绝含危险键段的输入"}
+```

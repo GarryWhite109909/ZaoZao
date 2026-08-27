@@ -1,0 +1,79 @@
+# 逐函数全文分析（含行号锚定）
+
+## 文件结构总览
+本文件是 Home Assistant 本地备份代理（Core/Container 安装），共定义：模块级入口 `async_get_backup_agents`（第 20-25 行）与类 `CoreLocalBackupAgent`（第 28 行起），类内方法包括构造器、`_load_backups`、`_read_backups`、`async_download_backup`、`async_upload_backup`、`async_list_backups`、`async_get_backup`、`get_backup_path`、`get_new_backup_path`、`async_delete_backup`。以下逐一枚举入口点与数据流。
+
+---
+
+## 1. 模块级入口 `async_get_backup_agents`（第 20-25 行）
+- 入口点：Home Assistant 备份集成注册回调，由框架在发现备份代理时调用，参数来自集成配置而非用户直接输入。
+- 第 23 行 `is_hassio(hass)` 判断是否为 Supervised/HassOS 安装；若是则返回空列表，否则返回 `CoreLocalBackupAgent(hass)`。
+- 数据流：无外部 source 到危险 sink 的流，仅对象实例化。**无漏洞**。
+
+## 2. `__init__`（第 29-36 行）
+- 第 33 行 `self._backup_dir = Path(hass.config.path("backups"))`：路径来自 HA 配置目录拼接固定子目录 `"backups"`，非用户可控。`self._backups` 为内存字典缓存。**无漏洞**。
+
+## 3. `_load_backups`（第 38-44 行）
+- 将 `_read_backups` 投递到执行器线程运行（第 40 行），结果整体替换 `self._backups`。
+- 注意：此处为“全量替换”而非合并，若上传后未刷新磁盘状态会被覆盖——这是可用性问题而非安全问题。
+
+## 4. `_read_backups`（第 46-58 行）—— 第一入口：文件系统扫描
+- 第 51 行 `self._backup_dir.glob("*.tar")` 枚举备份目录下所有 `.tar` 文件。source = 磁盘上任意放入该目录的 tar 文件（攻击者若能写入该目录即控制内容；本地攻击面）。
+- 第 52 行 `read_backup(backup_path)` 解析 tar 内元数据（backup.json），得到 `AgentBackup`，其字段（`backup_id`、名称等）完全由文件内容决定，**没有任何校验或白名单**。
+- 第 53-54 行以 `backup.backup_id` 作为字典键存储 `(backup, backup_path)`。异常捕获（第 55 行）覆盖解析失败情形，但只防崩溃，不防恶意元数据。
+- 数据流 A：磁盘 tar 内容 → `read_backup` → `backup.backup_id`/文件名相关字段 → 存入 `self._backups`。此为后续 sink 的关键 source。
+
+## 5. `async_download_backup`（第 60-66 行）
+- 直接 `raise NotImplementedError`（第 65 行）。Core 本地代理不支持下载（下载走 HTTP 层其他通道）。无数据流。
+
+## 6. `async_upload_backup`（第 68-79 行）—— 第二入口：上传通道 ★核心
+- 参数来源：`open_stream`（上传字节流的工厂）、`backup: AgentBackup`（由上层 API 从用户提交的元数据构造，`backup_id` 与建议文件名均为外部可控）、`on_progress` 回调。
+- 第 78 行 `self._backups[backup.backup_id] = (backup, self.get_new_backup_path(backup))`：
+  - **source**：`backup.backup_id`（外部可控字符串）作为字典键；
+  - **sink 前置**：调用 `get_new_backup_path(backup)` 计算落盘路径。
+- 关键缺陷验证：`get_new_backup_path`（见第 8 节）用 `suggested_filename(backup)` 直接拼接到 `_backup_dir` 之后，**没有对路径分隔符（`/`、`\`）、`..`、绝对路径做任何过滤或规范化**。按分析要求，“黑名单/正则视为可绕过”——而这里连黑名单都没有，属于零防御。
+- 后果链：恶意客户端在上传时提供形如 `../../home/user/.ssh/x.tar` 的建议文件名（或含分隔符的 `backup_id`），则写入/登记的路径逃逸出备份目录。虽然实际写盘发生在通用备份管理器（本文件外），但本函数把未经净化的 Path 登记进 `self._backups`，使 `get_backup_path`/`async_delete_backup` 后续可对该越界路径执行 `unlink` —— 形成**任意文件删除**原语（CWE-22/CWE-73）。
+- 另注意：本函数只更新内存映射而不真正写文件（真实写盘在 manager 中），但路径决策在此处做出，防御缺失的责任在本层。
+
+## 7. `async_list_backups`（第 81-85 行）
+- 懒加载后返回所有 backup 元数据列表。元数据（含恶意文件名）会回显给前端/API 消费者——次要问题：可能造成 UI 层显示欺骗，但不构成独立高危漏洞。
+
+## 8. `get_new_backup_path`（第 96-99 行）★sink 所在
+- 第 98 行 `return self._backup_dir / suggested_filename(backup)`：
+  - `pathlib` 的 `/` 运算符行为：若右侧是绝对路径（如 `/etc/passwd`），结果**直接取右侧绝对路径**，完全丢弃左侧基目录——这是比 `..` 更直接的逃逸通道；
+  - 若右侧含 `../`，Path 不做规范化，保留穿越段；
+  - 无任何 `resolve()` + `is_relative_to(_backup_dir)` 校验，无文件名白名单正则。
+- 结论：source（上传元数据中的建议文件名/backup_id）→ sink（Path 拼接并登记用于后续 unlink/写盘）之间**不存在有效防御**。
+
+## 9. `get_backup_path`（第 88-94 行）
+- 仅从 `self._backups` 字典查表返回已登记路径（第 91 行），KeyError 转 `BackupNotFound`。它本身不做校验，但会把第 6 节登记的越界 Path 原样交给调用者（删除流程），是数据流的中间转发点。
+
+## 10. `async_get_backup`（第 69 区间，实际第 101-121 行区域）
+- 懒加载后检查 `backup_id in self._backups`（键查找，不涉及路径拼接）；第 110 行仅做 `backup_path.exists()` 存在性检查——存在性检查不能阻止路径穿越（穿越目标文件存在反而通过）。返回的是元数据而非文件内容，主要风险仍是把越界路径信息暴露给上层。
+
+## 11. `async_delete_backup`（第 123-131 行）★第二 sink
+- 第 127 行 `backup_path.unlink(True)` 在执行器中删除文件，`missing_ok=True` 风格（第二个位置参数）。
+- **完整删除链**：上传时恶意建议文件名（source，第 78 行）→ `get_new_backup_path` 未净化拼接（第 98 行）→ 登记 `self._backups` → `get_backup_path` 取出（第 91 行）→ `unlink` 删除任意可写文件（第 127 行）。全程无路径 containment 校验。
+- 缓解因素（如实评估）：需要已认证的 HA 用户具备备份管理权限，且 Core/Container 场景默认单管理员；但多用户安装中低权用户若被授予备份权限即可越权删除 HA 进程可写的任意文件（如配置、数据库），属权限边界内提权破坏。
+
+## 12. 替代通道核查
+- 磁盘投递通道（第 51 行 glob）：攻击者若能向 backups 目录投放 tar，其元数据同样进入同一未净化路径逻辑，构成第二入口，结论一致。
+- `_read_backups` 以磁盘真实路径登记（第 53 行），该通道本身路径不可控，安全；危险仅在 upload 元数据通道。
+- 未发现环境变量、回调参数等其他 source。
+
+---
+
+## 综合结论
+唯一实质性漏洞：上传备份时外部可控的建议文件名经 `get_new_backup_path` 未净化拼接（且 pathlib 对绝对路径右侧直接采纳），导致路径穿越，最终可达任意文件删除（unlink）及越界写盘登记。类型 CWE-22（含 CWE-73 外部可控文件路径），风险等级：中高（需认证+备份权限，但后果为任意文件删除）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 路径穿越（伴随 CWE-73 外部可控文件路径）",
+  "risk_level": "中高",
+  "source": "line 68-77: async_upload_backup 的 backup 参数（backup_id 与 suggested_filename 由上传方元数据控制）",
+  "sink": "line 98: get_new_backup_path 中 self._backup_dir / suggested_filename(backup) 未净化拼接；line 127: async_delete_backup 中 backup_path.unlink 执行删除",
+  "explanation": "上传元数据中的建议文件名 -> line 78 get_new_backup_path -> line 98 pathlib 拼接无任何校验（绝对路径直接替换基目录，../ 保留穿越段）-> line 78 登记进 self._backups -> line 91 get_backup_path 取出 -> line 127 unlink 任意文件删除；磁盘投递 tar（line 51 glob）为第二入口，元数据同样进入同一逻辑",
+  "fix_suggestion": "line 98: 对 suggested_filename 结果先取 Path(name).name 剥离目录成分，再 resolve() 并断言 is_relative_to(self._backup_dir)，同时用白名单正则限制文件名字符集，拒绝包含路径分隔符或以绝对路径形式出现的输入"
+}
+```

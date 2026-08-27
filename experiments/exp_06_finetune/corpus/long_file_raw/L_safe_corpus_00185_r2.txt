@@ -1,0 +1,81 @@
+# sqls main.go 全文安全分析
+
+## 一、文件结构总览
+
+本文件是 sqls（SQL Language Server）的主入口，共约 130 行，包含以下函数/代码块：
+
+1. `main()`（第 22–27 行）
+2. `realMain()`（第 29–76 行）
+3. `serve()`（第 78–125 行）
+4. `stdrwc` 类型及其 `Read`/`Write`/`Close` 方法（第 127–143 行）
+5. `openEditor()`（第 145–152 行）
+
+下面逐一分析每个入口点与数据流。
+
+## 二、逐函数入口点枚举与数据流验证
+
+### 1. `main()`（第 22–27 行）
+
+仅调用 `realMain()` 并处理错误退出码。无独立输入源、无 sink。不构成攻击面。
+
+### 2. `realMain()`（第 29–76 行）
+
+**入口点 A：命令行参数**（`os.Args`，第 74 行传入 `app.Run`）。定义了三个 flag：
+- `-log / -l`（第 35–39 行）：日志文件路径
+- `-config / -c`（第 40–44 行）：配置文件路径
+- `-trace / -t`（第 45–49 行）：调试开关
+
+**入口点 B：子命令 `config`**（第 53–62 行）：
+```go
+editorEnv := os.Getenv("EDITOR")
+if editorEnv == "" { editorEnv = "vim" }
+return openEditor(editorEnv, config.YamlConfigPath)
+```
+- **source**：环境变量 `EDITOR`。
+- **sink**：`exec.Command(program, args...)`（第 148 行）。
+
+**数据流验证**：`EDITOR` 是用户自己的 shell 环境变量，只有能控制该进程启动环境的本地用户才能设置——而该用户本就拥有执行任意程序的权限。这是编辑器生态的通用惯例（git、crontab 等同样行为），不构成权限提升或注入漏洞。且参数以 `args...` 切片形式传递给 `exec.Command`，**不经 shell 解释**，无 shell 注入问题。第二个参数 `config.YamlConfigPath` 是包内常量路径，非外部可控。
+
+**入口点 C：默认 Action → `serve(c)`**（第 70–72 行），见下。
+
+### 3. `serve()`（第 78–125 行）
+
+**入口点 D：flag 值**
+- `logfile`（第 79 行）→ `os.OpenFile(logfile, ...)`（第 88 行）：任意文件写入？注意：这是**本机用户自己指定的命令行参数**，写日志到任意路径等价于该用户直接用 shell 重定向，无提权意义。非漏洞。
+- `configFile`（第 80 行）→ `config.GetConfig(configFile)`（第 106 行）：读取 YAML 配置并赋给 `server.SpecificFileCfg`。配置内容后续由 handler 包消费（不在本文件内），但来源仍是本机用户的 CLI 参数，信任边界内。
+- `trace`（第 81 行）→ 仅影响日志开关（第 117–119 行），无 sink。
+
+**入口点 E：stdin/stdout JSON-RPC 通道**（第 122–128 行 + `stdrwc` 第 127–143 行）：
+- LSP 客户端通过 stdin 发送 JSON-RPC 消息，全部路由到 `server.Handle`（第 103 行，实现在 internal/handler 包，不在本文件）。
+- 本文件中该通道没有直接的 source→sink 流；消息解析交给 jsonrpc2 库与 handler。若 handler 内部存在漏洞（如 SQL 补全中的注入），责任在 handler 包，无法从本文件证据判定，不得猜测。
+
+### 4. `stdrwc`（第 127–143 行）
+
+纯 I/O 适配器：`Read` 读 stdin、`Write` 写 stdout、`Close` 关闭二者。无输入校验需求，无 sink。
+
+### 5. `openEditor()`（第 145–152 行）
+
+唯一 sink 所在：
+```go
+cmd := exec.Command(program, args...)
+```
+- `program` 来源仅为 `os.Getenv("EDITOR")` 或硬编码 `"vim"`；
+- `args` 仅为 `config.YamlConfigPath` 常量；
+- 未使用 shell（无 `sh -c`），参数数组形式天然免疫注入；
+- 无 `cmd.Env` 定制、无相对路径劫持面（`exec.Command` 使用 PATH 查找，但 PATH 由用户自己控制，同前述结论）。
+
+## 三、第二入口与替代通道核查
+
+- HTTP/TCP 监听：全文无 `net.Listen`，仅 stdio（第 129–131 行注释及实现证实）。
+- 文件写入面：仅 logfile 一处，CLI 参数指定。
+- 环境变量：仅 `EDITOR` 一处。
+- 回调/信号：无。
+- 结论：不存在被遗漏的第二入口。
+
+## 四、总结
+
+所有 source（CLI 参数、EDITOR 环境变量、stdin JSON-RPC）要么处于用户自身信任边界内，要么流向不经 shell 的安全 API。黑名单/正则过滤未出现也无需出现。基于全文证据，未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认:唯一的命令执行sink位于openEditor(第145-152行),其program参数仅来自os.Getenv('EDITOR')(第56行)或硬编码'vim',args仅为常量config.YamlConfigPath;exec.Command使用参数数组而非shell解释,不存在注入。CLI参数-log/-config(第35-44行)由本机用户自行指定,读写任意路径不构成提权。stdin上的JSON-RPC消息(第122-128行)交由jsonrpc2库和handler包处理,本文件内无source到危险sink的数据流。无网络监听、无其他隐藏入口。", "fix_suggestion": "no fix needed"}
+```

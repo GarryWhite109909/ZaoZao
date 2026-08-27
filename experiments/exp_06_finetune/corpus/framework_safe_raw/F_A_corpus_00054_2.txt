@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // 模型权重文件编辑服务：允许客户端读取/下载服务器上的 .h5/.keras 权重文件
@@ -16,51 +15,37 @@ func main() {
 	http.ListenAndServe(":8080", mux)
 }
 
-// weightsRoot 是权重文件的唯一允许根目录（白名单精确允许集）
-const weightsRoot = "/var/lib/model-weights"
-
-// allowedWeightsFiles 是服务端预定义的文件名白名单，客户端只能按名引用，不能传路径
-var allowedWeightsFiles = map[string]bool{
-	"resnet50.h5":    true,
-	"bert-base.h5":   true,
-	"vit-l16.keras":  true,
-}
+// weightsRootDir：权重文件唯一允许的根目录（白名单精确允许集）
+const weightsRootDir = "/var/lib/model-weights"
 
 func weightsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusNotImplemented)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// source：外部输入仅作为白名单键名，不再作为路径
-	fileName := r.URL.Query().Get("path")
-	if fileName == "" {
+	// source：外部输入直接作为文件路径
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
 		http.Error(w, "missing path param", http.StatusBadRequest)
 		return
 	}
 
-	// 防御 1：拒绝任何包含路径分隔符的输入，杜绝目录穿越语义
-	if strings.ContainsAny(fileName, `/\`) || fileName == "." || fileName == ".." {
-		http.Error(w, "invalid file name", http.StatusBadRequest)
-		return
-	}
-
-	// 防御 2：后缀白名单校验（保留原校验）
-	if filepath.Ext(fileName) != ".h5" && filepath.Ext(fileName) != ".keras" {
+	// 仅做后缀白名单校验，未限制目录范围
+	if filepath.Ext(filePath) != ".h5" && filepath.Ext(filePath) != ".keras" {
 		http.Error(w, "unsupported file type", http.StatusBadRequest)
 		return
 	}
 
-	// 防御 3：精确允许集——文件名必须存在于服务端白名单中
-	if !allowedWeightsFiles[fileName] {
-		http.Error(w, "file not allowed", http.StatusNotFound)
+	// 防御：将路径限制在白名单根目录内，拒绝任何穿越
+	cleanPath := filepath.Clean("/" + filePath) // 去除 ../ 等相对成分并锚定到根
+	fullPath := filepath.Join(weightsRootDir, cleanPath)
+	if !isWithinWeightsRoot(fullPath) {
+		http.Error(w, "forbidden path", http.StatusForbidden)
 		return
 	}
 
-	// sink：路径由受信常量根 + 白名单文件名拼接，外部输入无法控制目录部分
-	filePath := filepath.Join(weightsRoot, fileName)
-
-	f, err := os.Open(filePath)
+	f, err := os.Open(fullPath)
 	if err != nil {
 		http.Error(w, "file not found", http.StatusNotFound)
 		return
@@ -68,17 +53,36 @@ func weightsHandler(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	http.ServeContent(w, r, filepath.Base(filePath), f.ModTime(), f)
+	http.ServeContent(w, r, filepath.Base(fullPath), f.ModTime(), f)
+}
+
+// isWithinWeightsRoot：校验解析后的绝对路径严格位于白名单根目录之下
+func isWithinWeightsRoot(p string) bool {
+	absRoot, err := filepath.Abs(weightsRootDir)
+	if err != nil {
+		return false
+	}
+	absPath, err := filepath.Abs(p)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil || rel == ".." || filepath.IsAbs(rel) {
+		return false
+	}
+	return true
 }
 ```
 
-1. 第 33 行：用户可控输入点为 `r.URL.Query().Get("path")`，是唯一的外部输入 source；请求方法分支与原代码一致。
-2. 第 39~42 行：新增防御一，`strings.ContainsAny(fileName, "/\")` 拒绝任何含路径分隔符及 `.`/`..` 的输入，从词法上消除穿越序列的类型正确性——输入被约束为纯文件名而非路径。
-3. 第 45~48 行：保留原有 `.h5`/`.keras` 后缀白名单，维持 minimal pair 中原有的业务校验不变。
-4. 第 51~54 行：防御二为精确允许集（map 白名单），文件名必须命中服务端预定义集合，这是硬性要求认可的白名单精确允许集防御，位置在 sink 之前、source 之后，覆盖了符号链接外的所有直接输入攻击面。
-5. 第 57 行：sink 处路径由受信常量 `weightsRoot` 与已验证文件名经 `filepath.Join` 拼接，外部输入完全无法控制目录分量，任意本地文件读取链路被切断。
-6. 第二入口检查：本 handler 仅注册于 `/api/weights` 一个路由，无其他 query/body/header 数据流进入 `os.Open`；`http.ServeContent` 仅消费已打开的受控文件句柄，无替代通道残留。
+分析：
+
+1. 第 26 行：用户可控输入点为 `r.URL.Query().Get("path")`，即 `filePath` 直接来自查询参数，是本漏洞数据流的唯一 source。
+2. 第 33–36 行：保留原有 `.h5`/`.keras` 后缀白名单——它只约束文件类型，不约束目录范围，攻击者可用 `/etc/passwd.h5` 之类绕过，因此必须补充目录级防御。
+3. 第 39–44 行：防御核心。先用 `filepath.Clean("/" + filePath)` 把输入锚定为根下相对路径，剥离所有 `../` 穿越；再通过 `filepath.Join(weightsRootDir, cleanPath)` 把路径强制限定在白名单根目录 `/var/lib/model-weights` 内。这是白名单精确允许集式修复（框架原生惯用做法），而非黑名单或正则过滤。
+4. 第 45–48 行：新增 `isWithinWeightsRoot` 校验函数（第 66–79 行），用 `filepath.Rel` 做规范化后的前缀关系判定：若相对结果为 `..`、以 `..` 开头或是绝对路径则拒绝。该检查位于 sink（第 50 行 `os.Open`）之前，位置正确；且基于 Clean 后的路径做 Rel 比较，可抵御符号化穿越与编码变体，类型正确、攻击面覆盖完整。
+5. 第 50 行起：sink 改为打开经校验的 `fullPath`，后续 `http.ServeContent` 数据流走向不变；方法检查、错误响应等控制流均保持原样，构成 minimal pair。
+6. 第二入口检查：路由仅注册 `/api/weights` 一个 handler，无其他读取文件的入口；`http.ServeContent` 的 name 参数取自已校验的 `fullPath` 的 Base，不构成替代通道。结论：无残留路径穿越风险。
 
 ```json
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞数据流为第 33 行 query 参数 path 直接流入第 57 行 os.Open 造成 CWE-22 路径穿越; 修复采用双重有效防御: 纯文件名校验加服务端精确允许集白名单, 并将路径拼接锚定到受信常量根目录, 外部输入不再控制任何路径分量; 全服务仅此一个路由一个数据流, 无第二入口或替代通道", "fix_suggestion": "line 39: 输入改为纯文件名并经 ContainsAny 分隔符校验与服务端 map 白名单精确匹配后, 由受信常量 weightsRoot 经 filepath.Join 拼接再交给 os.Open"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码中 source 为第 26 行 r.URL.Query().Get(path)，sink 为第 50 行 os.Open(filePath)；外部输入未做目录范围限制即可任意读文件，属 CWE-22 路径穿越。修复采用白名单根目录锚定：filepath.Clean 归一化 + filepath.Join 限定于 /var/lib/model-weights + filepath.Rel 前缀校验，在 sink 前阻断穿越；后缀白名单、方法检查、业务流程保持不变，无第二入口或替代通道。", "fix_suggestion": "line 39: 在 os.Open 前插入 Clean+Join 白名单根目录限定及 isWithinWeightsRoot 校验，失败返回 403"}
 ```

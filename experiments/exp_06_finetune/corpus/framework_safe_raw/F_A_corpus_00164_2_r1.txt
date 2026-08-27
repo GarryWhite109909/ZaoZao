@@ -1,0 +1,102 @@
+LANG: go
+```go
+// mcp_auth_server.go — simplified MCP authorization server (Go net/http)
+package main
+
+import (
+	"crypto/subtle"
+	"encoding/json"
+	"log"
+	"net/http"
+	"sync"
+)
+
+type Session struct {
+	ClientID string
+	Scope    string
+	Resource string // RFC 8707 audience
+}
+
+var (
+	mu       sync.RWMutex
+	sessions = map[string]*Session{} // sessionID -> session
+)
+
+// RFC 7662 requires the introspection endpoint itself to be protected:
+// only registered Resource Servers may call it.
+var authorizedRS = map[string]string{
+	"rs-api-gateway": "s3cr3t-rs-key-9f2a",
+	"rs-mcp-proxy":   "s3cr3t-rs-key-4c7e",
+}
+
+// rsAuthorized verifies the Resource Server's Basic credentials against the
+// exact allowlist using constant-time comparison (defense-in-depth).
+func rsAuthorized(r *http.Request) bool {
+	clientID, secret, ok := r.BasicAuth()
+	if !ok {
+		return false
+	}
+	expected, ok := authorizedRS[clientID]
+	if !ok {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(secret), []byte(expected)) == 1
+}
+
+// POST /introspect — token introspection endpoint for Resource Servers (RFC 7662)
+func introspectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !rsAuthorized(r) { // defense: authenticate the caller before honoring any user-controlled token key
+		w.Header().Set("WWW-Authenticate", `Basic realm="introspect"`)
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]bool{"active": false})
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		json.NewEncoder(w).Encode(map[string]bool{"active": false})
+		return
+	}
+	token := r.FormValue("token")
+	if token == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]bool{"active": false})
+		return
+	}
+	mu.RLock()
+	sess, ok := sessions[token]
+	mu.RUnlock()
+	if !ok {
+		json.NewEncoder(w).Encode(map[string]bool{"active": false})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"active":     true,
+		"client_id":  sess.ClientID,
+		"scope":      sess.Scope,
+		"token_type": "Bearer",
+		"aud":        sess.Resource,
+	})
+}
+
+func main() {
+	http.HandleFunc("/introspect", introspectHandler)
+	log.Println("MCP Authorization Server running on :9000")
+	log.Fatal(http.ListenAndServe(":9000", nil))
+}
+```
+
+分析：
+
+1. 第 41 行 `r.FormValue("token")` 是唯一用户可控输入点：攻击者可提交任意 token 字符串作为 map 查找键；第 45 行 `sessions[token]` 直接以该键命中任意会话。
+2. 原代码漏洞成因：`/introspect` 端点本身无调用方认证（RFC 7662 明确要求 introspection 端点必须保护），任何匿名请求都能用猜测/枚举的 token 键换取会话元数据（client_id、scope、aud），构成 CWE-639 通过用户可控键绕过授权。sink 为第 55 行返回会话详情的 `json.NewEncoder(w).Encode(...)`。
+3. 修复位置正确性：防御插入在方法检查之后、`ParseForm` 与 token 读取之前（第 39–44 行），确保未认证请求在任何用户可控键被处理前即被拒绝，覆盖全部后续数据流。
+4. 防御类型正确性：第 24–37 行新增 `rsAuthorized` 使用框架原生 `r.BasicAuth()` 解析凭据，并对照精确白名单 `authorizedRS`（仅注册过的 Resource Server），配合 `crypto/subtle.ConstantTimeCompare` 常数时间比较防时序侧信道——这是白名单精确允许集 + 标准库安全 API，非黑名单或正则过滤。
+5. 攻击面覆盖完整性：所有到达 sink 的路径都必须先通过第 39 行认证闸门；无效凭据统一返回 401 + `active:false`，不泄露 token 是否存在，同时阻断枚举型 IDOR。
+6. 第二入口/替代通道检查：路由表仅有 `/introspect` 一个入口（第 68 行），无其他 handler 或中间件暴露 sessions map；`main` 与其余控制流、变量名、函数名均保持原样，满足最小 diff。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-639：第 41 行 r.FormValue('token') 作为用户可控键直接查找 sessions map 并在第 55 行泄露会话元数据，且端点缺少 RFC 7662 要求的调用方认证；修复为在 handler 入口处通过 rsAuthorized 对 Resource Server 凭据做白名单加常数时间校验，未认证请求一律 401 且不区分 token 存在性；第二入口检查确认路由表仅 /introspect 一个入口，无其他通道可达 sessions map。", "fix_suggestion": "line 39: 在 ParseForm 之前插入 rsAuthorized(r) 白名单认证检查，失败时返回 401"}
+```

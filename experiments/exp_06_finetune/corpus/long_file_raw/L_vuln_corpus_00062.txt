@@ -1,0 +1,23 @@
+## 编号分析（全文通读）
+
+**入口点枚举**
+1. 第 44 行 `GET /` 列表接口：仅返回配置信息，无 sink。
+2. 第 55 行 `/{server_id}/{path:path}` HTTP 代理：source 为第 56 行 `path` 路径参数与第 96 行 `request.query_params`；sink 为第 84/89 行 `target_url` 拼接后传入第 130 行 `session.request()`。
+3. 第 194 行 WebSocket `/​{server_id}/api/terminals/{session_id}`：source 为首消息 JWT（有 decode_token 验证）与第 195 行 `session_id`；sink 为第 246 行 `ws_connect(upstream_url)`。
+
+**逐条数据流验证**
+
+- **HTTP path（第 56 → 66 → 84 行）**：`_sanitize_proxy_path`（第 27–52 行）做了迭代解码 8 次（防 `%252e%252e` 二次编码绕过）、`posixpath.normpath`、去前导斜杠、拒绝以 `..` 开头。迭代解码本身是有效防御。**但**它使用的是 `posixpath`，只把 `/` 当分隔符，不处理反斜杠 `\`。输入如 `..\..\secret` 或 `%5C..%5C..%5C` 经解码后为 `..\..\secret`，`normpath` 不解析反斜杠，`lstrip('/')` 与 `startswith('..')` 检查均不命中（字符串以 `\` 或字母开头），最终原样拼入 `target_url`。若上游服务（或中间的 orchestrator/policy 网关，第 87–89 行）运行在 Windows/Nginx 等将 `\` 规范化为分隔符的环境，即构成路径穿越绕过。黑名单式 `startswith('..')` 按题目要求视为可绕过过滤。
+- **query_params（第 92–93 行）**：直接字符串拼接回 URL。FastAPI 的 QueryParams 会重新编码，风险低。
+- **X-Session-Id 头转发（第 99–101 行）**：aiohttp 会拒绝含 CRLF 的头值，注入风险低；但该值未验证即透传给上游，属信任客户端输入的弱设计。
+- **auth_type == 'session'（第 111–112 行）**：`cookies = request.cookies` 把用户对 open-webui 的**全部 Cookie** 转发给管理员配置的上游服务器，存在凭据泄露面（依赖上游可信度，中低危）。
+- **错误信息回显（第 168 行）**：`502` 响应包含上游异常细节，轻微信息泄露。
+- **WebSocket session_id（第 195 → 246 行）**：`session_id` 是单段路径参数，Starlette 通常不允许其中出现 `/`，但若编码字符（如 `%3F`、`%23`）被透传拼接进上游 URL，可能改变请求目标端点；aiohttp 会对 URL 再编码，实际可利用性有限。
+- **SSRF 面**：`base_url` 来自管理员配置（第 73 行），非用户可控，不构成用户级 SSRF。
+- **WebSocket 认证（第 205–238 行）**：首消息 JWT + 组权限校验完整，无未授权访问。
+
+**结论**：核心漏洞是 `_sanitize_proxy_path` 仅用 `posixpath` 规范化，无法防御反斜杠形式的穿越序列，配合 `startswith('..')` 黑名单可在特定上游环境下绕过，导致对已授权终端服务器的越权路径读取（受限 SSRF/路径穿越）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 (Path Traversal) / CWE-918 variant", "risk_level": "medium", "source": "line 56: path:path 路径参数（含 %5C 编码的反斜杠序列）", "sink": "line 84-89: target_url 拼接后于 line 130 传入 session.request()", "explanation": "_sanitize_proxy_path 使用 posixpath.normpath 且仅检查 cleaned.startswith('..')，反斜杠不被视为分隔符，因此 ..\\..\\secret 或 %5C..%5C 解码后可通过全部检查并原样拼入 target_url；当上游终端服务器或 policy 网关（Windows/Nginx 等）将反斜杠规范化为路径分隔符时即可穿越到 base_url 之外的任意路径 -> 迭代 unquote 防住了二次编码但防不住反斜杠变体", "fix_suggestion": "line 43-51: 在规范化前先将 path.replace('\\\\', '/') 统一为正斜杠再 normpath，并将校验改为逐段拆分后拒绝任何等于 '..' 的段（白名单式校验），而非 startswith 黑名单"}
+```

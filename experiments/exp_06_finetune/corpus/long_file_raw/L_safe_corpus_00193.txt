@@ -1,0 +1,29 @@
+## 编号分析（全文通读）
+
+**入口点枚举**：本模块是 electerm 本地文件操作层，所有函数通过 `fsExport`（第 271 行起）暴露给上层（渲染进程经 RPC 调用），参数均为外部可控的路径/内容。逐一核对：
+
+**1. 命令注入链 A（Windows）**
+- 第 49–51 行 `runWinCmd`：`execAsync(\`powershell.exe -Command "${cmd}"\`)`，直接字符串拼接进 shell。
+- 第 86–90 行 `getFolderSizeWin`：`Get-ChildItem -Path "${folderPath}" ...` 将 `folderPath` 未做任何转义拼入。
+- 数据流：调用方传入的任意 `folderPath`（可含 `" ; Start-Process calc` 等）→ 第 88 行拼接 → 第 50 行 `exec` 执行。**无任何过滤/转义，防御无效，命令注入成立。**
+
+**2. 命令注入链 B（Unix）**
+- 第 36–45 行 `run`：bash 执行拼接命令。
+- 第 92–96 行 `getFolderSize`：``du -sh "${folderPath}" && find "${folderPath}" ...``。虽加了双引号，但双引号内 `` ` `` 和 `$()` 仍会被 bash 展开，如 `$(reboot)` 可逃逸。**引号包裹不构成有效防御，注入成立。**
+
+**3. Zip Slip / tar 路径穿越**
+- 第 189–197 行 `unzipFile`：`tar.x({ file: localFilePath, C: targetFolderPath })` 直接解压；第 169–186 行 `handleWindowsDrive` 同样先解压再 `mv`。tar 库默认不剥离条目名中的 `../`，恶意压缩包内 `../../evil.sh` 条目可写到 `targetFolderPath` 之外，实现任意文件写入。**无条目名校验，漏洞成立。**
+
+**4. openFile（第 150–155 行）**：Windows 分支已改用 base64 环境变量 + `-LiteralPath`（第 151 行），且用 `spawn` 数组传参，无 shell 拼接——此函数是安全的（对比旧版拼接写法已修复）。Unix 分支 `spawn('open'/'xdg-open', [localFilePath])` 数组传参，无注入。
+
+**5. zipFolder（第 158–166 行）**：文件名由服务端 `uid()` 生成，cwd/basename 来自本地路径但仅用于 tar 参数（非 shell），无注入。
+
+**6. readCustom/writeCustom/openCustom/closeCustom（第 222–260 行）**：操作的是已打开的 fd，非路径，本身无新攻击面。
+
+**7. 第二入口验证**：`fsExport.writeFile/readdirAsync/statAsync` 等接受任意路径读写，但这属于设计上的全盘文件管理器功能，风险取决于上层鉴权，本文件内无法判定为独立漏洞；而上述 1、2、3 是本模块自身引入的可利用缺陷。
+
+**结论**：存在真实漏洞——两处命令注入与一处 tar 解压路径穿越。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "command_injection_and_path_traversal", "risk_level": "high", "source": "调用方传入的 folderPath（getFolderSize/getFolderSizeWin）以及 unzipFile 的 localFilePath 压缩包内容", "sink": "runWinCmd/exec 执行 powershell 字符串、run 执行 bash 拼接命令、tar.x 解压目标目录", "explanation": "第一处：runWinCmd 用模板字符串把 cmd 直接拼进 powershell.exe -Command 并经 exec 执行，getFolderSizeWin 又将未转义的 folderPath 拼入其中，攻击者可通过包含双引号或分号的路径注入任意 PowerShell 命令。第二处：getFolderSize 在 Unix 下执行 du -sh 加双引号拼接的路径，双引号内反引号与 $() 仍会被 bash 展开，同样可注入命令。第三处：unzipFile 与 handleWindowsDrive 使用 tar.x 直接解压到 targetFolderPath，未校验压缩包条目名中的 ../ 序列，恶意 tar 包可实现目录穿越任意文件写入（Zip Slip）。openFile 已采用 base64 环境变量加数组传参方式，属安全实现，可作为修复参考。", "fix_suggestion": "命令执行改为 spawn 并以数组形式传参避免 shell 解释，例如用 powershell -Command 配合环境变量传递路径（参照 openFile 的做法），或对路径做严格白名单校验并拒绝含引号、$、反引号等元字符的输入；tar.x 解压时校验每个条目的解析后路径必须位于目标目录之内（entry.path 规范化后以目标目录为前缀），拒绝绝对路径和 .. 穿越，或使用支持安全解压选项的版本"}
+```

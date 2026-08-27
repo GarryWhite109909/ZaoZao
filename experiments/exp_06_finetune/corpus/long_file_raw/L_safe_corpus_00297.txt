@@ -1,0 +1,16 @@
+## 编号分析
+
+1. **入口点枚举（全文通读）**：本文件无 HTTP 路由，唯一外部输入通道是 `get_act_fn(config)`（第 20 行起）中的 `config`（来自模型仓库的 HF `config.json`，属攻击者可控 source——加载不可信模型时）。其余函数（第 76 行 `resolve_classifier_act_fn`、各 Pooler 类、第 148 行 `LambdaPoolerActivation`）均为纯内部计算，无额外入口。
+
+2. **source→sink 数据流验证**：
+   - 第 44–56 行：从 `config.sentence_transformers["activation_fn"]` 或 `config.sbert_ce_default_activation_function` 提取字符串 `function_name`——这是 source。
+   - 第 57–62 行：防御为前缀白名单检查 `function_name.startswith("torch.nn.modules.")`。该防御仅校验前缀，不限制后续属性遍历深度与目标类型。
+   - 第 64 行：sink 为 `resolve_obj_by_qualname(function_name)()`，按点号逐级 getattr 并立即无参调用。
+
+3. **绕过分析（第二入口/替代通道）**：`resolve_obj_by_qualname` 通常实现为逐段 `getattr`，因此形如 `torch.nn.modules.activation.ReLU.__init__.__globals__['__builtins__']` 的限定名可通过前缀检查，遍历到任意 Python 对象（如 `eval`、`exec`、文件操作类）。虽然最终以无参调用 `()`，直接调用 `eval()` 会抛异常，但可触达大量无参即有副作用的可调用对象（如打开文件句柄的类、触发导入/反序列化的工厂函数），构成沙箱逃逸面。前缀过滤属于“黑名单式/浅层白名单”，按要求视为可绕过、非有效防御。
+
+4. **结论锚定**：漏洞路径为第 44–56 行（source）→ 第 57–62 行（无效防御）→ 第 64 行（sink），利用前提是服务端加载攻击者提供的模型配置（vLLM 常见部署形态），风险为潜在任意代码执行。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "unsafe dynamic object resolution leading to potential remote code execution", "risk_level": "high", "source": "get_act_fn 中来自不可信模型 config.json 的 activation_fn / sbert_ce_default_activation_function 字符串（约第 44-56 行）", "sink": "resolve_obj_by_qualname(function_name)() 无参动态实例化（第 64 行）", "explanation": "config 由被加载模型的 config.json 提供，攻击者可控。第 57-62 行仅用 startswith 检查前缀 torch.nn.modules.，属于浅层白名单，可被属性链遍历绕过：例如 torch.nn.modules.activation.ReLU.__init__.__globals__ 这类限定名能通过前缀检查并经逐级 getattr 触达 __globals__、__builtins__ 等任意对象，随后在第 64 行被立即调用，构成沙箱逃逸与潜在任意代码执行。文件其余部分（resolve_classifier_act_fn 及各 Pooler 类）仅为张量运算，无其他入口或数据流。", "fix_suggestion": "将前缀检查改为严格枚举白名单（如仅允许显式列出的 nn.Sigmoid/nn.Softmax/nn.Identity 等具体类名，禁止包含点号层级超过模块名的限定名）；解析后校验返回对象确为 torch.nn.Module 子类且其 __module__ 属于 torch 内部；同时禁止限定名中出现 __globals__、__builtins__ 等双下划线属性段。"}
+```

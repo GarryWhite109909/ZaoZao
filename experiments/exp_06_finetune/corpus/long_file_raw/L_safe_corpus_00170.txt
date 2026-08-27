@@ -1,0 +1,19 @@
+## 编号分析
+
+1. **第 33–36 行 `storagePath`**：将 `oid` 拆为首字符、次字符、完整串三层拼入 `filepath.Join`。`filepath.Join` 会做路径清洗（Clean），但若 `oid` 含 `..` 或绝对路径成分，第三层 `string(oid)` 可造成穿越，例如 `oid = "../x"` 会得到 `Root/./../x` 经 Clean 后逃逸出 `Root`。因此该函数本身**不构成有效防御**，安全性完全依赖上游对 `oid` 的校验。
+
+2. **第 39–43 行 `Upload` 入口校验**：调用 `ValidOID(oid)`（Gogs 中该函数要求 64 位十六进制字符），拒绝任何含 `/`、`.` 等的输入，随后才进入 `storagePath`。source（HTTP 请求体/OID 参数）→ sink（文件写入）的数据流在此被白名单式校验阻断，属有效防御。
+
+3. **第 45–62 行 已存在文件的防越权绑定**：对象已存在时强制重算请求体 SHA-256 并与 `oid` 比对，防止低权限仓库把他人 OID 绑定到自己的仓库后下载原内容——这是对水平越权（IDOR 式跨仓读取）的有效防御。
+
+4. **第 64–95 行 临时文件写入与发布**：先写 `TempDir` 下随机名临时文件（`os.CreateTemp`，无路径注入面），哈希验证通过后才 `os.Rename` 原子发布；并发竞态由 rename 的原子性与 `ErrOIDMismatch` 兜底，最终路径内容始终与 OID 哈希一致。无漏洞。
+
+5. **第 98–115 行 `Download`**：**未调用 `ValidOID`**，直接把外部传入的 `oid` 送入 `storagePath` 后 `os.Open`。这是全文唯一缺少入口校验的 source→sink 流（HTTP OID 参数 → 文件读取）。但核查第二入口：Gogs 的 LFS 服务端（`internal/lfs/server.go`）在路由解析阶段对所有 OID 统一执行 `parseOID`/`ValidOID` 校验后才构造 `OID` 调用 `Download`，非法字符在到达本文件前已被拒绝；且 `storagePath` 对 `len(oid) < 2` 返回空串使 `os.Open("")` 失败而非泄露目录。因此当前代码库内不存在可达的穿越读取路径——但这属于“依赖调用方”的脆弱防御纵深，非本文件内的实际可利用漏洞。
+
+6. **其余通道排查**：无环境变量、无回调、无用户可控的 `Root`/`TempDir`（来自服务配置）；错误信息不含路径回显给客户端的敏感内容；临时文件用 defer 清理无残留。未发现其他 sink。
+
+结论：基于全文证据，所有数据流要么被 `ValidOID` 白名单阻断，要么（Download）由上游统一校验保护且当前不可达利用，判定无实际安全漏洞；建议仅为防御纵深加固。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "Upload 在第 41 行通过 ValidOID 白名单校验 OID 后才拼接路径，并通过对已存在对象强制重算哈希（第 47-61 行）与临时文件哈希验证后原子 rename（第 64-95 行）防止跨仓越权绑定和竞态污染；Download（第 98-115 行）虽自身未校验 OID，理论上存在路径穿越读取风险，但经核查其唯一调用方为 LFS 服务端路由层，该层在解析参数时已统一执行 ValidOID 校验，非法输入无法到达本函数，故当前代码中不存在可利用的数据流。", "fix_suggestion": "no fix needed"}
+```

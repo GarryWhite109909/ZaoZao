@@ -1,0 +1,51 @@
+## 编号分析（全文通读，逐函数）
+
+1. **第 1–20 行（包声明与导入）**：`com.fasterxml.jackson.databind.DatabindContext`，Jackson databind 库的抽象基类。无入口路由、无文件/环境读取；source 均为方法参数。
+
+2. **第 33 行 / 第 96–104 行 `_format`、`_truncate`、`_quotedString`、`_desc`**：纯字符串处理，仅截断 500 字符用于错误消息。无注入 sink（不写日志文件、不拼 SQL），最多算日志内容问题，且库层不做日志脱敏是合理设计。无漏洞。
+
+3. **第 44–52 行 `constructType`**：将 `Type` 转为 `JavaType`，委托给 `TypeFactory`。输入来自内部类型解析，非攻击者直接可控字符串。无漏洞。
+
+4. **第 60–92 行 `resolveSubType(JavaType baseType, String subClassName)` —— 关键点 A**：
+   - source：参数 `subClassName`（在多态反序列化场景下可来自 JSON 输入中的 `@class`/type id，即外部可控）。
+   - 第 64 行分支：若含 `<`，走 `constructFromCanonical(subClassName)`——**未经过任何 PolymorphicTypeValidator 校验**。
+   - 第 71 行分支：`getTypeFactory().findClass(subClassName)` 触发类加载——同样**无 PTV 校验**。
+   - 防御仅剩第 76/85 行的 `isTypeOrSuperTypeOf(baseType)` 基类型约束。该约束有效性完全取决于调用方传入的 `baseType` 是否安全；Javadoc（第 55–58 行）自述“假定校验已由调用方完成”。这是典型的“信任调用方”模式：当使用旧式 `enableDefaultTyping()` 或自定义 TypeResolverBuilder 未接入 PTV 时，攻击者 type id 可直达 `findClass` 类加载 sink，构成 CWE-502 反序列化风险面。但注意：本类自身不是入口点，漏洞成立依赖上游配置缺陷，属条件性/纵深防御缺口。
+
+5. **第 100–133 行 `resolveAndValidateSubType` —— 关键点 B（对照组）**：
+   - 第 106 行先取 `ltIndex`；含泛型时转 `_resolveAndValidateGeneric`。
+   - 第 111 行 `ptv.validateSubTypeName(...)`，DENIED 即抛异常（第 112–113 行）；第 128–132 行对 INDETERMINATE 结果再做 `validateSubType` 二次校验。防御链完整有效。说明作者知晓正确做法，而 `resolveSubType` 是刻意保留的免检通道——这正是风险所在：两条路径并存，误用免检路径即绕过白名单。
+
+6. **第 135–160 行 `_resolveAndValidateGeneric`**：
+   - 第 143 行只把泛型名**前缀**交给 PTV 校验（`subClass.substring(0, ltIndex)`），随后第 146 行用**完整原始字符串** `constructFromCanonical(subClass)` 构造类型。若某 PTV 对基础名放行而对泛型参数中的嵌套类名会拒绝，此处存在校验对象与实际构造对象不一致的缝隙（校验的是 `X`，加载的是 `X<Y>` 中 Y 相关类型）。不过第 147–149 行仍有基类型约束兜底，且第 152–155 行对非 ALLOWED 情况补做 `validateSubType` 类级校验，实际可利用性低，属设计瑕疵而非可直接利用漏洞。
+
+7. **第 162–178 行三个 `_throw*` 方法**：仅抛 `JsonMappingException`，异常消息包含 PTV 类名与 subtype 名，经 `_truncate` 截断。信息泄露量极小（回显攻击者自己提交的字符串），不算漏洞。
+
+8. **第 196–210 行 `objectIdGeneratorInstance` / 第 212–224 行 `objectIdResolverInstance`**：
+   - source：注解元数据 `ObjectIdInfo.getGeneratorType()/getResolverType()`（来自被反序列化类的注解，通常非用户输入）。
+   - sink：`ClassUtil.createInstance(implClass, ...)` 反射实例化任意类。
+   - 若应用将不可信数据当作类定义来源（如动态编译/脚本化 schema），可实例化任意无参构造类（副作用构造函数）。但常规 Jackson 用法中 implClass 来自编译期注解，不可控。判定：理论 sink，实际不可达。
+
+9. **第 232–261 行 `converterInstance`**：
+   - source：`converterDef`（注解或 introspector 返回值）。
+   - 第 246–250 行有类型检查（必须是 Converter 子类），第 253–258 行经 HandlerInstantiator 或 `ClassUtil.createInstance` 实例化。同上，来源为注解元数据而非网络输入，正常威胁模型下不可控。无实际漏洞。
+
+10. **第二入口/替代通道核查**：全文无 HTTP 路由、无文件 IO、无环境变量、无回调注册；唯一外部影响面是多态 type id 字符串（第 63、101 行参数）。替代通道即上文分析的 `resolveSubType` 免检路径与 `_resolveAndValidateGeneric` 的“名校验、全串加载”缝隙。
+
+## 结论
+
+本文件是库代码，本身不含可直接远程利用的完整漏洞链；但 `resolveSubType` 作为无 PTV 校验的类加载通道（第 71、77 行 sink），在旧式默认类型启用或调用方未先行校验时构成 CWE-502 攻击面，且与已加固的 `resolveAndValidateSubType` 并存形成易误用的危险旁路。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-502 反序列化不可信数据（多态类型解析缺少校验的危险旁路）",
+  "risk_level": "中（条件触发：需上游启用默认多态或调用方未预校验）",
+  "source": "line 63: resolveSubType 的参数 subClassName，多态反序列化时可来自 JSON 中的 type id，攻击者可控",
+  "sink": "line 71 与 line 77: getTypeFactory().findClass(subClassName) 及 constructFromCanonical(subClassName)，触发任意类加载",
+  "explanation": "攻击者控制的 type id 字符串 -> 未经过 PolymorphicTypeValidator 校验 -> 直达 findClass 类加载 sink -> 仅受 baseType.isTypeOrSuperTypeOf 约束，若 baseType 选择宽松即可加载并实例化 gadget 类；对比 line 111 起的 resolveAndValidateSubType 有完整双重校验，证明此免检路径是可被误用的旁路；另 line 143 只校验泛型前缀而 line 146 用完整字符串构造类型，存在校验对象不一致的设计缝隙",
+  "fix_suggestion": "line 60: 将 resolveSubType 标记为 deprecated 并强制其内部委托 resolveAndValidateSubType 传入默认 LaissezFaireSubTypeValidator 之外的严格 PTV，或在方法开头加入 ptv.validateSubClassName 校验后再执行 findClass"
+}
+```
+
+补充说明：本次分析基于全文证据如实判定。需要强调的是，该漏洞并非开箱即用的远程漏洞——它是库层面的危险 API 设计（免检类加载旁路），实际危害取决于使用方是否以不安全方式调用 `resolveSubType`。

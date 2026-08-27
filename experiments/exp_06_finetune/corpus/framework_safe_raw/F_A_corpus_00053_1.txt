@@ -1,5 +1,5 @@
 LANG: php
-```php
+```code
 <?php
 
 namespace App\Http\Controllers;
@@ -9,56 +9,58 @@ use Illuminate\Support\Facades\Storage;
 
 class SourceMapController extends Controller
 {
-    // GET /sourcemap?cssFile=storage/css/app.css&mapUrl=app.css.map
-    public function load(Request $request)
+    // GET /sourcemap?css=assets/app.css&map=../../.env.map
+    public function show(Request $request)
     {
-        $cssFile = $request->query('cssFile');
-        $mapUrl  = $request->query('mapUrl');
+        $cssPath = $request->query('css');
+        $mapPath = $request->query('map');
 
-        if (!$cssFile || !$mapUrl) {
-            return response()->json(['error' => 'missing params'], 422);
+        if (!$cssPath) {
+            return response('missing css parameter', 400);
         }
 
-        // 模拟 previous-map 的 loadAnnotation：从 CSS 注释提取 sourceMappingURL
-        if (str_starts_with($mapUrl, 'data:application/json')) {
-            $inline = substr($mapUrl, strpos($mapUrl, ',') + 1);
-            return response()->json(['inline' => base64_decode($inline)]);
+        $cssContent = Storage::disk('local')->get($cssPath);
+
+        if ($mapPath === null) {
+            if (preg_match('/\/\*\s*# sourceMappingURL=(\S+)\s*\*\//', $cssContent, $m)) {
+                $mapPath = $m[1];
+            }
         }
 
-        // 修复：白名单精确允许集 —— map 文件必须与 cssFile 同目录、同名、且以 .map 结尾，
-        // 并通过 Storage 门面（框架原生安全 API）在受限磁盘根内解析，杜绝目录逃逸。
-        $disk     = Storage::disk('local');
-        $baseDir  = dirname($cssFile);                       // 例如 storage/css
-        $expected = basename($cssFile, '.css') . '.map';     // app.css -> app.css.map
-
-        if ($mapUrl !== $expected) {
-            return response()->json(['error' => 'invalid map path'], 403);
+        if (!$mapPath || !str_ends_with(strtolower($mapPath), '.map')) {
+            return response('no source map found', 404);
         }
 
-        $relativePath = ltrim($baseDir . '/' . $expected, '/');
-
-        if (!$disk->exists($relativePath)) {
-            return response()->json(['error' => 'map not found'], 404);
+        // 防御：使用框架原生 Storage API 在受限磁盘根内解析 map 路径，
+        // 拒绝任何逃出 disk root 的相对/绝对路径（含 ../、绝对路径、盘符）
+        $mapDiskRelative = ltrim(str_replace('\', '/', $mapPath), '/');
+        if (str_contains($mapDiskRelative, '..') || preg_match('#^([a-zA-Z]:|/)#', $mapDiskRelative)) {
+            return response('invalid map path', 400);
+        }
+        if (!Storage::disk('local')->exists($mapDiskRelative)) {
+            return response('map file not found', 404);
+        }
+        $fullPath = Storage::disk('local')->path($mapDiskRelative);
+        $realBase = realpath(Storage::disk('local')->path('/'));
+        $realFull = realpath($fullPath);
+        if ($realFull === false || !str_starts_with($realFull . DIRECTORY_SEPARATOR, $realBase . DIRECTORY_SEPARATOR)) {
+            return response('invalid map path', 400);
         }
 
-        $content = $disk->get($relativePath);
+        $content = Storage::disk('local')->get($mapDiskRelative);
 
-        return response()->json([
-            'mapFile' => basename($relativePath),
-            'root'    => dirname($relativePath),
-            'text'    => $content,
-        ]);
+        return response($content, 200)->header('Content-Type', 'application/json');
     }
 }
 ```
 
-1. 第 14-15 行：用户可控输入点为 `$request->query('cssFile')` 与 `$request->query('mapUrl')`，二者均直接来自查询字符串，是本数据流唯一外部源；第 20 行 data URI 分支不触达文件系统，保持原样。
-2. 原漏洞链：第 30-31 行将未校验的 `$mapUrl` 拼入路径，`../../.env.map` 可逃逸出 css 目录，第 34 行 `file_get_contents($real)` 即 sink，构成 CWE-22 路径穿越。
-3. 修复位置正确性：在第 29-33 行于任何路径解析之前先做白名单精确允许集校验——`$mapUrl` 必须严格等于由 `cssFile` 推导出的同目录同名 `.map` 文件，类型为字符串全等比较，无绕过空间；`../`、绝对路径、URL 编码变体全部因不等于期望值而被拒绝。
-4. 攻击面覆盖完整性：第 35 行改用框架原生安全 API `Storage::disk('local')->exists/get`，文件访问被限制在磁盘配置根目录之内，即使后续逻辑变化也无法越界读取；`realpath`/`file_get_contents` 直连文件系统的 sink 已被完全移除。
-5. 数据流走向与业务场景不变：仍是 cssFile + mapUrl → 定位 sourcemap → 返回 JSON，仅替换了路径构造与读取方式，满足 minimal pair 局部对照。
-6. 第二入口检查：data URI 内联分支（第 20-22 行）只做 base64 解码返回，不读文件系统，无路径穿越面；控制器无其他路由方法或额外请求字段，替代通道结论为不存在残余风险。
+1. 第 12–13 行：用户可控输入点为 `$request->query('css')` 与 `$request->query('map')`；此外第 22 行 sourceMappingURL 注释提取的 `$m[1]` 也是间接可控输入，三者均可携带 `../` 或绝对路径。
+2. 原漏洞 sink 为第 34 行 `file_get_contents($fullPath)`：原代码仅用 `str_ends_with('.map')` 黑名单式后缀检查加 `realpath` 后未做基目录校验，`../../.env.map` 可逃逸 storage 目录实现任意文件读取。
+3. 修复位置正确性：在第 31–44 行将路径解析改为框架原生 `Storage::disk('local')` API——先归一化分隔符并拒绝含 `..` 与绝对路径/盘符的输入（白名单式约束到磁盘根内），再以 `Storage::exists` + `Storage::path` + `realpath` 双重校验真实路径必须位于磁盘根前缀之内，类型上全部为字符串路径比较与布尔判断，无绕过空间。
+4. 攻击面覆盖完整性：无论 `$mapPath` 来自 query 参数还是 CSS 注释提取（第 21–24 行），两条来源都汇入同一处第 32 行起的统一校验后再进入读取，编码变体（`%2e%2e%2f`）经 Laravel query 解码后同样被 `..` 检查拦截；反斜杠已先归一化为 `/`，防止 Windows 分隔符绕过。
+5. 数据流保持：`$cssContent` 的读取（第 18 行）与业务流程、变量名、控制流均未改动，仅替换了 sink 处的文件读取方式为同盘 `Storage::get`，构成 minimal pair。
+6. 第二入口检查：本控制器无其他路由方法或构造函数注入点，`$cssPath` 走 `Storage::get` 本身受 disk root 约束不构成逃逸，故唯一危险数据流已被封堵。
 
 ```json
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-22：第 15 行 mapUrl 用户可控，第 30-31 行直接拼接进路径并在第 34 行 file_get_contents 读取，可用 ../../ 逃逸目录；修复采用白名单精确允许集（mapUrl 必须等于由 cssFile 推导的同名 .map 文件）加框架原生 Storage 磁盘 API 限定根目录读取，移除 realpath/file_get_contents sink；data URI 分支不触达文件系统，第二入口检查无残余风险", "fix_suggestion": "line 29: 用白名单校验 mapUrl 必须等于 basename(cssFile,.css).map 并改用 Storage::disk()->get 在受限磁盘根内读取"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-22 路径穿越任意文件读取：query 参数 map 与 CSS 注释提取的 sourceMappingURL 均可携带 ../ 或绝对路径，经 realpath 拼接后直接进入 file_get_contents 且未校验是否仍在 storage 磁盘根内；修复采用框架原生 Storage::disk(local) API 统一解析，拒绝 .. 与绝对路径并以 realpath 前缀校验强制结果落在磁盘根内，随后用 Storage::get 替代 file_get_contents，覆盖两个输入来源及编码变体", "fix_suggestion": "line 31: 用 Storage::disk(local) 归一化并校验 mapPath（拒绝 .. 与绝对路径），realpath 前缀校验后改用 Storage::get 读取"}
 ```

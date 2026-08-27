@@ -1,0 +1,70 @@
+# PackBits RLE 编解码器安全分析
+
+## 一、文件结构总览与入口点枚举
+
+本文件是 psd_tools 项目的纯 Python PackBits RLE 回退实现，全文共两个公开函数：
+
+1. `decode(data: bytes, size: int)` —— 第 41 行起定义
+2. `encode(data: bytes) -> bytes` —— 第 76 行起定义
+
+**入口点（source）枚举：**
+- `decode` 的参数 `data`：来自 PSD 文件中压缩的通道行数据，属于不可信外部输入（攻击者可控的文件字节流），第 42 行签名处。
+- `decode` 的参数 `size`：通常为图像宽度×通道字节数，一般由 PSD 文件头派生，也可能间接受攻击者影响。
+- `encode` 的参数 `data`：通常是程序内部生成的原始像素数据，可信度较高，但仍需验证其行为是否可被恶意输入触发异常。
+
+**汇点（sink）枚举：**
+- 第 47-48 行：`data = bytearray(data)`、`result = bytearray(size)` —— 内存分配。
+- 第 53、60、61 行：切片赋值 `result[j : j + actual] = ...` 与 `data[i : i + actual]` 切片读取。
+- 第 84-118 行：`result.extend(...)`、`result.append(...)`、`result.extend(data[i:j])`。
+
+## 二、逐函数逐数据流分析
+
+### 函数 1：`decode`（第 41-73 行）
+
+**数据流 D1：`data` → `bytearray(data)`（第 47 行）**
+source 为外部字节串。`bytearray()` 构造仅做内存拷贝，无解析逻辑，无注入面。防御：无需防御，无 sink 风险。✅ 安全。
+
+**数据流 D2：`size` → `bytearray(size)`（第 48 行）**
+若 `size` 来自恶意 PSD 头（如超大宽度），此处可能造成大额内存分配——但这是所有图像解码器的固有 DoS 面，且分配量受调用方约束，非本模块可修复问题；同时分配失败会抛 `MemoryError` 而非内存破坏。判定为低风险设计权衡，不构成代码级漏洞。⚠️ 备注。
+
+**数据流 D3：头部字节 `bit` → 分支处理（第 51-69 行）**
+- 第 52 行 `i, bit = i + 1, data[i]`：循环条件 `i < length` 保证 `data[i]` 不越界。✅
+- RLE 重复分支（第 54-59 行）：`actual = min(1 + bit, size - j)`（第 57 行）。关键点：进入该分支时已确认 `j < size`（while 条件），故 `size - j ≥ 1`，`actual ≥ 1`，不会出现负数或零长度导致死循环；写入范围 `result[j : j+actual]` 被 `min` 截断在输出缓冲区内。**这是对经典 PackBits 解码器缓冲区溢出漏洞的有效防御**（许多 C 实现因缺少此 clip 而溢出）。✅
+- 字面拷贝分支（第 60-64 行）：`actual = min(copy_count, available, size - j)` 同时钳制输入剩余量与输出剩余量，双向上界均有效。第 64 行 `i += min(copy_count, available)` 按声明长度推进，即使实际拷贝被截断也不会回退或跳过越界。✅
+- `bit == 128` no-op（第 68 行注释）：仅消耗一个字节，正确。✅
+- 孤立重复头在流末尾（第 55-56 行 `if i >= length: break`）：防止 `data[i]` 在下一轮越界。✅
+- 终止性：每轮迭代 `i` 至少加 1（第 52 行无条件执行），`j` 单调不减且受 `size` 上界约束，循环必然终止，无死循环 DoS。✅
+- 返回值恒为 `size` 字节（零填充，第 48 行预分配保证），无信息泄露（不会把未初始化内存返回给调用方）。✅
+
+**结论：decode 无整数溢出、无越界读写、无死循环、无未初始化内存泄露。**
+
+### 函数 2：`encode`（第 76-118 行）
+
+**数据流 E1：空/单字节输入（第 82-86 行）**
+`length == 0` 直接返回原对象；`length == 1` 输出 `(0, data[0])`。边界正确。✅
+
+**数据流 E2：重复游程分支（第 88-95 行）**
+内层 while 由 `j - i >= MAX_LEN`（MAX_LEN=127）和流末尾双重 break 约束，`j` 有界；第 94 行 `result.extend((256 - (j - i), data[i]))` 中 `j - i ∈ [1, 127]`，头部字节落在合法区间 [129, 255]。✅
+
+**数据流 E3：字面分支（第 96-117 行）**
+- 第 99-107 行的内层循环各 break 条件均基于 `j < length` 前提下的索引比较，最坏情况 `j` 推进到 `length`，无越界读。
+- 第 108 行 `result.append(j - i - 1)`：需验证 `j > i`。进入 else 分支的前提是 `not (data[j] == data[j+1])` 或 `j+1 >= length`：
+  - 若 `j+1 < length` 且两字节不等，则外层 while 条件保证本轮至少执行一次 `j += 1`（第 106 行 pass 后落到循环尾隐式自增？——注意第 105-106 行是 `pass`，真正的自增在第 107 行之后的循环体末尾……实际上内层 while 循环体最后一条语句即第 107 行 `j += 1`，每次迭代必执行，除非先命中某个 break）。因此离开循环时必有 `j > i`，`j - i - 1 ≥ 0`，头部字节 ∈ [0, 126]，合法。✅
+  - 若 `j+1 == length`（最后一个字节），同样至少自增一次后由 `j < length` 退出，`j = i + 1`，append(0)，随后 extend 一个字节。✅
+- 第 116 行 `result.extend(data[i:j])`：切片自动钳制，无越界。✅
+- 输出膨胀上界：字面块最多 127 数据字节 + 1 头部 ≈ 0.8% 膨胀，无放大攻击面。✅
+
+## 三、第二入口与替代通道检查
+
+- 本模块无 I/O、无网络、无子进程、无 `eval`/`exec`/`pickle`、无路径操作、无环境变量读取——不存在替代攻击通道。
+- Cython 版本（docstring 提及 `_rle.pyx`）不在本文件范围内，本次结论仅覆盖此 Python 实现。
+- `decode` 是典型的 parser 入口（PSD 文件数据直接可达），但其所有写操作均经 `min` 三重钳制，黑名单式过滤不存在，也不需要。
+- 唯一理论风险是第 48 行 `bytearray(size)` 在 `size` 极大时的资源消耗，但这属于调用方（psd_tools 上层尺寸校验）职责，且抛出的是安全异常而非内存破坏，按业界惯例不计为模块级漏洞。
+
+## 四、最终结论
+
+全部 source→sink 数据流均有有效的结构性防御（min 钳制 + 循环不变量），未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后逐一验证了 decode 与 encode 两条函数的全部数据流。decode 中外部可控输入 data 与 size 到 result 缓冲区写入的所有路径均受 min(copy_count, available, size - j) 三重钳制保护（第57、61行），重复分支在孤立头部时有提前 break 防越界（第55-56行），循环每轮 i 必然递增保证终止性，返回值恒为 size 字节且由零填充预分配，无未初始化内存泄露。encode 中所有索引 j 受 MAX_LEN=127 与 length 双重约束，头部字节取值始终落在 PackBits 合法区间，切片操作自带钳制。模块无任何 I/O、反序列化、命令执行等替代攻击通道，黑名单过滤不存在也无需存在。唯一备注是 bytearray(size) 在 size 极大时的内存占用属上层调用方职责且以安全异常失败，不构成本模块漏洞。", "fix_suggestion": "no fix needed"}
+```

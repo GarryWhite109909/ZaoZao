@@ -1,0 +1,65 @@
+# 全文逐函数安全分析
+
+## 一、文件概览与入口点枚举
+
+本文件是 Gradle 签名插件的 `PgpSignatory`（第 27 行类声明），继承 `SignatorySupport`。全文共 8 个方法/代码块，逐一分析：
+
+**入口点清单（source 候选）：**
+1. 构造函数参数 `name`、`secretKey`、`password`（第 44 行）——来自构建脚本/`signing.properties`/环境变量（上游 `PgpSignatoryFactory`），属于受信任的本地构建配置；
+2. `sign(InputStream toSign, OutputStream signatureDestination)`（第 56 行）——待签名数据流，来自构建产物文件；
+3. 无 HTTP 路由、无反序列化入口、无回调注册、无文件路径拼接 sink。这是一个库类，所有输入均由 Gradle 构建进程内部提供。
+
+## 二、逐函数数据流分析
+
+### 1. 实例初始化块（第 40-42 行）
+`Security.addProvider(new BouncyCastleProvider())`：全局注册 JCE Provider。无外部输入，无 sink。注意这是对 JVM 全局状态的修改（线程安全由 `Security.addProvider` 保证），非漏洞但属副作用。
+
+### 2. 构造函数（第 44-48 行）
+`name` 仅存入 final 字段并在 `getName()` 返回（第 51-53 行），未进入任何命令执行、路径或 SQL sink；`secretKey` 存字段；`password` 直接传入 `createPrivateKey(secretKey, password)`（第 47 行）。**数据流 A：password → createPrivateKey 第 84 行 → `password.toCharArray()` → PBESecretKeyDecryptor.build()**。防御验证：无过滤需求，密码仅用于密钥解密 KDF，不落日志、不进 shell。风险点：password 以 `String` 形式驻留堆内存（不可显式清零），在内存转储/dump 场景下可泄露私钥口令——属低危加固项（CWE-316 明文存储于内存），Gradle 后续版本确实改用了 char[]/密码提供器。
+
+### 3. getName()（第 51-53 行）
+纯 getter，无 sink。
+
+### 4. sign()（第 56-70 行）——核心入口
+数据流 B：`toSign`（source）→ `feedGeneratorWith`（第 72-79 行）→ `generator.update(buffer, 0, read)`（第 76 行）→ `generate()`（第 64 行）→ `writeSignatureTo`（第 82-88 行）→ `pgpSignature.encode(bufferedOutput)`（第 86 行）→ `signatureDestination`（sink）。
+防御验证：全程为密码学摘要计算与 DER/PGP 编码，无字符串拼接、无路径操作、无反射。`signatureDestination` 由调用方打开，本类不构造文件路径，不存在路径遍历。
+**逻辑缺陷（第 74-78 行）**：`while (read > 0)` —— 当 `read == 0`（非阻塞流）时循环继续是正确的，但当流返回 `-1` 时退出，这正确；然而若某次 `read` 抛出异常则直接中断，无完整性问题。真正的问题见第 5 节 SHA-1。
+
+### 5. feedGeneratorWith()（第 72-79 行）
+缓冲区固定 1024 字节，`update(buffer, 0, read)` 正确限定长度，无越界。唯一 source 是 `toSign`，唯一 sink 是哈希更新，无可利用面。
+
+### 6. writeSignatureTo()（第 82-88 行）
+`new BCPGOutputStream(signatureDestination)` 包装后 `encode` + `flush`（第 87 行），注释明示不关闭流（第 83 行注释），资源管理责任在调用方——不构成 CWE-404（调用方契约明确）。
+
+### 7. createSignatureGenerator()（第 90-100 行）
+**关键证据：第 93 行硬编码 `PGPUtil.SHA1` 作为摘要算法。** 数据流：攻击者可控的待签名内容 + SHA-1 → 生成 detached/binary 签名。SHA-1 已被证明存在碰撞攻击（SHAttered, 2017；SHA-1 chosen-prefix collision, 2020）。对于发布到 Maven Central 的构件签名而言，使用 SHA-1 生成的 PGP 签名削弱了签名的抗伪造性，且现代 GnuPG 默认拒绝 SHA-1 签名导致兼容性/验证失败。这是真实存在的密码学弱点：**CWE-327（使用已破解或有风险的密码学算法）**。Gradle 上游后续版本已将此处改为可配置/更强的默认摘要（如 SHA-256/SHA-512），证实此为已知缺陷而非误报。
+防御有效性检查：无任何版本判断或配置开关允许用户在此处选择更强算法——即不存在有效缓解，source→sink 流完整可达。
+
+### 8. getKeyId()（第 59-62 行）
+`secretKey.getKeyID()` 恒非 null（long 装箱），`id == null ? null : ...` 为死分支，仅格式化为十六进制返回，无 sink。
+
+### 9. createPrivateKey()（第 84-91 行）
+见第 2 节数据流 A。异常处理用 `UncheckedException.throwAsUncheckedException(e)`（第 89 行）——需确认不会把受检异常包装丢失类型信息导致后续 catch 失配，但此处仅向上抛出，无安全影响。
+
+## 三、第二入口与替代通道核查
+
+- **第二入口**：本类无其他 public 方法接受外部数据（`createSignatureGenerator` 为 public 但无参）。
+- **替代通道**：`name` 字段若被下游写入 XML/HTML 会构成注入，但本文件内无此类 sink，不能基于猜测定罪。
+- **黑名单/正则**：全文无任何过滤逻辑，故不存在“可绕过过滤”问题。
+- **结论排除项**：无 SQL/命令/路径注入、无反序列化、无 SSRF、无 XXE。
+
+## 四、最终判定
+
+唯一可证实的真实缺陷是第 93 行硬编码 SHA-1 用于签名摘要（CWE-327），配合第 47 行口令以 String 形式驻留内存的低危问题（CWE-316）。前者为主漏洞，风险等级中（需要攻击者能影响签名验证场景或利用碰撞，实际利用门槛较高，但对软件供应链签名场景影响实质存在）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-327",
+  "risk_level": "medium",
+  "source": "line 56: sign(InputStream toSign) 外部可控的待签名内容",
+  "sink": "line 93: new BcPGPContentSignerBuilder(..., PGPUtil.SHA1) 使用 SHA-1 生成签名",
+  "explanation": "待签名数据经 feedGeneratorWith(line 72-79) 进入 generator.update(line 76)，再经 generate(line 64) 与 encode(line 86) 输出，全程摘要算法硬编码为 SHA-1(line 93)，无任何配置或升级机制作为有效防御；SHA-1 已存在实际碰撞与前缀碰撞攻击，用于发布构件的 PGP 签名会削弱防伪能力并遭现代 GnuPG 拒绝。次要问题: line 47 口令以 String 驻留堆内存(CWE-316, low)。其余函数(getName/getKeyId/writeSignatureTo/createPrivateKey 等)经逐行核查无注入、路径遍历或反序列化 sink。",
+  "fix_suggestion": "line 93: 将 PGPUtil.SHA1 替换为可配置的强摘要算法(默认 PGPUtil.SHA256 或 SHA512)；line 47: 改用 char[] 或 PasswordProvider 并在使用后清零"
+}
+```

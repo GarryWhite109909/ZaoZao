@@ -1,0 +1,53 @@
+# 全文逐函数安全分析
+
+## 1. 入口点枚举（覆盖全文）
+
+本文件是 flannel 的 `extension` 后端（第 1–27 行：包声明、import、`init()` 注册）。全文共 5 个函数，逐一分析：
+
+### 1.1 `init()`（第 29–31 行）
+仅调用 `backend.Register("extension", New)`，将后端注册进全局注册表。无外部输入、无 sink。唯一影响是使配置字符串 `"extension"` 能激活本后端，属于正常注册机制。
+
+### 1.2 `New()`（第 41–49 行）
+构造 `ExtensionBackend`，参数来自 flannel 内部（subnet manager、已探测的外部接口），无用户可控数据流入，无 sink。
+
+### 1.3 `Run()`（第 51–53 行）
+仅阻塞等待 ctx 取消，无任何输入处理或副作用。
+
+### 1.4 `RegisterNetwork()`（第 55–130 行）——核心入口
+**Source 分析：**
+- 第 58–70 行：`config.Backend`（JSON 字节）被反序列化为四个命令字符串字段（`PreStartupCommand` / `PostStartupCommand` / `SubnetAddCommand` / `SubnetRemoveCommand`）。这是唯一的 source：flannel 的网络配置。
+- 该配置的来源是 flannel 启动参数/etcd/Kubernetes 配置中的 flannel 配置段——即**节点管理员本人写入的可信配置**，不是网络对端可注入的数据。flannel 本身就是以 root 运行、负责修改主机网络的管理组件，其配置文件等价于 root 可写的执行策略。
+
+**Sink 分析与数据流验证：**
+
+- **流 1（第 72–80 行）**：`preStartupCommand` → `strings.Fields` 拆分 → `runCmd([]string{}, "", preArgs[0], preArgs[1:]...)`。命令字符串直接成为被执行程序及其参数。这确实是“配置即代码”，但 source 是管理员自己的配置，属设计意图（该后端名字就叫 extension，文档明确说明它会执行自定义命令），不构成漏洞。注意这里没有做任何变量展开（env 为空 slice，但 `runCmd` 内部仍会合并 `os.Environ()`，见下）。
+- **流 2（第 106–113 行）**：`postStartupCommand` → `runCmd(env, "", postArgs[0], postArgs[1:]...)`，其中 env 包含 `NETWORK=config.Network`、`SUBNET=lease.Subnet` 等。这些值随后在 `expandVars` 中被展开进 argv。关键点：`exec.Command` **不经 shell**，即使 `lease.Subnet` 含分号、反引号、`$(...)` 等元字符，也只是作为单个字面量参数传给目标程序，不存在 shell 注入。且这些值源自 etcd/apiserver 中管理员分配的子网 CIDR，本身格式受控。
+- **流 3（第 116–119 行）**：错误路径仅格式化日志/返回 error，无 sink。
+- **未使用字段**：`SubnetAddCommand` / `SubnetRemoveCommand` 在本文件中只被赋值到 `n` 结构体（第 66–67 行），其调用发生在同包其他文件（network 的 lease 事件处理）中，不在本次审查范围内；即便存在，source 同样是可信配置。
+
+### 1.5 `buildEnvMap()`（第 133–143 行）
+合并 `os.Environ()` 与传入 env 到 map。纯数据变换，无 sink。注意它把进程环境变量纳入后续展开查找表——见风险讨论。
+
+### 1.6 `expandVars()`（第 145–155 行）
+用 `os.Expand` 对每个参数做 `$VAR` / `${VAR}` 展开。注释正确指出：因无 shell，展开结果作为字面量参数传递，元字符不会引发注入。此判断成立——`os.Expand` 只做字符串替换，替换后的字符串不会再被 shell 解析。
+
+### 1.7 `runCmd()`（第 157–190 行）
+- 第 163–165 行：`expandVars(envMap, append([]string{name}, arg...))` —— 命令名和参数都会做环境变量展开。这意味着若攻击者能控制进程环境变量（如 `PRE_CMD=/bin/sh` 类似技巧），理论上可改写 argv。但能设置 flannel 进程环境变量的前提是已在主机上获得代码执行/root 权限，此时无提权意义，不构成独立漏洞。
+- 第 167 行：`exec.Command(name, arg...)` —— 无 shell 调用，防御有效。
+- 第 168 行：`cmd.Env = append(os.Environ(), env...)` —— 子进程继承完整父环境并追加业务变量；无敏感信息外泄给不可信方的问题（子进程同样是管理员指定的可信程序）。
+- 第 170–184 行：stdin 写入固定字符串 + 换行后关闭；`stdin` 参数在本文件所有调用点均为空串，无可控注入面。
+- 第 186–188 行：`CombinedOutput` 收集输出返回，仅用于日志与 `json.Marshal` 写入 lease 的 `BackendData`（第 82–85 行），随 lease 分发给集群内其他节点——输出内容来自管理员指定命令，信任级别一致。
+
+## 2. 第二入口 / 替代通道检查
+
+- HTTP/路由/文件读取/回调：本文件**均不存在**。唯一外部数据入口是 `config.Backend` JSON（第 61 行）。
+- `os.Environ()` 是隐式第二输入通道（经 `buildEnvMap` 进入 `expandVars`），如上分析，需先攻陷主机才有意义，非可达攻击路径。
+- `lease.Subnet` 等值进入 argv 但无 shell，无法逃逸为命令拼接。
+
+## 3. 结论
+
+所有 source→sink 流中，source 均为节点管理员提供的可信 flannel 配置；sink 为无 shell 的 `exec.Command` 直接执行，这正是该后端的声明功能（extension = 执行用户自定义命令的后端）。变量展开虽存在，但因无 shell 解释层而不构成注入；环境变量通道需要既有主机权限方可利用。黑名单/正则类可绕过防御在本文件中根本未被使用，故无需评估其有效性。基于全文证据，未发现可被低权限攻击者利用的安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文唯一 source 是 RegisterNetwork 第 61 行解析的 config.Backend 配置字符串，其来源为节点管理员写入的 flannel 配置，属可信输入；sink 为 runCmd 第 167 行 exec.Command 直接执行，这正是 extension 后端的设计功能。虽然第 72-80 行与第 106-113 行将配置字符串拆分为 argv 并执行，第 145-155 行 expandVars 还会用 os.Environ 展开变量，但由于 exec.Command 不经过 shell，lease.Subnet 等动态值即使含元字符也只能作为字面量参数传递，不存在命令注入。环境变量展开通道要求攻击者已能控制 flannel 进程环境，前提是已有主机权限，无提权价值。文件中不存在 HTTP 路由、文件读取等其他入口。", "fix_suggestion": "no fix needed"}
+```

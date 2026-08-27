@@ -1,0 +1,18 @@
+## 编号分析
+
+1. **入口点枚举（全文）**
+   - `prepareProxy(proxy, appPublicFolder)`：`proxy` 来自项目 package.json（开发者控制，非远程攻击者直接输入），第 12–44 行做类型校验，字符串形式要求 `^http(s)?:\/\//`（第 76 行）。这是配置面，不是 HTTP 攻击面。
+   - `mayProxy(pathname)`（第 51–56 行）：pathname 来自运行时 HTTP 请求路径。`path.resolve(appPublicFolder, pathname.slice(1))` 未限制在 public 目录内，含 `..` 的路径可逃逸目录；但结果只用于 `fs.existsSync` 判断是否走代理，不存在文件读取 sink，仅可能影响代理分流决策，无直接信息泄露 sink。
+   - `createProxyEntry` 的 `context` 回调（第 66–84 行）：基于请求方法与 accept 头的启发式分流，逻辑性风险（API 误判）而非安全漏洞。
+   - `onProxyReq`（第 85–94 行）：将 Origin 重写为 target，无用户输入注入头部的路径。
+   - `onProxyError(target)` 返回的错误处理器（第 138–166 行）：**关键点**。source 为攻击者可控的 `req.url`（第 142、160 行）与 `req.headers.host`（第 139、161 行）；sink 为 `res.end(...)` 拼接的响应体（第 159–165 行）以及日志输出。`req.url` 与 `host` 均未做任何 HTML 转义。触发条件是代理目标连接失败（如后端宕机时攻击者诱导请求）。`res.writeHead(500)`（第 157 行）未设置 Content-Type，Node 不自动补 charset，浏览器可能对无类型响应做 MIME sniffing，拼接的 `<script>` 等内容存在反射型 XSS / 内容注入（CWE-79/CWE-116）的可能。此外 host 头还可用于缓存投毒式日志注入，但主要 sink 是响应体。
+
+2. **防御有效性**：全文对该数据流没有任何编码/转义/白名单校验，黑名单类防御也不存在，故 source→sink 流未被阻断。
+
+3. **第二入口/替代通道**：`mayProxy` 的目录逃逸（`/../`）只影响 existsSync 判断，无可达敏感 sink；`resolveLoopback` 仅处理开发者配置的 localhost 目标，非攻击者可控。故唯一可达漏洞流为错误处理器的反射。
+
+4. **结论**：存在低危反射型内容注入/XSS，需代理出错且攻击者能构造特殊 URL/host 才触发，实际风险有限（开发服务器场景）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "reflected XSS / content injection", "risk_level": "low", "source": "req.url 与 req.headers.host（攻击者可控的 HTTP 请求字段）", "sink": "onProxyError 中 res.end 拼接的 500 错误响应体（未转义、未设置 Content-Type）", "explanation": "第 138-166 行 onProxyError 将 req.url 和 host 头原样拼入错误响应体并经 res.end 返回，全程无 HTML 编码或白名单过滤；writeHead(500) 也未指定 Content-Type，浏览器嗅探下可被注入脚本。触发需代理目标不可达，故为低危。另 mayProxy 第 52-53 行 path.resolve 存在目录穿越但无敏感 sink，不构成可利用漏洞。", "fix_suggestion": "在 onProxyError 中对 req.url 和 host 做 HTML 实体编码后再拼入响应体，并在 writeHead 时显式设置 Content-Type: text/plain; charset=utf-8"}
+```

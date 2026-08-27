@@ -1,0 +1,55 @@
+# 全文逐函数安全分析（Gitea git 模块仓库操作代码）
+
+## 一、入口点枚举
+
+本文件是内部库模块 `package git`，无 HTTP 路由，入口点为被上层调用的导出函数，其参数即为潜在 source：
+
+1. `ShowPrettyFormatLogToList`（第 19 行）：`revisionRange string` 参数；
+2. `IsRepoURLAccessible`（第 43 行）：`url string` 参数；
+3. `InitRepository`（第 48 行）：`repoPath`、`objectFormatName` 参数；
+4. `(repo *Repository).IsEmpty`（第 61 行）：使用 `repo.Path` 与 `repo.Ctx`；
+5. `Clone`（第 96 行）：`from, to string` 及 `CloneRepoOptions` 结构体（含 `Branch/Filter/Depth/Env/SkipTLSVerify` 等）；
+6. `Push`（第 148 行）：`repoPath` 及 `PushOptions`（`Remote/LocalRefName/Branch/ForceWithLease/Env` 等）。
+
+## 二、source→sink 数据流逐一验证
+
+### 流 1：`ShowPrettyFormatLogToList` — revisionRange → git log
+第 22–24 行将 `revisionRange` 通过 `AddDynamicArguments(revisionRange)` 注入 `git log <fmt> <range> --`。关键防御是 `gitcmd.NewCommand` 的实现约定（Gitea 中 `AddDynamicArguments` 会把参数放入独立 argv 元素，不经 shell），且命令以 `--` 结尾分隔 pathspec。由于不经过 shell 解释器，不存在命令注入；`revisionRange` 以单个 argv 传入，攻击者无法追加额外 git 子命令或选项——即使传入 `-x` 形式字符串，也只是 log 的一个参数，且调用方（上层服务）通常已校验 ref 格式。**结论：无可利用 sink。**
+
+### 流 2：`IsRepoURLAccessible` — url → ls-remote
+第 45 行 `AddDynamicArguments(url, "HEAD")` 同样为 argv 注入而非 shell 拼接，无法注入命令。但存在 **SSRF 面**：该函数对任意 URL 发起网络请求。不过它仅做连通性探测、返回 bool，不回显响应内容；真正的迁移 SSRF 防护在第 103–105 行体现（见流 3）。此处作为探测函数本身风险低。
+
+### 流 3：`Clone` — from/to/options → git clone
+- 第 104 行：`cmd.AddArguments("-c", "http.followRedirects=false")` —— 显式注释说明这是防 SSRF 加固：阻止攻击者 URL 经重定向跳到内网地址。这是有效防御（非黑名单）。
+- 第 106–107 行 `SkipTLSVerify` 关闭证书校验：若上层允许用户控制该选项，可致 MITM。但它是管理员/系统配置项（Gitea 中来自 webhook/migrate 的全局开关），非用户直控参数，属设计权衡而非漏洞。
+- 第 118–119 行 `opts.Filter` 经 `AddDynamicArguments` 进入 `--filter`：argv 注入不可行；`filter` 值如 `blob:none` 由系统内部生成。
+- 第 121–122 行 `opts.Branch` 进入 `-b`：同上，单 argv，无 shell，无法逃逸出 clone 子命令。
+- 第 123 行 `AddDashesAndList(from, to)`：`to` 是目标路径，由服务器端拼接（如 `data/repo路径`），若上层未清洗仓库名可致路径穿越，但本文件内 `path.Dir(to)` 仅用于建目录，穿越责任在上层命名校验，本文件无证据表明可被外部直接控制恶意值。
+- 第 130–137 行环境处理：`opts.Env != nil` 时完全替换环境变量（第 131 行），否则用 `proxy.EnvWithProxy(u)`（第 135 行）。注意第 133–136 行：当 `Env == nil` 且 `url.Parse(from)` 失败时，`envs` 保持 `os.Environ()` 初值——逻辑正确，不会传空 env 导致意外。代理经 URL 解析后设置，无注入面。
+
+### 流 4：`InitRepository` — objectFormatName → git init
+第 53–55 行先执行 `IsValidObjectFormat(objectFormatName)` 白名单校验（sha1/sha256），无效即返回错误，之后才 `AddOptionValues("--object-format", ...)`。白名单在此处是有效防御（取值域封闭）。`repoPath` 用于 `os.MkdirAll` 和 `WithDir`，由服务端受控路径构成。**无漏洞。**
+
+### 流 5：`IsEmpty` — repo.Path → rev-list
+第 63–66 行 `AddOptionFormat("--git-dir=%s", repo.Path)`：格式化进单个 option 参数，仍走 execve argv，无 shell；`repo.Path` 为服务端数据目录路径。错误分支（第 68–72 行）按退出码区分空仓库，仅影响正确性不影响安全。**无漏洞。**
+
+### 流 6：`Push` — PushOptions → git push
+- 第 154 行 `AddOptionFormat("--force-with-lease=%s", opts.ForceWithLease)`：拼入单个 argv，无 shell 注入；`ForceWithLease` 内容只影响 push 语义。
+- 第 159–165 行 refspec 构造：`fmt.Sprintf("%s:%s", LocalRefName, Branch)` 作为单个 argv 加入 `AddDashesAndList`（第 168 行）。冒号在 refspec 中是合法分隔符，攻击者即便控制 Branch 也只能改变推送的 ref 名，不能执行任意命令或添加额外参数（每个元素都是独立 argv）。
+- 第 169–181 行错误分类基于 stderr 字符串匹配，仅用于错误类型映射，无安全影响。
+- 第 170 行 `opts.Env` 直接透传给 `WithEnv`：与 Clone 相同，由调用方（系统内部，如 mirror 同步 env）构造，本文件无外部可控证据。
+
+## 三、第二入口与替代通道检查
+
+- 替代通道 1：`opts.Env` 完全替换进程环境（Clone 第 131 行）——若调用方把用户输入混入 Env 可泄露/篡改 git 凭据，但本文件内所有 Env 来源均为系统内部构造，无证据链指向用户可控。
+- 替代通道 2：`SkipTLSVerify`（第 106 行）与 `proxy.EnvWithProxy`（第 135 行）——代理地址来自配置而非用户输入。
+- 替代通道 3：`ShowPrettyFormatLogToList` 的 `revisionRange` 可能间接来自用户选择的 commit 区间，但因 argv 隔离 + `--` 分隔，最坏结果是 git 报错，无命令执行或参数注入。
+- 全文件所有 git 调用均经由 `gitcmd.NewCommand(...)` 抽象，该抽象的核心保证是不经过 shell（Gitea 重构后统一走 execve 风格参数数组），因此本文件中大量动态参数拼接不构成注入 sink。
+
+## 四、总结
+
+通读全文（第 1–182 行全部六个函数）：所有动态参数均通过 `AddDynamicArguments/AddOptionFormat/AddDashesAndList` 以独立 argv 传递，无 shell 拼接型 sink；`objectFormatName` 有封闭白名单；clone 显式禁用重定向防 SSRF；env 处理逻辑无泄露路径。剩余风险（SkipTLSVerify、Env 透传、to 路径）均依赖上层调用方传入受控值，在本文件范围内无 source 证据支撑可利用性。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文六个导出函数的所有动态参数均通过 gitcmd 抽象以独立 argv 传递，不经 shell 解释，无命令注入 sink；InitRepository 对 objectFormatName 使用封闭白名单校验；Clone 显式设置 http.followRedirects=false 防 SSRF；Env 与 SkipTLSVerify 均来自系统内部配置而非用户可控 source；Push 的 refspec 拼接同样限于单 argv 内，无法逃逸。各潜在风险点的实际可控 source 均不在本文件证据链内。", "fix_suggestion": "no fix needed"}
+```

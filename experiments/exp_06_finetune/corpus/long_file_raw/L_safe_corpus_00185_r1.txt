@@ -1,0 +1,84 @@
+# sqls main.go 安全分析（全文逐函数审计）
+
+## 一、文件结构总览
+
+本文件是 sqls（SQL Language Server）的入口程序，共包含以下函数/代码块：
+
+1. `main()`（第 22-27 行）
+2. `realMain()`（第 29-77 行）
+3. `serve()`（第 79-135 行）
+4. `stdrwc` 结构体及其 Read/Write/Close 方法（第 137-155 行）
+5. `openEditor()`（第 157-164 行）
+
+以下逐一枚举入口点与数据流。
+
+## 二、逐函数分析
+
+### 1. `main()`（第 22-27 行）
+
+仅调用 `realMain()` 并将错误打印到 stderr 后退出。无输入处理，无 sink。无风险。
+
+### 2. `realMain()`（第 29-77 行）
+
+**入口点枚举：**
+
+- **命令行参数**：`os.Args`（第 76 行传入 `app.Run`），包括：
+  - `-log/-l` 字符串标志（第 36-40 行）
+  - `-config/-c` 字符串标志（第 41-45 行）
+  - `-trace/-t` 布尔标志（第 46-50 行）
+- **子命令 `config/c`**（第 53-62 行）：读取环境变量 `EDITOR`（第 56 行），默认 `vim`，随后调用 `openEditor(editorEnv, config.YamlConfigPath)`（第 59 行）。
+- **默认 Action → serve()**（第 63-65 行）。
+- **环境变量**：`EDITOR`（第 56 行）——这是本文件唯一的直接环境变量 source。
+
+**数据流验证：**
+
+- **流 A：`EDITOR` 环境变量 → `exec.Command`（sink）**
+  - Source：第 56 行 `os.Getenv("EDITOR")`。
+  - Sink：第 158 行 `exec.Command(program, args...)`，第 163 行 `cmd.Run()`。
+  - 防御评估：若 `EDITOR` 为空则回退为字面量 `vim`（第 57-58 行），这消除了“空字符串导致异常行为”的问题，但**并非对恶意内容的过滤**。关键在于威胁模型：LSP server 是由用户本人启动的本地进程，`EDITOR` 本来就是用户 shell 环境的一部分。用户设置 `EDITOR='sh -c ...'` 属于用户对自己机器的自主配置，与用户直接在终端运行任意命令无异，不构成跨信任边界的漏洞。此外注意 `exec.Command(program, args...)` 中 program 作为单一可执行路径查找（不经过 shell 解析），args 为固定的 `config.YamlConfigPath`，攻击者无法通过该路径注入额外参数或 shell 元数据。**结论：不构成实际可利用漏洞**（属于设计上依赖可信本地环境的模式，与 git/sudo 等调用 `$EDITOR` 的惯例一致）。
+
+- **流 B：命令行参数 `-config` → `config.GetConfig(configFile)`**
+  - 在 `serve()` 第 106-109 行消费。读取用户指定的配置文件并加载到内存。这是用户主动指定自己机器上的文件路径，属正常功能；即使指向敏感文件，结果也只回传给同一用户的编辑器会话，无越权边界跨越。无 sink 型危险操作（不执行、不删除）。
+
+- **流 C：命令行参数 `-log` → `os.OpenFile`（第 89 行）**
+  - 以 `0660` 权限创建/追加日志文件。路径完全由启动者控制，启动者即本机用户，无提权场景（程序不以 setuid 运行）。无风险。
+
+### 3. `serve()`（第 79-135 行）
+
+**入口点枚举：**
+
+- CLI 标志（如上）；
+- **stdin/stdout 的 JSON-RPC 流**（第 126-132 行）：这是 LSP 协议主通道，所有请求经 `server.Handle`（handler 包内部实现，不在本文件内）分发。本文件未对该通道做任何解析，仅做字节转发（`stdrwc`），因此本文件层面不存在注入点；协议层安全性取决于 handler 包，超出本文件证据范围，不能凭空断言存在漏洞。
+- **第二入口检查**：除 stdin JSON-RPC 外，无 HTTP/TCP 监听、无文件 watcher 回调、无信号处理器在本文件中注册。`DisconnectNotify()`（第 131 行）仅用于等待连接关闭，非攻击面。
+
+**防御有效性核查：**
+
+- 日志文件打开失败时 `log.Fatal(err)`（第 91 行）：错误处理正确，不会带病运行。
+- 配置加载失败时返回包装错误（第 108、115 行）：fail-fast，正确。
+- trace 模式将消息写入 logWriter（第 120-122 行）：仅本地 stderr/日志文件，无外泄通道。
+
+### 4. `stdrwc`（第 137-155 行）
+
+纯 I/O 转发：Read 读 stdin（第 140-141 行）、Write 写 stdout（第 144-145 行）、Close 关闭两者（第 147-154 行）。无解析、无执行、无路径操作。无风险。
+
+### 5. `openEditor()`（第 157-164 行）
+
+- Sink：`exec.Command(program, args...)` + `cmd.Run()`。
+- 参数来源唯一：`os.Getenv("EDITOR")` 与常量 `config.YamlConfigPath`。
+- 未使用 shell（`cmd.SysProcAttr` 未设置，Go 默认不经 `/bin/sh -c`），因此不存在 shell 元字符注入；参数列表固定长度为 1，无法被追加额外参数。
+- 如前述，`EDITOR` 由本机用户控制，属可信边界内输入。**结论：无可利用的命令注入。**
+
+## 三、替代通道与遗漏面复查
+
+- 无网络监听代码（全文 grep 层面仅有 stdin/stdout）。
+- 无临时文件写、无 `os.Remove`、无 `os.Chmod` 等危险文件操作。
+- 无反序列化不可信数据的代码在本文件内（JSON-RPC 解析在 jsonrpc2 库及 handler 包）。
+- 版本信息输出（第 32 行）为静态字符串，无格式化字符串漏洞（使用 `Fprintln` 而非 `Printf` 拼接用户输入）。
+
+## 四、结论
+
+全部 source→sink 数据流均终止于可信边界内的本地操作；唯一的 exec sink 其输入来自用户自身环境变量，且不经 shell、参数固定，不构成跨信任边界漏洞。基于本文件证据，未发现安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后逐一核查了 main(第22-27行)、realMain(第29-77行)、serve(第79-135行)、stdrwc(第137-155行)、openEditor(第157-164行)。入口点包括: 命令行标志 -log/-config/-trace(第36-50行), 子命令 config 中的环境变量 EDITOR(第56行), 以及 stdin/stdout 上的 JSON-RPC 主通道(第126-132行)。唯一 exec sink 位于 openEditor 第158行 exec.Command(program, args...), 其输入 EDITOR 来自本机用户自身环境变量, 且 Go 默认不经 shell 解析、args 固定为 config.YamlConfigPath, 无法注入额外参数或元字符; 这与 git 等工具调用 $EDITOR 的本地惯例一致, 不构成跨信任边界漏洞。-log 参数触发的 os.OpenFile(第89行)与 -config 触发的 config.GetConfig(第107行)均由启动者本人控制且无提权场景。stdrwc 仅做字节转发, 无解析与执行。全文无网络监听、无临时文件写、无删除或权限修改操作, 未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,29 @@
+## 编号分析（逐函数、行号锚定）
+
+**入口点枚举**
+1. 默认导出函数（第 55 行）：`function (js, options = {})` —— source 是 `js`（解析后的 .po/gettext 文件对象，其 `translations`、`headers.Language` 完全由外部文件内容控制）与 `options`（可含 `keyseparator`、`locale`、`ctxSeparator` 等）。
+2. 回调/子入口：`getGettextValues`（第 27 行）、`emptyOrObject`（第 13 行）、`toArrayIfNeeded`（第 8 行）、`isFuzzy`（第 5 行）、`getI18nextPluralExtension`（第 22 行）——均直接消费上述外部数据，无任何输入校验。
+3. 隐式入口：`JSON.parse(JSON.stringify(...))`（第 56 行）仅做深拷贝，不构成防御；且若 `js.translations` 含 `__proto__` 自有属性会被 JSON 序列化保留为普通键。
+
+**逐函数数据流**
+
+- 第 5–6 行 `isFuzzy`：只读比较，无 sink。
+- 第 8–10 行 `toArrayIfNeeded`：`value.split('\n')`，value 来自 msgstr/msgid，最终进入输出对象值位置，非键位，风险低。
+- 第 13–20 行 `emptyOrObject`：`{ [key]: ... }` 计算属性键。key 源自 po 文件 msgid（经 keyseparator 切分后的最后一段）。若 key 为 `__proto__`，`{['__proto__']: v}` 在对象字面量中通常只设置自有属性（字面量形式不触发污染），故此处不是主 sink，但仍是键注入路径的一环。
+- 第 22–25 行：纯字符串拼接。
+- 第 27–48 行 `getGettextValues`：
+  - 第 33 行 `plurals[locale.toLowerCase()]` 与第 34 行 `plurals[locale.split(/_|-/)[0].toLowerCase()]`：locale 可来自 `js.headers.Language`（第 63 行）或 options。若 locale 为 `__proto__` 或 `constructor`，则读取原型链上的 plurals——读侧原型链访问；配合第 35 行 fallback `plurals.dev` 不构成防御。ext 随后影响 pluralSuffix，但 suffix 只拼接进 targetKey，真正危害落在下游键写入。
+  - 第 43–44 行 `Object.assign(gettextValues, emptyOrObject(pkey, ...))`：pkey 若为 `__proto__`，`Object.assign` 会以 `[[Set]]` 语义写入目标对象的原型——这是真实的原型污染写原语之一（对普通对象 assign `__proto__` 键会触发 setter）。不过 pkey 只是切分后的末段，主污染链在下方。
+- 第 55–118 行 主函数：
+  - 第 56 行深拷贝不消毒。
+  - 第 57–80 行 `keyasareference` 分支：第 62 行 `reference.split(...)` 的每个 `id` 直接作为新键 `data[ctx][id] = x`（第 65 行），id 来自 po 文件注释 reference 字段，完全攻击者可控；`__proto__` 作为 id 时 `data[ctx]['__proto__'] = x` 以 [[Set]] 语义写入 ctx 对象原型，若 x 为普通对象即污染 `Object.prototype`。第 66–78 行随后改写该共享对象的 msgstr/msgid，污染会扩散到所有对象。此为第二入口通道。
+  - 第 88–101 行 keyseparator 展开：第 94 行 `appendTo[keys[x]] = appendTo[keys[x]] || {}`，keys 由攻击者控制的 msgid 按 separator 切分而来。当某段为 `__proto__` 时，`appendTo['__proto__'] || {}` 取到的是 `Object.prototype`（真值），appendTo 变为原型对象，后续段继续在原型上建分支，最后一段作为 targetKey 经第 112 行 `Object.assign(appendTo, newValues)` 把任意值写入 `Object.prototype.<targetKey>`。黑名单不存在，正则无，无任何防御。
+  - 第 103–105 行 ctx 拼接、第 106–110 行 persistMsgIdPlural：均为字符串拼接进 targetKey，同样可携带 `__proto__` 等危险键名进入第 112 行的 assign。
+
+**替代通道核查**：`options.locale`/`headers.Language` → 原型链读取（第 33–34 行）；`comments.reference` → 键注入（第 62–65 行）；msgid + keyseparator → 嵌套路径写入（第 88–101 行）与最终 assign（第 112 行）。三条通道均无有效过滤；`JSON.parse(JSON.stringify())`、空键删除（第 74 行）、fuzzy 跳过均与键名安全无关。
+
+**结论**：存在通过恶意构造的 .po 文件触发的原型污染（CWE-1321），可进一步导致依赖 `Object.prototype` 属性查找的逻辑劫持或 RCE 链（视下游使用而定），风险定为高危。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1321 Prototype Pollution", "risk_level": "high", "source": "line 56: js.translations 中攻击者可控的 msgid / comments.reference / headers.Language", "sink": "line 94: appendTo[keys[x]] = appendTo[keys[x]] || {} 及 line 112: Object.assign(appendTo, newValues)，另见 line 65: data[ctx][id] = x", "explanation": "恶意 po 文件中的 msgid 含 keyseparator 分隔的 __proto__ 片段 -> line 90 split 后 -> line 94 appendTo 被导向 Object.prototype -> 后续片段在原型上创建分支 -> line 112 将 msgstr 值写入 Object.prototype 任意属性；替代通道 line 62-65 用 reference 注释行作为键直接赋值 data[ctx][id]，同样可写入 __proto__；全程无任何键名白名单或过滤，JSON 深拷贝不构成防御", "fix_suggestion": "line 94: 写入前校验键名，拒绝 __proto__、constructor、prototype（如 if (['\\_\\_proto\\_\\_', 'constructor', 'prototype'].includes(keys[x])) continue 或使用 Object.create(null) / Map 存储中间层级）；line 65: 同样校验 id 后再赋值；line 112: 改用 defineProperty 并限制 enumerable writable 或先过滤 newValues 的键"}
+```

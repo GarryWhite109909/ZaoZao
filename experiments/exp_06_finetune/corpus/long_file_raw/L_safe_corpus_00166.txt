@@ -1,0 +1,19 @@
+## 编号分析
+
+1. **第 60-90 行 `createRelease`**：入口点 POST `/apps/{appId}/envs/{env}/.../releases`。有 `@PreAuthorize` 调用 `hasReleaseNamespacePermission`（第 59 行），发布权限校验有效；`Env.valueOf(env)` 对非法环境会抛异常，无注入 sink（数据进入服务层经 REST 客户端，非 SQL/命令拼接）。未发现漏洞。
+
+2. **第 92-121 行 `createGrayRelease`**：同样有 `@PreAuthorize`；注意第 97 行将 `clusterName` 设为 `branchName`，但权限仍按原 cluster 校验——灰度分支发布沿用父 namespace 权限，属设计行为，且分支本身由授权操作创建。无独立漏洞。
+
+3. **第 123-135 行 `get`**：GET `/envs/{env}/releases/{releaseId}` 无 `@PreAuthorize`，但第 130-132 行调用 `shouldHideConfigToCurrentUser` 做隐藏配置检查，符合 Apollo “登录用户可读、敏感配置需权限” 的设计。防御有效。
+
+4. **第 137-152 行 `findAllReleases` 与 第 154-169 行 `findActiveReleases`**：均先做 `shouldHideConfigToCurrentUser` 检查，命中则返回空列表。防御有效。
+
+5. **第 171-177 行 `compareRelease`**：GET `/envs/{env}/releases/compare?baseReleaseId=&toCompareReleaseId=`。**全文唯一没有任何权限校验的读接口**：既无 `@PreAuthorize`，也无 `shouldHideConfigToCurrentUser` 检查。任意已认证（甚至视 Portal 配置可能匿名）用户可通过枚举/猜测 releaseId，获取两个 release 的完整配置差异（`ReleaseCompareResult` 含键值内容），绕过第 3、4 条入口建立的“隐藏配置”防线，构成越权信息泄露（broken access control / sensitive data exposure）。这是 source（HTTP 参数 baseReleaseId/toCompareReleaseId）→ sink（releaseService.compare 返回配置明文给响应体）的无防御数据流。
+
+6. **第 179-207 行 `rollback`**：PUT 回滚接口虽无注解式鉴权，但第 186-189 行在方法体内显式调用 `hasReleaseNamespacePermission` 并抛 `AccessDeniedException`，防御有效。
+
+7. **第二入口/替代通道核查**：所有写操作（create/gray/rollback）均有权限校验；其余读接口均有 hide-config 检查；仅 compare 是遗漏点。参数均为 long/String 且不落入 SQL/命令/路径拼接 sink，无注入类问题。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "broken_access_control_information_disclosure", "risk_level": "medium", "source": "compareRelease 方法的请求参数 baseReleaseId 和 toCompareReleaseId（GET /envs/{env}/releases/compare）", "sink": "releaseService.compare(...) 的返回值 ReleaseCompareResult 直接写入 HTTP 响应体", "explanation": "第 171-177 行的 compareRelease 接口是全文唯一缺少任何权限校验的入口：同文件中 createRelease/createGrayRelease 有 @PreAuthorize（第 59、93 行），get/findAllReleases/findActiveReleases 均调用 shouldHideConfigToCurrentUser 隐藏敏感配置（第 130、141、160 行），rollback 在方法内显式校验 hasReleaseNamespacePermission（第 187 行），唯独 compareRelease 既无注解鉴权也无 hide-config 检查。攻击者可通过遍历 releaseId 获取本应被隐藏的 namespace 配置差异内容，绕过其他读接口建立的数据访问控制，属于水平越权信息泄露。", "fix_suggestion": "在 compareRelease 中增加与 get 接口一致的校验：先通过 releaseService.findReleaseById 取得两个 release，对 baseReleaseId 和 toCompareReleaseId 对应的 release 分别调用 userPermissionValidator.shouldHideConfigToCurrentUser 或要求相应 namespace 读权限，未通过则抛出 AccessDeniedException"}
+```

@@ -1,0 +1,47 @@
+# 逐函数行号级分析
+
+## 1. ShowPrettyFormatLogToList（第 24–33 行）
+- **入口/source**：参数 `revisionRange`（第 25 行），由上层路由（如 compare/diff、commit 范围查询）传入，通常来自 URL 查询参数（如 `?from=...&to=...`）。
+- **sink**：第 27 行 `AddDynamicArguments(revisionRange)` 后在第 29 行 `RunStdBytes(ctx)` 执行 `git log`。
+- **防御验证**：`AddDynamicArguments` 仅把字符串作为单个 argv 元素传入（无 shell 注入），但**没有经过 `AddDashesAndList` 的 `--` 分隔保护**。若调用方未校验，攻击者可传入以 `-` 开头的值（如 `--output=/tmp/x` 或其他 git log 选项），被 git 解释为选项而非 revision —— 典型 **CWE-88 参数注入**。注释（第 26 行）只处理了歧义报错，不是安全过滤。
+- 注意：Gitea 上层在部分调用点做了 `git.CommandArgument` 类型限制，但本文件层面该数据流无有效防御。
+
+## 2. parsePrettyFormatLogToList（第 35–53 行）
+- 输出解析，仅按换行切分并 `GetCommit`，无命令执行，无漏洞。
+
+## 3. IsRepoURLAccessible（第 56–60 行）
+- **source**：`url` 参数（外部可控，如迁移表单的仓库地址）。
+- **sink**：第 58 行 `AddDynamicArguments(url, "HEAD")` 执行 `ls-remote`。
+- 同样是单 argv 元素、无 shell；但值若以 `-` 开头可被 git 当作选项（如 `--upload-pack=...`），存在参数注入面。不过该函数通常仅做可达性探测，且上游常先做 scheme 校验——风险较低但同属 CWE-88 面。
+
+## 4. InitRepository（第 63–81 行）
+- `objectFormatName` 在第 71–72 行经 `IsValidObjectFormat` 白名单校验后才拼入，属**有效白名单防御**。`repoPath` 由服务端生成路径，非直接用户输入。无漏洞。
+
+## 5. IsEmpty（第 84–101 行）
+- 仅使用 `repo.Path`（服务端内部路径），无外部输入到达命令行。无漏洞。
+
+## 6. Clone（第 104–155 行）
+- `opts.Depth` 为 int（第 127 行），类型安全。
+- `opts.Filter`（第 130–131 行）、`opts.Branch`（第 136–137 行）：经 `AddDynamicArguments` 作为 `--filter` / `-b` 的**选项值**消费，git 会将其作为值而非新选项解析，注入面有限。
+- 关键点：`from, to` 在第 140 行通过 `AddDashesAndList(from, to)` 传入 —— `--` 之后的位置参数不会被解释为选项，**这是有效防御**。
+- `SkipTLSVerify=true` 时禁用证书校验（第 117–118 行）属功能开关，需调用方授权，不单独计为漏洞。
+
+## 7. Push（第 158–196 行）
+- `ForceWithLease` 经 `AddOptionFormat`（第 164 行）构成单一 argv 元素 `--force-with-lease=<值>`，无法拆分出新选项。
+- `Remote`、refspec（第 171–178 行）最终走第 181 行 `AddDashesAndList(...)`，受 `--` 保护，**有效防御**。
+- stderr 字符串匹配（第 186–193 行）仅用于错误分类，无安全影响。
+
+## 结论
+全文唯一缺乏 `--` 分隔或白名单保护的动态参数流是 `ShowPrettyFormatLogToList` 的 `revisionRange`（以及次要的 `IsRepoURLAccessible` 的 url）。当上层把用户可控的 revision/range 字符串直接透传时，可注入 git 选项（CWE-88 命令/参数注入），例如借助 `--output` 等选项写文件或改变命令行为。黑名单式说明性注释与错误处理均不构成防御。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-88",
+  "risk_level": "中",
+  "source": "line 25: 函数参数 revisionRange, 由上层 HTTP 路由(如 compare/diff 的用户提交范围参数)透传的用户输入",
+  "sink": "line 27-29: AddDynamicArguments(revisionRange) 后由 RunStdBytes 执行 git log, 未加 -- 分隔",
+  "explanation": "revisionRange 通过 AddDynamicArguments 直接进入 git log 的 argv, 未使用 AddDashesAndList 加 -- 防护, 也无白名单或格式校验(第 26 行注释只解决歧义报错). 攻击者传入以连字符开头的值可被 git 解释为选项而非 revision, 实现参数注入(如利用 git log 支持的输出类选项写文件或泄露信息) -> 第 29 行 RunStdBytes 执行时触发",
+  "fix_suggestion": "line 27: 将 revisionRange 拆分为多个严格校验的参数并以 AddDashesAndList 传入, 或对每个 revision 使用 rev-parse 校验其确为合法 commit/refs 且不以连字符开头后再拼接"
+}
+```

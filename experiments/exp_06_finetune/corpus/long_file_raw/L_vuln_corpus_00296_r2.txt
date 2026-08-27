@@ -1,0 +1,43 @@
+# 全文逐函数安全分析（YesWiki CalcField）
+
+## 一、入口点枚举（source 识别）
+
+本文件是一个 Bazar 表单字段类，入口点如下：
+
+1. **第 21–29 行 `__construct(array $values, ...)`**：`$values[self::FIELD_CALCFORMULA]`（第 24 行）直接赋给 `$this->calcFormula`，无任何过滤。`$values` 来自表单定义（form definition）的持久化数据，即任何能创建/编辑 Bazar 表单的用户（通常是管理员，但 YesWiki 权限可下放）可控。这是本文件唯一的“配置型 source”。
+2. **第 49 行 `formatValuesBeforeSave($entry)`**：保存条目时的回调入口。`$entry` 是用户提交的表单数据（第二入口），与 `$this->calcFormula` 在此汇合。
+3. **第 36 行 `renderStatic($entry)`**：渲染时读取 `$this->displayText`（同样来自表单定义）和计算值。
+4. **第 152 行 `jsonSerialize()`**：将 `calcFormula`、`displayText` 原样输出到 API/JSON 通道——替代输出通道。
+
+## 二、核心数据流：calcFormula → eval（CWE-95 代码注入）
+
+sink 位于 **第 85 行**：`eval("\$value = $formula;")`，双引号字符串插值，`$formula` 完全进入 eval 上下文。
+
+防御链验证：
+
+- **第 57 行分词白名单**：正则只匹配运算符/括号（第 52 行）、数字/pi（第 51 行）、固定函数名列表（第 55 行）、`test(...)`（第 56 行）、字段属性名（第 54 行）。未匹配字符被静默丢弃，因此 `$`、反引号、字母串等无法进入 `$formula` —— 这一点上黑名单式绕过不成立。
+- **第 67 行数字分支**：`floatval()` 强转，安全。
+- **第 70 行函数分支**：直接拼接 `$matches[3]`，但候选集是硬编码的数学函数名（sin/cos/abs/sqrt 等），无 `eval`/`assert`/`system` 等。
+- **第 73 行 test 分支**：`testEntryValue` 第 121 行仅返回 `'1'` 或 `'0'`。
+- **第 76 行字段名分支**：`getEntryValue` 第 105 行返回 `floatval($entry[$propertyName])`；且第 124–140 行 `getPropertyNameIfDefined` 要求字段经 `findFieldFromNameOrPropertyName` 校验存在且 `is_scalar`，否则返回 null → 默认 0。用户提交的 `$entry` 值在此被强制数值化。
+- **第 79 行**去除空白；**第 80–82 行递归正则**做最终语法校验；**第 83 行**才把 `pi` 替换为 `pi()`（在校验之后插入，但插入内容为常量 `pi()`，不可控）。
+
+**残余风险点（基于全文证据）**：
+- 该防御完全依赖“先分词重组、再校验”这一复杂管线，历史上 YesWiki 此段代码（修复前版本）曾被绕过（如利用分词拼接构造非预期标识符序列、或校验正则与 PHP 解析差异），属于典型的“自研过滤 + eval”高危模式；
+- 若低权限用户可获得表单编辑权（Bazar 表单权限可配置），第 24 行的 source 即完全可控，第 85 行 eval 即为 RCE；
+- 即使当前版本难以直接绕过，eval 作为 sink 与白名单防御共存仍构成 CWE-95 风险面。
+
+## 三、其他函数核查
+
+- **第 31–34 行 `renderInput`**：返回空串，无风险。
+- **第 36–46 行 `renderStatic`**：`str_replace('{value}', strval($value), $this->displayText)` 后交给 twig 模板（第 44 行）。Twig 默认自动转义，且 `$value` 经第 98 行 `strval` 数值化；`displayText` 为管理员配置项，XSS 风险低但依赖模板转义设置。
+- **第 108–122 行 `testEntryValue`**：第 117 行使用松散比较 `==`，仅产生布尔结果再转 `'1'/'0'`，无注入路径。
+- **第 152–161 行 `jsonSerialize`**：原样导出 `calcFormula`，属信息暴露/存储型载荷中转通道，本身非 sink。
+
+## 四、结论
+
+sink 明确（第 85 行 eval），source 可控（第 24 行表单定义），防御为自研白名单+递归正则，虽大幅收窄攻击面，但该模式在历史版本中被证明可绕过，且权限模型下放时即为 RCE。判定存在漏洞（代码注入/CWE-95），风险等级中等偏高。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-95 (Eval Injection / Code Injection)", "risk_level": "high", "source": "line 24: $this->calcFormula = $values[self::FIELD_CALCFORMULA]，来自可编辑的表单定义数据", "sink": "line 85: eval(\"\\$value = $formula;\")", "explanation": "表单定义中的 calcFormula 经第 57 行分词白名单重组为 $formula，最终在第 85 行进入 eval 执行。虽然第 67/76 行对数字与字段值做了 floatval 强转、第 121 行 test 分支仅返回 0/1、第 80-82 行递归正则做语法校验，但整套防御是自研过滤加 eval 的高危模式：分词拼接与 PHP 实际解析之间存在语义差异，历史版本已被证明可绕过；且一旦具备表单编辑权限的低权限用户控制 calcFormula，即可实现远程代码执行。$entry 用户输入虽被数值化，但主攻击面是配置型 source 直达 eval。", "fix_suggestion": "line 85: 移除 eval，改用安全的数学表达式求值器（如 symfony/expression-language 或 parser 库），或至少将函数调用映射为白名单内的 PHP callable 显式分发，禁止动态拼接触发 eval/include"}
+```

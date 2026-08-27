@@ -1,0 +1,40 @@
+# 编号分析（全文逐函数）
+
+1. **第 1–40 行（imports 与类声明）**：纯配置映射器注册类，无网络入口、无反序列化入口。source 只能来自配置属性名/值。
+
+2. **第 42–66 行 `reset()`**：静态注册各模块 PropertyMapper，无外部输入参与，不可控数据流，安全。
+
+3. **第 68–70 行 `getValue()`**：将属性名交给 mapper 解析，属性名来自 SmallRye 配置框架（环境变量/CLI/文件），sink 为配置读取本身，不构成注入点。
+
+4. **第 72–74 行 `isSpiBuildTimeProperty()`**：仅前缀/后缀判断用于分类，不影响安全决策的绕过面有限。
+
+5. **第 76–94 行 各 getter / `sanitizeDisabledMappers()` 委托**：只读访问内部 Map，无 sink。
+
+6. **第 96–98 行 `maskValue(String,String)` 重载**：委托到三参版本，`configSourceName` 传 null——此时脱敏完全依赖 `mapper.isMask()`。
+
+7. **第 100–104 行 `maskValue(property, value, configSourceName)` —— 关键 sink 所在**：
+   - 脱敏条件为 `isKeyStoreConfigSource(configSourceName) || (mapper != null && mapper.isMask())`。
+   - 当通过两参重载调用（如 ShowConfig 输出路径）时 `configSourceName == null`，唯一防线是 `getMapper(property)` 能命中带 `isMask()` 的 mapper。
+
+8. **第 106–112 行 `removeProfilePrefixIfNeeded()` —— 缺陷核心**：
+   - 第 107 行仅判断 `property.startsWith("%")`，未校验是否真的包含 `.`；
+   - 第 108 行 `property.indexOf(".")` 在形如 `%dev` 这类无点号的 profile 属性名上返回 -1，`substring(0, -1+1)` 得空串 `""`；
+   - 第 109 行 `"".split(...)` 实际按字符切分，`[1]` 返回单个字符（如 `%dev_secret` 场景下若有点号则正常，但 `%profileX` 无点号时返回错误片段）；
+   - 结果：`getMapper()` 拿到被破坏的属性名，查不到 mapper，返回 null；
+   - 回到第 102 行：`mapper == null` 且 `configSourceName == null` 时，**敏感值原样返回**，最终经 ShowConfig 等命令输出到终端/日志，构成 CWE-532（敏感信息写入输出/日志）。黑名单式的前缀剥离在此可被“%开头但无点号”或畸形 profile 前缀绕过，属于无效防御。
+
+9. **第 114–140 行 `getMapperOrDefault` 系列**：依赖第 109 行清洗结果，缺陷向上传播；重复 mapper 仅取第一个并 debug 日志，无安全问题。
+
+10. **第 142–170 行 disabled mapper 相关**：同样受第 108–109 行影响，`isDisabledMapper` 对畸形前缀判断失真，但后果限于配置可见性，非直接 RCE。
+
+11. **第 172–178 行 `filterDeniedCategories()`**：基于已解析命令过滤类别，无外部可控 sink。
+
+12. **第 180–280 行 内部类 `MappersConfig`**：`addAll/addMapper/removeMapper/sanitizeMappers/assertDuplicatedMappers/handleMapper` 全部操作静态注册表；`assertDuplicatedMappers` 抛出的异常消息含 key 名（第 243 行），key 可含用户提供的属性名，但仅回显给本地 CLI 操作者，风险极低。
+
+13. **第二入口核查**：该文件无 HTTP 路由、无文件读写、无回调注册；唯一对外暴露是 `maskValue` 被 ShowConfig/help 输出链路调用，即上述 CWE-532 路径。替代通道（env var 形式的属性名）同样会进入第 106 行清洗逻辑，可复现同一绕过。
+
+# 结论
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-532", "risk_level": "low", "source": "line 100-101: maskValue 接收的配置属性名与敏感值(可来自环境变量或 keystore 配置源)", "sink": "line 102-103: 当 mapper 为 null 且 configSourceName 为 null 时原始敏感值被返回并输出到 ShowConfig 终端/日志", "explanation": "removeProfilePrefixIfNeeded 在第 107 行仅检查 startsWith 百分号而未校验点号存在性, 第 108 行 indexOf 点号对形如 %profile 无点号的属性名返回 -1, 第 109 行 split 得到错误片段导致 getMapper 查不到 isMask 的 mapper 返回 null, 两参重载 maskValue 又传入 null configSourceName, 两道防线同时失效 -> 敏感配置值未被掩码直接进入命令行输出/日志", "fix_suggestion": "line 106-111: 在 removeProfilePrefixIfNeeded 中先校验 indexOf 点号结果大于等于 0 再截断, 对无法解析前缀的属性名保守地视为需掩码(默认掩码而非默认放行), 并在 maskValue 中当 configSourceName 为 null 且属性名以 % 开头时强制走掩码分支"}
+```

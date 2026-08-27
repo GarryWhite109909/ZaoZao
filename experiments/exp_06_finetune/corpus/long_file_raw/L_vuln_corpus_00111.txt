@@ -1,0 +1,24 @@
+## 编号分析
+
+1. **入口点枚举（全文）**
+   - 第 60-64 行 `configure()`：定义三个命令行选项 `--host`、`--format`、`--date-format`、`--filter`，均为用户可控 source。
+   - 第 66 行起 `execute()`：读取上述选项。
+   - 第 91-110 行 `getLogs()`：通过 `stream_socket_server` 监听 TCP 端口（默认 0.0.0.0:9911），第 107 行 `yield ... fgets($stream)` 将**任意远程客户端发送的原始网络数据**作为日志消息产出——这是第二个（更严重的）入口点。
+
+2. **source→sink 数据流逐一验证**
+   - **流 A：`--host` → `stream_socket_server`（第 85 行）**：仅拼接 `tcp://` 前缀，无白名单校验。攻击者若能控制启动参数可绑定任意地址/端口；但该选项通常由开发者提供，风险较低。
+   - **流 B：`--format` / `--date-format` → ConsoleFormatter**：格式字符串注入最多影响控制台显示，无代码执行 sink。
+   - **流 C：`--filter` → `$this->el->evaluate()`（第 96 行）**：ExpressionLanguage 表达式直接求值。虽然 EL 沙箱限制了函数调用，但在非沙箱模式下可调用部分方法，属于潜在表达式注入；不过前提是攻击者能传命令行参数。
+   - **流 D（核心）：网络数据 → `unserialize`**
+     - source：第 107 行 `fgets($stream)`，任何能连上 9911 端口的客户端均可投递数据；
+     - 中转：第 94 行 `base64_decode($message)`；
+     - sink：第 95 行 `unserialize(base64_decode($message))` —— **对来自网络的不可信数据直接反序列化，且无任何 allowed_classes 白名单、签名校验或内容过滤**。
+   - 防御检查：第 97-99 行仅判断反序列化结果是否为 `false` 后 `continue`，这不是安全防御，只是容错；`$filter` 与 `displayLog` 均在反序列化**之后**执行，无法阻止 POP 链触发。黑名单/正则过滤不存在，也无其他校验。
+
+3. **第二入口与替代通道确认**：除命令行参数外，TCP 端口是无需认证的独立攻击面；默认绑定 `0.0.0.0:9911`（第 61 行），意味着同网段任意主机都可投递 payload。
+
+4. **结论**：这是真实的已知漏洞（Symfony CVE-2019-10909 类问题，后以 allowed_classes 修复）。反序列化用户可控数据可借助应用 classpath 中的 gadget chain 实现 RCE/文件删除等。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data", "risk_level": "high", "source": "line 107: fgets($stream) 从 TCP 端口读取任意客户端发送的数据", "sink": "line 95: unserialize(base64_decode($message))", "explanation": "getLogs 在第 107 行将任意网络客户端发来的原始行数据 yield 出来，execute 在第 95 行对其先 base64_decode 再 unserialize，全程无 allowed_classes 白名单、签名或内容校验；第 97 行的 false 判断只是容错而非防御，且发生在反序列化之后无法阻止 POP 链执行；服务默认监听 0.0.0.0:9911 使同网段任意主机可投递恶意序列化对象，结合应用依赖中的 gadget chain 可导致远程代码执行", "fix_suggestion": "line 95: 改为 unserialize(base64_decode($message), ['allowed_classes' => false]) 并校验 $record 为预期的数组结构，同时将默认监听地址改为 127.0.0.1 并增加访问认证"}
+```

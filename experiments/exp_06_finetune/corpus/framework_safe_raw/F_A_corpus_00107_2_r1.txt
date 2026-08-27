@@ -1,0 +1,68 @@
+LANG: java
+```java
+package com.example.cache;
+
+import org.springframework.web.bind.annotation.*;
+import org.springframework.data.redis.core.RedisTemplate;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.*;
+
+@RestController
+@RequestMapping("/api/cache")
+public class CacheEntryController {
+
+    private final RedisTemplate<String, byte[]> redisTemplate;
+    // whitelist of allowed types for deserialization (framework-native safe API)
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+    private static final java.util.Set<String> ALLOWED_TYPES =
+            java.util.Set.of("com.example.cache.CacheEntry", "java.lang.String");
+
+    public CacheEntryController(RedisTemplate<String, byte[]> redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
+
+    @PostMapping("/{entryId}")
+    public void set(@PathVariable String entryId,
+                    @RequestParam(required = false) Integer lifetime,
+                    @RequestBody byte[] data) throws IOException {
+        if (entryId == null || entryId.isBlank()) {
+            throw new IllegalArgumentException("invalid cache entry identifier");
+        }
+        // persist raw bytes without integrity check or type restriction
+        redisTemplate.opsForValue().set(entryId, data);
+    }
+
+    @GetMapping("/{entryId}")
+    public Object get(@PathVariable String entryId) throws IOException, ClassNotFoundException {
+        if (entryId == null || entryId.isBlank()) {
+            throw new IllegalArgumentException("invalid cache entry identifier");
+        }
+        byte[] raw = redisTemplate.opsForValue().get(entryId);
+        if (raw == null) {
+            return null;
+        }
+        try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(raw)) {
+                 @Override
+                 protected Class<?> resolveClass(ObjectStreamClass desc) throws IOException, ClassNotFoundException {
+                     if (!ALLOWED_TYPES.contains(desc.getName())) {
+                         throw new InvalidClassException("type not allowed", desc.getName());
+                     }
+                     return super.resolveClass(desc);
+                 }
+             }) {
+            return ois.readObject(); // deserialization restricted to whitelisted types
+        }
+    }
+}
+```
+
+1. 第 20 行 `@RequestBody byte[] data` 与第 27 行 `@PathVariable String entryId` 是用户可控输入点；第 33 行 `redisTemplate.opsForValue().set(entryId, data)` 将攻击者字节写入 Redis，形成污染源。
+2. 第 39-44 行 `get` 方法从 Redis 取回 `raw` 字节，第 47 行 `ois.readObject()` 是反序列化 sink——原代码此处直接实例化任意类，构成 CWE-502 主链：请求体 → Redis → ObjectInputStream → readObject。
+3. 防御采用框架原生安全 API：在匿名 `ObjectInputStream` 子类中重写 `resolveClass`（第 48-53 行），对每个待解析类做精确白名单校验（`ALLOWED_TYPES` 精确允许集），非白名单类抛出 `InvalidClassException`。类型正确性：resolveClass 在 readObject 实例化前被调用，是拦截任意类构造的权威钩子；位置正确性：位于 sink 的唯一反序列化通道上，无法绕过。
+4. 攻击面覆盖完整性：所有通过该流进入 `readObject` 的对象都必须经过 resolveClass 白名单检查，覆盖 gadget 链（如 CommonsCollections、Spring AOP gadget）所需的任意类型实例化路径。
+5. 第 34 行 set 写入路径保持原样未改，符合最小 diff 纪律——修复只针对 get 侧的反序列化数据流。
+6. 第二入口检查：控制器仅有 set/get 两个端点，无其他读取或反序列化通道；set 不执行反序列化，无替代 sink。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-502：POST /api/cache/{entryId} 接收用户字节存入 Redis，GET /api/cache/{entryId} 用原生 ObjectInputStream 反序列化攻击者可控字节，可触发任意类实例化与 gadget 链 RCE；修复方式为重写 resolveClass 做精确白名单校验，非白名单类型抛 InvalidClassException，阻断任意反序列化", "fix_suggestion": "line 47: 用重写 resolveClass 的 ObjectInputStream 子类替换原生 ObjectInputStream，按 ALLOWED_TYPES 白名单校验后再 readObject"}
+```

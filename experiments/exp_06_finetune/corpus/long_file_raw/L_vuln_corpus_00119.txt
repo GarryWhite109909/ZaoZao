@@ -1,0 +1,34 @@
+# 编号分析
+
+**1. 入口点枚举（通读全文）**
+- 构造函数（第 57-63 行）：`keyDirectoryPath` 来自组件配置（URI 参数），是外部可控 source。
+- `generateKeyPair`（第 66-110 行）：`algorithm`、`keyId`、`parameterSpec` 均为外部输入。
+- `storeKey`/`getKey`/`getKeyMetadata`/`updateKeyMetadata`/`deleteKey`（第 152-215 行）：`keyId` 直接参与文件路径构造。
+- `rotateKey`/`expireKey`/`revokeKey`（第 133-247 行）：间接传递 `keyId`。
+- `loadExistingKeys`（第 251-269 行）：从目录读取文件名作为 keyId，属第二入口（磁盘上文件名可被攻击者放置）。
+
+**2. 数据流验证**
+
+流 A：`keyId` → 第 273 行 `getKeyFile()` → 第 274 行 `keyDirectory.resolve(keyId + ".key")`。`keyId` 未经任何校验/规范化/白名单过滤。若 `keyId = "../../etc/cron.d/evil"`，则 resolve 后逃逸出 keyDirectory。Sink：第 157-163 行 `Files.newOutputStream(..., CREATE, TRUNCATE_EXISTING)` —— **任意文件写入/覆盖**（内容为 Java 序列化的 KeyPair）。同样影响 `getMetadataFile`（第 277 行）及 `deleteKey` 中 `Files.deleteIfExists`（第 216-217 行）—— 任意文件删除。
+
+流 B：反序列化 sink。第 191-196 行 `getKey` 与第 203-208 行 `getKeyMetadata` 使用原生 `ObjectInputStream.readObject()` 反序列化磁盘文件；第 262 行 `loadExistingKeys` 会自动加载目录下所有 `.metadata` 文件并触发该反序列化。文件路径由外部可控的 keyId 决定（流 A），且目录权限仅依赖部署环境，无完整性校验（无签名/MAC）。攻击者若能写入该目录（结合流 A 的写原语或低权限账户），可植入 gadget 链实现 **RCE（CWE-502 不受信反序列化）**。
+
+流 C：`algorithm` → `determineProvider`/`getAlgorithmName`（第 281-303 行）。先经枚举 `valueOf` 白名单，失败则回退返回原始字符串给 `KeyPairGenerator.getInstance`（第 74-79 行），可能触发非预期 provider 加载，但利用条件苛刻，风险较低。
+
+流 D：`exportKey/importKey`（第 118-131 行）委托 KeyFormatConverter，本文件内无可达危险 sink。
+
+**3. 第二入口确认**：`loadExistingKeys` 以文件名为 keyId 回读并反序列化，证实替代通道存在；`Paths.get(keyDirectoryPath)` 本身允许配置注入绝对路径，但配置通常视为受信输入，主风险仍在 keyId。
+
+**4. 结论**：存在两条真实漏洞链：(1) 路径遍历导致任意文件写/删（CWE-22）；(2) 对可被污染的文件执行 Java 原生反序列化（CWE-502）。两者组合可升级为 RCE。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 Path Traversal; CWE-502 Deserialization of Untrusted Data",
+  "risk_level": "High",
+  "source": "line 66: generateKeyPair 及 getKey/storeKey/deleteKey 等方法的外部参数 keyId",
+  "sink": "line 274: keyDirectory.resolve(keyId + '.key') 后于 line 158 Files.newOutputStream(CREATE, TRUNCATE_EXISTING) 写入; line 195 ois.readObject() 原生反序列化",
+  "explanation": "keyId 未做任何校验即拼入路径, 传入形如 ../../x 的值可逃逸 keyDirectory, 实现任意文件覆盖(line 158)与删除(line 216); 同时 getKey/getKeyMetadata/loadExistingKeys(line 262) 对这些路径下的文件直接使用 ObjectInputStream.readObject 反序列化且无签名校验, 攻击者写入恶意序列化对象后可在加载时触发 gadget 链导致 RCE",
+  "fix_suggestion": "line 273: 在 getKeyFile/getMetadataFile 中对 keyId 做白名单校验(如仅允许字母数字与连字符), 并用 normalize 与 startsWith(keyDirectory) 校验解析结果; line 195: 用 ObjectInputFilter 限制反序列化类型, 或改用带 MAC 签名的密封格式(如 SealedObject + AEAD)存储密钥与元数据"
+}
+```

@@ -1,0 +1,23 @@
+## 编号分析
+
+**入口点枚举（全文通读）**
+1. `Upload(oid, rc)` —— 第 60 行，外部传入 `oid` 与请求体流。
+2. `Download(oid, w)` —— 第 116 行，外部传入 `oid`。
+3. 无其他入口（无路由/环境变量/回调），本文件是存储层，source 即调用方传入的 `OID`。
+
+**数据流验证**
+
+- **Upload 路径（第 60–112 行）**：第 62 行先做 `ValidOID(oid)` 校验，通过后才进入第 66 行 `storagePath` → 第 71 行 `os.MkdirAll` / 第 104 行 `os.Rename`。若 `ValidOID` 要求 64 位十六进制（gogs 中如此），则路径可控字符被消除，此路径防御有效。
+
+- **Download 路径（第 116–131 行）**：⚠️ 关键缺陷——**没有调用 `ValidOID`**。直接进入第 117 行 `storagePath(oid)`：
+  - 第 47 行仅检查 `len(oid) < 2`；
+  - 第 49 行 `filepath.Join(s.Root, string(oid[0]), string(oid[1]), string(oid))`：若 `oid = "../../etc/passwd"`，则 `oid[0]='.'`、`oid[1]='.'`，Join 结果为 `<Root>/././../../etc/passwd`，`filepath.Join` 会清理为 Root 之外的绝对路径；
+  - 第 118 行 `osx.IsFile(fpath)` 与第 122 行 `os.Open(fpath)` 直接以该路径打开并回传内容——任意文件读取 sink。
+
+- **第二入口/替代通道**：`Upload` 因哈希校验（第 101 行）与 `ValidOID` 双重防御不可利用；但攻击者可通过 LFS 下载 API（调用方）将恶意 oid 直达 `Download`。`storagePath` 是共享辅助函数，其自身防御（长度检查 + Join）不足以阻止 `..` 序列。
+
+**结论**：存在漏洞。Upload 有校验，Download 缺失同一校验，构成 source→sink 未防护的路径穿越/任意文件读取。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "high", "source": "line 116: Download 的参数 oid 来自外部请求", "sink": "line 122: os.Open(fpath) 并经 io.Copy 回传文件内容", "explanation": "Download 未像 Upload 那样调用 ValidOID 校验；storagePath 在 line 49 使用 filepath.Join 拼接 oid，当 oid 含 ../ 时 Join 会解析出存储根目录之外的路径 -> 攻击者可用形如 ../../etc/passwd 的 oid 触发任意文件读取", "fix_suggestion": "line 116: 在 Download 开头增加与 Upload 相同的 if !ValidOID(oid) { return ErrInvalidOID } 校验，并在 storagePath 中拒绝包含路径分隔符或 .. 的 oid"}
+```

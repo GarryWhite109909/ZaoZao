@@ -1,0 +1,22 @@
+## 编号分析
+
+1. **入口点枚举（全文通读）**：本文件唯一外部入口是 `processSASLBind`（第 88 行起），由 LDAP Bind 操作回调触发。source 为 `bindOperation.getSASLCredentials()`（第 96 行），解析出三个攻击者可控值：`authzID`、`authcID`、`password`。其余入口仅为配置回调 `applyConfigurationChange` / `isConfigurationChangeAcceptable`（第 262–285 行），仅接受管理员配置的 identity mapper DN，无用户输入，无风险。
+
+2. **数据流 1：authcID 以 `dn:` 开头（第 133–172 行）**：`authcID.substring(3)` → `DN.valueOf()`（第 139 行）。`DN.valueOf` 是类型安全的 DN 解析器，非法输入抛异常被捕获并返回 INVALID_CREDENTIALS，无注入 sink。随后显式拒绝 root DN（第 145 行），再经 `getActualRootBindDN` 归一化后取 entry——但注意：此处仅取得 entry，密码校验在后面统一执行（第 246 行 `passwordMatches`），不存在绕过认证直接登录的路径。
+
+3. **数据流 2：authcID 走 identity mapper（第 173–193 行）**：`identityMapper.getEntryForID(authcID)`。mapper 内部自行构造搜索过滤器并做转义/编码，本文件未拼接任何过滤字符串，非本文件可利用面。
+
+4. **数据流 3：authzid 授权身份（第 199–240 行）——关键越权检查点**：
+   - `dn:` 形式：若 `authzDN` 与认证用户 DN 不同，则构造临时连接并强制检查 `Privilege.PROXIED_AUTH`（第 213–222 行），随后调用 `checkProxyAccess`（第 238 行）→ `SASLContext.hasProxyAccess` 执行 ACI 范围检查；任一失败即拒绝。防御有效且不可绕过（非黑名单/正则）。
+   - `u:` 或裸 ID 形式（第 226–257 行）：同样逻辑——映射出的 authZEntry 与 userEntry 不一致时，先查 PROXIED_AUTH 特权，再做 ACI 检查；空 authzid 置 null 也走同一特权+ACI 检查分支，与 DIGEST-MD5/GSSAPI 行为一致。
+   - 两分支均无“先授权后验证”或漏检路径。
+
+5. **数据流 4：password（第 245–250 行）**：仅传入 `AuthenticationPolicyState.passwordMatches` 做哈希比对，失败即拒绝；账户禁用状态先行检查（第 235 行）。无明文存储、无日志泄露（错误消息只含攻击者自己提交的 authcID/authzID，不含密码）。
+
+6. **第二通道/替代入口核查**：文件中无文件 IO、环境变量、反序列化、命令执行、JNDI 查找等 sink；`isSecure` 返回 false 仅是机制声明，提示需配合 TLS，属设计文档而非漏洞。
+
+7. **结论**：所有 source→sink 流均有结构性防御（类型化 DN 解析、特权+ACI 双重代理授权检查、集中式口令校验），无可绕过点，全文未见注入或越权路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文唯一入口 processSASLBind 中，authcID 经 DN.valueOf 类型化解析或 identityMapper 安全查询，authzid 变更授权身份时强制执行 PROXIED_AUTH 特权与 SASLContext.hasProxyAccess 的 ACI 双重检查，password 仅经 passwordMatches 哈希比对，无注入或越权 sink，防御均为结构性检查而非黑名单，无法绕过。", "fix_suggestion": "no fix needed"}
+```

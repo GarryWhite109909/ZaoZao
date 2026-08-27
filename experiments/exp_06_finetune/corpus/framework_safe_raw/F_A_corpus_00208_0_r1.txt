@@ -1,0 +1,67 @@
+LANG: python
+```python
+from flask import Flask, request, jsonify
+import re
+import xml.etree.ElementTree as ET
+
+app = Flask(__name__)
+
+# SVG 白名单：仅允许结构性/绘图标签与安全属性，事件属性一律剔除
+ALLOWED_TAGS = {'svg', 'g', 'path', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon', 'text', 'tspan', 'defs', 'use', 'title', 'desc'}
+ALLOWED_ATTRS = {'id', 'class', 'd', 'x', 'y', 'cx', 'cy', 'r', 'rx', 'ry', 'width', 'height', 'fill', 'stroke', 'stroke-width', 'transform', 'viewBox', 'xmlns', 'points', 'x1', 'y1', 'x2', 'y2', 'dx', 'dy', 'font-size', 'text-anchor'}
+
+def _sanitize_element(elem):
+    # 白名单精确允许集：非白名单标签整体丢弃（含 script/foreignObject/on* 事件载体）
+    if not (elem.tag in ALLOWED_TAGS):
+        return None
+    for attr in list(elem.attrib.keys()):
+        if attr not in ALLOWED_ATTRS:
+            del elem.attrib[attr]
+    kept = []
+    for child in list(elem):
+        cleaned_child = _sanitize_element(child)
+        if cleaned_child is None:
+            elem.remove(child)
+        else:
+            kept.append(cleaned_child)
+    return elem
+
+# 依赖此净化函数的下游会直接渲染返回的 SVG（信任其已无脚本）
+def sanitize_svg(svg_text):
+    # 白名单式净化：解析后仅保留允许的标签/属性，替代原黑名单正则
+    root = ET.fromstring(svg_text)
+    _sanitize_element(root)
+    return ET.tostring(root, encoding='unicode')
+
+@app.route('/api/svg/clean', methods=['POST'])
+def clean_svg():
+    svg_text = request.form.get('svg', '')
+    if not svg_text:
+        return jsonify({'error': 'missing svg field'}), 400
+    result = sanitize_svg(svg_text)
+    return result, 200, {'Content-Type': 'image/svg+xml'}
+
+@app.route('/view/<doc_id>')
+def view_doc(doc_id):
+    # 第二入口：从存储读取并直接内联渲染用户上传的 SVG 片段
+    snippet = load_user_snippet(doc_id)  # 假设来自数据库的用户内容
+    return f'<div class="embed">{snippet}</div>'
+
+def load_user_snippet(doc_id):
+    import sqlite3
+    conn = sqlite3.connect('docs.db')
+    row = conn.execute('SELECT body FROM snippets WHERE id=?', (doc_id,)).fetchone()
+    conn.close()
+    return row[0] if row else ''
+```
+
+分析：
+1. 第 30 行 `request.form.get('svg', '')` 是用户可控输入点；第 40 行 `load_user_snippet` 返回的数据库用户内容是第二入口的可控数据。
+2. 第 27-28 行 sink 为 `return result, ..., Content-Type: image/svg+xml`（下游直接渲染 SVG）；第 41 行为内联 HTML 渲染 sink。
+3. 第 24 行起 `sanitize_svg` 改用 `xml.etree.ElementTree` 解析 + `_sanitize_element` 白名单递归净化：类型正确性——基于解析后的 DOM 结构做标签/属性白名单判断，而非文本正则，无法被大小写、换行、嵌套 `<scr<script>ipt>` 等混淆绕过；位置正确性——净化发生在返回给下游渲染之前，覆盖 `/api/svg/clean` 全部输出。
+4. 攻击面覆盖完整性——第 9-11 行白名单不含 `script`、`foreignObject`、`animate`、`set`、`a` 等，且第 15-16 行删除所有非白名单属性，天然剔除 `onload`/`onclick` 等事件处理器与 `href=javascript:` 载体；畸形 XML 由 `ET.fromstring` 直接抛错拒绝，不产生残留片段。
+5. 第二入口检查结论——第 39-41 行 `view_doc` 内联渲染未净化片段仍属潜在 XSS，但按 minimal pair 纪律本次只修复目标漏洞所在数据流（SVG 净化黑名单不完整），该流保持原样并在后续样本中单独处理。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-79：sanitize_svg 仅用正则黑名单移除 script 标签块，可被大小写混淆、嵌套拆分、事件属性 onload、javascript: URI、foreignObject/animate 等载体绕过，残留脚本经 /api/svg/clean 以 image/svg+xml 返回后被下游直接渲染执行；修复采用 ElementTree 解析加标签与属性双白名单递归净化，删除全部非白名单元素与属性，畸形输入直接拒绝，防御位于返回前覆盖该数据流全部输出；第二入口 /view/<doc_id> 第 41 行内联渲染未净化片段属于另一条独立数据流，按最小 diff 纪律保持原样，不在本样本修复范围", "fix_suggestion": "line 24: 将 sanitize_svg 的正则黑名单替换为 ElementTree 解析加 ALLOWED_TAGS 与 ALLOWED_ATTRS 白名单递归净化"}
+```

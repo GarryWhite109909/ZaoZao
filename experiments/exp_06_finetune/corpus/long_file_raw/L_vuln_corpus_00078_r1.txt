@@ -1,0 +1,52 @@
+# 全文逐函数安全分析
+
+## 一、文件整体定位与入口点枚举
+
+本文件是 CryptoJS（crypto-js 开源库）的 PBKDF2 模块实现，全文共约 100 行，包含两个导出符号：
+
+1. `PBKDF2Algo` 类（第 5 行定义，第 14 行构造函数，第 33 行 `compute` 方法）
+2. `PBKDF2` 静态便捷函数（第 95 行）
+
+作为纯加密原语库，它本身不监听网络端口、不读取文件、不注册路由，因此**入口点**只能从以下几类枚举：
+
+- **入口点 A（参数入口）**：`PBKDF2(password, salt, cfg)` 的三个形参，第 95 行；
+- **入口点 B（配置对象注入）**：`PBKDF2Algo` 构造函数的 `cfg` 参数（第 14 行），经第 18–24 行 `Object.assign` 合并进内部配置；
+- **入口点 C（依赖导入）**：第 1–4 行从 `./core.js` 导入 `Base`、`WordArray`，从 `./sha1.js` 导入 `SHA1Algo`，从 `./hmac.js` 导入 `HMAC`——这些是受信任的同包模块，非外部可控输入；
+- **入口点 D（回调/事件/环境）**：全文无任何事件监听器、定时器回调、`process.env` 读取或子进程调用，可排除。
+
+## 二、逐函数 source→sink 数据流验证
+
+### 函数 1：`constructor(cfg)`（第 14–26 行）
+
+- 第 18 行 `Object.assign(new Base(), {...默认值}, cfg)`：将调用方传入的 `cfg` 浅合并覆盖默认值。默认值为 `keySize: 128/32`（第 20 行）、`hasher: SHA1Algo`（第 21 行）、`iterations: 1`（第 22 行）。
+- 数据流：外部传入的 `cfg.hasher` → 第 37 行 `HMAC.create(cfg.hasher, password)`。若攻击者能控制 `cfg`，理论上可注入任意“hasher”对象（原型污染式注入）。但该对象必须实现 `create/reset/finalize/update` 接口才能在第 44、47、52、57 行被调用，否则抛 TypeError 中止——这是**结构性约束而非安全防御**，但在库的正常使用场景下 `cfg` 由开发者而非攻击者控制，不构成实际漏洞。
+- 无字符串拼接进 HTML/SQL/shell 的 sink，无 eval。
+
+### 函数 2：`compute(password, salt)`（第 33–91 行）
+
+- 第 36 行解构 `cfg`；第 39 行 `HMAC.create(cfg.hasher, password)` —— password 作为 HMAC 密钥进入哈希运算，属预期密码学用途。
+- 第 45 行 `hmac.update(salt).finalize(blockIndex)` —— salt 进入 HMAC 消息体，同样为预期用途。
+- 第 48–68 行迭代循环：`for (let i = 1; i < iterations; i += 1)`（第 53 行），对中间结果反复 HMAC 并 XOR 累积到 `blockWords`（第 62 行）。若调用方传入负数或 0 的 `iterations`，循环直接跳过（i 从 1 开始且 `< iterations` 不成立），不会死循环；若传入超大值则是 DoS 自伤，由调用方负责。
+- 第 70 行 `derivedKey.concat(block)` 与第 73 行 `sigBytes = keySize * 4`：纯内存操作，无越界写风险（JS 数组自动扩展）。
+- **关键发现——弱默认参数**：
+  - 第 22 行 `iterations: 1`：PBKDF2 的迭代次数默认仅为 1 次，远低于 OWASP 建议（SHA-1 下至少数十万次）。若上层应用未显式传 `cfg.iterations`（如第 88 行文档示例 `CryptoJS.PBKDF2(password, salt)` 未带配置），派生密钥抗暴力破解能力极弱。这是 CWE-916（口令派生函数迭代次数不足）/ CWE-1188 类问题。
+  - 第 21 行 `hasher: SHA1Algo`：默认哈希为 SHA-1，属已淘汰的弱算法（CWE-327 使用已被破解的加密算法）。虽然 PBKDF2-HMAC-SHA1 尚未被完全攻破，但对新系统而言不符合现代标准（应至少 SHA-256）。
+- 防御有效性核查：全文无黑名单/正则过滤逻辑，因此不存在“看似有防御实则可绕过”的假阳性；同时也无输入校验（如 `iterations` 最小值强制），即**没有任何机制阻止不安全的低迭代配置生效**。
+
+### 函数 3：`PBKDF2` 快捷函数（第 95 行）
+
+- 单行透传：`(password, salt, cfg) => PBKDF2Algo.create(cfg).compute(password, salt)`。source 为三参数，sink 为上述 compute 内部 HMAC 调用。无额外校验，无第二入口差异。
+
+## 三、第二入口与替代通道检查
+
+- 无 HTTP 路由、无 CLI 参数解析、无文件读写、无 `eval`/`Function` 构造器、无 `child_process`、无动态 `require`——替代通道为零。
+- 唯一间接入口是 `cfg` 对象（入口点 B），其风险面已在函数 1 分析中覆盖：最坏情况是注入畸形 hasher 导致异常，或注入低迭代配置导致弱密钥，后者与主结论同源。
+- 时序侧信道：第 62 行 XOR 与比较操作不含密钥比较分支，不存在非常量时间比较问题（本模块不做密钥比对）。
+
+## 四、结论
+
+代码逻辑实现正确（与 RFC 2898 一致），无内存破坏、无注入类漏洞。真实存在的安全问题在于**不安全的默认配置**：默认 1 次迭代 + 默认 SHA-1，使未显式加固的上层应用产生易被暴力破解的派生密钥。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-916 / CWE-327", "risk_level": "中", "source": "line 95: 外部传入的 password/salt 及未指定时的缺省 cfg", "sink": "line 22: iterations 默认值为 1；line 21: hasher 默认值为 SHA1Algo", "explanation": "当上层应用按文档示例 line 88 直接调用 CryptoJS.PBKDF2(password, salt) 而不传 cfg 时，Object.assign 在 line 18-24 采用默认 iterations=1 和 SHA-1，派生密钥仅经过一次 HMAC 运算，攻击者获取盐值后可高速暴力枚举口令恢复密钥 -> 弱口令派生", "fix_suggestion": "line 22: 将默认 iterations 提升至不低于 310000（OWASP 对 PBKDF2-HMAC-SHA256 的建议值）；line 21: 将默认 hasher 改为 SHA256Algo，并在 compute 入口对 iterations 低于安全阈值时给出告警或拒绝"}
+```

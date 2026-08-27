@@ -1,0 +1,25 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. 第 84–140 行 `_run`：CLI 参数 `-i/-o/-lut/-elp/-nc/-bf/-vap/-vnap/-ssp/-p/-dp`，全部为外部可控 source。
+2. 第 143–152 行 `load_LUT`：读取用户指定 YAML 文件（ruamel `YAML()` 默认 safe 加载，不构成反序列化 RCE）。
+3. 第 155–205 行 `jinja_ify`：模板加载、渲染、输出写文件。
+4. 第 208–262 行 `jinja_multiple_md`：按 control 循环生成多文件。
+5. 第 265–284 行 `render_template`：递归二次渲染。
+6. 第 287–302 行 `_number_captions`：纯文本处理，无 sink。
+
+**逐条数据流验证**
+
+- **输出路径（第 197–199、242–245 行）**：`r_output_file` / `group_dir` 拼接后经 `PathSecurityValidator.validate_local_path` 校验，防御存在。但该 validator 是否防符号链接需看其实现，本文件内无法证实失效，暂记为有效。
+- **输入模板路径（第 172–173、238–240 行）**：`jinja_env.get_template(str(r_input_file))`，loader 为 `FileSystemLoader(pathlib.Path.cwd())`，**未做任何路径校验**（帮助文本称相对 trestle root，实际相对 cwd）。Jinja 的 `split_template_path` 会拒绝含 `..` 或绝对路径的段，直接穿越被框架阻断；但模板内 `{% include %}` 同样受此限制。故任意读受限——但注意 cwd 与 trestle_root 不一致时可加载 cwd 下任意模板文件（低危，CWE-73 残留）。
+- **关键漏洞流（source→sink）**：
+  - source A：第 158–162 行 LUT YAML 内容；source B：第 183–190 / 216–225 行经 `ProfileResolver` 解析的 profile/SSP 数据（OSCAL profile 可源自远程抓取并缓存的模型）；source C：第 174–196 行注入 lut 的 ssp_data/catalog 对象属性。
+  - 中转：第 266 行 `template.render(**lut)` 将上述数据展开进输出字符串。
+  - **sink：第 271–280 行 `render_template` 的递归循环**——把上一次渲染结果当作新模板，用**非沙箱** `Environment`（第 277–280 行，无 `SandboxedEnvironment`，且挂载自定义 `extensions()`）再次 `get_template(...).render(**lut)`。任何来自模型/LUT 的文本若含 `{{ ... }}` / `{% ... %}`（例如远程 profile 中 parameter 描述、LUT 值），将在第二阶被作为模板执行，形成二阶 SSTI → 任意代码执行（CWE-94 / CWE-1336）。`max_recursion_depth=2` 只是限次，不构成安全防御。
+- **替代通道**：`jinja_multiple_md` 第 252–256 行同样调用 `render_template`，同一 sink 有第二入口；`load_LUT` 的自引用字典构造（第 148–151 行）无安全影响。
+
+**结论**：核心问题是递归重渲染 + 非沙箱环境导致的二阶模板注入（数据源可为本地不可信缓存模型或 LUT 文件），以及输入模板路径未限定于 trestle root。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-94 / CWE-1336 二阶Jinja模板注入导致任意代码执行", "risk_level": "高", "source": "line 160: 用户提供的LUT YAML内容 与 line 217: 经ProfileResolver解析的profile/SSP数据(可能来自远程抓取缓存的模型)", "sink": "line 279-280: render_template将上一轮渲染结果作为新模板用非沙箱Environment再次get_template().render()", "explanation": "第一轮 template.render(**lut) 把LUT与catalog/ssp/profile数据展开进输出字符串 -> 第271行起循环将该字符串经DictLoader重新作为模板加载 -> 使用未沙箱化且带自定义extensions的Jinja Environment执行 -> 若数据中含 {{}}/{%%} 模板语法即被求值, 可达RCE; max_recursion_depth=2 仅限次数非安全控制; 另外line 173/239 输入模板路径仅相对cwd加载, 未校验限定于trestle_root", "fix_suggestion": "line 277-280: 改用 jinja2.sandbox.SandboxedEnvironment 并移除对不可信数据的递归重渲染; 同时在 line 172-173 与 line 238-239 对 r_input_file 调用 PathSecurityValidator.validate_local_path(trestle_root) 限制模板必须位于工程根目录内"}
+```

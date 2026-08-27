@@ -1,0 +1,61 @@
+# MathML.php 安全分析
+
+## 一、文件结构与入口点枚举（全文通读）
+
+本文件位于 `PhpOffice\Math\Reader` 命名空间，是 PHPOffice/Math 项目的 MathML 读取器。全文共约 150 行，包含以下函数，逐一分析：
+
+### 1. `__construct()`（第 24–27 行）
+- 仅初始化 `$this->xmlScanner = XmlScanner::getInstance();`。
+- 无参数输入、无副作用。**无风险点。**
+
+### 2. `read(string $content): ?Math`（第 29–46 行）——主入口
+入口点：外部传入的字符串 `$content`（典型来源为用户上传的 MathML 文档，如 Word/ODF 内嵌公式）。这是唯一的 source。
+
+数据流：
+1. 第 31 行：`$content = $this->xmlScanner->scan($content);` —— XmlScanner 是 PHPOffice 系列的标准 XXE 防护组件，内部会检测并禁用 DOCTYPE/ENTITY 声明（通过正则检测 `<!DOCTYPE`、`<!ENTITY`、`SYSTEM`、`PUBLIC` 关键字，并在 libxml 支持 `LIBXML_NOENT` 场景下抛出异常或移除声明）。这是针对 XML 外部实体注入（XXE）的专用防御，非黑名单式业务过滤，属于该威胁模型下的有效防御（配合 PHP 默认 libxml 不加载外部实体的行为形成双保险）。
+2. 第 32–38 行：`str_replace('&InvisibleTimes;', '<mchar name="InvisibleTimes"/>', $content)` —— 实体名替换，仅影响解析语义，不引入新的 sink。
+3. 第 41 行：`$this->dom->loadXML($content);` —— **sink #1：XML 解析器**。防御链：XmlScanner.scan → loadXML。注意此处未显式传 `LIBXML_NOENT`，PHP 默认不替换外部实体；即使攻击者构造 entity，XmlScanner 已在 scan 阶段拦截 DOCTYPE/ENTITY。**XXE 数据流被有效阻断。**
+4. 第 43 行：`$this->parseNode(null, $this->math);` —— 进入递归解析。
+
+需注意的残余点：若 XmlScanner 因版本差异未拦截（如旧版仅警告），loadXML 本身在默认 flags 下也不会展开外部实体到文档值中（除非 NOENT），且本代码后续只读取 `nodeValue`/`getAttribute`，不存在将解析结果回写为 XML 或执行系统命令的路径。
+
+### 3. `parseNode(?DOMNode $nodeRowElement, $parent)`（第 53–72 行）
+- 第 56 行：`new DOMXPath($this->dom)`；第 57 行：`$this->xpath->query('*', $nodeRowElement)` —— XPath 查询表达式为硬编码常量 `'*'`，**无任何用户输入拼接进查询语句，不存在 XPath 注入**。
+- 第 59–67 行：对 `annotation` 节点调用 `$parent->addAnnotation($nodeElement->getAttribute('encoding'), trim($nodeElement->nodeValue))` —— 数据进入 Math 对象内存结构，本类内无输出/序列化 sink；下游消费方是否安全不在本文件责任范围（且 annotation 仅作为字符串属性存储）。
+- 第 69 行：`$parent->add($this->getElement($nodeElement));` —— 递归入口。
+
+### 4. `getElement(DOMNode $nodeElement): Element\AbstractElement`（第 74–145 行）——核心分发
+逐 case 分析：
+
+- **`mfrac`（第 78–90 行）**：取两个子节点递归调用 getElement，构造 Fraction 对象。子节点数量校验 `length == 2`。无 sink。
+- **`mi`（第 91–92 行）**：`new Element\Identifier($nodeValue)` —— 字符串存入值对象。
+- **`mn`（第 93–94 行）**：`floatval($nodeValue)` —— **关键防御点**：强制类型转换为 float，任何恶意字符串在此被数值化，不可能携带注入载荷。数值上下文天然安全。
+- **`mo`（第 95–110 行）**：空值时从 `mchar` 的 `name` 属性取值，`new Element\Operator($nodeValue)`。注意第 32–38 行 read() 中 `str_replace` 会把 `&InvisibleTimes;` 替换为 `<mchar name="InvisibleTimes"/>`——这里存在一个理论上的“第二通道”：攻击者可在原文写入 `&InvisibleTimes;` 使其变成 mchar 元素。但该替换的目标字符串是固定常量 `'InvisibleTimes'`，攻击者无法控制 name 属性内容为任意值（只能得到这一个字面量），因此不构成可利用通道。
+- **`mrow`（第 111–117 行）**：递归 parseNode，深度受限于输入 XML 自身嵌套深度——存在**递归深度/资源耗尽**的理论 DoS 面（深层嵌套 MathML 导致栈溢出），但这是所有递归解析器的共性限制，libxml 默认有深度限制（256），实际不可达危险深度，属低风险设计权衡而非漏洞。
+- **`msup`（第 118–131 行）**：同 mfrac 模式，无 sink。
+- **`semantics`（第 132–137 行）**：递归 parseNode，annotation 分支已在 parseNode 中覆盖。
+- **default（第 138–142 行）**：抛出 NotImplementedException，异常消息含 `$nodeElement->nodeName`——nodeName 来自 DOM 解析结果，是合法 XML 标签名，不含原始用户可控的任意字节（XML 标签名字符集受限），且异常消息通常仅记日志。即便进入日志，标签名无法闭合日志格式中的引号结构的风险极低，非可利用注入。
+
+## 二、Source→Sink 数据流汇总验证
+
+| # | Source | Sink | 中间防御 | 结论 |
+|---|--------|------|----------|------|
+| 1 | read() 参数 $content | loadXML (第41行) | XmlScanner::scan + 无 LIBXML_NOENT | XXE 已阻断 |
+| 2 | nodeValue/getAttribute | Element\Identifier/Operator/Semantics 属性 | 存入内存对象，本文件无输出 sink | 无直接危害 |
+| 3 | mn 的 nodeValue | floatval 强转 | 类型转换 | 天然安全 |
+| 4 | XPath query | DOMXPath | 表达式硬编码 '*' | 无注入 |
+| 5 | &InvisibleTimes; 替换通道 | mchar name 属性 | 替换值为固定常量 | 不可控，无效通道 |
+
+## 三、第二入口与替代通道检查
+
+- 本类实现 ReaderInterface，唯一公开入口为 `read()`；`parseNode`/`getElement` 为 protected，仅可由本类及子类触达，外部无法绕过 XmlScanner 直接调用它们处理未扫描内容（除非应用层自行 new 子类并喂入 DOM——那属于应用层误用，非本文件缺陷）。
+- 未发现文件读取、命令执行（exec/shell/system）、反序列化（unserialize）、SQL、include/require 等 sink。
+- 异常路径（InvalidInputException / NotImplementedException）均 fail-fast，不产生降级解析。
+
+## 四、结论
+
+全文证据显示：唯一 source（read 的 $content）到达 XML 解析 sink 前经过专用 XXE 防御组件；其余所有数据流终点均为内存中的值对象，且数值路径经 floatval 强制转换；XPath 与 str_replace 均使用硬编码常量。未发现可利用漏洞。残余风险仅为深层嵌套 XML 的理论资源消耗，受 libxml 深度限制约束，不构成实际漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文逐一核查了 __construct(第24-27行)、read(第29-46行)、parseNode(第53-72行)、getElement(第74-145行)。唯一source是read()的外部content参数，其到达loadXML(第41行)前经过XmlScanner::scan(第31行)的DOCTYPE/ENTITY检测，且未启用LIBXML_NOENT，XXE被有效阻断。XPath查询表达式为硬编码常量星号(第57行)，无注入面。mn分支经floatval强转(第94行)天然安全；mi/mo/annotation的数据仅存入内存值对象，本文件内无输出、命令执行、反序列化、文件操作等sink。str_replace的InvisibleTimes替换目标为固定常量，攻击者不可控，不构成替代通道。protected方法无法被外部绕过scan直接调用。残余的深层嵌套递归DoS受libxml深度限制约束，不构成实际漏洞。", "fix_suggestion": "no fix needed"}
+```

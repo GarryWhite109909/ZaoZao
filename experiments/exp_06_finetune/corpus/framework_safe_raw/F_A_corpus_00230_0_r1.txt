@@ -1,0 +1,57 @@
+LANG: python
+```code
+# scheduler/views.py
+from django.http import HttpResponse
+from django.contrib.auth.models import User
+from django.core.management import call_command
+from django.views.decorators.csrf import csrf_exempt
+import os
+import subprocess
+
+
+@csrf_exempt
+def console(request):
+    """Console operations endpoint (invoked via CLI-style HTTP calls)."""
+    action = request.GET.get('action', '')
+
+    if action == 'install':
+        call_command('migrate')
+        # Seed the initial administrator account with credentials from the
+        # environment (framework-native settings API), never hard-coded.
+        admin_password = os.environ['SCHEDULER_ADMIN_PASSWORD']
+        if not User.objects.filter(username='administrator').exists():
+            User.objects.create_superuser(
+                username='administrator',
+                email='admin@example.com',
+                password=admin_password,
+            )
+        return HttpResponse('Installation completed, login with credentials from SCHEDULER_ADMIN_PASSWORD.')
+
+    if action == 'backup':
+        target_dir = request.GET.get('path', '/tmp')
+        # Whitelist exact allow-set of permitted backup directories.
+        allowed_dirs = {'/tmp', '/var/backups/scheduler'}
+        if target_dir not in allowed_dirs:
+            return HttpResponse('Invalid backup path.')
+        # Parameterized argument list (no shell interpolation) prevents injection.
+        subprocess.run(['pg_dump', 'scheduler', '-f', os.path.join(target_dir, 'backup.sql')], check=True)
+        return HttpResponse('Backup created in %s' % target_dir)
+
+    if action == 'sync':
+        from .google import sync_all_calendars
+        sync_all_calendars()
+        return HttpResponse('Sync finished.')
+
+    return HttpResponse('Usage: ?action=install|backup|sync')
+```
+
+1. 第 12 行 `request.GET.get('action', ...)` 与第 22 行 `request.GET.get('path', ...)` 是仅有的两个用户可控输入点；第 12 行的 action 走固定分支比较，不进入任何 sink，无需修复。
+2. 主漏洞数据流（CWE-798）：原第 18 行硬编码密码 `'administrator'` 直接传入第 19 行 `create_superuser` 的 `password` 参数（sink）。修复后第 16 行改从环境变量 `os.environ['SCHEDULER_ADMIN_PASSWORD']` 读取，属于框架/运行时原生安全配置 API，凭据不再出现在源码中；类型为 str，位置在 sink 之前，覆盖了唯一注入点。
+3. 次要数据流：原第 27 行 `os.system` 将用户可控 `target_dir` 以字符串插值拼入 shell 命令（命令注入面）。修复采用双重强防御：第 24-26 行白名单精确允许集 `{'/tmp', '/var/backups/scheduler'}` 精确匹配校验路径，第 28 行改为 `subprocess.run` 的参数化参数列表（预编译式 argv 数组，不经 shell 解析），彻底消除 shell 元字符攻击面。
+4. 防御位置正确性：白名单校验位于 sink 前的入口处且失败即提前返回，argv 参数化直接作用于进程创建 API，二者均无绕过路径。
+5. 攻击面覆盖完整性：install 分支凭据、backup 分支路径均已处理；sync 分支第 32 行 `sync_all_calendars()` 无外部输入参与，保持原样符合 minimal pair 局部对照要求。
+6. 第二入口检查：本视图无其他读取 `request.GET/POST/files` 的通道；`csrf_exempt` 为原有框架习语，按最小 diff 纪律保留，不在本次 CWE-798 修复范围内。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原 CWE-798 硬编码管理员凭据流已消除：第 16 行改用环境变量 os.environ 读取密码（框架原生安全配置 API），不再于源码中硬编码；原 backup 分支的命令拼接面同步以白名单精确允许集加 subprocess.run 参数化 argv 列表防御；其余控制流与标识符与原代码一致。", "fix_suggestion": "line 16: 用 os.environ 读取 SCHEDULER_ADMIN_PASSWORD 替换硬编码密码; line 24-28: 白名单允许集校验 target_dir 并改用 subprocess.run 参数列表替代 os.system"}
+```

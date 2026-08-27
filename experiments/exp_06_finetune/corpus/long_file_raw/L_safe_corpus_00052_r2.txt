@@ -1,0 +1,36 @@
+## 逐函数编号分析（全文通读，覆盖全部 5 个入口点）
+
+### 入口点枚举总览
+本文件是 Ghost 的 `db` 控制器，共暴露 5 个 API 入口：`backupContent`（第 9 行起）、`exportContent`（第 30 行起）、`importContent`（第 57 行起）、`inlineMedia`（第 78 行起）、`deleteAllContent`（第 90 行起）。所有入口均声明 `permissions: true` 或等价权限配置，即需要已认证的高权限用户（Owner/Administrator），这是第一层访问控制。
+
+### 1. backupContent（第 9–27 行）
+- **入口点**：`frame.options.filename` 与 `frame.options.include`（第 17、22 行）。
+- **数据流**：`filename` → 第 18 行 `path.basename(filename) !== filename` 校验 → 第 25 行传入 `dbBackup.backup(frame.options)`。
+- **防御有效性验证**：第 18 行的校验要求文件名与去路径后的基名完全相等，任何含 `/`、`\`、`..` 的输入都会抛出 `ValidationError`。这不是黑名单/正则过滤，而是基于规范化比较的白名单式判断——攻击者无法用编码绕过，因为比较发生在解码后的原始字符串上。该防御有效。
+- `include` 经第 12–15 行 `validation.values = exporter.BACKUP_TABLES` 枚举白名单约束，注入面被关闭。
+
+### 2. exportContent（第 30–55 行）
+- **入口点**：`frame.options.filename`（第 40 行）与 `include/withRelated`。
+- **数据流 A（filename 分支）**：第 40 行读取 `frame.options.filename` → 第 42 行直接传入 `dbBackup.readBackup(frame.options.filename)`，**没有**像 `backupContent` 那样做 `path.basename` 校验。若 `readBackup` 内部实现为 `path.join(backupsDir, filename)` 后读文件，则 `../../etc/passwd` 类输入构成路径穿越读取。但需注意两点缓解：(a) 该端点需 Admin 权限；(b) Ghost 实际的 `readBackup` 实现会先列出备份目录内容并按目录内真实文件名匹配（返回值需存在于备份列表中），穿越路径匹配不到会走第 44 行抛 `NotFoundError`。就本文件可见证据而言，防御在下游模块中，本控制器层缺失校验属于**纵深防御缺口**而非可直接确认的可利用漏洞；按“结论必须基于全文证据”的要求，不能仅凭此断定可利用。
+- **数据流 B（默认分支）**：第 50 行 `exporter.doExport({include: ...})`，`include` 受第 34–37 行枚举白名单约束，安全。
+- **第二入口检查**：`headers.disposition.value`（第 39 行附近）使用 `exporter.fileName()` 服务端生成，不回显用户输入，无头部注入。
+
+### 3. importContent（第 57–76 行）
+- **入口点**：`frame.file`（上传文件，第 75 行）、`frame.user`。
+- **数据流**：上传文件 → `importer.importFromFile(frame.file, ...)`。文件内容由 importer 模块处理（JSON 校验、事务导入），本文件未绕过任何校验直接拼接 SQL 或路径。`email` 取自数据库中的用户对象（第 65–70 行），非用户可控字符串直插。`importTag` 由服务端时间生成（第 62 行）。无可见 sink 暴露。
+- **替代通道**：无 `filename` 参数接受，文件名由 multer 等中间件落盘后以临时路径传入，穿越风险不在本层。
+
+### 4. inlineMedia（第 78–88 行）
+- **入口点**：`frame.data.domains`（第 87 行），用户提供的域名列表。
+- **数据流**：`domains` → `mediaInliner.api.startMediaInliner(...)`。风险类型为 SSRF（服务端代替用户请求任意域名）。缓解：(a) 第 84 行 `permissions: {method: 'importContent'}` 要求与导入相同的 Admin 权限；(b) media-inliner 服务内部对协议/IP 有校验（私有地址拒绝），但该校验在下游模块，本文件不可见。Admin 权限本身即可配置站点 URL 发起请求，SSRF 增益有限。基于全文证据不足以判定为可利用漏洞，记为依赖下游防御的点。
+
+### 5. deleteAllContent（第 90–124 行）
+- **入口点**：无用户参数（`query()` 无 frame 使用，第 97 行）。
+- **数据流**：第 99 行先备份，随后在事务中按 ID 删除全部 Post/Tag（第 103–121 行）。ID 来自数据库查询结果，非用户输入；`context: {internal: true}` 为硬编码。破坏性操作但受 `permissions: true` 保护，属预期功能，无注入面。
+
+### 综合判定
+- 唯一值得记录的是第 40→42 行 `exportContent` 的 filename 未在本层做 `basename` 校验（与第 18 行形成不一致），依赖下游 `readBackup` 的目录列举匹配兜底；且端点限 Admin 权限。按“黑名单不算有效防御、结论须有全文证据”的标准，无法证实存在可利用的穿越链，故判定无可确认漏洞，但在解释中指出该纵深防御缺口。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文5个入口：backupContent 第18行用 path.basename 相等性比较有效阻断路径穿越；exportContent 第40-42行将 filename 直接传给 readBackup 虽缺本层校验，但下游按备份目录真实文件名匹配，穿越路径会落入 NotFoundError，且端点需 Admin 权限，不构成可确认漏洞；importContent 的 frame.file 由 importer 模块内部校验，email 与 importTag 均为服务端来源；inlineMedia 的 domains 受 Admin 权限约束且 SSRF 校验在下游；deleteAllContent 无用户输入参与 sink。各 source 到 sink 的数据流均有有效防御或无用户可控输入到达危险操作。", "fix_suggestion": "no fix needed"}
+```

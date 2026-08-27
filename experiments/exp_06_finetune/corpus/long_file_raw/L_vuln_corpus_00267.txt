@@ -1,0 +1,20 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：
+   - `Configure`（第 57 行起）：配置文件指令 `urls`、`bind`、`dn_template`、`base_dn`、`filter` 等，均为管理员可控的静态配置，非外部用户输入。
+   - `Lookup(username)`（第 152 行）：实现 `module.Table` 接口，username 来自上游调用者（如 SMTP 会话中的地址查询），是**外部攻击者可控 source**。
+   - `AuthPlain(username, password)`（第 180 行）：实现 `module.PlainAuth`，username/password 来自 SMTP AUTH 等认证流程，是**外部攻击者可控 source**。
+   - 无其他文件/环境/回调入口。
+
+2. **source→sink 数据流验证**：
+   - 流 1：`AuthPlain` 第 190 行 `strings.ReplaceAll(a.filterTemplate, "{username}", username)` → 第 194 行 `conn.Search(req)` 的 Filter 字段。username 未做任何 LDAP 过滤器转义（无 `ldap.EscapeFilter`）。攻击者提交如 `*)(uid=*))(|uid=*` 可注入过滤器，绕过限制、匹配任意条目。**漏洞确认**。
+   - 流 2：`Lookup` 第 160 行同样的 ReplaceAll → 第 164 行 Search，同样未转义。**同一漏洞的第二入口**。
+   - 流 3：第 187 行 `dnTemplate` 替换后作为 Bind DN（第 208 行 `conn.Bind(userDN, password)`）。DN 注入影响有限：Bind 需要正确密码才能成功，且模板通常含完整 DN 结构；但配合 filter 注入可让任意条目成为 userDN。属于注入链的一部分。
+   - 防御检查：代码中没有任何对 username 的黑名单、正则或转义——即不存在所谓防御，直接拼接。
+   - 附带问题：共享连接（getConn/returnConn）在并发下存在竞态：一个 goroutine 用用户凭据 Bind 后（第 208 行），另一 goroutine 可能复用该已认证连接执行搜索，且 returnConn 中 rebind 失败处理有竞态窗口——这是次要的正确性/安全问题。
+
+3. **结论**：存在 LDAP 注入（CWE-90），风险高（可导致认证绕过）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-90 LDAP Injection", "risk_level": "high", "source": "line 180: AuthPlain 的 username 参数（以及 line 152 Lookup 的 username 参数）", "sink": "line 190/160: strings.ReplaceAll(filterTemplate, '{username}', username) 拼入 line 194/164 conn.Search 的过滤器", "explanation": "外部传入的 username 未经 ldap.EscapeFilter 转义，直接通过 strings.ReplaceAll 嵌入 LDAP 过滤器后传给 conn.Search -> 攻击者可用 '*)(' 等载荷注入过滤器，使搜索匹配任意条目并返回其 DN，随后用该 DN 尝试 Bind，可能造成认证绕过或目录信息泄露；Lookup 是同一漏洞的第二入口", "fix_suggestion": "line 190/160: 将 strings.ReplaceAll 替换为使用 ldap.EscapeFilter(username) 对用户输入进行转义后再嵌入过滤器和 dn_template"}
+```

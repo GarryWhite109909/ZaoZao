@@ -1,0 +1,30 @@
+## 编号分析
+
+1. **第 8–20 行 normalizeIPv4 / 第 23–35 行 normalizeIPv6**：利用 WHATWG URL 解析器归一化各种进制写法（十进制、八进制、十六进制、整数形式），防止 `2130706433`、`0x7f000001` 等绕过。防御有效。
+
+2. **第 38–90 行 isPrivateIPv4**：覆盖 10/8、172.16/12、192.168/16、127/8、169.254/16、100.64/10、198.18/15、0/8、240/4。范围判断基于已归一化的点分十进制，无黑名单正则，逻辑正确。
+
+3. **第 92–152 行 isPrivateIp**：处理 `::ffff:` 点分与十六进制映射形式、IPv6 本地地址（fc00::/7、fe80::/10），未识别格式 fail closed 返回 true。防御较完备。
+
+4. **第 154–175 行 errorIfHostnameResolvesToPrivateIp（核心入口点）**：
+   - 第 156 行：`env === 'development'` 直接放行——依赖配置，非用户可控，可接受；
+   - 第 159–161 行：与 `config.get('url')` 的 host 比较放行本站请求，host 来自配置文件，非攻击者可控；
+   - **第 163 行：`dnsPromises.lookup(options.url.hostname)` 解析后检查；但 got 随后发起实际请求时会再次独立进行 DNS 解析**。两次解析之间存在时间差，攻击者控制权威 DNS 可在第一次返回公网 IP、第二次返回 127.0.0.1/169.254.169.254，即经典 TOCTOU/DNS rebinding（CWE-350）。这是 source（外部传入的 URL）→ sink（got 发起请求）数据流中未被有效阻断的通道。
+   - 另外 lookup 默认可能返回多个 A 记录中的第一个，若首个为公网 IP 而后续记录为内网 IP，同样可绕过（未遍历所有结果）。
+
+5. **第 177–189 行 errorIfInvalidUrl**：仅校验 hostname 格式合法性（validator.isURL），不涉及私网判定，本身不是漏洞，但也不构成对 SSRF 的防御。
+
+6. **第 191–197 行 disableRetries**：仅在 test 环境生效，无安全影响。
+
+7. **第 199–211 行 gotOpts**：
+   - `beforeRequest` 与 `beforeRedirect` 均挂载了私网检查，重定向链每一跳都会重新执行 `errorIfHostnameResolvesToPrivateIp`，重定向绕过已被覆盖；
+   - 但如第 4 条所述，每个 hook 内的 DNS 校验与 got 实际连接时的解析仍是两次独立查询，rebinding 问题贯穿两条 hook 通道；
+   - 未使用自定义 lookup/pinning，也未复用首次解析出的 IP 建立连接。
+
+8. **第二入口核查**：模块导出的是扩展后的 got 实例，调用方传入任意 URL 即为 source；除 development 放行和 siteUrl host 白名单外，无其他旁路。`isPrivateIp` 本身被导出供外部使用，其实现正确。
+
+**结论**：IP 归一化与私网段覆盖均正确，重定向链也有防护；唯一实质漏洞是 DNS 校验与实际请求之间的 TOCTOU（DNS rebinding），以及 lookup 仅取单条记录导致的绕过面。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-350 (DNS Rebinding / TOCTOU in SSRF protection)", "risk_level": "high", "source": "line 163: dnsPromises.lookup(options.url.hostname) 对外部传入 URL 的域名做首次解析", "sink": "line 210-211: got 实际发起 HTTP 请求时对同一 hostname 进行第二次独立 DNS 解析并连接", "explanation": "errorIfHostnameResolvesToPrivateIp 在 beforeRequest/beforeRedirect 中用 dnsPromises.lookup 校验目标是否为私网 IP，但校验后 got 发起真实请求时会重新解析域名。攻击者控制权威 DNS 使第一次查询返回公网 IP 通过检查、第二次查询返回 127.0.0.1 或云元数据地址 169.254.169.254，即可实现 SSRF。此外 lookup 只返回单个地址，若域名有多条 A 记录且其中含内网 IP 也可绕过。IP 归一化与私网段判断本身正确，重定向链也逐跳校验，问题仅在于校验结果未绑定到实际连接", "fix_suggestion": "line 163: 使用 dnsPromises.lookup(hostname, {all: true}) 获取全部记录逐一校验，并通过 got 的自定义 lookup 选项将校验通过的 IP 固定用于实际连接（DNS pinning），或改用 ip-address 库配合连接级过滤，消除两次解析之间的时间窗口"}
+```

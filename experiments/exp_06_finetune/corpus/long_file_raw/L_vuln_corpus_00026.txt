@@ -1,0 +1,38 @@
+## 编号分析（全文通读）
+
+1. **第 1–30 行（文件头与 use）**：仅导入，无入口点。
+
+2. **第 47–56 行 `createObject()`**：校验 `__class` 与 `class` 不能同时出现，随后交给 Yii 父类。这是对 Yii 已知“双键覆盖”行为的加固，本身无漏洞。
+
+3. **第 65–70 行 `parseEnv()` / 第 84–87 行 `parseBooleanEnv()`**：纯转发到 `App::parseEnv`，无独立 sink。
+
+4. **第 96–110 行 `dump()` / 第 118–133 行 `dd()`**：调试函数，输出变量内容；调用方控制 `$var`，若模板/插件把用户输入传入可致信息泄露，但本文件内无用户输入 source。
+
+5. **第 141–166 行 `cookieConfig()`**：读取 General 配置决定 secure/domain，合并调用方 config。无请求参数直接进入敏感 sink。
+
+6. **第 173–179 行 `autoload()` + 第 187–243 行 `_autoloadCustomFieldBehavior()`**：
+   - 入口点：SPL 自动加载器（第 262 行注册），任何类加载触发。
+   - 数据流：`$storedFieldVersion = $fieldsService->getFieldVersion()`（约第 197 行，来自数据库 projectConfig/fields 表）→ 拼接进 `$filePath = $compiledClassesPath . 'CustomFieldBehavior_' . $storedFieldVersion . '.php'`（约第 203 行）→ `include $filePath`（第 207 行）。field version 由系统生成（随机串或哈希），正常不可控；但若 DB 被篡改则为二级注入通道。
+   - 更关键的数据流：`$fields = self::_fields()`（第 214 行）→ `_fields()`（第 288–303 行）直接从 `Table::FIELDS` 表读取 `handle` 和 `type` 列——这是本文件的唯一外部数据 source（数据库二级来源）。
+
+7. **第 252–285 行 `_generateCustomFieldBehavior()` —— 核心风险点**：
+   - 第 264–276 行：`$handle`（来自 DB fields 表）被直接插入 heredoc 生成的 PHP 代码：`public \$$handle;`、`'$handle' => true`。**没有任何对 handle 字符的白名单/转义处理**。
+   - 第 279 行：`$type` 经 `preg_match('/^(\$.*|(self|static|bool|...))$/i', ...)` 黑白混合正则判断后加 `\` 前缀——该正则允许任意以 `$` 开头的字符串原样通过（`$.*` 分支），且 `valueType()` 返回值被 `explode('|')` 后仅做 trim，未阻止反引号、括号等元字符进入生成的 PHP。
+   - 第 297–300 行：`str_replace` 把含 handle/type 的代码拼入模板内容。
+   - **Sink 1（第 310–312 行）**：`FileHelper::writeToFile($tmpFile, $fileContents)` 后 `rename` 并 `include $filePath` —— 写入并执行攻击者可控内容的 PHP 文件。
+   - **Sink 2（第 320 行）**：`eval(preg_replace('/^<\?php\s*/', '', $fileContents));` —— 直接 `eval` 含 DB 来源 handle/type 的代码，无任何过滤。
+   - 防御评估：本文件内对该数据流**零防御**。Craft 在 `FieldsService::saveField()` 处对 handle 有 `[a-z][a-zA-Z0-9_]*` 白名单校验，但按分析要求，依赖上游单点校验且存在绕过面（直接写库、projectConfig 导入、旧数据、第三方插件写入），不视为有效纵深防御；且 `type` 来自字段类名，同样仅靠上游约束。
+
+8. **第 305–315 行临时文件清理**：基于文件名前缀和 mtime 的目录清理，无漏洞。
+
+9. **第 322–344 行 `createGuzzleClient()`**：合并配置文件与调用方 config，`httpProxy` 来自本地配置；SSRF 仅在管理员可控配置场景下成立，非本文件直接漏洞。
+
+10. **第二入口/替代通道确认**：除 autoload 外无 HTTP 路由入口；但 `eval` 分支意味着任何能影响 fields 表 `handle`/`type` 值的通道（CSV/projectConfig 导入、SQL 注入链、受损管理员账号、恶意插件）都会直达代码执行 sink，构成典型的二阶（second-order）代码注入。
+
+## 结论
+
+source 为第 290–301 行 `_fields()` 从数据库读取的 `handle`/`type`，sink 为第 320 行 `eval()` 及第 310–312 行写文件+`include`。中间无有效净化，属于 CWE-94 二阶 PHP 代码注入。利用前提是能向 fields 表写入恶意 handle（需较高权限），故实际风险为中等偏低，但作为框架核心文件缺乏纵深防御确属真实缺陷。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-94 二阶PHP代码注入", "risk_level": "中", "source": "line 290-301: _fields() 从数据库 Table::FIELDS 读取的 handle 与 type 列值", "sink": "line 320: eval(preg_replace(...)) 执行由 handle/type 拼接生成的代码; line 310-312: FileHelper::writeToFile 写出 PHP 文件后 include 执行", "explanation": "_fields() 将数据库中的字段 handle/type 读出 -> _generateCustomFieldBehavior() 第264-276行将 handle 未做任何白名单校验直接嵌入 heredoc 生成 public $$handle 属性代码 -> 第320行 eval 或第310行写文件后 include 执行 -> 任何能向 fields 表写入恶意 handle 的通道(项目配置导入/直接写库/SQL注入链)即可实现远程代码执行; 文件内部对该数据流零净化, 上游 FieldsService 的 handle 正则校验属于可绕过的单点防御", "fix_suggestion": "line 264-276: 对 handle 强制白名单校验(如 preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/')) 不匹配则跳过该字段; line 320: 移除 eval 分支改为始终走写临时文件再 include 的路径, 并对 type 同样做类名字符合法性校验"}
+```

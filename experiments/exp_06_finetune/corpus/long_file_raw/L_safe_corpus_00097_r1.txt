@@ -1,0 +1,49 @@
+## 编号分析（逐函数、行号锚定）
+
+**1. 插件初始化与配置面（第 17–52 行）**
+- 第 18–21 行：`contentTypesToEncode`、`retryMethods` 均来自 `opts`（服务端开发者传入的插件注册参数），非外部用户输入，不构成攻击面。
+- 第 23–24 行：`cache = new LruMap(opts.cacheURLs || 100)`，仅缓存 URL 对象，容量受控。
+- 第 25–33 行：`buildRequest` 的全部参数（http/http2/base/sessionTimeout/undici 等）均来自启动时配置，属于可信输入；第 35–37 行对构建失败做了错误短路。
+
+**2. 核心入口 `fastify.decorateReply('from', ...)`（第 41–190 行）**
+- 入口点枚举：
+  - (a) 第 44 行 `req = this.request.raw`：原始请求（headers、url、method、httpVersion）——**这是唯一的外部用户可控 source**。
+  - (b) 第 45–53 行：`opts.method/timeout/onResponse/rewriteHeaders/rewriteRequestHeaders/getUpstream/onError/retriesCount/retryDelay` 全部由应用代码在调用 `reply.from()` 时写死，属第二入口但为开发者信任边界内。
+  - (c) 第 56–59 行：当未传 `source` 时，从 `req.url` 截取路径部分（去掉 query）作为转发路径——用户可控。
+  - (d) 第 62 行 `getUpstream(this.request, base)`：默认 `upstreamNoOp` 返回配置中的 `base`（第 232 行），上游主机不可被用户注入。
+
+**3. source→sink 数据流逐一验证**
+
+- **流 A：`req.url` → `source` → `buildURL(source, dest)` → 上游请求 url（第 56–70 行）**
+  用户可控的 `req.url` 路径被拼入上游 URL。防御有效性检查：`buildURL` 来自 `./lib/utils`（本文件外），其语义是基于 `new URL(source, dest)` 解析——相对路径无法逃逸 host（`new URL('//evil.com/x', 'http://base')` 会换 host，但这要求 source 以 `//` 开头；而 Fastify 路由层收到的 `req.url` 以 `/path` 形式存在且路由匹配已约束前缀；此外若开发者显式传 source 也是自己控制）。在本文件范围内没有把原始 query/fragment 直接拼进 sink 的字符串拼接；query 由第 71 行 `getQueryString` 单独处理并交给请求库编码。无有效绕过证据。
+
+- **流 B：缓存键混淆（第 63–68 行）**
+  `cacheKey = dest + source` 为纯字符串拼接。理论上 `(dest='http://a/b', source='/c')` 与 `(dest='http://a/', source='b/c')` 键不同但 URL 相同——这只是冗余缓存项，不会导致取错对象后发往错误主机，因为取出的仍是 `buildURL` 的正确产物。反向冲突（不同 URL 得到相同 key 并复用错误 url 对象）需要 `dest+source` 完全相等而解析结果不同，而 `dest` 与 `source` 在同一部署中分别由固定配置和固定路由决定，本文件内无可达的攻击者控制点使两个不同 (dest, source) 组合产生相同键。故判为理论瑕疵而非可利用漏洞。
+
+- **流 C：headers 复制（第 72–74 行）**
+  HTTP/2 下经 `filterPseudoHeaders` 剥离伪头（防 connection 头走私），HTTP/1.1 下浅拷贝；随后第 75 行强制覆写 `headers.host = url.host`，防止 host 头注入指向任意上游。`rewriteRequestHeaders` 钩子为开发者回调，非用户输入 sink。
+
+- **流 D：body 处理（第 78–113 行）**
+  - 第 79–92 行：`opts.body` 为开发者传入；禁止 stream（第 83–85 行）；content-length 用 `Buffer.byteLength` 重算，避免长度不一致导致的请求走私。
+  - 第 93–112 行：透传客户端 body 时，用 `fast-content-type-parse` 严格解析 content-type（第 99–102 行），仅在命中白名单 `contentTypesToEncode` 时 JSON 序列化，否则原样透传；content-length 重算（第 108 行）。GET/HEAD 带 body 直接抛错（第 115–124 行）。无 header 注入或长度欺骗通道。
+
+- **流 E：getQueryString（第 200–216 行）**
+  三个分支：开发者函数/对象、上游返回的 `url.search`（由 URL 解析器规范化）、或从 `reqUrl` 截取 `?` 之后原样回传。原样回传的 query 最终作为 `request({ qs })` 交给 request 库拼接，未发现与 CRLF 注入相关的直接字符串拼接头部的路径（头均已对象化）。黑名单类过滤不存在，无需按可绕过处理。
+
+- **流 F：响应侧（第 160–188 行）**
+  - `copyHeaders(rewriteHeaders(...))`：HTTP/2 下先 `stripHttp1ConnectionHeaders` 剥离 hop-by-hop 头（防响应走私）；HTTP/1.1 下依赖 rewriteHeaders 默认透传——上游是可信 base 指向的服务，风险归属部署方而非本库缺陷。
+  - 第 183–186 行：状态码非法走 `BadGatewayError`；第 187–193 行处理 aborted http2 流关闭；第 195–198 行 `this.send(res.stream)` 直接管道上游响应体，Fastify reply 层负责序列化，无二次注入点。
+
+- **流 G：重试逻辑 createRequestRetry（第 224–245 行）**
+  `retryDelay` 回调（第 141–143 行包装）若开发者返回用户可控值会进入 `setTimeout`——但该回调完全是开发者代码，本文件默认实现 `getDefaultDelay`（第 128–148 行）只用数字与上游 `retry-after` 头。上游 retry-after 可信度问题属于对上游的信任假设，且仅影响延迟时长，不构成安全 sink。
+
+- **流 H：生命周期钩子（第 193–203 行）**
+  onReady 仅告警 multipart 兼容性；onClose 关闭连接池。无外部输入。
+
+**替代通道核查**：文件无文件系统读取、无环境变量读取、无子进程、无 eval/Function 构造；唯一的网络 sink 是 `requestImpl`（内部 lib/request），其所有参数（method/url/qs/headers/body）在上文各流中均已被规范化或来源可信。第二入口（opts 各回调）均在开发者信任边界内。
+
+**结论**：全文通读后，所有用户可控 source（`req.url`、headers、body、content-type）到达网络 sink 前都经过 buildURL 解析、host 强制覆写、content-length 重算、hop-by-hop 头剥离等结构性防御，且这些防御不是黑名单/正则型，未见可利用绕过路径。缓存键拼接为理论性弱点，本文件内无可达攻击路径。判定：无可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认：唯一外部可控 source 是 req.url、请求头与 body（第 42-124 行），它们到达网络请求 sink（requestImpl，第 158 行调用）之前均经过结构性防御：buildURL 基于 URL 解析防止路径逃逸（第 62-70 行）、headers.host 被强制覆写为 url.host 防止 host 注入（第 75 行）、content-length 用 Buffer.byteLength 重算防止长度走私（第 91、108 行）、HTTP/2 下 filterPseudoHeaders 与响应侧 stripHttp1ConnectionHeaders 剥离 hop-by-hop 头（第 72、166 行）。getQueryString（第 200-216 行）与重试逻辑（第 224-245 行）不含可利用注入点。缓存键 dest+source 字符串拼接（第 64 行）为理论性瑕疵，但在本文件内 dest 来自配置、source 受路由约束，不存在可达的键冲突攻击路径。opts 相关回调均处于开发者信任边界，非漏洞。", "fix_suggestion": "no fix needed"}
+```

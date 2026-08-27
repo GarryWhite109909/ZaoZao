@@ -1,0 +1,33 @@
+## 编号分析
+
+**入口点枚举（全文）**
+- 第 76–88 行：rc 回调入口，可经 RC API 动态创建 restic server；第 83 行仅禁止 stdio。
+- 第 185–216 行：CLI 入口 `rclone serve restic`。
+- 第 316–335 行：HTTP 路由绑定：GET/POST/HEAD/DELETE 通配 `/*`，是全部外部输入 source。
+- 第 230–253 行 `WithRemote` 中间件：从 `rctx.RoutePath` 或 `r.URL.Path` 提取路径并做 `data/xx` 重写，存入 context（第 250 行）。
+
+**逐条数据流验证**
+
+1. **路径→文件操作**：第 232–239 行取路径，未做任何规范化或黑名单过滤即作为 remote 传给 `newObject/postObject/deleteObject/listObjects/createRepo`。但该值最终交给后端 Fs 的对象命名空间，跨仓库逃逸取决于后端实现；本文件内未见本地文件系统 sink 直接拼接，不能确证路径穿越。正则 `matchData`（第 362 行）仅用于重写，不构成安全防御。
+
+2. **append-only 写保护（postObject）——确认漏洞**：第 405–414 行先以 `newObject` 检查文件是否存在，不存在才放行；随后第 416 行 `RcatSize` 执行真正写入。检查与写入之间存在明显 **TOCTOU 竞态窗口**：攻击者并发发起两个对同一 remote 的 POST，两个请求都可能通过第 407 行的存在性检查（均返回 not-found），随后第二个请求覆盖第一个已写入的快照数据。在 append-only 模式下这违反了不可篡改承诺，可破坏备份完整性（restic 的安全模型依赖历史数据不可变）。黑名单式“存在才拒绝”不是有效防御。
+
+3. **append-only 删除检查（deleteObject）**：第 437 行用 `strings.Split(r.URL.Path, "/")` 判断倒数第二段是否为 `locks`，而实际操作的 remote 来自第 235 行的 `RoutePath`（可能为转义形式）。两者来源不一致：URL 编码（如 `%2f`）可使 `r.URL.Path` 与 `RoutePath` 呈现不同分段结构，存在绕过判定、删除非锁文件的可能；同时任何位于名为 `locks` 目录下的任意对象都可被合法删除，粒度过粗。此为第二入口/替代通道问题，与第 2 条同属 append-only 防线缺陷。
+
+4. **私有仓库隔离（checkPrivate）**：第 258–260 行比较 URL 参数 `userID` 与认证用户名，逻辑本身一致；未发现绕过证据。
+
+5. **createRepo/listObjects**：第 542 行校验 query 参数，第 491 行校验 Accept 头，均为功能性检查，无安全 sink。
+
+**结论**：核心可证实漏洞为第 405–416 行 append-only 模式的 TOCTOU 覆写竞态，辅以第 437 行基于 `r.URL.Path` 分段判断的可绕过删除白名单。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-367 (TOCTOU Race Condition), CWE-863 (Incorrect Authorization)",
+  "risk_level": "中",
+  "source": "line 316-335: HTTP 路由 POST /* 外部请求",
+  "sink": "line 416: operations.RcatSize 使用 remote 执行写入",
+  "explanation": "append_only 模式下 line 407 先用 newObject 检查目标是否已存在, 不存在才允许 line 416 的 RcatSize 写入; 检查与写入之间存在时间窗口, 攻击者并发发送两个针对同一 remote 的 POST 即可双双通过存在性检查, 后到的请求覆盖先写入的数据, 从而绕过 append-only 的不可篡改保证, 破坏备份快照完整性; 另外删除路径 line 437 基于 r.URL.Path 分段判断而真实 remote 来自 line 235 的 RoutePath, 两者可经 URL 编码产生分歧, 构成替代绕过通道",
+  "fix_suggestion": "line 405-416: 移除先检查后写入的模式, 将不可覆盖约束下沉到存储层原子操作(如带 IfNoneMatch 条件上传或后端原生 no-overwrite 语义); line 437: 删除判定应使用与 WithRemote 一致的已规范化 remote 字符串而非原始 r.URL.Path, 并将可删对象严格限定为 locks 目录下的锁文件"
+}
+```

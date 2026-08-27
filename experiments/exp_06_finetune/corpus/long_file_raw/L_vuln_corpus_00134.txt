@@ -1,0 +1,22 @@
+## 编号分析
+
+1. **入口点枚举**：本文件是认证核心库，无直接 HTTP 路由，但暴露了多个被上层 handler 调用的入口：
+   - 第 105 行 `ExchangeToken`（接收 domain/timestamp/signed_timestamp 三个外部参数）；
+   - 第 82 行 `ValidateDomainAndTimestamp`（校验域名与时间戳）；
+   - 第 246 行 `IsValidDomain`（域名格式白名单正则）；
+   - 第 226 行 `ParseMCPKeysFromStrings` / 第 238 行 `ParsePublicKey`（解析来自 DNS TXT 或 HTTP 的外部密钥记录）；
+   - 第 193 行 `BuildPermissions`（由用户可控的 domain 派生 JWT 权限资源模式）。
+
+2. **source→sink 数据流**：source 为第 106 行参数 `domain`（攻击者完全可控），经第 108 行 `ValidateDomainAndTimestamp` 校验后，在第 155 行传入 `BuildPermissions`，最终在第 165–170 行写入 `JWTClaims.Permissions` 并由 `GenerateTokenResponse` 签发为 JWT —— 这是典型的 source→sink 流。
+
+3. **防御有效性验证（IsValidDomain，第 246–256 行）**：正则为 `^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$`。关键缺陷：末尾分组是 `*`（零次或多次），即**允许不含任何点的单标签域名**通过校验，例如 `localhost`、`intranet`、`db` 均合法。同时允许大写字母，未做小写归一化（`Example.COM` 与 `example.com` 会生成不同的权限模式，可能造成权限混淆）。此外该正则不阻止形如 `a-b` 等非真实可解析名称。
+
+4. **sink 影响**：攻击者提交 `domain=localhost`（或任意内网主机名、单标签名），用自己控制的密钥在对应位置发布证明记录即可通过签名验证（第 152 行），随后第 156 行生成 `localhost/*` 的发布权限 JWT。若注册表后续按该域名路由发布请求，攻击者可获得对内部/保留名称空间的发布权；大小写不一致还会导致同一域名的多套权限条目。
+
+5. **第二入口与替代通道**：`ParsePublicKey`（第 238 行）对 Ed25519/P-384 密钥长度和曲线点做了严格校验（第 244–262 行），无注入面；`DecodeAndValidateSignature` 仅 hex 解码；时间戳 ±15 秒窗口（第 90 行）限制了重放窗口但签名消息仅为 timestamp（第 151 行），不绑定 domain——不过由于密钥本身从受害者域名获取，此点不构成独立漏洞。`VerifySignatureWithKeys`（第 66 行）逻辑正确，遍历所有密钥且错误分类合理。
+
+6. **结论**：核心问题集中在第 252 行的正则未强制要求至少一个点分隔的标签结构（以及未归一化大小写），属于输入校验不严导致的授权边界绕过。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-20 输入校验不当导致的授权绕过", "risk_level": "中", "source": "line 106: ExchangeToken 参数 domain 攻击者可控", "sink": "line 165-170: BuildPermissions 生成的 ResourcePattern 写入 JWT Claims 并签发令牌", "explanation": "第 252 行 IsValidDomain 正则中 (\.[...])* 允许零个点分标签, 单标签域名如 localhost 或 intranet 可通过校验 -> 攻击者可用自控密钥为这类保留/内部名称完成 DNS/HTTP 证明并换取 localhost/* 等发布权限的 JWT; 另外正则允许大写字母且未做小写归一化, Example.COM 与 example.com 会派生出不同权限模式, 造成同域多套权限的混淆", "fix_suggestion": "line 252: 将正则改为强制至少一个点分隔标签(如 ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$), 并在校验前对 domain 执行 strings.ToLower 归一化, 同时拒绝下划线及保留名称"}
+```

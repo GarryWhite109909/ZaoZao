@@ -1,0 +1,58 @@
+# Cloudreve WOPI 模块安全分析
+
+## 一、文件结构总览与入口点枚举
+
+本文件为 `wopi` 包，共两个导出/内部函数：
+
+1. **`GenerateWopiSrc`**（第 44–76 行）：由上层路由调用（推测为 viewer 会话创建流程），输入为 `types.ViewerAction`、`*types.Viewer`、`*manager.ViewerSession`。
+2. **`generateActionUrl`**（第 79–115 行）：包内私有函数，仅被 `GenerateWopiSrc` 第 68–70 行调用。
+
+入口点（source）逐一枚举：
+
+- **E1：viewer 配置数据** —— 第 50 行 `viewer.WopiActions[...]`。该 map 来自系统内注册的 viewer 配置（管理员在数据库中配置的 WOPI action URL 模板），非终端用户直接可控。
+- **E2：会话文件信息** —— 第 51 行 `viewerSession.File.Ext()`、第 67 行 `viewerSession.File.ID()`。File 来自已认证用户的文件记录；ID 为数据库主键，不可伪造。
+- **E3：站点 URL 配置** —— 第 47 行 `dep.SettingProvider().SiteURL(...)`，管理员配置项。
+- **E4：hashid 编码器** —— 第 48 行，内部依赖，输出为混淆后的文件 ID。
+
+无 HTTP 请求参数、header、cookie、环境变量或回调直接进入本文件——所有 source 均为服务端持久化配置或数据库实体。
+
+## 二、逐函数数据流分析
+
+### 函数 1：`GenerateWopiSrc`（第 44–76 行）
+
+- **第 46–48 行**：获取 siteURL 与 hasher，均为可信内部值。
+- **第 50–53 行**：以 `viewerSession.File.Ext()` 查 `viewer.WopiActions`，查不到返回 `ErrActionNotSupported`。扩展名仅作 map 键查找，不参与拼接，无注入面。
+- **第 56–63 行**：fallback 顺序遍历 action/view/edit，取到的 `src` 是**管理员配置的模板字符串**——这是本文件唯一可能含攻击者影响的数据（若管理员被攻陷则全站皆失守，超出威胁模型）。
+- **第 65–66 行**：`hashid.EncodeFileID(hasher, ...)` 将数字文件 ID 编码为 hashid，防枚举。
+- **第 67–70 行**：将 `routes.MasterWopiSrc(base, encodedID).String()` 作为 `fileSrc` 传入 `generateActionUrl`。该 URL 由站点自身 base + 路由拼接构成，不含用户原始输入。
+
+### 函数 2：`generateActionUrl`（第 79–115 行）
+
+source→sink 流：`src`（模板）→ 第 81–82 行 `<`/`>` 字符剥离 → 第 83 行 `url.Parse` → 第 86–99 行 query 重写 → 第 105 行 `RawQuery = queryReplaced.Encode()`。
+
+逐条验证防御有效性：
+
+1. **第 81–82 行的 `<`/`>` 过滤**：按题目要求视为可绕过的黑名单过滤，不作为有效防御依据。但其目的仅是清理模板中的占位符尖括号（如 `<uid>`），并非 XSS 防线。
+2. **真正的有效防御是第 83 行 `url.Parse` + 第 105 行 `url.Values.Encode()`**：
+   - `url.Parse` 保证结果为合法 URL 结构；
+   - `Encode()` 对所有 query key/value 做 percent-encoding，任何特殊字符（`&`、`=`、`#`、空格等）均被转义，杜绝 query 注入与参数走私。
+3. **第 87–95 行 placeholder 替换**：替换值来自硬编码 `queryPlaceholders` map（第 20–34 行），全部为常量字符串（`lng`、`true`、`darkmode`），无外部输入。
+4. **第 96–98 行 WOPI_SOURCE 替换**：`fileSrc` 为服务端自构造 URL（见 E1–E4 分析），经 Encode 后写入，安全。
+5. **第 100–103 行**：未找到占位符时默认设置 `WOPISrc=fileSrc`，同样安全。
+6. **第 107 行**：强制覆盖 `lang=lng`，防止模板中残留恶意 lang 参数被利用于开放重定向类逻辑（此处 lang 仅传给前端展示层）。
+
+### 第二入口与替代通道检查
+
+- 本文件无第二个 HTTP 入口；`AccessTokenQuery` 等常量（第 41 行）供其他文件使用，token 的签发校验不在此文件，无法在此评估，但本文件也未生成或接受 access_token。
+- 替代通道：`src` 若指向攻击者域名会形成外链跳转，但 `src` 仅能由管理员通过 viewer 配置写入，属受信配置面，且 `url.Parse` 不限制 scheme（这是设计使然，WOPI action URL 本就指向 Office Online/LibreOffice 等外部服务）。
+- 无 SSRF 面：本函数只生成 URL 返回给前端，不在服务端发起请求。
+
+### 结论性核对
+
+- 所有 sink（`RawQuery` 赋值、URL 拼接）均经过 `Encode()` 编码；
+- 唯一黑名单式过滤（第 81–82 行）即使被绕过也不构成漏洞路径，因为后续 Encode 兜底；
+- 无用户可控字符串未经编码进入最终 URL。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文两个函数后确认不存在可达的安全漏洞。GenerateWopiSrc 的输入均为服务端可信数据：viewer.WopiActions 为管理员配置的模板（第50行）、File.Ext 与 File.ID 来自数据库实体（第51、67行）、siteURL 为站点配置（第47行）。核心 sink 是 generateActionUrl 第105行的 RawQuery 赋值，其前置防御链完整：第83行 url.Parse 保证结构合法，第105行 url.Values.Encode() 对全部键值做百分号编码，使任何注入字符失效；第81至82行对尖括号的黑名单过滤即便绕过也无实际影响，因为 Encode 提供了兜底编码。第87至95行的占位符替换值全部来自第20至34行的硬编码常量 map，第96至98行与第100至103行写入的 fileSrc 由 routes.MasterWopiSrc 基于 hashid 编码的文件 ID 自构造，不含用户原始输入。文件内无 HTTP 参数、header、环境变量等直接 source，无服务端出网请求故无 SSRF，access_token 相关常量仅为声明不构成本文件内的数据流。第二入口与替代通道核查亦未发现用户可控数据到达 sink 的路径。", "fix_suggestion": "no fix needed"}
+```

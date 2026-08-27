@@ -1,0 +1,79 @@
+# 全文逐函数安全分析
+
+## 0. 文件概览与入口点枚举
+
+本文件是 OpenList（原 AList 分支）的分享（Sharing）业务逻辑层 `op/sharing.go`。虽然文件本身不直接注册 HTTP 路由，但它是分享功能的唯一业务入口层，所有来自 HTTP 层（`handles` 包）的参数都会流入本文件的函数。逐一枚举本文件对外暴露的全部入口点：
+
+1. **`GetSharingById(id string, refresh ...bool)`** —— 第 33 行起。source：外部传入的分享 ID 字符串（HTTP 路径/查询参数），sink：缓存键 + `db.GetSharingById(id)`。
+2. **`GetSharings(pageIndex, pageSize int)`** —— 第 60 行起。source：分页整数，sink：DB 查询。
+3. **`GetSharingsByCreatorId(userId uint, pageIndex, pageSize int)`** —— 第 68 行起。同上。
+4. **`GetSharingUnwrapPath(sharing *model.Sharing, path string)`** —— 第 76 行起。**核心风险函数**。source：用户可控的相对路径 `path`；sink：返回值被上层用于访问存储驱动中的真实路径。
+5. **`CreateSharing(sharing *model.Sharing)`** —— 第 103 行起。source：管理员提交的分享对象（含 `Files` 列表）；sink：序列化后写入 DB。
+6. **`UpdateSharing(sharing *model.Sharing, skipMarshal ...bool)`** —— 第 112 行起。同上，另有缓存删除操作。
+7. **`UpdateSharingId(sharing *model.Sharing, newId string)`** —— 第 124 行起。source：新 ID 字符串。
+8. **`DeleteSharing(sid string)` / `DeleteSharingsByCreatorId(creatorId uint)`** —— 第 133、138 行起。
+
+下面逐函数验证数据流与防御有效性。
+
+## 1. makeJoined（第 12–31 行）
+
+仅做 DB 记录到展示模型的转换：反序列化 `FilesRaw`（第 20 行），失败时置空数组（第 21–22 行）。JSON 反序列化失败被吞掉属于健壮性问题而非安全问题——空 `Files` 会在后续 `GetSharingUnwrapPath` 中被第 78 行的长度检查拦截。无用户输入直接进入危险 sink。无漏洞。
+
+## 2. GetSharingById（第 33–57 行）
+
+数据流：`id`（外部字符串）→ 缓存键（第 35 行）→ `db.GetSharingById(id)`（第 40 行）。ID 是字符串主键，GORM 按主键查询不存在 SQL 注入面（拼接由 ORM 参数化完成）。`singleflight`（第 38 行）只做并发去重，不影响安全性。注意点：缓存以 `id` 为键且 `refresh` 可绕过缓存，但缓存的是服务端生成的对象，无越权问题（权限校验在 handles 层）。无漏洞。
+
+## 3. GetSharings / GetSharingsByCreatorId（第 60–73 行）
+
+分页参数为 int 类型，无法注入；`userId` 为 uint。透传至 DB 层做 LIMIT/OFFSET 参数化查询。无漏洞。
+
+## 4. GetSharingUnwrapPath（第 76–99 行）—— 重点
+
+这是把“分享内的虚拟相对路径”映射为“存储真实路径”的唯一函数，其返回值最终会传给存储驱动执行列目录/下载等操作，因此它就是**路径穿越 sink 的守门人**。分三个分支分析：
+
+### 4.1 单文件分支（第 80–82 行）
+```go
+if len(sharing.Files) == 1 {
+    return stdpath.Join(sharing.Files[0], path), nil
+}
+```
+此处 **`path` 未经过任何清洗**，直接与 `sharing.Files[0]` 拼接。关键事实：`stdpath.Join` 只做词法上的路径连接与清理，`Join("/a/b", "../../etc/passwd")` 的结果是 `/etc/passwd`——即 Join 会“规范化掉”穿越段而不是拒绝它。因此攻击者对单文件分享请求 `path=../../../some/other/dir` 时，返回的真实路径会逃出分享根目录，指向存储内任意位置。对比多文件分支（第 84 行）显式调用了 `utils.FixAndCleanPath(path)` 并用 `[1:]` 去掉前导斜杠后再匹配子项，说明作者意识到需要清洗，但**单文件分支遗漏了同样的防御**——这是一个典型的分支间防御不一致缺陷。上游 OpenList 在后续版本中正是修补了此函数（将清洗逻辑统一提前）。该数据流 source→sink 完整成立：
+- source：HTTP 层传入的分享内相对路径 `path`（匿名可访问的公开分享即可触发）；
+- 防御：无（Join 不是有效防御，反而会把 `../` 规范化生效）；
+- sink：返回的 unwrapPath 用于存储访问 → 目录穿越/未授权读取。
+
+### 4.2 多文件分支（第 84–97 行）
+第 84 行 `utils.FixAndCleanPath(path)[1:]` 清洗了绝对化与 `..` 穿越，随后第 90–93 行用 `child == stdpath.Base(c)` 把首段映射回真实目录。防御本身有效，但存在一个次要弱点：匹配依据是 `Base(c)`，若两个分享条目的 Base 名相同（如 `/a/x` 与 `/b/x`），可能映射到错误条目——但两者都在创建者授权的 Files 列表内，属逻辑混淆而非越权，风险低。此外第 85 行对空路径直接报错，防止了分享根目录泄露。此分支整体可接受。
+
+### 4.3 空 Files（第 78 行）
+已拦截。OK。
+
+## 5. CreateSharing / UpdateSharing（第 103–122 行）
+
+第 106、115 行对 `sharing.Files` 每一项调用 `utils.FixAndCleanPath` 后再 JSON 序列化入库，保证存储侧的 Files 不含穿越形态。这是写入侧的正确防御。注意 `UpdateSharing` 的 `skipMarshal` 参数（第 113 行）：跳过时直接使用已有 `FilesRaw`，但由于该字段只能来自此前已被清洗过的记录或内部代码，且 handles 层不会让外部直接注入 `FilesRaw`，故不构成可利用通道。第 119 行 `sharingCache.Del(sharing.ID)` 保证修改后缓存一致，避免旧分享配置残留导致的陈旧授权。无独立漏洞。
+
+## 6. UpdateSharingId / DeleteSharing / DeleteSharingsByCreatorId（第 124–140 行）
+
+`newId` 写入 DB 主键，ORM 参数化；删除均按 ID 精确删除并同步清缓存（第 125、134 行）。`DeleteSharingsByCreatorId` 未清这些分享的缓存（第 139 行直接 return db 结果），被删分享可能在缓存中残留至 TTL 过期——但 `GetSharingById` 命中缓存后仍需通过 handles 层的口令/权限校验，且记录已从 DB 删除，刷新即失效，仅为短暂陈旧读，非可利用漏洞。
+
+## 7. 第二入口与替代通道核查
+
+- 是否存在绕过 `GetSharingUnwrapPath` 直接拼路径的通道？本文件内没有其他路径拼接 sink；上层 fs 层统一经由该函数取真实路径。
+- `CreateSharing`/`UpdateSharing` 的清洗是否可被绕过使恶意 `Files` 入库？即使能（黑名单式清洗理论上可绕过），多文件分支有二次校验，而**单文件分支根本不做校验**，所以真正的缺口在第 81 行而非写入侧。
+- 匿名可达性：公开分享无需登录即可携带任意 `path` 触发第 81 行分支，攻击门槛低。
+
+## 结论
+
+唯一成立的完整攻击链：**单文件分享 + 用户可控 `path` 含 `../` → 第 81 行未经清洗直接 `stdpath.Join` → 返回逃逸出分享范围的真实路径 → 存储层越权访问**。对应 CWE-23/CWE-22（路径穿越），风险等级高（匿名可触发、可遍历挂载存储内任意目录）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-23 Path Traversal (Relative Path Traversal)",
+  "risk_level": "high",
+  "source": "line 76: GetSharingUnwrapPath 的入参 path, 来自 HTTP 层用户可控的分享内相对路径, 公开分享匿名可触发",
+  "sink": "line 81: stdpath.Join(sharing.Files[0], path) 将未清洗的 path 直接拼接为存储真实路径并返回给存储驱动访问",
+  "explanation": "单文件分支 line 80-82 对 path 未调用 utils.FixAndCleanPath, 而 stdpath.Join 会把 ../ 规范化生效而非拒绝, 导致 path=../../.. 可逃逸分享根目录; 对比多文件分支 line 84 显式做了 FixAndCleanPath, 属于分支间防御不一致; 上游项目后续版本已修复此函数",
+  "fix_suggestion": "line 80-82: 在单文件分支同样先执行 path = utils.FixAndCleanPath(path)[1:] 并校验结果非空后再 Join, 或将清洗逻辑统一提到函数开头对所有分支生效"
+}
+```

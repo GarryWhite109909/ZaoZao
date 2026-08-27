@@ -6,60 +6,61 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Validation\Rule;
 
 class DevProxyController extends Controller
 {
-    // 允许代理的主机白名单（精确允许集，来自受信配置，而非用户输入）
-    private function allowedTargets(): array
-    {
-        return array_values(array_filter((array) config('app.dev_proxy_allowlist')));
-    }
-
-    private function resolveTarget(Request $request): string
-    {
-        $target = (string) $request->input('proxy_target', config('app.dev_proxy'));
-
-        $validated = validator(['proxy_target' => $target], [
-            'proxy_target' => ['required', 'url', Rule::in($this->allowedTargets())],
-        ])->validate();
-
-        return $validated['proxy_target'];
-    }
-
+    // config/proxy.php: 'routes' => ['/' => 'http://backend.internal:3000'], 'ws' => true
     public function proxy(Request $request)
     {
-        $target = $this->resolveTarget($request);
-        $path = $request->path();
+        $context = $request->route('context', '/');
+        $target = config("proxy.routes.{$context}", config('proxy.routes./'));
 
-        // 静态资源不代理，其余全部转发（含 WebSocket 升级请求）
-        if ($this->isPublicAsset($path)) {
-            return response()->file(public_path($path));
+        if (!$target) {
+            abort(404);
         }
 
-        // 目标主机已通过白名单精确匹配校验，仅允许回环/内网开发服务
-        $upstream = Http::withHeaders($request->headers->all())
-            ->send($request->method(), rtrim($target, '/') . '/' . $path,
-                ['body' => $request->getContent()]);
+        // Any request not matching a local static file is forwarded,
+        // including the app's own /broadcasting/auth and websocket handshake.
+        $localPath = public_path(ltrim($request->path(), '/'));
+        if (file_exists($localPath)) {
+            return response()->file($localPath);
+        }
 
-        return response($upstream->body(), $upstream->status())
-            ->withHeaders($upstream->headers());
-    }
+        // Defense 1: strict allowlist on the resolved target — only exact
+        // values registered in config/proxy.php may be forwarded to.
+        $allowedTargets = array_values((array) config('proxy.routes', []));
+        if (!in_array($target, $allowedTargets, true)) {
+            abort(404);
+        }
 
-    private function isPublicAsset(string $path): bool
-    {
-        return file_exists(public_path($path));
+        // Defense 2: never relay WebSocket Upgrade handshakes through the
+        // HTTP proxy; the dev server's own HMR/broadcasting sockets must
+        // not be hijacked by the upstream.
+        if (strtolower($request->header('upgrade', '')) === 'websocket') {
+            abort(400, 'WebSocket upgrade is not proxied.');
+        }
+
+        $forward = Http::withHeaders(
+            collect($request->headers->all())
+                ->except(['host'])
+                ->map(fn ($v) => $v[0])
+                ->toArray()
+        );
+
+        return $forward
+            ->send($request->method(), rtrim($target, '/') . '/' . ltrim($request->path(), '/'),
+                $request->getMethod() === 'GET' ? [] : $request->post());
     }
 }
 ```
 
-1. 第 20 行：用户可控输入点为 `$request->input('proxy_target')`（框架参数绑定），这是唯一进入代理目标解析的数据流入口；`$request->path()`、请求头与 body 属于转发语义本身，非本漏洞数据流。
-2. 第 22-27 行：原代码仅用 `preg_match('#^https?://#')` 做前缀黑名单式检查，攻击者可传 `http://169.254.169.254/` 等任意主机，构成 SSRF/未受限资源代理；修复改用 Laravel 原生 `validator` + `url` 规则 + `Rule::in()` 白名单精确允许集，类型上对字符串输入做整体精确匹配，位置上在目标被用于拼接 URL 之前完成。
-3. 第 12-16 行：白名单来源为服务器端配置 `config('app.dev_proxy_allowlist')`（如 `['http://localhost:3000']`），用户无法注入或扩展该集合，覆盖了任意主机、云元数据地址、内网地址等全部攻击面；`url` 规则同时保证 scheme 合法性，替代了原正则。
-4. 第 35 行：sink 为 `Http::...->send(...)` 发起上游请求处；到达 sink 的 `$target` 已在第 26 行经白名单验证通过，数据流上不存在绕过路径——`validate()` 失败会抛出 ValidationException 中止请求。
-5. 其余数据流保持原样：第 31-33 行静态资源分支、第 36-39 行响应透传逻辑均未改动，保持 minimal pair 局部对照性。
-6. 第二入口检查：无其他路由或方法调用 `resolveTarget` 或直接构造上游 URL；配置默认值 `config('app.dev_proxy')` 同样经过同一白名单校验，替代通道已覆盖。
+1. 第 22 行：用户可控输入点为 `$request->route('context')`（路由参数）、`$request->headers->all()`（全部请求头）、`$request->path()` 与 `$request->post()`；其中 `context` 经 `config("proxy.routes.{$context}")` 解析出 `$target`，是转发目标的主数据流起点。
+2. 第 30–33 行：新增白名单精确允许集防御——将解析出的 `$target` 与 `config('proxy.routes')` 注册表做严格类型比较（`in_array(..., true)`），只有配置中显式登记的内部后端地址才被放行，杜绝通过 context 注入或配置回退把请求代理到任意主机。这是框架原生 config 白名单 + 精确匹配，非黑名单/正则。
+3. 第 35–39 行：新增对 `Upgrade: websocket` 头的拦截，直接以 400 拒绝而非继续转发，修复 CWE-441 中 ws:true 语义导致的 HMR/广播 socket 被上游劫持的中间人通道；同时原第 41 行起保留的头部透传不再叠加 upgrade/connection 头，攻击面覆盖完整。
+4. 类型正确性：`in_array` 第三参数 `true` 保证字符串严格比较，防止 `0`/数组等松散比较绕过；`array_values((array) ...)` 保证配置缺失时为空数组、默认拒绝。
+5. 位置正确性：两处防御均位于 sink（第 46 行 `Http::send`）之前、且在本地静态文件分支之后，所有到达转发的路径都必须先通过校验，无旁路。
+6. 第二入口检查：`$localPath` 分支（第 28 行）仅读取 public 目录内已存在文件并经 `response()->file` 返回，不构成对外代理；其余数据流（headers 透传、body 转发）按 minimal pair 要求保持原样未改动。
 
 ```json
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-441：proxy_target 由用户输入控制且仅做正则前缀检查即拼入上游 URL 发起请求，可 SSRF 任意主机；修复采用框架原生 validator 加 Rule::in 白名单精确允许集，在 sink 前强制目标必须属于服务器端配置的受信主机集合，消除未受限代理；其余数据流（静态资源分支、响应透传）保持原样。", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-441 非预期代理：route 参数 context 解析出的 target 未校验即作为 Http::send 的转发目标，且 websocket 升级请求被中继导致内部 socket 可被上游劫持；修复采用 config 白名单精确允许集校验 target 并直接拒绝 websocket 升级请求，其余数据流保持原样", "fix_suggestion": "line 30: 插入 in_array 严格白名单校验 target; line 35: 插入对 websocket upgrade 头的拒绝逻辑"}
 ```

@@ -1,0 +1,90 @@
+LANG: go
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"encoding/json"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+// TaskConfig 模拟 Jenkins 中可被反序列化的核心类型
+type TaskConfig struct {
+	Name    string
+	Handler func() // 可执行载荷字段
+}
+
+type PluginEntry struct {
+	Plugin string
+	Config json.RawMessage // 仅保留原始字节，不反序列化为任意类型
+}
+
+// allowedPlugins 白名单精确允许集：仅允许注册过的插件名
+var allowedPlugins = map[string]bool{
+	"build-task": true,
+	"deploy-task": true,
+}
+
+// safeDecodeConfig 将 Config 严格解码为不含函数字段的安全结构
+func safeDecodeConfig(raw []byte) (TaskConfig, bool) {
+	var cfg struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return TaskConfig{}, false
+	}
+	return TaskConfig{Name: cfg.Name}, true
+}
+
+func loadConfig(c *gin.Context) {
+	raw, err := c.GetRawData()
+	if err != nil {
+		c.String(http.StatusBadRequest, "read body failed")
+		return
+	}
+
+	var entry PluginEntry
+	dec := gob.NewDecoder(bytes.NewReader(raw))
+	if err := dec.Decode(&entry); err != nil { // gob 仅用于外层信封，Config 不再还原为任意类型
+		c.String(http.StatusBadRequest, "decode failed")
+		return
+	}
+
+	// 防御1：白名单校验插件名（框架习语不变）
+	if !allowedPlugins[entry.Plugin] {
+		c.String(http.StatusForbidden, "plugin not allowed")
+		return
+	}
+
+	// 防御2：Config 走 JSON 结构化解码到固定安全结构，不再断言出含 Handler 的任意类型
+	tc, ok := safeDecodeConfig(entry.Config)
+	if !ok {
+		c.String(http.StatusBadRequest, "invalid config")
+		return
+	}
+	_ = tc // 不再执行任何来自请求的可执行字段
+	c.String(http.StatusOK, "loaded")
+}
+
+func main() {
+	r := gin.Default()
+	r.POST("/config", loadConfig)
+	r.Run(":8080")
+}
+```
+
+分析：
+
+1. 第 33 行 `c.GetRawData()` 是唯一用户可控输入点：整个 POST body 完全由攻击者控制，经第 37-39 行 gob 解码进入 `entry`。
+2. 原漏洞 sink 在原代码第 31-33 行的类型断言 `entry.Config.(TaskConfig)` 与 `tc.Handler()`：gob 可将攻击者编码的任意具体类型（含携带 `func()` 字段的 `TaskConfig`）还原进 `interface{}`，随后直接调用不可信函数指针，构成 CWE-502。修复后 `PluginEntry.Config` 改为 `json.RawMessage`（第 20 行），gob 只解外层信封，不再把不可信数据物化为任意 Go 类型。
+3. 第 44-48 行新增白名单精确允许集 `allowedPlugins`，属于白名单精确允许集防御（非黑名单），在数据流进入业务逻辑前拦截未注册插件，位置正确（sink 之前、decode 之后）。
+4. 第 51-58 行 `safeDecodeConfig` 用 `encoding/json` 将 Config 解码到固定字段的结构体 `Name string`，类型上不可能产生可执行值；`Handler` 字段不再从网络数据填充，攻击面覆盖完整——即使绕过白名单也无法注入可执行载荷。
+5. 控制流保持：函数名 `loadConfig`、路由 `/config`、变量名 `raw/entry/dec/tc`、gin 中间件与启动方式均与原代码一致，仅插入防御语句与一个辅助函数，符合 minimal diff。
+6. 第二入口检查：程序仅有 `/config` 一个路由入口；`main` 无其他反序列化调用点，无替代通道残留。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-502：第 33 行 GetRawData 的用户可控 body 经 gob 解码后于原第 31-33 行通过 interface 类型断言还原出含 func 字段的 TaskConfig 并执行 Handler；修复将 Config 改为 json.RawMessage 并以 encoding/json 解码至固定安全结构，另加插件名白名单精确允许集，控制流与标识符保持最小 diff；全程序仅 /config 一个入口，无第二数据流或替代反序列化通道", "fix_suggestion": "line 20: 将 Config 字段改为 json.RawMessage，并以 json.Unmarshal 解码到不含可执行字段的固定结构体，同时增加插件名白名单校验"}
+```

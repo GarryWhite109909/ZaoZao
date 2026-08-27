@@ -1,0 +1,35 @@
+## 编号分析（全文逐函数）
+
+**函数一：FsRecursiveMove（第 17–110 行左右）**
+
+1. 第 19 行 `c.ShouldBind(&req)`：入口点为 JSON body 的 `src_dir`、`dst_dir`、`conflict_policy`，是唯一 source。
+2. 第 24–26 行 `user.CanMove()` 权限校验；第 28 行 `user.JoinPath(req.SrcDir)` 将用户路径限制在其 base 路径内（防 `..` 逃逸），失败返回 403。第 33 行 `common.CanWrite(user, srcMeta, srcDir)` 校验源目录写权限。
+3. 第 39–49 行对 `dst_dir` 做完全相同的 JoinPath + GetNearestMeta + CanWrite 双重校验。
+4. 第 60–95 行遍历文件队列：所有被移动的文件名均来自 `fs.List` 返回的真实目录项（第 58、73 行），而非用户输入；`movingFileName` 由真实路径拼接而成，不存在用户可控的路径穿越 source→sink 流。
+5. 第 100–106 行 `fs.Move(ctx, fileName, dstDir, ...)` 是 sink，但 fileName 全部源自服务端枚举的文件系统条目，dstDir 已过 JoinPath 与 CanWrite。黑名单/正则未参与防御，防御来自 JoinPath 规范化 + 权限检查，属有效防御。
+6. 注释明示“跳过单项权限检查以提升性能”，这是设计取舍且根/目标两层均已做 CanWrite，不构成可由外部输入触发的穿越漏洞。
+
+**函数二：FsBatchRename（第 117–165 行左右）**
+
+7. 第 122 行绑定 body：source 为 `src_dir` 及 `rename_objects[].src_name/new_name`。
+8. 第 130–147 行：CanRename → JoinPath(src_dir) → CanWrite(meta)，链路完整。
+9. 第 151–158 行：对每个 `SrcName` 和 `NewName` 都调用 `checkRelativePath`（拒绝绝对路径与 `..` 等相对路径逃逸），随后第 160 行拼接 filePath、第 161 行 `fs.Rename` 为 sink。两条数据流（src_name→读取路径、new_name→写入名）均在 sink 前经过 checkRelativePath 白名单式校验，防御有效。
+
+**函数三：FsRegexRename（第 172–220 行左右）**
+
+10. 第 176 行绑定 body：source 为 `src_dir`、`src_name_regex`、`new_name_regex`。
+11. 第 182–196 行：同样具备 CanRename / JoinPath / CanWrite 完整链路。
+12. 第 199 行编译 `src_name_regex` 仅用于匹配既有文件名（第 209 行 MatchString），不进入路径。
+13. 关键流：第 210 行 `newFileName := srcRegexp.ReplaceAllString(...)` 由用户正则替换生成，属潜在危险中间值；但第 211–213 行立即对其调用 `checkRelativePath`，非法结果直接 403 中止，之后才在第 215–216 行到达 `fs.Rename` sink。即使替换串含 `../` 或 `$1` 展开出的穿越序列，也会被拦截，防御有效。
+
+**第二入口与替代通道核查**
+
+14. 三个 handler 均从 gin context 取 UserKey 用户并强制权限位（Move/Rename），无匿名旁路；无环境变量、文件上传、回调等其他入口。`conflict_policy` 仅作分支常量比较（CANCEL/SKIP/OVERWRITE），不进入任何 sink。
+
+**综合判定**
+
+全部三条 source→sink 数据流的最终 sink（fs.Move / fs.Rename）之前均有 JoinPath 规范化或 checkRelativePath 校验兜底，未发现可绕过的黑名单式过滤，也未发现遗漏校验的用户可控路径分量。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文三个入口点：FsRecursiveMove 中被移动对象名称全部来自 fs.List 枚举的真实目录项而非用户输入，src_dir 与 dst_dir 均经 user.JoinPath 规范化并做 CanWrite 检查后才到达 fs.Move；FsBatchRename 对每个 rename_object 的 src_name 与 new_name 在调用 fs.Rename 前都执行了 checkRelativePath 校验；FsRegexRename 中由用户正则替换生成的 newFileName 同样在 fs.Rename 之前经 checkRelativePath 拦截，含 ../ 或绝对路径的替换结果会直接返回 403。三个接口均要求对应权限位且无第二入口或替代通道绕过，未发现有效的路径穿越或越权数据流。", "fix_suggestion": "no fix needed"}
+```

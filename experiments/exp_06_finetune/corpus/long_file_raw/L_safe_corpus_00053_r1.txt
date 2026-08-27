@@ -1,0 +1,82 @@
+# PostCSS PreviousMap 安全分析（全文逐函数）
+
+## 一、文件概览与入口点枚举
+
+本文件是 postcss 的 `lib/previous-map.js`，共约 130 行。所有入口点如下：
+
+1. **构造函数入口（第 10-22 行）**：`new PreviousMap(css, opts)`，`css` 为 CSS 文本，`opts.from` 为文件路径，`opts.map` 可为对象/字符串/函数/Consumer/Generator。
+2. **CSS 内嵌注释入口（第 60-72 行 `loadAnnotation`）**：从 CSS 文本中提取 `/* # sourceMappingURL=... */`。
+3. **内联 data URI 入口（第 24-46 行 `decodeInline`）**：`data:application/json;base64,...` 或 URL-encoded JSON。
+4. **外部 .map 文件读取入口（第 74-88 行 `loadFile`）**：`readFileSync(path, 'utf-8')` 是全文件唯一文件系统 sink。
+5. **回调入口（第 92-96 行 `loadMap` 中 `prev(file)`）**：用户提供的函数回调。
+
+## 二、逐函数 source→sink 数据流验证
+
+### 1. `fromBase64`（第 4-9 行）
+仅做 base64 解码，无文件/命令/eval 类 sink。纯数据转换，无风险。
+
+### 2. 构造函数（第 10-22 行）
+- 第 13 行：`opts.map === false` 时直接返回。
+- 第 14 行：`opts.unsafeMap` 标志位——这是**显式的、由调用方主动开启的信任开关**，非默认行为。
+- 第 15 行：调用 `loadAnnotation(css)`，source 为 CSS 文本。
+- 第 18 行：`loadMap(opts.from, prev)`，source 为路径与 prev 对象。
+- 无直接 sink；数据流向下游的 `loadFile` / `decodeInline`。
+
+### 3. `consumer()`（第 24-29 行）
+将 `this.json || this.text` 交给 `SourceMapConsumer`。这是解析器输入，不是代码执行 sink；恶意 sourcemap 可能导致 DoS（超大 mappings），但属资源消耗而非漏洞利用原语，且输入本身即来自被处理的 CSS/map 文件。
+
+### 4. `decodeInline`（第 31-47 行）
+- 四个严格前缀正则（第 32-35 行）：`^data:application/json;charset=utf-?8;base64,` 等，锚定行首且限定 MIME 类型，**不是黑名单而是白名单前缀匹配**，无法注入其他 scheme（如 `file:`）。
+- 第 37-40 行：URL 解码分支；第 42-44 行：base64 分支。输出仅为字符串，后续作为 JSON 文本传给 `SourceMapConsumer` 或经 `JSON.parse`（第 110 行）。无路径拼接、无执行 sink。**防御有效**。
+
+### 5. `getAnnotationURL`（第 49-51 行）
+剥掉注释头并 trim，返回 URL 字符串。该值后续进入两条通道：(a) 第 103-104 行 `join(dirname(file), map)` 后进 `loadFile`；(b) 第 99 行 `decodeInline`。见下文对 (a) 的路径校验分析。
+
+### 6. `isMap`（第 53-59 行）
+结构检查（mappings/_mappings/sections 类型），无 sink。
+
+### 7. `loadAnnotation`（第 61-72 行）
+- 第 62 行正则匹配所有 sourceMappingURL 注释；第 63 行取最后一个。
+- 第 65-70 行：定位子串提取 annotation。注意潜在缺陷：若 CSS 中出现 `*/` 早于注释闭合（如嵌套在字符串中），可能截取错误范围——但这只影响 annotation 内容的正确性，不构成安全边界破坏，因为下游仍有 `loadFile` 的路径校验兜底。
+
+### 8. `loadFile`（第 74-88 行）——核心安全边界
+- **第 75-76 行**：`trusted` 为 false 且未开 `unsafeMap` 时才启用防护。
+- **第 77 行**：白名单后缀 `/\.map$/i` —— 强制以 `.map` 结尾，阻止任意扩展名。
+- **第 78-79 行**：必须有 cssFile。
+- **第 80-83 行**：`relative(dirname(cssFile), path)` 计算相对路径，拒绝 `..`、`..` + sep 开头及绝对相对结果——标准目录穿越防护。注意：`isAbsolute(rel)` 检查的是 rel 而非 path 本身，但若 path 是绝对路径且在 cssFile 目录之外，rel 必为绝对或以 `..` 开头；若绝对路径恰好在 cssFile 目录之内，则读取同目录 .map 属预期行为。**防御有效**。
+- **第 84-88 行**：sink `readFileSync(path, 'utf-8')`。到达此处的未信任路径必须同时满足：`.map` 后缀 + 位于 cssFile 同目录树内。攻击者需先能写入目标目录的 `.map` 文件才有意义，而那已是另一层信任域问题。
+- **绕过评估**：编码绕过（`%2e%2e`）？annotation 在第 103 行直接 join，未 decodeURIComponent——Node 的 join/fs 不解码百分号，故 `%2e%2e%2f` 会成为字面文件名，穿越失败。符号链接？超出本模块威胁模型（postcss 运行于构建环境，symlink 防护非其职责）。**无可利用绕过**。
+
+### 9. `loadMap`（第 90-118 行）
+- 第 91 行：`prev === false` 短路。
+- 第 93-95 行：prev 为字符串时直接返回——**这是 API 显式提供的 map 内容**，属受信输入。
+- 第 96-105 行：prev 为函数时，`trusted=true` 调用 `loadFile`（第 100 行），跳过路径校验——合理，因为提供回调的开发者已声明信任。
+- 第 106-109 行：Consumer/Generator 序列化，无 sink。
+- 第 111-112 行：`JSON.stringify(prev)`，无 sink。
+- 第 113-116 行：格式错误抛异常，信息含 `prev.toString()`——错误消息泄露至开发者控制台，非远程攻击面。
+- **第 117-119 行（第二入口重点）**：inline 分支走 `decodeInline`，已验证白名单前缀有效。
+- **第 120-127 行（替代通道）**：外部 annotation 路径。第 122 行 `join(dirname(file), map)`——若 annotation 以 `/` 开头，join 会产生绝对路径，但随后 `loadFile(map, file, false)` 中第 80-83 行的 relative 校验会因 `isAbsolute(rel)` 拒绝之。Windows 盘符（`C:\evil.map`）同理被 isAbsolute(rel) 拦截。**第二入口同样受保护**。
+
+### 10. `startWith`（第 129-132 行）
+简单前缀判断，用于区分 data: URI，无 sink。
+
+### 11. `withContent`（第 134-138 行）
+读取 sourcesContent 属性，无 sink。
+
+## 三、第二入口与替代通道总结
+
+| 通道 | source | 到达 sink？ | 防御 |
+|---|---|---|---|
+| CSS 注释 → 外部 .map | annotation | readFileSync（第 87 行） | `.map` 后缀 + relative 目录限制（第 77-83 行），有效 |
+| CSS 注释 → inline data URI | annotation | SourceMapConsumer | 白名单 MIME 前缀（第 32-35 行），有效 |
+| opts.map.prev 字符串/对象 | API 参数 | 解析器 | 开发者显式传入，属受信 API 契约 |
+| opts.map.prev 函数回调 | 回调返回路径 | readFileSync（trusted=true） | 开发者主动授权，符合设计意图 |
+| opts.unsafeMap | 显式标志 | 绕过全部校验 | 默认关闭，文档化的 opt-in 危险开关 |
+
+## 四、结论
+
+全文唯一的敏感 sink 是第 87 行 `readFileSync`。所有未经信任标志到达它的路径均受「`.map` 后缀 + 相对目录约束」双重白名单式防护，且无编码/解析层面的绕过路径（join 不做 URL 解码）。其余数据流终点均为 JSON 解析器，不构成代码执行。历史 CVE（如 postcss 相关的行内 map 问题）在本版本中已通过上述前缀白名单与目录校验修复。基于全文证据，未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文唯一文件系统 sink 为 loadFile 第 87 行 readFileSync。所有不可信路径（来自 CSS 注释中的 sourceMappingURL，第 61-72 行提取）到达该 sink 前必须通过第 77 行的 .map 后缀白名单和第 80-83 行的 relative 目录约束双重校验，无法穿越目录。内联 data URI 通道受第 32-35 行严格 MIME 前缀白名单限制，decodeInline 输出仅进入 JSON 解析器而非执行 sink。prev 函数回调和 unsafeMap 标志均为文档化的显式信任 opt-in，属设计意图而非漏洞。join 不做 URL 解码，故百分号编码穿越无效。未发现可利用的 source 到 sink 数据流。", "fix_suggestion": "no fix needed"}
+```

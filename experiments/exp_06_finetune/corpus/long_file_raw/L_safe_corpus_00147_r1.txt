@@ -1,0 +1,54 @@
+# FullModel.java 安全分析（全文逐函数审查）
+
+## 一、文件结构与入口点枚举
+
+本文件为 powsybl CGMES 模型解析组件，全文共约 190 行，包含以下函数/入口：
+
+1. **构造函数 `FullModel(...)`（第 41-58 行）**：接收 id、scenarioTime、created、description、version、profiles、dependentOn、supersedes、modelingAuthoritySet 九个参数。
+2. **getter 方法群（第 60-92 行）**：`getId`、`getScenarioTime`、`getCreated`、`getDescription`、`getVersion`、`getProfiles`、`getDependentOn`、`getSupersedes`、`getModelingAuthoritySet`。
+3. **`toString()`（第 94-107 行）**：字符串拼接全部字段。
+4. **静态内部类 `ParsingContext`（第 110-129 行）**：解析中间状态容器，非独立入口。
+5. **`parse(Reader reader)`（第 132-155 行）**：核心外部入口，接收任意 `Reader`（通常来自用户上传的 CIM/RDF XML 文件）。
+6. **`readSubElement(...)`（第 157-180 行）**：XML 子元素分发回调，处理 SCENARIO_TIME / CREATED / DESCRIPTION / VERSION / PROFILE / DEPENDENT_ON / SUPERSEDES / MODELING_AUTHORITY_SET 八类标签。
+
+外部可控 source 只有一个：**传入 `parse()` 的 Reader 所代表的 XML 文档内容**（属性值与元素文本）。以下逐一验证数据流。
+
+## 二、逐条 source→sink 数据流验证
+
+### 流 1：XML → XXE（XML 外部实体注入）
+- **source**：第 135 行 `reader` 参数（攻击者提供的 RDF/XML）。
+- **sink**：第 136 行 `getXMLInputFactory().createXMLStreamReader(reader)`。
+- **防御验证**：关键在于 `XmlUtil.getXMLInputFactory()` 的配置。powsybl commons 中该工厂通过 `XMLInputFactory.SUPPORT_DTD = false` 与 `IS_SUPPORTING_EXTERNAL_ENTITIES = false` 显式禁用 DTD 和外部实体（这是该库的已知安全基线），且 `gcXmlInputFactory`（第 141 行）用于清理工厂缓存防止内存累积。若该工厂确实禁用了 DTD/外部实体，则 XXE 不可达；黑名单式过滤不存在于本文件。基于本文件证据及上游库的已知加固配置，判定 XXE 防御有效。
+
+### 流 2：`rdf:about` 属性 → `context.id`
+- 第 139 行 `xmlReader.getAttributeValue(RDF_NAMESPACE, ABOUT)` 取值，仅存入 context，最终进入不可变 String 字段并通过 getter 返回。无 SQL、命令、路径拼接 sink 在本文件内。无漏洞。
+
+### 流 3：`scenarioTime` / `created` 元素文本
+- 第 161-162 行 `ZonedDateTime.parse(...)`：受控解析，非法输入抛异常而非执行危险操作。无漏洞。
+
+### 流 4：`description` / `modelingAuthoritySet`
+- 第 163、172 行 `XmlUtil.readText(xmlReader)` 读取文本，纯数据存储。唯一间接消费点是 `toString()`（第 100、106 行）的字符串拼接——不涉及日志注入框架强制、不涉及 HTML 输出（本文件无 web 层）。无 sink 可达。
+
+### 流 5：`version`
+- 第 165 行 `Integer.parseInt(...)`：类型强约束，溢出/格式错误直接抛 `NumberFormatException`。无漏洞。
+
+### 流 6：`profiles` 列表
+- 第 166 行 add 后，构造函数第 50-52 行校验非空并做防御性拷贝 `new ArrayList<>(profiles)`；getter 第 78 行返回 `Collections.unmodifiableList` 包装，防止调用方篡改内部状态。防御有效。
+
+### 流 7：`dependentOn` / `supersedes` 的 `rdf:resource` 属性
+- 第 168-169、171-172 行读取 URI 字符串存入列表，同样经构造函数拷贝 + unmodifiableList 保护。这些 URI 在本文件内未被用于任何资源加载/网络请求/文件访问，故即使含 `file://` 或 `http://` 值也不构成可达 sink。无漏洞。
+
+## 三、第二入口与替代通道检查
+
+- 本文件唯一的公共静态入口是 `parse(Reader)`；构造函数是第二入口，但其所有必填字段均经 `Objects.requireNonNull`（第 43-46、57 行）校验，集合经拷贝+只读包装，无绕过路径。
+- 无环境变量、系统属性、回调注册、反射、反序列化（非 Java native serialization）、临时文件、网络调用等替代通道。
+- 异常处理（第 143-145、177-179 行）将 `XMLStreamException` 包装为运行时异常上抛，不泄露内部堆栈之外的敏感信息给本层调用者。
+- 资源管理：第 140-142 行 finally 中关闭 reader 并 gc 工厂，无句柄泄漏导致的 DoS 放大点。
+
+## 四、结论
+
+全文所有 source→sink 流均终止于受控的数据存储与只读暴露，无命令执行、SQL、路径遍历、XXE（依赖上游工厂已禁用 DTD）、反序列化等可达 sink；集合可变性已防御性消除。未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文审查了构造函数(第41-58行)、九个getter(第60-92行)、toString(第94-107行)、ParsingContext(第110-129行)、parse(第132-155行)和readSubElement(第157-180行)。唯一source是parse入参Reader代表的XML内容,所有数据流(id/scenarioTime/description/version/profiles/dependentOn/supersedes/modelingAuthoritySet)均终止于String存储或ZonedDateTime.parse/Integer.parseInt等受控解析,本文件内无命令执行、SQL、文件访问、网络请求等sink。XXE方面依赖XmlUtil.getXMLInputFactory()对DTD与外部实体的禁用配置,且finally中正确关闭并回收工厂。集合字段经构造函数防御性拷贝加unmodifiableList保护,构造函数入口有Objects.requireNonNull与非空校验,无第二入口或环境/回调/反序列化等替代通道。", "fix_suggestion": "no fix needed"}
+```

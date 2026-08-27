@@ -1,0 +1,19 @@
+## 编号分析
+
+1. **入口点枚举（全文通读）**：本文件唯一入口是 `parseVaultConfig`（第 60 行起），source 为 Kubernetes 对象注解 `obj.GetAnnotations()`（第 65 行）以及 AdmissionReview 的 Namespace；另有 viper 配置/环境变量作为第二来源。文件无 HTTP 路由、文件读写或命令执行，sink 均为下游 mutation 逻辑使用的配置字段。
+
+2. **逐条数据流验证**：
+   - 第 68–73 行：`vault-addr` 注解直接赋给 `vaultConfig.Addr` 并置 `AddrFromObject=true`，**全文没有任何校验**（无 allowlist 检查、无私有地址检查）。而第 470 行 `SetConfigDefaults` 中定义了默认项 `vault_addr_allowlist`（第 472 行），但整个 `parseVaultConfig` 从未读取该键——防御机制存在却未接线，等于无效。
+   - 后果：任何能创建/修改 Pod 注解的租户可将 Vault 地址指向攻击者控制的 HTTPS 服务，webhook 注入的 sidecar 会用 Pod ServiceAccount 的 JWT 向该地址做 Kubernetes auth 登录，攻击者即可换取该 SA 的 Vault token——这是凭据窃取/SSRF 类漏洞（对应 bank-vaults 已知 CVE，官方修复即引入 addr allowlist）。
+   - 第 84–88 行：`vault-skip-verify` 走 `common.ResolveObjectSkipVerify`，受 `vault_allow_object_skip_verify` 开关约束，属有效防御（需管理员显式开启）。
+   - 第 96–104 行：Role/Path/AuthMethod 等注解可控，但仅决定认证参数，配合上面的恶意 Addr 才构成完整利用链；单独看风险低。
+   - 第 108–112 行：`TLSSecret` 注解可控，可让 webhook 挂载任意 Secret 到注入容器——若攻击者已知同 namespace 其他 Secret 名，存在横向读 Secret 风险，但通常受 RBAC/命名空间边界限制，属次级问题。
+   - 其余字段（镜像名、资源量、pull policy 等）均为字符串透传，最终进入 Pod spec，本质是“能改自己 Pod”的租户本就拥有的能力，不构成提权。
+
+3. **第二入口与替代通道**：viper/AutomaticEnv 提供的 `vault_addr` 等来自部署方环境变量，属可信管理员输入；注解才是不可信 source。替代通道（如 ConfigMap 注入路径）不在本文件内。
+
+4. **结论**：基于全文证据，`vault-addr` 注解→`Addr`→sidecar 连接目标的数据流缺乏有效校验（allowlist 默认值定义了却未被使用），构成真实漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "ssrf_credential_theft_via_unvalidated_annotation", "risk_level": "high", "source": "pod annotation vault-addr parsed at line 68 of parseVaultConfig", "sink": "vaultConfig.Addr consumed by injected sidecar to perform Vault login with the pod service account JWT", "explanation": "parseVaultConfig copies the user-controllable vault-addr annotation into vaultConfig.Addr and sets AddrFromObject=true without any validation. SetConfigDefaults defines a vault_addr_allowlist default at line 472 but parseVaultConfig never reads or enforces it, so the intended defense is dead code. A tenant who can annotate a pod can point the webhook-injected vault-env sidecar at an attacker-controlled HTTPS endpoint; the sidecar then authenticates using the pod service account JWT, letting the attacker obtain that identity's Vault token (credential theft/SSRF). Other annotation-driven fields such as TLSSecret also lack cross-checks but are lower risk.", "fix_suggestion": "In parseVaultConfig, when AddrFromObject is true, validate Addr against the configured vault_addr_allowlist (reject private/link-local addresses unless explicitly allowed) before accepting it, mirroring the upstream fix; also restrict which annotations untrusted users may set."}
+```

@@ -1,0 +1,49 @@
+LANG: python
+```python
+import os
+import subprocess
+import shlex
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+CONFIG_PATH = "/etc/sqls/config.yaml"
+
+# 白名单精确允许集：仅允许已知的编辑器可执行名
+ALLOWED_EDITORS = {"vim", "vi", "nano"}
+
+def _resolve_editor(editor):
+    # 防御：白名单精确匹配，拒绝任何含 shell 元字符或不在允许集内的值
+    if editor in ALLOWED_EDITORS:
+        return editor
+    return None
+
+@app.route("/config/edit", methods=["POST"])
+def edit_config():
+    # source: editor 来自客户端可控的请求参数
+    editor = request.form.get("editor") or os.environ.get("EDITOR", "vim")
+    safe_editor = _resolve_editor(editor)
+    if safe_editor is None:
+        return jsonify({"status": "rejected"}), 400
+    cmd = f"{safe_editor} {shlex.quote(CONFIG_PATH)}"
+    if os.name == "nt":
+        subprocess.run(["cmd", "/c", cmd], shell=False)
+    else:
+        # sink: 经白名单校验后的固定值，不再拼接未净化输入
+        subprocess.run([safe_editor, CONFIG_PATH], shell=False)
+    return jsonify({"status": "opened"})
+
+if __name__ == "__main__":
+    app.run(port=5000)
+```
+
+1. 第 12 行是唯一用户可控输入点：`request.form.get("editor")` 来自客户端 POST 表单，环境变量 `EDITOR` 为次级来源（服务器侧配置，但仍不可信）。
+2. 第 13 行原代码将 source 直接 f-string 拼接进 `cmd`，第 19 行以 `shell=True` 传给 `subprocess.run`，构成完整的 CWE-77 注入链。
+3. 新增第 11-16 行 `_resolve_editor` 辅助函数实施白名单精确允许集（vim/vi/nano），任何包含 `;`、`|`、反引号等元字符的输入都不在集合内而被拒绝；这是有效防御（白名单精确允许集），非黑名单/正则过滤。位置正确：位于 source 与 sink 之间、sink 拼接之前，覆盖了 form 参数与环境变量两条进入路径。
+4. 第 21 行 sink 改为列表形式 `subprocess.run([safe_editor, CONFIG_PATH], shell=False)` 并用 `shlex.quote` 保护常量路径：列表 + shell=False 使参数不经 shell 解释，类型正确地消除了元字符注入面；Windows 分支（第 18 行）原本就是 shell=False 列表调用，保持不变。
+5. 数据流走向与业务场景不变：仍是“取编辑器→拼命令→打开配置文件”，仅替换/插入防御语句，函数名 `edit_config`、路由 `/config/edit`、变量名均保持一致，满足最小 diff 纪律。
+6. 第二入口检查：除 `/config/edit` 外无其他路由，无中间件或 ORM 数据流引入额外 sink；`CONFIG_PATH` 为硬编码常量非用户可控；结论为该文件已无可达的命令注入链。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞链为 request.form.get 的 editor 参数经 f-string 拼接后传入 subprocess.run 且 shell=True 导致 CWE-77 命令注入; 修复采用白名单精确允许集 vim/vi/nano 校验编辑器值并以列表形式加 shell=False 调用 subprocess 同时用 shlex.quote 保护常量路径; 其余数据流(环境变量 EDITOR 同样经过白名单)均已覆盖; 无第二入口或其他可达 sink", "fix_suggestion": "line 13: 对 editor 施加白名单精确允许集校验, line 21: 改为 subprocess.run([safe_editor, CONFIG_PATH], shell=False)"}
+```

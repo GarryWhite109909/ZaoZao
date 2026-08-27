@@ -1,0 +1,23 @@
+## 编号分析
+
+1. **入口点枚举**：本类无直接路由/文件/环境入口，它是 Jinjava 模板引擎的 EL 解析器（第 17 行 extends BeanELResolver），所有模板中的属性访问与方法调用都会经过 `getValue`（第 62 行）、`setValue`（第 77 行）、`invoke`（第 82 行）、`getType/isReadOnly`（第 55/72 行）这些入口。source 是模板作者可控的表达式（base + property/method 名），sink 是通过反射最终执行的任意 bean 方法。
+
+2. **防御机制盘点**：
+   - 第 27–33 行 `DEFAULT_RESTRICTED_PROPERTIES` 仅含 `class`；
+   - 第 35–47 行 `DEFAULT_RESTRICTED_METHODS` 为精确字符串黑名单（`forName`、`getClass`、`readValueAs` 等）；
+   - 第 49–69 行 `DEFERRED_EXECUTION_RESTRICTED_METHODS` 仅在 deferred 模式生效（第 100–107 行的条件判断）；
+   - 第 196–216 行 `isRestrictedClass` 用包名前缀 + instanceof 黑名单拦截 reflect/jackson-databind/Class/ClassLoader 等。
+
+3. **数据流验证**：
+   - `getValue` 路径：`validatePropertyName`（第 158 行）只做精确匹配，且返回 null 后仍调用 `super.getValue(context, base, null)`（第 64 行），依赖父类行为兜底；黑名单可绕过（如大小写、snake_case 变换在第 176–186 行只处理下划线，不扩大拦截面）。
+   - `invoke` 路径：第 85–93 行方法名黑名单为精确匹配，未覆盖 `newInstance`、`getRuntime`、`exec`、`invoke`、`getMethod`、`loadClass` 等危险方法名；只要上下文变量链上存在暴露这些方法的非受限对象，即可逃逸沙箱。
+   - 结果检查（第 116–120 行）只拦返回值为受限类的情形，返回普通危险对象（如 Process、File、URLConnection）不被拦截。
+   - 第 89 行 `interpreter != null` 条件：在无解释器上下文调用时，用户配置的 `restrictedMethods/restrictedProperties` 全部失效，仅剩默认黑名单。
+
+4. **第二通道**：`findMethod` 重写（第 124–155 行）对 varArgs 方法不做额外过滤，且参数类型匹配失败时回退到 `findAny()`（第 141–143 行），可能选中与用户意图不符的重载，扩大可达方法面。
+
+5. **结论**：该类本质是“黑名单沙箱”，历史上 hubspot/jinjava 多次因同类黑名单遗漏导致模板沙箱逃逸（这正是本文件不断追加黑名单条目的原因）。按“黑名单视为可绕过”的判定标准，存在设计性安全缺陷：依赖精确名称匹配与包名前缀，无法穷举危险方法/类，攻击者可通过未被列入黑名单的方法链实现任意代码执行或敏感信息访问。风险取决于宿主向模板暴露的对象图，属中高风险的防御不完备问题，而非确定的一击即中 RCE。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "sandbox_escape_via_blacklist_bypass", "risk_level": "medium", "source": "template-controlled EL property and method names passed to getValue/invoke", "sink": "super.invoke reflective method execution at line 114 and super.getValue at line 64", "explanation": "The resolver relies entirely on exact-match blacklists: DEFAULT_RESTRICTED_METHODS omits dangerous names such as newInstance, getRuntime, exec, invoke, getMethod, loadClass; DEFERRED_EXECUTION_RESTRICTED_METHODS is only enforced in deferred mode; user-configured restrictions are skipped when JinjavaInterpreter.getCurrent is null at line 89; result filtering at lines 116-120 only blocks restricted classes, allowing ordinary dangerous returned objects. Any non-restricted object graph exposed to templates can therefore be chained to escape the sandbox.", "fix_suggestion": "Replace blacklists with an allowlist of permitted methods and properties, enforce restrictions regardless of interpreter presence, block dangerous return types by capability rather than package prefix, and add regression tests covering known bypass chains."}
+```

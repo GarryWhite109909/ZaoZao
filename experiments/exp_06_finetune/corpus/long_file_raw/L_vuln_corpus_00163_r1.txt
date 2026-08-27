@@ -1,0 +1,42 @@
+# 逐函数行号级分析
+
+## 1. uploadAttachment（第 40–72 行）
+- **入口**：multipart 表单字段 `file`（第 47 行 `ctx.Req.FormFile("file")`）。
+- **source→sink 流**：`header.Filename`（第 55 行）仅作为附件显示名写入数据库字段 `Name`，实际存储路径由服务端生成的 `attach.UUID` 决定（第 68 行返回 uuid，存储层按 UUID 落盘），文件名不参与路径拼接，无路径穿越 sink。
+- 文件类型由 `uploadFunc`（attachment 服务）内部做扩展名白名单校验（第 58 行对 `IsErrFileTypeForbidden` 返回 400）。大小通过 `NewLimitedUploaderKnownSize` 限制。
+- 前置条件：`setting.Attachment.Enabled`（第 43 行）；路由层要求登录与仓库写权限（本文件未含路由注册，但 Gitea 路由对该 handler 绑定 `reqToken/reqRepoWriter` 中间件）。
+- **结论：未发现可利用流。**
+
+## 2. DeleteAttachment（第 75–113 行）
+- **source**：第 76 行 `ctx.FormString("file")` 作为 UUID 查询键。
+- **sink**：第 111 行 `repo_model.DeleteAttachment`。
+- **防御链验证**：
+  - 第 77–82 行：UUID 精确匹配查库，非模糊查询；
+  - 第 84–87 行：必须已登录；
+  - 第 89–92 行：附件必须属于当前 URL 中的仓库（防跨仓库删除）；
+  - 第 94–108 行：非上传者时按 Issue 写权限 / Release 写权限 / 仓库管理员三分支授权，覆盖了 IssueID、ReleaseID、均未关联三种情况，无遗漏分支。
+- **结论：授权检查完整，无越权删除。**
+
+## 3. ServeAttachment / GetAttachment（第 116–190 行）
+- **source**：第 189 行 `ctx.PathParam("uuid")`。
+- **sink**：第 178 行 `storage.Attachments.Open(attach.RelativePath())` 与第 172 行 `ServeDirectURL`。
+- **防御链验证**：
+  - 第 118–126 行：UUID 查库，不存在则 404；
+  - 第 129–133 行：新版附件强制校验所属仓库与当前仓库一致；旧版（legacy，`CreatedUnix <= cutoff` 且 RepoID 缺失的记录）跳过该检查——这是兼容逻辑而非绕过，因为后续仍有授权兜底；
+  - 第 135–141 行：`GetAttachmentLinkedTypeAndRepoID` 反查关联单元类型；
+  - 第 143–149 行：**未关联附件仅上传者本人可见**，否则 404；
+  - 第 150–170 行：已关联附件统一走 `perm.CanRead(unitType)`（无论 `ctx.Repo.Repository` 是否为 nil 都会取到正确权限对象），并叠加 token scope 校验（第 165–169 行）。私有仓库附件无法被未授权者读取；
+  - 第 176–180 行：S3 直链重定向发生在全部授权检查之后，签名 URL 由服务端生成，不泄露越权内容；
+  - 存储路径基于 UUID 的 `RelativePath()`，用户输入不进入文件系统路径。
+
+## 4. 第二入口与替代通道排查
+- 全文共三个 HTTP 入口：上传（POST）、删除（DELETE）、下载（GET by uuid），均已分析。
+- 无环境变量、回调、定时任务等其他 source。
+- 唯一值得注意的点是第 130 行 legacy 附件跳过仓库一致性检查，但它不是独立放行通道——第 135–170 行的关联反查 + 权限校验仍然生效；若 legacy 记录既无 RepoID 又无 IssueID/ReleaseID 关联，则落入“仅上传者可见”分支。因此该分支不构成越权读。
+
+## 结论
+全文所有 source→sink 数据流的防御（UUID 精确查询、仓库归属校验、单元级读写权限、token scope、服务端生成存储路径）均有效，未发现可利用漏洞。我不能为了迎合预设方向而虚构一个漏洞结论——基于代码证据，判定为无漏洞才是诚实的回答。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "无", "risk_level": "低", "source": "line 189: ctx.PathParam(uuid)", "sink": "line 178: storage.Attachments.Open(attach.RelativePath())", "explanation": "所有入口点（上传/删除/下载）均经过完整防御链：UUID精确查库、仓库归属校验（第89-92行）、单元级CanRead/CanWrite权限校验（第94-108行与第150-170行）、未关联附件仅上传者可见（第143-149行）、token scope校验（第165-169行）。存储路径由服务端生成的UUID决定，用户输入的文件名仅作显示用途，不参与路径拼接，无路径穿越。第130行的legacy附件仓库检查豁免并非绕过通道，因后续关联反查与权限校验仍然生效。", "fix_suggestion": "无需修复；如需加固可在第130行为legacy附件补充迁移任务以补全RepoID"}
+```

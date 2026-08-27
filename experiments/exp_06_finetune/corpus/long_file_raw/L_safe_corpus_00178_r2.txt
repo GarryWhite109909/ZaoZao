@@ -1,0 +1,29 @@
+## 编号分析（全文逐函数）
+
+**1. 入口点枚举（第 1–160 行）**
+- 入口 A：CLI 参数 `--mcp` → `execute()`（第 138–150 行）→ `create_mcp_tools()`。
+- 入口 B：`apply_to_agent_config()`（第 96–135 行）接受字符串或 dict 形式的 `flag_value`，dict 路径可携带 `command`、`env`、`timeout` 三个字段（第 108–112 行），是第二入口/替代通道。
+- 环境变量入口：`--mcp-env` 经 `parse_mcp_command` 的 env_vars 解析（第 60–65 行）。
+
+**2. source→sink 数据流验证**
+- source：用户提供的 `command` 字符串（第 100 行 / 第 141 行）。
+- sink：`MCP(command=cmd, args=args, env=env)`（第 82–87 行），SDK 内部将以子进程方式执行该命令——即操作系统命令执行 sink。
+
+**3. 防御有效性分析（parse_mcp_command，第 41–68 行）**
+- 第 47 行 `shlex.split(command)` 仅做分词，不限制内容。
+- 第 55–56 行：`basename = os.path.basename(cmd); if basename not in ALLOWED_MCP_COMMANDS: raise`。这是**黑名单式路径校验的可绕过写法**：
+  - 校验的是 basename，但第 67 行返回并最终传给 `MCP()` 的是**原始完整路径 `cmd`**。攻击者可传 `/tmp/evil/python -c 'import os;os.system(...)'`，basename 为 `python` 通过白名单，实际执行的是任意路径下的恶意二进制。
+  - 同理 Windows 下 `C:\attacker\node.exe`、符号链接、PATH 劫持均可绕过。
+- 白名单本身包含 `python`、`node`、`docker` 等（第 14–28 行），即使路径合法，这些解释器也可直接执行任意代码（如 `python -c ...`），白名单对“任意代码执行”无实质约束力。注释（第 12–13 行）声称开发者自担风险，但这属于设计声明而非技术防御。
+- `args` 完全未过滤（第 51 行），`env` 仅做 KEY=value 拆分（第 60–65 行）无键名校验，可注入如 `LD_PRELOAD=/path/evil.so` 之类的危险环境变量，经第 84 行传入子进程环境。
+
+**4. 第二入口与替代通道**
+- `apply_to_agent_config` 的 dict 分支（第 107–112 行）：`flag_value.get('command','')` 同样流向同一 sink；若 config 来自不受信来源（如配置文件/远端），绕过方式与上相同。空 command 时 `create_mcp_tools('')` 会因 shlex.split 返回空而走第 74 行报错，无崩溃问题。
+- `timeout` 来自 dict 未做类型校验（第 111 行），非 int 可能导致 SDK 内异常，但被第 90 行 try/except 捕获，仅属健壮性问题。
+
+**5. 结论**
+存在真实漏洞：basename 白名单校验与实际执行路径不一致（TOCTOU 式校验对象错位），且白名单成员均为可执行任意代码的解释器，env 注入亦未设防。鉴于该工具面向本地 CLI 用户，威胁模型有限，定为中危。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "arbitrary command execution via allowlist bypass", "risk_level": "medium", "source": "user-supplied --mcp command string or apply_to_agent_config dict command field", "sink": "MCP(command=cmd, args=args, env=env) at lines 82-87 which spawns a subprocess", "explanation": "Line 55 checks only os.path.basename of the command against ALLOWED_MCP_COMMANDS, but line 67 returns the original full path which is executed at line 83. A command like /tmp/evil/python passes the check because its basename is python while executing an attacker-controlled binary. Additionally the allowlist includes interpreters such as python node docker that can run arbitrary code via args, and env pairs at lines 60-65 are not validated so variables like LD_PRELOAD can be injected into the child process environment.", "fix_suggestion": "Resolve the executable to its absolute canonical path via shutil.which and verify it resides in trusted system directories before execution; reject any command containing path separators; validate or drop dangerous environment variable names such as LD_PRELOAD; consider restricting arguments for interpreter-type commands."}
+```

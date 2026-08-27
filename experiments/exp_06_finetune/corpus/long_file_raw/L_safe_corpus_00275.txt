@@ -1,0 +1,27 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：本模块无 HTTP 路由，入口为两个公开函数：
+   - `deliver_webhook`（第 246 行附近）：由事件系统调用，`payload` 来自内部实体数据；
+   - `test_webhook`（第 262 行附近）：由 API 层测试端点调用，`webhook` 对象（含 `webhook.url`、`webhook.secret`）来自用户注册的 webhook 记录。
+   - 外部输入 source：`webhook.url`（攻击者可控的出站目标地址）。
+
+2. **source→sink 数据流**：`webhook.url` → `_send_webhook_request` 第 137 行 `_validate_webhook_url(webhook.url)` → 第 190 行 `session.post(webhook.url, ...)`。这是典型 SSRF sink。防御验证：
+   - 第 137 行 URL 校验（解析+解析 IP 检查）存在 DNS-rebinding TOCTOU 缺口，但第 152-158 行注释明确说明使用 `SSRFProtectedHTTPAdapter` 在**连接时**校验对端 IP 为公网地址，闭合了 rebinding 窗口；且该 adapter 挂载于 http/https 全部 scheme（第 160-161 行），重定向产生的每个新连接同样经过 adapter 校验；
+   - 第 159 行 `session.trust_env = False` 阻止环境代理绕过 IP 校验——这是对替代通道的主动封堵；
+   - 重定向通道：requests 默认跟随重定向，但每次连接均走同一 adapter，校验不被绕过。
+
+3. **第二入口/替代通道检查**：
+   - `test_webhook` 将 `response.text` 回传给调用者（第 276 行），若能访问内网则构成信息泄露放大器，但前置的连接时 SSRF 校验使内网不可达；
+   - 非 http/https scheme（如 file://）不匹配已挂载 adapter，但 `_validate_webhook_url` 应拒绝非 http(s) scheme（MLflow 标准校验），且 requests 对 file:// 不支持 post；
+   - HMAC 签名（第 88-105 行）使用 `hmac.new` 常量时间比较语义正确，secret 仅用于签名，无泄露路径。
+
+4. **其他次要问题（非漏洞）**：
+   - 第 195 行日志记录完整 `webhook.url`——URL 本身是注册者自填的，非敏感泄露；
+   - TTLCache 缓存（第 208-240 行）可能导致已删除 webhook 短暂继续投递，属可用性/一致性问题而非安全漏洞；
+   - 线程池共享 session 有锁保护（第 68-77 行），无线程安全问题。
+
+结论：SSRF 主 sink 具备双层有效防御（URL 校验 + 连接时 IP 校验），代理与重定向替代通道均被封堵，未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文唯一的攻击者可控 source 是 webhook.url，sink 是 session.post。该数据流具备两层有效防御：_validate_webhook_url 的静态校验加上 SSRFProtectedHTTPAdapter 在每次连接时校验对端为公网 IP，闭合了 DNS rebinding TOCTOU 窗口；session.trust_env=False 封堵了代理绕过通道，adapter 挂载于全部 http/https 使重定向后的每个新连接同样受校验。test_webhook 返回 response.body 虽有信息回传面，但因内网不可达而不构成可利用问题。HMAC 签名实现正确，缓存 TTL 差异仅为一致性小瑕疵。", "fix_suggestion": "no fix needed"}
+```

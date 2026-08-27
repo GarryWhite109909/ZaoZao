@@ -1,0 +1,52 @@
+# JOSE_JWS 全文安全分析
+
+## 一、文件结构总览与入口点枚举
+
+本文件为开源项目 `JOSE`（php-jose）中的 JWS 签名/验签类，继承自 `JOSE_JWT`。全文共 6 个方法，逐一枚举：
+
+1. **构造函数 `__construct`（第 4–9 行）**：入口参数为外部传入的 `$jwt` 对象（通常来自 `JOSE_JWT::decode()` 解析的不可信 token）。它直接复制 `$jwt->header`、`$jwt->claims`、`$jwt->signature`、`$jwt->raw` 四个属性——这是**第一入口点**：攻击者控制的 JWT 字符串经解析后成为本类的数据源。
+2. **`toJson`（第 11–27 行）**：输出通道，将 header/claims/signature 序列化为 JSON。
+3. **`sign`（第 29–43 行）**：签名入口，参数 `$private_key_or_secret`、`$algorithm`。
+4. **`verify`（第 45–51 行）**：验签公开入口，参数 `$public_key_or_secret`、`$alg`——这是**第二入口点**：密钥来源与期望算法均由调用方传入。
+5. **私有辅助 `rsa`（第 53–67 行）、`digest`（第 69–87 行）**。
+6. **私有核心 `_sign`（第 89–113 行）与 `_verify`（第 115–143 行）**。
+
+## 二、逐函数 source→sink 数据流验证
+
+### 1. `__construct`（第 4–9 行）
+- **source**：`$jwt->header['alg']`（攻击者可控的 token 头部）。
+- **sink**：后续 `_verify` 第 121 行 `$expected_alg = $this->header['alg']`。
+- **防御验证**：第 122–126 行存在关键防御——当未显式传参时自动采用 header 中的 alg，但若自动检测到的是 HMAC 族算法（HS256/384/512），立即抛出异常 `'HMAC algs MUST be explicitly specified as $expected_alg'`。这直接封堵了经典的 **alg 混淆攻击（RS256→HS256，用公钥当 HMAC 密钥）**：攻击者把 alg 改成 HS256 时，`_verify` 在第 124 行抛异常，不会执行到第 129 行的 `hash_hmac`。该防御是白名单式分支+强制显式声明，非黑名单，视为有效。
+- 但注意残留风险：若调用方**显式**传入 `$alg='HS256'` 且把 RSA 公钥字符串当作 secret 传入，库本身无法阻止（这是 API 契约问题，见结论说明）。
+
+### 2. `digest`（第 69–87 行）
+- **source**：`$this->header['alg']`；**sink**：返回给 `hash_hmac` / `$rsa->setHash`。
+- switch 为封闭白名单，default 抛 `UnexpectedAlgorithm`，无注入面。有效。
+
+### 3. `rsa`（第 53–67 行）
+- **source**：`$public_or_private_key`（可为 JWK 对象、RSA 实例或原始 PEM 字符串）；**sink**：`loadKey`、`setSignatureMode`。
+- 无反序列化、无命令执行 sink；`setSaltLength(false)` 是对 phpseclib issue #768 的已知修复注释（第 64 行），保证 PSS 验签正确性。无漏洞。
+
+### 4. `_sign`（第 89–113 行）
+- 签名方向由服务端持有私钥，`$algorithm` 虽可被调用方指定，但签名操作不构成对外信任决策，无越权 sink。ES 分支第 105–106 行明确拒绝不支持算法。无漏洞。
+
+### 5. `_verify`（第 115–143 行）——核心审计点
+- **source→sink 流 A（HMAC 路径）**：第 128–130 行，仅当 `$expected_alg` 显式为 HS* 才到达 `hash_hmac`；且第 122–126 行拦截了 autodetect 的 HS*。`hash_equals`（第 130 行）为恒定时间比较，防时序侧信道。防御有效。
+- **source→sink 流 B（RSA/PSS 路径）**：第 131–141 行，`verify` 由 phpseclib 内部做常数比较，密钥类型由调用方保证。无 alg 注入可能（switch 白名单）。
+- **第二入口检查**：`verify()` 公有方法（第 45–51 行）只是薄封装，`$alg=null` 时进入上述受保护的 autodetect 路径；不存在绕过 `_verify` 直接消费 `$this->signature` 的替代通道——全文搜索，signature 仅在 toJson 输出和 _verify 中使用。
+- **none/空 alg 检查**：若 token header 缺失 `alg` 键，第 70 行 `$this->header['alg']` 会产生 notice 并落入 default 抛异常，不会静默通过。
+
+### 6. `toJson`（第 11–27 行）
+- 仅 `json_encode`，无 XSS sink（输出由上层决定 content-type），无注入。
+
+## 三、替代通道与残余风险汇总
+- 不存在文件、环境变量、回调类入口；无 `eval`/`system`/`unserialize` sink。
+- 已知历史 CVE 类问题（如 php-jose 的 key confusion）在本版本中已通过第 122–126 行修复。
+- 残余为**使用层契约风险**而非代码缺陷：调用方必须自行保证“HS* 时传对称 secret、RS*/PS* 时传对应公钥”，以及 verify 后再校验 claims（iss/exp 等）——本类不含 claims 校验逻辑，属职责边界外。
+
+## 四、结论
+基于全文逐行证据：所有 source→sink 流均有白名单式算法校验 + 强制显式 HMAC 声明 + `hash_equals` 恒定时间比较防护，未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认：构造函数接收的外部 JWT 数据在 _verify 第 115-143 行被消费，其中第 122-126 行强制要求 HMAC 算法必须显式传入 expected_alg，封堵了 alg 混淆攻击；digest 与 _sign/_verify 的算法分派均为封闭白名单 switch，default 分支抛出 UnexpectedAlgorithm 异常；HMAC 比较使用 hash_equals 防时序攻击；PSS 验签通过 setSaltLength(false) 修复了 phpseclib 已知缺陷；全文不存在 eval、unserialize、命令执行等危险 sink，也无文件或环境变量类替代入口。残余风险仅为使用层契约：调用方需自行确保 HS 算法传入对称密钥、并在 verify 之后自行校验 iss 和 exp 等 claims，这些属于调用方职责而非本类代码缺陷。", "fix_suggestion": "no fix needed"}
+```

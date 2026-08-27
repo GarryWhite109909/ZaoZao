@@ -1,0 +1,38 @@
+## 编号分析
+
+**入口点枚举（全文）**
+- 第 41–43 行：`verifyRedirectUri(session, redirectUri, client)` — 公开入口，redirectUri 来自 OAuth/OIDC 请求参数（外部可控 source）。
+- 第 45–49 行：带 `requireRedirectUri` 的重载，同样透传外部 redirectUri。
+- 第 51–62 行：`resolveValidRedirects` — 处理管理员配置的相对 redirect。
+- 第 64–117 行：核心校验逻辑 `verifyRedirectUri(...)`。
+- 第 119–133 行：`toUri` 解析。
+- 第 136–141 行：`UNSAFE_PATH_PATTERN` 防目录穿越。
+- 第 143–146 行：`areWildcardsAllowed`。
+- 第 148–160 行：`relativeToAbsoluteURI`。
+- 第 162–190 行：`matchesRedirects` — 匹配 sink 前的判定逻辑。
+- 第 192–205 行：无参 redirect 时取唯一合法值。
+
+**数据流验证**
+
+1. **source**：第 41 行参数 `redirectUri`（攻击者通过授权请求的 `redirect_uri` 参数完全控制）→ **sink**：第 116 行 `return redirectUri`（返回后用于颁发授权码的重定向）。
+
+2. **防御检查**：
+   - 第 71–73 行：URI 解析失败即拒绝 — 有效。
+   - 第 76–78 行：`matchesRedirects` 白名单匹配 — 见下述缺陷。
+   - 第 80–85 行：仅针对 localhost 的端口归一化，不构成绕过面。
+   - 第 99–106 行：scheme 校验只限制为 http/https 或与匹配项前缀一致，不能阻止主机伪造。
+   - 第 136–141、143–146 行：`UNSAFE_PATH_PATTERN` 与 userinfo 检查仅在允许通配符时收紧路径，但见缺陷 2。
+
+3. **漏洞一（主要）：通配符前缀匹配缺少边界分隔符**
+   - 第 168–171 行：当配置如 `https://client.example.com/*` 且 `allowWildcards=true` 时，去掉 `*` 得到前缀 `https://client.example.com`，然后执行 `r.startsWith(validRedirect)`。攻击者提交 `https://client.example.com.evil.com/callback` 即可满足 `startsWith` —— 前缀后没有要求 `/`、`?`、`#` 等边界字符，导致匹配到攻击者控制的域名，形成开放重定向（可窃取 authorization code）。这是真实历史漏洞模式（Keycloak 曾修复过类似问题，加入边界字符校验）。
+
+4. **漏洞二：`*` 全通配 + 相对路径组合**
+   - 第 164–166 行：配置为 `*` 时任意 http(s) URI 直接返回 `"*"`，随后第 116 行原样返回攻击者 URI。这依赖管理员显式配置，属设计行为，但结合第 107–112 行对非绝对 URI 的拼接，若 redirect 为 `//evil.com`（协议相对），`isAbsolute()` 为 false，会拼到 rootUrl 后，此路径被缓解；但绝对 https URI 在 `*` 配置下无任何主机校验。
+
+5. **第二通道**：第 86–95 行 localhost 端口 80 归一化分支最终也走同一个有缺陷的 `matchesRedirects`，同样受漏洞一影响；`getSingleValidRedirectUri`（第 192–205 行）截断 `/*` 后不再做匹配，但该值来自服务端配置，风险低。
+
+6. **黑名单评估**：`UNSAFE_PATH_PATTERN` 是正则黑名单，按题目规则视为可绕过（例如利用未覆盖的编码组合），但它只影响是否允许通配符，主漏洞不依赖它被绕过即可成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-601 开放重定向", "risk_level": "高", "source": "line 41: verifyRedirectUri 的外部参数 redirect_uri", "sink": "line 116: return redirectUri 返回给调用方用于授权码重定向", "explanation": "攻击者在授权请求中传入 redirect_uri=https://client.example.com.evil.com/cb -> 客户端配置了通配符 https://client.example.com/* 且 URI 无 userinfo 无穿越路径使 areWildcardsAllowed 为真 -> line 170 r.startsWith(https://client.example.com) 因缺少边界分隔符而误判匹配 -> line 116 原样返回攻击者域名 -> 授权码被重定向到攻击者站点造成代码劫持", "fix_suggestion": "line 170: 在 startsWith 判断后追加边界校验，要求前缀之后紧跟 / ? # 或字符串结束（并比较时忽略大小写），同时建议对通配符匹配的主机部分做精确域名比对而非纯字符串前缀"}
+```

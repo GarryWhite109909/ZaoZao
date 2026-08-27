@@ -1,0 +1,83 @@
+LANG: php
+```php
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
+
+class DevProxyController extends Controller
+{
+    // 用户在 .env 或配置中指定的代理目标，例如 'http://localhost:3000'
+    private function resolveTarget(Request $request): string
+    {
+        // 防御：忽略用户传入的 proxy_target，仅允许配置白名单中的回环地址
+        $allowed = (array) config('app.dev_proxy_allowlist', [config('app.dev_proxy')]);
+        $target = config('app.dev_proxy');
+
+        if (!preg_match('#^https?://#', $target)) {
+            abort(400, 'proxy must start with http:// or https://');
+        }
+
+        // 防御：白名单精确匹配（scheme+host+port），并强制目标为回环地址
+        if (!in_array($target, $allowed, true)) {
+            abort(403, 'proxy target not allowed');
+        }
+        $host = parse_url($target, PHP_URL_HOST);
+        if (!in_array($host, ['127.0.0.1', '::1', 'localhost'], true)) {
+            abort(403, 'proxy target must be loopback');
+        }
+        return $target;
+    }
+
+    public function proxy(Request $request)
+    {
+        $target = $this->resolveTarget($request);
+        $path = $request->path();
+
+        // 静态资源不代理，其余全部转发（含 WebSocket 升级请求）
+        if ($this->isPublicAsset($path)) {
+            return response()->file(public_path($path));
+        }
+
+        // 防御：路径白名单前缀精确允许集，限制可代理的路径范围
+        $allowedPrefixes = (array) config('app.dev_proxy_path_prefixes', []);
+        $matched = false;
+        foreach ($allowedPrefixes as $prefix) {
+            if ($path === $prefix || str_starts_with($path, rtrim($prefix, '/') . '/')) {
+                $matched = true;
+                break;
+            }
+        }
+        if (!$matched) {
+            abort(404);
+        }
+
+        $upstream = Http::withHeaders($request->headers->all())
+            ->send($request->method(), rtrim($target, '/') . '/' . $path,
+                ['body' => $request->getContent()]);
+
+        return response($upstream->body(), $upstream->status())
+            ->withHeaders($upstream->headers());
+    }
+
+    private function isPublicAsset(string $path): bool
+    {
+        return file_exists(public_path($path));
+    }
+}
+```
+
+分析：
+
+1. 第 17 行：用户可控输入点为 `$request->input('proxy_target', ...)`，原代码中该值直接成为代理目标，构成 SSRF/开放代理（CWE-441）主链起点。
+2. 第 19 行：修复将数据流改为从服务端 `config('app.dev_proxy')` 读取，用户输入不再进入目标解析——类型正确性：`config()` 返回受信任的服务端字符串；位置正确性：在 sink 之前于 `resolveTarget` 内完成。
+3. 第 25–33 行：双重防御——先以 `in_array(..., true)` 对配置白名单做精确全等匹配（非正则黑名单），再用 `parse_url` 提取 host 并限定为回环地址集合 `['127.0.0.1','::1','localhost']`，覆盖 DNS rebinding 到内网地址的攻击面；任何绕过均触发 403。
+4. 第 45–53 行：对第二可控输入 `$request->path()` 增加路径前缀精确允许集（来自配置），防止借代理访问任意内部路径；未命中即 404。这是对同一漏洞数据流的补充约束，保持原控制流不变。
+5. 第 56–59 行：sink `Http::send(...)` 保持原样，但此时 `$target` 与 `$path` 均已通过白名单校验，攻击面闭合。
+6. 第二入口检查：`isPublicAsset`/静态资源分支（第 41–43 行）与原代码一致且不在本漏洞数据流上，按 minimal pair 纪律保持原样；无其他入口可注入 proxy_target。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-441：第 17 行用户可控的 proxy_target 输入直接流入第 57 行 Http::send 的上游 URL，构成不受限的开放代理/SSRF；修复后目标仅取自服务端配置并经白名单全等匹配加回环地址强制校验，路径另受配置前缀允许集限制，用户输入不再影响代理目标；静态资源分支与原逻辑一致，不属于该数据流", "fix_suggestion": "line 17-33: 忽略用户传入的 proxy_target，改用服务端配置并对目标执行白名单精确匹配与回环地址强制校验"}
+```

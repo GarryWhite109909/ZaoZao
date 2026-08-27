@@ -1,0 +1,24 @@
+## 编号分析
+
+1. **第 1–16 行（makeJoined）**：仅做 DB 记录到模型的转换与 JSON 反序列化，无用户输入 source，无 sink。
+
+2. **第 24–50 行（GetSharingById）**：入口参数为分享 id，直接作为缓存键和 DB 查询键，走参数化查询（db 层），无拼接 SQL，无路径操作。安全。
+
+3. **第 52–66 行（GetSharings / GetSharingsByCreatorId）**：分页参数由调用方传入，DB 层处理，本文件内无 sink。
+
+4. **第 68–97 行（GetSharingUnwrapPath）——核心风险点**：
+   - 第 71–78 行：对非管理员创建者做了 BasePath 复校验（`utils.IsSubPath`），这是有效防御，但只覆盖“创建者 BasePath 变更”场景。
+   - 第 79–81 行：**单文件分支**：`stdpath.Join(sharing.Files[0], path)` 直接使用未经过 `utils.FixAndCleanPath` 清洗的原始 `path`。虽然 `stdpath.Join` 内部会 lexical Clean，但这恰恰意味着 `../..` 会被规范化解析——例如 `Files[0]=/data/public`、请求 path=`../../private` 时结果为 `/private`，可逃逸出被分享目录范围。该分支没有任何后续校验确认结果仍位于 `sharing.Files[0]` 之下。source 是外部传入的分享子路径，sink 是实际文件系统访问路径的构造点。
+   - 第 83–95 行：多文件分支先执行 `FixAndCleanPath(path)[1:]` 清洗（第 84 行），再按首段目录名匹配 `sharing.Files`，`rest` 来自清洗后的路径，相对安全；但匹配依据是 `stdpath.Base(c)`（第 90 行），若两个共享项 basename 相同可能映射到错误条目，属逻辑缺陷而非可直接利用的安全漏洞。
+
+5. **第 99–107 行（CreateSharing）**：写入前对所有 Files 执行 `FixAndCleanPath`，防御到位。
+
+6. **第 109–119 行（UpdateSharing）**：默认同样清洗；但存在 `skipMarshal` 参数（第 109 行），当调用方传 true 时跳过清洗直接落库——若上游某入口允许用户控制 sharing 内容且传 skipMarshal=true，则构成第二入口绕过通道；本文件内无法证实此类调用存在，需结合全文其他文件确认，此处记为可疑而非确证。
+
+7. **第 121–137 行（UpdateSharingId / DeleteSharing / DeleteSharingsByCreatorId）**：id 删除操作走 DB 主键查询，无注入面；缓存删除逻辑正确。
+
+**结论**：单文件分支（第 80 行）缺少路径清洗与结果范围校验，`../` 序列经 `Join` 规范化后可越出共享根目录，构成路径遍历风险；多文件分支有清洗故不受影响。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "path_traversal", "risk_level": "medium", "source": "GetSharingUnwrapPath 的入参 path（来自分享访问请求的子路径）", "sink": "第 80 行 stdpath.Join(sharing.Files[0], path)，其返回值用于定位真实文件路径", "explanation": "单文件分享分支中 path 未经过 utils.FixAndCleanPath 清洗，也未在 Join 后校验结果是否仍在 sharing.Files[0] 之下；stdpath.Join 的词法 Clean 会解析 ../ 序列，攻击者可用形如 ../../xxx 的子路径逃逸出被分享目录，读取创建者权限范围内的任意文件。多文件分支因第 84 行有清洗而不受影响；第 71-78 行的 BasePath 复校验只限制创建者根变更场景，不能阻止本次遍历。", "fix_suggestion": "在第 80 行之前对 path 调用 utils.FixAndCleanPath 并剥离开头的分隔符，或在 Join 之后用 utils.IsSubPath 校验结果路径必须位于 sharing.Files[0] 之内，否则拒绝访问"}
+```

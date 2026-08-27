@@ -1,0 +1,21 @@
+## 编号分析（全文逐函数）
+
+1. **第 1–15 行**：依赖引入。`image-size`、`got`(request)、`probe-image-size`(probe)、validator 等，均为 source/sink 的载体。
+2. **第 44–66 行 `_imageSizeFromBuffer`**：纯内存解析 buffer，无文件系统/网络 sink，无漏洞。
+3. **第 68–100 行 `_probeImageSizeFromUrl`**：入口校验 `_.isEmpty(imageUrl) || !this.validator.isURL(imageUrl)`（第 74 行），注释声称底层 got 实例有 SSRF 防护钩子。此路径防御相对完整。
+4. **第 102–107 行 `_fetchImageSizeFromUrl`**：直接 `this.request(imageUrl, ...)` 发起网络请求，**没有任何 URL 校验、协议限制或内网地址过滤**——这是关键 sink。
+5. **第 109–134 行 `_imageSizeFromUrl`**：分流逻辑。第 121–127 行用正则 `(?:\.)([a-zA-Z]{3,4})(\?|$)` 提取扩展名；若命中 `cur/icns/dds` 则走 `_fetchImageSizeFromUrl`（第 128–129 行），**绕过了第 74 行的 `isURL` 校验和 got 的 SSRF beforeRequest 钩子**。攻击者可构造如 `http://169.254.169.254/latest/meta-data/.dds` 或内网地址 + `.dds` 后缀，使请求走未防护通道。此外第 113–119 行：`url.parse` 对空串不抛错但返回 protocol 为空的对象，随后拼出 `http:null` 类畸形 URL，属健壮性问题而非独立漏洞。
+6. **第 155–200 行 `getImageSizeFromUrl`**：外部主入口。第 157 行 `isLocalImage` 判断依赖 storageUtils（本文件外）；第 161 行 `/^\/assets/` 拼接后仍进入 `_imageSizeFromUrl`，即上述分流漏洞可达此入口。
+7. **第 223–262 行 `getImageSizeFromStoragePath`**：source 是 imagePath，sink 是 `imageStore.read({path})`（第 231 行）。路径安全性完全取决于 `storageUtils.getLocalImagesStoragePath`（第 229 行），本文件内无校验；若该函数无规范化/前缀检查则存在路径穿越风险，但代码不在本文中，不能据此断言。
+8. **第 264–287 行 `getOriginalImagePath`**：`path.parse` + 正则重组路径，仅做存在性探测（`imageStore.exists`），无读取 sink，风险低。
+9. **第 296–303 行 `_getPathFromUrl`**：`new RegExp(`^${this.urlUtils.getSubdir()}`)` 存在正则注入可能（subdir 含特殊字符时），但 subdir 来自配置而非用户输入，实际不可利用。
+10. **第 305–315 行**：`getImageSizeFromStorageUrl` 将 URL 剥前缀后送入存储读取链，与第 7 条同一 sink，同样依赖外部 storageUtils 防御。
+11. **第 317–346 行 `getImageSizeFromPath`**：`sizeOf(imagePath)` 直接读任意传入路径，若上游调用者将用户输入传入则为任意文件读（受 image-size 格式魔数限制），但本文件内无路由级调用证据。
+
+## 结论
+
+核心可证实漏洞：**SSRF 替代通道**——`_imageSizeFromUrl` 第 128–129 行在扩展名为 cur/icns/dds 时调用无任何校验的 `_fetchImageSizeFromUrl`（第 104 行 `this.request`），绕过第 74 行 `isURL` 与 got 的 SSRF 钩子。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918", "risk_level": "medium", "source": "line 155: getImageSizeFromUrl 接收的外部 imagePath 参数", "sink": "line 104: this.request(imageUrl, this.REQUEST_OPTIONS) 发起服务端 HTTP 请求", "explanation": "line 109-134 的 _imageSizeFromUrl 用 line 122 的扩展名正则分流：当 URL 以 .dds/.icns/.cur 结尾时走 line 128-129 调用 _fetchImageSizeFromUrl，而该函数 line 104 直接发起请求，完全绕过了 line 74 在 _probeImageSizeFromUrl 中的 isURL 校验以及 got 实例的 SSRF beforeRequest 防护钩子。攻击者提交形如 http://169.254.169.254/latest/meta-data/.dds 或 http://10.0.0.1:8080/x.dds 的图片地址即可让服务器向云元数据接口或内网服务发起请求并回传尺寸信息作为探测信道", "fix_suggestion": "line 102-107: 在 _fetchImageSizeFromUrl 入口处复用与 _probeImageSizeFromUrl 相同的 isURL 校验与 SSRF 过滤逻辑，或将 URL 校验提升到 _imageSizeFromUrl 分流之前对两条分支统一执行"}
+```

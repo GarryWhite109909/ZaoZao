@@ -1,0 +1,61 @@
+# 全文逐函数安全分析（sqls v0.2.28 主入口文件）
+
+## 一、入口点完整枚举（覆盖全文，不遗漏）
+
+本文件是 LSP 语言服务器 `sqls` 的 main 包，通读全文后确认存在以下 **6 类入口点**：
+
+1. **命令行参数**（第 36–48 行 Flags 定义）：`--log/-l`、`--config/-c`、`--trace/-t`；子命令 `config/c`（第 50–58 行）。
+2. **环境变量**：第 54 行 `os.Getenv("EDITOR")`。
+3. **配置文件**：第 109 行 `config.GetConfig(configFile)` 与第 113 行 `config.GetDefaultConfig()`，其内容被注入 `server.SpecificFileCfg` / `server.DefaultFileCfg`（第 111、117 行），随后被 handler 消费——这是**第二入口/替代通道**，虽然解析逻辑在 internal 包中未展示，但主文件明确把不可信文件内容传入服务器状态。
+4. **stdin/stdout JSON-RPC 流**：第 128–135 行 `jsonrpc2.NewConn(... stdrwc{}, ...)`，所有 LSP 客户端请求经第 105 行 `server.Handle` 进入 handler 包（外部代码，本文件不展开但必须指出该通道存在）。
+5. **日志文件路径**：第 87 行 `os.OpenFile(logfile, ...)`，路径来自用户参数。
+6. **常量与版本信息**（第 16、18、20 行）：无输入面。
+
+## 二、逐函数 source→sink 数据流验证
+
+### 函数 1：`main()`（第 22–30 行）
+仅调用 `realMain()` 并把错误写到 stderr（第 24 行）。无外部输入参与任何 sink。**无漏洞**。
+
+### 函数 2：`realMain()`（第 32–78 行）
+- 第 33–60 行构建 `cli.App`。三个 Flag 均为纯字符串/布尔读取，此处只是声明，真正的消费在 `serve()`。
+- **关键路径 A（子命令 config）**：第 53–58 行 Action 中：
+  - **source①**：第 54 行 `editorEnv := os.Getenv("EDITOR")` —— 环境变量，攻击者可控性取决于威胁模型（本地用户可自控；但在 CI、被入侵的 shell 配置、恶意包装脚本等场景下可被第三方控制）。
+  - 第 55–56 行：若为空则回退为硬编码 `"vim"`，这是对空值的防御，但对**非空的恶意值没有任何校验**——没有白名单、没有路径检查、没有对 shell 元字符的过滤。按分析要求，此类“无防御”直接判定为可绕过/无效。
+  - **sink①**：第 57 行 `openEditor(editorEnv, config.YamlConfigPath)` → 进入函数 5 的命令执行链。
+- 第 72 行 `app.Run(os.Args)`：标准库解析，无注入面。
+- **结论：source①(EDITOR) → sink①(sh/cmd -c) 是一条未经任何净化的完整数据流。**
+
+### 函数 3：`serve(c *cli.Context)`（第 79–137 行）
+- **数据流②（logfile）**：第 80 行取 `--log` 参数 → 第 87 行 `os.OpenFile(logfile, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0660)`。这是任意路径写/追加（CWE-22 类似形态），但该参数由**启动服务器的本地用户自己提供**，LSP 场景下编辑器以用户身份启动 sqls，不存在跨信任边界传递，故实际风险极低；且错误时第 88 行 `log.Fatal` 直接退出，无绕过问题。判为低危设计选择而非可利用漏洞。
+- **数据流③（configFile）**：第 81 行取值 → 第 108–111 行 `config.GetConfig(configFile)` 后赋给 `server.SpecificFileCfg`。文件内容进入 handler 状态；handler 内部如何使用（是否拼接 SQL、是否再触发命令）在本文件外，但作为入口点必须记录。注意第 40 行 Usage 明示“命令行指定 config 时忽略 initializationOptions”，说明作者意识到配置来源的优先级问题，但未做内容级消毒。
+- **数据流④（JSON-RPC）**：第 100 行建 server，第 105 行 `jsonrpc2.HandlerWithError(server.Handle)`，第 128–135 行把 stdin/stdout 接入。所有 LSP 方法（textDocument/didOpen 等）携带的工作区文本都是不可信输入，最终流向 handler 内部的 SQL 解析器（sqlparser）。本文件本身无 sink，但通道存在。
+- 第 124–126 行 `trace` 仅影响日志开关，无风险。
+- **结论：serve() 内部无可利用 sink，但它是三条不可信输入通道的汇聚点。**
+
+### 函数 4：`stdrwc`（第 139–154 行）
+Read/Write/Close 直接透传 os.Stdin/os.Stdout（第 141、144、149 行），无缓冲区处理逻辑、无注入面。**无漏洞**。
+
+### 函数 5：`openEditor(program string, args ...string)`（第 156–167 行）
+- 第 157 行 `cmdargs := strings.Join(args, " ")`；
+- 第 158 行 `command := program + " " + cmdargs` —— 字符串拼接构造完整 shell 命令行；
+- **sink 落点**：第 161–165 行：
+  ```go
+  if runtime.GOOS == "windows" { cmd = exec.Command("cmd", "/c", command) }
+  else { cmd = exec.Command("sh", "-c", command) }
+  ```
+  这是教科书式的 **OS Command Injection（CWE-78）** 形态：整条字符串交给 `sh -c` / `cmd /c` 解释，任何 shell 元字符（`; | $( ) && 反引号 换行符`）都会被执行。当前调用链中 args 只有 `config.YamlConfigPath`（固定包内常量），故本次调用本身注入点仅在 `program` 即 EDITOR 变量；但该函数签名接受任意 `args ...string`，一旦未来其他调用者传入含用户数据的参数即立即成为注入点——属于危险 API 设计叠加现实可达的注入流。
+- 防御有效性核查：全文对该数据流**不存在任何一层防御**（无白名单、无 exec.LookPath 校验、无参数数组形式 `exec.Command(program, args...)` 的替代用法）。按规则判定无效/缺失。
+
+## 三、第二入口与替代通道核查
+
+- 替代通道 1：即便不走 `sqls config` 子命令，配置文件（入口③）内容进入 handler 后，开源项目历史上曾存在通过配置项间接影响行为的路径；本文件第 109–117 行是其注入点，需结合 internal/config 与 handler 审计，本文件证据不足以断言其可利用，故不计入确定漏洞。
+- 替代通道 2：stdin JSON-RPC（入口④）全部委托给 handler 包，本文件无 sink。
+- 因此**唯一在本文件内 source 与 sink 同时可见、且无任何防御的数据流**是：第 54 行 `os.Getenv("EDITOR")` → 第 57 行 `openEditor` → 第 158 行字符串拼接 → 第 162/164 行 `sh -c`/`cmd /c` 执行。
+
+## 四、风险评估
+
+EDITOR 通常由本机用户设置，直接远程利用需要先控制环境变量（如通过被入侵的开发容器、CI runner、恶意的编辑器扩展修改进程环境）。因此定性为 CWE-78，风险等级 **medium**（本地提权/横向场景下高危，纯远程低危）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "medium", "source": "line 54: editorEnv := os.Getenv('EDITOR')", "sink": "line 162/164: exec.Command('sh','-c',command) 或 exec.Command('cmd','/c',command)", "explanation": "第54行从环境变量读取 EDITOR 且无任何白名单或元字符校验 -> 第57行作为 program 传入 openEditor -> 第157-158行与固定参数 strings.Join 后拼成单条 shell 命令字符串 -> 第161-165行整体交给 sh -c 或 cmd /c 解释执行，shell 元字符如分号、管道、反引号均可被注入执行；全文对该数据流不存在任何有效防御层", "fix_suggestion": "line 156-165: 改用参数数组形式 exec.Command(program, args...) 不经过 shell 解释，并在第54行后增加白名单校验（例如仅允许可执行文件名或绝对路径，拒绝包含空格及 shell 元字符的值），Windows 分支改用 syscall.EscapeArg 或避免 cmd /c"}
+```

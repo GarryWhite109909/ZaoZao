@@ -1,0 +1,35 @@
+## 编号分析（全文逐函数）
+
+1. **第 60–100 行 `StartAndGC`**：入口点一，接受 JSON 配置字符串，`CachePath`、`FileSuffix` 直接取自配置且**无任何校验**（第 82–83 行），随后传入 `Init()` 与 `getCacheFileName()`。若配置可被外部影响（如应用把用户输入拼进 cache 配置），即构成任意路径写入。
+
+2. **第 107–127 行 `Init()`**：sink 一 —— `os.MkdirAll(fc.CachePath, os.ModePerm)`（第 116 行），source 为第 82 行的 `cfg[cpKey]`，无路径白名单/规范化校验，可任意目录创建，权限为 ModePerm(0777)。
+
+3. **第 129–152 行 `getCacheFileName`**：key 经 MD5 十六进制编码（第 131–134 行），**有效防御了 key 引入的路径穿越**——hex 输出只含 [0-9a-f]。但第 149 行将 `fc.FileSuffix` 直接拼接进文件名，suffix 来自配置无校验，可含 `../` 等穿越序列（第二入口/替代通道）。
+
+4. **第 154–177 行 `Get`**：读取文件后调用 `GobDecode`（第 167 行）。sink 二 —— **gob 反序列化**。缓存目录权限为 0777 且路径可被配置操控；若攻击者能写该目录（共享主机、目录被污染、或利用上述任意路径写入），即可注入恶意 gob 数据。Go 的 gob 虽不像 Java 反序列化那样直接 RCE，但解码到 `interface{}` 可实例化任意注册类型，配合应用中已 `gob.Register` 的复杂类型可实现对象注入/资源耗尽（CWE-502）。
+
+5. **第 179–202 行 `GetMulti`**：循环调用 `Get`，同一数据流，无额外防御。
+
+6. **第 204–222 行 `Put`**：第 219 行 `FilePutContents(fn, data)`，结合第 1、3 点，CachePath/FileSuffix 可控时构成任意文件写入 sink 三；且第 254–258 行 `os.WriteFile(..., os.ModePerm)` 以 0777 权限写文件。
+
+7. **第 224–239 行 `Delete` / 第 241–261 行 Incr/Decr / 第 263–272 行 IsExist**：均复用 `getCacheFileName`，受同样的 CachePath/FileSuffix 污染影响；Delete 在路径可控时可删除任意 `.bin` 后缀可控文件。
+
+8. **第 274–296 行 `exists`/`FileGetContents`/`FilePutContents`**：底层 sink 封装，均为裸 `os` 调用，无任何路径约束。
+
+9. **第 298–308 行 GobEncode/GobDecode**：如上，反序列化不可信文件内容。
+
+10. **key 的 MD5 处理是唯一有效防御**（阻断 key→路径穿越）；但配置面（CachePath、FileSuffix）与文件内容面（gob）两条数据流均无有效防御。
+
+结论：主要漏洞为配置驱动的任意路径创建/写入 + 对磁盘文件内容的不可信 gob 反序列化。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 (路径穿越/任意文件写入) 与 CWE-502 (不可信数据反序列化)",
+  "risk_level": "高",
+  "source": "line 82-83: StartAndGC 中 cfg[CachePath] 与 cfg[FileSuffix] 未校验; line 167: Get 读取磁盘文件内容",
+  "sink": "line 116: os.MkdirAll(fc.CachePath); line 149+254: filepath.Join 后 os.WriteFile 写入; line 167: GobDecode 解码文件字节",
+  "explanation": "StartAndGC 将配置中的 CachePath 和 FileSuffix 原样赋给结构体 -> getCacheFileName 仅对 key 做 MD5 防穿越, 但 FileSuffix 直接拼进最终文件名, CachePath 直接用于 MkdirAll 和 WriteFile -> 若配置可被外部影响即可在任意目录以 0777 权限创建或覆盖文件; 同时 Get 将磁盘上可能被污染的缓存文件内容交给 GobDecode 解码为 interface{} -> 构成不可信反序列化链路",
+  "fix_suggestion": "line 82-83: 对 CachePath 做 filepath.Clean 并限制在固定根目录内, 校验 FileSuffix 仅允许字母数字点组成的短后缀; line 254: 将写入权限从 os.ModePerm 降为 0600; line 167: 对缓存文件增加完整性校验如 HMAC 签名后再 GobDecode"
+}
+```

@@ -1,0 +1,66 @@
+# gorush router/http_server.go 全文安全分析
+
+## 一、文件范围与函数清单
+
+本文件共包含 5 个函数，逐一分析：
+
+1. `RunHTTPServer`（第 17 行起）
+2. `listenAndServe`（第 76 行起）
+3. `listenAndServeTLS`（第 92 行起）
+4. `startServer`（第 108 行起）
+5. （间接引用）`routerEngine`（第 27 行调用，定义在包内其他文件）
+
+## 二、逐函数行号级分析
+
+### 函数 1：RunHTTPServer（第 17–74 行）
+
+**入口点枚举：**
+- 第 19 行参数 `cfg *config.ConfYaml`：全部来自配置文件/环境变量（gorush 的配置加载层），属于受信的部署侧输入，不是 HTTP 请求可达的 source。
+- 第 20 行参数 `q *queue.Queue`：内部队列句柄。
+- 第 22 行可变参数 `s ...*http.Server`：允许测试注入自定义 server。
+
+**数据流验证：**
+
+1. **source→sink 流 A（配置→监听地址）**：第 26 行 `Addr: cfg.Core.Address + ":" + cfg.Core.Port`。source 是本地配置文件，sink 是 `http.Server.Addr`。该路径无用户可控输入参与，攻击者无法通过 HTTP 请求影响 Address/Port。防御有效性：不适用（无外部 source）。结论：非漏洞。
+
+2. **source→sink 流 B（TLS MinVersion）**：第 39–41 行：
+   ```go
+   config := &tls.Config{
+       MinVersion: tls.VersionTLS10,
+   }
+   ```
+   这是本文件最实质的安全问题。`tls.VersionTLS10` 允许 TLS 1.0 与 TLS 1.1 协商。TLS 1.0/1.1 已被 RFC 8996 正式废弃，存在 BEAST、弱密码套件（CBC 填充预言）等历史攻击面，且不符合 PCI-DSS 等合规基线。Go 官方文档明确建议生产环境使用 `MinVersion: tls.VersionTLS12` 或更高。source 是代码硬编码常量（第 40 行），sink 是第 71 行 `server.TLSConfig = config`，最终作用于第 103 行 `s.ListenAndServeTLS("", "")` 的握手过程。此路径没有任何过滤或条件缓解——只要 `cfg.Core.SSL == true` 且未启用 AutoTLS（第 37 行分支判断），所有 HTTPS 握手都接受 TLS 1.0。注意第 38、45、52、56 行的多处 `//nolint` 注释表明作者已知 linter 会报警但选择压制。结论：**真实漏洞，CWE-327（使用已破解/有风险的加密算法或协议版本）**，风险等级中低（需要启用 SSL 模式才触发，且现代客户端通常协商更高版本，但强制降级窗口存在）。
+
+3. **source→sink 流 C（证书路径/base64）**：第 48 行 `tls.LoadX509KeyPair(cfg.Core.CertPath, cfg.Core.KeyPath)`；第 55–63 行 base64 解码后 `tls.X509KeyPair(cert, key)`。source 为配置项，错误时第 50、58、62、66 行均直接 return err，无信息泄露到 HTTP 响应（日志仅写服务端日志）。路径来自配置而非请求参数，不存在路径遍历注入面。结论：非漏洞。
+
+4. **第 68–69 行 else 分支**：缺少证书配置时返回 `errors.New("missing https cert config")`，fail-fast，无问题。
+
+### 函数 2：listenAndServe（第 76–90 行）
+
+- 第 79–84 行：ctx 取消后以 `cfg.Core.ShutdownTimeout` 秒为超时执行优雅关闭。超时值来自配置，若配置为负数会导致 `context.WithTimeout` 立即过期，属可用性配置错误而非可利用漏洞。
+- 第 85–89 行：`s.ListenAndServe()` 错误处理正确排除了 `http.ErrServerClosed`。
+- 无外部 source 进入任何 sink。结论：非漏洞。
+
+### 函数 3：listenAndServeTLS（第 92–106 行）
+
+- 结构与 listenAndServe 对称，第 101 行 `s.ListenAndServeTLS("", "")` 使用已挂载于 `server.TLSConfig` 的证书（第 71 行），空字符串参数表示复用 TLSConfig.Certificates，逻辑正确。
+- 无外部 source。结论：非漏洞。
+
+### 函数 4：startServer（第 108–115 行）
+
+- 仅根据第 111 行 `s.TLSConfig == nil` 分发到明文/TLS 监听，纯路由逻辑，无 source/sink。结论：非漏洞。
+
+### 第二入口与替代通道检查
+
+- **routerEngine（第 27 行）**：真正的 HTTP 路由入口在本文件之外定义，本文件仅作为 Handler 挂载点，无法在此文件内评估其 API 鉴权情况——但按题目要求基于全文证据判断，本文件内无可达的用户输入 source。
+- **AutoTLS 分支（第 37 行）**：`autoTLSServer` 在其他文件实现，走 Let's Encrypt，其 MinVersion 由 acme/autotls 库默认控制，不受本文件第 40 行影响，因此漏洞影响面限定于手动 SSL 配置模式。
+- **build tag（第 1–2 行 `!lambda`）**：lambda 构建下本文件整体排除，漏洞仅在非 lambda 部署形态存在。
+- **测试注入通道（第 22 行 `s ...*http.Server`）**：传入的 server 若自带 TLSConfig 则绕过第 39–41 行配置，但这是测试用途，不构成攻击面。
+
+## 三、结论汇总
+
+全文唯一确认的安全缺陷是第 40 行将 TLS 最低版本设为 TLS 1.0（CWE-327）。其余函数均为服务器生命周期管理代码，无用户可控输入到达敏感 sink。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-327", "risk_level": "medium", "source": "line 40: MinVersion: tls.VersionTLS10", "sink": "line 71: server.TLSConfig = config, 最终由 line 103 ListenAndServeTLS 用于所有 HTTPS 握手", "explanation": "当 cfg.Core.SSL 为 true 且 AutoTLS 未启用时, 第 39-41 行构造的 tls.Config 将最低协议版本硬编码为 TLS 1.0, 该配置经第 71 行赋给 server.TLSConfig 并在第 103 行生效, 允许客户端协商已废弃且存在 BEAST/CBC 弱点的 TLS 1.0 和 1.1 (RFC 8996 已废弃), 全文无任何条件缓解, 多处 nolint 注释表明已知告警被压制", "fix_suggestion": "line 40: 将 MinVersion 改为 tls.VersionTLS12 (推荐 tls.VersionTLS13), 并移除相关 nolint 注释"}
+```

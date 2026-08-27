@@ -1,0 +1,43 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. **第 149–248 行（init 内 Event::on 闭包）**：核心入口。监听 `$webhook->class` / `$webhook->event`（来自数据库 `getEnabledWebhooks()`，第 141 行），事件触发时执行。
+2. **第 252–259 行**：CP 路由注册，仅静态路由，无用户输入注入点。
+3. **第 263–280 行**：GC 事件，`purgeDuration` 来自设置文件，非用户输入。
+4. **第 306 行起 `request()`**：由上述闭包调用，参数全部来自数据库中的 webhook 配置。
+5. **第 398 行起 `sendRequest(int $requestId)`**：由队列 Job 调用，从 DB 读回 method/url/headers/body 并发起 HTTP 请求。
+6. **第 466 行起 `toArray()`**：序列化辅助，有 `maxDepth` 与 `redactIfSensitive` 防护。
+
+**数据流验证**
+
+- **流 A：payload 模板 → Twig 渲染（第 170、180 行）**
+  `$view->renderString($webhook->payloadTemplate, ['event' => $e])` —— source 是管理员在 CP 配置的模板字符串，sink 是 Twig `renderString`。Craft 的 `renderString` 默认在受限的 Twig 环境中运行且仅限有 CP 权限的管理员配置，属受信配置而非外部输入；不构成可利用注入。
+
+- **流 B：header 值 → HTTP 头（第 205–224 行）**
+  header 值经 `App::parseEnv` + `renderString` 后，用 `preg_split('/[\r\n]+/')` 拆行并 trim（第 211 行），有效阻断了 CRLF 头注入；Guzzle 也禁止非法头。防御有效。
+
+- **流 C：webhook URL → Guzzle 请求（SSRF）—— 关键问题**
+  - source：第 235–238 行，`$url = App::parseEnv($webhook->url)` 后再经 `renderString($url, ['event' => $e])` 渲染；
+  - 中转：第 247 行 `$this->request(...)` 将其写入 `{{%webhookrequests}}` 表；
+  - sink：第 425 行附近 `sendRequest()` 中 `->request($data['method'], $data['url'], $options)`，method/url 均直接取自 DB（第 406 行），**无任何 scheme/host 白名单或黑名单校验**。
+  - 防御评估：全文未发现对 URL 目标的任何校验（无内网 IP 过滤、无协议限制）。任何能访问 CP 且拥有 webhook 管理权限的用户（或能写入该表/篡改配置者）可将 URL 指向 `http://169.254.169.254/`、`http://localhost:xxxx/` 等内部服务，形成 **CWE-918 SSRF**。响应状态码、头与体还会被存入 activity 页面（第 438–443 行），造成内网信息回显泄露。
+
+- **流 D：debounce 更新路径（第 315–330 行）**
+  按 debounceKey 复用 pending 记录并更新 url/body，mutex 锁（`_lockRequest`）防并发竞态，逻辑上无注入（参数化查询）。
+
+- **流 E：`toArray()`（第 466–495 行）**
+  有深度限制和敏感字段 redaction，且输入来自事件对象而非请求参数，风险低。
+
+**第二入口/替代通道**：`request()` 是 public 方法，其他插件代码可直接调用传入任意 url/method，最终同样汇入第 425 行的 Guzzle sink，进一步扩大流 C 的可达性。SQL 全程使用 Query/Db 助手参数化，未见注入。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-918 (SSRF), 附带潜在 CWE-1336 (表达式语言注入)",
+  "risk_level": "high",
+  "source": "line 235-238: $url = App::parseEnv($webhook->url) 经 renderString 渲染, 以及 line 170/180 的 payloadTemplate/header 模板",
+  "sink": "line 425: Craft::createGuzzleClient()->request($data['method'], $data['url'], $options)",
+  "explanation": "webhook 的 method/url/headers/payloadTemplate 存于数据库并由具备 CP 权限的用户配置, 第 247 行将其写入 webhookrequests 表, 队列任务调用 sendRequest 时在第 425 行原样发起 HTTP 请求。全文未对目标 URL 做 scheme 或主机校验(无内网地址过滤), 可指向 localhost/云元数据等内部端点; 且响应状态码/头/体被持久化并在 Activity 页展示(第 438-443 行), 造成内网信息回显。renderString 对模板的渲染也允许配置者借助 Twig 表达式探测环境变量, 属设计信任边界过宽",
+  "fix_suggestion": "line 425 前增加出站请求校验: 仅允许 http/https 协议, 解析主机并拒绝环回/私有/链路本地 IP 段(如 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)及重定向后的目标, 并提供可配置的域名白名单"
+}
+```

@@ -1,0 +1,40 @@
+# 逐行分析（Pillow `ImageFilter.py`）
+
+## 一、入口点枚举
+
+本文件是纯库模块，**没有任何网络路由、CLI 参数、文件读取、环境变量读取或回调注册入口**。所有可被外部影响的输入只有两类：
+
+1. **构造函数参数**：`Kernel.__init__`（size/kernel/scale/offset）、`RankFilter.__init__`、`MedianFilter/MinFilter/MaxFilter.__init__`、`ModeFilter.__init__`、`GaussianBlur.__init__`、`BoxBlur.__init__`、`UnsharpMask.__init__`、`Color3DLUT.__init__`；
+2. **类方法回调参数**：`Color3DLUT.generate(size, callback, ...)` 与 `Color3DLUT.transform(callback, ...)`。
+
+## 二、逐函数 source→sink 验证
+
+1. **`BuiltinFilter.filter`（约第 41–45 行）**：`filterargs` 由子类硬编码常量（第 224–317 行的 BLUR…SMOOTH_MORE）或经 `Kernel.__init__` 校验后设置。`Kernel.__init__` 第 66–68 行校验 `size[0]*size[1] == len(kernel)`，随后传入 C 层 `image.filter()`。kernel 数值本身可为任意 float，但 C 端按数值卷积处理，不构成内存越界——这是设计允许的数学输入。无漏洞。
+2. **`RankFilter.__init__`（第 84–92 行）**：显式校验奇数 size 和 `0 <= rank < size*size`，防御有效且为白名单式范围检查（非黑名单）。sink 为 `image.rankfilter(self.size, self.rank)`（第 100 行），已约束。无漏洞。
+3. **`MedianFilter/MinFilter/MaxFilter`（第 105–140 行）**：委托 RankFilter 校验。无漏洞。
+4. **`ModeFilter`（第 145–158 行）**：`self.size` 未校验直接传给 `image.modefilter`，但负数/零在 C 层返回错误；这是库 API 的正常健壮性范畴，非安全边界。无安全漏洞。
+5. **`GaussianBlur.filter` / `BoxBlur`（第 163–207 行）**：`BoxBlur.__init__` 第 190–194 行校验半径非负；负值抛 ValueError。无漏洞。
+6. **`UnsharpMask`（第 210–231 行）**：radius/percent/threshold 直接透传 C 层，均为数值运算参数。无漏洞。
+7. **内置卷积核常量（第 224–317 行）**：全部字面量，无 source。无漏洞。
+8. **`Color3DLUT.__init__`（第 320–405 行）**：
+   - channels 白名单校验 `(3, 4)`（第 330 行）；
+   - `_check_size`（第 397–405 行）强制每维 ∈ [2, 65]，防止超大表导致内存耗尽——有效防御；
+   - 表长度校验 `len(table) != items * channels`（第 388–395 行），保证与 size 匹配后才赋给 `self.table`；
+   - sink `image.color_lut_3d(...)`（第 449–455 行）收到的 table 已被长度校验约束。
+   无漏洞。
+9. **`Color3DLUT.generate`（第 408–441 行）**：callback 是调用者显式传入的可调用对象——库代码调用调用者提供的函数是正常的 API 契约，不构成“回调注入”漏洞（不存在将不可信字符串 eval/exec 的路径）。无漏洞。
+10. **`Color3DLUT.transform`（第 444–489 行）**：同上，callback 由调用方提供；channels 有白名单校验（第 461–463 行）。无漏洞。
+
+## 三、第二入口与替代通道
+
+- 文件无 I/O、无反序列化（无 pickle/yaml/eval/exec/os.system/subprocess）、无 SQL、无路径拼接、无环境变量。
+- 唯一跨边界 sink 是 C 扩展调用（`image.filter/rankfilter/modefilter/gaussian_blur/box_blur/unsharp_mask/color_lut_3d`），所有数值参数均经范围校验或为设计上允许的任意浮点。
+- `_copy_table=False` 隐藏 kwarg 仅影响性能（是否拷贝表），不影响内存安全语义。
+
+## 四、结论
+
+通读全文后，本文件是 Pillow 的纯算法过滤器定义模块，所有外部可控输入均有有效的范围/类型校验，不存在可利用的 source→sink 漏洞数据流。我不能为了迎合预设结论而虚构一个不存在的漏洞——基于全文证据，诚实的结论如下：
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "None", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文逐一核查了 Kernel/RankFilter/MedianFilter/MinFilter/MaxFilter/ModeFilter/GaussianBlur/BoxBlur/UnsharpMask/各内置核常量以及 Color3DLUT 的 __init__/generate/transform/filter。该文件是 Pillow 纯算法库模块，无路由、无文件 IO、无环境变量、无反序列化、无 eval/exec 等 sink。所有进入 C 扩展的数值参数均被有效校验：RankFilter 在第 84-92 行做奇偶与 rank 范围白名单检查；BoxBlur 在第 190-194 行拒绝负半径；Color3DLUT._check_size 在第 397-405 行把每维限制在 [2,65] 并在第 388-395 行校验表长度等于 items*channels 后才传入 image.color_lut_3d。generate 与 transform 接受的 callback 是调用方显式传入的函数对象，属正常 API 契约而非注入点。未发现任何可利用的 source 到 sink 数据流。", "fix_suggestion": "无需修复；如需加固，可在 ModeFilter.__init__ 与 UnsharpMask.__init__ 中补充对 size/radius 的非负与上限校验以增强健壮性。"}
+```

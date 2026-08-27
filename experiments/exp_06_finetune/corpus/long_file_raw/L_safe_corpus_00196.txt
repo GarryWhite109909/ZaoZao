@@ -1,0 +1,21 @@
+## 编号分析
+
+1. **入口点枚举（全文）**
+   - 第 108–112 行：`ProcessMergeDriver.merge` 接收 `ancestor/ours/theirs/path/marker_size`，其中 `path` 可来自仓库索引/tree 条目（攻击者可通过恶意仓库控制任意字节文件名）。
+   - 第 197–205 行：`MergeDriverRegistry.get_driver` / `_create_from_config` 从 git 配置读取 `merge.<name>.driver` 命令字符串——这是设计上的“受信任配置”来源（与 git 自身行为一致），但若攻击者能写配置则直接 RCE，属既有威胁模型。
+   - 第 214–226 行：全局注册表单例，config 可被后续调用替换。
+
+2. **source→sink 数据流验证**
+   - sink：第 141–146 行 `subprocess.run(cmd, shell=True)`。
+   - `%O/%A/%B/%L`：来自临时目录与整数 marker_size，安全。
+   - `%P`：第 133–138 行经 `_shell_quote(path)` 引用；POSIX 路径用 `shlex.quote`（第 27 行）有效。注释声称修复了 CVE-2026-42563。
+   - **Windows 分支缺陷**：第 22–26 行 `_shell_quote` 在 win32 下采用 `'"' + value.replace('"', '""') + '"'`。cmd.exe 并不把 `""` 视为引号转义——双引号在解析时按开/闭切换处理。因此包含 `"` 的路径可闭合引用并注入命令（如 `x" & calc & "`）。Git 允许 tree/index 条目含 `"` 字节，恶意仓库合并时可触发。
+   - 另一残留问题：Windows 下路径中的 `%VAR%` 会被 cmd 展开为环境变量，属次要信息泄露面。
+
+3. **第二入口/替代通道**：`register_driver/register_factory` 为编程 API，非外部输入通道；配置驱动命令本身执行是 git 语义的设计行为。
+
+4. **结论**：POSIX 上防御有效；但 Windows 的 `_shell_quote` 引用方案对含双引号的 `%P` 路径无效，构成命令注入残留漏洞（CVE-2026-42563 修复不完整）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "command_injection", "risk_level": "high", "source": "merge() 的 path 参数（可来自恶意仓库的 tree/index 条目文件名，第 108-112 行）", "sink": "subprocess.run(cmd, shell=True)（第 141-146 行）", "explanation": "代码在第 133-138 行对 %P 占位符调用 _shell_quote 以修复 CVE-2026-42563，但 Windows 分支（第 22-26 行）使用 双引号包裹加内部双引号翻倍 的方式，而 cmd.exe 不将 "" 解释为转义引号，而是按开闭切换解析。当攻击者构造的仓库中文件名包含双引号字符（git 允许路径含任意字节）并在 Windows 上触发合并驱动时，路径可闭合外层引号并注入任意命令，例如 path 为 x\" & calc & \" 时拼接后的命令会被 cmd 拆分执行。此外 Windows 下路径中的 %VAR% 还会被 cmd 做环境变量展开。POSIX 分支的 shlex.quote 是有效的，漏洞仅影响 Windows 平台。", "fix_suggestion": "在 Windows 上放弃手工拼引用的方案：优先使用 subprocess.list2cmdline 配合不含 shell 的调用方式，或使用经过验证的 Windows 参数转义实现（正确处理反斜杠与双引号序列），并对路径中出现的百分号做转义或拒绝；最稳妥的做法是将 %P 写入临时文件并把该临时文件路径传给命令，避免原始路径进入命令行。"}
+```

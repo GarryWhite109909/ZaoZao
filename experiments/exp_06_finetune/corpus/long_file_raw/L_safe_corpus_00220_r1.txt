@@ -1,0 +1,40 @@
+## 编号分析（全文逐函数）
+
+**1. 环境变量读取（第 15–18 行）**
+`OAUTH_CLIENT_ID/SECRET/SCOPES`、`OPENID_PROVIDER_URL` 均来自环境变量，仅在 Space 部署环境中由平台注入，非用户可控输入。无直接 sink。
+
+**2. `attach_oauth`（第 21–49 行）**
+- 第 26–27 行：根据 `get_space()` 选择真实或 mock 路由。
+- 第 38–45 行：SessionMiddleware 的 secret 由 `OAUTH_CLIENT_SECRET` 派生（sha256），非硬编码密钥；`https_only=True`、`same_site="none"`（iframe 场景所需）。cookie 有签名保护。
+
+**3. `_add_oauth_routes`（第 52–137 行）——真实 OAuth 路由**
+- `/login/huggingface`（第 71–76 行）：redirect_uri 由 `_generate_redirect_uri` 生成；在 Space 中强制为 `https://{SPACE_HOST}/login/callback`（见第 6 点），host 来自环境变量而非请求，攻击者无法注入任意 host。
+- `/login/callback`（第 79–127 行）：token 获取由 authlib `authorize_access_token` 完成，含 state 校验（MismatchingStateError 分支只是重试逻辑）。`_nb_redirects` 经 `int()` 转换（第 97 行），仅控制重定向次数上限（`MAX_REDIRECTS=2`），最终跳转到固定的 `https://{SPACE_HOST}` + login_uri，login_uri 只含数值与 urlencode 后的 target，且后续仍会经过 `_redirect_to_target` 清洗。
+- `/logout`（第 130–133 行）：仅清除 session 键，然后走 `_redirect_to_target`。
+
+**4. `_add_mocked_oauth_routes`（第 140–176 行）——本地 mock 路由**
+- 仅当 `get_space() is None`（本地开发）时注册；`/login/callback` 直接写入开发者本人机器上的 `whoami()` 信息。此为已知的有意设计（本地调试用），生产 Space 中不存在该路由，不构成可利用漏洞。
+
+**5. `_generate_redirect_uri`（第 179–201 行）**
+- 第 180–184 行：`_target_url` 取自查询参数（source：用户输入），但只作为 **query 参数值** 嵌入 redirect_uri，经 `urlencode` 编码，不会改变 URL 的 host/path 结构。
+- 第 186–194 行：Space 中 host 强制取自 `SPACE_HOST` 环境变量（并 split 处理自定义域名列表），用户无法控制重定向目标主机。
+
+**6. `_redirect_to_target`（第 204–215 行）——关键 sink 分析**
+- source：`request.query_params.get('_target_url')`（第 206 行），完全用户可控。
+- sink：`RedirectResponse(safe_target)`（第 215 行）。
+- 防御验证：第 207–214 行使用 `urllib.parse.urlparse(target)` 解析后**只保留 `parsed.path`**，scheme 与 netloc 被丢弃，因此 `//evil.com`、`https://evil.com`、`javascript:` 等开放重定向 payload 均被剥离为纯路径；path 以 `/` 开头时不会跳离当前域。query/fragment 虽被保留，但它们附着在同源路径之后，不能构成跨域重定向。该防御是结构性的（白名单式只取 path），非黑名单/正则，视为有效。
+- 边界情况：若 path 为空则回退到 `/`（第 208 行 `or '/'`），无绕过空间。
+
+**7. `OAuthProfile` / `OAuthToken` / `_get_mocked_oauth_info`（第 218–316 行）**
+- 数据类仅做字典包装，无网络/文件 sink。
+- `_get_mocked_oauth_info` 使用本机 token 调 `whoami()`，数据写入 session cookie（签名保护），不外泄给第三方。
+
+**8. 第二入口与替代通道核查**
+- 全部三个路由（login、callback、logout）的出站重定向最终都收敛到 `_redirect_to_target` 或固定 SPACE_HOST 前缀，无遗漏的 raw `RedirectResponse(request.query_params[...])`。
+- 无文件读写、命令执行、SQL、eval 等 sink；session cookie 由签名中间件保护，伪造 `oauth_info` 需要知道 secret。
+
+**结论**：唯一的用户可控 source→sink 流（`_target_url` → RedirectResponse）已被结构性防御（urlparse 后仅取 path）有效阻断；其余重定向目标均锚定环境变量中的 SPACE_HOST。未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文共三组路由入口（/login/huggingface、/login/callback、/logout，含真实与mock两套）。唯一用户可控的重定向参数 _target_url 在 _redirect_to_target 中经 urlparse 解析后仅保留 path 部分，scheme 与 netloc 被丢弃，开放重定向被结构性阻断；Space 环境下其余重定向 host 均锚定环境变量 SPACE_HOST。mock 路由仅在本地开发注册，属有意设计。session cookie 由签名中间件保护，无其他危险 sink。", "fix_suggestion": "no fix needed"}
+```

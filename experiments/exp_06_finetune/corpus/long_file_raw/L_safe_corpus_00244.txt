@@ -1,0 +1,44 @@
+# 编号分析
+
+**1. StarredReposOptions / ToConds（第 17–44 行）**
+- 数据流：StarrerID、RepoOwnerID、IncludePrivate、Actor → SQL 条件。
+- 所有值均通过 `builder.Eq` 参数化绑定，无字符串拼接，无注入面。
+- 权限控制：`IncludePrivate=true` 时强制叠加 `AccessibleRepositoryCondition(opts.Actor, ...)`（第 33 行），私有仓库仅对仍有权限的 Actor 可见；`ApplyPublicOnly`（第 27–30 行）在公开接口场景下强制关闭 IncludePrivate。防御有效。
+
+**2. GetStarredRepos（第 55–57 行）**
+- 仅调用 `db.Find[Repository](ctx, opts)`，条件完全来自 `ToConds()`，无额外 sink。无漏洞。
+
+**3. WatchedReposOptions / ToConds（第 59–92 行）**
+- 与 Starred 结构对称：参数化 Eq + 私有仓库权限门控（第 76–81 行）+ `watch.mode != WatchModeDont` 过滤。防御有效。
+
+**4. GetWatchedRepos（第 100–103 行）**
+- `db.FindAndCount`，同上，无注入或越权路径。
+
+**5. GetRepoAssignees（第 105–145 行）**
+- 输入仅为内部 `repo *Repository` 对象（非用户可控 source）。
+- 第 114–117 行：access 表查询使用占位符 `repo_id = ? AND mode >= ?`。
+- 第 122–127 行：组织团队查询走封装函数。
+- 第 132–136 行：`e.In("id", uniqueUserIDs.Values())` 为参数化 IN 查询；ID 集合来源于数据库自身 access 表与团队表，非外部输入。
+- 无用户输入到达 SQL 的路径。
+
+**6. GetIssuePostersWithSearch（第 148–170 行）**
+- Source：`search` 字符串（用户可控搜索词）——这是全文唯一的外部可控输入。
+- Sink：SQL 查询（第 158–168 行）。
+- 数据流验证：
+  - 第 161 行 `builder.Like{"lower_name", strings.ToLower(search)+"%"}` —— xorm builder.Like 将值作为参数绑定，非拼接；
+  - 第 162 行 `db.BuildCaseInsensitiveLike("full_name", "%"+search+"%")` —— 同样是列名常量 + 参数化值；
+  - 列名/表名均为硬编码字面量（`lower_name`、`full_name`、`poster_id`、`issue`），search 只进入 value 位。
+  - LIKE 通配符（`%`、`_`）未转义，但仅影响搜索结果匹配范围，不构成 SQL 注入或信息泄露（结果仍限定于该 repo 的 issue poster 且 Limit 30、只返回公开展示字段 id/name/full_name/avatar）。
+- 结论：search 到 SQL 是参数化安全流，通配符问题为低危可用性细节而非漏洞。
+
+**7. 第二入口/替代通道检查**
+- 文件内无 HTTP 路由、无文件 IO、无环境变量读取、无回调注册；所有函数均为模型层纯数据访问，入口由上层 service/webhandler 决定，本文件未引入新的攻击面。
+- 全文无 `fmt.Sprintf` 拼 SQL、无 `Where(string)` 原始字符串接收外部输入。
+
+# 结论
+
+全文所有 source→sink 流均经参数化查询，私有仓库访问有 AccessibleRepositoryCondition 门控，无注入、无越权泄露路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文逐一核查：StarredReposOptions.ToConds(第33行)与WatchedReposOptions.ToConds(第76-81行)对私有仓库均强制叠加AccessibleRepositoryCondition权限门控，且ApplyPublicOnly可在公开场景强制仅公开仓库；GetRepoAssignees(第114-136行)全部使用占位符与参数化IN查询，输入源自数据库内部；GetIssuePostersWithSearch中唯一外部输入search经builder.Like与BuildCaseInsensitiveLike以参数绑定方式进入SQL，列名为硬编码字面量，不存在SQL注入；LIKE通配符未转义仅影响模糊匹配范围，不构成可利用漏洞。文件内无路由、文件、环境变量等第二入口。", "fix_suggestion": "no fix needed"}
+```

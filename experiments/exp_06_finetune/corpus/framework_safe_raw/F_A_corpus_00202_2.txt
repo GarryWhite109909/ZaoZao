@@ -1,0 +1,59 @@
+LANG: java
+```code
+package com.example.ghost.controller;
+
+import org.springframework.stereotype.Controller;
+import org.springframework.ui.Model;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.owasp.html.PolicyFactory;
+import org.owasp.html.Sanitizers;
+
+@Controller
+@RequestMapping("/admin/posts")
+public class PostHistoryController {
+
+    private final JdbcTemplate jdbc;
+    private static final PolicyFactory HTML_POLICY =
+        Sanitizers.FORMATTING
+            .and(Sanitizers.LINKS)
+            .and(Sanitizers.BLOCKS)
+            .and(Sanitizers.TABLES);
+
+    public PostHistoryController(JdbcTemplate jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    // 查看历史修订：将数据库中存储的 revision html 净化后注入模板
+    @GetMapping("/{postId}/history")
+    public String history(@PathVariable Long postId, Model model) {
+        var revisions = jdbc.queryForList(
+            "SELECT id, title, html FROM post_revisions WHERE post_id = ? ORDER BY created_at DESC", postId);
+        revisions.forEach(r -> r.put("html", HTML_POLICY.sanitize((String) r.get("html"))));
+        model.addAttribute("revisions", revisions);
+        return "post-history"; // Thymeleaf 模板中改用 th:text 渲染净化后的内容，utext 仅用于已净化字段
+    }
+
+    // 恢复修订：把 staff 用户提交的 revision html 经白名单净化后写回当前帖子的正文
+    @PostMapping("/{postId}/restore")
+    @ResponseBody
+    public String restore(@PathVariable Long postId, @RequestParam("revisionId") long revisionId) {
+        String html = jdbc.queryForObject(
+            "SELECT html FROM post_revisions WHERE id = ? AND post_id = ?", String.class, revisionId, postId);
+        // OWASP HtmlPolicyBuilder 白名单净化后再持久化，存储型 XSS 载荷被剥离
+        String safeHtml = HTML_POLICY.sanitize(html);
+        jdbc.update("UPDATE posts SET html = ? WHERE id = ?", safeHtml, postId);
+        return "restored";
+    }
+}
+```
+
+1. 第 21 行 `history` 与第 33 行 `restore` 的用户可控输入点：`@PathVariable Long postId`（Spring 自动绑定为 Long，类型安全）、`@RequestParam("revisionId") long revisionId`；真正的攻击载荷来自数据库中存储的 `html` 字段（第 25、35 行读出），属于存储型 XSS 的间接可控源。
+2. 主链 sink 一：第 27 行 `model.addAttribute("revisions", ...)` → Thymeleaf `th:utext` 原样输出。修复在第 26 行插入 `HTML_POLICY.sanitize(...)`，在数据进入 Model 之前完成白名单净化（位置正确——覆盖所有渲染前路径）；OWASP Sanitizers 只保留格式化/链接/块级/表格标签并强制属性白名单，`<script>`、`onerror=` 等事件属性被结构性剥离，类型正确。
+3. 主链 sink 二：第 39 行 `jdbc.update("UPDATE posts SET html = ? ...")` 将未净化 HTML 持久化为帖子正文，其他 staff 打开帖子即触发存储型 XSS。修复在第 38 行新增 `safeHtml = HTML_POLICY.sanitize(html)` 并以 `safeHtml` 入库，净化点位于持久化之前，堵住存储通道。
+4. 攻击面覆盖完整性：两条数据流共用同一 `post_revisions.html` 源，均通过同一个 `PolicyFactory` 白名单实例净化，不存在绕过另一条流的旁路；SQL 注入面原本已由参数化查询（第 24、36、39 行的 `?` 占位符）覆盖，保持不变。
+5. 第二入口检查：类中仅 `history` 与 `restore` 两个端点，无其他读取/写入 `posts.html` 或 `post_revisions.html` 的通道；模板注释同步改为建议对净化后内容使用 `th:text` 或仅在确认净化时使用 `utext`，避免渲染层回退引入新漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码存在两条 CWE-79 存储型 XSS 数据流：流一为 post_revisions.html 经 history 端点 model.addAttribute 进入 Thymeleaf th:utext 原样渲染；流二为 restore 端点将未净化 html 直接 UPDATE 进 posts 正文导致其他 staff 打开帖子时触发；两条流均已通过 OWASP HtmlSanitizer 白名单策略在渲染前与持久化前统一净化修复；SQL 层原有参数化查询保持不变", "fix_suggestion": "line 26: 对 revisions 中每条 html 字段执行 HTML_POLICY.sanitize 白名单净化; line 38-39: 新增 safeHtml = HTML_POLICY.sanitize(html) 并以净化结果入库"}
+```

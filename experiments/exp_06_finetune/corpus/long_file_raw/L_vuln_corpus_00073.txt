@@ -1,0 +1,39 @@
+## 编号分析
+
+1. **构造函数（第 44–57 行）**：依赖注入，无用户输入，无风险。
+
+2. **arrayToUser（第 59–72 行）**：数组转 User 对象，无 SQL 拼接。
+
+3. **getOneByName（第 74–86 行）**：`$name`、`$password` 拼入 SQL，但均经过 `dbService->escape()` 且用单引号包裹，属于参数化之外的转义防御；`$name` 还作为缓存键（第 76 行），仅影响缓存命中，无注入。**基本有效**（escape 为数据库驱动转义）。
+
+4. **getOneByEmail（第 88–92 行）**：同上，`$mail`/`$password` 均经 escape 后拼接，防御有效。
+
+5. **getAll（第 94–110 行）——关键漏洞点**：
+   - **source**：第 94 行 `$dbFields` 参数完全由调用方控制，无任何白名单校验；
+   - 第 105 行 `$selectDefinition = empty($dbFields) ? '*' : implode(', ', $dbFields);`
+   - **sink**：第 109 行 `"select $selectDefinition from {$prefix}users order by name"` —— 数组元素**未经任何转义或过滤**直接拼入 SQL；
+   - 另外 `{$prefix}` 来自参数 `user_table_prefix` / `table_prefix`（第 97–101 行），来自配置文件而非请求，通常不可控，但若配置可被覆盖同样是注入点。
+   - 攻击者若能通过任何入口（如 API、action 参数）传入 `$dbFields`，可注入如 `name FROM users UNION SELECT password...--` 等任意 SQL。这是典型的 CWE-89。
+
+6. **create（第 118–178 行）**：所有插入字段（name/email/motto/password 等）均经 `escape()` 包裹在引号内；密码先 hash 再 escape。防御有效。
+
+7. **update（第 190–230 行）**：
+   - 第 194–204 行对键名做**白名单过滤**（in_array 固定列表），键名安全；
+   - 值经 `escape()` 后拼入（第 216 行），有效。
+   - 注意第 219–221 行 WHERE 中用双引号包裹 escape 结果——MySQL 默认模式下双引号为字符串，但 ANSI_QUOTES 模式下会被当作标识符导致逻辑错误（非注入）。
+
+8. **delete（第 238–255 行）**：`$user['name']` 经 escape，有效。
+
+9. **groupsWhereIsMember / isInGroup（第 263–288 行）**：委托 AclService->check，无直接 SQL。
+
+10. **upgradePassword（第 305–331 行）**：新哈希与 name/email/旧密码均经 escape，且哈希值字符集受限，有效。
+
+11. **refreshUser / loadUserByUsername / loadUserByIdentifier（第 353–383 行）**：转发至 getOneByName，同第 3 点，有转义。
+
+12. **废弃代理方法（第 386–407 行）**：转发 AuthController，本文件内无 sink。
+
+**第二入口核查**：`getAll` 的 `$dbFields` 是唯一无防御的 source；其余路径均有 escape 或白名单。文件内未直接暴露 HTTP 入口，但该服务方法被控制器/action 调用（开源项目中存在调用方），一旦 `$dbFields` 可被请求参数影响即为可达注入。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "high", "source": "line 94: getAll 的 $dbFields 参数（调用方可控时为外部输入）", "sink": "line 105 与 line 109: implode 后的 $selectDefinition 未做任何转义直接拼入 select 语句", "explanation": "getAll 接收 $dbFields 数组 -> 第 105 行 implode(', ', $dbFields) 生成 $selectDefinition -> 第 109 行直接拼接进 'select ... from users order by name' 执行 -> 数组元素无白名单、无 escape、无类型校验，攻击者可通过注入子查询/UNION 实现任意 SQL 读取；对比同文件其他函数（getOneByName/create/update/delete/upgradePassword）均使用 dbService->escape 或固定键白名单，唯独此处完全缺失防御", "fix_suggestion": "line 94: 对 $dbFields 做严格白名单校验，例如只允许 User::PROPS_LIST 中定义的列名（preg_match('/^[a-z_]+$/') 加 in_array 白名单双重校验），或将 getAll 改为不接受动态列参数、内部固定列清单"}
+```

@@ -1,0 +1,90 @@
+LANG: go
+```go
+package main
+
+import (
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// 插件管理服务：从用户指定的 URL/名称下载并安装插件到插件根目录
+var pluginRoot = "/srv/app/plugins"
+
+// 白名单精确允许集：仅允许已注册的合法插件名
+var allowedPlugins = map[string]bool{
+	"core":     true,
+	"auth":     true,
+	"logging":  true,
+	"metrics":  true,
+}
+
+func isValidPluginName(name string) bool {
+	if !allowedPlugins[name] {
+		return false
+	}
+	if strings.ContainsAny(name, "/\") || name == "." || name == ".." {
+		return false
+	}
+	return true
+}
+
+func installHandler(w http.ResponseWriter, r *http.Request) {
+	// source：外部输入 —— 插件名直接来自查询参数
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "missing plugin name", http.StatusBadRequest)
+		return
+	}
+	// 防御：白名单精确允许集校验，拒绝路径穿越字符
+	if !isValidPluginName(name) {
+		http.Error(w, "invalid plugin name", http.StatusBadRequest)
+		return
+	}
+
+	resp, err := http.Get("https://registry.example.com/plugins/" + name + ".zip")
+	if err != nil {
+		http.Error(w, "download failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	dest := filepath.Join(pluginRoot, name+".zip")
+	f, err := os.Create(dest)
+	if err != nil {
+		http.Error(w, "create failed", http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+	io.Copy(f, resp.Body)
+	w.WriteHeader(http.StatusOK)
+}
+
+func listHandler(w http.ResponseWriter, r *http.Request) {
+	// 第二入口：同样以未校验的参数读取任意路径下的"插件清单"
+	name := r.URL.Query().Get("name")
+	data, err := os.ReadFile(filepath.Join(pluginRoot, name, "manifest.json"))
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Write(data)
+}
+
+func main() {
+	http.HandleFunc("/plugins/install", installHandler)
+	http.HandleFunc("/plugins/list", listHandler)
+	http.ListenAndServe(":8080", nil)
+}
+```
+
+1. 第 24 行与第 55 行：用户可控输入点为 `r.URL.Query().Get("name")`，分别流入 `installHandler` 与 `listHandler`。
+2. 第 30-33 行（installHandler）：在 sink `os.Create(filepath.Join(pluginRoot, name+".zip"))`（第 42-43 行）之前插入白名单精确允许集校验。类型正确性：`map[string]bool` 精确匹配完整插件名，任何含 `/`、`\`、`..` 的输入都不可能在集合中命中；位置正确性：校验位于 source 之后、`http.Get` 拼接与文件写入之前，同时阻断了 URL 路径注入与文件系统写入两条下游流。
+3. 攻击面覆盖完整性：`filepath.Join` 无法防御绝对路径或 `..` 穿越（Join 会清理但保留逃逸语义），白名单从源头消除所有非注册名，覆盖 `../../etc/passwd`、绝对路径、URL 编码穿越等全部变体。
+4. 第二入口检查结论：第 57 行 `listHandler` 中 `os.ReadFile(filepath.Join(pluginRoot, name, "manifest.json"))` 是同源同型漏洞的第二数据流（source 第 55 行 → sink 第 58 行），本次按 minimal pair 局部对照性要求保持原样，仅修复目标数据流；生产部署时应对其应用相同的 `isValidPluginName` 校验。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码存在 CWE-22 路径穿越：主链为 installHandler 中查询参数 name 直接拼接进 http.Get URL 并经 filepath.Join 写入 os.Create;第二链为 listHandler 中同名参数直接拼接进 os.ReadFile 读取任意 manifest.json;修复采用白名单精确允许集 allowedPlugins 在 sink 前校验插件名，阻断穿越字符与未注册名称，属于有效防御而非黑名单过滤;第二入口 listHandler 按 minimal pair 要求保持原样未修改", "fix_suggestion": "line 30: 在 dest 构造前插入 if !isValidPluginName(name) { http.Error(...); return } 白名单校验"}
+```

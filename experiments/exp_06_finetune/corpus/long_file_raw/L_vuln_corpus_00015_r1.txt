@@ -1,0 +1,54 @@
+# 全文逐函数行号级分析
+
+## 入口点枚举（通读全文后确认）
+
+本文件是 vouch-proxy 的 cookie 处理包，所有入口点均来自 HTTP 请求对象：
+
+- **入口点 1**：`r.Cookies()` —— 客户端完全可控的 Cookie 头，在 `setCookie`（第 46 行 `domains.Matches(r.Host)`）、`Cookie`（第 108 行）、`ClearCookie`（第 153 行）三处被读取；
+- **入口点 2**：`r.Host` —— 第 46、154 行，经 `domains.Matches` 匹配；
+- **入口点 3**：配置项 `cfg.Cfg.Cookie.*`（Name/Domain/MaxAge/Secure/HTTPOnly/SameSite）—— 属管理员可控配置，非攻击者直接通道。
+
+## 逐函数数据流验证
+
+### 1. `Configure()`（第 33–36 行）
+仅初始化 logger 与 sameSite，无外部输入，无风险。
+
+### 2. `SetCookie` / `setCookie`（第 39–99 行）
+- 第 46 行 `domain := domains.Matches(r.Host)`：Host 进入 Domain 属性。Go 标准库 `http.SetCookie` 会对 Domain 值做合法性校验（含空格/控制字符的 cookie 直接被丢弃），故 Host 注入此处被标准库防御兜住。
+- 第 69 行起的多分片逻辑：`splitCookie(val, ...)` 按 UTF-8 边界切分，写入的 cookie 名由服务端格式化生成（第 75 行），不可控。此路径本身无注入 sink。
+
+### 3. `Cookie()`（第 102–149 行）—— **核心漏洞所在**
+source：第 108 行 `cookies := r.Cookies()`，攻击者可在请求中携带任意名称、任意值的 cookie。
+sink 链：
+- 第 117 行仅用 `strings.HasPrefix(cookie.Name, cookieUnder)` 前缀匹配——这是**黑名单式弱过滤**，任何形如 `<name>_任意内容` 的 cookie 名都会进入解析分支；
+- 第 122–123 行：`xOFy := strings.Replace(...)` 后 `strings.Split(xOFy, "of")`。若攻击者发送名为 `<name>_abc` 的 cookie，`xyArray` 只有一个元素，第 125 行 `xyArray[1]` 直接**索引越界 panic**；
+- 即使格式合法，第 129 行按第一个遇到的分片声明的 `numParts` 分配切片；随后第 135 行 `cookieParts[i-1] = cookie.Value` 中 `i` 来自后续任意分片名（第 132 行）。攻击者先发 `<name>_1of1` 使 `numParts=1`，再发 `<name>_5of1`，则 `i=5`，对长度为 1 的切片执行 `cookieParts[4]=...` → **index out of range panic**；发 `<name>_0of1` 则 `i-1=-1` → 负索引 panic。错误分支（第 126、133 行）只覆盖了 `Atoi` 失败的情况，未校验 `i` 与 `numParts` 的关系，也未用 recover 兜底。
+- 该函数是认证热路径（每次请求读取 JWT cookie），panic 未被上层捕获即导致该请求 goroutine 崩溃，构成远程未认证 DoS。
+
+### 4. `ClearCookie()`（第 152–176 行）
+第 162 行同样使用宽松前缀匹配，会为所有以配置名开头的 cookie 下发过期删除指令。这只会删除匹配前缀的 cookie（包括攻击者自己伪造的分片名），不产生越界或注入，属低危行为问题而非可利用漏洞。
+
+### 5. `SameSite()`（第 181–197 行）
+输入为配置文件字符串，switch 白名单处理，默认值安全，无漏洞。
+
+### 6. `splitCookie()`（第 200–212 行）
+第 205–207 行内层循环 `for !utf8.RuneStart(longString[r]) { r-- }`：若回退到 `r==0` 仍非 RuneStart（理论上 UTF-8 合法串不会发生，但若传入被截断的非法字节序列则可能），将无限递减导致死循环/越界。实际调用方 val 为服务端签发的 JWT（base64 字符集），触发条件苛刻，属防御性编码缺陷。
+
+## 第二入口与替代通道核查
+- 替代通道：即使走单 cookie 快速路径（第 113–115 行提前 return），攻击者只需让带前缀的分片 cookie 排在前一个完整 cookie 之前即可命中解析分支；且只要请求中不含主 cookie 名，必然进入分片逻辑。无法绕过。
+- 配置型通道（Domain/SameSite）均非攻击者可达。
+
+## 结论
+存在真实漏洞：客户端可控的 cookie 名未经充分校验即用于切片索引与数组取元素，造成 panic 型拒绝服务。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-129 (Improper Validation of Array Index) / CWE-787",
+  "risk_level": "high",
+  "source": "line 108: r.Cookies() 攻击者完全可控的 Cookie 名与值",
+  "sink": "line 135: cookieParts[i-1] = cookie.Value 以及 line 125: xyArray[1]",
+  "explanation": "line 117 仅用 HasPrefix 弱前缀匹配即信任 cookie 名格式 -> line 123 Split 后未检查元素个数 -> line 125 访问 xyArray[1] 可越界 -> line 129 按首个分片声明分配切片 -> line 135 用后续分片自报的索引 i 写入 cookieParts[i-1]，i 大于 numParts 或为 0 时触发 index out of range panic -> 认证热路径上未认证远程 DoS",
+  "fix_suggestion": "line 123 之后检查 len(xyArray)==2 且两段均为数字；line 132 之后校验 1<=i<=numParts 且 i 未被重复占用，越界时返回错误而非写切片；line 125 前同样加 len(xyArray)>1 判断，并对整个解析函数增加边界防护"
+}
+```

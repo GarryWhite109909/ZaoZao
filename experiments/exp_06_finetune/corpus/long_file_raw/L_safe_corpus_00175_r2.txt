@@ -1,0 +1,35 @@
+## 编号分析（全文逐函数）
+
+**1. 入口点枚举**
+- 第 44 行 `launchEditor(file, specifiedEditor, onErrorCallback)`：唯一导出入口。`file` 来自调用方（如 Vite/Webpack dev server 的错误覆盖层，最终源自浏览器端 HTTP 请求中的文件名），是典型外部 source；`specifiedEditor` 可被环境变量 `EDITOR` 影响（在 guess.js 中）。
+- 第 5–9 行引入 `fs/os/path/picocolors/childProcess/guess/get-args`，其中 `getArgumentsForPosition` 与 `guessEditor` 的返回值直接进入命令行拼接。
+
+**2. parseFile（第 33–42 行）**
+- 第 34 行用 `positionRE = /:(\d+)(:(\d+))?$/` 剥离行列号。lineNumber/columnNumber 只能是纯数字，安全；但 `fileName = file.replace(positionRE, '')` 对文件名主体不做任何字符白名单校验，`&`、`"`、`%`、空格等全部原样保留。
+
+**3. 存在性检查与 WSL 分支（第 47、60–67 行）**
+- 第 47 行 `fs.existsSync(fileName)` 仅确认文件存在，不构成命令注入防御。
+- 第 61–66 行 WSL 下转相对路径，不改变字符集。
+
+**4. 参数拼装（第 69–74 行）**
+- 第 71 行 `getArgumentsForPosition(editor, ...)` 返回的额外参数与第 73 行 `args.push(fileName)` 一样，均含未净化的 fileName。
+
+**5. 非 Windows 分支（第 116–118 行）**
+- 第 117 行 `childProcess.spawn(editor, args, {stdio:'inherit'})` 无 shell，参数不经 shell 解释，无注入面。
+
+**6. Windows 分支（第 76–115 行）——sink 所在**
+- 第 97–99 行 `escapeCmdArgs` 正则为 `/([&|<>,;=^])/g`。注释第 88 行声称要转义 `%`，但正则中根本没有 `%`！同时未转义 `"` 和 `!`。
+- 第 101–111 行 `doubleQuoteIfNeeded`：若字符串含 `^` 则用 `^"..."^` 包裹——但内部已有的双引号未被转义；若含空格则普通双引号包裹。
+- **绕过路径 A（引号逃逸）**：fileName 形如 `a" & calc & "b` 时，`&` 被转成 `^&`，但 `"` 原样保留。若字符串不含空格和 `^`，第 110 行原样返回，`"` 直接进入命令行可闭合/开启引号上下文；即便走引号分支，内部 `"` 也未被转义，可提前终止引用使后续内容回到 cmd 解析层。
+- **绕过路径 B（引号内脱字符失效）**：cmd 在双引号内部不把 `^` 当转义符。若 fileName 同时含空格与特殊字符（如 `x & calc y`），先被替换为 `x ^& calc y`，再因含空格整体加引号变成 `"x ^& calc y"`——引号内的 `^` 是字面量，一旦引号被上述 `"` 注入破坏，`^&` 即还原为命令分隔符。
+- **绕过路径 C（变量展开）**：`%PATH%` 类串未被转义，cmd 会做环境变量展开，可构造畸形展开结果。
+- 第 113–114 行 `childProcess.exec(launchCommand, {shell:true})`：source（HTTP 请求提供的文件名）→ sink（shell 执行）数据流成立，中间过滤（黑名单式正则 + 有缺陷的引号包裹）按规则视为可绕过。
+
+**7. 回调路径（第 119–133 行）**
+- 第 124、131 行仅将错误信息经 `console.log` 输出并回调，无 sink，无漏洞。
+
+**结论**：Windows 平台下存在由外部可控文件名到 `exec(shell:true)` 的命令注入，防御（escapeCmdArgs 漏掉 `%`/`"`/`!`，doubleQuoteIfNeeded 不转义内部引号且引号内 `^` 失效）无效。此问题对应 launch-editor 已知 GHSA 公告（Windows RCE）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "command_injection", "risk_level": "high", "source": "launchEditor 的 file 参数（第 44 行），实际来自开发服务器错误覆盖层接收的外部文件名请求", "sink": "第 113-114 行 childProcess.exec(launchCommand, {shell:true})，launchCommand 由第 106-107 行拼接", "explanation": "Windows 分支中 escapeCmdArgs（第 98 行）的正则 /([&|<>,;=^])/g 遗漏了注释声称要转义的百分号，也未处理双引号和感叹号；doubleQuoteIfNeeded（第 102-111 行）对字符串内部已有的双引号不作转义，而 cmd 在双引号内不把插入的脱字符当作转义符。攻击者可通过错误覆盖层提交形如包含双引号加 & 计算器命令的文件名，利用引号逃逸或引号内脱字符失效突破引用上下文，实现任意命令执行。非 Windows 分支使用 spawn 无 shell，不受影响；parseFile 提取的行列号仅为数字，安全。", "fix_suggestion": "改用 childProcess.spawn(editor, args, {shell:false}) 并以参数数组传递，彻底避免 shell 解析；或对文件名实施严格白名单校验，并在 Windows 上正确转义包括百分号、双引号在内的全部元字符后再拼接"}
+```

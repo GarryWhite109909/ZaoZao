@@ -1,0 +1,31 @@
+## 编号分析
+
+**入口点枚举（全文）：**
+1. `render(mobiledoc, options)`（第 62-64 行）— mobiledoc 由上层 API 提供，渲染经 kg-mobiledoc-html-renderer，未知卡片仅记录日志，无直接 sink。
+2. `populateImageSizes(mobiledocJson)`（第 88 行起）— 接收文章的 mobiledoc JSON 字符串（来自编辑器/导入内容），是主要攻击面。
+3. `htmlToMobiledocConverter` getter（第 66-85 行）— 仅 require 包，环境变量 `process.env.CI` 只控制计时输出，无数据流。
+4. `cards` getter 中 `canTransformImage(storagePath)`（第 22-27 行）— storagePath 来自存储适配器内部路径，非用户直接可控。
+
+**关键数据流：`populateImageSizes` 的 SSRF**
+- **Source**：第 91 行 `JSON.parse(mobiledocJson)` 后，第 96-97 行取出卡片 payload；第 99 行 `payload.src` 完全由提交文章内容的用户控制。
+- **分支判定（防御有效性验证）**：
+  - 第 100 行 `payload.src.match(/images\.unsplash\.com/)` — 正则黑名单式匹配，可绕过：如 `https://images.unsplash.com.evil.internal/x.jpg` 或 `https://images.unsplash.com@169.254.169.254/` 均匹配该正则但指向任意主机。视为无效防御。
+  - 第 101 行 `/^\/content\/images\//` 相对路径判断 — 只影响走哪个分支，不阻止外部 URL 进入 else 分支。
+- **Sink**：
+  - 第 103 行 `getUnsplashSize(payload.src)` → 第 78 行 `new URL(url)` + 第 84 行 `imageSize.getImageSizeFromUrl(parsedUrl.href)`；
+  - 第 105 行 `imageSize.getImageSizeFromUrl(payload.src)` — 服务端对任意用户提供的 URL 发起 HTTP 请求获取图片尺寸。
+- **影响**：攻击者构造 image 卡片，src 指向内网地址（如 `http://169.254.169.254/latest/meta-data/`、`http://localhost:2368/...`），服务器将发起请求。虽然响应只用于解析图片尺寸、错误被吞掉（第 110-112 行），无法直接回显响应体，但可通过响应时间差异/错误信息进行盲 SSRF 探测内网端口与元数据服务可达性。
+
+**第二入口/替代通道**：同一 `payload.src` 也进入第 104 行 `storageUtils.isLocalImage` 分支与 `getOriginalImageSizeFromStorageUrl`，该函数通常有本地路径校验，且相对路径限制较强；主要风险仍在外部 URL 分支。`render` 路径中卡片 payload 经白名单卡片工厂处理，未见额外 sink。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF)",
+  "risk_level": "medium",
+  "source": "line 99: payload.src, 用户在文章 image 卡片中完全可控的 URL",
+  "sink": "line 105 / line 84: imageSize.getImageSizeFromUrl 对该 URL 发起服务端 HTTP 请求",
+  "explanation": "populateImageSizes 解析用户提交的 mobiledoc, 取出 image 卡片的 payload.src; 第 100 行用正则 match(/images\\.unsplash\\.com/) 判断是否 Unsplash, 该黑名单可被 images.unsplash.com.evil.internal 或子域伪装绕过, 未匹配时落入第 105 行 getImageSizeFromUrl 直接请求任意 URL, 造成盲 SSRF, 可探测内网端口和云元数据端点",
+  "fix_suggestion": "line 100: 改用 URL 解析后严格校验 hostname 必须等于 images.unsplash.com 且协议为 https, 并对外部 URL 增加 SSRF 防护(禁止私网/环回/链路本地 IP 解析结果)"
+}
+```

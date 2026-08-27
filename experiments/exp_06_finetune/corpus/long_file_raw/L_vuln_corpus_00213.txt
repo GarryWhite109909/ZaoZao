@@ -1,0 +1,30 @@
+## 编号分析
+
+1. **第 44-63 行（构造函数）**：`$values` 来自表单定义（form JSON），其中 `label` 做了 `html_entity_decode`（第 49 行），反而**移除**了编码防御，label 后续在模板中输出可能构成存储型 XSS 的注入点之一；但 form 定义通常仅管理员可改，属低危。
+
+2. **第 118-124 行 `renderStaticIfPermitted`**：先 `canRead` 再渲染，ACL 检查存在。但注意：`renderStatic` 本身是 protected，子类或外部代码若直接调用 `renderStatic`（历史上 YesWiki 多处直接调用），会绕过该检查——第二入口风险。
+
+3. **第 156-161 行 `getValue()`**：关键 source。回退链为 `$entry[...] ?? $_REQUEST[$this->propertyName] ?? $default`。`$_REQUEST` 直接取用户输入，且键名由 `$this->propertyName`（来自 form 定义）决定。注释中作者自己写了 TODO 质疑其必要性。
+
+4. **第 165-172 行 `renderStatic`**：将 `getValue($entry)` 的结果作为 `'value'` 传入 twig 模板（sink）。若对应 twig 模板未开启自动转义或使用 `|raw`，`$_REQUEST` 中的 HTML/JS 将被反射输出 → **反射型/存储型 XSS**。
+
+5. **第 130-135 行 `formatValuesBeforeSave`**：同样调用 `getValue()`，即用户 POST 的 `$_REQUEST` 值会被写入条目并持久化。虽然第 113-127 行 `formatValuesBeforeSaveIfEditable` 有 `canEdit` 检查，但：
+   - 若字段未配置 `writeAccess`（第 143-149 行 `canEdit` 中 `empty($writeAcl)` 直接返回 true），任何可写条目的用户都能写入任意内容；
+   - 其他直接调用 `formatValuesBeforeSave` 的代码路径绕过 ACL。
+   存储后的值再经 `renderStatic` 输出 → **存储型 XSS 链**。
+
+6. **第 137-142 行死代码**：`return []` 永不可达，无安全影响但说明逻辑混乱。
+
+7. **第 205-219 行 `jsonSerialize`**：将 `read_acl`、`write_acl` 序列化输出。若该 JSON 通过 API 暴露给低权限用户，泄露访问控制策略信息（信息泄露，CWE-200），属次要问题。
+
+8. **第 96-104 行 `renderInputIfPermitted` / 第 175-181 行 `renderInput`**：有 `canEdit` 门卫，但 twig 渲染 `'value' => $this->getValue($entry)` 同样含 `$_REQUEST` 回退，编辑表单回显处亦可能 XSS。
+
+9. **替代通道核查**：全文无文件操作、SQL、命令执行 sink；主要风险集中在 `$_REQUEST` → twig 输出与持久化两条流。Twig 默认自动转义可缓解，但 YesWiki 部分 bazar 字段模板使用 `|raw`（如 map、list 字段），黑名单式依赖不构成有效防御。
+
+## 结论
+
+核心漏洞：`getValue()`（第 160 行）以 `$_REQUEST` 作为回退 source，未经净化流入 `renderStatic`/`formatValuesBeforeSave`（sink），配合部分模板的 raw 输出形成 XSS，并可绕过字段级读写 ACL 的预期语义。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 (XSS) / CWE-807 (授权逻辑依赖不可信输入)", "risk_level": "中高危", "source": "line 160: return $entry[$this->propertyName] ?? $_REQUEST[$this->propertyName] ?? $this->default;", "sink": "line 168-170: render() 将 getValue 结果传入 twig 模板; line 134: formatValuesBeforeSave 将其持久化", "explanation": "getValue 以 $_REQUEST 用户输入为回退来源 -> 未净化地传入 renderStatic 的 twig 渲染(部分 bazar 模板使用 raw 输出)导致反射型 XSS, 且经 formatValuesBeforeSave 写入条目造成存储型 XSS; 同时 renderStatic 与 formatValuesBeforeSave 可被不经 IfPermitted 包装直接调用, 绕过 canRead/canEdit 字段级 ACL", "fix_suggestion": "line 160: 移除 $_REQUEST 回退, 仅从 $entry 取值; 并确保所有调用方必须经过 renderStaticIfPermitted/formatValuesBeforeSaveIfEditable, 且 twig 模板禁止对 value 使用 raw 过滤"}
+```

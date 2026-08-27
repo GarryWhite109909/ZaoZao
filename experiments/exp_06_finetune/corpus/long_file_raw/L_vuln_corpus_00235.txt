@@ -1,0 +1,37 @@
+## 编号分析（全文通读）
+
+**入口点枚举**
+1. **settings.DATABASES[alias]**（第 21-22 行 `_maindb_connection`，第 148-160 行各 `_test_database_*` 方法）：所有 USER/PASSWORD/NAME/TBLSPACE/DATAFILE/MAXSIZE 均来自 Django settings 配置文件或环境注入的配置。
+2. **`_get_test_db_params()`**（第 243-254 行）：把上述配置值打包成 parameters 字典。
+3. **交互式 input()**（第 40、66、110 行）：仅读取 'yes'/'no' 确认，不进入 SQL。
+4. **`set_as_test_mirror(primary_settings_dict)`**（第 130-137 行）：外部传入的 settings_dict 直接写入连接配置。
+
+**source→sink 数据流验证**
+
+1. **流 A**：settings 中 `TEST['USER']` / 主库 `USER` → 第 152 行 `_test_database_user()` → 第 250 行 `'user'` 参数 → 第 231、240 行模板 `'DROP USER %(user)s CASCADE'`、`'CREATE USER %(user)s ...'` → 第 226 行 `stmt = template % parameters` 字符串格式化拼接 → 第 228 行 `cursor.execute(stmt)`。**全程无任何转义、白名单校验或参数化绑定**。Oracle 用户名/表空间名是标识符，cx_Oracle 不支持 DDL 绑定变量，但代码也未做任何标识符合法性检查（如字母数字下划线正则）。若 settings 来自不可信来源（如 CI 环境变量、动态生成的配置），攻击者可注入如 `test_x CASCADE; DROP USER ...` 类语句。**防御缺失确认**。
+
+2. **流 B**：`TEST['PASSWORD']` 或默认常量 PASSWORD（第 12 行）→ 第 155 行 → `'IDENTIFIED BY %(password)s'`（第 213 行）→ 同样经 `%` 拼接执行。密码值同样未净化。
+
+3. **流 C**：`TEST['DATAFILE']` / 由 tblspace 派生的 `.dbf` 路径（第 163-170 行）→ `'DATAFILE '%(datafile)s' SIZE 20M'`（第 197-198 行）→ 文件路径注入可指向任意文件系统路径（Oracle 侧写文件）。
+
+4. **流 D**：`set_as_test_mirror()`（第 130 行）将外部传入字典直接覆盖 USER/PASSWORD，无校验，后续同样汇入 execute。
+
+5. **input() 确认流**：仅比较字符串 'yes'，无数据流入 SQL，安全。
+
+6. **错误信息回显**（第 41、68 行等 `sys.stderr.write(... % e)`）：数据库异常含用户输入时可能造成日志注入/信息泄露，属次要问题。
+
+**第二通道检查**：`_switch_to_test_user`（第 117-127 行）把 parameters['user']/'password' 写回 settings_dict，形成持久化的污染配置，后续连接均使用该污染值——扩大了影响面但同一 source。
+
+**结论**：这是 Django Oracle 后端测试库创建模块，典型触发场景为开发者本机/CI，settings 通常由开发者控制，故实际风险受限；但从数据流看存在真实的 SQL/DDL 注入面（CWE-89/CWE-20），且无任何过滤。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-89 (SQL Injection via identifier interpolation into DDL) / CWE-20",
+  "risk_level": "medium",
+  "source": "line 152-160: _test_database_user/_test_settings_get 从 settings.DATABASES 的 TEST 配置读取 user/password/datafile 等值",
+  "sink": "line 226-228: stmt = template % parameters 后 cursor.execute(stmt)，模板包括 CREATE USER %(user)s IDENTIFIED BY %(password)s 与 DROP USER %(user)s CASCADE",
+  "explanation": "settings 中的 TEST.USER/PASSWORD/DATAFILE -> _get_test_db_params -> _execute_statements 用百分号格式化直接拼入 DDL 语句并执行，全程无参数绑定、无标识符白名单或字符校验；set_as_test_mirror(line 130) 还允许外部字典直接污染凭据；当配置来自环境变量或不可信来源时可注入任意 DDL 或操纵 datafile 路径",
+  "fix_suggestion": "在 _get_test_db_params 或 _execute_statements 入口对 user/tblspace/datafile 强制白名单正则（仅字母数字下划线，datafile 校验绝对路径前缀），拒绝包含引号分号空格等元字符的值"
+}
+```

@@ -1,0 +1,63 @@
+# Cloudreve WOPI 模块安全分析
+
+## 一、全文结构枚举（逐函数、逐行锚定）
+
+本文件共两个函数：`GenerateWopiSrc`（第 44–76 行）与 `generateActionUrl`（第 79–117 行），外加常量与占位符映射定义（第 20–42 行）。以下逐一分析。
+
+## 二、入口点枚举
+
+**E1 — 管理员配置的 viewer action URL（source）**
+`viewer.WopiActions[viewerSession.File.Ext()]`（第 52 行）。该 map 来自 `types.Viewer`，最终源自数据库中管理员配置的 WOPI viewer 定义。这是本文件唯一的字符串 source。
+
+**E2 — 文件扩展名**
+第 52 行 `viewerSession.File.Ext()` 作为 map key 查找，不进入任何 sink，仅作查找键，无数据流风险。
+
+**E3 — 文件 ID**
+第 66 行 `hashid.EncodeFileID(hasher, viewerSession.File.ID())`，经 hashid 编码后拼入 `routes.MasterWopiSrc(...)` 生成的 URL 字符串（第 65–67 行），作为 `fileSrc` 参数传入 sink 函数。hashid 编码是确定性编码，输出受限于编码字符集，不可注入任意字符。
+
+**E4 — 站点 URL**
+第 47 行 `dep.SettingProvider().SiteURL(setting.UseFirstSiteUrl(ctx))`，管理员可配置值，同样只参与构造 `fileSrc`。
+
+**无 HTTP 直接入口**：本文件不含任何路由注册、HTTP handler、header/cookie/环境变量读取；WOPI 回调端点（access_token 校验等）在文件外实现。因此不存在用户可控的直接 source 进入本文件的 sink——除非攻击者能控制 E1/E4，而那已等同于服务器配置被攻陷。
+
+## 三、source→sink 数据流验证
+
+**流 D1：`src`（E1）→ `strings.ReplaceAll`（第 81–82 行）→ `url.Parse`（第 83 行）→ query 替换循环（第 87–101 行）→ `actionUrl.RawQuery = queryReplaced.Encode()`（第 112 行）**
+
+- 第 81–82 行仅移除 `<` 和 `>`，这不是有效防御：黑名单式过滤，且 `<`/`>` 在 URL 语义中并非关键分隔符。
+- 第 83 行 `url.Parse` 解析失败即报错返回（第 84–86 行），保证后续操作基于合法 URL 结构。
+- 第 87–100 行遍历原 query：若值为已知占位符则替换为白名单常量（`queryPlaceholders` 第 24–37 行，全部为硬编码字面量）；若值为 `WOPI_SOURCE` 则替换为 `fileSrc`；否则原样保留（第 99 行）。
+- 关键点：`src` 中原有的其他 query 值被**原样保留**并重新编码进 `RawQuery`。但 `url.Values.Encode()`（第 112 行）会对所有 key/value 做 URL 编码，因此即使 `src` 含 `&`、`=`、`#` 等字符，也无法逃逸出 query 部分形成新的参数边界或路径切换——`Encode()` 是结构性防御而非黑名单。
+- **残余风险**：`src` 的 host/path/scheme 完全由 `url.Parse` 保留。若管理员配置了恶意 scheme（如 `javascript:` 或内网地址），前端浏览器打开该 action URL 时可能产生 SSRF/开放重定向类问题。但这属于**信任管理员输入**的设计边界，且 `url.Parse` 不校验 scheme。严格来说这是一个低危的“未验证外部 URL”问题（CWE-601/CWE-918 变体），前提是攻击者需具备管理员权限修改 viewer 配置——通常不被视为可利用漏洞。
+
+**流 D2：`fileSrc`（E3+E4 构造）→ 第 95 行 `queryReplaced.Set(k, fileSrc)` / 第 104 行 `queryReplaced.Set(wopiSrcParamDefault, fileSrc)` → 第 112 行 `Encode()`**
+
+- `fileSrc` 由 `routes.MasterWopiSrc(base, ...)` 生成，base 为站点 URL（管理员配置），文件 ID 经 hashid 编码（受限字符集）。
+- 即便 base 含特殊字符，`Set` + `Encode()` 保证其只会成为单个 query 值，无法注入额外参数或破坏 URL 结构。
+- 若 base 本身是恶意/内网地址，同样回到“管理员可信”前提。
+
+**流 D3：`lang` 参数（第 114 行）**：硬编码 `"lng"`，无风险。
+
+**流 D4：`THEME_ID=darkmode` 等占位符替换（第 88–93 行）**：替换值全部来自硬编码 map，无用户输入，无风险。
+
+## 四、第二入口与替代通道检查
+
+- 无 HTTP handler、无 header 读取（常量如 `OverwriteHeader` 仅定义名称，本文件未使用）、无环境变量、无回调注册——替代通道在本文件范围内不存在。
+- `SessionCachePrefix`、锁相关常量（第 27–33 行）在本文件中仅为声明，无对应读写逻辑，不构成数据流。
+- 前端拿到生成的 action URL 后由浏览器发起请求到 WOPI 服务端，真正的鉴权（access_token 校验）在 WOPI 回调 handler 中完成，不在本文件分析范围，但本文件未绕过它——它只是生成带 `WOPISrc` 指回本站的 URL。
+
+## 五、结论
+
+通读全文后：所有进入 sink 的字符串要么是管理员配置值（信任边界内），要么经过 `url.Values.Encode()` 的结构性编码，不存在普通用户可控输入到达危险 sink 的路径。第 81–82 行的 `<`/`>` 过滤虽弱，但其保护的 `src` 并非用户可控，故不构成实际漏洞。唯一可记录的是对管理员提供的 action URL 未做 scheme/host 白名单校验（潜在 SSRF/开放跳转，需管理员权限触发，属设计取舍而非可利用漏洞）。
+
+```json
+{
+  "has_vulnerability": false,
+  "vulnerability_type": "CWE-20 (improper input validation, theoretical only)",
+  "risk_level": "low",
+  "source": "line 52: viewer.WopiActions admin-configured action url template",
+  "sink": "line 112: actionUrl.RawQuery = queryReplaced.Encode()",
+  "explanation": "全文仅有两条数据流: src(管理员配置) 与 fileSrc(站点URL+hashid文件ID) 最终写入 RawQuery。两者均非普通用户可控输入; url.Values.Encode() 提供结构性编码防止参数逃逸; 第81-82行的 <> 黑名单过滤虽弱但保护对象在信任边界内, 不构成可利用漏洞。文件内无HTTP入口、无header读取、无回调注册, 不存在第二入口或替代通道。",
+  "fix_suggestion": "可选加固: 在 line 83 url.Parse 之后增加 scheme 白名单校验(仅允许 http/https), 防止管理员误配 javascript: 等危险 scheme 导致前端执行"
+}
+```

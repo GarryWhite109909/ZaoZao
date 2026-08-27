@@ -1,0 +1,44 @@
+# 逐行安全分析
+
+## 入口点枚举
+
+本文件是 create-react-app 的 `webpackDevServer.config` 辅助模块，唯一导出为 `prepareProxy(proxy, appPublicFolder)`（第 17 行）。入口数据来源：
+
+1. **`proxy` 参数**（第 18 行）：来自项目 `package.json` 的 `proxy` 字段——这是**开发者自己写的配置文件**，不是远程攻击者可控的输入。
+2. **运行时 HTTP 请求**：通过 `context(pathname, req)` 回调（第 51 行）和 `onProxyError` 回调（第 122 行）间接接触请求头/路径。
+
+## 函数逐一分析
+
+### prepareProxy（第 17–113 行）
+- 第 19–21 行：空值直接返回。
+- 第 22–36 行：类型校验，非法即 `process.exit(1)`，无注入面。
+- 第 87–96 行：字符串形式的 proxy 必须匹配 `/^http(s)?:\/\//`。该正则只做**前缀校验**而非白名单，理论上允许 `http://evil.com`。但 proxy 值由本地开发者写入 package.json，属于自配置，不构成跨信任边界漏洞。
+- 第 98–112 行：对象形式要求每项有 `target`，同样来自开发者配置。
+
+### mayProxy（第 41–46 行）
+- 用 `path.resolve(appPublicFolder, pathname.slice(1))` 拼路径后仅做 `fs.existsSync` 判断（第 42–43 行）。即使 pathname 含 `../` 导致 resolve 跳出目录，结果只是“判定为 public 文件→不代理”，走向 webpack 静态服务（其自身有路径规范化），**不存在文件读取 sink**，无路径穿越可利用点。
+
+### createProxyEntry（第 48–83 行）
+- 第 49–53 行：仅 win32 下对 localhost 目标做 loopback 解析，见下。
+- 第 54–70 行 `context`：基于 pathname 与 accept 头决定是否代理，属路由分发逻辑，无 sink。
+- 第 71–77 行 `onProxyReq`：把 Origin 头改写为 target（第 75 行），是固定值赋给 header，非用户串拼接，无 CRLF 注入（http-proxy 内部 setHeader 会拒绝非法字符）。
+
+### resolveLoopback（第 115–139 行）
+- 只处理 hostname 为 `localhost` 的情况（第 120 行），改写为 `127.0.0.1`，输出经 `url.format`，无外部输入汇入敏感 sink。
+
+### onProxyError（第 142–166 行）
+- 第 145 行取 `req.headers.host`，第 147–152 行拼入 console.log；第 163–165 行把 `req.url`、`host`、`err.code` 拼进响应体 `res.end(...)`。
+- 这是典型的 source(host/url)→sink(响应体) 流，且 host 头攻击者可控。但：
+  - `res.end(string)` 走默认 `text/html` 时，Host 头中浏览器无法注入完整 HTML（Node 的 HTTP 解析器拒绝 header 值中的 CR/LF），且该错误页仅在代理失败时返回给发起请求的同一客户端，属于**反射型自我 XSS**级别，历来不被视为可利用漏洞（CRA 官方亦未修复此类提示性回显）。
+  - 无持久化、无其他用户可见通道。
+
+## 第二入口与替代通道检查
+- 无环境变量读取、无子进程 exec、无 eval/Function、无 fs 写操作——全文 grep 级别确认不存在命令注入或代码执行 sink。
+- `xfwd: true`（第 11 行）会追加 X-Forwarded 头到后端，但后端是开发者指定的可信 target。
+
+## 结论
+所有 source→sink 数据流要么源自开发者本地配置（同信任级），要么仅为错误信息回显给请求者本人，无有效攻击路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文通读后确认：proxy 配置来自开发者本地 package.json，属同一信任边界；mayProxy 仅做 existsSync 判断无文件读取 sink；onProxyReq 中 origin 改写为固定 target 无注入；onProxyError 将 req.url 与 host 头回显到错误响应，但 Node HTTP 解析器禁止 header 值含 CRLF，且仅反射给请求者本人，无可利用的跨用户攻击路径；全文无 eval、exec、fs 写等危险 sink。", "fix_suggestion": "no fix needed"}
+```

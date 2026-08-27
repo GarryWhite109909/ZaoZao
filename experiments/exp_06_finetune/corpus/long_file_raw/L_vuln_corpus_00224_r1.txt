@@ -1,0 +1,34 @@
+## 编号分析（全文通读，逐函数锚定行号）
+
+**1. 结构体定义区（第 28–260 行）——入口点枚举**
+- 第 28 行 `Config` 聚合了全部外部输入面：YAML/mapstructure 反序列化（第 30–60 行各字段 tag），即配置文件、环境变量覆盖（base.Options squash）均为 source。
+- 第 95–101 行 `TLSConfig.InsecureSkipVerify bool`：允许配置直接关闭 MySQL 客户端证书校验。
+- 第 200–230 行 `SecurityConfig`：`CACert/CAKey types.PEMContent`（可为路径或 PEM 字符串）、`TLSPolicy string` 自由字符串。
+- 第 250–253 行 `NetworkConfig.EnableIPv6` 影响 AdvertiseIP 选择。
+
+**2. `New()`（第 262–320 行）——默认值审计**
+- 第 305–308 行：默认 `TLSPolicy: rpc.PreferTLSPolicy`。按注释语义（第 208–211 行），prefer 模式下 ServerHandshake 接受非 TLS 明文连接——默认即存在降级通道。
+
+**3. `Validate()`（第 322–500 行）——防御有效性逐条验证**
+- 第 338–352 行：MySQL TLS 分支仅校验 Cert/Key/CA 非空，**未拒绝 `InsecureSkipVerify == true`**（第 99 行字段）。黑名单式缺失校验 = 可绕过，攻击者/误配置可使数据库连接静默降级为不验证服务端证书，中间人可窃取凭据与数据。
+- 第 380–385 行：Postgres 仅要求 `SSLMode != ""`，但未限制取值；`sslMode: disable` 或 `allow` 均可通过校验，等同无效防御（白名单缺失）。
+- 第 462–486 行：`TLSPolicy` 白名单校验被包在 `if cfg.Security.AutoIssueCert` 内（第 462 行）；当 AutoIssueCert=false 时 TLSPolicy 完全不校验，可传入任意字符串或合法的 default 策略使 gRPC 服务端接受明文连接——第二入口/替代通道成立。
+- 第 470–471 行：`CertSpec.IPAddresses/DNSNames` 仅判非空，内容不校验（如可填 0.0.0.0），签发证书 SAN 可被滥用，属弱校验。
+
+**4. `Convert()`（第 502–530 行）**
+- 第 512–514 行：`net.ParseIP(cfg.Server.GRPC.Listen)` 失败时返回 nil 且无错误上报，后续 Validate 的 nil 检查会兜底报错，此条数据流有下游防御，不算漏洞。
+- 第 516–523 行：AdvertiseIP 回退到本机 IP，无用户可控 sink，安全。
+
+**结论性证据链**：source（第 99 行 `InsecureSkipVerify` 配置项 / 第 214 行 `TLSPolicy`）→ 缺陷校验（第 338–352 行未拦截 skip-verify；第 462 行条件性白名单）→ sink（MySQL/gRPC 客户端 TLS 握手参数构造处使用该配置）→ 证书校验被禁用或降级为明文，构成 CWE-295。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-295",
+  "risk_level": "中",
+  "source": "line 99: TLSConfig.InsecureSkipVerify 字段及 line 214: SecurityConfig.TLSPolicy, 均来自外部 YAML/mapstructure 配置输入",
+  "sink": "line 338-352: Validate 中 MySQL TLS 校验逻辑, 以及 line 462-466: AutoIssueCert 条件内的 TLSPolicy 白名单校验, 校验结果最终传入数据库与 gRPC 的 TLS 握手配置",
+  "explanation": "配置文件中的 InsecureSkipVerify=true 可通过 Validate 校验 -> 该值直接用于构造 MySQL TLS 客户端配置导致证书链与主机名校验被禁用 -> 中间人可劫持数据库连接窃取凭据; 同时当 AutoIssueCert=false 时 TLSPolicy 不做任何白名单校验(第462行), 可设为 default 使 gRPC 服务端接受非 TLS 明文连接形成降级通道",
+  "fix_suggestion": "line 338-352: 在 Validate 的 MySQL TLS 分支中显式拒绝 cfg.Database.Mysql.TLS.InsecureSkipVerify 为 true; 并将 TLSPolicy 的白名单校验移出 AutoIssueCert 条件块使其无条件执行"
+}
+```

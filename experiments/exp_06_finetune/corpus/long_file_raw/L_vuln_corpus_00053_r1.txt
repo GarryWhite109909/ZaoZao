@@ -1,0 +1,68 @@
+# 全文逐函数安全分析
+
+## 一、文件概览与入口点枚举
+
+本文件是 postcss 的 `PreviousMap`（source map 加载器），全文共约 130 行，包含以下函数/入口点：
+
+1. **第 5-11 行 `fromBase64(str)`**：Base64 解码工具函数。
+2. **第 13-27 行 `class PreviousMap` 构造函数**：接收外部输入 `css`（CSS 文本）与 `opts`（含 `opts.map`、`opts.from`、`opts.unsafeMap`）。
+3. **第 29-34 行 `consumer()`**：将已加载的 map 文本交给 `SourceMapConsumer`。
+4. **第 36-56 行 `decodeInline(text)`**：解析内联 data URI 格式的 source map。
+5. **第 58-60 行 `getAnnotationURL(sourceMapString)`**：从注释中提取 URL 字符串。
+6. **第 62-69 行 `isMap(map)`**：格式判断。
+7. **第 71-86 行 `loadAnnotation(css)`**：从 CSS 文本中提取最后一个 `/* # sourceMappingURL= */` 注释的内容——这是**第一入口点（攻击者可控的 CSS 内容）**。
+8. **第 88-107 行 `loadFile(path, cssFile, trusted)`**：磁盘文件读取点——这是**核心 sink（`readFileSync`）**。
+9. **第 109-146 行 `loadMap(file, prev)`**：map 加载调度逻辑——**第二入口点（`prev` 回调/字符串）**。
+10. **第 148-151 行 `startWith`、第 153-158 行 `withContent`**：纯辅助函数，无 sink。
+
+## 二、Source→Sink 数据流逐一验证
+
+### 数据流 A：CSS 注释 → annotation → loadFile → readFileSync（主漏洞链）
+
+- **Source（第 71-86 行）**：`loadAnnotation(css)` 用正则匹配 CSS 中所有 `# sourceMappingURL=` 注释，取最后一个（第 76 行 `comments.pop()`），第 84 行把注释体去掉前缀后赋给 `this.annotation`。该值完全来自被处理的 CSS 文本，若 CSS 来自不可信来源（如用户上传、第三方依赖），则 `annotation` 完全攻击者可控。
+- **传播（第 137-139 行）**：`loadMap` 中当无内联 map 时，`let map = this.annotation`；若有 `file` 则 `join(dirname(file), map)` 拼接路径。
+- **Sink（第 104 行）**：`readFileSync(path, 'utf-8')` 同步读取任意路径文件并返回内容。
+
+**防御有效性验证（第 89-99 行）**：
+1. 第 90 行 `trusted` 参数：在 `loadMap` 第 140 行调用时传的是 `false`，即走校验分支——但注意第 113-115 行，当 `prev` 是**函数**时调用 `loadFile(prevPath, file, true)`，`trusted=true` 直接跳过全部校验（见数据流 B）。
+2. 第 92 行 `/\.map$/i.test(path)`：仅要求以 `.map` 结尾。攻击者只需让目标文件名以 `.map` 结尾即可绕过；且正则黑名单式后缀检查本身可被 `..%2f` 等编码或符号链接等替代通道绕过。
+3. 第 94-98 行相对路径检查：`relative(dirname(cssFile), path)` 不得为 `..`、不得以 `..+sep` 开头、不得是绝对路径。**关键缺陷：此检查仅在 `cssFile` 为真时执行**。当 postcss 以字符串方式处理 CSS（未设置 `opts.from`，即 `cssFile === undefined`）时，第 93 行的 `if (cssFile)` 整块跳过，唯一剩下的防御就是 `.map` 后缀。此时第 138 行 `if (file) map = join(...)` 也因 `file` 为空而不拼接目录，`annotation` 被原样作为路径传入 `loadFile`——攻击者可将 `annotation` 设为绝对路径如 `/etc/passwd.map` 或 `C:\secret.map`，直接读取文件系统上任意以 `.map` 结尾的文件内容。
+
+**结论：数据流 A 存在有效漏洞**（对应 CVE-2023-44270）。读取到的内容会进入 `this.text`（第 26 行），并通过 `consumer()`（第 33 行）暴露给后续 source map 处理流程，最终可能通过错误信息、生成的输出或 sourcesContent 泄漏给攻击者。
+
+### 数据流 B：`opts.map.prev` 函数回调 → trusted=true → 无校验读取
+
+- 第 114 行：`let prevPath = prev(file)`，回调返回值即路径。
+- 第 115 行：`this.loadFile(prevPath, file, true)`，第三个参数 `trusted=true` 使第 90-99 行所有校验失效。
+- 但该入口的前提是调用方主动传入 `prev` 函数，属于开发者显式授权行为（API 设计意图即为信任调用方），通常不视为独立漏洞；不过若上游框架把用户输入透传为 `prev`，则构成第二入口的提权通道。此处判定为“设计上信任边界内的功能”，非本文件自身缺陷。
+
+### 数据流 C：内联 data URI → decodeInline
+
+- 第 46 行：`this.inline` 为真时调用 `decodeInline(this.annotation)`。
+- 第 40-42 行：`decodeURIComponent(text.substr(...))` 与第 45 行 `fromBase64(...)` 均只做解码，结果作为 JSON 文本使用，不触达文件系统。`Buffer.from` 解码无注入面。此流无 sink，安全。
+
+### 数据流 D：JSON.parse（第 142 行）
+
+- `unknown.replace(/^\)]}'[^\n]*\n/, '')` 后 `JSON.parse`。解析失败被 `catch` 吞掉返回 `undefined`，无原型污染写入操作（只是解析），不构成漏洞。
+
+### 替代通道核查
+
+- 第 22-23 行：`opts.map.prev` 为字符串时直接作为 map 文本返回（第 117 行），无文件访问。
+- 第 119-124 行：`SourceMapConsumer/Generator` 对象直接序列化，无 IO。
+- `withContent()`（第 153-158 行）会把 map 中 `sourcesContent` 暴露出去——这正是数据流 A 中被读文件内容外泄的出口之一，佐证了信息泄露影响。
+
+## 三、综合结论
+
+核心漏洞链：**攻击者可控 CSS 中的 `# sourceMappingURL` 注释（第 71-86 行 source）→ 未设 `opts.from` 时绕过目录限制（第 93 行条件缺陷 + 第 138 行条件缺陷）→ 仅剩可绕过的 `.map` 后缀黑名单（第 92 行）→ `readFileSync`（第 104 行 sink）读取任意 `.map` 结尾文件 → 内容经 `this.text`/`sourcesContent` 外泄**。这正是 postcss 8.4.31 修复的 CVE-2023-44270（修复方案是在无 `from` 时也强制路径约束并拒绝绝对路径/遍历序列）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 路径遍历导致任意文件读取（信息泄露，对应 CVE-2023-44270）",
+  "risk_level": "高危",
+  "source": "line 84: this.annotation 来自 CSS 中攻击者可控的 sourceMappingURL 注释",
+  "sink": "line 104: readFileSync(path) 读取拼接后的任意路径",
+  "explanation": "攻击者在 CSS 中写入形如 /*# sourceMappingURL=/etc/passwd.map */ 的注释 -> loadAnnotation 提取为 annotation -> 当未设置 opts.from 时 loadMap 第 138 行不拼接目录且 loadFile 第 93 行因 cssFile 为空跳过相对路径校验 -> 仅剩第 92 行可绕过的 .map 后缀黑名单 -> readFileSync 读取文件系统上任意以 .map 结尾的文件 -> 内容存入 this.text 并经 consumer/sourcesContent 泄露",
+  "fix_suggestion": "line 92-99: 在 cssFile 缺失时同样拒绝绝对路径与包含 .. 遍历序列的 path（对 path 本身做 isAbsolute 与分段遍历检查），并将 .map 后缀白名单改为规范化后的真实路径校验"
+}
+```

@@ -1,0 +1,26 @@
+## 编号分析（全文逐函数）
+
+**入口点枚举**
+1. 命令行入口 `Command.Run`（约第 96–140 行）：`args` 仅作为远端 fs 路径，由操作者提供，非外部攻击面。
+2. HTTP 路由绑定 `bind`（第 226–245 行）：GET/POST/HEAD/DELETE 通配路由；`--private-repos` 时套 `{userID}` 子路由（第 248–262 行）。
+3. RC 回调 `cmdserve.AddRc`（第 60–73 行）：仅本地/受控 RC 接口创建 server，`stdio` 被显式拒绝。
+
+**数据流逐一验证**
+
+1. **路径遍历（source：URL Path → sink：fs 操作）**：中间件 `WithRemote`（第 148–180 行）取 `rctx.RoutePath` 或 `r.URL.Path`，先 `strings.Trim(urlpath, "/")`，再强制 `path.Clean(urlpath) == urlpath`，否则返回 400。这会拒绝任何含 `..`、冗余斜杠、`.` 的非规范路径。随后 `matchData` 正则只做 data 目录扁平→分片映射，不引入新输入。所有 handler（serveObject/postObject/deleteObject/listObjects/createRepo）的 remote 均来自该 context value，而非直接读 `r.URL.Path`。防御有效。注意：黑名单式过滤不算数，但这里是规范化等价检查（canonical form equality），不是黑名单，无法用编码变体绕过——`net/http` 已解码 `%2e%2e` 为 `..` 后再被 Clean 拒绝。
+
+2. **append-only 删除限制（deleteObject，第 291–334 行）**：校验用的是 `r.URL.Path` 的 `parts[len(parts)-2] != "locks"`，而实际删除对象用的是 context 中已清洗的 remote。尝试 `/a/locks/../config`：URL.Path 解码后末二段为 `..`，被拒；`/locks/../../x` 同理被拒；尾部斜杠 `/x/locks/` 时末二段恰为 `locks` 且 remote 为 `x/locks`，语义一致，无绕过。唯一差异是双重编码 `%252e%252e` 会保留为字面文件名，但那不构成遍历（Clean 后仍是合法名字）。结论：无有效绕过路径。
+
+3. **append-only 覆盖写（postObject，第 265–289 行）**：先 `newObject` 检查存在性再 `RcatSize` 写入，存在 TOCTOU 竞态窗口（并发两个 POST 可互相覆盖），属理论性低危缺陷，需要已认证客户端主动竞速，且 restic 对象名为内容哈希，实际影响极小。
+
+4. **private-repos 隔离（checkPrivate，第 183–195 行）**：要求认证用户名与 URL 中 `userID` 严格相等；未认证（`ok=false`）、user 为空或不匹配均 403；未匹配路由统一走 NotFound 返回 403（第 256–259 行），无默认放行分支。无绕过。
+
+5. **listObjects/createRepo**：remote 同样来自清洗后的 context；`create=true` 查询参数仅控制是否建目录，Mkdir 目标为 `path.Join(remote, 固定名)`，无注入点。JSON 编码输出无 XSS 面（Content-Type 非 HTML）。
+
+6. **第二通道核查**：RC 通道不能启用 stdio；HTTP 认证由 libhttp 统一处理；缓存 `cache.find/add/remove` 键为清洗后 remote，不引入新 sink。
+
+**结论**：核心遍历防御（canonical 检查）与 append-only/private-repos 逻辑在全文范围内均成立，无可利用漏洞；仅存 append-only 下并发覆盖的理论竞态，属加固建议而非可判定漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "WithRemote 中间件对全部路由的路径做 Trim 加 path.Clean 规范化等价校验，拒绝含 .. 或非规范形式的路径，且所有 handler 的 remote 均取自该 context 而非原始 URL；append-only 的删除白名单虽使用 r.URL.Path 分段判断，但任何遍历形态（解码后的 ..、多余斜杠、尾斜杠）都无法构造出既通过 locks 检查又指向其他对象的请求；private-repos 模式下未匹配路由一律 403，checkPrivate 要求用户名严格相等；createRepo 与 listObjects 的目标路径同样来自清洗后的 remote。唯一瑕疵是 append-only 下 postObject 存在性与写入之间的 TOCTOU 竞态，需已认证客户端主动并发竞速才可能触发，且 restic 对象名为内容哈希，实际风险可忽略，故不判定为漏洞。", "fix_suggestion": "no fix needed"}
+```

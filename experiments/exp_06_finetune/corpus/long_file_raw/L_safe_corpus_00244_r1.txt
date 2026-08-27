@@ -1,0 +1,95 @@
+# 逐函数安全分析
+
+## 文件概览与入口点枚举
+
+本文件是 Gitea 的仓库数据访问层（models/repo），共包含以下函数/类型，逐一分析：
+
+1. `StarredReposOptions` 结构体及方法（第 20-52 行）
+2. `GetStarredRepos`（第 54-56 行）
+3. `WatchedReposOptions` 结构体及方法（第 58-90 行）
+4. `GetWatchedRepos`（第 92-94 行）
+5. `GetRepoAssignees`（第 96-131 行）
+6. `GetIssuePostersWithSearch`（第 133-155 行）
+
+## 函数一：StarredReposOptions.ToConds / ToJoins（第 20-52 行）
+
+**入口点**：无直接 HTTP 入口。`StarrerID`、`RepoOwnerID`、`IncludePrivate`、`Actor` 均为 int64/bool/结构体指针类型参数，由上层调用方传入。
+
+**source→sink 数据流验证**：
+- 第 33-35 行：`builder.Eq{"star.uid": opts.StarrerID}` —— 使用 xorm builder 的参数化查询构造器，int64 值作为绑定参数传递，不存在 SQL 注入 sink。
+- 第 36-39 行：`builder.Eq{"repository.owner_id": opts.RepoOwnerID}` —— 同上，参数化。
+- 第 40-46 行：关键权限控制逻辑。当 `IncludePrivate=true` 时，通过 `AccessibleRepositoryCondition(opts.Actor, unit.TypeInvalid)` 对私有仓库做访问权限过滤，注释明确说明目的是防止“撤销访问后元数据泄露”。这是有效的授权防御：即使调用方请求包含私有仓库，Actor 无权限的私有仓库也会被条件排除。
+- 第 47-49 行：`IncludePrivate=false` 时仅返回 `is_private=false` 的公开仓库，防御有效。
+- 第 50-52 行（ToJoins）：JOIN 条件为硬编码字符串 `` `repository`.id=`star`.repo_id ``，不含任何用户输入，无注入面。
+- `ApplyPublicOnly`（第 28-31 行）：只能收紧（false 化）`IncludePrivate`，不能放宽，方向安全。
+
+**结论**：无漏洞。所有值均为强类型且经参数化绑定；私有仓库泄露风险已被 Actor 权限条件覆盖。
+
+## 函数二：GetStarredRepos（第 54-56 行）
+
+**入口点**：纯透传函数，将 `opts` 交给 `db.Find[Repository]`。泛型 Find 内部调用 `opts.ToConds()` 与 `ToJoins()`，即上述已验证的安全路径。
+
+**第二入口检查**：任何调用方若想绕过权限过滤，必须自行设置 `IncludePrivate=true` 且不传 Actor——但此时 `AccessibleRepositoryCondition(nil, ...)` 会产生空结果或拒绝语义（Gitea 中 nil actor 仅匹配公开仓库），不会造成越权。防御链完整。
+
+## 函数三：WatchedReposOptions.ToConds / ToJoins（第 58-90 行）
+
+与 StarredReposOptions 完全对称：
+- 第 71-73 行：`watch.user_id` 参数化等值查询。
+- 第 74-77 行：可选 owner 过滤，参数化。
+- 第 78-84 行：同样的 IncludePrivate 双分支 + `AccessibleRepositoryCondition` 授权门控，防御有效。
+- 第 85-87 行：额外排除 `watch.mode = WatchModeDont`，使用 `builder.Neq` 参数化，且该常量为代码内定义枚举，非用户可控。
+- 第 89-93 行（ToJoins）：硬编码 JOIN 字符串，无注入。
+
+**替代通道检查**：`watch` 表 JOIN 使用 INNER JOIN，无法通过伪造 watch 记录绕过 is_private/权限条件——权限条件在 WHERE 层强制生效于最终结果集。
+
+## 函数四：GetWatchedRepos（第 92-94 行）
+
+透传至 `db.FindAndCount`，走同一安全条件构造路径，无新增攻击面。
+
+## 函数五：GetRepoAssignees（第 96-131 行）
+
+**入口点**：接收 `*Repository` 对象（内部含 ID、OwnerID、Owner），全部来自数据库加载的受信数据，非用户原始输入。
+
+**数据流验证**：
+- 第 103-107 行：`e.Table("access").Where("repo_id = ? AND mode >= ?", repo.ID, perm.AccessModeWrite)` —— 占位符 `?` 参数化，`repo.ID` 为 int64 主键，`perm.AccessModeWrite` 为代码内常量。无注入。
+- 第 110-116 行：组织场景下追加团队用户 ID，同样基于 repo.OwnerID/repo.ID 的数据库内部关联查询。
+- 第 119-124 行：`e.In("id", uniqueUserIDs.Values())` —— In 子句值为从 access 表查出的 user_id 集合（数据库来源），并附加 `is_active=true` 过滤。xorm 的 In 会参数化展开，无注入。
+- 第 125-127 行：非组织时补充 owner 本身，对象来自已验证的 LoadOwner 加载链。
+
+**信息泄露评估**：返回的是“有写权限可被指派”的用户列表，调用方需先持有对该仓库的读权限才能到达此函数（上游路由层职责），且返回字段限于用户基本信息，属预期功能语义。
+
+## 函数六：GetIssuePostersWithSearch（第 133-155 行）
+
+**入口点**：`search` 字符串是本文件唯一的自由文本用户输入（source），需重点审查其到 SQL 的数据流（sink）。
+
+**source→sink 逐条验证**：
+- 第 138-143 行：基础条件 `user.id IN (SELECT poster_id FROM issue WHERE repo_id = ? AND is_pull = ?)` —— 全部参数化，repo.ID/isPull 强类型。
+- 第 144-147 行：search 处理路径：
+  - `builder.Like{"lower_name", strings.ToLower(search) + "%"}` —— search 作为 LIKE 绑定参数传入，不拼接进 SQL 文本本身，无注入可能。唯一残留问题是 `%`/`_` 通配符未转义，但此处前缀匹配本就允许通配语义，且结果集被限制在“该仓库 issue 的 poster”范围内，不构成跨仓库信息泄露。
+  - `db.BuildCaseInsensitiveLike("full_name", "%"+search+"%")` —— 该辅助函数生成参数化 LIKE 条件，列名 `full_name` 为硬编码白名单标识符，非用户可控。search 仍为绑定值。
+- 第 148-154 行：`Cols(...)` 列名全为硬编码；`Limit(30)` 硬编码上限，防止枚举式大批量拉取；`OrderBy("name")` 硬编码。
+
+**黑名单/正则绕过评估**：本函数未使用黑名单或正则过滤，而是完全依赖参数化绑定 + 硬编码标识符，属于结构性防御，不可绕过。
+
+**信息泄露评估**：返回字段限 id/name/full_name/avatar 等，且限定为已在目标仓库留下 issue/pull 的用户——这些用户对仓库可见性已有隐式暴露关系，属正常协作功能设计，非越权泄露。
+
+## 第二入口与替代通道总结
+
+- 所有 SQL 构造均经由 xorm builder 参数化，全文未发现字符串拼接用户输入进 SQL 的模式；
+- 私有仓库访问统一由 `AccessibleRepositoryCondition` 门控，两个 Options 类型的 ApplyPublicOnly 只能收紧不能放宽；
+- 无文件操作、命令执行、环境变量读取、回调反序列化等其他 sink 类型；
+- 唯一自由文本输入 `search` 已确认全程作为绑定参数处理。
+
+## 最终结论
+
+```json
+{
+  "has_vulnerability": false,
+  "vulnerability_type": "none",
+  "risk_level": "none",
+  "source": "N/A",
+  "sink": "N/A",
+  "explanation": "全文六个函数均使用 xorm builder 参数化查询，无用户输入拼接进 SQL 文本；唯一自由文本输入 search 在 GetIssuePostersWithSearch 中始终作为 LIKE 绑定参数处理，列名与排序字段均为硬编码标识符；私有仓库访问由 AccessibleRepositoryCondition 统一授权门控，ApplyPublicOnly 仅能收紧过滤；无文件、命令、环境变量等其他 sink。",
+  "fix_suggestion": "no fix needed"
+}
+```

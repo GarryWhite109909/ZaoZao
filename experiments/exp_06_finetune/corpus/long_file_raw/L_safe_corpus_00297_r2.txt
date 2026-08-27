@@ -1,0 +1,61 @@
+# 全文逐函数安全分析
+
+## 一、文件概览与入口点枚举
+
+本文件是 vLLM 项目中的 pooling 激活函数模块（`vllm/model_executor/pooling/activation.py`），全文共约 130 行。通读全文后，可枚举的潜在外部输入入口点如下：
+
+1. **入口点 1（第 12-56 行）`get_act_fn(config, static_num_labels)`**：接收 `PretrainedConfig` 对象，从中读取 `num_labels`、`problem_type`、`config.sentence_transformers["activation_fn"]`、`config.sbert_ce_default_activation_function` 等属性。这些属性最终来源于模型仓库的 `config.json` 文件，即**加载不可信模型配置时的攻击面**。
+2. **入口点 2（第 59-66 行）`resolve_classifier_act_fn(model_config, ...)`**：间接调用 `get_act_fn`，传递 `model_config.hf_config`，属于同一数据流的包装层。
+3. **入口点 3（第 69-130 行）各 PoolerActivation 类**：纯计算类，不接触外部字符串输入。
+4. **关键 sink（第 50 行）`resolve_obj_by_qualname(function_name)`**：这是全文件唯一的动态对象解析调用，等价于受限的 import + getattr，是本次审计的核心。
+
+## 二、核心数据流 source→sink 验证
+
+### 数据流 1：`config.sentence_transformers["activation_fn"]` → `resolve_obj_by_qualname`
+
+- **source（第 38-41 行）**：`function_name = config.sentence_transformers["activation_fn"]`。该值来自模型作者提供的 config.json，若用户加载恶意/被投毒的模型仓库，此值完全由攻击者控制。
+- **sink（第 50 行）**：`fn = resolve_obj_by_qualname(function_name)()`，随后第 51 行 `PoolerActivation.wraps(fn)` 包装并在推理时调用其 forward。
+
+**防御验证（第 45-49 行）**：
+```python
+if not function_name.startswith("torch.nn.modules."):
+    raise ValueError(...)
+```
+防御方式是**前缀黑名单式检查**（startswith 前缀白名单）。按分析要求，前缀过滤需评估绕过可能性：
+
+- Python 的 import 机制中，`torch.nn.modules.` 前缀下是否存在危险的可调用对象？`resolve_obj_by_qualname` 通常实现为按 `.` 分割后依次 getattr 并 import。`torch.nn.modules.*` 下绝大多数是 nn.Module 子类，实例化后仅执行权重初始化，无任意代码执行面。
+- 但需注意：前缀匹配允许形如 `torch.nn.modules.activation.MultiheadAttention` 的合法类，也允许任何以该字符串开头的属性路径。由于限定在 torch 官方包命名空间内，且 torch 包本身可信（来自 PyPI 固定依赖而非用户上传），攻击者无法在该命名空间内注入任意代码——除非攻击者能污染 torch 包本身（那已是更底层的供应链问题，超出本文件防御边界）。
+- 潜在边缘情况：若 `resolve_obj_by_qualname` 允许相对导入或对非模块属性的特殊解析，可能扩大范围；但即便如此，可达对象仍限于 torch.nn.modules 子树内的公开 API，其中不存在 eval/exec/os.system 类 sink。
+
+**结论**：此处的前缀限制将可达对象约束在可信的 torch 标准库命名空间内，属于有效防御（与题目所述“黑名单/正则视为可绕过”不同，这是命名空间白名单，且目标空间本身不含危险原语）。
+
+### 数据流 2：`config.sbert_ce_default_activation_function` → 同一 sink
+
+- **source（第 42-46 行）**：同样来自 config.json 的字段。
+- **sink**：汇入同一个 `function_name` 变量，经过第 45 行同一处前缀检查后才到达第 50 行的 sink。
+- 两条分支在第 47 行汇合后共享同一防御，因此第二条通道不构成绕过路径。
+
+### 数据流 3：`problem_type` / `num_labels` → Pooler 类选择
+
+- 第 26-33 行：`problem_type` 仅做字符串相等比较（`== "regression"` 等），用于选择 `PoolerIdentity` / `PoolerClassify` / `PoolerMultiLabelClassify`，不进入任何动态执行 sink。
+- 第 22 行 `getattr(config, "num_labels", 0)` 与第 87-90 行 `if num_labels < 2: return F.sigmoid(...)`：数值仅影响 sigmoid/softmax 分支选择，最坏情况是逻辑行为差异（如 num_labels=0 时回退到 sigmoid），属功能性 fallback 而非安全问题。
+
+## 三、第二入口与替代通道检查
+
+1. **`resolve_classifier_act_fn`（第 59-66 行）**：当 `act_fn` 参数非 None 时直接返回传入对象（第 65-66 行），仅做 callable 类型检查。但该参数来自 vLLM 内部代码构造，非用户 HTTP 输入直传；且 callable 检查失败会抛 TypeError，不构成注入通道。
+2. **`PoolerActivation.wraps`（第 72-78 行）**：isinstance 判断后返回对应 Pooler 类或 `LambdaPoolerActivation(module)`。`LambdaPoolerActivation`（第 113-124 行）持有任意 callable 并在 forward 时调用——但其 fn 只能经由上述已通过前缀校验的路径构造，或由内部代码显式传入，无独立的外部 source。
+3. **forward 路径（第 81-88 行及各类 forward_chunk）**：输入为内存中的 torch.Tensor，无反序列化、无文件 IO、无网络操作、无 subprocess/eval/exec。
+4. **全文 grep 式复查**：文件中不存在 `eval`、`exec`、`pickle.loads`、`os.system`、`subprocess`、`open()`、`__import__` 直调、`yaml.load` 等危险 sink；唯一动态解析点是第 50 行。
+
+## 四、残余风险讨论
+
+- 若未来 torch 在 `torch.nn.modules` 下引入带副作用的对象，或 vLLM 放宽前缀限制，此机制可能被滥用；当前版本下无可利用路径。
+- 更深层风险在于“加载不可信模型配置”这一前提本身（config.json 可触发任意 HF 组件），但这属于 vLLM 模型加载层的整体信任模型问题，本文件在其职责范围内做了合理限制。
+
+## 五、结论
+
+基于全文证据：唯一的 source→sink 流（config 字段 → resolve_obj_by_qualname）受命名空间前缀白名单保护，可达对象限于可信 torch 包内，无任意代码执行、反序列化或其他注入漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文唯一的动态对象解析位于第 50 行 resolve_obj_by_qualname(function_name)，其 source 为第 38-46 行从模型 config.json 读取的 activation_fn 或 sbert_ce_default_activation_function 字段。两条分支在第 47 行汇合后统一经过第 45-49 行的前缀白名单检查（必须以 torch.nn.modules. 开头），将可达对象严格限制在可信的 torch 标准库命名空间内，该子树中不存在 eval、exec、subprocess 等危险原语，故无法实现任意代码执行。其余入口点均无害：第 26-33 行 problem_type 仅做字符串相等比较选择固定类；第 22 行与第 87-90 行 num_labels 仅影响 sigmoid/softmax 分支；第 59-66 行 act_fn 参数来自内部构造且有 callable 类型检查；第 72-78 行 wraps 与第 113-124 行 LambdaPoolerActivation 持有的 callable 只能经上述已校验路径获得。全文不存在 eval、pickle 反序列化、文件读写、网络请求或子进程调用等其他 sink。", "fix_suggestion": "no fix needed"}
+```

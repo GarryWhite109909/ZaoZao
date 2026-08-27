@@ -1,0 +1,31 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `add` 子命令：flags `--type`、`--source`（第 24–25 行）
+2. `remove` 子命令：flag `--type` + 位置参数 `args[0]`（第 143–145 行）
+3. `edit` 子命令：flag `--type` + `args[0]` + 环境变量 `UNIGET_EDITOR`/`EDITOR`（第 180–200 行附近）
+4. `list` / `run` / `test` 子命令：flag `--type`，其中 `test` 接收 `args[0]` 作为 hook 名（第 255 行附近）
+5. 隐式入口：`viper.GetString("prefix")` 配置值
+
+**数据流逐一验证**
+
+- **add（第 91–131 行）**：`hookFileName` 取自 `--source` 的最后一段 basename（第 98–99 行），不含 `/`，无路径穿越；sink 是 `myos.CopyFile` 到固定目录。防御有效。但注意：若 `hookType` 不在四个合法值内，`hookFile` 为空串，CopyFile 会报错——仅可用性问题。
+- **remove（第 143–176 行）**：`hookFileName := args[0]`（第 145 行）**未做任何清洗**，直接拼接为 `hooksDir + "/" + hookFileName`（第 150–163 行），随后 `os.Remove(hookFile)`（第 170 行）。`args[0]` 可为 `../../etc/foo`，实现删除任意文件（受运行用户权限限制）。switch 无 default 分支也不阻止非法 `hookType` 时 `hookFile` 为空。
+- **edit（约第 177–240 行）**：同样 `hookFileName := args[0]` 无清洗，拼入 `hookFile` 后作为参数传给 `exec.Command(editorWithArgs[0], ...)`（第 218 行附近），可让编辑器打开任意路径文件；编辑后还会对其 `chmod 0700`（第 226 行附近），等于对任意系统文件赋予执行权限——权限提升原语。
+- **test（约第 245–280 行）**：`hookName := args[0]` 无清洗拼入 `hookFile`，sink 为 `runHook` 内的 `exec.Command(hookFile, args...)`（第 325 行附近的 #nosec G204 处）。攻击者可指定 `../../bin/sh` 等任意可执行文件并以当前用户身份执行，且 `args[1:]` 全部透传为命令行参数。这是最直接的**任意命令执行**流：source=CLI 参数 → 无过滤 → sink=exec.Command。
+- **run（第 236–250 行）与 processHooks/runHooks（第 282–310 行）**：只遍历固定目录下非隐藏文件并执行，目录本身由 prefix 配置决定；风险在于 hooks 目录内容本就可被 `add/edit` 写入任意脚本——这是设计使然（本地工具），但在多用户共享 prefix 场景下构成提权链。
+- **替代通道确认**：`prefix` 来自 viper 配置/环境变量，可改变根目录，进一步放大 remove/edit/test 的穿越范围。
+
+**结论**：存在漏洞。核心是 `remove`/`edit`/`test` 三处对位置参数 `args[0]` 未做路径规范化或白名单校验即拼接进文件路径，导致路径穿越（CWE-22），并在 `test` 中直接升级为任意命令执行（CWE-78）。`#nosec G204` 注释只是压制告警，不构成防御。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 路径穿越 / CWE-78 命令注入",
+  "risk_level": "high",
+  "source": "line 145 与 line 197、line 255 附近: remove/edit/test 子命令的位置参数 args[0]，以及 --type flag",
+  "sink": "line 170 os.Remove(hookFile)；line 218 附近 exec.Command(editor...)；line 325 附近 runHook 中 exec.Command(hookFile, args...)",
+  "explanation": "remove/edit/test 将用户提供的 args[0] 未经任何过滤直接拼接为 hooksDir + '/' + hookFileName，传入 ../../ 即可穿越到任意路径 -> 分别造成任意文件删除(os.Remove)、任意文件以编辑器打开并被 chmod 0700(提权原语)、以及通过 test 以任意二进制加任意参数执行命令(exec.Command)，构成任意命令执行",
+  "fix_suggestion": "line 145/197/255 附近: 对 hookName 使用 filepath.Base 并用 filepath.Clean 规范化后校验结果仍位于对应 hooks 目录内(filepath.Rel 检查无 .. 前缀)，同时对 hookType 增加 default 分支拒绝非法值"
+}
+```

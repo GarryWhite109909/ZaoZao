@@ -1,0 +1,29 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `resolve_url()`（第 76 行起）：外部 source 为 `$url` 参数（来自 HTML/CSS 中的图片地址），以及 `$protocol/$host/$base_path/$options`。
+2. `addTempImage()/getTempImage()`（第 152、166 行）：内存注册表，无文件操作 sink，仅存取数组。
+3. `clear()`（第 180 行）：对缓存路径执行 `unlink()`（第 190、200 行），但路径均由本类 `tempnam()` 或内部注册产生，非用户可控。
+4. 文件底部 `realpath(__DIR__...)`：固定路径，无风险。
+
+**数据流验证**
+
+- **流 A：$url → 协议白名单 → getFileContent（SSRF 面）**
+  - 第 88 行 `build_url` 拼接完整 URL；第 92–101 行仅当协议不在 `$options->getAllowedProtocols()` 时抛异常，随后执行用户可配置的 `$rule($full_url)` 校验。
+  - 关键缺陷：规则校验只针对**初始 URL** 执行一次；第 122 行 `Helpers::getFileContent($full_url, ...)` 底层基于 HTTP 流封装，默认**跟随重定向**。攻击者控制的外部服务器可返回 302 跳转到 `http://169.254.169.254/`、内网地址等，规则校验被完全绕过 → **SSRF（CWE-918）**。黑名单/一次性规则按题目标准视为可绕过防御。
+  - 另外第 93 行 `strpos($protocol, "data:") === 0` 使任何以 `data:` 开头的解析结果**完全跳过协议规则检查**，若上游 URL 归一化存在歧义（如大小写/空白变体在 `explode_url` 后仍落入 data 分支），构成第二入口绕过通道。
+
+- **流 B：file:// 本地文件读取**
+  - 第 104–105 行：若 `$allowed_protocols` 含 `file://` 且其 rule 放行（chroot 规则由部署方配置，代码本身不强制 chroot），则 `$resolved_url = $full_url` 直接作为本地路径读取并回显到 PDF → 潜在 **LFI（CWE-22）**，属配置依赖型漏洞。
+
+- **流 C：远程内容写入临时文件**
+  - 第 112 行 `tempnam($tmp_dir, ...)` 文件名随机不可控；第 127 行写入后第 139–143 行用 `dompdf_getimagesize` + 类型白名单（gif/png/jpeg/bmp/svg/webp）校验，不通过即删除。无任意扩展名/路径注入 → 无任意文件写/RCE。
+
+- **流 D：catch 块缓存污染（第 147 行）**
+  - 失败时将 `broken_image` 写入 `$_cache[$full_url]`，仅影响可用性/信息泄露（警告消息含原始 `$url`，经 `record_warnings` 可能回显到日志/PDF 注释），低危。
+
+**结论**：核心可确认漏洞为流 A 的 SSRF——规则校验与实际取回内容之间存在重定向 TOCTOU 缺口，且 data: 分支免检。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 SSRF", "risk_level": "中高", "source": "line 76: resolve_url 的 $url 参数（来自文档中的图片 URL）", "sink": "line 122: Helpers::getFileContent($full_url, ...) 发起网络请求", "explanation": "line 96-100 的协议规则只校验初始 $full_url 一次，而 line 122 取回内容时底层 HTTP 封装默认跟随重定向，攻击者可控服务器返回 302 即可访问内网或云元数据地址；此外 line 93 对 data: 前缀直接跳过全部规则检查，构成替代绕过通道", "fix_suggestion": "在 line 122 使用禁止重定向的流上下文，并对每一跳重定向目标重新执行 line 96-100 的协议与主机规则校验；同时收紧 line 93 的 data: 判定，确保归一化后的 URL 无法伪装进入免检分支"}
+```

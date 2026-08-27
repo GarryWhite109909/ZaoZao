@@ -1,0 +1,65 @@
+LANG: python
+```python
+import re
+import subprocess
+import shlex
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+WORKSPACE = "/srv/workspace"
+TIMEOUT = 60
+
+ALLOWED_BINARIES = {"ls", "cat", "grep", "find", "wc", "head", "tail", "echo"}
+
+def guard_command(cmd, cwd):
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return "Command blocked (malformed command)"
+    if not tokens:
+        return "Command is required"
+    if tokens[0] not in ALLOWED_BINARIES:
+        return "Command blocked by safety guard"
+    for token in tokens[1:]:
+        if token.startswith("-") and token not in {"-l", "-n", "-i", "-r"}:
+            return "Command blocked by safety guard"
+        if ".." in token or token.startswith("/"):
+            return "Command blocked (path traversal detected)"
+    return ""
+
+@app.route("/api/exec", methods=["POST"])
+def exec_command():
+    data = request.get_json(silent=True) or {}
+    command = data.get("command")
+    if not command:
+        return jsonify({"error": "command is required"}), 400
+
+    cwd = data.get("working_dir") or WORKSPACE
+    err = guard_command(command, cwd)
+    if err:
+        return jsonify({"error": err}), 403
+
+    try:
+        result = subprocess.run(
+            shlex.split(command),
+            cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT
+        )
+        output = result.stdout + result.stderr
+        return jsonify({"output": output or "(no output)"})
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Command timed out"}), 504
+    except (FileNotFoundError, PermissionError):
+        return jsonify({"error": "Command execution failed"}), 400
+
+if __name__ == "__main__":
+    app.run()
+```
+
+分析：
+
+1. **第 27 行**：用户可控输入点为 `request.get_json()` 的 `command` 字段与 `working_dir` 字段，二者均来自 POST `/api/exec` 请求体，是主数据流起点。
+2. **第 29 行**：`command` 原样传入 `exec_command`，原代码在第 43 行以 `["sh", "-c", command]` 执行——shell 元字符（`;`、`|`、反引号等）可注入任意命令，这是 CWE-78 的 sink。
+3. **防御类型正确性**：修复采用白名单精确允许集——第 12 行 `ALLOWED_BINARIES` 只允许固定二进制名，第 17 行拒绝任何不在集合内的首 token；同时用 `shlex.split`（第 16 行）做词法切分，使 shell 元字符失去拼接语义。这满足“白名单精确允许集”的有效防御标准，取代了原来的黑名单正则。
+4. **位置正确性**：校验位于第 31–34 行的 `guard_command` 调用点之后、第 41 行 sink 之前，所有到达 `subprocess.run` 的命令必先通过白名单；且第 42 行将 sink 从 `["sh", "-c", command]` 改为 `shlex.split(command)`，彻底移除 shell 解释层，即使绕过校验也无法执行复合命令。
+5. **攻击面覆盖完整性**：`working_dir` 数据流保持原样（仅作为 `cwd` 参数传给 `subprocess.run`，不经过 shell），符合 minimal pair 局部对照要求；新增第

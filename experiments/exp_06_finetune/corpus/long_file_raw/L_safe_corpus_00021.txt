@@ -1,0 +1,34 @@
+## 编号分析
+
+1. **入口点枚举（全文）**
+   - 第 88–140 行 `_run`：CLI 参数 `-i/--input`、`-o/--output`、`-lut`、`-elp`、`-ssp`、`-p` 等均为外部可控 source。
+   - 第 141–152 行：LUT 文件路径来自 `--look-up-table`，与 `cwd` 拼接后交给 `load_LUT`。
+   - 第 155–170 行：分发到 `jinja_multiple_md` 或 `jinja_ify`。
+
+2. **load_LUT（第 174–186 行）**：使用 `ruamel.yaml.YAML().load()`，默认为安全往返加载器，不执行任意 Python 对象构造，无反序列化 RCE。prefix 操作仅做字典自嵌套，无危害。→ 无漏洞。
+
+3. **jinja_ify（第 189–243 行）**
+   - **输入模板（第 194–195 行）**：`template_folder = pathlib.Path.cwd()`，随后 `jinja_env.get_template(str(r_input_file))`。`r_input_file` 直接来自用户参数 `args.input`，注释声称“相对于 trestle 根目录”，但**此处从未对 input 路径做任何校验或限制在 trestle_root 内**。`FileSystemLoader` 允许 `../` 相对跳转，攻击者可传如 `../../etc/passwd`，将任意本地文件作为 Jinja 模板读取并渲染进输出文件——**任意文件读取/信息泄露**。
+   - **输出路径（第 226–227 行）**：`PathSecurityValidator.validate_local_path(output_file, trestle_root)` 有效防御了输出侧路径穿越写。
+   - **SSTI 防护（第 262–268 行）**：环境由可信代码创建（`autoescape=True`，扩展来自受信模块），且 `render_template` 只渲染一次，lut 数据不二次解析为模板；但注意 lut 内容若含 `{{ }}` 也只是被转义显示，不构成注入执行。然而第 195 行的“把用户指定文件当模板”本身就是模板加载面失控。
+   - SSP/profile 加载走 `load_validate_model_name` 与 `ModelUtils.get_model_path_for_name_and_class`，限定在 trestle 模型目录内，无穿越。
+
+4. **jinja_multiple_md（第 246–296 行）**
+   - 目录创建与最终写出前均调用 `PathSecurityValidator.validate_local_path`（第 274、289 行），输出侧防御有效。
+   - 但第 282 行同样使用 `jinja_env.get_template(str(r_input_file))`，与第 195 行相同的**未校验输入模板路径**问题在第二入口复现——替代通道确认存在。
+
+5. **_number_captions（第 271 行起）**：纯正则文本处理，无 sink。
+
+6. **结论**：输出路径有有效防御；YAML 加载安全；唯一真实缺陷是两个入口点中 `get_template(str(args.input))` 未验证路径位于允许范围内，构成任意文件读取（内容还会被写入项目内输出文件，造成泄露）。风险等级：中。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "path_traversal_arbitrary_file_read",
+  "risk_level": "medium",
+  "source": "CLI 参数 args.input（-i/--input，第 90 行定义）",
+  "sink": "jinja_env.get_template(str(r_input_file))（第 195 行及第 282 行）配合 FileSystemLoader(cwd)",
+  "explanation": "input 参数仅声称相对 trestle 根目录，但在传入 get_template 前未调用 PathSecurityValidator 校验；FileSystemLoader 基于 cwd 解析并接受 ../ 序列，攻击者可指定如 ../../etc/passwd 的路径，使任意本地文件被当作 Jinja 模板加载并渲染到项目内的输出文件中，导致敏感文件内容泄露。该问题同时存在于 jinja_ify 和 jinja_multiple_md 两个入口。相比之下，所有输出路径均经 PathSecurityValidator.validate_local_path 校验，YAML 使用安全的 ruamel 默认加载器，模板只渲染一次且有 autoescape，故不存在写穿越、反序列化 RCE 或二次 SSTI。",
+  "fix_suggestion": "在调用 get_template 前对 input 路径做与输出一致的校验：解析绝对路径并确认其位于 trestle_root（或明确声明的模板目录）之内，拒绝包含 .. 的越界路径；同时在 FileSystemLoader 层限制可访问的根目录。"
+}
+```

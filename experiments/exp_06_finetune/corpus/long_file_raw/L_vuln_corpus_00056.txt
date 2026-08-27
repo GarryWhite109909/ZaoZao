@@ -1,0 +1,32 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：本文件是 MCP server，入口即三个 `@mcp.tool()`：`consult_gemini`、`consult_gemini_with_files`、`web_search`，均由远程 MCP 客户端调用；另有环境变量入口（第 21–25 行的 `GEMINI_BRIDGE_*`、`_get_timeout` 读 `GEMINI_BRIDGE_TIMEOUT`）。无其他路由/回调。
+
+2. **model 参数**（`_normalize_model_name`）：白名单映射，未匹配且以 `gemini-` 开头才透传，否则回退默认。随后作为 `cmd = ["gemini", "-m", selected_model]` 的 argv 元素传入 `subprocess.run`（无 shell），不构成命令注入。透传任意 `gemini-*` 字符串风险极低。
+
+3. **query 参数**：通过 `subprocess.run(..., input=query)` 走 stdin，无 shell 拼接，无注入。
+
+4. **directory 参数**：仅检查 `is_dir()`，无任何根目录约束——MCP 客户端可指定任意目录执行 CLI。这本身扩大攻击面但主要危害体现在下条。
+
+5. **核心漏洞 —— files 参数任意文件读取并外传**：
+   - source：`consult_gemini_with_files` 的 `files` 列表（MCP 客户端完全可控）。
+   - `_resolve_path` 中：若 candidate 是绝对路径则直接采用（`abs_path = str(candidate_path)`）；相对路径也未阻止 `../` 穿越——只把越界的 `rel_path` 置 None 用于显示，**abs_path 照样返回**。
+   - 在 **inline 模式**（`_prepare_inline_payload`）：对 `rel_path is None`（目录外文件）没有任何拦截，直接调用 `_read_file_for_inline(abs_path)` 读取内容，拼进 payload 经 stdin 发给 gemini CLI 上传至 Google 云端 LLM。即 MCP 客户端可读取宿主机任意可读文件（如 `~/.ssh/id_rsa`、`.env`、`/etc/passwd`）并把内容外发到第三方服务。
+   - 对比：**at_command 模式**（`_prepare_at_command_prompt`）在 `rel_path is None` 时明确跳过目录外文件——说明作者意识到该威胁模型，但 inline 模式遗漏了同等防护，属不一致防御。
+   - sink：`_read_file_for_inline` 的 `handle.read()` / head+tail 读取，及后续 `subprocess.run(input=stdin_content)` 外发。
+
+6. **防御有效性核验**：inline 模式的限制只有大小/数量截断（防 DoS），与路径边界无关；黑名单/正则不存在；故无有效缓解。CWE 归类为 CWE-22（路径穿越导致任意文件读取）并可叠加 CWE-200 信息暴露（数据外发第三方 LLM）。
+
+7. **次要问题**：`directory` 无根约束 + `at_command` 模式允许在任意 cwd 内让 CLI 自行读 cwd 下文件；以及 LLM 输出原样返回给客户端（提示注入面），但主结论以第 5 条为准。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 (Path Traversal / Arbitrary File Read) with CWE-200 information exposure",
+  "risk_level": "high",
+  "source": "line ~330: consult_gemini_with_files 的 files 参数（MCP 客户端可控，含绝对路径或 ../ 相对路径）",
+  "sink": "line ~150: _read_file_for_inline 中 handle.read() 读取任意路径文件，随后经 subprocess.run 的 input 外发给 gemini CLI 上传至云端 LLM",
+  "explanation": "_resolve_path 对绝对路径直接采纳、对 ../ 穿越仅在显示用 rel_path 上置 None 但仍返回 abs_path；inline 模式的 _prepare_inline_payload 不检查 rel_path 是否为 None 即读取并发送文件内容，而 at_command 模式有此检查，证明防御缺失属实现疏漏 -> 攻击者可通过 MCP 工具调用读取宿主任意可读文件并将内容外泄到第三方 AI 服务",
+  "fix_suggestion": "line ~130: 在 _resolve_path 或 _prepare_inline_payload 中当 rel_path 为 None（文件位于 directory 之外）时跳过该文件，与 _prepare_at_command_prompt 保持一致；同时对 directory 参数增加允许根目录白名单校验"
+}
+```

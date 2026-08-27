@@ -1,0 +1,24 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：
+   - `init()` 第 60-100 行：从数据库读取已启用的 webhook 配置（`getEnabledWebhooks()`），注册事件回调。webhook 的 `class`、`event`、`filters`、`method`、`payloadTemplate`、`headers`、`url`、`debounceKeyFormat` 均来自数据库中的管理员配置，非 HTTP 用户输入。
+   - CP 路由注册第 137-145 行：路由参数仅 `<groupId:\d+>`、`<id:\d+>` 数字约束，控制器不在本文件。
+   - `settingsHtml()`、`getCpNavItem()`：渲染固定模板，无用户输入拼接。
+   - `request()` / `sendRequest()` / `getRequestData()`：以整数 `requestId` 查询数据库，Yii Query 使用参数绑定，无 SQL 注入。
+   - GC 回调第 148-165 行：仅删除过期记录，配置来自 settings 文件。
+
+2. **source→sink 数据流验证**：
+   - **HTTP 请求 sink（SSRF 面）**：`sendRequest()` 第 262 行 `->request($data['method'], $data['url'], ...)`。`$data['url']` 来自 `webhookrequests` 表，源头是 `request()` 写入的 `$webhook->url`——即 CP 后台由具备管理权限的管理员创建的 webhook 配置。这是插件的设计功能（向管理员指定的任意 URL 发送通知），不构成可被低权限用户利用的 SSRF；且 `App::parseEnv` + `renderSandboxedString`（沙箱模板引擎）处理了值。防御有效（权限边界 + 沙箱渲染）。
+   - **头部注入**：第 108-125 行 headers 按 `\r\n` 分割成行后逐条加入 Guzzle headers 数组，Guzzle 会拒绝含 CRLF 的头值；多行被拆分而非原样传递，CRLF 注入不可达。
+   - **动态类调用**：第 71-74 行 `class_exists($filterClass)` + `$filterClass::check(...)`。`$filterClass` 来自数据库 filters 键（管理员配置），且要求实现 `FilterInterface::check` 才有副作用；`class_exists` 仅触发自动加载，无法实例化或调用任意方法，不可被普通用户控制。
+   - **JSON 编码**：第 128-131 行 body 经 `Json::encode`，无反序列化 sink（无 `unserialize`）。
+   - **SQL**：所有查询使用 Yii Query 参数化（第 196-205、243-250、292-300 行），无拼接。
+   - **敏感信息泄露**：`toArray()` 第 355 行对 depth=1 结果调用 `redactIfSensitive`，且有 `maxDepth` 防递归爆炸。
+
+3. **第二入口与替代通道**：队列 job `SendRequestJob` 仅携带 `requestId` 整数；`pushPendingJobs` 在请求结束后推入队列，无外部可控数据进入 sink。环境变量经 `App::parseEnv` 属部署侧配置。
+
+4. **结论**：本文件内所有 sink 的 source 均为管理员级配置或参数化数据库操作，未发现可被外部攻击者触达的漏洞。唯一值得注意的点是 webhook URL 可指向内网（SSRF），但这是需要 CP 管理权限的预期功能，属设计权衡而非漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认：所有到达危险 sink 的数据流源头均为 CP 后台管理员配置的 webhook 记录或参数化的数据库查询。sendRequest 中的 HTTP 请求 URL 来自管理员创建的 webhook 配置并经 App::parseEnv 与 renderSandboxedString 处理，属于插件的预期功能且受管理权限保护；headers 经过按换行拆分处理并由 Guzzle 防护 CRLF 注入；filterClass 虽为动态类名但仅做 class_exists 且需实现 FilterInterface 接口；所有 SQL 均通过 Yii Query 参数绑定；toArray 有 maxDepth 限制与 redactIfSensitive 脱敏。未发现外部用户可控的 source 到 sink 路径。", "fix_suggestion": "no fix needed"}
+```

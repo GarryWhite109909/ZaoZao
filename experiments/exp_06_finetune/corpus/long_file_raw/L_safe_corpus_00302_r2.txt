@@ -1,0 +1,57 @@
+# 逐函数安全分析（全文通读，行号锚定）
+
+## 1. 文件级入口点枚举
+
+本文件为 langchain_core 的 `DictPromptTemplate` 模块（第 1 行 docstring），无 HTTP 路由、无文件 I/O、无环境变量读取、无回调注册。全部外部输入通道仅两类：
+
+- **E1**：构造/反序列化时传入的 `template` dict 与 `template_format` 字面量（第 21–23 行字段定义）；
+- **E2**：`format` / `invoke` / `aformat` 调用时传入的 `kwargs` / `input` dict（第 40、47、53 行）。
+
+## 2. 逐函数分析
+
+### 2.1 `validate_template`（第 25–28 行）
+Pydantic model_validator，mode=after。唯一动作是调用 `_get_input_variables(self.template, self.template_format)`（第 27 行）并丢弃返回值。该函数是纯只读遍历，不执行格式化、不触达任何 sink。它仅起“提前暴露非法模板”的作用——若模板字符串含非法 f-string 占位符会在此抛错。**无数据流到达 sink，无漏洞。**
+
+### 2.2 `input_variables` 属性（第 31–33 行）
+直接转发到 `_get_input_variables`（第 32 行），只读提取变量名列表。source 为 template 字符串值，sink 为返回值（供调用方做白名单校验），本身不构成危险操作。
+
+### 2.3 `format`（第 35–44 行）
+Source：`kwargs`（任意用户可控键值）。Sink：`_insert_input_variables(self.template, kwargs, self.template_format)`（第 43 行）。关键点：formatter 是 `DEFAULT_FORMATTER_MAPPING[template_format]`（第 62 行），f-string 分支对应 `string.Formatter().vformat` 的受限版本——langchain 的 `_StringFormatter` 禁止属性访问（`.attr`）、索引（`[idx]`）与 format spec 转换，因此经典 Python 格式化字符串攻击（如 `{0.__class__}` 泄露对象图）在此被结构性阻断。且替换值来自用户提供的 `inputs` 值本身，不产生新的求值路径。**防御有效，非黑名单式过滤。**
+
+### 2.4 `aformat`（第 46–51 行）
+直接同步委托 `self.format(**kwargs)`（第 50 行），与 2.3 共享同一数据流与同一防御，无独立攻击面。
+
+### 2.5 `invoke`（第 53–61 行）
+将 `input: dict` 经 `_call_with_config(lambda x: self.format(**x), ...)`（第 56–57 行）送入 format。第二入口本质是 E2 的 Runnable 包装；`config` 仅用于 tracing 元数据（`ensure_config(config)` 第 58 行），不进入格式化数据流。无新增 sink。
+
+### 2.6 `_prompt_type` / `_serialized` / `is_lc_serializable` / `get_lc_namespace`（第 63–78 行）
+`_serialized` 调用 `dumpd(self)`（第 72 行）做 JSON 序列化，输出为结构化 dump，不执行代码。序列化本身是 langchain 标准机制；反序列化端的安全由 load 层的 allowed-object 白名单负责，不在本文件 sink 范围内。
+
+### 2.7 `pretty_repr`（第 80–90 行）
+无条件 `raise NotImplementedError`（第 89 行）。无逻辑、无数据流。
+
+### 2.8 `_get_input_variables`（第 93–112 行）
+递归遍历 dict values（第 97–98 行 str → `get_template_variables`；第 99–100 行嵌套 dict；第 101–107 行 list/tuple 内 str 与 dict）。注意：dict **keys 不被解析**（docstring 第 8–9 行明确声明），list/tuple 内更深层的 list 不递归——这是功能限制而非安全问题，因为该函数只收集变量名，从不格式化。无 sink。
+
+### 2.9 `_insert_input_variables`（第 115–146 行）——核心 sink 所在
+逐分支验证：
+
+- **str 分支（第 122–123 行）**：`formatter(v, **inputs)`。如 2.3 所述，langchain 受限 formatter 阻断属性/索引访问，防注入有效。
+- **dict 分支（第 124–131 行）**：递归处理；第 125–130 行对 `k == "image_url" and "path" in v` 发出 `warnings.warn`（第 130 行）提示本地文件路径滥用风险，但**仍继续递归格式化并保留该子树**（第 131 行）。评估：这只是弃用警告，不是删除行为；但真正的 sink（文件读取）并不在本模块——此处只是把 path 字符串原样放入输出 dict，是否读取文件取决于下游消费者。因此本文件内不存在 source→文件系统 sink 的完整数据流，警告属于纵深防御提示。非可利用漏洞。
+- **list/tuple 分支（第 132–142 行）**：对元素分别走 formatter 或递归（第 135–141 行），`type(v)(formatted_v)`（第 142 行）保留容器类型，类型安全。
+- **else 分支（第 143–144 行）**：非 str/dict/list 值原样透传 `formatted[k] = v`。透传的是**模板作者写死的常量**（int/bool 等），非用户输入，不可控注入。
+- **额外通道检查**：`inputs` 以 `**inputs` 展开，若 inputs 含多余键，受限 formatter 忽略未引用变量，不会泄漏进输出；若缺键则抛 KeyError，fail-closed。dict keys 永不被格式化（第 121 行循环仅格式化 value），消除了 key 注入通道。
+
+## 3. 第二入口与替代通道结论
+
+- 反序列化通道（`is_lc_serializable=True`，第 71–73 行）：dump 输出不含可执行内容；load 端防护在别处。
+- 无 subprocess / eval / open / SQL / 网络 sink 出现在全文（import 列表第 3–14 行可证：仅 warnings/functools/typing/pydantic/langchain_core）。
+- f-string formatter 若换成不受限实现才有风险，但映射取自 `DEFAULT_FORMATTER_MAPPING`（第 62 行），受控。
+
+## 4. 结论
+
+全文未发现可达的危险 sink；唯一的敏感模式（image_url/path）已被显式警告且实际文件读取不在本模块数据流内；格式化注入被 langchain 受限 formatter 结构性阻断。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文仅有两个输入通道：template 构造参数与 format/invoke 的 kwargs。所有格式化均经 DEFAULT_FORMATTER_MAPPING 中 langchain 受限 formatter 完成，禁止属性访问与索引，阻断格式化字符串注入；dict keys 不参与格式化；image_url/path 分支仅发出 warnings.warn 弃用警告且文件读取 sink 不在本模块；全文 import 无 eval/exec/open/subprocess 等危险函数，未发现可达 sink。", "fix_suggestion": "no fix needed"}
+```

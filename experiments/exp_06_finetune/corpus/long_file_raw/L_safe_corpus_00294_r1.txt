@@ -1,0 +1,38 @@
+# 编号分析（全文通读，逐函数行号锚定）
+
+## 1. 入口点枚举
+
+1. **构造入口 `__init__`（第 71–107 行）**：接收 `custom_code` 字符串参数，第 106 行调用 `_compile_custom_code()`。该参数来自管理员/配置文件（`CustomCodeGuardrailConfigModel`，第 47–51 行），属于受信配置面，非终端用户 HTTP 输入。
+2. **热更新入口 `update_custom_code`（第 316–377 行）**：第二个代码注入通道。第 320–324 行先调用 `validate_custom_code(new_code)` 做黑名单校验；随后在锁内重新 `exec`。
+3. **运行时入口 `apply_guardrail`（第 130–194 行）**：每次请求触发时执行已编译函数，输入为 `inputs` 与 `_prepare_safe_request_data` 过滤后的请求数据。
+
+## 2. source→sink 数据流验证
+
+**流 A：custom_code → exec（sink：第 96 行、第 339 行的 `exec(compile(...))`）**
+- 防御层 1：`validate_custom_code` 黑名单（第 90、320 行）。按要求视为可绕过，不计入有效防御。
+- 防御层 2（关键）：第 93 行 `exec_globals = get_custom_code_primitives().copy()` —— 全局命名空间仅含 LiteLLM 提供的原语（regex_match、http_post 等白名单函数），无 os/sys/subprocess/import 等；第 95 行 `exec_globals["__builtins__"] = {}` 清空内建，阻断 `open`、`eval`、`getattr` 经典逃逸路径；模块文档（第 15–18 行）声明无文件 I/O、无网络、禁止 import——因为受限 globals 中根本没有 `__import__`，用户代码无法导入任何模块。
+- 结论：即使黑名单被绕过，exec 的可达能力被白名单原语严格限定。**防御有效**。
+
+**流 B：update_custom_code 的第二入口（第 316–377 行）**
+- 同样先过 validate（第 320 行），再以相同的受限 globals + 空 builtins 执行（第 338–340 行）。与初始编译路径防护一致，无降级差异。失败时回滚旧代码（第 352–366 行），不产生半更新状态。**无新增漏洞**。
+
+**流 C：请求 inputs → 用户函数 → 结果处理**
+- 第 172 行仅传入 `inputs` 和过滤后的 `safe_request_data`；`_prepare_safe_request_data`（第 196–216 行）只暴露 model/user_id/team_id/end_user_id/metadata，剥离了 API key 等敏感字段。
+- `_process_result`（第 233–314 行）：对返回值做类型检查（第 245 行），action 仅 allow/block/modify 三分支，未知 action 默认 allow（第 309–314 行）。block 路径经 `raise_passthrough_exception` 或 HTTPException（第 275、282 行），modify 仅替换 texts/images/tool_calls 键。无 eval/format 注入、无路径拼接 sink。**安全**。
+
+**流 D：异常处理**
+- 第 186–194 行将执行异常包装为 `CustomCodeExecutionError` 并记录日志，错误消息含异常文本但不进入任何解释性 sink（无 HTML/SQL/shell 拼接），仅为日志与响应 detail。信息泄露风险极低且属设计行为。
+
+## 3. 替代通道核查
+
+- 无文件读写、无环境变量读取、无子进程、无回调注册到不受限上下文。
+- 唯一动态执行点是两处 `exec`，均使用同一套受限 globals 构造。
+- `threading.Lock`（第 84、330 行）保证编译原子性，无竞态导致的未验证执行窗口（validate 在锁外但 exec 在锁内且 exec 前 globals 已重建受限环境）。
+
+## 4. 结论
+
+该文件是「管理员自定义 guardrail 代码」功能，威胁模型下 custom_code 属受信管理员输入；即便视其为不可信，空 `__builtins__` + 白名单原语的沙箱设计阻断了任意代码执行的 sink 可达性。全文未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文共三处主要数据流：(1) 第71-107行 __init__ 接收 custom_code 并在第96行 exec；(2) 第316-377行 update_custom_code 作为第二入口在第339行再次 exec，两条路径均先经 validate_custom_code 且都使用 get_custom_code_primitives 白名单原语并将 __builtins__ 置空（第93-95、338-340行），即使黑名单正则被绕过也无法触达 os/sys/import 等危险能力，沙箱防御有效；(3) 第130-194行 apply_guardrail 运行时仅传入 inputs 与第196-216行过滤后的 safe_request_data，结果处理第233-314行仅允许 allow/block/modify 三种动作，无解释性 sink。custom_code 来自管理员配置而非终端用户输入，威胁模型内不存在可利用的 source 到危险 sink 的通路。", "fix_suggestion": "no fix needed"}
+```

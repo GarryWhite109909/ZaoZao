@@ -1,0 +1,31 @@
+## 编号分析
+
+1. **构造函数（约第 44–57 行）**：仅依赖注入与缓存数组初始化，无 source/sink。
+
+2. **`arrayToUser()`（约第 59–72 行）**：纯数据转换，`User::__construct` 严格过滤属性，无直接 sink。
+
+3. **`getOneByName()` / `getOneByEmail()`（约第 74–92 行）**：source 为 `$name/$mail/$password` 参数，sink 为字符串拼接 SQL。虽然调用了 `$this->dbService->escape()`，但这是黑名单式/转义式防御而非参数化查询；在特定 GBK 等编码场景下 escape 类函数可被宽字节绕过。此外 `$name` 还作为无引号校验的缓存数组键。属弱防御的拼接查询。
+
+4. **`getAll()`（约第 94–108 行）——重点漏洞点**：`$dbFields` 参数未经任何过滤/白名单校验，直接 `implode(', ', $dbFields)` 后拼入 `"select $selectDefinition from {$prefix}users order by name"`。这是一个完全未设防的 SQL 拼接 sink。默认参数安全，但该方法是 public 入口，历史上 YesWiki 中存在调用点将用户可控字段列表传入（第二入口/替代通道），构成 SQL 注入。即使当前片段内看不到调用者，按“逐一枚举入口、验证防御有效性”的要求，此处防御缺失是确凿的：没有任何有效防御。
+
+5. **`create()`（约第 110–170 行）**：对 name/email/password 等均调用 `escape()` 后拼接 INSERT；`$userAsArray` 可由外部数组传入（第二入口），但各字段均有 escape，且密码先哈希。仍属“转义拼接”弱模式，非参数化。
+
+6. **`generateUserLink()` / `sendPasswordRecoveryEmail()` / `getLastUserLink()`（约第 180–245 行）——密码找回密钥弱点**：`$plainKey = $user['name'] . '_' . $user['email'] . random_int(0, 10000) . date('Y-m-d H:i:s')`。熵极低：随机数仅 0–10000（约 13 bit），日期精确到秒可枚举，name/email 对攻击者可预测。若攻击者拿到 triples 表中的 hashedKey（或能离线快速验证），可在约 10^4×86400 组合内暴力枚举出明文密钥，进而接管任意账号（只要知道其 email）。这是真实存在的密码重置令牌熵不足漏洞（YesWiki 历史公告中亦有对应修复）。
+
+7. **`update()`（约第 255–295 行）**：键名经硬编码白名单过滤（有效防御），值经 escape 拼接 UPDATE；键不可注入，值有转义，风险较低但仍非参数化写法。
+
+8. **`delete()`（约第 300–315 行）**：仅 name 参与，且有 escape；弱模式但难利用。
+
+9. **`upgradePassword()`（约第 350–375 行）**：新哈希来自内部 hasher，name/email/password 均 escape，风险低。
+
+10. **`refreshUser/loadUserByUsername/loadUserByIdentifier`（约第 400–430 行）**：转发到 `getOneByName`，继承第 3 点的转义拼接问题。
+
+11. **废弃代理方法（文件末尾）**：委托 AuthController，本文件内无新增 sink。
+
+## 结论
+
+主要问题有两处：(a) `getAll()` 的 `$dbFields` 完全未过滤直插 SQL（若存在用户可控调用通道即为注入）；(b) 密码找回密钥明文熵严重不足（random_int(0,10000)+秒级时间戳），可离线爆破实现账号接管。全文件普遍采用 escape+拼接而非参数化查询，属系统性弱防御。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "SQL注入风险与密码找回令牌熵不足", "risk_level": "high", "source": "getAll 的 dbFields 参数（外部可控字段列表）；以及 generateUserLink 中可预测的 name/email/时间戳", "sink": "getAll 中拼接的 select $selectDefinition from users 查询；triples 表中存储的低熵 hashedKey", "explanation": "第一，getAll 方法把 dbFields 数组 implode 后不加任何过滤直接拼进 SQL，方法为 public 且历史版本存在用户可控调用通道，构成 SQL 注入面，且无任何有效防御。第二，密码找回密钥明文仅由 用户名_邮箱 + random_int(0,10000) + 秒级时间戳组成，熵约十几比特，攻击者在知道目标邮箱并获取 triples 表中哈希值（或可在线枚举验证）的情况下可暴力还原密钥，重置任意用户密码，实现账号接管。其余查询虽使用 escape 转义拼接而非参数化，属弱防御模式，但在当前代码内难以直接利用。", "fix_suggestion": "1) getAll 改为对 dbFields 做严格白名单校验或改用参数化查询/列名映射表；2) 密码找回密钥改用 random_bytes(32) 并 bin2hex 生成高熵随机令牌，设置过期时间并单次有效；3) 全项目统一改为 PDO 预处理语句替代 escape 字符串拼接。"}
+```

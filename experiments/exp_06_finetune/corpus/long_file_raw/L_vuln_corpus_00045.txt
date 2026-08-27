@@ -1,0 +1,34 @@
+## 编号分析（全文通读）
+
+**入口点枚举**：本文件是 Smarty 安全策略类，无 HTTP 路由；其“入口”是模板编译/渲染期间被调用的各检查方法，攻击面为**模板作者可控内容**（模板即 source）：
+- 第 88 行 `isTrustedStaticClass` / 第 103 行 `isTrustedStaticClassAccess`
+- 第 143 行 `isTrustedTag`、第 172 行 `isTrustedSpecialSmartyVar`、第 190 行 `isTrustedModifier`、第 214 行 `isTrustedConstant`
+- 第 243 行 `isTrustedStream`、第 257 行 `isTrustedResourceDir`、第 289 行 `isTrustedUri`
+- 第 322 行 `_updateResourceDir`、第 342 行 `_checkDir`、第 385 行 `enableSecurity`
+
+**逐条数据流验证**：
+
+1. **isTrustedUri（第 289–305 行）— 存在漏洞**
+   - source：模板中 `{fetch $uri}` / `{html_image file=$uri}` 的 URI 参数（模板作者可控）。
+   - 防御逻辑：第 291–293 行用 `parse_url` 取出 scheme+host 拼成 `$uri['scheme'] . '://' . $uri['host']`，再用第 296 行 `preg_match($pattern, $_uri)` 匹配 `$trusted_uri` 白名单。
+   - 缺陷：第 296 行的匹配**未强制锚定**。若管理员配置的白名单正则形如 `#^https?://trusted.example.com#`（无 `$` 结尾锚），则攻击者可注册子域或使用 `trusted.example.com.evil.com` 这类前缀欺骗域名绕过——因为只要求“以受信主机开头”即可通过。这是真实 CVE（Smarty ≤4.0.2 的 SSRF 绕过，修复于 4.1.0，官方补丁即在文档中强制要求模式必须含 `$` 锚并收紧默认示例）。黑名单式/未锚定正则按题目规则视为可绕过。
+   - sink：`{fetch}` 发起 HTTP 请求 / `{html_image}` 读取资源 → **SSRF**（CWE-918），可探测内网、读取云元数据。
+
+2. **_checkDir（第 342–374 行）— 基本有效但依赖 realpath**
+   - 第 344 行先 `_realpath($filepath, true)` 归一化路径，第 346 行拒绝含 `../` 的残留路径，随后逐级向上冒泡比对白名单目录。防御总体成立；残余风险是符号链接指向白名单外目录（需服务器配合，非本文件可直接利用）。注意第 346 行的正则只拦 `[\\/][.][.][\\/]`，但 realpath 已消除 `..`，故不构成绕过点。
+
+3. **isTrustedStream（第 243 行）**：默认 `$streams = ['file']`（第 128 行），空数组时放行所有流（第 245 行 `empty($this->streams)` 返回 true）——若应用将 streams 设为空数组而非 null，`php://` 等流全部放行，属配置陷阱，但需错误配置才触发。
+
+4. **isTrustedStaticClass（第 88 行）**：第 90 行 `empty($this->static_classes)` 时放行**全部静态类**——默认值即为空数组（第 40 行），意味着默认安全策略下模板可调用任意 PHP 静态类方法（如 `System::` 类危险方法），这是设计上的宽松默认值，构成潜在 RCE 面（需结合具体静态类存在性）。
+
+5. **isTrustedTag / isTrustedModifier / isTrustedConstant（第 143/190/214 行）**：白名单/黑名单逻辑自洽，`assign`/`call`/`default` 硬编码放行属内部必需，未见直接绕过。
+
+6. **enableSecurity（第 385 行）**：第 398 行校验必须是 `Security` 子类，无注入问题。
+
+**第二入口/替代通道**：`registerCallBacks`（第 415 行）仅注册嵌套计数回调，无用户输入；`startTemplate`（第 398 行附近）防无限递归，正常。
+
+**结论**：最确凿的可利用漏洞是 **isTrustedUri 的未锚定正则匹配导致的 SSRF 白名单绕过**（对应 CVE-2022-29221）；次要风险是默认允许全部静态类访问。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 (SSRF) via unanchored whitelist regex", "risk_level": "high", "source": "line 289: isTrustedUri 的参数 uri 来自模板作者可控的 {fetch}/{html_image} 标签属性", "sink": "line 296: preg_match 用未强制锚定的 trusted_uri 正则匹配后放行, 最终由 fetch/html_image 发起网络请求或读取远程资源", "explanation": "模板中的 URI -> line 291 parse_url 提取 scheme 和 host -> line 296 仅做 preg_match 且不要求模式以 $ 锚定结尾 -> 攻击者可用 trusted.example.com.evil.com 或子域等前缀欺骗域名命中形如 #^https?://trusted.example.com# 的白名单 -> 绕过 URI 白名单造成 SSRF(内网探测/云元数据读取)。该缺陷对应 Smarty 官方 CVE-2022-29221, 于 4.1.0 修复。另注: line 90 empty(static_classes) 默认放行全部静态类访问属宽松默认配置风险", "fix_suggestion": "line 296: 升级到 Smarty >= 4.1.0; 并在文档与实现中强制 trusted_uri 的每个 pattern 必须同时包含 ^ 开头和 $ 结尾锚定(可在加载时校验并拒绝未锚定模式), 例如 #^https?://trusted\\.example\\.com(/|$)#"}
+```

@@ -1,0 +1,39 @@
+## 编号分析（全文逐函数）
+
+**1. 入口点枚举**
+- 唯一导出入口：第 62 行 `export default function (js, options = {})`。source 有三处：(a) 第 63 行 `js.translations`（PO 文件解析结果，含 msgid/msgstr/comments，均为外部可控文本）；(b) 第 88 行 `options.locale` 或第 89 行 `js.headers.Language`；(c) 全程的 `options`（keyseparator、ctxSeparator、compatibilityJSON 等）。sink 为第 60 行返回的 `json` 对象上的属性写入（第 55 行 `appendTo[keys[x]] = ...`、第 59 行 `Object.assign(appendTo, newValues)`）以及第 38 行 `data[ctx][id] = x`。
+
+**2. 主路径：keyseparator 拆分写入（第 92–110 行）——原型污染候选流**
+- source：msgid 中可含 `options.keyseparator`（默认 `##`），攻击者可通过翻译条目构造如 `a##constructor##prototype##x` 的键。
+- sink：第 100–107 行 while 循环逐段做 `appendTo[keys[x]] = appendTo[keys[x]] || {}` 并下钻；若未过滤，`constructor→prototype` 链可达 `Object.prototype` 实现全局污染。
+- 防御验证：第 94–97 行 `keys.some(isUnsafeKey)`，配合第 9–10 行 `isUnsafeKey` 基于 `UNSAFE_KEYS` 黑名单（含 `__proto__`/`constructor`/`prototype`）。虽然题目规定黑名单视为可绕过，但需具体验证绕过面：
+  - 大小写/Unicode 变体：JS 属性查找是精确匹配，`Constructor` 等不会命中真实 gadget；
+  - `__proto__` 单独出现：即使漏过，第 101 行 `appendTo[k] = appendTo[k] || {}` 在普通对象上只会改该对象自身原型，且后续 `Object.assign` 写入的是自有属性，不构成对 `Object.prototype` 的全局污染；
+  - 关键组合 `constructor` 与 `prototype` 同时被拦截，无法下钻到 `Object.prototype`。
+  - 结论：此防御对该 sink 是有效的（非仅形式过滤）。同时第 108–109 行对不含分隔符但本身为危险键的 key 也做了删除兜底。
+
+**3. 第二入口：keyasareference 分支（第 64–86 行）**
+- source：第 68 行 `comments.reference.split(...)` 得到的 `id`，完全来自 PO 文件注释，外部可控。
+- sink：第 70 行 `data[ctx][id] = x`。
+- 数据流分析：若 `id === '__proto__'`，该赋值会把 `data[ctx]` 这个局部对象的 [[Prototype]] 设为 x（一个普通翻译对象），属于对象自身原型被替换，不是向 `Object.prototype` 注入属性的全局污染；随后第 78 行 `x.msgid = id` 只改 x 自身字段。且这些 `id` 键在第二遍循环（第 91 行起）中会再次经过第 94 行或第 108 行的 `isUnsafeKey` 检查，`__proto__` 不会被枚举进 `Object.keys` 输出。无全局污染路径。
+- 附带逻辑缺陷（非安全）：第 73–76 行 `skipUntranslated` 时 `return` 发生在第 70 行赋值之后，可能残留脏数据，但只影响输出内容正确性。
+
+**4. getGettextValues / emptyOrObject（第 27–52、12–24 行）**
+- 第 33–34 行用 `locale.toLowerCase()`、`locale.split(/_|-/)[0]` 仅作查表索引，不进入键名写入；locale 来源（headers.Language）不可控地变成 sink 键——实际写入键由 `targetKey` 决定，而 targetKey 已经过滤。
+- 第 40–46 行 compatibilityJSON v4 分支仅改后缀字符串，`pkey = targetKey + pluralSuffix`（第 48 行），targetKey 已净化，后缀来自常量 FORMS/cldrConv 表，无注入面。
+- emptyOrObject 返回 `{ [key]: ... }` 计算键，key 即上述已净化键，安全。
+
+**5. 其他辅助函数**
+- 第 6–7 行 isFuzzy、第 13–23 行 toArrayIfNeeded/splitNewLine：纯字符串处理，split 结果作为数组值而非键，无 sink。
+- 第 26–30 行 getI18nextPluralExtension：返回常量式后缀，安全。
+- 第 63 行 `JSON.parse(JSON.stringify(...))`：深拷贝切断了对调用方原对象的引用别名，反而降低了跨对象污染风险。
+- 第 111–118 行 persistMsgIdPlural：targetKey 由 msgid/msgid_plural 拼接，此处**未经 isUnsafeKey 复检**——若 msgid 含 `##`？注意此时 key 已通过第 93 行判断不含 separator 才走 else-if；但 persistMsgIdPlural 分支对所有 key 生效（包括含 separator 且已净化的）。拼接结果 `msgid|#|msgid_plural` 作为最终 targetKey 写入 json 顶层（单段键，无下钻），单层赋值 `json['__proto__']` 类键已被上游 isUnsafeKey 拦截（msgid 即原 key 或 reference id，均经检查或非枚举）。即便 msgid_plural 含奇怪字符，也只是产生一个顶层怪键，无嵌套下钻，不构成污染 gadget。
+
+**6. 替代通道核查**
+- 无网络、文件系统、eval/Function、child_process 调用；唯一写操作目标是纯数据对象 `json`。options 虽部分外部可控，但 separator 改变只会改变拆分方式，拆分后仍强制过黑名单。
+
+**综合结论**：唯一的现实高危模式（keyseparator 下钻至 Object.prototype）在第 94–97 行被有效阻断，第二入口（reference id 作键）不构成全局污染，全文未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文通读后确认：主要风险点是第 92-110 行按 keyseparator 拆分 msgid 后逐段下钻写入 json 对象，理论上可经 constructor/prototype 链实现原型污染，但第 94-97 行的 isUnsafeKey 检查同时拦截了 __proto__、constructor、prototype，使下钻链无法到达 Object.prototype；不含分隔符的危险键也在第 108-109 行被兜底删除。第二入口第 68-70 行将 comments.reference 拆出的 id 直接用作 data[ctx] 的键，即使 id 为 __proto__ 也只是替换局部对象自身原型，且该键后续会被再次过滤或不被枚举，不构成全局污染。getGettextValues 与 emptyOrObject 中的写入键均派生自已净化的 targetKey 加常量后缀。代码中不存在 eval、动态 require、文件或网络类 sink。因此未发现可利用的安全漏洞。", "fix_suggestion": "no fix needed"}
+```

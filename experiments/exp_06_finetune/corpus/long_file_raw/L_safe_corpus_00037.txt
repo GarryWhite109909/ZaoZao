@@ -1,0 +1,19 @@
+## 编号分析
+
+**入口点枚举（全文通读）**：本文件共 9 个视图函数，均为 `@login_required` + `@permission_required(Permissions.SCAN)` + POST 限制：`mobsfy`（第 64 行）、`execute_adb`（第 98 行）、`get_component`、`run_apk`、`take_screenshot`、`screen_cast`、`touch`、`mobsf_ca`、`global_proxy`。辅助函数 `get_package_name`（第 45 行）从 DB 或 `packages.json` 取包名。
+
+**逐条数据流验证**：
+
+1. **mobsfy（第 70→79 行）**：source 为 `request.POST['identifier']`，经 `cmd_injection_check`（第 71 行）过滤后传入 `Environment(identifier)`。按分析要求，黑名单类过滤视为可绕过，此防御不算有效；但 identifier 主要用于连接模拟器地址，实际命令拼接在 Environment 内部，风险有限。
+2. **execute_adb（第 101→106 行）**：source `request.POST['cmd']` **无任何校验**，直接 `cmd.split(' ')` 拼入 `subprocess.Popen(args + cmd.split(' '))`（第 105–108 行）。这是明确的 source→sink 命令注入流。代码注释（第 106 行 lgtm 标注）表明这是“有意设计”——允许已认证用户在 VM/AVD 内执行 adb 命令。但 adb 本身可在设备上执行 shell（如 `shell rm -rf /data`）、端口转发、安装任意 APK 等，且若 MobSF 部署时 adb 指向宿主或其他可达设备，影响扩大。防御仅有登录 + SCAN 权限，属访问控制而非输入净化，持有低权限账号即可利用。
+3. **touch（text 分支）**：`shlex.quote(x)` 正确转义，安全；数字分支经 `is_number` 校验，安全。
+4. **get_component / run_apk / take_screenshot**：均经 `is_md5` 白名单校验（十六进制定长），hash 类注入不可行；`take_screenshot` 中路径由 md5 拼接，md5 校验阻断了路径穿越。
+5. **mobsf_ca / global_proxy / screen_cast**：action 为固定枚举比较，无用户数据进入命令。
+
+**第二入口/替代通道**：`execute_adb` 是主要 AJAX 入口；MobSF 的 REST API（api=True 路径）同样路由到这些函数，构成替代通道，但同样受 API key 认证保护。
+
+**结论**：存在一处真实可利用的认证后命令执行/注入漏洞（execute_adb），其余入口防御有效。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "OS Command Injection", "risk_level": "medium", "source": "request.POST['cmd'] in execute_adb", "sink": "subprocess.Popen(args + cmd.split(' '))", "explanation": "execute_adb 视图将用户完全可控的 cmd 参数未经任何校验直接 split 后拼入 subprocess.Popen 执行 adb 命令。虽然需登录且具备 SCAN 权限，且作者注释表明这是为动态分析有意开放的功能，但这实质上向所有低权限用户提供了一条在目标设备乃至宿主机上执行任意 adb 子命令的通道（如 adb shell、adb install、adb forward 端口转发等），属于认证后的命令注入/任意命令执行漏洞。其他入口点（mobsfy 有黑名单过滤但可绕过、touch 使用 shlex.quote 与 is_number、hash 类参数有 is_md5 白名单）防御基本有效。", "fix_suggestion": "对 cmd 参数实施严格白名单校验，仅允许预定义的安全子命令集合（如 dumpsys、uiautomator 等只读命令），禁止 shell、install、forward 等高危子命令；或将该功能移至仅管理员角色可用，并记录审计日志。"}
+```

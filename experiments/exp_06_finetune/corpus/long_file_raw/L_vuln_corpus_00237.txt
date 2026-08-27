@@ -1,0 +1,30 @@
+## 编号分析
+
+**入口点枚举（全文）**
+
+1. **第 27 行 `Metadata()`**：无外部输入参数；redirectURL 来自集群内 Route 资源（第 152–160 行），namespace 来自 serviceaccount 文件（第 122–131 行）。均为受信任的集群内数据，且经 `url.QueryEscape` 编码后拼入 OAuth URL。无用户可控 source。
+2. **第 60 行 `getOAuthAuthorizationServer()`**：请求固定路径 `.well-known/oauth-authorization-server`，响应来自 API server，非用户输入。
+3. **第 76 行 `ValidateToken(token)`**：token 作为 Bearer Token 放入 Header（由 kube client 处理），不进入 URL，仅用于向 API server 发起认证请求验证有效性——这是预期用途，token 本身就是凭证，无注入 sink。
+4. **第 94 行 `GetUserInfo(token)`**：token 仅作为 Authorization header 值传给 `request()`（第 194 行），header 值中换行会被 Go http 库拒绝，不构成注入。
+5. **第 118 行 `Logout(token)`（关键）**：
+   - source：函数参数 `token`，由 HTTP handler 层直接透传的用户可控字符串；
+   - 第 143 行 sink：`fmt.Sprintf("apis/oauth.openshift.io/v1/oauthaccesstokens/%v", token)` —— **未做任何 URL 编码或校验**；
+   - 第 190 行 `http.NewRequest(method, strings.Join([]string{serverPrefix, url}, ""), nil)` 直接用拼接结果构造请求。
+   - 攻击者可传入形如 `xxx?redirect=...` 或含 `/`、`#` 的 token，改变请求路径、追加查询参数或截断路径，向内部 API server（`https://kubernetes.default.svc/`）发起伪造请求（SSRF/参数注入），或操纵删除其他资源路径。这是 Kiali 真实历史漏洞（CVE-2021-39361 相关的 logout 注入问题）。
+6. **第 165 行 `request()`**：TLS 校验正确（自定义 RootCAs，未设 InsecureSkipVerify）；URL 拼接本身是唯一薄弱点。
+7. **第 122 行 `getKialiNamespace()`**：读本地文件，不可被外部影响。
+8. **第 137 行 `getKialiRoutePath()`**：namespace 经 Sprintf 进入路径，但来源为本地 serviceaccount 文件，非用户可控。
+
+**第二入口核查**：`ValidateToken` 与 `GetUserInfo` 中 token 只进 header 不进 URL，无替代污染通道；唯一的 URL 注入点即 `Logout`。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-20 输入未校验导致服务端请求伪造/URL注入 (SSRF)",
+  "risk_level": "高",
+  "source": "line 118: Logout 函数参数 token, 由上层 HTTP handler 直接传入, 用户完全可控",
+  "sink": "line 143 + line 190: fmt.Sprintf 将 token 未编码拼入请求路径, 随后在 http.NewRequest 中作为目标 URL 发往 https://kubernetes.default.svc/",
+  "explanation": "攻击者提交含斜杠、问号或井号的 token 字符串 -> 第 143 行 Sprintf 直接嵌入路径 -> 第 190 行 NewRequest 使用该拼接结果 -> 可篡改对内部 Kubernetes API server 的请求路径与查询参数, 构成针对集群内部端点的请求伪造",
+  "fix_suggestion": "line 143: 对 token 先做 url.PathEscape 并校验其只含合法 token 字符集(如字母数字), 例如 fmt.Sprintf('apis/oauth.openshift.io/v1/oauthaccesstokens/%v', url.PathEscape(token)), 或改用 url.URL 结构体构造路径"
+}
+```

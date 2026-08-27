@@ -1,0 +1,27 @@
+## 编号分析
+
+**文件定位**：这是 go-git 项目 `plumbing/reference.go`（含新增的 `IsSafe` 防御函数），纯字符串处理库，无网络、无文件 I/O、无命令执行。所有 sink 均在调用方，本文件职责是校验/构造引用名。
+
+**入口点枚举**（全文通读）：
+1. `NewBranchReferenceName / NewNoteReferenceName / NewTagReferenceName / NewRemoteReferenceName / NewRemoteHEADReferenceName`（第 60–90 行）：直接拼接用户可控短名到前缀后，**不做任何校验**——依赖调用方事后调用 `Validate()`。
+2. `NewReferenceFromStrings`（第 232 行）：`target` 若以 `ref: ` 开头则截取为符号引用目标，截取后的 target 未校验。
+3. `IsBranch/IsTag/IsRemote/IsNote`（第 92–107 行）：仅前缀判断，纯查询。
+4. `IsSafe`（第 109–150 行）：路径安全判定。
+5. `Short`（第 152–162 行）：Sscanf 循环解析。
+6. `Validate`（第 200 行起）：git-check-ref-format 规则实现。
+
+**source→sink 数据流验证**：
+- **流 A：外部引用名 → 路径转换（典型 sink：`.git/<refname>` 文件写入）**。防御链为 `Validate()` + `IsSafe()`。逐条核对：
+  - `..`：rule 3 拒绝任意组件含 `..`；`IsSafe` 第 137–141 行再按 `/` 切分拒绝空、`.`、`..` 组件 —— 双重覆盖，无法穿越。
+  - `\`：rule 10 与 `IsSafe` 第 131 行均显式拒绝（Windows 路径分隔符逃逸）。
+  - 绝对路径/盘符：`refs/` 前缀要求 + 单层伪 ref 仅允许 `[A-Z_]`（第 144–149 行），`c:/x` 或 `/etc/passwd` 均不通过。
+  - 别名攻击（如 `refs/heads/config` 覆盖元数据）：`IsSafe` 只保证不逃逸 `refs/` 子树，但 `config` 是单层小写名，走伪 ref 分支会被 `[A-Z_]` 白名单拒绝；而 `refs/heads/...` 形式落在 refs 子树内属合法语义。防御有效。
+  - 控制字符/空格/`~^:?*[]`/`@{`/`.lock` 后缀：第 210–218 行逐项覆盖，与 git 规则一致。
+- **流 B：`NewReferenceFromStrings` 的符号引用 target**：此处未校验，但该函数是低层构造器，历史上 go-git 的实际漏洞（如 CVE-2025-21613/21614 相关的引用名路径问题）修复方式正是引入本文件中的 `IsSafe` 并在存储层（filesystem dotgit）sink 处强制调用。本文件内无 sink，构造器不构成独立漏洞。
+- **第二通道检查**：`Short()` 中 Sscanf 循环逻辑有缺陷（err==nil 时 continue 反而保留首次赋值），属正确性 bug 而非安全问题；`Validate` 对非 branch/tag 引用不限制 `-` 开头（第 220 行仅限 i==2 且 isBranch/isTag），若被拼入命令行可致参数注入——但本文件无 exec sink，且这是上游已知设计取舍。
+
+**结论**：本文件自身无可利用漏洞；它是防御性校验代码，且 `IsSafe` 与 `Validate` 组合对路径逃逸、别名覆盖的防御经逐规则核对有效。残余风险在于调用方必须记得调用这两个函数（构造器族默认不校验）。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "该文件为纯字符串校验与引用名构造工具，无 I/O 或执行类 sink。核心数据流（外部引用名到 .git 路径转换）由 Validate 与 IsSafe 双重防御：拒绝 .. 组件、反斜杠、控制字符、点开头组件、.lock 后缀，并将单层伪引用白名单限定为 [A-Z_]，可有效阻止路径穿越与元数据文件别名覆盖。构造器族（NewBranchReferenceName 等）与 NewReferenceFromStrings 不做校验属设计约定，安全责任在调用方及存储层 sink 处强制调用 IsSafe/Validate，本文件内不构成可利用漏洞。Short 函数存在逻辑瑕疵但仅为正确性问题。", "fix_suggestion": "no fix needed"}
+```

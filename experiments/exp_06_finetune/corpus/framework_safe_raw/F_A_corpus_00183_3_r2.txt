@@ -1,0 +1,59 @@
+LANG: javascript
+```code
+// server/middleware/auth-chain.ts
+import { defineEventHandler, getRequestURL, getQuery, createError } from 'h3'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
+
+const execFileAsync = promisify(execFile)
+
+// 鉴权中间件链：根据请求中的 workspace 参数定位用户工作区并校验 token
+export default defineEventHandler(async (event) => {
+  const url = getRequestURL(event)
+  if (!url.pathname.startsWith('/api/workspace')) return
+
+  const query = getQuery(event)
+  const workspaceDir = String(query.workspace || process.cwd())
+  const token = String(query.token || '')
+
+  // 第一步：token 校验（与命令执行无关，不构成对 sink 的防御）
+  if (!token.startsWith('sk_')) {
+    throw createError({ statusCode: 401, statusMessage: 'invalid token' })
+  }
+
+  // 第二步：定位该工作区下的部署配置文件
+  // 防御：不再拼接 shell 字符串，改用 execFile 参数数组形式，
+  // workspaceDir 作为独立 argv 元素传递，不经过 shell 解释
+  try {
+    const { stdout } = await execFileAsync(
+      'find',
+      [workspaceDir, '-name', 'serverless.yml', '-not', '-path', '*/node_modules/*'],
+      { maxBuffer: 10 * 1024 * 1024 },
+    )
+
+    const configFiles = stdout.trim().split('
+').filter(Boolean)
+
+    // 第三步：读取每个配置文件提取 service 名（同样使用参数数组，无 shell 拼接）
+    for (const file of configFiles) {
+      await execFileAsync('head', ['-n', '20', file])
+    }
+
+    event.context.configFiles = configFiles
+  } catch (error) {
+    console.error('Error scanning workspace:', error)
+    event.context.configFiles = []
+  }
+})
+```
+
+1. 第 14-15 行枚举用户可控输入点：`query.workspace` 与 `query.token` 均来自 h3 的 `getQuery`，直接绑定到请求查询字符串，是本中间件仅有的两个外部输入源。
+2. 第 17-20 行的 token 校验只做前缀检查，对命令注入无防御作用；原漏洞主链为第 15 行 `workspaceDir` → 第 33 行 `execAsync`（模板字符串拼接 `find "${workspaceDir}" ...`），攻击者可通过 `workspace=/tmp"; rm -rf /; #` 等载荷逃逸引号执行任意命令。
+3. 修复位置正确性：sink 处直接替换调用方式——第 6 行将 `promisify(exec)` 改为 `promisify(execFile)`，第 32-35 行把 shell 命令字符串改为 `execFileAsync('find', [argv...])`。`execFile` 不经过 `/bin/sh`，每个参数作为独立 argv 元素传递，类型上 `workspaceDir` 无论含何种 shell 元字符都只是字面路径参数，无法改变命令结构。
+4. 攻击面覆盖完整性：第二处 sink 在第 41 行 `head -n 20 "${file}"`，其输入 `file` 来自 find 输出而非用户直接输入，但同样存在拼接风险，一并改为 `execFileAsync('head', ['-n', '20', file])`，两条数据流均消除 shell 解释。
+5. 最小 diff 纪律：函数名、路由前缀 `/api/workspace`、变量名、控制流、错误处理与 `event.context.configFiles` 赋值全部保持不变，仅替换命令执行 API 及其调用形态。
+6. 第二入口/替代通道检查：除 `getQuery` 外无其他请求体/头读取点，`process.cwd()` 为服务端常量非用户可控；token 流未触及任何 sink，无需修改。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-77 命令注入：请求参数 query.workspace 经模板字符串拼入 exec 执行的 find 命令，query.file 派生值同样拼入 head 命令；修复采用 execFile 参数数组形式绕过 shell 解释，两条数据流均不再经过 /bin/sh，注入面完全消除", "fix_suggestion": "line 6: 将 promisify(exec) 替换为 promisify(execFile); line 32: 将 execAsync 模板字符串改为 execFileAsync('find', [workspaceDir, '-name', 'serverless.yml', '-not', '-path', '*/node_modules/*']); line 41: 将 head 拼接改为 execFileAsync('head', ['-n', '20', file])"}
+```

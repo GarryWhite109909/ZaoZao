@@ -1,0 +1,30 @@
+## 编号分析（全文通读）
+
+**入口点枚举**
+1. 第68行 `POST /` upload_file：上传文件，filename 经第81行 `os.path.basename` 处理，存储名加 uuid 前缀（第85行），路径穿越风险低；但**原始文件名与用户可控的 content_type 被原样存入 meta**（第101–102行）。
+2. 第161行 `GET /`、第180行 `/search`：仅列出本人或管理员可见文件，无越权。
+3. 第215行 `DELETE /all`：admin 限定，无问题。
+4. 第237行 `GET /{id}`、第261行 `GET /{id}/data/content`：有 owner/admin/knowledge 三重授权检查，正常。
+5. 第288行 `POST /{id}/data/content/update`：write 授权检查后调用 process_file，正常。
+6. 第324行 `GET /{id}/content`：授权检查有效；第361–369行的响应头逻辑中，inline 仅限 PDF 与 text/plain，其余强制 attachment——此路由防御基本到位。
+7. **第392行 `GET /{id}/content/html`：关键漏洞点。** 授权检查本身有效（owner/admin/knowledge read），但第414行直接 `FileResponse(file_path)` 返回任意已上传文件的原始字节，FastAPI 会根据文件扩展名猜测 Content-Type。攻击者（任意 verified 用户）在第68行上传一个 `.html` 或 `.svg` 文件（内容含 `<script>`），随后通过本路由以 `text/html` 内联渲染——存储型 XSS。
+8. 第434行 `GET /{id}/content/{file_name}`：返回 attachment 头，风险较低；注意第455行附近 `file.content.get(...)` 若 content 为 None 会 AttributeError（可用性问题，非安全漏洞）。
+9. 第505行起 `DELETE /{id}`：write 授权检查有效。
+
+**数据流验证**
+- source：第80–81行用户上传的 filename / 第102行用户可控的 content_type → 存入 DB meta（第101–102行）→ 第392行路由按 id 取回 → 第414行 sink（FileResponse 无任何 Content-Type 白名单、无 CSP、无 sandbox）。中间无有效防御（basename 只防路径穿越，不防内容类型）。
+- 替代通道确认：即使第324行主下载路由对非 PDF 强制 attachment，攻击者可绕过它直接使用 `/content/html` 这一第二入口，使第361–369行的防御失效。
+
+**结论**：存在 CWE-79 存储型 XSS（Open WebUI 已知漏洞模式）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-79 存储型跨站脚本(XSS)",
+  "risk_level": "高",
+  "source": "line 68-102: 上传接口将用户可控的文件内容与扩展名存入存储及 meta",
+  "sink": "line 414: GET /{id}/content/html 中 FileResponse(file_path) 以内联方式按扩展名推断的 Content-Type 返回原始文件",
+  "explanation": "任意已验证用户上传含脚本的 .html 或 .svg 文件 -> 通过 /api/v1/files/{id}/content/html 访问 -> FastAPI 按扩展名返回 text/html 内联渲染 -> 受害者浏览器执行注入脚本 -> 可窃取会话/操作账户; 主下载路由(line 361-369)的 attachment 防御被该第二入口绕过",
+  "fix_suggestion": "line 414: 对该路由增加扩展名白名单校验(仅允许可信静态类型), 显式设置安全的 Content-Type 并添加 Content-Security-Policy: sandbox 响应头, 禁止内联渲染用户上传的 html/svg 内容"
+}
+```

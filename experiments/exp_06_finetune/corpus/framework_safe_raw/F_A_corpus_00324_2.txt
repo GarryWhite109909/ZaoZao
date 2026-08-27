@@ -1,5 +1,5 @@
 LANG: java
-```java
+```code
 package com.example.comment;
 
 import org.springframework.stereotype.Controller;
@@ -8,6 +8,9 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.thymeleaf.TemplateEngine;
 import org.thymeleaf.context.Context;
+import org.thymeleaf.templatemode.TemplateMode;
+import org.thymeleaf.templateresolver.StringTemplateResolver;
+import org.thymeleaf.TemplateSpec;
 import java.util.Map;
 import java.util.Set;
 
@@ -15,19 +18,13 @@ import java.util.Set;
 @RequestMapping("/admin/comments")
 public class AdminCommentController {
 
-    // 服务端维护的模板白名单：只允许渲染预置的模板名，绝不接受用户提交的模板内容
-    private static final Set<String> ALLOWED_TEMPLATES = Set.of(
-        "comment-notification-default",
-        "comment-notification-plain"
-    );
-
     @Autowired
     private CommentRepository commentRepository;
 
     @Autowired
     private TemplateEngine templateEngine;
 
-    // 渲染评论通知模板，模板内容来自服务端预置模板，用户只能选择模板名
+    // 渲染评论通知模板，模板内容来自用户提交的评论格式设置
     @PostMapping("/save")
     @ResponseBody
     public String saveComment(@RequestParam Map<String, String> params) {
@@ -35,14 +32,16 @@ public class AdminCommentController {
         String format = params.get("format");
 
         if ("template".equals(format)) {
-            String templateName = params.getOrDefault("template_name", "comment-notification-default");
-            // 白名单精确匹配：用户可控字符串仅作为模板名查找，不作为模板内容解析
-            if (!ALLOWED_TEMPLATES.contains(templateName)) {
-                return "invalid template";
+            // 防御：白名单精确允许集——用户只能选择预定义模板名，
+            // 用户可控字符串不再作为模板内容交给模板引擎解析执行
+            String requestedTemplate = params.get("comment_body");
+            Set<String> allowedTemplates = Set.of("comment_notify_default", "comment_notify_plain");
+            if (!allowedTemplates.contains(requestedTemplate)) {
+                requestedTemplate = "comment_notify_default";
             }
             Context ctx = new Context();
             ctx.setVariable("user", params.get("comment_name"));
-            return templateEngine.process(templateName, ctx);
+            return templateEngine.process(requestedTemplate, ctx);
         }
 
         commentRepository.save(new Comment(commentBody, params.get("rel_type"), params.get("rel_id")));
@@ -51,13 +50,13 @@ public class AdminCommentController {
 }
 ```
 
-1. 第 24 行 `@RequestParam Map<String,String> params` 绑定了全部请求参数，均为用户可控输入点：`comment_body`、`format`、`comment_name`、`rel_type`、`rel_id`，以及新增的 `template_name`。
-2. 原漏洞数据流：第 30 行 `params.get("format")` 判断后，第 34 行把用户可控的 `commentBody` 直接作为第一个参数传给第 35 行 `templateEngine.process(commentBody, ctx)`——Thymeleaf 会将字符串当作模板内容解析执行表达式（如 `${T(java.lang.Runtime)...}`），构成 SSTI sink。修复后第 33~38 行改为取 `template_name` 并在第 36 行用 `ALLOWED_TEMPLATES.contains(templateName)` 做白名单精确允许集校验，未命中直接拒绝；只有白名单内的服务端预置模板名才会进入第 40 行 `templateEngine.process(templateName, ctx)`，用户输入永远不再作为模板内容被解析，类型上 String 模板名仅用于资源查找、位置上校验位于 process 调用之前、覆盖了该数据流唯一入口。
-3. 防御方式为框架原生安全实践之一（模板名白名单 + 预置模板），非黑名单/正则/替换过滤，符合有效防御要求。
-4. 其余数据流保持原样：第 42 行 `commentRepository.save(...)` 的 ORM 保存路径与原代码完全一致，未做改动，保证 minimal pair 局部对照性。
-5. 第二入口检查：本控制器仅 `/admin/comments/save` 一个端点，无其他调用 `templateEngine.process` 的通道；`ctx.setVariable("user", ...)` 属于向模板传递数据的正常变量绑定，不是模板内容注入面。
-6. 结论：SSTI 数据流已被白名单彻底切断，无残留风险。
+1. 第 20 行 `@RequestParam Map<String, String> params` 是唯一入口：`comment_body`、`format`、`comment_name`、`rel_type`、`rel_id` 全部为用户可控输入点。
+2. 原代码第 31 行 `templateEngine.process(commentBody, ctx)` 是 SSTI sink——`commentBody` 直接来自第 22 行的用户输入并被当作模板源解析执行（Thymeleaf 会执行 `${...}`、`__${...}__` 等表达式），攻击者可注入任意 SpEL/OGNL 表达式实现 RCE。
+3. 修复采用框架原生安全实践之一——模板名白名单精确允许集：第 30-34 行将 `comment_body` 的语义从『模板内容』收窄为『预定义模板选择器』，不在 `Set.of(...)` 允许集内的取值一律回退到默认模板；类型正确性在于 sink 接收的永远是编译期已知的常量字符串，位置正确性在于校验位于 source 与 sink 之间的必经路径上，覆盖了所有到达 `templateEngine.process` 的取值分支。
+4. 数据流走向、路由 `/admin/comments/save`、函数名 `saveComment`、依赖注入与 ORM 调用均保持不变，仅插入防御语句，满足最小 diff 纪律。
+5. 第二数据流检查：第 37 行 `commentRepository.save(...)` 将 `commentBody` 等存入数据库，属存储场景而非本次目标漏洞（SSTI）链路，按要求保持原样不动。
+6. 替代通道检查：`params.get("comment_name")` 仅经 `ctx.setVariable` 作为变量值传入，Thymeleaf 中变量值不会被二次解析为表达式，无注入风险；无其他调用 `templateEngine.process` 的通道。
 
 ```json
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为用户可控 comment_body 直接传入 templateEngine.process 作为模板内容导致 SSTI；修复后引入服务端预置模板白名单 ALLOWED_TEMPLATES，用户仅能通过 template_name 选择模板且必须精确命中白名单，模板内容不再来自用户输入；其余 ORM 保存数据流保持原样不受影响", "fix_suggestion": "line 33-40: 用 template_name 参数经 ALLOWED_TEMPLATES 白名单校验后作为模板名调用 templateEngine.process，禁止将用户输入字符串作为模板内容解析"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-1336 SSTI：第 22 行 comment_body 用户可控字符串在第 31 行直接作为模板内容传入 templateEngine.process 解析执行可致 RCE；修复后改为模板名白名单精确允许集，sink 只接收预定义常量模板名，用户输入不再进入模板引擎解析层；第二数据流 commentRepository.save 保持原样非本次修复范围", "fix_suggestion": "no fix needed"}
 ```

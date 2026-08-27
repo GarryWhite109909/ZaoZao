@@ -1,0 +1,67 @@
+# PBKDF2Algo / PBKDF2 全文安全分析
+
+## 一、文件结构概览
+
+本文件是 crypto-es 库的 PBKDF2（Password-Based Key Derivation Function 2）实现，全文共约 110 行有效代码。文件包含：
+
+1. 三个导入：`Base`、`WordArray`（第 1-4 行）、`SHA256Algo`（第 5 行）、`HMAC`（第 6 行）
+2. 类 `PBKDF2Algo extends Base`（第 8 行起），含构造函数 `constructor(cfg)` 与方法 `compute(password, salt)`
+3. 导出的工厂函数 `PBKDF2(password, salt, cfg)`（第 103 行附近）
+
+## 二、逐函数入口点枚举
+
+### 1. `constructor(cfg)`（第 17-40 行）
+
+**入口点**：
+- 参数 `cfg`：外部可传入的对象，直接进入第 32-36 行的 `Object.assign(new Base(), {...默认值}, cfg)`。
+- 这是典型的“配置合并”模式：调用者可通过 `cfg` 覆盖 `keySize`、`hasher`、`iterations` 三个属性。
+
+**数据流分析**：
+- source = `cfg`；sink = `this.cfg`，随后在 `compute()` 中被解构使用（第 47、62 行）。
+- **防御有效性验证**：此处没有任何过滤/校验——`cfg` 的任意属性都会覆盖默认值。按题目要求，“黑名单/正则过滤视为可绕过”，而这里连黑名单都没有。但需要判断这是否构成漏洞：
+  - `keySize` 过小（如 1）→ 派生密钥过短，属弱密钥风险；
+  - `iterations: 1` → 大幅削弱暴力破解成本（这正是 GHSA-mpj8-q39x-wq5h 公告的核心：原 CryptoJS 默认 iterations=1 不安全，本库已将默认值提升为 250000 并将 hasher 默认改为 SHA256，见第 24-29 行注释）；
+  - `hasher` 可被替换为任意对象——但该对象需实现 `create/update/finalize/reset` 接口才能运行，传入恶意对象只能导致自身进程内的行为异常或异常抛出，不构成跨信任边界的注入。
+
+**结论**：`cfg` 是受信调用方显式传入的 API 参数，属于“能力暴露”而非漏洞。密码学库允许调用方自选参数是标准设计（与 OpenSSL、WebCrypto 一致）；默认值本身已修复历史 CVE/GHSA。无不可信输入注入路径。
+
+### 2. `compute(password, salt)`（第 42-99 行）
+
+**入口点**：
+- 参数 `password`（第 43 行）：流入第 49 行 `HMAC.create(cfg.hasher, password)` 作为 HMAC 密钥。
+- 参数 `salt`（第 43 行）：流入第 63 行 `hmac.update(salt)`。
+
+**source→sink 数据流逐一验证**：
+
+| # | source | sink | 中间处理 | 防御 |
+|---|--------|------|----------|------|
+| 1 | `password` | `HMAC.create(hasher, password)` 第 49 行 | 无转换 | 无需防御：仅作为 HMAC 密钥参与运算，不会拼接进字符串/命令/HTML/路径，不存在注入型 sink |
+| 2 | `salt` | `hmac.update(salt)` 第 63 行 | 无转换 | 同上，纯数学输入 |
+| 3 | `blockIndexWords[0] += 1` 第 97 行 | 计数器递增 | 纯内部状态 | 无外部影响 |
+
+**关键安全性论证**：
+- 全文没有任何 `eval`、`Function`、`innerHTML`、`document.write`、`child_process`、`fs`、`fetch/XHR`、动态 `require` 等 sink（通读第 1-110 行确认，包括 JSDoc 注释区也无内嵌可执行示例被 eval 的机制）。
+- 所有 WordArray 运算均为定长 32 位字数组上的位运算（第 78-80 行 XOR 循环），无内存越界写：XOR 循环上界 `blockWordsLength` 取自 block 自身长度（第 69 行），`intermediateWords` 由同一 HMAC/hash 产生，长度一致；即使理论长度不一致，JS 数组越界读返回 undefined，`undefined ^ x` 得到 NaN→0 写入，最坏导致错误输出而非内存破坏（JS 内存安全模型保证）。
+- `derivedKey.concat(block)` 第 95 行与 `sigBytes = keySize * 4` 第 98 行：若调用者传负数/超大 `keySize`，可能造成 DoS（分配巨大数组或死循环），但这要求调用方主动传恶意 cfg，属于自伤场景，非跨边界漏洞。
+
+### 3. 工厂函数 `PBKDF2(password, salt, cfg)`（第 100-104 行）
+
+**入口点**：三个参数全部透传给 `PBKDF2Algo.create(cfg).compute(...)`。无额外逻辑、无字符串处理、无副作用。数据流与上述两条完全重合，无新增 sink。
+
+## 三、第二入口与替代通道检查
+
+1. **原型污染通道**：`Object.assign`（第 32 行）只向新建的 `new Base()` 实例写入，不触及 `Object.prototype`，且源对象是字面量+cfg——即使 cfg 含 `__proto__` 键，`Object.assign` 对自有可写属性的赋值目标是实例而非全局原型，不构成原型污染 gadget。
+2. **时序侧信道**：PBKDF2 本质是慢函数，其执行时间依赖 iterations/keySize（调用方可控），但不依赖 password 内容的分支路径——HMAC 内部为常数时间位运算，本文件无基于秘密值的条件分支，无新增侧信道。
+3. **随机数/熵通道**：本文件不生成盐，不涉及 RNG，无熵缺陷。
+4. **回调/事件入口**：无任何回调注册、事件监听、定时器。
+5. **环境变量/文件系统/网络**：零访问（import 仅限同包模块）。
+
+## 四、综合判定
+
+- 历史漏洞 GHSA-mpj8-q39x-wq5h（默认 iterations=1）已在本版本通过第 33-35 行默认值（keySize=4 words、SHA256、250000 次迭代）修复。
+- 全文无可达的危险 sink，所有外部输入仅作为纯密码学运算的操作数。
+- 唯一“弱点”是调用方可通过 cfg 降低强度，但这是文档化的合法 API 能力，非漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认：文件仅包含 PBKDF2Algo 构造函数、compute 方法和 PBKDF2 工厂函数三个入口点。外部输入 password、salt、cfg 仅作为 HMAC 密钥、消息和配置参数参与纯数学位运算（第 49、63、78-80 行），全文不存在 eval、Function、innerHTML、命令执行、文件系统、网络请求等任何危险 sink，也不存在基于秘密的条件分支导致的时序泄露。历史上 CryptoJS 默认 iterations=1 的弱点（GHSA-mpj8-q39x-wq5h）已通过第 33-35 行的默认值 SHA256 + 250000 次迭代修复。Object.assign 仅写入新实例，无原型污染风险。调用方通过 cfg 自行降低迭代次数属于文档化的合法 API 能力，不构成跨信任边界的安全漏洞。", "fix_suggestion": "no fix needed"}
+```

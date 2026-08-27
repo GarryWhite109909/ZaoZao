@@ -1,0 +1,41 @@
+## 编号分析（按行号锚定）
+
+1. **第 20–33 行常量与结构体**：定义注解键；`ingress` 结构体持有 `allowedExternalNames []*regexp.Regexp`（第 61 行），这是外部名白名单，来自启动配置而非用户输入。
+
+2. **第 84–95 行 `routeID`**：用 `\W` 替换为 `_` 后拼入路由 ID，仅用于标识，不构成 sink。
+
+3. **第 98–133 行 `externalNameRoute`（关键函数）**：
+   - 第 100 行：`isExternalDomainAllowed(allowedNames, svc.Spec.ExternalName)` 校验。该白名单为空时通常放行所有域名（skipper 默认行为），且即便非空，正则若未锚定也可被绕过——按要求视为不可靠防御。
+   - 第 107 行：`u := fmt.Sprintf("%s://%s:%s", scheme, svc.Spec.ExternalName, servicePort.TargetPort)` —— **sink**。`svc.Spec.ExternalName` 来自 Kubernetes API 中 Service 的 spec，任何能创建/修改 Service 的租户可控。它被直接拼为代理后端 URL，可指向任意内网地址（SSRF，CWE-918）。
+   - 第 108–110 行：`eskip.ParseFilters(fmt.Sprintf("setRequestHeader(\"Host\", \"%s\")", svc.Spec.ExternalName))` —— ExternalName 未做转义直接嵌入过滤器 DSL 字符串，含双引号或括号的值可注入任意额外 filter（CWE-74 注入）。
+   - 第 112 行：`routeID(...)` 已做 `\W` 清洗，ID 无注入问题。
+
+4. **第 136–161 行 `applyAnnotationPredicates`**：注解值经 `eskip.ParsePredicates` 解析后并入路由谓词。这是设计功能（集群管理员启用注解特性），但若允许普通租户写注解，则等于允许其注入谓词影响路由匹配——取决于部署策略，属设计权衡而非代码缺陷。
+
+5. **第 164–201 行 `addExtraRoutes`**：遍历 `ic.extraRoutes`（源自注解），设置 HostRegexps、路径等；`createHostRx(ruleHost)` 生成主机正则，host 来自 Ingress spec，仅用于匹配自身路由，风险有限。
+
+6. **第 212–231 行 `annotationFilter`**：`zalando.org/ratelimit` 与 `zalando.org/skipper-filter` 注解直接拼接并 `eskip.ParseFilters`——注解即过滤器 DSL，同第 4 点，是文档化功能但构成租户→代理行为的强 source。
+
+7. **第 244–252 行 `extraRoutes`**：`eskip.Parse(annotationRoutes)` 忽略错误（注释称由 validator 处理）；若上游无 validator，恶意/损坏注解被静默部分解析，可能产生非预期路由片段——防御依赖外部组件，本文件内不可验证。
+
+8. **第 255–266、269–282 行**：JSON 反序列化 backend-weights、pathMode 解析均有错误处理，无 sink。
+
+9. **第 295–341 行 `convert`**：遍历 state.ingressesV1 调 ingressV1Route（未在片段中）、汇总 hostRoutes、生成 catchall/east-west 路由；逻辑正确，无新 sink。
+
+10. **第 344–369 行 `generateTLSCertFromSecret`**：base64 解码 + X509KeyPair，失败即返回错误，类型检查在第 363 行（顺序欠佳但在返回前完成），无漏洞。
+
+11. **第二入口核查**：除 Service ExternalName 外，Ingress 注解（filter/predicate/routes/backend-weights/path-mode）均为第二入口通道，均直接进入 DSL 解析器；其中 ExternalName 流（source=Service spec → sink=Backend URL/filter 字符串）在本文件内无有效转义或可靠白名单，是最明确的可利用流。
+
+**结论**：存在漏洞。核心是 `externalNameRoute` 中租户可控的 `svc.Spec.ExternalName` 未转义拼入后端 URL 和过滤器字符串，导致 SSRF 与过滤器注入；白名单校验依赖可选的 `AllowedExternalNames` 且默认放行。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-918 SSRF / CWE-74 注入",
+  "risk_level": "高",
+  "source": "line 100/107: svc.Spec.ExternalName 来自 Kubernetes API 中租户可控的 Service spec",
+  "sink": "line 107: fmt.Sprintf 拼接为 route.Backend 的 URL; line 108: 直接嵌入 setRequestHeader 过滤器 DSL 字符串",
+  "explanation": "任何能创建或修改 Service 的租户可将 ExternalName 设为内网地址或元数据服务地址 -> isExternalDomainAllowed 仅在管理员显式配置 AllowedExternalNames 时生效且正则未锚定即可绕过 -> 该值未经转义被 fmt.Sprintf 拼成后端 URL 使 skipper 代理流量到任意目标(SSRF) -> 同时未转义嵌入 setRequestHeader 的引号字符串中, 含双引号的值可闭合原过滤器并注入任意额外 filter(过滤链注入)",
+  "fix_suggestion": "对 ExternalName 做严格校验: 强制 FQDN 格式校验并在未配置白名单时默认拒绝; 构造过滤器时使用 eskip 提供的结构化 API 或对值进行转义, 禁止 fmt.Sprintf 直接拼接; 将 isExternalDomainAllowed 改为空名单即拒绝并要求正则首尾锚定"
+}
+```

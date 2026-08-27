@@ -1,0 +1,76 @@
+# Gitea TwoFactor 模型文件安全分析
+
+## 一、文件定位与入口点枚举
+
+本文件是 `models/auth` 包中的数据模型层代码，不含 HTTP 路由。其"入口点"是所有被上层（web 路由、API、CLI）调用的导出函数。逐一枚举：
+
+1. **第 44-54 行**：`GenerateScratchToken()` — 生成恢复令牌，source 为 `util.CryptoRandomBytes(6)` 与 `util.CryptoRandomString(10)`；
+2. **第 56-60 行**：`HashToken(token, salt)` — PBKDF2 哈希函数，参数为外部传入的 source；
+3. **第 62-68 行**：`VerifyScratchToken(token)` — token 来自用户登录表单输入（第二入口：用户提交的 scratch code）；
+4. **第 70-72 行**：`getEncryptionKey()` — 从 `setting.SecretKey` 派生 AES 密钥；
+5. **第 74-81 行**：`SetSecret(secretString)` — secretString 来自用户在 2FA 注册页输入/生成的 TOTP 密钥；
+6. **第 83-93 行**：`ValidateTOTP(passcode)` — passcode 来自用户每次登录时提交的 6 位验证码；
+7. **第 95-99 行 / 101-105 行**：`NewTwoFactor` / `UpdateTwoFactor` — 将结构体写入数据库（sink: DB）；
+8. **第 107-118 行**：`GetTwoFactorByUID(uid)` — uid 来自 session/路由参数；
+9. **第 120-124 行**：`HasTwoFactorByUID(uid)`；
+10. **第 126-135 行**：`DeleteTwoFactorByID(id, userID)` — id/userID 来自路由与 session；
+11. **第 137-145 行**：`HasTwoFactorOrWebAuthn(id)`。
+
+## 二、逐条 source→sink 数据流验证
+
+### 数据流 1：scratch token 生成与存储（第 44-54 行 → 第 51 行 sink: DB 字段 ScratchSalt/ScratchHash）
+
+- 第 46 行使用 `util.CryptoRandomBytes(6)`（CSPRNG），48 位熵 ≈ 2^48 空间；base32 编码后 10 字符。
+- 第 50 行 salt 用 `CryptoRandomString(10)`，随机生成，非固定值。
+- 第 52 行哈希后仅存 `ScratchHash`，明文 token 不落库——防御有效。PBKDF2-SHA256 10000 轮（第 58 行）虽轮数偏低但配合随机 salt 可接受。
+
+### 数据流 2：VerifyScratchToken（第 62-68 行）
+
+- source：用户提交的 token（HTTP 表单）；sink：`subtle.ConstantTimeCompare`（第 67 行）。
+- 使用常数时间比较防时序侧信道，防御有效。无 SQL 注入面（纯内存比较）。
+- 注意：无速率限制逻辑在本层，但暴力破解受 2^48 空间限制，且限速属上层职责，不构成本文件漏洞。
+
+### 数据流 3：getEncryptionKey（第 70-72 行）— **发现漏洞点**
+
+```go
+k := md5.Sum([]byte(setting.SecretKey))
+return k[:]
+```
+
+- source：`setting.SecretKey`（站点级长期密钥，来自 app.ini/环境变量）。
+- sink：作为 AES 密钥传入 `secret.AesEncrypt/AesDecrypt`（第 77、88 行）。
+- 问题：用 **MD5 截断为 128 位**派生 AES 密钥。MD5 已被证明不具抗原像性保证，且将任意长度 SecretKey 压缩到 16 字节，削弱密钥熵上限至 128 位；更重要的是这是非标准、弱化的 KDF（对比 PBKDF2/HKDF）。若 SecretKey 本身熵不足（如管理员设置短口令），MD5 快速哈希使离线爆破加密后的 TOTP secret 成为可行攻击路径：攻击者获取 DB dump（SQL 注入、备份泄露等第二通道）后可离线穷举 SecretKey 并解出所有用户的 TOTP 种子，从而完全绕过 2FA。
+- 该模式在 Gitea 历史上确实被安全审计标记（后续版本改用 `secret.NewEncryptionKey()` 基于 SHA256 的正确 KDF），证实其为真实缺陷。
+
+### 数据流 4：SetSecret / ValidateTOTP（第 74-93 行）
+
+- SetSecret：AES 加密后 base64 存库，加密本身正确（依赖 secret.AesEncrypt 实现）。
+- ValidateTOTP：解密失败返回错误而非 panic，passcode 直接交给 `totp.Validate`，无注入面。防御有效，但其安全性完全继承自数据流 3 的弱密钥派生。
+
+### 数据流 5：DB 操作函数（第 95-145 行）
+
+- 全部使用 xorm 参数化查询（`Where("uid=?", uid)`、`ID(id).Delete(...)`），无字符串拼接 SQL，无注入。
+- `DeleteTwoFactorByID`（第 127-129 行）：删除条件同时绑定 `id` 和 `UID: userID`，防止越权删除他人记录（IDOR 防御有效）。
+- `ErrTwoFactorNotEnrolled.Error()`（第 34 行）：UID 为 int64，`%d` 格式化，无格式化字符串注入。
+
+## 三、第二入口与替代通道检查
+
+- 替代通道 1：数据库备份/dump 泄露 → 配合第 71 行 MD5 弱 KDF 可离线破解 SecretKey 解密全部 TOTP secret（放大漏洞影响的关键路径）。
+- 替代通道 2：scratch token 明文仅在生成响应中返回一次，库中只有加盐哈希，无泄露通道。
+- WebAuthn 通道（第 137-145 行）仅做存在性检查，无数据流风险。
+
+## 四、结论
+
+唯一实质性缺陷是第 70-72 行以 MD5 作为 AES 密钥派生函数（CWE-327 使用已破解/有风险的哈希算法；亦可归 CWE-916 弱 KDF），导致 2FA 密文强度被削弱，存在离线爆破风险。其余数据流均具备有效防御。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-327/CWE-916",
+  "risk_level": "medium",
+  "source": "line 71: setting.SecretKey",
+  "sink": "line 77 and line 88: secret.AesEncrypt/AesDecrypt via getEncryptionKey",
+  "explanation": "第 70-72 行 getEncryptionKey 使用 md5.Sum 将站点 SECRET_KEY 直接压缩为 128 位 AES 密钥，属于快速非加盐哈希派生密钥。一旦攻击者通过数据库泄露等第二通道获得 TwoFactor.Secret 密文（第 79 行存储），即可离线高速穷举弱 SECRET_KEY 并解密所有用户的 TOTP 种子，从而完全绕过双因素认证；MD5 的碰撞与结构弱点进一步降低派生密钥的可信度。",
+  "fix_suggestion": "line 71: 改用标准 KDF（如 sha256.Sum256 或 HKDF/PBKDF2 加盐派生）从 setting.SecretKey 派生 AES 密钥，并对存量数据提供迁移重加密方案"
+}
+```

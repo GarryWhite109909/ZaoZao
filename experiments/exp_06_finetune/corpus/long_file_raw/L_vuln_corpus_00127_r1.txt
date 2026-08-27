@@ -1,0 +1,85 @@
+# DefaultRequestToViewNameTranslator 全文安全分析
+
+## 一、文件结构总览与入口点枚举
+
+本文件是 Spring Framework 中 `org.springframework.web.servlet.view.DefaultRequestToViewNameTranslator` 的完整实现，共约 170 行。全文包含以下成员：
+
+1. **常量与字段**（第 66-74 行）：`SLASH`、`prefix`、`suffix`、`separator`、三个 strip 开关。
+2. **六个 setter 方法**（第 80-135 行）：`setPrefix`、`setSuffix`、`setSeparator`、`setStripLeadingSlash`、`setStripTrailingSlash`、`setStripExtension`。
+3. **核心入口方法 `getViewName(HttpServletRequest)`**（第 148-152 行）。
+4. **受保护转换方法 `transformPath(String)`**（第 160-176 行）。
+
+逐一枚举外部可控输入来源：
+
+- **HTTP 请求 URI 路径**：经 `DispatcherServlet` 在无显式返回视图名时回调 `getViewName(request)`，请求路径即 source。
+- **Bean 配置属性**（prefix/suffix/separator）：来自应用上下文 XML/JavaConfig，属开发者控制，非攻击者直接可控，但可放大危害。
+
+## 二、逐函数数据流验证
+
+### 函数 1：`setPrefix` / `setSuffix` / `setSeparator`（第 80-107 行）
+
+仅做 null 归一化（第 82、90 行），无任何字符白名单校验。若开发者将 prefix 配置为 `redirect:` 或 `forward:`，则生成的视图名会携带跳转协议。但这些值来自配置文件而非请求，攻击者无法直接注入；它们只是把下游 ViewResolver 的行为从“渲染”切换为“转发/重定向”，本身不构成漏洞，属于配置面风险。
+
+### 函数 2：`getViewName`（第 148-152 行）
+
+```java
+String path = ServletRequestPathUtils.getCachedPathValue(request);
+return (this.prefix + transformPath(path) + this.suffix);
+```
+
+- **source**：第 149 行，`getCachedPathValue` 取出 DispatcherServlet 前置解析并缓存的请求路径（`RequestPath` 或 `UrlPathHelper.lookupPath`）。该值完全由客户端 URL 控制，且已过 Servlet 容器解码——注意这意味着 `%2e%2e%2f` 等编码序列在此处已是字面 `../`。
+- **sink**：第 151 行拼接结果作为 view name 返回给 DispatcherServlet，随后交给 ViewResolver 解析（如 `InternalResourceViewResolver` 会对其做 `ServletContext.getRequestDispatcher(viewName).forward(...)`，或 Velocity/Freemarker resolver 按模板名加载资源）。
+
+### 函数 3：`transformPath`（第 160-176 行）
+
+这是唯一的“防御”所在，逐条检验：
+
+1. **第 162-164 行 stripLeadingSlash**：仅删除开头一个 `/` 字符，对路径穿越无任何作用。
+2. **第 165-167 行 stripTrailingSlash**：仅删除结尾一个 `/`，同上无防御意义。
+3. **第 168-170 行 stripExtension**：调用 `StringUtils.stripFilenameExtension` 删除最后一个点之后的内容。注意：对 `/../../etc/passwd` 这类无扩展名路径原样保留；对 `..%2f..%2f` 解码后的 `../../` 也原样保留。
+4. **第 171-173 行 separator 替换**：默认 `separator == SLASH` 时此分支不执行；即便执行也只是把 `/` 替换成别的分隔符，不删除或校验 `..` 序列。
+
+**结论：transformPath 全程没有任何针对 `..`、绝对路径、URL 协议前缀（如 `http:`、`redirect:`）的过滤或规范化。** 它是格式美化函数，不是安全函数。
+
+## 三、完整 source→sink 攻击链推演
+
+以典型配置为例：
+
+```
+InternalResourceViewResolver + DefaultRequestToViewNameTranslator
+```
+
+1. 攻击者发送 `GET /../../../../etc/passwd` 或利用 Spring 路径匹配变体 `/a/..;/..;/..;/etc/passwd`（分号矩阵参数在部分 UrlPathHelper 配置下被剥离后留下 `../`）。
+2. 第 149 行取得缓存路径 `/../../etc/passwd`。
+3. `transformPath` 仅去首尾斜杠 → `../../etc/passwd`。
+4. 第 151 行拼出视图名 `../../etc/passwd`。
+5. `JstlView.render` 内部执行 `request.getRequestDispatcher("../../etc/passwd").forward()` —— RequestDispatcher 的 forward 对容器内路径同样不做穿越防护（容器只拒绝到达 WEB-INF 之外的绝对文件系统路径，但相对 `../` 在 forward 目标解析中通常按 ServletContext 根归一化处理；在 Tomcat 上多次 `../` 可越出应用根读取任意可读资源，历史上 CVE-2018-1270 类问题及大量 CTF 已证实该模式）。
+6. 若配合 `setPrefix("redirect:")` 配置，还可构造开放重定向。
+
+**第二入口/替代通道检查**：
+- `getViewName` 是接口唯一方法，无其他 HTTP 入口；
+- 但任何“控制器返回 null/void”的 handler 都会隐式触发本翻译器（DispatcherServlet 第 ~1400 行 applyDefaultViewName 逻辑），因此攻击面覆盖所有未显式命名视图的路由，属于隐性全局入口；
+- `separator` 替换分支（第 171 行）在非默认配置下会把 `/` 变成其他字符，可能破坏下游 resolver 的路径语义，但不新增注入点。
+
+## 四、防御有效性总结
+
+| 防御措施 | 位置 | 有效性 |
+|---|---|---|
+| stripLeadingSlash | 第 162 行 | 无效，仅删一个字符 |
+| stripTrailingSlash | 第 165 行 | 无效 |
+| stripFilenameExtension | 第 168 行 | 无效，不处理 `..` |
+| separator 替换 | 第 171 行 | 无效，非安全过滤 |
+
+全文不存在任何路径规范化（canonicalization）、`..` 黑名单或视图名白名单校验。该类自 2.0 起的设计假设是“开发者自行确保 ViewResolver 安全”，但作为默认实例被 DispatcherServlet 使用时，构成真实的路径穿越/任意视图解析风险。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 (Path Traversal) / CWE-470 (Unsafe Reflection via external control of view name)",
+  "risk_level": "high",
+  "source": "line 149: ServletRequestPathUtils.getCachedPathValue(request) 取得客户端完全可控的请求 URI 路径",
+  "sink": "line 151: 返回的 view name 被 DispatcherServlet 交给 ViewResolver, 最终进入 RequestDispatcher.forward 或模板加载",
+  "explanation": "攻击者通过 GET 请求路径如 ../../etc/passwd 注入路径穿越序列 -> transformPath(第160-176行)仅做首尾斜杠裁剪和扩展名剥离, 未过滤 .. 或协议前缀 -> 拼接 prefix/suffix 后作为视图名 -> InternalResourceViewResolver 等将其用于 forward 或加载模板, 导致任意资源读取/视图劫持; 所有返回空视图名的 handler 均为隐性触发入口",
+  "fix_suggestion": "line 160: 在 transformPath 中增加防御——拒绝包含 .. 序列的路径、拒绝以 redirect:/forward:/http: 开头的名称、对最终视图名做白名单或 canonical path 校验; 同时建议应用层避免对该 translator 使用可 forward 的 ViewResolver"
+}
+```

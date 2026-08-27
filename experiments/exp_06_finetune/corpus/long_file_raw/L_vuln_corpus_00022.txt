@@ -1,0 +1,37 @@
+## 编号分析（全文通读）
+
+1. **第 40–44 行：属性定义** — `$defaultOption`、`$queryParameter`、`$cookieName`、`$columnType` 均为可由后台字段设置控制的属性，无输入过滤。
+
+2. **第 46–80 行 `init()`：第一入口点**。当 `$defaultOption === 'query'` 时（约第 71 行），`$this->defaultValue = $request->getParam($this->queryParameter)` —— 直接将 **GET/POST 请求参数**（完全攻击者可控）写入 `defaultValue`；当 `$defaultOption === 'cookie'` 时（约第 73 行），直接读取 `$_COOKIE[$this->cookieName]`，同样是攻击者可控 source。此处没有任何白名单、转义或类型校验。
+
+3. **第 82–87 行 `getContentColumnType()`** — 仅返回列类型字符串，来自管理员配置，非外部输入，无风险。
+
+4. **第 89–110 行 `serializeValue()`：sink 所在**。当 `defaultOption === 'custom'` 时，若前端提交值为空则回退到 `$this->defaultValue`（第 96–99 行），随后第 101 行调用 `Variables::getParsedValue($value, $element)`。Formie 的变量解析器会对值执行 **Twig 模板渲染**（用于支持 `{field.xxx}` 等变量语法）。由于 `defaultValue` 在 `init()` 中已被请求参数/ Cookie 污染，攻击者可提交如 `{% import ... %}` 或 `{{ ['id']|filter('system') }}` 形式的 payload，经查询参数或 Cookie 进入模板引擎 —— 典型 **SSTI → RCE** 链。这是该类真实漏洞（verbb/formie 隐藏字段查询参数注入）的根源。
+
+5. **第 112–119 行 `getFieldDefaults()`** — 默认配置，无输入流。
+
+6. **第 121–130 行 `getInputHtml()` / 第 132–138 行 `getPreviewInputHtml()`** — 渲染模板并传入 `$value`；Craft 模板默认自动转义 HTML，XSS 风险有限，且主要面向管理端。
+
+7. **第 140–152 行 `getFrontEndJsModules()`** — 仅输出 cookieName 到前端 JS 设置，属于低危信息暴露（Cookie 名），非可利用 sink。
+
+8. **第 154–172 行 `getFrontEndInputOptions()`：第二入口/sink**。第 160 行对 `(string)$this->defaultValue` 调用 `renderString(...)` —— 显式以 Twig 渲染 defaultValue。虽然此处有 try/catch（第 164–167 行），但 catch 只吞掉异常并回退原值，**不阻止渲染本身**。defaultValue 同样可被 `init()` 中 query/cookie 分支污染（尽管 `defaultOption` 同时为 custom 时才走 serializeValue 路径，但 renderString 路径下 defaultOption 为 query/cookie 时 defaultValue 即被污染并被渲染）。异常处理不是安全防御，仅是错误兜底。
+
+9. **第 174–230 行 schema 定义方法** — 纯管理端表单 schema，静态选项列表，无外部输入流入 sink。
+
+10. **第 232–252 行 `defineHtmlTag()`** — 构造 hidden input 标签，属性来自 handle/id（服务端生成），无注入点。
+
+**替代通道核查**：除 HTTP 参数与 Cookie 外，User-Agent / Referrer / IP（init 第 57–69 行）也写入 defaultValue，但它们最终多作为数据存储而非模板渲染输入，危害较低；核心可利用通道是 query 参数与 Cookie 两条 source→Twig 渲染 sink 的链路。黑名单/过滤：全文未见任何针对 defaultValue 的过滤，防御缺失而非绕过问题。
+
+**结论**：存在漏洞 —— 攻击者可控的查询参数/Cookie 值进入 Twig 模板解析（`Variables::getParsedValue` 与 `View::renderString`），构成服务端模板注入，可导致远程代码执行。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-1336 (SSTI), 可升级为 CWE-94 RCE",
+  "risk_level": "严重 (Critical)",
+  "source": "line 71: $request->getParam($this->queryParameter) 与 line 73: $_COOKIE[$this->cookieName]，均为攻击者可控输入写入 $this->defaultValue",
+  "sink": "line 101: Variables::getParsedValue($value, $element) 以及 line 160: Craft::$app->getView()->renderString((string)$this->defaultValue, ...)，两者均对 defaultValue 执行 Twig 模板渲染",
+  "explanation": "init() 将 GET/POST 参数或 Cookie 值未经任何校验写入 defaultValue -> 该值在 serializeValue() 回退逻辑中传入 Variables::getParsedValue 进行 Twig 解析，或在 getFrontEndInputOptions() 中被 renderString 直接渲染 -> 攻击者提交形如 {{ 攻击payload }} 的查询参数即可实现服务端模板注入，进而远程代码执行；try/catch 仅捕获异常不构成防御",
+  "fix_suggestion": "line 71/73: 对 query 与 cookie 来源的值禁止进入模板解析上下文——在传入 Variables::getParsedValue 或 renderString 前使用纯文本占位替换（先渲染模板再拼接用户值），或将用户输入标记为 raw 字符串并禁用其作为 Twig 源码；同时限制 defaultOption 为 query/cookie 时不得启用 custom 变量解析路径"
+}
+```

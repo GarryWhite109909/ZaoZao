@@ -1,0 +1,52 @@
+LANG: python
+```python
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import hashlib
+
+app = FastAPI()
+
+# 模拟构件签名服务：对上传的制品计算摘要并生成签名记录
+ARTIFACT_STORE = {}
+SIGNED_LOG = []
+
+@app.post("/artifacts/sign")
+async def sign_artifact(
+    file: UploadFile = File(...),
+    key_id: str = Form(...)
+):
+    content = await file.read()
+
+    # 使用 SHA-256 计算制品摘要（强哈希，修复 CWE-327）
+    digest = hashlib.sha256(content).hexdigest()
+    signature = f"sig-{key_id}-{digest}"
+
+    ARTIFACT_STORE[digest] = {"filename": file.filename, "content": content}
+    SIGNED_LOG.append(signature)
+
+    return {"artifact_digest": digest, "signature": signature}
+
+@app.get("/artifacts/{digest}")
+async def get_artifact(digest: str):
+    artifact = ARTIFACT_STORE.get(digest)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"filename": artifact["filename"], "size": len(artifact["content"])}
+```
+
+分析：
+
+1. 第 9 行 `sign_artifact` 路由中，用户可控输入点有两个：第 10 行的 `file: UploadFile = File(...)`（文件内容，经第 15 行 `await file.read()` 读入 `content`）和第 11 行的 `key_id: str = Form(...)`。目标漏洞数据流仅涉及 `content`。
+
+2. 追踪主链：`content`（第 15 行）→ 第 19 行 `hashlib.sha1(content).hexdigest()` 作为 sink，直接以弱哈希 SHA-1 生成制品摘要并进入签名记录与存储键。SHA-1 已被证明存在碰撞攻击（SHAttered），用于完整性/签名场景属于 CWE-327。
+
+3. 防御类型正确性：第 19 行替换为 `hashlib.sha256(content).hexdigest()`。SHA-256 是当前无已知实用碰撞攻击的标准强哈希，属框架无关的原生安全 API（Python 标准库 hashlib 提供的安全算法），是 CWE-327 的标准修复方式；输入输出类型不变（bytes → hex str），下游 `ARTIFACT_STORE[digest]`、`f"sig-{key_id}-{digest}"`、返回值结构完全兼容。
+
+4. 位置正确性：修改点位于 sink 调用处本身，即摘要计算的唯一入口，覆盖了该数据流的全部攻击面——所有经过 `/artifacts/sign` 上传的制品摘要均由 SHA-256 计算，不存在绕过路径。
+
+5. 最小 diff 纪律：函数名、路由路径、变量名、控制流与原代码逐行一致，仅替换第 19 行算法调用及对应注释（第 18 行），无其他改动，构成与漏洞版本的 minimal pair 对照。
+
+6. 第二入口检查：`GET /artifacts/{digest}`（第 28 行）仅按 digest 查询字典并返回元信息，不涉及任何密码学运算，非漏洞数据流入口；`key_id` 仅作字符串拼接进签名标识，不经哈希处理，无需变更。替代通道（如其他路由写入 `ARTIFACT_STORE`）不存在。结论：安全版本无残留漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码第 19 行使用 hashlib.sha1 对用户上传的制品内容计算摘要，SHA-1 存在实用碰撞攻击，用于签名记录场景构成 CWE-327；安全版本将第 19 行替换为 hashlib.sha256，为标准库原生强哈希 API，类型签名与下游存储、签名拼接、返回值完全兼容，控制流与其余数据流（key_id 拼接、GET 查询路由）保持原样，构成 minimal pair", "fix_suggestion": "line 19: 将 hashlib.sha1(content) 替换为 hashlib.sha256(content)"}
+```

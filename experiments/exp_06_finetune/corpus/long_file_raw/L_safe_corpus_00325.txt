@@ -1,0 +1,31 @@
+## 编号分析（全文逐函数）
+
+1. **第 20–25 行 `async_get_backup_agents`**：入口点。仅当非 HassIO 时返回 `CoreLocalBackupAgent`，无外部输入直接进入危险操作。
+
+2. **第 39–54 行 `_read_backups`**：文件系统入口点。`self._backup_dir.glob("*.tar")` 只枚举固定目录下的 `.tar` 文件，路径来自 `hass.config.path("backups")`，不受用户控制；解析失败有异常捕获，仅日志输出，无注入面。
+
+3. **第 56–58 行 `async_download_backup`**：直接 `raise NotImplementedError`，无数据流。
+
+4. **第 60–66 行 `async_upload_backup`**：第二入口点。接收 `open_stream` 回调与 `backup.backup_id`、文件名。关键 sink 在 `get_new_backup_path(backup)`（第 64 行调用）——见第 8 条分析。此处只更新内存字典 `self._backups`，不写盘。
+
+5. **第 68–73 行 `async_list_backups`**：仅返回内存中已加载的备份元数据，无 sink。
+
+6. **第 75–96 行 `async_get_backup`**：以 `backup_id` 作字典键查找（第 84 行），键不存在即抛 `BackupNotFound`；返回的是元数据而非路径拼接结果，无路径注入可能。
+
+7. **第 98–107 行 `get_backup_path`**：sink 是返回 `self._backups[backup_id][1]`。该路径只能来自两个来源：(a) 第 46 行 glob 枚举的真实文件；(b) 第 64 行经 `get_new_backup_path` 校验后的路径。用户提供的 `backup_id` 仅作字典键，无法构造任意路径。
+
+8. **第 109–118 行 `get_new_backup_path`**（核心防御点）：`candidate = self._backup_dir / suggested_filename(backup)`。注释明确指出 `suggested_filename` 不剥离分隔符，因此代码用 `candidate.parent != self._backup_dir` 做白名单式校验：
+   - `../../evil.tar` → parent 为上级目录 → 拒绝；
+   - `sub/dir/x.tar` → parent 为子目录 → 拒绝；
+   - 绝对路径 `/tmp/x.tar` → `Path` 拼接时绝对路径覆盖左侧，parent 为 `/tmp` → 拒绝。
+   这是基于规范化后父目录的等值比较（白名单语义），不是黑名单或正则过滤，属于有效防御。唯一理论边界是符号链接指向目录外，但该场景要求攻击者已能在 backups 目录内创建符号链接，超出本模块威胁模型。
+
+9. **第 120–129 行 `async_delete_backup`**：sink 为 `backup_path.unlink(True)`（第 126 行）。路径同样只能取自经校验的字典条目（第 7 条），`unlink` 限定在 backups 目录内的合法 tar 文件；且删除前通过 `async_get_backup` 类似的加载逻辑确认存在性。无任意文件删除漏洞。
+
+10. **替代通道检查**：全文无环境变量读取、无 subprocess、无 SQL、无反序列化不可信数据（`read_backup` 的异常处理表明 JSON 解析失败被安全捕获）；`on_progress` 回调由上层框架传入，本模块不调用外部输入构造的回调。
+
+**结论**：所有 source→sink 数据流（backup_id → 字典键 → 路径；suggested_filename → 拼接路径 → 写入位置）均有有效防御（字典键查找 + 父目录白名单校验），未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文共审查 9 个函数与全部入口点。backup_id 仅作为内存字典键使用（第 84、101 行），不参与路径拼接；唯一的路径拼接点 get_new_backup_path（第 111 行）使用 candidate.parent 与固定备份目录的等值比较做白名单校验，可阻断相对路径穿越、子目录写入和绝对路径覆盖三类攻击，属于有效防御而非黑名单。delete 操作（第 126 行 unlink）的路径只能来自 glob 枚举或经上述校验的条目，不存在任意文件读写删。无环境变量、命令执行、SQL 或不安全反序列化通道。", "fix_suggestion": "no fix needed"}
+```

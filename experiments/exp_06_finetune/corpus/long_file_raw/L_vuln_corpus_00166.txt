@@ -1,0 +1,32 @@
+## 编号分析
+
+**入口点枚举（全文共 8 个 HTTP 端点）：**
+
+1. **第 71–99 行 `createRelease`**：POST 发布。第 71 行有 `@PreAuthorize hasReleaseNamespacePermission`，发布前还有紧急发布开关校验（第 82 行）。防御有效。
+2. **第 101–130 行 `createGrayRelease`**：灰度发布，同样有 `@PreAuthorize`（第 101 行）。注意第 110 行 `model.setClusterName(branchName)` 用 branch 覆盖 cluster，但权限校验仍基于 URL 参数且在方法进入前执行，无越权。
+3. **第 132–142 行 `get`**：GET `/envs/{env}/releases/{releaseId}`。**无任何 `@PreAuthorize`、无 `shouldHideConfigToCurrentUser` 检查**——任何已登录用户可按自增 releaseId 遍历读取任意环境任意应用的配置内容（含配置值）。
+4. **第 144–158 行 `findAllReleases`**：有 `shouldHideConfigToCurrentUser` 隐藏检查（第 153 行），说明系统设计上确实存在“对当前用户隐藏配置”的需求——反衬第 3 点的缺失是漏洞而非设计。
+5. **第 160–175 行 `findActiveReleases`**：同样有隐藏检查（第 170 行），防御有效。
+6. **第 177–183 行 `compareRelease`**：GET `/envs/{env}/releases/compare`。**同样无任何权限校验**，可对比两个 releaseId 的差异，间接泄露配置变更内容；且与 `get` 组合构成替代通道：即使列表接口隐藏了配置，攻击者仍可通过此接口+遍历 ID 直接读取。
+7. **第 185–214 行 `rollback`**：虽无注解级授权，但第 195–197 行做了显式 `hasReleaseNamespacePermission` 手工校验并抛 `AccessDeniedException`，防御有效。
+
+**数据流验证：**
+- source：URL path 变量 `env`、`releaseId`（第 133–135 行）/ `baseReleaseId`、`toCompareReleaseId`（第 178–180 行）
+- sink：`releaseService.findReleaseById(Env.valueOf(env), releaseId)`（第 136 行）、`releaseService.compare(...)`（第 182 行），返回体直接回传给调用方
+- 中间防御：**零**。无权限注解、无隐藏判断、无对象所有权校验。`Env.valueOf` 仅做环境枚举转换，不构成访问控制。
+
+**第二通道确认**：即使依赖前端不暴露 releaseId，ID 为 long 自增型（第 135 行），可枚举；`compare` 接口可作为绕过“隐藏配置”策略的替代读取通道。
+
+**结论**：存在 CWE-862（缺少授权）导致的敏感信息泄露（配置内容），属于 Apollo 已知问题模式（未登录用户被 Spring Security 全局拦截，但普通低权用户可越权读高权命名空间配置）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-862 Missing Authorization",
+  "risk_level": "中",
+  "source": "line 133-135: GET /envs/{env}/releases/{releaseId} 的路径变量 env 与 releaseId",
+  "sink": "line 136: releaseService.findReleaseById(Env.valueOf(env), releaseId) 将配置内容直接返回给调用方",
+  "explanation": "get 方法(第132-142行)和 compareRelease 方法(第177-183行)均缺少 @PreAuthorize 或 shouldHideConfigToCurrentUser 校验，而同类接口 findAllReleases(第153行)和 findActiveReleases(第170行)都有隐藏配置检查，rollback(第195-197行)也有手工权限校验，证明该保护在本控制器中是被认可的设计要求；releaseId 为自增 long 可枚举，任意低权用户可通过遍历 releaseId 或利用 compare 接口作为替代通道读取任意应用任意环境的配置内容，造成越权信息泄露",
+  "fix_suggestion": "在第132行 get 方法上增加与 createRelease 一致的 @PreAuthorize 权限校验或 shouldHideConfigToCurrentUser 隐藏检查，并在第177行 compareRelease 上增加同样的授权校验"
+}
+```

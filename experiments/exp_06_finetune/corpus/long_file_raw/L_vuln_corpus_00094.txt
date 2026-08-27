@@ -1,0 +1,28 @@
+## 编号分析
+
+1. **入口点枚举（全文）**
+   - `prepareProxy(proxy, appPublicFolder)`（第 20 行）：`proxy` 来自 package.json（开发者控制，非外部输入）。
+   - `mayProxy(pathname)`（第 56 行）：`pathname` 来自 webpack-dev-server 收到的每个 HTTP 请求路径 —— **外部攻击者可控的 source**。
+   - `createProxyEntry` 内 `context(pathname, req)`（第 71 行）：读取 `req.method`、`req.headers.accept`，均为请求可控。
+   - `onProxyReq`（第 91 行）：将 `target` 写回 Origin 头，值来自配置，不可控。
+   - `resolveLoopback`（第 116 行）：仅处理开发者配置的字符串，无外部输入。
+   - `onProxyError(target)`（第 141 行）返回的错误回调：**sink 所在**。
+
+2. **数据流一：pathname → path.resolve → fs.existsSync（第 57–58 行）**
+   - `path.resolve(appPublicFolder, pathname.slice(1))` 未做任何 `..` 归一化限制，可解析到公共目录之外。但该结果只用于 `fs.existsSync` 判断是否走代理，并不读取或返回文件内容；静态文件服务由 webpack-dev-server 自身的防护处理。因此这是防御缺口（黑名单式“存在即不代理”可被编码路径绕过），但本身不构成直接文件泄露 sink。
+
+3. **数据流二：req.headers.host 与 req.url → 响应体（第 143–166 行）**
+   - 第 144 行取 `req.headers.host`，第 146、160、162 行把 `req.url` 和 `host` 以字符串拼接方式写入 `console.log` 和 `res.end(...)`。
+   - `res.writeHead(500)`（第 158 行）未设置 Content-Type；当代理出错时，响应体直接回显攻击者完全可控的 `Host` 头与请求 URL。若中间件链最终以默认 `text/html` 类型返回（Node 在无显式类型时浏览器按 HTML 嗅探），攻击者发送如 `Host: <script>...</script>` 或含 HTML 的 URL 即可在开发者浏览器中执行脚本 —— 反射型 XSS（CWE-79）。无任何 HTML 转义，防御缺失。
+
+4. **第二入口与替代通道**
+   - `accept` 头启发式（第 82 行）只影响路由选择，不影响输出编码。
+   - 对象形式 proxy（第 110 行起）合并用户配置后仍共用同一 `onError`，即所有代理错误路径都汇聚到同一 sink。
+   - `err.code` 来自 Node 错误对象，非用户可控。
+
+5. **结论**
+   - 主要漏洞：`onProxyError` 将未编码的 `Host` 头与 `req.url` 回显进 HTTP 响应体（第 160–164 行），构成反射型 XSS；次要问题是 `mayProxy` 的路径解析可被 `..`/编码绕过（第 57 行），但因 sink 仅是 `existsSync`，危害有限。开发服务器通常绑定 localhost 且有 DNS rebinding 风险叠加，风险评级为低到中。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79", "risk_level": "low", "source": "line 144: req.headers.host 与 line 146/160: req.url（攻击者可控的 HTTP 请求头与路径）", "sink": "line 158-165: res.writeHead(500) 后 res.end 拼接回显 host 与 req.url，未做任何 HTML 编码", "explanation": "代理出错时 onProxyError 把攻击者可控的 Host 头和请求 URL 原样拼进响应体 -> 未设置 Content-Type 且无转义 -> 浏览器可能按 text/html 渲染 -> 反射型 XSS，可叠加 DNS rebinding 打击访问开发服务器的开发者", "fix_suggestion": "line 158-165: 设置 Content-Type 为 text/plain 并对 host 与 req.url 做 HTML 实体编码后再写入响应，例如 res.setHeader('Content-Type','text/plain') 并过滤头中的换行与尖括号"}
+```

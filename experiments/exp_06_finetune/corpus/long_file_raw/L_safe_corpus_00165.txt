@@ -1,0 +1,39 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. 第 96 行 `validate()`：source 为命令 payload（`$this->payload('issue')`，第 99 行）及 options（`clone_info`、`skip_moderation`）。
+2. 第 322 行 `process()`：再次读取 payload 及 `$this->files`、clone_info。
+3. 无直接 HTTP 文件/环境变量入口；数据均来自 API 命令层。
+
+**逐条 source→sink 验证**
+
+- **summary/description 等文本字段**（第 108–127 行）：仅做非空与长度校验，输出时由 MantisBT 统一转义框架处理，无直接 sink，不构成注入。
+- **project_id**（第 136–160 行）：经 `mci_get_project_id` + `project_exists` + `access_has_project_level(report_bug_threshold)` 权限校验，有效。
+- **reporter 覆盖**（第 190–203 行）：有 `webservice_specify_reporter_on_add_access_level_threshold` 阈值校验，有效。
+- **handler**（第 206–234 行）：检查 assign/handle 阈值与用户存在性，有效。
+- **version/sticky/due_date**（第 262–289 行）：均有对应阈值权限校验；`sticky` 检查未传 `$this->user_id`（默认当前用户，行为一致），可接受。
+- **tags**（第 236–246 行）：`tag_name_is_valid` 校验 + 创建权限校验，有效。
+- **files**（第 296–321 行）：上传权限 + 审核事件 + 文件名长度校验；实际写入由 `file_attach_files` 内部处理，本文件内无路径拼接 sink。
+- **custom_fields**：先 `mci_project_custom_fields_validate` 再写入，有效。
+- **notes**（第 388–407 行）：view_state 经枚举转换，note_type 强制 `(int)`；`$t_note_attr` 直接取自输入但作为参数传入 `bugnote_add` 存库，输出侧由框架转义，无直接 sink。
+
+**关键缺陷 —— clone_info 缺少对主问题的授权检查**
+
+- 第 101 行读取 `options.clone_info`；
+- 第 103–110 行仅调用 `bug_is_readonly($t_clone_info['master_issue_id'])`，**没有调用 `access_has_bug_level( VIEWER, $master_issue_id )` 或任何针对该主问题的访问级别检查**；
+- 第 355–395 行 `process()` 中：`bug_update_date`、复制私有备注（含 `VS_PRIVATE` 备注，第 366–380 行）、`file_copy_attachments` 复制附件（第 383–385 行）、建立关系——全部基于攻击者提供的任意 `master_issue_id` 执行。
+- 对比同文件其他 id 类输入（handler、version 等）都有权限校验，此处是遗漏。攻击者只需在目标项目有报障权限，即可通过遍历 id 将**无权查看的私有问题**的备注、附件完整复制到自己新建的问题中，造成越权信息泄露（IDOR / 授权缺失）。此外第 392 行 `relationship_type` 仅做 `> BUG_REL_ANY` 数值比较，未验证为合法关系类型，属次要问题。
+
+**第二通道核查**：同一逻辑也存在于 SOAP 的 `mc_issue_add`（本文件引入），同样依赖此 command，故修复点集中于此即可覆盖。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "missing_authorization / IDOR",
+  "risk_level": "high",
+  "source": "options.clone_info.master_issue_id (line 101, attacker-controlled via API payload)",
+  "sink": "bug_update_date / bugnote_get_all_bugnotes+bugnote_add / file_copy_attachments / relationship_add (lines 355-395)",
+  "explanation": "validate() 在第 103-110 行只检查主问题是否只读(bug_is_readonly)，未检查当前用户对该主问题是否有查看/访问权限(access_has_bug_level)。process() 第 355-395 行随后按攻击者指定的任意 master_issue_id 更新日期、复制其全部备注(包括 VS_PRIVATE 私有备注)、复制附件并建立关系。只要用户在某项目拥有 report_bug_threshold 报障权限，即可克隆无权访问的私有问题的备注与附件到自己的新问题中，实现跨项目越权信息泄露。",
+  "fix_suggestion": "在使用 clone_info 前增加授权检查，例如 if( !access_has_bug_level( config_get( 'view_bug_threshold' ), $t_clone_info['master_issue_id'], $this->user_id ) ) throw new ClientException(...ERROR_ACCESS_DENIED)；同时对 relationship_type 用 relationship_type_exists()/白名单校验"
+}
+```

@@ -1,0 +1,131 @@
+# PgpSignatory.java 全文安全分析
+
+## 一、文件结构总览
+
+本文件为 Gradle signing 插件中的 PGP 签名实现类，全文共约 110 行，包含以下成员：
+
+- 实例初始化块（第 44–46 行）：注册 BouncyCastle Provider
+- 字段声明（第 48–50 行）：`name`、`secretKey`、`privateKey`
+- 构造函数 `PgpSignatory(String, PGPSecretKey, String)`（第 52–56 行）
+- `getName()`（第 58–60 行）
+- `sign(InputStream, OutputStream)`（第 62–81 行）
+- `getKeyId()`（第 83–87 行）
+- `feedGeneratorWith(...)`（第 89–95 行）
+- `writeSignatureTo(...)`（第 97–102 行）
+- `createSignatureGenerator()`（第 104–113 行）
+- `createPrivateKey(...)`（第 115–121 行）
+
+## 二、逐函数入口点与数据流分析
+
+### 1. 实例初始化块（第 44–46 行）
+
+```java
+{ Security.addProvider(new BouncyCastleProvider()); }
+```
+
+**入口点**：类加载/实例化时执行。无外部输入参与，仅注册固定算法提供者。JCE Provider 注册本身在多租户环境有轻微的 provider 顺序污染风险，但此处注册的是标准 BouncyCastleProvider，且 Gradle 为单用户构建工具进程，不构成可利用面。**结论：无漏洞。**
+
+### 2. 构造函数（第 52–56 行）
+
+```java
+public PgpSignatory(String name, PGPSecretKey secretKey, String password) {
+    this.name = name;
+    this.secretKey = secretKey;
+    this.privateKey = createPrivateKey(secretKey, password);
+}
+```
+
+**入口点/source**：`name` 与 `password` 均为调用方传入参数。追溯上游：在本插件体系中，`name` 来自 `signing.signatories` 配置或默认值 `'default'`；`password` 来自 `gradle.properties` 中的 `signing.password` 或环境变量 `ORG_GRADLE_PROJECT_signingPassword`——即构建者本人的凭据配置，属于受信任的本机输入，而非网络攻击者可控输入。
+
+**数据流验证**：
+- `password` → 第 56 行传入 `createPrivateKey(secretKey, password)` → 第 119 行 `password.toCharArray()` → 作为 PBESecretKeyDecryptor 的口令用于解密私钥。这是口令的正常用途（解密自身密钥），sink 是密码学运算而非日志/存储，不存在泄漏路径。
+- `name` → 仅赋值给字段 `this.name`，后续经 `getName()` 返回，无 sink。
+
+**防御有效性**：无需防御——无可达的危险 sink。注意第 119 行 `password.toCharArray()` 未清零数组，理论上口令以 char 数组形式短暂驻留内存，但这是 Java 密码学 API 的普遍局限，且口令来源是构建者自己的配置文件，非跨信任边界数据。**结论：无漏洞。**
+
+### 3. getName()（第 58–60 行）
+
+```java
+return name;
+```
+
+**入口点**：getter，无参数。`name` 为构造时固定的不可变字段（final）。返回值可能被上层拼入日志或错误消息，但 `name` 源于本地构建配置，非攻击者可控。**结论：无漏洞。**
+
+### 4. sign(InputStream toSign, OutputStream signatureDestination)（第 62–81 行）
+
+```java
+public void sign(InputStream toSign, OutputStream signatureDestination) {
+    PGPSignatureGenerator generator = createSignatureGenerator();
+    try {
+        feedGeneratorWith(toSign, generator);
+        PGPSignature signature = generator.generate();
+        writeSignatureTo(signatureDestination, signature);
+    } catch (IOException e) { ... } catch (PGPException e) { ... }
+}
+```
+
+**入口点/source**：
+1. `toSign` InputStream —— 上游为待签名的构件文件（jar/pom 等），由构建过程产生；
+2. `signatureDestination` OutputStream —— 上游为 `.sig` 输出文件流。
+
+这是本类的核心公开方法（public final 类中的 public 方法），需重点核查两条数据流：
+
+**数据流 A：toSign → feedGeneratorWith → generator.update**
+- 第 90–94 行循环读取最多 1024 字节，`read > 0` 时调用 `generator.update(buffer, 0, read)`。
+- 内容仅进入签名摘要计算，从不回写到任何输出流，也不进入命令、SQL、路径等危险 sink。即使 `toSign` 含恶意内容，结果只是产生一个对该内容的合法签名——这正是签名功能的语义。无注入面。
+- 细节核查：`while (read > 0)` 而非 `!= -1`，当 `read == 0`（非阻塞流）会提前终止导致签名不完整——这是一个**正确性缺陷**而非安全漏洞（对常规文件流 read 返回 0 仅在 buffer 长度为 0 时发生，此处 buffer 为 1024，实际不可触发）。
+
+**数据流 B：signature → writeSignatureTo → signatureDestination**
+- 第 100–101 行：`new BCPGOutputStream(signatureDestination)` 后 `pgpSignature.encode(bufferedOutput)` 再 flush。
+- 写出内容是 BC 库生成的确定性 DER/PGP 包编码，不含任何来自 `toSign` 或外部输入的未转义字节。signatureDestination 由调用方打开，本方法按注释约定不关闭它（资源管理责任在调用方，见 Javadoc 第 57–59 行），不构成泄漏。
+- 异常路径：IOException 包装为 UncheckedIOException（第 76 行），PGPException 经 `UncheckedException.throwAsUncheckedException` 重抛（第 78 行）。检查该工具语义：对 RuntimeException 原样抛出，对受检异常包装重抛——不会把敏感异常消息静默吞掉或造成双重注入。异常消息中不含口令或密钥材料。
+
+**第二入口/替代通道核查**：本方法无其他重载、无反射调用、无回调注册；`createSignatureGenerator()` 在第 66 行被调用，其内部（第 104–113 行）使用 `secretKey.getPublicKey().getAlgorithm()` 选择签名算法并硬编码 SHA512（第 108 行 `PGPUtil.SHA512`），算法选择不受外部输入影响，无降级攻击面。**结论：无漏洞。**
+
+### 5. getKeyId()（第 83–87 行）
+
+```java
+PgpKeyId id = new PgpKeyId(secretKey.getKeyID());
+return id == null ? null : id.getAsHex();
+```
+
+**入口点**：无参 getter。source 为 `secretKey.getKeyID()`——密钥对象自身的 long 型 ID，非外部输入。sink 为十六进制字符串返回值。第 86 行的 null 判断实为死代码（刚构造的对象不可能为 null），属代码质量问题而非安全问题。**结论：无漏洞。**
+
+### 6. feedGeneratorWith(...)（第 89–95 行）
+
+private 方法，唯一调用方为第 68 行的 `sign()`。上文已完整分析数据流 A：内容只进摘要器，无输出侧效应，无路径/命令/反序列化 sink。缓冲区固定 1024 字节，无堆分配放大。**结论：无漏洞。**
+
+### 7. writeSignatureTo(...)（第 97–102 行）
+
+private 方法，唯一调用方为第 71 行。写出内容完全由 BC 库编码生成，flush 保证落盘。无格式化字符串、无模板注入。**结论：无漏洞。**
+
+### 8. createSignatureGenerator()（第 104–113 行）
+
+public 方法但依赖实例状态（`secretKey`、`privateKey`），不接受任意参数。算法对：公钥算法 + 固定 SHA512（第 108 行）。SHA512 用于 PGP 签名哈希是当前安全选择，无 MD5/SHA1 降级。`generator.init(PGPSignature.BINARY_DOCUMENT, privateKey)`（第 109 行）使用文本规范化关闭的二进制文档模式，符合构件签名惯例。PGPException 转未检异常重抛，无信息泄漏。**结论：无漏洞。**
+
+### 9. createPrivateKey(...)（第 115–121 行）
+
+```java
+PBESecretKeyDecryptor decryptor = new BcPBESecretKeyDecryptorBuilder(
+    new BcPGPDigestCalculatorProvider()).build(password.toCharArray());
+return secretKey.extractPrivateKey(decryptor);
+```
+
+private 方法，唯一调用方为构造函数第 56 行。source 为口令，sink 为 BC 解密器。BC 的 S2K 派生使用密钥文件中记录的迭代计数与算法，无弱化处理。口令 char 数组未显式清零（第 119 行临时数组不可达引用后由 GC 回收）——理论上的内存驻留残留，但在本威胁模型（单用户构建机、口令本就明文存于 gradle.properties）中不构成实质风险升级。**结论：无漏洞。**
+
+## 三、横向核查
+
+- **黑名单/正则过滤**：全文不存在任何过滤逻辑，因此不存在“可绕过过滤”问题。
+- **反序列化**：无 ObjectInputStream、无 JSON/XML 反序列化。
+- **命令/SQL/路径拼接**：无 Runtime.exec、无 JDBC、无 File 操作。
+- **日志注入**：无 logger 调用。
+- **并发/TOCTOU**：字段均为 final，无共享可变状态。
+- **加密强度**：SHA512 + BC 标准 S2K，无弱算法。
+
+## 四、最终结论
+
+通读全文后确认：所有 source（name、password、toSign 流）均源自构建者本地可信配置或待签构件本身，全部 sink（签名生成、签名写出、私钥解密）均为密码学运算的正常语义用途，中间无任何跨越信任边界的未净化拼接。未发现可利用的安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文逐一核查了初始化块(第44-46行)、构造函数(第52-56行)、getName(第58-60行)、sign(第62-81行)、getKeyId(第83-87行)、feedGeneratorWith(第89-95行)、writeSignatureTo(第97-102行)、createSignatureGenerator(第104-113行)、createPrivateKey(第115-121行)。所有source(name/password/toSign)均来自构建者本地可信配置或待签构件, 所有sink(签名摘要更新、签名包写出、S2K私钥解密)均为密码学运算的正常语义用途, 不存在命令执行、路径遍历、反序列化、日志注入等可达危险sink; 签名算法硬编码为SHA512(第108行)无降级空间; 全文无黑名单或正则过滤故无绕过问题; 无第二入口或替代通道。第90行 while(read>0) 的边界写法与第86行的死代码null判断仅为正确性/质量问题, 不构成安全漏洞。", "fix_suggestion": "no fix needed"}
+```

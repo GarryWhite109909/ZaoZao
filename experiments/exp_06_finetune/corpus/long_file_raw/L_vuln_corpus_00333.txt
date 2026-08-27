@@ -1,0 +1,36 @@
+## 编号分析
+
+1. **第 1–10 行（入口/常量）**：模块导出签名函数 `module.exports = function(payload, secretOrPrivateKey, options, callback)`，这是唯一入口点。`SUPPORTED_ALGS` 第 7 行显式包含 `'none'`。
+
+2. **第 47–52 行（header 构造，关键 source）**：`header = Object.assign({alg: options.algorithm || 'HS256', ...}, options.header)`。`options.header` 是调用方可控对象，且 `Object.assign` 中后写的 `options.header` 会**覆盖**默认的 `alg`、`kid` 等字段。
+
+3. **第 84–90 行（validateOptions）**：`validate(sign_options_schema, false, options, ...)` 只校验 schema 中列出的键；`algorithm` 的校验器是 `includes.bind(null, SUPPORTED_ALGS)`（第 17 行），而 `SUPPORTED_ALGS` 含 `'none'`，因此 `options.algorithm = 'none'` 能通过校验。同时 `header` 键的校验器仅要求 `isPlainObject`（第 18 行），不检查其内容——攻击者可通过 `options.header.alg` 注入任意算法字符串，包括 `'none'` 或其他值，且该注入路径完全绕过第 17 行的白名单。
+
+4. **第 100–104 行（密钥存在性检查）**：仅在 `!secretOrPrivateKey && options.algorithm !== 'none'` 时报错。若 `options.algorithm === 'none'`，允许空密钥通过。
+
+5. **第 106–127 行（算法-密钥类型一致性检查）**：
+   - 第 115 行：`header.alg.startsWith('HS')` 才要求对称密钥；
+   - 第 117 行：正则 `/^(?:RS|PS|ES)/` 才要求私钥。
+   - 若 `header.alg === 'none'`，两个分支都不命中，**所有密钥类型/强度检查被完全跳过**。注意这里用的是被 `options.header` 覆盖后的 `header.alg`，而非经过白名单校验的 `options.algorithm`，二者可不一致（如 `options.algorithm='HS256'` 通过校验，但 `options.header={alg:'none'}` 覆盖后实际签发用 `none`）。
+
+6. **第 128–190 行（payload 处理）**：`validatePayload` 仅校验 iat/exp/nbf 类型，`allowUnknown=true`，其余 claim 不设防，但此处无 sink，风险有限。`timespan` 调用有 try/catch 包裹，异常安全。
+
+7. **第 194–210 行（sink：jws.createSign / jws.sign）**：将未经验证算法约束的 `header` 与 `secretOrPrivateKey` 直接传入 jws。当 `alg='none'` 时，jws 会生成无签名的 JWT（形如 `xxx.yyy.`），即**攻击者可控的 header 可导致签发不安全的未签名令牌**。若上游应用把用户输入透传到 `options.header`（常见于多租户/代理场景），即可伪造任意声明且无需密钥。
+
+8. **第二入口与替代通道**：同步分支（第 205 行 `jws.sign`）与回调分支（第 196 行 `jws.createSign`）使用同一份被污染的 `header`，两条通道均受影响；`signature.length < 256` 的弱密钥兜底检查（第 199、207 行）只覆盖 RS/PS，对 `none` 无效。
+
+9. **防御有效性评估**：第 17 行算法白名单因第 49 行 `options.header` 覆盖而失效（黑名单式遗漏）；第 106–127 行的类型检查以 `none` 为盲区。均为可绕过防御。
+
+结论：存在漏洞，对应 jsonwebtoken 历史 CVE 类问题（算法混淆/none 算法），CWE-347（对密码学签名的验证不当）/ CWE-327。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-347",
+  "risk_level": "high",
+  "source": "line 51: Object.assign 默认 header 与攻击者可控的 options.header 合并, alg 可被覆盖为 none",
+  "sink": "line 196 与 line 205: jws.createSign / jws.sign 使用该 header 签发令牌",
+  "explanation": "第 7 行 SUPPORTED_ALGS 含 none 且第 17 行校验器放行; 第 51 行 options.header 可整体覆盖默认 alg 而绕过白名单; 第 100-127 行针对 none 无任何密钥类型或强度检查; 最终在第 196/205 行以 alg=none 签出无签名 JWT, 若上游将用户输入透传至 options.header 即可伪造任意声明的合法令牌",
+  "fix_suggestion": "line 51: 移除对 options.header 的盲目合并, 禁止用户覆盖 alg 字段; 同时从 SUPPORTED_ALGS 中删除 none 并在 header.alg 为 none 时直接拒绝"
+}
+```

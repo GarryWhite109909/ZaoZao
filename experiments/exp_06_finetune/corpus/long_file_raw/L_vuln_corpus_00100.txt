@@ -1,0 +1,37 @@
+## 编号分析
+
+**入口点枚举（全文通读）：**
+
+1. **第 53 行类声明**：`CifsPublisherPluginDescriptor extends BuildStepDescriptor<Publisher>`，Jenkins 描述符类，其 public 无前缀方法会被 Stapler 自动暴露为 HTTP 端点（URL：`/descriptor/.../doXxx`）。
+
+2. **第 119–140 行的 10 个 `doCheckXxx(@QueryParameter String value)`**：仅做格式校验（required / 正整数等），返回 FormValidation，无 sink，不构成漏洞。
+
+3. **第 112–117 行 `configure(StaplerRequest, JSONObject)`**：将表单 JSON 绑定为 `CifsHostConfiguration` 列表并持久化。该端点未调用 `Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER)`。在旧版 Jenkins 中描述符 configure 由 manage-jenkins 页面保护，但本文件自身无权限校验；配置内容最终用于建立 SMB 连接（主机名、用户名、密码均来自请求），属于管理功能缺少显式鉴权的问题（依赖框架默认防护，属弱防御）。
+
+4. **第 159–172 行 `doTestConnection(StaplerRequest, response)` —— 核心问题**：
+   - **source**：HTTP 请求参数。第 160–161 行 `request.bindParameters(CifsHostConfiguration.class, "")` 与 `bindParameters(hostConfig)` 把攻击者完全可控的 hostname、port、username、password、domain、remoteRootDir 等直接绑定进对象。
+   - **sink**：第 163 行 `hostConfig.createClient(buildInfo).disconnect()` —— 用攻击者指定的主机/端口发起真实 SMB（JCIFS）网络连接。
+   - **数据流验证**：source→sink 之间没有任何权限检查（无 `checkPermission`）、没有主机白名单、没有对目标地址的限制。`createDummyBuildInfo`（第 175–188 行）只额外注入 winsServer 参数，同样无过滤。
+   - **后果**：任何能访问该 URL 的用户（旧版 Jenkins 匿名可读时包括匿名者；即使需登录，普通非管理员用户也可触发）可让 Jenkins 服务器向任意内网/外网地址任意端口发起连接 —— **SSRF（CWE-918）**。可用于内网探测、端口扫描、对内网 SMB 服务触发生成认证（NTLMv2 挑战响应泄露，可配合中继/抓取哈希）。
+   - **错误回显**：第 166–169 行把异常消息拼入 HTML，但先经 `Util.escape(...)` 转义，XSS 防御有效；不过异常细节会向触发者泄露内网连通性信息（超时 vs 拒绝），放大 SSRF 探测能力。
+
+5. **第二入口/替代通道**：
+   - 第 112 行 `configure` 持久化的 host 配置在构建发布时被使用，但那是构建期行为，属于设计功能；
+   - `addHostConfiguration` / `removeHostConfiguration`（第 96、103 行）为 Java 层方法，不经 Stapler 直接暴露，非独立 HTTP 入口；
+   - `readResolve`（第 191 行）仅为 Xstream 反序列化钩子，输入来自本地 config.xml，非外部 source。
+
+6. **防御有效性核查**：全文不存在黑名单或正则过滤；唯一“净化”是 `Util.escape`（有效防 XSS 但与 SSRF 无关）；`FormValidation.validateRequired` 仅是前端提示性校验，POST 可完全绕过，不算防御。
+
+**结论**：存在真实漏洞 —— `doTestConnection` 未授权 + 参数全控的网络出连 = SSRF。这与该插件历史上披露的 CVE（publish_over 系列 testConnection 缺少权限校验导致的 SSRF）一致。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-918 (SSRF), 附带 CWE-862 (缺少授权)",
+  "risk_level": "高危",
+  "source": "line 160-161: doTestConnection 中 request.bindParameters(CifsHostConfiguration.class, '') 将 HTTP 参数完全可控地绑定到 hostConfig",
+  "sink": "line 163: hostConfig.createClient(buildInfo).disconnect() 以攻击者指定的主机和端口发起 SMB 网络连接",
+  "explanation": "Stapler 将 doTestConnection 暴露为 HTTP 端点 -> 攻击者通过请求参数指定任意 hostname/port -> 方法内无 Jenkins.checkPermission 权限检查、无主机白名单或地址限制 -> createClient 直接连向该目标 -> 实现 SSRF，可探测内网、扫描端口并借 SMB 认证泄露 NTLM 哈希；异常信息虽经 Util.escape 转义（XSS 已防住）但仍向触发者回显内网连通性细节",
+  "fix_suggestion": "line 159: 在 doTestConnection 开头增加 Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER)；并对 bindParameters 得到的 hostname 做目标地址白名单校验，禁止指向内网/元数据地址"
+}
+```

@@ -1,0 +1,69 @@
+LANG: python
+```python
+import json
+import re
+import shlex
+import subprocess
+
+from django.http import JsonResponse
+from django.views.decorators.http import require_POST
+
+
+FFMPEG_PREFIXES = ('ffmpeg', '/usr/bin/ffmpeg', '/bin/ffmpeg')
+
+
+def sanitize_ffmpeg_command(command):
+    # whitelist-style validation: parse into argv and allow only known ffmpeg binaries
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return ''
+    if not argv:
+        return ''
+    if argv[0] not in FFMPEG_PREFIXES:
+        return ''
+    return argv
+
+
+@require_POST
+def ffmpeg_control(request):
+    action = request.POST.get('action', '')
+
+    if action == 'list':
+        keyword = request.POST.get('keyword', '')
+        cmd = "ps -eo pid,etime,%cpu,%mem,cmd | grep '[f]fmpeg'"
+        if keyword:
+            cmd += " | grep '" + keyword + "'"
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return JsonResponse({'output': proc.stdout.splitlines()})
+
+    if action == 'kill':
+        pid = request.POST.get('pid', '')
+        if not pid.isdigit():
+            return JsonResponse({'error': True, 'msg': 'Invalid PID'}, status=400)
+        kill_cmd = ['kill', '-9', pid]
+        subprocess.run(kill_cmd, shell=False)
+        return JsonResponse({'error': False, 'msg': f'Process {pid} killed'})
+
+    if action == 'start':
+        raw_command = request.POST.get('command', '')
+        safe_command = sanitize_ffmpeg_command(raw_command)
+        if not safe_command:
+            return JsonResponse({'error': True, 'msg': 'Sanitization failed'}, status=400)
+        subprocess.Popen(safe_command, shell=False,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return JsonResponse({'error': False, 'msg': 'started'})
+
+    return JsonResponse({'error': True, 'msg': 'Unknown action'}, status=400)
+```
+
+1. 第 22、27、40 行为用户可控输入点：`request.POST.get('action'/'keyword'/'pid'/'command')`，均为 Django 框架参数绑定，直接进入命令执行数据流。
+2. `list` 分支（第 29–33 行）中 `keyword` 拼入 shell 管道命令，属第二数据流；按最小 diff 纪律保持原样，仅修复目标漏洞所在流。
+3. `kill` 分支：第 36 行已有 `pid.isdigit()` 类型校验，第 37–38 行将 sink 改为列表形式并 `shell=False`，即使校验被绕过也无法注入元字符，类型正确且位于 sink 前最后一步。
+4. `start` 分支：第 41–43 行将黑名单/正则过滤整体替换为白名单精确允许集——`shlex.split` 将输入解析为 argv 列表，第 8–9 行仅当首元素严格等于 `FFMPEG_PREFIXES` 中的已知二进制路径才放行；第 46 行以 `shell=False` 执行该列表，任何 `&&`、`;`、反引号等元字符都成为普通参数而非 shell 语法，攻击面被完整覆盖。
+5. 防御位置正确性：校验发生在用户输入进入 sink 之前的唯一必经路径（`sanitize_ffmpeg_command` 返回空即 400 拒绝），无旁路通道。
+6. 第二入口检查：`action` 仅作分支比较不进 sink；`keyword` 流保持原样属有意保留的对照项；除上述三处外无其他 `subprocess` 调用点。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-78 OS Command Injection：start 分支经黑名单过滤后仍以 shell=True 执行用户可控命令，可被编码/空白变体绕过；修复采用 shlex.split 解析加 FFMPEG_PREFIXES 白名单精确匹配首元素，并以 shell=False 列表形式传给 Popen，彻底消除 shell 解释层；kill 分支在保留 isdigit 校验基础上改为列表形式 shell=False；list 分支的 keyword 拼接管道命令为第二数据流，按最小 diff 要求保持原样未改动", "fix_suggestion": "line 6-13: 以 shlex.split 加 FFMPEG_PREFIXES 白名单替换黑名单过滤，line 37-38 与 line 45-47: 改用列表参数并以 shell=False 调用 subprocess"}
+```

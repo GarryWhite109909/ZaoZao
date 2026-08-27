@@ -1,0 +1,36 @@
+# 编号分析
+
+1. **第 8-31 行（模块文档字符串）**：声明该 guardrail 执行“用户自定义 Python 代码”，声称沙箱化（无文件 I/O、无网络、无 import）。这是安全声明的核心，需验证。
+
+2. **第 92-99 行（`__init__`）**：`custom_code: str` 直接来自配置模型（`CustomCodeGuardrailConfigModel.custom_code`，第 66-68 行），即管理员/配置文件提供的任意字符串，无任何校验。
+
+3. **第 118-155 行（`_compile_custom_code`）**：关键 sink。第 127 行 `exec_globals = get_custom_code_primitives().copy()` 构建受限命名空间；**第 131 行 `exec(compile(self.custom_code, "<guardrail>", "exec"), exec_globals)` 执行任意代码**。
+
+4. **防御有效性验证（source→sink）**：
+   - source：第 92 行 `custom_code` 参数 / 第 66 行 `custom_code: str` 配置字段。
+   - sink：第 131 行 `exec()`。
+   - 中间防御：仅 `get_custom_code_primitives()` 提供受限 globals。**但 `exec` 的 globals 缺少 `__builtins__` 时 Python 会自动注入完整内置命名空间**——除非 primitives 明确设置 `exec_globals["__builtins__"] = {}`（本文件不可见，且即使如此，Python 沙箱历来可被逃逸，如通过对象 `__subclasses__`/`__globals__` 链）。文件内没有任何 AST 白名单校验、import 禁止机制或字节码限制。因此“沙箱”声明不成立：`import os; os.system(...)` 或访问原语对象的 dunder 属性即可完全逃逸。
+   - 结论：黑名单式/依赖命名空间隔离的过滤按分析要求视为无效防御。
+
+5. **入口点枚举（全文）**：
+   - 第 66-68 行：配置模型暴露 `custom_code` 字段（UI/API 可提交）。
+   - 第 92-99 行：构造函数。
+   - 第 158-246 行：`apply_guardrail` 运行时入口（inputs/request_data 来自 LLM 请求），但用户输入只作为参数传入已编译函数，不构成新的 exec sink；不过若自定义代码本身恶意，可读取 `request_data["metadata"]`（第 213-219 行）泄露数据。
+   - 第 322-355 行：`update_custom_code` **热更新入口**——运行中可直接替换并重新 exec 新代码（第 337 行调用 `_compile_custom_code`），扩大攻击面（无需重启即可植入恶意代码）。
+   - 第 222-239 行 `_prepare_safe_request_data`：对传给代码的数据做了白名单裁剪，是有效缓解但无法弥补 exec 本身的问题。
+
+6. **第二通道确认**：热更新路径（第 322-355 行）与初始化路径（第 137 行）最终汇于同一 sink（第 131 行），均无额外校验。
+
+7. **利用影响**：LiteLLM proxy 以服务进程权限运行，exec 逃逸 = RCE，可窃取数据库凭证、API keys、篡改所有请求/响应。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-94 (Improper Control of Generation of Code, eval/exec 注入导致 RCE)",
+  "risk_level": "严重 (Critical)",
+  "source": "line 92: __init__ 的 custom_code 参数 (源自 line 66 CustomCodeGuardrailConfigModel.custom_code 配置/UI 输入), 以及 line 322 update_custom_code 热更新入口",
+  "sink": "line 131: exec(compile(self.custom_code, '<guardrail>', 'exec'), exec_globals)",
+  "explanation": "custom_code 字符串未经任何语法白名单或静态校验直接传入 line 131 的 exec。所谓沙箱仅依赖 get_custom_code_primitives 提供的受限 globals, 但未显式移除 __builtins__, 且 Python 命名空间隔离可通过内省(如对象 __class__.__mro__/__subclasses__/__globals__)轻易逃逸, import os 后即可执行系统命令。line 322 的 update_custom_code 提供第二条到达同一 sink 的通道, 允许运行时注入恶意代码。成功利用等于在 LiteLLM proxy 进程内实现远程代码执行, 可窃取密钥与全部请求/响应数据",
+  "fix_suggestion": "line 131: 不要使用 exec 执行任意代码。改为基于 AST 的严格白名单解析(仅允许函数定义、if/for/return、白名单内建函数), 显式设置 exec_globals['__builtins__'] = {} 并禁止任何属性链访问 dunder 属性; 更稳妥的方案是用受控 DSL 或独立进程/容器隔离执行, 并对 line 322 的 update_custom_code 增加签名验证与审计"
+}
+```

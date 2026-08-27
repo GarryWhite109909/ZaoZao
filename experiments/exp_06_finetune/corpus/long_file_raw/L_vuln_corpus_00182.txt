@@ -1,0 +1,27 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `CreateMCPService`（第 27 行）：接收外部构造的 `MCPService`（含 `URL`、`StdioConfig.Command/Args`、`EnvVars`、`Headers`、`AuthConfig`），直接入库，无校验。
+2. `GetMCPServiceByID`（第 44 行）：按 tenantID+id 查询，租户隔离依赖 repo 层。
+3. `ListMCPServices`（第 60 行）：**调用了 `service.MaskSensitiveData()`（第 67 行）做脱敏**。
+4. `ListMCPServicesByIDs`（第 72 行）：**未调用 `MaskSensitiveData()`**，直接返回 repo 原始数据（第 81-84 行）——与入口 3 形成第二替代通道，绕过脱敏。
+5. `UpdateMCPService`（第 91 行）：合并更新；注意第 158-176 行的 `configChanged` 判定在字段已合并进 `existing` 之后进行，`*service.URL != *existing.URL` 恒为 false，nil 性比较也恒相等 → 配置变更后旧连接不会被关闭，`GetOrCreateClient` 可能复用旧配置连接（逻辑缺陷，非直接可利用漏洞）。
+6. `DeleteMCPService`（第 205 行）：先查后删，租户隔离正常。
+7. `TestMCPService`（第 226 行）：用库中配置发起出站连接（SSRF 风险取决于上游对 URL 的校验，本文件无校验），错误信息 `fmt.Sprintf("Failed to create client: %v", err)`（第 247、255、262 行）将内部错误细节返回给调用方，存在信息泄露。
+8. `GetMCPServiceTools/Resources`（第 283、312 行）：同上，按 ID 触发出站请求。
+
+**source→sink 数据流**
+- source：HTTP handler 传入的 service IDs / MCPService 对象 → sink：repo 返回值直接透传给响应。`ListMCPServices` 有脱敏防御，但 `ListMCPServicesByIDs`（第 72 行）缺失同一防御，黑名单式“仅列表接口脱敏”可被批量 ID 查询绕过 → **CWE-200 敏感信息暴露**（EnvVars/Headers/AuthConfig 中的 API key 泄露）。
+- 日志注入：名称经 `SanitizeForLog` 处理（第 180、215 行），有效。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-200",
+  "risk_level": "high",
+  "source": "line 72: ListMCPServicesByIDs 接收外部传入的 ids 参数",
+  "sink": "line 84: 直接返回未经 MaskSensitiveData 脱敏的 services 给调用方",
+  "explanation": "ListMCPServices 在 line 67 对每条记录调用 MaskSensitiveData 脱敏，但功能等价的替代查询入口 ListMCPServicesByIDs 缺少该步骤，攻击者可通过批量 ID 查询通道获取 EnvVars、Headers、AuthConfig 中存储的明文凭据，形成脱敏绕过",
+  "fix_suggestion": "line 84: 在 return 前对每个 service 调用 MaskSensitiveData，与 ListMCPServices 保持一致"
+}
+```

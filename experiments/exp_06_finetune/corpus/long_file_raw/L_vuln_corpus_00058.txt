@@ -1,0 +1,29 @@
+## 编号分析
+
+1. **第 30-31 行 `VAR_PATTERN` / 第 60-77 行 `resolve` 入口**：`resolve` 递归处理字符串/字典/列表，是所有参数解析的总入口。任何进入工作流参数的字符串都会经过 `_resolve_string`。
+
+2. **第 84-88 行 `_resolve_string`**：`MUSTACHE_PATTERN.sub` 把 `{{...}}` 归一化为 `${...}`，意味着用户即使不写 `${}`，用 mustache 语法也能触发变量解析——这是第二入口/替代通道。
+
+3. **第 226-229 行 `${env.VAR}` 处理（`_get_variable_value` 中 `var_type == 'env'` 分支）**：`os.getenv(env_var)` 无任何白名单限制。source 为攻击者可控的工作流定义/模板参数（如 YAML 模板中写 `${env.AWS_SECRET_ACCESS_KEY}`），sink 为环境变量读取。若工作流可由低权限用户提交（模板市场、共享 workflow 场景，代码注释中提到 template.invoke 与前端共享逻辑，证实存在多租户/模板来源），即可读取任意环境变量中的密钥 → CWE-200 信息泄露。
+
+4. **第 233-256 行 `params` 与 fallback 分支**：`${name}` 简写会回退到 params/ui_params，仅在本执行上下文内取值，属预期行为；但结合第 3 点，模板作者可用 `${env.*}` 越权读取宿主进程全部环境。
+
+5. **第 395-433 行 `get_nested_value`**：对非 dict/list 对象使用 `hasattr(current, key)` + `getattr(current, key)`（第 424-425 行）。路径来自 `${...}` 内任意内容（正则 `[^}]+` 不限制字符），可写成 `${step.__class__.__init__.__globals__}` 之类进行属性遍历。虽然本文件内未直接 eval/exec，但能沿对象图探测内部状态并注入到后续模块参数中，属于防御缺失（无属性名黑名单/白名单）。
+
+6. **第 437-477 行 `evaluate_condition`**：先 `_resolve_string` 再做字符串切分比较。若步骤输出含运算符字符串（如 `"a==b"`），会导致条件被意外拆分判断——逻辑缺陷，可造成条件绕过（如分支判断被注入数据操纵），但非直接内存安全漏洞。
+
+7. **第 168-176 行 `resolve_tvars`**：`_tvars` 值直接 str 替换进 params，无转义；若下游把 params 用于命令/SQL 拼接则形成二次注入通道，但本文件内无此类 sink。
+
+8. **全文核查结论**：文件本身不含 exec/eval/os.system，最实质的漏洞是第 228-229 行的无限制 `os.getenv` 环境变量泄露，以及第 424-425 行无限制 `getattr` 属性遍历。前者有明确 source→sink 数据流且无有效防御。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-200 (信息泄露) 及 CWE-693 (防护缺失 - 属性遍历)",
+  "risk_level": "高",
+  "source": "line 84-88 与 line 226-229: 攻击者可控的工作流参数或模板字符串中的 ${env.VAR} 表达式",
+  "sink": "line 229: return os.getenv(env_var)，无白名单校验；另见 line 425: getattr(current, key) 无属性名限制",
+  "explanation": "攻击者提交的工作流/模板参数经 resolve -> _resolve_string -> _get_variable_value 传递，var_type == env 分支直接调用 os.getenv(parts[1])，可读取宿主进程任意环境变量如 API 密钥和数据库密码，并将值注入步骤输出或下游模块参数；此外 {{...}} mustache 语法在 line 87 被归一化为 ${...} 构成替代入口；get_nested_value 的 getattr 分支还允许 __class__ 等属性遍历进一步探测内部对象",
+  "fix_suggestion": "line 226-229: 增加 env 变量白名单或前缀允许列表（如仅允许 FLYTO_PUBLIC_ 前缀），拒绝包含敏感关键词的变量；line 424-425: 禁止以 _ 开头的属性访问，仅允许 dict/list 键访问"
+}
+```

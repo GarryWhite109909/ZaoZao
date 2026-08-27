@@ -1,0 +1,29 @@
+## 编号分析
+
+**入口点枚举（全文通读）**
+1. 第 23–24 行：`$_REQUEST['APISecret']` — HTTP 入口，仅作为解密 API 的认证载荷回传，无本地 sink。
+2. 第 76–83 行：`getInput()` — CLI `$argv` 与 `$_REQUEST[$key]` 双通道读取，是潜在 source 汇聚点。
+3. 第 137–143 行：`listFFmpegProcesses($keyword)` — 内部拼接 shell 命令并 `exec`，**关键 sink**。
+4. 第 163–178 行：`killFFmpegProcess($pid)` — 接受外部 PID 参数后 `exec("kill -9 ...")`。
+
+**逐条数据流验证**
+
+- **流 A：`killFFmpegProcess`（第 169 行）**
+  - 第 165 行先做 `is_numeric($pid)` 校验，第 169 行又用 `escapeshellarg()` 包裹后才进入 `exec`。双重防御有效，PID 只能是数字。**无漏洞。**
+
+- **流 B：`listFFmpegProcesses`（第 139–143 行）— 存在漏洞**
+  - 第 140 行：`$command .= " | grep '$keyword'";` 将 `$keyword` 直接以单引号包裹拼入命令字符串；
+  - 第 143 行：`exec($command, ...)` 直接执行；
+  - 防御分析：**没有任何过滤、白名单或 `escapeshellarg()`**。单引号包裹可被注入 `'` 字符闭合（如 keyword 为 `x'; cat /etc/passwd; echo '`），形成完整命令注入。这是典型的第二入口/替代通道模式——本片段虽未展示调用方，但该函数作为公共工具函数，任何将 `getInput('keyword')` / `$_REQUEST['keyword']` 结果传入的调用路径都会构成完整的 source→sink 注入链；且函数自身未做任何防御，属于不安全设计（对比同文件第 169 行的正确写法即可证明作者知道应转义）。
+
+- **流 C：`sanitizeFFmpegCommand`（第 89–114 行）**
+  - 第 95–103 行采用黑名单式 `str_replace` + 正则剥离（`&&`、重定向、`;|`<>&$()\n\r{}` 等）。按要求黑名单视为可绕过：例如利用 IFS 变量展开被剥除前的其他元字符组合、Unicode/编码变体、或依赖调用方在 sanitize 之后再次拼接的路径均可绕过；且第 96 行还无条件改写 URL 前缀。该函数返回值最终流向 shell 执行（由外部调用方），黑名单防御不可靠。**风险点（次级）。**
+
+- **流 D：`_decryptString` / SSRF 面（第 45、53 行）**
+  - 目标 URL 由服务端配置 `$global['webSiteRootURL']` 拼接，用户输入只作为 POST 参数，无直接 SSRF/注入 sink。第 40 行时间窗校验（30 秒）防止重放，但第 36–37 行存在硬编码主机名信任旁路（`SERVER_NAME === 'vlu.me'` 直接放行）——若攻击者可控制 Host 头且 Web 服务器未严格绑定域名，可绕过时效校验，属低危逻辑弱点。
+
+**结论**：最实质的漏洞是第 140→143 行的 shell 命令注入（`$keyword` 未转义直入 `exec`）；次级问题为第 95–103 行黑名单净化可绕过、第 36 行 Host 信任旁路。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "shell_command_injection", "risk_level": "high", "source": "listFFmpegProcesses 的参数 keyword（典型来源为 getInput 或 $_REQUEST 的用户输入）", "sink": "第 143 行 exec($command)，其中第 140 行以单引号拼接 keyword", "explanation": "第 140 行将 keyword 直接拼入 grep 子命令并以单引号包裹，第 143 行未经 escapeshellarg 直接 exec，攻击者可用单引号闭合注入任意 shell 命令；同文件第 169 行 killFFmpegProcess 使用了 is_numeric 加 escapeshellarg 的正确写法，反证此处缺失防御。次级风险：sanitizeFFmpegCommand 第 95-103 行为黑名单过滤可被绕过；isStandaloneDecryptedPayloadValid 第 36 行对固定 SERVER_NAME 直接放行构成时效校验旁路。", "fix_suggestion": "对 keyword 使用 escapeshellarg 转义后再拼接，或改用 proc_open 数组参数形式执行 ps/grep；sanitizeFFmpegCommand 改为白名单校验完整命令结构而非字符黑名单；移除基于 SERVER_NAME 硬编码域名的免检分支"}
+```

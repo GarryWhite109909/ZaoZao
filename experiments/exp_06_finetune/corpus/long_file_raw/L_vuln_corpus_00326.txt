@@ -1,0 +1,33 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `rawHandler`（第 84 行）：路由入口，source 为 `r.URL.Path`（第 91 行）与 `r.URL.Query()`（经 `parseQueryFiles` 第 29 行、`parseQueryAlgorithm` 第 44 行）。
+2. `parseQueryFiles`（第 28 行）：解析 `files` 查询参数，逗号分隔，逐个 `QueryUnescape` 后进入 `slashClean` + `filepath.Join`。
+3. `parseQueryAlgorithm`（第 43 行）：白名单 switch，仅允许固定归档格式，无注入面。
+4. `setContentDisposition`（第 66 行）：`file.Name` 经 `url.PathEscape` 后写入 header，转义有效。
+5. `rawDirHandler`（第 137 行）：调用上述解析结果，最终进入 `getFiles` 与 `archiver.Archive`。
+6. `getFiles`（第 110 行）：递归打开目录，sink 为 `d.user.Fs.Open(path)` / `Stat(path)`，每层有 `d.Check(path)` 校验。
+
+**数据流验证**
+
+- 流 A：`files` 参数（第 30 行）→ `slashClean`（第 15–20 行）→ `filepath.Join(f.Path, name)`（第 36 行）→ `getFiles` 的 `Fs.Stat/Open`（第 116、151 行）。
+  - 防御 1：`gopath.Clean` 会消除前导 `/` 后的 `../`，如 `../..%2Fx` 变为 `/../../x` 再 Clean 成 `/x`，Linux 上遍历被中和。
+  - 缺陷：`slashClean`/`gopath.Clean` 只按 URL 路径语义处理正斜杠。若 `name` 为 `..\..\secret`（反斜杠），首字符非 `/` 仅补前导斜杠，Clean 在 Linux 上把 `\` 当普通字符保留；在 Windows 宿主上 `filepath.Join` 将 `\` 视为分隔符，`..` 得以向上跳出用户目录。代码作者在第 126 行注释中已承认反斜杠问题并在归档名处打了补丁（第 128 行 `ReplaceAll(nameInArchive, "\\", "/")`），但**未对第 36 行 Join 前的路径做同样处理**——同一根因只修了一半。
+  - 防御 2：`d.Check(path)`（第 111 行）作为第二道防线；但它是黑盒校验器，且 `rawDirHandler` 中对 `getFiles` 出错仅 `continue`（第 145 行），若 Check 实现对反斜杠形式路径的规范化与 OS 不一致即被绕过。黑名单式/依赖规范化一致性的过滤不视为可靠防御。
+- 流 B：`r.URL.Path`（第 91 行）→ `NewFileInfo` 带 `Checker: d`，由框架统一校验，未见明显绕过点。
+- 流 C：`algo` 参数白名单，安全。
+- 流 D：`Content-Disposition` 两处均用 `url.PathEscape`，无 header 注入。
+
+**结论**：存在路径遍历风险——`files` 查询参数中的反斜杠未被规范化，Windows 宿主（或任何将 `\` 视为分隔符的存储后端）下可借 `..\\` 逃逸用户作用域读取任意文件并打包下载；且该缺陷与第 126–128 行已修补的 zip-slip 属同一未完全修复的反斜杠处理不一致问题。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22",
+  "risk_level": "high",
+  "source": "line 30: r.URL.Query().Get(files) 中的 files 查询参数",
+  "sink": "line 116 与 line 151: d.user.Fs.Stat(path) / d.user.Fs.Open(path)",
+  "explanation": "攻击者在 GET 归档请求中传入含反斜杠的相对路径如 ..\\..\\secret -> slashClean 仅补前导斜杠且 gopath.Clean 不处理反斜杠 -> filepath.Join 在 Windows 宿主把 \\ 当分隔符使 .. 生效逃出用户目录 -> getFiles 打开越权文件并由 archiver.Archive 打包返回给具备 Download 权限的用户；第 128 行仅修复了归档内条目名的反斜杠，未修复第 36 行 Join 前的路径解析，属同一根因的不完整修复",
+  "fix_suggestion": "line 33-36: 在 slashClean 或 Join 前统一执行 strings.ReplaceAll(name, '\\', '/') 并拒绝 Clean 后仍以 ../ 开头或包含 .. 段的名称，同时确保 d.Check 对所有平台做一致的绝对路径规范化校验"
+}
+```

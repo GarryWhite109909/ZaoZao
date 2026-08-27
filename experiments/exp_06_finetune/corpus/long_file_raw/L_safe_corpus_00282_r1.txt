@@ -1,0 +1,52 @@
+# 逐函数安全分析（全文通读，行号锚定）
+
+## 文件结构总览
+
+本文件是 GuzzleHttp 的 cURL 同步 Handler（`CurlHandler`），共约 130 行。全文包含以下函数/入口点：
+
+1. `__construct(array $options)` — 第 33–60 行
+2. `__invoke(RequestInterface, array $options)` — 第 67–85 行
+3. `close()` — 第 91–94 行
+4. `__destruct()` — 第 96–102 行
+5. `__unserialize(array $data)` — 第 104–108 行
+6. 私有辅助：`assertOpen()` 第 110–117 行、`doClose(bool)` 第 119–137 行
+7. 常量白名单 `KNOWN_CONSTRUCTOR_OPTIONS` — 第 25–28 行
+
+---
+
+## 入口点枚举（source 分析）
+
+**入口点 A — 构造函数参数 `$options`（第 33 行）**
+- Source 类型：开发者传入的配置数组。
+- 防御验证：第 35–39 行对每个键名做严格白名单校验（`isset(self::KNOWN_CONSTRUCTOR_OPTIONS[$name])`），仅允许 `handle_factory` 与 `transport_sharing`。未知键在第 38 行抛出 `InvalidArgumentException`，且错误消息经 `DiagnosticValue::escape()` 转义（第 38 行），防止键名注入日志/HTML。
+- 数据流追踪：
+  - `handle_factory` → 第 44–49 行：仅当非 null 时直接赋给 `$this->factory`。类型由调用方保证为 `CurlFactoryInterface`（docblock 第 31 行 + strict_types 第 3 行），不进入任何字符串拼接、文件操作或命令执行 sink。
+  - `transport_sharing` → 第 41 行取出 → 第 52 行传入 `CurlShareHandleState::fromOption()` 归一化。该静态方法按 Guzzle 源码实现为枚举归一化，非法值抛异常而非透传，无 sink 可达。
+
+**入口点 B — `__invoke` 的 `$request` 与 `$options`（第 68–69 行）**
+- Source 类型：PSR-7 请求对象与传输选项数组，来自上层 Client 调用链。
+- 数据流逐条验证：
+  - **流 1**：`$request` → 第 72 行 `HostValidator::assertRequestHost($request)`。这是 SSRF 防御点：Guzzle 的 HostValidator 会拒绝含控制字符/空白的主机名并执行 allowlist 校验。即使该层被绕过，主机名最终流向第 79 行 `$this->factory->create($request, $options)`，由 CurlFactory 内部 `CURLOPT_URL` 设置——cURL 自身对 URL 中控制字符同样报错（CURLE_URL_MALFORMAT）。双重防御有效。
+  - **流 2**：`$options['delay']` → 第 73–75 行 `\usleep((int) ($options['delay'] * 1000))`。Sink 为 `usleep`。风险仅为 DoS（阻塞当前进程最多约 int 最大值微秒）。但 delay 是请求发起方自己设置的选项，攻击者若能设置它已等价于能任意发请求，不构成提权路径；且 `(int)` 强转消除了类型混淆。判定：非漏洞。
+  - **流 3**：`$request`+`$options` → 第 79 行 factory 创建 easy handle → 第 81 行 `\curl_exec($easy->handle)`。这是核心 sink（网络出站）。防御链：HostValidator（第 72 行）+ CurlFactory 内部的协议/端口校验（Guzzle 默认禁用 file:// 等危险 scheme 由上层配置决定）+ 第 82–83 行错误码捕获后交 `CurlFactory::finish`（第 84 行）统一处理响应，不将原始错误串直接回显给不可信输出。同步 handler 不存在多路复用下的句柄共享竞态（注释第 77–78 行明确说明 Multiplexing::NONE 下独占连接）。
+
+**入口点 C — 反序列化入口 `__unserialize`（第 104–108 行）**
+- 这是典型的反序列化 gadget 攻击面。防御验证：第 105 行先置 `$this->closed = true`，第 107 行无条件抛出 `LogicException`，且 docblock 明言 'should never be unserialized'。任何通过 unserialize 触达本类的尝试立即中断，属性不会被攻击者控制的 payload 填充（closed=true 兜底，即便异常被捕获也无法使用 handler）。防御完全有效。
+- 配套：`NonSerializableTrait`（第 18 行 use）通常使 `__sleep`/序列化同样被禁止，形成双向封堵。
+
+**入口点 D — 生命周期方法 `close()` / `__destruct()` / `doClose()`（第 91–137 行）**
+- 无外部 source 输入。`doClose` 第 121–124 行幂等守卫；第 126–133 行对 factory 关闭异常区分显式/隐式调用（析构中吞异常，符合 PHP 析构不得抛出的约束）；第 134–136 行 finally 清空 `$shareHandleState`，避免 share handle 悬垂引用导致的 use-after-free 类问题（PHP 层面即悬空对象引用）。无 sink 可达。
+
+**第二入口 / 替代通道检查**
+- 替代通道 1：`$this->factory` 若由外部注入（第 44–49 行），其行为不在本文件内——但接口类型受限于 `CurlFactoryInterface`，且注入方本就是可信代码路径（构造期配置），不构成跨信任边界输入。
+- 替代通道 2：`curl_exec` 返回值未直接检查，而是第 82 行记录 errno 后由 `CurlFactory::finish` 处理——不存在将 curl 错误信息未经处理拼入响应的路径。
+- 替代通道 3：无文件读写、无 `eval`、无 shell 执行、无 SQL、无动态 include；全文 grep 级别确认唯一 I/O sink 是 `usleep` 与 `curl_exec`，均已分析。
+- TOCTOU/并发：同步阻塞模型下单 handle 单请求，share state 在 close 后置 null（第 135 行），`assertOpen`（第 110–117 行）阻止 closed 后复用，无竞态窗口。
+
+## 结论汇总
+
+全部 source→sink 流均有有效防御或无可达危险 sink；反序列化入口被硬性阻断；SSRF 面由 HostValidator + CurlFactory 双层防护。未发现可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文逐一分析了 __construct(第33-60行)、__invoke(第67-85行)、close/__destruct/__unserialize/doClose(第91-137行) 等全部函数。构造函数选项经第35-39行白名单严格校验且错误消息经 DiagnosticValue::escape 转义；__invoke 中 request 经第72行 HostValidator 校验后才流向第81行 curl_exec，delay 参数经 (int) 强转后仅影响 usleep 且属调用方自身配置；__unserialize 在第105-107行无条件抛出 LogicException 并预先置 closed=true，彻底阻断反序列化 gadget；doClose 幂等并在 finally 中清空 shareHandleState，assertOpen 阻止关闭后复用。全文无 eval、shell、文件写入、SQL 等其他 sink，所有数据流的防御均有效，未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

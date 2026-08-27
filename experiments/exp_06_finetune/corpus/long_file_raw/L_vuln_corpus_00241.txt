@@ -1,0 +1,18 @@
+## 编号分析
+
+1. **`put`（第 30-79 行）**：入口为 `req.URL.Path`。第 36 行经 `sanitizePath(fs.UploadFolder, ...)` 清洗后作为 `os.OpenFile` 的 sink（第 52 行）。`sanitizePath` 未在片段中给出，但项目语义是解析绝对路径并校验前缀；假设其有效，则该流防御成立。第 41 行仅阻止文件名恰为 `.goshs` 的覆盖。
+
+2. **`upload`（第 82-176 行）**：目标目录 `targetDir` 同样经 `sanitizePath` 校验（第 92 行），目录部分安全。**关键问题在第 113-115 行**：上传文件名清洗只按 `/` 分割取最后一段——`strings.Split(part.FileName(), "/")`。**没有处理反斜杠 `\`**。在 Windows 上（Go 的 `filepath.Join`/`os.Create` 接受 `\` 作为分隔符），攻击者提交文件名 `..\..\..\evil.exe` 或 `..\.goshs` 时：
+   - 第 118 行 `.goshs` 黑名单可被 `foo\..\.goshs` 绕过（`filenameClean` 不等于字面量 `.goshs`）；
+   - 第 121 行 `finalPath := filepath.Join(targetDir, filenameClean)` 中 `..` 未被消除，导致任意路径写入（CWE-22 / CWE-434）。
+   在 Linux 上 `\` 是合法文件名字符，不构成遍历，故此漏洞为 Windows 部署特有——但仍是真实缺陷：黑名单/单字符过滤按要求视为无效防御。
+
+3. **`bulkDownload`（第 179-247 行）**：source 为 `req.URL.Query()["file"]`（第 185 行）。每个路径经同一 `sanitizePath(fs.Webroot, ...)` 校验，失败即 `continue` 跳过（第 190-193 行），无遍历残留进入 `filepath.Walk`（第 239 行）。第 221 行 `zippath := strings.ReplaceAll(filepath, fs.Webroot, "")` 后取 `[1:]`——若某路径恰好等于 Webroot 本身会被 walker 对目录跳过，普通文件路径必含前缀+分隔符，切片安全。该函数未发现可利用数据流。注意：若 `sanitizePath` 允许符号链接逃逸则另有问题，但代码内无证据，不作猜测。
+
+4. **第二入口/替代通道核查**：`put` 与 `upload` 均先过 CSRF、ReadOnly 检查并调用 `prepareWrite` 做 ACL 与大小限制；`upload` 中途错误时清理临时文件。唯一未被统一清洗的是 multipart 文件名（上述第 2 点）。
+
+5. **结论**：全文唯一确认的 source→sink 未防御数据流是 multipart 文件名 → `os.Create`/`os.Rename`，因仅过滤 `/` 而放过 `\` 与 `..`，Windows 下可目录穿越写文件并可绕过 `.goshs` 黑名单。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal (Windows) / CWE-434 Unrestricted File Upload", "risk_level": "medium", "source": "line 113: part.FileName() 来自 multipart 表单的客户端可控文件名", "sink": "line 121 与 line 128: filepath.Join(targetDir, filenameClean) 后传入 os.Create 和 os.Rename", "explanation": "upload 处理器中文件名清洗只用 strings.Split(fileName, '/') 取最后一段，未处理反斜杠与 .. 序列；在 Windows 上 filepath.Join 会把 ..\\..\\x 解析为目标目录之外，且形如 foo\\..\\.goshs 的名字可绕过第 118 行对 .goshs 的字面量黑名单，实现任意路径文件写入或覆盖 ACL 文件；Linux 上反斜杠仅为普通字符，故风险限于 Windows 部署", "fix_suggestion": "line 113: 改用 filepath.Base(part.FileName()) 并同时按 / 和 \\ 分割清洗，随后用 strings.Contains 校验结果不含 .. 且非 .goshs，再拼入 finalPath"}
+```

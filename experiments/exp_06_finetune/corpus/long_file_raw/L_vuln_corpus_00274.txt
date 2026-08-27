@@ -1,0 +1,36 @@
+## 编号分析
+
+1. **第 33–47 行 `update`**：接收外部传入的 `options`（字符串），直接赋给 `authority.options` 并入库。**没有任何加密处理**，也没有校验内容。对比第 100–107 行 `create` 中对 `acme_private_key` 做了 `data_encrypt` 后才存入 `kwargs["options"]`。
+
+2. **第 50–61 行 `update_options`**：独立入口点，直接把 `options` 写入数据库，同样无加密、无审计日志（连 `log_service.audit_log` 都没有）。这是绕过第 103–106 行加密逻辑的**第二入口/替代通道**：攻击者可通过更新接口将明文 ACME 私钥写入 `authority.options`。
+
+3. **第 64–88 行 `mint`**：若插件返回值长度不是 3 或 4，`private_key` 未定义导致 `UnboundLocalError`（可用性问题，非安全漏洞）。
+
+4. **第 91–130 行 `create`**：
+   - 第 92–97 行有名称/角色唯一性检查，防重复；
+   - 第 103–106 行仅当选项名为 `acme_private_key` 时加密，其他敏感插件选项（如其他私钥类字段）不加密即随 `json.dumps` 入库——黑名单式按名过滤，属可绕过的不完全防御；
+   - 第 110 行 `Authority(**kwargs)` 直接用 kwargs 构造 ORM 对象，依赖上游 schema 校验（本文件不可见）。
+
+5. **第 133–160 行查询函数**：`get_all` 无权限过滤，但通常由上层 API 权限控制；`get_authorities_by_name` 使用参数化 `in_()` 查询，无 SQL 注入。
+
+6. **第 162–172 行 `get_authority_role`**：admin 判断正确，无提权问题。
+
+7. **第 175–210 行 `render`**：
+   - 第 183 行 `filt.split(";")` 取用户输入；
+   - 第 187–189 行 `"cn" in filt` 子串匹配后直接取 `terms[1]` 拼 `ilike(f"%{term}%")`——用户可控通配符 `%`/`_` 可注入 LIKE 模式（轻微信息枚举风险）；
+   - 第 191 行 `database.filter(query, Authority, terms)` 将用户可控字段名/值交给通用过滤器，ORM 参数化保证无 SQL 注入；
+   - 第 195–204 行非 admin 强制 `Authority.id.in_(authority_ids)` 过滤，且该条件与前面 filter 是 AND 关系，**授权边界有效**，不构成越权读取。
+
+8. **核心漏洞确认**：source = 第 60 行 `update_options(authority_id, options)` 的 `options` 参数（以及第 34 行 `update` 的 `options`）；sink = 第 58 行 / 第 42 行 `authority.options = options` → `database.update` 持久化。防御（第 103–106 行的加密）只存在于 `create` 路径，更新路径完全绕过，导致敏感凭据（ACME 账户私钥等）以明文存入数据库，违反 CWE-312。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-312",
+  "risk_level": "中",
+  "source": "line 60: update_options(authority_id, options) 的 options 参数来自 API 请求体",
+  "sink": "line 58: authority.options = options 后经 database.update 明文持久化到数据库",
+  "explanation": "create 函数在第 103-106 行对 acme_private_key 做了 data_encrypt 再存入 options，但 update(第 42 行) 和 update_options(第 58 行) 这两个替代入口直接把用户提供的 options 字符串原样写入 authority.options，未做任何加密或校验，攻击者可经由更新接口将 ACME 私钥等敏感凭据以明文写入数据库；此外 create 中仅按字段名 acme_private_key 黑名单式加密，其他敏感插件选项也不加密",
+  "fix_suggestion": "在 line 58 与 line 42 复用 create 中的加密逻辑：解析 options JSON，对所有敏感键（含 acme_private_key 及其他密钥类选项）统一调用 data_encrypt 后再赋值给 authority.options，并在 update_options 中补充 log_service.audit_log 审计记录"
+}
+```

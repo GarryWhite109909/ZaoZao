@@ -1,0 +1,59 @@
+# 全文逐函数安全分析（PgpSignatory.java）
+
+## 一、文件概况与入口点枚举
+
+本文件共约 119 行，是 Gradle signing 插件中的 PGP 签名实现类 `org.gradle.plugins.signing.signatory.pgp.PgpSignatory`。它本身不暴露 HTTP 路由或命令行入口，属于**库级组件**，其“入口点”即公开构造器与公开方法。逐一枚举：
+
+1. **实例初始化块（第 41–43 行）**：`Security.addProvider(new BouncyCastleProvider())` —— 无外部输入，仅注册 JCE Provider，无数据流。
+2. **公开构造器 `PgpSignatory(String name, PGPSecretKey secretKey, String password)`（第 49–53 行）**：三个参数均为 source 候选——`name` 来自构建脚本配置，`secretKey` 来自密钥环文件解析，`password` 来自 gradle.properties / 环境变量 / keyring 口令配置。
+3. **`getName()`（第 56–58 行）**：返回字段 `name`，无 sink。
+4. **`sign(InputStream toSign, OutputStream signatureDestination)`（第 65–77 行）**：核心入口，`toSign` 是待签名数据的 source，`signatureDestination` 是输出 sink。
+5. **`getKeyId()`（第 80–83 行）**：读取 `secretKey.getKeyID()` 并转十六进制；注意第 82 行的判空逻辑有缺陷（见下）。
+6. **私有 `feedGeneratorWith(...)`（第 85–92 行）**：流读取循环。
+7. **私有 `writeSignatureTo(...)`（第 94–99 行）**：签名写出。
+8. **公开 `createSignatureGenerator()`（第 101–109 行）**：**关键漏洞所在行（第 103 行）**。
+9. **私有 `createPrivateKey(...)`（第 111–118 行）**：口令解密私钥。
+
+## 二、逐条 source→sink 数据流与防御验证
+
+### 数据流 1：password → createPrivateKey → privateKey（第 49→52→113→114 行）
+- Source：构造器第 49 行的 `String password` 参数（上游来自构建配置/环境）。
+- Sink：第 113 行 `build(password.toCharArray())` 与第 114 行 `extractPrivateKey(decryptor)`。
+- 防御检查：解密使用 BouncyCastle 的 `BcPBESecretKeyDecryptorBuilder`，算法由密钥环自身 S2K 指定，无硬编码弱化；无日志打印、无异常消息泄漏口令（第 115–116 行仅包装抛出）。**此流本身无注入类问题**。
+- 但存在**内存驻留弱点（CWE-316）**：第 49 行以不可清除的 `java.lang.String` 承载口令，且第 52 行长期保存在调用链中、第 47 行派生的 `privateKey` 字段生命周期与对象一致，无法主动擦除。属低危加固项。
+
+### 数据流 2：toSign → generator.update → generate → writeSignatureTo（第 65→68→89→70→71→96–98 行）
+- Source：第 65 行 `InputStream toSign`。
+- 处理：第 86–91 行固定 1024 字节缓冲循环喂入，边界正确（`read > 0` 判断，虽然未处理 `read == 0` 的罕见阻塞流场景，但非安全问题）。
+- Sink：第 96–97 行写入调用方提供的 OutputStream。
+- 防御检查：签名内容完全由 BC 库计算，无路径拼接、无反序列化、无 SQL/XML 注入面。**该流无有效攻击面**。
+
+### 数据流 3：createSignatureGenerator 中硬编码 SHA-1（第 101–109 行）★ 主要发现
+- 第 103 行：`new BcPGPContentSignerBuilder(secretKey.getPublicKey().getAlgorithm(), PGPUtil.SHA1)` —— **摘要算法被硬编码为 SHA-1**，无视密钥能力与策略配置。
+- Source：并非用户可控输入，而是**开发者硬编码的密码学决策**；sink 为第 104 行 `generator.init(...)` 及最终生成的签名（第 70 行 `generate()`）。
+- 影响链：所有经 `sign()`（第 65 行）产出的 PGP 签名均使用 SHA-1 摘要。SHA-1 已被证明存在选择前缀碰撞（SHAttered, 2017），RFC 4880bis/NIST SP 800-131A 均已弃用其用于数字签名。下游验证方若接受 SHA-1 签名，则面临碰撞伪造风险（CWE-327 使用已破解/有风险的密码学原语，亦可归类 CWE-328 可逆单向哈希）。这是 Gradle 该历史版本的真实缺陷，后续版本已改为可配置/默认 SHA-256/SHA-512。
+
+### 数据流 4：getKeyId 判空缺陷（第 80–83 行）
+- 第 81 行先执行 `new PgpKeyId(secretKey.getKeyID())`，第 82 行才判断 `id == null`。`new` 表达式要么成功返回非 null 对象、要么抛异常，因此判空恒为 false，属死代码/逻辑错误（CWE-476 相关的无效防护），但 `getKeyID()` 返回 long 原始值不会为 null，实际不构成可利用漏洞，仅为代码质量问题。
+
+## 三、第二入口与替代通道核查
+
+- 全文无反射调用、无 `Runtime.exec`、无文件路径拼接、无网络 API、无反序列化（`ObjectInputStream`）、无 XML 解析——不存在注入型第二通道。
+- `Security.addProvider`（第 42 行）无条件注册全局 Provider，理论上可被同 JVM 内后续代码利用 Provider 替换/顺序问题（CWE-1395 类），但此处注册的是标准 BC，且在插件上下文中属惯例做法，不判定为漏洞。
+- 异常处理（第 72–76、106–108、115–117 行）统一包装抛出，无堆栈外泄至响应面的场景（无 Web 层）。
+
+## 四、结论
+
+唯一实质性安全缺陷为**第 103 行硬编码 SHA-1 作为签名摘要算法**，导致该签名人产出的全部 PGP 签名强度不足；辅以第 49 行口令 String 驻留内存的低危问题。无输入注入、无越权、无反序列化等高危漏洞。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-327/CWE-328",
+  "risk_level": "Medium",
+  "source": "line 103: 硬编码的 PGPUtil.SHA1 摘要算法常量",
+  "sink": "line 103-104: new BcPGPContentSignerBuilder(algorithm, PGPUtil.SHA1) 并 generator.init 后于 line 70 generate() 产出全部签名",
+  "explanation": "line 103 将签名摘要算法硬编码为 SHA-1 且不可配置 -> 所有经 line 65 sign() 入口产出的 PGP 签名均使用已被碰撞攻破的 SHA-1 -> 攻击者可利用选择前缀碰撞对被签内容进行伪造替换，破坏签名抗抵赖性；另 line 49 以 String 承载口令导致 CWE-316 内存驻留（低危）；line 82 判空为死代码不构成漏洞",
+  "fix_suggestion": "line 103: 移除硬编码 PGPUtil.SHA1，改为使用 HashAlgorithmTags.SHA256 或 SHA512，并通过签名配置项允许用户指定摘要算法"
+}
+```

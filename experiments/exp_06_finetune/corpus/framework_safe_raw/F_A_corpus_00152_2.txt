@@ -1,0 +1,103 @@
+LANG: go
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"net/http"
+)
+
+type Doc struct {
+	XMLName xml.Name `xml:"document"`
+	Items   []Item   `xml:"item"`
+}
+
+type Item struct {
+	Title string `xml:"title"`
+	Body  string `xml:"body"`
+}
+
+// ensureNoEntityDecls 在正式解码前对同一份字节流做一次白名单式
+// 令牌扫描：只允许普通元素、字符数据、注释以及目标为 xml 的处理指令，
+// 任何 DTD 指令（DOCTYPE/ENTITY）一律拒绝，从根源上阻断 XXE。
+func ensureNoEntityDecls(data []byte) error {
+	scanner := xml.NewDecoder(bytes.NewReader(data))
+	for {
+		tok, err := scanner.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("xml scan error")
+		}
+		switch t := tok.(type) {
+		case xml.Directive:
+			return fmt.Errorf("dtd directives are not allowed")
+		case xml.ProcInst:
+			if t.Target != "xml" {
+				return fmt.Errorf("processing instruction not allowed")
+			}
+		case xml.StartElement, xml.EndElement, xml.CharData, xml.Comment:
+			// 白名单允许的令牌类型
+		default:
+			return fmt.Errorf("token type not allowed")
+		}
+	}
+}
+
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	file, _, err := r.FormFile("docfile")
+	if err != nil {
+		http.Error(w, "missing file", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		http.Error(w, "read error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := ensureNoEntityDecls(data); err != nil {
+		http.Error(w, "invalid xml", http.StatusBadRequest)
+		return
+	}
+
+	var doc Doc
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(&doc); err != nil {
+		http.Error(w, "invalid xml", http.StatusBadRequest)
+		return
+	}
+
+	for _, item := range doc.Items {
+		fmt.Fprintf(w, "%s: %s
+", item.Title, item.Body)
+	}
+}
+
+func main() {
+	http.HandleFunc("/upload", uploadHandler)
+	http.ListenAndServe(":8080", nil)
+}
+```
+
+1. 第 33 行的 `uploadHandler` 中，用户可控输入点是第 35 行 `r.FormFile("docfile")` 返回的上传文件句柄——这是本链唯一的攻击者输入通道。
+2. 第 43 行 `io.ReadAll` 将整个文件读入 `data`，随后原代码在第 55 行直接交给 `xml.NewDecoder(...).Decode(&doc)` 解析；若解析器接受 DTD/实体声明，攻击者可通过内嵌 `<!DOCTYPE ... <!ENTITY xxe SYSTEM "file:///etc/passwd">` 触发外部实体引用，sink 是第 63 行对 `item.Title/item.Body` 的回显（实体展开内容随之泄露）。
+3. 修复位置正确性：防御插入在读取完成之后、业务解码之前（新增第 50–52 行调用），位于污染数据进入 XML 解析器的必经之路上，且在 `main` 路由注册与 handler 控制流完全不变的前提下仅做前置校验，满足最小 diff。
+4. 防御类型正确性：新增的 `ensureNoEntityDecls`（第 26–47 行）采用白名单精确允许集——只放行 `StartElement/EndElement/CharData/Comment` 与目标为 `xml` 的处理指令，任何 `xml.Directive`（即 DOCTYPE/ENTITY 所在层）直接拒绝，而非黑名单字符串匹配，无法被大小写、编码或嵌套变体绕过。
+5. 攻击面覆盖完整性：扫描器与业务解码器使用同一份 `data` 字节流（第 28 行重新封装），令牌级检查覆盖文档序言与正文中的全部 DTD 注入点；即使后续 `Decode` 内部行为变化，恶意声明也已在入口被拦截。
+6. 第二入口/替代通道检查：除 `/upload` 外无其他路由或参数绑定路径（第 79–80 行仅注册一个 handler）；原代码中残留的 `os/exec` 导入已随无用代码移除，不存在命令执行等第二漏洞面，结论为修复后无 XXE 数据流。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码将用户上传文件直接交由 xml 解码器解析，存在 CWE-611 XXE 风险；修复后新增白名单令牌预扫描函数 ensureNoEntityDecls，在解码前拒绝一切 DTD 指令与非 xml 处理指令，路由、handler 名、结构体与控制流均保持不变，构成最小对照样本。", "fix_suggestion": "line 50: 在 Decode 前调用 ensureNoEntityDecls(data) 对同一字节流做白名单令牌扫描，拒绝所有 xml.Directive 以阻断外部实体引用"}
+```

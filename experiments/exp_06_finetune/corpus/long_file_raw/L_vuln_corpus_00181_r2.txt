@@ -1,0 +1,64 @@
+# flannel extension 后端安全分析
+
+## 一、全文通读与入口点枚举
+
+本文件是 flannel 的 `extension` 后端（第 1–17 行为 License 头，第 18 行 `package extension`），全文共约 130 行，包含以下函数与入口点：
+
+1. **`init()`（第 19–21 行）**：调用 `backend.Register("extension", New)` 注册后端工厂。这是唯一的注册入口，本身无危险操作。
+2. **`ExtensionBackend` 结构体定义（第 23–27 行）**：持有 `sm subnet.Manager`、`extIface`、`networks map[string]*network`。注意 `networks` 字段声明后从未被写入或读取——死代码，不构成攻击面。
+3. **`New()`（第 29–37 行）**：仅做结构体初始化并返回，无 source/sink。
+4. **`Run()`（第 39–41 行）**：阻塞等待 ctx 取消，无逻辑，无漏洞面。
+5. **`RegisterNetwork()`（第 43–110 行）**：核心函数，包含全部命令执行 sink，详见下文逐行分析。
+6. **`runCmd()`（第 113–139 行）**：通用命令执行辅助函数，是所有 sink 的汇聚点。
+
+外部输入通道枚举：
+- **配置文件/etcd/Kubernetes API 中的 backend 配置 JSON**（第 48 行 `config.Backend`）——这是主要 source；
+- **租约管理器返回的子网/IP 数据**（第 88–90 行 `lease.Subnet`、`lease.IPv6Subnet`、`attrs.PublicIP` 等）——次要 source；
+- 无 HTTP 路由、无文件路径参数、无环境变量直接读取（`os.Environ()` 只是透传给子进程）、无回调注册。
+
+## 二、source→sink 数据流逐一验证
+
+### 流 1：`config.Backend` → 四个命令字段 → `sh -c` 执行
+
+- **Source**：第 47–49 行，`json.Unmarshal(config.Backend, &cfg)` 将后端配置反序列化到含 `PreStartupCommand / PostStartupCommand / SubnetAddCommand / SubnetRemoveCommand` 四个 string 字段的结构体。`config.Backend` 来自 flannel 的网络配置（通常存于 etcd 或 Kubernetes ConfigMap），可由具备配置写权限者控制。
+- **防御验证**：反序列化之后到执行之前，**没有任何校验、白名单、转义或沙箱**。代码直接把字符串赋给 `n.preStartupCommand` 等字段（第 50–53 行）。不存在任何过滤层，因此也不存在“黑名单绕过”问题——是彻底的无过滤。
+- **Sink A**：第 57 行 `runCmd([]string{}, "", "sh", "-c", n.preStartupCommand)` —— preStartupCommand 直接作为 `sh -c` 的脚本体执行，任意命令注入（实际上就是“设计上允许任意命令”，但问题在于该值来自集群共享配置存储而非本地受信管理员文件时，任何能改配置的实体即可在所有节点以 root 执行任意命令）。
+- **Sink B**：第 96 行 `runCmd(..., "sh", "-c", n.postStartupCommand)` —— 同样模式。
+
+### 流 2：租约数据 → 环境变量 → 子进程
+
+- 第 92–98 行将 `config.Network`、`lease.Subnet`、`lease.IPv6Subnet`、`attrs.PublicIP`、`attrs.PublicIPv6` 通过 `fmt.Sprintf("KEY=%s")` 拼成环境变量传入 `runCmd`。
+- 在 `runCmd` 第 121 行 `cmd.Env = append(os.Environ(), env...)` 中合并进子进程环境。
+- 这些值来自 etcd/API server 的租约分配，格式受控（CIDR/IP），且通过环境变量传递而非拼入 shell 字符串，注入风险较低；但若租约数据被篡改（如恶意节点写入非法 Subnet 字符串），仍会进入 postStartupCommand 的执行上下文。此为次级风险，主风险仍是流 1。
+
+### 流 3：`SubnetAddCommand / SubnetRemoveCommand`
+
+- 第 52–53 行解析了这两个字段并存入 network 结构，但**本文件中从未执行它们**（推测由未展示的 `network.HandleSubnetEvents` 使用）。按“结论必须基于全文证据”原则，此处只指出字段已从不可信配置流入结构体，若下游同样以 `sh -c` 执行则构成同一漏洞的第二入口/替代通道——这与要求 3 吻合：即使修复 pre/post 命令，SubnetAdd/Remove 命令仍是平行的注入通道，必须一并治理。
+
+### `runCmd()` 内部检查（第 113–139 行）
+
+- 第 120 行 `exec.Command(name, arg...)`：name 固定为 "sh"，arg 为 `-c` + 用户可控脚本——exec 包不做任何 shell 解释防护，防护责任完全在上游，而上游无防护。
+- stdin 写入（第 125–134 行）内容为空串+换行，无注入面。
+- `CombinedOutput` 仅回读输出，无风险。
+
+## 三、第二入口与替代通道核查
+
+- 无 HTTP handler、无用户 CLI 参数直连 sink；
+- 替代通道即上述 `SubnetAddCommand/SubnetRemoveCommand` 字段及租约数据经环境变量进入脚本上下文；
+- 该漏洞本质是 CVE-2023-46751 类问题：flannel 曾因 extension 后端允许从共享配置存储注入命令而被评估——配置存储的写权限边界即是 RCE 边界。
+
+## 四、结论
+
+主数据流：第 48 行 `config.Backend`（source）→ 第 50–53 行无过滤赋值 → 第 57 行 / 第 96 行 `sh -c` 执行（sink），构成 CWE-78 OS 命令注入（设计层面为 CWE-77/CWE-94 特征的“配置驱动任意命令执行”）。风险等级取决于配置存储访问控制：在多租户或配置可被非 root 角色修改的环境中为高危。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-78 (OS Command Injection) / 配置驱动的任意命令执行",
+  "risk_level": "高危(取决于配置存储写权限边界)",
+  "source": "line 48: json.Unmarshal(config.Backend, &cfg), Backend 配置来自 etcd 或 Kubernetes API 等共享配置存储",
+  "sink": "line 57 与 line 96: runCmd(..., 'sh', '-c', n.preStartupCommand / n.postStartupCommand)",
+  "explanation": "line 48 反序列化的 PreStartupCommand 和 PostStartupCommand 在 line 50-53 直接赋值, 全程无任何校验或白名单, 随后在 line 57 和 line 96 经 sh -c 执行; 任何能修改网络后端配置的主体即可在 flannel 运行的每个节点以守护进程权限(root)执行任意命令; 另有替代通道: line 52-53 解析出的 SubnetAddCommand 与 SubnetRemoveCommand 同样源自不可信配置, 若下游事件处理同样以 sh -c 执行则构成平行注入点; 租约数据经 line 92-98 以环境变量方式传入子进程, 注入风险较低但可影响脚本语义",
+  "fix_suggestion": "line 57/96: 不再通过 sh -c 执行整段配置字符串; 改为仅允许引用预置的可执行文件路径(绝对路径白名单加哈希校验), 参数通过 argv 数组传递并对 NETWORK/SUBNET 等变量做严格格式校验(CIDR 正则); 同时对 SubnetAddCommand/SubnetRemoveCommand 采用同等约束, 并在文档中明确要求配置存储的 RBAC 最小化"
+}
+```

@@ -1,0 +1,53 @@
+LANG: python
+```python
+from django.contrib.auth.decorators import login_required, user_passes_test
+from django.http import JsonResponse, HttpResponseBadRequest
+from django.views.decorators.http import require_POST
+import json
+
+from myapp.models import GlobalSet
+
+
+def _is_staff(user):
+    return user.is_staff
+
+
+@login_required
+@user_passes_test(_is_staff)
+@require_POST
+def reorder_sets(request):
+    """Reorders global sets. Fixed: now restricted to staff/admin."""
+    try:
+        payload = json.loads(request.body)
+        set_ids = payload["ids"]
+    except (json.JSONDecodeError, KeyError):
+        return HttpResponseBadRequest("missing ids")
+
+    for position, set_id in enumerate(set_ids):
+        GlobalSet.objects.filter(pk=set_id).update(sort_order=position)
+
+    return JsonResponse({"success": True})
+
+
+@login_required
+def delete_set(request, set_id):
+    """Delete action that DOES enforce the admin check."""
+    if not request.user.is_staff:
+        return JsonResponse({"error": "forbidden"}, status=403)
+
+    GlobalSet.objects.filter(pk=set_id).delete()
+    return JsonResponse({"success": True})
+```
+
+分析：
+
+1. 第 21 行 `reorder_sets` 的用户可控输入点是请求体 JSON 中的 `ids` 字段（第 24 行），以及框架绑定的 `request` 对象本身；`delete_set` 的可控输入是 URL 路由参数 `set_id`（第 40 行）。
+2. 第 28-29 行为 sink：`GlobalSet.objects.filter(pk=set_id).update(sort_order=position)` 直接以登录用户提交的 id 列表批量改写全局排序，原代码仅有 `@login_required`（第 20 行），缺少授权检查，任何普通登录用户均可触发——CWE-862。
+3. 防御修复：在第 20-22 行之间插入 Django 框架原生授权装饰器 `@user_passes_test(_is_staff)`（辅助函数 `_is_staff` 定义于第 15-16 行）。位置正确性：装饰器在视图函数执行前、`require_POST` 之后拦截请求；类型正确性：`user_passes_test` 是 Django 官方授权 API，基于布尔谓词做白名单式精确允许（仅 staff 为 True），非黑名单/正则过滤。
+4. 攻击面覆盖完整性：该数据流唯一入口即 HTTP POST 到 `reorder_sets` 路由，装饰器覆盖全部到达 sink 的路径；ORM 参数化查询本身已防注入，无需额外处理。
+5. 第二入口检查：第 35-38 行的 `delete_set` 已有 `is_staff` 手动检查（第 36-37 行），属正确防御，按 minimal pair 纪律保持原样不动。
+6. 结论：修复后无 CWE-862 残留，两个入口均强制管理员权限。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞代码中 reorder_sets 仅用 login_required 认证而无授权检查，任何登录用户可通过 POST ids 批量改写 GlobalSet 排序（CWE-862）；修复采用 Django 原生 user_passes_test 装饰器限定 staff 用户，属白名单精确允许的有效防御；第二入口 delete_set 已含 is_staff 手动检查，保持原样。", "fix_suggestion": "line 21: 在 reorder_sets 上添加 @user_passes_test(_is_staff) 授权装饰器"}
+```

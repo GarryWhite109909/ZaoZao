@@ -1,0 +1,27 @@
+## 编号分析（全文逐函数）
+
+**1. 常量与结构体（第10–42行）**：SuciProfile 含 ProtectionScheme/PrivateKey/PublicKey，来自本地 yaml 配置，非外部输入，无直接风险。
+
+**2. CompressKey（第44–53行）**：仅内部调用（profileB 中对已通过长度校验的 65 字节公钥压缩），uncompressed[0:33] 不会越界；y 来自 uncompressKey 或 SetBytes，无外部可控越界。
+
+**3. uncompressKey（第55–90行）**：输入 compressedBytes 长度在 profileB 中已固定为 33（见下），xBytes 32 字节；ModSqrt 失败返回 nil 并被上层检查。数学运算均在 mod P 下进行，无 panic 路径。
+
+**4. HmacSha256 / Aes128ctr / AnsiX963KDF（第92–126行）**：macLen 固定为常量 8，不会越界切片；encKey/icb 长度由 KDF 输出按固定常量切分（EncKeyLen=16、Icb=16、MacKey=32，总 48 ≤ 2×32=64 字节 KDF 输出），aes.NewCipher 对 16 字节密钥必成功。counter 从 1 递增，kdfRounds=2，无溢出。
+
+**5. swapNibbles / calcSchemeResult（第128–141行）**：输出长度为明文的 2 倍 hex；末尾 'f' 判断有 len-1 索引——若 decryptPlainText 为空则 schemeResult 为空串会 panic。但 profileA/B 中 cipherText 至少需要覆盖 MAC 校验通过的密文；MAC 是 HMAC 截断，攻击者无法在空密文下伪造 MAC（需知道 MacKey），故该路径实际不可达，不构成可利用漏洞。
+
+**6. profileA（第143–200行）**：入口 input 为 SUCI 最后一段（网络侧 UE 提交）。hex 解码失败即返回；长度校验 `len(s) < 32+8` 拒绝短输入；切片 decryptPublicKey/CipherText/Mac 边界正确。privateKey 来自配置文件，hex 解码失败时 aHNPriv 为 nil——此时 X25519 会报错返回 nil，decryptSharedKey 为 nil，KDF 仍执行但 MAC 校验必然失败并返回错误，不会 panic（append(nil,...) 合法）。MAC 不匹配即拒绝，提供完整性防御；AES-CTR 在 MAC 通过后才解密。无注入/越界 sink。
+
+**7. checkOnCurve（第202–216行）**：对 profileB 的公钥点做曲线校验，(0,0) 点 infinity 按约定放行，ScalarMult 对其结果为 0，后续 MAC 无法通过，安全。
+
+**8. profileB（第218–300行）**：首字节决定 33/65 字节公钥长度，其他值拒绝；长度校验 `len(s) < PubKeyLen+8` 正确；压缩点经 uncompressKey + checkOnCurve 双重校验，非曲线点被拒，防止无效曲线/小子群滥用的主要面已被覆盖（P256 ScalarMult 常量时间实现）。uncompressed 分支的 x/y 直接取自输入但经 checkOnCurve 验证。KDF 使用共享密钥 x 坐标 .Bytes()——注意若共享点为无穷远（(0,0) 放行情形），Bytes() 为空，KDF 仍产出 64 字节，MAC 校验兜底。整体 source→sink（UE 提供 schemeOutput → hex 解码 → ECDH → MAC → AES 解密）防御链完整有效。
+
+**9. ToSupi（第316–377行）**：唯一顶层入口。suciPart[0] 白名单校验 imsi/nai/suci；suci 前缀要求至少 6 段；NullScheme 直接拼接返回（设计如此，null scheme 本身由运营商配置决定）；HNPublicKeyID 经 strconv.Atoi 严格解析（非数字拒绝），并有 `keyIndex > len(suciProfiles)` 的范围检查防止任意索引读取；scheme 与配置中 protectScheme 必须一致才进入 profileA/B，privateKey 仅来自服务器本地配置而非用户输入。supiType 取自 suciPart[1]，仅用于 calcSchemeResult 中与 SupiTypeIMSI 比较，不影响内存安全。mccMnc 与结果做字符串拼接后作为 SUPI 返回给上层 AMF/UDM 内部流程，无 SQL/shell/路径类 sink。（注：边界比较采用 `>` 而非 `>=` 属健壮性小瑕疵，极端畸形输入可能触发 recoverable panic，但在 free5gc 服务框架有 recover 且不涉及信息泄露或内存破坏，不构成可利用安全漏洞。）
+
+**10. 第二入口/替代通道核查**：本文件无 HTTP 路由、文件读写、环境变量、回调注册；所有数据均经由 ToSupi 单一入口传入，profileA/profileB 私钥均来自本地配置，不存在配置注入通道。日志仅打印结构化内容，无敏感私钥泄露（私钥从未进入日志）。
+
+综上：加密原语使用正确（HMAC-then-decrypt、X25519/P256 标准实现、KDF 符合 TS 33.501 Annex C），所有切片操作前均有长度校验，外部输入到敏感操作的每条数据流都有有效防御（严格解析+白名单+MAC 认证），无可利用漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认：ToSupi 是唯一入口，对 suci 前缀做白名单校验，段数不足即拒绝；HNPublicKeyID 经 strconv.Atoi 严格解析并有范围检查；scheme 必须与本地配置的 ProtectionScheme 一致才分发到 profileA/profileB；私钥仅来自服务器本地 yaml 配置，不受外部控制。profileA 中先做长度校验（len(s) >= 40）再切片，curve25519.X25519 错误时 MAC 校验兜底失败返回错误；profileB 中公钥首字节限定 0x02/0x03/0x04，压缩点经 uncompressKey 与 checkOnCurve 双重验证，非曲线点被拒绝，阻止无效曲线攻击；全部解密路径均为先 HMAC 校验后 AES-CTR 解密，认证顺序正确。KDF 切片长度基于固定常量且总量不超过 KDF 输出，无越界。文件内无 HTTP 路由、文件 IO、环境变量或回调等替代入口。仅存在 keyIndex 边界用大于号而非大于等于号的健壮性小瑕疵，最多引发可恢复 panic，不构成可利用安全漏洞。", "fix_suggestion": "no fix needed"}
+```

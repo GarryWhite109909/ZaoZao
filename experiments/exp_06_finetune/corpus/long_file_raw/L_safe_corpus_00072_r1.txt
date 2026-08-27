@@ -1,0 +1,75 @@
+# SFTPGo OAuth2 管理器安全分析
+
+## 一、文件定位与入口点枚举
+
+本文件是 SFTPGo 的 HTTPD 模块中 OAuth2 状态管理器的实现（内存版 + 数据库共享会话版）。本文件本身**不注册任何 HTTP 路由、不直接解析任何用户输入参数**，它是一个被上层 `oauth2.go` / 路由处理器调用的库层组件。因此需要逐一分析每个函数，确认其输入来源与输出去向。
+
+## 二、逐函数分析与数据流验证
+
+### 1. 第 27-29 行：包级变量 `oauth2Mgr`
+全局单例变量，仅持有管理器实例。无用户可控数据流经此处。
+
+### 2. 第 31-38 行：`newOAuth2Manager(isShared int)`
+- **入口点**：`isShared` 参数来自服务启动配置（dataprovider 配置），非用户请求可控。
+- 仅做分支选择返回 `dbOAuth2Manager{}` 或 `memoryOAuth2Manager`，无 sink。
+
+### 3. 第 40-48 行：`oauth2PendingAuth` 结构体
+字段含 `State`、`Provider`、`ClientID`、`ClientSecret *kms.Secret`、`RedirectURL`。注意：
+- `ClientSecret` 使用 kms.Secret 封装，后续有加密/解密处理；
+- 该结构体在 DB 版中会被 JSON 序列化存入共享会话（第 118 行），序列化对象来自服务端构造（见下），而非直接反序列化用户 JSON——反序列化路径在第 128-141 行，需单独评估。
+
+### 4. 第 50-60 行：`newOAuth2PendingAuth(...)`
+- 参数 `redirectURL, clientID, clientSecret` 由调用方（管理员配置的 OAuth2 provider 配置）传入，非请求路径直接注入。
+- **关键防御点**：第 52 行 `State: util.GenerateOpaqueString()` —— state 由密码学安全的随机生成器产生，非用户可控，这是防 CSRF 的核心，且不可预测。
+- `IssuedAt` 取服务器当前时间，不可伪造。
+
+### 5. 接口定义（第 62-67 行）
+纯接口声明，无逻辑。
+
+### 6. memoryOAuth2Manager 系列
+#### 第 70-76 行：`addPendingAuth`
+以随机 state 为 key 写入 map。state 服务端生成，map key 不可被攻击者碰撞（除非猜中 CSPRNG 输出）。
+
+#### 第 78-83 行：`removePendingAuth(state string)`
+按 state 删除。state 来自回调查询参数时，删除不存在的 key 无副作用；即使攻击者传入任意 state 字符串，也只能删除“自己发起或恰好知道 state”的条目——而 state 是高熵随机值且一次性使用，无法枚举他人会话。**无越权删除风险**。
+
+#### 第 85-98 行：`getPendingAuth(state string)`
+- source：state 参数（最终源自 OAuth2 回调 URL 查询参数，属第二入口）。
+- 防御链：① map 查找必须精确命中（第 89-91 行）；② 第 92-95 行时效校验 `diff > authStateValidity` 拒绝过期请求。
+- 返回值包含 ClientSecret（kms 加密形态，内存版未解密），交给上层换取 token。由于 state 不可预测且绑定发起者会话，**不存在水平越权读取**。
+
+#### 第 100-111 行：`cleanup()`
+遍历清理过期项，条件 `diff < 0 || diff > authStateValidity` 覆盖时钟回拨与超期两种情况。无漏洞。
+
+### 7. dbOAuth2Manager 系列
+#### 第 114-127 行：`addPendingAuth`
+- 第 115-119 行：先对 ClientSecret 调用 `Encrypt()`，失败则记录日志并 return（不落库明文）。
+- 第 120-126 行：写入共享会话，key 为随机 state，Timestamp 设为 `IssuedAt + authStateValidity` 作为过期时间。
+- 注意 `AddSharedSession` 错误被 nolint 忽略：若写库失败，上层回调将因查不到 state 而拒绝，属 fail-closed，不构成漏洞。
+
+#### 第 129-132 行：`removePendingAuth`
+同内存版分析，state 高熵不可枚举，无越权删除。
+
+#### 第 134-146 行：`getPendingAuth`
+- source：state（回调参数）→ `GetSharedSession(state)` 精确主键查找。
+- 第 139-142 行：时间戳过期校验，过期即拒。
+- 防御有效性：DB 主键精确匹配 + 过期校验 + state 为 CSPRNG 生成，攻击者无法通过构造 state 读取他人 pending auth。
+
+#### 第 148-161 行：`decodePendingAuthData(data any)`
+- 第 150-153 行：类型断言仅接受 `[]byte`；
+- 第 155-157 行：`json.Unmarshal` 到强类型结构体——**反序列化的数据是服务端自己在 addPendingAuth 时加密/序列化后写入的内容**，不是外部直接提交的 JSON，故不存在反序列化注入面。
+- 第 158 行：`ClientSecret.TryDecrypt()` 解密凭据供 token 交换使用，凭据仅在服务端内部流转，不回传给客户端。
+- 第 159-160 行：未知类型 fail-closed 返回错误。
+
+### 8. 第二入口与替代通道核查
+- 本文件无 HTTP handler、无环境变量读取、无文件 IO、无命令执行 sink（无 `exec`、无 `os.OpenFile` 写路径）。
+- 唯一外部影响面是 state 字符串（经回调 URL 进入），其所有消费点（get/remove）均受“精确匹配 + 高熵不可猜测 + 时效校验”三重约束。
+- ClientSecret 在 DB 版持久化前强制加密（第 116 行），符合凭据存储要求。
+- 内存版 cleanup 与 DB 版 cleanup 均有过期回收，无无限累积导致的 DoS（state 由合法管理员触发的 OAuth2 流程创建，且有时效）。
+
+### 9. 结论性核对
+逐函数检查完毕（覆盖第 27 至 161 行全部函数）：无 SQL 注入（经 dataprovider 参数化会话 API）、无 XSS（无 HTML 输出）、无 SSRF（RedirectURL 仅用于向 OAuth2 provider 发起授权跳转，且为管理员配置值）、无私有信息泄露（secret 加密存储、不回传客户端）、无 CSRF 绕过（state 随机且校验）。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "本文件为 OAuth2 状态管理库层代码，全文共约 10 个函数均已逐一审查。唯一外部输入是 OAuth2 回调中的 state 参数，其所有消费点（memoryOAuth2Manager.getPendingAuth 第 85-98 行、removePendingAuth 第 78-83 行、dbOAuth2Manager.getPendingAuth 第 134-146 行）均要求与 CSPRNG 生成的随机 state（第 52 行 util.GenerateOpaqueString）精确匹配并通过时效校验（第 92-95 行、第 139-142 行），攻击者无法枚举或伪造。ClientSecret 在 DB 版落库前强制 Encrypt（第 116 行），反序列化对象 decodePendingAuthData 处理的是服务端自写数据而非外部 JSON，无反序列化注入面。全文件无路由注册、无命令执行、无文件写、无 SQL 拼接等 sink，cleanup 函数均有完整过期回收。", "fix_suggestion": "no fix needed"}
+```

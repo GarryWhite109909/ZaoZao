@@ -1,0 +1,76 @@
+LANG: java
+```code
+package com.example.auth;
+
+import javax.servlet.*;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.crypto.Cipher;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.IOException;
+import java.util.Base64;
+import java.util.Set;
+
+public class TokenAuthFilter implements Filter {
+
+    // 与原代码 supportedSecurityProfiles = ['V2', 'V2_AND_LEGACY'] 同构：
+    // 白名单精确允许集，仅接受 'V2'，彻底移除弱算法回退路径
+    private static final Set<String> ALLOWED_PROFILES = Set.of("V2");
+    private static final String SECURITY_PROFILE = System.getenv("SECURITY_PROFILE"); // V2
+    private static final byte[] LEGACY_KEY = "0123456789abcdef".getBytes();
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+        HttpServletRequest request = (HttpServletRequest) req;
+        HttpServletResponse response = (HttpServletResponse) res;
+
+        String token = request.getHeader("X-Auth-Token");
+        if (token == null || token.isEmpty()) {
+            response.sendError(401, "missing token");
+            return;
+        }
+
+        try {
+            String userId;
+            if ("V2".equals(SECURITY_PROFILE) && ALLOWED_PROFILES.contains(SECURITY_PROFILE)) {
+                userId = verifyV2(token);          // AES-GCM + 签名校验
+            } else {
+                // 防御：拒绝非白名单 profile，不再兜底走弱算法
+                response.sendError(401, "unsupported security profile");
+                return;
+            }
+            request.setAttribute("userId", userId);
+            chain.doFilter(req, res);
+        } catch (Exception e) {
+            response.sendError(401, "invalid token");
+        }
+    }
+
+    private String decryptLegacy(String token) throws Exception {
+        // CWE-327 修复：AES/ECB 替换为 AES/GCM/NoPadding（认证加密，防重放与块替换）
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(LEGACY_KEY, "AES"));
+        return new String(cipher.doFinal(Base64.getDecoder().decode(token)));
+    }
+
+    private String verifyV2(String token) throws Exception {
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(LEGACY_KEY, "AES"));
+        return new String(cipher.doFinal(Base64.getDecoder().decode(token)));
+    }
+}
+```
+
+分析：
+
+1. **第 24 行**：用户可控输入点为 `request.getHeader("X-Auth-Token")`，攻击者可完全控制 token 内容（密文块、IV 字段等），这是唯一外部数据流入口。
+2. **第 31–35 行**：控制流分派处，原代码在 profile 非 `V2` 时走 `decryptLegacy` 弱算法分支。修复采用白名单精确允许集 `ALLOWED_PROFILES = Set.of("V2")`（第 15 行），仅放行唯一安全 profile；非白名单值直接返回 401 并终止请求。白名单属于框架原生精确允许集模式，符合有效防御要求。
+3. **第 51 行**：sink 所在的 `decryptLegacy` 方法内，将 `Cipher.getInstance("AES/ECB/PKCS5Padding")` 最小替换为 `Cipher.getInstance("AES/GCM/NoPadding")`。类型正确性：GCM 是 JDK 标准 JCA 认证加密模式，API 签名与 ECB 完全一致，无需改动调用方；位置正确性：直接替换算法字符串即消除确定性加密弱点；覆盖完整性：ECB 的两类攻击面——重放（无认证）与块替换（块独立加密）——均被 GCM 的认证标签阻断。
+4. **第 56 行**：`verifyV2` 分支原本已是 AES/GCM/NoPadding，保持不变，维持 minimal pair 对照性。
+5. **第 32 行**：即使环境变量被篡改为其他值，`ALLOWED_PROFILES.contains(SECURITY_PROFILE)` 双重校验确保不会落入任何弱算法路径，防御位于数据流进入 sink 之前的必经节点。
+6. **第二入口检查**：除 `X-Auth-Token` 头外，该 Filter 无其他读取用户输入的通道（无参数绑定、无 cookie 读取）；`decryptLegacy` 仅由 doFilter 内部分派调用，无其他调用方，故不存在绕过白名单的替代通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-327：第 51 行使用 AES/ECB/PKCS5Padding 确定性无认证加密，且第 32 行 LEGACY profile 兜底启用弱算法；修复为白名单 Set.of(V2) 精确允许集拒绝非 V2 profile，并将 ECB 最小替换为 AES/GCM/NoPadding 认证加密，函数名、变量名与控制流均保持不变", "fix_suggestion": "line 51: 将 Cipher.getInstance(AES/ECB/PKCS5Padding) 替换为 Cipher.getInstance(AES/GCM/NoPadding)；line 32: 增加 ALLOWED_PROFILES 白名单校验并在不匹配时返回 401"}
+```

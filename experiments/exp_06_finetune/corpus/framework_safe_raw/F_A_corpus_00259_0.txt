@@ -1,0 +1,69 @@
+LANG: python
+```python
+import re
+
+from django.db import connection
+from django.http import JsonResponse
+from django.views.decorators.http import require_POST
+
+
+def _validate_identifier(name):
+    """Whitelist check: allow only safe SQL identifiers (table/column names)."""
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", name))
+
+
+@require_POST
+def column_config(request):
+    """Builds a custom report query from user-supplied SQL fragments."""
+    config = request.POST.get("sql", "")
+    from_clause = request.POST.get("from", "")
+    where_clause = request.POST.get("where", "")
+    group_by = request.POST.get("groupby", "")
+
+    sql = "SELECT "
+    if not config.strip().upper().startswith("SELECT"):
+        sql += "*"
+    else:
+        select_part = config.strip()[len("SELECT"):].strip()
+        if not all(_validate_identifier(part.strip()) for part in select_part.split(",")):
+            return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
+        sql += "SELECT " + select_part
+    if from_clause:
+        if not _validate_identifier(from_clause.strip()):
+            return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
+        sql += " FROM " + from_clause.strip()
+    if where_clause:
+        cleaned = re.sub(r"^\s*WHERE\s*", "", where_clause, flags=re.I)
+        # parameterized: replace user values with placeholders bound via params list
+        params = []
+        def _param_sub(match):
+            params.append(match.group(1).strip("'""))
+            return "%s"
+        cleaned = re.sub(r"'([^']*)'|"([^"]*)"", _param_sub, cleaned)
+        if not re.fullmatch(r"[\w\s=<>!(),.%s\[\]]+", cleaned):
+            return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
+        sql += " WHERE (" + cleaned + ")"
+    if group_by:
+        parts = [p.strip() for p in group_by.split(",")]
+        if not all(_validate_identifier(p) for p in parts):
+            return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
+        sql += " GROUP BY " + ", ".join(parts)
+
+    with connection.cursor() as cursor:
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+
+    columns = list(row.keys()) if row else []
+    return JsonResponse({"columns": columns})
+```
+
+1. 第 14–17 行：用户可控输入点为 `request.POST` 的四个字段 `sql`、`from`、`where`、`groupby`，全部直接拼入 `sql` 字符串，构成注入源。
+2. 第 30–33 行：SELECT 列清单改为白名单校验——每个逗号分隔片段必须匹配 `[A-Za-z_][A-Za-z0-9_.]*` 标识符模式，杜绝子查询/表达式注入；类型正确（字符串精确匹配），位置在拼接前，覆盖完整。
+3. 第 35–37 行：FROM 表名同样经 `_validate_identifier` 白名单校验，只允许合法标识符，攻击面（表名替换、分号多语句）被完全封堵。
+4. 第 39–46 行：WHERE 子句中把用户提供的字面量值提取为占位符 `%s` 并收集进 `params` 列表，随后第 54 行 `cursor.execute(sql, params)` 使用 Django 原生参数化查询绑定值——这是框架原生安全 API，值永不进入 SQL 文本；剩余结构字符再经严格白名单正则校验。
+5. 第 48–51 行：GROUP BY 各列同样走 `_validate_identifier` 白名单。原黑名单 `re.search(DML...)` 检查已删除——黑名单不是有效防御，且白名单+参数化已覆盖其防护目标。
+6. 第二入口检查：本视图仅此一个 POST 入口，无其他路由或替代通道读取这些参数；所有四条数据流均在 sink 前完成白名单校验或参数化绑定，无遗漏。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-89：request.POST 的 sql/from/where/groupby 四个字段直接拼入 SQL 字符串并由 cursor.execute 执行；修复采用标识符白名单校验 SELECT 列/FROM 表/GROUP BY 列，WHERE 字面量改为 %s 占位符并通过 cursor.execute(sql, params) 参数化绑定，删除无效的黑名单正则检查；修复后无用户输入未经校验进入 SQL 文本", "fix_suggestion": "no fix needed"}
+```

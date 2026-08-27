@@ -1,0 +1,31 @@
+# 编号分析
+
+1. **第 33–41 行 `newOAuth2Manager`**：仅根据 isShared 选择内存或 DB 实现，无用户输入参与，无风险。
+
+2. **第 43–51 行 `oauth2PendingAuth` 结构体**：包含 State、Provider、ClientID、ClientSecret（kms.Secret）、RedirectURL、IssuedAt。State 由第 55 行 `util.GenerateOpaqueString()` 生成，为加密随机不透明串，非用户可控。
+
+3. **第 53–62 行 `newOAuth2PendingAuth`**：参数来自管理员配置 OAuth2 客户端时提供（本文件内未暴露 HTTP 入口），State 随机生成。
+
+4. **memoryOAuth2Manager（第 76–118 行）**：
+   - add/remove/get 均有 RWMutex 保护，无并发竞态。
+   - getPendingAuth 第 100–104 行校验 state 存在性，第 105–108 行校验时效（authStateValidity），过期拒绝。
+   - cleanup 定期清理过期项，防止 map 无限增长（DoS 缓解）。
+
+5. **dbOAuth2Manager（第 120–166 行）**：
+   - addPendingAuth 第 122–126 行先 Encrypt 再存入共享 session；Encrypt 失败则不存储（fail-closed）。
+   - getPendingAuth 第 139–150 行：按 state 取 session，先校验 Timestamp 过期再返回；state 是服务端生成的随机值，攻击者无法枚举有效 state。
+   - decodePendingAuthData 第 152–165 行：类型断言 + json.Unmarshal + TryDecrypt，错误均被处理并返回。
+
+6. **入口点核查**：本文件没有定义任何 HTTP handler、路由注册、请求参数解析或环境变量读取。所有数据流（state 查询、pending auth 存取）的 source 均为服务端生成的随机 opaque string 或管理员配置，sink 为内存 map / dataprovider session 存储，均为受信内部通道。
+
+7. **第二入口/替代通道**：dataprovider 共享 session 的 key 即 state，由 `GenerateOpaqueString` 生成，不可预测；session 有 TTL 且 cleanup 清理。ClientSecret 经 kms 加密存储，get 时 TryDecrypt，无明文泄漏路径。
+
+8. **潜在关注点**：
+   - `AddSharedSession` 等错误被 nolint 忽略——失败会导致 OAuth 流程无法完成，属可用性问题而非安全漏洞（fail-closed 方向）。
+   - memory manager 中 ClientSecret 未加密存于内存——进程内存中的密钥属于常规威胁模型之外，非漏洞。
+
+结论：state 校验、时效校验、加密存储、并发锁、清理机制齐备，未发现可利用的安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "该文件为 SFTPGo 的 OAuth2 pending auth 管理模块，不含任何 HTTP 路由或外部输入解析入口。state 由 util.GenerateOpaqueString 服务端随机生成，查询时严格校验存在性与时效（memory 版第 105-108 行，db 版第 143-147 行）；client_secret 通过 kms 加密后存储并在读取时 TryDecrypt；map 操作有读写锁保护并有 cleanup 过期清理。所有 source 到 sink 的数据流均在受信内部通道内完成，未发现可绕过的过滤或可利用的数据流。", "fix_suggestion": "no fix needed"}
+```

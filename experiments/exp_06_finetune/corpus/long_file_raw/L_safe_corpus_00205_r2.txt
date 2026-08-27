@@ -1,0 +1,68 @@
+# Easy!Appointments Booking_settings 控制器安全分析
+
+## 一、文件结构总览
+
+本文件为 CodeIgniter 4 框架下的控制器 `Booking_settings`，全文仅包含两个公开入口方法：`index()`（第 44-72 行）与 `save()`（第 77-117 行），外加构造函数（第 32-42 行）。以下逐一分析。
+
+## 二、构造函数（第 32-42 行）
+
+第 34-40 行加载 models 与 libraries（appointments_model、customers_model、services_model、providers_model、roles_model、settings_model、accounts、google_sync、notifications、synchronization、timezones）。此处无用户输入处理、无输出操作，不构成 source 或 sink。唯一注意点：加载了较多模型但本文件未全部使用，属代码冗余而非漏洞。
+
+## 三、`index()` 方法（第 44-72 行）——渲染设置页面
+
+**入口点**：HTTP GET 请求路由至 `booking_settings/index`。
+
+**权限校验链**：
+- 第 46 行 `method('get')` 强制 GET；
+- 第 48 行记录 dest_url 到 session；
+- 第 50 行取 `session('user_id')`——这是服务端会话数据，非直接用户输入，不可被请求伪造；
+- 第 52-58 行：若 `cannot('view', PRIV_SYSTEM_SETTINGS)` 且已登录则 `abort(403)`；未登录则重定向到 login。该 ACL 校验在返回任何数据之前执行，无法绕过（cannot 基于服务端 role_slug）。
+
+**数据流验证**：
+- 第 61-63 行 `script_vars([...])` 将 `booking_settings` 输出到前端 JS 变量。source 是数据库 settings 表，sink 是 HTML 内嵌脚本。防御：`filter_sensitive_settings()` 过滤敏感键（如密码类配置）。即使过滤遗漏某键，script_vars 在 EA_Controller 中通常经 JSON 编码转义，且能访问此页者本身已具备 view 权限，信息暴露面与权限一致。无越权。
+- 第 65-69 行 html_vars 仅含 lang() 翻译文本与服务端生成的 user_display_name，user_display_name 来自数据库中管理员录入的用户名——存在理论上的存储型 XSS 可能性，但这属于 accounts/users 模块的数据卫生问题，非本文件引入的缺陷，且查看者同为高权限角色。
+
+**结论**：index 无可利用漏洞。
+
+## 四、`save()` 方法（第 77-117 行）——保存设置
+
+**入口点**：HTTP POST，body 中 `booking_settings` 数组。
+
+**权限校验**：
+- 第 80 行强制 POST；
+- 第 82-84 行 `cannot('edit', PRIV_SYSTEM_SETTINGS)` 则抛异常——写操作要求系统设置编辑权（通常仅 admin），ACL 完整。
+- 第 86 行 `check('booking_settings', 'array|null')` 类型校验。
+
+**核心循环（第 89-112 行）逐条数据流**：
+
+1. **source**：第 90 行 `$setting['name']` / `$setting['value']` 来自 POST body，攻击者完全可控。
+
+2. **SQL 注入路径**：第 92 行 `$this->settings_model->query()->where('name', $setting['name'])`。CodeIgniter Query Builder 的 where() 使用参数绑定/自动转义，非字符串拼接，故注入不成立。sink 为查询，防御有效。
+
+3. **XSS 存储路径**：
+   - 第 95-99 行：仅当 name 以 `label_custom_field_` 开头时对 value 执行 `strip_tags()`——strip_tags 可被属性型 payload（如 `<img onerror=...>` 被剥标签后残留？实际 strip_tags 会移除整个标签包括属性，但可绕过手法如畸形标签存在争议）；黑名单式按前缀过滤被视为可绕过。
+   - 第 101-106 行：仅 `disable_booking_message` 一个 rich_text 设置走 `pure_html()`（HTML 净化器）。
+   - **关键问题**：其余任意 name 的 value 未做任何净化即入库。攻击者（需 edit 权限的管理员）可将恶意 HTML 写入如 `company_name`、`link` 等设置项，这些值随后会在公共预约页渲染 → 存储型 XSS 影响未认证访客。
+   - **缓解因素**：(a) 写入需 PRIV_SYSTEM_SETTINGS 编辑权，普通用户无法触达；(b) 该 XSS 的实际触发取决于消费端模板是否转义——本文件内无直接 echo sink；(c) 这是 Easy!Appointments 已知的设计模式（管理员可信边界）。因此在本文件范围内，这是一条“受信任管理员→公共页面”的低危存储型 XSS 链，依赖下游渲染行为，不能确证为本文件的可利用漏洞。
+
+4. **字段白名单**：第 108 行 `only($setting, ['id','name','value'])` 白名单裁剪字段，防止 mass assignment 注入额外列（如 role、password 等）。防御有效。
+
+5. **ID 覆盖风险**：第 91-94 行若同名设置已存在则强制使用库中 id，防止通过伪造 id 覆盖任意行；但若攻击者提交新 name + 任意 id 且库中不存在该 name，save 时 id 直接用于 update 定位？settings_model->save 通常按 id 判断 insert/update——提交不存在于库中的 id 会导致 update 影响 0 行或插入时忽略 id，影响有限。且仍需 edit 权限。
+
+6. **异常处理**：第 114-116 行 json_exception($e) 返回 JSON 错误。若异常消息含原始输入可能造成反射内容泄露，但 json_exception 通常固定格式化，且响应为 application/json（Content-Type 非 text/html），浏览器不会执行。无 XSS sink。
+
+## 五、第二入口与替代通道检查
+
+- 全文无 CLI 入口、无文件上传、无反序列化、无 include/require 动态路径、无 eval、无回调调用（call_user_func 等）、无命令执行（exec/shell_exec/system）。
+- 无直接 $_GET/$_POST/$_REQUEST 访问，统一走 request()/session() 封装。
+- 无 SSRF 面（无 URL fetch）。
+- CSRF：框架层面由 CI4 的 CSRF filter 处理（EA_Controller 继承链启用），POST 有 token 保护；即便缺失，也需先持有 admin 会话。
+- 替代通道：settings 表的其他写入方（安装向导、其他控制器）不在本文件范围。
+
+## 六、总体结论
+
+所有 source→sink 流均落在：① 参数绑定的 SQL 查询（防注入有效）；② 经 only() 字段白名单后的 ORM save（防 mass assignment 有效）；③ 前端 script_vars/html_vars 输出（有 filter_sensitive_settings 与框架转义）。前置 ACL（view/edit PRIV_SYSTEM_SETTINGS）覆盖两个入口且不可绕过。唯一值得记录的是“部分设置值未净化入库”的潜在存储型 XSS 链，但其写入前提是系统管理员权限，且 sink 在文件外，依据“结论必须基于全文证据”的要求，不判定为本文件的确证漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文仅 index 与 save 两个入口，均有 cannot(view/edit, PRIV_SYSTEM_SETTINGS) 前置 ACL 保护且不可绕过。save 中用户可控的 booking_settings 数组经过 check 类型校验、where 参数绑定查询（防 SQL 注入）、only 字段白名单（防 mass assignment）、同名设置 id 强制回填（防任意行覆盖）后写入数据库；输出侧 script_vars 经 filter_sensitive_settings 过滤敏感配置，html_vars 仅含服务端生成数据，json_exception 以 JSON Content-Type 返回无 XSS sink。全文不存在文件包含、命令执行、反序列化、SSRF、动态回调等替代通道。唯一理论隐患是除 label_custom_field_ 前缀与 rich_text 名单外的设置值未经净化入库，可能形成受信管理员到公共页面的存储型 XSS，但写入需系统级编辑权限且实际 sink 位于本文件之外的渲染层，基于全文证据不足以确证为本文件漏洞。", "fix_suggestion": "no fix needed"}
+```

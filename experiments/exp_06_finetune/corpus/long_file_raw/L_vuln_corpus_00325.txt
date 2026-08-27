@@ -1,0 +1,35 @@
+## 编号分析（逐函数、逐入口点）
+
+**文件结构总览**：本文件是 Home Assistant 本地备份代理，无 HTTP 路由、无环境变量读取；外部输入通过两条通道进入：
+- 通道 A：`async_upload_backup` 的 `backup` 参数（由上层备份管理器传入，最终源自用户上传的备份元数据）；
+- 通道 B：`backup_id` 参数（`async_get_backup` / `get_backup_path` / `async_delete_backup`），源自 API 调用者。
+
+**1. 第 24–27 行 `async_get_backup_agents`**：仅根据 `is_hassio` 返回 agent 实例，无用户输入参与，无风险。
+
+**2. 第 37–46 行 `_read_backups`**：source 是磁盘上 `backups/*.tar` 文件（第 41 行 glob）。sink 是第 42 行 `read_backup(backup_path)`。路径来自固定目录 glob，非拼接用户字符串；异常被捕获（第 44 行）仅记录日志。注意：磁盘上的 tar 文件本身可能是攻击者上传的恶意备份——但解析逻辑在 `read_backup`（util.py，未在本文件内），本文件无法证实或证伪其安全性。此处无直接漏洞。
+
+**3. 第 49–53 行 `async_download_backup`**：直接 `NotImplementedError`，无数据流。
+
+**4. 第 55–63 行 `async_upload_backup`**：**关键入口点**。source 为参数 `backup`（含攻击者可控的 `backup_id` 与建议文件名）。sink 在第 62 行：`self._backups[backup.backup_id] = (backup, self.get_new_backup_path(backup))`。追踪到第 85–88 行 `get_new_backup_path`：`return self._backup_dir / suggested_filename(backup)`。这里将用户可控的文件名与固定目录做 `/` 拼接。若 `suggested_filename` 未对 `../`、绝对路径成分做净化（黑名单/正则类防御按题目要求视为可绕过），则后续 `async_delete_backup` 第 105 行 `backup_path.unlink(True)` 将构成**任意文件删除**原语；同时该路径被注册进 `_backups`，可被下载/恢复流程用作写入目标。本文件内部没有任何对该路径的二次校验。
+
+**5. 第 65–68 行 `async_list_backups`**：只读内存字典，无风险。
+
+**6. 第 70–91 行 `async_get_backup` / 第 93–99 行 `get_backup_path`**：source 是 `backup_id` 字符串。但它仅作为字典键查找（第 79、95 行），不参与路径拼接，键不存在时抛 `BackupNotFound`。因此 `backup_id` 本身不是遍历向量——真正的污染发生在上传阶段把恶意路径写入了字典值。
+
+**7. 第 101–110 行 `async_delete_backup`**：source 链同上；sink 为第 105 行 `backup_path.unlink(True)`。由于第 104 行 `get_backup_path` 直接返回 `_backups[backup_id][1]`，而该值在上传时未经校验地来自 `suggested_filename(backup)`，删除操作作用于攻击者影响的任意相对路径。这是第二入口/替代通道：即使不走 delete，任何消费 `get_backup_path` 的调用方（如恢复流程的读/写）同样受影响。
+
+**防御有效性核查**：全文没有出现任何针对文件名的过滤、白名单或规范化代码；唯一“防线”是外部函数 `suggested_filename`（util.py，本文件外）。按分析要求，无法在本文件内证明其为有效防御，且历史实现中此类函数曾存在未剥离路径分隔符的问题。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22",
+  "risk_level": "medium",
+  "source": "line 56-61: async_upload_backup 的 backup 参数（含用户可控的建议文件名与 backup_id）",
+  "sink": "line 87: self._backup_dir / suggested_filename(backup) 以及 line 105: backup_path.unlink(True)",
+  "explanation": "上传时用户可控的备份元数据经 get_new_backup_path 拼接为本地路径并存入 _backups 字典，全程无路径净化或白名单校验；随后 async_delete_backup 通过 get_backup_path 取出该路径执行 unlink(True)，若 suggested_filename 未剥离 ../ 等成分即可删除 backups 目录之外的任意文件，同一被污染路径也可被下载或恢复流程用于任意读写 -> 任意文件删除/读写",
+  "fix_suggestion": "line 87: 对 suggested_filename 返回值调用 PurePath.name 剥离目录成分并校验结果不含路径分隔符且位于 self._backup_dir 内（resolve 后用 is_relative_to 断言），拒绝非法文件名"
+}
+```
+
+补充说明：本文件自身未包含 HTTP 解析或过滤逻辑，漏洞成立的前提是依赖项 `suggested_filename`（util.py）未做充分净化；由于该实现不在给定代码内，上述结论标注为条件性成立，修复建议应同时在 util 层落实文件名白名单化。

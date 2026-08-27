@@ -1,0 +1,25 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `ai_vision_analyze`（第 ~150 行起）：params 来源 —— `image_path`、`image_url`、`prompt`、`provider`、`model`、`api_key`、`max_tokens`、`detail`。
+2. 环境变量：第 ~172 行 `os.getenv(env_vars.get(provider, ''))` 读取 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`。
+3. 文件系统：第 ~186–193 行 `open(image_path, 'rb')` 读取任意路径文件并 base64。
+4. 出站 HTTP：OpenAI 分支固定 POST 到 `https://api.openai.com/v1/chat/completions`；Anthropic 分支先 `session.get(image_url)` 下载图片，再 POST 到 Anthropic 固定端点。
+
+**逐条 source→sink 数据流**
+
+- **流 1：`image_url` → `enforce_outbound_url` → `session.get(image_url)`（第 ~296–303 行）**。代码注释明确这是针对 GHSA-pgwh-4jj4-qm8v 的 SSRF 防护。但存在两个问题：(a) 该防护是“检查后使用”模式——校验的是初始 URL 字符串，而 `aiohttp` 的 `session.get` 默认会自动跟随重定向，若外部服务器返回 30x 跳转到内网地址（如 `http://169.254.169.254/`），后续请求不再经过 `enforce_outbound_url` 复检，构成经典的重定向绕过 SSRF；(b) 即使不依赖重定向，黑名单/正则类校验按分析要求视为可绕过。下载内容随后被编码进发给 Anthropic 的 payload，响应可经 `analysis` 回传给调用者，形成可观测的读通道。
+
+- **流 2：`image_path` → `open()`（第 ~186–193 行）→ base64 → 外部 LLM API**。无任何路径白名单或目录限制，可读取任意本地文件（如 `/etc/shadow`、凭据文件）并发送到第三方 API。缓解因素：模块声明了 `required_permissions=['filesystem.read', ...]` 与 `handles_sensitive_data=True`，说明该行为在权限模型内是有意设计；但在多租户/低信任工作流编排场景中，若攻击者能注入 params，仍构成敏感数据外泄通道。风险取决于宿主框架的参数来源可信度。
+
+- **流 3：`api_key` / 环境变量 → HTTP header**。密钥仅发往官方固定端点，无泄漏面；错误信息（第 ~265、~345 行）只回传 API 返回的 message，不含密钥。无问题。
+
+- **流 4：`prompt`/`model`/`detail` → JSON payload**。经 `aiohttp` json 序列化，无注入面；`max_tokens` 有 schema min/max 约束。无问题。
+
+- **第二入口核查**：OpenAI 分支将用户 `image_url` 直接传给 OpenAI 服务端抓取（第 ~247 行），由 OpenAI 而非本机发起请求，故不构成本地 SSRF；真正的本地出站仅 Anthropic 分支一处，即流 1。
+
+**结论**：主要漏洞为流 1 的 SSRF 重定向绕过——`enforce_outbound_url` 只校验初始 URL，未禁用或复检重定向目标，攻击者可用受控 URL 302 跳转探测内网并将结果带回。流 2 属设计内能力但有滥用风险，列为次要提示。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "SSRF via redirect following (check-then-use bypass of enforce_outbound_url)", "risk_level": "medium", "source": "user-controlled params.image_url", "sink": "session.get(image_url) at the anthropic branch, which auto-follows redirects to unvalidated internal targets", "explanation": "The SSRF guard validates only the initial URL string before the request; aiohttp follows 30x redirects by default and re-validation never runs on redirect targets, so an attacker-supplied URL can bounce to cloud metadata or intranet services and the downloaded content is returned through the analysis output. Secondary note: image_path allows reading any local file and sending it to a third-party API, which is declared via required_permissions but risky in low-trust workflows.", "fix_suggestion": "Create the aiohttp session with a custom redirect strategy that disables automatic redirects (e.g. allow_redirects=False) and manually re-run enforce_outbound_url on each Location target before following; additionally restrict image_path to an allowed workspace directory."}
+```

@@ -1,0 +1,55 @@
+# MCPHandler 安全分析（全文逐函数）
+
+## 一、入口点枚举（全文覆盖）
+
+本文件无 HTTP 路由，入口点为 CLI 层面的调用链：
+
+1. **`execute()`（第 152–166 行）**：CLI `--mcp` 与 `--mcp-env` 标志的最终分发入口。`command` 来自用户命令行参数，`env_vars` 同理。
+2. **`apply_to_agent_config()`（第 106–150 行）**：第二入口。`flag_value` 可为字符串或字典（含 `command`、`env`、`timeout` 键），同样源自 CLI 参数解析。
+3. **环境变量通道**：`--mcp-env "KEY=value"` 经 `parse_mcp_command()` 第 84–89 行注入子进程 env——这是替代注入通道，需单独验证。
+4. **文件/回调**：本文件不读文件、不注册回调；`check_dependencies()` 仅做 import 探测。
+
+## 二、source→sink 数据流逐条验证
+
+### 流 1：CLI command → shlex.split → 白名单校验 → 子进程执行
+
+- source：第 153 行 `command: str = None` 参数（CLI 用户输入）。
+- 中间处理：第 68 行 `shlex.split(command)` —— 正确的 shell 级拆分，防止引号逃逸拼接。
+- sink：第 137–142 行 `MCP(command=cmd, args=args, ...)`，最终由 praisonaiagents SDK 以 stdio 方式 spawn 子进程。
+- 防御验证：第 75–81 行取 `os.path.basename(cmd)` 后比对 `ALLOWED_MCP_COMMANDS`（第 17–31 行）。关键点：
+  - basename 校验阻断了路径遍历写法（如 `/bin/sh`、`../../evil.py`），因为 basename 必须命中白名单；
+  - 白名单内均为 npx/node/python/docker 等**本身即代码执行器**的工具。但注释（第 14–15 行）明确声明这是有意设计：SDK 的 MCP() 类“intentionally unrestricted — developers control their own inputs”，CLI 层白名单是产品边界而非安全边界；
+  - 绕过评估：即使绕过白名单（例如通过 `npx -y <恶意包>` 拉取任意 npm 包，或 `python -c '...'`），其前提是攻击者已能控制 CLI 命令行参数——本地 CLI 用户运行任意命令本就是其自身权限内的操作，不构成权限提升。此威胁模型下不算漏洞。
+
+### 流 2：env_vars → env dict → 子进程环境
+
+- source：第 154 行 `env_vars` / 第 121 行 `flag_value.get('env', '')`。
+- 处理：第 84–89 行按逗号切分、`split('=', 1)` 构造 dict，仅 `.strip()` 清洗。
+- sink：第 139 行 `MCP(..., env=env ...)`。
+- 验证：无过滤键名，理论上可注入 `LD_PRELOAD`、`PATH` 等敏感变量以影响子进程加载行为。但同样受限于威胁模型：输入者即本机 CLI 用户，可设置任意进程环境，无越权边界被突破。且 env 只传给白名单内的可信启动器。判定：非有效漏洞。
+
+### 流 3：apply_to_agent_config 字典分支
+
+- 第 117–124 行：dict 输入直接透传给 `create_mcp_tools`，最终仍走流 1 的同一白名单校验（第 75 行），防御一致有效。无旁路。
+
+### 流 4：错误信息回显
+
+- 第 79–82 行 ValueError 含原始 `cmd`，第 91 行 print_status 回显；第 145 行异常信息回显。CLI 场景输出到终端，无 HTML/XSS sink，无日志注入型持久化 sink。无害。
+
+### 流 5：check_dependencies（第 44–57 行）
+
+- 仅 `importlib.util.find_spec` 与 import，无外部输入参与，无 sink。
+
+## 三、第二入口与替代通道核查
+
+- `execute()` 与 `apply_to_agent_config()` 是两条独立入口，但均收敛到 `create_mcp_tools()` → `parse_mcp_command()`，校验逻辑单点化（第 75 行），不存在跳过白名单的第三条路径。
+- 全文搜索确认没有 `eval/exec/os.system/subprocess.Popen(shell=True)` 直接调用；唯一执行 sink 在 SDK 内部，且受白名单前置约束。
+- timeout 参数（第 122 行）来自 dict，类型未强校验，但仅作连接超时数值使用，非危险 sink。
+
+## 四、结论依据
+
+所有 source→sink 流均经过单点白名单校验；白名单“过宽”（允许 python/npx 等通用执行器）在 CLI 本地工具语境下与项目声明的威胁模型一致（开发者自控输入），不构成跨信任边界的注入。无黑名单式可绕过过滤，无 shell=True 拼接，无未校验的反序列化。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文两条入口 execute 与 apply_to_agent_config 均收敛至 parse_mcp_command 第75行的 basename 白名单校验, shlex.split 正确拆分, 无 shell=True 拼接或 eval 类 sink; 白名单允许 python/npx 等通用执行器属有意设计(第14-15行注释), 威胁模型为本地开发者自控输入, 不构成跨信任边界漏洞; env_vars 注入通道同理受限; 错误回显仅输出终端无 XSS sink.", "fix_suggestion": "no fix needed"}
+```

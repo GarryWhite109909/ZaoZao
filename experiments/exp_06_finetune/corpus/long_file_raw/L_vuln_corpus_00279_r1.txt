@@ -1,0 +1,54 @@
+# 全文逐函数安全分析
+
+## 1. 文件级入口点枚举（通读全文后归纳）
+
+本文件是 Ghost 的 mobiledoc 渲染库封装，全文共暴露以下对外入口：
+
+- **第 41 行 `render(mobiledoc, options)`**：接收任意 mobiledoc JSON（来源为文章内容，即编辑器/导入通道的持久化数据），交给 `mobiledocHtmlRenderer.render`。
+- **第 47–96 行 `get htmlToMobiledocConverter`**：仅做 require 与错误包装，无用户数据流。
+- **第 100–146 行 `populateImageSizes(mobiledocJson)`**：接收序列化的 mobiledoc 字符串，解析后对 image 卡片的 `payload.src` 发起网络/存储请求——这是本文件唯一含 source→sink 数据流的函数。
+- **第 149–153 行 `reload()`**：测试用缓存重置，无风险。
+- **第 6–39 行 `blankDocument` / `cards` / `atoms` getter**：静态配置与卡片工厂初始化，无外部输入。
+
+## 2. 逐函数数据流验证
+
+### 2.1 `render`（第 41–43 行）
+source：调用方传入的 `mobiledoc`（最终源自管理员/贡献者编辑器或 Koenig 导入）。sink：kg-mobiledoc-html-renderer。未知卡片走第 33–37 行的 `unknownCardHandler`，仅记录日志、不执行卡片代码；默认卡片由 CardFactory 白名单化渲染。HTML 渲染层本身依赖下游 sanitizer（Ghost 在输出端另有过滤），本文件内未发现直接 sink。此路径在本文件范围内不构成可确认漏洞。
+
+### 2.2 `populateImageSizes`（第 100–146 行）——重点
+
+**Source 链**：
+- 第 112 行 `JSON.parse(mobiledocJson)`：mobiledocJson 是已持久化的文章内容，任何有编辑权限的角色（含 Contributor）均可写入任意结构。
+- 第 117 行解构出 `cardName === 'image'` 的 `payload.src`（第 118 行条件），这是攻击者完全可控的字符串。
+
+**分支一：Unsplash 判定（第 121 行）**
+```js
+const isUnsplash = payload.src.match(/images\.unsplash\.com/);
+```
+该正则没有锚定 host，`https://evil.com/?x=images.unsplash.com` 即可命中。命中后进入第 124 行 `getUnsplashSize(payload.src)`（第 103–110 行）：先 `new URL(url)`，删除 w/fit/crop/dpr 参数，再于第 109 行调用 `imageSize.getImageSizeFromUrl(parsedUrl.href)` —— 服务端对任意 URL 发起 HTTP GET。这是典型的 **SSRF（CWE-918）**：攻击者可用该参数形式让服务器请求内网地址（如 `http://169.254.169.254/latest/meta-data?images.unsplash.com`）。防御有效性判定：正则匹配子串不校验真实主机名，按规则视为无效防御。
+
+**分支二：相对路径判定（第 122 行）**
+```js
+/^\/content\/images\//.test(payload.src)
+```
+锚定开头但只看前缀，随后第 125 行进入 `getOriginalImageSizeFromStorageUrl(payload.src)`。若 storage utils 对 `../` 未做规范化（本文件不可见其实现，无法确证），可能存在本地文件读取；但基于“结论必须基于全文证据”的要求，此处只能标记为待下游确认的疑点，不能作为定论。
+
+**分支三：兜底（第 126–127 行）**
+非 unsplash、非相对路径时直接 `getImageSizeFromUrl(payload.src)` —— 无任何域名白名单，任意 URL 均触发服务端出网请求。这实际上是比分支一更宽的 SSRF 面：即使绕不过 unsplash 正则也无所谓，因为默认分支本来就允许任意 URL。
+
+**第二入口/替代通道**：同一 `payload.src` 还会经 image 卡片渲染进入 `<img src>`（前端 XSS 由下游转义负责）；此外 `storageUtils.isLocalImage`（第 123 行）作为第三判定通道同样只是启发式判断。所有通道最终汇入同一组 imageSize 网络请求 sink。
+
+**缓解因素**：需要具备文章编辑权限的身份；响应体被丢弃（只取尺寸），泄露面主要是内网探测/盲 SSRF 与对内部服务的 GET 触发。因此风险评级为中危而非高危。
+
+### 2.3 其余函数
+- 第 14–17 行 `canTransformImage`：输入来自 storage 内部路径，非用户直控。
+- 第 50–53 行 `process.env.CI` 分支：环境变量仅控制计时日志，无注入面。
+- 第 78–88 行 catch 分支：返回抛错闭包，`err` 仅用于错误上下文，无泄漏到响应的结构性风险。
+
+## 3. 结论
+
+全文证据支持的确定漏洞是 `populateImageSizes` 中由攻击者可控的 `payload.src` 直达服务端 HTTP 请求的 SSRF（CWE-918），三处判定（unsplash 子串匹配、前缀匹配、isLocalImage 启发式）均不构成有效主机校验。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918", "risk_level": "medium", "source": "line 118: populateImageSizes 中 image 卡片 payload.src 来自可被低权限编辑角色写入的文章 mobiledoc 内容", "sink": "line 127: imageSize.getImageSizeFromUrl(payload.src) 以及 line 109 getUnsplashSize 内 parsedUrl.href, 服务端对任意 URL 发起 HTTP 请求", "explanation": "攻击者在文章中插入 image 卡片并将 src 设为内网地址 -> line 121 的 images.unsplash.com 正则未锚定主机名且 line 126 存在无白名单的兜底分支 -> 任意 src 都会直达 getImageSizeFromUrl 造成盲 SSRF, 可探测内网并触发内部 GET; line 122 前缀匹配与 isLocalImage 同样仅为启发式, 不构成有效防御", "fix_suggestion": "在 line 118 之后对 payload.src 做严格主机校验: 用 new URL 解析后比对 hostname 是否属于配置的允许域名列表(如 images.unsplash.com 与站点自身域), 拒绝私有网段 IP 与重定向跟随, 并对相对路径做 path.normalize 后强制限定在 content/images 目录内"}
+```

@@ -1,0 +1,30 @@
+## 编号分析（全文逐点）
+
+**入口点枚举**
+1. `POST /`（upload_file，第 55 行起）：上传文件，filename 经 `os.path.basename` 处理（第 68 行），存储名加 uuid 前缀，路径穿越风险低。
+2. `GET /`、`GET /search`、`DELETE /all`：列表/搜索/全删，有角色区分，无注入 sink。
+3. `GET /{id}`、`GET /{id}/data/content`、`POST /{id}/data/content/update`、`DELETE /{id}`：均有 `user_id == user.id or admin or has_access_to_file` 三重校验，访问控制基本完整。
+4. `GET /{id}/content`（get_file_content_by_id，第 226 行起）。
+5. `GET /{id}/content/html`（get_html_file_content_by_id，第 297 行起）。
+6. `GET /{id}/content/{file_name}`（第 332 行起）。
+
+**source→sink 数据流验证**
+
+- **流 A（关键）：上传 content_type → FileResponse media_type**
+  - source：`file.content_type` 完全由客户端控制，原样写入 `meta["content_type"]`（第 84 行），无白名单限制（process 分支的图片/视频列表只是决定是否解析，不限制存储类型）。
+  - sink：`GET /{id}/content` 中 `FileResponse(file_path, headers=headers, media_type=content_type)`（第 268 行）。当 content_type 为 `text/html` 时，不落入 pdf/text/plain 分支，headers 为空 dict，浏览器将以内联方式渲染 HTML → **存储型 XSS**。攻击者上传恶意 HTML，通过知识库共享（has_access_to_file 授予 read 权限）诱导受害者打开链接即可在应用域执行脚本窃取 token。黑名单式排除（仅对 pdf 特判 inline）不足以防御。
+
+- **流 B：`/{id}/content/html` 端点**
+  - 第 349 行 `return FileResponse(file_path)` 无任何 Content-Disposition 或内容类型约束，任何文件（含 HTML/SVG）均可能被浏览器内联渲染，同样是存储型 XSS 通道（第二入口/替代通道，与流 A 等效）。
+
+- **流 C：文件名 → Content-Disposition**
+  - filename 经 `quote()` RFC5987 编码（第 241、340 行），header 注入被有效防御。
+
+- **流 D：路径处理**
+  - 存储路径来自 Storage 层 + uuid 前缀，用户不可控；`Storage.get_file(file.path)` 的 path 来自 DB 但由服务端生成，未见直接拼接用户输入的路径穿越 sink。
+
+- **逻辑缺陷（非安全主漏洞）**：第 305–309 行先访问 `file_user.role` 再判空，file_user 为 None 时抛 AttributeError；第 364 行 `file.content.get(...)` 在 FileModel 无 content 字段时会异常。属可用性缺陷。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "stored_xss_via_unsafe_inline_file_serving", "risk_level": "high", "source": "upload_file 中客户端可控的 file.content_type 与上传文件内容（写入 meta 后经 has_access_to_file 共享给其他用户）", "sink": "get_file_content_by_id 第 268 行 FileResponse(file_path, media_type=content_type) 以及 get_html_file_content_by_id 第 349 行 FileResponse(file_path)，二者均允许 text/html 等危险类型内联渲染", "explanation": "攻击者上传 content_type 为 text/html 的文件，GET /{id}/content 因非 pdf 且非 text/plain 而不带 Content-Disposition，浏览器内联渲染 HTML 造成存储型 XSS；/{id}/content/html 是等效的第二通道。文件名 header 注入已被 quote 编码防御，路径无用户可控穿越 sink。", "fix_suggestion": "对所有非安全类型强制 Content-Disposition: attachment 并使用固定安全 media_type 白名单（如 application/octet-stream）；/{id}/content/html 仅允许已消毒的 HTML 或同样强制下载；考虑增加 CSP 响应头"}
+```

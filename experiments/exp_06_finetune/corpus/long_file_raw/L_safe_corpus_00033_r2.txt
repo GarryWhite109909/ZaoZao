@@ -1,0 +1,40 @@
+## 编号分析
+
+**1. 文件结构与入口点枚举（全文通读）**
+
+本文件是 psd_tools 项目的纯 Python PackBits RLE 编解码回退实现，全文仅包含两个模块级函数：
+
+- 第 66 行起：`decode(data: bytes, size: int) -> bytes`
+- 第 96 行起：`encode(data: bytes) -> bytes`
+
+文件内没有任何网络路由、命令行参数解析、环境变量读取、文件 I/O、反序列化（pickle/yaml）、eval/exec、subprocess 或回调注册。因此不存在传统意义上的外部 source→sink 数据流；唯一的“入口”是上层调用者传入的 `data` 与 `size`。
+
+**2. `decode` 函数逐行审计（第 66–93 行）**
+
+- 第 80–81 行：`i, j = 0, 0`，`length = len(data)`。
+- 第 83 行：`result = bytearray(size)` —— 预分配。若调用者传入超大 `size`（如解析恶意 PSD 头部得到的行宽×高度），会一次性分配内存，属于潜在的内存放大点。但这是**调用方契约问题**，且 PSD 解析器通常对行宽有上限校验；在本文件范围内不构成可独立利用的漏洞。
+- 第 86–87 行：`bit > 128` 分支，`actual = min(1 + bit, size - j)`（第 90 行）——输出侧裁剪正确，写入 `result[j:j+actual]` 不会越界。
+- 第 91–94 行：literal 分支用 `min(copy_count, available, size - j)` 同时限制输入与输出，切片安全。
+- 第 97 行：`bit == 128` 为 no-op，无死循环风险（每轮 `i` 至少 +1，第 86 行保证）。
+- 终止性：`i` 单调递增且受 `length` 约束，`j` 受 `size` 约束，while 条件（第 88 行）必然终止，无无限循环 / ReDoS 类问题。
+- 返回值恒为恰好 `size` 字节，无越界读、无类型混淆。`data = bytearray(data)` 只是拷贝，无 mutation 别名问题。
+
+**3. `encode` 函数逐行审计（第 96–160 行）**
+
+- 第 100–107 行：空输入与单字节输入的快速路径，返回值类型一致。
+- 第 109–159 行：主循环中 `i`、`j` 均单调递增（repeat 分支第 122 行 `i = j = j + 1`，literal 分支第 158 行 `i = j`），`MAX_LEN = 0x7F`（第 101 行）确保 header 字节合法（不会写出会与 128 混淆的值），无越界索引（所有比较均带 `j+1 < length` / `j+2 < length` 守卫）。
+- 输出最多约为输入的 `len + ceil(len/128)` 字节，约 +0.8% 膨胀，无压缩炸弹放大。
+- 无任何 sink：不写文件、不发网络、不执行代码。
+
+**4. 第二入口与替代通道检查**
+
+- 本模块被 `_rle.pyx`（Cython 版）作为回退替代，二者接口一致；即使走 Cython 路径失败回落到此处，行为面相同。
+- 上游调用链（psd_tools 的 compression 模块）传入的 `data` 来自 PSD 文件字节流，`size` 来自文件头/channel 行长。即便攻击者完全控制这两个参数，最坏后果也仅是第 83 行的一次大额内存分配或解码出全零数据——不触达任何危险 sink（无 exec/sql/path）。黑名单/正则类“防御”在本文件中根本不存在，也就无需评估其绕过性。
+
+**5. 结论**
+
+全文证据表明：两个函数均为纯内存字节变换，无 I/O、无动态执行、无注入面；边界检查完整（min-clipping），循环必然终止。唯一可讨论的是 `bytearray(size)` 预分配依赖调用方提供合理 `size`，属于健壮性/资源管理范畴而非本文件内的安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文仅含 decode（第66-93行）与 encode（第96-160行）两个纯内存字节变换函数，无路由、文件、环境变量、回调等外部入口，也无 eval、subprocess、文件写、网络等危险 sink。decode 中所有写入均经 min(copy_count, available, size-j) 双向裁剪，循环变量 i/j 单调递增保证终止；encode 的 MAX_LEN=0x7F 保证输出 header 合法且有界膨胀。唯一边缘点是 decode 第83行 bytearray(size) 预分配依赖调用方给出合理 size，属资源健壮性问题而非本文件内的可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

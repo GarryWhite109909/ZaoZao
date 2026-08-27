@@ -1,0 +1,23 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `run()`（第 76 行起）：参数 `stat_name`、`criticality`、`commands`、`mustache_dict`。`commands` 来自 glances.conf 配置文件；`mustache_dict` 来自各插件采集的系统数据（进程名/cmdline、容器名、挂载点等，属攻击者可控的 source）。
+2. `_sanitize_value()` / `_sanitize_mustache_dict()`：对 mustache 数据做黑名单替换过滤。
+3. `allow_operators()`（第 66 行）：决定 `secure_popen` 是否解释 shell 操作符。
+4. 无其他路由/文件/环境变量入口。
+
+**数据流验证**
+
+- 流 A：插件 stats（如进程 cmdline 列表）→ 第 96 行 `_sanitize_mustache_dict` → 第 97 行 `chevron.render` → 第 106 行 `secure_popen(cmd_full)`。
+ 防御评估：`_sanitize_value` 是**黑名单字符替换**（第 27-29 行），按题目标准视为可绕过：
+ - 仅覆盖 `('&&', '|', '>>', '>')` 四个操作符；若 `secure_popen` 还解释其他元字符（如分号、反引号、`$()`、换行符），均未被过滤；
+ - 第 40 行字典推导 `{k: _sanitize_value(v) for k, v in value.items()}` **只清洗 value，不清洗 key**——若攻击者可控数据出现在字典键中并被模板渲染，管道符可存活；
+ - 非 str/list/tuple/dict 类型（第 44-45 行）原样返回，自定义对象的字符串化结果未清洗。
+ 但需注意：代码注释明确说明 `secure_popen` 只将这四个符号解释为 shell 操作符（第 23-24 行），且递归修复针对已披露的嵌套绕过（GHSA-73wf）。在无法看到 `secure_popen` 源码的情况下，流 A 的残余风险主要是黑名单方法的固有脆弱性（键未清洗是文中可见的真实缺口）。
+
+- 流 B：配置文件中的命令行 `commands` → 第 106 行 `secure_popen(cmd_full, allow_operators=self.allow_operators())`。
+ 关键缺陷在 `allow_operators()`（第 66-67 行）：默认返回 `True`，即**除非用户显式加 `--disable-config-exec`，配置来源命令中的 `&&`、`|`、`>` 仍被解释**。任何能写入/篡改 glances.conf 的攻击者（低权限用户、被入侵的插件写配置）即可注入 `|` 链式命令或用 `>` 覆盖任意文件。这正是注释自认的“incomplete fix”（GHSA-59fj / CVE-2026-53925）：修复只提供了可选开关，而安全默认值应为 False（deny-by-default）。
+
+- 第二通道检查：chevron 未安装时（第 88 行）`cmd_full = cmd` 不经渲染直接执行，但该路径不含 mustache 注入面，且受同一 `allow_operators` 控制，风险与流 B 相同。
+
+**结论**：存在真实漏洞——配置驱动的命令执行默认允许 shell 操作符（不安全的默认值），叠加黑名单式清洗的固有可绕过性与字典键未清洗问题。

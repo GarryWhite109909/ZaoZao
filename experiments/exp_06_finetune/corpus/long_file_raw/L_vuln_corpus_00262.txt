@@ -1,0 +1,27 @@
+## 编号分析
+
+**入口点枚举（全文通读）**
+1. 第 243–248 行：`SanitizeSQL(sql string, args ...any)` —— 唯一公开入口，source 为调用方传入的 `sql` 模板与 `args` 参数。
+2. 第 84–89 行：`NewQuery(sql)` / 第 91 行 `init(sql)` —— 第二入口，同样接受任意 SQL 字符串，走同一套词法分析。
+3. 无文件、环境变量、网络、回调等其他通道；sink 是第 62 行返回的拼接后 SQL 字符串，交由上层执行。
+
+**数据流逐条验证**
+- 第 30–35 行：占位符索引边界检查（argIdx<0、超出 len(args) 报错），有效。
+- 第 38、57 行：参数前后各写入一个空格，修复了 GHSA-m7wr-2xf7-cm9p 的行注释注入（`--`），该防御有效。
+- 第 40–54 行：类型白名单（nil/int64/float64/bool/[]byte/string/time.Time），default 直接报错——白名单式防御，非黑名单，有效。
+- 第 118–137 行 `QuoteString`：仅对单引号做双写转义。在 `standard_conforming_strings=on` 时安全；文档第 240 行也明确声明此前提。但若连接配置为 off 或使用 `E'...'` 上下文，反斜杠可逃逸——属文档化前提，不算独立漏洞。
+- 第 139–166 行 `QuoteBytes`：hex 编码，无注入面。
+- **关键缺陷——词法器不识别 dollar-quoted 字符串**：
+  - 第 168–216 行 `rawState` 只处理 `'...'`、`"..."`、`E'...'`、注释；第 194–204 行遇到 `$` 后跟数字即切到 `placeholderState`。
+  - 全文没有任何状态处理 PostgreSQL 的 `$$...$$` / `$tag$...$tag$` 美元引用字符串。
+  - 因此模板 SQL 中若含美元引用字面量（如 `SELECT $$literal$$, $1`），字面量内部的 `$1` 仍被当作占位符替换；更严重的是攻击者可控的字符串参数值中包含 `$$` 即可提前闭合美元引用并注入任意 SQL。
+  - 数据流：source=args[i]（第 41 行）→ 第 52 行 `QuoteString` 仅双写单引号，无法阻止 `$$` 序列 → sink 第 62 行返回的 SQL。由于美元引用内部单引号无需转义，双写反而无效。
+- 第 63–68 行 unused-argument 检查与注入无关。
+- 第 218–289 行各注释/引号状态机本身逻辑正确，但不覆盖 dollar-quote 场景。
+- 第 291–316 行对象池：`reset` 复用切片，`q.Parts[:0]` 复用底层数组；并发下每个 goroutine 从池取独立对象，无数据竞争；但 `NewQuery` 返回的 Query 若被复用池外共享则可能串改——正常用法无问题。
+
+**结论**：存在真实漏洞——dollar-quoted 字符串未被词法器识别，导致占位符误判与参数逃逸注入（pgx 实际历史 issue 类别）。前提是模板 SQL 含 `$$` 字面量或参数值含 `$$` 且处于美元引用上下文，故为中风险。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89", "risk_level": "medium", "source": "line 243: SanitizeSQL 的 args 参数（以及 line 84 NewQuery 的 sql）", "sink": "line 62: 返回拼接后的 SQL 字符串交由数据库执行", "explanation": "词法器 rawState(line 168-216) 与 placeholderState(line 218-232) 未识别 PostgreSQL 美元引用字符串($$..$$ 或 $tag$..$tag$)，只识别单引号/双引号/E引号/注释。当模板 SQL 含美元引用字面量时，其中的 $N 被误当占位符替换；且攻击者可控的 string 参数经 QuoteString(line 118) 仅双写单引号，无法阻止参数值中的 $$ 提前闭合美元引用从而注入任意 SQL -> source(args) 经 line 52 写入 buf 到 sink(line 62)", "fix_suggestion": "在 rawState(line 194) 遇到 $ 且后续不是数字时增加 dollarQuotedState 状态机，解析 $$ 或 $tag$ 开头并跳过至匹配的闭合标记，期间不得产生占位符；同时保持 standard_conforming_strings=on 的前置校验"}
+```

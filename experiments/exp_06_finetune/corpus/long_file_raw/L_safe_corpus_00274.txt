@@ -1,0 +1,24 @@
+## 编号分析
+
+1. **第 30–41 行 `_validate_acme_url`**：这是唯一的防御函数。它要求 scheme 为 https 且 hostname 在 `ACME_DIRECTORY_HOST_ALLOWLIST` 内，本身是白名单校验（非黑名单），对单个 URL 字符串是有效的。
+
+2. **第 44–53 行 `_validate_acme_url_in_options`**：关键缺陷点。
+   - 第 46–48 行：`json.loads` 失败时 **`return` 静默通过**，不抛异常——即格式非法的 options 字符串完全绕过校验；
+   - 第 49–52 行：只遍历顶层列表元素，若 `acme_url` 嵌套在更深结构中则不会被检查；
+   - 该函数返回 None，调用方无法区分“校验通过”与“未校验”。
+
+3. **第 55–76 行 `update()`**：source 为 API 传入的 `options` 参数；第 71 行先调用 `_validate_acme_url_in_options(options)`，但结合第 2 点，传入非法 JSON 或嵌套结构即可绕过；第 73 行 `authority.options = options` 将未验证内容持久化到数据库 —— source→sink 数据流防御无效。
+
+4. **第 79–89 行 `update_options()`**：同样的模式，第 86 行校验、第 87 行直接落库，存在相同的绕过通道（第二入口）。
+
+5. **第 92–117 行 `mint()` / 第 141–176 行 `create()`**：创建路径上，第 168–170 行将 plugin_options 直接 `json.dumps` 存入 `options`，全程未调用 `_validate_acme_url_in_options`，即创建权威时 acme_url 可为任意主机，是第三条未设防通道。
+
+6. **下游 sink**：存储的 `authority.options` 中的 `acme_url` 后续会被 ACME 插件在签发证书时作为 HTTP 客户端请求目标（服务端发起请求），构成 SSRF：攻击者可将目录指向内网地址/元数据端点。
+
+7. **其余函数**（`get_all/get/get_by_name/render` 等）：`render` 第 233–247 行使用参数化 ORM 查询和 `ilike`，无注入；权限过滤（第 240–247 行）逻辑正常。`create_authority_roles` 中角色名来自插件输出，风险有限。
+
+结论：存在漏洞 —— 通过畸形 JSON 绕过 acme_url 白名单校验并持久化，导致服务端请求伪造（SSRF）。这与 Lemur 历史 CVE（ACME URL 校验绕过）一致。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "SSRF（acme_url 白名单校验绕过）", "risk_level": "high", "source": "update()/update_options()/create() 接收的外部 options 参数", "sink": "authority.options 持久化后被 ACME 插件用作服务端出站 HTTP 请求地址", "explanation": "第 44-53 行 _validate_acme_url_in_options 在 json.loads 失败时静默 return 而不抛异常，且仅检查顶层列表中的 acme_url 项；因此向 update（第 71-73 行）或 update_options（第 86-87 行）提交非法 JSON 或嵌套结构的 options 即可绕过 https 与 allowlist 校验并将任意 acme_url 写入数据库。此外 create() 第 168-170 行落库 plugin_options 时完全不经过该校验。后续证书签发流程会以该 url 发起服务端请求，形成 SSRF，可探测内网或云元数据端点。", "fix_suggestion": "当 options 无法解析或不包含合法结构时应抛出 InvalidConfiguration 而非 return；递归遍历所有嵌套层级查找 acme_url 并强制校验；在 create() 落库前同样调用统一校验函数；并对已存数据做迁移清洗。"}
+```

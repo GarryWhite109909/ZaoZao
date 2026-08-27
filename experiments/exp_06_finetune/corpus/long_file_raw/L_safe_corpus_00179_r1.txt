@@ -1,0 +1,40 @@
+## 编号分析（全文通读，逐入口点）
+
+**入口点枚举**
+- E1：`$argv[1]`（第 33 行附近）——CLI 参数，经 `preg_replace("/[^A-Za-z0-9 ]/")` 清洗后与 `$objClone->myKey` 比对（第 38 行）；Web 访问时 `$argv` 未定义则为空串。
+- E2：远端克隆服务器返回的 JSON（第 51 行 `url_get_contents` 后 `_json_decode`），字段 `sqlFile`、`videosDir`、`videoFiles`、`photoFiles` 全部进入后续 sink。
+- E3：管理员配置的插件参数 `cloneSiteURL`、`cloneSiteSSHUser/IP/Port/Password`。
+
+**鉴权检查（第 38–45 行）**
+```php
+if (empty(...) || $objClone->myKey !== $argv[1]) {
+    if (!User::isAdmin()) {
+        ...
+        echo "$objClone->myKey !== $argv[1]";
+```
+此处把**密钥本身回显给未授权调用者**。攻击者首次请求任意 `argv[1]` 即可从响应中读到真实 `myKey`，第二次携带该密钥即可通过鉴权——该防御被自身代码泄露而失效。这是明确的 source→sink 问题：source=`$objClone->myKey`，sink=`echo` 输出。
+
+**sqlFile 数据流（第 78、92–100 行）**
+`$json->sqlFile` 经 `preg_replace('/[^a-z0-9_.-]/i','')` + `escapeshellarg` 后拼入 `wget -O <escapeshellarg($sqlFile)>`。字符集无 `/`，无法目录穿越；wget 参数已转义。此流防御有效。
+
+**SQL dump 执行（第 130–160 行）**
+下载的 dump 逐行直接送入 `$global['mysqli']->query()`，内容完全来自远端服务器且无任何校验。配合上述密钥泄露，非管理员可触发对本地数据库的任意覆盖（可植入管理员账号/恶意插件数据，形成二次 RCE 链）。属设计性信任但鉴权失效使其可被外部利用。
+
+**文件写入流（第 175–195 行）**
+`filename` 清洗为 `[a-z0-9_.-]`，无 `/`，写入限定在 `$videosDir/$photosDir` 内；`url` 同样清洗（虽导致 URL 失效，但无穿越）。防御有效。
+
+**rsync 命令（第 199–215 行）**
+`sshUser/sshIP/port/videosDir` 均有白名单清洗；但：
+```php
+$cmd = str_replace("{password}", $objClone->cloneSiteSSHPassword->value, $rsync);
+```
+密码以**原文替换进单引号内**（`sshpass -p '{password}'`），未经过 `escapeshellarg`。若密码含单引号即可逃逸引号注入任意 shell 命令（第二入口：该值来自数据库中加密存储的管理员配置，`decryptIfNeed` 解出后直接入 sink，黑名单式清洗未覆盖此字段）。另外 `$log->file` 也未转义地嵌入 `--log-file='...'`。
+
+**收尾（第 225 行起）**
+`deleteDump={$json->sqlFile}` 拼接 URL——sqlFile 已清洗，仅参数注入层面无害；`chmod -R 777 {$videosDir}` 为硬编码路径，无用户输入。
+
+**结论**：主要风险为 (a) 第 44 行密钥回显导致的鉴权绕过信息泄露；(b) 第 212 行 SSH 密码未转义的第二阶命令注入；(c) 鉴权失效放大了 dump→SQL 执行流的危害。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "authentication bypass via secret key disclosure and second-order command injection", "risk_level": "high", "source": "$objClone->myKey echoed at line 44; decrypted cloneSiteSSHPassword injected into rsync command at line 212", "sink": "echo output / exec() shell command", "explanation": "Line 44 echoes the secret myKey to unauthenticated callers, letting anyone read the key and pass the auth check on a second request. With auth bypassed, the attacker-triggered flow executes an unvalidated remote SQL dump line-by-line against the local database (lines 130-160), enabling full DB takeover and secondary RCE. Separately, the SSH password is substituted raw into single quotes of the rsync command (line 212) without escapeshellarg, so a password containing a quote yields shell command injection.", "fix_suggestion": "Remove the echo of myKey and return a generic error; wrap the SSH password with escapeshellarg instead of raw str_replace; validate or sign the remote SQL dump before executing it"}
+```

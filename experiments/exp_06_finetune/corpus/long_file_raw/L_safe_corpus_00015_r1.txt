@@ -1,0 +1,34 @@
+## 编号分析（全文通读，逐函数行号级）
+
+**函数 1：`Configure()`（约第 27–30 行）**
+仅初始化 logger 与 sameSite，无外部输入 source，无 sink。安全。
+
+**函数 2：`SetCookie` / `setCookie`（第 32–70 行）**
+- 第 36 行 `domains.Matches(r.Host)` 与第 38 行配置覆盖 domain：domain 来自配置或内部匹配逻辑，非直接用户可控字符串注入 Set-Cookie 头；Go 的 `http.SetCookie` 会对 Value/Domain 做序列化校验，非法字符会被丢弃或报错，不构成 header 注入。
+- 第 55–66 行分片路径：`splitCookie(val, maxCookieSize-emptyCookieSize)` 中 val 为服务端生成的 JWT，非用户任意输入；分片数由 val 长度决定，受 maxCookieSize 约束。
+- 无用户可控 source 到危险 sink 的通路。
+
+**函数 3：`Cookie(r *http.Request)`（第 72–117 行）——唯一以请求为 source 的入口**
+- Source：`r.Cookies()`（第 79 行），cookie 名与值均为攻击者可控。
+- 第 82–84 行：完整名匹配直接返回，值后续交由 JWT 校验层处理，此处非 sink。
+- 第 88–95 行：解析 `xOFy`，`strconv.Atoi(xyArray[1])` 错误即返回（第 91–93 行）；第 94–96 行强制 `numParts` 在 `[1, maxCookieParts=32]` 区间内，分配的 slice 大小有上界，无法通过超大 numParts 触发大内存分配。
+- 第 100–104 行：索引 `i` 同样经 Atoi 校验，且第 105–107 行校验 `i > numParts` 即拒绝；i 的取值被限制在合法范围内，配合第 108 行写入 `cookieParts[i-1]` 不会越界到已分配区间之外。
+- 第 112–118 行：`strings.Join` 仅拼接字符串并返回给上层做 JWT 签名验证，伪造/拼接内容最终会被签名校验拒绝，不是信任边界内的 sink。
+- 关于边界情形：若某分片缺失，对应槽位为空串，Join 后为不完整 token，仍会被下游 JWT 验签拒绝；不存在认证绕过。
+
+**函数 4：`ClearCookie`（第 119–141 行）**
+- 第 121 行遍历请求 cookies，第 128 行前缀匹配后用 `cookie.Name` 作为删除 cookie 的名字回写。Name 来自客户端，但 Go 标准库在解析请求 Cookie 头时已对非法 token 做过滤，且 `http.SetCookie` 序列化时会丢弃含分隔符的 Name，不产生响应头注入。Domain 同样来自配置/内部匹配。
+
+**函数 5：`SameSite()`（第 147–166 行）**
+仅消费配置文件白名单枚举值（lax/strict/none），默认 fallthrough 保持 SameSite(0)，无用户输入参与。
+
+**第二入口与替代通道检查**
+- 本文件所有对外入口只有 `r.Cookies()` 与 `r.Host`；`r.Host` 仅进入 `domains.Matches` 做匹配，不拼接头。
+- 无环境变量、文件、回调等其他 source。
+- 黑名单/正则类可绕过防御：本文件未使用黑名单或正则过滤作为安全边界，区间校验（numParts/i）是数值范围检查而非可绕过的模式匹配。
+
+**结论**：全部数据流中，用户可控输入（cookie 名/值）要么经数值范围校验后有界使用，要么最终交给下游 JWT 验签这一真正的信任边界；cookie 写回均走 Go 标准库的安全序列化。未发现可利用的注入、越界、绕过或 DoS 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文逐函数核查：Cookie 函数中对分片数量 numParts 和索引 i 均做了 strconv.Atoi 解析与范围校验（1 到 maxCookieParts=32），slice 分配与写入均有界；拼接结果交由下游 JWT 验签处理，伪造内容不会通过认证。SetCookie/ClearCookie 中 domain 来自配置或 domains.Matches 内部逻辑，cookie 写回均经由 Go 标准库 http.SetCookie 的安全序列化，非法字符会被过滤，不存在响应头注入。SameSite 仅消费配置白名单枚举值。未发现用户可控 source 到危险 sink 的有效数据流。", "fix_suggestion": "no fix needed"}
+```

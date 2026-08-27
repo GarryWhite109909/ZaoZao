@@ -1,0 +1,76 @@
+LANG: python
+```code
+import json
+import re
+import subprocess
+
+from django.http import JsonResponse
+from django.views.decorators.http import require_POST
+
+
+FFMPEG_PREFIXES = ('ffmpeg', '/usr/bin/ffmpeg', '/bin/ffmpeg')
+
+
+def sanitize_ffmpeg_command(command):
+    # whitelist-style validation: only allow ffmpeg with a fixed set of
+    # benign flags and a media path, no shell metacharacters accepted
+    parts = command.split()
+    if len(parts) < 2:
+        return ''
+    if parts[0] not in FFMPEG_PREFIXES:
+        return ''
+    allowed_flags = {'-i', '-c', '-vcodec', '-acodec', '-f', '-y', '-b:v', '-b:a'}
+    for token in parts[1:]:
+        if token.startswith('-'):
+            if token not in allowed_flags:
+                return ''
+        else:
+            if any(ch in token for ch in ';|`<>&$(){}\\'"
+\r'):
+                return ''
+    return command
+
+
+@require_POST
+def ffmpeg_control(request):
+    action = request.POST.get('action', '')
+
+    if action == 'list':
+        keyword = request.POST.get('keyword', '')
+        cmd = ['ps', '-eo', 'pid,etime,%cpu,%mem,cmd']
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        lines = [l for l in proc.stdout.splitlines() if 'ffmpeg' in l]
+        if keyword:
+            lines = [l for l in lines if keyword in l]
+        return JsonResponse({'output': lines})
+
+    if action == 'kill':
+        pid = request.POST.get('pid', '')
+        if not pid.isdigit():
+            return JsonResponse({'error': True, 'msg': 'Invalid PID'}, status=400)
+        kill_cmd = ['kill', '-9', pid]
+        subprocess.run(kill_cmd)
+        return JsonResponse({'error': False, 'msg': f'Process {pid} killed'})
+
+    if action == 'start':
+        raw_command = request.POST.get('command', '')
+        safe_command = sanitize_ffmpeg_command(raw_command)
+        if not safe_command:
+            return JsonResponse({'error': True, 'msg': 'Sanitization failed'}, status=400)
+        subprocess.Popen(safe_command.split(), shell=False,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return JsonResponse({'error': False, 'msg': 'started'})
+
+    return JsonResponse({'error': True, 'msg': 'Unknown action'}, status=400)
+```
+
+1. 第 22 行 `request.POST.get('action')`、第 25 行 `keyword`、第 34 行 `pid`、第 44 行 `command` 是四个用户可控输入点，均来自 Django 请求对象。
+2. list 分支：原代码把 `keyword` 拼进 shell 命令串并以 `shell=True` 执行（原第 29-30 行），构成命令注入。修复后第 27-31 行改为参数列表形式调用 `ps`，不再经过 shell；grep 过滤改为第 32-35 行的 Python 内存过滤（子串匹配），`keyword` 永不进入进程执行环境，类型上为纯字符串比较，攻击面完全消除。
+3. kill 分支：保留原有 `isdigit()` 校验，但第 38-39 行将拼接字符串改为列表 `['kill', '-9', pid]` 且去掉 `shell=True`；即使校验被绕过，无 shell 解释层也无法注入元字符，防御位置在 sink 调用处，正确且完备。
+4. start 分支：删除黑名单式 `sanitize_ffmpeg_command`，替换为白名单实现（第 12-26 行）：首 token 必须精确属于 `FFMPEG_PREFIXES` 允许集，标志位必须命中固定允许集，路径类 token 拒绝一切 shell 元字符；随后第 47-48 行以 `safe_command.split()` 列表形式、`shell=False` 启动 Popen，双重保证无 shell 解析。
+5. 防御有效性论证：三处修复均采用『白名单 + 无 shell 参数化执行』这一框架原生安全模式，替代了可被绕过的黑名单/正则过滤；数据流走向（POST → 校验 → subprocess）与函数名、路由装饰器、控制流全部保持不变，满足最小 diff。
+6. 第二入口检查：全文件仅 `ffmpeg_control` 一个视图入口，三个分支的 sink 均已消除 `shell=True`；未发现其他 `subprocess`/`os.system`/`eval` 调用点，无遗漏通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "list 分支：keyword 原拼入 shell 命令经 shell=True 执行，现改为 ps 参数列表加 Python 内存过滤，注入面消除；kill 分支：pid 经 isdigit 校验后改用列表参数且移除 shell=True；start 分支：黑名单 sanitize 替换为 FFMPEG_PREFIXES 与标志位白名单，Popen 以 split 列表与 shell=False 执行；三处 sink 均不再经过 shell 解释器", "fix_suggestion": "no fix needed"}
+```

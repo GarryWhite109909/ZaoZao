@@ -1,0 +1,32 @@
+## 编号分析
+
+1. **第 12–36 行 `makeJoined`**：将 DB 中 `FilesRaw` JSON 反序列化为文件列表，无外部输入直接进入路径操作；`CreatorId` 来自 DB。无漏洞。
+
+2. **第 44–68 行 `GetSharingById`**：入口为分享 ID 字符串，仅作缓存键与 DB 查询参数（非拼接 SQL），singleflight 防击穿。无注入面。
+
+3. **第 70–80 行 `GetSharings` / 第 82–88 行 `GetSharingsByCreatorId`**：分页参数透传给 db 层，本文件内无 sink。
+
+4. **第 90–113 行 `GetSharingUnwrapPath`（核心）**：
+   - **单文件分支（第 94–96 行）**：`return stdpath.Join(sharing.Files[0], path), nil` —— 此处 `path` 是调用方传入的**原始用户输入**，未经过任何清洗。`stdpath.Join` 虽会做词法清理，但 `Join("/base", "../../etc/passwd")` 的结果仍会逃逸出 `/base` 之外（Join 只是连接并清理，不限制结果留在基目录内）。攻击者可通过 `..%2f..%2f` 类路径穿越到分享根目录之外的任意挂载路径。
+   - **多文件分支（第 98–112 行）**：先执行 `utils.FixAndCleanPath(path)[1:]` 清洗，再按首段与 `stdpath.Base(c)` 匹配，`rest` 来自已清洗路径，相对安全。
+   - 对比可见：多文件分支做了防御而单文件分支遗漏，属于防御不一致导致的路径穿越。
+
+5. **第 115–123 行 `CreateSharing` / 第 125–135 行 `UpdateSharing`**：写入侧对 `sharing.Files` 统一做 `FixAndCleanPath` 后序列化存储，存储的基准目录本身是干净的——问题不在存储，而在读取时对用户传入的相对 `path` 未清洗。
+
+6. **第 137–143 行 `UpdateSharingId`、第 145–148 行 `DeleteSharing`、第 150–153 行 `DeleteSharingsByCreatorId`**：缓存失效 + DB 删除，ID 为字符串主键，无拼接风险。
+
+7. **第二入口核查**：`GetSharingUnwrapPath` 是唯一将用户可控 `path` 拼入真实文件系统/驱动路径的函数；其上游（路由层）无论以 query 还是 body 传入，均汇入同一 sink。单文件分享是常见默认形态，攻击面完整可达。
+
+**结论**：存在 CWE-22 路径穿越，位于单文件分支，因缺少与多文件分支一致的 `FixAndCleanPath` 防御。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22",
+  "risk_level": "high",
+  "source": "line 91: GetSharingUnwrapPath 的入参 path, 来自访问分享的用户请求",
+  "sink": "line 96: return stdpath.Join(sharing.Files[0], path), nil",
+  "explanation": "当分享只含一个文件时, 用户提供的 path 未经过 utils.FixAndCleanPath 清洗就直接与分享根路径 Join; 传入 ../../ 形式的相对路径可使最终路径逃逸出分享范围, 访问任意其他挂载目录下的文件; 多文件分支在第 99 行有清洗, 单文件分支缺失该防御, 属于不一致防护导致的路径穿越",
+  "fix_suggestion": "line 95-96: 在单文件分支同样先执行 path = utils.FixAndCleanPath(path) 并校验 Join 结果仍位于 sharing.Files[0] 前缀之内后再返回"
+}
+```

@@ -1,0 +1,31 @@
+## 编号分析
+
+1. **第 47-50 行（构造函数）**：`$this->htaccessPath` 由 `Configuration::getRootPath()` 拼接而来，路径本身固定，非用户直接可控，不构成路径遍历入口。
+
+2. **第 52-57 行 `getServerPath()`**：source 为 `$this->configuration->getDefaultUrl()`（第 54 行）。该值来自安装/管理后台保存的配置（数据库中的默认 URL），属于第二入口——攻击者若能通过 setup 或管理接口写入该配置值，即可注入任意字符串。此处仅做 `parse_url(..., PHP_URL_PATH)` 提取和空值兜底，**没有任何字符白名单/编码校验**。关键点：`parse_url` 不做 URL 解码也不过滤控制符；若 defaultUrl 中含有原始换行符（如 `http://host/faq%0Aphp_value auto_prepend_file /tmp/x` 虽经百分号编码安全，但若配置写入端未做 `FILTER_VALIDATE_URL` 校验而允许字面 `\n`），换行会原样保留在 path 中。
+
+3. **第 59-79 行 `getRewriteBase()`**：仅读取 .htaccess 并返回 RewriteBase 参数，无写操作，无 sink。
+
+4. **第 88-118 行 `adjustRewriteBaseHtaccess()`**：
+   - 第 105 行：`$rewriteBase->setArguments([$this->getServerPath()])` —— 污点数据被设为 .htaccess 指令参数；
+   - 第 113-114 行：ErrorDocument 404 的参数同样由 `rtrim($this->getServerPath(), '/') . '/index.php?action=404'` 构造；
+   - 第 116-117 行：`(string) $htaccess` 序列化后经 `file_put_contents($this->htaccessPath, $output)` **写回 .htaccess 文件** —— 这是明确的 sink。
+   - 全文无任何对注入字符（换行、空格、引号）的转义或校验；htaccess 解析器序列化时不会阻止多行指令注入。
+
+5. **第 120-140 行 `findErrorDocument()`**：纯递归查找，无污点传播风险。
+
+6. **防御有效性核查**：全文不存在黑名单、正则过滤或编码函数；`parse_url` 与 `rtrim` 均不能阻断 CRLF 注入。因此 source→sink 数据流无有效防御。
+
+7. **利用链**：能修改“默认 URL”配置的入口（安装向导 setup 阶段、管理后台配置接口）→ `getDefaultUrl()` 返回含换行的 path → 写入 .htaccess 形成新指令（如 `php_value auto_prepend_file`、`AddType application/x-httpd-php .txt` 等）→ Apache 解析 .htaccess 时触发代码执行/文件包含。前提是攻击者已具备管理员或 setup 权限，且服务器使用 Apache 并允许 .htaccess 覆盖，故为需特权的前置条件漏洞，风险中等。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-94 (通过 .htaccess 指令注入导致任意代码执行)",
+  "risk_level": "中",
+  "source": "line 54: configuration.getDefaultUrl() 返回的默认URL路径(可经安装向导或管理后台配置接口被污染)",
+  "sink": "line 117: file_put_contents 将含污点参数的 htaccess 内容写回 .htaccess 文件",
+  "explanation": "getServerPath 仅用 parse_url 提取路径且未过滤换行等控制字符 -> 污染值在 line 105 和 line 114 被 setArguments 写入 RewriteBase 与 ErrorDocument 指令 -> line 116-117 序列化后整体写回 .htaccess -> 若默认URL含字面换行符可注入任意 Apache 指令(如 auto_prepend_file)实现代码执行",
+  "fix_suggestion": "line 54: 对 parse_url 结果做严格白名单校验(仅允许字母数字斜杠点横线下划线并拒绝 CR LF 空格引号), 或用 rawurlencode 编码后再拼入指令参数"
+}
+```

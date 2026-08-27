@@ -1,0 +1,82 @@
+# Cloudreve WOPI 模块安全分析
+
+## 一、文件结构总览
+
+本文件为 `wopi` 包，共两个函数：`GenerateWopiSrc`（第 47-77 行）与 `generateActionUrl`（第 82-121 行），外加常量与占位符映射定义（第 17-45 行）。核心功能是：根据 viewer 配置中的 WOPI action URL 模板，生成最终给前端的 WOPISrc 地址。
+
+---
+
+## 二、逐函数入口点枚举
+
+### 函数 1：`GenerateWopiSrc`（第 47-77 行）
+
+**入口点（source）清单：**
+
+1. **`ctx`（context）** — 第 48 行 `dep := dependency.FromContext(ctx)`。依赖注入容器，包含 `SettingProvider()`（站点配置）与 `HashIDEncoder()`。
+2. **`viewer *types.Viewer`（参数）** — 第 49 行。Viewer 来自数据库/管理员配置的查看器定义，其中 `viewer.WopiActions`（第 55 行）是**管理员可配置的外部 URL 模板**——这是本文件最关键的不可信输入。
+3. **`viewerSession *manager.ViewerSession`** — 第 50 行。包含 `viewerSession.File.Ext()`（第 56 行）与 `viewerSession.File.ID()`（第 69 行）。File 来自数据库记录，ID 为服务端生成的主键。
+4. **`action types.ViewerAction`** — 第 49 行参数，仅作为 map 的 key 使用（第 62 行 `availableActions[a]`），不进入任何输出字符串拼接。
+
+**内部数据流验证：**
+
+- **流 A：`viewer.WopiActions[src]` → `generateActionUrl(src, ...)`（第 68-70 行）**
+  - source：管理员在 viewer 配置中填写的 action URL 字符串（如 `https://office.example.com/hosting/wopi.aspx?<WOPI_SOURCE>`）。
+  - sink：`url.Parse` 后作为前端跳转目标返回。
+  - 防御分析：
+    - 第 83-84 行：`strings.ReplaceAll(src, "<", "")` 与 `">", "")` —— 剥离尖括号，防止模板本身被用作 HTML 注入载体的一部分；但这只是字符剥离，非转义。
+    - 第 85-88 行：`url.Parse` 校验格式合法性，解析失败直接报错返回（第 87-89 行）。
+    - **关键点：此处没有 scheme 白名单校验。** 若管理员将 action URL 配置为 `javascript:alert(1)?<WOPI_SOURCE>`，`url.Parse` 会成功（scheme=javascript 是合法 parse），该 URL 会原样下发给浏览器端打开 WOPI 编辑器。但需评估威胁模型：`viewer.WopiActions` 属于**管理员级配置**（Cloudreve 中 viewer 由站点管理员通过管理面板定义），管理员本就可注入任意前端脚本（等同已拥有站点控制权），因此这属于“受信配置面”，通常不计为漏洞——但若存在多租户/低权限可创建 viewer 的场景则升级为开放重定向/XSS。基于本文件证据无法确认存在此类低权限路径，故按保守结论处理。
+  - 结论：防御对“外部攻击者”有效（攻击者无权写 viewer 配置）；黑名单式 `<`/`>` 剥离单独看可绕过，但配合 `url.Parse` + 管理员信任边界，风险有限。
+
+- **流 B：`hashid.EncodeFileID(hasher, viewerSession.File.ID())` → `routes.MasterWopiSrc(...)`（第 69 行）**
+  - source：数据库自增文件 ID。
+  - sink：经 hashid 编码后拼入 WOPISrc 路径。
+  - 防御：hashid 编码混淆了真实 ID，且 ID 为整数主键，无用户可控字符串注入可能。`MasterWopiSrc` 返回 `*url.URL`（类型安全构造），非字符串拼接。**无漏洞。**
+
+- **流 C：`fileSrc` 作为 query value 注入（第 108 行 `queryReplaced.Set(k, fileSrc)`、第 113 行 `queryReplaced.Set(wopiSrcParamDefault, fileSrc)`）**
+  - 关键防御：`queryReplaced.Encode()`（第 118 行）会对所有 key/value 做 URL 编码，fileSrc 中即使含 `&`、`=`、`#` 也被正确 percent-encode，不会造成 query 分隔符逃逸或参数注入。**有效防御。**
+
+### 函数 2：`generateActionUrl`（第 82-121 行）
+
+**入口点：**
+1. `src string`（第 82 行）— 来自函数 1 流 A，即管理员配置的模板。
+2. `fileSrc string`（第 82 行）— 来自函数 1 内部构造的 `routes.MasterWopiSrc(...).String()`（第 69 行），非直接用户输入。
+
+**逐行数据流：**
+
+- 第 83-84 行：尖括号剥离（见上，弱防御但有 url.Parse 兜底）。
+- 第 85-89 行：parse 失败即 fail-closed，返回 error。✅
+- 第 91-105 行循环：
+  - 第 92-98 行：若 query 值命中 `queryPlaceholders` 白名单（第 19-33 行，全部为硬编码常量），用固定值替换或删除。白名单值均为字面量（"lng"、"true"、"darkmode"、""），**无用户输入回流，安全。**
+  - 第 99-103 行：`WOPI_SOURCE` 占位符替换为 `fileSrc`。fileSrc 经 hashid 编码 + 类型化 URL 构造，再经 Encode 编码，安全。
+  - 第 104-105 行：其余 query 原样保留——这些值同样来自管理员模板，同流 A 信任边界。
+- 第 107-109 行：未找到占位符时默认追加 `WOPISrc=fileSrc`，同流 C，Encode 保护。
+- 第 111 行：硬编码 `lang=lng`，无输入。
+- 第 117 行：`actionUrl.RawQuery = queryReplaced.Encode()` —— Encode 是标准库的完整 percent-encoding，防 query 注入。✅
+
+### 常量区（第 17-45 行）
+
+`queryPlaceholders`、各 header 名、`LockDuration` 全部为编译期字面量，无外部输入，不构成 source。
+
+---
+
+## 三、第二入口与替代通道检查
+
+1. **HTTP handler 入口？** 本文件不含任何路由注册、HTTP handler 或请求读取代码（无 `http.Request`、无 gin/echo 引用）。真正的 WOPI endpoint 处理（access_token 校验、LOCK 等 header 定义于第 27-35 行）在其他文件中实现，本文件仅提供 URL 生成。header 常量只是命名声明，非 sink。
+2. **环境变量 / 文件读取？** 无 `os.Getenv`、无文件 IO。唯一外部数据是依赖注入的 SettingProvider（站点 URL，管理员配置）与 Viewer 配置。
+3. **回调？** 无。
+4. **替代通道确认：** `viewerSession.File.ID()` 若能被低权限用户影响——不能，文件 ID 由系统分配；hashid 进一步隔离。
+
+## 四、综合判定
+
+| 数据流 | source | sink | 防御 | 判定 |
+|---|---|---|---|---|
+| A | 管理员配置的 action URL | 返回给前端的跳转地址 | `<`/`>` 剥离 + url.Parse | 管理员信任边界内，非漏洞 |
+| B | 文件 DB ID | WOPISrc 路径 | hashid + 类型化 URL 构造 | 安全 |
+| C | fileSrc | RawQuery | `Encode()` 完整编码 | 安全 |
+
+无用户可控输入直达危险 sink；无 SSRF（本文件不发起出站请求）；无路径遍历；无 SQL/命令注入面。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文两个函数及常量区后确认：本文件不含 HTTP handler、环境变量、文件 IO 等直接外部入口，唯一外部影响源是管理员配置的 viewer.WopiActions URL 模板（第 55、68 行）与数据库文件 ID（第 69 行）。三条数据流均验证有效：流A中管理员模板经尖括号剥离（第83-84行）、url.Parse fail-closed 校验（第85-89行）后输出，且该配置属管理员信任边界，普通用户无法写入；流B中文件 ID 经 hashid 编码并使用 routes.MasterWopiSrc 类型化构造 URL，无字符串拼接注入；流C中 fileSrc 写入 query 时由 queryReplaced.Encode()（第118行）做完整 percent-encoding，杜绝参数分隔符逃逸。queryPlaceholders 白名单（第19-33行）全为硬编码字面量，无输入回流。本文件不发起出站网络请求，不存在 SSRF 面。未发现用户可控 source 直达危险 sink 的路径。", "fix_suggestion": "no fix needed"}
+```

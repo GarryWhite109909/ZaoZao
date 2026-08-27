@@ -1,0 +1,77 @@
+# gorush `router/server.go` 全文安全分析
+
+## 一、文件定位与整体结构
+
+本文件是开源项目 gorush（appleboy/gorush）的 HTTP/HTTPS 服务器启动模块，构建标签为 `!lambda`（第 1–2 行），包名为 `router`（第 4 行）。全文共 5 个函数：
+
+1. `RunHTTPServer`（第 14 行起）
+2. `listenAndServe`（第 76 行起）
+3. `listenAndServeTLS`（第 92 行起）
+4. `startServer`（第 108 行起）
+5. （被引用但定义在别处的）`routerEngine`、`autoTLSServer`
+
+下面逐一分析。
+
+## 二、逐函数入口点与数据流枚举
+
+### 1. `RunHTTPServer`（第 14–74 行）
+
+**入口点枚举：**
+- 配置对象 `cfg *config.ConfYaml`：来自配置文件 / 环境变量 / 命令行，属于**管理员侧输入**，不是外部 HTTP 请求输入。
+- 可选注入的 `s ...*http.Server`（第 15 行）：仅用于测试注入自定义 server。
+- 真正对外暴露的请求入口是第 22 行 `Handler: routerEngine(cfg, q)` —— 路由处理逻辑不在此文件中，本文件不含任何 HTTP handler。
+
+**数据流验证：**
+
+- **流 1：`cfg.Core.Address + ":" + cfg.Core.Port` → `server.Addr`（第 21–22 行）。**
+  source 是配置项，sink 是监听地址。攻击者若能控制配置即已拥有服务器控制权（本地信任边界内），不构成漏洞。无用户可控输入参与拼接，不存在 SSRF 或地址注入面。
+
+- **流 2：TLS 证书路径 `cfg.Core.CertPath` / `cfg.Core.KeyPath` → `tls.LoadX509KeyPair`（第 37–40 行）。**
+  source 为配置文件路径，sink 为本地证书加载。这是服务器自身读取自己的证书，属于预期功能；即使路径可由配置控制，能改配置者已可任意操作。非漏洞。
+
+- **流 3：`cfg.Core.CertBase64` / `cfg.Core.KeyBase64` → `base64.StdEncoding.DecodeString` → `tls.X509KeyPair`（第 41–53 行）。**
+  同上，source 是管理员提供的 base64 证书。解码失败有错误检查并返回（第 43、48 行），X509 解析失败也返回错误（第 50–52 行）。无内存不安全操作，Go 的 base64 解码不会溢出。非漏洞。
+
+- **流 4：缺省分支返回 `errors.New("missing https cert config")`（第 55–56 行）。**
+  防御性校验正确：SSL 开启但未提供证书时拒绝启动，避免以明文回退。这是安全增强而非缺陷。
+
+- **TLS 版本：第 31 行 `MinVersion: tls.VersionTLS12`** —— 明确禁用了 TLS 1.0/1.1，符合现代安全基线；第 33–35 行强制 NextProtos 为 http/1.1，防止 ALPN 协议混淆。均属有效防御。
+
+- **注意点（非漏洞）：** 第 19–20 行 `//nolint:gosec` 抑制了 gosec 对未设置 `ReadHeaderTimeout`/`IdleTimeout` 等 timeout 字段的告警。缺少 `ReadTimeout`/`ReadHeaderTimeout` 理论上允许慢速 HTTP 攻击（Slowloris）占用连接，但这属于可用性加固建议，且该 server 由调用方/测试可传入带超时的 server 覆盖（第 24–26 行 `else { server = s[0] }`），生产部署通常配合反向代理。按“黑名单/过滤不算防御”的标准衡量，这里连过滤都不涉及——没有用户输入到达任何危险 sink。
+
+### 2. `listenAndServe`（第 76–90 行）
+
+**入口点：** context 取消信号与 `cfg.Core.ShutdownTimeout`。
+
+- 第 78–84 行：goroutine 监听 `<-ctx.Done()`，用 `cfg.Core.ShutdownTimeout` 构造超时后调用 `s.Shutdown(ctx)`。source 是配置整数，sink 是优雅关闭超时。若 ShutdownTimeout 为负或 0，`context.WithTimeout` 会立即过期导致关闭中断——这是运维行为问题，不是安全漏洞（无法被远程攻击者触发，需先控制配置）。
+- 第 85–89 行：`s.ListenAndServe()` 错误处理排除了 `http.ErrServerClosed`（第 86 行），逻辑正确，不会因正常关闭而误报。
+
+### 3. `listenAndServeTLS`（第 92–106 行）
+
+结构与上一个函数完全对称：
+- 第 94–100 行：同样的 ctx.Done + ShutdownTimeout 优雅关闭逻辑。
+- 第 101–105 行：`s.ListenAndServeTLS("", "")` —— 传空字符串是因为证书已在 `RunHTTPServer` 中通过 `server.TLSConfig = config`（第 71 行）预载入，TLS 握手将使用 `TLSConfig.Certificates`。这是标准用法，无凭据泄漏、无降级风险（MinVersion 已在第 31 行锁定 TLS1.2+）。
+
+### 4. `startServer`（第 108–115 行）
+
+- 第 110–113 行：根据 `s.TLSConfig == nil` 分派到 `listenAndServe` 或 `listenAndServeTLS`。分派条件与前面设置 TLSConfig 的路径一致（第 71 行只在 SSL 分支设置），不存在“以为开了 TLS 实际走明文”的分派错位：只有当 `cfg.Core.SSL == true` 且证书加载成功时 TLSConfig 才非 nil；AutoTLS 分支（第 28 行）由 `autoTLSServer` 内部配置（不在本文件）。逻辑自洽。
+
+### 5. 外部引用函数
+
+- `routerEngine(cfg, q)`（第 22 行）：真正的 HTTP 路由与参数解析所在，不在本文件，本文件对其无任何输入过滤责任，也无法在此验证其内部数据流——但本文件的结论不受其影响，因为本文件本身没有引入新的 source→sink 流。
+- `autoTLSServer`（第 29 行）：同上，autocert/Let's Encrypt 封装在别处实现。
+
+## 三、第二入口与替代通道核查
+
+- **HTTP 请求入口：** 本文件唯一的对外通道是第 22 行挂载的 `routerEngine`，本文件内没有任何 handler、没有解析 query/body/header/path 的代码，因此不存在直接的用户输入 source。
+- **文件系统入口：** 仅第 38 行读证书/私钥文件，路径来自配置，且只读用于自身 TLS，无写操作、无路径遍历 sink。
+- **环境变量/回调：** 本文件不读取环境变量，不注册回调。
+- **并发通道：** errgroup 双 goroutine（shutdown 与 serve）之间无共享可变状态竞争（server 由 net/http 内部保证并发安全）。
+
+## 四、结论
+
+通读全部 116 行代码：所有 source 均为管理员控制的配置项（地址、端口、证书路径/base64、超时秒数），所有 sink（ListenAndServe、LoadX509KeyPair、X509KeyPair、Shutdown）均为标准库安全用法且有完整错误处理；TLS 配置强制 MinVersion TLS1.2；SSL 模式下缺失证书会拒绝启动而非静默降级。唯一可提的是缺少 ReadHeaderTimeout（gosec 已标注 nolint），属 Slowloris 加固建议，不构成可利用的安全漏洞，且无用户输入参与任何数据流。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文逐一核查 RunHTTPServer(第14-74行)、listenAndServe(第76-90行)、listenAndServeTLS(第92-106行)、startServer(第108-115行)：所有source均为管理员配置项(Core.Address/Port/CertPath/CertBase64/ShutdownTimeout)，sink均为net/http与crypto/tls标准用法并带完整错误处理(第43,48,50行)；TLS强制MinVersion TLS1.2(第31行)；SSL开启但缺证书时拒绝启动(第55-56行)而非明文降级；本文件不含任何HTTP handler，用户输入不进入任何数据流。唯一瑕疵是server未设ReadHeaderTimeout(第20行nolint:gosec)，属Slowloris可用性加固建议，不可利用，不构成安全漏洞。", "fix_suggestion": "no fix needed"}
+```

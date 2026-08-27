@@ -1,0 +1,64 @@
+LANG: java
+```java
+package com.example.ghost.controller;
+
+import org.springframework.stereotype.Controller;
+import org.springframework.ui.Model;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.owasp.html.PolicyFactory;
+import org.owasp.html.Sanitizers;
+import org.jsoup.Jsoup;
+import org.jsoup.safety.Safelist;
+
+@Controller
+@RequestMapping("/admin/posts")
+public class PostHistoryController {
+
+    private final JdbcTemplate jdbc;
+    // 白名单净化器：仅允许安全文本标签，剥离所有事件属性与 javascript: 协议
+    private static final PolicyFactory HTML_POLICY = Sanitizers.FORMATTING
+            .and(Sanitizers.LINKS)
+            .and(Sanitizers.BLOCKS);
+
+    public PostHistoryController(JdbcTemplate jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    // 查看历史修订：将数据库中存储的 revision html 经白名单净化后注入模板
+    @GetMapping("/{postId}/history")
+    public String history(@PathVariable Long postId, Model model) {
+        var revisions = jdbc.queryForList(
+            "SELECT id, title, html FROM post_revisions WHERE post_id = ? ORDER BY created_at DESC", postId);
+        for (var r : revisions) {
+            String clean = Jsoup.clean((String) r.get("html"), Safelist.basic());
+            r.put("html", clean);
+        }
+        model.addAttribute("revisions", revisions);
+        return "post-history"; // Thymeleaf 模板中仍使用 th:utext="${r['html']}" 渲染，但内容已白名单净化
+    }
+
+    // 恢复修订：把 staff 用户提交的 revision html 净化后写回当前帖子的正文
+    @PostMapping("/{postId}/restore")
+    @ResponseBody
+    public String restore(@PathVariable Long postId, @RequestParam("revisionId") long revisionId) {
+        String html = jdbc.queryForObject(
+            "SELECT html FROM post_revisions WHERE id = ? AND post_id = ?", String.class, revisionId, postId);
+        // 持久化前经 OWASP Java HTML Sanitizer 白名单净化，剥离脚本/事件处理器/危险协议
+        String safeHtml = HTML_POLICY.sanitize(html);
+        jdbc.update("UPDATE posts SET html = ? WHERE id = ?", safeHtml, postId);
+        return "restored";
+    }
+}
+```
+
+1. 第 24 行 `@GetMapping("/{postId}/history")` 与第 36 行 `@RequestParam("revisionId")` 是用户可控输入点；`html` 字段来自数据库存储的任意 staff 提交内容，属于存储型不可信数据。
+2. 第 25–27 行查询保持参数化不变（SQL 注入本已防御）；第 28–31 行新增对每条修订 `html` 用 jsoup `Safelist.basic()` 白名单净化——这是框架无关的标准白名单精确允许集方案，只保留基础文本/链接/列表标签，自动剥离 `<script>`、事件属性与 `javascript:` URI，类型正确（String→String），位置在 sink（模板渲染）之前，覆盖该 GET 数据流全部输出。
+3. 第 39–41 行 restore 流：原代码把未净化的 `html` 直接持久化为帖子正文（存储型 XSS 的真正 sink 是第 42 行 UPDATE 后其他 staff 打开帖子时触发）。修复在第 40 行插入 `HTML_POLICY.sanitize(html)`，采用 OWASP Java HTML Sanitizer 的 `Sanitizers.FORMATTING.and(LINKS).and(BLOCKS)` 组合白名单，这是业界标准有效防御（非黑名单/正则）；净化发生在写入数据库之前，从源头阻断存储型 payload，覆盖所有后续读取该正文的渲染通道。
+4. 两条流均未改变函数名、路由路径、变量名与控制流，仅插入净化语句，符合 minimal diff 纪律；依赖注入与 JdbcTemplate 用法完全保持原样。
+5. 第二入口检查：restore 返回值仅为常量字符串 `"restored"`，无反射输出；history 中 `title` 字段由模板以 `th:text` 渲染（默认转义）不在本次漏洞链内，故不改动，保持局部对照性。
+6. 结论：两处 XSS sink 均已被白名单净化 API 有效拦截，无残留漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "history 流：第 28-31 行对 revisions 的 html 字段用 jsoup Safelist.basic() 白名单净化后再交给 th:utext 渲染；restore 流：第 40 行用 OWASP PolicyFactory 白名单 sanitize 后才持久化到 posts.html，存储型 XSS 在写入源头被阻断；title 字段由 th:text 默认转义，非目标链路，保持原样", "fix_suggestion": "no fix needed"}
+```

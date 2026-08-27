@@ -1,0 +1,31 @@
+# 编号分析
+
+1. **第 22–27 行**：导入 jinja2，并引入 `SandboxedEnvironment`。这是全文唯一涉及代码执行能力的库。
+
+2. **第 30–58 行 `jinja2_formatter`**：核心 sink。第 57 行 `SandboxedEnvironment().from_string(template).render(**kwargs)` —— `template` 是 source（由调用方传入的模板字符串）。防御措施是 SandboxedEnvironment。但文档字符串（第 35–37 行）和注释（第 51–56 行）均明确承认沙箱是 best-effort 而非安全保证；Jinja2 沙箱历史上存在多次逃逸（CVE-2024-22195、CVE-2024-34064、str.format / 属性链绕过等），且未限制 `SandboxedEnvironment` 的全局变量、过滤器或策略（如未使用 `ImmutableSandboxedEnvironment`、未禁用 `attr` 过滤器）。因此该防御按分析要求（黑名单式/尽力而为过滤视为可绕过）不算有效防御。
+
+3. **source→sink 数据流验证**：
+   - source：调用方传入的 `template` 参数（在 LangChain 中通常来自用户提供的 PromptTemplate 定义，如 hub 加载、序列化反序列化的 prompt 对象）。
+   - 流经路径：`DEFAULT_FORMATTER_MAPPING["jinja2"] = jinja2_formatter`（第 152 行）→ 第 57 行 render。
+   - 无任何输入校验、白名单、模板来源信任检查——仅靠沙箱这一可绕过机制。
+
+4. **第二入口与替代通道**：
+   - `_get_jinja2_variables_from_template`（第 84–94 行）：第 88 行 `env.parse(template)` 仅解析 AST，不执行渲染，无执行风险。
+   - `validate_jinja2`（第 60–81 行）：只做变量比对并 warning，不渲染。
+   - `mustache_formatter`（第 97–105 行）/ `mustache_template_vars` / `mustache_schema`：mustache 渲染为纯文本替换，无代码执行面。
+   - `check_valid_template`（第 130–155 行）、`get_template_variables`（第 158–184 行）：仅解析提取变量。
+   - `StringPromptTemplate.format_prompt`（第 200–213 行）：将 kwargs 传入 format，最终仍汇入上述 formatter；f-string 的 `formatter.format` 是标准 str.format，若 template 可控同样存在格式化攻击面，但本文件主要暴露面是 jinja2。
+
+5. **结论依据**：全文唯一的危险 sink 是第 57 行 jinja2 渲染；防御仅为官方自认不可靠的沙箱；template 来源在真实使用场景（反序列化 prompt、hub 模板）中可为不受信输入。构成 CWE-1336（模板注入导致的潜在 RCE），与上游 LangChain 官方安全通告一致（GHSA jinja2 模板注入，CVSS 高危）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine",
+  "risk_level": "high",
+  "source": "line 30: jinja2_formatter 的 template 参数, 来自调用方传入的模板字符串(可能为不受信来源)",
+  "sink": "line 57: SandboxedEnvironment().from_string(template).render(**kwargs)",
+  "explanation": "不受信的 template 字符串 -> DEFAULT_FORMATTER_MAPPING 注册的 jinja2_formatter -> 第 57 行 Jinja2 渲染。唯一防御是 SandboxedEnvironment, 但代码注释与文档字符串均承认其为 best-effort 而非安全保证; 未使用 ImmutableSandboxedEnvironment, 未限制全局变量与过滤器, 历史上存在多次沙箱逃逸 CVE, 因此视为可绕过, 可导致任意 Python 代码执行",
+  "fix_suggestion": "line 30: 禁止对不受信来源的模板启用 jinja2 格式化, 或改用 ImmutableSandboxedEnvironment 并配合自定义 SecurityPolicy 白名单(禁用 attr/globals 过滤器, 限制可用函数), 同时在加载层面对模板来源做信任校验"
+}
+```

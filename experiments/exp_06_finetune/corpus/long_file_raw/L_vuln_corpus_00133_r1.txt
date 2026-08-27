@@ -1,0 +1,31 @@
+## 编号分析（全文逐函数）
+
+1. **index()（约第 26–30 行）**：仅返回视图，`authorize('index')` 已做权限校验，无用户输入进入 sink。无漏洞。
+
+2. **create()（约第 37–44 行）**：静态视图渲染，无外部输入数据流。无漏洞。
+
+3. **store()（约第 49–105 行）**：
+   - 第 51–64 行：大量 `request()` 取值直接赋给模型属性，最终经 Eloquent `save()` 参数化写入数据库，无 SQL 注入；XSS 由 Blade 转义兜底。
+   - **第 66–75 行为关键入口**：`$request->input('clone_image_from_id')` 是完全由用户控制的 ID，第 67 行 `Accessory::select('image')->find(...)` **未做公司隔离（company_id）与 authorize 校验**，任何有创建权限的用户可指定任意租户/公司的 Accessory ID，读取其 `image` 字段并在第 72 行执行 `Storage::disk('public')->copy('accessories/'.$cloned_model_img->image, ...)`，将他人文件复制到自己的新记录中——典型的第二入口/替代通道 IDOR（CWE-639），且 `image` 字段若含 `../`（历史上传路径未严格规范化时）还可构成路径穿越复制任意公共盘文件（CWE-22）。
+
+4. **edit() / getClone()（约第 112–145 行）**：路由模型绑定 + authorize，正常；getClone 仅展示表单，本身不落盘。
+
+5. **update()（约第 152–205 行）**：字段赋值同 store，参数化保存安全；第 156–163 行 qty 验证有效；第 190–196 行 redirect_option 写 session，后续 `Helper::getRedirectOption` 内部白名单处理，风险低。
+
+6. **destroy()（约第 212–238 行）**：第 214 行先 find 再 authorize，顺序正确；**第 228–230 行** `Storage::disk('public')->delete('accessories'.'/'.$accessory->image)` —— `$accessory->image` 来自数据库，若该值在上游（store 的 clone 分支或图片上传命名）未被严格规范化而包含 `../` 序列，则构成任意文件删除 sink；同时删除动作依赖的 image 值可通过第 66–75 行的 clone 流被跨租户操纵，形成组合攻击链。
+
+7. **show()（约第 250–257 行）**：authorize 后只读视图，无漏洞。
+
+**防御有效性核查**：全文对 `clone_image_from_id`、`image` 字段没有任何公司作用域过滤、authorize 或路径规范化（basename/realpath）校验；Eloquent 参数化仅防 SQLi，不防上述逻辑漏洞。黑名单式防御不存在，但需要的防御也确实缺失。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-639 授权绕过（IDOR）/ CWE-22 路径穿越",
+  "risk_level": "中高危",
+  "source": "line 68: $request->input('clone_image_from_id') 用户可控 ID 与 line 67 查询所得的 image 字段值",
+  "sink": "line 72: Storage::disk('public')->copy('accessories/'.$cloned_model_img->image, ...) 以及 line 229: Storage::disk('public')->delete('accessories'.'/'.$accessory->image)",
+  "explanation": "攻击者在创建配件时提交任意 clone_image_from_id -> line 67 未校验目标记录的公司归属与权限 -> 读取他人 image 字段 -> line 72 将其文件复制进自己命名空间，实现跨租户文件窃取；若 image 值含 ../ 且上游未规范化，line 72 的 copy 与 line 229 的 delete 还可实现公共盘内路径穿越读写删。",
+  "fix_suggestion": "line 67: 查询改为 Accessory::select('image')->where('company_id', auth()->user()->company_id)->findOrFail(...) 并补充 authorize 校验；line 72 与 line 229: 对 image 先取 basename() 并用 realpath 确认落在 accessories 目录内后再执行 copy/delete"
+}
+```

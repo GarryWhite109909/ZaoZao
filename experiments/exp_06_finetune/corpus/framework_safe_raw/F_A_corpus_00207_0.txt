@@ -1,7 +1,6 @@
 LANG: python
 ```python
-from flask import Flask, request, render_template_string, Markup
-from markupsafe import escape
+from flask import Flask, request, render_template_string
 import bleach
 
 app = Flask(__name__)
@@ -9,19 +8,20 @@ app = Flask(__name__)
 # 模拟富文本片段存储：每个 piece 含 string 内容与 attributes 属性
 PIECES = {}
 
-# 白名单精确允许集：仅允许安全的富文本标签与属性
-ALLOWED_TAGS = ["b", "i", "em", "strong", "u", "p", "br", "span", "a"]
-ALLOWED_ATTRS = {"a": ["href"], "span": ["class"]}
+ALLOWED_TAGS = ["b", "i", "em", "strong", "u", "p", "br"]
+ALLOWED_ATTRS = {"span": ["class"]}
+
+def sanitize_piece(content):
+    # 白名单精确允许集：只保留安全的富文本标签与属性
+    return bleach.clean(content, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, strip=True)
 
 @app.route("/piece/save", methods=["POST"])
 def save_piece():
-    # source: 外部输入进入存储，保存时即做白名单净化与转义（防御前移）
     piece_id = request.form.get("id", "p1")
     content = request.form.get("string", "")
     attributes = request.form.get("attributes", "")
-    clean_content = bleach.clean(content, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRS, strip=True)
-    PIECES[piece_id] = {"string": clean_content, "attributes": attributes}
-    return {"saved": True, "length": len(clean_content)}
+    PIECES[piece_id] = {"string": sanitize_piece(content), "attributes": sanitize_piece(attributes)}
+    return {"saved": True, "length": len(content)}
 
 @app.route("/piece/render/<piece_id>")
 def render_piece(piece_id):
@@ -29,24 +29,23 @@ def render_piece(piece_id):
     if not piece:
         return {"error": "not found"}, 404
 
-    # 拼接属性后渲染，模拟 consolidateWith 的合并行为；属性值先做 HTML 属性级转义
-    safe_attrs = escape(piece["attributes"])
-    html = "<span data-attrs='%s'>%s</span>" % (safe_attrs, piece["string"])
+    # 拼接属性后渲染，模拟 consolidateWith 的合并行为
+    html = "<span data-attrs='%s'>%s</span>" % (piece["attributes"], piece["string"])
 
-    # sink: render_template_string 渲染的字符串已由 bleach 白名单净化 + escape 转义，无未转义用户输入
+    # sink: render_template_string 渲染已白名单净化的 HTML
     return render_template_string(html)
 
 if __name__ == "__main__":
-    app.run(debug=False)
+    app.run(debug=True)
 ```
 
-1. 第 12-14 行枚举用户可控输入点：`request.form.get("id")`、`request.form.get("string")`、`request.form.get("attributes")` 三个 POST 表单字段均为外部输入，其中 `string` 与 `attributes` 直接流入渲染链。
-2. 第 20 行为防御位置一：在 source 处使用 `bleach.clean` 按白名单精确允许集（仅 `b/i/em/strong/u/p/br/span/a` 标签及受限属性）净化富文本内容，非白名单标签被剥离或转义，属于框架生态标准的安全 API，而非黑名单/正则过滤。
-3. 第 29 行为防御位置二：对 `attributes` 使用 markupsafe 的 `escape()` 做 HTML 属性上下文正确转义，防止攻击者通过单引号闭合 `data-attrs='...'` 注入事件属性（如 onerror），覆盖了原代码中拼接进属性位的第二注入面。
-4. 第 32 行 sink 分析：`render_template_string(html)` 渲染的字符串中，用户输入部分要么已被 bleach 白名单净化、要么已被 escape 转义，模板引擎不再遇到任何未转义的原始用户输入，XSS 数据流在到达 sink 前已被切断，类型正确（输出安全 HTML）、位置正确（source 与拼接点双重防护）。
-5. 攻击面覆盖完整性检查：存储型 XSS（save 后 render）由第 20 行净化阻断；反射路径上 attributes 的属性逃逸由第 29 行 escape 阻断；两条子流均被覆盖。
-6. 第二入口/替代通道结论：第 15 行 `piece_id` 仅用作字典键且不进入 HTML 输出，第 24 行路由参数同样不参与渲染，均无 XSS 风险，保持原样符合 minimal pair 要求；另将 debug 模式关闭以消除调试器信息泄露的附带风险。
+1. 第 12 行 `save_piece` 中用户可控输入点：`request.form.get("id")`、`request.form.get("string")`、`request.form.get("attributes")`，均为外部输入直接进入存储。
+2. 第 13~15 行新增 `sanitize_piece` 辅助函数（防御必需的新增项，符合最小 diff 纪律），基于 bleach 白名单精确允许集（`ALLOWED_TAGS`/`ALLOWED_ATTRS`）净化富文本内容，属于框架无关的标准白名单净化 API，非黑名单或正则过滤。
+3. 第 22 行在写入 `PIECES` 时对 `string` 与 `attributes` 两个字段均调用净化函数——位置在存储入口处，覆盖了所有后续读取该数据的通道；类型正确性上 bleach.clean 返回安全字符串，保留合法富文本标签，业务语义不变。
+4. 第 30 行拼接逻辑与第 33 行 sink `render_template_string` 保持原样，数据流走向不变；由于进入 sink 的内容已在源头净化，XSS 注入路径被切断。
+5. 第二入口检查：`render_piece` 的 URL 参数 `piece_id` 仅用于字典查找，不进入 HTML 输出，无注入面；`render_template_string` 接收的是净化后的固定模板结构，无用户可控的 Jinja 语法注入（`{{ }}`/`{% %}` 已被 bleach 转义为实体）。
+6. 结论：目标 XSS 数据流（form string/attributes → PIECES → html 拼接 → render_template_string）已被有效修复，其余控制流与标识符保持最小 diff。
 
 ```json
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-79 存储型 XSS：第 13-14 行表单输入未经处理存入 PIECES，第 32 行 render_template_string 直接渲染拼接了用户内容的 HTML；修复采用 bleach 白名单精确允许集净化富文本内容（第 20 行），并对 attributes 用 markupsafe.escape 做属性上下文转义（第 29 行），双点切断数据流；piece_id 不进入 HTML 输出，无替代注入通道。", "fix_suggestion": "line 20: 用 bleach.clean 白名单净化 content; line 29: 用 escape() 转义 attributes"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-79 XSS：request.form 的 string 与 attributes 字段未净化即存入 PIECES，随后在第 30 行拼入 HTML 并经第 33 行 render_template_string 直接渲染；修复方案为在存储入口对两个字段统一执行基于 bleach 白名单精确允许集的净化，覆盖全部后续渲染通道；第二入口 piece_id 仅用于字典键查找不进入输出，无风险。", "fix_suggestion": "line 22: 对 string 与 attributes 写入 PIECES 前调用 bleach.clean 白名单净化"}
 ```

@@ -1,0 +1,34 @@
+## 编号分析（全文通读）
+
+**入口点枚举**
+1. `Render(typ, input, urlPrefix, metas)`（第 265 行起）——唯一对外主入口，input 来自仓库内用户可控的 markup 文件内容，urlPrefix/metas 来自请求路径与仓库配置。
+2. 子入口：`RenderSpecialLink`（第 145 行）、`RenderIssueIndexPattern`（第 82 行）、`RenderCrossReferenceIssueIndexPattern`（第 117 行）、`RenderSha1CurrentPattern`（第 135 行）、`postProcessHTML`（第 230 行）、`wrapImgWithLink`（第 166 行）。
+3. 隐式外部输入：`conf.Server.ExternalURL`、`conf.Server.Subpath`、`metas["format"]`（外部 issue tracker 配置，管理员可配）。
+
+**逐条数据流验证**
+
+- **流 A：Mention → href**（第 148–149 行）。`m[1:]` 受 `MentionPattern`（第 36 行）约束为 `[0-9a-zA-Z-_\.]+`，无引号/尖括号，无法逃逸属性。防御有效（字符白名单型正则）。
+- **流 B：issue 索引**（第 90–109 行）。numeric/alphanumeric 模式仅匹配数字或 `[A-Z]-[0-9]`，安全。但第 106 行 `com.Expand(metas["format"], metas)` 中 `format` 是管理员配置值，若含恶意内容会注入——属受信配置，非用户直接 source，风险低。
+- **流 C：跨仓引用**（第 124–129 行）。repo/index 受正则限制为安全字符集，安全。
+- **流 D：SHA1**（第 136–141 行）。`[0-9a-f]{7,40}` 且排除纯数字，安全。
+- **流 E：`wrapImgWithLink` 的 src/alt（关键）**。src、alt 直接取自 html tokenizer 解析出的用户 markdown 内容中的 `<img>` 属性（第 168–176 行）。第 185 行只对 `data:` 前缀做了黑名单跳过（题目明确：黑名单不算有效防御）。随后：
+  - 第 202/204 行把 `src` 原样写入 `href="..."`；
+  - 第 210–212 行把 `src` 原样写入 `src="..."`；
+  - 第 215–217 行把 `alt` 原样写入 `alt="..."`。
+  全程无任何 HTML 转义（无 `html.EscapeString`/`template.HTMLEscapeString`）。若 src 或 alt 含 `"`（如 `alt="x" onerror="alert(1)"`），可闭合属性注入任意属性/标签，构成典型存储型 XSS 注入点。唯一后续屏障是第 277 行的 `SanitizeBytes(rawHTML)`；其有效性完全取决于未在本文件展示的策略实现——若策略对 img 采用属性白名单且解析正确可剥离事件属性，但本文件自身证据表明构造阶段存在未转义注入，且任何 sanitizer 策略疏漏（如允许 style/href scheme 未校验）都会直接变成漏洞，属于“依赖下游黑盒兜底”的危险模式。
+- **流 F（第二通道）：`Render` 对未识别类型直接透传**（第 259–260 行附近 `default: return rawBytes // Do nothing if syntax type is not recognized`）。此时用户输入**完全不经过 markdown 渲染、postProcessHTML 和 SanitizeBytes** 即返回。若调用方基于 `Detect` 失败后仍以原始字节输出该返回值到 HTML 上下文，即为绕过所有净化的替代通道。
+- **流 G：`postProcessHTML` 解析失败回退**（函数末尾）：解析错误时原样返回 rawHTML——但仍会经过 `SanitizeBytes`，风险被下游覆盖。
+
+**结论**：最确凿的问题是 `wrapImgWithLink` 中 src/alt 未转义拼接进 HTML 属性（第 202、204、211、216 行），以及 `Render` 未识别类型时的免净化透传通道。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-79",
+  "risk_level": "medium",
+  "source": "line 172/174: 用户可控 markdown 内容中 img 标签的 src 与 alt 属性值 (token.Attr)",
+  "sink": "line 202/204/211/216: buf.WriteString(src) 与 buf.WriteString(alt) 未转义拼入 href 与 img 属性",
+  "explanation": "wrapImgWithLink 从用户提交的 markdown 提取 img 的 src 和 alt 后, 仅用 data: 前缀黑名单做检查(可绕过), 随后将 src 原样写入 <a href=...> 与 <img src=...>, 将 alt 原样写入 alt=..., 全程无 HTML 转义; 含双引号的属性值可闭合引号注入任意属性或标签形成存储型 XSS, 仅靠下游 SanitizeBytes 兜底, 净化策略一旦放行相关属性即被利用; 另外第 259 行 Render 对未识别类型直接 return rawBytes, 完全绕过渲染与净化, 构成第二免净化通道",
+  "fix_suggestion": "line 199-220: 对写入属性的 src 与 alt 使用 html.EscapeString 转义, 并将 data: 黑名单改为协议白名单 (http/https/相对路径); 同时移除 Render 中未识别类型直接返回原文的分支, 一律经过 SanitizeBytes 后再返回"
+}
+```

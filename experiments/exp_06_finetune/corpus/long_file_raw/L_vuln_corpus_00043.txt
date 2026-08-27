@@ -1,0 +1,33 @@
+## 编号分析
+
+1. **第 1–20 行（常量与规则表）**：定义引用前缀与 `RefRevParseRules`，无输入处理，无风险。
+
+2. **第 60–90 行（构造函数 NewBranchReferenceName 等）**：直接字符串拼接，不做校验——校验责任被推迟到调用方调用 `Validate()`。这意味着任何绕过 `Validate()` 的路径都构成 source→sink 流。
+
+3. **第 100–112 行（Short）**：`fmt.Sscanf` 循环逻辑有缺陷（无论 err 与否都继续），属正确性 bug，非安全漏洞。
+
+4. **第 130–190 行（Validate 主体）**：逐条核对 git-check-ref-format 规则：
+   - 规则 4：控制字符由第 118 行正则 `[\000-\037\177]` 覆盖，空格等在第 165 行 `ContainsAny(part, "~^:?*[ \t\n")` 覆盖——但注意 `\t\n` 已被控制字符正则覆盖，冗余无害；
+   - 规则 6、7、8、9、10 均实现正确。
+
+5. **关键缺陷（第 168–170 行）**：
+   ```go
+   if (isBranch || isTag) && strings.HasPrefix(part, "-") && (i == 2) {
+   ```
+   以 `-` 开头的组件检查**仅当**该名字是 branch/tag 且仅检查索引为 2 的那一段。对于其他类型引用（如 `refs/remotes/<remote>/...`、notes、或任意多级名），任何一段都可以以 `-` 开头，例如 `refs/remotes/--upload-pack=x/foo` 能通过 `Validate()`。这正是上游 go-git 的真实漏洞（GHSA-r5c7-7j9c-qfh9 / CVE-2025-21613 类）：经 `Validate()` 校验的引用名被传给底层 git 命令（如 fetch 的 refspec / `--upload-pack` 等选项注入点）时，以 `-` 开头的段会被解析为命令行选项，造成参数注入。防御有效性判定：现有过滤对 branch/tag 的第三段有效，但对第二入口（remote 引用、其他前缀）完全失效，属于可绕过的不完整黑名单。
+
+6. **第二入口核查**：`NewReferenceFromStrings`（第 180 行起）从磁盘 packed-refs/loose ref 文件读取内容构造引用，若仓库数据来自不可信来源（克隆的恶意仓库），恶意引用名同样流入 sink；`Validate()` 是唯一防线且存在上述缺口。
+
+7. **结论**：全文证据支持存在一个真实的引用名校验绕过 → 命令行参数注入漏洞，风险取决于调用方是否将引用名传入外部 git 进程（go-git 中确实如此）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-88 参数注入 / CWE-20 输入校验不完整",
+  "risk_level": "高",
+  "source": "line 60-90: NewBranchReferenceName/NewRemoteReferenceName 等拼接外部传入的名称, 以及 line 180 NewReferenceFromStrings 从不可信仓库文件读取的引用名",
+  "sink": "line 168-170: Validate 中仅对 isBranch||isTag 且 i==2 的部分做 - 前缀检查",
+  "explanation": "外部可控的引用名 -> Validate() -> 以 - 开头的段在非 branch/tag 类型(如 refs/remotes/--upload-pack=x/foo)或多级名的其他位置不被拒绝 -> 校验通过后被上层用于构造 git 子命令参数(refspec/选项) -> 攻击者注入 --upload-pack 等选项导致命令执行或参数注入",
+  "fix_suggestion": "line 168: 将检查改为对所有部分生效, 即去掉 isBranch/isTag 与 i==2 条件, 对任意 part 检查 strings.HasPrefix(part, '-') 并返回 ErrInvalidReferenceName"
+}
+```

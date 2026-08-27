@@ -1,0 +1,38 @@
+## 编号分析
+
+1. **第 33-38 行 `index()`**：仅 `authorize('view', Asset::class)`，无用户数据流入 sink，安全。
+
+2. **第 51-58 行 `create()`**：`request('asset_id')` 仅用于 `Asset::find` 查询并传入视图（select2 预选），Eloquent 参数化查询，无注入；视图输出依赖 Blade 转义。低风险但注意 `asset_ids` 类似反射点。
+
+3. **第 68-113 行 `store()`**：
+   - source：`$request->input('selected_assets')`（第 74 行）→ `Asset::whereIn`（参数化，安全）。
+   - 第 77 行对每个资产做 `Company::isCurrentUserHasAccess($asset)` 公司隔离检查——有效防御多租户越权创建。
+   - 但 `supplier_id`、`responsible_party_id`、`maintenance_type_id` 等外键（第 81-99 行）未校验是否属于当前公司/合法范围，存在跨公司引用的横向越权隐患（可指向其他公司的供应商/联系人）。
+   - `notes`、`name`、`url` 直接入库（第 84-87 行），若列表/详情视图存在 `{!! !!}` 或 JS 渲染则为存储型 XSS 面（Snipe-IT 历史上多次出现此类问题），本文件内无法确认 sink，需结合视图证据。
+   - 文件上传经 `validateUploadedFiles()` + `UploadFileRequest` 规则校验后由 `handleFile` 处理，路径由服务端生成，未见直接漏洞。
+
+4. **第 121-133 行 `edit()`**：有双重 `authorize`（含 `$maintenance->asset` 的策略，Snipe-IT 资产策略含公司隔离），防御有效。`request()->input('asset_ids', [])` 传入视图为潜在反射点，取决于视图转义。
+
+5. **第 141-166 行 `update()`**：与 edit 相同的双重授权，防御有效；字段赋值同 store，同样存在外键归属未校验问题。
+
+6. **第 172-200 行 `storeUploadedFiles()` / `validateUploadedFiles()`**：存储路径来自硬编码映射 `self::$map_storage_path['maintenances']`，文件名由 `handleFile` 服务端生成，非用户可控路径拼接，安全。
+
+7. **第 205-227 行 `complete()`**：source `$request->input('note')` → `Actionlog->note` 入库；授权只查了 `$maintenance->asset` 的 update 策略（该策略含公司检查），基本有效；note 存储型 XSS 取决于日志视图转义。
+
+8. **第 238-249 行 `destroy()`**：双重 authorize，有效。
+
+9. **第 259-263 行 `show()` —— 关键缺陷**：**完全没有调用 `$this->authorize(...)` 或任何公司隔离检查**。任何已认证的低权限用户可通过遍历 maintenance ID 直接查看任意公司/任意资产的维保记录（含成本、备注、供应商等敏感信息）。对比同文件所有其他写操作均有 authorize，此处是明显的遗漏，构成 CWE-639/CWE-862 授权缺失导致的 IDOR。
+
+10. **第二入口核查**：路由级中间件（auth）不能替代对象级授权；`Maintenance` 若未在模型中加公司全局作用域，show 的越权无法被其他层缓解。store 中 `selected_assets` 已有公司检查，故主要漏洞集中在 show() 缺失授权及各处外键归属未校验。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-862 / CWE-639",
+  "risk_level": "high",
+  "source": "line 259: show(Maintenance $maintenance) 通过路由模型绑定接收用户可控的 maintenance ID",
+  "sink": "line 262: return view('maintenances.view')->with('maintenance', $maintenance) 未做任何授权直接渲染敏感数据",
+  "explanation": "show 方法是全文唯一没有调用 this->authorize 的动作方法，缺少对象级授权和公司(多租户)隔离检查 -> 任意已登录低权限用户可枚举 maintenance id 查看其他公司资产的维保记录(成本/备注/供应商) -> 对比同文件 store/edit/update/destroy 均有 authorize 可证实这是遗漏而非设计",
+  "fix_suggestion": "line 260: 在 show 开头补充 $this->authorize('view', Asset::class); 和 $this->authorize('view', $maintenance->asset); 与 edit/update 保持一致"
+}
+```

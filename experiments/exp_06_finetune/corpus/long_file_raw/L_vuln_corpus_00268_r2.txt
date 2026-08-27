@@ -1,0 +1,55 @@
+# MoonrakerLDAP 组件安全分析
+
+## 一、文件结构与入口点枚举（全文通读）
+
+本文件共约 110 行，包含三个主要部分：
+
+1. **`MoonrakerLDAP.__init__`（第 24–62 行）**：配置初始化入口。source 为 `ConfigHelper` 读取的配置项：`ldap_host`(第 27 行)、`ldap_port`(第 28 行)、`ldap_secure`(第 29 行)、`base_dn`(第 30–31 行)、`group_dn`(第 32–35 行)、`bind_dn`/`bind_password`(第 38–45 行)、`user_filter`(第 46–54 行)。这些均来自 moonraker.conf 配置文件，属于**受信管理员输入**，但注意 `gettemplate().render()` 支持模板变量，可间接引用运行时值。
+2. **`authenticate_ldap_user`（第 64–69 行）**：异步入口，接收外部传入的 `username, password`，通过事件循环线程池调用 `_perform_ldap_auth`。这是真正的攻击面 source——username/password 来自 HTTP 登录请求（由上游 auth 组件调用）。
+3. **`_perform_ldap_auth`（第 71–101 行）**：核心 sink 所在，构造 LDAP 过滤器并执行 search/rebind。
+4. **`_validate_group`（第 103–114 行）**：仅做成员组比对，无注入 sink。
+5. **`load_component`（第 117–118 行）**：组件加载钩子，无用户输入。
+
+## 二、逐条 source→sink 数据流验证
+
+### 数据流 1：username → LDAP 过滤器字符串拼接（关键漏洞）
+
+- **source**：第 64 行 `async def authenticate_ldap_user(self, username, password)` 的 `username` 参数，来自登录 API 请求体，攻击者完全可控。
+- **传播路径**：第 69 行原样传入 `_perform_ldap_auth(username, password)`；第 77 行进入函数体。
+- **sink A（第 78 行）**：`ldfilt = f"(&(objectClass=Person)({attr_name}={username}))"` —— username 被 f-string 直接内插进 LDAP 搜索过滤器，**无任何转义**。
+- **sink B（第 80 行）**：`ldfilt = self.user_filter.replace("USERNAME", username)` —— 即使管理员配置了自定义过滤器，替换逻辑同样是裸文本替换，未转义。
+- **防御有效性核查**：
+  - 全文搜索：不存在对 `username` 的任何过滤、白名单校验或 `ldap3.utils.conv.escape_filter_chars()` 调用（ldap3 提供了该转义函数但未被使用）。
+  - 第 50–53 行的检查 `"USERNAME" not in self.user_filter` 只是确保模板含占位符，与注入防护无关。
+  - 第 82–84 行的 `try/except LDAPExceptionError` 只捕获异常改变报错文案，不阻止恶意过滤器执行。
+  - 结论：**黑名单/正则类防御完全缺失，非有效防御**。
+
+### 可利用性验证（第二入口与替代通道）
+
+- **认证绕过**：若 LDAP 服务器允许匿名/弱绑定查询（`bind_dn` 未配置时 conn_args 中 user=None，即匿名 bind，见第 73–76 行），攻击者可提交 `username = "*"` 或 `x)(uid=*))(|(uid=x`，使过滤器变为 `(&(objectClass=Person)(uid=*))` 匹配任意用户；随后第 88 行 `conn.rebind(user.entry_dn, password)` 虽需正确密码，但在某些目录服务中配合 OR 注入（如 `*)(|(objectClass=*`）可返回攻击者已知 DN 的条目，进而用已知口令 rebind 冒充他人。
+- **信息泄露 / 盲注**：通过第 83–85 行的错误分支差异（"Not Found" vs "Invalid Username or Password"，第 86 vs 100 行），攻击者可用布尔盲注逐字符探测目录内容（如 `admin)(memberOf=cn=admins...` 是否命中），枚举有效用户名与组成员关系。
+- **DoS 替代通道**：构造超长或复杂过滤器造成目录服务器全表扫描。
+- **password 流核查**：password 仅在第 88 行 `rebind(user.entry_dn, password)` 和第 94 行作为连接凭据使用，不进入过滤器字符串，**无注入风险**（但注意第 90 行日志不含密码，无凭据泄露）。
+- **user.entry_dn 流核查**：第 88 行将服务器返回的 `entry_dn` 作为 rebind DN——DN 来自服务器响应而非直接用户输入，属二阶注入的理论通道，但实际可控性低，主要风险仍是过滤器注入。
+- **配置侧核查**：`base_dn`/`group_dn` 等经 render 后直接作为 search 参数（第 87 行）与比较值（第 109 行），因来源为管理员配置，风险等级低，但若配置模板引用了请求级变量则同样可被污染（moonraker 模板默认不支持请求上下文，此处判定为低风险）。
+
+### 其他检查项
+
+- 第 65–68 行 `asyncio.Lock` 保证串行化，无线程安全问题；`run_in_thread` 阻塞操作已卸载到线程池，无事件循环阻塞问题。
+- 无 SQL/命令/路径 sink；无反序列化；无环境变量读取。
+
+## 三、结论
+
+唯一确认漏洞为 **LDAP 注入（CWE-90）**：外部可控的 `username` 未经 `escape_filter_chars` 转义即拼入第 78/80 行的搜索过滤器，可导致认证绕过、用户枚举与盲注信息泄露。修复方式是使用 `ldap3.utils.conv.escape_filter_chars(username)` 对两处插值点转义。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-90: LDAP Injection",
+  "risk_level": "High",
+  "source": "line 64: authenticate_ldap_user 的 username 参数，来自登录请求，攻击者完全可控",
+  "sink": "line 78 与 line 80: ldfilt = f-string 直接内插 username，以及 self.user_filter.replace('USERNAME', username) 裸替换",
+  "explanation": "username 从第 64 行入口未经任何转义或校验，经第 69 行传入 _perform_ldap_auth，在第 78 行被 f-string 拼入 LDAP 搜索过滤器，或在第 80 行通过 replace 拼入自定义过滤器；全文未调用 ldap3.utils.conv.escape_filter_chars，也无白名单或正则防御；第 82-84 行的异常捕获仅改写错误文案不阻断注入。攻击者可通过通配符或括号闭合构造任意过滤器，结合第 73-76 行可能的匿名 bind 实现认证绕过，并利用第 86 行与第 100 行不同错误消息进行布尔盲注枚举用户与组成员",
+  "fix_suggestion": "在 line 78 与 line 80 使用 ldap3.utils.conv.escape_filter_chars(username) 对用户名转义后再拼入过滤器，例如 ldfilt = f'(&(objectClass=Person)({attr_name}={escaped}))'，同时对自定义 user_filter 的 USERNAME 替换值同样转义"
+}
+```

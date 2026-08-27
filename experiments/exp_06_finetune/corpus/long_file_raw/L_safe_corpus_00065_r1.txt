@@ -1,0 +1,54 @@
+# B64 Markdown 扩展安全分析（全文逐函数审计）
+
+## 一、整体架构与入口点枚举
+
+本文件是一个 Python-Markdown 扩展（`pymdown-extensions` 生态中的 b64 扩展），无 HTTP 路由、无环境变量读取、无回调注册。其全部入口点如下：
+
+1. **配置入口**：`B64Extension.__init__`（约第 96–110 行）定义三个配置项 `base_path` / `root_path` / `restrict_path`，由调用方（文档构建者）传入，属于受信任的构建时配置，非不可信用户输入。
+2. **Markdown 文本入口**：`B64Postprocessor.run`（第 84–91 行）接收渲染后的 HTML 文本。若宿主应用将最终用户提供的 Markdown 直接送入该扩展，则 `<img src="...">` 中的路径即为不可信 source。
+3. **文件系统入口**：`repl_path` 中 `open(file_name, "rb")`（第 66 行附近）为唯一 sink——任意文件读取并 base64 内嵌。
+4. **辅助模块**：`util.parse_url` / `util.url2path` 为外部依赖（未在本文给出），只能按其契约推断：返回 `(…, is_url, is_absolute)` 等字段。
+
+## 二、核心数据流验证：source → sink
+
+### 流 1：相对路径 img → open
+
+- **source**：`RE_TAG_LINK_ATTR` 捕获 `src="..."` 的值（第 47–54 行正则）。
+- **处理**：`util.parse_url` 判定非 URL 后经 `url2path` 转本地路径；`is_absolute=False` 时执行 `os.path.normpath(os.path.join(base_path, path))`（第 39 行附近）。
+- **防御**：`restrict_path=True` 时计算 `os.path.abspath(file_name)` 并要求以 `root_path + os.sep` 开头（第 43–46 行）。关键点：
+  - `normpath` 已消除 `..` 相对穿越；
+  - 前缀检查附加了 `os.sep`，注释明确说明防止 `/x/docs` 与 `/x/docs_evil` 这类兄弟目录前缀混淆——这是对经典 startswith 绕过的正确修复；
+  - `abspath` 在前缀检查之前完成，检查对象是规范化后的绝对路径，无法通过符号链接以外的手段绕过（symlink 属于部署层问题，且 `os.path.exists`/`open` 不跟随检查后的替换，路径即打开路径）。
+- **sink**：仅当扩展名命中 `file_types` 白名单（png/jpg/gif/svg，第 12–17 行）才读文件。白名单同时限制了可泄露文件的类型。
+- **结论**：防御有效，无法构造穿越到 root_path 之外的读取。
+
+### 流 2：绝对路径 img → open
+
+- `is_absolute=True` 时直接 `os.path.normpath(path)`（第 37 行附近），随后同样进入 restrict_path 的 abspath + sep 前缀检查。绝对路径如 `/etc/passwd` 会因不以 root_path 开头被拒；`file:///etc/passwd` 形式由 `parse_url` 的 `is_url` 分支拦截（is_url 时 path 保持 URL 形态，不会拼成本地可存在路径，或仍受 restrict 检查约束）。Windows 盘符形式 `RE_SLASH_WIN_DRIVE`（第 22 行）虽在本文件定义但此处未见使用（属 util 层职责），即便传入也走同一 restrict 检查。
+- **结论**：与流 1 共享同一有效防御。
+
+### 流 3：URL 形式（http/https/data）
+
+- `is_url=True` 时不做本地转换；`os.path.exists(url字符串)` 几乎必然为 False，不触发 open。即使构造畸形 URL 使 exists 通过，仍需先过 restrict_path 前缀检查。
+- **结论**：无 sink 触达。
+
+### 流 4：restrict_path=False 的显式降级
+
+- 若调用方主动设置 `restrict_path=False`，则任意本地图片文件可被内嵌。但这是文档中明示的配置语义（"Restrict B64 paths such that they are under the base path"），属于功能开关而非漏洞；且扩展典型用于静态站点生成（MkDocs 等），base_path 由站点作者控制。
+
+## 三、第二入口与替代通道核查
+
+- **HTML 注入面**：`RE_TAG_HTML` 仅匹配 `<img>` 标签（第 25–44 行），`script/style/注释` 被 avoid 组跳过。src 值被强制包裹在引号内捕获（`"[^"]*"` 或 `'[^']*'`），无法通过引号逃逸注入额外属性或标签——输出仅替换 src 内容为 data URI，不引入新 HTML 结构。
+- **异常通道**：第 71–72 行裸 `except Exception: pass`，失败时原样返回 link，fail-safe 方向正确（拒绝而非放行）。
+- **编码侧信道**：b64 输出经 `.decode('ascii')`，无格式化字符串注入；`format` 仅填充固定模板。
+- **DoS 面**：大文件会被整读进内存并内嵌，但受图片扩展名白名单限制，属可用性小问题而非安全漏洞。
+- **SVG 注意点**：svg 以 `data:image/svg+xml;base64` 内嵌后，浏览器上下文中 SVG 可含脚本——但这取决于宿主站点的 CSP/沙箱策略，且文件本身来自受限目录内的可信资产，不构成本代码层面的注入漏洞。
+- **root_path 为空时的回退**：`run` 中 `root_path = base_path if not root_path else os.path.abspath(root_path)`（第 86 行附近），默认始终有 restrict 根，不存在“空根导致全盘可读”的缺口。
+
+## 四、结论汇总
+
+全部 source→sink 数据流均经过「normpath → abspath → 带 os.sep 的前缀白名单检查 → 扩展名白名单」四重防御，黑名单式绕过不适用（这里是正向白名单）；第二入口（URL 形式）、替代通道（属性注入、异常路径）均已核查无绕过。唯一风险是 restrict_path=False 的显式降级选项和 SVG 内嵌的下游脚本风险，均属配置/部署责任，非本代码缺陷。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文审计所有入口点：img src 属性是唯一不可信 source，open 是唯一 sink。每条数据流均经过 normpath 消除相对穿越、abspath 加带 os.sep 前缀的白名单检查（已防兄弟目录前缀绕过）、以及 png/jpg/gif/svg 扩展名白名单四重防御；URL 形式输入不触达本地文件 sink；引号强制的属性捕获杜绝 HTML 注入；异常路径 fail-safe 返回原文。restrict_path=False 为文档明示的功能开关，SVG 内嵌的脚本风险属部署层 CSP 责任，均不构成本代码漏洞。", "fix_suggestion": "no fix needed"}
+```

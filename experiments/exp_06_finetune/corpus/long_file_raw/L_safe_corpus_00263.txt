@@ -1,0 +1,19 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：插件通过 gRPC/dbplugin 接口暴露五个入口：`Initialize`（第 88 行，接收 `req.Config` 中的 `username_template`、`password_authentication`、连接配置）、`UpdateUser`（第 122 行，含 `changeUserPassword` 第 137 行与 `changeUserExpiration` 第 187 行）、`NewUser`（第 224 行）、`DeleteUser`（第 285 行，分 `defaultDeleteUser` 第 313 行 / `customDeleteUser` 第 296 行）。无 HTTP 路由、文件读取或环境变量入口。
+
+2. **source→sink 流验证**：
+   - **SQL 执行 sink**：所有查询最终走 `dbtxn.ExecuteTxQueryDirect` / `ExecuteDBQueryDirect`，其机制是把 `{{name}}`、`{{password}}` 等占位符做**字符串替换**后直接执行（非参数化）。
+   - **流 A：管理员配置的 Statements**（第 139、205、258、300 行）：creation/revocation/password 语句由 Vault 管理员在角色配置中设定，属于受信任配置，模板注入是其设计功能，不构成漏洞。
+   - **流 B：username**：`defaultDeleteUser` 中 schema 与 username 均经 `dbutil.QuoteIdentifier` 转义后拼接（第 332–357 行），防御有效；存在性检查用参数化 `$1`（第 155、320 行）。自定义删除语句中的 `{{name}}` 替换依赖管理员配置，同流 A。
+   - **流 C：password**：由 Vault 内部生成随机值，且 SCRAM 模式下先哈希（第 165、247 行）；明文密码经 `secretValues()`（第 382 行）脱敏。密码本身不含用户可控内容。
+   - **流 D：expiration**：由服务端时间格式化产生（第 203 行），不可控。
+   - **流 E：DisplayName/RoleName 进入用户名**（第 231 行）：默认模板截断至 8 字符并包裹于双引号中；理论上含双引号的 DisplayName 可破坏引号，但该值在上游 Vault 核心层已做字符清洗后才传入插件，且模板本身由管理员配置——在本文件信任边界内无可利用输入。
+
+3. **第二入口/替代通道检查**：`containsMultilineStatement`（第 395 行）仅影响语句切分方式，正则提取引号字符串失败时保守返回 false，不影响安全边界。`Initialize` 中模板先试运行校验（第 106 行）。未发现绕过通道。
+
+4. **结论**：所有动态拼接点要么使用 `QuoteIdentifier` 有效转义，要么数据源为受信任的管理员配置/内部生成值，符合数据库插件的信任模型。全文未见可被外部攻击者触达的注入路径。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文五个入口(Initialize/UpdateUser/NewUser/DeleteUser及内部函数)。所有SQL执行均经由占位符字符串替换的ExecuteTxQueryDirect, 但替换值来源均为受信任方: 管理员配置的Statements属设计功能; 默认删除路径中schema与username均经dbutil.QuoteIdentifier转义(第332-357行); 存在性检查使用参数化$1(第155/320行); password为内部随机生成且SCRAM模式下哈希处理并由secretValues脱敏; expiration由服务端格式化生成。DisplayName进入用户名的路径在上游核心层已被清洗, 且模板由管理员配置。黑名单类过滤不存在, 未发现可绕过缺陷。", "fix_suggestion": "no fix needed"}
+```

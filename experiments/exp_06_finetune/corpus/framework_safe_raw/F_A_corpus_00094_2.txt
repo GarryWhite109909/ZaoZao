@@ -1,0 +1,83 @@
+LANG: java
+```code
+package com.example.devproxy;
+
+import org.springframework.boot.web.servlet.server.ServletWebServerFactory;
+import org.springframework.http.*;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.messaging.handler.annotation.MessageMapping;
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.*;
+
+import javax.servlet.http.HttpServletRequest;
+import java.net.URI;
+import java.util.Set;
+
+@Controller
+public class ProxyController {
+
+    // 用户在配置文件中指定的代理目标，例如 application.yml: proxy.target=http://localhost:8081
+    @Value("${proxy.target}")
+    private String proxyTarget;          // source: 外部可控的代理目标
+
+    // 防御：部署时通过配置注入的精确白名单，只允许转发到显式登记的上游目标
+    @Value("${proxy.allowed-targets}")
+    private Set<String> allowedTargets;  // fix: 精确允许集（白名单）
+
+    private final RestTemplate restTemplate = new RestTemplate(new SimpleClientHttpRequestFactory());
+
+    // 宽泛的 catch-all 路由：拦截除静态资源外的所有请求并转发到 proxyTarget
+    @RequestMapping(value = "/{path:(?!static).*}", method = {RequestMethod.GET, RequestMethod.POST})
+    public ResponseEntity<byte[]> forward(HttpServletRequest request, @PathVariable String path) {
+        URI upstream = URI.create(proxyTarget + "/" + path);   // sink: 转发前必须校验目标
+        if (!mayProxy(path) || !isAllowedTarget(upstream)) {   // fix: 白名单精确匹配后才放行
+            return ResponseEntity.notFound().build();
+        }
+        HttpHeaders headers = new HttpHeaders();
+        // 与原版一致：把 Origin 改写为代理目标以规避 CORS 检查
+        headers.set(HttpHeaders.ORIGIN, proxyTarget);
+        HttpEntity<byte[]> entity = new HttpEntity<>(headers);
+        return restTemplate.exchange(upstream, HttpMethod.resolve(request.getMethod()), entity, byte[].class);
+    }
+
+    // WebSocket 握手同样被宽泛上下文捕获并转发（ws: true 的等价语义）
+    @MessageMapping("/{path:.+}")
+    public void relaySocket(@DestinationVariable String path) {
+        URI wsUpstream = URI.create(proxyTarget.replaceFirst("^http", "ws") + "/" + path);
+        // fix: WebSocket 通道同样执行白名单校验，未命中则拒绝建立连接
+        if (!isAllowedTarget(wsUpstream)) {
+            return;
+        }
+        // 直接建立到用户指定目标的 WebSocket 连接，包括开发服务器自身的 HMR 端点
+        new SimpleClientHttpRequestFactory(); // 连接逻辑省略，转发目标同上
+    }
+
+    // fix: 新增辅助函数——对最终上游 URI 做精确白名单匹配（scheme+host+port 全等比较）
+    private boolean isAllowedTarget(URI upstream) {
+        for (String allowed : allowedTargets) {
+            URI a = URI.create(allowed);
+            if (upstream.getScheme().equals(a.getScheme())
+                    && upstream.getHost().equals(a.getHost())
+                    && upstream.getPort() == a.getPort()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean mayProxy(String pathname) {
+        return !new java.io.File("public/" + pathname).exists();
+    }
+}
+```
+
+1. 第 27 行 `@PathVariable String path` 与第 22 行 `@Value("${proxy.target}")` 是用户可控输入点：path 来自请求路径，proxyTarget 来自外部可影响的配置；二者在第 33 行拼接成 `URI upstream`。
+2. 第 33 行的 `URI.create(proxyTarget + "/" + path)` 是主 sink：原代码在未校验目标的情况下直接交给第 42 行 `restTemplate.exchange` 发起 SSRF/非预期代理（CWE-441），攻击者可通过控制配置或路径把请求引向内网任意主机。
+3. 第 35 行修复在 sink 消费之前插入 `!isAllowedTarget(upstream)` 判断，位置正确（先校验后转发）；`isAllowedTarget`（第 56–66 行）对 scheme、host、port 三元组做全等比较，属于白名单精确允许集而非黑名单或正则过滤，类型上以 `URI` 结构化字段比较避免字符串前缀绕过。
+4. 第 24 行新增 `@Value("${proxy.allowed-targets}")` 注入精确允许集，白名单来源为部署方配置而非用户输入，保证防御数据源可信。
+5. 第二入口检查：第 46 行 `relaySocket` 构造的 `wsUpstream` 是同一漏洞的替代通道，第 49 行同样调用 `isAllowedTarget(wsUpstream)` 校验，未命中直接返回拒绝建连，覆盖了 WebSocket 转发通道。
+6. 其余逻辑（路由注册、`mayProxy` 文件存在性判断、Origin 改写）保持原样，仅做最小 diff 插入，满足 minimal pair 对照要求。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "原代码存在 CWE-441 非预期代理：第 22 行 @Value 注入的 proxyTarget 与第 27 行 @PathVariable path 在第 33 行拼接为未校验的 URI 并于第 42 行经 restTemplate.exchange 转发，构成 SSRF 主链；第二入口为第 46 行 relaySocket 的 wsUpstream。修复方式为新增第 24 行配置注入的精确白名单 allowedTargets 及辅助函数 isAllowedTarget（scheme/host/port 全等比较），并在第 35 行与第 49 行两处 sink 前强制校验，未命中即拒绝，属框架原生依赖注入加白名单精确允许集的有效防御", "fix_suggestion": "line 35: 在 restTemplate.exchange 前增加 isAllowedTarget(upstream) 白名单精确校验，line 49: relaySocket 中对 wsUpstream 同样执行 isAllowedTarget 校验"}
+```

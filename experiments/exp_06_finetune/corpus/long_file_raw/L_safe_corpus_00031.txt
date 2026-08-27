@@ -1,0 +1,23 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：
+   - `LoadSpec`（第 60 行附近）：`os.Open(file)` 打开任意路径文件，source 为调用方传入的文件名。
+   - `LoadSpecFromReader` / `LoadSplitSpecFromReader`：从 `io.ReaderAt` 读取 ELF 或原始 BTF blob，source 为外部数据。
+   - `LoadSpecAndExtInfosFromReader`、`LoadSplitSpec(file, base)`：同上。
+   - 无网络、环境变量、回调等其他入口。
+
+2. **source→sink 流验证**：
+   - **流 A**：ELF `.BTF` section → `loadRawSpec` → `parseBTFHeader`。防御检查：第 152 行 `header.HdrLen > len(btf)` 检查；第 158 行用 `uint64(header.StringOff)+uint64(header.StringLen) > uint64(len(btf))` 做 64 位加法防溢出；第 170 行对 TypeOff/TypeLen 同样处理。切片操作在检查之后进行，无越界。
+   - **流 B**：非 ELF 时 `io.ReadAll(io.NewSectionReader(rd, 0, math.MaxInt64))` 全量读入内存——可能造成内存消耗，但这是库的预期行为且受调用方控制输入大小，不构成可利用漏洞。
+   - **流 C**：`symbolOffsets` 中 `sym.Section` 索引前有 `int(sym.Section) >= len(file.Sections)` 边界检查（第 105 行附近），安全。
+   - **流 D**：`fixupDatasec` 使用 ELF 提供的 `sectionSizes[name]` 和 `symbolOffsets` 填充 Datasec——这些值最终用于内核加载时的校验，且此处仅是赋值，无内存写 sink。
+   - **流 E**：`fixupDatasecLayout` 中 `off += uint32(size)` 理论上若变量总尺寸超 2^32 会回绕，但 `Sizeof` 对嵌套类型有深度/尺寸限制（decoder 层），且结果仅写入 Offset 字段供内核校验，非直接内存写。
+   - **流 F**：`TypeByName` 使用 reflect 动态 set，但先验证 `AssignableTo(typeInterface)` 与指针可设置性，类型安全。
+
+3. **第二入口/替代通道**：`LoadSplitSpecFromReader` 跳过 ELF 解析直接走 raw BTF 路径，同样经过流 A 的边界检查；base Spec 的字符串表合并逻辑在 decoder 内部（不在本文件），本文件内未见绕过点。
+
+4. **结论**：所有来自不可信 BTF/ELF 数据的偏移量在切片前均以 uint64 防溢出方式校验；无命令执行、路径穿越、内存不安全写等 sink。该文件为解析库代码，历史 CVE 类问题（如整数溢出）在此版本已通过 64 位算术修复。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "全文审查了 LoadSpec、LoadSpecFromReader、loadRawSpec、loadSpecFromELF、symbolOffsets、fixupDatasec、fixupDatasecLayout、TypeByName 等全部入口与数据流。所有来自不可信 BTF 头部的偏移量（StringOff/StringLen/TypeOff/TypeLen/HdrLen）在使用前均通过 uint64 加法比较做了防整数溢出的边界检查后再切片，symbolOffsets 的节索引也有显式范围校验，reflect 写入有 AssignableTo 类型约束。未发现可利用的越界、注入或内存不安全 sink。", "fix_suggestion": "no fix needed"}
+```

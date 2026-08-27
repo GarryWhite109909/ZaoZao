@@ -1,0 +1,20 @@
+## 编号分析
+
+1. **入口点枚举（全文）**
+   - 第 60 行 `render(mobiledoc, options)`：mobiledoc 渲染入口，交给 kg-mobiledoc-html-renderer，卡片由白名单式 defaultCards 注册，未知卡片仅记日志（第 44-47 行），无 RCE 面。
+   - 第 71-77 行 `htmlToMobiledocConverter`：仅 require 固定包，异常分支返回抛错函数，无外部输入。
+   - 第 82-137 行 `populateImageSizes(mobiledocJson)`：**核心攻击面**。输入是文章的 mobiledoc JSON（编辑器内容，属于低权限用户可控的 source），第 90 行 `JSON.parse` 后遍历 cards。
+   - 第 96-98 行：当 cardName 为 'image' 且缺 width/height 时进入网络请求分支。
+
+2. **source→sink 数据流验证**
+   - **流 A（Unsplash 分支）**：第 103 行 `payload.src.match(/images\.unsplash\.com/)` 是**子串正则匹配**，非域名校验。攻击者可构造 `https://attacker.com/images.unsplash.com/x.png` 或 `https://images.unsplash.com.attacker.com/a.png`，即可通过该检查。随后第 107 行 `getUnsplashSize(payload.src)` → 第 87 行 `imageSize.getImageSizeFromUrl(parsedUrl.href)` 发起服务端 HTTP 请求。黑名单/宽松正则按规则视为可绕过防御，构成 **SSRF**：服务器代为请求内网地址（如 `http://169.254.169.254/images.unsplash.com`），响应虽只取图片尺寸，但错误信息经第 130-132 行 `logging.error(e)` 落入日志，可用于内网探测；且请求本身消耗服务器资源。这是真实历史漏洞模式（Ghost 曾修复过此处的 Unsplash 域名校验绕过）。
+   - **流 B（相对路径）**：第 104 行 `/^\/content\/images\//` 锚定开头，传入 `getOriginalImageSizeFromStorageUrl`，该函数基于存储适配器做路径解析，未发现拼接任意文件读取的证据，暂判安全。
+   - **流 C（isInternalImage）**：第 105 行调用 storageUtils 的内部域判断，属配置驱动的精确比较，非宽松正则，相对可信；但若管理员将内部 URL 配置为通配前缀则退化为流 A 同类问题——依赖部署配置，不作为确定漏洞。
+
+3. **第二入口与替代通道**：`render` 与 `populateImageSizes` 均消费同一 mobiledoc 数据源；`canTransformImage`（第 20-26 行）仅做扩展名与能力判断，无可控 sink。除流 A 外未见其他 source→危险 sink。
+
+4. **结论**：存在一处中危 SSRF，源于第 103 行子串匹配代替主机名校验。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "SSRF", "risk_level": "medium", "source": "populateImageSizes 中攻击者可控的文章 image 卡片 payload.src", "sink": "getUnsplashSize 内 imageSize.getImageSizeFromUrl 发起的服务端 HTTP 请求", "explanation": "第 103 行使用子串正则 /images\\.unsplash\\.com/ 判断是否为 Unsplash 图片，攻击者可构造形如 https://attacker.com/?x=images.unsplash.com 或 https://images.unsplash.com.evil.com/a.png 的 src 绕过校验，使服务器在第 87 行向任意 URL 发起请求，可用于内网探测和访问云元数据端点，响应差异可通过日志或时序观察", "fix_suggestion": "改用 new URL(payload.src) 解析后严格比较 hostname 是否等于 images.unsplash.com（并限定 https 协议），对其他分支同样采用主机名白名单而非子串匹配"}
+```

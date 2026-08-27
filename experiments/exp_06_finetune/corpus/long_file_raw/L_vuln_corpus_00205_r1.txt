@@ -1,0 +1,59 @@
+# 逐函数、逐行安全分析
+
+## 一、文件整体结构与入口点枚举
+
+本文件为 CodeIgniter 控制器 `Booking_settings`（第 19 行），继承 `EA_Controller`。全文共两个可被 HTTP 路由直接触达的公开方法（CodeIgniter 路由约定：URL 段 `/booking_settings/index` 与 `/booking_settings/save`），加上构造函数。逐一列举：
+
+- **入口点 1**：`__construct()`（第 33–46 行）——加载模型与库，无用户输入处理，本身不构成 source/sink。
+- **入口点 2**：`index()`（第 51–76 行）——GET 渲染页面。
+- **入口点 3**：`save()`（第 81–117 行）——POST 保存设置，**核心风险入口**。
+- **隐式第二入口/替代通道**：`$this->settings_model->save()` 写入的 `settings` 表会被其他控制器（如预约页 `Booking`、`Consents` 等）读取并输出到公共页面；即使本文件没有第二个写入口，写侧的污染会通过读侧通道扩散（存储型 XSS 的典型二段式数据流）。
+
+## 二、`index()`（第 51–76 行）逐行审计
+
+- 第 53 行 `method('get')` 强制 GET，防 CSRF/方法混淆，有效。
+- 第 55 行记录 `dest_url` 到 session，固定值，无注入面。
+- 第 59–66 行权限检查：`cannot('view', PRIV_SYSTEM_SETTINGS)` 时未登录跳登录、已登录 abort(403)。防御有效，但仅保护本页面渲染，不覆盖 save 之外的替代读取通道（如 API 控制器若存在同表读取则需另行评估，不在本文件内）。
+- 第 69–71 行 `script_vars([... 'booking_settings' => filter_sensitive_settings(...)])`：将设置批量注入 JS 变量。这里调用了 `filter_sensitive_settings()` 过滤敏感项（如密码类设置），但**未对值做 HTML/JS 上下文转义**——不过 script_vars 通常做 JSON 编码，且该页仅管理员可见，风险有限；真正的爆发点是这些值随后在公共预约页以 HTML 形式回显。
+
+## 三、`save()`（第 81–117 行）逐行审计 —— 主要漏洞
+
+- 第 84 行 `method('post')`：强制 POST，但**未见 CSRF token 校验**（EA_Controller 层可能有，本文件无法证实，按保守口径记为待确认项）。
+- 第 86–88 行：`cannot('edit', PRIV_SYSTEM_SETTINGS)` 抛异常——认证/授权防御有效，攻击者必须是具备系统设置编辑权的管理员。这把漏洞定性从“越权”降级为“管理员输入导致的存储型 XSS / 自身防护缺失”。
+- 第 90 行 `check('booking_settings', 'array|null')`：仅校验类型为数组，**不校验内容**。
+- 第 92 行 `$settings = request('booking_settings', [])`：**source 确立**——用户 POST 体完全可控。
+- 第 94–104 行 foreach 循环：
+  - 第 96 行按 `name` 查已有记录并回填 id——`where('name', ...)` 使用查询构建器参数绑定，SQL 注入不成立。
+  - 第 98–103 行是关键缺陷点：
+    ```php
+    if (!empty($setting['name']) && str_starts_with($setting['name'], 'label_custom_field_')) {
+        $setting['value'] = strip_tags($setting['value'] ?? '');
+    }
+    ```
+    防御有效性判定：`strip_tags` 属于黑名单式/剥离式过滤，可被属性型 payload 绕过（如 `<img src=x onerror=...>` 在某些上下文、或利用不完整标签、`<svg/onload>` 变体）；更重要的是它**只覆盖前缀为 `label_custom_field_` 的设置名**。其余任意设置键（如 `company_name`、`company_link`、`google_analytics_code`、`date_format` 等所有 settings 表条目）的 `value` **完全不做任何净化**即落库。
+  - 第 105–106 行 `only($setting, ['id','name','value'])`：白名单限制的是**字段名**而非字段内容，不能阻止恶意 value 入库。
+  - 第 108 行 `$this->settings_model->save($setting)`：**sink 确立**——污染数据持久化到 settings 表。
+- 第 111–115 行异常统一走 `json_exception` 输出，注意 `json_exception` 若回显原始异常消息可能泄露路径信息（低危，次要发现）。
+
+## 四、source→sink 数据流汇总与第二通道验证
+
+1. **流 A（主链）**：line 92 `request('booking_settings')` → line 99 条件性 strip_tags（对非 `label_custom_field_` 键完全不生效）→ line 108 `settings_model->save()` 落库 → 替代通道：公共预约页/管理页模板读取该设置并以 HTML 回显（如公司名称显示在 booking 页头部）→ **存储型 XSS（CWE-79）**。授权要求为管理员，故为“需要高权限”的 XSS，常见定级为中危；但在多管理员/SaaS 场景下低权管理员可打高权用户。
+2. **流 B**：同一 source → `script_vars` 注入 index 页 JS 上下文——依赖框架 JSON 编码，风险次级。
+3. **流 C（SQL）**：line 96 查询构建器绑定 + line 105 字段白名单 → SQL 注入不成立。
+4. **CSRF**：save 仅校验 method 与权限，文件内无 token 校验；若基类未实现则为 CWE-352（本文件证据不足，列为疑点）。
+
+## 五、结论
+
+存在真实漏洞：`save()` 对设置值的净化是条件性且可绕过的（strip_tags 黑名单式），任意设置键的 HTML 内容可持久化并在前端回显，构成存储型 XSS。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-79 存储型XSS（伴随条件性过滤不足，strip_tags 可绕过）",
+  "risk_level": "中",
+  "source": "line 92: request('booking_settings', []) 用户POST体中的 setting['name'] 与 setting['value'] 完全可控",
+  "sink": "line 108: $this->settings_model->save($setting) 将未净化的 value 持久化到 settings 表，经公共预约页等模板以HTML回显",
+  "explanation": "line 98-103 仅当 name 以 label_custom_field_ 开头时才调用 strip_tags，其余全部设置键的 value 无任何净化；strip_tags 本身为黑名单式剥离，可被事件属性等payload绕过，不算有效防御；line 105 only() 白名单只约束字段名不约束内容；授权要求 edit PRIV_SYSTEM_SETTINGS 权限，故为高权限前提下的存储型XSS，可通过多管理员场景打击更高权限用户",
+  "fix_suggestion": "line 98-103: 移除前缀条件，对所有写入 settings 表的 value 统一使用 html_escape 或白名单校验（如 company_link 用 filter_var URL 校验、日期格式用枚举校验），并在所有回显设置的模板处强制 html_escape 输出编码"
+}
+```

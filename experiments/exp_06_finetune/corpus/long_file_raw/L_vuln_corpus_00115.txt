@@ -1,0 +1,34 @@
+## 编号分析
+
+**入口点枚举（全文）**
+1. `install()`（第 84 行起）：source 为 `$zip`、`$destination`、`$options['install_path']`，可由 GPM 后台（admin 插件）以 HTTP 参数间接控制。
+2. `unZip()`（第 152 行起）：处理上传/下载的 ZIP 包。
+3. `loadInstaller()`（第 193 行起）：对解压内容执行 `require_once`。
+4. `moveInstall/copyInstall/sophisticatedInstall/uninstall()`：文件系统 sink。
+5. `isValidDestination/isGravInstance()`：校验逻辑。
+
+**数据流逐条验证**
+
+- **流 A（Zip Slip，CWE-22）**：第 165 行 `$zip->extractTo($destination)` 直接将压缩包全部条目解压到 tmp 目录，未遍历 `getNameIndex` 校验每个条目名是否含 `../` 或绝对路径。随后第 176 行返回 `$destination . '/' . $package_folder_name`，仅对首条目做了 `#\./$#` 的尾部正则替换（第 172 行），该正则只匹配结尾的 `./`，无法防御 `../../` 形式。若 ZIP 条目名含路径穿越序列且 PHP 版本较旧（extractTo 未内置净化），可实现任意文件写入。黑名单式正则按规则视为可绕过。
+
+- **流 B（任意代码执行，CWE-94）**：第 205 行 `require_once $install_file;` —— `$install_file` 来自解压后的 ZIP 内容（`install.php`）。任何能向 `install()` 提交恶意包的通道（管理员账号被 CSRF/钓鱼、GPM 源被劫持、第二入口如 CLI 脚本或第三方调用）都会导致攻击者代码在服务器上下文执行。这是 source(用户可控 ZIP)→sink(require) 的完整链路，无任何签名/白名单校验。
+
+- **流 C（slug 推导）**：第 210–222 行从目录名截取 slug 拼接类名并 `class_exists`，仅影响加载哪个类，不构成独立漏洞，但放大了流 B。
+
+- **流 D（sophisticatedInstall）**：第 268–300 行，源为已解压目录，目标 `$install_path` 来自 `$options['install_path']` 与 `$destination` 拼接；`isGravInstance`（第 373 行）仅检查固定文件存在性，不限制 destination 必须在 GRAV_ROOT 内——若上游传入外部路径仍可写任意位置，但主防线缺失已在流 A/B 覆盖。
+
+- **流 E（isValidDestination 逻辑缺陷）**：第 346–355 行 `elseif (!file_exists(...))` 先于 `!is_dir` 判断，`NOT_DIRECTORY` 分支不可达；属健壮性问题而非可直接利用漏洞。
+
+**第二入口/替代通道**：admin 插件表单与 GPM 远程仓库均可触达 `install()`；CLI 更新脚本同样调用本类，均落入流 A/B。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 路径穿越(Zip Slip) 与 CWE-94 任意代码执行",
+  "risk_level": "高危",
+  "source": "line 84: install() 接收的 $zip 参数及 $options[install_path]，可经 admin/GPM/CLI 等入口被攻击者影响",
+  "sink": "line 165: unZip 中 $zip->extractTo($destination) 无条目名校验；line 205: loadInstaller 中 require_once 解压出的 install.php",
+  "explanation": "恶意 ZIP 包内条目含 ../ 路径穿越时可写出 tmp 目录之外(第 172 行的正则仅去除尾部 ./ 不防御 ../)；同时解压内容中的 install.php 在第 205 行被直接 require 执行，构成从用户可控压缩包到服务器代码执行的完整链路，中间无签名验证或白名单等有效防御",
+  "fix_suggestion": "line 165 前遍历 zip 条目，用 realpath 校验每个条目解析后必须位于目标目录内并拒绝绝对路径与 .. 序列；line 205 处删除对包内 install.php 的动态 require，改为基于声明清单的安全钩子机制，并对安装包实施签名校验"
+}
+```

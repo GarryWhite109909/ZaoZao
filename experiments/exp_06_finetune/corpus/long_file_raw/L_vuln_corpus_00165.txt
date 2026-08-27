@@ -1,0 +1,34 @@
+## 编号分析（全文通读）
+
+**入口点枚举**
+1. 命令入口：`__construct( array $p_data )`（第 ~60 行），数据来自 Web API/JSON 请求体，`payload()`、`option()` 为用户可控 source。
+2. 二级入口字段：`issue.*` 全部键（summary/description/project/handler/reporter/tags/category/files/profile/version/sticky/due_date/custom_fields/notes）、`options.clone_info.*`、`options.skip_moderation`。
+3. 回调/事件通道：`event_signal( 'EVENT_REPORT_BUG_MODERATE_CHECK' )`、`EVENT_REPORT_BUG_MODERATE`、`helper_call_custom_function('issue_create_validate')` —— 属插件扩展面，非本文件漏洞。
+
+**逐条 source→sink 验证**
+
+- **project 权限**（第 ~110–135 行）：`mci_get_project_id` 后有 `access_has_project_level(report_bug_threshold)` 校验，有效。
+- **reporter 覆盖**（第 ~150 行）：有 `webservice_specify_reporter_on_add_access_level_threshold` 检查，有效。
+- **handler**（第 ~165 行）：有 `update_bug_assign_threshold` + `handle_bug_threshold` 双检查，有效。
+- **target_version**（第 ~230 行）：有 `roadmap_update_threshold`，有效；sticky、due_date 同样有阈值检查，有效。
+- **tags**（validate 第 ~195 行 / process 第 ~270 行）：validate 中校验存在性与创建权；process 里再次 `get_tag_id` 判断后 `tag_create($t_tag['name'], $this->user_id)`，与 validate 一致，无 TOCTOU 实际危害。名称经 `tag_name_is_valid` 白名单正则——按题目规则视为可绕过，但创建的 tag 仅是标签名，最终写入前 tag API 内部还会处理，风险低。
+- **notes.view_state 私密备注**（process 第 ~330 行）：`$t_view_state = $t_note['view_state'] ?? default` 直接传入 `bugnote_add(..., $t_view_state_id == VS_PRIVATE, ...)`。validate() 中**没有任何对私密备注权限的检查**（对比 web UI 的 `bugnote_add.php` 会检查 `set_view_status_threshold`）。任何能报 issue 的用户可通过 API 创建 VS_PRIVATE 备注——次要越权问题。
+- **★ clone_info.master_issue_id（核心漏洞）**：
+  - source：validate 第 ~72 行读取 `$t_clone_info['master_issue_id']`；
+  - 唯一防御：仅 `bug_is_readonly(...)`（只读状态检查），**完全没有 `access_has_bug_level( VIEWER, $t_master_issue_id )` 视图权限检查**；
+  - sink：process 第 ~285–320 行，`bugnote_get_all_bugnotes( $t_master_issue_id )` 将父 issue 的全部备注（含私密备注）复制进新建子 issue；`file_copy_attachments( $t_master_issue_id, $t_issue_id )` 复制父 issue 全部附件；随后历史日志还把 `$t_master_issue_id` 写入新 issue。
+  - 攻击路径：攻击者只需在任一可报 issue 的项目拥有 `report_bug_threshold` 权限，即可指定一个其**无权查看**的私有/受限项目的 issue 作为 master，克隆其备注与附件到自己的公开 issue 中读取 → 信息泄露（水平/跨项目越权）。黑名单式只读检查不构成访问控制，防御无效。
+
+**结论**：存在真实漏洞——clone 功能缺失对 master issue 的视图授权检查（CWE-862 / CWE-200）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-862 Missing Authorization (导致 CWE-200 Information Exposure)",
+  "risk_level": "高",
+  "source": "line 72: options.clone_info.master_issue_id 来自请求 payload, 用户完全可控",
+  "sink": "line 292: bugnote_get_all_bugnotes(master) 与 line 307: file_copy_attachments(master, child) 将无权查看的父 issue 备注和附件复制到攻击者自建的新 issue",
+  "explanation": "validate() 第 73 行对 master_issue_id 只调用了 bug_is_readonly() 状态检查, 未调用 access_has_bug_level(VIEWER) 做视图授权; process() 中 copy_notes/copy_files 直接读取该 issue 的私密备注与附件并写入攻击者可读的新 issue -> 跨项目信息泄露",
+  "fix_suggestion": "line 73: 在 bug_is_readonly 检查旁增加 if(!access_has_bug_level(config_get('view_bug_threshold'), $t_clone_info['master_issue_id'], $this->user_id)) throw ClientException(ERROR_ACCESS_DENIED); 同时对 notes.view_state 私密备注补充 set_view_status_threshold 权限校验"
+}
+```

@@ -1,0 +1,31 @@
+## 编号分析
+
+**入口点枚举（全文通读）**
+
+1. **构造函数**（约第 96–108 行）：接收外部传入的 `CertStoreParameters`，其中包含 `getLdapURL()`、`getBaseDN()`、各 attribute 名称等全部来自调用方配置——若配置源自不可信输入（如用户指定证书库），即为第一入口。
+2. **engineGetCertificates**（约第 137 行起）：`X509CertSelector` 的 subject 字符串/字节、内嵌证书的 subject 与 serialNumber 是第二入口。
+3. **engineGetCRLs**（约第 246 行起）：`xselector.getIssuerNames()` 的每个元素（String 或 byte[]）是第三入口。
+4. **connectLDAP**（约第 110 行）：`props.setProperty(Context.PROVIDER_URL, params.getLdapURL())` —— 出站连接目标完全由参数控制。
+
+**数据流逐一验证**
+
+- 流 A：selector subject → `parseDN()`（约第 122–152 行）→ `filterEncode()` → `search(attrName, "*"+attrValue+"*")`。`filterEncode` 按 RFC2254 转义了 `* ( ) \` 和 `\0`，通配符注入被阻断；但转义表只覆盖 char < 93，≥93 的字符原样拼接——这些不是 LDAP 过滤器元字符，尚可接受。此流对过滤器注入防御基本有效。
+- 流 B：serialNumber → 直接拼入 `"*" + attrValue + "*"`（certSubjectSerialSearch 内）。serial 是 BigInteger.toString()，纯数字，无注入面。
+- 流 C（**未防御**）：`search()` 中 `String filter = attributeName + "=" + attributeValue;` 随后 `String filter2 = "(&(" + filter + ")(" + temp[0] + "=*))";` —— `attributeName` 来自 `params.getUserCertificateAttribute()` 等配置值，**未经任何转义**直接拼入 LDAP 过滤器；`temp[0]` 同样来自 params。攻击者若控制属性名（如含 `)(uid=*))(|(uid=*`），即可注入任意过滤条件。
+- 流 D（**未防御**）：`ctx.search(params.getBaseDN(), filter2, ...)` —— BaseDN 未校验/转义，可注入或指向任意子树。
+- 流 E（**SSRF/CWE-918**）：`connectLDAP` 用 `params.getLdapURL()` 作为 PROVIDER_URL，且 `SECURITY_AUTHENTICATION = "none"` 匿名连接——攻击者可控参数时可让 JVM 向任意主机/端口发起 LDAP 连接。
+- 第二通道确认：engineGetCRLs 中 issuer 名同样走 parseDN→filterEncode（有效），但其 attrName 也来自 params（同流 C 缺陷）；且无论 selector 如何，都额外执行 `set.addAll(search(null, "*", attrs))` 全量拉取。
+
+**结论**：存在漏洞。核心缺陷是不可信的 params（attribute 名、BaseDN、LDAP URL）未经净化直接进入 JNDI 查询与出站连接，构成 LDAP 过滤器/DN 注入（CWE-90）及 SSRF（CWE-918）。风险等级：中（需要攻击者能影响 CertStore 参数这一前提，但在 PKIX 动态构建场景下现实可达）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-90 LDAP Injection / CWE-918 SSRF",
+  "risk_level": "medium",
+  "source": "line ~96 constructor: X509LDAPCertStoreParameters 提供 getLdapURL/getBaseDN/各 attributeName，以及 engineGetCertificates/engineGetCRLs 的 selector 输入",
+  "sink": "line ~370: ctx.search(params.getBaseDN(), filter2, constraints)；line ~110: props.setProperty(Context.PROVIDER_URL, params.getLdapURL())",
+  "explanation": "selector 的 subject/issuer 值经 parseDN+filterEncode 转义，通配符注入被阻断；但 search() 中 attributeName 与 temp[0] 直接拼接进 '(&(filter)(attr=*))' 过滤器、baseDN 未净化即传入 ctx.search，均无任何防御；connectLDAP 使用未校验的 ldapURL 且匿名认证，构成出站连接注入",
+  "fix_suggestion": "line ~365: 对 attributeName/temp[0]/baseDN 做白名单校验或 RFC2254 编码后再拼接；line ~110: 对 ldapURL 做 scheme/host 白名单限制，禁止任意出站地址"
+}
+```

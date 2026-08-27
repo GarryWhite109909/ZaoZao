@@ -1,0 +1,54 @@
+## 逐函数行号分析
+
+**1. `attachmentReadScope`（第 27–36 行）**
+纯映射函数，无输入 source，无 sink。仅返回 scope 常量。无可利用点。
+
+**2. `UploadIssueAttachment` / `UploadReleaseAttachment`（第 39–46 行）**
+入口点：路由回调，source 为 multipart 文件上传。repoID 来自已鉴权的 `ctx.Repo.Repository.ID`，非用户可控。
+
+**3. `uploadAttachment`（第 48–77 行）**
+- 第 51 行：检查附件功能开关。
+- 第 57 行：`ctx.Req.FormFile("file")` —— **source：用户上传文件与文件名**。
+- 第 62 行：`attachment.NewLimitedUploaderKnownSize(file, header.Size)` —— 有大小限制封装。
+- 第 64–66 行：`header.Filename` 仅作为 `Name` 元数据存入 DB；存储路径由服务端生成的 `attach.UUID` 决定（见第 152 行 `attach.RelativePath()`），**文件名不参与存储路径拼接**，无路径穿越 sink。
+- 类型过滤由 `UploadAttachmentForIssue/Release` 内部完成（第 68 行 `IsErrFileTypeForbidden`），即使黑名单可绕过，绕过后也只是存储了非常规类型文件，下载时以 `Content-Disposition` 提供，不直接执行。
+- 鉴权依赖路由层中间件（本文件未含，但 `ctx.Repo.Repository` 非空说明仓库上下文已建立）。
+
+**4. `DeleteAttachment`（第 80–117 行）**
+- 第 81 行：**source：`ctx.FormString("file")`（UUID）**。
+- 第 82 行：按 UUID 查询，非 SQL 拼接（ORM 参数化）。
+- 第 88 行：校验 `attach.RepoID != ctx.Repo.Repository.ID` —— 防跨仓库删除。
+- 第 90–113 行：非 uploader 时按 Issue/Release/Admin 分级鉴权，逻辑完整覆盖三个分支（IssueID>0、ReleaseID>0、其他）。
+- 未发现越权删除路径。注意：若 `RepoID==0` 的遗留附件，第 88 行会因 `0 != repoID` 被拒绝——偏保守方向，不构成漏洞。
+
+**5. `ServeAttachment`（第 120–172 行）—— 重点审查**
+- 第 121 行：**source：uuid 参数**。
+- 第 122 行：按 UUID 精确查询。
+- 第 129–133 行：对新建附件强制 `ctx.Repo.Repository.ID == attach.RepoID`；对 cutoff 之前的遗留附件跳过此检查——这是唯一可疑点，但随后：
+- 第 135–138 行：通过 `GetAttachmentLinkedTypeAndRepoID` 解析真实归属的 unitType/repoID。
+- 第 140–145 行：未链接附件仅 uploader 本人可见。
+- 第 147–166 行：链接附件时，即使 `ctx.Repo.Repository == nil` 也重新加载目标仓库并计算 Doer 权限，`perm.CanRead(unitType)` 强制读权限；API 场景再叠加 token scope 校验（第 161–165 行）。遗留附件若链接到某 issue/release，仍受该仓库权限约束；未链接则仅 uploader 可见。**遗留分支被后续双重校验兜住，不构成越权读取。**
+- 第 168–173 行：`IncreaseDownloadCount` 仅计数。
+- 第 175–180 行：S3 直链重定向 URL 由服务端基于 `RelativePath()`（UUID 派生）生成，非用户路径。
+- 第 187–191 行：打开的仍是 UUID 派生路径；`attach.Name` 作为下载文件名传给 `httplib.ServeUserContentByFile`，该库内部对 header 注入/CRLF 做净化（标准实现），且此处为响应头而非文件系统操作。
+
+**6. `GetAttachment`（第 174–177 行）**
+入口包装，uuid 来自路径参数，直接进入上述已审计流程。
+
+**第二入口/替代通道核查**：全文件共 4 个外部入口（两个上传、一个删除、一个下载），均已逐一覆盖；无环境变量、无回调、无隐藏参数通道。
+
+## 结论
+
+所有 source→sink 数据流均有有效防御：UUID 全程参数化查询、存储路径由服务端 UUID 决定、下载/删除均经仓库归属+单元级权限双重校验、遗留数据有 uploader-only 与链接解析兜底。未发现可确认的安全漏洞。
+
+```json
+{
+  "has_vulnerability": false,
+  "vulnerability_type": "None",
+  "risk_level": "None",
+  "source": "line 81: ctx.FormString file / line 121: uuid path param / line 57: uploaded file",
+  "sink": "line 82: GetAttachmentByUUID / line 189: storage.Attachments.Open(attach.RelativePath())",
+  "explanation": "全文逐一核查四个入口：上传的 Filename 仅作元数据，存储路径由服务端生成的 UUID 派生，无路径穿越 sink；UUID 查询走 ORM 参数化，无注入；删除前校验 RepoID 归属并按 Issue/Release/Admin 三分支鉴权；下载对遗留 cutoff 前附件虽跳过仓库归属检查，但随后通过 GetAttachmentLinkedTypeAndRepoID 解析真实归属并用 CanRead 强制读权限，未链接附件仅 uploader 可见，形成有效双重防御；S3 直链与 ETag 均基于 UUID 派生值，不可控",
+  "fix_suggestion": "无需修复；如需加固可在 line 129 对 cutoff 前遗留附件也统一要求 RepoID 匹配或显式迁移清理"
+}
+```

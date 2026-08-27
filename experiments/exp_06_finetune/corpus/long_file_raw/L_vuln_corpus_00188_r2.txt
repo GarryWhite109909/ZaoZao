@@ -1,0 +1,47 @@
+# 全文逐函数安全分析
+
+## 1. 模块级入口点枚举（第 1–33 行）
+
+- 第 1–12 行：文件头与导入。第 8 行导入 `secure_popen`（sink 所在），第 11–16 行条件导入 `chevron`（模板渲染引擎，source→sink 链路中的关键转换器）。chevron 缺失时走第 96 行的 else 分支直接使用原始命令，反而**绕过模板层但同样到达 sink**，需一并核查。
+- 第 20–22 行：`_SHELL_OPERATORS = ('&&', '|', '>>', '>')` —— 这是一个**黑名单**。按分析要求，黑名单/正则过滤视为可绕过、不算有效防御。注意该黑名单遗漏了：单字符后台操作符 `&`、命令分隔符 `;`、反引号 `` ` ``、命令替换 `$(`、输入重定向 `<`、换行符 `\n` 等。
+
+## 2. `_sanitize_value`（第 25–47 行）
+
+- 第 29–32 行：对字符串逐一替换黑名单操作符为空格。这是防御的唯一手段，但如上所述是**不完整黑名单**：例如值含 `; touch /tmp/pwn` 或 `` `id` `` 或 `$(reboot)` 时全部原样保留。
+- 第 33–38 行：递归处理 list/tuple/dict，修复了历史 CVE 中嵌套 cmdline 未净化的缺陷——这一步本身逻辑正确，但递归后仍落到同一个不完整黑名单上，因此“递归”只扩大了覆盖面，未改变过滤强度。
+- 第 39–40 行：其他类型原样返回，无可利用面。
+- 结论：该函数对已知四类操作符有效，但对第二类注入通道（`;`、`&`、`$()`、反引号）无效，属于可绕过防御。
+
+## 3. `_sanitize_mustache_dict`（第 50–62 行）
+
+- 第 59–61 行：仅遍历顶层 dict 的 value 调用 `_sanitize_value`；key 不净化，但 key 来自插件内部命名，非攻击者可控，风险低。
+- 该函数继承 `_sanitize_value` 的全部绕过面：任何经 Mustache 渲染进入命令行的攻击者可控字符串（进程名、容器名、挂载点、cmdline 参数）只要携带 `;`/`` ` ``/`$(`/`&` 即可穿透。
+
+## 4. `GlancesActions.__init__`（第 65–81 行）
+
+- 第 68 行保存 args；第 74–79 行启动防抖 Timer。无 sink、无外部输入直接消费，无漏洞；仅影响触发频率。
+
+## 5. `allow_operators`（第 84–95 行）
+
+- 第 94 行：默认返回 True，即默认允许 secure_popen 解释 shell 操作符。只有当用户显式设置 `--disable-config-exec` 时才收紧。这是“默认开放”的安全姿态：在默认部署下，即使黑名单漏掉的操作符之外，连被黑名单捕获前的原始重定向能力也依赖上游净化是否完整——进一步放大了第 2 节绕过的实际影响。
+
+## 6. `get` / `set`（第 98–106 行）
+
+- 纯内存 dict 存取，无 sink。仅作为 run() 的去重状态，无数据流。
+
+## 7. `run`（第 109–145 行）——核心 source→sink 数据流
+
+- **Source**：第 116 行参数 `mustache_dict`（插件统计，含攻击者可控的进程名/cmdline/容器名等）；第 115 行参数 `commands` 本身来自 glances.conf（本地配置，属受信边界内，但在多用户主机上低权用户若能写配置即成第二入口）。
+- 第 121–122 行：去重与 Timer 判断，纯控制流。
+- 第 128–133 行：chevron.render 将 mustache_dict 渲染进 cmd。**防御点唯一为第 131 行的 `_sanitize_mustache_dict`**，其有效性已在第 2 节证伪（黑名单可绕过）。Mustache 不做 HTML/shell 转义（代码注释第 44–46 行自认），故恶意子串完整存活于 `cmd_full`。
+- 第 136 行：`logger.info` 记录 cmd_full —— 若日志被低权用户读取，还泄露命令内容（次要信息泄露，非主漏洞）。
+- 第 140 行：`secure_popen(cmd_full, allow_operators=self.allow_operators())` —— **Sink**。secure_popen 的语义是解析并执行带 shell 操作符的命令；由于 allow_operators 默认 True 且净化黑名单不完整，攻击者可控的 `;`、`&`、`$()`、反引号等将在此被执行。
+- 替代通道核查：(a) chevron 未安装时第 133 行 `cmd_full = cmd` 直接用原始 commands 到达同一 sink，commands 含 mustache 占位符时虽不渲染，但配置来源命令仍受 allow_operators 默认 True 影响；(b) repeat=True 时绕过去重反复触发，放大影响但不新增注入面；(c) 无其他文件/环境变量入口。
+
+## 8. 综合结论
+
+存在真实漏洞：CWE-78 OS 命令注入。链路：插件统计中攻击者可控字符串（如进程 argv）→ 第 131 行不完整黑名单净化（遗漏 `;`/`&`/`$()`/反引号）→ 第 132 行 chevron.render 不转义 → 第 140 行 secure_popen 以默认 allow_operators=True 执行。风险等级：高（本地/相邻进程攻击者可在运行 Glances 的主机上以 Glances 权限执行任意命令）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78", "risk_level": "high", "source": "line 116: mustache_dict 插件统计中攻击者可控字符串（进程名/cmdline/容器名）", "sink": "line 140: secure_popen(cmd_full, allow_operators=self.allow_operators())", "explanation": "攻击者可控的统计值经 line 131 _sanitize_mustache_dict 净化，但该函数依赖 line 20-22 的黑名单 ('&&','|','>>','>')，遗漏了分号、单 ampersand、$( ) 命令替换、反引号、输入重定向等 shell 元字符，属于可绕过过滤；随后 line 132 chevron.render 不做 shell 转义，恶意元字符完整保留在 cmd_full 中；line 140 secure_popen 在 allow_operators 默认为 True（line 94）的情况下解释这些残留操作符，导致以 Glances 进程权限执行攻击者拼接的任意命令。替代通道：chevron 未安装时 line 133 直接使用原始命令到达同一 sink，结论不变。", "fix_suggestion": "line 20: 放弃黑名单替换方案，改为白名单校验或对渲染后的 cmd_full 使用无 shell 解释的参数化执行（shlex.quote 各参数或以列表形式传给 subprocess 并禁用 shell=True），同时建议 line 94 默认返回 False（默认拒绝操作符），并将 allow_operators 与 disable_config_exec 的语义统一"}
+```

@@ -1,0 +1,65 @@
+# 全文逐行安全分析
+
+## 一、文件结构与入口点枚举
+
+本文件是 YesWiki（WikiNi 衍生）的一个 Action 类 `EraseSpamedCommentsAction`，唯一入口是 `run()` 方法（第 22 行起）。入口点包括：
+
+1. **`$this->arguments['max']`**（第 29 行）——来自 wiki 标记语法 `{{erasespamedcomments max="50"}}`，即页面内容，可被任何有页面编辑权限者注入；
+2. **`$_POST['clean']`**（第 27、62 行）——POST 参数，控制分支；
+3. **`$_POST['suppr']`**（第 68 行）——POST 数组，元素直接作为待删除页名；
+4. **`$this->arguments['logpage']`**（第 96 行）——同 max，来自页面内嵌语法；
+5. **数据库回读数据**：`$comment['tag']`、`$comment['time']`、`$comment['body']`、`$comment['user']`、`$comment['comment_on']`（第 33–47 行），这些是评论页的元数据，其中 tag/time/comment_on 由系统生成，但 user 与 body 部分由用户提交。
+
+## 二、逐条 source→sink 数据流验证
+
+### 流 1：`$comment['tag']` → HTML 输出（XSS）
+
+第 40 行：`'<li><input name="suppr[]" value="' . $comment['tag'] . '" ...' . $comment['tag'] . ' ('...`
+
+tag 被两次拼接进 HTML（input 的 value 属性与正文文本），**均未经过 htmlspecialchars**。对比同一段代码中 `$comment['body']` 用了 `htmlspecialchars(..., ENT_COMPAT, YW_CHARSET)`（第 43 行）、`_t('DEL')` 也做了转义（第 41 行），说明作者有转义意识但遗漏了 tag。tag 是评论页名，通常受页面命名规则约束（字母数字），但在 YesWiki 中通过 API 或特殊字符处理路径创建的页名可能包含引号/尖括号；即便如此，这是典型的存储型 XSS 缺陷——防御缺失而非依赖上游约束。同理第 45–46 行 `$comment['comment_on']` 直接拼入 `<a>` 文本，也未转义。
+
+### 流 2：`$wiki->Format($comment['user'])`（第 47 行）
+
+user 经 Format 渲染，Format 本身是 wiki 语法渲染器，允许注入 wiki 标记。若评论者用户名含 wiki 语法（如 `""`、HTML 注入标记取决于配置），可能造成二次注入。风险较低但属于未净化输出。
+
+### 流 3：`$_POST['suppr'][]` → `PageController::delete($page)`（第 70–71 行）
+
+这是最严重的问题：**任意页面删除**。`run()` 中没有任何 ACL/权限检查（无 `$this->wiki->HasAccess('delete', ...)`、无 admin 角色验证）。任何能加载包含此 action 的页面的访客，均可构造 POST `clean=yes&suppr[]=HomePage&suppr[]=...` 删除站内任意页面。YesWiki 框架层面对 action 是否做权限拦截取决于该 action 是否注册为需要 admin 权限——从代码本身看没有声明，且注释表明它面向管理员使用却未强制。此外 `$page` 未做白名单校验（如限定为评论页 tag 格式），可直接删除普通页面甚至系统页面。
+
+### 流 4：`echo 'Effacement de : ' . $page`（第 69 行）
+
+`$page` 来自 POST，直接回显到 HTML，**反射型 XSS**。攻击者构造钓鱼链接/自动提交表单即可注入脚本。
+
+### 流 5：`$deletedPages` → `LogAdministrativeAction`（第 100–108 行）
+
+`$deletedPages` 由 POST 的 suppr 元素拼接而成（第 73 行），写入日志页时仅用 `""` 包裹（第 103–105 行）。在 YesWiki 中 `""text""` 是字面文本标记，可部分防格式注入，但不等于 HTML 转义；日志页被查看时若渲染器允许原始 HTML（默认对 admin 内容常开放），构成向日志页的注入通道——第二入口/替代通道：即使不删除页面成功，恶意 tag 字符串也会进入日志。
+
+### 流 6：`$this->arguments['logpage']`（第 96 行）
+
+来自页面嵌入语法的参数，控制日志写入目标页。编辑者可将日志重定向到任意页，属低危逻辑问题。
+
+### 流 7：`$erase_id` / `$day`（第 36–38 行）
+
+`$day` 来自数据库 time 字段（系统生成），`str_replace('-','',$day)` 后拼入 id 属性，风险极低。
+
+## 三、第二入口与替代通道核查
+
+- **CSRF**：第 28 行表单无 token 字段，第 62 行处理端无来源校验。结合流 3 的无权限删除，攻击者可用 CSRF 让已登录管理员批量删页。
+- **GET 侧通道**：`$wiki->Href()` 默认生成 GET 链接，但删除只走 POST，无 GET 触发路径。
+- **框架层防御假设**：不能假定调用方一定限制了 admin；开源审计应以代码自身证据为准——本类未调用任何 HasAccess/GetUser 判断。
+
+## 四、结论
+
+主要漏洞：(a) 第 69 行反射型 XSS；(b) 第 40/45 行存储型 XSS（tag/comment_on 未转义）；(c) 第 70–71 行未授权+CSRF 的任意页面删除（CWE-862/CWE-352）。综合以越权删除为主漏洞。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-862 (Missing Authorization) / CWE-352 (CSRF) / CWE-79 (XSS)",
+  "risk_level": "high",
+  "source": "line 68: $_POST['suppr'] 以及 line 27: $_POST['clean'], 均为未经认证校验的用户输入",
+  "sink": "line 71: PageController::delete($page) 执行任意页面删除; line 69: echo 拼接 $page 造成反射型 XSS; line 40 与 line 45: $comment['tag'] 与 $comment['comment_on'] 未转义直出 HTML",
+  "explanation": "run() 全文未调用 HasAccess 或任何角色检查, 任何能触发该 action 的访客可通过 POST clean=yes 和 suppr[] 数组删除站内任意页面; 表单无 CSRF token, 处理端亦无来源校验, 可构造跨站请求让管理员被动执行; 同时 line 69 将 POST 值 $page 直接 echo 回显, 构成反射型 XSS; line 40-46 将数据库中的 tag 与 comment_on 未经 htmlspecialchars 拼接进属性与正文 (对比 line 43 对 body 做了转义), 构成存储型 XSS; line 73-107 将 POST 数据经 deletedPages 写入日志页, 仅用双引号包裹未做 HTML 转义, 为第二注入通道",
+  "fix_suggestion": "在 run() 开头增加权限校验 (例如要求 admin 组或对每页调用 HasAccess('delete', $page)); 在 line 62 分支加入一次性 CSRF token 校验; line 69 改为 echo htmlspecialchars($page, ENT_COMPAT, YW_CHARSET); line 40 与 line 45 对 tag 及 comment_on 统一使用 htmlspecialchars 转义后再拼接; line 71 前对 $page 做页名白名单正则校验"
+}
+```

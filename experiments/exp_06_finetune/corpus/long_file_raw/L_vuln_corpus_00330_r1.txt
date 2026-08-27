@@ -1,0 +1,75 @@
+# 全文逐函数安全分析
+
+## 0. 文件结构总览与入口点枚举
+
+本文件为 Prompty 加载器，全文共约 160 行。逐一枚举所有入口点（source）：
+
+1. **文件路径参数**：`load(path)`（第 27 行）、`load_async(path)`（第 41 行）——外部传入的 `.prompty` 文件路径；
+2. **YAML frontmatter 内容**：由 `load_prompty` 解析出的 `data` 字典（第 31、45 行），其中任意键值可被攻击者控制（若 prompty 文件来自不可信来源）；
+3. **环境变量**：`${env:VAR}` 协议读取 `os.environ`（第 106 行）；
+4. **二级文件包含**：`${file:relative/path}` 协议触发 `_load_file_content`（第 113 行 → 第 137 行），可读任意扩展名文件；
+5. **回调通道**：`_pre_process` 作为 `LoadContext(pre_process=...)` 回调注入（第 68 行），在 `Prompty.load` 内部对每个 dict 触发——这是第二入口/替代通道，任何经过该 context 的嵌套 dict 都会执行协议解析；
+6. **保存侧回调**：`default_save_context` 的 `_strip_internals`（第 55–62 行），仅做键过滤，无 sink。
+
+## 1. `load()`（第 27–38 行）
+
+- 第 28 行：`path = Path(path).resolve()` —— 仅规范化路径，**无任何目录白名单/根目录约束**。攻击者控制的 path 可指向文件系统任意位置。
+- 第 29–30 行：仅检查存在性。
+- 第 31 行：`load_prompty(path)` 读入并解析 YAML（sink：文件读取 + YAML 解析；使用的是项目内 utils，此处假定 frontmatter 用 safe_load，但即便如此内容仍进入后续流程）。
+- 第 33 行：进入 `_build_agent`。
+
+数据流：`path(外部) → resolve → load_prompty 读文件 → _build_agent`。防御：无。这是第一个未验证的 source。
+
+## 2. `load_async()`（第 41–46 行）
+
+与 `load` 完全对称（第 42 行 resolve、第 44 行 await 异步读取、第 46 行同一 `_build_agent`）。所有结论同样适用，属第二入口的镜像通道。
+
+## 3. `default_save_context()`（第 49–62 行）
+
+- 第 55–62 行：`_strip_internals` 只删除 metadata 中 `__` 前缀键。这是输出净化，不涉及危险 sink（无 eval/exec/os.system/subprocess/yaml.dump unsafe）。唯一注意点：它只清洗 `metadata` 子字典，其他位置的 `__` 键不被清除，但这属于信息泄露面而非可利用漏洞，且依赖调用方如何序列化。判定：无直接漏洞。
+
+## 4. `_build_agent()`（第 65–81 行）
+
+- 第 70–72 行：body-only 时把整段 markdown 塞进 `instructions`，无过滤——但 markdown 内容最终只是模型提示词文本，非代码 sink。
+- 第 75 行：`ctx = LoadContext(pre_process=_pre_process(path))` —— 关键：把基于 attacker-controlled path 构造的回调注入加载管线。
+- 第 76 行：`Prompty.load(data, ctx)` —— pre_process 会对 data 中**每一个嵌套 dict** 执行（替代通道确认：即使顶层值不是 `${...}` 字符串，深层嵌套的字符串值也会被解析）。
+
+## 5. `_pre_process()` / 内部 `process()`（第 88–121 行）—— 核心风险区
+
+- 第 96–99 行：匹配 `${...}` 格式，黑名单式检查（startswith `${`、endswith `}`），按题目要求视为可绕过/弱防御，且这里本来就没有更严格的校验。
+- 第 101 行：`inner = value[2:-1]` 后 `partition(":")`，protocol 未做白名单外的任何限制——但实际只处理 `env` 和 `file` 两个分支，未知协议被静默忽略（第 121 行隐式跳过），不算命令注入面。
+- **`${env:VAR:default}` 分支（第 104–112 行）**：
+  - 第 106 行 `os.environ.get(var_name)` —— source 为进程环境变量。若 prompty 文件不可信，攻击者可让配置读取任意环境变量（如 `API_KEY`、`AWS_SECRET_ACCESS_KEY`）并注入到 prompt/metadata 中，随后可能随序列化或请求外发——**敏感信息泄露（CWE-200/CWE-214）**。
+  - 第 109 行 default 注入同理。
+- **`${file:relative/path}` 分支（第 113–118 行）**：
+  - 第 114 行：`relative_path = (agent_file.parent / val).resolve()` —— **关键缺陷**：`Path.__truediv__` 遇到绝对路径 `val`（如 `/etc/passwd` 或 Windows `C:/...`）时直接丢弃左侧基路径；且 `..%2F` 式的 `../../..` 在 resolve 后同样逃逸出 agent_file.parent。**没有任何 `is_relative_to(agent_file.parent)` 校验**。
+  - 第 115–117 行：仅检查存在性后即放行。
+  - 第 118 行：`data[key] = _load_file_content(relative_path)` —— sink：任意文件读取，结果写入配置对象。
+- 完整链路验证：source = 不可信 `.prompty` frontmatter 中的字符串值（第 96 行起处理）→ 绕过仅有格式检查 → 第 114 行路径拼接无 containment 检查 → 第 118/137 行 open() 读取 → 内容成为 agent 配置的一部分，可经 `to_yaml()/to_json()` 或后续 LLM 调用外泄。防御有效性：**无有效防御**（resolve 不等于沙箱化；存在性检查不构成访问控制）。
+
+## 6. `_load_file_content()`（第 124–140 行）
+
+- 第 128 行：`open(path, encoding="utf-8")` —— 直接打开上一步传入的未校验路径，sink 确认。
+- 第 129–130 行：`.json` → `json.load`（安全解析器）；第 131–132 行：yaml 用 `safe_load`（非 `load`，无反序列化 RCE）；第 133–134 行：**任意扩展名回退为纯文本读取**——意味着 `.prompty`、`.env`、私钥等任何文件都可被读出。注意没有 `.py` 执行、没有 pickle，故不构成代码执行，但任意读成立。
+
+## 7. 第二入口与替代通道复核
+
+- 异步入口（第 41 行）复用同一 `_pre_process`，漏洞等价可达；
+- 嵌套 dict 遍历（第 94–95 行 `for key, value in list(data.items())` 仅一层？——注意 process 只遍历当前层，但 `Prompty.load` 对每个子 dict 再次调用 pre_process，形成递归覆盖，深层 `${file:...}` 同样触发）；
+- `__source_path`（第 80 行）存入 metadata，配合 `default_save_context` 的 `__` 剥离逻辑，说明作者意识到内部键需隐藏，侧面印证 metadata 可能被导出——加强泄露链可信度。
+
+## 结论
+
+主要漏洞：`${file:}` 协议路径穿越导致任意文件读取（CWE-22），次要：`${env:}` 可窃取环境变量（CWE-200）。前提是 prompty 文件部分可控（典型威胁模型：用户加载第三方共享的 .prompty）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 (Path Traversal / Arbitrary File Read), CWE-200 (Sensitive Env Disclosure)",
+  "risk_level": "high",
+  "source": "line 96-101: attacker-controlled ${file:path} string from untrusted .prompty frontmatter",
+  "sink": "line 114 relative_path=(agent_file.parent/val).resolve() without containment check -> line 128 open(path) -> line 134 f.read()",
+  "explanation": "untrusted frontmatter value -> weak format-only check at line 96-99 -> line 114 truediv+resolve allows absolute paths and .. escape -> line 115 only existence check -> line 118 _load_file_content -> line 128 open reads any file (fallback text branch line 133-134 covers all extensions) -> content stored into agent config and may be exfiltrated via serialization or LLM call; secondary flow: ${env:VAR} at line 106 reads arbitrary environment variables into config; async entry line 41 and nested-dict callback channel via Prompty.load reach the same sink",
+  "fix_suggestion": "after line 114 add containment validation such as resolved.relative_to(agent_file.parent.resolve()) raising on failure, reject absolute val before joining, restrict file protocol to an allowlisted directory and extension set, and gate env protocol behind an explicit opt-in flag"
+}
+```

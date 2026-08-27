@@ -1,0 +1,31 @@
+## 编号分析
+
+1. **入口点枚举（全文）**：
+   - 第 60–100 行 `Configure`：配置文件指令（urls、bind、dn_template、base_dn、filter 等），均为管理员控制的静态配置，非攻击者可控。
+   - 第 102–128 行 `readBindDirective`：仅解析管理员配置，凭据来自配置文件，无外部输入。
+   - 第 130–172 行 `newConn`：连接建立，URL 来自配置。
+   - 第 174–201 行 `getConn` / 第 203–219 行 `returnConn`：连接池管理。
+   - 第 221–249 行 `Lookup(username)`：外部 source 为 `username` 参数，sink 为第 236 行的 LDAP Search filter。
+   - 第 251–293 行 `AuthPlain(username, password)`：外部 source 为 `username`/`password`，sink 为第 266 行 Search filter、第 275 行 DN 模板替换、第 284 行 `conn.Bind(userDN, password)`。
+
+2. **source→sink 数据流验证**：
+   - **Lookup 第 236 行**：`strings.ReplaceAll(a.filterTemplate, '{username}', ldap.EscapeFilter(username))` —— 用户名先经 `ldap.EscapeFilter` 转义（转义 `* ( ) \ \0` 等过滤器特殊字符），再代入模板。LDAP 过滤器注入被有效阻断。
+   - **AuthPlain 第 266 行**：同上，使用 `ldap.EscapeFilter`，有效。
+   - **AuthPlain 第 275 行**：`strings.ReplaceAll(a.dnTemplate, '{username}', ldap.EscapeDN(username))` —— DN 特殊字符（逗号、等号等）经 `ldap.EscapeDN` 转义后用于 Bind DN，防 DN 注入，有效。
+   - **AuthPlain 第 284 行**：`conn.Bind(userDN, password)` —— password 作为简单绑定密码直接传给 LDAP 协议字段，协议层编码由 go-ldap 库处理，不存在注入面；且绑定失败统一返回 `ErrUnknownCredentials`（第 285–287 行），不泄露区分信息。
+   - 模板中若用户名本身含 `{username}` 字符串：替换只发生一次方向是模板→值，值中残留的 `{username}` 不会再被二次展开（ReplaceAll 单向），无可利用点。
+
+3. **第二入口与替代通道**：`Lookup` 同时注册为 `table.ldap`（第 300 行），同样走第 236 行已转义路径；无文件、环境变量等其他外部输入通道。所有 URL/bind 凭据均为管理员配置。
+
+4. **防御有效性复核**：此处使用的是库级转义函数（EscapeFilter/EscapeDN），不是黑名单或正则，属于上下文正确的规范转义，视为有效防御。
+
+5. **次要观察（非漏洞）**：
+   - 第 141 行直接修改共享的 `a.tlsCfg.ServerName` 后再 Clone，并发下有轻微竞态，但 ServerName 值仍为合法主机名，无安全后果；
+   - 第 191 行 `Start()` 无锁写 `a.conn`，与 `getConn` 存在初始化竞态，属可靠性问题而非可利用安全漏洞；
+   - 连接在整个操作期间由 `connLock` 串行化持有（getConn 加锁至 returnConn 解锁），避免了“以用户身份绑定的连接被他人复用搜索”的越权问题。
+
+结论：全文未发现可利用的安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "两个外部输入入口 Lookup 与 AuthPlain 中，username 在代入 LDAP 过滤器前均经过 ldap.EscapeFilter 转义（第236行、第266行），在代入 dn_template 前经过 ldap.EscapeDN 转义（第275行），LDAP 过滤器注入与 DN 注入均被有效阻断；password 仅作为简单绑定凭据传给协议层，无注入面；其余数据（服务器 URL、bind 凭据、模板）全部来自管理员配置文件，不可被攻击者控制；连接由 connLock 全程串行保护，避免认证态连接复用导致的越权。未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
+```

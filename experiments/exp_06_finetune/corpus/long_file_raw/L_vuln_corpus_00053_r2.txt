@@ -1,0 +1,38 @@
+## 编号分析（全文逐函数）
+
+**1. 入口点枚举**
+- 构造器 `PreviousMap(css, opts)`（第 12–24 行）：`css` 为外部输入的 CSS 文本，`opts.from`、`opts.map`、`opts.map.prev`、`opts.unsafeMap` 均为外部可控参数。
+- 隐式入口：`loadAnnotation` 从 CSS 注释中提取的 `annotation`（第 60–74 行）——这是典型的第二入口：文件内容本身成为攻击载荷。
+- 回调入口：`opts.map.prev` 若为函数（第 84–94 行），其返回值直接作为路径使用。
+
+**2. `fromBase64`（第 5–11 行）**：纯解码工具，无 sink，无风险。
+
+**3. `decodeInline`（第 39–56 行）**：仅接受 `data:application/json` 前缀的内联 map，解码后作为 JSON 文本进入 `SourceMapConsumer`，不触达文件系统，无可利用数据流。
+
+**4. `loadAnnotation`（第 60–74 行）—— 漏洞核心 source**
+```js
+let comments = css.match(/\/\*\s*# sourceMappingURL=/g)
+let start = css.lastIndexOf(comments.pop())
+let end = css.indexOf('*/', start)
+this.annotation = this.getAnnotationURL(css.substring(start, end))
+```
+问题：`lastIndexOf(comments.pop())` 用“注释开头字符串”做整体查找。若该字符串在更早位置出现（例如出现在字符串字面量、或前一个匹配与真正注释之间内容重叠），`start` 会定位到错误位置；随后 `end = indexOf('*/', start)` 会跳过换行与中间任意内容，把两个无关片段之间的整段文本当作 URL 提取。攻击者可借此让 `annotation` 变成完全受控的相对路径（如 `../../../../etc/passwd.map` 或跨目录的 `.map` 文件）。这正是上游 postcss 8.4.31 修复的 CVE-2023-44270（行返回解析缺陷）。
+
+**5. `loadFile`（第 46–58 行）—— sink 与防御评估**
+sink 是第 47 行 `readFileSync(path, 'utf-8')`，即任意文件读取原语。防御有两层：
+- 第 48 行 `/\.map$/i.test(path)`：黑名单式后缀检查，可绕过（很多敏感信息恰好以 `.map` 结尾；且大小写/编码变体不适用但后缀限制本身即弱约束）。
+- 第 50–57 行相对路径检查：仅当 `cssFile` 存在时生效。
+关键缺口：
+(a) 当 `opts.from` 未提供（`file` 为 undefined）时，第 55 行调用 `this.loadFile(map, file, false)` 中 `cssFile` 为空，相对路径检查整体被跳过，只剩 `.map$` 后缀检查——可读取进程权限下任意以 `.map` 结尾的文件；
+(b) 结合第 4 点的解析缺陷，即使有 `cssFile`，构造的 annotation 也可在检查逻辑可接受的形态下指向非预期文件；
+(c) 第 85–92 行 `prev` 为函数时 `trusted=true`，防御被完全禁用（此为 API 设计使然，属可信边界内）。
+
+**6. `loadMap`（第 77–113 行）**：第 104–105 行 `join(dirname(file), map)` 后传入 `loadFile(..., false)`，是 source→sink 的完整通道：CSS 注释内容 → `annotation` → join → `readFileSync`。第 108 行 `JSON.parse` 失败仅吞异常返回 undefined，读取动作已经发生（读到的内容虽不回显给攻击者，但可配合后续 sourcemap 处理流程泄露 sourcesContent）。
+
+**7. `isMap` / `consumer` / `withContent`**：对象形状判断与消费封装，无独立 sink。
+
+**结论**：存在经 CSS 注释注入导致的任意 `.map` 文件读取（路径遍历受限但后缀检查可绕过、且无 `from` 时遍历完全放开），对应已知 CVE-2023-44270。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径遍历导致任意文件读取", "risk_level": "中", "source": "line 60-74: loadAnnotation 从外部 CSS 注释提取的 annotation，lastIndexOf 定位错位可注入任意相对路径", "sink": "line 47: loadFile 中 readFileSync(path, utf-8)", "explanation": "攻击者控制的 CSS 注释 -> loadAnnotation 因 lastIndexOf(comments.pop()) 匹配错位且 indexOf 跨越换行，将恶意路径写入 this.annotation -> loadMap 第 104-105 行 join(dirname(file), map) -> loadFile 第 48 行仅做 .map 后缀黑名单检查（可绕过），第 50-57 行相对路径检查在 cssFile 缺失时被整体跳过 -> readFileSync 读取越权文件", "fix_suggestion": "参照 postcss 8.4.31 修复：重写 loadAnnotation，从 CSS 末尾按行扫描真实注释位置而非对注释文本做 lastIndexOf 整体查找；并在 loadFile 中无论 cssFile 是否存在都强制 resolve 后校验路径未逃逸出允许根目录，拒绝包含 .. 段与非常规字符的 annotation"}
+```

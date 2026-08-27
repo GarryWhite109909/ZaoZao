@@ -1,0 +1,70 @@
+# zerogod/acceptor.go 全文安全分析
+
+## 一、文件结构与入口点枚举
+
+本文件是 ZeroGod（一个 mDNS/DNS-SD 服务欺骗工具，类似 bettercap 的 zeroconf 模块）的监听器封装。全文共包含以下函数与数据结构，逐一分析：
+
+1. `TCP_HANDLERS` 全局映射（第 14–27 行）
+2. `Acceptor` 结构体定义（第 29–41 行）
+3. `HandlerContext` 结构体定义（第 43–53 行）
+4. `NewAcceptor` 构造函数（第 55–85 行）
+5. `(*Acceptor).startTCP`（第 87–133 行）
+6. `(*Acceptor).startUDP`（第 135–166 行）
+7. `(*Acceptor).Start`（第 168–174 行）
+8. `(*Acceptor).Stop`（第 176–190 行）
+
+## 二、逐函数入口点与 source→sink 分析
+
+### 1. TCP_HANDLERS 映射（第 14–27 行）
+
+四个条目：`_ipp`、`_ipps`、`_http`、`_https`。这是静态配置表，非用户输入可控。唯一的动态性在于 `NewAcceptor` 中通过 `strings.Contains(service, svcName)` 匹配（第 66 行）。注意匹配顺序依赖 Go map 遍历的随机性：若 service 同时含 `_http` 与 `_ipps` 等子串，命中的 handler 不确定——这是一个**功能性缺陷**（非确定性 handler 选择），但不是可利用的安全漏洞，因为所有 handler 都在本模块内实现且 panic 有 recover 保护。
+
+### 2. NewAcceptor（第 55–85 行）
+
+**source**：`service` 字符串参数（最终来自 mDNS 广播的服务类型名，即网络对端可控输入）。
+**sink**：
+- 第 60 行：`strings.Contains(service, "_tcp")` → 仅决定 proto 为 "tcp"/"udp"，无注入面。
+- 第 67–72 行：仅用于 map 查找比较，不进入任何解释器/shell/路径。
+- 第 76 行：`mod.Warning("no protocol handler found for service %s ...", tui.Yellow(service), ...)` —— `service` 作为格式化参数传入，非格式串本身，无 format string 注入。
+- 第 80 行：`mod.Info("found %s %s protocol handler (tls=%v)", ...)` 同上。
+
+结论：`service` 只流向日志与字符串比较，不流向命令执行、文件路径或 SQL 等 sink。日志注入（伪造换行）在 tui 日志场景下风险极低且非本文件职责。
+
+### 3. startTCP（第 87–133 行）
+
+**入口点**：`net.Listen("tcp", "0.0.0.0:%d")`（第 90 行）——绑定所有接口。这是工具的设计意图（局域网服务欺骗），但值得指出：若运行环境有不受信网络接口，监听会暴露到该网络。这属于部署配置问题，代码层面无缺陷。
+
+第 92–94 行：TLS 包装，tlsConfig 由调用方提供，本文件不构造证书逻辑。
+
+第 100–132 行 accept 循环：
+- 每个 conn 启动 goroutine（第 108 行），构造 HandlerContext 并调用 `a.handler.Handle(ctx)`（第 130 行）。
+- **关键防御点**：第 126–129 行 `defer func(){ if r := recover(); r != nil { a.mod.Error(...) } }()`。这确保任意客户端发送的畸形数据导致 handler panic 时不会击穿整个进程。注意 recover 在 defer 中位于 Handle 调用之后注册于同一 defer 内——defer 注册在第 126 行，Handle 调用在第 130 行，顺序正确，recover 有效覆盖 Handle 执行期间的所有 panic。
+- 无连接数限制、无超时设置（未调用 `conn.SetDeadline`）：恶意客户端可通过大量慢速连接消耗资源（goroutine/fd 耗尽）。这是**资源耗尽类弱点（CWE-400 类似）**，但作为主动欺骗工具，其威胁模型是攻击者对抗场景，且实际协议 handler（ipp/http，不在本文件内）通常自行处理读写；本文件本身不读取客户端数据，因此慢速连接最多占用一个 goroutine + 一个 fd。属于低危健壮性问题而非典型可利用漏洞。
+- 客户端数据在本文件中不被解析：`conn.RemoteAddr()`（第 103、128 行）仅用于日志。
+
+### 4. startUDP（第 135–166 行）
+
+**入口点**：UDP socket 绑定 `0.0.0.0:port`（第 137–139 行）。
+**source→sink**：第 152 行 `ReadFromUDP(buffer[0:])` 读入网络数据（source），第 156 行 `a.mod.Info("%v:\n%s", addr, Dump(buffer[0:n]))` —— 数据经 `Dump` 后作为格式化参数输出到日志。验证：
+- 格式串是字面量，用户数据在参数位，无 format string 注入；
+- `buffer[0:n]` 切片边界由 ReadFromUDP 返回值保证，无越界；
+- `Dump`（外部函数）负责十六进制转储，即使内容含控制字符也只是日志污染，无执行 sink。
+- 固定 4096 字节缓冲区，UDP 单包天然受限，无溢出可能（Go slice 安全）。
+
+### 5. Start / Stop（第 168–190 行）
+
+纯状态分发与关闭逻辑。第 182–184 行 TCP 停止路径：先 `ctxCancel()` 再等待 context Done 再 Close listener——关闭顺序合理。第 187 行 UDP 直接 Close。无输入参与，无漏洞面。唯一小瑕疵：`running=false` 与并发 Accept 循环之间无锁同步（data race on bool），但 Go 中这只是良性竞争，Accept 会因 listener Close 返回错误退出循环，不构成安全问题。
+
+## 三、第二入口与替代通道核查
+
+- **替代通道 1（mDNS 广播内容）**：`service`、`ippAttributes`、`httpPaths` 均来自上游 mDNS 解析（本文件外），本文件中它们只被透传给 HandlerContext 和用于 Contains 匹配/日志，无 sink。
+- **替代通道 2（客户端连接数据）**：TCP 数据完全交给 ippClientHandler/httpClientHandler/handleGenericTCP（外部文件）；UDP 数据只做 Dump 日志。本文件自身不存在将网络字节流导向 exec/file/net 写回的 sink。
+- **黑名单/正则检查**：本文件未使用任何黑名单或正则过滤，故不存在“过滤可绕过”问题。
+
+## 四、综合结论
+
+通读全文后：所有网络输入（service 名、UDP 包内容、TCP 连接）在本文件内的 sink 仅为日志输出，均为格式化参数位置，无注入、无溢出、无路径遍历、无命令执行。panic 被 recover 兜底。存在的仅有两个低危健壮性事项：(1) 监听 0.0.0.0 且 TCP 无连接数限制/超时，理论上可被资源耗尽；(2) handler 匹配用 Contains 且 map 遍历无序，可能导致 handler 选择不确定。均不构成可利用的安全漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "通读全文：网络输入包括 mDNS 服务名字符串(第55行参数)、TCP客户端连接(第100行Accept)、UDP数据包(第152行ReadFromUDP)。这些source在本文件内的sink仅为日志输出(第76、80、128、156行)，全部以格式化参数形式传入字面量格式串，无format string注入、无命令执行、无文件操作、无内存越界(Go slice边界由ReadFromUDP返回值保证)。panic由第126-129行的recover兜底，畸形客户端数据不会击穿进程。发现两处低危健壮性问题但不构成可利用漏洞：一是startTCP对每个连接无限流无超时(第108行goroutine无上限)，理论上可被慢速连接耗尽fd和goroutine(CWE-400类)；二是第65-73行用strings.Contains配合map无序遍历匹配handler，当服务名同时命中多个关键字时handler选择不确定，属功能缺陷。此外监听0.0.0.0是该欺骗工具的设计意图，属部署考量。", "fix_suggestion": "no fix needed"}
+```

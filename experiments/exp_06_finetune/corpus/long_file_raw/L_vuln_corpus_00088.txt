@@ -1,0 +1,18 @@
+## 编号分析
+
+1. **`put`（第 19–72 行）入口点**：路由 PUT，source 为 `req.URL.Path`（第 25 行）与 `req.Body`。路径经 `sanitizePath(fs.UploadFolder, ...)` 清洗，并阻断 `.goshs` 覆盖与 ACL 校验——路径流防御看似有效（假设 sanitizePath 做了 containment 检查）。
+2. **第 44 行 `io.ReadAll(req.Body)`**：将整个请求体一次性读入内存，**没有任何大小上限**（对比 `upload` 第 100 行起采用 chunkSize 分块写入）。攻击者可发送超大或无限流（chunked），造成内存耗尽，CWE-400。这是全文证据支持的缺陷。
+3. **`put` 缺少 CSRF 防护**：`upload`（第 76 行）有 `checkCSRF`，而 `put` 没有；但 PUT 属非简单请求，跨站利用受 CORS preflight 限制，风险较低。
+4. **`upload`（第 75–152 行）**：文件名仅按 `/` 分割取最后段（第 116 行），未处理 Windows 反斜杠——在 Windows 主机上 `..\..\x` 可穿越（平台相关）；Linux 上反斜杠是合法文件名字符，不构成穿越。`.goshs` 仅精确匹配，`.goshs~` 临时文件名不受限但非 ACL 文件本身，影响有限。
+5. **`bulkDownload`（第 155 行起）**：`file` 查询参数经 `sanitizePath(fs.Webroot, ...)` 且失败即 continue（第 168–171 行），遍历项被跳过——防御结构上有效。walker 用 `filepath.Walk`（Lstat，不跟随符号链接）。
+6. **第 161–164 行逻辑缺陷**：`len(files) == 0` 时调用 `handleError` 后**缺少 return**，函数继续执行，向已写入 404 的响应再写 zip 头，属响应处理缺陷而非可直接利用漏洞。
+
+## 结论
+
+主要可确认漏洞：`put` 中无界读取请求体导致拒绝服务。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-400 未受限的资源消耗（内存耗尽 DoS）", "risk_level": "中", "source": "line 44: io.ReadAll(req.Body) 之前的 req.Body（攻击者完全可控且无大小限制）", "sink": "line 44: io.ReadAll 将整个请求体载入内存", "explanation": "put 处理器在第 44 行用 io.ReadAll 一次性把 PUT 请求体读入内存，且该处理器不像 upload 那样分块写入（对比第 100 行起的 chunkSize 循环），也没有任何 Content-Length 或字节数上限校验；攻击者可通过大文件或 chunked 无限流使服务器内存耗尽 -> 服务不可用", "fix_suggestion": "line 44: 改为 io.LimitReader(req.Body, maxSize) 并设置合理上限，或像 upload 函数一样使用固定 buf 分块拷贝到 osFile，超限时中断并返回 413"}
+```
+
+附带说明（非主结论）：`upload` 第 116 行文件名清洗未处理反斜杠，Windows 部署下存在路径穿越风险；`bulkDownload` 第 163 行 `handleError` 后缺少 `return`，属逻辑缺陷。
