@@ -92,7 +92,7 @@ def call_teacher(key: str, user_prompt: str,
         try:
             use_key, key_idx = _next_key() if len(KEYS) > 1 else (key, 0)
             resp = requests.post(
-                API_URL, timeout=240,
+                API_URL, timeout=420,  # 2026-08-28：思考型教师长任务 240s 频发 ReadTimeout，放宽到 420s
                 headers={"Authorization": f"Bearer {use_key}",
                          "Content-Type": "application/json"},
                 json=payload)
