@@ -1,0 +1,59 @@
+LANG: go
+```code
+package search
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/dlclark/regexp2"
+)
+
+// maxQueryLen bounds the worst-case size of any string handed to the engine.
+const maxQueryLen = 256
+
+// querySyntax keeps the classic nested-quantifier shape, but every group is
+// atomic (?>...): the backtracking engine can never re-enter a matched group,
+// so matching stays linear even on adversarial input like aaaa...a!
+var querySyntax = regexp2.MustCompile(`^(?>[A-Za-z0-9_]+)(?>[ \-](?>[A-Za-z0-9_]+))*$`, regexp2.None)
+
+func init() {
+	// Belt-and-braces: abort any match still running after 500ms.
+	querySyntax.MatchTimeout = 500 * time.Millisecond
+}
+
+// SearchHandler serves GET /search?q=<term> and validates the term before use.
+func SearchHandler(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query().Get("q")
+	if len(query) > maxQueryLen {
+		http.Error(w, "query too long", http.StatusBadRequest)
+		return
+	}
+	ok, err := querySyntax.MatchString(query)
+	if err != nil || !ok {
+		http.Error(w, "malformed query", http.StatusBadRequest)
+		return
+	}
+	// Query is a well-formed token list; hand off to the search core here.
+	w.Write([]byte("search accepted"))
+}
+
+// Register wires the only route exposed by this package.
+func Register(mux *http.ServeMux) {
+	mux.HandleFunc("/search", SearchHandler)
+}
+```
+
+第1步（类别定位）：本条属于 CWE-400 无界资源消耗中的灾难性回溯正则（ReDoS）子类：不可信输入被交给带回溯语义的正则引擎，嵌套量词形态（如 (a+)+、(a|a)*、(\w+\s?)+）在匹配临近失败时产生指数级回溯，单个请求即可耗尽 CPU。这不是注入、越权或信息泄露。特别说明：Go 标准库 regexp 是 RE2 线性引擎、天然免疫此类问题；本模块第 7 行引入的 dlclark/regexp2 是带回溯语义的 .NET 风格引擎（为使用原子组等高级语法），因此该风险类在本文件真实存在，防御必须显式成立。
+
+第2步（输入点枚举与可达性）：外部输入点唯一——第 25 行 r.URL.Query().Get('q') 读取查询参数，对应第 41 行注册的唯一路由 /search；query 在第 26 行先过长度闸门，随后在第 30 行作为 MatchString 的被匹配串进入回溯引擎。source 到 sink 单流直达、无中间变换，可达性成立，防御必须覆盖这条流。
+
+第3步（防御一：输入长度上限）：第 26-29 行 len(query) > 256 超限即返回 400。类型正确——它限制的是输入规模本身，使任何引擎（哪怕纯回溯）的最坏工作量有上界；位置正确——位于输入边界、先于第 30 行 sink 执行；覆盖完整——source→sink 仅此一条流且必经该分支，无旁路。
+
+第4步（防御二与三：原子组正则 + 引擎超时兜底）：第 16 行模式虽保留嵌套量词的典型外形，但所有组均写成原子组 (?>...)，匹配完成后禁止引擎回溯重入，从机制上消除指数回溯——类型正确（原子组正是回溯引擎下该漏洞形态的针对性消解）、位置正确（定义在包级 Regexp 对象上，对该对象的全部匹配调用统一生效）；第 20 行 MatchTimeout=500ms 作为引擎级兜底，超时返回 ErrTimeout 并在第 31 行转为 400 响应，三层防御互为冗余。
+
+第5步（第二入口/替代通道检查结论）：全文件仅第 39-41 行 Register 注册 /search 一个路由；querySyntax.MatchString 全文件仅第 30 行一处调用；除 q 外无其他参数、header 或 body 字段进入正则，也无反射等间接调用。未来任何调用方都必须复用 handler 内同一闸门序列（长度上限→原子组匹配→超时），防御不可绕过。结论：无第二入口、无替代通道，本文件对 CWE-400 防御类型正确、位置正确、覆盖完整，判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点唯一：第25行 r.URL.Query().Get('q') 经第41行注册的唯一路由 /search 进入，第30行 querySyntax.MatchString(query) 为回溯引擎 sink，source→sink 单流直达；防御一：第26行 len(query)>256 在 sink 前以长度上限约束输入规模，位置在输入边界且覆盖唯一数据流，最坏工作量有界；防御二：第16行模式全部使用原子组 (?>...) 禁止回溯重入，从引擎层面消除嵌套量词的指数回溯，对该 Regexp 的所有匹配调用生效；防御三：第20行 MatchTimeout=500ms 兜底，超时错误在第31行转为400响应；第二入口检查：全文件仅 /search 一个路由、MatchString 仅一处调用、除 q 外无其他参数或间接调用进入正则，无绕过通道，判定安全", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,67 @@
+LANG: python
+```code
+"""Product search API for the storefront service.
+
+Queries the catalog database and returns matching products as JSON.
+"""
+import os
+
+import psycopg2
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+
+DB_CONFIG = {
+    "host": os.environ.get("DB_HOST", "10.0.2.15"),
+    "port": 5432,
+    "dbname": "shop",
+    "user": "app_rw",
+    "password": os.environ.get("DB_PASSWORD", ""),
+}
+
+
+@app.route("/api/products/search", methods=["GET"])
+def search_products():
+    keyword = request.args.get("q", "").strip()
+    category = request.args.get("category", "all")
+    conn = None
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        sql = "SELECT id, name, price FROM products WHERE name ILIKE %s AND category = %s"
+        cur.execute(sql, ("%" + keyword + "%", category))
+        rows = cur.fetchall()
+        cur.close()
+        return jsonify({"items": [dict(zip(("id", "name", "price"), r)) for r in rows]})
+    except psycopg2.Error as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+```
+
+1. **本类核心特征（第 35 行）**：`str(e)` 把 psycopg2 驱动异常对象转成字符串后，原样放进 `jsonify` 响应体（HTTP 500）返回客户端。psycopg2 异常的字符串形式携带 PostgreSQL 服务端的完整错误上下文——第 29 行 SQL 语句原文片段、LINE/位置标记、表名与列名；连接失败时还包含主机、端口、账号。这是「错误信息泄露敏感信息」的典型形态；同时由于第 30 行使用参数绑定，用户输入不参与 SQL 语法构造，本例不存在 SQL 注入，也不涉及命令执行或越权判断，类别唯一归属 CWE-209。
+
+2. **输入点枚举与可达性（第 23、24 行）**：外部输入点共两处——第 23 行 `request.args.get('q')` 与第 24 行 `request.args.get('category')`，均来自第 21 行路由 `/api/products/search` 的查询字符串，无需认证即可触达。主数据流：q/category → 第 30 行 `cur.execute` 的绑定参数 → 当输入触发驱动层错误（category 超出列宽抛 value too long、编码异常、表结构漂移抛 UndefinedColumn 等）时，异常在第 34 行被捕获，含 SQL 原文的消息经第 35 行进入响应体，source→sink 全程可达。
+
+3. **第二条数据流（第 27 行，不依赖恶意输入）**：`psycopg2.connect(**DB_CONFIG)` 在数据库宕机、凭据失效或网络不可达时抛出 OperationalError，消息形如 connection to server at 10.0.2.15, port 5432 failed ... user app_rw，直接暴露内网地址、端口与数据库账号；对第 21 行路由的任意请求都会执行到第 27 行，因此该流无需任何特殊输入即可触发，并同样汇聚到第 35 行的 sink，泄露面比注入类更宽。
+
+4. **逐流防御核查**：流 1——第 23 行 `.strip()` 仅去除空白，属输入规范化而非泄露防御；第 30 行参数绑定是针对 SQL 注入的有效防御，但防御类别与 CWE-209 不重叠，对错误消息内容零覆盖。流 2——连接配置来自第 12-18 行环境变量，无任何脱敏。两条流共用的第 34-35 行 except 块没有消息白名单、错误码映射或细节剥离，也没有把 `str(e)` 改为仅写服务端日志——即对错误信息泄露全程不存在有效防御。
+
+5. **第二入口/替代通道检查**：全文件仅第 21 行一个 `@app.route`，无其他路由、蓝图注册、CLI 入口或间接调用层；第 42 行 `app.run` 未启用 debug，Werkzeug 交互式调试器不构成额外泄露通道。结论：入口唯一，但入口内部存在两个异常源（第 27、30 行）与两个输入参数（第 23、24 行）汇聚到同一 sink，第 35 行对两类路径均无防护，确认存在 CWE-209 漏洞。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-209 Generation of Error Message Containing Sensitive Information",
+  "risk_level": "High",
+  "source": "line 23-24: request.args.get('q') 与 request.args.get('category')，经第 21 行路由无需认证触达",
+  "sink": "line 35: jsonify 响应体中的 str(e)，将 psycopg2 异常原文（含 SQL、表结构、内网连接细节）返回客户端",
+  "explanation": "流1: 第 23-24 行参数进入第 30 行参数化执行，触发驱动层错误（超长值/编码/模式漂移）时异常消息含第 29 行 SQL 原文与出错位置，第 34 行捕获后第 35 行 str(e) 原文进响应体；流2: 第 27 行连接失败时消息含内网主机 10.0.2.15、端口 5432、账号 app_rw，任意请求即可触发并经同一 sink 泄露；防御核查: 第 23 行 strip 仅清理空白，第 30 行参数绑定只防 SQL 注入、对错误泄露零覆盖，第 34-35 行无脱敏/白名单/通用错误码，全程无有效防御；第二入口检查: 仅第 21 行一个路由，无其他路由/蓝图/间接调用，第 42 行未开 debug，但单入口内两类异常源与两个参数汇聚同一 sink，泄露成立",
+  "fix_suggestion": "line 35: 最小修复——响应体仅返回固定通用文案与请求 ID（如 {'status':'error','message':'internal error'}），str(e) 完整细节只写入服务端日志"
+}
+```

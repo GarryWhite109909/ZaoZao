@@ -1,0 +1,60 @@
+LANG: javascript
+```code
+// src/payment/GatewayClient.js - PCI cardholder-data client (TLS enforced)
+import axios from 'axios';
+import https from 'https';
+
+const PLAINTEXT_PORTS = new Set(['80', '8080', '8000', '3000']);
+
+function assertTlsEndpoint(rawUrl) {
+  const url = new URL(rawUrl);
+  if (url.protocol !== 'https:') {
+    throw new Error(`refusing cardholder data over ${url.protocol}: TLS required`);
+  }
+  if (PLAINTEXT_PORTS.has(url.port)) {
+    throw new Error(`plaintext port ${url.port} forbidden for PAN/CVV traffic`);
+  }
+  return url;
+}
+
+export class GatewayClient {
+  constructor(endpointUrl, apiKey) {
+    this.endpoint = assertTlsEndpoint(endpointUrl);
+    this.apiKey = apiKey;
+    this.http = axios.create({
+      baseURL: this.endpoint.origin,
+      httpsAgent: new https.Agent({ rejectUnauthorized: true, minVersion: 'TLSv1.2' }),
+      timeout: 10000,
+      maxRedirects: 0,
+    });
+  }
+
+  async charge(card) {
+    const payload = {
+      pan: String(card.number).replace(/\D/g, ''),
+      expiry: `${card.expMonth}/${card.expYear}`,
+      cvv: String(card.cvv),
+      amountMinor: card.amountMinor,
+      currency: card.currency,
+    };
+    const res = await this.http.post('/v1/charges', payload, {
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+    });
+    return { transactionId: res.data.id, status: res.data.status };
+  }
+}
+```
+
+1. 第 1 步（类别核心特征）：CWE-311 的核心是敏感数据（PAN/CVV/令牌/密钥/PII）以明文形态跨越信任边界——典型形态是走明文信道（http:// 明文传输）或明文落盘，本例的敏感载荷在第 31-37 行组装（卡号、有效期、CVV），并在第 38 行 `this.http.post` 处离开进程边界进入网络；其漏洞孪生形态是 baseURL 配置为 http:// 或缺少 TLS 强制。这与注入、越权、反序列化等其他类别无关，判定对象是传输机密性。
+
+2. 第 2 步（输入点枚举与可达性）：外部输入点共两组。其一为构造函数参数 endpointUrl 与 apiKey（第 19 行）：endpointUrl 经第 20 行校验后写入第 23 行 baseURL，决定每次请求的目标主机；apiKey 写入第 39 行 Authorization 头，随请求体同信道出网。其二为 charge(card) 的持卡人字段（第 30 行）：card.number/expMonth/expYear/cvv 流入第 32-34 行 payload，直达第 38 行网络写出 sink。两组 source 到 sink 路径均可达。注意第 32 行 `replace(/\D/g, '')` 仅是 PAN 数字格式归一化，属于业务清洗，不作为安全防御参与判定。
+
+3. 第 3 步（防御类型正确性）：第 9 行对 URL 解析后的 `url.protocol` 做 `!== 'https:'` 等值白名单校验，属于传输层加密强制——CWE-311 传输场景的标准缓解；它作用于协议层而非数据内容，不是黑名单/正则/字符串替换过滤，不存在编码绕过空间（URL 解析器已对 scheme 归一化，`http:` 无法伪装成 `https:`）。第 12-13 行明文端口拦截为纵深防御。第 24 行 `https.Agent({ rejectUnauthorized: true, minVersion: 'TLSv1.2' })` 强制证书链校验并禁用 TLS 1.0/1.1，阻断中间人降级与剥离攻击。
+
+4. 第 4 步（防御位置与覆盖面）：校验位于第 20 行构造函数内，即任何请求发出之前，不存在“先配置后绕过”的窗口；第 22-27 行创建的 axios 实例是该类唯一网络出口对象。第 26 行 `maxRedirects: 0` 封堵了重定向降级到 http 的经典绕过路径；第 38 行请求路径为硬编码相对路径 '/v1/charges'，调用方无法按次覆盖主机。因此 PAN、CVV、有效期（第 38 行请求体）与 apiKey（第 39 行请求头）全部敏感字段均被同一 TLS 信道覆盖，无遗漏字段。
+
+5. 第 5 步（第二入口/替代通道检查）：模块仅导出 GatewayClient 一个类；文件内无直接 `http.request`/`https.request`/`fetch` 调用，除 charge 外无其他触网方法；构造函数在第 20 行抛异常使 http:// 配置无法实例化，第 26 行使运行期重定向降级不可行。结论：不存在第二入口或明文替代通道，防御类型正确、位置前置、覆盖完整，本文件不构成 CWE-311。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点1: 构造函数 endpointUrl(第19行)经第9行 https: 协议等值白名单与第12行明文端口拦截后注入第23行 baseURL, http:// 配置在实例化时即被拒绝; 输入点2: charge 的 card.number/cvv/expiry(第30行)组装进第31-37行 payload, 仅经第38行 this.http.post 出网, 该实例绑定第24行 https.Agent(rejectUnauthorized: true, minVersion TLSv1.2) 强制证书校验与现代 TLS 版本, 第26行 maxRedirects: 0 阻断重定向降级到 http, 第38行路径为硬编码相对路径无法按调用覆盖主机; 防御类型为传输层加密加协议白名单, 非黑名单/正则/字符串替换过滤, 位置在构造函数即任何请求发出之前, 覆盖 PAN/CVV/apiKey 全部敏感字段; 第二入口检查: 模块仅导出 GatewayClient, 无直接 http/https.request 或 fetch 调用, 无其他方法触网, 不存在明文替代通道, 判定无 CWE-311", "fix_suggestion": "no fix needed"}
+```

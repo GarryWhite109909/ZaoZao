@@ -1,0 +1,73 @@
+LANG: javascript
+```code
+// server/routes/export.js
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const { Parser } = require('json2csv');
+const db = require('../db');
+const router = express.Router();
+
+// 仅校验登录态，不做角色与字段级授权
+function requireLogin(req, res, next) {
+  const token = req.headers['x-auth-token'];
+  if (!token) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (e) {
+    return res.status(401).json({ error: 'invalid token' });
+  }
+  next();
+}
+
+// GET /api/export/orders?format=csv|json&debug=1
+router.get('/export/orders', requireLogin, async (req, res) => {
+  const format = req.query.format || 'csv';
+  const debug = req.query.debug === '1';
+  // 全列查询：含内部成本价、供应商结算价、毛利率、供应商联系人、内部备注
+  const rows = await db.query(
+    'SELECT id, sku, title, list_price, internal_cost, supplier_price, margin_pct, supplier_contact, internal_note FROM products'
+  );
+  if (debug) {
+    // 调试分支：把 SQL、行数、数据库版本直接回显给客户端
+    return res.json({
+      debug: true,
+      sql: 'SELECT id, sku, title, list_price, internal_cost, supplier_price, margin_pct, supplier_contact, internal_note FROM products',
+      rowCount: rows.length,
+      dbVersion: (await db.query('SELECT version()'))[0].version
+    });
+  }
+  if (format === 'json') {
+    return res.json({ exportedAt: new Date().toISOString(), data: rows });
+  }
+  const fields = ['id', 'sku', 'title', 'list_price', 'internal_cost', 'supplier_price', 'margin_pct', 'supplier_contact', 'internal_note'];
+  const parser = new Parser({ fields });
+  res.setHeader('Content-Disposition', 'attachment; filename="orders_export.csv"');
+  res.send(parser.parse(rows));
+});
+
+module.exports = router;
+```
+
+1. 第 1 步——本类核心特征：本模块的漏洞是 CWE-200 敏感信息暴露：服务端把本应仅限内部的数据（第 26 行查询结果中的内部成本价 internal_cost、供应商结算价 supplier_price、毛利率 margin_pct、供应商联系人 supplier_contact、内部备注 internal_note，以及第 32 行的完整 SQL 文本、第 34 行的数据库版本号）原样写入对客户端可见的 HTTP 响应。全程无 SQL 拼接、无命令执行、无跨站脚本，也不是访问他人对象 ID 的越权问题，而是字段级敏感数据在响应中泄露，应归为 CWE-200，而非 CWE-78/89/862 等其他类别。
+
+2. 第 2 步——外部输入点枚举与可达性：①第 10 行 req.headers['x-auth-token']，仅作为登录门禁；②第 22 行 req.query.format，决定走第 37 行 JSON 分支还是第 40-43 行 CSV 分支；③第 23 行 req.query.debug，决定是否进入第 28-35 行调试回显分支。三个输入均无需任何转换即可达对应 sink：format/debug 是纯分支开关，token 一旦验证通过，其后的所有响应路径对任意角色开放，可达性成立。
+
+3. 第 3 步——主数据流与防御核查：第 25-27 行 db.query 全列查询返回含 5 个敏感列的 rows → 第 40 行 fields 数组显式纳入 internal_cost/supplier_price/margin_pct/supplier_contact/internal_note → 第 41-43 行 json2csv 按该 fields 序列化并由 res.send 写入响应。防御核查：第 9-18 行 requireLogin 只验证 JWT 签名，无角色判断、无字段级授权，认证通过的低权限用户同样拿到全部内部列，认证不等于防泄露；第 40 行的 fields 是固定白名单，其本身就是泄露载体而非过滤措施；全文件不存在任何行级脱敏或字段剔除逻辑，防御完全缺失。
+
+4. 第 4 步——替代通道一（JSON 全量回显）：第 37-38 行 format=json 时 res.json({data: rows}) 直接序列化整个 rows 对象，连 fields 白名单都不经过，所有敏感列原样进入响应体。该通道与 CSV 通道共享同一敏感数据源，属于同一 sink 的第二条独立暴露路径。
+
+5. 第 5 步——替代通道二（客户端可控调试回显）：第 23 行 debug 参数完全由客户端控制，无 NODE_ENV 或环境变量校验；命中后第 30-35 行 res.json 回显完整 SQL 文本（第 32 行，暴露表名 products 与全部列名）、rowCount（第 33 行）以及第 34 行 SELECT version() 得到的数据库版本号，属于内部实现细节与版本信息对不可信方暴露，是 CWE-200 的典型调试信息泄露形态。
+
+6. 第 6 步——第二入口/替代通道检查结论：本文件仅挂载 /export/orders 一个路由，无其他入口或间接调用；但同一敏感数据集存在三条响应通道——CSV（第 43 行）、JSON（第 38 行）、debug 回显（第 30-35 行），format 与 debug 参数即替代通道，仅删除或修复任一分支仍保留完整泄露面，三条通道必须同时收敛。结论：CWE-200 敏感信息暴露成立，风险等级 High（内部定价与供应商数据可被任意已登录用户批量导出，可用于供应链成本分析与价格套利）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-200 Exposure of Sensitive Information",
+  "risk_level": "High",
+  "source": "line 25-27: db.query 全列查询返回的 products 结果集, 含 internal_cost/supplier_price/margin_pct/supplier_contact/internal_note 等敏感列",
+  "sink": "line 43: res.send(parser.parse(rows)) 将含敏感列的 CSV 写入对客户端可见的 HTTP 响应",
+  "explanation": "流1: 第25-27行全列查询取得敏感列 -> 第40行 fields 白名单显式纳入 internal_cost/supplier_price/margin_pct/supplier_contact/internal_note -> 第43行 res.send 以 CSV 全量回显给任意已登录用户; 流2: 同一 rows 经第37-38行 format=json 分支 res.json({data: rows}) 原样序列化全部敏感字段, 连字段白名单都不经过; 流3: 第23行 debug 参数由客户端完全控制且无环境校验 -> 第30-35行 res.json 回显完整 SQL 文本(第32行, 暴露表名与全部列名)、rowCount 与第34行 SELECT version() 得到的数据库版本号; 防御核查: 第9-18行 requireLogin 仅验证 JWT 签名, 无角色与字段级授权, 认证不构成对字段泄露的防御, 全文件无脱敏或字段剔除逻辑; 第二入口检查: 本文件仅 /export/orders 一个路由, 但 format 与 debug 参数构成同一敏感数据集的三条替代响应通道(CSV 第43行/JSON 第38行/debug 第30-35行), 仅修任一分支仍保留泄露面",
+  "fix_suggestion": "line 40: 最小修复——按角色维护导出字段白名单, 从 fields 中移除 internal_cost/supplier_price/margin_pct/supplier_contact/internal_note 等内部列并在序列化前对 rows 做字段过滤, 同时将第28-35行 debug 分支改为仅由服务端环境变量门控且不再回显 SQL 与数据库版本"
+}
+```

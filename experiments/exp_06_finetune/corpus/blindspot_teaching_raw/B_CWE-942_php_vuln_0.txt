@@ -1,0 +1,63 @@
+LANG: php
+```php
+<?php
+
+declare(strict_types=1);
+
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Psr\Http\Server\RequestHandlerInterface as RequestHandler;
+use Slim\Factory\AppFactory;
+
+require __DIR__ . '/../vendor/autoload.php';
+
+$app = AppFactory::create();
+
+// 网关级 CORS 中间件：直接反射客户端 Origin 并放行凭据，作用于全部 /v1/* 路由
+$app->add(function (Request $request, RequestHandler $handler): Response {
+    $origin = $request->getHeaderLine('Origin');
+
+    return $handler->handle($request)
+        ->withHeader('Access-Control-Allow-Origin', $origin !== '' ? $origin : '*')
+        ->withHeader('Access-Control-Allow-Credentials', 'true')
+        ->withHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+        ->withHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Api-Key')
+        ->withHeader('Vary', 'Origin');
+});
+
+// 预检请求短路：同样经过上面的中间件，回显过宽头后以 204 放行
+$app->options('/{routes:.+}', function (Response $response): Response {
+    return $response->withStatus(204);
+});
+
+// 会话鉴权的敏感端点：返回账户邮箱与 API Token
+$app->get('/v1/account', function (Request $request, Response $response): Response {
+    session_start();
+    if (empty($_SESSION['user_id'])) {
+        $response->getBody()->write(json_encode(['error' => 'unauthorized']));
+        return $response->withStatus(401);
+    }
+    $response->getBody()->write(json_encode([
+        'user_id'   => $_SESSION['user_id'],
+        'email'     => $_SESSION['email'] ?? null,
+        'api_token' => $_SESSION['api_token'] ?? null,
+    ]));
+    return $response->withHeader('Content-Type', 'application/json');
+});
+
+$app->run();
+```
+
+1. **本类核心特征定位**：第 19 行将客户端可控的 `Origin` 请求头原样反射进 `Access-Control-Allow-Origin`（为空时回退通配 `*`），第 20 行叠加 `Access-Control-Allow-Credentials: true`，构成“任意源反射 + 凭据放行”的典型过宽跨域策略。这是 CWE-942 Permissive Cross-domain Policy 的跨域策略配置缺陷，属于响应头策略层面的问题，不是命令注入、SQL 注入、XSS 或越权等其他类别。
+
+2. **外部输入点枚举与可达性**：① 第 16 行 `$request->getHeaderLine('Origin')`——HTTP 请求头，攻击者页面可任意伪造，经第 19 行无条件流入响应头 sink，中间件挂载于第 15 行应用最外层，对每个请求 100% 可达；② 第 27 行 OPTIONS 预检路由——走同一中间件链路，预检响应同样携带第 19-20 行的过宽头；③ 第 39-41 行 `$_SESSION` 中的 email/api_token——服务端会话敏感数据，经第 32 行 `/v1/account` 端点进入响应体，而该响应必然被全局中间件附加过宽 CORS 头。
+
+3. **逐条数据流防御核查**：流 1（第 16 行 Origin → 第 19 行 ACAO）：两者之间不存在任何源白名单、域后缀匹配、正则或条件分支，反射是无条件的，且与凭据头叠加；流 2（第 38-42 行敏感 payload → 响应体）：无 CSRF Token 校验、无 SameSite Cookie 约束、无自定义头要求（第 22 行反而显式放行 Content-Type/Authorization 跨域携带），第 23 行 `Vary: Origin` 仅防 CDN 缓存串扰，对策略本身无防御作用。两条流均无任何有效防御。
+
+4. **暴露链推演**：受害者已登录网关（浏览器持有会话 Cookie）→ 访问攻击者页面 → 页面脚本对网关发起携带凭据的跨站请求 `/v1/account` → 浏览器自动附带 Cookie，服务端在第 38-42 行返回 email 与 api_token → 响应头 ACAO 等于攻击者源（第 19 行）且 credentials 为 true（第 20 行）→ 浏览器放行脚本读取，攻击者获得凭据级敏感数据。
+
+5. **第二入口/替代通道检查**：第 15 行 `$app->add` 将中间件挂在应用最外层，全部路由（含第 27 行预检路由与第 32 行敏感端点）无例外继承该策略；第 27-29 行的预检路径同样回显过宽头并以 204 确认，等于为“任意源 + 凭据”组合出具预检通行证；不存在未覆盖该中间件的替代路由或更严格的策略通道，缺陷为全局性，漏洞成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-942 Permissive Cross-domain Policy", "risk_level": "High", "source": "line 16: $request->getHeaderLine('Origin') 客户端完全可控的 Origin 请求头", "sink": "line 19: withHeader('Access-Control-Allow-Origin', 反射 Origin 或通配 *) 并叠加 line 20 的 Allow-Credentials: true", "explanation": "流1: line 16 读取攻击者可控的 Origin 头 -> line 19 无白名单/正则/条件校验原样反射进 ACAO, 空值回退通配 * -> line 20 叠加 Allow-Credentials: true, 任意源可携凭据跨域读取响应; 流2: line 15 全局中间件包裹 line 32 的 /v1/account 端点, line 38-42 返回 email/api_token 等会话敏感数据, 该响应携带过宽 CORS 头, 攻击者页面以携带凭据的跨站请求即可借受害者 Cookie 完整读取; 防御核查: line 16-19 之间无任何源校验, 无 CSRF Token/SameSite 约束, line 22 反而放行跨域请求头, line 23 的 Vary 仅防缓存串扰不构成策略防御; 第二入口: line 27-29 预检路由同样回显过宽头并以 204 放行, 全局挂载使所有路由无例外继承该策略, 不存在更安全的替代通道", "fix_suggestion": "line 19: 改为服务端可信源白名单精确匹配(如仅允许 https://app.example.com), 匹配成功才回显该单一 Origin, 否则不输出 ACAO 头, 并仅对确需凭据的受信源保留 line 20 的 Allow-Credentials: true"}
+```

@@ -1,0 +1,51 @@
+LANG: python
+```code
+import re
+
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+
+# 搜索关键词格式校验：词由字母/数字/下划线组成，词间允许空白分隔
+KEYWORD_RE = re.compile(r'^(\s*\w+\s*)+$')
+
+PRODUCTS = ['apple pie', 'banana split', 'cherry cake', 'date bar', 'fig roll']
+
+
+@app.route('/api/products/search')
+def search_products():
+    keyword = request.args.get('q', '')
+    if not KEYWORD_RE.match(keyword):
+        return jsonify({'results': [], 'error': 'invalid keyword'}), 400
+    needle = keyword.strip().lower()
+    hits = [p for p in PRODUCTS if needle in p.lower()]
+    return jsonify({'results': hits})
+
+
+@app.route('/api/products/filter')
+def filter_products():
+    tag_expr = request.args.get('tag', '')
+    if KEYWORD_RE.match(tag_expr):
+        needle = tag_expr.strip().lower()
+        hits = [p for p in PRODUCTS if needle in p.lower()]
+        return jsonify({'results': hits})
+    return jsonify({'results': [], 'error': 'invalid tag'}), 400
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+```
+
+第 1 步（类别定性）：第 8 行 `KEYWORD_RE = re.compile(r'^(\s*\w+\s*)+$')` 是教科书级的嵌套量词形态——外层 `+` 作用于一个内部又含 `\w+`、`\s*` 两个量词的分组，且 `\s*` 可匹配空串、`\w+` 可对同一段文本做任意切分，量词作用域重叠产生指数级歧义。Python `re` 是回溯引擎、无线性时间保证，恶意输入可让单次 `match` 消耗无界 CPU。危害是资源耗尽型拒绝服务，属于 CWE-400 Uncontrolled Resource Consumption（ReDoS 是其在正则场景的典型表现），不涉及命令/代码执行或数据拼接，不是 CWE-78/89/94 等注入类，也不是越权类。
+
+第 2 步（输入点枚举与可达性）：本模块共两个外部输入点——第 15 行 `request.args.get('q', '')`（路由 `/api/products/search`，第 13-14 行注册）和第 25 行 `request.args.get('tag', '')`（路由 `/api/products/filter`，第 23-24 行注册）。两者均为 GET 查询参数、攻击者完全可控，且代码未做任何鉴权。第 15 行的值原样传入第 16 行 `KEYWORD_RE.match(keyword)`，第 25 行的值原样传入第 26 行 `KEYWORD_RE.match(tag_expr)`，source→sink 可达性成立，单个构造请求即可触发汇点。
+
+第 3 步（流1 防御核验，第 15 行→第 16 行）：sink 之前不存在任何防御——无输入长度上限、无字符白名单、无匹配超时（Python `re` 不支持单次调用超时）。第 16 行的 `if not ... match(...)` 看似校验，但 `match` 调用本身就是资源消耗点，第 17 行的 400 响应必须等 match 返回后才可能执行，即 CPU 已被耗尽；且校验『失败』恰恰是触发最坏回溯的条件：形如 30 个字母 a 后跟一个 `!` 的输入会迫使引擎枚举约 2^29 种分词方式（数十秒起），40 个字符即达小时级。Werkzeug/Gunicorn 默认约 8KB 的请求行长度上限对几十字符即可爆炸的指数复杂度毫无约束作用。该流确认无有效防御。
+
+第 4 步（流2 防御核验，第 25 行→第 26 行）：与流1 完全同构——第 25 行参数直达第 26 行的同一编译正则对象，前置无任何过滤或限长；区别仅在 match 成功后进入第 27-29 行子串过滤，但阻塞发生在第 26 行内部，后续逻辑与 DoS 无关。两条流共同确认：校验逻辑位置在 sink 之后或本身即 sink，且属于『用易回溯正则做校验』这一无效防御类型，覆盖面为零。
+
+第 5 步（第二入口/替代通道检查与结论）：第 23-24 行的 `/api/products/filter` 是独立注册的第二条外部可达路由，经第 26 行到达与主链相同的汇点，因此只修复 search 路由不能消除风险；模块内 `KEYWORD_RE` 无其他间接调用点，也不存在经请求体、Header 的其他通道（本模块仅消费 query 参数）。综合结论：两个无鉴权入口的攻击者可控参数 → 无防御的嵌套量词正则 match → 单请求无界 CPU 占用，少量并发即可耗尽 worker 线程池形成服务级 DoS，判定为 CWE-400，风险 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-400 Uncontrolled Resource Consumption", "risk_level": "High", "source": "line 15: keyword = request.args.get('q', '')（第二入口 line 25: tag_expr = request.args.get('tag', '')）", "sink": "line 16: KEYWORD_RE.match(keyword)（line 26: KEYWORD_RE.match(tag_expr) 为同一汇点）", "explanation": "流1: line 15 的 GET 参数 q 无长度限制/白名单/超时，直达 line 16 的 KEYWORD_RE.match；流2: line 25 的 GET 参数 tag 同样无前置防御，直达 line 26 的同一正则汇点；成因: line 8 模式 ^(\\s*\\w+\\s*)+$ 为嵌套量词（外层 + 包裹含 \\w+ 与 \\s* 的分组），Python re 回溯引擎对形如 30 个字母 a 加一个感叹号的输入需枚举约 2^29 种分词方式，单请求可占满 CPU 数十秒至小时级，且校验失败路径恰触发最坏回溯，line 17 的 400 响应位于 match 之后无法阻止消耗；第二入口: line 23-24 的 /api/products/filter 路由经 line 26 到达同一汇点，仅修复一处不足以消除风险", "fix_suggestion": "line 8: 将模式改写为无嵌套量词歧义的线性等价形式（如 ^\\s*\\w+(\\s+\\w+)*\\s*$），并在 line 16 与 line 26 调用前增加输入长度上限（如 64 字符），或改用 RE2 等线性时间正则引擎"}
+```

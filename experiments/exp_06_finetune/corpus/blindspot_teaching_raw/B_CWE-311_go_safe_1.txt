@@ -1,0 +1,66 @@
+LANG: go
+```go
+package payment
+
+import (
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"time"
+)
+
+// GatewayClient submits cardholder data to the external payment gateway.
+type GatewayClient struct {
+	client  *http.Client
+	baseURL *url.URL
+}
+
+// NewGatewayClient refuses plaintext endpoints and downgrade redirects so
+// cardholder data can never traverse an unencrypted channel.
+func NewGatewayClient(endpoint string) (*GatewayClient, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme != "https" {
+		return nil, errors.New("payment gateway endpoint must be a valid https URL")
+	}
+	return &GatewayClient{
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if req.URL.Scheme != "https" {
+					return fmt.Errorf("blocked downgrade redirect to %s", req.URL.Scheme)
+				}
+				return nil
+			},
+		},
+		baseURL: u,
+	}, nil
+}
+
+// Charge posts cardholder data over the TLS-enforced client above.
+func (c *GatewayClient) Charge(cardNumber, cvv, amount string) error {
+	form := url.Values{"card": {cardNumber}, "cvv": {cvv}, "amount": {amount}}
+	resp, err := c.client.PostForm(c.baseURL.String()+"/v1/charge", form)
+	if err != nil {
+		return fmt.Errorf("gateway request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	return nil
+}
+```
+
+1. 第 1 步（类别核心特征）：CWE-311 的核心是敏感数据（卡号/CVV 属持卡人 PII）以明文形态跨越信任边界——典型形态是经明文信道 http:// 传输（无 TLS），或落盘不加密存储；它不是 SQL/命令注入，也不是越权/访问控制问题。本模块中敏感载荷是第 41 行 Charge 的 cardNumber/cvv/amount，暴露点是第 43 行 PostForm 发出的 HTTP 请求；该代码的漏洞孪生体是默认 http.Client 直接向 http:// 网关 POST 表单，而本文件用三层协同防御消除了该形态。
+
+2. 第 2 步（输入点枚举与可达性）：外部输入点共两个。输入点一：构造函数参数 endpoint（第 20 行），经 url.Parse（第 21 行）存入 baseURL（第 36 行），最终拼入第 43 行请求 URL——可达网络 sink；输入点二：Charge 的 cardNumber/cvv/amount（第 41 行），进入第 42 行 form 成为 POST 请求体，同样汇入第 43 行 sink。两条数据流均确认可达，文件内不存在其他输入。
+
+3. 第 3 步（流一防御验证：endpoint→请求 URL）：第 22-24 行对解析后的 u.Scheme 做精确 https 白名单，解析失败或空 scheme 一并拒绝，属于 fail-closed；位置正确——校验发生在构造期，此时任何卡数据尚不存在，明文端点根本无法与持卡人数据配对；类型正确——判定依据是 url.Parse 归一化后的结构化 Scheme 字段而非对原始字符串做正则/黑名单匹配，http://、大小写变体、缺省 scheme 均无法绕过，且 https scheme 使 net/http 强制走 TLS 握手。
+
+4. 第 4 步（流二防御验证：卡数据→请求体）：卡数据只能经过第 26 行创建的唯一 http.Client 发出。第 28 行 Transport 强制 MinVersion TLS12，保证请求体（含卡号/CVV）在传输中始终加密并拒绝旧版可降级协议；第 29-34 行 CheckRedirect 拦截任何 scheme 非 https 的重定向——这一点关键，因为 Go 默认客户端会跟随 https→http 降级重定向，此处显式封堵。覆盖面：初始请求与整条重定向链均为 TLS-only；本模块不落盘写任何敏感数据，存储侧无攻击面，传输侧已被完整覆盖。
+
+5. 第 5 步（第二入口/替代通道检查）：全文件仅导出 NewGatewayClient 与 Charge 两个符号；client 字段未导出，包外调用者无法注入明文客户端替换；Charge 是唯一触网函数，不存在 net.Dial、第二个 http.Client、http:// 回退分支，也没有将 form 值写入日志或磁盘的旁路。两条 source→sink 流均被类型正确、位置正确、覆盖完整的防御拦截，无第二入口，故判定无 CWE-311 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点1: endpoint(第20行)经url.Parse(第21行)存入baseURL(第36行)并拼入PostForm请求URL(第43行),可达sink;输入点2: cardNumber/cvv/amount(第41行)进入form(第42行)成为POST请求体(第43行),可达sink;防御1: 第22-24行对解析后的Scheme做https精确白名单,解析失败或空scheme一并拒绝,fail-closed,且位于构造期,任何卡数据存在前即阻断明文端点,属结构化白名单而非可绕过的正则/字符串过滤;防御2: 第28行Transport强制MinVersion TLS12保证请求体全程加密,第29-34行CheckRedirect拦截任何非https重定向,封堵Go默认客户端会跟随的https到http降级链路;第二入口检查: 全文件仅一个未导出http.Client字段(第14/26行),Charge是唯一触网函数,无net.Dial、无第二客户端、无http回退分支、无敏感数据落盘或写日志旁路,防御覆盖完整,故无CWE-311漏洞", "fix_suggestion": "no fix needed"}
+```

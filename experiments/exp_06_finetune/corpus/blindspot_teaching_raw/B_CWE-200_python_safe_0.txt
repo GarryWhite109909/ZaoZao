@@ -1,0 +1,53 @@
+LANG: python
+```code
+# warehouse/export/views.py
+"""Order export API: streams order rows as CSV behind a strict column whitelist.
+
+Repository rows also carry internal-only columns (unit_cost, internal_price)
+and PII (customer_email) that must never appear in an export.
+"""
+import csv
+import io
+
+from flask import Flask, Response, request
+
+from warehouse.repository import fetch_order_rows
+
+app = Flask(__name__)
+
+# Single source of truth: only these columns may ever leave the service.
+EXPORTABLE_COLUMNS = ("order_id", "sku", "quantity", "unit_price", "total")
+
+
+@app.route("/exports/orders", methods=["GET"])
+def export_orders():
+    requested = request.args.get("fields", "")  # untrusted caller input
+    wanted = [c for c in requested.split(",") if c in EXPORTABLE_COLUMNS]
+    columns = wanted or list(EXPORTABLE_COLUMNS)
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="raise")
+    writer.writeheader()
+    for row in fetch_order_rows():  # full DB rows incl. sensitive columns
+        writer.writerow({k: row[k] for k in columns})
+    payload = buf.getvalue()
+
+    return Response(payload, mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=orders.csv"})
+```
+
+1. 第 1 步（类别核心特征）：本例属于 CWE-200 敏感信息暴露——仓储层返回的行数据内含内部定价列 `unit_cost`、`internal_price` 与 PII 列 `customer_email`（第 12 行导入、第 29 行取数），而导出接口的职责就是把行数据序列化进 HTTP 响应体（第 33-34 行）。典型漏洞形态是：列选择由用户参数驱动且不加限制，攻击者用 `?fields=unit_cost` 即可在导出的 CSV 中直接回显内部成本价。这是“敏感数据对不可信方可见”，不是 SQL 注入、也不是越权（接口本身已授权访问，问题只在响应字段范围）。
+
+2. 第 2 步（输入点枚举与可达性）：整个模块只注册了一个路由 `/exports/orders`（第 20 行），其唯一外部输入是第 22 行的查询参数 `request.args.get("fields", "")`。数据流完整可达 sink：第 22 行原始输入 → 第 23 行过滤 → 第 24 行收敛为 `columns` → 第 27 行作为 DictWriter 的 `fieldnames` → 第 30 行作为每行的取键集合 → 第 31 行 `payload` → 第 33 行响应体。即用户确实能控制“请求哪些列名”，输入到暴露点的通路存在，防御必须在这条通路上生效。
+
+3. 第 3 步（防御类型验证）：第 23 行采用白名单成员判断 `c in EXPORTABLE_COLUMNS`（白名单定义于第 17 行），这是 allowlist 而非黑名单/正则/字符串替换——`unit_cost`、`internal_price`、`customer_email` 因不在白名单中，无论怎样拼接输入都无法通过过滤；传入空值或纯非法列名时，第 24 行 `wanted or list(EXPORTABLE_COLUMNS)` 回退到默认白名单，不会退化为“全量导出”。防御位置正确：它位于用户输入并入序列化 schema 的唯一汇合点，且在任何字节写入缓冲区之前执行。
+
+4. 第 4 步（防御覆盖面验证）：表头与数据行走同一数据源——第 27 行 `fieldnames=columns` 决定 CSV 表头，第 30 行字典推导 `{k: row[k] for k in columns}` 决定每行写入的键，二者均由过滤后的 `columns` 派生，不存在绕过过滤直接写原始行的路径；第 27 行 `extrasaction="raise"` 作为兜底，一旦未来代码改动引入非白名单键会直接抛错（fail-closed）而非静默写出。第 31-33 行仅返回白名单缓冲区内容，无调试回显，模块也未开启 Flask debug 模式，不存在错误页泄露行数据的通道。
+
+5. 第 5 步（第二入口/替代通道检查）：模块仅第 20 行一个 HTTP 入口；`fetch_order_rows`（第 12 行导入、第 29 行调用）是内部仓储函数，不暴露任何路由；除 `fields` 外没有其他查询参数、请求头或间接调用会影响输出列的选取。因此不存在第二条能触达响应体的 source→sink 通路，白名单防御无绕过面。
+
+6. 结论：唯一输入点被白名单在序列化边界前拦截，表头与全部数据行覆盖完整，第二入口检查为空，敏感列在数学上不可能进入导出结果——本文件为 CWE-200 的安全实现，无需修复。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入是第22行查询参数fields,可达sink:第23行过滤→第24行columns→第27行fieldnames→第30行行投影→第31行payload→第33行响应体;防御为第23行基于第17行EXPORTABLE_COLUMNS的白名单成员判断,属allowlist而非黑名单/正则/字符串替换,unit_cost、internal_price、customer_email等敏感列永远无法通过,空或非法输入在第24行回退默认白名单;防御位置在用户输入并入序列化schema的唯一汇合点且先于任何写入;覆盖面完整:表头(第27-28行)与每行数据(第30行)均由同一columns派生,第27行extrasaction=raise兜底fail-closed;第二入口检查:模块仅注册第20行一个路由,fetch_order_rows为内部仓储调用无HTTP暴露,无其他参数影响输出列,不存在绕过通道,故无CWE-200敏感信息暴露", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,59 @@
+LANG: python
+```code
+"""PCI-DSS aligned client for the external payment gateway.
+
+Cardholder data (PAN) must never cross a trust boundary in plaintext
+(CWE-311). This module hard-fails any non-TLS endpoint and enforces
+TLS 1.2+ with certificate verification before any card byte moves.
+"""
+
+import ssl
+from urllib.parse import urlparse
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
+
+
+class _TLS12Adapter(HTTPAdapter):
+    """Force TLS 1.2+ with full certificate-chain verification."""
+
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        kwargs["ssl_context"] = ctx
+        return super().init_poolmanager(*args, **kwargs)
+
+
+class PaymentGatewayClient:
+    def __init__(self, base_url: str, api_key: str) -> None:
+        scheme = urlparse(base_url).scheme.lower()
+        if scheme != "https":
+            raise ValueError("cardholder data requires TLS: http:// endpoint rejected")
+        self._endpoint = base_url.rstrip("/") + "/v1/charges"
+        self._session = requests.Session()
+        self._session.mount("https://", _TLS12Adapter())
+        self._session.headers["Authorization"] = "Bearer " + api_key
+
+    def charge(self, card_number: str, expiry: str, amount_cents: int) -> dict:
+        payload = {"pan": card_number, "exp": expiry, "amount": amount_cents}
+        response = self._session.post(
+            self._endpoint, json=payload, timeout=10, verify=True
+        )
+        response.raise_for_status()
+        return {"status": response.status_code, "auth_id": response.json().get("id")}
+```
+
+1. **类别特征定位**：CWE-311 的核心特征是敏感数据（口令/令牌/密钥/PII，本例为持卡人 PAN 与网关 API 密钥）以明文形态跨越信任边界——典型形态之一是明文信道传输：把卡号提交到 `http://` 接口，链路上任意中间节点可被动窃听。它关注传输/存储的机密性，与 SQL/命令注入（CWE-89/78）、越权访问（CWE-862）、硬编码凭据（CWE-798）不是同一类别。本文件中潜在暴露点是第 38-40 行的网络发送（sink），敏感数据在第 37 行组装；本文件为安全版，防御链见后续步骤。
+
+2. **外部输入点枚举与可达性**：共三处外部输入——① 第 27 行构造器参数 `base_url`（决定请求目的地）；② 第 27 行构造器参数 `api_key`（第 34 行写入 Authorization 头）；③ 第 36 行 `charge()` 参数 `card_number/expiry/amount_cents`（持卡人数据本体）。三者全部可达唯一 sink：卡数据在第 37 行进入 payload，api_key 在第 34 行进入会话默认头，base_url 经第 31 行固化为 `self._endpoint`，最终全部汇入第 38-40 行的 `self._session.post`，可达性确认成立。
+
+3. **主数据流防御验证（card_number/expiry → payload → post）**：第一道防线在第 28-30 行——先 `lower()` 归一化，再要求 scheme 严格等于 https，否则抛 `ValueError` 直接熔断。这是 fail-closed 的正向白名单校验，不是黑名单/正则/字符串替换过滤，无法用大小写混淆或混合写法绕过；位置正确：校验发生在构造器这一信任边界入口，且先于第 31 行端点固化执行，此后 `_endpoint` 不可再变，`charge()` 也不接受任何 URL 参数，因此不存在把 sink 重新指回 http:// 的路径；覆盖完整：模块内唯一请求目标就是第 31 行派生的 `self._endpoint`。
+
+4. **传输层防御验证（覆盖全部三条流）**：第 19-23 行自定义 HTTPAdapter 在 ssl 上下文上设置 `minimum_version = TLSv1_2`，第 33 行挂载到会话，第 39 行 `verify=True` 显式开启证书链校验防中间人。传输层位于应用载荷之下，因此第 37 行 payload 中的 PAN 与第 34 行头部的 api_key 的每一个字节都强制经过 TLS 1.2+ 加密信道，无明文残留。另注：全文件唯一的 http:// 字符串出现在第 30 行的拒绝性报错文案中，是熔断提示而非可用通道。
+
+5. **第二入口/替代通道检查**：逐项排查——模块内网络 I/O 仅第 38-40 行一处；无其他公开方法或模块级代码构造请求；无 logging/print 输出 PAN 或密钥（不存在明文落日志这一 CWE-311 变体路径）；无重试/降级到明文的回退逻辑；无从环境变量或配置二次读取 URL 的旁路。结论：不存在第二入口或替代通道，结合第 3、4 步的防御验证，判定本模块对 CWE-311 安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "外部输入点共三处：第27行构造器参数 base_url 与 api_key、第36行 charge 参数 card_number/expiry/amount_cents，三者均可达唯一网络 sink 即第38-40行的 self._session.post；主数据流 card_number/expiry 经第37行 payload 进入 post，其防御为第28-30行 scheme 白名单：先 lower 归一化再要求严格等于 https，否则抛 ValueError 熔断，属 fail-closed 正向校验而非黑名单/正则/字符串替换，位置在构造器信任边界且先于第31行端点固化，之后 _endpoint 不可变且 charge 无 URL 参数，覆盖完整；传输层第20-22行 ssl 上下文强制 TLS1.2+、第33行挂载会话、第39行 verify=True 显式证书链校验，位于应用载荷之下，故第37行 PAN 与第34行 Authorization 头中 api_key 的每个字节均走加密信道；第二入口检查：全文件仅此一处网络 I/O，第30行 http:// 仅为拒绝报错文案而非可用通道，无日志打印 PAN 或密钥、无明文回退重试、无环境变量 URL 旁路，故判定对 CWE-311 安全。", "fix_suggestion": "no fix needed"}
+```

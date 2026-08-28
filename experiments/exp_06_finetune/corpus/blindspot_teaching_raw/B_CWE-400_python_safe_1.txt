@@ -1,0 +1,66 @@
+LANG: python
+```code
+"""Tag search endpoint for the catalog service.
+
+The legacy implementation validated queries with the stdlib pattern
+r'^(\s*\w+\s*)*$' (nested quantifiers): a query such as 'a a a ... a!'
+made the matcher backtrack exponentially (ReDoS, CWE-400). This
+module keeps the feature but bounds matcher work three ways.
+"""
+import regex  # third-party 'regex' package: atomic groups + timeouts
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+MAX_QUERY_LEN = 128      # bound 1: cap the subject string length
+MATCH_TIMEOUT_S = 0.2    # bound 3: wall-clock budget per match
+
+# bound 2: atomic groups (?>...) never give characters back, so the
+# comma-separated token grammar below matches in linear time.
+QUERY_RE = regex.compile(r'\s*(?>[\w.-]+)(?>\s*,\s*[\w.-]+)*\s*')
+
+
+def validate_query(query):
+    """Return the parsed tag list, or None if the query is rejected."""
+    if len(query) > MAX_QUERY_LEN:
+        return None
+    try:
+        if QUERY_RE.fullmatch(query, timeout=MATCH_TIMEOUT_S) is None:
+            return None
+    except regex.TimeoutError:
+        return None
+    return [t for t in (s.strip() for s in query.split(',')) if t]
+
+
+@app.route('/search')
+def search():
+    query = request.args.get('q', '')
+    tags = validate_query(query)
+    if tags is None:
+        return jsonify(error='invalid query'), 400
+    hits = []
+    with open('catalog.txt', encoding='utf-8') as fh:
+        for line in fh:
+            low = line.lower()
+            if all(t.lower() in low for t in tags):
+                hits.append(line.rstrip('\n'))
+    return jsonify(results=hits[:50])
+
+
+if __name__ == '__main__':
+    app.run()
+```
+
+1. **第 1 步（类别特征）**：本条属于 CWE-400 无界资源消耗中的 ReDoS 子类，核心特征是不可信输入驱动正则引擎做灾难性回溯——嵌套量词（如 `(a+)+`、`(a|a)*`、旧版的 `(\s*\w+\s*)*`）使匹配时间随输入长度指数增长，最终耗尽 CPU。这与注入、越权、反序列化等数据流类别无关，判定对象是“匹配耗时是否受控”。第 3-5 行 docstring 记录了旧版漏洞模式，第 18 行是重写后的安全模式，第 26 行是匹配 sink。
+
+2. **第 2 步（输入点枚举与可达性）**：全文件唯一外部输入点是第 35 行 `request.args.get('q', '')`（HTTP GET 参数）；第 36 行将其无条件传入 `validate_query`，第 26 行 `QUERY_RE.fullmatch(query, timeout=...)` 即正则回溯资源消耗点。source→sink 链路单一、无条件分支旁路，可达性成立。文件内不存在其他 `request` 引用。
+
+3. **第 3 步（数据流防御逐一验证）**：对这条唯一的 source→sink 流，防御分三层且互补：①第 23-24 行长度上限 128，在 sink 之前约束主体规模（类型正确：容量上限，而非可绕过的黑名单/字符串替换过滤）；②第 18 行模式用原子组 `(?>[\w.-]+)` 包裹 token，字符一旦消费不再交还，从语法层消除了旧版嵌套量词中 `\w+` 跨迭代拆分同一字符 run 的 2^n 歧义，匹配退化为线性（类型正确：结构级修复，写死在模式里，任何输入都无法触发回溯爆炸）；③第 26 行 `timeout=0.2` 提供墙钟预算，即使未来有人改坏模式，超时抛出 `regex.TimeoutError`，第 28-29 行捕获后返回 400（位置正确：直接挂在 sink 调用点）。三层全部位于 sink 之前或调用点，覆盖该流全部输入。
+
+4. **第 4 步（残余消耗点检查）**：校验通过后的 `tags` 仅用于第 43 行子串 `in` 检索（线性时间，不经过正则引擎）和第 40 行固定路径文件读取；第 45 行将响应截断为 50 条，限制响应体规模。用户输入在 sink 之后不再触达任何正则或无界循环。
+
+5. **第 5 步（第二入口/替代通道结论）**：全文件仅第 33 行注册 `/search` 一个路由，`validate_query` 仅有 `search` 一个调用方，第 48-49 行 `__main__` 启动的是同一 app，不存在其他路由、参数或间接调用能绕过 `validate_query` 直达第 26 行 sink。防御位置与覆盖面完整，无绕过路径，判定为安全实现。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入为第35行 request.args.get('q')，经第36行 validate_query 无条件到达第26行 QUERY_RE.fullmatch 这一正则回溯资源消耗点；该流防御分三层：第23-24行长度上限128在 sink 前约束主体规模，第18行模式以原子组包裹 token 与分隔符、字符消费后不再交还，从语法层消除旧版嵌套量词（形如 (a+)+ 的组内嵌套量词）造成的指数级回溯歧义、使匹配线性化，第26行 timeout=0.2 秒提供墙钟预算、超时抛 regex.TimeoutError 并由第28-29行捕获后返回400；三层均为类型正确（容量上限+语法结构修复+运行时预算，非黑名单或字符串替换过滤）、位置正确（全部位于 sink 之前或直接挂在调用点）、覆盖完整（单一 sink、单一调用链、全部输入必经）；第43行校验后的检索为线性子串匹配、第40行读取固定路径文件、第45行响应截断50条，无第二资源消耗点；第33行仅注册 /search 一个路由，validate_query 仅有 search 一个调用方，第48-49行 __main__ 运行同一应用，不存在第二入口或替代通道，防御无绕过路径，判定安全。", "fix_suggestion": "no fix needed"}
+```

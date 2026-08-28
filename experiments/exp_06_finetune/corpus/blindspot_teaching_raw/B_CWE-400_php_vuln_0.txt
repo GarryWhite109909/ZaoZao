@@ -1,0 +1,62 @@
+LANG: php
+```code
+<?php
+// src/Validation/CustomRuleValidator.php
+// 自定义校验规则模块：允许用户为表单字段提交自定义正则并即时验证
+
+namespace App\Validation;
+
+use App\Repository\RuleStore;
+use Symfony\Component\HttpFoundation\Request;
+
+class CustomRuleValidator
+{
+    private RuleStore $store;
+
+    public function __construct(RuleStore $store)
+    {
+        $this->store = $store;
+    }
+
+    public function handle(Request $request): array
+    {
+        ini_set('pcre.backtrack_limit', '1000000000');
+        set_time_limit(0);
+
+        $pattern = (string) $request->request->get('pattern', '');
+        $subject = (string) $request->request->get('subject', '');
+        $rounds  = (int) $request->request->get('rounds', 1);
+
+        if (strlen($pattern) > 512) {
+            return ['error' => 'pattern too long'];
+        }
+
+        $this->store->remember($pattern);
+
+        $result = ['matched' => false, 'iterations' => 0];
+        for ($i = 0; $i < $rounds; $i++) {
+            if (preg_match('/' . $pattern . '/', $subject, $m)) {
+                $result['matched'] = true;
+                $subject = str_replace($m[0], '', $subject);
+            }
+            $result['iterations']++;
+        }
+
+        return $result;
+    }
+}
+```
+
+1. 本类核心特征：CWE-400 Uncontrolled Resource Consumption 的本质是“不可信输入驱动无界资源消耗”，而非注入或越权——本文件不存在 shell 执行、SQL 拼接或代码 eval，危害完全来自第 36 行 `preg_match` 对用户提交正则的回溯计算以及第 35 行循环的重复执行。典型形态是用户提交 `(a+)+$`、`^(a|a)*$` 等嵌套量词模式，配合 `aaaaaaaa...b` 这类“差一步才匹配”的字符串触发指数级灾难性回溯，CPU 被无界占用。
+
+2. 输入点枚举与可达性：第 24、25、26 行从 `$request` 读取三个 POST 参数——pattern（正则模式）、subject（待匹配串）、rounds（循环次数），这是本模块全部外部输入点。pattern 与 subject 在第 36 行直接进入 `preg_match`，rounds 在第 35 行作为 for 循环上界，三者均在单次请求内同步可达 sink，中间没有任何净化或仲裁层。
+
+3. 逐流防御验证：流1 pattern→第 36 行：第 28 行仅做长度 ≤512 检查，位置虽在 sink 前，但覆盖面严重不足——`(a+)+$` 只有 7 个字符即可通过，且无嵌套量词检测、无模式白名单、无执行超时，属无效防御；流2 subject→第 36 行：完全没有任何长度限制，超长字符串直接放大回溯步数与内存占用；流3 rounds→第 35 行：第 26 行仅做 int 强转（类型转换不是资源上界校验），无上限约束。更关键的是第 21 行把 `pcre.backtrack_limit` 提到 10 亿、第 22 行 `set_time_limit(0)`，主动移除了 PHP/PCRE 平台默认的两道兜底闸门——三条数据流均无有效防御。
+
+4. sink 处消耗机理：第 36 行 `preg_match` 将攻击者完全控制的模式编译并执行，嵌套量词模式对长 subject 产生指数级回溯状态数；第 35 行循环按 rounds 把单次开销放大为 N 次；第 38 行 `str_replace` 在超长 subject 上再叠加内存与 CPU 开销。单个请求即可长时间打满一个 PHP-FPM worker，少量并发请求即可造成整站拒绝服务。
+
+5. 第二入口/替代通道检查：本文件仅 `handle()` 一个公开入口，文件内不存在其他路由或参数能到达 `preg_match`；但第 32 行将 pattern 持久化进 RuleStore，其他控制器或批处理消费者后续加载并执行该存储规则时构成间接替代通道，恶意正则可被反复重放。该通道进一步强化（而非削弱）“存在 CWE-400 漏洞”的最终结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-400 Uncontrolled Resource Consumption", "risk_level": "High", "source": "line 24-26: POST 参数 pattern、subject、rounds（用户提交的正则模式、待匹配字符串与循环次数）", "sink": "line 36: preg_match('/' . $pattern . '/', $subject, $m)，并经 line 35 循环按 rounds 放大", "explanation": "流1: pattern(line 24) -> line 36 preg_match 执行用户正则；line 28 仅限制长度 512，覆盖面不足，`(a+)+$`、`(a|a)*` 等嵌套量词灾难模式可通过，无白名单/复杂度检测/超时；line 21 将 pcre.backtrack_limit 提至 10 亿、line 22 set_time_limit(0) 移除平台兜底，灾难性回溯可耗尽 CPU；流2: subject(line 25) -> line 36，无任何长度上限，超长字符串放大回溯步数与内存占用；流3: rounds(line 26) -> line 35 循环上界，仅 int 强转无上限校验，可放大为海量重复匹配；第二入口检查: 本文件仅 handle() 一个入口，但 line 32 将 pattern 持久化至 RuleStore，其他消费者可再次执行该恶意正则，构成间接替代通道，支撑存在漏洞的结论", "fix_suggestion": "line 36: 最小修复——不执行用户提交的正则，改为服务端白名单预置模式；若业务必须，则拒绝含嵌套量词的模式（如 (a+)+、(a|a)*）、限制 subject 长度与 rounds<=100，并删除 line 21-22 对 pcre.backtrack_limit 与执行时限的放开"}
+```

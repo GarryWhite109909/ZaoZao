@@ -1,0 +1,66 @@
+LANG: php
+```code
+<?php
+
+declare(strict_types=1);
+
+namespace App\Payment;
+
+use RuntimeException;
+
+/**
+ * External payment gateway client: cardholder data leaves only over verified TLS.
+ */
+final class PaymentGatewayClient
+{
+    private const ENDPOINT  = 'https://gateway.example.com/v1/charges';
+    private const CA_BUNDLE = '/etc/ssl/certs/ca-certificates.crt';
+
+    public function charge(array $card, int $amountCents): array
+    {
+        // Fail closed if the endpoint is ever downgraded to plaintext http://
+        if (!str_starts_with(self::ENDPOINT, 'https://')) {
+            throw new RuntimeException('Refusing to send card data over a non-TLS channel');
+        }
+
+        $ch = curl_init(self::ENDPOINT);
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => json_encode([
+                'pan'    => $card['pan'],
+                'cvv'    => $card['cvv'],
+                'expiry' => $card['exp'],
+                'amount' => $amountCents,
+            ]),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_CAINFO         => self::CA_BUNDLE,
+            CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+            CURLOPT_TIMEOUT        => 10,
+        ]);
+
+        $body   = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        if ($status !== 200 || !is_string($body)) {
+            throw new RuntimeException('Gateway request failed');
+        }
+        return json_decode($body, true) ?: [];
+    }
+}
+```
+
+1. 第 1 步（核心特征定性）：CWE-311 的漏洞形态是敏感数据（本例为 PAN/CVV/有效期，属持卡人 PII）以明文形态跨越信任边界——要么走明文信道（http://、ftp://、未加密邮件），要么落明文存储（未加密数据库/文件/日志/cookie）。它不是注入（CWE-89/78）、不是 XSS、也不是越权：问题不在数据被错误解释或被未授权者访问，而在数据本身在传输/静态阶段未加密。本文件中敏感载荷在第 27-32 行组装，并在第 41 行 curl_exec 处离开进程边界发往外部网关，这是持卡数据唯一一次跨信任边界。
+
+2. 第 2 步（输入点枚举与可达性）：外部输入点共 4 个，全部经唯一公开入口 charge()（第 17 行）进入：(a) $card['pan']、(b) $card['cvv']、(c) $card['exp']（结账表单提交的原始持卡人数据），(d) $amountCents（订单金额，低敏感）。四个输入在第 27-32 行被无条件写入 json_encode 请求体，经 CURLOPT_POSTFIELDS（第 27 行）到达唯一网络 sink——第 41 行 curl_exec；方法内不存在提前 return、分支丢弃或改道，可达性为 100%。
+
+3. 第 3 步（逐流验证防御的类型/位置/覆盖面）：对 pan/cvv/exp → 请求体 → curl_exec 主链，防御是传输层强制 TLS，类型正确——用信道加密保护数据在线上的形态，而非对数据本身做黑名单/正则/字符串替换过滤（那类手段既可绕过，也根本不保护传输内容）。位置正确——作用于 sink 所在信道本身：第 14 行端点常量固定为 https://，第 20-22 行在方案非 https 时抛异常 fail-closed，杜绝明文回退；第 34 行 CURLOPT_SSL_VERIFYPEER=true 配合第 36 行 CURLOPT_CAINFO 校验网关证书链，第 35 行 CURLOPT_SSL_VERIFYHOST=2 将证书绑定到主机名，构成带身份认证的加密信道，可抗中间人窃听（若只加密不验证对端，TLS 仍可被 MITM 解密，防御即不完整）。覆盖面完整——全部敏感字段走同一条 TLS 请求；URL 为常量（第 24 行），敏感数据不进查询串；无日志、无缓存、无落库等旁路。
+
+4. 第 4 步（第二入口/替代通道检查）：该类仅暴露一个公开方法（第 17 行）与一个常量端点（第 14 行）；无其他路由或参数可触发发送，无动态拼接 URL，无 mail()/file_put_contents/数据库/session/cookie 等替代传输或存储通道；第 21 行与第 45 行的异常消息均为静态字符串，不回显任何卡数据，失败路径不会把载荷泄入日志；第 41-47 行返回的网关响应仅含交易结果，不含持卡人数据。
+
+5. 第 5 步（结论）：所有 source→sink 数据流均被强制且经身份验证的 TLS 覆盖，不存在明文信道或明文存储路径，第二入口与替代通道检查为空，判定本文件无 CWE-311 漏洞（safe）。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一公开入口 charge()（第17行）接收4个外部输入：$card 的 pan/cvv/exp（结账表单原始持卡人数据）与 $amountCents，全部经 json_encode 写入 CURLOPT_POSTFIELDS（第27-32行）并无条件到达唯一网络 sink curl_exec（第41行）；防御为传输层强制 TLS 且类型正确：以信道加密保护数据线上形态，而非可绕过的黑名单/正则/字符串替换过滤；位置正确：第14行端点常量固定 https://，第20-22行方案非 https 时抛异常 fail-closed 杜绝明文回退，第34行 CURLOPT_SSL_VERIFYPEER=true 加第36行 CURLOPT_CAINFO 校验证书链、第35行 CURLOPT_SSL_VERIFYHOST=2 绑定主机名，构成可抗中间人的带身份认证加密信道；覆盖完整：全部敏感字段走同一条 TLS 请求，URL 为常量（第24行）不拼接输入，敏感数据不入查询串、不入日志/缓存/数据库；第二入口与替代通道检查：类仅一个公开方法与一个常量端点，无其他路由或动态 URL，无 mail/文件/数据库/session/cookie 等明文旁路，第21与45行异常消息为静态字符串不回显卡数据，网关响应仅含交易结果；综上所有数据流均被有效防御覆盖，无 CWE-311 漏洞", "fix_suggestion": "no fix needed"}
+```

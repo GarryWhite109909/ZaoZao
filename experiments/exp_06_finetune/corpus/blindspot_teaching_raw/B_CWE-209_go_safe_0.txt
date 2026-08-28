@@ -1,0 +1,64 @@
+LANG: go
+```code
+package userapi
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"log"
+	"net/http"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+// UserService 提供用户资料查询能力。
+type UserService struct {
+	db     *sql.DB
+	logger *log.Logger
+}
+
+// NewUserService 注入数据库句柄与服务端日志器。
+func NewUserService(db *sql.DB, logger *log.Logger) *UserService {
+	return &UserService{db: db, logger: logger}
+}
+
+// HandleGetUser 处理 GET /api/user?user_id=xxx。
+func (s *UserService) HandleGetUser(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+
+	var name, email string
+	err := s.db.QueryRow("SELECT name, email FROM users WHERE id = ?", userID).Scan(&name, &email)
+	if errors.Is(err, sql.ErrNoRows) {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "user not found"})
+		return
+	}
+	if err != nil {
+		// 详细错误（含 SQL 片段、表名、驱动与连接细节）只进服务端日志
+		s.logger.Printf("query user failed: user_id=%q err=%v", userID, err)
+		// 响应体只由常量构成，err 不进入任何写出调用
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "internal server error"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"name": name, "email": email})
+}
+```
+
+1. **第 1 步 — 类别核心特征**：CWE-209 的核心是“错误信息泄露敏感内容”：底层操作失败时，异常对象/底层错误被原样回显给客户端。本场景中敏感载体是第 29 行 `Scan` 返回的驱动错误 `err`，其文本通常内嵌 SQL 语句片段、表名/列名、驱动错误码甚至连接细节（例如 MySQL 驱动会返回形如 `Error 1146: Table 'shop.users' doesn't exist` 的文本）。对应的漏洞写法是 `http.Error(w, err.Error(), 500)` 或 `json.NewEncoder(w).Encode(err)`。需明确：这不是 SQL 注入（第 29 行使用 `?` 占位符绑定，user_id 不拼接进 SQL 文本），也不是越权问题，本类唯一风险是错误通道的信息暴露。
+
+2. **第 2 步 — 外部输入点枚举与可达性**：本文件唯一外部输入是第 26 行 `r.URL.Query().Get("user_id")`（无请求体解析、无自定义头、无路径参数）。可达性成立：user_id 在第 29 行作为绑定参数进入 QueryRow，攻击者可借此触发查询失败（非法 id、探测不存在的列等），从而在第 29 行生成携带敏感信息的 err——攻击者输入可达“错误生成点”。但 user_id 本身不进入响应，CWE-209 意义上的敏感数据是第 29 行产生的 err 对象。
+
+3. **第 3 步 — 主数据流防御验证（类型/位置）**：数据流为 err（第 29 行）→ 第 35 行错误分支 → 两个出口：(a) 第 37 行 `s.logger.Printf` 把完整 err 写入构造时注入的服务端 logger（第 20-21 行），其目标是服务端日志（stderr/文件），客户端不可达；(b) 第 39-41 行响应体仅由常量字面量构成（`internal server error`），err 从未传入 Encode、未被 `err.Error()` 拼入 w。该防御是“常量响应 + 通道分离”的结构性防御，而非对 err 文本做黑名单/正则/字符串替换清洗——后者因驱动错误文本随版本、locale、场景变化而必然可绕过；此处敏感内容根本不存在进入响应的数据通路，无绕过面。位置上防御位于 sink 边界（响应写出前的最后一步），类型与位置均正确。
+
+4. **第 4 步 — 覆盖面完整性**：穷举本文件所有对 w 的写出点：第 31-32 行（ErrNoRows 分支，常量 `user not found`，不含 err 内容）、第 39-41 行（通用错误分支，常量 `internal server error`）、第 45-46 行（成功分支，仅业务字段 name/email，属预期输出）。不存在 `fmt.Fprintf(w, ..., err)`、`http.Error(w, err.Error(), ...)`、携带 err 的调试响应头，也无 panic 时序列化 err 的路径。三条分支全部只输出常量或预期业务数据，防御覆盖完整、无遗漏通路。
+
+5. **第 5 步 — 第二入口/替代通道检查**：本文件仅暴露一个处理器 HandleGetUser（第 25 行）与一个输入点（第 26 行）；无其他路由复用同一查询、无文件内中间件或 recover 逻辑把 err 写入响应、无第二个 ResponseWriter 出口或调试端点。结合第 3-4 步：详细错误被完全限制在服务端日志通道内，客户端通道只可能收到常量或预期业务字段。结论：不存在第二入口或替代泄露通道，无 CWE-209 暴露，判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点为第 26 行的查询参数 user_id，经第 29 行作为占位符绑定参数进入 QueryRow，攻击者可触发查询失败并在第 29 行产生驱动错误 err（其文本可能含 SQL 片段、表名/列名、驱动错误码与连接细节）；主数据流防御验证：err 仅在第 35 行错误分支内被消费，第 37 行写入构造时注入的服务端 logger（第 20-21 行，客户端不可达），第 39-41 行响应体仅由常量字面量 internal server error 构成，err 从未传入 Encode、未被 err.Error() 拼入响应，该防御为结构化的常量响应与通道分离而非黑名单、正则或字符串替换过滤，不存在可绕过面，且位于 sink 边界即响应写出前的最后一步，类型与位置均正确；覆盖面核查：本文件全部对 w 的写出点为第 31-32 行（常量 user not found）、第 39-41 行（常量 internal server error）、第 45-46 行（仅业务字段 name 与 email），无调试响应头、无 panic 序列化 err 的路径，所有 source 到 sink 的通路只携带常量或预期业务数据；第二入口检查：本文件仅注册一个处理器 HandleGetUser（第 25 行）与一个输入点（第 26 行），无其他路由、参数、中间件或间接调用能将 err 送入客户端通道，详细错误被完全限制在服务端日志通道内，故不存在 CWE-209 信息泄露，判定为安全", "fix_suggestion": "no fix needed"}
+```

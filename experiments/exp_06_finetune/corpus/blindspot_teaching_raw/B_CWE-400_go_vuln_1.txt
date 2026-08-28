@@ -1,0 +1,62 @@
+LANG: go
+```code
+package search
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/dlclark/regexp2"
+)
+
+// Filter is the JSON body accepted by POST /api/v1/tickets/search.
+type Filter struct {
+	Query string `json:"query"`
+}
+
+// summaryPattern keeps a summary to word chars separated by single spaces.
+var summaryPattern = regexp2.MustCompile(`^(\w+\s?)*$`, regexp2.None)
+
+var ticketIndex = []struct{ ID, Summary string }{
+	{"T-1001", "login page timeout"},
+	{"T-1002", "export csv encoding"},
+}
+
+// HandleSearch returns the IDs of tickets whose summary matches the query.
+func HandleSearch(w http.ResponseWriter, r *http.Request) {
+	var f Filter
+	if err := json.NewDecoder(r.Body).Decode(&f); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	if len(f.Query) > 4096 {
+		http.Error(w, "query too long", http.StatusBadRequest)
+		return
+	}
+
+	hits := make([]string, 0, 8)
+	for _, t := range ticketIndex {
+		ok, _ := summaryPattern.MatchString(t.Summary + " " + f.Query)
+		if ok {
+			hits = append(hits, t.ID)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(hits)
+}
+```
+
+1. 第 1 步（类别定性）：第 16 行 `var summaryPattern = regexp2.MustCompile(``^(\w+\s?)*$``, regexp2.None)` 是 CWE-400 最典型的子形态——灾难性回溯正则（ReDoS）：外层 `*` 包裹内层 `\w+` 与可选 `\s?`，对同一段文本存在指数级多种切分方式；且 regexp2 是 .NET 风格的回溯型引擎，未设置 MatchTimeout。一旦匹配在末尾锚点 `$` 处失败，引擎将穷举全部切分，CPU 消耗无界。输入不会被解释为命令或 SQL，也不涉及权限判断，因此这是纯粹的资源消耗类缺陷，不是命令注入/SQL 注入/越权。
+
+2. 第 2 步（输入点枚举与可达性）：全文件仅有一个外部输入点——第 26 行 `json.NewDecoder(r.Body).Decode(&f)`，把 HTTP 请求体写入第 12 行声明的 `Filter.Query`。数据流：f.Query → 第 30 行仅做长度比较（内容原样透传）→ 第 35~37 行进入处理 → 第 37 行 `summaryPattern.MatchString(t.Summary + " " + f.Query)` 作为匹配主题串。每次 POST 请求都必然执行第 37 行，source→sink 可达性成立。
+
+3. 第 3 步（防御核验）：唯一防线是第 30 行 `len(f.Query) > 4096` 的长度上限——类型是长度检查、位置在 sink 前一步，但覆盖面不足：`^(\w+\s?)*$` 只需约 28 个字符（如 28 个 'a' 后跟一个 '!'）即可产生 2^27 量级回溯步骤，远低于 4096，攻击载荷轻松通过，属于可绕过的无效防御；此外第 16 行 MustCompile 传入 regexp2.None 且未设 MatchTimeout（零值即不限时），第 37 行 `ok, _ :=` 把 error（含潜在超时错误）直接丢弃，也没有字符白名单、规范化或单请求时限。结论：这条 source→sink 流全程无有效防御。
+
+4. 第 4 步（消耗点与放大效应）：第 37 行位于第 36 行 `for _, t := range ticketIndex` 循环内，每条 ticket 都用同一恶意主题串跑一次指数回溯，消耗随记录数线性放大；由于失败发生在 `$` 锚点，引擎必须穷尽所有切分才能返回 false，无法提前退出。单请求即可钉死一个 CPU 核数秒至数小时；Go 的 HTTP 服务每连接一个 goroutine，少量并发恶意请求即可耗尽 CPU 与调度器，造成整站拒绝服务。
+
+5. 第 5 步（第二入口/替代通道检查）：全文件仅第 24 行 `HandleSearch` 一个导出入口；summaryPattern（第 16 行）为包私有变量，全文件仅第 37 行一处调用；不存在其他路由、查询参数、环境配置或间接调用能绕过第 26 行的解码到达第 37 行的 sink。替代通道检查结论：不存在。但仅有的单一入口（挂载为 POST /api/v1/tickets/search）已足以确认漏洞成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-400 Uncontrolled Resource Consumption", "risk_level": "High", "source": "line 26: json.NewDecoder(r.Body).Decode 将 HTTP 请求体写入 Filter.Query（用户完全可控的搜索关键字）", "sink": "line 37: summaryPattern.MatchString(t.Summary+' '+f.Query) 回溯型正则匹配的主题串", "explanation": "主数据流：line 26 请求体 query 字段 -> line 30 长度检查（仅比较长度、内容原样透传）-> line 37 拼接为 MatchString 主题串，每次 POST 必达 sink；line 16 模式 ^(\\w+\\s?)*$ 为外层 * 嵌套内层 \\w+ 与可选 \\s? 的嵌套量词形态，同一段文本存在指数级多种切分，且 regexp2 为回溯型引擎、MustCompile 传 regexp2.None 且未设 MatchTimeout（零值即不限时），匹配失败时穷举全部切分；line 30 的 4096 长度上限为无效防御：约 28 个字符（如 28 个 a 后跟一个 !）即可触发 2^27 量级回溯步骤，远低于上限，且无白名单/规范化/并发或单请求时限，line 37 还以 ok, _ 丢弃 error；line 36 循环对每条 ticket 重复执行同一恶意主题串的指数匹配，消耗随记录数放大，单请求可钉死 CPU 数秒至数小时，少量并发请求即耗尽 goroutine 调度与 CPU 造成拒绝服务；次要流：line 26 的 r.Body 未用 http.MaxBytesReader 限界，超大请求体解码同样造成无界内存消耗，同属本类；第二入口检查：全文件仅 HandleSearch 一个导出入口，summaryPattern 为包私有且仅 line 37 一处调用，不存在其他路由/参数/间接调用可绕过 line 26 到达 sink，替代通道不存在，单一入口已足以确认漏洞成立", "fix_suggestion": "line 16: 最小修复——把 regexp2.MustCompile 换成标准库 regexp.MustCompile（RE2 线性时间引擎、无回溯，天然免疫灾难性回溯），或保留 regexp2 但为其设置 MatchTimeout（如 100 毫秒）并将模式改写为无嵌套量词的等价形式"}
+```

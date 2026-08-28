@@ -1,0 +1,66 @@
+LANG: go
+```code
+package gateway
+
+import (
+	"net/http"
+	"strings"
+)
+
+// corsPolicy enforces a strict cross-origin policy for the REST API gateway.
+// Only exact, pre-registered origins are eligible for credentialed CORS.
+type corsPolicy struct {
+	allowed map[string]bool
+}
+
+// NewCORSPolicy builds the whitelist at startup. Any entry containing a
+// wildcard is dropped so a permissive value can never reach the runtime path.
+func NewCORSPolicy(origins []string) *corsPolicy {
+	m := make(map[string]bool, len(origins))
+	for _, o := range origins {
+		if o == "" || strings.Contains(o, "*") {
+			continue
+		}
+		m[o] = true
+	}
+	return &corsPolicy{allowed: m}
+}
+
+// Middleware wraps every gateway route with the CORS decision.
+func (p *corsPolicy) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Add("Vary", "Origin")
+			if p.allowed[origin] {
+				h := w.Header()
+				h.Set("Access-Control-Allow-Origin", origin)
+				h.Set("Access-Control-Allow-Credentials", "true")
+				h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")
+				h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			}
+		}
+		if r.Method == http.MethodOptions && origin != "" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+1. 第 1 步——本类核心特征：CWE-942 关注 CORS 策略宽度，即 Access-Control-Allow-Origin 是否使用通配符 `*` 或无条件反射攻击者可控的 Origin，尤其当与 Access-Control-Allow-Credentials: true 并存时，任意第三方站点可携带凭据跨域读取响应。这不是注入、越权或文件上传类问题。本文件中 ACAO 仅在第 35 行、且只在第 33 行白名单命中分支内写入，写入值是与白名单键逐字节相等的精确 Origin，通配值在结构上不可能出现。
+
+2. 第 2 步——外部输入点枚举与可达性：共两处输入。其一为运行时 Origin 请求头（第 30 行 r.Header.Get），完全攻击者可控；第 28 行的中间件包裹网关全部路由，第 45 行 next.ServeHTTP 是唯一放行通道，因此该数据流在每次请求上执行并可达第 35-38 行的响应头写入 sink。其二为部署期配置切片 origins（第 16 行），经 NewCORSPolicy 写入 allowed map（第 22 行）并门控第 33 行判断。两条流均可达 sink，逐一验证防御。
+
+3. 第 3 步——流一（Origin 头→ACAO 头）防御验证：第 33 行 p.allowed[origin] 为对固定白名单的精确等值 map 查表，类型正确——不是黑名单、不是前缀/后缀/子串匹配、不是正则、不是字符串替换（这些形态可被 https://app.example.com.evil.com 或 https://evil-app.example.com 类构造绕过）；位置正确——判断位于第 35-38 行响应头写入之前，未命中时完全不输出 ACAO，浏览器侧直接阻断，fail-closed；覆盖完整——中间件覆盖所有路由，且第 35 行反射值即白名单命中键本身，编码或大小写技巧无法使额外来源通过查表。
+
+4. 第 4 步——流二（配置→白名单）与凭据组合验证：第 19 行在启动期丢弃任何含 `*` 的条目及空串，即使运维误配置，通配值也无法进入运行时 map；第 36 行 Allow-Credentials 仅在第 33 行白名单命中分支内输出，因此 ACAO 通配与凭据并存的危险组合在本文件中结构性不可能——凭据头从不在未匹配来源上发出。
+
+5. 第 5 步——缓存侧信道封堵：第 32 行对任何携带 Origin 的请求在放行判定之前无条件写入 Vary: Origin，使网关前置的 CDN/共享代理不会把携带某一来源 ACAO 的缓存响应复用给另一来源，封堵了按来源反射策略最常见的缓存污染旁路。
+
+6. 第 6 步——第二入口/替代通道检查：预检 OPTIONS（第 41-43 行）由同一策略处理并返回 204，响应头同样受第 33 行门控；文件内不存在其他写 ACAO/ACAC 的代码路径，第 45 行是唯一向业务路由放行的通道，无其他路由、参数或间接调用可绕过该包裹。结论：防御类型、位置、覆盖面均正确，不存在 CWE-942 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点一: 运行时 Origin 请求头(第30行), 经第28行中间件包裹全部网关路由、第45行唯一放行通道, 可达第35-38行响应头写入点; 该流防御为第33行 p.allowed[origin] 精确等值 map 查表, 非黑名单/正则/子串替换, 类型正确, 位于响应头写入之前, 未命中则不输出任何 ACAO, fail-closed, 中间件覆盖所有路由且反射值与白名单键逐字节一致, 无编码或大小写绕过; 输入点二: 部署期 origins 配置(第16行), 第19行启动期丢弃含 * 的条目, 通配值结构上无法进入运行时白名单; 第36行 Allow-Credentials 仅在第33行白名单命中分支内输出, ACAO 通配与凭据并存的危险组合不可能出现; 第32行对任何带 Origin 的请求先无条件写 Vary: Origin, 阻断共享缓存将单一来源 ACAO 响应复用给其他来源的缓存侧信道; 第二入口检查: 预检 OPTIONS(第41-43行)走同一策略, 文件内无其他写 ACAO/ACAC 的路径, 第45行为唯一放行通道, 无替代入口; 结论: 防御类型、位置、覆盖面均正确, 不存在 CWE-942", "fix_suggestion": "no fix needed"}
+```

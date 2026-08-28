@@ -1,0 +1,57 @@
+LANG: python
+```code
+"""用户资料查询服务:数据库失败时只向客户端返回通用错误文案,驱动异常细节仅写入服务端日志。"""
+import logging
+import sqlite3
+
+from flask import Flask, jsonify, request
+
+logger = logging.getLogger(__name__)
+_handler = logging.FileHandler("/var/log/app/profile_service.log")
+_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+
+app = Flask(__name__)
+
+
+def fetch_profile(user_id: str):
+    conn = sqlite3.connect("app.db")
+    try:
+        cur = conn.execute("SELECT id, name FROM users WHERE id = ?", (user_id,))
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+@app.route("/profile")
+def profile():
+    user_id = request.args.get("user_id", "")
+    try:
+        row = fetch_profile(user_id)
+    except Exception:
+        # 驱动异常(含 SQL 片段/库文件路径/连接细节)只允许进入服务端日志
+        logger.exception("profile query failed for user_id=%r", user_id)
+        return jsonify({"error": "internal error, please retry later"}), 500
+    if row is None:
+        return jsonify({"error": "user not found"}), 404
+    return jsonify({"id": row[0], "name": row[1]})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+```
+
+第 1 步|本类核心特征:CWE-209 关注「错误信息生成」环节——底层操作失败时,若把异常对象/驱动错误(内含 SQL 语句片段、堆栈帧、内部文件路径、连接串等)直接序列化进对客户端的响应,即构成敏感信息泄露。典型漏洞形态是在 except 块里写 `return jsonify({'error': str(e)}), 500`,或开启框架 debug 让 Werkzeug 渲染带源码的 traceback。本文件第 30-33 行正是该类唯一的风险转换点(数据库异常→HTTP 响应);同时第 19 行使用 `?` 绑定参数,用户输入不参与 SQL 拼接,可先排除 SQL 注入这一相邻类别——本例判定对象仅为错误回显,不涉及注入/越权。
+
+第 2 步|外部输入点枚举与可达性:全文件唯一外部输入是第 27 行 `request.args.get('user_id', '')`(HTTP 查询参数),无请求体、请求头、路径参数等其他读取点。该值经第 29 行调用传入 fetch_profile(第 16 行),在第 19 行作为 sqlite3 绑定参数参与查询。绑定参数使用户输入无法改变 SQL 语法,但数据库操作本身仍可能因表缺失、库文件损坏/被锁定等原因抛出 sqlite3.OperationalError/DatabaseError,这类驱动异常消息可能携带 SQL 文本、表名乃至库文件路径等敏感内容,并从第 17-22 行沿调用栈向上传播至第 30 行的 except——输入点到「错误生成区」的可达性成立,防御必须在第 30-33 行这一汇聚点完成。
+
+第 3 步|主链数据流验证(驱动异常→客户端响应):第 30 行 `except Exception` 位于路由处理器内,即进程把数据交付给客户端前的最后边界(位置正确);其捕获范围覆盖全部 Exception 子类——第 17 行 connect 虽在 fetch_profile 内部 try 之外,但第 29 行的调用整体处于第 28-33 行 try 之内,故 connect/execute(第 19 行)/fetchone(第 20 行)/close(第 22 行)的任何失败模式都被汇聚到同一出口(覆盖完整);第 33 行返回硬编码通用文案 'internal error, please retry later',异常对象从未经 str()/repr()/jsonify 序列化进响应,全文件也不存在任何把异常内容写入响应的语句——这是异常与响应构造的结构性隔离,而非黑名单/正则/字符串替换之类可被构造绕过的过滤(类型正确)。
+
+第 4 步|旁链数据流验证(驱动异常→服务端日志)与正常路径:第 32 行 `logger.exception(...)` 把完整异常消息与堆栈写入第 8 行配置的服务端文件日志 /var/log/app/profile_service.log,该通道仅服务端可读,是详细错误的预期归宿,不构成对客户端的暴露;格式串为常量、user_id 以 %r 参数传入(repr 转义顺带防日志伪造),无格式化注入。第 34-36 行正常路径仅返回业务字段 id/name 与 404 文案,属功能数据而非错误信息,不在本类范围。另第 40 行 app.run 未开启 debug,即使未来有异常绕过第 30 行(如处理器其他位置的 bug),Flask 非 debug 默认 500 页也是不含细节的通用文案,构成第二道保险。
+
+第 5 步|第二入口/替代通道检查与结论:全文件仅第 25 行注册唯一路由 /profile,第 27 行仅读取唯一参数,无其他蓝图、errorhandler、CLI 入口或间接调用路径;错误细节的可能出口只有两个——HTTP 响应(已被第 30/33 行结构性封死)与服务端日志(第 32 行,预期安全去向);唯一潜在的替代通道是 Flask 未捕获异常默认页与 Werkzeug 调试器,但第 40 行未启用 debug 且第 30 行已拦截数据库路径全部异常,该通道同样无法携带 SQL/堆栈/路径等细节到达客户端。结论:防御类型正确(结构性包含)、位置正确(响应边界)、覆盖完整(全部异常类型与全部 DB 失败模式),不存在第二入口或替代通道,判定无 CWE-209 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "本类核心特征是把异常对象或底层驱动错误(含 SQL 文本、堆栈、内部路径、连接细节)回显给客户端,属 CWE-209,而非注入或越权;输入点枚举:全文件唯一外部输入是第 27 行 request.args.get('user_id') 查询参数,经第 29 行进入 fetch_profile,在第 19 行作为 sqlite3 绑定参数执行,数据库失败(表缺失/库文件损坏或锁定等)时驱动异常可能携带 SQL 片段与库文件路径,从第 17-22 行传播到第 30 行 except,可达性成立,此外无请求体/请求头/路径参数等其他输入;数据流一(异常→客户端响应,主链):第 30 行 except Exception 位于路由处理器这一进程对客户端的最后边界(位置正确),捕获全部 Exception 子类,覆盖 connect(第 17 行)/execute(第 19 行)/fetchone(第 20 行)/close(第 22 行)的全部失败模式(覆盖完整),第 33 行仅返回硬编码通用文案 'internal error, please retry later',异常对象从未经 str/repr/jsonify 进入响应,属结构性包含而非黑名单/正则/字符串替换等可绕过过滤(类型正确);数据流二(异常→服务端日志):第 32 行 logger.exception 将完整异常与堆栈写入第 8 行配置的服务端日志文件,该通道客户端不可读,是详细错误的预期安全归宿,且格式串为常量、user_id 以 %r 参数传入,无格式化注入;数据流三(正常路径):第 36 行仅返回业务字段 id/name,非错误信息,不属本类;第二入口/替代通道检查:全文件仅第 25 行注册唯一路由 /profile、第 27 行读取唯一参数,无其他蓝图/errorhandler/间接调用,唯一潜在替代通道是 Flask 未捕获异常的默认 500 页与 Werkzeug 调试器,但第 40 行 app.run 未开启 debug,默认页为通用文案且调试器未启用,加之第 30 行已拦截数据库路径全部异常,故不存在能把错误细节送达客户端的第二通道,防御类型/位置/覆盖均正确,判定无 CWE-209 漏洞", "fix_suggestion": "no fix needed"}
+```

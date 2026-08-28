@@ -1,0 +1,64 @@
+LANG: php
+```code
+<?php
+declare(strict_types=1);
+/*
+ * module/Payment/src/Gateway/LegacyGatewayClient.php
+ * Legacy acquirer integration - the partner bank only exposes
+ * a cleartext HTTP listener on port 8080 (documented limitation).
+ */
+
+namespace Payment\Gateway;
+
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+
+final class LegacyGatewayClient
+{
+    private Client $http;
+    private string $endpoint;
+
+    public function __construct(?string $endpoint = null)
+    {
+        $this->endpoint = $endpoint ?? 'http://acquirer.partner-bank.example:8080/v1/charge';
+        $this->http = new Client(['timeout' => 15]);
+    }
+
+    /**
+     * Submit a card charge. $pan is the full primary account number,
+     * $cvv the 3-digit verification code, $holder the printed cardholder name.
+     */
+    public function charge(string $pan, string $cvv, string $holder, float $amount): array
+    {
+        $payload = [
+            'pan'      => $pan,
+            'cvv'      => $cvv,
+            'holder'   => $holder,
+            'amount'   => $amount,
+            'merchant' => getenv('MERCHANT_ID') ?: '',
+        ];
+
+        try {
+            $resp = $this->http->post($this->endpoint, ['json' => $payload]);
+            return json_decode((string) $resp->getBody(), true) ?? [];
+        } catch (GuzzleException $e) {
+            error_log('charge failed: ' . json_encode($payload) . ' err=' . $e->getMessage());
+            return ['status' => 'error'];
+        }
+    }
+}
+```
+
+1. 第 1 步——本类核心特征：CWE-311 的判定要点是敏感数据以明文形态跨越信任边界，而不是数据被解释为代码（注入）或权限校验缺失（越权）。本文件的敏感数据是持卡人 PII：第 29 行的 $pan（完整主账号）、$cvv（校验码）、$holder（持卡人姓名）；第 21 行把网关默认端点硬编码为 `http://` 明文信道，第 40 行将含 PAN/CVV 的 JSON 请求体经该信道发出，第 43 行还把同一明文 payload 写入错误日志。全文件不存在命令执行、SQL 拼接、HTML 输出等 sink，因此这是典型的 Missing Encryption of Sensitive Data，不是 CWE-78/89/79 等其他类别。
+
+2. 第 2 步——外部输入点枚举与可达性：入口 1 为第 29 行公开方法 charge() 的四个参数，由上层控制器或对账批处理传入真实持卡人数据，第 32-34 行未经任何变换直接进入 $payload，随后在第 40 行作为请求体发出、在第 43 行被 json_encode 落日志，source→sink 全程可达且无中间处理；入口 2 为第 19 行构造函数的 $endpoint 参数（来自配置），它只决定明文数据发往哪个信道，仅影响暴露路径，不构成任何防御。
+
+3. 第 3 步——流 1（PAN/CVV/姓名 → 第 40 行 http POST）防御核查：从第 32-34 行到第 40 行之间没有任何加密调用（无 openssl_encrypt、sodium 等字段级加密，也无令牌化/替换 token），第 22 行创建 Guzzle 客户端时未配置任何强制 TLS 的选项，目标 scheme 完全由第 21 行默认值决定为 http://；即使调用方经第 19 行传入 https 地址，代码也不校验 scheme。防御类型：无；位置：无；覆盖面：0，同网段攻击者可直接嗅探完整卡号与 CVV。
+
+4. 第 4 步——流 2（同一 payload → 第 43 行 error_log）防御核查：第 42 行捕获 GuzzleException 后，第 43 行将完整 $payload（含明文 PAN 与 CVV）序列化写入 PHP 错误日志，无 PAN 掩码（如仅保留后四位）、无 CVV 剔除、无日志文件加密。这是明文落盘型暴露，与流 1 同属 CWE-311；日志通常长期保留且权限宽松，进一步扩大暴露面。两条流均无任何有效防御。
+
+5. 第 5 步——第二入口/替代通道检查：全类仅暴露 charge() 一个公开方法，无其他路由、无静态门面、无 __call 之类的间接转发；唯一替代通道是第 19 行构造函数允许注入自定义 endpoint，但其默认值（第 21 行）即 http:// 且无 scheme 强制校验，该通道既不能阻止明文传输，也不能阻止第 43 行的明文落盘，说明漏洞在默认与实际部署路径上必然触发。结论：两条 source→sink 数据流均无有效防御，确认存在 CWE-311，风险 High（持卡人数据明文外传加落盘，直接违反 PCI DSS 的传输与存储保护要求）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-311 Missing Encryption of Sensitive Data", "risk_level": "High", "source": "line 29: charge() 的外部入参 $pan/$cvv/$holder（持卡人 PII）", "sink": "line 40: 经 Guzzle 向 line 21 硬编码的 http:// 端点明文 POST 请求体（第二 sink: line 43 error_log 明文落盘完整 payload）", "explanation": "流1: line 29 入参 $pan/$cvv/$holder -> line 32-34 组装进 $payload -> line 40 POST 到 line 21 的 http:// 明文端点，全程无 TLS/字段加密/令牌化，卡号与 CVV 明文跨越信任边界；流2: 同一 $payload 在 line 43 被 json_encode 后经 error_log 明文写入错误日志，无掩码无加密；防御核查: 全文件无 openssl_encrypt/sodium 等加密调用，line 22 创建的 Guzzle 客户端未强制 TLS，line 19 构造函数虽可注入自定义 endpoint 但默认值即 http:// 且不校验 scheme，属无效伪防御；第二入口核查: 类仅暴露 charge() 一个公开入口，无其他路由或间接调用，替代通道不构成防御，漏洞确认", "fix_suggestion": "line 21: 将默认端点改为 https:// 并在构造函数中强制校验 scheme 必须为 https，同时删除 line 43 对 payload 的明文日志（排错仅记录卡号后四位掩码）"}
+```

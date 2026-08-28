@@ -1,0 +1,65 @@
+LANG: java
+```code
+package com.example.account.reset;
+
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
+
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * 密码重置：生成重置令牌并调用内部通知服务发送邮件。
+ */
+@RestController
+public class PasswordResetController {
+
+    private static final String NOTIFY_URL = "http://notify.internal.example.com:8080/mail/send";
+
+    @PostMapping("/password/reset")
+    public String requestReset(@RequestParam("email") String email) {
+        String token = UUID.randomUUID().toString();
+        return sendResetMail(email, token);
+    }
+
+    @PostMapping("/password/reset/admin")
+    public String adminReset(@RequestParam("email") String email,
+                             @RequestParam("token") String token) {
+        return sendResetMail(email, token);
+    }
+
+    private String sendResetMail(String email, String token) {
+        String link = "http://account.example.com/reset?token=" + token;
+        String payload = "{\"to\":\"" + email + "\",\"body\":\"reset link: " + link + "\"}";
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(NOTIFY_URL).openConnection();
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(payload.getBytes(StandardCharsets.UTF_8));
+            }
+            return "sent";
+        } catch (Exception e) {
+            return "error";
+        }
+    }
+}
+```
+
+1. 第 19、34、37、41 行共同呈现 CWE-311 的核心特征：敏感数据（密码重置令牌，等同临时凭据，可接管账号；以及用户邮箱 PII）以明文形态跨越信任边界——第 34 行把令牌拼进 `http://` 开头的重置链接，第 35 行组装进请求体，第 37 行连接第 19 行的 `http://` 明文端点，第 41 行明文写出。sink 是网络写出点而非命令/SQL/HTML 解释器，因此该形态属于传输机密性缺失（CWE-311），不是命令注入、SQL 注入、XSS，也不是越权问题。
+
+2. 外部输入点枚举与可达性：本文件共两个 HTTP 入口——第 22 行 `POST /password/reset` 的 `@RequestParam email`，第 28-29 行 `POST /password/reset/admin` 的 `@RequestParam email` 与 `@RequestParam token`。Spring MVC 直接把请求参数绑定到方法形参，两个方法分别在第 24、30 行调用 `sendResetMail`，故全部外部输入均可直达第 41 行的写出点；第 23 行生成的 token 虽非外部输入，但它是本次传输的敏感主体。
+
+3. 流 1 防御核查：source 第 23 行 token → 第 34 行拼入 `http://` 链接 → 第 35 行组装 payload → 第 37 行打开指向第 19 行 `http://` 端点的连接 → 第 41 行明文写出。全程无任何加密：URL scheme 为 `http://`，未使用 `HttpsURLConnection`/`SSLSocketFactory`/StartTLS，令牌发送前未加密或哈希；字符串拼接与 JSON 组装只影响报文格式，不构成机密性控制；文件中也不存在黑名单/正则类过滤（即便存在，过滤也无法替代加密）。防御缺失，链路成立。
+
+4. 流 2 防御核查（第二入口）：第 27-30 行的 admin 路由允许外部直接提交 token，经同一 `sendResetMail` 汇入同一 sink 第 41 行，同样无 TLS；两条路由共享唯一出口，任何只针对单一路由的修补都会被另一条绕过，覆盖面为全部入口均暴露。此外第 34 行的重置链接本身是 `http://`，即使内网一跳加密，用户点击链接时令牌仍会经明文信道泄露。
+
+5. 替代通道与结论：本文件内除上述两条路由外无其他入口，也无日志、落盘、缓存等替代暴露通道；两条 source→sink 链均无有效防御，确认 CWE-311 明文传输敏感数据成立。风险为 High：网络路径上的观察者截获重置令牌即可重置任意用户密码并接管账号。最小修复：第 19 行将 `NOTIFY_URL` 改为 `https://` 并启用证书校验，同时把第 34 行重置链接改为 `https://`。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-311 Missing Encryption of Sensitive Data", "risk_level": "High", "source": "line 23: UUID.randomUUID() 生成的密码重置令牌 token（line 22 与 line 28-29 两个入口的外部输入 email/token 一并汇入该链路）", "sink": "line 41: os.write(payload.getBytes(...)) 将含令牌的明文请求体经 line 37 连接写入 line 19 的 http:// 明文信道", "explanation": "流1: line 22 入口 /password/reset 接收 email, line 23 生成重置令牌 token, line 34 将 token 拼入 http:// 重置链接, line 35 组装请求体, line 37 打开指向 line 19 http:// 明文端点的连接, line 41 明文写出, 全程无 TLS 无加密, 防御缺失; 流2: line 27-30 第二入口 /password/reset/admin 直接接收外部传入的 token 并复用 sendResetMail, 汇入同一 sink line 41, 同样无加密, 两路由共享唯一出口导致单点修补可被另一入口绕过; 防御核查: 代码无 HttpsURLConnection/SSLSocketFactory/StartTLS 等任何加密配置, 字符串拼接与 JSON 组装不构成机密性防护, 亦无黑名单/正则过滤存在; 第二入口与替代通道: 存在两条路由(line 21 与 line 27)且 line 34 重置链接本身即 http:// 明文信道, 文件内无日志或落盘等其他暴露通道, 结论: CWE-311 明文传输敏感数据成立, 截获令牌即可接管账号", "fix_suggestion": "line 19: 将 NOTIFY_URL 的 http:// 改为 https:// 并校验服务器证书，同时将 line 34 重置链接改为 https://，确保令牌全程仅在 TLS 信道传输"}
+```

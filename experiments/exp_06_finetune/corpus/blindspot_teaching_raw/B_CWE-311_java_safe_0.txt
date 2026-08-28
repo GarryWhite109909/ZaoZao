@@ -1,0 +1,66 @@
+LANG: java
+```code
+package com.example.account.reset;
+
+import java.net.URI;
+import java.security.SecureRandom;
+import java.time.Instant;
+import java.util.Base64;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.stereotype.Service;
+
+@Service
+public class PasswordResetService {
+    private final UserRepository userRepository;
+    private final BCryptPasswordEncoder hasher = new BCryptPasswordEncoder(12);
+    private final SecureRandom rng = new SecureRandom();
+    private final Map<String, String> pendingTokenHashes = new ConcurrentHashMap<>();
+    private final Map<String, Instant> pendingExpiry = new ConcurrentHashMap<>();
+
+    public PasswordResetService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    public String createResetLink(String email, String baseUrl) {
+        URI base = URI.create(baseUrl);
+        if (!"https".equalsIgnoreCase(base.getScheme())) {
+            throw new IllegalArgumentException("reset link must be served over TLS");
+        }
+        byte[] raw = new byte[32];
+        rng.nextBytes(raw);
+        String token = Base64.getUrlEncoder().withoutPadding().encodeToString(raw);
+        pendingTokenHashes.put(email, hasher.encode(token));
+        pendingExpiry.put(email, Instant.now().plusSeconds(900));
+        return base + "/reset/confirm?token=" + token;
+    }
+
+    public boolean applyReset(String email, String token, String newPassword) {
+        Instant expiry = pendingExpiry.get(email);
+        String storedHash = pendingTokenHashes.get(email);
+        if (expiry == null || Instant.now().isAfter(expiry) || !hasher.matches(token, storedHash)) {
+            return false;
+        }
+        pendingTokenHashes.remove(email);
+        pendingExpiry.remove(email);
+        String passwordHash = hasher.encode(newPassword);
+        return userRepository.updatePasswordHash(email, passwordHash);
+    }
+}
+```
+
+第1步（类别定位）：本类对应 CWE-311 的核心特征——敏感数据（重置令牌、用户新密码）以明文形态跨信任边界。该类漏洞的典型形态是：重置链接用 `http://` 明文信道把令牌发给用户（链路上可被嗅探），或新密码/令牌明文落库。这与注入、越权、日志伪造等类别无关。本文件为安全版，可见两道对应防御：第 26-29 行的 TLS 信道强制，以及第 33/46 行的 bcrypt 加密存储。
+
+第2步（输入点枚举与可达性）：入口一 `createResetLink(email, baseUrl)`（第 25 行）：baseUrl 经第 26 行 URI 解析、第 27 行 scheme 校验后进入第 35 行链接拼接 sink；内部生成的 token（第 30-32 行）同样直达第 35 行 sink。入口二 `applyReset(email, token, newPassword)`（第 38 行）：token 经第 41 行校验，newPassword 直达第 46 行编码器与第 47 行持久化 sink。所有 source→sink 路径均可达，无死代码。
+
+第3步（流 A：令牌→传输信道，防御验证）：令牌在第 35 行被拼入返回链接，是唯一跨信任边界的传输点。防御位于第 26-29 行：先 `URI.create` 解析，再以 `getScheme` 与 https 严格比较，非 https 直接抛 `IllegalArgumentException`，属 fail-closed 的协议强制。类型正确：TLS 正是 CWE-311 要求的信道加密控制，scheme 允许列表保证任何通过校验的 URL 只能经 TLS 传输——这不是可被编码/双写/大小写绕过的黑名单或字符串替换；位置正确：校验发生在链接构造之前、令牌离开信任边界之前；覆盖完整：令牌仅出现在第 35 行这一条输出路径，无日志、无第二返回口，且第 33 行令牌在服务端仅以 bcrypt 哈希留存，存储侧同样受控。
+
+第4步（流 B：新密码→存储，防御验证）：newPassword 自第 38 行进入后，第 46 行经 `BCryptPasswordEncoder`（成本因子 12，自动加盐）单向哈希，第 47 行仅哈希值传入 `userRepository.updatePasswordHash`。类型正确：bcrypt 是自适应口令哈希函数，非可逆编码、非字符串过滤；位置正确：是持久化前的最后一步；覆盖完整：明文 newPassword 无日志、无返回、无其他引用；第 41 行对用户提交令牌的校验用 `hasher.matches` 做 bcrypt 哈希比对，不存在明文比较或明文存储。
+
+第5步（第二入口/替代通道检查）：全类仅第 25 行与第 38 行两个 public 方法，无其他路由、参数或间接调用能触达令牌或密码；类内无日志语句、无直接 JDBC/HTTP 客户端明文写出，`pendingTokenHashes` 仅存哈希。结论：不存在绕过 TLS 强制或 bcrypt 存储的替代通道，本文件不构成 CWE-311 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "流A: 第32行SecureRandom生成的令牌于第35行拼入重置链接返回投递, 第26-29行以URI解析并强制scheme=https且fail-closed抛异常, 属协议级TLS强制而非可绕过的黑名单/正则/字符串替换, 令牌仅此一条输出路径且第33行服务端仅存bcrypt哈希; 流B: 第38行newPassword于第46行bcrypt(成本12自动加盐)哈希后第47行仅哈希值持久化, 明文无日志无返回, 第41行令牌校验亦为bcrypt.matches哈希比对; 第二入口检查: 全类仅第25行与第38行两个public入口, 无其他路由/参数/间接调用, 无日志语句与明文DB/HTTP写出通道, 两道防御类型正确/位置正确/覆盖完整, 不存在CWE-311明文暴露", "fix_suggestion": "no fix needed"}
+```

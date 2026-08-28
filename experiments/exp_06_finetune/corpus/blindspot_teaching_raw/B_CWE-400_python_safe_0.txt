@@ -1,0 +1,68 @@
+LANG: python
+```code
+"""Input-validation service: safely evaluate user-supplied regexes.
+
+A client posts a JSON body with `pattern` and `subject`; the server
+compiles and runs the pattern. ReDoS hardening (CWE-400): size caps on
+both inputs plus a hard wall-clock timeout on every evaluation.
+"""
+import regex
+from flask import Flask, jsonify, request
+
+MAX_PATTERN_LEN = 128
+MAX_SUBJECT_LEN = 4096
+EVAL_TIMEOUT_S = 1.0
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 64 * 1024  # reject bodies over 64 KiB
+
+
+class RegexRejected(ValueError):
+    """Submitted input violates module policy."""
+
+
+def evaluate(pattern, subject):
+    if not isinstance(pattern, str) or len(pattern) > MAX_PATTERN_LEN:
+        raise RegexRejected('pattern must be a string of at most 128 chars')
+    if not isinstance(subject, str) or len(subject) > MAX_SUBJECT_LEN:
+        raise RegexRejected('subject must be a string of at most 4096 chars')
+    try:
+        compiled = regex.compile(pattern, timeout=EVAL_TIMEOUT_S)
+    except regex.error as exc:
+        raise RegexRejected('invalid pattern: %s' % exc) from exc
+    return bool(compiled.search(subject, timeout=EVAL_TIMEOUT_S))
+
+
+@app.post('/api/regex/validate')
+def validate():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        matched = evaluate(body.get('pattern', ''), body.get('subject', ''))
+    except TimeoutError:
+        return jsonify(error='evaluation exceeded the time budget'), 422
+    except RegexRejected as exc:
+        return jsonify(error=str(exc)), 400
+    return jsonify(matched=matched)
+
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000)
+```
+
+第 1 步：本类核心特征——CWE-400 在本场景的典型形态是 ReDoS（正则灾难性回溯）：不可信的 pattern 与 subject 直接驱动服务端正则引擎，嵌套量词如 `(a+)+`、`(a|a)*`、`(x+x+)+y` 会使回溯步数随输入长度指数增长；Python 的 `re`/`regex` 引擎（未设超时时）均为回溯型实现，可被打穿。本例汇点是第 28 行 `regex.compile` 与第 31 行 `compiled.search`。这与注入/越权无关——不涉及代码执行或权限判断，危害是单个请求独占 CPU 造成拒绝服务。
+
+第 2 步：输入点枚举与可达性——全文件唯一外部入口是第 34-35 行的 `POST /api/regex/validate` 路由；第 36 行 `request.get_json` 取回请求体，第 40 行取出 pattern 与 subject 两个不可信字段后原样传入 `evaluate`（第 22 行），中间无任何转折；`evaluate` 内部第 28 行编译 pattern、第 31 行以 subject 调用 search，两条 source→sink 路径均确认可达。另有一个隐式传输层输入——原始请求体字节流，由第 15 行 `MAX_CONTENT_LENGTH=64KiB` 封顶（超限 413），在进入解析前即受控。
+
+第 3 步：流 1（pattern→compile/search）防御验证——第 23-24 行的 isinstance 检查加 128 字符上限只能约束内存与编译开销，挡不住仅 6 字符的 `(a+)+$` 这类短模式，因此决定性防御是第 28 行与第 31 行传入 regex 引擎的 `timeout=1.0` 墙钟预算：引擎在匹配循环内部检查耗时并抛出内建 TimeoutError，无论模式形态如何都会在约 1 秒内中止。类型正确：直接给被消耗的资源（CPU 时间）设上界，而不是像模式黑名单/字符串替换那样可被 `(a|aa)+`、`([a-zA-Z]+)*` 等变体轻易绕过；位置正确：预算挂在汇点语句本身，全文件不存在第二处 compile/search 调用，任何路径都无法绕过；覆盖完整：第 41-42 行捕获 TimeoutError 返回 422，中止是受控行为而非进程崩溃。
+
+第 4 步：流 2（subject→search）防御验证——第 25-26 行对 subject 做类型检查并限长 4096：回溯成本随主体长度放大，限长直接压缩单次调用的最坏工作量；且两条流在第 31 行汇聚为同一次 search 调用，该调用的 timeout 参数同样覆盖 subject 流。第 25 行的 isinstance 还拒绝 JSON 中的非字符串类型（如数组/数值），避免 `len()` 抛 TypeError 造成 500 与类型混淆类异常。
+
+第 5 步：覆盖面与错误路径——所有拒绝路径显式可控：非法语法→第 29-30 行转 RegexRejected→第 43-44 行返回 400；超时→422；超限/类型错误→400。模块内不存在其他无界资源操作（无文件读取、解压、深解析），单请求 CPU 上界约 1 秒、内存上界由第 15 行与两处字段上限共同保证，即单请求资源消耗在构造上有界（请求频率型洪泛属网关限流职责，不在本模块契约内）。
+
+第 6 步：第二入口/替代通道检查——文件仅定义一个路由（第 34 行），`evaluate` 仅被 `validate`（第 40 行）调用；无查询参数、请求头、文件上传或环境变量触达正则引擎，模块级代码不处理用户数据；不存在绕过长度上限或 timeout 预算的替代通道，防御类型正确、位置正确、覆盖完整，判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部入口是第34行的 POST /api/regex/validate 路由：第36行读取 JSON 请求体，第40行取出 pattern 与 subject 两个不可信字段并直达第28行 regex.compile 与第31行 compiled.search 这一 ReDoS 汇点，两条数据流均确认可达；流1（pattern→compile/search）：第23-24行的类型检查与128字符上限只能约束内存与编译成本，挡不住形如 (a+)+$ 的短模式指数回溯，决定性防御是第28行与第31行传入 regex 引擎的 timeout=1.0 墙钟预算——引擎在匹配循环内检查耗时并抛出内建 TimeoutError，无论模式形态如何都在约1秒内中止，这是直接给 CPU 资源设上界的正确防御类型，而非可被 (a|aa)+ 等变体绕过的模式黑名单，且预算挂在汇点语句本身、全文件无第二处 compile/search 调用故无路径可绕过，TimeoutError 在第41-42行被捕获并返回422，中止行为受控；流2（subject→search）：第25-26行类型检查加4096字符上限压缩回溯成本随主体长度的放大，且两流汇聚于第31行同一次 search 调用，同样受 timeout 覆盖；传输层隐式通道（原始请求体）由第15行 MAX_CONTENT_LENGTH=64KiB 封顶，超限返回413；第二入口检查：文件仅此一个路由，evaluate 仅被 validate 调用，无查询参数/请求头/文件/环境变量等替代通道触达正则引擎，防御类型正确、位置正确、覆盖完整，判定无 CWE-400 漏洞", "fix_suggestion": "no fix needed"}
+```

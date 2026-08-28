@@ -1,0 +1,61 @@
+LANG: python
+```code
+"""REST API gateway with a strict CORS policy (CWE-942 safe reference).
+
+Only exact-allowlisted origins receive CORS grants; credentials are never
+combined with a wildcard, and every response varies on Origin.
+"""
+from flask import Flask, jsonify, request, Response
+
+ALLOWED_ORIGINS = frozenset({
+    "https://app.example.com",
+    "https://dashboard.example.com",
+})
+
+
+def apply_cors(resp: Response) -> Response:
+    origin = request.headers.get("Origin", "")
+    resp.vary.add("Origin")  # shared caches must not reuse one origin's response
+    if origin in ALLOWED_ORIGINS:  # exact scheme+host match, no wildcard/regex/suffix
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
+
+app = Flask(__name__)
+
+
+@app.after_request
+def cors_hook(resp: Response) -> Response:
+    return apply_cors(resp)
+
+
+@app.route("/api/gateway/data", methods=["GET", "POST", "OPTIONS"])
+def gateway_data():
+    if request.method == "OPTIONS":  # preflight; grant still added by cors_hook
+        resp = Response(status=204)
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        resp.headers["Access-Control-Max-Age"] = "600"
+        return resp
+    payload = {"service": "gateway", "user": request.headers.get("X-User", "anon")}
+    return jsonify(payload)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8443)
+```
+
+1. 本类核心特征：CWE-942 关注跨域策略过宽——`Access-Control-Allow-Origin` 使用通配符 `*`、或把任意请求 Origin 原样反射回响应头，尤其当与 `Access-Control-Allow-Credentials: true` 组合时，任意恶意站点可携带受害者 Cookie/凭据跨域读取受保护响应。本文件中唯一的 ACAO 写入点在第 18 行，且被第 17 行的精确白名单分支包裹，全文件不存在 `*` 字面量；判定范围仅限跨域策略宽度，不涉及注入、越权或 SSRF。
+
+2. 外部输入点枚举与可达性：共三处输入。(a) 第 15 行读取请求头 Origin，经第 26-28 行全局 `after_request` 钩子，每个响应（含第 33-38 行 OPTIONS 预检）都会进入 `apply_cors`，到达第 18 行 sink，可达；(b) 第 39 行读取 X-User 头，仅进入 `jsonify` 响应体，不写入任何 Access-Control-* 头，不是本类 sink；(c) 第 35-37 行预检的 Allow-Methods/Allow-Headers/Max-Age 均为硬编码常量，无外部输入参与。
+
+3. Origin→ACAO 数据流防御验证：类型正确——第 17 行用 `frozenset`（第 8-11 行）做精确等值匹配白名单，`https://app.example.com.evil.com`、子域 `https://evil.example.com`、`null` 来源及大小写变体均无法命中，不是黑名单/正则/子串替换等可绕过形态；位置正确——白名单校验是第 18-19 行赋值的直接前置条件，且封装在第 26-28 行全局钩子内，没有任何路由能绕过它单独写 CORS 头；覆盖面完整——第 16 行在分支之前无条件添加 `Vary: Origin`，防止共享缓存把白名单来源的响应投递给其他来源，第 19 行凭据头只在精确匹配分支内下发，全文件不存在通配符与凭据的组合。
+
+4. 预检通道核查：OPTIONS 分支（第 33-38 行）返回静态方法与头列表，其 CORS 授权仍统一经过第 26-28 行钩子，即预检与实际请求遵循同一份白名单，不存在更宽松的独立预检路径。
+
+5. 第二入口/替代通道检查：全模块仅第 31 行注册的 `/api/gateway/data` 一个路由，无 blueprint、无 flask-cors 扩展、无其他 Access-Control-* 写入点（唯一写入点为第 18-19 行，位于第 17 行白名单之后）；第 39 行 X-User 反射只影响响应体不影响策略头。结论：不存在绕过通道，防御类型/位置/覆盖面均完整，判定无 CWE-942 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点一: 第 15 行读取 Origin 头, 经第 26-28 行全局 after_request 钩子到达唯一 CORS sink 即第 18 行 Access-Control-Allow-Origin 赋值, 可达; 防御验证: 第 17 行以 frozenset(第 8-11 行)精确等值匹配做白名单, 后缀拼接/子域/null/大小写变体均不命中, 非黑名单或正则等可绕过形态, 类型正确; 校验位于第 18-19 行赋值之前并封装于全局钩子, 所有路由与 OPTIONS 预检(第 33-38 行)共用同一出口, 位置与覆盖面完整; 第 16 行无条件添加 Vary: Origin 防止共享缓存串源; 第 19 行凭据头仅在精确匹配分支内下发, 全文件无通配符与凭据组合; 输入点二: 第 39 行 X-User 头仅进入 jsonify 响应体, 不构成跨域策略 sink; 第二入口检查: 全模块仅第 31 行一个路由, 无 flask-cors 扩展或其它 Access-Control-* 写入点, 不存在绕过通道, 判定安全", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,60 @@
+LANG: java
+```code
+package com.acme.export;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * 商品数据 CSV 导出模块。
+ */
+@RestController
+@RequestMapping("/api/export")
+public class ProductExportController {
+
+    private final ProductRepository productRepository;
+
+    public ProductExportController(ProductRepository productRepository) {
+        this.productRepository = productRepository;
+    }
+
+    @GetMapping(value = "/products.csv", produces = "text/csv")
+    public String exportProducts(@RequestParam(defaultValue = "false") boolean debug) {
+        List<Map<String, Object>> rows = productRepository.findAllWithInternalFields();
+        StringWriter buffer = new StringWriter();
+        PrintWriter csv = new PrintWriter(buffer);
+        csv.println("sku,name,unit_cost,supplier_price,margin_rate,internal_note");
+        for (Map<String, Object> row : rows) {
+            csv.printf("%s,%s,%s,%s,%s,%s%n",
+                    row.get("sku"), row.get("name"),
+                    row.get("unit_cost"), row.get("supplier_price"),
+                    row.get("margin_rate"), row.get("internal_note"));
+        }
+        if (debug) {
+            csv.println("# debug datasource=" + productRepository.describeDataSource());
+        }
+        return buffer.toString();
+    }
+}
+```
+
+1. 第 1 步（本类核心特征）：CWE-200 的要点是敏感信息被原样回显给不可信方。本例中内部成本 `unit_cost`、供应商价 `supplier_price`、毛利率 `margin_rate`、内部备注 `internal_note`，以及 debug 模式下的数据源连接串，全部进入 HTTP 响应体（第 41 行）。危害是数据泄露而非代码执行或查询结构被篡改，因此归类为 CWE-200 信息暴露，而非命令注入（CWE-78）/SQL 注入（CWE-89）/代码注入（CWE-94），也不是越权写入类问题。
+
+2. 第 2 步（输入点枚举与可达性）：输入点一——第 26-27 行的 GET /api/export/products.csv 路由本身，文件内无任何 @PreAuthorize/角色判断/租户过滤，任意客户端可直接调用，到 sink 无中间校验；输入点二——第 27 行 @RequestParam 绑定的 `debug` 布尔参数，完全由客户端控制，在第 38 行即被消费，两条输入到第 41 行 sink 的可达性均为直接可达。
+
+3. 第 3 步（主流：敏感列回显）：第 28 行 `findAllWithInternalFields()` 从数据库载入含内部定价字段的完整记录 -> 第 33-36 行 `csv.printf` 将 unit_cost/supplier_price/margin_rate/internal_note 四列逐行写入缓冲区，第 31 行表头甚至对外宣告了这些敏感列名 -> 第 41 行 `return buffer.toString()` 把全部内容作为响应体回显。防御核查：全文件不存在字段白名单 DTO/投影、无角色校验、无脱敏或列裁剪逻辑，属于防御完全缺失（连可绕过的黑名单都不存在），覆盖面为零。
+
+4. 第 4 步（第二流：调试信息回显）：第 27 行客户端传入 debug=true -> 第 38 行 `if (debug)` 是唯一'闸门'，但它本身就是触发条件而非防御，取值由攻击者任意指定 -> 第 39 行拼接 `describeDataSource()` 返回的连接串/内部路径写入响应 -> 第 41 行回显。`defaultValue = "false"` 不构成任何防护，因为默认值只影响未传参的请求。
+
+5. 第 5 步（第二入口/替代通道检查）：本文件仅第 26 行一条 @GetMapping 映射，无其他路由、无间接调用或异步旁路；`debug` 参数构成同一路由上的第二输入通道，与主流汇聚于同一 sink（第 41 行）。不存在可绕过该结论的替代通道，两条流均无有效防御，最终结论：存在 CWE-200 漏洞，风险等级 High（内部定价与基础设施信息对任意调用方暴露）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-200 Exposure of Sensitive Information", "risk_level": "High", "source": "line 28: productRepository.findAllWithInternalFields() 载入含 unit_cost/supplier_price/margin_rate/internal_note 的内部字段; line 27: 客户端可控的 debug 请求参数", "sink": "line 41: return buffer.toString() 作为 HTTP 响应体回显给调用方", "explanation": "流1: line 28 从数据库载入含内部成本/供应商价/毛利率/内部备注的完整记录 -> line 33-36 csv.printf 将四个敏感列全部写入导出内容(line 31 表头亦对外宣告列名) -> line 41 整个缓冲区作为响应体返回, 全程无角色校验/无字段白名单投影/无脱敏, 属防御完全缺失而非可绕过过滤; 流2: line 27 debug 参数由客户端任意指定 -> line 38 if(debug) 仅为触发条件而非防御 -> line 39 拼接 describeDataSource() 的连接串/内部路径写入响应, defaultValue=false 不构成防护; 第二入口检查: 本文件仅 line 26 一条 @GetMapping 路由, 无其他路由或间接调用, debug 参数构成同一路由上的第二输入通道, 两条流汇聚于同一 sink line 41, 敏感定价数据与内部基础设施信息对任意不可信方暴露, 结论成立", "fix_suggestion": "line 33: 最小修复——将查询与导出改为仅含 sku/name 的对外字段白名单(删除 unit_cost/supplier_price/margin_rate/internal_note 四列并同步修改第 31 行表头), 同时移除第 38-40 行 debug 分支使服务端忽略该参数"}
+```

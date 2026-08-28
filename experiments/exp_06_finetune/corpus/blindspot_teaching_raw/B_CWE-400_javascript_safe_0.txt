@@ -1,0 +1,51 @@
+LANG: javascript
+```javascript
+'use strict';
+
+const express = require('express');
+const RE2 = require('re2');
+
+const router = express.Router();
+
+const MAX_PATTERN_LENGTH = 128;
+const MAX_SUBJECT_LENGTH = 4096;
+
+router.post('/regex/validate', (req, res) => {
+  const { pattern, subject } = req.body || {};
+
+  if (typeof pattern !== 'string' || typeof subject !== 'string') {
+    return res.status(400).json({ error: 'pattern and subject must be strings' });
+  }
+  if (pattern.length > MAX_PATTERN_LENGTH) {
+    return res.status(400).json({ error: 'pattern exceeds 128 chars' });
+  }
+  if (subject.length > MAX_SUBJECT_LENGTH) {
+    return res.status(400).json({ error: 'subject exceeds 4096 chars' });
+  }
+
+  let re;
+  try {
+    re = new RE2(pattern);
+  } catch (err) {
+    return res.status(400).json({ error: 'invalid pattern' });
+  }
+
+  return res.json({ matched: re.test(subject) });
+});
+
+module.exports = router;
+```
+
+第1步（类别核心特征）：CWE-400 在本场景的典型形态是 ReDoS——不可信输入驱动无界 CPU 消耗：攻击者提交含嵌套量词的灾难性正则（如 `(a+)+`、`(a|a)*`、`(.*)*`），或构造对抗性 subject 字符串，使回溯型引擎（原生 RegExp/V8）匹配耗时呈指数爆炸，单个请求即可占满事件循环造成拒绝服务。这本质是资源消耗问题，与 SQL 注入、越权、XSS 等类别无关。本模块的潜在 sink 是第 26 行的正则编译与第 31 行的匹配执行。
+
+第2步（输入点枚举与可达性）：模块唯一外部入口是第 11 行注册的 POST /regex/validate 路由；第 12 行解构出两个 source：`req.body.pattern` 与 `req.body.subject`。pattern 直达第 26 行 `new RE2(pattern)`（编译 sink），subject 直达第 31 行 `re.test(subject)`（执行 sink），两条数据流中间无任何跳转或条件分支阻断，可达性确认成立。
+
+第3步（pattern 流防御验证）：第 14 行类型检查确保进入编译的是字符串；第 17-19 行将 pattern 长度封顶在 128 字符，从规模上限制编译产物复杂度；关键防御在第 26 行——使用 re2 包（Google RE2 的 Node 绑定）而非原生 RegExp。RE2 将模式编译为线性时间自动机，引擎设计上不存在回溯，因此 `(a+)+` 这类嵌套量词匹配时间恒为 O(n·m)。防御类型正确：这是结构性消除，而非黑名单枚举危险模式（黑名单可被 `(a|aa)+` 等变体绕过，且仅靠 128 字符上限在原生回溯引擎上仍会灾难性回溯）；位置正确：替换发生在唯一编译点；覆盖完整：模块内不存在第二处 `new RegExp` 或回退路径，第 27-29 行 catch 仅返回 400，不会降级到原生引擎。
+
+第4步（subject 流防御验证）：第 20-22 行将 subject 限制在 4096 字符，即使模式本身合法，也把单次匹配工作量上界压至 O(4096 × 模式长度)；第 31 行的 `re.test` 在 RE2 线性引擎上执行，与第 26 行的编译期保证构成双层防御。两处长度检查均位于 sink 之前的唯一必经路径上，无绕过分支，防御位置与覆盖面均正确。
+
+第5步（第二入口/替代通道检查）：第 34 行仅导出该 router 实例；模块内无其他 `router.get/post`、无 app 级路由、无导出的正则编译工具函数可被其他模块间接调用；pattern 与 subject 之外无第三参数进入 sink，也不存在通过 query、header 或事件回调触达编译/匹配逻辑的替代通道。结论：所有 source→sink 路径均被『长度上限 + RE2 线性时间引擎』完整覆盖，无 CWE-400 残留风险，判定为安全实现。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一入口为第11行 POST /regex/validate 路由；source1=req.body.pattern（第12行解构）经第14行类型检查与第17-19行128字符长度上限后于第26行进入 new RE2 编译，RE2 为线性时间自动机引擎、设计上无回溯，嵌套量词 (a+)+ 或 (a|a)* 也只以 O(n*m) 完成，防御类型为结构性消除而非可绕过的黑名单枚举，位置在唯一编译点且覆盖全部编译调用；source2=req.body.subject（第12行）经第20-22行4096字符上限后于第31行 re.test 执行，匹配在 RE2 引擎上进行，工作量被长度限制与线性引擎双重封顶；第27-29行 catch 仅返回400、不回退到原生 RegExp；第34行仅导出该 router，模块内无其他路由、无导出的正则编译函数、无 query/header 等替代通道，全部 source→sink 路径均受防御覆盖，判定无 CWE-400 风险", "fix_suggestion": "no fix needed"}
+```

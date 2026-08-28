@@ -1,0 +1,69 @@
+LANG: php
+```code
+<?php
+
+namespace App\Http\Controllers\Export;
+
+use App\Models\Product;
+use Illuminate\Http\Request;
+use Illuminate\Routing\Controller;
+use Illuminate\Support\Facades\Response;
+
+class ProductExportController extends Controller
+{
+    // GET /api/export/products?format=csv&debug=1
+    public function export(Request $request)
+    {
+        $format = $request->query('format', 'json');
+        $debug  = $request->query('debug', '0');
+
+        $rows = Product::all()->map(function (Product $p) {
+            return [
+                'sku'              => $p->sku,
+                'name'             => $p->name,
+                'retail_price'     => $p->retail_price,
+                'supplier_cost'    => $p->supplier_cost,
+                'internal_margin'  => $p->internal_margin,
+                'supplier_contact' => $p->supplier_contact,
+                'internal_note'    => $p->internal_note,
+            ];
+        });
+
+        if ($debug === '1') {
+            return Response::json([
+                'rows'        => $rows,
+                'db_host'     => config('database.connections.mysql.host'),
+                'db_database' => config('database.connections.mysql.database'),
+                'app_env'     => config('app.env'),
+                'app_version' => app()->version(),
+            ]);
+        }
+
+        if ($format === 'csv') {
+            $csv = implode(',', array_keys($rows->first()->toArray())) . "\n";
+            foreach ($rows as $r) {
+                $csv .= implode(',', $r->toArray()) . "\n";
+            }
+            return Response::make($csv, 200, ['Content-Type' => 'text/csv']);
+        }
+
+        return Response::json(['rows' => $rows]);
+    }
+}
+```
+
+1. 本类核心特征：这是 CWE-200 Exposure of Sensitive Information，而非注入或越权类。数据本身是服务端合法读取的可信数据，没有恶意输入被解释成命令/SQL/代码（非 CWE-78/89/94），也不是校验失误导致访问他人资源（非 CWE-862/639）；问题在于服务端把本不应离开信任边界的数据——供应商成本价、内部毛利率、供应商联系人、内部备注（第 23~26 行），以及调试分支里的数据库主机/库名、运行环境、框架版本（第 33~36 行）——原样写入对客户端的 HTTP 响应，属于“API 响应直接回显敏感字段 + 调试模式对客户端开启”的典型形态。
+
+2. 外部输入点枚举与可达性：入口为 GET /api/export/products（第 12 行注释），外部输入点共两个——第 15 行 `$request->query('format')` 与第 16 行 `$request->query('debug')`，均由客户端完全可控；方法体内没有任何认证/角色中间件判断或 `can()` 授权，任何能触达该路由的调用方都可一路执行到第 18 行的全量查询与第 31/45/48 行三个响应出口，source→sink 可达性成立。
+
+3. 数据流一（敏感业务列回显）：第 18 行 `Product::all()` 取出含敏感列的完整记录 → 闭包在第 23~26 行显式把 supplier_cost、internal_margin、supplier_contact、internal_note 组装进 `$rows` → 第 48 行 `Response::json` 原样回显，或经第 41~45 行拼入 CSV 响应体。全程无字段白名单、无按角色裁剪、无脱敏（打码/区间化）；闭包是显式列名映射，连模型 `$hidden` 机制也被绕开，防御完全缺失。
+
+4. 数据流二（调试信息外泄）：第 16 行客户端可控的 debug 参数 → 第 30 行仅做 `=== '1'` 弱比较即进入调试分支 → 第 33~36 行读取 `config('database.connections.mysql.host')`、库名、`app.env`、`app()->version()` → 第 31 行随 JSON 响应返回客户端。调试开关由请求方自己的参数决定，而非服务端 `app.debug` 配置或管理员身份，属于“内部路径/版本/连接信息写入对外可见响应”的典型 CWE-200 形态。
+
+5. 防御有效性核验：两条流上均不存在任何有效防御——没有字段黑/白名单（列名硬编码在闭包内，调用方无从触发过滤）、没有正则或字符串替换过滤、没有角色/范围校验、没有日志或响应脱敏；CSV 分支（第 40~46 行）复用同一个未过滤的 `$rows`，与 JSON 分支暴露面完全相同。按判定规则，即便存在黑名单/替换过滤也不算有效防御，而此处连这类手段都没有。
+
+6. 第二入口/替代通道检查：本文件唯一入口是 export 方法，但存在三条等价暴露通道——调试 JSON（第 31 行）、CSV 下载（第 45 行）、普通 JSON（第 48 行），三者共用同一份含敏感列的 `$rows`；文件内不存在任何按字段裁剪的替代路由或间接调用。因此无论客户端选择哪种 format，敏感列都会离开服务端，且批量导出会放大泄露规模，结论成立：CWE-200，风险 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-200 Exposure of Sensitive Information", "risk_level": "High", "source": "line 18: Product::all() 全量读取含 supplier_cost/internal_margin/supplier_contact/internal_note 敏感列的商品记录；line 16: 客户端可控的 debug 查询参数", "sink": "line 48: Response::json(['rows' => $rows]) 将敏感列原样回显给客户端（等价 sink：line 31 调试 JSON、line 45 CSV 响应）", "explanation": "流一：line 18 全量查询 -> line 23-26 闭包显式组装 supplier_cost/internal_margin/supplier_contact/internal_note -> line 48 JSON 回显与 line 41-45 CSV 导出，无字段白名单、无角色裁剪、无脱敏，模型 $hidden 被闭包绕开；流二：line 16 客户端可控 debug 参数 -> line 30 仅 === '1' 弱判断 -> line 33-36 读取数据库主机/库名、app.env、框架版本 -> line 31 随响应外泄，调试开关由请求方控制而非服务端配置；防御核验：两条流均无任何有效防御，黑名单/替换过滤亦不存在，CSV 分支复用同一 $rows 暴露面相同；第二入口检查：文件内唯一入口为 export 方法，但存在调试 JSON/CSV/普通 JSON 三条等价暴露通道，均输出未过滤 $rows，无按字段裁剪的替代路由，结论成立", "fix_suggestion": "line 23: 最小修复——按调用方角色使用字段白名单，普通用户仅导出 sku/name/retail_price，从闭包中移除 supplier_cost/internal_margin/supplier_contact/internal_note 四个敏感列；同时删除 line 30-38 客户端可控的 debug 分支，禁止将数据库连接信息与框架版本写入对外响应"}
+```

@@ -1,0 +1,62 @@
+LANG: python
+```code
+# app/auth/password_reset.py
+"""Password reset flow: token issuance and confirmation."""
+import logging
+import secrets
+import smtplib
+from email.message import EmailMessage
+
+import requests
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+log = logging.getLogger(__name__)
+
+SMTP_HOST, SMTP_PORT = "mail.corp.lan", 25
+TOKEN_LOOKUP_URL = "http://token-service.internal/lookup"
+SET_PASSWORD_URL = "http://user-profile.internal/api/set-password"
+
+
+@app.route("/password/reset", methods=["POST"])
+def issue_reset_token():
+    email = request.form["email"]
+    token = secrets.token_urlsafe(32)
+    msg = EmailMessage()
+    msg["To"] = email
+    msg["Subject"] = "Your password reset token"
+    msg.set_content(f"Use this token to reset your password: {token}")
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
+        smtp.send_message(msg)
+    log.info("issued reset token %s for %s", token, email)
+    return jsonify({"status": "sent"})
+
+
+@app.route("/password/confirm", methods=["POST"])
+def confirm_reset():
+    token = request.form["token"]
+    new_password = request.form["password"]
+    owner = requests.get(
+        TOKEN_LOOKUP_URL, params={"token": token}, timeout=5
+    ).json()
+    requests.post(
+        SET_PASSWORD_URL,
+        json={"user_id": owner["user_id"], "password": new_password},
+        timeout=5,
+    )
+    return jsonify({"status": "ok"})
+```
+
+1. 本类核心特征：CWE-311 关注的是敏感数据（密码/令牌/密钥/PII）以**明文形态跨越信任边界**——明文信道传输或明文落盘/入日志。本文件中，重置令牌与新密码正是以三种明文形态出站：无 STARTTLS 的 SMTP 发信（第 27-28 行）、明文写入应用日志（第 29 行）、http:// 出站 HTTP 调用（第 37-39、40-44 行）。这不是注入类问题：全文件没有命令拼接、SQL 拼接或 eval，也不存在越权判断缺陷；缺陷纯粹在于机密性——数据在传输与落盘时全程未加密。
+
+2. 流 1（令牌 → 明文邮件 + 明文日志）：入口为第 19 行注册的 POST /password/reset，第 21 行 request.form['email'] 是外部输入，第 22 行 secrets.token_urlsafe(32) 生成高熵令牌——随机性强不等于传输保密。令牌在第 26 行拼入邮件正文，第 27 行 smtplib.SMTP(SMTP_HOST, 25) 建立的是纯文本 SMTP 连接：既未调用 starttls()，也未用 SMTP_SSL，第 28 行 send_message 将令牌明文发往网络，链路嗅探者可直接截获并接管账户；同一令牌在第 29 行经 log.info 明文写入应用日志（明文落盘，日志聚合系统可读）。该 handler 由框架路由直接调用，source→sink 无条件可达，两条子路径均无加密或脱敏。
+
+3. 流 2（令牌与新密码 → 明文 HTTP）：入口为第 33 行注册的 POST /password/confirm，第 35 行 request.form['token'] 与第 36 行 request.form['password'] 为外部输入。第 37-39 行以查询参数把令牌发往 http://token-service.internal——http:// 即无 TLS，且令牌进入 URL 更易被代理与访问日志留存；第 40-44 行把新密码以 JSON 体 POST 到 http://user-profile.internal。'内网域名'不提供任何加密，网络路径上的任意观察点都能读到明文密码。
+
+4. 防御核查（逐流验证类型/位置/覆盖面）：全文件不存在任何防御——无 https scheme、无 starttls()/SMTP_SSL、无字段级加密（未使用 cryptography/Fernet 等）、无日志脱敏；也不存在黑名单/正则/字符串替换类过滤，即便有，此类过滤对'明文传输'也不构成有效防御。覆盖面：第 27-28、29、37-39、40-44 四处 sink 全部裸露，防御覆盖率为零，明文暴露在每条数据流上均成立。
+
+5. 第二入口/替代通道检查：本模块仅注册第 19 行 /password/reset 与第 33 行 /password/confirm 两个路由，无其他路由、无 GET 参数变体、无间接调用包装；入口从 request.form 换成 request.args 也不影响结论，因为漏洞在出站 sink 而非入口解析。两条路由是通往同一信任边界（邮件中继/内部服务）的替代通道，且每条通道都是明文——替代通道不构成缓解，反而扩大暴露面，支撑最终结论：存在 CWE-311，风险 High（重置令牌与新密码泄露可直接导致账户接管）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-311 Missing Encryption of Sensitive Data", "risk_level": "High", "source": "line 22: secrets.token_urlsafe 生成的重置令牌（及 line 36 用户提交的新密码）", "sink": "line 27-28: smtplib.SMTP 无 STARTTLS 明文发信；另有 line 29 明文日志、line 37-39 与 line 40-44 的 http:// 出站请求", "explanation": "流1: line 22 令牌在 line 26 拼入邮件正文, 经 line 27-28 端口25纯文本 SMTP(未调用 starttls)明文出站, 嗅探者可截获令牌接管账户; 流2: 同一令牌在 line 29 经 log.info 明文落盘到应用日志; 流3: line 35 令牌在 line 37-39 以查询参数发往 http://token-service.internal, 无 TLS 且令牌进入 URL 易被代理日志留存; 流4: line 36 新密码在 line 40-44 以 JSON 体 POST 到 http://user-profile.internal, 明文传输; 防御核查: 全文件无 https、无 starttls/SMTP_SSL、无字段级加密、无日志脱敏, 亦无任何过滤层, 四处 sink 防御覆盖率为零; 第二入口核查: 仅 line 19 与 line 33 两个路由, 无其他入口或间接调用, 两条路由为通往同一信任边界的替代明文通道, 不构成缓解, 结论成立", "fix_suggestion": "line 27: 改用 smtplib.SMTP_SSL 或在 send_message 前调用 smtp.starttls(context=ssl.create_default_context()); 同时将 line 15-16 的 http:// 全部改为 https:// 并保持证书校验, 删除或脱敏 line 29 的令牌日志"}
+```

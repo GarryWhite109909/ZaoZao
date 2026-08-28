@@ -1,0 +1,56 @@
+LANG: javascript
+```code
+'use strict';
+
+const express = require('express');
+const router = express.Router();
+
+// 表单设计器自定义校验规则模块：
+// 用户为字段提交正则规则，服务端保存前同步试运行一次以确认规则可用。
+const savedRules = new Map();
+
+router.use(express.json());
+
+// 保存并试运行校验规则
+router.post('/api/form/validation-rule', function (req, res) {
+  const field = req.body.field;
+  const pattern = req.body.pattern;   // 用户提交的正则模式
+  const sample = req.body.sample;     // 试运行样本
+
+  if (typeof field !== 'string' || !field) {
+    return res.status(400).json({ error: 'field required' });
+  }
+  // 拦截危险关键字，限制长度
+  if (typeof pattern !== 'string' || pattern.length > 256 ||
+      /eval|Function|require|child_process/.test(pattern)) {
+    return res.status(400).json({ error: 'bad pattern' });
+  }
+
+  const re = new RegExp(pattern);
+  const matched = re.test(sample);    // 保存前试运行
+  savedRules.set(field, { pattern, matched });
+  return res.json({ field, matched });
+});
+
+// 前端「测试规则」按钮的独立试运行接口
+router.post('/api/form/validation-rule/test', function (req, res) {
+  const re = new RegExp(req.body.pattern);
+  return res.json({ matched: re.test(req.body.sample) });
+});
+
+module.exports = router;
+```
+
+第 1 步（类别定性）：本例核心特征是不可信输入驱动无界资源消耗：第 15 行用户提交的正则模式与第 16 行试运行样本在服务端被同步执行（第 27-28 行），攻击者可提交含嵌套量词的模式（如 `(a+)+$`、`([a-z]+)*$`、`(a|a)*$`），匹配失败时回溯步数随样本长度指数增长，即典型 ReDoS，属于 CWE-400 Uncontrolled Resource Consumption（具体形态对应复杂正则回溯）。需明确：`new RegExp(字符串)` 只编译模式、不执行任意 JS，危害不是命令注入/代码注入/SQL 注入，而是 CPU 被无界消耗后 Node 单线程事件循环整体阻塞，故必须归入资源消耗类而非注入或越权类。
+
+第 2 步（输入点枚举与可达性）：外部输入共两处入口四个参数——入口 1（第 13 行 POST /api/form/validation-rule）的 req.body.pattern（第 15 行）与 req.body.sample（第 16 行）；入口 2（第 34 行 POST /api/form/validation-rule/test）的 req.body.pattern/sample（第 35-36 行）。本模块未挂载任何鉴权或限流中间件，路由直接可达；入口 1 中 pattern 经第 27 行 new RegExp 编译后在第 28 行被 test 消费，sample 直接作为第 28 行的匹配串，source→sink 为同步调用链，可达性确认。
+
+第 3 步（防御有效性验证，入口 1）：唯一过滤位于第 22-25 行，类型为长度上限（≤256）加关键字黑名单（eval/Function/require/child_process），位置在 RegExp 构造之前。但覆盖面完全错位：黑名单针对的是代码执行关键字，而灾难性回溯只需 `(a+)+$` 这类 7 字符模式——不含任何黑名单词、远小于长度上限，可 100% 绕过；长度上限本身说明开发者只考虑了存储维度而未考虑回溯复杂度维度。第 16 行的 sample 则完全未经过滤直达第 28 行。故入口 1 全程无有效防御。
+
+第 4 步（消耗点与攻击路径）：攻击者向入口 1 提交 pattern=`(a+)+$`、sample=`'a'.repeat(30)+'!'`：第 28 行 re.test 必须枚举 30 个 a 的全部分组方式（约 2^30 次回溯）才能判定不匹配，V8 主线程同步阻塞数十秒以上，样本每增加 10 个 a 耗时约放大 1000 倍。第 27-28 行无超时机制、无 worker 线程隔离、未使用 re2 等线性时间引擎，单个廉价 HTTP 请求即可让整个进程停止响应所有并发请求，构成无界资源消耗。
+
+第 5 步（第二入口与替代通道结论）：第 34-36 行是独立注册的第二条路由，pattern/sample 从 req.body 直达第 35 行 new RegExp 与第 36 行 test，连第 22-25 行的形式过滤都不存在，确认同一 sink 存在零防御的第二入口；此外第 29 行将用户模式持久化进 savedRules（Map），若其他模块后续重新执行已保存规则则形成持久化攻击通道。两处入口加持久化存储共同支撑最终结论：本模块存在系统性 CWE-400 漏洞，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-400 Uncontrolled Resource Consumption", "risk_level": "High", "source": "line 15: req.body.pattern（入口1 POST /api/form/validation-rule 请求体中用户提交的正则模式）", "sink": "line 28: re.test(sample)（用户模式经 line 27 new RegExp 编译后在事件循环主线程同步匹配）", "explanation": "流1: line 15 pattern 经 line 22-25 黑名单加长度过滤（可绕过）到 line 27 new RegExp 再到 line 28 re.test，嵌套量词模式如 (a+)+$ 触发指数回溯；流2: line 16 sample 未经过滤直达 line 28 作为匹配串，'a'.repeat(30)+'!' 即可引爆；流3: line 34-36 入口2 的 pattern/sample 无任何过滤直达 line 35-36 同一 sink；防御分析: line 22-25 黑名单只拦 eval/Function 等代码执行关键字，与回溯复杂度无关，(a+)+$ 仅 7 字符且不含黑名单词，长度上限 256 远超所需，属可绕过过滤而非有效防御；影响: Node 单线程事件循环被同步阻塞，无超时、无 worker、非 re2，单个请求即可致全服务拒绝服务；第二入口: line 34-36 为零防御独立入口，line 29 将恶意模式持久化至 savedRules 构成潜在后续执行通道", "fix_suggestion": "line 27: 禁止直接执行用户提交的正则——改用 re2 等线性时间引擎，或先用 safe-regex 检测并拒绝嵌套量词模式（如 (a+)+$、([a-z]+)*$），同时将匹配放入 worker 线程并加超时"}
+```

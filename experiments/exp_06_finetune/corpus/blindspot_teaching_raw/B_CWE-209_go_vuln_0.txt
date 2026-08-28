@@ -1,0 +1,66 @@
+LANG: go
+```code
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+var db *sql.DB
+
+func main() {
+	var err error
+	db, err = sql.Open("mysql", "billing_rw:S3cret!@tcp(10.0.8.12:3306)/billing")
+	if err != nil {
+		log.Fatal(err)
+	}
+	http.HandleFunc("/api/invoices", invoiceHandler)
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+// GET /api/invoices?customer=acme
+func invoiceHandler(w http.ResponseWriter, r *http.Request) {
+	customer := r.URL.Query().Get("customer")
+	query := "SELECT invoice_id, amount, bank_account FROM invoices WHERE customer_name = ?"
+	rows, err := db.Query(query, customer)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		detail := fmt.Sprintf("db error: %v; sql: %s", err, query)
+		json.NewEncoder(w).Encode(map[string]string{"error": detail})
+		return
+	}
+	defer rows.Close()
+	invoices := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var id string
+		var amount float64
+		if err := rows.Scan(&id, &amount); err != nil {
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		invoices = append(invoices, map[string]interface{}{"invoice_id": id, "amount": amount})
+	}
+	json.NewEncoder(w).Encode(invoices)
+}
+```
+
+1. 本类核心特征：CWE-209 的典型形态是把底层错误对象/错误文本（含 SQL 语句、驱动明细、内部连接地址、表列名、堆栈等）原样写进对客户端的响应。第 33-34 行将驱动错误 `err` 与完整 SQL 拼成 `detail` 后直接 Encode 进响应体，第 43 行把 `err.Error()` 直接回显，均是该形态。必须明确：这不是注入或越权——第 29 行使用 `?` 占位符参数化查询，用户输入不改变 SQL 结构，不构成 SQL 注入；代码中也没有命令执行或权限绕过，漏洞本质是错误信息中的敏感内容对外暴露。
+
+2. 外部输入点枚举与可达性：唯一外部输入点是第 27 行 `r.URL.Query().Get('customer')`，经第 21 行注册的 `/api/invoices` 路由进入 `invoiceHandler`，并作为绑定参数传入第 29 行 `db.Query`。攻击者可通过超长值、非法编码等输入触发驱动层报错，或在连接抖动时命中第 30 行错误分支；该分支位于主执行路径上，任何 Query 失败都必然到达第 33-34 行，source→sink 可达性成立。
+
+3. 数据流一与防御缺失：敏感数据为第 29 行产生的驱动错误 `err`（可含 `dial tcp 10.0.8.12:3306` 等内网拓扑、MySQL 错误码与表/列名）以及第 28 行 SQL 明文（含 `bank_account` 敏感列名），经第 33 行 `fmt.Sprintf` 拼接、第 34 行写入响应体。全程零防御：没有错误分类（区分用户错误与内部错误）、没有白名单映射为固定文案、没有任何过滤或脱敏；即便假设存在黑名单/字符串替换，按标准也不视为有效防御，本例则完全不存在任何处理。
+
+4. 数据流二与防御缺失：第 42 行 `rows.Scan` 失败时（如类型转换错误），错误文本含列名与原始驱动值，第 43 行 `err.Error()` 直接 Encode 进响应体，同样无任何分类、映射或过滤，是同一 CWE-209 形态的第二暴露点。
+
+5. 第二入口/替代通道检查结论：全文件仅第 21 行注册 `/api/invoices` 一个路由，无其他 handler、无中间件间接调用；第 17 行 DSN 属启动期配置，不受用户输入影响。替代通道仅为同一 handler 内第 43 行的第二回显点。两处 sink 均从唯一入口可达，确认存在 CWE-209 漏洞；最小修复是在错误分支返回固定文案，明细仅写服务端日志。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-209 Generation of Error Message Containing Sensitive Information", "risk_level": "High", "source": "line 29: db.Query 失败返回的驱动错误 err（含内网地址与 MySQL 明细）及 line 28 的完整 SQL 文本", "sink": "line 34: json.NewEncoder(w).Encode 将含 err 与 SQL 的 detail 写入 HTTP 响应体（line 43 为第二回显点）", "explanation": "流1: line 27 唯一外部输入 customer 经 line 21 路由进入 handler，作为绑定参数传入 line 29 db.Query，查询失败时 line 33 fmt.Sprintf 将 err 与 line 28 完整 SQL（含 bank_account 敏感列名）拼为 detail，line 34 直接 Encode 进响应体，err 可含 dial tcp 10.0.8.12:3306 等内网连接细节与表列名，全程无错误分类/白名单/过滤，属 CWE-209 错误信息泄露而非 SQL 注入（line 29 用 ? 占位符参数化，输入不改变查询结构）; 流2: line 42 rows.Scan 失败错误（含列名与原始驱动值）经 line 43 err.Error() 直接回显，同样零防御; 第二入口检查: 全文件仅 line 21 注册 /api/invoices 一个路由，无其他 handler 或间接调用，line 17 DSN 为启动期配置不受输入影响，替代通道仅为同 handler 内 line 43 第二回显点，两处 sink 均自唯一入口可达，结论成立", "fix_suggestion": "line 33: 删除对 err 与 query 的拼接，改为固定文案如 'internal server error'，将 err 与 SQL 仅通过 log.Printf 记录到服务端日志；line 43 的 err.Error() 同样替换为固定文案"}
+```

@@ -1,0 +1,55 @@
+LANG: javascript
+```code
+'use strict';
+const express = require('express');
+const multer = require('multer');
+const fs = require('fs');
+
+const app = express();
+const upload = multer({ dest: '/tmp/uploads', limits: { fileSize: 10 * 1024 * 1024 } });
+
+// 服务端日志通道:仅写 stderr,与 HTTP 响应物理隔离
+function logError(scope, meta) {
+  process.stderr.write(`[error] ${scope} ${JSON.stringify(meta)}\n`);
+}
+
+// POST /api/files/parse —— 接收上传文件并统计非空行数
+app.post('/api/files/parse', upload.single('file'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'no file provided' });
+  }
+  try {
+    const content = fs.readFileSync(req.file.path, 'utf8');
+    const rows = content.split(/\r?\n/).filter(Boolean).length;
+    fs.unlinkSync(req.file.path);
+    return res.json({ rows });
+  } catch (err) {
+    // 完整异常细节(消息/堆栈/临时路径)只进服务端日志
+    logError('file-parse', { message: err.message, stack: err.stack, tmp: req.file.path });
+    // 客户端仅收到固定通用文案,不回显任何异常内容
+    return res.status(500).json({ error: 'internal server error' });
+  }
+});
+
+// 兜底错误中间件:接住 multer 等中间件抛出的异常,同样只回通用文案
+app.use((err, req, res, next) => {
+  logError('middleware', { message: err.message, stack: err.stack });
+  return res.status(500).json({ error: 'internal server error' });
+});
+
+module.exports = app;
+```
+
+1. **第 1 步（本类核心特征）**：CWE-209 的要害是把异常对象/底层错误细节（堆栈、内部路径、SQL、连接串等）原样送进客户端可见的响应。本场景（文件处理接口）的典型漏洞形态是在 catch 中写 `res.status(500).json({ error: err.stack })` 或直接回显 `err.message`——fs 错误会携带 `/tmp/uploads/...` 内部临时路径，堆栈会暴露项目目录结构与依赖版本。本文件第 24-28 行正是该形态的防御位；需明确判定对象是错误信息的出口，而非注入、越权或路径穿越。
+
+2. **第 2 步（输入点枚举与可达性）**：外部输入点共三处，均可达响应出口：(a) 第 15 行 multipart 文件字段 `file`，其内容在第 20 行被 `readFileSync` 读取、第 21 行解析、第 22 行删除——临时文件丢失或权限错误（ENOENT/EACCES）抛出的异常携带内部路径，直达第 24 行 catch，即潜在 sink（第 28 行响应）的必经点；(b) multipart 报文本身（超限、畸形结构）在第 15 行 multer 中间件内抛错，经 `next(err)` 传导至第 33 行兜底中间件，对应潜在 sink 第 35 行；(c) 缺失文件字段走第 16-18 行静态 400。
+
+3. **第 3 步（主数据流防御验证）**：第 24 行 catch 将异常拆成两条互不相通的通道——细节通道：`err.message`/`err.stack`/临时路径仅传入第 26 行 `logError`，最终落在第 11 行 `process.stderr`，纯服务端；响应通道：第 28 行响应体是字符串字面量 'internal server error'，不含对 err 的任何插值或拼接。该防御属于「通道分离 + 出口常量化」，不是黑名单/正则/字符串替换，攻击者无论怎样构造触发异常的输入都无法影响响应内容；位置上它位于 try 块内全部异常（第 20 行 `readFileSync`、第 22 行 `unlinkSync`）的唯一汇聚点，覆盖完整。
+
+4. **第 4 步（其余出口与中间件流防御验证）**：第 33-36 行兜底错误中间件以同一模式处理 multer 层异常（如 LIMIT_FILE_SIZE）：细节入第 34 行日志，第 35 行仅回固定文案，堵住了 Express 默认错误处理器在开发模式回显堆栈的缺口。穷举本文件全部 `res.*` 出口：第 17 行（静态 400）、第 23 行（仅整数行数统计，属业务结果）、第 28 行与第 35 行（固定文案）——没有任何一处携带 err 对象、堆栈或动态错误文本，防御覆盖所有异常路径。
+
+5. **第 5 步（第二入口/替代通道检查）**：本模块仅注册一条路由（第 15 行），无其他 HTTP 动词、无子路由挂载、未读取 query/body 等其他参数；日志通道（`process.stderr`）与 HTTP 响应物理隔离，客户端无法读取；即使极端情况下兜底中间件自身抛错，生产模式下 Express 内置最终处理器也只返回状态文本而不回显堆栈。所有客户端可见输出均已枚举且不含异常细节，结论：不存在第二入口或替代泄露通道。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点一:第15行multipart文件字段,内容经第20行readFileSync与第21行解析,读取/删除异常(ENOENT/EACCES,含内部临时路径)进入第24行catch;防御为通道分离而非黑名单/正则/替换:err.message与err.stack与临时路径仅经第26行logError写入第11行process.stderr服务端日志,第28行响应体为字面量'internal server error',不含任何err插值,位于try块全部异常的唯一汇聚点,覆盖完整;输入点二:multipart超限或畸形报文在第15行multer中间件抛错,由第33行兜底错误中间件接住,细节入第34行日志、第35行仅回固定文案,堵住Express默认处理器开发模式回显堆栈的缺口;输入点三:缺文件走第16-18行静态400;穷举全部响应出口第17/23/28/35行均无异常细节;第二入口检查:仅此一条路由,未读query/body,日志与HTTP响应物理隔离,兜底中间件自身抛错时生产模式最终处理器亦不回显堆栈;结论:不存在CWE-209错误信息泄露", "fix_suggestion": "no fix needed"}
+```

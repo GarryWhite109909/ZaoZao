@@ -1,0 +1,59 @@
+LANG: go
+```code
+package payment
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+)
+
+// ChargeRequest mirrors the fields collected by the checkout frontend.
+type ChargeRequest struct {
+	OrderID    string `json:"order_id"`
+	CardNumber string `json:"card_number"`
+	CardHolder string `json:"card_holder"`
+	Expiry     string `json:"expiry"`
+	CVV        string `json:"cvv"`
+	Amount     int    `json:"amount"`
+}
+
+// HandleCharge accepts raw cardholder data from the checkout frontend
+// and forwards it to the legacy ChargeWay gateway v1 plain-HTTP API.
+func HandleCharge(w http.ResponseWriter, r *http.Request) {
+	var req ChargeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+	resp, err := http.Post("http://api.chargeway-gw.com/v1/charges",
+		"application/json", bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "gateway unreachable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	w.Write(out)
+}
+```
+
+1. 本类核心特征：CWE-311 的典型形态是敏感数据（密码/令牌/密钥/PII）以明文形态跨越信任边界。本例的敏感数据是持卡人 PII——第 13-16 行的 CardNumber（PAN）、CardHolder、Expiry、CVV，信任边界是本服务到外部支付网关的出站网络跳，明文形态体现为第 33 行 URL scheme 为 `http://` 的无 TLS 信道。需明确排除其他类别：全程没有不可信输入拼接进命令/SQL/表达式解释器（非 CWE-78/89/94），也没有鉴权决策点（非 CWE-862/284），缺陷纯粹是传输机密性缺失。
+
+2. 输入点枚举与可达性：本文件唯一外部输入点是第 22 行导出的 HTTP 处理器 `HandleCharge` 的 `*http.Request`——第 24 行 `r.Body` 被直接 JSON 解码进 `ChargeRequest`（第 11-18 行），其中第 13-16 行四个字段即敏感持卡人数据。数据流：第 24 行 Decode → `req` → 第 28 行 `json.Marshal` → 第 33-34 行作为 `http.Post` 请求体发出。中间没有任何 return 分支丢弃字段、没有字段白名单重组，任何通过 JSON 语法校验的请求都 100% 抵达 sink。
+
+3. 逐条防御核查：对上述唯一一条 source→sink 流——第 24 行的 err 检查只验证 JSON 语法，与机密性无关；第 28 行 `json.Marshal` 是序列化而非加密；第 33 行 `http.Post` 使用 `http.DefaultClient`，无自定义 Transport、无 TLSClientConfig、无证书校验配置；亦无 PAN 掩码/截断/令牌化、无 scheme 白名单强制 https。即连“可绕过的过滤”都不存在，传输加密防御完全缺位。第 29-32、35-38 行的错误分支只处理编码/网络失败，不改变明文本质。
+
+4. sink 暴露形态：第 33 行 scheme 为 `http://`（默认 80 端口），第 34 行 body 携带完整 JSON——PAN、CVV、姓名、有效期全部明文上线，链路上任意中间节点（交换机、代理、NAT、上游运营商）可被动截获完整持卡人数据，直接违反 PCI DSS 对持卡人数据在开放网络传输必须强加密的要求，是 CWE-311（子类 CWE-319 明文传输）的教科书形态。第 24 行入站方向是否 TLS 由部署层决定，本文件可确认的暴露点是第 33-34 行出站腿。
+
+5. 第二入口/替代通道检查：全文件仅 `HandleCharge` 一个导出函数、一个路由入口；无 `init()`、无 goroutine、未导入 log（卡数据不会进日志）、无文件/DB 落盘；第 40-41 行回传的是网关响应体，不携带卡数据。替代通道不存在，暴露面即上述单条链路，结论：存在 CWE-311 漏洞，PAN+CVV 明文外传，定级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-311 Missing Encryption of Sensitive Data", "risk_level": "High", "source": "line 24: r.Body 经 json.NewDecoder 解码出的持卡人数据（第 13-16 行 CardNumber/CardHolder/Expiry/CVV）", "sink": "line 33: http.Post 以 http:// 明文信道将含 PAN/CVV 的完整 JSON 请求体发往外部支付网关", "explanation": "唯一外部输入点为第 22 行 HandleCharge 的 r *http.Request，第 24 行 r.Body 解码进 ChargeRequest 后经第 28 行 json.Marshal 原样进入第 33-34 行 http.Post 请求体，链路无分支丢弃或改写字段，可达性完整；防御核查：第 24 行仅校验 JSON 语法、第 28 行仅为序列化，均不提供机密性保护，http.Post 走默认 client 无任何 TLS 配置，亦无 PAN 掩码/令牌化/字段裁剪或 scheme 白名单，传输加密防御完全缺位（连可绕过的过滤都不存在）；第 33 行 URL scheme 为 http://，PAN+CVV 明文跨越网络信任边界，链路上任一中间节点可完整截获，属 CWE-311/CWE-319 明文传输形态而非注入或越权；第二入口检查：本文件仅此一个导出处理器，无日志/文件/DB 写出，第 40-41 行响应回传不携带卡数据，替代通道不存在，结论成立", "fix_suggestion": "line 33: 将网关地址改为 https:// 并改用启用 TLS 的 http.Client（Transport 设 MinVersion: tls.VersionTLS12），同时对 PAN 令牌化并停止明文传输 CVV"}
+```

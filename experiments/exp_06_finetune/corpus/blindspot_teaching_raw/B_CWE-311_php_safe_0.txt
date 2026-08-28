@@ -1,0 +1,67 @@
+LANG: php
+```php
+<?php
+declare(strict_types=1);
+
+namespace App\Auth;
+
+use PDO;
+use RuntimeException;
+
+final class PasswordResetService
+{
+    private const RESET_URL = 'https://account.example.com/reset';
+    public function __construct(private readonly PDO $db) {}
+
+    private function requireTls(string $scheme): void
+    {
+        if (strtolower($scheme) !== 'https') {
+            throw new RuntimeException('reset flow must run over TLS');
+        }
+    }
+
+    public function issueResetLink(string $email, string $scheme): string
+    {
+        $this->requireTls($scheme);
+        $stmt = $this->db->prepare('SELECT id FROM users WHERE email = ?');
+        $stmt->execute([$email]);
+        $userId = $stmt->fetchColumn();
+        if ($userId === false) {
+            throw new RuntimeException('user not found');
+        }
+        $token = bin2hex(random_bytes(32));
+        $this->db->prepare('INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES (?, ?, NOW() + INTERVAL 900 SECOND)')
+            ->execute([$userId, hash('sha256', $token)]);
+        return self::RESET_URL . '?token=' . $token;
+    }
+
+    public function applyNewPassword(string $scheme, string $token, string $newPassword): void
+    {
+        $this->requireTls($scheme);
+        $stmt = $this->db->prepare('SELECT user_id FROM password_resets WHERE token_hash = ? AND expires_at > NOW()');
+        $stmt->execute([hash('sha256', $token)]);
+        $userId = $stmt->fetchColumn();
+        if ($userId === false) {
+            throw new RuntimeException('invalid or expired token');
+        }
+        $this->db->prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+            ->execute([password_hash($newPassword, PASSWORD_ARGON2ID), $userId]);
+        $this->db->prepare('DELETE FROM password_resets WHERE user_id = ?')
+            ->execute([$userId]);
+    }
+}
+```
+
+第 1 步（类别特征定位）：CWE-311 的核心特征是敏感数据（密码/重置令牌/密钥/PII）以明文形态跨信任边界——要么经 http 等明文信道传输，要么明文落盘、进日志或进邮件。本样本是密码重置流程的安全版，考察对象是明文暴露而非注入或越权：SQL 全部走 PDO 预处理（第 24-25、39-40、45-46、47-48 行），权限决策不在本模块内。流程中两处敏感资产：重置令牌与新密码，下文逐一验证其防御。
+
+第 2 步（输入点枚举与可达性）：共四个外部输入——issueResetLink 的 $email 与 $scheme（第 21 行，来自 POST 表单与请求传输层），applyNewPassword 的 $scheme、$token、$newPassword（第 36 行，来自 POST）。可达性确认：$email 直达第 24-25 行查询；$token 直达第 40 行哈希比对；$newPassword 直达第 46 行 password_hash；$scheme 直达第 16 行 scheme 判定。全部输入均可达敏感数据 sink，无死输入。
+
+第 3 步（数据流一：重置令牌）：令牌由 random_bytes(32) CSPRNG 生成（第 30 行，256 位熵）；落库时仅存 hash('sha256', $token)（第 31-32 行），原始令牌不落盘，数据库泄露也无法还原可用令牌；出站唯一出口是第 33 行拼接的链接，其 scheme 来自第 11 行硬编码常量 'https://...'，不接受任何外部输入影响，传输信道在构造期即固定为 TLS。入站方向，第 38 行 requireTls 在查库前先行校验。防御类型正确（TLS 是传输态加密的正确控制）、位置正确（出站 scheme 在常量层固定，入站在方法第一条语句拦截）、覆盖面完整（收发双向、两个入口均设门）。
+
+第 4 步（数据流二：新密码）：$newPassword（第 36 行）进入 applyNewPassword 后第一件事是 requireTls（第 38 行），明文 http 请求在密码触达任何存储前即被 RuntimeException 拒绝；随后第 46 行以 password_hash($newPassword, PASSWORD_ARGON2ID) 处理——Argon2id 是内存困难 KDF，属于密码存储的正确类型（区别于可逆加密或 md5/sha1 快哈希），且哈希发生在 sink 本身。明文密码全程不落库、不进日志、不进邮件、不出现在响应中。requireTls 是对传输层派生 scheme 的白名单等值判定（仅接受 'https'，默认拒绝，fail-closed），不属于可绕过的黑名单/正则/字符串替换过滤。
+
+第 5 步（第二入口与替代通道检查）：本模块仅暴露两个公开方法，均以 requireTls 作为第一条语句（第 23、38 行），不存在绕过 TLS 门的替代路由、静态快捷入口或间接调用；除 https 链接外无其他出站通道，原始令牌与新密码没有任何返回或日志路径。唯一带外载体是邮件正文中的重置链接，其残余风险已被三重设计约束：令牌 900 秒过期（第 31 行）、用后即删保证单次有效（第 47-48 行）、256 位 CSPRNG 熵（第 30 行），且链接 scheme 强制 https，用户点击后的令牌提交仍走 TLS。结论：不存在明文跨信任边界路径，判定为安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点枚举: issueResetLink 的 $email/$scheme(第21行)与 applyNewPassword 的 $scheme/$token/$newPassword(第36行)均为外部可控且全部可达敏感 sink; 流一(重置令牌): random_bytes(32) CSPRNG 生成(第30行), 落库仅存 sha256 哈希(第31-32行), 出站链接 scheme 由第11行硬编码 https 常量固定, 入站经第38行 requireTls 白名单校验, TLS 为传输态正确防御类型且位置在方法入口先于任何秘密处理, 覆盖收发双向; 流二(新密码): 第38行 requireTls 先拒绝明文 http, 第46行 password_hash PASSWORD_ARGON2ID 内存困难 KDF 后落库, 明文密码不落库不进日志不进邮件; requireTls 为传输层 scheme 的 fail-closed 等值白名单而非可绕过过滤; 第二入口检查: 仅两个公开方法且均以 requireTls 开头(第23/38行), 无替代路由或间接调用, 唯一带外载体为邮件中的 https 链接, 残余风险由 900 秒过期(第31行)+用后即删单次有效(第47-48行)+256位熵约束; 结论: 无明文跨信任边界暴露, 不构成 CWE-311", "fix_suggestion": "no fix needed"}
+```

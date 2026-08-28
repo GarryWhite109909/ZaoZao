@@ -1,0 +1,67 @@
+LANG: go
+```code
+// Package main implements the document ingestion upload endpoint.
+package main
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+)
+
+func reply(w http.ResponseWriter, code int, detail string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "error", "detail": detail})
+}
+
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			reply(w, http.StatusInternalServerError, string(debug.Stack()))
+		}
+	}()
+	file, header, err := r.FormFile("doc")
+	if err != nil {
+		reply(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	defer file.Close()
+	savePath := filepath.Join("/var/lib/docparser/inbox", filepath.Base(header.Filename))
+	dst, err := os.Create(savePath)
+	if err != nil {
+		reply(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer dst.Close()
+	if _, err := io.Copy(dst, file); err != nil {
+		reply(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "detail": "stored"})
+}
+
+func main() {
+	http.HandleFunc("/api/v1/upload", uploadHandler)
+	_ = http.ListenAndServe("0.0.0.0:8080", nil)
+}
+```
+
+1. **本类核心特征**：CWE-209 的典型形态是把异常对象/底层错误原样返回给客户端。本文件中三处 `err.Error()`（第 27、34、39 行）与一处 `debug.Stack()`（第 22 行）均未经任何加工，经第 13-17 行的 `reply` 助手序列化为 JSON 直接进入 HTTP 响应体：`os.Create` 返回的 `*PathError` 携带内部绝对路径与操作系统失败原因，`debug.Stack()` 携带源码文件路径、行号与函数名。需明确：代码中没有任何命令/SQL 拼接执行、也没有访问控制判定，不属于命令注入、SQL 注入或越权类，危害本质是错误通道的信息泄露，归 CWE-209。
+
+2. **外部输入点枚举与可达性**：① multipart 文件字段 `doc`（第 25 行 `r.FormFile`）：客户端完全可控，任何非 multipart 或损坏的分片请求都会使其失败，第 27 行直达 sink，可达性成立；② 客户端可控文件名 `header.Filename`（第 25 行返回值）：经第 31 行拼入内部目录 `/var/lib/docparser/inbox`，第 32 行 `os.Create` 失败（与已存在子目录同名、权限不足、非法字符等）时第 34 行直达 sink，可达性成立；③ 上传内容本体：第 38 行 `io.Copy` 失败（如客户端中途断开）时第 39 行直达 sink；④ 隐式输入：handler 内任意运行时 panic 经第 21 行 `recover` 到达第 22 行的 `debug.Stack()` sink。四条流全部可达。
+
+3. **逐流防御验证**：流1（第 25→27 行）：`err.Error()` 零处理直传；流2（第 25→31→32→34 行）：全程唯一的变换是第 31 行 `filepath.Base`，它只约束文件名参与路径拼接（针对路径遍历），对错误文本中的内部绝对路径与 OS 失败原因零过滤，第 34 行原样透传——该防御的位置与覆盖面均与本类无关；流3（第 38→39 行）：零处理直传；流4（panic→第 22 行）：完整堆栈零处理直传。全文件不存在通用错误文案映射、错误类型白名单或『仅记日志不外发』模式；即便出现黑名单/正则/字符串替换类过滤也应视为可绕过，而此处连这类过滤都没有，四条流均无有效防御。
+
+4. **第二入口/替代通道检查**：main（第 45-47 行）仅注册单一路由 `/api/v1/upload`（第 46 行），不存在其他路由、参数或间接调用入口；但单入口内部有四条相互独立的 sink 调用（第 22、27、34、39 行），且第 20-24 行的 `defer recover` 构成不依赖任何特定错误分支的替代触发通道——任何 panic 都会落入堆栈泄露。入口唯一但泄露通道多元且全部无防护，支撑最终结论。
+
+5. **危害与可利用性**：未认证攻击者可用三类低成本探针：发送非 multipart 请求获取标准库内部错误细节（第 27 行）；发送注定创建失败的文件名获取内部绝对路径与目录结构（第 34 行）；构造触发 panic 的请求获取完整堆栈与源码布局（第 22 行）。泄露的路径、行号与依赖细节可直接辅助后续攻击（路径猜测、组件指纹、逻辑定位），风险定为 High。
+
+6. **修复方向**：在 `reply`（第 13 行）层面统一收敛：对外只返回固定通用文案与业务错误码，`err.Error()`/`debug.Stack()` 仅写入服务端日志；最小修复见下方结论 JSON 的 fix_suggestion。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-209 Generation of Error Message Containing Sensitive Information", "risk_level": "High", "source": "line 25: 客户端上传请求 r.FormFile('doc') 与可控 header.Filename 引发的底层错误对象（os.Create 的 *PathError 含内部绝对路径 /var/lib/docparser/inbox、multipart 库错误、panic 堆栈）", "sink": "line 34: reply(w, http.StatusInternalServerError, err.Error()) 将错误原文写入 HTTP 响应体（同类透传另见 line 22/27/39）", "explanation": "流1: line 25 r.FormFile('doc') 失败（非 multipart 或损坏请求）时 line 27 将 err.Error() 原文交 reply 写入响应体，泄露标准库内部错误细节；流2: line 25 取得的客户端可控 header.Filename 经 line 31 filepath.Base 拼入内部目录，line 32 os.Create 失败时 line 34 将 *PathError 原文（含内部绝对路径 /var/lib/docparser/inbox 与 OS 失败原因）写入响应体，line 31 的 filepath.Base 仅约束路径拼接（防遍历）对错误文本零覆盖不构成防御；流3: line 38 io.Copy 失败时 line 39 同样透传 err.Error()；流4: line 20-24 defer recover 捕获任意 panic 后 line 22 将 debug.Stack() 完整堆栈（源码路径、行号、函数名）写入响应体；四条流共用 line 13-17 的 reply 原样透传通道，全文件无通用错误文案映射、无错误白名单、无仅记日志模式，不存在任何有效防御；第二入口检查: main 仅注册单一路由 /api/v1/upload（line 46），无其他路由或参数通道，但单入口内含四条独立 sink 且 recover 构成不依赖特定错误分支的替代触发通道，泄露为系统性，确认 CWE-209 成立而非注入或越权类", "fix_suggestion": "line 13: reply 不再向响应体透传 detail，对外仅返回固定通用文案与错误码，err.Error() 与 debug.Stack() 只写入服务端日志"}
+```

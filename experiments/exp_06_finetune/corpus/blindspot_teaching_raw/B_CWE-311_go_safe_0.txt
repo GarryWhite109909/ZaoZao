@@ -1,0 +1,67 @@
+LANG: go
+```code
+package passwordreset
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"time"
+	"golang.org/x/crypto/bcrypt"
+)
+
+type Store interface {
+	SaveToken(hash []byte, exp time.Time) error
+	SetPassword(hash []byte, pwdHash []byte) error
+}
+
+// RequestReset issues a single-use token; TLS is mandatory (CWE-311 defense).
+func RequestReset(w http.ResponseWriter, r *http.Request, st Store, send func(to, body string) error) {
+	if r.TLS == nil {
+		http.Error(w, "https required", http.StatusUpgradeRequired)
+		return
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	sum := sha256.Sum256(raw)
+	if err := st.SaveToken(sum[:], time.Now().Add(15*time.Minute)); err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	send(r.FormValue("email"), "https://example.com/reset?token="+hex.EncodeToString(raw))
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// CompleteReset consumes the token and stores the new password bcrypt-hashed.
+func CompleteReset(w http.ResponseWriter, r *http.Request, st Store) {
+	if r.TLS == nil {
+		http.Error(w, "https required", http.StatusUpgradeRequired)
+		return
+	}
+	sum := sha256.Sum256([]byte(r.FormValue("token")))
+	pwdHash, err := bcrypt.GenerateFromPassword([]byte(r.FormValue("password")), bcrypt.DefaultCost)
+	if err != nil || st.SetPassword(sum[:], pwdHash) != nil {
+		http.Error(w, "invalid request", http.StatusForbidden)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+```
+
+1. 本类核心特征：CWE-311 关注的是敏感数据（密码、令牌、密钥、PII）以明文形态跨越信任边界——要么经明文信道传输（如 http:// 无 TLS 的请求/响应），要么以明文落盘存储；它不是注入、XSS 或越权问题，判定的对象是机密性而非数据解释或访问控制。本模块的敏感资产有两项：重置令牌（第 23-27 行生成、第 33 行发出）与新密码（第 44 行读取），需逐一确认没有任何路径使其以明文跨边界。
+
+2. 外部输入点枚举与可达性：共三个输入点——第 33 行 `r.FormValue('email')`、第 43 行 `r.FormValue('token')`、第 44 行 `r.FormValue('password')`。Go 的 FormValue 同时合并查询串与 POST 表单体，且 RequestReset/CompleteReset 均为导出的 handler（预期被路由挂载），因此攻击者/用户可控数据确实可达 sink：令牌流向第 29 行存储与第 33 行邮件发送，密码流向第 44 行 bcrypt 后于第 45 行持久化，可达性成立。
+
+3. 流 1（令牌）防御验证：第 19-22 行的 TLS 门是 handler 的第一条语句，`r.TLS == nil` 即返回 426（fail-closed），先于任何 FormValue 读取和令牌生成执行——位置正确；其类型是传输层加密强制，不是黑名单/正则/字符串替换类可被载荷构造绕过的过滤——类型正确；覆盖面上，明文令牌的出口仅两处：第 29 行以 SHA-256 摘要落库（原始令牌永不持久化），第 33 行邮件链接硬编码 https:// 方案（收件人点击的一跳同样走 TLS）——两条腿均被加密或哈希覆盖，无明文残留。第 23-27 行 crypto/rand 提供 256 位不可预测性，进一步压缩离线猜测空间。
+
+4. 流 2（新密码）防御验证：第 39-42 行与流 1 完全相同的 TLS 门，同样是首条语句、fail-closed；明文密码仅存在于 TLS 保护的请求内存中，第 44 行经 bcrypt（自适应口令哈希，正确的存储类型，优于可逆加密或裸 SHA-256）后才在第 45 行写入存储；第 46-48 行响应只含通用错误，不回显令牌或密码，也无任何日志语句。
+
+5. 第二入口/替代通道检查：模块仅导出 RequestReset 与 CompleteReset 两个入口；全文无其他 FormValue/URL 查询读取点，无 http:// 字面量或降级跳转（唯一的 URL 是第 33 行的 https:// 链接），未导入日志库、无间接调用把原始令牌或密码转发到其他通道。两个入口均在触碰敏感数据前强制 TLS，故不存在绕过加密的替代路径，CWE-311 防御完整，判定为安全实现。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "敏感资产为重置令牌与新密码；流1：第33行 FormValue('email') 与第23-27行 crypto/rand 令牌的出口仅两处——第29行以 SHA-256 摘要落库（明文令牌不持久化）与第33行 mailer 发送（链接硬编码 https:// 方案），且均被第19-22行 TLS 强制门（r.TLS==nil 返回426，fail-closed）前置保护，该门位于 handler 首条语句、先于任何敏感数据读取，类型为传输层加密强制而非可绕过的黑名单/正则过滤；流2：第43-44行读取 token 与新密码，同样先经第39-42行 TLS 门，密码在第44行经 bcrypt 自适应哈希后才于第45行持久化，响应仅含通用错误（第46-48行）不回显敏感值；第二入口检查：模块仅导出 RequestReset 与 CompleteReset，无其他 FormValue 读取点、无 http:// 降级链接或跳转、无日志输出敏感数据，替代通道不存在，故无 CWE-311 漏洞", "fix_suggestion": "no fix needed"}
+```

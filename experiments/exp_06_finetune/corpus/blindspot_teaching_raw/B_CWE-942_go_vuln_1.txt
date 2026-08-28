@@ -1,0 +1,64 @@
+LANG: go
+```go
+package main
+
+import (
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+// corsMiddleware 为 SPA 前端放行跨域;开发期为省去白名单维护,直接回显请求 Origin
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		origin := c.GetHeader("Origin")
+		if origin != "" {
+			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Access-Control-Allow-Credentials", "true")
+			c.Header("Vary", "Origin")
+		}
+		if c.Request.Method == http.MethodOptions {
+			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+			c.Header("Access-Control-Max-Age", "86400")
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
+}
+
+func main() {
+	r := gin.Default()
+	r.Use(corsMiddleware())
+
+	api := r.Group("/api")
+	{
+		api.GET("/profile", func(c *gin.Context) {
+			user := c.Query("user")
+			c.JSON(http.StatusOK, gin.H{
+				"user":     user,
+				"email":    user + "@corp.example.com",
+				"balance":  9820.55,
+				"apiToken": "sk_live_9f3ab77c1d",
+			})
+		})
+	}
+
+	r.Run(":8080")
+}
+```
+
+1. **本类核心特征定位**：CWE-942 的典型漏洞形态是 CORS 策略过宽——第 14 行将请求头 Origin 原样写入 `Access-Control-Allow-Origin`,第 15 行叠加 `Access-Control-Allow-Credentials: true`。二者组合意味着互联网上任意源都能携带 Cookie 等凭据跨域读取响应，这是跨域策略配置缺陷，不是命令注入、SQL 注入或越权等其他类别。
+
+2. **输入点枚举与可达性**：外部输入点一为第 12 行 `c.GetHeader("Origin")`,HTTP 请求头完全由攻击者页面伪造，经第 13 行仅有的判空判断后直达第 14 行 sink,可达性 100%;外部输入点二为第 36 行 `c.Query("user")`,汇入第 37-41 行 JSON 响应，与第 40-41 行的账户余额、apiToken 等敏感字段一同输出，构成策略过宽时被窃取的敏感载荷。
+
+3. **防御有效性核查**：对 Origin→Allow-Origin 这条流，第 13 行 `origin != ""` 只是非空检查，任何形如 `https://evil.example` 的字符串均放行——既非白名单也非域名校验，连可绕过的黑名单/正则都不存在，属零防御；第 16 行 `Vary: Origin` 仅是缓存正确性措施，不构成访问控制。对业务响应流，第 35 行路由无任何鉴权中间件，敏感数据直接随响应输出。第 31 行 `r.Use(corsMiddleware())` 全局挂载，宽松策略覆盖面为全站所有路由。
+
+4. **利用路径**：攻击者页面执行 `fetch('http://target:8080/api/profile?user=alice', {credentials:'include'})`,浏览器自动附带会话 Cookie;服务端按第 14-15 行回显 `Allow-Origin: https://evil.example` 且允许凭据，浏览器放行攻击者 JS 读取含 apiToken 的完整响应。第 18-23 行预检分支还放行任意方法与自定义头，进一步扩大攻击面。回显 Origin 比通配 `*` 更危险：浏览器禁止 `*` 与凭据同用，而回显恰好绕开了这一内置限制。
+
+5. **第二入口/替代通道结论**：全文件仅第 35 行 `/api/profile` 一个业务路由，不存在其他路由、参数或间接调用另行设置 CORS 头；第 18 行 OPTIONS 预检分支与主分支同属第 10-27 行这一个中间件，是同一漏洞面的组成部分而非独立防御点；但全局挂载意味着任何新增路由都会继承该缺陷。单一路由已足以确认任意源凭据跨域读取，CWE-942 成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-942 Permissive Cross-domain Policy", "risk_level": "High", "source": "line 12: c.GetHeader('Origin') 攻击者完全可控的 Origin 请求头", "sink": "line 14: c.Header('Access-Control-Allow-Origin', origin) 原样回显任意 Origin,并叠加 line 15 的 Allow-Credentials true", "explanation": "流1: 第12行 Origin 头经第13行仅判空后直达第14行响应头,无白名单/正则/域名校验,零防御;流2: 第36行 user 查询参数汇入第37-41行 JSON,与余额及 apiToken 敏感字段一同输出,是被跨域窃取的载荷;防御核查: 第31行 r.Use 全局挂载使宽松策略覆盖全部路由,第16行 Vary 仅为缓存措施不构成访问控制,第35行路由无鉴权;第二入口检查: 全文件仅 /api/profile 一个业务路由,第18行 OPTIONS 预检分支同属该中间件而非独立防御,任意源可携带 Cookie 凭据跨域读取敏感响应,漏洞成立", "fix_suggestion": "line 14: 删除 Origin 回显,改为可信域白名单(如 map 查找仅含 https://app.example.com),仅命中白名单才设置 Access-Control-Allow-Origin,否则不返回该头,并保留 Vary: Origin"}
+```

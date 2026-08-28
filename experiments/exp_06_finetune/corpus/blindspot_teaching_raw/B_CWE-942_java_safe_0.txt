@@ -1,0 +1,66 @@
+LANG: java
+```code
+package com.example.gateway.cors;
+
+import jakarta.servlet.*;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+import java.util.Set;
+
+/** Gateway-wide CORS policy: exact Origin whitelist, Vary: Origin, never '*' with credentials. */
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class GatewayCorsFilter implements Filter {
+
+    private static final Set<String> ALLOWED_ORIGINS = Set.of(
+            "https://console.example.com",
+            "https://partner.example.com");
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+        HttpServletRequest request = (HttpServletRequest) req;
+        HttpServletResponse response = (HttpServletResponse) res;
+        String origin = request.getHeader("Origin");
+        if (origin == null) {
+            chain.doFilter(req, res);
+            return;
+        }
+        response.addHeader("Vary", "Origin");
+        if (ALLOWED_ORIGINS.contains(origin)) {
+            response.setHeader("Access-Control-Allow-Origin", origin);
+            response.setHeader("Access-Control-Allow-Credentials", "true");
+        }
+        if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
+            if (ALLOWED_ORIGINS.contains(origin)) {
+                response.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE");
+                response.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+                response.setStatus(HttpServletResponse.SC_NO_CONTENT);
+            } else {
+                response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+            }
+            return;
+        }
+        chain.doFilter(req, res);
+    }
+}
+```
+
+第 1 步：类别定位。本类核心特征是跨域策略响应头的生成方式——sink 为第 34 行 `setHeader('Access-Control-Allow-Origin', ...)` 与第 35 行 `Allow-Credentials`。CWE-942 关注的是跨域策略是否过宽（ACAO 反射任意 Origin、`*` 与凭据组合、缺失 Vary 导致缓存投毒），与 SQL 注入、XSS、越权等其他类别无关；本文件是安全版示范：ACAO 只回显精确白名单内的 origin，从不输出 `*`。
+
+第 2 步：外部输入点枚举与可达性。① 第 27 行 `request.getHeader('Origin')`——攻击者完全可控，直接流入第 33 行白名单判定，命中后写入第 34 行 ACAO，构成 source→sink 直达链；② 第 37 行 `request.getMethod()` 的 OPTIONS 预检分支——同样攻击者可控，经第 38 行同一白名单判定决定预检放行（204）或拒绝（403）。文件内不存在其他外部输入点，两条流汇聚于同一布尔判定。
+
+第 3 步：流 1（Origin→ACAO）防御验证。防御类型为固定 `Set.of`（第 18-20 行）的精确等值匹配（第 33 行 `contains`），不是黑名单、不是正则、也不是 startsWith/replace 之类的字符串变换，因此 `console.example.com.evil.com`、`console-example.com`、`@` 混淆等常见绕过全部失效；位置上，判定位于唯一写入 ACAO 的语句（第 34 行）之前，且回显的是白名单常量而非原始输入，攻击者值不可能被反射；覆盖面上，实际请求路径（第 47 行放行）与预检路径（第 38-44 行）复用同一判定，未命中时响应不含任何 CORS 头、预检直接 403，无遗漏分支。
+
+第 4 步：通配符+凭据组合与缓存变体覆盖。第 35 行 `Allow-Credentials=true` 只存在于第 33 行白名单命中分支内部，而第 34 行输出的永远是精确 origin，代码中不存在任何能产生 `ACAO: *` 的路径，`*` 与凭据的组合在结构上不可能出现；第 32 行对所有携带 Origin 的请求（无论放行与否）统一 `addHeader('Vary', 'Origin')`，使 CDN/共享代理不会把为某 origin 生成的 CORS 决策缓存后投递给另一 origin，覆盖了 CWE-942 的缓存投毒变体。
+
+第 5 步：第二入口/替代通道检查。本过滤器经 `@Component` + `@Order(HIGHEST_PRECEDENCE)`（第 14-15 行）注册于网关链最前端，所有路由的响应都先经过它，不存在绕过它的路由或参数通道；本文件内写 CORS 头的语句仅第 32、34、35、39、40 行，全部受第 33/38 行同一白名单约束，文件中亦无 `@CrossOrigin` 注解或其他可产生宽松策略的配置。对未列入白名单的来源，第 47 行虽仍放行业务请求（服务端鉴权不受影响），但浏览器因无 ACAO 头而拒绝读取响应，凭据不会跨域泄露。结论：防御类型正确、位置正确、覆盖完整，无 CWE-942 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点为第27行 Origin 请求头与第37行 OPTIONS 预检方法,均直达第34行 Access-Control-Allow-Origin 响应头 sink;防御为第18-20行固定 Set 的精确等值白名单(第33行 contains),非黑名单/正则/字符串替换,evil.com 后缀与 @ 混淆等绕过无效;第34行仅回显白名单常量,从不输出通配符 *;第35行 Allow-Credentials=true 仅在白名单命中分支内,与 * 结构性互斥;第32行对所有带 Origin 的请求设置 Vary: Origin,覆盖共享缓存投毒变体;预检与实际请求复用同一判定,未命中返回403且无任何 CORS 头;过滤器经 @Component+@Order(HIGHEST_PRECEDENCE)(第14-15行)注册于链首,本模块无第二入口或替代通道,防御类型/位置/覆盖面均正确,判定安全", "fix_suggestion": "no fix needed"}
+```

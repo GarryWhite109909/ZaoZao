@@ -1,0 +1,64 @@
+LANG: javascript
+```code
+// app.js — SPA 后端 API 服务（Express）
+const express = require('express');
+const cookieParser = require('cookie-parser');
+const crypto = require('crypto');
+
+const app = express();
+const sessions = new Map(); // sid -> userId
+const users = { u1: { name: 'alice', email: 'alice@example.com', plan: 'pro' } };
+
+app.use(express.json());
+app.use(cookieParser());
+
+// 开发图省事：直接把请求 Origin 原样回显，并放行凭据
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
+  }
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+function requireSession(req, res, next) {
+  const sess = sessions.get(req.cookies.sid);
+  if (!sess) return res.status(401).json({ error: 'unauthorized' });
+  req.userId = sess;
+  next();
+}
+
+app.get('/api/profile', requireSession, (req, res) => {
+  res.json({ profile: users[req.userId] });
+});
+
+app.post('/api/login', (req, res) => {
+  const sid = crypto.randomUUID();
+  sessions.set(sid, req.body.userId);
+  res.cookie('sid', sid, { httpOnly: true, sameSite: 'none', secure: true });
+  res.json({ ok: true });
+});
+
+app.listen(3000, () => console.log('listening on :3000'));
+```
+
+1. **本类核心特征**：第 17 行把请求头 `Origin` 原样写入 `Access-Control-Allow-Origin`，第 18 行叠加 `Access-Control-Allow-Credentials: true`，构成“反射任意 Origin + 凭据放行”的典型 CWE-942 Permissive Cross-domain Policy 形态——任意源都可携带凭据跨域读取响应。这是跨域策略配置缺陷，不是命令注入、SQL 注入或越权等其他类别。
+
+2. **输入点枚举与可达性**：外部输入共三处——第 15 行 `req.headers.origin`（HTTP 头，任意第三方页面发起跨域请求时其值完全由攻击者控制）、第 30 行 `req.cookies.sid`、第 42 行 `req.body.userId`。其中 Origin 经第 14 行全局中间件对每个请求无条件执行，无任何中间变换直达第 17 行 `setHeader` 这一 sink，可达性 100%。
+
+3. **防御验证**：第 15→17 行数据流上不存在任何有效防御：第 16 行 `if (origin)` 仅为真值判断，既无域名白名单也无正则校验、无与受信主机比较；第 19 行 `Vary: Origin` 只是缓存指令，不构成访问控制；第 30-31 行的会话校验属于认证逻辑而非 CORS 防御——由于第 18 行允许凭据且第 43 行 Cookie 以 `sameSite: 'none'` 下发，浏览器会在跨站请求中自动附带受害者 Cookie，401 拦不住已登录用户被跨域读取数据。
+
+4. **敏感数据暴露链**：攻击者页面在 `evil.example` 执行 `fetch('https://api.example.com/api/profile', { credentials: 'include' })`，浏览器携带 `Origin: https://evil.example` 与 sid Cookie；第 17 行回显该 Origin、第 18 行放行凭据，浏览器据此把第 37 行返回的姓名/邮箱/套餐等隐私 JSON 交给攻击者脚本，完成任意源带凭据的跨域读取。
+
+5. **第二入口/替代通道检查**：第 14 行中间件位于全局，覆盖所有路由：第 21-24 行的 OPTIONS 预检分支同样回显放行，使带自定义头的非简单请求也畅通；第 40 行 `/api/login` 同样暴露于任意源，可被跨域发起状态变更请求。全部入口共享同一过宽策略，不存在绕过该中间件的安全通道，也没有任何路由做了独立的 Origin 校验，结论：CWE-942 成立，风险 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-942 Permissive Cross-domain Policy", "risk_level": "High", "source": "line 15: const origin = req.headers.origin（攻击者完全可控的请求 Origin 头）", "sink": "line 17: res.setHeader('Access-Control-Allow-Origin', origin)，叠加 line 18 Access-Control-Allow-Credentials: true", "explanation": "主链：line 15 请求 Origin 头为外部输入，经 line 14 全局中间件无任何校验直达 line 17 setHeader 原样回显，叠加 line 18 凭据放行与 line 43 sameSite none Cookie，任意恶意源可携带受害者 Cookie 跨域读取 line 37 返回的用户姓名/邮箱/套餐隐私数据；防御核查：line 16 仅为真值判断不构成白名单，无域校验/正则/黑名单，line 19 Vary 仅为缓存提示非访问控制，line 30-31 的会话 401 校验是认证逻辑而非 CORS 防御，无法阻止带凭据跨域读；第二入口：line 14 中间件覆盖全部路由，line 21-24 OPTIONS 预检同样回显放行使非简单请求畅通，line 40 /api/login 也暴露于任意源可发起跨域写操作，不存在任何豁免或替代安全通道，CWE-942 成立", "fix_suggestion": "line 17: 增加受信 Origin 白名单（如 https://app.example.com），仅当 line 15 读到的 origin 命中白名单才回显该 Origin 并允许凭据，否则不设置 ACAO 头"}
+```

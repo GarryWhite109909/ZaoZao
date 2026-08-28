@@ -1,0 +1,69 @@
+LANG: javascript
+```code
+// src/routes/passwordReset.js —— 密码重置模块（安全版）
+import express from 'express';
+import crypto from 'crypto';
+import bcrypt from 'bcrypt';
+import nodemailer from 'nodemailer';
+import db from '../db.js';
+
+const router = express.Router();
+
+const transporter = nodemailer.createTransport({
+  host: 'smtp.example.com',
+  port: 465,
+  secure: true,      // SMTPS：整个 SMTP 会话走 TLS，禁止明文连接
+  requireTLS: true,  // 双保险：即使走协商升级也强制 TLS
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+});
+
+// 信道门禁：明文 http 请求一律 308 重定向到 https（308 保留方法与请求体）
+router.use((req, res, next) => {
+  if (!req.secure) return res.redirect(308, `https://${req.headers.host}${req.originalUrl}`);
+  next();
+});
+
+router.post('/reset-request', async (req, res) => {
+  const email = String(req.body.email || '').toLowerCase();
+  const token = crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  await db.storeResetToken(email, tokenHash, Date.now() + 15 * 60 * 1000);
+  const resetUrl = `https://example.com/reset?token=${token}`;
+  await transporter.sendMail({
+    from: 'noreply@example.com',
+    to: email,
+    subject: 'Password reset',
+    text: `Open ${resetUrl} within 15 minutes.`,
+  });
+  res.json({ message: 'If the account exists, a reset email has been sent.' });
+});
+
+router.post('/reset-confirm', async (req, res) => {
+  const { token, newPassword } = req.body;
+  const tokenHash = crypto.createHash('sha256').update(String(token)).digest('hex');
+  const record = await db.findResetToken(tokenHash);
+  if (!record || record.expiresAt < Date.now()) return res.status(400).json({ error: 'invalid or expired token' });
+  const passwordHash = await bcrypt.hash(String(newPassword), 12);
+  await db.updatePassword(record.userId, passwordHash);
+  await db.deleteResetToken(tokenHash);
+  res.json({ message: 'password updated' });
+});
+
+export default router;
+```
+
+1. 第 1 步——类别核心特征：CWE-311 的本质是敏感数据（重置令牌、新密码、邮箱）以明文形态跨越信任边界——要么经明文信道传输（http:// 链接、无 TLS 的裸 SMTP 端口 25），要么明文落库/落日志。它不是注入、越权或反序列化问题，判断对象是“数据在传输与存储中的机密性”。本文件中的敏感资产：重置令牌（第 26 行）、新密码（第 40 行）、用户邮箱（第 25 行）；潜在暴露点：SMTP 出站（第 30 行）、数据库写入（第 28、45 行）。
+
+2. 第 2 步——外部输入点枚举与可达性：本模块仅两个入口。(a) POST /reset-request 的 req.body.email（第 25 行）→ 流入 db.storeResetToken（第 28 行）与 sendMail 的收件人（第 32 行），可达；(b) POST /reset-confirm 的 req.body.token 与 req.body.newPassword（第 40 行）→ token 流入 sha256 摘要后查库（第 41-42 行），newPassword 流入 bcrypt（第 44 行）再入 db.updatePassword（第 45 行），可达。两条路由均位于第 19-22 行中间件之后，无绕行注册。
+
+3. 第 3 步——流 1（令牌→邮件信道）防御验证：令牌（第 26 行）嵌入硬编码 https 的 resetUrl（第 29 行）并经 transporter.sendMail 发出（第 30-35 行）。防御为第 13-14 行的 secure: true（端口 465 整会话 SMTPS）+ requireTLS: true：类型正确——这是传输层整信道加密，而非黑名单/正则/字符串替换类可绕过过滤；位置正确——绑定在 transport 创建处，先于本模块任何一次发信；覆盖完整——模块内全部邮件都复用该 transport，且 secure: true 不存在明文降级回退路径。配合第 29 行硬编码 https，令牌永远不会出现在 http:// 链接中。
+
+4. 第 4 步——流 2（新密码→存储）与流 3（令牌→存储）防御验证：原始密码（第 40 行）先经 bcrypt cost 12 自适应单向哈希（第 44 行），仅哈希值进入 db.updatePassword（第 45 行）——bcrypt 是凭据存储的类型正确防御，位置在持久化前的最后一点，且全文件不存在把 newPassword 明文写库或打印的路径。重置令牌同理：入库（第 27 行）与查询（第 41 行）均只使用 sha256 摘要，数据库泄露不会还原出可用令牌。
+
+5. 第 5 步——入站信道门禁：第 19-22 行的 router.use 中间件对 !req.secure 的明文 http 请求返回 308 重定向到 https（308 保留方法与请求体），因此携带邮箱、令牌、新密码的请求体无法经明文信道到达任何一个 handler。这是信道级强制而非逐字段过滤，位置在两条路由之前，覆盖本模块全部入口。
+
+6. 第 6 步——第二入口/替代通道检查：模块仅导出此 router，且只有上述两个 POST 路由读取 req.body；令牌只经 POST body 接收，不经 URL 查询串回传（避免 referer、访问日志泄露）；无 console/log 输出令牌或密码；无 http:// 链接、无明文 SMTP 回退、无绕过中间件的间接调用。结论：所有 source→sink 流均被 TLS 强制与哈希存储覆盖，不存在 CWE-311 暴露面。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "流1 令牌出站信道: req.body.email(第25行)触发生成重置令牌(第26行), 令牌嵌入硬编码 https 链接(第29行)并经 transporter.sendMail 发出(第30行), 防御为第13-14行 secure:true+requireTLS:true 的传输层 TLS 加密, 类型正确(整信道加密而非黑名单/正则过滤), 位置正确(绑定在 transport 创建处且先于任何发信), 覆盖完整(本模块全部邮件复用该 transport 且 secure:true 无明文降级路径); 流2 新密码存储: req.body.newPassword(第40行)先经 bcrypt cost12 单向哈希(第44行), 仅哈希值进入 db.updatePassword(第45行), 无任何明文落库或日志路径; 流3 令牌存储: 令牌仅以 sha256 摘要入库(第27行)与查询(第41行), 库泄露不产生可用令牌; 信道门禁: 第19-22行中间件将明文 http 请求 308 重定向到 https, 两个路由的请求体均无法经明文信道到达; 第二入口检查: 模块仅导出本 router 的两个 POST 路由, 令牌只经 POST body 接收(不经 URL 查询串, 避免 referer 与日志泄露), 无其他读取 req.body 的路径, 无明文 SMTP 回退或 http:// 链接, 结论: 所有 source→sink 流均被 TLS 强制与哈希存储覆盖, 不存在 CWE-311 暴露面", "fix_suggestion": "no fix needed"}
+```

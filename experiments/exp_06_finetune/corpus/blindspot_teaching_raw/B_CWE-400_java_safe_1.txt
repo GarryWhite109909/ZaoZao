@@ -1,0 +1,67 @@
+LANG: java
+```code
+package com.acme.catalog.search;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Pattern;
+
+/**
+ * Storefront search: validates the free-text query, then filters the catalog.
+ * ReDoS hardening (CWE-400): the legacy pattern ^(\w+[ .,-]*)*$ nested
+ * quantifiers and backtracked exponentially on crafted input; this version
+ * caps query length and matches an atomic-group pattern in linear time.
+ */
+public final class CatalogSearchService {
+    public static final int MAX_QUERY_LENGTH = 64;
+    // (?>...) freezes each token: the engine can drop whole iterations but
+    // never re-split a word run, so the exponential path is removed.
+    private static final Pattern QUERY_PATTERN = Pattern.compile("^(?>\\w+[ .,-]*)+$");
+
+    private final List<String> catalog;
+
+    public CatalogSearchService(List<String> catalog) {
+        this.catalog = List.copyOf(catalog);
+    }
+
+    public List<String> search(String rawQuery) {
+        if (rawQuery == null || rawQuery.length() > MAX_QUERY_LENGTH) {
+            return List.of();                  // defense 1: hard length cap
+        }
+        if (!QUERY_PATTERN.matcher(rawQuery).matches()) {
+            return List.of();                  // defense 2: atomic-group regex
+        }
+        String needle = rawQuery.trim().toLowerCase();
+        List<String> hits = new ArrayList<>();
+        for (String item : catalog) {
+            if (item.toLowerCase().contains(needle)) {
+                hits.add(item);
+            }
+        }
+        return hits;
+    }
+
+    /** Bulk entry for the admin import job; funnels into the same guard. */
+    public List<String> searchAll(List<String> rawQueries) {
+        List<String> merged = new ArrayList<>();
+        for (String q : rawQueries) {
+            merged.addAll(search(q));
+        }
+        return merged;
+    }
+}
+```
+
+1. **类别特征定位**：本类的核心风险面是“不可信输入驱动的正则匹配资源消耗”（CWE-400 / ReDoS）：当模式含嵌套量词（如 `(a+)+`、`(\w+[ .,-]*)*` 这类“星号组内含加号量词”结构）且输入被构造成使整体匹配在末尾失败时，引擎会对迭代切分做指数级回溯，单请求即可耗尽 CPU。这属于资源消耗类缺陷，不是注入、越权或信息泄露。本文件为加固版：第 17 行唯一编译的正则使用原子组 `(?>...)`，第 26 行另加输入长度硬上限（第 9 行 Javadoc 中的旧模式仅为历史说明，未编译）。
+
+2. **输入点枚举与可达性**：外部输入点共两个——第 25 行 `search(String rawQuery)` 的 `rawQuery`，以及第 43 行 `searchAll(List<String> rawQueries)` 的列表元素；第 46 行 `merged.addAll(search(q))` 把每个元素原样传入 `search()`，因此两条 source 均可达第 29 行 `QUERY_PATTERN.matcher(rawQuery).matches()` 这一回溯消耗 sink。第 21 行构造器入参 `catalog` 是服务端目录数据，不流向任何正则，不是 source。
+
+3. **主链防御验证（search 路径）**：第 26 行在到达 sink 前拒绝 null 及长度超过 64 的输入，位置正确（先于第 29 行、作用于同一不可变 String 引用、中间无改写点）；但仅靠限长对指数回溯并不充分（约 30 字符即可爆炸），因此第 17 行的原子组是主修复——类型正确：`(?>\w+[ .,-]*)+` 冻结每次迭代的内部匹配，引擎只能整体丢弃迭代、无法把单词段重新切分给后续迭代，回溯路径从指数级降为线性；位置正确：它正是第 29 行实际作用于原始用户输入的那一个 Pattern；覆盖完整：全文件仅此一处对用户输入做正则匹配。该修复是结构性消除回溯歧义，不属于黑名单/字符串替换这类可绕过过滤。
+
+4. **第二条流与残余消耗点**：`searchAll` 路径（第 43–48 行）没有独立匹配逻辑，逐元素委托给第 25 行的 `search()`，两道防御对每个元素同样生效，不存在“批量通道绕过”。第 35 行 `contains` 是普通子串查找：`needle` 已限长 ≤64、`catalog` 为服务端数据，最坏代价为多项式级，不构成灾难性回溯点。
+
+5. **第二入口/替代通道结论**：全文件公开面仅 `search` 与 `searchAll` 两个方法，且均汇聚到同一条“限长 + 原子组”受保护路径；文件内无其他 `Pattern`/`Matcher`/`String.matches`/`replaceAll` 调用，无静态可变状态、反射或框架绑定提供旁路。结论：无第二入口、无替代通道，防御类型正确、位置正确、覆盖完整，判定为安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点共两处：第25行 search 的 rawQuery 与第43行 searchAll 的列表元素，后者经第46行逐条转入 search，均可达第29行 QUERY_PATTERN.matcher(rawQuery).matches() 这一正则回溯消耗点；防御一：第26行在 sink 前施加64字符硬长度上限，位置正确且中间无可改写点，但仅靠限长不足以抵御指数回溯；防御二：第17行模式以原子组 (?>...) 重写旧式嵌套量词结构，冻结每次迭代的内部匹配、使引擎只能整体丢弃迭代而无法重新切分单词段，匹配代价降为线性，属类型正确的结构性修复而非黑名单或字符串替换类可绕过过滤，且为全文件唯一作用于用户输入的正则，覆盖完整；第43-48行批量入口无独立匹配逻辑，逐元素复用同一受保护路径；第35行 contains 为普通子串查找且 needle 已限长、catalog 为服务端数据，非回溯消耗点；第二入口检查：公开面仅 search 与 searchAll 两个方法且均汇聚到同一防御路径，无其他 Pattern 或 Matcher 调用、无静态可变状态或反射旁路，故不存在绕过通道，判定安全", "fix_suggestion": "no fix needed"}
+```

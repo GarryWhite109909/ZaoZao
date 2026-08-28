@@ -118,7 +118,17 @@ def call_teacher(key: str, user_prompt: str,
             resp.raise_for_status()
             content_parts, reasoning_parts = [], []
             hit_length = False
+            # 2026-08-28 硬性总时长上限：流式下 (30,300) 的超时只看"相邻 chunk 间隔"，
+            # 思考型教师若每 <300s 吐一点 token（多半是 reasoning）养着 socket、正文却一直
+            # 为空，iter_lines 就永远不终断，可干挂数小时。这里对"每次拿到任意 chunk"做
+            # 总时长兜底，超限即强制断开走重试。环境变量可调，默认 900s（足够覆盖 253s 级长任务）。
+            wall_limit = int(os.environ.get("TEACHER_WALL_LIMIT", "900"))
+            _start_t = time.monotonic()
             for raw in resp.iter_lines(decode_unicode=True):
+                if time.monotonic() - _start_t > wall_limit:
+                    resp.close()
+                    raise TimeoutError(
+                        f"teacher 流式请求超过 {wall_limit}s 总时长上限，强制断开")
                 if not raw or not raw.startswith("data:"):
                     continue
                 chunk = raw[len("data:"):].strip()

@@ -1,0 +1,65 @@
+LANG: java
+```code
+package com.example.inventory.api;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+
+/**
+ * Product lookup API. On database failure, detailed driver diagnostics
+ * (including the failing SQL) are written to the server log only; clients
+ * receive a fixed generic message.
+ */
+@RestController
+public class ProductLookupController {
+
+    private static final Logger log = LoggerFactory.getLogger(ProductLookupController.class);
+    private final DataSource dataSource;
+
+    public ProductLookupController(DataSource dataSource) {
+        this.dataSource = dataSource;
+    }
+
+    @GetMapping("/api/products/search")
+    public ResponseEntity<String> search(@RequestParam("sku") String sku) {
+        String sql = "SELECT id, name, price FROM products WHERE sku = ?";
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, sku);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return ResponseEntity.ok(rs.getString("name"));
+                }
+                return ResponseEntity.notFound().build();
+            }
+        } catch (SQLException e) {
+            log.error("Product search query failed", e);
+            return ResponseEntity.status(500).body("{\"error\":\"internal server error\"}");
+        }
+    }
+}
+```
+
+1. 第 1 步（类别核心特征）：本类漏洞是 CWE-209——错误信息泄露敏感内容：数据库操作失败时，JDBC 驱动抛出的 SQLException 的 message 通常内嵌完整 SQL 文本、表名/列名、驱动版本乃至数据库主机与端口，若把异常对象或 e.getMessage() 直接写入 HTTP 响应即构成泄露。需明确：这与注入无关（第 33~36 行使用 PreparedStatement 占位符参数化查询，本身无注入），也不是越权问题，考察点仅在错误信息暴露通道。
+
+2. 第 2 步（输入点枚举与可达性）：本模块唯一外部输入是第 32 行的请求参数 sku（@RequestParam）。数据流：sku → 第 36 行 ps.setString(1, sku) → 第 37 行 executeQuery。当查询失败（连接断开、驱动状态异常、SQL 执行错误）时，SQLException 从第 34 行 getConnection、第 35 行 prepareStatement、第 37 行 executeQuery 或第 39 行 getString 抛出，全部被第 43 行的单一 catch 捕获——即外部输入可达错误处理决策区，泄露与否完全取决于第 43~45 行的处理方式。
+
+3. 第 3 步（防御逐流验证）：敏感对象是第 43 行的异常 e（携带 SQL 文本、驱动诊断与堆栈）。它的唯一数据流出口是第 44 行 log.error("Product search query failed", e)，写入服务端日志——这是详细诊断信息的正确 sink。第 45 行返回客户端的响应体是编译期常量字符串，与 e、e.getMessage()、e.toString() 无任何数据依赖。防御类型正确：采用固定通用文案，而非黑名单/正则/字符串替换类过滤，因此不存在可绕过面；位置正确：位于数据离开信任边界、序列化进 HTTP 响应的唯一出口；覆盖完整：三条返回路径（第 39 行业务数据、第 41 行 404、第 45 行通用 500）均不返回异常衍生文本，且单一 catch 覆盖方法内全部 SQLException 抛出点。
+
+4. 第 4 步（第二入口/替代通道检查）：本文件仅声明第 31 行 /api/products/search 一个路由，除 sku 外无其他 @RequestParam/@PathVariable，无 fallback 方法；SQLException 未被重抛，因此不会进入 Spring 默认 /error 渲染通道（该通道在 include-stacktrace 配置开启时是常见的残留泄露途径）；亦无反射、RequestDispatcher 转发或二次封装工具等间接调用。客户端可见字符串只有第 45 行常量与第 39 行的业务字段，均非错误内容。
+
+5. 第 5 步（结论）：本模块是 CWE-209 的规范安全形态——详细错误仅落服务端日志、客户端只收固定通用文案，防御类型、位置、覆盖面均正确，且无第二入口或替代泄露通道，判定无漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入是第32行的请求参数 sku, 经第36行 setString 进入第37行 executeQuery, 查询失败时驱动抛出的 SQLException(消息内嵌完整 SQL 文本、驱动与连接细节)在第43行被捕获, 第34行 getConnection 抛出的含数据库主机/端口信息的异常同样落入该 catch; 敏感异常对象 e 的唯一数据流出口是第44行 log.error 写入服务端日志, 这是详细诊断信息的正确 sink; 第45行返回客户端的响应体是编译期常量字符串, 与 e、e.getMessage() 无任何数据依赖, 防御类型为固定通用文案而非黑名单/正则/字符串替换, 不存在可绕过面, 且位于数据离开信任边界的唯一出口, 覆盖全部三条返回路径(第39行业务数据、第41行404、第45行通用500)与方法内全部 SQLException 抛出点; 第二入口检查: 本文件仅声明 /api/products/search 一个路由、仅 sku 一个参数, 异常未重抛故不会进入 Spring 默认 /error 渲染通道, 无反射/转发等间接调用, 不存在其他泄露通道, 结论为无 CWE-209 漏洞", "fix_suggestion": "no fix needed"}
+```

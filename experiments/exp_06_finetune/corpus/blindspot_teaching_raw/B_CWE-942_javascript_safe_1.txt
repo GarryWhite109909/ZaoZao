@@ -1,0 +1,61 @@
+LANG: javascript
+```code
+'use strict';
+
+const express = require('express');
+const app = express();
+
+// SPA 前端部署的精确 Origin 白名单：协议 + 域名 + 端口整体匹配
+const ALLOWED_ORIGINS = new Set([
+  'https://app.example.com',
+  'https://staging.example.com',
+]);
+
+// 统一 CORS 中间件：替代「把请求 Origin 原样回显」的图省事写法
+app.use('/api', (req, res, next) => {
+  const origin = req.headers.origin;
+
+  // 无论命中与否都声明 Vary，让共享缓存以 Origin 作为缓存键
+  res.setHeader('Vary', 'Origin');
+
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    // 仅对白名单命中的 Origin 精确回显，绝不使用通配符 '*'
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    // 凭据模式：允许携带 Cookie，但仅在白名单分支内设置，严禁与 '*' 组合
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Max-Age', '600');
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
+// 敏感数据端点（上游另有鉴权中间件挂载 req.user）：
+// 响应可携带 Cookie 凭据，因此 CORS 策略必须严格
+app.get('/api/user/profile', (req, res) => {
+  res.json({ id: req.user.id, email: req.user.email });
+});
+
+module.exports = app;
+```
+
+1. **类别定位**：本类核心特征是 CORS 响应头配置过宽，审计焦点是 `Access-Control-Allow-Origin` 的取值方式——典型漏洞形态是把请求头 Origin 无条件原样回显（第 21 行若去掉第 19 行判断即是），或使用通配符 `*` 并同时开启 `Access-Control-Allow-Credentials: true`，使任意恶意站点能携带受害者 Cookie 跨域读取响应。本文件第 12–24 行是 CORS 策略的唯一落点，属于 CWE-942 审计面；它与注入、越权无关——响应体不拼接外部输入，权限校验也不在本类范围。注意本样本为安全版：第 21 行并非无条件回显。
+
+2. **外部输入点枚举与可达性**：本模块全部外部输入共两处——第 14 行 `req.headers.origin`（攻击者完全可控的请求头）与第 26 行 `req.method`（HTTP 方法，受浏览器约束可控性有限）。第 14 行的 origin 直接进入第 19 行白名单判断，命中后流向第 21 行 `res.setHeader('Access-Control-Allow-Origin', origin)` 这一 sink，可达性成立；这正是漏洞形态的写入位，防御必须在该数据流上验证。
+
+3. **主数据流防御验证（origin→ACAO sink）**：第 7–10 行 `ALLOWED_ORIGINS` 是 `Set` 精确字符串集合，第 19 行用 `has()` 做全等匹配——这是白名单而非黑名单、正则或字符串替换，不存在 `includes()` 子串误放行（如 `https://app.example.com.evil.com`）或正则锚点绕过问题，类型正确。位置上，判断位于第 21 行 sink 之前、同一中间件内，且第 13 行 `app.use('/api', ...)` 先于全部 /api 路由挂载，无绕过分支；未命中时第 21、23 行均不执行，响应不含 ACAO 头，浏览器直接拦截跨域读取，覆盖完整。
+
+4. **凭据与缓存两个组合条件**：第 23 行 `Access-Control-Allow-Credentials: true` 只在第 19 行白名单分支内设置，全文件不存在 `'*'` 字面量，无凭据与通配符组合的路径，满足凭据模式硬约束。第 17 行无条件输出 `Vary: Origin`，使 CDN/代理以 Origin 为缓存键，阻断「为 A 站生成的 ACAO 响应被缓存后投递给 B 站」的缓存投毒变体，补齐了精确回显方案在共享缓存场景下的缺口。
+
+5. **预检分支与敏感端点核对**：第 26–31 行 OPTIONS 预检分支复用同一白名单结果——非白名单 Origin 的预检响应不含 ACAO，预检必然失败，预检通道没有旁路；第 38–40 行 `/api/user/profile` 是携带 Cookie 凭据的敏感数据端点（返回用户邮箱），其响应头完全由第 13 行中间件统一决定，不存在路由级覆盖。
+
+6. **第二入口/替代通道检查**：全文件仅第 13 行中间件一处写入 CORS 相关头，无 `app.options` 通配预检、无其他中间件或路由二次写 ACAO、无环境变量驱动的动态白名单拼接；本模块定义的路由全部位于 /api 前缀下，第 42 行导出的 app 无论挂载到哪个父应用，策略随中间件一并生效。结论：不存在第二入口或替代通道，防御类型、位置、覆盖面均完整，判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "数据流1：外部输入 req.headers.origin（第14行）经第19行 ALLOWED_ORIGINS.has() 精确白名单全等匹配后才在第21行回显为 Access-Control-Allow-Origin；防御类型为 allowlist 而非黑名单/正则/字符串替换，可拒绝 https://app.example.com.evil.com 等后缀伪造与子域仿冒；防御位置在 sink 之前且位于第13行 app.use('/api') 统一中间件内，先于全部 /api 路由执行，无绕过分支；未命中白名单时第21与23行均不执行，响应无 ACAO 头，浏览器拦截跨域读取，覆盖完整；数据流2：第23行 Access-Control-Allow-Credentials 仅存在于白名单分支内，全文件无通配符 '*' 字面量，不构成凭据与通配符组合的危险形态；第17行无条件输出 Vary: Origin，使 CDN/代理缓存以 Origin 为键，阻断为 A 站生成的 ACAO 响应被缓存投递给 B 站的变体；第26-31行预检分支复用同一白名单结果，非白名单 Origin 的预检响应无 ACAO 必然失败，预检通道无旁路；第二入口检查：全文件仅第13行中间件一处写入 CORS 头，无 app.options 通配预检、无路由级 ACAO 覆盖、无动态拼接白名单，第42行导出的 app 挂载后策略随中间件一并生效，不存在替代通道，判定安全", "fix_suggestion": "no fix needed"}
+```

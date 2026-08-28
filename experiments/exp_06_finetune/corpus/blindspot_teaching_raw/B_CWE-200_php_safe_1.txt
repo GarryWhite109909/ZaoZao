@@ -1,0 +1,66 @@
+LANG: php
+```code
+<?php
+// app/Http/Resources/UserProfileResource.php
+
+declare(strict_types=1);
+
+namespace App\Http\Resources;
+
+use Illuminate\Http\Request;
+use Illuminate\Http\Resources\Json\JsonResource;
+use Illuminate\Support\Arr;
+
+/**
+ * 用户资料接口序列化层：以字段白名单 + 脱敏掩码结构性阻断 CWE-200 敏感信息泄露。
+ */
+final class UserProfileResource extends JsonResource
+{
+    /** 服务端唯一允许离开响应边界的字段集合（allowlist，而非黑名单） */
+    private const PUBLIC_FIELDS = ['id', 'username', 'avatar_url', 'email', 'created_at'];
+
+    public function toArray(Request $request): array
+    {
+        // 外部输入点：GET /api/users/{id}/profile?fields=... 客户端可选字段列表
+        $requested = array_map('trim', explode(',', (string) $request->query('fields', '')));
+
+        // 防御核心：客户端所选字段必须先与服务端白名单求交集，未列入白名单的键一律丢弃
+        $fields = array_values(array_intersect($requested, self::PUBLIC_FIELDS));
+        if ($fields === []) {
+            $fields = self::PUBLIC_FIELDS;
+        }
+
+        // 模型原始属性含 password_hash/remember_token/api_key，但只按白名单取值
+        $data = Arr::only($this->resource->getAttributes(), $fields);
+
+        // 半敏感字段 email 二次脱敏：掩码后才允许进入响应
+        if (isset($data['email']) && is_string($data['email'])) {
+            $data['email'] = $this->maskEmail($data['email']);
+        }
+
+        return $data;
+    }
+
+    private function maskEmail(string $email): string
+    {
+        [$local, $domain] = explode('@', $email, 2);
+        $keep = min(2, strlen($local));
+
+        return substr($local, 0, $keep) . str_repeat('*', max(strlen($local) - $keep, 1)) . '@' . $domain;
+    }
+}
+```
+
+第1步：本类核心特征是 CWE-200 敏感信息对不可信方暴露——用户模型的原始属性表（第32行 `getAttributes()` 取出）含 `password_hash`、`remember_token`、`api_key` 等敏感字段，漏洞形态是序列化整个实体把哈希/内部字段一并回显进 API 响应；这与注入（无 SQL/命令拼接）和越权（不改变查询对象）无关，本类只决定哪些字段能离开服务端，是典型的序列化边界防御层。
+
+第2步：枚举外部输入点——本文件唯一外部输入是第23行 `$request->query('fields')`（GET 查询参数，完全攻击者可控）；数据流为：第23行解析参数 → 第26行白名单交集 → 第32行 `Arr::only` 取属性 → 第39行 return → 框架序列化为 HTTP JSON 响应体（sink），可达性成立；另一个源是模型敏感属性本身，同样汇于第32行，两条流均需逐一验证。
+
+第3步：流1（fields 参数→响应）防御验证——第26行 `array_intersect($requested, self::PUBLIC_FIELDS)` 是白名单（allowlist）而非黑名单/正则/字符串替换，类型正确；位置位于序列化边界（响应前最后一站），所有响应键都必须经过它，覆盖完整；第27-29行保证交集为空时回退到完整白名单，攻击者传 `fields=password_hash,remember_token` 只会得到空交集并回落到公开字段集，无法借参数注入额外键；第32行 `Arr::only` 在结构上只输出白名单键。
+
+第4步：流2（敏感属性→响应）防御验证——源头 `getAttributes()` 虽含 `password_hash`/`remember_token`/`api_key`，但这些键不在第18行 `PUBLIC_FIELDS` 白名单中，经第26行与第32行双重过滤后结构性无法进入 `$data`；对白名单内的半敏感字段 email，第35-37行再经 `maskEmail`（第42-47行）掩码为 `ab***@domain` 形式后才输出，构成白名单+脱敏的纵深防御，两条流均无绕过路径。
+
+第5步：第二入口/替代通道检查——本模块唯一序列化出口是第20行的 `toArray`，唯一外部参数是 `fields`；防御内置于类中而非调用方，任何路由复用本类都自动经过白名单，不存在绕过白名单的其他路由/参数/间接调用，亦无 `var_dump`/`dd`/调试输出或 JSON 序列化旁路；结论：两条 source→sink 流均被类型正确、位置正确、覆盖完整的防御拦截，不存在 CWE-200 敏感信息暴露。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "外部输入点仅第23行的 fields 查询参数且攻击者可控，经第26行白名单交集与第32行 Arr::only 到达第39行响应序列化，可达性成立但被拦截；敏感源为模型原始属性（含 password_hash/remember_token/api_key），因这些键不在第18行 PUBLIC_FIELDS 白名单内而结构性无法进入响应；第26行采用 allowlist 交集而非黑名单/正则/字符串替换，防御位于序列化边界且覆盖全部输出键，交集为空时第27-29行回退完整白名单，传 fields=password_hash 只能得到公开字段集；第35-37行对半敏感字段 email 追加掩码脱敏形成纵深防御；第二入口检查：本模块唯一序列化出口为 toArray 且防御内置于类中，无其他路由/参数/间接调用可绕过，无调试输出，故不存在 CWE-200 敏感信息暴露", "fix_suggestion": "no fix needed"}
+```

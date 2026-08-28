@@ -1,0 +1,62 @@
+LANG: go
+```go
+package main
+
+import (
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+)
+
+// corsMiddleware 为 API 网关全部路由注入跨域策略。
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		origin := c.GetHeader("Origin") // 外部输入点:来源完全由请求方控制
+		if origin == "" {
+			origin = "*"
+		}
+		c.Header("Access-Control-Allow-Origin", origin)      // sink:无条件回显任意 Origin
+		c.Header("Access-Control-Allow-Credentials", "true") // 叠加凭据放行
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
+}
+
+func main() {
+	r := gin.Default()
+	r.Use(corsMiddleware()) // 全局挂载:所有路由共享同一宽松策略
+
+	// 敏感接口:依赖会话 Cookie 鉴权,返回账户余额
+	r.GET("/api/v1/accounts", func(c *gin.Context) {
+		user := c.Query("user")
+		balance := queryBalance(user)
+		c.JSON(http.StatusOK, gin.H{"user": user, "balance": balance})
+	})
+
+	_ = r.Run(":8080")
+}
+
+func queryBalance(user string) string {
+	// 真实项目中此处调用下游账户服务
+	return "88888.00"
+}
+```
+
+1. **本类核心特征定位**：第 16 行将请求头 `Origin` 原样写入 `Access-Control-Allow-Origin`（第 13-15 行还在 Origin 为空时回退为通配 `*`），第 17 行同时设置 `Access-Control-Allow-Credentials: true`。“反射任意 Origin + 凭据放行”的组合是 CWE-942 Permissive Cross-domain Policy 的教科书形态——任意站点可携带受害者凭据跨域读取响应。漏洞位于 HTTP 响应头的跨域策略声明层，与命令注入、SQL 注入、XSS 或越权逻辑无关，不得归入其他类别。
+
+2. **外部输入点枚举与可达性**：① 第 12 行 `c.GetHeader('Origin')` 是攻击者完全可控的输入；中间件在第 30 行通过 `r.Use` 全局挂载，任何路由（含第 33 行的 `/api/v1/accounts`）的每次请求都必然经过第 12→16 行路径，source→sink 可达性确认。② 第 34 行 `c.Query('user')` 是第二个输入点，流入第 36 行响应体，是被宽松策略暴露的敏感载荷。③ 第 20 行 `c.Request.Method` 仅用于预检分支，非安全输入。
+
+3. **防御验证（Origin 流）**：第 12 行到第 16 行之间不存在任何白名单、可信域正则、后缀匹配或字符串校验；第 13-15 行仅把空 Origin 替换为 `*`，属于扩大放行面而非防御。Origin 值被逐字回显，`https://evil.example` 等任意来源均被授予读取权，且未设置 `Vary: Origin`，该数据流防御覆盖面为零。
+
+4. **敏感数据暴露链**：受害者登录网关后浏览器自动携带会话 Cookie；攻击者页面在任意源执行 `fetch('http://gateway/api/v1/accounts?user=victim', {credentials:'include'})` 时，因第 17 行允许凭据，浏览器附带 Cookie 发起跨域请求；响应头第 16 行 ACAO 恰好等于攻击者源，浏览器据此放行脚本读取第 36 行 JSON 中的账户余额。source（第 12 行 Origin + 受害者 Cookie）→ sink（第 16 行响应头 + 第 36 行敏感响应体）全链路无任何拦截。
+
+5. **第二入口/替代通道检查**：OPTIONS 预检请求在第 20 行分支之前已经过第 16-19 行，因此预检响应同样携带宽松头，带自定义头（如 Authorization）的跨域请求也会被批准；中间件为全局唯一策略注入点（第 30 行），不存在绕开该策略的其他路由或处理器，未来新增路由也自动继承同一缺陷——即没有“安全的第二入口”，所有通道均受同一漏洞影响，系统性配置缺陷成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-942 Permissive Cross-domain Policy", "risk_level": "High", "source": "line 12: c.GetHeader('Origin') 读取攻击者完全可控的 Origin 请求头", "sink": "line 16: c.Header('Access-Control-Allow-Origin', origin) 无条件回显任意来源,并在 line 17 叠加 Allow-Credentials: true", "explanation": "主数据流: line 12 攻击者可控 Origin 头 -> line 16 原样回写 ACAO -> line 17 允许凭据 -> 任意恶意站点可携带受害者会话 Cookie 跨域读取 line 36 返回的账户余额; 防御验证: source 到 sink 之间无白名单/正则/可信域校验, line 13-15 仅将空 Origin 回退为通配 * 属于放宽而非防御, 且未设置 Vary: Origin; 第二入口检查: 中间件经 line 30 r.Use 全局挂载, OPTIONS 预检在 line 20 分支前已写入宽松头, 所有现有及未来路由均继承同一策略, 不存在未受影响的替代通道", "fix_suggestion": "line 16: 最小修复为引入可信域白名单, 仅当请求 Origin 精确命中白名单时才回写该具体域名并保留 Allow-Credentials, 否则不发送 ACAO 头; 严禁通配 * 与 Allow-Credentials: true 同时出现"}
+```

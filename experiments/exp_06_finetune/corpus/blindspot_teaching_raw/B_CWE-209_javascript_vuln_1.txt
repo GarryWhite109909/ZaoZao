@@ -1,0 +1,56 @@
+LANG: javascript
+```code
+const express = require('express');
+const router = express.Router();
+const fs = require('fs');
+const path = require('path');
+const multer = require('multer');
+
+const upload = multer({ dest: '/tmp/uploads' });
+
+// POST /api/files/process —— 接收上传的 JSON 配置文件,解析后落盘到导出目录
+router.post('/process', upload.single('file'), (req, res) => {
+  try {
+    const exportPath = path.join('/srv/app/exports', path.basename(req.body.name || 'default.json'));
+    const raw = fs.readFileSync(req.file.path, 'utf8');
+    const parsed = JSON.parse(raw);
+    fs.writeFileSync(exportPath, JSON.stringify(parsed, null, 2));
+    res.json({ ok: true, saved: exportPath });
+  } catch (err) {
+    console.error('file process failed:', err);
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+      stack: err.stack.split('\n'),
+      code: err.code
+    });
+  }
+});
+
+// POST /api/files/cleanup —— 清理临时上传文件
+router.post('/cleanup', (req, res) => {
+  try {
+    const tmp = path.join('/tmp/uploads', path.basename(req.body.file));
+    fs.unlinkSync(tmp);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message, stack: err.stack });
+  }
+});
+
+module.exports = router;
+```
+
+第 1 步（本类核心特征定性）：本文件第 19-24 行与第 35 行呈现的是 CWE-209 的典型形态——捕获底层异常后不做任何脱敏，直接把 `err.message`、`err.stack`、`err.code` 序列化进客户端响应体，使内部绝对路径、完整堆栈（模块路径/函数名/行号/依赖布局）、文件系统错误码以及用户输入内容片段对外暴露。需要明确：异常内容在这里只被“展示”而不被“执行”，全程没有命令拼接、SQL 拼接或权限校验绕过，因此这是错误信息泄露（CWE-209），不是命令注入、SQL 注入或越权类漏洞。
+
+第 2 步（外部输入点枚举与可达性）：本模块共两个 HTTP 入口。入口①：第 10 行 `POST /api/files/process`，multer 的 `upload.single('file')` 使上传文件字节内容（`req.file`）与表单字段 `req.body.name`（第 12 行）完全攻击者可控；文件内容在第 13 行被读入、第 14 行进入 `JSON.parse`——攻击者只需上传一段非 JSON 字节即可必然触发解析异常，到 sink 可达性 100%；`req.body.name` 在第 12 行拼入导出路径，第 15 行 `writeFileSync` 失败（EACCES/ENAMETOOLONG 等）时其值会嵌入错误消息。入口②：第 29 行 `POST /api/files/cleanup`，`req.body.file`（第 31 行）进入路径拼接并在第 32 行 `unlinkSync`，发送不存在的文件名即可触发 ENOENT，同样可达。
+
+第 3 步（逐条数据流验证防御缺失）：流 A（上传内容→解析错误）：第 14 行抛出的 SyntaxError 在现代 Node 中形如 `Unexpected token 'h', "hello" is not valid JSON`，会把攻击者文件内容片段回显，经第 21 行 `error: err.message` 进入响应，从 throw 到响应之间无任何白名单、错误码映射或通用文案替换。流 B（路径→文件系统错误）：第 15 行失败时 `err.message` 内嵌内部绝对路径 `/srv/app/exports/...`，经第 21-23 行进入响应；第 12 行的 `path.basename` 只用于防路径拼接穿越，位于路径构造处而非错误输出通道，对本类不构成防御。流 C（第二入口）：第 32 行 `unlinkSync` 的 ENOENT/EACCES 消息经第 35 行原样返回，泄露 `/tmp/uploads` 内部目录结构。此外无论哪条流触发，第 22 行与第 35 行的 `err.stack` 都会泄露服务端模块绝对路径、函数名与行号。
+
+第 4 步（防御面总结）：全文件不存在任何针对错误输出的处理——没有按 `NODE_ENV` 区分环境的详细信息开关、没有错误码→友好文案映射、没有响应体字段白名单；第 18 行 `console.error` 只是服务端日志，不替代也不净化响应；第 22 行 `err.stack.split('\n')` 仅做格式化，信息量不减反增（转为数组更易被客户端解析）。三条 source→sink 流全部无有效防御。
+
+第 5 步（第二入口/替代通道结论）：存在第二入口——第 29 行 `/api/files/cleanup` 与主入口完全同型，同样把 `err.message`/`err.stack` 写进响应（第 35 行），说明泄露不是单点疏忽而是模块级编码模式；另外第 16 行成功响应还回显内部导出路径 `saved: exportPath`，属于同一信息暴露家族的辅助通道。两个入口、三条数据流均无防御，支撑最终结论：存在 CWE-209 漏洞，风险为 High（为后续攻击提供内部路径、技术栈指纹与输入回显）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-209 Generation of Error Message Containing Sensitive Information", "risk_level": "High", "source": "line 10: POST /api/files/process 中 multer 接收的外部上传文件 req.file 与 req.body.name(第 12 行); 第二入口 line 29 的 req.body.file(第 31 行)", "sink": "line 19: res.status(500).json 将 err.message/err.stack/err.code 原样写入响应体(第二入口同型 sink 为第 35 行)", "explanation": "流A: 第10行 multer 接收的外部上传文件内容经第13行读入、第14行 JSON.parse 解析, 攻击者上传非 JSON 字节即可必然触发 SyntaxError, 其 message 含文件内容片段, 经第21行进入响应; 流B: 第12行 req.body.name 拼入导出路径, 第15行 writeFileSync 失败时 err.message 内嵌内部绝对路径 /srv/app/exports, 经第21-23行进入响应; 流C: 第二入口第31行 req.body.file 使第32行 unlinkSync 抛出 ENOENT, 泄露 /tmp/uploads 内部目录结构, 经第35行进入响应; 防御核查: 三条流从异常抛出到响应之间无任何脱敏/错误码映射/通用文案, 第18行 console.error 仅为服务端日志不改变响应内容, 第12与31行 path.basename 只防路径穿越、与错误输出通道无关, 第22行 err.stack.split 仅格式化不消除信息, 故三条流均无有效防御; 第二入口核查: 第29行 /api/files/cleanup 为同型第二入口且同样直返 err.message 与 err.stack, 第16行成功响应还回显内部导出路径, 多入口同模式证明该模块系统性缺失错误脱敏, 结论成立", "fix_suggestion": "line 19: 最小修复——响应体只返回固定通用文案如 {ok:false,error:'internal error'}, err.message/err.stack/err.code 仅保留在第18行服务端日志中, 并对第35行第二入口做同样处理"}
+```

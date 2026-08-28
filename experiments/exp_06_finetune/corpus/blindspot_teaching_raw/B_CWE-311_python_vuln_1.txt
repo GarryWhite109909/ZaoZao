@@ -1,0 +1,51 @@
+LANG: python
+```code
+"""HTTP client for the external payment gateway (billing service)."""
+
+import logging
+import os
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+GATEWAY_URL = "http://payments.internal.example.com/api/v1"
+API_KEY = os.environ["PAYMENT_GATEWAY_API_KEY"]
+
+
+def charge_card(card_number: str, cvv: str, expiry: str, amount_cents: int, order_id: str) -> dict:
+    payload = {
+        "card_number": card_number,
+        "cvv": cvv,
+        "expiry": expiry,
+        "amount": amount_cents,
+        "order_id": order_id,
+        "api_key": API_KEY,
+    }
+    logger.info("submitting charge for order %s", order_id)
+    resp = requests.post(GATEWAY_URL + "/charge", json=payload, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def refund_card(card_number: str, amount_cents: int, order_id: str) -> dict:
+    payload = {"card_number": card_number, "amount": amount_cents,
+               "order_id": order_id, "api_key": API_KEY}
+    resp = requests.post(GATEWAY_URL + "/refund", json=payload, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+```
+
+1. **第 1 步（本类核心特征）**：第 10 行 `GATEWAY_URL = "http://..."` 采用明文 HTTP scheme，这是 CWE-311（敏感数据缺失加密）的典型形态——持卡人数据（卡号/CVV/有效期）与网关凭证 API_KEY 将以未加密形式跨越信任边界（应用进程 → 外部网络信道）。需要明确归类：代码中没有任何 SQL 拼接、命令拼接或权限校验缺陷，数据被正确结构化地传输给网关，问题不在“数据被解释为代码执行”（注入类）或“越权访问”，而在“敏感数据以明文暴露于不加密信道”，故属于 CWE-311，而非 CWE-78/89/94 等其他类别。
+
+2. **第 2 步（输入点枚举与可达性）**：本模块共三组外部输入点，全部可达 sink：① 第 14 行 `charge_card` 的参数 `card_number/cvv/expiry/amount_cents/order_id`（来自上层结账流程的用户提交持卡人数据），在第 15-22 行全部并入 `payload`，直达第 24 行 `requests.post` sink；② 第 11 行 `API_KEY`（环境变量读取的网关凭证），在第 21 行并入同一 `payload`，同样到达第 24 行 sink；③ 第 29 行 `refund_card` 的 `card_number` 参数，在第 30-31 行并入 `payload`，到达第 32 行第二个 sink。三条数据流均无任何中断或转换，可达性成立。
+
+3. **第 3 步（逐流验证防御缺失）**：主链 `card_number/cvv/expiry → payload → 第 24 行 requests.post`：全链路不存在任何防御——URL scheme 为 `http://`（第 10 行），未使用 TLS；发送前无字段级加密、无令牌化、无 PAN 掩码/截断处理；`requests` 库的 `verify` 参数仅对 HTTPS 证书校验生效，此处 scheme 为 http 根本不适用，不构成任何保护；代码中也不存在黑名单/正则/字符串替换等过滤逻辑（且按规则即便存在格式校验也不算加密防御）。API_KEY 流（第 11 行 → 第 21 行 → 第 24 行）同样零保护，凭证随明文信道外发，可被任意中间人截获重放。
+
+4. **第 4 步（第二入口/替代通道检查）**：存在第二公开入口 `refund_card`（第 29 行），其 sink 在第 32 行，复用第 10 行同一 `http://` 基址，同样明文传输 `card_number` 与 `api_key`——替代通道与主链缺陷完全一致。文件内无其他路由、无 `getattr` 之类的动态间接调用、无重试/异步旁路通道。两个入口收敛于同一明文外发模式，说明缺陷源于网关地址的系统性设计（scheme 即明文），而非偶发遗漏，进一步支撑漏洞成立结论。
+
+5. **第 5 步（结论）**：CWE-311 成立，风险等级 High——攻击者只需处于任意网络路径（内网嗅探、ARP 欺骗、上游代理）即可完整截获卡号、CVV、有效期与 API 密钥，直接违反 PCI DSS 对持卡人数据在开放网络传输必须加密的强制要求，且无任何缓解措施。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-311 Missing Encryption of Sensitive Data", "risk_level": "High", "source": "line 14: charge_card 参数 card_number/cvv/expiry（持卡人敏感数据）与 line 11: API_KEY 网关凭证", "sink": "line 24: requests.post(GATEWAY_URL + '/charge', json=payload) 经 http:// 明文信道外发", "explanation": "流1(主链): line 14 参数 card_number/cvv/expiry -> line 15-22 组装 payload -> line 24 requests.post 经 http:// 明文外发, 全链无 TLS、无字段级加密、无令牌化、无 PAN 掩码; 流2: line 11 API_KEY -> line 21 并入 payload -> line 24 同一明文信道外发, 凭证未受任何保护; 流3(替代通道): line 29 refund_card 参数 card_number -> line 30-31 payload -> line 32 requests.post 复用同一 http:// 基址明文外发; 代码中不存在任何过滤/校验逻辑, 且即便有格式正则校验也不构成加密防御, requests 的 verify 参数仅作用于 HTTPS 证书校验、对 http scheme 完全无效; 两个入口收敛于同一明文外发模式, 证明缺陷为系统性设计问题; 中间人可完整截获卡号/CVV/有效期/密钥, 直接违反 PCI DSS, 判定 CWE-311 成立", "fix_suggestion": "line 10: 将 GATEWAY_URL 的 scheme 由 http 改为 https 并启用证书校验, 同时在发送前对卡号做令牌化、避免 CVV 经非加密链路外发"}
+```

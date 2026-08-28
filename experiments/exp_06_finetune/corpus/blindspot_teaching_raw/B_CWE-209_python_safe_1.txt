@@ -1,0 +1,54 @@
+LANG: python
+```code
+import logging
+import os
+import uuid
+
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("file_service")
+
+UPLOAD_DIR = "/var/data/uploads"
+ALLOWED_EXTENSIONS = {".txt", ".csv", ".pdf"}
+
+
+@app.route("/files/process", methods=["POST"])
+def process_file():
+    uploaded = request.files.get("file")
+    if uploaded is None:
+        return jsonify({"error": "missing file"}), 400
+    try:
+        ext = os.path.splitext(uploaded.filename or "")[1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            return jsonify({"error": "unsupported file type"}), 400
+        save_path = os.path.join(UPLOAD_DIR, uuid.uuid4().hex + ext)
+        uploaded.save(save_path)
+        size = os.path.getsize(save_path)
+        return jsonify({"status": "ok", "size": size}), 200
+    except Exception:
+        logger.exception("file processing failed")
+        return jsonify({"error": "internal server error"}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, debug=False)
+```
+
+1. **本类核心特征**：CWE-209 指错误消息包含敏感信息——把异常对象、底层错误（堆栈、服务器内部路径如 /var/data/uploads、SQL 语句、数据库连接串等）原样返回给客户端。它与注入、越权无关，本质是“错误通道的信息泄露”。文件处理接口的高危位置正是异常分支：本文件第 31-33 行。若此处写成 `return jsonify({'error': str(e)})` 或返回 `traceback.format_exc()`，即构成典型 CWE-209；本文件在此采取了相反的正确写法。
+
+2. **输入点枚举与可达性**：外部输入共两处——① 第 20 行 `request.files.get('file')`，攻击者完全可控的文件字节流；② 第 24 行 `uploaded.filename`，攻击者可控的文件名（仅取扩展名）。二者在第 27-29 行的 `os.path.join`/`uploaded.save`/`os.path.getsize` 处可达 sink：超大文件、磁盘写满、目录权限错误等都会抛出 OSError，其消息内嵌服务器绝对路径与 errno 细节，正是 CWE-209 要保护的敏感数据；sink 是返回客户端的 HTTP 响应体，即第 22、26、30、33 行四个 `return jsonify(...)`。
+
+3. **主链防御验证（类型/位置/覆盖面）**：第 31-33 行的防御属于“结构性整体替换”而非过滤——except 捕获后客户端响应是常量字面量 'internal server error'，完全没有拼接异常对象、`repr(e)` 或 `traceback.format_exc()`；完整异常与堆栈只经第 32 行 `logger.exception` 写入服务端日志。它不像黑名单/正则/字符串替换那样可被新型异常类型、编码变形或未覆盖字段绕过，因为响应体根本不含任何动态错误内容。位置正确：第 23 行 try 覆盖 source 之后全部可失败语句（第 24-29 行），异常无法绕过该 handler 携带动态内容外流。覆盖面完整：try 之前的第 21-22 行与第 25-26 行分支同样只返回常量文案。
+
+4. **处理器内其他泄露通道排查**：成功路径第 30 行只返回 status 与 size，不含路径、文件名或错误文本；第 27 行用 `uuid.uuid4().hex` 重命名落盘文件，客户端文件名在任何响应中均不回显；第 22、26 行的 400 响应为常量。框架层：第 37 行显式 `debug=False`，Werkzeug 非调试模式下对视图之外的错误（如畸形 multipart 触发的 400/413）也返回不含堆栈的通用页面，且未设置 `PROPAGATE_EXCEPTIONS`。
+
+5. **第二入口/替代通道检查**：本模块仅注册第 18 行一个路由 /files/process、一个视图函数 process_file；无其他 blueprint/路由、无 CLI 命令、无自定义 errorhandler 或中间件把异常格式化进响应；客户端可见出口仅有第 22、26、30、33 行四个 return 语句，均已在第 3、4 步审计为常量或非敏感字段。结论：不存在第二入口或替代通道，结合第 3-4 步，本文件不存在 CWE-209 错误信息泄露，判定为安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "外部输入点唯一且可达：第20行 request.files.get('file') 接收攻击者可控的上传内容，第24行解析攻击者可控的 filename 后缀，二者在第27-29行的落盘与取大小操作中可触发 OSError 等底层异常，异常文本内含服务器路径 /var/data/uploads 与 errno 等敏感细节，即 CWE-209 的敏感数据源，sink 为返回客户端的 HTTP 响应体；主链防御位于第31-33行：捕获 Exception 后仅以 logger.exception 将完整异常与堆栈写入服务端日志，客户端响应为常量字符串 'internal server error'，不拼接异常对象、repr 或 traceback，属于结构性整体替换而非黑名单/正则/字符串替换过滤，无法通过新型异常类型或编码变形绕过；位置与覆盖面正确：第23行 try 覆盖第24-29行全部可失败语句，try 之前各分支（第21-22、25-26行）同样只返回常量文案；替代通道排查：第30行成功响应仅含 size 与状态字段，第27行以 uuid4 重命名使客户端文件名不回显，第37行显式 debug=False 保证 Werkzeug 层畸形请求错误也返回无堆栈通用页面；第二入口检查：本模块仅注册第18行单一路由 /files/process 与单一视图函数，客户端可见出口仅为第22、26、30、33行四个 return jsonify 语句且均已审计为常量或非敏感字段，无其他路由、参数或间接调用通道，故不存在 CWE-209 错误信息泄露", "fix_suggestion": "no fix needed"}
+```

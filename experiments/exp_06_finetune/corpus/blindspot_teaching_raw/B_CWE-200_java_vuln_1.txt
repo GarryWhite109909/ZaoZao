@@ -1,0 +1,57 @@
+LANG: java
+```code
+package com.example.userprofile.controller;
+
+import com.example.userprofile.entity.UserAccount;
+import com.example.userprofile.repository.UserAccountRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/v1/users")
+public class UserProfileController {
+
+    @Autowired
+    private UserAccountRepository userRepository;
+
+    @GetMapping("/{id}")
+    public Map<String, Object> getProfile(@PathVariable Long id,
+                                          @RequestParam(defaultValue = "false") boolean debug) {
+        UserAccount user = userRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("user not found"));
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("id", user.getId());
+        resp.put("username", user.getUsername());
+        resp.put("email", user.getEmail());
+        resp.put("passwordHash", user.getPasswordHash());
+        resp.put("salt", user.getSalt());
+        resp.put("internalTenantId", user.getInternalTenantId());
+        if (debug) {
+            resp.put("dbUrl", System.getenv("SPRING_DATASOURCE_URL"));
+            resp.put("serverVersion", "tomcat-9.0.65 / spring-5.3.22");
+        }
+        return resp;
+    }
+}
+```
+
+第 1 步：本类核心特征定位。CWE-200 的本质是把敏感信息暴露给不可信方，而非注入或越权：本例 API 响应体直接回显密码哈希（第 31 行 passwordHash）、盐值（第 32 行 salt）、内部租户标识（第 33 行 internalTenantId），并在 debug 参数开启时对外返回数据库连接串（第 35 行）与精确框架版本（第 36 行）。全程没有任何拼接执行或权限判定逻辑，属于典型的『实体/响应整体序列化导致敏感字段外泄』形态，不属于 CWE-78/89/94/284 等其他类别。
+
+第 2 步：外部输入点枚举与可达性。本文件唯一对外入口是 HTTP 端点 GET /api/v1/users/{id}（第 22-24 行），共两个输入点：①路径变量 id（第 23 行），任意客户端无需认证即可传入，直接驱动第 25 行的 findById 查询；②查询参数 debug（第 24 行），客户端可控布尔值，直接控制第 33-37 行的调试分支。类与方法上均无 @PreAuthorize 或任何安全拦截，两个输入点到第 38 行 return 的路径均为直线可达。
+
+第 3 步：主数据流追踪。流 A：第 25 行从数据库加载完整 UserAccount 实体 → 第 31-33 行将 passwordHash、salt、internalTenantId 原样放入 resp → 第 38 行作为 JSON 响应体返回给任意调用方，攻击者可离线爆破哈希。流 B：第 24 行客户端传 debug=true → 第 33 行条件放行 → 第 35 行把 SPRING_DATASOURCE_URL（含主机、端口、库名的连接串）写入响应 → 第 38 行返回；第 36 行同时泄露 Tomcat/Spring 精确版本，便于攻击者匹配已知 CVE。
+
+第 4 步：防御有效性核验。两条流上均不存在任何防御：无 DTO 投影或字段白名单，实体侧无 @JsonIgnore 或自定义序列化器剔除敏感字段，debug 参数无角色校验或服务端开关限制，响应亦无脱敏处理。即便假设存在基于字段名黑名单或字符串替换的过滤，按标准也不视为有效防御（可绕过）；本例连此类弱过滤都不存在，防御覆盖面为零。
+
+第 5 步：第二入口/替代通道检查。本文件仅声明一个路由（第 22 行 @GetMapping("/{id}")），不存在其他 handler、内部转发或间接调用，也未将敏感信息写入日志，暴露通道唯一即 HTTP 响应体。但需注意：即使不带 debug=true，默认响应仍回显 passwordHash/salt/internalTenantId（第 31-33 行），说明漏洞不依赖第二参数，debug 仅是放大通道（追加连接串与版本泄露）。综合确认：单一入口、两条暴露流、全程无防御，CWE-200 成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-200 Exposure of Sensitive Information", "risk_level": "High", "source": "line 25: userRepository.findById(id) 加载的 UserAccount 实体(含 passwordHash/salt/internalTenantId 敏感字段)及 line 24 客户端可控 debug 参数", "sink": "line 31-36: resp.put 将 passwordHash/salt/internalTenantId/dbUrl/serverVersion 写入响应, 经 line 38 return 序列化为对外 JSON 响应体", "explanation": "流A: line 23 路径变量 id 无认证直达 line 25 查询, line 31-33 将 passwordHash/salt/internalTenantId 原样放入 resp 并经 line 38 返回, 无 DTO 白名单/无 @JsonIgnore/无脱敏, 可离线破解凭据; 流B: line 24 客户端可控 debug=true 放行 line 33 分支, line 35 泄露 SPRING_DATASOURCE_URL 连接串, line 36 泄露 Tomcat/Spring 精确版本便于匹配已知 CVE, 无任何角色校验; 两条流均无任何有效防御, 连黑名单或字符串替换类弱过滤都不存在, 防御覆盖面为零; 第二入口检查: 文件内仅 line 22 一个路由, 无其他 handler/内部转发/日志通道, 暴露通道唯一为 HTTP 响应体, 但默认响应已泄露哈希与盐值, 漏洞不依赖 debug 参数, debug 仅为放大通道, CWE-200 成立", "fix_suggestion": "line 31: 删除 passwordHash/salt/internalTenantId 三行回显, 改用仅含 id/username/email 的白名单 DTO; 同时移除或以管理员角色限定 line 34-37 的 debug 分支, 剔除数据源 URL 与框架版本信息"}
+```

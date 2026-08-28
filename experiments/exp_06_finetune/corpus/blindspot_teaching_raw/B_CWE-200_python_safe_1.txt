@@ -1,0 +1,55 @@
+LANG: python
+```code
+from flask import Blueprint, jsonify, abort
+from flask_login import current_user, login_required
+from models import User, db  # User 实体含 password_hash / api_key / is_admin 等内部敏感列
+
+profile_bp = Blueprint('profile', __name__)
+
+# 响应字段白名单：仅允许对外公开的字段
+PUBLIC_FIELDS = ('id', 'username', 'display_name', 'created_at')
+# 半敏感字段：需脱敏掩码后方可展示
+MASKED_FIELDS = ('email',)
+
+
+def mask_email(value):
+    name, _, domain = value.partition('@')
+    if not name or not domain:
+        return '***'
+    return name[0] + '***@' + domain
+
+
+def serialize_public_profile(user):
+    """白名单序列化：逐字段显式拷贝，禁止 to_dict()/vars() 全量导出。"""
+    data = {}
+    for field in PUBLIC_FIELDS:
+        data[field] = getattr(user, field)
+    for field in MASKED_FIELDS:
+        data[field] = mask_email(getattr(user, field))
+    return data
+
+
+@profile_bp.route('/api/users/<int:user_id>/profile', methods=['GET'])
+@login_required
+def get_profile(user_id):
+    user = db.session.get(User, user_id)
+    if user is None:
+        abort(404)
+    if user.id != current_user.id and not current_user.is_admin:
+        abort(403)
+    return jsonify(serialize_public_profile(user)), 200
+```
+
+第 1 步：类别特征定位。CWE-200 的核心特征是敏感信息对不可信方暴露——典型形态是 API 响应直接回显敏感字段（password_hash、api_key、is_admin 等密码哈希/密钥/内部标识），成因多为序列化整个实体（to_dict()/vars() 全量导出）而非按字段筛选。它不是注入（CWE-89/79）也不是越权（CWE-862/IDOR）：第 36 行的属主校验解决的是'谁能看这条记录'，而 CWE-200 关注的是'返回的记录里包含哪些字段'。本样本为安全版，采用字段白名单 + 邮箱掩码双重防御。
+
+第 2 步：输入点枚举与可达性确认。外部输入点共两处：(a) 第 30/32 行路由参数 user_id（经 `<int:user_id>` 转换器约束为整数）；(b) 第 33 行 db.session.get 加载的完整 ORM 实体，其数据列含 password_hash/api_key/is_admin/email 等敏感值。数据流：user_id → 第 33 行查库得 user 实体 → 第 38 行调用 serialize_public_profile（第 20-27 行）→ 构造 dict → 第 38 行 jsonify → HTTP 响应。sink 唯一且可达：第 38 行 jsonify 是本模块唯一的响应出口，实体敏感列理论上可沿此流到达响应。
+
+第 3 步：主流防御验证（字段白名单）。第 8 行 PUBLIC_FIELDS 定义默认拒绝的允许列表，第 23-24 行逐字段显式拷贝 id/username/display_name/created_at。类型正确：这是字段级白名单，而非黑名单/正则/字符串剔除——后三者可被键名变体绕过，而白名单下即使日后给 User 模型新增 secret_token 等敏感列也不会默认进入响应；位置正确：位于序列化边界，是 jsonify 的唯一数据来源；覆盖完整：password_hash/api_key/is_admin 不在 PUBLIC_FIELDS 与 MASKED_FIELDS 任一元组中，第 24/26 行 getattr 循环永远不会读取它们，敏感列无法进入 data 字典。
+
+第 4 步：次流防御验证（半敏感字段掩码）。email 属于 PII，第 25-26 行将其单独路由到第 13-17 行 mask_email：partition('@') 拆分后仅保留本地部分首字符与域名（形如 a***@example.com），畸形输入回退为 '***'。这构成纵深防御——即便将 email 视为敏感字段，响应中最多泄露首字母与域名，不构成 CWE-200 意义上的敏感信息暴露。
+
+第 5 步：第二入口/替代通道检查。本模块仅注册一条路由（第 30 行），无调试端点、无 DEBUG 分支；全文不存在 vars(user)、user.to_dict()、repr(user) 等全量导出；第 34-35、36-37 行错误分支仅 abort(404)/abort(403)，不回显实体任何字段；亦无日志打印敏感列。jsonify 的唯一实参来自 serialize_public_profile，不存在绕过该序列化函数的间接调用。结论：无第二入口、无替代通道，白名单 + 掩码对唯一 source→sink 流覆盖完整，判定不存在 CWE-200 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "外部输入点为第30行路由参数 user_id 与第33行加载的完整 ORM 实体（含 password_hash/api_key/is_admin/email 等敏感列），唯一 sink 为第38行 jsonify 响应；数据流 user_id→db.session.get→user 实体→serialize_public_profile→jsonify 可达；防御一：第8行 PUBLIC_FIELDS 白名单在第23-24行逐字段拷贝，属默认拒绝的允许列表而非黑名单/正则/字符串剔除，位置处于序列化边界且是 jsonify 的唯一数据来源，覆盖完整，password_hash/api_key/is_admin 不在白名单中故永远不会被读取进响应；防御二：第13-17行 mask_email 对半敏感字段 email 做掩码（仅保留首字母与域名，畸形输入回退为 ***），构成纵深防御；第二入口检查：本模块仅注册一条路由，无调试端点、无 vars()/to_dict()/repr() 全量导出、404/403 分支不回显实体内容、无敏感字段日志，不存在绕过序列化函数的替代通道，故判定无 CWE-200 敏感信息暴露漏洞", "fix_suggestion": "no fix needed"}
+```

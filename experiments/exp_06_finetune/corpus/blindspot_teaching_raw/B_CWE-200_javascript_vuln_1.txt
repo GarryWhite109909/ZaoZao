@@ -1,0 +1,48 @@
+LANG: javascript
+```code
+// routes/profile.js — 用户资料查询接口
+const express = require('express');
+const router = express.Router();
+const { User, UserConfig } = require('../models');
+const { collectDbStats } = require('../services/monitor');
+
+// GET /api/users/:id — 返回用户完整资料(附带调试诊断信息)
+router.get('/users/:id', async (req, res) => {
+  try {
+    const user = await User.findByPk(req.params.id, {
+      include: [{ model: UserConfig, as: 'config' }]
+    });
+    if (!user) {
+      return res.status(404).json({ error: 'user not found' });
+    }
+    // 调试诊断:打包内部环境信息,便于线上排查
+    const debugInfo = {
+      node: process.version,
+      cwd: process.cwd(),
+      dbUrl: process.env.DATABASE_URL,
+      dbStats: await collectDbStats()
+    };
+    // 直接把整个 ORM 实体序列化后返回
+    return res.json({ user: user.toJSON(), debug: debugInfo });
+  } catch (err) {
+    // 出错时把堆栈也回给前端,方便定位
+    return res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
+module.exports = router;
+```
+
+1. **本类核心特征定位**：CWE-200 的本质是把敏感信息暴露给不可信方，典型形态就是 API 响应直接回显敏感字段。第 24 行把整个 ORM 实体经 `user.toJSON()` 原样写入响应，实体中含 passwordHash、resetToken 及 config 内部关联；第 17-22 行把 DATABASE_URL 连接串、进程 cwd、node 版本打包为 debugInfo 一并返回；第 27 行把 err.stack 回显给客户端。三处都是『敏感数据 → 对外响应』的直接回显，全程不涉及命令执行或 SQL 拼接，因此不是 CWE-78/CWE-89 注入类，也不是 CWE-284 越权——问题不在『谁能访问接口』，而在『响应内容本身携带敏感字段』。
+
+2. **外部输入点枚举与可达性**：本模块唯一外部输入是第 8 行路由捕获的路径参数 `req.params.id`(未使用 req.body/req.query/请求头)。可达性成立：第 10 行将其传入 findByPk 加载对应实体，第 24 行无条件序列化返回；攻击者枚举 id 即可批量收割全站用户的密码哈希。该输入不进入任何执行或查询拼接，其作用只是『选择哪份敏感数据被回显』，危害性质属于信息暴露而非注入。
+
+3. **主数据流防御验证(实体流)**：source 为第 10 行加载的完整实体，sink 为第 24 行 res.json。逐层检查：查询层(第 10-12 行)无 attributes 白名单投影，默认取全列；序列化层直接调 toJSON(),无 DTO/serializer 剔除；响应层 res.json 之前无 delete/omit 字段操作。三层均不存在任何过滤，连可绕过的黑名单/正则都没有，防御覆盖面为零。
+
+4. **次数据流防御验证(环境信息流与错误流)**：流 2——第 20 行 `process.env.DATABASE_URL`(通常内嵌数据库账号口令)与第 18-19 行 node 版本、cwd 汇入 debugInfo,第 17-22 行没有 NODE_ENV 门控，生产环境同样经第 24 行返回；流 3——第 27 行 catch 分支把 err.message 与 err.stack 直接回显，泄露内部绝对路径、目录结构与 ORM/驱动栈帧，且无统一错误净化中间件兜底。两条流从 source 到 sink 全程无任何防御。
+
+5. **第二入口/替代通道检查**：本文件只注册一条路由(GET /users/:id),模块内没有其他 handler 写出 User 实体或环境数据；但同一 handler 内部存在两条替代暴露通道——成功响应(第 24 行)与错误响应(第 27 行)，后者可由非法 id 类型、数据库故障等触发。此外即使删掉 debugInfo,第 24 行的实体序列化仍独立泄露 passwordHash,说明漏洞不依赖单一字段。综合三条数据流与通道检查，判定为 CWE-200 Exposure of Sensitive Information,风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-200 Exposure of Sensitive Information", "risk_level": "High", "source": "line 10: User.findByPk 加载的完整用户实体(含 passwordHash、resetToken、config 内部关联)及 line 20: process.env.DATABASE_URL 等内部环境数据", "sink": "line 24: res.json({ user: user.toJSON(), debug: debugInfo }) 将敏感实体与内部环境信息整体写入 HTTP 响应;line 27: 错误响应回显 err.stack", "explanation": "流1: 任意客户端经 line 8 路由以 req.params.id 命中 line 10 的 findByPk,整实体经 user.toJSON() 在 line 24 被 res.json 回显,passwordHash/resetToken/config 内部关联零过滤暴露,查询层无 attributes 投影、序列化层无 DTO、响应层无字段剔除,三层均无防御;流2: line 20 的 DATABASE_URL 连接串与 line 18-19 的 node 版本/cwd 打包进 debugInfo,无 NODE_ENV 门控,生产环境同样经 line 24 返回;流3: line 27 错误分支回显 err.message 与 err.stack,泄露内部绝对路径与框架栈帧,无错误净化器兜底;第二入口检查: 本模块仅注册一条路由,无其他写出用户实体的通道,但同一 handler 内成功响应(line 24)与错误响应(line 27)构成两条替代暴露通道,且移除 debugInfo 后 line 24 仍独立泄露密码哈希,故 CWE-200 信息暴露成立", "fix_suggestion": "line 24: 最小修复——改为显式白名单序列化,如 res.json({ user: { id: user.id, username: user.username, email: user.email } }),剔除 passwordHash/resetToken/config 关联;同时删除 line 17-22 的 debugInfo 块与 line 27 的 err.stack 回显,错误响应仅返回通用提示"}
+```

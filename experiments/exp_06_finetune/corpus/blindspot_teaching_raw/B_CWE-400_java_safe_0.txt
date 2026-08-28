@@ -1,0 +1,53 @@
+LANG: java
+```code
+package com.acme.validation;
+
+import com.google.re2j.Pattern;
+import com.google.re2j.PatternSyntaxException;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.Collections;
+import java.util.Map;
+
+/**
+ * 用户自定义正则校验端点：客户端同时提交正则与待校验值。
+ * ReDoS(CWE-400) 防御：RE2J 线性时间引擎 + 双重长度上限。
+ */
+@RestController
+public class RegexValidationController {
+
+    static final int MAX_PATTERN_LENGTH = 128;
+    static final int MAX_INPUT_LENGTH = 4096;
+
+    @GetMapping("/validate")
+    public Map<String, Boolean> validate(@RequestParam String pattern,
+                                         @RequestParam String value) {
+        if (pattern.length() > MAX_PATTERN_LENGTH || value.length() > MAX_INPUT_LENGTH) {
+            return Collections.singletonMap("valid", false);
+        }
+        boolean ok;
+        try {
+            ok = Pattern.compile(pattern).matcher(value).matches();
+        } catch (PatternSyntaxException e) {
+            ok = false;
+        }
+        return Collections.singletonMap("valid", ok);
+    }
+}
+```
+
+1. 第 1 步（核心特征）：本类核心特征是不可信输入驱动无界资源消耗——第 23-24 行客户端同时提交正则表达式与待匹配文本，第 30 行在服务端编译并执行该正则。若使用 java.util.regex 的回溯引擎，攻击者可用嵌套量词模式（如 `(a+)+`、`(a|a)*`、`(a|aa)+`）配合极短输入触发指数级回溯，单请求即可耗尽 CPU。这是 CWE-400 资源消耗（ReDoS），不是注入或越权：数据不越界、不落库，危害仅为计算失控。
+
+2. 第 2 步（输入点穷举与可达性）：外部输入点穷举——本模块唯一入口为第 22 行 `GET /validate`，外部输入恰为第 23 行 `pattern` 与第 24 行 `value` 两个 `@RequestParam`；二者无任何中间转发，直达第 30 行 sink（`Pattern.compile(pattern).matcher(value).matches()`），可达性成立，因此防御必须且只需覆盖这两条 source→sink 流。
+
+3. 第 3 步（防御类型正确性）：第 3 行导入的是 `com.google.re2j.Pattern`（RE2J，RE2 的 Java 移植）而非 `java.util.regex.Pattern`。RE2J 基于自动机实现，保证 O(n×m) 线性时间且完全不做回溯，从引擎结构上使灾难性回溯不可表达——对比黑名单式过滤（如仅禁止 `(a+)+` 字面量），攻击者可用 `(a|aa)+`、`(.*)*`、`(x+x+)+y` 等等价变体绕过，而引擎级防御对所有语法统一免疫；第 29-33 行 try/catch 捕获 `PatternSyntaxException`，同时兜住 RE2J 不支持的语法（反向引用、环视），避免异常外泄为 500 影响可用性。
+
+4. 第 4 步（防御位置与覆盖面）：第 25 行在 sink 之前、控制器信任边界处实施双长度上限（pattern≤128、value≤4096），是到达第 30 行的必经之路。线性引擎成本为 O(模式长×输入长)，第 25 行恰好把两个因子都钉住——单靠长度上限在回溯引擎下仍可被短模式长回溯击穿，单靠 RE2J 不限长仍可被超大输入放大常数成本，二者互补才构成完整覆盖；两条流（pattern→compile、value→matcher）分别被这两个上限覆盖，无遗漏分支。
+
+5. 第 5 步（第二入口/替代通道检查）：全模块仅第 22 行一个路由映射，`Pattern.compile` 在文件中仅第 30 行一处调用，无其他 public 方法、无反射或间接调用、无 service 层二次入口；任何到达 sink 的请求必须经过第 25 行守卫。结论：无第二入口、无绕过通道，防御的类型/位置/覆盖三项均成立，判定为安全实现。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点穷举：唯一入口为第22行 GET /validate，外部输入为第23行 pattern 与第24行 value，二者直达第30行 Pattern.compile(...).matcher(value).matches() 这一 CPU 消耗 sink；防御一（类型正确）：第3行使用 RE2J 线性时间引擎替代 java.util.regex 回溯引擎，无回溯机制使 (a+)+、(a|a)* 等嵌套量词的指数爆炸在结构上不可能，优于可被 (a|aa)+ 等变体绕过的黑名单过滤；防御二（位置与覆盖正确）：第25行在信任边界、sink 之前对 pattern 限长128、value 限长4096，线性成本 O(模式长×输入长) 的两个因子均被上界约束，两条 source→sink 流全部覆盖；第29-33行 try/catch 兜住 PatternSyntaxException，非法或不支持的语法不致 500；第二入口检查：Pattern.compile 全文件仅第30行一处、仅一个路由、无反射或间接调用，所有请求必经第25行守卫，故无 CWE-400 风险", "fix_suggestion": "no fix needed"}
+```
