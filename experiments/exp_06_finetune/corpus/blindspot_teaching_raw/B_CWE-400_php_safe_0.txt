@@ -1,0 +1,66 @@
+LANG: php
+```code
+<?php
+
+declare(strict_types=1);
+
+namespace App\Validation;
+
+use RuntimeException;
+
+/**
+ * Input-validation module: runs a user-submitted regex against a value on the server.
+ * ReDoS (CWE-400) hardening: pattern/subject length caps, a dedicated PCRE
+ * backtrack/recursion budget, and fail-closed handling of PCRE errors.
+ */
+final class UserPatternMatcher
+{
+    private const MAX_PATTERN_LEN = 128;
+    private const MAX_SUBJECT_LEN = 4096;
+    private const BACKTRACK_LIMIT = 1000;
+    private const RECURSION_LIMIT = 1000;
+
+    /** Sole public entry point; both fields come straight from the HTTP request. */
+    public function check(array $request): bool
+    {
+        $pattern = (string) ($request['pattern'] ?? '');
+        $subject = (string) ($request['subject'] ?? '');
+
+        if (mb_strlen($pattern) > self::MAX_PATTERN_LEN) {
+            throw new RuntimeException('pattern exceeds 128 chars');
+        }
+        if (mb_strlen($subject) > self::MAX_SUBJECT_LEN) {
+            throw new RuntimeException('subject exceeds 4096 chars');
+        }
+
+        $oldBt = ini_get('pcre.backtrack_limit');
+        $oldRc = ini_get('pcre.recursion_limit');
+        ini_set('pcre.backtrack_limit', (string) self::BACKTRACK_LIMIT);
+        ini_set('pcre.recursion_limit', (string) self::RECURSION_LIMIT);
+        try {
+            $result = @preg_match($pattern, $subject);
+            if ($result === false || preg_last_error() !== PREG_NO_ERROR) {
+                return false; // backtrack/recursion budget exhausted or bad pattern: fail closed
+            }
+            return $result === 1;
+        } finally {
+            ini_set('pcre.backtrack_limit', $oldBt);
+            ini_set('pcre.recursion_limit', $oldRc);
+        }
+    }
+}
+```
+
+第1步（类别核心特征）：本类对应 CWE-400 的典型形态——不可信输入驱动无界资源消耗，具体为 ReDoS：第39行 `@preg_match($pattern, $subject)` 是资源消耗 sink，若直接执行用户提交的嵌套量词模式（如 `(a+)+$`、`(a|a)*b`），PCRE 回溯步数随 subject 长度指数增长，单个请求即可耗尽 CPU；深嵌套括号还会通过递归消耗栈空间。这是资源消耗问题，与 SQL 注入、XSS、越权等注入/访问控制类别无关。
+
+第2步（输入点枚举与可达性）：外部输入仅两处——第24行 `$request['pattern']`（用户正则）与第25行 `$request['subject']`（被检串），均直接取自 HTTP 请求数组、无中间转义层，在同一次 check() 调用内直达第39行 sink，两条 source→sink 数据流均可达，必须逐条验证防御。
+
+第3步（pattern 流防御验证）：第27-29行对 pattern 施加 128 字符硬上限——类型正确（资源总量限制，不是黑名单/正则/字符串替换这类可绕过过滤），位置正确（唯一入口内、sink 之前），覆盖完整（每次调用必经）。但 `(a+)+$` 仅 6 字符即可触发灾难性回溯，长度上限单独不充分，因此第36-37行在执行前把 `pcre.backtrack_limit` 与 `pcre.recursion_limit` 收紧到 1000：这是运行时资源配额型防御，回溯/递归步数被硬性封顶，攻击者无法通过构造输入绕过，任何模式的最坏执行时间恒为常数级。
+
+第4步（subject 流防御与失败处理）：第30-32行对 subject 施加 4096 字符上限，限制喂给引擎的输入规模，与回溯预算构成纵深防御；第40-42行在 preg_match 返回 false 或 `preg_last_error()` 非 `PREG_NO_ERROR` 时直接返回 false——预算耗尽（`PREG_BACKTRACK_LIMIT_ERROR`/`PREG_RECURSION_LIMIT_ERROR`）或模式编译失败都走失败即拒绝路径，不重试、不留下可被重放放大的异常通道；第44-47行 finally 恢复原 ini 值，收紧的预算只作用于本次执行，既不泄漏到后续请求，也不会被其他代码放宽。
+
+第5步（第二入口/替代通道结论）：全文件仅第22行 check() 一个公开方法，`preg_match` 仅在第39行出现一次；不存在其他路由、其他参数名、`eval` 或 `preg_replace` 的 /e 修饰符等替代执行通道，也没有把 pattern 缓存或转交其他组件的旁路。两条数据流的防御在类型、位置、覆盖面三方面均成立，最终结论：无 CWE-400 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "外部输入点共两处：第24行请求字段 pattern 与第25行请求字段 subject，二者在同一次 check() 调用中直达第39行 preg_match 这一资源消耗 sink，可达性成立；pattern 流防御：第27-29行 128 字符硬上限属资源总量限制型防御而非可绕过的黑名单/正则/字符串替换过滤，位于唯一入口且先于 sink，但 (a+)+$ 这类短灾难模式仍可通过长度检查，故第36-37行在执行前将 pcre.backtrack_limit 与 pcre.recursion_limit 收紧至 1000，为 PCRE 回溯与递归步数设定硬预算，任何模式的最坏执行时间被钳制为常数级；subject 流防御：第30-32行 4096 字符上限限制喂给引擎的输入规模，与回溯预算构成纵深防御；第40-42行对 preg_match 返回 false 或 preg_last_error 非 PREG_NO_ERROR 的情形失败即拒绝，预算耗尽或模式编译失败均返回 false 且不重试；第44-47行 finally 恢复原 ini 值，收紧的预算仅作用于本次执行；第二入口检查：全文件仅第22行 check() 一个公开方法，preg_match 仅在第39行出现一次，不存在其他路由、参数名或 eval/preg_replace 等替代执行通道，两条数据流的防御在类型、位置、覆盖面三方面均完整，判定无 CWE-400 风险", "fix_suggestion": "no fix needed"}
+```

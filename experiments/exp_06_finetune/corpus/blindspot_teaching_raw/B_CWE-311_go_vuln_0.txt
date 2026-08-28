@@ -1,0 +1,66 @@
+LANG: go
+```code
+package reset
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+)
+
+// notifyURL 内网通知服务地址
+const notifyURL = "http://notify.internal.example.com/v1/mail"
+
+// ResetHandler 处理 POST /reset 密码重置请求：校验表单后把新密码下发给用户。
+func ResetHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	email := r.FormValue("email")
+	newPassword := r.FormValue("new_password")
+	if email == "" || len(newPassword) < 8 {
+		http.Error(w, "invalid input", http.StatusBadRequest)
+		return
+	}
+	if err := sendResetMail(email, newPassword); err != nil {
+		http.Error(w, "notify failed", http.StatusBadGateway)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "password reset done")
+}
+
+// sendResetMail 组装邮件正文并调用通知服务发送。
+func sendResetMail(email, newPassword string) error {
+	body, _ := json.Marshal(map[string]string{
+		"to":      email,
+		"subject": "Your new password",
+		"text":    "Your new password is: " + newPassword,
+	})
+	resp, err := http.Post(notifyURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("notify service status: %d", resp.StatusCode)
+	}
+	return nil
+}
+```
+
+第 1 步（类别定性）：CWE-311 的核心特征是敏感数据（密码/令牌/密钥/PII）以明文形态跨越信任边界——或经明文信道传输，或明文落盘。本例属于前者：第 11 行把内网通知服务地址硬编码为 http:// 明文协议，第 40 行 http.Post 携带含用户新密码的请求体经该明文信道出站。数据格式合法、送达对象正确，全程不存在命令/SQL/模板解释过程，也与鉴权或越权无关，因此该形态应判定为 CWE-311 Missing Encryption of Sensitive Data，而非注入或访问控制类缺陷。
+
+第 2 步（输入点枚举与可达性）：本模块的外部输入共两处，均来自 POST /reset 表单体：第 19 行 email := r.FormValue("email")（用户 PII）与第 20 行 newPassword := r.FormValue("new_password")（凭据）。二者在第 25 行作为实参传入 sendResetMail，形参未经任何转换直接进入第 35-39 行的 JSON 构造，并在第 40 行到达 http.Post 这个 sink——两条输入到 sink 的路径连续可达。
+
+第 3 步（主数据流追踪）：流1（新密码）：第 20 行取得明文新密码 → 第 25 行传入 sendResetMail → 第 38 行以字符串拼接写入 JSON 的 text 字段（'Your new password is: ' + newPassword，未加密、未哈希、未令牌化）→ 第 40 行 http.Post 按第 11 行的 http:// 目标发出。密码以明文跨越进程与网络信任边界，链路嗅探、中间代理或内网旁路者均可被动读取，等同于凭据直接泄露。
+
+第 4 步（防御有效性逐流核查）：流2（email）：第 19 行 → 第 36 行 to 字段 → 第 40 行，与流1 共用同一明文请求体，PII 同样明文出站。两条流上仅存在第 15 行的 HTTP 方法校验与第 21 行的非空/长度校验，二者属于输入合法性检查，位置在进入业务逻辑之前、覆盖面仅限格式，不提供任何机密性保护：既未启用 TLS，也未对数据加密或替换为一次性令牌；全文件无 crypto/tls、无任何加密调用。且此类问题本质上无法靠黑名单/正则/字符串替换过滤弥补（即便部署也会被绕过），故两条流均确认无有效防御。
+
+第 5 步（第二入口/替代通道检查）：本文件内 sendResetMail 仅在第 25 行被唯一调用，不存在其他路由、其他参数路径或接口/goroutine 间接调用可达第 40 行的 sink；也未发现将敏感数据写入日志、文件或数据库的替代落盘通道。结论：单一入口 POST /reset 已完整构成 source→sink 链路，漏洞成立，判定为 CWE-311，风险等级 High（明文传输用户凭据，可被被动嗅探直接利用）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-311 Missing Encryption of Sensitive Data", "risk_level": "High", "source": "line 20: newPassword := r.FormValue('new_password')（辅以 line 19 的 email PII 输入）", "sink": "line 40: http.Post(notifyURL, 'application/json', bytes.NewReader(body)) 将含明文新密码的请求体经 http:// 外发", "explanation": "流1: line 20 新密码输入 -> line 25 传入 sendResetMail -> line 38 拼入 JSON text 字段 -> line 40 经 line 11 的 http:// 明文信道外发，凭据全程未加密；流2: line 19 email（PII）沿同一参数路径进入 line 36 的 to 字段并随同一明文请求体外发；防御核查: line 15 方法校验与 line 21 非空/长度校验仅为输入合法性检查，不提供机密性，全文件无 TLS/加密/令牌化措施，两条流均无有效防御；第二入口核查: sendResetMail 仅被 line 25 唯一调用，无其他路由/参数/间接调用可达 sink，单一入口已足以确认漏洞成立", "fix_suggestion": "line 11: 将 notifyURL 的 scheme 由 http:// 改为 https://（http.Post 默认客户端即启用带证书校验的 TLS），使新密码仅经加密信道传输；进一步建议改为下发一次性重置令牌链接而非明文密码"}
+```

@@ -1,0 +1,74 @@
+LANG: go
+```code
+package validation
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/dlclark/regexp2"
+)
+
+// rulePayload is submitted by tenants via the dashboard to define custom
+// field-validation rules for their ingestion pipelines.
+type rulePayload struct {
+	Field     string `json:"field"`
+	Pattern   string `json:"pattern"`
+	TestValue string `json:"test_value"`
+}
+
+// PreviewRuleHandler handles POST /api/v1/validation/rules/preview.
+// It compiles the tenant-supplied pattern and runs it against the supplied
+// test value so the tenant can preview the rule result before saving it.
+func PreviewRuleHandler(w http.ResponseWriter, r *http.Request) {
+	var payload rulePayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+	if payload.Pattern == "" {
+		http.Error(w, `{"error":"pattern required"}`, http.StatusBadRequest)
+		return
+	}
+	// regexp2 (a .NET-style backtracking engine) is used instead of the stdlib
+	// RE2 regexp so tenants can use lookarounds and backreferences in rules.
+	rule, err := regexp2.Compile(payload.Pattern, regexp2.None)
+	if err != nil {
+		http.Error(w, `{"error":"pattern does not compile"}`, http.StatusBadRequest)
+		return
+	}
+	matched, err := rule.MatchString(payload.TestValue)
+	if err != nil {
+		http.Error(w, `{"error":"match failed"}`, http.StatusInternalServerError)
+		return
+	}
+	status := "no_match"
+	if matched {
+		status = "match"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"result":"` + status + `"}`))
+}
+```
+
+1. **本类核心特征（第 33、38 行）**：CWE-400 的本质是不可信输入驱动无界资源消耗（CPU/时间/内存），而非数据落入命令或查询解释器。本例第 33 行把租户提交的正则原样交给 regexp2 编译、第 38 行执行匹配；regexp2 是 .NET 风格的**回溯引擎**（为支持 lookaround/反向引用而选），嵌套量词模式（如 `(a+)+`、`(a|a)*`）在回溯引擎上会产生指数级匹配路径，属典型灾难性回溯 ReDoS 形态。注意 Go 标准库 regexp 是 RE2 线性引擎、天然免疫此类攻击，风险恰恰来自选用回溯引擎且未设超时。明确排除：这不是命令注入/SQL 注入/越权——正则内容不进入任何命令通道，危害仅为资源耗尽。
+
+2. **输入点枚举与可达性（第 21-23 行）**：唯一 HTTP 入口为第 21 行 `PreviewRuleHandler`（POST /api/v1/validation/rules/preview，见第 18 行注释）；第 23 行 `json.Decode` 从请求体解析出全部外部输入：Field（第 13 行，声明后从未使用，非数据流）、Pattern（第 14 行）、TestValue（第 15 行）。可达性：Pattern 于第 33 行进入 `regexp2.Compile`，其返回值在第 38 行被执行匹配；TestValue 直接作为第 38 行 `MatchString` 的实参。两条 source→sink 路径在同一次请求内直达 sink，中间无任何变换或校验层。
+
+3. **逐流防御验证（第 27、34 行）**：流1（第 14 行→第 33 行→第 38 行）仅有第 27 行的空串检查和第 34 行的编译错误检查，二者均不限制模式长度、嵌套量词或回溯复杂度；流2（第 15 行→第 38 行）对被匹配文本无任何长度上限或内容过滤。整个 handler 未设置 regexp2 的 `MatchTimeout` 字段（默认 0 表示不限时），未用 `r.Context()` 派生超时，也没有并发信号量隔离；即便补一个黑名单关键字过滤（如禁用某些元字符），攻击者仍可用等价语法（字符类、等价嵌套结构）绕过，按规则不计为有效防御。故两条流均处于无防御状态。
+
+4. **资源消耗点与攻击效果（第 38 行）**：第 38 行是主 sink——攻击者提交 Pattern=`(a+)+$`、TestValue=30 个 'a' 后接 '!'，匹配失败前回溯引擎需探索约 2^30 条路径，单请求即可让当前 goroutine 长时间占满一个 CPU 核；net/http 为每请求单 goroutine 且本 handler 无超时，少量并发恶意请求即可耗尽整机 CPU，令所有租户的校验请求不可用。次要通道：第 23 行解码前未用 `http.MaxBytesReader` 限制请求体，超长 JSON 同样造成内存放大，与主链同属 CWE-400；第 33 行编译超长模式亦有内存开销，但主消耗点在第 38 行。
+
+5. **第二入口/替代通道检查**：本文件仅暴露 `PreviewRuleHandler` 一个入口，`regexp2.Compile`/`MatchString` 在模块内无其他调用点；不存在查询参数、Header 或其他路由把数据送入正则引擎；Field 字段是死输入，不构成通道。结论：单一入口即已构成完整可利用路径，不存在“缺少第二入口故不可利用”的减损情形，最终判定存在 CWE-400 Uncontrolled Resource Consumption，风险 High。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-400 Uncontrolled Resource Consumption",
+  "risk_level": "High",
+  "source": "line 14: payload.Pattern（租户提交的正则模式，配套输入 line 15: payload.TestValue）",
+  "sink": "line 38: rule.MatchString(payload.TestValue) 回溯匹配执行",
+  "explanation": "流1: line 23 JSON 解码取得 payload.Pattern -> line 33 regexp2.Compile 编译 -> line 38 MatchString 执行, 无复杂度/长度限制; 流2: line 15 payload.TestValue -> line 38 直接作为被匹配文本, 攻击者同时控制模式与输入; 防御核查: 仅有 line 27 空串检查与 line 34 编译错误检查, 未设置 MatchTimeout(默认0=不限时), 无 context 超时与并发隔离, 黑名单式过滤可用等价语法绕过故不算有效防御; 攻击形态: 嵌套量词如 (a+)+$ 配合 30 个 a 加 ! 的文本触发指数级回溯, 单请求占满一个核, 少量并发即耗尽 CPU, 属不可控资源消耗而非注入/越权; 次要通道: line 23 未用 http.MaxBytesReader 限制请求体, 超长 JSON 造成内存放大, 同属本类; 第二入口检查: 模块内仅 PreviewRuleHandler 一个入口, 无其他路由/参数/间接调用进入 regexp2, Field 为死输入, 单一入口即可完成攻击, 结论成立",
+  "fix_suggestion": "line 33: 编译后立即设置 rule.MatchTimeout = 500 * time.Millisecond（regexp2 默认 0 为不限时）并对 pattern 长度设上限；若无需 lookaround/反向引用，改用标准库 regexp（RE2 线性引擎）可根除此类回溯"
+}
+```

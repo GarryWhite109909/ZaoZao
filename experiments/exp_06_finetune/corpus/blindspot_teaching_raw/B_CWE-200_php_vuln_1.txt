@@ -1,0 +1,73 @@
+LANG: php
+```code
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Models\User;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Routing\Controller;
+
+class ProfileController extends Controller
+{
+    // GET /api/v1/users/{id} —— 用户资料接口
+    public function show(Request $request, int $id): JsonResponse
+    {
+        $user = User::findOrFail($id);
+
+        $payload = [
+            // 注意: App\Models\User 未定义 $hidden，toArray() 会带出全部列
+            'user' => $user->toArray(),
+            'meta' => [
+                'php_version'   => PHP_VERSION,
+                'framework'     => app()->version(),
+                'document_root' => $_SERVER['DOCUMENT_ROOT'],
+                'db_connection' => config('database.connections.mysql'),
+            ],
+        ];
+
+        if ($request->query('debug') === '1') {
+            $payload['debug'] = [
+                'app_key'  => config('app.key'),
+                'env'      => config('app.env'),
+                'mail_dsn' => config('mail.mailers.smtp'),
+            ];
+        }
+
+        return response()->json($payload);
+    }
+
+    // GET /api/v1/users?role=admin —— 列表接口复用同一序列化方式
+    public function index(Request $request): JsonResponse
+    {
+        $role = $request->query('role', 'user');
+
+        $users = User::where('role', $role)->get();
+
+        return response()->json(['users' => $users->toArray()]);
+    }
+}
+```
+
+1. 本类核心特征：CWE-200 的要点是“敏感信息对不可信方暴露”——数据获取与响应流程本身合法，问题在于返回内容里夹带了不该给客户端看的字段。第 19 行 `$user->toArray()` 把整个 Eloquent 实体全量序列化（模型未定义 `$hidden`，password/remember_token/api_key 列原样带出），第 36 行直接写入 HTTP 响应；第 24 行把数据库连接配置、第 30 行把加密根密钥 APP_KEY 一并回显。这是典型的敏感信息暴露形态，不是命令注入/SQL 注入（无任何拼接执行或查询构造），也不是越权类（CWE-862 关注访问控制缺失，此处核心缺陷是返回内容本身含敏感字段）。
+
+2. 外部输入点全量枚举与可达性：① 第 13 行路由参数 `{id}`，经第 15 行 `User::findOrFail($id)` 决定加载哪个用户的完整记录，任意有效 id 均可达第 36 行的响应出口；② 第 28 行查询参数 `debug`，客户端可控，命中即把第 30-32 行的密钥/环境/邮件 DSN 加入响应体；③ 第 42 行查询参数 `role`，决定第 44 行查询范围，间接控制第 46 行批量暴露哪些用户；④ 第 23 行 `$_SERVER['DOCUMENT_ROOT']` 与第 21-22 行版本号虽源自服务端，但被无条件写入对外响应。四条输入全部可达 sink。
+
+3. 逐条数据流防御验证：流1（id→实体→第 19 行 toArray→第 36 行 json）在第 15 行到第 36 行之间不存在字段白名单、不存在 JsonResource/DTO 转换层、模型无 `$hidden`、无任何脱敏或加密——防御完全缺失；流2（debug→config 回显）第 28 行的 `=== '1'` 判断只是客户端自带的开关，不是认证/授权检查，对暴露零防御作用；流3（第 21-24 行固定 meta 回显）无任何条件与过滤；流4（role→第 46 行列表序列化）与流1 同构。整个文件连黑名单/正则/字符串替换这类“可绕过过滤”都不存在，防御覆盖面为零。
+
+4. 暴露内容危害定级：第 19 行带出的 password 列为密码哈希（可离线爆破）、remember_token 可伪造登录态、api_key 可直接冒用身份；第 24 行 `config('database.connections.mysql')` 含数据库主机/用户名/密码；第 30 行 APP_KEY 是 Laravel 加密与签名的根密钥，泄露后可解密或伪造加密 cookie；第 23 行绝对路径与版本信息为后续攻击提供侦察价值。任一单项即构成高危信息暴露。
+
+5. 第二入口/替代通道检查结论：存在第二入口——同文件第 40 行 `index()` 挂载于 `GET /api/v1/users`，第 46 行 `$users->toArray()` 复用同一全量序列化模式，批量暴露多个用户的敏感列；存在替代触发通道——第 28 行 debug 参数无需任何特权即可开启密钥回显。两条通道与主链共享“实体直接序列化、配置直接回显”的根因且均无防御，支持最终结论：存在 CWE-200 漏洞，风险等级 High。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-200 Exposure of Sensitive Information",
+  "risk_level": "High",
+  "source": "line 15: User::findOrFail($id) 加载完整 User 实体（含 password/remember_token/api_key 敏感列）",
+  "sink": "line 36: response()->json($payload) 将未过滤实体字段与内部配置写入对外 HTTP 响应",
+  "explanation": "流1: 路由参数 id（line 13）经 line 15 findOrFail 选定实体，line 19 toArray() 全量序列化（模型未定义 $hidden），line 36 返回给任意未认证客户端，全程无字段白名单/DTO 转换/脱敏，防御缺失; 流2: 查询参数 debug（line 28）为客户端可控开关而非防御，命中后 line 30-32 回显 config('app.key') 加密根密钥、app.env 与 SMTP 凭据; 流3: line 21-24 无条件回显 PHP_VERSION、框架版本、$_SERVER['DOCUMENT_ROOT'] 绝对路径及 config('database.connections.mysql') 数据库连接串（含用户名/密码）; 流4（第二入口）: line 42 role 参数经 line 44 查询在 line 46 对多用户复用同一全量序列化; 各流均无有效防御，属敏感信息对不可信方暴露（CWE-200），非注入或越权类",
+  "fix_suggestion": "line 19: 在 App\Models\User 中声明 protected $hidden = ['password', 'remember_token', 'api_key']; 并移除 line 21-24 与 line 29-33 的 meta/debug 内部配置回显（连接串、APP_KEY、路径、版本仅写服务端日志）"
+}
+```

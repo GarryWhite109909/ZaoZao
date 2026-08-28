@@ -96,7 +96,7 @@ FAMILIES = {
             "批量任务接口（用户指定条数的循环处理无上限）",
         ],
         "teach": re.compile(r"回溯|ReDoS|资源|耗尽|复杂度|上限|深度", re.I),
-        "vuln_ev": re.compile(r"\(\w+[+*]\)[+*]|\(\w+\|\w+\)\*|\{[0-9]+,\}|while\s*\(|for\s*\(|extract|unzip|decompress|递归|recurse", re.I),
+        "vuln_ev": re.compile(r"\([^)]*\w[+*?]?\)[+*?]?|\[.*for .* in |while\s*[({]|for\s*[(\[]|range\(|extract|unzip|decompress|\{(0|[0-9]+),\}|\|\w+\|", re.I),
         "safe_ev": re.compile(r"上限|max_len|limit|长度限制|惰性|原子组|possessive|atomic|非贪婪|深度限制|max_depth|配额", re.I),
     },
     "CWE-1427": {
@@ -145,7 +145,7 @@ FAMILIES = {
             "支付回调（把网关原始报错透传给客户端）",
         ],
         "teach": re.compile(r"错误信息|报错|堆栈|异常|泄露|错误消息", re.I),
-        "vuln_ev": re.compile(r"str\(e\)|e\.message|getMessage|err\.Error\(\)|\.Error\(\)|exception|Exception|error\.message", re.I),
+        "vuln_ev": re.compile(r"str\(e\)|e\.message|getMessage|err\.Error\(\)|\.Error\(\)|exception|Exception|error\.message|\b(err|e|error|ex)\.(message|sql|stack|sqlState|errno|statusText|details)|\b\.stack\b|errno|err\.sql", re.I),
         "safe_ev": re.compile(r"log|logger|logging|通用|generic|internal error|服务端|详细", re.I),
     },
 }

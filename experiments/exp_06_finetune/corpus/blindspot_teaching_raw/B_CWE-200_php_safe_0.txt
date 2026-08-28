@@ -1,0 +1,66 @@
+LANG: php
+```code
+<?php
+
+namespace App\Export;
+
+use App\Repository\ProductRepository;
+use App\Security\ExportAuthorizer;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+
+/** Streams the product catalogue as CSV; cost_price/supplier_margin stay internal. */
+final class ProductCsvExporter
+{
+    /** Whitelist: the ONLY columns that may ever be serialised. */
+    private const ALLOWED_FIELDS = [
+        'sku'        => 'SKU',
+        'name'       => 'Product Name',
+        'list_price' => 'List Price',
+        'stock'      => 'Stock',
+    ];
+
+    public function __construct(
+        private readonly ProductRepository $products,
+        private readonly ExportAuthorizer $authorizer,
+    ) {
+    }
+
+    public function handle(Request $request): StreamedResponse
+    {
+        $this->authorizer->assertCanExport($request);
+        $requested = array_filter(explode(',', (string) $request->query->get('fields', '')));
+        $columns = array_intersect_key(self::ALLOWED_FIELDS, array_flip($requested));
+        if ($columns === []) {
+            $columns = self::ALLOWED_FIELDS;
+        }
+
+        $response = new StreamedResponse();
+        $response->headers->set('Content-Type', 'text/csv; charset=UTF-8');
+        $response->setCallback(function () use ($columns): void {
+            $out = fopen('php://output', 'w');
+            fputcsv($out, array_values($columns));
+            foreach ($this->products->findAllForExport() as $row) {
+                fputcsv($out, array_values(array_intersect_key($row, $columns)));
+            }
+            fclose($out);
+        });
+
+        return $response;
+    }
+}
+```
+
+1. **核心特征定位**：本类对应 CWE-200 的典型形态——敏感信息对不可信方暴露：导出接口把数据库行序列化进 HTTP 响应体（第 41-42 行），风险在于内部定价列 `cost_price`/`supplier_margin`（第 10 行注释明示为 internal-only）是否会随 CSV 流出。这不是注入（无 SQL/命令/模板解释过程），也不是越权（CWE-862 关注“能否调用功能”，而第 29 行已有授权门；本类的问题域是“响应里返回哪些字段”）。
+
+2. **输入点枚举与可达性**：本文件外部输入点共两处。①第 30 行 `$request->query->get('fields')` 查询参数，完全用户可控，经 explode/array_flip 进入第 31 行交集运算，并决定第 40/42 行 fputcsv 输出哪些列——可达 sink；②第 29 行整个 Request 传入 `ExportAuthorizer->assertCanExport`，仅消费身份信息做授权判定，无数据路径进入响应体——不可达 sink。敏感数据源是第 41 行 `findAllForExport()` 返回的含内部定价列的数据库行（非外部输入，但为暴露风险源头）。
+
+3. **流 1 验证（fields 参数 → 列选择 → fputcsv）**：防御为第 31 行 `array_intersect_key(self::ALLOWED_FIELDS, array_flip($requested))`。类型正确：以第 14-19 行编译期常量为基准做白名单交集（默认拒绝），攻击者传 `fields=cost_price,supplier_margin` 时这些键不在白名单中被直接丢弃；位置正确：位于列集合确定的唯一汇聚点，先于两处输出；覆盖完整：第 32-34 行把空交集回退到完整白名单，不存在空集或异常旁路，且白名单本身不受请求影响。对比黑名单 unset、正则剔除、字符串替换均可被别名/新增列绕过，本防御不属于可绕过类型。
+
+4. **流 2 验证（数据库行 → fputcsv）**：第 42 行 `array_intersect_key($row, $columns)` 在序列化前最后一跳按同一白名单过滤每行，`cost_price`/`supplier_margin` 物理上不会进入 fputcsv 的第二个参数；第 40 行表头输出同样只含白名单标签，无旁路。这是默认拒绝型白名单：即使仓储层未来新增敏感列（如 internal_note），未显式加入第 14-19 行常量并经代码评审前一律被剔除；第 39 行 `fopen('php://output')` 只接收 fputcsv 写入的内容，不存在原始行直通。
+
+5. **第二入口/替代通道检查**：本模块唯一公共入口是第 27 行 `handle()`，闭包仅由 StreamedResponse 在响应发送时触发（第 38 行）；文件内无其他路由、无 JSON/调试序列化分支、无 dump/var_export/日志回显行数据；授权失败时第 29 行抛出异常，发生在任何数据获取之前，异常路径也不携带行数据。结论：不存在绕过白名单的第二入口或替代通道，防御类型、位置、覆盖面均完整，无 CWE-200 敏感信息暴露。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点枚举: 第30行HTTP查询参数fields用户可控, 经explode/array_flip进入第31行交集运算并决定第40/42行fputcsv输出哪些列, 可达sink; 第29行Request对象仅传入ExportAuthorizer做授权判定, 无数据路径进入响应体; 敏感源为第41行findAllForExport()返回的含cost_price/supplier_margin内部定价列的数据库行; 流1防御: 第31行array_intersect_key以第14-19行编译期常量白名单ALLOWED_FIELDS为基准做默认拒绝, 传入cost_price等未白名单键被直接丢弃, 交集为空时第32-34行回退完整白名单, 防御类型为白名单而非黑名单/正则/字符串替换, 位置在列集合唯一汇聚点且先于两处输出, 覆盖完整; 流2防御: 第42行array_intersect_key($row, $columns)在序列化前最后一跳按同一白名单过滤每行, 敏感列物理上不进入fputcsv, 第40行表头同样只含白名单标签, 未来新增敏感列默认被剔除; 第二入口检查: 本文件唯一公共入口为第27行handle(), 闭包仅由StreamedResponse触发, 无其他路由/JSON分支/调试回显, 授权异常发生在数据获取前且不携带行数据, 不存在绕过白名单的替代通道, 结论: 无CWE-200敏感信息暴露", "fix_suggestion": "no fix needed"}
+```

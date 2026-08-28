@@ -1,0 +1,64 @@
+LANG: javascript
+```code
+'use strict';
+
+const express = require('express');
+const crypto = require('crypto');
+const axios = require('axios');
+const nodemailer = require('nodemailer');
+const User = require('../models/user');
+
+const router = express.Router();
+
+// 明文 SMTP 传输器：25 端口、secure:false、不校验证书
+const mailer = nodemailer.createTransport({
+  host: 'smtp.internal.example.com',
+  port: 25,
+  secure: false,
+  tls: { rejectUnauthorized: false }
+});
+
+// 密码重置：生成令牌并经明文信道分发
+router.post('/forgot-password', async (req, res) => {
+  const email = req.body.email;
+  const user = await User.findOne({ where: { email } });
+  if (!user) {
+    return res.status(404).json({ error: 'user not found' });
+  }
+
+  const resetToken = crypto.randomBytes(32).toString('hex');
+  await user.update({ resetToken, resetTokenExpiry: Date.now() + 3600000 });
+
+  // 通道一：令牌明文写入 SMTP 邮件
+  await mailer.sendMail({
+    from: 'noreply@example.com',
+    to: email,
+    subject: 'Reset your password',
+    text: 'Your reset token: ' + resetToken
+  });
+
+  // 通道二：令牌经 http:// 明文转发给内部通知服务
+  await axios.post('http://notify.internal.example.com/reset', {
+    userId: user.id,
+    token: resetToken
+  });
+
+  return res.json({ message: 'reset instructions sent' });
+});
+
+module.exports = router;
+```
+
+1. **第 1 步（本类核心特征）**：CWE-311 的判定要点是敏感数据在跨信任边界时既未加密也未哈希。本文件中，等同凭据的密码重置令牌以三种明文形态跨边界：第 35 行拼入邮件正文、经第 12-17 行无 TLS 的 SMTP 信道发出；第 41 行放入 http:// 出站请求体；第 28 行明文落库。这与注入类完全不同：第 21 行的外部输入 email 只进入第 22 行 ORM 参数化查询与第 33 行收件人字段，没有任何字符串被拼进命令、SQL 或代码解释器，故排除 CWE-78/89/94，问题本质是机密性保护缺失。
+
+2. **第 2 步（输入点枚举与可达性）**：外部输入点仅一处——第 21 行 req.body.email，是唯一攻击者可控输入，但它只作为查询键和收件人，本身不是秘密；真正的敏感数据是第 27 行服务端生成的 resetToken，它不依赖外部输入即属敏感。从第 20 行路由入口起，每个 POST /forgot-password 请求都无条件把令牌送达三个 sink：第 28 行（落库）、第 35 行（邮件正文）、第 41 行（http 请求体），可达性 100%。
+
+3. **第 3 步（逐流防御核验）**：流A（第 27→28 行）：ORM update 直接写原始令牌，无任何哈希/加密调用；流B（第 27→35 行，经第 31-36 行 sendMail）：传输器第 14 行用 25 端口、第 15 行 secure:false 表示无隐式 TLS，第 16 行 rejectUnauthorized:false 即使发生 opportunistic STARTTLS 也接受任意证书，链路等同明文；流C（第 27→41 行，经第 39 行 axios.post）：目标硬编码为 http://，全程无 TLS。全文件不存在任何白名单/正则/过滤逻辑（也就不存在可绕过的伪防御），第 23-25 行的用户存在性检查只是业务前置条件，与机密性无关——三条流均无有效防御。
+
+4. **第 4 步（危害链）**：能嗅探应用与 smtp.internal.example.com:25 或 notify.internal.example.com:80 之间流量的攻击者，可直接恢复出有效的 32 字节重置令牌，随即调用重置接口接管任意用户账号；数据库被拖走时同样泄露全部在途令牌。第 27 行 crypto.randomBytes 的高熵无法弥补明文传输——熵只防猜测，不防窃听。
+
+5. **第 5 步（第二入口/替代通道检查）**：本模块仅导出一个路由（第 20 行 POST /forgot-password），无其他路由、无其他 req 读取点、无 EventEmitter/消息队列等间接分发令牌的调用；两个 sink 均内联在处理器内，三条明文流在本文件内闭环，无需依赖未证实的替代路径即可确认 CWE-311 成立，风险等级 High（明文信道泄露等同凭据的令牌导致账号接管）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-311 Missing Encryption of Sensitive Data", "risk_level": "High", "source": "line 27: const resetToken = crypto.randomBytes(32).toString('hex') 生成的密码重置令牌", "sink": "line 35: 令牌拼入邮件正文经第 12-17 行 secure:false 的 25 端口 SMTP 明文发出", "explanation": "流A: line 27 令牌 -> line 28 user.update 明文落库, 无哈希或加密; 流B: line 27 令牌 -> line 35 邮件正文 -> line 14 端口25 加 line 15 secure:false 加 line 16 rejectUnauthorized:false 的 SMTP 明文信道, 嗅探即可截获; 流C: line 27 令牌 -> line 41 -> line 39 axios.post 到硬编码 http:// 地址, 无 TLS 明文外发; 防御核查: 三条流全程无加密/哈希, line 23-25 仅为用户存在性业务校验, 不构成机密性防御, 文件内亦无可绕过的过滤伪防御; 第二入口检查: 模块仅导出 line 20 一个路由, 无其他路由/参数/间接调用分发令牌, 三条明文流在本文件内闭环, 结论成立", "fix_suggestion": "line 15: 将 secure 改为 true 并改用 465 端口(或强制 STARTTLS 且 line 16 rejectUnauthorized:true), 同时把 line 39 的 http:// 出站地址改为 https://, 并在 line 28 落库前对令牌做单向哈希"}
+```

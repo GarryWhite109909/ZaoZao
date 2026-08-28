@@ -1,0 +1,65 @@
+LANG: php
+```code
+<?php
+
+declare(strict_types=1);
+
+namespace App\Http\Controllers\Search;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+
+/**
+ * Catalog search: extracts field:value filter tokens from a free-form query.
+ */
+final class SearchFilterController extends Controller
+{
+    private const MAX_QUERY_LENGTH = 256;
+    private const MAX_TOKENS = 16;
+
+    /**
+     * Possessive quantifiers (++) plus the atomic group (?>...) remove
+     * backtracking entirely: each character is consumed at most once, so a
+     * match attempt is O(n). The naive form with nested quantifiers such as
+     * ((\w+\s*)+ would backtrack exponentially on crafted input.
+     */
+    private const TOKEN_RE = '/\b(?>(?P<field>[A-Za-z]++):(?P<value>[A-Za-z0-9_.-]++))/';
+
+    public function search(Request $request): JsonResponse
+    {
+        $query = (string) $request->input('q', '');
+
+        // Defense 1: hard length cap bounds every preg_match subject to 256 chars.
+        if (mb_strlen($query) > self::MAX_QUERY_LENGTH) {
+            return response()->json(['error' => 'query_too_long'], 422);
+        }
+
+        $filters = [];
+        if (preg_match_all(self::TOKEN_RE, $query, $m, PREG_SET_ORDER) > 0) {
+            // Defense 3: cap extracted tokens to bound result memory and downstream cost.
+            foreach (array_slice($m, 0, self::MAX_TOKENS) as $token) {
+                $filters[$token['field']] = $token['value'];
+            }
+        }
+
+        return response()->json(['filters' => $filters]);
+    }
+}
+```
+
+第1步（类别核心特征）：CWE-400 的本质是不可信输入驱动无界资源消耗；在搜索过滤场景下的典型形态是灾难性回溯正则（ReDoS）——当模式含嵌套量词（如 (a+)+、((\w+\s*)+）或交替分支重叠时，回溯状态随输入长度指数增长，单个请求即可耗尽 CPU。它不是注入、越权或反序列化等其他类别。本例的资源消耗点是第 37 行的 preg_match_all，模式定义于第 25 行常量，被匹配文本来自第 29 行的用户输入。
+
+第2步（输入点枚举与可达性）：全文件唯一外部输入点是第 29 行的 $request->input('q','')；该值仅经过长度校验（第 32 行）后即作为第 37 行 preg_match_all 的 subject，source→sink 路径真实可达——这正是漏洞形态所要求的通道，防御必须在这条唯一路径上成立。Request 中没有其他参数、header 或路由占位符参与正则匹配。
+
+第3步（防御一：输入长度上限，第 31–34 行）：类型正确——回溯开销以 subject 长度为乘性因子，256 字符硬上限把最坏情况工作量钳制为常数级；位置正确——位于第 37 行 sink 之前、函数内所有执行路径必经，超限即 422 短路返回；覆盖完整——进入 preg_match_all 的变量只有 $query，不存在绕过该校验的第二条数据通路。
+
+第4步（防御二：模式级根治，第 25 行）：模式使用占有量词 [A-Za-z]++、[A-Za-z0-9_.-]++ 并整体包在原子组 (?>...) 中，PCRE 引擎对每个字符至多消费一次、子匹配失败即整体放弃，不存在可回溯状态，单次尝试严格 O(n)；即使移除第 32 行的长度校验也不会指数爆炸。这是消除回溯机制本身的根治型防御，区别于黑名单/字符串替换等可绕过过滤。第 20–23 行注释同时点明朴素写法 ((\w+\s*)+ 的嵌套量词风险，形成教学对照。
+
+第5步（防御三：结果规模上限，第 38–39 行）：MAX_TOKENS=16 经 array_slice 截断提取出的过滤项数量，限制结果数组内存与下游构建查询的循环开销，覆盖了正则匹配之外的第二类资源消耗面，属纵深防御。
+
+第6步（第二入口/替代通道检查）：唯一公开入口是第 27 行的 search()（挂载单一路由）；TOKEN_RE 全文件仅在第 37 行使用一次；不存在 CLI 命令、队列 Job、其他控制器方法或间接调用以未校验输入触发该正则。结论：无第二入口、无替代通道，两道防御在唯一 source→sink 链上类型正确、位置正确、覆盖完整，判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入为第29行 $request->input('q')，经第32行长度校验后直达第37行 preg_match_all 的 subject，可达性成立；防御一：第31-34行施加256字符硬上限，位于 sink 之前且全路径必经，将回溯最坏成本钳制为常数级；防御二：第25行模式使用占有量词 [A-Za-z]++ 与原子组 (?>...)，消除全部回溯状态，匹配严格线性 O(n)，属模式级根治而非可绕过的黑名单/替换过滤；防御三：第38-39行 MAX_TOKENS 截断结果规模，限制下游内存与循环开销；第二入口检查：全文件唯一入口为第27行 search()，TOKEN_RE 仅在第37行使用一次，无 CLI/队列/其他路由等替代通道，防御覆盖完整，判定无 CWE-400 漏洞", "fix_suggestion": "no fix needed"}
+```

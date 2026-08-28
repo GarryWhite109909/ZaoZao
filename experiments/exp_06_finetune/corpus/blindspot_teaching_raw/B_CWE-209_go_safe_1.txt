@@ -1,0 +1,66 @@
+LANG: go
+```code
+package main
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+)
+
+const uploadDir = "/var/lib/docvault/uploads"
+
+// handleUpload 处理文档上传：解析 multipart 表单并把文件落盘到 uploadDir。
+func handleUpload(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		log.Printf("upload: parse multipart form failed: %v", err)
+		http.Error(w, "upload failed, please retry later", http.StatusBadRequest)
+		return
+	}
+	file, header, err := r.FormFile("document")
+	if err != nil {
+		log.Printf("upload: read form file failed: %v", err)
+		http.Error(w, "upload failed, please retry later", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	dst := filepath.Join(uploadDir, filepath.Base(header.Filename))
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		log.Printf("upload: open dest %s failed: %+v", dst, err)
+		http.Error(w, "upload failed, please retry later", http.StatusInternalServerError)
+		return
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, file); err != nil {
+		log.Printf("upload: copy stream to %s failed: %+v", dst, err)
+		http.Error(w, "upload failed, please retry later", http.StatusInternalServerError)
+		return
+	}
+	fmt.Fprintf(w, "saved: %s\n", filepath.Base(dst))
+}
+
+func main() {
+	http.HandleFunc("/upload", handleUpload)
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+1. **第1步（类别核心特征）**：CWE-209 的敏感面是“错误信息本身”——把底层错误对象（os.PathError 携带的内部绝对路径与 errno、multipart 解析错误暴露的服务端解析细节、io 错误暴露的存储介质状态，乃至 SQL 片段、堆栈、连接串等）序列化后写入 HTTP 响应。漏洞对照写法是 `http.Error(w, err.Error(), 500)` 或 `fmt.Fprintf(w, "%v", err)`。本类是信息泄露通道问题，不是 SQL/命令注入（CWE-89/78）、不是路径穿越（CWE-22）、不是越权（CWE-862），也不是向日志注入恶意载荷（CWE-117）——本文件唯一敏感汇聚点是对 ResponseWriter 的写入（第18、24、33、40、43行）。
+
+2. **第2步（输入点枚举与可达性）**：外部输入共三处——①第16行 `r.ParseMultipartForm` 解析的整个请求体（客户端完全可控）；②第21行 `r.FormFile("document")` 返回的文件句柄与 `header.Filename`（客户端可控）；③第29行 `header.Filename` 经 `filepath.Base` 后拼入 `dst`。四条到响应的错误路径全部可达：畸形 multipart 体触发第16行分支；缺失或超 8MB 文件触发第21行分支；同名文件已存在（EEXIST）或目录权限问题触发第31行 `os.OpenFile` 返回携带内部路径 `/var/lib/docvault/uploads/...` 的 os.PathError；上传中途读失败触发第38行 `io.Copy` 错误。
+
+3. **第3步（逐流验证防御类型与位置）**：流1（第16→18行）、流2（第21→24行）、流3（第31→33行）、流4（第38→40行）采用同一结构化防御：错误对象只作为 `log.Printf` 实参写入服务端日志（第17、23、32、39行），而 `http.Error` 的文案实参是编译期固定字面量 'upload failed, please retry later'。该防御不是黑名单/正则/字符串替换（那类可被构造输入绕过），而是“错误对象与响应出口物理隔离”——全文件不存在 `err.Error()`、把 err 用 `%v` 格式化后写 w、或把 err 直接 Fprintf 给客户端的语句，因此没有可绕过面；位置上每处防御都紧贴失败调用之后、任何响应写出之前，顺序正确。
+
+4. **第4步（覆盖面核查）**：文件内对 w 的全部写出口仅第18、24、33、40、43行五处。前四处已验证为常量文案；第五处成功分支只回显 `filepath.Base(dst)`，即客户端自己上传的文件名（目录成分已被 Base 剥离），不含服务端 uploadDir 前缀，不构成内部路径泄露。`defer file.Close()`/`defer out.Close()` 的关闭错误被有意忽略、不进入响应；四个错误分支加成功分支全部覆盖，无遗漏路径。
+
+5. **第5步（第二入口/替代通道检查）**：第46-49行 main 仅注册 `/upload` 一个路由并直接绑定 handleUpload，无其他 handler、无 debug/pprof 端点、无全局 recover 中间件把 err 回显给客户端；Go net/http 对 handler panic 的默认行为是把堆栈写入服务端日志并关闭连接，不会把 panic 内容发给客户端。文件内也不存在通过响应头、redirect Location 或日志回读等间接通道外带错误细节的路径。结论：不存在第二入口或替代泄露通道，防御覆盖全部 source→sink 流，判定为无 CWE-209 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点枚举：第16行 ParseMultipartForm 的请求体、第21行 FormFile 的 document 字段与 header.Filename、第29行由文件名拼出的 dst，三条输入全部可达响应错误分支；流1 畸形表单体→第16行分支，流2 缺失或超8MB文件→第21行分支，流3 目标已存在或权限错误→第31行 os.OpenFile 返回含内部绝对路径与 errno 的 os.PathError，流4 拷贝中断→第38行 io.Copy 错误；四条流的防御均为结构化常量文案而非黑名单/正则/字符串替换：错误对象只经 log.Printf（第17、23、32、39行）写入服务端日志，http.Error（第18、24、33、40行）实参为固定字面量 'upload failed, please retry later'，全文件不存在 err.Error() 或把 err 格式化写入 ResponseWriter 的语句，无可绕过面且防御位置紧贴失败点、先于任何响应写出；覆盖面：对 w 的写出口仅第18、24、33、40、43行五处，第43行成功分支只回显 filepath.Base(dst) 即客户端自带文件名，不含服务端目录前缀，无内部路径泄露；第二入口检查：第46-49行仅注册 /upload 一个路由，无其他 handler、调试端点或 recover 中间件回显 err，net/http 对 panic 只记服务端日志，不存在替代泄露通道，故无 CWE-209 漏洞", "fix_suggestion": "no fix needed"}
+```

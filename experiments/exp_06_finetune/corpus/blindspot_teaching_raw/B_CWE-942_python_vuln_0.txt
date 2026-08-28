@@ -1,0 +1,45 @@
+LANG: python
+```python
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import secrets
+
+app = Flask(__name__)
+
+# Gateway-wide CORS: allow any origin and send credentials
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
+
+SESSIONS = {}
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    token = secrets.token_hex(16)
+    SESSIONS[token] = username
+    resp = jsonify({"ok": True})
+    resp.set_cookie("session", token, httponly=True, secure=True, samesite="None")
+    return resp
+
+@app.route("/api/user/profile", methods=["GET"])
+def profile():
+    token = request.cookies.get("session", "")
+    user = SESSIONS.get(token)
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify({"user": user, "email": user + "@corp.example", "role": "admin", "api_key": "sk-live-9f2c"})
+```
+
+1. 第 1 步（本类核心特征）：第 8 行 `CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)` 是 CWE-942 Permissive Cross-domain Policy 的教科书形态——Access-Control-Allow-Origin 采用通配 `*` 并叠加 credentials 放行。flask-cors 在“通配 + supports_credentials=True”模式下会把请求的 Origin 头原样反射进 Access-Control-Allow-Origin，并附加 Access-Control-Allow-Credentials: true，等价于“任意源可携带凭据跨域读取响应”。这是跨域策略配置过宽问题，不是命令注入、SQL 注入或越权逻辑缺陷。
+
+2. 第 2 步（输入点枚举与可达性）：外部输入点共三处——①第 14-15 行表单 username/password（登录入口）；②第 24 行 Cookie `session`（profile 入口）；③隐式输入：每个请求自带的 Origin 头，在第 8 行被 CORS 层直接消费。可达性：第 8 行配置作用于 `r"/api/*"` 全部路由，因此第 22 行 profile 的响应（第 28 行）与第 12 行 login 的响应均会携带由攻击者 Origin 反射生成的放行头，Origin→sink 路径无任何中间过滤。
+
+3. 第 3 步（数据流逐条验证）：流 1：攻击页面伪造的 Origin 头 → 第 8 行 flask-cors 通配匹配 → 响应头 Access-Control-Allow-Origin 反射任意源 + Allow-Credentials: true → 第 28 行含 role、api_key 的敏感 JSON 可被任意源 JS 携带凭据读取。流 2：第 24 行会话 Cookie → 第 25 行会话查找 → 第 28 行返回该用户敏感数据；第 19 行 `samesite="None"` 使跨站子资源请求仍会附带凭据 Cookie，与流 1 叠加构成完整利用链。
+
+4. 第 4 步（防御有效性与覆盖面）：全文件不存在任何 Origin 白名单、正则校验或环境区分；通配 `*` 本身就是漏洞本体而非防御；supports_credentials=True 恰好关闭了浏览器对“`*` + 凭据”组合的天然拒绝，迫使中间件退化为反射任意源；第 19 行 httponly/secure 仅防 XSS 窃取 Cookie 与明文传输，并不限制哪些源可以读取响应，对本类完全无效。结论：source→sink 全链路无有效防御。
+
+5. 第 5 步（第二入口/替代通道）：第 12 行 /api/login 同样落在第 8 行 `r"/api/*"` 资源模式内，是同一过宽策略覆盖下的第二入口（可被跨源页面携带凭据触发登录态操作）；同时检查确认不存在任何绕开该 CORS 配置的路由或间接调用，全部 API 共享同一过宽 sink，支撑“存在漏洞”的最终结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-942 Permissive Cross-domain Policy", "risk_level": "High", "source": "line 8: 请求 Origin 头（攻击者完全可控）被 flask-cors 的 origins='*' 通配匹配消费", "sink": "line 8: 响应头 Access-Control-Allow-Origin 反射任意源并叠加 Access-Control-Allow-Credentials: true，覆盖 line 28 等全部 /api/* 响应", "explanation": "流1: 攻击者页面 Origin 头 -> line 8 flask-cors 通配加 supports_credentials=True -> 响应头反射任意源并放行凭据 -> line 28 含 role/api_key 的敏感 JSON 可被任意源携带 Cookie 跨域读取; 流2: line 24 会话 Cookie -> line 25 会话查找 -> line 28 返回用户敏感数据, line 19 SameSite=None 使跨站请求仍附带凭据, 与流1叠加成完整利用链; 防御检查: 全文件无 Origin 白名单或正则校验, 通配 * 与 supports_credentials 即漏洞本体, line 19 httponly/secure 不限制响应可读源, 均非有效防御; 第二入口: line 12 /api/login 同处 line 8 r'/api/*' 模式受同一过宽策略覆盖, 不存在绕开该配置的替代通道", "fix_suggestion": "line 8: 将 origins='*' 改为显式可信域白名单（如 ['https://admin.corp.example']），并仅在确需凭据的具体域名上开启 supports_credentials"}
+```

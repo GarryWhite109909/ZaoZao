@@ -1,0 +1,65 @@
+LANG: go
+```code
+package main
+
+import (
+	"log"
+	"net/http"
+)
+
+// corsOrigins 是 SPA 前端站点的精确 Origin 白名单（scheme+host+port 全等匹配）。
+var corsOrigins = map[string]struct{}{
+	"https://app.example.com":   {},
+	"https://admin.example.com": {},
+}
+
+// corsMiddleware 校验每个请求的 Origin 头，仅白名单命中才回显 ACAO。
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin") // 唯一外部输入点
+		if origin != "" {
+			if _, ok := corsOrigins[origin]; ok {
+				h := w.Header()
+				h.Set("Access-Control-Allow-Origin", origin)
+				h.Add("Vary", "Origin")
+				h.Set("Access-Control-Allow-Credentials", "true")
+			}
+			// 白名单外的 Origin 不产生任何 CORS 头，浏览器同源策略拦截读取
+		}
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			h := w.Header()
+			h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			h.Set("Access-Control-Allow-Headers", "Content-Type, X-Requested-With")
+			h.Set("Access-Control-Max-Age", "600")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func profileHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"user":"alice","email":"alice@example.com"}`))
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/profile", profileHandler)
+	log.Fatal(http.ListenAndServe(":8080", corsMiddleware(mux)))
+}
+```
+
+1. **本类核心特征（CWE-942）**：风险不在注入或越权，而在跨域策略响应头的宽度——sink 是第 21 行的 `Access-Control-Allow-Origin` 响应头，source 是第 17 行攻击者完全可控的 `Origin` 请求头。若无条件回显 Origin、使用通配符 `*` 并配合 Allow-Credentials，任意恶意站点即可携带受害者凭据跨域读取响应。本例第 19 行在第 21 行回显前做了精确白名单判断，属于该类的安全形态，需与注入/CSRF 等类别明确区分。
+
+2. **输入点枚举与可达性**：外部输入点共两处——第 17 行 `r.Header.Get("Origin")` 与第 27 行 `r.Header.Get("Access-Control-Request-Method")`（连同 `r.Method`）。Origin 从第 17 行流入第 19 行判断、命中后流入第 21 行 ACAO sink，可达性成立，这是唯一写入 CORS 放行头的数据流；第 27 行读取的预检方法头的值从不进入任何响应头，第 29-31 行写入的均为编译期固定常量字符串，与攻击者输入无数据流。
+
+3. **防御类型正确性**：第 19 行 `corsOrigins[origin]` 是 Go map 的全键全等查找，即精确白名单（allowlist equality），不是黑名单、不是正则、也不是 `strings.Contains`/`TrimPrefix`/`Replace` 之类的子串操作；因此 `https://app.example.com.evil.com`、`https://app.example.com:8443`、`http://app.example.com`、`null` 等变体均无法命中，未命中即走第 24-25 行的 fail-closed 路径——不写任何 ACAO 头，浏览器同源策略直接拦截读取。
+
+4. **防御位置与覆盖面**：中间件在第 47 行以 `corsMiddleware(mux)` 包裹整个路由器，唯一业务路由 `/api/profile`（第 46 行）与预检 OPTIONS 分支（第 27 行）全部先经过第 19 行校验，文件中不存在第二处写 `Access-Control-*` 头的位置；第 22 行 `Vary: Origin` 使共享缓存（CDN/反向代理）按 Origin 区分缓存键，防止白名单源的带凭据响应被缓存后投递给其他源；第 23 行 Allow-Credentials 只可能出现在精确白名单命中分支，与通配符 `*` 在任何执行路径上都不可能同时出现，满足『凭据不与通配组合』。
+
+5. **第二入口/替代通道检查**：全文件仅一个 `http.ListenAndServe`（第 47 行）、一个 `ServeMux`、一条路由，无静态文件服务、无其他 handler 绕过中间件；预检响应即使返回 204，也因缺少 ACAO 头而被浏览器拒绝。结论：不存在绕过白名单的替代通道，判定为 CWE-942 的安全实现，无漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点为第17行攻击者可控的 Origin 请求头，数据流 Origin→第19行白名单判断→第21行 Access-Control-Allow-Origin 回显；第19行为 map 全键全等查找的精确白名单，非黑名单/正则/子串替换，https://app.example.com.evil.com 等变体均无法命中，未命中走 fail-closed 不输出任何 CORS 头；防御位置正确：第47行中间件包裹整个 mux，唯一路由（第46行 /api/profile）与预检分支（第27行）均先经校验，无第二处写 Access-Control-* 头；覆盖完整：第22行 Vary: Origin 防共享缓存跨源投递，第23行 Allow-Credentials 仅与精确白名单 Origin 同现、绝不与通配符组合；第二入口检查：仅一个 ListenAndServe（第47行）与一条路由，无静态服务或旁路 handler，判定无 CWE-942 漏洞", "fix_suggestion": "no fix needed"}
+```

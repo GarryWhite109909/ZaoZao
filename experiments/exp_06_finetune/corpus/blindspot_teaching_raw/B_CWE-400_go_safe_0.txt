@@ -1,0 +1,65 @@
+LANG: go
+```code
+package regexgate
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"regexp"
+)
+
+const (
+	maxPatternLen = 256  // caps regex compile cost
+	maxSubjectLen = 8192 // caps per-request scan cost
+)
+
+var errPatternTooLong = errors.New("pattern exceeds 256-byte limit")
+
+// CompileUserPattern compiles an untrusted regex behind a hard length cap.
+// stdlib regexp is RE2-based: automaton simulation yields linear-time
+// matching, so nested quantifiers like (a+)+ cannot backtrack exponentially.
+func CompileUserPattern(pattern string) (*regexp.Regexp, error) {
+	if len(pattern) > maxPatternLen {
+		return nil, fmt.Errorf("%w: got %d bytes", errPatternTooLong, len(pattern))
+	}
+	return regexp.Compile(pattern)
+}
+
+// HandleValidate is the module's single HTTP entry (POST /validate).
+func HandleValidate(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	pattern := r.FormValue("pattern")
+	subject := r.FormValue("subject")
+	if len(subject) > maxSubjectLen {
+		http.Error(w, "subject too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	re, err := CompileUserPattern(pattern)
+	if err != nil {
+		http.Error(w, "invalid pattern", http.StatusBadRequest)
+		return
+	}
+	if re.MatchString(subject) {
+		fmt.Fprintln(w, "match")
+		return
+	}
+	fmt.Fprintln(w, "no match")
+}
+```
+
+1. 第 1 步（本类核心特征）：CWE-400 的正则分支即 ReDoS——不可信输入驱动无界资源消耗。典型触发形态是攻击者提交含嵌套量词的模式（如 `(a+)+$`、`(a|a)*`）交给回溯型引擎（PCRE、Python re、Java util.regex）执行，匹配时间随文本长度指数爆炸，单个请求即可打满 CPU。它不是注入（无代码/命令拼接）、不是越权（无权限边界穿越），危害面是可用性。本例中不可信正则从第 30 行进入，在第 24 行被编译、第 41 行被执行，正是该族 sink 形态。
+
+2. 第 2 步（输入点枚举与可达性）：本文件共三个外部输入点——①第 30 行 `r.FormValue('pattern')`（同时覆盖 URL 查询串与 POST 表单两种载体）；②第 31 行 `r.FormValue('subject')`；③第 29 行 `r.Body` 原始请求体（FormValue 内部触发 ParseForm 时读取）。三者全部可达资源消耗点：pattern 经第 36 行进入第 20 行 CompileUserPattern，抵达第 24 行 `regexp.Compile`（编译期 CPU/内存）与第 41 行 `MatchString`（匹配期 CPU）；subject 直达第 41 行；body 进入表单解析内存。无第四个输入点。
+
+3. 第 3 步（pattern 流防御验证）：第 21 行在到达第 24 行编译 sink 之前执行 `len(pattern) > maxPatternLen` 的 256 字节硬上限，超限即返回错误、fail-closed。类型正确：这是确定性数值上限，不是可被编码/拆分绕过的黑名单或字符串过滤；位置正确：位于 sink 前的必经路径——第 36 行是 handler 内唯一调用点，且上限内置于导出函数 CompileUserPattern，任何未来调用方都被强制覆盖；覆盖完整：编译成本随模式长度线性增长，256 字节封顶后编译期开销恒定，标准库自身还叠加嵌套深度与表达式规模上限兜底。
+
+4. 第 4 步（匹配流防御验证）：即便模式通过编译，Go 标准库 regexp 基于 RE2 自动机模拟，匹配为线性时间、无回溯状态，嵌套量词 `(a+)+` 在该引擎下根本无法引发指数爆炸——这是引擎级防御，与语言生态中回溯型引擎形成本质区别。叠加第 32-35 行在 `MatchString`（第 41 行）之前拒绝超过 8192 字节的 subject（返回 413、fail-closed），单请求最坏代价约为 O(256×8192) 字符操作，常数级、可预算，无法被放大。
+
+5. 第 5 步（请求体流防御验证）：第 29 行在 FormValue 触发表单解析之前用 `http.MaxBytesReader` 把可读体积封顶在 1MiB。这一通道常被遗漏：若缺失，攻击者提交数 GB 的 urlencoded body，ParseForm 会全量读入内存，构成一个独立于正则的 CWE-400 内存耗尽通道；此处与正则防御同层补齐，说明防御覆盖了模块内全部消耗通道而非只盯主链。
+
+6. 第 6 步（第二入口/替代通道结论）：本文件仅暴露 HandleValidate（第 28 行）一个 HTTP 入口，无其他路由、无 init() 注册、无包级可变状态；正则执行 sink 只有第 24 行 Compile 与第 41 行 MatchString，且只能经由上述两条已设限输入到达；CompileUserPattern 虽导出，但长度上限内置于函数体，外部包调用同样被覆盖。结论：不存在第二入口或绕过通道，防御的类型、位置、覆盖面均成立，判定为安全实现。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "输入点枚举: 第30行 FormValue('pattern')、第31行 FormValue('subject')、第29行原始请求体, 三者均可达第24行 regexp.Compile 与第41行 re.MatchString 两个资源消耗点; pattern 流: 第21行 len(pattern)>maxPatternLen 的256字节硬上限位于编译 sink 之前且 fail-closed, 属确定性数值上限而非黑名单/正则过滤, CompileUserPattern 是唯一编译入口且上限内置于函数体, 任何调用方均被覆盖, 编译成本随长度线性、封顶后恒定; 匹配流: Go 标准库 regexp 基于 RE2 自动机模拟, 匹配线性时间、无回溯, 嵌套量词如 (a+)+ 或 (a|a)* 无法引发指数爆炸, 标准库另有嵌套深度与表达式规模上限兜底; subject 流: 第32行 len(subject)>maxSubjectLen 的8192字节上限先于第41行 MatchString, 超限返回413, 与线性时间叠加后单请求最坏代价约为 O(256×8192) 字符操作, 常数可预算; 请求体流: 第29行 http.MaxBytesReader 将可读体积封顶1MiB, 先于 FormValue 触发的表单解析执行, 防止超大 body 被全量缓冲导致的内存耗尽这一独立 CWE-400 通道; 第二入口检查: 本文件仅 HandleValidate(第28行)一个 HTTP 入口, 无其他路由、无 init 注册、无包级可变状态, 正则执行 sink 仅第24行与第41行且只能经上述已设限输入到达, CompileUserPattern 虽导出但防御内嵌, 不存在绕过通道, 判定安全", "fix_suggestion": "no fix needed"}
+```

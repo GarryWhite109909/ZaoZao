@@ -1,0 +1,64 @@
+LANG: javascript
+```code
+'use strict';
+
+const http = require('http');
+const { URLSearchParams } = require('url');
+
+const GATEWAY_HOST = 'payments.acme-bank.example';
+const GATEWAY_PORT = 8080; // 明文 HTTP 端口，未启用 TLS
+
+// 仅校验卡号格式，不提供任何机密性保护
+function panFormatOk(pan) {
+  return /^\d{13,19}$/.test(pan);
+}
+
+// 由结账控制器调用：cardholderData 直接来自前端提交的 HTTP 请求体
+function chargeCard(cardholderData) {
+  if (!panFormatOk(cardholderData.cardNumber)) {
+    throw new Error('invalid card number');
+  }
+
+  const payload = new URLSearchParams({
+    card_number: cardholderData.cardNumber,
+    cvv: cardholderData.cvv,
+    expiry: cardholderData.expiry,
+    amount: String(cardholderData.amount),
+    currency: 'USD'
+  }).toString();
+
+  const req = http.request({
+    hostname: GATEWAY_HOST,
+    port: GATEWAY_PORT,
+    path: '/api/v1/charge',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(payload)
+    }
+  }, (res) => {
+    let body = '';
+    res.on('data', (c) => { body += c; });
+    res.on('end', () => console.log(`charge result: ${body}`));
+  });
+
+  req.write(payload); // PAN+CVV 以明文写入出站套接字
+  req.end();
+}
+
+module.exports = { chargeCard };
+```
+
+**第 1 步（本类核心特征定位）**：CWE-311 的核心特征是敏感数据（口令/令牌/密钥/PII）以明文形态跨越信任边界，本例属于其中“明文信道传输”子形态：第 28 行使用 Node.js 的 `http.request`（而非 `https.request`）向第 6-7 行定义的 `payments.acme-bank.example:8080` 发起出站请求，全程无 TLS。持卡人数据（主账号 PAN、CVV、有效期）将以链路上任意中间人可直接读取的明文离开进程。该问题的本质是传输机密性缺失，不涉及命令拼接、SQL 语句构造或权限判断，因此不属于命令注入/SQL 注入/越权等其他类别。
+
+**第 2 步（外部输入点枚举与可达性）**：本模块唯一对外入口是第 47 行导出的 `chargeCard(cardholderData)`（第 15 行定义），参数由结账控制器直接传入，第 14 行注释标明来源为前端提交的 HTTP 请求体，属用户完全可控的外部输入。可达性路径连续无中断：`cardholderData.cardNumber`（第 16、21 行）、`cvv`（第 22 行）、`expiry`（第 23 行）拼入 `payload`（第 20-26 行），随后在第 43 行 `req.write(payload)` 写入第 28 行创建的套接字——source 到 sink 直达，可达性成立。
+
+**第 3 步（防御核查：唯一“防御”不构成本类有效防御）**：source→sink 全链路仅有一处检查——第 16 行调用第 9-12 行的 `panFormatOk`，它是 `/^\d{13,19}$/` 正则格式校验，只验证卡号形状，不加密、不令牌化、不提供任何机密性保护，对本类而言等同无防御；第 20 行 `URLSearchParams` 仅做 URL 编码，属传输格式化而非加密；第 7 行端口 8080 配合第 28 行 `http` 模块确认无 TLS。整条数据流上不存在任何有效加密防御，防御覆盖面为零。
+
+**第 4 步（sink 确认与暴露后果）**：主 sink 为第 43 行 `req.write(payload)`：明文 PAN+CVV 经第 28-36 行构造的明文 HTTP POST 发往外部支付网关。同网段嗅探、ARP 欺骗、被劫持的代理或负载均衡访问日志均可完整还原持卡人数据，直接违反 PCI DSS 对 PAN 传输加密的强制要求。另第 40 行将网关响应体写入 `console.log`，若网关回显 PAN 会构成日志侧的次要明文暴露，但它是同一数据流的下游衍生，并非独立漏洞入口。
+
+**第 5 步（第二入口/替代通道检查与结论）**：逐一排查：模块仅导出 `chargeCard` 一个函数（第 47 行），无其他导出、无路由注册、无事件监听、无基于字符串的动态分发或间接调用；除第 28 行 `http.request` 外不存在第二个出站通道（无 `https`、无消息队列、无落盘写入）。因此结论建立在唯一但完整、无任何缓解的明文传输流上：CWE-311 成立，风险等级 High（持卡人敏感数据明文出站，实际窃听与合规风险均高）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-311 Missing Encryption of Sensitive Data", "risk_level": "High", "source": "line 15: chargeCard(cardholderData) 参数，持卡人数据 cardNumber/cvv/expiry 直接来自结账请求体", "sink": "line 43: req.write(payload) 将明文 PAN+CVV 写入 line 28 http.request 建立的明文 HTTP 连接（payments.acme-bank.example:8080，无 TLS）", "explanation": "主数据流：line 15 入参 cardholderData -> line 21-23 将 cardNumber/cvv/expiry 拼入 payload -> line 43 req.write 明文写出 -> line 28 http.request 经 8080 端口明文信道发往外部支付网关；防御核查：line 16 调用 line 9-12 的 panFormatOk 仅为正则格式校验，不提供加密或令牌化，line 20 URLSearchParams 仅做 URL 编码属传输格式化而非加密，全链路无 TLS、无字段级加密，防御覆盖面为零；第二入口检查：模块仅导出 chargeCard（line 47），无其他路由/参数/间接调用，唯一出站通道即 line 28 的明文 http.request，line 40 的响应日志在网关回显 PAN 时构成同一数据流的次要暴露而非独立入口；该漏洞属敏感数据明文跨信任边界传输（CWE-311），非注入或越权类", "fix_suggestion": "line 28: 将 http.request 改为 https.request 并将端口改为 443 以启用 TLS 加密信道，必要时对 PAN 先做令牌化再出站"}
+```

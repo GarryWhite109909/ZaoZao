@@ -1,0 +1,59 @@
+LANG: javascript
+```code
+// routes/userProfile.js — 公开用户资料接口（安全版：响应白名单投影 + 邮箱脱敏）
+const express = require('express');
+const router = express.Router();
+
+// 模拟存储层：实体含密码哈希、TOTP 密钥等内部敏感字段
+const users = new Map([
+  [42, {
+    id: 42,
+    username: 'alice',
+    email: 'alice@example.com',
+    passwordHash: '$2b$12$KIXQe9m1oGvOx',
+    totpSecret: 'JBSWY3DPEHPK3PXP',
+    internalScore: 97,
+    createdAt: '2024-01-01T00:00:00Z',
+  }],
+]);
+
+// 白名单：唯一允许离开服务边界的字段集合（默认拒绝，未列出即不输出）
+const PUBLIC_PROFILE_FIELDS = ['id', 'username', 'email', 'createdAt'];
+
+function maskEmail(email) {
+  const at = email.indexOf('@');
+  if (at <= 0) return '***';
+  return email[0] + '***' + email.slice(at);
+}
+
+function toPublicProfile(user) {
+  const dto = {};
+  for (const field of PUBLIC_PROFILE_FIELDS) {
+    if (user[field] === undefined) continue;
+    dto[field] = field === 'email' ? maskEmail(user[field]) : user[field];
+  }
+  return dto;
+}
+
+router.get('/api/users/:id/profile', (req, res) => {
+  const user = users.get(Number(req.params.id));
+  if (!user) return res.status(404).json({ error: 'user not found' });
+  return res.json(toPublicProfile(user)); // 唯一序列化出口：只输出白名单投影
+});
+
+module.exports = router;
+```
+
+1. 本类核心特征：CWE-200 是敏感信息对不可信方的暴露——数据经由合法响应通道流出，问题不在注入执行或权限校验，而在输出字段过宽：第 11-13 行的实体携带 passwordHash、totpSecret、internalScore 等内部字段，第 39 行的 res.json 是它们唯一可能离开服务边界的 sink；若按漏洞形态直接 res.json(user) 整体序列化，哈希与密钥会原样回显给任意调用方。本样本为安全版，需验证防御的类型、位置与覆盖面。
+
+2. 外部输入点全量枚举与可达性：本模块仅第 36 行一条路由，唯一外部输入是第 37 行的 req.params.id（路径参数），无 query/body/header 读取，无其他 handler；第 37 行 users.get(Number(...)) 用该输入选取实体，被选中的 user 正是第 39 行被序列化的对象，因此 source→sink 链路真实可达——这正是必须依赖出口防御的原因。
+
+3. 主数据流防御验证（类型/位置/覆盖面）：第 39 行并未直接序列化 user，而是序列化第 27-34 行 toPublicProfile 的返回值；投影循环（第 29 行）只遍历第 19 行白名单枚举的四个字段，dto 逐字段构造（第 31 行），passwordHash/totpSecret/internalScore 因不在白名单而结构性缺席。该防御是默认拒绝的允许列表——即使日后实体新增 apiKey 等敏感字段也不会自动泄漏，区别于 delete user.passwordHash 式黑名单（新增字段即失效）或正则/字符串替换过滤（可被编码变体绕过），类型正确；位置正确：投影位于第 39 行这一本模块唯一序列化出口，即数据跨出信任边界前的最后一跳，中间无旁路直接引用 user；覆盖完整：成功响应唯一出口受投影保护，第 38 行 404 分支仅返回静态字符串，不含任何实体字段。
+
+4. 白名单内 PII 字段的二次最小化：唯一涉及个人隐私的 email 在第 31 行额外经过第 21-25 行 maskEmail 掩码，仅保留本地部分首字符与 @域名，属于确定性结构变换与数据最小化，而非对完整实体做黑名单式剔除或正则清洗，不存在构造输入绕过后回吐原始值的问题；即使掩码逻辑有缺陷，泄露面也已被白名单限定在声明的公开字段内，两层防御互为冗余。
+
+5. 第二入口/替代通道检查结论：全文件仅第 39 行一处成功响应序列化与第 38 行一处静态 404 响应；不存在 res.send(user)、JSON.stringify(user)、调试端点或实体日志等旁路；users Map 为模块私有，第 42 行仅导出 router，外部模块无法取得原始实体；亦无第二个路由或间接调用能绕过 toPublicProfile。结论：不存在第二入口或替代通道，敏感字段在所有路径上均无法到达响应，CWE-200 暴露不成立。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入为第 37 行 req.params.id，经 users.get 选取的实体正是第 39 行 res.json 序列化的对象，source 到 sink 可达；防御为默认拒绝的白名单投影：第 39 行不直接序列化实体，而是输出第 27-34 行 toPublicProfile 的结果，仅第 19 行 PUBLIC_PROFILE_FIELDS 枚举的 id、username、email、createdAt 可进入响应，passwordHash、totpSecret、internalScore 被结构性排除，实体日后新增敏感字段也不会泄漏，属类型正确（非黑名单删除/正则替换等可绕过手段）；位置正确：投影位于本模块唯一序列化出口第 39 行，即数据跨出信任边界前的最后一跳；覆盖完整：第 38 行 404 分支仅返回静态字符串，无实体数据；白名单内的 email 另经第 21-25 行 maskEmail 掩码做最小化，属确定性变换而非黑名单过滤；第二入口检查：全文件仅第 36 行一条路由、第 39 行一处成功响应序列化，无 res.send(user)、无 JSON.stringify 实体、无调试端点、无实体日志，users 为模块私有且第 42 行仅导出 router，不存在绕过投影的替代通道；综上敏感信息无法到达不可信方，无 CWE-200 暴露", "fix_suggestion": "no fix needed"}
+```

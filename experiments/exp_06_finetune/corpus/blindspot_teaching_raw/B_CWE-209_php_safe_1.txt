@@ -1,0 +1,65 @@
+LANG: php
+```code
+<?php
+declare(strict_types=1);
+
+namespace App\Http\Controller;
+
+use Psr\Log\LoggerInterface;
+use RuntimeException;
+use Throwable;
+
+/** CSV 文件导入接口(安全版):失败时客户端只收到固定文案,异常细节仅写服务端日志。 */
+final class CsvImportController
+{
+    private const MSG_GENERIC = '文件处理失败,请检查文件格式后重试';
+
+    public function __construct(private LoggerInterface $logger) {}
+
+    /** @param array{tmp_name:string,name:string,error:int} $upload */
+    public function import(array $upload, string $delimiter): array
+    {
+        try {
+            if (($upload['error'] ?? 1) !== UPLOAD_ERR_OK) {
+                throw new RuntimeException('upload aborted, error code=' . ($upload['error'] ?? -1));
+            }
+            if (!is_uploaded_file($upload['tmp_name'])) {
+                throw new RuntimeException('reject non-upload path: ' . $upload['tmp_name']);
+            }
+            if (!in_array($delimiter, [',', ';', "\t"], true)) {
+                throw new RuntimeException('unsupported delimiter: ' . $delimiter);
+            }
+            $handle = fopen($upload['tmp_name'], 'r');
+            if ($handle === false) {
+                throw new RuntimeException('fopen failed on uploaded temp file');
+            }
+            $rows = 0;
+            while (fgetcsv($handle, 0, $delimiter) !== false) {
+                $rows++;
+            }
+            fclose($handle);
+            return ['status' => 'ok', 'rows' => $rows];
+        } catch (Throwable $e) {
+            $this->logger->error('csv import failed', [
+                'exception' => (string) $e,
+                'client_name' => (string) ($upload['name'] ?? ''),
+            ]);
+            return ['status' => 'error', 'message' => self::MSG_GENERIC];
+        }
+    }
+}
+```
+
+1. **第 1 步(核心特征)**:CWE-209 的核心特征是把异常对象/底层错误的原始内容返回给客户端——典型泄露物包括完整堆栈、服务器内部路径(如 /tmp/phpaB3xYz)、SQL 语句、连接串、框架版本等。本例第 22/25/28/32 行构造的异常消息恰好内嵌了服务器临时路径与上传内部错误码这类敏感内容,说明"泄露原料"存在;判定维度是错误内容是否到达客户端响应,与 SQL 注入、XSS、越权等其他类别无关。
+
+2. **第 2 步(输入点枚举与可达性)**:外部输入点共两个:① `$upload`(HTTP multipart 上传的 $_FILES 形态数组,第 18 行传入)——第 21 行读 `error`、第 24/30 行读 `tmp_name`、第 43 行读 `name`;② `$delimiter`(请求参数,第 18 行传入)——第 27 行校验、第 35 行用于 fgetcsv。两条输入都流入 try 块(第 20-39 行)的校验/打开/解析逻辑,任一失败即抛出携带内部细节的异常,即 source→sink(控制器返回给框架序列化的响应体)的泄露链在结构上可达,防御必须恰好卡在这条链的末端。
+
+3. **第 3 步(逐条数据流验证防御)**:两条输入流的全部错误分支(第 22/25/28/32 行 throw,以及 fopen/fgetcsv 可能抛出的任何 Error)都汇聚到第 40 行唯一的 `catch (Throwable $e)`:完整异常串 `(string) $e`(消息+内部路径+堆栈)只进入第 41-44 行的 PSR-3 `logger->error()`,即仅落服务端日志;客户端可见的返回值全文件只有两处——第 39 行成功路径(仅行数统计,无内部信息)与第 45 行错误路径(仅第 13 行编译期常量 `MSG_GENERIC`)。防御类型正确:在 sink 处用常量整体替换动态错误内容(结构性消除),而非对错误文本做黑名单/正则/字符串替换——后者面对堆栈、路径等高熵内容必然可绕过;位置正确:try 块包裹第 20-39 行全部处理逻辑,是数据返回调用方前的最后一道边界;覆盖完整:`Throwable` 同时捕获所有 Exception 与 Error(含 TypeError/ValueError 等非预期类型),不存在漏网异常。
+
+4. **第 4 步(输出面穷举)**:全文件无 `echo`/`print`/`var_dump`/`dd`/`exit` 等直接输出;异常对象 `$e` 的唯一消费方是第 42 行的日志上下文;第 27 行的分隔符白名单属于功能性输入校验(保证 fgetcsv 行为确定),并非本类 CWE-209 防御的组成部分——即使删掉它,泄露链仍被第 40 行 catch 完整拦截,防御不依赖任何可绕过的过滤逻辑。
+
+5. **第 5 步(第二入口/替代通道检查)**:本模块仅 `import()`(第 18 行)一个公开方法,构造函数只注入依赖;无其他路由、无静态缓存返回、无间接调用会把 `$e` 或其消息送回客户端。唯一需注意的替代通道在模块之外——框架全局错误中间件(如 Slim error middleware)须在生产环境关闭 `displayErrorDetails`,但就本文件而言,所有异常路径都终止于第 40 行 catch,不存在绕过通道。结论:客户端永远只能拿到通用文案,无 CWE-209 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "外部输入点两处:HTTP 上传数组 $upload(第21行读 error、第24/30行读 tmp_name、第43行读 name)与请求参数 $delimiter(第27行校验、第35行使用),两者均可达第22/25/28/32行的异常抛出点,异常消息内嵌服务器临时路径与上传内部错误码,若直接进响应即构成 CWE-209;防御为第40行唯一 catch(Throwable) 边界:完整异常串 (string)$e(含消息、内部路径、堆栈)仅写入第41-44行 PSR-3 服务端日志,客户端可见返回仅第39行成功结果(行数统计)与第45行错误文案(第13行编译期常量 MSG_GENERIC),属 sink 处以常量替换动态错误内容的结构性消除,而非可绕过的黑名单/正则/字符串替换过滤;位置正确:try 块包裹第20-39行全部处理逻辑,为返回调用方前最后一道边界;覆盖完整:Throwable 同时捕获全部 Exception 与 Error,全文件无 echo/print/var_dump 直接输出,异常对象唯一消费方是日志器,第27行分隔符白名单仅为功能性校验、非本漏洞防御组成部分;第二入口检查:模块仅 import()(第18行)一个公开入口,无其他路由/间接调用/替代输出通道可将异常细节送达客户端(框架级错误中间件需另行关闭 displayErrorDetails,但不在本文件内),故无 CWE-209 漏洞", "fix_suggestion": "no fix needed"}
+```

@@ -1,0 +1,64 @@
+LANG: php
+```code
+<?php
+
+declare(strict_types=1);
+
+namespace App\Http\Middleware;
+
+use Psr\Http\Message\ResponseFactoryInterface;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\ServerRequestInterface;
+use Psr\Http\Server\MiddlewareInterface;
+use Psr\Http\Server\RequestHandlerInterface;
+
+/** CORS policy: exact-match origin allow-list; wildcard is never combined with credentials (CWE-942 guard). */
+final class CorsMiddleware implements MiddlewareInterface
+{
+    private const ALLOWED_ORIGINS = [
+        'https://dashboard.example.com',
+        'https://admin.example.com',
+    ];
+
+    public function __construct(private readonly ResponseFactoryInterface $responses)
+    {
+    }
+
+    public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
+    {
+        $origin = $request->getHeaderLine('Origin');
+
+        if ($request->getMethod() === 'OPTIONS' && $origin !== '') {
+            return $this->applyPolicy($this->responses->createResponse(204), $origin);
+        }
+
+        return $this->applyPolicy($handler->handle($request), $origin);
+    }
+
+    private function applyPolicy(ResponseInterface $response, string $origin): ResponseInterface
+    {
+        if (!in_array($origin, self::ALLOWED_ORIGINS, true)) {
+            return $response->withHeader('Vary', 'Origin');
+        }
+
+        return $response
+            ->withHeader('Access-Control-Allow-Origin', $origin)
+            ->withHeader('Access-Control-Allow-Credentials', 'true')
+            ->withHeader('Vary', 'Origin');
+    }
+}
+```
+
+1. 本类核心特征是 CORS 跨域策略配置：敏感行为是第 43 行写出 `Access-Control-Allow-Origin`、第 44 行写出 `Access-Control-Allow-Credentials: true`。该类别属于 CWE-942（过宽跨域策略），漏洞形态是 `ACAO: *` 与凭据组合、或无条件反射任意 Origin；本文件为安全版，与注入、越权、反序列化等其他类别无关。
+
+2. 外部输入点枚举：全文件唯一外部输入是第 27 行 `$request->getHeaderLine('Origin')` 读取的攻击者可控 Origin 请求头（无查询参数、请求体、Cookie 等其他读取）。可达性确认：`$origin` 在第 30 行（预检分支）与第 33 行（实际请求分支）两条路径均作为实参传入 `applyPolicy`，最终到达第 43 行 sink `withHeader('Access-Control-Allow-Origin', $origin)`，source→sink 可达。
+
+3. 数据流 A（实际请求，第 27→33→36→43 行）防御验证：第 38 行 `in_array($origin, self::ALLOWED_ORIGINS, true)` 以严格模式（第三参 true，无类型松散比较）对第 16-19 行封闭常量数组做精确等值匹配。类型正确——是精确白名单而非黑名单/正则/字符串替换，`https://dashboard.example.com.evil.com`、`https://evil-dashboard.example.com` 等伪造域均无法命中；位置正确——检查位于唯一收口函数 `applyPolicy` 内，先于任何 CORS 头写出；覆盖完整——拒绝路径第 39 行只返回 `Vary: Origin`，完全不发出 ACAO/ACAC，浏览器将拦截跨域读取。
+
+4. 数据流 B（预检 OPTIONS，第 29-31 行）与组合条件验证：预检响应同样强制经过 `applyPolicy` 的第 38 行检查，因此第 44 行 `Access-Control-Allow-Credentials: true` 只可能在白名单精确命中后发出，永不与通配符 `*` 或攻击者可控 Origin 共存，规避了 CWE-942 的经典危险组合；第 39 与 45 行对允许和拒绝两种响应均返回 `Vary: Origin`，防止共享 CDN/代理缓存把一个源的 CORS 头投递给另一源；且反射值经白名单过滤后必为固定常量，Origin 值不存在 CRLF 头注入可能。
+
+5. 第二入口/替代通道检查：本模块是网关唯一的 CORS 头写入点——`applyPolicy` 为 private、类为 final，不存在其他路由、参数或间接调用可绕过该检查，也没有任何无条件回显 Origin 的兜底路径。结论：精确白名单 + Vary: Origin + 凭据不与通配组合的三重防御类型正确、位置正确、覆盖完整，无第二入口，不构成 CWE-942 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "外部输入仅第27行读取的 Origin 请求头，经第30行预检分支与第33行实际请求分支两条路径均可达第43行 Access-Control-Allow-Origin 响应头这一 sink；两条流共用唯一收口 applyPolicy：第38行 in_array 第三参 true 对第16-19行固定常量白名单做严格精确等值匹配，属类型正确（精确白名单而非黑名单/正则/字符串替换，前后缀伪造域无法命中）、位置正确（先于任何 CORS 头写出）、覆盖完整（预检与实际请求两分支均强制经过，拒绝路径第39行不发出任何 ACAO/ACAC）；第44行 Allow-Credentials: true 仅在白名单命中后发出，永不与通配符 * 或攻击者可控 Origin 组合；第39与45行对允许与拒绝响应均返回 Vary: Origin，防止共享缓存跨源串投 CORS 头；反射值必为固定常量，亦无 CRLF 头注入；第二入口检查：CORS 头仅由私有方法 applyPolicy 一处写入，类为 final，无其他路由/参数/间接调用可绕过，防御完整，不构成 CWE-942", "fix_suggestion": "no fix needed"}
+```

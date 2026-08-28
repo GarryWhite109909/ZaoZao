@@ -1,0 +1,52 @@
+LANG: java
+```code
+package com.example.filesvc.web;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
+@RestController
+public class FileProcessController {
+
+    private static final Path BASE_DIR = Paths.get("/var/app/inbox");
+
+    @PostMapping("/api/files/process")
+    public ResponseEntity<String> process(@RequestParam("file") MultipartFile file) {
+        String name = file.getOriginalFilename();
+        if (name != null && name.contains("..")) {
+            return ResponseEntity.badRequest().body("illegal file name");
+        }
+        try {
+            Path target = BASE_DIR.resolve(name);
+            Files.write(target, file.getBytes());
+            return ResponseEntity.ok("processed: " + name);
+        } catch (IOException e) {
+            return ResponseEntity.status(500).body("process failed: " + e.getMessage() + " | " + e.getStackTrace()[0]);
+        } catch (Exception e) {
+            return ResponseEntity.status(500).body("unexpected error: " + e.toString());
+        }
+    }
+}
+```
+
+1. 本类核心特征：第 30 行与第 32 行把异常对象细节（`e.getMessage()`、`e.getStackTrace()[0]`、`e.toString()`）直接拼接进 HTTP 500 响应体返回客户端。泄露内容包括服务器绝对路径（如 `/var/app/inbox/...: Permission denied`）、内部包名/类名/方法名与源码行号（堆栈首帧 `com.example.filesvc.web.FileProcessController.process(...)`）。这是错误信息泄露敏感内容（CWE-209），全程没有任何执行类 sink，不是命令注入/SQL 注入/XXE，也不是越权问题。
+
+2. 外部输入点枚举与可达性：唯一外部入口是第 20 行 `@RequestParam("file") MultipartFile`，含两个攻击者可控分量——原始文件名（第 21 行）与文件字节（第 27 行）。文件名经第 26 行 `resolve` 进入第 27 行 `Files.write`，任一 I/O 失败即抛 IOException 被第 29 行捕获到达 sink（第 30 行）；文件名为 null 时第 26 行 `resolve(null)` 抛 NullPointerException 被第 31 行捕获到达第二 sink（第 32 行）；`file.getBytes()` 的读取失败同样汇入第 30 行。全部输入点均可达 sink。
+
+3. 数据流 1 与防御核查：攻击者上传文件名为已存在目录名或空串的文件，第 27 行抛出携带服务器绝对路径与操作系统层原因的 IOException，第 30 行将其 message 与堆栈首帧写入响应体。全文件唯一防御是第 22-24 行对 `..` 的字符串包含黑名单：类型为黑名单过滤、位置在 try 之前、目标是文件名而非错误输出，对异常净化覆盖面为零（且该黑名单本身可被绝对路径等方式绕过）；不存在 `@ControllerAdvice`、通用错误体或仅写日志的处理模式，该流无任何有效防御。
+
+4. 数据流 2 与防御核查：multipart 字段缺省文件名时 `name` 为 null，通过第 22 行的 null 安全判断后于第 26 行抛 NPE，第 32 行 `e.toString()` 把完整异常类名与 JVM 生成的细节消息原样返回。与流 1 共用同一套缺失的防御；且 IOException 与 Exception 两级 catch 叠加，使处理方法内几乎所有失败路径都以细节丰富的响应体收尾，泄露近乎全覆盖。
+
+5. 第二入口/替代通道检查：本文件仅声明一条路由（第 19 行 `/api/files/process`）与一个处理方法（第 20 行），无其他 `@PostMapping`/`@GetMapping`、无 `@ExceptionHandler`/`@ControllerAdvice`、无经服务层间接格式化错误的调用；不存在第二入口或替代通道，单一 multipart 上传通道即完整承载 source→sink，支撑漏洞成立结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-209 Generation of Error Message Containing Sensitive Information", "risk_level": "High", "source": "line 20: 外部输入 @RequestParam MultipartFile file（攻击者可控的原始文件名 line 21 与文件字节 line 27）", "sink": "line 30: e.getMessage() 与 e.getStackTrace()[0] 拼接进 HTTP 500 响应体（line 32 的 e.toString() 为同类第二 sink）", "explanation": "流1：上传文件名经 line 22-24 的 '..' 字符串黑名单（仅针对文件名、位于 try 之前、对错误输出零覆盖且可被绝对路径等方式绕过）后到达 line 26-27，I/O 失败抛出的 IOException 携带服务器绝对路径与底层原因，line 30 将 e.getMessage() 与 e.getStackTrace()[0]（泄露内部包 com.example.filesvc、类/方法名与源码行号）直接写入 500 响应体返回客户端；流2：文件名为 null 时 line 26 抛 NullPointerException 被 line 31 捕获，line 32 将 e.toString()（完整异常类名与 JVM 细节消息）原样返回；防御核查：全文件无 @ControllerAdvice、无通用错误体、无仅日志化处理，两级 catch 使几乎所有失败路径均泄露细节，属防御完全缺失；第二入口检查：本文件仅 line 19 一条路由与一个处理方法，无其他控制器/全局异常处理器/间接调用，单一通道即支撑结论；该形态为错误信息泄露敏感内容（CWE-209），非命令注入/SQL 注入/越权等其他类别", "fix_suggestion": "line 30: 删除 e.getMessage()/e.getStackTrace() 拼接，改为返回固定通用提示（如 'process failed'），完整异常仅写入服务端日志 logger.error('process failed', e)；line 32 的 e.toString() 同样替换为通用提示"}
+```

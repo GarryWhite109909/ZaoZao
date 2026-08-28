@@ -1,0 +1,62 @@
+LANG: java
+```code
+package com.acme.payments.gateway;
+
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * Submits cardholder charge data to the external payment gateway.
+ */
+public class PaymentGatewayClient {
+
+    private static final String GATEWAY_ENDPOINT = "http://payments-gw.internal.example.com:8080/api/v1/charge";
+
+    public String submitCharge(String cardNumber, String cardholderName,
+                               String cvv, String expiry, double amount) throws Exception {
+        String payload = String.format(
+                "{\"card_number\":\"%s\",\"cardholder\":\"%s\",\"cvv\":\"%s\",\"expiry\":\"%s\",\"amount\":%.2f}",
+                cardNumber, cardholderName, cvv, expiry, amount);
+
+        URL url = new URL(GATEWAY_ENDPOINT);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setDoOutput(true);
+
+        try (OutputStream os = conn.getOutputStream()) {
+            os.write(payload.getBytes(StandardCharsets.UTF_8));
+        }
+
+        int status = conn.getResponseCode();
+        if (status != 200) {
+            throw new IllegalStateException("Gateway rejected charge: HTTP " + status);
+        }
+        return "charge-submitted";
+    }
+}
+```
+
+1. 本类核心特征：第 13 行将出站端点硬编码为 `http://` 明文信道，第 17~19 行把卡号、持卡人姓名、CVV、有效期等支付卡 PII 以明文拼进 JSON，经该信道跨进程/主机信任边界外发——这正是 CWE-311（敏感数据缺失加密）的典型形态：传输保密性缺失。代码中没有任何不可信字符串被解释为命令、SQL 或查询语句，数据体是纯数据载荷，因此这不是命令注入/SQL 注入/注入类问题，也不是越权，而是明文传输敏感数据。
+
+2. 外部输入点枚举与可达性：第 15~16 行 `submitCharge` 的四个字符串参数（cardNumber/cardholderName/cvv/expiry）即外部输入点，对应收银台/上游服务传入的持卡人数据；它们无条件流入第 17~19 行的 payload 拼装，再直达第 28 行 `os.write` 的网络写出，路径上没有任何分支、校验或转换能阻断该流，source→sink 可达性成立。
+
+3. 主数据流验证：第 15~16 行（source：原始 PAN/CVV）→ 第 17~19 行（`String.format` 拼成明文 JSON，敏感字段原样保留）→ 第 21~22 行（按第 13 行的 `http://` 端点 `openConnection`，且强转为 `HttpURLConnection`，确认底层是明文 socket 而非 TLS）→ 第 28 行（sink：`os.write` 将明文卡数据写入网络）。
+
+4. 防御核查：全链路无任何有效防御——端点 scheme 为 `http://`，无 `HttpsURLConnection`/SSLContext/TLS 配置；序列化前无字段级加密、令牌化或哈希；第 17 行 `String.format` 仅为格式化拼装，不构成任何过滤或保护；第 31~34 行的 HTTP 状态码检查发生在数据已经明文发出之后，属于响应处理，无法追回传输中已暴露的数据。即便存在黑名单/正则类过滤也不能替代加密，而本例连过滤都不存在。主机名含 internal 不构成缓解：跨进程/跨主机即为信任边界，且支付卡数据传输本身受 PCI DSS 加密要求约束。
+
+5. 第二入口/替代通道检查：本文件仅暴露一个公开方法 `submitCharge` 与一个端点常量 `GATEWAY_ENDPOINT`，无其他路由、无日志落盘、无缓存或第二写路径；替代通道缺失并不能减轻风险，仅此一条 `http://` 明文外发流已足以确认漏洞成立。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-311 Missing Encryption of Sensitive Data",
+  "risk_level": "High",
+  "source": "line 15-16: submitCharge 方法参数 cardNumber/cardholderName/cvv/expiry（外部传入的持卡人敏感数据）",
+  "sink": "line 28: os.write(payload...) 将明文卡数据写入 line 13 定义的 http:// 明文信道",
+  "explanation": "输入点核查：第15-16行四个字符串参数为外部持卡人数据（卡号/姓名/CVV/有效期），无条件直达第28行网络写出，可达性成立；数据流：第15-16行参数 -> 第17-19行 String.format 拼成明文 JSON -> 第21-22行按第13行 http:// 端点建立 HttpURLConnection -> 第28行 os.write 明文外发；防御核查：端点为 http:// 且强转 HttpURLConnection 确认无 TLS，序列化前无字段级加密/令牌化/哈希，String.format 仅为格式化不构成防御，第31-34行状态码检查发生在传输之后无法保护已暴露数据，全链路无任何有效加密防御；第二入口检查：本文件仅一个公开方法与一个端点常量，无其他路由或替代通道，但仅此一条明文外发流已足以确认 CWE-311",
+  "fix_suggestion": "line 13: 将 GATEWAY_ENDPOINT 改为 https:// 并改用 HttpsURLConnection 发送，同时对卡号/CVV 做字段级加密或令牌化后再传输"
+}
+```

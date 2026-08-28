@@ -1,0 +1,66 @@
+LANG: python
+```code
+"""form_schema/field_validator.py
+动态表单校验服务：租户可提交自定义正则表达式，用于校验其表单字段取值。
+"""
+
+import re
+
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+SAMPLE_TEXT = "a" * 64  # 字段缺省取值，用于演示正则匹配效果
+
+# 粗粒度黑名单：仅拦截三种字面嵌套量词写法
+BLOCKED_FRAGMENTS = ("(.*)*", "(.+)+", "(a+)+")
+
+
+@app.route("/api/fields/validate", methods=["POST"])
+def validate_field():
+    pattern = request.form.get("pattern", "")
+    value = request.form.get("value", SAMPLE_TEXT)
+
+    if len(pattern) > 256 or any(frag in pattern for frag in BLOCKED_FRAGMENTS):
+        return jsonify({"ok": False, "error": "pattern rejected"}), 400
+
+    try:
+        matcher = re.compile(pattern)
+        result = matcher.fullmatch(value)
+    except re.error:
+        return jsonify({"ok": False, "error": "invalid regex"}), 400
+
+    return jsonify({"ok": bool(result),
+                    "span": list(result.span()) if result else None})
+
+
+@app.route("/api/fields/validate/batch", methods=["POST"])
+def validate_batch():
+    payload = request.get_json(silent=True) or {}
+    results = []
+    for rule in payload.get("rules", []):
+        try:
+            hit = re.fullmatch(rule.get("pattern", ""), rule.get("value", SAMPLE_TEXT))
+        except re.error:
+            hit = None
+        results.append(bool(hit))
+    return jsonify({"results": results})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+```
+
+第 1 步（本类核心特征）：第 26-27 行把用户提交的正则原样交给 Python `re` 引擎编译并对输入串做回溯匹配。CWE-400 的典型形态之一即 ReDoS：当 pattern 含嵌套量词或重叠分支（如 `(a|aa)+`、`(a*)*`、`(x+x+)+y`），且被匹配串在尾部带一个无法匹配的字符时，回溯路径数随输入长度呈指数增长；Python `re` 是带回溯的实现且不提供任何超时参数，单个请求即可让 worker 线程计算数小时。这是不可信输入驱动的无界 CPU 资源消耗，属于 CWE-400，而不是命令注入/SQL 注入/代码执行——尽管语义上是『执行正则』，全程不涉及命令、SQL 或代码求值。
+
+第 2 步（输入点枚举与可达性）：本模块共两个 HTTP 入口。入口一 POST /api/fields/validate：第 19 行 `request.form.get('pattern')` 与第 20 行 `request.form.get('value')` 均为攻击者完全可控的表单字段，未经任何转换直接流入第 26 行 `re.compile(pattern)` 与第 27 行 `matcher.fullmatch(value)`，source→sink 在同一函数体内直达，可达性成立。入口二 POST /api/fields/validate/batch：第 37 行 `request.get_json` 取出 JSON 体，第 39 行遍历 rules 列表，第 41 行 `re.fullmatch(rule.get('pattern'), rule.get('value'))` 同样直达匹配 sink。
+
+第 3 步（主链防御验证）：第 22 行存在两道检查，但均非有效防御。其一 `len(pattern) > 256` 的长度上限：回溯规模由 pattern 结构乘以 value 长度决定，灾难性模式通常不足 20 个字符，长度上限无法约束回溯规模；其二三段字面黑名单 `(.*)* / (.+)+ / (a+)+` 属于黑名单过滤，可被 `(a|aa)+b`、`(a*)*$`、`((a+)*)+$` 等不含这些子串的等价灾难写法绕过。第 28 行 `except re.error` 只捕获编译期语法错误，运行期回溯爆炸不会抛出该异常；全文件亦无 signal.alarm、子进程隔离、worker 超时等兜底机制。主链确认无有效防御。
+
+第 4 步（第二入口数据流与防御缺失）：第 35-45 行批量路由是同一 sink 的替代通道，且防御更弱：完全没有第 22 行的黑名单与长度检查，第 41 行直接用用户 pattern/value 调用 `re.fullmatch`。攻击者甚至无需自定义 value——仅提交 pattern 为 `(a|aa)+b`，对缺省的第 11 行 SAMPLE_TEXT（64 个 'a'）做 fullmatch 时，因尾部 'b' 永远无法匹配，引擎需枚举指数级的切分路径后才判定失败。此外第 39 行 rules 列表长度无上限，单请求可携带任意多条规则，把指数级消耗再乘以循环次数，形成放大效应。
+
+第 5 步（第二入口结论与最终判定）：第二入口检查结论为『存在』——/api/fields/validate/batch 与主路由汇入同一匹配 sink，且连弱黑名单都没有；模块内亦无认证、限流或并发约束。两条链均为不可信输入驱动的无界 CPU 消耗，单个未认证请求即可钉死一个 worker 线程，线程池耗尽后整站拒绝服务，故判定存在 CWE-400 漏洞，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-400 Uncontrolled Resource Consumption", "risk_level": "High", "source": "line 19: request.form.get('pattern', '')（用户提交的正则；line 20 的 value 控制回溯输入；第二入口为 line 37 request.get_json）", "sink": "line 27: matcher.fullmatch(value)（line 26 re.compile(pattern) 编译用户正则；第二入口同型 sink 为 line 41 re.fullmatch）", "explanation": "流1: line 19/20 表单参数 pattern 与 value 未经任何有效性约束直达 line 26 re.compile 与 line 27 fullmatch，提交 (a|aa)+b 之类嵌套量词即可对缺省 64 个 a 的样本串触发指数级回溯; 流2: line 22 的长度上限 256 无法约束回溯规模（灾难模式通常不足 20 字符），三段字面黑名单可被 (a*)*$ / ((a+)*)+$ 等等价写法绕过，line 28 的 except re.error 只捕获编译期语法错误、对运行期回溯失效，Python re 引擎无超时机制，主链无有效防御; 流3: 第二入口 line 35-45 批量路由完全缺失黑名单与长度检查，line 41 直接 re.fullmatch，且 line 39 的 rules 列表长度无上限形成循环放大; 综上属不可信输入驱动的无界 CPU 消耗（ReDoS），归类 CWE-400 而非命令注入/SQL 注入", "fix_suggestion": "line 26: 弃用用户提交的正则，改为服务端内置白名单规则；若业务必须支持自定义正则，换用支持超时的第三方 regex 模块（如 regex.compile(pattern).fullmatch(value, timeout=0.5)）并限制 pattern 复杂度与 value 长度"}
+```

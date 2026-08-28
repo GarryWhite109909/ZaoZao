@@ -1,0 +1,67 @@
+LANG: php
+```code
+<?php
+declare(strict_types=1);
+
+namespace App\Auth;
+
+use PDO;
+
+final class PasswordResetService
+{
+    public function __construct(
+        private readonly PDO $pdo,
+        private readonly string $notifyApi = 'http://notify.internal.example.com/api/v1/mail'
+    ) {}
+
+    /** POST /auth/reset-request  form: email */
+    public function requestReset(string $email): void
+    {
+        $token = bin2hex(random_bytes(32));
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO password_resets (email, token, expires_at) VALUES (?, ?, NOW() + INTERVAL 1 HOUR)'
+        );
+        $stmt->execute([$email, $token]);
+        $this->sendMail($email, 'Reset your password',
+            "Open http://shop.example.com/auth/reset-confirm?token={$token} to set a new password.");
+    }
+
+    /** POST /auth/reset-confirm  form: token, password */
+    public function confirmReset(string $token, string $newPassword): void
+    {
+        $sel = $this->pdo->prepare(
+            'SELECT email FROM password_resets WHERE token = ? AND expires_at > NOW()'
+        );
+        $sel->execute([$token]);
+        $row = $sel->fetch(PDO::FETCH_ASSOC);
+        if ($row === false) {
+            throw new \RuntimeException('invalid or expired reset token');
+        }
+        $upd = $this->pdo->prepare('UPDATE users SET password = ? WHERE email = ?');
+        $upd->execute([$newPassword, $row['email']]);
+    }
+
+    private function sendMail(string $to, string $subject, string $body): void
+    {
+        $ctx = stream_context_create(['http' => [
+            'method'  => 'POST',
+            'content' => http_build_query(['to' => $to, 'subject' => $subject, 'body' => $body]),
+        ]]);
+        file_get_contents($this->notifyApi, false, $ctx);
+    }
+}
+```
+
+1. 第 1 步（本类核心特征）：CWE-311 的核心是敏感数据（口令/令牌/PII）以明文形态跨越信任边界，本文件呈现两种典型形态：①明文信道——重置令牌被拼进 `http://` 链接（第 24 行）并经默认 `http://` 的出站邮件 API 明文外发（第 12、48 行）；②明文落库——新口令未经 `password_hash()` 直接写入 `users.password`（第 39 行）。需要明确：全部 SQL 均使用预处理语句（第 19-22、30-33、38-39 行），不存在 SQL 注入，也没有命令执行或越权逻辑，问题本质是敏感数据的机密性缺失（未加密），属于 CWE-311，而非注入/越权类。
+
+2. 第 2 步（输入点枚举与可达性）：外部输入共三处——入口 1：第 16 行 `requestReset(string $email)`，来自 POST /auth/reset-request 表单字段 email；入口 2：第 28 行 `confirmReset(string $token, string $newPassword)`，来自 POST /auth/reset-confirm 表单字段 token 与 password。两个入口均为 public 方法、由路由控制器直接调用，参数无任何阻断地直达 sink：`$email` → 第 22 行落库并经第 23 行进入 sendMail；`$token` → 第 18 行生成的令牌 → 第 24 行链接 → 第 48 行外发；`$newPassword` → 第 39 行落库。可达性全部成立。
+
+3. 第 3 步（流 A：令牌明文过网）：第 18 行生成重置令牌后，第 24 行将其拼入 `http://shop.example.com/auth/reset-confirm?token=...`，经第 23 行调用第 42 行 `sendMail()`，最终在第 48 行 `file_get_contents($this->notifyApi, ...)` 发往第 12 行默认值 `http://notify.internal.example.com`。全程无 TLS、无应用层加密、令牌未做哈希；且链接本身是 `http://`，用户点击时令牌会第二次明文过网。防御验证：全文件不存在任何加密/TLS 配置，也没有任何过滤逻辑（即便存在黑名单/正则/字符串替换，也无法替代传输机密性，均不算有效防御），防御缺失成立。另第 22 行令牌同时明文写入 `password_resets.token`，属同一明文存储面。
+
+4. 第 4 步（流 B：口令明文落库）：第 28 行的 `$newPassword` 未经 `password_hash()`/`crypt()` 处理，直接在第 39 行写入 `users.password`。第 38 行的预处理语句只能防 SQL 注入，与数据机密性无关，属于防御类型错位，不构成本类的有效防御；任何具备数据库读取能力的途径（备份、慢日志、连锁注入）都能直接取得明文口令。
+
+5. 第 5 步（第二入口/替代通道检查）：存在第二入口——第 28 行 `confirmReset` 与第 16 行 `requestReset` 并列，分别独立到达明文外发 sink（第 48 行）与明文落库 sink（第 39 行）；第 42 行 `sendMail` 是共享辅助函数，任何新增调用方都会继承 `http://` 明文信道。本文件内未发现其他路由或间接调用可到达这两个 sink，但仅凭已确认的两个入口与两条完整数据流，足以支撑结论：存在 CWE-311，风险 High（中间人截获重置令牌即可接管任意账号）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-311 Missing Encryption of Sensitive Data", "risk_level": "High", "source": "line 16: POST /auth/reset-request 触发 requestReset，line 18 生成重置令牌 $token", "sink": "line 48: file_get_contents($this->notifyApi, false, $ctx) 将含令牌邮件体经 http:// 明文外发", "explanation": "流A: line 18 令牌拼入 line 24 的 http:// 重置链接, 经 line 23 调用 line 42 sendMail, 于 line 48 发往 line 12 默认的 http://notify.internal.example.com, 全程无 TLS/无应用层加密/令牌未哈希, 链接本身为 http:// 致用户点击时令牌二次明文过网, 且 line 22 令牌同时明文落库; 流B: line 28 confirmReset 的 $newPassword 未经 password_hash 于 line 39 明文写入 users.password, line 38 预处理语句仅防 SQL 注入、与机密性无关, 不属有效防御; 防御面: 全文件无任何加密/TLS/哈希措施, 亦无过滤逻辑, 且黑名单/正则/字符串替换类过滤本就不能替代传输加密与口令哈希; 第二入口: line 28 为独立第二入口, 与 line 16 分别到达明文外发与明文落库两个 sink, sendMail 为共享辅助函数使任何调用方继承明文信道, 未发现其他路由或间接调用, 已确认入口足以定论", "fix_suggestion": "line 12: 最小修复——将 $notifyApi 默认值改为 https:// 使 line 48 走 TLS；并在 line 39 改为 password_hash($newPassword, PASSWORD_DEFAULT) 哈希后存储，line 24 重置链接同步改用 https://"}
+```

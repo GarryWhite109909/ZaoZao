@@ -1,0 +1,65 @@
+LANG: javascript
+```code
+// src/routes/accountSearch.js
+const express = require('express');
+const mysql = require('mysql2/promise');
+
+const router = express.Router();
+
+const pool = mysql.createPool({
+  host: 'db.internal.corp',
+  port: 3306,
+  user: 'reporting_rw',
+  password: process.env.DB_PASSWORD,
+  database: 'billing',
+});
+
+// GET /api/accounts/search?email=...
+router.get('/api/accounts/search', async (req, res) => {
+  const email = req.query.email || '';
+  try {
+    const [rows] = await pool.query(
+      'SELECT account_id, email, balance FROM accounts WHERE email LIKE ?',
+      ['%' + email + '%']
+    );
+    res.json({ results: rows });
+  } catch (err) {
+    console.error('[accounts] query failed:', err);
+    res.status(500).json({
+      message: err.message,
+      sql: err.sql,
+      code: err.code,
+      stack: err.stack,
+    });
+  }
+});
+
+// POST /api/accounts/:id/audit
+router.post('/api/accounts/:id/audit', async (req, res) => {
+  try {
+    await pool.query(
+      'INSERT INTO audit_log (account_id, action, created_at) VALUES (?, ?, NOW())',
+      [req.params.id, req.body.action]
+    );
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).send('DB error: ' + err.message);
+  }
+});
+
+module.exports = router;
+```
+
+1. 第 1 步（本类核心特征）：CWE-209 的核心是“错误信息中携带敏感内容并回传给客户端”。第 24 行 catch 捕获数据库驱动抛出的 Error 后，第 26-31 行把 err.message、err.sql、err.code、err.stack 四个字段整体写入 500 响应体；第 43-44 行在第二个路由再把 err.message 拼进响应文本——SQL 语句、堆栈、内部路径、连接细节随错误对象原样出网，正是本类典型形态。同时明确排除其他类别：第 20-21 行与第 39-40 行均使用 `?` 占位符参数化、值由驱动转义，不构成 SQL 注入；文件无命令执行、无权限判断逻辑，问题类别唯一，即错误信息泄露（CWE-209），不是注入或越权。
+
+2. 第 2 步（外部输入点枚举与 sink 可达性）：共三个输入点——第 17 行 req.query.email（GET /api/accounts/search）、第 40 行 req.params.id 与 req.body.action（POST /api/accounts/:id/audit）。email 经第 21 行参数数组进入第 19 行 pool.query；id 与 action 经第 40 行进入第 38 行语句。任一输入触发的驱动级失败（连接拒绝、访问被拒、外键约束、字段超长等）都会把执行流带入第 24 行或第 43 行 catch，sink 对外部请求可达；且 mysql2 的 query() 在客户端内联参数值，失败时 err.sql 中带有用户原始输入，输入可实际出现在泄露内容里。第 11 行 process.env.DB_PASSWORD 属部署配置而非请求输入，不会进入响应，仅在此枚举说明。
+
+3. 第 3 步（流 1 数据流与防御核验）：第 17 行 email → 第 21 行参数 → 第 19-21 行 SELECT → 失败时第 24 行 err：err.sql 携带完整语句（暴露 accounts 表名、列名与内联的 email 值），err.stack 携带服务器绝对路径与行号，连接类错误的 message 还会带出第 8、10 行的内部主机 db.internal.corp 与账号 reporting_rw → 第 26-31 行 res.status(500).json 原样序列化。防御核验：占位符参数化只防注入、对本类无效；catch 到响应之间无错误码映射、无字段白名单、无按环境（development/production）降级；第 25 行 console.error 仅为服务端日志，不影响响应体——该链路零防御。
+
+4. 第 4 步（流 2 数据流与防御核验）：第 40 行 req.params.id、req.body.action → 第 38-40 行 INSERT → 第 43 行 catch → 第 44 行 'DB error: ' + err.message 直接 send 给客户端；外键/超长类错误的 message 会暴露 audit_log 的表名、列名与约束定义，err.sql 内联 id 与 action 值。同样无任何过滤、映射或降级处理，防御缺失与流 1 完全一致。
+
+5. 第 5 步（第二入口/替代通道检查与结论）：存在第二入口——第 36 行 POST 路由与第 16 行 GET 路由共享第 7 行同一连接池，连接级失败（ECONNREFUSED、ER_ACCESS_DENIED_ERROR）会同时命中两个 catch，形成两条相互独立、形态一致的 source→sink 链；本文件未定义任何 Express 错误处理中间件（第 48 行仅 module.exports 导出 router），不存在全局兜底拦截；除这两条路由外未发现其他入口或间接调用。两条链均无防御，支撑最终结论：本文件是典型、无歧义的 CWE-209，风险 High——SQL 与库表结构、内部主机/账号、堆栈路径一并暴露，可直接辅助攻击者绘制内网拓扑与数据库结构。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-209 Generation of Error Message Containing Sensitive Information", "risk_level": "High", "source": "line 24: catch (err) 捕获的数据库驱动 Error 对象（含 SQL、连接细节与堆栈；由 line 17 req.query.email 及 line 40 req.params.id、req.body.action 触发的语句失败产生）", "sink": "line 26: res.status(500).json({message: err.message, sql: err.sql, code: err.code, stack: err.stack}) 原样写入响应体", "explanation": "流1：line 17 req.query.email 经 line 21 参数数组进入 line 19 pool.query，mysql2 客户端格式化使失败时 err.sql 内联用户值，line 24 catch 后 line 26-31 将 err.message/err.sql/err.code/err.stack 原样序列化进 500 响应，err.sql 暴露 accounts 表完整语句与列名，err.stack 暴露内部绝对路径与行号，连接类错误 message 带出 line 8-10 的 db.internal.corp 与 reporting_rw；防御核验：占位符参数化仅防注入、与本类无关，catch 到响应间无错误映射、无字段白名单、无环境降级，line 25 console.error 仅为服务端日志，全链路零防御；流2（第二入口）：line 40 req.params.id 与 req.body.action 进入 line 38 INSERT，line 43 catch 后 line 44 以字符串拼接把 err.message 直接 send 给客户端，外键/超长错误暴露 audit_log 表列与约束定义，同样无防御；文件未定义任何 Express 错误中间件（line 48 仅导出 router），两条路由共享 line 7 连接池，连接级失败同时命中两个 catch，替代通道检查确认仅此两条独立泄露链；结论：典型 CWE-209 错误信息敏感内容泄露，非 SQL 注入/命令注入/越权类。", "fix_suggestion": "line 26: 最小修复——响应体仅返回固定文案 {error: 'internal server error'}，删除 message/sql/code/stack 字段，err 详细内容只写入服务端日志；line 44 同步改为固定文案"}
+```

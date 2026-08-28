@@ -1,0 +1,69 @@
+LANG: php
+```code
+<?php
+
+namespace App\Modules\FileProcessing;
+
+use App\Core\Database;
+use App\Core\Response;
+use App\Exception\StorageException;
+
+class DocumentImportHandler
+{
+    private Database $db;
+
+    public function __construct(Database $db)
+    {
+        $this->db = $db;
+    }
+
+    public function handle(): void
+    {
+        try {
+            $file = $_FILES['attachment'] ?? null;
+            if ($file === null || $file['error'] !== UPLOAD_ERR_OK) {
+                Response::json(['status' => 'error', 'message' => 'no file uploaded'], 400);
+                return;
+            }
+
+            $targetPath = __DIR__ . '/../../storage/uploads/' . basename($file['name']);
+            if (!move_uploaded_file($file['tmp_name'], $targetPath)) {
+                throw new StorageException('failed to persist upload to ' . $targetPath);
+            }
+
+            $stmt = $this->db->pdo->prepare('INSERT INTO documents (name, path, size) VALUES (:n, :p, :s)');
+            $stmt->execute(['n' => $file['name'], 'p' => $targetPath, 's' => $file['size']]);
+            Response::json(['status' => 'ok', 'id' => $this->db->pdo->lastInsertId()], 200);
+        } catch (\PDOException $e) {
+            Response::json([
+                'status' => 'error',
+                'message' => $e->getMessage(),
+                'sql' => $e->errorInfo[2] ?? '',
+                'trace' => $e->getTraceAsString(),
+            ], 500);
+        } catch (\Exception $e) {
+            Response::json([
+                'status' => 'error',
+                'message' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ], 500);
+        }
+    }
+}
+```
+
+分析：
+
+1. **本类核心特征定位**：CWE-209 的典型形态是异常对象/底层错误被原样写进响应体。本文件第 35-41 行与第 42-47 行两个 catch 块分别把 `$e->getMessage()`（第 38、45 行）、`$e->errorInfo[2]` 原生驱动错误（第 39 行）、`$e->getTraceAsString()` 完整堆栈（第 40、46 行）直接序列化进 `Response::json` 的 HTTP 响应。这是错误信息泄露敏感内容（信息泄露类），不是注入或越权：第 32 行使用预处理语句绑定参数，不存在 SQL 注入；文件中也没有任何命令执行或鉴权逻辑，缺陷纯粹在于异常内部细节成为客户端可见的响应内容。
+
+2. **外部输入点枚举与可达性**：唯一外部输入点是第 21 行的 multipart 上传 `$_FILES['attachment']`（含 name/tmp_name/size/error 字段），以及由这些值触发的数据库/驱动异常状态。可达性成立：`handle()` 即路由处理器，每次请求必经 try 块；`$file['name']` 流入第 27 行 `$targetPath`，再流入第 29 行异常消息与第 33 行 `execute()` 参数，两条链最终都汇入 catch 块中的响应 sink。
+
+3. **数据流 A（内部路径泄露）**：第 27 行 `$targetPath` 拼接了 `__DIR__`（模块的绝对内部路径，如 /var/www/...）与用户可控文件名；第 29 行将其写入 `StorageException` 消息；被第 42 行通用 catch 捕获后，第 45 行 `getMessage()` 把内部文件系统路径回显给客户端，第 46 行 `getTraceAsString()` 进一步暴露框架内部类名、文件路径与行号。第 27 行的 `basename()` 只是路径穿越缓解措施，与错误信息脱敏无关，不构成本类防御。
+
+4. **数据流 B（SQL/驱动细节泄露）与防御覆盖面**：当第 33 行 `execute()` 因字段超长、唯一约束或连接故障抛出 `PDOException` 时，第 35 行捕获，第 38 行 `getMessage()` 含驱动错误文本与失败 SQL 语句，第 39 行 `errorInfo[2]` 是含表名/列名/参数值的原生错误，第 40 行堆栈暴露完整内部调用链。第 32 行预处理语句只防 SQL 注入，对驱动错误文本回显毫无作用；全文件无日志-only 处理器、无错误码映射、无 debug 开关门控（如 app.debug 判断），两条流均为零有效防御。
+
+5. **第二入口/替代通道检查**：本类除构造函数外仅暴露 `handle()` 一个公共入口，文件内无其他路由、方法或间接调用；且两个 catch 块收敛到同一组泄露 sink（第 38-40、45-46 行），任何替代触发路径（上传失败、DB 失败、框架异常）都必然落入泄露点——既不存在绕过泄露的安全通道，也不存在未覆盖的独立入口，证实该缺陷在本处理器内是系统性的，支撑最终结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-209 Generation of Error Message Containing Sensitive Information", "risk_level": "High", "source": "line 21: $_FILES['attachment'] 上传输入字段(name/tmp_name/size)及其触发的数据库/驱动异常状态", "sink": "line 38: Response::json 将 $e->getMessage()、$e->errorInfo[2] 与 $e->getTraceAsString() 原样写入 HTTP 响应体(同模式见第39-40、45-46行)", "explanation": "流A: 第21行上传输入 -> 第27行 $targetPath 拼接 __DIR__ 内部绝对路径与用户可控文件名 -> 第29行写入 StorageException 消息 -> 第42行通用 catch -> 第45-46行 getMessage 与完整堆栈回显客户端, 泄露内部文件系统路径与框架调用链; 流B: 第21行上传元数据 -> 第33行 execute() 触发 PDOException -> 第35行捕获 -> 第38-40行驱动错误文本、含表名列名参数值的原生 SQL 错误与完整堆栈回显客户端; 防御核查: 第27行 basename 仅缓解路径穿越、第32行预处理语句仅防 SQL 注入, 二者均不脱敏错误输出, 全文件无日志-only 处理、无错误码映射、无 debug 门控, 两条流均零有效防御; 第二入口检查: handle() 为唯一公共入口, 两个 catch 收敛于同一泄露 sink, 不存在绕过泄露的替代路由或通道, 缺陷为系统性", "fix_suggestion": "line 38: 最小修复——两个 catch 块改为服务端记录完整异常(error_log/monolog), 响应体仅返回通用文案, 如 Response::json(['status' => 'error', 'message' => 'internal server error'], 500), 不再输出 getMessage/errorInfo/trace"}
+```

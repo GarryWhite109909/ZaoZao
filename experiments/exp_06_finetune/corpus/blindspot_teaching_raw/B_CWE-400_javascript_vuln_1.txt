@@ -1,0 +1,53 @@
+LANG: javascript
+```code
+'use strict';
+
+const express = require('express');
+const router = express.Router();
+const catalog = require('../services/catalog');
+
+// 搜索词格式白名单：仅允许字母数字词，词间用单个空格或连字符分隔
+const TERM_PATTERN = /^([a-zA-Z0-9]+[- ]?)+$/;
+
+// 将查询词编译为高亮正则：多个词合并为交替分支后整体叠加 + 量词
+function buildHighlightRegex(query) {
+  const words = query.trim().split(/\s+/).filter(Boolean);
+  const escaped = words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return new RegExp('(' + escaped.join('|') + ')+', 'i');
+}
+
+router.get('/search', (req, res) => {
+  const q = String(req.query.q || '');
+  const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+
+  // 输入长度上限与格式校验
+  if (q.length > 256) {
+    return res.status(400).json({ error: 'query too long' });
+  }
+  if (!TERM_PATTERN.test(q)) {
+    return res.status(400).json({ error: 'invalid query' });
+  }
+
+  const highlight = buildHighlightRegex(q);
+  const pool = catalog.listAll(); // 全量商品，含卖家自定义名称与简介（用户生成内容）
+  const hits = pool.filter(p => highlight.test(p.name) || highlight.test(p.summary));
+
+  res.json({ total: hits.length, items: hits.slice(0, limit) });
+});
+
+module.exports = router;
+```
+
+1. **本类核心特征定位**：CWE-400 的本质是不可信输入驱动无界资源消耗，本例的典型形态是灾难性回溯正则（ReDoS）：第 8 行 `TERM_PATTERN` 采用嵌套量词 `([a-zA-Z0-9]+[- ]?)+`（分组内 `+` 与 `?` 之外整体再叠加 `+`），第 14 行把用户词表拼成 `(w1|w2)+` 的交替分支叠加量词；两类结构在匹配失败时回溯路径数随输入长度指数增长。危害是 CPU 耗尽与事件循环阻塞，全程不涉及命令执行、SQL 拼接或权限绕过，因此归类为 CWE-400 资源消耗，而非 CWE-78/89 等注入类。
+
+2. **输入点枚举与可达性**：模块唯一路由为第 17 行 `GET /search`，外部输入点共两处：第 18 行 `req.query.q` 与第 19 行 `req.query.limit`。q 无条件流向第 25 行 `TERM_PATTERN.test(q)`（主 sink），并经第 29 行传入 `buildHighlightRegex`、在第 14 行进入 `new RegExp`、于第 31 行对商品字段执行（次级 sink），可达性成立；limit 经 `Math.min(..., 100)` 限幅后仅用于第 33 行 `slice`，无资源放大效应，不构成 sink。
+
+3. **主数据流防御核验（q → 第 25 行）**：防御一为第 22 行长度上限 256——位置虽在 sink 之前，但触发该正则指数回溯仅需约 30~40 个字符（如 `'a'.repeat(38)+'!'`，回溯步数达 2^37 量级），256 的阈值对回溯规模毫无约束，覆盖面不足；防御二是第 8 行白名单正则本身——它既是“校验”又是漏洞载体，校验动作即 sink，等于用漏洞模式做防御；此外 Node 原生 RegExp 无匹配超时、未使用 RE2 等线性引擎、无 worker 隔离，该流全程无有效防御，单个请求即可阻塞单线程事件循环，令所有并发用户得不到响应。
+
+4. **次级数据流防御核验（q → 第 14 行 → 第 31 行）**：第 13 行对元字符做字符串替换转义，属于可绕过的过滤型防御——它只能阻断正则语法注入，无法消除构造本身的歧义：用户提交重叠词（如 `'a aa'` 生成 `(a|aa)+`）或重复词（`'a a a a a'` 生成 `(a|a|a|a|a)+`）即可制造指数回溯；且第 30 行商品池包含卖家自定义名称与简介（用户生成内容），攻击者可预置 `'aaaa…ab'` 形态的存储型负载作为匹配目标，该流同样无有效防御。
+
+5. **第二入口/替代通道检查结论**：本文件仅导出第 17 行 `GET /search` 一条路由，`TERM_PATTERN` 与 `buildHighlightRegex` 在模块内无其他调用点，不存在其他参数或间接调用可到达这两个正则执行点，第 19 行 limit 亦不构成资源 sink；但唯一入口未挂载鉴权与限流中间件，且同时承载上述两条漏洞数据流，故漏洞结论由主链独立成立——未鉴权单请求即可造成全服务阻塞，风险定为 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-400 Uncontrolled Resource Consumption", "risk_level": "High", "source": "line 18: const q = String(req.query.q || '')（GET /search 的查询参数 q，外部输入）", "sink": "line 25: TERM_PATTERN.test(q) 执行嵌套量词正则（次级 sink：line 14 构造动态正则后在 line 31 highlight.test 执行）", "explanation": "流1：line 18 的 q 未经有效净化直达 line 25 的 TERM_PATTERN.test；line 8 的 ^([a-zA-Z0-9]+[- ]?)+$ 为嵌套量词形态（组内 + 与 ? 外层再叠加 +），对 'a'.repeat(38)+'!' 类输入产生 2^37 量级回溯步数；line 22 的 256 字符长度上限虽位于 sink 之前，但触发指数回溯仅需约 30-40 字符，无法约束回溯规模，且 Node 原生 RegExp 无匹配超时、未使用 RE2 线性引擎、无 worker 隔离，该流无有效防御；流2：同一 q 经 line 29 传入 buildHighlightRegex，在 line 14 被拼为 (w1|w2)+ 交替分支叠加量词的动态正则并于 line 31 对商品字段执行；line 13 的元字符转义属字符串替换过滤，仅能阻断正则语法注入，无法消除分支重叠歧义，输入 'a aa' 即生成 (a|aa)+、输入 'a a a a a' 即生成 (a|a|a|a|a)+，且 line 30 商品池含卖家自定义名称与简介（用户生成内容），攻击者可预置长重复字符负载作为匹配目标触发回溯，该流同样无有效防御；第二入口检查：本模块仅暴露 line 17 的 GET /search 一条路由，TERM_PATTERN 与 buildHighlightRegex 无其他调用点、无其他参数或间接调用可达正则执行点，line 19 的 limit 经 Math.min 限幅仅用于 line 33 的 slice 不构成资源 sink，但唯一入口未挂载鉴权与限流中间件且同时承载上述两条漏洞流，结论成立；危害定性：单次恶意匹配即可阻塞 Node 单线程事件循环造成全服务拒绝服务，属不可控资源消耗（ReDoS），非命令注入、SQL 注入或越权等其他类别", "fix_suggestion": "line 8: 将嵌套量词白名单改写为无歧义的线性形态 /^[a-zA-Z0-9]+(?:[- ][a-zA-Z0-9]+)*$/，并在 line 14 去掉包裹交替分支的 + 量词（改为逐词独立匹配），有条件时引入 RE2 引擎或为单次匹配设置超时"}
+```

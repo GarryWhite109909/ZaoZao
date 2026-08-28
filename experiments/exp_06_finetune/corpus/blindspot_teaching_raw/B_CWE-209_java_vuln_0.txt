@@ -1,0 +1,67 @@
+LANG: java
+```code
+package com.example.order.controller;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+
+@RestController
+public class OrderQueryController {
+
+    @Autowired
+    private DataSource dataSource;
+
+    @GetMapping("/api/orders/lookup")
+    public ResponseEntity<String> lookupOrder(@RequestParam("orderId") String orderId) {
+        try (Connection conn = dataSource.getConnection()) {
+            PreparedStatement ps = conn.prepareStatement(
+                    "SELECT order_id, status, amount FROM orders WHERE order_id = ?");
+            ps.setString(1, orderId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                return ResponseEntity.ok(rs.getString("status"));
+            }
+            return ResponseEntity.notFound().build();
+        } catch (SQLException e) {
+            return ResponseEntity.status(500).body("Query failed: " + e.getMessage());
+        }
+    }
+
+    @GetMapping("/api/orders/count")
+    public ResponseEntity<String> countByUser(@RequestParam("userId") String userId) {
+        try (Connection conn = dataSource.getConnection()) {
+            PreparedStatement ps = conn.prepareStatement(
+                    "SELECT COUNT(*) AS total FROM orders WHERE user_id = ?");
+            ps.setString(1, userId);
+            ResultSet rs = ps.executeQuery();
+            rs.next();
+            return ResponseEntity.ok(String.valueOf(rs.getInt("total")));
+        } catch (SQLException e) {
+            return ResponseEntity.status(500).body("Count failed: " + e.getMessage());
+        }
+    }
+}
+```
+
+1. **本类核心特征定位**：CWE-209 的典型形态是“把异常对象/底层错误原样写进响应体”。第 31 行 `catch (SQLException e)` 之后，第 32 行直接把 `e.getMessage()` 拼接进 `"Query failed: ..."` 作为 500 响应体返回；JDBC 驱动的异常消息通常内嵌完整 SQL 文本、表/列名、内部数据库主机等敏感细节。注意：第 24-25 行与第 40-41 行均使用 PreparedStatement 占位符参数化查询，不存在 SQL 注入；问题性质是错误信息外泄，属于 CWE-209（错误消息包含敏感信息），不是注入/越权/命令执行等其他类别。
+
+2. **外部输入点枚举与可达性**：本文件共两个外部输入点——第 22 行 `@RequestParam("orderId")` 与第 37 行 `@RequestParam("userId")`，均为 HTTP 查询参数，攻击者可直接构造。orderId 经第 25 行 `ps.setString` 绑定后到达第 26 行 `executeQuery`；userId 经第 41 行绑定后到达第 42 行 `executeQuery`；此外第 23/39 行 `dataSource.getConnection()` 也在同一 try 块内，连接池耗尽、数据库不可达等失败同样抛出 SQLException。两条输入到 sink 的路径均可达。
+
+3. **主数据流逐段追踪（流1）**：第 22 行 orderId → 第 25 行参数绑定 → 第 26 行 `executeQuery` 抛出 SQLException（消息内嵌 SQL 语句、表名 orders、内部主机 db.internal）→ 第 31 行捕获 → 第 32 行 `e.getMessage()` 字符串拼接进 ResponseEntity 500 响应体 → 原样返回给浏览器/调用方。敏感数据（驱动错误详情）从异常对象直达客户端响应体，中间无任何转换或脱敏。
+
+4. **防御有效性核查（流2）**：第 37 行 userId → 第 41 行绑定 → 第 42 行 `executeQuery` 失败 → 第 45 行 catch → 第 46 行同样把 `e.getMessage()` 写入响应体。两条流上不存在任何防御：没有把异常映射为通用错误码/固定文案，没有消息白名单，没有 `@ControllerAdvice` 全局异常处理器兜底，也没有“仅记日志、对外返回通用提示”的模式——catch 块本身就是泄露点。甚至连黑名单/正则/字符串替换这类可绕过过滤都不存在，防御覆盖面为零。
+
+5. **第二入口/替代通道检查**：第 36-47 行的 `/api/orders/count` 是与主入口完全同构的第二入口，说明该泄露是类级别的系统性写法而非孤立笔误；本模块内不存在替代安全通道（无统一异常处理层、无错误码映射器），任何数据库层失败都会把驱动详情暴露给匿名客户端。结论：存在漏洞，CWE-209，风险 High（泄露 SQL/schema/内部拓扑，可辅助攻击者进一步侦察）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-209 Generation of Error Message Containing Sensitive Information", "risk_level": "High", "source": "line 22: @RequestParam orderId（及 line 37: userId）触发查询失败产生的携带 SQL 文本与内部主机信息的 SQLException", "sink": "line 32: e.getMessage() 拼接进 500 响应体原样返回客户端（line 46 为同型第二泄露点）", "explanation": "流1: line 22 orderId → line 25 参数绑定 → line 26 executeQuery 抛出 SQLException → line 31 catch → line 32 e.getMessage() 进入响应体返回客户端; 流2: line 37 userId → line 41 绑定 → line 42 executeQuery 失败 → line 45 catch → line 46 同样泄露; 两条流全程无任何防御：无通用错误文案映射、无消息白名单、无 @ControllerAdvice 兜底、无仅记日志模式，catch 块即泄露点，连可绕过的黑名单/正则过滤都不存在; 查询均为 PreparedStatement 参数化，不存在 SQL 注入，问题性质是错误信息外泄即 CWE-209; 第二入口 /api/orders/count 与主入口完全同构，模块内无替代安全通道，属类级系统性缺陷", "fix_suggestion": "line 32: 删除 e.getMessage() 回显，改为返回固定通用文案（如 'Internal error, please retry later'），异常详情仅通过 logger 写入服务端日志；line 46 同步修复"}
+```

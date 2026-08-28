@@ -1,0 +1,48 @@
+LANG: python
+```code
+# app/api/profile.py — 用户资料查询接口
+import os
+
+from flask import Flask, jsonify
+
+from app.models import User, SessionLocal
+
+app = Flask(__name__)
+app.config["DEBUG"] = True  # 调试模式对客户端开启
+
+
+@app.route("/api/users/<int:user_id>", methods=["GET"])
+def get_user_profile(user_id):
+    """返回指定用户的完整资料。User 表含 id, username, email,
+    password_hash, api_key, is_admin, last_login_ip 等列。"""
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter(User.id == user_id).first()
+        if user is None:
+            return jsonify({"error": "user not found"}), 404
+
+        # 直接把 ORM 实体的全部列序列化进响应，未做任何字段白名单过滤
+        payload = {col.name: getattr(user, col.name) for col in user.__table__.columns}
+        payload["debug_info"] = {
+            "env": os.environ.get("APP_ENV", "production"),
+            "db_uri": app.config.get("DATABASE_URL", ""),
+            "service_version": "2.3.1-internal-build",
+        }
+        return jsonify(payload), 200
+    finally:
+        session.close()
+```
+
+1. **本类核心特征定位**：CWE-200 的本质是把敏感信息暴露给不可信方，而非注入或越权执行。第 23 行的字典推导把 User 实体的全部列（含 password_hash、api_key、is_admin、last_login_ip，见第 14-15 行注释）原样装入 payload，第 29 行 jsonify 直接写入 HTTP 响应返回给任意客户端；第 24-28 行进一步把环境名、数据库连接串、内部版本号拼进同一响应，第 9 行 DEBUG=True 让 Werkzeug 调试页对客户端开放。这是典型的『API 响应直接回显敏感字段 + 调试模式对外开启 + 内部配置写入对外响应』的 CWE-200 形态，与命令注入（CWE-78）、SQL 注入（CWE-89）、代码注入（CWE-94）无关。
+
+2. **外部输入点枚举与可达性**：本模块唯一外部输入点是第 12 行路由 `/api/users/<int:user_id>` 的路径参数 user_id（不可信）。可达链完整无断点：第 12 行 user_id → 第 18 行作为查询条件取回完整 User 实体 → 第 23 行整实体反射式序列化进 payload → 第 29 行返回客户端。函数体内没有任何登录态或权限校验，任何能访问该接口的客户端枚举 user_id 即可拉取任意用户的敏感字段。
+
+3. **逐条数据流防御核验**：流 A——数据库中 User.password_hash 经第 23 行进入 payload、第 29 行回显，全程无字段白名单或序列化 schema；流 B——api_key、is_admin、last_login_ip 走完全相同路径，同样无过滤；流 C——第 26 行读取 app.config 中的 DATABASE_URL（通常内嵌凭据），经第 24 行并入 payload、第 29 行回显；流 D——第 9 行 DEBUG=True，异常时调试页把源码片段与配置回显给客户端。四条流上唯一的『检查』是第 19-20 行的 404 判空，它只处理用户不存在，既不触及敏感字段也不做授权判断，属无效防御；模块内虽无黑名单/正则/字符串替换类可绕过过滤，但也同样不存在任何有效防御。
+
+4. **暴露面与风险定性**：第 23 行基于 `user.__table__.columns` 的反射式序列化意味着模型日后新增任何敏感列都会自动泄漏，覆盖面随模型扩张而扩大；password_hash 可被离线爆破、api_key 可被直接冒用、DATABASE_URL 泄漏数据库凭据、debug_info 泄漏内部拓扑与版本信息，综合风险定为 High。
+
+5. **第二入口/替代通道检查**：本文件仅第 12 行一条路由，不存在其他路由、参数或间接调用可触达第 23/29 行的序列化点；但第 9 行的 DEBUG=True 构成独立的替代暴露通道（调试错误页），且该单一路由本身已足以完成从输入到敏感字段回显的完整暴露。结论：确认存在 CWE-200 敏感信息暴露漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-200 Exposure of Sensitive Information", "risk_level": "High", "source": "line 18: session.query(User).filter(User.id == user_id).first() 取回含 password_hash/api_key/is_admin 的完整实体，起点为 line 12 路由参数 user_id", "sink": "line 29: return jsonify(payload), 200 将敏感字段与内部配置写入对外 HTTP 响应", "explanation": "流A: 数据库中 password_hash 经 line 23 整实体反射式序列化进入 payload 并由 line 29 回显，无字段白名单; 流B: api_key/is_admin/last_login_ip 走同一序列化路径泄漏，同样无过滤; 流C: line 26 读取含凭据的 DATABASE_URL 经 line 24 并入 payload 由 line 29 回显; 流D: line 9 DEBUG=True 使 Werkzeug 调试页向客户端回显源码与配置; 唯一检查是 line 19-20 的 404 判空，不触及敏感字段也无鉴权，属无效防御; 第二入口检查: 本文件仅 line 12 一条路由，无其他路由或间接调用，但该单一路由叠加调试模式已构成完整暴露通道", "fix_suggestion": "line 23: 改为显式白名单仅序列化 id/username/email 等公开字段，剔除 password_hash/api_key/is_admin/last_login_ip，并移除 debug_info 与生产环境的 DEBUG 开关"}
+```

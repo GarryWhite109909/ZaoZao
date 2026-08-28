@@ -1,0 +1,55 @@
+LANG: java
+```code
+package com.example.filesvc.web;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
+
+@RestController
+public class FileProcessController {
+
+    private static final Logger log = LoggerFactory.getLogger(FileProcessController.class);
+    private static final Path BASE_DIR = Paths.get("/var/appdata/uploads");
+
+    @PostMapping("/files/process")
+    public ResponseEntity<String> process(@RequestParam("file") MultipartFile file) {
+        try {
+            Path target = BASE_DIR.resolve(file.getOriginalFilename()).normalize();
+            if (!target.startsWith(BASE_DIR)) {
+                return ResponseEntity.badRequest().body("Invalid file request.");
+            }
+            String content = Files.readString(target);
+            return ResponseEntity.ok("Processed " + content.lines().count() + " lines.");
+        } catch (Exception e) {
+            // Full details (stack trace, internal paths) stay in server-side logs only;
+            // the client receives a fixed generic message with no exception data.
+            log.error("File processing failed for upload: {}", file.getOriginalFilename(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("Unable to process the file. Please try again later.");
+        }
+    }
+}
+```
+
+1. 第 30-35 行点出本类核心特征：CWE-209 的漏洞形态是文件处理接口在异常处理时把异常对象或底层错误（IOException 携带的内部绝对路径、堆栈帧、类名等）直接写入 HTTP 响应返回给客户端，例如返回 e.getMessage()/e.toString() 或把 printStackTrace 输出重定向进响应体；这属于错误通道选择问题，不是 SQL 注入、路径穿越或越权等数据本身被滥用类别。本文件是该形态的安全版：异常细节只进服务端日志（第 33 行），客户端拿到与异常内容无关的固定文案（第 34-35 行）。
+
+2. 第 21-22 行枚举外部输入点并确认可达性：本文件唯一外部入口是 POST /files/process 的 multipart 参数 file，无其他请求参数。其派生数据 originalFilename 在第 24 行被 resolve 进 BASE_DIR，随后第 28 行 Files.readString 按该路径读盘；当文件名不存在、含非法字符或权限不足时，第 28 行抛出的 IOException/InvalidPathException 会携带服务器内部绝对路径与堆栈，即 CWE-209 的敏感载体；该异常到达客户端的唯一通道是方法的 return 值（HTTP 响应体），可达性成立，因此防御只需且必须封死响应构造点。
+
+3. 数据流一（异常对象 → 服务端日志）防御验证：第 30 行 catch (Exception e) 捕获的异常在第 33 行作为 SLF4J log.error 的末位参数写入服务端日志文件，包含完整堆栈与消息。日志是服务端可信诊断通道，不进入 HTTP 响应，客户端不可读取，这是详细错误的正确去向——类型正确（专用日志通道而非客户端响应）、位置正确（catch 处即异常诞生点）、覆盖完整（catch(Exception) 同时覆盖受检 IOException 与运行时 InvalidPathException/SecurityException/NullPointerException，try 块内所有异常均进入该处理，无逃逸路径）。
+
+4. 数据流二（异常对象 → HTTP 响应体）防御验证：第 34-35 行返回的响应体是编译期常量字符串 'Unable to process the file. Please try again later.'，未拼接 e.getMessage()、e.getClass() 或任何堆栈内容。防御机制是常量输出加通道分离，而非黑名单/正则/字符串替换过滤——不依赖对异常文本的模式匹配，攻击者无法通过构造特殊文件名或文件内容改变异常消息来绕过，因为异常对象从未进入响应构造表达式；位置位于信任边界最后出口（响应体生成处），即使未来异常类型变化依然安全。另两条返回路径同样干净：第 26 行为常量 'Invalid file request.'，第 29 行仅返回由文件内容统计出的行数（整数），均不含路径或异常细节。
+
+5. 第二入口/替代通道检查：本文件仅声明一个 @PostMapping 处理器（第 21 行），无其他路由、无 @ExceptionHandler、无直接操作 HttpServletResponse 或 PrintWriter 的代码，也无把异常对象交给外部工具类再回填响应的间接调用；客户端可见输出仅第 26、29、34-35 行三处 return，全部为常量或纯计数。参数绑定失败等框架层错误发生在进入本方法之前，不属于本模块的输出路径。结论：不存在第二入口或替代通道泄露异常细节，CWE-209 防御类型正确、位置正确、覆盖完整，判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点为第21-22行 POST /files/process 的 multipart 参数 file，其 originalFilename 在第24行 resolve 进 BASE_DIR 并于第28行 Files.readString 读盘，失败时抛出的 IOException/InvalidPathException 携带服务器内部绝对路径与堆栈，可达客户端的唯一通道是方法返回的 HTTP 响应体；数据流1：异常对象 e（第30行）经第33行 SLF4J log.error 写入服务端日志，属服务端可信诊断通道，客户端不可见，且 catch(Exception) 覆盖 try 块内全部受检与运行时异常，无逃逸；数据流2：异常对应的客户端响应（第34-35行）为编译期常量字符串，未拼接 e.getMessage()/e.toString()/堆栈，防御为常量输出加通道分离而非黑名单/正则/字符串替换过滤，无法被构造异常消息绕过，位置在响应体生成这一信任边界最后出口，覆盖完整；其余返回路径第26行为常量文案、第29行仅返回行数计数，均不含异常细节；第二入口检查：本文件仅一个路由处理器，无其他路由、无 @ExceptionHandler、无直接操作 HttpServletResponse 或间接回填异常的调用，客户端可见输出仅三处 return 且全部为常量或计数，不存在错误信息泄露通道，判定无 CWE-209。", "fix_suggestion": "no fix needed"}
+```

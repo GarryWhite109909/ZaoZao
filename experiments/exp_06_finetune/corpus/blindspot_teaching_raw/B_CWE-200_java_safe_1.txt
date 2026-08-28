@@ -1,0 +1,61 @@
+LANG: java
+```code
+package com.example.profile.web;
+
+import java.security.Principal;
+import java.util.Map;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * Self-service profile endpoint. UserAccount carries secrets (passwordHash,
+ * internalTenantId) and must never be serialized to clients; every response
+ * is built through the whitelist DTO ProfileView instead.
+ */
+@RestController
+public class UserProfileController {
+
+    // Stub of the persistence layer (a Spring Data repository in production).
+    private final Map<String, UserAccount> accounts = Map.of(
+            "alice", new UserAccount(1L, "alice", "alice@example.com",
+                    "$2a$10$N9qo8uLOickgx2ZMRZoMye", "tenant-77-int"));
+
+    @GetMapping("/api/v1/profile")
+    public ProfileView myProfile(Principal principal) {
+        UserAccount account = accounts.get(principal.getName()); // verified identity, not client input
+        if (account == null) {
+            throw new IllegalStateException("account not provisioned");
+        }
+        return ProfileView.from(account); // whitelist mapping; entity never returned
+    }
+
+    record UserAccount(long id, String displayName, String email,
+                       String passwordHash, String internalTenantId) {}
+
+    record ProfileView(long id, String displayName, String maskedEmail) {
+
+        static ProfileView from(UserAccount account) {
+            return new ProfileView(account.id(), account.displayName(), maskEmail(account.email()));
+        }
+
+        private static String maskEmail(String email) {
+            int at = email.indexOf('@');
+            return at <= 1 ? "***" : email.charAt(0) + "***" + email.substring(at);
+        }
+    }
+}
+```
+
+第 1 步：本类核心特征是 CWE-200 敏感信息暴露的安全版样本。持久化实体 UserAccount（第 30-31 行）携带 passwordHash（BCrypt 哈希）与 internalTenantId（内部租户标识），该类别的典型漏洞形态是控制器直接 `return account`，让 Jackson 把整个实体序列化进 JSON 响应，把哈希与内部字段一并回显给不可信客户端；本类改为经第 33 行的白名单 DTO ProfileView 构造响应。判定焦点是“哪些字段进入响应体”，与注入（无解释器拼接）、越权（返回范围由服务端验证身份限定为本人）等其他类别无关。
+
+第 2 步：外部输入点枚举与可达性。全文件唯一对外入口是第 21 行的 `@GetMapping("/api/v1/profile")`；控制器入参仅第 22 行的 `java.security.Principal`，由 Spring Security 过滤器链从已验证会话/令牌解析，客户端不能用任何请求参数直接指定查询键；文件中不存在 @RequestParam、@PathVariable、@RequestBody、@RequestHeader。到 sink 的可达性：第 23 行 `principal.getName()` 作为键取出 account → 第 27 行传入 `ProfileView.from` → 第 36 行构造 DTO → 作为返回值交给 HttpMessageConverter 写入响应体，即实体敏感字段到响应体这条 source→sink 链真实可达，防御必须且确实落在该边上。
+
+第 3 步：主数据流防御验证（唯一一条流：account→ProfileView→响应体）。类型正确：第 27 行与第 35-36 行实施的是 allowlist 白名单映射——第 33 行 ProfileView 结构上只声明 id、displayName、maskedEmail 三个组件，passwordHash 与 internalTenantId 在响应类型中根本不存在，Jackson 对 record 只序列化其组件，因此敏感字段不是“被规则过滤掉”而是“结构性不可达”；这与黑名单（按字段名剔除，新增字段即绕过）、正则/字符串替换（可被编码变体绕过）有本质区别，属于类型级不可绕过防御。位置正确：映射发生在控制器返回值这一序列化边界，是对象进入消息转换器前的最后一站，后续环节只能看到白名单后的形状。
+
+第 4 步：覆盖完整性逐字段核对 UserAccount 的 5 个字段：id 与 displayName 非敏感，第 36 行原样复制；email 为准 PII，第 36 行先经第 39-42 行 maskEmail 处理，本地部分掩码为 a***@example.com 形态，第 40-41 行对无 @ 或本地部分过短的输入回退为 ***，不会因异常输入退化为原文，原始 email 从未进入响应对象；passwordHash 与 internalTenantId 在第 36 行未被复制且 DTO 无对应字段。本模块内 ProfileView 的唯一构造路径是 from()，不存在绕过掩码直接构造 DTO 的调用点，白名单与掩码两层防御覆盖全部字段。
+
+第 5 步：第二入口/替代通道检查。全类仅第 21 行一个 @GetMapping，无其他路由或处理器方法；UserAccount（第 30 行）除第 23 行加载、第 27 行进入白名单映射外无任何其他引用，不存在把它写入日志、toString 或错误消息的旁路；第 25 行抛出的是固定文案，Spring Boot 默认错误响应不含堆栈与异常消息，不构成 CWE-209 式泄露通道。结论：不存在第二入口或替代通道，白名单边界覆盖所有到达响应体的路径，CWE-200 不成立。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部入口是第21行 GET /api/v1/profile,控制器入参仅第22行的 Principal,由 Spring Security 从已验证会话或令牌解析,类中不存在 @RequestParam、@PathVariable、@RequestBody 等其他输入点;唯一 source 到 sink 数据流:第23行以 principal.getName() 取出 UserAccount(第30-31行,含 passwordHash 哈希与 internalTenantId 内部标识)→ 第27行 ProfileView.from → 第36行逐字段白名单复制 → 返回值交 Jackson 序列化进响应体;防御类型正确:第33行 ProfileView 是 allowlist 型白名单 DTO,仅声明 id、displayName、maskedEmail 三个组件,passwordHash 与 internalTenantId 在响应类型中结构性不存在,Jackson 只序列化 record 组件,敏感字段不是被过滤而是不可达,区别于可被新增字段绕过的黑名单和可被编码变体绕过的正则或字符串替换;防御位置正确:映射发生在控制器返回值这一序列化边界,是对象进入 HttpMessageConverter 前的最后一站;覆盖完整:逐字段核对,id 与 displayName 非敏感原样复制,email 先经第39-42行 maskEmail 掩码为 a***@example.com 形态且无 @ 时回退为 ***,passwordHash 与 internalTenantId 从未被复制,模块内 ProfileView 唯一构造路径是 from,无绕过点;第二入口检查:全类仅一个 @GetMapping,UserAccount 除加载与进入白名单映射外无其他引用,无日志或 toString 通道,第25行错误文案固定且默认错误响应不含堆栈与异常消息,不存在替代通道,故 CWE-200 不成立", "fix_suggestion": "no fix needed"}
+```

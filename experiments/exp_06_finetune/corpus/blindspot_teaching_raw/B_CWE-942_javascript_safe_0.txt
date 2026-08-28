@@ -1,0 +1,56 @@
+LANG: javascript
+```code
+'use strict';
+
+const express = require('express');
+const router = express.Router();
+
+// 唯一可信来源清单：精确字符串全等匹配，禁止通配/后缀/正则/子串
+const ALLOWED_ORIGINS = new Set([
+  'https://console.example.com',
+  'https://ops.example.com',
+]);
+
+// 网关级 CORS 出口控制：在所有业务路由之前统一执行
+router.use((req, res, next) => {
+  const origin = req.headers.origin; // 外部输入点：攻击者完全可控的 Origin 头
+
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    // 仅精确命中才回显具体来源，绝不使用通配符 *
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.vary('Origin'); // 防止共享缓存把 A 来源的响应串发给 B 来源
+  } else {
+    // 未命中白名单：不下发任何 ACAO，浏览器同源策略默认拦截读取
+    res.removeHeader('Access-Control-Allow-Origin');
+  }
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204); // 预检请求同样受上方白名单约束
+  }
+  next();
+});
+
+// 业务路由：网关聚合指标读取（响应体为静态 JSON，无请求输入回显）
+router.get('/api/gateway/metrics', (req, res) => {
+  res.json({ cluster: 'edge-1', qps: 4213, p99Ms: 87 });
+});
+
+module.exports = router;
+```
+
+1. 第 1 步：本类（CWE-942）核心特征是跨域策略配置过宽——`Access-Control-Allow-Origin` 使用通配符 `*`、或不加校验地回显请求 Origin，并与 `Access-Control-Allow-Credentials: true` 组合，使任意恶意站点可携带用户凭据跨域读取响应。其 sink 是策略响应头本身的写入点，而非注入/越权类的代码拼接或权限判断点；本文件中唯一的策略 sink 是第 18 行的 `res.setHeader('Access-Control-Allow-Origin', origin)`。
+
+2. 第 2 步：枚举全部外部输入点并确认可达性——(a) 第 14 行 `req.headers.origin`，攻击者完全可控，直接流向第 18 行的策略头写入，是唯一需要审查的 source→sink 链；(b) 第 28 行 `req.method`，仅与常量 `'OPTIONS'` 做全等比较后走第 29 行的 204 短路，不影响任何策略头取值；(c) 第 35 行路由 `/api/gateway/metrics` 不接收任何请求参数，第 36 行响应体为静态 JSON，无输入回显，不构成暴露点。
+
+3. 第 3 步：对主数据流 origin(第 14 行)→ACAO 头(第 18 行) 验证防御——类型上，第 16 行 `ALLOWED_ORIGINS.has(origin)` 是对第 7-10 行固定清单的精确全等匹配，不是黑名单、不是正则、也不是子串/后缀匹配，因此 `https://console.example.com.evil.io`、`https://evil-console.example.com`、`null`、带端口变体等伪造来源全部无法命中；位置上，第 16 行的门卫包裹了第 18-21 行全部策略头写入，不存在分支外的 ACAO 写入路径，且第 25 行对未命中来源主动移除残留 ACAO 头（防上游中间件遗留），防御位置正确；覆盖面上，第 19 行 `Allow-Credentials: true` 只在白名单命中分支内可达，而通配符 `*` 在全文件中从未下发，危险的『通配+凭据』组合在结构上不可能出现。
+
+4. 第 4 步：第 22 行 `res.vary('Origin')` 补齐缓存侧防御——若缺少该头，共享代理/CDN 可能缓存为白名单来源 A 生成的响应（含 ACAO: A 与凭据许可）并串发给来源 B，等于绕过逐请求白名单；`res.vary` 以 Express 惯用方式追加 Vary 指令，确保缓存按 Origin 区分条目，封堵该替代暴露通道。
+
+5. 第 5 步：第二入口/替代通道检查——第 13 行以 `router.use` 在模块内所有路由之前注册中间件，因此预检分支（第 28-30 行）与业务路由（第 35 行）都强制经过同一白名单网关；全文件不存在第二处 `setHeader('Access-Control-Allow-Origin')` 写入点，业务路由亦无参数回显；结论是无任何路由、参数或间接调用可绕过第 16 行的门卫，防御类型正确、位置前置、覆盖完整，判定为安全实现。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "外部输入点共三处：第14行 req.headers.origin、第28行 req.method、第35行静态路由 /api/gateway/metrics（无参数回显）；主数据流 origin(第14行)→策略头写入(第18行)：防御为第7-10行固定清单上的 Set 精确全等匹配(第16行)，非黑名单/正则/子串匹配，console.example.com.evil.io、evil-console.example.com、null、带端口变体均无法命中，且第18-21行全部策略头写入均位于该分支内，第25行对未命中来源移除残留 ACAO，防御位置与覆盖面完整；第19行 Allow-Credentials 仅在白名单命中分支内下发，通配符从未出现，通配+凭据组合在结构上不可能；第22行 res.vary('Origin') 防止共享缓存将 A 来源响应串发给 B 来源，封堵缓存侧信道；第二入口检查：第13行 router.use 先于模块内所有路由注册，预检 OPTIONS(第28-30行)与业务路由(第35行)均经过同一网关，文件内无其他 ACAO 写入点，无替代通道可绕过，判定安全", "fix_suggestion": "no fix needed"}
+```

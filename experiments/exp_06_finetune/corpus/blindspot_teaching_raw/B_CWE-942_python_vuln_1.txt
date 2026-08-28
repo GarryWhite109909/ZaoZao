@@ -1,0 +1,61 @@
+LANG: python
+```code
+# webapp/api.py — 单页应用(SPA)用户中心后端,会话 Cookie 由 auth 蓝图通过 Set-Cookie 建立
+from flask import Flask, request, jsonify, session
+
+app = Flask(__name__)
+app.secret_key = "change-me-in-prod"
+
+USERS = {  # 演示用内存表,生产中来自数据库
+    1: {"id": 1, "email": "alice@example.com", "role": "admin", "api_token": "sk-live-9f3a1c"},
+    2: {"id": 2, "email": "bob@example.com", "role": "user", "api_token": "sk-live-2c7d84"},
+}
+
+
+@app.after_request
+def attach_cors_headers(response):
+    # 图省事:直接把请求的 Origin 原样回显,未做任何白名单校验
+    origin = request.headers.get("Origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    else:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+
+@app.route("/api/profile")
+def get_profile():
+    uid = session.get("uid")
+    if uid is None:
+        return jsonify({"error": "login required"}), 401
+    return jsonify(USERS[uid])
+
+
+@app.route("/api/notifications")
+def get_notifications():
+    uid = session.get("uid")
+    if uid is None:
+        return jsonify({"error": "login required"}), 401
+    return jsonify({"uid": uid, "items": ["password expiring in 3 days", "new login from 203.0.113.7"]})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+```
+
+1. **本类核心特征**：第 18 行把请求头 `Origin` 原样写入 `Access-Control-Allow-Origin`，第 20 行对无 Origin 的请求退化为通配符 `*`，第 21 行再叠加 `Access-Control-Allow-Credentials: true`——这正是 CWE-942 Permissive Cross-domain Policy 的典型形态（反射 Origin + 凭据放行，任意源可携带 Cookie 跨域读取响应），属于跨域策略配置过宽，不是命令注入/SQL 注入/XSS 等注入类，也不是越权逻辑缺陷。
+
+2. **外部输入点枚举与可达性**：① 第 16 行 `request.headers.get('Origin')`——攻击者页面发起跨域请求时浏览器自动携带、值完全由攻击者控制，经第 13 行 `@app.after_request` 钩子无条件流向第 18/20 行的响应头 sink，对所有路由 100% 可达；② 第 29/37 行 `session.get('uid')`——跨域凭据请求中浏览器自动附带的会话 Cookie，决定返回哪位用户的数据，是攻击链的凭据来源；③ 请求路径（第 27/35 行路由）选择被暴露的资源。三条输入均无中断地到达响应。
+
+3. **防御核查**：第 16 行到第 18 行之间不存在白名单、正则允许列表、scheme/host 校验或同源判断；第 17-20 行的 if/else 只在『回显攻击者 Origin』与『通配符 `*`』之间二选一，两个分支都是放行语义，不构成过滤；整个文件也没有 flask-cors 白名单、中间件或网关层校验，且该策略经第 13 行钩子全局覆盖所有响应。结论：source→sink 全程无有效防御。
+
+4. **数据流到暴露点**：恶意站点 `https://evil.com` 的页面执行 `fetch('https://spa.example.com/api/profile', {credentials:'include'})`，浏览器带上 `Origin: https://evil.com` 与受害者会话 Cookie；服务器在第 18 行回显 `ACAO: https://evil.com`、第 21 行放行凭据，浏览器据此允许攻击者脚本读取响应，拿到第 32 行返回的 email/role/api_token（第 8-9 行数据）；`/api/notifications`（第 35 行）同理泄露。第 23 行对 OPTIONS 预检也全量放行，攻击无前置障碍。
+
+5. **第二入口/替代通道检查**：第 13 行 `after_request` 是全局钩子，`/api/profile`（第 27 行）、`/api/notifications`（第 35 行）以及未来新增的任何路由都自动继承该宽松策略，预检请求（第 23 行）同样放行；文件中不存在第二条配置正确的 CORS 通道或例外路由。多入口共享同一 sink 且全部失守，支撑最终结论：存在 CWE-942，风险 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-942 Permissive Cross-domain Policy", "risk_level": "High", "source": "line 16: request.headers.get('Origin') 读取攻击者完全可控的 Origin 请求头", "sink": "line 18: response.headers['Access-Control-Allow-Origin'] = origin 将任意 Origin 原样回显,并在 line 21 叠加 Allow-Credentials: true", "explanation": "流1: 任意源的 Origin(line 16)未经白名单校验即在 line 18 原样回显为 Access-Control-Allow-Origin,叠加 line 21 的 Allow-Credentials: true,恶意站点可用 fetch(credentials:'include') 携带受害者会话 Cookie 跨域读取 /api/profile(line 27)返回的 email/role/api_token(line 8-9、32);流2: 无 Origin 头的请求落入 line 20 通配符 * 分支,同样放行任意源(带凭据场景浏览器虽拒绝 * 但该分支仍属过宽策略);防御核查: line 16-21 之间无白名单/正则/同源校验,if/else 仅在回显与通配之间二选一,均为放行语义,且经 line 13 的 after_request 钩子全局生效,全程无有效防御;第二入口: 该钩子对全部路由生效,/api/notifications(line 35)与 OPTIONS 预检(line 23)均为受影响的替代通道,不存在配置正确的第二通道,确认存在 CWE-942", "fix_suggestion": "line 18: 最小修复——维护可信 Origin 白名单(如 https://app.example.com),仅当 request.headers.get('Origin') 命中白名单时才回显该值并配合 Allow-Credentials,否则不返回 Access-Control-Allow-Origin 头,并删除 line 20 的通配符分支"}
+```

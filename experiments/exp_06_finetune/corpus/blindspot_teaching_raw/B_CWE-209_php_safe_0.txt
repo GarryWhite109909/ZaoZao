@@ -1,0 +1,64 @@
+LANG: php
+```code
+<?php
+
+declare(strict_types=1);
+
+namespace App\Api;
+
+use PDO;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Psr\Log\LoggerInterface;
+use Throwable;
+
+/** GET /api/user?email=... ；数据库故障只回通用文案，细节仅写服务端日志 */
+final class UserLookupAction
+{
+    public function __construct(
+        private readonly PDO $db, // 容器装配时已设 ERRMODE_EXCEPTION
+        private readonly LoggerInterface $logger
+    ) {
+    }
+
+    public function __invoke(Request $request, Response $response): Response
+    {
+        $email = (string)($request->getQueryParams()['email'] ?? '');
+        try {
+            $stmt = $this->db->prepare(
+                'SELECT id, email, created_at FROM users WHERE email = :email'
+            );
+            $stmt->execute(['email' => $email]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            $response->getBody()->write(
+                (string)json_encode(['code' => 0, 'data' => $row === false ? null : $row])
+            );
+            return $response->withStatus(200);
+        } catch (Throwable $e) {
+            // 驱动错误（含 SQL、连接细节、堆栈）只落服务端日志，不进响应体
+            $this->logger->error('user lookup failed', [
+                'exception' => get_class($e) . ': ' . $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            $response->getBody()->write(
+                (string)json_encode(['code' => 500, 'msg' => '系统繁忙，请稍后重试'])
+            );
+            return $response->withStatus(500);
+        }
+    }
+}
+```
+
+1. **本类核心特征**：CWE-209 的判别点是“错误/异常内容的出站通道”。数据库驱动抛出的 `PDOException->getMessage()` 常内嵌完整 SQL 文本（表名、列名、绑定值）、主机端口等连接细节，`getTraceAsString()` 还会暴露内部文件路径与调用栈。本文件的漏洞孪生写法是：第 35 行 catch 后若把第 41-43 行的响应体写成 `json_encode(['msg' => $e->getMessage()])`，驱动错误即原样回显前端。需明确：这不是 SQL 注入——第 26-29 行使用预编译加参数绑定，输入不改变语句结构；也不是认证/越权问题——接口没有资源级判断差异；类别归属是错误消息泄露敏感信息。
+
+2. **输入点枚举与可达性**：全文件外部输入点仅一个——第 24 行从 PSR-7 查询参数取出的 `$email`（框架路由把 GET /api/user 映射到第 22 行唯一公开入口 `__invoke`）。可达性成立：`$email` 在第 29 行以绑定参数进入第 26-30 行数据库调用链，位于 try 块内，驱动层一旦抛错即转入第 35 行 catch，进而到达第 41-43 行响应写入。但敏感内容的真正 source 是第 26-30 行抛出的异常对象本身（驱动消息/SQL/堆栈），`$email` 只是业务参数且从未进入错误响应表达式。除该查询参数外，文件未读取 header、body、cookie、环境变量等任何其他输入。
+
+3. **主链防御验证（异常对象→前端响应）**：防御为“出站载荷整体替换”——第 41-43 行写入的是编译期常量数组，msg 为固定文案，`$e` 的 getMessage/getTraceAsString/getCode 等任何字段均未出现在该表达式中。类型正确：这不是黑名单/正则/字符串替换过滤（那类方案对驱动消息天然可绕过——消息随驱动版本、方言、本地化变化，且堆栈是独立泄露字段），而是通道级隔离，不存在可绕过的过滤面。位置正确：第 35 行 catch 是本模块异常出站前的唯一汇聚点，且先于任何错误响应写入。覆盖完整：`catch (Throwable)` 是 PDOException 的超集，配合第 17 行注入连接已设 ERRMODE_EXCEPTION（否则驱动错误静默返回、根本不会进入 catch），第 26-30 行所有失败模式——连接失败、模式漂移导致的语法错、约束冲突、乃至意外 TypeError——全部汇入同一处理器；try 块内无提前 return、无第二个响应写入点。
+
+4. **其余数据流核查**：流二——异常对象→第 37-40 行 `logger->error`，这是有意设计的服务端诊断通道，PSR-3 日志器落盘到文件/采集后端，不属于 HTTP 响应体，详细错误（含 SQL 与堆栈）放在此处是正确位置而非泄露；流三——第 31-33 行成功路径仅返回查询到的业务行数据，与错误内容无关。另注意第 17 行的 ERRMODE_EXCEPTION 是整条异常防御路径存在的前提，注释已锚定该装配约定。
+
+5. **第二入口/替代通道检查**：文件仅第 22 行 `__invoke` 一个公开入口（单动作控制器模式），无其他路由或方法触及该 PDO 实例；无 echo/print/var_dump，无 error_log 到可被 Web 服务的路径，也无把 `$e->getMessage()` 塞进新异常重抛的写法（那会把泄露推迟到上层全局处理器）。错误路径到达前端的唯一通道就是第 41-43 行常量文案。结论：不存在第二入口或替代通道，结合第 2-4 步，本文件不构成 CWE-209 暴露。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入为第24行查询参数email,经第29行绑定参数到达第26-30行数据库调用,控制流可达第35行catch与第41-43行响应写入;敏感source是驱动抛出的异常对象(含SQL/连接细节/堆栈),第17行注入连接已设ERRMODE_EXCEPTION使驱动错误以异常形式进入第35行catch(Throwable),其为PDOException超集,覆盖连接失败/语法错/约束冲突/意外TypeError等全部失败模式;错误路径唯一出站点第41-43行为编译期常量数组,异常的getMessage/getTraceAsString等字段均未进入出站表达式,属载荷整体替换而非黑名单/正则/字符串替换过滤,无绕过面,且位于响应构造前的唯一异常汇聚点,类型/位置/覆盖均正确;第37-40行详细错误仅写入PSR-3服务端日志,属诊断通道不构成前端暴露;第31-33行成功路径仅返回业务行数据;第二入口检查:文件仅第22行__invoke一个公开入口,无其他路由/方法/echo/var_dump/携带异常消息的重抛,错误路径到前端唯一通道即第41-43行常量文案,故无CWE-209泄露", "fix_suggestion": "no fix needed"}
+```

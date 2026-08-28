@@ -1,0 +1,54 @@
+LANG: php
+```code
+<?php
+declare(strict_types=1);
+
+namespace App\Http\Controller\Api;
+
+use App\Service\UserProfileService;
+use App\Support\SessionGuard;
+
+final class ProfileApiController
+{
+    private UserProfileService $profiles;
+
+    public function __construct(UserProfileService $profiles)
+    {
+        $this->profiles = $profiles;
+    }
+
+    public function handle(): void
+    {
+        SessionGuard::start();
+        $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+        if ($origin !== '') {
+            header('Access-Control-Allow-Origin: ' . $origin);
+            header('Vary: Origin');
+            header('Access-Control-Allow-Credentials: true');
+        }
+        if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
+            header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+            header('Access-Control-Allow-Headers: Content-Type, Authorization');
+            http_response_code(204);
+            return;
+        }
+        $userId = (int)($_SESSION['user_id'] ?? 0);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode($this->profiles->getProfile($userId), JSON_UNESCAPED_UNICODE);
+    }
+}
+```
+
+1. **本类核心特征定位**：第 23 行将请求头中的 Origin 原样拼接进 `Access-Control-Allow-Origin` 响应头（开发图省事的“反射 Origin”写法），第 25 行又无条件追加 `Access-Control-Allow-Credentials: true`。二者叠加是 CWE-942 Permissive Cross-domain Policy 的典型形态——比通配 `*` 更糟，因为浏览器禁止 `*` 与凭据并用，而反射 Origin 恰好绕开了这一限制，使任意源都能携带凭据跨域读取响应。这是 CORS 策略配置过宽类漏洞，不是命令注入、SQL 注入或 XSS。
+
+2. **外部输入点枚举与可达性**：①第 21 行 `$_SERVER['HTTP_ORIGIN']` 为攻击者完全可控的请求头，未经任何转换直达第 23 行的 `header()` sink，可达性成立；②第 27 行 `$_SERVER['REQUEST_METHOD']` 仅用于分支判断，不进入 CORS 头取值；③第 33 行 `$_SESSION['user_id']` 是服务端会话状态，非攻击者可控输入。主数据流为输入点①。
+
+3. **防御有效性核查**：第 21 行到第 23 行之间唯一的检查是第 22 行的 `$origin !== ''` 判空，它接受任意非空值（包括 `https://evil.example`），既无白名单、无精确匹配、也无协议/域名校验，属于零防御；第 24 行的 `Vary: Origin` 只影响缓存语义，对访问控制无任何约束作用。覆盖面上，该宽松头作用于包括第 35 行认证后用户资料 JSON 在内的全部响应，即 100% 的输出都携带此放行策略。
+
+4. **攻击链推演**：攻击者在任意域下的页面执行 `fetch(url, {credentials: 'include'})` → 浏览器自动附带受害者会话 Cookie（第 20 行已启动会话）→ 服务端在第 23 行把攻击者 Origin 原样回显、第 25 行放行凭据 → 浏览器判定该源可读响应，第 35 行的会话级用户资料 JSON 被完整泄露；第 27–31 行的 OPTIONS 预检分支还预先放行全部方法与自定义头，扫清浏览器最后一道关卡。
+
+5. **第二入口/替代通道检查**：本模块仅暴露 `handle()` 一个入口，OPTIONS 预检（第 27 行）与正常请求共用第 22–26 行同一段 CORS 设置代码，文件内不存在其他设置 CORS 头的独立路径或间接调用。因此单一“反射 Origin + 凭据放行”链路即足以支撑结论：漏洞成立，属 CWE-942。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-942 Permissive Cross-domain Policy", "risk_level": "High", "source": "line 21: $_SERVER['HTTP_ORIGIN'] 攻击者完全可控的 Origin 请求头", "sink": "line 23: header('Access-Control-Allow-Origin: ' . $origin) 将任意来源原样回显为 CORS 放行头并叠加 line 25 凭据放行", "explanation": "流1: line 21 读取攻击者可控的 HTTP_ORIGIN -> line 22 仅判空 -> line 23 原样回显进 Access-Control-Allow-Origin, line 25 固定返回 Access-Control-Allow-Credentials: true, 任意恶意站点可携带受害者会话 Cookie 跨域读取 line 35 输出的会话级用户资料 JSON, 属 CWE-942 典型形态; 流2: line 27 OPTIONS 预检分支复用同一 CORS 设置并在 line 28-29 放行全部方法与头, 恶意预检必然通过; 防御核查: line 21 至 line 23 之间无白名单/精确匹配/正则校验, 唯一条件 $origin !== '' 不构成有效防御, line 24 的 Vary 头仅影响缓存, 且宽松策略覆盖包括认证响应在内的全部输出; 第二入口检查: 本模块仅 handle 一个入口, 预检与正常请求共用同一 CORS 代码路径, 无其他独立通道, 单一反射链即足以确认漏洞", "fix_suggestion": "line 23: 引入受信 Origin 白名单, 仅当 $origin 严格等于 https://app.example.com 等受信源时才回显该头并保留凭据放行, 否则不发送任何 CORS 头"}
+```

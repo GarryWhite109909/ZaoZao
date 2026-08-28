@@ -1,0 +1,56 @@
+LANG: java
+```code
+package com.acme.gateway.cors;
+
+import java.io.IOException;
+import javax.servlet.Filter;
+import javax.servlet.FilterChain;
+import javax.servlet.ServletException;
+import javax.servlet.ServletRequest;
+import javax.servlet.ServletResponse;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+/**
+ * Global cross-domain policy for the REST API gateway.
+ * Registered as a servlet Filter bean so every proxied route is covered.
+ */
+public class GatewayCorsFilter implements Filter {
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+        HttpServletRequest request = (HttpServletRequest) req;
+        HttpServletResponse response = (HttpServletResponse) res;
+
+        String origin = request.getHeader("Origin");
+        if (origin == null || origin.trim().isEmpty()) {
+            origin = "*";
+        }
+        response.setHeader("Access-Control-Allow-Origin", origin);
+        response.setHeader("Access-Control-Allow-Credentials", "true");
+        response.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+        response.setHeader("Access-Control-Allow-Headers", "*");
+
+        if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
+            response.setStatus(HttpServletResponse.SC_OK);
+            return;
+        }
+        chain.doFilter(req, res);
+    }
+}
+```
+
+1. 本类核心特征：CORS 策略过宽——第 24 行读取请求 Origin 头，第 28 行将其原样回显到 `Access-Control-Allow-Origin`，第 29 行叠加 `Access-Control-Allow-Credentials: true`，二者组合意味着任意源可携带凭据跨域读取响应，这是 CWE-942 Permissive Cross-domain Policy 的典型漏洞形态，不是命令注入/SQL 注入/越权等其他类别。
+
+2. 外部输入点枚举与可达性：本文件唯一外部输入是第 24 行的 Origin 请求头，由浏览器在跨域请求中自动携带、攻击者页面完全可控；它未经任何转换直达第 28 行的 `setHeader` sink，可达性为直接命中。第 30-31 行放行全部方法与请求头、第 33-36 行处理预检，共同放大暴露面但非独立输入点。
+
+3. 防御验证：source（第 24 行）→ sink（第 28 行）之间唯一的“检查”是第 25-27 行的判空回退——Origin 缺失时反而回退为通配 `*`，属于放宽而非限制；全程无域名白名单、无正则校验、无 scheme/host 校验，也不区分可信源与恶意源。回显任意 Origin 加凭据放行使浏览器同源策略对凭据请求完全失效，现有逻辑不构成有效防御。
+
+4. 暴露路径：按第 13-14 行注释，该过滤器全局注册、覆盖网关全部代理路由，包括返回会话用户数据的认证接口；第 37 行 `chain.doFilter` 在宽松头已写入后才进入业务链，因此认证后的 JSON 响应同样携带该策略。攻击者在任意域托管页面，用 `fetch(url, {credentials: 'include'})` 即可携带受害者 Cookie 读取网关响应并外传；第 33-36 行对任意来源的 OPTIONS 预检直接放行，使 PUT/DELETE/自定义头等非简单请求也能成功。
+
+5. 第二入口/替代通道检查：除主 `doFilter` 外，第 33-36 行的预检分支是同一宽松策略的第二入口，行为与主链一致；本模块内不存在其他 CORS 配置、注解或路由级覆盖，所有跨域响应头均由此单一过滤器统一写入——说明漏洞是网关级系统性问题而非单点疏漏，支撑最终结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-942 Permissive Cross-domain Policy", "risk_level": "High", "source": "line 24: request.getHeader('Origin') 读取攻击者完全可控的 Origin 请求头", "sink": "line 28: response.setHeader('Access-Control-Allow-Origin', origin) 原样回显任意来源", "explanation": "外部输入点仅 line 24 的 Origin 头，浏览器跨域请求自动携带、攻击者页面可控，直达 line 28 sink；line 25-27 判空回退为通配 * 属于放宽而非防御；source 到 sink 之间无白名单、无正则、无域名校验，任意 Origin 被回显；line 29 叠加 Allow-Credentials: true，任意源可携带 Cookie 凭据跨域读取网关认证后响应；line 30-31 放行全部方法与请求头，line 33-36 对任意来源自动放行预检；line 13-14 表明过滤器全局注册覆盖全部代理路由，暴露面为整个网关；第二入口检查：OPTIONS 预检分支与主链共享同一宽松策略，模块内无其他 CORS 配置或路由级覆盖，结论为系统性 CWE-942 漏洞", "fix_suggestion": "line 28: 最小修复——建立可信域白名单（如 https://app.acme.com），仅当请求 Origin 精确命中白名单时才回显该 Origin，否则不设置 ACAO 头；同时将 line 29 的 Allow-Credentials 收敛为仅对白名单域开启"}
+```

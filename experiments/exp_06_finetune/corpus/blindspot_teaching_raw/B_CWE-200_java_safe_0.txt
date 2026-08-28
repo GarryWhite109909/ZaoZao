@@ -1,0 +1,63 @@
+LANG: java
+```code
+package com.acme.catalog.export;
+
+import java.util.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import org.springframework.web.bind.annotation.*;
+
+/**
+ * 商品导出接口：对外仅暴露白名单列；成本价/内部毛利/供应商联系人属内部定价数据，禁止出域。
+ */
+@RestController
+public class ProductExportController {
+
+    // 内部实体含敏感列：costPrice(成本价)、internalMargin(内部毛利)、supplierContact(供应商联系人)
+    record Product(String sku, String name, String category, double listPrice, int stock,
+                   double costPrice, double internalMargin, String supplierContact) {}
+
+    // 导出白名单：列名 -> 取值函数；敏感列没有对应映射，结构上不可被任何请求选中
+    private static final Map<String, Function<Product, Object>> EXPORT_COLUMNS = Map.of(
+            "sku", Product::sku,
+            "name", Product::name,
+            "category", Product::category,
+            "listPrice", Product::listPrice,
+            "stock", Product::stock);
+
+    private final List<Product> products = List.of(
+            new Product("SKU-1001", "机械键盘", "peripherals", 299.0, 42, 158.0, 0.47, "chen.w@partner.cn"),
+            new Product("SKU-2002", "无线鼠标", "peripherals", 129.0, 310, 61.5, 0.52, "li.r@partner.cn"));
+
+    @GetMapping("/api/products/export")
+    public List<Map<String, Object>> export(@RequestParam String category,
+                                            @RequestParam(defaultValue = "sku,name") String columns) {
+        Set<String> selected = Arrays.stream(columns.split(","))
+                .map(String::trim)
+                .filter(EXPORT_COLUMNS::containsKey)
+                .collect(Collectors.toSet());
+        return products.stream()
+                .filter(p -> p.category().equalsIgnoreCase(category))
+                .map(p -> {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    selected.forEach(col -> row.put(col, EXPORT_COLUMNS.get(col).apply(p)));
+                    return row;
+                })
+                .collect(Collectors.toList());
+    }
+}
+```
+
+1. 第 1 步（核心特征定性）：本类考察 CWE-200 敏感信息暴露——内部实体 Product（第 15-16 行）携带成本价 costPrice、内部毛利 internalMargin、供应商联系人 supplierContact 等仅限内部定价使用的敏感列，而导出接口的 sink 是第 30-32 行声明的 HTTP 响应体（返回值由 Jackson 序列化后直接回显给调用方）。问题类型是『对象内的哪些字段允许出域』，不涉及 SQL/命令注入（无查询拼接或命令执行），也不属于越权/IDOR（不判断能否访问某个对象，而判断字段级暴露），因此按 CWE-200 审查。
+
+2. 第 2 步（输入点枚举与可达性）：外部输入仅两个 @RequestParam——第 31 行 category、第 32 行 columns。category 只流入第 38 行的过滤谓词，影响返回哪些行，其值本身从不写入响应，与敏感字段无数据流交集；columns 经第 33-34 行按逗号切分并 trim 后进入第 35 行过滤，再经第 36 行 selected 与第 41 行写入响应行，是唯一能影响 sink 内容的输入，也是防御必须覆盖的关键路径。
+
+3. 第 3 步（columns→sink 流防御验证）：第 35 行 filter(EXPORT_COLUMNS::containsKey) 是对固定映射表（第 19-24 行）的正向白名单交集：请求 columns=sku,costPrice 时 costPrice 被静默丢弃，未知列名或大小写不符的 token 同样被丢弃，属 fail-closed；这不是黑名单（未列举禁止列名）、不是正则、也不是字符串替换，无法通过编码、大小写或重复 token 绕过。位置正确：过滤位于列名解析为取值函数（第 41 行）之前的唯一入口；覆盖完整：白名单键集即响应允许出现的全部键，第 40 行的 row Map 没有任何其他写入点。
+
+4. 第 4 步（实体→sink 流防御验证）：Product 的敏感字段（第 16 行）到达响应的唯一可能通路是第 41 行 EXPORT_COLUMNS.get(col).apply(p)，而映射表的取值函数（第 20-24 行）仅含 sku/name/category/listPrice/stock 五个安全方法引用；代码中不存在 BeanUtils.copyProperties、反射、直接序列化实体或日志打印实体等旁路，因此三个敏感列在结构上不可达 sink；即使 selected 被污染，第 41 行 get(col) 也只会返回 null 触发 NPE 而非泄露数据。未来给 Product 新增敏感字段时，只要不改白名单映射表就不会外泄，防御具备前向安全性。
+
+5. 第 5 步（第二入口/替代通道检查）：本文件仅声明第 30 行一个 @GetMapping(/api/products/export) 处理器，无 POST 或 CSV/XML 等其他导出格式变体，无自定义 HttpMessageConverter、@JsonAnyGetter 之类的序列化后门，也无反射/对象拷贝等间接调用暴露实体；模块内不存在绕过白名单的第二入口或替代通道，结合第 3-4 步的逐流验证，最终判定该导出功能对 CWE-200 免疫。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "外部输入点共两个：第31行请求参数 category 与第32行请求参数 columns；category 仅流入第38行的过滤谓词决定返回哪些行，其值从不写入响应体，与敏感字段无数据流交集；columns 是唯一能影响响应内容的输入，经第33-34行按逗号切分并 trim 后，在第35行通过 EXPORT_COLUMNS::containsKey 与固定白名单映射（第19-24行）做正向交集，costPrice/internalMargin/supplierContact 等任何非白名单列名（含大小写不符者）直接被丢弃，属白名单机制而非黑名单/正则/字符串替换，不可通过构造列名绕过；防御位置正确：过滤发生在列名解析为取值函数的唯一入口之前，且第19-24行的映射表本身不含任何敏感列的 accessor，即使 selected 被污染，第41行 EXPORT_COLUMNS.get(col) 也只会返回 null 触发 NPE 而非泄露数据，属结构性 fail-closed；实体到响应的唯一通路是第41行 EXPORT_COLUMNS.get(col).apply(p)，其取值函数仅为第20-24行的五个安全方法引用，第16行定义的敏感字段无任何引用路径，也不存在 BeanUtils.copyProperties、反射、直接序列化实体或日志输出等旁路，第40行的 row 局部 Map 仅被白名单 forEach 写入；第二入口检查：本文件仅第30行一个 @GetMapping 处理器，无其他路由、无 CSV 等其他导出格式变体、无自定义序列化器或间接调用，不存在绕过白名单的替代通道，故判定无 CWE-200 敏感信息暴露", "fix_suggestion": "no fix needed"}
+```

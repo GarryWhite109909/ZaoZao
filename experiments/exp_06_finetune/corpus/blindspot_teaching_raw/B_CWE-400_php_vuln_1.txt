@@ -1,0 +1,66 @@
+LANG: php
+```code
+<?php
+// module/Search/SearchFilter.php
+
+namespace App\Module\Search;
+
+use App\Http\Request;
+use App\Repository\ProductRepository;
+
+class SearchFilter
+{
+    private ProductRepository $products;
+
+    public function __construct(ProductRepository $products)
+    {
+        $this->products = $products;
+    }
+
+    public function handle(Request $request): array
+    {
+        // long search phrases used to fail validation (preg_match returned false),
+        // so we raise the PCRE backtrack limit for this request
+        ini_set('pcre.backtrack_limit', 1000000000);
+
+        $keyword = trim((string) $request->input('q', ''));
+        $tagExpr = (string) $request->input('tags', '');
+
+        if ($keyword !== '' && !preg_match('/^(\w+\s?)+$/', $keyword)) {
+            return ['error' => 'invalid_keyword'];
+        }
+
+        if ($tagExpr !== '' && !preg_match('/^([a-z]+,?)+$/i', $tagExpr)) {
+            return ['error' => 'invalid_tags'];
+        }
+
+        $terms = preg_split('/\s+/', $keyword, -1, PREG_SPLIT_NO_EMPTY);
+
+        return $this->products->search($terms, explode(',', $tagExpr));
+    }
+}
+```
+
+1. 本类核心特征：CWE-400 Uncontrolled Resource Consumption 的典型形态是不可信输入驱动无界资源消耗。本例中第 27 行与第 31 行的校验正则含嵌套量词 `(\w+\s?)+` 与 `([a-z]+,?)+`（量词嵌套量词），PCRE 引擎需对同一子串的切分方式做指数级枚举（灾难性回溯/ReDoS），消耗的是 CPU 与请求时长，不产生命令执行、数据泄露或越权访问，因此归类为资源消耗，而非命令注入/SQL 注入/越权等其他类别。
+
+2. 输入点枚举与可达性：外部输入共两处——第 24 行 `$request->input('q', '')` 与第 25 行 `$request->input('tags', '')`（框架 Request 封装 GET/POST 参数，未认证即可控）。两者仅经 trim/强转即分别到达第 27、31 行的 preg_match，攻击者发送单个请求 `?q=aaaaaaaa...!` 即可达 sink，可达性确认。第 22 行的 ini_set 在匹配前把 pcre.backtrack_limit 提到 10 亿，等于主动拆除了 PCRE 唯一的内置刹车。
+
+3. 流 1 防御核验（第 24 行 → 第 27 行）：source 与 sink 之间只有 trim（去首尾空白，对 `a*30 + '!'` 类载荷毫无削弱）与非空判断；无长度上限、无字符白名单、无速率限制。校验正则本身即消耗点：`^(\w+\s?)+$` 对 30+ 个单词字符后跟一个不匹配字符的输入产生约 2^n 次回溯，叠加第 22 行放大的回溯预算，单请求可烧数秒 CPU，数十并发即可打满 PHP-FPM worker。即便存在黑名单/str_replace 类过滤也无法防御（载荷只是普通字母），且本代码连此类过滤都没有——全程无有效防御。
+
+4. 流 2 防御核验（第 25 行 → 第 31 行）：`^([a-z]+,?)+$/i` 同为嵌套量词结构，可选逗号 `,?` 使切分方式组合爆炸；唯一守卫 `$tagExpr !== ''` 被任意非空长串绕过，无长度截断、无超时，与流 1 共享第 22 行被放大的回溯预算，构成同一端点上的第二条独立 DoS 通道。
+
+5. 排除干扰项与类别确认：第 35 行 `preg_split('/\s+/')` 为线性模式，无回溯爆炸，不构成消耗点；第 37 行仓储调用接收的是已校验数组，按仓储契约使用参数化查询，无 SQL 注入面；全文件无解压、无递归解析、无用户控长度的循环/分配，唯一无界消耗形态就是灾难性回溯正则，坐实 CWE-400。
+
+6. 第二入口/替代通道结论：本文件内公开入口仅 handle()（构造函数除外），不存在其他路由方法或间接调用进入这两个 preg_match；但 q 与 tags 本身就是汇入同一 sink 类别的两条替代通道，且任何绑定该过滤器的路由（如 GET /search）都会继承该缺陷；文件内无第三条通道。结论：存在 CWE-400 高危漏洞（未认证、可自动化放大）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-400 Uncontrolled Resource Consumption",
+  "risk_level": "High",
+  "source": "line 24: $request->input('q', '') 用户可控搜索词（line 25: $request->input('tags', '') 为第二条源）",
+  "sink": "line 27: preg_match('/^(\\w+\\s?)+$/', $keyword)（line 31: preg_match('/^([a-z]+,?)+$/i', $tagExpr) 为第二消耗点）",
+  "explanation": "流1: line 24 的 q 参数仅经 trim 即到达 line 27 的嵌套量词正则，无长度上限、无白名单、无限流，形如 30 个字母后跟感叹号的输入触发指数级回溯，且 line 22 的 ini_set 将 pcre.backtrack_limit 提至 10 亿，单请求可消耗秒级 CPU，数十并发即可耗尽 PHP-FPM worker；流2: line 25 的 tags 参数到达 line 31 的嵌套量词正则，唯一守卫是非空检查，任意非空长串即可触发同一回溯，构成同一端点的第二条独立消耗通道；line 35 的 preg_split('/\\s+/') 为线性模式不构成消耗点，line 37 的仓储调用按契约使用参数化查询无注入面；全文件无超时、限流、长度截断等有效防御，属不可信输入驱动的无界 CPU 消耗，非注入或越权",
+  "fix_suggestion": "line 27: 将嵌套量词模式替换为线性等价的字符类形式 '/^[\\w\\s]+$/'（line 31 同步改为 '/^[a-z]+(,[a-z]+)*$/i'），删除 line 22 的 ini_set，并在匹配前增加 mb_strlen($keyword) <= 64 的长度上限与按 IP 的请求速率限制"
+}
+```

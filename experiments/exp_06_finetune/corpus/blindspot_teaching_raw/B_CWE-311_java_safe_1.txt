@@ -1,0 +1,66 @@
+LANG: java
+```java
+package com.acme.pay.gateway;
+
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocketFactory;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+
+/** Submits cardholder data to the external payment processor; PAN must never transit in plaintext (CWE-311). */
+public final class PaymentGatewayClient {
+
+    private static final String ENDPOINT = "https://gateway.acmepay.example/v1/charges";
+
+    private final SSLSocketFactory tlsFactory;
+
+    public PaymentGatewayClient() throws Exception {
+        SSLContext ctx = SSLContext.getInstance("TLSv1.3");
+        ctx.init(null, null, new SecureRandom());
+        this.tlsFactory = ctx.getSocketFactory();
+    }
+
+    public String charge(String pan, String expiry, int amountCents) throws IOException {
+        URL url = new URL(ENDPOINT);
+        if (!"https".equalsIgnoreCase(url.getProtocol())) {
+            throw new SecurityException("cardholder data requires TLS transport");
+        }
+        HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+        conn.setSSLSocketFactory(tlsFactory);
+        conn.setHostnameVerifier(HttpsURLConnection.getDefaultHostnameVerifier());
+        conn.setInstanceFollowRedirects(false);
+        conn.setRequestMethod("POST");
+        conn.setDoOutput(true);
+        conn.setRequestProperty("Content-Type", "application/json");
+        String body = "{\"pan\":\"" + esc(pan) + "\",\"expiry\":\"" + esc(expiry)
+                + "\",\"amount\":" + amountCents + "}";
+        try (OutputStream out = conn.getOutputStream()) {
+            out.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+        int status = conn.getResponseCode();
+        return (status >= 200 && status < 300) ? "approved" : "declined";
+    }
+
+    private static String esc(String v) {
+        return v.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+}
+```
+
+1. **类别特征定位**：CWE-311 的核心形态是敏感数据（本例为持卡人 PAN/有效期，属 PCI PII）以明文跨越信任边界——漏洞版典型写法是向 `http://` 端点 POST 卡号或明文落盘。本样本是安全对照版：第 25 行的持卡人参数确实流向第 40 行的网络写出口，但整条信道被强制 TLS 包裹。需明确这不是注入（第 46-47 行 esc 仅做 JSON 转义，非本类防御核心）、也不是越权/鉴权问题。
+
+2. **输入点枚举与可达性**：外部输入点仅第 25 行 `charge(String pan, String expiry, int amountCents)`，其中 pan/expiry 为持卡人敏感数据，amountCents 为非敏感整型。可达性确认：pan/expiry 在第 37-38 行拼入请求体 body，第 39-40 行经 `conn.getOutputStream()` 写出，source 到 sink（网络套接字）链路完整可达，因此信道加密必须逐一验证。
+
+3. **主数据流防御验证（类型/位置/覆盖面）**：唯一信道由第 30 行 `url.openConnection()` 创建，URL 来自第 15 行私有常量 `ENDPOINT`，硬编码为 `https://`。第 27-29 行在打开连接前做协议结构校验：`getProtocol()` 非 https 即抛 SecurityException，fail-closed——这是对 URL scheme 的结构性白名单，不是可绕过的字符串替换/正则过滤。第 31 行将连接绑定到第 20 行创建的仅 TLSv1.3 上下文：加密类型正确（传输层强加密）、位置正确（施加于连接对象、输出流打开之前）、覆盖完整（第 40 行写出的全部字节含 pan/expiry 均走该加密流，无明文出网路径）。
+
+4. **覆盖面补强**：第 32 行显式保留默认 HostnameVerifier（证书身份校验，未被宽松的 `return true` 实现覆盖），TLS 同时提供机密性与网关身份认证，防中间人；第 33 行 `setInstanceFollowRedirects(false)` 关闭自动重定向，封死 https→http 降级重定向这一 CWE-311 常见旁路。此外 pan 仅存在于内存与加密信道，无日志输出、无明文持久化，存储侧无缺口。
+
+5. **第二入口/替代通道检查**：类仅暴露一个公开方法 charge；`ENDPOINT` 为 private static final，无 setter、无配置注入、无反射调用点可将 URL 换成 http；类内无第二个连接构造点、无失败重试降级逻辑。替代通道检查为阴性，支撑最终结论：无 CWE-311 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入点为第25行charge方法的pan与expiry参数（持卡人数据），amountCents为非敏感整型；pan与expiry在第37-38行拼入请求体并于第40行经conn.getOutputStream()写入网络sink，链路可达；该流唯一信道由第30行基于第15行硬编码https常量创建，第27-29行在连接建立前做URL协议结构白名单校验（非https即抛SecurityException，fail-closed，非可绕过的字符串过滤），第31行绑定第20行创建的仅TLSv1.3的SSLSocketFactory，加密类型正确（传输层强加密）、位置正确（连接对象上、输出流打开前）、覆盖完整（全部持卡人字节经同一加密流，无明文出网路径）；第32行保留默认主机名证书校验防中间人，第33行禁用自动重定向封死https到http降级旁路，pan无日志无明文落盘；第二入口检查：类仅一个公开方法，ENDPOINT为私有常量不可被配置或参数改为http，无第二连接构造点、无重试降级、无反射间接调用，替代通道为阴性，故无CWE-311漏洞", "fix_suggestion": "no fix needed"}
+```

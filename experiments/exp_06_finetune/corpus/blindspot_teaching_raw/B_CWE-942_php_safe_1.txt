@@ -1,0 +1,65 @@
+LANG: php
+```code
+<?php
+
+declare(strict_types=1);
+
+namespace App\Http\Middleware;
+
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\ServerRequestInterface;
+use Psr\Http\Server\MiddlewareInterface;
+use Psr\Http\Server\RequestHandlerInterface;
+
+/**
+ * CORS policy for the SPA backend (api.example.com).
+ * Invariants: exact Origin whitelist; Vary: Origin always sent;
+ * Allow-Credentials only with whitelisted origins, never '*'.
+ */
+final class SpaCorsMiddleware implements MiddlewareInterface
+{
+    private const ALLOWED_ORIGINS = [
+        'https://app.example.com',
+        'https://admin.example.com',
+    ];
+
+    public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
+    {
+        $origin = trim($request->getHeaderLine('Origin'));
+        $response = $handler->handle($request);
+
+        if ($origin === '' || !in_array($origin, self::ALLOWED_ORIGINS, true)) {
+            return $response->withHeader('Vary', 'Origin');
+        }
+
+        $response = $response
+            ->withHeader('Vary', 'Origin')
+            ->withHeader('Access-Control-Allow-Origin', $origin)
+            ->withHeader('Access-Control-Allow-Credentials', 'true');
+
+        if (strtoupper($request->getMethod()) === 'OPTIONS') {
+            return $response
+                ->withStatus(204)
+                ->withHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+                ->withHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+                ->withHeader('Access-Control-Max-Age', '600');
+        }
+
+        return $response;
+    }
+}
+```
+
+第 1 步：本类核心特征是 CORS 策略宽度问题——风险取决于 Access-Control-Allow-Origin 是否使用通配符 `*`、是否无条件回显请求方 Origin、以及是否在携带凭据时仍放行任意来源。本文件第 26 行确实读取了外部输入 Origin 请求头，第 35 行也确实将其回显进 Access-Control-Allow-Origin，形式上与 SPA 后端“图省事原样回显 Origin”的漏洞形态同构；但判定关键在于回显是否受控。这是纯粹的跨域策略类别（CWE-942），与 SQL 注入、XSS、越权等无关。
+
+第 2 步：枚举全部外部输入点并确认可达性。全文件外部输入仅两处：①第 26 行 `getHeaderLine('Origin')`，是唯一能流入 CORS 响应头取值的值；②第 38 行读取的请求方法，但它只与常量 'OPTIONS' 做相等比较，取值不进入任何响应头。可达性：第 26 行的 `$origin` 经第 29 行判断后，在白名单命中分支可到达第 35 行的 sink（`withHeader('Access-Control-Allow-Origin', $origin)`）——可达但受门控。
+
+第 3 步：对唯一一条 source→sink 数据流（第 26 行 Origin → 第 35 行 ACAO）验证防御。防御位于第 29 行：`in_array($origin, self::ALLOWED_ORIGINS, true)` 对第 19-22 行的常量数组做严格全串相等匹配。类型正确——这是精确白名单，不是黑名单、不是正则、不是 str_replace/子串过滤，`https://app.example.com.attacker.net` 这类后缀拼接或编码变形均无法通过；位置正确——校验位于 sink 之前的唯一必经路径，且未命中分支（第 30 行）完全不发射 ACAO 头，不存在旁路；覆盖完整——空 Origin 与未知 Origin 一并落入拒绝分支。
+
+第 4 步：配套不变量验证。①第 30 行与第 34 行在拒绝与允许两个分支都设置 Vary: Origin，使共享缓存/CDN 按 Origin 区分缓存条目，防止“带 ACAO 的响应被另一 Origin 复用”或反向串扰；②第 36 行 Access-Control-Allow-Credentials: true 只可能与第 35 行的白名单精确 Origin 同时出现，全文件不存在通配符与凭据同发的组合；③预检路径（第 38-43 行）的 Allow-Methods/Allow-Headers 均为固定常量，未回显 Access-Control-Request-Headers，且预检同样先经过第 29 行白名单，未命中则无 ACAO，浏览器会直接拦截预检。
+
+第 5 步：第二入口/替代通道检查。全文件发射 Access-Control-* 响应头的位置仅第 33-36 行与第 39-43 行两段，均位于第 29 行白名单之后；该中间件以 PSR-15 形式包裹整个应用路由，不存在绕过它直接输出 CORS 头的其他路由、参数或间接调用，也没有运行时能把白名单替换为 `*` 的配置开关。结论：无第二入口，防御类型/位置/覆盖面均完整，判定安全。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "唯一外部输入为第26行读取的 Origin 请求头, 经第29行 in_array 对第19-22行常量白名单做严格全串精确匹配后才在第35行回显为 Access-Control-Allow-Origin, 属精确白名单而非黑名单/正则/子串替换, 后缀拼接或编码变形无法绕过; 未命中分支第30行完全不发射 ACAO 头, 且第30与34行两个分支均设置 Vary: Origin, 防止共享缓存跨 Origin 串扰; 第36行 Allow-Credentials 仅与白名单精确 Origin 组合, 全文件不存在通配符与凭据同发的组合; 预检 OPTIONS 路径第38-43行同样先过白名单且 Allow-Headers 为固定常量不回显请求头; 全文件 CORS 头发射点仅此一处且位于 PSR-15 全局中间件内, 无第二入口或替代通道, 防御类型/位置/覆盖面完整, 判定安全", "fix_suggestion": "no fix needed"}
+```

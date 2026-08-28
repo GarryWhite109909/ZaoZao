@@ -1,0 +1,52 @@
+LANG: javascript
+```code
+// gateway/cors-gateway.js —— REST API 网关：CORS 配置与账户查询模块
+const express = require('express');
+const cookieParser = require('cookie-parser');
+const cors = require('cors');
+
+const app = express();
+
+// 网关级 CORS：反射任意 Origin 并允许携带凭据
+app.use(cors({
+  origin: true,            // 将请求 Origin 头原样回写进 Access-Control-Allow-Origin
+  credentials: true,       // 允许跨域请求携带 Cookie / Authorization
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id']
+}));
+
+app.use(express.json());
+app.use(cookieParser());
+
+const ACCOUNTS = {
+  u1001: { id: 'u1001', name: 'alice', email: 'alice@corp.io', balance: 8200 }
+};
+
+app.get('/api/gateway/account/:accountId', (req, res) => {
+  const sessionUser = req.cookies.session_user;
+  if (!sessionUser) {
+    return res.status(401).json({ error: 'missing session cookie' });
+  }
+  const account = ACCOUNTS[req.params.accountId];
+  if (!account) {
+    return res.status(404).json({ error: 'account not found' });
+  }
+  res.json({ requestedBy: sessionUser, account });
+});
+
+app.listen(8080, () => console.log('gateway listening on :8080'));
+```
+
+1. **本类核心特征定位**：第 9-14 行是 Express `cors` 中间件的网关级配置——第 10 行 `origin: true` 使响应头 `Access-Control-Allow-Origin` 直接反射请求方 Origin（任意源均被放行），第 11 行 `credentials: true` 叠加允许跨域携带 Cookie/凭据。这正是 CWE-942 Permissive Cross-domain Policy 的典型形态（CORS 过宽 + 凭据放行，任意源可携带凭据跨域读取响应），属于跨域策略配置缺陷，不是命令注入、SQL 注入或越权等其他类别。
+
+2. **外部输入点枚举与可达性**：① 第 10 行消费的 HTTP `Origin` 请求头，攻击者完全可控，经 cors 中间件直达响应头 sink（第 9-14 行）；② 第 24 行读取的 Cookie `session_user`，由受害者浏览器在跨域请求中自动携带，决定第 32 行是否返回数据；③ 第 23 行路径参数 `:accountId`，经第 28 行查表后进入第 32 行响应体。三条输入全部可达暴露点。
+
+3. **主数据流验证**：攻击者页面 `https://evil.example` 执行 `fetch('https://gateway/api/gateway/account/u1001', {credentials: 'include'})`：浏览器自动附上受害者的 `session_user` Cookie → 第 24 行读到会话 → 第 25 行仅做判空存在性检查即放行 → 第 32 行返回含 email/balance 的敏感 JSON；同时因第 10-11 行，响应携带 `Access-Control-Allow-Origin: https://evil.example` 与 `Access-Control-Allow-Credentials: true`，浏览器据此放行 evil.example 的脚本读取完整响应体。
+
+4. **防御有效性核查**：全文件不存在任何 Origin 白名单、黑名单或正则校验（第 10 行是直接反射，连可绕过的过滤都不存在）；第 25-27 行的会话判空只验证凭据存在、不限制请求来源，对跨域读取无缓解作用；Cookie 未设置 SameSite 属性、无 CSRF token、无任何来源收敛措施。source→sink 全程零有效防御。
+
+5. **第二入口/替代通道检查**：第 9 行 `app.use(cors(...))` 挂载在应用级，账户路由（第 23 行）及未来所有路由均继承同一过宽策略；第 12-13 行对预检 OPTIONS 请求的方法与请求头也全部放行；文件内不存在第二条更严格的 CORS 配置或路由级覆盖，无替代安全通道。结论：单一全局漏洞策略覆盖全部入口，CWE-942 成立，风险等级 High（任意恶意站点可携带受害者凭据读取账户敏感数据）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-942 Permissive Cross-domain Policy", "risk_level": "High", "source": "line 10: cors 配置 origin: true 反射攻击者可控的请求 Origin 头", "sink": "line 9-14: cors 中间件为每个响应写入反射的 Access-Control-Allow-Origin 并叠加 credentials: true，使 line 32 的账户敏感 JSON 可被任意源携带凭据跨域读取", "explanation": "流1：请求 Origin 头 -> line 10 origin: true 原样反射 -> 响应头 Access-Control-Allow-Origin 对任意来源放行；流2：evil.example 页面以 credentials: include 发起 fetch -> 浏览器自动附带受害者 session_user Cookie -> line 24 读取、line 25 仅判空检查 -> line 32 返回 email/balance 敏感数据并被攻击者脚本读取；防御核查：全文件无 Origin 白名单/黑名单/正则，line 25-27 仅认证存在性检查不限制来源，无 SameSite/CSRF 防护，source->sink 全程零有效防御；第二入口检查：line 9 app.use 为网关级全局中间件，所有路由继承同一过宽策略，OPTIONS 预检同样全放行，不存在路由级覆盖或更严格的替代通道", "fix_suggestion": "line 10: 最小修复——将 origin: true 改为显式可信域名白名单（如 origin: ['https://app.corp.io']），使 credentials: true 仅对白名单源生效"}
+```

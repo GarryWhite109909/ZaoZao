@@ -1,0 +1,48 @@
+LANG: python
+```code
+import os
+import traceback
+
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+UPLOAD_DIR = "/srv/data/uploads"
+
+
+def read_upload(filename):
+    path = os.path.join(UPLOAD_DIR, filename)
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+@app.route("/api/files/process", methods=["POST"])
+def process_file():
+    filename = request.form.get("filename", "")
+    try:
+        data = read_upload(filename)
+        return jsonify({"size": len(data), "head": data[:32].hex()}), 200
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 500
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        return jsonify({"error": traceback.format_exc()}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+```
+
+1. **本类核心特征（第 23、25、27 行）**：三个 except 分支都把异常对象/底层错误原样序列化进响应体——第 23、25 行的 `str(exc)` 会携带操作系统级错误码与内部绝对路径（如 `[Errno 2] No such file or directory: '/srv/data/uploads/...'`），第 27 行 `traceback.format_exc()` 返回完整堆栈（服务器端源码路径、行号、函数名、依赖库安装路径与版本）。这是典型的 CWE-209 错误信息泄露敏感信息：危害经由“错误通道”泄露内部细节，filename 并未被当作命令/SQL/代码执行，不存在 CWE-78/89/94 的执行语义，也不是越权类问题。
+
+2. **输入点枚举与可达性（第 18 行为唯一 source）**：本模块唯一外部输入是第 18 行 `request.form.get("filename", "")`，由第 16 行注册的 POST /api/files/process 路由接收。数据流：第 18 行 → 第 20 行 `read_upload(filename)` → 第 11 行 `os.path.join` 拼接 → 第 12 行 `open()`。攻击者提交不存在的文件名必然触发 FileNotFoundError 到达第 23 行；提交无读权限路径或目录路径触发 PermissionError/IsADirectoryError 到达第 25/26 行；文件名含空字节等触发 ValueError 落入第 26 行兜底到第 27 行——所有分支都确定性地汇入泄露 sink，可达性由攻击者完全控制。
+
+3. **逐流防御验证**：流 1（18→20→11→12→23）：filename 无白名单、无规范化、无任何过滤，异常消息未做脱敏，`str(exc)` 裸传出；流 2（24→25）：同样原样返回；流 3（26→27）：`except Exception` 兜底不是防御，反而把一切未预期异常统一导入泄露通道，保证 sink 可达率 100%。从异常抛出点到 `jsonify` 之间不存在任何过滤层、通用错误页或“仅记日志、对外返回固定提示”的方案，防御覆盖面为零。
+
+4. **敏感内容与影响评估**：第 23/25 行泄露内部绝对路径 `/srv/data/uploads` 并构成文件存在性预言机（文件不存在与无权限返回不同消息，可探测服务器文件布局）；第 27 行泄露服务器端模块绝对路径、函数名、行号及第三方库路径/版本，可直接绘制主机内部结构，为后续攻击提供精确情报，风险级别 High。
+
+5. **第二入口/替代通道检查**：本模块仅注册第 16 行一个路由且方法限定 POST；除 filename 外未读取任何其他参数（无 request.args/files/json）；`read_upload` 无其他调用方，不存在绕开泄露点的替代通道。唯一入口即漏洞入口，结论成立：存在 CWE-209 漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-209 Generation of Error Message Containing Sensitive Information", "risk_level": "High", "source": "line 18: filename = request.form.get('filename', '') 客户端可控文件名", "sink": "line 23: return jsonify({'error': str(exc)}), 500 异常对象原样进入响应体", "explanation": "流1: 第18行外部输入 filename 经第20行 read_upload 到第11行 os.path.join 拼接、第12行 open 触发 FileNotFoundError, 异常对象携带内部绝对路径 /srv/data/uploads/<用户输入>, 第23行 str(exc) 原样写入响应体; 流2: 第24-25行 PermissionError 同样以 str(exc) 泄露路径与权限细节; 流3: 第26行 except Exception 兜底捕获一切异常, 第27行 traceback.format_exc() 返回完整堆栈含服务器模块绝对路径/行号/依赖库路径; 防御核查: filename 无白名单或规范化, 异常到响应之间无任何脱敏/过滤/通用错误提示, 兜底 except 反而保证所有错误100%汇入泄露通道; 第二入口检查: 本模块仅注册第16行 POST /api/files/process 一个路由, 除 filename 外无其他参数, read_upload 无其他调用方, 唯一入口即漏洞入口, 结论成立", "fix_suggestion": "line 23: 删除 str(exc)/traceback.format_exc() 回传, 改为 app.logger.exception(exc) 仅写服务端日志, 并统一返回 jsonify({'error': 'internal server error'}), 500"}
+```

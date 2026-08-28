@@ -1,0 +1,65 @@
+LANG: java
+```code
+package com.acme.search.filter;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * KeywordFilterEngine turns the raw query typed by a user into a
+ * 'fuzzy' regex and applies it to every indexed document title.
+ */
+public class KeywordFilterEngine {
+
+    private static final int MAX_PATTERN_LEN = 128;
+    private static final int MAX_HITS = 200;
+
+    public List<String> apply(String rawQuery, List<String> titles) {
+        if (rawQuery == null || rawQuery.isEmpty()) {
+            return Collections.emptyList();
+        }
+        String fuzzy = rawQuery.trim().replaceAll("[{}\\\\|]", "");
+        if (fuzzy.length() > MAX_PATTERN_LEN) {
+            fuzzy = fuzzy.substring(0, MAX_PATTERN_LEN);
+        }
+        Pattern pattern = Pattern.compile("^(" + fuzzy + ")+$", Pattern.CASE_INSENSITIVE);
+
+        List<String> hits = new ArrayList<>();
+        for (String title : titles) {
+            Matcher matcher = pattern.matcher(title);
+            if (matcher.matches()) {
+                hits.add(title);
+                if (hits.size() >= MAX_HITS) {
+                    break;
+                }
+            }
+        }
+        return hits;
+    }
+}
+```
+
+1. **本类核心特征**：CWE-400 的本质是不可信输入驱动无界资源消耗，本例形态为灾难性回溯正则（ReDoS）。第 26 行把用户输入拼进 `^(输入)+$` 模板——包装本身就构造了嵌套量词，用户即使只输入 `a+` 也会变成经典的 `^(a+)+$`；第 31 行在 java.util.regex 这一回溯型引擎上执行匹配。危害是 CPU 被指数级回溯耗尽导致拒绝服务，不涉及代码执行、SQL 或命令解释器，必须归为 CWE-400 资源消耗类，而非 CWE-78/89/94 等注入类。
+
+2. **输入点枚举与可达性**：本文件有两个外部输入点。流 1：第 18 行 `rawQuery`，唯一公共入口 `apply` 由搜索控制层以请求参数 `q` 直接调用，路径 18→22→26→30→31 全部可达；流 2：第 29 行 `titles`，索引标题可能含用户生成内容（如垃圾标题中连续 30 个 `a`），路径 29→30→31 可达。两条流最终都汇聚到第 31 行 `matcher.matches()` 这一资源消耗点。
+
+3. **防御逐条核验**：第 19-21 行仅判空，对回溯无任何约束；第 22 行 `replaceAll("[{}\\\\|]", "")` 是字符串替换黑名单，可绕过——`(a+)+b` 不含任何被剥离字符，原样存活，且第 26 行包装器会自行补上 `(...)+` 嵌套，黑名单形同虚设；第 23-25 行截断到 128 字符只限制模式长度而非匹配时间，5 个字符的 `(a+)+` 已足以触发指数回溯；第 16/33 行 `MAX_HITS` 只限制结果条数，不限制计算量。全程无非回溯引擎（如 RE2/J）、无匹配超时、无模式白名单，两条流上均不存在有效防御。
+
+4. **资源消耗点放大效应**：第 31 行 `matches()` 在请求线程上同步执行；模式 `(a+)+b` 对上含约 30 个连续 `a` 且结尾失配的标题时，引擎需枚举约 2^30 种切分方式才能判定失败，单个请求即可占满一个核心数分钟，少量并发请求即可耗尽线程池造成全服务 DoS——完全由不可信输入驱动的无界 CPU 消耗，是本类的教科书形态。
+
+5. **第二入口/替代通道检查**：本文件仅第 18 行一个公共方法，无其他路由、参数或间接调用能到达 `Pattern.compile`/`matcher`；`titles`（第 29 行）是唯一辅助通道，仅提供被匹配主串以放大消耗，本身不构成正则。因此 rawQuery→第 26 行→第 31 行这条链就是本模块的完整攻击面，支撑上述漏洞结论。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-400 Uncontrolled Resource Consumption",
+  "risk_level": "High",
+  "source": "line 18: apply 方法的 rawQuery 参数（搜索请求直接传入的用户查询串）",
+  "sink": "line 31: matcher.matches() 在回溯型正则引擎上执行第 26 行拼接出的嵌套量词模式",
+  "explanation": "流1: line 18 rawQuery → line 22 黑名单替换 → line 26 拼入 ^(输入)+$ 模板并编译 → line 30-31 matches() 执行；流2: line 29 titles（索引中的用户生成标题）→ line 30 作为被匹配主串 → line 31；防御核验: line 19 仅判空、line 22 字符串替换黑名单可被 (a+)+b 完整绕过、line 23-25 长度截断无法约束回溯时间、line 16/33 MAX_HITS 只限结果数不限 CPU，两条流上均无有效防御；成因: java.util.regex 为回溯引擎，嵌套量词失配时产生指数级回溯，单请求即可长时间占满 CPU，并发请求耗尽线程池，属资源消耗而非注入类；第二入口: 本文件仅 line 18 一个公共入口，无其他路由/参数/间接调用可达 sink，titles 为唯一辅助通道（提供长主串放大消耗）",
+  "fix_suggestion": "line 26: 停止将用户输入拼接进正则模板，改用 RE2/J 等非回溯引擎编译该模式，或最低限度先以白名单拒绝含嵌套量词的输入并用 Pattern.quote 降级为字面量匹配"
+}
+```

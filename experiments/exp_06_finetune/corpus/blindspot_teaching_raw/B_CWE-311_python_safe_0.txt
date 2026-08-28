@@ -1,0 +1,55 @@
+LANG: python
+```code
+"""Password reset service: reset tokens travel over enforced-TLS channels only."""
+import secrets
+import smtplib
+import ssl
+from email.message import EmailMessage
+
+from argon2 import PasswordHasher
+
+RESET_BASE_URL = "https://accounts.example.com/reset"   # https only, never http
+SMTP_HOST, SMTP_PORT = "smtp.internal.example.com", 465
+
+_hasher = PasswordHasher()            # Argon2id, per-hash random salt
+_tls = ssl.create_default_context()   # CERT_REQUIRED + hostname verification
+_digests: dict[str, str] = {}         # email -> argon2 digest (DB stand-in)
+
+
+def save_new_password(user_email: str, new_password: str) -> None:
+    """Persist only the Argon2id digest; cleartext never reaches storage."""
+    _digests[user_email] = _hasher.hash(new_password)
+
+
+def deliver_reset_email(user_email: str, token: str) -> None:
+    msg = EmailMessage()
+    msg["From"] = "noreply@example.com"
+    msg["To"] = user_email
+    msg["Subject"] = "Password reset"
+    msg.set_content(f"Reset link: {RESET_BASE_URL}?token={token}")
+    # Sink: the token crosses the trust boundary here. SMTP_SSL pins TLS from
+    # the first byte; _tls rejects plaintext fallback and untrusted certificates.
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=_tls) as smtp:
+        smtp.send_message(msg)
+
+
+def handle_reset_request(user_email: str, new_password: str) -> None:
+    """Entry point for POST /account/reset; OTP verification happens upstream."""
+    token = secrets.token_urlsafe(32)  # 256-bit CSPRNG token
+    save_new_password(user_email, new_password)
+    deliver_reset_email(user_email, token)
+```
+
+1. 第 1 行起本类核心特征：CWE-311 关注敏感数据（重置令牌/新密码）以明文形态跨信任边界——典型漏洞形态是把重置链接写成 `http://`、用 `smtplib.SMTP` 未升级 STARTTLS 的明文信道发送令牌，或将明文密码直接落库；这是传输/静态机密性保护缺失，不是 SQL 注入（CWE-89）、XSS（CWE-79）或越权（CWE-862）。本文件为安全版：每条敏感路径均被强制 TLS 或 Argon2id 散列覆盖。
+
+2. 输入点枚举与可达性：唯一公开入口是第 34 行 `handle_reset_request(user_email, new_password)`（对应 POST /account/reset）。`new_password` 经第 37 行到达第 19 行存储 sink；第 36 行 `secrets.token_urlsafe(32)` 生成的重置令牌（账户接管凭证）经第 38 行进入第 27 行邮件正文，最终于第 31 行 `smtp.send_message` 跨出信任边界；`user_email` 经第 25 行进入同一发送调用。三条流全部可达 sink，链路无中断。
+
+3. 流 1（令牌→网络）防御验证：第 30 行 `smtplib.SMTP_SSL(..., context=_tls)` 携带第 13 行 `ssl.create_default_context()`。类型正确——这是传输层强制加密，而非黑名单/正则/字符串替换等可绕过的过滤；SMTP_SSL 从第一个字节即完成 TLS 握手，不存在 STARTTLS 降级或明文回退，默认上下文强制证书链与主机名校验，阻断中间人嗅探令牌。位置正确——恰好包裹第 31 行唯一的发送 socket。覆盖完整——文件内不存在 `smtplib.SMTP`/`sendmail` 等明文替代发送路径，且第 9 行 `RESET_BASE_URL` 硬编码 `https://`，正文链接不可能以 http 形态外发。
+
+4. 流 2（密码→存储）防御验证：第 19 行 `_hasher.hash(new_password)`（第 12 行 `PasswordHasher`，Argon2id 加每哈希随机盐）。类型正确——单向自适应慢散列，即使整库拖走也无法还原明文，不是 base64 之类可逆编码；位置正确——作用于唯一持久化写入点（第 19 行即落库位置）；覆盖完整——`new_password` 不进入日志、不进入第 27 行邮件正文（正文仅含 https 链接与令牌）、不存在第二个写路径。
+
+5. 第二入口/替代通道检查：全模块仅第 34 行一个公开函数，无其他路由、CLI 或间接调用；唯一网络出口是第 31 行（TLS 固定通道），唯一存储写入是第 19 行（已散列）；令牌与密码均未写入任何日志或异常文本。结论：不存在绕过防御的明文通道，无 CWE-311 漏洞。
+
+```json
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "none", "source": "N/A", "sink": "N/A", "explanation": "外部输入点唯一：第34行 handle_reset_request 的 user_email 与 new_password（POST /account/reset 入口），两条敏感流均可达 sink；流1：第36行 secrets.token_urlsafe 生成的重置令牌在第27行拼入邮件正文，于第31行 smtp.send_message 跨出信任边界，防御为第30行 smtplib.SMTP_SSL 携带第13行 ssl.create_default_context()，类型正确（传输层强制加密，非黑名单/正则/字符串替换过滤），SMTP_SSL 自首字节即 TLS 握手，无 STARTTLS 降级与明文回退，证书加主机名校验阻断中间人嗅探，位置正确（恰好包裹唯一发送 socket），覆盖完整（文件内无 smtplib.SMTP 或 sendmail 明文替代路径，第9行 RESET_BASE_URL 硬编码 https，链接不会以 http 外发）；流2：第37行 new_password 传入第19行 PasswordHasher.hash 以 Argon2id 加盐单向散列后写入存储，类型正确（自适应慢散列，拖库亦无明文），位置正确（唯一持久化写入点），覆盖完整（明文密码不进日志、不进邮件正文、无第二写路径）；第二入口/替代通道检查：全文件仅一个公开入口，唯一网络出口为第31行 TLS 固定通道，唯一存储写入为第19行散列写入，令牌与密码均未落入日志，故不存在绕过防御的明文通道，判定安全", "fix_suggestion": "no fix needed"}
+```

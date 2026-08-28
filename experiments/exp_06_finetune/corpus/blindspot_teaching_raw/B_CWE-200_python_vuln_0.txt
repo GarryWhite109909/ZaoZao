@@ -1,0 +1,67 @@
+LANG: python
+```code
+import csv
+import io
+
+from flask import Flask, Response, jsonify, request
+
+app = Flask(__name__)
+
+# 内部商品表：cost_price / internal_margin / supplier_terms 为按分级不得对外的敏感列
+PRODUCTS = [
+    {"id": 1, "name": "widget", "msrp": 29.9, "cost_price": 8.4,
+     "internal_margin": 0.72, "supplier_terms": "net-45, secret rebate 12%"},
+    {"id": 2, "name": "gadget", "msrp": 59.0, "cost_price": 17.3,
+     "internal_margin": 0.70, "supplier_terms": "exclusive, floor price 15.0"},
+]
+
+# 允许导出的列（未做敏感度区分，敏感列被一并纳入）
+EXPORTABLE = ["id", "name", "msrp", "cost_price", "internal_margin", "supplier_terms"]
+
+
+@app.route("/export/products.csv", methods=["GET"])
+def export_products_csv():
+    fields = request.args.get("fields", ",".join(EXPORTABLE))
+    selected = [f.strip() for f in fields.split(",") if f.strip() in EXPORTABLE]
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=selected, extrasaction="ignore")
+    writer.writeheader()
+    for row in PRODUCTS:
+        writer.writerow({k: row.get(k, "") for k in selected})
+    return Response(buf.getvalue(), mimetype="text/csv")
+
+
+@app.route("/api/products/<int:pid>", methods=["GET"])
+def product_detail(pid):
+    for row in PRODUCTS:
+        if row["id"] == pid:
+            return jsonify(row)
+    return jsonify({"error": "not found"}), 404
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
+```
+
+1. **类别定位**：本样本核心缺陷是 CWE-200——把按内部分级不得外泄的数据（第 10-13 行的 cost_price、internal_margin、supplier_terms，即内部成本/毛利/供应商条款）原样写入对任意客户端可见的 HTTP 响应：第 30 行 CSV 导出响应体、第 37 行 JSON 全字段回显，以及第 42 行 debug=True 向客户端开放 Werkzeug 调试页（回溯/源码/环境信息外泄）。全程没有把不可信数据拼入命令、SQL 或模板解释器，因此不是 CWE-78/89/94 等注入类；缺陷也不在鉴权判定本身，而在响应载荷过度暴露敏感字段，属典型的敏感信息暴露形态。
+
+2. **外部输入点枚举与可达性**：入口一：第 22 行 `request.args.get('fields', ...)`，查询参数完全由客户端控制，经第 23 行解析为 selected，进入第 26 行 `DictWriter(fieldnames=selected)` 与第 29 行 `writerow`，最终汇入第 30 行 Response 响应体，source→sink 全链可达；且默认值取自第 17 行全量列表，攻击者零输入、一个普通 GET /export/products.csv 即触发泄露。入口二：第 33 行路径参数 `<int:pid>`，决定回显哪条记录，直达第 37 行 `jsonify(row)`。两个输入点均确认可达敏感数据出口。
+
+3. **流 A（fields→CSV）防御验证**：第 23 行存在白名单过滤（`f.strip() in EXPORTABLE`），类型为输入侧白名单、位置在序列化之前，但覆盖面失效：白名单本体在第 17 行，而第 17 行把三个敏感列一并纳入，第 22 行默认值又取自该全量列表——该过滤器实际是“放行”而非“拦截”敏感列，对 CWE-200 不构成有效防御；全程无列级敏感度分级、无按调用方角色裁剪、响应亦无脱敏。
+
+4. **流 B/C 防御验证**：流 B（pid→JSON）：第 37 行 `jsonify(row)` 对整行字典全量序列化，第 34 至 37 行之间无任何字段白名单、脱敏或角色判断，防御缺失。流 C：第 42 行 `app.run(debug=True)` 将调试模式对客户端开启，出错时调试页向任意访问者展示完整回溯、源码片段与运行环境，同样无防护，属配置级敏感信息暴露。
+
+5. **第二入口/替代通道检查**：存在。第 33-38 行的 `/api/products/<int:pid>` 是与主导出路由完全独立的第二路由，以 JSON 形式回显同一批敏感列；同时第 22 行 fields 参数本身构成替代通道——可用 `?fields=cost_price,supplier_terms` 精确点名敏感列。两条通道互不依赖、均无防御，说明敏感列暴露是系统性缺陷而非单点笔误，支撑最终结论 has_vulnerability=true、类别为 CWE-200。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-200 Exposure of Sensitive Information",
+  "risk_level": "High",
+  "source": "line 22: request.args.get('fields', ...) 客户端可控的导出字段参数，默认值即包含全部敏感列",
+  "sink": "line 30: Response(buf.getvalue(), mimetype='text/csv') 将含 cost_price/internal_margin/supplier_terms 的 CSV 响应体返回给任意未认证客户端",
+  "explanation": "流A: line22 fields 参数经 line23 白名单解析后进入 line26 DictWriter 与 line29 writerow，最终由 line30 整体返回；line23 过滤虽为白名单，但白名单本体 line17 已纳入 cost_price/internal_margin/supplier_terms 三个敏感列，且 line22 默认值取自该全量列表，过滤覆盖面失效，属放行而非拦截，不构成有效防御；流B: line33 路径参数 pid 选中记录后，line37 jsonify(row) 对整行字典全量序列化回显，中间无任何字段裁剪或脱敏，防御缺失；流C: line42 app.run(debug=True) 将调试模式对客户端开启，错误回溯、源码片段与运行环境信息可被任意访问者查看，无防护；第二入口检查: line33-38 的 /api/products/<int:pid> 为独立第二路由，以 JSON 回显同一批敏感列，且 fields 参数可用 ?fields=cost_price,supplier_terms 精确点名敏感列，两条通道均无防御，证明敏感列暴露为系统性缺陷",
+  "fix_suggestion": "line 17: 将 EXPORTABLE 收窄为仅公开列（id,name,msrp），使 line22 默认值与 line23 过滤天然排除敏感列；同时在 line37 改为显式公开字段构造响应、line42 关闭 debug"
+}
+```
