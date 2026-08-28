@@ -1,0 +1,106 @@
+LANG: php
+```code
+# === file: Classes/Controller/FormManagementController.php ===
+<?php
+declare(strict_types=1);
+
+namespace Vendor\FormExtension\Controller;
+
+use Psr\Http\Message\ServerRequestInterface;
+use TYPO3\CMS\Core\Http\HtmlResponse;
+use Vendor\FormExtension\Domain\Dto\SearchCriteria;
+use Vendor\FormExtension\Domain\Repository\FormDefinitionRepository;
+
+final class FormManagementController
+{
+    public function __construct(
+        private readonly FormDefinitionRepository $repository,
+    ) {}
+
+    /** Backend module list view: GET ?search=...&limit=... */
+    public function listAction(ServerRequestInterface $request): HtmlResponse
+    {
+        $params = $request->getQueryParams();
+        $criteria = SearchCriteria::fromQueryParams($params);
+        $rows = $this->repository->findAll($criteria);
+        $html = '';
+        foreach ($rows as $row) {
+            $html .= '<li>' . htmlspecialchars((string)$row['label'], ENT_QUOTES) . '</li>';
+        }
+        return new HtmlResponse('<ul>' . $html . '</ul>');
+    }
+}
+# === file: Classes/Domain/Dto/SearchCriteria.php ===
+<?php
+declare(strict_types=1);
+
+namespace Vendor\FormExtension\Domain\Dto;
+
+/** Carries the search term from the controller to the repository layer. */
+final class SearchCriteria
+{
+    public function __construct(
+        public readonly string $searchTerm = '',
+        public readonly int $limit = 0,
+    ) {}
+
+    public static function fromQueryParams(array $params): self
+    {
+        $term = isset($params['search']) ? (string)$params['search'] : '';
+        // treat as LIKE-safe: strip SQL wildcard characters only
+        $term = str_replace(['%', '_'], '', $term);
+        $limit = isset($params['limit']) ? (int)$params['limit'] : 0;
+        return new self($term, $limit);
+    }
+
+    public function hasLimit(): bool
+    {
+        return $this->limit > 0;
+    }
+}
+# === file: Classes/Domain/Repository/FormDefinitionRepository.php ===
+<?php
+declare(strict_types=1);
+
+namespace Vendor\FormExtension\Domain\Repository;
+
+use Doctrine\DBAL\Connection;
+use Vendor\FormExtension\Domain\Dto\SearchCriteria;
+
+final class FormDefinitionRepository
+{
+    public const TABLE_NAME = 'tx_formextension_form_definition';
+
+    public function __construct(
+        private readonly Connection $connection,
+    ) {}
+
+    /** Fetch all form definitions matching the search term. */
+    public function findAll(SearchCriteria $criteria): array
+    {
+        $sql = 'SELECT * FROM ' . self::TABLE_NAME;
+        if ($criteria->searchTerm !== '') {
+            $sql .= " WHERE identifier LIKE '%" . $criteria->searchTerm . "%'"
+                . " OR label LIKE '%" . $criteria->searchTerm . "%'";
+        }
+        if ($criteria->hasLimit()) {
+            $sql .= ' LIMIT ' . $criteria->limit;
+        }
+        return $this->connection->fetchAllAssociative($sql);
+    }
+}
+```
+
+1. **外部输入点枚举与可达性**：本组文件唯一的 HTTP 入口是 FormManagementController.php L18-20 的 `listAction`，L20 `getQueryParams()` 引入两个外部输入：`search` 与 `limit`。L21 将整个 params 传入 `SearchCriteria::fromQueryParams`，L22 将 criteria 对象传入 `FormDefinitionRepository::findAll`，直达 FormDefinitionRepository.php L22-23 的字符串拼接并在 L28 经 `fetchAllAssociative` 执行原始 SQL——source 到 sink 跨三个文件完整可达，中间无断点。
+
+2. **数据流逐一防御验证**：流1（search）：L1:20 → L2:16 赋值 `$term` → L2:18 `str_replace(['%','_'],...)` 仅删除两个 LIKE 通配符，属字符串替换式黑名单过滤，不处理单引号、注释符、UNION 等语法元素，载荷如 `x' OR 1=1-- ` 或 `') UNION SELECT ...--` 原样通过 → L3:22-23 拼入 LIKE 子句 → L3:28 执行，注入成立，全链无参数绑定/预编译。流2（limit）：L2:19 强制 `(int)` 类型转换，属有效防御，故 L3:26 的 LIMIT 拼接不可注入。
+
+3. **中间文件性质**：SearchCriteria.php 是典型的“看似净化实则不完整”传递层；且过滤位于 DTO 工厂而非 sink 侧，`searchTerm` 为公开属性，任何调用方直接 `new SearchCriteria($raw)` 即完全绕过 L2:18 的 str_replace，说明该过滤既不充分也未被强制执行。
+
+4. **第二入口与替代通道**：当前代码仅 `listAction` 一个路由动作，无第二 HTTP 入口；但 `findAll` 为公开方法，其他控制器、CLI 命令或调度任务以未净化 criteria 调用即复现同一 sink，构成替代调用通道。另注意 L1:25 的 `htmlspecialchars` 仅是输出侧 XSS 编码，与 SQL 注入无关，不构成对 CWE-89 的任何防御。
+
+5. **结论**：主链 L1:20 → L2:16/18 → L3:22-23 → L3:28 存在可利用 SQL 注入（CWE-89），攻击者可通过 UNION/布尔盲注读取任意表，后端模块上下文评定为 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89", "risk_level": "Critical", "source": "L1:line 20: FormManagementController.listAction 通过 getQueryParams 读取 GET 参数 search", "sink": "L3:line 28: FormDefinitionRepository.findAll 中 fetchAllAssociative 执行拼接后的原始 SQL", "explanation": "流1: L1:20 读取 search → L1:21 传入 fromQueryParams → L2:16 赋给 searchTerm → L2:18 str_replace 仅删除 % 和 _ 两个 LIKE 通配符, 属字符串替换黑名单过滤, 不处理单引号/注释/UNION, 载荷如 x' OR 1=1-- 原样通过 → L3:22-23 直接拼接进 LIKE 子句 → L3:28 fetchAllAssociative 执行, 注入成立; 流2: L1:20 的 limit 参数在 L2:19 经 (int) 强制类型转换, 属有效防御, L3:26 的 LIMIT 拼接不可注入; 防御评估: 全链唯一过滤为 L2:18 的 str_replace, 位置在中间 DTO 层而非 sink, 类型为可绕过的字符替换, 无参数绑定或预编译语句, 不构成有效防御; L1:25 的 htmlspecialchars 仅为输出侧 XSS 编码, 与 SQL 注入无关; 第二入口: 当前仅 listAction 一个 HTTP 路由, 无第二路由, 但 findAll 为公开方法且 searchTerm 为公开属性, 其他控制器/CLI/调度任务直接 new SearchCriteria 或以原始参数调用 findAll 均可绕过 L2:18 到达同一 sink, 构成替代调用通道", "fix_suggestion": "line 22: 移除字符串拼接, 改用参数绑定, 如 fetchAllAssociative('SELECT * FROM 表名 WHERE identifier LIKE ? OR label LIKE ?', ['%'.$term.'%', '%'.$term.'%']) 并配合通配符转义"}
+```

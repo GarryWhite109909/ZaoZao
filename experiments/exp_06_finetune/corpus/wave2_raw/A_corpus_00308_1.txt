@@ -1,0 +1,62 @@
+LANG: javascript
+```code
+const express = require('express');
+const ejs = require('ejs');
+const ExcelJS = require('exceljs');
+
+const reporting = require('../helpers/reporting');
+
+const router = express.Router();
+
+// Dispatch table populated by admin modules at boot time.
+const typeFunctions = {
+  products: 'getProductStats',
+  customers: 'getCustomerStats',
+  sales: 'getSalesStats',
+};
+
+function resolveStats(type, mode) {
+  const fn = reporting[typeFunctions[type]] || reporting.getSummaryStats;
+  return fn(mode);
+}
+
+router.get('/admin/reporting/stats', (req, res) => {
+  const stats = resolveStats(req.query.type);
+  res.json({ statistics: stats, date_range: reporting.getDateRange() });
+});
+
+router.get('/admin/reporting/view', (req, res) => {
+  const type = req.query.type;
+  const stats = resolveStats(type, 'table');
+  const page = ejs.render(`
+    <h2 class="report-title">${type} report</h2>
+    <pre><%= summary %></pre>
+  `, { summary: JSON.stringify(stats) });
+  res.send(page);
+});
+
+router.get('/admin/reporting/export', async (req, res) => {
+  const type = req.query.type;
+  const stats = resolveStats(type, 'table');
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Reporting');
+  (stats.rows || []).forEach((row) => ws.addRow(row));
+  const buf = await wb.xlsx.writeBuffer();
+  res.attachment(`${type}.${req.query.format || 'xlsx'}`);
+  res.send(buf);
+});
+
+module.exports = router;
+```
+
+1. **第 27 行（source 枚举与可达性）**：外部输入点共四处——第 22、27、37 行的 `req.query.type`（三条路由各一处）以及第 43 行的 `req.query.format`。主链从第 27 行 `const type = req.query.type` 开始，该值完全由 URL 查询串控制，从进入到 sink 之间没有任何校验、白名单过滤或编码处理，可达性无阻断。
+
+2. **第 29–30 行（sink）**：第 29 行 `ejs.render(...)` 会把第一个参数当作 EJS 模板源码编译成可执行 JS 函数；第 30 行通过 JS 模板字面量 `${type}` 把原始输入直接拼进模板源码。攻击者请求 `?type=<%= 7*7 %>` 页面即输出 49，`?type=<%= process.mainModule.require('child_process').execSync('id') %>` 即可 RCE——与原漏洞 `?type={{7*7}}` 的服务端模板求值语义完全等价（CWE-1336）。
+
+3. **防御核验（类型/位置/覆盖面）**：`type` 在到达 sink 前唯一经过的逻辑是第 17 行 `typeFunctions[type]`（带 fallback）——它只是为动态调用挑选 helper 方法名的白名单查找，既不校验、规范化原始值，也不拦截第 30 行的拼接（无论查表命中与否 `${type}` 都会执行）；且注入发生在模板编译期，任何输出转义都来不及生效。故主链上不存在有效防御。
+
+4. **第二入口/替代通道**：第 21–24 行 `/admin/reporting/stats` 复用同一 source，但只到达第 17 行的动态分发，无模板 sink（最坏情况是未捕获 TypeError 导致 500）；第 36–45 行 `/admin/reporting/export` 中 `type`/`format` 只流入第 43 行 `res.attachment`，Express 底层 content-disposition 模块会对文件名做安全编码，既无头注入也无模板求值。因此模板注入 sink 唯一存在于 `/view` 路由，但三条路由共享同一未校验的 `req.query.type`，说明该模式是系统性的，`/view` 链路端到端可利用。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Server-Side Template Injection (SSTI) via type query parameter leading to RCE", "risk_level": "Critical", "source": "line 27: const type = req.query.type（/admin/reporting/view 路由查询参数，同一参数还流入第 22、37 行）", "sink": "line 29: ejs.render(...) 编译并执行由第 30 行 ${type} 拼接而成的模板源码", "explanation": "第 27 行 req.query.type 未经任何校验即在第 30 行被 ${type} 拼入 EJS 模板源码，第 29 行 ejs.render 将其编译为可执行 JS 并求值，payload 如 <%= 7*7 %> 或 <%= process.mainModule.require('child_process').execSync('id') %> 可实现 SSTI 到 RCE，与原 Bagisto type={{7*7}} 的 Blade 求值语义等价；第 17 行 typeFunctions[type] 查表只是动态分发的方法名白名单，不校验也不拦截原始值，且注入发生在模板编译期、输出转义无法生效，故主链无有效防御；第二入口核验：第 21-24 行 stats 路由复用同一 source 但仅达第 17 行动态分发（无模板 sink，最坏未捕获 TypeError 致 500），第 36-45 行 export 路由的 type/format 仅流入第 43 行 res.attachment（Express 的 content-disposition 模块对文件名安全编码，无头注入亦无模板求值），模板注入 sink 唯一存在于 /view 路由，三条路由共享同一未校验参数表明该模式系统性存在，/view 链路端到端可利用", "fix_suggestion": "line 30: 不要把 req.query.type 拼入模板源码——将其作为数据传入并用转义占位符输出（如 ejs.render(template, { reportType: String(type) }) 配合 <h2><%= reportType %> report</h2>），或在第 27 行之后用 typeFunctions 白名单校验 type，不合法立即返回 400"}
+```

@@ -1,0 +1,99 @@
+LANG: php
+```code
+# === file: src/Field/FieldValueResolver.php ===
+<?php
+namespace YesWiki\Bazar\Field;
+
+/**
+ * Resolves the runtime value of a bazar field.
+ * Mirrors upstream BazarField::getValue() fallback chain.
+ */
+class FieldValueResolver
+{
+    private array $defaults;
+
+    public function __construct(array $defaults = [])
+    {
+        $this->defaults = $defaults;
+    }
+
+    public function getValue(?array $entry, string $propertyName)
+    {
+        if (is_array($entry) && array_key_exists($propertyName, $entry)) {
+            return $entry[$propertyName];
+        }
+        // fallback kept for backward compatibility with direct URL edits
+        if (isset($_REQUEST[$propertyName])) {
+            return $_REQUEST[$propertyName]; // SOURCE: user-controlled
+        }
+        return $this->defaults[$propertyName] ?? '';
+    }
+}
+# === file: src/Field/FieldSanitizer.php ===
+<?php
+namespace YesWiki\Bazar\Field;
+
+/**
+ * Legacy cleanup applied before static rendering.
+ */
+class FieldSanitizer
+{
+    public function cleanForStatic($value)
+    {
+        if (!is_string($value)) {
+            return $value;
+        }
+        // historical mitigation: drop inline script tags only
+        $value = str_ireplace('<script>', '', $value);
+        $value = str_ireplace('</script>', '', $value);
+        return $value;
+    }
+}
+# === file: src/Render/StaticFieldRenderer.php ===
+<?php
+namespace YesWiki\Render;
+
+use YesWiki\Bazar\Field\FieldValueResolver;
+use YesWiki\Bazar\Field\FieldSanitizer;
+
+class StaticFieldRenderer
+{
+    private FieldValueResolver $resolver;
+    private FieldSanitizer $sanitizer;
+
+    public function __construct(FieldValueResolver $resolver, FieldSanitizer $sanitizer)
+    {
+        $this->resolver = $resolver;
+        $this->sanitizer = $sanitizer;
+    }
+
+    public function renderField(?array $entry, string $propertyName): string
+    {
+        $value = $this->resolver->getValue($entry, $propertyName);
+        $value = $this->sanitizer->cleanForStatic($value);
+        // value is interpolated into raw HTML without htmlspecialchars
+        return '<div class="bazar-field">' . $value . '</div>';
+    }
+
+    public function outputField(?array $entry, string $propertyName): void
+    {
+        echo $this->renderField($entry, $propertyName); // SINK
+    }
+}
+```
+
+**分析（针对整组文件）**
+
+1. **外部输入点枚举与可达性**：唯一超全局输入点是 `src/Field/FieldValueResolver.php:23-24` 的 `$_REQUEST[$propertyName]`（同时覆盖 GET/POST/COOKIE 三通道）；次级输入为同文件 `:19-20` 的 `$entry[$propertyName]`（调用方传入用户可控 entry 时为污点）。可达性已证实：`src/Render/StaticFieldRenderer.php:18` 将 `$entry` 声明为可空，`:20` 调用 `getValue` 时 entry 为空即落入 `$_REQUEST` 回退分支，污点值必然沿返回值传回 `:20` 的 `$value`。
+
+2. **主数据流防御核验**：流1（主链）：`FieldValueResolver.php:24` → `StaticFieldRenderer.php:20` → `:21` 调用 `cleanForStatic` → `FieldSanitizer.php:15-16` → `StaticFieldRenderer.php:23` 拼入 HTML → `:28` `echo`。防御核验：`FieldSanitizer.php:15-16` 仅用 `str_ireplace` 删除字面 `<script>`/`</script>` 标签，属黑名单字符串替换，`<img src=x onerror=...>`、`<svg onload=...>`、`<script/src=` 等属性变体全部绕过，且未覆盖属性上下文与 `javascript:` URI；全链无 `htmlspecialchars`/`htmlentities`/模板自动转义 → 防御无效，反射型 XSS 成立。
+
+3. **次级数据流核验**：流2：`FieldValueResolver.php:19-20` 的 `$entry[$propertyName]` → 同一 `cleanForStatic`（`FieldSanitizer.php:9-18`）→ 同一 sink `StaticFieldRenderer.php:28`；伪净化与流1完全相同、覆盖面同样不足，同样可绕过。
+
+4. **第二入口/替代通道**：`$_REQUEST` 本身即 GET/POST/COOKIE 三通道合一，无需额外路由；`getValue` 与 `outputField` 均为 public，任何控制器调用 `outputField`（或调用 `renderField` 后自行输出）均构成等价第二入口；文件组内 `FieldSanitizer.php` 是唯一中间层且为伪净化，不存在可阻断污点的替代路径，支撑漏洞成立的最终结论。
+
+5. **结论**：CWE-79 反射型 XSS，source（`FieldValueResolver.php:24`）与 sink（`StaticFieldRenderer.php:28`）跨文件分离，中间层净化不完整，风险 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 跨站脚本（反射型 XSS，跨文件污点，中间伪净化）", "risk_level": "High", "source": "L1:line 24: FieldValueResolver::getValue 返回用户可控的 $_REQUEST[$propertyName]", "sink": "L3:line 28: StaticFieldRenderer::outputField 将未转义值 echo 进 HTML 响应", "explanation": "流1主链: FieldValueResolver.php:24 的 $_REQUEST[$propertyName] 污点返回 → StaticFieldRenderer.php:20 接收 → :21 调用 FieldSanitizer::cleanForStatic → FieldSanitizer.php:15-16 仅 str_ireplace 删除字面 <script>/</script> 标签, 属黑名单字符串替换, <img src=x onerror=...> 与 <svg onload=...> 及 <script 属性变体均可绕过, 且未覆盖属性上下文与 javascript: URI, 非有效防御 → StaticFieldRenderer.php:23 拼入 div HTML → :28 echo 输出, 全链无 htmlspecialchars/htmlentities 或模板自动转义, 反射型 XSS 成立; 流2次级: FieldValueResolver.php:19-20 的 $entry[$propertyName] 在调用方传入用户可控 entry 时流经同一伪净化到达同一 sink, 同样可绕过; 第二入口与替代通道: $_REQUEST 同时覆盖 GET/POST/COOKIE 三通道, getValue 与 outputField 均为 public, 任何控制器调用 outputField 或 renderField 后自行输出均构成等价入口, 文件组内 FieldSanitizer.php 为唯一中间层且净化不完整, 不存在可阻断污点的替代路径", "fix_suggestion": "line 28: 输出前对 $value 执行 htmlspecialchars($value, ENT_QUOTES, 'UTF-8')（或在 line 23 拼接前统一转义），并删除 FieldSanitizer.php L15-16 的黑名单 str_ireplace 伪净化"}
+```

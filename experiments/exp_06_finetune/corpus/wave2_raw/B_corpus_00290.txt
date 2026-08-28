@@ -1,0 +1,110 @@
+LANG: go
+```code
+# === file: web/repo/migrate.go ===
+package repo
+
+import (
+	"net/http"
+
+	"gitea.dev/services/mirror"
+)
+
+// MigrateRepo handles POST /repo/migrate.
+func MigrateRepo(w http.ResponseWriter, r *http.Request) {
+	cloneAddr := r.FormValue("clone_addr")
+	opts := mirror.MigrateOptions{CloneAddr: cloneAddr}
+	if err := mirror.MigrateRepository(r.Context(), opts); err != nil {
+		http.Error(w, "migrate failed", http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/user/repos", http.StatusSeeOther)
+}
+
+# === file: services/mirror/migrate.go ===
+package mirror
+
+import (
+	"context"
+	"errors"
+	"strings"
+
+	"gitea.dev/modules/git"
+)
+
+// MigrateOptions carries migration parameters.
+type MigrateOptions struct {
+	CloneAddr string
+	Mirror    bool
+}
+
+// validateCloneAddr blocks only the literal file:// scheme prefix;
+// internal targets like http://169.254.169.254 or localhost are NOT blocked.
+func validateCloneAddr(addr string) bool {
+	return !strings.HasPrefix(strings.ToLower(addr), "file://")
+}
+
+// MigrateRepository validates then delegates to the git layer.
+func MigrateRepository(ctx context.Context, opts MigrateOptions) error {
+	addr := opts.CloneAddr
+	if !validateCloneAddr(addr) {
+		return errors.New("invalid clone address")
+	}
+	if !git.IsRepoURLAccessible(ctx, addr) {
+		return errors.New("repository not accessible")
+	}
+	return git.Clone(ctx, addr, "/data/repos/tmp-migrate", git.CloneRepoOptions{Mirror: opts.Mirror})
+}
+
+# === file: modules/git/clone.go ===
+package git
+
+import (
+	"context"
+	"os"
+	"path"
+	"time"
+
+	"gitea.dev/modules/git/gitcmd"
+)
+
+// CloneRepoOptions options when clone a repository.
+type CloneRepoOptions struct {
+	Mirror  bool
+	Timeout time.Duration
+}
+
+// Clone clones original repository to target path; from is used as the clone URL.
+func Clone(ctx context.Context, from, to string, opts CloneRepoOptions) error {
+	toDir := path.Dir(to)
+	if err := os.MkdirAll(toDir, os.ModePerm); err != nil {
+		return err
+	}
+	cmd := gitcmd.NewCommand().AddArguments("clone")
+	if opts.Mirror {
+		cmd.AddArguments("--mirror")
+	}
+	cmd.AddDashesAndList(from, to)
+	if opts.Timeout <= 0 {
+		opts.Timeout = -1
+	}
+	return cmd.WithTimeout(opts.Timeout).RunWithStderr(ctx)
+}
+
+// IsRepoURLAccessible checks if given repository URL is accessible.
+func IsRepoURLAccessible(ctx context.Context, url string) bool {
+	_, _, err := gitcmd.NewCommand("ls-remote", "-q", "-h").AddDynamicArguments(url, "HEAD").RunStdString(ctx)
+	return err == nil
+}
+```
+
+1. 【输入点枚举与可达性】唯一外部输入点是 web/repo/migrate.go L11 的 `r.FormValue("clone_addr")`（L12 的 mirror 布尔值不构成网络目标面）。可达路径：L13 调用 `mirror.MigrateRepository` → services/mirror/migrate.go L25 赋给 `addr` → L29 传入 `git.IsRepoURLAccessible`、L32 传入 `git.Clone`，两处均把该字符串作为 git 网络操作的目标地址，source 到 sink 全链可达。
+
+2. 【数据流与防御逐条验证】流1（clone_addr→git.Clone）：中间层 services/mirror/migrate.go L19-20 的 `validateCloneAddr` 仅黑名单 `file://` 前缀，不校验 scheme 白名单也不解析 host，`http://169.254.169.254/`、`http://localhost:8500/`、内网 IP、`gopher://` 等全部放行，属可绕过的不完整过滤；modules/git/clone.go L19-32 的 `Clone` 内部零校验，L28 `AddDashesAndList(from, to)` 后于 L32 执行 `git clone`，服务端向任意 URL 发起请求，SSRF 成立。流2（clone_addr→IsRepoURLAccessible）：services/mirror/migrate.go L29 原样透传，modules/git/clone.go L36-38 对该 URL 执行 `git ls-remote` 主动建立网络连接，是同一 source 的第二 sink（可作内网存活/端口探测）。
+
+3. 【第二入口与替代通道】本组文件中唯一 HTTP 路由是 POST /repo/migrate，无其他路由或参数入口；但 `git.Clone` 与 `git.IsRepoURLAccessible` 均为导出函数，构成间接调用面（任何后续调用者传入用户输入即复现漏洞）；且同一请求内存在两条独立 sink 通道（先 ls-remote 探测、后 clone 拉取），移除任一条另一条仍可 SSRF，故不存在可中断全链的单一防御点。
+
+4. 【结论】调用链上无任何有效防御：黑名单过滤不完整 + git 层零校验，CWE-918 服务端请求伪造成立，攻击者可借迁移功能访问云元数据端点与内网服务，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918: Server-Side Request Forgery (SSRF)", "risk_level": "High", "source": "L1:line 11: r.FormValue('clone_addr') 用户可控的克隆地址", "sink": "L3:line 32: git.Clone 中 RunWithStderr 执行 git clone 并连接攻击者指定 URL", "explanation": "流1: L1:11 r.FormValue(clone_addr) 经 L1:13 传入 MigrateRepository, L2:25 赋给 addr, L2:32 透传给 git.Clone, 在 L3:28 AddDashesAndList(from,to) 并于 L3:32 执行 git clone, 攻击者可指定 http://169.254.169.254 或内网地址触发服务端请求; 流2: 同一 source 经 L2:29 透传至 L3:36-38 IsRepoURLAccessible, 对任意 URL 发起 ls-remote 网络连接, 构成第二 sink; 防御验证: L2:19-20 validateCloneAddr 仅黑名单 file:// 前缀, 不校验 scheme 白名单与目标主机, 属可绕过的不完整过滤, git.Clone 与 IsRepoURLAccessible 内部均无 scheme/host 白名单或内网地址拦截; 第二入口: 本组文件唯一路由为 POST /repo/migrate, 无其他 HTTP 入口, 但 Clone 与 IsRepoURLAccessible 为导出函数构成间接调用面, 且同一请求内两条通道任一存在即可 SSRF, 故漏洞成立", "fix_suggestion": "line 20: 将黑名单改为白名单校验, 仅允许 http/https scheme 并解析 host 拒绝环回/私网/链路本地地址(如 127.0.0.0/8, 169.254.0.0/16, 10.0.0.0/8, ::1), 校验通过后才允许进入 git 层"}
+```

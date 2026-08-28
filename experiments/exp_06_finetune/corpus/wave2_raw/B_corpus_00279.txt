@@ -1,0 +1,96 @@
+LANG: javascript
+```code
+# === file: core/server/api/endpoints/posts.js ===
+const express = require('express');
+const router = express.Router();
+const mobiledocLib = require('../../lib/mobiledoc/image-sizes');
+
+// POST /ghost/api/admin/posts/preview - force-rerender editor payload
+router.post('/preview', async (req, res) => {
+    const mobiledocJson = req.body.mobiledoc;
+    if (!mobiledocJson) {
+        return res.status(400).json({error: 'mobiledoc required'});
+    }
+
+    // fills missing width/height on image cards before rerender
+    const enriched = await mobiledocLib.populateImageSizes(mobiledocJson);
+    return res.json({mobiledoc: enriched});
+});
+
+module.exports = router;
+# === file: core/server/lib/mobiledoc/image-sizes.js ===
+const logging = require('@tryghost/logging');
+const storageUtils = require('../../adapters/storage/utils');
+const {imageSize} = require('../image/image-size');
+
+// used when force-rerendering post content to ensure that old image card
+// payloads contain width/height values used when generating srcsets
+const populateImageSizes = async function (mobiledocJson) {
+    const mobiledoc = JSON.parse(mobiledocJson);
+
+    const sizePromises = mobiledoc.cards.map(async (card) => {
+        const [cardName, payload] = card;
+
+        const needsFilling = cardName === 'image' && payload && payload.src && (!payload.width || !payload.height);
+        if (!needsFilling) {
+            return;
+        }
+
+        const isUnsplash = payload.src.match(/images\.unsplash\.com/);
+        const isRelativeImagePath = /^\/content\/images\//.test(payload.src);
+        try {
+            let size;
+            if (isUnsplash) {
+                size = await imageSize.getImageSizeFromUrl(payload.src);
+            } else if (isRelativeImagePath || storageUtils.isLocalImage(payload.src)) {
+                size = await imageSize.getOriginalImageSizeFromStorageUrl(payload.src);
+            } else {
+                size = await imageSize.getImageSizeFromUrl(payload.src);
+            }
+
+            if (size && size.width && size.height) {
+                payload.width = size.width;
+                payload.height = size.height;
+            }
+        } catch (e) {
+            logging.error(e);
+        }
+    });
+
+    await Promise.all(sizePromises);
+
+    return JSON.stringify(mobiledoc);
+};
+
+module.exports = {populateImageSizes};
+# === file: core/server/lib/image/image-size.js ===
+const request = require('@tryghost/request');
+const imageSize = require('image-size');
+
+// resolve a /content/images/... url to a local file and measure it
+async function getOriginalImageSizeFromStorageUrl(url) {
+    const buffer = await require('../../adapters/storage').readLocalFile(url);
+    return imageSize(buffer);
+}
+
+// fetches a remote URL server-side to read image dimensions
+async function getImageSizeFromUrl(url) {
+    const res = await request(url, {method: 'GET'});
+    const buffer = await res.body;
+    return imageSize(buffer);
+}
+
+module.exports = {imageSize, getImageSizeFromUrl, getOriginalImageSizeFromStorageUrl};
+```
+
+1. 外部输入点枚举与可达性：唯一外部输入是 core/server/api/endpoints/posts.js 第 7 行的 `req.body.mobiledoc`（第 6 行 POST /preview 路由），第 13 行原样传入 `populateImageSizes`；core/server/lib/mobiledoc/image-sizes.js 第 8 行 JSON.parse，第 10-11 行遍历 cards 提取 `payload.src`，第 23/27 行传入 `getImageSizeFromUrl`，最终到达 core/server/lib/image/image-size.js 第 12 行发起出站请求——攻击者完全控制 cardName、payload.src、width/height，`needsFilling`（第 13 行）恒可满足，全链可达无中断。
+
+2. 逐流防御验证：流A（image-sizes.js 第 23 行 unsplash 分支）与流B（第 27 行 fallback 分支）汇于同一 sink；第 18 行 unsplash 正则只是子串匹配、仅决定走哪个分支，两个 URL 分支调用同一函数，主机白名单从未被强制执行；第 19 行相对路径正则只把本地路径分流到第 25 行，任意绝对 http/https URL 落入第 27 行；第 24 行 `storageUtils.isLocalImage` 是启发式判断而非协议/主机校验；全链无私网与元数据地址（169.254.169.254、127.0.0.1、10.x）拦截，image-size.js 第 12 行将 url 原样交给 request——正则与字符串匹配按规则视为可绕过，链上不存在任何有效防御。
+
+3. 第二入口与替代通道：本组文件内唯一 HTTP 入口是 posts.js 第 6 行的 /preview 路由；但 `populateImageSizes`（image-sizes.js 第 44 行导出）与 `getImageSizeFromUrl`（image-size.js 第 17 行导出）均为库级导出函数，其他管理路由（导入、定时重渲染）可直接复用同一未校验链路；第 25 行本地存储分支是替代通道（本地文件读取，非 SSRF sink），其存在恰恰证明第 18-19 行的正则分流不是净化而是路由选择。
+
+4. 结论：攻击者提交含 `src=http://169.254.169.254/latest/meta-data/` 且缺 width/height 的 image 卡片即可让服务器发起任意出站 GET（内网探测/云元数据访问），且 posts.js 第 14 行回显填充后的 width/height 提供部分响应反馈，CWE-918 成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 SSRF (Server-Side Request Forgery)", "risk_level": "High", "source": "L1:line 7: posts.js 中 req.body.mobiledoc — 用户提交的原始 mobiledoc JSON", "sink": "L3:line 12: image-size.js 中 request(url, {method: 'GET'}) — 以未校验 URL 发起服务端出站 HTTP 请求", "explanation": "流A(主链): L1:7 的 req.body.mobiledoc 经 L1:13 传入 populateImageSizes; L2:8 JSON.parse 后 L2:10-11 遍历 cards 提取 payload.src; L2:18 的 unsplash 正则只是子串匹配用于分支选择, L2:23 与 L2:27 两个 URL 分支调用同一 getImageSizeFromUrl, 主机白名单从未被强制执行; L2:19 相对路径正则仅把本地路径分流到 L2:25, 任意绝对 http/https URL 落入 L2:27; L2:24 的 storageUtils.isLocalImage 是启发式判断而非协议与主机校验; 全链无私网与元数据地址(169.254.169.254/127.0.0.1/10.x)拦截, L3:12 将 url 原样交给 request 发起出站 GET, 构成 SSRF; 流B(替代分支): L2:25 本地存储分支读取本地文件, 不是 SSRF sink, 但证明正则分流并非净化; 防御评估: L2:18/L2:19 均为正则匹配且只做路由选择不做拒绝, 按规则视为可绕过的无效防御, 链上不存在任何完整校验; 第二入口: 本组文件唯一 HTTP 入口是 L1:6 的 /preview 路由, 但 populateImageSizes(L2:44)与 getImageSizeFromUrl(L3:17)均为导出函数, 其他管理路由(导入/定时重渲染)可直接复用同一未校验链路; 攻击者提交含 src=http://169.254.169.254/latest/meta-data/ 且缺 width/height 的 image 卡片即触发, L1:14 回显填充结果提供部分响应反馈", "fix_suggestion": "line 27: 调用 getImageSizeFromUrl 前用 new URL 解析 src, 强制协议为 https 且主机精确等于白名单(如 images.unsplash.com), 否则跳过该卡片不发起任何请求"}
+```

@@ -1,0 +1,56 @@
+LANG: typescript
+
+```typescript
+// server/api/comments.post.ts —— Nuxt3/Nitro 评论接口：鉴权 + 清洗中间件链
+import {
+  defineEventHandler,
+  getCookie,
+  readBody,
+  createError,
+  setHeader,
+  type H3Event,
+} from 'h3'
+
+const sessions = new Map<string, number>() // sid -> uid
+const comments = new Map<number, { uid: number; title: string; content: string }>()
+let nextId = 1
+
+// 中间件 1：会话鉴权（只回答“是谁”，不处理内容安全）
+async function requireAuth(event: H3Event): Promise<number> {
+  const sid = getCookie(event, 'nuxt-session')
+  const uid = sid ? sessions.get(sid) : undefined
+  if (!uid) throw createError({ statusCode: 401, statusMessage: 'login required' })
+  return uid
+}
+
+// 中间件 2：XSS 清洗 —— 黑名单只剥 <script> 标签
+function stripScriptTags(raw: string): string {
+  return raw
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<script[^>]*>/gi, '')
+}
+
+export default defineEventHandler(async (event) => {
+  const uid = await requireAuth(event)
+  const body = await readBody(event)
+  const content = stripScriptTags(String(body.content ?? ''))
+  const id = nextId++
+  comments.set(id, { uid, title: String(body.title ?? ''), content })
+  setHeader(event, 'Content-Type', 'text/html; charset=utf-8')
+  return `<article data-id='${id}'><h2>${body.title}</h2>${content}</article>`
+})
+```
+
+1. 第 32 行是全部外部输入入口：`readBody(event)` 使 `body.content` 与 `body.title` 均为攻击者完全可控的字符串；第 17 行的 cookie 虽也是输入点，但第 18 行仅用于会话查找、不流向 sink。第 31 行鉴权返回的 uid 只作归属标记，输入可达后续所有处理，可达性成立。
+
+2. 第 33 行 → 第 24-28 行是 content 路径上的唯一防御：两条正则黑名单只删除 `<script>` 标签。`<img src=x onerror=alert(1)>`、`<svg onload=...>`、`<a href='javascript:alert(1)'>`、`<iframe srcdoc=...>` 等向量不含 `script` 字样，原样通过——黑名单/正则替换按规则视为可绕过，非有效防御，与原 SVGO 插件“只删 `<script>` 元素、漏掉其余可执行向量”完全同构。
+
+3. 第 37 行是 sink：模板字符串把 `content` 与 `body.title` 未做任何 HTML 实体编码地拼入响应，且第 36 行显式设置 `text/html`，浏览器将把注入内容解析为活动脚本执行。
+
+4. 第二入口与替代通道：`body.title` 在第 33 行被完全绕过（清洗只包裹了 content），经第 35 行原样入库、第 37 行原样插值，属零防御直达 sink；同时第 35 行写入的 `comments` 存储可被其他路由（如 GET /api/comments/[id]）再次渲染，构成脱离本响应的存储型 XSS 通道。
+
+5. 防御位置与类型核验：第 19 行的 401 拦截是身份校验，属防御类型错位，不覆盖内容安全，任意已登录低权限用户均可注入并打击查看页面的其他用户/管理员；下游渲染（第 37 行及其他消费路由）依赖 `stripScriptTags` 做净化，正如原漏洞中消费方依赖 removeScripts 插件做 sanitization——覆盖面不足导致 XSS 成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 跨站脚本（XSS）——净化中间件黑名单不完整", "risk_level": "High", "source": "line 32: readBody(event) 中的 body.content 与 body.title（line 17 的 cookie 仅用于会话查找，不达 sink）", "sink": "line 37: 模板字符串把 body.title 与 content 未编码拼入 text/html 响应", "explanation": "流1：line 32 的 body.content -> line 33 stripScriptTags -> line 26-27 两条正则黑名单只删除 <script> 标签，<img src=x onerror=alert(1)>、<svg onload=...>、<a href='javascript:alert(1)'>、<iframe srcdoc=...> 等不含 script 字样的向量全部放行 -> line 37 拼入 HTML 响应被执行；流2：line 32 的 body.title 完全未经过任何清洗 -> line 35 原样入库 -> line 37 直接插值，零防御直达 sink；防御评估：line 19 的鉴权只做身份校验属防御类型错位，黑名单/正则替换视为可绕过，全链无任何输出编码；第二入口与替代通道：line 35 写入的 comments 存储可被其他路由（如 GET /api/comments/[id]）再次渲染形成存储型 XSS，任意已登录低权限用户均可注入攻击其他用户与管理员浏览器", "fix_suggestion": "line 37: 对所有插值字段做上下文感知的 HTML 实体编码，content 改用 DOMPurify 类白名单净化后再输出与入库（line 33 同步替换黑名单函数）"}
+```

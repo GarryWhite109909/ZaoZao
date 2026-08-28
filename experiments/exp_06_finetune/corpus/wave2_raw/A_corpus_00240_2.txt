@@ -1,57 +1,70 @@
 LANG: java
 ```java
-package com.example.cms.controller;
-
-import com.example.cms.model.GlobalSet;
-import com.example.cms.service.GlobalSetService;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+package com.example.cms.admin;
 
 import java.util.List;
 import java.util.Map;
 
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * Control-panel endpoints for managing global content sets.
+ * SecurityConfig forces an authenticated session on every request
+ * under /admin/** ; privileged mutations additionally require the
+ * ADMIN role (see per-method annotations below).
+ */
 @RestController
-@RequestMapping("/api/globals")
+@RequestMapping("/admin/globals")
 public class GlobalSetController {
 
-    private final GlobalSetService globalSetService;
+    private final JdbcTemplate jdbc;
 
-    public GlobalSetController(GlobalSetService globalSetService) {
-        this.globalSetService = globalSetService;
+    public GlobalSetController(JdbcTemplate jdbc) {
+        this.jdbc = jdbc;
     }
 
-    @PostMapping("/sets/save")
-    public ResponseEntity<?> saveSet(@RequestBody Map<String, Object> body) {
-        if (!globalSetService.isAdmin()) {
-            return ResponseEntity.status(403).body(Map.of("error", "admin required"));
+    @PostMapping("/save")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<String> saveSet(@RequestBody Map<String, Object> body) {
+        jdbc.update("UPDATE global_sets SET name = ?, handle = ? WHERE id = ?",
+                body.get("name"), body.get("handle"), body.get("setId"));
+        return ResponseEntity.ok("saved");
+    }
+
+    @PostMapping("/reorder")
+    public ResponseEntity<String> reorderSets(@RequestBody List<Long> ids) {
+        for (int i = 0; i < ids.size(); i++) {
+            jdbc.update("UPDATE global_sets SET sort_order = ? WHERE id = ?",
+                    i, ids.get(i));
         }
-        return ResponseEntity.ok(globalSetService.save(body));
+        return ResponseEntity.ok("reordered");
     }
 
-    @PostMapping("/sets/delete")
-    public ResponseEntity<?> deleteSet(@RequestBody Map<String, Object> body) {
-        if (!globalSetService.isAdmin()) {
-            return ResponseEntity.status(403).body(Map.of("error", "admin required"));
-        }
-        globalSetService.deleteById((Long) body.get("id"));
-        return ResponseEntity.ok().build();
-    }
-
-    // Missing admin check, unlike save/delete above
-    @PostMapping("/sets/reorder")
-    public ResponseEntity<?> reorderSets(@RequestBody List<Long> ids) {
-        globalSetService.reorder(ids);
-        return ResponseEntity.ok().build();
+    @PostMapping("/delete")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<String> deleteSet(@RequestBody Map<String, Object> body) {
+        jdbc.update("DELETE FROM global_sets WHERE id = ?", body.get("id"));
+        return ResponseEntity.ok("deleted");
     }
 }
 ```
 
-1. 第 33 行 `@PostMapping("/sets/reorder")` 是外部输入入口（source）：任何已认证用户都能 POST 到该端点，请求体中的 `ids` 列表直接来自客户端。
-2. 第 34 行将客户端传入的 `ids` 直接绑定到方法参数，无任何校验或过滤。
-3. 第 35 行调用 `globalSetService.reorder(ids)` 是危险操作（sink）：直接按攻击者提供的顺序重写全局集合的排序，影响 CMS 全局内容结构。
-4. 对比第 20 行和第 28 行，`save` 与 `delete` 端点均显式执行了 `isAdmin()` 检查并返回 403，而 `reorder` 端点完全没有等价的授权检查——防御缺失与原 PHP 漏洞完全同构。
-5. 类上也没有任何 `@PreAuthorize` 或 Security 配置兜底，因此该越权操作对任意低权限已登录用户开放。
+1. **输入点枚举与可达性**：控制器在 `/admin/globals` 前缀下暴露三个 POST 输入点——第 32 行 `saveSet` 的 `@RequestBody Map`（name/handle/setId）、第 39 行 `reorderSets` 的 `@RequestBody List<Long> ids`、第 49 行 `deleteSet` 的 `@RequestBody Map`（id）。第 16-18 行注释表明 SecurityConfig 仅对 `/admin/**` 强制会话认证，因此三者均可被任意已登录控制台用户完全控制并直达各自 sink。
+
+2. **主链追踪（source→sink）**：第 39 行 `ids` 直接由 JSON 请求体绑定，无来源校验；第 40 行循环展开后，第 41 行 `jdbc.update` 将每个 id 对应的 `sort_order` 改写为调用者指定的任意顺序——全局内容集排序是影响所有站点内容结构的管理员级配置变更，source→sink 一跳直达，中间无任何过滤或校验层。
+
+3. **防御逐一核查**：对照组第 31 行与第 48 行的 `@PreAuthorize("hasRole('ADMIN')")` 位置正确（位于第 33、50 行 sink 之前）且覆盖方法级，证明本控制器的授权模型要求 ADMIN 角色；而 reorder 方法（第 38-39 行）完全没有方法级授权注解，唯一门槛是认证。第 39 行的 `List<Long>` 绑定仅做类型校验，第 41 行参数化 SQL 仅防注入，均不构成授权防御——认证不等于授权，此处防御属于“缺失”而非“可绕过”。
+
+4. **第二入口与替代通道排查**：本文件内不存在其他路由、参数或间接调用能到达第 41 行的 sink；save/delete 是独立且已正确防护的通道。唯一漏洞通道是 `POST /admin/globals/reorder`，任何持有低权限角色（如编辑）的已认证用户可直接调用，将全局集顺序改写为任意值。
+
+5. **结论**：漏洞语义结构与原 Craft CMS `GlobalsController::actionReorderSets` 缺失 `requireAdmin()`（相邻 `save-set`/`delete-set` 均强制）完全对应，确认 CWE-862 缺失授权。
 
 ```json
-{"has_vulnerability": true, "vulnerability_type": "CWE-862 Missing Authorization on reorder endpoint", "risk_level": "medium", "source": "line 33-34: POST /api/globals/sets/reorder 接收客户端 ids 参数", "sink": "line 35: globalSetService.reorder(ids) 直接重排全局集合", "explanation": "任意已认证用户可提交 ids -> reorder 无 isAdmin 检查 -> 低权限用户篡改全局集合顺序", "fix_suggestion": "line 34: 在 reorderSets 方法开头加入与 save/delete 相同的 isAdmin 校验或添加 @PreAuthorize 注解"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-862 Missing Authorization", "risk_level": "High", "source": "line 39: @RequestBody List<Long> ids — POST /admin/globals/reorder 的JSON请求体", "sink": "line 41: jdbc.update('UPDATE global_sets SET sort_order = ? WHERE id = ?') 全局排序写操作", "explanation": "流1: line 39 ids 来自任意已认证用户的请求体 -> line 40 循环 -> line 41 直接改写全局集 sort_order, 无中间校验; 防御核查: line 31 与 line 48 的 @PreAuthorize('hasRole('ADMIN')') 证明本控制器授权模型要求 ADMIN, 而 reorder 方法无任何方法级授权注解, 仅剩 /admin/** 的会话认证(line 16-18), 认证不等于授权; line 39 的 List<Long> 绑定仅类型校验, line 41 参数化SQL仅防注入, 均非授权防御, 属防御缺失而非可绕过; 第二入口排查: 文件内无其他路由或间接调用可达 line 41 的 sink, save/delete 为独立且已防护通道, 唯一漏洞通道为 POST /admin/globals/reorder, 低权限已认证用户可直接调用, 与原 Craft CMS actionReorderSets 缺失 requireAdmin 的语义结构一致", "fix_suggestion": "line 38: 在 reorderSets 方法上添加 @PreAuthorize('hasRole('ADMIN')')，与 line 31 和 line 48 的授权模型对齐"}
 ```

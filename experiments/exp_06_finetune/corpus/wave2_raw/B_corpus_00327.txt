@@ -1,0 +1,105 @@
+LANG: php
+```code
+# === file: public/index.php ===
+<?php declare(strict_types=1);
+
+use App\DependencyResolver\LockTransaction;
+use App\Package\LockFileWriter;
+
+require __DIR__ . '/../src/DependencyResolver/LockTransaction.php';
+require __DIR__ . '/../src/Package/LockFileWriter.php';
+
+// 外部输入点1：HTTP 查询参数 package（SOURCE，污点起点）
+$package = $_GET['package'] ?? '';
+// 外部输入点2：HTTP 查询参数 dist_url（SOURCE）
+$distUrl = $_GET['dist_url'] ?? '';
+
+// 第二入口/替代通道：CLI 参数汇入同一污点链（外部输入点3、4）
+if (PHP_SAPI === 'cli' && isset($argv[1])) {
+    $package = $argv[1];
+    $distUrl = $argv[2] ?? '';
+}
+
+$tx = new LockTransaction(new LockFileWriter());
+$tx->updateMirrorAndUrls($package, $distUrl);
+
+# === file: src/DependencyResolver/LockTransaction.php ===
+<?php declare(strict_types=1);
+
+namespace App\DependencyResolver;
+
+use App\Package\LockFileWriter;
+
+/**
+ * 重组自 Composer LockTransaction：保留 updateMirrorAndUrls 的
+ * URL 白名单正则与黑名单式替换净化。
+ */
+class LockTransaction
+{
+    private LockFileWriter $writer;
+
+    public function __construct(LockFileWriter $writer)
+    {
+        $this->writer = $writer;
+    }
+
+    public function updateMirrorAndUrls(string $packageName, string $distUrl): void
+    {
+        // 看似净化：黑名单单轮替换，....// 删除一次后仍剩 ../，可绕过
+        $safeName = str_replace(['../', '..\\'], '', $packageName);
+
+        // 原版白名单正则只约束 distUrl 内容，不约束 $safeName 的路径语义
+        if (preg_match('{^https?://(?:(?:www\.)?bitbucket\.org|(api\.)?github\.com|(?:www\.)?gitlab\.com)/}i', $distUrl)) {
+            $distUrl = preg_replace('{(?<=/|sha=)[a-f0-9]{40}(?=/|$)}i', 'HEAD', $distUrl);
+        }
+
+        // 污点继续向 sink 传播
+        $this->writer->writeLock($safeName, json_encode(['dist_url' => $distUrl], JSON_UNESCAPED_SLASHES));
+    }
+}
+
+# === file: src/Package/LockFileWriter.php ===
+<?php declare(strict_types=1);
+
+namespace App\Package;
+
+/**
+ * 锁文件落盘：CWE-22 污点汇聚点。
+ */
+class LockFileWriter
+{
+    private string $baseDir;
+
+    public function __construct(?string $baseDir = null)
+    {
+        $this->baseDir = $baseDir ?? sys_get_temp_dir() . '/app-lock';
+    }
+
+    public function writeLock(string $packageName, string $content): void
+    {
+        // SINK：$packageName 直接拼入路径，无 realpath/基于 baseDir 的前缀校验
+        $path = $this->baseDir . '/' . $packageName . '.json';
+        if (!is_dir($this->baseDir)) {
+            mkdir($this->baseDir, 0755, true);
+        }
+        file_put_contents($path, $content);
+    }
+}
+```
+
+1. 外部输入点枚举与可达性：`public/index.php` L10 `$_GET['package']`、L12 `$_GET['dist_url']` 为 HTTP 输入，L15-L17 CLI `$argv[1]/$argv[2]` 为第二入口；四者均汇入同一变量并在 L20-L21 进入 `LockTransaction::updateMirrorAndUrls`，到 sink 路径可达。
+2. 主数据流逐跳验证（CWE-22）：index.php L10 → L21 → LockTransaction.php L23（`str_replace` 黑名单单轮替换，输入 `....//` 删除一个 `../` 后仍余 `../`，可绕过）→ LockTransaction.php L31 `writeLock($safeName, ...)` → LockFileWriter.php L20 直接拼接路径 → L24 `file_put_contents` 实现任意文件写入。
+3. 防御类型/位置/覆盖面核查：全链唯一过滤位于 LockTransaction.php L23，属黑名单+字符串替换式过滤，单轮执行可嵌套绕过，非有效防御；LockFileWriter.php L20/L24 无 `realpath`、无 baseDir 前缀校验；LockTransaction.php L26 的锚定白名单正则本身有效，但仅覆盖 distUrl 的内容分支，完全不覆盖 packageName 的路径分支，覆盖面不足。
+4. 第二入口与替代通道结论：index.php L15-L17 的 CLI 通道与 HTTP 通道共享同一变量与调用链，抵达同一 sink；`dist_url` 流（index.php L12 → LockTransaction.php L26-L27 → LockFileWriter.php L24 的内容参数）不参与路径拼接，不构成第二条路径穿越流；任意写可覆盖 webshell 或计划任务文件，故风险为 Critical。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 路径穿越导致任意文件写入",
+  "risk_level": "Critical",
+  "source": "L1:line 10: public/index.php 的 $_GET['package']",
+  "sink": "L3:line 24: src/Package/LockFileWriter.php 的 file_put_contents($path, $content)",
+  "explanation": "主链：L1:line 10 的 $_GET['package'] 经 L1:line 21 进入 L2:line 20 updateMirrorAndUrls，L2:line 23 的 str_replace 黑名单单轮替换可被 ....// 绕过还原为 ../，L2:line 31 将其传入 writeLock，L3:line 20 直接拼接进路径，L3:line 24 file_put_contents 实现任意文件写入；防御核查：全链唯一过滤为 L2:line 23 的黑名单字符串替换（可绕过，非有效防御），L3:line 20 与 line 24 处无 realpath 或 baseDir 前缀校验，L2:line 26 的锚定白名单正则本身有效但仅覆盖 distUrl 内容分支、不覆盖 packageName 路径分支；流B：L1:line 12 的 $_GET['dist_url'] 经 L2:line 26-27 处理后仅作为 L3:line 24 的文件内容参数写入文件体，不参与路径拼接，故不构成第二条路径穿越流；第二入口：L1:line 15-17 的 CLI $argv 与 HTTP 共享同一变量与调用链抵达同一 sink，替代通道存在，任意写可覆盖 webshell 或计划任务文件，故定 Critical",
+  "fix_suggestion": "line 20: 拼接后用 realpath 校验目标路径必须位于 baseDir 之内，并拒绝包含 .. 或路径分隔符及绝对路径的包名，否则抛异常拒绝写入"
+}
+```

@@ -1,0 +1,101 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+from flask import Flask, jsonify, request
+
+from app.services import fetch_remote_schema
+
+app = Flask(__name__)
+
+
+@app.route("/schema/preview", methods=["GET"])
+def schema_preview():
+    schema_url = request.args.get("url", "")
+    ref = request.args.get("ref", ".")
+    try:
+        content = fetch_remote_schema(schema_url, ref)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"preview": content[:2000]})
+
+
+@app.route("/schema/import", methods=["POST"])
+def schema_import():
+    body = request.get_json(silent=True) or {}
+    schema_url = body.get("schema_url", "")
+    try:
+        content = fetch_remote_schema(schema_url, ".")
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"preview": content[:2000]})
+
+
+# === file: app/services.py ===
+from app.fetcher import get_body, join_url
+
+# Looks like an SSRF filter, but a substring blacklist is trivially bypassed
+_BLOCKED = ("localhost", "file:", "169.254", "metadata.")
+
+
+def fetch_remote_schema(user_url: str, user_ref: str = ".") -> str:
+    lowered = user_url.lower()
+    for token in _BLOCKED:
+        if token in lowered:
+            raise ValueError("blocked host in schema url")
+    # user_ref may itself be an absolute URL and silently replaces the host
+    candidate = join_url(user_url, user_ref)
+    # this flag turns off the only real network-level guard inside get_body
+    return get_body(candidate, allow_private_network=True)
+
+
+# === file: app/fetcher.py ===
+import socket
+from urllib.parse import urlparse
+
+import httpx
+
+DEFAULT_HTTP_TIMEOUT = 30.0
+MAX_HTTP_REDIRECTS = 20
+
+
+def join_url(url: str, ref: str = ".") -> str:
+    # an absolute ref replaces scheme and host entirely; pure pass-through
+    return str(httpx.URL(url).join(ref))
+
+
+def _validate_url_for_fetch(url: str, *, allow_private_network: bool) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("unsupported scheme")
+    if parsed.hostname is None:
+        raise ValueError("missing host")
+    if allow_private_network:
+        return  # the only real guard, disabled by the caller flag
+    ip = socket.gethostbyname(parsed.hostname)
+    if ip.startswith("127.") or ip.startswith("10."):
+        raise ValueError("private address blocked")
+
+
+def get_body(url: str, *, allow_private_network: bool = False) -> str:
+    current_url = url
+    for _ in range(MAX_HTTP_REDIRECTS + 1):
+        _validate_url_for_fetch(current_url, allow_private_network=allow_private_network)
+        response = httpx.get(current_url, follow_redirects=False, timeout=DEFAULT_HTTP_TIMEOUT)
+        if response.status_code in (301, 302, 303, 307, 308):
+            current_url = join_url(current_url, response.headers.get("location", ""))
+            continue
+        break
+    return response.text
+```
+
+1. 【输入点枚举与可达性】共三个外部输入点，全部可达 sink：app/routes.py:10 的 `request.args.get('url')` 与 app/routes.py:11 的 `request.args.get('ref')`（GET /schema/preview）经 routes.py:13 进入 fetch_remote_schema；app/routes.py:22 的 `body.get('schema_url')`（POST /schema/import）经 routes.py:24 进入同一函数；三条流最终都汇于 app/services.py:15 的 get_body 调用，抵达 app/fetcher.py:32 的 `httpx.get(current_url)`。
+
+2. 【主链防御逐段验证】流A（主链）：routes.py:10 → services.py:8-11 的 `_BLOCKED` 子串黑名单只匹配 localhost/file:/169.254/metadata. 且只作用于原始 user_url，可用 `127.0.0.1`、`0x7f000001`、`2130706433`（十进制 IPv4）、`0177.0.0.1`（八进制）、`[::1]` 或解析到内网的域名绕过，且拼接结果 candidate 与后续重定向目标均不再过黑名单——按规则属可绕过的无效防御；services.py:13 的 join_url（fetcher.py:10-12）为纯传递无校验；services.py:15 传入 `allow_private_network=True`，使 fetcher.py:21-22 的唯一真实防线直接 return 短路，污点 URL 无任何有效校验抵达 fetcher.py:32 完成 SSRF。
+
+3. 【替代通道与第二入口】流B：routes.py:11 的 ref 参数完全不受黑名单检查，fetcher.py:12 的 `httpx.URL(url).join(ref)` 遇绝对 ref 会整体替换 scheme 与 host，可直接注入 `http://169.254.169.254/latest/meta-data/` 等内网地址；流C（第二入口）：routes.py:19-27 的 POST /schema/import 与 GET 共享同一 sink，路径完全相同；此外 fetcher.py:34 的重定向 Location 拼接后同样依赖已被禁用的校验，构成间接通道。
+
+4. 【防御覆盖面补充】即使 fetcher.py:15-25 的校验被启用，fetcher.py:24 也只是 `127./10.` 前缀黑名单，漏掉 192.168/172.16-31/169.254/0.0.0.0/IPv6 内网段，且未覆盖重定向每一跳；故整条调用链上不存在完整防御，多入口多通道均可达，CWE-918 成立，风险 High（可访问内网与云 metadata）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918: Server-Side Request Forgery (SSRF)", "risk_level": "High", "source": "L1:line 10: request.args.get('url') 用户可控的 schema URL（GET /schema/preview）", "sink": "L3:line 32: httpx.get(current_url, ...) 服务端发起 HTTP 请求", "explanation": "流A主链: app/routes.py:10 的 request.args.get('url') 经 routes.py:13 进入 services.py:7; services.py:9-11 的 _BLOCKED 子串黑名单仅匹配 localhost/file:/169.254/metadata. 且只检查原始 user_url, 可用 127.0.0.1、0x7f000001、2130706433、0177.0.0.1、[::1] 或解析到内网的域名绕过, 属可绕过的无效防御; services.py:13 的 join_url(app/fetcher.py:10-12)为纯传递无任何校验; services.py:15 以 allow_private_network=True 调用 get_body, 使 fetcher.py:21-22 的唯一真实防线直接 return 短路, 污点 URL 抵达 fetcher.py:32 的 httpx.get 完成 SSRF; 流B替代通道: routes.py:11 的 ref 参数不受黑名单检查, join_url 遇绝对 ref 会整体替换 scheme 与 host, 可直接注入 http://169.254.169.254/ 等内网地址; 流C第二入口: routes.py:22 的 body.get('schema_url')(POST /schema/import)经 routes.py:24 走相同路径抵达同一 sink; 重定向目标 fetcher.py:34 拼接后同样无主机校验; 即使启用校验, fetcher.py:24 的 127./10. 前缀黑名单也漏掉 192.168/172.16-31/169.254/0.0.0.0/IPv6 内网段; 综上调用链无完整防御, CWE-918 成立", "fix_suggestion": "line 15: 删除 app/services.py 第15行的 allow_private_network=True 传参恢复默认校验, 并在 fetcher.py 对每一跳(含重定向)解析 IP 且仅放行 is_global 公网地址"}
+```

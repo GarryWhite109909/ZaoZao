@@ -1,0 +1,108 @@
+LANG: javascript
+```code
+# === file: core/server/utils/private-ip.js ===
+const net = require('net');
+
+function normalizeIPv4(addr) {
+    try {
+        const normalized = new URL('http://' + addr + '/').hostname;
+        if (net.isIPv4(normalized)) {
+            return normalized;
+        }
+    } catch (e) { /* parse failed */ }
+    return null;
+}
+
+function isPrivateIPv4(addr) {
+    const parts = addr.split('.');
+    const a = parseInt(parts[0], 10);
+    const b = parseInt(parts[1], 10);
+    if (a === 10 || a === 127 || a === 0 || a >= 240) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    return false;
+}
+
+// Public entry: decide whether an address is forbidden.
+function isPrivateIp(addr) {
+    if (!addr) return true; // fail closed on empty
+    const normalized = normalizeIPv4(addr);
+    if (normalized) return isPrivateIPv4(normalized);
+    if (addr === '::1' || addr === '::') return true;
+    return false; // any other IPv6 / odd form is treated as public
+}
+
+module.exports = { isPrivateIp, normalizeIPv4 };
+# === file: core/server/lib/external-request.js ===
+const got = require('got');
+const dnsPromises = require('dns').promises;
+const errors = require('@tryghost/errors');
+const config = require('../../shared/config');
+const { isPrivateIp } = require('../utils/private-ip');
+
+// Guard hook: single DNS lookup at hook time; got re-resolves on connect.
+async function errorIfHostnameResolvesToPrivateIp(options) {
+    if (config.get('env') === 'development') {
+        return; // every check skipped in development
+    }
+    const siteUrl = new URL(config.get('url'));
+    const requestUrl = new URL(options.url.href);
+    if (requestUrl.host === siteUrl.host) {
+        return; // self-host allowlist by hostname string compare
+    }
+    const result = await dnsPromises.lookup(options.url.hostname);
+    if (isPrivateIp(result.address)) {
+        throw new errors.InternalServerError({ message: 'URL resolves to a non-permitted private IP block', code: 'URL_PRIVATE_INVALID' });
+    }
+}
+
+const externalRequest = got.extend({
+    timeout: 10000,
+    hooks: {
+        beforeRequest: [errorIfHostnameResolvesToPrivateIp],
+        beforeRedirect: [errorIfHostnameResolvesToPrivateIp]
+    }
+});
+
+// SINK: outbound socket to the attacker-influenced host.
+async function fetchRemote(url) {
+    const response = await externalRequest(url, { responseType: 'json' });
+    return response.body;
+}
+
+module.exports = { fetchRemote };
+# === file: core/server/api/oembed.js ===
+const express = require('express');
+const { fetchRemote } = require('../lib/external-request');
+
+const router = express.Router();
+
+// SOURCE: attacker-controlled query param reaches the outbound fetcher.
+router.get('/oembed', async (req, res) => {
+    const target = req.query.url; // tainted, no validation here
+    try {
+        const data = await fetchRemote(target);
+        res.json(data);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+module.exports = router;
+```
+
+**分析（针对整组文件）**
+
+1. **外部输入点枚举与可达性**：全组唯一攻击者可控输入是 `oembed.js` L8 的 `req.query.url`（GET /api/oembed，无需认证），L10 原样传入 `fetchRemote(target)`，文件内无任何校验；`external-request.js` L9/L12 的 `config.get('env')`、`config.get('url')` 为部署配置，不构成 source。可达性：target → L33 `externalRequest(url)` → got 钩子 → 真实出站请求，全链贯通，source 与 sink 分处第 3、第 2 文件。
+
+2. **逐条数据流的防御验证**：主链仅一条：oembed.js L8 → L10 → external-request.js L33。链上防御共四处，均不完整——防御A（private-ip.js L26-32 `isPrivateIp`）：黑名单式 IP 段过滤，且 L31 对所有未识别的 IPv6/畸形形式 `return false` 视为公网（fail-open），`::ffff:7f00:1` 等映射写法可绕过；防御B（external-request.js L9-11）：development 环境直接 return，属环境开关而非防御；防御C（L14-16）：与 `siteUrl.host` 做主机名字符串比较的自机白名单，不校验实际解析 IP；防御D（L17-20）：仅做**单次** `dnsPromises.lookup` 后查黑名单，而 got 在 L33 建连时会做第二次独立 DNS 解析，两次解析间的 TOCTOU 使 TTL=0 的 DNS rebinding 可让钩子看到公网 IP、建连时解析到 127.0.0.1，检查被整体绕过。
+
+3. **第二入口/替代通道**：本组文件仅 `/oembed` 一个 HTTP 路由，无其他参数入口或间接调用；但 got 默认跟随重定向，L27 的 `beforeRedirect` 复用同一有缺陷钩子，攻击者可控的重定向目标构成到达同一 sink 的替代通道，且同样受 TOCTOU 与 fail-open 黑名单影响——所有通道共享同一不完整防御。
+
+4. **结论**：调用链上不存在任何完整防御（黑名单可绕过 + 环境短路 + 字符串白名单 + 单次解析 TOCTOU），source（L3:line 8）到 sink（L2:line 33）全程无有效净化，CWE-918 SSRF 成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918: Server-Side Request Forgery (DNS rebinding TOCTOU 绕过私网 IP 黑名单)", "risk_level": "High", "source": "L3:line 8: req.query.url — GET /api/oembed 的攻击者可控查询参数", "sink": "L2:line 33: externalRequest(url) 由 got 发起出站 HTTP 请求", "explanation": "主数据流: oembed.js L8 req.query.url → L10 fetchRemote(target) → external-request.js L32-33 externalRequest(url) → beforeRequest 钩子 L8 → L17 dnsPromises.lookup 后调用 private-ip.js L26 isPrivateIp → 通过则 L33 真正建连, source 到 sink 无有效净化; 防御A private-ip.js L26-32 为黑名单式 IP 段过滤且 L31 对未识别 IPv6/畸形形式 return false 视为公网, ::ffff:7f00:1 等映射写法可绕过; 防御B external-request.js L9-11 development 环境短路关闭全部检查, 属环境开关非防御; 防御C L14-16 与 siteUrl.host 的主机名字符串比较白名单, 不校验实际解析 IP; 防御D L17-20 仅单次 dnsPromises.lookup, 与 got L33 建连时的二次独立 DNS 解析之间存在 TOCTOU, TTL=0 的 DNS rebinding 使钩子见公网 IP 而建连解析到 127.0.0.1, 检查被完全绕过; 第二入口: 本组文件仅 /oembed 一个 HTTP 路由无其他参数入口, 但 got 默认跟随重定向, L27 beforeRedirect 复用同一有缺陷钩子, 攻击者可控重定向目标构成到达同一 sink 的替代通道且同样无完整防御; 结论: 所有通道共享不完整防御, CWE-918 SSRF 成立", "fix_suggestion": "line 17: 用固定解析结果的方式消除 TOCTOU——自定义 lookup 得到 IP 后校验并直接向该 IP 建连(携带原 Host 头), 或在校准 socket 真实远端地址后再放行; 同时删除 L9 的 development 短路并补全 private-ip.js L31 对 IPv4-mapped IPv6 等未识别形式的 fail-closed 处理"}
+```

@@ -1,0 +1,81 @@
+LANG: python
+
+```code
+# === file: app/routes.py ===
+from flask import Flask, jsonify, request
+
+from app.services import BackupService
+
+app = Flask(__name__)
+service = BackupService(base_dir='/var/backups')
+
+
+@app.route('/api/backups', methods=['POST'])
+def create_backup():
+    body = request.get_json(force=True)
+    backup_id = body['id']
+    filename = body.get('filename') or f'{backup_id}.tar'
+    service.register(backup_id, filename)
+    return jsonify(status='created')
+
+
+@app.route('/api/backups/<backup_id>', methods=['DELETE'])
+def delete_backup(backup_id):
+    service.delete(backup_id)
+    return jsonify(status='deleted')
+
+# === file: app/services.py ===
+from app.storage import BackupStore
+
+
+class BackupService:
+    """Business layer: keeps backup metadata, delegates file operations."""
+
+    def __init__(self, base_dir: str) -> None:
+        self.store = BackupStore(base_dir)
+        self._meta: dict[str, str] = {}
+
+    def register(self, backup_id: str, filename: str) -> None:
+        # Pseudo-sanitization: strips literal '../' only once.
+        safe_name = filename.replace('../', '')
+        self._meta[backup_id] = safe_name
+
+    def delete(self, backup_id: str) -> None:
+        name = self._meta.get(backup_id, f'{backup_id}.tar')
+        path = self.store.build_path(name)
+        self.store.remove(path)
+
+# === file: app/storage.py ===
+from pathlib import Path
+
+
+class BackupStore:
+    """Storage layer: all filesystem access for backups."""
+
+    def __init__(self, base_dir: str) -> None:
+        self.base = Path(base_dir)
+
+    def build_path(self, name: str) -> Path:
+        """Naive join: keeps '..' segments and absolute overrides."""
+        return self.base / name
+
+    def remove(self, path: Path) -> None:
+        """Delete a backup file from disk."""
+        path.unlink(missing_ok=True)
+```
+
+**分析（针对整组文件）：**
+
+1. **输入点枚举与可达性**：外部输入点共三处——app/routes.py L11-L13（POST /api/backups 请求体 id、filename）与 L18-L20（DELETE /api/backups/\<backup_id\> 路径参数）。L1:line 14 与 L1:line 20 分别把污点传入 BackupService.register/delete，经 services.py 传递后均可达 app/storage.py L16 的 unlink，可达性成立。
+
+2. **主流逐跳验证**：routes.py L13 filename → services.py L13 `replace('../','')` 伪净化 → L14 存入 `_meta` → L17 取出 → L18 `build_path` → storage.py L12 `self.base / name`（pathlib 拼接原样保留 `..` 段；传入绝对路径时直接抛弃基础目录）→ L16 `path.unlink(missing_ok=True)` 任意文件删除。payload 示例：`....//....//etc/crontab` 经单遍替换后重组出 `../` 段；`/etc/crontab` 直接越界。
+
+3. **防御评估**：链上唯一过滤位于 services.py L13，属字符串替换/黑名单式单遍过滤，位置在中间层，覆盖面不含 `....//` 重组、绝对路径与编码变体，按规则视为无效防御；storage.py L12 与 L16 均无 `resolve()` + containment（is_relative_to）校验；routes.py 层无任何校验。两条流上均不存在完整防御。
+
+4. **第二入口/替代通道**：DELETE 路由（routes.py L18-L20）可独立触发删除；services.py L17 的回退拼接 `f'{backup_id}.tar'` 使未注册的 backup_id 也成为污点源，构成第二条流（受 `.tar` 后缀约束但仍可 `../` 跨目录删除任意 tar 文件）；两条通道汇入同一 sink，项目中不存在其他净化通道或间接防御调用。
+
+5. **结论**：source（routes.py）与 sink（storage.py）分离于不同文件，中间层净化形同虚设，CWE-22 任意文件删除成立，风险等级 High；最小修复锚定 storage.py L16。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal: 用户可控备份文件名/backup_id 导致任意文件删除", "risk_level": "High", "source": "L1:line 13: create_backup 中 request body 的 filename（次级源：L1:line 12 的 id 与 L1:line 19 的 DELETE 路径参数 backup_id）", "sink": "L3:line 16: BackupStore.remove 中 path.unlink(missing_ok=True)", "explanation": "输入点枚举与可达性：L1:line 12-13 POST 请求体 id 与 filename、L1:line 19 DELETE 路径参数 backup_id，经 L1:line 14 或 L1:line 20 进入 service，均可达 L3:line 16 的 unlink；主流验证：L1:line 13 filename → L2:line 13 replace('../','') 伪净化 → L2:line 14 存入 _meta → L2:line 17 取出 → L2:line 18 build_path → L3:line 12 pathlib 拼接保留 .. 段 → L3:line 16 unlink 任意文件删除，payload ....//....//etc/crontab 经单遍替换重组出 ../ 段，绝对路径 /etc/crontab 更会使拼接直接抛弃基础目录；防御评估：唯一过滤在 L2:line 13，属黑名单式字符串替换可绕过，不构成有效防御，L3:line 12 与 L3:line 16 均无 resolve 加 containment 校验，L1 层无校验；第二入口：L1:line 20 的 DELETE 可独立触发，L2:line 17 回退拼接 f'{backup_id}.tar' 使未注册 backup_id 也成为污点源（受 .tar 后缀限制但仍可跨目录），两通道汇入同一 sink，无其他净化通道；结论：两条 source→sink 流均无完整防御，CWE-22 任意文件删除成立", "fix_suggestion": "line 16: 在 remove 内先 resolved = path.resolve() 并校验 resolved.is_relative_to(self.base.resolve())，不满足即抛错拒绝删除，同时将 L2:line 13 的替换过滤改为文件名白名单校验"}
+```

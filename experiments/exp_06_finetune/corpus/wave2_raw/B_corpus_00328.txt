@@ -1,0 +1,92 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+from flask import Flask, request, render_template_string
+
+from app.markdown_directives import render_markdown
+
+app = Flask(__name__)
+
+
+@app.route("/render", methods=["POST"])
+def render():
+    # 外部输入点：用户提交的 Markdown 正文，可携带 !!! include 指令
+    content = request.form.get("content", "")
+    html = render_markdown(content)
+    return render_template_string("<div>{{ doc }}</div>", doc=html)
+
+
+@app.route("/preview", methods=["POST"])
+def preview():
+    # 第二入口：预览接口复用同一渲染管线
+    content = request.form.get("body", "")
+    return render_markdown(content)
+
+# === file: app/markdown_directives.py ===
+import re
+from typing import Any, Dict, Match
+
+from app.include_resolver import read_include
+
+INCLUDE_RE = re.compile(r"^!!!\s+include\s+(?P<title>.+?)\s*$", re.M)
+
+
+def parse_include(m: Match[str]) -> Dict[str, Any]:
+    relpath = m.group("title").strip()  # 污点进入指令层，strip 仅去空白
+    try:
+        content = read_include(relpath)  # 未做任何路径校验，原样透传
+    except FileNotFoundError:
+        return {"type": "block_error", "raw": "Could not find file: " + relpath}
+    return {"type": "include", "raw": content}
+
+
+def render_include(text: str) -> str:
+    return '<pre class="directive-include">\n' + text + "</pre>\n"
+
+
+def render_markdown(text: str) -> str:
+    parts = []
+    last = 0
+    for m in INCLUDE_RE.finditer(text):
+        parts.append(text[last:m.start()])
+        tok = parse_include(m)
+        if tok["type"] == "include":
+            parts.append(render_include(tok["raw"]))
+        else:
+            parts.append("<!-- " + tok["raw"] + " -->")
+        last = m.end()
+    parts.append(text[last:])
+    return "".join(parts)
+
+# === file: app/include_resolver.py ===
+import os
+
+
+def read_include(relpath: str, base_dir: str = "docs") -> str:
+    dest = os.path.join(base_dir, relpath)
+    dest = os.path.normpath(dest)  # 伪净化：归一化但不限制在 base_dir 内
+    if not os.path.isfile(dest):
+        raise FileNotFoundError(dest)
+    with open(dest, "rb") as f:  # sink：按攻击者可控路径读取文件
+        return f.read().decode("utf-8")
+```
+
+1. **外部输入点枚举与可达性**：app/routes.py L11（/render 的 `request.form.get('content')`）与 L19（/preview 的 `request.form.get('body')`）是全部两个外部输入点；L12/L20 均立即调用 render_markdown，攻击者在正文中写入 `!!! include ../../../etc/passwd` 即可让污点进入指令解析，两条输入到 sink 均可达。
+
+2. **中间传递与伪净化核查**：app/markdown_directives.py L10 从正则捕获组提取 relpath，仅 `.strip()` 去空白（非防御）；L12 原样透传给 read_include。app/include_resolver.py L5 `os.path.join` 拼接后，L6 `os.path.normpath` 只折叠 `..` 与多余分隔符，不校验结果是否仍位于 base_dir 之下，`docs/../../etc/passwd` 归一化为 `/etc/passwd`，属"看似净化实则不完整"；L7 `isfile` 只验证存在性、不限制读取边界，反而便于攻击者探测有效路径。
+
+3. **sink 确认**：app/include_resolver.py L9 `open(dest, 'rb')` 以拼接结果为路径读取文件，内容经 render_include 拼入响应回显给攻击者，可窃取配置、密钥、源码等任意可读文件；自 source 至 sink 全链无白名单、前缀校验或 realpath 边界检查。
+
+4. **第二入口与替代通道**：/preview（app/routes.py L16-L20）与 /render 共享同一 render_markdown→parse_include→read_include→open 调用链，构成确认的第二入口；read_include 的 base_dir 参数虽可配置，但当前两个调用方均使用默认值 'docs'，不存在任何调用点传入已净化的绝对路径，故所有通道均无有效防御，漏洞成立。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 路径遍历导致任意文件读取",
+  "risk_level": "High",
+  "source": "L1:line 11: request.form.get('content') 用户提交的 Markdown 正文（第二入口 L1:line 19 的 'body' 同理）",
+  "sink": "L3:line 9: open(dest, 'rb') 以攻击者可控路径打开并读取文件",
+  "explanation": "流1：L1:line 11 content → L1:line 12 render_markdown → L2:line 10 提取 relpath（仅 strip，非防御）→ L2:line 12 透传 read_include → L3:line 5 join → L3:line 6 normpath → L3:line 9 open 读取；流2：L1:line 19 body 经同一管线到达同一 sink；防御核查：L3:line 6 的 os.path.normpath 仅折叠 .. 不限制在 base_dir 内，docs/../../etc/passwd 归一化为 /etc/passwd，属看似净化实则不完整，L3:line 7 isfile 只验证存在性不限制边界，L2:line 10 的 strip 仅去空白，全链无白名单/前缀/realpath 校验；第二入口：/preview 路由与 /render 共享同一调用链同样可达 sink，read_include 的 base_dir 参数虽可配置但两个调用方均用默认值 docs，无任何通道存在完整防御",
+  "fix_suggestion": "line 6: normpath 后追加边界校验，如 if os.path.commonpath([os.path.realpath(dest), os.path.realpath(base_dir)]) != os.path.realpath(base_dir): raise ValueError('path escapes base_dir')"
+}
+```

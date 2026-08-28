@@ -1,0 +1,106 @@
+LANG: php
+```code
+# === file: src/Controller/CustomReportController.php ===
+<?php
+namespace App\Controller;
+
+use App\Report\ReportService;
+use Symfony\Component\HttpFoundation\Request;
+
+class CustomReportController
+{
+    // POST /admin/custom-report/data
+    public function dataAction(Request $request, ReportService $reports)
+    {
+        $sort    = (string) $request->get('sort', 'id');
+        $dir     = (string) $request->get('dir', 'ASC');
+        $offset  = $request->get('offset');
+        $limit   = $request->get('limit');
+        $filters = json_decode((string) $request->get('filter', '[]'), true) ?: [];
+        $config  = json_decode((string) $request->get('config', '{}'));
+
+        return $reports->getReportData($config, $filters, $sort, $dir, $offset, $limit);
+    }
+}
+# === file: src/Report/ReportService.php ===
+<?php
+namespace App\Report;
+
+use App\Tool\Adapter\SqlAdapter;
+
+class ReportService
+{
+    public function __construct(private SqlAdapter $adapter)
+    {
+    }
+
+    public function getReportData($config, array $filters, string $sort, string $dir, $offset, $limit): array
+    {
+        // hardening is incomplete: blacklist strip only, dir whitelisted
+        $offset = $this->stripDangerous($offset);
+        $limit  = $this->stripDangerous($limit);
+        $dir    = strtoupper($dir) === 'ASC' ? 'ASC' : 'DESC';
+
+        return $this->adapter->getData($config, $filters, $sort, $dir, $offset, $limit);
+    }
+
+    private function stripDangerous($value): string
+    {
+        return str_replace([';', '--', '/*'], '', (string) $value);
+    }
+}
+# === file: src/Tool/Adapter/SqlAdapter.php ===
+<?php
+namespace App\Tool\Adapter;
+
+use Pimcore\Db;
+
+class SqlAdapter
+{
+    public function getData($config, array $filters, string $sort, string $dir, $offset, $limit): array
+    {
+        $db = Db::get();
+        $base = $this->getBaseQuery($config, $filters);
+        $order = ' ORDER BY ' . $db->quoteIdentifier($sort) . ' ' . $dir;
+        $sql = $base['data'] . $order;
+        if ($offset !== null && $limit) {
+            $sql .= " LIMIT $offset,$limit";
+        }
+        return [
+            'data'  => $db->fetchAllAssociative($sql),
+            'total' => $db->fetchOne($base['count']),
+        ];
+    }
+
+    private function getBaseQuery($config, array $filters): array
+    {
+        $db = Db::get();
+        $cfg = (array) $config;
+        $sql = "\n" . ($cfg['sql'] ?? 'SELECT *');
+        if (!empty($cfg['where'])) {
+            $sql .= "\n WHERE (" . $cfg['where'] . ')';
+        }
+        $condition = ['1 = 1'];
+        foreach ($filters as $filter) {
+            $condition[] = $db->quoteIdentifier($filter['property']) . ' = ' . $db->quote($filter['value'] ?? null);
+        }
+        $where = implode(' AND ', $condition);
+        return [
+            'data'  => 'SELECT * FROM (' . $sql . ') AS somerandxyz WHERE ' . $where,
+            'count' => 'SELECT COUNT(*) FROM (' . $sql . ') AS somerandxyz WHERE ' . $where,
+        ];
+    }
+}
+```
+
+1. **输入点枚举与可达性**：文件1 `src/Controller/CustomReportController.php` L12-L17 共 6 个外部输入（sort/dir/offset/limit/filter/config），全部在 L19 汇入 `ReportService::getReportData`，经文件2 L19 透传至文件3 `SqlAdapter::getData`（L8）与 `getBaseQuery`（L23），最终到达 L18 `fetchAllAssociative` 与 L19 `fetchOne` 两个执行点，可达性成立。
+
+2. **逐流防御验证**：流1 offset（文件1 L14）与流2 limit（L15）在文件2 L15-L16 仅经 `stripDangerous`（L24）做 `str_replace` 黑名单删除 `;` `--` `/*`，属可绕过过滤——注入 `0,1 union select ...` 或嵌套子查询无需这些字符，随后在文件3 L15 内插 `LIMIT $offset,$limit`，L18 执行，无有效防御；流3 config（文件1 L17）在中间层零过滤原样透传，文件3 L27 `cfg['sql']` 与 L29 `cfg['where']` 直接拼接进子查询，经 L37/L38 包裹后于 L18/L19 执行，可注入任意 SQL；流4 filter 数组在文件3 L33 值经 `db->quote`、列名经 `quoteIdentifier`，防御有效；流5 sort 在文件3 L12 经 `quoteIdentifier`，防御有效；流6 dir 在文件2 L17 白名单化为 ASC/DESC，防御有效。
+
+3. **第二入口/替代通道**：同一路由下 `config` 参数构成独立于 offset/limit 的第二注入通道，且完全绕过中间层黑名单（服务层根本不处理 config）；此外 `SqlAdapter::getData` 为 public 方法，可被项目内其他控制器或服务直接调用形成间接调用通道，两条替代通道均汇入同一 sink，支撑漏洞成立结论。
+
+4. **结论**：主链 offset/limit 与辅链 config 在调用链上均无完整防御（黑名单可绕过 + 零过滤透传），CWE-89 SQL 注入成立，风险级别 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89: SQL注入（跨文件：Controller source → Service 黑名单弱过滤/透传 → Adapter 拼接 sink）", "risk_level": "Critical", "source": "L1:line 14: CustomReportController::dataAction 中 $request->get('offset')（同源还有 L15 limit 与 L17 config）", "sink": "L3:line 18: SqlAdapter::getData 中 $db->fetchAllAssociative($sql)（辅 sink 为 L19 fetchOne）", "explanation": "输入点共6处均在文件1 L12-L17（sort/dir/offset/limit/filter/config），经 L19 进入文件2；流1 offset 与流2 limit：文件2 L15-L16 仅经 L24 str_replace 黑名单删除分号与注释符，属可绕过过滤（union select 或子查询注入无需这些字符），到文件3 L15 拼入 LIMIT 子句，L18 fetchAllAssociative 执行，注入成立；流3 config：文件2 L19 原样透传零过滤，文件3 L27 cfg[sql] 与 L29 cfg[where] 直接拼接，经 L37/L38 包裹后于 L18/L19 执行，可注入任意 SQL，构成同一路由下绕过中间层的第二注入通道；流4 filter 在文件3 L33 经 db->quote 与 quoteIdentifier，防御有效；流5 sort 在文件3 L12 经 quoteIdentifier，防御有效；流6 dir 在文件2 L17 白名单化，防御有效；另 SqlAdapter::getData 为 public，存在被其他服务直接调用的替代通道；综上调用链无完整防御，CWE-89 成立", "fix_suggestion": "line 15: 文件3 中改为 $db->fetchAllAssociative($sql . ' LIMIT ?, ?') 并在文件2 对 offset/limit 先做 intval 强制转换再传入，同时对 config 的 sql/where 字段实施白名单校验或参数化构建"}
+```

@@ -1,0 +1,109 @@
+LANG: php
+```code
+# === file: src/Controller/Admin/DataObjectController.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Controller\Admin;
+
+use App\Service\CompositeIndexService;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\JsonResponse;
+
+class DataObjectController
+{
+    public function __construct(private CompositeIndexService $indexService) {}
+
+    public function updateIndicesAction(Request $request): JsonResponse
+    {
+        $table = (string) $request->request->get('table', '');
+        $type = (string) $request->request->get('index_type', 'query');
+        $indices = $request->request->all('composite_indices');
+
+        // 看似净化：黑名单删除 drop/delete/分号，双写或反引号即可绕过
+        foreach (['drop', 'delete', ';'] as $bad) {
+            $table = str_ireplace($bad, '', $table);
+        }
+
+        $this->indexService->applyCompositeIndices($table, $type, $indices);
+
+        return new JsonResponse(['status' => 'ok']);
+    }
+}
+# === file: src/Service/CompositeIndexService.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Service;
+
+use App\Model\CompositeIndexRepository;
+
+class CompositeIndexService
+{
+    public function __construct(private CompositeIndexRepository $repository) {}
+
+    public function applyCompositeIndices(string $table, string $type, array $compositeIndices): void
+    {
+        // 唯一严格校验只针对 index_type，三个污点变量均未处理
+        if (!in_array($type, ['query', 'localized_query'], true)) {
+            throw new \InvalidArgumentException('unsupported index type');
+        }
+
+        $normalized = [];
+        foreach ($compositeIndices as $item) {
+            $normalized[] = [
+                'index_key' => 'c_' . ($item['index_key'] ?? ''),
+                'index_columns' => $item['index_columns'] ?? '',
+            ];
+        }
+
+        $this->repository->updateCompositeIndices($table, $normalized);
+    }
+}
+# === file: src/Model/CompositeIndexRepository.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Model;
+
+use Doctrine\DBAL\Connection;
+
+class CompositeIndexRepository
+{
+    public function __construct(private Connection $db) {}
+
+    public function updateCompositeIndices(string $table, array $compositeIndices): void
+    {
+        $existing = $this->db->fetchAllAssociative(
+            'SHOW INDEXES FROM ' . $this->db->quoteIdentifier($table) . " WHERE Key_Name LIKE 'c\\_%'"
+        );
+        $existingMap = [];
+        foreach ($existing as $row) {
+            $existingMap[$row['Key_name']] = $row['Column_name'];
+        }
+        foreach ($compositeIndices as $index) {
+            $key = $index['index_key'];
+            $columns = $index['index_columns'];
+            if (isset($existingMap[$key]) && $existingMap[$key] === $columns) {
+                continue;
+            }
+            // sink：表名/索引名/列清单直接拼接，quoteIdentifier 未在此复用
+            $this->db->executeQuery('ALTER TABLE `' . $table . '` ADD INDEX `' . $key . '` (' . $columns . ');');
+        }
+    }
+}
+```
+
+1. **外部输入点枚举与可达性**：唯一 HTTP 入口为 L1:14 `updateIndicesAction`，输入点为 L1:16 `table`、L1:17 `index_type`、L1:18 `composite_indices` 数组（内含 index_key/index_columns/index_type）。调用链 L1:25 → L2:12 → L2:27 → L3:12 → L3:28，三个污点变量全部可达 sink。
+
+2. **流1（table）防御验证**：L1:21-23 用 `str_ireplace` 黑名单仅删除 drop/delete/分号，属字符串替换过滤——双写（如 `drodropp` 拼回 `dropp`）、反引号、括号、注释符均不受影响，可绕过；污点经 L1:25、L2:27 原样透传，在 L3:28 拼入反引号内，注入反引号即可闭合逃逸。
+
+3. **流2/流3（index_key、index_columns）防御验证**：L2:22 对 index_key 仅加 `c_` 前缀，未转义反引号，L3:22 取出后在 L3:28 处于反引号内可闭合注入；L2:23 对 index_columns 完全透传，L3:23 取出后在 L3:28 处于无引号括号位置，可直接拼接任意 SQL 片段并注释语句尾部。
+
+4. **防御位置与覆盖面**：L2:15-17 的白名单是全链唯一严格校验，但只覆盖从不进入 SQL 语句的 `index_type`；L3:15 的 `quoteIdentifier` 仅用于 SHOW INDEXES 查询，未复用于 L3:28 的 sink；全链无参数化查询、无标识符字符白名单，防御不完整。
+
+5. **第二入口与结论**：本文件组内仅 L1:14 一个路由可达 sink，不存在其他路由或间接调用通道；但同一请求内 table/index_key/index_columns 构成三条并行污点通道，且 L3:12 方法为 public 可被其他调用方复用扩大暴露面。调用链上无任何完整防御，CWE-89 成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL注入（ALTER TABLE 标识符与列清单拼接）", "risk_level": "High", "source": "L1:line 16: POST 参数 table（及 line 18 的 composite_indices 数组内 index_key 与 index_columns）", "sink": "L3:line 28: executeQuery 拼接的 ALTER TABLE 语句", "explanation": "流1: L1:16 的 table 经 L1:21-23 黑名单 str_ireplace 仅删除 drop/delete/分号, 双写或反引号即可绕过, 经 L1:25 与 L2:27 透传至 L3:28 拼入反引号内可闭合逃逸; 流2: L1:18 数组内 index_key 在 L2:22 仅加 c_ 前缀未转义反引号, L3:22 取出后在 L3:28 闭合反引号注入; 流3: 同数组 index_columns 经 L2:23 完全透传, L3:23 取出后在 L3:28 无引号位置直接拼接任意 SQL; 防御核查: L2:15-17 白名单仅覆盖从不进入 SQL 的 index_type, L3:15 的 quoteIdentifier 只用于 SHOW INDEXES 未复用于 sink, 全链无参数化; 第二入口: 组内仅 L1:14 一个 HTTP 路由可达 sink, 无替代通道, 但同一请求构成三条并行污点通道且 L3:12 为 public 可被其他调用方复用; 结论: 调用链无完整防御, 漏洞成立", "fix_suggestion": "line 28: 对 table 与 key 一律使用 $this->db->quoteIdentifier 包裹, columns 拆分后逐列 quoteIdentifier 再以逗号拼接, 并辅以仅允许 [A-Za-z0-9_] 的标识符白名单校验"}
+```

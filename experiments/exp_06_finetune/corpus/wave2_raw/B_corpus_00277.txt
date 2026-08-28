@@ -1,0 +1,109 @@
+LANG: go
+
+```code
+# === file: weed/remote_storage/config.go ===
+package remote_storage
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
+)
+
+// ParseRemoteConf decodes a user-submitted remote-storage configuration
+// arriving via the filer remote.configure admin API.
+func ParseRemoteConf(raw []byte) (*remote_pb.RemoteConf, error) {
+	conf := &remote_pb.RemoteConf{}
+	if err := json.Unmarshal(raw, conf); err != nil {
+		return nil, err
+	}
+	// naive guard: only rejects the literal substring "localhost";
+	// 127.0.0.1 / 169.254.169.254 / internal DNS names all pass
+	if strings.Contains(conf.S3Endpoint, "localhost") {
+		return nil, fmt.Errorf("endpoint not allowed")
+	}
+	return conf, nil
+}
+
+# === file: weed/remote_storage/s3_client.go ===
+package remote_storage
+
+import (
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3iface"
+	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
+)
+
+var activeClients = map[string]*s3RemoteStorageClient{}
+
+type s3RemoteStorageClient struct {
+	conf *remote_pb.RemoteConf
+	conn s3iface.S3API
+}
+
+// Mount builds the client; the HTTP endpoint is taken verbatim from the
+// user-controlled config with no host/IP validation.
+func Mount(name string, conf *remote_pb.RemoteConf) error {
+	config := &aws.Config{
+		Region:           aws.String(conf.S3Region),
+		Endpoint:         aws.String(conf.S3Endpoint), // tainted value flows in
+		S3ForcePathStyle: aws.Bool(conf.S3ForcePathStyle),
+	}
+	sess, err := session.NewSession(config)
+	if err != nil {
+		return err
+	}
+	activeClients[name] = &s3RemoteStorageClient{conf: conf, conn: s3.New(sess)}
+	return nil
+}
+
+# === file: weed/remote_storage/s3_ops.go ===
+package remote_storage
+
+import (
+	"fmt"
+	"net/http"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
+)
+
+// StatFile issues HeadObject: an HTTP request to the user-chosen endpoint (SSRF sink).
+func (s *s3RemoteStorageClient) StatFile(loc *remote_pb.RemoteStorageLocation) (*filer_pb.RemoteEntry, error) {
+	resp, err := s.conn.HeadObject(&s3.HeadObjectInput{
+		Bucket: aws.String(loc.Bucket),
+		Key:    aws.String(loc.Path[1:]),
+	})
+	if err != nil {
+		if reqErr, ok := err.(awserr.RequestFailure); ok && reqErr.StatusCode() == http.StatusNotFound {
+			return nil, ErrRemoteObjectNotFound
+		}
+		return nil, fmt.Errorf("stat s3 %s%s: %w", loc.Bucket, loc.Path, err)
+	}
+	return &filer_pb.RemoteEntry{StorageName: s.conf.Name, RemoteSize: aws.Int64Value(resp.ContentLength)}, nil
+}
+
+// Lookup is the trigger invoked by filer metadata reads.
+func Lookup(name string, loc *remote_pb.RemoteStorageLocation) (*filer_pb.RemoteEntry, error) {
+	return activeClients[name].StatFile(loc)
+}
+```
+
+1. 外部输入点枚举与可达性：①config.go:13 `ParseRemoteConf(raw []byte)` 接收用户通过 remote.configure 管理 API 提交的 JSON，污点字段为 `conf.S3Endpoint`（config.go:14/20）；②s3_ops.go:15 `StatFile(loc)` 的 `loc.Bucket/loc.Path`（s3_ops.go:17-18）也是外部 RPC 输入，但只控制请求的 bucket/key 路径部分，不改变目标主机。可达链完整：config.go:13 → s3_client.go:20 `Mount` → s3_client.go:23 `aws.Config.Endpoint` → s3_client.go:30 `s3.New` → s3_ops.go:30 `Lookup` → s3_ops.go:16 `HeadObject`，source 与 sink 分处不同文件且中间无阻断。
+
+2. 数据流防御逐一验证：唯一防御位于 config.go:20 的 `strings.Contains(conf.S3Endpoint, 'localhost')`，属黑名单子串过滤，按规则视为可绕过——`127.0.0.1`、`169.254.169.254`（云元数据）、`10.x` 内网 IP、IPv6 `[::1]`、十进制 IP `2130706433`、内网 DNS 名称全部放行；s3_client.go:20-32 为纯传递文件，把污点 Endpoint 原样写入 `aws.Config.Endpoint`，无任何校验；sink 所在 s3_ops.go:16 处也没有主机 allowlist 或解析后私网 IP 检查。防御位置在链路最上游且覆盖面不足，整条链无有效防御。
+
+3. 第二入口与替代通道：存在——同一污点 Endpoint 被该 client 的 ReadFile/WriteFile/ListObjects/DeleteFile 等全部方法复用（对应原始实现的下载/上传/列举/删除操作），任一远程元数据操作都会向攻击者主机发起请求；且 conf 挂载后持久保存在 activeClients 中，后续每次操作重复命中，构成持久性 SSRF；`loc.Path` 还可进一步控制请求路径（如指向元数据 API 的具体路径）。因此即使强化 localhost 检查，替代通道依然存在，漏洞结论稳固。
+
+4. 结论：CWE-918 SSRF 成立。攻击者提交恶意 endpoint 完成挂载后，服务端会对任意指定主机（含内网与 169.254.169.254 云元数据）发起 HTTP 请求，可探测内网、窃取临时凭证，评 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918", "risk_level": "High", "source": "L1:line 13: ParseRemoteConf(raw []byte) 用户提交的远端存储配置 JSON，污点字段 conf.S3Endpoint", "sink": "L3:line 16: s.conn.HeadObject 以污点 Endpoint 为目标主机发起 HTTP 请求（SSRF sink）", "explanation": "流1: L1 config.go:13 的 conf.S3Endpoint 在 L1:20 仅经 contains('localhost') 黑名单子串检查（可被 127.0.0.1/169.254.169.254/[::1]/2130706433/内网 DNS 绕过，属无效防御）→ L2 s3_client.go:20 Mount 将其原样写入 aws.Config.Endpoint(L2:23) 并 s3.New(L2:30)，纯传递无校验 → L3 s3_ops.go:16 HeadObject 以该 Endpoint 发起 HTTP 请求，SSRF 成立; 流2: L3:30 Lookup→StatFile 为触发入口，loc.Bucket/loc.Path(L3:17-18) 亦为外部输入，可控制请求路径但目标主机由污点 Endpoint 决定; 第二入口: 同一污点 Endpoint 被 client 的 ReadFile/WriteFile/List/Delete 等全部方法复用，conf 持久化于 activeClients 后每次远程操作重复命中，属持久性 SSRF，仅修补 localhost 检查无法覆盖 IP 字面量与 DNS 重绑定; 成因: 唯一防御位于链路最上游且为可绕过黑名单，中游传递文件与 sink 均无主机 allowlist 或私网 IP 解析校验", "fix_suggestion": "line 20: 删除 localhost 黑名单，改为对 S3Endpoint 强制域名 allowlist，并在 Mount 前解析主机 IP 拒绝环回/私网/链路本地段，校验失败则拒绝挂载"}
+```

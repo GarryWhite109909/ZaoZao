@@ -1,0 +1,87 @@
+LANG: php
+```code
+# === file: core/Request.php ===
+<?php
+// core/Request.php —— HTTP 输入封装层（source 所在文件）
+namespace Wiki\Core;
+
+class Request
+{
+    private array $get;
+
+    public function __construct()
+    {
+        $this->get = $_GET; // 全量接收外部 GET 输入，无任何过滤
+    }
+
+    public function param(string $name, ?string $default = null): ?string
+    {
+        return isset($this->get[$name]) ? (string)$this->get[$name] : $default;
+    }
+}
+# === file: controllers/RecentChangesController.php ===
+<?php
+// controllers/RecentChangesController.php —— 中间层：白名单看似存在，回退分支却放行原始输入
+namespace Wiki\Controllers;
+
+use Wiki\Core\Request;
+use Wiki\Db\PageRepository;
+
+class RecentChangesController
+{
+    public function __construct(private Request $request, private PageRepository $repo) {}
+
+    private function resolveDateMin(): string
+    {
+        $period = $this->request->param('period'); // 污点进入业务层
+        if (is_string($period) && in_array($period, ['day', 'week', 'month'], true)) {
+            $map = ['day' => '-1 day', 'week' => '-1 week', 'month' => '-1 month'];
+            return date('Y-m-d H:i:s', strtotime($map[$period])); // 命中白名单：返回安全常量
+        }
+        return $period ?? date('Y-m-d H:i:s', strtotime('-1 month')); // 回退分支：原始输入原样返回
+    }
+
+    public function show(): void
+    {
+        $max = (int)($this->request->param('max') ?? 500); // 第二输入点 max：(int) 强转，有效防御
+        $dateMin = $this->resolveDateMin();                // 污点继续下传
+        $rows = $this->repo->loadRecentlyChanged($max, $dateMin); // 污点实参流向 sink
+        foreach ($rows as $page) {
+            echo '<small>', htmlspecialchars($page['time']), '</small><br>', "\n";
+        }
+    }
+}
+# === file: db/PageRepository.php ===
+<?php
+// db/PageRepository.php —— sink 所在文件：SQL 字符串拼接
+namespace Wiki\Db;
+
+use PDO;
+
+class PageRepository
+{
+    public function __construct(private PDO $pdo) {}
+
+    public function loadRecentlyChanged(int $max, string $dateMin): array
+    {
+        $sql = 'SELECT id, tag, time, user FROM pages'
+             . " WHERE time >= '" . $dateMin . "'" // sink：$dateMin 未参数化直接拼入
+             . ' ORDER BY time DESC LIMIT ' . $max;
+        return $this->pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
+    }
+}
+```
+
+1. **输入点枚举与可达性**：唯一外部入口是 HTTP GET。core/Request.php L11 全量复制 `$_GET`，L16 `param()` 原样返回。业务层取用两处：controllers/RecentChangesController.php L14（period）与 L24（max）。period 经 L25→L26 作为实参传入 `PageRepository::loadRecentlyChanged`，到达 db/PageRepository.php L14 拼接点并在 L16 执行——source 到 sink 可达成立。
+
+2. **流A（漏洞流）防御核验**：RecentChangesController.php L15 的 `in_array` 白名单只覆盖 if 分支（命中时 L17 返回 `date()` 生成的安全常量）；未命中时控制流落到 L19，`$period` 未经编码、参数化或类型转换原样返回。该防御属于条件式净化，位置在中间层且覆盖面不含回退路径，等价于无防御；下游 PageRepository.php L14 直接字符串拼接、L16 `pdo->query` 执行，全链无预处理语句，CWE-89 成立。
+
+3. **流B（已阻断流）防御核验**：`$_GET['max']` 在 RecentChangesController.php L24 经 `(int)` 强转，且 sink 形参声明为 `int $max`（PageRepository.php L11），污点在进入拼接前被类型转换清除，属有效防御；对比之下 period 无任何等价转换。
+
+4. **第二入口/替代通道**：`Request::param` 是通用取值器，任何复用 Request + PageRepository 的其他控制器动作（如按 tag 检索、RSS 输出）都构成同型替代通道；攻击者仅需查询串 `?period=' union select ...--` 即直达同一 sink。另注：RecentChangesController.php L28 的 `htmlspecialchars` 只作用于输出端 XSS，对 SQL 注入无防御意义；period 传数组（`period[]=x`）只会触发 L12 返回类型 TypeError（DoS），说明输入同样未收敛。
+
+5. **结论**：主链 source（core/Request.php L16）→ sink（db/PageRepository.php L14/L16）之间仅存在覆盖不全的白名单，调用链上无完整防御，判定存在 CWE-89 SQL 注入；最小修复应在 sink 处参数化，并在中间层回退分支返回固定默认值。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL注入", "risk_level": "High", "source": "L1:line 16: core/Request.php Request::param() 原样返回的 $_GET 输入（period 参数）", "sink": "L3:line 14: db/PageRepository.php loadRecentlyChanged() 中 $dateMin 拼入 SQL 并于 line 16 经 pdo->query 执行", "explanation": "流A（漏洞主链）：$_GET['period'] 经 core/Request.php L16 param() 原样返回，至 controllers/RecentChangesController.php L14 赋给 $period；L15 in_array 白名单仅覆盖 if 分支（命中时 L17 返回 date() 生成的安全常量），未命中落入 L19 回退分支，原始输入未经任何编码或转换直接返回；L26 将其作为 $dateMin 实参传入 PageRepository::loadRecentlyChanged，db/PageRepository.php L14 直接字符串拼接进 SQL 并在 L16 执行，全链无预处理语句，该白名单属条件式净化且覆盖面不含回退路径，视为无效防御；流B（已阻断）：$_GET['max'] 在 controller L24 经 (int) 强转且 sink 形参为 int 类型（PageRepository L11），类型转换构成有效防御；第二入口：Request::param 为通用取值器，任何复用该封装与 PageRepository 的其他控制器动作均构成替代通道，查询串 ?period=' union select ...-- 可直达同一 sink；controller L28 的 htmlspecialchars 仅防输出端 XSS，与 SQL 注入无关；综上调用链无完整防御，CWE-89 成立", "fix_suggestion": "line 14: 最小修复：改为 PDO 预处理语句（WHERE time >= :date_min 并 execute 绑定 $dateMin），同时在 RecentChangesController L19 回退分支返回固定默认日期而非原始 $period"}
+```

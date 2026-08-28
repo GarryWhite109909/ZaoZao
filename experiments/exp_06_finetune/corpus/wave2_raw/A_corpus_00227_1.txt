@@ -1,0 +1,75 @@
+LANG: node.js
+
+```code
+const express = require('express');
+const axios = require('axios');
+const crypto = require('crypto');
+const OAuth = require('oauth-1.0a');
+const settingsStore = require('./settings-store'); // DB-backed config KV
+
+const app = express();
+const feedCache = new Map();
+const CACHE_TTL_MS = 90 * 60 * 1000;
+
+async function performApiRequest(url = 'https://api.twitter.com/1.1/search/tweets.json', getField = '') {
+  let accessToken = await settingsStore.get('twitter_access_token');
+  let accessTokenSecret = await settingsStore.get('twitter_access_token_secret');
+  let consumerKey = await settingsStore.get('twitter_consumer_key');
+  let consumerSecret = await settingsStore.get('twitter_consumer_secret');
+
+  if (!accessToken) accessToken = '220111598-87eLa7MgXZmd7YeRSkenTSVxhZikok61PXMKZFti';
+  if (!accessTokenSecret) accessTokenSecret = 'KsDrxrxoGqVVK0ethvcTTrV58RBH3WUjnPeI616fnxIFS';
+  if (!consumerKey) consumerKey = 'WgDmyOjMgX1N7RhcLpQqzUrtR';
+  if (!consumerSecret) consumerSecret = '0e8PlzIeKlmGGyH1ajS2Ggaw0anPTX23p3gp2WqZ0PCNxkYYX1';
+
+  const cacheId = crypto.createHash('md5').update(url + getField).digest('hex');
+  const hit = feedCache.get(cacheId);
+  if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.data;
+
+  const oauth = OAuth({
+    consumer: { key: consumerKey, secret: consumerSecret },
+    signature_method: 'HMAC-SHA1',
+    hash_function: (base, key) => crypto.createHmac('sha1', key).update(base).digest('base64')
+  });
+  const reqData = { url: url + getField, method: 'GET' };
+  const res = await axios.get(reqData.url, {
+    headers: oauth.toHeader(oauth.authorize(reqData, { key: accessToken, secret: accessTokenSecret }))
+  });
+
+  if (res.data && Object.keys(res.data).length > 0) {
+    feedCache.set(cacheId, { data: res.data, ts: Date.now() });
+  }
+  return res.data;
+}
+
+app.get('/api/twitter/search', async (req, res) => {
+  const count = parseInt(req.query.count, 10) || 5;
+  const q = encodeURIComponent(req.query.q || '');
+  const items = await performApiRequest('https://api.twitter.com/1.1/search/tweets.json',
+    `?count=${count}&q=${q}`);
+  res.json((items && items.statuses) || []);
+});
+
+app.get('/api/twitter/user/:handle', async (req, res) => {
+  const items = await performApiRequest('https://api.twitter.com/1.1/statuses/user_timeline.json',
+    `?include_entities=true&exclude_replies=true&count=5&screen_name=${req.params.handle}`);
+  if (items && items.errors) return res.status(502).json({ error: 'upstream error' });
+  res.json(items || []);
+});
+
+app.listen(3000, () => console.log('twitter feed listening on :3000'));
+```
+
+1. **外部输入点枚举与可达性**：第 43-44 行的 `req.query.count` / `req.query.q` 与第 52 行的 `req.params.handle` 是全部外部输入入口；两条 GET 路由（第 42、50 行）均未挂载任何鉴权中间件，直接 `await performApiRequest(...)`（第 45、51 行），外部请求到凭据使用点的可达性成立。
+
+2. **Source 确认**：第 17-20 行——当 `settingsStore`（数据库配置）返回空值时，无条件回退到硬编码的 access token、token secret、consumer key、consumer secret 字符串字面量；没有环境变量、密钥管理服务或部署期注入作为替代来源，任何接触源码或安装该包的人即持有有效凭据，与原 PHP 中 `get_option(...) == false` 时赋值字面量的语义完全等价。
+
+3. **Sink 确认**：第 26-34 行——回退凭据被装入 `oauth-1.0a` 客户端，经 `oauth.authorize` / `toHeader` 生成 HMAC-SHA1 签名头后随 `axios.get` 发往 api.twitter.com；第 22-24 行的 Map 缓存仅在命中时短路，每个新查询组合的首次请求必然走到签名逻辑，凭据使用必然发生。
+
+4. **防御验证**：第 43 行 `parseInt` 与第 44 行 `encodeURIComponent` 只清洗查询参数，与凭据来源无任何关系；第 12-15 行的 store 读取后没有『禁止回退』的校验或告警；第 53 行仅处理上游错误响应；整个链路不存在黑名单、正则或过滤层能够阻断回退逻辑本身——回退即漏洞。
+
+5. **第二入口与结论**：`/api/twitter/user/:handle`（第 50 行）是独立于 search 的替代通道，汇入同一 sink；且 `performApiRequest` 的默认参数 `url`（第 11 行）意味着未来任何新路由无参调用同样触发该路径。CWE-798 成立，风险 High：凭据随源码分发，可被用于劫持关联 Twitter 账号并消耗 API 配额。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-798 Use of Hard-coded Credentials", "risk_level": "High", "source": "line 17-20: settingsStore 取值为空时无条件回退使用的硬编码 Twitter OAuth access token、token secret、consumer key、consumer secret 字符串字面量", "sink": "line 26-34: oauth-1.0a 客户端用回退凭据做 HMAC-SHA1 签名并经 axios.get 发送出站认证请求", "explanation": "流1: 第43-44行 req.query.count/q 与第52行 req.params.handle 经两条无鉴权 GET 路由(第42/50行)进入 performApiRequest(第45/51行)，可达性成立; 流2: 第17-20行在 settingsStore 取值为空时无条件回退到硬编码 OAuth 凭据字面量，无环境变量或密钥库兜底; sink: 第26-34行凭据装入 oauth-1.0a 客户端签名后随 axios.get 发往 api.twitter.com，第22-24行缓存未命中时每次请求必触发凭据使用; 防御缺失: 第43行 parseInt 与第44行 encodeURIComponent 仅清洗查询参数与凭据来源无关，store 读取后无禁止回退的校验，无任何过滤层可阻断回退逻辑; 第二入口: /api/twitter/user/:handle(第50行)与第11行默认参数 url 均汇入同一 sink，故 CWE-798 成立", "fix_suggestion": "line 17-20: 删除硬编码回退字面量，settingsStore 缺失时快速失败返回 503，凭据改为从环境变量或密钥管理服务注入"}
+```

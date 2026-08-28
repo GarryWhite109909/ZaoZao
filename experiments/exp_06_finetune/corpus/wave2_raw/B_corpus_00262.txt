@@ -1,0 +1,106 @@
+LANG: go
+```code
+# === file: web/routes.go ===
+package web
+
+import (
+	"net/http"
+
+	"example.com/app/internal/repo"
+)
+
+// GET /api/users?name=xxx&sort=xxx
+func ListUsers(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name") // SOURCE-1: HTTP 查询参数, 攻击者完全可控
+	sort := r.URL.Query().Get("sort") // SOURCE-2: 第二外部输入点
+	users, err := repo.FindUsers(r.Context(), name, sort)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write([]byte(users))
+}
+
+func init() {
+	http.HandleFunc("/api/users", ListUsers)
+}
+
+# === file: internal/sanitize/sanitize.go ===
+package sanitize
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// SanitizeSQL 将模板中的 $n 占位符替换为字面量, 声称已完成净化。
+// 实际 QuoteString 仅双写单引号(黑名单式字符串替换),
+// 未处理反斜杠与 E'' 转义串语法, 净化并不完整。
+func SanitizeSQL(sql string, args ...any) (string, error) {
+	for i := 1; i <= len(args); i++ {
+		var lit string
+		switch a := args[i-1].(type) {
+		case string:
+			lit = QuoteString(a) // 看似净化, 实则可绕过
+		case int:
+			lit = strconv.Itoa(a)
+		default:
+			return "", fmt.Errorf("invalid arg type: %T", a)
+		}
+		sql = strings.Replace(sql, "$"+strconv.Itoa(i), lit, 1)
+	}
+	return sql, nil
+}
+
+func QuoteString(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+# === file: internal/repo/repo.go ===
+package repo
+
+import (
+	"context"
+
+	"example.com/app/internal/sanitize"
+
+	"github.com/jackc/pgx/v5"
+)
+
+var conn *pgx.Conn // 由 main 包初始化
+
+// FindUsers: name 走不完整的 sanitize; sort 未做任何处理直接拼接。
+func FindUsers(ctx context.Context, name, sort string) (string, error) {
+	tpl := "SELECT name FROM users WHERE name = $1 ORDER BY " + sort + " LIMIT 20"
+	q, err := sanitize.SanitizeSQL(tpl, name)
+	if err != nil {
+		return "", err
+	}
+	rows, err := conn.Query(ctx, q) // SINK: SQL 执行
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var out string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return "", err
+		}
+		out += n + "\n"
+	}
+	return out, rows.Err()
+}
+```
+
+分析（针对整组文件）：
+
+1. 外部输入点枚举与可达性：web/routes.go L11 `r.URL.Query().Get('name')` 与 L12 `r.URL.Query().Get('sort')` 是仅有的两个外部输入点，均在 L13 经 `repo.FindUsers` 传入 internal/repo/repo.go，最终汇于 repo.go L20 `conn.Query(ctx, q)` 这一 SQL 执行 sink，两条链路均可达。
+2. 数据流1（name 主链）防御验证：repo.go L16 调用 sanitize.SanitizeSQL，sanitize.go L17 进入 L29 `QuoteString`，其唯一防御是 `strings.ReplaceAll(s, "'", "''")`——属黑名单式字符串替换过滤，按规则视为可绕过；且未处理反斜杠与 `E''` 转义串语法，在 `standard_conforming_strings=off` 或转义串场景下攻击者可用反斜杠逃逸引号注入任意 SQL，净化位置在中间文件、覆盖面仅限单引号一个字符，不构成有效防御。
+3. 数据流2（sort）防御验证：repo.go L15 将 sort 直接字符串拼接进 `ORDER BY` 子句，全链无任何过滤、白名单或参数化，属于零防御直达 sink。
+4. 第二入口与替代通道核查：除 /api/users 路由的 name、sort 两个参数外无其他路由或输入通道；`repo.FindUsers` 仅被 `ListUsers` 唯一调用，`conn.Query` 仅在 repo.go L20 出现；即存在同一路由上的第二输入点（sort），且两条 source→sink 数据流均无完整防御，支撑 CWE-89 注入成立的结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89: SQL 注入（不完整的净化与字符串拼接）", "risk_level": "Critical", "source": "L1:line 11: r.URL.Query().Get('name') 外部 HTTP 查询参数", "sink": "L3:line 20: conn.Query(ctx, q) 执行拼接后的 SQL", "explanation": "数据流1: routes.go L11 读取 name 为可控 source, 经 L13 进入 repo.go L16 sanitize.SanitizeSQL, 在 sanitize.go L29 QuoteString 仅用 strings.ReplaceAll 双写单引号做黑名单式字符串替换, 未处理反斜杠与 E'' 转义语法, 在 standard_conforming_strings=off 或转义串场景可反斜杠逃逸注入任意 SQL, 该净化不完整不算有效防御, 最终达 repo.go L20 conn.Query 执行; 数据流2: routes.go L12 的 sort 为第二入口, 在 repo.go L15 直接拼接进 ORDER BY 子句, 全链零净化直达 L20 sink; 防御核查: 全链仅 QuoteString 一处过滤且属可绕过的字符串替换类, 无参数化绑定、无标识符白名单; 第二入口核查: 除 /api/users 的 name 与 sort 外无其他路由或间接调用, repo.FindUsers 仅被 ListUsers 调用, 两条数据流均可达 sink, CWE-89 成立", "fix_suggestion": "line 20: 放弃自实现转义与拼接, 改用 pgx 参数化查询 conn.Query(ctx, 'SELECT name FROM users WHERE name = $1 ORDER BY ' + col, name), 其中 sort 先经列名白名单映射为 col 后方可拼入"}
+```

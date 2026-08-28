@@ -1,0 +1,107 @@
+LANG: php
+```code
+# === file: src/Core/Service/PageTagResolver.php ===
+<?php
+namespace YesWiki\Core\Service;
+
+// Resolves the wiki page tag for the current request.
+// Legacy URLs like /?wiki=MaPage must keep working, so the raw
+// request value is returned as-is.
+class PageTagResolver
+{
+    public function __construct(private $wiki) {}
+
+    public function resolveTag()
+    {
+        if (!empty($_REQUEST['wiki'])) {
+            return $_REQUEST['wiki'];
+        }
+        if (!empty($_GET['page'])) {
+            return $_GET['page'];
+        }
+        return $this->wiki->config['default_page'] ?? 'HomePage';
+    }
+}
+
+# === file: handlers/page/deletepage.php ===
+<?php
+// Handler for /MaPage/deletepage — confirm and delete a wiki page.
+use YesWiki\Core\Service\PageTagResolver;
+use YesWiki\Core\Repository\BacklinkRepository;
+
+$resolver  = $this->services->get(PageTagResolver::class);
+$backlinks = $this->services->get(BacklinkRepository::class);
+
+// current page tag, taken verbatim from the request (legacy ?wiki= URLs)
+$tag = $resolver->resolveTag();
+// strip a query-string fragment if someone wrote ?wiki=Foo?x=1
+$tag = strtok($tag, '?');
+
+// secondary input, only used later for the post-delete redirect
+$incomingurl = !empty($_REQUEST['incomingurl'])
+    ? filter_var($_REQUEST['incomingurl'], FILTER_VALIDATE_URL) : '';
+
+if ($this->UserIsOwner() || $this->UserIsAdmin()) {
+    if (!$this->IsOrphanedPage($tag)) {
+        // page still has backlinks: list them so the owner can erase them
+        $linkedFrom = $backlinks->findByTarget($tag);
+        $msg = '<p><em>' . _t('DELETEPAGE_NOT_ORPHEANED') . "</em></p>\n";
+        $msg .= "<ul>\n";
+        foreach ($linkedFrom as $page) {
+            $msg .= '<li>' . $this->ComposeLinkToPage($page['from_tag'], '', '', 0) . "</li>\n";
+        }
+        $msg .= "</ul>\n";
+    } else {
+        // orphaned page: CSRF-checked deletion flow (unchanged)
+        $msg = _t('DELETEPAGE_CONFIRM');
+    }
+} else {
+    $msg = '<p><em>' . _t('DELETEPAGE_NOT_OWNER') . "</em></p>\n";
+}
+
+echo $this->Header();
+echo "<div class=\"page\">\n";
+echo $msg;
+echo "</div>\n";
+echo $this->Footer();
+
+# === file: src/Core/Repository/BacklinkRepository.php ===
+<?php
+namespace YesWiki\Core\Repository;
+
+// Read/write access to the {prefix}links table (page backlinks).
+class BacklinkRepository
+{
+    public function __construct(private $wiki) {}
+
+    // Every page whose link points at $tag.
+    public function findByTarget($tag)
+    {
+        $prefix = $this->wiki->config['table_prefix'];
+        $query = 'SELECT DISTINCT from_tag FROM ' . $prefix . 'links'
+               . " WHERE to_tag = '" . $tag . "'";
+        return $this->wiki->LoadAll($query);
+    }
+
+    // Remove backlinks pointing at a deleted page (eraselink=oui).
+    public function eraseLinksFor($tag)
+    {
+        $prefix = $this->wiki->config['table_prefix'];
+        $query = 'DELETE FROM ' . $prefix . 'links'
+               . " WHERE to_tag = '" . $tag . "'";
+        return $this->wiki->Query($query);
+    }
+}
+```
+
+1. **输入点枚举与可达性**：外部输入共三处——`PageTagResolver.php` L13-14 的 `$_REQUEST['wiki']`、L16-17 的 `$_GET['page']`（均原样返回，经 `deletepage.php` L10 赋给 `$tag`，L21 传入仓储，直达 sink，可达）；`deletepage.php` L15-16 的 `$_REQUEST['incomingurl']`（经 `FILTER_VALIDATE_URL` 后仅存于 `$incomingurl` 用于重定向，不参与任何 SQL 拼接，不可达 sink）。
+
+2. **主数据流与防御逐跳验证**：L1:14 → L2:10 → L2:12 `strtok($tag,'?')` → L2:21 → L3:13-14 拼接 → L3:15 `LoadAll` 执行。中间层 `strtok` 只按问号截断查询串，单引号、空格、`UNION SELECT` 等载荷原样通过，属字符串截断式过滤，可绕过，非有效防御；`FILTER_VALIDATE_URL` 位置错误（作用于 incomingurl 而非 tag），覆盖面为零；L2:18 的 `UserIsOwner/UserIsAdmin` 与 CSRF 校验属授权/会话控制，不构成 SQL 净化；L3:14 直接字符串拼接、L3:15 无参数绑定——链上无任何完整防御。
+
+3. **第二入口与替代通道**：`$_GET['page']`（L1:16-17）是与 `$_REQUEST['wiki']` 汇合同一数据流的替代输入通道；`BacklinkRepository.php` L19-24 的 `eraseLinksFor` 以完全相同的拼接构成第二 SQL sink（DELETE），若在 `eraselink=oui` 分支以同一受污染 `$tag` 调用同样可注入；incomingurl 通道不达 SQL sink，不改变结论。
+
+4. **结论**：source（文件1）与 sink（文件3）跨文件分离，中间文件仅做可绕过的截断处理，调用链无参数化/转义，确认 CWE-89 SQL 注入；因受 owner/admin 权限门控，定为 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL注入（跨文件：请求解析→处理器→仓储拼接）", "risk_level": "High", "source": "L1:line 13: PageTagResolver::resolveTag 读取 $_REQUEST['wiki']（line 16 另读 $_GET['page']）并原样返回", "sink": "L3:line 15: BacklinkRepository::findByTarget 在 line 14 将 $tag 拼入 WHERE to_tag='...' 后经 LoadAll 执行", "explanation": "主流：L1:line13 的 $_REQUEST['wiki'] 与 L1:line16 的 $_GET['page'] 在 resolveTag 中未做任何净化即返回，经 L2:line10 赋给 $tag；L2:line12 的 strtok($tag,'?') 仅按问号截断查询串，单引号、空格及 UNION SELECT 等载荷原样通过，属可绕过的字符串截断过滤，非有效防御；L2:line21 将 $tag 传入 findByTarget，L3:line13-14 直接字符串拼接进 SELECT，L3:line15 经 LoadAll 执行，全链无参数化、无转义，注入可达；L2:line15-16 的 $_REQUEST['incomingurl'] 为第二输入点，经 FILTER_VALIDATE_URL 后仅存于 $incomingurl 用于重定向，不进入任何 SQL 拼接，不可达本 sink；L2:line18 的 UserIsOwner/UserIsAdmin 与 CSRF 校验属授权与会话控制，不构成 SQL 净化；替代通道与第二 sink：$_GET['page'] 与 $_REQUEST['wiki'] 汇入同一数据流，L3:line19-24 的 eraseLinksFor 以相同拼接构成第二 SQL sink（DELETE），若在 eraselink=oui 分支以同一 $tag 调用同样可注入；综上调用链无完整防御，确认 CWE-89", "fix_suggestion": "line 14: 改为参数化查询，如 $query = 'SELECT DISTINCT from_tag FROM ' . $prefix . 'links WHERE to_tag = :tag'，并通过 LoadAll 的预编译绑定传入 $tag；line 22 的 eraseLinksFor 同样改为绑定参数"}
+```
