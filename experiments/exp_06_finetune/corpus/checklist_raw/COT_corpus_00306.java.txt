@@ -1,0 +1,35 @@
+## 漏洞分析报告
+
+**目标文件**：`FreemarkerTemplateEngine.java`（XDocReport FreeMarker 模板引擎适配层）
+
+### 步骤 1｜枚举用户可控输入点
+
+本类的“模板正文”不是硬编码，而是来自外部文档（XDocReport 的典型用法是用户上传 odt/docx，其中抽取出的字段即模板源）。可控输入点：
+- **第 116 行** `processNoCache(String templateName, IContext context, Reader reader, Writer writer)` 的 `reader` 参数——承载从用户上传文档中抽取的模板文本；
+- **第 110 行** `processWithCache` 的 `templateName`——经第 81 行注册的 `XDocReportEntryTemplateLoader` 从用户文档条目加载模板；
+- **第 202 行** `extractFields(Reader reader, ...)` 的 `reader`——同样把不可信文本当模板语法解析。
+
+### 步骤 2｜追踪 source→sink 数据流
+
+主数据流：第 116 行 `reader`（攻击者控制的模板正文）→ 第 120 行 `new Template(templateName, getReader(reader), getFreemarkerConfiguration())` 按 FreeMarker 语法解析 → 第 122 行转入私有 `process` → 第 162 行 `template.createProcessingEnvironment(context, writer)` → **第 163 行 `environment.process()` 执行模板**，正文中的内嵌指令全部被求值。由于第 253–257 行的默认配置只设置了编码与 `DefaultObjectWrapper`，全程未调用 `setNewBuiltinClassResolver` 限制 `?new` 内建方法，攻击者在文档中植入形如 `[#assign ex='freemarker.template.utility.Execute'?new()]${ex('id')}` 的表达式即可实例化任意类、执行系统命令（SSTI→RCE）。
+
+### 步骤 3｜验证防御有效性
+
+唯一的“过滤”在第 132–146 行 `getReader`：
+- 触发条件为 `forceModifyReader && isEscapeTemplate()`，而第 74 行 `forceModifyReader = false` 为默认值，**默认路径直接在第 145 行原样返回未净化的 reader**；
+- 即便两个开关都打开，第 139/142 行也只是把 `formatter.getStartDocumentDirective()/getEndDocumentDirective()`（即 `[#escape ...]` 输出转义包装）拼在模板首尾——它只对插值**输出结果**做 XML 转义，既不删除也不中和模板正文中已存在的 `[#assign]`、`?new()` 等指令，属于可绕过的部分防护，无法阻断 SSTI。
+全文件不存在白名单、参数化或类解析器限制等其他防御，该流未被任何有效防御覆盖。
+
+### 步骤 4｜第二入口/替代通道核查
+
+- 第 110 行 `processWithCache` 经 `MultiTemplateLoader`（含 `XDocReportEntryTemplateLoader`）加载用户文档中的模板条目，最终汇入同一个第 163 行执行点——同一污染通道的第二入口；
+- 第 207 行 `extractFields` 将同一 `reader` 整体按模板语法解析，进一步证实不可信内容被当作模板处理；
+- 第 288 行 `process(String templateName, ...)` 从 classpath 读取内部 `.ftl` 资源，非主要污染源。所有通道均无防御覆盖。
+
+### 步骤 5｜结论
+
+用户可控模板正文未经任何有效中和即被 FreeMarker 解析并执行，且配置允许 `?new` 任意类实例化，构成 CWE-1336 服务端模板注入，可直接导致远程代码执行，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Server-Side Template Injection (SSTI)", "risk_level": "Critical", "source": "line 116: processNoCache 的 Reader 参数（承载用户上传文档中抽取的模板正文）", "sink": "line 163: environment.process()（经 line 120 new Template 解析攻击者可控模板后执行）", "explanation": "用户可控模板正文 -> line 120 new Template 按 FreeMarker 语法解析 -> line 122 调用私有 process -> line 162 createProcessingEnvironment -> line 163 environment.process() 求值模板内嵌指令 -> 默认配置（line 253-257）未设置 NewBuiltinClassResolver，?new 可实例化任意类（如 Execute/ObjectConstructor）导致远程代码执行；唯一防线 getReader（line 132-146）默认关闭（line 74 forceModifyReader=false，line 145 原样返回），开启时也仅在模板首尾拼接 [#escape] 输出转义包装（line 139/142），不中和正文中已有指令，属可绕过防护；第二入口 line 110 processWithCache 经 XDocReportEntryTemplateLoader 加载同一污染源并汇入相同执行点", "fix_suggestion": "line 256: 在 setObjectWrapper 之后追加 DEFAULT_FREEMARKER_CONFIGURATION.setNewBuiltinClassResolver(TemplateClassResolver.SAFER_RESOLVER)，禁止模板经 ?new 解析实例化任意类"}
+```

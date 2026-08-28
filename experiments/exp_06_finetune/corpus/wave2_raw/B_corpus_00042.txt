@@ -1,0 +1,109 @@
+LANG: php
+```code
+# === file: app/Controllers/Upload.php ===
+<?php
+namespace App\Controllers;
+
+use App\Services\UploadStorage;
+use CodeIgniter\Controller;
+
+class Upload extends Controller
+{
+    // POST /upload/save
+    public function save()
+    {
+        $file   = $this->request->getFile('attachment');
+        $folder = $this->request->getPost('folder');
+        $name   = $this->request->getPost('save_as');
+
+        $stored = UploadStorage::persist($file, $folder, $name);
+
+        return view('upload_done', ['stored' => $stored]);
+    }
+}
+# === file: app/Services/UploadStorage.php ===
+<?php
+namespace App\Services;
+
+use CodeIgniter\HTTP\Files\UploadedFile;
+
+class UploadStorage
+{
+    public static function persist(UploadedFile $file, ?string $folder, ?string $name): string
+    {
+        $folder = $folder ?? date('Ymd');
+        $name   = $name ?? $file->getClientName();
+
+        // single-pass blacklist: looks like sanitization, is not
+        $folder = str_replace(['../', '..\\'], '', $folder);
+        $name   = str_replace(['../', '..\\'], '', $name);
+
+        $target = WRITEPATH . 'uploads/' . trim($folder, '/') . '/';
+
+        $file->move($target, $name);
+        return $target . $name;
+    }
+}
+# === file: system/HTTP/Files/UploadedFile.php ===
+<?php
+namespace CodeIgniter\HTTP\Files;
+
+use CodeIgniter\Files\File;
+use CodeIgniter\HTTP\Exceptions\HTTPException;
+
+class UploadedFile extends File
+{
+    protected $path;
+    protected $originalName;
+    protected $name;
+    protected $hasMoved = false;
+
+    public function __construct(string $path, string $originalName)
+    {
+        $this->path         = $path;
+        $this->originalName = $originalName;
+        $this->name         = $originalName;
+        parent::__construct($path, false);
+    }
+
+    public function getClientName(): string
+    {
+        return $this->originalName;
+    }
+
+    private function isValid(): bool
+    {
+        return is_uploaded_file($this->path);
+    }
+
+    public function move(string $targetPath, ?string $name = null): bool
+    {
+        $targetPath  = rtrim($targetPath, '/') . '/';
+        $name       ??= $this->name;
+        $destination = $targetPath . $name;
+
+        if (! $this->isValid()) {
+            throw HTTPException::forInvalidFile();
+        }
+
+        $this->hasMoved = move_uploaded_file($this->path, $destination);
+        $this->name     = basename($destination);
+
+        return $this->hasMoved;
+    }
+}
+```
+
+**分析**
+
+1. **外部输入点枚举与可达性**：控制器 `app/Controllers/Upload.php` 共三个外部输入——L12 `getFile('attachment')`（multipart 元数据含客户端原始文件名，可控）、L13 `getPost('folder')`、L14 `getPost('save_as')`（完全用户可控）。三者全部作为实参传入 `UploadStorage::persist`（UploadStorage.php L8），persist 在 L19 无条件调用 `$file->move(...)`，move 内部 L36 拼接后于 L42 直达 `move_uploaded_file`，可达性成立。
+
+2. **防御逐条核验**：唯一“过滤”是 UploadStorage.php L14–15 的 `str_replace` 单次剥离 `../` 与反斜杠变体——属黑名单字符串替换：输入 `....//` 删除一次后重组为 `../`；纯 `..` 目录名不含任何匹配序列，经 L17 `trim` 后直接拼成 `uploads/../` 逃逸一级。全链无 basename 收敛、无字符白名单、无 `realpath` 前缀校验。下沉侧 UploadedFile.php L27–30 `isValid()` 仅验证临时文件确来自 HTTP 上传，与目标路径无关；L43 的 `basename` 在移动完成之后才执行、只用于属性记录，不影响已落盘的 `$destination`。故两处均不构成有效防御。
+
+3. **第二入口/替代通道**：本组文件内 `persist` 仅有控制器一个调用点、`move` 仅被 persist 调用，不存在其他路由或间接调用；但存在替代通道——当 `save_as` 缺省时 UploadStorage.php L11 回退到 `getClientName()`（UploadedFile.php L22 直接返回客户端原始文件名），multipart 文件名字段携带的穿越序列汇入同一 sink，与主链等效。
+
+4. **结论**：主链（POST folder/save_as）与替代链（客户端原始文件名回退）两条数据流均可携带穿越序列到达 UploadedFile.php L42，攻击者可将上传内容写入 Web 根目录形成 webshell 或覆盖框架内任意可写文件，CWE-22 成立，定级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 跨文件路径遍历导致任意文件写入", "risk_level": "Critical", "source": "L1:line 13: getPost(folder) 与 L1:line 14 getPost(save_as) 用户可控的目标目录与文件名，另有替代通道 multipart 客户端原始文件名经 L2:line 11 回退 getClientName 进入同链", "sink": "L3:line 42: move_uploaded_file(this->path, destination)，其中 destination 在 L3:line 36 由 targetPath 与 name 未经校验直接拼接", "explanation": "流1: L1:line13-14 的 POST folder/save_as 传入 L2:line8 persist，L2:line14-15 用 str_replace 单次剥离 ../ 属黑名单替换，输入 ....// 删除一次后重组为 ../，纯 .. 目录名不含序列可借 L2:line17 trim 后拼出 uploads/../ 直接逃逸，随后 L2:line19 调用 move；流2: save_as 缺省时 L2:line11 回退 getClientName（L3:line22 返回客户端原始名），同样仅过单次替换；两流汇聚于 L3:line36 destination=targetPath.name 拼接并在 L3:line42 move_uploaded_file 落盘；防御核验: L3:line27-30 isValid 仅证明临时文件来自 HTTP 上传而不约束目标路径，L3:line43 basename 在移动后才用于记录，全链无白名单、realpath 前缀校验或 basename 收敛；第二入口: 组内 persist 与 move 各仅一个调用点、无其他路由或间接调用，但 multipart 文件名字段构成等效替代通道；故 CWE-22 成立，可写入 webroot 形成webshell或覆盖任意可写文件", "fix_suggestion": "line 36: 先对 folder 与 name 施加 basename 收敛并强制白名单正则 [A-Za-z0-9._-]{1,255} 且拒绝以点开头，再用 realpath 校验拼接结果的目录前缀必须严格等于 WRITEPATH 的 uploads 子目录，否则拒绝移动"}
+```

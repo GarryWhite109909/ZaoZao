@@ -1,0 +1,20 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点并追踪 sink**
+- 第 38 行 `verifyAndDecodeJSON(data []byte, ...)` 与第 54 行 `verifyAndDecode(data []byte, ...)` 的 `data` 参数是外部可控输入（待验证的镜像签名块：clearsigned 明文 + armored 签名）。数据流：第 56 行 `clearsign.Decode(data)` 解析出明文与签名体，随后在第 62 行进入密码学验证 sink `openpgp.CheckDetachedSignature(...)`。
+- 第 68 行 `isLegacySignature(data)` 仅在第 77 行做前缀判断，不做签名验证，无危险 sink。
+- 第 23 行 `signAndEncodeJSON` 是签名侧（写方向），不属于验证路径。
+
+**步骤 2｜逐条验证防御有效性**
+- 唯一 source→sink 流：`data`(第 54 行) -> `clearsign.Decode`(第 56 行) -> `CheckDetachedSignature`(第 62 行)。关键缺陷在第 62 行：第四个参数传入 `nil` 作为 `*packet.Config`，即未对签名所用的哈希算法施加任何白名单约束，库默认会接受 MD5、SHA-1 等已被破解/高风险哈希算法生成的签名。整个文件中不存在任何对哈希算法的允许集校验——这是防御完全缺失，而非“黑名单可绕过”问题，故该流未被任何有效防御覆盖。
+
+**步骤 3｜检查第二入口/替代通道**
+- 第 38 行 `verifyAndDecodeJSON` 在第 40 行直接委托给 `verifyAndDecode`，与上述缺陷 sink 共用同一路径；文件内不存在其他带哈希算法校验的安全验证通道。因此所有验证入口均暴露于同一弱点。
+
+**步骤 4｜结论**
+- 本代码构成 CWE-327：数字签名验证时未强制使用密码学安全的哈希算法。攻击者若能实施 SHA-1 选择前缀碰撞等攻击，可伪造被本包接受的镜像签名，使完整性校验被绕过、恶意镜像被放行（下游可致任意代码执行）。综合可达性与利用前提，风险等级定为 High。
+- 最小修复：在第 62 行将 `nil` 替换为限定安全哈希算法（如 SHA-256）并显式拒绝 MD5/SHA-1 的 `*packet.Config`。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-327 使用已破解或存在风险的加密算法", "risk_level": "High", "source": "line 54: verifyAndDecode 的 data 参数（外部可控的签名块）", "sink": "line 62: openpgp.CheckDetachedSignature 以 nil 配置调用，未限制哈希算法", "explanation": "外部可控 data -> 第 56 行 clearsign.Decode 解析出明文与签名体 -> 第 62 行 CheckDetachedSignature 第四参数为 nil，缺少 packet.Config 对哈希算法的白名单约束 -> 接受 MD5/SHA-1 等弱哈希签名的验证 -> 攻击者可借碰撞伪造签名绕过镜像完整性校验", "fix_suggestion": "line 62: 将末尾参数 nil 改为强制安全哈希算法（如 SHA-256）并拒绝 MD5/SHA-1 的 *packet.Config"}
+```

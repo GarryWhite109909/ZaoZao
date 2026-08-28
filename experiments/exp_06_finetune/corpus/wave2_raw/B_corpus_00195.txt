@@ -1,0 +1,109 @@
+LANG: php
+```code
+# === file: public/api.php ===
+<?php
+require_once __DIR__ . '/../lib/sanitizer.php';
+require_once __DIR__ . '/../services/stream_manager.php';
+
+function getInput($key, $default = '')
+{
+    global $argv;
+    if (php_sapi_name() === 'cli') {
+        foreach ($argv as $arg) {
+            if (strpos($arg, "{$key}=") === 0) {
+                return substr($arg, strlen("{$key}="));
+            }
+        }
+    } else {
+        return isset($_REQUEST[$key]) ? $_REQUEST[$key] : $default;
+    }
+    return $default;
+}
+
+$action = getInput('action', 'status');
+
+if ($action === 'start') {
+    $rawCommand = getInput('ffmpegCommand', '');
+    $safeCommand = sanitizeFFmpegCommand($rawCommand);
+    if ($safeCommand !== '') {
+        startStream($safeCommand);
+    }
+} elseif ($action === 'list') {
+    listFFmpegProcesses(getInput('keyword', ''));
+}
+
+# === file: lib/sanitizer.php ===
+<?php
+// lib/sanitizer.php
+// Blacklist sanitizer for ffmpeg commands
+
+function sanitizeFFmpegCommand($command)
+{
+    $allowedPrefixes = ['ffmpeg', '/usr/bin/ffmpeg', '/bin/ffmpeg'];
+
+    // Remove dangerous characters
+    $command = str_replace('&&', '', $command);
+    $command = str_replace('rtmp://vlu.me/', 'rtmp://live/', $command);
+    $command = preg_replace('/\s*&?>.*(?:2>&1)?/', '', $command);
+    $command = preg_replace('/[;|`<>$()\n\r{}]/', '', $command);
+
+    // Ensure it starts with an allowed prefix
+    foreach ($allowedPrefixes as $prefix) {
+        if (strpos(trim($command), $prefix) === 0) {
+            return $command;
+        }
+    }
+
+    return '';
+}
+
+# === file: services/stream_manager.php ===
+<?php
+// services/stream_manager.php
+
+function startStream($ffmpegCommand)
+{
+    $cmd = $ffmpegCommand . ' > /dev/null 2>&1 &';
+    exec($cmd, $output, $status);
+    return $status === 0;
+}
+
+function listFFmpegProcesses($keyword = '')
+{
+    $command = "ps -eo pid,etime,%cpu,%mem,cmd | grep '[f]fmpeg'";
+
+    if (!empty($keyword)) {
+        $command .= " | grep '$keyword'";
+    }
+
+    exec($command, $output, $status);
+
+    $processes = [];
+    foreach ($output as $line) {
+        preg_match('/^\s*(\d+)\s+([\d:-]+)\s+([\d.]+)\s+([\d.]+)\s+(.+)$/', $line, $matches);
+        if (!empty($matches)) {
+            $processes[] = [
+                'pid' => intval($matches[1]),
+                'cpu_usage' => floatval($matches[3]),
+                'memory_usage' => floatval($matches[4]),
+                'command' => $matches[5]
+            ];
+        }
+    }
+    return $processes;
+}
+```
+
+**分析**
+
+1. **输入点枚举与可达性**：外部输入共三处——public/api.php L15 经 `getInput()` 读取的 `$_REQUEST`（派生出 `action`、`ffmpegCommand`、`keyword` 三个参数），以及 L8-L13 的 CLI `$argv` 通道。`ffmpegCommand`（L23）经 L24→L26 传入 `startStream`，最终到达 services/stream_manager.php L7 的 `exec()`，可达性成立；`keyword`（L29）直传 `listFFmpegProcesses`，到达同文件 L19 的 `exec()`，可达性成立。
+
+2. **主链防御逐一验证**：唯一防线是 lib/sanitizer.php L10-L13 的 `sanitizeFFmpegCommand`，属于黑名单式字符串替换+字符类正则剔除，按规则视为无效防御：正则 `\s*&?>` 只能删除 `&>` 或 `>` 开头的重定向片段，`&&` 被 str_replace 清除但**单个 `&` 不在任何过滤规则内**，攻击者提交 `ffmpeg -version & 任意命令` 即可在 L17 前缀检查通过后原样返回并注入；且该检查只校验开头若干字符，对剩余部分零覆盖。污染值经 L3:6 拼接后在 L3:7 `exec` 执行，调用链上无任何有效净化。
+
+3. **第二入口/替代通道**：存在且更危险——`action=list` 分支（api.php L29）中 `keyword` 参数**完全未经过任何净化函数**，在 stream_manager.php L16 直接拼入双引号 shell 字符串并于 L19 `exec` 执行，闭合单引号即可注入任意命令；CLI `$argv` 通道复用同一 `getInput`，同样汇入上述两个 sink。两通道相互独立，均支撑漏洞成立。
+
+4. **结论**：主链（黑名单可绕过）与次链（零过滤）共两条 source→sink 数据流全部无有效防御，构成 Web 可达的远程命令执行（RCE），CWE-78 成立，风险级别 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78: OS Command Injection", "risk_level": "Critical", "source": "L1:line 23: getInput('ffmpegCommand') 读取 $_REQUEST['ffmpegCommand'] 外部输入（public/api.php）", "sink": "L3:line 7: startStream 内 exec($cmd) 执行拼接后的 shell 命令（services/stream_manager.php）", "explanation": "输入点枚举：public/api.php L15 的 $_REQUEST 全量读取（派生 action/ffmpegCommand/keyword 三参数）及 L8-L13 的 CLI $argv 通道均可达 sink；主链数据流：L1:23 读入原始 ffmpegCommand，L1:24 调用 L2:5 的 sanitizeFFmpegCommand，其 L2:10-13 仅做黑名单处理——str_replace 只删 && 与固定串、正则只匹配 &> 或 > 及字符类 [;|`<>$()\n\r{}]，单个 & 字符未被过滤，且 L2:17 的前缀检查只验证开头为 ffmpeg 即原样返回剩余内容，攻击者以 ffmpeg -x & 任意命令 形式即可绕过；污染值经 L1:26 startStream 在 L3:6 拼接后于 L3:7 exec 执行，链上无有效防御；第二入口：L1:29 action=list 时 $_REQUEST['keyword'] 零净化直接在 L3:16 拼入双引号 shell 字符串并于 L3:19 exec 执行，闭合单引号即可注入，属独立替代通道；CLI argv 通道复用 getInput 同样汇入两个 sink；综上两条数据流的防御分别为可绕过黑名单与完全缺失，CWE-78 成立", "fix_suggestion": "line 7: 放弃黑名单拼接，将 ffmpeg 参数拆为数组并对每个参数用 escapeshellarg 转义后再构造命令（或改用 proc_open 传参数组绕开 shell），同时修复 L3:16 对 keyword 的裸拼接"}
+```

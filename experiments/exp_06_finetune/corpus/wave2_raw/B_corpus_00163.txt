@@ -1,0 +1,103 @@
+LANG: go
+```code
+# === file: routers/attachment.go ===
+package routers
+
+import (
+	"gitea.dev/services/attachment"
+	"gitea.dev/services/context"
+)
+
+// GET /attachments/{uuid} - main download entry for web UI and API.
+func GetAttachment(ctx *context.Context) {
+	// SOURCE: uuid comes verbatim from the request path, fully attacker-controlled
+	attachment.ResolveAndStream(ctx, ctx.PathParam("uuid"))
+}
+
+// GET /attachments/download?file={uuid} - legacy endpoint kept for old clients.
+func GetAttachmentLegacy(ctx *context.Context) {
+	// second entry: the same untrusted key arrives via query string
+	attachment.ResolveAndStream(ctx, ctx.FormString("file"))
+}
+# === file: services/attachment.go ===
+package attachment
+
+import (
+	"net/http"
+
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/modules/storage"
+	"gitea.dev/services/context"
+)
+
+// legacyCutoff: rows created before this ts predate repo-bound attachments.
+var legacyCutoff int64 = 1700000000
+
+// ResolveAndStream loads an attachment purely by the client-supplied UUID and
+// streams it. Its only guard, the repo-binding check below, is skipped for all
+// legacy rows and whenever ctx.Repo is unset (CWE-639).
+func ResolveAndStream(ctx *context.Context, uuid string) {
+	attach, err := repo_model.GetAttachmentByUUID(ctx, uuid)
+	if err != nil {
+		ctx.HTTPError(http.StatusNotFound)
+		return
+	}
+
+	// Purported defense: repo binding. Legacy rows bypass it entirely and no
+	// unit-level CanRead or uploader verification ever runs on that branch.
+	if attach.CreatedUnix > legacyCutoff && ctx.Repo != nil &&
+		ctx.Repo.Repository != nil && ctx.Repo.Repository.ID != attach.RepoID {
+		ctx.HTTPError(http.StatusNotFound)
+		return
+	}
+
+	blob := &storage.AttachmentBlob{
+		UUID:         attach.UUID,
+		Name:         attach.Name,
+		RelativePath: attach.RelativePath(),
+	}
+	if err := storage.StreamAttachment(ctx.Resp, ctx.Req, blob); err != nil {
+		ctx.ServerError("StreamAttachment", err)
+	}
+}
+# === file: modules/storage/attachment.go ===
+package storage
+
+import (
+	"net/http"
+
+	"gitea.dev/modules/httplib"
+)
+
+// AttachmentBlob is the minimal descriptor handed to the object store.
+type AttachmentBlob struct {
+	UUID         string
+	Name         string
+	RelativePath string
+}
+
+// StreamAttachment opens the stored object and writes its bytes to the
+// response. It performs no authorization itself; whatever blob reaches
+// this function is disclosed verbatim (SINK).
+func StreamAttachment(resp http.ResponseWriter, req *http.Request, blob *AttachmentBlob) error {
+	fr, err := Attachments.Open(blob.RelativePath)
+	if err != nil {
+		return err
+	}
+	defer fr.Close()
+	httplib.ServeUserContentByFile(req, resp, fr, httplib.ServeHeaderOptions{Filename: blob.Name})
+	return nil
+}
+```
+
+1. 【输入点枚举与可达性】外部输入共两处：routers/attachment.go 第 11 行 `ctx.PathParam('uuid')`（主路由 GET /attachments/{uuid}）与第 17 行 `ctx.FormString('file')`（遗留路由）。两者都直接传入 services/attachment.go 第 17 行 ResolveAndStream，在第 18 行按用户可控键 GetAttachmentByUUID 查库，第 32-37 行组装 blob 后于第 37 行调用 modules/storage/attachment.go 第 19 行 StreamAttachment，最终抵达第 20 行 `Attachments.Open(blob.RelativePath)`，两条路径均可达 sink，无任何断链。
+
+2. 【数据流与防御逐一验证】流A（路径参数 uuid）：链上唯一防御位于 services/attachment.go 第 26-30 行的 RepoID 等值比对；其位置在中间服务层，类型虽是等值判断而非黑名单/正则，但覆盖面残缺——`CreatedUnix <= legacyCutoff` 的历史行整体跳过该校验、`ctx.Repo == nil` 时同样跳过，且全链不存在 CanRead(unitType)、UploaderID 归属或 token scope 校验，等值通过只能证明『请求所在仓库匹配』而不能证明『请求者有权读取该对象』，故属无效防御。流B（查询参数 file）：与流A共用同一服务函数与同一 sink，遭遇的是同一个残缺闸门，无任何附加过滤或鉴权，同样可绕过。
+
+3. 【第二入口与替代通道】routers/attachment.go 第 15-18 行的 GetAttachmentLegacy 构成独立注册的第二路由入口，与主入口在服务层汇合后共享同一 sink；且 ResolveAndStream 是包级导出函数，后续任何新路由复用即自动继承该缺陷。两个入口相互印证：绕过不是单点笔误，而是调用链上的系统性鉴权缺失。
+
+4. 【结论】攻击者只需持有或枚举到其他仓库附件的 UUID（尤其是不受仓库绑定约束的历史行），即可跨仓库读取私有附件内容，source 与 sink 分离于不同文件且中间层防线形同虚设，构成 CWE-639 授权绕过（IDOR）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639: Authorization Bypass Through User-Controlled Key (attachment UUID IDOR)", "risk_level": "High", "source": "L1:line 11: ctx.PathParam('uuid') 用户完全可控的附件主键 (第二入口 L1:line 17 ctx.FormString('file'))", "sink": "L3:line 20: storage.Attachments.Open(blob.RelativePath) 打开并回传私有附件内容", "explanation": "流A: L1:line 11 路径参数 uuid 经 L2:line 17 ResolveAndStream 在 L2:line 18 按用户可控键查库, 于 L2:line 32-37 组装 blob 直达 L3:line 20 Open 泄露文件字节; 流B: L1:line 17 查询参数 file 为第二入口, 与流A共用同一链路与 sink; 唯一防御位于 L2:line 26-30 的 RepoID 等值比对, 属中间层条件闸门但覆盖面不完整: CreatedUnix 小于等于 legacyCutoff 的历史行整体跳过, ctx.Repo 为 nil 时跳过, 且全链缺少 CanRead(unitType)/UploaderID/scope 校验, 通过比对只说明请求仓库匹配而非请求者有权限, 故非有效防御; 两入口汇聚证实替代通道存在, 攻击者持任意他仓附件 UUID 即可跨仓库读取私有附件, 构成 CWE-639 授权绕过", "fix_suggestion": "L2:line 26: 删除 legacyCutoff 与 ctx.Repo 判空短路, 改为无条件解析 attach 关联 unitType 并先执行 perm.CanRead 与 UploaderID 归属校验, 全部通过后才允许调用 L3 的 StreamAttachment"}
+```

@@ -1,0 +1,36 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点并追踪数据流**
+
+- 输入点 A：第 25 行 `Copy(ctx, src, remote)` 的 `remote` 参数。rclone 执行服务端复制/同步时，该值来自源远端列出的对象名，攻击者可通过控制源远端的文件名注入 `../` 等路径语法字符。
+- 数据流 1：`remote`(第 25 行) → 第 45 行 `f.newObject(remote)` → 第 46 行 `dstObj.mkdirAll()`，以未净化名称在本地创建目录树。
+- 数据流 2：`remote`(第 25 行) → 第 59 行 `f.localPath(remote)` → 第 78 行 `Clone(src, dst)` 的 `dst` 形参 → 第 85 行 `apfs.CopyFile(src, dst, state, apfs.COPYFILE_CLONE)` 实际写出文件内容，为最终危险 sink。
+- 输入点 B：第 51 行 `srcPath := srcObj.path` 是本后端源对象的自身路径，第 53 行 `EvalSymlinks` 仅作用于读取侧，不是本次写出 sink 的污染来源。
+
+**步骤 2｜逐条验证防御有效性**
+
+- 第 26 行 `GOOS != "darwin" || f.opt.NoClone`、第 29 行类型断言、第 34 行 `TranslateSymlinks` 分支均为功能性开关，不含任何路径净化语义。
+- 全文不存在路径规范化后的根目录包含校验、无 `..` 段拒绝、无白名单精确允许集。背景所述唯一防线是“可配置的文件名编码器”，属配置性过滤：当目的端选择的 encoding 未包含斜杠/点号转义时即完全失效，等同于可绕过的黑名单式防御，不能覆盖上述任一条流。
+- 第 53 行 `EvalSymlinks` 仅处理 `srcPath`（读侧），与第 59/85 行的写出路径无关，不构成对该流的防护。
+
+**步骤 3｜检查第二入口与替代通道**
+
+- 第 45–46 行是独立旁路：即使后续 Clone 失败，`mkdirAll()` 已用同一污染 `remote` 在目标根之外创建目录。
+- 第 72 行 `f.NewObject(ctx, remote)` 用同一 `remote` 再次做路径解析并返回对象，构成重复解析通道。
+- 第 78 行 `Clone` 为导出函数，包内其他调用点同样能把污染路径直接送达第 85 行 `apfs.CopyFile`。
+
+**步骤 4｜结论**
+
+`remote` 从第 25 行到第 85 行的写出 sink 之间没有任何有效防御，配合未转义路径分隔符的编码配置即可目录逃逸，在目标根之外克隆/覆盖任意文件（可进一步导致权限提升/RCE），判定为 CWE-22 路径穿越，风险等级 High。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 Path Traversal",
+  "risk_level": "High",
+  "source": "line 25: Copy 入参 remote（同步时来自源远端的对象名，攻击者可控）",
+  "sink": "line 85: apfs.CopyFile(src, dst, state, apfs.COPYFILE_CLONE)，dst 经 line 59 f.localPath(remote) 与 line 78 Clone 传入",
+  "explanation": "remote(line 25) -> f.localPath(remote)(line 59) -> Clone 的 dst(line 78) -> apfs.CopyFile 写出(line 85)；中间仅第 26/29/34 行的功能开关，无路径规范化、无 .. 拒绝、无根目录包含校验，唯一依赖的可配置文件名编码器在未转义斜杠与点号时失效，属可绕过过滤；remote 含 ../ 即目录逃逸并在根外克隆/覆盖文件；旁路通道：line 45-46 newObject+mkdirAll 用同一污染 remote 在根外建目录，line 72 NewObject 再次按该路径解析",
+  "fix_suggestion": "line 59: 将第二实参改为先 filepath.Clean 并校验结果仍位于 f.root 内的路径，越界时返回 fs.ErrorCantCopy"
+}
+```

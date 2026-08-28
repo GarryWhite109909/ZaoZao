@@ -1,0 +1,98 @@
+LANG: go
+
+```code
+# === file: internal/server/routes.go ===
+package server
+
+import (
+	"net/http"
+
+	"archiver/internal/service"
+)
+
+// RegisterRoutes 注册服务对外暴露的全部路由。
+func RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/extract", HandleExtract)
+}
+
+// HandleExtract 处理 GET /api/extract?archive=backup.zip&dest=subdir
+// 两个参数均直接取自请求 URL，属于外部输入。
+func HandleExtract(w http.ResponseWriter, r *http.Request) {
+	archiveName := r.URL.Query().Get("archive") // source：攻击者可控的压缩包名
+	destSub := r.URL.Query().Get("dest")        // source：攻击者可控的目标子目录
+	if err := service.ExtractTo(r.Context(), archiveName, destSub); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+# === file: internal/service/extract_service.go ===
+package service
+
+import (
+	"context"
+	"strings"
+)
+
+// sanitizeDest 仅去掉一个前导斜杠：既不拒绝 .. 片段，
+// 也不做路径归一化，形如 ../../etc 的输入会原样通过。
+func sanitizeDest(dest string) string {
+	return strings.TrimPrefix(dest, "/")
+}
+
+// ExtractTo 是 HTTP 层调用的业务入口。
+func ExtractTo(ctx context.Context, archiveName, dest string) error {
+	subDir := sanitizeDest(dest) // 看似净化实则不完整：.. 序列未被处理
+	return runExtraction(ctx, archiveName, subDir)
+}
+
+# === file: internal/service/archive_sink.go ===
+package service
+
+import (
+	"context"
+
+	_ "github.com/rclone/rclone/backend/local"
+	"github.com/rclone/rclone/cmd/archive/extract"
+	"github.com/rclone/rclone/fs"
+)
+
+const (
+	uploadFS  = `:local:/tmp/uploads`  // 用户上传压缩包的存放处
+	archiveFS = `:local:/srv/archives` // 解压目标根目录
+)
+
+// runExtraction 执行真正的解压操作。
+// subDir 直接来自 HTTP 的 dest 参数，未经有效校验即到达本函数；
+// 它与压缩包内部成员名共同构成 Zip-Slip 路径穿越（CWE-22）。
+func runExtraction(ctx context.Context, archiveName, subDir string) error {
+	src, err := fs.NewFs(ctx, uploadFS)
+	if err != nil {
+		return err
+	}
+	dst, err := fs.NewFs(ctx, archiveFS)
+	if err != nil {
+		return err
+	}
+	// SINK：subDir 与包内路径在 ArchiveExtract 内部拼接并写出，
+	// 全链路不存在任何目录包含性检查。
+	return extract.ArchiveExtract(ctx, src, subDir, dst, archiveName)
+}
+```
+
+分析（针对整组文件）：
+
+1. **外部输入点枚举与可达性**：全部外部输入集中在 `internal/server/routes.go` L17-L18——HTTP 查询参数 `archive` 与 `dest`，均由请求方任意构造。`RegisterRoutes`（L10-L12）把 `/api/extract` 绑定到 `HandleExtract`，后者在 L19 无条件将两个参数传入 `service.ExtractTo`，因此两条数据流从入口即可达下游，无任何前置校验。
+
+2. **流一经中间层防御核验（dest → subDir）**：`dest` 进入 `internal/service/extract_service.go` 后，唯一的“防御”是 L11 的 `strings.TrimPrefix(dest, '/')`。它只剥掉一个前导斜杠，属于黑名单式部分过滤：不拒绝 `..` 片段、不做 `filepath.Clean` 归一化、不校验结果是否仍位于解压根目录内，`../../etc` 之类载荷原样存活，按规则视为无效防御。污点随后经 L17 传入 `runExtraction`。
+
+3. **流二与汇合点（archiveName）**：`archive` 参数在整条链路上零过滤，经 `extract_service.go` L17 直达 `internal/service/archive_sink.go` L30 的 `extract.ArchiveExtract(ctx, src, subDir, dst, archiveName)`。此外上传的压缩包内容本身受攻击者控制，成员名可携带 `../` 前缀，与被污染的 `subDir` 叠加后在解压时逃逸出 `/srv/archives`，构成典型 Zip-Slip 写文件原语（CWE-22）。
+
+4. **第二入口/替代通道核查**：`RegisterRoutes` 仅注册 `/api/extract` 一个处理器，组内不存在其他调用 `ExtractTo` 或 `runExtraction` 的代码路径，也没有命令行参数、消息队列等替代通道；外部可达性由这一条唯一 HTTP 链路确证，结论不受其他入口干扰。
+
+5. **综合结论**：三条要素（双参数 source、伪净化中间层、无包含性检查的解压 sink）串联成完整跨文件污点链，调用链上不存在任何完整防御，判定存在 CWE-22 路径穿越/目录遍历漏洞，攻击者可越界写文件，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22", "risk_level": "High", "source": "L1:line 17: HTTP 查询参数 archive（及 line 18 的 dest）由请求方完全控制", "sink": "L3:line 30: extract.ArchiveExtract 以未校验的 subDir 与包内成员路径拼接后解压写盘", "explanation": "数据流一：routes.go L18 的 dest 经 ExtractTo 进入 extract_service.go L10 的 sanitizeDest，唯一防御是 L11 的 strings.TrimPrefix 仅删一个前导斜杠，不拒 .. 片段、不做 filepath.Clean 归一化、无目录包含校验，属可绕过的部分过滤；污点经 L17 传入 archive_sink.go L19 的 runExtraction，最终在 L30 作为 subDir 进入 extract.ArchiveExtract 与包内路径拼接写出；数据流二：routes.go L17 的 archive 参数全程零过滤直达同一 sink，且压缩包内容由攻击者上传、成员名可含 ../ 前缀，二者叠加形成 Zip-Slip 越界写；第二入口核查：RegisterRoutes 仅注册 /api/extract 一个处理器，组内无其他调用 ExtractTo 或 runExtraction 的路径，也无命令行或消息队列等替代通道，外部可达性由该唯一 HTTP 入口确证；综上调用链上不存在任何完整防御，判定存在 CWE-22 目录穿越漏洞", "fix_suggestion": "line 11: 将 sanitizeDest 改为 filepath.Clean 归一化加包含性校验：Clean 后若含 .. 或脱离解压根目录则返回错误，并同时拒绝绝对路径"}
+```

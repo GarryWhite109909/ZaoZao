@@ -1,0 +1,102 @@
+LANG: javascript
+```code
+# === file: src/css-source.js ===
+'use strict'
+
+// [SOURCE] css 全文与文件名均来自 HTTP 请求体, 攻击者完全可控
+function extractSourceMappingURL(cssText) {
+  const comments = cssText.match(/\/\*\s*# sourceMappingURL=/g)
+  if (!comments) return null
+  const start = cssText.lastIndexOf(comments.pop())
+  const end = cssText.indexOf('*/', start)
+  if (start > -1 && end > -1) {
+    return cssText.substring(start, end)
+      .replace(/^\/\*\s*# sourceMappingURL=/, '')
+      .trim()
+  }
+  return null
+}
+
+function parseCssInput(body) {
+  return {
+    from: body.from,
+    css: body.css,
+    annotation: extractSourceMappingURL(body.css || '')
+  }
+}
+
+module.exports = { parseCssInput }
+
+# === file: src/map-resolver.js ===
+'use strict'
+const { dirname, join } = require('path')
+
+// 看似防御: 后缀正则 + 明文 ../ 黑名单, 均为可绕过的字符串检查
+function looksSafe(p) {
+  if (!/\.map$/i.test(p)) return false
+  if (p.includes('../')) return false
+  if (p.includes('..\\')) return false
+  return true
+}
+
+function resolveMapPath(cssFilePath, annotation) {
+  if (!annotation) return null
+  let candidate
+  try {
+    candidate = decodeURIComponent(annotation)
+  } catch (e) {
+    candidate = annotation
+  }
+  if (cssFilePath) {
+    candidate = join(dirname(cssFilePath), candidate)
+  }
+  // from 缺失时注解原样保留, 绝对路径直接放行
+  return looksSafe(candidate) ? candidate : null
+}
+
+module.exports = { resolveMapPath }
+
+# === file: src/map-store.js ===
+'use strict'
+const fs = require('fs')
+const express = require('express')
+const { parseCssInput } = require('./css-source')
+const { resolveMapPath } = require('./map-resolver')
+
+// [SINK] 攻击者可控路径直接进入文件读取
+function readMapFromDisk(mapPath) {
+  if (fs.existsSync(mapPath)) {
+    return fs.readFileSync(mapPath, 'utf-8').toString().trim()
+  }
+  return null
+}
+
+function buildPreviousMap(reqBody) {
+  const parsed = parseCssInput(reqBody)
+  const mapPath = resolveMapPath(parsed.from, parsed.annotation)
+  if (!mapPath) return { error: 'annotation rejected' }
+  const text = readMapFromDisk(mapPath)
+  return { mapFile: mapPath, text }
+}
+
+const app = express()
+app.use(express.json())
+app.post('/process-css', (req, res) => {
+  res.json(buildPreviousMap(req.body))
+})
+app.listen(3000)
+
+module.exports = { buildPreviousMap }
+```
+
+1. **外部输入点枚举与可达性**：唯一 HTTP 入口为 map-store.js L25 `POST /process-css`，`req.body` 整体透传进 `buildPreviousMap`(L26)。其中 `body.css` 在 css-source.js L21 被提取出 `sourceMappingURL` 注解，`body.from` 在 css-source.js L19 原样取出作基准文件名；两者入口层零校验，分别经 map-store.js L16/L17 直达 `resolveMapPath` 与 `readMapFromDisk`，到 sink 可达性成立。
+
+2. **主链数据流与防御逐一验证**：主链为 body.css → css-source.js L21 `annotation` → map-store.js L17 → map-resolver.js L16 解码 → L21 `join(dirname(from), candidate)` 归一化 → L24 `looksSafe` → map-store.js L19 → L10 `fs.readFileSync(mapPath)`。全链唯一防御是 map-resolver.js L5-L10：`.map` 后缀正则加明文 `../`、`..\` 黑名单，属可绕过的字符串过滤而非有效防御。绕过一：注解写 `src/../../../../etc/passwd.map` 时，L21 的 join 先于黑名单完成归一化，candidate 变成 `/etc/passwd.map`，已不含 `..` 字面量，L7-L8 检查形同虚设；绕过二：`body.from` 缺省时 L20 条件不成立跳过 join，注解直接填绝对路径 `/etc/passwd.map` 即可通过 L6-L8 全部检查读到系统文件。
+
+3. **第二入口与替代通道**：项目仅有这一条路由，不存在其他 handler 或对 `buildPreviousMap` 的间接调用；但存在两条并列污染参数通道——`body.css` 注解通道与 `body.from` 基准目录通道（后者可在 map-resolver.js L21 任意移动 `dirname` 解析基点），且每种通道各有至少一种独立绕过形态，任一单独利用即可到达 sink，支撑漏洞成立的最终结论。
+
+4. **结论**：source（css-source.js）与 sink（map-store.js）分处不同文件，中间 map-resolver.js 的净化发生在路径归一化之后且覆盖面不含绝对路径场景，属于“看似校验实则不完整”，调用链上无完整防御，判定 CWE-22 路径穿越成立，风险等级 High（读取范围受 `.map` 后缀限制，但配合 `from` 任意指定基准目录仍可定向读取敏感映射/配置类文件）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22: 路径穿越导致任意文件读取", "risk_level": "High", "source": "L1:line 21: parseCssInput 从请求体 body.css 提取的 sourceMappingURL 注解 annotation", "sink": "L3:line 10: readMapFromDisk 中 fs.readFileSync(mapPath, utf-8)", "explanation": "主链: body.css 经 L1:line 21 提取注解, L3:line 17 传入 L2:line 12 resolveMapPath, L2:line 21 join 归一化后于 L2:line 24 过 looksSafe, 最终 L3:line 10 readFileSync 读取该路径文件并回显; 防御缺陷: L2:line 5-10 仅有 .map 后缀正则与明文 ../ 及 ..\\ 黑名单, 注解 src/../../../../etc/passwd.map 在 L2:line 21 被 join 先行归一化为 /etc/passwd.map, 黑名单执行时已无 .. 字面量, 检查失效; 绕过二: body.from 为空时 L2:line 20 跳过 join, 注解直接填绝对路径 /etc/passwd.map 即通过全部检查; 替代通道: body.from 自 L1:line 19 经 L3:line 17 到 L2:line 21 控制 dirname 基准目录, 可把解析基点设为任意位置, 与注解通道汇合同一 sink; 入口面: 仅 POST /process-css 一条路由, 无第二入口或间接调用, 但两个污染参数通道与两种绕过形态均各自独立可达 sink, 故 CWE-22 成立", "fix_suggestion": "line 21: 在 join 归一化之后追加 path.relative(BASE_DIR, candidate) 校验, 结果以 .. 开头或为绝对路径即拒绝, 并同时拒绝以 / 或盘符开头的原始注解"}
+```

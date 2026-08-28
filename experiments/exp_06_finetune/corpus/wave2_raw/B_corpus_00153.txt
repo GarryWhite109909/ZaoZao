@@ -1,0 +1,103 @@
+LANG: php
+```code
+# === file: public/sso/acs.php ===
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../src/Saml/XmlSanitizer.php';
+require_once __DIR__ . '/../src/Saml/DOMDocumentFactory.php';
+
+use Saml\XmlSanitizer;
+use Saml\DOMDocumentFactory;
+
+// SAML ACS endpoint: any sender may POST an IdP-style response here
+$body   = file_get_contents('php://input');
+$posted = $_POST['SAMLResponse'] ?? '';
+$xml    = ($posted !== '') ? base64_decode($posted, true) : $body;
+
+if (!is_string($xml) || $xml === '') {
+    http_response_code(400);
+    exit('missing payload');
+}
+if (!XmlSanitizer::looksSafe($xml)) {           // flawed gate, see XmlSanitizer
+    http_response_code(400);
+    exit('rejected');
+}
+
+$doc = DOMDocumentFactory::fromString($xml);    // tainted xml reaches the parser
+echo 'assertions=' . $doc->getElementsByTagName('Assertion')->length;
+# === file: src/Saml/XmlSanitizer.php ===
+<?php
+declare(strict_types=1);
+
+namespace Saml;
+
+final class XmlSanitizer
+{
+    /**
+     * Blacklist gate invoked before every parse.
+     * Flaw: strpos() is case-sensitive while XML keywords are not,
+     * so `<!doctype` or `<!Entity` walks straight through.
+     */
+    public static function looksSafe(string $xml): bool
+    {
+        foreach (['<!DOCTYPE', '<!ENTITY'] as $needle) {
+            if (strpos($xml, $needle) !== false) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+# === file: src/Saml/DOMDocumentFactory.php ===
+<?php
+declare(strict_types=1);
+
+namespace Saml;
+
+use DOMDocument;
+use RuntimeException;
+
+final class DOMDocumentFactory
+{
+    public static function fromString(string $xml): DOMDocument
+    {
+        if (trim($xml) === '') {
+            throw new RuntimeException('empty payload');
+        }
+        $dom = new DOMDocument('1.0', 'UTF-8');
+        $options = LIBXML_DTDLOAD | LIBXML_DTDATTR | LIBXML_NONET | LIBXML_PARSEHUGE;
+        $loaded = $dom->loadXML($xml, $options);   // SINK: DTDLOAD expands external entities now
+        if (!$loaded) {
+            throw new RuntimeException('unparseable xml');
+        }
+        foreach ($dom->childNodes as $child) {     // too late: expansion already happened
+            if ($child->nodeType === XML_DOCUMENT_TYPE_NODE) {
+                throw new RuntimeException('doctype forbidden');
+            }
+        }
+        return $dom;
+    }
+
+    public static function fromFile(string $file): DOMDocument
+    {
+        $data = @file_get_contents($file);
+        if ($data === false || trim($data) === '') {
+            throw new RuntimeException('bad file');
+        }
+        return self::fromString($data);
+    }
+}
+```
+
+1. 【输入点枚举与可达性】外部输入共两处：acs.php L11 `file_get_contents('php://input')`（原始请求体）与 acs.php L12 `$_POST['SAMLResponse']`（表单字段，L13 做 base64 解码）。二者在 L13 合并为 `$xml`，经 L24 调用 `DOMDocumentFactory::fromString` 直达 DOMDocumentFactory.php L18 的 `loadXML`，除一个可绕过开关外全程无条件可达。
+
+2. 【逐流防御核验】流A（php://input→loadXML）与流B（SAMLResponse→base64→loadXML）共用唯一前置防御 XmlSanitizer.php L15-L19：对 `<!DOCTYPE`/`<!ENTITY` 的区分大小写 strpos 黑名单——XML 关键字大小写不敏感，提交 `<!doctype` 或 `<!Entity` 即整体绕过，属黑名单/字符串匹配类无效防御。工厂层：L17 `LIBXML_NONET` 仅禁网络抓取，`file://` 本地读取不受影响，且 `LIBXML_DTDLOAD` 反而主动开启 DTD 加载；L22-L26 的 DOCTYPE 子节点检查发生在 loadXML 之后，实体早在解析阶段已展开并完成本地文件读取，属事后补救，不构成有效防御。结论：两条流上均无完整防御。
+
+3. 【第二入口与替代通道】存在：同一路由有双通道（原始 body 与表单字段），封堵任一另一条仍可达 sink；此外 DOMDocumentFactory.php L30-L37 的静态方法 `fromFile` 是暴露的第二入口，任意路径的文件内容经 L36 汇入同一个 `fromString`→L18 sink，构成间接调用面。因此即便加固单一参数也无法消除漏洞。
+
+4. 【攻击语义验证】攻击者发送含小写 `<!doctype r [<!entity f system 'file:///etc/passwd'>]>` 的断言：黑名单放行，loadXML 在解析期即读取本地文件（经报错回显或响应长度差外带），随后工厂才抛出 doctype 异常但损害已发生，与 CWE-611 完全一致，判定漏洞成立（High：本地任意文件读，NONET 使 SSRF 受限）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611: XML外部实体注入(XXE)", "risk_level": "High", "source": "L1:line 12: acs.php 中 $_POST['SAMLResponse'] 外部输入(并行入口为 L1:line 11 的 php://input 原始请求体)", "sink": "L3:line 18: DOMDocumentFactory.php 中 $dom->loadXML($xml, 含LIBXML_DTDLOAD的选项) 触发外部实体解析", "explanation": "数据流A: acs.php L11 php://input → L13 合并为 $xml → L24 fromString → DOMDocumentFactory.php L18 loadXML; 数据流B: acs.php L12 $_POST['SAMLResponse'] → L13 base64解码 → 同一汇点, 两流均可达; 唯一前置防御 XmlSanitizer.php L15-L19 为区分大小写的 strpos 黑名单, 仅匹配大写 `<!DOCTYPE`/`<!ENTITY`, 而 XML 关键字大小写不敏感, 小写 `<!doctype` 直接绕过, 属可绕过黑名单不算有效防御; 工厂层 L17 LIBXML_NONET 只禁网络抓取不影响 file:// 本地读取, 且 LIBXML_DTDLOAD 主动开启 DTD 加载, L22-L26 的 DOCTYPE 检查位于 loadXML 之后, 实体已在解析期展开读取, 属事后拦截不构成防御; 第二入口: 同路由双通道(body 与表单字段)互为冗余, 另有公开静态 API fromFile(DOMDocumentFactory.php L30-L37) 经 L36 汇入同一 sink 形成间接调用面; 综上调用链无任何完整防御, 判定存在 CWE-611 漏洞", "fix_suggestion": "line 17: 从 $options 中移除 LIBXML_DTDLOAD 与 LIBXML_DTDATTR，禁止加载 DTD，从源头阻断外部实体展开"}
+```

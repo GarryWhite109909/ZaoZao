@@ -1,0 +1,22 @@
+## 漏洞分析报告（@fastify/reply-from 代理插件）
+
+**步骤 1｜枚举用户可控输入点并追踪危险 sink**
+- 输入点①：原始请求目标 `req.url`——第 61 行 `const req = this.request.raw` 直接取自客户端请求；第 73-75 行在 `reply.from()` 未显式传 source 时执行 `source = req.url`。HTTP/1.1 允许绝对形式请求目标（如 `GET http://evil.com/ HTTP/1.1`）与协议相对路径（`//evil.com/`），Node 会原样放入 `req.url`，故该值可携带完整攻击者 URL。
+- 输入点②：`req.headers`（第 89 行整体复制/过滤后转发）；输入点③：`this.request.body`（第 114-131 行转发）。
+- 对应危险 sink：出站上游请求链——第 82/85 行 `buildURL(source, dest)` 合成目标 URL → 第 90 行 `headers.host = url.host` 覆写 Host 头 → 第 178 行 `requestImpl({ method, url, qs, headers, body, timeout }, ...)` 真正向该 URL 发起请求。
+
+**步骤 2｜逐条 source→sink 数据流的防御有效性验证**
+- 流 A（核心）：`req.url` → 第 74 行 `source` → 第 82/85 行 `buildURL` → 第 178 行出站请求。防御核查：本文件内从 source 到出站请求之间**不存在任何对最终 host/origin 的精确白名单校验**；第 89 行 `filterPseudoHeaders` 仅剥离 HTTP/2 伪头，与 host 校验无关；第 80-83 行 LRU 缓存仅为加速（cacheKey=`dest+source`，攻击者每次使用新 URL 即生成新键，还会把恶意 URL 写入缓存），均不构成有效防御。按标准 URL 解析语义，source 为绝对 URL 或协议相对路径时 dest 基址被忽略，最终请求主机完全由攻击者决定。
+- 流 B：`req.url` 查询串 → 第 91 行 `getQueryString` → 第 262-265 行切片拼接回同一 url，属同一受控目标的参数通道，非独立防御点。
+- 流 C：body 转发（第 114-131 行）发往已确定的目标，非本次缺陷成因。
+
+**步骤 3｜第二入口/替代通道核查**
+- 显式传入非空 source（如 `reply.from('/api/x')`）时不经过第 74 行，不受影响；但插件公开支持的典型用法是在路由处理器内**无参调用 `reply.from()`**，此时 `req.url` 是唯一来源，所有采用该模式的代理路由全部暴露。
+- HTTP/2 入口（第 88 行 `sourceHttp2`）走完全相同的 `buildURL` 流程；虽然 h2 的 `:path` 不能为绝对形式，但 HTTP/1.1 通道不受限，两条入口共享同一缺陷根因，不存在已被防护的备用通道。
+
+**步骤 4｜结论**
+用户可控的 `req.url` 未经任何有效防御直达出站请求 sink：攻击者通过构造恶意 URL，可使仅配置了特定路由代理的服务向任意主机发起请求，绕过 `reply.from` 的路由限制，插件沦为“混淆代理”（受信中介被诱导滥用），并可进一步用于 SSRF/访问未授权上游路由。判定为 CWE-441，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-441 Unintended Proxy or Intermediary (Confused Deputy)", "risk_level": "High", "source": "line 74: source = req.url（第61行取自 this.request.raw，HTTP/1.1 绝对形式或协议相对请求目标由客户端完全控制）", "sink": "line 178: requestImpl({ method, url, qs, headers, body, timeout }) 向上游发起请求（目标 URL 经第82/85行 buildURL 未校验合成，第90行连 Host 头一并改写）", "explanation": "攻击者发送绝对形式请求目标(GET http://evil.com/ HTTP/1.1)或协议相对路径(//evil.com/) -> 第74行 source=req.url 完全可控 -> 第82/85行 buildURL 以 dest 为基址解析，绝对/协议相对目标使基址失效，且全文件无任何 host 白名单校验（filterPseudoHeaders 仅处理 h2 伪头，LRU 缓存仅为加速） -> 第90行 headers.host=url.host 同步改写 -> 第178行 requestImpl 将请求发往攻击者指定主机 -> 绕过 reply.from 仅代理特定路由的限制，形成混淆代理并可进一步 SSRF", "fix_suggestion": "line 85: 在 buildURL 得到 url 后立即精确校验 url.host 必须严格等于 dest 的 host（精确允许集比对），不一致则抛错拒绝转发，第82行缓存写入前的构建路径同样适用该校验"}
+```

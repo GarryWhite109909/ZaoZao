@@ -160,7 +160,7 @@ def main():
     ap.add_argument("--per-cell", type=int, default=5, help="每 语言×形态×方向 组合的任务数")
     args = ap.parse_args()
 
-    key = os.environ.get("OPENROUTER_KEY", "")
+    key = (os.environ.get("TEACHER_KEY") or os.environ.get("OPENROUTER_KEY") or "")
     if not key:
         print("错误：需要 OPENROUTER_KEY", file=sys.stderr)
         sys.exit(1)

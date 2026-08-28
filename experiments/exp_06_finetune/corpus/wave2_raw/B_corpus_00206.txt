@@ -1,0 +1,102 @@
+LANG: java
+```code
+# === file: src/main/java/org/forgerock/oauth2/restlet/AuthorizeConsentResource.java ===
+package org.forgerock.oauth2.restlet;
+
+import java.util.Map;
+import org.forgerock.openam.rest.service.RouterContextResource;
+import org.restlet.data.Reference;
+import org.restlet.representation.Representation;
+import org.restlet.resource.Get;
+
+/**
+ * OAuth2 authorize endpoint: entry point when user consent is required.
+ */
+public class AuthorizeConsentResource extends RouterContextResource {
+
+    private final ConsentDataModelBuilder dataModelBuilder;
+    private final ConsentPageRenderer pageRenderer;
+
+    public AuthorizeConsentResource(ConsentDataModelBuilder b, ConsentPageRenderer r) {
+        this.dataModelBuilder = b;
+        this.pageRenderer = r;
+    }
+
+    @Get
+    public Representation authorize() {
+        Reference resRef = getRequest().getResourceRef();
+        String rawPath = resRef.getPath(true);
+        String rawQuery = resRef.getQuery(true);
+        Map<String, Object> model = dataModelBuilder.build(rawPath, rawQuery);
+        return pageRenderer.render(model);
+    }
+}
+# === file: src/main/java/org/forgerock/oauth2/restlet/ConsentDataModelBuilder.java ===
+package org.forgerock.oauth2.restlet;
+
+import java.util.HashMap;
+import java.util.Map;
+import org.apache.commons.lang3.StringUtils;
+
+/**
+ * Builds the data model consumed by the consent page renderer.
+ */
+public class ConsentDataModelBuilder {
+
+    public Map<String, Object> build(String rawPath, String rawQuery) {
+        String target = rawPath;
+        if (!StringUtils.isBlank(rawQuery)) {
+            target = target + "?" + rawQuery;
+        }
+        // Looks defensive: strip script tags from the redirect target
+        target = StringUtils.replaceIgnoreCase(target, "<script>", "");
+        target = StringUtils.replaceIgnoreCase(target, "</script>", "");
+
+        Map<String, Object> data = new HashMap<>();
+        data.put("target", target);
+        data.put("display_name", "OpenAM Demo Client");
+        return data;
+    }
+}
+# === file: src/main/java/org/forgerock/oauth2/restlet/ConsentPageRenderer.java ===
+package org.forgerock.oauth2.restlet;
+
+import java.util.Map;
+import org.restlet.data.MediaType;
+import org.restlet.representation.Representation;
+import org.restlet.representation.StringRepresentation;
+
+/**
+ * Renders the consent HTML page by direct string concatenation.
+ */
+public final class ConsentPageRenderer {
+
+    public Representation render(Map<String, Object> model) {
+        StringBuilder html = new StringBuilder();
+        html.append("<html><body>");
+        html.append("<form method=\"POST\" action=\"")
+            .append(model.get("target"))
+            .append("\">");
+        html.append("<p>").append(model.get("display_name")).append("</p>");
+        html.append("<button type=\"submit\">Allow</button></form></body></html>");
+        return new StringRepresentation(html.toString(), MediaType.TEXT_HTML);
+    }
+}
+```
+
+**分析**
+
+1. **外部输入点枚举与可达性**：整组文件唯一的外部输入面位于 AuthorizeConsentResource.java L25-L27——Restlet `getRequest().getResourceRef()` 的 path 与 query 直接来自 HTTP 请求行，攻击者通过构造恶意链接可完全控制其内容；这两个值作为实参传入 L28 的 `build()`，返回的 model 在 L29 进入 `render()` 并最终写进 text/html 响应体，source 到 sink 可达性成立。除此之外未读取任何 header、cookie 或 body 参数。
+
+2. **逐条数据流的防御核验**：
+   - 流 A（rawPath）：L1:26 → ConsentDataModelBuilder.java L14 赋给 `target` → L19-L20 仅做 `<script>`/`</script>` 字面量的大小写不敏感黑名单替换，属典型的字符串替换伪净化，可用 `"><img src=x onerror=...>`、`<svg onload=...>` 或嵌套写法 `<<script>script>` 轻易绕过，不是有效防御 → L23 写入 `model['target']` → 回到 AuthorizeConsentResource.java L29 → ConsentPageRenderer.java L17-L19 用 StringBuilder 把它拼进双引号包裹的 `action` 属性，全程无任何上下文编码（原版代码对 display_name 有 ESAPI 编码，但对 target 从未编码，此处保留了同样的缺口），载荷仅需一个引号字符即可闭合属性注入事件处理器。
+   - 流 B（rawQuery）：L1:27 经 ConsentDataModelBuilder.java L15-L16 拼接进 target 后走完全相同的链路，同样只经过可绕过的黑名单替换。
+   - 对照项：ConsentDataModelBuilder.java L24 的 `display_name` 是编译期常量，ConsentPageRenderer.java L20 对它的渲染不受污染，说明漏洞专属于 target 这条未编码通道。
+
+3. **第二入口与替代通道排查**：全组仅有一个路由入口（AuthorizeConsentResource 的 `@Get authorize`）；`ConsentDataModelBuilder.build` 只在 L1:28 被调用一次，`ConsentPageRenderer.render` 只在 L1:29 被调用一次，不存在其他路由、参数合并点或间接调用可以引入或绕过该链路，中间文件的黑名单替换是唯一的“防御”且已被证明无效——因此单一路由即可确认漏洞成立。
+
+4. **危害定级**：这是位于 OAuth2 授权同意页的反射型 XSS，受害者在已认证会话中点击攻击者链接即触发，脚本可代为提交同意表单或窃取授权码/令牌，风险等级为 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 反射型XSS：授权同意页 target 参数未做上下文编码直接拼入 HTML 属性", "risk_level": "High", "source": "L1:line 26: getResourceRef().getPath() 返回的攻击者完全可控的请求行路径（同函数 line 27 的 getQuery() 为等价第二输入）", "sink": "L3:line 18: model.get(`target`) 未编码拼入 action 属性并以 text/html 响应输出", "explanation": "流A：L1:line 26 取得攻击者可控请求路径 → L2:line 14 赋值 target → L2:line 19-20 仅做 script 标签字面量的黑名单字符串替换，属可绕过伪净化（如 img onerror 载荷或嵌套标签写法均可穿透）→ L2:line 23 写入 model 键 target → L1:line 29 传入渲染器 → L3:line 17-19 用 StringBuilder 拼入双引号包裹的 action 属性，无任何上下文编码，载荷用一个引号字符即可闭合属性注入事件处理器；流B：L1:line 27 的查询串经 L2:line 15-16 拼接进 target 后走同一链路，同样仅过黑名单；对照项：L2:line 24 的 display_name 为编译期常量，L3:line 20 处不受污染；第二入口排查：全组仅有 @Get authorize 一个路由，build 与 render 各只有一处调用，无其他参数通道或间接调用可改变结论，故存在可利用的反射型 XSS", "fix_suggestion": "line 19: 删除黑名单替换，改为在放入模型前执行 ESAPI.encoder().encodeForHTMLAttribute(target)（或改用开启自动转义的模板引擎），确保渲染端不再手工拼接 HTML"}
+```

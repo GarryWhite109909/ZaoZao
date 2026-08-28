@@ -1,0 +1,106 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+from flask import Flask, jsonify, request
+
+from marklet.html_renderer import render_token
+from marklet.parser import parse_admonition
+
+app = Flask(__name__)
+
+
+@app.route("/preview", methods=["POST"])
+def preview():
+    """把用户提交的 Markdown 渲染成 HTML 预览。"""
+    body = request.form.get("markdown", "")
+    token = parse_admonition(body)
+    return jsonify({"html": render_token(token)})
+
+
+@app.route("/api/notes/import", methods=["POST"])
+def import_note():
+    """第二入口：笔记导入复用同一解析与渲染链。"""
+    payload = request.get_json(silent=True) or {}
+    token = parse_admonition(payload.get("content", ""))
+    return jsonify({"html": render_token(token)})
+
+
+# === file: marklet/parser.py ===
+import re
+
+_SCRIPT_RE = re.compile(r"<script[^>]*>.*?</script>", re.IGNORECASE | re.DOTALL)
+
+DIRECTIVE_RE = re.compile(
+    r'!!!\s+(?P<name>[A-Za-z_]\w*)'
+    r'(?:\s+"(?P<title>[^"\n]*)")?'
+    r'(?:\s+:class=(?P<cls>\S+))?'
+)
+
+
+def strip_scripts(text: str) -> str:
+    """黑名单清理：仅删除成对的 script 块，其余内容原样保留。"""
+    return _SCRIPT_RE.sub("", text)
+
+
+def parse_admonition(markdown_text: str):
+    """从原始 Markdown 提取第一个 !!! 提示块，生成渲染 token。"""
+    m = DIRECTIVE_RE.search(markdown_text or "")
+    if not m:
+        return None
+    title = m.group("title") or m.group("name").capitalize()
+    title = strip_scripts(title)
+    return {
+        "type": "admonition",
+        "title": title,
+        "attrs": {
+            "name": m.group("name"),
+            "class": m.group("cls"),
+        },
+    }
+
+
+# === file: marklet/html_renderer.py ===
+def render_admonition_title(text: str) -> str:
+    """标题文本未做任何转义，直接拼入 <p> 标签内部。"""
+    return '<p class="admonition-title">' + text + "</p>\n"
+
+
+def render_admonition(token: dict) -> str:
+    attrs = token["attrs"]
+    html = '<section class="admonition ' + attrs["name"]
+    if attrs.get("class"):
+        html += " " + attrs["class"]
+    html += '">\n'
+    html += render_admonition_title(token["title"])
+    return html + "</section>\n"
+
+
+def render_token(token) -> str:
+    if isinstance(token, dict) and token.get("type") == "admonition":
+        return render_admonition(token)
+    return ""
+```
+
+**分析**
+
+1. **外部输入点枚举与可达性**：全组文件共两个外部输入点——`app/routes.py` 第 12 行 `request.form.get('markdown')`（POST `/preview`）与第 20 行 `request.get_json()` 的 `content` 字段（POST `/api/notes/import`）。二者均立即传入第 13/21 行的 `parse_admonition`，返回的 token 又直接交给第 14/22 行 `render_token`，无任何中间拦截，到 sink 可达。
+
+2. **主数据流（title）**：`routes.py:L12` → `L13` → `parser.py:L19` 正则捕获 title（`L22`）→ `L23` `strip_scripts` 清洗 → `L26` 写入 token → 回到 `routes.py:L14` `render_token` → `html_renderer.py:L16→L18→L6` → `L12` 调用 `render_admonition_title` → `L3` 把 `text` 未转义地字符串拼接进 `<p class="admonition-title">` 内部，形成存储于响应体的 XSS。
+
+3. **防御逐一验证（title 流）**：唯一防御是 `parser.py:L3` 定义、`L14` 应用的黑名单正则，仅删除“成对的” `<script>...</script>` 块。`<img src=x onerror=alert(1)>`、`<svg onload=...>`、未闭合的 `<script>` 均原样通过；且输出端 `html_renderer.py` 全文件没有任何 `escape`/转义函数。该防御属黑名单+字符串替换型，位置在中间层而非输出端，覆盖面不足，判定为可绕过的无效防御。
+
+4. **第二条流（class 属性注入）与 name 对比**：`parser.py:L29` 将 `:class=` 选项值零过滤写入 token，经同一链路到达 `html_renderer.py:L9-L10` 拼入 `<section>` 的 class 属性，攻击者可用引号闭合属性注入事件处理器，此流完全无防御。对比之下，`parser.py:L28` 的 `name` 被 `L6` 正则 `[A-Za-z_]\w*` 约束为标识符字符，是整条链上唯一有效的约束字段。
+
+5. **第二入口与结论**：`routes.py:L17-L22` 的 `/api/notes/import` 以 JSON 通道复用完全相同的 `parse_admonition → render_token` 链，构成替代攻击通道，两条路由共享同一漏洞路径；除此之外无其他间接调用。综上，source（`routes.py`）与 sink（`html_renderer.py`）分离在不同文件，中间仅有不完整黑名单，调用链上无完整防御，确认 CWE-79 成立。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-79 跨站脚本",
+  "risk_level": "High",
+  "source": "L1:line 12: app/routes.py preview 视图 request.form.get('markdown') 读入的用户可控 Markdown 正文",
+  "sink": "L3:line 3: marklet/html_renderer.py render_admonition_title 中 text 未转义拼接进 HTML 的输出语句",
+  "explanation": "流1(title): L1:line 12 表单输入经 L1:line 13 进入 L2:line 22 提取 title, L2:line 23 经 strip_scripts 黑名单清理后写入 L2:line 26 的 token, 经 L1:line 14 render_token 到达 L3:line 12 再到 L3:line 3 无转义拼入 p 标签; 流1防御验证: 唯一防御是 L2:line 3 与 L2:line 14 的黑名单正则, 只删成对 script 块, img onerror、svg onload、未闭合 script 均可绕过且输出端无转义, 属可绕过的无效防御; 流2(class): L2:line 29 提取的 :class= 选项零过滤直达 L3:line 9-10 拼入 section 的 class 属性, 可闭合属性注入事件处理器, 该流完全无防御; 流3(name): L2:line 28 的 name 受 L2:line 6 正则 [A-Za-z_]\\w* 约束, 是链上唯一有效约束字段; 第二入口: L1:line 17-22 的 /api/notes/import 以 JSON content 复用同一 parse_admonition 到 render_token 链, 构成替代通道, 两条路由共享同一漏洞; 综上调用链无完整防御, 确认 CWE-79 反射型 XSS",
+  "fix_suggestion": "line 3: 在 html_renderer.py 引入 markupsafe.escape, 将 L3 改为拼接 escape(text), 并在 L9-L10 对 attrs.get('class') 先 escape 再拼接"
+}
+```

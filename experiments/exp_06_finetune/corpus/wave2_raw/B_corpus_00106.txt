@@ -1,0 +1,106 @@
+LANG: java
+```code
+# === file: src/main/java/com/spinnaker/pipeline/web/PipelineController.java ===
+package com.spinnaker.pipeline.web;
+
+import com.spinnaker.pipeline.service.PipelineService;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/pipelines")
+public class PipelineController {
+
+  private final PipelineService pipelineService;
+
+  public PipelineController(PipelineService pipelineService) {
+    this.pipelineService = pipelineService;
+  }
+
+  @PostMapping("/import")
+  public String importPipeline(@RequestBody String yamlManifest) {
+    return pipelineService.importFromYaml(yamlManifest);
+  }
+
+  @PostMapping("/clone")
+  public String clonePipeline(@RequestParam("templateSpec") String templateSpec) {
+    return pipelineService.importFromYaml(templateSpec);
+  }
+}
+# === file: src/main/java/com/spinnaker/pipeline/service/PipelineService.java ===
+package com.spinnaker.pipeline.service;
+
+import com.spinnaker.pipeline.config.YamlFactory;
+import org.springframework.stereotype.Service;
+
+@Service
+public class PipelineService {
+
+  /** Import a user supplied pipeline manifest into the running app. */
+  public String importFromYaml(String manifest) {
+    String cleaned = blockKnownGadgets(manifest);
+    Object cfg = YamlFactory.parseManifest(cleaned);
+    return "imported:" + String.valueOf(cfg);
+  }
+
+  /**
+   * Blacklist filter: strips only two well-known gadget tag literals.
+   */
+  private String blockKnownGadgets(String input) {
+    if (input == null) {
+      return "";
+    }
+    return input
+        .replace("!!javax.script.ScriptEngineManager", "")
+        .replace("!com.netflix.spinnaker.", "!safe.");
+  }
+}
+# === file: src/main/java/com/spinnaker/pipeline/config/YamlFactory.java ===
+package com.spinnaker.pipeline.config;
+
+import org.springframework.stereotype.Component;
+import org.yaml.snakeyaml.DumperOptions;
+import org.yaml.snakeyaml.LoaderOptions;
+import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.constructor.Constructor;
+import org.yaml.snakeyaml.representer.Representer;
+import org.yaml.snakeyaml.resolver.Resolver;
+
+/**
+ * Central factory for SnakeYAML parsers shared across services.
+ */
+@Component
+public class YamlFactory {
+
+  /** Permissive parser kept for legacy template compatibility. */
+  public static Object parseManifest(String content) {
+    LoaderOptions opts = new LoaderOptions();
+    opts.setMaxAliasesForCollections(50);
+    opts.setCodePointLimit(3145728);
+    Constructor ctor = new Constructor(opts);
+    Representer rep = new Representer();
+    DumperOptions dump = new DumperOptions();
+    Yaml yaml = new Yaml(ctor, rep, dump, opts, new Resolver());
+    return yaml.load(content);
+  }
+}
+```
+
+**分析（覆盖固定清单）：**
+
+1. **外部输入点枚举与可达性**：整组文件共两个外部输入点——L1(PipelineController.java):line 21 的 `@RequestBody String yamlManifest`（POST /pipelines/import）与 L1:line 26 的 `@RequestParam('templateSpec')`（POST /pipelines/clone）。二者分别经 L1:line 22、L1:line 27 进入 L2(PipelineService.java):line 10 的 importFromYaml，再由 L2:line 12 调用 L3(YamlFactory.java):line 18 的 parseManifest，最终全部到达 L3:line 26 的 `yaml.load(content)`，可达性成立；组内无其他入口遗漏。
+
+2. **数据流A（主链）防御核查**：L1:21→L1:22→L2:10→L2:12→L3:18→L3:26。链上唯一过滤是 L2:line 24-25 的黑名单字符串替换，仅删除两条固定 gadget 字面量；攻击者可用 `%TAG` 自定义标签句柄拆分字面量使匹配失效，或直接改用 c3p0、JndiConverter 等未列入黑名单的类，属可绕过过滤，非有效防御。
+
+3. **数据流B与工厂侧伪防护核查**：流B L1:26→L1:27 汇入同一链路，共享同样不完整的过滤。L3:line 20-21 的 maxAliasesForCollections/codePointLimit 只防 Billion Laughs 实体膨胀与超大输入，完全不约束标签实例化的类型；L3:line 22 使用全局 `Constructor` 允许任意类反序列化，且全链无 SafeConstructor 或类型白名单，两条流均无完整防御。
+
+4. **第二入口确认**：存在第二入口（L1:line 26 的 /pipelines/clone），与主链共用同一 sink L3:line 26，替代通道成立；任何只修补 import 接口的方案都会被 clone 入口绕过，进一步支撑漏洞结论。
+
+5. **影响评级**：攻击者提交形如 `!!javax.script.ScriptEngineManager[[...]]` 的 YAML 即可在解析期完成任意类构造，达成远程代码执行，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502: SnakeYAML 使用 Constructor 反序列化不可信数据导致任意类实例化(RCE)", "risk_level": "Critical", "source": "L1:line 21: PipelineController.importPipeline 的 @RequestBody String yamlManifest", "sink": "L3:line 26: YamlFactory.parseManifest 中 yaml.load(content)", "explanation": "输入点枚举: 组内共两个外部输入点, L1:line 21 POST /pipelines/import 请求体与 L1:line 26 POST /pipelines/clone 的 templateSpec 参数, 分别经 L1:line 22 与 L1:line 27 进入 L2:line 10 importFromYaml, 由 L2:line 12 调用 L3:line 18 parseManifest, 均可达 L3:line 26 的 yaml.load, 无其他遗漏通道; 流A(主链) L1:21→L2:10→L2:12→L3:18→L3:26, 链上唯一过滤为 L2:line 24-25 对两条固定 gadget 字面量的黑名单字符串替换, 可用 %TAG 自定义句柄重写标签或改用 c3p0/JndiConverter 等未列入黑名单的类绕过, 属可绕过过滤而非有效防御; 流B L1:26→L1:27 汇入同一链路, 共享同样的不完整过滤; 工厂侧 L3:line 20-21 的 maxAliasesForCollections 与 codePointLimit 仅防实体膨胀和超大输入, 不约束标签实例化类型, 对 CWE-502 无效; L3:line 22 采用全局 Constructor 且全链无 SafeConstructor 或类型白名单, 攻击者以 !!javax.script.ScriptEngineManager 类载荷即可在解析期触发任意类构造实现 RCE; 第二入口(clone)与主链共用同一 sink, 替代通道成立, 结论确凿", "fix_suggestion": "line 22: 将 new Constructor(opts) 替换为 new SafeConstructor(opts) 以仅加载标准类型"}
+```

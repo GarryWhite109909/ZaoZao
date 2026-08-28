@@ -1,0 +1,93 @@
+LANG: php
+```code
+# === file: src/Http/BlameController.php ===
+<?php
+namespace App\Http;
+
+use App\Support\PathFilter;
+use App\Reports\Gitblame;
+
+/**
+ * Renders per-file version-control blame reports.
+ */
+class BlameController
+{
+    public function show(): void
+    {
+        $raw = $_GET['file'] ?? '';
+        if ($raw === '') {
+            http_response_code(400);
+            exit('missing file parameter');
+        }
+        $clean  = PathFilter::clean($raw);
+        $report = new Gitblame();
+        header('Content-Type: text/plain');
+        echo implode(PHP_EOL, $report->generate($clean));
+    }
+}
+
+# === file: src/Support/PathFilter.php ===
+<?php
+namespace App\Support;
+
+/**
+ * Lightweight guard applied before invoking VCS tools.
+ */
+final class PathFilter
+{
+    public static function clean(string $path): string
+    {
+        $path = str_replace(['../', '..\\'], '', $path);
+        $path = preg_replace('/[;&|`]/', '', $path);
+        return ltrim($path, '/');
+    }
+}
+
+# === file: src/Reports/Gitblame.php ===
+<?php
+namespace App\Reports;
+
+/**
+ * Produces git blame output for one tracked file.
+ */
+class Gitblame
+{
+    public function generate(string $filename): array
+    {
+        return $this->getBlameContent($filename);
+    }
+
+    protected function getBlameContent(string $filename): array
+    {
+        $cwd = getcwd();
+        chdir(dirname($filename));
+        $command = 'git blame --date=short "' . basename($filename) . '" 2>&1';
+        $handle  = popen($command, 'r');
+        if ($handle === false) {
+            chdir($cwd);
+            return ['ERROR: blame command failed'];
+        }
+        $raw = stream_get_contents($handle);
+        pclose($handle);
+        chdir($cwd);
+
+        return explode("\n", $raw);
+    }
+}
+```
+
+**分析**
+
+1. **外部输入点枚举与可达性**：整组代码唯一的外部输入点是 `src/Http/BlameController.php:14` 的 `$_GET['file']`（无其他 POST/cookie/argv 读取）。该值在 `:19` 传入 `PathFilter::clean`，`:22` 作为实参进入 `Gitblame::generate`（`src/Reports/Gitblame.php:9`），经 `:11` 转入 `getBlameContent`（`:14`），在 `:18` 被拼入命令字符串并于 `:19` 由 `popen` 执行——source 到 sink 的调用链完整可达。
+
+2. **逐条防御验证**：主链上唯一的“防御”位于 `src/Support/PathFilter.php:11-12`：`:11` 是黑名单字符串替换（仅删除目录遍历片段），`:12` 是字符类正则删除（仅移除分号、&、竖线、反引号四种字符）。两者均为黑名单/正则删除型过滤，未覆盖 `$()` 命令替换所需的美元符与圆括号、未覆盖双引号、未覆盖换行符，均可绕过；sink 端 `Gitblame.php:18` 的 `basename()` 只截取最后一段路径分量，完全不中和 shell 元字符，也不构成防御。因此调用链上不存在转义、白名单或参数化执行等有效防御。
+
+3. **利用面确认**：由于 `Gitblame.php:18` 以双引号包裹文件名而引号本身未被过滤，提交形如 `a"$(id)"` 的参数即可在引号内触发命令替换，或用 `%0a` 注入新命令行，`popen` 直接交给 shell 解释。
+
+4. **第二入口/替代通道排查**：逐一检查三个文件——`PathFilter::clean` 除 `BlameController.php:19` 外无其他调用方；`Gitblame::generate` 与 `getBlameContent` 仅被 `show` 这一个动作调用；不存在其他路由、CLI 参数或间接回调能到达 sink。替代通道不存在，结论由上述单一数据流独立支撑且成立。
+
+5. **结论**：用户输入经弱黑名单清洗后直达 `popen` 命令串，构成 CWE-78 操作系统命令注入；入口为 Web 可达端点，可直接导致远程命令执行，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 操作系统命令注入", "risk_level": "Critical", "source": "L1:line 14: $_GET['file'] 用户可控的待 blame 文件名参数", "sink": "L3:line 19: popen($command, 'r') 执行拼接后的 git blame 命令", "explanation": "数据流：BlameController.php:14 读取 $_GET['file']，:19 经 PathFilter::clean 清洗，:22 调用 Gitblame::generate（Gitblame.php:9），:11 转入 getBlameContent（:14），:18 将其拼入命令字符串并由 :19 popen 执行，source 至 sink 全程可达；防御分析：PathFilter.php:11 黑名单字符串替换仅删除目录遍历片段，:12 正则仅删除分号、&、竖线、反引号四类字符，均属可绕过过滤，未覆盖 $() 命令替换、双引号与换行符，Gitblame.php:18 的 basename 仅截断目录分量不中和 shell 元字符，调用链上不存在转义或参数化执行等有效防御；第二入口排查：全组仅 show 动作一处构造 Gitblame 并调用 generate，无其他路由、请求参数或间接调用可达 getBlameContent，替代通道不存在；成因：弱黑名单清洗后的用户输入直接进入 popen 命令串，构成 CWE-78 命令注入", "fix_suggestion": "line 18: 改为 escapeshellarg(basename($filename)) 参与拼接，并在 BlameController 入口以 [A-Za-z0-9._-] 白名单校验文件名"}
+```

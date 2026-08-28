@@ -1,0 +1,83 @@
+LANG: python
+```code
+# === file: mobsf/DynamicAnalyzer/routes.py ===
+# -*- coding: utf_8 -*-
+"""Dynamic analyzer AJAX routes."""
+import random
+
+from django.views.decorators.http import require_http_methods
+
+from mobsf.MobSF.views.authentication import login_required
+from mobsf.MobSF.views.authorization import (
+    Permissions,
+    permission_required,
+)
+from mobsf.DynamicAnalyzer.views.common.shared import send_response
+from mobsf.DynamicAnalyzer.services import capture_screenshot
+from mobsf.DynamicAnalyzer.validators import sanitize_hash
+from mobsf.DynamicAnalyzer.environment import Environment
+
+
+@login_required
+@permission_required(Permissions.SCAN)
+@require_http_methods(['POST'])
+def take_screenshot(request):
+    """Take Screenshot."""
+    data = {}
+    try:
+        env = Environment()
+        bin_hash = request.POST['hash']
+        rand_int = random.randint(1, 1000000)
+        name = 'screenshot-{}.png'.format(rand_int)
+        target = capture_screenshot(env, sanitize_hash(bin_hash), name)
+        data = {'status': 'ok', 'path': target}
+    except Exception as exp:
+        data = {'status': 'failed', 'message': str(exp)}
+    return send_response(data)
+
+# === file: mobsf/DynamicAnalyzer/validators.py ===
+# -*- coding: utf_8 -*-
+"""Hash validation helpers for the dynamic analyzer."""
+
+
+def sanitize_hash(value):
+    """Normalize untrusted hash, blocks literal dot-dot segments."""
+    if not isinstance(value, str):
+        return ''
+    cleaned = value.replace('../', '')
+    cleaned = cleaned.replace('..\\', '')
+    return cleaned.strip()
+
+# === file: mobsf/DynamicAnalyzer/services.py ===
+# -*- coding: utf_8 -*-
+"""Screenshot persistence for the dynamic analyzer."""
+import os
+
+from django.conf import settings
+
+
+def capture_screenshot(env, bin_hash, name):
+    """Create per-app screenshot folder and grab a frame."""
+    screen_dir = os.path.join(
+        settings.UPLD_DIR,
+        bin_hash + '/screenshots-apk/')
+    if not os.path.exists(screen_dir):
+        os.makedirs(screen_dir)
+    out_file = os.path.join(screen_dir, name)
+    env.screen_shot(out_file)
+    return out_file
+```
+
+分析步骤：
+
+1. 外部输入点枚举与可达性：整组文件唯一的外部输入是 routes.py 第 26 行的 `request.POST['hash']`（POST 路由，第 18-20 行仅做认证/授权，不做内容校验）；该值在第 29 行经 `sanitize_hash` 包装后传入 `capture_screenshot`，直达 services.py 的文件系统操作。文件名 `name` 来自服务端 `random`，不可控；除该参数外无其他 POST/GET 读取，source→sink 可达性成立。
+
+2. 数据流与防御逐一验证（单条主流）：routes.py L26 → L29 `sanitize_hash` → validators.py L8-L9 黑名单式 `str.replace` 删除 `../` 与 `..\` → services.py L10-L12 与 `settings.UPLD_DIR` 拼接 → L14 `os.makedirs` 任意目录创建 → L16 `env.screen_shot(out_file)` 向攻击者控制的路径写文件。防御位于中间层 validators.py，但类型是黑名单+单次字符串替换：(a) `....//` 经一次 replace 折叠回 `../`；(b) 绝对路径如 `/data/local/tmp/x` 不含点点序列原样通过，且 `os.path.join` 遇到绝对路径分量会整体丢弃 UPLD_DIR；(c) 无白名单格式校验（原代码中的 `is_md5` 白名单已被移除）、无解码归一化。覆盖面不足，属可绕过的无效防御，调用链上不存在完整防御。
+
+3. 第二入口与替代通道核查：本拆分中只有 routes.py 一个路由消费 `hash` 并到达 services.py 的 sink，不存在第二条独立污点链或间接调用通道；但 validators.py 的 `sanitize_hash` 是共享工具函数，任何后续路由复用它都会继承同样的绕过缺陷。替代通道缺失不影响结论——唯一主链已因防御无效而完整成立。
+
+4. 危害定性：攻击者通过构造 `hash` 参数可在 UPLD_DIR 之外任意目录创建目录并写入截图文件（路径遍历写入），符合 CWE-22 语义，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "High", "source": "L1:line 26: request.POST['hash'] 用户可控的哈希参数", "sink": "L3:line 16: env.screen_shot(out_file) 配合 line 14 os.makedirs 写入拼接路径", "explanation": "输入点枚举：全组唯一外部输入为 routes.py L26 的 request.POST['hash']，经 L29 传入 capture_screenshot，文件名 name 由服务端随机生成不可控，可达性成立；数据流验证：routes.py L26 → validators.py L8-L9 黑名单 str.replace 删除 ../ 与 ..\ → services.py L10-L12 与 UPLD_DIR 拼接 → L14 makedirs 与 L16 screen_shot 落地，防御为黑名单加单次字符串替换，....// 折叠回 ../，绝对路径分量使 os.path.join 丢弃 UPLD_DIR，且无白名单校验与解码归一化，属可绕过无效防御；第二入口核查：本组仅此一条路由到达该 sink，无替代通道，但 validators.sanitize_hash 作为共享工具被复用会扩散同一缺陷，主链防御无效故漏洞成立", "fix_suggestion": "line 12: 在拼接前改用白名单校验（如正则 ^[a-f0-9]{32}$ 等价于原 is_md5），不匹配立即拒绝，禁止黑名单替换式过滤"}
+```

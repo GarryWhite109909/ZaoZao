@@ -1,0 +1,108 @@
+LANG: go
+```code
+# === file: web/handlers.go ===
+package web
+
+import (
+	"net/http"
+
+	"example.com/app/internal/fileutil"
+	"example.com/app/internal/store"
+)
+
+// GET /attachment?name=<key> downloads a stored attachment.
+func Attachment(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name") // SOURCE: user-controlled object key
+	clean := fileutil.Safe(name)
+	data, err := store.Load(clean) // flows straight to sink
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	_, _ = w.Write(data)
+}
+
+func Avatar(w http.ResponseWriter, r *http.Request) { // second entry
+	name := r.FormValue("avatar")
+	data, _ := store.Load(fileutil.Safe(name))
+	_, _ = w.Write(data)
+}
+# === file: internal/fileutil/sanitize.go ===
+package fileutil
+
+import (
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+// Blacklist filter: keeps only [a-zA-Z0-9_.]; note '.' survives, so '..' passes.
+var nonAlphaNumExpr = regexp.MustCompile("[^a-zA-Z0-9_.]+")
+
+const maxFilenameLength = 200
+
+// Safe looks sanitizing but performs no ownership or boundary check.
+func Safe(filename string) string {
+	filename = nonAlphaNumExpr.ReplaceAllString(filename, "")
+	ext := filepath.Ext(filename)
+	base := filename[:min(maxFilenameLength, len(filename)-len(ext))]
+	return base + ext
+}
+
+// HasPrefix enforces path boundaries but is never called on request keys.
+func HasPrefix(p, prefix string) bool {
+	return p == prefix || strings.HasPrefix(p, filepath.Clean(prefix)+string(filepath.Separator))
+}
+# === file: internal/store/files.go ===
+package store
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+const UploadRoot = "/var/lib/app/uploads"
+
+// Load resolves a user key against the shared root and reads that file.
+func Load(name string) ([]byte, error) {
+	p, err := resolve(UploadRoot, name, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile(p) // SINK
+}
+
+func resolve(base, filename string, count uint) (string, error) {
+	var suffix string
+	if count > 0 {
+		suffix = fmt.Sprintf(" (%d)", count)
+	}
+	path := base + suffix
+	if filename != "" {
+		noExt := strings.TrimSuffix(filename, filepath.Ext(filename))
+		path = filepath.Join(base, noExt+suffix+filepath.Ext(filename))
+	}
+	_, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return path, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return resolve(base, filename, count+1)
+}
+```
+
+分析（针对整组文件）：
+
+1. **外部输入点枚举与可达性**：入口一是 `web/handlers.go:12` 的 `r.URL.Query().Get('name')`，入口二是 `web/handlers.go:23` 的 `r.FormValue('avatar')`。两者均在同一函数内经 `fileutil.Safe` 处理后传入 `store.Load`（`web/handlers.go:14` 与 `web/handlers.go:24`），最终抵达 `internal/store/files.go:18` 的 `os.ReadFile(p)`，source→sink 可达性成立。
+2. **中间文件防御验证**：唯一的过滤是 `internal/fileutil/sanitize.go:10` 的正则黑名单在 `sanitize.go:15-20` 的 `ReplaceAllString` 字符剥离——类型为黑名单/正则替换，位置位于链路中段，覆盖面仅限字符类；白名单保留了点号使 `..` 序列原样通过，且不校验键的属主归属，按规则视为可绕过、非有效防御。`sanitize.go:23-25` 的 `HasPrefix` 本可做尊重路径边界的包含检查，但全工程无任何调用点，属于死代码式假防御。
+3. **sink 侧缺失校验**：`internal/store/files.go:13-19` 的 `Load` 接受原始键后，由 `files.go:21-39` 的 `resolve` 以共享根 `files.go:10` 通过字符串拼接（`files.go:26`）和 `filepath.Join`（`files.go:29`）直接解析，全程无会话属主绑定、无边界断言；`files.go:31` 的 `os.Stat` 还额外构成存在性预言机，可用于枚举他人对象。
+4. **第二入口与替代通道**：`web/handlers.go:22-26` 的 `Avatar` 是独立 HTTP 入口，经 `FormValue` 走完全相同的 Safe→Load→ReadFile 链路，证明漏洞并非单路由孤例；叠加 `os.Stat` 预言机通道，进一步扩大可利用面。
+5. **结论**：调用链上不存在完整的授权或路径边界校验——用户可控键（文件名）直接决定被读取的存储对象，任何能猜到/知道键名的客户端即可跨属主读取共享上传根下的任意文件，符合 CWE-639 授权绕过语义。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 通过用户可控键的授权绕过（跨属主文件读取）", "risk_level": "High", "source": "L1:line 12: web/handlers.go Attachment 中 r.URL.Query().Get('name') 读取攻击者可控的对象键", "sink": "L3:line 18: internal/store/files.go Load 中 os.ReadFile(p) 读取按该键解析出的任意存储对象", "explanation": "输入点枚举与可达性：入口一 L1:12 查询参数 name、入口二 L1:23 表单字段 avatar，均经 fileutil.Safe 后进入 store.Load 并抵达 L3:18 的 os.ReadFile，可达性成立；防御逐一验证：唯一过滤为 L2:10 正则黑名单在 L2:15-20 的字符剥离，白名单保留点号致 .. 原样通过，黑名单/正则替换按规则视为可绕过而非有效防御，L2:23-25 HasPrefix 具备正确边界检查但全工程零调用点属死代码防御，L3:13 与 L3:21-39 对键无属主校验，L3:26 拼接与 L3:29 Join 以共享根 L3:10 解析任意键；第二入口与替代通道：L1:22-26 Avatar 经 FormValue 复现同链路证明非单一路径，另 L3:31 os.Stat 构成存在性预言机辅助枚举他人对象；结论：链上无完整授权或边界校验，用户可控键决定被访问对象，构成 CWE-639 跨属主未授权读取", "fix_suggestion": "line 18: 在 os.ReadFile 前把键绑定到会话属主子目录，并用 fileutil.HasPrefix(filepath.Clean(p), userDir) 断言解析结果未越界，否则拒绝请求"}
+```

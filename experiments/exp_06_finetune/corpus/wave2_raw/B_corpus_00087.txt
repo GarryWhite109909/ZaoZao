@@ -1,0 +1,84 @@
+LANG: python
+
+```code
+# === file: hub/xsrf.py ===
+"""xsrf utilities extracted from the single-file version."""
+from tornado import web
+
+
+def needs_check_xsrf(handler):
+    """Return True when the request must prove a valid xsrf token."""
+    # refactor bug: dropped the original method-in-{get,head,options}
+    # conjunct, so POST navigations are trusted blindly
+    fetch_mode = handler.request.headers.get('Sec-Fetch-Mode', 'unspecified')
+    if fetch_mode in {'navigate', 'websocket', 'no-cors', 'unspecified'}:
+        return False
+    return True
+
+
+def check_xsrf_cookie(handler):
+    """Check that xsrf cookie matches xsrf token in request."""
+    if not needs_check_xsrf(handler):
+        return
+    token = (
+        handler.get_argument('_xsrf', None)
+        or handler.request.headers.get('X-Xsrftoken')
+        or handler.request.headers.get('X-Csrftoken')
+    )
+    if not token:
+        raise web.HTTPError(403, '_xsrf argument missing')
+    if token != handler.xsrf_token:
+        raise web.HTTPError(403, 'XSRF cookie does not match')
+
+# === file: hub/routes.py ===
+import tornado.web
+
+from hub.services import update_account_email
+from hub.xsrf import check_xsrf_cookie
+
+
+class EmailChangeHandler(tornado.web.RequestHandler):
+    """POST /settings/email - change the account email."""
+
+    def post(self):
+        check_xsrf_cookie(self)
+        new_email = self.get_argument('email')
+        update_account_email(self.current_user['id'], new_email)
+        self.write({'status': 'ok'})
+
+
+class HubApplication(tornado.web.Application):
+    def __init__(self):
+        super().__init__([
+            (r'/settings/email', EmailChangeHandler),
+        ])
+
+# === file: hub/services.py ===
+import sqlite3
+
+_conn = sqlite3.connect('hub.db')
+
+
+def update_account_email(user_id, email):
+    """Persist an account-level change (state-changing sink)."""
+    cur = _conn.cursor()
+    cur.execute(
+        'UPDATE users SET email = ? WHERE id = ?',
+        (email, user_id),
+    )
+    _conn.commit()
+```
+
+**分析（针对整组文件）**
+
+1. **外部输入点枚举与可达性**：共三处外部输入。① `hub/xsrf.py:9` 读取攻击者完全可控的 `Sec-Fetch-Mode` 请求头（缺省回退 `'unspecified'`），其返回值经 `hub/xsrf.py:17` 决定整个校验是否短路，直接决定 `hub/routes.py:11` 的防御是否生效，可达 sink；② `hub/xsrf.py:19-21` 的 `_xsrf` 表单参数与 `X-Xsrftoken`/`X-Csrftoken` 头，仅在①放行失败时才被读取比较；③ `hub/routes.py:12` 的 `email` 表单参数（跨站请求体载荷），经 `hub/routes.py:13` 直达 `hub/services.py:9` 的状态变更写操作。三条输入均可通过一次跨站 POST 到达 sink。
+
+2. **逐条数据流防御验证**：流1（主链）：攻击者页面构造 `<form method=POST action=/settings/email>`，浏览器将其归类为导航请求并自动携带 `Sec-Fetch-Mode: navigate`，命中 `hub/xsrf.py:10` 白名单 → `hub/xsrf.py:17` 直接 return → `hub/routes.py:11` 防御空转 → `hub/routes.py:12-13` 将攻击者控制的 email 写入 `hub/services.py:9-11` 的 UPDATE。该防御本质是对攻击者可控头部的字符串白名单放行（等价于可绕过的黑名单/字符串匹配），全链路无 Origin/Referer 校验、未设置 SameSite cookie 属性，不构成有效防御。流2：不支持 Fetch Metadata 的客户端或任何省略该头的请求取默认值 `'unspecified'`，同样命中 `hub/xsrf.py:10` 绕过。流3：仅当 fetch_mode 为 `cors` 等少数值才进入 `hub/xsrf.py:19-26` 的 token 比对——唯一真实防线覆盖面极窄，且走哪条分支由攻击者可控头部决定。`hub/services.py:9-11` 为参数化 SQL，注入面已封，但对 CSRF 无任何二次防护。
+
+3. **第二入口/替代通道**：存在。任何复用 `check_xsrf_cookie` 的路由（`HubApplication` 注册的其他 POST 端点）均继承同一缺陷；同一处理器内 `_xsrf`/`X-Xsrftoken`/`X-Csrftoken` 三条 token 通道在绕过路径上根本不会执行；非浏览器客户端亦可直接省略头部发起请求。替代通道的存在进一步支撑漏洞成立的结论。
+
+4. **成因定位**：单文件拆分重构时，`_needs_check_xsrf` 原有的方法约束 `method.lower() in {get, head, options}` 在 `hub/xsrf.py:7-8` 注释处被丢弃，导致对状态变更型 POST 的导航请求盲目信任，构成 CWE-352。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-352: 跨站请求伪造(CSRF)", "risk_level": "High", "source": "L1:line 9: 攻击者可控的 Sec-Fetch-Mode 请求头(缺省回退unspecified, 及L1:line 19-21 的 _xsrf参数与X-Xsrftoken/X-Csrftoken头)", "sink": "L3:line 9: update_account_email 内 cur.execute 执行 UPDATE users 的状态变更写操作", "explanation": "流1: 跨站form POST使浏览器自动携带Sec-Fetch-Mode=navigate, 命中L1:10白名单, L1:17直接return短路校验, L2:11防御空转, L2:12攻击者表单体email经L2:13传入L3:9执行UPDATE, 完成CSRF; 流2: 旧浏览器或脚本不发送该头时取默认值unspecified, 同样命中L1:10白名单绕过; 流3: 仅fetch_mode=cors等少数值才进入L1:19-26的token比对, 该比对为唯一真实防线但覆盖面极窄且分支由攻击者可控头部选择; 防御评估: L1:9-11基于攻击者可控请求头的字符串白名单放行属可绕过过滤, 全链路无Origin/Referer校验亦未设置SameSite cookie属性, 不构成有效CSRF防御; 第二入口: 任何复用check_xsrf_cookie的路由继承同一缺陷, 且_xsrf参数与X-Xsrftoken/X-Csrftoken三条通道在绕过路径上根本不会被执行, 替代通道存在故确认漏洞成立", "fix_suggestion": "line 10: 删除对navigate与unspecified的无条件放行, 恢复原方法约束——仅当fetch_mode属于navigate/unspecified且handler.request.method.lower()属于get/head/options时才跳过检查, 其余情况一律执行L1:19起的token比对"}
+```

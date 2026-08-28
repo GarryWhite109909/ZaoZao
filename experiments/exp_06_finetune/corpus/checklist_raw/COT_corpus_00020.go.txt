@@ -1,0 +1,36 @@
+## 漏洞分析报告：markup.go（CWE-1336）
+
+### 第 1 步｜枚举用户可控输入点
+
+- **line 336** `func Render(typ Type, input any, urlPrefix string, metas map[string]string)`：三个可控入口。
+  - `input`：议题/评论/Wiki 等正文，完全用户可控；
+  - `metas`：其中 `metas["format"]` 是外部议题跟踪器的 URL **模板**（来自仓库配置，仓库管理员可控），`metas["style"]`、`metas["repoLink"]` 同样来自调用方；
+  - `urlPrefix`：请求相关前缀。
+- **line 95** `pattern.FindAll(rawBytes, -1)`：从用户正文中匹配出片段 `m`（如 `ABC-123`、`#1287`），并在 **line 107/109** 被写入 `metas["index"]` —— 即用户正文内容会注入到后续模板展开的取值表中。
+
+### 第 2 步｜source→sink 数据流追踪与防御有效性验证
+
+主数据流：
+`input`(line 336) -> `RawMarkdown/RawOrgMode`(line 351/353) -> `postProcessHTML`(line 358 调用， 函数体 line 238) -> 文本令牌进 `RenderSpecialLink`(line 248) -> `RenderIssueIndexPattern`(line 159→87)。
+
+在 **line 102** 判定 `metas["format"]` 非空时进入外部跟踪器分支：
+- line 107/109：把用户正文匹配结果写入 `metas["index"]`；
+- **line 111**：`com.Expand(metas["format"], metas)` 将 `metas["format"]` 当作模板做纯文本占位符替换，对引号、尖括号、空格等特殊元素**零转义**，展开结果随即经 `fmt.Sprintf` 直接嵌入 `<a href="%s">` 的属性上下文。
+
+sink 处防御核验：无参数化、无白名单精确允许集、无上下文转义；唯一后续防线是 **line 358** 的 `SanitizeBytes`，它是出口处的整体清洗而非该 sink 的定点防护，既不能阻止模板被注入后造成的链接结构破坏与异常渲染（背景所述可致 panic），也不改变“特殊元素未在模板层中和”的本质。故此条流判为漏洞。
+
+对照同文件其他插值点佐证差异：line 103（`#[0-9]+`）、line 134（`[0-9a-zA-Z-_.]`）、line 147（`[0-9a-f]{7,40}`）、line 156（mention 字符集）的插值源均受正则字符集约束、无法携带引号破坏属性；**唯独 line 111 的模板 `metas["format"]` 不受任何字符集约束**，是无约束插值点。
+
+### 第 3 步｜第二入口/替代通道检查
+
+- **line 161**：`RenderSha1CurrentPattern(rawBytes, metas["repoLink"])` —— `repoLink` 同样出自 metas 且未转义即拼入 line 147 的 href，属同一根因的备用通道；
+- **line 254** `wrapImgWithLink`：line 209/218/223 将解析出的 `src`/`alt` 原样回写进新标签，属性值未二次转义，为同类未转义插值的替代通道（同样仅靠 line 358 兜底）；
+- `RenderIssueIndexPattern`（line 87）为首字母大写的导出函数，自身不提供任何转义，安全性完全依赖调用方是否再执行 `SanitizeBytes`。
+
+### 第 4 步｜结论
+
+**line 111** 是无定点防御的模板注入 sink：模板 `metas["format"]` 与注入值 `metas["index"]` 共同决定最终 href 属性内容，且全程无中和处理，符合 CWE-1336（模板引擎特殊元素未正确中和）。考虑 line 358 出口清洗对实际可利用性有一定削弱，风险评级 Medium。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 模板注入（模板引擎特殊元素未正确中和）", "risk_level": "Medium", "source": "line 336: Render 的 metas 参数（外部跟踪器模板 metas['format']，仓库管理员可控）与 input 正文（经 line 95 正则匹配后于 line 109 写入 metas['index']）", "sink": "line 111: com.Expand(metas['format'], metas) 展开结果经 fmt.Sprintf 未转义嵌入 <a href> 属性", "explanation": "用户正文 input(line 336) -> 渲染为 HTML 后文本令牌进入 RenderSpecialLink(line 248) -> RenderIssueIndexPattern 匹配 m(line 95) 并写入 metas['index'](line 107/109) -> com.Expand 将可控模板 metas['format'] 作占位符纯文本替换且零转义 -> fmt.Sprintf 拼入 <a href> 属性(line 111)；sink 处无参数化/白名单/上下文转义，仅 line 358 SanitizeBytes 出口整体清洗兜底，属非定点防线，模板层特殊元素未被中和 -> CWE-1336", "fix_suggestion": "line 111: 对展开结果做属性上下文转义，将 com.Expand(metas['format'], metas) 用 html.EscapeString 包裹后再传入 fmt.Sprintf"}
+```

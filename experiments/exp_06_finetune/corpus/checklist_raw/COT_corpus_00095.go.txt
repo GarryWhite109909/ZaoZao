@@ -1,0 +1,26 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点**
+
+本文件是 Aiven operator 的 CRD 类型定义（v1alpha1），所有带 json 标签的 spec 字段均由提交 CR 的用户控制。与 Secret 访问相关的输入点：
+- 第 50 行 `ConnInfoSecretSource.Name`、第 52 行 `ConnInfoSecretSource.Namespace`、第 56 行 `PasswordKey`——指定要读取的既有 Secret 的名称、**所在命名空间**、密码键名；
+- 第 21/23 行 `AuthSecretReference.Name/Key`（无 Namespace 字段）；
+- 第 205/207 行 `ResourceReference.Name/Namespace`；
+- 第 30/33/36/40 行 `ConnInfoSecretTarget` 各字段（创建目标 Secret 用）。
+
+**步骤 2｜追踪 source→sink 并验证防御有效性**
+
+- 关键流 A：第 43–45 行注释明确声明该结构体的语义——控制器会按用户填写的 Name/Namespace 去**读取既有 Secret 并持续 watch**，取第 56 行指定的 PasswordKey 用于认证，并把连接参数写回用户自己命名空间的连接信息 Secret。防御检查：第 47–48、53–54 行仅有 `Required` 和 `MinLength=1` 校验；第 52 行的 `Namespace` **没有任何 CEL/XValidation 或 webhook 强制它等于资源所在命名空间**（对比第 77、85、164 行对其他敏感字段都加了 `XValidation: self == oldSelf`，而第 52 行没有等价约束）。因此持有集群级 Secret 读权限的控制器成为“混淆代理人”：攻击者只需在自己命名空间有 ClickhouseUser 等资源的 create 权限，即可让控制器代为读取任意命名空间的 Secret 并把内容落到攻击者可读的位置。
+- 流 B：第 207 行 `ResourceReference.Namespace` 经第 210–233 行 `ref()`（第 211 行直接采用 `in.Namespace`，第 212 行仅在 Name 含分隔符时跳过默认值填充）同样允许跨命名空间对象键且无校验，但引用对象是 ProjectVPC 资源而非 Secret，泄露面远小于流 A。
+
+**步骤 3｜第二入口/替代通道排查**
+
+第 19–24 行 `AuthSecretReference` 只有 Name/Key、无 Namespace，默认解析到资源同命名空间，不构成跨 ns 通道；第 27–41 行 `ConnInfoSecretTarget` 是控制器**创建**目标 Secret 且第 28 行 Name 不可变，属写出方向不外泄。故跨命名空间 Secret 外泄的主通道唯一指向第 52 行的 `Namespace` 字段。
+
+**步骤 4｜结论**
+
+第 52 行的用户可控 Namespace 字段缺少“必须等于资源所在命名空间”的强制校验，使具备低权限（自命名空间建 CR）的开发者可借控制器集群级读权限窃取任意命名空间的生产数据库凭据、API key、token，构成 CWE-441 非预期代理/混淆代理人，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-441 Unintended Proxy/Intermediary (Confused Deputy)", "risk_level": "High", "source": "line 52: ConnInfoSecretSource.Namespace（配合 line 50 Name、line 56 PasswordKey，均为用户提交的 CR 字段）", "sink": "line 46: 控制器依据该结构体（line 43-45 注释声明的行为）按用户指定的 Namespace 跨命名空间读取源 Secret 并把密码复制到用户命名空间的连接信息 Secret", "explanation": "攻击者在自有命名空间创建 ClickhouseUser 等资源并在 connInfoSecretSource 中填入受害者命名空间与 Secret 名 -> 控制器以自身集群级 Secret 读权限代为读取受害者 Secret 的 PasswordKey -> 将凭据写入攻击者命名空间内的连接信息 Secret -> 攻击者读取本地 Secret 完成跨命名空间外泄；line 52 的 Namespace 仅有 MinLength 类校验而无任何强制等于资源命名空间的规则，防御缺失，控制器沦为混淆代理人", "fix_suggestion": "line 52: 删除 Namespace 字段（或加 CEL/XValidation 强制其等于资源所在命名空间，禁止跨命名空间引用源 Secret）"}
+```

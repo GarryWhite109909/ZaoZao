@@ -1,0 +1,111 @@
+LANG: java
+```code
+# === file: src/main/java/demo/web/GraphQlHttpController.java ===
+package demo.web;
+import java.util.Map;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import demo.exec.RequestExecutionService;
+import demo.graphql.DefaultGraphQlRequest;
+
+/** Entry point: accepts a raw GraphQL-over-HTTP body at POST /graphql. */
+public class GraphQlHttpController {
+
+	private final RequestExecutionService executionService = new RequestExecutionService();
+	private final ObjectMapper json = new ObjectMapper();
+
+	public Map<String, Object> handlePost(String httpBody) throws Exception {
+		Map<String, Object> payload = json.readValue(httpBody,
+				new TypeReference<Map<String, Object>>() {});
+		String document = (String) payload.getOrDefault("query", "");
+		String operationName = (String) payload.get("operationName");
+		@SuppressWarnings("unchecked")
+		Map<String, Object> variables =
+				(Map<String, Object>) payload.getOrDefault("variables", Map.of());
+		@SuppressWarnings("unchecked")
+		Map<String, Object> extensions =
+				(Map<String, Object>) payload.getOrDefault("extensions", Map.of());
+		DefaultGraphQlRequest request = new DefaultGraphQlRequest(
+				document, operationName, variables, extensions);
+		return executionService.execute(request);
+	}
+}
+
+# === file: src/main/java/demo/graphql/DefaultGraphQlRequest.java ===
+package demo.graphql;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+// Minimal port of org.springframework.graphql.GraphQlRequest
+interface GraphQlRequest {
+	String getDocument();
+	String getOperationName();
+	Map<String, Object> getVariables();
+	Map<String, Object> getExtensions();
+}
+
+/** Holds the client-supplied parts of a GraphQL request. */
+public class DefaultGraphQlRequest implements GraphQlRequest {
+
+	private final String document;
+	private final String operationName;
+	private final Map<String, Object> variables;
+	private final Map<String, Object> extensions;
+
+	public DefaultGraphQlRequest(String doc, String op,
+			Map<String, Object> vars, Map<String, Object> ext) {
+		this.document = (doc == null) ? "" : doc.trim();
+		this.operationName = (op == null || op.isBlank()) ? null : op.trim();
+		// shallow copy: nested values pass through untouched, no type check
+		this.variables = new LinkedHashMap<>(vars);
+		this.extensions = new LinkedHashMap<>(ext);
+	}
+
+	@Override public String getDocument() { return document; }
+	@Override public String getOperationName() { return operationName; }
+	@Override public Map<String, Object> getVariables() { return variables; }
+	@Override public Map<String, Object> getExtensions() { return extensions; }
+}
+
+# === file: src/main/java/demo/exec/RequestExecutionService.java ===
+package demo.exec;
+import java.util.Map;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.jsontype.impl.LaissezFaireSubTypeValidator;
+import demo.graphql.GraphQlRequest;
+
+/** Executes a request; resolves polymorphic types found in client JSON. */
+public class RequestExecutionService {
+
+	// default typing + laissez-faire validator honors any '@class' subtype
+	private final ObjectMapper mapper = new ObjectMapper().activateDefaultTyping(
+			LaissezFaireSubTypeValidator.instance, ObjectMapper.DefaultTyping.NON_FINAL);
+
+	public Map<String, Object> execute(GraphQlRequest request) {
+		try {
+			String rawVars = mapper.writeValueAsString(request.getVariables());
+			Object typedVars = mapper.readValue(rawVars, Object.class); // CWE-502 sink
+			String rawExt = mapper.writeValueAsString(request.getExtensions());
+			mapper.readValue(rawExt, Object.class); // second sink, same flaw
+			return Map.of("ok", String.valueOf(typedVars));
+		}
+		catch (Exception ex) {
+			throw new IllegalStateException("execution failed", ex);
+		}
+	}
+}
+```
+
+1. **外部输入点枚举与可达性**：唯一外部入口是 `GraphQlHttpController.java:L14` 的 `httpBody` 参数（POST /graphql 原始请求体），L15-L16 解析为 payload 后在 L17-L24 取出 query/operationName/variables/extensions 四个字段；其中 variables（L20-L21）与 extensions（L23-L24）是攻击者完全可控的嵌套结构，经 L25-L27 构造请求对象并跨文件传入 `RequestExecutionService.execute`，最终在 `RequestExecutionService.java:L17` 与 `:L19` 两个 `readValue` 汇点被消费，可达性成立。
+
+2. **流A（variables）防御验证**：中间层 `DefaultGraphQlRequest.java:L23-L24` 只对 document/operationName 做 trim 与空值检查——既不覆盖 variables/extensions 内容，也与反序列化风险无关，属“看似净化实则不完整”；L25-L27 为浅拷贝，嵌套值原样透传。末端 `RequestExecutionService.java:L11-L12` 配置了 `LaissezFaireSubTypeValidator.instance` + 默认多态类型，等于放行全部子类型，攻击者可在变量内注入 `@class` 键指定任意类路径触发实例化；全链路无白名单、无类型校验、无黑名单/正则/字符串替换（即便有亦视为可绕过），L22-L23 的 catch 仅包装异常、不能阻止类实例化，故无任何有效防御。
+
+3. **流B（extensions）防御验证**：同一入口字段经 `DefaultGraphQlRequest.java:L33` 的 getExtensions 原样到达 `RequestExecutionService.java:L18-L19` 的第二个汇点，路径与流A完全对称，沿途零校验，同样构成 CWE-502。
+
+4. **第二入口/替代通道**：整个项目仅此一个路由方法 handlePost，`execute` 仅被 `GraphQlHttpController.java:L27` 调用一次，不存在其他控制器、定时任务或反射间接调用；替代通道仅为同一请求体内的 extensions 字段（对应第二汇点 L19），它不构成独立入口但证明无论攻击者使用哪个字段漏洞均成立，支撑最终结论。
+
+5. **结论**：source（HTTP 请求体）与 sink（多态反序列化）分离在不同文件，中间文件仅有表面净化，链路上无完整防御，CWE-502 成立；配合已知 Jackson gadget 链可达成任意类实例化乃至 RCE，风险级别 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502: Deserialization of Untrusted Data（Jackson 默认多态类型解析导致不可信数据反序列化）", "risk_level": "Critical", "source": "L1:line 14: GraphQlHttpController.handlePost 的 httpBody 参数，即 POST /graphql 的原始请求体，其 variables 与 extensions 字段完全受攻击者控制", "sink": "L3:line 17: RequestExecutionService 中 mapper.readValue(rawVars, Object.class)，在启用默认多态类型解析的 mapper 上反序列化客户端可控数据", "explanation": "输入点枚举：唯一外部入口为 GraphQlHttpController.java 第14行 handlePost 的 httpBody，第15-16行解析为 payload 后在第17-24行取出 query/operationName/variables/extensions 四个字段；流A(variables)：第25-27行构造 DefaultGraphQlRequest 并跨文件调用 execute，DefaultGraphQlRequest.java 第23-27行仅做 trim、空值检查与浅拷贝，嵌套值原样保留，经第32行 getVariables 到达 RequestExecutionService.java 第16-17行，writeValueAsString 后用开启默认多态类型的 mapper 执行 readValue(Object.class)，攻击者可在变量内注入 @class 键指定任意类路径触发实例化；流B(extensions)：同入口字段经 DefaultGraphQlRequest.java 第33行 getExtensions 到达 RequestExecutionService.java 第18-19行的第二个 readValue 汇点，路径与流A完全对称；防御核查：中间文件第23-24行的净化只作用于 document/operationName 且与反序列化无关，浅拷贝不是过滤手段，末端第11-12行使用 LaissezFaireSubTypeValidator.instance 等于放行全部子类型，全链路无白名单、无类型校验、无黑名单或正则替换（即便存在亦属可绕过），第22-23行 catch 仅包装异常不能阻止类实例化，故两流均无有效防御；第二入口排查：项目仅此一个路由方法，execute 仅被 GraphQlHttpController.java 第27行调用一次，无其他控制器、定时器或反射间接调用，替代通道仅为同一请求体中的 extensions 字段且同样可达汇点，结论为 CWE-502 成立且风险为 Critical", "fix_suggestion": "line 11: 移除 activateDefaultTyping 与 LaissezFaireSubTypeValidator，改用 BasicPolymorphicTypeValidator 白名单（allowIfSubType 仅放行业务 DTO），或将 variables 直接绑定为固定类型字段，禁止按客户端提供的 @class 解析任意类型"}
+```

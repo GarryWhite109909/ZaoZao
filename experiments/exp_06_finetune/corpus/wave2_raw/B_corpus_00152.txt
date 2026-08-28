@@ -1,0 +1,86 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+from __future__ import annotations
+
+from flask import Flask, jsonify, request
+
+from app.services import extract_xml_text
+
+app = Flask(__name__)
+
+
+@app.route("/ingest/xml", methods=["POST"])
+def ingest_xml():
+    upload = request.files.get("document")
+    xml_path = request.args.get("path")
+    if upload is None:
+        return jsonify(error="missing document"), 400
+    payload = upload.read()
+    texts = list(extract_xml_text(payload, xml_path=xml_path))
+    return jsonify(texts=texts), 200
+
+# === file: app/services.py ===
+from __future__ import annotations
+
+import re
+from typing import Iterator, Optional
+
+from app.xml_parser import stream_leaf_texts
+
+
+_DOCTYPE_RE = re.compile(rb"<!DOCTYPE", re.IGNORECASE)
+
+
+def _looks_safe(raw: bytes) -> bool:
+    """Naive guard: scan only the first 64 bytes for a DOCTYPE."""
+    return _DOCTYPE_RE.search(raw[:64]) is None
+
+
+def extract_xml_text(payload: bytes, xml_path: Optional[str] = None) -> Iterator[Optional[str]]:
+    if not _looks_safe(payload):
+        raise ValueError("rejected: doctype detected")
+    return stream_leaf_texts(payload, xml_path=xml_path)
+
+# === file: app/xml_parser.py ===
+from __future__ import annotations
+
+from io import BytesIO
+from typing import IO, Iterator, Optional, Union
+
+from lxml import etree
+
+
+def stream_leaf_texts(
+    file: Union[str, IO[bytes], bytes],
+    xml_path: Optional[str] = None,
+) -> Iterator[Optional[str]]:
+    """Stream text of leaf elements from an XML document."""
+    if isinstance(file, bytes):
+        file = BytesIO(file)
+    element_iterator = etree.iterparse(file, events=("start", "end"))
+    if xml_path is not None:
+        _, root = next(element_iterator)
+        selector = etree.XPath(xml_path)
+        element_iterator = (("end", el) for el in selector(root))
+    for event, element in element_iterator:
+        if event == "end" and element.text and element.text.strip():
+            yield element.text
+        element.clear()
+```
+
+分析：
+
+1. **输入点枚举与可达性**：本项目仅有两个外部输入点，均在 app/routes.py——L12 的 `request.files.get('document')`（上传的 XML 字节）与 L13 的 `request.args.get('path')`。前者经 L16 `upload.read()` 变为 payload，L17 调用 `extract_xml_text` 进入 services 层，再由 services.py L20 直达 xml_parser.py L16 的 `etree.iterparse`，**可达 sink**；后者沿同一调用链到达 xml_parser.py L19 的 `etree.XPath(xml_path)`，同样可达。
+
+2. **逐流防御验证（流1 主链）**：source=L1:line 12 → sink=L3:line 16。链上唯一防御是 services.py L9 定义、L12-L14 应用的 `_looks_safe`：这是针对字面量 `<!DOCTYPE` 的黑名单正则，且只扫描前 64 字节。攻击者只需在 XML 前部放置一段足够长的注释或空白（如 `<!--AAAA...-->`），将 DOCTYPE 推出 64 字节窗口即可绕过；该检查对 ENTITY 定义、编码变体、网络/文件 URI 均零覆盖。按规则，黑名单/正则过滤视为可绕过，**不构成有效防御**。
+
+3. **sink 本体核验**：xml_parser.py L16 调用 `etree.iterparse(file, ...)` 时未传入任何自定义 parser，未设置 `resolve_entities=False`、`no_network=True` 等 lxml 安全选项，默认解析器会解析 DTD 中的外部实体，与原单文件漏洞语义一致（CWE-611）。中间文件 services.py 表面做了"净化"，实为不完整过滤，属于典型的净化看似发生实则失效的中转层。
+
+4. **第二入口/替代通道核查**：全项目只有 `/ingest/xml` 一个路由，不存在其他路由或间接调用直接抵达 sink；但同一路由内的 `path` 查询参数构成第二条污点通道（routes.py L13 → services.py L20 → xml_parser.py L19 `etree.XPath`，XPath 注入风险）；此外 `stream_leaf_texts` 在 xml_parser.py L10 公开接受 `str` 文件名形参，一旦被其他模块复用即形成新的直达入口。这些佐证了攻击面的真实性而非孤立构造。
+
+5. **结论**：主链"上传字节 → iterparse"完整贯通且无有效防御，确认 CWE-611 成立；辅链"path → XPath"为附加通道。利用可导致本地任意文件读取（file:// 协议）、内网探测及实体爆炸 DoS，风险评级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611: Improper Restriction of XML External Entity Reference (XXE)", "risk_level": "High", "source": "L1:line 12: request.files.get('document') 返回的用户上传 XML 文件字节", "sink": "L3:line 16: etree.iterparse(file, ...) 以默认解析器解析不可信 XML, 未禁用外部实体解析", "explanation": "流1主链: routes.py L12-L16 将用户上传的 XML 原始字节传入 services.py L17 extract_xml_text, 经 L20 直达 xml_parser.py L16 的 etree.iterparse; 途中唯一防御是 services.py L9 与 L12-L14 的 _looks_safe, 属黑名单正则且只扫描前 64 字节, 攻击者用长注释或空白把 DOCTYPE 移出检测窗口即可绕过, 对实体定义与网络访问零覆盖, 不构成有效防御; 流2替代通道: routes.py L13 的 path 查询参数沿同一调用链到达 xml_parser.py L19 的 etree.XPath, 构成 XPath 注入这一第二污点通道; 第二入口核查: 全项目仅有 /ingest/xml 一个路由, 无其他路由或间接调用抵达 sink, 但同一路由内的 path 参数已是第二个输入通道, 且 stream_leaf_texts 在 xml_parser.py L10 公开接受任意文件名形参, 未来复用即成新入口; 根因: 调用链上没有任何位置构造 resolve_entities=False 或 no_network=True 的安全解析器, lxml 默认解析外部实体, 可导致本地文件读取与实体爆炸 DoS", "fix_suggestion": "line 16: 构造安全解析器并显式传入, 即 parser = etree.XMLParser(resolve_entities=False, no_network=True) 后改为 etree.iterparse(file, events=('start', 'end'), parser=parser), 同时对 xml_path 增加白名单校验"}
+```

@@ -1,0 +1,105 @@
+LANG: java
+```code
+# === file: src/main/java/com/example/report/web/DocumentUploadController.java ===
+package com.example.report.web;
+
+import com.example.report.core.XDocArchive;
+import com.example.report.service.PreprocessingService;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+@RestController
+public class DocumentUploadController {
+
+    private final PreprocessingService service = new PreprocessingService();
+
+    // SOURCE: 客户端上传的 OOXML/ODT 模板包, 字节内容与 entry 条目名全部可控
+    @PostMapping(value = "/reports/render", consumes = "multipart/form-data")
+    public String render(@RequestParam("file") MultipartFile file,
+                         @RequestParam(value = "entry", defaultValue = "word/document.xml") String entryName)
+            throws Exception {
+        XDocArchive archive = XDocArchive.readArchive(file.getInputStream());
+        return service.preprocessEntry(archive, entryName);
+    }
+}
+# === file: src/main/java/com/example/report/service/PreprocessingService.java ===
+package com.example.report.service;
+
+import com.example.report.core.XDocArchive;
+import com.example.report.document.preprocessor.sax.SAXXDocPreprocessor;
+import java.io.InputStream;
+import java.io.StringWriter;
+
+public class PreprocessingService {
+
+    // 看似净化: 仅拉黑 .svg 后缀, 且只扫描流前 256 字节中的字面量 DOCTYPE
+    private boolean looksSafe(String entryName, InputStream in) throws Exception {
+        if (entryName.endsWith(".svg")) {
+            return false;
+        }
+        in.mark(4096);
+        byte[] head = new byte[256];
+        int n = in.read(head);
+        in.reset();
+        String headText = new String(head, 0, Math.max(n, 0), "UTF-8");
+        return !headText.contains("DOCTYPE");
+    }
+
+    public String preprocessEntry(XDocArchive archive, String entryName) throws Exception {
+        InputStream entryStream = archive.getEntryInputStream(entryName); // 污点透传
+        if (!looksSafe(entryName, entryStream)) {
+            throw new IllegalArgumentException("blocked entry");
+        }
+        StringWriter out = new StringWriter();
+        new SAXXDocPreprocessor().preprocess(entryName, entryStream, out, null, null, null);
+        return out.toString();
+    }
+}
+# === file: src/main/java/com/example/report/document/preprocessor/sax/SAXXDocPreprocessor.java ===
+package com.example.report.document.preprocessor.sax;
+
+import com.example.report.template.formatter.FieldsMetadata;
+import com.example.report.template.formatter.IDocumentFormatter;
+import java.io.*;
+import java.util.Map;
+import org.xml.sax.*;
+import org.xml.sax.helpers.XMLReaderFactory;
+
+public class SAXXDocPreprocessor {
+
+    public boolean preprocess(String entryName, InputStream reader, Writer writer,
+                              FieldsMetadata fieldsMetadata, IDocumentFormatter formatter,
+                              Map<String, Object> sharedContext) throws IOException {
+        try {
+            // SINK: createXMLReader 默认允许 DTD 与外部实体, 未设置任何限制 feature
+            XMLReader xmlReader = XMLReaderFactory.createXMLReader();
+            BufferedDocumentContentHandler<?> handler =
+                    new BufferedDocumentContentHandler<>(entryName, fieldsMetadata, formatter, sharedContext);
+            xmlReader.setContentHandler(handler);
+            xmlReader.parse(new InputSource(reader));
+            BufferedDocument document = handler.getBufferedDocument();
+            if (document != null) {
+                document.save(writer);
+                return true;
+            }
+            return false;
+        } catch (SAXException e) {
+            throw new IOException(e);
+        }
+    }
+}
+```
+
+**分析**
+
+1. **外部输入点枚举与可达性**：输入点A为 DocumentUploadController.java:15-16 的 multipart 参数 `file`（整个模板包字节）与 `entry`（zip 条目名）；第 18 行 `XDocArchive.readArchive` 解包后，由 PreprocessingService.java:24 `getEntryInputStream(entryName)` 取出任意条目流，并在 PreprocessingService.java:29 原样传入 `preprocess`，直达 SAXXDocPreprocessor.java:21 的 `xmlReader.parse`，可达性成立。输入点B为 `entryName` 本身，作为独立外部参数决定解包哪个条目，与 A 同源不同参。
+
+2. **逐流防御核查**：主链（A→sink）唯一拦截点是 PreprocessingService.java:11-21 的 `looksSafe`（在第 25 行调用），其性质为后缀黑名单（.svg）加仅前 256 字节的字面量子串匹配，属可绕过的字符串过滤——攻击者可在 XML prolog 用超长注释把 DOCTYPE 推到 256 字节之外（XML 允许注释先于 DOCTYPE），或将文档改为 UTF-16 编码使 ASCII 字节扫描失效，且 .svg 后缀黑名单与实体解析无关，故不构成有效防御；sink 侧 SAXXDocPreprocessor.java:17 使用 `XMLReaderFactory.createXMLReader()` 默认配置，未设置 disallow-doctype-decl、external-general-entities、external-parameter-entities 任一 feature，也未安装 EntityResolver/SecurityManager，即 sink 处零防护。
+
+3. **第二入口与替代通道**：项目中不存在第二个 HTTP 路由或其他调用方，但同一路由的 `entry` 参数构成第二污染通道（可指定任意 zip 条目如 customXml/item.xml，绕过针对固定条目名的假设）；替代外传通道方面，PreprocessingService.java:30 将解析结果回写并由 DocumentUploadController.java:19 返回响应体，形成 in-band 文件读取回显，实体 URL 亦可指向 http/dns 实现 OOB 外带，二者均支撑可利用性。
+
+4. **结论**：主链 L1:15→L1:18→L2:24→L2:29→L3:21 全程无有效防御，判定 CWE-611 成立，可导致任意文件读取与 SSRF。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611: Improper Restriction of XML External Entity Reference (XXE)", "risk_level": "High", "source": "L1:line 15: DocumentUploadController.render 接收的 MultipartFile file 上传档案字节流与 entry 条目名请求参数", "sink": "L3:line 21: SAXXDocPreprocessor.preprocess 中 xmlReader.parse(new InputSource(reader)) 解析外部实体", "explanation": "数据流1(主链): L1:15-16 接收上传档案与条目名, L1:18 readArchive 解包, L2:24 getEntryInputStream 取出攻击者完全可控的 XML 条目流, L2:29 原样透传, L3:21 xmlReader.parse 触发外部实体解析, 污点全程未中断; 防御核查1: L2:11-21 looksSafe 仅为 .svg 后缀黑名单加前 256 字节内 DOCTYPE 字面子串扫描, 属可绕过字符串过滤——超长注释可将 DOCTYPE 移出扫描窗口或改用 UTF-16 编码使 ASCII 匹配失效, 后缀黑名单与实体解析无关, 不构成有效防御; 防御核查2: L3:17 createXMLReader 未设置 disallow-doctype-decl/external-general-entities/external-parameter-entities 任一 feature 也未配置 EntityResolver 或 SecurityManager, sink 处零防护; 第二入口核查: 无其他 HTTP 路由, 但同一路由的 entry 参数构成第二污染通道可选择任意 zip 条目, 且 L2:30 至 L1:19 的响应回显提供 in-band 文件读取通道, OOB(DNS/HTTP)外带同样可行; 综合判定 CWE-611 成立, 可致任意文件读取与 SSRF", "fix_suggestion": "line 17: 在 SAXXDocPreprocessor.java 第 17 行创建 XMLReader 后立即调用 xmlReader.setFeature(http://apache.org/xml/features/disallow-doctype-decl,true) 并同时关闭 external-general-entities 与 external-parameter-entities, 必要时再设置拒绝解析的空 EntityResolver"}
+```

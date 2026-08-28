@@ -1,0 +1,27 @@
+## 漏洞分析报告（Appointments.php · 标注 CWE-639）
+
+**步骤 1｜用户可控输入点枚举与追踪**
+- 第 67 行路由参数 `$appointment_hash` → 第 76 行 `redirect('booking/' . ...)`:目标为固定前缀拼接,且第 72 行以 `/^[a-fA-F0-9]{32}$/` 做 32 位十六进制的白名单式精确校验,无注入面;
+- 第 96–102 行 search 的 keyword/order_by/limit/offset → 第 104 行传入模型:order_by 为自由字符串,但其真实 sink 位于模型层、不在本文件内,无法在本文件确证注入,不作为结论依据;
+- 第 153 行 store 的 appointment JSON → 第 155 行 `only()` 字段白名单过滤 → 第 159 行 save:纯新建路径,无跨对象引用;
+- 第 188 行 find 的 `request('appointment_id')` → 第 195 行访问检查 → 第 197 行模型查询 → 第 199 行全量返回;
+- 第 219 行 update 的 appointment JSON(含 id)→ 第 226–228 行条件检查 → 第 234 行 save;
+- 第 259 行 destroy 的 `request('appointment_id')` → 第 266 行检查 → 第 270 行 delete。
+find/update/destroy 三条流的共同授权节点是第 285 行 `check_appointment_access`。
+
+**步骤 2｜防御有效性逐流验证**
+- `cannot(...)`(第 182/213/253 行)只判断角色是否持有 PRIV_APPOINTMENTS 权限位,属模块级粗粒度 RBAC,无对象级归属判断;
+- 第 191/262 行 `FILTER_VALIDATE_INT` 与第 186/257 行 numeric 校验只约束输入形态,与授权无关;
+- 决定性的对象级控制是第 285–302 行:仅第 292–297 行处理 SECRETARY(服务商不受支持则 403)、第 299–301 行处理 PROVIDER(非本人则 403)。该角色白名单只覆盖两类角色,customer 等其余角色两个条件均不命中、函数正常返回——用户自选的 appointment_id 未经任何归属校验直达 sink。对照第 110–118 行与第 121–131 行 search 内联实现的 provider/secretary 隔离,可证该隔离是本模块既定安全边界,而直连端点对边界外角色默认放行(fail-open),防御未完整覆盖该数据流。
+
+**步骤 3｜第二入口与替代通道**
+- 同一缺陷有三条通道:find(188→197→199,越权读取 notes/meeting_link/客户关联等敏感字段)、destroy(259→270,越权删除)、update(219→234,越权修改,且第 26–39 行字段白名单允许改写 id_users_provider/id_users_customer);遍历数字 id 可批量操作任意预约;
+- 第 104→133 行 search 对同样的未枚举角色亦不过滤,构成批量读取替代通道,说明缺口是系统性的;
+- store 为新建对象路径,不引用既有对象,不在本漏洞链内。
+
+**步骤 4｜结论**
+持有所述模块权限位的低权认证角色(如 customer 类角色,系统角色权限可配置)可通过自控主键 appointment_id 读取/修改/删除任意预约,构成 CWE-639 授权绕过。风险等级:High(需认证,但影响机密性与完整性且可批量遍历)。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key (IDOR)", "risk_level": "High", "source": "line 188: $appointment_id = request('appointment_id')（同类来源 line 219 的 appointment JSON 与 line 259 的 request('appointment_id')）", "sink": "line 197: appointments_model->find($appointment_id) 经 line 199 json_response 返回任意预约；同型 sink line 270 delete 与 line 234 save", "explanation": "用户可控 appointment_id -> cannot() 仅模块级 RBAC(line 182) -> FILTER_VALIDATE_INT 仅限格式(line 191) -> check_appointment_access(line 285) 只对 SECRETARY(line 292) 与 PROVIDER(line 299) 两类角色做对象级隔离，customer 等未枚举角色两条件均不命中而直接放行 -> 自选 id 直达模型查询/删除/保存 -> 越权读写删任意预约；对照 search 在 line 110/121 的内联隔离可知 provider 隔离是既定安全边界，直连端点对该边界外角色默认放行", "fix_suggestion": "line 299: 在 check_appointment_access 中改为默认拒绝——先放行 admin，再按角色白名单校验归属（customer 校验 id_users_customer 是否本人），未列出的角色一律 abort(403)"}
+```

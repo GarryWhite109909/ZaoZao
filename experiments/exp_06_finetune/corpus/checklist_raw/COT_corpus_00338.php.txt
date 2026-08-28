@@ -1,0 +1,28 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点并追踪流向**
+
+- 输入点 A：外部传入的 JWT 令牌本身。第 6-10 行 `__construct($jwt)` 将 `$jwt->header`、`$jwt->signature`、`$jwt->raw` 原样复制进对象属性，其中 `header['alg']`（第 7 行）完全由令牌攻击者控制，`$this->raw`（第 10 行）是被验签的攻击者构造串。
+- 输入点 B：第 48 行 `verify($public_key_or_secret, $alg = null)` 的 `$alg` 参数由调用方决定，默认为 `null`。
+- 输入点 C：`$public_key_or_secret` 来自应用配置（通常是 PEM 公钥字符串），正常场景下攻击者不可控，但其内容（公钥）是公开可知的。
+- 追踪结果：A 直达 `_verify` 内的算法选择点（第 124-128 行）与最终验签计算点（第 132 行）；B 决定 A 是否生效。
+
+**步骤 2｜逐条验证 source→sink 数据流的防御有效性**
+
+- 流 1（核心漏洞流）：攻击者构造 `header.alg='HS256'` 的令牌，并用已知的 RSA 公钥作为 HMAC 密钥自行签名 -> 第 7 行复制入 `$this->header` -> 应用按惯例调用第 48 行 `verify($公钥)` 不传 `$alg` -> 第 124 行 `!$expected_alg` 成立 -> 第 126 行 `$expected_alg = $this->header['alg']` 直接采信攻击者指定的算法 -> 第 128 行 switch 命中 HS\* 分支 -> 第 132 行执行 `hash_hmac($this->digest(), $signature_base_string, $public_key_or_secret, true)`，把应用的**非对称公钥**当作 HMAC 共享密钥重算并与攻击者签名做严格比较 -> 公钥人人可得，攻击者必然能算出一致的 HMAC -> 签名验证被完全绕过。
+- 防御核查：第 72-91 行 `digest()` 虽是白名单，但同时放行 HS\*/RS\*/ES\*/PS\* 整个家族，且从不校验「算法 ↔ 密钥类型」一致性（非对称密钥配 HS\* 未被拦截），属于过宽白名单，无法阻断混淆；全类中不存在任何将算法钉死到密钥类型的检查，故该流**无有效防御覆盖**。
+- 流 2（对照）：若调用方在第 48 行显式传入 `$alg='RS256'`，第 124 行条件不成立，走第 136 行 RSA 验签路径，可阻断混淆——但这依赖调用方自律，库的默认值 `null` 使该防线形同虚设。
+
+**步骤 3｜检查第二入口/替代通道**
+
+- `sign()`（第 32-46 行）同样按第 99 行 `header['alg']` 分发并在第 103 行做 HMAC，但其密钥是应用私钥，攻击者不可控，不构成伪造入口。
+- 若把 `$public_key_or_secret` 传成 RSA 对象，第 132 行 `hash_hmac` 收到对象会失败；但典型用法传 PEM 字符串即可利用，替代通道成立。PS\*→HS\* 混淆同理。
+- 附带证据：第 65-66 行 `digest()` 读的是 `header['alg']` 而 switch 用 `$expected_alg`，即便显式指定算法，摘要仍取自攻击者头部，说明算法来源整体不可信。
+
+**步骤 4｜结论**
+
+存在 CWE-327 算法混淆（key confusion / alg substitution）：`_verify` 在未显式指定算法时回退信任令牌自带的 `alg`，且未将算法与密钥类型绑定，攻击者用公开的 RSA 公钥充当 HMAC 密钥即可伪造合法签名，整体绕过 `verify()` 的签名校验（认证/授权前提被击穿）。风险等级：High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-327 算法混淆（JWS alg 替换/密钥混淆致签名验证绕过）", "risk_level": "High", "source": "line 7: $jwt->header（攻击者构造的 JWT 头，alg 可控）；line 48: verify 的 $alg 参数默认 null", "sink": "line 132: hash_hmac(...)（以应用非对称公钥作 HMAC 密钥完成验签比较）；算法选择点 line 126/128", "explanation": "攻击者构造 header.alg 为 HS256 并以 RSA 公钥为 HMAC 密钥自签的令牌 -> line 7 复制入 $this->header -> line 48 verify 未显式传 $alg（默认 null）-> line 124 !$expected_alg 成立 -> line 126 回退采用攻击者可控的 header[alg] -> line 128 switch 命中 HS* 分支 -> line 132 以应用 RSA 公钥作 HMAC 密钥重算并严格比较 -> 攻击者持公开公钥即可算出一致签名 -> 验证整体绕过；line 72-91 digest() 白名单同时放行 HS 与 RS/PS 家族且不绑定密钥类型，属过宽白名单，无有效防御", "fix_suggestion": "line 126: 删除回退到 $this->header['alg'] 的赋值，改为在 $expected_alg 为空时抛出 JOSE_Exception_UnexpectedAlgorithm 强制调用方显式指定算法，并另行校验算法与密钥类型匹配（非对称密钥一律拒绝 HS*）"}
+```

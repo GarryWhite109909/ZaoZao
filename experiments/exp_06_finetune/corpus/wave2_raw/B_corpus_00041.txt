@@ -1,0 +1,111 @@
+LANG: go
+```code
+# === file: iceberg/routes.go ===
+package iceberg
+
+import (
+	"net/http"
+
+	"github.com/gorilla/mux"
+)
+
+// Server implements the Iceberg REST Catalog API.
+type Server struct {
+	tablesManager *TablesManager
+}
+
+func NewServer(tm *TablesManager) *Server { return &Server{tablesManager: tm} }
+
+// RegisterRoutes registers Iceberg REST Catalog routes.
+func (s *Server) RegisterRoutes(router *mux.Router) {
+	router.HandleFunc("/v1/namespaces/{namespace}/tables/{table}", s.Auth(s.handleLoadTable)).Methods(http.MethodGet)
+	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables/{table}", s.Auth(s.handleLoadTable)).Methods(http.MethodGet)
+}
+
+// Auth wraps a handler; the real authentication middleware lives elsewhere.
+func (s *Server) Auth(h http.HandlerFunc) http.HandlerFunc { return h }
+
+// handleLoadTable forwards caller-controlled path variables to storage.
+func (s *Server) handleLoadTable(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	namespace, table := vars['namespace'], vars['table']
+	meta, err := s.tablesManager.LoadTable(namespace, table)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Write(meta)
+}
+
+# === file: iceberg/sanitize.go ===
+package iceberg
+
+import "strings"
+
+// SanitizeNamespace normalizes a caller-supplied namespace identifier
+// before it is joined into a storage path below baseDir.
+func SanitizeNamespace(ns string) string {
+	ns = strings.TrimSpace(ns)
+	ns = strings.TrimPrefix(ns, '/')
+	ns = strings.ReplaceAll(ns, '\\', '/')
+	return ns
+}
+
+# === file: iceberg/manager.go ===
+package iceberg
+
+import (
+	"context"
+	"path/filepath"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+)
+
+// FilerClient provides access to the filer for storage operations.
+type FilerClient interface {
+	WithFilerClient(streamingMode bool, fn func(client filer_pb.SeaweedFilerClient) error) error
+}
+
+// TablesManager performs catalog storage operations through the filer.
+type TablesManager struct {
+	filerClient FilerClient
+	baseDir     string
+}
+
+// LoadTable resolves baseDir/namespace/table via the filer.
+func (m *TablesManager) LoadTable(namespace, table string) ([]byte, error) {
+	dir := filepath.Join(m.baseDir, SanitizeNamespace(namespace))
+	var meta []byte
+	err := m.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		resp, err := client.LookupDirectoryEntry(context.Background(), &filer_pb.LookupDirectoryEntryRequest{
+			Directory: dir,
+			Name:      table,
+		})
+		if err != nil {
+			return err
+		}
+		meta = []byte(resp.Entry.Name)
+		return nil
+	})
+	return meta, err
+}
+```
+
+【跨文件污点分析】
+
+1. **外部输入点枚举与可达性**：iceberg/routes.go L18-L19 注册了两条 GET 路由，路径变量 `{namespace}`/`{table}`（以及 `{prefix}`）均直接取自原始 HTTP URL；gorilla/mux 默认基于解码后路径提取 Vars，故 `%2e%2e%2f` 类编码载荷到达 L27-L28 时已是明文 `..`。两条路由汇聚于同一 handler handleLoadTable（routes.go L26-L35），污点在 L29 无条件传入 `tablesManager.LoadTable` —— source 到 sink 可达性成立。
+
+2. **逐条数据流的防御验证**：
+   - 流 A（namespace）：routes.go L28 → LoadTable 形参 → manager.go L23 调用 SanitizeNamespace。但 sanitize.go L8-L10 仅做 TrimSpace、TrimPrefix(`/`)、ReplaceAll(`\`,`/`) 三种字符串规整，属典型的字符串替换型'伪净化'，对 `..` 段零覆盖，且反斜杠转换反而把 `\..\` 规范成 `/../` 更利于攻击者——无效防御。
+   - 流 B（table）：routes.go L28 直接作为第二实参传递，在 manager.go L28 进入 `Name:` 字段，全程未经任何函数处理，完全绕开 sanitize.go。
+   - manager.go L23 的 `filepath.Join` 只做词法 Clean：`Join('/data/catalog','../secrets') == '/data/secrets'`，恰好证明其会取消基目录前缀而非限制边界；全链无任何 HasPrefix/Containment 校验。
+
+3. **sink 确认**：manager.go L26-L28 将攻击者可控的 `Directory`（含 `..`）交给 filer 的 `LookupDirectoryEntry`，filer 按目录树逐级解析该相对路径，可越出 baseDir 读取/探测任意目录条目，语义为 CWE-22 路径遍历。
+
+4. **第二入口与替代通道**：存在——routes.go L19 的带前缀路由 `/v1/{prefix}/namespaces/...` 是独立注册的第二入口，与 L18 汇聚同一 handler、同一 sink；同时 `table` 参数构成绕过 SanitizeNamespace 的第二参数通道（该函数完全不覆盖它）；routes.go L23 的 Auth 为恒等透传占位，即使接入真实认证也只做身份判断、不约束路径取值，不能阻断污点。
+
+5. **综合结论**：链上三处看似防御的环节（Auth 包装、SanitizeNamespace 字符串清洗、filepath.Join 词法清理）均非完整防御，黑名单缺失 + 无边界断言，判定存在可利用的跨文件路径遍历漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径遍历（跨文件：HTTP 路径变量 → 伪净化 → filer 目录拼接）", "risk_level": "High", "source": "L1:line 28: mux.Vars 提取的 namespace/table 路径变量（外部 HTTP 输入）", "sink": "L3:line 27: filer_pb.LookupDirectoryEntry 的 Directory 字段（经 filepath.Join 拼接后传入）", "explanation": "流A：routes.go L18/L19 两条路由的路径变量经 handleLoadTable（L27-L29）直传 LoadTable，无入参校验；流B：sanitize.go L7-L12 的 SanitizeNamespace 仅 TrimSpace/TrimPrefix/ReplaceAll，属字符串替换型伪净化，不过滤 .. 段且反斜杠替换反而规范化出 ../，可绕过；流C：manager.go L23 filepath.Join 只做词法 Clean，Join(baseDir,'..') 会取消基目录前缀导致逃逸，链上无 HasPrefix 边界校验；流D：table 参数在 manager.go L28 直接进入 Name 字段，完全绕过 sanitize 层，构成第二参数通道；第二入口：routes.go L19 前缀路由独立注册但汇聚同一 handler 与同一 sink，Auth（routes.go L23）为恒等透传不构成路径约束；综上调用链无完整防御，攻击者以 /v1/namespaces/..%2f..%2fx/tables/y 类请求即可越界访问 filer 条目", "fix_suggestion": "line 23: 在拼接后增加边界断言——若 strings.Contains(namespace, '..') 或 !strings.HasPrefix(filepath.Join(m.baseDir, namespace), filepath.Clean(m.baseDir)+string(os.PathSeparator)) 则拒绝请求"}
+```

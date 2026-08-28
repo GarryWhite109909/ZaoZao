@@ -1,0 +1,31 @@
+## 漏洞分析报告
+
+### 步骤 1：枚举用户可控输入点并追踪流向
+
+- **第 70 行** `public function get($version, $page, $data = [])`：`$version` 与 `$page` 来自文档路由参数（如 `/docs/{version}/{page}`），完全由用户控制。
+- **第 47 行** `public function getIndex($version)`：同样接收用户可控的 `$version`。
+- **第 100 行** `request()->getRequestUri()`：请求 URI 亦为用户可控输入。
+
+追踪主数据流：第 72 行闭包捕获 `$version/$page` → **第 73 行**拼接进文件路径 → 第 75 行存在性判断 → **第 76 行**读出文件内容 → **第 78 行**经 `replaceLinks` 处理 → **第 80 行**传入 `renderBlade`，到达模板引擎危险 sink。
+
+### 步骤 2：逐条验证 source→sink 数据流的防御有效性
+
+- **流 A（版本占位符注入）**：**第 96 行** `str_replace('{{version}}', $version, $content)` 将原始 `$version` 直接替换进即将被编译的模板源码。`str_replace` 在此处是“向模板注入值”而非转义或过滤，随后**第 80 行** `renderBlade` 把含攻击者内容的字符串交给 Blade 编译执行。全程无任何转义、白名单或语法中和覆盖此流——若文档中含 `{{version}}` 占位符（LaRecipe 默认文档即包含），攻击者提交形如 `@php system('id') @endphp` 的 version 即实现 RCE。
+- **流 B（路径穿越 + 模板注入）**：**第 73 行** `'/'.$version.'/'.$page.'.md'` 未做任何规范化、未禁止 `..` 与斜杠，可穿越至服务器任意目录读取任意 `.md` 文件，其内容同样在**第 80 行**作为 Blade 模板渲染。攻击者只要能在任意可读路径落盘 `.md` 文件（如上传功能），即可完全控制模板源码导致 RCE。无 `realpath`/目录前缀校验。
+- **流 C（URI 注入）**：**第 100 行**将 `getRequestUri()` 替换进内容，在 `get()` 中该处理发生在**第 78 行**、先于**第 80 行**渲染，构成第二条进入模板引擎的辅助通道。
+
+三条流均无有效防御，黑名单/简单替换类手段在本文件中根本不存在，更谈不上覆盖。
+
+### 步骤 3：检查第二入口与替代通道
+
+- `getIndex`（**第 47–55 行**）：**第 55 行**同样调用 `replaceLinks` 注入可控 `$version`，是平行入口。
+- `sectionExists`（**第 112–116 行**）：**第 115 行**使用相同的未过滤路径拼接，虽只做 `exists()` 判断，仍可作为路径穿越探测 oracle。
+- **第 59、84 行**缓存键直接使用原始 `$version/$page`，可被用于缓存投毒放大影响。替代通道充分存在，漏洞不可通过单点封堵规避。
+
+### 步骤 4：结论
+
+用户可控的 `$version` 经**第 96 行** `str_replace` 进入模板源码、`$version/$page` 经**第 73 行**穿越路径控制被读取的模板文件，最终均在**第 80 行** `renderBlade` 处以 Blade 引擎编译执行，构成 CWE-1336 服务端模板注入（SSTI），可实现任意命令执行与环境变量读取，与背景描述的影响一致。风险等级：Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Server-Side Template Injection (SSTI)", "risk_level": "Critical", "source": "line 70: get($version, $page, ...) 用户可控路由参数", "sink": "line 80: $this->renderBlade($parsedContent, $data)", "explanation": "$version/$page -> line 73 拼接路径且无穿越校验可读取任意 .md -> line 96 str_replace 将原始 $version 替换进模板源码 -> line 80 renderBlade 以 Blade 引擎编译执行 -> 攻击者注入 Blade 指令实现 RCE", "fix_suggestion": "line 70: 函数入口对 $version 与 $page 做白名单校验（preg_match('/^[A-Za-z0-9._-]+$/', $version) 且显式拒绝包含 '..' 的值），不合法立即 abort(404)"}
+```

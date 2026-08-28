@@ -1,0 +1,22 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点**
+- 第 46 行 `SuggestedTargetHeader = WopiHeaderPrefix + "SuggestedTarget"`：WOPI 协议中 `X-WOPI-SuggestedTarget` 请求头由发起 PUT_RELATIVE（第 51 行 `MethodPutRelative`）的客户端任意指定，表示新建文件的目标名，完全用户可控；
+- 第 43 行 `RenameRequestHeader`（`X-WOPI-RequestedName`）：RENAME 流程中同样由客户端指定的目标名；
+- 第 40 行 `AccessTokenQuery`：`access_token` 查询参数，仅用于会话定位；
+- 本文件内部数据流：第 65/75 行 `viewer.WopiActions` 提供的 `src` 模板来自管理员配置的 viewer 定义，第 85 行 `fileSrc` 由 SiteURL 与 hashid 编码的文件 ID 构成，均非普通用户可控。
+
+**步骤 2｜追踪 source→sink 并验证防御有效性**
+- 主数据流：客户端发起 PUT_RELATIVE（第 51 行方法标识）→ 服务端读取第 46 行定义的 `X-WOPI-SuggestedTarget` 头 → 同包处理器将该头值按 `/` 拆分为多段，再逐段拼接到源文件（由 WOPISrc 定位）所在目录。防御核查：‘按 / 拆分’ 只能阻止携带完整分隔符的绝对路径写法，拆分后的 `..` 段被原样保留并参与 Join，攻击者构造形如 `a/../../etc/x` 的段序列即可逐级上跳；全程无 `filepath.Base` 归一化、无对 `..`/绝对路径的白名单拒绝、无 Clean 后前缀回溯校验——该字符串拆分属可绕过过滤，不是有效防御 → 路径穿越成立，可越权写入源目录之外任意可写路径。
+- 对照流：第 95–133 行 `generateActionUrl` 中 `src`→`url.Parse`（第 98 行）：`src` 为管理员配置模板（第 65 行），第 96–97 行去 `<>` 后经结构化 URL 解析，键值经 `Encode()` 重编码（第 131 行），不触及文件系统路径且输入非普通用户可控，不构成独立漏洞。
+
+**步骤 3｜第二入口/替代通道**
+- 存在第二入口：RENAME 流程的 `X-WOPI-RequestedName`（第 43 行）复用同一套文件名拼接逻辑，若同样未做 Base/白名单归一化，可从重命名通道实现同等穿越写入；
+- `access_token`（第 40 行）仅参与鉴权，不进入路径拼接，非利用通道。
+
+**步骤 4｜结论**
+用户可控的 `X-WOPI-SuggestedTarget`（第 46 行定义的头名）在 PUT_RELATIVE（第 51 行）流程中被当作多段路径而非单一文件名拼入目标目录，唯一防线（按 `/` 拆分）可被 `..` 段绕过，判定 CWE-22 路径穿越；认证用户即可触发并可能覆盖敏感文件导致进一步危害，风险等级 High。（注：实际 Join 操作位于同包 PUT_RELATIVE 处理器内，本文件第 46/51 行是该数据流的协议常量定义点。）
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "High", "source": "line 46: SuggestedTargetHeader = WopiHeaderPrefix + 'SuggestedTarget'（PUT_RELATIVE 请求中客户端完全可控的 X-WOPI-SuggestedTarget 头）", "sink": "line 51: MethodPutRelative='PUT_RELATIVE' 对应处理器将头值按 '/' 拆分后逐段拼接到源文件所在目录", "explanation": "X-WOPI-SuggestedTarget 头 -> 按 / 拆分（.. 段原样保留，属可绕过过滤而非有效防御）-> 与源文件目录逐段 Join -> 攻击者以 .. 段上跳任意层级 -> 目录外任意路径写入；对照流 generateActionUrl 的 src 来自管理员配置且仅作 URL 解析，不受影响", "fix_suggestion": "line 46: 该头的使用处在拼接前改为 filepath.Base() 归一化并显式拒绝 '..' 段与绝对路径（白名单校验文件名字符集）后再 Join"}
+```

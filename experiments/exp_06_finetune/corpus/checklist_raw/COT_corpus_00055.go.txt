@@ -1,0 +1,25 @@
+## 漏洞分析报告
+
+**第 1 步｜枚举用户可控输入点并追踪流向**
+- `subtitlesHandler`：line 35 `path`、line 36 `source`、line 37 `name`、line 38 `embedded` 全部来自 `r.URL.Query()`，均为用户可控。其中 `path`/`source` 进入 line 44 鉴权与 line 54 索引解析；`name` 在 line 40 仅做非空校验后直达 line 63 文件读取 sink，并在 line 101 通过 `http.ServeContent` 原样回显。
+- `metadataHandler`：line 119-120 `path`/`source` 传入 line 122 `files.FileInfoFaster`，由库内部按用户 scope 解析。
+- `publicMetadataHandler`：line 155 `path` 仅用于 line 176 展示字段回填，真实文件操作使用 line 162 服务端持有的 `d.IndexPath`。
+- `lyricsHandler`：line 193-194 `path`/`source` 先经 line 206 `GetRealPath` 再到 line 210 `ExtractLyrics`。
+- `publicLyricsHandler`：直接使用 line 236 的 `d.IndexPath`。
+
+**第 2 步｜逐条验证 source→sink 数据流的防御有效性**
+- 流 A：`path`(line 35) → `idx.GetRealPath(userscope, path)`(line 54)。该函数基于索引树把虚拟路径解析为真实路径，越界路径不存在于索引中即返回 404（line 55-56），此流有有效约束。
+- 流 B：`name`(line 37) → `filepath.Join(parentDir, name)`(line 63) → `utils.GetSubtitleSidecarContent`。`name` **完全未经过** `GetRealPath`、白名单或任何清理；line 44 `GetScopeForSourceName` 只校验 source 名称到用户 scope 的映射，与 `name` 无关；`filepath.Join` 仅做词法 Clean，会把 `../` 归一化并允许跳出 `parentDir`，不构成根目录包含检查。防御缺失，流 B 可控直达文件读取 sink。
+
+**第 3 步｜分支对照**
+`embedded=true` 分支中，`name` 仅在 line 80-85 与检测到的字幕轨道名做全等比较，作为查找键而不参与路径拼接，该分支安全；但 line 38 显示 `embedded` 默认 false，默认流量恰好落入存在漏洞的外挂字幕分支。
+
+**第 4 步｜第二入口/替代通道排查**
+逐一核查其余四个 handler：`metadataHandler`(line 118)、`publicMetadataHandler`(line 151)、`lyricsHandler`(line 192)、`publicLyricsHandler`(line 227) 的文件操作均经索引解析或使用服务端 `d.IndexPath`，未见同类绕过；唯一未设防通道是 `subtitlesHandler` 的 `name` 参数。
+
+**第 5 步｜结论**
+任一已认证用户请求 `/api/media/subtitles?path=<合法视频路径>&name=../../../../etc/passwd&embedded=false`，line 63 会拼出源目录之外的文件系统路径，`GetSubtitleSidecarContent` 读取其内容并于 line 101 原样返回，构成路径遍历/任意文件读取（可进一步读取配置、数据库等敏感文件）。对应 **CWE-22**，风险等级 **High**。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal（任意文件读取）", "risk_level": "High", "source": "line 37: name := r.URL.Query().Get(`name`)", "sink": "line 63: utils.GetSubtitleSidecarContent(filepath.Join(parentDir, name))", "explanation": "name(line 37 用户可控) -> line 40 仅非空校验 -> 未经过 line 54 GetRealPath 的索引范围约束 -> line 63 与 parentDir 拼接时 filepath.Join 仅做词法清洗、无根目录包含检查 -> GetSubtitleSidecarContent 读取源目录之外的任意文件 -> line 101 http.ServeContent 将内容原样回显 -> 路径遍历任意文件读取", "fix_suggestion": "line 63: 拼接前对 name 归一化并拒绝越界，改为 filepath.Join(parentDir, filepath.Base(name))，同时校验 Base 结果不含 .. 且不等于空"}
+```

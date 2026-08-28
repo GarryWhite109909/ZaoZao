@@ -1,0 +1,25 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点并追踪数据流**
+
+本文件的用户可控输入点有两处：
+- 第 73 行 `async_upload_backup` 的 `backup: AgentBackup` 参数：上传备份时其元数据（含备份文件名，第 15 行从 `.util` 导入的 `suggested_filename` 即从中提取文件名）由调用方控制；
+- 第 88 行 `async_get_backup`、第 127 行 `async_delete_backup` 的 `backup_id` 参数。
+
+追踪主数据流：第 73 行 `backup` → 第 78 行 `self.get_new_backup_path(backup)` → 第 125 行 `return self._backup_dir / suggested_filename(backup)` 构造出落盘目标路径，并在第 78 行注册进 `self._backups`，作为后续写入上传流的最终位置。
+
+**步骤 2｜验证防御有效性**
+
+第 125 行使用 `Path.__truediv__` 直接将 `suggested_filename(backup)` 的返回值拼接到第 39 行初始化的 `self._backup_dir` 之后。Python 的 `/` 运算符既不会中和 `..` 分量（OS 打开文件时会解析从而逃逸备份目录），且当右侧是绝对路径时整个前缀会被替换（`Path('/x/backups') / '/etc/cron.d/evil'` 直接得到 `/etc/cron.d/evil`）。通读全文件：无字符白名单、无 `resolve()` + `is_relative_to` 目录边界校验、无取 basename 剥离目录分量的处理。该条 source→sink 流没有任何有效防御覆盖。
+
+**步骤 3｜检查第二入口/替代通道**
+
+存在替代通道：第 78 行注册的被污染路径会被删除接口复用——第 132 行 `get_backup_path` 从 `self._backups` 取出该路径（第 119 行直接返回字典中存储的 Path），第 133 行 `backup_path.unlink` 执行删除，构成任意文件删除原语。而 `_read_backups`（第 53 行）仅在 `_backup_dir` 内 `glob('*.tar')`，该通道安全；`async_get_backup` 只读取已注册元数据，不构成额外写入口。
+
+**步骤 4｜结论**
+
+攻击者在上传备份时构造恶意文件名元数据（含 `../` 序列或绝对路径）→ 第 125 行无校验拼接生成越界路径 → 该路径被注册为备份落盘位置，实现向主机任意目录写文件（与背景描述一致）；同时可经第 132–133 行删除任意文件。判定为 CWE-22 路径遍历，写原语可达任意目录，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "Critical", "source": "line 73: async_upload_backup 的 backup 参数（攻击者可控的备份文件名元数据）", "sink": "line 125: return self._backup_dir / suggested_filename(backup)", "explanation": "line 73 backup 元数据中的文件名 -> line 78 get_new_backup_path -> line 125 用 Path / 运算符直接拼接 suggested_filename 返回值，全流程无白名单、无 resolve 后目录边界校验、未剥离目录分量，.. 或绝对路径均可逃逸 backups 目录 -> line 78 将越界路径注册为落盘位置导致任意文件写；line 132-133 unlink 复用同一污染路径构成任意文件删除", "fix_suggestion": "line 125: 先用 Path(suggested_filename(backup)).name 剥离目录分量，再拼接并校验 resolve 后路径仍位于 self._backup_dir 内，否则拒绝该备份"}
+```

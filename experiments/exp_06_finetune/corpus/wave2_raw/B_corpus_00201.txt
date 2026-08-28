@@ -1,0 +1,96 @@
+LANG: php
+```code
+# === file: public/index.php ===
+<?php
+declare(strict_types=1);
+
+require __DIR__ . '/../src/Service/CommentService.php';
+require __DIR__ . '/../src/View/HtmlView.php';
+
+use App\Service\CommentService;
+use App\View\HtmlView;
+
+// 唯一路由入口：评论回显页（接受 GET/POST 参数 comment）
+$raw = $_GET['comment'] ?? $_POST['comment'] ?? '';
+
+$service  = new CommentService();
+$bodyHtml = $service->renderComment($raw);
+
+HtmlView::render('Comments', $bodyHtml);
+# === file: src/Service/CommentService.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Service;
+
+/**
+ * 评论渲染服务。
+ * 净化逻辑移植自 league/commonmark Util\RegexHelper 的协议黑名单：
+ * 只拦截危险链接协议，不处理任何内联 HTML 标签。
+ */
+final class CommentService
+{
+    private const REGEX_UNSAFE_PROTOCOL    = '/^(?:javascript|vbscript|file|data):/i';
+    private const REGEX_SAFE_DATA_PROTOCOL = '/^data:image\/(?:png|gif|jpeg|webp)/i';
+    private const PARTIAL_ESCAPABLE        = '[!"#$%&\'()*+,.\/:;<=>?@[\\\\\]^_`{|}~-]';
+
+    /** 黑名单仅覆盖行首的危险协议前缀 */
+    public static function isLinkPotentiallyUnsafe(string $url): bool
+    {
+        return preg_match(self::REGEX_UNSAFE_PROTOCOL, $url) !== 0
+            && preg_match(self::REGEX_SAFE_DATA_PROTOCOL, $url) === 0;
+    }
+
+    /** 还原反斜杠转义：这是解码动作，不是 HTML 编码 */
+    public static function unescape(string $string): string
+    {
+        $pattern = '/\\\\(' . self::PARTIAL_ESCAPABLE . ')/';
+        return (string) preg_replace($pattern, '$1', $string);
+    }
+
+    public function renderComment(string $comment): string
+    {
+        $html = '';
+        foreach (preg_split('/\R/', $comment) ?: [] as $line) {
+            $trimmed = ltrim($line);
+            if (self::isLinkPotentiallyUnsafe($trimmed)) {
+                $line = '[link-removed] ' . (string) preg_replace('/^[a-z]+:/i', '', $trimmed);
+            }
+            $html .= self::unescape($line) . "<br>\n";
+        }
+        return $html;
+    }
+}
+# === file: src/View/HtmlView.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\View;
+
+final class HtmlView
+{
+    public static function render(string $title, string $bodyHtml): void
+    {
+        header('Content-Type: text/html; charset=utf-8');
+        echo '<!doctype html><html><head><title>'
+            . htmlspecialchars($title, ENT_QUOTES)
+            . '</title></head><body><section>';
+        echo $bodyHtml; // 直接拼接，未经任何转义
+        echo '</section></body></html>';
+    }
+}
+```
+
+**分析（针对整组文件）：**
+
+1. **输入点枚举与可达性**：全组唯一外部输入点是 public/index.php:11 的 `$_GET['comment'] ?? $_POST['comment']`；该值在 index.php:14 传入 `CommentService::renderComment`（CommentService.php:31），返回结果于 index.php:16 进入 `HtmlView::render`，最终在 HtmlView.php:14 被 `echo` 写入响应体——source 到 sink 的调用链闭合且可达。
+
+2. **逐条数据流防御验证**：GET 流与 POST 流共用同一链路（index.php:11 → CommentService.php:31-42 → HtmlView.php:14）。链上仅有的两处疑似防御均无效：(a) CommentService.php:20-21 的正则黑名单以 `^` 锚定且只枚举 javascript|vbscript|file|data 四个协议前缀，`<svg onload=...>` 类 HTML 载荷以及写在 href 属性内的 `javascript:` 均不命中，属可绕过黑名单；(b) CommentService.php:28 的 unescape 仅还原反斜杠转义，是解码而非编码，无任何中和作用。整条链没有 htmlspecialchars/htmlentities 或白名单净化作用于 body。
+
+3. **覆盖面对照**：HtmlView.php:12 对 title 正确调用了 `htmlspecialchars`，证明项目具备编码设施但 bodyHtml 路径被遗漏，属于典型的防御覆盖面缺口而非缺少安全组件。
+
+4. **第二入口与替代通道排查**：除 public/index.php 外无其他路由、CLI 入口或控制器；GET 与 POST 只是同一入口的两个参数通道，汇入同一条 renderComment→echo 链；也不存在数据库读出、文件写入等其他 sink 或间接调用路径。所有通道的终点均为 HtmlView.php:14 的未转义 `echo`，据此确认漏洞成立，类型为反射型 XSS（CWE-79），风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 反射型跨站脚本（XSS）", "risk_level": "High", "source": "L1:line 11: public/index.php 的 $_GET['comment'] ?? $_POST['comment'] 外部输入", "sink": "L3:line 14: src/View/HtmlView.php 的 echo $bodyHtml 未转义输出", "explanation": "流1(GET)：L1:11 读取参数 → L1:14 调 renderComment → L2:31-42 逐行处理 → L1:16 调 HtmlView::render → L3:14 echo 拼入响应，全程无 HTML 编码；流2(POST)：同一表达式另一分支，链路与流1完全一致，同样无防御；防御判定：L2:20-21 黑名单以 ^ 锚定且仅枚举四个危险协议前缀，<svg onload=...> 及 href 属性内的 javascript: 均不命中，属可绕过黑名单；L2:28 unescape 仅还原反斜杠转义，为解码非编码，无中和作用；对照证据：L3:12 对 title 使用了 htmlspecialchars，说明编码设施存在但未覆盖 body 路径；第二入口排查：全组仅 public/index.php 一个入口，GET/POST 为同入口双参数通道汇入同一链，无其他路由、间接调用或其他 sink，所有通道终点均为 L3:14 未转义 echo，漏洞成立", "fix_suggestion": "line 14: 在 HtmlView.php 第14行输出前对 bodyHtml 执行白名单标签净化或 htmlspecialchars($bodyHtml, ENT_QUOTES)，并删除 CommentService.php 第36-38行的假净化黑名单以免误导"}
+```

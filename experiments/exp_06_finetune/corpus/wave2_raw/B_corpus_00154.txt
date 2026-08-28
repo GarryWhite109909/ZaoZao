@@ -1,0 +1,101 @@
+LANG: php
+```code
+# === file: src/Controller/MetadataController.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Controller;
+
+use App\Service\MetadataSanitizer;
+use SimpleSAML\XML\DOMDocumentFactory;
+
+final class MetadataController
+{
+    // 入口1: POST /metadata/import, 表单字段 xml 携带完整 XML 文档
+    public function import(): void
+    {
+        $raw = (string)($_POST['xml'] ?? '');
+        $xml = (new MetadataSanitizer())->removeDtd($raw);
+        $dom = DOMDocumentFactory::fromString($xml);
+        header('Content-Type: application/xml');
+        echo $dom->saveXML();
+    }
+
+    // 入口2: GET /metadata/preview?xml=..., 同一管道同一 sink
+    public function preview(): void
+    {
+        $raw = (string)($_GET['xml'] ?? '');
+        $xml = (new MetadataSanitizer())->removeDtd($raw);
+        $dom = DOMDocumentFactory::fromString($xml);
+        echo $dom->documentElement->textContent;
+    }
+}
+# === file: src/Service/MetadataSanitizer.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Service;
+
+final class MetadataSanitizer
+{
+    // 看似加固: 删除 DTD 关键字; 但单趟 str_replace 可被嵌套写法绕过,
+    // 例如 <!DOCT<!DOCTYPEYPE 经一次替换后重组为 <!DOCTYPE
+    public function removeDtd(string $xml): string
+    {
+        return str_replace(['<!DOCTYPE', '<!ENTITY'], '', $xml);
+    }
+}
+# === file: src/XML/DOMDocumentFactory.php ===
+<?php
+declare(strict_types=1);
+
+namespace SimpleSAML\XML;
+
+use DOMDocument;
+use RuntimeException;
+use SimpleSAML\Assert\Assert;
+use SimpleSAML\XML\Exception\UnparseableXMLException;
+use function libxml_clear_errors;
+use function libxml_get_last_error;
+use function libxml_use_internal_errors;
+
+final class DOMDocumentFactory
+{
+    public static function fromString(string $xml): DOMDocument
+    {
+        Assert::notWhitespaceOnly($xml);
+        $internalErrors = libxml_use_internal_errors(true);
+        libxml_clear_errors();
+        $domDocument = new DOMDocument('1.0', 'UTF-8');
+        // LIBXML_DTDLOAD 保持 DTD/外部实体处理开启; LIBXML_NONET 仅禁远程网络, 不拦本地 file://
+        $options = LIBXML_DTDLOAD | LIBXML_DTDATTR | LIBXML_NONET | LIBXML_PARSEHUGE | LIBXML_NSCLEAN;
+        $loaded = $domDocument->loadXML($xml, $options);
+        libxml_use_internal_errors($internalErrors);
+        if (!$loaded) {
+            $error = libxml_get_last_error();
+            libxml_clear_errors();
+            throw new UnparseableXMLException($error);
+        }
+        libxml_clear_errors();
+        // 后置防护: 在 loadXML 之后才扫描 DOCTYPE 节点, 此时外部资源读取已经发生
+        foreach ($domDocument->childNodes as $child) {
+            if ($child->nodeType === XML_DOCUMENT_TYPE_NODE) {
+                throw new RuntimeException('Dangerous XML detected, DOCTYPE nodes are not allowed');
+            }
+        }
+        return $domDocument;
+    }
+}
+```
+
+1. **外部输入点枚举与可达性**：共两个外部输入点——`src/Controller/MetadataController.php` 第15行 `$_POST['xml']`（路由 POST /metadata/import）与第25行 `$_GET['xml']`（路由 GET /metadata/preview）。两者均无内容校验，分别在第16/26行进入清洗器、在第17/27行作为参数跨文件传入 `src/XML/DOMDocumentFactory.php` 的 `fromString`，直达第25行 `loadXML` —— source 到 sink 全链可达。
+
+2. **逐条数据流防御核验**：流A（第15行→`MetadataSanitizer.php` 第14行→`DOMDocumentFactory.php` 第25行）：唯一前置过滤是第14行的黑名单 `str_replace` 删除 `<!DOCTYPE`/`<!ENTITY`，单趟字符串替换可被嵌套标记绕过（`<!DOCT<!DOCTYPEYPE` 替换一次后重组为 `<!DOCTYPE`），且不覆盖 XInclude 与外部 DTD 引用，属无效防御；流B（第25行→第27行→sink）共用同一管道，同样无有效防御。sink 自身：第24行启用 `LIBXML_DTDLOAD` 使 DTD/外部实体在解析期被加载，`LIBXML_NONET` 只阻断远程主机、不拦截本地 `file://` 读取；第34-38行的 DOCTYPE 节点检查位于第25行解析之后（后置检测），实体对外部资源的读取在此之前已完成，且仅遍历顶层 `childNodes`——防护位置滞后、覆盖面不全。链上不存在任何完整防御。
+
+3. **第二入口与替代通道**：存在第二入口 `preview`（`MetadataController.php` 第23-29行，GET 参数），与主入口共享 sanitizer 与 sink，扩大了暴露面；除这两条路由外无 `fromFile` 等其他通道，但仅现有双路由已足以支撑漏洞可达结论。
+
+4. **结论**：CWE-611 XXE 成立，风险 High——本地文件读取与内网探测可行，后置 DOCTYPE 检查无法撤销已完成的实体解析；最小修复锚定 sink 行。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611: XML External Entity Injection (XXE)", "risk_level": "High", "source": "L1:line 15: $_POST['xml'] 经 POST /metadata/import 传入的完整不可信 XML 文档", "sink": "L3:line 25: DOMDocumentFactory::fromString 中 loadXML($xml, $options) 对不可信 XML 的解析", "explanation": "流A: L1:line 15 的 $_POST['xml'] 经 L1:line 16 进入 L2:line 14 的黑名单 str_replace 删除 <!DOCTYPE 与 <!ENTITY 后, 由 L1:line 17 跨文件传入 sink L3:line 25 的 loadXML; 该过滤为单趟字符串替换, 输入 <!DOCT<!DOCTYPEYPE 经一次替换即重组为 <!DOCTYPE, 且不覆盖 XInclude 与外部 DTD 引用, 属无效防御; 流B: L1:line 25 的 $_GET['xml'] 经 L1:line 26-27 走完全相同管道抵达同一 sink, 同样无有效防御; sink 侧 L3:line 24 启用 LIBXML_DTDLOAD 使 DTD 与外部实体在解析期间被处理, LIBXML_NONET 仅阻断远程主机而不拦截本地 file:// 读取; L3:line 34-38 的 DOCTYPE 节点检查位于解析之后, 属后置检测, 实体对外部资源的读取在检查前已发生, 且仅遍历顶层 childNodes, 防护位置滞后且覆盖不全; 第二入口为 L1:line 23-29 的 preview 路由(GET 参数), 与主入口共享 sanitizer 与 sink, 除该路由外无其他替代通道; 综上整条调用链无完整防御, 构成 CWE-611 XXE, 可导致本地文件读取与内网探测", "fix_suggestion": "line 25: 从 options 中移除 LIBXML_DTDLOAD, 并将 DOCTYPE 检查前移到 loadXML 之前对原始字符串执行、命中即拒绝; 上游 L2:line 14 的黑名单替换应改为解析前的 XSD 白名单校验"}
+```

@@ -1,0 +1,92 @@
+LANG: javascript
+```code
+# === file: app/models/string_piece.js ===
+// 富文本编辑器字符串片段模型（拆分自 trix StringPiece）
+const normalizeNewlines = (s) => (s == null ? "" : String(s).replace(/\r\n/g, "\n"))
+
+export default class StringPiece {
+  // 反序列化入口：pieceJSON 来自服务端文档快照 / 协同编辑消息（外部可控）
+  static fromJSON(pieceJSON) {
+    return new this(pieceJSON.string, pieceJSON.attributes)
+  }
+
+  constructor(string) {
+    this.string = normalizeNewlines(string) // 仅归一化换行，非安全过滤
+    this.length = this.string.length
+  }
+
+  getValue() {
+    return this.string
+  }
+
+  toString() {
+    return this.string.toString()
+  }
+
+  canBeConsolidatedWith(piece) {
+    return !!piece && this.constructor === piece.constructor
+  }
+
+  consolidateWith(piece) {
+    return new this.constructor(this.toString() + piece.toString(), this.attributes)
+  }
+}
+
+# === file: app/services/text_pipeline.js ===
+import StringPiece from "../models/string_piece"
+
+// 所谓“净化”实为黑名单正则：仅删除成对 <script>…</script>，
+// 对 <img onerror>、<svg onload>、未闭合标签等完全不设防 —— 可绕过
+const stripScriptTags = (html) => html.replace(/<script[\s\S]*?<\/script>/gi, "")
+
+// 把反序列化出的片段列表合并为一个 HTML 字符串
+export function buildDocumentHTML(pieceList) {
+  let merged = null
+  for (const item of pieceList || []) {
+    const piece = StringPiece.fromJSON(item) // 触达 source
+    if (merged && merged.canBeConsolidatedWith(piece)) {
+      merged = merged.consolidateWith(piece) // 字符串原样拼接
+    } else {
+      merged = piece
+    }
+  }
+  return stripScriptTags(merged ? merged.getValue() : "") // 全链唯一防御点，覆盖不足
+}
+
+// 纯传递包装：不编码、不过滤
+export function wrapInline(html) {
+  return `<span class="doc">${html}</span>`
+}
+
+# === file: app/views/document_view.js ===
+import { buildDocumentHTML, wrapInline } from "../services/text_pipeline"
+
+export default class DocumentView {
+  constructor(rootElement) {
+    this.root = rootElement
+  }
+
+  // 入口一：打开已保存文档（pieces 为用户曾提交的历史数据）
+  loadDocument(docJSON) {
+    const html = buildDocumentHTML(docJSON.pieces)
+    this.root.innerHTML = wrapInline(html) // SINK
+  }
+
+  // 入口二：应用协同编辑远端补丁，复用同一渲染链
+  applyRemotePatch(patchJSON) {
+    const html = buildDocumentHTML([patchJSON.piece])
+    this.root.insertAdjacentHTML("beforeend", wrapInline(html)) // SINK 变体
+  }
+}
+```
+
+**分析**
+
+1. **外部输入点枚举与可达性**：共两处外部输入——① `document_view.js` L9-L10 的 `docJSON.pieces`（打开已保存文档）；② `document_view.js` L15-L16 的 `patchJSON.piece`（协同编辑补丁）。二者均传入 `text_pipeline.js` L8 的 `buildDocumentHTML`，并在 L11 经 `StringPiece.fromJSON` 进入 `string_piece.js` L7，`pieceJSON.string` 成为污点源，沿 `getValue`（string_piece.js L16）/`toString`（L20）对下游完全可达；`attributes` 字段在构造器中被丢弃，不构成额外污点通道。
+2. **主链防御逐点核验（loadDocument 流）**：`string_piece.js` L7 → L11 `normalizeNewlines` 仅替换换行符，非安全过滤 → `text_pipeline.js` L13 `consolidateWith` 对字符串原样拼接 → L18 `stripScriptTags` 是全链唯一防御，但它是正则黑名单且只匹配成对的 `<script>` 块，`<img src=x onerror=...>`、`<svg onload>`、未闭合的 `<script>` 均不命中，按规则视为可绕过、非有效防御 → L22-L23 `wrapInline` 纯字符串插值传递 → 最终 `document_view.js` L11 将未净化 HTML 赋给 `innerHTML`，链上无任何实体编码或白名单净化，CWE-79 成立。
+3. **第二条流核验（applyRemotePatch 流）**：`document_view.js` L16 以单元素数组复用同一 `buildDocumentHTML`，经过与主链完全相同的 L11/L13/L18 路径，最终在 L17 经 `insertAdjacentHTML` 写入 DOM，是与主链共享同一不完整净化点的第二 sink 变体。
+4. **第二入口与替代通道结论**：存在两个入口（`loadDocument`、`applyRemotePatch`）与两个 sink（`innerHTML`、`insertAdjacentHTML`），全部收敛于 `text_pipeline.js` L18 这一个不完整净化点；且 `buildDocumentHTML`/`wrapInline` 为公开导出函数，任何新增调用方都会继承该缺陷，调用链上不存在能阻断污点的其他防线，据此确认整组文件存在可利用的跨文件 XSS。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 跨站脚本（XSS）：外部 JSON 字符串未经充分净化即写入 innerHTML", "risk_level": "High", "source": "L1:line 7: StringPiece.fromJSON 反序列化接收的外部 pieceJSON.string（服务端文档快照/协同消息）", "sink": "L3:line 11: DocumentView.loadDocument 将 buildDocumentHTML 结果赋给 root.innerHTML", "explanation": "输入点枚举：document_view.js L10 的 docJSON.pieces 与 L16 的 patchJSON.piece 两处外部输入均经 text_pipeline.js L8-L11 的 StringPiece.fromJSON 汇入 string_piece.js L7 的 pieceJSON.string，attributes 参数被构造器丢弃故无额外通道；主流验证：string_piece.js L7 至 L11 的 normalizeNewlines 仅做换行归一化非安全过滤，text_pipeline.js L13 consolidateWith 原样拼接，L18 stripScriptTags 为正则黑名单且仅删除成对 script 标签，img onerror 等向量完全绕过属无效防御，L22-L23 wrapInline 纯传递，最终 document_view.js L11 写入 innerHTML，链上无实体编码或白名单净化；第二流验证：document_view.js L16 复用同一 buildDocumentHTML 后于 L17 经 insertAdjacentHTML 到达同一缺陷，与主流共享同一不完整净化点；第二入口结论：存在 loadDocument 与 applyRemotePatch 两个入口及 innerHTML 与 insertAdjacentHTML 两个 sink 变体，全部收敛于 text_pipeline.js L18，且 buildDocumentHTML 为公开导出函数任何新调用方均继承缺陷，确认跨文件 CWE-79 可利用。", "fix_suggestion": "line 11: 写入 innerHTML 前用 DOMPurify.sanitize 做白名单净化（L17 的 insertAdjacentHTML 同样处理），纯文本展示场景改用 textContent 赋值"}
+```

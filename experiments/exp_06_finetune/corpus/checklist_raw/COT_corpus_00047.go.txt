@@ -1,0 +1,34 @@
+## 漏洞分析报告
+
+### 步骤 1｜枚举用户可控输入点并追踪 sink
+
+- **入口 A（请求路径，完全攻击者可控）**：第 88 行 `currentPath := req.URL.RawPath`（为空时第 90 行回退到 `EscapedPath()`）。攻击者可在路径中携带任意百分号编码，如 `%2e%2e%2f`、`%2f`。
+- **入口 B（查询串）**：第 125–126 行读取 `req.URL.RawQuery`，仅在第 129 行拼入重定向 Location。
+- **配置项** `Replacement/Regex/XForwardedPrefix` 来自运维配置（Ingress 注解），非请求级用户输入，但作为替换模板参与运算。
+
+追踪到的危险 sink：
+- **流 A1（主漏洞流）**：currentPath → 第 101 行 `rt.regexp.ReplaceAllString(currentPath, rt.replacement)`（replacement 中 `$1/$2` 等捕获组把用户路径片段原样并入结果）→ 第 144 行 `req.URL.RawPath = newTarget` → 第 147 行 `url.PathUnescape` 写入 `req.URL.Path` → 第 157 行 `rt.next.ServeHTTP` 以被改写的路径转发后端。**到达危险 sink。**
+- 流 A2：currentPath → 第 136 行同样的 ReplaceAllString → 第 138 行写入 `X-Forwarded-Prefix` 头（次要通道）。
+- 流 B：RawQuery → 第 129 行 `http.Redirect`（受 absoluteURLRedirect 分支约束）。
+
+### 步骤 2｜逐条验证防御有效性
+
+- 第 94 行 `MatchString` 只判断是否命中正则，不做任何字符过滤或规范化；
+- 第 107 行仅拦截空串结果；
+- 第 112–114 行的防护（注释自述“防止用户捕获组内容注入绝对 URL 重定向”）只在 replacement 模板本身是绝对 URL 时生效；最常见的相对路径 rewrite 场景（如 replacement=`/$2`）**完全不经过任何校验**；
+- 第 147 行 `url.PathUnescape` 是解码而非净化：它把攻击者预编码的 `%2e%2e%2f` 还原成 `../`，反而完成 payload 构造；第 141–143 行注释明确承认允许替换引入转义字符且不处理多重编码；
+- 无黑名单也无白名单，但即便有正则类过滤也不算有效防御——此处实际是**零校验**。结论：流 A1 从 source 到 sink 全程无有效防御覆盖。对比之下，无 regex 分支（第 103 行）的 newTarget 仅由运维模板去掉 `$N` 得出，不含用户数据，该条流安全。
+
+### 步骤 3｜第二入口与替代通道
+
+存在替代通道：
+1. 同一 currentPath 经第 136–138 行注入 `X-Forwarded-Prefix` 头，上游收到的前缀头含未净化的用户数据；
+2. 当运维将 replacement 配置为含捕获组的绝对 URL（如 `https://固定域/$1`）时，第 101 行产物含用户数据，经第 115 行 `url.Parse` 后由第 129 行输出 302——构成受限的开放重定向面；但主判定仍为路径穿越流 A1。
+
+### 步骤 4｜结论
+
+攻击链示例：配置 `regex=/base/(.*)`、`replacement=/$1` 时，请求 `GET /base/..%2f..%2fadmin` → 第 101 行得 newTarget=`/..%2f..%2fadmin` → 第 144 行直接赋值 → 第 147 行解码为 `/../../admin` → 第 157 行后端收到逃逸出预期前缀的路径，绕过基于路径前缀的访问边界（CWE-22，背景标注高危）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "High", "source": "line 88: currentPath := req.URL.RawPath（攻击者可控请求路径，可含 %2e%2e%2f 等编码段）", "sink": "line 144-147: req.URL.RawPath = newTarget 并经 url.PathUnescape 写入 req.URL.Path，最终 line 157 rt.next.ServeHTTP 转发后端", "explanation": "currentPath -> line 101 ReplaceAllString 经捕获组 $1 将含编码穿越符的用户路径片段并入 newTarget -> line 144 未校验直接赋给 req.URL.RawPath -> line 147 PathUnescape 把 %2e%2e%2f 解码为 ../ 反而完成 payload -> line 157 以越权路径请求后端；line 94 仅匹配判断、line 107 仅拦空串、line 114 防护只覆盖绝对 URL 模板分支，相对路径 rewrite 场景全程无净化或白名单校验", "fix_suggestion": "line 144: 赋值前先按 / 切分并校验 newTarget 各段不含 . 或 ..，且解码后路径不得逃逸配置的目标前缀，非法则返回 400"}
+```

@@ -1,0 +1,104 @@
+LANG: java
+```code
+# === file: src/jenkins/web/ConfigImportServlet.java ===
+package jenkins.web;
+
+import java.io.IOException;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import jenkins.model.PluginStore;
+import jenkins.util.XmlGuard;
+
+public class ConfigImportServlet extends HttpServlet {
+    private final PluginStore pluginStore = new PluginStore();
+
+    @Override
+    protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+        String configXml = req.getParameter("config");               // [SOURCE]
+        if (configXml == null || configXml.isEmpty()) {
+            resp.sendError(400);
+            return;
+        }
+        String filtered = XmlGuard.stripDangerousTags(configXml);
+        pluginStore.loadFromXml(filtered);                           // [FLOW->SINK FILE]
+        resp.setStatus(200);
+    }
+}
+# === file: src/jenkins/util/XmlGuard.java ===
+package jenkins.util;
+
+/** Best-effort removal of well-known gadget markers before import. */
+public final class XmlGuard {
+    private static final String[] BLOCKED = {"<map>", "dynamic-proxy", "ProcessBuilder", "java.lang.Runtime"};
+
+    public static String stripDangerousTags(String xml) {
+        String out = xml;
+        for (String token : BLOCKED) {
+            out = out.replace(token, "");
+        }
+        return out;
+    }
+}
+# === file: src/jenkins/model/PluginStore.java ===
+package jenkins.model;
+
+import com.thoughtworks.xstream.XStream;
+import com.thoughtworks.xstream.converters.MarshallingContext;
+import com.thoughtworks.xstream.converters.UnmarshallingContext;
+import com.thoughtworks.xstream.converters.collections.AbstractCollectionConverter;
+import com.thoughtworks.xstream.io.HierarchicalStreamReader;
+import com.thoughtworks.xstream.io.HierarchicalStreamWriter;
+import com.thoughtworks.xstream.io.xml.XppDriver;
+import com.thoughtworks.xstream.mapper.Mapper;
+import java.io.StringReader;
+import java.util.ArrayList;
+import java.util.List;
+
+public class PluginStore {
+    private final XStream xstream = new XStream();
+
+    public void loadFromXml(String xml) {
+        HierarchicalStreamReader reader = new XppDriver().createReader(new StringReader(xml));
+        xstream.registerConverter(new EntryListConverter(xstream.getMapper()));
+        xstream.unmarshal(reader);                               // [SINK]
+    }
+
+    public static final class EntryListConverter extends AbstractCollectionConverter {
+        public EntryListConverter(Mapper mapper) {
+            super(mapper);
+        }
+        @Override
+        public boolean canConvert(Class type) {
+            return List.class.isAssignableFrom(type);
+        }
+        @Override
+        public void marshal(Object src, HierarchicalStreamWriter w, MarshallingContext ctx) {
+            throw new UnsupportedOperationException();
+        }
+        @Override
+        public Object unmarshal(HierarchicalStreamReader r, UnmarshallingContext ctx) {
+            List items = new ArrayList();
+            while (r.hasMoreChildren()) {
+                r.moveDown();
+                items.add(readItem(r, ctx, items));              // gadget resolution
+                r.moveUp();
+            }
+            return items;
+        }
+    }
+}
+```
+
+1. 【输入点枚举与可达性】整组文件唯一的外部输入点是 `ConfigImportServlet.java:16` 的 `req.getParameter("config")`（POST 路由请求体）；污点沿 L21 进入过滤函数、L22 跨文件传入 `PluginStore.java:18`，直达 L21 的 sink，调用链无任何中断，可达性成立。
+
+2. 【逐流防御验证】全程仅一条 source→sink 数据流。中游 `XmlGuard.java:7-12` 表面做了净化，实为 4 个固定 token 的黑名单加 `String.replace` 精确匹配：`<Map>` 大小写变体、标签内插入空白、CDATA 包裹、实体编码均可绕过，且黑名单远未覆盖 gadget 类面；sink 所在的 `PluginStore.java:21` 也未启用 XStream 安全框架或类型白名单，`:41` 的 `readItem` 按 XML 中攻击者指定的类名做多态解析——防御类型错误（黑名单字符串替换）、位置错误（中游而非 sink 处）、覆盖面不足，判定为无效防御。
+
+3. 【第二入口/替代通道排查】组内不存在 doGet/doPut 等其他 HTTP 方法分支，也没有第二个路由或其他类调用 `loadFromXml` 或 `stripDangerousTags`；`PluginStore.java:41` 的 `readItem` 只是同一次 `unmarshal` 调用的内部延续，属于 sink 自身实现而非独立攻击通道。最终漏洞结论由唯一入口、唯一数据流支撑，无相互矛盾的证据。
+
+4. 【定级】攻击者完全可控的 XML 直接进入多态反序列化并按类名实例化对象，典型后果为远程代码执行，风险定为 Critical，CWE-502 成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 不可信数据反序列化（XStream多态反序列化，跨文件source-sink分离）", "risk_level": "Critical", "source": "L1:line 16: req.getParameter('config') 接收攻击者可控XML字符串", "sink": "L3:line 21: xstream.unmarshal(reader) 执行不可信XML反序列化（内部经 line 41 readItem 按类名解析对象）", "explanation": "数据流1（主链）：ConfigImportServlet.java L16 的 req.getParameter('config') 为唯一外部输入，攻击者通过 POST 提交任意XML；该值在 L21 进入 XmlGuard.stripDangerousTags，L22 跨文件传入 pluginStore.loadFromXml，到达 PluginStore.java L18-L21 的 xstream.unmarshal 并由 L41 readItem 完成多态对象重建，source 与 sink 分处不同文件且链路完整可达；防御核验：中间文件 XmlGuard.java L7-L12 仅为4个固定标记的黑名单加 String.replace 精确替换，属可绕过过滤（大小写变体、插入空白、CDATA包裹、实体编码均可绕过），未限制可实例化类型集合，未使用XStream安全框架白名单，且位于中游而非sink处，不构成有效防御；第二入口排查：组内无 doGet/doPut 等其他HTTP分支，无其他路由或类调用 loadFromXml 或 stripDangerousTags，L41 的 readItem 是同一 unmarshal 的内部步骤而非替代通道，漏洞结论由唯一入口唯一数据流支撑成立", "fix_suggestion": "line 21: 删除对黑名单过滤的依赖，在调用 xstream.unmarshal 前启用 XStream 安全框架并用 addAllowedTypes 仅放行具体实体类型白名单，拒绝根元素及子元素的多态类名解析"}
+```

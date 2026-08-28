@@ -1,0 +1,111 @@
+LANG: java
+```code
+# === file: src/main/java/com/example/transport/MinaPayloadReceiver.java ===
+package com.example.transport;
+
+import java.io.InputStream;
+import org.apache.mina.core.buffer.IoBuffer;
+
+/**
+ * Transport adapter exposing raw bytes received over the MINA session.
+ */
+public final class MinaPayloadReceiver {
+
+    private MinaPayloadReceiver() {
+    }
+
+    /**
+     * SOURCE: backed by network data from a remote peer,
+     * fully attacker-controlled, no content validation here.
+     */
+    public static InputStream openRemoteStream(IoBuffer buffer) {
+        return buffer.asInputStream();
+    }
+
+    public static byte[] drainBuffer(IoBuffer buffer) {
+        byte[] out = new byte[buffer.remaining()];
+        buffer.get(out);
+        return out;
+    }
+}
+
+# === file: src/main/java/com/example/convert/PayloadConverters.java ===
+package com.example.convert;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.ObjectInput;
+import java.io.ObjectInputStream;
+import com.example.transport.MinaPayloadReceiver;
+import org.apache.mina.core.buffer.IoBuffer;
+
+/**
+ * Conversion helpers between MINA buffers and object streams.
+ */
+public final class PayloadConverters {
+
+    private PayloadConverters() {
+    }
+
+    /** Pure delegation; adds no validation. */
+    public static InputStream toInputStream(IoBuffer buffer) {
+        return MinaPayloadReceiver.openRemoteStream(buffer);
+    }
+
+    // available() check looks like a guard but only rejects empty payloads;
+    // no class filtering, cannot stop gadget chains.
+    public static ObjectInput toObjectInput(IoBuffer buffer) throws IOException {
+        InputStream is = toInputStream(buffer);
+        if (is.available() <= 0) {
+            throw new IOException("empty payload");
+        }
+        return new ObjectInputStream(is);
+    }
+}
+
+# === file: src/main/java/com/example/handler/InboundMessageHandler.java ===
+package com.example.handler;
+
+import java.io.ObjectInput;
+import com.example.convert.PayloadConverters;
+import org.apache.mina.core.buffer.IoBuffer;
+
+/**
+ * Invoked by the MINA IoHandler for every inbound session message.
+ */
+public class InboundMessageHandler {
+
+    /**
+     * SINK: readObject runs on a stream built from remote bytes.
+     */
+    public Object handleMessage(IoBuffer inbound) throws Exception {
+        ObjectInput oi = PayloadConverters.toObjectInput(inbound);
+        try {
+            return oi.readObject();
+        } finally {
+            oi.close();
+        }
+    }
+
+    /** Alternative channel reaching the same sink. */
+    public void handleBatch(Iterable<IoBuffer> frames) throws Exception {
+        for (IoBuffer frame : frames) {
+            handleMessage(frame);
+        }
+    }
+}
+```
+
+**分析**
+
+1. **外部输入点枚举与可达性**：外部输入共三处——① `MinaPayloadReceiver.openRemoteStream`（MinaPayloadReceiver.java 第 18-19 行）将 MINA 会话缓冲直接转为流，内容完全由远端控制；② `InboundMessageHandler.handleMessage`（InboundMessageHandler.java 第 15 行）的 `IoBuffer` 参数由 IoHandler 对每条入站消息调用，经第 16 行进入转换器并最终在第 18 行 `readObject()` 消费，可达；③ `handleBatch`（第 25 行）循环调用 `handleMessage`（第 27 行），同样可达同一 sink。`drainBuffer`（MinaPayloadReceiver.java 第 22 行）虽输出原始字节，但当前无调用方将其送入反序列化，不构成漏洞通道。
+
+2. **主流防御逐一验证**：主链为 L1:19 `asInputStream()` → L2:20 纯委托（零校验）→ L2:26 取得流 → L2:27 `available() <= 0` 检查 → L2:30 `new ObjectInputStream(is)` → L3:16 → L3:18 `oi.readObject()`。唯一的“防御”位于 PayloadConverters.java 第 27-29 行，但它只拒绝空载荷：既不解析/校验序列化魔数后的类名，也未调用 `setObjectInputFilter` 设置白名单，无法阻止 CommonCollections 等 gadget 链，属“看似净化实则不完整”；全链不存在黑名单、正则或字符串替换之外的任何有效过滤，也无自定义 `resolveClass` 拦截。
+
+3. **第二入口与替代通道**：存在第二入口 `handleBatch`（InboundMessageHandler.java 第 25 行），以批量帧形式汇入同一 sink，攻击面等价于主入口；替代转换路径 `toInputStream`（PayloadConverters.java 第 19 行）与 `drainBuffer` 均不触发 `readObject`，故非漏洞路径，这佐证漏洞根因唯一锁定在反序列化调用而非传输层本身。
+
+4. **结论**：source（文件1）与 sink（文件3）跨文件分离，中间文件仅做传递加伪净化，调用链上无完整防御，CWE-502 成立；远程攻击者发送恶意序列化帧即可实例化任意类，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 反序列化不可信数据", "risk_level": "Critical", "source": "L1:line 19: MinaPayloadReceiver.openRemoteStream 中 buffer.asInputStream() 返回的远端网络可控字节流", "sink": "L3:line 18: InboundMessageHandler.handleMessage 中 oi.readObject() 反序列化调用", "explanation": "主链: L1:19 asInputStream 取得攻击者完全可控的网络流 -> L2:20 纯委托零校验 -> L2:26 接收 -> L2:27 available() 检查仅拒绝空载荷属不完整净化(无类白名单/未设 ObjectInputFilter, 无法阻断 gadget 链) -> L2:30 包装为 ObjectInputStream -> L3:16 传入 -> L3:18 readObject 实例化任意类; 第二入口: L3:25 handleBatch 循环调用 L3:27 handleMessage 汇入同一 sink, 攻击面等价; 替代通道 L1:22 drainBuffer 与 L2:19 toInputStream 不调用 readObject 故非漏洞路径; 全链无黑名单正则之外的有效防御, 远程可触发, 判定 CWE-502 成立", "fix_suggestion": "line 30: 在 new ObjectInputStream(is) 后立即调用 setObjectInputFilter 设置业务类白名单, 清单外类一律抛出异常; 更彻底方案是弃用原生序列化改用 JSON 等安全格式"}
+```

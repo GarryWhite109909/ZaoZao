@@ -1,0 +1,25 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点并追踪流向**
+- 第 74-76 行 `createRelease`、第 103-106 行 `createGrayRelease`：路径变量+请求体，流入第 86/116 行 `publish`（写操作），受第 72/101 行 `@PreAuthorize` 保护；
+- 第 132-133 行 `get(env, releaseId)`：`releaseId` 为路径变量、完全用户可控，直达第 134 行 `releaseService.findReleaseById`，结果于第 139 行返回调用方（读操作）；
+- 第 143-148 行 `findAllReleases`、第 157-162 行 `findActiveReleases`：数据流在第 149/164 行被 `shouldHideConfigToCurrentUser` 拦截；
+- 第 172-174 行 `compareRelease(baseReleaseId, toCompareReleaseId)`：两个 releaseId 用户可控，直达第 176 行 `compare`；
+- 第 181-183 行 `rollback(releaseId, toReleaseId)`：先在第 184 行按 ID 取对象，再于第 190 行做对象级授权。
+
+**步骤 2｜逐条验证防御有效性**
+- `get` 流：第 133 行 releaseId -> 第 134 行 `findReleaseById` -> 第 139 行返回。中间唯一逻辑是第 136 行判空抛 `NotFoundException`，这是存在性检查而非授权检查；方法与类上均无 `@PreAuthorize`（对比第 72/101 行写法），也未调用 `userPermissionValidator`；第 49 行类级 `@Validated` 仅启用参数校验，不提供授权。该流无任何有效防御，任意已认证用户可用遍历/猜测的 releaseId 读取任意应用与命名空间的发布配置（配置值常含敏感信息）。
+- `compareRelease` 流：第 173-174 行 -> 第 176 行直接返回差异结果，同样无授权检查。
+
+**步骤 3｜对照同文件正确实现**
+`rollback` 在第 184 行取数后，于第 190-192 行用 `release.getAppId()/getClusterName()/getNamespaceName()` 调用 `hasReleaseNamespacePermission` 校验、失败抛 `AccessDeniedException`，证明本代码库已有对象级授权模式；`findAllReleases`/`findActiveReleases` 也在第 149/164 行有隐藏配置检查。可见 `get` 的缺失是实现遗漏，并非框架层统一放行或另有兜底。
+
+**步骤 4｜第二入口/替代通道核查**
+除 `GET /envs/{env}/releases/{releaseId}` 外，第 171-176 行 `GET /envs/{env}/releases/compare` 同样以用户可控 releaseId 取数且全程未鉴权，攻击者可借比对接口间接获取他人配置内容，构成同一缺陷的替代通道；其余端点均有对应防护，不构成额外越权面。
+
+**步骤 5｜结论**
+第 133 行用户可控的 `releaseId` 未经对象级授权即在主键查询后返回，构成 CWE-639 授权绕过（IDOR）：低权限已认证用户可横向读取任意命名空间的发布配置。因需登录但可批量遍历 ID 且泄露内容含配置明文，定级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key", "risk_level": "High", "source": "line 133: @PathVariable long releaseId（GET /envs/{env}/releases/{releaseId}）", "sink": "line 134: releaseService.findReleaseById(Env.valueOf(env), releaseId)，结果于 line 139 直接返回", "explanation": "已认证用户可控 releaseId -> line 134 按主键直查发布记录 -> 中间仅 line 136 判空（存在性检查而非授权检查）、无 @PreAuthorize 亦未调用 userPermissionValidator -> line 139 返回任意应用/命名空间的发布配置 -> 越权读取；替代通道 line 173-174 的 baseReleaseId/toCompareReleaseId -> line 176 compare 同样未鉴权", "fix_suggestion": "line 135: 参照第 190 行写法插入对象级授权——调用 userPermissionValidator.hasReleaseNamespacePermission(release.getAppId(), env, release.getClusterName(), release.getNamespaceName())，不通过则抛 AccessDeniedException"}
+```

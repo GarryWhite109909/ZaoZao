@@ -1,0 +1,96 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+from .services import TokenIntrospectionService
+
+
+async def introspect_handler(request: Request) -> JSONResponse:
+    """RFC-7662 风格内省端点，token 直接来自 POST 表单。"""
+    form = await request.form()
+    raw_token = form.get("token")
+    if not isinstance(raw_token, str) or not raw_token:
+        return JSONResponse({"active": False}, status_code=400)
+    return await TokenIntrospectionService().introspect(raw_token)
+
+
+async def revoke_handler(request: Request) -> JSONResponse:
+    """第二入口：同一用户可控密钥，换一个动词打到同一存储。"""
+    body = await request.json()
+    raw_token = str(body.get("token", ""))
+    return await TokenIntrospectionService().revoke(raw_token)
+
+
+routes = [
+    Route("/introspect", introspect_handler, methods=["POST"]),
+    Route("/revoke", revoke_handler, methods=["POST"]),
+]
+
+# === file: app/services.py ===
+import re
+
+from .token_store import TOKEN_STORE
+
+
+class TokenIntrospectionService:
+    """中间层：只做格式净化，不做属主或调用方授权校验。"""
+
+    _TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-]{8,64}$")
+
+    async def introspect(self, raw_token: str):
+        # 看似防御：strip + 格式白名单，但与调用者身份完全无关
+        cleaned = raw_token.strip()
+        if not self._TOKEN_RE.match(cleaned):
+            return {"active": False}
+        record = await TOKEN_STORE.lookup(cleaned)
+        if not record:
+            return {"active": False}
+        return {
+            "active": True,
+            "client_id": record["client_id"],
+            "scope": record["scope"],
+            "aud": record["resource"],
+        }
+
+    async def revoke(self, raw_token: str):
+        cleaned = raw_token.strip()  # 仅字符串清理，无任何鉴权
+        await TOKEN_STORE.delete(cleaned)
+        return {"revoked": True}
+
+# === file: app/token_store.py ===
+"""全局内存令牌库，以原始令牌字符串为主键。"""
+
+TOKENS = {
+    "tok-alice-0001": {"client_id": "client-A", "scope": "mcp:read", "resource": "rs://alpha"},
+    "tok-bob-0002": {"client_id": "client-B", "scope": "mcp:write", "resource": "rs://beta"},
+}
+
+
+class TokenStore:
+    async def lookup(self, token_str: str):
+        # SINK: 直接按键取整条记录，不校验请求者与该记录的归属关系
+        return TOKENS.get(token_str)
+
+    async def delete(self, token_str: str):
+        return TOKENS.pop(token_str, None)
+
+
+TOKEN_STORE = TokenStore()
+```
+
+1. **外部输入点枚举与可达性**：共两个输入点。入口一在 app/routes.py L11（`form.get('token')`，POST /introspect），经 L14 传入服务层，services.py L16 继续下传，最终到达 token_store.py L12 的 `TOKENS.get`，路径连通；入口二在 app/routes.py L20（`body.get('token')`，POST /revoke），经 L21→services.py L28→token_store.py L15 的 `pop`，同样连通。无其他 query/header 输入点。
+
+2. **逐流防御验证**：流1（主链）routes.py L11→L14→services.py L13/L14-15：strip 加正则格式白名单只是语法层字符集与长度检查，位置错在数据净化层而非授权层，覆盖面不含“调用方是否有权查看该令牌”这一维度，攻击者只需提交任意合法格式的他人令牌即可穿透，属可绕过检查不算有效防御；随后 token_store.py L12 按键返回完整记录（client_id/scope/resource），无任何属主比对。流2（旁路）routes.py L20→services.py L27 仅 strip，连格式校验都没有，直达 token_store.py L15 可删除任意主体的令牌。
+
+3. **第二入口/替代通道确认**：存在——/revoke 路由是与 /introspect 共享同一存储的第二入口，且防线更弱；两条独立流均呈现“用户可控密钥直接索引受保护对象”模式，交叉印证 CWE-639 成立。
+
+4. **拆分结构说明**：source 位于文件1（routes.py），sink 位于文件3（token_store.py），二者物理隔离；文件2（services.py）充当“看似有净化实则不完整”的中间层，模拟真实项目中 routes/services/db 分层。
+
+5. **结论**：全链路无 RFC 7662 客户端认证、无对象级归属校验，正则与 strip 类过滤按规则判定无效，跨文件污点从 L1 的表单/JSON 输入直达 L3 的键值查询，漏洞成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639", "risk_level": "High", "source": "L1:line 11: raw_token = form.get('token')（另有 L1:line 20 的 body.get('token') 第二入口）", "sink": "L3:line 12: TOKENS.get(token_str) 按用户可控键返回任意令牌完整记录", "explanation": "流1: app/routes.py L11 表单 token 经 L14 进入 app/services.py L13 strip 与 L14-15 正则格式白名单——该检查仅为语法层字符集校验，位于净化层而非授权层，不覆盖调用方身份与属主关系维度，提交任意合法格式的他人令牌即可绕过——随后 services.py L16 下传至 app/token_store.py L12 TOKENS.get 按键返回任意记录的 client_id/scope/resource，构成水平越权读取; 流2: app/routes.py L20 JSON 体 token 经 services.py L27 仅 strip 后直达 token_store.py L15 pop，可撤销任意主体令牌，为共享同一存储的第二入口替代通道; 全链路无 RFC7662 客户端认证、无对象级属主比对，正则与 strip 类过滤按规则视为无效防御，故 CWE-639 授权绕过成立", "fix_suggestion": "line 16: 在 lookup 前强制内省端点客户端认证，并将返回记录的 client_id 与已认证调用方身份比对，不匹配一律返回 active=false"}
+```

@@ -1,0 +1,23 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点**
+第 36–55 行的 `Project` 结构体由 YAML 反序列化填充，来源是攻击者可通过 PR 提交/修改的仓库级 atlantis.yaml，因此全部字段均为用户可控输入。其中关键输入点：
+- 第 39 行 `Dir`、第 37 行 `Name`、第 38 行 `Branch`、第 45–47 行三类 requirements、第 42 行 distribution；
+- **第 40 行 `Workspace *string`**（yaml tag `workspace`）——本次分析的核心污染源。
+
+**步骤 2｜逐条验证 source→sink 数据流的防御有效性**
+- `Dir` 流：第 80 行拒绝含 `'..'` 的值，第 84–87 行用 doublestar 校验 glob 合法性，第 156 行再经 `filepath.Clean('./'+dir)` 规范化——防御完整覆盖该流。
+- `Name` 流：第 100 行 `validProjectName` 要求 URL 安全字符（白名单式等价校验），第 128/134 行补充 glob 交叉限制——已覆盖。
+- `Branch` 流：第 112–116 行强制首尾斜杠且正则必须可编译，保证第 163 行 `MustCompile` 不 panic——已覆盖。
+- requirements/distribution 流：第 140–143 行分别走 `validPlanReq`/`validApplyReq`/`validImportReq`/`validDistribution` 的精确白名单——已覆盖。
+- **`Workspace` 流：未被覆盖。** 第 138–148 行的 `ValidateStruct` 为上述每个字段都注册了校验规则，但**没有任何针对 `p.Workspace` 的 `validation.Field` 条目**；唯一的处理是第 166 行的空值判断，随后第 169 行 `v.Workspace = *p.Workspace` 将原始值**原样透传**进 `valid.Project.Workspace`。该字段在下游被用于拼接本地工作区目录及 plan/apply 输出路径（如 `repos/<repo>/<pull>/…/<workspace>`），值中含 `'..'` 或绝对路径即可逃逸工作区根目录。缺失校验即缺失防御，黑名单式的“判空”不构成对路径穿越字符的中和。
+
+**步骤 3｜第二入口/替代通道核查**
+本文件内的直接危险调用：第 60 行 `os.ReadDir(dir)` 的实参来自调用方传入的扫描目录，非用户直接可控；第 163 行 `MustCompile` 有第 116 行 `Compile` 预检兜底。替代通道方面：`Workflow`（第 41 行）同样未校验，但其下游用于查找注册的 workflow 名称而非拼路径；真正可达危险 sink 的备用通道正是项目级 `workspace` 字段——由于 `Validate` 阶段对该字段零规则，从 YAML 到 `ToValid` 再到命令构建器的整条链上不存在任何一道防线能拦截该流。
+
+**步骤 4｜结论**
+`Workspace`（line 40）→ 无校验透传（line 169）→ 下游工作区路径拼接，source→sink 全程无有效防御，构成漏洞。按数据集标注归为 CWE-1336（特殊元素未正确中和）；攻击者可为普通 PR 作者即可触发，可实现服务器端路径穿越读写（可进一步升级），风险评级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine", "risk_level": "High", "source": "line 40: Project 结构体 Workspace 字段（yaml tag workspace，来自用户可通过 PR 提交的 atlantis.yaml）", "sink": "line 169: v.Workspace = *p.Workspace 原样透传至 valid.Project，供下游拼接本地工作区目录与 plan/apply 输出路径", "explanation": "攻击者通过 PR 修改仓库配置控制 Workspace(line 40) -> Validate 的 ValidateStruct(line 138-148) 为 Dir/Name/Branch/requirements/distribution 均注册了校验规则，唯独没有 Workspace 的任何规则，仅 line 166 判空 -> line 169 将原始值未经净化透传 -> 下游以该值构造工作区路径，值中含 '..' 或绝对路径即可逃逸工作区根目录，造成服务器端路径穿越读写文件", "fix_suggestion": "line 147: 在其后追加一条 validation.Field(&p.Workspace, ...) 规则，校验器拒绝包含 '..'、路径分隔符及空白/控制字符的 workspace 值"}
+```

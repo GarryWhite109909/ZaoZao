@@ -1,0 +1,111 @@
+LANG: java
+```code
+# === file: src/main/java/demo/registry/KvSource.java ===
+package demo.registry;
+
+import org.kiwiproject.consul.Consul;
+import org.kiwiproject.consul.KeyValueClient;
+
+/**
+ * Reads raw entries from the shared Consul KV store. Any client with KV
+ * write access (external attacker or compromised node) controls these bytes.
+ */
+public class KvSource {
+
+    private final KeyValueClient kv;
+
+    public KvSource(String host, int port) {
+        this.kv = Consul.builder()
+                .withUrl("http://" + host + ":" + port)
+                .build()
+                .keyValueClient();
+    }
+
+    /** SOURCE: returns attacker-controlled Base64 text straight from KV. */
+    public String fetchRaw(String key) {
+        return kv.getValueAsString(key).orElse(null);
+    }
+}
+
+# === file: src/main/java/demo/codec/PayloadCodec.java ===
+package demo.codec;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+
+public final class PayloadCodec {
+
+    private PayloadCodec() {}
+
+    public static byte[] decodeBase64(String raw) {
+        return Base64.getDecoder().decode(raw.getBytes(StandardCharsets.ISO_8859_1));
+    }
+
+    // Looks defensive but only blacklists ONE legacy gadget package.
+    static void preCheck(byte[] bytes) throws IOException {
+        String head = new String(bytes, StandardCharsets.ISO_8859_1);
+        if (head.contains("org.apache.commons.collections4.functors")) {
+            throw new IOException("legacy gadget blocked");
+        }
+    }
+
+    /** SINK: native deserialization, no ObjectInputFilter installed. */
+    public static Object deserialize(byte[] bytes) throws IOException, ClassNotFoundException {
+        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
+            return in.readObject();      // <-- sink
+        }
+    }
+
+    public static Object decodeAndDeserialize(String raw) throws Exception {
+        byte[] bytes = decodeBase64(raw);
+        preCheck(bytes);                 // denylist only, easily bypassed
+        return deserialize(bytes);
+    }
+}
+
+# === file: src/main/java/demo/bean/BeanResolver.java ===
+package demo.bean;
+
+import demo.codec.PayloadCodec;
+import demo.registry.KvSource;
+
+/** Resolves beans by name; both the name and the stored value come from outside. */
+public class BeanResolver {
+
+    private final KvSource kv;
+
+    public BeanResolver(KvSource kv) {
+        this.kv = kv;
+    }
+
+    public Object lookupByName(String name) throws Exception {
+        String raw = kv.fetchRaw(name.replace('$', '/'));   // taint flows through untouched
+        if (raw == null) {
+            return null;
+        }
+        return PayloadCodec.decodeAndDeserialize(raw);      // reaches SINK in PayloadCodec
+    }
+
+    public <T> T lookupByNameAndType(String name, Class<T> type) throws Exception {
+        Object obj = lookupByName(name);                    // gadget already ran inside readObject
+        return type.cast(obj);                              // cast AFTER sink: no protection
+    }
+}
+```
+
+**分析（整组文件）**
+
+1. **外部输入点枚举与可达性**：① `KvSource.java:22-24` 的 `fetchRaw` —— Consul KV 为共享外部存储，任何具备 KV 写权限的客户端均可植入任意 Base64 字节，属典型不可信输入；该返回值在 `BeanResolver.java:16` 被接收后无条件传入 `PayloadCodec.java:32-36` 的 `decodeAndDeserialize`，最终抵达 `PayloadCodec.java:28` 的 `readObject`，可达性成立。② `BeanResolver.java:15` 的 `name` 参数由调用方外部控制，经 `$`→`/` 替换后可指向 KV 中任意键，即攻击者可选定被反序列化的载荷位置。③ `BeanResolver.java:23-26` 的 `lookupByNameAndType` 是复用同一链路的第二公开入口。
+
+2. **逐流防御验证**：主数据流 `KvSource.java:23 → BeanResolver.java:16 → PayloadCodec.java:33(decodeBase64) → :34(preCheck) → :35(deserialize) → :28(readObject)`：唯一拦截点是 `PayloadCodec.java:18-23` 的 `preCheck`，其为黑名单子串匹配且只封禁 `org.apache.commons.collections4.functors` 一个包，攻击者改用 commons-collections 3.x、Spring、JDK 内置等其他 gadget 链即可绕过，按规则黑名单不构成有效防御；全链无 `ObjectInputFilter`、无 lookahead 解析、无类白名单。备用流 `BeanResolver.java:24-25`：`type.cast` 发生在 `readObject` 之后，gadget 已在反序列化阶段执行完毕，类型转换对漏洞无任何缓解作用。
+
+3. **第二入口与替代通道**：存在——`lookupByNameAndType` 与任何直接调用 `PayloadCodec.decodeAndDeserialize/deserialize` 的代码共享同一个未防护 sink；`name` 参数使外部可将读取定向至任意 KV 键；能直写 KV 的攻击者甚至无需经过原 `put()` 序列化路径。所有入口均汇聚于 `PayloadCodec.java:28` 这一无过滤汇点。
+
+4. **结论**：跨文件污点链完整、无有效防御，CWE-502 成立，可导致远程代码执行，风险级别 Critical；最小修复锚定 `PayloadCodec.java:27`。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502: Deserialization of Untrusted Data（Java 原生反序列化，可致 RCE）", "risk_level": "Critical", "source": "L1:line 23: KvSource.fetchRaw 返回的 Consul KV 原始字符串（外部可写的共享存储内容）", "sink": "L2:line 28: PayloadCodec.deserialize 中 ObjectInputStream.readObject 对外部字节执行原生反序列化", "explanation": "主数据流: L1 KvSource.java line 23 fetchRaw 取出攻击者可控的 KV 值 -> L3 BeanResolver.java line 16 lookupByName 原样透传(仅做 $ 到 / 的键替换, 与载荷无关) -> L2 PayloadCodec.java line 33 decodeBase64 解码 -> line 34 preCheck -> line 35 deserialize -> line 28 readObject 触发危险反序列化; 防御核查: 该流唯一拦截点为 L2 line 18-23 的 preCheck, 属黑名单子串匹配且仅覆盖 org.apache.commons.collections4.functors 一个包, 更换 commons-collections 3.x 或 JDK 内置等 gadget 链即可绕过, 黑名单按规则视为无效防御, 全链未安装 ObjectInputFilter 也无类白名单解析器; 第二入口流: L3 line 23-26 lookupByNameAndType 复用同一链路, 其 type.cast 位于 line 25 即 readObject 之后, 无法阻止反序列化阶段已执行的 gadget, 不构成缓解; 替代通道: L3 line 15-16 的 name 参数由外部控制并可经 $ 替换指向任意 KV 键从而选定载荷, 具备 KV 写权限的攻击者亦可直写存储绕过写入侧序列化, 多个入口全部汇聚到 L2 line 28 这一未防护汇点, 故确认漏洞成立", "fix_suggestion": "line 27: 创建 ObjectInputStream 后立即调用 setObjectInputFilter 安装仅放行业务 Bean 类的白名单过滤器再执行 readObject, 或将存储格式改为 JSON 等非原生序列化"}
+```

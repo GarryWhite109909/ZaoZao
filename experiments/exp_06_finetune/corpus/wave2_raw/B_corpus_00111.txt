@@ -1,0 +1,107 @@
+LANG: php
+```code
+# === file: src/Monolog/SocketServer.php ===
+<?php
+
+namespace App\Monolog;
+
+/** Accepts raw log lines pushed by remote log agents over TCP. */
+class SocketServer
+{
+    private $socket;
+
+    public function __construct(string $host)
+    {
+        if (!str_contains($host, '://')) {
+            $host = 'tcp://'.$host;
+        }
+        if (!$sock = stream_socket_server($host, $errno, $errstr)) {
+            throw new \RuntimeException('Listen failed on '.$host);
+        }
+        $this->socket = $sock;
+    }
+
+    /** Yields clientId => raw line for every message any client sends. */
+    public function listen(): iterable
+    {
+        while ($client = stream_socket_accept($this->socket)) {
+            while (!feof($client)) {
+                yield (int) $client => fgets($client); // SOURCE
+            }
+        }
+    }
+}
+
+# === file: src/Monolog/RecordSanitizer.php ===
+<?php
+
+namespace App\Monolog;
+
+/** Best-effort scrubbing of inbound payloads before decoding. */
+class RecordSanitizer
+{
+    private const BLOCKED = ['Guzzle', 'Swift_', 'eval(', 'system('];
+
+    public function clean(string $raw): string
+    {
+        $data = base64_decode(trim($raw), true);
+        if (false === $data) {
+            return '';
+        }
+        foreach (self::BLOCKED as $frag) {
+            $data = str_replace($frag, '', $data);
+        }
+        return $data;
+    }
+}
+
+# === file: src/Command/ServerLogCommand.php ===
+<?php
+
+namespace App\Command;
+
+use App\Monolog\RecordSanitizer;
+use App\Monolog\SocketServer;
+use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
+
+class ServerLogCommand extends Command
+{
+    protected static $defaultName = 'app:server:log';
+
+    protected function configure()
+    {
+        $this->addOption('host', null, InputOption::VALUE_REQUIRED, 'Bind address', '0.0.0.0:9911');
+    }
+
+    protected function execute(InputInterface $input, OutputInterface $output)
+    {
+        $server = new SocketServer($input->getOption('host'));
+        $sanitizer = new RecordSanitizer();
+        foreach ($server->listen() as $clientId => $line) {
+            $record = unserialize($sanitizer->clean($line)); // SINK
+            if (false === $record) {
+                continue;
+            }
+            $output->writeln(sprintf('[client %d] %s', $clientId, print_r($record, true)));
+        }
+        return 0;
+    }
+}
+```
+
+**分析**
+
+1. 【输入点枚举与可达性】共两处外部输入：(a) `ServerLogCommand.php:L19` 定义的 `--host` CLI 选项，在 `L24` 传入 `SocketServer::__construct`（`SocketServer.php:L11-L19`），仅决定监听地址，不进入反序列化内容路径；(b) 主链输入——任意 TCP 客户端字节：`SocketServer.php:L25` `stream_socket_accept` 接受连接后，`L27` `fgets` 产出原始行并 yield，`ServerLogCommand.php:L26` foreach 接收为 `$line`，同文件 `L27` 经 `clean()` 后立即送入 `unserialize`——source 到 sink 跨文件可达，中间仅隔一个纯传递的清洗类。
+
+2. 【防御逐条核验】(a) `RecordSanitizer.php:L13` `base64_decode(..., true)` 严格模式只校验 base64 字符集完整性，攻击者可对任意恶意序列化串合法编码，非安全控制；(b) `RecordSanitizer.php:L17-L19` `str_replace` 黑名单仅删除 `Guzzle`/`Swift_`/`eval(`/`system(` 四个大小写敏感片段，可通过大小写变体（PHP 类名不区分大小写）、嵌套拼接（如 `GGuzzleuzzle` 删除一次后还原出 `Guzzle`）或改用未列入清单的 Symfony/Laminas 等 gadget 链绕过——字符串替换过滤按规则视为可绕过，无效；(c) `ServerLogCommand.php:L28-L30` 的 `false === $record` 判定发生在 unserialize 之后，POP 链已在 `L27` 触发，属事后容错而非防御；(d) 全链无 `allowed_classes` 白名单、无 HMAC 签名校验。
+
+3. 【第二入口与替代通道】代码库中仅此一条命令调用 `SocketServer::listen` 与 `RecordSanitizer::clean`，不存在绕过清洗直达 sink 的其他路由或间接调用；但默认绑定 `0.0.0.0:9911`（`ServerLogCommand.php:L19` 默认值，`SocketServer.php:L13-L14` 自动补 `tcp://` 前缀），且 `SocketServer.php:L25` accept 时无任何认证握手，任何能连通该端口的主机均为等效入口，实际暴露面等同多入口。
+
+4. 【结论】source（文件1 网络读取）与 sink（文件3 反序列化）分离，中间文件的黑名单过滤形同虚设，调用链上无完整防御，构成典型跨文件 CWE-502，网络可达且通常导致 RCE，定为 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 对不可信数据执行反序列化（跨文件：网络源到 unserialize 汇点）", "risk_level": "Critical", "source": "L1:line 27: SocketServer.php 中 fgets($client) 读入的任意 TCP 客户端原始字节流", "sink": "L3:line 27: ServerLogCommand.php 中 unserialize($sanitizer->clean($line)) 未限制 allowed_classes", "explanation": "主数据流：任意TCP客户端→SocketServer.php:L25 accept→L27 fgets产出原始行→ServerLogCommand.php:L26 foreach接收→L27 clean后立刻unserialize，source与sink分处不同文件；防御核验一：RecordSanitizer.php:L13 base64_decode严格模式仅验证字符集完整性，恶意序列化串可合法编码通过，非安全控制；防御核验二：RecordSanitizer.php:L17-L19 str_replace黑名单仅四个大小写敏感片段，可用大小写变体（PHP类名不区分大小写）、嵌套拼接如GGuzzleuzzle还原、或未列入清单的Symfony/Laminas等gadget链绕过，字符串替换过滤视为可绕过故无效；防御核验三：ServerLogCommand.php:L28-L30的false判定发生在unserialize之后，POP链已在sink触发，属事后容错；全链无allowed_classes白名单亦无HMAC签名；第二入口评估：仅此一条命令链到达sink，无其他路由或间接调用可绕过清洗，但默认绑定0.0.0.0:9911（ServerLogCommand.php:L19默认值、SocketServer.php:L13-L14自动补tcp://）且accept无认证（SocketServer.php:L25），任何可达端口的主机均为等效入口，暴露面等同多入口，维持Critical", "fix_suggestion": "line 27: 改为 unserialize($sanitizer->clean($line), ['allowed_classes' => false]) 并在SocketServer层增加共享密钥HMAC校验，或整体改用 json_decode 解析记录"}
+```

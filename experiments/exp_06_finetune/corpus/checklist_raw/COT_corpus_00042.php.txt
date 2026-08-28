@@ -1,0 +1,31 @@
+## 漏洞分析报告
+
+**步骤 1｜枚举用户可控输入点**
+
+- 第 90 行：构造函数参数 `$originalName`，docblock 明示 'The client-provided filename'。框架解析 multipart 上传时以 `$_FILES[...]['name']` 填充，攻击者通过伪造表单 filename 可完全控制其内容（包括 `../` 序列、路径分隔符等）。
+- 第 98 行：`$clientPath`（webkit 相对路径）同为客户端可控，但仅被存储并于第 279–282 行原样返回，未到达任何文件操作 sink。
+- 第 132 行：`move()` 的 `$targetPath` 通常由开发者指定；可选参数 `$name` 缺省为 null 时将回退到上述可控状态（见步骤 2）。
+
+**步骤 2｜逐条验证 source→sink 数据流的防御**
+
+- 流 A（漏洞流）：第 90 行 `$originalName` → 第 93 行未做任何处理直接赋给 `$this->name` → 第 145 行当调用方未传第二参时 `$name ??= $this->getName()` 取回原始客户端文件名 → 第 146 行直接拼接为 `$destination` → 第 149 行 `move_uploaded_file($this->path, $destination)` 落盘。全链路不存在 basename()/pathinfo()/白名单/遍历序列过滤。
+- 防御有效性核查：
+  - 第 141 行 `isValid()`（实现在第 337 行 `is_uploaded_file($this->path) && $this->error === UPLOAD_ERR_OK`）只校验源临时文件是真实上传件，完全不约束目标路径；
+  - 第 146 行 `getDestination()`（父类方法）仅在同名冲突时追加序号避让，不做路径归一化或 `..` 剥离；
+  - 第 167 行 `$this->name = basename($destination)` 在 sink 之后才执行，对本次写入无防护作用。
+  - 结论：无任何有效防御覆盖该条流。
+- 流 B（安全对照）：第 351–357 行 `store()` 调用 `move()` 时始终显式传入 `$fileName`，缺省走 `getRandomName()` 随机名，不会落入第 145 行的回退分支。
+
+**步骤 3｜第二入口/替代通道核查**
+
+- `store()`（第 351 行）固定传第二参且默认随机名，不触发该漏洞；其 `$folderName`（第 353 行）若被上层以用户输入调用可另成路径拼接点，属调用方责任，本文件内默认 `date('Ymd')` 安全。
+- `getClientName()`（第 270 行）、`getClientExtension()`（第 328 行）、`getExtension()`（第 303 行）返回客户端可控字符串（注释已声明 NOT trusted），但均为取值接口而非写盘 sink，风险取决于下游用法。
+- 主利用入口唯一且常见：按官方允许的用法省略第二参调用 `move()`（第 132 行签名 `$name = null`），无需额外入口即可触达 sink。
+
+**步骤 4｜结论**
+
+攻击者上传 filename 形如 `../../../../var/www/html/shell.php` 的文件，应用执行 `$file->move(WRITEPATH.'uploads/')` 时，第 145→146→149 行链路会把攻击者完全控制的内容写到预期目录之外（如 webroot），构成任意路径文件写入；若落点可被 Web 解析则升级为远程代码执行。判定为 CWE-22 路径遍历（任意文件写入），综合评级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "High", "source": "line 90: 构造函数参数 $originalName（框架自 $_FILES 填充的客户端上传文件名）", "sink": "line 149: move_uploaded_file($this->path, $destination)", "explanation": "客户端可控文件名 $originalName -> line 93 未净化存入 $this->name -> line 145 当 move() 省略第二参时 $name 回退为 getName() 即原始文件名 -> line 146 直接拼接进 $destination 且 getDestination 仅做重名避让 -> line 149 move_uploaded_file 将上传内容写入逃逸出目标目录的路径（如 ../../html/shell.php），形成任意位置文件写入并可致 RCE；line 141/337 的 isValid 与 is_uploaded_file 只校验源文件合法性，line 167 的 basename 位于 sink 之后，均不构成有效防御", "fix_suggestion": "line 145: 改为 $name ??= basename($this->getName()); 以剥离客户端文件名中的目录成分与遍历序列"}
+```

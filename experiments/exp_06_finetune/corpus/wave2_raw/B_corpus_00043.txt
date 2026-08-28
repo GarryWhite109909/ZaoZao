@@ -1,0 +1,110 @@
+LANG: go
+
+```code
+# === file: gitapi/routes.go ===
+package gitapi
+
+import (
+	"net/http"
+
+	"example.com/gitapi/refs"
+)
+
+// HandleUpdateRef 处理 POST /refs/update?ref=<short>&hash=<sha>
+func HandleUpdateRef(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("ref")
+	if name == "" {
+		name = r.Header.Get("X-Ref-Name") // 备用输入通道
+	}
+	hash := r.URL.Query().Get("hash")
+	if err := refs.UpdateRef(name, hash); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+# === file: gitapi/refs/service.go ===
+package refs
+
+import (
+	"errors"
+	"regexp"
+	"strings"
+
+	"example.com/gitapi/storage"
+)
+
+var ctrlSeqs = regexp.MustCompile(`[\000-\037\177]`)
+
+var ErrInvalidReferenceName = errors.New("invalid reference name")
+
+// ReferenceName 对应上游 plumbing.ReferenceName
+type ReferenceName string
+
+func NewBranchReferenceName(name string) ReferenceName {
+	return ReferenceName("refs/heads/" + name)
+}
+
+// sanitizeRef 清除短名中的父目录序列后再持久化
+func sanitizeRef(s string) string {
+	return strings.ReplaceAll(s, "../", "")
+}
+
+// Validate 仅实现 git-check-ref-format 的控制字符规则，其余规则 TODO
+func (r ReferenceName) Validate() error {
+	if ctrlSeqs.MatchString(string(r)) {
+		return ErrInvalidReferenceName
+	}
+	return nil
+}
+
+// UpdateRef 净化短名后委托存储层写入
+func UpdateRef(short, hash string) error {
+	n := NewBranchReferenceName(sanitizeRef(short))
+	if err := n.Validate(); err != nil {
+		return err
+	}
+	return storage.WriteRef(n.String(), hash)
+}
+
+# === file: gitapi/storage/store.go ===
+package storage
+
+import (
+	"os"
+	"path/filepath"
+)
+
+// RefStore 将松散引用持久化到 Root（即 .git 目录）
+type RefStore struct {
+	Root string
+}
+
+var Default = &RefStore{Root: ".git"}
+
+// WriteRef 创建父目录并写入松散引用文件
+func WriteRef(name, hash string) error {
+	p := Default.Root + string(filepath.Separator) + name
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(p, []byte(hash+"\n"), 0o644)
+}
+```
+
+分析：
+
+1. 【输入点枚举与可达性】外部输入共三处：routes.go L11 `r.URL.Query().Get('ref')`（主 source）、L13 `r.Header.Get('X-Ref-Name')`（备用通道）、L15 `Get('hash')`（决定写入内容）。L11/L13 的值在 L16 直接传入 `refs.UpdateRef`，经 L2 service.go L37 加前缀、L41 进入 `storage.WriteRef`，最终到达 L3 store.go L21 `os.WriteFile`——source 到 sink 全链可达，中间无任何断点。
+
+2. 【主链防御核验】第一道防线 L2 L24 `strings.ReplaceAll(s,'../','')` 属黑名单字符串替换：单次扫描删除后，`....//` 会残留 `../`，故 payload `....//....//....//tmp//pwn` 还原为 `../../../tmp/pwn`，可绕过；第二道防线 L2 L28-L33 `Validate()` 只保留了上游 go-git 规则 4（控制字符正则），缺失点段 `..`、反斜杠、`.lock` 后缀等关键规则，且在加前缀之后才校验，属“看似发生实则不完整”的伪净化。两道均非有效防御。
+
+3. 【sink 处无兜底】L3 L17 用纯字符串拼接 `Root + 分隔符 + name` 构造路径，未做 `filepath.Clean` 后的 Root 前缀校验，L18 `MkdirAll` 还会替攻击者创建越界目录，L21 直接落盘。因此 `ref=....//....//....//tmp//pwn&hash=xxx` 可在仓库外任意路径写文件，且内容 hash 同样来自 L15 的未校验输入。
+
+4. 【第二入口与替代通道】存在：当查询参数为空时，routes.go L13 回退读取请求头 `X-Ref-Name`，与主参数汇入同一 `UpdateRef`→`WriteRef`→`os.WriteFile` 链，构成同一路由下的替代传输通道；此外 `hash` 参数是同一 sink 的内容维度污点源。全项目无其他 handler、无其他文件写入函数，故所有通道均汇聚于该唯一 sink，可达性结论稳固。
+
+5. 【结论】调用链上仅有可绕过的黑名单替换与覆盖面严重不足的正则校验，无完整防御，构成 CWE-22 路径穿越（任意文件写入，路径与内容均可控），定为 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径穿越：引用短名净化不完整导致越界文件写入", "risk_level": "Critical", "source": "L1:line 11: HTTP 查询参数 ref（r.URL.Query().Get），备用通道为 L1:line 13 的 X-Ref-Name 请求头", "sink": "L3:line 21: os.WriteFile 写入由 L3:line 17 字符串拼接而成的攻击者可控路径", "explanation": "数据流1（主链）：L1 line11 取查询参数 ref 为 source，L1 line16 传入 refs.UpdateRef；L2 line24 sanitizeRef 仅用 strings.ReplaceAll 单次删除 ../，黑名单替换可被 ....// 嵌套序列绕过还原出 ../../../；L2 line28 Validate 只检查控制字符（对应上游规则4），缺失点段、反斜杠、.lock 等规则且在校验前已拼接前缀，属位置与覆盖面均不完整的伪净化；L2 line41 将 refs/heads/+污染名交给 storage.WriteRef；L3 line17 纯字符串拼接 Root 与 name，无 Clean 后前缀校验，L3 line21 os.WriteFile 完成越界写入，示例 payload ref=....//....//....//tmp//pwn 可写出仓库目录且 L1 line15 的 hash 参数同时污染文件内容。防御核验：链上仅两处过滤——L2 line24 黑名单替换（按要求视为可绕过）与 L2 line29 仅覆盖控制字符的正则（覆盖面不足），均非有效防御，调用链无完整校验。第二入口：L1 line13 当查询参数为空时回退读取 X-Ref-Name 请求头，与主参数汇入同一 sink，构成替代通道；项目内无其他路由或间接写文件路径，所有通道收敛于唯一 sink，故判定 CWE-22 成立。", "fix_suggestion": "line 24(L2 service.go): 用白名单校验替代 ReplaceAll——对最终 ReferenceName 执行完整 git-check-ref-format 规则（拒绝含 .. 的段、开头为点、结尾 .lock、反斜杠等），并在 L3 line17 之后追加 filepath.Clean 结果必须仍以 Root 为前缀的校验，确保路径无法逃逸"}
+```

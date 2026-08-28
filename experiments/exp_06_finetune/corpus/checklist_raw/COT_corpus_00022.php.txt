@@ -1,0 +1,29 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点**
+- 第 81 行：`$this->defaultValue = $request->getParam($this->queryParameter);` —— 字段配置为 `query` 时，URL 查询参数值原样写入属性，完全由攻击者控制；
+- 第 83 行：`$_COOKIE[$this->cookieName] ?? ''` —— Cookie 值由客户端任意指定；
+- 第 65/67 行：User-Agent / Referer 请求头，客户端可控；
+- 第 102 行：`serializeValue(mixed $value, ...)` 的 `$value` 来自表单提交处理链。该字段前端渲染为 `<input type="hidden">`（第 139 行 getInputHtml 渲染输入模板，末尾 defineHtmlTag 定义 type=hidden），提交值不受任何服务端约束，未认证用户可 POST 任意内容覆盖。
+
+**步骤 2｜逐条验证 source→sink 数据流与防御有效性**
+- 流 A（主漏洞，对应背景描述）：提交值 `$value` → 第 105 行仅判断 `defaultOption === 'custom'` → 第 113 行 `if ($value === '')` 只拦截空串并回填默认值，**任何非空攻击载荷原样放行** → 第 117 行 `Variables::getParsedValue($value, $element)` 将该值交由 Twig 模板引擎求值（背景已证实提交值在提交处理中被当 Twig 执行）。全链路无转义、无参数化、无精确白名单；空串检查不构成对 `{{ }}`/`{% %}` 语法的中性化。→ 防御缺失，漏洞成立。
+- 流 B：第 81/83 行查询参数/Cookie → `$this->defaultValue` → 第 173-174 行 `Craft::$app->getView()->renderString((string)$this->defaultValue, ...)` 显式把字符串作为 Twig 模板渲染，中间零过滤。→ 第二条独立注入路径成立。
+
+**步骤 3｜第二入口/替代通道核查**
+- 除 POST 表单提交（流 A）外，存在 GET 查询参数与 Cookie 两条替代通道（第 81、83 行），可在页面渲染阶段经 renderString（第 173 行）触发；`userAgent`/`referUrl` 配置（第 65、67 行）亦可将可控头部值带入同一渲染点。各通道互相独立、均无需认证、均无防御覆盖，不存在“仅单一路径可达”的缓解情形。
+
+**步骤 4｜结论**
+- 未认证攻击者可通过构造的表单提交值（或查询参数/Cookie）直达 Twig 求值点，构成 CWE-1336 服务端模板注入（SSTI）。Craft/Twig 环境下模板内可访问全局对象，通常可导致敏感信息泄露乃至远程代码执行，风险等级 Critical。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-1336 服务端模板注入",
+  "risk_level": "Critical",
+  "source": "line 102: serializeValue($value) 接收的前端表单提交值（隐藏域可被未认证用户任意篡改）；辅助来源 line 81: $request->getParam($this->queryParameter) 与 line 83: $_COOKIE[$this->cookieName]",
+  "sink": "line 117: Variables::getParsedValue($value)（内部将值作 Twig 求值）；另一 sink line 173-174: getView()->renderString((string)$this->defaultValue)",
+  "explanation": "未认证提交值 -> line 105 判定 defaultOption 为 custom -> line 113 仅拦截空串、非空载荷原样放行 -> line 117 传入 Variables::getParsedValue 被当 Twig 模板求值 -> 攻击者用 {{...}} 语法实现 SSTI（可致信息泄露/RCE）；第二通道：line 81/83 查询参数或 Cookie 写入 defaultValue -> line 173-174 renderString 直接渲染 -> 同样模板注入；两条流均无转义/白名单等有效防御",
+  "fix_suggestion": "line 117: 不再将用户提交的 $value 传入 Variables::getParsedValue 做 Twig 解析，改为仅解析管理员配置的 defaultValue、提交值原样存储"
+}
+```

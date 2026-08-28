@@ -1,0 +1,96 @@
+LANG: php
+```code
+# === file: api/updateBackground.php ===
+<?php
+/**
+ * Endpoint: POST /api/updateBackground.php
+ * Saves the logged-in user's background photo.
+ */
+header('Content-Type: application/json');
+global $global;
+if (!isset($global['systemRootPath'])) {
+    require_once '../videos/configuration.php';
+}
+require_once $global['systemRootPath'] . 'objects/user.php';
+require_once $global['systemRootPath'] . 'objects/UserPhotoService.php';
+
+$obj = new stdClass();
+if (!User::isLogged()) {
+    $obj->error = __('You must be logged');
+    die(json_encode($obj));
+}
+// NOTE: no CSRF token / Origin check is performed on this state-changing POST
+$response = UserPhotoService::handleSave($_POST['imgBase64']);
+print json_encode($response);
+
+# === file: objects/UserPhotoService.php ===
+<?php
+/**
+ * Service layer: shapes the upload payload and delegates persistence.
+ */
+require_once __DIR__ . '/functions.php';     // provides base64DataToImage(), __()
+require_once __DIR__ . '/PhotoStorage.php';
+
+class UserPhotoService
+{
+    public static function handleSave($imgBase64)
+    {
+        global $global;
+        if (!is_string($imgBase64) || strlen($imgBase64) < 32) {
+            return ['status' => 'error', 'msg' => 'invalid image payload'];
+        }
+        // Normalizes url-safe base64 spaces; formatting only, NOT a security gate
+        $imgBase64 = str_replace(' ', '+', $imgBase64);
+        $imageData = base64DataToImage($imgBase64);
+        $imagePath = 'videos/userPhoto/';
+        if (!is_dir($global['systemRootPath'] . $imagePath)) {
+            mkdir($global['systemRootPath'] . $imagePath, 0755, true);
+        }
+        if (!is_writable($global['systemRootPath'] . $imagePath)) {
+            return ['status' => 'error', 'msg' => 'No write Access'];
+        }
+        $fileName = 'background' . User::getId() . '.png';
+        // request origin was never verified beyond the session cookie
+        return PhotoStorage::store($imagePath . $fileName, $imageData);
+    }
+}
+
+# === file: objects/PhotoStorage.php ===
+<?php
+/**
+ * Persistence layer for user photo blobs.
+ */
+require_once __DIR__ . '/user.php';
+
+class PhotoStorage
+{
+    public static function store($photoURL, $binaryData)
+    {
+        global $global;
+        // Writes whatever bytes arrive from the service layer
+        $bytes = file_put_contents($global['systemRootPath'] . $photoURL, $binaryData);
+        if (!$bytes) {
+            return ['status' => 'error', 'msg' => 'We could not save this file'];
+        }
+        $user = new User(User::getId());
+        $user->setBackgroundURL($photoURL);
+        $user->save();
+        User::updateSessionInfo();
+        return ['status' => 'success', 'url' => $global['systemRootPath'] . $photoURL];
+    }
+}
+```
+
+**分析（针对整组文件）**
+
+1. **外部输入点枚举与可达性**：本组文件唯一的外部输入点是 L1 `api/updateBackground.php` 第 20 行读取的 `$_POST['imgBase64']`。它作为实参传入 L2 `objects/UserPhotoService.php` 第 10 行的 `handleSave()`，在第 17 行经 `str_replace` 归一化、第 18 行经 `base64DataToImage()` 解码为二进制后，于第 28 行传入 `PhotoStorage::store()`，最终到达 L3 `objects/PhotoStorage.php` 第 13 行的 `file_put_contents()` 并写盘，随后第 17–19 行更新用户记录。登录检查通过后数据流无条件可达，source 与 sink 分处不同文件，链路闭合。
+
+2. **逐跳防御验证**：L1 第 15–18 行仅为登录态检查（AuthN），对跨站请求伪造无防护作用，第 19 行注释表明 CSRF 校验从未实现；L2 第 13 行是类型/长度检查（格式层面），第 17 行 `str_replace(' ', '+', ...)` 属字符串替换归一化，按规则视为可绕过且非安全控制，第 20–25 行是目录创建与可写性的运维检查；L3 第 13 行直接落盘，无任何内容或来源校验。全链路不存在 CSRF 令牌比对、Origin/Referer 校验或 SameSite 约束，防御缺失且中间层“看似有检查实则不完整”。
+
+3. **第二入口与替代通道排查**：在本组三个文件内，`PhotoStorage::store` 仅被 L2 第 28 行单点调用，`handleSave` 仅被 L1 第 20 行调用；不存在 GET 变体、其他参数名或间接包含形成的第二入口。但唯一入口本身即暴露面：浏览器对跨站自动提交的 POST 表单会自动携带受害者会话 Cookie，PHP 对 urlencoded 与 multipart 编码均填充 `$_POST`，`Content-Type: application/json` 响应头不能阻止此类请求，故单入口仍足以确认 CWE-352 成立。
+
+4. **结论**：攻击者页面可在受害者已登录状态下伪造 POST，携带任意 base64 内容，使服务器以受害者身份将攻击者控制的字节写入 `videos/userPhoto/background<uid>.png` 并持久化到用户资料，属认证后状态变更端点的跨站请求伪造，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-352 跨站请求伪造：状态变更型认证端点缺少CSRF令牌校验，攻击者可借受害者会话写入任意文件内容", "risk_level": "High", "source": "L1:line 20: api/updateBackground.php 读取的外部POST参数 $_POST['imgBase64']", "sink": "L3:line 13: objects/PhotoStorage.php 中 file_put_contents($global['systemRootPath'].$photoURL, $binaryData)", "explanation": "流1: L1:line 20 的 $_POST['imgBase64'] 传入 L2:line 10 handleSave，经 L2:line 17 字符串替换与 line 18 base64DataToImage 解码后由 L2:line 28 传入 PhotoStorage::store，最终在 L3:line 13 file_put_contents 写盘并于 L3:line 17-19 持久化到用户记录，全程无来源校验；防御核查: L1:line 15-18 仅登录态检查属AuthN非CSRF防护，L2:line 13 类型长度检查与 line 17 字符串替换均非有效防御(可绕过)，L2:line 20-25 为目录可写性运维检查，L3 无任何校验，整链无令牌/Origin/Referer/SameSite机制，防御不完整；第二入口排查: PhotoStorage::store 仅被 L2:line 28 单点调用、handleSave 仅被 L1:line 20 调用，无GET变体或替代参数通道，但唯一入口因浏览器自动携带会话Cookie且PHP对multipart/urlencoded均填充$_POST而直接暴露于跨站伪造请求，故确认CWE-352成立", "fix_suggestion": "line 20: 在调用 handleSave 前校验与会话绑定的CSRF令牌，如 hash_equals($_SESSION['csrf_token'], $_POST['csrf_token']) 不通过即返回403，并在渲染上传表单时下发该一次性令牌"}
+```

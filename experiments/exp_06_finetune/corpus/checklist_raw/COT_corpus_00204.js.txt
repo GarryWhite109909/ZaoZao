@@ -1,0 +1,27 @@
+## 漏洞分析报告
+
+### 步骤 1｜枚举用户可控输入点
+
+- **输入点①**：第 223 行路由 `` `${self.options.prettyUrlDir}/*` ``（即 `/files/*`）的路径参数，第 225 行从 `req.params[0]` 取出，URL 路径完全由请求者控制。
+- **输入点②**：第 256 行 `req.get('host')`，HTTP Host 头完全由请求者控制。
+- **输入点③**：第 19 行 `insertViaUpload: true` 允许通过上传直接创建文件 piece；第 43-47 行 `attachment` 字段接受 attachment 模块允许的任意类型（第 2 行注释明示“any type”），即攻击者（editor 角色）可上传含内嵌脚本的 SVG/HTML 等活动内容，存入 `file.attachment`。
+- **输入点④**：`doc.slug`（第 135、234 行使用），由 slug 字段类型做规范化清洗。
+
+### 步骤 2｜逐条追踪 source→sink 数据流及防御有效性
+
+- **流 A（安全）**：`req.params[0]` → 第 225 行正则 `^([^.]+)\.\w+$` 与第 230 行黑名单（`..`、`/`）→ 仅作为第 233-235 行查询对象的值传入 `self.find`（对象语法，非字符串拼接，无注入）→ 该 slug 未被反射进任何响应体；第 227/231/237/261 行 `res.send(...)` 输出的均为静态字面量。此流无 XSS sink。
+- **流 B（漏洞流）**：上传的 SVG 文件内容 → `file.attachment` → 第 248 行 `self.apos.attachment.url()` 取回源地址 → 第 255-257 行拼出 `proxyUrl` → **第 258 行 `streamProxy` 将上游响应的字节与 `content-type: image/svg+xml` 原样回传，且运行在站点自身域（same-origin）下**。全程无 `Content-Disposition: attachment`、无 `Content-Security-Policy: sandbox`、无内容转义/净化；第 225/230 行的校验只约束 URL 形状用于防目录遍历，对响应体内容零覆盖，按规则黑名单类过滤亦不算有效防御 → 浏览器导航到 `/files/x.svg` 时直接渲染 SVG 并在站点源执行内嵌脚本 → **存储型 XSS**。
+- **流 C（第二通道）**：Host 头 → 第 256 行拼入 `proxyUrl` → 服务端向攻击者指定的主机发起请求，并将该主机的响应头/体经第 258 行转发给客户端 → 攻击者可用自控服务器返回 `text/html` 载荷，借助本地 uploadfs 场景形成反射型内容注入/XSS（兼有 SSRF 面）。两条流在第 258 行汇合同一 sink。
+
+### 步骤 3｜第二入口/替代通道核查
+
+- 第 140-151 行 `addUrls` 与第 165-214 行 `applyPrettyUrlPaths` 将 `getPrettyPath` 结果写入 `_url`/`_prettyUrl`/`entry.urls`，属模板渲染通道，slug 有字段级清洗，风险次要。
+- 替代通道成立：无需额外路由，任何 attachment 允许的活动内容类型（SVG/HTML 等）均可经同一 `/files/*` 路由（第 223 行）触发流 B；curl 直接请求该路由即可复现截图中的 XSS 现象。
+
+### 步骤 4｜结论
+
+存在存储型 XSS（CWE-79）：用户上传的活动内容经站点同源代理原样输出，缺少强制下载/沙箱响应头等输出侧防御；Host 头注入构成可达同一 sink 的第二通道。综合利用条件（需 editor 上传权限）定级 **High**。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (XSS)", "risk_level": "High", "source": "line 19: insertViaUpload 允许上传任意类型附件（如含内嵌脚本的 SVG），内容存入 file.attachment", "sink": "line 258: streamProxy 将附件原始字节连同上游 content-type 在站点自身域原样回传", "explanation": "攻击者上传含脚本的 SVG -> 第 248 行取回源 URL -> 第 255-257 行构造 proxyUrl -> 第 258 行 streamProxy 以 image/svg+xml 同源输出 -> 浏览器渲染 SVG 并在站点源执行内嵌脚本 -> 存储型 XSS；第 225/230 行正则与黑名单仅防目录遍历、不覆盖响应体输出，不构成有效防御；第二通道：第 256 行 req.get('host') 可控使代理可被指向攻击者主机并转发任意 text/html 响应至同一 sink", "fix_suggestion": "line 258: 为 streamProxy 增加响应头覆盖，强制 Content-Disposition: attachment 并附加 CSP sandbox 头，阻止 SVG/HTML 在站点源内联执行"}
+```

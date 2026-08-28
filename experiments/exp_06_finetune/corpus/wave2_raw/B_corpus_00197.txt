@@ -1,0 +1,110 @@
+LANG: go
+
+```code
+# === file: internal/server/handler.go ===
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"mcpagent/internal/tools"
+)
+
+type invokeRequest struct {
+	Args map[string]string `json:"args"`
+}
+
+// POST /api/tool/invoke : main entry used by LLM clients.
+func InvokeHandler(w http.ResponseWriter, r *http.Request) {
+	var req invokeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	command := req.Args["command"] // SOURCE: raw client input
+	out, err := tools.RunShell(r.Context(), req.Args["working_dir"], command)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"output": out})
+}
+
+// GET /debug/exec : legacy CI channel (second entry point).
+func DebugExec(w http.ResponseWriter, r *http.Request) {
+	command := r.URL.Query().Get("cmd") // SOURCE #2
+	out, _ := tools.RunShell(r.Context(), "", command)
+	w.Write([]byte(out))
+}
+
+# === file: internal/tools/guard.go ===
+package tools
+
+import (
+	"errors"
+	"regexp"
+	"strings"
+)
+
+var denyList = []*regexp.Regexp{
+	regexp.MustCompile(`\brm\s+-[rf]{1,2}\b`),
+	regexp.MustCompile(`\bdd\s+if=`),
+	regexp.MustCompile(`\b(format|mkfs|diskpart)\b\s`),
+	regexp.MustCompile(`\b(shutdown|reboot|poweroff)\b`),
+}
+
+// Screen looks defensive but only denies a fixed list; base64 pipes,
+// $() expansion or quote splitting (r''m) bypass every rule here.
+func Screen(command string) error {
+	lower := strings.ToLower(strings.TrimSpace(command))
+	for _, re := range denyList {
+		if re.MatchString(lower) {
+			return errors.New("blocked by safety guard")
+		}
+	}
+	return nil
+}
+
+# === file: internal/tools/executor.go ===
+package tools
+
+import (
+	"bytes"
+	"context"
+	"os/exec"
+	"runtime"
+)
+
+// RunShell runs the caller supplied command string inside a shell.
+func RunShell(ctx context.Context, cwd, command string) (string, error) {
+	if err := Screen(command); err != nil {
+		return "", err
+	}
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", command)
+	} else {
+		cmd = exec.CommandContext(ctx, "sh", "-c", command) // SINK
+	}
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	return out.String(), err
+}
+```
+
+**分析**
+
+1. **输入点枚举与可达性**：外部输入共两处。① handler.go L17 解码 POST /api/tool/invoke 请求体，L21 提取 `req.Args['command']` 为 source①，L22 连同 L22 的 `working_dir` 一并传入 `tools.RunShell`（executor.go L11），中间无任何类型转换失败分支或提前 return 阻断，直达 sink executor.go L19 可达性成立；② handler.go L32 的查询参数 `cmd` 为 source②，经 L33 进入同一 `RunShell`，同样可达。
+2. **流1防御核验**（handler.go L21 → executor.go L19）：唯一防线是 executor.go L12 调用的 guard.go L18 `Screen`，其实现仅为对小写字符串匹配 guard.go L9-L14 的 4 条黑名单正则。黑名单属可绕过过滤：base64 管道解码后交给 sh、`$()` 命令替换、引号拆分（如 `r''m -rf /`）、以及任何不在规则内的命令（`curl x.sh|sh`）均不命中；全程无白名单、无参数数组式 exec、无 shell 转义，且原版的 restrictToWorkspace 路径遍历校验在拆分重组时被整体删除——防御位置在 sink 前一步但覆盖面严重不足，不构成有效防御。
+3. **流2防御核验**（handler.go L32 → executor.go L19）：与流1完全共用 `Screen` 与 sink，防御缺口一致。附加通道：handler.go L22 传入的 `working_dir` 直达 executor.go L21-23 设置 `cmd.Dir`，攻击者可将执行目录设为任意路径，进一步放大影响面。
+4. **第二入口结论**：存在替代通道 GET /debug/exec（handler.go L31-35），与主入口两源一汇于 executor.go L19；这意味着仅在 guard.go 补规则无法覆盖调试路由，必须改 sink 侧执行模型才能根治。
+5. **结论**：主链 handler.go L21 → executor.go L19 调用链上无完整防御，构成 HTTP 直接可达的任意命令执行，判定 CWE-78 成立，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78: OS Command Injection", "risk_level": "Critical", "source": "L1:line 21: req.Args['command'] 从 POST /api/tool/invoke 请求体解析出的攻击者可控命令串（次入口为 L1:line 32 的查询参数 cmd）", "sink": "L3:line 19: exec.CommandContext(ctx, 'sh', '-c', command) 将用户字符串直接交 shell 执行", "explanation": "流1: L1:line 17 解码请求体→line 21 取 command→line 22 调 tools.RunShell→L3:line 12 过 Screen→line 19 以 sh -c 执行, 全程无可信校验; 流2: L1:line 32 取查询参数 cmd→line 33 调同一 RunShell→同一 sink; 防御分析: 唯一防线是 L2:line 18-26 的 Screen, 仅对 L2:line 9-14 的 4 条黑名单正则做小写匹配, 属可绕过的黑名单过滤, base64 管道解码执行、$() 替换、引号拆分(如 r''m -rf /)以及规则外任意命令均可穿透, 且原版 restrictToWorkspace 路径校验在重构中被删除, 不存在白名单或参数数组式 exec; 第二入口: 存在 GET /debug/exec(L1:line 31-35)作为替代通道并与主入口汇聚于同一 sink, 另有 working_dir 参数(L1:line 22→L3:line 21-23)可任意设定 cmd.Dir 工作目录, 综合判定调用链上无完整防御, CWE-78 成立", "fix_suggestion": "line 19: 废弃 sh -c 字符串拼接, 改为参数数组形式 exec.CommandContext(ctx, bin, args...) 并对 bin 做固定白名单校验; 同时将 guard.go 黑名单升级为白名单模式, 并下线 L1 中 /debug/exec 调试路由"}
+```

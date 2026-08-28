@@ -1,0 +1,33 @@
+## 漏洞分析报告
+
+**步骤 1｜用户可控输入点枚举与追踪**
+
+本文件是 beego 基础工具库，三个导出函数的形参均由上层组件（含处理远程请求的 cache 模块）传入，属外部可控数据：
+
+- 第 49 行 `SearchFile(filename string, paths ...string)`：`filename` → 第 51 行 `filepath.Join(path, filename)` → `FileExists` → 第 39 行 `os.Stat(name)`；
+- 第 62 行 `GrepFile(patten string, filename string)`：`filename` → 第 68 行 `os.Open(filename)`（任意路径文件读取）；`patten` → 第 63 行 `regexp.Compile(patten)`；
+- 第 38 行 `FileExists(name string)`：`name` → 第 39 行 `os.Stat(name)`。
+
+所有文件名类输入均无阻碍地到达文件系统危险 sink（`os.Open`/`os.Stat`）。
+
+**步骤 2｜防御有效性验证**
+
+逐条检查 source→sink 流：
+
+- 第 51 行 `filepath.Join` 仅做路径拼接，**不清洗 `../`、不限定目录白名单**，不构成防御；
+- 第 68 行 `os.Open(filename)` 之前没有任何规范化、归属校验或强哈希绑定，形参直通 sink；
+- 第 63 行 `regexp.Compile` 只是编译正则用于匹配，对输入不起安全过滤作用（Go RE2 虽免疫回溯爆炸，但不约束文件名）；
+
+即三条流上均**不存在任何有效防御**（无参数化等价物、无白名单精确允许集、无转义）。
+
+**步骤 3｜第二入口/替代通道**
+
+存在替代通道：依据背景，beego ≤2.2.0 的 `cache/file.go` 中 `getCacheFileName` 使用弱哈希（MD5）将远程可控的缓存 key 直接派生为缓存文件名，随后依赖本文件的文件操作原语（`FileExists`/`SearchFile`/`GrepFile` 所封装的 `os.Stat`/`os.Open` 路径逻辑）完成读写。由于文件名由弱算法确定性派生且全链路无完整性校验，远程攻击者可预测或碰撞目标缓存文件名，覆盖其他用户的缓存条目，形成“远程可控 key → 弱哈希派生文件名 → 未鉴权文件打开”的第二条污点通道，最终导致权限提升。
+
+**步骤 4｜结论**
+
+文件名从外部输入到 `os.Open`/`os.Stat` 全程无有效防御，且关键文件名派生环节采用弱加密算法、缺乏完整性绑定（CWE-327），二者叠加使远程攻击者可实现跨用户缓存覆盖与权限提升。风险等级 **High**（远程触发、后果为提权，但需特定缓存写入权限条件）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-327 Use of a Broken or Risky Cryptographic Algorithm", "risk_level": "High", "source": "line 62: GrepFile 形参 filename/patten 及 line 49: SearchFile 形参 filename（上游为远程可控缓存 key 经 getCacheFileName 弱哈希派生的文件名）", "sink": "line 68: os.Open(filename)（辅以 line 51: filepath.Join 后 line 39: os.Stat）", "explanation": "远程可控缓存 key -> getCacheFileName 用弱哈希(MD5)派生文件名且无完整性校验 -> 作为实参传入本文件导出函数(line 49/line 62) -> line 51 filepath.Join 不清洗 ../ 且无白名单 -> line 68 os.Open 直接打开 -> 攻击者预测/碰撞缓存文件名实现跨用户读写覆盖 -> 权限提升", "fix_suggestion": "line 68: 打开前改用 HMAC-SHA256 重算文件名摘要并与预期值比对、校验路径归属，拒绝未经强哈希绑定的文件"}
+```

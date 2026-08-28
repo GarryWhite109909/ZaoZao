@@ -1,0 +1,99 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+from flask import Blueprint, request, Response
+from app.services import render_user_page
+
+bp = Blueprint("pages", __name__)
+
+@bp.route("/preview", methods=["POST"])
+def preview():
+    # 输入点1/输入点2：POST 表单正文与自定义链接，均为攻击者完全可控
+    content = request.form.get("content", "")
+    url = request.form.get("url", "")
+    html = render_user_page(content, url)
+    return Response(html, mimetype="text/html")
+
+@bp.route("/quicklink", methods=["GET"])
+def quicklink():
+    # 第三输入点：GET 查询参数 u 直达同一渲染服务（第二入口）
+    url = request.args.get("u", "")
+    return Response(render_user_page("", url), mimetype="text/html")
+
+# === file: app/services.py ===
+import re
+from app.rendering import PageRenderer
+
+_SCRIPT_OPEN = re.compile(r"<\s*script[^>]*>", re.I)
+
+class PageService:
+    def __init__(self) -> None:
+        # 配置缺陷：escape=False 关闭输出转义；放行名单显式允许 javascript:
+        self.renderer = PageRenderer(
+            escape=False,
+            allow_harmful_protocols=("javascript:",),
+        )
+
+    def strip_scripts(self, text: str) -> str:
+        # 看似净化：仅删除 <script...> 开标签的正则黑名单，
+        # img/onerror、内联事件属性、javascript: 伪协议全部漏过
+        return _SCRIPT_OPEN.sub("", text)
+
+    def render_user_page(self, content: str, url: str) -> str:
+        cleaned = self.strip_scripts(content)
+        return self.renderer.render_inline_html(cleaned) + self.renderer.render_link(cleaned, url)
+
+render_user_page = PageService().render_user_page
+
+# === file: app/rendering.py ===
+from typing import ClassVar, Literal, Tuple
+
+_SPECIALS = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}
+
+def escape_text(text: str) -> str:
+    for ch, rep in _SPECIALS.items():
+        text = text.replace(ch, rep)
+    return text
+
+HARMFUL_PROTOCOLS: Tuple[str, ...] = ("javascript:", "vbscript:", "file:", "data:")
+
+class PageRenderer:
+    NAME: ClassVar[Literal["html"]] = "html"
+
+    def __init__(self, escape: bool = True, allow_harmful_protocols=None) -> None:
+        self._escape = escape
+        self._allow_harmful_protocols = allow_harmful_protocols
+
+    def safe_url(self, url: str) -> str:
+        # 缺陷A：命中放行名单直接 return，下方黑名单被短路；
+        # javascript:alert(1) 不含特殊字符，escape 后仍是可执行伪协议
+        if self._allow_harmful_protocols and url.lower().startswith(tuple(self._allow_harmful_protocols)):
+            return escape_text(url)
+        if url.lower().startswith(HARMFUL_PROTOCOLS):
+            return "#harmful-link"
+        return escape_text(url)
+
+    def render_link(self, text: str, url: str) -> str:
+        # 缺陷B：text 未做任何过滤即拼入标签体；url 经有缺陷的 safe_url 拼入 href
+        return '<a href="' + self.safe_url(url) + '">' + text + "</a>"
+
+    def render_inline_html(self, html: str) -> str:
+        # 缺陷C：escape=False 时原始字符串不经任何处理直接输出
+        if self._escape:
+            return escape_text(html)
+        return html
+```
+
+**分析**（文件序号按输出顺序：L1=app/routes.py，L2=app/services.py，L3=app/rendering.py）
+
+1. **①外部输入点枚举与可达性**：共三个外部输入点——app/routes.py:9 `request.form['content']`、app/routes.py:10 `request.form['url']`、以及第二入口 app/routes.py:17 `request.args['u']`。三者分别经 app/routes.py:11/:18 调用 app/services.py:23 绑定的 `render_user_page`，进入 app/services.py:19-21 后无条件流向 app/rendering.py 的两处 HTML 拼接点，source→sink 全程可达。
+
+2. **②数据流1（正文→HTML 输出）防御验证**：content 自 app/routes.py:9 流经 app/services.py:17 `strip_scripts`——这是正则黑名单，只删除 `<script...>` 开标签一次，嵌套写法 `<sc<script>ript>` 还原后即绕过，且 `<img src=x onerror=...>`、内联事件属性完全不在覆盖面内，属可绕过过滤、非有效防御；随后到达 app/rendering.py:32-36，因 app/services.py:10 配置 `escape=False`，走 app/rendering.py:36 原样返回，最终由 app/routes.py:12 以 text/html 写入响应，调用链上不存在任何完整净化。
+
+3. **②数据流2（URL→href）与数据流3（标签体）防御验证**：url 自 app/routes.py:10 或 :17 经 app/services.py:21 进入 app/rendering.py:22-23，放行名单 `('javascript:',)` 命中前缀即提前 return，app/rendering.py:24 的 HARMFUL_PROTOCOLS 黑名单被短路形同虚设；即便落到 app/rendering.py:26，`escape_text`(app/rendering.py:5-8) 仅替换 & < > 引号四个字符，无法中和 `javascript:` 伪协议本身，拼入 href 后点击即可执行 JS。另外同一 content 作为 text 实参在 app/rendering.py:30 未经任何过滤拼入 `<a>` 标签体，构成第三条并行污点流。
+
+4. **③第二入口与替代通道确认**：/quicklink(app/routes.py:14-18) 是与 /preview 完全独立的第二入口，GET 参数 u 复用同一服务汇合同一对 sink；主路由内部 content 与 url 双参数并行成流，content 还兼作 `render_link` 的 text 形参形成替代通道。多条入口/通道全部收敛于 app/rendering.py:36 与 :30 两处无完整防御的拼接点，证明这是系统性缺陷而非孤立路径，CWE-79 成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 跨站脚本（反射型/注入型 XSS）：中间层净化不完整与渲染层危险配置叠加导致任意 HTML 与 javascript: 伪协议注入", "risk_level": "High", "source": "L1:line 9: app/routes.py preview 中 request.form.get('content') 的用户可控正文（并列输入 line 10 的 url 参数，另有第二入口 line 17 的 GET 参数 u）", "sink": "L3:line 36: app/rendering.py PageRenderer.render_inline_html 原样返回未转义 HTML 并于 app/routes.py line 12 写入响应（次级 sink 为 line 30 render_link 的 href 与标签体拼接）", "explanation": "流1 正文链：app/routes.py:9 的 content 经 app/services.py:17 strip_scripts 正则黑名单（仅删 <script 开标签，嵌套 <sc<script>ript> 及 <img onerror= 均可绕过，覆盖面不足）流入 app/rendering.py:36，因 app/services.py:10 配置 escape=False 原样返回并由 app/routes.py:12 以 text/html 输出；流2 链接链：app/routes.py:10 与第二入口 app/routes.py:17 的 url 经 app/services.py:21 进入 app/rendering.py:22，放行名单 ('javascript:',) 命中即提前 return 使 line 24 黑名单被短路，escape_text(app/rendering.py:5-8) 仅替换 & < > 引号四字符无法中和伪协议，href 中 javascript: 点击即执行；流3 标签体链：同一 content 未经任何过滤于 app/rendering.py:30 拼入 <a> 标签体；防御评估：services 层正则黑名单属可绕过过滤不算有效防御，rendering 层转义因错误配置与字符覆盖不足双重失效，全链无完整防御；第二入口确认：/quicklink GET 路由与 /preview 的双参数及 render_link 的 text 形参构成多通道，全部汇聚到同一对 sink，故漏洞系统性成立", "fix_suggestion": "line 10: 删除 escape=False 与 allow_harmful_protocols=('javascript:',) 配置，改为默认安全值（escape=True、allow_harmful_protocols=None），使 app/rendering.py line 34 恒走转义分支、line 22 放行名单为空且 line 24 黑名单正常拦截 javascript: 等伪协议，同时以完整实体转义替换 app/services.py line 17 的正则黑名单"}
+```

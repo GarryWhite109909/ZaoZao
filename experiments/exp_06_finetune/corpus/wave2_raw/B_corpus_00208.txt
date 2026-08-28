@@ -1,0 +1,89 @@
+LANG: javascript
+```code
+# === file: src/routes/svgRoutes.js ===
+'use strict';
+
+const express = require('express');
+const { parse, stringify } = require('../lib/xast.js');
+const removeScriptElement = require('../plugins/removeScriptElement.js');
+const { renderPreview } = require('../views/previewRenderer.js');
+
+const router = express.Router();
+
+function applyVisitor(ast, visitor) {
+  const walk = (node, parent) => {
+    if (visitor.enter) visitor.enter(node, parent);
+    (node.children || []).forEach((child) => walk(child, node));
+  };
+  walk(ast, null);
+}
+
+// 入口1: 客户端在请求体中直接上传 SVG 文本
+router.post('/preview', (req, res) => {
+  const svgText = String(req.body.svg || '');
+  const ast = parse(svgText);
+  applyVisitor(ast, removeScriptElement.fn().element);
+  const markup = stringify(ast);
+  res.type('html').send(renderPreview(markup));
+});
+
+// 入口2: base64 编码的查询参数, 复用同一条处理链
+router.get('/embed', (req, res) => {
+  const svgText = Buffer.from(String(req.query.data || ''), 'base64').toString('utf8');
+  const ast = parse(svgText);
+  applyVisitor(ast, removeScriptElement.fn().element);
+  res.type('html').send(renderPreview(stringify(ast)));
+});
+
+module.exports = router;
+
+# === file: src/plugins/removeScriptElement.js ===
+'use strict';
+
+const { detachNodeFromParent } = require('../lib/xast.js');
+
+exports.name = 'removeScriptElement';
+exports.type = 'visitor';
+exports.active = true;
+exports.description = 'removes <script> elements';
+
+// 注意: 仅按标签名黑名单移除 <script> 节点,
+// 不覆盖 onload/onerror 等事件属性、<foreignObject>、javascript: URI 等向量
+exports.fn = () => {
+  return {
+    element: {
+      enter: (node, parentNode) => {
+        if (node.name === 'script') {
+          detachNodeFromParent(node, parentNode);
+        }
+      },
+    },
+  };
+};
+
+# === file: src/views/previewRenderer.js ===
+'use strict';
+
+// 将上游传来的 SVG 片段未经转义直接拼接进 HTML 文档
+function renderPreview(svgMarkup) {
+  return '<!doctype html><html><body>'
+    + '<div id="canvas">' + svgMarkup + '</div>'
+    + '</body></html>';
+}
+
+module.exports = { renderPreview };
+```
+
+1. **外部输入点枚举与可达性**：全项目共两个外部输入点——`svgRoutes.js` L20（POST /preview 的 `req.body.svg`）与 L29（GET /embed 的 `req.query.data`，base64 解码）。两者均未做任何入口校验，直接进入 `parse → applyVisitor → stringify` 链路，最终都汇入 `previewRenderer.js` 的渲染函数，可达性成立。
+
+2. **主数据流逐段验证**：流1：`svgRoutes.js` L20 `svgText` → L21 `parse` → L22 `applyVisitor(removeScriptElement.fn().element)` → L23 `stringify` → L24 调用 `renderPreview` → `previewRenderer.js` L6 字符串拼接进 HTML → 返回 `svgRoutes.js` L24 由 `res.type('html').send()` 以 text/html 发出。污点从 source 到 sink 全程无有效中和。
+
+3. **防御位置/类型/覆盖面核查**：链路上唯一的“防御”是 `removeScriptElement.js` L16-L18 的 `node.name === 'script'` 标签名黑名单。它对属性型载荷完全不生效：`<svg onload=alert(1)>`、`<a xlink:href='javascript:...'>`、`<foreignObject>` 内嵌 HTML、`data:` URI 等均不匹配该条件而原样透传——黑名单式过滤可绕过，不构成有效防御；渲染端 `previewRenderer.js` L4-L8 无任何 HTML 实体编码，响应也未设置 CSP。
+
+4. **第二入口/替代通道**：GET /embed（`svgRoutes.js` L28-L33）经 base64 解码后走 L30-L32 与主链完全相同的处理逻辑和同一个 sink，证明漏洞不依赖单一路由或单一参数形态；此外任何未来新增的 `renderPreview` 调用方都会继承同一缺陷。
+
+5. **结论**：source（`svgRoutes.js`）与 sink（`previewRenderer.js`）分处不同文件，中间的插件文件呈现“看似已净化（移除了 script 标签）实则仅覆盖单一向量”的典型不完整防御，构成跨文件反射型 XSS（CWE-79）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 跨站脚本(XSS): 未中和的用户可控 SVG 片段被拼接进 text/html 响应", "risk_level": "High", "source": "L1:line 20: req.body.svg —— POST /preview 请求体中的用户可控 SVG 文本(src/routes/svgRoutes.js)", "sink": "L3:line 6: renderPreview 中 svgMarkup 与 HTML 字符串的 + 拼接(src/views/previewRenderer.js), 经 L1:line 24 以 text/html 发送", "explanation": "外部输入点共两处且均可达 sink: 主链起点 L1:line 20 的 req.body.svg 与第二入口 L1:line 29 的 req.query.data(base64); 流1: L1:20 svgText → L1:21 parse → L1:22 applyVisitor → L1:23 stringify → L1:24 renderPreview → L3:6 拼接进 HTML → L1:24 res.send(text/html) 触发反射型 XSS; 流2: L1:29 base64 解码后经 L1:30-32 走同一链路汇入同一 sink; 防御核查: 全链唯一过滤是 L2:16-18 的 node.name==='script' 标签名黑名单, 属性型载荷如 <svg onload=alert(1)>、<a xlink:href='javascript:...'>、<foreignObject> 及 data: URI 均不命中该条件而原样透传, 属可绕过的黑名单过滤不算有效防御; L3:4-8 渲染层无任何 HTML 实体编码且响应无 CSP; 第二入口确认: GET /embed(L1:28-33)复用相同处理链与相同 sink, 证明漏洞不依赖单一路由或参数, 未来任何新的 renderPreview 调用方同样暴露; 综上存在跨文件 CWE-79 反射型 XSS", "fix_suggestion": "line 6: 在拼接前对 svgMarkup 执行白名单净化(如 DOMPurify, 剥离全部事件属性与 javascript:/data: URI)后再输出, 并为响应追加 CSP; 同时将 L2 插件由标签名黑名单改为元素与属性白名单"}
+```

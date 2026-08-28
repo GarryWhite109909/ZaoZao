@@ -1,0 +1,98 @@
+LANG: go
+
+```code
+# === file: server.go ===
+//go:build darwin && cgo
+
+// Package local exposes an HTTP facade over the filesystem copier.
+package local
+
+import (
+	"net/http"
+)
+
+// HandleCopy serves GET /copy?remote=<dest>&src=<name>.
+func (f *Fs) HandleCopy(w http.ResponseWriter, r *http.Request) {
+	remote := r.URL.Query().Get("remote") // 外部输入点1：客户端完全可控的目的路径
+	src := r.URL.Query().Get("src")       // 外部输入点2：客户端可控的源标识
+	if src == "" {
+		http.Error(w, "missing src", http.StatusBadRequest)
+		return
+	}
+	out, err := f.CopyRemote(r.Context(), src, remote)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write([]byte(out))
+}
+
+# === file: copier.go ===
+package local
+
+import (
+	"context"
+	"path/filepath"
+	"strings"
+)
+
+// sanitizeRemote 看似净化：剥离一次 ../ 前缀并做 Clean。
+func sanitizeRemote(remote string) string {
+	r := strings.TrimPrefix(remote, "../")
+	r = strings.TrimPrefix(r, "/")
+	return filepath.Clean(r) // Clean 不消除相对路径的前导 ..，逃逸依旧成立
+}
+
+// CopyRemote 组装目的路径并触发克隆。
+func (f *Fs) CopyRemote(ctx context.Context, srcName, remote string) (string, error) {
+	cleaned := sanitizeRemote(remote) // 不完整防御：a/../../etc/x 清洗后仍为 ../etc/x
+	dst := f.localPath(cleaned)       // 污染值被拼到根目录之外的目标
+	if err := mkdirAll(dst); err != nil {
+		return "", err
+	}
+	srcPath := f.resolveSrc(srcName)
+	return cloneToFile(srcPath, dst) // 污染 dst 原样传入下一层
+}
+
+# === file: clone.go ===
+//go:build darwin && cgo
+
+package local
+
+import (
+	"fmt"
+
+	"github.com/go-darwin/apfs"
+	"github.com/rclone/rclone/fs"
+)
+
+// cloneToFile 执行 APFS 克隆，dst 未做任何二次校验。
+func cloneToFile(src, dst string) (string, error) {
+	state := apfs.CopyFileStateAlloc()
+	defer func() {
+		if err := apfs.CopyFileStateFree(state); err != nil {
+			fs.Errorf(dst, "free state error: %v", err)
+		}
+	}()
+	cloned, err := apfs.CopyFile(src, dst, state, apfs.COPYFILE_CLONE) // 危险汇聚点：dst 直接落盘
+	if err != nil {
+		return "", fmt.Errorf("clone %s -> %s failed: %w", src, dst, err)
+	}
+	fs.Debugf(dst, "isCloned: %v", cloned)
+	return dst, nil
+}
+```
+
+分析：
+
+1. 【外部输入点枚举与可达性】本组文件共两个外部输入点：① server.go 第 12 行查询参数 `remote`（目的路径）；② server.go 第 13 行查询参数 `src`（源标识）。`remote` 经第 18 行进入 copier.go 第 17 行 CopyRemote，在第 19 行被 `f.localPath` 拼接为 dst，再由第 24 行传入 cloneToFile，最终抵达 clone.go 第 20 行 `apfs.CopyFile` 的 dst 实参——可达；`src` 经 copier.go 第 23 行 resolveSrc 成为同一调用的 src 实参——同样可达。
+
+2. 【防御逐条验证】唯一疑似防御位于 copier.go 第 10-14 行 sanitizeRemote：仅执行一次 `TrimPrefix('../')`、一次去首部 `/` 再 `filepath.Clean`，属黑名单式字符串前缀剥离，可绕过——输入 `a/../../etc/x` 不匹配前缀、Clean 后变为 `../etc/x` 仍逃逸根目录；且 Clean 明确不消除相对路径的前导 `..`，故该净化位置虽在 sink 之前但覆盖面不完整，判定无效。server.go 第 14 行仅对 src 判空，非路径防御。全链不存在基于根目录前缀（HasPrefix）或 allowlist 的包含性校验。
+
+3. 【第二入口/替代通道】存在：同一路由中 `src` 参数即为第二通道，使攻击者可同时控制读取源（配合流 1 构成跨目录任意文件复制，读+写双重原语）；此外 CopyRemote 与 cloneToFile 是包内公共逻辑，任何其他调用方（如未来的批量同步入口）都会继承同一未净化数据流，进一步扩大暴露面。
+
+4. 【结论】主链 server.go L12 → copier.go L18/L19 → copier.go L24 → clone.go L20 上无任何完整防御，CWE-22 成立；未认证即可写/读宿主任意路径（如 authorized_keys、cron 任务），风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径穿越导致任意文件写入/读取", "risk_level": "Critical", "source": "L1:line 12: server.go HandleCopy 中 r.URL.Query().Get('remote') 返回的客户端可控目的路径", "sink": "L3:line 20: clone.go 中 apfs.CopyFile(src, dst, state, apfs.COPYFILE_CLONE) 以未校验的 dst 执行落盘写入", "explanation": "流1主链: server.go L12 remote 参数经 L18 传入 copier.go L17 CopyRemote, 于 L19 经 localPath 拼接为 dst, 再由 L24 cloneToFile 抵达 clone.go L20 apfs.CopyFile 的 dst 实参, 全程无有效防御; 流2第二通道: server.go L13 src 参数经 copier.go L23 resolveSrc 成为 clone.go L20 的 src 实参, 构成任意源路径读取, 与流1组合可实现跨目录任意文件复制; 防御验证: copier.go L10-L14 sanitizeRemote 仅做一次 TrimPrefix('../') 加 filepath.Clean, 属黑名单式字符串剥离, 输入 'a/../../etc/x' 清洗后变为 '../etc/x' 仍逃逸根目录, 且 Clean 不消除相对路径前导 .., 判定为无效防御; server.go L14 对 src 仅判空, 无路径约束; 全链缺失根目录前缀包含性校验或 allowlist; 第二入口结论: 同一路由的 remote 与 src 即两条独立可控通道, 且 CopyRemote/cloneToFile 为包内公共逻辑, 其他调用方会继承同一污染流, 漏洞确凿", "fix_suggestion": "line 19: 在 copier.go 计算出 dst 后立即加入包含性校验: 若 strings.Contains(cleaned, '..') 或 !strings.HasPrefix(filepath.Clean(dst), f.root+string(os.PathSeparator)) 则直接返回错误拒绝复制"}
+```

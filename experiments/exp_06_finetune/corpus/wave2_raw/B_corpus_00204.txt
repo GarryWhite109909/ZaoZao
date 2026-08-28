@@ -1,0 +1,99 @@
+LANG: javascript
+```code
+# === file: src/routes/files.js ===
+const express = require('express');
+const router = express.Router();
+const { buildFileViewModel } = require('../services/file-service');
+const { renderDownloadPage } = require('../views/download-page');
+
+// GET /files/* - pretty URL entry for uploaded file pieces
+router.get('/files/*', async (req, res, next) => {
+  try {
+    const raw = req.params[0] || '';
+    const matches = raw.match(/^([^.]+)\.\w+$/);
+    if (!matches) {
+      return res.status(400).send('invalid');
+    }
+    const [, slug] = matches;
+    // traversal-only guard: rejects '..' and '/', leaves markup intact
+    if (slug.includes('..') || slug.includes('/')) {
+      return res.status(403).send('forbidden');
+    }
+    const model = buildFileViewModel(slug);
+    return renderDownloadPage(res, model);
+  } catch (e) {
+    return next(e);
+  }
+});
+
+// Second entry: preview endpoint feeds req.query.name straight through
+router.get('/files-preview', async (req, res, next) => {
+  try {
+    const model = buildFileViewModel(String(req.query.name || ''));
+    return renderDownloadPage(res, model);
+  } catch (e) {
+    return next(e);
+  }
+});
+
+module.exports = router;
+
+# === file: src/services/file-service.js ===
+// Pass-through service layer between the HTTP route and the view.
+const FILES = {
+  'annual-report': { title: 'Annual Report', extension: 'pdf' },
+  'brand-guide': { title: 'Brand Guide', extension: 'pdf' }
+};
+
+// Naive tag-strip: removes only literal <script> tags.
+// Attribute payloads such as <img src=x onerror=alert(1)> survive intact.
+function stripScriptTags(input) {
+  return String(input).replace(/<\/?script[^>]*>/gi, '');
+}
+
+function buildFileViewModel(slug) {
+  const cleanName = stripScriptTags(slug);
+  const doc = FILES[cleanName] || null;
+  return {
+    // the requested name is echoed back onto the download page
+    requestedName: cleanName,
+    title: doc ? doc.title : '',
+    extension: doc ? doc.extension : 'pdf'
+  };
+}
+
+module.exports = { buildFileViewModel };
+
+# === file: src/views/download-page.js ===
+// Interstitial download page. Every value is concatenated straight
+// into the HTML string with no context-aware escaping.
+function renderDownloadPage(res, model) {
+  const href = `/uploads/${model.requestedName}.${model.extension}`;
+  const html = [
+    '<!doctype html><html><head><title>Download</title></head><body>',
+    `<h1>${model.title || model.requestedName}</h1>`,
+    `<p>You asked for: ${model.requestedName}</p>`,
+    `<a id="dl" href="${href}">Download file</a>`,
+    '</body></html>'
+  ].join('');
+  res.status(model.title ? 200 : 404).type('html').send(html);
+}
+
+module.exports = { renderDownloadPage };
+```
+
+**分析（覆盖固定清单 ①②③）**
+
+1. **①外部输入点枚举与可达性**：共两个外部输入点。输入一：`src/routes/files.js` 第 9 行 `req.params[0]`（GET /files/* 通配段），经第 10 行正则提取 slug 后于第 19 行传入 `buildFileViewModel`，第 20 行进入 `renderDownloadPage`，直达 sink，可达性成立。输入二：同文件第 29 行 `req.query.name`（GET /files-preview），无任何前置校验即进入同一服务层与视图层，同样可达 sink。
+
+2. **②逐流防御验证**：流 A 上存在三道疑似防御，均无效——第 10 行正则 `^([^.]+)\.\w+$` 只约束『末段必须是字母数字扩展名』，不限制标记字符，载荷 `x<img src=x onerror=alert(1)>.png` 可完整通过；第 16 行黑名单仅拦截 `..` 与 `/`，而事件型 XSS 载荷不含这两者，属典型可绕过黑名单；中间层 `src/services/file-service.js` 第 10 行 `stripScriptTags` 只删除字面 `<script>` 标签，是看似净化实则不完整的字符串替换过滤，`<img onerror=...>` 类属性载荷原样透传到第 18 行 `requestedName`。流 B 上仅有该伪净化层，连正则与黑名单都不存在。全链路无任何 HTML 实体编码。
+
+3. **③sink 验证**：`src/views/download-page.js` 第 4 行将 `requestedName` 插入 `href` 属性（可用引号闭合属性实现属性上下文注入）；第 7、8 行直接插入元素体上下文；第 12 行以 `text/html` 类型 `send` 返回，浏览器将执行注入脚本。文档未命中时第 7 行回退到 `requestedName`，保证即使无匹配记录反射也必然发生。
+
+4. **替代通道结论**：确认存在第二入口 `/files-preview`（第 27-34 行），其防护比主入口更弱（零校验），与主入口共享服务层与视图层，因此即便修复主路由的路径解析，攻击者仍可经查询参数通道触达同一 sink；此外无全局转义中间件或 CSP 配置兜底。
+
+5. **综合结论**：两条 source→sink 数据流在调用链上均无有效防御，构成反射型 XSS（CWE-79），风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 反射型跨站脚本", "risk_level": "High", "source": "L1:line 9: req.params[0]，GET /files/* 通配路径段，攻击者完全可控并流入渲染链", "sink": "L3:line 12: res.type('html').send(html)，未转义插值以 text/html 返回浏览器执行", "explanation": "流A：L1:9 req.params[0] 经 L1:10 正则仅约束扩展名格式且 L1:16 黑名单只拦 .. 与 /，载荷 x<img src=x onerror=alert(1)>.png 全部通过；中间层 L2:10 stripScriptTags 仅删除字面 script 标签，属可绕过的伪净化，属性型载荷透传至 L2:18 requestedName；流B：第二入口 L1:29 req.query.name 零校验进入同一服务层；两流汇聚于 L3:4 的 href 属性插值与 L3:7、L3:8 的元素体插值，L3:12 以 text/html 发送；全链路无 HTML 实体编码、无模板自动转义、无 CSP 兜底，故两条数据流均可达 sink 构成反射型 XSS", "fix_suggestion": "line 4: 在 download-page.js 第4至8行对所有插值统一先经 escapeHtml 做实体转义（含 &、<、> 及单双引号字符）再拼接，并在 files.js 第14行后增加 slug 白名单字符集校验"}
+```

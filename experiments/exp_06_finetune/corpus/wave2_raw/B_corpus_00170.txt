@@ -1,0 +1,109 @@
+LANG: go
+```code
+# === file: internal/routes/lfs.go ===
+package routes
+
+import (
+	"net/http"
+
+	"gogs.io/gogs/internal/lfsx"
+)
+
+// MountLFS exposes GET /lfs/objects/{oid}; cookie presence is the only gate.
+func MountLFS(mux *http.ServeMux, store lfsx.Storager) {
+	mux.Handle("GET /lfs/objects/{oid}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := r.Cookie("session"); err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		oid := lfsx.OID(r.PathValue("oid")) // SOURCE: attacker-controlled
+		_ = lfsx.ServeObject(store, oid, w)
+	}))
+}
+
+# === file: internal/lfsx/service.go ===
+package lfsx
+
+import "io"
+
+// ServeObject shape-checks the OID then delegates. The guard is
+// FORMAT-ONLY: object ownership is never verified (hash-as-capability).
+func ServeObject(s Storager, oid OID, w io.Writer) error {
+	if !ValidOIDShape(oid) {
+		return ErrInvalidOID
+	}
+	return s.Download(oid, w) // unmodified oid flows onward
+}
+
+// ValidOIDShape reports whether oid looks like a sha256 hex digest.
+func ValidOIDShape(oid OID) bool {
+	if len(oid) != 64 {
+		return false
+	}
+	for i := 0; i < len(oid); i++ {
+		c := oid[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+# === file: internal/lfsx/storage.go ===
+package lfsx
+
+import (
+	"io"
+	"os"
+	"path/filepath"
+
+	"github.com/cockroachdb/errors"
+)
+
+var ErrInvalidOID = errors.New("oid is not valid")
+var ErrObjectNotExist = errors.New("object does not exist")
+
+type OID string
+
+type Storager interface {
+	Download(oid OID, w io.Writer) error
+}
+
+type LocalStorage struct{ Root string }
+
+func (s *LocalStorage) storagePath(oid OID) string {
+	if len(oid) < 2 {
+		return ""
+	}
+	return filepath.Join(s.Root, string(oid[0]), string(oid[1]), string(oid))
+}
+
+// Download uses oid directly as the lookup key; no ACL downstream.
+func (s *LocalStorage) Download(oid OID, w io.Writer) error {
+	fpath := s.storagePath(oid)
+	if fi, err := os.Stat(fpath); err != nil || fi.IsDir() {
+		return ErrObjectNotExist
+	}
+	r, err := os.Open(fpath) // SINK: file chosen purely by user key
+	if err != nil {
+		return errors.Wrap(err, "open file")
+	}
+	defer r.Close()
+	if _, err := io.Copy(w, r); err != nil {
+		return errors.Wrap(err, "copy file")
+	}
+	return nil
+}
+```
+
+1. 【外部输入点枚举与可达性】整组文件只有一个对外入口：internal/routes/lfs.go 第 10-11 行注册路由 GET /lfs/objects/{oid}。外部输入点共两处：路径参数 oid（第 16 行经 r.PathValue 提取，攻击者完全可控）和会话 cookie（第 12 行，仅做存在性判断，不参与任何对象级决策）。oid 在第 17 行传入 lfsx.ServeObject，经 internal/lfsx/service.go 第 11 行原样到达 internal/lfsx/storage.go 第 30 行 Download，在第 35 行 os.Open 被消费，source 到 sink 可达性成立。
+
+2. 【数据流与防御逐一验证】主链：L1:16 提取 oid → L1:17 → L2:7 ServeObject → L2:8 进入 ValidOIDShape（L2:15-26，长度等于 64 且字符限十六进制的格式白名单）→ L2:11 未做任何修改透传给 Download → L3:31 storagePath 按 Root/o[0]/o[1]/oid 拼接 → L3:32 os.Stat 仅判存在与否 → L3:35 os.Open 打开文件 → L3:40 io.Copy 将全部内容写回响应。全链唯一的检查是 L2 的格式校验：它属于完整性/形状校验而非授权控制，既不校验 OID 归属者，也不把 oid 与当前会话身份绑定，任何合法的 64 位十六进制键一律放行，覆盖面为零授权语义，对 CWE-639 是无效防御；L3:29 注释亦明示存储层无 ACL。设计隐含的『内容哈希即能力令牌』假设不成立——OID 会随仓库元数据、引用或分享链接泄露，可被任意登录用户转发重放。
+
+3. 【第二入口/替代通道排查】三个文件中仅 L1:11 一处路由注册，没有查询参数、表单字段或其他 handler 能把输入送入 Download；Storager 接口（L3:16-19）只有 LocalStorage 一个实现，不存在绕过 ServeObject 直达存储层的间接调用；上传侧不在本次拆分范围内。L1:12 的 cookie 检查只是登录存在性门槛，不是对象级鉴权，不能缓解本漏洞。因此该单一主链即是唯一且充分的攻击通道，结论据此成立。
+
+4. 【结论】调用链上认证仅为 cookie 存在性检查，对象级授权全程缺位：任意已登录用户可用他人对象的 OID 读取其完整内容，构成基于用户可控键的授权绕过（CWE-639 / IDOR）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 授权绕过（用户可控键 IDOR）", "risk_level": "High", "source": "L1:line 16: HTTP 路径参数提取的 oid（r.PathValue）为攻击者完全可控的对象键", "sink": "L3:line 35: os.Open(fpath) 以用户提供的 OID 直接打开对象文件并经 io.Copy 外发全部内容", "explanation": "流1 主链：L1:16 提取 oid → L1:17 调用 ServeObject → L2:8 进入 ValidOIDShape（L2:15-26 仅做长度与十六进制格式白名单）→ L2:11 未修改透传至 Download → L3:31 storagePath 拼接路径 → L3:32 os.Stat 仅判存在 → L3:35 os.Open 打开 → L3:40 io.Copy 全量外发；防御验证：全链唯一检查是 L2 的格式校验，属完整性校验而非授权控制，不校验 OID 归属也不绑定会话身份，任意合法 64 位十六进制键一律放行，无法阻断 CWE-639；L1:12 的 cookie 检查仅为登录存在性判断，非对象级鉴权；L3:29 明示存储层无 ACL；隐含的哈希即能力令牌假设失效，因 OID 作为内容哈希可经仓库元数据泄露或被转发重放；第二入口排查：仅 L1:11 一处路由、Storager 接口仅 LocalStorage 单实现，无其他参数通道或间接调用绕过 ServeObject，主链即唯一且充分的攻击通道", "fix_suggestion": "line 11: 在委托 Download 前增加对象级授权——依据当前会话校验其对 oid 所属仓库的读权限，未授权时返回 403 或 404"}
+```

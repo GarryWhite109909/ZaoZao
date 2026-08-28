@@ -1,0 +1,97 @@
+LANG: javascript
+```code
+# === file: server/routes/fs-routes.js ===
+const express = require('express')
+const { rmrfPath, movePath, folderSize } = require('../services/fs-service')
+
+const router = express.Router()
+
+// Params below arrive from the renderer over HTTP; treat as untrusted
+router.post('/fs/rmrf', async (req, res) => {
+  const target = req.body.path // SOURCE: attacker-controlled path
+  try {
+    await rmrfPath(target)
+    res.json({ ok: true })
+  } catch (e) {
+    res.status(500).json({ message: e.message })
+  }
+})
+
+router.post('/fs/move', async (req, res) => {
+  const { from, to } = req.body // second entry, same input class
+  await movePath(from, to)
+  res.json({ ok: true })
+})
+
+router.get('/fs/size', async (req, res) => {
+  const p = req.query.path // third entry via query string
+  const info = await folderSize(p)
+  res.json(info)
+})
+
+module.exports = router
+
+# === file: server/services/fs-service.js ===
+const { isWin } = require('../../common/runtime-constants')
+const { run, runWinCmd } = require('../../common/shell-exec')
+
+// Fake sanitizer: blacklist replace of double quotes and semicolons only
+function clean (p) {
+  return String(p).replace(/[";]/g, '')
+}
+
+async function rmrfPath (localFolderPath) {
+  const safe = clean(localFolderPath)
+  const cmd = isWin
+    ? `Remove-Item '${safe}' -Force -Recurse -ErrorAction SilentlyContinue`
+    : `rm -rf "${safe}"`
+  return isWin ? runWinCmd(cmd) : run(cmd) // tainted cmd reaches sink
+}
+
+async function movePath (from, to) {
+  const cmd = isWin ? `Move-Item '${from}' '${to}'` : `mv '${from}' '${to}'`
+  return isWin ? runWinCmd(cmd) : run(cmd) // no filtering at all
+}
+
+async function folderSize (folderPath) {
+  if (isWin) {
+    return runWinCmd(`Get-ChildItem -Path "${clean(folderPath)}" -Recurse | Measure-Object Length -Sum`)
+  }
+  return run(`du -sh "${clean(folderPath)}" && find "${clean(folderPath)}" -type f | wc -l`)
+}
+
+module.exports = { rmrfPath, movePath, folderSize }
+
+# === file: common/shell-exec.js ===
+const { promisify } = require('util')
+const { exec } = require('child_process')
+
+const execAsync = promisify(exec)
+
+// Full shell execution: login bash honors all shell grammar
+const run = (cmd) => {
+  const { Bash } = require('node-bash')
+  const ps = new Bash({
+    executableOptions: { '--login': true }
+  })
+  return ps.invokeCommand(cmd).then(s => s.stdout.toString()) // SINK 1
+}
+
+const runWinCmd = (cmd) => {
+  return execAsync(`powershell.exe -Command "${cmd}"`) // SINK 2
+}
+
+module.exports = { run, runWinCmd }
+```
+
+**分析**
+
+1. **输入点枚举与可达性**：共 3 个外部输入点——L1:line 8（POST /fs/rmrf 的 req.body.path）、L1:line 18（POST /fs/move 的 req.body.from/to）、L1:line 24（GET /fs/size 的 req.query.path）。三者经服务层函数同步透传，最终全部到达 L3:line 12 的 `ps.invokeCommand(cmd)` 与 L3:line 16 的 `execAsync`，可达性成立。
+2. **防御逐流核验**：全链唯一“防御”是 L2:line 5-6 的 `clean()`，类型为黑名单+字符串替换，仅删除双引号与分号两个字符；在双引号包裹的 POSIX 场景中 `$( )` 命令替换、反引号、换行符均未被拦截，PowerShell 单引号场景可用单引号逃逸；且该过滤完全不覆盖 movePath 流（L2:line 17-19 裸拼单引号模板）。过滤位于中间服务层而非 sink 层，覆盖面不足，三条流均判定为无效防御。
+3. **sink 性质**：L3:line 12 的登录 bash 与 L3:line 16 的 `exec`（shell:true 语义）都解释完整 shell 语法，接收端零转义、零校验。
+4. **第二入口/替代通道**：存在——/fs/move 与 /fs/size 是独立注册的路由，与主链共享 L3 文件中的同一批 sink，任一入口被单独利用即可实现任意命令执行，无需依赖主链。
+5. **结论**：source 位于路由文件、sink 位于独立的 shell 执行模块，中间服务层的伪净化形同虚设，跨文件 CWE-78 命令注入成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78", "risk_level": "Critical", "source": "L1:line 8: server/routes/fs-routes.js 中 POST /fs/rmrf 的 req.body.path", "sink": "L3:line 12: common/shell-exec.js 中 run() 的 ps.invokeCommand(cmd)（次级 sink 为 line 16 的 execAsync）", "explanation": "数据流1: L1:line 8 的 req.body.path 经 L2:line 9-14 的 rmrfPath 拼入 rm -rf 后到达 L3:line 12 与 line 16 执行; 数据流2: L1:line 18 的 req.body.from/to 经 L2:line 17-19 的 movePath 以单引号模板串直达同一 sink, 该分支完全未过滤, 注入单引号闭合即可追加任意命令; 数据流3: L1:line 24 的 req.query.path 经 L2:line 22-26 的 folderSize 进入 du/find 与 powershell 拼接; 防御核验: 全链唯一过滤为 L2:line 5-6 的 clean(), 属黑名单字符串替换, 仅删除双引号和分号两个字符, 双引号包裹场景下 $() 命令替换、反引号与换行符均未被拦截, PowerShell 单引号场景可用单引号逃逸, 且该过滤不覆盖 movePath 流, 位置在中间服务层而非 sink 层, 判定为无效防御; 第二入口确认: POST /fs/move 与 GET /fs/size 是独立注册的替代通道, 与主链共享 L3 文件的同一批 sink, 任一入口均可直接实现任意命令执行; 综合判定跨文件 CWE-78 命令注入成立", "fix_suggestion": "line 12: 在 sink 层放弃 shell 字符串拼接, 改为 spawn('rm', ['-rf', localFolderPath], {shell: false}) 式参数数组调用, 并在 L1:line 8 等入口对路径做白名单正则校验(仅允许字母数字与 ./-_ 等路径字符)"}
+```
