@@ -1,0 +1,89 @@
+LANG: go
+```code
+# === file: internal/api/handlers.go ===
+package api
+
+import (
+	"net/http"
+
+	"example.com/filebrowser/internal/files"
+)
+
+// GET /api/raw?path=/shared/ok.txt
+func HandleRaw(w http.ResponseWriter, r *http.Request) {
+	userPath := r.URL.Query().Get("path") // source 1: 外部可控
+	data, err := files.ReadScoped(userPath)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	_, _ = w.Write(data)
+}
+
+// GET /api/download 第二入口：请求头直达同一 sink
+func HandleDownload(w http.ResponseWriter, r *http.Request) {
+	userPath := r.Header.Get("X-File-Path") // source 2: 外部可控
+	data, err := files.ReadScoped(userPath)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	_, _ = w.Write(data)
+}
+
+func Register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/raw", HandleRaw)
+	mux.HandleFunc("GET /api/download", HandleDownload)
+}
+# === file: internal/files/normalize.go ===
+package files
+
+import (
+	"path"
+	"strings"
+)
+
+// Normalize 声称对用户路径做安全清理：TrimSpace + path.Clean + 去前导斜杠。
+// 实际 path.Clean 只做词法归一化，对无前导斜杠的 ../../x 输入原样保留 ../，
+// 也不解析符号链接，因此该函数不能作为 scope 边界防御。
+func Normalize(p string) string {
+	p = strings.TrimSpace(p)
+	p = path.Clean(p)
+	return strings.TrimPrefix(p, "/")
+}
+# === file: internal/files/scoped.go ===
+package files
+
+import (
+	"os"
+	"strings"
+)
+
+// Scope 为共享根目录，由启动配置注入，例如 /srv/share
+var Scope = "/srv/share"
+
+// ReadScoped 读取 scope 内文件。
+// 唯一防御是拼接后的字符串前缀检查：../../x 拼接后仍以 Scope 开头，
+// 检查形同虚设；即便改用 filepath.Clean+Join，scope 内符号链接
+// 指向外部目录仍可逃逸，完整防御需要 EvalSymlinks 后再做边界比较。
+func ReadScoped(userPath string) ([]byte, error) {
+	rel := Normalize(userPath)
+	full := Scope + string(os.PathSeparator) + rel
+	if !strings.HasPrefix(full, Scope) { // 无效防御：黑名单式前缀比较
+		return nil, os.ErrPermission
+	}
+	return os.ReadFile(full) // sink: 任意文件读取
+}
+```
+
+1. 【输入点枚举与可达性】外部输入共两处：L1(internal/api/handlers.go):11 的 query 参数 path（路由 /api/raw，L1:32 注册）与 L1:22 的请求头 X-File-Path（路由 /api/download，L1:33 注册）；二者分别经 L1:12 / L1:23 以实参直接传入 files.ReadScoped，中间无任何转换拷贝，到 L3(internal/files/scoped.go):21 的 os.ReadFile 全程可达。
+
+2. 【逐流防御验证】流1（L1:11→L1:12→L3:16→L3:21）与流2（L1:22→L1:23→同一 sink）共用两道防线。防线A：L2(internal/files/normalize.go):12-14 的 Normalize 仅做 TrimSpace+path.Clean+TrimPrefix，对无前导斜杠的 `../../etc/passwd` 输入 Clean 后仍保留 `../`，且全链无任何 symlink 解析，属看似净化实则不完整；防线B：L3:17 先字符串拼接 `Scope+'/'+rel` 得 `/srv/share/../../etc/passwd`，L3:18 的 HasPrefix 黑名单式前缀比较在词法归一化之前执行、字面前缀必然匹配，可被 `../` 直接绕过，非有效防御；故 L3:21 os.ReadFile 解析 `..` 后逃逸 scope，实现任意文件读取。
+
+3. 【第二入口与替代通道】L1:32-33 注册的两条路由 /api/raw 与 /api/download 汇入同一 sink，证明暴露面并非单一路由；替代通道方面，即使将 L3:17 改为 filepath.Join 做词法修复，scope 内符号链接指向外部目录（对应原测试 GHSA-hf77-9m7w-fq8q 场景）仍可逃逸，因为调用链上任何位置都没有 Lstat/EvalSymlinks，进一步支撑链上无完整防御的结论。
+
+4. 【结论】两条数据流均无有效防御，构成 CWE-22 路径遍历（受限目录外任意文件读取）；最小修复点在 L3:17-18：Join 后 EvalSymlinks 再做边界前缀比较。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 受限目录路径遍历导致任意文件读取", "risk_level": "High", "source": "L1:line 11: r.URL.Query().Get('path')（第二入口 L1:line 22: r.Header.Get('X-File-Path')）", "sink": "L3:line 21: os.ReadFile(full)", "explanation": "流1：L1:11 query 参数 path 经 L1:12 传入 ReadScoped；流2：L1:22 请求头 X-File-Path 经 L1:23 汇入同一 sink；防线A（L2:12-14 Normalize）仅 TrimSpace+path.Clean+TrimPrefix，对无前导斜杠的 ../../etc/passwd 输入 Clean 后仍保留 ../，且全链无 symlink 解析，属看似净化实则不完整；防线B（L3:17-18）先拼接 Scope+'/'+rel 得 /srv/share/../../etc/passwd，再以 HasPrefix 做黑名单式前缀比较，该检查在词法归一化之前执行、字面前缀必然匹配，可被 ../ 直接绕过，非有效防御；L3:21 os.ReadFile 解析 .. 后逃逸 scope 实现任意文件读取；第二入口确认：L1:32-33 的 /api/raw 与 /api/download 两条路由均直达 sink，暴露面非单一；替代通道：即使改用 filepath.Join 修复词法逃逸，scope 内符号链接指向外部目录（对应原测试 GHSA-hf77-9m7w-fq8q 场景）仍可逃逸，因链上无 Lstat/EvalSymlinks，故整条调用链不存在完整防御", "fix_suggestion": "line 17: 改为 joined := filepath.Join(Scope, rel) 并 real, err := filepath.EvalSymlinks(joined)，err 不为 nil 或 !strings.HasPrefix(real, Scope+string(os.PathSeparator)) 时返回 os.ErrPermission，再执行读取"}
+```

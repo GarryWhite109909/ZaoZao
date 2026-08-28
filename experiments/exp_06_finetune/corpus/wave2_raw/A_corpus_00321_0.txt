@@ -1,0 +1,58 @@
+LANG: python
+
+```python
+# formbuilder/views.py
+from django.http import HttpResponse, JsonResponse
+from django.shortcuts import get_object_or_404
+from django.template import Template, Context
+from django.urls import path
+
+from .models import Form, Submission
+
+
+def save_form_settings(request, form_id):
+    """Any user who can open a form's settings page may store arbitrary text
+    into the success message / submission title fields (no permission check)."""
+    form = get_object_or_404(Form, pk=form_id)
+    if request.method == 'POST':
+        form.success_message = request.POST.get('success_message', '')
+        form.submission_title = request.POST.get('submission_title', '')
+        form.save()
+        return JsonResponse({'status': 'ok'})
+    return JsonResponse({'status': 'method_not_allowed'}, status=405)
+
+
+def submission_success(request, submission_id):
+    """Success page rendered after a submission: the stored strings are
+    compiled and executed by the Django template engine as raw template source."""
+    submission = get_object_or_404(
+        Submission.objects.select_related('form'), pk=submission_id
+    )
+    form = submission.form
+
+    ctx = Context({'submission': submission, 'form': form})
+    title = Template(form.submission_title).render(ctx)
+    message = Template(form.success_message).render(ctx)
+
+    return HttpResponse('<h1>{}</h1><p>{}</p>'.format(title, message))
+
+
+urlpatterns = [
+    path('forms/<int:form_id>/settings/', save_form_settings),
+    path('submissions/<int:submission_id>/success/', submission_success),
+]
+```
+
+1. **source 枚举与可达性**：第 38 行路由 `forms/<int:form_id>/settings/` 进入第 10 行视图，第 15-16 行 `request.POST.get('success_message')` / `request.POST.get('submission_title')` 是完全攻击者可控的原始字符串，第 17 行未经任何处理直接持久化到数据库；该视图没有任何权限装饰器或输入校验，等价于原漏洞中“拥有表单设置权限的用户即可写入”。这是存储型 source，任何后续提交都会触发 sink，可达性成立。
+
+2. **sink 确认**：第 31-32 行 `Template(form.submission_title).render(ctx)` / `Template(form.success_message).render(ctx)`——`django.template.Template(字符串)` 会把存储文本当作完整 Django 模板源码编译执行（等价于 Twig 的 createTemplate/renderString），`{{ }}`/`{% %}` 中的 payload（如上下文遍历 `{{ submission.form.settings }}`、`{% include ... %}`）在渲染时被执行，执行结果经第 34 行直接回显给访问者。
+
+3. **防御逐一验证**：从 source 到 sink 全链路无任何防御——第 14 行仅检查请求方法；不存在针对模板语法的黑名单/正则/字符串替换过滤（且此类过滤本就属于可绕过防御，如 `{%-`、空白与嵌套变体）；也未采用 Django 的安全惯用法“固定模板文件 + 上下文变量”（即 `render(request, 'success.html', {...})`，由自动转义机制处理变量）。两条数据流（submission_title→第 31 行、success_message→第 32 行）均无有效防御。
+
+4. **第二入口与替代通道**：第 39 行 success 路由是触发 sink 的入口；本文件内不存在其他到达 sink 的路由，settings 路由的 GET 分支（第 19 行）不触及 sink；但两个存储字段可被任意后续消费者复用渲染（如通知邮件渲染，对应原 Formie notifications），因此构成持久化存储型模板注入，影响所有读取这两个字段的代码路径。
+
+5. **结论**：source（第 15-16 行，POST 写入并持久化）→ sink（第 31-32 行，模板引擎编译执行）语义结构与原 Twig 注入完全一致，防御同样完全缺失，漏洞成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine (Django template SSTI)", "risk_level": "High", "source": "line 15: request.POST.get('success_message') 与 line 16: request.POST.get('submission_title') 经 line 17 无过滤持久化", "sink": "line 31: Template(form.submission_title).render(ctx) 与 line 32: Template(form.success_message).render(ctx)", "explanation": "流1: line 15-16 攻击者可控字符串经 line 17 存库 -> line 32 被当作 Django 模板源码编译执行 -> line 34 回显结果; 流2: submission_title 同样无过滤 -> line 31 同一 sink; 防御分析: 全链路无输入校验, 无黑名单/正则/替换过滤(此类过滤亦可绕过), 未使用固定模板文件+上下文变量的安全惯用法; 第二入口: line 39 success 路由为触发点, settings 路由 GET 分支(line 19)不达 sink, 但存储字段可被任意后续消费者(如通知邮件渲染)复用, 构成持久化存储型模板注入", "fix_suggestion": "line 31: 删除 Template() 编译, 改为固定模板文件 render(request, 'success.html', {'title': form.submission_title, 'message': form.success_message, 'submission': submission}), 让存储文本作为普通变量经自动转义输出, 并在 line 15-16 保存入口拒绝含 {{ 或 {% 的输入"}
+```

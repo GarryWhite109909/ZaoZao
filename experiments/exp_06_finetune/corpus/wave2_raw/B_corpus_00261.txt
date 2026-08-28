@@ -1,0 +1,106 @@
+LANG: php
+```code
+# === file: src/phpMyFAQ/Setup/UrlConfigProvider.php ===
+<?php
+declare(strict_types=1);
+
+namespace phpMyFAQ\Setup;
+
+/**
+ * Reads environment values submitted by the setup wizard form.
+ */
+final class UrlConfigProvider
+{
+    /** Source: raw installer POST value, fully attacker-controlled. */
+    public static function getDefaultUrlFromRequest(): string
+    {
+        return isset($_POST['faqDefaultUrl']) ? (string) $_POST['faqDefaultUrl'] : 'http://localhost/faq/';
+    }
+
+    /** parse_url only parses; it does not neutralize spaces, '#' or raw newlines. */
+    public static function getServerPath(): string
+    {
+        $path = parse_url(self::getDefaultUrlFromRequest(), PHP_URL_PATH);
+        return ($path === null || $path === false || $path === '') ? '/' : $path;
+    }
+}
+
+# === file: src/phpMyFAQ/Setup/HtaccessRuleComposer.php ===
+<?php
+declare(strict_types=1);
+
+namespace phpMyFAQ\Setup;
+
+/**
+ * Composes .htaccess directive argument values.
+ * rtrim() below only strips trailing slashes: raw newlines, leading
+ * blanks and '#' survive, so this 'sanitization' is incomplete.
+ */
+final class HtaccessRuleComposer
+{
+    /** Pure pass-through of the tainted path. */
+    public function rewriteBaseValue(): string
+    {
+        return UrlConfigProvider::getServerPath();
+    }
+
+    /** Cosmetic transform only; no encoding, no character whitelist. */
+    public function errorDocument404Value(): string
+    {
+        $path = rtrim(UrlConfigProvider::getServerPath(), '/');
+        return $path . '/index.php?action=404';
+    }
+}
+
+# === file: src/phpMyFAQ/Setup/EnvironmentConfigurator.php ===
+<?php
+declare(strict_types=1);
+
+namespace phpMyFAQ\Setup;
+
+use phpMyFAQ\Core\Exception;
+
+final class EnvironmentConfigurator
+{
+    private HtaccessRuleComposer $composer;
+
+    public function __construct(private string $htaccessPath)
+    {
+        $this->composer = new HtaccessRuleComposer();
+    }
+
+    public function adjustRewriteBaseHtaccess(): bool
+    {
+        if (!file_exists($this->htaccessPath)) {
+            throw new Exception('The .htaccess file does not exist!');
+        }
+
+        $lines = file($this->htaccessPath, FILE_IGNORE_NEW_LINES) ?: [];
+        $out = [];
+        foreach ($lines as $line) {
+            if (preg_match('/^\s*RewriteBase\b/i', $line)) {
+                $out[] = 'RewriteBase ' . $this->composer->rewriteBaseValue();
+            } elseif (preg_match('/^\s*ErrorDocument\s+404\b/i', $line)) {
+                $out[] = 'ErrorDocument 404 ' . $this->composer->errorDocument404Value();
+            } else {
+                $out[] = $line;
+            }
+        }
+
+        // Sink: tainted directive values are written verbatim into .htaccess
+        return (bool) file_put_contents($this->htaccessPath, implode(PHP_EOL, $out));
+    }
+}
+```
+
+1. **外部输入点枚举与可达性**：全组唯一外部输入点是 UrlConfigProvider.php:14 的 `$_POST['faqDefaultUrl']`（安装向导表单）；EnvironmentConfigurator.php:23 的 `file()` 读取的是服务器本地旧 .htaccess，构造函数的 `$htaccessPath` 来自内部配置，均非外部污点。可达路径：UrlConfigProvider.php:14 → :20（parse_url 取 path）→ :21 返回 → HtaccessRuleComposer.php:16/:22 消费 → EnvironmentConfigurator.php:27/:29 拼入指令行 → :36 `file_put_contents` 落盘，source 到 sink 链路完整闭合。
+
+2. **数据流 A（RewriteBase 通道）防御核查**：UrlConfigProvider.php:14 → :20 → :21 → HtaccessRuleComposer.php:16（纯透传）→ EnvironmentConfigurator.php:27 → :36。途中唯一处理是 :20 的 parse_url，它是 URL 解析而非净化，不删除或转义空格、`#`、原始换行；:27 为裸字符串拼接，无任何校验 → 该流无有效防御。
+
+3. **数据流 B（ErrorDocument 404 通道）防御核查**：同一 source 经 HtaccessRuleComposer.php:22 的 `rtrim($path, '/')`，仅裁剪尾部斜杠，属字符串裁剪类处理（按规则视为可绕过），换行符与前导空白完全存活，:23 拼接固定后缀后进入 EnvironmentConfigurator.php:29 → :36；另核查 :26/:28 的 preg_match 仅用于定位旧行位置，从不校验写入的新值，覆盖面为零 → 净化不完整，链上无完整防御。
+
+4. **第二入口与替代通道核查**：全组不存在第二外部入口（无其他路由、参数或间接输入），但同一污点有 EnvironmentConfigurator.php:27 与 :29 两个汇入点双路写入，且任何调用 `adjustRewriteBaseHtaccess()` 的安装控制器都会触发该链；攻击者在 faqDefaultUrl 中夹带原始换行（表单体 %0A 解码后）即可向 .htaccess 注入任意 Apache 指令（如 `php_value auto_prepend_file`），在 AllowOverride 开启环境形成持久化 RCE → 漏洞成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89: 外部输入未净化即拼入 .htaccess 指令并写盘(注入类污点流, 与原单文件漏洞语义一致)", "risk_level": "High", "source": "L1:line 14: $_POST['faqDefaultUrl'] 安装向导提交的默认 URL, 外部输入起点", "sink": "L3:line 36: file_put_contents 将含污点指令的整份内容写入 .htaccess", "explanation": "数据流A: L1:line 14 的 $_POST['faqDefaultUrl'] 经 L1:line 20 parse_url 提取 path 并于 L1:line 21 原样返回, 经 L2:line 16 纯透传后在 L3:line 27 拼为 RewriteBase 行, 到达 L3:line 36 file_put_contents, 途中 parse_url 仅解析不净化, 空格/井号/原始换行均存活; 数据流B: 同一 source 经 L2:line 22 的 rtrim 仅裁掉尾部斜杠, 属可绕过的字符串裁剪而非净化, 换行与前导空白完全存活, 于 L2:line 23 拼接固定后缀后在 L3:line 29 拼入 ErrorDocument 404 行并同样到达 L3:line 36; 防御核查: L3:line 26 与 L3:line 28 的正则只定位旧行从不校验新值, 覆盖面为零, 全链无编码/白名单/转义, 不存在完整防御; 第二入口核查: 全组唯一外部输入点为 L1:line 14, 无其他路由或参数通道, 但同一污点经 L3:line 27 与 L3:line 29 两个汇入点双路写入, 且任何调用 adjustRewriteBaseHtaccess 的安装控制器都触发该链, 攻击者以 faqDefaultUrl 夹带原始换行即可注入任意 Apache 指令(如 php_value auto_prepend_file)实现持久化 RCE, 漏洞成立", "fix_suggestion": "line 22: 在 HtaccessRuleComposer 中先以白名单校验路径(仅允许 ^/[A-Za-z0-9._~/-]*$ 且拒绝换行与空白), 校验失败抛出 Exception, 再供 L3:line 27 与 L3:line 29 拼接, 确保写入 L3:line 36 前完成净化"}
+```

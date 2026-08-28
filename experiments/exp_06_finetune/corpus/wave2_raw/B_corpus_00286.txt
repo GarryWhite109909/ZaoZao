@@ -1,0 +1,107 @@
+LANG: go
+
+```code
+# === file: adapters/acuityads/extract.go ===
+package acuityads
+
+import (
+	"github.com/prebid/openrtb/v20/openrtb2"
+	"github.com/prebid/prebid-server/v4/adapters"
+	"github.com/prebid/prebid-server/v4/errortypes"
+	"github.com/prebid/prebid-server/v4/openrtb_ext"
+	"github.com/prebid/prebid-server/v4/util/jsonutil"
+)
+
+// extractImpExt parses imp.Ext from the inbound OpenRTB bid request.
+// ext.Host / ext.AccountID are fully attacker-controlled.
+func extractImpExt(imp *openrtb2.Imp) (*openrtb_ext.ExtAcuityAds, error) {
+	var bidderExt adapters.ExtImpBidder
+	if err := jsonutil.Unmarshal(imp.Ext, &bidderExt); err != nil {
+		return nil, &errortypes.BadInput{Message: "ext.bidder not provided"}
+	}
+	var ext openrtb_ext.ExtAcuityAds
+	if err := jsonutil.Unmarshal(bidderExt.Bidder, &ext); err != nil {
+		return nil, &errortypes.BadInput{Message: "ext.bidder not provided"}
+	}
+	imp.Ext = nil
+	return &ext, nil
+}
+# === file: adapters/acuityads/endpoint.go ===
+package acuityads
+
+import (
+	"text/template"
+
+	"github.com/prebid/prebid-server/v4/macros"
+	"github.com/prebid/prebid-server/v4/openrtb_ext"
+)
+
+// buildEndpointURL substitutes bidder params into the endpoint template.
+// No host allowlist, scheme check or IP validation is performed here.
+func buildEndpointURL(endpoint *template.Template, params *openrtb_ext.ExtAcuityAds) (string, error) {
+	endpointParams := macros.EndpointTemplateParams{Host: params.Host, AccountID: params.AccountID}
+	return macros.ResolveMacros(endpoint, endpointParams)
+}
+# === file: adapters/acuityads/client.go ===
+package acuityads
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"text/template"
+
+	"github.com/prebid/openrtb/v20/openrtb2"
+	"github.com/prebid/prebid-server/v4/adapters"
+	"github.com/prebid/prebid-server/v4/config"
+	"github.com/prebid/prebid-server/v4/openrtb_ext"
+)
+
+type AcuityAdsAdapter struct {
+	endpoint *template.Template
+}
+
+func Builder(name openrtb_ext.BidderName, cfg config.Adapter, server config.Server) (adapters.Bidder, error) {
+	tpl, err := template.New("endpointTemplate").Parse(cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return &AcuityAdsAdapter{endpoint: tpl}, nil
+}
+
+var bidderClient = &http.Client{}
+
+func (a *AcuityAdsAdapter) MakeRequests(openRTBRequest *openrtb2.BidRequest, reqInfo *adapters.ExtraRequestInfo) ([]*adapters.RequestData, []error) {
+	ext, err := extractImpExt(&openRTBRequest.Imp[0])
+	if err != nil {
+		return nil, []error{err}
+	}
+	url, err := buildEndpointURL(a.endpoint, ext)
+	if err != nil {
+		return nil, []error{err}
+	}
+	body, err := json.Marshal(openRTBRequest)
+	if err != nil {
+		return nil, []error{err}
+	}
+	if req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body)); err == nil {
+		req.Header.Add("Content-Type", "application/json;charset=utf-8")
+		bidderClient.Do(req)
+	}
+	return []*adapters.RequestData{{Method: http.MethodPost, Body: body, Uri: url}}, nil
+}
+```
+
+**分析（针对整组文件）**
+
+1. 【输入点枚举与可达性】外部输入点共三处：(a) 入站 OpenRTB 竞价请求体——client.go L30 将 `openRTBRequest.Imp[0]` 传入 extractImpExt，extract.go L15/L19 两次 `jsonutil.Unmarshal` 把攻击者完全可控的 `imp.0.ext.bidder` JSON（含 host/accountID 字段）载入 `ext.Host/ext.AccountID`，L23 返回后经 client.go L34 传入 buildEndpointURL，endpoint.go L13 填入 `EndpointTemplateParams.Host`，L14 `macros.ResolveMacros` 替换进 URL，最终到 client.go L42 `http.NewRequest(http.MethodPost, url, ...)` 与 L44 `bidderClient.Do(req)`，source→sink 全链可达；(b) client.go L20 `cfg.Endpoint` 为运营方静态配置，仅决定模板形状，非请求期攻击者输入；(c) client.go L38 将完整 OpenRTB 请求体作为 POST body 发往由 Host 决定的主机，属同一主链的泄露放大，非独立流。
+
+2. 【防御逐流核查】主链唯一一条数据流上：extract.go L15/L19 仅做 JSON 反序列化类型错误检查，对 host 值零校验；endpoint.go L13–L14 为纯字符串模板替换（中间文件看似经过 template 处理，实则 client.go L20 的 Parse 只定位占位符，不构成 URL 上下文转义）；client.go L42 `http.NewRequest` 接受任意绝对 URL，L27 `http.Client{}` 未设 CheckRedirect/Transport 限制且默认跟随重定向。全链无域名白名单、无 scheme 限制、无私网/回环/链路本地 IP 黑名单、无正则或字符串过滤，host 可被设为 `169.254.169.254`、`localhost` 或任意内网地址，防御为零，CWE-918 成立。
+
+3. 【第二入口/替代通道】本组文件中唯一污点入口是 client.go L29 `MakeRequests`→L30 `extractImpExt`，不存在其他路由、其他参数或间接调用抵达 L44 的 `bidderClient.Do`；endpoint.go L13 的 `AccountID` 是第二个攻击者可控宏，但与 Host 走同一 URL、同一 sink，属同一漏洞的次级参数而非独立通道；`cfg.Endpoint`（client.go L20）为可信运营方配置。故确认：单一入口、单一汇聚点、链路完整且无任何有效防御。
+
+4. 【结论】攻击者通过竞价请求的 `imp.0.ext.bidder.host` 即可让服务器向任意主机（含云元数据 169.254.169.254、内网服务）发起 POST，且请求体携带完整 OpenRTB 载荷（设备 IP、UA 等）造成数据外带，风险等级 High；最小修复是在 endpoint.go 拼接前对 Host 做域名白名单并拒绝内网地址。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 SSRF（服务端请求伪造）：攻击者可控的 imp.ext.bidder.host 经宏替换进入出站 HTTP 请求 URL，调用链上无任何主机校验", "risk_level": "High", "source": "L1:line 15: extract.go jsonutil.Unmarshal(imp.Ext,...) 载入入站 OpenRTB 请求中攻击者完全可控的 imp.0.ext.bidder JSON，其 host/accountID 字段进入 ext.Host/ext.AccountID", "sink": "L3:line 44: client.go bidderClient.Do(req)，URL 来自 line 42 http.NewRequest(http.MethodPost, url,...)，url 由攻击者可控 Host 经宏替换拼成", "explanation": "流1（主链）：client.go L30 将 openRTBRequest.Imp[0] 传入 extractImpExt → extract.go L15/L19 两次 Unmarshal 把攻击者可控 ext.bidder 载入 ext.Host/ext.AccountID → L23 返回 → client.go L34 传入 buildEndpointURL → endpoint.go L13 将 params.Host 填入 EndpointTemplateParams → L14 macros.ResolveMacros 字符串替换进端点模板 → client.go L42 http.NewRequest 接受任意绝对 URL → L44 bidderClient.Do 发起出站请求，source 到 sink 全链可达；防御核查：extract.go L15/L19 仅做 JSON 类型/反序列化错误检查，endpoint.go L13-L14 为纯模板字符串替换，client.go L20 的 template.Parse 不构成 URL 上下文转义，全链无域名白名单、无 scheme 限制、无私网/回环/链路本地 IP 黑名单、无正则或字符串过滤，client.go L27 的 http.Client 未设 CheckRedirect 且默认跟随重定向，host 可指向 169.254.169.254/localhost/任意内网地址，防御为零；次要流：client.go L38 将完整 OpenRTB 请求体作为 POST body 发往攻击者选定主机造成数据外带，AccountID（endpoint.go L13）为同链路上的第二个攻击者可控宏；第二入口核查：本组文件唯一污点入口为 client.go L29 MakeRequests→L30 extractImpExt，无其他路由/参数/间接调用抵达 L44 的 Do，cfg.Endpoint（client.go L20）为运营方静态配置非请求期输入，确认单一入口单一汇聚点，CWE-918 成立", "fix_suggestion": "line 13: 在 endpoint.go 将 params.Host 拼入模板前做严格域名白名单（仅允许运营方域名如 *.acuityads.com），解析 IP 后拒绝私网/回环/链路本地地址，AccountID 限制为字母数字白名单"}
+```

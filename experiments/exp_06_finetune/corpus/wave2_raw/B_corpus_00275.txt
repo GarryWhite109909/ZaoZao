@@ -1,0 +1,77 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+from flask import Flask, request, jsonify
+
+from app.services import register_webhook, dispatch_event
+
+app = Flask(__name__)
+
+
+@app.route("/api/webhooks", methods=["POST"])
+def create_webhook():
+    body = request.get_json(force=True)
+    # SOURCE: attacker fully controls the outbound target URL
+    url = body["url"]
+    name = body.get("name", "hook")
+    hook_id = register_webhook(name, url)
+    return jsonify({"id": hook_id}), 201
+
+
+@app.route("/api/events/<event>", methods=["POST"])
+def fire_event(event):
+    payload = request.get_json(silent=True) or {}
+    dispatch_event(event, payload)
+    return jsonify({"ok": True})
+
+
+# === file: app/services.py ===
+import re
+
+from app.delivery import send_webhook
+
+# GUARD: blacklist-only host filter that looks like SSRF protection
+_BLOCKLIST = re.compile(r"localhost|127\.0\.0\.1|169\.254\.169\.254", re.I)
+
+# in-memory registry standing in for the webhook table
+_WEBHOOKS = {}
+
+
+def register_webhook(name, url):
+    if _BLOCKLIST.search(url or ""):
+        raise ValueError("host not allowed")
+    _WEBHOOKS[name] = {"url": url}
+    return name
+
+
+def dispatch_event(event, payload):
+    # pass-through: stored url forwarded to delivery unmodified
+    for hook in _WEBHOOKS.values():
+        send_webhook(hook["url"], payload)
+
+
+# === file: app/delivery.py ===
+import requests
+
+_session = requests.Session()
+
+
+def send_webhook(url, payload):
+    # SINK: no scheme/host re-validation before the outbound call
+    resp = _session.post(url, json=payload, timeout=5)
+    return resp.status_code
+```
+
+**分析（针对整组文件）**
+
+1. **外部输入点枚举与可达性**：本组共两个 HTTP 入口。入口一 `POST /api/webhooks`（app/routes.py L8-L15）：L12 `url = body['url']` 是唯一 SSRF 相关 source，攻击者完全可控；它经 L14 进入 `register_webhook`，在 app/services.py L13 过黑名单后于 L15 写入 `_WEBHOOKS`，随后由 `dispatch_event` L21-L22 原样传给 app/delivery.py L8 的 `_session.post(url, ...)`——污点经注册表跨请求存活，可达性成立（存储型链路）。入口二 `POST /api/events/<event>`（app/routes.py L18-L22）：其 body 仅作为 `payload` 进入请求体参数，不控制目标 URL，非 SSRF source，但它是把已存储 source 推向 sink 的触发器。
+
+2. **逐流防御验证**：流A（注册时，app/services.py L13）：`_BLOCKLIST.search` 是黑名单正则，仅匹配 `localhost`、`127.0.0.1`、`169.254.169.254` 三个字面子串；`127.0.0.2`、`0x7f000001`、`2130706433`、`0177.0.0.1`、`[::1]`、`[::ffff:127.0.0.1]`、内网 DNS 名（如 `svc.cluster.local`）及 DNS rebinding 全部绕过——黑名单/子串过滤按规则视为无效防御，且校验只发生在注册时刻而非发送时刻，存在 TOCTOU 窗口。流B（发送时，主链）：app/services.py L21-L22 对 `hook['url']` 纯透传，app/delivery.py L6-L8 在出站请求前无 scheme 白名单、无私网/环回 IP 解析复核，原代码 sink 侧的 `_validate_webhook_url` 在拆分后完全缺失——sink 侧防御覆盖面为零。
+
+3. **第二入口与替代通道**：存在第二路由 `fire_event`（app/routes.py L18）可达同一 sink，但其参数只影响请求体内容、不控制目的地址，故 SSRF source 仍然唯一；替代通道是 `_WEBHOOKS` 的持久化语义——攻击者注册一次后，任何后续事件派发（包括其他用户或内部任务触发）都会把污点 URL 送入 sink；全组代码中出站 HTTP 调用点仅 app/delivery.py L8 一处，sink 唯一，无其他绕行路径改变结论。
+
+4. **结论**：完整链 app/routes.py L12 → app/services.py L15/L22 → app/delivery.py L8 上仅存在一处可绕过黑名单，调用链无完整防御，CWE-918 成立；攻击者可借替代编码探测内网、命中云元数据端点，风险评级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918: Server-Side Request Forgery (SSRF)", "risk_level": "High", "source": "L1:line 12: app/routes.py create_webhook 中 url = body['url']（POST /api/webhooks 请求体，攻击者完全可控的 webhook 目标 URL）", "sink": "L3:line 8: app/delivery.py send_webhook 中 _session.post(url, json=payload, timeout=5)（以用户可控 URL 发起出站 HTTP 请求）", "explanation": "流1(注册时): routes.py L12 的 body['url'] 经 L14 进入 services.register_webhook, services.py L13 仅用黑名单正则匹配 localhost/127.0.0.1/169.254.169.254 字面子串, 可被 127.0.0.2、0x7f000001、2130706433、[::1]、[::ffff:127.0.0.1]、内网域名及 DNS rebinding 绕过, 黑名单属可绕过过滤非有效防御, 且校验仅在注册时执行存在 TOCTOU; 流2(发送时,主链): services.py L21-L22 将存储的 hook['url'] 原样透传, delivery.py L8 _session.post(url) 前无任何 scheme 白名单或私网/环回 IP 复核, 原代码 sink 侧 _validate_webhook_url 在拆分后缺失, sink 侧防御覆盖面为零; 第二入口: routes.py L18 fire_event 可触发同一 sink 但其 body 仅成为请求体 payload 不控制目标 URL, 故 SSRF source 唯一; 替代通道: services.py L9 _WEBHOOKS 持久化使污点跨请求存活(存储型 SSRF), 任意后续事件派发即达 sink; 全组代码出站请求点仅 delivery.py L8 一处, sink 唯一; 综上调用链无完整防御, CWE-918 成立", "fix_suggestion": "line 8: 在 delivery.py 的 _session.post 前增加发送时校验: 仅允许 https scheme, 用 ipaddress 解析主机并拒绝环回/私网/链路本地地址, 并在解析 DNS 后复核实际连接 IP 以防 rebinding 与 TOCTOU"}
+```

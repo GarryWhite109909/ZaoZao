@@ -1,0 +1,97 @@
+LANG: javascript
+```code
+# === file: render/serializer.js ===
+'use strict';
+// Serializer extracted from domino NodeUtils: node -> HTML fragment.
+var HTML_NS = 'http://www.w3.org/1999/xhtml';
+var hasRawContent = { STYLE: true, SCRIPT: true, XMP: true, IFRAME: true,
+  NOEMBED: true, NOSCRIPT: true, NOFRAMES: true, PLAINTEXT: true };
+
+function escape(s) {
+  return s.replace(/[&<>\u00A0]/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '\u00A0': '&nbsp;' }[c];
+  });
+}
+
+function escapeMatchingClosingTag(rawText, parentTag) {
+  var closing = '</' + parentTag;
+  if (!rawText.toLowerCase().includes(closing)) return rawText;
+  return rawText.replace(new RegExp(closing, 'ig'), function (m) {
+    return '&lt;' + m.slice(1);
+  });
+}
+
+// kid: {nodeType, data}; parent: {nodeType, namespaceURI, tagName}
+function serializeOne(kid, parent) {
+  var s = '';
+  switch (kid.nodeType) {
+    case 3: // TEXT_NODE
+    case 4: // CDATA_SECTION_NODE
+      var parenttag = (parent.nodeType === 1 &&
+        parent.namespaceURI === HTML_NS) ? parent.tagName : '';
+      if (hasRawContent[parenttag]) {
+        s += kid.data; // raw text emitted verbatim
+      } else {
+        s += escape(kid.data);
+      }
+      break;
+    case 8: // COMMENT_NODE
+      s += '<!--' + kid.data.replace(/(--\!?)>/g, '$1&gt;') + '-->';
+      break;
+    default:
+      s += escape(String(kid.data));
+  }
+  return s;
+}
+
+module.exports = { serializeOne: serializeOne,
+  escapeMatchingClosingTag: escapeMatchingClosingTag };
+
+# === file: render/sanitize.js ===
+'use strict';
+// Output "sanitizer" run before rendering serialized HTML.
+// Blacklist style: strips paired <script> blocks and javascript: URIs only.
+
+function sanitizeHtml(html) {
+  return String(html)
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/javascript:/gi, '');
+}
+
+module.exports = { sanitizeHtml: sanitizeHtml };
+
+# === file: routes/comment.js ===
+'use strict';
+var express = require('express');
+var router = express.Router();
+var serializeOne = require('../render/serializer').serializeOne;
+var sanitizeHtml = require('../render/sanitize').sanitizeHtml;
+var HTML_NS = 'http://www.w3.org/1999/xhtml';
+
+// GET /comment/render?comment=<user text>
+router.get('/comment/render', function (req, res) {
+  var userText = req.query.comment || ''; // source: attacker controlled
+  var styleNode = { nodeType: 1, namespaceURI: HTML_NS, tagName: 'STYLE' };
+  var textNode = { nodeType: 3, data: userText };
+  var fragment = serializeOne(textNode, styleNode);
+  var page = '<html><head><style>' + fragment +
+    '</style></head><body>comment saved</body></html>';
+  res.send(sanitizeHtml(page)); // delivered as text/html
+});
+
+module.exports = router;
+```
+
+分析（针对整组文件）：
+
+1. **外部输入点枚举与可达性**：全组唯一外部输入是 routes/comment.js L10 的 `req.query.comment`（L9 注册的 GET /comment/render 路由）。该值 L12 装入 `textNode.data`，L13 传入 `serializeOne`；由于 styleNode.tagName='STYLE' 且 namespaceURI 为 HTML 命名空间（L11），render/serializer.js L29 的 `hasRawContent['STYLE']` 必然命中，L30 的 raw 分支无条件可达，source→sink 链路闭合。
+
+2. **数据流与防御逐一验证**：主链为 comment.js L10 → L12 → L13 → serializer.js L30 `s += kid.data` → 返回 comment.js L14 拼入页面 → L16 `res.send` 以 text/html 输出。防御核查：(a) serializer.js L32 的 `escape()` 只覆盖 else 分支，L30 raw 分支零转义；(b) serializer.js L13-19 的 `escapeMatchingClosingTag` 虽存在并导出（L45），但文本节点路径从未调用，属“在位却未生效”的防御；(c) render/sanitize.js L7-8 是黑名单正则（仅删成对 `<script>...</script>` 块与 `javascript:` 前缀），按规则视为可绕过——载荷 `</style><img src=x onerror=alert(1)>` 不匹配任一规则而原样透传。调用链上不存在完整防御。
+
+3. **第二入口/替代通道排查**：本组文件仅 comment.js L9 一条路由；`serializeOne` 与 `sanitizeHtml` 无其他 require 方或间接调用；serializer.js L36 注释节点分支自带 `(--!?)>` 转义，属另一条已防御路径而非替代攻击面。结论：无第二入口或替代通道，单一入口已足以支撑漏洞判定。
+
+4. **触发与定性**：请求 `/comment/render?comment=</style><img src=x onerror=alert(1)>` 时，输出页面中 `<style>` 上下文被提前闭合并注入带事件属性的 `<img>`，浏览器执行 onerror，构成反射型 XSS（CWE-79）；GET 可达、无需认证、任意 HTML 注入，风险 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79: 跨站脚本 (XSS) — 用户输入经序列化器 raw 分支未转义拼入 HTML", "risk_level": "High", "source": "L3:line 10: req.query.comment (routes/comment.js, GET /comment/render 查询参数)", "sink": "L1:line 30: s += kid.data (render/serializer.js, TEXT_NODE raw 分支未转义拼接 HTML 片段)", "explanation": "主链: routes/comment.js L10 req.query.comment → L12 textNode.data → L13 serializeOne → render/serializer.js L29 hasRawContent[STYLE] 命中 → L30 s += kid.data 原样拼接 → 返回 comment.js L14 拼入页面 → L16 res.send 以 text/html 输出; 防御1: serializer.js L32 escape() 仅覆盖非 raw 分支, L30 raw 分支完全绕过; 防御2: serializer.js L13-L19 escapeMatchingClosingTag 存在并导出于 L45 但文本节点路径从未调用, 属在位未生效的防御; 防御3: render/sanitize.js L7-L8 黑名单正则仅删除成对 <script>...</script> 块与 javascript: 前缀, 载荷 </style><img src=x onerror=alert(1)> 不匹配任一规则而原样透传, 黑名单/正则过滤按规则视为可绕过; 第二入口排查: 全组仅 comment.js L9 一条路由, serializeOne 与 sanitizeHtml 无其他调用方, serializer.js L36 注释分支自带 (--!?)> 转义属已防御路径, 无第二入口或替代通道, 单入口即可确认可达; 成因: 不可信文本被送入 HTML raw-text 上下文且链上无上下文感知转义, 构成反射型 XSS", "fix_suggestion": "line 30: 在 raw 分支改为 s += escapeMatchingClosingTag(escape(kid.data), parenttag), 或直接拒绝将不可信数据写入 STYLE/SCRIPT 等 raw-text 元素, 确保用户数据永远先经上下文相关转义再拼接"}
+```

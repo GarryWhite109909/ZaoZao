@@ -1,0 +1,113 @@
+LANG: php
+```code
+# === file: src/Controller/WebhookController.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Controller;
+
+use App\Service\WebhookService;
+
+final class WebhookController
+{
+    public function __construct(private WebhookService $webhooks) {}
+
+    // GET /webhooks/register — the only HTTP entry of this app
+    public function register(): void
+    {
+        $callbackUrl = $_GET['callback_url'] ?? '';
+        $event       = $_GET['event'] ?? 'ping';
+
+        $this->webhooks->dispatch($event, $callbackUrl);
+
+        header('Content-Type: application/json');
+        echo json_encode(['status' => 'accepted']);
+    }
+}
+# === file: src/Service/WebhookService.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Service;
+
+use App\Http\Handler\CurlHandler;
+use GuzzleHttp\Psr7\Request;
+
+final class WebhookService
+{
+    private CurlHandler $handler;
+
+    public function __construct()
+    {
+        $this->handler = new CurlHandler();
+    }
+
+    public function dispatch(string $event, string $callbackUrl): void
+    {
+        // Incomplete defense: blacklist only exact host 'localhost' and 'file:' prefix
+        $parts = parse_url($callbackUrl);
+        $host  = strtolower((string) ($parts['host'] ?? ''));
+        if ($host === 'localhost' || str_starts_with(strtolower($callbackUrl), 'file:')) {
+            throw new \InvalidArgumentException('Blocked webhook target.');
+        }
+
+        $request = new Request('POST', $callbackUrl, ['X-Webhook-Event' => $event], '{}');
+
+        ($this->handler)($request, ['connect_timeout' => 3]);
+    }
+}
+# === file: src/Http/Handler/CurlHandler.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Http\Handler;
+
+use Psr\Http\Message\RequestInterface;
+
+/**
+ * Minimal cURL transport (adapted from Guzzle CurlHandler):
+ * builds an easy handle from the request URI and executes it.
+ */
+final class CurlHandler
+{
+    public function __invoke(RequestInterface $request, array $options = []): string
+    {
+        $easy = \curl_init();
+
+        \curl_setopt($easy, \CURLOPT_URL, (string) $request->getUri());
+        \curl_setopt($easy, \CURLOPT_RETURNTRANSFER, true);
+        \curl_setopt($easy, \CURLOPT_FOLLOWLOCATION, true);
+        if (isset($options['connect_timeout'])) {
+            \curl_setopt($easy, \CURLOPT_CONNECTTIMEOUT, (int) $options['connect_timeout']);
+        }
+
+        $body = \curl_exec($easy);  // sink: request URI reaches curl_exec unfiltered
+
+        \curl_close($easy);
+
+        return \is_string($body) ? $body : '';
+    }
+}
+```
+
+**整体分析（针对整组文件）**
+
+1. **外部输入点枚举与可达性**：全组共两个外部输入点，均由唯一路由 `GET /webhooks/register` 触发 `WebhookController::register()`。① `WebhookController.php L15` 的 `$_GET['callback_url']` 在 L18 传入 `WebhookService::dispatch`，经 `WebhookService.php L27` 成为 Request URI、L29 调用 `CurlHandler::__invoke`，在 `CurlHandler.php L18` 写入 `CURLOPT_URL`、L25 执行 `curl_exec`，到 sink 可达性成立；② `WebhookController.php L16` 的 `$_GET['event']` 仅作为请求头 `X-Webhook-Event` 的值（`WebhookService.php L27`），不进入 URL，不构成 SSRF 通道。
+
+2. **source→sink 数据流与防御逐一验证**：唯一主链为 `WebhookController.php L15 → L18 → WebhookService.php L18 → L21-L25 → L27 → L29 → CurlHandler.php L14 → L18 → L25`（sink 文件保留了原 CurlHandler 语义：由请求 URI 构建句柄并 `curl_exec`）。链上唯一防御位于 `WebhookService.php L21-L25`：`$host === 'localhost'` 精确匹配黑名单 + `str_starts_with(..., 'file:')` 前缀过滤，属字符串黑名单，按规则视为可绕过——`http://127.0.0.1/`、`http://[::1]/`、`http://169.254.169.254/`（云元数据）、`10.x` 内网段、`localhost.evil.com`、DNS rebinding、十进制/十六进制 IP 写法均可绕过 host 检查；`gopher://`、`dict://`、`tftp://` 等其余 curl 支持的 scheme 不在前缀黑名单内直接放行。此外 `CurlHandler.php L20` 开启 `CURLOPT_FOLLOWLOCATION`，允许初始合法外网 URL 经 302 重定向转向内网目标，放大攻击面；sink 处 `CurlHandler.php L18/L25` 对最终 URL 无 scheme 白名单、无解析 IP 复核，防御不完整，CWE-918 成立。
+
+3. **第二入口/替代通道排查**：全组仅 `WebhookController::register` 一个 HTTP 入口；`WebhookService.php L29` 是 `CurlHandler::__invoke` 的唯一调用点，不存在其他路由、CLI 脚本或间接调用可触达 sink；第二输入点 `$_GET['event']`（`WebhookController.php L16`）已验证不达 sink。因此暴露面收敛为上述单一主链，且该链无完整防御，结论不受替代通道影响。
+
+4. **结论**：用户可控 URL 跨三个文件直达 `curl_exec`，中间层黑名单形同虚设，SSRF（CWE-918）成立，可访问内网服务与云元数据接口，风险 High；最小修复应落在中间层校验处并以白名单替代黑名单。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-918: SSRF — 用户可控回调 URL 经不完整黑名单跨文件直达 curl_exec",
+  "risk_level": "High",
+  "source": "L1:line 15: $_GET['callback_url'] 于 WebhookController::register",
+  "sink": "L3:line 25: curl_exec($easy) 于 CurlHandler::__invoke",
+  "explanation": "输入点枚举: 共两个外部输入点, WebhookController.php L15 $_GET['callback_url'] 经 L18 传入 WebhookService::dispatch, 经 WebhookService.php L27 构造 Request URI、L29 调用 handler, 到达 CurlHandler.php L18 CURLOPT_URL 与 L25 curl_exec, 可达性成立; 第二输入点 WebhookController.php L16 $_GET['event'] 仅写入请求头 X-Webhook-Event (WebhookService.php L27), 不进入 URL, 不构成 SSRF 通道; 主数据流防御验证: 唯一防御在 WebhookService.php L21-L25, 为 host==='localhost' 精确黑名单加 'file:' 前缀过滤, 属字符串黑名单可绕过, 127.0.0.1/[::1]/169.254.169.254/内网 IP 段/localhost.evil.com/DNS rebinding/十进制与十六进制 IP 写法均可绕过 host 检查, gopher:// dict:// tftp:// 等方案不在前缀黑名单直接放行; CurlHandler.php L20 开启 CURLOPT_FOLLOWLOCATION 允许外网 URL 重定向进入内网, 放大攻击面; sink 处 CurlHandler.php L18/L25 无 scheme 白名单与解析 IP 复核, 防御不完整; 第二入口排查: 全组仅 register 一个路由, WebhookService.php L29 是 CurlHandler::__invoke 的唯一调用点, 无其他路由或间接调用触达 sink, 暴露面即此单一无完整防御链, CWE-918 SSRF 成立",
+  "fix_suggestion": "line 23: 在 WebhookService.php 将黑名单替换为白名单——仅允许 https 方案, 解析主机名后校验最终 IP 不在回环/私有/链路本地网段且属于批准网段, 同时关闭 CURLOPT_FOLLOWLOCATION 或限制重定向目标, 并在 CurlHandler 执行前对最终连接 IP 复核"
+}
+```

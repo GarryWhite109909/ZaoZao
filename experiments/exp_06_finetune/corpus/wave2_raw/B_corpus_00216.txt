@@ -1,0 +1,101 @@
+LANG: javascript
+```code
+# === file: src/options.js ===
+'use strict';
+
+// Default converter options (trimmed from showdown getDefaultOpts).
+function getDefaultOpts (simple) {
+  const defaultOptions = {
+    prefixHeaderId: { defaultValue: false, describe: 'Add a prefix to generated header ids', type: 'string' },
+    rawHeaderId: { defaultValue: false, describe: 'Keep < > and quotes in generated ids', type: 'boolean' },
+    ghCodeBlocks: { defaultValue: true, type: 'boolean' },
+    encodeEmails: { defaultValue: true, type: 'boolean' }
+  };
+  if (simple === false) {
+    return JSON.parse(JSON.stringify(defaultOptions));
+  }
+  const ret = {};
+  for (const opt in defaultOptions) {
+    if (Object.prototype.hasOwnProperty.call(defaultOptions, opt)) {
+      ret[opt] = defaultOptions[opt].defaultValue;
+    }
+  }
+  return ret;
+}
+
+// SOURCE: every query-string key/value is merged verbatim over the defaults.
+function getUserOpts () {
+  const params = new URLSearchParams(window.location.search);
+  const userInput = {};
+  for (const pair of params.entries()) {
+    userInput[pair[0]] = pair[1];
+  }
+  const opts = getDefaultOpts(true);
+  for (const key in userInput) {
+    opts[key] = userInput[key]; // tainted flags and body land here
+  }
+  return opts;
+}
+
+export { getDefaultOpts, getUserOpts };
+
+# === file: src/sanitize.js ===
+'use strict';
+// Fake defense: the blacklist only covers spaces, backticks and single
+// quotes; <, > and double quotes survive, and when rawHeaderId=true is
+// set by the user this function degenerates into a pure pass-through.
+function sanitizeHeaderId (rawId, opts) {
+  let id = String(rawId);
+  if (opts && opts.rawHeaderId) {
+    return id.replace(/\s/g, '-'); // spaces -> dashes only
+  }
+  return id.replace(/[`'\s]/g, '-'); // < > and double quotes untouched
+}
+
+export { sanitizeHeaderId };
+
+# === file: src/preview.js ===
+'use strict';
+import { getUserOpts } from './options.js';
+import { sanitizeHeaderId } from './sanitize.js';
+
+function renderHeading (text, level, opts) {
+  const id = sanitizeHeaderId(text, opts);
+  const prefix = opts.prefixHeaderId === true ? 'section-' : (opts.prefixHeaderId || '');
+  return '<h' + level + ' id="' + prefix + id + '">' + text + '</h' + level + '>';
+}
+
+function renderMarkdown (mdText, opts) {
+  const lines = String(mdText).split('\n');
+  let html = '';
+  for (const line of lines) {
+    const m = line.match(/^(#{1,6})\s+(.*)$/);
+    html += m ? renderHeading(m[2], m[1].length, opts) : '<p>' + line + '</p>';
+  }
+  return html;
+}
+
+function initPreview () {
+  const opts = getUserOpts(); // tainted options incl. body and rawHeaderId
+  const html = renderMarkdown(opts.body || '', opts);
+  document.getElementById('preview').innerHTML = html; // SINK: CWE-79
+}
+
+document.addEventListener('DOMContentLoaded', initPreview);
+
+export { renderMarkdown, renderHeading };
+```
+
+**分析（针对整组文件）**
+
+1. **外部输入点枚举与可达性**：全组唯一外部输入点是 `src/options.js` L25 的 `window.location.search`；L27-L28 将全部查询键值原样收集，L31-L32 无键白名单、无值校验地覆盖默认选项（可注入 `body`、`rawHeaderId`、`prefixHeaderId`）。可达路径：`preview.js` L27 DOMContentLoaded → L22 `getUserOpts()` → L23 `renderMarkdown` → L6 `sanitizeHeaderId` → L8 字符串拼接 → L24 `innerHTML`，source 到 sink 全链可达。
+
+2. **逐流防御验证**：流1（选项流）：query 中 `rawHeaderId=true` → `opts` → `sanitize.js` L7-L8 该分支仅做空白替换，属纯传递，`<`、`>`、双引号全部存活；流2（正文流）：query 的 `body` → `preview.js` L15-L16 识别为标题文本 → `sanitize.js` L10 黑名单正则 `/[`'\s]/g` 只覆盖反引号、单引号与空白，未覆盖 `<`、`>`、双引号及 `onerror` 等事件载荷，属可绕过的无效防御；输出侧 `preview.js` L8 将 id 与 text 未经 HTML 实体编码直接拼入 `id="..."` 属性与标签体，L24 直接赋给 `innerHTML`，全链无任何有效编码/转义。
+
+3. **利用面**：两条流在 `preview.js` L24 汇合，示例 payload `body=# a%22><img/src=x/onerror=alert(1)>`（`%22` 即双引号，两个净化分支均不过滤），双引号闭合 id 属性后 `<img>` 成为真实 DOM 节点，构成 URL 触发的反射型 XSS。
+
+4. **第二入口/替代通道排查**：全项目唯一入口是 `preview.js` L27 的 DOMContentLoaded→`initPreview`；`sanitize.js` 仅被 `preview.js` L3 导入且仅 L6 一处调用；`options.js` 的 `getDefaultOpts` 单独调用只返回硬编码安全默认值、不接触 sink；不存在其他路由、参数或间接调用能绕过或缓解该链路，故唯一通道即漏洞通道，判定存在 CWE-79。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79: 跨站脚本（XSS）— 未净化的 header id 与选项经 innerHTML 注入 HTML", "risk_level": "High", "source": "L1:line 25: options.js getUserOpts 读取 window.location.search，全部查询参数未经校验合并进 opts", "sink": "L3:line 24: preview.js 将未编码的拼接 HTML 赋给 document.getElementById('preview').innerHTML", "explanation": "流1（选项流）：options.js L25 从 window.location.search 读入全部查询参数，L27-L28 原样收集，L31-L32 无键白名单地覆盖默认项，攻击者置 rawHeaderId=true 后 sanitize.js L7-L8 分支仅做空白替换，属纯传递，<、>、双引号全部存活；流2（正文流）：query 的 body 经 preview.js L23 进入 renderMarkdown，L15-L16 命中标题后进入 renderHeading，sanitize.js L10 黑名单正则 /[`'\\s]/g 只过滤反引号、单引号与空白，未覆盖 <、>、双引号及 onerror 等事件载荷，属可绕过的无效防御；输出侧 preview.js L8 将 id 与 text 未经 HTML 实体编码直接拼入 id 属性与标签体，L24 赋给 innerHTML，两流在此汇合触发反射型 XSS，示例 payload 为 body=# a%22><img/src=x/onerror=alert(1)>，其中 %22 闭合 id 属性；第二入口排查：全项目唯一入口为 preview.js L27 的 DOMContentLoaded 到 initPreview，sanitize.js 仅被 preview.js L3 导入且仅 L6 一处调用，getDefaultOpts 单独调用只返回硬编码安全默认值不接触 sink，不存在其他路由、参数或间接调用，唯一通道即漏洞通道，结论为存在 CWE-79 漏洞", "fix_suggestion": "line 8: 拼接前对 id 与 text 做 HTML 实体编码（转义 <、>、& 与单双引号），并在 options.js line 32 处改为仅接受已知选项键的白名单合并，即可同时切断选项流与正文流"}
+```

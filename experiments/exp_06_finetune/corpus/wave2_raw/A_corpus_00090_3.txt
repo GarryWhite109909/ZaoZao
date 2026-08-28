@@ -1,0 +1,70 @@
+LANG: java
+```code
+package com.vms.admin;
+
+import jakarta.servlet.http.*;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.HandlerInterceptor;
+import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+import java.util.Map;
+
+@Configuration
+public class CategoryAdminConfig implements WebMvcConfigurer {
+
+    static class AdminAuthInterceptor implements HandlerInterceptor {
+        @Override
+        public boolean preHandle(HttpServletRequest req, HttpServletResponse res, Object handler) throws Exception {
+            HttpSession session = req.getSession(false);
+            if (session == null || session.getAttribute("userId") == null) {
+                res.sendError(401);
+                return false;
+            }
+            if (!Boolean.TRUE.equals(session.getAttribute("canManageCategories"))) {
+                res.sendError(403);
+                return false;
+            }
+            return true;
+        }
+    }
+
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(new AdminAuthInterceptor()).addPathPatterns("/admin/**");
+    }
+}
+
+@RestController
+class CategoryAdminController {
+
+    private final JdbcTemplate jdbc;
+
+    CategoryAdminController(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+
+    @PostMapping("/admin/categories/delete")
+    public Map<String, Object> delete(@RequestParam(name = "id", defaultValue = "0") long id) {
+        int n = jdbc.update("DELETE FROM categories WHERE id = ?", id);
+        jdbc.update("DELETE FROM category_assets WHERE category_id = ?", id);
+        if (n > 0) {
+            return Map.of("error", false, "msg", "");
+        }
+        return Map.of("error", true, "msg", "Error on delete");
+    }
+}
+```
+
+1. **第 45 行（source 枚举与可达性）**：`@RequestParam(name='id', defaultValue='0') long id` 是本文件唯一的外部输入点，Spring MVC 会同时从 query string 和 form body 绑定该参数（等价于原代码的 `$_REQUEST['id']`，`defaultValue='0'` 对应 `intval` 兜底），数值完全由请求方控制，且未经任何转换直接流入第 46-47 行，source→sink 可达。
+
+2. **第 15-29 行 + 第 33 行（防御类型/位置/覆盖面）**：请求到达 sink 前的唯一防线是 `AdminAuthInterceptor`（第 33 行注册到 `/admin/**`）：第 18-22 行校验 HttpSession 登录态，第 23-26 行校验 `canManageCategories` 权限（对应原代码 `canCreateCategory`）。该防御属于会话级认证/授权，位置正确、对未登录用户的覆盖完整；但它凭浏览器自动附带的 JSESSIONID Cookie 识别身份，整条过滤器/拦截器链中不存在 CSRF token 校验、Origin/Referer 校验或 SameSite Cookie 配置，对“请求是否由受害者在本站发起”完全不设防——身份判断无法区分攻击者构造的跨站请求与合法请求，不构成 CSRF 有效防御。
+
+3. **第 46-47 行（sink）**：`jdbc.update` 执行 `DELETE FROM categories` 与 `DELETE FROM category_assets`，是与调用者会话权限绑定的破坏性状态变更（对应 `Category::deleteAssets`）。SQL 使用 `?` 占位符且参数绑定为 `long`，SQL 注入被排除；参数的唯一作用是选择删除哪一行，攻击语义完整保留。
+
+4. **利用路径**：攻击者页面构造自动提交的跨站 form POST 到 `/admin/categories/delete` 并携带 `id=N`；浏览器在跨站表单提交时自动附带受害者会话 Cookie，第 19-27 行校验全部通过并 `return true`，第 46-47 行随即执行删除；该请求属于简单请求，CORS 预检不适用，响应虽不可读但副作用已发生，链上无任何环节可阻断。
+
+5. **第二入口/替代通道**：本文件内不存在第二个输入点（仅一个 `@RequestParam`），但该缺口是链级而非端点级——第 33 行把同一拦截器应用于整个 `/admin/**` 命名空间，任何同前缀的其他状态变更路由都共享“有鉴权、无 CSRF”的相同缺口；同时应用未引入 Spring Security 的 `CsrfFilter`，也不存在其他过滤器提供 token 校验，无替代防御通道，据此确认 CWE-352 成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-352 Cross-Site Request Forgery (CSRF) on session-cookie authenticated state-changing admin endpoint", "risk_level": "High", "source": "line 45: @RequestParam(name='id', defaultValue='0') long id，从表单/查询参数直接绑定的外部输入", "sink": "line 46-47: jdbc.update 执行 DELETE FROM categories 与 DELETE FROM category_assets", "explanation": "主数据流：line 45 外部参数 id -> line 46-47 删除分类及其资产；中间唯一防御是 line 15-29 的 AdminAuthInterceptor（line 33 注册于 /admin/**），仅做 HttpSession 登录与 canManageCategories 授权，凭浏览器自动附带的 JSESSIONID 识别身份，链上无 CSRF token、无 Origin/Referer 校验、无 SameSite 配置，无法区分跨站伪造请求与合法请求；SQL 采用 ? 占位符且绑定 long 类型，SQL 注入不成立，剩余缺口即 CSRF；第二入口分析：文件内无其他输入点，但缺口为链级，/admin/** 下所有状态变更路由同样暴露，且未部署 Spring Security CsrfFilter 等替代防御 -> 跨站 form POST 以受害者管理员会话触发任意分类删除，CWE-352 成立", "fix_suggestion": "line 33: 在拦截器链最前端注册 CSRF Token 校验拦截器（校验会话绑定的一次性 token 与 Origin/Referer，覆盖所有非幂等请求），或引入 Spring Security 默认开启的 CsrfFilter，并将会话 Cookie 设为 SameSite=Lax"}
+```

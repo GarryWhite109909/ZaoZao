@@ -1,0 +1,75 @@
+LANG: php
+```code
+# === file: src/Controller/ImportController.php ===
+<?php
+namespace App\Controller;
+
+use App\Security\UrlGuard;
+use App\Service\WebServiceFetcher;
+
+class ImportController
+{
+    // GET /spreadsheet/import?url=... ：唯一外部入口
+    public function importAction(array $query): string
+    {
+        $rawUrl = (string) ($query['url'] ?? ''); // SOURCE: 用户可控 URL
+        $url = UrlGuard::sanitize($rawUrl);
+        $fetcher = new WebServiceFetcher();
+        $data = $fetcher->fetch($url);
+        return $data ?? 'import failed';
+    }
+}
+# === file: src/Security/UrlGuard.php ===
+<?php
+namespace App\Security;
+
+class UrlGuard
+{
+    // 看似净化：仅 scheme 白名单 + 主机字符串黑名单，不完整
+    public static function sanitize(string $url): string
+    {
+        $url = trim($url);
+        $parsed = parse_url($url);
+        $scheme = $parsed['scheme'] ?? '';
+        if ($scheme !== 'http' && $scheme !== 'https') {
+            return '';
+        }
+        $host = strtolower($parsed['host'] ?? '');
+        if (str_contains($host, 'localhost') || $host === '127.0.0.1') {
+            return '';
+        }
+        return $url; // 其余情况原样返回，未做任何主机限制
+    }
+}
+# === file: src/Service/WebServiceFetcher.php ===
+<?php
+namespace App\Service;
+
+class WebServiceFetcher
+{
+    public function fetch(string $url): ?string
+    {
+        if ($url === '') {
+            return null;
+        }
+        $ctx = stream_context_create(['http' => ['user_agent' => 'Mozilla/5.0']]);
+        $output = @file_get_contents($url, false, $ctx); // SINK: 服务端发起请求
+        if ($output === false || mb_strlen($output) > 32767) {
+            return null;
+        }
+        return $output;
+    }
+}
+```
+
+1. 外部输入点枚举与可达性：全部代码中唯一外部输入点是 ImportController.php L12 的 `$query['url']`（HTTP 查询参数，完全用户可控）；`$query` 其余键未被使用，UrlGuard 与 WebServiceFetcher 自身不接收任何外部数据。该值经 L13 传入 sanitize、L15 传入 fetch，最终到达 WebServiceFetcher.php L12 的 `file_get_contents`，source→sink 可达性成立。
+
+2. 数据流防御逐一验证：流1（主链）：ImportController.php L12 → L13 UrlGuard::sanitize → UrlGuard.php L12-14 仅校验 scheme 属于 http/https（scheme 白名单不限制目标主机，内网 http 服务如 169.254.169.254 云元数据仍可达，不构成 SSRF 防御）→ UrlGuard.php L15-17 为字符串黑名单，仅匹配 localhost 与 127.0.0.1 字面量，可用 0x7f000001、2130706433、内网 IP 或 DNS rebinding 轻易绕过，按规则黑名单/字符串匹配视为无效防御 → L19 将原 URL 原样返回 → ImportController.php L15 → WebServiceFetcher.php L12 `file_get_contents($url, false, $ctx)` 触发 SSRF；fetch 内部 L8 仅做空串判断，无任何主机或 IP 校验，链上不存在完整防御。
+
+3. 第二入口与替代通道：当前代码仅一条路由，但 WebServiceFetcher::fetch（WebServiceFetcher.php L6）为 public 方法且自身零校验，任何其他控制器或后台脚本直接调用它并传入原始 URL 即可完全绕过 UrlGuard，构成间接调用的替代通道；同时 UrlGuard::sanitize 为 public static，调用方也可选择不调用。因此系统不存在纵深防御，替代通道进一步确认漏洞不可被现有防线阻断。
+
+4. 结论：source 到 sink 的调用链上仅有可绕过的 scheme 白名单与字符串黑名单，无完整防御，攻击者可借服务端发起任意 http(s) 请求探测内网、访问云元数据端点，构成 CWE-918，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918", "risk_level": "High", "source": "L1:line 12: $query['url'] 用户可控的 URL 查询参数", "sink": "L3:line 12: file_get_contents($url, false, $ctx) 服务端发起 HTTP 请求", "explanation": "流1: ImportController.php L12 读取 $query['url'] → L13 传入 UrlGuard::sanitize → UrlGuard.php L12-14 仅校验 scheme 为 http/https，不限制目标主机，内网地址仍可达 → L15-17 黑名单仅字符串匹配 localhost 与 127.0.0.1，可用 0x7f000001、2130706433、169.254.169.254 或 DNS rebinding 绕过，属无效防御 → L19 原样返回 URL → ImportController.php L15 传入 WebServiceFetcher::fetch → WebServiceFetcher.php L12 file_get_contents 触发 SSRF；第二入口: WebServiceFetcher::fetch 为 public 且自身无任何主机校验，其他调用方直接传入原始 URL 即可绕过 UrlGuard，构成替代通道，sanitize 亦可被调用方跳过；故调用链上无完整防御，确认 CWE-918", "fix_suggestion": "line 12: 在 WebServiceFetcher::fetch 调用 file_get_contents 前实施默认拒绝的域名白名单校验，解析 host 为 IP 后拒绝回环/私网/链路本地地址，并禁用重定向跟随"}
+```

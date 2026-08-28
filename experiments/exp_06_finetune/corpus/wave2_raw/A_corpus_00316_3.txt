@@ -1,0 +1,62 @@
+LANG: typescript
+
+```typescript
+// app/api/messaging/templates/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import ejs from "ejs";
+import { prisma } from "@/lib/prisma";
+import { verifySession } from "@/lib/auth";
+
+// Route whitelist: paths with these prefixes skip session verification entirely.
+const ROUTE_WHITELIST = ["/api/healthz", "/api/public"];
+
+function withWhitelistAuth(handler: (req: NextRequest) => Promise<NextResponse>) {
+  return async (req: NextRequest): Promise<NextResponse> => {
+    const { pathname } = req.nextUrl;
+    if (ROUTE_WHITELIST.some((p) => pathname.startsWith(p))) return handler(req);
+    const session = await verifySession(req.cookies.get("sid")?.value);
+    if (!session) {
+      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    }
+    return handler(req); // auth decides WHO may call; template content is never inspected
+  };
+}
+
+// Naive filter: strips Jinja-style {{ }} only, while EJS evaluates <% %> tags.
+function stripBraces(s: string): string {
+  return s.replace(/\{\{[\s\S]*?\}\}/g, "");
+}
+
+export const POST = withWhitelistAuth(async (req: NextRequest) => {
+  const { type, body } = await req.json(); // SOURCE: attacker-controlled template body
+  const content = stripBraces(String(body ?? ""));
+  const tpl = await prisma.messagingTemplate.upsert({
+    where: { type },
+    update: { content },
+    create: { type, content },
+  });
+  const preview = ejs.render(tpl.content, { code: "482913", minutes: 10 }); // SINK
+  return NextResponse.json({ id: tpl.id, preview });
+});
+
+export const GET = withWhitelistAuth(async (req: NextRequest) => {
+  const type = req.nextUrl.searchParams.get("type") ?? ""; // second entry: query param
+  const tpl = await prisma.messagingTemplate.findUnique({ where: { type } });
+  if (!tpl) return NextResponse.json({ error: "not_found" }, { status: 404 });
+  return NextResponse.json({ preview: ejs.render(tpl.content, { code: "482913" }) }); // SINK 2
+});
+```
+
+1. **第 27–28 行（输入点①）与第 40 行（输入点②）**：POST 处理器通过 Next.js 惯用的 `req.json()` 取出 `body`（邮件模板正文，完全由客户端控制）；GET 处理器通过 `req.nextUrl.searchParams.get('type')` 接收查询参数用于选取数据库中的模板行。两条输入最终都汇入同一 sink：第 35 行与第 43 行的 `ejs.render(tpl.content, ...)`，可达性在同一次请求内即闭环（POST 写入后立即渲染）。
+
+2. **第 29 行是唯一的内容防御，且属可绕过防御**：`stripBraces` 是黑名单式字符串替换，只删除 Jinja 风格的 `{{ }}`，而第 3 行引入的 EJS 引擎求值的是 `<% %>` 定界符——过滤规则与引擎语法错配；同时该过滤仅位于写入侧（POST），第 43 行的渲染路径对已存储内容完全不过滤，覆盖面缺失。按规则，字符串替换过滤不构成有效防御。
+
+3. **第 30–35 行（source→sink 主链）**：未净化的 `content` 经 Prisma `upsert` 持久化到数据库后，第 35 行把用户字符串直接作为模板体传给 `ejs.render`——EJS 内部用 `new Function` 编译模板，注入 `<%= process.mainModule.require('child_process').execSync('id') %>` 即获得服务端 RCE，全程无沙箱、无渲染环境限制，与原漏洞语义一一对应。
+
+4. **第 10–19 行白名单鉴权链的位置错误**：本路由不在第 8 行白名单内，需携带有效会话 Cookie 才能进入处理器，但该链只回答“谁能调用”，无角色/所有权检查——任意低权限登录用户即可覆盖全局模板并触达 sink。鉴权是认证控制而非模板内容净化，对 SSTI 不构成防御，等同于原代码中“缺失净化”的状态。
+
+5. **第二入口与替代通道结论**：GET（第 39–43 行）构成存储型替代通道——POST 写入的恶意模板可由 GET 请求或未来任何渲染该数据库行的调用（如发信任务）间接触发同一 sink；第 8 行白名单项 `/api/healthz`、`/api/public` 与本路由无关，不存在未认证绕过路径，但“认证后任意用户 RCE”已足以成立，故漏洞确认存在。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine (Server-Side Template Injection leading to RCE)", "risk_level": "Critical", "source": "line 28: POST req.json() 的 body 字段（用户可控模板正文）；line 40: GET 的 type 查询参数为第二入口", "sink": "line 35: ejs.render(tpl.content, ...) 将用户字符串直接编译执行；line 43 为同一 sink 的存储型触发点", "explanation": "流1：line 28 body -> line 29 stripBraces（黑名单字符串替换，只删 {{ }} 而 EJS 求值 <% %>，语法错配且仅覆盖写入侧，可绕过）-> line 30-34 Prisma upsert 持久化 -> line 35 ejs.render 以 new Function 编译用户模板，注入 <%= process.mainModule.require('child_process') %> 即 RCE，无沙箱无环境限制；流2：同一恶意 content 经 line 41 查询后在 line 43 再次 render，构成存储型第二通道，未来任何渲染该行的调用（如发信任务）同样命中；防御验证：line 10-19 白名单鉴权链仅做会话校验、无角色与所有权检查，任意登录用户可写全局模板，属位置错误的防御，不拦截模板内容；第二入口排查：line 8 白名单项 /api/healthz 与 /api/public 与本路由无关，无未认证绕过，但认证后任意用户 RCE 成立", "fix_suggestion": "line 35: 禁止将用户内容作为模板体编译——把用户文本作为数据变量传入固定的服务端模板（ejs.render(trustedTemplate, { userBody: content })），或改用无逻辑沙箱引擎并限制可用标签；同时将 line 29 的过滤按 EJS 定界符重写并在 line 43 渲染前同样执行"}
+```

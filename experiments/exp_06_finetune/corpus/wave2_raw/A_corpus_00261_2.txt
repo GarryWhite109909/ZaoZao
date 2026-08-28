@@ -1,0 +1,68 @@
+LANG: java
+
+```java
+package com.example.faq.captcha;
+
+import java.util.Map;
+
+import jakarta.servlet.http.HttpServletRequest;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * Persists captcha sessions and periodically purges expired entries.
+ */
+@RestController
+@RequestMapping("/api/captcha")
+public class CaptchaSessionController {
+
+    private final JdbcTemplate jdbcTemplate;
+
+    public CaptchaSessionController(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    @PostMapping("/save")
+    public ResponseEntity<Map<String, String>> saveCaptcha(
+            @RequestHeader("User-Agent") String userAgent,
+            HttpServletRequest request) {
+        String clientIp = request.getHeader("X-Forwarded-For");
+        String filteredAgent = sanitize(userAgent);
+        String sql = "INSERT INTO captcha_session (ip_address, user_agent) VALUES ('"
+                + clientIp + "', '" + filteredAgent + "')";
+        jdbcTemplate.execute(sql);
+        return ResponseEntity.ok(Map.of("status", "stored", "ip", clientIp));
+    }
+
+    @GetMapping("/gc")
+    public ResponseEntity<Map<String, Integer>> garbageCollector(HttpServletRequest request) {
+        String clientIp = request.getHeader("X-Forwarded-For");
+        String sql = "DELETE FROM captcha_session WHERE ip_address = '"
+                + clientIp + "' AND created_at < NOW() - INTERVAL 1 HOUR";
+        int removed = jdbcTemplate.update(sql);
+        return ResponseEntity.ok(Map.of("removed", removed));
+    }
+
+    private String sanitize(String input) {
+        return input == null ? "" : input.replaceAll("(?i)(union|select|insert|delete|drop|--|#)", "");
+    }
+}
+```
+
+1. **外部输入点枚举与可达性**：第 30 行 `@RequestHeader("User-Agent")` 与第 32 行 `request.getHeader("X-Forwarded-For")` 是 `/api/captcha/save` 的两个 source，均为攻击者可任意设置的 HTTP 头；它们在第 34–35 行被直接字符串拼接进 INSERT 语句，第 36 行 `jdbcTemplate.execute(sql)` 执行，source 到 sink 之间无任何类型校验或参数化，路径完全可达。
+
+2. **主链防御验证**：第 33 行对 userAgent 应用的唯一过滤是第 49–51 行的 `sanitize`——一个关键词黑名单 `replaceAll`。按判定规则，黑名单/字符串替换属可绕过防御：`selselectect` 删除后还原为 `select`，且 `extractvalue`、`sleep`、布尔盲注等载荷根本不含名单内关键词；更关键的是它完全不转义单引号，攻击者可无阻碍闭合字面量注入任意 SQL。而第 32 行的 clientIp 流向第 35 行时**零过滤**，连黑名单都没有。
+
+3. **第二入口确认**：第 40–45 行的 `GET /api/captcha/gc` 是独立入口：第 42 行再次读取 X-Forwarded-For，第 43–44 行拼进 DELETE 语句，第 45 行 `jdbcTemplate.update(sql)` 执行，全程无任何处理。此外 `JdbcTemplate` 的字符串重载本身不提供任何参数化保护，两条路由构成两条互不依赖的注入通道。
+
+4. **语义等价结论**：改写后与原漏洞语义结构一致——请求头/客户端标识（source）→ 字符串插值构造语句 → 存储层执行（sink），防御同样缺失或仅为可绕过的黑名单，多条无防御数据流成立，无需其他间接调用即可远程利用。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL注入（HTTP请求头拼接进SQL语句）", "risk_level": "Critical", "source": "line 30: @RequestHeader('User-Agent') 与 line 32: request.getHeader('X-Forwarded-For')，均为攻击者完全可控的HTTP头", "sink": "line 36: jdbcTemplate.execute(sql) 执行拼接后的INSERT（第二入口对应 line 45: jdbcTemplate.update(sql) 执行拼接DELETE）", "explanation": "流1: line 30 User-Agent 与 line 32 X-Forwarded-For 经 line 34-35 字符串拼接进INSERT并在 line 36 执行; 唯一过滤是 line 49-51 的关键词黑名单 replaceAll 且仅作用于 User-Agent, 黑名单/字符串替换按规则视为可绕过(如 selselectect 还原为 select, 或使用 extractvalue/sleep/布尔盲注等不在名单内的载荷), 且未转义单引号导致闭合字面量毫无阻碍; 流2: line 32 的 clientIp 未经过任何处理直达 line 35 拼接点, 完全无防御; 流3(第二入口): line 40-45 的 GET /api/captcha/gc 将 line 42 的 X-Forwarded-For 拼进 DELETE 并在 line 45 经 jdbcTemplate.update 执行, 全程零过滤; JdbcTemplate 字符串重载不提供参数化, 因此多条无有效防御的 source→sink 数据流成立", "fix_suggestion": "line 34: 改用参数化语句 jdbcTemplate.update('INSERT INTO captcha_session (ip_address, user_agent) VALUES (?, ?)', clientIp, userAgent), 并在 line 43-45 对 DELETE 做同样参数化改造"}
+```

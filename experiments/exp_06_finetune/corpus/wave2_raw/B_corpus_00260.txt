@@ -1,0 +1,90 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+from flask import Flask, request, jsonify
+from services.controller_service import ControllerService
+
+app = Flask(__name__)
+svc = ControllerService()
+
+
+@app.route('/make_controller', methods=['POST'])
+def make_controller():
+    controller = request.form.get('controller', '')
+    app_root = request.form.get('app_root', 'app/controllers/')
+    if svc.controller_exists(controller, app_root):
+        return jsonify({'error': controller + ' already exists.'}), 409
+    svc.create(controller, app_root)
+    return jsonify({'ok': True})
+
+
+@app.route('/controllers', methods=['GET'])
+def list_controllers():
+    return jsonify(svc.list_all())
+
+# === file: app/services/controller_service.py ===
+import re
+
+from db import Database
+
+
+class ControllerService:
+    def __init__(self):
+        self.db = Database()
+
+    @staticmethod
+    def normalize(name):
+        # 仅补全后缀, 不做字符白名单或转义
+        name = name.strip()
+        if not re.search(r'Controller$', name):
+            name += 'Controller'
+        return name
+
+    def controller_exists(self, controller, app_root):
+        controller = self.normalize(controller)
+        # 看似净化: 只删除双引号, 单引号/括号/注释符全部放行
+        safe = controller.replace('"', '')
+        sql = "SELECT id FROM controllers WHERE name = '" + safe + "' AND app_root = '" + app_root + "'"
+        return self.db.query(sql) is not None
+
+    def create(self, controller, app_root):
+        controller = self.normalize(controller)
+        self.db.execute(
+            "INSERT INTO controllers (name, app_root) VALUES ('" + controller + "', '" + app_root + "')"
+        )
+
+    def list_all(self):
+        return self.db.query("SELECT name, app_root FROM controllers")
+
+# === file: app/db.py ===
+import sqlite3
+
+
+class Database:
+    def __init__(self, path='runway.db'):
+        self.conn = sqlite3.connect(path)
+
+    def query(self, sql):
+        cur = self.conn.execute(sql)
+        return cur.fetchall()
+
+    def execute(self, sql):
+        self.conn.execute(sql)
+        self.conn.commit()
+```
+
+分析（文件序号：L1=app/routes.py，L2=app/services/controller_service.py，L3=app/db.py）：
+
+1. 外部输入点枚举与可达性：唯一携带外部输入的路由是 POST /make_controller（routes.py L8-L15），输入点为 L10 的 `controller` 与 L11 的 `app_root`；二者经 L12/L14 两条调用进入服务层并最终抵达 db.py 的 SQL 执行点，可达性成立；GET /controllers（routes.py L18-L20）不接收任何外部输入。
+
+2. 逐流验证：流1 routes.py L10 → controller_service.py L19（normalize，L14-15 正则仅做后缀补全，非过滤）→ L21（replace 仅删双引号字符）→ L22 拼接为 SELECT → db.py L9 `conn.execute(sql)` 触发注入；流2 routes.py L11 的 `app_root` 零处理，在 controller_service.py L22 直接拼入同一语句，汇入同一 sink；流3 routes.py L14 调用 create，controller 与 app_root 在 controller_service.py L26-28 拼接 INSERT，于 db.py L13 `conn.execute` 触发第二个 sink。
+
+3. 防御类型/位置/覆盖面评估：normalize（controller_service.py L11-16）是变形而非净化；replace（L21）属黑名单单字符删除，用单引号、右括号或注释符即可绕过；两处处理虽位于拼接点（L22/L28）之前，但覆盖面不含单引号等 SQL 元字符；db.py L9/L13 直接 execute 上层传入的完整字符串，全链路无参数化查询或占位符，防御不完整。
+
+4. 第二入口与替代通道：`app_root`（routes.py L11）是独立于 controller 的第二 source，汇入相同 sink；list_all（controller_service.py L31-32）使用常量 SQL 不受影响；除此之外不存在其他路由、环境变量或间接调用能把数据送入 db.py 的执行点。
+
+5. 结论：三条 source→sink 流均无有效防御，跨文件链路（source 在 L1，sink 在 L3）判定 CWE-89 SQL 注入成立，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL注入（跨文件：source位于routes.py，sink位于db.py）", "risk_level": "Critical", "source": "L1:line 10: request.form.get('controller') 获取的用户可控控制器名", "sink": "L3:line 9: Database.query 中 self.conn.execute(sql) 执行拼接后的SQL字符串", "explanation": "流1: routes.py L10 的 controller 参数经 L12 进入 controller_exists, 在 controller_service.py L19 经 normalize 仅做后缀补全(L14-15 正则不构成过滤), L21 replace 只删双引号字符属黑名单式清洗, 单引号/右括号/注释符均可绕过, L22 拼接为 SELECT 语句, 最终于 db.py L9 conn.execute(sql) 触发注入; 流2: routes.py L11 的 app_root 参数未经过任何处理, 在 controller_service.py L22 直接拼入同一 SELECT, 汇入同一 sink; 流3: routes.py L14 调用 create, controller 与 app_root 在 controller_service.py L26-28 拼接 INSERT, 于 db.py L13 conn.execute 触发第二个 sink; 防御评估: normalize(L11-16) 是变形不是过滤, replace(L21) 黑名单单字符删除可绕过, 二者虽位于拼接点(L22/L28)之前但覆盖面不含单引号等元字符, db.py L9/L13 均直接执行上层传入的原始字符串, 全链路无参数化查询, 防御不完整; 第二入口: app_root(routes.py L11)是独立 source 汇入相同 sink, GET /controllers(controller_service.py L32)使用常量 SQL 不受影响, 除此之外无其他路由或间接调用通道, 故判定存在 CWE-89 SQL 注入", "fix_suggestion": "line 22: 改为参数化查询, 如 self.db.query('SELECT id FROM controllers WHERE name = ? AND app_root = ?', (controller, app_root)), 并同步修复 L28 的 INSERT 以及 db.py L9/L13 使其只接收带占位符的语句与参数元组"}
+```

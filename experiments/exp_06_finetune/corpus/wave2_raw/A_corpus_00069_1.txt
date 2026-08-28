@@ -1,54 +1,60 @@
-LANG: node.js/javascript
-```code
+LANG: node.js
+```javascript
 const express = require('express');
 const crypto = require('crypto');
+
 const app = express();
 app.use(express.json());
 
-// Supported ciphers list — includes a legacy, insecure option
-const supportedCiphers = ['aes-256-gcm', 'des-cbc'];
-const supportedSecurityProfiles = ['V2', 'V2_AND_LEGACY'];
+// 对应原 AbstractCryptoClientV2 的白名单：legacy 安全档仍被放行
+const SUPPORTED_CIPHERS = ['gcm'];
+const SUPPORTED_SECURITY_PROFILES = ['V2', 'V2_AND_LEGACY'];
+const LEGACY_SECURITY_PROFILES = ['V2_AND_LEGACY'];
 
 function isSupportedCipher(cipherName) {
-  return supportedCiphers.includes(cipherName);
+  return SUPPORTED_CIPHERS.includes(cipherName);
 }
 
-app.post('/api/crypto/encrypt', (req, res) => {
-  const { plaintext, cipherName, securityProfile } = req.body;
-
+// 对应原 getCipherOpenSslName/buildCipherMethod：解析出 OpenSSL 算法名
+function resolveAlgorithm(cipherName, keySize, securityProfile) {
+  if (!SUPPORTED_SECURITY_PROFILES.includes(securityProfile)) {
+    throw new Error('Unsupported security profile');
+  }
+  if (LEGACY_SECURITY_PROFILES.includes(securityProfile)) {
+    // legacy 档直接降级为无认证 CBC，cipherName 白名单不参与
+    return 'aes-' + keySize + '-cbc';
+  }
   if (!isSupportedCipher(cipherName)) {
-    return res.status(400).json({ error: 'unsupported cipher' });
+    throw new Error('Unsupported cipher');
   }
-  if (!supportedSecurityProfiles.includes(securityProfile)) {
-    return res.status(400).json({ error: 'unsupported profile' });
+  return 'aes-' + keySize + '-gcm';
+}
+
+// 对应原 decrypt()：元数据信封字段由请求体直接提供
+app.post('/api/vault/decrypt', (req, res) => {
+  const { cipherName, keySize, securityProfile, iv, key, ciphertext, authTag } = req.body;
+  const algorithm = resolveAlgorithm(cipherName, Number(keySize) || 256, securityProfile);
+  const decipher = crypto.createDecipheriv(algorithm, Buffer.from(key, 'base64'), Buffer.from(iv, 'base64'));
+  if (algorithm.endsWith('-gcm')) {
+    decipher.setAuthTag(Buffer.from(authTag, 'base64'));
   }
-
-  // Legacy profile silently downgrades to the weak legacy cipher
-  let selectedCipher = cipherName;
-  if (securityProfile === 'V2_AND_LEGACY') {
-    selectedCipher = 'des-cbc';
-  }
-
-  const key = crypto.randomBytes(8); // DES key size
-  const iv = Buffer.alloc(8);
-  const cipher = crypto.createCipheriv(selectedCipher, key, iv);
-
-  const encrypted = Buffer.concat([
-    cipher.update(String(plaintext), 'utf8'),
-    cipher.final()
-  ]);
-
-  res.json({ ciphertext: encrypted.toString('base64'), algorithm: selectedCipher });
+  const plaintext = Buffer.concat([decipher.update(Buffer.from(ciphertext, 'base64')), decipher.final()]);
+  res.type('text/plain').send(plaintext.toString('utf8'));
 });
 
-app.listen(3000, () => console.log('listening on 3000'));
+app.listen(3000, () => console.log('vault decrypt service listening on :3000'));
 ```
 
-1. 第 12 行：`req.body` 中的 `cipherName` 与 `securityProfile` 是外部输入，构成 source。
-2. 第 13-19 行：仅做白名单校验，但白名单本身包含弱算法 `des-cbc`（第 5 行），校验形同虚设。
-3. 第 22-24 行：当客户端选择 `V2_AND_LEGACY` 兼容模式时，代码无条件降级为 `des-cbc`，与原 PHP 中 `V2_AND_LEGACY` 安全配置文件允许回退到旧版不安全加密的语义结构一致。
-4. 第 27-31 行：sink 为 `crypto.createCipheriv(selectedCipher, ...)` 直接使用攻击者可控/可诱导的弱算法执行加密，且 IV 固定为全零（第 26 行），无任何算法强度防御或拒绝逻辑。
+1. **Source 枚举与可达性**：第 32 行注册唯一路由 POST /api/vault/decrypt，第 5 行 express.json() 中间件把请求体整体解析进 req.body；第 33 行解构出的 cipherName/keySize/securityProfile/iv/key/ciphertext/authTag 七个字段全部为外部输入且无来源校验；第 34 行立即传入 resolveAlgorithm，第 35 行进入解密 sink，source→sink 在同一同步调用链内，可达性成立。
+
+2. **主链防御验证（白名单自身包含风险选项）**：第 18 行对 securityProfile 做白名单检查，但第 9 行 SUPPORTED_SECURITY_PROFILES 自身包含 'V2_AND_LEGACY'——防御把风险选项写进了放行列表，攻击者提交 securityProfile='V2_AND_LEGACY' 即通过；第 21 行命中 LEGACY_SECURITY_PROFILES（第 10 行），第 23 行返回 'aes-<keySize>-cbc'。
+
+3. **第二道防御验证（位置导致覆盖面为零）**：第 25 行 isSupportedCipher（第 12-14 行）仅放行 'gcm'，看似严格，但它位于第 21 行 legacy 分支之后，legacy 路径在第 23 行提前 return，cipherName 校验对主链零覆盖；第 36-38 行 setAuthTag 仅在算法名以 '-gcm' 结尾时执行，CBC 路径完全无完整性校验，且第 33 行 iv 由攻击者提供，CBC 下篡改 IV 可翻转首块明文，密文篡改与 padding oracle 均可行。
+
+4. **Sink 确认**：第 35 行 crypto.createDecipheriv(algorithm, ...) 以第 23 行返回的无认证 CBC 算法初始化解密器；第 33-34 行 keySize 同为外部输入，可进一步降级为 'aes-128-cbc'；无认证 CBC 属于破损/风险密码算法，构成 CWE-327。
+
+5. **第二入口/替代通道**：全文件仅第 32 行一个 HTTP 路由，不存在其他路由或间接调用能到达 createDecipheriv；但同一入口内 keySize（第 33-34 行）与在 legacy 路径被忽略的 authTag 构成替代弱化通道，且第 17 行 resolveAlgorithm 是共享决策点，未来任何复用它的路由都会继承同一降级缺陷；综上主链无有效防御，漏洞成立。
 
 ```json
-{"has_vulnerability": true, "vulnerability_type": "CWE-327 使用已破解或有风险的密码学算法", "risk_level": "high", "source": "line 12: req.body 中的 cipherName 与 securityProfile 外部输入", "sink": "line 28: crypto.createCipheriv(selectedCipher, ...) 使用 des-cbc 执行加密", "explanation": "外部输入经白名单校验后仍可选择或被降级到 des-cbc 弱算法 -> createCipheriv 直接以该算法加密数据，缺少对算法强度的强制约束", "fix_suggestion": "line 5: 从 supportedCiphers 中移除 des-cbc 并删除 V2_AND_LEGACY 降级逻辑，仅允许 aes-256-gcm 等现代认证加密算法"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-327 Use of a Broken or Risky Cryptographic Algorithm (legacy 安全档降级至无认证 AES-CBC)", "risk_level": "High", "source": "line 33: req.body 中的 securityProfile/cipherName/keySize/iv/ciphertext 等外部输入", "sink": "line 35: crypto.createDecipheriv 以可降级为 aes-*-cbc 的算法执行解密", "explanation": "主链: 第33行 req.body.securityProfile -> 第18行白名单校验, 但第9行白名单自身包含 V2_AND_LEGACY, 提交该值即通过 -> 第21行命中 LEGACY_SECURITY_PROFILES -> 第23行返回 aes-<keySize>-cbc -> 第35行 createDecipheriv 以无认证 CBC 解密; 辅助流: 第33行 keySize 经第34行拼入算法名, 可进一步降级为 aes-128-cbc; 防御1失效: 第25行 isSupportedCipher 仅放行 gcm, 但位于第21行 legacy 分支之后, 第23行提前 return 使其对主链零覆盖; 防御2失效: 第36-38行 setAuthTag 仅在 -gcm 后缀时执行, CBC 路径无完整性校验, 且第33行 iv 由攻击者控制, 篡改 IV 可翻转首块明文, 存在密文篡改与 padding oracle 风险; 第二入口: 全文件仅第32行一个路由, 无其他路由或间接调用, 但同入口 keySize 与被忽略的 authTag 构成替代通道, 且第17行 resolveAlgorithm 为共享决策点, 复用它的任何新路由均继承同一降级缺陷", "fix_suggestion": "line 21: 删除 LEGACY_SECURITY_PROFILES 降级分支并从第9行白名单移除 V2_AND_LEGACY, 强制所有解密走第28行 aes-*-gcm 路径, 同时将第36行 setAuthTag 改为无条件执行"}
 ```

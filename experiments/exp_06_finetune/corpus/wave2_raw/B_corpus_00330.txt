@@ -1,0 +1,84 @@
+LANG: python
+```code
+# === file: app/loader.py ===
+"""Load .prompty style config files and inline ${file:...} references."""
+
+import os
+import re
+
+import yaml
+
+from app.resolver import resolve_ref
+from app.reader import read_content
+
+_FILE_REF = re.compile(r"^\$\{file:(?P<val>.+)\}$")
+
+
+def load_config(path, base_dir=None):
+    """Parse a config file and expand any ${file:...} references in it."""
+    if base_dir is None:
+        base_dir = os.path.dirname(os.path.abspath(path))
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict):
+        return {}
+    for key, value in list(data.items()):
+        if not isinstance(value, str):
+            continue
+        m = _FILE_REF.match(value.strip())
+        if not m:
+            continue
+        raw_ref = m.group("val")
+        target = resolve_ref(base_dir, raw_ref)
+        data[key] = read_content(target)
+    return data
+
+# === file: app/resolver.py ===
+"""Resolve ${file:...} reference values into absolute paths."""
+
+import os
+
+
+def resolve_ref(base_dir, ref):
+    """Join the reference onto base_dir after stripping traversal tokens."""
+    cleaned = ref.replace("../", "").replace("..\\", "")
+    candidate = os.path.join(base_dir, cleaned)
+    return os.path.abspath(candidate)
+
+# === file: app/reader.py ===
+"""Read referenced content files as JSON, YAML, or plain text."""
+
+import json
+
+import yaml
+
+
+def read_content(path):
+    """Load a file based on its extension."""
+    with open(path, encoding="utf-8") as f:
+        if path.endswith(".json"):
+            return json.load(f)
+        if path.endswith((".yml", ".yaml")):
+            return yaml.safe_load(f)
+        return f.read()
+```
+
+1. **输入点枚举与可达性**：app/loader.py L14 `load_config(path, base_dir=None)` 的两个形参均可被外部影响；L18-L19 将配置文件（.prompty/.yaml，可被用户上传或编辑）整体 `yaml.safe_load` 载入，其中所有字符串值成为攻击者可控数据；L25-L28 正则提取 `${file:...}` 得到 `raw_ref`（source），L29-L30 无条件传入 `resolve_ref` 与 `read_content`，直达 sink，可达性成立。
+
+2. **逐条数据流防御核查**：主链 loader.py L28 → resolver.py L8，全链唯一过滤是 `replace('../','')` / `replace('..\\','')` 黑名单字符串替换——`....//` 经一次替换还原为 `../`，`....//....//etc/passwd` 还原为 `../../etc/passwd`（Windows 下 `..\\` 嵌套同理）；且当 ref 为绝对路径（如 `/etc/passwd`）时，resolver.py L9 `os.path.join` 直接丢弃 base_dir。resolver.py L10 `os.path.abspath` 仅做规范化、不产生任何目录边界约束。app/reader.py L10 `open(path)` 前后无 realpath/is_relative_to/startswith 边界校验、无目录白名单。黑名单/字符串替换按规则视为无效防御 → 调用链上无完整防御。
+
+3. **第二入口与替代通道**：① `load_config` 的 `base_dir` 形参可由调用方注入，直接控制路径拼接基准；② app/reader.py `read_content` 为公开函数，可被其他路由或模块以任意字符串 path 间接调用；③ `load_config` 的 `path` 形参本身可指向任意可读 YAML（loader.py L18 的 open 同样未校验），构成任意配置读取通道。多条通道最终汇聚于同一 sink。
+
+4. **结论与修复**：source（loader.py L28）→ sink（reader.py L10）跨文件链路成立，CWE-22 任意文件读取，可读取应用凭据、密钥配置等，风险 High；最小修复在 resolver.py 返回前增加边界校验。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 路径穿越/任意文件读取",
+  "risk_level": "High",
+  "source": "L1:line 28: app/loader.py raw_ref = m.group('val') — 外部 YAML 配置中 ${file:...} 的引用值，攻击者完全可控",
+  "sink": "L3:line 10: app/reader.py open(path, encoding='utf-8') — 以未校验的解析路径打开并读取文件",
+  "explanation": "主链: 外部可上传/可编辑的 .prompty/.yaml 配置 → app/loader.py L19 yaml.safe_load 载入为可控 dict → L25 正则匹配 ${file:...} → L28 raw_ref 提取（source，完全可控）→ L29 传入 app/resolver.py resolve_ref → resolver.py L8 唯一防御为 replace('../','') 与 replace('..\\','') 黑名单字符串替换，可绕过: '....//' 经一次替换还原为 '../'，'....//....//etc/passwd' 还原为 '../../etc/passwd'，且 ref 为 '/etc/passwd' 等绝对路径时 L9 os.path.join 直接丢弃 base_dir → L10 os.path.abspath 仅规范化不做边界约束 → 返回 app/loader.py L30 read_content(target) → app/reader.py L10 open(path) 读取任意文件（sink），L15 f.read() 回传内容; 防御核查: 全链仅 resolver.py L8 一处过滤且为黑名单替换（无效防御），loader.py 与 reader.py 均无 realpath/is_relative_to/startswith 边界校验、无目录白名单; 第二入口与替代通道: ① load_config 的 base_dir 形参可由调用方注入直接控制拼接基准; ② app/reader.py read_content 为公开函数可被其他路由或模块以任意字符串 path 间接调用; ③ load_config 的 path 形参本身可指向任意可读 YAML（loader.py L18 open 同样未校验）; 结论: source 到 sink 的跨文件调用链无完整防御，CWE-22 任意文件读取成立",
+  "fix_suggestion": "line 10: app/resolver.py 在返回前校验 os.path.abspath(candidate) 必须位于 os.path.abspath(base_dir)+os.sep 之下，并拒绝以 / 或盘符开头的绝对路径 ref，否则抛出 ValueError"
+}
+```
