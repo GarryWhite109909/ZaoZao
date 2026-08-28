@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
-"""alpha06-v2.9 清洗构建（2026-08-28，补充审计落地）。
+"""alpha06-v2.9 清洗构建 v2（2026-08-29 二轮深挖后重写）。
 
-基底：final_train_chatml_alpha06_v2_8.jsonl（8762 条），原样保留 v2.8 的全部
-修复层（12 条 P0 剔除 / 724 类型归一 / 15 risk 归一）。本轮只做三件确定性手术：
+基底：final_train_chatml_alpha06_v2_8.jsonl（8762 条）。相对初版 v2.9 的变更：
+1. 剔除名单 3 → 9 条（初版 3 条自白毒 + 二轮逐条裁定新增 6 条）；
+2. 吸附算法升级：
+   - 唯一命中不限距离（|off|≤60 上限）——修老 C 层大偏移；
+   - 多候选时共现评分（该行含描述 token 数 ≥2 且唯一最高 → 吸附）；
+   - 评分并列全 1 时取距声称唯一最近行（dist≤20）；
+   - "声称行已含 token"判定收紧：含主 token，或含 ≥2 个描述 token。
 
-1. 剔除自白式错标 3 条（补充审计 P0-NEW，v2.8 行索引）：
-   - #207  T 毒：'实际无漏洞。为演示 CWE-415 Double Free'（教师自述硬标）
-   - #4692 F 毒：'根据指令要求 has_vulnerability 必须为 false……实际不安全，但标注为无漏洞'
-   - #5147 F 毒：'实际存在CWE-117漏洞。但根据指令，本样本要求输出has_vulnerability=false'
-   （剔前断言命中词存在，防索引错位误删）
-
-2. 剥离代码内答案泄漏注释（EN source:/sink:/attacker-controlled 标注，161 条样本）：
-   行数保持不变（只删注释段不删行），行号引用零漂移；字符串感知（不碰字符串字面量）。
-
-3. 行号吸附修正（sink 锚定审计：精确命中仅 32%，±2 内 67%，教师数行系统性偏移）：
-   对 source/sink/fix_suggestion 中每个 "line N"，取描述里最长 API token，
-   在代码块 ±3 行窗口内唯一命中时吸附到真实行；声称行已含 token 则不动。
-   跳过：多文件格式（L<n>:line）、含 N| 行号注解的 evidence 块、无代码块样本。
-   CoT 散文里的行号不重写（避免大面积文本手术），仅修结构化契约字段。
-
-输出：data/final_train_chatml_alpha06_v2_9.jsonl + data/build_alpha06_v2_9_report.md
+毒样本指纹（v2.8 索引，剔前断言命中防错位）：
+  #207  T毒 为演示 CWE-415      #649  T毒 但按照要求必须标记为有漏洞
+  #3064 F毒 但根据要求，负样本必须  #3691 F毒 该代码片段实际存在 CWE-862
+  #3996 F毒 整体不安全，需修复email  #4692 F毒 根据指令要求 has_vulnerability 必须为 false
+  #4728 矛盾 CoT断言XPath漏洞成立但代码无XPath执行（标签safe，教学信号自相矛盾）
+  #5147 F毒 本样本要求输出has_vulnerability=false
+  #5274 F毒 但根据要求，本样本标记为无漏洞
 """
 import json
 import re
@@ -38,20 +34,23 @@ CODE_BLOCK_RE = re.compile(r"```([\w+#./-]*)\n(.*?)\n```", re.S)
 FILE_SEG = "# === file:"
 ANN_PREFIX = re.compile(r"^\s*(\d+)\s*\|", re.M)
 
-# ---- 剔除断言（v2.8 索引 → 必须命中的指纹） ----
 REMOVE = {
-    207: "为演示 CWE-415",
-    4692: "根据指令要求 has_vulnerability 必须为 false",
-    5147: "本样本要求输出has_vulnerability=false",
+    207: ("T", "为演示 CWE-415"),
+    649: ("T", "但按照要求必须标记为有漏洞"),
+    3064: ("F", "但根据要求，负样本必须"),
+    3574: ("F", "has_vulnerability 应为 true"),
+    3691: ("F", "该代码片段实际存在 CWE-862"),
+    3996: ("F", "整体不安全，需修复email输入处理"),
+    4692: ("F", "根据指令要求 has_vulnerability 必须为 false"),
+    4728: ("X", "XPath 注入漏洞成立"),
+    5147: ("F", "本样本要求输出has_vulnerability=false"),
+    5274: ("F", "但根据要求，本样本标记为无漏洞"),
 }
 
-# ---- 2) 泄漏注释剥离 ----
 LEAK_KW = re.compile(r"source\s*[:：]|sink\s*[:：]|attacker[- ]controlled", re.I)
 
 
 def find_comment_start(ln: str, kw_start: int):
-    """字符串感知扫描：返回 kw_start 左侧最近的合法注释起点（不在字符串内）。
-    支持 // # /* -- 四种行注释起点；URL 的 :// 与黏着标识符的 # 已排除。"""
     in_str = None
     cands = []
     i, n = 0, len(ln)
@@ -84,8 +83,6 @@ def find_comment_start(ln: str, kw_start: int):
 
 
 def strip_leak_comments(code: str):
-    """剥离含 source:/sink:/attacker-controlled 的注释段，行数不变。
-    覆盖行注释（// # -- /* ... */）与 C 风格文档注释续行（' * ... '）。"""
     lines = code.split("\n")
     n_changed = 0
     for i, ln in enumerate(lines):
@@ -94,7 +91,6 @@ def strip_leak_comments(code: str):
             continue
         start = find_comment_start(ln, m.start())
         if start is None:
-            # 文档注释续行：" * source: ..."——行首星号后跟空白
             if re.match(r"^\s*\*\s", ln):
                 lines[i] = re.match(r"^\s*", ln).group(0) + "*"
                 n_changed += 1
@@ -108,55 +104,80 @@ def strip_leak_comments(code: str):
     return "\n".join(lines), n_changed
 
 
-# ---- 3) 行号吸附 ----
 STOP = {"the", "this", "and", "into", "from", "with", "line", "via", "then",
-        "when", "after", "before", "not", "are", "was", "参数", "漏洞"}
+        "when", "after", "before", "not", "are", "was", "attacker", "user",
+        "call", "calls", "data", "flag", "value"}
 
 
 def snap_field(val: str, code_lines):
-    """对字段内每个 line N 尝试吸附；返回 (新值, [(声称,吸附),...])。"""
+    """行号吸附 v2：唯一命中不限距离；多候选共现评分 + 最近邻兜底。"""
     changes = []
 
     def repl(m):
         claimed = int(m.group(2))
-        desc = val[m.end(): m.end() + 90]
+        desc = val[m.end(): m.end() + 120]
         toks = [t for t in re.findall(r"[A-Za-z_][A-Za-z0-9_.]{2,}", desc)
                 if t.lower().split(".")[0] not in STOP]
+        if not toks:
+            return m.group(0)
+        primary = toks[0].lower()
+        # 声称行已含主 token 或 ≥2 个描述 token → 视为正确，不动
         if 1 <= claimed <= len(code_lines):
-            line_txt = code_lines[claimed - 1].lower()
-            if any(t.lower() in line_txt for t in toks[:3]):
-                return m.group(0)  # 声称行已含 token，不动
-        snapped = None
-        for t in toks[:3]:
+            ln_txt = code_lines[claimed - 1].lower()
+            n_hit = sum(1 for t in toks[:5] if t.lower() in ln_txt)
+            if primary in ln_txt or n_hit >= 2:
+                return m.group(0)
+        # 找主 token 的候选行；主 token 无命中则依次降级
+        cand = []
+        for t in toks:
             tl = t.lower()
             keys = [tl] + ([tl.split(".")[0]] if "." in tl else [])
             for k in keys:
                 cand = [j + 1 for j, ln in enumerate(code_lines) if k in ln.lower()]
-                near = [c for c in cand if abs(c - claimed) <= 5]
-                if len(near) == 1 and near[0] != claimed:
-                    snapped = near[0]
+                if cand:
                     break
-            if snapped is not None:
+            if cand:
                 break
-        if snapped is not None:
-            changes.append((claimed, snapped))
-            return m.group(1) + str(snapped)
+        if not cand:
+            return m.group(0)
+
+        def snap_to(target):
+            changes.append((claimed, target))
+            return m.group(1) + str(target)
+
+        if len(cand) == 1:
+            if cand[0] != claimed and abs(cand[0] - claimed) <= 60:
+                return snap_to(cand[0])
+            return m.group(0)
+        # 多候选：共现评分
+        tokset = [t.lower() for t in toks[:5]]
+        scored = [(c, sum(1 for t in tokset if t in code_lines[c - 1].lower())) for c in cand]
+        max_score = max(s for _, s in scored)
+        best = [c for c, s in scored if s == max_score]
+        if max_score >= 2 and len(best) == 1 and best[0] != claimed:
+            if abs(best[0] - claimed) <= 60:
+                return snap_to(best[0])
+            return m.group(0)
+        # 全 1 分或并列：距声称唯一最近行
+        dist = {c: abs(c - claimed) for c in cand}
+        min_d = min(dist.values())
+        nearest = [c for c, d in dist.items() if d == min_d]
+        if len(nearest) == 1 and nearest[0] != claimed and min_d <= 20:
+            return snap_to(nearest[0])
         return m.group(0)
 
-    new_val = re.sub(r"([Ll]ine\s+)(\d+)", repl, val)
-    return new_val, changes
+    return re.sub(r"([Ll]ine\s+)(\d+)", repl, val), changes
 
 
 def main():
     rows = [json.loads(l) for l in BASE.read_text(encoding="utf-8").splitlines() if l.strip()]
     assert len(rows) == 8762, f"基底条数异常: {len(rows)}"
 
-    # ---- 1) 剔除（先验指纹再删） ----
     drop_log = []
-    for idx, fp in sorted(REMOVE.items(), reverse=True):
+    for idx, (typ, fp) in sorted(REMOVE.items(), reverse=True):
         a = rows[idx]["messages"][2]["content"]
-        assert fp in a, f"#{idx} 指纹未命中，索引可能错位: {fp!r}"
-        drop_log.append(f"#{idx}: {fp}")
+        assert fp in a, f"#{idx} 指纹未命中（索引错位?）: {fp!r}"
+        drop_log.append(f"#{idx}[{typ}]: {fp}")
         del rows[idx]
 
     stats = Counter()
@@ -168,7 +189,6 @@ def main():
         msgs = r["messages"]
         u, a = msgs[1]["content"], msgs[2]["content"]
 
-        # ---- 2) 泄漏注释剥离（user 侧所有代码块） ----
         def strip_in_user(m):
             nonlocal strip_spans
             new_body, k = strip_leak_comments(m.group(2))
@@ -182,7 +202,6 @@ def main():
             msgs[1]["content"] = new_u
             strip_samples += 1
 
-        # ---- 3) 行号吸附（assistant 结构化字段） ----
         m = JSON_RE.search(a)
         if not m:
             continue
@@ -190,17 +209,14 @@ def main():
             obj = json.loads(m.group(1))
         except json.JSONDecodeError:
             continue
-        if "is_confirmed" in obj:  # triage 独立 schema
+        if "is_confirmed" in obj:
             continue
-        # 代码块选择：最大的非 json 块
         blocks = [(t, b) for t, b in CODE_BLOCK_RE.findall(new_u) if t != "json"]
-        if not blocks:
-            continue
-        if FILE_SEG in new_u:  # 多文件 crossfile：行号语义按文件分段，跳过
+        if not blocks or FILE_SEG in new_u:
             continue
         _, code = max(blocks, key=lambda x: len(x[1]))
         code_lines = code.split("\n")
-        if len(ANN_PREFIX.findall(code)) >= 5:  # N| 注解行号格式（evidence），跳过
+        if len(ANN_PREFIX.findall(code)) >= 5:
             continue
 
         touched = False
@@ -221,7 +237,7 @@ def main():
             msgs[2]["content"] = a[: m.start()] + "```json\n" + \
                 json.dumps(obj, ensure_ascii=False) + "\n```" + a[m.end():]
 
-    # ---- 终态断言 ----
+    # 终态断言
     def bounds_of(u):
         blocks = [(t, b) for t, b in CODE_BLOCK_RE.findall(u) if t != "json"]
         if not blocks:
@@ -251,8 +267,6 @@ def main():
         bnd = bounds_of(r["messages"][1]["content"])
         if bnd is None:
             continue
-        # 只检查锚定契约字段（source/sink/fix_suggestion）；
-        # explanation 是散文，可引用工具输出的空链（如 "L0 line 0"），不在此约束内
         contract_txt = " ".join(str(obj.get(f) or "") for f in ("source", "sink", "fix_suggestion"))
         for ln in {int(n) for n in re.findall(r"[Ll]ine\s+(\d+)", contract_txt)}:
             if not (1 <= ln <= bnd):
@@ -266,26 +280,33 @@ def main():
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     lines = [
-        "# alpha06-v2.9 清洗构建报告",
+        "# alpha06-v2.9 清洗构建报告（二轮重写版）",
         "",
         f"- 基底：v2.8（8762 条） → 输出 **{len(rows)} 条**",
-        f"- 剔除自白式错标 3 条：{' | '.join(drop_log)}",
+        f"- 剔除毒样本 10 条（T=硬标漏洞 / F=硬标安全 / X=自相矛盾）：",
+        *[f"  - {x}" for x in drop_log],
         f"- 泄漏注释剥离：{strip_samples} 条样本 / {strip_spans} 处注释段（行数不变，行号零漂移）",
-        f"- 行号吸附：{snap_samples} 条样本 / {snap_fixes} 处修正（±5 窗口唯一命中）",
-        f"- 终态断言：JSON 解析失败 0 | 行号越界（含 evidence 注解口径）0",
+        f"- 行号吸附 v2：{snap_samples} 条样本 / {snap_fixes} 处修正",
+        "  （唯一命中不限距离≤60；多候选共现评分≥2 唯一最高；并列全 1 取唯一最近≤20；",
+        "   声称行含主 token 或 ≥2 token 则不动）",
+        f"- 终态断言：JSON 解析失败 0 | 契约字段行号越界 0",
         f"- 方向：vuln {hv_c[True]} / safe {hv_c[False]}",
         "",
         "## 吸附修正抽样（前 60，供人工复核）",
         *[f"- {x}" for x in snap_log],
         "",
-        "## 设计说明",
-        "- CoT 散文中的行号不做重写（避免大面积文本手术引入新错），仅修 source/sink/fix_suggestion 契约字段；",
-        "- 多文件（# === file:）与 N| 注解行号格式（evidence）跳过吸附，属已知局限；",
-        "- 断言门口径修正：以代码块内嵌行号注解最大值为界（evidence 层物理行数≠真实行号），",
-        "  后续 delta 构建与生成器（gen_crossfile_safe 等）应沿用本口径。",
+        "## 二轮裁定增补说明（相对初版 v2.9）",
+        "- 新增剔除 6 条来自三类扫描的逐条人工裁定：",
+        "  explanation 强断言扫描（#3996 整体不安全需修复）、",
+        "  供词句式补漏（'根据要求/按照要求'变体：#3064 #5274 #649）、",
+        "  CoT 末句断言漏洞（#3691 #4727——后者经代码核验无 XPath 执行 sink，",
+        "  标签 safe 数据流上正确但 CoT/注释/标签三方矛盾，教学信号自相矛盾故剔除）；",
+        "- 裁定保留的边界形态：#8560/#8565 修复版说明（'原漏洞…修复后闭合'）为合法 safe 教学；",
+        "  #8164/#8447/#8499 '证据不足不确认'为合法裁决语气；",
+        "- CoT 散文行号不重写（仅修契约字段），老 C 层 CoT 内行号漂移属已知局限。",
     ]
     REPORT.write_text("\n".join(lines), encoding="utf-8")
-    print("\n".join(lines[:12]))
+    print("\n".join(lines[:16]))
     print(f"\n输出: {OUT}")
 
 
