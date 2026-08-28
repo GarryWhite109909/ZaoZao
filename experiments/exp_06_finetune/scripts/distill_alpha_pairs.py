@@ -64,10 +64,12 @@ SCHEMA_SAFE = ('{"has_vulnerability": false, "vulnerability_type": "none", '
                '"explanation": "...", "fix_suggestion": "no fix needed"}')
 
 
-DEFAULT_MAX_TOKENS = 16384 if IS_BIGMODEL else 8000
+DEFAULT_MAX_TOKENS = 32768 if IS_BIGMODEL else 8000
 # BigModel GLM-5.3-flash 始终思考：thinking 与正文共用 max_tokens 预算，
 # 大 prompt（系统文本+12k 字符代码）下 8000 经常只够思考导致正文为空
-# （2026-08-27 批跑实测 empty content 频发），16384 起步。
+# （2026-08-27 批跑实测 empty content 频发）；2026-08-29 实测 16384 仍会
+# finish=length 截断（思考+双流分析+代码全文输出），提至 32768 并配
+# 截断自动翻倍重试（见 call_teacher 内 finish=length 分支）。
 
 
 def call_teacher(key: str, user_prompt: str,
@@ -91,8 +93,15 @@ def call_teacher(key: str, user_prompt: str,
     for attempt in range(retries):
         try:
             use_key, key_idx = _next_key() if len(KEYS) > 1 else (key, 0)
+            # 2026-08-28 改流式：非流式的 read timeout 是"整个响应读完"的硬顶，
+            # 最长任务（12k 字符输入→等量输出）在 420s 内永远跑不完，每次都
+            # 超时烧尽重试。流式下 timeout 只限"相邻 chunk 间隔"，只要 token
+            # 在流就不会被判死——天花板从时间变成 max_tokens 本身。
+            payload["stream"] = True
+            # chunk 间隔 180→300s：思考型教师长任务偶发思考间隙停顿
+            # （2026-08-29 批跑实测），只要还在流就不判死。
             resp = requests.post(
-                API_URL, timeout=420,  # 2026-08-28：思考型教师长任务 240s 频发 ReadTimeout，放宽到 420s
+                API_URL, timeout=(30, 300), stream=True,
                 headers={"Authorization": f"Bearer {use_key}",
                          "Content-Type": "application/json"},
                 json=payload)
@@ -107,17 +116,41 @@ def call_teacher(key: str, user_prompt: str,
                 time.sleep(min(wait, 180))
                 continue
             resp.raise_for_status()
-            try:
-                data = resp.json()
-            except ValueError:
-                # 大响应偶发截断/非 JSON（2026-08-23 实测）：带诊断重试
-                raise ValueError(f"non-json body: {resp.text[:120]!r}")
-            msg = data["choices"][0]["message"]
-            content = msg.get("content")
-            if not content and (msg.get("reasoning") or msg.get("reasoning_content")):
+            content_parts, reasoning_parts = [], []
+            hit_length = False
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw or not raw.startswith("data:"):
+                    continue
+                chunk = raw[len("data:"):].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    evt = json.loads(chunk)
+                except ValueError:
+                    continue
+                choice = (evt.get("choices") or [{}])[0]
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+                if delta.get("reasoning_content"):
+                    reasoning_parts.append(delta["reasoning_content"])
+                if choice.get("finish_reason") == "length":
+                    hit_length = True
+            if hit_length:
+                # 截断自动翻倍重试（2026-08-29）：截断的正文 JSON 多半不完整，
+                # 与其让 validate 拒掉重生成（浪费整次输出），不如当场翻倍
+                # max_tokens 重发一次；65536 封顶，再截断就认命返回让上层裁。
+                if payload["max_tokens"] < 65536:
+                    payload["max_tokens"] = min(payload["max_tokens"] * 2, 65536)
+                    print(f"    [warn] finish=length 截断，翻倍重试 "
+                          f"max_tokens={payload['max_tokens']}", flush=True)
+                    continue
+                print("    [warn] finish=length 且已达 65536 上限，按原样返回", flush=True)
+            content = "".join(content_parts)
+            if not content and reasoning_parts:
                 # 推理模型偶发只回 reasoning（2026-08-25 长清单 prompt 实测）：
                 # 正文为空时从 reasoning 兜底提取——结论 JSON 通常在思维链尾部
-                rc = msg.get("reasoning") or msg.get("reasoning_content") or ""
+                rc = "".join(reasoning_parts)
                 if re.search(r"```json|has_vulnerability", rc):
                     return rc
                 raise ValueError("empty content (reasoning only, no json)")
