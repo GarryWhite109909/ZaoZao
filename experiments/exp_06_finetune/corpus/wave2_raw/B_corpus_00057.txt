@@ -1,0 +1,96 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+# -*- coding: utf-8 -*-
+from aiohttp import web
+
+from app.file_service import load_local_file
+
+
+async def handle_fetch(request):
+    # 外部输入点 S1：GET 查询参数 path，攻击者完全可控
+    path = request.query.get('path', '')
+    result = await load_local_file(request.app['config'], path)
+    if not result.get('successful'):
+        return web.json_response({'error': 'not_found'}, status=404)
+    return web.Response(body=result['buffer'],
+                        content_type='application/octet-stream')
+
+
+async def handle_thumb(request):
+    # 第二入口 S2：路由段 {image} 同样进入同一加载链
+    path = request.match_info.get('image', '')
+    result = await load_local_file(request.app['config'], path)
+    if not result.get('successful'):
+        raise web.HTTPNotFound
+    return web.Response(body=result['buffer'])
+
+
+def make_app(config):
+    app = web.Application()
+    app['config'] = config
+    app.router.add_get('/fetch', handle_fetch)
+    app.router.add_get('/thumb/{image}', handle_thumb)
+    return app
+
+# === file: app/file_service.py ===
+# -*- coding: utf-8 -*-
+from os.path import abspath, join
+
+from app.storage import read_checked_path
+
+
+async def load_local_file(config, path):
+    root = config.FILE_LOADER_ROOT_PATH.rstrip('/')
+    file_path = abspath(join(root, path.lstrip('/')))
+
+    # 看似净化：仅用 startswith 做根目录前缀检查（黑名单式弱防御）
+    # 缺口1：未追加路径分隔符，前缀可比对到同级目录名
+    # 缺口2：此处不解码，下游 unquote 还原出的穿越序列不受本检查约束
+    if not file_path.startswith(abspath(root)):
+        return {'successful': False, 'error': 'not_found'}
+
+    # 过检后原样透传，链上不再复核
+    return await read_checked_path(file_path)
+
+# === file: app/storage.py ===
+# -*- coding: utf-8 -*-
+from datetime import datetime
+from os import fstat
+from os.path import exists, isfile
+from urllib.parse import unquote
+
+
+async def read_checked_path(file_path):
+    # 盲目信任上游已过检的标记，自身零校验
+    if not exists(file_path):
+        # 检查之后才解码：%2e%2e%2f 在此还原为 ../
+        file_path = unquote(file_path)
+
+    if exists(file_path) and isfile(file_path):
+        with open(file_path, 'rb') as source_file:  # sink
+            stats = fstat(source_file.fileno())
+            return {
+                'successful': True,
+                'buffer': source_file.read(),
+                'metadata': {
+                    'size': stats.st_size,
+                    'updated_at': datetime.utcfromtimestamp(stats.st_mtime),
+                },
+            }
+    return {'successful': False, 'error': 'not_found'}
+```
+
+1. **输入点枚举与可达性**：全部外部输入共两处——app/routes.py L9（`request.query.get('path')`）与 L19（路由段 `{image}`）；二者分别在 L10、L20 传入 `load_local_file`，经 app/file_service.py L18 下传至 app/storage.py L8，最终都可达 L15 的 `open`，source 与 sink 分处不同文件且链路连通。
+
+2. **主数据流（流 A：/fetch）防御核验**：file_service.py L9 的 `join+lstrip('/')` 只去首部斜杠、不消除 `..`；L14 的 `startswith` 属前缀黑名单式弱防御——未追加分隔符（root 为 `/data` 时传入 `../data-evil/x` 经 abspath 变为 `/data-evil/x` 即可通过），且检查时不解码；storage.py L12 在过检之后才执行 `unquote`，把 `%2e%2e%2f` 还原为 `../`，随后 L15 直接打开越界路径。检查位置先于解码、解码后无任何复核，属典型的“净化看似发生实则不完整”。
+
+3. **第二入口数据流（流 B：/thumb/{image}）**：routes.py L19→L20 与流 A 汇入同一服务函数，共享 L2 全部缺陷与 L3 的解码时序缺陷，同样无有效防御直达 sink。
+
+4. **替代通道排查**：除上述两路由外，项目内不存在其他读取文件的 sink（无 subprocess、无其他 open 调用），也无间接调用绕开 `load_local_file`；两条通道均可达 sink 且均无完整防御，支撑漏洞成立的最终结论。
+
+5. **结论**：跨文件组合后形成完整的 CWE-22 路径遍历链（编码绕过前缀检查 + 检查后解码），任意文件读取成立，风险评级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22: 路径遍历（检查后解码导致目录限制失效）", "risk_level": "High", "source": "L1:line 9: request.query.get('path') 外部可控输入", "sink": "L3:line 15: open(file_path,'rb') 任意文件读取", "explanation": "数据流A：L1:line 9 取得查询参数 path，经 L1:line 10 传入 load_local_file，在 L2:line 9 与根目录拼接并 abspath，L2:line 14 仅用 startswith 做前缀式弱检查后于 L2:line 18 原样透传，L3:line 12 对已过检路径执行 unquote 将 %2e%2e%2f 还原为 ../，最终 L3:line 15 open 读出任意文件；数据流B：L1:line 19 第二入口 /thumb/{image} 的路由段经 L1:line 20 进入同一条链，共享全部缺陷并抵达同一 sink；防御核验：L2:line 14 的 startswith 属黑名单式前缀匹配，未追加路径分隔符（root=/data 时传 ../data-evil/x 可经 abspath 绕过），且检查位于 L3:line 12 解码之前、解码后无复核，lstrip 只去首部斜杠不消除 ..，全链不存在解码前置或 realpath 归一化复检等有效防御；第二入口与替代通道：独立路由 /thumb/{image} 直达同一加载链，两入口均可达 sink，此外无其他 sink 或间接调用改变结论，CWE-22 成立", "fix_suggestion": "line 12: 删除该校验后的 unquote，改为在 file_service.py 第 9 行拼接前先对 path 执行 unquote，再用 os.path.realpath 归一化并以 startswith(realpath(root)+os.sep) 复检通过后方可在 storage.py 放行"}
+```

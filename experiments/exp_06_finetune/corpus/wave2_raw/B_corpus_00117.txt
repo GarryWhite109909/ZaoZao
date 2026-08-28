@@ -1,0 +1,109 @@
+LANG: java
+```code
+# === file: src/main/java/org/example/mail/MailMessageAdapter.java ===
+package org.example.mail;
+
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.Map;
+import javax.mail.Header;
+import javax.mail.internet.MimeMessage;
+
+/**
+ * Flattens an inbound MimeMessage into a plain header map; every name and
+ * value below originates from the remote mail sender and is untrusted.
+ */
+public class MailMessageAdapter {
+
+    public Map<String, Object> extractHeaders(MimeMessage message) throws Exception {
+        Map<String, Object> headers = new HashMap<>();
+        Enumeration<?> lines = message.getAllHeaders();      // SOURCE
+        while (lines.hasMoreElements()) {
+            Header h = (Header) lines.nextElement();
+            headers.put(h.getName(), h.getValue());
+        }
+        return headers;
+    }
+}
+
+# === file: src/main/java/org/example/mail/MailHeaderFilterStrategy.java ===
+package org.example.mail;
+
+import java.util.HashMap;
+import java.util.Map;
+import org.apache.camel.support.DefaultHeaderFilterStrategy;
+
+/**
+ * Upstream policy: drop only camel-prefixed header names; values untouched.
+ */
+public class MailHeaderFilterStrategy extends DefaultHeaderFilterStrategy {
+
+    public MailHeaderFilterStrategy() {
+        initialize();
+    }
+
+    protected void initialize() {
+        setLowerCase(true);
+        // filter headers begin with "Camel" or "org.apache.camel"
+        setOutFilterStartsWith(CAMEL_FILTER_STARTS_WITH);
+    }
+
+    public Map<String, Object> apply(Map<String, Object> headers) {
+        Map<String, Object> out = new HashMap<>();
+        for (Map.Entry<String, Object> e : headers.entrySet()) {
+            String name = e.getKey().toLowerCase();
+            if (!name.startsWith("camel") && !name.startsWith("org.apache.camel")) {
+                out.put(name, e.getValue());                 // passthrough
+            }
+        }
+        return out;
+    }
+}
+
+# === file: src/main/java/org/example/mail/MailPayloadDecoder.java ===
+package org.example.mail;
+
+import java.io.ByteArrayInputStream;
+import java.io.ObjectInputStream;
+import java.util.Base64;
+import java.util.Map;
+import javax.mail.internet.MimeMessage;
+
+/**
+ * Turns base64 header values back into live java objects for downstream
+ * processors; treated as trusted because headers were already 'filtered'.
+ */
+public class MailPayloadDecoder {
+
+    public Object consume(MimeMessage message) throws Exception {
+        Map<String, Object> raw = new MailMessageAdapter().extractHeaders(message);
+        Map<String, Object> filtered = new MailHeaderFilterStrategy().apply(raw);
+        return decode(filtered, "x-java-object");
+    }
+
+    public Object decode(Map<String, Object> headers, String field)
+            throws Exception {
+        Object raw = headers.get(field);
+        if (raw == null) {
+            return null;
+        }
+        byte[] bytes = Base64.getDecoder().decode(raw.toString());
+        try (ObjectInputStream ois =
+                new ObjectInputStream(new ByteArrayInputStream(bytes))) {
+            return ois.readObject();                         // SINK
+        }
+    }
+}
+```
+
+1. **外部输入点枚举与可达性**：全组文件仅有一个外部输入点——`MailMessageAdapter.java` L17 的 `message.getAllHeaders()`，邮件头的名字和值均由远程发件人完全控制；`MailPayloadDecoder.java` L15 `consume()` 是消费路由入口，L16 调用 `extractHeaders` 取得污染 Map，L17 送入过滤器，L18 以固定字段名传入 `decode`，最终抵达 L30 `readObject`，source 到 sink 可达性成立。`decode` 的 `field` 形参在主链中由字面量 `x-java-object` 提供，不属于外部输入。
+
+2. **逐条数据流防御验证**：主链流为 L1:17/L1:20 → `MailHeaderFilterStrategy.apply`(L2:22) → `decode`(L3:23) → `readObject`(L3:30)。链上唯一防御位于 `MailHeaderFilterStrategy.java` L25-L27：类型是**头名前缀黑名单**（startsWith `camel` / `org.apache.camel`），位置在中间文件；覆盖面只作用于键名、从不检查头值，且黑名单天然可绕过——攻击者改用任意非 camel 前缀头名（如 `x-java-object`、`attachment`）即可让 base64 序列化载荷原样通过；L17 `setLowerCase(true)` 与 L25 `toLowerCase` 仅做大小写归一化，不构成过滤，故该防御无效。sink 侧 L27-L30 无 ObjectInputFilter、无 resolveClass 白名单，解码后直接 `readObject`。
+
+3. **第二入口与替代通道**：`MailPayloadDecoder.decode`(L3:21) 对外暴露任意 `field` 参数，更换头字段名即可经同一 sink 再次触发；此外 `decode` 可被直接调用并传入自造 Map，完全跳过过滤层，构成第二入口；两条替代通道均无任何附加校验。
+
+4. **结论**：source 与 sink 分处不同文件，中间仅有可绕过的键名黑名单这一道伪净化，调用链上不存在完整防御，判定存在 CWE-502 漏洞；远程匿名邮件发送者即可投递恶意序列化载荷实现 RCE，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 反序列化不可信数据（跨文件：邮件头 source 与 readObject sink 分离）", "risk_level": "Critical", "source": "L1:line 17: MailMessageAdapter.extractHeaders 中 message.getAllHeaders() 返回的远程发件人可控邮件头", "sink": "L3:line 30: MailPayloadDecoder.decode 中 ois.readObject() 反序列化执行点", "explanation": "主链流：MailMessageAdapter.java L17 getAllHeaders 收集远程发件人完全可控的头名与头值并在 L20 存入返回 Map，经 MailPayloadDecoder.java L15-L18 进入 MailHeaderFilterStrategy.apply 后回到 decode，最终于 L30 readObject 触发反序列化；防御验证：链上唯一防御位于 MailHeaderFilterStrategy.java L25-L27，类型为头名前缀黑名单（startsWith camel 与 org.apache.camel），位置介于 source 与 sink 之间，但覆盖面仅限键名、从不检查头值，黑名单机制可被任意非 camel 前缀头名（如 x-java-object）绕过，且 L17 setLowerCase(true) 与 L25 toLowerCase 只做大小写归一化并非过滤，故属无效防御；sink 侧 L27-L30 无 ObjectInputFilter、无 resolveClass 白名单，Base64 解码后直接 readObject；第二入口与替代通道：decode 对外暴露任意 field 参数，更换头字段名即可经同一 sink 触发，亦可绕过 consume 直接以自造 Map 调用 decode 跳过过滤层，两条通道均无附加校验，共同支撑漏洞成立结论", "fix_suggestion": "line 30: 为 ObjectInputStream 设置 ObjectInputFilter 类白名单（或彻底移除头值反序列化、改用结构化文本格式显式解析）"}
+```

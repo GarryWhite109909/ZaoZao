@@ -1,0 +1,32 @@
+## 漏洞分析
+
+**第 1 步｜枚举用户可控输入点**
+本文件是库模块，无直接 HTTP 路由；按公告描述的真实使用场景（开发者将用户提供的字符串并入模板），外部可控输入点为：
+- line 53-55：`__init__` 的 `template` 参数——开发者以 `MessageTemplate(用户输入)` 构造时，模板本身即被攻击者控制；
+- line 72：`format(*args, **kwargs)` 与 line 76：`format_map(mapping)` 的值参数；
+- 由模板语法间接派生的 `field_name` 与 `format_spec`（line 123-125 的解析产物）。
+
+追踪：`template` 在 line 56 存入 `self.template`，随后于 line 84-87 被当作 `format_string` 送入 `_vformat`。
+
+**第 2 步｜逐条验证 source→sink 数据流的防御有效性**
+- 流 A（主链，成立）：template(line 53) -> self.template(line 56) -> format_string(line 85-86) -> line 123 `self.parse(format_string)` 切出攻击者可控的 field_name -> line 156 `self.get_field(field_name, args, kwargs)`。防御核查：line 136-152 仅处理自动/手动编号切换，完全不约束字段内容；本类未覆写 `get_field`，原样继承 `string.Formatter` 的任意属性链与下标遍历能力；全链路无白名单、无转义、无中性化 → 无有效防御。攻击者可用形如 `{0.__class__.__init__.__globals__[KEY]}` 的字段遍历到模块全局、配置对象乃至 `os.environ`，敏感值经 line 166/168 拼回消息返回给用户，构成信息泄露。
+- 流 B（次级 sink，成立）：同一 parse 产出的 format_spec -> line 164 `format_field` -> line 174 `getattr(segment_class, format_spec, None)`，攻击者可通过 `{f:spec}` 按名字动态取得段类上任意非下划线公开方法并在 line 180 以 `formatter(value)` 调用，进一步扩大可达面；此处仅有 `startswith('_')` 这一类弱限制，仍属可绕过的黑名单式防护。
+- 流 C（安全用法，不成立）：用户数据仅作为 format/map 的值传入时，只被插值为字面文本，不进入 parse 语法层，天然不可注入——但该机制无法阻止用户数据被放进模板位的误用。
+
+**第 3 步｜第二入口与替代通道**
+存在多条汇聚到同一 sink 的入口：`format`(line 74) 与 `format_map`(line 78) 都进入 `_format`(line 80)；当模板是 Message 对象时，每个文本段 `str(seg)` 同样走 `_vformat` 路径(line 95-97)。任一通道中模板内容混入用户数据即可触发，各入口之间没有额外的隔离或过滤层。
+
+**第 4 步｜结论**
+CWE-1336 模板注入成立：该类对外提供模板格式化能力，却未对字段名/格式说明符做任何中性化或白名单限制（未覆写 `get_field`），用户可控内容一旦进入模板位，即可借属性遍历读取进程内敏感数据（环境变量、配置密钥等）并随消息外发。风险等级 High。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-1336 模板注入（格式化字符串信息泄露）",
+  "risk_level": "High",
+  "source": "line 53: __init__ 的 template 参数（用户数据被并入模板时成为污染源，line 56 存入 self.template）",
+  "sink": "line 156: self.get_field(field_name, args, kwargs)（字段名来自 line 123 self.parse；次级 sink 为 line 174 getattr(segment_class, format_spec)）",
+  "explanation": "用户可控 template -> line 85-86 作为 format_string 传入 _vformat -> line 123 parse 解析出攻击者可控的 field_name 与 format_spec -> line 156 get_field 未覆写且无白名单，允许任意属性链与下标遍历 -> 形如 {0.__class__.__init__.__globals__[KEY]} 的字段可触达模块全局变量与 os.environ -> 敏感值经 line 166/168 拼入返回消息外泄；line 174 还可按名动态获取并调用段类公开方法",
+  "fix_suggestion": "line 156: 改为调用经覆写的 get_field，先校验 field_name 仅匹配标识符或数字索引（拒绝含 __ 或方括号的属性链）后再解析"
+}
+```

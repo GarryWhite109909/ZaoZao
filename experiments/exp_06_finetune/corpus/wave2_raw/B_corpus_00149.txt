@@ -1,0 +1,103 @@
+LANG: php
+```code
+# === file: src/Controller/MediaUploadController.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Controller;
+
+use App\Service\SvgPolicyValidator;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
+use Symfony\Component\HttpFoundation\JsonResponse;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\Routing\Annotation\Route;
+
+class MediaUploadController
+{
+    public function __construct(private SvgPolicyValidator $validator) {}
+
+    #[Route('/api/media/svg', name: 'media_svg_upload', methods: ['POST'])]
+    public function upload(Request $request): JsonResponse
+    {
+        $file = $request->files->get('attachment');
+        if (!$file instanceof UploadedFile) {
+            return new JsonResponse(['error' => 'missing attachment'], 400);
+        }
+        if ('image/svg+xml' !== $file->getClientMimeType()) {
+            return new JsonResponse(['error' => 'only svg allowed'], 415);
+        }
+        $svg = $file->getContent();
+        $this->validator->assertSafeSvg($svg);
+        return new JsonResponse(['status' => 'stored', 'size' => strlen($svg)]);
+    }
+}
+# === file: src/Service/SvgPolicyValidator.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Service;
+
+use App\Security\SvgDomScanner;
+
+// Blacklist pre-filter applied before deep DOM inspection.
+class SvgPolicyValidator
+{
+    private const BLOCKED_TAGS = ['script', 'iframe', 'foreignObject'];
+
+    public function __construct(private SvgDomScanner $scanner) {}
+
+    public function assertSafeSvg(string $svg): void
+    {
+        foreach (self::BLOCKED_TAGS as $tag) {
+            if (false !== stripos($svg, '<' . $tag)) {
+                throw new \RuntimeException('blocked element: ' . $tag);
+            }
+        }
+        if (1 === preg_match('/on\w+\s*=/i', $svg)) {
+            throw new \RuntimeException('event handler found');
+        }
+        $this->scanner->scan($svg);
+    }
+}
+# === file: src/Security/SvgDomScanner.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Security;
+
+// Deep structural inspection of SVG markup through DOM traversal.
+class SvgDomScanner
+{
+    public function scan(string $svg): array
+    {
+        \libxml_use_internal_errors(true);
+        $dom = new \DOMDocument();
+        $dom->loadXML($svg, \LIBXML_NOENT | \LIBXML_DTDLOAD);
+        \libxml_clear_errors();
+        $findings = [];
+        foreach (['script', 'foreignObject', 'use'] as $tag) {
+            if ($dom->getElementsByTagName($tag)->length > 0) {
+                $findings[] = 'element:' . $tag;
+            }
+        }
+        $xpath = new \DOMXPath($dom);
+        $bad = $xpath->query('//*[@*[starts-with(name(), \'on\')]]');
+        if (false !== $bad && $bad->length > 0) {
+            $findings[] = 'attribute:on*';
+        }
+        return $findings;
+    }
+}
+```
+
+1. **输入点枚举与可达性**：全组唯一外部输入点是 MediaUploadController.php L16 的 `POST /api/media/svg` 路由——L19 从 multipart 取字段 `attachment`，L26 `getContent()` 读出攻击者完全控制的原始字节；L27 立即传入 `SvgPolicyValidator::assertSafeSvg`（SvgPolicyValidator.php L15），该方法 L25 无条件转调 `SvgDomScanner::scan`（SvgDomScanner.php L9），数据无分支丢失地抵达 L13 的 `loadXML`，可达性成立。
+
+2. **逐流防御核验**：主链为 F1:L26 → F2:L25 → F3:L13。沿途防御逐一评估：(a) F1:L23 的 `getClientMimeType` 是客户端可伪造的请求头，不构成防御；(b) F2:L17-L21 的 `stripos` 标签黑名单只匹配 script/iframe/foreignObject，而 XXE 只需 DOCTYPE/ENTITY 声明，且字符串黑名单按规则视为可绕过；(c) F2:L22-L24 的 `on\w+=` 正则只针对事件属性，与实体注入无关，同样属可绕过过滤；(d) F3:L16-L25 的元素/XPath 检查发生在 L13 解析完成之后，属事后检测，无法撤销已发生的实体展开；全链路没有任何位置出现 `libxml_disable_entity_loader` 或移除危险标志的完整防御。
+
+3. **第二入口/替代通道排查**：项目中仅此一条路由，无 CLI 命令、导入接口或其他控制器；`SvgDomScanner` 仅由 `SvgPolicyValidator` 构造注入（F2:L13），不存在跳过黑名单直达 sink 的旁路调用，因此漏洞结论由这条唯一链路即可支撑。
+
+4. **影响与成因**：F3:L13 同时启用实体替换（`LIBXML_NOENT`）与 DTD 加载（`LIBXML_DTDLOAD`），攻击者可上传含 `<!DOCTYPE svg [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]>` 的 SVG 读取本地文件或发起 SSRF，亦可借实体爆炸造成 DoS；无 RCE 证据，定级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)", "risk_level": "High", "source": "L1:line 26: MediaUploadController 中 $file->getContent() 返回攻击者上传的原始 SVG 字节", "sink": "L3:line 13: SvgDomScanner 中 $dom->loadXML($svg, LIBXML_NOENT|LIBXML_DTDLOAD) 解析不可信 XML", "explanation": "唯一数据流: MediaUploadController.php L19 接收 multipart 字段 attachment, L26 getContent() 取得完全受控字节, L27 调用 SvgPolicyValidator::assertSafeSvg(SvgPolicyValidator.php L15), 其中 L17-L21 的 stripos 标签黑名单仅匹配 script/iframe/foreignObject 而 XXE 只需 DOCTYPE/ENTITY 且字符串黑名单可绕过, L22-L24 的 on\\w+= 正则只针对事件属性与实体注入无关亦属可绕过过滤, 随后 L25 原样透传至 SvgDomScanner::scan(SvgDomScanner.php L9), 于 L13 以 LIBXML_NOENT|LIBXML_DTDLOAD 解析触发实体展开构成 XXE; 防御位置核验: F1 L23 的 getClientMimeType 为客户端可伪造头不构成防御, F3 L16-L25 的元素与 XPath 检查发生在 L13 解析之后属事后检测无法阻止实体替换, 全链无 libxml_disable_entity_loader 或等效开关; 第二入口排查: 全项目仅此一条路由, 无 CLI 命令/导入接口/其他控制器, SvgDomScanner 仅被 SvgPolicyValidator 注入调用, 不存在绕过过滤层的替代通道, 单链即可支撑漏洞结论", "fix_suggestion": "line 13: 移除 LIBXML_NOENT 与 LIBXML_DTDLOAD 标志, 改为 $dom->loadXML($svg, LIBXML_NONET | LIBXML_COMPACT) 并确保外部实体加载被禁用"}
+```

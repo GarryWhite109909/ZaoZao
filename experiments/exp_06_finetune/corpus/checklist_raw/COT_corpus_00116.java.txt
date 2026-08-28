@@ -1,0 +1,29 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点并追踪数据流**
+
+- 输入点 A：`lookupByName(String key)` 的参数（第 76 行），由上层 Registry 调用方传入；
+- 输入点 B（核心污染源）：第 81 行 `kvClient.getValueAsString(key)` 从 Consul KV 读回的**存储值**。Consul 通常无强制 ACL，且第 65 行硬编码 `'http://'` 明文连接，任何能写 KV 的客户端或链路上的中间人都能植入任意 Base64 编码的 Java 序列化字节；
+- 输入点 C：`findByTypeWithName`/`findByType` 中第 111、138 行 `getKeys` 返回的键列表，同样来自 Consul，同属不可信通道。
+
+追踪主数据流：第 81 行取出 KV 值 -> 第 82 行 `decodeBase64` -> 第 83 行 `ConsulRegistryUtils.deserialize` -> 第 303 行 `new ObjectInputStream(new ByteArrayInputStream(bytes))` -> **第 304 行 `in.readObject()`**，命中反序列化危险 sink。
+
+**步骤 2｜逐条验证防御有效性**
+
+- 主流（B→sink）：全程无任何防护——无 `ObjectInputFilter`、无类白名单、无签名/HMAC 校验；`decodeBase64` 仅是编码转换，不构成安全控制；
+- 第 94 行 `type.cast(object)` 发生在 `readObject()` **完成之后**，反序列化期间 gadget 链副作用已执行完毕，事后强转不是有效防御；
+- 第 78 行 `key.replace('$', '/')` 只是对键名做字符替换，与值的反序列化无关，亦非防御。结论：source→sink 无有效防御覆盖。
+
+**步骤 3｜检查第二入口与替代通道**
+
+- `findByTypeWithName` 第 122 行、`findByType` 第 149 行用从 Consul 枚举出的键回调 `lookupByName`——攻击者只需在 KV 中植入恶意条目即可被自动反序列化，无需预知 bean 名；
+- `remove` 第 195 行、`put` 第 219 行内部同样调用 `lookupByName`；
+- 所有入口最终都汇聚到同一个未加固的 `deserialize`/`readObject`，替代通道全部可达。（另注：`clone` 方法内的 deserialize 输入为本地已绑定对象，非外部污染源，不计入。）
+
+**步骤 4｜结论**
+
+Consul KV 值这一不可信输入未经校验直达 `ObjectInputStream.readObject`，构成 CWE-502 反序列化不可信数据漏洞，可通过常见 gadget 链达成任意代码执行；利用前提是攻击者具备 KV 写权限或处于明文 HTTP 链路位置（内网横向/中间人均现实可行），综合评定为 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 Deserialization of Untrusted Data", "risk_level": "High", "source": "第81行: kvClient.getValueAsString(key) 从 Consul KV 读回的值（可被有 KV 写权限的攻击者或明文 HTTP 中间人注入，见第65行硬编码 http 连接）", "sink": "第304行: ConsulRegistryUtils.deserialize 内 in.readObject()（经第83行调用）", "explanation": "Consul KV 存储值属不可信外部数据 -> 第82行 decodeBase64 -> 第83行 deserialize -> 第303行 new ObjectInputStream -> 第304行 readObject 直接还原任意对象并触发 gadget 链可致 RCE；全程无 ObjectInputFilter/类白名单/签名校验；第94行 type.cast 位于 readObject 之后无法阻止反序列化期副作用；第78行 replace 仅处理键名字符非防御；第二入口 findByTypeWithName 第122行、findByType 第149行、remove 第195行、put 第219行均汇入同一 sink", "fix_suggestion": "第303行: 创建 ObjectInputStream 后立即调用 in.setObjectFilter 设置类白名单（默认拒绝、仅放行预期业务类型），或在反序列化前对 KV 值做 HMAC 签名校验"}
+```

@@ -1,0 +1,95 @@
+LANG: java
+```code
+# === file: src/main/java/com/robothy/s3/rest/handler/DeleteObjectsHandler.java ===
+package com.robothy.s3.rest.handler;
+
+import com.robothy.s3.rest.service.S3XmlRequestParser;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.handler.codec.http.FullHttpRequest;
+import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.QueryStringDecoder;
+import java.nio.charset.StandardCharsets;
+
+/** Handles POST /?delete : multi-object deletion carrying an XML body. */
+public class DeleteObjectsHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
+
+  private final S3XmlRequestParser parser = new S3XmlRequestParser();
+
+  @Override
+  protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) {
+    QueryStringDecoder qs = new QueryStringDecoder(request.uri());
+    if (!HttpMethod.POST.equals(request.method()) || !qs.parameters().containsKey("delete")) {
+      ctx.fireChannelRead(request.retain());
+      return;
+    }
+    ByteBuf content = request.content();
+    String xmlBody = content.toString(StandardCharsets.UTF_8);
+    Object result = parser.parseDeleteRequest(xmlBody);
+    // Dispatch result to ObjectService.deleteObjects(bucketId, keys)
+  }
+
+}
+
+# === file: src/main/java/com/robothy/s3/rest/service/XmlMapperFactory.java ===
+package com.robothy.s3.rest.service;
+
+import com.ctc.wstx.stax.WstxInputFactory;
+import com.ctc.wstx.stax.WstxOutputFactory;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.dataformat.xml.XmlFactory;
+import com.fasterxml.jackson.dataformat.xml.XmlMapper;
+import javax.xml.stream.XMLInputFactory;
+
+/** Shared XmlMapper used by all S3 XML request parsers. */
+public final class XmlMapperFactory {
+
+  private static XmlMapper mapper;
+
+  public static synchronized XmlMapper getXmlMapper() {
+    if (mapper == null) {
+      XMLInputFactory input = new WstxInputFactory();
+      input.setProperty(XMLInputFactory.IS_NAMESPACE_AWARE, Boolean.FALSE);
+      XmlFactory xmlFactory = new XmlFactory(input, new WstxOutputFactory());
+      mapper = new XmlMapper(xmlFactory);
+      mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+    }
+    return mapper;
+  }
+
+}
+
+# === file: src/main/java/com/robothy/s3/rest/service/S3XmlRequestParser.java ===
+package com.robothy.s3.rest.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.dataformat.xml.XmlMapper;
+import java.io.IOException;
+
+/** Parses S3 XML request bodies (DeleteObjects, CompleteMultipartUpload, etc.). */
+public class S3XmlRequestParser {
+
+  public JsonNode parseDeleteRequest(String xmlBody) {
+    try {
+      XmlMapper mapper = XmlMapperFactory.getXmlMapper();
+      return mapper.readValue(xmlBody, JsonNode.class);
+    } catch (IOException e) {
+      throw new IllegalArgumentException("Malformed XML request body.", e);
+    }
+  }
+
+}
+```
+
+1. **外部输入点枚举与可达性**：本组代码唯一的网络入口是 Netty HTTP 管道。DeleteObjectsHandler.java:18 的 channelRead0 接收 FullHttpRequest，:19-20 用 URI 方法与 delete 查询参数做纯路由判断（非安全校验），:24-25 把客户端完全可控的原始请求体解码为 xmlBody，:26 直接传入解析器——从公网/本地端口发送 POST /?delete 即可到达 sink，可达性成立。
+
+2. **主数据流逐步验证**：流1：DeleteObjectsHandler.java:25（xmlBody 产生）→ :26（跨文件传参）→ S3XmlRequestParser.java:12（取得共享 mapper）→ :13（readValue 解析不可信 XML，Woodstox 在此展开 DTD 与外部实体）。中间文件 XmlMapperFactory.java:17-18 构造 WstxInputFactory 时只设置了 IS_NAMESPACE_AWARE=FALSE——这是 S3 命名空间兼容性配置而非安全开关，未设置 SUPPORT_DTD=false 与 IS_SUPPORTING_EXTERNAL_ENTITIES=false，属于“看似净化实则不完整”的伪防御。
+
+3. **防御类型/位置/覆盖面核查**：XmlMapperFactory.java:18 的唯一配置不覆盖 DTD 与外部实体维度；S3XmlRequestParser.java:14-16 的 catch 仅做异常包装，不阻断实体展开与 Billion Laughs 资源消耗；全链路不存在黑名单、正则或字符串替换过滤，也无任何调用方二次加固，因此链上无有效防御。
+
+4. **第二入口/替代通道**：XmlMapperFactory.java:15 的 getXmlMapper 是全局单例，同进程内其他解析 XML 的处理器（如 CompleteMultipartUpload、LocationConstraint 等）以及对通用类 S3XmlRequestParser 的任何间接调用都复用同一未加固 mapper 并汇聚到同一 sink；查询参数本身不进入 XML 解析、不构成独立污点路径。综上，source 与 sink 分处不同文件、中间仅有伪净化，跨文件 XXE（CWE-611）成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611", "risk_level": "High", "source": "L1:line 25: DeleteObjectsHandler.channelRead0 将客户端完全可控的 HTTP 请求体解码为字符串 xmlBody", "sink": "L3:line 13: S3XmlRequestParser 使用共享 XmlMapper 对不可信 XML 执行 readValue 触发外部实体解析", "explanation": "主链：攻击者向服务端口发送 POST /?delete 并携带含外部实体的 XML；DeleteObjectsHandler.java L18-L20 仅做方法与查询参数的路由判断，L24-L25 将原始请求体解码为 xmlBody，L26 跨文件传入 S3XmlRequestParser.parseDeleteRequest；S3XmlRequestParser.java L12 经 XmlMapperFactory.getXmlMapper 取得共享实例并于 L13 调用 readValue，Woodstox 在此展开 DTD 与外部实体，造成任意文件读取与 SSRF。防御核查：XmlMapperFactory.java L18 仅设置 IS_NAMESPACE_AWARE=FALSE，属命名空间兼容性配置而非安全开关，未设置 SUPPORT_DTD=false 与 IS_SUPPORTING_EXTERNAL_ENTITIES=false，为看似加固实则不完整的伪净化；S3XmlRequestParser.java L14-L16 的 catch 仅包装异常不阻断实体展开；全链无黑名单、正则或字符串替换过滤，无有效防御。输入点枚举：唯一外部入口为 Netty HTTP 管道的请求体与 URI（DeleteObjectsHandler.java L19-L25），查询参数仅参与路由不进入 XML 解析，不构成独立污点。第二入口与替代通道：XmlMapperFactory.java L15 的 getXmlMapper 为全局单例，其他解析 XML 的处理器（CompleteMultipartUpload、LocationConstraint 等）及对 S3XmlRequestParser 的间接调用均复用同一未加固 mapper 并汇聚至同一 sink，替代通道全部可达，跨文件 XXE 链成立。", "fix_suggestion": "XmlMapperFactory.java line 18: 在设置 IS_NAMESPACE_AWARE 之后追加 input.setProperty(XMLInputFactory.SUPPORT_DTD, Boolean.FALSE) 与 input.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, Boolean.FALSE)，使共享 mapper 彻底禁用 DTD 与外部实体"}
+```

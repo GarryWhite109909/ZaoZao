@@ -1,0 +1,25 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点并追踪数据流**
+
+- 输入点：`webhook.url`。根据背景信息，默认部署的 MLflow Tracking Server 无鉴权地暴露 model-registry webhooks API，攻击者可通过创建/测试 webhook 接口提供任意 URL，该 URL 存入 `Webhook` 对象后作为参数进入本文件 `_send_webhook_request`（第 136–137 行）。
+- 危险 sink：第 189 行 `session.post(webhook.url, data=payload_bytes, ...)` —— 服务端以自身网络位置向用户提供的 URL 发起 POST 请求。
+- 流 A（异步）：`deliver_webhook`(第 304 行) → `_deliver_webhook_impl`(第 282 行) → 取缓存 webhooks(第 292 行) → 线程池提交(第 295–301 行) → `_send_webhook_with_error_handling`(第 274 行) → 第 189 行。
+- 流 B（同步）：`test_webhook`(第 323 行) → 第 338 行直接调用 `_send_webhook_request` → 同一 sink；且第 341–344 行把 `response_status` 与 `response_body` 封装进 `WebhookTestResult` 返回给调用者。
+
+**步骤 2｜逐条验证防御有效性**
+
+- 唯一防御是第 153 行 `_validate_webhook_url(webhook.url)`（导入自第 36 行）。它位于 sink 之前、能覆盖两条流，但其性质是对 URL 本身的格式/合法性校验，**不是对请求目标的白名单允许集**：不限制目标主机范围，攻击者提供的 `http://169.254.169.254/...`、`http://127.0.0.1:PORT`、内网主机地址等均可通过校验后到达第 189 行发起请求。即便其内部含有私网地址黑名单，按判定规则黑名单式过滤可被等价 IP 表示、DNS 重绑定、重定向等手段绕过，不算有效防御。
+- 结论：流 A 与流 B 的 source→sink 均未被有效拦截。
+
+**步骤 3｜第二入口与替代通道**
+
+存在两条独立通道到达同一 sink：事件驱动的异步投递（第 295 行 submit）与同步测试接口 `test_webhook`（第 338 行）。后者危害更大：第 343–344 行将目标响应状态码与响应体回显给 API 调用方，构成“可读回显”的 SSRF oracle，可直接读取内网服务响应与云元数据凭据。
+
+**步骤 4｜结论**
+
+用户可控 URL 未受有效目标约束即被服务端发起请求，且默认部署无鉴权、同步通道回显响应内容，构成 CWE-918 SSRF。考虑到可打云元数据窃取凭据并结合无鉴权暴露，风险等级评为 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 SSRF", "risk_level": "High", "source": "line 137: _send_webhook_request 的 webhook 参数（webhook.url 来自无鉴权 webhooks API 的用户输入）", "sink": "line 189: session.post(webhook.url, ...)", "explanation": "用户经未鉴权 webhooks 创建/测试接口提供任意 url -> Webhook 对象传入 _send_webhook_request -> 第 153 行 _validate_webhook_url 仅做 URL 格式级校验，非目标地址白名单，无法阻止指向内网/云元数据(169.254.169.254)/环回地址的 URL -> 第 189 行 session.post 以服务端身份向该 url 发起 POST -> 异步投递(line 295)与同步 test_webhook(line 338)两条通道均可达同一 sink，且 line 343-344 将响应状态码与响应体回显给调用者，形成可读取内网响应的 SSRF", "fix_suggestion": "line 153: 将 _validate_webhook_url 升级为 SSRF 安全校验：解析目标主机并拒绝私网/环回/链路本地地址（含 169.254.169.254、127.0.0.1 等），仅允许显式白名单目标，并在发请求时绑定已验证的解析 IP"}
+```

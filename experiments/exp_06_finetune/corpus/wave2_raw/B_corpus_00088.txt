@@ -1,0 +1,104 @@
+LANG: go
+```code
+# === file: internal/httpapi/routes.go ===
+package httpapi
+
+import (
+	"io"
+	"net/http"
+	"path/filepath"
+	"strings"
+
+	"goshs.de/goshs/v2/internal/storage"
+)
+
+func (fs *FileServer) RegisterRoutes(mux *http.ServeMux) {
+	mux.Handle("/upload", Guard(http.HandlerFunc(fs.upload))) // POST /upload: guarded (handler in upload.go)
+	mux.HandleFunc("/put/", fs.put)                           // PUT: NOT wrapped by Guard (legacy clients)
+}
+
+// put stores a raw-body upload at a caller-chosen path under UploadFolder.
+func (fs *FileServer) put(w http.ResponseWriter, req *http.Request) {
+	if fs.ReadOnly {
+		http.Error(w, "read only", http.StatusForbidden)
+		return
+	}
+	rel := strings.TrimPrefix(req.URL.Path, "/put/")
+	savepath := filepath.Join(fs.UploadFolder, rel) // attacker-controlled destination
+	body, err := io.ReadAll(req.Body)               // SOURCE: attacker-controlled bytes
+	if err != nil {
+		http.Error(w, "bad body", http.StatusBadRequest)
+		return
+	}
+	defer req.Body.Close()
+	if !fs.applyCustomAuth(w, req) { // ACL only; NO CSRF token check on this route
+		return
+	}
+	if err := storage.WriteUpload(savepath, body); err != nil { // tainted data reaches sink
+		http.Error(w, "write failed", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+# === file: internal/httpapi/csrf.go ===
+package httpapi
+
+import (
+	"crypto/subtle"
+	"net/http"
+)
+
+// Guard validates a double-submit CSRF token. Sound implementation, but its
+// coverage depends on wiring: only POST /upload is wrapped in routes.go,
+// so every other state-changing route silently bypasses it.
+func Guard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		c, err := req.Cookie("goshs_session")
+		if err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		tok := req.Header.Get("X-CSRF-Token")
+		if subtle.ConstantTimeCompare([]byte(tok), []byte(c.Value)) != 1 {
+			http.Error(w, "csrf mismatch", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
+// applyCustomAuth: per-directory ACL pass-through, not bound to session/origin.
+func (fs *FileServer) applyCustomAuth(w http.ResponseWriter, req *http.Request) bool {
+	return req.Header.Get("X-ACL") != "deny"
+}
+# === file: internal/storage/writer.go ===
+package storage
+
+import (
+	"bytes"
+	"io"
+	"os"
+)
+
+// WriteUpload persists caller-supplied bytes at the caller-chosen path.
+func WriteUpload(savepath string, body []byte) error {
+	// #nosec G304
+	dst, err := os.OpenFile(savepath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644) // SINK
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+	_, err = io.Copy(dst, bytes.NewReader(body))
+	return err
+}
+```
+
+1. **输入点枚举与可达性**：internal/httpapi/routes.go L12-L15 注册路由，PUT /put/ 在 L14 直挂 fs.put，前面没有任何中间件；输入点一是 routes.go L25 的 `io.ReadAll(req.Body)`（跨站请求可携带任意字节），输入点二是 routes.go L23-L24 由 `req.URL.Path` 派生的 savepath；两个实参经 L34 `storage.WriteUpload` 传入，直达 internal/storage/writer.go L12 `os.OpenFile` 与 L17 `io.Copy`，链路无中断，可达性成立。
+2. **数据流A（body→文件内容）防御核验**：链上前置仅 ReadOnly（routes.go L19，纯配置开关）与 applyCustomAuth（csrf.go L28-L30，只比对攻击者可自行携带的 X-ACL 请求头，不绑定会话、Origin 或 Token，跨站请求原样通过），均属无效防御；整条链无 Token、无 Origin/Referer 校验。
+3. **数据流B（path→savepath→OpenFile）防御核验**：filepath.Join（routes.go L24）仅做词法 Clean，不把结果约束在 UploadFolder 内，`../` 序列未被拒绝；writer.go 函数体自身不含任何鉴权或范围检查，O_TRUNC 直接截断覆写目标文件。
+4. **关键防御的位置缺陷**：csrf.go L11-L25 的 Guard 本身是正确的双提交 Token 校验（constant-time 比较），但接线层面只在 routes.go L13 包裹了 POST /upload；L14 的 PUT 未被包裹，构成『净化看似存在实则覆盖不完整』的中间层，对该链路等效于没有 CSRF 防御。
+5. **第二入口与最终结论**：受保护的替代通道是 POST /upload（routes.go L13，Guard 生效）；抵达 writer.go 汇点的调用仅 WriteUpload 一处，无其他旁路或间接调用。POST 与 PUT 写文件能力等价而防护不对称，跨站页面可借受害者浏览器会话发起跨域 PUT（fetch/XHR 或表单+方法改写代理）写入任意路径，确认 CWE-352，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-352 跨站请求伪造（CSRF）：PUT 上传路由缺少 Token/Origin 校验，导致以受害者身份向服务器任意路径写入文件", "risk_level": "High", "source": "L1:line 25: io.ReadAll(req.Body) 读取的攻击者可控请求体（辅路 L1:line 23-24 req.URL.Path 控制写入目标路径）", "sink": "L3:line 12: os.OpenFile 以 O_CREATE|O_TRUNC 打开攻击者指定路径，并由 L3:line 17 io.Copy 写入污点数据完成落盘", "explanation": "输入点枚举与可达性：routes.go L12-L15 注册路由，PUT /put/ 在 L14 直挂 fs.put 且无中间件；输入点一为 L25 的 io.ReadAll(req.Body)，输入点二为 L23-L24 由 req.URL.Path 派生的 savepath；两实参经 L34 storage.WriteUpload 直达 writer.go L12 os.OpenFile 与 L17 io.Copy，链路无中断。流A（body→文件内容）防御核验：仅 ReadOnly（routes.go L19，配置开关）与 applyCustomAuth（csrf.go L28-L30，仅比对攻击者可自带的 X-ACL 头，不绑定会话或来源）在前，均为无效防御，全链无 Token 或 Origin 校验。流B（path→savepath→OpenFile）防御核验：filepath.Join（routes.go L24）只做词法 Clean，不限制在 UploadFolder 内，../ 可逃逸；writer.go 函数体无鉴权与范围检查，O_TRUNC 直接覆写。关键缺陷：csrf.go L11-L25 的 Guard 本身是有效的 constant-time 双提交 Token 校验，但仅在 routes.go L13 包裹 POST /upload，L14 的 PUT 未被包裹，属防御存在但覆盖不完整的位置性缺口。第二入口结论：受保护的替代通道是 POST /upload（routes.go L13），抵达汇点的调用仅 WriteUpload 一处，无其他旁路；POST 与 PUT 能力等价而防护不对称，跨站页面可借受害者会话发起跨域 PUT 写入任意路径，确认 CWE-352。", "fix_suggestion": "line 14: 用 Guard 包裹 PUT 路由，如 mux.Handle('/put/', Guard(http.HandlerFunc(fs.put)))，并在 Guard 中追加 Origin/Referer 同源校验，使所有非 GET/HEAD 变更请求都强制携带与会话绑定的 CSRF Token"}
+```

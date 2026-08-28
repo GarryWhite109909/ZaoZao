@@ -1,0 +1,113 @@
+LANG: go
+```code
+# === file: routes/wopi_routes.go ===
+package routes
+
+import (
+	"net/http"
+
+	"cloudreve-demo/service"
+)
+
+// GET /api/wopi/action?viewer=wopi-default&file_id=abc[&action_url=...]
+func WopiActionHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	// SOURCE-A: legacy clients may send a full action-url template override.
+	override := q.Get("action_url")
+
+	// SOURCE-B: file identifier later concatenated into the WOPISrc path.
+	fileID := q.Get("file_id")
+
+	viewer := q.Get("viewer")
+	if viewer == "" {
+		viewer = "wopi-default"
+	}
+
+	service.OpenEditor(w, r, viewer, override, fileID)
+}
+
+# === file: service/template.go ===
+package service
+
+import "strings"
+
+// viewerTmpl mimics rows persisted by the admin endpoint PUT /api/viewers,
+// whose body is stored verbatim, so these values stay attacker-influenced
+// even when no action_url override is sent on the request.
+var viewerTmpl = map[string]string{
+	"wopi-default": `https://office.example.com/we/wordeditorframe.aspx`,
+}
+
+// SanitizeTemplate is documented as making a template safe before parsing;
+// it only strips markup delimiters and never touches .. , %2e%2e or scheme.
+func SanitizeTemplate(s string) string {
+	s = strings.ReplaceAll(s, "<", "")
+	return strings.ReplaceAll(s, ">", "")
+}
+
+// LoadTemplate relays the stored template or the request override through
+// the cosmetic sanitizer; no allow-list or path containment check happens.
+func LoadTemplate(name, override string) string {
+	tmpl := viewerTmpl[name]
+	if override != "" {
+		tmpl = override
+	}
+	return SanitizeTemplate(tmpl)
+}
+
+# === file: service/dispatch.go ===
+package service
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+)
+
+const wopiSrcPlaceholder = "WOPI_SOURCE"
+
+// OpenEditor assembles the final editor URL and navigates the browser there.
+func OpenEditor(w http.ResponseWriter, r *http.Request, viewer, override, fileID string) {
+	tmpl := LoadTemplate(viewer, override)
+
+	actionURL, err := url.Parse(tmpl)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to parse action url: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// fileID is appended with no traversal check; .. escapes the prefix.
+	fileSrc := "https://" + r.Host + "/api/wopi/files/" + fileID
+
+	q := actionURL.Query()
+	if _, ok := q[wopiSrcPlaceholder]; ok {
+		q.Set(wopiSrcPlaceholder, fileSrc)
+	} else {
+		q.Set("WOPISrc", fileSrc)
+	}
+	q.Set("lang", "lng")
+	actionURL.RawQuery = q.Encode()
+
+	// SINK: navigation target derives entirely from unvalidated input.
+	http.Redirect(w, r, actionURL.String(), http.StatusFound)
+}
+```
+
+分析：
+
+1. **外部输入点枚举与可达性**：共 5 个外部输入——routes/wopi_routes.go:14 `action_url`（查询参数，直接作模板覆盖）、同文件 :17 `file_id`、:19 `viewer`（选择存储模板的键）、service/dispatch.go:22 参与拼接的 `r.Host`（Host 头）、service/template.go:8 由管理端 PUT /api/viewers 原样落库的 `viewerTmpl`（注释明示）。前三者经 routes/wopi_routes.go:24 一跳进入 `service.OpenEditor`，中间无任何拦截分支，全部可达 sink；`viewer` 虽不直接进入 URL，但决定哪条被污染模板流入 sink，同样构成输入面。
+
+2. **数据流逐条验证防御**：
+   - 流1（主链）：routes/wopi_routes.go:14 → service/template.go:24（override 覆盖存储值）→ service/template.go:14-17 `SanitizeTemplate` → service/dispatch.go:15 `url.Parse` → service/dispatch.go:34 `http.Redirect`。唯一“防御”是 :15-16 删除尖括号——属黑名单式字符串替换，对 `../`、`%2e%2e%2f`、`..\`、`javascript:`、`//evil.com` 全部无效；`url.Parse` 仅拒绝语法非法值，接受相对路径与外部主机，不构成路径限制。
+   - 流2：routes/wopi_routes.go:17 `file_id` → service/dispatch.go:22 字符串拼接进 `/api/wopi/files/` 前缀 → :26/:28 写入 WOPISrc → :34。全程零校验（原代码中的 hashid 编码环节被剥离），`file_id=../../admin/export` 即逃逸受限前缀。
+
+3. **中间文件定性**：service/template.go 表面是净化层（函数名与注释声称 safety），实际 `SanitizeTemplate` 是不完整的黑名单替换，`LoadTemplate` 为纯传递且允许请求参数覆盖受信存储值——即“净化看似发生实则不完整”。
+
+4. **第二入口与替代通道**：存在。第二入口 = 管理端写入的 `viewerTmpl`（service/template.go:5-10），即使请求不带 `action_url`，被污染的存量模板仍沿同一链路抵达同一 sink；替代通道 = `file_id`（流2）独立汇入同一 sink；另有 Host 头未校验参与 :22 拼接（host 头注入），为第三条次要通道。多入口汇聚于单一 sink，强化而非削弱结论。
+
+5. **结论**：调用链上不存在任何有效的路径/scheme 白名单或编码归一化校验，CWE-22 成立；主链为 routes/wopi_routes.go:14 → service/template.go:24 → service/dispatch.go:15 → service/dispatch.go:34。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal: 未校验的 action_url 模板与 file_id 拼入跳转 URL 导致受限端点命名空间逃逸", "risk_level": "High", "source": "L1:line 14: HTTP 查询参数 action_url（次级 source 为 L1:line 17 的 file_id）", "sink": "L3:line 34: http.Redirect 以完全由外部输入拼装的 URL 发起浏览器跳转", "explanation": "流1: L1:14 的 action_url 在 L2:24 覆盖存储模板, 仅经 L2:14-17 尖括号黑名单替换(对 ../ 、%2e%2e%2f 、javascript: 、//evil.com 均无效), 于 L3:15 被 url.Parse 接受为相对路径或外部主机, 最终 L3:34 http.Redirect 跳出 /api/wopi 受限命名空间; 流2: L1:17 的 file_id 零校验, 在 L3:22 直接拼进 /api/wopi/files/ 路径, 取 ../../ 类值即可目录穿越, 同样汇入 L3:34; 防御核查: 全链仅有 L2:15-16 字符串替换与 L3:16 的格式错误检查, 均不限制路径范围或 scheme, 不构成有效防御; 第二入口: L2:8 的 viewerTmpl 由管理端 PUT /api/viewers 原样落库, 即使不带 action_url, 被污染存量模板仍沿同一链路抵达同一 sink; 替代通道: L3:22 的 r.Host 未校验参与拼接(host 头注入), 为第三条次要通道", "fix_suggestion": "line 34: 在 L3:15 解析后增加双重校验——actionURL 的 Scheme/Host 必须命中办公端点白名单且 Path 归一化后不含 .. 段, 同时对 file_id 先做 hashid 解码、失败即拒绝后再拼接"}
+```

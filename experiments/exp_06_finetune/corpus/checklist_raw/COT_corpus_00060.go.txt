@@ -1,0 +1,31 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点并追踪数据流**
+
+第 17 行函数入参 `req` 是隧道客户端从服务端收到的协议消息，字段均源自外部用户的 HTTP 请求：
+- `req.Path`（第 20 行消费）
+- `req.Query`（第 21–22 行消费）
+- `req.BodyBase64`（第 26–28 行消费）
+- `req.Headers`（第 42 行消费）
+- `req.Method`（第 37 行消费）
+
+关键数据流：`req.Path` → 第 20 行 `fmt.Sprintf` 拼接进 `url` → 第 37 行 `http.NewRequest` 构造出站请求 → 第 51 行 `hc.Do` 实际分发给本地 `host:port` 服务。危险 sink 为第 51 行的出站请求执行。
+
+**步骤 2｜逐条验证防御有效性**
+
+- **Path 流（核心）**：第 20 行以 `%s` 直接拼接，函数内对该字段无任何白名单、规范化或越界校验。结合背景，上游服务端转发的是 `r.URL.Path`（**已解码**），因此 `%2e%2e%2f` 到达本函数时已是 `../`、`%2f` 已是裸 `/`；而 Go 的 `url.Parse`/`http.Client` 既不解析点段也不会恢复编码语义，穿越路径将被**原样**送达本地服务。第 42 行 `SanitizeIncomingHeaderMap` 只清洗 headers，覆盖不到 Path；第 32 行 body 大小限制与本流无关。**该流无任何有效防御**。
+- **Query 流**：第 22 行原样追加，本身即用户自己的查询串透传，属辅助通道，非主要危害。
+- **Headers 流**：经 `SanitizeIncomingHeaderMap` 集中清洗，视为已防护。
+- **Method 流**：非法方法会在第 37 行被 `NewRequest` 报错拒绝，无可利用面。
+
+**步骤 3｜第二入口/替代通道检查**
+
+文件内仅此一个出口函数，无其他路由；同消息内的 Query（第 22 行）可作配合通道但不独立成洞。需注意：由于解码动作发生在上游服务端，客户端侧即使事后重编码也无法恢复原始编码边界，因此唯一可行的防线就是本函数在使用 `Path` 前自行做点段规范化/越界校验——当前完全缺失，不存在兜底。（另：若上游不保证 Path 以 `/` 开头，还可能借 `@` 造成 authority 混淆，但按背景 `r.URL.Path` 恒以 `/` 开头，该通道不可达。）
+
+**步骤 4｜结论**
+
+攻击者经隧道发送形如 `/%2e%2e/%2e%2e/internal-secret` 的请求，服务端解码后本函数于第 20 行构造出 `http://host:port/../../internal-secret`，并在第 51 行原样发给本地服务，可穿越本地应用基于路径前缀的限制、绕过路径型鉴权或触达内部端点，构成代理链路上的路径穿越（CWE-22）。风险等级 **High**。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "High", "source": "line 20: req.Path（上游服务端转发的已解码外部请求路径）", "sink": "line 51: hc.Do(httpReq)（经 line 37 http.NewRequest 构造）", "explanation": "外部用户发送含 %2e%2e%2f 的编码路径 -> 上游以 r.URL.Path 解码后经隧道下发 -> req.Path 变为 ../ 或裸 / -> line 20 直接拼入 url -> line 37 NewRequest 与 line 51 Do 不解析点段且不还原编码语义 -> 本地服务收到穿越路径 -> 绕过基于路径的前缀鉴权/访问受限资源", "fix_suggestion": "line 20: 拼接前先对 req.Path 做 path.Clean 规范化并拒绝包含 .. 或 Clean 后逃逸根目录的值（更优做法是透传未解码的原始 request-target）"}
+```

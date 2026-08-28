@@ -1,0 +1,20 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点**
+- 第 68 行 `StartAndGC(config string)`：JSON 配置串（部署/运维侧控制），派生出 `CachePath`/`FileSuffix`（第 95-96 行）。
+- 缓存键入口：第 153 行 `Get(ctx, key)`、第 178 行 `GetMulti(keys)`、第 200 行 `Put(ctx, key, ...)`、第 223 行 `Delete(key)`、第 240/255 行 `Incr/Decr(key)`、第 270 行 `IsExist(key)`。缓存键在实际业务中通常直接或间接受应用层用户输入影响（如按用户名/会话 ID 组合键）。
+
+**步骤 2｜追踪 source→sink 并验证防御**
+- 主数据流：`key` → 第 154/215/224/271 行传入 `getCacheFileName` → **第 126-127 行 `m := md5.New()`、`io.WriteString(m, key)`** → 第 128 行 `keyMd5 := hex.EncodeToString(...)` → 第 148 行以 `keyMd5+FileSuffix` 作为唯一文件名。sink 即弱哈希算法本身（CWE-327）。
+- 防御有效性核查：全程无盐值、无 HMAC、未使用任何抗碰撞更强的算法；第 130-135 行的 `DirectoryLevel` 分层仅按摘要前缀分桶存放，不增加熵、完全不防碰撞；第 128 行 hex 编码把文件名字符限定在 `[0-9a-f]`，只是顺带阻断了路径穿越，对碰撞问题无效。即该流上不存在任何有效缓解。
+- 配置流：`config`(第 68 行) → 第 95-96 行 → 第 116/141 行 `os.MkdirAll`、第 310 行 `os.WriteFile`；`filepath.Join` 会清洗 `..`，且该输入属运维配置而非终端用户输入，非本次标注的主漏洞。
+
+**步骤 3｜第二入口/替代通道排查**
+- 第 183 行 `GetMulti` 循环调用 `Get`；第 241/256 行 `Incr/Decr` 先经 `Get` 再于第 251/266 行调 `Put`；`IsExist` 第 271 行直连 `getCacheFileName`。所有公开方法最终收敛到同一个 MD5 sink（第 126 行），包内不存在第二个哈希实现或绕过路径。
+
+**步骤 4｜结论**
+- 成立：MD5 的选择前缀碰撞已实用化，攻击者若能控制缓存键，可构造两个不同 key 映射到同一物理文件——`Put` 时覆盖他键条目、`Get` 时串读到他人数据（缓存投毒/越权读）。利用需具备写缓存能力且无直接代码执行，定级 Medium。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-327 Use of a Broken or Risky Cryptographic Algorithm", "risk_level": "Medium", "source": "line 153 与 line 200: Get/Put 的 key 参数（应用层可控的缓存键）", "sink": "line 126-127: md5.New() 后 io.WriteString(m, key)，line 128 生成 keyMd5 作为唯一文件名依据", "explanation": "用户可控 key -> line 154/215/224/271 getCacheFileName -> line 126-127 无盐 MD5 摘要 -> line 128 hex 编码 -> line 148 直接作为缓存文件名；MD5 抗碰撞性已被攻破，两个不同 key 可映射到同一文件，导致 Put 覆盖他键数据或 Get 串读他人缓存（缓存投毒）；line 130-135 目录分层仅分散存储位置、不增加熵，不构成有效防御；hex 字符集仅顺带阻断路径穿越，与碰撞无关", "fix_suggestion": "line 126: 将 md5.New() 替换为 sha256.New()，并把 line 20 的导入由 crypto/md5 改为 crypto/sha256"}
+```

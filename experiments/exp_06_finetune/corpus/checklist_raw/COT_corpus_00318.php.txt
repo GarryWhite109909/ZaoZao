@@ -1,0 +1,30 @@
+## 漏洞分析报告
+
+**目标文件**：`FeatureCallSilentToken.php`（Shopware Twig 自定义标签的编译节点）
+
+### 步骤 1｜枚举用户可控输入点并追踪数据流
+
+- **第 15 行**：`private readonly string $flag` 是本文件唯一的外部数据入口。它对应 Twig 模板中 `{% sw_silent_feature_call '标志名' %}` 的字符串实参。凡能提供或修改 Twig 模板的一方（第三方 App/主题包作者、多租户场景下的店铺管理员等）均可控制该值——App 在 Shopware 信任模型中只允许声明式配置 + Twig，不允许执行任意 PHP，因此模板内容属于不可信输入边界内。
+- 数据流追踪：第 15 行存入只读属性 → 第 23 行 `compile()` 被编译器调用 → **第 27 行** `$this->flag` 通过字符串拼接传入 `$compiler->raw()`，被原样写入编译生成的 PHP 缓存文件。成功到达危险 sink（代码生成点）。
+- 排除其他参数：第 16 行 `$body` 经第 28 行 `subcompile()` 走 Twig 正常编译管线，不产生越权代码；第 17/18 行 `$line/$tag` 为整数与内部标签名，未参与第 27 行的拼接，均非注入通道。
+
+### 步骤 2｜验证防御有效性
+
+- **第 27 行**是唯一 sink：`->raw('\Shopware\...\Feature::callSilentIfInactive(\'' . $this->flag . '\', function () use(&$context) { ')`。`$flag` 被直接嵌进生成代码的单引号字符串字面量中，**全程零防御**：
+  - 无已知 feature flag 的白名单精确匹配；
+  - 无引号/反斜杠转义（未使用 `Compiler::repr()` 等安全序列化方法）；
+  - 无任何黑名单或过滤（即便有也属可绕过方案）。
+- 攻击验证：flag 含一个单引号即可提前闭合字符串字面量，其后的内容成为编译产物中的裸 PHP 语句（例如 flag 为 `x');/*payload*/('` 形态），编译缓存每次渲染都会执行，实现任意代码执行。该条 source→sink 流没有任何有效防御覆盖。
+
+### 步骤 3｜第二入口 / 替代通道检查
+
+- 本文件中 `raw()` 出现于第 27 行和第 29 行：第 29 行为固定字面量 `'});'`，不含变量；第 27 行是唯一拼接外部数据的写码点。
+- 不存在第二条净化路径：TokenParser 层提取的字符串未经校验即传入构造函数（第 14–21 行仅做赋值），compile 阶段也无中间校验，故替代通道不存在，所有流汇聚到同一未防护 sink。
+
+### 步骤 4｜结论
+
+构成 **CWE-1336（模板引擎特殊元素未正确中和）**：模板级参数逃逸出字符串上下文变为任意 PHP 代码，随编译产物持久化并在每次请求渲染时执行，等效 RCE。触发者可为仅拥有模板/App 投放能力的低权限方，后果为服务器完全接管，风险等级 **Critical**。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Template Injection", "risk_level": "Critical", "source": "line 15: __construct 的 string $flag 参数（Twig 标签 sw_silent_feature_call 的模板实参，可由第三方 App/主题或租户管理员提供的模板控制）", "sink": "line 27: $compiler->raw() 将 $this->flag 以单引号包裹原样拼接进编译生成的 PHP 代码", "explanation": "模板中的 flag 字符串 -> 第 15 行存入属性 -> 第 27 行未做白名单校验、未做引号转义，直接拼入 raw() 写出的 PHP 单引号字面量 -> 注入单引号即可闭合字符串并附加任意 PHP 语句 -> 编译缓存在每次模板渲染时执行，形成持久化任意代码执行", "fix_suggestion": "line 27: 取消 raw 拼接，改为链式安全输出：先 raw('...callSilentIfInactive(')，再 repr($this->flag)，再 raw(', function () use(&$context) { ')，由 repr 对引号和特殊字符完成转义"}
+```

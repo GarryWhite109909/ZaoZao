@@ -1,0 +1,27 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点并追踪数据流**
+
+本文件是 Jinja 过滤器注册模块，自身无 HTTP 入口，但其产物直接决定模板渲染安全性。用户可控输入点：
+- (a) **用户上传的 docx 模板中的 Jinja 表达式**：这些内容由第 100–103 行 `get_jinja_env()` 返回的环境编译执行；
+- (b) 渲染上下文中的变量值，流入各过滤器参数 `value`（第 17、28、39、50、56、62 行）与 `image` 的参数（第 67 行）。
+
+追踪结果：日期类流的路径为 `value -> 第 24/35/46 行 parse_string -> 第 25/36/47 行 babel format_*`，均为格式化 API，非 eval/exec 类危险 sink；文件内也不存在 execute/system/open 调用。真正的高危流是：**用户模板文本 -> 第 101 行构建的模板引擎 -> 表达式被当作 Python 代码求值**。
+
+**步骤 2｜逐条验证防御有效性**
+
+- 日期/空串/Listing 过滤器（第 13–14、50–53、56–59、62–63 行）：下游为 babel/dateutil 解析格式化函数，不解释代码，安全。
+- `image` 过滤器：第 80 行 `imghdr.what(img) not in ['png','jpg','jpeg']` 为精确允许集校验，第 85 行 `InlineImage` 仅嵌入图片对象，无代码执行面，安全。
+- **模板内容流：无任何有效防御**。第 9 行导入的是普通 `jinja2.Environment` 而非 `jinja2.sandbox.SandboxedEnvironment`；第 101 行据此构建了**非沙箱**环境。用户在模板中写入形如 `{{ ''.__class__.__mro__[1].__subclasses__() }}` 的载荷即可沿 dunder 链触达任意类并执行系统命令。整条流上没有沙箱、没有白名单、没有转义可阻断。
+
+**步骤 3｜第二入口/替代通道检查**
+
+第 102 行把全部自定义过滤器注册进同一个非沙箱环境，第 103 行将其返回给任意调用方；因此凡是通过 `get_jinja_env()` 渲染用户模板的路由（模板上传、文档生成等）都是等效攻击通道。docx 模板的 document.xml 中嵌入 Jinja 标签即可触发，无需额外参数；`settings.DOCXTEMPLATE_JINJA_EXTENSIONS` 加载扩展只会进一步扩大可达语法面，但即使默认配置下沙箱缺失已足以 RCE。
+
+**步骤 4｜结论**
+
+存在漏洞：CWE-1336 服务端模板注入（SSTI）导致远程代码执行。根因是第 101 行使用非沙箱 Environment 渲染用户可控模板内容，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Server-Side Template Injection (SSTI)", "risk_level": "Critical", "source": "line 101: 外部用户上传 docx 模板中的 Jinja 表达式内容（由 get_jinja_env 返回的环境渲染）", "sink": "line 101: Environment(extensions=...) 构建非沙箱 Jinja2 环境，用户模板表达式被编译为 Python 代码执行", "explanation": "用户可控模板内容 -> line 100-103 get_jinja_env 返回的非沙箱 Environment -> 模板内 {{ }} 表达式获得完整 Python 属性访问能力（如 __class__.__mro__ 链）-> SSTI/RCE；line 9 仅导入普通 Environment 而非 SandboxedEnvironment，全链路无沙箱/白名单/转义等有效防御；line 102 注册的过滤器共用同一环境，所有渲染路由均为等效攻击通道", "fix_suggestion": "line 101: 将 Environment 替换为 jinja2.sandbox.SandboxedEnvironment 以启用沙箱限制模板内属性访问"}
+```

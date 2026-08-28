@@ -1,0 +1,109 @@
+LANG: go
+```code
+# === file: internal/tunnel/session.go ===
+package tunnel
+
+import (
+	"encoding/json"
+	"io"
+	"net"
+)
+
+// RequestMessage is decoded straight from the public relay socket.
+type RequestMessage struct {
+	RequestID  string              `json:"id"`
+	Method     string              `json:"method"`
+	Path       string              `json:"path"`
+	Query      string              `json:"query"`
+	Headers    map[string][]string `json:"headers"`
+	BodyBase64 string              `json:"body"`
+}
+
+// ReadRequest reads one framed message off the wire and returns it
+// with every field, including Path, completely unvalidated.
+func ReadRequest(conn net.Conn) (RequestMessage, error) {
+	var msg RequestMessage
+	data, err := io.ReadAll(io.LimitReader(conn, 1<<20))
+	if err != nil {
+		return msg, err
+	}
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return msg, err
+	}
+	return msg, nil
+}
+
+# === file: internal/tunnel/dispatch.go ===
+package tunnel
+
+import (
+	"strings"
+
+	"openhole/internal/local"
+)
+
+// HandleFrame is the only dispatcher wired to the public relay.
+func HandleFrame(conn net.Conn, host string, port int) error {
+	req, err := ReadRequest(conn)
+	if err != nil {
+		return err
+	}
+	// Looks defensive but is only a literal-substring blacklist:
+	// %2e%2e%2f, .%2e/ and mixed encodings pass through unchanged.
+	req.Path = strings.ReplaceAll(req.Path, "..", "")
+	req.Query = strings.TrimSpace(req.Query)
+	return local.ForwardToLocal(req, host, port)
+}
+
+# === file: internal/local/forward.go ===
+package local
+
+import (
+	"bytes"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"openhole/internal/tunnel"
+)
+
+const maxBodyBytes = 10 * 1024 * 1024
+
+// ForwardToLocal concatenates req.Path into the upstream URL and fires
+// the request. No path canonicalization happens anywhere downstream.
+func ForwardToLocal(req tunnel.RequestMessage, host string, port int) error {
+	target := fmt.Sprintf("http://%s:%d%s", host, port, req.Path)
+	if req.Query != "" {
+		target += "?" + req.Query
+	}
+	body, _ := base64.StdEncoding.DecodeString(req.BodyBase64)
+	httpReq, err := http.NewRequest(req.Method, target, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	hc := &http.Client{Timeout: 30 * time.Second}
+	resp, err := hc.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
+	return nil
+}
+```
+
+1. **外部输入点枚举与可达性**：session.go L23 从公网 `net.Conn` 读取原始字节，L27 `json.Unmarshal` 将其直接映射为 `msg.Path`(L13)、`msg.Query`(L14)、`msg.Headers`(L15)、`msg.BodyBase64`(L16)，全部攻击者可控且零校验返回；dispatch.go L11 调用 `ReadRequest` 后将同一结构体于 L19 传入 `local.ForwardToLocal`，forward.go L18 接收并在 L19/L24/L29 消费——source 到 sink 跨文件可达。
+
+2. **数据流逐一验证**：流A（主链）session.go L27 `msg.Path` → dispatch.go L17 `strings.ReplaceAll(req.Path,"..","")` → forward.go L19 `Sprintf` 拼接 URL → L24 `NewRequest` → L29 `hc.Do` 发出；L17 属字面子串替换黑名单，`%2e%2e%2f`、`.%2e/` 等编码形式原样通过并在目标服务解码为 `../`，按规则视为可绕过、非有效防御，且全链无路径规范化或白名单。流B：session.go L14 `Query` → dispatch.go L18 仅 `TrimSpace` → forward.go L21 直接拼入 target 尾部，可携带编码穿越段，同样无防御。流C：`BodyBase64` 于 forward.go L23 解码入请求体，原始代码的 10MB 上限校验在拆分重组中被丢弃。
+
+3. **中间文件定性**：dispatch.go 的过滤看似存在实则不完整——只处理字面 `..`，对编码变体和 Query 通道均失效，属装饰性净化；调用链上不存在任何位置的有效防御。
+
+4. **第二入口与替代通道**：`ReadRequest` 与 `ForwardToLocal` 均为导出函数，任何新增 handler 复用即继承漏洞；`Query` 是已达同一 sink 的替代参数通道；当前项目无其他路由能绕过或补足该缺失防御。
+
+5. **结论**：source(session.go) 与 sink(forward.go) 分离在不同文件，中间仅有无效黑名单过滤，CWE-22 路径穿越成立，风险 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22", "risk_level": "High", "source": "L1:line 27: json.Unmarshal 将公网连接字节反序列化进 msg.Path 等字段，攻击者完全可控", "sink": "L3:line 24: http.NewRequest 使用拼接了未验证 req.Path 的 target 构造请求并于 line 29 由 hc.Do 发出", "explanation": "流A主链: L1:line 27 反序列化得到攻击者可控 Path 经 L2:line 17 ReplaceAll 仅删除字面 .. 属黑名单式字符串替换, 可被 %2e%2e%2f 或 .%2e/ 编码绕过, 随后在 L3:line 19 被 Sprintf 拼入上游 URL, line 24 构造请求, line 29 实际发出, 可穿透至本机任意敏感路径如 /debug/pprof 或管理接口; 流B: L1:line 14 的 Query 经 L2:line 18 仅 TrimSpace 后于 L3:line 21 直接拼入 URL, 是到达同一 sink 的替代通道且同样无防御; 流C: BodyBase64 于 L3:line 23 解码进入请求体, 原始 10MB 大小上限校验在拆分中丢失; 防御分析: 全链唯一过滤位于 L2:line 17 且为可绕过的子串替换黑名单, 无解码后复检、无路径规范化、无白名单前缀校验, 不构成有效防御; 第二入口: ReadRequest 与 ForwardToLocal 均为导出函数, 任何新增 handler 复用即继承漏洞, 当前虽只有 HandleFrame 一个调用方, 但 Query 通道已可达同一 sink; 结论: source 与 sink 分处不同文件且调用链上无完整防御, CWE-22 成立", "fix_suggestion": "line 19: 拼接前先经 url.Parse 并对 req.Path 做 path.Clean 规范化, 拒绝包含 .. 段及编码穿越变体的路径, 再以白名单前缀校验后才允许构造请求"}
+```

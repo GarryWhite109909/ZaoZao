@@ -1,0 +1,25 @@
+## 漏洞分析报告
+
+**步骤 1｜用户可控输入点枚举与追踪**
+- 输入点 A：第 41 行构造函数参数 `$values`（Bazar 表单定义数组，可由有表单编辑权限的用户填写并持久化）。第 47 行取 `FIELD_LABEL` 写入 `$this->label`，第 53 行取 `FIELD_HINT` 写入 `$this->hint`——两者均为用户可控且可存储的污染源。
+- 输入点 B：第 192 行 `getValue` 中 `$_REQUEST[$this->propertyName]` 直接回退读取请求数据（代码内 TODO 注释亦承认此风险），作为 `value` 传入模板。
+- 追踪路径：label/hint 存于对象属性并经 getLabel/getHint 暴露；`renderStatic`（第 168 行）与 `renderInput`（第 177 行）调用 `render()`，第 231 行将含 label/hint 的完整 `$this` 以 `field` 键合并进模板数据，最终在第 234 行 `TemplateEngine->render` 执行模板输出。
+
+**步骤 2｜防御有效性验证（source→sink 逐条核查）**
+- 第 47 行对 label 施加的 `html_entity_decode()` **不是防御而是反向操作**：它把 `&lt;script&gt;` 等已编码实体还原为可执行的 `<script>`，主动把上游可能存在的编码防御拆掉；
+- 第 53 行 hint 完全未经过任何净化处理；
+- 入口处的 `canRead`/`canEdit`（第 214/225 行）仅是 ACL 授权判断，不产生任何输出编码效果，无法覆盖该流；
+- 依据背景信息，下游 `@bazar/inputs/*.twig` 与 `@bazar/fields/*.twig` 在属性上下文及标签体上下文对 `field.label`/`field.hint` 应用了 `|raw('html')`，显式关闭 Twig 自动转义——框架级防护被主动绕过。整条数据流上不存在任何有效编码/白名单防御。
+
+**步骤 3｜第二入口与替代通道核查**
+- 通道一：`renderStaticIfPermitted`（第 108 行）→ fields 模板，展示视图渲染 label/hint；
+- 通道二：`renderInputIfPermitted`（第 119 行）→ inputs 模板，编辑视图在 placeholder 等属性上下文渲染 label/hint；
+- 通道三：`jsonSerialize`（第 300 行起）将 label/hint 原样序列化对外输出。
+- 三条通道共享第 231 行这一数据注入点；payload 随表单定义持久化，任意一次表单渲染（所有子类字段均继承本类）都会触发，构成存储型 XSS，无法通过封堵单一入口消除。
+
+**步骤 4｜结论**
+用户可控的表单定义 label/hint → 第 47 行仅被反向解码/第 53 行无处理 → 存储于字段对象 → 第 231 行注入模板 → 模板以 `|raw` 原样输出 → 存储型 XSS（CWE-79）。能编辑表单定义的攻击者可植入脚本窃取查看表单的管理员会话，判定为高危漏洞。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-Site Scripting (Stored XSS)", "risk_level": "High", "source": "line 47: $values[self::FIELD_LABEL]（line 53: $values[self::FIELD_HINT] 同理），来自用户可控且可持久化的表单定义", "sink": "line 234: TemplateEngine->render（数据经 line 231 注入 field 对象，模板对 field.label/field.hint 应用 |raw 原样输出）", "explanation": "用户可控表单定义 label/hint -> line 47 仅做 html_entity_decode 反向解码、line 53 无任何处理 -> 存储于字段对象 -> line 168/177 渲染时经 line 231 注入模板数据 -> 下游 inputs/fields 模板用 |raw 关闭 Twig 自动转义并原样输出到属性上下文与标签体上下文 -> 存储型 XSS", "fix_suggestion": "line 47: 移除 html_entity_decode() 直接保留原值，并同步删除模板中 field.label/field.hint 处的 |raw 过滤器、改用 Twig 默认自动转义"}
+```

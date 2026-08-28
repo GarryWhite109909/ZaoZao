@@ -1,0 +1,99 @@
+LANG: php
+```code
+# === file: app/Http/CacheController.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Http;
+
+use App\Cache\CacheStorage;
+use App\Service\WidgetRenderer;
+use Psr\Http\Message\ServerRequestInterface;
+
+class CacheController
+{
+    public function __construct(private CacheStorage $storage, private WidgetRenderer $renderer) {}
+
+    // POST /admin/cache/write  表单字段: key / value —— 外部输入点1
+    public function writeAction(ServerRequestInterface $request): void
+    {
+        $key = (string)($request->getParsedBody()['key'] ?? '');
+        $value = (string)($request->getParsedBody()['value'] ?? '');
+        // 看似净化：strip_tags 只剥离HTML标签，PHP序列化载荷不含标签可原样通过
+        $value = strip_tags($value);
+        $this->storage->set($key, $value);
+    }
+
+    // GET /admin/cache/widget?key=... —— 外部输入点2（触发反序列化的第二入口）
+    public function widgetAction(ServerRequestInterface $request): mixed
+    {
+        $key = (string)($request->getQueryParams()['key'] ?? '');
+        return $this->renderer->render($key);
+    }
+}
+# === file: app/Cache/CacheStorage.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Cache;
+
+use App\Cache\Backend\DatabaseBackend;
+
+/** 缓存存取封装：写入时序列化，读取时只回传原始字符串（纯传递层） */
+class CacheStorage
+{
+    public function __construct(private DatabaseBackend $backend) {}
+
+    public function set(string $entryIdentifier, mixed $data): void
+    {
+        // 仅校验键名字符集，对缓存值本身无任何约束（防御面不完整）
+        if (!preg_match('/^[A-Za-z0-9_.-]{1,250}$/', $entryIdentifier)) {
+            throw new \InvalidArgumentException('invalid cache identifier');
+        }
+        $this->backend->store($entryIdentifier, serialize($data));
+    }
+
+    public function getRaw(string $entryIdentifier): string|false
+    {
+        return $this->backend->fetch($entryIdentifier);
+    }
+}
+# === file: app/Service/WidgetRenderer.php ===
+<?php
+declare(strict_types=1);
+
+namespace App\Service;
+
+use App\Cache\CacheStorage;
+
+/** 从缓存读取小部件配置并还原为对象图 */
+class WidgetRenderer
+{
+    private const DEFAULT_KEY = 'widget.default';
+
+    public function __construct(private CacheStorage $storage) {}
+
+    public function render(string $requestedKey): mixed
+    {
+        $key = $requestedKey !== '' ? $requestedKey : self::DEFAULT_KEY;
+        $raw = $this->storage->getRaw($key);
+        if ($raw === false || $raw === '') {
+            return null;
+        }
+        // 未传 allowed_classes 白名单，攻击者预置的序列化对象在此被完整还原
+        return unserialize($raw);
+    }
+}
+```
+
+1. 【输入点枚举与可达性】共两个外部输入点：①app/Http/CacheController.php L17-L18，POST /admin/cache/write 的表单字段 key 与 value，经 L21 进入 CacheStorage::set 持久化到 DatabaseBackend，为反序列化提供数据源，可达；②同文件 L27，GET /admin/cache/widget 的查询参数 key，经 L28 直接决定 WidgetRenderer 中待反序列化的条目，可达。除这两个路由外无其他入口文件。
+
+2. 【逐流防御验证】流A（投毒）：L1:18 value → L1:20 strip_tags（黑名单式标签剥离，形如 O:8:... 的序列化载荷不含任何 HTML 标签，原样绕过）→ L1:21 → L2:13 set，L2:16 正则仅校验键名字符集、完全不覆盖缓存值，L2:19 serialize 后入库，防御无效；流B（触发）：L1:27 key → L1:28 → L3:18 getRaw → L2:22-24 纯透传、无任何过滤 → L3:23 unserialize 且未提供 allowed_classes 白名单，链上亦无 HMAC/签名完整性校验，两处检查（L1:20 黑名单过滤、L2:16 部分正则）位置在链路两端但覆盖面均不含载荷内容，属可绕过防御，非有效防御。
+
+3. 【第二入口与替代通道】存在明确第二入口：GET /admin/cache/widget 的 key 参数（L1:27）独立控制反序列化目标；即使请求不带 key，L3:17 回落到 L3:11 的默认条目 widget.default 仍会触发反序列化。替代通道：任何其他向同一 DatabaseBackend 写入的组件或共享缓存被污染的场景，均可绕过 writeAction 直达 L3:23 的 sink，说明根因在于 sink 自身缺少类白名单与完整性校验，而非某一条路径的偶然缺失。
+
+4. 【结论】两流在数据库后端汇合：攻击者先经流A植入任意序列化对象，再经流B（或默认键、或其他写入方污染的条目）触发还原，形成完整 CWE-502 PHP 对象注入链，配合框架内 POP 链可致远程代码执行，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502 反序列化不可信数据（PHP对象注入）", "risk_level": "Critical", "source": "L1:line 18: CacheController::writeAction 读取的 POST 表单字段 value（辅以 line 17 的 key）", "sink": "L3:line 23: WidgetRenderer::render 中的 unserialize($raw)", "explanation": "流A投毒链: L1:line18 value 经 L1:line20 strip_tags（黑名单式标签剥离，序列化载荷不含HTML标签故完全绕过）与 L1:line21 传入 L2:line13 set，L2:line16 正则仅覆盖键名字符集而不覆盖缓存值，L2:line19 serialize 后持久化进 DatabaseBackend，攻击者由此控制缓存内容; 流B触发链: L1:line27 查询参数 key 经 L1:line28 进入 L3:line17 选定条目，L3:line18 调用 L2:line22 getRaw 在 L2:line24 原样透传返回，最终 L3:line23 unserialize 未提供 allowed_classes 白名单，全链无签名或类白名单，构成 CWE-502; 防御核验: 三处检查（L1:line20 标签剥离属黑名单过滤、L2:line16 键名正则覆盖面不含值、L3:line19 仅空值判断）均可绕过，非有效防御; 第二入口与替代通道: 存在第二入口即 GET /admin/cache/widget 的 key 参数（L1:line27），缺省回落 L3:line11 的 widget.default 条目仍触发反序列化，且任何其他向同一 DatabaseBackend 写入的组件或共享缓存污染均可直达 sink，证明根因是 sink 缺少 allowed_classes 与完整性校验而非单一路径问题", "fix_suggestion": "line 23: 改为 unserialize($raw, ['allowed_classes' => false])，并在 L2:line19 写入时附带 HMAC 签名、读取时先验签再反序列化"}
+```

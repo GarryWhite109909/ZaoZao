@@ -1,23 +1,28 @@
-**步骤 1：枚举用户可控输入点并追踪数据流**
+## 漏洞分析
 
-- 第 100 行 `VerifyScratchToken(token)`：token 为用户输入，流向第 103 行 `HashToken`（pbkdf2 哈希）与第 104 行 `subtle.ConstantTimeCompare`，均为密码学比较 sink，无注入面。
-- 第 112 行 `SetSecret(secretString)`：经 AesEncrypt 后 base64 存库，不进入 SQL/命令语法层。
-- 第 118 行 `ValidateTOTP(passcode)`：passcode 传入 `totp.Validate`（第 127 行），为验证函数参数，非危险 sink。
-- 第 152 行 `GetTwoFactorByUID(uid)`、第 160 行 `HasTwoFactorByUID(uid)`：uid 流入 xorm 的 `Where("uid=?", uid)`，占位符参数化绑定。
-- 第 166 行 `DeleteTwoFactorByID(id, userID)`：`ID(id).Delete(&TwoFactor{UID: userID})`，xorm ID()/结构体条件均为参数化构造。
+**步骤 1｜枚举用户可控输入点并追踪数据流**
 
-**步骤 2：防御有效性验证**
+本文件是 Gitea 的认证模型层，无直接 HTTP 解析，但全部导出函数的标识符参数在路由层均由用户请求（路径/查询参数）透传而来：
+- 第 138 行 `GetTwoFactorByUID(ctx, uid)`：uid 用户可控 → 第 140 行到达 `db.GetEngine(ctx).Where(...).Get(twofa)`，按任意 uid 读出完整 TwoFactor 记录（含加密 Secret、ScratchSalt、ScratchHash）并在第 146 行返回；
+- 第 151 行 `HasTwoFactorByUID(ctx, uid)`：uid 可控 → 第 152 行 `Exist` 探测查询；
+- 第 156 行 `DeleteTwoFactorByID(ctx, id, userID)`：id/userID 可控 → 第 157 行 `Delete`；
+- 第 168 行 `HasTwoFactorOrWebAuthn(ctx, id)`：id 可控 → 第 169 行流入第 152 行、第 175 行 `HasWebAuthnRegistrationsByUID`。
 
-所有数据库访问均通过 xorm ORM 的占位符/结构体条件（第 153、161、167 行），不存在字符串拼接 SQL；无 eval/exec/system 类 sink。加密密钥来自 `setting.SecretKey`（配置项），非硬编码字面量凭证。scratch token 使用随机盐 + PBKDF2 + 恒定时间比较，无时序侧信道缺陷。
+**步骤 2｜逐条验证防御有效性**
 
-**步骤 3：第二入口检查**
+- 第 140/152 行的 `Where("uid=?", uid)` 为参数化绑定，只能防 SQL 注入，**不能替代授权检查**；
+- 第 138–147 行函数体内不存在任何“当前会话用户是否等于 uid / 是否管理员”的校验点，uid 参数与数据库敏感读取之间没有任何鉴权闸门，该条流完全未被防御覆盖；
+- 第 157–158 行的删除以 `UID: userID` 作为匹配条件，这只是数据范围限定而非授权判定，且 userID 本身未与会话身份比对，攻击者可同时伪造二者；
+- 对照组：第 92 行使用 `subtle.ConstantTimeCompare` 常量时间比较、第 121 行 `totp.Validate` 均为验证逻辑且无注入面，不属于本漏洞路径。
 
-本文件为模型层代码，不含 HTTP 路由或 handler；背景所述的“组织标签读取端点未校验组织可见性”漏洞位于其他文件（web 路由层），不在本文件内。本文件内 `DeleteTwoFactorByID` 已通过 `UID: userID` 条件将删除限定在属主范围内，未见缺失授权的可达路径。
+**步骤 3｜第二入口/替代通道检查**
 
-**步骤 4：结论**
+存在多条平行通道：第 132 行 `UpdateTwoFactor` 仅按 `t.ID` 全列更新、无属主校验；第 168–175 行将同一可控 id 送入两个未鉴权查询（第 152、175 行）。结合背景信息（组织标签读取端点未校验组织可见性即可跨租户读取），说明“仅凭调用方提供的 ID 即执行数据库操作”的模式在该版本中于上游路由层普遍缺少中间件级授权拦截，替代通道成立。
 
-本文件内不存在用户可控输入到达危险 sink 的数据流，亦无硬编码凭证；背景提示的 CWE-862 问题不体现在此代码中，不能捏造不存在的 sink。
+**步骤 4｜结论**
+
+uid/id 自调用方一路透传至数据库敏感读写，中间无任何有效授权防御（参数化≠鉴权），构成 CWE-862 缺失授权的水平越权：低权限用户可探测并读取任意用户/私有组织的受限数据。风险等级 **High**。
 
 ```json
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "uid/id/userID -> xorm Where 占位符与结构体条件 -> 参数化查询不进入 SQL 语法层; token/passcode -> pbkdf2/totp.Validate -> 密码学验证非危险 sink; 密钥来自 setting.SecretKey 配置而非硬编码; 本文件为模型层, 无路由入口, 背景所述 CWE-862 端点不在本文件内", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-862 Missing Authorization", "risk_level": "High", "source": "line 138: GetTwoFactorByUID(ctx, uid) 的 uid 参数（路由层来自用户请求）", "sink": "line 140: db.GetEngine(ctx).Where(`uid=?`, uid).Get(twofa) 未鉴权读取并返回他人 TwoFactor 记录", "explanation": "uid 由调用方/请求透传 -> 函数内无归属或管理员校验 -> line 140 直接按 uid 返回任意用户的 TwoFactor 记录（含加密 Secret、ScratchSalt、ScratchHash）-> 参数化绑定仅防注入不防越权，构成缺失授权的水平越权读取；line 152、168-175、132 为同类替代通道，与背景中私有组织标签未授权读取同源", "fix_suggestion": "line 138: 在函数体开头增加执行者校验——当前会话用户必须等于 uid 或具备管理员权限，校验失败即返回权限拒绝错误后再继续查询"}
 ```

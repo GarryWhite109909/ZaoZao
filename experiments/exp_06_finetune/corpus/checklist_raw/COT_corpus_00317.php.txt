@@ -1,0 +1,39 @@
+## 漏洞分析报告
+
+**目标文件**：`Shopware/Core/Framework/Context.php`（标注 CWE-1336）
+
+### 步骤 1｜枚举用户可控输入点
+
+本文件是框架核心类，文件内没有直接的 HTTP 超全局变量入口（无 `$_GET`/`$_POST`/Request 对象）。但根据背景说明，该类的实例（第 18 行 `class Context extends Struct`）作为 `context` 变量被注入到几乎任意 Twig 模板中，因此实际攻击面是：**能够写入/注入 Twig 模板内容的攻击者**（低权限管理员、应用/邮件模板编辑者等）在模板渲染期对该对象发起的方法调用。可控入口包括：
+
+- 第 151 行 `public function scope(string $scope, callable $callback)` —— `$scope` 字符串与回调完全由调用方控制；
+- 第 190 行 `public function isAllowed(string $privilege): bool` —— 权限判定入口；
+- 第 202 行 `setRuleIds`、第 185 行 `setTaxState`、第 255 行 `setRounding`、第 175 行 `setConsiderInheritance` —— 安全相关状态写入口。
+
+### 步骤 2｜追踪 source→sink 数据流
+
+- **流 A（作用域篡改）**：模板内攻击代码 → 调用 `context.scope('system', ...)`（第 151 行）→ 第 154 行 `$this->scope = $scope;` **直接赋值**。第 22–24 行虽然定义了 `SYSTEM_SCOPE`/`USER_SCOPE`/`CRUD_API_SCOPE` 三个合法常量，但赋值前没有任何白名单比对，任意字符串（包括 `'system'`）均被接受；回调在第 157 行 `$result = $callback($this);` 执行期间，所有依赖 `getScope()` 的作用域检查均被欺骗。
+- **流 B（权限判定默认放行）**：第 190–197 行 `isAllowed` 中，仅当第 192 行 `$this->source instanceof AdminApiSource` 成立时才做真实鉴权；否则第 196 行无条件 `return true`，形成默认放行兜底。
+
+两条流叠加：获得模板执行立足点的攻击者可临时把上下文切到系统作用域，并让所有 `isAllowed` 判定通过——这正是模板引擎对未净化/未受限对象能力的暴露（CWE-1336），使普通模板注入立足点升级为完整权限绕过链。
+
+### 步骤 3｜防御有效性验证
+
+- 第 58 行 `if ($source instanceof SystemSource)` 只在构造时生效一次，无法覆盖运行期的 scope 切换；
+- 第 204–206 行 `rulesLocked` 锁只保护 `setRuleIds`，完全不覆盖 `scope()`/`isAllowed()`；
+- 第 208 行 `array_filter(array_values($ruleIds))` 仅清洗规则 ID 数组，与作用域无关；
+- 文件内不存在任何针对 Twig 暴露面的方法白名单、沙箱限制或序列化排除（第 37 行 `#[Ignore]` 只作用于 `$extensions` 属性）。
+
+结论：流 A、流 B 均**无有效防御覆盖**。
+
+### 步骤 4｜第二入口/替代通道
+
+存在多条等效通道：第 218 行 `enableInheritance(callable $function)` 与第 235 行 `disableInheritance(callable $function)` 同样接受任意回调并在执行期间篡改继承状态（第 221/238 行直接写 `$this->considerInheritance`）；第 185/255 行 setter 可在模板内改写影响计价与税额判定的状态。任一通道都可配合模板注入完成提权，文件内不存在补偿性控制。
+
+### 步骤 5｜结论
+
+Context 对象整体暴露给 Twig 模板引擎，且其上保留了「无白名单的作用域切换原语」（第 154 行）与「非管理员来源默认放行」（第 196 行）两个特权能力，构成 CWE-1336（Improper Neutralization of Special Elements Used in a Template Engine）：模板注入立足点可直接升级为权限绕过/SSTI 完整利用链。风险等级：**High**。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Template Injection", "risk_level": "High", "source": "line 151: 攻击者可控的 Twig 模板代码调用 context.scope(string $scope, callable $callback)", "sink": "line 154: $this->scope = $scope 无白名单赋值（配合 line 196 isAllowed 默认 return true）", "explanation": "攻击者注入的模板代码 -> 全局注入 Twig 的 context 对象 -> scope() 接受任意作用域串且第 154 行直接赋值无白名单校验 -> 回调执行期间伪装 system 作用域 -> isAllowed 对非 AdminApiSource 在第 196 行无条件放行 -> 权限绕过/SSTI 升级链", "fix_suggestion": "line 154: 对 $scope 增加白名单校验（仅允许第 22-24 行的 SYSTEM_SCOPE/USER_SCOPE/CRUD_API_SCOPE，否则抛 InvalidArgumentException），并在模板引擎侧禁止暴露 scope/isAllowed 等特权方法"}
+```

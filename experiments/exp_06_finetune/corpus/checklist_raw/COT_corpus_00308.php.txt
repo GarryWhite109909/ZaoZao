@@ -1,0 +1,22 @@
+## 漏洞分析报告
+
+**步骤 1｜枚举用户可控输入点**
+本文件共有两类 HTTP 输入，出现在四个位置：
+- 第 33 行：`request()->query('type')`（`stats()` 入口）
+- 第 48 行：`request()->query('type')`（`viewStats()` 入口）
+- 第 63 行：`request()->query('type')`（`export()` 入口）
+- 第 65 行：`request()->query('type')` 与 `request()->query('format')` 再次被读取，拼接为下载文件名；同行传入 `new ReportingExport($stats)` 的 `$stats` 继承自第 63 行受控分派的结果。
+
+**步骤 2｜逐条数据流防御核验**
+- 流 A（type → 动态方法分派）：第 33/48/63 行将用户输入直接作为数组键写入 `{$this->typeFunctions[request()->query('type')]}` 并立即动态调用 `$this->reportingHelper->{...}()`。防御核验：全文件不存在 `in_array`/`array_key_exists` 等精确白名单校验，也无类型/格式校验；第 17 行 `$typeFunctions = []` 是空映射，传入值完全不受允许集约束，属于“无有效防御”，而非安全的静态白名单分派。
+- 流 B（type/format/stats → 导出渲染链路）：第 65 行未净化的 `type`、`format` 及受控分派产生的 `$stats` 进入 `Excel::download(new ReportingExport($stats), ...)`。`ReportingExport` 是经 Excel 门面触发的视图式导出对象，数据沿该链路到达模板引擎求值上下文；文件内无任何转义调用或框架自动防护覆盖此流。结合背景 PoC（请求 `?type={{7*7}}` 后响应中出现 49，证明花括号表达式被服务端模板引擎实际执行），确认构成 SSTI（CWE-1336），并可进一步导致代码/命令执行。
+
+**步骤 3｜第二入口与替代通道检查**
+`stats()`（第 31 行）、`viewStats()`（第 46 行）、`export()`（第 61 行）三个公开方法共用同一污染模式，任一路由均可作为触发通道；第 65 行的 `format` 参数是独立的第二可控输入点。本文件内看不到任何中间件级过滤或集中校验对该模式进行兜底，替代通道均未被防御覆盖。
+
+**步骤 4｜结论**
+用户可控的 `type`/`format` 未经任何有效净化即驱动动态方法分派并流入模板渲染型导出组件，模板引擎对注入的表达式完成求值（{{7*7}}→49），CWE-1336 服务端模板注入成立；因处于管理员路由需认证，综合评级为 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine (SSTI)", "risk_level": "High", "source": "line 33/48/63: request()->query('type')", "sink": "line 63-65: 动态方法调用与 Excel::download(new ReportingExport($stats)) 模板渲染导出", "explanation": "request()->query('type') -> 第33/48/63行未做白名单校验直接作为数组键动态调用 reportingHelper 方法 -> 受控分派结果 $stats 连同原始 type 于第65行进入 Excel::download(new ReportingExport(...)) 视图式导出链路 -> 模板引擎对未净化输入求值（PoC: type={{7*7}} 返回 49）-> SSTI 可致 RCE", "fix_suggestion": "line 33/48/63: 索引前增加精确白名单校验，如 abort_unless(array_key_exists(request()->query('type'), $this->typeFunctions), 404)，并在 line 65 对 format 限定允许扩展名"}
+```

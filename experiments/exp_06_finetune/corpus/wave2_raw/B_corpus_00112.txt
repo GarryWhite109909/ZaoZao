@@ -1,0 +1,99 @@
+LANG: php
+```code
+# === file: src/Controller/ImportController.php ===
+<?php
+
+namespace App\Controller;
+
+use App\Support\PayloadFilter;
+use App\Tool\Serialize;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
+
+final class ImportController
+{
+    // POST /admin/import/state   form field: state
+    public function importState(Request $request): Response
+    {
+        $raw = (string) $request->request->get('state', '');
+        if ($raw === '') {
+            return new Response('missing state', 400);
+        }
+
+        $filtered = PayloadFilter::stripDangerousClasses($raw);
+
+        $data = Serialize::unserialize($filtered);
+
+        return new Response('imported keys: ' . implode(',', array_keys((array) $data)));
+    }
+
+    // GET /admin/import/preview  query param: blob
+    public function previewBlob(Request $request): Response
+    {
+        $raw = (string) $request->query->get('blob', '');
+
+        return new Response(var_export(Serialize::unserialize(PayloadFilter::stripDangerousClasses($raw)), true));
+    }
+}
+# === file: src/Support/PayloadFilter.php ===
+<?php
+
+namespace App\Support;
+
+/**
+ * Legacy hardening layer kept from the old Tool\Serialize usage.
+ * Strips historically abused gadget class names out of a serialized
+ * payload before it is handed to the unserialize helper.
+ */
+final class PayloadFilter
+{
+    private const BLOCKED_CLASSES = [
+        'Pimcore\Model\Document\PageSnippet',
+        'Symfony\Component\Routing\Route',
+    ];
+
+    public static function stripDangerousClasses(string $payload): string
+    {
+        foreach (self::BLOCKED_CLASSES as $needle) {
+            $payload = str_replace($needle, '__stripped__', $payload);
+        }
+
+        return $payload;
+    }
+}
+# === file: src/Tool/Serialize.php ===
+<?php
+
+namespace App\Tool;
+
+final class Serialize
+{
+    public static function serialize(mixed $data): string
+    {
+        return serialize($data);
+    }
+
+    public static function unserialize(?string $data = null): mixed
+    {
+        if ($data) {
+            $data = unserialize($data);
+        }
+
+        return $data;
+    }
+}
+```
+
+分析（针对整组文件）：
+
+1. **输入点枚举与可达性**：全组仅有两个外部输入点——`src/Controller/ImportController.php` 第 15 行（POST /admin/import/state 的表单字段 `state`）和第 30 行（GET /admin/import/preview 的查询参数 `blob`）。流 A 沿第 20 行进入过滤、第 22 行传入工具类；流 B 在第 32 行内联过滤后直接传入；两者均可达 `src/Tool/Serialize.php` 第 15 行的原生 `unserialize($data)`，可达性成立。
+
+2. **逐流防御核验**：流 A 的唯一防御是 `src/Support/PayloadFilter.php` 第 17-24 行，本质是对第 12-15 行仅有的两个硬编码类名做 `str_replace` 的黑名单字符串替换——攻击者可改用名单外的任意 gadget 类、利用 PHP 类名大小写不敏感构造变体、或以嵌套序列化串规避匹配，按规则属可绕过过滤，不算有效防御；sink 侧（`src/Tool/Serialize.php` 第 14-16 行）调用 `unserialize` 未传 `allowed_classes` 选项，默认允许实例化任意类，第 14 行的 `if ($data)` 只是空串短路而非安全控制。流 B（第 32 行）复用同一黑名单，无任何附加校验，同样无效。
+
+3. **第二入口/替代通道**：存在。GET 路由 `previewBlob`（`src/Controller/ImportController.php` 第 28-33 行）是独立于主路由的第二 HTTP 入口，与主链汇聚到同一 sink；且 `Serialize::unserialize` 是公共静态工具方法，任何后续控制器或服务静态引入 `App\Tool\Serialize` 都会构成额外的间接调用通道，进一步扩大暴露面。
+
+4. **结论**：source 位于文件 1、sink 位于文件 3，中间文件 2 的净化看似发生实则只是不完整的字符串黑名单，污点经返回值跨文件无阻断传播，整条调用链上不存在白名单、签名校验或 `allowed_classes=false` 等任一完整防御，语义与原单文件漏洞一致；在带 composer 自动加载的宿主环境中可构造 POP 链实现对象注入乃至远程代码执行。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502: Deserialization of Untrusted Data（PHP 对象注入）", "risk_level": "Critical", "source": "L1:line 15: POST /admin/import/state 表单字段 state 经 request->request->get 进入（第二入口为 L1:line 30 的 GET 查询参数 blob）", "sink": "L3:line 15: Serialize::unserialize 内调用的原生 unserialize($data)，未限制 allowed_classes", "explanation": "流A：L1:line 15 读取表单字段 state，line 20 传入 L2:line 17 的 stripDangerousClasses，该过滤仅为 str_replace 字符串替换黑名单（L2:line 12-15 仅两个硬编码类名），可经名单外 gadget 类、大小写变体或嵌套序列化串绕过，随后 L1:line 22 将结果传入 L3:line 15 的 unserialize 且未提供 allowed_classes 选项，默认允许实例化任意类；流B：L1:line 30 读取查询参数 blob，line 32 内联复用同一黑名单后直达同一 sink，绕过方式与流A相同；两条流的唯一防御均为可绕过的字符串替换过滤，L3:line 14 的空值判断仅为空串短路而非安全控制，调用链上不存在白名单、签名校验或 allowed_classes=false 等有效防御；第二入口确认存在：GET /admin/import/preview（L1:line 28-33）是独立 HTTP 通道汇聚至同一 sink，且 Serialize::unserialize 为公共静态工具方法，任何控制器或服务静态引入均可构成间接调用通道；综上 source 与 sink 分离于不同文件但污点经返回值无阻断传播，构成 CWE-502 反序列化对象注入，在存在 composer 自动加载的环境可升级为远程代码执行", "fix_suggestion": "line 15: 将 L3 的 unserialize($data) 改为 unserialize($data, ['allowed_classes' => false])，并移除对 L2 黑名单的虚假依赖；若需还原结构化数据应改用 json_decode 等无对象实例化的安全格式"}
+```

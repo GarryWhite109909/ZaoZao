@@ -1,0 +1,77 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+import json
+
+from core.pipeline import run_pipeline
+
+
+mispattributes = {'input': ['url'], 'output': ['text']}
+
+
+def handler(q=False):
+    if q is False:
+        return False
+    request = json.loads(q)
+    if request.get('raw_html'):
+        return run_pipeline(raw_html=request.get('raw_html'))
+    if request.get('url'):
+        url = request['url']
+        return run_pipeline(url=url)
+    return False
+
+
+def introspection():
+    return mispattributes
+# === file: core/pipeline.py ===
+from bs4 import BeautifulSoup
+from markdownify import markdownify
+
+from core.net_client import fetch_url
+
+
+# 看似拦截内网地址的黑名单：仅子串匹配，可被十进制IP/IPv6/DNS重绑定绕过
+BLOCKED_HOSTS = ('localhost', '127.0.0.1', '0.0.0.0', '169.254.169.254')
+
+
+def _looks_internal(url):
+    lowered = url.lower()
+    return any(host in lowered for host in BLOCKED_HOSTS)
+
+
+def run_pipeline(url=None, raw_html=None):
+    if raw_html:
+        html = raw_html
+    else:
+        if _looks_internal(url):
+            return {'error': 'blocked host'}
+        html = fetch_url(url)
+    html = strip_useless_tags(html)
+    markdown = markdownify(html, heading_style='ATX', strip=['a', 'img'])
+    return {'results': [{'types': ['text'], 'values': [str(markdown)]}]}
+
+
+def strip_useless_tags(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    for tag in soup.find_all(['script', 'head', 'header', 'footer', 'meta', 'link']):
+        tag.decompose()
+    return str(soup)
+# === file: core/net_client.py ===
+import requests
+
+
+def fetch_url(url):
+    # 无 scheme/IP 白名单校验，且跟随重定向，放大绕过面
+    r = requests.get(url, allow_redirects=True)
+    r.raise_for_status()
+    return r.text
+```
+
+1. 【输入点枚举与可达性】app/routes.py 第 11 行 `json.loads(q)` 将外部传入的整段 JSON 作为不可信输入解析，共枚举出两个输入点：第 12 行 `request.get('raw_html')` 与第 14-15 行 `request.get('url')`。其中第 15 行的 url 为攻击者完全可控字符串，第 16 行立即将其传入 `run_pipeline`，沿 core/pipeline.py 第 16 行形参进入处理链，最终可达 core/net_client.py 第 6 行的网络请求，可达性成立。
+2. 【主数据流防御验证】主链为 L1:15 → L1:16 → L2:16 → L2:20 → L2:22 → L3:6。链上唯一防线是 core/pipeline.py 第 8 行定义、第 13 行执行的 `BLOCKED_HOSTS` 黑名单：类型为子串包含匹配（黑名单），位置仅在中间层且只覆盖 url 分支；覆盖面上既不校验 scheme，也未做 IP 规范化（2130706433、0x7f000001、[::1] 等写法可直接绕过），也无法防 DNS 重绑定；且 core/net_client.py 第 6 行 `allow_redirects=True` 允许先访问外网域名再经 302 跳转抵达内网目标。黑名单属可绕过过滤，不构成有效防御，故主链 source 到 sink 之间无完整防护。
+3. 【第二入口与替代通道】存在明确第二入口：app/routes.py 第 12 行的 raw_html 分支完全绕过 `_looks_internal`（该校验只存在于第 20 行的 url 分支），携带的内容直接进入 core/pipeline.py 第 23-25 行的解析与转换管线；同时 handler 对 q 无任何来源认证、CSRF 令牌或会话校验，任何能向模块投递消息的客户端均可驱动服务端按其指定 URL 发起跨站请求。替代通道与弱防御共同支撑漏洞成立的结论。
+4. 【结论】拆分后 source（routes.py）与 sink（net_client.py）分离在不同文件，中间 pipeline.py 的黑名单看似净化实则不完整，调用链整体符合 CWE-352：服务端在无完整防御的情况下依据用户可控输入发起请求。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-352: 跨站请求伪造（用户可控URL经多层传递直达服务端网络请求，链上无可绕过性之外的完整防御）", "risk_level": "High", "source": "L1:line 15: handler 中从外部JSON提取的 request['url'] 攻击者完全可控字符串", "sink": "L3:line 6: requests.get(url, allow_redirects=True)", "explanation": "主数据流: L1:15 url=request['url'] 经 L1:16 传入 L2:16 run_pipeline, L2:20 调用的 _looks_internal 仅为 L2:8 四个字面量的黑名单子串匹配, 可用十进制IP 2130706433 或 0x7f000001 或 [::1] 或 DNS 重绑定绕过, 且 L3:6 allow_redirects=True 允许先访问外网再经 302 跳转内网, 黑名单属可绕过过滤不算有效防御, 因此 L1:15 到 L3:6 requests.get 全程无完整防御; 第二入口: L1:12 raw_html 分支完全绕过 _looks_internal(该检查仅存在于 L2:20 的 url 分支), 内容直接进入 L2:23-25 的解析转换管线; 另 handler 对 q 无来源认证或令牌校验, 任何客户端均可触发服务端按可控 URL 发起跨站请求", "fix_suggestion": "line 6: 在 net_client.fetch_url 内先用 urllib.parse 解析 scheme 与 hostname, 强制 https 并对解析出的全部地址做公网白名单校验, 同时设 allow_redirects=False 以阻断重定向绕过"}
+```

@@ -1,0 +1,22 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点并追踪数据流**
+- 输入点①：第 33 行 `CreateMCPService(ctx, service)` 的 `service` 参数由上层 HTTP handler 从请求体反序列化而来，其中 `StdioConfig.Command`、`StdioConfig.Args`（连同 EnvVars/URL/Headers/AuthConfig）完全用户可控；函数内除第 35-37 行给 AdvancedConfig 补默认值外无任何校验，第 43 行直接 `s.mcpServiceRepo.Create(ctx, service)` 持久化。
+- 输入点②：第 106 行 `UpdateMCPService(ctx, service)` 的 `service` 参数同样来自请求体；第 141-142 行只要 `service.StdioConfig != nil` 就原样覆盖 `existing.StdioConfig`，第 161 行持久化，全程无校验。
+- 危险操作边界：第 247-249 行把含污染 StdioConfig 的 service 封装进 `mcp.ClientConfig`，第 251 行 `mcp.NewMCPClient(config)` 创建客户端，第 263 行 `client.Connect(testCtx)` 对 stdio 传输类型即按 Command+Args 以子进程方式启动目标程序；本文件内虽无显式 exec 调用，但第 251/263 行与第 322/352 行 `s.mcpManager.GetOrCreateClient(service)` 所调用的 internal/mcp 客户端正是按 stdio_config.command/args 拉起子进程的位置（与背景描述一致）。
+
+**步骤 2｜逐条验证防御有效性**
+- 流①（Create→持久化→客户端执行）：第 33→43 行之间不存在针对 Command/Args 的白名单、路径限制或任何过滤；
+- 流②（Update→合并→持久化→客户端执行）：第 141-142 行无条件合并后，同样直达第 251/263 行或第 322/352 行的客户端创建/连接；
+- 文件中唯一的安全相关处理是第 187 行 `secutils.SanitizeForLog(existing.Name)`，仅净化日志输出防日志伪造，位于命令执行流之外；第 80 行 `MaskSensitiveData()` 只影响列表返回视图。二者均不覆盖上述污染流，故两条流都无有效防御。
+
+**步骤 3｜检查第二入口/替代通道**
+- 写入入口有两个：Create（第 33 行）与 Update（第 141-142 行），可先建后改绕过任何单点限制；
+- 执行触发点有三个：TestMCPService（第 251/263 行）、GetMCPServiceTools（第 322 行）、GetMCPServiceResources（第 352 行）；且 GetOrCreateClient 为惰性创建——即便不主动测试，只要查询工具/资源列表就会按需创建客户端并拉起进程，构成稳定的替代触发通道。
+
+**步骤 4｜结论**
+- 用户可控 `StdioConfig.Command/Args` -> 无校验持久化（第 43/161 行）-> 装入 ClientConfig 创建客户端（第 247-251 行）-> Connect/GetOrCreateClient 按 stdio 配置以子进程执行（第 263、322/352 行）。由于用户同时控制 argv[0] 与全部参数（可自行指定 sh 类解释器加任意参数），等价于完整的命令注入，认证用户即可达成服务器 RCE。属 CWE-77 命令注入（OS 层为 CWE-78），风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-77 Command Injection", "risk_level": "Critical", "source": "line 33: CreateMCPService 的 service 参数（StdioConfig.Command/Args 用户可控，另一写入入口为 line 141-142 的 UpdateMCPService 合并）", "sink": "line 251: mcp.NewMCPClient(config) 经 line 263: client.Connect 以 stdio 子进程执行 Command/Args；替代触发点 line 322/352: s.mcpManager.GetOrCreateClient(service)", "explanation": "请求体中的 StdioConfig.Command/Args -> 第 43/161 行无任何校验直接持久化 -> 第 247-251 行装入 ClientConfig 创建客户端 -> 第 263 行 Connect 或第 322/352 行 GetOrCreateClient 按 stdio 配置拉起子进程 -> 用户全控 argv[0] 与全部参数可注入任意命令获得服务器 RCE；文件内 SanitizeForLog 仅护日志、MaskSensitiveData 仅护返回视图，均不覆盖该流", "fix_suggestion": "line 141: 在 existing.StdioConfig = service.StdioConfig 前增加 Command/Args 白名单校验（仅允许预注册的可执行文件，拒绝解释器与任意路径），并在第 43 行 Create 持久化前做同样校验"}
+```

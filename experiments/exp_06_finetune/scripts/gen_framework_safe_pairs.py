@@ -130,7 +130,7 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     args = ap.parse_args()
 
-    key = os.environ.get("OPENROUTER_KEY", "")
+    key = (os.environ.get("TEACHER_KEY") or os.environ.get("OPENROUTER_KEY") or "")
     if not key:
         print("错误：需要 OPENROUTER_KEY", file=sys.stderr)
         sys.exit(1)

@@ -1,0 +1,105 @@
+LANG: javascript
+```code
+# === file: src/routes/tools.js ===
+// src/routes/tools.js
+import express from 'express';
+import { runTool } from '../service/runner.js';
+
+const router = express.Router();
+
+// Entry 1: GET query parameters drive a CLI tool invocation.
+router.get('/tools/run', async (req, res) => {
+  const mode = String(req.query.mode ?? '');
+  const target = String(req.query.target ?? '');
+  try {
+    const out = await runTool(mode, target);
+    res.json({ output: out });
+  } catch (err) {
+    res.status(500).json({ error: 'tool run failed' });
+  }
+});
+
+// Entry 2: POST JSON body reaches the same service.
+router.post('/tools/scan', async (req, res) => {
+  const mode = String(req.body?.mode ?? 'full');
+  const target = String(req.body?.target ?? '.');
+  const out = await runTool(mode, target);
+  res.json({ output: out });
+});
+
+export default router;
+# === file: src/security/shell_guard.js ===
+// src/security/shell_guard.js
+/**
+ * Compose escape, flag protection, and quoting functions to create a
+ * function used for escaping shell arguments (adapted from argguard).
+ */
+export function compose({ escapeFn, flagFn, quoteFn }) {
+  const escape = quoteFn
+    ? (arg) => quoteFn(escapeFn(arg))
+    : (arg) => escapeFn(arg);
+
+  if (!flagFn) {
+    return escape;
+  }
+
+  return (arg) => {
+    let [preFlag, , ...rest] = flagFn(arg);
+    while (rest.length > 0 && escapeFn(preFlag) === '') {
+      arg = rest.join('');
+      [preFlag, , ...rest] = rest;
+    }
+    return escape(arg);
+  };
+}
+
+// Split an argument into whitespace separated tokens for flag detection.
+const splitTokens = (arg) => arg.split(/\s+/);
+
+// Weak escaper: drops flag-shaped tokens, strips only ; & | characters.
+const escapeFn = (token) =>
+  /^-{1,2}[\w-]+$/.test(token) ? '' : token.replace(/[;&|]/g, '');
+
+// Factory used by the command service; no quoteFn is installed.
+export const buildShellGuard = () =>
+  compose({ escapeFn, flagFn: splitTokens });
+# === file: src/service/runner.js ===
+// src/service/runner.js
+import { exec } from 'child_process';
+import { buildShellGuard } from '../security/shell_guard.js';
+
+const guard = buildShellGuard();
+
+/**
+ * Run the bundled CLI tool with user supplied options.
+ * Arguments are passed through the shared shell guard first.
+ */
+export function runTool(mode, target) {
+  const safeMode = guard(mode);
+  const safeTarget = guard(target);
+  const cmd = `cli-tool --mode ${safeMode} --target ${safeTarget}`;
+  return new Promise((resolve, reject) => {
+    exec(cmd, { shell: '/bin/sh' }, (err, stdout, stderr) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(stdout || stderr);
+      }
+    });
+  });
+}
+```
+
+分析（针对整组文件）：
+
+1. 【输入点枚举与可达性】外部输入点共 4 个：src/routes/tools.js 第 9-10 行（GET /tools/run 的 req.query.mode/target）与第 21-22 行（POST /tools/scan 的 req.body.mode/target）。四者分别经 tools.js 第 12 行和第 23 行进入 runTool(mode, target)，在 src/service/runner.js 第 12-13 行被 guard 处理，第 14 行拼入模板字符串 cmd，最终在第 16 行 exec 执行——source 到 sink 全部可达。
+
+2. 【主链防御核验】主数据流：tools.js:10 target → runner.js:13 → shell_guard.js:16-21 的 flag 消费循环：当首个 token 匹配 shell_guard.js:30 的 `^-{1,2}[\w-]+$` 时 escapeFn 返回空串，触发循环用第 18 行 `rest.join('')` 把剩余攻击者输入重新拼接，随后仅经过第 30 行的黑名单字符串替换 `/[;&|]/g` 即返回。该防御属于黑名单+字符串替换（按规则视为可绕过）：覆盖面只有 3 个字符，反引号、`$()`、换行符等元字符原样放行；且 quoteFn 从未安装（shell_guard.js:33-34），不存在任何引用包裹层；净化位置在中间库而非 sink 前，形同虚设。例如输入 `--verbose \`id\`` 经循环重拼后输出仍含反引号，runner.js:14 拼接后在第 16 行被 /bin/sh 解释执行。
+
+3. 【其余流与第二入口】流 2：tools.js:9 的 req.query.mode 走完全相同路径（runner.js:12 → guard → exec）；流 3：第二入口 POST /tools/scan（tools.js:20-25）的 body.mode/target 经 tools.js:23 汇入同一 runTool。三个流向共用唯一的、可绕过的 shell_guard 净化，不存在第二条更严格的净化路径；除这两个路由外项目无其他调用方，但两个入口四个参数全部收敛到同一 sink，替代通道成立并强化结论。
+
+4. 【结论】调用链上唯一防御位于中间文件 shell_guard.js:30，属可绕过黑名单且伴随原 compose 组件的 flag 消费重拼缺陷；sink 处 runner.js:16 显式指定 `/bin/sh`，保证元字符被 shell 展开。无完整防御，CWE-78 成立；Web 直接可达的任意命令执行，风险 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78: OS Command Injection（shell 参数转义组合器依赖可绕过黑名单，flag 消费循环重拼用户输入后交由 exec 执行）", "risk_level": "Critical", "source": "L1:line 10: src/routes/tools.js 中 GET /tools/run 读取的 req.query.target", "sink": "L3:line 16: src/service/runner.js 中 exec(cmd, { shell: '/bin/sh' }) 执行拼接后的命令", "explanation": "流1(主链): L1:line 10 req.query.target 经 L1:line 12 runTool 传入 L3:line 13 guard, 进入 L2:line 16-21 的 flag 消费循环——当首 token 匹配 L2:line 30 正则时 escapeFn 返回空串触发循环, L2:line 18 用 rest.join 重拼剩余输入, 最终仅经 L2:line 30 黑名单替换 /[;&|]/g 返回, 反引号/$()/换行等元字符未被处理; 防御验证: 唯一防御是 L2:line 30 的黑名单加字符串替换, 属可绕过过滤, 位置在中间库而非 sink 前, 覆盖面仅 3 字符, 且 quoteFn 未安装(L2:line 33-34)导致无引用层, 不构成有效防御; 流2: L1:line 9 req.query.mode 走相同路径经 L3:line 12 到达同一 sink; 流3: 第二入口 POST /tools/scan(L1:line 20-25) 的 req.body.mode/target 经 L1:line 23 汇入同一 runTool; 三条流均无完整净化, sink 为 L3:line 16 在 /bin/sh 下执行 L3:line 14 拼接的命令, CWE-78 成立", "fix_suggestion": "line 14: 在 runner.js 移除字符串拼接, 改用 execFile('cli-tool', ['--mode', mode, '--target', target], { shell: false }) 以数组传参并禁用 shell, 同时废弃 L2 的黑名单式 guard"}
+```

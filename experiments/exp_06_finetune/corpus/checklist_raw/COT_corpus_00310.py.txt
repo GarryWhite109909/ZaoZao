@@ -1,0 +1,28 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点并追踪数据流**
+
+本模块是 LangChain 提示词模板的核心定义，所有对外入口的 `template` 参数均为外部可控的模板字符串：
+- `jinja2_formatter(template, ...)`（第 32 行）
+- `mustache_formatter(template, ...)`（第 111 行）
+- `validate_jinja2`（第 74 行）、`get_template_variables`（第 250 行）、`check_valid_template`（第 218 行）
+- 分发中心为第 206–210 行的 `DEFAULT_FORMATTER_MAPPING`，将模板按格式路由到 `formatter.format`（f-string，第 207 行）、`mustache.render`（第 121 行）、`jinja2_formatter`（第 209 行）。上层调用方（如由用户输入构造 `PromptTemplate`）会把不可信模板串传入这些入口。
+
+**步骤 2｜逐条验证 source→sink 防御有效性**
+
+- 流 A（jinja2）：template → 第 209 行映射 → 第 71 行 `SandboxedEnvironment().from_string(template).render(**kwargs)`。唯一防御是 jinja2 沙箱，但第 35–40 行与第 64–70 行注释**自认**沙箱仅为 best-effort、"not a guarantee of security"；jinja2 沙箱历史上多次被逃逸（如借助 `str.format` 的沙箱逃逸漏洞），沙箱内仍可遍历已暴露对象的属性链。作者文档级别的免责声明 + 已知可逃逸 ⇒ 不构成完整有效防御。
+- 流 B（f-string）：template → 第 207 行 `formatter.format` → Python `str.format` 语义原生支持 `{x.__class__.__mro__[...]}` 式属性/索引穿越；此处 formatter 仅校验多余/缺失参数，对模板特殊元素**零中和** ⇒ 完全无防御，正是"通过模板语法访问 Python 对象内部"的直接通道。
+- 流 C（mustache）：第 121 行 `mustache.render` 为逻辑无关模板，无表达式执行面，此通道本身相对安全。
+- 辅助校验函数（第 107 行 `env.parse`、第 268 行 `Formatter().parse`、第 140 行 `mustache.tokenize`）只提取变量名用于告警/schema 推导，既不渲染也不对后续渲染流做任何消毒，不能阻断流 A/B。
+
+**步骤 3｜第二入口与替代通道**
+
+存在多条并行通道：jinja2（第 209 行）、f-string（第 207 行）、mustache（第 208 行）；此外 `StringPromptTemplate.format_prompt`（第 300 行）与 `pretty_repr`（第 333 行）调用 `self.format(...)`，最终同样汇入 `DEFAULT_FORMATTER_MAPPING`。任一通道的 template 可控即可触达渲染 sink，无法靠单点封堵。
+
+**步骤 4｜结论**
+
+用户可控模板串未经有效中和即进入模板引擎渲染/格式化 sink：jinja2 沙箱被作者自述为非保证且可逃逸，f-string 通道完全裸奔，构成 CWE-1336 模板注入，攻击者可借模板语法访问 Python 对象内部（信息泄露，结合沙箱逃逸可升级为任意代码执行）。风险等级：High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 模板注入", "risk_level": "High", "source": "line 32: template 参数（外部可控模板串，经第206-210行 DEFAULT_FORMATTER_MAPPING 分发到各格式化通道）", "sink": "line 71: SandboxedEnvironment().from_string(template).render(**kwargs)；line 207: formatter.format（f-string 通道）", "explanation": "用户可控 template -> 各入口透传且中间解析函数（line 107/268/140）只提变量名不消毒 -> jinja2 通道到达 line 71 沙箱渲染，但代码注释自认沙箱仅 best-effort 非安全保证且存在已知逃逸 -> f-string 通道到达 line 207 走 str.format，支持属性/索引穿越且无任何特殊字符中和 -> 攻击者可用模板语法访问 Python 对象内部造成信息泄露，严重时可致代码执行", "fix_suggestion": "line 71: 渲染前对 template 实施白名单精确校验（仅允许预注册模板或纯占位符语法，拒绝含属性访问、双下划线等结构的模板），并将模板来源严格限定为可信配置而非用户输入"}
+```

@@ -1,0 +1,26 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点**
+- 第 56 行 `request('asset_id')`（create，仅用于 `Asset::find` 查询）；
+- 第 82 行 `$request->input('selected_assets')`（store）；
+- 第 92–106 行各表单字段 supplier_id/cost/notes/name/start_date/url 等（store）、第 167–178 行同名字段（update）；
+- 第 141 行 `request()->input('asset_ids', [])`（edit，仅回显给视图）；
+- 第 208 行 `$request->file('file')`、第 219 行 `file_notes`（上传）；
+- 第 263 行 `$request->input('note')`（complete）；
+- 第 304 行路由模型绑定 `Maintenance $maintenance`：记录主键由 URL 提供，属用户可控输入。
+
+**步骤 2｜逐条验证 source→sink 数据流的防御**
+- selected_assets → 第 82 行 `Asset::whereIn('id', ...)`：Eloquent 查询构造器数组参数化绑定，值不进入 SQL 语法层，安全；
+- 各表单字段 → 逐属性赋值后在第 111/180 行 `save()`：Eloquent 参数化写入，且未用 `fill()/create()` 批量赋值，无 mass assignment，也无字符串拼 SQL；
+- 上传文件 → 第 234–237 行 Validator 按 UploadFileRequest 白名单规则校验；第 199–200 行存储路径取自静态映射 `self::$map_storage_path`，第 215 行文件名前缀同样来自静态映射，均非用户可控路径；
+- 全文件不存在 eval/system/exec/原生查询/动态模板编译类危险 sink；第 35、61、139、306 行 `view()` 的视图名均为硬编码字面量，用户数据只作为变量传入 Blade，不构成模板引擎注入——即标注的 CWE-1336 在本文件没有对应 sink，不能凭空认定。
+
+**步骤 3｜第二入口/替代通道检查**
+横向对比各方法的授权覆盖：index 第 33 行、create 第 53 行、store 第 79 行、edit 第 136–137 行、update 第 163–164 行、complete 第 245 行、destroy 第 283–284 行均调用了 `$this->authorize(...)`；唯独 show（第 304–307 行）完全没有 authorize，直接把路由绑定的任意维护记录渲染输出。这就是背景所述影响的被遗漏读取入口：任意已激活账号无需任何资产/维护权限，即可通过遍历 ID 读取本公司全部维护记录（资产标签、供应商、采购成本、备注、日期）。除 show 外未发现其他绕过通道。
+
+**步骤 4｜结论**
+本文件不存在 CWE-1336（模板注入）所需的 sink，该标注与代码不符；真实缺陷是 show 方法缺失授权（CWE-862 Missing Authorization），构成公司内水平越权的信息泄露，风险等级 Medium。最小修复是在 show 中补充与其他方法一致的 authorize 调用。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 标注不符：文件内无模板注入 sink，实际为 CWE-862 Missing Authorization", "risk_level": "Medium", "source": "line 304: show(Maintenance $maintenance) 路由模型绑定的记录 ID（URL 用户可控）", "sink": "line 306: view('maintenances.view')->with('maintenance', $maintenance) 未授权渲染完整维护记录", "explanation": "第304行路由模型绑定使 maintenance 主键由 URL 可控 -> show 方法（第306行）未调用任何 authorize 直接返回含资产标签/供应商/成本/备注/日期的完整记录 -> 对比 index(33)/create(53)/store(79)/edit(136-137)/update(163-164)/complete(245)/destroy(283-284) 均有 authorize，show 为唯一遗漏的读取入口 -> 任意激活用户可遍历 ID 读取本公司全部维护记录；同时全文件无 eval/exec/原生 SQL/动态模板编译，view 名硬编码，故标注的 CWE-1336 不成立，实际成因为授权缺失", "fix_suggestion": "line 306: 在该行 return 之前加入 $this->authorize('view', $maintenance->asset)，与其他方法的授权写法保持一致"}
+```

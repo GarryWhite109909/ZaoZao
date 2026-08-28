@@ -1,0 +1,107 @@
+LANG: python
+```code
+# === file: dulwich_merge/config.py ===
+"""Repository configuration access for merge drivers."""
+
+import configparser
+
+
+class Config:
+    """Git-style ini config; merge.* sections may come from untrusted repos."""
+
+    def __init__(self, path: str = ".git/config"):
+        self._parser = configparser.ConfigParser()
+        self._parser.read(path)
+
+    def load_driver_command(self, name: str) -> str | None:
+        """SOURCE: raw merge.<name>.driver command line, untrusted."""
+        try:
+            return self._parser.get(f"merge.{name}", "driver").strip()
+        except (configparser.NoSectionError, configparser.NoOptionError):
+            return None
+
+# === file: dulwich_merge/registry.py ===
+"""Merge driver registry: resolves driver names to runnable commands."""
+
+from .config import Config
+from .executor import run_shell_merge
+
+
+class ProcessMergeDriver:
+    """Driver backed by an external command string."""
+
+    def __init__(self, command: str, name: str = "custom"):
+        self.command = command
+        self.name = name
+
+    def merge(self, ancestor: bytes, ours: bytes, theirs: bytes,
+              path: str | None = None, marker_size: int = 7):
+        # Pure pass-through: tainted command reaches executor unmodified.
+        return run_shell_merge(self.command, ancestor, ours, theirs,
+                               path, marker_size)
+
+
+class MergeDriverRegistry:
+    def __init__(self, config: Config | None = None):
+        self._drivers = {}
+        self._config = config
+
+    def get_driver(self, name: str):
+        if name in self._drivers:
+            return self._drivers[name]
+        command = self._config.load_driver_command(name) if self._config else None
+        if command is None:
+            return None
+        driver = ProcessMergeDriver(command, name)
+        # Pseudo-guard: blacklist strips only the literal 'rm -rf';
+        # metacharacters like ; | ` $( ) survive, so this is bypassable.
+        if "rm -rf" in driver.command:
+            driver.command = driver.command.replace("rm -rf", "")
+        self._drivers[name] = driver
+        return driver
+
+# === file: dulwich_merge/executor.py ===
+"""SINK module: runs merge driver commands through the OS shell."""
+
+import os
+import subprocess
+import tempfile
+
+
+def run_shell_merge(command: str, ancestor: bytes, ours: bytes, theirs: bytes,
+                    path: str | None = None, marker_size: int = 7):
+    """Expand %O/%A/%B/%L/%P placeholders, then execute the command."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        p_anc = os.path.join(tmpdir, "ancestor")
+        p_ours = os.path.join(tmpdir, "ours")
+        p_theirs = os.path.join(tmpdir, "theirs")
+        for target, data in ((p_anc, ancestor), (p_ours, ours),
+                             (p_theirs, theirs)):
+            with open(target, "wb") as f:
+                f.write(data)
+
+        cmd = command.replace("%O", p_anc).replace("%A", p_ours)
+        cmd = cmd.replace("%B", p_theirs).replace("%L", str(marker_size))
+        if path:
+            cmd = cmd.replace("%P", path)
+
+        # shell=True lets every metacharacter of the config string execute.
+        proc = subprocess.run(cmd, shell=True, capture_output=True)
+        with open(p_ours, "rb") as f:
+            merged = f.read()
+        return merged, proc.returncode == 0
+```
+
+分析：
+
+1. 【输入点枚举与可达性】外部输入点共四处：① `config.py:16` 读取 `merge.<name>.driver` 配置原始命令串（克隆恶意仓库即可植入）；② `merge()` 的 `path` 参数（源自工作区文件名，攻击者可控）经 `executor.py:23` 的 `%P` 替换进入命令；③ `ancestor/ours/theirs` 字节内容仅写入 tmpdir 下固定名临时文件，路径由系统控制，不进入命令行，无注入面；④ `marker_size` 为 int 且经 `str()` 转换，无注入面。主链可达性：`config.py:16` → `registry.py:29`（get_driver 取回命令串）→ `registry.py:32`（封装为 ProcessMergeDriver.command）→ `registry.py:17`（merge() 纯透传）→ `executor.py:26`（`subprocess.run(cmd, shell=True)`），链路完整闭合。
+
+2. 【逐流防御验证】流1（配置命令串）：唯一拦截是 `registry.py:33-36` 的伪净化——仅黑名单匹配字面量 `rm -rf` 并做字符串替换删除；这是典型的可绕过过滤，攻击者用 `$(...)`、反引号、分号、`rm<两个空格>-rf`、base64 编码等任一变体即可绕过，全链无 shlex 解析、无引号包裹、无参数列表、无白名单，判定为无效防御。流2（path/%P）：从 `registry.py:14` 到 `executor.py:23` 完全无任何过滤或转义，含 `;` 或反引号的文件名直接拼接进 shell 命令，零防御。
+
+3. 【第二入口与替代通道】存在多条：更换任意 driver `name` 会触发 `config.py:16` 读取新的配置键，属同型入口复现；外部代码可绕过注册表直接构造 `ProcessMergeDriver`（`registry.py:10` 接受任意 command 字符串）再调用 `merge()` 抵达同一 sink；`path` 参数通道如上独立成立。所有通道最终汇聚于 `executor.py:26` 同一 `shell=True` 执行点，无一设有完整防御。
+
+4. 【结论】source 与 sink 分离于不同文件（config.py 与 executor.py），中间 registry.py 为纯传递并叠加了看似存在实则不完整的黑名单净化，调用链上无有效防御，构成跨文件 CWE-78 命令注入，触发场景为对不可信仓库执行合并操作，可达任意命令执行，风险级别 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "Critical", "source": "L1:line 16: Config.load_driver_command 返回的 merge.<name>.driver 配置原始命令串", "sink": "L3:line 26: subprocess.run(cmd, shell=True) 执行拼接后的外部命令", "explanation": "流1主链: config.py:line16 从 .git/config 读出 merge.<name>.driver 原始字符串(克隆恶意仓库即可植入) → registry.py:line29 取得该串 → registry.py:line32 存入 ProcessMergeDriver.command → registry.py:line17 经 merge() 纯透传给 run_shell_merge → executor.py:line26 subprocess.run(cmd, shell=True) 执行, 全链无引号包裹/无参数列表/无白名单, 构成可达的命令注入; 流1防御核验: registry.py:lines33-36 仅黑名单匹配字面量 rm -rf 并做字符串替换, 属可绕过伪净化, 用 $(...) 反引号 分号 或双空格变体即失效, 不算有效防御; 流2替代通道: merge() 的 path 参数(工作区文件名)在 executor.py:line23 经 %P 替换拼入同一命令, 含 ; 或反引号的文件名可直接注入, 该流完全无过滤; 其他输入点核验: ancestor/ours/theirs 内容仅写入 tmpdir 固定名临时文件不进入命令行, marker_size 为 int 经 str() 无注入面; 第二入口确认: 更换 driver name 触发 config.py:line16 读取新配置键, 以及绕过注册表直接构造 ProcessMergeDriver(registry.py:line10), 多条通道均汇于 executor.py:line26 同一 sink 且均未设防, 判定存在 CWE-78 漏洞", "fix_suggestion": "line 26: 将 subprocess.run(cmd, shell=True) 改为先 shlex.split 再以参数列表形式 shell=False 执行, 并在 registry.py:line32 对配置命令做白名单校验、对 %P 路径拒绝元字符"}
+```

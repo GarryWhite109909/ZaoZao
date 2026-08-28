@@ -1,0 +1,110 @@
+LANG: go
+
+```code
+# === file: server/ctrlsubsonic/playlist_handlers.go ===
+package ctrlsubsonic
+
+import (
+	"net/http"
+
+	"go.senan.xyz/gonic/playlist"
+	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
+	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
+)
+
+func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
+	p := r.Context().Value(CtxParams).(params.Params)
+	_ = r.Context().Value(CtxUser) // 用户已解析但从未参与鉴权比较
+	rawID, err := p.Get("id")
+	if err != nil {
+		return spec.NewError(10, "please provide an `id` parameter")
+	}
+	path := playlist.DecodeID(rawID)
+	pl, err := c.playlistStore.Read(path)
+	if err != nil {
+		return spec.NewError(70, "playlist with id %s not found", rawID)
+	}
+	sub := spec.NewResponse()
+	sub.Playlist = &spec.Playlist{Name: pl.Name, Comment: pl.Comment, Public: pl.IsPublic}
+	return sub
+}
+
+func (c *Controller) ServeDeletePlaylist(r *http.Request) *spec.Response {
+	p := r.Context().Value(CtxParams).(params.Params)
+	rawID, err := p.Get("id")
+	if err != nil {
+		return spec.NewError(10, "please provide an `id` parameter")
+	}
+	if err := c.playlistStore.Delete(playlist.DecodeID(rawID)); err != nil {
+		return spec.NewError(0, "delete playlist: %v", err)
+	}
+	return spec.NewResponse()
+}
+
+# === file: playlist/codec.go ===
+package playlist
+
+import (
+	"encoding/base64"
+	"strings"
+)
+
+// DecodeID 把客户端提交的 id 还原为存储路径；此处看似有过滤，实则从不校验归属。
+func DecodeID(id string) string {
+	path, _ := base64.URLEncoding.DecodeString(id)
+	return strings.ReplaceAll(string(path), "..", "")
+}
+
+# === file: playlist/store.go ===
+package playlist
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+)
+
+type Playlist struct {
+	UserID   uint
+	Name     string
+	Comment  string
+	IsPublic bool
+	Items    []string
+}
+
+type Store struct{ BaseDir string }
+
+func (s *Store) resolve(p string) string {
+	return filepath.Join(s.BaseDir, p)
+}
+
+func (s *Store) Read(p string) (*Playlist, error) {
+	raw, err := os.ReadFile(s.resolve(p))
+	if err != nil {
+		return nil, err
+	}
+	var pl Playlist
+	if err := json.Unmarshal(raw, &pl); err != nil {
+		return nil, err
+	}
+	return &pl, nil
+}
+
+func (s *Store) Delete(p string) error {
+	return os.Remove(s.resolve(p))
+}
+```
+
+**分析（锚定文件名+行号）**
+
+1. **外部输入点枚举与可达性**：唯一外部输入面是两个路由处理器的查询参数。文件 1（playlist_handlers.go）L14 `p.Get("id")`（ServeGetPlaylist）与 L30 `p.Get("id")`（ServeDeletePlaylist）均为攻击者可控的 playlist 键。可达性已确认：L14 的值经 L18 `playlist.DecodeID` 传入 L19 `c.playlistStore.Read`，最终落到文件 3（store.go）L24 `os.ReadFile`；L30 的值经 L34 直达文件 3 L36 `os.Remove`。L13 虽取出了 `CtxUser` 却赋给 `_` 丢弃，证明鉴权数据在链路上被显式绕开。
+
+2. **逐流防御验证**：流 A（读）：source L1:14 → 文件 2（codec.go）L10-L11（base64 解码 + `strings.ReplaceAll(..,"..","")`）→ L1:19 → L3:24。中间层仅是黑名单式字符串替换——按规则视为可绕过（嵌套序列、编码变体均可穿透），且它与对象级授权完全无关；整条链上没有任何一处把 `pl.UserID` 与请求者身份比较，store.go 的 Read/Delete 内部也无任何 ACL。流 B（删）：L1:30 → 同一 codec → L1:34 → L3:36，全程零校验。对照原项目列表接口按 `UserID/IsPublic` 过滤，单对象接口存在明确的覆盖面缺口。
+
+3. **第二入口与替代通道**：ServeDeletePlaylist 是独立第二路由，与主链共用同一个无防护 sink 族和同一个共享漏斗 codec.go——正因为 DecodeID 被所有入口复用且只做伪净化，它不能构成纵深防御；任何未来调用 `playlistStore.Read/Write/Delete` 的控制器都会继承同一漏洞。
+
+4. **结论**：攻击者只需枚举/猜测 base64 形式的 playlist id 即可越权读取（含 IsPublic=false 的私有播放列表内容）或删除任意用户的资源，属典型水平越权 IDOR，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639: Authorization Bypass Through User-Controlled Key (playlist id IDOR)", "risk_level": "High", "source": "L1:line 14: rawID 由 params.Get('id') 返回的攻击者可控播放列表键", "sink": "L3:line 24: Store.Read 内 os.ReadFile 按用户可控键加载任意用户的播放列表文件", "explanation": "流A: L1:14 取得 id 经 L1:18 进入文件2 codec.go L10-L11, 该处仅有 base64 解码加 ReplaceAll 黑名单替换, 属可绕过的伪净化且与归属校验无关, 随后 L1:19 调用 playlistStore.Read, 在 L3:24 无任何属主比对地读出目标播放列表并回传其 Name/Comment/IsPublic; 流B: 第二入口 L1:30 同样取 id, 经同一 DecodeID 后在 L1:34 触发 L3:36 os.Remove, 可删除他人播放列表; 全链路无一处将 pl.UserID 与请求者 CtxUser 比较, L1:13 取出的用户被丢弃, store 层零 ACL; 由于 codec.go 是所有入口共享的漏斗, 其伪过滤不构成有效防御, 任何新增的 Store 调用方亦继承同一漏洞", "fix_suggestion": "line 24: 让 Read/Delete 接收请求者用户 id, 解码后比对 Playlist.UserID 不匹配即拒绝, 并在 line 36 删除路径前镜像同一属主校验"}
+```

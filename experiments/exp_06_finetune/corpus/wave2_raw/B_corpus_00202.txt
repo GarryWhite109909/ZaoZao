@@ -1,0 +1,91 @@
+LANG: javascript
+```code
+# === file: app/components/modals/post-history.js ===
+import Component from '@glimmer/component';
+import {action} from '@ember/object';
+import {tracked} from '@glimmer/tracking';
+import {inject as service} from '@ember/service';
+import {extractRenderedHTML} from '../../utils/revision-html';
+import PreviewPanel from '../post-history/preview-panel';
+
+export default class PostHistoryModal extends Component {
+    @service modals;
+    @tracked selectedHTML = null;
+    @tracked selectedRevisionIndex = 0;
+
+    constructor() {
+        super(...arguments);
+        this.post = this.args.model.post;
+        this.editorAPI = this.args.model.editorAPI;
+    }
+
+    get revisionList() {
+        const revisions = this.post.get('postRevisions').toArray()
+            .sort((a, b) => b.get('createdAt') - a.get('createdAt'));
+        return revisions.map((revision) => ({
+            lexical: revision.get('lexical'),
+            createdAt: revision.get('createdAt')
+        }));
+    }
+
+    get selectedRevision() {
+        return this.revisionList[this.selectedRevisionIndex];
+    }
+
+    @action
+    async refreshPreview() {
+        const state = this.editorAPI.editorInstance.parseEditorState(this.selectedRevision.lexical);
+        this.editorAPI.editorInstance.setEditorState(state);
+        const hidden = document.querySelector('.gh-post-history-hidden-lexical.current');
+        this.selectedHTML = extractRenderedHTML(hidden);
+        this.modals.open(PreviewPanel, {html: this.selectedHTML});
+    }
+}
+
+# === file: app/utils/revision-html.js ===
+// Shared helpers for post-history preview rendering.
+const PLACEHOLDER_RE = /<div\b[^>]*>(\s*Begin writing your post\.\.\.\s*)<\/div>/i;
+
+export function extractRenderedHTML(element) {
+    if (!element) {
+        return '';
+    }
+    const raw = element.innerHTML;
+    // NOTE: only strips the Koenig placeholder block. This is NOT an HTML
+    // sanitizer: script tags, onerror handlers and javascript: URLs survive.
+    return raw.replace(PLACEHOLDER_RE, '');
+}
+
+export function freezeContenteditable(root) {
+    root.querySelectorAll('[contenteditable]').forEach((el) => {
+        el.setAttribute('contenteditable', 'false');
+    });
+}
+
+# === file: app/components/post-history/preview-panel.js ===
+import Component from '@glimmer/component';
+import {action} from '@ember/object';
+import {freezeContenteditable} from '../../utils/revision-html';
+
+export default class PreviewPanel extends Component {
+    @action
+    didInsert(element) {
+        freezeContenteditable(element);
+        // args.html is caller-supplied markup; inserted verbatim below.
+        // Traces back to revision.lexical via PostHistoryModal.refreshPreview.
+        element.innerHTML = this.args.html;
+    }
+}
+```
+
+1. 【输入点枚举与可达性】外部输入点共三处：(a) app/components/modals/post-history.js:23 `revision.get('lexical')`——postRevisions 模型里的历史版本正文，是低权限贡献者即可写入的存储型外部内容；(b) post-history.js:36 `document.querySelector('.gh-post-history-hidden-lexical.current')` 读到的隐藏节点 innerHTML——它由 输入点 经同文件 34-35 行 parseEditorState/setEditorState 渲染派生而来，属同一污染通道而非独立可信源；(c) preview-panel.js:11 组件形参 `args.html`——对外开放的通用入口。主链可达性：post-history.js:23 → :29(selectedRevision) → :34 → :35 → :36 → :37(跨入 utils 文件) → :38(跨文件传出) → preview-panel.js:11，source 与 sink 分处不同文件且链路连通。
+
+2. 【逐流防御验证】流1：post-history.js:34-35 的 Lexical 解析仅重建编辑器状态，不是 HTML 净化器，序列化往返可保留内联事件属性与危险协议；流2：utils/revision-html.js:11 的 `raw.replace(PLACEHOLDER_RE, '')` 只针对唯一占位 div 做黑名单式单次正则字符串替换，未覆盖 script 标签、onerror 内联事件、javascript: URL，属看似净化实则不完整的伪防御；流3：utils/revision-html.js:16 freezeContenteditable 仅切换 contenteditable 属性，对脚本执行零中和作用。全链路不存在 DOMPurify 或白名单转义，sink 处原样赋值 innerHTML，三个环节均不构成有效防御。
+
+3. 【第二入口与替代通道】preview-panel.js:5 导出的 PreviewPanel 接受任意 html 参数，任何其他调用方以 `modals.open(PreviewPanel, {html: ...})` 打开即直达 sink，构成独立于主链的第二入口；utils/revision-html.js:4 的 extractRenderedHTML 是导出工具函数，可被其他组件复用从而扩散同一污染模式；post-history.js:32 的 @action refreshPreview 可被模板反复触发，每次重放完整污点链。多通道并存进一步支撑漏洞成立的结论。
+
+4. 【结论】CWE-79 存储型 DOM XSS 成立：贡献者写入的历史版本 lexical 内容经伪净化后被 staff 高权限会话以 innerHTML 渲染，触发条件仅需打开历史预览，风险定级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79: 存储型 DOM 跨站脚本", "risk_level": "High", "source": "L1:line 23: revision.get('lexical') 读取的攻击者可控历史版本内容", "sink": "L3:line 11: element.innerHTML = this.args.html", "explanation": "主链流: L1:23 revision.get('lexical') 为存储型外部输入, 经 L1:29 selectedRevision、L1:34 parseEditorState、L1:35 setEditorState 渲染进隐藏节点, L1:36 读取其 innerHTML, L1:37 进入 L2:8 取 raw 并在 L2:11 仅以单一正则剔除占位 div, 再由 L1:38 以 html 参数传入 PreviewPanel, 最终 L3:11 赋给 element.innerHTML 完成未净化传播; 防御核验: L1:34-35 的 Lexical 解析只重建编辑器状态而非 HTML 白名单过滤, 内联事件与 javascript: 协议可在序列化往返中保留; L2:11 的 replace 属黑名单式单模式字符串替换, 未处理 script 标签与 onerror 等载荷, 可绕过不算有效防御; L2:16 freezeContenteditable 仅改 contenteditable 属性对脚本无中和作用; 全链无 DOMPurify 等完整净化点; 第二入口: L3:5 的 PreviewPanel 对外暴露 args.html 通用接口, 其他调用方经 modals.open 传入的任意 html 同样直达 L3:11, 且 L2:4 extractRenderedHTML 作为导出工具可被复用扩散, 替代通道成立, 故确认 CWE-79 存储型 DOM XSS", "fix_suggestion": "line 11: 在 preview-panel.js 赋值前改为 element.innerHTML = DOMPurify.sanitize(this.args.html) 做白名单净化, 或改用 textContent 并另行安全渲染富文本"}
+```

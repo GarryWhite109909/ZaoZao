@@ -1,0 +1,31 @@
+## 漏洞分析：AccessoriesController（CWE-601）
+
+**步骤 1｜枚举用户可控输入点并追踪流向**
+- 表单字段 `request('name')`、`request('category_id')` 等（第 65–78、168–180 行）：赋给 Eloquent 模型属性后经 `save()` 持久化，ORM 内部参数化，非注入型 sink；
+- 第 81 行 `$request->input('clone_image_from_id')`：传入 Eloquent `find()`，参数化查询，安全；
+- 第 93/96 行与第 184/187 行 `$request->input('redirect_option')`：用户可控，写入 session 并参与后续重定向决策；
+- 第 118 行 `url()->previous()`：取自 HTTP **Referer 头**（攻击者可通过外链页面完全控制），未经校验即写入 `session('back_url')`；
+- 重定向执行点：第 102/191 行 `Helper::getRedirectOption($request, ...)`（依据请求/会话中的 redirect_option 生成响应）、第 106/162/198 行 `redirect()->back()`（目标解析自 Referer 派生的上一跳地址）。
+
+**步骤 2｜逐条验证 source→sink 防御有效性**
+- 数据库流：Eloquent 参数化完整覆盖，安全；
+- redirect_option 流：第 93/184 行仅对 `'back'` 单个值做等值改写，else 分支（第 96/187 行）把任意用户输入原样放入 session，随后第 102/191 行据此执行重定向——单值等值检查不构成白名单，else 分支完全未被覆盖，也无任何域名校验；
+- Referer 流：第 118 行 `url()->previous()` 直接持久化进 session，无同源/allowlist 校验；第 106/162/198 行 `redirect()->back()` 的跳转目标同样派生自 Referer。两条流全程无有效防御。
+
+**步骤 3｜第二入口与替代通道**
+- 同一模式在 `store()`（第 93–97、102、106 行）与 `update()`（第 184–188、191、198 行）重复出现；`edit()`（第 118 行）是 Referer 投毒入口，GET 即可触发、无需 CSRF token，污染的 session 值跨请求存活，影响此后任意走保存/更新流程的用户；`destroy()`/`show()` 使用固定 `route()`，不受影响。
+
+**步骤 4｜结论**
+- 攻击者诱导已登录管理员从恶意页面跳转到 accessories 编辑页，恶意 Referer 经第 118 行存入 session；或提交携带恶意 `redirect_option` 的表单（第 96/187 行）。随后保存成功路径的 `Helper::getRedirectOption`（第 102/191 行）与失败路径的 `redirect()->back()`（第 106/198 行）基于这些未校验值生成 Location 头，将用户重定向至任意外部站点，构成可钓鱼利用的开侧重定向。判定为 CWE-601，风险等级 Medium。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-601 Open Redirect",
+  "risk_level": "Medium",
+  "source": "line 118: session()->put('back_url', url()->previous()) 中源自 HTTP Referer 头的 url()->previous()；另见 line 96/187: $request->input('redirect_option') 写入 session",
+  "sink": "line 102/191: Helper::getRedirectOption 发起重定向；line 106/198: redirect()->back() 以 Referer 派生地址为跳转目标",
+  "explanation": "攻击者控制 Referer -> line 118 url()->previous() 未做同源校验直接写入 session('back_url') -> 该会话值跨请求存活并被后续重定向逻辑消费（line 102/191 Helper::getRedirectOption、line 106/198 redirect()->back()）-> 生成指向任意外部站点的 Location 头 -> 用户被钓鱼重定向；redirect_option 流同理：line 93/184 仅对 'back' 单值改写，其余任意值经 line 96/187 原样入 session 并驱动重定向，无白名单覆盖",
+  "fix_suggestion": "line 118: 用 parse_url 校验 url()->previous() 的 host 与本站一致后再写入 session，不一致则回退为 route('accessories.index')；同时将 line 96/187 的 redirect_option 收敛为 index/item 白名单"
+}
+```

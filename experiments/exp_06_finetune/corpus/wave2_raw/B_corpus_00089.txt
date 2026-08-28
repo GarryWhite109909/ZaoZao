@@ -1,0 +1,101 @@
+LANG: php
+```code
+# === file: plugin/Comments/admin/save.php ===
+<?php
+header('Content-Type: application/json');
+require_once '../../../../videos/configuration.php';
+require_once __DIR__ . '/../CommentService.php';
+
+$obj = new stdClass();
+$obj->error = true;
+$obj->msg = '';
+
+$plugin = AVideoPlugin::loadPluginIfEnabled('Comments');
+
+if (!User::isAdmin()) {
+    $obj->msg = 'You cant do this';
+    die(json_encode($obj));
+}
+
+// TODO: add csrf token check someday
+$data = $_POST;
+$result = CommentService::handleSave($data);
+
+$obj->error = $result['error'];
+$obj->msg = $result['msg'];
+echo json_encode($obj);
+# === file: plugin/Comments/CommentService.php ===
+<?php
+require_once __DIR__ . '/Objects/Comment.php';
+
+class CommentService
+{
+    // 看似有净化：只过滤 title 字段，并丢弃 csrf_token 字段名（不校验其值）
+    public static function sanitize(array $data)
+    {
+        if (isset($data['title'])) {
+            $data['title'] = strip_tags($data['title']);
+        }
+        unset($data['csrf_token']);
+        return $data;
+    }
+
+    public static function handleSave(array $post)
+    {
+        $clean = self::sanitize($post);
+        $o = new Comment(@$clean['id']);
+        if (!empty($clean['title'])) {
+            $o->setTitle($clean['title']);
+        }
+        if (!empty($clean['status'])) {
+            $o->setStatus($clean['status']);
+        }
+        return $o->save() ? array('error' => false, 'msg' => 'Saved')
+                          : array('error' => true, 'msg' => 'Save failed');
+    }
+}
+# === file: plugin/Comments/Objects/Comment.php ===
+<?php
+require_once $global['systemRootPath'] . 'objects/ObjectYPT.php';
+
+class Comment extends ObjectYPT
+{
+    protected $id;
+    protected $title;
+    protected $status;
+
+    public function __construct($id = 0)
+    {
+        $this->id = intval($id);
+        if ($this->id > 0) {
+            $this->load($this->id);
+        }
+    }
+
+    public function setTitle($t) { $this->title = $t; }
+    public function setStatus($s) { $this->status = $s; }
+
+    // 状态变更落库点
+    public function save()
+    {
+        if ($this->id > 0) {
+            return self::updateTable('comments', get_object_vars($this));
+        }
+        return self::insertIntoTable('comments', get_object_vars($this));
+    }
+}
+```
+
+分析（针对整组文件）：
+
+1. **外部输入点枚举与可达性**：本组唯一的 HTTP 输入点是 save.php 第 18 行 `$data = $_POST`（整包接收，消费键为 id/title/status）。三条流全部可达 sink：id 经 save.php L19 进入 handleSave → CommentService.php L19 `new Comment($clean['id'])` → Comment.php L12 存为成员 → CommentService.php L26 触发 save() → Comment.php L25 updateTable 落库；title 经 CommentService.php L10→L21→Comment.php L25 落库；status 经 CommentService.php L23-L24→Comment.php L25 落库。
+
+2. **逐流防御核验**：流 id 仅有 Comment.php L12 的 intval 类型转换，属数据处理而非反 CSRF 手段；流 title 在 CommentService.php L10 用 strip_tags 做黑名单式标签过滤，可绕过且与伪造请求防御无关；流 status 在 CommentService.php L23-L24 零处理直通。全局层面：save.php L12 的 User::isAdmin() 是会话 Cookie 鉴权，跨站表单提交时浏览器自动携带 Cookie，鉴权照常通过，不能阻断 CSRF；CommentService.php L12 的 `unset($data['csrf_token'])` 只删除字段名、从不比对取值，形同虚设甚至主动丢弃证据。整条链上不存在 token 比对、Origin/Referer 校验或 SameSite 语义等任何有效反 CSRF 措施。
+
+3. **第二入口与替代通道**：本组文件仅 save.php 一个 HTTP 路由入口，不存在第二个入口文件；但替代通道成立——外部攻击页可通过自动提交的 urlencoded/multipart 表单 POST 直接触发同一调用链；同时 id 与 status 完全绕过唯一的过滤函数 sanitize，且 handleSave 为 public static，后续任何新路由复用该服务时同样无防护。单入口但跨站可达、链上零有效防御，支撑漏洞成立结论。
+
+4. **结论**：source（save.php L18 的 $_POST）到 sink（Comment.php L25/L27 的落库写操作）之间无完整防御，管理端状态变更可被跨站伪造请求触发，CWE-352 成立，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-352 跨站请求伪造(CSRF)：管理端状态变更接口缺少反CSRF令牌校验", "risk_level": "High", "source": "L1:line 18: save.php 中 $data = $_POST 接收的全部跨站可伪造请求参数", "sink": "L3:line 25: Comment.php 中 Comment::save() 调用 updateTable 将攻击者可控数据写入数据库的状态变更点", "explanation": "流1 id: save.php L18 整包接收 $_POST → L19 进入 CommentService::handleSave → svc L19 new Comment(id) → Comment.php L12 intval 后存为成员 → svc L26 触发 save() → Comment.php L25 updateTable 落库, 防御仅 intval 类型转换, 与 CSRF 无关; 流2 title: save.php L18 → svc L10 strip_tags 黑名单式标签过滤(可绕过且非反CSRF手段) → svc L21 setTitle → Comment.php L25 落库; 流3 status: save.php L18 → svc L23-L24 原样直传 → Comment.php L25 落库, 零处理; 全局防御核验: save.php L12 User::isAdmin() 为会话 Cookie 鉴权, 跨站表单自动携带 Cookie 可直接通过, 不构成 CSRF 防御; svc L12 unset(csrf_token) 只删除字段名从不校验取值, 形同虚设; 链上不存在 token 比对/Origin 或 Referer 校验/SameSite 等任何反 CSRF 措施; 第二入口核查: 本组仅 save.php 一个 HTTP 路由入口, 无其他入口文件, 但替代通道成立——外部攻击页可用 urlencoded 或 multipart 表单自动提交触发同一调用链, 且 id 与 status 完全绕过唯一过滤函数 sanitize, handleSave 为 public static 亦可被后续路由复用而同样无防护; 综上主链 source 到 sink 无任何完整防御, CWE-352 成立", "fix_suggestion": "line 17: 在 save.php 于 isAdmin 判断后立即加入 CSRF 防护——校验随会话签发的随机 token(用 hash_equals 比对 $_POST['csrf_token'] 与 $_SESSION['csrf_token'])并核对 Origin 头, 任一失败即拒绝响应"}
+```

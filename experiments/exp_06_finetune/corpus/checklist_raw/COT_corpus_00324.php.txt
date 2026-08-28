@@ -1,0 +1,33 @@
+## 漏洞分析
+
+**步骤 1｜用户可控输入点枚举**
+- 第 39 行：`getComments` 中 `$filter = $request->all()`，用于第 42 行 Eloquent `filter()` 与第 46 行 `paginate()`，走 ORM 封装，本文件内无裸 SQL/eval sink；
+- 第 65 行：`saveCommentEdit` 中 `$data = $request->all()`，包含 `comment_body`、`format`、`action`、`id` 等全部请求参数，是本次核心污染源；
+- 第 149 行：`$comment_body = $data['comment_body']`，将可控正文取出进入清洗流程。
+
+**步骤 2｜source→sink 数据流及防御有效性验证**
+
+主数据流：第 65 行 `$request->all()` → 第 149 行 `$comment_body` → 第 152 行 `clean_html` → 第 155–156 行基于 `$evil` 黑名单数组的 `clean_xss` → 第 158–159 行 `Markdown::convertToHtml` → 第 162 行回写 `$data['comment_body']` → 第 165 行 `mw()->database_manager->save($table, $data)` 持久化。
+
+防御评估：
+- 第 152 行 `clean_html` 与第 156 行 `clean_xss` 属于黑名单/正则式过滤（第 155 行 `$evil` 仅枚举 `on\w*`、`xmlns`、`formaction` 等事件属性特征），按规则黑名单过滤视为可绕过，不构成有效防御；且二者完全不处理模板引擎特殊元素（如 `{...}` 定界符、模板函数语法）；
+- 第 158–159 行的 Markdown 转换发生在过滤**之后**，转换产物为原始 HTML 且不再经过任何二次净化，反而扩大了特殊元素的存活面；
+- 第 163 行硬编码 `'allow_html' => '1'` 明确允许 HTML 存储，确认无输出侧转义兜底。
+
+因此该条流上不存在完整覆盖的有效防御，含模板引擎特殊元素的 `comment_body` 原样到达第 165 行存储 sink。
+
+**步骤 3｜sink 性质与触发路径**
+第 165 行将污染数据写入 `comments` 表形成存储型载荷；随后在第 33 行后台视图 `comment::admin.comments.index` 渲染以及前台评论模板输出时，Microweber 模板引擎会解析其中的模板特殊元素并求值，构成 CWE-1336 模板注入（写入点在本文件，执行点在渲染阶段）。
+
+**步骤 4｜第二入口与替代通道排查**
+- 第 117 行 delete 分支对 `$data['id']` 做 `intval` 强转，无注入面；
+- 第 174 行起 `__report_for_spam` 仅将字段外发 POST 到固定 URL（第 181 行为普通 URL 字面量，非凭证），不产生本地执行；
+- 第 71 行 `get_by_id($data['reply_to_comment_id'])` 走模型封装查询；
+- 全文件无硬编码凭证。替代通道方面：前台匿名提交评论若复用同一套 `clean_xss` 清洗则同样绕过，但本文件内的主链即第 65→165 行的管理端保存通道，独立成立。
+
+**步骤 5｜结论**
+存在漏洞：用户可控 `comment_body` 经可绕过的黑名单过滤后持久化，渲染时被模板引擎解析，属存储型模板引擎注入（CWE-1336）。因载荷持久化、每次渲染均触发、模板引擎求值可能升级为代码执行，风险评级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Template Engine Injection", "risk_level": "High", "source": "line 65: $data = $request->all()（comment_body 在 line 149 取出）", "sink": "line 165: mw()->database_manager->save($table, $data) 持久化未中和模板特殊元素的 comment_body，于模板渲染时解析", "explanation": "line 65 request->all -> line 149 comment_body -> line 152 clean_html 与 line 155-156 基于 $evil 黑名单的 clean_xss（黑名单可绕过且不过滤模板定界符）-> line 159 Markdown::convertToHtml 在过滤后生成原始 HTML 且无二次净化 -> line 162 回写并经 line 163 allow_html=1 允许 HTML -> line 165 存入 comments 表 -> 后台 line 33 视图及前台模板渲染时模板引擎解析特殊元素，形成存储型模板注入", "fix_suggestion": "line 162: 赋值前对 $comment_body 中的模板定界符做转义（将 { 和 } 替换为 &#123; 和 &#125;）后再入库"}
+```

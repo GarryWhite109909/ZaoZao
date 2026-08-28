@@ -1,0 +1,105 @@
+LANG: java
+```code
+# === file: src/main/java/com/grid/web/CgmesUploadController.java ===
+package com.grid.web;
+
+import com.grid.cgmes.FullModelParser;
+import com.grid.xml.XmlSanitizer;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.io.Reader;
+import java.io.StringReader;
+
+@RestController
+public class CgmesUploadController {
+
+    // Entry A: raw import, nothing filters the payload
+    @PostMapping("/cgmes/import")
+    public String importRaw(@RequestBody String body) {
+        Reader raw = new StringReader(body);
+        return FullModelParser.parse(raw).toString();
+    }
+
+    // Entry B: supposedly cleaned import
+    @PostMapping("/cgmes/import-clean")
+    public String importClean(@RequestBody String body) {
+        Reader filtered = XmlSanitizer.stripDeclarations(body);
+        return FullModelParser.parse(filtered).toString();
+    }
+}
+# === file: src/main/java/com/grid/xml/XmlSanitizer.java ===
+package com.grid.xml;
+
+import java.io.Reader;
+import java.io.StringReader;
+
+/** Looks defensive but is only an exact-case blacklist strip. */
+public final class XmlSanitizer {
+
+    private XmlSanitizer() {
+    }
+
+    public static Reader stripDeclarations(String xml) {
+        String out = xml.replace("<!DOCTYPE", "");
+        if (out.contains("<!ENTITY")) {
+            out = out.replace("<!ENTITY", "");
+        }
+        return new StringReader(out);
+    }
+}
+# === file: src/main/java/com/grid/cgmes/FullModelParser.java ===
+package com.grid.cgmes;
+
+import javax.xml.XMLConstants;
+import javax.xml.stream.XMLInputFactory;
+import javax.xml.stream.XMLStreamReader;
+import java.io.Reader;
+
+public final class FullModelParser {
+
+    public record FullModel(String id, int version) {
+        @Override
+        public String toString() {
+            return id + ':' + version;
+        }
+    }
+
+    private static XMLInputFactory newFactory() {
+        XMLInputFactory f = XMLInputFactory.newInstance();
+        f.setProperty(XMLConstants.SUPPORT_DTD, true);
+        return f;
+    }
+
+    // SINK: entity resolution happens while this reader advances
+    public static FullModel parse(Reader reader) {
+        try {
+            XMLStreamReader r = newFactory().createXMLStreamReader(reader);
+            r.nextTag();
+            String id = r.getAttributeValue(null, "about");
+            while (r.hasNext()) {
+                if (r.next() == XMLStreamReader.START_ELEMENT
+                        && r.getLocalName().equals("version")) {
+                    return new FullModel(id, Integer.parseInt(r.getElementText()));
+                }
+            }
+            return new FullModel(id, -1);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}
+```
+
+1. 外部输入点枚举与可达性：入口A为 CgmesUploadController.java 第16-19行，POST /cgmes/import 的 @RequestBody 攻击者字符串在第18行被包装为 StringReader，第19行直传 FullModelParser.parse，直达 FullModelParser.java 第26行的 createXMLStreamReader，可达；入口B为同文件第23-26行，POST /cgmes/import-clean 的请求体先经 XmlSanitizer.stripDeclarations（XmlSanitizer.java 第12行），第17行仍以 StringReader 返回污点数据，随后进入同一 sink，可达。source 文件（控制器）与 sink 文件（解析器）分离，中间隔一个净化文件。
+
+2. 逐流防御验证：流1（控制器第18→19行→解析器第26行）全链零过滤——FullModelParser.java 第18-20行的工厂未设置 ACCESS_EXTERNAL_DTD 与 ACCESS_EXTERNAL_SCHEMA，第19行反而显式 SUPPORT_DTD=true，外部一般实体与参数实体均可解析；流2（控制器第25行→XmlSanitizer 第13、15行→解析器第26行）唯一防线是大小写敏感的字符串替换黑名单 replace('<!DOCTYPE','') 与 replace('<!ENTITY','')，提交 <!doctype、<!Entity 等混合大小写变体即绕过，且该文件完全不触及 XMLInputFactory 安全属性，按规则黑名单+字符串替换不算有效防御，两条流均无完整防护。
+
+3. 第二入口与替代通道：确认存在 /cgmes/import 与 /cgmes/import-clean 两条并行路由，均汇聚到 FullModelParser.parse（FullModelParser.java 第24行）这一共享 sink；此外 parse 为 public static，任何未来新增的调用方都会继承同一未加固工厂，漏洞不依赖单一入口或单一参数通道。
+
+4. 成因定位：原始代码中工厂级的 ACCESS_EXTERNAL_DTD/SCHEMA 加固在本重组中被整体移除并替换为上游伪净化，防御位置错误（应在 sink 工厂处关闭 DTD，而非在中间层做文本黑名单），导致跨文件链上任一点都不构成完整防御。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 XML外部实体注入", "risk_level": "High", "source": "L1:line 18: CgmesUploadController.importRaw 中攻击者可控的HTTP请求体被包装为StringReader（第二入口为同文件line 25经XmlSanitizer的同源数据）", "sink": "L3:line 26: FullModelParser.parse 中 createXMLStreamReader 在SUPPORT_DTL=true且无ACCESS_EXTERNAL限制下解析实体", "explanation": "流1: L1:18请求体原样经L1:19传入L3:24 parse, 链上零过滤, L3:19显式开启SUPPORT_DTD且L3:18-20未设ACCESS_EXTERNAL_DTD与ACCESS_EXTERNAL_SCHEMA, 外部实体直接解析; 流2: L1:25经L2:12 stripDeclarations, 其L2:13与L2:15仅做大小写敏感的字符串替换黑名单, 用小写doctype或entity变体即可绕过, 且该中间文件不触及XMLInputFactory配置, 属可绕过过滤而非有效防御; 第二入口: 存在/cgmes/import与/cgmes/import-clean两条路由, 以及任何未来调用public静态方法parse(Reader)的通道, 全部汇聚到同一未加固工厂, 结论为两条流均构成CWE-611 XXE, 可致本地文件读取与SSRF", "fix_suggestion": "line 19: 在FullModelParser.newFactory中将SUPPORT_DTD设为false并把ACCESS_EXTERNAL_DTD与ACCESS_EXTERNAL_SCHEMA属性置为空串, 使两条路由共用的工厂成为唯一加固点"}
+```

@@ -1,0 +1,92 @@
+LANG: python
+```code
+# === file: app/routes/dag_sources.py ===
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends
+
+from airflow.api_fastapi.auth.managers.models.resource_details import DagAccessEntity
+from airflow.api_fastapi.common.db.common import SessionDep
+from airflow.api_fastapi.core_api.security import requires_access_dag
+from app.services.source_resolver import resolve_dag_source
+
+dag_sources_router = APIRouter(tags=["DagSource"], prefix="/dagSources")
+
+
+@dag_sources_router.get("/{dag_id}")
+def get_dag_source(
+    dag_id: str,
+    session: SessionDep,
+    version_number: int | None = None,
+    _perm=Depends(requires_access_dag(method="GET", access_entity=DagAccessEntity.CODE)),
+):
+    """SOURCE: dag_id 与 version_number 直接来自 HTTP 请求，外部完全可控。"""
+    return resolve_dag_source(session, dag_id, version_number)
+
+# === file: app/services/source_resolver.py ===
+from __future__ import annotations
+
+from fastapi import HTTPException, status
+
+from app.db.dag_repository import DagSourceRepository
+
+
+def resolve_dag_source(session, dag_id: str, version_number: int | None):
+    # 看似净化的中间层：仅做格式规整与黑名单子串检查，
+    # 无法阻止任意 dag_id 枚举，亦无资源级属主校验。
+    clean_id = dag_id.strip().lower()
+    if not clean_id or '..' in clean_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='invalid dag_id')
+    record = DagSourceRepository.fetch_source(session, clean_id, version_number)
+    if record is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f'code not found. dag_id={clean_id!r} version={version_number}',
+        )
+    return record
+
+# === file: app/db/dag_repository.py ===
+from __future__ import annotations
+
+from airflow.models.dag_version import DagVersion
+
+
+class DagSourceRepository:
+    @staticmethod
+    def fetch_source(session, dag_id: str, version_number: int | None):
+        # SINK: 以调用者可控的 dag_id 直接作主键查询并回传源码，
+        # 查询前后均无 '该用户是否可读此具体 DAG' 的对象级判定。
+        dag_version = DagVersion.get_version(dag_id, version_number, session=session)
+        if not dag_version or not dag_version.dag_code:
+            return None
+        return {
+            'dag_id': dag_id,
+            'content': dag_version.dag_code.source_code,
+            'version_number': dag_version.version_number,
+            'dag_display_name': dag_version.dag_model.dag_display_name,
+        }
+```
+
+【整体分析】（行号自各文件分隔行后第 1 行起算；文件序号 L1=app/routes/dag_sources.py，L2=app/services/source_resolver.py，L3=app/db/dag_repository.py）
+
+1. **输入点枚举与可达性**：外部输入点共两处——`app/routes/dag_sources.py:15` 的路径参数 `dag_id` 与 `:17` 的查询参数 `version_number`；`:16` 的 session 由框架注入、`:18` 的 `_perm` 是依赖注入结果，均非攻击面。两参数经 `:21` 传入 `resolve_dag_source`，在 `app/services/source_resolver.py:11-14` 被规整后原样透传至 `DagSourceRepository.fetch_source`，最终在 `app/db/dag_repository.py:11` 作为查询主键命中 `DagVersion.get_version`，并于 `:16` 将 `dag_code.source_code` 写入响应——source 到 sink 跨三文件可达性成立。
+
+2. **数据流 1（dag_id）防御逐项核验**：链路 L1:15→L1:21→L2:11(strip/lower)→L2:12 黑名单 `'..' in clean_id`→L2:14→L3:11→L3:16。防御一：L1:18 `requires_access_dag` 属全局功能级 RBAC，类型正确但只回答『能否读 DAG 代码功能』，从不解析请求中的 dag_id 值做对象级比对，位置在路由层、覆盖面缺资源维度；防御二：L2:11-12 为字符串规整加黑名单子串过滤，按判定标准视为可绕过且不改变键值语义，任意合法 dag_id（如其他团队的 DAG）照样直达查询；防御三：L3:12 的 `if not dag_version` 仅是存在性检查充当 404 兜底，并非授权。全程无对象级属主校验，CWE-639 成立。
+
+3. **数据流 2（version_number）防御逐项核验**：链路 L1:17→L1:21→L2:14→L3:11，除框架类型约束外无任何业务校验，允许对同一 dag_id 遍历全部历史版本，放大单次越权的泄露面；该流的风险依附于流 1 的未授权键值，二者叠加构成完整越权读取。
+
+4. **第二入口与替代通道**：本组文件仅注册一个路由（L1:13），无第二 HTTP 入口；但存在替代通道—— 其一，同一路由的 `version_number` 构成版本遍历通道；其二，L2:8 的 `resolve_dag_source` 是可复用的公共服务函数，任何未来路由间接调用都会继承同一缺口；其三，sink 接受任意 dag_id，攻击者在单一入口内即可横向枚举所有租户/团队的 DAG 源码，等效于无限的替代资源 ID 通道。
+
+5. **结论**：三层防线均不完整（全局权限≠对象权限、黑名单无效、404≠鉴权），source 与 sink 分离于不同文件但污点跨文件无损传播，确认为 CWE-639 水平越权读取任意 DAG 源码，风险等级 High。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key",
+  "risk_level": "High",
+  "source": "L1:line 15: 路径参数 dag_id（辅链为 L1:line 17 的 version_number 查询参数）",
+  "sink": "L3:line 11: DagVersion.get_version(dag_id, ...) 以可控键查询并于 line 16 返回 dag_code.source_code",
+  "explanation": "流1 dag_id：L1:15→L1:21→L2:11 strip/lower 规整→L2:12 黑名单 '..' 子串检查（可绕过且不改键语义）→L2:14→L3:11 作查询键→L3:16 泄露 source_code；流2 version_number：L1:17→L1:21→L2:14→L3:11，无任何业务校验，可遍历同一 dag 全部历史版本；防御核验：L1:18 requires_access_dag 为全局功能级 RBAC，不绑定请求中的 dag_id 值，属覆盖面缺失的对象级防线空白；L2:11-12 为字符串规整加黑名单过滤，按标准视为无效防御；L3:12 仅存在性检查充当 404 兜底而非鉴权；第二入口结论：本组仅一个 HTTP 路由（L1:13）无第二路由入口，但 version_number 构成版本遍历替代通道，L2:8 的 resolve_dag_source 为可复用服务函数、间接调用会继承缺口，且 sink 接受任意 dag_id 使攻击者可在单入口横向枚举所有 DAG 源码；综上调用链无完整防御，构成 CWE-639 水平越权读取任意 DAG 源码",
+  "fix_suggestion": "line 11: 在 app/db/dag_repository.py 调用 get_version 前增加对象级授权——依据当前用户身份校验其对目标 dag_id 的读权限（如联接 dag 属主或作用域过滤），未通过返回 403 或统一 404，并移除 L2:12 的无效黑名单"
+}
+```

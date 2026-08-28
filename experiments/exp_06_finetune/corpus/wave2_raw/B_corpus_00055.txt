@@ -1,0 +1,94 @@
+LANG: go
+
+```code
+# === file: adapters/http/media_handlers.go ===
+package http
+
+import (
+	"fmt"
+	"net/http"
+
+	"github.com/gtsteffaniak/filebrowser/backend/adapters/fs/indexing"
+	"github.com/gtsteffaniak/filebrowser/backend/media"
+)
+
+// subtitlesHandler serves external subtitle sidecar files for a video.
+func subtitlesHandler(w http.ResponseWriter, r *http.Request, d *requestContext) (int, error) {
+	path := r.URL.Query().Get("path")
+	source := r.URL.Query().Get("source")
+	name := r.URL.Query().Get("name")
+
+	if name == "" {
+		return http.StatusBadRequest, fmt.Errorf("name parameter is required")
+	}
+	userscope, err := d.user.GetScopeForSourceName(source)
+	if err != nil {
+		return http.StatusForbidden, err
+	}
+	idx := indexing.GetIndex(source)
+	if idx == nil {
+		return http.StatusNotFound, fmt.Errorf("source %s not found", source)
+	}
+	realPath, _, err := idx.GetRealPath(userscope, path)
+	if err != nil {
+		return http.StatusNotFound, err
+	}
+	content, err := media.ReadSubtitleSidecar(realPath, name)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte(content))
+	return http.StatusOK, nil
+}
+# === file: media/subtitle_service.go ===
+package media
+
+import (
+	"path/filepath"
+	"strings"
+)
+
+// ResolveSidecarPath joins the client-supplied subtitle name beside the video file.
+func ResolveSidecarPath(videoPath, name string) string {
+	parentDir := filepath.Dir(videoPath)
+	safeName := strings.TrimPrefix(name, "../") // strips only ONE leading ../, rest survives
+	return filepath.Join(parentDir, safeName)
+}
+
+// ReadSubtitleSidecar loads external subtitle content for the HTTP response.
+func ReadSubtitleSidecar(videoPath, name string) (string, error) {
+	target := ResolveSidecarPath(videoPath, name)
+	return readSidecarFromDisk(target)
+}
+# === file: media/sidecar_fs.go ===
+package media
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// readSidecarFromDisk normalizes then reads raw subtitle bytes from disk.
+func readSidecarFromDisk(p string) (string, error) {
+	p = filepath.Clean(p) // normalization only, no containment check vs media root
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return "", fmt.Errorf("failed to get subtitle sidecar content: %v", err)
+	}
+	return string(data), nil
+}
+```
+
+**分析**
+
+1. 【输入点枚举】adapters/http/media_handlers.go 第13–15行从 URL 查询串读取 path/source/name 三个外部输入；第32行把 name 直接传入 media.ReadSubtitleSidecar，name 全程无本地校验即进入文件读取链，source→sink 可达性成立。
+2. 【数据流追踪】主链：name（media_handlers.go:15）→ ReadSubtitleSidecar（:32）→ subtitle_service.go:17 构造 target → :12 `filepath.Join(parentDir, safeName)` → sidecar_fs.go:18 → :12 `os.ReadFile(p)`；source 位于第1个文件，sink 位于第3个文件，中间文件承担“看似净化实则不完整”的角色。
+3. 【防御核验】subtitle_service.go:11 的 `strings.TrimPrefix(name, "../")` 只剥离一次开头前缀，`../../etc/passwd` 剥离后仍余 `../etc/passwd`，`....//` 亦可绕过，属黑名单式单次替换、非有效防御；sidecar_fs.go:11 的 `filepath.Clean` 仅做词法规范化，不校验结果是否仍位于媒体根目录内；media_handlers.go:28 的 GetRealPath 只约束 path 参数本身，对事后拼接的 name 零覆盖——调用链上不存在任何完整防御。
+4. 【第二入口与替代通道】本组文件中仅 subtitlesHandler 一个路由能到达 os.ReadFile，无其他参数或间接调用构成第二入口；原工程的 lyrics/metadata 处理器属独立通道且未被拆入本组文件，因此最终结论由这条唯一主链独立支撑。
+5. 【定性】攻击者以 `?path=a.mp4&source=s&name=..%2f..%2fetc%2fpasswd` 即可越界读取任意文件并把内容回显到响应体，构成 CWE-22 路径穿越任意文件读取，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径穿越导致任意文件读取", "risk_level": "High", "source": "L1:line 15: name 来自 r.URL.Query().Get('name')，HTTP 查询参数完全攻击者可控", "sink": "L3:line 12: os.ReadFile(p) 以攻击者可控路径读取任意系统文件", "explanation": "输入点枚举：GET /api/media/subtitles 的三个查询参数 path(L1:13)/source(L1:14)/name(L1:15) 为全部外部输入，其中 name 经 L1:32 media.ReadSubtitleSidecar 进入文件读取链，可达性成立；主数据流 name→ReadSubtitleSidecar(L1:32)→ResolveSidecarPath(L2:17→L2:9-13)→readSidecarFromDisk(L2:18→L3:10)→os.ReadFile(L3:12)；防御核验一：L2:11 strings.TrimPrefix(name,'../') 仅剥离一次开头前缀，'../../etc/passwd' 剥离后仍含 ../ 且 '....//' 可绕过，属黑名单式过滤而非有效防御；防御核验二：L3:11 filepath.Clean 只做词法规范化，不校验结果是否仍在媒体根目录内，无法阻断 .. 穿越；防御核验三：L1:28 GetRealPath 仅约束 path 参数，对事后拼接的 name 无任何范围校验，故调用链上不存在完整防御；第二入口交代：本组文件内仅有 subtitlesHandler 一个路由触达该 sink，无其他参数或间接调用，原工程 lyrics/metadata 等处理器为独立通道未被拆入，单一主链足以支撑漏洞成立的结论", "fix_suggestion": "line 12: 读取前用 filepath.Rel(视频父目录, p) 校验相对路径不以 .. 开头且未逃逸根目录，否则拒绝请求（或将 name 收敛为 filepath.Base 纯文件名白名单）"}
+```

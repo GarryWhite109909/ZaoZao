@@ -1,0 +1,93 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+from flask import Flask, request, jsonify
+
+from app.services import embed_local_images
+
+app = Flask(__name__)
+
+
+@app.route('/render', methods=['POST'])
+def render_markdown():
+    # 外部输入点1：POST 表单 content，img 标签的 src 属性完全由用户控制
+    content = request.form.get('content', '')
+    html = embed_local_images(content)
+    return jsonify({'html': html})
+
+
+@app.route('/preview', methods=['GET'])
+def preview():
+    # 外部输入点2（第二入口）：查询参数 md 进入同一条嵌入链
+    raw = request.args.get('md', '')
+    return embed_local_images(raw)
+
+
+if __name__ == '__main__':
+    app.run()
+
+# === file: app/services.py ===
+import os
+import re
+
+from app.file_reader import read_as_data_uri
+
+RE_IMG_SRC = re.compile(r'<img[^>]*?\ssrc\s*=\s*["\']([^"\']+)["\']', re.I)
+BASE_PATH = '/srv/app/static/uploads'
+
+
+def _is_remote(path):
+    return path.startswith(('http://', 'https://', 'data:'))
+
+
+def sanitize_rel_path(path):
+    # 看似净化：仅删除第一次出现的 ../，黑名单式替换可被重复序列绕过
+    return path.replace('../', '', 1)
+
+
+def embed_local_images(text):
+    def _repl(m):
+        raw = m.group(1)
+        if _is_remote(raw):
+            return m.group(0)
+        rel = sanitize_rel_path(raw)
+        # normpath 只归一化，不保证结果仍在 BASE_PATH 之内
+        full = os.path.normpath(os.path.join(BASE_PATH, rel))
+        if os.path.exists(full):
+            return m.group(0).replace(raw, read_as_data_uri(full))
+        return m.group(0)
+    return RE_IMG_SRC.sub(_repl, text)
+
+# === file: app/file_reader.py ===
+import base64
+import os
+
+MIME_TYPES = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.svg': 'image/svg+xml',
+}
+
+
+def read_as_data_uri(file_name):
+    # sink：直接打开上游解析出的路径，无任何路径合法性校验
+    ext = os.path.splitext(file_name)[1].lower()
+    mime = MIME_TYPES.get(ext, 'application/octet-stream')
+    with open(file_name, 'rb') as f:
+        payload = base64.b64encode(f.read()).decode('ascii')
+    return 'data:{};base64,{}'.format(mime, payload)
+```
+
+**分析**
+
+1. **输入点枚举与可达性**：共两个外部输入点——`app/routes.py` line 11 的表单字段 `content`（路由 `/render`）与 line 19 的查询参数 `md`（路由 `/preview`）。二者均立即传入 `embed_local_images`；`app/services.py` line 21 由正则 `RE_IMG_SRC` 捕获 `src` 属性值赋给 `raw`，该值完全由攻击者构造，沿链可达最终文件读取。
+
+2. **逐条数据流的防御验证（主链）**：`raw` 先经 `app/services.py` line 16 的 `sanitize_rel_path`，仅执行一次 `replace('../', '', 1)`——属黑名单式字符串替换，输入 `../../../../etc/passwd` 剥离一层后仍剩余足够 `../` 完成穿越，判定无效；随后 line 26 的 `os.path.join` + `os.path.normpath` 只做形式归一化，整个项目不存在任何 `startswith`/`realpath` 包含性校验把结果限制在 `BASE_PATH` 内；line 27 的 `os.path.exists` 仅是可用性检查而非安全边界；最终 line 28 调用 `app/file_reader.py`，其 line 15 `open(file_name, 'rb')` 对路径零校验。另注意 `file_reader.py` line 4-8 的 `MIME_TYPES` 只决定 dataURI 标签且缺省回落 `application/octet-stream`，对可读文件类型毫无限制，白名单覆盖面为零。
+
+3. **替代通道**：即使修复弱过滤，`src` 写成绝对路径（如 `/etc/passwd`）时 `os.path.join(BASE_PATH, rel)` 会整体丢弃基准目录，直接命中 sink，构成第二条绕过路径；远程协议守卫 `_is_remote` 只排除 http/https/data，与本漏洞通道无关。
+
+4. **第二入口确认**：`/preview`（`routes.py` line 13-20）以查询参数复用同一条 `embed_local_images → read_as_data_uri` 链抵达同一 sink；除 `open` 外无其他危险汇点。两个入口、两条通道均无完整防御，CWE-22 任意文件读取成立，响应还会把文件内容 base64 回显给攻击者，风险评级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径遍历导致任意文件读取", "risk_level": "High", "source": "L1:line 11: request.form.get('content') 中用户可控 markdown 的 img src 属性", "sink": "L3:line 15: open(file_name, 'rb') 二进制读取并 base64 回显", "explanation": "主链: L1:line 11 表单 content 与 L1:line 19 查询参数 md 两个外部输入均传入 L2:line 19 embed_local_images, L2:line 21 正则捕获 src 得到攻击者全控的 raw; 流A: raw 经 L2:line 16 sanitize_rel_path 仅执行一次 replace('../','',1), 属黑名单字符串替换, 用多重 ../ 序列即可绕过; L2:line 26 join+normpath 只做归一化, 项目内不存在任何 startswith 或 realpath 包含校验, L2:line 27 exists 只是可用性检查而非安全边界; 随后 L2:line 28 调用 L3:line 15 open(file_name,'rb') 零校验读取, 内容 base64 后回显给攻击者; 流B替代通道: src 写绝对路径时 os.path.join 直接丢弃 BASE_PATH, 连弱过滤都无需触发; 流C第二入口: GET /preview 的 md 参数走完全相同链路抵达同一 sink; 另 L3:line 4-8 MIME_TYPES 仅决定 dataURI 标签且默认 octet-stream, 对可读文件类型零限制; 综上调用链无有效防御, CWE-22 任意文件读取成立", "fix_suggestion": "line 26: 先判 os.path.isabs(rel) 为真即原样返回标签, 再要求 os.path.realpath(full) 以 os.path.realpath(BASE_PATH)+os.sep 为前缀, 否则一律不读文件"}
+```

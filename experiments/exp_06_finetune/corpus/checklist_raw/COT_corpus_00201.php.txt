@@ -1,0 +1,17 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点**
+本文件是 league/commonmark 的纯正则工具类，无直接 HTTP 输入，其处理的外部数据全部来自调用方传入的参数：`isEscapable`、`matchAt`、`matchFirst`、`unescape` 等方法接收的是已进入解析流程的文档片段（纯计算，无危险 sink）；安全关键点是 **第 239 行 `isLinkPotentiallyUnsafe(string $url)` 的 `$url` 参数**——它承载用户撰写的 Markdown 链接目的地（`[x](url)`）或 Attributes 扩展设置的 `href`/`src` 属性值（见背景说明），属于典型用户可控输入，用于决定该 URL 能否进入最终渲染的 HTML 属性。
+
+**步骤 2｜验证 source→sink 数据流的防御有效性**
+该流唯一的防线是第 241 行的黑名单判定：`\preg_match(self::REGEX_UNSAFE_PROTOCOL, $url) !== 0 && ...`，其中第 69 行 `REGEX_UNSAFE_PROTOCOL = '/^(?:javascript|vbscript|file|data):/i'` 要求方案名**自行首开始连续字面匹配**，且匹配前**未剥离任何控制字符**。而浏览器按 WHATWG URL 规范解析时会丢弃 URL 中的制表符/换行符以及首尾 C0 控制字符，因此攻击者构造 `jav<TAB>ascript:alert(1)` 或前导控制字节 + `javascript:` 的变体：正则因中间夹带控制字节而不匹配 → `isLinkPotentiallyUnsafe` 返回 `false`（判为“安全”）→ URL 未经任何转义或精确白名单校验即被写入渲染结果的 `href`/`src` 属性 → 浏览器还原出 `javascript:` 并执行脚本。第 70 行 `REGEX_SAFE_DATA_PROTOCOL` 仅细化 `data:` 子集，与此绕过无关。按规则，黑名单/正则过滤属可绕过防御，不构成有效防护，该条数据流未被覆盖。
+
+**步骤 3｜第二入口与替代通道**
+第 69 行常量是 `public`，除第 241 行外还被库内链接渲染、`AttributesHelper::filterAttributes()` 等多处直接复用，所有基于该常量的判定共享同一缺陷；整条链路上不存在第二层校验（无协议精确白名单、无输出端转义兜底），故替代通道同样可达。
+
+**步骤 4｜结论**
+用户可控 URL（Markdown 链接/属性）-> 第 239 行 `$url` -> 第 241 行黑名单正则判定被控制字节绕过放行 -> 写入渲染 HTML 的 `href`/`src` -> 浏览器丢弃控制字节后按 `javascript:` 执行，构成存储型 XSS（CWE-79）。由于绕过门槛极低且影响所有启用不安全链接过滤的使用方，风险等级评为 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (XSS)", "risk_level": "High", "source": "line 239: isLinkPotentiallyUnsafe(string $url) 的 $url 参数，来自用户提交的 Markdown 链接目的地或 Attributes 扩展的 href/src 属性值", "sink": "line 241: preg_match(self::REGEX_UNSAFE_PROTOCOL, $url) 黑名单判定，返回 false 放行后 URL 进入渲染 HTML 的 href/src 属性", "explanation": "用户可控 URL -> line 239 $url -> line 241 依据 line 69 黑名单正则 /^(?:javascript|vbscript|file|data):/i 判定 -> 该正则要求方案名自行首连续字面匹配且匹配前未剥离控制字符，攻击者在方案名中嵌入制表符/换行等控制字节或添加前导控制字节即可使正则不匹配而返回 false 放行 -> URL 未经精确白名单或转义即写入 href/src -> 浏览器按 WHATWG URL 规范丢弃控制字节后仍解析为 javascript: 并执行脚本 -> XSS", "fix_suggestion": "line 241: 先用 preg_replace 删除 $url 中全部 \\x00-\\x20 控制字符与空白后再执行两条 preg_match，并将黑名单改为仅放行 http/https/mailto 等精确白名单协议"}
+```

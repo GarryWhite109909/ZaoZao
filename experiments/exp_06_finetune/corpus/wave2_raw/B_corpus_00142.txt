@@ -1,0 +1,91 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+from flask import Blueprint, jsonify, request
+
+from app.services import validate_peppol_document
+
+bp = Blueprint('peppol', __name__)
+
+
+@bp.route('/validate', methods=['POST'])
+def validate_document():
+    # raw XML body straight from the client
+    document_content = request.get_data()
+    schematron = request.args.get('schematron', 'PEPPOL-EN16931-UBL.xsl')
+    errors = validate_peppol_document(document_content, [schematron])
+    return jsonify(errors=errors)
+
+
+@bp.route('/validate/upload', methods=['POST'])
+def validate_upload():
+    # second entry: multipart invoice uploads
+    results = []
+    for uploaded in request.files.getlist('files'):
+        document_content = uploaded.read()
+        results.extend(validate_peppol_document(document_content, ['PEPPOL-EN16931-UBL.xsl']))
+    return jsonify(results=results)
+
+# === file: app/services.py ===
+import re
+from typing import List
+
+from app.saxon_backend import run_schematron
+
+
+_DOCTYPE_RE = re.compile(r'<!DOCTYPE\s+[^>\[]+>', re.IGNORECASE)
+
+
+def sanitize_xml_header(document_content: bytes) -> bytes:
+    # looks like XXE hardening, but the pattern skips internal subsets
+    text = document_content.decode('utf-8', errors='ignore')
+    return _DOCTYPE_RE.sub('', text).encode('utf-8')
+
+
+def validate_peppol_document(document_content: bytes, schematron_xsls: List[str]) -> List[dict]:
+    cleaned = sanitize_xml_header(document_content)
+    return run_schematron(cleaned)
+
+# === file: app/saxon_backend.py ===
+from typing import List
+
+from lxml import etree
+from saxonche import PySaxonProcessor
+
+
+_FAILED_ASSERT = '{http://purl.oclc.org/dsdl/svrl}failed-assert'
+
+
+def run_schematron(document_content: bytes) -> List[dict]:
+    errors = []
+    with PySaxonProcessor(license=False) as proc:
+        xsltproc = proc.new_xslt30_processor()
+        # sink: untrusted XML parsed with DTD/entity resolution left on
+        document = proc.parse_xml(xml_text=document_content.decode())
+        executable = xsltproc.compile_stylesheet(
+            stylesheet_file='data/sendpeppol-schematron/PEPPOL-EN16931-UBL.xsl')
+        output = executable.transform_to_string(xdm_node=document)
+        parsed_output = etree.fromstring(output.encode())
+        for e in parsed_output.findall(_FAILED_ASSERT):
+            errors.append({
+                'text': e.findtext('{*}text'),
+                'code': e.get('id'),
+                'severity': e.get('flag'),
+                'location': e.get('location'),
+            })
+    return errors
+```
+
+**分析**
+
+1. **外部输入点枚举与可达性**：共三处外部输入。① app/routes.py L11 `request.get_data()` 接收 POST /validate 的原始 XML 请求体；② app/routes.py L22 `uploaded.read()` 读取 POST /validate/upload 的多部分上传文件；③ app/routes.py L12 `request.args.get('schematron')` 查询参数。①②经 L13/L23 直接传入 services.py L16 `validate_peppol_document`，再经 L17 净化、L18 进入 saxon_backend.py L10 `run_schematron`，最终在 L15 `proc.parse_xml(xml_text=document_content.decode())` 被解析——污点全程无中断，可达性成立。
+
+2. **逐流防御验证**：流①与流②共用唯一防御点，即 services.py L7 正则 `_DOCTYPE_RE` 在 L13 执行替换。该正则字符类 `[^>\[]+` 显式排除了内部子集起始符，因此形如 `<!DOCTYPE r [<!ENTITY xxe SYSTEM ...>]>` 的载荷完全不匹配、原样透传；正则黑名单按判定规则视为可绕过，不构成有效防御。此外链路上游（routes.py）零校验，下游 saxon_backend.py L12-L15 创建 PySaxonProcessor 时未设置任何禁用 DTD/外部实体解析或网络访问的安全配置，攻击者可控字节直达 sink，外部实体可被展开造成本地文件读取与 SSRF。
+
+3. **第二入口与替代通道**：确认存在。除主入口 /validate 外，/validate/upload 是功能等价的第二入口；且 routes.py L12 的 schematron 参数未经任何校验流入 saxon_backend.py L16-L17 `compile_stylesheet(stylesheet_file=...)`，构成加载任意本地样式表的替代通道。两条入口与替代通道全部汇入同一个不完整的净化函数，说明项目缺少集中式安全解析层，支撑漏洞成立的最终结论。
+
+4. **结论**：source（HTTP 原始 XML 体/上传文件）到 sink（parse_xml 解析）之间仅有一道可绕过的正则黑名单，无任何有效 XXE 防御，判定为 CWE-611 漏洞，风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611", "risk_level": "High", "source": "L1:line 11: app/routes.py request.get_data() 客户端原始XML请求体（第二入口 L1:line 22 上传文件内容）", "sink": "L3:line 15: app/saxon_backend.py proc.parse_xml(xml_text=document_content.decode()) 未禁用DTD与外部实体解析", "explanation": "流1: routes.py L11 请求体经 L13 传入 services.py L16, 于 L17-L13 经正则净化后由 L18 进入 saxon_backend.py L15 parse_xml, 污点直达; 流2: routes.py L22 uploaded.read() 读取上传文件走完全相同链路到达同一 sink; 防御核查: 全链路唯一防御是 services.py L7 正则在 L13 的字符串替换, 字符类排除内部子集符号导致携带 ENTITY 声明的 DOCTYPE 完全不被匹配, 属可绕过黑名单而非有效防御, 且 sink 侧 L12-L15 无任何禁用 DTD/外部实体的安全配置; 第二入口: routes.py L17-L24 的 /validate/upload 为等价第二入口, 另有 L12 schematron 参数未校验流入 saxon_backend.py L16-L17 compile_stylesheet 构成替代通道, 所有通道共用同一失效净化, 结论为存在 CWE-611 漏洞", "fix_suggestion": "line 15: 在解析前对 PySaxonProcessor 配置禁止 DTD 与外部实体解析（设置禁用 DTD 的安全处理属性或改用 resolve_entities=False 且 no_network=True 的解析器预检），同时删除 services.py L13 的无效正则替换，改为结构白名单校验"}
+```

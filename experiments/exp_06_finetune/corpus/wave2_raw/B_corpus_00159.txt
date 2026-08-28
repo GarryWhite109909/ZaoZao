@@ -1,0 +1,88 @@
+LANG: php
+```code
+# === file: app/Controllers/Appointments.php ===
+<?php
+defined('BASEPATH') or exit('No direct script access allowed');
+
+/**
+ * Appointments controller — 承接原 index/find 的越权读取入口。
+ */
+class Appointments extends EA_Controller
+{
+    public function __construct()
+    {
+        parent::__construct();
+        $this->load->model('appointments_model');
+        $this->load->library('booking_service');
+    }
+
+    public function find(): void
+    {
+        try {
+            method('get');
+            if (cannot('view', PRIV_APPOINTMENTS)) {
+                abort(403, 'Forbidden');
+            }
+            check('appointment_id', 'numeric');
+            $appointment_id = request('appointment_id'); // SOURCE: 用户可控主键
+            $appointment = $this->booking_service->load($appointment_id);
+            json_response($appointment);
+        } catch (Throwable $e) {
+            json_exception($e);
+        }
+    }
+}
+
+# === file: app/Libraries/Booking_service.php ===
+<?php
+defined('BASEPATH') or exit('No direct script access allowed');
+
+/**
+ * Booking service — 中间层：看似有校验，实际只验格式。
+ */
+class Booking_service
+{
+    public function load(string $appointment_id): array
+    {
+        // 仅验证正整数格式，未校验该预约是否属于当前用户
+        $appointment_id = trim($appointment_id);
+        if (!ctype_digit($appointment_id) || (int) $appointment_id <= 0) {
+            throw new InvalidArgumentException('Invalid appointment ID.');
+        }
+        $CI =& get_instance();
+        return $CI->appointments_model->find((int) $appointment_id); // 转发至 sink
+    }
+}
+
+# === file: app/Models/Appointments_model.php ===
+<?php
+defined('BASEPATH') or exit('No direct script access allowed');
+
+/**
+ * Appointments model — 数据访问层。
+ */
+class Appointments_model extends EA_Model
+{
+    public function find(int $appointment_id): array
+    {
+        // SINK: 缺少 id_users_provider / id_users_customer 归属过滤
+        return $this->db
+            ->get_where('appointments', ['id' => $appointment_id])
+            ->row_array();
+    }
+}
+```
+
+**分析**
+
+1. **外部输入点枚举与可达性**：整组文件唯一的外部输入点是 `app/Controllers/Appointments.php` L24 的 `request('appointment_id')`（GET 参数）。数据流完整可达：L24 取值 → L25 传入 `booking_service->load` → `app/Libraries/Booking_service.php` L17 调用 `appointments_model->find` → `app/Models/Appointments_model.php` L12-13 以该 id 执行 `get_where` 查询，结果沿原路返回并在控制器 L26 `json_response` 全量输出，链路无中断。
+
+2. **逐条防御核验（唯一主链）**：① 控制器 L20 `cannot('view', PRIV_APPOINTMENTS)` 属角色级权限，位置在入口处，但覆盖面不含对象级归属，登录的低权限用户仍可通过；② 控制器 L23 `check(...,'numeric')` 与服务层 L13 `ctype_digit`+正整数判断均为类型/格式校验，只能挡住非数字注入，不能阻止攻击者更换 id=1..N 枚举他人预约；③ 模型层 L13 `get_where` 数组绑定仅防 SQL 注入，WHERE 子句中没有 `id_users_provider`/`id_users_customer`/session 用户任何归属条件。三处均非对象级授权，对 CWE-639 全部无效。
+
+3. **“伪净化”中间层**：`Booking_service.php` L12-15 是典型的“看似净化实则不完整”——trim 与 ctype_digit 只收窄了格式，污点数据（记录主键本身）原样穿透到达 sink，这正是把原单文件中已被修补的 `check_appointment_access` 移除后形成的语义缺口。
+
+4. **第二入口与替代通道**：本组文件内仅有 `find` 一个 HTTP 入口、一个请求参数；由于强类型 `string→int` 收窄，不存在绕过格式校验的其他参数通道。但 sink 下沉在模型层且无归属约束，任何未来复用 `Appointments_model::find` 的路由（如 update/destroy 重构后）都会结构性继承同一越权——这支撑而非削弱“链上授权缺失”的最终结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 通过用户可控主键导致的对象级授权缺失(IDOR)", "risk_level": "High", "source": "L1:line 24: request('appointment_id') 读取用户完全可控的记录主键", "sink": "L3:line 12: Appointments_model::find 中 get_where 按该 id 直查 appointments 表", "explanation": "唯一数据流：Appointments.php L24 request('appointment_id') 取得GET主键 → L25 进入 booking_service->load → Booking_service.php L12-15 仅做 trim 与 ctype_digit 正整数格式校验(类型检查而非授权) → L17 调用 appointments_model->find → Appointments_model.php L12-13 get_where 以该 id 直查 appointments 并返回完整行 → 控制器 L26 json_response 全量输出含 notes/meeting_link 等敏感字段；防御核查一：控制器 L20 cannot('view',PRIV_APPOINTMENTS) 为角色级权限，位置在入口但不覆盖对象级归属，低权限登录用户可通过；防御核查二：L23 check(numeric) 与服务层 L13 ctype_digit 均为格式校验，无法阻止更换 id 枚举他人预约；防御核查三：模型层 L13 参数化绑定仅防 SQL 注入，WHERE 无任何 user/provider 归属条件；综上链上对象级授权完全缺失，攻击者可遍历 id 越权读取任意预约，构成 CWE-639；第二入口结论：本组文件内仅 find 一个HTTP入口且无其他参数通道(强类型收窄)，但 sink 位于模型层且无归属过滤，任何后续复用 Appointments_model::find 的路由将结构性继承同一越权，替代通道分析支持结论成立", "fix_suggestion": "line 12: 在 Appointments_model::find 查询结果上增加对象级授权——取行后比对 row 的 id_users_provider/id_users_customer 与 session('user_id')(及 secretary 关联)，不匹配即抛出 Forbidden，或将归属条件并入 get_where 的 WHERE 子句"}
+```

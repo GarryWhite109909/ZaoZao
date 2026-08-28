@@ -1,0 +1,108 @@
+LANG: java
+
+```code
+# === file: src/main/java/org/apache/camel/component/infinispan/remote/InfinispanRemoteEventListener.java ===
+package org.apache.camel.component.infinispan.remote;
+
+import org.infinispan.notifications.Listener;
+import org.infinispan.notifications.cachelistener.annotation.CacheEntryCreated;
+import org.infinispan.notifications.cachelistener.annotation.CacheEntryModified;
+import org.infinispan.notifications.cachelistener.event.CacheEntryEvent;
+
+/**
+ * Listens for replicated exchange payloads arriving over the HotRod wire.
+ */
+@Listener
+public class InfinispanRemoteEventListener {
+
+    private final ExchangePayloadRouter router;
+
+    public InfinispanRemoteEventListener(ExchangePayloadRouter router) {
+        this.router = router;
+    }
+
+    @CacheEntryCreated
+    public void onCreated(CacheEntryEvent<String, byte[]> event) {
+        dispatch(event);
+    }
+
+    @CacheEntryModified
+    public void onModified(CacheEntryEvent<String, byte[]> event) {
+        dispatch(event);
+    }
+
+    private void dispatch(CacheEntryEvent<String, byte[]> event) {
+        byte[] raw = event.getValue();
+        if (raw != null && raw.length > 0) {
+            router.route(raw);
+        }
+    }
+}
+# === file: src/main/java/org/apache/camel/component/infinispan/remote/ExchangePayloadRouter.java ===
+package org.apache.camel.component.infinispan.remote;
+
+import org.apache.camel.component.infinispan.remote.protostream.DefaultExchangeHolderUtils;
+
+/**
+ * Triages incoming payloads and forwards them to the marshaller layer.
+ */
+public class ExchangePayloadRouter {
+
+    private static final int MAX_BYTES = 65536;
+
+    public void route(byte[] payload) {
+        if (!accepted(payload)) {
+            return;
+        }
+        DefaultExchangeHolderUtils.deserialize(payload);
+    }
+
+    /**
+     * Triage inspects only transport framing: serialization magic bytes and
+     * total size. Payload contents are never validated or whitelisted, so a
+     * crafted ObjectInputStream body still reaches the sink unchanged.
+     */
+    private boolean accepted(byte[] payload) {
+        return payload.length <= MAX_BYTES
+                && payload[0] == (byte) 0xac
+                && payload[1] == (byte) 0xed;
+    }
+}
+# === file: src/main/java/org/apache/camel/component/infinispan/remote/protostream/DefaultExchangeHolderUtils.java ===
+package org.apache.camel.component.infinispan.remote.protostream;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+
+import org.apache.camel.support.DefaultExchangeHolder;
+import org.apache.camel.util.ClassLoadingAwareObjectInputStream;
+
+/** Marshalling helpers for {@link DefaultExchangeHolder} over Protostream transports. */
+final class DefaultExchangeHolderUtils {
+
+    private DefaultExchangeHolderUtils() {
+    }
+
+    public static DefaultExchangeHolder deserialize(byte[] bytes) throws IOException {
+        try (ByteArrayInputStream bais = new ByteArrayInputStream(bytes);
+             ObjectInputStream ois = new ClassLoadingAwareObjectInputStream(bais)) {
+            return (DefaultExchangeHolder) ois.readObject();
+        } catch (ClassNotFoundException e) {
+            throw new IOException(e);
+        }
+    }
+}
+```
+
+**分析**
+
+1. **输入点枚举与可达性**：本组外部输入点共两处——`InfinispanRemoteEventListener.java:20-23` 的 `onCreated` 与 `:25-28` 的 `onModified`，两者都在 `:31` 经 `event.getValue()` 取得远端缓存中的 `byte[]`，其内容由写入缓存的任意网络对端完全控制；两条流在 `:33` 汇入 `router.route(raw)`，随后经 `ExchangePayloadRouter.java:16` 直达 `DefaultExchangeHolderUtils.java:19` 的 `ois.readObject()`，source→sink 跨三文件贯通，可达性成立。
+2. **防御逐流核验**：`InfinispanRemoteEventListener.java:32` 仅做判空与非零长度判断，属健壮性检查而非安全过滤；`ExchangePayloadRouter.java:24-27` 的 `accepted()` 只校验 Java 序列化魔数 `0xACED` 与 64KB 上限——攻击者构造的恶意序列化流天然携带该魔数且可压缩进尺寸限制，既无类白名单也无 `ObjectInputFilter` 或 HMAC 签名，属典型的看似有净化实则不完整的形式检查，可直接绕过。
+3. **sink 侧无兜底**：`DefaultExchangeHolderUtils.java:18-19` 直接以原生 `ObjectInputStream.readObject` 还原对象并强转；`:20` 使用的 `ClassLoadingAwareObjectInputStream` 仅放宽类加载上下文以便从应用类路径解析任意类，反而扩大了可用 gadget 面，不构成任何防御。
+4. **第二入口与替代通道**：created 与 modified 是两个并行入口，但均收敛于同一私有方法 `dispatch`（`InfinispanRemoteEventListener.java:30-35`）→ 同一 `route` → 同一 `deserialize` 链；组内不存在其他 `deserialize` 调用方，也没有先验签名校验或安全格式的替代路径，故所有通道最终都抵达未防护的 `readObject`，无法绕开危险汇点。
+5. **结论**：跨文件污点链完整、链上无一处有效净化，攻击者可通过向共享缓存写入恶意序列化负载触发任意类实例化，构成 CWE-502 反序列化漏洞（可升级为 RCE），风险级别 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-502: Java 原生反序列化不可信数据（跨文件污点传播）", "risk_level": "Critical", "source": "L1:line 31: event.getValue() 返回的远端缓存攻击者可控字节", "sink": "L3:line 19: ois.readObject() 对该字节的直接反序列化", "explanation": "输入点枚举：文件1 L20-23 onCreated 与 L25-28 onModified 两个回调均在 L31 取得远端缓存 byte[]，内容完全由网络对端控制，两条流经 L33 汇入 route 后同达文件2 L16 再传至文件3 L19 的 readObject，可达性成立；防御核验：文件1 L32 仅判空与长度属健壮性检查，文件2 L24-27 只查 0xACED 魔数与 64KB 上限，恶意序列化流天然满足且无类白名单、无 ObjectInputFilter、无签名校验，属可绕过的形式检查，文件3 L20 的 ClassLoadingAwareObjectInputStream 仅放宽类加载反而扩大 gadget 面不构成防御；第二入口结论：created 与 modified 两入口收敛于同一 dispatch-route-deserialize 链，组内无其他调用方亦无先验签名的替代通道，全部通道均抵达未防护的 readObject，漏洞成立", "fix_suggestion": "line 19: 在 readObject 前为 ObjectInputStream 设置 ObjectInputFilter 白名单（仅放行 DefaultExchangeHolder 与 java.base 基础类型），并在路由层增加 HMAC 完整性校验"}
+```

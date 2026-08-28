@@ -1,0 +1,106 @@
+LANG: php
+```code
+# === file: src/Http/ImageController.php ===
+<?php
+namespace App\Http;
+
+use App\Service\ImageCacheService;
+
+/** Entry point: renders an <img> tag whose src is fully user controlled,
+ * mirroring how dompdf feeds remote image urls into its cache resolver. */
+class ImageController
+{
+    public static function handle(): void
+    {
+        $url = $_GET['img'] ?? '';
+        $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+
+        [$localPath, $type] = ImageCacheService::resolveUrl($url, 'http', $host, '/assets/');
+
+        header('Content-Type: text/html; charset=utf-8');
+        echo '<img src="' . htmlspecialchars((string) $localPath, ENT_QUOTES)
+           . '" data-type="' . htmlspecialchars((string) $type, ENT_QUOTES) . '">';
+    }
+}
+
+if (PHP_SAPI !== 'cli') { ImageController::handle(); }
+# === file: src/Service/ImageCacheService.php ===
+<?php
+namespace App\Service;
+
+use App\Support\ImageInspector;
+
+class ImageCacheService
+{
+    protected static array $cache = [];
+
+    public static function resolveUrl(string $url, string $proto, string $host, string $base): array
+    {
+        $fullUrl = preg_match('#^[a-z][a-z0-9+.-]*://#i', $url) ? $url : $proto . '://' . $host . $base . ltrim($url, '/');
+        $scheme = strtolower(parse_url($fullUrl, PHP_URL_SCHEME) ?: 'http');
+
+        // Incomplete guard: only the transport scheme is checked; the payload
+        // itself is never scanned for DOCTYPE or ENTITY declarations.
+        if (!in_array($scheme, ['http', 'https', 'data'], true)) {
+            return ['', 'unknown'];
+        }
+
+        if ($scheme === 'data') {
+            $pos = strpos($fullUrl, ',');
+            $bytes = $pos === false ? '' : base64_decode(substr($fullUrl, $pos + 1));
+        } else {
+            $bytes = @file_get_contents($fullUrl);
+        }
+        if ($bytes === false || $bytes === '') {
+            return ['', 'unknown'];
+        }
+
+        $tmp = tempnam(sys_get_temp_dir(), 'img_');
+        file_put_contents($tmp, $bytes);
+        self::$cache[$fullUrl] = $tmp;
+
+        $type = ImageInspector::sniffType($tmp);
+        return [$tmp, $type];
+    }
+}
+# === file: src/Support/ImageInspector.php ===
+<?php
+namespace App\Support;
+
+class ImageInspector
+{
+    /** SINK: dimension sniffing hands xml/svg payloads to DOMDocument. */
+    public static function sniffType(string $path): ?string
+    {
+        $raw = (string) @file_get_contents($path);
+        if ($raw === '') {
+            return null;
+        }
+        if (stripos($raw, '<svg') === false && stripos($raw, '<?xml') === false) {
+            return strncmp($raw, "\x89PN", 3) === 0 ? 'png' : 'bin';
+        }
+
+        $doc = new \DOMDocument();
+        $doc->loadXML($raw, LIBXML_NOENT | LIBXML_DTDLOAD);
+        $root = $doc->documentElement;
+
+        return ($root && strtolower($root->nodeName) === 'svg') ? 'svg' : 'xml';
+    }
+}
+```
+
+**分析**
+
+1. **输入点枚举与可达性**：全组共两个外部输入点。① `ImageController.php:12` 的 `$_GET['img']`（主 source），经 `:15` 直接作为 `resolveUrl` 第一参数进入服务层；② `ImageController.php:13` 的 `$_SERVER['HTTP_HOST']`（第二入口），经同一调用进入 `ImageCacheService.php:12` 参与 URL 拼接。两条输入最终都收敛于 `ImageInspector.php:18` 的 `loadXML`，可达性成立。
+
+2. **主数据流逐段验证**：`ImageController.php:12` → `ImageCacheService.php:10-13`（拼接/解析出 scheme）→ `:17-19` 协议白名单 → `:21-25` data 分支 base64 解码或 `:25` 远端抓取得到攻击者完全控制的 `$bytes` → `:32` 写入临时文件 → `:35` 原样传给 `ImageInspector::sniffType` → `ImageInspector.php:9` 读回全部字节 → `:13` 内容探测门 → `:18` `DOMDocument::loadXML($raw, LIBXML_NOENT | LIBXML_DTDLOAD)`，污点全程无中断。
+
+3. **防御逐一核验**：唯一链上防御是 `ImageCacheService.php:17-19` 的 scheme 字符串白名单——属黑名单/字符串级检查且只覆盖传输层，对载荷内容零覆盖，还显式放行纯攻击者内容的 `data:` 通道，按规则判定为可绕过、非有效防御；`ImageInspector.php:13` 的 `stripos` 探测不是过滤器，恰是把形似 XML 的攻击者字节精确路由进解析器的开关；`ImageController.php:18-19` 的 `htmlspecialchars` 位于 sink 执行之后、仅作用于输出回显，与本漏洞无关。全链无 DOCTYPE/ENTITY 剥离、无 `LIBXML_NONET`、未禁用实体加载。
+
+4. **第二入口与替代通道**：存在两条。其一为 `data:` URI 替代通道（`ImageCacheService.php:21-23`）：攻击者提交 `img=data:image/svg+xml;base64,...` 即可内嵌带恶意 DTD 的 XML，完全跳过网络抓取直达 sink；其二为 Host 头第二入口（`ImageController.php:13`）：把 `ImageCacheService.php:25` 的抓取目标导向攻击者服务器，响应体同样汇入 `ImageInspector.php:18`。多通道汇聚证实暴露面并非单点偶发。
+
+5. **结论**：source 与 sink 分离于不同文件、中间层防御形同虚设，调用链上无完整防御，构成 CWE-611 XXE（可读本地文件/SSRF），定级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 Improper Restriction of XML External Entity Reference (XXE)", "risk_level": "High", "source": "L1:line 12: $_GET['img'] 用户可控图片URL", "sink": "L3:line 18: DOMDocument::loadXML 以 LIBXML_NOENT|LIBXML_DTDLOAD 解析攻击者可控的SVG/XML字节", "explanation": "主链: ImageController.php L12 取得用户可控URL经L15传入ImageCacheService::resolveUrl; ImageCacheService.php L12-L13 拼接并解析scheme, L17-L19 仅做协议字符串白名单(http/https/data), 属可绕过的黑名单式检查且对载荷零覆盖; L21-L23 data分支base64解码或L25 file_get_contents 得到攻击者完全控制字节, L32 写临时文件后L35原样传入ImageInspector::sniffType; ImageInspector.php L9 读回全部字节, L13 的stripos门是路由开关而非过滤, L18 loadXML同时启用实体替换与外部DTD加载, 构成XXE; 替代通道: img=data:image/svg+xml;base64,... 可内嵌任意DTD绕过网络抓取直达同一sink; 第二入口: L1:L13 的 $_SERVER['HTTP_HOST'] 可控Host将L2:L25抓取目标导向攻击者服务器, 响应体亦汇入L3:L18; 防御核查: 全链仅协议白名单(L2:L17)与sink之后的输出转义(L1:L18-L19), 无DOCTYPE剥离/无LIBXML_NONET/未禁用实体加载, 调用链上不存在完整防御", "fix_suggestion": "L3:line 18: 移除 LIBXML_NOENT 与 LIBXML_DTDLOAD, 改用 LIBXML_NONET|LIBXML_COMPACT, 并在解析前检测到 DOCTYPE 或 ENTITY 声明时直接拒绝该载荷"}
+```

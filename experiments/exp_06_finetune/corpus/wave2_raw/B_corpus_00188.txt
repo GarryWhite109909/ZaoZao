@@ -1,0 +1,102 @@
+LANG: python
+
+```code
+# === file: glances/stats_provider.py ===
+"""Plugin stats provider: builds the Mustache context for on-alert actions.
+
+Strings here come from outside the process: a process cmdline is chosen by
+whoever launched it, so any local user can control these values.
+"""
+
+import os
+
+
+def collect_process_stats(pid):
+    """Stats dict for pid; every cmdline item is attacker-controlled."""
+    try:
+        with open('/proc/%d/cmdline' % pid, 'rb') as fh:
+            raw = fh.read()
+    except OSError:
+        raw = b''
+    argv = [p.decode('utf-8', 'replace') for p in raw.split(b'\0') if p]
+    return {'processes': [{'name': os.path.basename(argv[0]) if argv else '',
+                           'cmdline': argv}]}
+# === file: glances/actions.py ===
+"""Manage on-alert actions: render Mustache templates, execute commands."""
+
+from glances.logger import logger
+from glances.secure import secure_popen
+
+try:
+    import chevron
+    chevron_tag = True
+except ImportError:
+    chevron_tag = False
+
+# Characters that secure_popen interprets as shell operators.
+_SHELL_OPERATORS = ('&&', '|', '>>', '>')
+
+
+def _sanitize_value(value):
+    """Blacklist-replace shell operators, recursing into containers."""
+    if isinstance(value, str):
+        for op in _SHELL_OPERATORS:
+            value = value.replace(op, ' ')
+        return value
+    if isinstance(value, (list, tuple)):
+        return type(value)(_sanitize_value(item) for item in value)
+    if isinstance(value, dict):
+        return {k: _sanitize_value(v) for k, v in value.items()}
+    return value
+
+
+def sanitize_mustache_dict(mustache_dict):
+    if not mustache_dict:
+        return mustache_dict
+    return {k: _sanitize_value(v) for k, v in mustache_dict.items()}
+
+
+class GlancesActions:
+    def __init__(self, args=None):
+        self.args = args
+
+    def allow_operators(self):
+        return not getattr(self.args, 'disable_config_exec', False)
+
+    def run(self, stat_name, criticality, commands, repeat, mustache_dict=None):
+        for cmd in commands:
+            if chevron_tag:
+                safe_dict = sanitize_mustache_dict(mustache_dict)
+                cmd_full = chevron.render(cmd, safe_dict)
+            else:
+                cmd_full = cmd
+            logger.info(f'Action for {stat_name}: {cmd_full}')
+            secure_popen(cmd_full, allow_operators=self.allow_operators())
+        return True
+# === file: glances/secure.py ===
+"""Shell execution helper used by on-alert actions."""
+
+import subprocess
+
+
+def secure_popen(cmd, allow_operators=True):
+    """Run cmd through the system shell so pipes/redirects keep working."""
+    proc = subprocess.Popen(cmd, shell=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc.communicate()
+    return proc.returncode
+```
+
+**分析**
+
+1. **外部输入点枚举与可达性**：①`glances/stats_provider.py` L13-L14 读取 `/proc/<pid>/cmdline`，其内容由任意本地用户通过启动进程自由设定；L17 构造 argv 列表，L18-L19 连同 `name`（argv[0] 的 basename）打包返回。告警引擎在触发命中时把该返回值作为 `mustache_dict` 实参跨文件传入 `GlancesActions.run`（actions.py L42），到 sink 可达。②第二输入点：actions.py L42 的 `commands` 参数源自 glances.conf（配置可控）；③actions.py L36-L37 的 `args` 决定 L40 `allow_operators` 取值，缺省时恒放行。
+
+2. **主数据流防御逐一验证**：stats_provider.py L17(argv)→L19 返回 → actions.py L42 入参 → L45 `sanitize_mustache_dict` → L16-L26 `_sanitize_value` → L46 `chevron.render` 插值 → L50 `secure_popen` → secure.py L8 `Popen(shell=True)`。链上唯一防线是 L18-L21 的黑名单 `str.replace`（仅处理 `&&`、`|`、`>>`、`>` 四个操作符）：属黑名单/字符串替换过滤，可绕过——未覆盖分号、反引号、`$()`、`${}`、换行、`<` 等元字符，替换为空格也不消除分隔语义；chevron 渲染不做 shell 转义；L22-L25 的递归只是扩展到嵌套容器（能覆盖 cmdline 列表），不改变字符集缺陷 → **无效防御**。sink 端 secure.py L8 无条件 `shell=True`，`allow_operators` 形参未参与任何限制。
+
+3. **第二入口/替代通道**：(a) chevron 缺失分支 actions.py L47-L48 把原始命令串直接送入同一 sink；(b) 配置来源的 `commands` 是独立污点源，同样汇聚于 L50→secure.py L8；(c) 模板变量 `{{name}}` 与 `{{cmdline}}` 为并行通道，同源于攻击者可控 argv。多条通道均落在无有效防御的执行点上。
+
+4. **结论**：CWE-78 成立——净化看似发生（中间文件有递归清洗）但黑名单不完整，source 与 sink 分离在不同文件且中间无有效防御，本地低权限攻击者可借进程命名以监控服务身份执行任意命令。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78: OS Command Injection via Mustache-rendered alert action", "risk_level": "High", "source": "L1:line 13: 读取 /proc/<pid>/cmdline, argv 内容由本地攻击者启动的进程决定", "sink": "L3:line 8: subprocess.Popen(cmd, shell=True) 执行经模板插值的告警命令", "explanation": "主链: stats_provider.py L13-L17 读入攻击者可控 argv 经 L19 返回后作为 mustache_dict 传入 actions.py L42 run(); L45 进入 L16-L26 _sanitize_value, 该防御仅为黑名单字符串替换(仅处理 && | >> >), 未覆盖分号 反引号 $() ${} 换行 < 等元字符, 替换为空格不消除分隔语义, chevron 渲染亦不做 shell 转义, 属可绕过的无效防御; 净化后经 L46 chevron.render 插值, 于 L50 传给 secure_popen, 最终在 secure.py L8 以 shell=True 无条件交由系统 shell 解释, sink 端 allow_operators 形参未实施限制且 actions.py L40 在 args 缺少 disable_config_exec 时默认放行; 第二入口一: actions.py L47-L48 在 chevron 缺失分支将原始命令串直接送入同一 sink; 第二入口二: 来自 glances.conf 的 commands 参数为配置可控独立污点源, 同样汇聚到 L50; 替代通道: 模板变量 {{name}} 与 {{cmdline}} 并行可达且同源于可控 argv; 综上调用链无完整防御, 本地低权限攻击者可借进程命名以监控账号身份执行任意命令", "fix_suggestion": "line 8: 在 secure_popen 中弃用 shell=True, 改为 shell=False 按 argv 列表执行(或对全部插值参数做 shlex.quote 白名单校验), 不再依赖黑名单替换"}
+```

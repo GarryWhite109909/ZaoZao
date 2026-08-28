@@ -1,0 +1,27 @@
+## 漏洞分析报告（CWE-918）
+
+**步骤 1｜枚举用户可控输入点并追踪数据流**
+
+- **输入点 A（核心）**：第 38 行 `Make(conf *remote_pb.RemoteConf)`。`RemoteConf` 由客户端通过远端存储配置 RPC（remote storage configure）提交，属于用户可控数据。其中第 45 行 `conf.S3Endpoint` 直接写入 `aws.Config.Endpoint`，第 44/46 行 Region 与 ForcePathStyle 同样外部可控。
+- **输入点 B**：各操作方法入参 `loc *remote_pb.RemoteStorageLocation`（第 79、134、193、223、255、340 行等）中的 Bucket/Path 也来自客户端请求，作为请求路径/主机组成部分发出。
+- **污染流**：`conf.S3Endpoint`（line 45）→ `aws.Config.Endpoint` → 第 56 行 `session.NewSession(config)` → 第 67 行 `client.conn = s3.New(sess)` → 此后该 client 的**所有** API 调用（第 98、147 行 ListObjectsV2、第 194 行 HeadObject、第 235 行 GetObject 下载、第 294 行 Upload、第 327/333/341/349/363/382 行等）都会向攻击者指定的任意主机发起 HTTP 请求；响应体经 `ReadFile` 返回给调用者，错误信息在第 202、241 行回显状态码——构成**可读回显的 SSRF**。
+
+**步骤 2｜防御有效性验证**
+
+- 全文对 `conf.S3Endpoint` **没有任何 scheme/host 白名单、内网地址黑名单或其他校验**，endpoint 字符串原样进入 HTTP 客户端。
+- 第 51–53 行的匿名凭证分支（`credentials.AnonymousCredentials`）不是防御，反而免去签名要求，使服务器更容易对内网端点（如云元数据 169.254.169.254）发出可成功解析的请求。
+- 凭证检查：第 50 行 AccessKey/SecretKey 取自配置项而非硬编码字面量，不构成 CWE-798 问题。
+- 结论：该条 source→sink 流上不存在有效防御，黑名单/白名单均缺失。
+
+**步骤 3｜第二入口与替代通道**
+
+- 除列表类操作外，`StatFile`(194)、`ReadFileWithConcurrency`(235)、`WriteFile`(294)、`UpdateFileMetadata`(327/333)、`DeleteFile`(341)、`CreateBucket`(363)、`DeleteBucket`(382) 复用同一个被污染 endpoint 构建的 `s.conn`，任一通道均可触发对内网的请求。
+- 叠加第 46 行 `S3ForcePathStyle` 可控：关闭 path-style 时 Bucket 名可进入虚拟主机式子域名，进一步扩大可控请求面（子域指向、路径拼接）。替代通道充分存在，无法通过单一入口封堵。
+
+**步骤 4｜结论**
+
+用户可控的 `conf.S3Endpoint` 未经验证即被用于构建 S3 客户端，服务器随后代表攻击者向任意主机发起 HTTP 请求并可回显响应，符合 CWE-918（SSRF）；结合背景所述 RPC 无认证、无校验，攻击者可探测内网、读取云元数据凭证，风险等级 **High**。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 SSRF 服务端请求伪造", "risk_level": "High", "source": "line 45: aws.String(conf.S3Endpoint)（conf 经 remote storage configure 类 RPC 由用户提交）", "sink": "line 67: s3.New(sess) 以用户可控 Endpoint 构建客户端，后续 line 98/194/235/294/341 等所有 conn 调用均向其发 HTTP 请求", "explanation": "用户提交的 conf.S3Endpoint -> line 45 写入 aws.Config.Endpoint -> line 56 session.NewSession -> line 67 s3.New 绑定为 client.conn -> ListDirectory/StatFile/ReadFile/WriteFile/DeleteFile 等全部经该 client 向攻击者指定主机发请求，响应经 ReadFile 回显 -> 全程无 scheme/host 白名单或内网地址校验，line 51-53 匿名凭证分支更便于无签名探测内网与云元数据 -> 可回显 SSRF", "fix_suggestion": "line 45: 在赋值前校验 conf.S3Endpoint，仅放行预注册的 https 远端域名并拒绝内网/链路本地地址，校验失败则 Make 返回错误"}
+```

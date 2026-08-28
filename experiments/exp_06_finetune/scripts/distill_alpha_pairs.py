@@ -31,12 +31,21 @@ CORPUS = Path(__file__).resolve().parents[1] / "corpus"
 OUT_PATH = CORPUS / "distill_alpha_pairs.jsonl"
 PROGRESS_PATH = CORPUS / "distill_progress.jsonl"
 
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = os.environ.get("TEACHER_MODEL", "stealth/ox-alpha")
+TEACHER_API_URL = os.environ.get(
+    "TEACHER_API_URL",
+    "https://openrouter.ai/api/v1/chat/completions")
+# 端点协议按 URL 自动分派：OpenRouter 兼容 OpenAI chat/completions；
+# 智谱 BigModel 同为 OpenAI 兼容（v4），但无 reasoning 参数、模型始终思考。
+IS_BIGMODEL = "bigmodel" in TEACHER_API_URL
+API_URL = TEACHER_API_URL
+DEFAULT_MODEL = ("glm-5.3-flash" if IS_BIGMODEL else "z-ai/glm-5.3-flash")
+MODEL = os.environ.get("TEACHER_MODEL", DEFAULT_MODEL)
+# 2026-08-27：stealth/ox-alpha（Stealth Ox Alpha 测试期代号，即 ZAI GLM-5.3 Flash）已下线，OpenRouter 404 提示转用公开 slug z-ai/glm-5.3-flash
 
 # 多账号轮换（2026-08-26）：免费档限额按账号计，OPENROUTER_KEY 支持逗号分隔
 # 多把 key，每次请求轮换使用；单 key 时行为与原来完全一致
-KEYS = [k.strip() for k in os.environ.get("OPENROUTER_KEY", "").split(",") if k.strip()]
+_RAW_KEY_ENV = os.environ.get("TEACHER_KEY") or os.environ.get("OPENROUTER_KEY") or ""
+KEYS = [k.strip() for k in _RAW_KEY_ENV.split(",") if k.strip()]
 _key_i = 0
 
 
@@ -55,18 +64,30 @@ SCHEMA_SAFE = ('{"has_vulnerability": false, "vulnerability_type": "none", '
                '"explanation": "...", "fix_suggestion": "no fix needed"}')
 
 
-def call_teacher(key: str, user_prompt: str, max_tokens: int = 8000,
+DEFAULT_MAX_TOKENS = 16384 if IS_BIGMODEL else 8000
+# BigModel GLM-5.3-flash 始终思考：thinking 与正文共用 max_tokens 预算，
+# 大 prompt（系统文本+12k 字符代码）下 8000 经常只够思考导致正文为空
+# （2026-08-27 批跑实测 empty content 频发），16384 起步。
+
+
+def call_teacher(key: str, user_prompt: str,
+                 max_tokens: int | None = None,
                  temperature: float = 0.4, retries: int = 5) -> str:
+    if max_tokens is None:
+        max_tokens = int(os.environ.get("TEACHER_MAX_TOKENS", DEFAULT_MAX_TOKENS))
     import requests
     payload = {
         "model": MODEL,
         "messages": [{"role": "user", "content": user_prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
-        # 教师是推理模型：不限思考长度会把 token 预算全部耗在 reasoning 上
-        # 导致正文为空（实测 2026-08-22）。medium 平衡分析质量与产出稳定性。
-        "reasoning": {"effort": os.environ.get("TEACHER_EFFORT", "medium")},
     }
+    if not IS_BIGMODEL:
+        # OpenRouter 推理模型：不限思考长度会把 token 预算全部耗在 reasoning 上
+        # 导致正文为空（实测 2026-08-22）。medium 平衡分析质量与产出稳定性。
+        payload["reasoning"] = {"effort": os.environ.get("TEACHER_EFFORT", "medium")}
+    # BigModel GLM-5.3-flash 始终思考且不可关（400 code 1210 实测 2026-08-27），
+    # 靠大 max_tokens + reasoning_content 兜底保证正文产出。
     for attempt in range(retries):
         try:
             use_key, key_idx = _next_key() if len(KEYS) > 1 else (key, 0)

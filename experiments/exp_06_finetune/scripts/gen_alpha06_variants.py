@@ -294,12 +294,22 @@ def main():
     ap.add_argument("--per-kind-limit", type=int, default=0)
     args = ap.parse_args()
 
-    key = os.environ.get("OPENROUTER_KEY", "")
+    key = (os.environ.get("TEACHER_KEY") or os.environ.get("OPENROUTER_KEY") or "")
     if not key:
         print("错误：需要 OPENROUTER_KEY", file=sys.stderr)
         sys.exit(1)
 
     manifest = json.loads((CORPUS / "train_pool" / "manifest.json").read_text())["samples"]
+    # 考卷簇种子过滤（P2，2026-08-27）：dedupe_real_corpus.py 审计出的
+    # 隔离淘汰种子（与 rolling_dev/rolling_dev_safe 同簇）不再送教师——
+    # 省无谓 API 开销，泄漏拦截前移到种子层
+    _bl = CORPUS.parent / "results/corpus_cluster_blocklist.json"
+    if _bl.exists():
+        _banned = set(json.loads(_bl.read_text(encoding="utf-8"))["filenames"])
+        _n = len(manifest)
+        manifest = [s for s in manifest if Path(s["file"]).name not in _banned]
+        if _n != len(manifest):
+            print(f"[blocklist] 滤除考卷簇种子 {_n - len(manifest)} 个", flush=True)
     rng = random.Random(42)
 
     tasks = []
@@ -325,11 +335,14 @@ def main():
                                                s.get("expected_vulnerability", ""), t),
             })
     # B 跨文件：取注入类种子
+    # 2026-08-27 扩量：类池 5→9 族、字符上限 6000→12000（BigModel ctx 131k 足够），
+    # 候选任务 16→~105（crossfile 目标 ≥50 条入库）
     inj = [s for s in manifest if (s.get("expected_cwe") or "") in
-           ("CWE-89", "CWE-78", "CWE-79", "CWE-22", "CWE-918")][:16]
+           ("CWE-89", "CWE-78", "CWE-79", "CWE-22", "CWE-918",
+            "CWE-502", "CWE-611", "CWE-639", "CWE-352")]
     for i, s in enumerate(inj):
         code = (CORPUS / "train_pool" / s["file"]).read_text(errors="replace")
-        if len(code) > 6000:
+        if len(code) > 12000:
             continue
         tasks.append({"key": f"B:{Path(s['file']).stem}", "kind": "crossfile",
                       "lang_out": s.get("language", "").lower(),

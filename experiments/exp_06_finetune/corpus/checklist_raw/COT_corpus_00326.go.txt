@@ -1,0 +1,39 @@
+## 漏洞分析报告
+
+### 步骤 1｜用户可控输入点枚举与 sink 追踪
+
+| 输入点 | 位置 | 到达的危险 sink |
+|---|---|---|
+| 查询参数 `files`（逗号分隔的多选下载目标） | 第 28 行 `r.URL.Query().Get("files")` | 经第 171→185 行传入 `getFiles`，最终在第 137 行成为归档条目名 `NameInArchive`，第 211 行由 `archiver.Archive` 写入响应压缩包 |
+| 请求路径 `r.URL.Path` | 第 90 行 | 第 219 行 `file.Fs.Open(file.Path)`（受 NewFileInfo 的 Checker 约束） |
+| 查询参数 `algo` | 第 48 行 | 仅作白名单 switch 映射到固定归档器，不拼接进任何路径 |
+| 查询参数 `inline` / 文件名输出 | 第 73、75、78、209 行 | 均经 `url.PathEscape` 后写入 Content-Disposition 头 |
+
+关键 sink 是**归档条目名**：第 125–127 行计算 `nameInArchive`，第 137 行注入 `archives.FileInfo`，第 211 行随压缩包输出给客户端。
+
+### 步骤 2｜逐条数据流的防御有效性验证
+
+**流 A（查询参数直注 `..`）— 已防御**：第 34 行解码后，第 39 行 `slashClean` 先补根再 `gopath.Clean`，根化路径会消解所有前导 `..`；第 40 行 `filepath.Join` 保证结果仍落在所选目录之下。直接通过 `files=../..` 逃逸用户范围的路径被阻断。
+
+**流 B（二阶注入：预置文件名 → 归档条目名）— 防御无效**：
+- 第 151 行 `Readdirnames` 枚举目录项，第 157 行 `filepath.Join` 拼出子路径。Linux 宿主上允许存在字面名为 `` `..\..\pwn` `` 的合法文件（反斜杠不是路径分隔符）。
+- 第 113 行 `d.Check(path)` 只校验存储路径是否在用户授权范围内——此类文件名完全在范围内，检查通过。该防御覆盖的是“FS 访问越界”，**不覆盖“条目名安全性”**。
+- 第 125–127 行 `TrimPrefix`/`ToSlash` 后，`` `..\..\pwn` `` 原样保留。
+- 第 133 行 `strings.ReplaceAll(nameInArchive, "\\", "/")`（即 GHSA-gxjx-7m74-hcq8 的修复）把反斜杠归一为斜杠，反而生成规范的 `` `../../pwn` `` **点点穿越段**——这是纯粹的字符串替换归一化，未检测/剔除 `..` 段，按规则不属于有效净化。
+- 第 135–137 行将含 `..` 的名字直接写入 `NameInArchive`，全链路（125–141 行）没有任何“条目名不得包含 `..` 或必须落在归档根内”的校验。
+- 第 211 行 `archiver.Archive` 将其作为条目名写入压缩包 → 受害者解压时条目逃逸解压目录（zip-slip，任意文件写）。
+
+### 步骤 3｜第二入口 / 替代通道排查
+
+- 单文件下载 `rawFileHandler`（第 219 行）：仅回读内容，无路径语义的条目名输出，安全。
+- `algo` 参数（第 48–68 行）：精确白名单，默认拒绝，安全。
+- 响应头文件名（第 75、78、209 行）：`url.PathEscape` 编码，无 CRLF/路径语义，安全。
+- 结论：唯一未被防御覆盖的通道就是**目录归档的条目名生成链**。
+
+### 步骤 4｜结论
+
+第 133 行的替换式修复不完整：它只统一了分隔符，既未阻止含反斜杠的存量文件名进入条目名，又把 Windows 特有的 zip-slip 转化为对所有解压器生效的 `../` 穿越。判定为 **CWE-22 路径穿越（Zip-Slip）**，需下载权限 + 范围内可影响文件名，解压侧触发任意写，风险等级 **High**。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal (Zip-Slip)", "risk_level": "High", "source": "line 28: 查询参数 files 选择下载目录；line 157: Readdirnames 返回的目录项名（攻击者预置的字面名 ..\\..\\pwn）", "sink": "line 137: NameInArchive 写入 archives.FileInfo，line 211: archiver.Archive 输出归档条目", "explanation": "用户经 line 28 选择目录归档 -> line 151/157 递归枚举命中含反斜杠的合法在册文件名 ..\\..\\pwn -> line 113 d.Check 仅校验存储路径在用户范围内，反斜杠名合法通过 -> line 125-127 TrimPrefix/ToSlash 保留 ..\\..\\pwn -> line 133 ReplaceAll 将反斜杠归一为斜杠，生成规范点点段 ../../pwn（字符串替换非有效净化，且未做任何 .. 段校验）-> line 137 直接作为归档条目名 -> line 211 写入压缩包 -> 受害者解压时条目逃逸解压目录造成任意文件写", "fix_suggestion": "line 133: 归一化后追加校验，将 nameInArchive 按 / 分段，若任一段等于 .. 则跳过该条目或返回错误，而非仅做分隔符替换"}
+```

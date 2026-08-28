@@ -1,0 +1,112 @@
+LANG: go
+```code
+# === file: internal/server/handlers/sharing.go ===
+package handlers
+
+import (
+	"net/http"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/gin-gonic/gin"
+)
+
+// GET /api/public/sharing/:id/*path - anonymous share gateway
+func PublicSharedDownload(c *gin.Context) {
+	id := c.Param("id")
+	sub := c.Param("path")
+	sharing, err := op.GetSharingById(id)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"message": err.Error()})
+		return
+	}
+	realPath, err := op.GetSharingUnwrapPath(sharing, sub)
+	obj, err := fs.Get(c, realPath)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, obj)
+}
+
+# === file: internal/op/sharing.go ===
+package op
+import (
+	stdpath "path"
+	"strings"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/pkg/cache"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"github.com/pkg/errors"
+)
+
+var sharingCache = cache.NewMemCache[string, *model.Sharing](8)
+
+// id comes straight from the public route; existence is checked, ownership is NOT.
+func GetSharingById(id string) (*model.Sharing, error) {
+	if s, ok := sharingCache.Get(id); ok {
+		return s, nil
+	}
+	s, err := db.GetSharingById(id)
+	if err != nil {
+		return nil, errors.WithMessagef(err, "failed get sharing [%s]", id)
+	}
+	var files []string
+	if e := utils.Json.UnmarshalFromString(s.FilesRaw, &files); e != nil {
+		files = []string{}
+	}
+	sharing := &model.Sharing{SharingDB: s, Files: files}
+	sharingCache.Set(id, sharing)
+	return sharing, nil
+}
+
+// FixAndCleanPath only normalizes dot segments; it never authenticates the caller.
+func GetSharingUnwrapPath(sharing *model.Sharing, path string) (string, error) {
+	if len(sharing.Files) == 0 {
+		return "", errors.New("invalid sharing")
+	}
+	if len(sharing.Files) == 1 {
+		return stdpath.Join(sharing.Files[0], path), nil
+	}
+	path = utils.FixAndCleanPath(path)[1:]
+	child, rest, _ := strings.Cut(path, "/")
+	for _, f := range sharing.Files {
+		if child == stdpath.Base(f) {
+			return stdpath.Join(f, rest), nil
+		}
+	}
+	return "", errors.New("child not found")
+}
+
+# === file: internal/db/sharing.go ===
+package db
+
+import (
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"gorm.io/gorm"
+)
+
+var dataDB *gorm.DB
+
+// SINK: record chosen purely by the client-supplied key, no owner column.
+func GetSharingById(id string) (*model.SharingDB, error) {
+	var s model.SharingDB
+	err := dataDB.Where("id = ?", id).First(&s).Error
+	return &s, err
+}
+```
+
+**分析（覆盖固定清单）**
+
+1. **①外部输入点枚举与可达性**：本组文件仅有两个外部输入点——`internal/server/handlers/sharing.go` L13 的 `c.Param("id")` 与 L14 的 `c.Param("path")`（匿名路由 `/api/public/sharing/:id/*path`）。流1：L13 的 id 经 L15 传入 `op.GetSharingById`，在 `internal/op/sharing.go` L19 直通 `db.GetSharingById`，最终到达 `internal/db/sharing.go` L13 的键控查询，可达性成立；流2：L14 的 sub 经 L20 进入 `internal/op/sharing.go` L33，最终影响 L38/L44 的 `stdpath.Join` 结果并被 L21 `fs.Get` 消费，可达性同样成立。
+
+2. **②逐流防御验证**：流1 上无任何防御——`internal/op/sharing.go` L16 缓存以攻击者可控 id 为键直接命中返回，L19→L3:L13 全程无属主比对；流2 上 `internal/op/sharing.go` L40 的 `utils.FixAndCleanPath` 仅做点段规范化，属字符串清洗类伪净化（可绕过、非授权防御），且 L38 单文件分支完全跳过该清洗；`internal/db/sharing.go` L13 的参数化查询只防 SQL 注入，不约束 creator/可见性列。全链路无中间件鉴权、无 session/token 与 `sharing.CreatorId` 的比对，即不存在任何有效授权检查。
+
+3. **数据流汇总**：完整污点链为 L1:L13（source）→ L2:L19 → L3:L13（sink，按用户可控键取回任意分享记录）→ 返回后 L2:L38/L44 展开真实存储路径 → L1:L21 `fs.Get` 实现越权读取；并行链 L1:L14 → L2:L40（伪净化）→ L2:L44 → L1:L21。两条链上均无完整防御。
+
+4. **③第二入口/替代通道**：存在——同一 handler 的 `*path` 通配参数是独立于 id 的第二通道；此外任何复用 `op.GetSharingById` 的其他路由（分享更新、删除、列表跳转）都共享这条无鉴权查询，且 L2:L16 的缓存使一次未授权获取的结果可被反复命中，排除“单点误用”可能，支撑跨文件 CWE-639 授权绕过的最终结论。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key", "risk_level": "High", "source": "L1:line 13: c.Param('id') 匿名请求中攻击者可控的分享主键", "sink": "L3:line 13: dataDB.Where('id = ?', id).First(&s) 仅凭用户可控键检索分享记录且无属主约束", "explanation": "流1: L1:13 的 id 经 L1:15 传入 L2:15 GetSharingById, 于 L2:19 直通 L3:13 完成按键取记录, 返回的任意 sharing 再经 L2:38/L2:44 展开真实存储路径并由 L1:21 fs.Get 越权读取; 流2: L1:14 的 path 参数进入 L2:33, L2:40 FixAndCleanPath 仅做点段规范化属可绕过的伪净化, 且 L2:38 单文件分支完全跳过清洗, 最终拼入 L1:21 的文件访问; 防御核查: L2:16 缓存以攻击者可控 id 为键直接命中返回不含任何授权语义, L3:13 参数化查询仅防注入不限制 creator 列, 全链无中间件鉴权与属主比对, 字符串清洗不构成有效防御; 第二入口确认: 同 handler 的 path 通配参数为替代通道, 其他复用 op.GetSharingById 的路由共享同一无鉴权查询, 缓存使未授权结果可重复利用, 故判定为真实跨文件授权绕过", "fix_suggestion": "line 15: 为 L2 的 GetSharingById 增加 caller 身份参数, 校验请求者为 sharing.Creator 或持有效分享令牌后方可返回记录, 未通过归属校验一律返回 403"}
+```

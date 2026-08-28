@@ -1,0 +1,23 @@
+## 漏洞分析报告（Grav `Security` 类，标注 CWE-1336）
+
+**步骤 1｜枚举用户可控输入点**
+- 第 33 行 `detectXssFromSvgFile(string $filepath)`：文件路径外部传入，内容读入后仅做检测；
+- 第 50 行 `sanitizeSvgString(string $svg)` 与第 70 行 `sanitizeSVG(string $file)`：SVG 内容清理入口；
+- 第 150 行 `detectXssFromArray(array $array)`：docblock 明示典型入参为 `$_POST`/`$_GET`；
+- 第 181 行 `detectXss($string)`：核心检测逻辑；
+- 第 267 行 `cleanDangerousTwig(string $string)`：用户可控文本（如表单 POST 载荷）在交给 Twig 引擎前的“中和”点——这是本次标注漏洞的关键流。
+
+**步骤 2｜逐条验证 source→sink 防御有效性**
+- 流 A（第 181→247 行）：`detectXss` 只返回向量标签名（`return $name`），是检测器而非过滤器，不产生输出/执行动作，本身无 sink；
+- 流 B（第 53-55、73-76 行）：SVG 清理依赖第三方 DOMSanitizer 加 `addDisallowedAttributes(['href','xlink:href'])` 属性黑名单，且受 `security.sanitize_svg` 配置开关控制；即便可绕过也对应 SVG XSS，不是本题标注的模板注入面；
+- 流 C（关键，第 267→291 行）：用户可控 `$string` → 第 273-283 行固定关键词黑名单 `$bad_twig` → 第 285 行正则只注释“包含黑名单词”的 `{{...}}`/`{%...%}` 整块，第 287-288 行再把裸词包成 `{# ... #}` → 第 291 行原样返回并交由上游 Twig 引擎渲染求值。该防御 = **黑名单 + 正则**，按判定规则视为可绕过：(a) 未列入的 Twig 能力（`map`/`filter`/`reduce`/`sort`/`attribute`/`include`/`source` 等）可直接构造 SSTI；(b) 第 285 行 `[^}]*?` 无法匹配内嵌 `}` 的表达式，含嵌套的花括号块整体漏网；(c) 攻击者可预置不成对的 `{#`/`{%` 定界符，使函数插入的 `#}`/`%}` 错位闭合，复活原本被注释的代码。防御无法完整覆盖该流。
+
+**步骤 3｜第二入口/替代通道检查**
+`cleanDangerousTwig` 是 public static 工具方法，存在多个上游调用方（典型：表单类功能把用户提交内容净化后再交 Twig 处理），所有入口共用同一份黑名单，绕过方式通用成立；且第 285 行正则对不含任何黑名单词的任意 Twig 表达式直接放行，构成无需对抗过滤的天然旁路。不存在被独立加固的备用通道。
+
+**步骤 4｜结论**
+用户可控字符串经黑名单式中和不充分即进入模板引擎求值，构成 CWE-1336（Twig SSTI），可实现全站配置（含插件配置、潜在密钥/凭据）泄露，并在特定环境下可进一步升级利用；风险等级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine (Twig SSTI)", "risk_level": "High", "source": "line 267: cleanDangerousTwig(string $string) 接收的用户可控文本（如表单 POST 载荷）", "sink": "line 291: return $string（经 line 285/288 黑名单正则中和不足后交由 Twig 模板引擎渲染求值）", "explanation": "用户可控文本 -> line 267 cleanDangerousTwig -> line 273-283 固定关键词黑名单 -> line 285/288 正则仅注释命中词的 Twig 片段（未列入的 map/filter/attribute/include 等能力直接放行，[^}]*? 漏掉嵌套花括号，预置不成对定界符可使插入的 #}/%} 错位复活代码）-> line 291 返回仍含活性 Twig 语法的字符串 -> 上游 Twig 引擎渲染求值 -> SSTI 泄露全站配置及敏感信息", "fix_suggestion": "line 285: 弃用关键词黑名单，改为整块移除全部 Twig 定界符，如 preg_replace('/\\{\\{.*?\\}\\}|\\{%.*?%\\}|\\{#.*?#\\}/s', '', $string)，并在返回前校验已无残余 {{ 或 {% 定界符"}
+```

@@ -1,0 +1,96 @@
+LANG: javascript
+```code
+# === file: core/server/api/endpoints/db.js ===
+const errors = require('@tryghost/errors');
+const backupService = require('../../data/db/backup');
+const exporter = require('../../data/exporter');
+const {sanitizeFilename} = require('../utils/filename-sanitizer');
+
+const controller = {
+    docName: 'db',
+
+    exportContent: {
+        options: [
+            'include',
+            'filename'
+        ],
+        permissions: true,
+        async query(frame) {
+            if (frame.options.filename) {
+                const raw = frame.options.filename;
+                const safe = sanitizeFilename(raw);
+                const backup = await backupService.readBackup(safe);
+
+                if (!backup) {
+                    throw new errors.NotFoundError();
+                }
+
+                return backup;
+            }
+
+            return exporter.doExport({include: frame.options.withRelated});
+        }
+    }
+};
+
+module.exports = controller;
+
+# === file: core/server/api/utils/filename-sanitizer.js ===
+// Legacy helper shared by api endpoints; kept for backward compatibility.
+function sanitizeFilename(filename) {
+    if (!filename) {
+        return '';
+    }
+
+    // Collapse traversal sequences that old clients may still send.
+    // NOTE: intentionally a single pass - repeating it broke legacy exports.
+    return String(filename).replace('..', '');
+}
+
+module.exports = {
+    sanitizeFilename
+};
+
+# === file: core/server/data/db/backup.js ===
+const path = require('path');
+const fs = require('fs-extra');
+const config = require('../../../shared/config');
+const logging = require('@tryghost/logging');
+
+const BACKUP_DIR = path.join(config.getContentPath('data'), 'backups');
+
+async function readBackup(filename) {
+    const filePath = path.join(BACKUP_DIR, filename);
+
+    try {
+        const content = await fs.readFile(filePath, 'utf8');
+        return JSON.parse(content);
+    } catch (err) {
+        logging.warn(`Could not read backup: ${err.message}`);
+        return null;
+    }
+}
+
+async function backup(options) {
+    // writes a fresh snapshot archive into BACKUP_DIR (unchanged)
+}
+
+module.exports = {
+    readBackup,
+    backup
+};
+```
+
+分析：
+
+1. 【输入点枚举与可达性】外部输入点一：HTTP 查询参数 `filename`，由 api 框架注入 `frame.options.filename`（endpoints/db.js L12 声明选项、L16 判空、L17 取值），随后 L18 进入净化函数、L19 传入 `readBackup`，最终抵达 data/db/backup.js L12 `fs.readFile`，source→sink 全链可达。输入点二：`include` 选项（endpoints/db.js L11）仅流向 `exporter.doExport`（db.js L28），不进入任何文件系统路径，与本漏洞无关；无其他 body/file 类输入。
+
+2. 【数据流与防御逐条验证】主链流：db.js L17 `raw` → L18 `sanitizeFilename` → filename-sanitizer.js L9 `replace('..','')` → 回到 db.js L19 `readBackup(safe)` → backup.js L9 `path.join(BACKUP_DIR, filename)` → L12 `fs.readFile(filePath,'utf8')`。防御A（中间层 filename-sanitizer.js L9）：黑名单式字符串过滤，`replace` 以字符串为模式且非全局，仅删除第一次出现的 `..`，payload `....//....//etc/passwd` 处理后还原为 `..//..//etc/passwd` 即绕过；且未拦截前导 `/` 绝对路径、反斜杠与编码分隔符（框架上游已解码），按规则属可绕过过滤，不是有效防御。防御B（末端 backup.js L9）：`path.join` 仅做词法规范化，不会把结果钳制在 BACKUP_DIR 内，缺少 `path.resolve`+前缀校验、realpath 校验或扩展名白名单。整条调用链上不存在任何完整防御。
+
+3. 【第二入口/替代通道】三个文件中 `readBackup` 仅有一个调用点（endpoints/db.js L19），不存在其他路由、参数或间接调用能到达该 sink；但 data/db/backup.js L24-L26 将其公开导出，任何后续新增路由复用即继承同一缺陷——这属于潜在扩散面，不构成当前的第二入口，主链结论独立成立。
+
+4. 【利用与定级】攻击者请求 `GET /ghost/api/admin/db/export/?filename=....//....//config.production.json`，经单次替换后仍携带 `../`，`path.join` 解析出 BACKUP_DIR 之外的路径，实现应用进程权限下的任意文件读取（可窃取配置与密钥），符合 CWE-22，定级 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 路径穿越导致任意文件读取", "risk_level": "High", "source": "L1:line 17: core/server/api/endpoints/db.js 中 const raw = frame.options.filename（HTTP 查询参数 filename 注入）", "sink": "L3:line 12: core/server/data/db/backup.js 中 fs.readFile(filePath, 'utf8')（filePath 来自第 9 行 path.join 拼接的用户可控文件名）", "explanation": "唯一相关外部输入点为查询参数 filename：api框架注入 frame.options.filename（endpoints/db.js L12声明、L16判空、L17取值），经 L18-L19 直达 backup.js L12 fs.readFile，全链可达；另一输入点 include（db.js L11）只流向 exporter.doExport（db.js L28），不触及文件路径，与漏洞无关；流1主链：db.js L17 raw → L18 sanitizeFilename → filename-sanitizer.js L9 replace('..','') → db.js L19 readBackup → backup.js L9 path.join(BACKUP_DIR, filename) → L12 fs.readFile；防御A（中间层 filename-sanitizer.js L9）：黑名单式单次替换，replace 以字符串为模式且非全局，仅删第一处 '..'，payload ....//....//x 还原为 ..//..//x 即绕过，且未拦绝对路径、反斜杠与编码分隔符，属可绕过过滤而非有效防御；防御B（末端 backup.js L9）：path.join 仅规范化不钳制目录，缺 resolve+startsWith 前缀校验与 realpath 校验，链上无完整防御；第二入口排查：三文件中 readBackup 仅 db.js L19 一个调用点，无其他路由/参数/间接调用可达 sink，但 backup.js L24-L26 公开导出使未来路由复用即继承缺陷，不影响本结论；综上为需后台会话的任意文件读取，可窃取配置与密钥，定级 High", "fix_suggestion": "line 9: 在 backup.js 第 9 行改为 const resolved = path.resolve(BACKUP_DIR, filename)，并校验 resolved === BACKUP_DIR 或 resolved.startsWith(BACKUP_DIR + path.sep)，不满足即抛错拒绝；同时将 filename-sanitizer.js L9 改为循环替换直至不再含 '..' 并拒绝以 / 开头的绝对路径"}
+```

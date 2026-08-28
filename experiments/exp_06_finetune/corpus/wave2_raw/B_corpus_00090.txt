@@ -1,0 +1,93 @@
+LANG: php
+```code
+# === file: api/category_delete.php ===
+<?php
+header('Content-Type: application/json');
+global $global;
+if (!isset($global['systemRootPath'])) {
+    require_once '../videos/configuration.php';
+}
+require_once $global['systemRootPath'] . 'lib/request.php';
+require_once $global['systemRootPath'] . 'objects/category.php';
+
+$obj = new stdClass();
+$obj->error = true;
+$obj->msg = '';
+// [SOURCE] id taken straight from the request (GET/POST/COOKIE merged)
+$obj->id = RequestUtil::getIntParam('id');
+
+if (!Category::canCreateCategory()) {
+    $obj->msg = __('Permission denied');
+    die(json_encode($obj));
+}
+
+// forwards tainted id into destructive op; no CSRF token verified anywhere
+if (!Category::deleteAssets($obj->id)) {
+    $obj->error = false;
+} else {
+    $obj->msg = __('Error on delete');
+}
+die(json_encode($obj));
+
+# === file: lib/request.php ===
+<?php
+/**
+ * Helper that LOOKS defensive: trim + strip_tags + intval reshape the
+ * value, but there is no Origin/Referer check and no CSRF token compare.
+ */
+class RequestUtil
+{
+    public static function getIntParam($key)
+    {
+        $raw = isset($_REQUEST[$key]) ? $_REQUEST[$key] : '';
+        $clean = intval(strip_tags(trim($raw))); // pure passthrough vs CSRF
+        return $clean;
+    }
+}
+
+# === file: objects/category.php ===
+<?php
+class Category
+{
+    /**
+     * Authorization only: confirms the session belongs to an admin.
+     * Does NOT prove this particular request was intentionally issued.
+     */
+    public static function canCreateCategory()
+    {
+        return !empty($_SESSION['user']['isAdmin']);
+    }
+
+    public static function deleteAssets($categoryId)
+    {
+        global $config;
+        $id = intval($categoryId); // value shaping only, still no origin proof
+        $dir = rtrim($config['systemRootPath'], '/') . '/videos/category_' . $id;
+        foreach ((array) @glob($dir . '/*') as $file) {
+            @unlink($file); // [SINK-A] destructive filesystem operation
+        }
+        $pdo = new PDO(
+            'mysql:host=' . $config['dbHost'] . ';dbname=' . $config['dbName'],
+            $config['dbUser'],
+            $config['dbPass']
+        );
+        $stmt = $pdo->prepare('DELETE FROM categories WHERE id = ?');
+        $ok = $stmt->execute(array($id)); // [SINK-B] destructive database operation
+        return $ok && @rmdir($dir);
+    }
+}
+```
+
+**分析（针对整组文件）**
+
+1. **输入点枚举与可达性**：唯一的外部请求输入是 lib/request.php 第 10 行读取的 `$_REQUEST['id']`（由 api/category_delete.php 第 14 行调用 `RequestUtil::getIntParam('id')` 触发，GET/POST/COOKIE 三通道合流）；objects/category.php 第 10 行的 `$_SESSION` 属服务端会话状态，不算请求输入，除此之外无其他输入点。可达性成立：第 14 行返回值赋给 `$obj->id` → api/category_delete.php 第 22 行作为实参传入 `Category::deleteAssets` → objects/category.php 第 16 行接收 → 第 19 行 `@unlink` 删除文件、第 27 行 `DELETE` 删除数据库记录，污点直达汇点、链路无断点。
+
+2. **逐条数据流防御核验**：主链 `$_REQUEST['id']`→unlink/DELETE 上，lib/request.php 第 11 行的 trim+strip_tags+intval 只是值整形（字符串过滤/黑名单类处理，按规则视为无效，且与请求伪造正交）；api/category_delete.php 第 16 行与 objects/category.php 第 10 行的 `canCreateCategory` 仅做会话角色鉴权，回答的是“是不是管理员”而非“请求是否由本人自愿发起”，属授权检查而非防伪检查，位置虽在调用之前但覆盖面不含来源校验；全链路无 CSRF token 比对、无 Origin/Referer 验证、未见 Cookie SameSite 属性设置——CWE-352 所需防御完全缺失。
+
+3. **第二入口与替代通道**：`$_REQUEST` 兼容 GET，攻击者用 `<img src='https://target/api/category_delete.php?id=3'>` 或自动提交的跨站表单即可触发；objects/category.php 的 `deleteAssets` 是 public 静态方法，任何其他引入该文件的脚本都可携带请求参数复用同一危险调用形成旁路入口；COOKIE 亦并入 `$_REQUEST`，进一步扩大可利用通道。
+
+4. **结论**：source（api/category_delete.php 第 14 行）与 sink（objects/category.php 第 19/27 行）分处不同文件，中间文件 lib/request.php 看似清洗实则对 CSRF 无任何作用，调用链上不存在完整防御，漏洞成立；因需诱导已登录管理员访问恶意页面，风险定为 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-352 跨站请求伪造（CSRF）：管理端删除分类资产接口缺失防伪令牌与来源校验", "risk_level": "High", "source": "L1:line 14: api/category_delete.php 经 RequestUtil::getIntParam('id') 读入的 $_REQUEST['id']", "sink": "L3:line 19: objects/category.php deleteAssets 内 @unlink($file)（同函数 line 27 的 DELETE 语句为等价第二汇点）", "explanation": "流1(主链): L1:line 14 从 $_REQUEST['id'] 取值赋给 obj->id，L1:line 22 以实参传入 Category::deleteAssets，L3:line 16 接收后于 L3:line 19 执行 @unlink 删除文件并于 L3:line 27 执行 DELETE 删除数据库记录，source 到 sink 连通无断点；输入点枚举: 唯一外部请求参数为 L2:line 10 的 $_REQUEST['id']（GET/POST/COOKIE 合流），L3:line 10 的 $_SESSION 为服务端会话状态不算请求输入，无其他输入点且全部可达汇点；防御核验: L2:line 11 的 trim+strip_tags+intval 属值整形/字符串过滤类处理视为无效，L1:line 16 与 L3:line 10 的 canCreateCategory 仅做会话角色鉴权，证明身份而非请求自愿性，位置在调用前但覆盖面不含来源校验，全链路无 CSRF token 比对、无 Origin/Referer 验证、未见 SameSite 设置；第二入口: $_REQUEST 接受 GET 使 img 标签或自动提交表单即可跨站触发，deleteAssets 为 public 静态方法可被其他引入 objects/category.php 的脚本以请求参数复用形成旁路，COOKIE 并入 $_REQUEST 进一步扩大通道；结论: 认证检查不能替代防伪检查，主链构成 CWE-352", "fix_suggestion": "line 22: 在调用 deleteAssets 前先执行 CSRF 校验，例如 hash_equals($_SESSION['csrf_token'], (string)$_REQUEST['csrf_token']) 且核对 Origin 同源，任一失败立即拒绝删除"}
+```

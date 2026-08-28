@@ -1,0 +1,122 @@
+LANG: go
+```code
+# === file: server/handlers/fsmove.go ===
+package handlers
+
+import (
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/server/common"
+	"github.com/gin-gonic/gin"
+)
+
+type BatchMoveReq struct {
+	SrcDir string   `json:"src_dir"`
+	DstDir string   `json:"dst_dir"`
+	Names  []string `json:"names"`
+}
+
+// FsBatchMove binds the JSON body and delegates all path handling to the fs package.
+func FsBatchMove(c *gin.Context) {
+	var req BatchMoveReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if !user.CanMove() {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	err := fs.BatchMove(c.Request.Context(), user.BasePath(),
+		req.SrcDir, req.DstDir, req.Names)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c)
+}
+
+# === file: internal/fs/ops.go ===
+package fs
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path"
+	"strings"
+)
+
+var ErrInvalidPath = errors.New("invalid path")
+
+// checkRelativePath blocks absolute paths and a leading '..' only;
+// mid-path '..' segments survive for legacy mount compatibility and
+// per-file names coming from BatchMove are never routed through here.
+func checkRelativePath(p string) error {
+	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, "..") {
+		return ErrInvalidPath
+	}
+	return nil
+}
+
+// BatchMove resolves every requested name against srcDir and hands the
+// concrete paths to the storage driver.
+func BatchMove(ctx context.Context, base, srcDir, dstDir string, names []string) error {
+	if err := checkRelativePath(dstDir); err != nil {
+		return err
+	}
+	srcRoot := path.Join(base, srcDir)
+	dstRoot := path.Join(base, dstDir)
+	for _, name := range names {
+		full := fmt.Sprintf("%s/%s", srcRoot, name)
+		if err := moveOne(ctx, full, dstRoot); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+# === file: internal/fs/driver.go ===
+package fs
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+)
+
+// moveOne performs the physical move with the local storage driver.
+// Paths arrive fully resolved from the ops layer and are trusted as-is.
+func moveOne(_ context.Context, srcPath, dstRoot string) error {
+	target := filepath.Join(dstRoot, filepath.Base(srcPath))
+	return os.Rename(srcPath, target)
+}
+```
+
+**分析**
+
+① **外部输入点枚举与可达性**：唯一 HTTP 入口为 `server/handlers/fsmove.go` L21 的 `c.ShouldBind(&req)`，注入三个攻击者完全可控字段：`req.SrcDir`(L13)、`req.DstDir`(L14)、`req.Names`(L15，数组每个元素独立可控)。L30-31 将三者未经任何变换原样传入 `fs.BatchMove`，到达 sink 的可达性直接成立。
+
+② **逐条数据流防御验证**：
+- 主链（names）：fsmove.go L31 → ops.go L25 形参 `names` → L31 循环 → L32 `fmt.Sprintf("%s/%s", srcRoot, name)` 直接拼接 → L33 `moveOne` → driver.go L11 形参 `srcPath` → L13 `os.Rename` 第一实参，全链零校验；
+- 流 B（SrcDir）：ops.go L29 `path.Join(base, srcDir)` 仅做词法 Clean，不把结果钳制在 base 内，足量 `../` 即逃逸出用户根目录；
+- 流 C（DstDir）：唯一经过 ops.go L16-21 `checkRelativePath` 的输入，但该函数是前缀黑名单（只拦以 `/` 或 `..` 开头的串），`docs/../../x` 类中段穿越直接绕过，且它完全未覆盖 srcDir 与任何 name 元素——黑名单/前缀过滤属可绕过伪防御；driver.go L12 的 `filepath.Base` 只约束目标文件名，对进入 sink 的 `srcPath` 无净化作用。
+
+③ **第二入口/替代通道**：本组文件仅 `FsBatchMove` 一条路由，但其内部存在 names 每元素、SrcDir、DstDir 三条并行污点通道，任一均可独立触达 sink；且 ops.go 导出的 `checkRelativePath` 可被项目其他包复用形成虚假安全感，`BatchMove` 接受任意字符串切片，新增路由即成第二入口。认证（L26）与 `CanMove` 授权（L27-30）均不能替代路径边界校验。
+
+④ **结论**：source 与 sink 分离于不同文件，中间层仅有不完整的伪净化，调用链上无任何有效防御，CWE-22 跨文件路径遍历成立，风险 High（需登录且具备 move 权限，但利用后可在宿主文件系统任意搬移/读取文件）。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-22 路径遍历（跨文件：HTTP请求体→服务层路径拼接→存储驱动 os.Rename）",
+  "risk_level": "High",
+  "source": "L1:line 21: server/handlers/fsmove.go c.ShouldBind 绑定的 req.Names/src_dir/dst_dir 外部输入",
+  "sink": "L3:line 13: internal/fs/driver.go os.Rename(srcPath, target) 物理移动任意路径",
+  "explanation": "流A主链: fsmove.go L21 ShouldBind 取得攻击者可控的 names 数组, L30-31 原样传入 fs.BatchMove; ops.go L31-L32 把未校验的 name 用 fmt.Sprintf 直接拼到 srcRoot 之后, L33 经 moveOne 传入 driver.go L11 形参 srcPath, 最终 L13 os.Rename 以任意路径执行移动, 全链无校验; 流B: req.SrcDir 于 ops.go L29 经 path.Join(base, srcDir) 拼接, Join 仅词法清理不钳制在用户根目录内, 足量 ../ 可逃逸; 流C: 仅 dstDir 在 ops.go L26 经过 checkRelativePath(L16-L21), 该函数为前缀黑名单, 只拒绝以 / 或 .. 开头的字符串, docs/../../x 等中段穿越可绕过, 且 srcDir 与全部 name 元素未被其覆盖, 黑名单式过滤属可绕过伪防御; driver.go L12 的 filepath.Base 仅约束目标文件名, 对进入 sink 的 srcPath 无净化作用; 第二入口: 本组文件仅 FsBatchMove 一条路由, 但内部存在 names 每元素/SrcDir/DstDir 三条并行注入通道, 导出的 checkRelativePath 可被其他包复用形成虚假安全感, BatchMove 接受任意字符串切片亦为潜在新入口; 综上调用链无完整防御, 认证与 CanMove 授权不能替代路径边界校验, CWE-22 成立",
+  "fix_suggestion": "line 32: 拼接前先按 / 分段校验 name 并拒绝任何等于 .. 的段（同样应用于 srcDir），改用 path.Join 拼接并确认结果仍位于 base 内后再调用 moveOne"
+}
+```

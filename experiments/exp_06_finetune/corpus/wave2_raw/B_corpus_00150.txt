@@ -1,0 +1,90 @@
+LANG: python
+```code
+# === file: app/routes.py ===
+from flask import Flask, request, jsonify
+from app.services import TableChatService
+
+app = Flask(__name__)
+service = TableChatService()
+
+
+@app.route("/dataset/chat", methods=["POST"])
+def dataset_chat():
+    payload = request.get_json(force=True)
+    data_ref = payload.get("data", "")      # source: 用户可控的本地路径或远程URL
+    result = service.load_dataset(data_ref)
+    return jsonify({"summary": result})
+
+
+@app.route("/dataset/preview", methods=["GET"])
+def dataset_preview():
+    data_ref = request.args.get("url", "")  # 第二入口: 查询参数同样直达服务层
+    result = service.load_dataset(data_ref)
+    return jsonify({"summary": result})
+# === file: app/services.py ===
+import re
+import urllib.request
+
+from app.parser import load_tabular
+
+
+_DTD_RE = re.compile(r"<!\s*DOCTYPE", re.IGNORECASE)
+
+
+def _screen(raw_text: str) -> bool:
+    """看似安全检查: 仅扫描前 256 个字符是否出现 DOCTYPE"""
+    head = raw_text[:256]
+    return _DTD_RE.search(head) is None
+
+
+class TableChatService:
+    def load_dataset(self, data_ref: str) -> str:
+        if data_ref.startswith(("http://", "https://")):
+            with urllib.request.urlopen(data_ref, timeout=5) as resp:
+                raw = resp.read()
+        else:
+            with open(data_ref, "rb") as fh:
+                raw = fh.read()
+        text = raw.decode("utf-8", errors="replace")
+        if not _screen(text):
+            return "blocked: suspicious DTD"
+        rows = load_tabular(text)           # 污点原样流入解析器
+        cols = sorted({k for row in rows for k in row})
+        return f"columns: {', '.join(cols)}"
+# === file: app/parser.py ===
+import io
+
+from lxml import etree
+
+
+NS_ROW = ".//row"
+
+
+def load_tabular(text: str) -> list[dict]:
+    # sink: 解析器显式允许实体展开与 DTD 加载, 无任何外部实体限制
+    parser = etree.XMLParser(
+        resolve_entities=True,
+        load_dtd=True,
+        no_network=False,
+    )
+    doc = etree.parse(io.BytesIO(text.encode("utf-8")), parser)
+    root = doc.getroot()
+    rows = []
+    for node in root.findall(NS_ROW):
+        rows.append({child.tag: child.text for child in node})
+    return rows
+```
+
+分析（行号约定：每个文件内容自身从 1 开始计数，不含 `# === file:` 分隔行）：
+
+1. **外部输入点枚举与可达性**：共两个外部输入点——routes.py L12 的 POST body 字段 `data` 与 routes.py L19 的 GET 查询参数 `url`，二者均直接传入 `service.load_dataset`（routes.py L13/L20）。污点经 services.py L17 进入 `load_dataset`，在 L24 赋给 `text` 后于 L27 传入 `load_tabular`，最终到达 parser.py L16 的 `etree.parse`，全链路无中断，可达性成立。
+
+2. **逐流防御验证**：唯一防御是 services.py L10-L13 的 `_screen`——类型为“黑名单正则 + 截断扫描”，位置在中间服务层，覆盖面仅前 256 字符且只匹配 `DOCTYPE` 字面量。绕过方式明确：攻击者在 XML 开头放置超长注释把 `<!DOCTYPE>` 推到第 256 字符之后即可穿透；即便补齐全文扫描，黑名单式字符串匹配仍属可绕过手段（如编码变形、外部参数实体），不算有效防御。sink 所在的 parser.py L11-L15 反而显式开启 `resolve_entities=True`、`load_dtd=True`、`no_network=False`，解析层零防护。因此实体展开读取本地文件（`file:///etc/passwd` 等）后经列名回显到响应，构成完整 CWE-611 链。
+
+3. **第二入口与替代通道**：存在——GET `/dataset/preview`（routes.py L17-L21）是与主路由平行的第二入口，共享同一 `load_dataset→load_tabular→etree.parse` 污点路径；此外 services.py L22-L23 的本地路径分支本身允许任意文件读取，可作为不依赖 XXE 的替代数据通道。两条入口均无任何其他净化点，支撑“调用链上无完整防御”的结论。
+
+4. **结论**：source（用户可控的数据引用）与 sink（实体可解析的 XML 解析器）分处不同文件，中间文件存在看似过滤实则截断失效的黑名单检查，主链与第二入口链均为可利用的 XXE，风险等级 High（敏感文件泄露、内网探测）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 Improper Restriction of XML External Entity Reference", "risk_level": "High", "source": "L1:line 12: routes.py 中 POST /dataset/chat 请求体字段 data 以及 L19 处 GET /dataset/preview 查询参数 url, 用户完全可控的数据引用(URL或本地路径)", "sink": "L3:line 16: parser.py 中 etree.parse 配合 resolve_entities=True 且 load_dtd=True 的 XMLParser, 外部实体被展开并回显", "explanation": "数据流一(主链): routes.py L12 取得用户输入 data_ref -> routes.py L13 调用 service.load_dataset -> services.py L18-L23 远程拉取或本地读取内容 -> services.py L24 得到 text -> services.py L25 经 _screen 检查 -> services.py L27 传入 load_tabular -> parser.py L16 etree.parse 完成实体展开, 结果经列名拼入响应返回给攻击者; 数据流二(第二入口): routes.py L19 查询参数 url 走完全相同的 services/parser 路径抵达同一 sink; 防御分析: 全链唯一防线是 services.py L10-L13 的黑名单正则, 且只扫描前 256 字符, 攻击者用超长注释把 DOCTYPE 移出扫描窗口即可绕过, 黑名单/截断扫描属可绕过手段不算有效防御, 而 parser.py L11-L15 显式开启 resolve_entities/load_dtd/no_network=False, 解析层无任何缓解; 第二入口与替代通道: GET /dataset/preview 为平行入口复用同一污点路径, services.py L22-L23 本地路径分支还构成独立任意文件读取通道, 二者均无净化, 证实调用链上不存在完整防御", "fix_suggestion": "line 12: 在 parser.py 中改为 etree.XMLParser(resolve_entities=False, load_dtd=False, no_network=True, huge_tree=False) 禁止实体与 DTD 加载, 同时移除 services.py 中无效的前缀截断黑名单检查"}
+```

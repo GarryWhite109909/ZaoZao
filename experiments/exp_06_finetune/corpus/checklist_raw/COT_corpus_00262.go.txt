@@ -1,0 +1,28 @@
+## 漏洞分析报告
+
+**背景定位**：本代码是 pgx 驱动的 SQL 净化器（`SanitizeSQL`），将 `$N` 占位符替换为经过转义的参数值后拼出完整 SQL。对应已知缺陷：词法器不识别美元引号（dollar-quoted）字符串字面量，导致参数值可在其中逃逸（CVE-2024-27304 / pgx v5.5.4 修复项）。
+
+### 步骤 1｜枚举用户可控输入点并追踪数据流
+
+- **入口 A**：第 433 行 `func SanitizeSQL(sql string, args ...any)`——`args` 是应用层传入的参数值，通常直接来自用户输入；`sql` 模板若由开发者拼接用户输入构造则同样可控。
+- **入口 B**：第 108 行 `NewQuery(sql)` + 第 44 行 `Query.Sanitize(args ...)`——同一能力的第二个公开入口。
+- **数据流**：`args` → 第 68 行 `arg := args[argIdx]` → 第 80-81 行 `case string: p = QuoteString(...)` → 第 90 行 `buf.Write(p)` 写入结果缓冲；`sql` → 第 435 行 `init` → 第 215 行 `rawState` 切分为 `Parts` → 第 52 行 `buf.WriteString(part)`。最终第 105 行 `return buf.String()` 产出**可直接执行的 SQL 文本**，即危险 sink。
+
+### 步骤 2｜验证防御有效性
+
+- **已存在的防御**：(a) 第 69-87 行参数类型白名单；(b) 第 157-163 行 `QuoteString` 对单引号双写转义；(c) 第 66、94 行在参数前后补空格（针对旧公告 GHSA-m7wr-2xf7-cm9p 的注释注入修复）。
+- **缺口（防御失效点）**：第 231-239 行 `rawState` 的 `case '$'` 分支仅在下一字符为数字时进入 `placeholderState`，否则把 `$` 当普通文本吞掉——**完全未识别 `$$...$$` 与 `$tag$...$tag$` 美元引号字面量**。因此字面量内部的 `$N` 仍被切分为占位符并在第 90 行原位替换；而 `QuoteString` 的单引号转义只在单引号上下文有效，当参数值自身携带闭合定界符（如 `` $$ `` 或 `` $tag$ ``）时，写入后会**提前终结美元引号字面量**，剩余内容逃逸为 SQL 语法。转义覆盖范围不能覆盖此条流 → **绕过成立**。
+- **PoC 推演**：`SanitizeSQL(`SELECT $$a$1$$`, 值=`b$$; DROP TABLE t; --`)`。词法切分得 Parts=[`SELECT $$a`, 1, `$$`]，输出 `` SELECT $$a 'b$$; DROP TABLE t; --' $$ ``。PostgreSQL 将 `` $$a 'b$$ `` 解析为一个完整字面量，其后 `; DROP TABLE t; --` 成为可执行语句——尽管单引号已被正确双写。
+- 另注：第 430-432 行注释自述仅当 `standard_conforming_strings=on` 时安全，属依赖外部配置的条件性防护，不构成本缺口的补偿。
+
+### 步骤 3｜检查第二入口/替代通道
+
+第 108 行 `NewQuery` + 第 44 行 `Sanitize` 与第 433 行 `SanitizeSQL` 共用同一套有缺陷的词法器（第 215 行 `rawState`）与同一插值逻辑（第 90 行），无任何独立的替代安全路径；两个公开导出入口均受同一缺陷影响。
+
+### 步骤 4｜结论
+
+用户可控参数值经仅做单引号转义的净化器拼入 SQL，因词法器与 PostgreSQL 对美元引号字面量的解析不一致，攻击者可通过携带定界符的值实现任意 SQL 注入。需满足“查询含带占位符的美元引号字面量 + 简单协议”等前置条件，故风险评级为 High（一旦命中即为任意 SQL 执行）。判定：**存在漏洞，CWE-89**。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "High", "source": "line 433: SanitizeSQL 的 args 用户可控参数（line 68 取出, line 81 进入 QuoteString）", "sink": "line 90: buf.Write(p) 将参数值拼入最终 SQL 并于 line 105 返回待执行语句", "explanation": "用户可控字符串参数 -> line 435 init 词法切分 -> line 231-239 rawState 对 $ 后非数字一律按普通文本处理, 不识别 $$ 或 $tag$ 美元引号字面量, 其内部 $N 被误判为占位符 -> line 81 QuoteString 仅双写单引号, 该转义对美元引号上下文无效 -> 参数值携带闭合定界符(如 $$)时在 line 90 写入后提前终结字面量, 余下内容逃逸为可执行 SQL -> 注入成立。既有防御(类型白名单/单引号转义/前后补空格)均只覆盖单引号上下文, 无法覆盖此流; line 108 NewQuery 与 line 44 Sanitize 共用同一缺陷词法器, 无替代安全通道", "fix_suggestion": "line 231: 在 case '$' 分支先探测 $$ 或 $tag$ 定界符并新增 dollarQuotedState 跳过整个美元引号字面量后再返回 rawState, 使词法解析与 PostgreSQL 一致"}
+```

@@ -1,0 +1,30 @@
+## 漏洞分析
+
+**步骤 1｜枚举用户可控输入点并追踪 sink**
+
+三个处理器均通过 `c.ShouldBind` 从 JSON 请求体接收输入：
+
+- `FsRecursiveMove`：第 28 行绑定 `src_dir/dst_dir/conflict_policy`，路径分量在第 101 行拼接，最终第 139 行到达 `fs.Move`；
+- `FsBatchRename`：第 161 行绑定 `src_dir`、`rename_objects[].src_name`（结构体定义第 153 行）、`new_name`，`src_name` 在第 196 行拼接进 `filePath`，第 197 行到达 `fs.Rename`；
+- `FsRegexRename`：第 214 行绑定 `src_dir/src_name_regex/new_name_regex`，第 262 行到达 `fs.Rename`。
+
+**步骤 2｜逐条验证 source→sink 防御有效性**
+
+- `FsRecursiveMove` 流：`src_dir`(第 38 行)、`dst_dir`(第 54 行) 均经 `user.JoinPath` 归一化校验并分别在第 48、64 行 `CanWrite` 授权；`movingFileName` 由 `fs.List` 返回的真实条目名构造（第 101 行），非用户直传字符串 → 防御覆盖完整。
+- `FsBatchRename` 三条流：
+  - `src_dir`：第 171 行 `JoinPath` + 第 182 行 `CanWrite` → 有效；
+  - `new_name`：第 191 行 `checkRelativePath` 拒绝路径分隔符/穿越 → 有效；
+  - **`src_name`：仅有第 188 行空串检查，无任何路径校验**。第 171/182 行的授权对象是 `reqPath`（基目录），不随每个 `src_name` 重新计算；且第 158 行注释明确说明跳过了逐项权限检查，`fs.Rename` 内部不会补检 → 防御缺口成立。
+- `FsRegexRename` 流：第 261 行路径取自 `fs.List` 条目名而非用户字符串；替换生成的新名经第 256 行 `checkRelativePath` 拦截 → 覆盖完整。
+
+**步骤 3｜第二入口/替代通道检查**
+
+`FsRegexRename`（第 212 行起）源路径只能来自存储列表结果，`NewNameRegex` 产物被第 256 行校验；`FsRecursiveMove`（第 26 行起）所有路径分量要么过 `JoinPath` 要么来自列表——两者均无替代通道。唯一可利用入口是 `FsBatchRename` 的 `src_name`。
+
+**步骤 4｜结论**
+
+第 161→187→196→197 行构成无防御的污染流：持有 rename 权限的用户提交 `src_name` 含 `../../` 时，第 196 行拼接出的 `filePath` 逃逸出第 182 行已授权的 `reqPath`，可在虚拟文件系统内对任意可达路径的文件执行重命名（等效跨目录移动/篡改），绕过目录级写授权。属 CWE-22 路径穿越，风险 High。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "High", "source": "line 161: c.ShouldBind 绑定请求体中的 rename_objects[].src_name（字段定义 line 153）", "sink": "line 197: fs.Rename(c.Request.Context(), filePath, renameObject.NewName)", "explanation": "src_name -> line 161 ShouldBind 进入 -> line 188 仅空串检查 -> line 196 与已授权 reqPath 直接拼接为 filePath -> line 197 fs.Rename 执行重命名；line 171 JoinPath 与 line 182 CanWrite 仅对 src_dir 基目录授权，line 191 checkRelativePath 仅覆盖 NewName，均未覆盖 SrcName，且 line 158 注明跳过逐项权限检查，故含 ../ 的 src_name 可逃出授权目录重命名任意可达文件，绕过目录级写权限", "fix_suggestion": "line 191: 在该校验处同步对 renameObject.SrcName 调用 checkRelativePath，非法（含 ../ 或路径分隔符）时返回 403"}
+```

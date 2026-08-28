@@ -1,0 +1,37 @@
+## 漏洞分析报告：CifsPublisherPluginDescriptor.java（CWE-441）
+
+### 步骤 1｜枚举用户可控输入点并追踪数据流
+
+- **入口 A（核心）**：第 174 行 `doTestConnection(StaplerRequest, StaplerResponse)` 是 Jenkins Descriptor 中以 `do` 开头的方法，会被 Stapler 自动暴露为 Web 端点（`.../descriptor/.../doTestConnection`）。第 175 行 `request.bindParameters(CifsHostConfiguration.class, "")` 与第 176 行再次 `bindParameters(hostConfig)`，把**全部 HTTP 参数**（hostname、port、username、password、remoteRootDir 等）直接绑定成 `CifsHostConfiguration` 对象——完全用户可控。
+- 第 197 行 `request.bindParameters(CifsNodeProperties.class, ...)` 还把 WINS 服务器参数读入，第 199 行写入 `buildInfo`。
+- **Sink**：第 179 行 `hostConfig.createClient(buildInfo).disconnect()`——用上述攻击者控制的配置向任意指定主机发起 **SMB 网络连接**。source→sink 数据流成立：`HTTP 参数 -> bindParameters -> hostConfig -> createClient(SMB 连接)`。
+
+### 步骤 2｜验证防御有效性
+
+- 该端点**没有任何权限校验**：方法体内不存在 `Jenkins.get().checkPermission(...)`，任何拥有 Overall/Read 权限的用户均可直接调用。
+- 方法**没有 `@POST` 注解**：GET 请求即可触发，而 Jenkins 的 CSRF crumb 防护不作用于 GET，因此还可被 CSRF 利用（诱导已登录管理员浏览器发起请求）。
+- 各 `doCheck*` 校验器（第 126–155 行）只是独立的表单校验端点，`validateRequired` 仅查非空，既不限制目标主机范围，也完全不覆盖 `doTestConnection` 这条流。
+- 第 184 行 `Util.escape` 只转义异常消息的 HTML 标记，属于输出编码，与出站连接行为无关。
+- 结论：这条流上**不存在有效防御**。
+
+### 步骤 3｜检查第二入口/替代通道
+
+- 第 118 行 `configure()` 由 Jenkins 核心系统配置页调用，受框架级管理权限与 POST+crumb 保护，非攻击通道。
+- 第 103 行 `addHostConfiguration`、第 111 行 `removeHostConfiguration` 是普通 Java 方法，不是 Web 入口。
+- 实际可达的利用通道即 `doTestConnection` 本身：直连（低权限用户）与 CSRF（驱动高权限会话）两条路径均可用。
+
+### 步骤 4｜结论
+
+Jenkins 在此充当“混淆代理”：攻击者用自己选定的主机名/端口/凭证驱动 Jenkins 发起 SMB 连接，可用于捕获/中继 Jenkins 出站的 NTLM 认证凭证、探测内网。对应公告描述的 Publish Over CIFS Plugin ≤0.10 缺失权限检查 + 非 POST 的混淆代理问题，判定为 **CWE-441**，风险等级 **High**。
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-441 Confused Deputy (Unintended Proxy)",
+  "risk_level": "High",
+  "source": "line 175: request.bindParameters(CifsHostConfiguration.class, '') 将全部HTTP参数(主机名/端口/用户名/密码等)绑定为SMB主机配置",
+  "sink": "line 179: hostConfig.createClient(buildInfo).disconnect() 向参数指定的任意主机发起SMB连接",
+  "explanation": "line 174 doTestConnection 是Stapler自动暴露的Web端点 -> line 175-176 bindParameters 把攻击者提供的 hostname/port/username/password 完整绑定进 hostConfig -> line 179 createClient 用这些参数向攻击者指定服务器发起SMB认证连接 -> 方法体无任何 checkPermission 权限校验且无 @POST 注解(GET 请求不触发 crumb 防护) -> Overall/Read 低权限用户可直接调用或经 CSRF 驱动高权限会话调用 -> Jenkins 被当作混淆代理连接任意SMB服务并使用攻击者凭证，可致 NTLM 凭证中继与内网探测",
+  "fix_suggestion": "line 174: 在 doTestConnection 方法声明处添加 @POST 注解，并在方法体首行插入 Jenkins.get().checkPermission(Jenkins.ADMINISTER) 强制管理员权限校验"
+}
+```

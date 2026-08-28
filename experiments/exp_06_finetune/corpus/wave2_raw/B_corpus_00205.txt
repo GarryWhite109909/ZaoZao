@@ -1,0 +1,105 @@
+LANG: php
+```code
+# === file: application/controllers/Booking_settings.php ===
+<?php
+defined('BASEPATH') or exit('No direct script access allowed');
+
+class Booking_settings extends EA_Controller
+{
+    public function __construct()
+    {
+        parent::__construct();
+        $this->load->model('settings_model');
+    }
+
+    public function index(): void
+    {
+        method('get');
+        if (cannot('view', PRIV_SYSTEM_SETTINGS)) {
+            redirect('login');
+            return;
+        }
+        html_vars([
+            'page_title' => lang('settings'),
+            'booking_settings' => $this->settings_model->get_all(),
+        ]);
+        $this->load->view('pages/booking_settings');
+    }
+
+    public function save(): void
+    {
+        try {
+            method('post');
+            if (cannot('edit', PRIV_SYSTEM_SETTINGS)) {
+                throw new RuntimeException('You do not have the required permissions for this task.');
+            }
+            check('booking_settings', 'array|null');
+            $settings = request('booking_settings', []); // SOURCE: attacker-controlled POST body
+            foreach ($settings as $setting) {
+                $this->settings_model->save_setting($setting);
+            }
+            response();
+        } catch (Throwable $e) {
+            json_exception($e);
+        }
+    }
+}
+# === file: application/models/Settings_model.php ===
+<?php
+defined('BASEPATH') or exit('No direct script access allowed');
+
+class Settings_model extends EA_Model
+{
+    public array $allowed_fields = ['id', 'name', 'value'];
+
+    public function save_setting(array $setting): void
+    {
+        // Partial defense: strip_tags only for label_custom_field_* names.
+        if (!empty($setting['name']) && str_starts_with($setting['name'], 'label_custom_field_')) {
+            $setting['value'] = strip_tags($setting['value'] ?? '');
+        }
+
+        $existing = $this->db->where('name', $setting['name'])->get('settings')->row_array();
+
+        if (!empty($existing)) {
+            $setting['id'] = $existing['id'];
+        }
+
+        $row = array_intersect_key($setting, array_flip($this->allowed_fields));
+
+        if (isset($row['id'])) {
+            $this->db->update('settings', $row, ['id' => $row['id']]);
+        } else {
+            $this->db->insert('settings', $row);
+        }
+    }
+
+    public function get_all(): array
+    {
+        return $this->db->get('settings')->result_array();
+    }
+}
+# === file: application/views/pages/booking_settings.php ===
+<?php defined('BASEPATH') or exit('No direct script access allowed'); ?>
+<h1><?= $page_title ?></h1>
+<table class='settings-table'>
+<?php foreach ($booking_settings as $setting): ?>
+    <tr>
+        <td class='setting-name'><?= $setting['name'] ?></td>
+        <td class='setting-value'><?= $setting['value'] ?></td>
+    </tr>
+<?php endforeach ?>
+</table>
+```
+
+**分析（针对整组文件）**
+
+1. **外部输入点枚举与可达性**：全组文件唯一的 HTTP source 是 POST `/booking_settings/save` 的 `booking_settings` 参数，在 Booking_settings.php L1:line 34 由 `request('booking_settings', [])` 原样读出，line 36 逐条传入 `Settings_model::save_setting`，污染值经 line 24/26 写库持久化；GET `index`（L1:line 12-24）不接收任何请求参数，仅在 line 21 通过 `get_all()`（Settings_model.php L2:line 32）读回污染行并在 line 23 分发到视图，是 sink 的触发通道而非独立 source，可达性成立。
+2. **主数据流逐跳核验**：流1（主链）：L1:line 34 源数组 → L2:line 11 前缀门控——仅当键名以 `label_custom_field_` 开头才在 line 12 执行 `strip_tags`，攻击者改用任意其他键名（如 `company_name`、`calendar_view` 或全新键）即整段绕过 → L2:line 21 `array_intersect_key` 只按字段名过滤键、从不检查值内容，纯透传 → L2:line 24/26 原样入库 → L1:line 21 读回 → L3:line 6 与 line 7 以 `<?= ?>` 短回显直接输出到 HTML 元素内容，全链无一处 `htmlspecialchars`/`htmlentities` 输出编码，存储型 XSS 成立。
+3. **防御有效性判定**：L1:line 30 的权限检查属访问控制而非净化，只限制谁可投毒、不改变载荷性质；L1:line 33 `check(...,'array|null')` 仅验证顶层结构类型，不触及字符串内容；L2:line 11-13 的 `strip_tags` 是按键名前缀触发的黑名单式过滤，覆盖面残缺（绝大多数键名不受保护），且 strip_tags 本身属可被畸形标签变体绕过的字符串过滤类手段，均不计为有效防御。
+4. **第二入口与替代通道**：本组文件内不存在第二个独立 source 路由；但存在替代暴露面——(a) 更新分支 L2:line 23-24 允许以同名键覆写既有安全配置行，预置的安全数据同样可被污染；(b) 同一污染结果同时命中视图两个回显点（L3:line 6 的 `name` 与 line 7 的 `value`），构成一源双汇的并行流；(c) `get_all()` 是公共读接口，未来任何调用它的控制器/视图都自动继承污点。这些通道共同支撑漏洞可利用的最终结论。
+5. **结论**：source（控制器）与 sink（视图）分离在不同文件，中间模型文件的净化看似存在实则因前缀门控而近乎失效，调用链上无完整防御，判定为可利用的跨文件存储型 XSS（CWE-79），风险等级 High（投毒需编辑权限，但载荷持久化后在所有访问设置页的管理员浏览器中执行，可实现会话窃取与账户接管）。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 存储型跨站脚本", "risk_level": "High", "source": "L1:line 34: request('booking_settings', []) 返回的攻击者完全可控的设置数组", "sink": "L3:line 8: 视图对 $setting['value'] 的无转义短回显（line 7 的 $setting['name'] 为同源并行回显点）", "explanation": "输入点枚举：唯一HTTP source是POST /booking_settings/save 的 booking_settings 参数，L1:line 34 读入后 line 36 传入模型，经 L2:line 24/26 持久化，再由 L1:line 21 经 get_all(L2:line 32) 读回并于 L1:line 23 分发视图触发，可达性成立；主链防御核验：L1:line 30 权限检查属访问控制非净化，L1:line 33 check 仅验证顶层结构类型，L2:line 11-13 strip_tags 仅对 label_custom_field_ 前缀键名生效，属覆盖面残缺的黑名单式过滤，其余任意键名完全绕过，L2:line 21 array_intersect_key 只过滤字段名不检查值内容，L3 全文件无 htmlspecialchars 等输出编码，故全链无有效防御；第二入口结论：组内无第二个独立source路由，但存在替代通道——L2:line 23-24 更新分支可用同名键覆写既有配置行扩大影响面，同一污染流同时命中 L3:line 7 与 line 8 两个回显点构成一源双汇，且 get_all 作为公共读接口使未来任何消费者继承污点，综上判定存在可利用的跨文件存储型XSS", "fix_suggestion": "line 8: 最小修复是将该处及 line 7 改为 htmlspecialchars($setting['value'], ENT_QUOTES, 'UTF-8') 形式的输出编码，并在 Settings_model 层对 name 增加白名单校验、对所有 value 统一净化以消除前缀门控缺口"}
+```

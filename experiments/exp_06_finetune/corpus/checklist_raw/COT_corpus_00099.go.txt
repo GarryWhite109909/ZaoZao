@@ -1,0 +1,29 @@
+## 漏洞分析
+
+**第 1 步｜枚举用户可控输入点并追踪流向**
+本文件的可控输入集中在 `DownloadRequest` 结构（第 78–83 行）：`Directory`(line 79)、`URL`(line 80)、`FileName`(line 81)、`UseHeader`(line 82)，由外部路由构造后经 `New()`(line 97) 注入。`Execute()`(line 141) 是唯一触发外联的入口：line 155 用 `dl.req.URL.String()` 构造请求，line 161 `client.Do(req)` 发起真实网络请求（危险 sink）；此外远端可控的 `Content-Disposition` 文件名在 line 174–183 进入 `dl.path`，连同内容一起在 line 200–201 写入服务器文件系统（第二 sink）。
+
+**第 2 步｜逐条验证 source→sink 防御有效性**
+针对 `URL → client.Do` 这条流有两道防御：
+- 重定向防御：line 34–36 `CheckRedirect` 返回 `http.ErrUseLastResponse`，客户端不跟随 30x 跳转，该防御本身有效；
+- 内网校验：line 148 调用 `isExternalNetwork`（实现 line 249–297）：line 254 取 `URL.Host`，line 274 `dialer.DialContext` **独立拨号一次**，再对这一次连接的远端 IP 按 line 284–295（loopback/link-local 判断 + `internalRanges` 网段黑名单）校验。
+
+缺陷在于：校验使用的是 line 274 的一次性独立连接，而真正取数的 line 161 `client.Do` 会**重新做 DNS 解析并建立全新连接**，两次解析之间没有任何绑定关系。攻击者控制权威 DNS（TTL=0）即可让首次解析返回公网 IP 通过校验、第二次解析返回 `169.254.169.254`/`127.0.0.1`/`10.x` 等内网地址——典型 check 与 use 分离（DNS rebinding）。基于“单次解析结果”的网段黑名单无法覆盖第二条解析通道，按规则属可绕过过滤，不构成有效防御；重定向防御虽有效但不能弥补该 TOCTOU 缺口。
+
+**第 3 步｜检查第二入口/替代通道**
+文件内其余函数 `ByServer`(line 108)、`ByID`(line 124)、`track`(line 308)、`find`(line 322)、`remove`(line 333) 仅做内存缓存簿记，不触网；除 line 161 外无其他出网 sink。替代绕过通道亦被封堵：重定向已被 line 34–36 禁止，整数 IP 变换逻辑处于注释状态（line 256–260）且即使启用也会被远端 IP 校验拦截。故唯一可利用路径即上述双解析 TOCTOU；响应体经 line 200–201 落盘到服务器目录，构成内网数据外带通道。
+
+**第 4 步｜结论**
+用户可控 URL 到达 `client.Do` 网络请求 sink，前置内网校验因“校验连接”与“取数连接”解耦而失效，服务器被用作访问内部网络的非预期代理（CWE-441，SSRF 中介）。已认证用户可借此探测/读取云元数据等内网资源并落盘读取，风险等级 High。（附带观察：`dl.path` 受 `FileName` 或响应头 filename 影响，line 201 写盘依赖外部 Filesystem 层防护，不在本次标注范畴。）
+
+```json
+{
+  "has_vulnerability": true,
+  "vulnerability_type": "CWE-441 Unintended Proxy / Intermediary（SSRF）",
+  "risk_level": "High",
+  "source": "line 80: DownloadRequest.URL（用户可控下载目标，经 line 97 New 传入）",
+  "sink": "line 161: client.Do(req)",
+  "explanation": "用户可控 URL -> line 148 调用 isExternalNetwork -> line 274 用独立拨号连接做一次性 DNS 解析并按 line 284-295 网段黑名单校验该次远端 IP -> line 161 client.Do 对同一 host 重新解析 DNS 并新建连接发起真实请求 -> 两次解析无绑定，攻击者以 TTL=0 的 DNS rebinding 使首查返回公网 IP、二查返回 169.254.169.254/127.0.0.1 等内网地址 -> 服务器沦为访问内部网络的代理，响应体经 line 200-201 写入服务器目录供攻击者读取；line 34-36 禁止跟随重定向的防御有效但不覆盖此 TOCTOU 缺口",
+  "fix_suggestion": "line 23: 为 client 配置自定义 http.Transport 并在其 DialContext 回调中于每次实际拨号时对解析出的远端 IP 复用 isExternalNetwork 的内网判定，使校验与最终取数使用同一次连接"
+}
+```

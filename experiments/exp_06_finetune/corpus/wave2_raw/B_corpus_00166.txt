@@ -1,0 +1,112 @@
+LANG: java
+
+```code
+# === file: src/main/java/com/ctrip/framework/apollo/portal/controller/ReleaseController.java ===
+package com.ctrip.framework.apollo.portal.controller;
+
+import com.ctrip.framework.apollo.common.dto.ReleaseDTO;
+import com.ctrip.framework.apollo.portal.entity.vo.ReleaseCompareResult;
+import com.ctrip.framework.apollo.portal.service.ReleaseService;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ReleaseController {
+
+  private final ReleaseService releaseService;
+
+  public ReleaseController(ReleaseService releaseService) {
+    this.releaseService = releaseService;
+  }
+
+  @GetMapping("/envs/{env}/releases/{releaseId}")
+  public ReleaseDTO get(@PathVariable String env,
+                        @PathVariable long releaseId) {
+    return releaseService.loadRelease(env, releaseId);
+  }
+
+  @GetMapping("/envs/{env}/releases/compare")
+  public ReleaseCompareResult compareRelease(@PathVariable String env,
+                                             @RequestParam long baseReleaseId,
+                                             @RequestParam long toCompareReleaseId) {
+    return releaseService.compareReleases(env, baseReleaseId, toCompareReleaseId);
+  }
+}
+
+# === file: src/main/java/com/ctrip/framework/apollo/portal/service/ReleaseService.java ===
+package com.ctrip.framework.apollo.portal.service;
+
+import com.ctrip.framework.apollo.common.dto.ReleaseDTO;
+import com.ctrip.framework.apollo.portal.component.AdminServiceClient;
+import com.ctrip.framework.apollo.portal.entity.vo.ReleaseCompareResult;
+import com.ctrip.framework.apollo.portal.environment.Env;
+import org.springframework.stereotype.Service;
+
+@Service
+public class ReleaseService {
+
+  private final AdminServiceClient adminServiceClient;
+
+  public ReleaseService(AdminServiceClient adminServiceClient) {
+    this.adminServiceClient = adminServiceClient;
+  }
+
+  public ReleaseDTO loadRelease(String env, long releaseId) {
+    Env environment = Env.valueOf(env); // 仅规范化环境名, 不校验资源归属
+    return adminServiceClient.findReleaseById(environment, releaseId);
+  }
+
+  public ReleaseCompareResult compareReleases(String env, long baseId, long toCompareId) {
+    Env environment = Env.valueOf(env);
+    return adminServiceClient.compare(environment, baseId, toCompareId);
+  }
+}
+
+# === file: src/main/java/com/ctrip/framework/apollo/portal/component/AdminServiceClient.java ===
+package com.ctrip.framework.apollo.portal.component;
+
+import com.ctrip.framework.apollo.common.dto.ReleaseDTO;
+import com.ctrip.framework.apollo.portal.component.config.PortalConfig;
+import com.ctrip.framework.apollo.portal.entity.vo.ReleaseCompareResult;
+import com.ctrip.framework.apollo.portal.environment.Env;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestTemplate;
+
+@Component
+public class AdminServiceClient {
+
+  private final RestTemplate restTemplate;
+  private final PortalConfig portalConfig;
+
+  public AdminServiceClient(RestTemplate restTemplate, PortalConfig portalConfig) {
+    this.restTemplate = restTemplate;
+    this.portalConfig = portalConfig;
+  }
+
+  public ReleaseDTO findReleaseById(Env env, long releaseId) {
+    String url = portalConfig.getAdminServiceUrl(env) + "/releases/" + releaseId;
+    return restTemplate.getForObject(url, ReleaseDTO.class);
+  }
+
+  public ReleaseCompareResult compare(Env env, long baseReleaseId, long toCompareReleaseId) {
+    String url = portalConfig.getAdminServiceUrl(env) + "/releases/compare?base=" + baseReleaseId + "&toCompare=" + toCompareReleaseId;
+    return restTemplate.getForObject(url, ReleaseCompareResult.class);
+  }
+}
+```
+
+分析（针对整组文件）：
+
+1. **外部输入点枚举与可达性**：ReleaseController.java L20-L24 路由 `/envs/{env}/releases/{releaseId}` 中 env(L21)、releaseId(L22) 为路径变量外部输入，releaseId 经 L23 进入服务层并直达 AdminServiceClient.findReleaseById，可达；ReleaseController.java L26-L31 路由 compare 中 baseReleaseId(L28)、toCompareReleaseId(L29) 为查询参数外部输入，经 L30 进入 compareReleases→AdminServiceClient.compare，可达；整组文件内无其他 HTTP 入口或间接调用通道。
+
+2. **流A防御核验**（L1:22 → L1:23 → L2:18-20 → L3:21-23）：中间层 L2:19 的 `Env.valueOf(env)` 只对环境名做格式校验、非法值抛异常，与 releaseId 所指资源是否属于当前用户完全无关——属“看似净化实则不完整”；控制器无 @PreAuthorize，服务层无 appId/namespace 归属比对，客户端 L3:22 直接把 releaseId 字符串拼进管理端 URL 并在 L3:23 执行 getForObject 取回数据，全链不存在任何有效防御（并非黑名单/正则被绕过的问题，而是对象级授权完全缺失）。
+
+3. **流B防御核验**（L1:28-29 → L2:23-25 → L3:26-28）：compare 端点两个 releaseId 参数原样进入 L3:27 的 URL 查询串，与流A共享同一未防护的 AdminServiceClient，同样零授权校验、零过滤。
+
+4. **第二入口与结论支撑**：compare 路由是独立注册的第二入口，不经 get 路由即可触达同一 sink，证明缺失是链路级缺陷而非单点疏漏；结合两流，任意用户可通过枚举自增的 releaseId/baseReleaseId 水平越权读取其他应用及私有命名空间的发布配置，CWE-639 成立。
+
+```json
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key (IDOR)", "risk_level": "High", "source": "L1:line 22: @PathVariable long releaseId (ReleaseController.get 路径变量)", "sink": "L3:line 23: restTemplate.getForObject 以用户可控 releaseId 拼接 URL 取回 ReleaseDTO", "explanation": "流A: L1:22 可控 releaseId 经 L1:23 与 L2:18-20 传递, 中间层仅 Env.valueOf 校验环境名格式(看似净化实则与资源归属无关), 至 L3:22 拼接 URL 并在 L3:23 getForObject 取回任意发布记录, 全链无对象级授权; 流B: L1:28-29 compare 端点为第二入口, baseReleaseId 与 toCompareReleaseId 经 L2:23-25 抵达 L3:26-28 同一未防护客户端; 两条流均无 @PreAuthorize 或归属校验, 也不存在黑名单/正则/替换过滤(是缺失而非可绕过); 任意用户枚举自增 releaseId 即可跨应用水平越权读取私有配置内容", "fix_suggestion": "line 20: 在 ReleaseService.loadRelease 返回前依据 release 的 appId/clusterName/namespaceName 调用 UserPermissionValidator 做对象级授权校验, 未通过抛 AccessDeniedException, compare 流程同样先加载再鉴权"}
+```

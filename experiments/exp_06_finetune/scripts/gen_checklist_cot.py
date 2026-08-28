@@ -62,33 +62,50 @@ def build_prompt(code: str, lang: str, cwe: str, vuln_desc: str) -> str:
 
 
 def stratified_sample(manifest, n_total: int):
-    """CWE×语言 分层抽样：单 CWE 封顶 12，长尾优先保入。"""
-    by_cwe = collections.defaultdict(list)
+    """CWE×语言 分层抽样（2026-08-27 扩量版）：
+    - 文件字符上限 9000→12000、单族封顶 12→24；
+    - CWE-798/CWE-190 长尾强制全收（v2.x 审查发现清单源这两族为 0）；
+    - 主循环不满时回填剩余样本——分层只影响顺序，不影响可达总量。
+    """
+    eligible = []
     for s in manifest:
         code_p = CORPUS / "train_pool" / s["file"]
-        if not code_p.exists() or len(code_p.read_text(errors="replace")) > 9000:
+        if not code_p.exists() or len(code_p.read_text(errors="replace")) > 12000:
             continue
+        eligible.append(s)
+    FORCED = {"CWE-798", "CWE-190"}
+    picked, taken = [], set()
+    for s in eligible:
+        if s.get("expected_cwe") in FORCED and s["file"] not in taken:
+            picked.append(s); taken.add(s["file"])
+    rest = [s for s in eligible if s["file"] not in taken]
+    by_cwe = collections.defaultdict(list)
+    for s in rest:
         by_cwe[s.get("expected_cwe", "?")].append(s)
-    per_cap = max(4, min(12, (n_total // max(len(by_cwe), 1)) + 2))
-    picked = []
+    per_cap = max(6, min(24, (n_total // max(len(by_cwe), 1)) + 4))
     for cwe in sorted(by_cwe, key=lambda c: len(by_cwe[c])):  # 长尾先挑
-        pool = by_cwe[cwe]
-        # 语言多样性：按语言轮转取
+        pool = [x for x in by_cwe[cwe] if x["file"] not in taken]
         by_lang = collections.defaultdict(list)
-        for s in pool:
-            by_lang[(s.get("language") or "?")].append(s)
+        for x in pool:
+            by_lang[(x.get("language") or "?")].append(x)
         i = 0
         while len([p for p in picked if p.get("expected_cwe") == cwe]) < per_cap and any(by_lang.values()):
             langs = sorted(by_lang)
             lang = langs[i % len(langs)]
             if by_lang[lang]:
-                picked.append(by_lang[lang].pop(0))
+                nxt = by_lang[lang].pop(0)
+                if nxt["file"] not in taken:
+                    picked.append(nxt); taken.add(nxt["file"])
             else:
-                by_lang.pop(lang)
-                continue
+                by_lang.pop(lang); continue
             i += 1
             if len(picked) >= n_total:
                 return picked
+    for s in rest:  # 回填：长尾已尽、封顶未满时不再丢样本
+        if len(picked) >= n_total:
+            break
+        if s["file"] not in taken:
+            picked.append(s); taken.add(s["file"])
     return picked[:n_total]
 
 
@@ -99,12 +116,22 @@ def main():
     ap.add_argument("--pilot", action="store_true")
     args = ap.parse_args()
 
-    key = os.environ.get("OPENROUTER_KEY", "")
+    key = (os.environ.get("TEACHER_KEY") or os.environ.get("OPENROUTER_KEY") or "")
     if not key:
         print("需要 OPENROUTER_KEY", file=sys.stderr)
         sys.exit(1)
 
     manifest = json.loads((CORPUS / "train_pool" / "manifest.json").read_text())["samples"]
+    # 考卷簇种子过滤（P2，2026-08-27）：dedupe_real_corpus.py 审计出的
+    # 隔离淘汰种子（与 rolling_dev/rolling_dev_safe 同簇）不再送教师——
+    # 省无谓 API 开销，泄漏拦截前移到种子层
+    _bl = CORPUS.parent / "results/corpus_cluster_blocklist.json"
+    if _bl.exists():
+        _banned = set(json.loads(_bl.read_text(encoding="utf-8"))["filenames"])
+        _n = len(manifest)
+        manifest = [s for s in manifest if Path(s["file"]).name not in _banned]
+        if _n != len(manifest):
+            print(f"[blocklist] 滤除考卷簇种子 {_n - len(manifest)} 个", flush=True)
     seeds = stratified_sample(manifest, args.n_total)
     done = set()
     if PROGRESS_PATH.exists():
