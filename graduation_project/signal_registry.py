@@ -35,6 +35,21 @@ _REGISTRY_PATH = Path(__file__).resolve().parent.parent / "models" / "signal_reg
 # 延迟回填的跨样本一致性门槛：同一信号被 ≥K 个独立样本一致判定才 commit
 MIN_AGREE_SAMPLES = 2
 
+# 抑制池保护名单（工具层优化指导 §五之四，2026-08-30）：自有链级规则不进抑制池。
+# 规则级抑制的粒度缺陷：规则是否误报取决于"文件"（B608 在 hard_bypass_01 的
+# replace 假净化上是否决性证据，在别的文件可能是正确告警），规则级抑制 → 样本级
+# 盲区且静默（工具层零召回无任何提示）。自有 taint 规则携带完整 source→sink
+# 证据链，是全链路最强证据形态：被抑制的代价（真阳性候选在**所有文件**静默消失，
+# 生产池曾实锤压掉 python-xss-taint / python-sqli-taint 全族）远大于保留候选的
+# 裁决成本（每候选 N=3 次采样）。故对其仅记录否定计数（供按文件粒度治理），
+# 永不置 suppressed；读端同样豁免（防历史 JSON 残留的 suppressed=True 复发）。
+_PROTECTED_RULE_PREFIXES = ("taint_tracker:", "graduation_project.semgrep_rules.")
+
+
+def _is_protected_rule(rule_id: str) -> bool:
+    """自有链级规则识别（结构性前缀，非样本拼写拟合）。"""
+    return bool(rule_id) and rule_id.startswith(_PROTECTED_RULE_PREFIXES)
+
 
 @dataclass
 class Signal:
@@ -214,7 +229,12 @@ class SignalRegistry:
                     if sig.confirmed > 0:
                         sig.confirmed = 0
                         sig.confirmed_files = []
-                    if len(sig.rejected_files) >= MIN_AGREE_SAMPLES:
+                    # §五之四 保护（2026-08-30）：自有链级规则达到抑制门槛也不
+                    # suppressed——其候选带完整证据链，规则级静默跳过 = 全文件
+                    # 真阳性消失（§五之四 实锤）。否定计数照常累计，供后续
+                    # "按文件粒度降权"治理取数。
+                    if (len(sig.rejected_files) >= MIN_AGREE_SAMPLES
+                            and not _is_protected_rule(rule_id)):
                         sig.suppressed = True
                 sig.suppressed_samples += 1
         # 变更后自动持久化（2026-08-15：此前 save() 全仓库无调用方，重启归零）
@@ -230,9 +250,14 @@ class SignalRegistry:
             return self._signals.get(rule_id)
 
     def is_suppressed(self, rule_id: str) -> bool:
-        """该规则是否在抑制池（D 级：工具见到直接跳过）。"""
+        """该规则是否在抑制池（D 级：工具见到直接跳过）。
+
+        §五之四（2026-08-30）：自有链级规则读端豁免——历史 JSON 里可能残留
+        保护机制上线前的 suppressed=True，读端不放行则候选依旧被静默跳过，
+        写端禁止形同虚设（写读两端必须同口径，§11.12 教训）。
+        """
         sig = self.get_signal(rule_id)
-        return bool(sig and sig.suppressed)
+        return bool(sig and sig.suppressed and not _is_protected_rule(rule_id))
 
     def boost_priority(self, rule_id: str) -> float:
         """返回该规则的召回优先级权重（已回填的高置信信号权重高，供候选排序）。"""
@@ -378,6 +403,29 @@ if __name__ == "__main__":
     print(f"[{'PASS' if ok3 else 'FAIL'}] 抑制池(≥2独立文件): "
           f"单次={not r.is_suppressed('py.taint.sql')}")
 
+    # 3b) §五之四 保护（2026-08-30）：自有链级规则即使 ≥2 独立文件全票否决
+    #     也不进抑制池（候选静默消失 = 全文件真阳性丢失，实锤 python-xss-taint）
+    for fn in ("x.py", "y.py"):
+        r.record("graduation_project.semgrep_rules.python-xss-taint",
+                 confirmed=False, n=3, votes_true=0, votes_false=3,
+                 votes_invalid=0, file=fn)
+    sig_xss = r.get_signal("graduation_project.semgrep_rules.python-xss-taint")
+    ok3b = (not sig_xss.suppressed and not r.is_suppressed(
+        "graduation_project.semgrep_rules.python-xss-taint")
+        and sig_xss.suppressed_samples == 2)  # 否定计数照常累计（供治理取数）
+    print(f"[{'PASS' if ok3b else 'FAIL'}] 自有链级规则不抑制(§五之四): "
+          f"suppressed={sig_xss.suppressed}, rejected_files={len(sig_xss.rejected_files)}")
+
+    # 3c) §五之四 读端豁免：历史 JSON 残留的 suppressed=True（保护上线前写入）
+    #     对自有规则不再生效（写读同口径）
+    from graduation_project.signal_registry import Signal as _Signal
+    legacy = r._signals.setdefault("taint_tracker:Path Traversal",
+                                   _Signal(rule_id="taint_tracker:Path Traversal"))
+    legacy.suppressed = True
+    ok3c = not r.is_suppressed("taint_tracker:Path Traversal")
+    print(f"[{'PASS' if ok3c else 'FAIL'}] 自有规则读端豁免(§五之四): "
+          f"is_suppressed={r.is_suppressed('taint_tracker:Path Traversal')} (期望 False)")
+
     # 4) 类型校正多数投票：首个类型可被更高票类型替换（不再先到先得）。
     #    门槛（2026-08-16 修正后）：单文件校正不生效（< MIN_AGREE_SAMPLES=2 时
     #    保留工具原标注防 B 级污染），≥2 独立文件一致才提交。
@@ -404,6 +452,6 @@ if __name__ == "__main__":
     print(f"[{'PASS' if ok5 else 'FAIL'}] 自动持久化/重启恢复: file_exists={tmp.is_file()}, "
           f"suppressed={sig3.suppressed if sig3 else None}")
 
-    all_ok = all([ok1, ok2, ok3, ok4, ok5])
+    all_ok = all([ok1, ok2, ok3, ok3b, ok3c, ok4, ok5])
     print(f"\n{'=== 自检通过 ===' if all_ok else '!!! 自检失败 !!!'}")
     sys.exit(0 if all_ok else 1)

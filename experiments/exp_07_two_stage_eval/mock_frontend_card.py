@@ -17,6 +17,8 @@ TwoStageScanner.scan_code() → to_dict()，并按 app/backend/static/scan.html
   R4 证据链：source/sink/explanation/fix 全文行号锚 vs 源码真实行
   R5 多漏洞：vulnerability_types 与"全部确认漏洞"区一致，top1=vulnerability_type
   R6 复核区：reviewer_findings 展示待复核候选（含 rule_id/置信度）
+  R7 伴生凭证标注（2026-08-30 §8.5 过渡方案）：唯一 confirmed 候选属 secret 族
+     → 类型行显示「伴生凭证发现」徽标（与 scan.html 同步实现）
 
 用法（GPU 空闲时）：
   # 自动挑选重点样本（type_miss/FP/真漏洞复核/多漏洞共现）
@@ -158,6 +160,29 @@ def check_card(r: dict, code: str, rec: dict) -> dict:
         notes.append(f"类型 vs 标注不一致：卡 {sorted(got_cwes)} vs 标注 {sorted(exp_cwes)}"
                      f"——需综合考量（标注单标/近邻概念/主次排序）")
     issues["_notes"] = notes
+    # R7 伴生凭证标注（2026-08-30，工具层优化指导 §8.5 过渡方案，与 scan.html
+    # 同步）：唯一 confirmed 候选属 secret 族（B105 族/hardcoded-*/Hardcoded
+    # Credentials/gitleaks 规则名）→ 前端类型行显示「伴生凭证发现」徽标（纯展示，
+    # 不改判定）。核对报告记录哪些卡会出现该标注，防两份渲染实现漂移。
+    # 注意：必须在 issues["_notes"] = notes 赋值之后追加（该赋值是整体覆写）。
+    if hv is True and (r.get("_kind") or "two-stage") == "two-stage":
+        sec = re.compile(
+            r"B10[567]|hardcoded[-_.]?(?:token|secret|password|credential|api[_-]?key)"
+            r"|Hardcoded Credentials|generic-api-key|aws-access-key-id|python-bytes-literal-secret",
+            re.IGNORECASE)
+        conf = [a for a in r.get("adjudications") or [] if a.get("confirmed")]
+        only_secret = bool(conf) and all(
+            ((a.get("category")
+              or (a.get("finding") or {}).get("category") or "") == "secret")
+            or sec.search(a.get("rule_id")
+                          or (a.get("finding") or {}).get("rule_id") or "")
+            or sec.search(a.get("taint_type")
+                          or (a.get("finding") or {}).get("taint_type") or "")
+            for a in conf)
+        if only_secret:
+            issues["_notes"].append(
+                "唯一 confirmed 候选为 secret 族 → 前端显示「伴生凭证发现」标注"
+                "（§8.5 过渡方案：文件级类型可能只是伴生发现）")
     return issues
 
 
