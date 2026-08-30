@@ -120,6 +120,11 @@
         overflow-y: auto;
         overscroll-behavior: contain;
       }
+      /* 两阶段详情：原始输出折叠块 */
+      .code-block details > summary { list-style: none; cursor: pointer; }
+      .code-block details > summary::-webkit-details-marker { display: none; }
+      .code-block details > summary::before { content: '▸ '; }
+      .code-block details[open] > summary::before { content: '▾ '; }
       .progress-bar {
         height: 8px;
         background-color: var(--vuln-line);
@@ -375,10 +380,10 @@
               <span class="text-xs text-[var(--vuln-ink-2)]">两阶段扫描</span>
               <input id="opt-two-stage" type="checkbox" checked class="accent-[var(--vuln-brand)]" title="两阶段为系统唯一扫描路径（无法关闭）；勾选后展开下方采样数设置。采样越多越准、越慢" />
             </div>
-            <div id="two-stage-tool-hint" class="hidden px-3 pb-1 text-xs text-[var(--vuln-ink-3)]">系统默认走两阶段扫描（工具召回 + LLM 自一致率裁决），无需任何勾选。本开关仅控制「自一致率采样数」是否可调（取消勾选用默认 3）。工具召回：Semgrep 污点规则 + TaintTracker + 正则预筛 + 外部工具（密钥/依赖/SAST/IaC）。</div>
+            <div id="two-stage-tool-hint" class="hidden px-3 pb-1 text-xs text-[var(--vuln-ink-3)]">系统默认走两阶段扫描：第 1 阶段由工具召回可疑点（Semgrep 污点规则 + TaintTracker + 正则预筛 + 外部工具：密钥/依赖/SAST/IaC），第 2 阶段由模型对每条候选独立采样投票、多数票定结论；候选全部被否决时模型会再通读全文兜底。无需任何勾选，本开关仅控制下方「模型采样次数」是否可调（取消勾选用默认 3）。</div>
             <div id="two-stage-samples-wrap" class="hidden flex items-center justify-between rounded-md px-3 py-2">
-              <span class="text-xs text-[var(--vuln-ink-2)]">自一致率采样数</span>
-              <input id="opt-two-stage-samples" type="number" value="3" min="1" max="10" class="w-20 text-xs bg-[var(--vuln-bg)] border border-[var(--vuln-line)] rounded px-2 py-1 text-[var(--vuln-ink)] focus:outline-none focus:ring-1 focus:ring-[var(--vuln-brand)]" title="LLM 重复采样次数，用于自一致率置信度评估" />
+              <span class="text-xs text-[var(--vuln-ink-2)]">模型采样次数</span>
+              <input id="opt-two-stage-samples" type="number" value="3" min="1" max="10" class="w-20 text-xs bg-[var(--vuln-bg)] border border-[var(--vuln-line)] rounded px-2 py-1 text-[var(--vuln-ink)] focus:outline-none focus:ring-1 focus:ring-[var(--vuln-brand)]" title="对每条候选独立提问的次数，多数票决定结论；越多越稳、越慢" />
             </div>
           </div>
         </div>
@@ -872,7 +877,9 @@
             // 规范化 has_vulnerability：非 true/false 的值（undefined/缺失）统一为 null（分析失败）
             if (r.has_vulnerability !== true && r.has_vulnerability !== false) {
               r.has_vulnerability = null;
-              if (!r._kind) r._kind = 'error';
+              // _kind 缺失时不再一律标 error：两阶段结果（含 stage1）的 null
+              // 是"需复核"语义，误标会让正常复核决策渲染成失败卡
+              if (!r._kind) r._kind = r.stage1 ? 'two-stage' : 'error';
             }
           }
           scanResults.push(r);
@@ -991,7 +998,7 @@
               promises.push(singleAnalyze(code, lang, filename, nSamples));
             }
           } else {
-            /* 默认路径：两阶段（工具召回 + LLM 自一致率裁决） */
+            /* 默认路径：两阶段（工具召回 + 模型逐条裁决） */
             promises.push(singleAnalyze(code, lang, filename, nSamples));
           }
 
@@ -1458,7 +1465,8 @@
         /* 三态严重度：两阶段 review/null 归为需要复核（warning 色系） */
         function resultSeverity(r) {
           if (r._kind === 'error') return 'info';
-          if (r._kind === 'two-stage' && r.has_vulnerability == null) return 'review';
+          /* 两阶段 null 归为需复核（warning 色系），判定用 isTwoStageResult 兜底 */
+          if (isTwoStageResult(r) && r.has_vulnerability == null) return 'review';
           if (r.has_vulnerability === false) return 'info';
           var risk = (r.risk_level || '').toLowerCase();
           /* 两阶段缺少顶层 risk_level（旧缓存等）时，从裁决最高严重度推导 */
@@ -1474,68 +1482,321 @@
           return f.taint_type || f.rule_id || 'detected';
         }
         /* 两阶段核心字段明细：裁决投票/置信度 + 证据链(source→sink, path) + 分析/修复 + 需复核链 + 工具召回监控 */
+        /* 可解释性辅助（2026-08-29）：明确区分"工具召回"与"LLM 裁决"两阶段，
+           以及每个候选来自哪一层——防止用户把"排除·复核"误读为系统结论、
+           把 LLM 兜底发现误读为工具检出（hard_cve_02/typical_23 实拍反馈） */
+        var TOOL_LABELS = { semgrep: 'Semgrep', semgrep_rules: 'Semgrep', taint_tracker: 'TaintTracker', prefilter: 'Prefilter 正则', bandit: 'Bandit', gitleaks: 'Gitleaks', trivy: 'Trivy', pip_audit: 'pip-audit', 'pip-audit': 'pip-audit', detect_secrets: 'detect-secrets', 'detect-secrets': 'detect-secrets' };
+        var TOOL_FINDING_LABELS = { semgrep: 'Semgrep 规则召回', taint_tracker: '污点分析召回', bandit: 'Bandit 规则召回', prefilter: '正则预筛召回', llm_recheck: 'LLM 兜底发现（工具未召回）' };
+        var CATEGORY_LABELS = {
+          taint: '污点分析召回', sast: 'SAST 规则召回', prefilter: '正则预筛召回',
+          secret: '密钥扫描', sca: '依赖扫描', iac: 'IaC 扫描'
+        };
+
+        /* 候选来源的纯文本标签（前端徽标与单文件报告共用，保证两处口径一致） */
+        function candidateSourceText(f, decision) {
+          var cat = f.category || '';
+          var isLlm = cat === 'llm' || f.tool === 'llm_recheck';
+          if (isLlm) {
+            /* 区分两种 LLM 介入场景（2026-08-29 修正，typical_04 实拍反馈）：
+               no_candidate = 工具漏报后兜底；has_candidate_recheck = 工具候选
+               被裁决否决后全文复核翻案——"工具未召回"字样在后者是误导 */
+            return (decision || '').indexOf('no_candidate') === 0
+              ? '模型全文复核发现（工具未召回，兜底）'
+              : '模型全文复核发现（工具候选被否决后）';
+          }
+          return CATEGORY_LABELS[cat] || TOOL_FINDING_LABELS[f.tool] || '';
+        }
+
+        function candidateSourceBadge(f, decision) {
+          var label = candidateSourceText(f, decision);
+          if (!label) return '';
+          var cat = f.category || '';
+          var isLlm = cat === 'llm' || f.tool === 'llm_recheck';
+          var cls = isLlm
+            ? 'bg-[var(--vuln-state-warning)]/10 text-[var(--vuln-state-warning)]'
+            : 'bg-[var(--vuln-state-info)]/10 text-[var(--vuln-state-info)]';
+          return '<span class="px-1.5 py-0.5 rounded-full text-[10px] ' + cls + '">' + escapeHtml(label) + '</span>';
+        }
+
+        function stage1FlowHTML(r) {
+          var s1 = r.stage1 || {};
+          var dec = s1.decision || '';
+          if (!dec) return '';
+          var byTool = s1.by_tool || {};
+          var parts = [];
+          Object.keys(byTool).forEach(function (k) {
+            var n = byTool[k] || 0;
+            if (n > 0) parts.push((TOOL_LABELS[k] || k) + ' ×' + n);
+          });
+          var recallTxt = parts.length ? parts.join(' · ') : '各工具均 0 命中';
+          var leak = dec === 'no_candidate_recheck_vuln';
+          var overturn = dec === 'has_candidate_recheck_vuln';
+          var stage2 = leak ? '模型全文复核发现漏洞（工具层漏报，兜底）'
+            : (dec === 'no_candidate_recheck_safe' ? '模型全文复核确认安全'
+              : (overturn ? '工具候选被模型否决 → 全文复核翻案发现漏洞'
+                : '模型逐条裁决工具候选（每条独立采样，多数票定结论）'));
+          var warn = leak ? '<span class="font-medium" style="color:var(--vuln-state-warning)">⚠ 工具层漏报</span> · ' : '';
+          return '<div class="rounded-md border border-[var(--vuln-line)] bg-[var(--vuln-surface-2)]/40 px-2.5 py-1.5 mb-3 text-xs text-[var(--vuln-ink-2)]">' +
+            warn + '流程：第 1 阶段 <span class="font-medium text-[var(--vuln-ink)]">工具召回</span>（<span class="font-mono">' + escapeHtml(recallTxt) + '</span>）' +
+            ' → 第 2 阶段 <span class="font-medium text-[var(--vuln-ink)]">' + escapeHtml(stage2) + '</span></div>';
+        }
+
+        /* ---------- 两阶段详情渲染（2026-08-29 重构，typical_04/28 实拍反馈） ----------
+           阅读模型：结论 → 依据 → 排除明细，三节各司其职：
+           1. 流程条：一句话讲清两阶段链路（谁召回、谁裁决、最终怎么判）；
+           2. 「模型确认的漏洞」：文件级结论的证据卡，全文分析/修复建议/链路只在这里出现一次；
+           3. 「工具召回候选的模型复核」：被否决/待复核候选的紧凑明细——
+              票数永远是"模型 N 次采样投票"（工具只负责召回），原始输出折叠进 <details>。
+           去重规则（typical_04/28 实拍：同屏两份分析说明/修复建议/链路）：
+           - 文件级 explanation 顶部摘要 ≤200 字，全文只在确认卡渲染；
+           - 修复建议只在确认卡渲染（卡底部块与被否决候选均不重复）；
+           - 顶层 source→sink chips 对两阶段卡不再渲染（链路在卡片内带行号展示）。 */
+        function fmtSnippet(s, max) {
+          if (!s) return '';
+          var t = String(s).trim();
+          if (t.charAt(t.length - 1) === '(') return t + '…)';
+          if (t.length > (max || 48)) return t.slice(0, max || 48) + '…';
+          return t;
+        }
+
+        /* 人话链路：污点来源 ·L10 `request.args.get(…)` → 危险汇聚点 ·L12 `open(…)`；
+           withLabels=false 用于紧凑候选行 */
+        function taintChainHTML(f, withLabels) {
+          var hasSrc = f.source && f.source !== 'N/A';
+          var hasSnk = f.sink && f.sink !== 'N/A';
+          if (!hasSrc && !hasSnk) return '';
+          function chip(txt, line, cls) {
+            return '<span class="px-1.5 py-0.5 rounded ' + cls + ' font-mono">' + escapeHtml(txt) +
+              (line ? '<span class="text-[var(--vuln-ink-3)]"> ·L' + escapeHtml(String(line)) + '</span>' : '') + '</span>';
+          }
+          var html = '';
+          if (withLabels && hasSrc) html += '<span class="text-[var(--vuln-ink-3)]">污点来源</span> ';
+          if (hasSrc) html += chip(fmtSnippet(f.source), f.source_line, 'bg-[var(--vuln-state-error)]/10 text-[var(--vuln-state-error)]');
+          if (hasSrc && hasSnk) html += ' <span class="text-[var(--vuln-ink-3)]">→</span> ';
+          if (withLabels && hasSnk) html += '<span class="text-[var(--vuln-ink-3)]">危险汇聚点</span> ';
+          if (hasSnk) html += chip(fmtSnippet(f.sink), f.sink_line, 'bg-[var(--vuln-state-warning)]/10 text-[var(--vuln-state-warning)]');
+          return '<div class="mt-1 text-xs flex items-center gap-1.5 flex-wrap">' + html + '</div>';
+        }
+
+        /* 采样投票的归属（2026-08-29 实拍反馈：两张卡都写"模型 3 次独立采样"，
+           用户分不清哪部分属于工具、哪部分属于模型）——拆成"发现方 / 裁决方"，
+           且裁决方注明通道：逐条裁决（对工具候选）vs 全文复核（模型自主发现） */
+        function rulingText(a, groupSize) {
+          if ((a.decision || '') === 'direct') return '确定性工具直出（无需模型投票）';
+          var n = (a.votes_true || 0) + (a.votes_false || 0) + (a.votes_invalid || 0);
+          var channel = isLlmFinding(a.finding || {}) ? '全文复核' : '逐条裁决';
+          var s = '模型（' + channel + '）：' + n + ' 次独立采样，判真 ' + (a.votes_true || 0) + ' · 判假 ' + (a.votes_false || 0) + ' · 无效 ' + (a.votes_invalid || 0);
+          if (groupSize > 1) s += '；组内每条候选独立采样';
+          return s;
+        }
+        function rulingHTML(a, groupSize) {
+          return '<span class="text-[var(--vuln-ink-2)] font-medium">裁决方</span> ' + escapeHtml(rulingText(a, groupSize));
+        }
+        /* 发现方描述：仅模型自主发现时需要文字点明（工具召回的场景徽标即发现方） */
+        function finderText(a) {
+          var f = a.finding || {};
+          if (f.category === 'llm' || f.tool === 'llm_recheck') return '模型全文复核（非工具召回）';
+          return '';
+        }
+        function isLlmFinding(f) {
+          return (f || {}).category === 'llm' || (f || {}).tool === 'llm_recheck';
+        }
+
+        /* 裁决档位 → 一句话结论（前端徽标与单文件报告共用）。
+           「一致性」= 多数方票数占比，不是正确率概率（后端 confidence 定义如此） */
+        function adjudSentence(a) {
+          var d = a.decision || (a.confirmed ? 'confirmed_vulnerability' : 'dismissed_safe');
+          var pct = Math.round((a.confidence || 0) * 100);
+          if (d === 'direct') return '确定性工具直出';
+          if (d === 'confirmed_vulnerability') return '模型确认漏洞 · 一致性 ' + pct + '%';
+          if (d === 'confirmed_review') return '模型确认漏洞 · 票数不一致（' + pct + '%），转人工复核';
+          if (d === 'dismissed_safe') return '模型排除误报 · 一致性 ' + pct + '%';
+          if (d === 'dismissed_review') return '模型倾向排除 · 票数不一致（' + pct + '%），转人工复核';
+          return adjudDecisionLabel(a);
+        }
+
+        /* 证据门等确定性拦截的辅助说明 */
+        function adjudAuxNote(a) {
+          if (a.evidence_gate) {
+            return '证据门拦截：' + (a.evidence_gate === 'sink_defended' ? '汇聚点已有防御' : a.evidence_gate === 'no_input_entry' ? '污点输入不可达' : a.evidence_gate);
+          }
+          return '';
+        }
+
+        /* 原始输出折叠块：items=[{label,text}]，默认收起（2026-08-29：不再内联刷屏） */
+        function rawOutputsDetails(items, title) {
+          var outs = (items || []).filter(function (it) { return it && it.text && String(it.text).trim(); });
+          if (!outs.length) return '';
+          var body = outs.map(function (it, i) {
+            return '<div class="mt-1.5 first:mt-0">' +
+              '<span class="text-[10px] text-[var(--vuln-ink-3)]">' + escapeHtml(it.label || ('采样 ' + (i + 1))) + '</span>' +
+              '<div class="text-xs text-[var(--vuln-ink-3)] whitespace-pre-wrap font-mono">' + escapeHtml(String(it.text).trim()) + '</div></div>';
+          }).join('');
+          return '<details class="mt-1.5"><summary class="text-xs text-[var(--vuln-ink-3)] hover:text-[var(--vuln-ink-2)]">' +
+            escapeHtml(title || ('模型原始输出（' + outs.length + ' 条，点击展开）')) + '</summary>' +
+            '<div class="mt-1 pl-2 border-l border-[var(--vuln-line)]">' + body + '</div></details>';
+        }
+
+        function adjudRawItems(a, prefix) {
+          return (a.raw_outputs || []).map(function (o, i) {
+            return { label: (prefix ? prefix + ' · ' : '') + '采样 ' + (i + 1), text: o };
+          });
+        }
+
+        /* 确认卡：文件级结论的证据实体 */
+        function confirmedCardHTML(a, r, explanationTruncated) {
+          var f = a.finding || {};
+          var sev = (f.severity || 'medium').toLowerCase();
+          var sc = sev === 'critical' || sev === 'high' ? 'var(--vuln-state-error)' : (sev === 'medium' ? 'var(--vuln-state-warning)' : 'var(--vuln-state-info)');
+          var html = '<div class="rounded-md border border-[var(--vuln-line)] bg-[var(--vuln-surface)]/40 px-2.5 py-2">' +
+            '<div class="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">' +
+            candidateSourceBadge(f, r.stage1 && r.stage1.decision) +
+            '<span class="font-mono font-medium" style="color:' + sc + '">' + escapeHtml(twoStageTypeLabel(f)) + '</span>' +
+            '<span class="px-1.5 py-0.5 rounded-full bg-[var(--vuln-surface-2)] text-[var(--vuln-ink-2)]">' + escapeHtml(adjudSentence(a)) + '</span>' +
+            '</div>';
+          /* 发现方/裁决方归属行：模型自主发现时点明「非工具召回」；
+             翻案场景追加桥接说明——同一位置先被判误报后确认，不解释会被当成 bug */
+          var finder = finderText(a);
+          var roleLine = (finder ? '<span class="text-[var(--vuln-ink-2)] font-medium">发现方</span> ' + escapeHtml(finder) + ' <span class="text-[var(--vuln-ink-3)]">·</span> ' : '') + rulingHTML(a);
+          html += '<div class="mt-1 text-xs text-[var(--vuln-ink-3)]">' + roleLine + '</div>';
+          if (isLlmFinding(f) && r.stage1 && r.stage1.decision === 'has_candidate_recheck_vuln') {
+            html += '<div class="mt-1 text-xs text-[var(--vuln-ink-3)]">说明：候选否决（逐条裁决）与全文复核是两次独立裁决——前者只回答「该工具告警是否为真」（判了误报），后者开放式通读全文件（翻案确认）。</div>';
+          }
+          html += taintChainHTML(f, true);
+          if (f.path && f.path.length) {
+            html += '<div class="mt-1 text-xs text-[var(--vuln-ink-3)]">传播链：<span class="font-mono">' + escapeHtml(f.path.join(' → ')) + '</span></div>';
+          }
+          /* 分析说明全文只渲染这一次：顶部摘要 200 字截断时必须补全，
+             未截断且与文件级 explanation 同文时不再重复（typical_23 实拍反馈） */
+          var reason = a.reasoning || '';
+          if (reason && (explanationTruncated || reason !== r.explanation)) {
+            html += '<div class="mt-1.5"><span class="text-xs font-medium text-[var(--vuln-ink)]">分析说明' + (explanationTruncated && reason === r.explanation ? '（全文）' : '') + '</span><div class="text-xs text-[var(--vuln-ink-2)] whitespace-pre-wrap mt-0.5">' + escapeHtml(reason) + '</div></div>';
+          }
+          /* 修复建议只挂在确认卡上；被否决候选渲染修复建议会误导（问题都不成立） */
+          if (a.fix_suggestion && a.fix_suggestion !== 'no fix needed') {
+            html += '<div class="mt-1 text-xs text-[var(--vuln-state-success)]">修复建议：' + escapeHtml(a.fix_suggestion) + '</div>';
+          }
+          var aux = adjudAuxNote(a);
+          if (aux) html += '<div class="mt-1 text-xs text-[var(--vuln-ink-3)]">' + escapeHtml(aux) + '</div>';
+          var rawN = (a.raw_outputs || []).filter(function (x) { return x && String(x).trim(); }).length;
+          var rawChannel = isLlmFinding(f) ? '全文复核' : '逐条裁决';
+          html += rawOutputsDetails(adjudRawItems(a), '模型原始输出（' + rawChannel + '，' + rawN + ' 次采样，点击展开）');
+          return html + '</div>';
+        }
+
+        /* 排除/待复核候选：同型合并（2026-08-29 二次反馈，typical_28 实拍）——
+           同一问题常被多个工具/规则重复召回（正则 + Semgrep ×N），逐条渲染会出现
+           N 份几乎相同的卡片。分组键 = 类型 + 裁决档 + 票数：同组合并为一行，
+           工具来源去重计数、位置去重（≤2 条，其余计数）、原始输出合并折叠。 */
+        function groupKeyOf(a) {
+          var f = a.finding || {};
+          return twoStageTypeLabel(f) + '|' + (a.decision || '') + '|' + (a.votes_true || 0) + '|' + (a.votes_false || 0) + '|' + (a.votes_invalid || 0);
+        }
+
+        function rejectedGroupsHTML(rows, stageDecision) {
+          var order = [], map = {};
+          rows.forEach(function (a) {
+            var k = groupKeyOf(a);
+            if (!map[k]) { map[k] = []; order.push(k); }
+            map[k].push(a);
+          });
+          return order.map(function (k) {
+            var group = map[k];
+            var first = group[0];
+            var f = first.finding || {};
+            /* 工具来源去重计数："正则预筛召回 · SAST 规则召回 ×2" */
+            var labelCount = {};
+            group.forEach(function (a) {
+              var lb = candidateSourceText(a.finding || {}, stageDecision) || (a.finding || {}).tool || '工具候选';
+              labelCount[lb] = (labelCount[lb] || 0) + 1;
+            });
+            var labels = Object.keys(labelCount).map(function (lb) {
+              return labelCount[lb] > 1 ? lb + ' ×' + labelCount[lb] : lb;
+            });
+            var html = '<div class="rounded-md border border-[var(--vuln-line)] bg-[var(--vuln-surface)]/30 px-2.5 py-2">' +
+              '<div class="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">' +
+              '<span class="px-1.5 py-0.5 rounded-full text-[10px] bg-[var(--vuln-state-info)]/10 text-[var(--vuln-state-info)]">' + escapeHtml(labels.join(' · ')) + '</span>' +
+              '<span class="font-mono text-[var(--vuln-ink-2)]">' + escapeHtml(twoStageTypeLabel(f)) +
+              (group.length > 1 ? '<span class="text-[var(--vuln-ink-3)] font-sans"> ×' + group.length + ' 条候选</span>' : '') + '</span>' +
+              '<span class="ml-auto text-[var(--vuln-ink-3)]">' + escapeHtml(adjudSentence(first)) + '</span>' +
+              '</div>';
+            /* 位置去重：同组候选可能落在不同行号，最多展示 2 条链路 */
+            var chains = [];
+            group.forEach(function (a) {
+              var c = taintChainHTML(a.finding || {}, false);
+              if (c && chains.indexOf(c) === -1) chains.push(c);
+            });
+            chains.slice(0, 2).forEach(function (c) { html += c; });
+            if (chains.length > 2) html += '<div class="mt-1 text-xs text-[var(--vuln-ink-3)]">另有 ' + (chains.length - 2) + ' 处不同位置</div>';
+            /* 发现方已在来源徽标（工具召回）；此处只标裁决方归属 */
+            html += '<div class="mt-1 text-xs text-[var(--vuln-ink-3)]">' + rulingHTML(first, group.length) + '</div>';
+            var aux = adjudAuxNote(first);
+            if (aux) html += '<div class="mt-1 text-xs text-[var(--vuln-ink-3)]">' + escapeHtml(aux) + '</div>';
+            /* 原始输出合并折叠：N 条候选 × 每条采样；多候选组内标注每条候选的来源工具，
+               否则用户无法把"候选 1/2/3"和上方工具来源对上号 */
+            var items = [];
+            group.forEach(function (a, gi) {
+              var prefix = '';
+              if (group.length > 1) {
+                var af = a.finding || {};
+                var toolName = TOOL_LABELS[af.tool] || af.tool || '工具';
+                prefix = '候选 ' + (gi + 1) + '（' + toolName + ' 召回）';
+              }
+              items = items.concat(adjudRawItems(a, prefix));
+            });
+            var per = (first.raw_outputs || []).length;
+            html += rawOutputsDetails(items, '模型原始输出（' + (group.length > 1 ? group.length + ' 条候选 × ' : '') + per + ' 次采样，点击展开）');
+            return html + '</div>';
+          }).join('');
+        }
+
         function twoStageDetailHTML(r) {
           if (r._kind !== 'two-stage') return '';
-          var html = '';
-          var adjs = r.adjudications || [];
-          if (adjs.length) {
-            html += '<p class="text-xs font-medium text-[var(--vuln-ink)] mb-1">LLM 裁决 · 自一致率置信度</p><div class="space-y-2 mb-3">';
-            adjs.forEach(function (a) {
-              var f = a.finding || {};
-              var sev = (f.severity || 'medium').toLowerCase();
-              var sc = sev === 'critical' || sev === 'high' ? 'var(--vuln-state-error)' : (sev === 'medium' ? 'var(--vuln-state-warning)' : 'var(--vuln-state-info)');
-              var pct = Math.round((a.confidence || 0) * 100);
-              html += '<div class="rounded-md border border-[var(--vuln-line)] bg-[var(--vuln-surface)]/40 px-2.5 py-2">' +
-                '<div class="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">' +
-                '<span class="font-mono font-medium" style="color:' + sc + '">' + escapeHtml(twoStageTypeLabel(f)) + '</span>' +
-                '<span class="text-[var(--vuln-ink-3)]">真 ' + (a.votes_true || 0) + ' / 假 ' + (a.votes_false || 0) + ' / 无效 ' + (a.votes_invalid || 0) + '</span>' +
-                '<span class="px-1.5 py-0.5 rounded-full bg-[var(--vuln-surface-2)] text-[var(--vuln-ink-2)]">' + escapeHtml(adjudDecisionLabel(a)) + ' · ' + pct + '%</span>' +
-                '</div>';
-              // 证据链：source → sink（含行号）
-              var src = f.source && f.source !== 'N/A';
-              var snk = f.sink && f.sink !== 'N/A';
-              if (src || snk) {
-                html += '<div class="mt-1.5 text-xs flex items-center gap-1.5 flex-wrap">' +
-                  (src ? '<span class="px-1.5 py-0.5 rounded bg-[var(--vuln-state-error)]/10 text-[var(--vuln-state-error)] font-mono">' + escapeHtml(f.source) + (f.source_line ? ' <span class="text-[var(--vuln-ink-3)]">L' + f.source_line + '</span>' : '') + '</span>' : '') +
-                  (src && snk ? '<span class="text-[var(--vuln-ink-3)]">→</span>' : '') +
-                  (snk ? '<span class="px-1.5 py-0.5 rounded bg-[var(--vuln-state-warning)]/10 text-[var(--vuln-state-warning)] font-mono">' + escapeHtml(f.sink) + (f.sink_line ? ' <span class="text-[var(--vuln-ink-3)]">L' + f.sink_line + '</span>' : '') + '</span>' : '') +
-                  '</div>';
-              }
-              // 传播链
-              if (f.path && f.path.length) {
-                html += '<div class="mt-1 text-xs text-[var(--vuln-ink-3)]">传播链：<span class="font-mono">' + escapeHtml(f.path.join(' → ')) + '</span></div>';
-              }
-              // 分析说明（reasoning）+ 修复
-              if (a.reasoning) {
-                html += '<div class="mt-1.5"><span class="text-xs font-medium text-[var(--vuln-ink)]">分析说明</span><div class="text-xs text-[var(--vuln-ink-2)] whitespace-pre-wrap mt-0.5">' + escapeHtml(a.reasoning) + '</div></div>';
-              }
-              if (a.fix_suggestion && a.fix_suggestion !== 'no fix needed') {
-                html += '<div class="mt-1 text-xs text-[var(--vuln-state-success)]">修复建议：' + escapeHtml(a.fix_suggestion) + '</div>';
-              }
-              // LLM 原始输出（首个判真样本）
-              if (a.raw_outputs && a.raw_outputs.length) {
-                var rawShow = a.raw_outputs[0] || '';
-                if (rawShow.length > 600) rawShow = rawShow.slice(0, 600) + '…';
-                html += '<div class="mt-1.5"><span class="text-xs font-medium text-[var(--vuln-ink)]">LLM 原始输出</span><div class="text-xs text-[var(--vuln-ink-3)] whitespace-pre-wrap mt-0.5 font-mono">' + escapeHtml(rawShow) + '</div></div>';
-              }
-              html += '</div>';
-            });
+          var html = stage1FlowHTML(r);
+          /* 阅读顺序（2026-08-29）：确认的候选在前、被否决在后（组内按置信度
+             降序）——先给结论再给"为什么其它告警被排除"，避免用户先读到
+             大段"漏洞不成立"论述被带偏（typical_23 实拍反馈） */
+          var adjs = (r.adjudications || []).slice().sort(function (x, y) {
+            var cx = x.confirmed ? 1 : 0, cy = y.confirmed ? 1 : 0;
+            if (cx !== cy) return cy - cx;
+            return (y.confidence || 0) - (x.confidence || 0);
+          });
+          var stageDecision = r.stage1 && r.stage1.decision;
+          var confirmed = adjs.filter(function (a) { return a.confirmed; });
+          var rejected = adjs.filter(function (a) { return !a.confirmed; });
+          var explanationTruncated = (r.explanation || '').length > 200;
+          if (confirmed.length) {
+            html += '<p class="text-xs font-semibold text-[var(--vuln-ink)] mb-1.5">模型确认的漏洞（最终结论）</p><div class="space-y-2 mb-3">';
+            confirmed.forEach(function (a) { html += confirmedCardHTML(a, r, explanationTruncated); });
             html += '</div>';
           }
+          /* 排除/待复核区（2026-08-29 二次反馈）：整体折叠为一行摘要——文件级结论
+             已由上方确认卡给出，N 条未被采纳候选的明细属于按需查阅内容；
+             reviewer_findings 与 rejected 中 *_review 条目同源双份（后端同时 append
+             两列表），仅取其一作为行来源，避免重复计数 */
           var reviewer = r.reviewer_findings || [];
-          if (reviewer.length) {
-            html += '<p class="text-xs font-medium text-[var(--vuln-state-warning)] mb-1">⚠ 需人工复核算链（低置信/平票）</p><div class="space-y-1 mb-3">';
-            reviewer.forEach(function (rv) {
-              var f = rv.finding || {};
-              var pct = Math.round((rv.confidence || 0) * 100);
-              html += '<div class="text-xs text-[var(--vuln-ink-2)]">' +
-                '<span class="font-mono">' + escapeHtml(twoStageTypeLabel(f)) + '</span> · ' +
-                '真 ' + (rv.votes_true || 0) + '/' + (rv.votes_false || 0) + ' · 置信度 ' + pct + '% · ' +
-                escapeHtml(adjudDecisionLabel(rv)) +
-                (rv.reasoning ? ' · ' + escapeHtml(rv.reasoning) : '') +
-                '</div>';
+          var rows = rejected.length ? rejected : reviewer;
+          if (rows.length) {
+            var nSafe = 0, nReview = 0, tie = 0;
+            rows.forEach(function (a) {
+              var d = a.decision || '';
+              if (d === 'dismissed_safe') nSafe++; else nReview++;
+              if ((a.votes_true || 0) > 0 && (a.votes_true || 0) === (a.votes_false || 0)) tie++;
             });
-            html += '</div>';
+            var dist = [];
+            if (nSafe) dist.push('已排除 ' + nSafe);
+            if (nReview) dist.push('倾向排除但票数不一致 ' + nReview);
+            html += '<details class="mb-3 rounded-md border border-[var(--vuln-line)] bg-[var(--vuln-surface-2)]/30 px-2.5 py-1.5">' +
+              '<summary class="text-xs text-[var(--vuln-ink-2)] select-none">' +
+              '<span class="font-semibold text-[var(--vuln-ink)]">工具召回候选的模型复核（' + rows.length + ' 条）</span>' +
+              ' · ' + escapeHtml(dist.join(' · ')) + (tie ? '（含 ' + tie + ' 条平票）' : '') +
+              ' · ' + (r.has_vulnerability == null ? '文件级结论待人工裁定' : '不影响文件级结论') +
+              '</summary>' +
+              '<div class="space-y-2 mt-2">' + rejectedGroupsHTML(rows, stageDecision) + '</div></details>';
+          }
+          if (!adjs.length && r.raw_output) {
+            /* 极旧缓存兜底：无裁决数据时原始输出折叠展示，避免详情区空白 */
+            html += rawOutputsDetails(adjudRawItems({ raw_outputs: [r.raw_output] }));
           }
           return html;
         }
@@ -1550,11 +1811,24 @@
           }
           if (!mon) return '';
           var miss = mon.estimated_miss_rate == null ? '—' : (mon.estimated_miss_rate * 100).toFixed(1) + '%';
-          return '<div class="mb-3 rounded-md border border-[var(--vuln-line)] bg-[var(--vuln-surface)]/40 px-3 py-2 text-xs text-[var(--vuln-ink-2)]">' +
+          // 小样本防误导（2026-08-29）：n<5 时百分比无统计意义（1 次复核判真即
+          // 显示"100%"，读起来像系统灾难），改为明确标注样本量与参考性质
+          var n = mon.recheck_sampled || 0;
+          var missCell;
+          if (!n) {
+            missCell = '<strong class="text-[var(--vuln-ink)]">—</strong>（暂无复核样本）';
+          } else if (n < 5) {
+            missCell = '<strong class="text-[var(--vuln-ink)]">' + miss + '</strong>' +
+              '<span style="color:var(--vuln-state-warning)">（仅 ' + n + ' 次复核，样本不足仅供参考）</span>';
+          } else {
+            missCell = '<strong class="text-[var(--vuln-ink)]">' + miss + '</strong>（n=' + n + '）';
+          }
+          return '<div class="mb-3 rounded-md border border-[var(--vuln-line)] bg-[var(--vuln-surface)]/40 px-3 py-2 text-xs text-[var(--vuln-ink-2)]" title="无候选：工具完全没报警、由模型全文复核兜底的文件数；漏报率估算：对无候选文件抽样复核后发现真漏洞的比例——反映工具层漏报程度，样本少时仅作参考">' +
             '<span class="font-medium text-[var(--vuln-ink)]">工具召回监控</span>（全局 · 自服务启动累计）：' +
-            '无候选 <strong class="text-[var(--vuln-ink)]">' + (mon.no_candidate_total || 0) + '</strong>' +
-            ' · 抽样复核 <strong class="text-[var(--vuln-ink)]">' + (mon.recheck_sampled || 0) + '</strong>' +
-            ' · 估漏报率 <strong class="text-[var(--vuln-ink)]">' + miss + '</strong></div>';
+            '无候选（工具没报警，模型兜底复查）<strong class="text-[var(--vuln-ink)]">' + (mon.no_candidate_total || 0) + '</strong>' +
+            ' · 抽样复核 <strong class="text-[var(--vuln-ink)]">' + n + '</strong>' +
+            ' · 复核发现真漏洞（工具漏报）<strong class="text-[var(--vuln-ink)]">' + (mon.recheck_vuln_found || 0) + '</strong>' +
+            ' · 工具漏报率估算 ' + missCell + '</div>';
         }
 
         /* 将结果列表按扫描轮次分组；arr 需已按「新→旧」排序，分组结果保持该顺序 */
@@ -1602,6 +1876,109 @@
           return html;
         }
 
+        /* 两阶段结果判定（2026-08-29 加固）：此前仅依赖前端注入的 _kind，
+           一旦 _kind 在持久化/恢复环节丢失，合法的"需人工复核"决策会被
+           Error 卡误标为"分析失败"（hard_crossfile_02_input 实拍）。
+           后端 to_dict 必带 stage1 字段，用它做结构兜底。 */
+        function isTwoStageResult(r) {
+          if (!r) return false;
+          return r._kind === 'two-stage' || !!r.stage1;
+        }
+
+        /* Stage 1 decision → 中文复核原因（复核卡的语义说明） */
+        var RECHECK_REASON = {
+          recheck_low_conf_review: '模型全文复核多数判漏洞但未全票一致（工具层未召回），按门槛转人工复核',
+          recheck_hit_review: '模型全文复核发现疑似漏洞（工具层未召回），按门槛转人工复核',
+          recheck_unknown_review: '模型全文复核结果未知（调用异常或平票），转人工复核',
+          recheck_unverified_type_review: '模型全文复核判真，但漏洞类型与代码形态不匹配（防幻觉门槛），转人工复核',
+          recheck_incomplete_flow_review: '数据流不完整：本文件无自身输入入口，危险操作由函数参数驱动（helper/库函数，污点来源在调用方）——单文件扫描无法判定安全，需结合调用方人工复核',
+          dismissed_incomplete_flow_review: '数据流不完整：工具已召回但模型判为误报，而本文件的危险操作依赖其他文件（helper 型参数驱动，或 sink 位于被调用的自定义模块中）——单文件扫描无法判定安全，需结合调用方或项目级上下文人工复核',
+          no_candidate_safe: '工具层无候选，模型全文复核确认安全'
+        };
+
+        function reviewReasonText(r) {
+          var dec = (r.stage1 && r.stage1.decision) || '';
+          if (RECHECK_REASON[dec]) return RECHECK_REASON[dec];
+          return r.error || '模型对候选的投票未达一致结论（平票或多数票不足），转人工复核';
+        }
+
+        /* 安全结果的诊断面板（2026-08-29）：判安全是最需要排查的结果
+           （工具是否漏报？模型为何判假？复核投票如何？），但此前安全卡只有
+           一句话结论，全链路信息不可见。数据本就在后端返回里（stage1 /
+           findings / adjudications.raw_outputs），此处折叠展示，不占版面。 */
+        function safeDiagHTML(r) {
+          var st = r.stage1 || {};
+          var byTool = st.by_tool || {};
+          var tools = Object.keys(byTool).filter(function (k) { return byTool[k]; })
+            .map(function (k) { return (TOOL_LABELS[k] || k) + ' ×' + byTool[k]; });
+          var rows = [];
+          rows.push('工具召回：' + (tools.length ? tools.join(' · ') : '各工具均 0 命中（漏报）'));
+          if (st.decision) rows.push('Stage 1 判定：' + st.decision);
+          if (st.recheck) {
+            var rc = st.recheck;
+            rows.push('复核投票：判真 ' + (rc.votes_true || 0) + ' · 判假 ' + (rc.votes_false || 0) +
+                      ' · 无效 ' + (rc.votes_invalid || 0) + '（共 ' + (rc.n || 0) + ' 次）');
+          }
+          var adjs = r.adjudications || [];
+          if (adjs.length) {
+            rows.push('候选裁决：' + adjs.map(function (a) {
+              return (a.votes_true || 0) + '/' + (a.votes_false || 0);
+            }).join(' · ') + '（真/假）');
+          }
+          var fnd = r.findings || [];
+          if (fnd.length) {
+            rows.push('召回明细：' + fnd.map(function (f) {
+              return (f.rule_id || '?').split('.').pop() + '@L' + (f.sink_line || 0);
+            }).join(' · '));
+          }
+          var body = '<div class="space-y-1">' + rows.map(function (t) {
+            return '<div class="text-xs text-[var(--vuln-ink-2)]">' + escapeHtml(t) + '</div>';
+          }).join('') + '</div>';
+          var outs = [];
+          adjs.forEach(function (a) { outs = outs.concat(adjudRawItems(a)); });
+          if (!outs.length && r.raw_output) outs = adjudRawItems({ raw_outputs: [r.raw_output] });
+          body += rawOutputsDetails(outs, '模型输出（' + outs.length + ' 条，点击展开）');
+          return '<details class="mt-2 rounded-md border border-[var(--vuln-line)] bg-[var(--vuln-surface-2)]/30 px-2.5 py-1.5">' +
+            '<summary class="text-xs text-[var(--vuln-ink-3)] hover:text-[var(--vuln-ink-2)] select-none">' +
+            '诊断信息（工具召回 · 复核投票 · 模型输出）</summary>' +
+            '<div class="mt-1.5">' + body + '</div></details>';
+        }
+
+        /* 诊断信息纯文本版（Markdown 报告用，与 safeDiagHTML 同口径） */
+        function safeDiagLines(r) {
+          var st = r.stage1 || {};
+          var byTool = st.by_tool || {};
+          var tools = Object.keys(byTool).filter(function (k) { return byTool[k]; })
+            .map(function (k) { return (TOOL_LABELS[k] || k) + ' ×' + byTool[k]; });
+          var out = ['#### 诊断信息', '',
+            '- **工具召回**：' + (tools.length ? tools.join(' · ') : '各工具均 0 命中（漏报）')];
+          if (st.decision) out.push('- **Stage 1 判定**：' + st.decision);
+          if (st.recheck) {
+            var rc = st.recheck;
+            out.push('- **复核投票**：判真 ' + (rc.votes_true || 0) + ' · 判假 ' + (rc.votes_false || 0) +
+                     ' · 无效 ' + (rc.votes_invalid || 0) + '（共 ' + (rc.n || 0) + ' 次）');
+          }
+          var adjs = r.adjudications || [];
+          if (adjs.length) {
+            out.push('- **候选裁决**（真/假）：' + adjs.map(function (a) {
+              return (a.votes_true || 0) + '/' + (a.votes_false || 0);
+            }).join(' · '));
+            var fnd = r.findings || [];
+            if (fnd.length) {
+              out.push('- **召回明细**：' + fnd.map(function (f) {
+                return '`' + (f.rule_id || '?') + '`@L' + (f.sink_line || 0);
+              }).join(' · '));
+            }
+            adjs.forEach(function (a, i) {
+              var raws = (a.raw_outputs || []).filter(function (x) { return x && String(x).trim(); });
+              if (!raws.length) return;
+              out.push('', '**模型输出（候选 ' + (i + 1) + '）**', '```json',
+                       String(raws[0]).trim(), '```');
+            });
+          }
+          return out;
+        }
+
         function cardHTML(r, index) {
           var sev = resultSeverity(r);
           var roundBadge = (currentRound && r._roundId === currentRound.id)
@@ -1610,30 +1987,33 @@
           // 删除按钮：默认低调，hover 时变红
           var delBtn = '<button type="button" class="del-result inline-flex items-center justify-center w-7 h-7 rounded-md text-[var(--vuln-ink-3)] hover:text-[var(--vuln-state-error)] hover:bg-[var(--vuln-state-error)]/10 focus:outline-none focus:ring-2 focus:ring-[var(--vuln-state-error)] transition-colors flex-shrink-0" data-id="' + escapeAttr(r._id || '') + '" title="删除该结果" aria-label="删除该结果"><svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg></button>';
 
-          // 两阶段需复核卡：has_vulnerability=null 且为 two-stage（平票/低置信/解析失败）→ 需人工复核语义，非分析失败
-          if (r._kind === 'two-stage' && r.has_vulnerability == null) {
+          // 两阶段需复核卡：has_vulnerability=null 且为两阶段结果 → 需人工复核语义，非分析失败
+          if (isTwoStageResult(r) && r.has_vulnerability == null) {
             var reviewSummary = (r.adjudications && r.adjudications.length)
               ? '共 ' + r.adjudications.length + ' 项候选待复核'
-              : ((r.reviewer_findings && r.reviewer_findings.length) ? (r.reviewer_findings.length + ' 条低置信需复核') : '平票/无法判定，需人工复核');
+              : ((r.reviewer_findings && r.reviewer_findings.length) ? (r.reviewer_findings.length + ' 条低置信需复核') : '');
+            var reasonText = reviewReasonText(r);
             return '<article class="result-card glass-card" data-severity="review" style="border-left:3px solid var(--vuln-state-warning)">' +
               '<div class="flex items-start justify-between gap-4 mb-2"><div class="flex items-center gap-3"><span class="icon-box-sm warning inline-flex items-center justify-center rounded"><svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"></path><path d="M7 12l4-4 4 4 5-5"></path></svg></span>' +
               '<span class="text-xs font-semibold text-[var(--vuln-state-warning)]">需复核</span>' +
               '<span class="text-xs px-1.5 py-0.5 rounded bg-[var(--vuln-surface-2)] text-[var(--vuln-ink-2)]">两阶段</span>' + roundBadge + '</div>' + delBtn + '</div>' +
               '<h3 class="text-base font-semibold text-[var(--vuln-ink)] mb-1">' + escapeHtml(r.filename || '代码') + '</h3>' +
-              '<p class="text-sm text-[var(--vuln-ink-2)] mb-1">' + escapeHtml(reviewSummary) + '</p>' +
-              (r.error ? '<p class="text-xs text-[var(--vuln-ink-3)] mb-1 font-mono">' + escapeHtml(r.error) + '</p>' : '') +
+              '<p class="text-sm text-[var(--vuln-ink-2)] mb-1">' + escapeHtml(reasonText) + '</p>' +
               (r.explanation ? '<p class="text-sm text-[var(--vuln-ink-2)] mb-2">' + escapeHtml(r.explanation) + '</p>' : '') +
               '<div class="code-block" role="region" aria-label="详情">' + twoStageDetailHTML(r) + '</div>' +
               '</article>';
           }
 
-          // Error card（真正的分析失败：error 结果或非两阶段的 null）
-          if (r._kind === 'error' || r.has_vulnerability == null) {
+          // Error card（真正的分析失败：非两阶段结果的 null / 明确的 error 结果）
+          if (r._kind === 'error' || (!isTwoStageResult(r) && r.has_vulnerability == null)) {
             return '<article class="result-card glass-card" data-severity="info" style="border-left:3px solid var(--vuln-state-error)">' +
               '<div class="flex items-start justify-between gap-4 mb-2"><div class="flex items-center gap-3"><span class="icon-box-sm error inline-flex items-center justify-center rounded"><svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg></span>' +
               '<span class="text-xs font-semibold text-[var(--vuln-state-error)]">分析失败</span>' + roundBadge + '</div>' + delBtn + '</div>' +
               '<p class="text-sm text-[var(--vuln-ink-2)]">' + escapeHtml(r.error || '未知错误') + '</p>' +
               (r.filename ? '<p class="text-xs text-[var(--vuln-ink-3)] mt-1 font-mono">' + escapeHtml(r.filename) + '</p>' : '') +
+              /* 诊断信息（2026-08-29）：真异常时展示后端返回的链路残留，
+                 便于区分"推理崩溃"与"保守转复核"两类不同性质的失败 */
+              (isTwoStageResult(r) ? (twoStageDetailHTML(r) || safeDiagHTML(r)) : '') +
               '</article>';
           }
 
@@ -1644,6 +2024,7 @@
               '<span class="text-xs font-semibold text-[var(--vuln-state-success)]">安全</span>' + roundBadge + '</div>' + delBtn + '</div>' +
               '<h3 class="text-base font-semibold text-[var(--vuln-ink)] mb-1">' + escapeHtml(r.filename || '代码') + '</h3>' +
               '<p class="text-sm text-[var(--vuln-ink-2)]">' + escapeHtml(r.explanation || '未发现漏洞') + '</p>' +
+              (isTwoStageResult(r) ? safeDiagHTML(r) : '') +
               '</article>';
           }
 
@@ -1675,6 +2056,7 @@
           if (rawType && rawType.toLowerCase() !== 'none' && /CWE-?\d+/i.test(vulnType) && rawType !== vulnType) {
             cweCorrectHTML = '<div class="text-xs mb-2 flex flex-wrap items-center gap-1.5">' +
               '<span class="px-1.5 py-0.5 rounded bg-[var(--vuln-brand)]/10 text-[var(--vuln-brand)] font-medium">CWE Normalizer 纠正</span>' +
+              '<span class="text-[var(--vuln-ink-3)]">模型说对了漏洞类型，编号由查表工具按规范库纠正：</span>' +
               '<span class="text-[var(--vuln-ink-3)]">模型输出</span>' +
               '<span class="px-1.5 py-0.5 rounded bg-[var(--vuln-surface-2)] text-[var(--vuln-ink-2)] font-mono line-through">' + escapeHtml(rawType) + '</span>' +
               '<span class="text-[var(--vuln-ink-3)]">→</span>' +
@@ -1704,9 +2086,10 @@
               '</div>';
           }
 
-          // Source → Sink
+          // Source → Sink（2026-08-29：两阶段卡不渲染——顶层 chips 与裁决卡内链路重复，
+          // 且不带行号的截断片段可读性差；两阶段链路统一在「模型确认的漏洞」卡内展示）
           var flowInfo = '';
-          if (r.source && r.source !== 'N/A' && r.sink && r.sink !== 'N/A') {
+          if (r._kind !== 'two-stage' && r.source && r.source !== 'N/A' && r.sink && r.sink !== 'N/A') {
             flowInfo = '<div class="text-xs text-[var(--vuln-ink-2)] mb-2 flex items-center gap-1.5"><span class="px-1.5 py-0.5 rounded bg-[var(--vuln-state-error)]/10 text-[var(--vuln-state-error)] font-mono">' + escapeHtml(r.source) + '</span><span class="text-[var(--vuln-ink-3)]">→</span><span class="px-1.5 py-0.5 rounded bg-[var(--vuln-state-warning)]/10 text-[var(--vuln-state-warning)] font-mono">' + escapeHtml(r.sink) + '</span></div>';
           }
 
@@ -1723,13 +2106,16 @@
           if (r._kind === 'two-stage') {
             detailContent += twoStageDetailHTML(r);
           }
-          if (r.fix_suggestion && r.fix_suggestion !== 'no fix needed') {
+          /* 2026-08-29 去重（typical_04/28 实拍）：两阶段卡的分析说明/修复建议/原始输出
+             已按「顶部摘要 + 确认卡全文 + 折叠原始输出」各渲染一次，以下三个通用块
+             会对同一内容二次渲染，对两阶段一律跳过（旧缓存兜底在 twoStageDetailHTML 内） */
+          if (r.fix_suggestion && r.fix_suggestion !== 'no fix needed' && r._kind !== 'two-stage') {
             detailContent += '<p class="text-xs font-medium text-[var(--vuln-ink)] mb-1">修复建议</p><div class="text-xs text-[var(--vuln-ink-2)] mb-3 whitespace-pre-wrap">' + escapeHtml(r.fix_suggestion) + '</div>';
           }
-          if (r.raw_output) {
+          if (r.raw_output && r._kind !== 'two-stage') {
             detailContent += '<p class="text-xs font-medium text-[var(--vuln-ink)] mb-1">LLM 原始输出</p><div class="text-xs text-[var(--vuln-ink-3)] whitespace-pre-wrap">' + escapeHtml(r.raw_output) + '</div>';
           }
-          if (r.explanation) {
+          if (r.explanation && r._kind !== 'two-stage') {
             detailContent = '<p class="text-xs font-medium text-[var(--vuln-ink)] mb-1">分析说明</p><div class="text-xs text-[var(--vuln-ink-2)] mb-3 whitespace-pre-wrap">' + escapeHtml(r.explanation) + '</div>' + detailContent;
           }
 
@@ -1882,31 +2268,27 @@
             '**耗时**：' + (r.total_duration ? r.total_duration + 's' : '—'), ''];
           var adjs = r.adjudications || [];
           if (adjs.length) {
-            lines.push('## LLM 裁决（自一致率置信度）', '');
-            lines.push('| 类型 | 裁决 | 置信度 | 真/假/无效 | 修复建议 |', '|---|---|---|---|---|');
+            lines.push('## 裁决明细（第 1 阶段工具召回 → 第 2 阶段模型裁决）', '');
+            lines.push('| 来源 | 类型 | 模型裁决 | 一致性 | 采样(判真/判假/无效) | 修复建议 |', '|---|---|---|---|---|---|');
             adjs.forEach(function (a) {
               var f = a.finding || {};
               var type = twoStageTypeLabel(f);
               var pct = Math.round((a.confidence || 0) * 100);
-              var label = a.confirmed ? '确认漏洞' : '排除安全';
-              var sugg = (a.fix_suggestion && a.fix_suggestion !== 'no fix needed') ? a.fix_suggestion.replace(/\|/g, '/') : '—';
-              lines.push('| ' + type + ' | ' + label + ' | ' + pct + '% | ' + (a.votes_true || 0) + '/' + (a.votes_false || 0) + '/' + (a.votes_invalid || 0) + ' | ' + sugg + ' |');
+              var src = candidateSourceText(f, r.stage1 && r.stage1.decision) || (f.tool || '—');
+              var sugg = (a.confirmed && a.fix_suggestion && a.fix_suggestion !== 'no fix needed') ? a.fix_suggestion.replace(/\|/g, '/') : '—';
+              lines.push('| ' + src + ' | ' + type + ' | ' + adjudSentence(a) + ' | ' + pct + '% | ' + (a.votes_true || 0) + '/' + (a.votes_false || 0) + '/' + (a.votes_invalid || 0) + ' | ' + sugg + ' |');
             });
             lines.push('');
           }
           var reviewer = r.reviewer_findings || [];
           if (reviewer.length) {
-            lines.push('## 需人工复习核链', '', '| 类型 | 真/假 | 置信度 |', '|---|---|---|');
-            reviewer.forEach(function (rv) {
-              var f = rv.finding || {};
-              var type = twoStageTypeLabel(f);
-              lines.push('| ' + type + ' | ' + (rv.votes_true || 0) + '/' + (rv.votes_false || 0) + ' | ' + Math.round((rv.confidence || 0) * 100) + '% |');
-            });
+            /* 与卡片同口径：低置信候选详情已在裁决列表，此处仅汇总 */
+            lines.push('## 需人工复核', '', reviewer.length + ' 条候选票数不一致（真/假分歧），明细见上方裁决表。');
             lines.push('');
           }
           // LLM 原始输出
           if (adjs.length) {
-            lines.push('## LLM 原始输出', '');
+            lines.push('## 模型原始输出（逐候选，含被否决候选的判假理由）', '');
             adjs.forEach(function (a, i) {
               var f = a.finding || {};
               lines.push('### ' + (i + 1) + '. ' + twoStageTypeLabel(f) + (a.confirmed ? '（确认）' : '（排除）'));
@@ -1916,7 +2298,7 @@
               lines.push('');
             });
           }
-          lines.push('## 说明', '', (r.explanation || '由两阶段架构（工具召回 + LLM 自一致率裁决）生成。'));
+          lines.push('## 说明', '', (r.explanation || '由两阶段架构生成：第 1 阶段工具召回可疑点，第 2 阶段模型对每条候选独立采样投票（多数票定结论）；候选全部被否决时，模型会再通读全文做兜底复核。'));
           return lines.join('\n');
         }
 
@@ -2038,9 +2420,10 @@
           if (total === 0) return;
           var findings = list.filter(function (r) { return r && r.has_vulnerability === true; });
           var vulnerable = findings.length;
-          /* 两阶段 null（平票/低置信/解析失败）是正常语义，归入「需复核」，不计为失败 */
-          var reviews = list.filter(function (r) { return r && r._kind === 'two-stage' && r.has_vulnerability == null; }).length;
-          var errors = list.filter(function (r) { return !r || r._kind === 'error' || (r.has_vulnerability == null && r._kind !== 'two-stage'); }).length;
+          /* 两阶段 null（平票/低置信/解析失败）是正常语义，归入「需复核」，不计为失败；
+             判定用 isTwoStageResult（含 stage1 结构兜底），避免 _kind 丢失被误计为失败 */
+          var reviews = list.filter(function (r) { return r && isTwoStageResult(r) && r.has_vulnerability == null; }).length;
+          var errors = list.filter(function (r) { return !r || r._kind === 'error' || (r.has_vulnerability == null && !isTwoStageResult(r)); }).length;
           var safe = total - vulnerable - reviews - errors;
           var counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
           list.forEach(function (r) {
@@ -2096,6 +2479,23 @@
             console.warn('无法持久化扫描结果', e);
           }
         }
+        /* 前端版本自检（2026-08-29）：静态资源虽已 no-cache，但**已缓存且未过期**
+           的旧副本仍需手动硬刷新才失效，症状是"后端改了、界面没变"这类疑难问题。
+           启动后比对后端 /api/health 的 ui_build 与本次加载时服务端下发的
+           X-UI-Build；不一致即说明浏览器用的是旧前端，提示硬刷新。 */
+        function checkUIBuild() {
+          try {
+            fetch('/api/health').then(function (r) { return r.json(); })
+              .then(function (d) {
+                if (!d || !d.ui_build) return;
+                var cur = document.documentElement.getAttribute('data-ui-build') || '';
+                if (cur && cur === d.ui_build) return;      // 已是最新
+                if (!cur) return;                            // 首次加载，无从比对
+                showToast('前端有新版本，请按 Ctrl+F5（Mac Cmd+Shift+R）硬刷新后生效', 'warning', 8000);
+              }).catch(function () {});
+          } catch (e) {}
+        }
+
         function loadScanResults() {
           try {
             var raw = localStorage.getItem(SCAN_RESULTS_KEY);
@@ -2112,7 +2512,14 @@
                 // 旧数据 has_vulnerability 可能是 undefined（字段缺失），规范化为 null
                 if (arr[i] && arr[i].has_vulnerability !== true && arr[i].has_vulnerability !== false) {
                   arr[i].has_vulnerability = null;
-                  if (!arr[i]._kind) arr[i]._kind = 'error';
+                  if (!arr[i]._kind) arr[i]._kind = arr[i].stage1 ? 'two-stage' : 'error';
+                  needPersist = true;
+                }
+                // Migration (2026-08-29): _kind was previously forced to 'error'
+                // when missing, so two-stage "needs review" results were stored
+                // as failures. Restore them by stage1 structure -- no rescan needed.
+                if (arr[i] && arr[i]._kind === 'error' && arr[i].stage1) {
+                  arr[i]._kind = 'two-stage';
                   needPersist = true;
                 }
               }
@@ -2167,8 +2574,11 @@
               if (r.fix_suggestion && r.fix_suggestion !== 'no fix needed') lines.push('', '**修复建议**：', r.fix_suggestion);
             } else if (r.has_vulnerability === false) {
               lines.push('未发现漏洞。' + (r.explanation || ''));
-            } else if (r._kind === 'two-stage') {
-              lines.push('需人工复核（两阶段：平票/低置信/解析失败）。');
+              /* 诊断信息（2026-08-29）：安全结论同样需要可追溯——工具召回、
+                 复核投票、模型判断依据写入报告，便于离线排查与论文取证 */
+              if (isTwoStageResult(r)) { lines.push(''); lines = lines.concat(safeDiagLines(r)); }
+            } else if (isTwoStageResult(r)) {
+              lines.push('需人工复核（两阶段：' + reviewReasonText(r) + '）。');
               if (r.explanation) lines.push(r.explanation);
             } else {
               lines.push('分析失败：' + (r.error || '未知错误'));
@@ -2181,7 +2591,7 @@
           var total = list.length;
           if (total === 0) return;
           var findings = list.filter(function (r) { return r && r.has_vulnerability === true; });
-          var reviews = list.filter(function (r) { return r && r._kind === 'two-stage' && r.has_vulnerability == null; }).length;
+          var reviews = list.filter(function (r) { return r && isTwoStageResult(r) && r.has_vulnerability == null; }).length;
           var errors = list.filter(function (r) { return !r || r._kind === 'error' || (r.has_vulnerability == null && r._kind !== 'two-stage'); }).length;
           var report = {
             id: 'r_' + Date.now(),
@@ -2399,6 +2809,14 @@
         /* ==================== Init ==================== */
         renderResults();
         loadScanResults();
+        checkUIBuild();
+        /* 记录本次加载的前端版本（同源请求读取 X-UI-Build 响应头） */
+        try {
+          fetch('/samples/demo/manifest.json', { method: 'GET' }).then(function (r) {
+            var b = r.headers.get('X-UI-Build');
+            if (b) document.documentElement.setAttribute('data-ui-build', b);
+          }).catch(function () {});
+        } catch (e) {}
         restoreLastRound();
         renderResults();      // 恢复最近一轮标记后重新渲染（给卡片加「最近一轮」徽标）
         updateRoundUI();

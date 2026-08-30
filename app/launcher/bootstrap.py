@@ -574,8 +574,17 @@ def check_inprocess_backend_ready(backend: str) -> bool:
 
 
 def is_port_in_use(port: int) -> bool:
-    """检测本机指定端口是否已被占用（仅判断 127.0.0.1）。"""
+    """检测本机指定端口是否已被占用（仅判断 127.0.0.1）。
+
+    2026-08-29 修复：bind 前设置 SO_REUSEADDR——uvicorn 服务端启动时即带此选项，
+    检测 socket 不带时，旧进程退出后残留的 TIME_WAIT 连接会让 bind 失败
+    （EADDRINUSE）→ 误报"端口被占用"；而 TIME_WAIT 由内核持有、无属主进程，
+    lsof/fuser 查不到 PID → kill_process_on_port 无对象可杀 → 报"无法自动释放"。
+    "^C 后立刻重启必失败、等一分钟自愈"即此 race。检测口径必须与真实服务
+    （uvicorn，带 SO_REUSEADDR）的绑定行为一致：只有真 LISTEN 才算占用。
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.settimeout(2)
         try:
             s.bind(("127.0.0.1", port))

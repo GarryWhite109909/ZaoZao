@@ -307,6 +307,12 @@ class Scanner:
                 result.sink = normalize_line_numbers(result.sink, code)
             if result and result.fix_suggestion and result.fix_suggestion not in ("N/A", "no fix needed"):
                 result.fix_suggestion = normalize_line_numbers(result.fix_suggestion, code)
+            # explanation 同样纠正（2026-08-29）：模型在说明正文里也用 "line N"
+            # 锚定叙述且行号易错，与 source/sink/fix 同口径纠正，消除"证据链
+            # 行号对、说明行号错"的同屏矛盾。仅依赖同文本内部锚 delta 传播
+            # （跨字段 hint 已撤销）；无锚文本原样返回，无副作用。
+            if result and result.explanation:
+                result.explanation = normalize_line_numbers(result.explanation, code)
             return result
 
     def _scan_code_impl(

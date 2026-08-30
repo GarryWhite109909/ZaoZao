@@ -885,6 +885,24 @@ _TRUST_NOTES = {
     "taint": "（此告警带有 source→sink 污点链证据，可信度较高）",
 }
 
+# 按证据类型（而非工具来源）分级的信任标注（2026-08-29，工具层优化指导 §四）：
+# fixed5 实证有 3 段"工具到点、模型全否决、复核翻案"（typical_04 / hard_bypass_04
+# 等）——TaintTracker 的污点链（source→sink→传播链，AST 级数据流分析产物）与
+# bandit/semgrep 普通规则的位置型告警（无数据流证据）在证据强度上是两回事，
+# 却此前共用同一套 category 标注：污点链的结构化证据优势未被 prompt 显式利用。
+# 分级键 = finding 是否携带真实的 source→sink 链（has_chain），而非 category 标签：
+#   - taint_tracker / semgrep taint 带链 → 高信任链标注（含"推翻须指认断点"义务）；
+#   - semgrep OSS taint 结果无 metavars（类别是 taint 但链为空）→ 按位置型对待；
+#   - bandit/semgrep 普通规则/prefilter（无链）→ 低/中信任位置型标注。
+_TRUST_NOTE_CHAIN = (
+    "✓ 此告警带有工具静态污点分析产出的 source→sink 数据流链（含行号与传播路径，"
+    "AST/数据流引擎得出，方向可靠性显著高于普通规则匹配）。请认真对待该链路："
+    "若你的独立分析认同链路成立，应当采信；若要推翻，必须指认链路断点的具体行号"
+    "与断因（该行变量被改写为常量/该处存在覆盖全部流量的有效防御）——"
+    "仅凭直觉或泛泛的「代码有过滤」不构成有效推翻。"
+)
+_TRUST_NOTE_POSITIONAL = _TRUST_NOTES["sast"]
+
 
 def build_triage_prompt(
     finding,
@@ -928,7 +946,16 @@ def build_triage_prompt(
     category = getattr(finding, "category", "")
     path_chain = getattr(finding, "path", None) or []
     evidence = getattr(finding, "evidence", "")
-    trust_note = _TRUST_NOTES.get(category, "")
+    # 信任标注按证据类型分级（2026-08-29 §四）：带 source→sink 链 → 链级高信任；
+    # category 是 taint 但链为空（semgrep OSS 无 metavars）→ 降为位置型；
+    # 其余（sast/iac/prefilter）按 category 取位置型/正则标注。
+    has_chain = bool((source or "").strip() and (sink or "").strip())
+    if has_chain:
+        trust_note = _TRUST_NOTE_CHAIN
+    elif category == "taint":
+        trust_note = _TRUST_NOTE_POSITIONAL
+    else:
+        trust_note = _TRUST_NOTES.get(category, "")
 
     # 传播链：source -> ... -> sink
     if path_chain:

@@ -53,11 +53,38 @@ _CWE_BY_KEYWORD: list[tuple[tuple[str, ...], str]] = [
     (("session fixation", "会话固定"), "CWE-384 Session Fixation"),
     (("hardcoded credential", "hard-coded credential", "hardcoded secret", "hard-coded secret", "hardcoded token", "hard-coded token", "硬编码凭据", "硬编码凭证"), "CWE-798 Use of Hard-Coded Credentials"),
     (("jwt", "json web token"), "CWE-347 Improper Verification of Cryptographic Signature"),
+    # 2026-08-29 补（工具层优化指导 P2 规则族落地的配套类型）：prefilter 新规则
+    # 产出的 taint_type 与模型对同类漏洞的表述统一到规范编号。
+    (("open redirect", "开放重定向", "url 重定向"), "CWE-601 Open Redirect"),
+    (("prototype pollution", "原型污染", "原型链污染"), "CWE-1321 Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')"),
+    # 注意：此处只收"短语级"关键词，不收 md5/sha1/ecb 这类裸技术词——
+    # 工具 rule_id（如 insecure-hash-algo-md5）会经 normalize 做"回声票"判定
+    # （_aggregate 的 is_echo），裸词命中会把模型的独立判断误判成复读工具，
+    # 破坏平票裁定（typical_17 实锤行为，two_stage_scanner 自检 #13 固化）。
+    (("weak cryptography", "weak crypto", "weak hash", "weak cipher", "弱加密", "弱哈希", "弱密码学"), "CWE-327 Use of a Broken or Risky Cryptographic Algorithm"),
+    (("weak random", "insecure random", "弱随机", "可预测随机数"), "CWE-338 Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)"),
+    (("hardcoded iv", "hard-coded iv", "hardcoded initialization vector", "硬编码初始向量"), "CWE-329 Generation of Predictable IV with CBC Mode"),
+    (("integer overflow", "整数溢出"), "CWE-190 Integer Overflow or Wraparound"),
+    (("timing attack", "timing side channel", "时序攻击", "时序侧信道"), "CWE-208 Observable Timing Discrepancy"),
 ]
 
 # 短规则 ID 类关键词：裸子串会误命中 "logical"、"cmdi_xxx" 等上下文，
 # 用 \b 词边界收紧为独立词。
 _BOUNDED_KEYWORDS = frozenset({"cmdi", "codei", "logi"})
+
+# 高特异 evidence 白名单（2026-08-29，typical_32 实锤后新增）：
+# 代码形态铁证词——在 analysis 文本中出现即唯一指向某 CWE，足以覆盖模型
+# "内部自洽但张冠李戴"的编号（如把原型污染标成 CWE-912 Unintentional Proxy）。
+# 纪律（对照记忆匣 §七）：词条必须能在不看测试集的情况下由 CWE 官方定义自证——
+# CWE-1321 官方描述即 "external input to modify object prototype attributes"，
+# __proto__ 是 JS 原型污染的专有形态，无第二解释。禁止为逐个 strict miss
+# 泛滥加词；新词须同样满足"官方定义写明该特征 + 无第二语义指向"。
+# 注意：与普通 _CWE_BY_KEYWORD 不同，此表**可覆盖字段中已有的编号**
+# （铁证优先于模型记忆），因此词条准入门槛必须极高。
+_HIGH_SPEC_EVIDENCE: list[tuple[tuple[str, ...], str]] = [
+    (("prototype pollution", "原型污染", "原型链污染", "__proto__",),
+     "CWE-1321 Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')"),
+]
 
 # 字段中的 CWE 编号模式（normalize_with_evidence 守卫用：字段已有明确编号
 # 时不再用 evidence 做跨类型覆盖）。
@@ -151,9 +178,19 @@ def normalize_with_evidence(vulnerability_type: str, evidence: str = "") -> str:
             if _hit(field, keywords):
                 return label  # 字段明确命中表内语义 → 用字段（不被 evidence 覆盖）
         if _CWE_NUM_RE.search(field):
+            # 字段已含明确编号 → 默认尊重模型判断（2026-08-18 守卫）。
+            # 例外（2026-08-29）：evidence 命中高特异形态铁证（_HIGH_SPEC_EVIDENCE）
+            # 时覆盖——模型可能输出"内部自洽但张冠李戴"的编号（912←原型污染），
+            # 而铁证词与 CWE 官方定义一一对应，可信度高于编号记忆。
+            for keywords, label in _HIGH_SPEC_EVIDENCE:
+                if _hit(evidence, keywords):
+                    return label
             return field  # 字段已含明确编号 → 尊重模型判断，不进 evidence 兜底
     if evidence:
         for keywords, label in _CWE_BY_KEYWORD:
+            if _hit(evidence, keywords):
+                return label
+        for keywords, label in _HIGH_SPEC_EVIDENCE:
             if _hit(evidence, keywords):
                 return label
     return normalize_cwe_label(vulnerability_type)
