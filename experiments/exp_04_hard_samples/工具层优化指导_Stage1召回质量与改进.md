@@ -136,6 +136,10 @@ Semgrep×2 + TaintTracker×1 + Prefilter×1）→ **每条都要跑 N=3 次采�
 
 > 状态更新（2026-08-29 第二波实施后）：P0/P1 全部落地，P2 首批规则族已上线，
 > 复测数据见 §五之三。剩余缺口为框架级/长尾 category（§五之五）。
+> 状态更新（2026-08-30 第三波）：抑制池治理（§五之四）落地；待办 1 三项方案
+> 落地（证据上下文剥离 + 白名单扩容 + 工具层复测）；另完成 87 段候选**逐条
+> 人工审查**，6 族被丢弃的精确告警救援（§五之六）。剩余缺口为框架级/长尾
+> category（§五之五）。
 
 | 优先级 | 项 | 性质 | 状态 |
 |---|---|---|---|
@@ -146,7 +150,9 @@ Semgrep×2 + TaintTracker×1 + Prefilter×1）→ **每条都要跑 N=3 次采�
 | P1 | 候选合并去重（§三） | 成本 + 噪声 | ✅ 已做（`_dedupe` 族级归并，候选≥3 样本 20→10） |
 | P2 | 补零召回 category 的规则（首批：open redirect / log / timing / crypto×3 / proto×2 / overflow） | 覆盖面 | ✅ 首批已做（§五之三）；剩余框架级 category 见 §五之五 |
 | P2 | 污点链证据在裁决 prompt 中的差异化利用（§四） | 裁决层协同 | ✅ 已做（按证据类型分级信任标注） |
-| P1 | 信号抑制池的样本级盲区（§五之四，本轮新发现） | 召回损耗 | ⚠️ 已定位、待治理 |
+| P1 | 信号抑制池的样本级盲区（§五之四，本轮新发现） | 召回损耗 | ✅ 已治理（2026-08-30：自有链级规则不抑制 + 抑制留痕 `suppressed_by_registry`） |
+| P1 | 待办 1：证据上下文污染类型推断（§五之三末） | 类型归因错误 | ✅ 已实施（2026-08-30：上下文剥离 + 白名单扩容 XXE/LDAP/NoSQL/SpEL，工具层复测通过；LLM 裁决层重跑待算力） |
+| P1 | 87 段候选逐条人工审查（§五之六，第三波） | 证据浪费/静默丢弃 | ✅ 已完成（6 族被丢弃精确告警救援：B307/eval 族、B506、B605、B311、spel-injection、B202；安全样本零新增候选） |
 | — | 跨文件数据流（crossfile 全族） | 架构级，需项目级上下文 | 单文件管道外，论文标注局限 |
 
 ## 五之二、规则层实锤缺陷：os.path.join 形态零覆盖（已修，2026-08-29）
@@ -292,15 +298,18 @@ pip-audit、detect-secrets 依赖本地漏洞库/网络，零召回按 SKIP 降�
 | Stage 1 零召回 | 36/87（41%） | **23/87（26%）** |
 | 零召回 × 期望真 | 25 | **12** |
 | 候选数 ≥3 的样本 | 20/87（23%） | **10/87（11%）** |
-| 直出档（secret/sca）确定性 finding 覆盖 | 0 段（secret 档当时对代码文件关闭） | **11 段** |
+| 直出档（secret/sca）确定性 finding 覆盖 | 0 段（secret 档当时对代码文件关闭） | **11 段**³ |
 | 安全样本（26 段）中出现候选 | 15 | 15（新规则仅 timing 误触发 safe_13，已修） |
+
+³ 夜间修复 #3（凭证强度门槛，同日晚于本表复测）收紧后，弱值转裁决档、
+  直出覆盖变为 3 段（真凭证）；第三波复测全表见 §七 与 §五之六。
 
 新捞回 13 段全部 expected=true：typical_06 / 12 / 15 / 16 / 18 / 19 / 29 / 31 / 32、
 hard_bypass_06、hard_cve_02、hard_crossfile_02_input、hard_crossfile_03_sink。
 自检矩阵：prefilter 42 例、two_stage 24 例、cwe_normalizer 全例、
 tool_smoke_test 9 PASS / 1 SKIP，全过。
 
-## 五之四、新发现：信号抑制池的样本级盲区（待治理）
+## 五之四、新发现：信号抑制池的样本级盲区（✅ 已治理，2026-08-30）
 
 复测中实测：生产 `models/signal_registry.json` 已积累 12 条被抑制规则
 （门槛 = ≥2 个独立文件被高置信否定，设计如此），其中包括：
@@ -315,22 +324,55 @@ B608 在 hard_bypass_01（replace 假净化）是否决性证据，在别的文�
 正确告警。规则级抑制 → 样本级盲区，且**静默**（工具层零召回，无任何提示），
 与 B1 的"排除逻辑自我实现预言"同构。
 
-**口径提示**：评估/论文数据必须用 `--no-signal-feedback`（纯静态管线），
-否则工具层数据混入运行期学习状态、不可复现。
+**评估口径（2026-08-30 定稿，按目的选择、报告必须标注）**：
+
+- **归因/消融口径**：`--no-signal-feedback`（纯静态管线）——可复现、样本顺序
+  无关、与 fixed5 基线同口径，用于逐层归因（§七 消融表）与规则改动验证
+  （本工具层优化指导内所有复测数字均此口径）；
+- **系统口径（生产形态，含自适应闭环）**：feedback 开启 + 每轮隔离注册表
+  （eval_two_stage 已内置，跨跑不共享不污染生产）——衡量"系统上线后跑起来
+  的真实效果"。此口径此前的风险是运行期抑制静默吞候选；**抑制池治理
+  （本节）落地后已封堵主要病灶**（自有链级规则不再被压制、抑制命中在
+  stage1 留痕可审计），故该口径可用且更贴近部署形态；
+- 跨轮对比必须同口径；论文中两种口径可并行报告（静态工具层 vs 完整闭环），
+  如实标注即可。
 
 **待治理建议**：① 自有 taint 规则（带完整证据链）不进抑制池，或抑制降级为
 "候选降权"而非"静默跳过"；② 抑制命中时在 stage1 决策中留痕（如
 `suppressed_by_registry` 计数），消除静默性。
 
-## 五之五、剩余零召回缺口（第二波复测后，12 段，均为框架级/长尾）
+**治理实施（2026-08-30，方案 ①+② 均落地）**：
+
+1. **自有链级规则保护（写端 + 读端双口径）**——`signal_registry.py` 新增
+   `_PROTECTED_RULE_PREFIXES = ("taint_tracker:", "graduation_project.semgrep_rules.")`：
+   - 写端：`record()` 否定达到抑制门槛时，受保护规则**不置 suppressed**（否定
+     计数照常累计，供后续"按文件粒度降权"治理取数）；
+   - 读端：`is_suppressed()` 对受保护规则豁免——历史 JSON 残留的
+     `suppressed=True`（保护上线前写入）不再生效，写读必须同口径。
+   - 识别用**结构性前缀**（自有引擎/自有规则目录），非样本拼写拟合。
+2. **抑制留痕（读端）**——`two_stage_scanner.py` 的 `_apply_signal_registry` /
+   `_drop_irrelevant_positional` 记录被跳过/被剔除的 rule_id，`scan_code` 写入
+   stage1 字典：`suppressed_by_registry`（规则级抑制命中）与 `dropped_unowned`
+   （无主告警剔除）。"某样本工具层零召回"由此可归因：是没命中，还是命中后被
+   抑制/剔除——评估与前端的静默性消除（B1 同构问题闭环）。
+3. **自检用例**——signal_registry 自检新增 3b（≥2 独立文件全票否决自有规则仍
+   不抑制、否定计数照常累计）、3c（历史残留 suppressed 读端豁免）；
+   two_stage 自检新增 #21（上下文剥离）、#22（抑制留痕端到端：B888-T 被跳过
+   留痕、`taint_tracker:*` 链级候选保留）。
+
+注：生产 `models/signal_registry.json` 当前 signals=0（文档记录的 12 条抑制
+规则已不在），但机制性缺陷仍在——只要进程继续累积否定，盲区会复发，故治理
+照常实施。
+
+## 五之五、剩余零召回缺口（第三波复测后，11 段，均为框架级/长尾）
 
 首批 P2 规则落地后剩余的零召回 × 期望真清单——特征是"漏洞语义在框架层，
-单文件正则无标准形态可写"或"需要项目级上下文"：
+单文件正则无标准形态可写"或"需要项目级上下文"（typical_36 SpEL 已在第三波
+捞回，见 §五之六；hard_cve_03 为设计内 0 候选 + 强制复核兜底，非缺口）：
 
 | 样本 | category | 缺口性质 |
 |---|---|---|
 | hard_cve_05_spring4shell / hard_cve_06_struts2_ognl / hard_cve_08_fastjson_deser | Java 框架 CVE | 框架层漏洞形态（参数绑定/OGNL/反序列化开关），无对应规则 |
-| typical_36_java_spel | SpEL 注入 | 表达式注入 sink（SpelExpressionParser）未建规则 |
 | typical_21_xxe | XXE | XML 解析器特性开关（disallow-doctype-decl），缺失型 |
 | typical_24_ldap / typical_25_nosql / typical_26_xpath | 注入族长尾 | sink 语义各异（LDAP filter/NosQL query/XPath），可分期补 |
 | typical_30_mass_assignment | Mass Assignment | 框架层（强参数/白名单缺失），缺失型 |
@@ -402,22 +444,30 @@ rule=models.semgrep_rules...request-data-write
 
 → **已回滚**（恢复 fixed5 基线行为）。
 
-**建议方案（下次做，三项一起上）**：
-1. 扩展 `_STANDARD_TAINT_TYPES` 覆盖非注入型：SSRF / XXE / LDAP / NoSQL /
-   Open Redirect / Weak Crypto / Hardcoded Credential 等
-2. 同时启用证据上下文剥离（行上下文只说明"在哪里"，不说明"是什么"）
-3. 重跑 87 段全量 + 与 fixed5 做对照表（零召回 41% → ?、复核判真 24 → ?、
-   recall/FPR 是否回退）
+**建议方案（三项一起上）——已实施（2026-08-30 第三波）**：
+1. ✅ 扩展 `_STANDARD_TAINT_TYPES` 覆盖非注入型：SSRF / Open Redirect /
+   Weak Crypto / Hardcoded Credential（第二波已做）+ **XXE / LDAP Injection /
+   NoSQL Injection / SpEL Injection**（第三波补齐，NoSQL/LDAP/XXE 为白名单
+   扩容配套推断分支，SpEL 见 §五之六）
+2. ✅ 证据上下文剥离：`_infer_taint_type` 仅取 `[告警行上下文]` 标记**之前**的
+   告警语义描述（标记常量 `_EVIDENCE_CTX_MARK` 与追加处共用，防字面量漂移）；
+   裁决 prompt 不受影响（P0.3 上下文本就是给 LLM 看"在哪里"的）
+3. ✅ 工具层复测（87 段静态管线，`--no-signal-feedback` 口径）：
+   - hard_cve_03 从"2 条错误候选"变为"0 候选 + 强制复核兜底"（符合设计意图，
+     诱导模型投错票的错误类型标注消失）
+   - 安全/噪声样本候选 17 → 17（零回退）；配套 6 族精确告警救援见 §五之六
+   - **LLM 裁决层重跑（recall/FPR/兜底判真数 24→?）待算力，不在本机跑**
 
-### 待办 2：Java 路径安全规则缺失
+### 待办 2：Java 路径安全规则缺失（✅ 已完成，§五之二配套清账）
 
-Java 侧前缀校验（`getCanonicalPath().startsWith(...)`）未纳入 `path_safe`
-安全规则，Java 加固写法会被判漏洞。按 `_PATH_JOIN_PATTERNS` 同款方式补一行。
+Java 侧前缀校验安全规则已作为 `path_canonical_startswith` 落地
+（`getCanonicalPath().startsWith` / NIO `toRealPath().startsWith`，见
+§五之二"配套"项与本表 TLS 修复之后的泛化纪律记录）。
 
-### 待办 3：候选合并去重（§三）
+### 待办 3：候选合并去重（§三）（✅ 已完成，§五之三）
 
-23% 样本 ≥3 条候选，每条消耗 N=3 次采样。同（族, sink 行）归并 + 多工具标记，
-能显著降成本与噪声。
+同（族, sink 行）归并 + 多工具标记已落地，候选≥3 样本 20 → 10（第三波复测
+进一步降至 8，见 §五之六）。
 
 
 ## 五之四、2026-08-29 夜间批量修复（用户提示质量审计驱动）
@@ -493,6 +543,71 @@ CWE-918 —— **符合我定的主次规则，是正确行为**。冲突源于 
 - **其余弱提示**（semgrep 命令注入候选忽略列表参数/shlex 转义、hard_cve_03 的
   request-data-write 偏靶、B701 对 SSTI 旁敲）：已知精度边界，模型能消解，不修。
 
+## 五之六、第三波：87 段候选逐条人工审查 + 精确告警救援（2026-08-30）
+
+> 方法论前提：**脚本统计只负责"跑工具、把候选摆出来"，合理性判断人工逐条做**
+> （脚本自动判定会掩盖逐条证据的问题，B1 教训的同型——统计指标好看 ≠ 证据健康）。
+> 工具：`experiments/exp_04_hard_samples/stage1_candidates_dump.py`（纯静态管线、
+> `--no-signal-feedback` 口径、不调 LLM），逐样本输出候选的 rule_id/类型/行号/
+> 完整证据文本，对照 manifest 期望类型与样本源码逐条审。
+
+### 审查结论总览
+
+87 段、修复前 102 条候选 + 14 段有剔除留痕，逐条过三问：
+① 候选合不合理（是否指向真实漏洞特征）；② 会不会误导模型（类型归因/证据文本）；
+③ 有无该产出却未产出的候选。
+
+- **设计内行为确认（无需修）**：safe_01/02/03/05/06/07/08/13/17 等安全样本的
+  链级/审计候选全部是"真数据流 + 防御在裁决层识别"（参数化/shlex/白名单/
+  html.escape/int 转换），类型归因正确，不算误导；typical_14/15/16 等 B105
+  弱值按凭证门槛转裁决档（夜间修复 #3 语义）；typical_20 的 SSRF 共现照
+  §8.1 口径（多漏洞共现，非归因错）。
+- **发现 6 族"工具命中、管线丢弃"**（该产出却未产出，全部修复）：
+
+| # | 样本 | 被丢弃告警 | 根因 | 修复 | 落地形态 |
+|---|---|---|---|---|---|
+| 1 | typical_08（CWE-94） | B307 / eval-detected / user-eval ×3 | `_infer_taint_type` **无 Code Injection 分支**，eval 族语义无从归型 | 新增分支：`\beval\b\|\bexec\b` 词边界 + `b307`/`insecure function`；**置于 SQL 之前**（eval 告警消息含 "execute arbitrary code"，会被 SQL 分支的 "execute" 抢走） | B307/eval-detected 与链级候选同行归并、user-eval 独立入裁决档 |
+| 2 | typical_36（CWE-94/917） | semgrep spel-injection（**主漏洞证据**） | 无 SpEL 类型与分支 | 白名单加 "SpEL Injection" + 分支 `spel`（cwe_normalizer 已有 SpEL→CWE-917 映射） | 0 → 1 候选，零召回×真 12 → 11 |
+| 3 | hard_cve_07（CWE-22） | B202 tarfile.extractall | 上下文剥离副作用：此前 B202 靠行上下文的 `extractall(` 撞词过白名单，剥离后失援；其消息 "tarfile.extractall used without..." **不带括号** | Path 分支 `extractall(`→裸 `extractall` + `tarfile` 词 | B202 与 path_traversal_open_join 归并为 `bandit+prefilter` 双工具候选，**且补齐了行号 L19**（open_join 无行号的缺陷顺带消除） |
+| 4 | hard_cve_01（CWE-78） | B605 | 消息 "Starting a process with a shell" 不含 "command"/"subprocess" | 命令注入分支加 `b605` + `process with a shell` | 与链级候选同 sink 行归并，多工具一致证据补齐 |
+| 5 | typical_19（CWE-330） | B311 | 消息 "Standard pseudo-random generators are not cryptographically secure" 不含 "weak" | 弱加密分支加 `b311` + `pseudo-random` | 与 crypto_weak_random 归并（bandit+prefilter） |
+| 6 | typical_11（CWE-502） | B506 | deserial 分支只认 pickle/deserial，不认 yaml | 加 `yaml` 词 | 与链级候选归并（bandit+prefilter+semgrep+taint_tracker 四工具一致） |
+
+### 复测（与第二波同口径）
+
+| 指标 | 第二波 | 第三波（本波后） |
+|---|---|---|
+| Stage 1 零召回 | 23/87（26%） | 23/87（26%，构成更健康：hard_cve_03 由"2 条错误候选"转设计内 0 候选+强制复核，typical_36 捞回） |
+| 零召回 × 期望真 | 12 | **11**（typical_36 捞回） |
+| 候选数 ≥3 的样本 | 10/87 | **8/87**（救援以"归并进链级候选"落地，冗余度反降） |
+| 安全/噪声样本候选 | 17 | 17（**零新增**） |
+| 剔除留痕段 | 12 | **7**（全部为确认无类型语义的部署/风格类告警，见下） |
+
+自检矩阵：prefilter / two_stage（新增 #21 剥离、#22 抑制留痕、#21 附 6 分支+
+2 负样本）/ cwe_normalizer / signal_registry（新增 3b/3c）全过；
+tool_smoke_test 9 PASS / 1 SKIP。
+
+### 剩余剔除项逐条裁决（确认丢弃合理，记录防再议）
+
+- **B108**（hard_cve_03 / hard_longfile_02，硬编码临时目录）：语义是 CWE-377
+  次要标签，两样本主漏洞均有候选/复核兜底；裁决层无对应类型契约，为单样本
+  次要标签扩白名单 = 契约膨胀，**缓期**（若后续标签治理确认 CWE-377 共现
+  标注价值再议）。
+- **B104 / avoid_app_run_with_bad_host**（绑 0.0.0.0/坏 host）、**B113**
+  （requests 无 timeout）、**B110**（try/except pass）、**B413**（pycrypto
+  import）：部署配置/风格提示类，无标准漏洞语义类型，丢弃合理。
+- **request-data-write**（hard_cve_03/07 的写入类告警）：剥离后语义中立
+  （"用户数据写入"，无类型指向），按设计剔除交兜底复核——这正是待办 1 的
+  目标行为（不再伪装成 Path Traversal 污染归因）。
+
+### 零召回缺口现状（第三波后，11 段，均无任何告警产生——非丢弃）
+
+§五之五清单去掉 typical_36（已捞回）后不变：框架 CVE×3、XXE、LDAP、NoSQL、
+XPath、Mass Assignment、Type Juggling、hard_cve_03（设计内 0 候选走强制复核）、
+hard_crossfile_02_sink（架构级）。全部无工具告警可救，处理原则不变（能写
+标准写法的分期补，写不出的论文如实标注）。
+
+
 ## 六、判假守卫：数据流不完整不得静默判安全（已实施，2026-08-29）
 
 ### 问题：判真有全票门、判假零门槛的不对称
@@ -550,18 +665,26 @@ safe_01/02/04/08/17、noise_03 六段仍正常 `no_candidate_recheck_safe`，零
 
 **第二波消融数据已就绪（2026-08-29，工具层离线复测，LLM 层待重跑）**：
 
-| 维度 | 基线（08-18） | 第二波工具层 |
-|---|---|---|
-| Stage 1 零召回率 | 41%（36/87） | **26%（23/87）** |
-| 零召回 × 期望真 | 25 段 | **12 段** |
-| 候选 ≥3 的样本（冗余度） | 23%（20/87） | **11%（10/87）** |
-| 直出档确定性 finding 覆盖 | 4 段 | **11 段** |
+| 维度 | 基线（08-18） | 第二波工具层 | 第三波（08-30，含逐条审查救援） |
+|---|---|---|---|
+| Stage 1 零召回率 | 41%（36/87） | **26%（23/87）** | 26%（23/87，构成更健康¹） |
+| 零召回 × 期望真 | 25 段 | **12 段** | **11 段**（typical_36 捞回） |
+| 候选 ≥3 的样本（冗余度） | 23%（20/87） | **11%（10/87）** | **9%（8/87）** |
+| 直出档确定性 finding 覆盖 | 4 段 | 11 段² | **3 段**² |
+| LLM 兜底判真数（no_candidate_recheck_vuln） | 24 段 | **12 段**（08-30 全量评估实测³） | 待第三波工具层重跑（预计 11：typical_36 转裁决通道） |
 
-工具层消融实验的设计口径：① 基线（08-18 规则+调用方式）；② +接入修复（B1/B2/B3）；
-③ +首批 P2 规则族；④ +候选合并。每层都能独立归因（本轮 13 段新捞回的逐样本
-清单见 §五之三）。注意：**LLM 兜底判真数（24 → ?）要等裁决层重跑才有**——
-工具层捞回的 13 段会从"兜底通道"转移到"有候选裁决通道"，预计兜底承担率
-显著下降，这正是"工具层为 LLM 减负"叙事的数据。
+¹ hard_cve_03 从"2 条错误类型候选"转设计内"0 候选 + 强制复核兜底"（待办 1
+  上下文剥离），typical_36 由 0 → 1。
+² 第二波的 11 段是"夜间修复 #3 之前"的口径（B105 弱值也直出）；#3 收紧门槛后
+  弱值 8 段转裁决档、仅真凭证直出（typical_06 / hard_bypass_06 / typical_18），
+  与该修复自身记录"弱值 8/8 转裁决档、真凭证 3/3 直出"一致。
+³ 远程 08-30 全量评估（transformers / combined_nosource / full_recheck / N=3）：
+  recall 1.0（55 TP + 6 复核转人工，0 FN）、FPR 0.1、acc 0.973；**兜底判真
+  24 → 12，减半**——"工具层为 LLM 减负"叙事的数据。两点口径说明：① 该评估
+  signal_feedback 开启（隔离注册表，系统口径），运行中累积抑制了自有 sqli/xss
+  taint 规则等 4 条（§8.5 核对注 3）——抑制池治理落地后此病灶已封堵，系统口径
+  可继续用，与静态口径（消融归因）并行报告并各自标注；② 工具层为
+  第二波状态（第三波 6 族救援与上下文剥离未包含）。
 
 ## 八、后置待办（2026-08-30，raw_texts 作用域崩溃诊断的遗留项）
 
@@ -589,12 +712,17 @@ top1 可能变为 CWE-918——**届时属"多漏洞共现/标注漏标"，不�
 
 2026-08-29 引入 `raw_texts` 时埋下 UnboundLocalError：凡 `_aggregate` 中
 top confirmed finding 的 rule_id 命中**信号注册表已提交 corrected_type 的规则**
-（当前 14 条：B501、B301、deser_pickle_loads、sqli_percent_format、
+（当时 14 条：B501、B301、deser_pickle_loads、sqli_percent_format、
 `taint_tracker:{Path Traversal, SQL Injection, Command Injection, Code Injection,
 Insecure Deserialization}` + 4 条 semgrep 规则），整个 `_aggregate` 中断 →
 该文件显示"分析失败"。此窗口期内产生的**任何批量扫描/评估结果**（若有），
 命中上述规则的样本需逐个复核是否被记为失败；此后端窗口仅一天，但任何
 08-29 之后导出的结果文件都过一遍 `_kind == "error"` 统计再入库。
+
+（2026-08-30 补记：生产 `models/signal_registry.json` 现已为空 signals=0——
+上述 14 条 corrected 规则与 12 条抑制规则均不在，历史数据疑被重置；§8.2 的
+窗口期复核义务仅对"引用窗口期内导出的旧结果文件"适用。注册表为空同时意味着
+§五之四 的治理修复落地时无存量迁移负担。）
 
 ### 8.3 验证待办（重启后端后执行）
 
@@ -641,6 +769,33 @@ hard_bypass_05            评估组态 B105 0/3 全否决、xss-t 1/2 否决 →
 | P1 可立即修 | `vulnerability_types` 已透出全部 confirmed 类型（多漏洞支持），前端"全部确认漏洞"区已正确显示；但 `vulnerability_type`(top1) 单独出现时前端语义为"该文件漏洞类型"，798 误导主类型 | 过渡方案：无其他 confirmed 候选、且 B105/secret 族为唯一 confirmed 时，前端类型行追加"（含伴生凭证发现）"标注。纯展示，不改判定 |
 | P1 治本 | **授权类 P2 预筛规则**：`@app.route`/Spring `@Mapping` 装饰的 handler，函数体直接返回数据或执行写操作，且函数体+模块级均无 session/token/permission/is_admin 检查特征 → `missing_authz_suspect` 候选交 LLM 裁决 | 六段样本会全部获得 authz 候选进裁决，确认后类型自然正确。**必须过泛化三关 + 87 段回归**（会动 fixed5 候选集合）|
 | 观察 | B105 在"测试代码硬编码密码"上模型本身摇摆（2:1/0:3 都出现）| bandit LOW severity 特征本身成立，不建议工具层压制 B105（typical_06 主漏洞就是 798，一刀切会伤真阳性）|
+
+**本地核对（2026-08-30，第三波静态 dump + 远程全量评估 JSON 交叉验证）**：
+
+1. **票型证据核实一致**：typical_15 / typical_16 / hard_crossfile_03_sink 候选
+   仅 B105 一条（2:1 或 3:0 判真 → top1=798）；typical_22 / hard_bypass_05 /
+   hard_bypass_08 为 B105 + xss-taint 双候选（xss 被 1:2 否决、B105 判真 →
+   798 顶替；bypass_05 双双否决 → review）。typical_14 是反例：xss-taint 3:0
+   胜出，798 未抢占——但 top1 变成 **CWE-306**（模型把"未校验归属的订单查询"
+   判成认证缺失而非标注的 639/79），属裁决层类型漂移/标注口径问题，非工具层。
+2. **§8.8 草案按严格条件 2 在六段上 0 触发**（静态逐条核对，详见 §8.8 核对注）：
+   宽口径"直接返回数据"又会在 safe_02（/comment 返回 HTML）等安全样本上制造
+   候选。**条件 2 的"敏感操作"定义需先重定，本仓暂不实现**，等标签治理定案。
+3. **评估运行期抑制实锤**：远程 08-30 全量评估（feedback 开启、隔离注册表）
+   运行中累积抑制了 `python-sqli-taint` / `python-xss-taint` / B404 /
+   format-string 四条规则——§五之四 盲区在真实评估里发生（recall 仍 1.0 由
+   兜底扛住）。第三波抑制池保护落地后此路径已封堵（自有规则不再被压制、
+   抑制留痕进 stage1 可审计）；feedback-on 系统口径此后可用，但**报告须标注
+   口径**，消融/归因对比仍用 `--no-signal-feedback`（§五之四 评估口径定稿）。
+4. **过渡方案已实施（2026-08-30，纯展示不改判定）**：`scan.html` 漏洞卡类型行
+   新增「伴生凭证发现」徽标——唯一 confirmed 候选属 secret 族时显示
+   （secret 族识别：B105/B106/B107 / hardcoded-* / Hardcoded Credentials /
+   gitleaks 规则名，与后端 `_SECRET_SAST_RULE_RE` 同语义）。同步：
+   `mock_frontend_card.py` 补 R7 渲染核对规则（注意其 `issues["_notes"]` 是
+   整体覆写，R7 必须在赋值后追加）。验证：逻辑三用例（B105 唯一 confirmed
+   显示 / SQL 链级不显示 / 双 secret 直出显示）+ 远程评估 JSON 逐样本模拟
+   （798 抢占五段显示、bypass_05 无 confirmed 不显示、typical_20/01/14 不
+   显示）。治本项（§8.8 规则）仍缓期，见该节核对注。
 
 ### 8.6 跨文件 input 文件兜底 FP（2026-08-30 实锤，标注层决策 + 守卫建议）
 
@@ -699,6 +854,21 @@ review；生产组态（ALPHA05_PROMPT 1982字 + triage_aligned）干净判 True
 
 **独立集验证建议**：在 `testset_cve_fix` 的授权类 CVE（若存在）+ 手工构造 3 段
 安全对照（有 login_required 的同形态 handler）上验证 TP/FP。
+
+**本地核对（2026-08-30，87 段静态 dump 逐条验证，暂缓实现的原因）**：
+
+按触发条件严格版（条件 2 = DB 写/文件写/数据集返回/用户数据修改）逐条核对
+§8.5 六段，**0 触发**——六段的"敏感操作"要么在注释里（typical_22
+"演示：实际执行转账"、hard_bypass_05/08），要么是纯字符串返回
+（typical_15），要么被红线排除（typical_16 的 /login），要么是无查询调用的
+helper 透传（hard_crossfile_03_sink）。宽口径（8.5 表格的"直接返回数据"）
+虽能让六段获得候选，但静态核对面板上 safe_02 /comment（返回转义 HTML）、
+safe_17 /withdraw_safe（返回 f-string）等安全样本同样满足"handler + 返回数据
++ 无访问控制特征字样"——safe_17 有 `with lock` 但不在访问控制词表内。
+**结论：条件 2 的敏感操作定义是本规则成立与否的关键，需先定案再实现**；
+候选方案（供标签治理/用户决策）：宽口径 + 扩访问控制词表（`with lock`/
+`session[` 归属校验形态）+ 接受安全样本上的裁决档成本（模型可否决），
+或仅按"B105 族为唯一候选"的文件补造 authz 竞争候选（更窄但样本形）。
 
 ### 8.9 生产组态全量卡实拍终版结论（2026-08-30，87 段，推翻/修正 §8.5 部分定性）
 

@@ -262,7 +262,21 @@ _STANDARD_TAINT_TYPES = frozenset({
     # 剔除 → 界面显示"0 命中"，实为命中后丢弃（工具层浪费）。
     # 影响面实测：仅 2 段真漏洞样本含 TLS 特征、安全样本 0 段 → 不增加 FP 风险。
     "Insecure TLS",
+    # --- 长尾注入族（2026-08-30 待办1，工具层优化指导 §五之三）：白名单此前
+    # 只有注入型 + P2 族，XXE/LDAP/NoSQL 的精确告警（bandit B405-B409 XML 族、
+    # semgrep ldap 规则等）会被当"无主告警"剔除——与 SSRF 当初被剔除同构。
+    # 这三类的 sink 语义各异但证据文本自带规范词（untrusted XML / LDAP filter /
+    # MongoDB 查询拼接），可安全推断。
+    "XXE", "LDAP Injection", "NoSQL Injection",
+    # 2026-08-30 逐条审查补（stage1_candidates_dump 人工审查发现）：SpEL 表达式
+    # 注入（CWE-917）——typical_36 的 semgrep spel-injection 精确命中被当无主
+    # 剔除（主漏洞证据丢失）。cwe_normalizer 已有 SpEL→CWE-917 映射，类型对齐。
+    "SpEL Injection",
 })
+
+# sast/iac 告警 evidence 中"告警行上下文"片段的标记（P0.3 追加 / _infer_taint_type
+# 剥离共用同一常量，防止两处字面量漂移——待办1 2026-08-30）
+_EVIDENCE_CTX_MARK = "[告警行上下文]"
 
 # secret 类 SAST 规则（B3，2026-08-29，工具层优化指导 §二）：语义就是"硬编码凭证"
 # 的位置型规则——凭证本来就没有 source→sink 污点流（B105/hardcoded-token 被判
@@ -786,6 +800,11 @@ class TwoStageScanner:
         # 强制 LLM 复核（否则生产 sampled 模式 90% 静默放行）。请求级使用，每次扫描
         # 开始时复位。
         self._last_suppressed = False
+        # §五之四 留痕（2026-08-30）：被抑制池跳过 / 被无主剔除的规则 id 在请求级
+        # 累积，写入 stage1 字典（suppressed_by_registry / dropped_unowned）——
+        # 消除"工具层零召回无任何提示"的静默性（与 B1 排除逻辑自我实现预言同构）。
+        self._last_suppressed_rules: list[str] = []
+        self._dropped_unowned_rules: list[str] = []
 
     # ------------------------------------------------------------------
     # 主入口
@@ -867,12 +886,27 @@ class TwoStageScanner:
 
         # 请求级复位抑制/剔除标记（候选被抑制池跳过或剔除 → 无候选分支强制复核）
         self._last_suppressed = False
+        self._last_suppressed_rules = []
+        self._dropped_unowned_rules = []
 
         # Stage 1：工具召回
         findings = self._stage1_recall(code, language, filename)
         result.findings = findings
         result.stage1 = self._stage1_stats(findings)
         result.stage1["recall_duration"] = round(time.time() - start, 2)
+        # §五之四 留痕（2026-08-30）：抑制池跳过 / 无主告警剔除的规则在 stage1
+        # 字典可见——"某样本工具层零召回"由此可归因（是没命中，还是命中后被
+        # 抑制/剔除），消除静默性；评估与前端可据此审计抑制池健康度。
+        if self._last_suppressed_rules:
+            result.stage1["suppressed_by_registry"] = {
+                "count": len(self._last_suppressed_rules),
+                "rule_ids": sorted(set(self._last_suppressed_rules)),
+            }
+        if self._dropped_unowned_rules:
+            result.stage1["dropped_unowned"] = {
+                "count": len(self._dropped_unowned_rules),
+                "rule_ids": sorted(set(self._dropped_unowned_rules)),
+            }
 
         # 无候选 → 判安全但复核：sampled=按比例抽样复核（监控工具层召回漂移）；
         # full_recheck=全量 LLM 复核（安全关键场景，消除"无证据判安全"的静默放行）。
@@ -1173,9 +1207,19 @@ class TwoStageScanner:
 
         """
         tt = (finding.get("taint_type") or "")
+        # 证据上下文剥离（待办1，2026-08-30）：sast/iac 告警的 evidence 附带
+        # [告警行上下文] 源码片段，行上下文只说明"在哪里"（sink 邻域代码），
+        # 不说明"是什么"——hard_cve_03 实锤：semgrep request-data-write 因
+        # 上下文含 open(/extractall 被推断成 Path Traversal，带着错误类型标注
+        # 进裁决诱导模型投错票（同一文件三次扫描三结论）。类型/族归因只准用
+        # 告警自身语义描述。裁决 prompt 不受影响（P0.3 上下文本就是给 LLM 看
+        # 的，那里需要"在哪里"）。
+        ev = str(finding.get("evidence") or "")
+        if _EVIDENCE_CTX_MARK in ev:
+            ev = ev.split(_EVIDENCE_CTX_MARK, 1)[0]
         text = " ".join(str(x) for x in [
             finding.get("taint_type"), finding.get("rule_id"),
-            finding.get("evidence"), finding.get("message"),
+            ev, finding.get("message"),
         ] if x).lower()
         # 语义类型名（如 "Command Injection"）直接用；规则号/长路径（B602、
         # models.semgrep_rules.xxx）是工具内部标识，须按关键词推断真实类型。
@@ -1184,9 +1228,41 @@ class TwoStageScanner:
             return tt
         # 注意：text 已 lower()，规则号正则必须用小写才匹配（2026-08-15 修复：
         # 原大写 B608 使规则号推断成为死代码，全靠 evidence 关键词兜底）
-        if "subprocess" in text or "os.system" in text or "command" in text \
-                or re.search(r"b60[2347]", text):
+        # b605（start_process_with_a_shell，os.system/popen）：消息 "Starting a
+        # process with a shell"——2026-08-30 审查补（hard_cve_01 实锤：与链级
+        # 候选同 sink 的精确 bandit 证据被剔除，多工具一致信号丢失）
+        if ("subprocess" in text or "os.system" in text or "command" in text
+                or "process with a shell" in text
+                or re.search(r"b60[23457]", text)):
             return "Command Injection"
+        # --- 长尾注入族（2026-08-30 待办1，白名单扩容配套推断分支）---
+        # NoSQL 必须在 SQL 之前判定："nosql" 含 "sql" 子串，先判 SQL 会把
+        # NoSQL 注入吞掉（cwe_normalizer 2026-08-18 修过同款顺序陷阱）。
+        if ("nosql" in text or "no sql" in text or "no-sql" in text
+                or "mongodb" in text or "mongo" in text):
+            return "NoSQL Injection"
+        if "ldap" in text:
+            return "LDAP Injection"
+        # XXE：bandit B405-B409（XML 解析器黑名单族）消息统一含 "untrusted XML"，
+        # semgrep 侧为 entity/doctype 语义。裸 "xml" 不做依据（太宽，会撞
+        # XMLDecoder 等反序列化形态）。
+        if ("xxe" in text or "untrusted xml" in text
+                or "xml external entity" in text or "entity expansion" in text
+                or re.search(r"b40[5-9]", text)):
+            return "XXE"
+        # SpEL（2026-08-30 逐条审查补）：typical_36 的 semgrep spel-injection
+        # 精确命中被当无主剔除（主漏洞 CWE-94/917 证据丢失）。cwe_normalizer
+        # 已有 SpEL→CWE-917 映射。
+        if "spel" in text or "expression parser" in text:
+            return "SpEL Injection"
+        # Code Injection（2026-08-30 逐条审查补）：eval 族告警（bandit B307、
+        # semgrep eval-detected/user-eval）此前无推断分支——typical_08 的 3 条
+        # 精确告警全被剔除。必须在 SQL 之前判定：eval 告警消息含 "execute
+        # arbitrary code"，SQL 分支的 "execute" 会抢走。\beval\b 词边界避开
+        # literal_eval（推荐写法）与 evaluate；\bexec\b 避开 execute/executable。
+        if (re.search(r"\beval\b|\bexec\b", text) or "b307" in text
+                or "insecure function" in text):
+            return "Code Injection"
         if "execute" in text or "sql" in text or re.search(r"b608|b609", text):
             return "SQL Injection"
         if "format-string" in text or "html" in text or "xss" in text or "innerhtml" in text:
@@ -1208,15 +1284,19 @@ class TwoStageScanner:
                 or "urllib" in text or "ssrf" in text or "fetch(" in text
                 or "b310" in text):
             return "SSRF"
-        # 词边界 \bopen：避免 urlopen 的 "open(" 子串误判为文件打开
-        if (re.search(r"\bopen\s*\(", text) or ".save(" in text or "extractall(" in text
-                or ".extract(" in text or "os.path.join" in text
+        # 词边界 \bopen：避免 urlopen 的 "open(" 子串误判为文件打开。
+        # tarfile/extractall 裸词（2026-08-30 审查补）：B202 消息
+        # "tarfile.extractall used without any validation" 不带括号——上下文
+        # 剥离（待办1）后原先靠行上下文撞词的推断失援，须由告警自身语义承接
+        # （hard_cve_07 实锤）。
+        if (re.search(r"\bopen\s*\(", text) or ".save(" in text or "extractall" in text
+                or ".extract(" in text or "tarfile" in text or "os.path.join" in text
                 or "os.path.realpath" in text or "readfile" in text
                 or "createreadstream" in text or "file(" in text or "getresource(" in text):
             return "Path Traversal"
         if "from_string" in text or "template" in text or "ssti" in text:
             return "Server-Side Template Injection"
-        if "pickle" in text or "deserial" in text:
+        if "pickle" in text or "deserial" in text or "yaml" in text:
             return "Insecure Deserialization"
         # ↓↓↓ P2 类型族（2026-08-29，与 prefilter P2 规则 taint_type 对齐）：
         # 这些类型模型完全可以裁决，但此前既无 _infer_taint_type 分支、
@@ -1224,10 +1304,14 @@ class TwoStageScanner:
         # 证据被当作"无主告警"剔除，只剩 prefilter 无行号规则（typical_17 实锤：
         # B324 + semgrep md5 两条带行号证据全被剔除）。
         # 弱哈希/弱随机/硬编码 IV/弱密码算法
+        # b311/pseudo-random（2026-08-30 审查补）：B311 消息 "Standard
+        # pseudo-random generators are not cryptographically secure" 不含 weak
+        # 词——typical_19 的精确 bandit 证据此前被剔除
         if ("md5" in text or "sha1" in text or "des(" in text or "rc4" in text
                 or "weak" in text and "hash" in text or "b324" in text
                 or "insecure-hash" in text or "hardcoded-iv" in text
-                or "crypto" in text and "weak" in text or "random" in text and "weak" in text):
+                or "crypto" in text and "weak" in text or "random" in text and "weak" in text
+                or "b311" in text or "pseudo-random" in text):
             return "Weak Cryptography"
         # 原型污染
         if ("__proto__" in text or "prototype" in text and "pollution" in text
@@ -1475,6 +1559,7 @@ class TwoStageScanner:
             # 复用抑制语义：本文件发生"候选被剔除"，无候选分支必须强制复核，
             # 防止生产 sampled 模式下 90% 静默放行（与审查 #4 同机制）
             self._last_suppressed = True
+            self._dropped_unowned_rules.extend(dropped)  # §五之四：stage1 留痕
             print(f"[TwoStageScanner] 剔除无主告警 {len(dropped)} 条"
                   f"（{sorted(set(dropped))[:6]}）→ 交 LLM 全文件复核兜底")
         return kept
@@ -1607,6 +1692,7 @@ class TwoStageScanner:
         if skipped:
             for _ in skipped:
                 _monitor_incr("suppressed_skipped")
+            self._last_suppressed_rules.extend(skipped)  # §五之四：stage1 留痕
             # 候选被抑制池跳过 → 本文件可能落入无候选：标记强制复核（08-16 审查 #4，
             # 2026-08-18 补回：抑制跳过后若不再产生候选，无候选分支须 force 复核）
             self._last_suppressed = True
@@ -2045,7 +2131,7 @@ class TwoStageScanner:
                 if category in ("sast", "iac"):
                     ctx = self._line_context(code, int(item.line or 0))
                     if ctx:
-                        evidence = (evidence + "\n[告警行上下文]\n" + ctx).strip()
+                        evidence = (evidence + "\n" + _EVIDENCE_CTX_MARK + "\n" + ctx).strip()
                 findings.append(ToolFinding(
                     rule_id=item.rule_id or f"{item.tool}:unknown",
                     category=category,
@@ -3233,8 +3319,108 @@ if __name__ == "__main__":
     print(f"[{'PASS' if ok_rawtype else 'FAIL'}] §四 raw 类型作用域(registry 校正分支): "
           f"{_res.vulnerability_type!r} <- raw {_res.raw_vulnerability_type!r}")
 
+    # 21) 待办1（2026-08-30）：_infer_taint_type 证据上下文剥离——行上下文只说明
+    #     "在哪里"，不说明"是什么"。hard_cve_03 实锤：request-data-write 的告警
+    #     描述不含任何 sink 词，但附带的行上下文含 open(/extractall → 被撞词成
+    #     Path Traversal 过白名单逃过剔除，带着错误类型标注进裁决诱导模型投票。
+    rdw_rule = "models.semgrep_rules.python.request-data-write"
+    rdw_ctx = ToolFinding(rule_id=rdw_rule, category="sast", source="", sink="",
+                          taint_type=rdw_rule, source_line=8, sink_line=8,
+                          severity="medium", tool="semgrep",
+                          evidence="Found user-controlled request data passed into "
+                                   "'.write(...)'.\n[告警行上下文]\n"
+                                   "8:@app.route(\"/extract\")\n9:open(tmp)\n10:tar.extractall(...)")
+    rdw_clean = ToolFinding(rule_id=rdw_rule, category="sast", source="", sink="",
+                            taint_type=rdw_rule, source_line=8, sink_line=8,
+                            severity="medium", tool="semgrep",
+                            evidence="Found user-controlled request data passed into '.write(...)'.")
+    claimed_ctx = TwoStageScanner._infer_taint_type(rdw_ctx.to_dict())
+    claimed_clean = TwoStageScanner._infer_taint_type(rdw_clean.to_dict())
+    ok_strip = (claimed_ctx not in _STANDARD_TAINT_TYPES      # 不再伪装成白名单类型
+                and claimed_ctx == claimed_clean              # 有无上下文结论一致
+                and claimed_clean == rdw_rule)                # 语义中立 → 保留原标注
+    print(f"[{'PASS' if ok_strip else 'FAIL'}] 待办1 证据上下文剥离: 带上下文={claimed_ctx!r} "
+          f"不带={claimed_clean!r} (均应为规则号且不落白名单)")
+    # 剥离后落白名单外 → 无主剔除照常生效（转 LLM 兜底），且剔除留痕落实例
+    kept_strip = object.__new__(TwoStageScanner)
+    kept_strip._dropped_unowned_rules = []
+    kept_strip2 = kept_strip._drop_irrelevant_positional([rdw_ctx])
+    ok_strip = ok_strip and kept_strip2 == [] \
+        and kept_strip._dropped_unowned_rules == [rdw_rule]
+    print(f"[{'PASS' if ok_strip else 'FAIL'}] 待办1 剔除+留痕: kept={len(kept_strip2)}, "
+          f"dropped_unowned={kept_strip._dropped_unowned_rules}")
+    # 长尾类型推断分支（白名单扩容配套）：典型告警语义词 → 正确类型
+    ok_tail = all([
+        TwoStageScanner._infer_taint_type({"taint_type": "B405", "rule_id": "B405",
+            "evidence": "Using xml.etree.ElementTree to parse untrusted XML data "
+                        "is known to be vulnerable to XML attacks"}) == "XXE",
+        TwoStageScanner._infer_taint_type({"taint_type": "ldap-rule", "rule_id": "ldap-rule",
+            "evidence": "User input in LDAP filter construction"}) == "LDAP Injection",
+        TwoStageScanner._infer_taint_type({"taint_type": "nosql-rule", "rule_id": "nosql-rule",
+            "evidence": "MongoDB query built from request data"}) == "NoSQL Injection",
+        # 2026-08-30 逐条审查补的 6 个分支：
+        TwoStageScanner._infer_taint_type({"taint_type": "B307", "rule_id": "B307",
+            "evidence": "Use of possibly insecure function - consider using safer "
+                        "ast.literal_eval."}) == "Code Injection",
+        TwoStageScanner._infer_taint_type({"taint_type": "B506", "rule_id": "B506",
+            "evidence": "Use of unsafe yaml load. Allows instantiation of arbitrary "
+                        "objects. Consider yaml.safe_load()."}) == "Insecure Deserialization",
+        TwoStageScanner._infer_taint_type({"taint_type": "B605", "rule_id": "B605",
+            "evidence": "Starting a process with a shell: Seems safe, but may be "
+                        "changed in the future, consider rewriting without shell"}) == "Command Injection",
+        TwoStageScanner._infer_taint_type({"taint_type": "B311", "rule_id": "B311",
+            "evidence": "Standard pseudo-random generators are not cryptographically "
+                        "secure."}) == "Weak Cryptography",
+        TwoStageScanner._infer_taint_type({"taint_type": "spel-rule", "rule_id": "spel-rule",
+            "evidence": "Detection of SpEL expression injection"}) == "SpEL Injection",
+        TwoStageScanner._infer_taint_type({"taint_type": "B202", "rule_id": "B202",
+            "evidence": "tarfile.extractall used without any validation. Please check "
+                        "and discard dangerous members."}) == "Path Traversal",
+        # 负样本：literal_eval（安全推荐写法）与 evaluate 不被词边界误伤
+        TwoStageScanner._infer_taint_type({"taint_type": "safe-rule", "rule_id": "safe-rule",
+            "evidence": "ast.literal_eval is the recommended safe alternative"}) == "safe-rule",
+        TwoStageScanner._infer_taint_type({"taint_type": "safe-rule", "rule_id": "safe-rule",
+            "evidence": "The parsed result is evaluated and cached for reuse"}) == "safe-rule",
+    ])
+    print(f"[{'PASS' if ok_tail else 'FAIL'}] 待办1 长尾类型推断: XXE/LDAP/NoSQL 分支")
+
+    # 22) §五之四 抑制留痕（2026-08-30）：候选被抑制池跳过时 stage1 字典留痕
+    #     suppressed_by_registry——"工具层零召回"由此可归因（没命中 vs 命中后被抑制），
+    #     消除静默性；且受保护的自有链级规则（taint_tracker:*）不被抑制。
+    with tempfile.TemporaryDirectory() as _td2:
+        _reg2 = SignalRegistry(path=Path(_td2) / "reg.json", enabled=True)
+        for _f in ("a.py", "b.py"):     # ≥2 独立文件全票否决 → 普通规则进抑制池
+            _reg2.record("B888-T", confirmed=False, n=3, votes_true=0, votes_false=3,
+                         votes_invalid=0, file=_f)
+        _ts2 = TwoStageScanner(client=FakeClient(outputs), system_prompt="sys",
+                               use_semgrep=False, use_taint_tracker=False,
+                               use_prefilter=False, use_external=False,
+                               sampling_rate=0, use_conformal=False,
+                               use_signal_feedback=False, use_counterfactual=False)
+        _ts2._signal_registry = _reg2
+        _sup_finding = ToolFinding(rule_id="B888-T", category="sast", source="", sink="",
+                                   taint_type="B888-T", source_line=1, sink_line=1,
+                                   severity="medium", tool="bandit", evidence="x")
+        _own_finding = ToolFinding(rule_id="taint_tracker:SQL Injection", category="taint",
+                                   source="request.args.get('q')", sink="cursor.execute(q)",
+                                   taint_type="SQL Injection", source_line=1, sink_line=2,
+                                   path=["q"], severity="high", tool="taint_tracker")
+
+        def _fake_recall(code, language, filename):
+            return _ts2._dedupe(_ts2._apply_signal_registry([_sup_finding, _own_finding]))
+
+        _ts2._stage1_recall = _fake_recall
+        _r2s = _ts2.scan_code("x = 1\n", "python", "sup.py")
+        # B888-T 被跳过并留痕；自有 taint 链级候选保留（§五之四保护，即便被
+        # 全票否决 2 次也不进抑制池——本例它根本未被否定，保护读端兜底）
+        ok_trace = (_r2s.findings and _r2s.findings[0].rule_id == "taint_tracker:SQL Injection"
+                    and _r2s.stage1.get("suppressed_by_registry", {}).get("rule_ids") == ["B888-T"])
+    print(f"[{'PASS' if ok_trace else 'FAIL'}] §五之四 抑制留痕: "
+          f"suppressed_by_registry={_r2s.stage1.get('suppressed_by_registry')}, "
+          f"剩余候选={[f.rule_id for f in _r2s.findings]}")
+
     print("\n", "=== 自检通过 ===" if all([ok_parse, ok_dedupe, ok_adjud, ok_safe,
           ok_direct, ok_full, ok_rag_default, ok_gate1, ok_gate2, ok_gate3,
           ok_recheck_type, ok_anchor, ok_majority, ok_entry, ok_noleak,
           ok_wire, ok_chain, ok_b3, ok_b3b, ok_dedupe3, ok_dedupe4, ok_dedupe5,
-          ok_rawtype]) else "=== 存在失败用例 ===")
+          ok_rawtype, ok_strip, ok_tail, ok_trace]) else "=== 存在失败用例 ===")
