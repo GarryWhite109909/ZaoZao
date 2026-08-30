@@ -691,9 +691,8 @@ def _build_backend_info() -> dict:
             "precision_note": "未知后端，无法判断精度信息。",
         })
 
+    info["ui_build"] = _UI_BUILD
     return info
-
-
 @app.get("/api/backend/info")
 def backend_info():
     """当前推理后端与模型精度信息。
@@ -2254,7 +2253,50 @@ def queue_cancel(task_id: str):
 # ---------------------------------------------------------------------------
 # 静态资源托管（Vue 构建产物，开发时不存在则跳过）
 # ---------------------------------------------------------------------------
+def _compute_ui_build(static_dir: "Path") -> str:
+    """前端构建标记：静态目录内所有 .html/.js/.css 的 mtime+size 摘要。
+
+    用于前端自检版本（详见 _NoCacheStaticFiles.file_response）。
+    """
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        files = sorted(
+            p for p in static_dir.rglob("*")
+            if p.is_file() and p.suffix in (".html", ".js", ".css")
+        )
+        for p in files:
+            st = p.stat()
+            h.update(f"{p.relative_to(static_dir)}:{st.st_mtime_ns}:{st.st_size}".encode())
+    except Exception:
+        return "unknown"
+    return h.hexdigest()[:12]
+
+
+class _NoCacheStaticFiles(StaticFiles):
+    """静态资源禁用浏览器缓存（2026-08-29）。
+
+    前端 scan.html 迭代频繁，浏览器缓存旧版会导致后端已修的逻辑在界面上
+    完全不生效（用户重启后端无用，必须手动硬刷新），且症状表现为"改了没效果"
+    的疑难问题。HTML/CSS/JS 加 no-cache，图片等带 hash 的资源保持可缓存。
+    """
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        path = str(kwargs.get("full_path") or (args[1] if len(args) > 1 else ""))
+        if path.endswith((".html", ".js", ".css")):
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
+            # 版本探针（2026-08-29）：no-cache 对"已缓存且未过期"的旧副本
+            # 仍需一次手动硬刷新才失效。注入 build 标记后前端可自检版本，
+            # 发现不一致即提示刷新——把"改了没效果"变成可自诊断的问题。
+            resp.headers["X-UI-Build"] = _UI_BUILD
+        return resp
+
+
 _static_dir = Path(__file__).resolve().parent / "static"
+_UI_BUILD = _compute_ui_build(_static_dir) if _static_dir.is_dir() else "unknown"
 if _static_dir.is_dir():
     # 根路径返回欢迎页，其余静态资源由 StaticFiles 托管
     @app.get("/", response_class=HTMLResponse)
@@ -2264,7 +2306,7 @@ if _static_dir.is_dir():
             return FileResponse(str(welcome_file))
         return FileResponse(str(_static_dir / "index.html"))
 
-    app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="static")
+    app.mount("/", _NoCacheStaticFiles(directory=str(_static_dir), html=True), name="static")
 else:
     @app.get("/", response_class=HTMLResponse)
     async def index():

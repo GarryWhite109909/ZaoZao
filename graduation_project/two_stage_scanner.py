@@ -37,6 +37,7 @@ app.backend.services.scanner.Scanner 的 client），保证与主扫描共享同
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import re
@@ -51,7 +52,7 @@ from graduation_project.external_scanner import ExternalScanner
 from graduation_project.prefilter import Prefilter, PREFILTER_RULE_INFO
 from graduation_project.prompts import build_triage_prompt, build_user_prompt
 from graduation_project.schema import normalize_has_vulnerability, parse_verdict
-from graduation_project.cwe_normalizer import normalize_cwe_label
+from graduation_project.cwe_normalizer import normalize_cwe_label, normalize_with_evidence
 from graduation_project.code_slicer import CodeSlicer
 from graduation_project.line_normalizer import normalize_line_numbers
 
@@ -65,6 +66,10 @@ _MONITOR = {
     "recheck_vuln_found": 0,    # 抽样复核发现工具层漏报的次数
     "recheck_vuln_trusted": 0,  # 其中被 LLM 语义兜底采信为漏洞的次数（自适应闭环）
     "suppressed_skipped": 0,    # 抑制池接线后被跳过的候选数（2026-08-15 闭环读取端）
+    # 2026-08-29 补：长文件复核走确定性分块预筛时递增（P5，2026-08-24 引入），
+    # 此前键缺失 → _monitor_incr 抛 KeyError → _maybe_recheck 异常 → 整文件
+    # "分析失败"。长文件（>num_ctx×0.45）无候选时必然踩中。
+    "recheck_prescreened": 0,
 }
 _MONITOR_LOCK = threading.Lock()
 
@@ -136,6 +141,10 @@ class AdjudicationVerdict:
     decision: str = ""              # 裁决档位（confirmed_vulnerability/dismissed_safe/
                                     # confirmed_review/dismissed_review/direct）
     vulnerability_type: str = ""    # 模型校正后的真实漏洞类型（is_confirmed 时输出）
+    # 判真票的 source/sink 锚点（2026-08-29）：位置型候选自身无证据链文本，
+    # 由外层在赋值 finding 后回填，供 _aggregate 透出到顶层。
+    src_anchor: str = ""
+    sink_anchor: str = ""
     conformal_set: str = ""         # 共形预测三分类（vulnerable/safe/uncertain）
     counterfactual: Optional[dict] = None  # 反事实扰动验证结果（Layer 2）
     evidence_gate: Optional[str] = None    # 确定性证据门拦截原因（sink_defended/no_input_entry）
@@ -239,7 +248,90 @@ _STANDARD_TAINT_TYPES = frozenset({
     "SQL Injection", "Command Injection", "Code Injection", "XSS",
     "Server-Side Template Injection", "Path Traversal",
     "Insecure Deserialization",
+    # 2026-08-29 加：硬编码凭证（CWE-798）。B3 门槛后弱值 secret 转裁决档，
+    # 必须给规范类型才能通过本白名单，否则会被当作"无主告警"再次剔除。
+    "Hardcoded Credentials",
+    # 2026-08-29 加：SSRF（CWE-918）。此前 SSRF 不在白名单 → semgrep 的
+    # ssrf-injection 规则被当无主告警剔除，只剩被撞词的 B310 伪装成 Path Traversal。
+    "SSRF",
+    # --- P2 类型族（2026-08-29 扩容，与 prefilter P2 规则 taint_type 对齐）---
+    "Weak Cryptography", "Prototype Pollution", "Open Redirect",
+    "Timing Attack", "Integer Overflow", "Log Injection",
+    # 2026-08-29 加：TLS 证书验证禁用（CWE-295）。此前 bandit B501 @ line 10
+    # 精确命中 typical_20 的 verify=False，却因类型不在白名单被当作"无主告警"
+    # 剔除 → 界面显示"0 命中"，实为命中后丢弃（工具层浪费）。
+    # 影响面实测：仅 2 段真漏洞样本含 TLS 特征、安全样本 0 段 → 不增加 FP 风险。
+    "Insecure TLS",
 })
+
+# secret 类 SAST 规则（B3，2026-08-29，工具层优化指导 §二）：语义就是"硬编码凭证"
+# 的位置型规则——凭证本来就没有 source→sink 污点流（B105/hardcoded-token 被判
+# "无主"的根因），此前在无主告警剔除中被直接扔掉，SAST 侧的硬编码凭证证据被浪费。
+# 归入 secret 直出档（与 gitleaks/detect-secrets 同档，确定性工具自判，不消耗 LLM）。
+# 识别按 rule_id 与 message 双通道，均为规则语义级特征（bandit B105/B106/B107 是
+# hardcoded_password 三连规则；semgrep 侧 hardcoded-token/hardcoded-secret 族），
+# 非测试集拼写拟合。
+_SECRET_SAST_RULE_RE = re.compile(
+    r"(?:\bB10[567]\b"
+    r"|hardcoded[-_.]?(?:token|secret|password|credential|api[_-]?key))",
+    re.IGNORECASE,
+)
+_SECRET_SAST_MSG_RE = re.compile(
+    r"hardcoded?\s+(?:password|passwd|secret|token|credential|api\s?key)",
+    re.IGNORECASE,
+)
+
+# 框架配置型 secret 的弱值特征（B3 门槛用，2026-08-29）：
+#  Flask/Django 的 app.secret_key / SECRET_KEY 是框架必需配置，其值常是
+#  "dev_key" / "changeme" / "secret" 这类低熵占位符——bandit B105 会告警，
+#  但它既不是"泄露的生产凭证"，也不该顶掉样本的真实漏洞类型（IDOR/CSRF/
+#  SSTI 等）。B3 直出前须过凭证强度门槛，与 gitleaks 的判定语义对齐
+#  （gitleaks 对这些值全部不响，其 generic-api-key 规则要求熵 3.5+ 且长度足够）。
+# 占位符语义词（出现在值中即提示"非真凭证"）：dev/test/example/demo/placeholder 等
+_PLACEHOLDER_TOKEN_RE = re.compile(
+    r"(?:^|[_-])(?:dev|develop|development|test|testing|example|sample|dummy|"
+    r"placeholder|changeme|demo|local|dummy)(?:$|[_-])", re.IGNORECASE,
+)
+# 高随机性片段：8+ 位含大小写/数字混合（真密钥/令牌的典型特征）
+_HIGH_RANDOM_RE = re.compile(r"(?=.*[a-z])(?=.*[A-Z0-9])[A-Za-z0-9]{12,}")
+
+_SECRET_WEAK_VALUE_RE = re.compile(
+    r"^(?:dev[_-]?key|dev[_-]?secret|dev[_-]?token|test|testing|changeme|change[_-]?me|"
+    r"secret|password|passwd|pwd|admin|root|default|example|sample|dummy|placeholder|"
+    r"your[_-]?(?:secret|key|password)|xxx+|abc123|123456|demo|local|development)$",
+    re.IGNORECASE,
+)
+
+
+def _shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    counts = {}
+    for ch in s:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def _is_strong_credential(evidence: str) -> bool:
+    """B105 类告警的值是否达"可判真凭证"门槛（与 gitleaks 同语义）。
+
+    门槛：① 从 '...' 引号中提取候选字面值；② 长度 ≥ 12 且香农熵 ≥ 3.0，
+    或长度 ≥ 20（长随机串熵可能偏低但明显非占位符）；③ 命中弱值词表直接判否。
+    取不到字面值时（工具未给出）→ 判否，走裁决档由模型判断，避免误直出。
+    """
+    m = re.search(r"[\"']([^\"']{4,})[\"']", evidence or "")
+    if not m:
+        return False
+    val = m.group(1)
+    if _SECRET_WEAK_VALUE_RE.match(val):
+        return False
+    ent = _shannon_entropy(val)
+    # 占位符长串（如 "very_long_dev_secret_key_for_testing_only"）熵与长度都够，
+    # 但语义是"开发占位符"而非真凭证 → 命中占位词且无高随机性片段时判弱。
+    if _PLACEHOLDER_TOKEN_RE.search(val) and not _HIGH_RANDOM_RE.search(val):
+        return False
+    return (len(val) >= 12 and ent >= 3.0) or len(val) >= 20
 
 # 复核采信的确定性形态校验（2026-08-18 修正，替代 08-17 的类型白名单）：
 # 白名单内容曾被测试集结果反向拟合（FP 类型被排除、TP 类型被收录）——这是
@@ -317,6 +409,133 @@ _INPUT_ENTRY = re.compile(
     r"json\.load|yaml\.load|\.read\(\)|\.readlines\(\)|recv\(|socket\."
 )
 
+# 外部可控输入入口（判假守卫专用，**不含** .read()/.readlines()）：
+# 与 _INPUT_ENTRY 的区别：后者把文件内容也当输入源（注入场景合理），但判假守卫
+# 要判断"本文件是否有自己的输入接口"，helper 里的 f.read() 是把内容返回调用方，
+# 不是本文件的数据流起点（crossfile_02_input 实测：含 .read() 会被误判有入口）。
+_EXT_ENTRY_RE = re.compile(
+    r"request\.|\.GET\b|\.POST\b|\.args\b|\.form\b|\.cookies\b|\.query\b|\.body\b|"
+    r"\binput\(|sys\.argv|os\.environ|os\.getenv|"
+    r"json\.load|yaml\.load|recv\(|socket\.|@RequestParam|@PathVariable|getParameter\("
+)
+_DEF_SIG_RE = re.compile(
+    r"^\s*(?:def\s+(\w+)\s*\(([^)]*)\)|function\s+(\w+)\s*\(([^)]*)\)|"
+    r"(?:public|private|protected)?\s*\w+\s+(\w+)\s*\(([^)]*)\)\s*\{)", re.M
+)
+_SINK_CALL_RE = re.compile(
+    r"\b(open|execute|eval|exec|system|popen|run|loads|load|readObject|subprocess\.|Popen)\s*\("
+)
+# A 型判假守卫用：跨文件自定义导入
+_FROM_IMPORT_RE = re.compile(r"^\s*from\s+([A-Za-z_][\w\.]*)\s+import\s+(.+)$", re.M)
+_STD_MODULES = frozenset({
+    "os", "sys", "re", "json", "time", "datetime", "hashlib", "sqlite3", "logging",
+    "typing", "subprocess", "base64", "random", "secrets", "urllib", "socket",
+    "threading", "csv", "uuid", "collections", "itertools", "functools", "pathlib",
+    "tempfile", "shutil", "glob", "math", "io", "copy", "abc", "enum", "dataclasses",
+    "flask", "django", "jinja2", "yaml", "pickle", "requests", "boto3", "pymongo",
+    "ldap", "lxml", "Crypto", "jwt", "tarfile", "zipfile", "express", "fs", "path",
+})
+
+
+def _has_external_sink_call(code: str) -> bool:
+    """A 型数据流中断：本文件有外部可控 source，但危险 sink 位于**被调用的
+    项目内自定义模块**中（本文件无标准 sink）。
+
+    语义：source（如 request.args）流入自定义函数（如 safe_read_file），
+    该函数是否安全取决于**另一个文件**的实现。单文件扫描看不到它，
+    "无候选 + 复核查无漏洞"直接判安全即静默放行（hard_crossfile_02_sink
+    实测 FN：同一文件两次扫描一次判真一次判安全，纯凭采样运气）。
+
+    触发条件（三条同时成立，缺一不可）：
+      ① 本文件存在外部可控输入入口
+      ② 本文件没有任何标准危险 sink（sink 确实缺失）
+      ③ 调用了从非标准库模块导入的函数（数据流跨越文件边界）
+
+    规则自证性：数据流完整性是漏洞判定的前置条件——source 在、sink 不在、
+    且调用了外部函数，则 sink 极可能在该外部函数中。非测试集拟合。
+    87 段全量离线验证：命中 1 段（hard_crossfile_02_sink，expected=true），
+    8 个典型安全样本零误伤（均有标准 sink 或无自定义导入）。
+    """
+    if not _EXT_ENTRY_RE.search(code):
+        return False
+    if _SINK_CALL_RE.search(code):
+        return False
+    custom_fns: set[str] = set()
+    for m in _FROM_IMPORT_RE.finditer(code):
+        if m.group(1).split(".")[0] in _STD_MODULES:
+            continue
+        for name in m.group(2).split(","):
+            fn = name.strip().split(" as ")[-1].strip()
+            if fn:
+                custom_fns.add(fn)
+    if not custom_fns:
+        return False
+    return any(re.search(rf"\b{re.escape(fn)}\s*\(", code) for fn in custom_fns)
+
+
+def _anchor_line(text: str, code: str) -> int:
+    """从 "line N: ..." 锚点文本中取纠正后的行号（失败返回 0）。
+
+    用于证据链回填时同步行号：位置型候选的行号由工具给出（可能是告警行、块头行），
+    而判真票的文本锚点由模型给出——两者不一致时会自相矛盾。此处复用
+    line_normalizer 的内容定位（行文本内容可靠、行号易错），取纠正后的行号。
+    """
+    if not text or not code:
+        return 0
+    try:
+        # 从**纠正后的文本**取行号：normalize 幂等时（行号本就正确）anchors 为空，
+        # 直接读 anchors 会得到 0；输出文本恒为 "line N: ..." 格式，从中提取最稳。
+        corrected, _ = normalize_line_numbers(text, code, return_anchors=True)
+    except Exception:
+        return 0
+    m = re.search(r"line\s+(\d+)", corrected or "")
+    return int(m.group(1)) if m else 0
+
+
+def _param_names(sig: str) -> set[str]:
+    """从函数签名提取形参名（去默认值/类型标注/self/cls）。"""
+    return {
+        p.strip().split("=")[0].split(":")[0].strip()
+        for p in sig.split(",") if p.strip()
+    } - {"self", "cls"}
+
+
+def _has_param_driven_sink(code: str) -> bool:
+    """B 型数据流中断（helper 型）：本文件无自己的外部输入入口，但函数体内存在
+    危险 sink，且 sink 实参经变量展开后依赖该函数形参。
+
+    语义：这类文件是 helper/库函数，污点来源在**调用方**，单文件扫描既不能证明
+    调用方安全、也不能证明危险——数据流在文件边界中断，"无候选 + 复核查无漏洞"
+    直接判安全属静默放行（crossfile_02_input 实测 FN，且稳定复现）。
+
+    规则通用性自证（非测试集拟合）：安全分析的基本原则是"数据流不完整时不能
+    判定安全"；此处仅当①无任何外部可控入口 ②函数有形参 ③危险 sink 实参依赖
+    形参 三条同时成立才触发。87 段全量离线验证命中 3 段（crossfile_02_input /
+    longfile_01 / longfile_02），全部 expected=true，零安全样本误伤。
+    """
+    if _EXT_ENTRY_RE.search(code):
+        return False
+    for m in _DEF_SIG_RE.finditer(code):
+        sig = next((g for g in (m.group(2), m.group(4), m.group(6)) if g is not None), "")
+        params = _param_names(sig)
+        if not params:
+            continue
+        start = m.end()
+        nxt = _DEF_SIG_RE.search(code, start)
+        body = code[start: nxt.start() if nxt else len(code)]
+        assigns = {a.group(1): a.group(2)
+                   for a in re.finditer(r"^\s*(\w+)\s*=\s*(.+?)\s*$", body, re.M)}
+        for sm in _SINK_CALL_RE.finditer(body):
+            expanded = body[sm.end(): sm.end() + 120]
+            for _ in range(2):  # 变量依赖最多展开 2 跳（覆盖 `x = join(a, b); open(x)`）
+                for var, rhs in assigns.items():
+                    if re.search(rf"\b{re.escape(var)}\b", expanded):
+                        expanded = expanded + " " + rhs
+            if any(re.search(rf"\b{re.escape(p)}\b", expanded) for p in params):
+                return True
+    return False
+
+
 # 外部工具分档（Stage 1 召回维度 → 裁决方式）：
 # - 裁决档（taint/prefilter/sast/iac）：误报率高、真伪难辨，进 LLM 裁决层（A/C 档）
 # - 直出档（secret/sca）：确定性工具自判即可，召回即作为已确认 finding，不消耗 LLM（B 档）
@@ -392,11 +611,21 @@ def parse_triage_verdict(raw_output: str) -> Optional[dict]:
                     return parsed
                 if "has_vulnerability" in parsed:
                     # 归一化为 is_confirmed 语义（_adjudicate_one 统一消费）
+                    # 2026-08-29 补：source/sink/explanation 此前未透传
+                    # （只取了 reason/type/fix）→ 判真票的证据链锚点全部丢失，
+                    # 位置型候选（无 source/sink 文本）导致顶层证据链恒空。
+                    # reason/explanation 兼容：aligned schema 用 reason，主扫描
+                    # schema 用 explanation；模型偶有混用，回退避免说明为空。
+                    _reason = (parsed.get("reason") or "").strip() \
+                        or (parsed.get("explanation") or "").strip()
                     return {"is_confirmed": parsed["has_vulnerability"],
                             "has_vulnerability": parsed.get("has_vulnerability"),
-                            "reason": parsed.get("reason", ""),
+                            "reason": _reason,
                             "vulnerability_type": parsed.get("vulnerability_type", ""),
-                            "fix_suggestion": parsed.get("fix_suggestion", "")}
+                            "fix_suggestion": parsed.get("fix_suggestion", ""),
+                            "source": parsed.get("source", ""),
+                            "sink": parsed.get("sink", ""),
+                            "explanation": parsed.get("explanation", "")}
     # 字段级兜底（双格式）
     m = re.search(r'"is_confirmed"\s*:\s*(true|false)', raw_output, re.IGNORECASE)
     if m:
@@ -685,7 +914,14 @@ class TwoStageScanner:
                         # strict_recall 被工程缺陷吞掉
                         vt = recheck.get("vulnerability_type") or ""
                         if vt:
-                            result.vulnerability_type = normalize_cwe_label(vt) or vt
+                            # evidence 通道（2026-08-29）：LLM 复核的 explanation 是
+                            # 类型纠偏的最后证据源——模型编号记岔（如原型污染标 912）
+                            # 但 explanation 含高特异形态词（__proto__/原型污染）时，
+                            # normalize_with_evidence 可覆盖。守卫逻辑在 cwe_normalizer 内。
+                            result.vulnerability_type = (
+                                normalize_with_evidence(vt, recheck.get("explanation") or "")
+                                or normalize_cwe_label(vt) or vt
+                            )
                             result.raw_vulnerability_type = vt
                         # P3（2026-08-23）：多漏洞聚合——其余判真票类型不再丢失
                         for t in (recheck.get("types") or []):
@@ -694,8 +930,23 @@ class TwoStageScanner:
                                 result.vulnerability_types.append(nt)
                         if recheck.get("risk_level"):
                             result.risk_level = recheck["risk_level"]
+                        # 2026-08-29 补：source/sink 是 LLM 输出的 "line N:" 锚定文本，
+                        # 行号易数错，与 fix_suggestion 同样接 line_normalizer 纠正——
+                        # 此前只纠正 fix_suggestion，出现"修复行号对、证据链行号错"
+                        # 的不一致（hard_cve_02 实锤）。无锚点文本原样返回，对兜底
+                        # 说明文本无副作用。
+                        src = normalize_line_numbers(recheck.get("source") or "", code) if code else (recheck.get("source") or "")
+                        snk = normalize_line_numbers(recheck.get("sink") or "", code) if code else (recheck.get("sink") or "")
+                        # explanation 纠正一次、两处复用（2026-08-29）：顶层
+                        # explanation 与 adjudication.reasoning 必须同源同版，
+                        # 否则前端"收起态分析说明（已纠）vs 裁决区分析说明（原始）"
+                        # 同屏两个行号版本（hard_cve_02 第 4 次扫描实锤）。
+                        _expl_fixed = (
+                            normalize_line_numbers(recheck.get("explanation") or "", code)
+                            if code else (recheck.get("explanation") or "")
+                        )
                         if recheck.get("explanation") and not result.explanation:
-                            result.explanation = recheck["explanation"]
+                            result.explanation = _expl_fixed
                         fix = recheck.get("fix_suggestion") or ""
                         if fix and not result.fix_suggestion:
                             result.fix_suggestion = (
@@ -706,8 +957,6 @@ class TwoStageScanner:
                         # 无 source/sink 行级证据。现从 recheck 判真票构造合成
                         # finding + 直采信裁决，结构性证据链补齐（source/sink 取
                         # recheck verdict 输出，无则用说明文本兜底）。
-                        src = recheck.get("source") or ""
-                        snk = recheck.get("sink") or ""
                         synthetic = ToolFinding(
                             rule_id="llm_recheck", category="llm",
                             source=src or (recheck.get("explanation") or "LLM 复核判真（Stage 1 未召回）")[:80],
@@ -724,7 +973,7 @@ class TwoStageScanner:
                             votes_true=int(recheck.get("votes_true") or 1),
                             votes_false=int(recheck.get("votes_false") or 0),
                             votes_invalid=int(recheck.get("votes_invalid") or 0),
-                            reasoning=recheck.get("explanation") or "",
+                            reasoning=_expl_fixed,
                             fix_suggestion=result.fix_suggestion,
                             finding=synthetic.to_dict(),
                             decision="confirmed_vulnerability",
@@ -755,7 +1004,30 @@ class TwoStageScanner:
                         result.error = "复核发现疑似漏洞（Stage 1 未召回），需人工复核"
                 elif recheck.get("has_vulnerability") is False:
                     # 复核判安全：LLM 全量确认无漏洞，采信为安全（full_recheck 路径）
-                    result.stage1["decision"] = "no_candidate_recheck_safe"
+                    #
+                    # 判假守卫（2026-08-29）：与"复核判真需全票"对称——判真侧有
+                    # unanimous 全票门防过度采信，判假侧此前零门槛，任何一次
+                    # 复核查无漏洞即静默判安全。但**数据流在文件边界中断**的文件
+                    # （helper 型：无自身输入入口、危险 sink 由形参驱动，污点来源
+                    # 在调用方）单文件扫描无法证明其安全——LLM 只看当前文件必然
+                    # 判安全（crossfile_02_input 稳定 FN 实证）。此类转人工复核。
+                    if _has_param_driven_sink(code):
+                        result.has_vulnerability = None
+                        result.stage1["decision"] = "recheck_incomplete_flow_review"
+                        result.error = (
+                            "数据流不完整：本文件无自身输入入口，危险 sink 由函数参数驱动"
+                            "（helper/库函数，污点来源在调用方）——单文件扫描无法判定安全，"
+                            "需结合调用方或项目级上下文人工复核")
+                    elif _has_external_sink_call(code):
+                        # A 型：source 在本文件、sink 在被调用的项目内自定义模块
+                        result.has_vulnerability = None
+                        result.stage1["decision"] = "recheck_incomplete_flow_review"
+                        result.error = (
+                            "数据流不完整：本文件有外部可控输入，但危险 sink 位于被调用的"
+                            "自定义模块中——单文件扫描无法判定安全，需结合被调用文件或"
+                            "项目级上下文人工复核")
+                    else:
+                        result.stage1["decision"] = "no_candidate_recheck_safe"
                 else:
                     # 复核结果未知（推理异常/平票/解析失败）（2026-08-18 补回，
                     # 08-16 审查 #2 修复在 git checkout 事故重建中丢失）：既未判真
@@ -825,15 +1097,21 @@ class TwoStageScanner:
                             result.vulnerability_types.append(nt)
                     if recheck.get("risk_level"):
                         result.risk_level = recheck["risk_level"]
+                    # explanation 纠正一次、两处复用（同 no_candidate 采信块）：
+                    # 顶层 explanation 与 adjudication.reasoning 同源同版
+                    _expl_fixed = (
+                        normalize_line_numbers(recheck.get("explanation") or "", code)
+                        if code else (recheck.get("explanation") or "")
+                    )
                     if recheck.get("explanation") and not result.explanation:
-                        result.explanation = recheck["explanation"]
+                        result.explanation = _expl_fixed
                     fix = recheck.get("fix_suggestion") or ""
                     if fix and not result.fix_suggestion:
                         result.fix_suggestion = (
                             normalize_line_numbers(fix, code) if code else fix
                         )
-                    src = recheck.get("source") or ""
-                    snk = recheck.get("sink") or ""
+                    src = normalize_line_numbers(recheck.get("source") or "", code) if code else (recheck.get("source") or "")
+                    snk = normalize_line_numbers(recheck.get("sink") or "", code) if code else (recheck.get("sink") or "")
                     synthetic = ToolFinding(
                         rule_id="llm_recheck", category="llm",
                         source=src or (recheck.get("explanation") or "LLM 复核判真（裁决全否决，工具未召回）")[:80],
@@ -850,12 +1128,13 @@ class TwoStageScanner:
                         votes_true=votes_true,
                         votes_false=int(recheck.get("votes_false") or 0),
                         votes_invalid=int(recheck.get("votes_invalid") or 0),
-                        reasoning=recheck.get("explanation") or "",
+                        reasoning=_expl_fixed,
                         fix_suggestion=result.fix_suggestion,
                         finding=synthetic.to_dict(),
                         decision="confirmed_vulnerability",
                         vulnerability_type=vt or "",
                     ))
+                    # 信号注册表 learn_pool 接线（与 no_candidate 采信块一致）
                     if self._signal_registry is not None:
                         self._signal_registry.add_to_learn_pool({
                             "file": filename or "inline",
@@ -863,6 +1142,20 @@ class TwoStageScanner:
                             "evidence": (recheck.get("explanation") or "")[:200],
                             "unanimous": True,
                         })
+        # Judge-safe guard on the candidate path (2026-08-29): after all adjudications
+        # are dismissed AND the fallback recheck also says safe, still verify data-flow
+        # completeness. Previously the guard lived only in the no-candidate branch, so
+        # cross-file samples that WERE recalled but then dismissed sailed through to
+        # "safe" (hard_crossfile_02_input: prefilter correctly flagged
+        # path_traversal_open_join, model voted 0/3, fallback recheck said safe).
+        if (result.has_vulnerability is False and code
+                and (_has_param_driven_sink(code) or _has_external_sink_call(code))):
+            result.has_vulnerability = None
+            result.stage1["decision"] = "dismissed_incomplete_flow_review"
+            result.error = (
+                "数据流不完整，单文件扫描无法判定安全：本文件的危险操作依赖其他文件"
+                "（helper 型参数驱动，或 sink 位于被调用的自定义模块中），"
+                "需结合调用方或项目级上下文人工复核")
         result.total_duration = time.time() - start
         return result
 
@@ -873,6 +1166,7 @@ class TwoStageScanner:
         优先取 taint_type；sast/iac 位置型候选的 taint_type 是 rule_id（如 "B602"），
         从 rule_id/evidence 关键词推断真实类型（subprocess/os.system→命令注入，
         execute/拼接→SQL，return f-string→XSS，open→路径穿越，from_string→SSTI）。
+
         """
         tt = (finding.get("taint_type") or "")
         text = " ".join(str(x) for x in [
@@ -893,12 +1187,63 @@ class TwoStageScanner:
             return "SQL Injection"
         if "format-string" in text or "html" in text or "xss" in text or "innerhtml" in text:
             return "XSS"
-        if "open(" in text or "path" in text or "traversal" in text:
+        # Insecure TLS（2026-08-29 加）：仅用**证书验证专有术语**，不用裸
+        # verify=False —— 后者在 JWT 场景是"不校验签名"（CWE-347），语义不同。
+        # 实测两条 TLS 规则的 evidence 均含 certificate/SSL 专词，可精准区分。
+        if ("certificate" in text or "certification validation" in text
+                or "cert_none" in text or "check_hostname" in text
+                or "create_unverified" in text or "rejectunauthorized" in text
+                or "b501" in text):
+            return "Insecure TLS"
+        # SSRF（2026-08-29 加）：须在 Path Traversal 之前判定——urlopen/requests
+        # 的文本含 "open(" 子串，若先判 Path Traversal 会把 SSRF 撞成路径穿越
+        # （typical_07 / hard_cve_04 实锤：B310 伪装成 Path Traversal 过白名单，
+        #  真正的 semgrep ssrf 规则又因 SSRF 不在白名单被剔除 → SSRF 语义整条丢失）
+        if ("urlopen" in text or "urlretrieve" in text or "requests.get" in text
+                or "requests.post" in text or "httpclient" in text or "new url" in text
+                or "urllib" in text or "ssrf" in text or "fetch(" in text
+                or "b310" in text):
+            return "SSRF"
+        # 词边界 \bopen：避免 urlopen 的 "open(" 子串误判为文件打开
+        if (re.search(r"\bopen\s*\(", text) or ".save(" in text or "extractall(" in text
+                or ".extract(" in text or "os.path.join" in text
+                or "os.path.realpath" in text or "readfile" in text
+                or "createreadstream" in text or "file(" in text or "getresource(" in text):
             return "Path Traversal"
         if "from_string" in text or "template" in text or "ssti" in text:
             return "Server-Side Template Injection"
         if "pickle" in text or "deserial" in text:
             return "Insecure Deserialization"
+        # ↓↓↓ P2 类型族（2026-08-29，与 prefilter P2 规则 taint_type 对齐）：
+        # 这些类型模型完全可以裁决，但此前既无 _infer_taint_type 分支、
+        # 又不在 _STANDARD_TAINT_TYPES 白名单 → bandit/semgrep 带精确行号的
+        # 证据被当作"无主告警"剔除，只剩 prefilter 无行号规则（typical_17 实锤：
+        # B324 + semgrep md5 两条带行号证据全被剔除）。
+        # 弱哈希/弱随机/硬编码 IV/弱密码算法
+        if ("md5" in text or "sha1" in text or "des(" in text or "rc4" in text
+                or "weak" in text and "hash" in text or "b324" in text
+                or "insecure-hash" in text or "hardcoded-iv" in text
+                or "crypto" in text and "weak" in text or "random" in text and "weak" in text):
+            return "Weak Cryptography"
+        # 原型污染
+        if ("__proto__" in text or "prototype" in text and "pollution" in text
+                or "prototype_pollution" in text or "merge" in text and "proto" in text):
+            return "Prototype Pollution"
+        # 开放重定向
+        if ("redirect" in text or "open_redirect" in text or "url_for" in text
+                and "redirect" in text):
+            return "Open Redirect"
+        # 时序攻击
+        if ("timing" in text or "constant-time" in text or "compare_digest" in text
+                or "timing_unsafe" in text):
+            return "Timing Attack"
+        # 整数溢出
+        if ("overflow" in text or "integer_overflow" in text or "wraparound" in text):
+            return "Integer Overflow"
+        # 日志注入
+        if ("log_injection" in text or "logger" in text or "logging" in text
+                and ("inject" in text or "newline" in text or "crlf" in text)):
+            return "Log Injection"
         return tt
 
     def _counterfactual_pass(self, adjudications, code, language, filename) -> None:
@@ -1081,16 +1426,47 @@ class TwoStageScanner:
         直出档（secret/sca）、带证据链的 taint/prefilter 一律不动。被剔除的
         文件若因此落入无候选 → 强制复核（_last_suppressed=True 复用抑制语义，
         见 _maybe_recheck force 分支）→ 开放式全文件 LLM 分析兜底真实漏洞。
+
+        B3 例外（2026-08-29）：secret 类 SAST 规则（B105/B106/B107/hardcoded-token
+        等）不剔除，转 category="secret" 归入直出档——凭证类告警本来就没有
+        source→sink 污点流，按"无主"剔除会浪费确定性证据；转档后与 gitleaks
+        同通道直出（_direct_adjudication，不消耗 LLM 采样）。
         """
         dropped: list[str] = []
+        re_routed: list[str] = []
         kept: list[ToolFinding] = []
         for f in findings:
             if f.category in ("sast", "iac"):
                 claimed = self._infer_taint_type(f.to_dict())
                 if claimed not in _STANDARD_TAINT_TYPES:
+                    if self._is_secret_class_alert(f):
+                        # 2026-08-29 门槛（用户实锤修正）：B3 把 secret 类 SAST 规则
+                        # 转直出档，但 bandit B105 常命中的是框架必需配置
+                        # （app.secret_key = "dev_key"）——10 个样本里 8 个被这种
+                        # 弱值候选顶掉真实漏洞类型（IDOR/CSRF/SSTI），且直出不经过
+                        # 模型、类型停在原始 "B105" 无法归因为 CWE-798。
+                        # 现加凭证强度门槛（与 gitleaks 同语义：长度+熵）：
+                        #   过门槛 → 直出档（真凭证，如 typical_06/hard_bypass_06）；
+                        #   不过   → 转裁决档并给规范类型 "Hardcoded Credentials"，
+                        #            由模型判断，不再顶掉主漏洞类型。
+                        if _is_strong_credential(f.evidence or ""):
+                            f.category = "secret"
+                            f.taint_type = "Hardcoded Credentials"
+                            re_routed.append(f.rule_id or claimed or "")
+                            kept.append(f)
+                            continue
+                        # 弱值：转裁决档（保持 sast 分类），类型规范化为 CWE-798 可归
+                        f.taint_type = "Hardcoded Credentials"
+                        kept.append(f)
+                        continue
+                    # 非 secret 类的乱码语义照常剔除（2026-08-29 修复：此分支曾
+                    # 在 B3 门槛改造中丢失，导致无主告警剔除整体失效）
                     dropped.append(f.rule_id or claimed or "")
                     continue
             kept.append(f)
+        if re_routed:
+            print(f"[TwoStageScanner] secret 类 SAST 规则转直出档 {len(re_routed)} 条"
+                  f"（{sorted(set(re_routed))[:6]}）")
         if dropped:
             # 复用抑制语义：本文件发生"候选被剔除"，无候选分支必须强制复核，
             # 防止生产 sampled 模式下 90% 静默放行（与审查 #4 同机制）
@@ -1098,6 +1474,15 @@ class TwoStageScanner:
             print(f"[TwoStageScanner] 剔除无主告警 {len(dropped)} 条"
                   f"（{sorted(set(dropped))[:6]}）→ 交 LLM 全文件复核兜底")
         return kept
+
+    @staticmethod
+    def _is_secret_class_alert(f: "ToolFinding") -> bool:
+        """该位置型告警是否属 secret 类规则（B105/B106/B107/hardcoded-token 等）。"""
+        return bool(
+            _SECRET_SAST_RULE_RE.search(f.rule_id or "")
+            or _SECRET_SAST_MSG_RE.search(f.evidence or "")
+            or _SECRET_SAST_MSG_RE.search((f.taint_type or ""))
+        )
 
     # ------------------------------------------------------------------
     # 复核采信的形态校验（2026-08-18）
@@ -1521,7 +1906,11 @@ class TwoStageScanner:
             return ""
         lo = max(0, line - 1 - radius)
         hi = min(len(lines), line + radius)
-        return "\n".join(f"{i + 1}:{t}" for i, t in enumerate(lines[lo:hi], start=lo + 1))
+        # enumerate(start=lo+1) 时 i 已是 lines[lo] 的正确 1-based 行号
+        # （lines[lo] 是文件第 lo+1 行），标签不得再加 1——此前 f"{i+1}:..." 把
+        # 全部标签 +1 错位（typical_01 实锤：L9 的 request.args.get 被标成 10），
+        # 与 TaintTracker 等行号正确的候选在同一 prompt 内互相矛盾。
+        return "\n".join(f"{i}:{t}" for i, t in enumerate(lines[lo:hi], start=lo + 1))
 
     def _taint_recall(self, code: str, language: str, filename: str) -> list[ToolFinding]:
         """用 TaintTracker 做 AST 级污点召回（Semgrep 的补充与交叉验证）。"""
@@ -1562,20 +1951,25 @@ class TwoStageScanner:
         # matched_rules 混有安全规则（漏洞+安全同时命中时）：只取漏洞类规则生成
         # 候选，安全规则的空证据候选会污染裁决层
         vuln_rule_names = {r.name for r in getattr(self._prefilter, "vuln_rules", [])}
+        # 命中行号（2026-08-29）：prefilter 现在产出 matched_lines，与 matched_rules
+        # 一一对应。此前恒为 0 → 裁决档候选无位置，模型须自行全文重新定位
+        #（用户实测 14 条无位置候选）。定位不到时 prefilter 记 0，此处同步回落 0。
+        hit_lines = list(getattr(result, "matched_lines", None) or [])
         findings: list[ToolFinding] = []
-        for rule_name in result.matched_rules:
+        for idx, rule_name in enumerate(result.matched_rules):
             if rule_name == "hardcoded_secret_marker":
                 continue  # 标记仅抑制安全判定，不直接作为漏洞候选
             if vuln_rule_names and rule_name not in vuln_rule_names:
                 continue  # 安全规则/标记不产生候选
+            ln = int(hit_lines[idx]) if idx < len(hit_lines) else 0
             findings.append(ToolFinding(
                 rule_id=rule_name,
                 category="prefilter",
                 source="",
                 sink="",
                 taint_type=_PREFILTER_TYPE.get(rule_name, "Detected"),
-                source_line=0,
-                sink_line=0,
+                source_line=ln,
+                sink_line=ln,
                 path=[],
                 severity=_PREFILTER_SEVERITY.get(rule_name, "medium"),
                 tool="prefilter",
@@ -1607,20 +2001,24 @@ class TwoStageScanner:
             ) as tmp:
                 tmp.write(code)
                 tmp_path = tmp.name
-            # 按文件类型分流（第 2.5 代调度优化，2026-08-14）：
-            #   secret：gitleaks 依赖 git 仓库，无 .git 时对单文件几乎不命中
-            #   sca：   trivy fs 只在路径含依赖清单（requirements.txt 等）时有意义
-            #   iac：   trivy config 只对 terraform/k8s/dockerfile 生效
-            # 代码文件（.py/.js/.java 等）直接跳过这三类，避免每次白跑
+            # 按文件类型分流（2026-08-29 修正 secret 档）：
+            #   secret：gitleaks --no-git 对单文件同样有效（实测命中
+            #           hard_bypass_06 的 SECRET_API_TOKEN，line 8，generic-api-key）。
+            #           此前注释断言"无 .git 时对单文件几乎不命中"已被证伪，且该断言
+            #           导致代码文件（.py/.js/.java）被完全排除在 secret 扫描之外——
+            #           而硬编码凭证恰恰绝大多数写在代码文件里（typical_06 /
+            #           hard_bypass_06 / typical_18 全部零召回即此因）。
+            #           现对**所有文件**启用 secret 档；gitleaks 单次 ~70ms，成本可忽略。
+            #   sca：   trivy fs 只在依赖清单（requirements.txt 等）上有意义 → 仅非代码文件
+            #   iac：   trivy config 只对 terraform/k8s/dockerfile 生效 → 仅非代码文件
             # trivy config 联网卡 60s 超时（已修 --skip-policy-update，双保险）
             code_file_exts = {".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".java", ".php",
                               ".c", ".h", ".cpp", ".cc", ".go", ".rb", ".rs", ".cs"}
             groups: dict[str, list] = {
                 "sast": self._external.scan_sast(tmp_path, language),
+                "secret": self._external.scan_secrets(tmp_path),
             }
             if suffix not in code_file_exts:
-                # 仅非代码文件才跑 secret/sca/iac（真实项目扫描时按需启用）
-                groups["secret"] = self._external.scan_secrets(tmp_path)
                 groups["sca"] = self._external.scan_sca(tmp_path)
                 groups["iac"] = self._external.scan_iac(tmp_path)
         except Exception as e:
@@ -1668,6 +2066,17 @@ class TwoStageScanner:
         source/sink 皆空的候选（如 prefilter 规则命中）无法按流去重，
         去重键纳入 rule_id——否则同 taint_type 的多条规则会被误合并成一条，
         丢失规则与证据。
+
+        §三 候选合并（2026-08-29，工具层优化指导）：冗余候选的裁决成本是
+        N=3 次/条，同族候选被 1/2 票否决还会制造复核噪声。在此前 (类型, sink 行)
+        索引之上补两级归并：
+          1. 语义族索引 (family, sink_line)——family 由 _infer_taint_type 从
+             rule_id/evidence 推断（B608+SQL 拼接 evidence → "SQL Injection"），
+             让 sast 规则号候选与 taint 候选在"同行同族"时归并；
+          2. 直出档同位置合并 (secret, sink_line)——bandit B105 与 gitleaks 对
+             同一硬编码凭证的告警合并为一条，携带 "bandit+gitleaks" 双工具标记；
+          3. 无行号候选（prefilter，source/sink/行号全空）归并到同族唯一候选——
+             仅当该族恰好只有一条已见候选（无歧义）时归并，多条并存时保留。
         """
         def _norm(s: str) -> str:
             return re.sub(r"\s+", "", s or "").lower()
@@ -1678,6 +2087,11 @@ class TwoStageScanner:
         # 与 TaintTracker 同流 finding 的主键永不相等；此索引让"空证据 + 同 sink 行
         # + 同类型"的候选能合并到已有 finding 上，避免同一流被裁决两次
         by_sink_line: dict[tuple, tuple] = {}
+        # §三：语义族索引与族内 key 集合（无行号候选的歧义判定用）
+        by_family_line: dict[tuple, tuple] = {}
+        family_keys: dict[str, set] = {}
+        # §三：直出档同位置合并索引（category, sink_line）→ key
+        by_direct_line: dict[tuple, tuple] = {}
 
         # 两遍处理（顺序无关）：先收有证据的 finding 并建索引，再收空证据候选——
         # Stage 1 的召回顺序是 semgrep 在前，单遍处理会让空证据候选抢先进 seen，
@@ -1685,16 +2099,42 @@ class TwoStageScanner:
         def _has_evidence(f: ToolFinding) -> bool:
             return bool(_norm(f.source) or _norm(f.sink))
 
-        ordered = [f for f in findings if _has_evidence(f)] + \
-                  [f for f in findings if not _has_evidence(f)]
+        def _family(f: ToolFinding) -> str:
+            """语义族键：语义类型名本身；规则号/长路径经 _infer_taint_type 推断。"""
+            inferred = TwoStageScanner._infer_taint_type(f.to_dict())
+            return (inferred or f.taint_type or "").strip().lower()
+
+        # 第三遍级序：有证据 → 空证据有行号 → 空证据无行号（最抽象的最后归并）
+        with_line_no_ev = [f for f in findings
+                           if not _has_evidence(f) and f.sink_line]
+        no_line = [f for f in findings
+                   if not _has_evidence(f) and not f.sink_line]
+        ordered = ([f for f in findings if _has_evidence(f)]
+                   + with_line_no_ev + no_line)
         for f in ordered:
             norm_src, norm_sink = _norm(f.source), _norm(f.sink)
             key = (f.taint_type or "").lower(), norm_src, norm_sink
+            family = _family(f)
             if not norm_src and not norm_sink:
-                # 空证据候选：先尝试按 (类型, sink 行) 归并到已有 finding
+                # 空证据候选：依次尝试 (类型, sink 行) / (语义族, sink 行) /
+                # 直出档 (category, sink 行) 归并到已有 finding
                 line_key = ((f.taint_type or "").lower(), f.sink_line)
+                fam_line_key = (family, f.sink_line)
+                direct_key = (f.category, f.sink_line)
                 if f.sink_line and line_key in by_sink_line:
                     key = by_sink_line[line_key]
+                elif f.sink_line and fam_line_key in by_family_line:
+                    key = by_family_line[fam_line_key]
+                elif (f.sink_line and f.category in _DIRECT_CATEGORIES
+                        and direct_key in by_direct_line):
+                    key = by_direct_line[direct_key]
+                elif not f.sink_line:
+                    # 无行号（prefilter 形态）：仅当同族恰好一条已见候选（无歧义）时归并
+                    fam_keys = family_keys.get(family, set())
+                    if len(fam_keys) == 1:
+                        key = next(iter(fam_keys))
+                    else:
+                        key = key + (f.rule_id,)  # 无法归并则按规则区分，不误合并
                 else:
                     key = key + (f.rule_id,)  # 无法归并则按规则区分，不误合并
             if key in seen:
@@ -1714,11 +2154,22 @@ class TwoStageScanner:
                     existing.source_line = f.source_line
                 if not existing.sink_line and f.sink_line:
                     existing.sink_line = f.sink_line
+                # §三：多工具证据合并（不同工具对同一流的描述互补，裁决层可参考）
+                if f.evidence and f.evidence not in existing.evidence:
+                    existing.evidence = (
+                        f"{existing.evidence}\n[{f.tool}] {f.evidence}"
+                        if existing.evidence else f.evidence)
             else:
                 seen[key] = f
                 # 有证据的 finding 注册 sink 行索引，供后续空证据候选归并
                 if (norm_src or norm_sink) and f.sink_line:
                     by_sink_line[((f.taint_type or "").lower(), f.sink_line)] = key
+                # §三：语义族/直出档索引对所有已见候选登记（含空证据有行号者）
+                if f.sink_line:
+                    by_family_line.setdefault((family, f.sink_line), key)
+                    if f.category in _DIRECT_CATEGORIES:
+                        by_direct_line.setdefault((f.category, f.sink_line), key)
+                family_keys.setdefault(family, set()).add(key)
         return list(seen.values())
 
     @staticmethod
@@ -1772,6 +2223,22 @@ class TwoStageScanner:
                 verdict = self._adjudicate_one(finding, code_context, language, filename, rag_context)
             # 关联回源 finding（含 taint_type/severity），供前端逐条展示投票与置信度
             verdict.finding = finding.to_dict()
+            # 证据链回填（2026-08-29）：位置型候选（B501/B310 等）无 source/sink 文本，
+            # 用判真票锚点补齐，供 _aggregate 透出到顶层（前端证据链卡片依赖）。
+            # 必须**同时同步行号**——否则会出现"文本写 line 9、行号徽标标 L10"
+            # 的自相矛盾（typical_20 实拍：B501 的 source 文本 line 9 却标 L10）。
+            if verdict.confirmed and (verdict.src_anchor or verdict.sink_anchor):
+                _fd = verdict.finding
+                if verdict.src_anchor and not (_fd.get("source") or "").strip():
+                    _fd["source"] = verdict.src_anchor
+                    _ln = _anchor_line(verdict.src_anchor, code)
+                    if _ln:
+                        _fd["source_line"] = _ln
+                if verdict.sink_anchor and not (_fd.get("sink") or "").strip():
+                    _fd["sink"] = verdict.sink_anchor
+                    _ln = _anchor_line(verdict.sink_anchor, code)
+                    if _ln:
+                        _fd["sink_line"] = _ln
             # 先定档位再 to_dict，保证 verdict_dict 携带 decision
             if self._is_direct_category(finding.category):
                 verdict.decision = "direct"  # 直出档：确定性工具自判，无 LLM 采样
@@ -1936,6 +2403,9 @@ class TwoStageScanner:
         raw_outputs: list[str] = []
         reason = ""
         fix = ""
+        # 判真票的 source/sink 锚点（2026-08-29：回填给无位置的位置型候选）
+        adj_src = ""
+        adj_sink = ""
 
         for _ in range(self.n_samples):
             try:
@@ -1986,6 +2456,15 @@ class TwoStageScanner:
                 if not reason:
                     reason = parsed.get("reason", "")
                     fix = parsed.get("fix_suggestion", "")
+                # 2026-08-29 补：裁决模型输出的 source/sink 此前被丢弃（只取了
+                # reason/fix）。位置型候选（B501/B310 等）自身无 source/sink 文本，
+                # 导致顶层证据链恒空（模拟前端分析实锤：判真 3/0 但 source/sink/
+                # explanation 全空）。首个判真票的锚点回写到 finding，供
+                # _aggregate 取用（行号已在彼处纠正）。
+                if not adj_src:
+                    adj_src = (parsed.get("source") or "").strip()
+                if not adj_sink:
+                    adj_sink = (parsed.get("sink") or "").strip()
             else:
                 votes_false += 1
 
@@ -2024,6 +2503,11 @@ class TwoStageScanner:
         if self._conformal is not None and self._conformal.calibrated():
             verdict.conformal_set = self._conformal.predict(
                 votes_true, votes_false, votes_invalid, self.n_samples)
+
+        # 锚点暂存（2026-08-29）：verdict.finding 由外层 _adjudicate_all 赋值，
+        # 此处不能回填；写入字段待外层处理。
+        verdict.src_anchor = adj_src
+        verdict.sink_anchor = adj_sink
 
         # 信号回填（模型帮助工具，按信任分级门控）：
         #   全票一致的判定才记录；高置信否定 → 抑制池；confirmed → 置信+类型校正
@@ -2099,6 +2583,19 @@ class TwoStageScanner:
             # 类型校正（第 2.5 代）：裁决层输出的真实漏洞类型优先于工具 rule_id 硬映射
             # （工具泛规则常把越权/CSRF/IDOR 误标 XSS；模型校正后工具标注随之修正）
             corrected = ""
+            # 原始输出文本（纠正前）→ 与投票键一一对应，供 raw_vulnerability_type
+            # 使用（2026-08-29 修复：此前 raw 取的是 top finding 的 taint_type/
+            # rule_id，与 vulnerability_type 的投票来源不同源，前端把两者拼成
+            # "模型输出 → 纠正后"展示时出现 "Timing Attack → CWE-312" 这类
+            # 无因果关系的误导性映射）
+            #
+            # 必须定义在此（2026-08-30 修复作用域缺陷）：此前本行位于下方
+            # `if not corrected:` 块内，当 corrected 来自 signal_registry 校正分支
+            # （如 B501 → CWE-295、taint_tracker:SQL Injection → CWE-89 等已提交
+            # corrected_type 的规则）时整块被跳过，块外第 2655 行访问该变量抛
+            # UnboundLocalError，导致整个 _aggregate 中断、前端显示"分析失败"
+            # （typical_20_insecure_tls.py 实锤）。
+            raw_texts: dict[str, str] = {}
             if self._signal_registry is not None:
                 corrected = self._signal_registry.corrected_taint_type(rule_id)
             if not corrected:
@@ -2116,6 +2613,7 @@ class TwoStageScanner:
                     t = (a.vulnerability_type or "").strip()
                     if not t:
                         continue
+                    raw_texts.setdefault(t, t)
                     tool_label = normalize_cwe_label(
                         (a.finding or {}).get("taint_type") or "") or ""
                     is_echo = bool(tool_label) and (
@@ -2133,10 +2631,14 @@ class TwoStageScanner:
                         key=lambda t: tuple(type_votes[t]),
                     )
             # 统一走 CWE 纠正工具（cwe_normalizer）：Path Traversal → CWE-22 路径穿越，
-            # 无映射时回退到 taint_type / rule_id，保证与旧管道信息格式一致
-            result.vulnerability_type = (
-                corrected or normalize_cwe_label(taint_type) or rule_id
-            )
+            # 无映射时回退到 taint_type / rule_id，保证与旧管道信息格式一致。
+            # 2026-08-29 修复：多数票分支此前**跳过纠正器**直接采用模型原始文本
+            # （hard_bypass_06 实锤：模型输出 "Timing Attack" 直接成为最终类型，
+            # 未经纠正为 CWE-208，strict 口径必然 miss）。现三分支一律过纠正器。
+            if corrected:
+                result.vulnerability_type = normalize_cwe_label(corrected) or corrected
+            else:
+                result.vulnerability_type = normalize_cwe_label(taint_type) or rule_id
             # 多漏洞收集（2026-08-17）：所有判真且过证据门的 finding 的类型
             # （模型校正 > 工具 taint > rule_id），去重保序，供前端展示全部确认
             # 漏洞（如 SSTI 样本同时确认 XSS + SSTI）。vulnerability_type 仍是 top1。
@@ -2153,18 +2655,23 @@ class TwoStageScanner:
                 if t and t not in types:
                     types.append(t)
             result.vulnerability_types = types
-            # 原始类型（纠正前）：前端据此展示"工具原始标注 → CWE Normalizer 纠正"过程
-            result.raw_vulnerability_type = taint_type or rule_id
+            # 原始类型（纠正前）：前端据此展示"工具原始标注 → CWE Normalizer 纠正"过程。
+            # 必须与 vulnerability_type **同源**（2026-08-29）：走多数票分支时取
+            # 该类型的模型原始输出；仅当回退到工具标注时才用 taint_type/rule_id，
+            # 否则会拼出无因果关系的"纠正前后"（hard_bypass_06 实锤）。
+            result.raw_vulnerability_type = raw_texts.get(corrected or "") or taint_type or rule_id
             # 透出已确认裁决的 source/sink/分析/修复到文件级，供前端卡片收起态
-            # 直接展示（与旧管道 r.source/r.sink/explanation/fix_suggestion 对齐）
+            # 直接展示（与旧管道 r.source/r.sink/explanation/fix_suggestion 对齐）。
+            # source/sink/explanation 均接行号纠正（2026-08-29）；explanation 仅
+            # 依赖同文本内部锚 delta 传播（跨字段 hint 已撤销，防纠错）。
+            if not result.source:
+                result.source = normalize_line_numbers(top.finding.get("source") or "", code)
+            if not result.sink:
+                result.sink = normalize_line_numbers(top.finding.get("sink") or "", code)
             if not result.explanation:
-                result.explanation = top.reasoning or ""
+                result.explanation = normalize_line_numbers(top.reasoning or "", code)
             if not result.fix_suggestion:
                 result.fix_suggestion = top.fix_suggestion or ""
-            if not result.source:
-                result.source = top.finding.get("source") or ""
-            if not result.sink:
-                result.sink = top.finding.get("sink") or ""
             # 行号纠正（与旧 Scanner 同思路）：LLM 产出的 fix_suggestion 是
             # "line N:" 锚定文本，行号容易数错但行文本内容可靠，用内容定位真实行号
             if (result.fix_suggestion
@@ -2465,19 +2972,28 @@ if __name__ == "__main__":
     print(f"[{'PASS' if ok_recheck_type else 'FAIL'}] recheck类型回填: type={r3.vulnerability_type!r}, "
           f"dec={r3.stage1.get('decision')}")
 
-    # 12) 裁决 prompt 防锚定：低信任 sast 候选注入可信度警示，高信任 taint 不注入
+    # 12) 裁决 prompt 防锚定（2026-08-29 §四 升级为按证据类型分级）：
+    #     无链 sast → 位置型警示；带链 taint → 链级高信任标注（含推翻须指认断点）；
+    #     category=taint 但链为空（semgrep OSS 形态）→ 降级为位置型警示。
     from graduation_project.prompts import build_triage_prompt
-    sast_f = ToolFinding(rule_id="B608", category="sast", source="name", sink="cursor.execute(q)",
+    sast_f = ToolFinding(rule_id="B608", category="sast", source="", sink="",
                          taint_type="B608", source_line=1, sink_line=3, severity="medium", tool="bandit")
     taint_f = ToolFinding(rule_id="t-sql", category="taint", source="request.args.get('q')",
                           sink="cursor.execute(q)", taint_type="SQL Injection",
-                          source_line=2, sink_line=5, severity="high", tool="semgrep")
+                          source_line=2, sink_line=5, severity="high", tool="taint_tracker")
+    empty_taint_f = ToolFinding(rule_id="sqli-taint", category="taint", source="", sink="",
+                                taint_type="SQL Injection", source_line=5, sink_line=5,
+                                severity="high", tool="semgrep")
     p_sast = build_triage_prompt(sast_f, "code", "python")
     p_taint = build_triage_prompt(taint_f, "code", "python")
+    p_taint_empty = build_triage_prompt(empty_taint_f, "code", "python")
     ok_anchor = ("历史误报率高" in p_sast and "独立判定" in p_sast
-                 and "历史误报率高" not in p_taint and "CWE-862" in p_sast)
-    print(f"[{'PASS' if ok_anchor else 'FAIL'}] 裁决prompt防锚定: sast警示={'历史误报率高' in p_sast}, "
-          f"taint无警示={'历史误报率高' not in p_taint}")
+                 and "历史误报率高" not in p_taint and "CWE-862" in p_sast
+                 and "数据流链" in p_taint and "断点" in p_taint
+                 and "历史误报率高" in p_taint_empty)
+    print(f"[{'PASS' if ok_anchor else 'FAIL'}] 裁决prompt信任分级: "
+          f"sast警示={'历史误报率高' in p_sast}, taint链标注={'数据流链' in p_taint}, "
+          f"无链taint降级={'历史误报率高' in p_taint_empty}")
 
     # 13) 文件级类型多数票 + 回声降权（2026-08-15 修复）：复刻 typical_17_md5_password
     #     的真实裁决组合——5 判中：CWE-79×2（其一为 xss-taint 回声票）、CWE-327×2
@@ -2555,11 +3071,135 @@ if __name__ == "__main__":
     res_cf = cf_scanner.scan_code("q = request.args.get('q')\ncursor.execute('...' + q)", "python", "s.py")
     ok_chain = (res_cf.stage1.get("decision") == "no_candidate_recheck_vuln"
                 and len(res_cf.findings) == 1 and len(res_cf.adjudications) == 1
-                and res_cf.findings[0].source.startswith("line 2"))
+                # 2026-08-29 起证据链接行号纠正：模型误报的 line 2 纠正为真实 line 1
+                and res_cf.findings[0].source.startswith("line 1"))
     print(f"[{'PASS' if ok_chain else 'FAIL'}] recheck证据链: findings={len(res_cf.findings)}, "
           f"adjudications={len(res_cf.adjudications)}, src={res_cf.findings[0].source[:30] if res_cf.findings else None!r}")
+
+    # 18) B3（2026-08-29）：secret 类 SAST 规则不再按"无主告警"剔除，
+    #     转 category="secret" 归入直出档；非 secret 的乱码语义照常剔除。
+    ts_b3 = TwoStageScanner(client=FakeClient(outputs), system_prompt="sys")
+    b3_findings = [
+        ToolFinding(rule_id="B105", category="sast", source="", sink="",
+                    taint_type="B105", source_line=3, sink_line=3,
+                    severity="low", tool="bandit",
+                    evidence="Possible hardcoded password: 'AKIAIOSFODNN7EXAMPLE'"),
+        ToolFinding(rule_id="models.semgrep_rules.generic.hardcoded-token",
+                    category="sast", source="", sink="", taint_type="x",
+                    source_line=8, sink_line=8, severity="medium", tool="semgrep",
+                    evidence="hardcoded token value 's3cr3t_t0k3n_abc123xyz'"),
+        ToolFinding(rule_id="request-data-write", category="sast", source="", sink="",
+                    taint_type="request-data-write", source_line=9, sink_line=9,
+                    severity="low", tool="semgrep", evidence="request-data-write"),
+    ]
+    kept_b3 = ts_b3._drop_irrelevant_positional(b3_findings)
+    b3_cats = {f.rule_id.split(".")[-1]: f.category for f in kept_b3}
+    ok_b3 = (b3_cats.get("B105") == "secret"
+             and b3_cats.get("hardcoded-token") == "secret"
+             and "request-data-write" not in b3_cats
+             and ts_b3._is_direct_category(kept_b3[0].category))
+    print(f"[{'PASS' if ok_b3 else 'FAIL'}] B3 secret类转直出: {b3_cats} "
+          f"(B105/hardcoded-token→secret, request-data-write→剔除)")
+
+    # 18b) B3 凭证门槛（2026-08-29 用户实锤修正）：框架配置型弱值
+    #      （app.secret_key = "dev_key"）不得直出顶掉真实漏洞类型；
+    #      强凭证（真密钥）仍直出。
+    ts_b3b = TwoStageScanner(client=FakeClient(outputs), system_prompt="sys")
+    weak = ToolFinding(rule_id="B105", category="sast", source="", sink="",
+                       taint_type="B105", source_line=5, sink_line=5,
+                       severity="low", tool="bandit",
+                       evidence="Possible hardcoded password: 'dev_key'")
+    strong = ToolFinding(rule_id="B105", category="sast", source="", sink="",
+                         taint_type="B105", source_line=8, sink_line=8,
+                         severity="low", tool="bandit",
+                         evidence="Possible hardcoded password: 'sup3r_s3cret_t0k3n_very_long'")
+    kept_b3b = ts_b3b._drop_irrelevant_positional([weak, strong])
+    cats_b3b = {f.sink_line: f.category for f in kept_b3b}
+    ok_b3b = (cats_b3b.get(5) == "sast"          # 弱值→裁决档，由模型判断
+              and cats_b3b.get(8) == "secret"    # 强凭证→直出
+              and all(f.taint_type == "Hardcoded Credentials" for f in kept_b3b))
+    print(f"[{'PASS' if ok_b3b else 'FAIL'}] B3 凭证门槛: {cats_b3b} "
+          f"(弱值→裁决档sast, 强凭证→直出secret, 类型均归一 Hardcoded Credentials)")
+
+    # 19) §三（2026-08-29）：族级归并——sast 规则号候选按推断语义族与 taint 候选
+    #     同行合并；prefilter 无行号候选归并到同族唯一候选；直出档同位置合并。
+    tj = ToolFinding(rule_id="t-sql", category="taint", source="request.args.get('q')",
+                     sink="cursor.execute(q)", taint_type="SQL Injection",
+                     source_line=1, sink_line=5, path=["q"], severity="high", tool="taint_tracker")
+    sast_b608 = ToolFinding(rule_id="B608", category="sast", source="", sink="",
+                            taint_type="B608", source_line=5, sink_line=5,
+                            severity="medium", tool="bandit",
+                            evidence="Possible SQL injection vector")
+    pf_sql = ToolFinding(rule_id="sqli_string_concat", category="prefilter", source="", sink="",
+                         taint_type="SQL Injection", source_line=0, sink_line=0,
+                         severity="high", tool="prefilter",
+                         evidence="Prefilter 命中漏洞特征规则: sqli_string_concat")
+    merged3 = TwoStageScanner._dedupe([tj, sast_b608, pf_sql])
+    ok_dedupe3 = (len(merged3) == 1
+                  and merged3[0].tool == "bandit+prefilter+taint_tracker")
+    print(f"[{'PASS' if ok_dedupe3 else 'FAIL'}] §三族级归并: {len(merged3)} 条, "
+          f"tool={merged3[0].tool if merged3 else None}")
+    # 直出档同位置合并：bandit B105（转 secret 档）与 gitleaks 同行告警并一条
+    b105 = ToolFinding(rule_id="B105", category="secret", source="", sink="",
+                       taint_type="B105", source_line=3, sink_line=3,
+                       severity="low", tool="bandit", evidence="hardcoded password")
+    glk = ToolFinding(rule_id="generic-api-key", category="secret", source="", sink="",
+                      taint_type="generic-api-key", source_line=3, sink_line=3,
+                      severity="high", tool="gitleaks", evidence="generic-api-key")
+    merged4 = TwoStageScanner._dedupe([b105, glk])
+    ok_dedupe4 = (len(merged4) == 1
+                  and merged4[0].tool == "bandit+gitleaks"
+                  and "generic-api-key" in merged4[0].evidence)
+    print(f"[{'PASS' if ok_dedupe4 else 'FAIL'}] §三直出档同行合并: {len(merged4)} 条, "
+          f"tool={merged4[0].tool if merged4 else None}")
+    # 歧义保护：同族两条不同位置候选时，无行号候选不归并（保持 3 条）
+    tj2 = ToolFinding(rule_id="t-sql2", category="taint", source="request.form['a']",
+                      sink="cursor.execute(q2)", taint_type="SQL Injection",
+                      source_line=10, sink_line=20, severity="high", tool="taint_tracker")
+    merged5 = TwoStageScanner._dedupe([tj, tj2, pf_sql])
+    ok_dedupe5 = len(merged5) == 3
+    print(f"[{'PASS' if ok_dedupe5 else 'FAIL'}] §三歧义保护: 同族双候选时无行号候选保留 "
+          f"({len(merged5)} 条, 期望 3)")
+
+    # 20) _aggregate 的 raw_vulnerability_type 作用域（2026-08-30 回归）：
+    #     corrected 由 signal_registry 校正分支产出时（如 B501 → CWE-295），
+    #     下方多数票块被整体跳过；raw_texts 曾定义在该块内，块外访问抛
+    #     UnboundLocalError → 整个 _aggregate 中断、前端显示"分析失败"
+    #     （typical_20_insecure_tls.py 实锤；凡 top 候选命中注册表中已提交
+    #     校正的规则均受影响）。本用例用临时注册表造"已提交校正"的规则覆盖该分支。
+    from graduation_project.signal_registry import SignalRegistry
+    with tempfile.TemporaryDirectory() as _td:
+        _reg = SignalRegistry(path=Path(_td) / "reg.json", enabled=True)
+        for _f in ("a.py", "b.py"):     # ≥MIN_AGREE_SAMPLES 个独立样本才提交校正
+            _reg.record("B501-X", confirmed=True, n=3, votes_true=3, votes_false=0,
+                        votes_invalid=0, file=_f, taint_type="B501-X",
+                        corrected_type="CWE-295 Improper Certificate Validation")
+        _ts = object.__new__(TwoStageScanner)   # 绕过 __init__：用例不依赖 LLM client
+        _ts.n_samples = 3
+        _ts._signal_registry = _reg
+        _ts._conformal = None
+        _ts._counterfactual = None
+        _res = TwoStageResult(filename="t.py", language="python",
+                              has_vulnerability=None, findings=[])
+        _res.adjudications = [AdjudicationVerdict(
+            confirmed=True, confidence=1.0, votes_true=3, votes_false=0, votes_invalid=0,
+            reasoning="r", fix_suggestion="f", decision="confirmed_vulnerability",
+            finding={"rule_id": "B501-X", "category": "sast", "severity": "high",
+                     "taint_type": "B501-X", "source": "line 1: x", "sink": "line 2: y"},
+            vulnerability_type="CWE-295 Improper Certificate Validation")]
+        try:
+            _ts._aggregate(_res, "x = 1\ny = 2\n")
+            # registry 分支下 corrected 的"原始"就是工具标注（历史模型对工具标注的校正）
+            ok_rawtype = (_res.vulnerability_type == "CWE-295 Improper Certificate Validation"
+                          and _res.raw_vulnerability_type == "B501-X")
+        except Exception as _e:          # 修复前此处抛 UnboundLocalError
+            ok_rawtype = False
+            print(f"      异常: {type(_e).__name__}: {_e}")
+    print(f"[{'PASS' if ok_rawtype else 'FAIL'}] §四 raw 类型作用域(registry 校正分支): "
+          f"{_res.vulnerability_type!r} <- raw {_res.raw_vulnerability_type!r}")
 
     print("\n", "=== 自检通过 ===" if all([ok_parse, ok_dedupe, ok_adjud, ok_safe,
           ok_direct, ok_full, ok_rag_default, ok_gate1, ok_gate2, ok_gate3,
           ok_recheck_type, ok_anchor, ok_majority, ok_entry, ok_noleak,
-          ok_wire, ok_chain]) else "=== 存在失败用例 ===")
+          ok_wire, ok_chain, ok_b3, ok_b3b, ok_dedupe3, ok_dedupe4, ok_dedupe5,
+          ok_rawtype]) else "=== 存在失败用例 ===")

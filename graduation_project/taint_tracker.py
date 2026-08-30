@@ -453,10 +453,14 @@ class TaintTracker:
                     arg_joined = stmt_text
                 sinks.append((label, args, arg_joined))
             if not sinks:
-                # 文本兜底：ProcessBuilder 等非调用节点型 sink
-                label = self._match(stmt_text, self._sink_compiled)
-                if label:
-                    sinks.append((label, [stmt_text], stmt_text))
+                # 文本兜底：ProcessBuilder 等非调用节点型 sink。
+                # 仅限非复合语句——复合语句的 stmt_text 覆盖整个 body 块，兜底会把
+                # 块内 sink 记到块头行（typical_28 的 try: 行实锤）；块内语句会被
+                # _iter_statements 单独 yield 并在此处按真实行号各自兜底。
+                if not any(c.type in _BODY_TYPES for c in stmt.children):
+                    label = self._match(stmt_text, self._sink_compiled)
+                    if label:
+                        sinks.append((label, [stmt_text], stmt_text))
 
             for label, args, arg_joined in sinks:
                 ttype = (_SINK_TYPE_LANG_OVERRIDE.get(ts_lang, {}).get(label)
@@ -914,8 +918,16 @@ class TaintTracker:
     # 调用/摘要相关
     # ------------------------------------------------------------------
     def _sink_nodes_in(self, stmt: Node, code_bytes: bytes, ts_lang: str) -> list[Node]:
+        # 复合语句（if/try/for/while…）的 body 块内调用不在本级扫描：块内语句会被
+        # _iter_statements 单独 yield 并按各自真实行号扫描。若在本级（块头行）扫描，
+        # 块内 sink 会被记到块头行上（typical_28 的 try: / hard_cve_01 的 if 行实锤），
+        # 并与块内正确行形成同键路径，two_stage 去重首见优先会让伪行号胜出。
+        body_ranges = [(c.start_byte, c.end_byte)
+                       for c in stmt.children if c.type in _BODY_TYPES]
         best: dict[tuple[str, int], Node] = {}
         for desc in self._iter_descendants(stmt):
+            if body_ranges and any(b0 <= desc.start_byte < b1 for b0, b1 in body_ranges):
+                continue
             if desc.type not in _CALL_NODE_TYPES and desc.type not in _MEMBER_NODE_TYPES \
                     and desc.type not in _SUBSCRIPT_NODE_TYPES:
                 continue
@@ -1109,3 +1121,23 @@ public class Vuln {
         for p in tracker.trace(src, language=lang, filename=f"sample.{name}"):
             chain = " → ".join(p.propagation) if p.propagation else "(直接表达式)"
             print(f"  L{p.source_line}:{p.source} -> L{p.sink_line}:{p.sink} [{p.taint_type}] 链: {chain}")
+
+    # 复合语句 sink 行号回归（2026-08-29）：if/try 块内 sink 必须记调用行，
+    # 不得产出"块头行"伪路径（typical_28 try:/hard_cve_01 if 行实锤，
+    # 伪行号曾因去重首见优先胜出、误导裁决层）
+    compound_sample = """\
+from flask import request
+import os
+
+def share():
+    module_path = request.args.get("module", "")
+    if os.path.exists(module_path):
+        os.system("ldconfig " + module_path)
+        return "ok"
+    return "no"
+"""
+    c_paths = tracker.trace(compound_sample, language="python", filename="compound.py")
+    sink_lines = sorted({p.sink_line for p in c_paths if p.sink == "os.system("})
+    ok_compound = sink_lines == [7]
+    print(f"[{'PASS' if ok_compound else 'FAIL'}] 复合语句sink行号: os.system 行号={sink_lines} (期望 [7]，"
+          f"若含 6 即块头行伪路径回归)")

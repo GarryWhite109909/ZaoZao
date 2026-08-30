@@ -60,6 +60,12 @@ _SEMGREP_CONFIGS: list[str] = _resolve_semgrep_configs()
 # 目录不存在或为空时，scan_taint() 返回空列表（降级为 TaintTracker/Prefilter 召回）。
 _TAINT_RULES_DIR: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "semgrep_rules")
 
+# Gitleaks 自定义规则（2026-08-29 B2）：默认规则集之上的追加规则
+# （AWS Access Key ID 前缀形态 / Python 字节串字面量凭证）。[extend]
+# useDefault=true 保证默认规则不受影响。文件缺失时退回纯默认规则集（降级不报错）。
+_GITLEAKS_CONFIG: str = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "gitleaks_rules.toml")
+
 # taint 规则 id 前缀 → (taint_type, 默认严重度) 映射，用于把 semgrep finding 映射到统一结构
 # severity 与 two_stage_scanner._SEVERITY_BY_TYPE 保持一致（映射表是权威来源，
 # YAML 里的 severity 仅用于 semgrep 自身的展示，不参与裁决层分级）
@@ -585,16 +591,32 @@ class ExternalScanner:
     def _run_gitleaks(self, path: str) -> list[ExternalFinding]:
         """运行 Gitleaks（密钥检测）。
 
-        命令：gitleaks detect --source <path> --report-format json --report-path -
-        --report-path - 将 JSON 输出到 stdout。输出为 JSON 数组，每项含
-        RuleID / Description / File / StartLine / Severity。
+        命令：gitleaks detect --source <path> --no-git --config <自定义规则>
+        --report-format json --report-path -
+        输出为 JSON 数组，每项含 RuleID / Description / File / StartLine / Severity。
+
+        2026-08-29 修复（secret 档零召回根因）：此前缺 --no-git，gitleaks 默认
+        走 git 历史模式；管道用 NamedTemporaryFile（无 .git 仓库）扫描时直接零输出
+        ——注释里"无 .git 时对单文件几乎不命中"的自我实现预言即来源于此（工具没坏，
+        是调用方式让它必然不命中）。实测加 --no-git 后精确命中
+        hard_bypass_06 的 SECRET_API_TOKEN（line 8，generic-api-key，~70ms）。
+
+        2026-08-29 B2 补：--config 挂载自定义规则（graduation_project/
+        gitleaks_rules.toml，[extend] useDefault 追加于默认规则集之上），补
+        AWS Access Key ID（AKIA 前缀）与 Python 字节串字面量凭证两个语义盲区
+        （typical_06 / typical_18 修复后仍 0 命中的根因）。规则文件缺失时
+        退回默认规则集。
         """
-        out = self._run_subprocess([
-            "gitleaks", "detect",
+        cmd = ["gitleaks", "detect"]
+        if os.path.isfile(_GITLEAKS_CONFIG):
+            cmd += ["--config", _GITLEAKS_CONFIG]
+        cmd += [
             "--source", path,
+            "--no-git",                 # 单文件/无 .git 目录必须显式指定（见 docstring）
             "--report-format", "json",
             "--report-path", "-",
-        ])
+        ]
+        out = self._run_subprocess(cmd)
         if not out or not out.strip():
             return []
         try:

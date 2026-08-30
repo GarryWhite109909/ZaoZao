@@ -35,15 +35,23 @@ def _anchor_re():
         import re
         # 匹配 "line 7:" / "line7:" / "L7:" / "第 7 行:" / "第7行" 等，
         # 捕获行号与后续文本。
+        # 2026-08-29 补 1：区间锚点 "line 13-15:" / "lines 13-15:" /
+        # "第 13-15 行"（typical_32 实锤盲区）。区间取起点 N 定位，纠正后
+        # 统一输出单行 `line N:` 格式。
+        # 2026-08-29 补 2：无冒号叙述锚 "line 8 获取..."（hard_cve_02 实锤）——
+        # 模型在 explanation 字段惯用空格分隔（fix_suggestion 才用冒号），
+        # 旧正则整体不匹配 → 分析说明从未被纠正过。无冒号形态要求后跟
+        # 非空白字符（(?=\S)），排除 "line 6 10" 数字列表类误匹配；
+        # 误识别的安全兜底是内容定位失败时原样返回（不动文本）。
         # content 用非贪婪 + lookahead：在下一个锚点或结尾处截断，避免 `. *`
         # 贪婪吞掉同一文本里的后续锚点；content 保留冒号后的首个空格。
         _LINE_ANCHOR_RE = re.compile(
             r"(?:"
-            r"\b(?:line|L)\s*(?P<num_line>\d+)\s*[:：]"
-            r"|第\s*(?P<num_cn>\d+)\s*行\s*[:：]?"
+            r"\b(?:lines?|L)\s*(?P<num_line>\d+)(?:\s*[-–~]\s*\d+)?(?:\s*[:：]|\s(?=\S))"
+            r"|第\s*(?P<num_cn>\d+)\s*(?:[-–~]\s*\d+\s*)?行\s*[:：]?"
             r")"
             r"(?P<content>.*?)"
-            r"(?=\s*(?:\b(?:line|L)\s*\d+\s*[:：]|第\s*\d+\s*行\s*[:：]?)|\Z)",
+            r"(?=\s*(?:\b(?:lines?|L)\s*\d+(?:\s*[-–~]\s*\d+)?(?:\s*[:：]|\s(?=\S))|第\s*\d+\s*(?:[-–~]\s*\d+\s*)?行\s*[:：]?)|\Z)",
             re.IGNORECASE | re.DOTALL,
         )
     return _LINE_ANCHOR_RE
@@ -63,18 +71,41 @@ def _norm_frag(frag: str) -> str:
     return frag.replace("'", "").replace('"', "").lower()
 
 
+_DECL_LINE_RE = None
+_DECL_PENALTY = 0.5
+
+
+def _is_declaration_line(line: str) -> bool:
+    """声明性语句（import/using/package/include）：只引入标识符，不含数据流。"""
+    global _DECL_LINE_RE
+    if _DECL_LINE_RE is None:
+        import re as _re
+        _DECL_LINE_RE = _re.compile(
+            r"^\s*(?:from\s+[\w\.]+\s+import\b|import\b|package\s+[\w\.]+\s*;"
+            r"|using\s+[\w\.]+\s*;|#include\b)"
+        )
+    return bool(_DECL_LINE_RE.match(line))
+
+
 def _code_fragments(text: str) -> list[str]:
-    """提取锚点内容中最长的无空白代码片段（≥8 字符，最多 2 个）。
+    """提取锚点内容中的无空白代码片段（≥8 字符，全部返回不截断）。
 
     模型的描述尾缀（中文/英文自由文本）会稀释整串相似度，但代码片段本身
     通常是一个连续无空白 token（如 `request.args.get('file')`），且会
     原样出现在真实源码行中——用它做"包含关系"匹配最稳。
+
+    2026-08-29 修正：不再按长度截断 top-2/top-4。修复建议类锚常带大段
+    "修复新代码"（源码中不存在，如 os.path.abspath(...)），其长度会垄断
+    top-N、把真正有定位力的短片段（如 open(full_path,）挤出候选——
+    hard_bypass_04 fix line 13 实锤（top-2/top-4 均复发）。改为全量返回：
+    不存在源码中的新代码片段在 _line_score 里自然零分（无副作用），真实
+    片段按"包含即 0.95 + 同分就近 tie-break"定位，误定位风险可控。
     """
     pieces = sorted(
-        (_norm_frag(p) for p in text.split() if len(p) >= 8),
+        {_norm_frag(p) for p in text.split() if len(p) >= 8},
         key=len, reverse=True,
     )
-    return pieces[:2]
+    return pieces
 
 
 def _norm(text: str) -> str:
@@ -85,6 +116,11 @@ def _norm(text: str) -> str:
     # 去掉行尾的状态描述（如 "用户可控路径参数"、"直接打开拼接后的路径"），
     # 只保留代码片段本身。以代码关键字/符号特征截断到第一个明显的代码片段结束点。
     s = s.split("（")[0].split("，")[0].split("。")[0]
+    # f-string 前缀剥离（2026-08-29，hard_cve_02 实拍 3）：模型修复建议写
+    # `logger.info("Login...")`（正确修复形态），源码是 `logger.info(f"Login...")`——
+    # 一个 f 前缀之差导致片段包含匹配失败、相似度 0.55<0.6 阈值，fix 行号纠不上。
+    # f 是语法标记非内容，锚与源码行同侧剥离为等价归一化，无副作用。
+    s = s.replace('(f"', '("').replace("(f'", "('")
     # 归一化空白与引号差异
     return "".join(s.split()).replace('"', "").replace("'", "").lower()
 
@@ -147,6 +183,8 @@ def _find_line(content_anchor: str, code_lines: list[str], orig: int | None = No
     for i, line in enumerate(code_lines):
         norm_line = _norm(line)
         score = _line_score(target_full, target_cjk, frags, norm_line, _norm(_strip_cjk(line)))
+        if score > 0 and _is_declaration_line(line):
+            score *= _DECL_PENALTY
         if score <= 0:
             continue
         if score == 1.0 and i + 1 == orig:
@@ -179,6 +217,11 @@ def normalize_line_numbers(
     Returns:
         return_anchors=False：纠正后的文本（匹配不到的内容段原样保留）。
         return_anchors=True：(纠正后文本, [(orig_line, fixed_line), ...])。
+
+    2026-08-29 撤销 hint_delta 跨字段偏移传播：实测同一票生成中 source/sink
+    （锚定格式）与 explanation（叙事格式）的行号偏移经常不同（hard_cve_02
+    第 2 次扫描 +3 vs +2），跨字段 hint 会纠错。explanation 仅依赖同文本
+    内部锚的 delta 传播；无内部锚时保持原样，靠数据侧校准（P1-3b）治本。
     """
     if not text or not code:
         return (text, []) if return_anchors else text
@@ -188,28 +231,47 @@ def normalize_line_numbers(
         return (text, []) if return_anchors else text
 
     re_anchor = _anchor_re()
-    out: list[str] = []
-    anchors: list[tuple[int, int]] = []
-    last_end = 0
-    for m in re_anchor.finditer(text):
-        # 锚点之前的普通文本原样保留
-        out.append(text[last_end:m.start()])
+    matches = list(re_anchor.finditer(text))
+    if not matches:
+        return (text, []) if return_anchors else text
+
+    # 第一遍：逐锚内容定位
+    entries: list[tuple[int, int | None]] = []  # (orig, fixed|None)，orig=None=解析失败
+    for m in matches:
         num_s = m.group("num_line") or m.group("num_cn")
-        content = m.group("content")
         try:
             orig = int(num_s)
         except ValueError:
-            out.append(m.group(0))
-            last_end = m.end()
+            entries.append((None, None))
             continue
-        fixed = _find_line(content, code_lines, orig=orig)
-        if fixed is not None and fixed != orig:
-            # 纠正后的锚点统一输出为 `line N:` 格式（下游解析器只认该形态）
-            out.append(f"line {fixed}:{content}")
+        entries.append((orig, _find_line(m.group("content"), code_lines, orig=orig)))
+
+    # delta 传播（2026-08-29，hard_cve_02 实锤）：自由文本（explanation）的锚
+    # 常含纯中文叙述（"line 9 直接拼入日志"），无代码片段可在源码定位。
+    # 同一文本内模型按同一套计数数行（偏移一致），故：可定位锚的 delta
+    # 全部一致时，将该 delta 应用于定位失败的锚；delta 不一致（行号系统
+    # 混乱）或无成功锚 → 放弃传播、原样保留（不做破坏性覆盖）。
+    # 跨字段 hint 已撤销（见 docstring：source/sink 与 explanation 偏移
+    # 经实测不同源，跨字段传播会纠错）。
+    deltas = {fixed - orig for orig, fixed in entries if fixed is not None and orig is not None}
+    delta = deltas.pop() if len(deltas) == 1 else None
+
+    out: list[str] = []
+    anchors: list[tuple[int, int]] = []
+    last_end = 0
+    for m, (orig, fixed) in zip(matches, entries):
+        out.append(text[last_end:m.start()])
+        last_end = m.end()
+        propagated = False
+        if fixed is None and orig is not None and delta and delta != 0:
+            candidate = orig + delta
+            if candidate >= 1:  # 传播结果必须落在合法行号范围
+                fixed, propagated = candidate, True
+        if fixed is not None and orig is not None and fixed != orig:
+            out.append(f"line {fixed}:{m.group('content')}")
             anchors.append((orig, fixed))
         else:
             out.append(m.group(0))
-        last_end = m.end()
     out.append(text[last_end:])
 
     corrected = "".join(out)
