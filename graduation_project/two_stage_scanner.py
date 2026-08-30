@@ -1755,18 +1755,17 @@ class TwoStageScanner:
         true_types: list = []  # P3 修复（2026-08-23）：收集全部判真票类型——此前只取首票，
                                # 多漏洞文件走复核通道时其余漏洞类型被静默丢弃
         try:
-            for _ in range(n):
-                resp = self.client.generate(
-                    prompt=build_user_prompt(code=recheck_code, language=language),
-                    system_prompt=self.system_prompt,
-                    # 2026-08-15 修复：不再硬编码 0.7 无视 self.temperature——
-                    # 多票采样需要足够温度打破同模态重复（取配置与 0.7 的较大值），
-                    # 单票直接用调用方配置（默认低温稳定）。
-                    temperature=(max(self.temperature, 0.7) if n > 1 else self.temperature),
-                    max_tokens=int(os.environ.get("VULN_SCANNER_MAX_TOKENS", "2048")),
-                    num_ctx=self.num_ctx,
-                    keep_alive=self._effective_keep_alive(),
-                )
+            # N 票统一经 _sample_votes 获取（2026-08-30）：vLLM 下单请求批量
+            # 采样（服务端共享 prefill），其余后端逐条循环，语义一致。
+            recheck_prompt = build_user_prompt(code=recheck_code, language=language)
+            vote_results = self._sample_votes(
+                recheck_prompt, n,
+                # 2026-08-15 修复：不再硬编码 0.7 无视 self.temperature——
+                # 多票采样需要足够温度打破同模态重复（取配置与 0.7 的较大值），
+                # 单票直接用调用方配置（默认低温稳定）。
+                temperature=(max(self.temperature, 0.7) if n > 1 else self.temperature),
+            )
+            for resp in vote_results:
                 text = resp.get("text", "") if isinstance(resp, dict) else ""
                 verdict = parse_verdict(text) if text else None
                 hv_i = normalize_has_vulnerability(verdict.get("has_vulnerability")) if verdict else None
@@ -2389,6 +2388,44 @@ class TwoStageScanner:
             f"{i}| {line}" for i, line in enumerate(code.split("\n"), start=start_line)
         )
 
+    def _sample_votes(self, prompt: str, n: int, temperature: float) -> list:
+        """N 次采样统一入口（2026-08-30 vLLM 批量采样接线）。
+
+        client 支持 generate_n（vLLM OpenAI n 参数）且 n>1 时，单请求批量
+        采样——服务端对同一 prompt 的 n 条采样共享 prefill（parallel
+        sampling），消除 N 次串行请求重复 pay 全量 prefill 的吞吐瓶颈；
+        否则（Ollama / transformers / llamacpp）逐条 generate 循环，语义不变。
+
+        返回 generate 结构 dict 列表；批量整体异常时抛给调用方（裁决侧
+        逐票计 invalid、复核侧走原有整体 error 返回），单条失败为该项
+        error 非空——与循环版逐票异常语义一致。
+        """
+        max_tokens = int(os.environ.get("VULN_SCANNER_MAX_TOKENS", "2048"))
+        gen_n = getattr(self.client, "generate_n", None)
+        if n > 1 and callable(gen_n):
+            try:
+                return gen_n(
+                    prompt=prompt, n=n,
+                    system_prompt=self.system_prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    num_ctx=self.num_ctx,
+                    keep_alive=self._effective_keep_alive(),
+                )
+            except Exception as e:
+                print(f"[TwoStageScanner] generate_n 批量采样失败，退化为逐条: {e}")
+        return [
+            self.client.generate(
+                prompt=prompt,
+                system_prompt=self.system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                num_ctx=self.num_ctx,
+                keep_alive=self._effective_keep_alive(),
+            )
+            for _ in range(n)
+        ]
+
     def _adjudicate_one(
         self, finding: ToolFinding, code_context: str,
         language: str, filename: str, rag_context: Optional[str],
@@ -2411,21 +2448,15 @@ class TwoStageScanner:
         adj_src = ""
         adj_sink = ""
 
-        for _ in range(self.n_samples):
-            try:
-                result = self.client.generate(
-                    prompt=prompt,
-                    system_prompt=self.system_prompt,
-                    temperature=self.temperature,
-                    max_tokens=int(os.environ.get("VULN_SCANNER_MAX_TOKENS", "2048")),
-                    num_ctx=self.num_ctx,
-                    keep_alive=self._effective_keep_alive(),
-                )
-            except Exception as e:
-                print(f"[TwoStageScanner] 裁决推理失败: {e}")
-                votes_invalid += 1
-                continue
-
+        # N 票统一经 _sample_votes 获取（2026-08-30）：client 支持 generate_n
+        # （vLLM）时单请求批量采样（服务端共享 prefill），否则逐条循环——
+        # 两种路径的逐票解析/无效票语义完全一致
+        try:
+            vote_results = self._sample_votes(prompt, self.n_samples, self.temperature)
+        except Exception as e:
+            print(f"[TwoStageScanner] 裁决推理失败: {e}")
+            vote_results = [{"error": f"{type(e).__name__}: {e}"} for _ in range(self.n_samples)]
+        for result in vote_results:
             text = result.get("text", "") if isinstance(result, dict) else ""
             if result.get("error") if isinstance(result, dict) else False:
                 votes_invalid += 1

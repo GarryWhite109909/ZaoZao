@@ -238,12 +238,20 @@ class AnalyzeRequest(BaseModel):
 class UrlScanRequest(BaseModel):
     url: str = Field(..., max_length=2048)
     use_rag: Optional[bool] = None
+    # 每候选 LLM 采样次数（1~10，None 用全局默认 3）。批量巡检可传 1 换速度
+    #（单脚本耗时约降 2/3），深度审计用默认或更高
+    n_samples: Optional[int] = Field(None, ge=1, le=10)
+    # 是否跳过公共 CDN/统计分析库脚本（默认开：这些库不是站点自有攻击面，
+    # 却各消耗采样预算；关掉恢复旧全量行为）
+    skip_common_libs: bool = True
 
 
 class GithubScanRequest(BaseModel):
     repo_url: str = Field(..., max_length=2048)
     use_rag: Optional[bool] = None
     max_files: int = Field(50, ge=1, le=500)  # 限制扫描文件数，避免大仓库超时
+    # 与 URL 扫描同语义：每文件 LLM 采样次数（None 用全局默认 3）
+    n_samples: Optional[int] = Field(None, ge=1, le=10)
 
 
 class ExternalScanRequest(BaseModel):
@@ -1003,6 +1011,7 @@ async def _scan_files_scheduled(
     use_rag: Optional[bool],
     client_id: str,
     priority: int = PRIORITY_LOW,
+    n_samples: Optional[int] = None,
 ) -> BatchResult:
     """逐文件提交到调度器，等待结果汇总。
 
@@ -1010,6 +1019,7 @@ async def _scan_files_scheduled(
     交互式扫描（HIGH）可随时插队，避免批量任务饿死单文件请求。
     URL/GitHub 属于安全关键场景：显式 full_recheck（现为全局默认，此处保留
     显式传参以文档化意图），消除"工具层无候选 → 静默判安全"的漏报风险。
+    n_samples 透传请求级采样数（None 用全局默认 3；URL/GitHub 巡检可传 1）。
     """
     batch = BatchResult(total_files=len(files))
     batch_start = time.time()
@@ -1019,6 +1029,7 @@ async def _scan_files_scheduled(
             lambda fn=filename, lg=language, cd=code: _two_stage_scan(
                 cd, lg, fn, use_rag=use_rag,
                 no_candidate_mode="full_recheck",
+                n_samples=n_samples,
             ),
             description=f"scan:{filename}",
         )
@@ -1052,8 +1063,11 @@ async def url_scan(req: UrlScanRequest, request: Request):
     url_err = validate_target_url(req.url)
     if url_err:
         return JSONResponse({"error": url_err, "url": req.url}, status_code=400)
-    # fetch_url 是同步阻塞（requests），放线程池避免卡事件循环
-    fetch_result = await asyncio.to_thread(fetch_url, req.url)
+    # fetch_url 是同步阻塞（requests），放线程池避免卡事件循环；
+    # 公共库过滤默认开（skip_common_libs=False 恢复全量抓取）
+    fetch_result = await asyncio.to_thread(
+        fetch_url, req.url, 15, req.skip_common_libs,
+    )
 
     if fetch_result.error:
         return JSONResponse(
@@ -1069,7 +1083,7 @@ async def url_scan(req: UrlScanRequest, request: Request):
          s.language, s.content)
         for s in fetch_result.scripts
     ]
-    batch = await _scan_files_scheduled(files, req.use_rag, client_id)
+    batch = await _scan_files_scheduled(files, req.use_rag, client_id, n_samples=req.n_samples)
     global _last_batch
     with _stats_lock:
         _last_batch = batch
@@ -1079,6 +1093,8 @@ async def url_scan(req: UrlScanRequest, request: Request):
         "url": req.url,
         "title": fetch_result.title,
         "total_scripts": fetch_result.total_scripts,
+        # 被公共库过滤跳过的外链（前端提示；skip_common_libs=False 时为空）
+        "skipped_libs": fetch_result.skipped_libs,
         "summary": batch.to_dict(),
     }
 
@@ -1159,7 +1175,9 @@ async def github_scan(req: GithubScanRequest, request: Request):
         if not code_files:
             return {"repo": req.repo_url, "message": "仓库中未找到支持的代码文件"}
 
-        batch = await _scan_files_scheduled(code_files, req.use_rag, client_id)
+        batch = await _scan_files_scheduled(
+            code_files, req.use_rag, client_id, n_samples=req.n_samples,
+        )
         global _last_batch
         with _stats_lock:
             _last_batch = batch
