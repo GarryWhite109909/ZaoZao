@@ -406,7 +406,11 @@ def _has_cross_file_call(code: str) -> bool:
 _INPUT_ENTRY = re.compile(
     r"request\.|\.GET\b|\.POST\b|\.args\b|\.form\b|\.cookies\b|\.query\b|\.body\b|"
     r"\binput\(|sys\.argv|os\.environ|os\.getenv|"
-    r"json\.load|yaml\.load|\.read\(\)|\.readlines\(\)|recv\(|socket\."
+    r"json\.load|yaml\.load|\.read\(\)|\.readlines\(\)|recv\(|socket\.|"
+    # PHP 超全局（2026-08-30 补，typical_09 实锤）：此前 PHP 的 $_GET/$_POST/
+    # $_REQUEST/$_COOKIE/php://input 全不识别 → 门 2 误判"无输入入口"，
+    # 3:0 判真被 evidence_gate 拦成复核（跨语言盲区：原自检用例全为 Python）
+    r"\$_(GET|POST|REQUEST|COOKIE|SERVER)\b|php://input"
 )
 
 # 外部可控输入入口（判假守卫专用，**不含** .read()/.readlines()）：

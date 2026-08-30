@@ -700,3 +700,47 @@ review；生产组态（ALPHA05_PROMPT 1982字 + triage_aligned）干净判 True
 **独立集验证建议**：在 `testset_cve_fix` 的授权类 CVE（若存在）+ 手工构造 3 段
 安全对照（有 login_required 的同形态 handler）上验证 TP/FP。
 
+### 8.9 生产组态全量卡实拍终版结论（2026-08-30，87 段，推翻/修正 §8.5 部分定性）
+
+**数据**：`results/frontend_card_check_20260830_140158.json`（ALPHA05_PROMPT +
+triage_aligned + full_recheck + n=3 + num_ctx 16384 + 生产注册表，逐项对齐
+main.py/bootstrap，对齐检查表见日志头部）。
+
+**判定层**：TP=59 TN=21 FP=1（crossfile_01_input/943）→ **FPR 4.2%**
+（评估组态 10% 的 2 个 FP 中 crossfile_03_input 在生产组态转复核）；复核 6
+（真 2：typical_09/longfile_01；安 4）。**strict recall 0.967 / loose 1.0**。
+
+**类型层 strict hit 52/59 = 88.2%**（评估组态 ~75%）。生产组态 7 个 miss 重新归因：
+
+| 样本 | 判 | 期望 | 归因层 |
+|---|---|---|---|
+| typical_08_eval | top1=78 | 94 | **工具层**：模型归因 95/94 基本对（多漏洞列表可证），top1 被 severity 更高的工具 78 finding 抢占——top1 与模型归因**不同源** |
+| hard_cve_03_tarfile | top1=798 | 22;377 | **工具层**：同上，vts=[89] 与 top1=798 脱节 |
+| crossfile_03_sink | 798 | 639 | 工具层残留（§8.5 机制，仅此 1 段）|
+| typical_15 / bypass_08 | 287 | 862 / 347 | **训练层**：287（认证不当）大筐吃掉授权/验证专号——无候选兜底时模型独立归因的边界问题 |
+| typical_22_csrf | 862 | 352 | **训练层**：CSRF vs 授权缺失（锚表已立仍错 → v2_15 加量）|
+| typical_30_mass_assign | 862 | 915 | **训练层**：mass assignment 的 915 专号未内化 |
+
+**§8.5 定性修正（重要）**：798 抢占六连是**评估组态特有现象**——生产组态下
+B105 被否决、模型经无候选兜底**独立归因**出 287/862/384/352（6 段中 3 段直接
+strict hit）。P2 授权规则（§8.8）的价值从"治 798"重定位为"**把无候选兜底转成
+有候选裁决**"——降低复核率、给类型归因提供工具锚（兜底归因漂移问题见训练层
+v2_15 §3.1）。**"无工具锚点时模型类型归因不稳"由本数据再次确证**。
+
+**新增修复项**：
+
+1. **【已修】PHP 入口正则盲区**（typical_09 实锤）：`_INPUT_ENTRY` 缺
+   `$_GET/$_POST/$_REQUEST/$_COOKIE/$_SERVER/php://input` → 门 2 误拦 PHP 的
+   3:0 判真。已补正则 + 自检通过 + typical_09 复验识别入口 + Python 回归 PASS。
+   预期重扫后 typical_09 复核 → True（strict recall 0.967 → 0.984）。
+   **教训：08-29 加门时自检用例全是 Python——今后新增语言相关判定必须带
+   该语言的阳性用例。**
+2. **top1 与多漏洞列表同源化**（typical_08/cve_03 实锤）：`vulnerability_type`
+   按 severity 取 finding 类型，`vulnerability_types` 是模型归因列表，两者可脱节。
+   建议：有模型类型票时 top1 优先取多数票类型，工具 rule_id 映射仅兜底。
+   **动 fixed5 基线，需全量回归。**
+3. **types 元素统一 normalize**（10 段展示不一致中 8 段实为此问题）：
+   "CWE-78 Command Injection" vs "CWE-78 OS Command Injection"、"Wraparound" vs
+   "Wrap-up"——同一编号两套官方名，前端两处显示会不一致。修复：`vulnerability_types`
+   元素统一过 `normalize_cwe_label`（纯展示层，低风险）。
+
