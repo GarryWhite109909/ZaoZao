@@ -610,3 +610,93 @@ Insecure Deserialization}` + 4 条 semgrep 规则），整个 `_aggregate` 中�
 | line_normalizer.py:269 | `propagated` 赋值后未读取 | 无害残留标志位，逻辑本身正确（fixed 已直接生效）|
 | two_stage_scanner.py:1283 | 循环变量遮蔽模块级 import `build_triage_prompt` | 运行时无影响，重命名可消，低优先 |
 
+### 8.5 CWE-798 抢占文件级类型（2026-08-30 实锤，工具层修复建议 P1）
+
+**现象**（两套组态一致复现，跨组态稳健）：`typical_15_missing_authz`（期望 862）、
+`typical_16_session_fixation`（384）、`typical_22_csrf`（352）、`hard_bypass_05_csrf_same_origin`（352）、
+`hard_bypass_08_jwt_none_alg`（347）、`hard_crossfile_03_sink`（639）——六段主漏洞为
+鉴权/会话/CSRF 类的样本，文件级 `vulnerability_type` 全被顶成 **CWE-798 硬编码凭证**。
+
+**工具层查证**（票型证据，评估组态 JSON）：
+
+```
+typical_15_missing_authz  候选仅 1 条：B105 (2真/1假) → conf → top1=CWE-798
+hard_crossfile_03_sink    候选仅 1 条：B105 (2真/1假) → top1=CWE-798
+hard_bypass_05            评估组态 B105 0/3 全否决、xss-t 1/2 否决 → 全否决应判 False
+                          生产组态 B105 判真 → top1=798（组态差异，但机制相同）
+```
+
+**根因链（工具层）**：
+1. **授权类（CWE-862/639/306/384/352/347）工具层零召回**——已有记载的盲区
+   （无 source 型漏洞：授权缺失/IDOR/会话固定，正则与污点追踪均无能为力）；
+2. 这些样本里的测试惯用硬编码密码（`password="admin123"` 等）被 **B105 召回**，
+   成为**唯一/仅有的可确认候选**；
+3. B105 判真后按 `_aggregate` top1 规则（confirmed 中取最高 severity）成为
+   文件级类型 → 798 盖过样本主类型。
+
+**修复建议（按可改性分级）**：
+
+| 级别 | 建议 | 说明 |
+|---|---|---|
+| P1 可立即修 | `vulnerability_types` 已透出全部 confirmed 类型（多漏洞支持），前端"全部确认漏洞"区已正确显示；但 `vulnerability_type`(top1) 单独出现时前端语义为"该文件漏洞类型"，798 误导主类型 | 过渡方案：无其他 confirmed 候选、且 B105/secret 族为唯一 confirmed 时，前端类型行追加"（含伴生凭证发现）"标注。纯展示，不改判定 |
+| P1 治本 | **授权类 P2 预筛规则**：`@app.route`/Spring `@Mapping` 装饰的 handler，函数体直接返回数据或执行写操作，且函数体+模块级均无 session/token/permission/is_admin 检查特征 → `missing_authz_suspect` 候选交 LLM 裁决 | 六段样本会全部获得 authz 候选进裁决，确认后类型自然正确。**必须过泛化三关 + 87 段回归**（会动 fixed5 候选集合）|
+| 观察 | B105 在"测试代码硬编码密码"上模型本身摇摆（2:1/0:3 都出现）| bandit LOW severity 特征本身成立，不建议工具层压制 B105（typical_06 主漏洞就是 798，一刀切会伤真阳性）|
+
+### 8.6 跨文件 input 文件兜底 FP（2026-08-30 实锤，标注层决策 + 守卫建议）
+
+**现象**：`hard_crossfile_03_input.py`（期望 False，helper 拆分的输入文件）
+生产组态判 **True / CWE-1336**（评估组态 True / CWE-112，两套组态类型漂移但都判真）。
+
+**工具层查证**：`tools=['llm']`——工具层**零召回**，`llm_recheck` 兜底 3:0 全票判真。
+即：这是**无候选 LLM 兜底通道（full_recheck）**的产物，不是工具召回错误。
+
+**归因**：跨文件拆分样本的"input 文件"有输入入口、无本文件危险 sink——
+`_has_param_driven_sink` 守卫的触发条件（无入口+形参驱动 sink）不匹配；
+LLM 单文件视角下数据流不完整仍按"存在风险"判真。
+
+**修复建议**：
+
+| 级别 | 建议 | 说明 |
+|---|---|---|
+| 需回归验证 | 无候选复核路径新增守卫：文件**只有输入入口、工具层零命中、且无危险 sink 调用**时，LLM 判真降级为 review（不判 True）| **风险高**：fixed5 里 24 段真漏洞靠兜底通道判真，此守卫可能误伤；必须 87 段全量对照后才可合并 |
+| 标注层决策 | helper 拆分文件单独算不算漏洞（manifest 说不算；单文件视角下"有输入即风险"是合理推断）| 产品语义与标注语义的分歧，由标签治理定：若维持"不算"，评估时该样本按特例豁免；若算，改 manifest |
+
+### 8.7 组态差异量化（2026-08-30 实测，"同样本同配置不同结果"的用户观察）
+
+`hard_bypass_03_xss_replace`：评估组态（combined_nosource 5056字 prompt）票型摇摆进
+review；生产组态（ALPHA05_PROMPT 1982字 + triage_aligned）干净判 True/CWE-79。
+**system prompt + 裁决 schema 差异是主要变量**，temperature=0.7×N=3 采样叠加放大。
+待办：typical_08（94/95）、typical_23（1336/79）各跑 3 轮生产组态测翻转率，
+若翻转率 >1/3，考虑生产 temperature 0.7→0.3（投票内多样性仍存，判定稳定性提升）。
+
+### 8.8 P2 预筛规则设计草案：`missing_authz_suspect`（2026-08-30，治 798 抢占的治本项）
+
+**设计依据**：§8.5 六段实证 + fixed5 时代即已记载的授权类零召回盲区（无 source 型：
+授权缺失/IDOR/会话固定/CSRF，污点追踪与正则均覆盖不到）。
+
+**触发条件（Python 版，全部满足才产出候选）**：
+
+1. handler 形态：函数被 `@app.route` / `@router.get|post|put|delete`（Flask/FastAPI）
+   或类方法被 `@GetMapping/@PostMapping/@RequestMapping`（Java）装饰；
+2. 函数体含敏感操作特征之一：DB 写（execute + INSERT/UPDATE/DELETE 字样）、
+   文件写、`db.query/commit`、返回数据集（query.all()/fetchall() 后 return）、
+   用户数据修改（user.password/email 等属性赋值）；
+3. **全文件无访问控制特征**（模块级+函数体均无）：`session[`、`current_user`、
+   `login_required`、`@token_required`、`permission`、`is_admin`、`role`、
+   `Depends(`、`get_current_user`、`verify_token`。
+
+→ 产出 `category=prefilter, severity=high, taint_type="Missing Authorization"` 候选，
+交 LLM 裁决确认具体族（862 缺失 / 639 IDOR / 384 会话固定 / 352 CSRF / 347 JWT）。
+
+**红线**：
+- 特征 3 的"无访问控制"必须**全文件扫描**——helper 里调用了 `get_current_user()`
+  也算有检查（哪怕主文件没有），防误报；
+- 纯静态页面/公开 API（登录、注册、健康检查路由名）排除；
+- **必须过泛化三关 + 87 段全量回归**（动候选集合，fixed5 24 段兜底样本会转移通道）。
+
+**预期收益**：§8.5 六段全部获得 authz 候选进裁决，模型确认后文件级类型归正；
+同时覆盖 v2_15 训练侧"授权族辨析组"的推理端配套（模型判对类型后工具层不再回拖）。
+
+**独立集验证建议**：在 `testset_cve_fix` 的授权类 CVE（若存在）+ 手工构造 3 段
+安全对照（有 login_required 的同形态 handler）上验证 TP/FP。
+

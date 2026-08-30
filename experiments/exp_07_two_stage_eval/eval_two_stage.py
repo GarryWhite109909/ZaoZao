@@ -451,8 +451,14 @@ def main() -> None:
             "vulnerability_type": r.vulnerability_type,
             "raw_vulnerability_type": r.raw_vulnerability_type,
             "risk_level": r.risk_level,
-            "explanation": (r.explanation or "")[:300],
-            "fix_suggestion": (r.fix_suggestion or "")[:200],
+            # 2026-08-30 补：前端卡片核对需要完整字段——此前 explanation[:300]/
+            # fix[:200] 截断、source/sink 未落盘，导致"卡片逐字段排查"无法闭环
+            # （卡片渲染的是 to_dict() 全文）。vulnerability_types 为多漏洞列表。
+            "source": r.source or "",
+            "sink": r.sink or "",
+            "vulnerability_types": list(r.vulnerability_types or []),
+            "explanation": r.explanation or "",
+            "fix_suggestion": r.fix_suggestion or "",
             "error": r.error,
             "duration": round(dur, 2),
             "stage1": stage1,
@@ -474,6 +480,9 @@ def main() -> None:
                     "vulnerability_type": a.vulnerability_type,
                     "conformal_set": a.conformal_set,
                     "counterfactual": a.counterfactual,
+                    # 2026-08-30 补：位置型候选的锚点回填（卡片"证据链"字段来源）
+                    "src_anchor": getattr(a, "src_anchor", "") or "",
+                    "sink_anchor": getattr(a, "sink_anchor", "") or "",
                 }
                 for a in r.adjudications
             ],
