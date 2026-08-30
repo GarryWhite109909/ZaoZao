@@ -104,6 +104,30 @@ def load_chatml_dataset(path: Path) -> Dataset:
     return Dataset.from_list(records)
 
 
+def assert_no_truncation(dataset, tokenizer, max_seq_length: int, allow: bool = False):
+    """P2-20 硬断言：防止 max_seq_length 不足导致 JSON 结论被静默截断。
+
+    TRL SFTTrainer 对超长样本静默截断——截断点落在 JSON 结论中段时该样本
+    的监督信号直接损坏（v2_12 审计：max_seq_length=2048 时 23.4% 样本 JSON
+    被切掉）。此处在训练前对全量样本做真实分词统计，超限即报错退出。
+    """
+    texts = [tokenizer.apply_chat_template(r["messages"], tokenize=False) for r in dataset]
+    lens = [len(ids) for ids in tokenizer(texts, add_special_tokens=False)["input_ids"]]
+    over = [n for n in lens if n > max_seq_length]
+    if not over:
+        print(f"长度硬断言通过: max={max(lens)} tokens <= max_seq_length={max_seq_length}")
+        return
+    print(f"!! 长度硬断言失败: {len(over)}/{len(lens)} 条样本超过 max_seq_length={max_seq_length}"
+          f"（最长 {max(lens)} tokens），JSON 结论将被截断。")
+    if allow:
+        print("   --allow-truncation 已启用，继续训练（这些样本监督信号损坏，后果自负）。")
+        return
+    print("   处理：调大 --max-seq-length（alpha06_v2_13 清洗后实测上限约 8.1k tokens，"
+          "云端脚本默认 12288 足够；本地默认 2048 必然失败——该数据集应在云端训练），")
+    print("        或确认可接受截断后加 --allow-truncation。")
+    sys.exit(1)
+
+
 def split_train_dev(dataset: Dataset, dev_ratio: float, seed: int = 42) -> tuple[Dataset, Dataset]:
     """按 dev_ratio 分拆训练集与验证集（P0 改造：避免过拟合，按 dev loss 选 best）。
 
@@ -164,6 +188,8 @@ def main():
                         help="启用 DoRA（权重分解为 magnitude+direction，PEFT 0.19+ 支持；"
                              "注意：DoRA + 4bit QLoRA 在 ROCm 上需单独验证兼容性）")
     parser.add_argument("--max-seq-length", type=int, default=2048, help="最大序列长度")
+    parser.add_argument("--allow-truncation", action="store_true",
+                        help="允许超长样本被截断（跳过 P2-20 长度硬断言，不建议）")
     parser.add_argument("--save-steps", type=int, default=50, help="每 N 步保存 checkpoint（防中断丢进度）")
     parser.add_argument("--eval-steps", type=int, default=None,
                         help="每 N 步评估 dev（默认与 save-steps 相同；可调大降低 eval 开销，"
@@ -247,6 +273,9 @@ def main():
             return _orig_apply(*args, **kwargs)
         tokenizer.apply_chat_template = _patched_apply
         print("Qwen3: 已 patch apply_chat_template 默认 enable_thinking=False")
+
+    # P2-20 硬断言：数据集最长样本必须完整放进 max_seq_length，否则 JSON 结论被截断
+    assert_no_truncation(full_dataset, tokenizer, args.max_seq_length, allow=args.allow_truncation)
 
     # 加载模型（4bit 或 fp16）
     bnb_config = try_4bit_quant(use_4bit)
