@@ -25,6 +25,76 @@ MAX_REDIRECTS = 5
 # 允许的 URL scheme
 ALLOWED_SCHEMES = ("http", "https")
 
+# ---------------------------------------------------------------------------
+# 公共库过滤（2026-08-30，URL 扫描提速）：抓取的每个脚本都要过两阶段扫描
+# （3 次 LLM 采样，实测 ~70s/个），第三方公共库（jQuery/GA/bundle 等）不是
+# 站点自有攻击面，全量扫直接把整页扫描拖到数十分钟。按"公共 CDN 域名 +
+# 库名路径关键词"两级模式过滤，只匹配 URL 形态、不猜内容——站点自有代码
+# （/static/app.js 等）不受影响；同名自托管库被过滤也安全（库本身非攻击面）。
+# ---------------------------------------------------------------------------
+# 公共 CDN / 分析统计服务的域名（子域匹配）
+_LIB_HOST_RE = re.compile(
+    r"(?:^|\.)(?:"
+    r"jsdelivr\.net|cdnjs\.cloudflare\.com|unpkg\.com|bootcdn\.net|"
+    r"staticfile\.org|jquery\.com|code\.jquery\.com|jqueryui\.com|"
+    r"ajax\.googleapis\.com|fonts\.googleapis\.com|gstatic\.com|"
+    r"googletagmanager\.com|google-analytics\.com|googlesyndication\.com|"
+    r"doubleclick\.net|cloudflareinsights\.com|bootstrapcdn\.com|"
+    r"connect\.facebook\.net|analytics\.tiktok\.com|snap\.licdn\.com|"
+    r"hm\.baidu\.com|cdn\.cnzz\.com|s\.cnzz\.com|pos\.baidu\.com|"
+    r"matomo\.cloud|piwik\.pro|clarity\.ms|yandex\.ru/metrika|mc\.yandex\.ru|"
+    r"hotjar\.com|fullstory\.com|mouseflow\.com|smartlook\.com|"
+    r"mixpanel\.com|segment\.(?:io|com)|amplitude\.com|heapanalytics\.com|"
+    r"sentry\.io|browser\.sentry-cdn\.com|newrelic\.com|nr-data\.net|"
+    r"bugsnag\.com|rollbar\.com|trackjs\.com|datadoghq\.com|"
+    r"intercom\.(?:io|cdn)|widget\.intercom\.io|static\.zdassets\.com|"
+    r"tawk\.to|disqus\.com|addthis\.com|sharethis\.com|addtoany\.com|"
+    r"recaptcha\.net|google\.com/recaptcha|hcaptcha\.com|turnstile\.cloudflare\.com|"
+    r"js\.stripe\.com|paypal(?:objects)?\.com|checkout\.razorpay\.com|"
+    r"criteo\.com|taboola\.com|outbrain\.com|amazon-adsystem\.com|"
+    r"adsbygoogle\.com|at\.alicdn\.com|gitee\.com/libs|taobao\.com/a\.js"
+    r")$",
+    re.IGNORECASE,
+)
+# 路径/文件名中的库名关键词（词边界防误杀：/myapp/reactive-api.js 不含 react 库形态）
+_LIB_NAME_RE = re.compile(
+    r"(?:^|[/_.-])(?:"
+    r"jquery[\w.-]{0,10}\.min\.js|jquery(?:[-.]ui|-mobile|\.[0-9])?|zepto(?:\.min)?|"
+    r"prototype(?:\.min)?|mootools|backbone(?:\.min)?|underscore(?:\.min)?|"
+    r"lodash(?:\.min)?|moment(?:\.min)?(?:-with-locales)?|dayjs(?:\.min)?|"
+    r"angular(?:\.min)?(?:-animate|-route|-aria)?|react(?:\.production|-dom|\.min)?(?:-dom\.production)?|"
+    r"vue(?:\.runtime)?(?:\.global)?(?:\.prod)?(?:\.min)?|bootstrap(?:\.bundle|\.min)?|"
+    r"popper(?:\.min)?|chart(?:\.umd|\.min)?|echarts(?:\.min)?|d3(?:\.v[0-9]+)?(?:\.min)?|"
+    r"three(?:\.module)?(?:\.min)?|swiper(?:\.bundle)?(?:\.min)?|gsap(?:\.min)?|"
+    r"gtag(?:/js|\.)|gtm\.js|analytics(?:\.js|-debug)?|fbevents\.js|pixel(?:\.min)?\.js|"
+    r"hm\.js|web-sdk|js-sdk|td\.js|ga\.js"
+    r")(?:$|[/?#])",
+    re.IGNORECASE,
+)
+
+
+def is_common_library_url(url: str) -> bool:
+    """判断脚本 URL 是否为公共 CDN 库 / 统计分析脚本。
+
+    仅按 URL 形态（域名 + 路径关键词）判断，不下载内容。
+    纯函数，供 fetcher 过滤与单测复用。
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").rstrip(".").lower()
+        path = parsed.path or ""
+    except ValueError:
+        return False
+    if _LIB_HOST_RE.search(host):
+        return True
+    # 路径关键词：/js/jquery-3.6.0.min.js、/gtag/js?id= 等
+    probe = f"{path.lower()}"
+    if _LIB_NAME_RE.search(probe):
+        return True
+    return False
+
 
 @dataclass
 class FetchedScript:
@@ -45,6 +115,7 @@ class FetchResult:
     title: str = ""
     scripts: list[FetchedScript] = field(default_factory=list)
     inline_html: str = ""  # 含事件处理器的 HTML 片段
+    skipped_libs: list[str] = field(default_factory=list)  # 被公共库过滤跳过的外链
     error: str | None = None
 
     @property
@@ -145,12 +216,15 @@ def _safe_get(session: requests.Session, url: str, timeout: int, redirects_left:
     return resp, None
 
 
-def fetch_url(url: str, timeout: int = 15) -> FetchResult:
+def fetch_url(url: str, timeout: int = 15, skip_common_libs: bool = True) -> FetchResult:
     """抓取目标 URL，提取所有 JS 脚本和可疑 HTML 片段。
 
     Args:
         url: 目标网页 URL
         timeout: 请求超时秒数
+        skip_common_libs: 是否跳过公共 CDN/统计分析库（这些脚本不是站点
+            自有攻击面，却各消耗 3 次 LLM 采样，是 URL 扫描慢的主因）。
+            被跳过的外链记入 result.skipped_libs 供前端提示。
 
     Returns:
         FetchResult，scripts 至少包含 0 个元素。
@@ -204,6 +278,9 @@ def fetch_url(url: str, timeout: int = 15) -> FetchResult:
     for m in src_pattern.finditer(html):
         src_url = m.group(1)
         full_url = urljoin(url, src_url)
+        if skip_common_libs and is_common_library_url(full_url):
+            result.skipped_libs.append(full_url)
+            continue  # 公共库不下载、不进扫描
         js_resp, js_err = _safe_get(session, full_url, timeout)
         if js_err:
             continue  # 外链失败不阻断，跳过

@@ -325,7 +325,11 @@
           <div id="panel-url" role="tabpanel" class="tab-panel hidden">
             <label for="url-input" class="block text-xs text-[var(--vuln-ink-2)] mb-2">目标站点 URL</label>
             <input id="url-input" type="url" class="w-full bg-[var(--vuln-bg)] border border-[var(--vuln-line)] rounded-md p-3 text-sm text-[var(--vuln-ink)] focus:outline-none focus:ring-2 focus:ring-[var(--vuln-brand)]" placeholder="https://example.com/api" />
-            <p class="text-xs text-[var(--vuln-ink-3)] mt-2">将抓取站点内联与外链脚本，逐个做 LLM 安全分析。</p>
+            <div class="flex items-center justify-between mt-3 mb-2">
+              <label for="url-n-samples" class="text-xs text-[var(--vuln-ink-2)]">模型采样次数</label>
+              <input id="url-n-samples" type="number" value="3" min="1" max="10" class="w-20 text-xs bg-[var(--vuln-bg)] border border-[var(--vuln-line)] rounded px-2 py-1 text-[var(--vuln-ink)] focus:outline-none focus:ring-1 focus:ring-[var(--vuln-brand)]" title="每条候选的 LLM 投票次数；越多越稳、越慢。快速巡检设 1 可把单脚本耗时降到约 1/3" />
+            </div>
+            <p class="text-xs text-[var(--vuln-ink-3)] mt-2">将抓取站点内联与外链脚本逐个分析；jQuery/GA 等公共库自动跳过（非站点自有代码）。快速巡检可把采样次数设为 1。</p>
           </div>
           <div id="panel-github" role="tabpanel" class="tab-panel hidden">
             <label for="github-input" class="block text-xs text-[var(--vuln-ink-2)] mb-2">GitHub 仓库地址</label>
@@ -790,6 +794,17 @@
           if (healthAbort) { healthAbort.abort(); healthAbort = null; }
         });
 
+        // 2026-08-30（用户实拍：跳转离开后"接着分析但不出结果"）：导航离开页面
+        // 会终止前端 fetch——后端调度器继续跑完，结果却无人接收。分析进行中
+        // 给出离开提醒（已完成结果有 localStorage 持久化，未完成的那次会丢）。
+        // 彻底方案（后端加"最近结果"查询端点 + 回站拉取）记入待办文档。
+        window.addEventListener('beforeunload', function (e) {
+          if (!interactiveScanning) return;
+          e.preventDefault();
+          e.returnValue = '分析仍在进行中，离开页面将无法收到本次结果';
+          return e.returnValue;
+        });
+
         /* ==================== Progress helpers ==================== */
         var hideProgressTimer = null; /* hideProgress 的延迟隐藏定时器，新扫描开始前必须撤销 */
         function showProgress(indeterminate, text) {
@@ -880,6 +895,11 @@
               // _kind 缺失时不再一律标 error：两阶段结果（含 stage1）的 null
               // 是"需复核"语义，误标会让正常复核决策渲染成失败卡
               if (!r._kind) r._kind = r.stage1 ? 'two-stage' : 'error';
+              // 2026-08-30 迁移补丁：旧版持久化曾把两阶段 null 存成 _kind='error'
+              //（safe_03_subprocess_list 实拍：证据门转复核被旧数据标成"分析失败"，
+              // 恢复后一直显示红色失败卡且无详情）。stage1 结构在 = 两阶段结果，
+              // 纠正为 two-stage（与 isTwoStageResult 的 stage1 兜底口径一致）。
+              if (r._kind === 'error' && r.stage1) r._kind = 'two-stage';
             }
           }
           scanResults.push(r);
@@ -983,7 +1003,6 @@
           /* 分析开始即在结果列表顶部显示「正在分析」占位卡，已有卡片整体下移 */
           interactiveScanning = true;
           renderResults();
-
           var promises = [];
 
           if (useMulti) {
@@ -1130,18 +1149,26 @@
         function analyzeUrl() {
           var url = document.getElementById('url-input').value.trim();
           if (!url) { alert('请输入 URL'); return; }
+          var nSamples = Math.min(10, Math.max(1, parseInt((document.getElementById('url-n-samples') || {}).value, 10) || 3));
           beginRound();
           setBtnLoading(true);
           showProgress(true, '正在抓取站点并分析…');
-          postJSON('/api/url-scan', { url: url }, 'batch').then(function (d) {
+          postJSON('/api/url-scan', { url: url, n_samples: nSamples }, 'batch').then(function (d) {
             setBtnLoading(false);
             if (d.error) { addResult(errorResult(d.error, url)); }
             else {
+              // 公共库过滤可观测：跳过了几个第三方脚本一目了然
+              var skipped = d.skipped_libs || [];
+              if (skipped.length) {
+                showToast('已跳过 ' + skipped.length + ' 个公共库脚本（jQuery/GA 等非站点自有代码）', 'info');
+              }
               // 后端两种响应形态：有脚本时返回 {summary:{results:[...]}}，
               // 无脚本时返回 {results:[], message:"..."}。此处统一兼容。
               var results = d.results || (d.summary && d.summary.results) || [];
               if (results.length) {
                 results.forEach(function (r) { r._kind = 'two-stage'; addResult(r); });
+              } else if (skipped.length) {
+                addResult(safeResult(url, '站点脚本均为公共库（已跳过 ' + skipped.length + ' 个），无自有脚本需要分析'));
               } else {
                 addResult(safeResult(url, d.message || '未找到可分析脚本'));
               }
@@ -1893,12 +1920,18 @@
           recheck_unverified_type_review: '模型全文复核判真，但漏洞类型与代码形态不匹配（防幻觉门槛），转人工复核',
           recheck_incomplete_flow_review: '数据流不完整：本文件无自身输入入口，危险操作由函数参数驱动（helper/库函数，污点来源在调用方）——单文件扫描无法判定安全，需结合调用方人工复核',
           dismissed_incomplete_flow_review: '数据流不完整：工具已召回但模型判为误报，而本文件的危险操作依赖其他文件（helper 型参数驱动，或 sink 位于被调用的自定义模块中）——单文件扫描无法判定安全，需结合调用方或项目级上下文人工复核',
-          no_candidate_safe: '工具层无候选，模型全文复核确认安全'
+          no_candidate_safe: '工具层无候选，模型全文复核确认安全',
+          // 2026-08-30 补（safe_03 实拍）：有候选但被证据门全拦 → decision 仍是
+          // has_candidate_adjudicate，复核原因此前回退到 r.error（"证据门拦截…"），
+          // 语义上这不是失败而是"确定性核验否决了模型票型"，单独给准确文案
+          has_candidate_adjudicate: '模型确认的候选经确定性证据门核验（sink 已有防御特征），按保守策略转人工复核'
         };
 
         function reviewReasonText(r) {
           var dec = (r.stage1 && r.stage1.decision) || '';
           if (RECHECK_REASON[dec]) return RECHECK_REASON[dec];
+          // 证据门拦截文案（后端写入 r.error）本身含"需人工复核"，直接复用为复核原因
+          if (r.error && r.error.indexOf('需人工复核') !== -1) return r.error;
           return r.error || '模型对候选的投票未达一致结论（平票或多数票不足），转人工复核';
         }
 

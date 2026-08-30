@@ -99,3 +99,40 @@ B105 唯一候选误导；但模型侧的深层缺陷是——**没有 authz 候
 **验收口径更新**：7 miss 中工具层 3 段（typical_08/cve_03/crossfile_03_sink）
 随工具层 top1 同源化修复（§8.9）后应归正；训练层 4 段（15/22/30/bypass_08）
 v2_15 验收 = 4 段 3 轮全中。两口径分别验收，不混算。
+
+### 3.4 【2026-08-30 新增】Spring 数据绑定族锚表 + 同配置漂移实锤
+
+**实锤样本**：`hard_cve_05_spring4shell.java`（CVE-2022-22965）。
+同一生产组态两次运行（14:01 vs 17:36）：**3:0 全票判 915 → 3:0 全票判 943**——
+两次全票、结论不同，模型在 915/943/94 三个近邻间无锚漂移（非采样噪声）。
+修复建议同时出现伪修复：`@Valid/@Validated` 挡不住数据绑定攻击（只校验不限制
+绑定）；"在类上添加 @RequestBody"为 API 知识错误（参数级注解）；
+"form.getName() 判空"与漏洞机制无关（无效改动）。
+
+**教师判定锚（嵌入 v2_15 教师 prompt）**：
+
+```
+【Spring 数据绑定族】POJO 参数未注解自动绑定（Spring MVC @PostMapping 方法签名
+  直接写 UserForm form，无 @RequestBody/@ModelAttribute/@InitBinder 白名单）
+  1. 本质 = 攻击者可提交任意前缀参数写入对象属性（class.module.classLoader...
+     可达 Tomcat 配置 → 写 AccessLogValve → webshell，即 Spring4Shell/CVE-2022-22965）
+     → 915（动态属性注入）；表单绑定到模型属性 + 输出未转义 → 94/79 伴生
+  2. 943（数据查询逻辑）与本族无关——绑定不是查询；出现 943 即错
+  3. 正确修复只允许：@InitBinder(setAllowedFields/disallowedFields) 白名单、
+     DTO + allowlist 拷贝、@ModelAttribute(binding=true) 显式收窄；
+     @Valid/@Validated 只做校验不限制绑定 → 无效修复禁止；
+     @RequestBody/@ModelAttribute 是参数级注解，"加在类上"为 API 错误禁止
+  4. 危害叙事必须含"任意属性写入/可达 classLoader"（RCE 路径），
+     不得弱化为"信息泄露/异常"
+```
+
+**配套验收**：cve_05 三轮 temp=0.7 全中 915 且 explanation 含"属性写入/classLoader"
+锚句；修复建议出现 setAllowedFields 才算入库生效。
+
+**补充蒸馏方向**：alpha05 训练集中 Spring/Java 框架形态占比低（工具层同域盲区
+互证），v2_15 定向补 Spring 绑定族（915 主 + 94/79 伴生 + 943 反例）≥8 条，
+跨形态（@Controller vs @RestController、字段级/构造级绑定）。
+
+**演示截图建议（项目负责人口径）**：该样本在"同配置漂移"解决前**不得**作为
+stable 展示样例（14:01 单次运行判 915 的"最稳"结论已被 17:36 实拍推翻——
+单次运行不能作为稳定性依据，见工具层文档 §8.7）。

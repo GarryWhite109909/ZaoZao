@@ -226,6 +226,128 @@ class VLLMClient:
                 "error": f"{type(e).__name__}: {e}",
             }
 
+    def generate_n(
+        self,
+        prompt: str,
+        n: int,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = 2048,
+        keep_alive=0,
+        timeout: int = 300,
+        num_ctx: int = 16384,
+        num_gpu: Optional[int] = None,
+        num_thread: Optional[int] = None,
+        think: Optional[bool] = None,
+        format: Optional[Union[str, dict]] = None,
+    ) -> List[Dict]:
+        """一次请求生成 n 条独立采样（OpenAI 兼容 n 参数）。
+
+        供两阶段扫描的多票裁决复用：此前 N 次采样 = N 次串行请求，
+        每次 pay 全量 prefill；vLLM 服务端对同一 prompt 的 n 条采样共享
+        prefill（PagedAttention + parallel sampling），吞吐提升显著。
+
+        Args:
+            n: 采样条数（1~10）；n<=1 或 temperature<=0 时退化为循环
+               generate()（OpenAI 语义下 n>1 需要 temperature>0）。
+            其余参数与 generate() 一致（keep_alive/num_ctx/num_gpu/num_thread/
+            think 为兼容占位，vLLM 侧 no-op）。
+
+        Returns:
+            list[dict]，每项与 generate() 返回结构相同（text/duration/tokens/
+            meta/error）。服务端异常时整体退化为循环 generate()，单条失败时
+            该项 error 非空——调用方按逐票无效处理，语义与循环版一致。
+        """
+        n = max(1, min(int(n), 10))
+        # n<=1 无批量收益；temperature<=0（贪心）与 n>1 组合在 OpenAI 语义下
+        # 非法（vLLM 会拒绝），且贪心采样 n 票必然相同、无自一致率意义
+        if n <= 1 or temperature is None or temperature <= 0:
+            return [
+                self.generate(
+                    prompt=prompt, system_prompt=system_prompt,
+                    temperature=temperature, max_tokens=max_tokens,
+                    keep_alive=keep_alive, timeout=timeout, num_ctx=num_ctx,
+                    num_gpu=num_gpu, num_thread=num_thread, think=think,
+                    format=format,
+                )
+                for _ in range(n)
+            ]
+
+        start_time = time.time()
+        try:
+            messages: List[Dict[str, str]] = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+
+            payload: Dict = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature,
+                "n": n,
+                "stream": False,
+            }
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens
+            if format is not None:
+                payload["guided_json"] = format if isinstance(format, dict) else "json"
+
+            resp = requests.post(self.api_chat, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+
+            choices = data.get("choices", [])
+            usage = data.get("usage", {})
+            prompt_count = usage.get("prompt_tokens", 0)
+            # completion_tokens 是全部 n 条的总和，按条均摊供逐票统计参考
+            completion_count = usage.get("completion_tokens", 0)
+            duration = time.time() - start_time
+
+            results: List[Dict] = []
+            for choice in choices:
+                msg = choice.get("message", {}) or {}
+                results.append({
+                    "text": msg.get("content", ""),
+                    "duration": duration,
+                    "tokens": {
+                        "prompt": prompt_count // max(len(choices), 1),
+                        "completion": completion_count // max(len(choices), 1),
+                        "total": (prompt_count + completion_count) // max(len(choices), 1),
+                    },
+                    "meta": {
+                        "id": data.get("id"),
+                        "model": data.get("model"),
+                        "finish_reason": choice.get("finish_reason"),
+                        "usage": usage,
+                        "backend": "vllm",
+                        "batched_n": n,
+                    },
+                    "error": None,
+                })
+            # 服务端返回条数不足（极端情况）时，缺失票按 error 占位，
+            # 调用方按 invalid 票处理，保持票数对齐 n
+            while len(results) < n:
+                results.append({
+                    "text": "", "duration": duration,
+                    "tokens": {"prompt": 0, "completion": 0, "total": 0},
+                    "meta": {"backend": "vllm", "batched_n": n},
+                    "error": "vllm 返回采样数不足",
+                })
+            return results
+        except Exception as e:
+            # 整体失败退化为循环 generate：批量路径故障不改变扫描可用性
+            print(f"[VLLMClient] generate_n 失败，退化为逐条采样: {e}")
+            return [
+                self.generate(
+                    prompt=prompt, system_prompt=system_prompt,
+                    temperature=temperature, max_tokens=max_tokens,
+                    keep_alive=keep_alive, timeout=timeout, num_ctx=num_ctx,
+                    num_gpu=num_gpu, num_thread=num_thread, think=think,
+                    format=format,
+                )
+                for _ in range(n)
+            ]
+
     def generate_structured(
         self,
         prompt: str,
