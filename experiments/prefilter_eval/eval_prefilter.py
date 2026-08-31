@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -33,7 +34,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from graduation_project.prefilter import Prefilter  # noqa: E402
+from graduation_project.prefilter import Prefilter, PREFILTER_RULE_INFO  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 测试集定位
@@ -47,20 +48,31 @@ OUTPUT_DIR = PROJECT_ROOT / "experiments/prefilter_eval/results"
 # ---------------------------------------------------------------------------
 # prefilter 规则名 → CWE 映射
 # ---------------------------------------------------------------------------
-# 依据 prefilter.py 中 _build_vuln_rules 的规则语义建立。
-# 安全规则不对应 CWE（命中即判安全，不参与 strict_TP 的 CWE 校验）。
-RULE_TO_CWE: dict[str, str] = {
-    "sqli_string_concat": "CWE-89",
-    "sqli_fstring": "CWE-89",
-    "sqli_percent_format": "CWE-89",
-    "cmd_os_system_concat": "CWE-78",
-    "cmd_subprocess_shell_concat": "CWE-78",
-    "rce_eval_request": "CWE-95",
-    "path_traversal_open_concat": "CWE-22",
-    # hardcoded_secret 已降级为安全抑制标记（不判 True），不参与 strict_TP 的 CWE 校验
-    "deser_pickle_loads": "CWE-502",
-    "deser_yaml_unsafe_load": "CWE-502",
-}
+# 【2026-08-31 修正】原为手工维护的独立副本（仅 9 条），随 prefilter 新增规则
+# 持续漂移：32 条漏洞规则中 23 条未登记，导致严格口径把它们全部计成
+# "CWE 不匹配"——实测 87 段里 25 例不匹配**全部**是命中规则为空，即规则已正确
+# 命中并判对方向（29/29 TP、0 FP），只是评测器不认识规则名。
+# 这是**度量缺陷**而非工具缺陷，会把 prefilter 的真实能力系统性低估
+# （strict_accuracy 0.324 实为虚低）。
+#
+# 改为从 prefilter 自身的 PREFILTER_RULE_INFO 派生（单一真源）：规则新增时
+# 只需在 prefilter 里登记 cwe 字段，评测自动覆盖，不再存在两份表漂移。
+# 安全规则（category=safe）不对应 CWE，命中即判安全，不参与 strict_TP 的 CWE 校验。
+_CWE_PREFIX_RE = re.compile(r"CWE-\d+", re.IGNORECASE)
+
+
+def _build_rule_to_cwe() -> dict[str, str]:
+    """从 PREFILTER_RULE_INFO 派生 规则名→CWE 映射（取 'CWE-611 xxx' 的编号部分）。"""
+    out: dict[str, str] = {}
+    for rule_name, meta in PREFILTER_RULE_INFO.items():
+        cwe_raw = (meta or {}).get("cwe", "")
+        m = _CWE_PREFIX_RE.search(cwe_raw or "")
+        if m:
+            out[rule_name] = m.group(0).upper()
+    return out
+
+
+RULE_TO_CWE: dict[str, str] = _build_rule_to_cwe()
 
 
 def read_sample_code(samples_dir: Path, filename: str) -> str | None:

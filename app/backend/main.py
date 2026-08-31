@@ -69,6 +69,7 @@ from app.backend.services.scheduler import (
 # 核心层能力（两阶段扫描 / 外部工具 / 修复验证 / vLLM；多模型投票在业务服务层）
 from graduation_project.external_scanner import ExternalScanner
 from graduation_project.two_stage_scanner import TwoStageScanner, tool_recall_monitor_snapshot
+from graduation_project.risk_budget import allocate, plan_to_files, BudgetPlan
 from graduation_project.fix_verifier import FixVerifier, validate_fix_suggestion
 from app.backend.services.multi_model_scanner import MultiModelScanner
 from graduation_project.vllm_client import VLLMClient
@@ -226,6 +227,23 @@ MAX_SINGLE_FILE_BYTES = 2 * 1024 * 1024         # 单文件大小上限（2MB）
 MAX_BATCH_TOTAL_BYTES = 10 * 1024 * 1024        # 批量总大小上限（10MB）
 
 # ---------------------------------------------------------------------------
+# 仓库遍历收集阶段的硬上限（2026-08-31）
+# ---------------------------------------------------------------------------
+# 只用于防超大仓库把内存吃光，**不是扫描预算**——扫描扫谁由 risk_budget
+# 按风险分决定。上限须远大于 max_files（默认 50），否则又退化成"按遍历顺序
+# 截断"：排序只能在前 N 个里排，auth/ 目录仍可能未被收集到。
+COLLECT_HARD_CAP_FILES = 3000
+COLLECT_HARD_CAP_BYTES = 200 * 1024 * 1024      # 200MB
+
+# 批量场景（URL / GitHub / 工作区）的无候选复核策略。
+# "targeted"（默认）：三档定向复核——按"文件风险分 × 盲区命中"分配注意力，
+#   零盲区文件不送 LLM。大仓库下替代 full_recheck（后者对每个无候选文件都做
+#   全文件 × min(3,n) 票，成本随文件数线性爆炸）。
+# "full_recheck"：回退旧行为（每个无候选文件全量复核），供 A/B 对比与论文消融。
+BATCH_NO_CANDIDATE_MODE = os.environ.get(
+    "VULN_SCANNER_BATCH_RECHECK_MODE", "targeted")
+
+# ---------------------------------------------------------------------------
 # Pydantic 请求模型
 # ---------------------------------------------------------------------------
 
@@ -245,6 +263,9 @@ class UrlScanRequest(BaseModel):
     # 是否跳过公共 CDN/统计分析库脚本（默认开：这些库不是站点自有攻击面，
     # 却各消耗采样预算；关掉恢复旧全量行为）
     skip_common_libs: bool = True
+    # 脚本数预算（2026-08-31）：None/0 = 不限（页面脚本通常不多，默认全扫）。
+    # 超限时按风险分从高到低取，未覆盖脚本在 budget.uncovered_sample 回报。
+    max_scripts: Optional[int] = Field(None, ge=1, le=500)
 
 
 class GithubScanRequest(BaseModel):
@@ -253,6 +274,10 @@ class GithubScanRequest(BaseModel):
     max_files: int = Field(50, ge=1, le=500)  # 限制扫描文件数，避免大仓库超时
     # 与 URL 扫描同语义：每文件 LLM 采样次数（None 用全局默认 3）
     n_samples: Optional[int] = Field(None, ge=1, le=10)
+    # 同构文件折叠（2026-08-31）：结构指纹完全相同的文件（复制粘贴的 CRUD /
+    # vendored 多语言副本）只扫代表文件，省下的预算给其它文件。默认开；
+    # 关掉则每个文件都扫（更慢，但覆盖完整）。
+    fold_duplicates: bool = True
 
 
 class ExternalScanRequest(BaseModel):
@@ -1079,21 +1104,59 @@ async def batch_scan(
 # ---------------------------------------------------------------------------
 # 逐文件调度扫描（替代 Scanner.scan_files，支持优先级让路）
 # ---------------------------------------------------------------------------
+def _apply_scan_budget(
+    files: list[tuple[str, str, str]],
+    max_files: Optional[int] = None,
+    fold_duplicates: bool = True,
+) -> tuple[list[tuple[str, str, str]], BudgetPlan]:
+    """在扫描预算内按文件风险分从高到低选取，未覆盖者显式回报。
+
+    替代此前的"按遍历顺序取前 N 个"：大仓库里高危文件（auth/api/payment）
+    常排在低危文件之后，顺序截断会让它们压根进不了扫描。
+
+    Returns:
+        (selected_files, plan)。plan.uncovered / plan.folded 供 API 回报
+        "哪些文件没扫到"——预算外文件也是"没扫到"，必须可被审计，
+        与 suppressed_by_registry / dropped_unowned 的留痕原则同构。
+    """
+    plan = allocate(files, max_files=max_files, fold_duplicates=fold_duplicates)
+    return plan_to_files(plan, files), plan
+
+
+def _budget_summary(plan: BudgetPlan, limit: int = 20) -> dict:
+    """预算分配的可展示摘要（供 API 响应与前端展示）。"""
+    return {
+        "selected": len(plan.selected),
+        "uncovered": len(plan.uncovered),
+        "folded_duplicates": len(plan.folded),
+        # 未覆盖文件路径（截断展示）——"扫了谁、没扫谁"必须对用户可见
+        "uncovered_sample": [f.path for f in plan.uncovered[:limit]],
+        # 最高风险文件及其分项依据，供审计"为什么是这些文件"
+        "top_risk": [f.to_dict() for f in plan.selected[:10]],
+    }
+
+
 async def _scan_files_scheduled(
     files: list[tuple[str, str, str]],
     use_rag: Optional[bool],
     client_id: str,
     priority: int = PRIORITY_LOW,
     n_samples: Optional[int] = None,
+    no_candidate_mode: Optional[str] = None,
 ) -> BatchResult:
     """逐文件提交到调度器，等待结果汇总。
 
     批量场景（URL / GitHub / 工作区）每个文件以 LOW 优先级入队，
     交互式扫描（HIGH）可随时插队，避免批量任务饿死单文件请求。
-    URL/GitHub 属于安全关键场景：显式 full_recheck（现为全局默认，此处保留
-    显式传参以文档化意图），消除"工具层无候选 → 静默判安全"的漏报风险。
     n_samples 透传请求级采样数（None 用全局默认 3；URL/GitHub 巡检可传 1）。
+
+    no_candidate_mode（2026-08-31）：批量场景的无候选复核策略，默认取
+    BATCH_NO_CANDIDATE_MODE（"targeted" 三档定向复核）。大仓库下 full_recheck
+    对每个无候选文件都做全文件 × min(3,n) 票，成本随文件数线性爆炸；
+    targeted 按"文件风险分 × 盲区命中"分配注意力，零盲区文件不送 LLM。
+    设为 VULN_SCANNER_BATCH_RECHECK_MODE=full_recheck 可回退旧行为做 A/B。
     """
+    mode = no_candidate_mode or BATCH_NO_CANDIDATE_MODE
     batch = BatchResult(total_files=len(files))
     batch_start = time.time()
     for filename, language, code in files:
@@ -1101,7 +1164,7 @@ async def _scan_files_scheduled(
             priority, client_id,
             lambda fn=filename, lg=language, cd=code: _two_stage_scan(
                 cd, lg, fn, use_rag=use_rag,
-                no_candidate_mode="full_recheck",
+                no_candidate_mode=mode,
                 n_samples=n_samples,
             ),
             description=f"scan:{filename}",
@@ -1156,7 +1219,12 @@ async def url_scan(req: UrlScanRequest, request: Request):
          s.language, s.content)
         for s in fetch_result.scripts
     ]
-    batch = await _scan_files_scheduled(files, req.use_rag, client_id, n_samples=req.n_samples)
+    # 与仓库场景同：按风险分排序（高危脚本先扫），预算外脚本显式回报。
+    # 页面脚本数量通常远小于仓库，max_files 默认不设限（全部都扫），
+    # 但排序仍让"最可疑的脚本"排在前面——用户在流式中先看到高价值结果。
+    selected, plan = _apply_scan_budget(files, max_files=req.max_scripts or None)
+    batch = await _scan_files_scheduled(
+        selected, req.use_rag, client_id, n_samples=req.n_samples)
     global _last_batch
     with _stats_lock:
         _last_batch = batch
@@ -1168,6 +1236,7 @@ async def url_scan(req: UrlScanRequest, request: Request):
         "total_scripts": fetch_result.total_scripts,
         # 被公共库过滤跳过的外链（前端提示；skip_common_libs=False 时为空）
         "skipped_libs": fetch_result.skipped_libs,
+        "budget": _budget_summary(plan),
         "summary": batch.to_dict(),
     }
 
@@ -1210,7 +1279,14 @@ def _clone_and_collect(req: GithubScanRequest) -> tuple[Optional[str], Optional[
     except FileNotFoundError:
         return tmp_dir, None, JSONResponse({"error": "系统未安装 git"}, status_code=500)
 
+    # 遍历阶段**不做 max_files 截断**（2026-08-31 修复：此前 os.walk 顺序取前
+    # max_files 即 break，是盲目截断——大仓库里 utils/、models/ 常排在 auth/、
+    # api/ 之前，高危文件压根没进扫描）。改为"全量收集 → 按风险分排序 → 预算
+    # 内选取"，由 risk_budget.allocate 决定扫谁、未覆盖者显式回报。
+    # 收集阶段仍有硬上限（防超大仓库把内存吃光），但上限远高于扫描预算，
+    # 保证"选谁扫"由风险分决定而非遍历顺序。
     code_files = []
+    collected_bytes = 0
     for root, _dirs, fnames in os.walk(clone_target):
         # 按路径段精确匹配跳过依赖/版本目录（子串匹配会误伤 x.gitlab 等合法目录名）
         if set(Path(root).parts) & {".git", "node_modules", "vendor", "__pycache__"}:
@@ -1225,11 +1301,14 @@ def _clone_and_collect(req: GithubScanRequest) -> tuple[Optional[str], Optional[
                     content = fp.read()
                 rel_path = os.path.relpath(fpath, clone_target)
                 code_files.append((rel_path, EXT_TO_LANG[ext], content))
+                collected_bytes += len(content)
             except Exception:
                 continue
-            if len(code_files) >= req.max_files:
+            if (len(code_files) >= COLLECT_HARD_CAP_FILES
+                    or collected_bytes >= COLLECT_HARD_CAP_BYTES):
                 break
-        if len(code_files) >= req.max_files:
+        if (len(code_files) >= COLLECT_HARD_CAP_FILES
+                or collected_bytes >= COLLECT_HARD_CAP_BYTES):
             break
 
     return tmp_dir, code_files, None
@@ -1248,8 +1327,14 @@ async def github_scan(req: GithubScanRequest, request: Request):
         if not code_files:
             return {"repo": req.repo_url, "message": "仓库中未找到支持的代码文件"}
 
+        # 按风险分在预算内选取（替代 os.walk 顺序截断）：高危文件优先获得
+        # 扫描注意力，预算外的文件在响应里显式回报（不静默丢弃）。
+        selected, plan = _apply_scan_budget(
+            code_files, max_files=req.max_files,
+            fold_duplicates=req.fold_duplicates,
+        )
         batch = await _scan_files_scheduled(
-            code_files, req.use_rag, client_id, n_samples=req.n_samples,
+            selected, req.use_rag, client_id, n_samples=req.n_samples,
         )
         global _last_batch
         with _stats_lock:
@@ -1258,7 +1343,9 @@ async def github_scan(req: GithubScanRequest, request: Request):
 
         return {
             "repo": req.repo_url,
-            "scanned_files": len(code_files),
+            "scanned_files": len(selected),
+            "repo_files_total": len(code_files),
+            "budget": _budget_summary(plan),
             "summary": batch.to_dict(),
         }
     finally:

@@ -51,6 +51,32 @@ _SEMANTIC_TO_CWE = {
     # md5(password) 归 916；而 bandit B324 / semgrep 只能到"用了弱算法"这一粒度
     # （327）。标准答案按精确分类记 916，此处双编号以对齐工具能力。
     "weak cryptography": "327|916",
+    # 2026-08-31 补：新增 4 条 prefilter 规则对应的语义名（VFlask 真盲区定向修复）。
+    # 语义名取自 PREFILTER_RULE_INFO 的 taint_type，与 CWE 一一对应无歧义。
+    "improper verification of cryptographic signature": "347",
+    "information exposure through error message": "209",
+    # 209（错误信息泄露）与 312（敏感信息明文存储）常有交集：异常里带敏感数据。
+    # 二者是不同 CWE，但语义近邻，允许互相匹配——判定时以标准答案为准。
+    "cleartext storage of sensitive information": "312|311",
+    "unrestricted file upload": "434",
+    # 2026-08-31 补（exp_01 审计实锤，§9.8 同型——测量工具先于引擎）：
+    # detect-secrets 的 rule_id 是**插件 type 名**（Secret Keyword / AWS Access Key /
+    # Hex High Entropy String / Private Key…），语义全是"硬编码密钥"。修复
+    # detect-secrets 绝对路径缺陷后该工具首次产出候选，随即暴露本缺口
+    # （hardcoded_secret_02.java 的 Secret Keyword 被判 B，实为类型正确）。
+    "secret keyword": "798",
+    "aws access key": "798",
+    "hex high entropy string": "798",
+    "base64 high entropy string": "798",
+    "private key": "798",
+    "basic auth": "798",
+    "generic api key": "798",
+    # 2026-08-31 补（NodeGoat 审计实锤，§9.8 同型）：
+    # "insecure cookie"——semgrep express-cookie-settings 族的推断类型；
+    # no-httponly 精确分类 1004、no-secure 精确分类 614（同为 cookie flag
+    # 缺陷语义族，工具粒度只有"缺配置"一档，双编号对齐）。
+    "insecure cookie": "1004|614",
+    "nosql injection": "943",
 }
 
 
@@ -75,8 +101,16 @@ def collect_raw_candidates(ts, code: str, lang: str, fname: str) -> tuple[list, 
     """复刻 _stage1_recall 内部流程但保留中间态：原始候选 / 剔除+抑制后 / 最终去重。
 
     返回 (raw, after_drop, final)。after_drop 相对 raw 的差集 = 剔除/抑制的贡献。
+
+    2026-08-31 修复：召回维度失败不再静默——cve_fix 首轮审计曾因 __new__ 绕过
+    构造导致 _taint_recall 内部状态缺失、AttributeError 被吞，四路里两路全军
+    覆没，产出"A 盲区"假阳性（cve_fix_0009 的 SQL 实际被 taint_tracker 直调
+    召回）。现改为：taint 直接用 TaintTracker 独立实例（不依赖 scanner 内部
+    状态）；任何维度失败抛 RuntimeError fail-loud——审计工具自身故障必须
+    显式暴露，否则"A 盲区"结论全是假的。
     """
     from concurrent.futures import ThreadPoolExecutor
+    from graduation_project.taint_tracker import TaintTracker
 
     def _semgrep():
         if ts.use_semgrep:
@@ -84,9 +118,25 @@ def collect_raw_candidates(ts, code: str, lang: str, fname: str) -> tuple[list, 
         return []
 
     def _taint():
-        if ts._taint_tracker_enabled():
-            return ts._taint_recall(code, lang, fname)
-        return []
+        # 复刻 scanner._taint_recall 的 TaintPath→ToolFinding 归一化
+        # （two_stage_scanner.py:2030-2052 同款），保证 drop/dedupe/审计行
+        # 拿到的都是带 rule_id/tool/severity 的统一候选结构
+        paths = TaintTracker().trace(code, lang, fname)
+        from graduation_project.two_stage_scanner import (
+            ToolFinding, _SEVERITY_BY_TYPE)
+        return [ToolFinding(
+            rule_id=f"taint_tracker:{p.taint_type}",
+            category="taint",
+            source=p.source,
+            sink=p.sink,
+            taint_type=p.taint_type,
+            source_line=p.source_line,
+            sink_line=p.sink_line,
+            path=list(p.propagation),
+            severity=_SEVERITY_BY_TYPE.get(p.taint_type, "medium"),
+            tool="taint_tracker",
+            evidence="TaintTracker AST 污点分析定位的同文件 source→sink 路径",
+        ) for p in paths]
 
     def _prefilter():
         if ts._prefilter is not None:
@@ -99,18 +149,20 @@ def collect_raw_candidates(ts, code: str, lang: str, fname: str) -> tuple[list, 
         return []
 
     raw = []
+    failures = []
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for fut in [pool.submit(fn) for fn in (_semgrep, _taint, _prefilter, _external)]:
+        for name, fut in zip(("semgrep", "taint", "prefilter", "external"),
+                             [pool.submit(fn) for fn in (_semgrep, _taint, _prefilter, _external)]):
             try:
                 raw.extend(fut.result())
             except Exception as e:
-                print(f"  [召回维度失败] {e}")
+                failures.append(f"{name}: {type(e).__name__}: {e}")
+    if failures:
+        raise RuntimeError(
+            f"召回维度故障（审计结果无效）[{fname}]: " + "; ".join(failures))
 
     dropped = ts._drop_irrelevant_positional(list(raw))
     final = ts._dedupe(ts._apply_signal_registry(dropped))
-
-    def key(f):
-        return (f.rule_id, f.sink_line or f.source_line, f.taint_type)
 
     after_drop = dropped
     return raw, after_drop, final
@@ -126,14 +178,24 @@ def candidate_rows(raw, after_drop, final) -> list[dict]:
     其实正确、只是没写回字段"的候选误判成 B 类型错标（VFlask 实锤：B608 明明
     能推断出 SQL Injection，却被算成错标）。故此处同步计算并供判定使用。
     """
+    from collections import Counter
     from graduation_project.two_stage_scanner import TwoStageScanner
-    final_keys = {(f.rule_id, f.sink_line or f.source_line, f.taint_type) for f in final}
+    # 【2026-08-31 修正】原用「键是否在 final 集合里」判定去向，而键由
+    # (rule_id, 行, 类型) 构成——被 _dedupe 合并掉的那条与保留下来的那条
+    # **键完全相同**，于是两条原始候选都被标成"进裁决"，凭空多出一倍候选，
+    # 并连锁触发"重复候选"误报（dvna L39 实测：final 实为 1 条却显示 2 条进裁决）。
+    # 改为**计数配额**：某键在 final 中出现 n 次，则 raw 中该键的前 n 条算
+    # 进裁决，其余算被合并——这与 _dedupe 的实际语义一致。
+    final_quota = Counter(
+        (f.rule_id, f.sink_line or f.source_line, f.taint_type) for f in final)
     drop_keys = {(f.rule_id, f.sink_line or f.source_line, f.taint_type) for f in after_drop}
+    used: Counter = Counter()
     rows = []
     for f in raw:
         k = (f.rule_id, f.sink_line or f.source_line, f.taint_type)
-        if k in final_keys:
+        if used[k] < final_quota[k]:
             fate = "进裁决"
+            used[k] += 1
         elif k in drop_keys:
             fate = "去重合并"
         else:
@@ -156,9 +218,23 @@ def audit_expected(rec: dict, rows: list[dict], final) -> list[dict]:
         exp_cwe = exp.get("cwe", "")
         exp_num = exp_cwe.replace("CWE-", "")
         exp_line = exp.get("line", 0)
-        covering = [r for r in rows
-                    if r["fate"] != "被剔除/抑制"
-                    and abs(r["line"] - exp_line) <= 2]
+        # 行号未知（适配自 exp_04/cve_fix 等无行号 manifest，line=0）时退化为
+        # 纯类型匹配——2026-08-31 修复：此前 abs(候选行-0)<=2 恒假，cve_fix 20 段
+        # 全部假"盲区"（实际 taint_tracker 对 0009 有 SQL L17 召回）
+        if exp_line:
+            covering = [r for r in rows
+                        if r["fate"] != "被剔除/抑制"
+                        and abs(r["line"] - exp_line) <= 2]
+            dropped_rel = [r for r in rows
+                           if r["fate"] == "被剔除/抑制"
+                           and abs(r["line"] - exp_line) <= 2]
+        else:
+            type_all = [r for r in rows
+                        if exp_num in _types_to_cwes(" ".join(
+                            [r["taint_type"], r["rule_id"],
+                             r.get("inferred_type") or ""]))]
+            covering = [r for r in type_all if r["fate"] != "被剔除/抑制"]
+            dropped_rel = [r for r in type_all if r["fate"] == "被剔除/抑制"]
         # 判定口径：原始类型 + 推断后类型 + 规则号（2026-08-31）。
         # 只看原始 taint_type 会把"字段未写回但推断正确"的候选误判为 B，
         # 与生产 _dedupe 的语义族口径不一致（详见 candidate_rows 文档）。
@@ -175,9 +251,7 @@ def audit_expected(rec: dict, rows: list[dict], final) -> list[dict]:
         out.append({"cwe": exp_cwe, "line": exp_line, "note": exp.get("note", ""),
                     "verdict": verdict,
                     "covering": covering,
-                    "dropped_covering": [r for r in rows
-                                         if r["fate"] == "被剔除/抑制"
-                                         and abs(r["line"] - exp_line) <= 2]})
+                    "dropped_covering": dropped_rel})
     # C 类：与任何 expected 行不沾边的进裁决候选 = 无关候选（人工定性）
     exp_lines = [e.get("line", 0) for e in rec.get("expected_findings") or []]
     unrelated = [r for r in rows
@@ -260,10 +334,17 @@ def check_candidate_reasonable(cand: dict, code: str) -> dict:
 
 
 def dedupe_check(rows: list[dict]) -> list[dict]:
-    """问 4 聚合版：同文件内 规则+类型+行 完全相同的重复候选。"""
-    seen = {}
+    """问 4 聚合版：同文件内 规则+类型+行 完全相同的重复候选。
+
+    只统计**最终进裁决**的候选（2026-08-31 修正）：被 _dedupe 合并掉的原始
+    候选与保留项键相同，若一并统计会把"合并成功"误报成"去重失败"。
+    去重失败的判据应是"最终列表里仍存在重复"，而非"原始列表里有同键项"。
+    """
+    seen: dict = {}
     dup = []
     for r in rows:
+        if r.get("fate") != "进裁决":
+            continue
         k = (r["rule_id"], r["taint_type"], r["line"])
         seen[k] = seen.get(k, 0) + 1
         if seen[k] == 2:
@@ -364,6 +445,24 @@ def main() -> None:
 
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     repo = Path(args.repo_dir)
+    # 格式适配（2026-08-31）：两种 manifest 统一为 files 列表
+    #   - 仓库基准格式：{"repo":..., "files":[{file, language, expected_findings...}]}
+    #   - exp_04 单文件格式：[{file, language, expected_cwe, expected_present, ...}]
+    if "files" not in manifest:
+        flat = manifest if isinstance(manifest, list) else manifest.get("samples", [])
+        manifest = {
+            "repo": args.manifest,
+            "files": [{
+                "file": r.get("file", ""),
+                "language": (r.get("language") or "python").lower(),
+                "expected_present": r.get("expected_present", True),
+                "expected_findings": (
+                    [{"cwe": f"CWE-{n}", "line": 0,
+                      "note": r.get("expected_vulnerability", "")}
+                     for n in re.findall(r"CWE-(\d+)", r.get("expected_cwe") or "")]
+                    if r.get("expected_present") else [])
+            } for r in flat if isinstance(r, dict) and r.get("file")]
+        }
     targets = [r for r in manifest["files"]
                if not args.file or r["file"] == args.file]
     print(f"审计 {len(targets)} 个文件（零 LLM，纯工具层）")

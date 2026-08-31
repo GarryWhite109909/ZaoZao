@@ -336,9 +336,26 @@ def cmd_batch(args: argparse.Namespace) -> int:
         print(f"  {colorize('提示:', YELLOW)} 目录中未找到支持的代码文件: {args.directory}")
         return 1
 
+    # 超限时按**文件风险分**排序后取前 N（2026-08-31）。此前是 files[:limit]
+    # 按遍历顺序截断——大仓库里 utils/、models/ 常排在 auth/、api/ 之前，
+    # 高危文件会被"限流"掉。风险分是纯确定性的（路径语义 + 公开漏洞形态词表），
+    # 不消耗 LLM，与 Web 端 /api/github-scan 的预算调度同口径。
     if args.limit and len(files) > args.limit:
-        print(f"  {colorize('提示:', YELLOW)} 文件数 {len(files)} 超过上限 {args.limit}，仅扫描前 {args.limit} 个")
-        files = files[: args.limit]
+        from graduation_project.risk_budget import score_file
+        scored = []
+        for fp in files:
+            try:
+                content = fp.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            rel = fp.relative_to(args.directory) if Path(args.directory) in fp.parents else fp
+            scored.append((score_file(str(rel), detect_language(str(fp)), content).score,
+                           str(rel), fp))
+        scored.sort(key=lambda t: (-t[0], t[1]))
+        files = [t[2] for t in scored[: args.limit]]
+        print(f"  {colorize('提示:', YELLOW)} 文件数 {len(scored)} 超过上限 {args.limit}，"
+              f"已按风险分排序，扫描风险最高的 {len(files)} 个"
+              f"（最高分 {scored[0][0]:.1f} = {scored[0][1]}）")
 
     scanner = build_scanner(args)
 

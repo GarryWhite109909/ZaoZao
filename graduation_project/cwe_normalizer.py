@@ -48,6 +48,28 @@ _CWE_BY_KEYWORD: list[tuple[tuple[str, ...], str]] = [
     # 2026-08-18 补：LDAP 注入（87 集 typical_24 / CVE-fix cve_fix_0002 均覆盖；
     # 模型常语义对"LDAP注入"但编号记错成 CWE-89）。
     (("ldap injection", "ldap注入", "ldap filter"), "CWE-90 Improper Neutralization of Special Elements used in an LDAP Statement"),
+    # --- 2026-08-31 第四波补（prefilter 长尾注入族落地配套）：全部短语级
+    # 关键词（不收 xml/xpath 等裸技术词——工具 rule_id 会经 normalize 参与
+    # "回声票"判定，裸词会把模型独立判断误判成复读工具，typical_17 实锤纪律）。
+    (("xxe", "xml external entity", "xml 实体注入", "xml external entity reference"),
+     "CWE-611 Improper Restriction of XML External Entity Reference"),
+    (("xpath injection", "xpath注入"), "CWE-643 Improper Neutralization of Special Elements in XPath Expression"),
+    # 2026-08-31 补（NodeGoat 审计配套）：不安全 Cookie flag。no-httponly 精确
+    # 分类 1004，no-secure 精确分类 614（HTTPS 会话敏感 Cookie 缺 Secure）——
+    # 两词互斥，先判更具体的 secure（实际上两关键词无子串包含，顺序无碍）。
+    (("no-secure", "cookie without 'secure'"), "CWE-614 Sensitive Cookie in HTTPS Session Without 'Secure' Attribute"),
+    (("insecure cookie", "no-httponly", "cookie without 'httponly'"), "CWE-1004 Sensitive Cookie Without 'HttpOnly' Flag"),
+    (("mass assignment", "批量赋值"), "CWE-915 Improperly Controlled Modification of Dynamically-Determined Object Attributes"),
+    (("type juggling", "type confusion", "松散比较", "magic hash", "类型混淆"),
+     "CWE-843 Access of Resource Using Incompatible Type ('Type Confusion')"),
+    (("unrestricted file upload", "unrestricted upload", "任意文件上传"),
+     "CWE-434 Unrestricted Upload of File with Dangerous Type"),
+    (("cleartext storage", "明文存储"),
+     "CWE-312 Cleartext Storage of Sensitive Information"),
+    (("information exposure through error", "error message disclosure"),
+     "CWE-209 Information Exposure Through Error Message"),
+    (("cryptographic signature", "signature verification"),
+     "CWE-347 Improper Verification of Cryptographic Signature"),
     # 认证/会话/凭证类（2026-08-17 补，供 normalize_with_evidence 从分析文本二次
     # 提取类型时使用——这些类型模型常分析对但标号记错或直接落工具 rule_id）：
     (("session fixation", "会话固定"), "CWE-384 Session Fixation"),
