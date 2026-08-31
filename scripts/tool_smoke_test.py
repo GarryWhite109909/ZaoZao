@@ -214,7 +214,14 @@ def smoke_secret_dispatch() -> None:
         def generate(self, **kwargs):  # 裁决/复核均不应被调用到 secret 候选
             return {"text": '{"is_confirmed": false}', "error": None}
 
-    from graduation_project.two_stage_scanner import TwoStageScanner
+    try:
+        from graduation_project.two_stage_scanner import TwoStageScanner
+    except ImportError as exc:
+        # 与 taint_tracker 用例同口径：依赖不全属环境问题，SKIP 不拦 CI
+        # （2026-08-30：此前未兜底 → 缺 tree_sitter 时脚本整体 traceback，
+        #  已安装工具的 PASS 结果全部丢失，P0 防线形同失效）
+        _skip("secret档端到端直出", f"依赖不全: {exc}")
+        return
     ts = TwoStageScanner(client=_FakeClient(), system_prompt="sys", n_samples=3,
                          use_semgrep=False, use_taint_tracker=False,
                          use_prefilter=False, use_external=True,

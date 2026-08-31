@@ -262,7 +262,7 @@ _STANDARD_TAINT_TYPES = frozenset({
     # 剔除 → 界面显示"0 命中"，实为命中后丢弃（工具层浪费）。
     # 影响面实测：仅 2 段真漏洞样本含 TLS 特征、安全样本 0 段 → 不增加 FP 风险。
     "Insecure TLS",
-    # --- 长尾注入族（2026-08-30 待办1，工具层优化指导 §五之三）：白名单此前
+    # --- 长尾注入族（2026-08-30 待办1，工具层优化指导 §五之六）：白名单此前
     # 只有注入型 + P2 族，XXE/LDAP/NoSQL 的精确告警（bandit B405-B409 XML 族、
     # semgrep ldap 规则等）会被当"无主告警"剔除——与 SSRF 当初被剔除同构。
     # 这三类的 sink 语义各异但证据文本自带规范词（untrusted XML / LDAP filter /
@@ -856,6 +856,18 @@ class TwoStageScanner:
                 self.n_samples = n_eff
         rag_enabled = self.use_rag if use_rag is None else use_rag
         start = time.time()
+
+        # 空文件/纯空白守卫（2026-08-30，DVNA 的 __init__.py 实锤）：空内容
+        # 进入 full_recheck 兜底会被送 LLM"复核空气"，产出无意义的复核条目。
+        # 空文件不构成漏洞载体，直接判安全短路返回。
+        if not code or not code.strip():
+            result = TwoStageResult(
+                filename=filename, language=language, has_vulnerability=False,
+                stage1={"decision": "empty_file_skipped", "candidates": 0},
+                explanation="空文件（0 字节或纯空白），无可分析的代码内容。",
+            )
+            result.error = None
+            return result
 
         try:
             return self._scan_code_inner(code, language, filename, rag_enabled, start)
@@ -1523,6 +1535,15 @@ class TwoStageScanner:
         dropped: list[str] = []
         re_routed: list[str] = []
         kept: list[ToolFinding] = []
+        # 留痕容器按需补齐（2026-08-30）：本方法会在 __init__ 之外被直接调用——
+        # 离线审计/回归脚本为跑纯 Stage 1 会用 __new__ 绕过构造（不接 LLM client），
+        # 此时 _dropped_unowned_rules 尚未初始化 → 剔除命中即 AttributeError，
+        # 整个文件的审计中断（audit_stage1.py 实锤）。留痕是**旁路记录**，不该
+        # 有能力中断主流程——这与 B1 类"静默/崩溃源于接入方式"是同一类问题。
+        if not hasattr(self, "_dropped_unowned_rules"):
+            self._dropped_unowned_rules = []
+        if not hasattr(self, "_last_suppressed_rules"):
+            self._last_suppressed_rules = []
         for f in findings:
             if f.category in ("sast", "iac"):
                 claimed = self._infer_taint_type(f.to_dict())
@@ -1681,6 +1702,11 @@ class TwoStageScanner:
         reg = self._signal_registry
         if reg is None or not findings:
             return findings
+        # 留痕容器按需补齐（2026-08-30）：与 _drop_irrelevant_positional 同因——
+        # 本方法可在 __init__ 之外被直接调用（离线审计脚本用 __new__ 绕过构造），
+        # 缺字段会让"抑制留痕"反过来中断召回主流程。
+        if not hasattr(self, "_last_suppressed_rules"):
+            self._last_suppressed_rules = []
         kept: list[ToolFinding] = []
         skipped: list[str] = []
         for f in findings:
@@ -2768,11 +2794,18 @@ class TwoStageScanner:
                 if a.evidence_gate:
                     continue  # 与 _aggregate 底部 majority_confirm 的 evidence_gate 门一致
                 fd = a.finding or {}
-                t = (a.vulnerability_type or "").strip()
-                if not t:
-                    t = normalize_cwe_label(fd.get("taint_type") or "") or ""
-                if not t or t.lower() in ("none", "unknown", "detected"):
-                    t = str(fd.get("rule_id") or "")
+                # 取值优先级不变（模型校正 > 工具 taint > rule_id），但**取到后统一
+                # 过 normalize_cwe_label**（2026-08-30，工具层优化指导 §8.9 第 3 项）：
+                # 此前仅兜底复核分支做了归一化，裁决主分支直接把模型原文入库，
+                # 导致同一编号两套官方名并存（"CWE-78 Command Injection" vs
+                # "CWE-78 OS Command Injection"、"Wraparound" vs "Wrap-up"），
+                # 前端两处显示不一致。归一化后重复项由下方保序去重自然合并。
+                raw_t = (a.vulnerability_type or "").strip()
+                if not raw_t:
+                    raw_t = str(fd.get("taint_type") or "").strip()
+                if not raw_t or raw_t.lower() in ("none", "unknown", "detected"):
+                    raw_t = str(fd.get("rule_id") or "").strip()
+                t = normalize_cwe_label(raw_t) or raw_t
                 if t and t not in types:
                     types.append(t)
             result.vulnerability_types = types
@@ -3419,8 +3452,43 @@ if __name__ == "__main__":
           f"suppressed_by_registry={_r2s.stage1.get('suppressed_by_registry')}, "
           f"剩余候选={[f.rule_id for f in _r2s.findings]}")
 
+    # 23) §8.9 第 3 项：vulnerability_types 元素统一过 normalize_cwe_label。
+    #     同一 CWE 的两套官方名（"CWE-78 OS Command Injection" vs
+    #     "CWE-78 Command Injection"）此前在**裁决主分支**直接入库，仅兜底复核
+    #     分支归一化 → 前端两处显示同一漏洞两个名字。归一化后重复项由保序去重合并。
+    _ts3 = TwoStageScanner(client=FakeClient(
+        ['```json\n{"is_confirmed": true, "reason": "拼接未净化", '
+         '"vulnerability_type": "CWE-78 OS Command Injection"}\n```'] * 3
+        + ['```json\n{"is_confirmed": true, "reason": "拼接未净化", '
+           '"vulnerability_type": "CWE-78 Command Injection"}\n```'] * 3),
+        system_prompt="sys", n_samples=3,
+        use_semgrep=False, use_taint_tracker=False, use_prefilter=False,
+        use_external=False, sampling_rate=0, use_conformal=False,
+        use_signal_feedback=False, use_counterfactual=False)
+    _c1 = ToolFinding(rule_id="B605", category="sast", source="request.args['h']",
+                      sink="os.system(cmd)", taint_type="Command Injection",
+                      source_line=1, sink_line=2, severity="high", tool="bandit")
+    _c2 = ToolFinding(rule_id="B602", category="sast", source="request.args['h']",
+                      sink="subprocess.Popen(cmd, shell=True)",
+                      taint_type="Command Injection",
+                      source_line=1, sink_line=5, severity="high", tool="bandit")
+    _ts3._stage1_recall = lambda code, language, filename: [_c1, _c2]
+    # 样本代码须自带外部输入入口：否则确定性证据门（门 2，无输入入口）会把两条
+    # 候选拦下转人工复核，vulnerability_types 恒空——门本身是对的，是构造问题。
+    _r3 = _ts3.scan_code(
+        "from flask import request\n"
+        "import os, subprocess\n"
+        "def run():\n"
+        "    h = request.args.get('h')\n"
+        "    os.system('ping ' + h)\n",
+        "python", "cmdi.py")
+    ok_tnorm = _r3.vulnerability_types == ["CWE-78 Command Injection"]
+    print(f"[{'PASS' if ok_tnorm else 'FAIL'}] §8.9 类型归一化: "
+          f"vulnerability_types={_r3.vulnerability_types} "
+          f"(期望 ['CWE-78 Command Injection']，两条候选为同一 CWE 的两套官方名)")
+
     print("\n", "=== 自检通过 ===" if all([ok_parse, ok_dedupe, ok_adjud, ok_safe,
           ok_direct, ok_full, ok_rag_default, ok_gate1, ok_gate2, ok_gate3,
           ok_recheck_type, ok_anchor, ok_majority, ok_entry, ok_noleak,
           ok_wire, ok_chain, ok_b3, ok_b3b, ok_dedupe3, ok_dedupe4, ok_dedupe5,
-          ok_rawtype, ok_strip, ok_tail, ok_trace]) else "=== 存在失败用例 ===")
+          ok_rawtype, ok_strip, ok_tail, ok_trace, ok_tnorm]) else "=== 存在失败用例 ===")

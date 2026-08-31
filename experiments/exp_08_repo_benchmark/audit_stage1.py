@@ -40,16 +40,34 @@ _SEMANTIC_TO_CWE = {
     "template injection": "1336", "ssti": "1336",
     "timing attack": "208",
     "open redirect": "601",
+    # 2026-08-31 补（VFlask 审计实锤缺口）：推断分支已能产出这些语义名，
+    # 但本表缺映射 → 候选明明类型正确却被判 B。补的都是"语义名↔CWE 一对一
+    # 无歧义"的项；有歧义的（如 weak cryptography 在 327/326/916 间）按项目
+    # 标准答案口径取一个，并在下方注明。
+    "hardcoded credentials": "798",      # 硬编码凭证，无歧义
+    "insecure tls": "295",               # 禁用证书校验，无歧义
+    # 弱密码学：327（弱/被破解算法，工具粒度）与 916（密码哈希强度不足，精确分类）
+    # 同组。依据：CWE-916 官方定义 + CodeQL js/insufficient-password-hash 均将
+    # md5(password) 归 916；而 bandit B324 / semgrep 只能到"用了弱算法"这一粒度
+    # （327）。标准答案按精确分类记 916，此处双编号以对齐工具能力。
+    "weak cryptography": "327|916",
 }
 
 
 def _types_to_cwes(text: str) -> set:
-    """从类型/规则文本提取 CWE 编号：显式编号 + 语义名映射。"""
+    """从类型/规则文本提取 CWE 编号：显式编号 + 语义名映射。
+
+    语义名可映射**多个** CWE（"|" 分隔，2026-08-31）：标准答案的精确分类与
+    工具的能力粒度常常不是同一个编号，但语义等价。例如密码用 md5 哈希，
+    CWE 官方/CodeQL 的精确分类是 **916**（密码哈希计算强度不足），而 bandit
+    B324 只能产出"弱哈希算法"这一粒度（327）。两者是同一个缺陷的不同粒度表述，
+    不应判成"类型错标"——故归入同一语义组，任一命中即算对齐。
+    """
     out = set(_CWE_RE.findall(text or ""))
     low = (text or "").lower()
     for name, cwe in _SEMANTIC_TO_CWE.items():
         if name in low:
-            out.add(cwe)
+            out.update(c for c in str(cwe).split("|") if c)
     return out
 
 
@@ -99,7 +117,16 @@ def collect_raw_candidates(ts, code: str, lang: str, fname: str) -> tuple[list, 
 
 
 def candidate_rows(raw, after_drop, final) -> list[dict]:
-    """每条原始候选标注去向：kept(final) / dropped(剔除) / deduped(合并进另一条)。"""
+    """每条原始候选标注去向：kept(final) / dropped(剔除) / deduped(合并进另一条)。
+
+    同时记录 **推断后类型**（2026-08-31 修正）：候选的 taint_type 字段常是工具
+    内部标识（bandit 的 B608/B324、semgrep 的规则文件路径），而生产链路里
+    `_dedupe` 的语义族归并**走的是 _infer_taint_type 推断后的语义名**
+    （two_stage_scanner 2218 行）。审计判定若只看原始 taint_type，就会把"类型
+    其实正确、只是没写回字段"的候选误判成 B 类型错标（VFlask 实锤：B608 明明
+    能推断出 SQL Injection，却被算成错标）。故此处同步计算并供判定使用。
+    """
+    from graduation_project.two_stage_scanner import TwoStageScanner
     final_keys = {(f.rule_id, f.sink_line or f.source_line, f.taint_type) for f in final}
     drop_keys = {(f.rule_id, f.sink_line or f.source_line, f.taint_type) for f in after_drop}
     rows = []
@@ -111,7 +138,12 @@ def candidate_rows(raw, after_drop, final) -> list[dict]:
             fate = "去重合并"
         else:
             fate = "被剔除/抑制"
+        try:
+            inferred = TwoStageScanner._infer_taint_type(f.to_dict())
+        except Exception:
+            inferred = f.taint_type
         rows.append({"rule_id": f.rule_id, "tool": f.tool, "taint_type": f.taint_type,
+                     "inferred_type": inferred,
                      "line": f.sink_line or f.source_line, "severity": f.severity,
                      "evidence": (f.evidence or "")[:80], "fate": fate})
     return rows
@@ -127,8 +159,13 @@ def audit_expected(rec: dict, rows: list[dict], final) -> list[dict]:
         covering = [r for r in rows
                     if r["fate"] != "被剔除/抑制"
                     and abs(r["line"] - exp_line) <= 2]
+        # 判定口径：原始类型 + 推断后类型 + 规则号（2026-08-31）。
+        # 只看原始 taint_type 会把"字段未写回但推断正确"的候选误判为 B，
+        # 与生产 _dedupe 的语义族口径不一致（详见 candidate_rows 文档）。
         type_match = [r for r in covering
-                      if exp_num in _types_to_cwes(r["taint_type"] + " " + r["rule_id"])]
+                      if exp_num in _types_to_cwes(" ".join(
+                          [r["taint_type"], r["rule_id"],
+                           r.get("inferred_type") or ""]))]
         if not covering:
             verdict = "A 盲区（零候选）"
         elif type_match:
@@ -262,8 +299,13 @@ def render_md(all_audits: list[dict], manifest: dict) -> str:
         for e in a["expected_audit"]:
             counts["A" if e["verdict"].startswith("A") else
                    ("B" if e["verdict"].startswith("B") else "OK")] += 1
-            cov = "<br>".join(f"{c['tool']}·{c['taint_type']}·L{c['line']}"
-                              for c in e["covering"]) or "—"
+            cov_parts = []
+            for c in e["covering"]:
+                shown = c["inferred_type"]
+                if shown != c["taint_type"]:
+                    shown += "(原:%s)" % c["taint_type"][:12]
+                cov_parts.append("%s·%s·L%s" % (c["tool"], shown, c["line"]))
+            cov = "<br>".join(cov_parts) or "—"
             drop = "<br>".join(f"{c['tool']}·{c['taint_type']}·L{c['line']}"
                                for c in e["dropped_covering"]) or "—"
             lines.append(f"| {e['cwe']} | {e['line']} | {e['verdict']} | {cov} | {drop} |")
@@ -311,6 +353,12 @@ def main() -> None:
     ts._taint_tracker = None          # _taint_tracker_enabled 内惰性加载
     ts.n_samples = 3
     ts._signal_registry = None
+    # §五之四 留痕容器（2026-08-30）：本脚本为跑纯 Stage 1 用 __new__ 绕过
+    # __init__（不接 LLM client），而留痕字段在 __init__ 内初始化 —— 未补这两个
+    # 字段时，命中"无主告警剔除/抑制池跳过"的文件会 AttributeError，整仓审计中断。
+    ts._last_suppressed = False
+    ts._last_suppressed_rules = []
+    ts._dropped_unowned_rules = []
     from graduation_project.prefilter import Prefilter
     ts._prefilter = Prefilter()
 

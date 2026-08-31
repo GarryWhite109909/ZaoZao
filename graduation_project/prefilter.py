@@ -157,6 +157,36 @@ PREFILTER_RULE_INFO: dict[str, dict[str, str]] = {
         "risk": "High",
         "severity": "high",
     },
+    # --- 2026-08-31 补：VFlask 审计暴露的 4 条真盲区（工具层优化指导 §9.8）---
+    # 全部按"框架/语言标准 API"声明（泛化纪律三关卡），不针对具体样本：
+    #   jwt.decode(verify=False)  → PyJWT 标准参数
+    #   return str(e)             → 异常详情返回客户端（语言无关形态）
+    #   敏感字段 = 请求值 + 入库   → 字段语义词根为行业标准命名
+    #   request.files + save()    → Flask/Werkzeug 标准上传 API
+    "jwt_verify_disabled": {
+        "taint_type": "Improper Verification of Cryptographic Signature",
+        "cwe": "CWE-347 Improper Verification of Cryptographic Signature",
+        "risk": "Critical",
+        "severity": "critical",
+    },
+    "error_info_exposure": {
+        "taint_type": "Information Exposure Through Error Message",
+        "cwe": "CWE-209 Information Exposure Through Error Message",
+        "risk": "Medium",
+        "severity": "medium",
+    },
+    "cleartext_sensitive_storage": {
+        "taint_type": "Cleartext Storage of Sensitive Information",
+        "cwe": "CWE-312 Cleartext Storage of Sensitive Information",
+        "risk": "High",
+        "severity": "high",
+    },
+    "unrestricted_file_upload": {
+        "taint_type": "Unrestricted File Upload",
+        "cwe": "CWE-434 Unrestricted Upload of File with Dangerous Type",
+        "risk": "Medium",
+        "severity": "medium",
+    },
     "integer_overflow_ext_arith": {
         "taint_type": "Integer Overflow",
         "cwe": "CWE-190 Integer Overflow",
@@ -216,6 +246,15 @@ _INPUT_SRC_RE = re.compile(
 # 时序比较敏感词（timing_unsafe_compare 用）：与"凭证/签名/校验值"语义相关的
 # 标识符词根。不含 username/uid 等普通标识符——普通字段的 == 比较不构成时序
 # 侧信道告警价值（避免把常见业务比较当漏洞）。
+# 请求容器取值的**起始根**（2026-08-30）：用于判断比较表达式的某一侧是否"直接
+# 从请求里读取"，与 _INPUT_SRC_RE（"是否含输入源"）分工——后者不限位置，前者
+# 必须是表达式开头。取值器（Python 的 .get('x')）本身带括号，故不能用"含括号
+# 即服务端计算值"来区分，要看最外层是不是请求容器。
+_INPUT_ROOT_RE = re.compile(
+    r"^(?:req\b|request\b|params\b|\$_GET|\$_POST|\$_REQUEST|\$_COOKIE|\$_SERVER)",
+    re.IGNORECASE,
+)
+
 _SECRET_COMPARE_NAME_RE = re.compile(
     r"token|secret|signature|mac|hash|otp|password|passwd|api_?key|csrf|nonce",
     re.IGNORECASE,
@@ -229,6 +268,21 @@ _EXT_INT_SRC_RE = re.compile(
     r"|\bscanf\s*\([^;\n]{0,80}?%d[^;\n]{0,80}?&\s*(\w+)",
     re.IGNORECASE,
 )
+
+
+def _line_of(code: str, pattern: "re.Pattern[str]") -> int:
+    """返回 pattern 在 code 中首次命中的行号（1-based；0=未命中）。
+
+    供多 pattern 规则的 line_func 使用（2026-08-31）：这类规则由"漏洞主体特征 +
+    上下文特征"共同构成，而 _hit_line 默认取**行号最小的命中 pattern**——
+    上下文特征若出现在更靠前的位置，行号就会指到无关行，审计判定（expected
+    行号 ±2）随之错失。line_func 让规则显式声明"哪一条才是漏洞主体"。
+    命中判定与行号定位共用同一个 pattern 对象，天然同源，不会指错。
+    """
+    m = pattern.search(code or "")
+    if not m:
+        return 0
+    return code.count("\n", 0, m.start()) + 1
 
 # 路径构造 API（2026-08-29）：各语言"父目录 + 不可信片段 → 路径"的标准写法。
 # 泛化依据：语言级/标准库级事实——os.path.join 是 Python 唯一标准路径拼接 API；
@@ -284,6 +338,11 @@ class _Rule:
     # 自定义匹配器（如配对括号扫描）。设置后作为 AND 条件参与判定：
     # 必须先通过 match_func，再按 patterns/require_all 逻辑判定。
     match_func: Optional[Callable[[str], bool]] = None
+    # 自定义行号定位器（2026-08-30）：match_func 型规则无正则可用，_hit_line
+    # 只能返回 0 → 候选无行号，裁决层须全文重新定位，审计工具也无法把它与
+    # expected 行号对齐（DVNA authHandler 的 timing 命中被当成"无关噪声"实锤）。
+    # 设置后优先于 patterns 定位。
+    line_func: Optional[Callable[[str], int]] = None
 
     def match(self, code: str) -> bool:
         """判断给定代码是否命中本规则。"""
@@ -620,6 +679,8 @@ class Prefilter:
             name="timing_unsafe_compare",
             patterns=[],
             match_func=lambda code: self._timing_unsafe_compare(code),
+            # 行号定位（2026-08-30）：命中判定与行号同源，均走 _timing_hit_line
+            line_func=lambda code: self._timing_hit_line(code),
             category="vuln",
         ))
 
@@ -705,6 +766,116 @@ class Prefilter:
             category="vuln",
         ))
 
+        # --- JWT 签名校验被关闭（2026-08-31，CWE-347）---
+        # 漏洞形态（PyJWT / jsonwebtoken / jjwt 等库的标准参数名，语言级事实）：
+        # 解码时显式关闭签名校验 → 攻击者可伪造任意 payload（典型可致越权）。
+        # 三种标准关闭写法（均为库文档记载的 API 参数，非某仓库变量命名）：
+        #   ① verify=False / verify_signature=False   （PyJWT）
+        #   ② options={"verify_signature": False}     （PyJWT，字典选项形态）
+        #   ③ algorithms=[] 空算法列表                （PyJWT 无算法即不校验）
+        # 安全写法 `jwt.decode(token, key, algorithms=["HS256"])` 不含上述参数，
+        # 天然不命中；`verify=True` 为默认值亦不命中。
+        # 参数区用 `(?:[^()]|\([^()]*\))*?` 而非 `[^)]*`：后者遇到实参里的
+        # **内层调用**就断了——`jwt.decode(request.args.get("t"), verify=False)`
+        # 的 get(...) 自带一对括号，用 [^)] 会漏判（自检用例实锤）。前者容忍
+        # 一层嵌套调用，足以覆盖"参数由函数调用/切片产生"的常见写法；
+        # 同时仍以 `jwt.decode(` 为锚点，不会跨语句误配。
+        rules.append(_Rule(
+            name="jwt_verify_disabled",
+            patterns=[
+                re.compile(r"jwt\.decode\s*\((?:[^()]|\([^()]*\))*?verify\s*=\s*False", IC),
+                re.compile(r"jwt\.decode\s*\((?:[^()]|\([^()]*\))*?verify_signature\s*['\"]?\s*[:=]\s*False", IC),
+            ],
+            category="vuln",
+        ))
+
+        # --- 异常详情返回客户端（2026-08-31，CWE-209）---
+        # 漏洞形态（语言无关）：异常处理块把异常文本直接作为响应体返回。
+        # 内部异常消息常含堆栈片段、SQL 片段、文件路径、配置值 → 信息泄露。
+        # 只认"返回给调用方"这一动作（return/响应构造），不匹配日志/打印：
+        #   logging.error(str(e)) / print(str(e)) 是正常排错行为，不算泄露。
+        # 正确写法是返回通用错误文案、详情记日志。
+        # 命中与行号**同源**，均走 _error_exposure_line（2026-08-31）：
+        # 初版用 `str\(\w+\)` 匹配，把 `return str(result)` / `str(user_id)`
+        # 这类**普通变量**也当成异常回显（87 段回归实锤：safe_16_ldap_escape、
+        # hard_crossfile_03_input 两个安全样本因此误报）。必须限定为
+        # `except ... as <name>` 绑定的异常变量本身，才是 CWE-209 的形态。
+        rules.append(_Rule(
+            name="error_info_exposure",
+            patterns=[],
+            match_func=lambda code: self._error_exposure_line(code) > 0,
+            line_func=lambda code: self._error_exposure_line(code),
+            category="vuln",
+        ))
+
+        # 敏感字段取自请求的正则单独提出：规则匹配与行号定位**必须共用同一
+        # 正则**（2026-08-31 实锤）——本规则是双 pattern AND（敏感字段 + 持久化
+        # 调用），而 _hit_line 取"最小行号的匹配 pattern"，VFlask app.py 的持久化
+        # 调用在 L64、敏感字段在 L160，行号会落到无关的 L64，审计判定（L160±2）
+        # 因此错失。漏洞主体是"敏感字段从请求进来"那一行，故显式指定 line_func。
+        _sensitive_field_re = re.compile(
+            r"\b(?:ccn|cc_?num|credit_?card|card_?number|card_?num|cardnum|"
+            r"cvv|cvc|ssn|social_?security|iban|passport_?no)\w*\s*=\s*"
+            r"(?:content|request|body|form|args|data|json|payload|"
+            r"req\.body|req\.query|params)\b", IC)
+
+        # --- 敏感字段明文入库（2026-08-31，CWE-312）---
+        # 漏洞形态：支付/身份类敏感字段取自请求，随后持久化且文件内无加密痕迹。
+        # 两个 AND 条件（require_all）：
+        #   ① 敏感字段 = 请求值（字段语义词根 ccn/credit_card/card_number/cvv/
+        #      ssn/iban 等为行业通用命名与 PCI-DSS 术语，非某仓库变量命名）；
+        #   ② 文件内存在持久化调用（ORM session.add / .save() / INSERT）。
+        # 是否真"明文"由裁决层判定（可能已加密），本规则只负责把这类数据流
+        # 送进裁决——绝不能让支付数据静默落库而不被检视。
+        #
+        # **不设 exclude 排除"存在加密调用"**（2026-08-31 实锤）：exclude 是
+        # **文件级**判定，只要文件任何位置出现 hashlib/encrypt 就会整体排除——
+        # 而 VFlask app.py 的 L141 hashlib.md5(密码) 与 L160 的 ccn 完全无关，
+        # 却把整条 312 规则排除了。"敏感字段是否被加密"是**字段级**语义，
+        # 正则层判不了，交给裁决层；此处若强行排除，等于让无关的密码哈希
+        # 给支付数据做了伪证。
+        rules.append(_Rule(
+            name="cleartext_sensitive_storage",
+            patterns=[
+                _sensitive_field_re,
+                re.compile(
+                    r"(?:session\.add\s*\(|\.save\s*\(|\.add\s*\(\s*\w+\s*\)|"
+                    r"INSERT\s+INTO|\.create\s*\(|\.insert_one\s*\(|\.insert\s*\()", IC),
+            ],
+            require_all=True,
+            # 行号指向"敏感字段从请求进来"那一行（漏洞主体），而非持久化调用行
+            line_func=lambda code: _line_of(code, _sensitive_field_re),
+            category="vuln",
+        ))
+
+        # --- 无限制文件上传（2026-08-31，CWE-434）---
+        # 漏洞形态（Flask/Werkzeug/Express/Django 的标准上传 API，语言级事实）：
+        # 取上传文件 → 落盘保存，但**未做扩展名/类型白名单校验**。
+        # 两条件 AND：① 存在上传文件取值；② 存在落盘保存。
+        # 排除（关键）：出现扩展名/类型校验特征时**不报**——
+        #   allowed_file( / allowed_extensions / ALLOWED_EXTENSIONS /
+        #   .endswith(('.png',...)) / content_type 校验 / mimetypes 校验。
+        # 注意：secure_filename() **不**在此列——它只净化路径（防穿越），
+        # 不限制文件类型，用它防不住上传 .php/.jsp 等危险类型（VFlask L294 实锤：
+        # 该行同时有 secure_filename 与任意类型上传，正是本规则要抓的形态）。
+        rules.append(_Rule(
+            name="unrestricted_file_upload",
+            patterns=[
+                re.compile(r"request\.files\s*[\[.]|req\.files\b|request\.FILES|"
+                           r"@RequestParam\s+MultipartFile|getPart\s*\(", IC),
+                re.compile(r"\.\s*save\s*\(|\.write\s*\(|Files\.copy\s*\("
+                           r"|move_uploaded_file\s*\(", IC),
+            ],
+            require_all=True,
+            exclude=[
+                re.compile(r"allowed_?file\b|allowed_?extensions?\b", IC),
+                re.compile(r"\.endswith\s*\(\s*[\(\['\"]", IC),
+                re.compile(r"splitext\s*\(|mimetypes?\.guess|content_?type\s*(?:not\s*)?in\b", IC),
+                re.compile(r"ALLOWED_?(?:EXT|MIME|TYPE)", IC),
+            ],
+            category="vuln",
+        ))
+
         # --- 定宽整数溢出（2026-08-29 P2，CWE-190，Java/C 族）---
         # 漏洞形态（语言级事实）：Java int/long 等定宽整数与外部输入派生操作数
         # 相乘/相加会静默回绕。只认「定宽类型声明 ← 外部来源操作数的乘法」：
@@ -726,6 +897,78 @@ class Prefilter:
         排除：比较行含 session 取值（`token != session.get("csrf_token")` 是
         CSRF 校验的标准实现，会话内令牌比对不构成有告警价值的时序侧信道）。
         """
+        return self._timing_hit_line(code) > 0
+
+    @staticmethod
+    def _both_sides_external(line: str) -> bool:
+        """比较两侧**均直接取自外部输入** → 字段一致性校验，非时序侧信道。
+
+        `req.body.password == req.body.cpassword`（注册/改密的确认密码校验）
+        比较的是**用户自己提交的两个值**，攻击者两侧都能控制，响应时间的差异
+        不泄露任何服务端秘密——时序侧信道成立的前提是**至少一侧为服务端持有
+        的秘密**（常量、哈希结果、会话值等）。这是语言无关的安全分析事实，
+        且属极常见业务写法（DVNA appHandler L152 / passport L64 实锤，两者
+        均被判为无关噪声）。
+
+        判定：比较号两侧都含输入源，且右侧未经任何函数调用加工（右侧若有调用，
+        如 `req.body.token == md5(req.body.login)`，则该侧是**服务端计算值**，
+        构成真实的秘密比较，必须保留）。
+        """
+        sides = re.split(r"==|!=", line, maxsplit=1)
+        if len(sides) != 2:
+            return False
+        left, right = sides
+        if not (_INPUT_SRC_RE.search(left) and _INPUT_SRC_RE.search(right)):
+            return False
+        # 右侧**起始**必须是请求容器取值（req.body.x / request.form.get('x')），
+        # 才说明这一侧也是"从请求里读来的"——不能只看整行是否含 "("：同行后续
+        # 语句（if (a == b) { res.send('ok'); }）里的调用会污染整行判断，且
+        # Python 的 .get('x') 取值器本身带括号，按"含括号=服务端计算值"会漏判。
+        right_head = right.strip().split()[0] if right.strip() else ""
+        return bool(right_head) and bool(_INPUT_ROOT_RE.match(right_head))
+
+    def _error_exposure_line(self, code: str) -> int:
+        """异常详情被返回给客户端的首个行号（1-based；0=未命中）。
+
+        CWE-209 的形态是：**异常处理块**把异常文本放进响应体。故只认
+        `except ... as <name>` 绑定的那个变量被 str() 后 return——普通变量
+        （`return str(result)`）与日志记录（`logging.error(str(e))`）都不算。
+        另收 `traceback.format_exc()` 直接返回（同样泄露堆栈详情）。
+
+        异常变量名由代码自己声明（`except X as e`），不做"猜名字"的特判；
+        额外兜底 `e` 是因为它是 Python 社区压倒性的约定名，且部分代码用
+        `except Exception:` 不绑定变量而直接引用 e（历史写法）。
+        """
+        names = set(re.findall(r"except\s+[\w.]+\s+as\s+(\w+)", code or ""))
+        names.add("e")
+        best = 0
+        for name in names:
+            pat = re.compile(
+                r"return\s+[^\n]{0,200}?str\s*\(\s*%s\s*(?:\.\w+)*\s*\)" % re.escape(name),
+                re.IGNORECASE,  # 注意：IC 是各 _build_* 方法的局部变量，此处不可用
+            )
+            m = pat.search(code or "")
+            if m:
+                ln = code.count("\n", 0, m.start()) + 1
+                if best == 0 or ln < best:
+                    best = ln
+        m2 = re.compile(
+            r"return\s+[^\n]{0,200}?(?:traceback\.format_exc|format_exception)\s*\(",
+            re.IGNORECASE,
+        ).search(code or "")
+        if m2:
+            ln = code.count("\n", 0, m2.start()) + 1
+            if best == 0 or ln < best:
+                best = ln
+        return best
+
+    def _timing_hit_line(self, code: str) -> int:
+        """定位首次时序不安全比较所在行（1-based；0=未命中）。
+
+        行号必须与命中判定同源（两者共用本函数），否则会出现"规则命中但行号
+        为 0 / 行号指向无关行"——候选位置错配会误导裁决层定位（2026-08-30）。
+        """
+        best = 0
         for var in self._input_var_names(code):
             if not _SECRET_COMPARE_NAME_RE.search(var):
                 continue
@@ -736,8 +979,40 @@ class Prefilter:
                 line = code[line_start: line_end if line_end != -1 else len(code)]
                 if re.search(r"session\s*[\[.]", line, re.IGNORECASE):
                     continue
-                return True
-        return False
+                if self._both_sides_external(line):
+                    continue
+                ln = code.count("\n", 0, m.start()) + 1
+                if best == 0 or ln < best:
+                    best = ln
+        # 通道 2：内联输入源比较（2026-08-30，DVNA authHandler L49 实锤缺口）。
+        #   if (req.query.token == md5(req.query.login)) { ... }
+        # 凭证语义标识符直接写在比较表达式里、未经中间变量赋值——通道 1 的
+        # _input_var_names 只收集**赋值目标**，这类形态此前完全漏召回。
+        # 形态与通道 1 等价（都是"凭证语义值参与 ==/!= 比较"），属语言无关写法。
+        # 行内必须出现输入源（_INPUT_SRC_RE），否则是比较两个常量/局部变量，
+        # 与时序侧信道无关。
+        for m in re.finditer(
+                r"([A-Za-z_$][\w$]*)\s*(?:==|!=)|(?:==|!=)\s*([A-Za-z_$][\w$]*)", code):
+            ident = m.group(1) or m.group(2) or ""
+            if not ident or not _SECRET_COMPARE_NAME_RE.search(ident):
+                continue
+            line_start = code.rfind("\n", 0, m.start()) + 1
+            line_end = code.find("\n", m.end())
+            line = code[line_start: line_end if line_end != -1 else len(code)]
+            if re.search(r"session\s*[\[.]", line, re.IGNORECASE):
+                continue
+            if self._both_sides_external(line):
+                continue
+            if not _INPUT_SRC_RE.search(line):
+                continue
+            ln = code.count("\n", 0, m.start()) + 1
+            if best == 0 or ln < best:
+                best = ln
+        # 取**最靠前**的命中行，而非首个遍历到的变量所在行：变量集合迭代顺序
+        # 与代码位置无关，直接返回首个匹配会让候选指向靠后的无关比较行
+        # （DVNA authHandler 实锤：指针落到 L71 的密码一致性校验，而真正的
+        #  时序敏感比较在 L49 的 token == md5(login)）。
+        return best
 
     def _ext_int_param_names(self, code: str) -> set[str]:
         """定宽整数的外部来源变量名（@RequestParam 形参 / scanf %d / parseInt(request…)）。"""
@@ -904,10 +1179,20 @@ class Prefilter:
     def _hit_line(code: str, rule: "_Rule") -> int:
         """定位规则在代码中的首次命中行号（1-based；0=未能定位）。
 
-        仅对 patterns 型规则有效：用每条 pattern 在原代码上 search，取最小的
-        匹配偏移换算行号。match_func 型规则（如 path_traversal_open_join）
-        无正则可用，返回 0（保持旧行为）。
+        两种定位通道（2026-08-30 补齐）：
+          1. line_func：match_func 型规则自带的定位器（如时序比较的比较行），
+             精度最高——它知道自己在哪一行命中；
+          2. patterns：用每条 pattern 在原代码上 search，取最小匹配偏移换算行号。
+        两者都不可用时记 0（与旧行为一致，向下兼容）。
         """
+        line_func = getattr(rule, "line_func", None)
+        if line_func is not None:
+            try:
+                ln = int(line_func(code) or 0)
+            except Exception:
+                ln = 0
+            if ln > 0:
+                return ln
         best = None
         for pat in getattr(rule, "patterns", None) or []:
             try:
@@ -1203,5 +1488,115 @@ if __name__ == "__main__":
     all_pass = all_pass and ok_meta
     print(f"[{'PASS' if ok_meta else 'FAIL'}] 规则元信息完整性: "
           f"缺失={missing or '无'}（未登记会导致候选类型回落 Detected）")
+
+    # 命中行号（2026-08-30）：match_func 型规则此前只有"命中/未命中"、行号恒 0，
+    # 候选无位置 → 裁决层须全文重新定位，审计工具也无法与 expected 行号对齐
+    # （DVNA authHandler 的 timing 命中被误判为"无关噪声"实锤）。
+    line_cases: list[tuple[str, str, str, int]] = [
+        # (标签, 代码, 语言, 期望行号)
+        ("时序比较·内联输入源",
+         'app.get("/r", function(req, res) {\n'
+         '  if (req.query.token == expected_token) { res.send("ok"); }\n'
+         '});', "javascript", 2),
+        # 最靠前命中：同一文件两处命中时须取行号最小者，否则候选指向靠后的
+        # 无关比较（authHandler L71 密码一致性 vs L49 token 比对）
+        ("时序比较·取最靠前行",
+         'def f(request):\n'
+         '    token = request.args.get("token")\n'
+         '    b = token == SECRET\n'
+         '    c = token == OTHER\n'
+         '    return b, c', "python", 3),
+        ("会话内令牌比对(安全)",
+         'def v(request):\n'
+         '    token = request.form.get("token")\n'
+         '    if token != session.get("csrf_token"):\n'
+         '        return "bad"', "python", 0),
+        # 两侧均取自请求 = 注册/改密的确认密码校验：比较的是用户自己提交的两个
+        # 值，不与服务端秘密比较，响应差异不泄露秘密（DVNA appHandler L152 /
+        # passport L64 实锤——两者此前被判为无关噪声）。右侧须为请求容器取值：
+        # `req.body.token == md5(req.body.login)` 的右侧是服务端计算值，须保留。
+        ("两侧皆请求的字段一致性校验(安全)",
+         'app.post("/r", function(req, res) {\n'
+         '  if (req.body.password == req.body.cpassword) { res.send("ok"); }\n'
+         '});', "javascript", 0),
+        ("右侧为服务端计算值(须保留)",
+         'app.post("/r", function(req, res) {\n'
+         '  if (req.body.token == md5(req.body.login)) { res.send("ok"); }\n'
+         '});', "javascript", 2),
+    ]
+
+    # 2026-08-31 新增 4 条规则的召回/误报用例（VFlask 审计暴露的真盲区）。
+    # 每条规则都配"负样本"：证明规则抓的是漏洞形态而非"文件里恰好有这些 API"。
+    _NEW_RULES_CASES: list[tuple[str, str, str, list[tuple[str, int]]]] = [
+        # (标签, 代码, 语言, 期望 [(规则名, 行号)])
+        ("JWT·关闭签名校验",
+         'def insecure_verify():\n'
+         '    token = request.headers.get("Authorization")\n'
+         '    return jwt.decode(token, verify=False)\n', "python",
+         [("jwt_verify_disabled", 3)]),
+        ("JWT·options 字典形态关闭校验",
+         'def f(request):\n'
+         '    return jwt.decode(request.args.get("t"), '
+         'options={"verify_signature": False})\n', "python",
+         [("jwt_verify_disabled", 2)]),
+        ("JWT·正常校验(安全)",
+         'def f(request):\n'
+         '    return jwt.decode(request.args.get("t"), KEY, algorithms=["HS256"])\n',
+         "python", []),
+        ("异常详情·返回客户端",
+         'def f(request):\n'
+         '    try:\n'
+         '        db.query(request.args.get("q"))\n'
+         '    except Exception as e:\n'
+         '        return jsonify({"Error": str(e.message)}), 404\n', "python",
+         [("error_info_exposure", 5)]),
+        ("异常详情·只记日志(安全)",
+         'def f(request):\n'
+         '    try:\n'
+         '        db.query(request.args.get("q"))\n'
+         '    except Exception as e:\n'
+         '        logging.error("failed: %s", str(e))\n'
+         '        return jsonify({"Error": "internal"}), 500\n', "python", []),
+        ("敏感字段明文入库",
+         'def reg(request):\n'
+         '    content = request.json\n'
+         '    ccn = content["ccn"]\n'
+         '    cust = Customer(ccn)\n'
+         '    db.session.add(cust)\n', "python",
+         [("cleartext_sensitive_storage", 3)]),
+        ("普通表单入库(安全)",
+         'def reg(request):\n'
+         '    name = request.form.get("name")\n'
+         '    u = User(name)\n'
+         '    db.session.add(u)\n', "python", []),
+        ("文件上传·无类型校验",
+         'def up(request):\n'
+         '    f = request.files["file"]\n'
+         '    f.save(os.path.join(UP, secure_filename(f.filename)))\n', "python",
+         [("unrestricted_file_upload", 2)]),
+        ("文件上传·有白名单(安全)",
+         'def up(request):\n'
+         '    f = request.files["file"]\n'
+         '    if not allowed_file(f.filename):\n'
+         '        return "bad"\n'
+         '    f.save(os.path.join(UP, f.filename))\n', "python", []),
+    ]
+    for label, code, lang, expect in _NEW_RULES_CASES:
+        rr = pf.scan(code, lang)
+        got = sorted(
+            (n, ln) for n, ln in zip(rr.matched_rules, rr.matched_lines)
+            if n in {"jwt_verify_disabled", "error_info_exposure",
+                     "cleartext_sensitive_storage", "unrestricted_file_upload"})
+        ok_case = got == sorted(expect)
+        all_pass = all_pass and ok_case
+        print(f"[{'PASS' if ok_case else 'FAIL'}] 新规则·{label}: {got} (期望 {sorted(expect)})")
+    for label, code, lang, exp_line in line_cases:
+        rr = pf.scan(code, lang)
+        got = rr.matched_lines[rr.matched_rules.index("timing_unsafe_compare")] \
+            if "timing_unsafe_compare" in rr.matched_rules else 0
+        ok_line = got == exp_line
+        all_pass = all_pass and ok_line
+        print(f"[{'PASS' if ok_line else 'FAIL'}] 命中行号·{label}: 行号={got} "
+              f"(期望 {exp_line})")
 
     print("\n=== 全部通过 ===" if all_pass and r1 == r2 else "\n=== 存在失败用例 ===")
