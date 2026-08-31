@@ -68,6 +68,10 @@ _CALL_NODE_TYPES = {
     "call", "call_expression", "method_invocation",
     "function_call_expression", "method_call_expression",
     "object_creation_expression",
+    # 2026-08-31 补：PHP 的面向对象调用（$pdo->query($q) / $mysqli->query($q)）
+    # 是 member_call_expression，此前不在表内 → PHP 的 PDO/mysqli OO 形态
+    # **根本不会作为调用节点被检查**，PHP 侧 OO 数据库访问全盲。
+    "member_call_expression",
 }
 _MEMBER_NODE_TYPES = {
     "attribute", "member_expression", "field_access", "member_access_expression",
@@ -79,7 +83,20 @@ _SUBSCRIPT_NODE_TYPES = {
 _ARGUMENT_LIST_TYPES = {"argument_list", "arguments"}
 
 # 语句体节点（复合语句的子块）
-_BODY_TYPES = {"block", "statement_block", "compound_statement", "declaration_list"}
+# 2026-08-31 补：try 的 except/catch/finally 子句此前既不是 _BODY_TYPES 也不是
+# 语句节点 → _iter_statements 的 walk 对它**既不递归进入也不 yield**，整个
+# except/catch 块内的赋值与 sink 完全不可见。
+# 实锤：hard_cve_06_struts2_ognl 的 `request.getHeader(...)` 赋值与
+# `Ognl.getValue(...)` 都在 catch 块内 → 污点链两侧同时消失，样本零召回；
+# 而 sink 节点仍会被 try_statement 级的 _sink_nodes_in 扫到（catch_clause 当时
+# 不在 body_ranges 里）→ 形成"只看得到 sink、看不到污点"的半盲状态。
+# 纳入 _BODY_TYPES 后两处一并修正：① 子句内语句按真实行号被扫描；
+# ② _sink_nodes_in 的 body_ranges 会排除子句，块内 sink 不再被错记到 try 行
+# （与 §五之七 #2 修的"块头行伪路径"同型）。
+_BODY_TYPES = {
+    "block", "statement_block", "compound_statement", "declaration_list",
+    "catch_clause", "except_clause", "finally_clause",
+}
 
 # 单作用域最多输出路径数
 _MAX_PATHS_PER_SCOPE = 50
@@ -96,21 +113,42 @@ _SOURCE_PATTERNS: dict[str, list[str]] = {
         "input(", "sys.argv", "os.environ", "os.getenv(", "sys.stdin",
     ],
     "javascript": [
-        "req.query", "req.body", "req.params", "process.argv", "process.env",
+        # Express 回调的请求对象形参命名自由（req / request 都是社区惯例写法，
+        # Express 官方文档两种都出现），故两种前缀都收；属性名才是语义所在。
+        "req.query", "req.body", "req.params", "req.headers", "req.cookies",
+        "req.files",
+        "request.query", "request.body", "request.params", "request.headers",
+        "request.cookies", "request.files",
+        "process.argv", "process.env",
         "location.hash", "document.URL", "document.referrer",
         "location.search", "window.name", "event.data",
     ],
     "typescript": [
-        "req.query", "req.body", "req.params", "process.argv", "process.env",
+        "req.query", "req.body", "req.params", "req.headers", "req.cookies",
+        "req.files",
+        "request.query", "request.body", "request.params", "request.headers",
+        "request.cookies", "request.files",
+        "process.argv", "process.env",
         "location.hash", "document.URL", "document.referrer",
         "location.search", "window.name", "event.data",
     ],
+    # 2026-08-31 修复：原模式把**变量名**锁进模式（"request.getParameter"），
+    # 而 Java 的请求对象是方法形参、命名自由（req / request / httpRequest…）。
+    # 实测 87 段 8 个 Java 样本 taint_tracker 贡献恒为 0；自检用例恰好用的
+    # "request" 变量名，所以自检永远通过——**自检用例与被锁的假设同名，
+    # 就永远发现不了这个假设**（与 §8.9 教训 1 同源：新语言判定必须带
+    # 该语言的多形态阳性用例，只用一个形态等于没测）。
+    # 现改为**方法名级**：getParameter/getHeader/getInputStream 等是
+    # Servlet HttpServletRequest 接口的标准方法名（Java 生态无第二语义），
+    # 与调用方变量名无关（语言级事实，非某仓库命名拟合）。
     "java": [
-        "request.getParameter", "request.getAttribute", "request.getHeader",
+        "getParameter(", "getParameterValues(", "getParameterMap(",
+        "getHeader(", "getHeaders(", "getAttribute(",
+        "getInputStream(", "getReader(", "getQueryString(", "getRequestURI(",
         "System.getenv(", "args[",
     ],
     "php": [
-        "$_GET", "$_POST", "$_REQUEST", "$_COOKIE", "$_FILES",
+        "$_GET", "$_POST", "$_REQUEST", "$_COOKIE", "$_FILES", "$_SERVER",
     ],
 }
 
@@ -172,6 +210,56 @@ _SINK_DEFINITIONS: list[tuple[str, str]] = [
     ("render_template_string(", "Server-Side Template Injection"),
     ("render(", "Server-Side Template Injection"),
     ("render_template(", "Server-Side Template Injection"),
+    # --- Java 专有 sink（2026-08-31）---
+    # 形态依据：全部是 Java 标准库/框架的**专有 API 名**，无第二语义（语言级事实，
+    # 非某仓库命名拟合）；跨语言撞名风险由 _SINK_LANG_ONLY 限定到 java。
+    # 背景：修复 source 侧变量名硬编码后，87 段 Java 样本里 5/8 仍零召回——
+    # 根因从"看不到输入"变成"看不到危险调用"，两处都得补才算真的支持该语言。
+    ("new File(", "Path Traversal"),       # java.io.File（§五之二 已论证标准性）
+    ("Paths.get(", "Path Traversal"),      # NIO.2 Paths.get（同上）
+    ("FileInputStream(", "Path Traversal"),
+    ("FileOutputStream(", "Path Traversal"),
+    ("FileReader(", "Path Traversal"),
+    ("FileWriter(", "Path Traversal"),
+    ("ObjectInputStream(", "Insecure Deserialization"),  # 原生反序列化入口
+    ("readObject(", "Insecure Deserialization"),
+    ("parseObject(", "Insecure Deserialization"),  # fastjson 专有（Gson/Jackson/org.json 均不同名）
+    ("parseExpression(", "SpEL Injection"),        # Spring ExpressionParser
+    ("Ognl.getValue(", "SpEL Injection"),          # Struts2 OGNL（库专有 API）
+    # --- PHP 专有 sink（2026-08-31）---
+    # 此前整张表只有 system( 一个 PHP 可用的 sink，PHP 通道形同虚设。
+    ("mysqli_query(", "SQL Injection"),            # mysqli 扩展
+    ("mysql_query(", "SQL Injection"),             # 旧 mysql 扩展（遗留代码常见）
+    ("->query(", "SQL Injection"),                 # PDO::query / mysqli::query（-> 是 PHP 语法）
+    ("unserialize(", "Insecure Deserialization"),  # PHP 反序列化标准函数
+    # file_get_contents 双语义（本地文件读 / URL 取），此处按主用法归 Path Traversal；
+    # URL 形态的 SSRF 语义由 curl_exec 与 prefilter 的 ssrf 规则覆盖。
+    ("file_get_contents(", "Path Traversal"),
+    ("shell_exec(", "Command Injection"),
+    ("passthru(", "Command Injection"),
+    ("proc_open(", "Command Injection"),
+    ("curl_exec(", "SSRF"),                        # PHP curl 发起请求
+    # --- 无歧义族 sink（2026-08-31，与 prefilter 同形态 → 升级为链级证据）---
+    # 目的不是新增召回（prefilter 已覆盖），而是让这些族也能拿到 source→sink
+    # 链级高信任证据（§五之三 信任标注按证据类型分级：链级 > 位置型/正则）。
+    # 收录标准：**API 名在该生态无第二语义**（不加 .parse( / find( / logging. 等
+    # 需上下文守卫才能用的宽名——那些留在 prefilter 的正则 + 守卫实现）。
+    (".xpath(", "XPath Injection"),                # lxml / Scrapy / Selenium 标准求值入口
+    ("search_s(", "LDAP Injection"),               # python-ldap 专有（_s 后缀）
+    ("ldap_search(", "LDAP Injection"),            # PHP ldap 扩展专有
+    ("urlopen(", "SSRF"),                          # Python urllib
+    ("urlretrieve(", "SSRF"),
+    ("axios(", "SSRF"),                            # JS axios 库
+    # 2026-08-31 补（NodeGoat 审计）：needle 是 Node 生态标准 HTTP 客户端，
+    # research.js L16 `needle.get(req.query.url + req.query.symbol)` SSRF 实锤。
+    ("needle.get(", "SSRF"),
+    ("needle.post(", "SSRF"),
+    ("axios.get(", "SSRF"),
+    ("axios.post(", "SSRF"),
+    ("http.request(", "SSRF"),                     # Node 原生 http 模块
+    # redirect 尾缀通用覆盖：Flask redirect( / Django redirect( / Express
+    # res.redirect( / Java sendRedirect( 全部以 "redirect" 结尾（§五之三 论证）
+    ("redirect(", "Open Redirect"),
 ]
 
 _SINK_TAINT_TYPE: dict[str, str] = {pat: ttype for pat, ttype in _SINK_DEFINITIONS}
@@ -208,6 +296,33 @@ _SINK_LANG_DISABLED: dict[str, set[str]] = {
 #     已由 cursor.execute / executeQuery 覆盖 → 限定 JS/TS。
 _SINK_LANG_ONLY: dict[str, set[str]] = {
     ".query(": {"javascript", "typescript"},
+    # 2026-08-31 补：新 sink 的语言限定。**键必须与 _SINK_DEFINITIONS 里的
+    # pattern 字面完全一致（含尾部括号）**，否则限定静默失效。
+    # 收列标准：该 API 名在某个生态外可能被撞名或语义不同。
+    # Java 专有
+    "new File(": {"java"}, "Paths.get(": {"java"},
+    "FileInputStream(": {"java"}, "FileOutputStream(": {"java"},
+    "FileReader(": {"java"}, "FileWriter(": {"java"},
+    "ObjectInputStream(": {"java"}, "readObject(": {"java"},
+    "parseExpression(": {"java"}, "Ognl.getValue(": {"java"},
+    "parseObject(": {"java"},
+    # PHP 专有
+    "mysqli_query(": {"php"}, "mysql_query(": {"php"},
+    "->query(": {"php"}, "unserialize(": {"php"},
+    "file_get_contents(": {"php"}, "shell_exec(": {"php"},
+    "passthru(": {"php"}, "proc_open(": {"php"}, "curl_exec(": {"php"},
+    "ldap_search(": {"php"},
+    # Python 专有
+    "search_s(": {"python"}, "urlopen(": {"python"}, "urlretrieve(": {"python"},
+    # JS/TS 专有（Python 的同名 urllib 已由上面两条覆盖；Node 的 http 模块名与
+    "needle.get(": {"javascript"}, "needle.post(": {"javascript"},
+    # Python 的 http.client 撞名，限定到 JS/TS 避免误用）
+    "axios(": {"javascript", "typescript"},
+    "axios.get(": {"javascript", "typescript"},
+    "axios.post(": {"javascript", "typescript"},
+    "http.request(": {"javascript", "typescript"},
+    # 未列入本表的 sink 不限语言，其中 redirect( 是**故意**的：
+    # Flask/Django/Express/Java sendRedirect 共用该尾缀（§五之三 论证）。
 }
 
 # sink 危险度（用于截断时保留高危路径）
@@ -217,8 +332,16 @@ _SINK_RANK: dict[str, int] = {
     "Insecure Deserialization": 4,
     "SQL Injection": 3,
     "Server-Side Template Injection": 3,
+    "SpEL Injection": 3,
     "XSS": 2,
     "Path Traversal": 2,
+    # 2026-08-31 补：新增 sink 的类型若不在本表，_SINK_RANK.get(ttype, 0) 会取 0，
+    # 在 _MAX_PATHS_PER_SCOPE 截断时（按 -rank 排序）被优先丢弃——新类型必须登记，
+    # 否则"加了对的规则却因为排名垫底而没进裁决"。
+    "SSRF": 3,
+    "LDAP Injection": 3,
+    "XPath Injection": 3,
+    "Open Redirect": 2,
 }
 
 # 消毒函数（包裹污点变量后视为已消毒）。注意：
@@ -252,11 +375,21 @@ def _core(pattern: str) -> str:
 
 
 def _compile(patterns: list[str]) -> list[tuple[str, str, "re.Pattern[str]"]]:
-    """编译模式列表，返回 (原 pattern, core, regex) 三元组，按 core 长度降序。"""
+    """编译模式列表，返回 (原 pattern, core, regex) 三元组，按 core 长度降序。
+
+    前缀处理（2026-08-31 补 `->` 分支）：
+      - core 以 "." 或 "->" 开头 → 按子串匹配，不加前置断言。这两者本身是
+        **语法分隔符**，不会与标识符字符混淆，加断言反而会失配：
+        "->query" 若加 (?<![A-Za-z0-9_]) 断言，在 "$pdo->query" 里前一个字符
+        是 'o'（pdo 的末字母）→ 断言失败 → PHP 的 PDO/mysqli OO 查询形态
+        整类漏召回（实测 _sink_label_for_head 返回 None）。
+      - 其余 core 加 (?<![A-Za-z0-9_]) 左侧边界，避免 "exec" 命中 "myexec"。
+        尾部由 _sink_label_for_head 的 head[m.end():] 检查兜底。
+    """
     out: list[tuple[str, str, "re.Pattern[str]"]] = []
     for p in patterns:
         c = _core(p)
-        if c.startswith("."):
+        if c.startswith(".") or c.startswith("->"):
             regex = re.compile(re.escape(c))
         else:
             regex = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(c))
@@ -353,6 +486,17 @@ class TaintTracker:
         if not scopes:
             scopes = [(root, "<module>")]
 
+        # import-aware sink 符号表（2026-08-31，训练集 mining 实锤 668 次）：
+        # Node 的 require('child_process') 解构导入（execFile/execSync/spawn/
+        # exec）后按导入名裸调——训练集形态：
+        #   const { execFile } = require('child_process');
+        #   execFile(cmd, args, cb)      ← 裸调，非 child_process.execFile(
+        # 此前 sink 表只有 "child_process.exec(" 精确串 → 668 次形态全漏。
+        # 符号表 = 该文件内导入的命令执行 API 名集合；_analyze_scope 扫描时
+        # 对命中符号的调用补记 Command Injection sink。
+        cp_symbols = self._collect_cp_symbols(root, code_bytes) if ts_lang in (
+            "javascript", "typescript") else set()
+
         # 第一遍：为每个函数生成摘要（参数种子 + return 污点）
         summaries: dict[str, FunctionSummary] = {}
         for func_node, qual in scopes:
@@ -368,6 +512,7 @@ class TaintTracker:
             result = self._analyze_scope(
                 func_node, code_bytes, ts_lang,
                 seed_params=False, summaries=summaries,
+                cp_symbols=cp_symbols,
             )
             paths.extend(result.paths)
 
@@ -384,6 +529,36 @@ class TaintTracker:
     # ------------------------------------------------------------------
     # 作用域收集
     # ------------------------------------------------------------------
+    def _collect_cp_symbols(self, root: Node, code_bytes: bytes) -> set:
+        """收集本文件 require('child_process') 导入的命令执行 API 调用名。
+
+        两种形态（训练集 mining 668 次）：
+            const { execFile, execSync, spawn } = require('child_process');
+                → 裸调 execFile(cmd) —— 返回解构名
+            const cp = require('child_process');
+                → cp.execFile(cmd) —— 返回 "cp.execFile" 整链（head.rsplit('.')[1]
+                比对命名空间名），见 audit 的 base 取法：base=尾段，故存
+                f"{ns}.execFile" 形式并在比对时用 head 尾段+倒数第二段联合判断
+        """
+        symbols: set = set()
+        text = code_bytes.decode("utf-8", errors="replace")
+        # 解构导入：const/let/var { a, b as c } = require('child_process')
+        for m in re.finditer(
+                r"(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\(\s*['\"]child_process['\"]\s*\)",
+                text):
+            for part in m.group(1).split(","):
+                name = part.split(":")[-1].strip()
+                if name:
+                    symbols.add(name)
+        # 命名空间导入：const cp = require('child_process') → 记 "cp.*" 前缀
+        for m in re.finditer(
+                r"(?:const|let|var)\s+(\w+)\s*=\s*require\(\s*['\"]child_process['\"]\s*\)",
+                text):
+            ns = m.group(1)
+            symbols.add(f"{ns}.*")
+            symbols.add(ns)          # 命名空间名本身（base 比对用）
+        return symbols
+
     def _collect_function_scopes(self, root: Node, ts_lang: str) -> list[tuple[Node, str]]:
         """递归收集顶层函数 + 类方法节点（不深入函数体内部的嵌套函数）。"""
         func_types = _FUNCTION_NODE_TYPES.get(ts_lang, set())
@@ -426,12 +601,14 @@ class TaintTracker:
         ts_lang: str,
         seed_params: bool,
         summaries: dict[str, FunctionSummary],
+        cp_symbols: Optional[set] = None,
     ) -> _ScopeResult:
         """分析单个作用域：按语句顺序做 def-use 传播，返回路径与 return 污点。"""
         source_compiled = self._sources_for(ts_lang)
         tainted: dict[str, _Taint] = {}
         paths: list[TaintPath] = []
         returns: list[tuple[str, int]] = []
+        cp_symbols = cp_symbols or set()
 
         func_start_line = func_node.start_point[0] + 1
         if seed_params:
@@ -470,7 +647,7 @@ class TaintTracker:
                     )
 
             # 2) 本语句内 sink：参数含污染变量 / 直接含 source 表达式
-            sinks: list[tuple[str, list[str], str]] = []  # (label, args, arg_joined)
+            sinks: list[tuple[str, list[str], str, int]] = []  # (label, args, arg_joined, sink行)
             for sink_node in self._sink_nodes_in(stmt, code_bytes, ts_lang):
                 head = self._head_text(sink_node, code_bytes)
                 # is_call 必须与 _sink_nodes_in 内部同口径（2026-08-31）：两处是
@@ -487,8 +664,20 @@ class TaintTracker:
                     arg_joined = " ".join(args)
                 else:
                     # 成员型 sink（如 el.innerHTML = q）：污点来自整条语句（赋值右值）
-                    arg_joined = stmt_text
-                sinks.append((label, args, arg_joined))
+                    # 2026-08-31 修正：**不能**用整条语句文本。赋值目标本身也在
+                    # 该文本里，而它刚在步骤 1 被标记为污点 → 同一漏洞会多产出
+                    # 一条"传播链更长"的重复路径（typical_35 实锤：
+                    # `Object obj = ois.readObject();` 出两条 readObject 路径，
+                    # chain 分别为 [..ois] 与 [..ois, obj]，后者是 obj 自己喂给自己）。
+                    # 改为取赋值右值；本语句非赋值时才退回整条语句。
+                    _rhs = [r for _tg, r in self._assignment_info(stmt, ts_lang, code_bytes)]
+                    arg_joined = " ".join(_rhs) if _rhs else stmt_text
+                # sink 行号取 sink 调用节点自身行（2026-08-31 NodeGoat 审计实锤）：
+                # 箭头函数整体作为一条语句时 stmt.start 是 handler 定义行
+                # （contributions.js L28），语句内的 eval( 在 L32——记 stmt_line
+                # 会让候选锚到 4 行之外。调用节点行才是 sink 的真实位置。
+                sinks.append((label, args, arg_joined,
+                              sink_node.start_point[0] + 1))
             if not sinks:
                 # 文本兜底：ProcessBuilder 等非调用节点型 sink。
                 # 仅限非复合语句——复合语句的 stmt_text 覆盖整个 body 块，兜底会把
@@ -500,14 +689,44 @@ class TaintTracker:
                 if not any(c.type in _BODY_TYPES for c in stmt.children):
                     label = self._sink_label_for_text(stmt_text, ts_lang)
                     if label:
-                        sinks.append((label, [stmt_text], stmt_text))
+                        sinks.append((label, [stmt_text], stmt_text, stmt_line))
 
-            for label, args, arg_joined in sinks:
+            # 2b) import-aware cp sink 补记（2026-08-31）：execFile/execSync/spawn
+            #     等解构导入名不在常规 sink 表——训练集 mining 实锤 668 次形态全漏。
+            #     注意不能用 _sink_nodes_in（它先按 sink 表过滤节点，execFile(
+            #     根本进不了候选），必须直接遍历本语句的调用节点。
+            if cp_symbols:
+                for call_node in self._call_nodes_in(stmt, ts_lang):
+                    head = self._head_text(call_node, code_bytes)
+                    parts = head.rsplit(".", 1)
+                    base = parts[-1].strip()
+                    ns = parts[0].strip() if len(parts) == 2 else ""
+                    # 命中条件：裸调名在解构集合，或 命名空间名.方法 形态
+                    if base not in cp_symbols and (
+                            not ns or f"{ns}.*" not in cp_symbols):
+                        continue
+                    args = self._argument_texts(call_node, code_bytes)
+                    arg_joined = " ".join(args) or stmt_text
+                    arg_clean = self._strip_string_literals(arg_joined)
+                    cp_line = call_node.start_point[0] + 1  # sink=调用节点行（同 §9.20 锚定修正）
+                    direct = self._match(arg_clean, source_compiled)
+                    if direct:
+                        paths.append(TaintPath(
+                            direct, f"cp:{base}", "Command Injection",
+                            stmt_line, cp_line))
+                    for var, t in list(tainted.items()):
+                        if t.sanitized or not self._var_in_text(arg_clean, var):
+                            continue
+                        paths.append(TaintPath(
+                            t.origin, f"cp:{base}", "Command Injection",
+                            t.origin_line, cp_line,
+                            propagation=t.chain,
+                        ))
+
+            for label, args, arg_joined, sn_line in sinks:
                 ttype = (_SINK_TYPE_LANG_OVERRIDE.get(ts_lang, {}).get(label)
                          or _SINK_TAINT_TYPE.get(label, "Unknown"))
                 arg_clean = self._strip_string_literals(arg_joined)
-
-                # 直接 source 表达式出现在参数里（同语句流）；消毒包裹的不报
                 direct = self._match(arg_clean, source_compiled)
                 if direct:
                     if self._match(self._strip_sanitizer_calls(arg_clean), source_compiled) is not None:
@@ -517,7 +736,7 @@ class TaintTracker:
                         # 直接写 source 的形态一律绕过 → 新 .query( sink 会把它
                         # 判成 SQL 注入（安全代码误报）。
                         if not self._is_parameterized_sql(label, ttype, args, direct, arg_clean):
-                            paths.append(TaintPath(direct, label, ttype, stmt_line, stmt_line))
+                            paths.append(TaintPath(direct, label, ttype, stmt_line, sn_line))
                     continue
 
                 for var, t in list(tainted.items()):
@@ -529,7 +748,7 @@ class TaintTracker:
                         continue  # 语境安全：列表参数 subprocess / 模板值插值 / autoescape
                     paths.append(TaintPath(
                         t.origin, label, ttype,
-                        t.origin_line, stmt_line,
+                        t.origin_line, sn_line,
                         propagation=t.chain,
                     ))
 
@@ -910,9 +1129,61 @@ class TaintTracker:
         return not any(self._var_in_text(remaining, v) for v in tainted_vars)
 
     def _is_parameterized_sql(self, label: str, ttype: str, args: list[str], var: str, arg_clean: str) -> bool:
-        """SQL sink 参数化查询识别：数据在绑定参数中且首参含占位符/第二参为容器。"""
-        if ttype != "SQL Injection":
-            return False
+        """SQL/LDAP sink 参数化查询识别：数据在绑定参数中且首参含占位符/第二参为容器。
+
+        2026-08-31 补 LDAP：python-ldap 的 search_s(base, scope, filterstr,
+        attrs) 与 SQL 占位符语义同构——filter 模板在第三参、数据在第四参
+        （attrs 列表）→ safe_16 的标准参数化形态
+        （``search_s(base, scope, "(uid=%s)", [username])``）此前被新 sink
+        误报为 LDAP 注入。首参占位符 ``%s`` 由 _PARAM_PLACEHOLDER_RE 识别；
+        末参为列表容器与 SQL 分支的 is_container 判定同语义。
+        """
+        if ttype == "SQL Injection":
+            return self._parameterized_common(args, var, arg_clean)
+        if ttype == "LDAP Injection" and "search_s(" in label:
+            # filter 模板 = 首个含占位符的字符串常量参（注意必须**先筛常量参**
+            # 再查占位符——base 参 "dc=x" 是常量但无占位符；此前"取首个常量参查
+            # 占位符"会把 base 当模板、恒得 n_ph=0 → 误判成变量模板分支放行）。
+            # 数据 = 尾部列表参。判定矩阵（已入自检）：
+            #   常量模板 + 占位符数==列表元素数   → 参数化，不报（safe_16 直写形态）
+            #   常量模板 + 占位符数!=列表元素数   → 报（畸形参数化）
+            #   模板在变量里（先行赋值，语句级看不到字面量）→ 仅当模板变量本身
+            #     无污点才判参数化；污点变量出现在模板参 → 报（模板污染形态）
+            if len(args) < 4:
+                return False
+            last = args[-1].lstrip()
+            if not last.startswith("["):
+                return False
+            const_args = [a for a in args if a.strip().startswith(('"', "'"))]
+            tmpl = next((a for a in const_args if _PARAM_PLACEHOLDER_RE.search(a)), None)
+            if tmpl is not None:
+                # 占位符计数**不能**直接 findall（_PARAM_PLACEHOLDER_RE 是
+                # "带引号整串"匹配，`(uid=%s)(cn=%s)` 只返回一次）→ 占位符
+                # 不匹配的畸形参数化会被误判安全。改为在模板**去引号内容**上
+                # 逐个计数。
+                inner = tmpl.strip()
+                if inner[:1] in ('"', "'") and inner[-1:] == inner[:1]:
+                    inner = inner[1:-1]
+                n_ph = len(re.findall(r"\?|%[sdifr]|:\w+|\$\d+", inner))
+                n_items = (len([x for x in last[1:-1].split(",") if x.strip()])
+                           if last.strip()[1:-1].strip() else 0)
+                return n_ph == n_items
+            # 模板在变量里：污点变量能走到参数化检查，说明其出现在**尾部列表**
+            # （否则模板参被污染、模板参 own 检查已拦截）→ 参数化成立。
+            # 模板变量自身被污染的形态（tmpl = "(uid=" + n）在步骤 1 已把 tmpl
+            # 标记为污点 → 此分支不会走（模板参含污点变量）。
+            tmpl_vars = [a for a in args if a not in const_args and a != last
+                         and not a.strip().startswith(('"', "'"))]
+            if any(self._var_in_text(self._strip_string_literals(a), var) for a in tmpl_vars):
+                return False
+            return True
+        return False
+
+    def _parameterized_common(self, args: list[str], var: str, arg_clean: str) -> bool:
+        """SQL 参数化判定（原 _is_parameterized_sql 的 SQL 分支，逻辑不变）。
+
+        调用方已保证 ttype == "SQL Injection"，此处不再重复检查。
+        """
         if len(args) < 2:
             return False
         first = args[0]
@@ -1292,6 +1563,151 @@ def share():
          'app.get("/s", function(req, res) {\n'
          '  client.query("SELECT * FROM u WHERE id=" + req.query.id);\n'
          '});', "javascript", [(2, "SQL Injection")]),
+        # ---------------------------------------------------------------
+        # 2026-08-31 补：跨语言 source/sink 覆盖用例。
+        # 纪律（§8.9 教训 1 + 本次 P0-2 实锤）：新增语言相关判定必须带
+        # **该语言的多个变量名形态**——自检样例若与被硬编码的假设同名
+        # （旧用例写死 "request.getParameter"），自检永远通过，缺陷永远隐身。
+        # ---------------------------------------------------------------
+        # --- Java：请求对象形参命名自由，三种变体都必须召回 ---
+        ("Java req 变体(形参名无关)",
+         'class T{void f(HttpServletRequest req) throws Exception{\n'
+         '  String n = req.getParameter("n");\n'
+         '  Statement s = null;\n'
+         '  s.executeQuery(n);\n'
+         '}}', "java", [(4, "SQL Injection")]),
+        ("Java httpRequest 变体",
+         'class T{void f(HttpServletRequest httpRequest) throws Exception{\n'
+         '  String n = httpRequest.getParameter("n");\n'
+         '  Statement s = null;\n'
+         '  s.executeQuery(n);\n'
+         '}}', "java", [(4, "SQL Injection")]),
+        # 负样本：常量 SQL 无 source，不得产出
+        ("Java 常量SQL(不误报)",
+         'class T{void f() throws Exception{\n'
+         '  Statement s = null;\n'
+         '  s.executeQuery("SELECT 1");\n'
+         '}}', "java", []),
+        ("Java 反序列化(ObjectInputStream)",
+         'class T{void f(HttpServletRequest req) throws Exception{\n'
+         '  byte[] d = Base64.getDecoder().decode(req.getParameter("t"));\n'
+         '  ObjectInputStream o = new ObjectInputStream(new ByteArrayInputStream(d));\n'
+         '}}', "java", [(3, "Insecure Deserialization")]),
+        # 无参 sink 不得把赋值目标自己算作流入（typical_35 实锤的重复路径）
+        ("Java 无参sink不重复(赋值目标不参与)",
+         'class T{void f(HttpServletRequest req) throws Exception{\n'
+         '  ObjectInputStream o = new ObjectInputStream(System.in);\n'
+         '  Object obj = o.readObject();\n'
+         '  Statement s = null;\n'
+         '}}', "java", []),
+        ("Java SpEL(parseExpression)",
+         'class T{String f(@RequestParam String e){\n'
+         '  Expression x = parser.parseExpression(e);\n'
+         '  return x.getValue().toString();\n'
+         '}}', "java", [(2, "SpEL Injection")]),
+        ("Java fastjson(parseObject)",
+         'class T{String f(@RequestBody String b){\n'
+         '  Object o = JSON.parseObject(b);\n'
+         '  return o.toString();\n'
+         '}}', "java", [(2, "Insecure Deserialization")]),
+        # catch 块内的赋值与 sink 曾经**完全不可见**（hard_cve_06 实锤）。
+        # 行号 6 = s.executeQuery 所在行（sink 行，非 catch 行 3、也非 try 行 2）——
+        # 期望值本身即断言"不记到块头行"。
+        ("Java catch块内污点链",
+         'class T{void f(HttpServletRequest r) throws Exception{\n'
+         '  try { x(); }\n'
+         '  catch(Exception e) {\n'
+         '    String n = r.getParameter("n");\n'
+         '    Statement s = null;\n'
+         '    s.executeQuery(n);\n'
+         '  }\n'
+         '}}', "java", [(6, "SQL Injection")]),
+        ("Python except块内污点链",
+         'def v():\n'
+         '    try:\n'
+         '        pass\n'
+         '    except Exception:\n'
+         '        n = request.args.get("n")\n'
+         '        cursor.execute(n)\n', "python", [(6, "SQL Injection")]),
+        # --- PHP：OO 与过程式两种数据库访问形态 ---
+        ("PHP PDO ->query(",
+         '<?php\n$q = $_GET["id"];\n$pdo->query($q);\n', "php",
+         [(3, "SQL Injection")]),
+        ("PHP mysqli_query(",
+         '<?php\n$q = $_GET["id"];\nmysqli_query($c, $q);\n', "php",
+         [(3, "SQL Injection")]),
+        ("PHP unserialize(",
+         '<?php\n$d = $_GET["d"];\nunserialize($d);\n', "php",
+         [(3, "Insecure Deserialization")]),
+        ("PHP curl_exec(→SSRF)",
+         '<?php\n$u = $_GET["u"];\necho curl_exec($u);\n', "php",
+         [(3, "SSRF")]),
+        ("PHP 常量查询(不误报)",
+         '<?php\n$pdo->query("SELECT 1");\n', "php", []),
+        # --- 无歧义族：prefilter 已覆盖，此处升级为链级证据 ---
+        ("Python urlopen(→SSRF)",
+         'def v():\n'
+         '    u = request.args.get("u")\n'
+         '    urllib.request.urlopen(u)\n', "python", [(3, "SSRF")]),
+        ("Python .xpath(→XPath注入)",
+         'def v():\n'
+         '    n = request.args.get("n")\n'
+         '    tree.xpath("//u[@n=\'" + n + "\']")\n', "python",
+         [(3, "XPath Injection")]),
+        ("Python ldap search_s(→LDAP注入)",
+         'def v():\n'
+         '    n = request.args.get("n")\n'
+         '    l.search_s("dc=x", ldap.SCOPE_SUBTREE, "(uid=" + n + ")")\n',
+         "python", [(3, "LDAP Injection")]),
+        # LDAP 参数化判定矩阵（safe_16 教训：新 sink 上线即产生 1 个安全样本
+        # 误报——python-ldap 的 search_s(base, scope, filter, attrs) 与 SQL
+        # 占位符语义同构，必须识别；且占位符计数不能整串 findall）
+        ("Python ldap 参数化·直写(不误报)",
+         'def v():\n'
+         '    u = request.args.get("username", "")\n'
+         '    l.search_s("dc=e", ldap.SCOPE_SUBTREE, "(uid=%s)", [u])\n',
+         "python", []),
+        ("Python ldap 参数化·变量模板(不误报)",
+         'def v():\n'
+         '    u = request.args.get("username", "")\n'
+         '    tmpl = "(uid=%s)"\n'
+         '    l.search_s("dc=e", ldap.SCOPE_SUBTREE, tmpl, [u])\n',
+         "python", []),
+        ("Python ldap 占位符不匹配(须报)",
+         'def v():\n'
+         '    n = request.args.get("n")\n'
+         '    l.search_s("dc=e", ldap.SCOPE_SUBTREE, "(uid=%s)(cn=%s)", [n])\n',
+         "python", [(3, "LDAP Injection")]),
+        ("Python ldap 模板污染(须报)",
+         'def v():\n'
+         '    n = request.args.get("n")\n'
+         '    tmpl = "(uid=" + n + ")"\n'
+         '    l.search_s("dc=e", ldap.SCOPE_SUBTREE, tmpl, [n])\n',
+         "python", [(4, "LDAP Injection")]),
+        ("Python redirect(→开放重定向)",
+         'def v():\n'
+         '    u = request.args.get("u")\n'
+         '    return redirect(u)\n', "python", [(3, "Open Redirect")]),
+        ("Python redirect 常量(不误报)",
+         'def v():\n'
+         '    return redirect("/home")\n', "python", []),
+        ("JS axios.get(→SSRF)",
+         'app.get("/f", function(req, res) {\n'
+         '  axios.get(req.query.url);\n'
+         '});', "javascript", [(2, "SSRF")]),
+        # 2026-08-31 NodeGoat 审计补（第七波）
+        ("JS needle.get(→SSRF)",
+         'function h(req, res) {\n'
+         '  const url = req.query.url;\n'
+         '  needle.get(url, cb);\n'
+         '}', "javascript", [(3, "SSRF")]),
+        # sink 行号锚定回归（NodeGoat contributions.js 实锤）：箭头函数整体
+        # 是一条语句时，sink 行必须是调用节点行而非 handler 定义行。
+        ("JS 箭头handler内eval(sink行号=调用行)",
+         'obj.h = (req, res, next) => {\n'
+         '    // comment line\n'
+         '    const preTax = eval(req.body.preTax);\n'
+         '};', "javascript", [(3, "Code Injection")]),
     ]
     ok_sink = True
     for label, src, lang, expect in sql_cases:

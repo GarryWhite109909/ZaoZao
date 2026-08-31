@@ -187,6 +187,106 @@ PREFILTER_RULE_INFO: dict[str, dict[str, str]] = {
         "risk": "Medium",
         "severity": "medium",
     },
+    # --- 2026-08-31 第四波：长尾注入族（工具层优化指导 §五之五 零召回清单）---
+    # 全部按"库/语言标准 API + 标准安全开关"声明（泛化纪律三关卡），不针对样本：
+    #   XXE   → 解析器加固开关缺失（resolve_entities/disallow-doctype 等标准参数）
+    #   LDAP  → filter 由 f-string/拼接构造（参数化传参是标准安全写法）
+    #   NoSQL → 请求值进 Mongo 查询文档字面量（类型强制 str() 是标准安全写法）
+    #   XPath → 表达式由 f-string/拼接构造
+    #   PHP   → 松散比较 == 是 PHP 语言特性级形态（hash_equals/=== 是标准写法）
+    #   915   → setattr 动态属性写入（白名单过滤是标准安全写法）
+    #   fastjson / OGNL → 库专有 API 名（parseObject / Ognl.getValue）
+    "xxe_unprotected_parse": {
+        "taint_type": "XXE",
+        "cwe": "CWE-611 Improper Restriction of XML External Entity Reference",
+        "risk": "Critical",
+        "severity": "critical",
+    },
+    "ldap_injection": {
+        "taint_type": "LDAP Injection",
+        "cwe": "CWE-90 Improper Neutralization of Special Elements used in an LDAP Statement",
+        "risk": "High",
+        "severity": "high",
+    },
+    # --- 2026-08-31 第五波：核心注入族（召回缺口修复）---
+    # 与第四波「长尾注入族」不同，本波补的是 OWASP 主流类别的**形态缺口**：
+    # 旧规则只认「输入直接出现在 sink 调用内」的内联字面量形态，而真实代码
+    # 主流是「先构造变量、再把变量传入 sink」的 1 跳形态，以及 f-string /
+    # 模板字符串等非拼接构造式。四类共用一套 1 跳消解与构造识别逻辑。
+    "sqli_constructed_query": {
+        "taint_type": "SQL Injection",
+        "cwe": "CWE-89 SQL Injection",
+        "risk": "Critical",
+        "severity": "critical",
+    },
+    "cmd_injection_shell": {
+        "taint_type": "Command Injection",
+        "cwe": "CWE-78 Command Injection",
+        "risk": "Critical",
+        "severity": "critical",
+    },
+    "xss_unescaped_output": {
+        "taint_type": "XSS",
+        "cwe": "CWE-79 Cross-Site Scripting",
+        "risk": "High",
+        "severity": "high",
+    },
+    "ssrf_request_from_input": {
+        "taint_type": "SSRF",
+        "cwe": "CWE-918 Server-Side Request Forgery",
+        "risk": "High",
+        "severity": "high",
+    },
+    "nosql_query_injection": {
+        "taint_type": "NoSQL Injection",
+        "cwe": "CWE-943 Improper Neutralization of Special Elements in Data Query Logic",
+        "risk": "Critical",
+        "severity": "critical",
+    },
+    # 2026-08-31 补（NodeGoat 审计）：MongoDB $where 操作符 JS-eval 注入
+    "nosql_where_injection": {
+        "taint_type": "NoSQL Injection",
+        "cwe": "CWE-943 Improper Neutralization of Special Elements in Data Query Logic",
+        "risk": "Critical",
+        "severity": "critical",
+    },
+    # 2026-08-31 补（NodeGoat 审计）：模板引擎 autoescape 显式关闭（XSS 系统性根因）
+    "template_autoescape_disabled": {
+        "taint_type": "XSS",
+        "cwe": "CWE-79 Cross-Site Scripting",
+        "risk": "High",
+        "severity": "high",
+    },
+    "xpath_injection": {
+        "taint_type": "XPath Injection",
+        "cwe": "CWE-643 Improper Neutralization of Special Elements in XPath Expression",
+        "risk": "High",
+        "severity": "high",
+    },
+    "php_loose_compare": {
+        "taint_type": "Type Juggling",
+        "cwe": "CWE-843 Access of Resource Using Incompatible Type",
+        "risk": "High",
+        "severity": "high",
+    },
+    "mass_assignment_setattr": {
+        "taint_type": "Mass Assignment",
+        "cwe": "CWE-915 Improperly Controlled Modification of Dynamically-Determined Object Attributes",
+        "risk": "High",
+        "severity": "high",
+    },
+    "deser_fastjson": {
+        "taint_type": "Insecure Deserialization",
+        "cwe": "CWE-502 Deserialization of Untrusted Data",
+        "risk": "Critical",
+        "severity": "critical",
+    },
+    "ognl_expression_injection": {
+        "taint_type": "SpEL Injection",
+        "cwe": "CWE-917 Improper Neutralization of Special Elements in Data Query Logic",
+        "risk": "Critical",
+        "severity": "critical",
+    },
     "integer_overflow_ext_arith": {
         "taint_type": "Integer Overflow",
         "cwe": "CWE-190 Integer Overflow",
@@ -229,6 +329,60 @@ _CALL_START_PATTERNS = {
         r"(?:info|debug|warning|warn|error|critical|exception|notice|log)\s*\(",
         re.IGNORECASE,
     ),
+    # --- 2026-08-31 第四波补：长尾注入族 sink（XXE/LDAP/NoSQL/XPath/
+    # setattr/OGNL）。全部为对应库的**标准 API 名**（语言级事实）：
+    # xml_parse 覆盖 lxml（etree.fromstring/parse）、minidom、通用 parseString；
+    # ldap_s 覆盖 python-ldap 的 search_s 与 PHP 的 ldap_search；
+    # mongo_find 覆盖 PyMongo find_one/find 与 Mongoose findOne/find——
+    #   `\.find\s*\(` 的 `find` 后必须紧跟 `(`，不会误配 `.findAll(`；
+    # xpath_e 是 lxml/Scrapy 的 .xpath( 评估入口；
+    # setattr_call 是 Python 动态属性写入的标准 API；
+    # ognl_e 是 OGNL 库的表达式求值入口。
+    # 带**文件级上下文守卫**的宽 sink（.search( 之于 LDAP、mongo_find 之于
+    # MongoDB）不在本表——它们由 match_func 里"上下文特征 + 宽 sink"组合判定，
+    # 避免 .search( / .find( 在非对应上下文中误报。
+    "xml_parse": re.compile(
+        r"etree\.(?:fromstring|parse|XML)\s*\(|minidom\.parse(?:String)?\s*\("
+        r"|\bparseString\s*\(", re.IGNORECASE),
+    # 宽 sink（.parse(）：仅在文件含 XML 解析器上下文特征时由 match_func 启用
+    #（_XML_PARSER_CTX_RE），覆盖 Java `factory.newDocumentBuilder().parse(
+    # request.getInputStream())` 形态；裸 .parse( 与文件/日期解析撞词，不单独启用
+    "xml_parse_w": re.compile(r"\.\s*parse\s*\(", re.IGNORECASE),
+    "ldap_s": re.compile(r"\.search_s\s*\(|\bldap_search\s*\(", re.IGNORECASE),
+    # 宽 sink（.search(）：仅在文件含 LDAP 上下文特征时由 match_func 启用，
+    # 覆盖 node ldapjs client.search(filter) / ldap3 conn.search(...) 形态
+    "ldap_search_w": re.compile(r"\.search\s*\(", re.IGNORECASE),
+    "mongo_find": re.compile(r"\.(?:find_one|findOne|find)\s*\(", re.IGNORECASE),
+    "xpath_e": re.compile(r"\.xpath\s*\(", re.IGNORECASE),
+    "setattr_call": re.compile(r"\bsetattr\s*\(", re.IGNORECASE),
+    "ognl_e": re.compile(r"\bOgnl\.(?:getValue|parseExpression)\s*\("),
+    # --- 2026-08-31 第五波：核心注入族 sink 补齐（召回缺口）---
+    # sql_execute：语句执行入口，各语言/db-api 的标准 API 名（语言级事实）：
+    #   .execute/.executemany/.executescript → Python DB-API(PEP 249)
+    #   .executeQuery/.executeUpdate         → JDBC
+    #   mysqli_query                         → PHP
+    # 裸 `.execute(` 与 Java 线程池 ExecutorService.execute(Runnable) 同名，
+    # 故整条规则另加 SQL 上下文守卫（_SQL_CTX_RE）隔离该语义冲突。
+    # 不含 Django .raw(/.extra( —— 与其他库 .raw( 撞词，暂无样本支撑，未纳入。
+    "sql_execute": re.compile(
+        r"\.execute(?:many|script)?\s*\(|\.executeQuery\s*\(|\.executeUpdate\s*\("
+        r"|\bmysqli_query\s*\(|\.query\s*\(", re.IGNORECASE),
+    # `.query(`（2026-08-31 补）：Node mysql/mysql2/pg 的标准查询 API
+    #（§9.7 #1 在 taint_tracker 已论证其标准性）。词边界保证不撞
+    # `req.query.id`（query 后是 `.` 非括号）与 `querySelector(`；整条规则
+    # 另有 _SQL_CTX_RE 文件级守卫，无 SQL 上下文的 `.query(` 不启用。
+    # http_client：SSRF 的出口——服务端主动发起外部请求的标准 API。
+    # 不含裸 fetch(：浏览器端 fetch 是前端取数，无 SSRF 语义（服务端请求伪造）。
+    "http_client": re.compile(
+        r"\burlopen\s*\(|\burlretrieve\s*\("
+        r"|requests\.(?:get|post|put|head|patch|delete|request)\s*\("
+        r"|\baxios\.(?:get|post|put|head|patch|delete|request)\s*\("
+        r"|\bneedle\.(?:get|post|put|head|patch|delete|request)\s*\("
+        r"|https?\.request\s*\(|\bcurl_exec\s*\(",
+        re.IGNORECASE),
+    # cmd_exec：`exec(` 在 JS（child_process）=命令注入，在 Python =代码执行，
+    # 同名不同义（语言级事实）。故该 sink 仅在文件含 child_process 引入时启用。
+    "cmd_exec": re.compile(r"\bexec\s*\(", re.IGNORECASE),
 }
 
 # 外部可控输入源标记（2026-08-29 P2 规则族共用，与 two_stage_scanner._EXT_ENTRY_RE
@@ -266,6 +420,149 @@ _SECRET_COMPARE_NAME_RE = re.compile(
 _EXT_INT_SRC_RE = re.compile(
     r"@\w*(?:RequestParam|PathVariable)\b[^;\n]{0,120}?\b(?:int|long|short|double|float)\s+(\w+)"
     r"|\bscanf\s*\([^;\n]{0,80}?%d[^;\n]{0,80}?&\s*(\w+)",
+    re.IGNORECASE,
+)
+
+# --- 2026-08-31 第四波：长尾注入族配套正则 ---
+
+# LDAP 上下文特征（ldap_injection 的宽 sink `.search(` 需要：单独出现时与
+# 搜索/检索语义撞词严重，仅在文件含 LDAP 库特征时才启用该 sink）。
+_LDAP_CTX_RE = re.compile(
+    r"\bimport\s+ldap\b|ldap\.initialize|ldap3\b|ldapjs|ldap_connect|"
+    r"ldap_search|\bsearch_s\b",
+    re.IGNORECASE,
+)
+
+# NoSQL 上下文特征（mongo_find 的宽 sink `.find(` 同理需要文件级守卫）。
+# Sequelize `Model.findOne({where: {id: req.body.id}})` 与 Mongo findOne 同形
+# （node_sequelize 负样本实锤），无守卫必误报——JS 无 mongo 字样的抽象层文件
+# 因此漏报，属精度取舍（跨文件上下文是架构级局限，同 crossfile 记档）。
+_NOSQL_CTX_RE = re.compile(
+    r"pymongo|MongoClient|mongoose|mongodb|mongo(?:db)?\s*[\[.\"]"
+    r"|require\s*\(\s*['\"](?:mongoose|mongodb|mongojs)['\"]",
+    re.IGNORECASE,
+)
+
+# Java/JS XML 解析器上下文（宽 sink `.parse(` 的守卫：裸 .parse( 与
+# 文件/日期/通用 parse 撞词严重，仅在文件含 XML 解析器工厂/读取器特征时启用）。
+_XML_PARSER_CTX_RE = re.compile(
+    r"DocumentBuilderFactory|SAXParser(?:Factory)?|XMLReader|XMLInputFactory"
+    r"|libxmljs|DOMParser|etree\b|minidom|xml\.sax",
+    re.IGNORECASE,
+)
+
+
+def _code_wo_comment_lines(code: str) -> str:
+    """剥离整行注释（//、#、块注释中间行、SQL 风格 --）。
+
+    用于"安全特征文件级判定"的净化：CVE-fix 独立集实锤——修复教学代码把
+    `// Missing: factory.setFeature("...disallow-doctype-decl", true)` 写在
+    注释里，_XXE_SAFE_RE 文件级搜索被注释命中 → 漏洞版被误判"已加固"。
+    只剥离**整行**注释（行首即注释符），不做行内剥离（http:// 等 URL 会误伤）；
+    行内注释里的守卫词仍会命中，属已知边界（教学样本为整行形态）。
+    """
+    return "\n".join(
+        line for line in (code or "").splitlines()
+        if not line.lstrip().startswith(("//", "#", "*", "/*", "--")))
+
+
+def _strip_str_literals(text: str) -> str:
+    """把字符串字面量替换为空白，**保留 JS 模板串的 `${}` 插值**。
+
+    「构造式/变量引用」类判定的共享原语（第四、五波统一入口）：
+    SQL/HTML 文本里的单词（FROM、WHERE、列名）是**文本**而非标识符引用，
+    不剥离会被当成拼接进来的变量（noise_03 实测误报）。反引号串不能整段
+    剥离——`${x}` 插值是真实的代码引用（JS 构造形态），故只保留插值段。
+    """
+    text = re.sub(
+        r"`[^`]*`",
+        lambda m: " " + " ".join(re.findall(r"\$\{[^}]*\}", m.group(0))) + " ",
+        text or "", flags=re.DOTALL)
+    return re.sub(r"(['\"]).*?\1", " ", text, flags=re.DOTALL)
+
+# XXE 安全配置特征（存在任一即认为解析器已加固，xxe_unprotected_parse 不报）。
+# 覆盖：lxml（resolve_entities=False / no_network / load_dtd）、Java
+# （disallow-doctype-decl / FEATURE_SECURE_PROCESSING / external-*-entities /
+# XMLConstants setFeature）、libxmljs（noent:false）、defusedxml 全家。
+_XXE_SAFE_RE = re.compile(
+    r"resolve_entities\s*=\s*False|no_network\s*=\s*True|load_dtd\s*=\s*False"
+    r"|disallow-doctype-decl|FEATURE_SECURE_PROCESSING|external-[a-z-]*entit"
+    r"|setFeature\s*\(\s*XMLConstants|defusedxml|defused_parse|noent\s*:\s*[Ff]alse"
+    r"|(?:attribute|feature)\s*\(\s*http://xml\.org",
+    re.IGNORECASE,
+)
+
+# PHP 超全局输入（php_loose_compare 用）：PHP 4.1+ 的标准输入数组，语言级事实，
+# 天然语言隔离（其他语言无此形态）。既是 PHP 上下文守卫，也是输入源标记。
+_PHP_SUPERGLOBAL_RE = re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|SERVER|SESSION)\b")
+
+# --- 2026-08-31 第五波：配套上下文守卫 ---
+
+# SQL 上下文特征：sql_execute 的裸 `.execute(` 与 Java 线程池
+# ExecutorService.execute(Runnable) 同名，需文件级 SQL 语义隔离。
+# 覆盖 SQL 关键字与主流 DB 客户端标识（均为语言/库级标准名）。
+_SQL_CTX_RE = re.compile(
+    r"\bselect\b|\binsert\s+into\b|\bupdate\b\s+\w|\bdelete\s+from\b"
+    r"|sqlite3|mysql|postgres|psycopg|\bjdbc\b|DriverManager|createStatement"
+    r"|PreparedStatement|cursor\.execute|mysqli|sqlalchemy",
+    re.IGNORECASE,
+)
+
+# JS child_process 引入特征：`exec(` 在 JS 侧是命令注入（child_process.exec），
+# 在 Python 侧是代码执行（内置 exec）。本守卫决定 cmd_exec sink 是否启用。
+_JS_CHILDPROCESS_RE = re.compile(
+    r"child_process|require\(\s*[\"']child_process[\"']", re.IGNORECASE)
+
+# HTML 标签字面量（XSS 用）：出现在字符串字面量中说明该串是 HTML 片段，
+# 而非普通文本——「HTML 片段 + 未转义输入 + 输出到响应」才是 XSS 三要素。
+_HTML_TAG_RE = re.compile(
+    r"<\s*(?:html|body|div|p|span|h[1-6]|a\s|table|tr|td|ul|li|script|img|"
+    r"form|input|b|i|br|pre|header|footer)\b",
+    re.IGNORECASE,
+)
+
+# 输出转义特征（XSS 安全写法，存在任一即不报）：把输入转义后再插入 HTML 是
+# XSS 的标准修复（html.escape / markupsafe / bleach / autoescape 等）。
+# 不含裸 `escape(`：`re.escape`/`shlex.escape` 语义不同（转义目标不是 HTML），
+# 会误伤，故只认带命名空间或库专有的写法。
+_XSS_SAFE_RE = re.compile(
+    r"html\.escape|markupsafe|\bbleach\b|sanitize|escapeHtml|escape_html"
+    r"|DOMPurify|autoescape|select_autoescape|xss_clean",
+    re.IGNORECASE,
+)
+
+# Shell 转义特征（命令注入安全写法，存在任一即不报）：参数经 shell 引号转义后
+# 再拼进命令行是命令注入的标准修复（shlex.quote / escapeshellarg 等）。
+_CMD_SAFE_RE = re.compile(
+    r"shlex\.quote|shlex\.join|pipes\.quote|escapeshellarg|escapeshellcmd",
+    re.IGNORECASE,
+)
+
+# SSRF 安全特征（URL 白名单校验，存在任一即不报）：对目标 URL 做域名/前缀
+# 白名单校验是 SSRF 的标准修复写法（与路径穿越的 abspath+startswith 同构）。
+_SSRF_SAFE_RE = re.compile(
+    r"allow(?:ed)?_?(?:domains|hosts|urls)|whitelist|white_list"
+    r"|urlparse\s*\([^)]*\)\s*\.\s*(?:netloc|hostname)"
+    r"|\.startswith\s*\(\s*[\"']https?://",
+    re.IGNORECASE,
+)
+
+# 响应输出 sink（XSS 用）：把内容写回 HTTP 响应的标准 API/语句。
+# 仅构造不输出不构成 XSS（中间变量可能后续被转义）。
+_OUTPUT_SINK_RE = re.compile(
+    r"\breturn\s+|\becho\b|\bprint\s*\(|\bres\s*\.\s*(?:send|write|end|json)\s*\("
+    r"|\bresponse\s*\.\s*(?:write|send)\s*\(|HttpResponse|render_template_string"
+    r"|\bout\s*\.\s*print",
+    re.IGNORECASE,
+)
+
+# Mass Assignment 安全特征（存在任一即不报）：请求键进入对象属性前有字段
+# 白名单过滤——`if key in allowed_fields` / `fields = [...]` 白名单 /
+# Django form / DRF serializer 等框架级过滤形态。
+_MASS_ASSIGN_SAFE_RE = re.compile(
+    r"allowed_?fields|whitelist|white_list|__fields|fillable|"
+    r"\bkey\s+(?:not\s+)?in\s+\w|if\s+\w+\s+not\s+in\s+\w+\s*:|"
+    r"ModelForm|serializers?\.\w+\(.*(data|instance)|filterable",
     re.IGNORECASE,
 )
 
@@ -514,6 +811,16 @@ class Prefilter:
             names.add(m.group(1))
         for m in re.finditer(
                 r"(\w+)\s*=\s*[\w.]+\s*\(\s*(?:request|req)\s*[\.\[]", code, re.IGNORECASE):
+            names.add(m.group(1))
+        # 2026-08-31 补：request/req 作为**首参**传入的函数返回值
+        # （`uid = get_user_input(request, "uid")`）——跨文件/工具函数包装的
+        # 主流形态，返回值必然是请求派生的（语言级事实：以 request 为输入）。
+        for m in re.finditer(
+                r"(\w+)\s*=\s*[\w.]+\s*\(\s*(?:request|req)\s*[,)]", code, re.IGNORECASE):
+            names.add(m.group(1))
+        # PHP 超全局赋值（`$name = $_GET['name']`）：PHP 的输入源标准形态，
+        # 与 _PHP_SUPERGLOBAL_RE 同一事实集（PHP 4.1+ 语言特性）。
+        for m in re.finditer(r"\$(\w+)\s*=\s*\$_", code):
             names.add(m.group(1))
         return names
 
@@ -889,7 +1196,485 @@ class Prefilter:
             category="vuln",
         ))
 
+        # --- XXE：未加固的 XML 解析器解析外部输入（2026-08-31 第四波，CWE-611）---
+        # 漏洞形态：XML 解析 sink（lxml etree.fromstring/parse、minidom、
+        # DocumentBuilderFactory 等）的参数来自外部输入，且文件内无任何解析器
+        # 加固特征（_XXE_SAFE_RE：resolve_entities=False / disallow-doctype-decl /
+        # defusedxml / noent:false 等标准开关）。缺失型中"有标准安全开关可查"的
+        # 形态——守卫词是各库文档记载的标准 API，非样本拼写。
+        # safe_14（defused 形态）由守卫词天然豁免。Java 分离形态
+        #（factory.newDocumentBuilder().parse(input)）由宽 sink xml_parse_w +
+        # _XML_PARSER_CTX_RE 文件级守卫承接。
+        rules.append(_Rule(
+            name="xxe_unprotected_parse",
+            patterns=[],
+            match_func=lambda code: (
+                not _XXE_SAFE_RE.search(_code_wo_comment_lines(code))
+                and (self._sink_hits_input_vars(code, ("xml_parse",))
+                     or (bool(_XML_PARSER_CTX_RE.search(code))
+                         and self._sink_hits_input_vars(code, ("xml_parse_w",))))
+            ),
+            line_func=lambda code: (
+                self._sink_first_hit_line(code, ("xml_parse",))
+                or (self._sink_first_hit_line(code, ("xml_parse_w",))
+                    if _XML_PARSER_CTX_RE.search(code) else 0)
+            ),
+            category="vuln",
+        ))
+
+        # --- LDAP 注入（2026-08-31 第四波，CWE-90）---
+        # 漏洞形态：LDAP filter 由 f-string/拼接/格式化构造后传入查询 sink。
+        # sink 表：search_s（python-ldap）/ ldap_search（PHP）为专有 API；
+        # 宽 sink `.search(`（node ldapjs / ldap3）仅在文件含 LDAP 上下文特征
+        # 时启用（_LDAP_CTX_RE），否则与普通"搜索"语义撞词。
+        # safe_16（字面量 filter + 参数化传参）因 filter 非构造式而天然豁免。
+        rules.append(_Rule(
+            name="ldap_injection",
+            patterns=[],
+            match_func=lambda code: (
+                bool(_LDAP_CTX_RE.search(code))
+                and (self._sink_hits_constructed(code, ("ldap_s",))
+                     or self._sink_hits_constructed(code, ("ldap_search_w",)))
+            ),
+            line_func=lambda code: (
+                self._constructed_hit_line(code, ("ldap_s",))
+                or (self._constructed_hit_line(code, ("ldap_search_w",))
+                    if _LDAP_CTX_RE.search(code) else 0)
+            ),
+            category="vuln",
+        ))
+
+        # --- NoSQL 注入（2026-08-31 第四波，CWE-943）---
+        # 漏洞形态：请求值直接进入 MongoDB 查询文档（dict/object 字面量），
+        # 攻击者可注入 $gt/$ne 等操作符绕过认证。触发（AND）：文件含 MongoDB
+        # 上下文特征（_NOSQL_CTX_RE）+ find/find_one/findOne sink 的参数区是
+        # 查询文档（含 `{`）且出现输入。DVNA 的 Sequelize（findAll/findOne ORM）
+        # 无 mongo 上下文特征 → 不误报。
+        rules.append(_Rule(
+            name="nosql_query_injection",
+            patterns=[],
+            match_func=lambda code: (
+                bool(_NOSQL_CTX_RE.search(code))
+                and self._mongo_find_hit(code)
+            ),
+            line_func=lambda code: self._mongo_find_hit_line(code),
+            category="vuln",
+        ))
+
+        # --- NoSQL $where JS-eval 操作符注入（2026-08-31，NodeGoat 审计）---
+        # 漏洞形态：MongoDB 的 $where 接受一段 JS 字符串并在服务端 eval
+        # （官方文档行为），用户输入拼接/插值进该串 → 任意 JS 执行
+        # （allocations-dao L78 实锤：$where 拼接 req.query 的 threshold）。
+        # 触发（AND，同行）：$where +（模板 ${} 或 与变量拼接）。$where 是
+        # MongoDB 标准操作符（语言级事实），JS 模板与 Python 拼接同形态；
+        # 常量 $where（无插值）不触发。
+        rules.append(_Rule(
+            name="nosql_where_injection",
+            patterns=[],
+            match_func=lambda code: self._nosql_where_hit_line(code) > 0,
+            line_func=lambda code: self._nosql_where_hit_line(code),
+            category="vuln",
+        ))
+
+        # --- 模板 autoescape 显式关闭（2026-08-31，NodeGoat 审计）---
+        # 漏洞形态：模板引擎自动转义被显式设为 false → 全部变量输出不转义，
+        # XSS 的系统性根因（server.js L137 swig.setDefaults({autoescape: false})
+        # 实锤；Python 侧 jinja2 Environment(autoescape=False) 同形态）。
+        # 语言级事实：autoescape 是 swig/jinja2/nunjucks 等引擎的标准选项名，
+        # 显式 false/False/0 赋值即关闭；True/注释提及不触发。
+        rules.append(_Rule(
+            name="template_autoescape_disabled",
+            patterns=[re.compile(r"\bautoescape\b\s*[:=]\s*(?:false|0)\b", IC)],
+            category="vuln",
+        ))
+
+        # --- XPath 注入（2026-08-31 第四波，CWE-643）---
+        # 漏洞形态：XPath 表达式由 f-string/拼接构造后传入 .xpath( 求值。
+        # .xpath( 是 lxml/Scrapy 的专有评估入口（Java 走 XPathFactory，形态
+        # 不同不在此覆盖）。安全写法（参数化 XPath / XPathVariableResolver）
+        # 的表达式不经过 f-string 构造，天然豁免。
+        rules.append(_Rule(
+            name="xpath_injection",
+            patterns=[],
+            match_func=lambda code: self._sink_hits_constructed(code, ("xpath_e",)),
+            line_func=lambda code: self._constructed_hit_line(code, ("xpath_e",)),
+            category="vuln",
+        ))
+
+        # --- PHP 类型混淆（松散比较，2026-08-31 第四波，CWE-843）---
+        # 详见 _php_loose_compare_line。$_ 超全局是 PHP 特有语法，天然语言隔离。
+        rules.append(_Rule(
+            name="php_loose_compare",
+            patterns=[],
+            match_func=lambda code: self._php_loose_compare_line(code) > 0,
+            line_func=lambda code: self._php_loose_compare_line(code),
+            category="vuln",
+        ))
+
+        # --- Mass Assignment（2026-08-31 第四波，CWE-915）---
+        # 详见 _mass_assignment_hit_line。setattr() 是 Python 标准动态属性 API，
+        # 业务代码正常写入用得少（ORM 字段直接赋值是主流），+ 键值遍历 + 输入
+        # 关联三条件 AND 保精度；白名单过滤（allowed_fields 等）时豁免。
+        rules.append(_Rule(
+            name="mass_assignment_setattr",
+            patterns=[],
+            match_func=lambda code: self._mass_assignment_hit_line(code) > 0,
+            line_func=lambda code: self._mass_assignment_hit_line(code),
+            category="vuln",
+        ))
+
+        # --- Fastjson 反序列化（2026-08-31 第四波，CWE-502）---
+        # 漏洞形态（框架级事实）：fastjson 的 JSON.parseObject/JSON.parse 开启
+        # autoType 时可致 RCE（CVE-2017-18349 族），输入直接进 parse 即为候选。
+        # JSON.parseObject( 是 fastjson 特有 API（org.json/Gson/Jackson 均不同名）
+        # 可无守卫；裸 JSON.parse( 是 JS 标准 API（安全解析），必须以 fastjson
+        # import 作守卫才计入。
+        rules.append(_Rule(
+            name="deser_fastjson",
+            patterns=[],
+            match_func=lambda code: (
+                re.search(r"JSON\.parseObject\s*\(", code) is not None
+                or (re.search(r"com\.alibaba\.fastjson", code) is not None
+                    and re.search(r"JSON\.parse\s*\(", code) is not None)
+            ),
+            line_func=lambda code: _line_of(code, re.compile(r"JSON\.parse(?:Object)?\s*\(")),
+            category="vuln",
+        ))
+
+        # --- OGNL 表达式注入（2026-08-31 第四波，CWE-917）---
+        # 漏洞形态（库级事实）：Ognl.getValue/parseExpression 把字符串当表达式
+        # 求值——表达式由外部输入（请求头/参数）构造即 RCE（Struts2 S2-045 族）。
+        # Ognl. 前缀是库专有命名空间，无第二语义；普通代码不直接调用 OGNL。
+        rules.append(_Rule(
+            name="ognl_expression_injection",
+            patterns=[],
+            match_func=lambda code: self._sink_hits_constructed(code, ("ognl_e",)),
+            line_func=lambda code: self._constructed_hit_line(code, ("ognl_e",)),
+            category="vuln",
+        ))
+
+        # --- SQL 注入·构造型查询（2026-08-31 第五波，CWE-89）---
+        # 详见 _sqli_hit_line。保留原 sqli_* 三条内联规则（scripts/
+        # tool_smoke_test.py 依赖 sqli_string_concat 的规则名），本条作为
+        # 1 跳/f-string/变量拼接形态的补充，两者 CWE 一致不会互相冲突。
+        rules.append(_Rule(
+            name="sqli_constructed_query",
+            patterns=[],
+            match_func=lambda code: self._sqli_hit_line(code) > 0,
+            line_func=lambda code: self._sqli_hit_line(code),
+            category="vuln",
+        ))
+
+        # --- 命令注入·f-string/模板字符串（2026-08-31 第五波，CWE-78）---
+        # 详见 _cmd_hit_line。补 cmd_subprocess_shell_concat 只认 `+` 的缺口。
+        rules.append(_Rule(
+            name="cmd_injection_shell",
+            patterns=[],
+            match_func=lambda code: self._cmd_hit_line(code) > 0,
+            line_func=lambda code: self._cmd_hit_line(code),
+            category="vuln",
+        ))
+
+        # --- XSS·未转义输出（2026-08-31 第五波，CWE-79）---
+        # 详见 _xss_hit_line。此前 prefilter 完全无 XSS 规则（87 段弃权 3 段）。
+        rules.append(_Rule(
+            name="xss_unescaped_output",
+            patterns=[],
+            match_func=lambda code: self._xss_hit_line(code) > 0,
+            line_func=lambda code: self._xss_hit_line(code),
+            category="vuln",
+        ))
+
+        # --- SSRF·输入决定请求目标（2026-08-31 第五波，CWE-918）---
+        # 详见 _ssrf_hit_line。此前 prefilter 无 SSRF 规则（87 段弃权 2 段）。
+        rules.append(_Rule(
+            name="ssrf_request_from_input",
+            patterns=[],
+            match_func=lambda code: self._ssrf_hit_line(code) > 0,
+            line_func=lambda code: self._ssrf_hit_line(code),
+            category="vuln",
+        ))
+
         return rules
+
+    # ------------------------------------------------------------------
+    # 2026-08-31 第五波：核心注入族行号定位（内联构造 + 1 跳变量传入）
+    # ------------------------------------------------------------------
+    def _split_first_arg(self, region: str) -> tuple[str, str]:
+        """把参数区切分为「首个顶层参数」与「其余部分」。
+
+        按第一个**顶层**逗号切分：引号内、括号内的逗号不计（如
+        `execute("a,b", (x,))` 的首参是完整 SQL 字面量而非 "a）。
+
+        顶层逗号的有无是参数化查询的结构性判据——DB-API 的安全写法正是
+        把查询文本与参数**分列两个实参**（execute(sql, params)）；而注入
+        形态的查询文本自身由输入构造。
+        """
+        depth = 0
+        in_str: Optional[str] = None
+        escaped = False
+        for i, ch in enumerate(region):
+            if in_str is not None:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == in_str:
+                    in_str = None
+                continue
+            if ch in ("'", '"'):
+                in_str = ch
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                return region[:i], region[i + 1:]
+        return region, ""
+
+    def _assigned_expr(self, code: str, var: str) -> Optional[str]:
+        """返回变量最后一次赋值的右侧表达式（1 跳解析，供 sink 参数消解用）。
+
+        只取行首形态（`^\\s*var = ...`）以避开 `a == b`、字典键 `{'v': 1}`
+        等伪赋值；多处赋值取最后一处（覆盖 `x = f(...)` 后又被覆盖的场景）。
+        """
+        expr: Optional[str] = None
+        for m in re.finditer(
+                rf"(?m)^[ \t]*{re.escape(var)}[ \t]*=[^=](.*)$", code):
+            expr = m.group(1)
+        return expr
+
+    def _assigned_expr_line(self, code: str, var: str) -> tuple[Optional[str], int]:
+        """`_assigned_expr` 的行号版：返回 (表达式, 行号)，未找到返回 (None, 0)。"""
+        expr: Optional[str] = None
+        line = 0
+        for m in re.finditer(
+                rf"(?m)^[ \t]*{re.escape(var)}[ \t]*=[^=](.*)$", code):
+            expr = m.group(1)
+            line = code.count("\n", 0, m.start()) + 1
+        return expr, line
+
+    def _is_constant_var(self, code: str, name: str) -> bool:
+        """变量是否解析为编译期常量（拼接常量不构成注入面）。
+
+        `name = "admin"` 这类常量拼接进 SQL/命令是硬编码而非外部输入
+        （noise_03 实测：把常量当变量会误报）。未在本文件赋值（如函数形参）
+        按非常量处理——保守取向，宁可保留候选交 LLM 复核。
+        """
+        expr = self._assigned_expr(code, name)
+        if expr is None:
+            return False
+        return bool(re.fullmatch(
+            r"(['\"]).*\1|[\d.]+|True|False|None|null", expr.strip()))
+
+    def _expr_is_constructed(self, expr: str, var_res, code: str = "") -> bool:
+        """表达式是否由「字符串构造」而来（注入候选的必要形态）。
+
+        五种构造形态（均为主流语言的字符串构造标准写法）：
+        ① f-string 前缀；② `%` 格式化；③ `.format(`；④ `+` 拼接且含变量；
+        ⑤ JS 模板字符串 `` `${x}` ``（与 f-string 对等的内插构造）。
+        另含「直接引用输入变量/构造变量」——整串来自外部（如 execute(user_sql)）。
+
+        两条精度约束（均由 87 段安全对照样本实锤，非臆测）：
+        · 变量引用匹配**先剥离字符串字面量**（共享原语 `_strip_str_literals`）：
+          SQL 文本里的列名与输入变量同名时（safe_01 的 `WHERE username = ?` 与
+          变量 username）不能算变量引用。
+        · 拼接标识符须非常量：`"..." + name`（name="admin"）是硬编码拼接而非
+          外部输入（noise_03）。
+
+        参数化查询的查询文本是**含占位符的纯字面量**，五种形态全不匹配，
+        天然豁免（safe_01/05/07、noise_01/02/05 实测均不误报）。
+        """
+        if not expr:
+            return False
+        if (re.search(r"\bf['\"]", expr) or re.search(r"\.format\s*\(", expr)
+                or re.search(r"`[^`]*\$\{", expr)):
+            return True
+        if re.search(r"['\"][^'\"]*['\"]\s*%", expr):
+            return True
+        # 以下标识符相关判定一律在「剥离字符串字面量」后的文本上进行：
+        # SQL/HTML 文本里的单词（FROM、WHERE、列名）是文本而非标识符引用，
+        # 不剥离会把它们当成拼接进来的变量（noise_03 实测误报）。
+        bare = _strip_str_literals(expr)
+        if re.search(r"\+\s*\w|\w\s*\+", bare):
+            # 拼接号作用于标识符，且该标识符不是编译期常量（noise_03 约束）
+            for ident in re.findall(r"[+\s]\s*([A-Za-z_$][\w$]*)", bare):
+                if not (code and self._is_constant_var(code, ident)):
+                    return True
+        return any(r.search(bare) for r in var_res)
+
+    def _sqli_hit_line(self, code: str) -> int:
+        """SQL 注入行号定位（1-based；0=未命中）。
+
+        覆盖两类此前漏判的形态（87 段实测弃权 5 段全属此类）：
+        ① 内联构造：`execute("..." + var)` / `execute(f"...{v}")` / 跨行拼接；
+        ② 1 跳传入：`query = "..." + var` 后 `execute(query)`——即把构造后的
+           变量作为查询文本传入（真实代码的主流写法，旧规则只认内联字面量）。
+
+        排除参数化查询：查询文本未构造 + 另有参数元组 → 走参数绑定，是
+        DB-API/E JDBC 的标准安全写法，不构成注入。
+
+        行号口径：1 跳形态报**查询文本的构造行**而非 sink 行——漏洞主体是
+        「把输入拼进语句」这一步，sink 只是执行点；且审计标准答案（VFlask
+        manifest CWE-89@261）与真实漏洞报告均按构造行标注。内联形态构造与
+        sink 同行，两种口径自然一致。
+        """
+        if not _SQL_CTX_RE.search(code or ""):
+            return 0
+        constructed = self._constructed_var_names(code)
+        inputs = self._input_var_names(code)
+        var_res = [re.compile(rf"\b{re.escape(v)}\b") for v in (constructed | inputs)]
+        best = 0
+        for start, end in self._call_arg_regions_with_pos(code, "sql_execute"):
+            first, _rest = self._split_first_arg(code[start:end])
+            ln = code.count("\n", 0, start) + 1
+            # 首参是裸变量 → 消解其赋值表达式，判断查询文本是否经构造
+            bare = re.fullmatch(r"\s*([A-Za-z_$][\w$.]*)\s*", first)
+            if bare:
+                expr, assign_ln = self._assigned_expr_line(code, bare.group(1))
+                if expr is not None:
+                    first, ln = expr, (assign_ln or ln)
+            if self._expr_is_constructed(first, var_res, code):
+                if best == 0 or ln < best:
+                    best = ln
+        return best
+
+    def _cmd_hit_line(self, code: str) -> int:
+        """命令注入行号定位（1-based；0=未命中）。
+
+        补齐旧规则 cmd_subprocess_shell_concat 只认 `+` 拼接的形态缺口：
+        ① Python f-string（`subprocess.run(f"ping {host}", shell=True)`）；
+        ② JS 模板字符串（`` exec(`gzip ${file}`) ``，child_process 引入为守卫）。
+        subprocess 仍要求 shell=True——列表传参形态由 subprocess_list_form
+        安全规则判定，shell=True 才使字符串经 shell 解析。
+
+        豁免：参数经 shell 引号转义（shlex.quote/escapeshellarg）后拼接是
+        命令注入的标准修复（safe_08 实测），_CMD_SAFE_RE 命中即不报。
+        """
+        if _CMD_SAFE_RE.search(_code_wo_comment_lines(code or "")):
+            return 0
+        constructed = self._constructed_var_names(code)
+        inputs = self._input_var_names(code)
+        var_res = [re.compile(rf"\b{re.escape(v)}\b") for v in (constructed | inputs)]
+        keys = ["subprocess", "os_system"]
+        if _JS_CHILDPROCESS_RE.search(code or ""):
+            keys.append("cmd_exec")
+        best = 0
+        for key in keys:
+            for start, end in self._call_arg_regions_with_pos(code, key):
+                region = code[start:end]
+                if key == "subprocess" and not re.search(
+                        r"shell\s*=\s*True", region, re.IGNORECASE):
+                    continue
+                hit = (
+                    re.search(r"\bf['\"]", region) is not None          # Python f-string
+                    or re.search(r"`[^`]*\$\{", region) is not None     # JS 模板字符串
+                    or self._expr_is_constructed(region, var_res, code)
+                )
+                if not hit:
+                    continue
+                ln = code.count("\n", 0, start) + 1
+                if best == 0 or ln < best:
+                    best = ln
+        return best
+
+    def _xss_hit_line(self, code: str) -> int:
+        """XSS 行号定位（1-based；0=未命中）。
+
+        三要素（缺一不可，均为 XSS 的构成性事实）：
+        ① 字符串字面量含 HTML 标签 → 该串是 HTML 片段而非普通文本；
+        ② 片段中拼接/插值了外部输入 → 未转义注入点；
+        ③ 结果被输出到响应（return / echo / res.send 等）→ 到达浏览器。
+        仅构造不输出不构成 XSS（中间变量仍可能被转义），故③是必要项。
+
+        豁免两类安全写法（87 段安全对照样本实锤）：
+        · 输出前转义（html.escape / autoescape 等）：safe_06、safe_15；
+        · 模板占位符 `{{ x }}` 不是字符串插值——它由模板引擎渲染，配合
+          autoescape 不构成注入，不能与 f-string/`+` 拼接同等对待。
+        """
+        if not _HTML_TAG_RE.search(code or ""):
+            return 0
+        if not _OUTPUT_SINK_RE.search(code or ""):
+            return 0
+        if _XSS_SAFE_RE.search(_code_wo_comment_lines(code or "")):
+            return 0
+        constructed = self._constructed_var_names(code)
+        inputs = self._input_var_names(code)
+        var_res = [re.compile(rf"\b{re.escape(v)}\b") for v in (constructed | inputs)]
+        best = 0
+        for i, line in enumerate((code or "").splitlines()):
+            if not _HTML_TAG_RE.search(line):
+                continue
+            # 该行需同时含「输入」与「字符串构造」：输入进入 HTML 片段
+            has_input = (_INPUT_SRC_RE.search(line)
+                         or any(r.search(line) for r in var_res))
+            if not has_input:
+                continue
+            # 剥离模板占位符后再判构造：`{{ x }}` 由模板引擎渲染，不是字符串插值
+            probe = re.sub(r"\{\{.*?\}\}|\{%-?.*?-?%\}", " ", line)
+            if not (re.search(r"\bf['\"]", probe)
+                    or re.search(r"\+\s*\w|\w\s*\+", probe)
+                    or re.search(r"['\"]\s*\.\s*\$", probe)  # PHP 字符串连接符
+                    or re.search(r"\$\{\s*\w+\s*\}", probe)):  # JS 模板字符串
+                continue
+            if best == 0:
+                best = i + 1
+        return best
+
+    def _nosql_where_hit_line(self, code: str) -> int:
+        """NoSQL $where 注入行号定位（1-based；0=未命中）。
+
+        同行 AND 条件：`$where` 操作符 + 用户输入进入 JS 执行串的痕迹
+        （模板 `${}` 或 引号包裹的字符串拼接）。先剥 /* */ 块注释（占位
+        保行号）再逐行判——NodeGoat allocations-dao 实锤：官方注释掉的
+        修复示例（L64-76 块注释内）恰好含 $where+插值形态，不剥块注释
+        会命中注释行 L73 而漏真 sink L78。行内 // 与整行注释同样排除。
+        """
+        code = re.sub(
+            r"/\*.*?\*/",
+            lambda m: "\n" * m.group(0).count("\n"),
+            code or "",
+            flags=re.DOTALL,
+        )
+        for i, line in enumerate(code.splitlines(), 1):
+            if "$where" not in line:
+                continue
+            stripped = line.strip()
+            if stripped.startswith("//") or stripped.startswith("#"):
+                continue
+            # 剥行内注释（// 对 JS；# 只在行首才可能是注释，已由上面排除）
+            probe = line.split("//", 1)[0]
+            if "$where" not in probe:
+                continue
+            after = probe[probe.index("$where"):]
+            if "${" in after or re.search(r"['\"]\s*\+|\+\s*['\"]?\s*\w", after):
+                return i
+        return 0
+
+    def _ssrf_hit_line(self, code: str) -> int:
+        """SSRF 行号定位（1-based；0=未命中）。
+
+        漏洞形态：URL 由外部输入决定并交给服务端 HTTP 客户端发起请求——
+        攻击者借服务端身份访问内网/元数据服务（169.254.169.254 等）。
+        安全写法是域名白名单校验，白名单形态（allowlist/startswith）
+        与本规则互斥，命中即不报。
+        """
+        if _SSRF_SAFE_RE.search(_code_wo_comment_lines(code or "")):
+            return 0
+        constructed = self._constructed_var_names(code)
+        inputs = self._input_var_names(code)
+        var_res = [re.compile(rf"\b{re.escape(v)}\b") for v in (constructed | inputs)]
+        best = 0
+        for start, end in self._call_arg_regions_with_pos(code, "http_client"):
+            first, _rest = self._split_first_arg(code[start:end])
+            bare = re.fullmatch(r"\s*([A-Za-z_$][\w$.]*)\s*", first)
+            if bare:
+                first = self._assigned_expr(code, bare.group(1)) or first
+            if _INPUT_SRC_RE.search(first) or any(r.search(first) for r in var_res):
+                ln = code.count("\n", 0, start) + 1
+                if best == 0 or ln < best:
+                    best = ln
+        return best
 
     def _timing_unsafe_compare(self, code: str) -> bool:
         """输入派生的凭证/签名变量参与 ==/!= 比较（时序侧信道候选）。
@@ -1075,6 +1860,263 @@ class Prefilter:
                 if any(re.search(rf"\b{re.escape(v)}\b", arg_region) for v in join_vars):
                     return True
         return False
+
+    # ------------------------------------------------------------------
+    # 长尾注入族共用辅助（2026-08-31 第四波：XXE/LDAP/NoSQL/XPath/OGNL）
+    # ------------------------------------------------------------------
+    def _constructed_var_names(self, code: str) -> set[str]:
+        """由字符串构造表达式生成（且引用外部输入）的变量名（1 跳）。
+
+            filter_str = f"(uid={username})"          # f-string 内插
+            xpath = f"//user[username='{u}']"         # f-string
+            errorMessage = "Error: " + contentType    # + 拼接
+
+        注入类漏洞的主流写法是「查询/表达式字符串由动态构造而成」：f-string、
+        JS 模板串、`+` 拼接、`%` 格式化、`.format()`。构造材料引用外部输入
+        （直接或经 1 跳输入变量）→ 该变量是注入源候选。字面量常量（safe_16 的
+        `filter_str = "(uid=%s)"` 配参数化传参）不收集 → 安全写法天然豁免。
+        收集结果只被注入族 sink 的参数区引用检查消费，不单独构成命中。
+
+        精度约束（与 _expr_is_constructed 同源，均实锤于安全对照样本）：
+        输入引用匹配在**剥离字符串字面量后**的文本上进行（共享原语
+        _strip_str_literals）——SQL 文本里的列名与输入变量同名不算引用。
+        """
+        names: set[str] = set()
+        input_vars = self._input_var_names(code)
+        var_res = [re.compile(rf"\b{re.escape(v)}\b") for v in input_vars]
+        # f-string 构造（f 前缀即动态构造；是否引用输入不限定——f-string 变量
+        # 传给注入 sink 本身就构成候选，输入关联由 sink 参数区判断兜底）
+        for m in re.finditer(r"(\w+)\s*=\s*f['\"]", code, re.IGNORECASE):
+            names.add(m.group(1))
+        # JS 模板字符串构造（backtick + ${} 内插，JS 的 f-string 对等形态）
+        for m in re.finditer(r"(\w+)\s*=\s*`[^`]*\$\{", code):
+            names.add(m.group(1))
+        # `+` 拼接 / `%` 格式化 / .format 构造，且右侧引用输入源或输入变量
+        for m in re.finditer(r"(\w+)\s*=\s*([^\n=;]+)", code):
+            rhs = m.group(2)
+            if not re.search(r"\+|%\s*\w|\.format\s*\(", rhs):
+                continue
+            bare = _strip_str_literals(rhs)
+            if (_INPUT_SRC_RE.search(bare)
+                    or any(r.search(bare) for r in var_res)):
+                names.add(m.group(1))
+        return names
+
+    def _sink_hits_input_vars(self, code: str, sink_keys) -> bool:
+        """任一 sink 的参数区出现外部输入：直接出现输入源标记，或引用输入
+        变量 / 构造变量（_input_var_names ∪ _constructed_var_names）。"""
+        vars_ = self._input_var_names(code) | self._constructed_var_names(code)
+        return (self._sink_arg_has_input(code, sink_keys)
+                or self._sink_arg_refs_vars(code, sink_keys, vars_))
+
+    def _sink_hits_constructed(self, code: str, sink_keys) -> bool:
+        """任一 sink 的参数区出现「构造式」输入（命中判定，与行号同源）。"""
+        return self._constructed_hit_line(code, sink_keys) > 0
+
+    def _constructed_hit_line(self, code: str, sink_keys) -> int:
+        """构造式注入的行号定位（1-based；0=未命中）。
+
+        注入族的专用判定（比 _sink_hits_input_vars 收窄）：
+
+        ① 参数区出现「输入参与字符串构造」形态：输入源标记与拼接号（+）共存
+           （`(uid=" + request.args.get("u")` 内联拼接）；
+        ② 参数区出现 f-string 前缀（`f"(uid={u})"` 内联构造）；
+        ③ 参数区引用**构造式变量**（f-string/拼接/格式化的 1 跳产物）。
+
+        不含「输入源裸出现」通道：LDAP 参数化查询把输入作为**独立参数**传入
+        （`search_s(base, scope, filter_str, [username])`），若裸出现也算命中，
+        参数化安全写法会被误报（safe_16 实锤）；只有 filter 字符串本身经构造
+        才构成注入候选。
+        """
+        vars_ = self._constructed_var_names(code)
+        var_res = [re.compile(rf"\b{re.escape(v)}\b") for v in vars_]
+        best = 0
+        for key in sink_keys:
+            if key not in _CALL_START_PATTERNS:
+                continue
+            for region_start, region_end in self._call_arg_regions_with_pos(code, key):
+                region = code[region_start:region_end]
+                hit = ((re.search(r"\+", region) and _INPUT_SRC_RE.search(region))
+                       or re.search(r"\bf['\"]", region) is not None
+                       or re.search(r"`[^`]*\$\{", region) is not None
+                       or any(r.search(region) for r in var_res))
+                if hit:
+                    ln = code.count("\n", 0, region_start) + 1
+                    if best == 0 or ln < best:
+                        best = ln
+        return best
+
+    def _sink_first_hit_line(self, code: str, sink_keys) -> int:
+        """注入族规则的行号定位（1-based；0=未命中）：首个参数区含输入的 sink 调用行。
+
+        与命中判定**同源**（遍历同一批 sink key、同一输入变量集合），避免
+        "命中但行号指错"（2026-08-30 行号同源纪律）。
+        """
+        vars_ = self._input_var_names(code) | self._constructed_var_names(code)
+        var_res = [re.compile(rf"\b{re.escape(v)}\b") for v in vars_]
+        best = 0
+        for key in sink_keys:
+            if key not in _CALL_START_PATTERNS:
+                continue
+            for region_m in self._call_arg_regions_with_pos(code, key):
+                start = region_m
+                if (_INPUT_SRC_RE.search(code[start[0]:start[1]])
+                        or any(r.search(code[start[0]:start[1]]) for r in var_res)):
+                    ln = code.count("\n", 0, start[0]) + 1
+                    if best == 0 or ln < best:
+                        best = ln
+        return best
+
+    def _call_arg_regions_with_pos(self, code: str, pattern_key: str):
+        """_call_arg_regions 的位置版：yield (start, end) 参数区绝对位置。"""
+        for m in _CALL_START_PATTERNS[pattern_key].finditer(code):
+            depth = 1
+            in_str: Optional[str] = None
+            escaped = False
+            j = m.end()
+            start = j
+            while j < len(code):
+                ch = code[j]
+                if in_str is not None:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == in_str:
+                        in_str = None
+                    j += 1
+                    continue
+                if ch in ("'", '"'):
+                    in_str = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            end = j if j < len(code) else len(code)
+            yield (start, end)
+
+    def _php_loose_compare_line(self, code: str) -> int:
+        """PHP 松散比较（CWE-843 类型混淆）行号定位（1-based；0=未命中）。
+
+        漏洞形态（PHP 语言特性级事实）：`==`/`!=` 松散比较在凭证校验场景
+        会被 magic-hash 绕过（"0e123" == "0e456" 均(int)0 为真）——正确写法
+        是 `===`/`!==` 强比较或 hash_equals。触发条件（缺一不可）：
+        ① 文件含 PHP 超全局输入（PHP 上下文 + 输入关联双保证）；
+        ② 行内存在凭证语义词（_SECRET_COMPARE_NAME_RE，普通业务字段不报）；
+        ③ 行内是弱比较 `==`/`!=`（`===`/`!==` 是修复写法，不命中）；
+        ④ 比较至少一侧连接输入（行内超全局，或行内变量是超全局 1 跳赋值目标）；
+        ⑤ 两侧均直接取自超全局 → 字段一致性校验（确认密码类），排除。
+        """
+        if not _PHP_SUPERGLOBAL_RE.search(code or ""):
+            return 0
+        php_input_vars = set(re.findall(r"\$(\w+)\s*=\s*\$_", code or ""))
+        best = 0
+        for i, line in enumerate((code or "").splitlines()):
+            if not re.search(r"(?<![=!<>])==(?!=)|(?<![=!])!=(?!=)", line):
+                continue
+            if not _SECRET_COMPARE_NAME_RE.search(line):
+                continue
+            # 侧输入关联：行内超全局，或行内出现超全局 1 跳变量
+            lhs, _, rhs = line.partition("==") if "==" in line else line.partition("!=")
+            both = f"{lhs} {rhs}"
+            # 两侧均直接取自超全局 → 字段一致性校验（确认密码类，攻击者两侧
+            # 都能控制，不泄露服务端秘密）。注意不能复用 _both_sides_external：
+            # 其 _INPUT_SRC_RE 认 `req\.`/`.POST` 前缀，PHP 的 `$_POST` 不匹配
+            if (_PHP_SUPERGLOBAL_RE.search(lhs)
+                    and _PHP_SUPERGLOBAL_RE.search(rhs)):
+                continue
+            hits_input = (_PHP_SUPERGLOBAL_RE.search(both) is not None
+                          or any(re.search(rf"\$\b{re.escape(v)}\b", both)
+                                 for v in php_input_vars))
+            if not hits_input:
+                continue
+            if self._both_sides_external(line):
+                continue
+            if best == 0:
+                best = i + 1
+        return best
+
+    def _mongo_find_hit(self, code: str) -> bool:
+        """NoSQL 查询文档含输入（调用方已保证文件含 MongoDB 上下文特征）。"""
+        return self._mongo_find_hit_line(code) > 0
+
+    def _mongo_find_hit_line(self, code: str) -> int:
+        """NoSQL 注入行号定位（1-based；0=未命中）。
+
+        触发：find/find_one/findOne sink 的参数区是查询文档（含 `{` 字面量，
+        Mongo 查询的标准形态）且出现输入（输入源标记直接出现，或引用输入
+        变量）。Array.prototype.find 的回调形态（`arr.find(x => ...)`）参数区
+        无 `{` 开头的查询文档语义且无输入 → 不命中。
+        豁免：值经类型强制（`str(u)` / `int(u)`）后传入——强制类型使 `$gt`
+        等操作符注入失效，是 MongoDB 官方推荐的安全写法（typical_25 的
+        fix_idea 即此形态）。
+        """
+        vars_ = self._input_var_names(code) | self._constructed_var_names(code)
+        var_res = [re.compile(rf"\b{re.escape(v)}\b") for v in vars_]
+        best = 0
+        for region_start, region_end in self._call_arg_regions_with_pos(
+                code, "mongo_find"):
+            region = code[region_start:region_end]
+            if "{" not in region:
+                continue
+            if not (_INPUT_SRC_RE.search(region)
+                    or any(r.search(region) for r in var_res)):
+                continue
+            # 类型强制豁免：清除所有 cast 形态（str(var)/int(var)/float(var)）
+            # 后再查——仍有裸输入引用才算注入
+            stripped = re.sub(
+                r"\b(?:str|int|float)\s*\(\s*(?:\w+\s*(?:\+\s*\w+\s*)*)\)",
+                "", region)
+            if _INPUT_SRC_RE.search(stripped) or any(
+                    r.search(stripped) for r in var_res):
+                ln = code.count("\n", 0, region_start) + 1
+                if best == 0 or ln < best:
+                    best = ln
+        return best
+
+    def _mass_assignment_hit_line(self, code: str) -> int:
+        """Mass Assignment（CWE-915）行号定位（1-based；0=未命中）。
+
+        漏洞形态（Python 语言级事实）：请求体 dict 的键值对经 `setattr()`
+        动态写入 ORM 对象——键由请求控制，`is_admin` 等敏感字段可被越权写入：
+
+            data = request.get_json()
+            for key, value in data.items():
+                setattr(user, key, value)
+
+        触发（AND）：① 存在 setattr 调用；② 存在 dict 键值遍历
+        （`for k, v in X.items()`）且遍历对象是输入变量（1 跳）；
+        ③ 文件无字段白名单安全特征（_MASS_ASSIGN_SAFE_RE）。
+        Django form / DRF serializer 等框架过滤形态已在安全特征表排除。
+        """
+        if _MASS_ASSIGN_SAFE_RE.search(_code_wo_comment_lines(code or "")):
+            return 0
+        input_vars = self._input_var_names(code)
+        # 收集「可迭代对象来自输入」的循环解构变量（key/value）——setattr
+        # 参数区引用的是解构变量而非可迭代对象本身
+        loop_vars: set[str] = set()
+        for m in re.finditer(
+                r"for\s+(\w+)\s*,\s*(\w+)\s+in\s+(\w+)\s*\.\s*items\s*\(\s*\)",
+                code, re.IGNORECASE):
+            it = m.group(3)
+            if it in input_vars or _INPUT_SRC_RE.search(
+                    code[max(0, m.start() - 200): m.end()]):
+                loop_vars.add(m.group(1))
+                loop_vars.add(m.group(2))
+        if not loop_vars:
+            return 0
+        best = 0
+        for region_start, region_end in self._call_arg_regions_with_pos(
+                code, "setattr_call"):
+            region = code[region_start:region_end]
+            if any(re.search(rf"\b{re.escape(v)}\b", region) for v in loop_vars):
+                ln = code.count("\n", 0, region_start) + 1
+                if best == 0 or ln < best:
+                    best = ln
+        return best
 
     def _build_safe_rules(self) -> list[_Rule]:
         """构建安全特征规则集。"""
@@ -1381,6 +2423,33 @@ if __name__ == "__main__":
          True, "high"),
         ("日志注入(漏洞,直接内嵌输入)",
          'log.info("query from: %s", request.args.get("q"))',
+         True, "high"),
+        # --- 2026-08-31 NodeGoat 审计补用例（第七波）---
+        ("NoSQL $where(漏洞,JS模板插值)",
+         "allocationsCol.find({ $where: `this.userId == ${uid} && this.stocks > '${t}'` });",
+         True, "high"),
+        ("NoSQL $where(漏洞,Python拼接)",
+         'col.find({"$where": "this.stocks > " + user_input})',
+         True, "high"),
+        ("NoSQL $where(安全,常量串)",
+         'col.find({ $where: "this.userId == 42" });',
+         None, "low"),
+        ("NoSQL $where(注释示例不误触发)",
+         "if (t) {\n"
+         "    /*\n"
+         "    // fix example: return {$where: `x > ${parsed}`};\n"
+         "    */\n"
+         "    return { $where: `this.x > '${t}'` };\n"
+         "}",
+         True, "high"),
+        ("autoescape关闭(漏洞,swig配置)",
+         'swig.setDefaults({\n    autoescape: false\n});',
+         True, "high"),
+        ("autoescape开启(安全)",
+         'app.jinja_env.autoescape = True',
+         None, "low"),
+        ("needle SSRF(漏洞)",
+         'const url = req.query.url + req.query.symbol;\nneedle.get(url, (e, r) => {});',
          True, "high"),
         ("时序比较(漏洞,token==常量)",
          'token = request.headers.get("X-API-Token", "")\n'

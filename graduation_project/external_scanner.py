@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -234,6 +235,17 @@ class ExternalScanner:
         # 环境变量 <TOOL>_BIN（如 SEMGREP_BIN）可显式指定可执行文件路径，
         # 覆盖 PATH 探测（例如 semgrep 装在独立 venv、未加入 PATH 的场景）。
         self._installed: dict[str, str] = {}
+        # P2-8（2026-08-31）：semgrep 单文件执行缓存。scan_code 对同一临时文件
+        # 先 scan_taint 后 scan_sast，此前各起一次 semgrep 进程（~0.85s + ~1.2s，
+        # 占单文件总耗时 ~90%）——规则加载与解析做两遍。现共享一次执行，
+        # 两路解析从缓存分流（taint 规则 id 按命名约定 "-taint" 后缀识别）。
+        self._semgrep_cache: dict[str, Optional[dict]] = {}
+        # 执行状态留痕（2026-08-31，P2-9 消静默）：工具名 → 最近一次执行的
+        # 状态（ok / empty / parse_error / timeout / not_found / os_error）。
+        # 此前 20+ 处降级 return [] 全部静默——工具超时/解析失败与"无命中"
+        # 在结果上无法区分（B1 的"零召回先查调用链"因此缺第一手证据）。
+        # 只记录不干预：留痕是旁路，不得影响召回主流程。
+        self.last_status: dict[str, str] = {}
         conda_bins = self._conda_env_bin_dirs()
         for name in requested:
             if name not in _ALL_TOOLS:
@@ -422,13 +434,20 @@ class ExternalScanner:
     # ------------------------------------------------------------------
     # 子进程执行
     # ------------------------------------------------------------------
-    def _run_subprocess(self, cmd: list[str]) -> Optional[str]:
+    def _run_subprocess(self, cmd: list[str], cwd: Optional[str] = None) -> Optional[str]:
         """运行子进程并返回 stdout 文本。
+
+        Args:
+            cmd: 命令行（首元素为工具名，会被替换为探测到的绝对路径）
+            cwd: 工作目录。部分工具（detect-secrets 1.x）对绝对路径不做扫描，
+                 必须由调用方切到目标目录并传相对文件名（见 _run_detect_secrets）。
 
         工具未找到 / 超时 / 其他异常均返回 None，由调用方降级处理。
         不检查退出码 —— 部分工具（如 gitleaks）在"无发现"时退出码非零，
         但 stdout 仍可能包含 JSON。
         """
+        # 留痕键 = 裸工具名（替换绝对路径**之前**取；替换后是完整路径，作键无意义）
+        tool = cmd[0] if cmd else "?"
         try:
             # 用 __init__ 探测到的绝对路径替换裸命令名（支持 <TOOL>_BIN 环境变量
             # 覆盖 PATH 探测，例如 semgrep 装在独立 venv 未加入 PATH 的场景）
@@ -440,13 +459,20 @@ class ExternalScanner:
                 text=True,
                 encoding="utf-8", errors="replace",
                 timeout=_TOOL_TIMEOUT,
+                cwd=cwd,
             )
+            # 执行层留痕：stdout 空 = 工具跑完但无输出（可能是"无命中"，也可能是
+            # 工具静默失败——由调用方解析层覆盖为 parse_error 甄别）。
+            self.last_status[tool] = "ok" if (proc.stdout or "").strip() else "empty"
             return proc.stdout
         except FileNotFoundError:
+            self.last_status[tool] = "not_found"
             return None
         except subprocess.TimeoutExpired:
+            self.last_status[tool] = "timeout"
             return None
         except OSError:
+            self.last_status[tool] = "os_error"
             return None
 
     # ------------------------------------------------------------------
@@ -465,6 +491,7 @@ class ExternalScanner:
         try:
             data = json.loads(out)
         except json.JSONDecodeError:
+            self.last_status["bandit"] = "parse_error"  # 执行层留痕（消静默）
             return []
         findings: list[ExternalFinding] = []
         for r in data.get("results", []):
@@ -479,39 +506,87 @@ class ExternalScanner:
             ))
         return findings
 
-    def _run_semgrep(self, path: str) -> list[ExternalFinding]:
-        """运行 Semgrep（多语言 SAST）。
+    def _semgrep_execute_cached(self, path: str) -> Optional[dict]:
+        """同文件一次 semgrep 执行，sast/taint 两路解析共享（P2-8，2026-08-31）。
 
-        命令：semgrep --json --quiet --config p/security-audit --config p/owasp-top-10 <path>
-        输出 JSON 含 results 数组，每项含 check_id / path / start.line /
-        extra.severity / extra.message。
+        命令：semgrep --json --quiet --config <registry 包们> --config <taint 目录> <path>
+        （taint 目录缺失时自动省略该 config——与 scan_taint 的降级语义一致。）
+
+        缓存键 = 文件绝对路径（同一 scan_code 两次调用命中同键）；上限 64 条
+        超限全清——临时文件每次扫描新建，跨文件复用价值低，防内存无限增长。
+
+        **errors 重试（2026-08-31，exp_01 审计 × LLM 跑批并发实锤）**：
+        多进程并发时 semgrep-core 偶发 exit 2（"Error while matching"，疑似
+        规则解析缓存/临时目录争抢），失败模式为 results=0 + errors=1（整体崩，
+        什么都不出）。实测崩溃率与并发强度正相关（独跑 0%，与 LLM 跑批并发
+        约 40%）。竞态是偶发的 → **对 errors 非空的执行重试 1 次**（重试成功率
+        高，代价仅作用于失败场景；无 errors 的正常空结果不重试，避免双倍耗时）。
+
+        Returns:
+            解析后的 semgrep JSON dict；无输出/解析失败时返回 None
+            （两路解析函数对 None 一致降级为空列表）。
         """
-        # 固定规则集（可复现）：security-audit + owasp-top-10；
-        # 后续自写 taint 规则文件追加进 _SEMGREP_CONFIGS 即可。
-        # 离线/规则拉取失败时 semgrep 会在 JSON errors 中报告，
-        # 此时视为工具不可用而非"扫描通过"
-        out = self._run_subprocess(
-            ["semgrep", "--json", "--quiet"]
-            + [c for cfg in _SEMGREP_CONFIGS for c in ("--config", cfg)]
-            + [path]
-        )
-        if not out or not out.strip():
-            return []
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            return []
-        if data.get("errors"):
-            print(f"[ExternalScanner] semgrep 报告错误（可能是离线/规则拉取失败）: "
-                  f"{str(data['errors'][0])[:200]}")
+        key = os.path.abspath(path)
+        if key in self._semgrep_cache:
+            return self._semgrep_cache[key]
+        cmd = ["semgrep", "--json", "--quiet"]
+        cmd += [c for cfg in _SEMGREP_CONFIGS for c in ("--config", cfg)]
+        if os.path.isdir(_TAINT_RULES_DIR):
+            cmd += ["--config", _TAINT_RULES_DIR]
+        cmd += [path]
+        data: Optional[dict] = None
+        for attempt in (1, 2):  # 第 2 次仅在 errors 非空时执行（见下）
+            out = self._run_subprocess(cmd)
+            data = None
+            if not (out and out.strip()):
+                break  # 空输出 = 正常"无命中"（semgrep 无发现时 stdout 可能为空），不重试
+            try:
+                parsed = json.loads(out)
+            except json.JSONDecodeError:
+                self.last_status["semgrep"] = "parse_error"  # 执行层留痕（消静默）
+                break
+            if not isinstance(parsed, dict):
+                break
+            n_err = len(parsed.get("errors") or [])
+            if not n_err:
+                data = parsed
+                break
+            # errors 非空：留痕 + 重试一次
+            self.last_status["semgrep"] = f"errors_retry{attempt}:{n_err}"
+            print(f"[ExternalScanner] semgrep 报错（attempt {attempt}，errors={n_err}，"
+                  f"results={len(parsed.get('results') or [])}）: "
+                  f"{str(parsed['errors'][0])[:160]}")
+            if attempt == 1 and parsed.get("results"):
+                # 有部分结果：先用部分结果兜底，再重试取更完整的一份
+                data = parsed
+            elif attempt == 1:
+                time.sleep(0.3)  # 让并发的另一个 semgrep 进程先释放资源
+                continue
+        if len(self._semgrep_cache) > 64:
+            self._semgrep_cache.clear()
+        self._semgrep_cache[key] = data
+        return data
+
+    def _run_semgrep(self, path: str) -> list[ExternalFinding]:
+        """运行 Semgrep（多语言 SAST），从共享执行缓存分流解析。
+
+        命令见 _semgrep_execute_cached。本函数只取**非 taint 规则**的命中
+        （taint 规则 id 以 "-taint" 结尾，由 _run_semgrep_taint 解析）——
+        保持与合并前"sast 命令不含 taint 规则"完全一致的输出面。
+        """
+        data = self._semgrep_execute_cached(path)
+        if data is None:
             return []
         findings: list[ExternalFinding] = []
         for r in data.get("results", []):
+            rule_id = str(r.get("check_id", ""))
+            if rule_id.endswith("-taint"):
+                continue  # taint 规则命中归 _run_semgrep_taint（分流，不双计）
             extra = r.get("extra", {}) or {}
             start = r.get("start", {}) or {}
             findings.append(ExternalFinding(
                 tool="semgrep",
-                rule_id=str(r.get("check_id", "")),
+                rule_id=rule_id,
                 severity=normalize_severity(str(extra.get("severity", "INFO"))),
                 message=str(extra.get("message", "")),
                 filename=str(r.get("path", "")),
@@ -521,31 +596,18 @@ class ExternalScanner:
         return findings
 
     def _run_semgrep_taint(self, path: str, language: str) -> list[dict]:
-        """运行自研 Semgrep taint 规则，解析污点路径 finding。
+        """解析自研 Semgrep taint 规则的污点路径 finding（P2-8 起从共享缓存取数）。
 
-        命令：semgrep --json --quiet --config <semgrep_rules 目录> <path>
-        输出 JSON 含 results 数组，每项含 check_id / path / start.line /
-        extra.severity / extra.message / extra.metavars。
-
-        semgrep 的 taint 模式会自动向 extra.metavars 注入 $SOURCE / $SINK
-        （source/sink 的实际表达式与位置），据此填充 source/sink/行号；
+        命令见 _semgrep_execute_cached（sast + taint 规则合并为一次执行）。
+        本函数只取 **"-taint" 结尾规则**的命中，从 extra.metavars 提取
+        $SOURCE / $SINK（semgrep taint 模式自动注入的实际表达式与位置），
         传播链从 extra.dataflow_trace 或 extra.taint_source 提取。
 
         Returns:
             候选 finding dict 列表（见 scan_taint 文档）。失败/无结果返回 []。
         """
-        out = self._run_subprocess(
-            ["semgrep", "--json", "--quiet", "--config", _TAINT_RULES_DIR, path]
-        )
-        if not out or not out.strip():
-            return []
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            return []
-        if data.get("errors"):
-            print(f"[ExternalScanner] semgrep taint 报告错误: "
-                  f"{str(data['errors'][0])[:200]}")
+        data = self._semgrep_execute_cached(path)
+        if data is None:
             return []
 
         findings: list[dict] = []
@@ -553,6 +615,8 @@ class ExternalScanner:
             extra = r.get("extra", {}) or {}
             start = r.get("start", {}) or {}
             rule_id = str(r.get("check_id", ""))
+            if not rule_id.endswith("-taint"):
+                continue  # sast 规则命中归 _run_semgrep（分流，不双计）
             # 从规则 id 推断 taint_type 与默认严重度（sqli→SQL Injection 等）
             # 注意顺序：codei（CWE-95 代码注入）必须先于 cmdi 判断，避免子串误归
             taint_type, sev = _TAINT_TYPE_BY_RULE.get(
@@ -622,6 +686,7 @@ class ExternalScanner:
         try:
             data = json.loads(out)
         except json.JSONDecodeError:
+            self.last_status["gitleaks"] = "parse_error"  # 执行层留痕（消静默）
             return []
         # gitleaks 输出为数组；个别版本可能包在 {"Results": [...]} 中
         if isinstance(data, dict):
@@ -634,11 +699,19 @@ class ExternalScanner:
             severity = normalize_severity(raw_sev)
             if not raw_sev:
                 severity = "high"  # 工具未给等级时密钥泄露默认高危
+            # 2026-08-31：message 附命中行原文（gitleaks JSON 的 Match 字段）。
+            # 此前 message 只有通用描述（不含凭证值）→ ① 凭证强度门槛
+            # （_is_strong_credential 从引号提取值）取不到字面值恒判弱；
+            # ② detect-secrets 弱值候选绕过门槛直出抢 top1（§9.19 实锤）。
+            msg = str(r.get("Description", "") or r.get("RuleID", ""))
+            match_line = str(r.get("Match", "") or "").strip()
+            if match_line:
+                msg += f"\n[命中行] {match_line}"
             findings.append(ExternalFinding(
                 tool="gitleaks",
                 rule_id=str(r.get("RuleID", "")),
                 severity=severity,
-                message=str(r.get("Description", "") or r.get("RuleID", "")),
+                message=msg,
                 filename=str(r.get("File", "")),
                 line=int(r.get("StartLine", 0) or 0),
                 category="secret",
@@ -664,6 +737,7 @@ class ExternalScanner:
         try:
             data = json.loads(out)
         except json.JSONDecodeError:
+            self.last_status["trivy"] = "parse_error"  # 执行层留痕（消静默）
             return []
         findings: list[ExternalFinding] = []
         for result in data.get("Results", []):
@@ -701,6 +775,7 @@ class ExternalScanner:
         try:
             data = json.loads(out)
         except json.JSONDecodeError:
+            self.last_status["trivy"] = "parse_error"  # 执行层留痕（消静默）
             return []
         findings: list[ExternalFinding] = []
         for result in data.get("Results", []):
@@ -744,6 +819,7 @@ class ExternalScanner:
             try:
                 data = json.loads(out)
             except json.JSONDecodeError:
+                self.last_status["pip-audit"] = "parse_error"  # 执行层留痕（消静默）
                 continue
             for dep in data.get("dependencies", []):
                 for v in dep.get("vulns", []):
@@ -765,27 +841,52 @@ class ExternalScanner:
     def _run_detect_secrets(self, path: str) -> list[ExternalFinding]:
         """运行 detect-secrets（熵值 + 正则双引擎密钥检测，误报低于纯正则）。
 
-        命令：detect-secrets scan --all-files <path>
-        输出 baseline JSON：{"results": {"<file>": [{"type","line_number",
-        "hashed_secret","is_verified"}]}}
+        命令：detect-secrets scan --all-files <basename>（工作目录 = 文件所在目录）
+
+        **路径形态是硬性约束（2026-08-31 实锤，与 B1 同型的接入层缺陷）**：
+        detect-secrets 1.5.0 传入**绝对路径**时 `results` 恒为 `{}`（实测：同一
+        文件 `--all-files /tmp/x.py` 零召回、`--all-files x.py` + cwd=/tmp 正常召回
+        Secret Keyword + AWS Access Key）。此前接入层固定传绝对路径 → 该工具
+        在整个项目生命周期内**从未产出过任何发现**，而冒烟脚本把"阳性零召回"
+        降级为 SKIP，把这个必然失败伪装成了"插件/版本相关的环境差异"。
+
+        修复：切到目标文件所在目录，只传文件名。results 的键随之变为文件名，
+        故 filename 字段回填为调用方传入的原始 path，保持语义不变。
         """
-        out = self._run_subprocess(["detect-secrets", "scan", "--all-files", path])
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        basename = os.path.basename(path)
+        out = self._run_subprocess(
+            ["detect-secrets", "scan", "--all-files", basename], cwd=directory)
         if not out or not out.strip():
             return []
         try:
             data = json.loads(out)
         except json.JSONDecodeError:
+            self.last_status["detect-secrets"] = "parse_error"  # 执行层留痕（消静默）
             return []
         findings: list[ExternalFinding] = []
-        for filename, items in (data.get("results") or {}).items():
+        # 行内容缓存：detect-secrets JSON 不含命中文本（只有 type/line_number），
+        # 读一次源文件按行取——凭证强度门槛需要行内的引号字面值（2026-08-31）
+        src_lines: list[str] = []
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                src_lines = fh.readlines()
+        except OSError:
+            src_lines = []
+        for _filename, items in (data.get("results") or {}).items():
             for item in items:
+                line_no = int(item.get("line_number", 0) or 0)
+                msg = f"检测到疑似密钥: {item.get('type', '')}"
+                if 0 < line_no <= len(src_lines):
+                    msg += f"\n[命中行] {src_lines[line_no - 1].strip()}"
                 findings.append(ExternalFinding(
                     tool="detect-secrets",
                     rule_id=str(item.get("type", "Secret")),
                     severity="high",  # 密钥泄露默认高危（与 gitleaks 口径一致）
-                    message=f"检测到疑似密钥: {item.get('type', '')}",
-                    filename=str(filename),
-                    line=int(item.get("line_number", 0) or 0),
+                    message=msg,
+                    # 回填原始 path：results 的键是传给工具的 basename（见 docstring）
+                    filename=str(path),
+                    line=line_no,
                     category="secret",
                 ))
         return findings

@@ -55,6 +55,10 @@ from graduation_project.schema import normalize_has_vulnerability, parse_verdict
 from graduation_project.cwe_normalizer import normalize_cwe_label, normalize_with_evidence
 from graduation_project.code_slicer import CodeSlicer
 from graduation_project.line_normalizer import normalize_line_numbers
+from graduation_project.blind_spots import (
+    scan_blind_spots, render_for_prompt, build_review_context,
+)
+from graduation_project.risk_budget import score_file
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +74,11 @@ _MONITOR = {
     # 此前键缺失 → _monitor_incr 抛 KeyError → _maybe_recheck 异常 → 整文件
     # "分析失败"。长文件（>num_ctx×0.45）无候选时必然踩中。
     "recheck_prescreened": 0,
+    # 2026-08-31 补：定向复核（no_candidate_mode="targeted")的分档计数。
+    # A/B/C 三档互斥且穷尽，供"注意力预算"章节的帕累托分析取数。
+    "recheck_tier_a": 0,        # 高危+盲区：盲区片段 × min(3,n) 票
+    "recheck_tier_b": 0,        # 低危+盲区：盲区片段 × 1 票
+    "recheck_tier_c": 0,        # 零盲区：不送 LLM（显式留痕"未经 LLM 复核"）
 }
 _MONITOR_LOCK = threading.Lock()
 
@@ -272,6 +281,18 @@ _STANDARD_TAINT_TYPES = frozenset({
     # 注入（CWE-917）——typical_36 的 semgrep spel-injection 精确命中被当无主
     # 剔除（主漏洞证据丢失）。cwe_normalizer 已有 SpEL→CWE-917 映射，类型对齐。
     "SpEL Injection",
+    # --- 第四波类型（2026-08-31，长尾注入族 + VFlask 审计缺口配套）：prefilter
+    # 第四波新规则的 taint_type 与外部工具同语义告警的推断结果统一进白名单，
+    # 防 sast 告警（bandit/semgrep 未来命中同形态）被当"无主告警"剔除。
+    "XPath Injection", "Type Juggling", "Mass Assignment",
+    "Improper Verification of Cryptographic Signature",   # CWE-347（jwt_verify_disabled）
+    "Information Exposure Through Error Message",         # CWE-209（error_info_exposure）
+    "Cleartext Storage of Sensitive Information",         # CWE-312（cleartext_sensitive_storage）
+    # 2026-08-31 补（NodeGoat 审计）：semgrep express-cookie-settings 族——
+    # session(...) 缺 httpOnly/secure/domain/expires/path 配置的 6 条精确告警
+    # 此前全部被当"无主告警"剔除（CWE-1004/614 类 cookie flag 缺陷无类型承接）。
+    "Insecure Cookie",
+    "Unrestricted File Upload",                           # CWE-434（unrestricted_file_upload）
 })
 
 # sast/iac 告警 evidence 中"告警行上下文"片段的标记（P0.3 追加 / _infer_taint_type
@@ -332,11 +353,17 @@ def _is_strong_credential(evidence: str) -> bool:
 
     门槛：① 从 '...' 引号中提取候选字面值；② 长度 ≥ 12 且香农熵 ≥ 3.0，
     或长度 ≥ 20（长随机串熵可能偏低但明显非占位符）；③ 命中弱值词表直接判否。
-    取不到字面值时（工具未给出）→ 判否，走裁决档由模型判断，避免误直出。
+    引号提取失败的兜底（2026-08-31，typical_06 实锤）：gitleaks 的 Match 字段
+    是**裸值**（无引号无赋值，如 "AKIAIOSFODNN7EXAMPLE"）→ 引号分支恒判弱 →
+    真凭证被误转裁决档。兜底：evidence 中存在 ≥20 位连续密钥形态 token
+    （[A-Za-z0-9+/=_-]，AKIA ID / hex / base64 的共同形态）即判真。
+    仍取不到任何值 → 判否，走裁决档由模型判断，避免误直出。
     """
     m = re.search(r"[\"']([^\"']{4,})[\"']", evidence or "")
     if not m:
-        return False
+        # 裸值兜底：gitleaks Match 常为无引号的值本身
+        bare = re.search(r"[A-Za-z0-9+/=]{20,}", evidence or "")
+        return bool(bare)
     val = m.group(1)
     if _SECRET_WEAK_VALUE_RE.match(val):
         return False
@@ -693,6 +720,13 @@ class TwoStageScanner:
             LLM 复核，消除"无证据判安全"的静默放行，供安全关键场景）。
     """
 
+    # 定向复核（no_candidate_mode="targeted"）的档位阈值。
+    # A 档门槛：文件风险分 ≥ 此值，或高优先级盲区 ≥ TARGETED_HIGH_SPOTS 条。
+    # 12.0 的依据（risk_budget 自检实测）：含外部源+sink+入口点的业务文件得分
+    # 约 20~40；纯工具层/DTO 为负分。12 足以把"有实际攻击面"与"无"分开。
+    TARGETED_HIGH_RISK_SCORE = 12.0
+    TARGETED_HIGH_SPOTS = 2
+
     def __init__(
         self,
         client,
@@ -713,6 +747,7 @@ class TwoStageScanner:
         use_signal_feedback: bool = True,
         use_counterfactual: bool = True,
         triage_aligned: bool = False,
+        use_blind_spots: Optional[bool] = None,
     ):
         self.client = client
         self.system_prompt = system_prompt
@@ -738,8 +773,22 @@ class TwoStageScanner:
         #   "sampled"     —— 10% 抽样 LLM 复核（监控工具层漏报率，省算力）
         #   "full_recheck"—— 每个无候选文件都全量 LLM 复核（消除"无证据判安全"，
         #                     供 URL/GitHub 等安全关键场景）
+        #   "targeted"    —— 三档定向复核（2026-08-31）：按"文件风险分 × 盲区命中"
+        #                     分配注意力，零盲区文件不送 LLM。大仓库场景下替代
+        #                     full_recheck——后者对每个无候选文件都做全文件 × N 票，
+        #                     成本随仓库规模线性爆炸且大多花在零风险文件上。
         self.no_candidate_mode = (
-            no_candidate_mode if no_candidate_mode in ("sampled", "full_recheck") else "sampled"
+            no_candidate_mode
+            if no_candidate_mode in ("sampled", "full_recheck", "targeted")
+            else "sampled"
+        )
+        # 工具层盲区提醒（graduation_project/blind_spots.py）：
+        # 把"工具写不了规则或写了会误报爆炸"的位置以行级提示注入 prompt，
+        # 只描述工具的能力边界，不产生 finding、不进裁决、永不进抑制池。
+        # 默认开启（VULN_SCANNER_BLIND_SPOTS=0 关闭，供 FP 影响消融）。
+        self.use_blind_spots = (
+            use_blind_spots if use_blind_spots is not None
+            else os.environ.get("VULN_SCANNER_BLIND_SPOTS", "1") == "1"
         )
         # 自适应闭环（决策记录见 docs/方法论_工具模型自适应闭环.md）：
         # 无候选复核判 True 时采信 LLM（语义兜底），而非转人工 review。
@@ -900,9 +949,23 @@ class TwoStageScanner:
         self._last_suppressed = False
         self._last_suppressed_rules = []
         self._dropped_unowned_rules = []
+        self._last_tool_status = {}  # P2-9：外部工具执行状态（_stage1_recall 中更新）
+        # 工具层盲区（请求级）：Stage 1 之后计算，裁决/复核两条路径共用同一份，
+        # 保证"同一文件的盲区提醒"在一次扫描内完全一致（可复现）。
+        self._last_blind_spots = None
 
         # Stage 1：工具召回
         findings = self._stage1_recall(code, language, filename)
+        # 工具层盲区定位（纯确定性，无 LLM）：无论有无候选都算——
+        # 有候选 → 附在裁决上下文（零额外调用）；无候选 → 决定定向复核档位与片段。
+        if self.use_blind_spots:
+            try:
+                self._last_blind_spots = scan_blind_spots(code)
+            except Exception as e:
+                # 盲区是**旁路提示**，任何异常都不得中断召回主流程
+                # （与 _drop_irrelevant_positional 的留痕容器同因）
+                print(f"[TwoStageScanner] 盲区扫描失败（降级无提醒）: {e}")
+                self._last_blind_spots = None
         result.findings = findings
         result.stage1 = self._stage1_stats(findings)
         result.stage1["recall_duration"] = round(time.time() - start, 2)
@@ -919,20 +982,51 @@ class TwoStageScanner:
                 "count": len(self._dropped_unowned_rules),
                 "rule_ids": sorted(set(self._dropped_unowned_rules)),
             }
+        # P2-9（2026-08-31）：外部工具执行状态写进 stage1。"工具层零召回"由此
+        # 可归因到执行层：ok=正常跑完 / empty=无输出 / parse_error=输出不可解析 /
+        # timeout / not_found / os_error。仅在有异常状态时记录，正常 ok 不占字典。
+        abnormal = {t: s for t, s in self._last_tool_status.items() if s != "ok"}
+        if abnormal:
+            result.stage1["tool_status"] = abnormal
+        if self._last_blind_spots is not None and self._last_blind_spots.count:
+            # 盲区留痕（§五之四 同构思路）：与 suppressed/dropped 一样写进 stage1，
+            # 让"模型看到了什么提示"可被审计——盲区提醒会实质影响模型判断，
+            # 不可见即不可控。
+            result.stage1["blind_spots"] = self._last_blind_spots.to_dict()
 
         # 无候选 → 判安全但复核：sampled=按比例抽样复核（监控工具层召回漂移）；
-        # full_recheck=全量 LLM 复核（安全关键场景，消除"无证据判安全"的静默放行）。
+        # full_recheck=全量 LLM 复核（安全关键场景，消除"无证据判安全"的静默放行）；
+        # targeted=三档定向复核（按风险分 × 盲区分配注意力，大仓库默认）。
         # force=本文件发生抑制跳过/无主告警剔除（_last_suppressed）→ 强制复核
         if not findings:
-            recheck = self._maybe_recheck(code, language, force=self._last_suppressed)
+            recheck = self._maybe_recheck(
+                code, language, force=self._last_suppressed, filename=filename)
             result.has_vulnerability = False
             result.stage1["decision"] = "no_candidate_safe"
             if recheck is not None:
                 result.stage1["recheck"] = recheck
+                if recheck.get("tier") == "C":
+                    # 定向复核 C 档：零盲区 → 未送 LLM。
+                    # 关键：这不是"复核判安全"（那需要 LLM 真的看过），而是
+                    # "注意力预算未覆盖"。故 decision 单独取值，且**不转人工**——
+                    # 否则每个零风险文件都会变成一条待办，review 队列被淹没。
+                    # 留痕在 stage1.recheck 里（tier/C），前端与审计可区分二者。
+                    result.has_vulnerability = False
+                    result.stage1["decision"] = "no_candidate_no_blind_spot"
+                    result.explanation = (
+                        "工具层无候选，且未命中任何工具层盲区形态——该文件未获得"
+                        "LLM 复核预算（定向复核 C 档）。这不等于经 LLM 确认安全。")
+                    result.total_duration = time.time() - start
+                    return result
                 if recheck.get("has_vulnerability") is True:
                     n = int(recheck.get("n") or 1)
                     votes_true = int(recheck.get("votes_true") or (1 if n == 1 else 0))
                     unanimous = n > 0 and votes_true == n
+                    # 定向复核 B 档（低危+盲区，单票）：n=1 时的"全票"只是"没人
+                    # 反对"，不是"三票一致"。无工具证据的采信必须是最高置信级别，
+                    # 故 B 档判真一律转人工复核（走下方 recheck_low_conf_review）。
+                    if recheck.get("tier") == "B":
+                        unanimous = False
                     if self.trust_llm_recheck and unanimous:
                         # 复核采信门（2026-08-18 修正）：无候选复核是全凭 LLM 的
                         # 最高置信采信路径。注入型漏洞必须与代码形态匹配（sink 存在
@@ -1116,7 +1210,8 @@ class TwoStageScanner:
         # 命中且全票判真 → 采信为漏洞（与无候选 trust_llm_recheck 同门槛）。
         if (result.has_vulnerability is False and result.adjudications
                 and self.trust_llm_recheck and code):
-            recheck = self._maybe_recheck(code, language, force=True, count_monitor=False)
+            recheck = self._maybe_recheck(
+                code, language, force=True, count_monitor=False, filename=filename)
             if recheck is not None and recheck.get("has_vulnerability") is True:
                 n = int(recheck.get("n") or 1)
                 votes_true = int(recheck.get("votes_true") or (1 if n == 1 else 0))
@@ -1262,10 +1357,15 @@ class TwoStageScanner:
                 or "xml external entity" in text or "entity expansion" in text
                 or re.search(r"b40[5-9]", text)):
             return "XXE"
+        # XPath 注入（2026-08-31 第四波）：lxml .xpath / Java XPath 评估语义。
+        # 裸 "xpath" 专属性强（无第二漏洞语义），可安全归型。
+        if "xpath" in text:
+            return "XPath Injection"
         # SpEL（2026-08-30 逐条审查补）：typical_36 的 semgrep spel-injection
         # 精确命中被当无主剔除（主漏洞 CWE-94/917 证据丢失）。cwe_normalizer
-        # 已有 SpEL→CWE-917 映射。
-        if "spel" in text or "expression parser" in text:
+        # 已有 SpEL→CWE-917 映射。ognl（2026-08-31 第四波补）：OGNL 表达式求值
+        # 与 SpEL 同属"表达式注入"族，cwe_normalizer 的 ognl 关键词同归 CWE-917。
+        if ("spel" in text or "ognl" in text or "expression parser" in text):
             return "SpEL Injection"
         # Code Injection（2026-08-30 逐条审查补）：eval 族告警（bandit B307、
         # semgrep eval-detected/user-eval）此前无推断分支——typical_08 的 3 条
@@ -1310,6 +1410,17 @@ class TwoStageScanner:
             return "Server-Side Template Injection"
         if "pickle" in text or "deserial" in text or "yaml" in text:
             return "Insecure Deserialization"
+        # fastjson（2026-08-31 第四波补）：JSON.parseObject / fastjson 语义归
+        # 反序列化——hard_cve_08（CWE-502）族的 semgrep/bandit 同语义告警承接。
+        if "parseobject" in text or "fastjson" in text:
+            return "Insecure Deserialization"
+        # JWT 签名校验关闭（2026-08-31 第四波补）：jwt/verify_signature 专属性
+        # 强，无撞词。注意在 TLS 分支之前无碍——TLS 用 certificate 专词，JWT
+        # 证据不含；反过来 JWT 分支的 "verify" 语义不能裸用（B501 evidence 是
+        # "verify=False" 但含 certificate 专词 → 走 TLS 分支，不冲突）。
+        if ("jwt" in text or "verify_signature" in text
+                or "none algorithm" in text or "algorithm.**none**" in text):
+            return "Improper Verification of Cryptographic Signature"
         # ↓↓↓ P2 类型族（2026-08-29，与 prefilter P2 规则 taint_type 对齐）：
         # 这些类型模型完全可以裁决，但此前既无 _infer_taint_type 分支、
         # 又不在 _STANDARD_TAINT_TYPES 白名单 → bandit/semgrep 带精确行号的
@@ -1344,6 +1455,12 @@ class TwoStageScanner:
         if ("log_injection" in text or "logger" in text or "logging" in text
                 and ("inject" in text or "newline" in text or "crlf" in text)):
             return "Log Injection"
+        # 不安全 Cookie 配置（2026-08-31，NodeGoat 审计）：semgrep
+        # express-cookie-settings 族 rule_id 特有片段（no-httponly/no-secure/
+        # cookie-settings）——证据词专属性强，无撞词面。
+        if ("no-httponly" in text or "no-secure" in text
+                or "cookie-settings" in text or "cookie-flags" in text):
+            return "Insecure Cookie"
         return tt
 
     def _counterfactual_pass(self, adjudications, code, language, filename) -> None:
@@ -1545,6 +1662,34 @@ class TwoStageScanner:
         if not hasattr(self, "_last_suppressed_rules"):
             self._last_suppressed_rules = []
         for f in findings:
+            if f.category == "secret":
+                # 2026-08-31 统一门槛（§9.19 实锤）：凭证强度门槛此前只接了
+                # sast 通道（B105 经 _is_secret_class_alert 转档时判定），
+                # gitleaks/detect-secrets 的**原生 secret 候选完全绕过**——
+                # detect-secrets 修复绝对路径缺陷后首次大量产出，其 Secret
+                # Keyword 插件对测试惯用弱密码（admin123）直接告警 → 绕门槛
+                # 直出（1:0，免 LLM）→ _aggregate top1 被 "Secret Keyword"
+                # 抢占（typical_14/15/16/bypass_05/crossfile_03_sink 五段，
+                # 08-30 时模型经无候选兜底独立归因出的主类型通道被关闭）。
+                # 同一个凭证，bandit 看到要过门槛、detect-secrets 看到直接
+                # 直出——门槛语义必须按"凭证内容强度"统一，不分工具：
+                #   过门槛（真凭证形态）→ 保持 secret 直出（typical_06/
+                #     hardcoded_secret_01 等，B3 直出增益保留）；
+                #   不过（弱值/取不到字面值）→ 转裁决档（category→sast 与
+                #     B105 弱值完全对称），类型规范化 Hardcoded Credentials，
+                #     交模型裁决——evidence 现含命中行原文（runner 层增强），
+                #     模型有判断材料。
+                if _is_strong_credential(f.evidence or ""):
+                    # 直出的真凭证同样规范化类型：裸工具 type 名（Secret Keyword）
+                    # 进 top1 会成为无法归因的显示（与 B105 转档同语义，§9.19）
+                    f.taint_type = "Hardcoded Credentials"
+                    kept.append(f)
+                    continue
+                f.category = "sast"
+                f.taint_type = "Hardcoded Credentials"
+                re_routed.append(f.rule_id or "")
+                kept.append(f)
+                continue
             if f.category in ("sast", "iac"):
                 claimed = self._infer_taint_type(f.to_dict())
                 if claimed not in _STANDARD_TAINT_TYPES:
@@ -1820,22 +1965,29 @@ class TwoStageScanner:
         return parts, info
 
     def _maybe_recheck(self, code: str, language: str, force: bool = False,
-                       count_monitor: bool = True) -> Optional[dict]:
+                       count_monitor: bool = True, filename: str = "") -> Optional[dict]:
         """无候选文件的 LLM 复核：监控 Stage 1 召回漂移，或全量复核消除静默放行。
 
         - no_candidate_mode="sampled"：按 sampling_rate 抽样（默认 10%），用主扫描
           prompt 全量判一次，给出工具层漏报率的在线估计（tool_recall_monitor_snapshot）。
         - no_candidate_mode="full_recheck"：每个无候选文件都复核（采样率视为 1），
           供 URL/GitHub 等安全关键场景——"无候选"不再直接判安全，先问一次 LLM。
+        - no_candidate_mode="targeted"（2026-08-31）：三档定向复核，按"文件风险分
+          × 盲区命中"分配注意力，零盲区文件不送 LLM。大仓库替代 full_recheck。
         - force=True（审查 #4，2026-08-16）：本文件发生抑制跳过时强制复核。
         - count_monitor=False（裁决全否决兜底调用）：该场景文件有候选，不算
           "无候选"文件，no_candidate_total 是召回监控指标，不能被污染。
 
         Returns:
             {"sampled": True, "has_vulnerability": bool|None}；未抽样时返回 None。
+            targeted 模式下 C 档返回 {"sampled": False, "tier": "C", ...}。
         """
         if count_monitor:
             _monitor_incr("no_candidate_total")
+        if self.no_candidate_mode == "targeted" and not force:
+            # 定向复核：三档。force 时不走此路（抑制跳过的文件必须真复核，
+            # 否则 §五之四 的"静默放行"会以另一种形式复现）。
+            return self._targeted_recheck(code, language, filename=filename)
         if force:
             sampled = True
         elif self.no_candidate_mode == "full_recheck":
@@ -1920,6 +2072,160 @@ class TwoStageScanner:
         if true_verdict:
             for k in ("vulnerability_type", "risk_level", "explanation", "fix_suggestion",
                       "source", "sink"):
+                v = true_verdict.get(k) or ""
+                if v and v.lower() not in ("none", "no fix needed", "n/a"):
+                    out[k] = v
+        return out
+
+    # ------------------------------------------------------------------
+    # 三档定向复核（2026-08-31，no_candidate_mode="targeted"）
+    # ------------------------------------------------------------------
+    def _targeted_recheck(self, code: str, language: str,
+                          filename: str = "") -> dict:
+        """按"文件风险分 × 盲区命中"给无候选文件分配 LLM 注意力。
+
+        为什么需要它：full_recheck 对每个无候选文件都做**全文件 × min(3,n) 票**，
+        成本随文件数线性爆炸，且大部分预算花在零风险文件（utils/dto/常量表）上。
+        大仓库 50 文件 × 3 票 × 全文件上下文，是分钟到十分钟量级。
+
+        三档（2026-08-31 修正，见下方 §为什么零盲区不等于不送）：
+          A 档｜有盲区 且（风险分 ≥ TARGETED_HIGH_RISK_SCORE，或高优先级盲区 ≥ 2 条）
+              → 盲区片段 × min(3, n_samples) 票（与 full_recheck 同置信级别）
+          B 档｜有盲区但低危；**或零盲区但高风险分**
+              → 片段 × 1 票。单票判真**不具采信资格**（由 scan_code 的
+                tier=="B" 判断拦下转 review）——"一票通过"是没人反对，不是三票
+                一致，而无工具证据的采信必须是最高置信级别。
+          C 档｜零盲区 且 低风险分
+              → 不送 LLM，返回 tier="C" 由上层显式留痕"未获得复核预算"；
+                但仍按 sampling_rate 抽样（默认 10%），抽样命中降级为 B 档。
+
+        § 为什么"零盲区"不能直接等于"不送 LLM"（自检实证）：
+          盲区规则覆盖的是**工具写不了规则**的形态（越权、过滤可绕过性…），
+          而 SQL 注入/命令注入/路径穿越/XSS 这类**工具本该召回**的形态并不在
+          盲区表里。若一律按"零盲区→跳过"处理，一旦工具因规则不覆盖、语言不
+          支持、新框架而零召回，这些漏洞就被静默放行——正是本项目一贯要消除
+          的静默性。故加两道保险：
+            1) 风险分高（有外部源+sink+入口点 = 有实际攻击面）却零召回，是
+               **工具失效的信号**，比"文件没内容"更值得复核 → 降 B 档；
+            2) C 档按 sampling_rate 抽样复核，在线估计"零盲区文件的漏报率"
+               （复用 sampled 模式原有的监控语义，非新增机制）。
+
+        省时的两个来源（可分别关掉做消融）：
+          1. C 档省掉整次调用（大仓库的主要收益）；
+          2. A/B 档把"整文件"换成"盲区片段"（自检实测 5575→285 字符，5.1%），
+             模型从"读 1000 行找漏洞"变成"看几个带行号的 13 行片段判漏洞"。
+        """
+        report = self._last_blind_spots
+        if report is None:
+            # 兜底：盲区扫描被关闭或失败时临时算一次（保证档位判定始终有依据）
+            try:
+                report = scan_blind_spots(code)
+            except Exception:
+                report = None
+
+        risk = score_file(filename or "", language, code)
+        n_spots = report.count if report else 0
+
+        # ---- 档位判定 ----
+        if n_spots > 0:
+            if (risk.score >= self.TARGETED_HIGH_RISK_SCORE
+                    or report.high_priority_count >= self.TARGETED_HIGH_SPOTS):
+                tier, why = "A", "high_risk_or_high_spots"
+            else:
+                tier, why = "B", "low_risk_with_spots"
+        elif risk.score >= self.TARGETED_HIGH_RISK_SCORE:
+            tier, why = "B", "zero_spot_but_high_risk"   # 保险 1：工具失效信号
+        else:
+            tier, why = "C", "zero_spot_low_risk"
+
+        # ---- 保险 2：C 档抽样（在线监控零盲区文件的漏报率）----
+        if tier == "C" and self.sampling_rate > 0 and random.random() < self.sampling_rate:
+            tier, why = "B", "c_tier_sampled"
+
+        if tier == "C":
+            _monitor_incr("recheck_tier_c")
+            return {"sampled": False, "tier": "C", "has_vulnerability": None,
+                    "reason": why, "risk_score": round(risk.score, 2)}
+
+        n = max(1, min(3, self.n_samples)) if tier == "A" else 1
+        _monitor_incr("recheck_tier_a" if tier == "A" else "recheck_tier_b")
+        _monitor_incr("recheck_sampled")
+
+        # ---- 复核上下文：有盲区用盲区片段，零盲区用预筛块/整文件 ----
+        prescreen_info = None
+        if n_spots > 0:
+            # 盲区片段替代整文件；构建失败回退整文件——宁可慢也不能静默看不全
+            # （00071/00074：ollama 静默截断后"自信判安全"的教训）。
+            ctx = build_review_context(code, report, window=6)
+            recheck_code = ctx if ctx else code
+        else:
+            # 零盲区无定位信息：退化为整文件；超长时走已有的确定性分块预筛
+            ctx = None
+            recheck_code = code
+            est_tokens = len(code) // 2 + code.count("\n")
+            if est_tokens > self.num_ctx * 0.45:
+                picked, prescreen_info = self._prescreen_chunks(code, language)
+                if picked:
+                    recheck_code = "\n\n".join(picked)
+                    _monitor_incr("recheck_prescreened")
+
+        votes_true = votes_false = votes_invalid = 0
+        true_verdict: Optional[dict] = None
+        true_types: list = []
+        try:
+            prompt = build_user_prompt(code=recheck_code, language=language)
+            vote_results = self._sample_votes(
+                prompt, n,
+                temperature=(max(self.temperature, 0.7) if n > 1 else self.temperature),
+            )
+            for resp in vote_results:
+                text = resp.get("text", "") if isinstance(resp, dict) else ""
+                verdict = parse_verdict(text) if text else None
+                hv_i = (normalize_has_vulnerability(verdict.get("has_vulnerability"))
+                        if verdict else None)
+                if hv_i is True:
+                    votes_true += 1
+                    if verdict:
+                        if true_verdict is None:
+                            true_verdict = verdict
+                        vt_i = (verdict.get("vulnerability_type") or "").strip()
+                        if (vt_i and vt_i.lower() not in ("none", "n/a", "unknown")
+                                and vt_i not in true_types):
+                            true_types.append(vt_i)
+                elif hv_i is False:
+                    votes_false += 1
+                else:
+                    votes_invalid += 1
+        except Exception as e:
+            return {"sampled": True, "tier": tier, "has_vulnerability": None,
+                    "error": str(e), "votes_true": votes_true,
+                    "votes_false": votes_false, "votes_invalid": votes_invalid,
+                    "n": n, "risk_score": round(risk.score, 2), "reason": why}
+
+        if votes_true > votes_false:
+            hv = True
+        elif votes_false > votes_true:
+            hv = False
+        else:
+            hv = None
+        if hv is True:
+            _monitor_incr("recheck_vuln_found")
+        out = {
+            "sampled": True, "tier": tier, "reason": why,
+            "targeted_context": ctx is not None,   # 是否用了盲区片段（False=整文件回退）
+            "has_vulnerability": hv,
+            "votes_true": votes_true, "votes_false": votes_false,
+            "votes_invalid": votes_invalid, "n": n,
+            "risk_score": round(risk.score, 2),
+            "blind_spot_count": report.count if report else 0,
+        }
+        if prescreen_info:
+            out["prescreen"] = prescreen_info
+        if true_types:
+            out["types"] = true_types
+        if true_verdict:
+            for k in ("vulnerability_type", "risk_level", "explanation",
+                      "fix_suggestion", "source", "sink"):
                 v = true_verdict.get(k) or ""
                 if v and v.lower() not in ("none", "no fix needed", "n/a"):
                     out[k] = v
@@ -2145,6 +2451,12 @@ class TwoStageScanner:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+            # P2-9 执行状态留痕（2026-08-31）：工具超时/未找到/解析失败此前与
+            # "无命中"在结果上不可区分（B1 静默性同构）。旁路记录，异常不中断。
+            try:
+                self._last_tool_status = dict(getattr(self._external, "last_status", {}))
+            except Exception:
+                self._last_tool_status = {}
 
         for category, items in groups.items():
             for item in items:
@@ -2202,6 +2514,11 @@ class TwoStageScanner:
         # 与 TaintTracker 同流 finding 的主键永不相等；此索引让"空证据 + 同 sink 行
         # + 同类型"的候选能合并到已有 finding 上，避免同一流被裁决两次
         by_sink_line: dict[tuple, tuple] = {}
+        # 2026-08-31：有证据候选的二级索引 (类型, source, sink 行) → key。
+        # TaintTracker 对同一调用会产出 sink 文本不同的两条（dvna L39 实测：
+        # 'cp:exec' 与 'exec('，source 同为 req.body、行同为 39），主键
+        # (类型, source, sink) 因 sink 文本差异永不相等，导致同一流进裁决两次。
+        by_src_line: dict[tuple, tuple] = {}
         # §三：语义族索引与族内 key 集合（无行号候选的歧义判定用）
         by_family_line: dict[tuple, tuple] = {}
         family_keys: dict[str, set] = {}
@@ -2213,6 +2530,26 @@ class TwoStageScanner:
         # 导致同流的 taint_tracker finding 无法归并
         def _has_evidence(f: ToolFinding) -> bool:
             return bool(_norm(f.source) or _norm(f.sink))
+
+        # 类型写回（2026-08-31，工具层优化指导 §9.8）：把工具内部标识统一成
+        # 语义名。候选的 taint_type 常是工具内部标识——bandit 的 B608/B324、
+        # semgrep 的**规则文件路径**；而 _infer_taint_type 能从 rule_id/evidence
+        # 推断出语义名（B608+SQL 拼接 → "SQL Injection"）。此前推断结果**只用于
+        # 归并分组、从不写回字段**，导致：
+        #   ① 进裁决的候选带着 `B608` 这种标识，模型只能靠 evidence 自己理解，
+        #      裁决输入质量受损（同一份信息，语义名比规则号直白得多）；
+        #   ② 审计/监控看到的类型与生产归并实际依据的类型不一致（测量偏差）。
+        # 写回后 _infer_taint_type 是**幂等**的（已是语义名时原样返回），
+        # 故不影响归并键的稳定性。
+        # 注意：仅当推断成功且与原值不同才覆盖，推断不出时保留原值——
+        # 宁可让裁决层看到规则号，也不能把有信息的类型抹成空。
+        for f in findings:
+            try:
+                inferred = TwoStageScanner._infer_taint_type(f.to_dict())
+            except Exception:
+                inferred = ""
+            if inferred and inferred != f.taint_type:
+                f.taint_type = inferred
 
         def _family(f: ToolFinding) -> str:
             """语义族键：语义类型名本身；规则号/长路径经 _infer_taint_type 推断。"""
@@ -2230,6 +2567,16 @@ class TwoStageScanner:
             norm_src, norm_sink = _norm(f.source), _norm(f.sink)
             key = (f.taint_type or "").lower(), norm_src, norm_sink
             family = _family(f)
+            # 二级归并（2026-08-31）：有证据候选在主键未命中时，按
+            # (类型, source, sink 行) 归并——仅 sink 文本描述不同属同一流。
+            # 三条件（类型+source+行）比主键只放宽 sink 文本一项，不会把
+            # 同行的不同 sink 调用（exec(a); exec(b)）误并——那种情况 source
+            # 不同（不同实参变量），此处要求 source 归一化后完全相同。
+            if (key not in seen and (norm_src or norm_sink) and f.sink_line):
+                alt = by_src_line.get(
+                    ((f.taint_type or "").lower(), norm_src, f.sink_line))
+                if alt is not None:
+                    key = alt
             if not norm_src and not norm_sink:
                 # 空证据候选：依次尝试 (类型, sink 行) / (语义族, sink 行) /
                 # 直出档 (category, sink 行) 归并到已有 finding
@@ -2279,6 +2626,9 @@ class TwoStageScanner:
                 # 有证据的 finding 注册 sink 行索引，供后续空证据候选归并
                 if (norm_src or norm_sink) and f.sink_line:
                     by_sink_line[((f.taint_type or "").lower(), f.sink_line)] = key
+                    # setdefault：归到首个（有证据候选先处理，证据最完整）
+                    by_src_line.setdefault(
+                        ((f.taint_type or "").lower(), norm_src, f.sink_line), key)
                 # §三：语义族/直出档索引对所有已见候选登记（含空证据有行号者）
                 if f.sink_line:
                     by_family_line.setdefault((family, f.sink_line), key)
@@ -2330,11 +2680,22 @@ class TwoStageScanner:
         """
         adjudications: list[AdjudicationVerdict] = []
         reviewer: list[dict] = []
+        # 盲区提醒注入（2026-08-31）：有候选时把行级盲区提醒附在裁决上下文，
+        # **零额外 LLM 调用**——复用本就存在的裁决采样。
+        # 只注入第一个裁决档候选：盲区提醒是"文件级"信息，对每个候选重复注入
+        # 会产生 N(采样) × M(候选) 倍的冗余 prefill，而信息量完全相同。
+        blind_text = ""
+        if self.use_blind_spots and self._last_blind_spots:
+            blind_text = render_for_prompt(self._last_blind_spots)
+        blind_injected = False
         for finding in findings:
             if self._is_direct_category(finding.category):
                 verdict = self._direct_adjudication(finding)
             else:
                 code_context = self._slice_context(code, language, finding)
+                if blind_text and not blind_injected:
+                    code_context = code_context + "\n\n" + blind_text
+                    blind_injected = True
                 verdict = self._adjudicate_one(finding, code_context, language, filename, rag_context)
             # 关联回源 finding（含 taint_type/severity），供前端逐条展示投票与置信度
             verdict.finding = finding.to_dict()
@@ -3487,8 +3848,267 @@ if __name__ == "__main__":
           f"vulnerability_types={_r3.vulnerability_types} "
           f"(期望 ['CWE-78 Command Injection']，两条候选为同一 CWE 的两套官方名)")
 
+    # --- 用例 #24（2026-08-31 第四波）：长尾注入族 prefilter 规则端到端 ---
+    # 8 条规则各自的命中 / 安全对照不命中；prefilter 候选的 taint_type 直通
+    # _stage1_recall（不落 _PREFILTER_TYPE 之外的类型，防"Detected"退化）。
+    ok_wave4 = True
+    _pf = Prefilter()
+    _w4_rules = {r.name: r for r in _pf.vuln_rules}
+    _w4_cases = [
+        ("xxe_unprotected_parse",
+         "from flask import request\nfrom lxml import etree\n"
+         "p = etree.XMLParser()\nroot = etree.fromstring(request.get_data(), parser=p)\n",
+         True),
+        ("xxe_unprotected_parse",
+         "from lxml import etree\n"
+         "p = etree.XMLParser(resolve_entities=False, no_network=True)\n"
+         "root = etree.fromstring(data, parser=p)\n", False),
+        ("ldap_injection",
+         "import ldap\nu = request.args.get('u')\n"
+         "f = f'(uid={u})'\n"
+         "conn = ldap.initialize('ldap://x')\n"
+         "conn.search_s('dc=x', ldap.SCOPE_SUBTREE, f)\n", True),
+        ("ldap_injection",
+         "import ldap\nu = request.args.get('u')\n"
+         "conn.search_s('dc=x', ldap.SCOPE_SUBTREE, '(uid=%s)', [u])\n", False),
+        ("nosql_query_injection",
+         "from pymongo import MongoClient\nu = request.form.get('u')\n"
+         "db.users.find_one({'user': u, 'pass': p})\n", True),
+        ("xpath_injection",
+         "x = f\"//user[username='{u}']\"\nr = tree.xpath(x)\n", True),
+        ("php_loose_compare", "<?php\nif ($u_token == $expected) { }\n"
+         "$u_token = $_GET['token'];\n", True),
+        ("php_loose_compare", "<?php\nif ($_POST['p'] == $_POST['c']) {}\n", False),
+        ("mass_assignment_setattr",
+         "data = request.get_json()\n"
+         "for key, value in data.items():\n    setattr(user, key, value)\n", True),
+        ("deser_fastjson",
+         "import com.alibaba.fastjson.JSON;\nObject o = JSON.parseObject(body);\n",
+         True),
+        ("ognl_expression_injection",
+         "String m = \"Error: \" + request.getHeader(\"C-Type\");\n"
+         "Object r = Ognl.getValue(m, ctx, null);\n", True),
+    ]
+    for _name, _code, _want in _w4_cases:
+        _hit = _w4_rules[_name].match(_code)
+        if _hit != _want:
+            ok_wave4 = False
+            print(f"  [FAIL] {_name}: hit={_hit} (期望 {_want})")
+    print(f"[{'PASS' if ok_wave4 else 'FAIL'}] 第四波长尾注入族: "
+          f"{len(_w4_cases)} 例（XXE/LDAP/NoSQL/XPath/PHP/setattr/fastjson/OGNL）")
+
+    # --- 用例 #25（2026-08-31）：三档定向复核 + 工具层盲区提醒 --------------
+    # 背景：大仓库里 no_candidate_mode="full_recheck" 对每个无候选文件都做
+    # 全文件 × min(3,n) 票，成本随文件数线性爆炸。定向复核按"文件风险分 ×
+    # 盲区命中"分配注意力，零盲区文件不送 LLM。
+    class _RecClient:
+        """记录每次调用的 prompt，用于验证"是否真的没调 LLM"与注入内容。"""
+
+        def __init__(self, outputs):
+            self.outputs = outputs
+            self.i = 0
+            self.prompts: list[str] = []
+
+        def generate(self, **kwargs):
+            self.prompts.append(kwargs.get("prompt", "") or "")
+            out = self.outputs[self.i % len(self.outputs)]
+            self.i += 1
+            return {"text": out, "error": None}
+
+    def _mk_targeted(code_replies, n_samples=3, sampling_rate=0.0):
+        # sampling_rate 显式传 0：C 档抽样是随机行为，测试必须确定性。
+        # （抽样本身有单独用例 25a-2 验证）
+        return TwoStageScanner(
+            client=_RecClient(code_replies), system_prompt="sys", n_samples=n_samples,
+            use_semgrep=False, use_taint_tracker=False, use_prefilter=False,
+            use_external=False, no_candidate_mode="targeted", sampling_rate=sampling_rate,
+            use_conformal=False, use_signal_feedback=False, use_counterfactual=False)
+
+    _safe_v = '{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None"}'
+    _vuln_v = ('{"has_vulnerability": true, "vulnerability_type": "CWE-639", '
+               '"risk_level": "High", "explanation": "无归属校验"}')
+
+    # 25a) C 档：零盲区的纯计算文件 → 一次 LLM 都不该调
+    _zero = "\n".join(f"v{i} = {i} * 2 + 1" for i in range(1, 40))
+    ts_c = _mk_targeted([_safe_v])
+    rc = ts_c.scan_code(_zero, "python", "utils/calc.py")
+    ok_t_c = (rc.stage1["decision"] == "no_candidate_no_blind_spot"
+              and rc.has_vulnerability is False
+              and len(ts_c.client.prompts) == 0)   # 关键：零 LLM 调用
+    print(f"[{'PASS' if ok_t_c else 'FAIL'}] 定向复核 C 档（零盲区不调 LLM）: "
+          f"decision={rc.stage1['decision']}, has_vuln={rc.has_vulnerability}, "
+          f"LLM 调用={len(ts_c.client.prompts)} 次（期望 0）")
+
+    # 25a-2) 零盲区但**高风险分** → 降 B 档，仍要送 LLM。
+    #   这是 targeted 的关键安全阀：盲区表覆盖的是"工具写不了规则"的形态，
+    #   而 SQL 注入/命令注入这类工具本该召回的形态并不在表里。文件有实际攻击面
+    #   （外部源+sink+入口点，风险分高）却零召回，是**工具失效的信号**，
+    #   比"文件没内容"更值得复核——否则就是静默放行。
+    _sqli = ("import sqlite3\nfrom flask import request\n\n"
+             "@app.route('/s')\ndef search():\n"
+             "    q = request.args.get('q')\n"
+             "    conn = sqlite3.connect('t.db')\n"
+             "    rows = conn.execute(\"SELECT * FROM t WHERE n = '\" + q + \"'\")\n"
+             "    return rows\n")
+    ts_c2 = _mk_targeted([_safe_v])
+    rc2 = ts_c2.scan_code(_sqli, "python", "app/api/search.py")
+    _re_c2 = rc2.stage1.get("recheck") or {}
+    ok_t_c2 = (_re_c2.get("tier") == "B"
+               and _re_c2.get("reason") == "zero_spot_but_high_risk"
+               and len(ts_c2.client.prompts) == 1)   # 送了，且只 1 票
+    print(f"[{'PASS' if ok_t_c2 else 'FAIL'}] 零盲区但高风险分（安全阀）: "
+          f"tier={_re_c2.get('tier')}(期望 B), reason={_re_c2.get('reason')}, "
+          f"风险分={_re_c2.get('risk_score')}, LLM 调用={len(ts_c2.client.prompts)}（期望 1）")
+
+    # 25a-3) C 档抽样：sampling_rate=1.0 时零盲区低危文件也送（在线监控漏报率）
+    ts_c3 = _mk_targeted([_safe_v], sampling_rate=1.0)
+    rc3 = ts_c3.scan_code(_zero, "python", "utils/calc.py")
+    _re_c3 = rc3.stage1.get("recheck") or {}
+    ok_t_c3 = (_re_c3.get("tier") == "B"
+               and _re_c3.get("reason") == "c_tier_sampled"
+               and len(ts_c3.client.prompts) == 1)
+    print(f"[{'PASS' if ok_t_c3 else 'FAIL'}] C 档抽样复核（漏报率监控）: "
+          f"tier={_re_c3.get('tier')}(期望 B), reason={_re_c3.get('reason')}, "
+          f"LLM 调用={len(ts_c3.client.prompts)}（期望 1）")
+
+    # 25b) A 档：高危路径 + 越权盲区 → 盲区片段 × min(3,n) 票，且用定向上下文
+    # 样本须足够长（尾部补 24 行无关工具函数）：build_review_context 有收益闸门
+    # （片段须比原文省 40% 以上才启用定向）——7 行小样本的片段=全文件+header，
+    # 永远过不了闸门，定向恒回退整文件（2026-08-31 修复：该用例上线即 FAIL，
+    # 因样本过短而非功能缺陷；片段闸门本身是防"定向不省反费"的正确设计）。
+    _idor = ("from flask import request\n"
+             "from app.models import Order\n"
+             "@app.route('/order')\n"
+             "def view_order():\n"
+             "    oid = request.args.get('order_id')\n"
+             "    order = Order.query.get(oid)\n"
+             "    return render(order)\n"
+             + "".join(
+                 f"def _util_{i}(a, b):\n"
+                 f"    total = (a or 0) + (b or 0)\n"
+                 f"    if total > 10:\n"
+                 f"        return round(total * 0.9, 2)\n"
+                 f"    return total\n\n"
+                 for i in range(1, 9)))
+    ts_a = _mk_targeted([_safe_v] * 3)
+    ra = ts_a.scan_code(_idor, "python", "app/api/auth/order.py")
+    _re_a = ra.stage1.get("recheck") or {}
+    # 送进 LLM 的必须是**盲区片段**（build_review_context 打的 "盲区片段" 头），
+    # 而不是整文件——这是定向复核"省时间"的来源。
+    _a_prompt = ts_a.client.prompts[0] if ts_a.client.prompts else ""
+    ok_t_a = (_re_a.get("tier") == "A" and _re_a.get("n") == 3
+              and _re_a.get("targeted_context") is True
+              and "盲区片段" in _a_prompt
+              and ra.stage1["decision"] in
+              ("no_candidate_recheck_safe", "recheck_incomplete_flow_review"))
+    print(f"[{'PASS' if ok_t_a else 'FAIL'}] 定向复核 A 档: tier={_re_a.get('tier')}, "
+          f"n={_re_a.get('n')}, 定向上下文={_re_a.get('targeted_context')}, "
+          f"prompt 含盲区片段={'盲区片段' in _a_prompt}, "
+          f"decision={ra.stage1['decision']}")
+
+    # 25c) B 档：低危路径 + 低优先级盲区 → 单票；单票判真**不得采信**（转人工）
+    # 样本须是"真低危"：无入口点、无外部源，仅有一个弱随机盲区。
+    # （用 _idor 不行——它虽在 utils/ 下但内容密度分仍很高，会落到 A 档）
+    _low = ("import random\n"
+            "def gen_id():\n"
+            "    return str(random.random())[:8]\n")
+    ts_b = _mk_targeted([_vuln_v])
+    rb = ts_b.scan_code(_low, "python", "utils/legacy_helper.py")
+    _re_b = rb.stage1.get("recheck") or {}
+    ok_t_b = (_re_b.get("tier") == "B" and _re_b.get("n") == 1
+              and rb.has_vulnerability is None          # 未被采信为漏洞
+              and rb.stage1["decision"] == "recheck_low_conf_review")
+    print(f"[{'PASS' if ok_t_b else 'FAIL'}] 定向复核 B 档（单票不采信）: "
+          f"tier={_re_b.get('tier')}, n={_re_b.get('n')}, "
+          f"has_vuln={rb.has_vulnerability}（期望 None）, "
+          f"decision={rb.stage1['decision']}")
+
+    # 25d) blind_spots 写进 stage1（可审计），且盲区片段带原始行号
+    ok_t_bs = (ra.stage1.get("blind_spots", {}).get("count", 0) > 0
+               and any(s["category"] == "authorization"
+                       for s in ra.stage1["blind_spots"]["spots"]))
+    print(f"[{'PASS' if ok_t_bs else 'FAIL'}] 盲区留痕: "
+          f"count={ra.stage1.get('blind_spots', {}).get('count')}, "
+          f"类别={[s['category'] for s in ra.stage1.get('blind_spots', {}).get('spots', [])]}")
+
+    # 25e) 有候选时盲区提醒注入裁决 prompt（零额外调用），且只注入一次
+    _ts_bs = TwoStageScanner(
+        client=_RecClient(['```json\n{"is_confirmed": false, "reason": "已参数化"}\n```'] * 6),
+        system_prompt="sys", n_samples=3,
+        use_semgrep=False, use_taint_tracker=False, use_prefilter=False,
+        use_external=False, sampling_rate=0, no_candidate_mode="targeted",
+        use_conformal=False, use_signal_feedback=False, use_counterfactual=False)
+    _f = ToolFinding(rule_id="B608", category="sast", source="request.args.get('id')",
+                     sink="cursor.execute(q)", taint_type="SQL Injection",
+                     source_line=2, sink_line=4, severity="high", tool="bandit")
+    _ts_bs._stage1_recall = lambda code, language, filename: [_f, _f]
+    _ts_bs.scan_code(_idor, "python", "app/api/auth/order.py")
+    # 两个候选 × 3 票 = 6 次裁决调用（+3 次裁决全否决兜底复核，用 build_user_prompt
+    # 不含提醒）。盲区提醒只注入首个裁决档候选 → 恰好 n_samples 次调用含提醒。
+    _injected = sum(1 for p in _ts_bs.client.prompts if "工具层盲区提醒" in p)
+    ok_t_inj = _injected == _ts_bs.n_samples
+    print(f"[{'PASS' if ok_t_inj else 'FAIL'}] 盲区注入裁决（零额外调用、只注首个候选）: "
+          f"总调用={len(_ts_bs.client.prompts)}, 含提醒={_injected}"
+          f"（期望 {_ts_bs.n_samples}=n_samples）")
+
+    # 25f) 盲区永不进抑制池：盲区扫描/注入后 SignalRegistry 不得新增任何信号。
+    # 用临时 registry 隔离（默认路径会加载生产历史的 62 条信号，与本用例无关）。
+    from graduation_project.signal_registry import reset_signal_registry
+    import tempfile as _tf
+    _reg_bs = reset_signal_registry(
+        path=Path(_tf.mkdtemp()) / "reg.json", enabled=True)
+    _before = _reg_bs.stats()["signals_total"]
+    ts_c2 = _mk_targeted([_safe_v] * 3)
+    ts_c2._signal_registry = _reg_bs
+    ts_c2.scan_code(_idor, "python", "app/api/auth/order.py")
+    ok_t_noreg = _reg_bs.stats()["signals_total"] == _before
+    print(f"[{'PASS' if ok_t_noreg else 'FAIL'}] 盲区不进抑制池: "
+          f"扫描前={_before} → 扫描后={_reg_bs.stats()['signals_total']}（期望不变）")
+
+    # 25g) use_blind_spots=False 时完全不注入（论文消融开关）
+    ts_off = _mk_targeted([_safe_v] * 3)
+    ts_off.use_blind_spots = False
+    r_off = ts_off.scan_code(_idor, "python", "app/api/auth/order.py")
+    ok_t_off = (not any("工具层盲区提醒" in p for p in ts_off.client.prompts)
+                and "blind_spots" not in (r_off.stage1 or {}))
+    print(f"[{'PASS' if ok_t_off else 'FAIL'}] 盲区开关可关（消融）: "
+          f"注入={any('工具层盲区提醒' in p for p in ts_off.client.prompts)}"
+          f"（期望 False）, stage1 含 blind_spots="
+          f"{'blind_spots' in (r_off.stage1 or {})}（期望 False）")
+
+    # --- 用例 #26（2026-08-31，§9.19）：secret 候选凭证强度门槛的对称性 ------
+    # 门槛此前只接 sast 通道（B105），gitleaks/detect-secrets 原生 secret 候选
+    # 完全绕过——detect-secrets 修复绝对路径缺陷后弱值（admin123）直出抢 top1
+    # （五段实锤）。门槛语义必须按"凭证内容强度"统一，不分工具：
+    #   弱值 secret → category 转 sast 裁决档（与 B105 弱值对称）
+    #   真凭证 secret → 保持直出 + 类型规范化 Hardcoded Credentials
+    ts_sec = TwoStageScanner.__new__(TwoStageScanner)
+    _sec_weak = ToolFinding(rule_id="Secret Keyword", category="secret", source="",
+                            sink="", taint_type="Secret Keyword", source_line=4,
+                            sink_line=4, severity="high", tool="detect-secrets",
+                            evidence='检测到疑似密钥: Secret Keyword\n[命中行] password = "admin123"')
+    _sec_strong = ToolFinding(rule_id="aws-access-key-id", category="secret", source="",
+                              sink="", taint_type="aws-access-key-id", source_line=3,
+                              sink_line=3, severity="high", tool="gitleaks",
+                              evidence='AWS Access Key\n[命中行] key = "AKIAIOSFODNN7EXAMPLE"')
+    _kept_sec = ts_sec._drop_irrelevant_positional([_sec_weak, _sec_strong])
+    _by_rule = {f.rule_id: f for f in _kept_sec}
+    ok_secret_gate = (
+        _by_rule["Secret Keyword"].category == "sast"
+        and _by_rule["Secret Keyword"].taint_type == "Hardcoded Credentials"
+        and _by_rule["aws-access-key-id"].category == "secret"
+        and _by_rule["aws-access-key-id"].taint_type == "Hardcoded Credentials")
+    print(f"[{'PASS' if ok_secret_gate else 'FAIL'}] secret 凭证门槛对称性: "
+          f"弱值→{_by_rule['Secret Keyword'].category}/"
+          f"{_by_rule['Secret Keyword'].taint_type}（期望 sast/Hardcoded Credentials）, "
+          f"真凭证→{_by_rule['aws-access-key-id'].category}/"
+          f"{_by_rule['aws-access-key-id'].taint_type}（期望 secret/Hardcoded Credentials）")
+
     print("\n", "=== 自检通过 ===" if all([ok_parse, ok_dedupe, ok_adjud, ok_safe,
           ok_direct, ok_full, ok_rag_default, ok_gate1, ok_gate2, ok_gate3,
           ok_recheck_type, ok_anchor, ok_majority, ok_entry, ok_noleak,
           ok_wire, ok_chain, ok_b3, ok_b3b, ok_dedupe3, ok_dedupe4, ok_dedupe5,
-          ok_rawtype, ok_strip, ok_tail, ok_trace, ok_tnorm]) else "=== 存在失败用例 ===")
+          ok_rawtype, ok_strip, ok_tail, ok_trace, ok_tnorm, ok_wave4,
+          ok_t_c, ok_t_c2, ok_t_c3, ok_t_a, ok_t_b, ok_t_bs, ok_t_inj,
+          ok_t_noreg, ok_t_off, ok_secret_gate])
+          else "=== 存在失败用例 ===")

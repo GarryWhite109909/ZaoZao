@@ -1055,41 +1055,6 @@ FN/误报样本同步进 v2_15 蒸馏反例池（§9.3 模式）
 347、ORM get IDOR、模板串 SSTI）零召回。**P1 验证：app.py 关闭切片跑一次对账**
 （差异 = 切片稀释贡献；剩余 = 规则盲区）。
 
-**工具层逐条审计（2026-08-31 补跑，`audit_stage1.py`，零 LLM）**
-
-§9.6 此前只有 LLM **实扫**对账（发现级 recall 5/13≈38%），回答的是"模型表现
-如何"；而"38% 的缺口里多少源于工具层没召回"——**此前从未测过**。补跑结果
-（17 条 expected finding）：**OK 9 · A 盲区 6 · B 类型错标 2**
-（B 类已按 §9.8 修正判定口径）。
-
-| expected | 判定 | 覆盖候选 | 归因 |
-|---|---|---|---|
-| L26/L62 CWE-798 硬编码密钥/弱凭证 | **OK** | bandit B105 ×4 | — |
-| L97 CWE-347 `jwt.decode(verify=False)` | **A 盲区** | 无 | JWT 签名不校验，无 sink 形态 |
-| L112 CWE-79 404 页 XSS | B | semgrep SSTI @L114 | 同区域 XSS+SSTI 双语义，工具只出 SSTI 一条 |
-| L114/L281 CWE-1336 SSTI | **OK** | semgrep render-template-string | — |
-| L141 CWE-327 md5 存密码 | **OK** | bandit B324 + semgrep md5 ×2 + prefilter | — |
-| L148 CWE-209 `str(e.message)` 回显 | **A 盲区** | 无 | 异常信息泄露，无 sink 形态 |
-| L160 CWE-312 信用卡明文存库 | **A 盲区** | 无 | 缺失型（应加密未加密），无污点形态 |
-| L208/L231 CWE-639 IDOR | **A 盲区** ×2 | 无 | 缺失型（未校验归属），与 §8.5 授权类同构 → **不修，记档** |
-| L261 CWE-89 `%s` 拼接 SQL | **OK** | bandit B608 + semgrep tainted-sql-string | — |
-| L329 CWE-502 `yaml.load` | **OK** | bandit B506 + semgrep + prefilter | — |
-| L294 CWE-434 任意文件上传 | B（实为 A） | bandit B311 @L295 | B311 是弱随机与上传无关，行号±2 邻近误判；**434 规则缺失是真盲区** |
-| e2e_zap L18 CWE-295 | **OK** | bandit B501 + semgrep disabled-cert-validation | — |
-| e2e_zap L15 CWE-798 | **OK** | bandit B105 | — |
-| layout L5 CWE-311 | A 盲区 | 无 | info 级，不计 miss（§9.6 口径）|
-
-**结论**：工具层**语义召回 9/16 ≈ 56%**（layout info 级不计分母），显著高于
-LLM 实扫的 38%。§9.6 那句"工具层对这些形态零召回"的猜测**只对了一半**：
-347/209/312/639×2 确实零召回（5 条真盲区，含被误判为 B 的 434），但
-**798/79/1336×2 工具层全都召回了**——丢分发生在**裁决层**（模型否决或未进
-裁决），不是工具层。
-
-**修正 §9.6 的 P1 待办**：原计划"关闭切片跑对账以分离切片稀释 vs 规则盲区"。
-有了工具层审计作对照后可直接定位，无需再靠开关切片做差分实验：
-**工具层零召回 = 规则盲区**（5 条：347/209/312/639×2/434）；
-**工具层已召回但实扫 miss = 切片稀释或裁决层否决**（需另查）。
-
 ### 9.7 第二轮修复落地（2026-08-30 晚，依赖齐备后复测驱动）
 
 **环境教训（本轮第一教训，2026-08-31 更正）**：上一轮我在系统 `python3.11` 上
@@ -1244,7 +1209,13 @@ semgrep 路径→SSTI / XSS / SQL Injection / Weak Cryptography。**21 条里有
 | 仓库 | 旧口径 | 新口径 |
 |---|---|---|
 | **VFlask** 17 条 | OK 1 · A 6 · **B 10** | **OK 9** · A 6 · **B 2** |
-| **DVNA** 11 条 | OK 4 · A 4 · **B 3** | **OK 6** · A 4 · **B 1** |
+| **DVNA** 11 条 | OK 4 · A 4 · **B 3** | **OK 5** · A 4 · **B 2** |
+
+> **更正记录**：本表 DVNA 一行初版写的是"新口径 OK 6 · B 1"，**是错的**——
+> 当时未核对实际输出、按"L235 转 OK 且 L197 也转 OK"推算得出。实测
+> `stage1_audit.dvna.all.md` 为 **OK 5 · A 4 · B 2**（L197 的候选类型是
+> `Code Injection`(94)，标准答案是 `CWE-95`(eval 注入)，两者不同编号，
+> 始终判 B）。**文档里的对比数字必须逐行取自实际输出，不得推算。**
 
 其中 DVNA **L235 CWE-611 由 B → OK**——正是 §9.7 记的"规则名→CWE 映射缺口，
 待批处理"那条，修正口径后自动解决，无需单独补映射。
@@ -1265,7 +1236,948 @@ evidence/rule 关键词推断。目前**不打算改**：semgrep 的 CWE 标注�
 标准答案不一致（semgrep 标 96「静态代码注入」，本项目标准答案标 1336「SSTI」），
 若改用 metadata 反而会**降低** OK 率。是否引入需先统一 CWE 口径，**记档待决策**。
 
-**遗留（真实 A 盲区，均为缺失型或需定向规则）**：347（JWT verify=False）、
-209（异常回显）、312（信用卡明文）、639×2（IDOR）、434（文件上传）、
-311（layout，info 级不计）。其中 639×2 与 §8.5 授权类同构 → 不修记档。
+**遗留（真实 A 盲区）**：347（JWT verify=False）、209（异常回显）、
+312（信用卡明文）、639×2（IDOR）、434（文件上传）、311（layout，info 级不计）。
+其中 639×2 与 §8.5 授权类同构 → 不修记档。
+**前 4 条已于 2026-08-31 补规则修复，见 §9.9。**
 
+### 9.9 标准答案核验 + 4 条真盲区规则 + 类型写回（2026-08-31）
+
+#### 9.9.1 标准答案核验：官方没有清单，按权威 CWE 定义逐条校验
+
+用户提出"去网上找标准答案"。核查结论：**不存在官方标准答案**——
+we45/Vulnerable-Flask-App 的 README 全文只有一句
+`> This is a ZAP Test. Hope it works ;)` 加 "Intentionally Vulnerable Flask app
+for use in Demos"，**没有漏洞清单**；OWASP 项目页（nest.owasp.org）为空白模板。
+manifest 里的标注系源码实读得出，故改按**权威 CWE 定义**逐条校验分类准确性。
+
+| 条目 | 原标注 | 核验结论 | 依据 |
+|---|---|---|---|
+| L141 md5 存密码 | 327 | **改为 916** | CWE-916 官方定义「密码哈希计算强度不足」；CodeQL `js/insufficient-password-hash` 同为 916。327 是"用了有风险算法"的**工具粒度**，bandit B324 只能到此 |
+| L62 `admin/admin123` | 798 | **维持 798**，note 补 1392 | 代码内硬编码种子凭证 → 798 成立；另属 CWE-1392「使用默认凭证」，二者同一缺陷的不同侧面 |
+| L97 `jwt.decode(verify=False)` | 347 | **确认无误** | CWE-347「密码签名校验不当」；CISA 通告与多个 CVE（如 CVE-2025-20248）均用 347 标记签名校验失效 |
+| L208/L231 IDOR | 639 | **确认无误** | CodeQL `cs/web/insecure-direct-object-reference` 标注 `external/cwe/cwe-639`；CVE-2026-25567 亦用 639 |
+| L294 文件上传 | 434 | **确认无误** | CWE-434「危险类型文件无限制上传」。原判 B 是因 L295 的 `random.randint`(B311 弱随机) 在 ±2 行内邻近误配，**与 434 无关** |
+| 其余 89/79/1336/502/798/295/311 | — | 逐条确认无误 | — |
+
+**关键区分——标准答案粒度 vs 工具能力粒度**：md5 存密码的精确分类是 916，
+但工具（bandit B324）只能产出"弱哈希算法"(327)。若标准答案定 916 而判定只认
+327，这条会**永远判 B**，可工具语义其实是对的。故在 `_SEMANTIC_TO_CWE` 中把
+`weak cryptography` 映射为 **`327|916` 同语义组**，二者任一命中即算对齐。
+**不要用标准答案的精度去惩罚工具的能力上限。**
+
+#### 9.9.2 补 4 条定向规则（VFlask OK 9 → 13）
+
+| 规则 | CWE | 形态依据（泛化三关卡） | 验证 |
+|---|---|---|---|
+| `jwt_verify_disabled` | 347 | PyJWT 标准参数 `verify=False` / `options={"verify_signature": False}` | L97 命中；`jwt.decode(t, KEY, algorithms=["HS256"])` 不命中 |
+| `error_info_exposure` | 209 | 语言无关：`except ... as <name>` 绑定的异常变量被 `str()` 后 return | L148 命中；`logging.error(str(e))`、`return str(result)` 均不命中 |
+| `cleartext_sensitive_storage` | 312 | 字段语义词根（`ccn/credit_card/cvv/ssn/iban`，PCI-DSS 术语）+ 持久化调用 | L160 命中；普通表单入库不命中 |
+| `unrestricted_file_upload` | 434 | Flask `request.files` + `.save()` 标准上传 API | L294 命中；有 `allowed_file` 白名单的不命中 |
+
+**VFlask 结果**：OK **9 → 13**，B 2 → 1，A 6 → 3。
+
+**过程中修掉的两个自身缺陷**（都由 87 段回归暴露，非推测）：
+1. **`error_info_exposure` 初版误报**：正则 `str\(\w+\)` 匹配任意变量，把
+   `return str(result)`、`str(user_id)` 也当异常回显 → safe_16_ldap_escape、
+   hard_crossfile_03_input 两个**安全样本**新增候选。改为追踪
+   `except ... as <name>` 绑定的变量名，误报清零。
+2. **`cleartext_sensitive_storage` 初版漏召回**：设了 `exclude` 排除"文件内存在
+   加密调用"，但 **exclude 是文件级判定**——VFlask L141 的 `hashlib.md5`(密码)
+   与 L160 的 ccn 毫无关系，却把整条 312 规则排除了。改为不设 exclude，
+   "是否明文"交裁决层（字段级语义，正则判不了）。
+
+**另一处行号定位问题**：本规则是双 pattern AND（敏感字段 + 持久化调用），
+`_hit_line` 取**行号最小的命中 pattern** → VFlask 的持久化调用在 L64、
+敏感字段在 L160，行号落到无关的 L64，审计判定（L160±2）错失。
+新增 `_line_of()` 辅助 + `line_func`，让多 pattern 规则显式声明"哪一条是漏洞
+主体"。**多 pattern 规则必须配 line_func**，否则行号会指向上下文而非漏洞。
+
+**87 段回归（新增规则后）**：总候选 104 → 106（+2，均来自真漏洞样本
+hard_owasp_01_file_upload、hard_bypass_08_jwt_none_alg）；
+**安全样本候选 17 保持不变**（无新增误报）；零召回 23/87 不变。
+
+#### 9.9.3 类型写回（生产侧，§9.8 的根因修复）
+
+§9.8 指出审计与生产口径不一致的根因是**推断结果只用于归并分组、从不写回
+字段**。本轮在 `_dedupe` 开头补写回：
+
+```python
+for f in findings:
+    inferred = TwoStageScanner._infer_taint_type(f.to_dict())
+    if inferred and inferred != f.taint_type:
+        f.taint_type = inferred
+```
+
+收益：
+- **裁决输入质量提升**：进裁决的候选从 `B608`、semgrep 规则文件路径，变成
+  `SQL Injection` / `Insecure Deserialization` / `Weak Cryptography` 等语义名。
+  同一份信息，语义名比规则号直白得多。
+- **消除 §9.8 的测量偏差**：生产与审计口径就此统一（审计侧的 `inferred_type`
+  兼容逻辑保留，作为双保险）。
+
+安全性验证：
+- `_infer_taint_type` **幂等**（已是语义名时原样返回），写回不影响归并键稳定性
+- 87 段回归**逐文件候选数完全一致**（106 / 零召回 23 / 安全样本 17 / 剔除留痕 7）
+- 8 个模块自检 FAIL=0
+
+设计取舍：仅当推断成功才覆盖，推断不出时**保留原值**——宁可让裁决层看到
+规则号，也不能把有信息的类型抹成空。
+
+#### 9.9.4 本轮最终状态
+
+| 仓库 | 状态 |
+|---|---|
+| **VFlask** 17 条 | **OK 13** · B 1（L112 XSS）· A 3（L208/L231 IDOR、layout L311 info 级）|
+| **DVNA** 11 条 | OK 5 · B 2（L197 CWE-95 vs 94、L49 CWE-640 vs 208）· A 4 |
+
+剩余 A 盲区定性：
+- **639×2（IDOR）**：缺失型漏洞（ORM 查询本身安全，缺的是归属校验），
+  与 §8.5 授权类同构 → **不修，记档**
+- **CWE-95 / CWE-640**（B 类）：命中行正确、类型是两个不同侧面。
+  `mathjs.eval()` 判 94(代码注入) vs 标准答案 95(eval 注入)；
+  `md5(login)` 作令牌判 208(时序比较) vs 标准答案 640(弱重置令牌)。
+  **模型可消解**，属裁决层优化空间，非工具层缺陷
+- **CWE-112 XSS**：同区域 XSS+SSTI 双语义，工具只出 SSTI 一条（另一条被
+  归并吸收），需裁决层区分
+
+**教训（本轮第 4 条）**：我在 §9.8 表格里写的 DVNA 数字（OK 6 · B 1）是**凭推算
+而非实际输出**写下的，实测为 OK 5 · B 2。与 §9.7 教训 1（陈旧产物）同源：
+**文档里的每一个对比数字都必须逐行取自实际输出，推算、记忆、推测都不可信**——
+它们比没有数字更危险，因为看起来有依据。
+
+### 9.10 cve_fix 20 段首轮审计 + 数据资产全量盘点（2026-08-31）
+
+**数据资产全量盘点**（用户提示后补全，此前只知 87 段）：
+- 带标注：exp_04 87 段 + **exp_01 14 段** + **testset_cve_fix 20 段**（含 source_repo/
+  source_sha/taint_path/vuln_patterns/fix_idea 富字段）→ 141 段可审计
+- 语料池 2271 文件（corpus/）：taint_boundary_raw 150、framework_safe_raw 145、
+  long_file_raw 745、blindspot_teaching_raw 104……**命名即工具层弱点分类**，
+  mining 素材（远期）
+- 历史专项：prefilter_eval（0801 三份结果）可做规则回归对比
+
+**cve_fix 审计结果**（22 发现级审计点）：
+
+| 判定 | 数量 | 明细 |
+|---|---|---|
+| OK（召回+类型对）| **13** | 502/78×2/79×2/22×2/798/1336/918/611/89×2（java）——最小化 CVE 片段形态工具层覆盖良好 |
+| A 真盲区 | 5 | **LDAP 注入 90×2**（filter 拼接无规则，P2）；**CWE-441×2**（冷门，P3 缓）；**PHP 文件 0011**（语言支持缺口，路线图）|
+| 标注存疑 | 4 | 0003/0004 的 95（agent 框架示例，eval 是设计意图）、0019 的 94/918（最小化文件只含 SSTI 部分，多标签超范围）——**测试集杂质，转标注治理** |
+
+**与 §9.9 的衔接**：本审计的 miss 里有 347/209/312 吗——没有（本集 20 段不含这三类形态）；
+§9.9.2 的 4 条规则（jwt_verify_disabled/error_info_exposure/cleartext_sensitive_storage/
+unrestricted_file_upload）是 VFlask 对账驱动的，与本集互补。两集合计后仍缺的定向规则：
+LDAP 注入 90（本集 ×2，P2 立项）。
+
+**待办补记**：① exp_01 14 段尚未跑审计（本轮只盘点未执行）；② 0019 的 jwt 形态
+若与 §9.9.2 jwt_verify_disabled 规则形态一致，重扫时应转 OK（验收项）。
+
+**审计工具自身修了 3 个 bug**（fail-loud 改造的额外收益）：
+1. `__new__` 绕过致 _taint_recall 静默失败 → taint 独立实例直调 + 失败显式抛错
+2. TaintPath/ToolFinding 结构不齐 → 复刻 _taint_recall 归一化（audit 内）
+3. **无行号 manifest（line=0）时行号匹配恒假 → 全部假"盲区"** → 退化为纯类型匹配
+   （教训：审计工具的"A 盲区"结论在自身故障时全不可信——先证明工具没错，再定引擎有错）
+
+**召回基线更新**：cve_fix 发现级召回 13/22 = 59%（真实 CVE 形态）；87 段类型命中
+88.2%（单文件）；仓库大文件 38%（§9.6）。三档差距 = 切片稀释 + 框架/冷门规则缺口，
+全部在工具层射程内。
+
+### 9.11 训练集形态 mining——泛化差距图谱（2026-08-31，战略转向：形态规则 > 逐仓补规则）
+
+**用户确立**：泛化性能是项目价值核心，逐仓补规则不可持续。训练集（16609 条，
+含代码块 16583 个）是现成的"期望形态频谱"——`mine_train_forms.py` 解析出
+**1804 个形态签名**，与工具层 sink 覆盖求差集即泛化差距图谱。
+
+**跨语言 sink 缺口 Top**（频次 = 该形态在训练集出现次数 ≈ 一条规则的可泛化收益）：
+
+| 形态 | 频次 | 现状 | 修复 |
+|---|---|---|---|
+| `require('child_process')` 解构族（execFile 226 / execSync 202 / spawn 65）| **668** | **零覆盖**：taint_tracker 只有 `child_process.exec(` 精确串，require 解构导入后裸调 execFile/execSync/spawn 全漏 | **P1**：JS import-aware sink——解析 require 行建符号表，`execFile(`/`spawn(` 裸调命中 Command Injection |
+| `exec(回调)` Node 异步形态（`exec(VAR, (err,stdout)=>{...})`）| 86 | exec( 有覆盖（94/78 override），但回调第二参数形态未见误报 | 观察 |
+| `Runtime.getRuntime().exec(` Java | 63 | 已覆盖 | — |
+| `$obj = unserialize($VAR)` PHP | PHP unserialize 零覆盖（形态 mining 未见直证，但 php-goof 在队列）| **P1**：PHP 反序列化 + `$_GET/$_POST` source（taint_tracker 已有 source，缺 PHP sink 连接验证）|
+| `.redirect(...)->with(` Laravel 链式 | 27 | redirect( 有覆盖，链式尾部行无污点 | 观察 |
+
+**TAINT_PATH 字段**：训练集该字段全空/未填——形态频谱以代码块 mining 为主。
+
+**方法论固化**：每轮"训练集 mining → 差集 → 形态规则 → DVNA/VFlask/87 段三场
+复测"为一迭代；规则只写**形态签名级**（require 解构族），禁止样本特判（泛化三关
+语言级事实关先行）。下次大版本模型训练（v2_15）后语料换血，mining 重跑即可
+拿到新形态频谱——**工具层进化与模型进化共用同一数据源，同步迭代**。
+
+**第一修已落地：import-aware cp sink**（taint_tracker.py）：
+- `_collect_cp_symbols`：解析 `const {execFile, execSync, spawn} = require('child_process')`
+  解构名 + `const cp = require(...)` 命名空间名（含 `cp.*` 通配形式）
+- `_analyze_scope` 2b 补记：独立于常规 sinks 循环（execFile 不在 sink 表，
+  放循环内永远跑不到——第一版逻辑位置错误，复测时抓出），直接遍历调用节点比对
+  解构名/命名空间名，参数含污点 → 补 Command Injection 路径
+- 六项验证全 PASS：execFile/execSync/spawn 三解构变体 + cp.execFile 命名空间 +
+  fs 安全对照（非 cp 导入零候选）+ Python 直传回归（列表参数零召回是 0817
+  语境安全设计行为，非回归）
+
+**工具层逐条审计（2026-08-31 补跑，`audit_stage1.py`，零 LLM）**
+
+§9.6 此前只有 LLM **实扫**对账（发现级 recall 5/13≈38%），回答的是"模型表现
+如何"；而"38% 的缺口里多少源于工具层没召回"——**此前从未测过**。补跑结果
+（17 条 expected finding）：**OK 9 · A 盲区 6 · B 类型错标 2**
+（B 类已按 §9.8 修正判定口径）。
+
+| expected | 判定 | 覆盖候选 | 归因 |
+|---|---|---|---|
+| L26/L62 CWE-798 硬编码密钥/弱凭证 | **OK** | bandit B105 ×4 | — |
+| L97 CWE-347 `jwt.decode(verify=False)` | **A 盲区** | 无 | JWT 签名不校验，无 sink 形态 |
+| L112 CWE-79 404 页 XSS | B | semgrep SSTI @L114 | 同区域 XSS+SSTI 双语义，工具只出 SSTI 一条 |
+| L114/L281 CWE-1336 SSTI | **OK** | semgrep render-template-string | — |
+| L141 CWE-327 md5 存密码 | **OK** | bandit B324 + semgrep md5 ×2 + prefilter | — |
+| L148 CWE-209 `str(e.message)` 回显 | **A 盲区** | 无 | 异常信息泄露，无 sink 形态 |
+| L160 CWE-312 信用卡明文存库 | **A 盲区** | 无 | 缺失型（应加密未加密），无污点形态 |
+| L208/L231 CWE-639 IDOR | **A 盲区** ×2 | 无 | 缺失型（未校验归属），与 §8.5 授权类同构 → **不修，记档** |
+| L261 CWE-89 `%s` 拼接 SQL | **OK** | bandit B608 + semgrep tainted-sql-string | — |
+| L329 CWE-502 `yaml.load` | **OK** | bandit B506 + semgrep + prefilter | — |
+| L294 CWE-434 任意文件上传 | B（实为 A） | bandit B311 @L295 | B311 是弱随机与上传无关，行号±2 邻近误判；**434 规则缺失是真盲区** |
+| e2e_zap L18 CWE-295 | **OK** | bandit B501 + semgrep disabled-cert-validation | — |
+| e2e_zap L15 CWE-798 | **OK** | bandit B105 | — |
+| layout L5 CWE-311 | A 盲区 | 无 | info 级，不计 miss（§9.6 口径）|
+
+**结论**：工具层**语义召回 9/16 ≈ 56%**（layout info 级不计分母），显著高于
+LLM 实扫的 38%。§9.6 那句"工具层对这些形态零召回"的猜测**只对了一半**：
+347/209/312/639×2 确实零召回（5 条真盲区，含被误判为 B 的 434），但
+**798/79/1336×2 工具层全都召回了**——丢分发生在**裁决层**（模型否决或未进
+裁决），不是工具层。
+
+**修正 §9.6 的 P1 待办**：原计划"关闭切片跑对账以分离切片稀释 vs 规则盲区"。
+有了工具层审计作对照后可直接定位，无需再靠开关切片做差分实验：
+**工具层零召回 = 规则盲区**；**工具层已召回但实扫 miss = 切片稀释或裁决层
+否决**（需另查）。
+
+> 上表为**补 4 条规则之前**的状态。补规则后的最新数据见 **§9.9**
+> （VFlask OK 9 → **13**）。
+
+
+### 9.12 第四波：长尾注入族 8 规则——§五之五 零召回清单清账（2026-08-31）
+
+> 定位：§五之五「剩余零召回缺口（11 段）」中"能写出语言/框架标准写法"的项，
+> 加上 §9.10 立项的「LDAP 注入 90（P2 立项）」。**逐条"修不了 vs 没修"判定先行**
+> （用户要求：不修的必须说清是真修不了还是没修），可修的 8 类本轮全落地。
+
+#### 9.12.1 逐条判定：真修不了 vs 能修未修
+
+| 缺口样本 | 判定 | 依据 |
+|---|---|---|
+| typical_21 XXE | **能修未修**（本轮修）| 解析器加固开关是标准 API 参数（resolve_entities/disallow-doctype-decl），缺失型中有标准安全开关可查 |
+| typical_24 LDAP | **能修未修**（本轮修）| filter 由 f-string/拼接构造是注入形态；参数化传参（safe_16）是标准安全写法 |
+| typical_25 NoSQL | **能修未修**（本轮修）| 请求值直进 Mongo 查询文档字面量；类型强制 str() 是标准安全写法 |
+| typical_26 XPath | **能修未修**（本轮修）| 表达式构造后传 .xpath( 求值，形态同 SQL 拼接 |
+| typical_33 PHP 类型混淆 | **能修未修**（本轮修）| `==` 松散比较是 PHP 语言特性级形态，$_ 超全局天然语言隔离 |
+| typical_30 Mass Assignment | **能修未修**（本轮修）| setattr 动态属性写入是 Python 标准 API，正常业务代码极少用 |
+| hard_cve_06 Struts2 OGNL | **能修未修**（本轮修）| Ognl.getValue/parseExpression 是库专有 API，无第二语义 |
+| hard_cve_08 fastjson | **能修未修**（本轮修）| JSON.parseObject 是 fastjson 特有 API（org.json/Gson/Jackson 均不同名） |
+| hard_cve_05 spring4shell | **真修不了** | POJO 参数绑定是 Spring MVC **官方标准用法**，漏洞在框架版本（<5.3.18）；写规则会 FP 掉所有正常 Spring controller |
+| hard_cve_03 tarfile | 设计内不修（维持）| 0 候选 + 强制复核兜底，上下文剥离后的正确行为（§五之六 待办1） |
+| hard_crossfile_02_sink | 架构级不修（维持）| 跨文件数据流，单文件管道外（论文标注局限） |
+| VFlask 639×2 / CWE-200 / DVNA 639 | 缺失型不修（维持，§9.9 同判）| ORM 查询本身安全，缺的是归属/字段过滤逻辑，无污点形态 |
+
+#### 9.12.2 落地的 8 条规则（prefilter.py，全部过泛化三关）
+
+| 规则 | CWE | 形态 | 标准安全写法豁免 |
+|---|---|---|---|
+| `xxe_unprotected_parse` | 611 | XML 解析 sink（lxml/minidom/parseString + Java `.parse(` 宽 sink×DocumentBuilderFactory 上下文守卫）× 输入，且全文件**无加固特征** | resolve_entities=False / disallow-doctype-decl / defusedxml / noent:false（_XXE_SAFE_RE，**注释行剥离后判定**） |
+| `ldap_injection` | 90 | filter 经 f-string/模板串/拼接构造 → search_s/ldap_search（`.search(` 需 ldap 上下文守卫）| 参数化传参 `[username]` 作独立参数（safe_16）；字面量 filter 非构造式不收集 |
+| `nosql_query_injection` | 943 | find/find_one/findOne 参数区为查询文档（`{`）且含输入；文件需 mongo 上下文守卫 | 值经 str()/int() 类型强制（typical_25 fix_idea 形态） |
+| `xpath_injection` | 643 | f-string 构造表达式 → `.xpath(` | 常量表达式不收集 |
+| `php_loose_compare` | 843 | 凭证词 + 弱比较 `==` + 输入关联（$_ 超全局或其 1 跳变量）| `===` 强比较；两侧均 $_ 的字段一致性（确认密码） |
+| `mass_assignment_setattr` | 915 | dict 键值遍历（输入派生）+ setattr 引用循环变量 | 白名单过滤（allowed_fields/`if key in` 等，_MASS_ASSIGN_SAFE_RE，注释剥离后判定） |
+| `deser_fastjson` | 502 | JSON.parseObject（无守卫）；裸 JSON.parse 须 fastjson import 守卫（JS 同名 API 是安全解析） | Gson/Jackson/org.json 不同名天然不撞 |
+| `ognl_expression_injection` | 917 | Ognl.getValue/parseExpression 参数区含构造式输入 | — |
+
+配套：`_constructed_var_names`（f-string/JS 模板串/拼接/格式化构造且引用输入的
+变量，1 跳）、`_code_wo_comment_lines`（整行注释剥离——**CVE-fix 独立集实锤的
+注释污染**：cve_fix_0021 把 `// Missing: setFeature(...disallow-doctype-decl...)`
+写在注释里，_XXE_SAFE_RE 文件级搜索被注释命中 → 漏洞版被误判"已加固"漏报）；
+`_STANDARD_TAINT_TYPES` + XPath Injection/Type Juggling/Mass Assignment/347/209/312/434
+语义名；`_infer_taint_type` + XPath/OGNL/fastjson/JWT 推断分支；cwe_normalizer +
+611/643/915/843/434/312/209/347 短语级映射（**不收 xml/xpath 等裸词**，回声票纪律）。
+
+#### 9.12.3 验证矩阵（三关全过）
+
+| 关 | 结果 |
+|---|---|
+| 87 段（设计集） | 8 段全部 0→候选（21/24/25/26/30/33/cve_06/cve_08，全 expected=true）；**零召回×真 11 → 3**（剩余 = spring4shell 真修不了 + cve_03 设计内 + crossfile_02_sink 架构级）；**安全/噪声候选 14 持平（零新增）**；候选≥3 的 10 持平 |
+| 独立集 cve_fix（零接触） | cve_fix_0021（CWE-611）由**漏报 → 命中 @L25**（注释污染修复后）；cve_fix_0001（CWE-90 标注，实为占位符替换+LdapEncoder.nameEncode 转义）不命中为**正确**——占位符替换形态不追（转义有无正则判不了，记档）；其余 18 段零误报 |
+| 安全对照 | safe_14（defused）/ safe_16（LDAP 参数化）/ safe_09 / typical_09 不误报；9 个独立构造负样本（Java setFeature、参数化 LDAP、Mongo str() 强制、PHP `===`、确认密码、白名单 setattr、常量 xpath、Gson、Sequelize findOne）全不命中 |
+| 仓库级 | VFlask 6 文件 + DVNA 14 文件全仓扫描：**第四波规则 0 新增候选**（无 mongo/ldap/OGNL 上下文 → 守卫正确关闭） |
+| 自检 | prefilter 全过；two_stage 新增用例 #24（11 例：8 正 + 3 负）全过；cwe_normalizer 全过 |
+
+**已知边界（记档）**：
+- cve_fix_0002（CWE-90，ldapauth 库源码）：`{{username}}` 占位符替换 + 形参污点
+  + 2 跳 object 字段传递（searchFilter→opts.filter→search(options)），正则层
+  三重射程外（`.replace(/</g)` 是转义安全写法，只有 `{{...}}` 占位符形态可区分，
+  但 2 跳与跨文件无法兼顾）→ 不追，维持 §9.10 的 A 盲区判定；
+- JS 无 mongo 字样的抽象层文件（`db.collection(...)` 不带 require）NoSQL 漏报
+  ——Sequelize `findOne({where:...})` 同形负样本（node_sequelize）证明守卫必要，
+  精度取舍，跨文件上下文是架构级局限；
+- Java XXE 分离形态（parse 行与输入行断链）按文件级输入关联兜底，更强精度需
+  变量级 2 跳（现 1 跳）；
+- 行内注释中的守卫词仍会命中 _XXE_SAFE_RE（只剥整行注释，http:// URL 防误伤）。
+
+**LLM 裁决层重跑待算力**（同 §五之六 待办1 口径）：候选类型均带规范 taint_type
+（XXE→CWE-611 等），裁决通过后 8 段应转"有候选裁决"通道，兜底判真数预期 12 → ~4。
+
+---
+
+### 9.13 度量先行：两处「测量缺陷」修正（2026-08-31）
+
+**教训**：动手改工具前先验证度量本身可信。本轮发现两处测量缺陷都在**系统性
+低估**工具层能力，若照单全收会导出错误结论（"prefilter 很弱，该砍掉"）。
+
+#### 9.13.1 评测器 CWE 映射表漂移（prefilter 严格准确度被低估 3 倍）
+
+`experiments/prefilter_eval/eval_prefilter.py` 维护了一份**手工副本**
+`RULE_TO_CWE`（仅 9 条），而 prefilter 实际已有 32 条漏洞规则。新增规则的
+CWE 在副本里查不到 → 被计成「CWE 不匹配」。
+
+实锤：87 段里 25 例「CWE 不匹配」的命中规则**全部为空列表**——即规则已正确
+命中并判对方向（29/29 TP、FP=0），只是评测器不认识规则名。
+
+修复：改为从 `PREFILTER_RULE_INFO` **派生**（单一真源），新增规则只要在
+prefilter 里登记 `cwe` 字段，评测自动覆盖，两份表不再可能漂移。
+
+| 指标（87 段） | 修正前 | 修正后 |
+|---|---|---|
+| strict_accuracy | 0.3243 | **0.9459** |
+| strict_TP（CWE 匹配） | 4 | **27** |
+| CWE 不匹配 | 25 | **2** |
+
+#### 9.13.2 审计脚本去向判定用键匹配（凭空多出一倍候选）
+
+`audit_stage1.py::candidate_rows` 用「键是否在 final 集合里」判定去向，而键是
+`(rule_id, 行, 类型)`——被 `_dedupe` **合并掉**的那条与保留下来的那条键完全
+相同，于是两条原始候选都被标成「进裁决」，并连锁触发「重复候选」误报。
+
+dvna L39 实锤：final 实际只有 1 条，报告却显示 2 条进裁决。
+
+修复：改为**计数配额**（某键在 final 中出现 n 次，则 raw 中前 n 条算进裁决，
+其余算被合并）；`dedupe_check` 同步只统计最终进裁决的候选。
+
+---
+
+### 9.14 第五波：核心注入族形态缺口（2026-08-31）
+
+§9.12 补的是**长尾注入族**（XXE/LDAP/NoSQL/XPath…）。本波补的是 OWASP 主流
+类别的**形态缺口**——旧规则只认「输入直接出现在 sink 调用内」的内联字面量，
+而真实代码主流是「先构造变量、再把变量传入 sink」的 1 跳形态，以及 f-string /
+模板字符串等非拼接构造式。
+
+#### 9.14.1 落地的 4 条规则（prefilter.py）
+
+| 规则 | CWE | 补的形态 | sink 依据（语言/库级标准 API） |
+|---|---|---|---|
+| `sqli_constructed_query` | CWE-89 | 1 跳变量传入、f-string、`%`/`.format` | `.execute/.executemany/.executescript`（PEP 249）、`.executeQuery/.executeUpdate`（JDBC）、`mysqli_query` |
+| `cmd_injection_shell` | CWE-78 | Python f-string、JS 模板字符串 | `subprocess.*`+`shell=True`、`os.system`、`exec(`（**仅** child_process 引入时） |
+| `xss_unescaped_output` | CWE-79 | prefilter 此前**完全无** XSS 规则 | 三要素：HTML 标签字面量 + 输入拼接/插值 + 输出 sink |
+| `ssrf_request_from_input` | CWE-918 | prefilter 此前**完全无** SSRF 规则 | `urlopen/urlretrieve`、`requests.*`、`axios.*`、`http(s).request`、`curl_exec` |
+
+共用一套 1 跳消解（`_split_first_arg` / `_assigned_expr_line`）与构造识别
+（`_expr_is_constructed`）。上下文守卫沿用 §9.12 纪律：裸 `.execute(` 与 Java
+线程池 `ExecutorService.execute(Runnable)` 同名 → 加 `_SQL_CTX_RE`；JS `exec(`
+= 命令注入而 Python `exec(` = 代码执行 → 加 `_JS_CHILDPROCESS_RE`；裸 `fetch(`
+是浏览器端取数、无 SSRF 语义 → 不纳入 sink 表。
+
+#### 9.14.2 精度约束（全部由安全对照样本实锤，非臆测）
+
+首轮上线即产生 4 个 FP，逐条定位后加约束，最终 **FP 归零**：
+
+| 样本 | 误报原因 | 约束 |
+|---|---|---|
+| `safe_06_csp_header` | 已 `html.escape` | `_XSS_SAFE_RE`（转义后再插 HTML 是标准修复） |
+| `safe_15_ssti_escape` | Jinja `{{ x }}` 被当字符串插值；且有 autoescape | 剥模板占位符后再判插值；`_XSS_SAFE_RE` |
+| `safe_08_shlex` | 已 `shlex.quote`（shell 引号转义） | `_CMD_SAFE_RE` |
+| `noise_03_harden` | ① 常量 `"admin"` 被当变量；② SQL 文本里的 `FROM`/`WHERE` 被当拼接标识符 | `_is_constant_var`；标识符提取一律在**剥离字符串字面量后**的文本上做 |
+
+第 ② 条是**二次修复**：首次只修了变量引用分支，拼接标识符分支仍在原文上取词，
+把 SQL 关键字当成变量（`FROM` 未在本文件赋值 → 判非常量 → 命中）。
+
+#### 9.14.3 行号口径：1 跳形态报构造行而非 sink 行
+
+VFlask L265 首次报出后被审计判为「C 无关候选」——不是误报，是**行号偏了 4 行**：
+manifest 标 CWE-89@261（`%` 构造行），规则报 265（`execute` 行），超出 ±2 容差。
+
+修正：1 跳形态报**查询文本的构造行**（漏洞主体是「把输入拼进语句」这一步，
+sink 只是执行点；标准答案与真实漏洞报告均按构造行标注）。内联形态构造与
+sink 同行，两种口径自然一致。修正后 L261 由 A 盲区转 OK。
+
+#### 9.14.4 伴生修复：TaintTracker 同流双报去重
+
+调试 dvna 时发现 taint_tracker 对**同一条流**产出两条候选，sink 描述分别为
+`cp:exec` 与 `exec(`（`source` 与行均相同）。主键 `(类型, source, sink)` 因
+sink 文本差异永不相等 → 同一漏洞进裁决两次，白耗 N=3 次采样。
+
+修复：`_dedupe` 增加二级索引 `by_src_line`，有证据候选在主键未命中时按
+`(类型, source, sink 行)` 归并。放宽的只有 sink 文本一项，同行的不同 sink
+调用（`exec(a); exec(b)`）因 source 不同不会被误并。
+
+#### 9.14.5 验证矩阵
+
+| 关 | 结果 |
+|---|---|
+| prefilter 独立评测（87 段） | recall 0.4754→**0.7377**；strict_acc **0.9434**；**FP=0**（不劣化）；覆盖率 0.4253→0.6092 |
+| prefilter 独立评测（cve_fix 20） | recall 0.35→**0.60**；strict_acc **0.75**；FP=0 |
+| 独立集仓库（VFlask，零接触） | **L261 CWE-89 由 A 盲区转 OK**；C 类噪声表**清零**；OK 13 保持 |
+| 独立集仓库（DVNA） | OK 5 保持；无新增 C 噪声；重复候选误报消除 |
+| 冒烟 | `scripts/tool_smoke_test.py` **PASS=9 FAIL=0** |
+| 自检 | prefilter 全过；taint_tracker / cwe_normalizer 全过 |
+
+#### 9.14.6 诚实口径：87 段上是冗余佐证，真实增益在仓库
+
+必须区分两个层面，避免把 prefilter 的独立召回增益当成系统召回增益：
+
+| 层面 | 修复前 | 修复后 | 结论 |
+|---|---|---|---|
+| 87 段 Stage 1 判定 | OK 44 / A 41 | OK 44 / A 41 | **无变化** |
+| 87 段候选数 | raw 181 → final 98 | raw 201 → final 100 | 新规则贡献 20 条原始候选，**18 条并入已有候选**，仅 2 条独立新增 |
+
+原因：87 段合成集的注入类样本已被 semgrep/bandit/taint_tracker 覆盖，prefilter
+新增多为**交叉佐证**（多工具一致的候选在裁决层更不易被 1/2 票否决，对应
+§三「冗余候选制造复核噪声」的反面）。真实召回增益来自 VFlask L261——那里其他
+工具都没覆盖到，prefilter 补上了。
+
+prefilter 召回提升的**直接收益是短路率**：判 True 的样本不再调用 LLM，87 段上
+判 True 由 29 → 45（FP 恒为 0，故短路安全）。
+
+**已知边界（记档）**：
+- 1 跳为限：`q = build(user); execute(q)` 这类 2 跳仍漏，需变量级数据流（架构级）；
+- `_assigned_expr_line` 按行首形态取赋值，跨行赋值的续行部分不入表达式
+  （Java 多行拼接 SQL 实测靠首行已能判定，但不保证全部形态）；
+- XSS 三要素里的「输出 sink」用正则近似，模板自动转义以外的间接输出（`return`
+  到上层拼装）可能漏；
+- SSRF 只覆盖显式 HTTP 客户端调用，经封装函数/SDK 的间接请求不追。
+
+### 9.15 两波收口：注释免疫全覆盖 + 构造检测共享原语（2026-08-31）
+
+§9.12（第四波长尾族）与 §9.14（第五波主流族）并行落地后发现三处不一致，本轮
+全部收口——**两波共用的判定逻辑必须建立在同一组原语上，否则下次改形态要改两处
+（§9.7 方法论教训 3"判定收进单一入口"）**。
+
+| # | 问题 | 修复 |
+|---|---|---|
+| 1 | **注释免疫不对称**：§9.12.2 给 `_XXE_SAFE_RE`/`_MASS_ASSIGN_SAFE_RE` 加了整行注释剥离（cve_fix_0021 教训），§9.14 的 `_XSS_SAFE_RE`/`_CMD_SAFE_RE`/`_SSRF_SAFE_RE` 仍在原始文本上判——文件里任何注释提到 `html.escape`/`shlex.quote`/`allowlist` 都会整体豁免对应规则（同款失败模式潜伏） | 三处判定统一走 `_code_wo_comment_lines`；新行为验证：注释提 shlex/escape 的真漏洞正确报出，safe_06/08/15（防御在代码行）不受影响 |
+| 2 | **构造检测双实现分叉**：第四波 `_constructed_var_names`（变量级收集）与第五波 `_expr_is_constructed`（表达式级判定）各有一套字符串构造识别，能力互缺——前者无字符串剥离（noise_03 教训②未同步）、后者不认 JS 模板串 | 抽出模块级共享原语 `_strip_str_literals`（剥 `'`/`"` 字面量、反引号串**保留 `${}` 插值段**——插值是真实代码引用）；两侧统一调用；`_expr_is_constructed` 构造形态 ④→⑤（补模板串）。两个 API 保留：变量级（sink 参数区引用检查）与表达式级（1 跳消解）本就是同一机制的两个粒度，原语已归一 |
+| 3 | **`sql_execute` sink 缺 `.query(`**：Node mysql/pg 标准查询 API（§9.7 #1 已在 taint_tracker 论证标准性）在 prefilter 侧缺失，`db.query(sql)` 1 跳形态漏召回 | 补入 sink 表（词边界天然避开 `req.query.id`/`querySelector`，`_SQL_CTX_RE` 守卫兜底）；`req.query` 取值与非 SQL 上下文负样本验证不误报 |
+
+**验证（全量，零回退）**：三模块自检全过；eval_prefilter 87 段 strict_acc 0.9434 /
+recall 0.7377 / FP=0、cve_fix strict_acc 0.75 / recall 0.60——与 §9.14.5 逐项一致；
+87 段静态回归四项指标持平（零召回 15、零召回×真 3、候选≥3 的 10、安全样本候选 14）。
+候选明细仅两处 2→1 且均为**归并改善**：typical_10（taint_tracker 同流双报被 §9.14.4
+去重收进多工具候选）、hard_longfile_01（prefilter 行号对齐构造行 L317 后与 bandit
+B608 归并为 `bandit+prefilter` 双工具候选——多工具一致证据，§三 冗余治理的正向形态）。
+
+**skill 同步**（`.codebuddy/skills/`）：tool-defect-audit 补环境铁律（graproj，
+§9.7 教训的操作化）、87 段回归命令改为 dump 静态口径（eval_two_stage 归第 5 步
+LLM 对账）、新规则登记 `PREFILTER_RULE_INFO` 纪律（§9.13.1 单一真源）、复测同
+环境同口径纪律；过期基线节改为指针式快照（历史数字曾与文档修正脱节）。
+vuln-scan-sample-triage 补环境纪律、F6 跳号注解（行号噪声，定义在训练层文档
+P1-C）、关键路径补 exp_08 仓库基准。
+
+### 9.16 第六波：逐工具健康诊断 → 2 个 P0 接入缺陷 + 语言覆盖补齐（2026-08-31）
+
+> 触发方式：对"每个工具还有无可优化处"做**逐工具健康检查**——冒烟 + 87 段
+> dump 的语言×工具覆盖矩阵 + 最小样例对照实验 + 内部方法分步追踪。两个 P0
+> 都不是"规则不够"，而是**调用方式让工具必然零召回**（B1 同型第 3、4 次）。
+
+#### 9.16.1 P0-1：detect-secrets 对绝对路径必然零召回（SKIP 后门掩盖）
+
+| 调用形态 | `password = "hunter2_hunter2_secret"` |
+|---|---|
+| CLI 直跑（相对路径） | 召回 `Secret Keyword` |
+| 接入层 `scan --all-files /abs/path.py` | **`results: {}`** |
+| cwd=文件目录 + basename | 召回 `Secret Keyword` + `AWS Access Key` |
+
+detect-secrets 1.5.0 对绝对路径不扫描；接入层固定传绝对路径 → 该工具**整个
+项目周期从未产出过任何发现**。掩盖机制：冒烟脚本把"阳性零召回"显式降级为
+SKIP（注释"插件/版本相关"）——**B1 的核心纪律是"零召回先查调用链"，把零召回
+设计成免检等于在最需要它的地方废除它**。
+
+修复：`_run_detect_secrets` 改为 cwd=目录 + basename；filename 回填原 path。
+收益（87 段）：secret 通道 3 → 8 段（typical_15/16/33、crossfile_03_sink、
+longfile_03 新增），安全样本零误报；VFlask 审计中 L26/L62/L15 的 798 发现
+获得 bandit+gitleaks+detect-secrets 三工具一致。
+
+**冒烟脚本修订**：SKIP 只授予"环境不具备"（trivy 漏洞库/pip-audit 网络），
+**不授予零召回**；detect-secrets（无外部依赖）零召回改判 FAIL，FAIL 提示
+固化"先查调用链路径形态，勿归因为插件或版本"。
+
+#### 9.16.2 P0-2：Java/JS source 硬编码变量名 → taint_tracker 跨语言失效
+
+`_SOURCE_PATTERNS["java"]` 写的是 `request.getParameter`——**变量名锁进了
+模式**，而 Java 请求对象是形参、命名自由。实测 87 段 8 个 Java 样本
+taint_tracker 贡献恒为 0。**自检用例恰好用 `request` 变量名 → 自检永远
+通过**——自检样例与被锁的假设同名，就永远发现不了这个假设（§8.9 教训 1
+的推论：新语言判定必须带该语言**多形态**阳性用例）。
+
+修复：Java 改**方法名级**（`getParameter(` / `getHeader(` / `getParameterValues(`
+/ `getInputStream(` / `getReader(` / `getQueryString(` 等 Servlet 专有方法，
+无第二语义）；JS/TS 补 `request.` 变体与 `req.headers/cookies/files`。
+
+#### 9.16.3 两个解析层缺陷（修 source 后暴露）
+
+1. **catch/except 块整体不可见**：`_BODY_TYPES` 缺 `catch_clause`/
+   `except_clause`/`finally_clause` → `_iter_statements` 对 try 的子句**既不
+   递归也不 yield**，块内赋值与 sink 全盲；且 sink 节点仍会被 try_statement
+   级扫描看到 → "只见 sink 不见污点"半盲。hard_cve_06 的 `request.getHeader`
+   赋值 + `Ognl.getValue` 双双落在 catch 内 → 零召回。Python 侧 except 同样
+   受益（自检补 6 行内联链用例）。
+2. **无参 sink 回退整条语句**：`Object obj = ois.readObject();` 的 arg_joined
+   回退用 stmt_text，把刚标记为污点的赋值目标 obj 也算进去 → 同一漏洞两条
+   readObject 路径（chain 多出 obj 自己喂自己）。改为取赋值右值。
+
+#### 9.16.4 语言 sink 补齐 + 无歧义族 sink（链级证据升级）
+
+- **Java 专有**（`_SINK_LANG_ONLY` 限定）：`new File(` / `Paths.get(` /
+  `FileInputStream(/OutputStream/Reader/Writer` / `ObjectInputStream(` /
+  `readObject(` / `parseObject(`（fastjson 专有）/ `parseExpression(`（SpEL）/
+  `Ognl.getValue(`。
+- **PHP 专有**：`mysqli_query(` / `mysql_query(` / `->query(`（PDO/mysqli OO，
+  需 `_CALL_NODE_TYPES` 补 `member_call_expression`）/ `unserialize(` /
+  `file_get_contents(` / `shell_exec(` / `passthru(` / `proc_open(` /
+  `curl_exec(` / `ldap_search(`。此前整张表 PHP 只有 `system(` 可用。
+- **无歧义族**（不新增召回，把 prefilter 已有召回**升级为链级高信任证据**，
+  §五之三 信任分级的兑现）：`.xpath(` / `search_s(` / `urlopen(` /
+  `urlretrieve(` / `axios(.get/.post(` / `http.request(` / `redirect(`。
+  收录标准 = API 名在该生态无第二语义；`.parse(`/`find(` 等需上下文守卫的
+  宽名仍留在 prefilter。
+- **`_SINK_RANK` 补登记**：新增类型不登记 rank 会在 `_MAX_PATHS_PER_SCOPE`
+  截断时垫底被丢——"加了对的规则却没进裁决"的隐形坑。
+- **`_compile` 补 `->` 前缀分支**：`->query` 加标识符断言会在 `$pdo->query`
+  失配（前字符是 `o`）→ PHP OO 查询整类漏。
+- **LDAP 参数化误报**：新 `search_s(` sink 上线即误报 safe_16（python-ldap
+  参数化形态 `search_s(base, scope, filter, [attrs])` 与 SQL 占位符同构）。
+  判定矩阵（已入自检）：常量模板+占位符数==列表元素数 → 安全；占位符数
+  不匹配 → 报；模板变量被污染 → 报。**占位符计数不能整串 findall**
+  （`_PARAM_PLACEHOLDER_RE` 匹配带引号整串，`(uid=%s)(cn=%s)` 只返回一次）
+  → 改在去引号内容上逐个计数。且模板参须**先筛常量参再查占位符**
+  （base 参 `"dc=x"` 是常量但无占位符，先取首个常量参会把它当模板）。
+
+#### 9.16.5 P2 两项
+
+- **P2-9 执行状态留痕**：`ExternalScanner.last_status`（ok/empty/parse_error/
+  timeout/not_found/os_error），two_stage 写入 `stage1["tool_status"]`
+  （仅异常状态）。此前 20+ 处降级 `return []` 全静默——工具超时与"无命中"
+  不可区分（B1 静默性同构）。留痕是旁路，不干预主流程。
+- **P2-8 semgrep 合并**：`_semgrep_execute_cached` 同文件一次执行
+  （registry 包 + taint 目录），两路解析从缓存按 `"-taint"` 后缀分流，
+  互不双计。单文件 2.04s → 1.31s（-36%），缓存命中 0.07s。
+
+#### 9.16.6 验证矩阵
+
+| 关 | 结果 |
+|---|---|
+| 冒烟 | **10 PASS / 0 FAIL / 0 SKIP**（detect-secrets 由 SKIP 转 PASS） |
+| 模块自检 | taint_tracker 31 例（新增 20+：Java/JS 变体、catch 块、PHP 四象限、LDAP 参数化矩阵）、two_stage（含 #25b 修复）、prefilter、cwe_normalizer 全过 |
+| 87 段（14:49 终版 vs 13:49 基线） | 总候选 117 → **132**（+15 全部来自 13 个真漏洞样本）；**安全样本候选 17 持平（零新增误报）**；零召回 15 / 零召回×真 3 持平 |
+| Java 样本 | 34 获链级候选（semgrep+taint 归并）；35 ObjectInputStream+readObject；36 SpEL；cve_06 Ognl；cve_08 fastjson——5/8 从零到链级 |
+| 仓库级 | VFlask OK 13 · B 1 · A 3；DVNA OK 5 · B 2 · A 4——**与 §9.9.4 逐项一致**（零回退） |
+| prefilter 独立评测 | 87 段 recall 0.7377 / strict_acc 0.9434 / FP=0；cve_fix 0.60 / 0.75——与 §9.14.5 逐项一致 |
+| P2-8 等价性 | 终版 dump 与合并前逐文件候选一致（零变化） |
+
+**候选≥3 的样本 10 → 17 说明**：+7 段全部是真漏洞样本获得**多工具一致证据**
+（如 open_redirect 族 taint+semgrep+prefilter 三通道），非同漏洞重复告警
+（同族同行已归并）——§三 冗余治理的正向形态，裁决层更不易被单票否决。
+
+#### 9.16.7 方法论沉淀
+
+1. **"零召回降级 SKIP"只授予环境不具备**。冒烟防线的作用是把零召回变成
+   FAIL 让人去查调用链；把零召回本身设计成 SKIP，防线在最需要的地方失效
+   （detect-secrets 整个生命周期零产出的直接原因）。
+2. **自检用例必须与被测代码"不同假设"**。旧 Java 自检写 `request.getParameter`，
+   与源码硬编码的 `request` 同名 → 永远 PASS。新语言判定必须带该语言的
+   变体形态（req/request/httpRequest…），单一形态等于没测。
+3. **修 A 暴露 B 是常态**：修完 source（9.16.2）Java 仍 5/8 零召回 → sink
+   缺失；修完 sink 又暴露 catch 盲区与参数化误报——**逐层修、每层复测**，
+   不要试图一次写完。
+4. **二分定位洗清嫌疑**：P2-9 上线后 two_stage 自检 #25b FAIL，移除 P2-9
+   重跑仍 FAIL → P2-9 无辜；真因是 blind_spots 用例样本过短（7 行文件的
+   片段省不过 40% 闸门），属前会话遗留设计缺陷。**用例期望值也要核对**——
+   本波两次因期望行号数错而假 FAIL（catch 用例、模板污染用例）。
+5. **stash 对照对未提交工作区无效**：工作区本身就有大量未提交改动时，
+   `git stash` 回退的是旧版本而非"本波改动前"，对照结论不可信；
+   应做**针对性移除重跑**（只撤本波改动）。
+
+---
+
+### 9.16 盲区提醒独立验证：从 2/7 到 7/7（2026-08-31）
+
+`graduation_project/blind_spots.py`（用户实现，8 类 21 条 + 三硬约束 + 已接线
+`two_stage_scanner`）此前**只有模块自检**（自出题）。按 §9.13「度量先行」纪律，
+用**审计中实际发现的 A 盲区**（dvna 4 处 + VFlask 3 处，均为 manifest 标注的真
+漏洞）做独立验证——初测仅 **2/7**。缺口与修复如下。
+
+#### 9.16.1 四处缺口与修复
+
+| # | 缺口 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | dvna L144/L145 IDOR（与 L107 同形） | `per_category_cap=2` 直接**丢弃**超限位置：3 处 IDOR 只提醒前 2 处，漏的正是真漏洞 | cap 改为限制**条目数**而非位置数：超限位置并入代表条目的 `extra_lines`（prompt 里"同类另见 Lx/Ly"，条目数不变不稀释注意力）；`build_review_context` 按 `all_lines` 提取片段（不丢覆盖） |
+| 2 | VFlask L208/L231 IDOR | 变量流只做 **1 跳**：`content = request.json` 污染的是 `content`，而 sink 用的是 `customer_id`（2 跳派生） | 加传播闭包 `_PROPAGATE_RE` + `TTAINT_PROPAGATION_HOPS=2`（迭代至不动点）；更深链仍属 TaintTracker/模型职责 |
+| 3 | VFlask L231（路由参数形态） | 输入源只认 `request.*`，不认 **URL 路径变量**：`@app.route('/get/<cust_id>')` → `get_customer(cust_id)` 整链 0 提醒 | 加 `_ROUTE_PARAM_RE`（Flask `<x>` / Django `<c:x>` / Express `:x` / Spring `{x}`，均为官方文档标准路由语法）；只在路由装饰器行内匹配，非路由上下文的 `<div>` 不误伤 |
+| 4 | layout.html L5 CWE-311、appHandler L207 CWE-200 | 规则表无明文传输类；无"无过滤批量查询"信息暴露形态 | 补 2 条低优先级规则（`http://` 明文引用 priority 2、`findAll()` 无过滤 priority 3） |
+
+#### 9.16.2 伴生缺陷：定向复核在短文件上"名存实亡"
+
+补规则后做泛化验证，发现 `build_review_context` 在短文件/压缩产物上**反而比
+原文更长**（dvna `config/server.js` **131%**、`jquery.min.js` **100.1%**）——
+window 片段互相重叠合并≈整文件，还多出行号前缀。此时"定向复核"已无省时意义，
+却仍承担片段拼接与行号映射的失真风险。
+
+修复：加**收益闸门** `MIN_SAVING_RATIO = 0.6`——片段占原文 60% 以上时返回
+`None`，调用方回退整文件（`two_stage_scanner` 已是 `ctx if ctx else code`，
+文件本就小时全量复核并不贵）。
+
+| | 改动前 | 改动后 |
+|---|---|---|
+| dvna 平均压缩率 | 81.1% | **37.1%** |
+| VFlask 平均压缩率 | 56.9% | **22.6%** |
+| 片段 >50% 原文的文件 | dvna 3/5、VFlask 5/7 | **0 / 0** |
+
+（注：闸门按**字符**占比判定——自检用例曾因填充行过短，出现"覆盖 49% 行数却
+折算成 66% 字符"被正确挡下，已改用真实长度样本。）
+
+#### 9.16.3 验证
+
+| 关 | 结果 |
+|---|---|
+| 独立集（真实审计盲区 7 处） | **定位 7/7、模型可见 7/7**（`all_lines` ±2 容差 + 片段/整文件回退双通道确认） |
+| 模块自检 | **12/12 全过**（新增 4 组：二跳传播、路由参数、同类超限不丢位置、收益闸门） |
+| 措辞纪律 | 23/23 条全部含"请确认"、无定性词（新增 2 条同样合规） |
+| 泛化（两仓 22 文件全扫） | 提醒未泛滥：仅 5 个文件盲区≥3，第三方压缩 JS 由收益闸门自然回退 |
+| 回归 | 冒烟 PASS=9 FAIL=0；prefilter 87 段 strict_acc 0.9434 / recall 0.7377 / FP=0 持平；dvna OK 5、VFlask OK 13 无回退 |
+
+#### 9.16.4 口径说明
+
+盲区提醒**不产生 finding、不影响 `has_vulnerability`**（模块三硬约束），故上表
+的 7/7 是"模型能看到几处"，**不等于**召回提升——模型是否据此判真需第 5 步
+LLM 跑批对账才能证实。盲区的价值在于把"静默漏报"变成"显式提示"，与
+`suppressed_by_registry` / `dropped_unowned` / `BudgetPlan.uncovered` 同一消除
+静默性原则。
+
+---
+
+### 9.17 risk_budget 预算调度独立验证（2026-08-31）
+
+用户实现的 `graduation_project/risk_budget.py`（文件风险打分 + 预算分配，
+已接线 `github_scan` 与 CLI 批量路径）此前只有模块自检（自出题）。本轮按
+§9.13「度量先行」纪律做独立验证：**用有标准答案的数据集，在同等预算下对比
+「旧：walk 顺序截断」vs「新：风险调度」能否保住漏洞文件**。
+
+实验脚本（可复用）：`experiments/exp_08_repo_benchmark/eval_risk_budget.py`
+（三数据集 × 7 档预算 + **随机顺序截断期望**基线——87 段文件名字母序恰好把
+vuln 密集的 hard_* 排最前，直接对比旧策略会高估它，必须以随机为公平底线）。
+
+#### 9.17.1 结果
+
+| 数据集（GT 数） | 发现 |
+|---|---|
+| dvna（GT 2） | GT 排名 **#0 / #3**（14 文件）；预算≥5 全覆盖；预算=3 时新策略以 `server.js` 换出 `appHandler`——**非实质回退**：server.js 的硬编码凭证是 semgrep 审计中确认过的真实漏洞（L24 形态核验通过），只是 manifest 审计范围未收录（GT 完整性假象） |
+| VFlask（GT 2） | GT 排名 **#1 / #2**（9 文件）；全预算档全覆盖，零回退 |
+| exp04_87（GT 61） | 新策略 ≈ 随机基线（@10: 7 vs 7.2；@20: 15 vs 14.2；@50: 36 vs 35.1）；旧 walk 顺序（9/18/25）系字母序运气，非代表性 |
+
+#### 9.17.2 87 段 ≈ 随机是**预期内**的（但暴露了一个真缺口）
+
+87 段的 26 个安全对照**按设计就长得危险**（参数化查询/shlex.quote/autoescape
+——有 sink、有入口、有输入，但已缓解）。存在性打分**原理上分不开"漏洞"与
+"缓解了的漏洞形态"**——那是 prefilter/LLM 的职责（漏洞中位排名 44 vs 安全
+32.5，前 20 名混入 9 个安全文件）。真实仓库里绝大多数文件是 boring 的
+（DTO/常量/UI），打分器的本职是分离"值得看/不值得看"，该集不含 boring 文件，
+测不出这项价值。**不要用 87 段的 precision@N 评价风险调度**。
+
+但归因过程暴露了一个真缺口：**纯硬编码凭证文件对调度器不可见**——
+`typical_06_secret.py`（CWE-798，无 sink/入口/输入）排名 **86/87**。真实仓库
+里这类文件往往很"安静"，预算紧张时 CWE-798 整类被饿死。
+
+**修复**（语言级事实，非样本拟合）：`_SECRET_HINT_RE`——凭证语义标识符
+（secret/password/api_key/token/credential…）**赋值为非空字符串字面量**。
+env/配置读取（`os.getenv`/`process.env`）与空值是标准安全写法，天然不命中
+（右侧须以引号开头）；`==` 比较用 `(?<![=!<>])=(?!=)` 排除。定位是**弱风险
+提示**（W=4/处，cap 2，只影响预算排序，不产生判定）。
+
+| 验证 | 结果 |
+|---|---|
+| 87 段副作用 | **13 个漏洞文件正确提权，0 个安全文件误提**（safe_13 的 `csrf_token = secrets.token_hex()` 为函数调用不命中——字面量要求即精度守卫） |
+| typical_06_secret | 排名 86→84、score 3.0→7.0（仍靠后：该文件仅此一个信号，如实记录） |
+| 87 段覆盖 | @8/15/20/50 由 6/10/11/35 → **7/10/15/36** |
+| dvna | server.js（真实凭证）按语义上浮——预算=3 的换位即来源于此，见上表归因 |
+| 模块自检 | 10/10（新增凭证提示 2 组：字面量提权/env/空值/比较不误计） |
+| 编译 | CLI 与后端入口 py_compile 通过 |
+
+#### 9.17.3 结论与边界
+
+**结论：优化保留**。真实仓库上 GT 稳定进头部、全预算档无实质回退、uncovered
+显式回报与折叠闸门设计合理（高危文件永不折叠）；补充凭证提示后 CWE-798 类
+"安静文件"不再被系统性饿死。
+
+**边界（记档）**：
+- 打分对"缓解了的漏洞形态"无分辨力（原理性，87 段 ≈ 随机的根因）——预算的
+  价值在真实仓库的"interesting vs boring"分离，勿用对抗集 precision@N 评价；
+- `typical_06_secret` 类纯凭证文件仍排中后段（单信号天花板）；若要更高优先级
+  需把"凭证字面量"升为独立档位——本轮不做（避免为设计集调权重）；
+- manifest GT 不完整时（如 dvna server.js），"新策略换出 GT 文件"可能恰是
+  正确行为——用 GT 覆盖率评价预算调度须先核对 GT 完整性；
+- 折叠闸门 `FOLD_MAX_RISK_SCORE=0.0` 依赖"分数<0 才折叠"，W_PATH_LOW 调权
+  时需联动复核。
+
+### 9.18 exp_01 14 段首轮审计：semgrep 并发竞态 + 审计器映射缺口（2026-08-31）
+
+> 数据面背景：exp_01_basic_scan 14 段（py/js/java/php 基础形态 + 2 safe 对照）
+> 是 §9.10 盘点后**最后一个进入审计循环的既有数据面**。走 skill 全流程：
+> 逐行实读建 manifest（exp_08_repo_benchmark/manifest_exp01.json）→ 纯工具审计
+> → 修复 → 复测。全程与 87 段 LLM 跑批**并发**执行（审计零 LLM，不占 GPU）。
+
+#### 9.18.1 首轮结果与两个缺陷
+
+首轮审计：13 OK + 1 B（hardcoded_secret_02.java）+ **0 A 盲区 + 0 C 噪声 +
+safe 两段零误报**——第六波后的工具层在这套基础形态集上覆盖完整。两个缺陷：
+
+| # | 缺陷 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | hardcoded_secret_02.java 判 B | detect-secrets 的 rule_id 是**插件 type 名**（Secret Keyword / AWS Access Key / Hex High Entropy String…），审计器 `_SEMANTIC_TO_CWE` 无映射 → 类型正确被判 B（§9.8 同型：测量工具先于引擎——detect-secrets 修复绝对路径缺陷后首次产出候选，随即暴露） | 映射表补 7 个 secret 族 type 名 → B 转 OK |
+| 2 | **semgrep 并发竞态**：semgrep-core 偶发 exit 2（"Error while matching"），失败模式 results=0 + errors=1（整体崩） | 多进程并发（exp_01 审计 × 87 段 LLM 跑批同机）争抢 semgrep 内部缓存/临时目录。崩溃率与并发强度正相关：独跑 0%、与跑批并发约 40%（dump 期间 29 次/87 段）；跑批日志同现 16 次 | `_semgrep_execute_cached` 对 errors 非空的执行**重试 1 次**（0.3s 退避）；无 errors 的正常空结果不重试（防双倍耗时） |
+
+**竞态的实际损失量化（修复前）**：跑批 16 次报错仅 typical_35 丢 1 条候选
+（semgrep 的 XSS 弱证据，静态审计本判 B 错标，两条 taint 主票完整、终判不受
+影响）——损耗被多工具冗余兜住，但机制上"偶发整文件 semgrep 全空 + 零留痕"
+不可接受。留痕缺口：errors 分支此前不写 `last_status`，已补（errors_retry:N）。
+
+**重试验证**：修复后 dump（与跑批并发，29 次报错）→ 87 段四项指标与 14:49
+基线**逐样本零差异**（总候选 132 / 零召回 15 / 零召回×真 3 / 安全样本候选 17），
+29 次竞态全部被重试兜住；exp_01 复测 **14/14 全 OK**；冒烟 10 PASS。
+
+#### 9.18.2 exp_01 的审计结论（对比其他数据面的定位）
+
+- 14 段覆盖 6 类基础形态（SQLi/XSS/CmdI/PathTrav/798/502）× 4 语言 + 2 安全对照，
+  **无官方答案**（合成教学样本），manifest 按权威 CWE 定义逐行标注（findings 级）。
+- 与 87 段的分工：87 段是"难样本 + 多漏洞共现"集，exp_01 是"教科书形态"集——
+  后者零 A 盲区说明第六波后的规则库对**入门形态**已全覆盖；真正的剩余缺口
+  （缺失型/框架级/跨文件）集中在 §五之五 与 §9.9.4 清单。
+- PHP 第一样本（xss_01）曾因竞态掉成 A 盲区——修复重试后恢复。**PHP 的召回
+  面仍薄**（本批仅 1 段 XSS；echo 直出形态 prefilter 不认，靠 semgrep registry），
+  php-goof 审计（未跑）是下一个 PHP 验证场。
+
+#### 9.18.3 方法论
+
+1. **并发是新的故障注入器**：同机多进程跑 semgrep 时崩溃率 0%→40%，此前的
+   "工具稳不稳"结论全部建立在独跑之上。P2-9 留痕（errors_retry 状态）+ 重试
+   是并发场景的基本卫生；涉及外部工具的并行评估/审计应默认假设竞态存在。
+2. **审计全程零 LLM 的价值再次兑现**：与 GPU 跑批完全并行，CPU 空闲时段的
+   数据面清欠不与算力任务冲突。
+
+### 9.19 php-goof 首轮审计：PHP 仓库形态首发，3 条盲区全为版本/间接源边界（2026-08-31）
+
+§9.18.2 预告的"PHP 验证场"兑现。对象 `snyk-labs/php-goof`（Snyk 官方 PHP 漏洞演示应用，
+8 个 PHP 文件，`exploits/` 下 2 个载荷字体文件按纪律排除审计域外）。manifest
+（`manifest_php-goof.json`）逐行实读 + 官方 readme 漏洞演示映射
+（SNYK-PHP-LEAGUECOMMONMARK-174004 / SNYK-PHP-PHPMAILERPHPMAILER-1311001 /
+SNYK-PHP-DOMPDFDOMPDF-2428942），composer.lock 核对 dompdf v1.2.0 /
+league/commonmark 0.18.2 / phpmailer v6.4.1 与演示版本一致。
+
+**结果（零 LLM 审计，`stage1_audit.php-goof.all.md`）：OK 5 · A 盲区 3 · B 0**。
+7 条 expected 命中 5：
+
+| 发现 | 覆盖 | 工具/链路 |
+|---|---|---|
+| func.php L13 SQLi | ✓ | semgrep |
+| tasks.php L11 / L27 SQLi（UPDATE/DELETE） | ✓ | semgrep（L13 缓解形态与 L11 去重合并） |
+| index.php L39 反射 XSS | ✓ | semgrep |
+| db.php L4 硬编码口令 | ✓ | detect-secrets `Secret Keyword` → CWE-798 语义映射首次在 PHP 验证 |
+| index.php L65 / pdf.php L39 / mail.php L19 | **A 盲区** | 见下，逐条定性 |
+
+**A 盲区逐条定性（三条全部不修——泛化三关不过，属结构性边界而非规则缺失）**：
+
+1. **index.php L65 CommonMark XSS**：`echo $converter->convertToHtml(urldecode($row['title']))`。
+   source 是 **DB 间接源**（`$row[...]`），PHP source 模型只认超全局数组——把 DB 行
+   读值纳为 source 会让一切 PHP 数据库应用误报爆炸；且利用性依赖 commonmark
+   0.18.2 的 unsafe-link 实体绕过（新版 `html_input=escape` 默认安全），版本敏感。
+   → 数据流分析/SCA 域，行级形态工具不追。
+2. **pdf.php L39 dompdf RCE**：`$dompdf->loadHtml($html)`（L30 用户输入拼接 +
+   L10 `setIsRemoteEnabled(true)`）。`loadHtml(` 撞 **DOMDocument::loadHtml**
+   （XML 解析语义，相关 CWE 是 611）——同调用名双语义，加 sink 必在 DOMDocument
+   场景制造 B 类错标（§9.16 JS `exec(`/`render(`/`.save(` 同型教训）。
+   → 配置组合 + 版本敏感 + 双语义，不修。
+3. **mail.php L19 PHPMailer validateAddress**：phpmailer 6.4.1 的
+   `validateAddress` 缺省回调 `'PHP'` 是**版本特有行为**；修复版及一切正常应用
+   中它是最常见的邮箱校验调用，加 sink 误报极高。
+   → SCA 域（依赖版本感知），应用侧无稳定静态形态。
+
+**零代码修复 → 候选集合不动 → fixed5 基线免回归**（132/15/3/17 口径不变）。
+
+**PHP 召回面结论更新（对 §9.18.2 "PHP 召回面仍薄"的回应）**：教科书 SQLi/XSS/798
+形态已全覆盖（含 PDO/mysqli OO 与过程式双形态、反射与存储两种 XSS 出口），剩余
+盲区全部是"版本敏感 + DB 间接源/双语义"类——**PHP 无需第七波补规则**，规则库
+在该语言上的下一层缺口已从"形态规则"升维到"数据流/版本感知"架构能力。
+
+**对账口径两条**：
+- exploit 载荷文件（gotcha_font.php 内嵌 `<?php phpinfo(); ?>`）的 semgrep
+  `phpinfo-use` 告警被无主告警剔除 → 0 候选，与"排除域外"预期一致（剔除规则
+  对载荷文件反而正确）。
+- tasks.php L13（INSERT `$title`，入库前经 urlencode 编码引号）按标注纪律
+  "框架/标准库默认缓解写 notes 不进 expected"处理——semgrep 果然照报
+  （拼接进 SQL 就报，宁可信其有口径），因与 expected L11 同类型同文件去重合并，
+  未计 B/C，口径无扰动。"缓解写 notes"的反向价值首次实测。
+
+### 9.20 NodeGoat 首轮审计 → 第七波修复：cookie 映射缺口 + $where/needle/autoescape 三规则 + sink 行号锚定（2026-08-31）
+
+对象 `OWASP/NodeGoat`（OWASP 官方 Node.js 教学库，审计域 26 文件 = 24 服务端 JS +
+2 个用户输入渲染视图；assets/vendor、test/、Gruntfile 排除域外）。manifest
+（`manifest_nodegoat.json`）逐行实读 + 代码内官方 "Fix for Ax" 注释块逐条核对，
+24 条 expected（覆盖 A1-1 SSJS eval / A1-2 NoSQL $where / A1-3 Log Injection /
+A2 明文口令与弱策略 / A3 autoescape:false / A4 IDOR / A5-A8 配置注释 /
+ReDoS / SSRF）。
+
+#### 9.20.1 首轮 → 修复后对照
+
+首轮 **OK 7 · A 16 · B 1** → 第七波修复后 **OK 13 · A 10 · B 0**（24 条 expected）。
+修复四项：
+
+1. **Insecure Cookie 类型承接（首轮 6 条无主告警剔除 → D 类假盲区）**：
+   semgrep express-cookie-settings 族（session(...) 缺 httpOnly/secure/domain/
+   expires/path 共 6 条精确告警）全部被当无主告警剔除——server.js L78 CWE-1004
+   的"盲区"实为命中后丢弃（§9.18 同构：不是工具没命中，是管线把它扔了）。
+   修复三表联动：`_infer_taint_type` 加 cookie 分支（rule_id 特有片段
+   no-httponly/no-secure/cookie-settings 专属性强无撞词）→
+   `_STANDARD_TAINT_TYPES` 加 "Insecure Cookie" → 审计器 `_SEMANTIC_TO_CWE`
+   加 `"insecure cookie": "1004|614"`（no-secure 精确分类是 614，工具粒度只有
+   "缺配置"一档，双编号对齐——§9.8 口径先例）；cwe_normalizer 同步 1004/614。
+2. **$where 操作符注入规则（A 盲区 → 真）**：`nosql_where_injection`
+   （CWE-943）。MongoDB `$where` 接受 JS 字符串并服务端 eval（官方文档行为），
+   同行 AND：`$where` +（模板 `${}` 或字符串拼接）。语言级事实：$where 是
+   MongoDB 标准操作符，JS 模板/Python 拼接同形态；常量串不触发。
+   **两个教训**：① 块注释剥离必须先行——官方注释掉的修复示例（L64-76 块注释）
+   恰好含 $where+插值形态，首版命中注释行 L73 而漏真 sink L78（自检与真实文件
+   双重暴露）；② 行内注释剥离对 `/* */` 无效，`_code_wo_comment_lines` 只处理
+   整行注释——新行级规则默认先用保行号的块注释替换再逐行判。
+3. **needle HTTP 客户端 → SSRF（A 盲区 → 真）**：research.js L16
+   `needle.get(req.query.url + req.query.symbol)` 零召回实锤 Node 客户端缺口。
+   prefilter `http_client` sink 表加 `needle.(get|post|...)`；taint
+   `_SINK_DEFINITIONS` 加 `needle.get(`/`needle.post(`（`_SINK_LANG_ONLY`
+   JS 专有；SSRF 已有 `_SINK_RANK=3` 免登记）。
+4. **模板 autoescape 显式关闭 → XSS（A 盲区 → 真）**：
+   `template_autoescape_disabled`（CWE-79）。`autoescape\s*[:=]\s*(false|0)`
+   是 swig/jinja2/nunjucks 标准选项的显式禁用（server.js L137 实锤；Python 侧
+   `Environment(autoescape=False)` 同形态），True/注释提及不触发。
+
+**附带质量修复——taint sink 行号锚定**：contributions.js 的 eval 候选此前
+sink_line 记为 handler 定义行 L28（箭头函数整体是一条语句，`stmt.start` 在
+L28，eval 在 L32，注释行隔开 → 审计 ±2 外判 A）。修复：sink 路径的 sink_line
+一律取 **sink 调用节点自身行**（含 cp 分支），复合语句/多行调用场景行号精度
+普遍提升。taint 自检加"箭头 handler 内 eval"回归用例（期望 L3 非 L1）。
+87 段回归证明此修复零扰动（见下）。
+
+**manifest 口径修正（非工具缺陷）**：all.js L9 cryptoKey expected 由 CWE-321
+改为父类 798——`Secret Keyword` 工具粒度只到"硬编码凭证"，321 是 798 子类，
+B 转 OK（粒度对齐，不是错标）。
+
+#### 9.20.2 剩余 10 条 A 盲区定性（全部结构性边界，零代码修复）
+
+| 形态 | 为什么不修 |
+|---|---|
+| server.js L145 http 明文服务 | 部署形态相关（反代/TLS 终结是主流），静态判定必高误报 |
+| profile-dao L62 ssn / user-dao L25 password 明文落库 | 敏感字段赋值→持久化是数据流语义，行级规则会误伤一切 `x.ssn = y` |
+| allocations.js L23 IDOR（CWE-639） | 授权类结构性盲区（VFlask 同款，§9.6 已定性） |
+| profile.js L59 ReDoS 嵌套量词 | 需对正则字面量做正则分析（新能力域），列为未来规则机会 |
+| profile.js L65 render 回传 body 值 XSS | 渲染数据流泛形态，每处 res.render 都会命中，噪声不可控 |
+| session.js L64 console.log 日志注入 | `console.` 被全局排除（浏览器端无 CWE-117 语义）；Node 后端 console.log 恰是服务端日志——**运行时双语义**，正则层不可判，与 LSP/require 上下文分析才有解 |
+| session.js L144 弱口令正则 | 需对正则质量做语义评判（.{1,20} 是否过弱），非形态匹配 |
+| views ×2（swig `{{ }}`） | 模板层语法 JS 工具链不解析——**模板层=当前工具域外**，与 vendor 同级豁免可写入后续 manifest 纪律 |
+
+#### 9.20.3 回归与泛化验证
+
+- 87 段全量静态回归（`stage1_candidates.20260831_144901.json`，第六波终态；
+  190511 中间版已被工作区清理，四项指标与其完全一致）：总候选 132 /
+  零召回 15 / 零召回×真 3（清单一致）/ 安全样本候选 17——**四项与基线逐项零
+  差异，零新增误报**（$where/needle/autoescape 形态在 87 段中不存在，第七波
+  是纯新增覆盖面，且 sink_line 锚定修复未改变任何样本的候选集合）。
+- 模块自检：prefilter / taint_tracker / two_stage_scanner / cwe_normalizer
+  全部通过（新增 8 条用例）；冒烟 10 PASS / 0 FAIL；后端可导入。
+- 三关自检：$where=MongoDB 标准操作符（语言级事实✓）· $where+插值同行 AND
+  （结构特征非拼写✓）· pymongo JS/Python 双形态（多语言变体✓）。needle 与
+  axios 同族论证（§9.15）；autoescape 为引擎标准选项名（跨语言✓）。
+
+#### 9.21.4 方法论
+
+1. **"无主告警剔除"日志是 D 类假盲区的首选证据源**：首轮审计的 server.js L78
+   "零候选"与剔除日志里的 express-cookie 6 条直接对上——审计时先看剔除留痕
+   （`stage1.dropped_unowned`）再定性 A，能省一轮错误归因。
+2. **注释块是教学仓库的陷阱**：官方把"修复代码"注释在旁边（NodeGoat 风格），
+   形态与漏洞完全一致——行级规则必须默认剥块注释（保行号占位），否则命中
+   示例而非真 sink。这条对 DVWA/NodeGoat 类带修复注释的仓库是通用前提。
+3. **审计器自身是第一嫌疑**：本轮 5 项修复中 2 项是测量层（_SEMANTIC_TO_CWE
+   缺口、manifest 粒度口径），与 §9.8/§9.18 的"测量工具先于引擎"三连——
+   A 盲区定性顺序固定为：剔除留痕 → 审计器映射 → 引擎规则。
+
+### 9.21 生产组态全量重跑对账 + secret 直出门槛的通道漏洞（2026-08-31）
+
+> 背景：第六波（§9.16）+ §9.17/9.18 修复全部落地后，按"完全对齐 APP"的组态
+> 重跑 87 段 LLM（transformers / triage_train_aligned / num_ctx 6144 / N=3 /
+> full_recheck，base 环境 ROCm——§9.7 "远程算力"表述更正：就是本机）。
+> 逐项组态核对表见对账记录；两处口径保持与 08-30 一致（共形不加载生产文件、
+> signal_feedback 隔离注册表）。
+
+#### 9.21.1 重跑对账：兜底闭环达成
+
+| 指标 | 08-30 全量 | **本轮（第六波工具层后）** | 解读 |
+|---|---|---|---|
+| 判定 | TP59 TN21 FP1 复核6 | TP56 TN20 **FP1** 复核10 | FP 仍为 1 且同一样本（crossfile_01_input/943） |
+| strict recall | 1.0 | **1.0**（FN=0） | 保持 |
+| **兜底判真（tools=llm）** | **12** | **3** | **-75%，"工具层为 LLM 减负"闭环**：剩余 3 段全部是"不修清单"成员（spring4shell 框架版 / crossfile 架构级 ×2） |
+| 兜底判真占比 | 20%（12/60） | **5.3%（3/57）** | 论文核心叙事数据 |
+
+#### 9.21.2 类型层回退的根因：secret 直出档的通道漏洞
+
+strict hit 77.2%（44/57），miss 13 段归因：**secret 抢占 ×5**（detect-secrets
+副作用）+ 共现/伴生 ×2 + 纯裁决漂移 ×6（→ v2_15 反例池 §3.5）。
+
+**抢占机制（票型实锤）**：detect-secrets 绝对路径缺陷修复后（§9.16.1）首次
+大量产出，其候选 `category="secret"` → **命中 `_is_direct_category` 直出档
+（1:0，免 LLM）→ 完全绕过凭证强度门槛**。门槛（夜间修复 #3）只接了 sast
+通道（B105 经转档判定）；同一个测试弱密码 `admin123`，bandit 看到要过门槛
+（0:3 否决），detect-secrets 看到直接直出——**门槛语义按工具分叉，按内容
+才是对的**。八个月前 B1 的"注释里的自我实现预言"在此的变体：门槛的正当性
+建立在"B105 会命中弱值"上，而 secret 工具通道从设计起就没进门槛。
+
+**修复（门槛统一 + 证据增强）**：
+1. runner 层：gitleaks message 附 `Match` 命中行原文；detect-secrets 按行号
+   读源文件附命中行（其 JSON 无命中文本）。此前 secret 候选 evidence 只有
+   "检测到疑似密钥: <type>"——门槛取不到值、模型没材料，双重缺陷。
+2. two_stage 层：`_drop_irrelevant_positional` 对 **category=secret 一律过
+   `_is_strong_credential`**：过 → 保持直出 + 类型规范化 Hardcoded
+   Credentials（裸 "Secret Keyword" 进 top1 无法归因 CWE）；不过 → category
+   转 sast 裁决档（与 B105 弱值完全对称）交模型。
+3. 门槛函数补**裸值兜底**：gitleaks 的 Match 常无引号（`AKIAIOSFODNN7EXAMPLE`
+   裸值）→ 引号提取恒失败 → 真凭证误判弱（typical_06 实锤）。兜底：≥20 位
+   连续密钥形态 token（AKIA/hex/base64 共同形态）判真。
+
+**验证**：自检 #26（弱值→sast 裁决档 / 真凭证→直出，对称性）；门槛五场景
+（AKIA 裸值/引号弱值/引号真值/无值/hex 裸值）全过；冒烟 10 PASS；87 段静态
+回归——总候选 132→124（-8 全部是"同凭证 B105+detect-secrets 归并成一条双
+工具候选"的**去重改善**），零召回 15 / 零召回×真 3 / **安全样本候选 17 持平**；
+真凭证直出 4 段全保留（typical_06/18、bypass_06、typical_33）。
+
+**预期（重跑验证中，`exp_07_full87.local_alpha05_rerun2`）**：5 段抢占消失
+→ B105 裁决否决 → 无候选兜底通道恢复 → 模型独立归因主类型（08-30 数据：
+287/862/384 三段直接 strict hit）→ strict hit 回升方向 88%。
+
+#### 9.21.3 复核 6 → 10 的构成
+
+新增复核 4 段：safe_03/04（候选面变大后安全样本也出现裁决票）、typical_13、
+typical_21。08-30 复核的 typical_09（PHP 入口正则修复兑现 §8.3）、longfile_01
+本轮直接判真。复核非错误（转人工语义），但 secret 门槛修复后应回落。
+
+#### 9.21.4 方法论
+
+1. **门槛的完整性=按内容不按通道**。凡"只接了 A 通道的门槛"，B 通道新增
+   供给时必然绕过——secret 候选的三条来源（sast 转档 / gitleaks / detect-
+   secrets）在修复前只有第一条过门槛。新增数据源接入时，逐条核对它经过的
+   每一道既有门。
+2. **直出档是绕过 LLM 的特权通道，特权必须配门槛**。1:0 直出的置信度语义
+   是"确定性工具自判"，工具判定弱值时（Secret Keyword 对 admin123 响）
+   特权就成了抢占的直通车。
+3. **对账先钻一个反常点**：strict hit 回退 11 个点没有平均用力，先钻最大的
+   miss 簇（Secret Keyword ×5）→ 票型 1:0 → category=secret → 直出分支——
+   四步定位到根因，比全面扫描快得多。

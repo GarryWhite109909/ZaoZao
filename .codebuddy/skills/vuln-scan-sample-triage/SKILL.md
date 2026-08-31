@@ -108,6 +108,8 @@ stat -c '%y' graduation_project/*.py            # 代码修改时间
 - **F3** 硬性知识错误（如"`==` 是恒定时间比较"、"extractall path 是常量故无路径穿越"）
 - **F4** 捏造 API（如 `logging.escape()`）
 - **F5** 伪修复（值比较挡不住键名注入 / 参数化矛盾于"确认漏洞" / 修复与判定严重性不匹配）
+- **F6** 行号噪声（说明/修复行号 ±2~3，推理端 line_normalizer 兜底、数据侧治本）
+  ——完整定义在训练层文档 P1-C，本表列出仅为编号连续
 - **F7** 主次排序缺失（选了真实的伴生/次类型，未选主类型）→ **工程侧无解**，硬编码主次=答案泄漏
 - **F8** 幻觉类型被投票机制放大（"独立票"加分机制让幻觉票胜出）
 
@@ -119,6 +121,7 @@ stat -c '%y' graduation_project/*.py            # 代码修改时间
 | 独立验证集（20 段真实 CVE）| `experiments/exp_06_finetune/testset_cve_fix/` |
 | fixed5 基线结果 | `experiments/exp_07_two_stage_eval/results/*20260818_104203.json` |
 | 工具层优化文档 | `experiments/exp_04_hard_samples/工具层优化指导_Stage1召回质量与改进.md` |
+| 仓库级基准与审计 | `experiments/exp_08_repo_benchmark/`（audit_stage1.py / manifest_*.json / repos/）|
 | 训练层优化文档 | `experiments/exp_06_finetune/audit/优化建议_alpha06_日志类CWE归因辨析_v2_14.md` |
 | 扫描核心 | `graduation_project/two_stage_scanner.py` |
 | 行号纠正 | `graduation_project/line_normalizer.py` |
@@ -131,10 +134,13 @@ stat -c '%y' graduation_project/*.py            # 代码修改时间
 ## 模块自检入口（改动后必跑）
 
 ```bash
+# 环境纪律（§9.7 环境教训）：项目指定 conda 环境 graproj（README §614）。
+# 报"缺依赖"前必须穷举 conda/uv/pyenv/venv/系统 python；永不往系统 python 强装。
+GRAPROJ_PY=/home/zane/miniconda3/envs/graproj/bin/python
 for m in line_normalizer cwe_normalizer prefilter two_stage_scanner taint_tracker; do
-  python3 graduation_project/$m.py 2>&1 | tail -1
+  $GRAPROJ_PY graduation_project/$m.py 2>&1 | tail -1
 done
-python3 -c "import app.backend.main"   # 后端可导入性
+$GRAPROJ_PY -c "import app.backend.main"   # 后端可导入性
 ```
 
 ## 已踩过的坑（防止复发）

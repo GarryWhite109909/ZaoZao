@@ -15,8 +15,17 @@
   FAIL  已安装但断言失败（退出码 1，CI 可拦）
   SKIP  工具未安装，或工具依赖本地漏洞库/网络而环境不具备（trivy/pip-audit）
 
+**SKIP 只授予"环境不具备"，不授予"零召回"（2026-08-31 修订）**：
+detect-secrets 曾长期把"阳性零召回"降级为 SKIP 并注释成"插件/版本相关"，
+实际上是接入层传绝对路径导致 detect-secrets 1.x 必然返回空 results——
+该工具在整个项目生命周期内从未产出过任何发现（与 B1 同型的接入层缺陷）。
+把"零召回"设计成免检，等于给 B1 类问题留后门：B1 的核心纪律是
+"零召回先查调用链"，一旦允许 SKIP，这条纪律就在最需要它的地方失效了。
+故 detect-secrets（无网络/漏洞库依赖）零召回改为 **FAIL**。
+只有真正依赖外部资源的 trivy(sca/iac) / pip-audit 保留零召回 SKIP。
+
 离线可跑：prefilter / taint_tracker / semgrep(本地规则) / bandit / gitleaks
-均不依赖网络；trivy(sca/iac)、pip-audit、detect-secrets 零召回时按 SKIP 降级。
+/ detect-secrets 均不依赖网络。
 
 运行：PYTHONPATH=. python3 scripts/tool_smoke_test.py
 """
@@ -157,7 +166,7 @@ def smoke_gitleaks(ext: ExternalScanner, tmpdir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6) detect-secrets（secret，best-effort）
+# 6) detect-secrets（secret，无外部依赖 → 零召回判 FAIL）
 # ---------------------------------------------------------------------------
 def smoke_detect_secrets(ext: ExternalScanner, tmpdir: str) -> None:
     if "detect-secrets" not in ext.available_tools():
@@ -167,11 +176,16 @@ def smoke_detect_secrets(ext: ExternalScanner, tmpdir: str) -> None:
                       'password = "hunter2_hunter2_secret"\n')
     findings = ext.scan_secrets(vuln)
     ds_hits = [f for f in findings if f.tool == "detect-secrets"]
-    if ds_hits:
-        _record("detect-secrets", True, f"召回 {len(ds_hits)} 条")
-    else:
-        # 检测依赖插件配置，零召回不足以判定调用链断裂 → 降级 SKIP
-        _skip("detect-secrets", "阳性样例零召回（插件/版本相关，按环境差异降级，不拦截 CI）")
+    # 零召回必须 FAIL，不得 SKIP（docstring 已记 2026-08-31 的教训）：
+    # detect-secrets 1.x 对绝对路径恒返回空 results，历史上该缺陷正是被
+    # "插件/版本相关，降级 SKIP" 的注释掩盖了整个项目周期。
+    _record(
+        "detect-secrets", bool(ds_hits),
+        f"召回 {len(ds_hits)} 条（期望 ≥1；零召回先查调用链路径形态，勿归因为插件问题）"
+        if ds_hits else
+        "阳性样例零召回 —— 先查 _run_detect_secrets 的 cwd/路径形态，"
+        "勿归因为插件或版本（B1 纪律：接入层缺陷的锅不能甩给工具）",
+    )
 
 
 # ---------------------------------------------------------------------------
