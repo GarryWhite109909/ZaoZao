@@ -268,3 +268,16 @@ def semgrep_local_configs(project_root: Optional[Path] = None) -> list[str]:
     if not rules_dir.is_dir():
         return []
     return [str(p.resolve()) for p in sorted(rules_dir.glob("*.yaml"))]
+
+
+def scan_stats_path(project_root: Optional[Path] = None) -> Path:
+    """后端扫描历史统计的持久化文件（data/scan_stats.json）。
+
+    /api/stats 的统计原本只存在进程内存里，后端一重启就清零，安全态势页
+    （posture.html）会退化成空状态。这里把统计数据落到 data/ 下，与
+    data/chroma_db/（RAG 向量库）、models/signal_registry.json（信号注册表）
+    同属「运行时产物、扫描可重建、不入库」的一类，故统一放 data/ 目录。
+
+    文件结构见 app/backend/main.py 的 _default_scan_stats()。
+    """
+    return (project_root or find_project_root()) / "data" / "scan_stats.json"

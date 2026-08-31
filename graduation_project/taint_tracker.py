@@ -124,6 +124,13 @@ _SINK_DEFINITIONS: list[tuple[str, str]] = [
     ("executeQuery(", "SQL Injection"),
     ("executeUpdate(", "SQL Injection"),
     ("cursor.execute", "SQL Injection"),
+    # Node 数据库驱动 / ORM 的原生 SQL 执行入口（2026-08-30，DVNA L11 实锤盲区）：
+    #   mysql/mysql2/pg/sqlite3 的 connection.query(sql)、Sequelize 的
+    #   sequelize.query(sql) 共用 .query( 方法名——它是 Node 数据访问层的
+    #   **标准查询 API 名**，与 Python 的 cursor.execute 地位对等（语言级事实，
+    #   非某仓库的变量命名）。DOM 的 querySelector( 不受影响（.query 后紧跟
+    #   "Selector" 而非 "("）。语言限定见 _SINK_LANG_ONLY。
+    (".query(", "SQL Injection"),
     # 命令注入（Java 的 Runtime.exec / Node child_process.exec / Python 的 os.popen 等）
     # 2026-08-18 修正：原裸 ".exec(" 会命中 JS 的 RegExp.exec(pattern)（正则匹配不是
     # 命令执行）→ 伪命令注入路径。收紧为具体的命令执行形态。
@@ -177,6 +184,30 @@ _SINK_PATTERNS: list[str] = [pat for pat, _ in _SINK_DEFINITIONS]
 _SINK_TYPE_LANG_OVERRIDE: dict[str, dict[str, str]] = {
     "javascript": {"exec(": "Command Injection"},
     "typescript": {"exec(": "Command Injection"},
+}
+
+# 语言级 sink 禁用（2026-08-30，DVNA 实测）：同一调用名在不同语言生态语义迥异，
+# 泛匹配会产出整类伪候选（污染裁决注意力 + 污染类型统计）：
+#   - render(：Python Jinja render_template_string 生态是模板注入 sink；
+#     JS/TS 的 res.render(...) 是 Express 正常视图渲染，每个控制器都调 → 禁
+#   - .save(：Python Flask FileStorage .save( 是文件写入（Path Traversal sink）；
+#     JS/TS 的 product.save(...) 是 Sequelize/Mongoose ORM 持久化 → 禁
+#   - render_template(：同 render(，Express 生态无此名，保守不列
+# 解除禁用前先在真实 JS 项目上验证是否存在对应的真实 sink 形态。
+_SINK_LANG_DISABLED: dict[str, set[str]] = {
+    "javascript": {"render(", ".save("},
+    "typescript": {"render(", ".save("},
+}
+
+# sink 语言白名单（2026-08-30）：表内的 sink **仅**在列出的语言生效；未列入本表
+# 的 sink 不限语言。与 _SINK_LANG_DISABLED 互补，且必须与它同口径——三处过滤
+# （语句级节点扫描 / 文本兜底 / _sink_nodes_in）统一走 _sink_lang_allowed，
+# 避免"改一处漏两处"重演（2026-08-30 的 render( 伪 SSTI 即因此漏网一次）。
+#   - .query(：Python 侧 Model.objects.query 是 Django ORM 的**惰性查询集**
+#     （不执行 SQL、无字符串拼接面），启用会制造伪候选；Python 的 SQL 执行入口
+#     已由 cursor.execute / executeQuery 覆盖 → 限定 JS/TS。
+_SINK_LANG_ONLY: dict[str, set[str]] = {
+    ".query(": {"javascript", "typescript"},
 }
 
 # sink 危险度（用于截断时保留高危路径）
@@ -442,7 +473,13 @@ class TaintTracker:
             sinks: list[tuple[str, list[str], str]] = []  # (label, args, arg_joined)
             for sink_node in self._sink_nodes_in(stmt, code_bytes, ts_lang):
                 head = self._head_text(sink_node, code_bytes)
-                label = self._match(head, self._sink_compiled)
+                # is_call 必须与 _sink_nodes_in 内部同口径（2026-08-31）：两处是
+                # **同一个判定**，此前只改了 _sink_nodes_in 内部、漏掉这里 →
+                # 带 "(" 的 sink（.query(）在语句级被判 None，静默退回文本兜底，
+                # 而兜底 args 是整条语句、参数化无从判定（JS 单行箭头函数实锤）。
+                # 这正是"改一处漏两处"的又一次重演——同判定多调用点必须一起改。
+                label = self._sink_label_for_head(head, ts_lang,
+                                                  is_call=sink_node.type in _CALL_NODE_TYPES)
                 if not label:
                     continue
                 args = self._argument_texts(sink_node, code_bytes)
@@ -457,8 +494,11 @@ class TaintTracker:
                 # 仅限非复合语句——复合语句的 stmt_text 覆盖整个 body 块，兜底会把
                 # 块内 sink 记到块头行（typical_28 的 try: 行实锤）；块内语句会被
                 # _iter_statements 单独 yield 并在此处按真实行号各自兜底。
+                # 2026-08-30 补：兜底同样受语言级禁用约束——JS 的 .then(回调){res.render(...)}
+                # 不构成 body 块，整条语句文本含 "render(" 会被兜底命中并记到 .then(
+                # 起始行（DVNA appHandler.js L11/59/107/145 伪 SSTI 实锤）。
                 if not any(c.type in _BODY_TYPES for c in stmt.children):
-                    label = self._match(stmt_text, self._sink_compiled)
+                    label = self._sink_label_for_text(stmt_text, ts_lang)
                     if label:
                         sinks.append((label, [stmt_text], stmt_text))
 
@@ -471,7 +511,13 @@ class TaintTracker:
                 direct = self._match(arg_clean, source_compiled)
                 if direct:
                     if self._match(self._strip_sanitizer_calls(arg_clean), source_compiled) is not None:
-                        paths.append(TaintPath(direct, label, ttype, stmt_line, stmt_line))
+                        # 参数化查询同样要在此分支生效（2026-08-30）：Node 的
+                        # db.query("... ?", [req.body.id]) 是**标准参数化写法**，
+                        # 数据落在绑定参数里；此前参数化检查只挂在"污染变量"分支，
+                        # 直接写 source 的形态一律绕过 → 新 .query( sink 会把它
+                        # 判成 SQL 注入（安全代码误报）。
+                        if not self._is_parameterized_sql(label, ttype, args, direct, arg_clean):
+                            paths.append(TaintPath(direct, label, ttype, stmt_line, stmt_line))
                     continue
 
                 for var, t in list(tainted.items()):
@@ -727,6 +773,61 @@ class TaintTracker:
                 return pat
         return None
 
+    def _sink_lang_allowed(self, label: Optional[str], ts_lang: str) -> bool:
+        """语言级 sink 过滤的唯一判定（禁用表 + 白名单表，三处过滤共用）。
+
+        集中在此处是为了避免同一判定散落在"语句级节点扫描 / 文本兜底 /
+        _sink_nodes_in"三处——此前 render( 的文本兜底分支漏判禁用，直接产出
+        DVNA 的 4 条伪 SSTI 候选（2026-08-30 实锤）。
+        """
+        if not label:
+            return False
+        if label in _SINK_LANG_DISABLED.get(ts_lang, set()):
+            return False
+        allowed = _SINK_LANG_ONLY.get(label)
+        return allowed is None or ts_lang in allowed
+
+    def _sink_label_for_head(self, head: str, ts_lang: str,
+                             is_call: bool = False) -> Optional[str]:
+        """调用头部文本（如 ``res.render`` / ``db.query``）的 sink 标签判定。
+
+        head 是参数列表之前的完整文本，故要求匹配**止于头部末尾**——否则
+        ``document.querySelector`` 会被 ".query" 命中（2026-08-30 实锤：
+        pattern 末尾的 "(" 只作书写约定，被 _core 剥离后不参与匹配）。
+
+        is_call（2026-08-31）：节点是否为**调用节点**。pattern 以 "(" 结尾即
+        声明"这是一个调用"，此时必须要求是调用节点——否则会把裸成员访问误判成
+        调用。实锤：`req.query.id` 的内层成员节点 head 为 ``req.query``，".query"
+        恰在末尾 → 被判成数据库查询 sink（Express 的 req.query 是读取 URL 查询
+        参数，DVNA appHandler L77/L187/L188 三条误报）。不带 "(" 的 sink
+        （如 ``cursor.execute``）仍按成员访问匹配，语义不变。
+        """
+        for pat, _core, regex in self._sink_compiled:
+            m = regex.search(head)
+            if not m or head[m.end():].strip():
+                continue
+            if pat.endswith("(") and not is_call:
+                continue
+            if self._sink_lang_allowed(pat, ts_lang):
+                return pat
+        return None
+
+    def _sink_label_for_text(self, text: str, ts_lang: str) -> Optional[str]:
+        """整条语句文本的 sink 标签判定（文本兜底用）。
+
+        与 _sink_label_for_head 同语义，只是文本形态不同：此处文本含参数列表，
+        故对以 "(" 结尾的 pattern 要求其后紧跟 "("（等价于"调用该方法"）。
+        """
+        for pat, _core, regex in self._sink_compiled:
+            m = regex.search(text)
+            if not m:
+                continue
+            if pat.endswith("(") and not re.match(r"\s*\(", text[m.end():]):
+                continue
+            if self._sink_lang_allowed(pat, ts_lang):
+                return pat
+        return None
+
     def _tainted_in_text(self, text: str, tainted: dict[str, _Taint]) -> list[_Taint]:
         """返回 text 中出现的污染变量对应的 _Taint 列表。"""
         hits: list[_Taint] = []
@@ -932,7 +1033,13 @@ class TaintTracker:
                     and desc.type not in _SUBSCRIPT_NODE_TYPES:
                 continue
             head = self._head_text(desc, code_bytes)
-            if not head or not self._match(head, self._sink_compiled):
+            if not head:
+                continue
+            # 标签判定含语言级过滤（禁用表 + 白名单表），与语句级扫描同口径；
+            # is_call 传达"是否为调用节点"，供带 "(" 的 sink 判定（见函数文档）
+            label = self._sink_label_for_head(head, ts_lang,
+                                              is_call=desc.type in _CALL_NODE_TYPES)
+            if not label:
                 continue
             key = (head, desc.start_point[0])
             prev = best.get(key)
@@ -1141,3 +1248,57 @@ def share():
     ok_compound = sink_lines == [7]
     print(f"[{'PASS' if ok_compound else 'FAIL'}] 复合语句sink行号: os.system 行号={sink_lines} (期望 [7]，"
           f"若含 6 即块头行伪路径回归)")
+
+    # sink 标签匹配语义（2026-08-30）：pattern 末尾的 "(" 只作书写约定，被 _core
+    # 剥离后不参与匹配 → ".query(" 会命中 document.querySelector（DVNA 审计实锤）。
+    # 现要求匹配止于调用头部末尾（_sink_label_for_head），两处形态均须正确。
+    def _types(src: str, lang: str) -> list[tuple[int, str]]:
+        return sorted((p.sink_line, p.taint_type)
+                      for p in tracker.trace(src, language=lang))
+
+    sql_cases: list[tuple[str, str, str, list[tuple[int, str]]]] = [
+        # (标签, 代码, 语言, 期望 [(行, 类型)])
+        ("JS ORM 原生查询(拼接→SQL注入)",
+         'module.exports.s = function (req, res) {\n'
+         '  var query = "SELECT name FROM Users WHERE login=\'" + req.body.login + "\'";\n'
+         '  db.sequelize.query(query, { model: db.User });\n'
+         '};', "javascript", [(3, "SQL Injection")]),
+        # DOM 的 querySelector 不是数据库查询 API（负样本）
+        ("DOM querySelector(不误报)",
+         'function f() {\n'
+         '  var el = document.querySelector(req.body.sel);\n'
+         '  return el;\n'
+         '}', "javascript", []),
+        # 语言白名单：Python 的 .query 是 Django ORM 惰性查询集，不执行 SQL
+        ("Python .query(语言白名单外)",
+         'def v(request):\n'
+         '    q = Model.objects.query\n'
+         '    return q', "python", []),
+        # 参数化查询：数据落在绑定参数里（Node 标准写法）
+        ("JS 参数化查询(安全)",
+         'app.get("/u", function(req, res) {\n'
+         '  db.query("SELECT * FROM t WHERE id=?", [req.body.id]);\n'
+         '});', "javascript", []),
+        # 带 "(" 的 sink 必须对**调用节点**生效（2026-08-31 实锤回归防线）：
+        # Express 的 req.query 是读取 URL 查询参数的属性访问，其内层成员节点
+        # 头部为 "req.query"，".query" 恰在末尾——若不要求是调用节点，会被判成
+        # 数据库查询 sink（DVNA appHandler L77/L187/L188 三条误报）。
+        ("Express req.query 参数读取(不误报)",
+         'app.post("/r", function(req, res) {\n'
+         '  if (req.query.id == "") { res.send(req.query.url); }\n'
+         '});', "javascript", []),
+        # 正样本对照：真正的数据库客户端调用（call 节点）必须仍然命中
+        ("JS 数据库客户端查询(真阳性)",
+         'app.get("/s", function(req, res) {\n'
+         '  client.query("SELECT * FROM u WHERE id=" + req.query.id);\n'
+         '});', "javascript", [(2, "SQL Injection")]),
+    ]
+    ok_sink = True
+    for label, src, lang, expect in sql_cases:
+        got = _types(src, lang)
+        ok_case = got == expect
+        ok_sink = ok_sink and ok_case
+        print(f"[{'PASS' if ok_case else 'FAIL'}] {label}: {got} (期望 {expect})")
+
+    all_ok = ok_compound and ok_sink
+    print(f"\n{'=== 自检通过 ===' if all_ok else '!!! 自检失败 !!!'}")

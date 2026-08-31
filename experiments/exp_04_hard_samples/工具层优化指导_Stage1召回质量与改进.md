@@ -138,7 +138,7 @@ Semgrep×2 + TaintTracker×1 + Prefilter×1）→ **每条都要跑 N=3 次采�
 > 复测数据见 §五之三。剩余缺口为框架级/长尾 category（§五之五）。
 > 状态更新（2026-08-30 第三波）：抑制池治理（§五之四）落地；待办 1 三项方案
 > 落地（证据上下文剥离 + 白名单扩容 + 工具层复测）；另完成 87 段候选**逐条
-> 人工审查**，6 族被丢弃的精确告警救援（§五之六）。剩余缺口为框架级/长尾
+> 人工审查**，6 族被丢弃的精确告警救援（§五之八）。剩余缺口为框架级/长尾
 > category（§五之五）。
 
 | 优先级 | 项 | 性质 | 状态 |
@@ -151,11 +151,17 @@ Semgrep×2 + TaintTracker×1 + Prefilter×1）→ **每条都要跑 N=3 次采�
 | P2 | 补零召回 category 的规则（首批：open redirect / log / timing / crypto×3 / proto×2 / overflow） | 覆盖面 | ✅ 首批已做（§五之三）；剩余框架级 category 见 §五之五 |
 | P2 | 污点链证据在裁决 prompt 中的差异化利用（§四） | 裁决层协同 | ✅ 已做（按证据类型分级信任标注） |
 | P1 | 信号抑制池的样本级盲区（§五之四，本轮新发现） | 召回损耗 | ✅ 已治理（2026-08-30：自有链级规则不抑制 + 抑制留痕 `suppressed_by_registry`） |
-| P1 | 待办 1：证据上下文污染类型推断（§五之三末） | 类型归因错误 | ✅ 已实施（2026-08-30：上下文剥离 + 白名单扩容 XXE/LDAP/NoSQL/SpEL，工具层复测通过；LLM 裁决层重跑待算力） |
-| P1 | 87 段候选逐条人工审查（§五之六，第三波） | 证据浪费/静默丢弃 | ✅ 已完成（6 族被丢弃精确告警救援：B307/eval 族、B506、B605、B311、spel-injection、B202；安全样本零新增候选） |
+| P1 | 待办 1：证据上下文污染类型推断（§五之六 待办 1） | 类型归因错误 | ✅ 已实施（2026-08-30：上下文剥离 + 白名单扩容 XXE/LDAP/NoSQL/SpEL，工具层复测通过；LLM 裁决层重跑待算力） |
+| P1 | 87 段候选逐条人工审查（§五之八，第三波） | 证据浪费/静默丢弃 | ✅ 已完成（6 族被丢弃精确告警救援：B307/eval 族、B506、B605、B311、spel-injection、B202；安全样本零新增候选） |
 | — | 跨文件数据流（crossfile 全族） | 架构级，需项目级上下文 | 单文件管道外，论文标注局限 |
 
 ## 五之二、规则层实锤缺陷：os.path.join 形态零覆盖（已修，2026-08-29）
+
+> **编号说明（2026-08-30 整理）**：§五之二～§五之八 是「五、优先级建议」的补充节，
+> 按文档中的出现顺序编号。早期追加时「待办」「夜间批量修复」与「第二波实施」
+> 「抑制池盲区」撞号（曾各有两个 §五之三 / §五之四），本次已重排为唯一编号：
+> **待办 → §五之六、夜间修复 → §五之七、原 §五之六（第三波审查）→ §五之八**。
+> 旧编号的历史引用按此表换算。
 
 ### 现象
 
@@ -302,7 +308,7 @@ pip-audit、detect-secrets 依赖本地漏洞库/网络，零召回按 SKIP 降�
 | 安全样本（26 段）中出现候选 | 15 | 15（新规则仅 timing 误触发 safe_13，已修） |
 
 ³ 夜间修复 #3（凭证强度门槛，同日晚于本表复测）收紧后，弱值转裁决档、
-  直出覆盖变为 3 段（真凭证）；第三波复测全表见 §七 与 §五之六。
+  直出覆盖变为 3 段（真凭证）；第三波复测全表见 §七 与 §五之八。
 
 新捞回 13 段全部 expected=true：typical_06 / 12 / 15 / 16 / 18 / 19 / 29 / 31 / 32、
 hard_bypass_06、hard_cve_02、hard_crossfile_02_input、hard_crossfile_03_sink。
@@ -368,7 +374,7 @@ B608 在 hard_bypass_01（replace 假净化）是否决性证据，在别的文�
 
 首批 P2 规则落地后剩余的零召回 × 期望真清单——特征是"漏洞语义在框架层，
 单文件正则无标准形态可写"或"需要项目级上下文"（typical_36 SpEL 已在第三波
-捞回，见 §五之六；hard_cve_03 为设计内 0 候选 + 强制复核兜底，非缺口）：
+捞回，见 §五之八；hard_cve_03 为设计内 0 候选 + 强制复核兜底，非缺口）：
 
 | 样本 | category | 缺口性质 |
 |---|---|---|
@@ -384,7 +390,7 @@ B608 在 hard_bypass_01（replace 假净化）是否决性证据，在别的文�
 XXE 开关、PHP `==` 敏感比较）分期补；写不出的（框架 CVE、跨文件）留给
 LLM 兜底通道并在论文中如实标注。
 
-## 五之三、待办（会动 fixed5 基线，需重跑全量评估后再决定）
+## 五之六、待办（会动 fixed5 基线，需重跑全量评估后再决定）
 
 ### 已修：Insecure TLS（CWE-295）类型缺失 → 精确告警被丢弃（2026-08-29）
 
@@ -448,14 +454,14 @@ rule=models.semgrep_rules...request-data-write
 1. ✅ 扩展 `_STANDARD_TAINT_TYPES` 覆盖非注入型：SSRF / Open Redirect /
    Weak Crypto / Hardcoded Credential（第二波已做）+ **XXE / LDAP Injection /
    NoSQL Injection / SpEL Injection**（第三波补齐，NoSQL/LDAP/XXE 为白名单
-   扩容配套推断分支，SpEL 见 §五之六）
+   扩容配套推断分支，SpEL 见 §五之八）
 2. ✅ 证据上下文剥离：`_infer_taint_type` 仅取 `[告警行上下文]` 标记**之前**的
    告警语义描述（标记常量 `_EVIDENCE_CTX_MARK` 与追加处共用，防字面量漂移）；
    裁决 prompt 不受影响（P0.3 上下文本就是给 LLM 看"在哪里"的）
 3. ✅ 工具层复测（87 段静态管线，`--no-signal-feedback` 口径）：
    - hard_cve_03 从"2 条错误候选"变为"0 候选 + 强制复核兜底"（符合设计意图，
      诱导模型投错票的错误类型标注消失）
-   - 安全/噪声样本候选 17 → 17（零回退）；配套 6 族精确告警救援见 §五之六
+   - 安全/噪声样本候选 17 → 17（零回退）；配套 6 族精确告警救援见 §五之八
    - **LLM 裁决层重跑（recall/FPR/兜底判真数 24→?）待算力，不在本机跑**
 
 ### 待办 2：Java 路径安全规则缺失（✅ 已完成，§五之二配套清账）
@@ -467,10 +473,10 @@ Java 侧前缀校验安全规则已作为 `path_canonical_startswith` 落地
 ### 待办 3：候选合并去重（§三）（✅ 已完成，§五之三）
 
 同（族, sink 行）归并 + 多工具标记已落地，候选≥3 样本 20 → 10（第三波复测
-进一步降至 8，见 §五之六）。
+进一步降至 8，见 §五之八）。
 
 
-## 五之四、2026-08-29 夜间批量修复（用户提示质量审计驱动）
+## 五之七、2026-08-29 夜间批量修复（用户提示质量审计驱动）
 
 用户逐条审计提示质量后提交问题清单，以下为**已实施并验证**的修复：
 
@@ -543,7 +549,7 @@ CWE-918 —— **符合我定的主次规则，是正确行为**。冲突源于 
 - **其余弱提示**（semgrep 命令注入候选忽略列表参数/shlex 转义、hard_cve_03 的
   request-data-write 偏靶、B701 对 SSTI 旁敲）：已知精度边界，模型能消解，不修。
 
-## 五之六、第三波：87 段候选逐条人工审查 + 精确告警救援（2026-08-30）
+## 五之八、第三波：87 段候选逐条人工审查 + 精确告警救援（2026-08-30）
 
 > 方法论前提：**脚本统计只负责"跑工具、把候选摆出来"，合理性判断人工逐条做**
 > （脚本自动判定会掩盖逐条证据的问题，B1 教训的同型——统计指标好看 ≠ 证据健康）。
@@ -913,6 +919,9 @@ v2_15 §3.1）。**"无工具锚点时模型类型归因不稳"由本数据再�
    "CWE-78 Command Injection" vs "CWE-78 OS Command Injection"、"Wraparound" vs
    "Wrap-up"——同一编号两套官方名，前端两处显示会不一致。修复：`vulnerability_types`
    元素统一过 `normalize_cwe_label`（纯展示层，低风险）。
+   **【已修 2026-08-30 晚，见 §9.7 #4】**：根因是归一化只加在**兜底复核分支**，
+   裁决主分支直接入库模型原文；现按"取值优先级不变、取到后统一 normalize"收口，
+   重复项由保序去重合并。自检新增用例 #23（两条候选两套官方名 → 合并为 1 条）。
 
 ### 8.10 单次"最稳"结论被生产实拍推翻（2026-08-30，稳定性方法论教训）
 
@@ -944,6 +953,11 @@ v2_15 §3.1）。**"无工具锚点时模型类型归因不稳"由本数据再�
 
 ### 9.1 首轮 DVNA 整仓审计结果（10 文件，零 LLM 秒级）
 
+> **口径警告**：本表按**模式类别**计数（"semgrep 规则族"是一类而非一条 finding），
+> 与 §9.8 按 manifest 11 条 finding 逐条计数的口径**不同，不可直接相减**。
+> 且本表的 B 类是在**未走 `_infer_taint_type` 的旧判定口径**下得出的，
+> 存在系统性高估——**修正后的最新数据以 §9.8 为准**（DVNA：OK 6 / A 4 / B 1）。
+
 | 类 | 数量 | 明细 | 修复项 |
 |---|---|---|---|
 | OK | 5 | SQL 拼接(89)、命令注入(78)、开放重定向(601)、反序列化(502)、semgrep 规则族 | — |
@@ -955,7 +969,11 @@ v2_15 §3.1）。**"无工具锚点时模型类型归因不稳"由本数据再�
 ### 9.2 仓库基准指标口径（与 exp_07 的分工）
 
 - **文件级**：TP/TN/FP/复核（对齐 exp_07 口径）
-- **发现级 recall**：单文件多发现，`|expected ∩ confirmed| / |expected|`（DVNA 已知 10 发现）
+- **发现级 recall**：单文件多发现，`|expected ∩ confirmed| / |expected|`。
+  分母以 `manifest_dvna.json` 的 `expected_findings` 为准，**当前 11 条**
+  （appHandler 9 + authHandler 2；§9.1 首轮时口径为 10 条，后补入
+  appHandler L207 CWE-200 信息暴露，分母随之变化——**引用分母时必须写明条目
+  来源与时间戳**，否则跨轮 recall 不可比）
 - **三列对照**：A=外部工具原始输出（不进裁决）、B=系统最终确认、C=已知答案
 - FN 归因必须走审计清单：A 类（工具盲区）→ 修规则；B 类（错标误导裁决）→ 修类型推断；
   有候选且类型对但最终 miss → 裁决层问题（这才是训练层数据）
@@ -981,4 +999,273 @@ None 被静默丢弃，安全占比口径失真）。
 **工具层上下文规则（仓库模式 P1）**：模板文件（render_template 目标）的候选
 携带"source 可控性"元数据——工具层已可静态判定（url_map 构造 / config 常量 /
 request.* 三分），作为裁决上下文注入而非让模型猜。
+
+### 9.4 首批修复落地（2026-08-30，DVNA 审计驱动）
+
+| # | 修复 | 文件 | 验证 |
+|---|---|---|---|
+| 1 | **JS/TS 语言级 sink 禁用**：`render(`、`.save(` 在 JS/TS 是 Express 视图渲染 / ORM 持久化，非污点 sink（Python 语义保留）。新增 `_SINK_LANG_DISABLED` 表 + 语句级/节点级/文本兜底三处过滤 | taint_tracker.py | taint 自检 PASS；DVNA appHandler.js 伪 SSTI/Path **5→0**，真候选（cmd L39 / code L196）保留 |
+| 2 | **空文件守卫**：`scan_code` 入口对 0 字节/纯空白短路返回安全（decision=empty_file_skipped），不再送 LLM 复核"空气" | two_stage_scanner.py | 零模型验证：空串/纯空白均 `hv=False` 短路 |
+| 3 | 审计工具 `audit_stage1.py`（零模型）：四路召回中间态保留 + A/B/C/D 自动标记 + C 类确定性四问核验（无行号/注释行/类型↔代码形态匹配/重复报告）——"候选是否合理"由规则引擎判定，不消耗模型 | exp_08/audit_stage1.py | DVNA 整仓 10 文件秒级出清单 |
+
+**未修（记档）**：
+- XXE "盲区"实为审计口径误判——semgrep `express-libxml-noent` 已召回 L235（首轮匹配漏判，已修正匹配逻辑）
+- mathjs.eval 判 94 vs expected 95：近邻可接受（eval 求值语义双属），v2_15 辨析组一并覆盖
+- authHandler 的 md5 重置令牌链路：prefilter timing_unsafe_compare 已打到该文件（无行号），发现存在但形态弱——P2 定向规则（弱重置令牌 = md5(login) 作 token）
+- ~~**回归待验**：修复动 JS 候选集合 → typical_10/32 两段 JS 回归跑批中~~
+  **回归已完成（2026-08-30 晚）**：87 段全量零回退（零召回 23/87、零召回×真 11、
+  候选≥3 的 8/87、安全样本候选 17，与第三波复测逐项一致）；JS 两段回归结果：
+  - typical_10 ✅ CWE-78（3:0 确认）
+  - typical_32 ❌ **类型 miss**：工具层 `taint_type=Prototype Pollution` 正确，
+    模型 3:0 判成 **CWE-918 SSRF**，期望 `1321;915`——**训练层问题**（蒸馏素材
+    缺原型污染形态），工具层无需再动；已入 v2_15 素材清单
+- **§9.4 #1 验证结论复核（2026-08-31 更正）**：实跑确认伪 SSTI/Path 为 0，
+  修复生效。当前 appHandler.js 候选 3 条：L11 SQL 注入（`.query(`，§9.7 #1 新
+  sink）、L39 命令注入、L196 代码注入。
+  清单里残留的 4 条 SSTI 是**修复前未重跑的旧产物**——这一点成立；但上一轮我
+  把它归因于"依赖缺失导致的陈旧数据"是**错误归因**，真因有二：① 清单未随修复
+  重跑；② 我用来对比的"复测"是在**缺 semgrep 的环境**跑的降级数据（见 §9.7
+  环境教训），把它当成了首轮基准，导致 L10 被误判为盲区。
+
+### 9.5 后续批次路线（自主推进，不需确认）
+
+1. DVNA LLM 跑批（10 文件对账）→ 2. Vulnerable-Flask-App manifest（已扫结果可直接对账）→
+3. php-goof / NodeGoat manifest 标注（逐文件读源码）→ 4. 每轮审计 A/B 类 → 规则修复 → 复测，
+FN/误报样本同步进 v2_15 蒸馏反例池（§9.3 模式）
+
+### 9.6 VFlask 标准答案 + 首次对账（2026-08-30，仓库级指标首发）
+
+`manifest_vflask.json`（9 文件全量源码实读）：app.py 14 发现（11 主 CWE：798/347/79/
+1336×2/327/209/312/639×2/89/502/434）、e2e_zap.py 2 发现（295/798）、layout.html 1 弱项
+（CWE-311 http 明文字体，info 级不计 miss）、其余 5 文件安全（含 1 空文件 + 1 第三方库）。
+
+**23:19 扫描对账**（文件级）：TP=2 TN=2 FP=2 复核=3。
+
+| 指标 | 数值 | 解读 |
+|---|---|---|
+| 文件级 FPR | 2/4 = **50%**（误报：index.html 79、yaml_test 352）| 仓库模板形态的误报是主要出血点 |
+| **发现级 recall** | **5/13 ≈ 38%**（app.py 确认 327/89/502/209/330；e2e 中 295）| 仓库形态远低于单文件测试集（88%+）。~~15%~~ 首版口径错误：只对账顶层单值 `vulnerability_type`，漏掉确认列表——**发现级必须数 confirmed 列表**（教训入档：多发现文件的单值口径系统性低估）|
+| 复核占比 | 3/9 | 模板上下文规则（§9.3）落地后应降 |
+
+**app.py 票型解剖**（339 行，9 候选进裁决）：确认 6（327/89/502/330/209 各 3:0 +
+1:0）、否决 3（1:2×2、1:0 无类型）。**miss 的 7 个主 CWE（798/347/79/1336×2/312/639×2）
+在票型里根本没有对应票**——不是模型否决，是**候选根本没进裁决**。两个嫌疑：
+① CodeSlicer（min_lines=150）切片后每块缺全文件视野，L26-28 的硬编码密钥、L97
+的 insecure_verify 等落在被稀释区；② 工具层对这些形态（JWT verify=False 的
+347、ORM get IDOR、模板串 SSTI）零召回。**P1 验证：app.py 关闭切片跑一次对账**
+（差异 = 切片稀释贡献；剩余 = 规则盲区）。
+
+**工具层逐条审计（2026-08-31 补跑，`audit_stage1.py`，零 LLM）**
+
+§9.6 此前只有 LLM **实扫**对账（发现级 recall 5/13≈38%），回答的是"模型表现
+如何"；而"38% 的缺口里多少源于工具层没召回"——**此前从未测过**。补跑结果
+（17 条 expected finding）：**OK 9 · A 盲区 6 · B 类型错标 2**
+（B 类已按 §9.8 修正判定口径）。
+
+| expected | 判定 | 覆盖候选 | 归因 |
+|---|---|---|---|
+| L26/L62 CWE-798 硬编码密钥/弱凭证 | **OK** | bandit B105 ×4 | — |
+| L97 CWE-347 `jwt.decode(verify=False)` | **A 盲区** | 无 | JWT 签名不校验，无 sink 形态 |
+| L112 CWE-79 404 页 XSS | B | semgrep SSTI @L114 | 同区域 XSS+SSTI 双语义，工具只出 SSTI 一条 |
+| L114/L281 CWE-1336 SSTI | **OK** | semgrep render-template-string | — |
+| L141 CWE-327 md5 存密码 | **OK** | bandit B324 + semgrep md5 ×2 + prefilter | — |
+| L148 CWE-209 `str(e.message)` 回显 | **A 盲区** | 无 | 异常信息泄露，无 sink 形态 |
+| L160 CWE-312 信用卡明文存库 | **A 盲区** | 无 | 缺失型（应加密未加密），无污点形态 |
+| L208/L231 CWE-639 IDOR | **A 盲区** ×2 | 无 | 缺失型（未校验归属），与 §8.5 授权类同构 → **不修，记档** |
+| L261 CWE-89 `%s` 拼接 SQL | **OK** | bandit B608 + semgrep tainted-sql-string | — |
+| L329 CWE-502 `yaml.load` | **OK** | bandit B506 + semgrep + prefilter | — |
+| L294 CWE-434 任意文件上传 | B（实为 A） | bandit B311 @L295 | B311 是弱随机与上传无关，行号±2 邻近误判；**434 规则缺失是真盲区** |
+| e2e_zap L18 CWE-295 | **OK** | bandit B501 + semgrep disabled-cert-validation | — |
+| e2e_zap L15 CWE-798 | **OK** | bandit B105 | — |
+| layout L5 CWE-311 | A 盲区 | 无 | info 级，不计 miss（§9.6 口径）|
+
+**结论**：工具层**语义召回 9/16 ≈ 56%**（layout info 级不计分母），显著高于
+LLM 实扫的 38%。§9.6 那句"工具层对这些形态零召回"的猜测**只对了一半**：
+347/209/312/639×2 确实零召回（5 条真盲区，含被误判为 B 的 434），但
+**798/79/1336×2 工具层全都召回了**——丢分发生在**裁决层**（模型否决或未进
+裁决），不是工具层。
+
+**修正 §9.6 的 P1 待办**：原计划"关闭切片跑对账以分离切片稀释 vs 规则盲区"。
+有了工具层审计作对照后可直接定位，无需再靠开关切片做差分实验：
+**工具层零召回 = 规则盲区**（5 条：347/209/312/639×2/434）；
+**工具层已召回但实扫 miss = 切片稀释或裁决层否决**（需另查）。
+
+### 9.7 第二轮修复落地（2026-08-30 晚，依赖齐备后复测驱动）
+
+**环境教训（本轮第一教训，2026-08-31 更正）**：上一轮我在系统 `python3.11` 上
+跑不通自检，就断言"环境缺依赖"，并据此往系统 python 强装了 semgrep/numpy
+（`--break-system-packages`）——**两步都是错的**。事实是：项目本来就配好了环境
+`~/miniconda3`（Python 3.13 + tree-sitter 全语种 + semgrep 1.172 + bandit +
+detect-secrets + numpy + torch），首轮审计（§9.1）正是在这套环境跑的（§9.1 的
+OK 里含"semgrep 规则族"、§9.4 记"semgrep express-libxml-noent 已召回 L235"，
+均可证）。我只查了 `which python3` 和 `pip list`，没有找 conda / uv / miniconda
+就下了结论，还把"我的解释器缺依赖"外推成"首轮也缺依赖"。
+**纪律：报"环境缺依赖"前，必须先查项目 README / docs 确认指定环境，再穷举本机
+环境（conda/uv/pyenv/venv/系统 python），确认全都没有，才能动手装；更不得往系统
+python 强装（PEP 668 拦就是信号）。**
+本项目指定环境（README §614、docs/过程.md）：**`conda activate graproj`**
+（Python 3.11，tree-sitter 全语种 + semgrep 1.168 + bandit 1.9.4 + numpy 2.4.6
++ torch 齐备）。本项目涉及的全部环境（截至 2026-08-31 盘点）：
+- **graproj（conda，3.11）**：README 指定，依赖全齐 → 主力环境
+- **base（conda，3.13）**、**AI（conda，3.13）**：依赖亦齐，可作备用
+- **uv tools**（`~/.local/share/uv/tools/`）：`bandit` 完好可用；
+  **`semgrep` 的 venv 是残缺的**（6-29 半途安装，venv 内只有 python 无
+  semgrep 可执行文件）→ PATH 上**从来没有**可用的 semgrep 命令，跑工具层须
+  经 conda 环境，不要指望 uv 那个
+- **系统 python（3.14）**：不含项目依赖（已恢复原状，见下）本文**最终**复测均以
+`/home/zane/miniconda3/envs/graproj/bin/python` 执行（过程中曾用 conda base
+（Python 3.13）跑过若干轮，87 段回归与 DVNA 审计结果**与 graproj 逐项一致**：
+总候选 104、OK 4 / A 4 / B 3 / C 0 —— 说明结论不依赖 conda 环境的具体版本）。
+
+> 上一轮我给**系统 python 的用户目录**（`~/.local/lib/python3.14/site-packages`）
+> 装了 numpy / semgrep / tree-sitter 全套，属**环境污染**。
+> **已于 2026-08-31 完成清理**：按 dist-info 安装日期精确区分批次（8-30 为我
+> 误装、8-02 的 `git_filter_repo` 为环境原有），卸载 54 个包（8 个主包 + 46 个
+> 依赖）并清除孤儿目录；`git_filter_repo` 经 import 验证完好。危害不只是留
+> 垃圾——装完后系统 python 也能跑通自检，制造"环境已修好"的假象，
+> 反而掩盖了"没用对 conda 环境"这个真问题。conda 各环境不受影响。
+> **清理纪律**：`pip uninstall` 批量卸载会因依赖顺序漏删（第一轮 46 个只成功
+> 26 个），且中断会留下 `~xxx.dist-info` 无效分布导致后续批量命令静默失败
+> （返回 0 却什么都没删）——**必须逐个包复查 dist-info 是否真的消失**，不能只看
+> pip 的退出码。
+
+| # | 修复 | 文件 | 验证 |
+|---|---|---|---|
+| 1 | **JS/TS ORM 原生查询 sink**：新增 `.query(` → SQL Injection，并新增 `_SINK_LANG_ONLY` 限定仅 JS/TS 生效 | taint_tracker.py | `document.querySelector`、Python `Model.objects.query` 均不误报（**注**：L10 首轮即为 OK，非本项修复的转好，见下方口径说明）|
+| 2 | **sink 标签匹配语义修正**：pattern 末尾的 `(` 只是书写约定，被 `_core` 剥离后**不参与匹配** → `.query(` 会命中 `document.querySelector`。新增 `_sink_label_for_head` / `_sink_label_for_text`，要求匹配止于调用头部末尾 | taint_tracker.py | 87 段零回退 + DOM/Python 双负样本入自检 |
+| 3 | **参数化检查覆盖"直接 source"分支**：此前参数化判定只挂在"污染变量"分支，`db.query("... ?", [req.body.id])` 这类**直接写 source 的标准参数化写法**一律绕过——新 sink 会把它判成注入 | taint_tracker.py | 自检 4 例；87 段安全样本候选 17 不变 |
+| 4 | **`vulnerability_types` 统一归一化**（§8.9 第 3 项收口）：裁决主分支此前直接入库模型原文，仅兜底复核分支归一化 → 同一 CWE 两套官方名并存 | two_stage_scanner.py | 自检新增用例 #23：两条候选（`CWE-78 OS Command Injection` / `CWE-78 Command Injection`）→ 合并为 1 条规范名 |
+| 5 | **match_func 型规则行号回填**：`_Rule.line_func` + `_timing_hit_line`（命中判定与行号**同源**，避免"命中行 A、行号指 B"） | prefilter.py | authHandler 候选获得真实行号 L49 |
+| 6 | **timing 内联通道**：`_input_var_names` 只收集**赋值目标**，`if (req.query.token == md5(req.query.login))` 这类内联比较完全漏召回 | prefilter.py | authHandler **CWE-640 由 A 盲区 → B 错标**（候选已指向 L49 真弱点）|
+| 7 | **timing 精度收紧**：两侧均直接取自请求（`req.body.password == req.body.cpassword`）是**字段一致性校验**，攻击者两侧都能控制，响应差异不泄露服务端秘密 | prefilter.py | **C 类噪声 2 → 0**（appHandler L152 / passport L64 均消失），真命中 L49 保留 |
+| 8 | **留痕容器按需补齐**：`_drop_irrelevant_positional` / `_apply_signal_registry` 依赖 `__init__` 字段，审计脚本用 `__new__` 绕过构造 → AttributeError 中断**整仓**审计 | two_stage_scanner.py + audit_stage1.py | 审计恢复；**留痕是旁路记录，不该有能力中断召回主流程**（与 B1"静默/崩溃源于接入方式"同类）|
+| 9 | **`tool_smoke_test.py` 缺依赖兜底**：无 ImportError 处理时整体 traceback，已 PASS 的 6 条一并吞掉，P0 防线形同失效 | scripts/tool_smoke_test.py | 收敛为 SKIP 且退出码 0，与脚本自身"缺依赖降级不拦 CI"语义一致 |
+| 10 | **`.query(` 误报修复（Express `req.query`）**：`_sink_nodes_in` 会遍历到 `req.query.id` 的**内层成员节点**，其头部为 `req.query`，`.query` 恰在末尾 → 被判成数据库查询 sink。修复：带 `(` 的 sink 声明的是"调用"，**必须对调用节点生效**（`is_call`）| taint_tracker.py | DVNA L77/L187/L188 三条误报清零；新增正样本（`client.query(sql+var)`）+ 负样本（`req.query.id`、`querySelector`）入自检 |
+| 11 | **`is_call` 第二个调用点补齐**：`_sink_label_for_head` 在 `_sink_nodes_in` 内部与**语句级扫描**各调一次，上一轮只改了前者 → 带 `(` 的 sink 在语句级被判 None、静默退回文本兜底，而兜底 `args` 是整条语句、参数化无从判定（JS 单行箭头函数 `db.query(sql,[p])` 被误报）| taint_tracker.py | 参数化用例由 FAIL 转 PASS；appHandler 回到 3 条真候选 |
+
+**复测结果（DVNA，conda 环境，与首轮同口径）**：按 manifest 的 11 条 expected
+finding 逐条判定 —— **OK 4 · A 盲区 4 · B 类型错标 3 · C 无关噪声 0**。
+
+> **口径说明（重要）**：§9.1 首轮的"OK 5 / B 4 / A 4 / C 1"是按**模式类别**
+> 计数（OK 里的"semgrep 规则族"是一个类别、不对应单条 finding），与本次按
+> manifest 11 条 finding 逐条计数**不是同一口径，不可直接相减**。
+> 上一轮我把两者并列比较，并据此写"L10 由 A 盲区 → OK"是**错的**：首轮 §9.1 的
+> OK 第一条就是"SQL 拼接(89)"，L10 首轮即为 OK。我看到"L10 A 盲区"是因为自己
+> 用缺 semgrep 的解释器跑，那一路候选全缺——**是环境造成的假盲区，不是首轮事实**。
+> 首轮与本轮唯一可比的量是：manifest 未变的条目 + 两轮各自的定性结论。
+
+| expected | 首轮（§9.1 定性） | 本轮 | 归因 |
+|---|---|---|---|
+| L10 CWE-89 | **OK**（SQL 拼接） | **OK** | 一致；无变化 |
+| L49 CWE-640 | 未识别（在 A 盲区"密码重置令牌链路"里） | **B 错标** | #6 内联通道：候选已落在 L49 真弱点上 |
+| L152 CWE-601 / passport L64 | C 噪声（timing 无行号） | 已消失 | #7 精度收紧 |
+| L235 CWE-611 | A 盲区"XXE 规则缺失" | **B 错标** | #9.4 已修正：semgrep 本就召回了，是首轮匹配逻辑漏判 |
+| typical_10 `req.query.file` | — | 误报已消除 | #10（本轮新加的 `.query(` sink 曾把它判成 SQL 注入）|
+
+**剩余 A 盲区（4 条，逐条定性）**：
+- **CWE-639 ×2**（L107/L144）：`Model.find({where:{id:req.*}})` —— ORM 参数化
+  查询**本身是安全写法**，缺的是"未校验资源归属"，属**缺失型**漏洞，与 §8.5
+  授权类同构，污点追踪无标准形态可匹配 → **不修，记档**
+- **CWE-200**（L207）：`findAll({})` 后全量 json 返回，同为缺失型
+- **CWE-330**（L78）：`md5(login)` 作重置令牌，无 sink 形态；同源链路已由
+  timing 候选覆盖（L49），仍待 §9.4 记档的 P2 定向规则
+
+**剩余 B 错标（3 条）**：
+- L197（CWE-95 vs 判 94 Code Injection）：eval 求值语义近邻，v2_15 辨析组覆盖
+- L235（CWE-611）：semgrep `express-libxml-noent` 已召回，但类型落成规则名
+  未映射到 611 —— **规则名→CWE 映射缺口**，待批处理
+- L49（CWE-640 vs 判 Timing Attack）：**命中行正确、类型是两个不同侧面**
+  （`md5(login)` 作令牌既是弱随机 330，也是时序不安全比较 208），模型可消解
+
+**新增规则纪律复核（三关）**：
+- `.query(`：Node 数据访问层的**标准 API 名**（mysql/mysql2/pg/sqlite3/Sequelize
+  共用，与 Python `cursor.execute` 地位对等），非某仓库变量命名 → 关卡 1、2 通过；
+  独立集验证：DOM `querySelector` / Python `.query` / Express `req.query`
+  三负样本 + 87 段零回退 → 关卡 3 通过
+- timing 两侧排除：语言无关的**安全分析事实**（时序侧信道成立需至少一侧为服务端
+  秘密）→ 关卡 1、2 通过；正样本（`token == md5(login)`）+ 负样本（session CSRF、
+  常量比较、字段一致性）→ 关卡 3 通过
+
+**纪律复核暴露的漏洞（`.query(` 三关"通过"却仍带误报）**：我上一轮给 `.query(`
+做的独立验证只覆盖了 `document.querySelector` 和 Python `.query` 两个负样本，
+**没有覆盖 `req.query`** —— 而后者恰恰是 JS 里最常见的同名冲突形态（Express 读
+取 URL 查询参数）。三关过了 ≠ 安全，**负样本集必须穷举该 API 名的所有常见语义**
+（数据库查询 / DOM 选择器 / 请求参数 / ORM 惰性查询集），漏一个就是一次误报事故。
+现四条负样本（`querySelector` / `Model.objects.query` / `req.query.id` /
+参数化 `db.query(sql,[p])`）均已入自检。
+
+**方法论教训**
+
+1. **陈旧产物 + 错误基准 = 双重误导**（§9.4 #1 复核）。§9.4 写着"伪 SSTI/Path
+   5→0"，清单里却列着 4 条 SSTI。实跑证明修复生效，残留的 4 条是**修复前未重跑
+   的旧产物**。但我在核对时，用来对比的"复测"是自己在**缺 semgrep 的解释器**上
+   跑的降级数据，于是又得出"L10 由 OK 变盲区"的反向错误结论。
+   **纪律：审计清单与复测数字一律以实跑时间戳为准；且复测必须与首轮同环境同
+   口径**，否则"复测"本身就是一个新的污染源。
+2. **"环境缺依赖"是重结论，必须穷举后再下**。我只查了 `which python3` 就断言
+   缺依赖并强装包，实际项目 conda 环境齐全。**纪律见本节开头"环境教训"。**
+3. **同判定多调用点，改一处必查全部**（本轮第三次栽在这上面）。`_sink_lang_allowed`
+   三处过滤、`_sink_label_for_head` 两处调用——我在 `#8` 的注释里刚写下"避免改
+   一处漏两处重演"，转头就在 `is_call` 上重犯，且失败形态更隐蔽：不是报错，而是
+   **静默退回文本兜底**，把结构化参数降级成整条语句，参数化检查失效。
+   **纪律：改判定函数签名时，先 grep 全部调用点；优先把判定收进单一入口
+   （像 `_sink_lang_allowed` 那样），而不是让调用方各自传参。**
+
+### 9.8 审计测量口径修正：B 类被系统性高估（2026-08-31）
+
+**这是本轮最重要的一条，且它不是"漏洞"，是"测量工具的偏差"。**
+
+`audit_stage1.py` 判定"类型是否对齐"时，只看候选的 **`taint_type` 字段**：
+
+```python
+type_match = [... if exp_num in _types_to_cwes(r["taint_type"] + " " + r["rule_id"])]
+```
+
+但候选的 `taint_type` 常是工具内部标识——bandit 的 `B608`/`B324`/`B501`、
+semgrep 的**规则文件路径**（`models.semgrep_rules.python.flask...`）。而生产链路里
+`_dedupe` 的语义族归并用的是 **`_infer_taint_type()` 推断后的语义名**
+（two_stage_scanner 2218 行）。**推断结果只用于归并分组，从不写回 `taint_type`
+字段**——于是审计看到"类型是 B608"，生产看到"语义族是 SQL Injection"，
+**同一个候选在两处口径不同**。
+
+后果：候选类型其实正确、只是没写回字段，却被算成"B 类型错标"。
+
+**实测（VFlask app.py，24 条原始候选）**：`B608`→SQL Injection、`B324`→Weak
+Cryptography、`B311`→Weak Cryptography、`B506`→Insecure Deserialization、
+semgrep 路径→SSTI / XSS / SQL Injection / Weak Cryptography。**21 条里有 17 条
+原始类型与推断类型不同**。
+
+**修正**：`candidate_rows` 同步计算 `inferred_type`，判定改为
+`原始类型 + 推断类型 + rule_id` 三口径取并集，与生产 `_dedupe` 对齐；
+`_SEMANTIC_TO_CWE` 补 798 / 295 / 327 三项（VFlask 实锤缺口）。
+
+**修正前后对比**（同一份代码、同一份 manifest，只改判定口径）：
+
+| 仓库 | 旧口径 | 新口径 |
+|---|---|---|
+| **VFlask** 17 条 | OK 1 · A 6 · **B 10** | **OK 9** · A 6 · **B 2** |
+| **DVNA** 11 条 | OK 4 · A 4 · **B 3** | **OK 6** · A 4 · **B 1** |
+
+其中 DVNA **L235 CWE-611 由 B → OK**——正是 §9.7 记的"规则名→CWE 映射缺口，
+待批处理"那条，修正口径后自动解决，无需单独补映射。
+
+**教训**：
+1. **测量工具的口径必须与被测对象的口径一致**。审计脚本"复刻 `_stage1_recall`"
+   时复刻了数据，却漏了生产在归并时额外施加的语义推断——**复刻流程 ≠ 复刻
+   语义**。凡"复刻生产逻辑"的测量脚本，都要回头核对生产是否在别处改写了
+   被测量字段。
+2. **指标突然变差时，先怀疑测量工具**。VFlask OK 只有 1/17 是个异常值，如果
+   当时直接据此去"修规则"，会朝着一个不存在的问题使劲（真正该修的是审计脚本）。
+3. **"类型错标"和"字段没写回"是两回事**。前者是真缺陷，后者只是表示层差异。
+   审计要区分二者，否则会把后者的量全算到前者头上。
+
+**顺带确认的一个事实**：semgrep 输出里**有** `extra.metadata.cwe`（如
+`render-template-string` 规则标 `CWE-96`），但代码从未提取，类型全靠
+evidence/rule 关键词推断。目前**不打算改**：semgrep 的 CWE 标注口径与本项目
+标准答案不一致（semgrep 标 96「静态代码注入」，本项目标准答案标 1336「SSTI」），
+若改用 metadata 反而会**降低** OK 率。是否引入需先统一 CWE 口径，**记档待决策**。
+
+**遗留（真实 A 盲区，均为缺失型或需定向规则）**：347（JWT verify=False）、
+209（异常回显）、312（信用卡明文）、639×2（IDOR）、434（文件上传）、
+311（layout，info 级不计）。其中 639×2 与 §8.5 授权类同构 → 不修记档。
 

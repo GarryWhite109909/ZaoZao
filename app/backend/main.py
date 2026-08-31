@@ -80,6 +80,7 @@ from graduation_project.paths import (
     local_vllm_model_dir,
     llamacpp_dir,
     ollama_default_store,
+    scan_stats_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -327,15 +328,84 @@ async def _shutdown_scheduler() -> None:
 # 最近一次批量扫描结果（供 /api/report 下载）
 _last_batch: Optional[BatchResult] = None
 
-# 扫描历史统计（进程内，重启后清零）
-_scan_stats: dict = {
-    "total_scans": 0,
-    "total_files": 0,
-    "total_vulnerable": 0,
-    "total_safe": 0,
-    "total_errors": 0,
-    "recent_scans": [],  # 最近 20 条扫描记录
-}
+# ---------------------------------------------------------------------------
+# 扫描历史统计（持久化到 data/scan_stats.json，进程重启后保留）
+# ---------------------------------------------------------------------------
+# 最近扫描记录保留条数：安全态势趋势图只取近 7 条，仪表盘"最近动态"取前 5 条，
+# 20 条足以支撑两者，同时把落盘文件大小控制在可接受范围。
+_STATS_RECENT_LIMIT = 20
+
+# 统计中的整数字段（加载时逐个校验，防止损坏文件污染计数器）
+_STATS_INT_FIELDS = (
+    "total_scans",
+    "total_files",
+    "total_vulnerable",
+    "total_safe",
+    "total_errors",
+)
+
+
+def _default_scan_stats() -> dict:
+    """返回一份字段齐全的空统计（用于初始化与加载失败时回退）。"""
+    return {
+        "total_scans": 0,
+        "total_files": 0,
+        "total_vulnerable": 0,
+        "total_safe": 0,
+        "total_errors": 0,
+        "recent_scans": [],
+    }
+
+
+def _load_scan_stats() -> dict:
+    """从磁盘恢复扫描统计；文件缺失或损坏时回退为空统计并告警。
+
+    这里必须容错：磁盘文件被手工改坏、或后续版本调整了字段结构，都不能让
+    后端启动失败——统计数据丢失的代价远小于服务起不来。
+    """
+    stats = _default_scan_stats()
+    path = scan_stats_path()
+    if not path.is_file():
+        return stats
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning("扫描统计文件读取失败（%s），本次以空统计启动：%s", path, exc)
+        return stats
+    if not isinstance(raw, dict):
+        logger.warning("扫描统计文件结构异常（%s），本次以空统计启动", path)
+        return stats
+
+    for key in _STATS_INT_FIELDS:
+        val = raw.get(key, 0)
+        # bool 是 int 的子类，需显式排除；负数会让前端渲染出无意义的值
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or val < 0:
+            continue
+        stats[key] = int(val)
+
+    recent = raw.get("recent_scans")
+    if isinstance(recent, list):
+        stats["recent_scans"] = [e for e in recent if isinstance(e, dict)][:_STATS_RECENT_LIMIT]
+    return stats
+
+
+def _save_scan_stats() -> None:
+    """把内存中的统计落盘（原子写；失败仅告警，不影响扫描流程）。
+
+    调用方须已持有 _stats_lock。
+    """
+    path = scan_stats_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 先写 .tmp 再 os.replace：避免写到一半进程退出，留下截断的 JSON
+        tmp = path.parent / (path.name + ".tmp")
+        tmp.write_text(json.dumps(_scan_stats, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("扫描统计落盘失败（%s）：%s", path, exc)
+
+
+_scan_stats: dict = _load_scan_stats()
 
 # _scan_stats / _last_batch 的读写防护锁：
 # 写入发生在 async handler（事件循环线程），而 get_stats 是普通 def（线程池线程）、
@@ -753,7 +823,7 @@ def backend_options():
 
 
 def _record_scan(batch: BatchResult, source: str = "batch") -> None:
-    """记录一次扫描到统计中（进程内，重启后清零）。
+    """记录一次扫描到统计中，并立即落盘（进程重启后保留）。
 
     Args:
         batch: 扫描批次结果。
@@ -786,8 +856,10 @@ def _record_scan(batch: BatchResult, source: str = "batch") -> None:
             ],
         }
         _scan_stats["recent_scans"].insert(0, entry)
-        if len(_scan_stats["recent_scans"]) > 20:
-            _scan_stats["recent_scans"] = _scan_stats["recent_scans"][:20]
+        if len(_scan_stats["recent_scans"]) > _STATS_RECENT_LIMIT:
+            _scan_stats["recent_scans"] = _scan_stats["recent_scans"][:_STATS_RECENT_LIMIT]
+        # 落盘：/api/stats 是安全态势页的主要数据源，持久化后重启不再退化为空状态
+        _save_scan_stats()
 
 
 @app.get("/api/stats")
@@ -795,7 +867,8 @@ def get_stats():
     """仪表盘统计数据：扫描历史汇总 + 最近动态。
 
     前端 index.html 调用此端点获取真实数据，替换静态占位。
-    进程重启后统计清零，前端可用 localStorage 做历史持久化。
+    统计数据持久化在 data/scan_stats.json，后端重启后仍然保留（安全态势页
+    posture.html 依赖此端点作为主要数据源）；想清零时删除该文件并重启即可。
     注意：此端点不调用 check_health（会阻塞等待 Ollama），健康状态由前端
     单独请求 /api/health/live 获取，避免拖慢仪表盘数据加载。
     """
