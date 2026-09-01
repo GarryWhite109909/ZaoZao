@@ -2,771 +2,1071 @@ batch=184 样本数=2
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=8098 lang=python
+### id=8084 lang=go
 [CODE]
-   1| """Webhook delivery implementation following Standard Webhooks conventions.
+   1| package sanitize
    2| 
-   3| This module implements webhook delivery patterns similar to the Standard Webhooks
-   4| specification (https://www.standardwebhooks.com), providing consistent and secure
-   5| webhook delivery with HMAC signature verification and timestamp-based replay protection.
-   6| """
-   7| 
-   8| import base64
-   9| import hashlib
-  10| import hmac
-  11| import json
-  12| import logging
-  13| import threading
-  14| import time
-  15| import uuid
-  16| from concurrent.futures import ThreadPoolExecutor
-  17| from datetime import datetime, timezone
+   3| import (
+   4| 	"bytes"
+   5| 	"encoding/hex"
+   6| 	"fmt"
+   7| 	"slices"
+   8| 	"strconv"
+   9| 	"strings"
+  10| 	"sync"
+  11| 	"time"
+  12| 	"unicode/utf8"
+  13| )
+  14| 
+  15| // Part is either a string or an int. A string is raw SQL. An int is a
+  16| // argument placeholder.
+  17| type Part any
   18| 
-  19| import requests
-  20| import urllib3
-  21| from cachetools import TTLCache
-  22| from packaging.version import Version
-  23| from requests.adapters import HTTPAdapter
-  24| from urllib3.util.retry import Retry
-  25| 
-  26| from mlflow.entities.webhook import Webhook, WebhookEvent, WebhookTestResult
-  27| from mlflow.environment_variables import (
-  28|     MLFLOW_ENABLE_WORKSPACES,
-  29|     MLFLOW_WEBHOOK_CACHE_TTL,
-  30|     MLFLOW_WEBHOOK_DELIVERY_MAX_WORKERS,
-  31|     MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES,
-  32|     MLFLOW_WEBHOOK_REQUEST_TIMEOUT,
-  33| )
-  34| from mlflow.store.model_registry.abstract_store import AbstractStore
-  35| from mlflow.store.model_registry.file_store import FileStore
-  36| from mlflow.utils.validation import _validate_webhook_url
-  37| from mlflow.webhooks.constants import (
-  38|     WEBHOOK_DELIVERY_ID_HEADER,
-  39|     WEBHOOK_SIGNATURE_HEADER,
-  40|     WEBHOOK_SIGNATURE_VERSION,
-  41|     WEBHOOK_TIMESTAMP_HEADER,
-  42| )
-  43| from mlflow.webhooks.types import (
-  44|     WebhookPayload,
-  45|     get_example_payload_for_event,
-  46| )
-  47| 
-  48| _logger = logging.getLogger(__name__)
-  49| 
-  50| # Thread pool for non-blocking webhook delivery
-  51| _webhook_delivery_executor = ThreadPoolExecutor(
-  52|     max_workers=MLFLOW_WEBHOOK_DELIVERY_MAX_WORKERS.get(),
-  53|     thread_name_prefix="webhook-delivery",
-  54| )
-  55| 
-  56| # Shared session for webhook requests (thread-safe)
-  57| _webhook_session: requests.Session | None = None
-  58| _webhook_session_lock: threading.Lock = threading.Lock()
+  19| type Query struct {
+  20| 	Parts []Part
+  21| }
+  22| 
+  23| // utf.DecodeRune returns the utf8.RuneError for errors. But that is actually rune U+FFFD -- the unicode replacement
+  24| // character. utf8.RuneError is not an error if it is also width 3.
+  25| //
+  26| // https://github.com/jackc/pgx/issues/1380
+  27| const replacementcharacterwidth = 3
+  28| 
+  29| const maxBufSize = 16384 // 16 Ki
+  30| 
+  31| var bufPool = &pool[*bytes.Buffer]{
+  32| 	new: func() *bytes.Buffer {
+  33| 		return &bytes.Buffer{}
+  34| 	},
+  35| 	reset: func(b *bytes.Buffer) bool {
+  36| 		n := b.Len()
+  37| 		b.Reset()
+  38| 		return n < maxBufSize
+  39| 	},
+  40| }
+  41| 
+  42| var null = []byte("null")
+  43| 
+  44| func (q *Query) Sanitize(args ...any) (string, error) {
+  45| 	argUse := make([]bool, len(args))
+  46| 	buf := bufPool.get()
+  47| 	defer bufPool.put(buf)
+  48| 
+  49| 	for _, part := range q.Parts {
+  50| 		switch part := part.(type) {
+  51| 		case string:
+  52| 			buf.WriteString(part)
+  53| 		case int:
+  54| 			argIdx := part - 1
+  55| 			var p []byte
+  56| 			if argIdx < 0 {
+  57| 				return "", fmt.Errorf("first sql argument must be > 0")
+  58| 			}
   59| 
-  60| # Cache for webhook listings by event
-  61| # TTLCache is thread-safe for basic operations, but we still use a lock for
-  62| # complex operations to ensure consistency
-  63| _webhook_cache_lock: threading.Lock = threading.Lock()
-  64| _webhook_cache: TTLCache[WebhookEvent, list[Webhook]] | None = None
-  65| 
-  66| 
-  67| def _create_webhook_session() -> requests.Session:
-  68|     """Create a new webhook session with retry configuration.
-  69| 
-  70|     Returns:
-  71|         Configured requests.Session object
-  72|     """
-  73|     max_retries = MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES.get()
-  74| 
-  75|     # urllib3 >= 2.0 supports additional features
-  76|     extra_kwargs = {}
-  77|     if Version(urllib3.__version__) >= Version("2.0"):
-  78|         extra_kwargs["backoff_jitter"] = 1.0  # Add up to 1 second of jitter
-  79| 
-  80|     retry_strategy = Retry(
-  81|         total=max_retries,
-  82|         status_forcelist=[429, 500, 502, 503, 504],  # Retry on these status codes
-  83|         allowed_methods=["POST"],  # Only retry POST requests
-  84|         backoff_factor=1.0,  # Exponential backoff: 1s, 2s, 4s, etc.
-  85|         backoff_max=60.0,  # Cap maximum backoff at 60 seconds
-  86|         respect_retry_after_header=True,  # Automatically handle Retry-After headers
-  87|         raise_on_status=False,  # Don't raise on these status codes
-  88|         **extra_kwargs,
-  89|     )
-  90| 
-  91|     adapter = HTTPAdapter(max_retries=retry_strategy)
-  92|     session = requests.Session()
-  93|     session.mount("http://", adapter)
-  94|     session.mount("https://", adapter)
-  95| 
-  96|     return session
-  97| 
-  98| 
-  99| def _get_or_create_webhook_session() -> requests.Session:
- 100|     """Get or create a shared webhook session with retry configuration.
- 101| 
- 102|     Returns:
- 103|         Configured requests.Session object
- 104|     """
- 105|     global _webhook_session
- 106| 
- 107|     if _webhook_session is None:  # To avoid unnecessary locking
- 108|         with _webhook_session_lock:
- 109|             if _webhook_session is None:
- 110|                 _webhook_session = _create_webhook_session()
- 111| 
- 112|     return _webhook_session
- 113| 
- 114| 
- 115| def _generate_hmac_signature(secret: str, delivery_id: str, timestamp: str, payload: str) -> str:
- 116|     """Generate webhook HMAC-SHA256 signature.
- 117| 
- 118|     Args:
- 119|         secret: The webhook secret key
- 120|         delivery_id: The unique delivery ID
- 121|         timestamp: Unix timestamp as string
- 122|         payload: The JSON payload as string
- 123| 
- 124|     Returns:
- 125|         The signature in the format "v1,<base64_encoded_signature>"
- 126|     """
- 127|     # Signature format: delivery_id.timestamp.payload
- 128|     signed_content = f"{delivery_id}.{timestamp}.{payload}"
- 129|     signature = hmac.new(
- 130|         secret.encode("utf-8"), signed_content.encode("utf-8"), hashlib.sha256
- 131|     ).digest()
- 132|     signature_b64 = base64.b64encode(signature).decode("utf-8")
- 133|     return f"{WEBHOOK_SIGNATURE_VERSION},{signature_b64}"
- 134| 
- 135| 
- 136| def _send_webhook_request(
- 137|     webhook: Webhook,
- 138|     payload: WebhookPayload,
- 139|     event: WebhookEvent,
- 140|     session: requests.Session,
- 141| ) -> requests.Response:
- 142|     """Send a webhook request to the specified URL with retry logic.
- 143| 
- 144|     Args:
- 145|         webhook: The webhook object containing the URL and secret
- 146|         payload: The payload to send
- 147|         event: The webhook event type
- 148|         session: Configured requests session with retry logic
- 149| 
- 150|     Returns:
- 151|         requests.Response object from the webhook request
- 152|     """
- 153|     _validate_webhook_url(webhook.url)
- 154| 
- 155|     # Create webhook payload with metadata
- 156|     webhook_payload = {
- 157|         "entity": event.entity.value,
- 158|         "action": event.action.value,
- 159|         "timestamp": datetime.now(timezone.utc).isoformat(),
- 160|         "data": payload,
- 161|     }
- 162|     if MLFLOW_ENABLE_WORKSPACES.get():
- 163|         webhook_payload["workspace"] = webhook.workspace
- 164| 
- 165|     payload_json = json.dumps(webhook_payload)
- 166|     payload_bytes = payload_json.encode("utf-8")
- 167| 
- 168|     # Generate IDs and timestamps for webhooks
- 169|     delivery_id = str(uuid.uuid4())
- 170|     unix_timestamp = str(int(time.time()))
- 171| 
- 172|     # MLflow webhook headers
- 173|     headers = {
- 174|         "Content-Type": "application/json",
- 175|         WEBHOOK_DELIVERY_ID_HEADER: delivery_id,
- 176|         WEBHOOK_TIMESTAMP_HEADER: unix_timestamp,
- 177|     }
- 178| 
- 179|     # Add signature if secret is configured
- 180|     if webhook.secret:
- 181|         signature = _generate_hmac_signature(
- 182|             webhook.secret, delivery_id, unix_timestamp, payload_json
- 183|         )
- 184|         headers[WEBHOOK_SIGNATURE_HEADER] = signature
- 185| 
- 186|     timeout = MLFLOW_WEBHOOK_REQUEST_TIMEOUT.get()
- 187| 
- 188|     try:
- 189|         return session.post(webhook.url, data=payload_bytes, headers=headers, timeout=timeout)
- 190|     except requests.exceptions.RetryError as e:
- 191|         # urllib3 exhausted all retries
- 192|         max_retries = MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES.get()
- 193|         _logger.error(f"Webhook request to {webhook.url} failed after {max_retries} retries: {e}")
- 194|         raise
- 195|     except requests.RequestException as e:
- 196|         # Other request errors
- 197|         _logger.error(f"Webhook request to {webhook.url} failed: {e}")
- 198|         raise
- 199| 
- 200| 
- 201| def _get_or_create_webhook_cache(ttl_seconds: int) -> TTLCache[WebhookEvent, list[Webhook]]:
- 202|     """Get or create the webhook cache with the specified TTL.
- 203| 
- 204|     Args:
- 205|         ttl_seconds: Cache TTL in seconds
- 206| 
- 207|     Returns:
- 208|         The webhook cache instance
- 209|     """
- 210|     global _webhook_cache
- 211| 
- 212|     if _webhook_cache is None:
- 213|         with _webhook_cache_lock:
- 214|             # Check again in case another thread just created it
- 215|             if _webhook_cache is None:
- 216|                 # Max size of 1000 should be enough for event types
- 217|                 _webhook_cache = TTLCache(maxsize=1000, ttl=ttl_seconds)
- 218| 
- 219|     return _webhook_cache
- 220| 
- 221| 
- 222| def _get_cached_webhooks_by_event(
- 223|     store: AbstractStore,
- 224|     event: WebhookEvent,
- 225|     ttl_seconds: int,
- 226| ) -> list[Webhook]:
- 227|     """Get webhooks for a specific event from cache or fetch from store if cache is stale.
- 228| 
- 229|     Args:
- 230|         store: The abstract store to fetch webhooks from
- 231|         event: The webhook event to filter by
- 232|         ttl_seconds: Cache TTL in seconds
- 233| 
- 234|     Returns:
- 235|         List of webhooks subscribed to the event
- 236|     """
- 237|     cache = _get_or_create_webhook_cache(ttl_seconds)
- 238| 
- 239|     # Try to get from cache first (TTLCache handles expiry automatically)
- 240|     cached_webhooks = cache.get(event)
- 241|     if cached_webhooks is not None:
- 242|         return cached_webhooks
- 243| 
- 244|     # Cache miss, need to fetch from store
- 245|     with _webhook_cache_lock:
- 246|         # Check again in case another thread just populated it
- 247|         cached_webhooks = cache.get(event)
- 248|         if cached_webhooks is not None:
- 249|             return cached_webhooks
- 250| 
- 251|         # Fetch fresh data - only webhooks for this specific event
- 252|         # Fetch all pages to ensure we don't miss any webhooks
- 253|         webhooks: list[Webhook] = []
- 254|         page_token: str | None = None
- 255|         while True:
- 256|             page = store.list_webhooks_by_event(event, max_results=100, page_token=page_token)
- 257|             webhooks.extend(page)
- 258|             if not page.token:
- 259|                 break
- 260|             page_token = page.token
- 261| 
- 262|         # Store in cache
- 263|         cache[event] = webhooks
- 264|         return webhooks
- 265| 
- 266| 
- 267| def _send_webhook_with_error_handling(
- 268|     webhook: Webhook,
- 269|     payload: WebhookPayload,
- 270|     event: WebhookEvent,
- 271|     session: requests.Session,
- 272| ) -> None:
- 273|     try:
- 274|         _send_webhook_request(webhook, payload, event, session)
- 275|     except Exception as e:
- 276|         _logger.error(
- 277|             f"Failed to send webhook to {webhook.url} for event {event}: {e}",
- 278|             exc_info=True,
- 279|         )
- 280| 
- 281| 
- 282| def _deliver_webhook_impl(
- 283|     *,
- 284|     event: WebhookEvent,
- 285|     payload: WebhookPayload,
- 286|     store: AbstractStore,
- 287| ) -> None:
- 288|     session = _get_or_create_webhook_session()
- 289|     ttl_seconds = MLFLOW_WEBHOOK_CACHE_TTL.get()
- 290| 
- 291|     # Get only webhooks subscribed to this specific event (filtered at DB level when possible)
- 292|     webhooks = _get_cached_webhooks_by_event(store, event, ttl_seconds)
- 293|     for webhook in webhooks:
- 294|         if webhook.status.is_active():
- 295|             _webhook_delivery_executor.submit(
- 296|                 _send_webhook_with_error_handling,
- 297|                 webhook,
- 298|                 payload,
- 299|                 event,
- 300|                 session,
- 301|             )
- 302| 
- 303| 
- 304| def deliver_webhook(
- 305|     *,
- 306|     event: WebhookEvent,
- 307|     payload: WebhookPayload,
- 308|     store: AbstractStore,
- 309| ) -> None:
- 310|     # Exit early if the store is a FileStore since it does not support webhook APIs
- 311|     if isinstance(store, FileStore):
- 312|         return
- 313| 
- 314|     try:
- 315|         _deliver_webhook_impl(event=event, payload=payload, store=store)
- 316|     except Exception as e:
- 317|         _logger.error(
- 318|             f"Failed to deliver webhook for event {event}: {e}",
- 319|             exc_info=True,
- 320|         )
- 321| 
- 322| 
- 323| def test_webhook(webhook: Webhook, event: WebhookEvent | None = None) -> WebhookTestResult:
- 324|     """Test a webhook by sending a test payload.
- 325| 
- 326|     Args:
- 327|         webhook: The webhook object to test
- 328|         event: Optional event type to test. If not specified, uses the first event from webhook.
- 329| 
- 330|     Returns:
- 331|         WebhookTestResult indicating success/failure and response details
- 332|     """
- 333|     # Use provided event or the first event type for testing
- 334|     test_event = event or webhook.events[0]
- 335|     session = _get_or_create_webhook_session()
- 336|     try:
- 337|         test_payload = get_example_payload_for_event(test_event)
- 338|         response = _send_webhook_request(
- 339|             webhook=webhook, payload=test_payload, event=test_event, session=session
- 340|         )
- 341|         return WebhookTestResult(
- 342|             success=response.status_code < 400,
- 343|             response_status=response.status_code,
- 344|             response_body=response.text,
- 345|         )
- 346|     except Exception as e:
- 347|         return WebhookTestResult(
- 348|             success=False,
- 349|             error_message=f"Failed to test webhook: {e!r}",
- 350|         )
- 351| 
- 352| 
-
-### id=8099 lang=python
-[CODE]
-   1| """Webhook delivery implementation following Standard Webhooks conventions.
-   2| 
-   3| This module implements webhook delivery patterns similar to the Standard Webhooks
-   4| specification (https://www.standardwebhooks.com), providing consistent and secure
-   5| webhook delivery with HMAC signature verification and timestamp-based replay protection.
-   6| """
-   7| 
-   8| import base64
-   9| import hashlib
-  10| import hmac
-  11| import json
-  12| import logging
-  13| import threading
-  14| import time
-  15| import uuid
-  16| from concurrent.futures import ThreadPoolExecutor
-  17| from datetime import datetime, timezone
-  18| 
-  19| import requests
-  20| import urllib3
-  21| from cachetools import TTLCache
-  22| from packaging.version import Version
-  23| from urllib3.util.retry import Retry
-  24| 
-  25| from mlflow.entities.webhook import Webhook, WebhookEvent, WebhookTestResult
-  26| from mlflow.environment_variables import (
-  27|     MLFLOW_ENABLE_WORKSPACES,
-  28|     MLFLOW_WEBHOOK_CACHE_TTL,
-  29|     MLFLOW_WEBHOOK_DELIVERY_MAX_WORKERS,
-  30|     MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES,
-  31|     MLFLOW_WEBHOOK_REQUEST_TIMEOUT,
-  32| )
-  33| from mlflow.store.model_registry.abstract_store import AbstractStore
-  34| from mlflow.store.model_registry.file_store import FileStore
-  35| from mlflow.utils.validation import _validate_webhook_url
-  36| from mlflow.webhooks.constants import (
-  37|     WEBHOOK_DELIVERY_ID_HEADER,
-  38|     WEBHOOK_SIGNATURE_HEADER,
-  39|     WEBHOOK_SIGNATURE_VERSION,
-  40|     WEBHOOK_TIMESTAMP_HEADER,
-  41| )
-  42| from mlflow.webhooks.ssrf import SSRFProtectedHTTPAdapter
-  43| from mlflow.webhooks.types import (
-  44|     WebhookPayload,
-  45|     get_example_payload_for_event,
-  46| )
-  47| 
-  48| _logger = logging.getLogger(__name__)
-  49| 
-  50| # Thread pool for non-blocking webhook delivery
-  51| _webhook_delivery_executor = ThreadPoolExecutor(
-  52|     max_workers=MLFLOW_WEBHOOK_DELIVERY_MAX_WORKERS.get(),
-  53|     thread_name_prefix="webhook-delivery",
-  54| )
-  55| 
-  56| # Shared session for webhook requests (thread-safe)
-  57| _webhook_session: requests.Session | None = None
-  58| _webhook_session_lock: threading.Lock = threading.Lock()
-  59| 
-  60| # Cache for webhook listings by event
-  61| # TTLCache is thread-safe for basic operations, but we still use a lock for
-  62| # complex operations to ensure consistency
-  63| _webhook_cache_lock: threading.Lock = threading.Lock()
-  64| _webhook_cache: TTLCache[WebhookEvent, list[Webhook]] | None = None
-  65| 
-  66| 
-  67| def _create_webhook_session() -> requests.Session:
-  68|     """Create a new webhook session with retry configuration.
-  69| 
-  70|     Returns:
-  71|         Configured requests.Session object
-  72|     """
-  73|     max_retries = MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES.get()
-  74| 
-  75|     # urllib3 >= 2.0 supports additional features
-  76|     extra_kwargs = {}
-  77|     if Version(urllib3.__version__) >= Version("2.0"):
-  78|         extra_kwargs["backoff_jitter"] = 1.0  # Add up to 1 second of jitter
-  79| 
-  80|     retry_strategy = Retry(
-  81|         total=max_retries,
-  82|         status_forcelist=[429, 500, 502, 503, 504],  # Retry on these status codes
-  83|         allowed_methods=["POST"],  # Only retry POST requests
-  84|         backoff_factor=1.0,  # Exponential backoff: 1s, 2s, 4s, etc.
-  85|         backoff_max=60.0,  # Cap maximum backoff at 60 seconds
-  86|         respect_retry_after_header=True,  # Automatically handle Retry-After headers
-  87|         raise_on_status=False,  # Don't raise on these status codes
-  88|         **extra_kwargs,
-  89|     )
-  90| 
-  91|     # SSRF-protected adapter validates each connection's peer IP is public at
-  92|     # connect time, closing the DNS-rebinding TOCTOU gap between
-  93|     # _validate_webhook_url (resolve + check) and the actual request (re-resolve).
-  94|     adapter = SSRFProtectedHTTPAdapter(max_retries=retry_strategy)
-  95|     session = requests.Session()
-  96|     # Disable env proxy handling: a proxy would make the validated peer the
-  97|     # proxy rather than the webhook destination, bypassing the SSRF check.
-  98|     session.trust_env = False
-  99|     session.mount("http://", adapter)
- 100|     session.mount("https://", adapter)
- 101| 
- 102|     return session
- 103| 
- 104| 
- 105| def _get_or_create_webhook_session() -> requests.Session:
- 106|     """Get or create a shared webhook session with retry configuration.
+  60| 			if argIdx >= len(args) {
+  61| 				return "", fmt.Errorf("insufficient arguments")
+  62| 			}
+  63| 
+  64| 			// Prevent SQL injection via Line Comment Creation
+  65| 			// https://github.com/jackc/pgx/security/advisories/GHSA-m7wr-2xf7-cm9p
+  66| 			buf.WriteByte(' ')
+  67| 
+  68| 			arg := args[argIdx]
+  69| 			switch arg := arg.(type) {
+  70| 			case nil:
+  71| 				p = null
+  72| 			case int64:
+  73| 				p = strconv.AppendInt(buf.AvailableBuffer(), arg, 10)
+  74| 			case float64:
+  75| 				p = strconv.AppendFloat(buf.AvailableBuffer(), arg, 'f', -1, 64)
+  76| 			case bool:
+  77| 				p = strconv.AppendBool(buf.AvailableBuffer(), arg)
+  78| 			case []byte:
+  79| 				p = QuoteBytes(buf.AvailableBuffer(), arg)
+  80| 			case string:
+  81| 				p = QuoteString(buf.AvailableBuffer(), arg)
+  82| 			case time.Time:
+  83| 				p = arg.Truncate(time.Microsecond).
+  84| 					AppendFormat(buf.AvailableBuffer(), "'2006-01-02 15:04:05.999999999Z07:00:00'")
+  85| 			default:
+  86| 				return "", fmt.Errorf("invalid arg type: %T", arg)
+  87| 			}
+  88| 			argUse[argIdx] = true
+  89| 
+  90| 			buf.Write(p)
+  91| 
+  92| 			// Prevent SQL injection via Line Comment Creation
+  93| 			// https://github.com/jackc/pgx/security/advisories/GHSA-m7wr-2xf7-cm9p
+  94| 			buf.WriteByte(' ')
+  95| 		default:
+  96| 			return "", fmt.Errorf("invalid Part type: %T", part)
+  97| 		}
+  98| 	}
+  99| 
+ 100| 	for i, used := range argUse {
+ 101| 		if !used {
+ 102| 			return "", fmt.Errorf("unused argument: %d", i)
+ 103| 		}
+ 104| 	}
+ 105| 	return buf.String(), nil
+ 106| }
  107| 
- 108|     Returns:
- 109|         Configured requests.Session object
- 110|     """
- 111|     global _webhook_session
- 112| 
- 113|     if _webhook_session is None:  # To avoid unnecessary locking
- 114|         with _webhook_session_lock:
- 115|             if _webhook_session is None:
- 116|                 _webhook_session = _create_webhook_session()
- 117| 
- 118|     return _webhook_session
- 119| 
- 120| 
- 121| def _generate_hmac_signature(secret: str, delivery_id: str, timestamp: str, payload: str) -> str:
- 122|     """Generate webhook HMAC-SHA256 signature.
- 123| 
- 124|     Args:
- 125|         secret: The webhook secret key
- 126|         delivery_id: The unique delivery ID
- 127|         timestamp: Unix timestamp as string
- 128|         payload: The JSON payload as string
- 129| 
- 130|     Returns:
- 131|         The signature in the format "v1,<base64_encoded_signature>"
- 132|     """
- 133|     # Signature format: delivery_id.timestamp.payload
- 134|     signed_content = f"{delivery_id}.{timestamp}.{payload}"
- 135|     signature = hmac.new(
- 136|         secret.encode("utf-8"), signed_content.encode("utf-8"), hashlib.sha256
- 137|     ).digest()
- 138|     signature_b64 = base64.b64encode(signature).decode("utf-8")
- 139|     return f"{WEBHOOK_SIGNATURE_VERSION},{signature_b64}"
- 140| 
- 141| 
- 142| def _send_webhook_request(
- 143|     webhook: Webhook,
- 144|     payload: WebhookPayload,
- 145|     event: WebhookEvent,
- 146|     session: requests.Session,
- 147| ) -> requests.Response:
- 148|     """Send a webhook request to the specified URL with retry logic.
+ 108| func NewQuery(sql string) (*Query, error) {
+ 109| 	query := &Query{}
+ 110| 	query.init(sql)
+ 111| 
+ 112| 	return query, nil
+ 113| }
+ 114| 
+ 115| var sqlLexerPool = &pool[*sqlLexer]{
+ 116| 	new: func() *sqlLexer {
+ 117| 		return &sqlLexer{}
+ 118| 	},
+ 119| 	reset: func(sl *sqlLexer) bool {
+ 120| 		*sl = sqlLexer{}
+ 121| 		return true
+ 122| 	},
+ 123| }
+ 124| 
+ 125| func (q *Query) init(sql string) {
+ 126| 	parts := q.Parts[:0]
+ 127| 	if parts == nil {
+ 128| 		// dirty, but fast heuristic to preallocate for ~90% usecases
+ 129| 		n := strings.Count(sql, "$") + strings.Count(sql, "--") + 1
+ 130| 		parts = make([]Part, 0, n)
+ 131| 	}
+ 132| 
+ 133| 	l := sqlLexerPool.get()
+ 134| 	defer sqlLexerPool.put(l)
+ 135| 
+ 136| 	l.src = sql
+ 137| 	l.stateFn = rawState
+ 138| 	l.parts = parts
+ 139| 
+ 140| 	for l.stateFn != nil {
+ 141| 		l.stateFn = l.stateFn(l)
+ 142| 	}
+ 143| 
+ 144| 	q.Parts = l.parts
+ 145| }
+ 146| 
+ 147| func QuoteString(dst []byte, str string) []byte {
+ 148| 	const quote = '\''
  149| 
- 150|     Args:
- 151|         webhook: The webhook object containing the URL and secret
- 152|         payload: The payload to send
- 153|         event: The webhook event type
- 154|         session: Configured requests session with retry logic
+ 150| 	// Preallocate space for the worst case scenario
+ 151| 	dst = slices.Grow(dst, len(str)*2+2)
+ 152| 
+ 153| 	// Add opening quote
+ 154| 	dst = append(dst, quote)
  155| 
- 156|     Returns:
- 157|         requests.Response object from the webhook request
- 158|     """
- 159|     _validate_webhook_url(webhook.url)
- 160| 
- 161|     # Create webhook payload with metadata
- 162|     webhook_payload = {
- 163|         "entity": event.entity.value,
- 164|         "action": event.action.value,
- 165|         "timestamp": datetime.now(timezone.utc).isoformat(),
- 166|         "data": payload,
- 167|     }
- 168|     if MLFLOW_ENABLE_WORKSPACES.get():
- 169|         webhook_payload["workspace"] = webhook.workspace
+ 156| 	// Iterate through the string without allocating
+ 157| 	for i := 0; i < len(str); i++ {
+ 158| 		if str[i] == quote {
+ 159| 			dst = append(dst, quote, quote)
+ 160| 		} else {
+ 161| 			dst = append(dst, str[i])
+ 162| 		}
+ 163| 	}
+ 164| 
+ 165| 	// Add closing quote
+ 166| 	dst = append(dst, quote)
+ 167| 
+ 168| 	return dst
+ 169| }
  170| 
- 171|     payload_json = json.dumps(webhook_payload)
- 172|     payload_bytes = payload_json.encode("utf-8")
- 173| 
- 174|     # Generate IDs and timestamps for webhooks
- 175|     delivery_id = str(uuid.uuid4())
- 176|     unix_timestamp = str(int(time.time()))
- 177| 
- 178|     # MLflow webhook headers
- 179|     headers = {
- 180|         "Content-Type": "application/json",
- 181|         WEBHOOK_DELIVERY_ID_HEADER: delivery_id,
- 182|         WEBHOOK_TIMESTAMP_HEADER: unix_timestamp,
- 183|     }
- 184| 
- 185|     # Add signature if secret is configured
- 186|     if webhook.secret:
- 187|         signature = _generate_hmac_signature(
- 188|             webhook.secret, delivery_id, unix_timestamp, payload_json
- 189|         )
- 190|         headers[WEBHOOK_SIGNATURE_HEADER] = signature
- 191| 
- 192|     timeout = MLFLOW_WEBHOOK_REQUEST_TIMEOUT.get()
- 193| 
- 194|     try:
- 195|         return session.post(webhook.url, data=payload_bytes, headers=headers, timeout=timeout)
- 196|     except requests.exceptions.RetryError as e:
- 197|         # urllib3 exhausted all retries
- 198|         max_retries = MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES.get()
- 199|         _logger.error(f"Webhook request to {webhook.url} failed after {max_retries} retries: {e}")
- 200|         raise
- 201|     except requests.RequestException as e:
- 202|         # Other request errors
- 203|         _logger.error(f"Webhook request to {webhook.url} failed: {e}")
- 204|         raise
- 205| 
- 206| 
- 207| def _get_or_create_webhook_cache(ttl_seconds: int) -> TTLCache[WebhookEvent, list[Webhook]]:
- 208|     """Get or create the webhook cache with the specified TTL.
- 209| 
- 210|     Args:
- 211|         ttl_seconds: Cache TTL in seconds
+ 171| func QuoteBytes(dst, buf []byte) []byte {
+ 172| 	if len(buf) == 0 {
+ 173| 		return append(dst, `'\x'`...)
+ 174| 	}
+ 175| 
+ 176| 	// Calculate required length
+ 177| 	requiredLen := 3 + hex.EncodedLen(len(buf)) + 1
+ 178| 
+ 179| 	// Ensure dst has enough capacity
+ 180| 	if cap(dst)-len(dst) < requiredLen {
+ 181| 		newDst := make([]byte, len(dst), len(dst)+requiredLen)
+ 182| 		copy(newDst, dst)
+ 183| 		dst = newDst
+ 184| 	}
+ 185| 
+ 186| 	// Record original length and extend slice
+ 187| 	origLen := len(dst)
+ 188| 	dst = dst[:origLen+requiredLen]
+ 189| 
+ 190| 	// Add prefix
+ 191| 	dst[origLen] = '\''
+ 192| 	dst[origLen+1] = '\\'
+ 193| 	dst[origLen+2] = 'x'
+ 194| 
+ 195| 	// Encode bytes directly into dst
+ 196| 	hex.Encode(dst[origLen+3:len(dst)-1], buf)
+ 197| 
+ 198| 	// Add suffix
+ 199| 	dst[len(dst)-1] = '\''
+ 200| 
+ 201| 	return dst
+ 202| }
+ 203| 
+ 204| type sqlLexer struct {
+ 205| 	src     string
+ 206| 	start   int
+ 207| 	pos     int
+ 208| 	nested  int // multiline comment nesting level.
+ 209| 	stateFn stateFn
+ 210| 	parts   []Part
+ 211| }
  212| 
- 213|     Returns:
- 214|         The webhook cache instance
- 215|     """
- 216|     global _webhook_cache
- 217| 
- 218|     if _webhook_cache is None:
- 219|         with _webhook_cache_lock:
- 220|             # Check again in case another thread just created it
- 221|             if _webhook_cache is None:
- 222|                 # Max size of 1000 should be enough for event types
- 223|                 _webhook_cache = TTLCache(maxsize=1000, ttl=ttl_seconds)
- 224| 
- 225|     return _webhook_cache
- 226| 
- 227| 
- 228| def _get_cached_webhooks_by_event(
- 229|     store: AbstractStore,
- 230|     event: WebhookEvent,
- 231|     ttl_seconds: int,
- 232| ) -> list[Webhook]:
- 233|     """Get webhooks for a specific event from cache or fetch from store if cache is stale.
- 234| 
- 235|     Args:
- 236|         store: The abstract store to fetch webhooks from
- 237|         event: The webhook event to filter by
- 238|         ttl_seconds: Cache TTL in seconds
- 239| 
- 240|     Returns:
- 241|         List of webhooks subscribed to the event
- 242|     """
- 243|     cache = _get_or_create_webhook_cache(ttl_seconds)
- 244| 
- 245|     # Try to get from cache first (TTLCache handles expiry automatically)
- 246|     cached_webhooks = cache.get(event)
- 247|     if cached_webhooks is not None:
- 248|         return cached_webhooks
- 249| 
- 250|     # Cache miss, need to fetch from store
- 251|     with _webhook_cache_lock:
- 252|         # Check again in case another thread just populated it
- 253|         cached_webhooks = cache.get(event)
- 254|         if cached_webhooks is not None:
- 255|             return cached_webhooks
- 256| 
- 257|         # Fetch fresh data - only webhooks for this specific event
- 258|         # Fetch all pages to ensure we don't miss any webhooks
- 259|         webhooks: list[Webhook] = []
- 260|         page_token: str | None = None
- 261|         while True:
- 262|             page = store.list_webhooks_by_event(event, max_results=100, page_token=page_token)
- 263|             webhooks.extend(page)
- 264|             if not page.token:
- 265|                 break
- 266|             page_token = page.token
- 267| 
- 268|         # Store in cache
- 269|         cache[event] = webhooks
- 270|         return webhooks
- 271| 
- 272| 
- 273| def _send_webhook_with_error_handling(
- 274|     webhook: Webhook,
- 275|     payload: WebhookPayload,
- 276|     event: WebhookEvent,
- 277|     session: requests.Session,
- 278| ) -> None:
- 279|     try:
- 280|         _send_webhook_request(webhook, payload, event, session)
- 281|     except Exception as e:
- 282|         _logger.error(
- 283|             f"Failed to send webhook to {webhook.url} for event {event}: {e}",
- 284|             exc_info=True,
- 285|         )
- 286| 
+ 213| type stateFn func(*sqlLexer) stateFn
+ 214| 
+ 215| func rawState(l *sqlLexer) stateFn {
+ 216| 	for {
+ 217| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 218| 		l.pos += width
+ 219| 
+ 220| 		switch r {
+ 221| 		case 'e', 'E':
+ 222| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 223| 			if nextRune == '\'' {
+ 224| 				l.pos += width
+ 225| 				return escapeStringState
+ 226| 			}
+ 227| 		case '\'':
+ 228| 			return singleQuoteState
+ 229| 		case '"':
+ 230| 			return doubleQuoteState
+ 231| 		case '$':
+ 232| 			nextRune, _ := utf8.DecodeRuneInString(l.src[l.pos:])
+ 233| 			if '0' <= nextRune && nextRune <= '9' {
+ 234| 				if l.pos-l.start > 0 {
+ 235| 					l.parts = append(l.parts, l.src[l.start:l.pos-width])
+ 236| 				}
+ 237| 				l.start = l.pos
+ 238| 				return placeholderState
+ 239| 			}
+ 240| 		case '-':
+ 241| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 242| 			if nextRune == '-' {
+ 243| 				l.pos += width
+ 244| 				return oneLineCommentState
+ 245| 			}
+ 246| 		case '/':
+ 247| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 248| 			if nextRune == '*' {
+ 249| 				l.pos += width
+ 250| 				return multilineCommentState
+ 251| 			}
+ 252| 		case utf8.RuneError:
+ 253| 			if width != replacementcharacterwidth {
+ 254| 				if l.pos-l.start > 0 {
+ 255| 					l.parts = append(l.parts, l.src[l.start:l.pos])
+ 256| 					l.start = l.pos
+ 257| 				}
+ 258| 				return nil
+ 259| 			}
+ 260| 		}
+ 261| 	}
+ 262| }
+ 263| 
+ 264| func singleQuoteState(l *sqlLexer) stateFn {
+ 265| 	for {
+ 266| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 267| 		l.pos += width
+ 268| 
+ 269| 		switch r {
+ 270| 		case '\'':
+ 271| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 272| 			if nextRune != '\'' {
+ 273| 				return rawState
+ 274| 			}
+ 275| 			l.pos += width
+ 276| 		case utf8.RuneError:
+ 277| 			if width != replacementcharacterwidth {
+ 278| 				if l.pos-l.start > 0 {
+ 279| 					l.parts = append(l.parts, l.src[l.start:l.pos])
+ 280| 					l.start = l.pos
+ 281| 				}
+ 282| 				return nil
+ 283| 			}
+ 284| 		}
+ 285| 	}
+ 286| }
  287| 
- 288| def _deliver_webhook_impl(
- 289|     *,
- 290|     event: WebhookEvent,
- 291|     payload: WebhookPayload,
- 292|     store: AbstractStore,
- 293| ) -> None:
- 294|     session = _get_or_create_webhook_session()
- 295|     ttl_seconds = MLFLOW_WEBHOOK_CACHE_TTL.get()
- 296| 
- 297|     # Get only webhooks subscribed to this specific event (filtered at DB level when possible)
- 298|     webhooks = _get_cached_webhooks_by_event(store, event, ttl_seconds)
- 299|     for webhook in webhooks:
- 300|         if webhook.status.is_active():
- 301|             _webhook_delivery_executor.submit(
- 302|                 _send_webhook_with_error_handling,
- 303|                 webhook,
- 304|                 payload,
- 305|                 event,
- 306|                 session,
- 307|             )
- 308| 
- 309| 
- 310| def deliver_webhook(
- 311|     *,
- 312|     event: WebhookEvent,
- 313|     payload: WebhookPayload,
- 314|     store: AbstractStore,
- 315| ) -> None:
- 316|     # Exit early if the store is a FileStore since it does not support webhook APIs
- 317|     if isinstance(store, FileStore):
- 318|         return
- 319| 
- 320|     try:
- 321|         _deliver_webhook_impl(event=event, payload=payload, store=store)
- 322|     except Exception as e:
- 323|         _logger.error(
- 324|             f"Failed to deliver webhook for event {event}: {e}",
- 325|             exc_info=True,
- 326|         )
+ 288| func doubleQuoteState(l *sqlLexer) stateFn {
+ 289| 	for {
+ 290| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 291| 		l.pos += width
+ 292| 
+ 293| 		switch r {
+ 294| 		case '"':
+ 295| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 296| 			if nextRune != '"' {
+ 297| 				return rawState
+ 298| 			}
+ 299| 			l.pos += width
+ 300| 		case utf8.RuneError:
+ 301| 			if width != replacementcharacterwidth {
+ 302| 				if l.pos-l.start > 0 {
+ 303| 					l.parts = append(l.parts, l.src[l.start:l.pos])
+ 304| 					l.start = l.pos
+ 305| 				}
+ 306| 				return nil
+ 307| 			}
+ 308| 		}
+ 309| 	}
+ 310| }
+ 311| 
+ 312| // placeholderState consumes a placeholder value. The $ must have already has
+ 313| // already been consumed. The first rune must be a digit.
+ 314| func placeholderState(l *sqlLexer) stateFn {
+ 315| 	num := 0
+ 316| 
+ 317| 	for {
+ 318| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 319| 		l.pos += width
+ 320| 
+ 321| 		if '0' <= r && r <= '9' {
+ 322| 			num *= 10
+ 323| 			num += int(r - '0')
+ 324| 		} else {
+ 325| 			l.parts = append(l.parts, num)
+ 326| 			l.pos -= width
+ 327| 			l.start = l.pos
+ 328| 			return rawState
+ 329| 		}
+ 330| 	}
+ 331| }
+ 332| 
+ 333| func escapeStringState(l *sqlLexer) stateFn {
+ 334| 	for {
+ 335| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 336| 		l.pos += width
+ 337| 
+ 338| 		switch r {
+ 339| 		case '\\':
+ 340| 			_, width = utf8.DecodeRuneInString(l.src[l.pos:])
+ 341| 			l.pos += width
+ 342| 		case '\'':
+ 343| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 344| 			if nextRune != '\'' {
+ 345| 				return rawState
+ 346| 			}
+ 347| 			l.pos += width
+ 348| 		case utf8.RuneError:
+ 349| 			if width != replacementcharacterwidth {
+ 350| 				if l.pos-l.start > 0 {
+ 351| 					l.parts = append(l.parts, l.src[l.start:l.pos])
+ 352| 					l.start = l.pos
+ 353| 				}
+ 354| 				return nil
+ 355| 			}
+ 356| 		}
+ 357| 	}
+ 358| }
+ 359| 
+ 360| func oneLineCommentState(l *sqlLexer) stateFn {
+ 361| 	for {
+ 362| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 363| 		l.pos += width
+ 364| 
+ 365| 		switch r {
+ 366| 		case '\\':
+ 367| 			_, width = utf8.DecodeRuneInString(l.src[l.pos:])
+ 368| 			l.pos += width
+ 369| 		case '\n', '\r':
+ 370| 			return rawState
+ 371| 		case utf8.RuneError:
+ 372| 			if width != replacementcharacterwidth {
+ 373| 				if l.pos-l.start > 0 {
+ 374| 					l.parts = append(l.parts, l.src[l.start:l.pos])
+ 375| 					l.start = l.pos
+ 376| 				}
+ 377| 				return nil
+ 378| 			}
+ 379| 		}
+ 380| 	}
+ 381| }
+ 382| 
+ 383| func multilineCommentState(l *sqlLexer) stateFn {
+ 384| 	for {
+ 385| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 386| 		l.pos += width
+ 387| 
+ 388| 		switch r {
+ 389| 		case '/':
+ 390| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 391| 			if nextRune == '*' {
+ 392| 				l.pos += width
+ 393| 				l.nested++
+ 394| 			}
+ 395| 		case '*':
+ 396| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 397| 			if nextRune != '/' {
+ 398| 				continue
+ 399| 			}
+ 400| 
+ 401| 			l.pos += width
+ 402| 			if l.nested == 0 {
+ 403| 				return rawState
+ 404| 			}
+ 405| 			l.nested--
+ 406| 
+ 407| 		case utf8.RuneError:
+ 408| 			if width != replacementcharacterwidth {
+ 409| 				if l.pos-l.start > 0 {
+ 410| 					l.parts = append(l.parts, l.src[l.start:l.pos])
+ 411| 					l.start = l.pos
+ 412| 				}
+ 413| 				return nil
+ 414| 			}
+ 415| 		}
+ 416| 	}
+ 417| }
+ 418| 
+ 419| var queryPool = &pool[*Query]{
+ 420| 	new: func() *Query {
+ 421| 		return &Query{}
+ 422| 	},
+ 423| 	reset: func(q *Query) bool {
+ 424| 		n := len(q.Parts)
+ 425| 		q.Parts = q.Parts[:0]
+ 426| 		return n < 64 // drop too large queries
+ 427| 	},
+ 428| }
+ 429| 
+ 430| // SanitizeSQL replaces placeholder values with args. It quotes and escapes args
+ 431| // as necessary. This function is only safe when standard_conforming_strings is
+ 432| // on.
+ 433| func SanitizeSQL(sql string, args ...any) (string, error) {
+ 434| 	query := queryPool.get()
+ 435| 	query.init(sql)
+ 436| 	defer queryPool.put(query)
+ 437| 
+ 438| 	return query.Sanitize(args...)
+ 439| }
+ 440| 
+ 441| type pool[E any] struct {
+ 442| 	p     sync.Pool
+ 443| 	new   func() E
+ 444| 	reset func(E) bool
+ 445| }
+ 446| 
+ 447| func (pool *pool[E]) get() E {
+ 448| 	v, ok := pool.p.Get().(E)
+ 449| 	if !ok {
+ 450| 		v = pool.new()
+ 451| 	}
+ 452| 
+ 453| 	return v
+ 454| }
+ 455| 
+ 456| func (p *pool[E]) put(v E) {
+ 457| 	if p.reset(v) {
+ 458| 		p.p.Put(v)
+ 459| 	}
+ 460| }
+ 461| 
+ 462| 
+
+### id=8085 lang=go
+[CODE]
+   1| package sanitize
+   2| 
+   3| import (
+   4| 	"bytes"
+   5| 	"encoding/hex"
+   6| 	"fmt"
+   7| 	"math"
+   8| 	"slices"
+   9| 	"strconv"
+  10| 	"strings"
+  11| 	"sync"
+  12| 	"time"
+  13| 	"unicode/utf8"
+  14| )
+  15| 
+  16| // Part is either a string or an int. A string is raw SQL. An int is a
+  17| // argument placeholder.
+  18| type Part any
+  19| 
+  20| type Query struct {
+  21| 	Parts []Part
+  22| }
+  23| 
+  24| // utf.DecodeRune returns the utf8.RuneError for errors. But that is actually rune U+FFFD -- the unicode replacement
+  25| // character. utf8.RuneError is not an error if it is also width 3.
+  26| //
+  27| // https://github.com/jackc/pgx/issues/1380
+  28| const replacementcharacterwidth = 3
+  29| 
+  30| const maxBufSize = 16384 // 16 Ki
+  31| 
+  32| var bufPool = &pool[*bytes.Buffer]{
+  33| 	new: func() *bytes.Buffer {
+  34| 		return &bytes.Buffer{}
+  35| 	},
+  36| 	reset: func(b *bytes.Buffer) bool {
+  37| 		n := b.Len()
+  38| 		b.Reset()
+  39| 		return n < maxBufSize
+  40| 	},
+  41| }
+  42| 
+  43| var null = []byte("null")
+  44| 
+  45| func (q *Query) Sanitize(args ...any) (string, error) {
+  46| 	argUse := make([]bool, len(args))
+  47| 	buf := bufPool.get()
+  48| 	defer bufPool.put(buf)
+  49| 
+  50| 	for _, part := range q.Parts {
+  51| 		switch part := part.(type) {
+  52| 		case string:
+  53| 			buf.WriteString(part)
+  54| 		case int:
+  55| 			argIdx := part - 1
+  56| 			var p []byte
+  57| 			if argIdx < 0 {
+  58| 				return "", fmt.Errorf("first sql argument must be > 0")
+  59| 			}
+  60| 
+  61| 			if argIdx >= len(args) {
+  62| 				return "", fmt.Errorf("insufficient arguments")
+  63| 			}
+  64| 
+  65| 			// Prevent SQL injection via Line Comment Creation
+  66| 			// https://github.com/jackc/pgx/security/advisories/GHSA-m7wr-2xf7-cm9p
+  67| 			buf.WriteByte(' ')
+  68| 
+  69| 			arg := args[argIdx]
+  70| 			switch arg := arg.(type) {
+  71| 			case nil:
+  72| 				p = null
+  73| 			case int64:
+  74| 				p = strconv.AppendInt(buf.AvailableBuffer(), arg, 10)
+  75| 			case float64:
+  76| 				p = strconv.AppendFloat(buf.AvailableBuffer(), arg, 'f', -1, 64)
+  77| 			case bool:
+  78| 				p = strconv.AppendBool(buf.AvailableBuffer(), arg)
+  79| 			case []byte:
+  80| 				p = QuoteBytes(buf.AvailableBuffer(), arg)
+  81| 			case string:
+  82| 				p = QuoteString(buf.AvailableBuffer(), arg)
+  83| 			case time.Time:
+  84| 				p = arg.Truncate(time.Microsecond).
+  85| 					AppendFormat(buf.AvailableBuffer(), "'2006-01-02 15:04:05.999999999Z07:00:00'")
+  86| 			default:
+  87| 				return "", fmt.Errorf("invalid arg type: %T", arg)
+  88| 			}
+  89| 			argUse[argIdx] = true
+  90| 
+  91| 			buf.Write(p)
+  92| 
+  93| 			// Prevent SQL injection via Line Comment Creation
+  94| 			// https://github.com/jackc/pgx/security/advisories/GHSA-m7wr-2xf7-cm9p
+  95| 			buf.WriteByte(' ')
+  96| 		default:
+  97| 			return "", fmt.Errorf("invalid Part type: %T", part)
+  98| 		}
+  99| 	}
+ 100| 
+ 101| 	for i, used := range argUse {
+ 102| 		if !used {
+ 103| 			return "", fmt.Errorf("unused argument: %d", i)
+ 104| 		}
+ 105| 	}
+ 106| 	return buf.String(), nil
+ 107| }
+ 108| 
+ 109| func NewQuery(sql string) (*Query, error) {
+ 110| 	query := &Query{}
+ 111| 	query.init(sql)
+ 112| 
+ 113| 	return query, nil
+ 114| }
+ 115| 
+ 116| var sqlLexerPool = &pool[*sqlLexer]{
+ 117| 	new: func() *sqlLexer {
+ 118| 		return &sqlLexer{}
+ 119| 	},
+ 120| 	reset: func(sl *sqlLexer) bool {
+ 121| 		*sl = sqlLexer{}
+ 122| 		return true
+ 123| 	},
+ 124| }
+ 125| 
+ 126| func (q *Query) init(sql string) {
+ 127| 	parts := q.Parts[:0]
+ 128| 	if parts == nil {
+ 129| 		// dirty, but fast heuristic to preallocate for ~90% usecases
+ 130| 		n := strings.Count(sql, "$") + strings.Count(sql, "--") + 1
+ 131| 		parts = make([]Part, 0, n)
+ 132| 	}
+ 133| 
+ 134| 	l := sqlLexerPool.get()
+ 135| 	defer sqlLexerPool.put(l)
+ 136| 
+ 137| 	l.src = sql
+ 138| 	l.stateFn = rawState
+ 139| 	l.parts = parts
+ 140| 
+ 141| 	for l.stateFn != nil {
+ 142| 		l.stateFn = l.stateFn(l)
+ 143| 	}
+ 144| 
+ 145| 	q.Parts = l.parts
+ 146| }
+ 147| 
+ 148| func QuoteString(dst []byte, str string) []byte {
+ 149| 	const quote = '\''
+ 150| 
+ 151| 	// Preallocate space for the worst case scenario
+ 152| 	dst = slices.Grow(dst, len(str)*2+2)
+ 153| 
+ 154| 	// Add opening quote
+ 155| 	dst = append(dst, quote)
+ 156| 
+ 157| 	// Iterate through the string without allocating
+ 158| 	for i := 0; i < len(str); i++ {
+ 159| 		if str[i] == quote {
+ 160| 			dst = append(dst, quote, quote)
+ 161| 		} else {
+ 162| 			dst = append(dst, str[i])
+ 163| 		}
+ 164| 	}
+ 165| 
+ 166| 	// Add closing quote
+ 167| 	dst = append(dst, quote)
+ 168| 
+ 169| 	return dst
+ 170| }
+ 171| 
+ 172| func QuoteBytes(dst, buf []byte) []byte {
+ 173| 	if len(buf) == 0 {
+ 174| 		return append(dst, `'\x'`...)
+ 175| 	}
+ 176| 
+ 177| 	// Calculate required length
+ 178| 	requiredLen := 3 + hex.EncodedLen(len(buf)) + 1
+ 179| 
+ 180| 	// Ensure dst has enough capacity
+ 181| 	if cap(dst)-len(dst) < requiredLen {
+ 182| 		newDst := make([]byte, len(dst), len(dst)+requiredLen)
+ 183| 		copy(newDst, dst)
+ 184| 		dst = newDst
+ 185| 	}
+ 186| 
+ 187| 	// Record original length and extend slice
+ 188| 	origLen := len(dst)
+ 189| 	dst = dst[:origLen+requiredLen]
+ 190| 
+ 191| 	// Add prefix
+ 192| 	dst[origLen] = '\''
+ 193| 	dst[origLen+1] = '\\'
+ 194| 	dst[origLen+2] = 'x'
+ 195| 
+ 196| 	// Encode bytes directly into dst
+ 197| 	hex.Encode(dst[origLen+3:len(dst)-1], buf)
+ 198| 
+ 199| 	// Add suffix
+ 200| 	dst[len(dst)-1] = '\''
+ 201| 
+ 202| 	return dst
+ 203| }
+ 204| 
+ 205| type sqlLexer struct {
+ 206| 	src       string
+ 207| 	start     int
+ 208| 	pos       int
+ 209| 	nested    int    // multiline comment nesting level.
+ 210| 	dollarTag string // active tag while inside a dollar-quoted string (may be empty for $$).
+ 211| 	stateFn   stateFn
+ 212| 	parts     []Part
+ 213| }
+ 214| 
+ 215| type stateFn func(*sqlLexer) stateFn
+ 216| 
+ 217| func rawState(l *sqlLexer) stateFn {
+ 218| 	for {
+ 219| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 220| 		l.pos += width
+ 221| 
+ 222| 		switch r {
+ 223| 		case 'e', 'E':
+ 224| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 225| 			if nextRune == '\'' {
+ 226| 				l.pos += width
+ 227| 				return escapeStringState
+ 228| 			}
+ 229| 		case '\'':
+ 230| 			return singleQuoteState
+ 231| 		case '"':
+ 232| 			return doubleQuoteState
+ 233| 		case '$':
+ 234| 			nextRune, _ := utf8.DecodeRuneInString(l.src[l.pos:])
+ 235| 			if '0' <= nextRune && nextRune <= '9' {
+ 236| 				if l.pos-l.start > 0 {
+ 237| 					l.parts = append(l.parts, l.src[l.start:l.pos-width])
+ 238| 				}
+ 239| 				l.start = l.pos
+ 240| 				return placeholderState
+ 241| 			}
+ 242| 			// PostgreSQL dollar-quoted string: $[tag]$...$[tag]$. The $ was
+ 243| 			// just consumed; try to match the rest of the opening tag.
+ 244| 			// Without this, placeholders embedded inside dollar-quoted
+ 245| 			// literals would be incorrectly substituted.
+ 246| 			if tagLen, ok := scanDollarQuoteTag(l.src[l.pos:]); ok {
+ 247| 				l.dollarTag = l.src[l.pos : l.pos+tagLen]
+ 248| 				l.pos += tagLen + 1 // advance past tag and closing '$'
+ 249| 				return dollarQuoteState
+ 250| 			}
+ 251| 		case '-':
+ 252| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 253| 			if nextRune == '-' {
+ 254| 				l.pos += width
+ 255| 				return oneLineCommentState
+ 256| 			}
+ 257| 		case '/':
+ 258| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 259| 			if nextRune == '*' {
+ 260| 				l.pos += width
+ 261| 				return multilineCommentState
+ 262| 			}
+ 263| 		case utf8.RuneError:
+ 264| 			if width != replacementcharacterwidth {
+ 265| 				if l.pos-l.start > 0 {
+ 266| 					l.parts = append(l.parts, l.src[l.start:l.pos])
+ 267| 					l.start = l.pos
+ 268| 				}
+ 269| 				return nil
+ 270| 			}
+ 271| 		}
+ 272| 	}
+ 273| }
+ 274| 
+ 275| func singleQuoteState(l *sqlLexer) stateFn {
+ 276| 	for {
+ 277| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 278| 		l.pos += width
+ 279| 
+ 280| 		switch r {
+ 281| 		case '\'':
+ 282| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 283| 			if nextRune != '\'' {
+ 284| 				return rawState
+ 285| 			}
+ 286| 			l.pos += width
+ 287| 		case utf8.RuneError:
+ 288| 			if width != replacementcharacterwidth {
+ 289| 				if l.pos-l.start > 0 {
+ 290| 					l.parts = append(l.parts, l.src[l.start:l.pos])
+ 291| 					l.start = l.pos
+ 292| 				}
+ 293| 				return nil
+ 294| 			}
+ 295| 		}
+ 296| 	}
+ 297| }
+ 298| 
+ 299| func doubleQuoteState(l *sqlLexer) stateFn {
+ 300| 	for {
+ 301| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 302| 		l.pos += width
+ 303| 
+ 304| 		switch r {
+ 305| 		case '"':
+ 306| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 307| 			if nextRune != '"' {
+ 308| 				return rawState
+ 309| 			}
+ 310| 			l.pos += width
+ 311| 		case utf8.RuneError:
+ 312| 			if width != replacementcharacterwidth {
+ 313| 				if l.pos-l.start > 0 {
+ 314| 					l.parts = append(l.parts, l.src[l.start:l.pos])
+ 315| 					l.start = l.pos
+ 316| 				}
+ 317| 				return nil
+ 318| 			}
+ 319| 		}
+ 320| 	}
+ 321| }
+ 322| 
+ 323| // placeholderState consumes a placeholder value. The $ must have already has
+ 324| // already been consumed. The first rune must be a digit.
+ 325| func placeholderState(l *sqlLexer) stateFn {
+ 326| 	num := 0
  327| 
- 328| 
- 329| def test_webhook(webhook: Webhook, event: WebhookEvent | None = None) -> WebhookTestResult:
- 330|     """Test a webhook by sending a test payload.
+ 328| 	for {
+ 329| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 330| 		l.pos += width
  331| 
- 332|     Args:
- 333|         webhook: The webhook object to test
- 334|         event: Optional event type to test. If not specified, uses the first event from webhook.
- 335| 
- 336|     Returns:
- 337|         WebhookTestResult indicating success/failure and response details
- 338|     """
- 339|     # Use provided event or the first event type for testing
- 340|     test_event = event or webhook.events[0]
- 341|     session = _get_or_create_webhook_session()
- 342|     try:
- 343|         test_payload = get_example_payload_for_event(test_event)
- 344|         response = _send_webhook_request(
- 345|             webhook=webhook, payload=test_payload, event=test_event, session=session
- 346|         )
- 347|         return WebhookTestResult(
- 348|             success=response.status_code < 400,
- 349|             response_status=response.status_code,
- 350|             response_body=response.text,
- 351|         )
- 352|     except Exception as e:
- 353|         return WebhookTestResult(
- 354|             success=False,
- 355|             error_message=f"Failed to test webhook: {e!r}",
- 356|         )
- 357| 
- 358| 
+ 332| 		if '0' <= r && r <= '9' {
+ 333| 			// Clamp rather than silently wrap on pathological input like
+ 334| 			// "$92233720368547758070" which would otherwise overflow int and
+ 335| 			// could land on a valid args index. Any value above MaxInt32 far
+ 336| 			// exceeds any plausible args length, so Sanitize will correctly
+ 337| 			// return "insufficient arguments".
+ 338| 			if num > (math.MaxInt32-9)/10 {
+ 339| 				num = math.MaxInt32
+ 340| 			} else {
+ 341| 				num = num*10 + int(r-'0')
+ 342| 			}
+ 343| 		} else {
+ 344| 			l.parts = append(l.parts, num)
+ 345| 			l.pos -= width
+ 346| 			l.start = l.pos
+ 347| 			return rawState
+ 348| 		}
+ 349| 	}
+ 350| }
+ 351| 
+ 352| // dollarQuoteState consumes the body of a PostgreSQL dollar-quoted string
+ 353| // ($[tag]$...$[tag]$). The opening tag (including its terminating '$') has
+ 354| // already been consumed.
+ 355| func dollarQuoteState(l *sqlLexer) stateFn {
+ 356| 	closer := "$" + l.dollarTag + "$"
+ 357| 	idx := strings.Index(l.src[l.pos:], closer)
+ 358| 	if idx < 0 {
+ 359| 		// Unterminated — mirror the behavior of other quoted-string states by
+ 360| 		// consuming the remaining input into the current part and stopping.
+ 361| 		if len(l.src)-l.start > 0 {
+ 362| 			l.parts = append(l.parts, l.src[l.start:])
+ 363| 			l.start = len(l.src)
+ 364| 		}
+ 365| 		l.pos = len(l.src)
+ 366| 		return nil
+ 367| 	}
+ 368| 	l.pos += idx + len(closer)
+ 369| 	l.dollarTag = ""
+ 370| 	return rawState
+ 371| }
+ 372| 
+ 373| // scanDollarQuoteTag checks whether src begins with an optional dollar-quoted
+ 374| // string tag followed by a closing '$'. src must point just past the opening
+ 375| // '$'. Returns the byte length of the tag (zero for an anonymous $$) and
+ 376| // whether a valid tag was found.
+ 377| //
+ 378| // Tag grammar matches the PostgreSQL lexer (scan.l):
+ 379| //
+ 380| //	dolq_start: [A-Za-z_\x80-\xff]
+ 381| //	dolq_cont:  [A-Za-z0-9_\x80-\xff]
+ 382| func scanDollarQuoteTag(src string) (int, bool) {
+ 383| 	first := true
+ 384| 	for i := 0; i < len(src); {
+ 385| 		r, w := utf8.DecodeRuneInString(src[i:])
+ 386| 		if r == '$' {
+ 387| 			return i, true
+ 388| 		}
+ 389| 		if !isDollarTagRune(r, first) {
+ 390| 			return 0, false
+ 391| 		}
+ 392| 		first = false
+ 393| 		i += w
+ 394| 	}
+ 395| 	return 0, false
+ 396| }
+ 397| 
+ 398| func isDollarTagRune(r rune, first bool) bool {
+ 399| 	switch {
+ 400| 	case r == '_':
+ 401| 		return true
+ 402| 	case 'a' <= r && r <= 'z':
+ 403| 		return true
+ 404| 	case 'A' <= r && r <= 'Z':
+ 405| 		return true
+ 406| 	case !first && '0' <= r && r <= '9':
+ 407| 		return true
+ 408| 	case r >= 0x80 && r != utf8.RuneError:
+ 409| 		return true
+ 410| 	}
+ 411| 	return false
+ 412| }
+ 413| 
+ 414| func escapeStringState(l *sqlLexer) stateFn {
+ 415| 	for {
+ 416| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 417| 		l.pos += width
+ 418| 
+ 419| 		switch r {
+ 420| 		case '\\':
+ 421| 			_, width = utf8.DecodeRuneInString(l.src[l.pos:])
+ 422| 			l.pos += width
+ 423| 		case '\'':
+ 424| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 425| 			if nextRune != '\'' {
+ 426| 				return rawState
+ 427| 			}
+ 428| 			l.pos += width
+ 429| 		case utf8.RuneError:
+ 430| 			if width != replacementcharacterwidth {
+ 431| 				if l.pos-l.start > 0 {
+ 432| 					l.parts = append(l.parts, l.src[l.start:l.pos])
+ 433| 					l.start = l.pos
+ 434| 				}
+ 435| 				return nil
+ 436| 			}
+ 437| 		}
+ 438| 	}
+ 439| }
+ 440| 
+ 441| func oneLineCommentState(l *sqlLexer) stateFn {
+ 442| 	for {
+ 443| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 444| 		l.pos += width
+ 445| 
+ 446| 		switch r {
+ 447| 		case '\\':
+ 448| 			_, width = utf8.DecodeRuneInString(l.src[l.pos:])
+ 449| 			l.pos += width
+ 450| 		case '\n', '\r':
+ 451| 			return rawState
+ 452| 		case utf8.RuneError:
+ 453| 			if width != replacementcharacterwidth {
+ 454| 				if l.pos-l.start > 0 {
+ 455| 					l.parts = append(l.parts, l.src[l.start:l.pos])
+ 456| 					l.start = l.pos
+ 457| 				}
+ 458| 				return nil
+ 459| 			}
+ 460| 		}
+ 461| 	}
+ 462| }
+ 463| 
+ 464| func multilineCommentState(l *sqlLexer) stateFn {
+ 465| 	for {
+ 466| 		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 467| 		l.pos += width
+ 468| 
+ 469| 		switch r {
+ 470| 		case '/':
+ 471| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 472| 			if nextRune == '*' {
+ 473| 				l.pos += width
+ 474| 				l.nested++
+ 475| 			}
+ 476| 		case '*':
+ 477| 			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+ 478| 			if nextRune != '/' {
+ 479| 				continue
+ 480| 			}
+ 481| 
+ 482| 			l.pos += width
+ 483| 			if l.nested == 0 {
+ 484| 				return rawState
+ 485| 			}
+ 486| 			l.nested--
+ 487| 
+ 488| 		case utf8.RuneError:
+ 489| 			if width != replacementcharacterwidth {
+ 490| 				if l.pos-l.start > 0 {
+ 491| 					l.parts = append(l.parts, l.src[l.start:l.pos])
+ 492| 					l.start = l.pos
+ 493| 				}
+ 494| 				return nil
+ 495| 			}
+ 496| 		}
+ 497| 	}
+ 498| }
+ 499| 
+ 500| var queryPool = &pool[*Query]{
+ 501| 	new: func() *Query {
+ 502| 		return &Query{}
+ 503| 	},
+ 504| 	reset: func(q *Query) bool {
+ 505| 		n := len(q.Parts)
+ 506| 		q.Parts = q.Parts[:0]
+ 507| 		return n < 64 // drop too large queries
+ 508| 	},
+ 509| }
+ 510| 
+ 511| // SanitizeSQL replaces placeholder values with args. It quotes and escapes args
+ 512| // as necessary. This function is only safe when standard_conforming_strings is
+ 513| // on.
+ 514| func SanitizeSQL(sql string, args ...any) (string, error) {
+ 515| 	query := queryPool.get()
+ 516| 	query.init(sql)
+ 517| 	defer queryPool.put(query)
+ 518| 
+ 519| 	return query.Sanitize(args...)
+ 520| }
+ 521| 
+ 522| type pool[E any] struct {
+ 523| 	p     sync.Pool
+ 524| 	new   func() E
+ 525| 	reset func(E) bool
+ 526| }
+ 527| 
+ 528| func (pool *pool[E]) get() E {
+ 529| 	v, ok := pool.p.Get().(E)
+ 530| 	if !ok {
+ 531| 		v = pool.new()
+ 532| 	}
+ 533| 
+ 534| 	return v
+ 535| }
+ 536| 
+ 537| func (p *pool[E]) put(v E) {
+ 538| 	if p.reset(v) {
+ 539| 		p.p.Put(v)
+ 540| 	}
+ 541| }
+ 542| 
+ 543| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=8098 teacher=unknown flags=[]
+### id=8084 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+**入口点枚举（全文通读）**
+1. 第 243–248 行：`SanitizeSQL(sql string, args ...any)` —— 唯一公开入口，source 为调用方传入的 `sql` 模板与 `args` 参数。
+2. 第 84–89 行：`NewQuery(sql)` / 第 91 行 `init(sql)` —— 第二入口，同样接受任意 SQL 字符串，走同一套词法分析。
+3. 无文件、环境变量、网络、回调等其他通道；sink 是第 62 行返回的拼接后 SQL 字符串，交由上层执行。
+
+**数据流逐条验证**
+- 第 30–35 行：占位符索引边界检查（argIdx<0、超出 len(args) 报错），有效。
+- 第 38、57 行：参数前后各写入一个空格，修复了 GHSA-m7wr-2xf7-cm9p 的行注释注入（`--`），该防御有效。
+- 第 40–54 行：类型白名单（nil/int64/float64/bool/[]byte/string/time.Time），default 直接报错——白名单式防御，非黑名单，有效。
+- 第 118–137 行 `QuoteString`：仅对单引号做双写转义。在 `standard_conforming_strings=on` 时安全；文档第 240 行也明确声明此前提。但若连接配置为 off 或使用 `E'...'` 上下文，反斜杠可逃逸——属文档化前提，不算独立漏洞。
+- 第 139–166 行 `QuoteBytes`：hex 编码，无注入面。
+- **关键缺陷——词法器不识别 dollar-quoted 字符串**：
+  - 第 168–216 行 `rawState` 只处理 `'...'`、`"..."`、`E'...'`、注释；第 194–204 行遇到 `$` 后跟数字即切到 `placeholderState`。
+  - 全文没有任何状态处理 PostgreSQL 的 `$$...$$` / `$tag$...$tag$` 美元引用字符串。
+  - 因此模板 SQL 中若含美元引用字面量（如 `SELECT $$literal$$, $1`），字面量内部的 `$1` 仍被当作占位符替换；更严重的是攻击者可控的字符串参数值中包含 `$$` 即可提前闭合美元引用并注入任意 SQL。
+  - 数据流：source=args[i]（第 41 行）→ 第 52 行 `QuoteString` 仅双写单引号，无法阻止 `$$` 序列 → sink 第 62 行返回的 SQL。由于美元引用内部单引号无需转义，双写反而无效。
+- 第 63–68 行 unused-argument 检查与注入无关。
+- 第 218–289 行各注释/引号状态机本身逻辑正确，但不覆盖 dollar-quote 场景。
+- 第 291–316 行对象池：`reset` 复用切片，`q.Parts[:0]` 复用底层数组；并发下每个 goroutine 从池取独立对象，无数据竞争；但 `NewQuery` 返回的 Query 若被复用池外共享则可能串改——正常用法无问题。
+
+**结论**：存在真实漏洞——dollar-quoted 字符串未被词法器识别，导致占位符误判与参数逃逸注入（pgx 实际历史 issue 类别）。前提是模板 SQL 含 `$$` 字面量或参数值含 `$$` 且处于美元引用上下文，故为中风险。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "Medium", "source": "line 243: SanitizeSQL 的 args 参数（以及 line 84 NewQuery 的 sql）", "sink": "line 62: 返回拼接后的 SQL 字符串交由数据库执行", "explanation": "词法器 rawState(line 168-216) 与 placeholderState(line 218-232) 未识别 PostgreSQL 美元引用字符串($$..$$ 或 $tag$..$tag$)，只识别单引号/双引号/E引号/注释。当模板 SQL 含美元引用字面量时，其中的 $N 被误当占位符替换；且攻击者可控的 string 参数经 QuoteString(line 118) 仅双写单引号，无法阻止参数值中的 $$ 提前闭合美元引用从而注入任意 SQL -> source(args) 经 line 52 写入 buf 到 sink(line 62)", "fix_suggestion": "在 rawState(line 194) 遇到 $ 且后续不是数字时增加 dollarQuotedState 状态机，解析 $$ 或 $tag$ 开头并跳过至匹配的闭合标记，期间不得产生占位符；同时保持 standard_conforming_strings=on 的前置校验"}
+
+### id=8085 teacher=unknown flags=[]
 [ANALYSIS]
 ## 编号分析
 
 **入口点枚举（全文）**
+1. `SanitizeSQL(sql, args...)`（第 316 行附近）——唯一公开入口，source 为调用方传入的 SQL 模板与参数，sink 为返回的拼接后 SQL 字符串。
+2. `NewQuery(sql)` / `Query.Sanitize(args)` —— 同一数据流的分步形式。
+3. 无文件、环境变量、网络、回调等其他通道；`pool` 仅是内存复用。
 
-1. `deliver_webhook`（第284行）：事件触发通道，payload 来自内部事件，store 提供的 webhook 列表（含用户注册的 URL/secret）。
-2. `test_webhook`（第303行）：测试通道，`webhook` 对象（含任意 `url`）直接传入。
-3. 环境变量：`MLFLOW_WEBHOOK_*`、`MLFLOW_ENABLE_WORKSPACES`（第27–32行）——仅影响行为参数，非攻击面。
+**逐条数据流验证**
 
-**数据流验证**
+1. **占位符解析**：`rawState` 中 `$` 后跟数字进入 `placeholderState`；`placeholderState` 对超大数字做钳制（第 190 行附近注释），防止 int 溢出落到合法索引。`num` 最小为 0 时 `argIdx = -1`，`Sanitize` 第 44 行显式报错 `first sql argument must be > 0`。防御有效。
+2. **参数不足/未使用**：第 47 行 `argIdx >= len(args)` 报错；末尾遍历 `argUse` 报错 unused argument，防止参数错位注入。有效。
+3. **字符串参数转义**：`QuoteString` 将 `'` 翻倍为 `''`。在 `standard_conforming_strings = on`（PostgreSQL 默认）下这是完备的——反斜杠无特殊含义。函数文档（第 311 行附近）明确声明了该前提条件。注意：若部署环境把 `standard_conforming_strings` 关闭，或 SQL 模板用 `E'...'` 包裹占位符，则参数中的 `\` 可使后续 `'` 失效从而注入——但代码自身不控制服务器配置，且已文档化该限制，属已知前提而非可独立利用的漏洞。黑名单类过滤不存在，全部是状态机精确转义。
+4. **字节串参数**：`QuoteBytes` 用 hex 编码 `'\x...'` 形式，hex 字符集内无引号/反斜杠，长度计算与写入一致（`requiredLen` 精确），无越界、无逃逸。有效。
+5. **数值/布尔/时间**：`strconv.AppendInt/Float/Bool` 与 time 的固定格式串，均不可能产生引号。有效。
+6. **SQL 模板中的引号上下文识别**：`singleQuoteState`/`doubleQuoteState`/`escapeStringState` 正确处理成对引号；`oneLineCommentState`、嵌套感知的 `multilineCommentState` 防止 GHSA-m7wr-2xf7-cm9p 类“注释吞占位符”攻击；占位符前后各写一个空格进一步阻断行注释拼接。有效。
+7. **Dollar-quoted 字符串**：`scanDollarQuoteTag` 按 PostgreSQL 词法实现 tag 语法，`dollarQuoteState` 跳过整个 `$tag$...$tag$` 体，防止模板中字面量内的 `$1` 被误替换导致注入。有效。
+8. **无效 UTF-8 截断**：各状态的 `RuneError && width != 3` 分支直接终止并截断剩余输入，避免多字节字符尾字节伪造引号（pgx #1380）。有效。
+9. **对象池**：`bufPool`/`queryPool`/`sqlLexerPool` 均有 reset 且大小上限，无跨请求状态泄漏（`Query.init` 重置 parts，lexer 整体重置）。无并发漏洞。
 
-- 流 A：用户注册的 `webhook.url` → 第141行 `_validate_webhook_url(webhook.url)` → 第177行 `session.post(webhook.url, ...)`。防御为单一校验函数；按规则黑名单/正则类过滤视为可绕过（典型实现基于 scheme 白名单+内网 IP 黑名单，可被 DNS rebinding、重定向至内网、IPv6/十进制 IP 等绕过）。且重试配置（第76–85行）跟随 3xx 重定向时无 re-validation。**SSRF 成立（CWE-918）**。
-- 流 B：`test_webhook`（第303行）→ 第315行 `_send_webhook_request` → 第177行 POST 任意 URL → 第321–324行将 `response.text` 完整回传给调用者。这是**全读型 SSRF**：攻击者可读取内网服务（如云元数据 169.254.169.254、内部管理接口）的响应体并原样返回，危害高于盲打。
-- 流 C：HMAC 签名（第109–125行）使用 `hmac.new` 常量时间比较不适用（这里是生成端），签名覆盖 delivery_id/timestamp/payload，防篡改与重放设计正确，无漏洞。
-- 流 D：缓存（第189–245行）TTLCache + 双检锁，线程安全处理正确；但注意第273–281行：URL 校验发生在投递时而非注册时，配合缓存意味着绕过校验的 URL 可在 TTL 内反复触发。
-- 流 E：异常日志（第181、185、257行）记录完整 URL 与错误，可能泄露内网拓扑到日志，属低风险信息泄露。
+**第二入口/替代通道检查**：`NewQuery` 与 `SanitizeSQL` 共享同一 lexer 与转义逻辑，无旁路；`Part` 类型由内部生成，外部无法直接构造非法 Part 进入 `Sanitize`（除非导出字段被滥用，属调用方责任）。
 
-**第二入口确认**：`test_webhook` 是独立于投递流程的第二入口，且返回响应体，是最严重的利用路径。
+**结论**：在文档声明的前提（standard_conforming_strings 开启，PostgreSQL 默认）下，全文所有 source→sink 流均有有效防御，无可利用漏洞。唯一风险是部署方关闭该配置时的文档化限制。
 [JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF) (Server-Side Request Forgery)", "risk_level": "High", "source": "line 323: test_webhook 接收含任意 url 的 webhook 对象 / 用户注册的 webhook.url", "sink": "line 189: session.post(webhook.url, ...) 以及 line 344: response_body=response.text 回传给调用者", "explanation": "用户可控的 webhook.url 经第141行 _validate_webhook_url 校验后于第177行发起服务器端请求；该单点校验属于黑名单式防御可被 DNS rebinding 或重定向绕过，且 test_webhook 在第324行把目标响应体完整返回给调用者，构成全读型 SSRF，可探测并窃取内网服务如云元数据接口的数据", "fix_suggestion": "在注册和发送时均做严格校验：解析 URL 后禁止私网/链路本地/环回地址段，禁用自动重定向或对每次重定向重新校验目标 IP，并对 test_webhook 的 response_body 做长度限制与内容脱敏"}
-
-### id=8099 teacher=unknown flags=[]
-[ANALYSIS]
-## 编号分析
-
-1. **入口点枚举（全文）**：本模块无 HTTP 路由，入口为两个公开函数：
-   - `deliver_webhook`（第 246 行附近）：由事件系统调用，`payload` 来自内部实体数据；
-   - `test_webhook`（第 262 行附近）：由 API 层测试端点调用，`webhook` 对象（含 `webhook.url`、`webhook.secret`）来自用户注册的 webhook 记录。
-   - 外部输入 source：`webhook.url`（攻击者可控的出站目标地址）。
-
-2. **source→sink 数据流**：`webhook.url` → `_send_webhook_request` 第 137 行 `_validate_webhook_url(webhook.url)` → 第 190 行 `session.post(webhook.url, ...)`。这是典型 SSRF sink。防御验证：
-   - 第 137 行 URL 校验（解析+解析 IP 检查）存在 DNS-rebinding TOCTOU 缺口，但第 152-158 行注释明确说明使用 `SSRFProtectedHTTPAdapter` 在**连接时**校验对端 IP 为公网地址，闭合了 rebinding 窗口；且该 adapter 挂载于 http/https 全部 scheme（第 160-161 行），重定向产生的每个新连接同样经过 adapter 校验；
-   - 第 159 行 `session.trust_env = False` 阻止环境代理绕过 IP 校验——这是对替代通道的主动封堵；
-   - 重定向通道：requests 默认跟随重定向，但每次连接均走同一 adapter，校验不被绕过。
-
-3. **第二入口/替代通道检查**：
-   - `test_webhook` 将 `response.text` 回传给调用者（第 276 行），若能访问内网则构成信息泄露放大器，但前置的连接时 SSRF 校验使内网不可达；
-   - 非 http/https scheme（如 file://）不匹配已挂载 adapter，但 `_validate_webhook_url` 应拒绝非 http(s) scheme（MLflow 标准校验），且 requests 对 file:// 不支持 post；
-   - HMAC 签名（第 88-105 行）使用 `hmac.new` 常量时间比较语义正确，secret 仅用于签名，无泄露路径。
-
-4. **其他次要问题（非漏洞）**：
-   - 第 195 行日志记录完整 `webhook.url`——URL 本身是注册者自填的，非敏感泄露；
-   - TTLCache 缓存（第 208-240 行）可能导致已删除 webhook 短暂继续投递，属可用性/一致性问题而非安全漏洞；
-   - 线程池共享 session 有锁保护（第 68-77 行），无线程安全问题。
-
-结论：SSRF 主 sink 具备双层有效防御（URL 校验 + 连接时 IP 校验），代理与重定向替代通道均被封堵，未发现可利用漏洞。
-[JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文唯一的攻击者可控 source 是 webhook.url，sink 是 session.post。该数据流具备两层有效防御：_validate_webhook_url 的静态校验加上 SSRFProtectedHTTPAdapter 在每次连接时校验对端为公网 IP，闭合了 DNS rebinding TOCTOU 窗口；session.trust_env=False 封堵了代理绕过通道，adapter 挂载于全部 http/https 使重定向后的每个新连接同样受校验。test_webhook 返回 response.body 虽有信息回传面，但因内网不可达而不构成可利用问题。HMAC 签名实现正确，缓存 TTL 差异仅为一致性小瑕疵。", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文：唯一入口 SanitizeSQL/NewQuery 的所有数据流均已验证。占位符索引有钳制防溢出和边界报错；QuoteString 在 standard_conforming_strings 开启前提下通过成对单引号完成完备转义；QuoteBytes 使用纯 hex 编码无逃逸可能；数值与时间参数经 strconv 和固定格式输出不含引号；词法器正确处理单双引号、E字符串、行注释、嵌套块注释及 dollar-quoted 字符串，阻断 GHSA-m7wr-2xf7-cm9p 类注释注入与占位符误替换；无效 UTF-8 输入触发安全截断；对象池有重置逻辑无状态泄漏。唯一注意事项是文档已声明的运行前提：若管理员将 PostgreSQL 的 standard_conforming_strings 关闭或在模板中使用 E前缀包裹占位符，字符串参数中的反斜杠可能导致转义失效，但这属于部署配置问题而非本代码缺陷。", "fix_suggestion": "no fix needed"}

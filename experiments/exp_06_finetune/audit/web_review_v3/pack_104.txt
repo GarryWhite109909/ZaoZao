@@ -2,500 +2,7 @@ batch=104 样本数=2
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=7884 lang=go
-[CODE]
-   1| package kubernetes
-   2| 
-   3| import (
-   4| 	"crypto/tls"
-   5| 	b64 "encoding/base64"
-   6| 	"encoding/json"
-   7| 	"errors"
-   8| 	"fmt"
-   9| 	"regexp"
-  10| 	"strconv"
-  11| 	"strings"
-  12| 
-  13| 	log "github.com/sirupsen/logrus"
-  14| 	"github.com/zalando/skipper/dataclients/kubernetes/definitions"
-  15| 	"github.com/zalando/skipper/eskip"
-  16| 	"github.com/zalando/skipper/secrets/certregistry"
-  17| )
-  18| 
-  19| const (
-  20| 	ingressRouteIDPrefix                = "kube"
-  21| 	backendWeightsAnnotationKey         = "zalando.org/backend-weights"
-  22| 	ratelimitAnnotationKey              = "zalando.org/ratelimit"
-  23| 	skipperLoadBalancerAnnotationKey    = "zalando.org/skipper-loadbalancer"
-  24| 	skipperBackendProtocolAnnotationKey = "zalando.org/skipper-backend-protocol"
-  25| 	pathModeAnnotationKey               = "zalando.org/skipper-ingress-path-mode"
-  26| 	ingressOriginName                   = "ingress"
-  27| 	tlsSecretType                       = "kubernetes.io/tls"
-  28| 	tlsSecretDataCrt                    = "tls.crt"
-  29| 	tlsSecretDataKey                    = "tls.key"
-  30| )
-  31| 
-  32| type ingressContext struct {
-  33| 	state               *clusterState
-  34| 	ingressV1           *definitions.IngressV1Item
-  35| 	logger              *logger
-  36| 	annotationFilters   []*eskip.Filter
-  37| 	annotationPredicate string
-  38| 	annotationBackend   string
-  39| 	forwardBackendURL   string
-  40| 	enableExternalNames bool
-  41| 	extraRoutes         []*eskip.Route
-  42| 	backendWeights      map[string]float64
-  43| 	pathMode            PathMode
-  44| 	redirect            *redirectInfo
-  45| 	hostRoutes          map[string][]*eskip.Route
-  46| 	defaultFilters      defaultFilters
-  47| 	certificateRegistry *certregistry.CertRegistry
-  48| 	calculateTraffic    func([]*weightedIngressBackend) map[string]backendTraffic
-  49| }
-  50| 
-  51| type ingress struct {
-  52| 	eastWestRangeDomains                           []string
-  53| 	eastWestRangePredicates                        []*eskip.Predicate
-  54| 	allowedExternalNames                           []*regexp.Regexp
-  55| 	kubernetesEastWestDomain                       string
-  56| 	pathMode                                       PathMode
-  57| 	httpsRedirectCode                              int
-  58| 	kubernetesEnableEastWest                       bool
-  59| 	provideHTTPSRedirect                           bool
-  60| 	disableCatchAllRoutes                          bool
-  61| 	forceKubernetesService                         bool
-  62| 	enableExternalNames                            bool
-  63| 	backendTrafficAlgorithm                        BackendTrafficAlgorithm
-  64| 	defaultLoadBalancerAlgorithm                   string
-  65| 	forwardBackendURL                              string
-  66| 	kubernetesAnnotationPredicates                 []AnnotationPredicates
-  67| 	kubernetesAnnotationFiltersAppend              []AnnotationFilters
-  68| 	kubernetesEastWestRangeAnnotationPredicates    []AnnotationPredicates
-  69| 	kubernetesEastWestRangeAnnotationFiltersAppend []AnnotationFilters
-  70| }
-  71| 
-  72| var (
-  73| 	nonWord = regexp.MustCompile(`\W`)
-  74| 
-  75| 	errNotEnabledExternalName = errors.New("ingress is not enabled to reference external name service")
-  76| 	errNotAllowedExternalName = errors.New("ingress with not allowed external name service")
-  77| )
-  78| 
-  79| func (ic *ingressContext) addHostRoute(host string, route *eskip.Route) {
-  80| 	ic.applyBackend(route)
-  81| 	ic.hostRoutes[host] = append(ic.hostRoutes[host], route)
-  82| }
-  83| 
-  84| func (ic *ingressContext) applyBackend(route *eskip.Route) {
-  85| 	if ic.forwardBackendURL == "" || ic.annotationBackend == "" || route == nil {
-  86| 		return
-  87| 	}
-  88| 	if be, err := eskip.BackendTypeFromString(ic.annotationBackend); err != nil {
-  89| 		return
-  90| 	} else {
-  91| 		switch be {
-  92| 		case eskip.ForwardBackend:
-  93| 			route.BackendType = eskip.NetworkBackend
-  94| 			route.Backend = ic.forwardBackendURL
-  95| 			route.Filters = []*eskip.Filter{}
-  96| 		}
-  97| 	}
-  98| }
-  99| 
- 100| func newIngress(o Options) *ingress {
- 101| 	return &ingress{
- 102| 		provideHTTPSRedirect:                           o.ProvideHTTPSRedirect,
- 103| 		httpsRedirectCode:                              o.HTTPSRedirectCode,
- 104| 		disableCatchAllRoutes:                          o.DisableCatchAllRoutes,
- 105| 		pathMode:                                       o.PathMode,
- 106| 		kubernetesEnableEastWest:                       o.KubernetesEnableEastWest,
- 107| 		kubernetesEastWestDomain:                       o.KubernetesEastWestDomain,
- 108| 		eastWestRangeDomains:                           o.KubernetesEastWestRangeDomains,
- 109| 		eastWestRangePredicates:                        o.KubernetesEastWestRangePredicates,
- 110| 		enableExternalNames:                            o.EnableExternalNames,
- 111| 		allowedExternalNames:                           o.AllowedExternalNames,
- 112| 		forceKubernetesService:                         o.ForceKubernetesService,
- 113| 		backendTrafficAlgorithm:                        o.BackendTrafficAlgorithm,
- 114| 		defaultLoadBalancerAlgorithm:                   o.DefaultLoadBalancerAlgorithm,
- 115| 		forwardBackendURL:                              o.ForwardBackendURL,
- 116| 		kubernetesAnnotationPredicates:                 o.KubernetesAnnotationPredicates,
- 117| 		kubernetesAnnotationFiltersAppend:              o.KubernetesAnnotationFiltersAppend,
- 118| 		kubernetesEastWestRangeAnnotationPredicates:    o.KubernetesEastWestRangeAnnotationPredicates,
- 119| 		kubernetesEastWestRangeAnnotationFiltersAppend: o.KubernetesEastWestRangeAnnotationFiltersAppend,
- 120| 	}
- 121| }
- 122| 
- 123| func getLoadBalancerAlgorithm(m *definitions.Metadata, defaultAlgorithm string) string {
- 124| 	algorithm := defaultAlgorithm
- 125| 	if algorithmAnnotationValue, ok := m.Annotations[skipperLoadBalancerAnnotationKey]; ok {
- 126| 		algorithm = algorithmAnnotationValue
- 127| 	}
- 128| 
- 129| 	return algorithm
- 130| }
- 131| 
- 132| // TODO: find a nicer way to autogenerate route IDs
- 133| func routeID(namespace, name, host, path, backend string) string {
- 134| 	namespace = nonWord.ReplaceAllString(namespace, "_")
- 135| 	name = nonWord.ReplaceAllString(name, "_")
- 136| 	host = nonWord.ReplaceAllString(host, "_")
- 137| 	path = nonWord.ReplaceAllString(path, "_")
- 138| 	backend = nonWord.ReplaceAllString(backend, "_")
- 139| 	return fmt.Sprintf("%s_%s__%s__%s__%s__%s", ingressRouteIDPrefix, namespace, name, host, path, backend)
- 140| }
- 141| 
- 142| // routeIDForCustom generates a route id for a custom route of an ingress
- 143| // resource.
- 144| func routeIDForCustom(namespace, name, id, host string, index int) string {
- 145| 	name = name + "_" + id + "_" + strconv.Itoa(index)
- 146| 	return routeID(namespace, name, host, "", "")
- 147| }
- 148| 
- 149| func externalNameRoute(
- 150| 	ns, name, idHost string,
- 151| 	hostRegexps []string,
- 152| 	svc *service,
- 153| 	servicePort *servicePort,
- 154| 	allowedNames []*regexp.Regexp,
- 155| ) (*eskip.Route, error) {
- 156| 	if !isExternalDomainAllowed(allowedNames, svc.Spec.ExternalName) {
- 157| 		return nil, fmt.Errorf("%w: %s", errNotAllowedExternalName, svc.Spec.ExternalName)
- 158| 	}
- 159| 
- 160| 	scheme := "https"
- 161| 	if n, _ := servicePort.TargetPort.Number(); n != 443 {
- 162| 		scheme = "http"
- 163| 	}
- 164| 
- 165| 	u := fmt.Sprintf("%s://%s:%s", scheme, svc.Spec.ExternalName, servicePort.TargetPort)
- 166| 	f, err := eskip.ParseFilters(fmt.Sprintf(`setRequestHeader("Host", "%s")`, svc.Spec.ExternalName))
- 167| 	if err != nil {
- 168| 		return nil, err
- 169| 	}
- 170| 
- 171| 	return &eskip.Route{
- 172| 		Id:          routeID(ns, name, idHost, "", svc.Spec.ExternalName),
- 173| 		BackendType: eskip.NetworkBackend,
- 174| 		Backend:     u,
- 175| 		Filters:     f,
- 176| 		HostRegexps: hostRegexps,
- 177| 	}, nil
- 178| }
- 179| 
- 180| func applyAnnotationPredicates(m PathMode, r *eskip.Route, annotation string) error {
- 181| 	if annotation == "" {
- 182| 		return nil
- 183| 	}
- 184| 
- 185| 	predicates, err := eskip.ParsePredicates(annotation)
- 186| 	if err != nil {
- 187| 		return err
- 188| 	}
- 189| 
- 190| 	// to avoid conflict, give precedence for those predicates that come
- 191| 	// from annotations
- 192| 	if m == PathPrefix {
- 193| 		for _, p := range predicates {
- 194| 			if p.Name != "Path" && p.Name != "PathSubtree" {
- 195| 				continue
- 196| 			}
- 197| 
- 198| 			r.Path = ""
- 199| 			for i, p := range r.Predicates {
- 200| 				if p.Name != "PathSubtree" && p.Name != "Path" {
- 201| 					continue
- 202| 				}
- 203| 
- 204| 				copy(r.Predicates[i:], r.Predicates[i+1:])
- 205| 				r.Predicates[len(r.Predicates)-1] = nil
- 206| 				r.Predicates = r.Predicates[:len(r.Predicates)-1]
- 207| 				break
- 208| 			}
- 209| 		}
- 210| 	}
- 211| 
- 212| 	r.Predicates = append(r.Predicates, predicates...)
- 213| 	return nil
- 214| }
- 215| 
- 216| func (ing *ingress) addExtraRoutes(ic *ingressContext, ruleHost, path, pathType string) {
- 217| 	hosts := []string{createHostRx(ruleHost)}
- 218| 	var ns, name string
- 219| 	name = ic.ingressV1.Metadata.Name
- 220| 	ns = ic.ingressV1.Metadata.Namespace
- 221| 	eastWestDomain := ing.kubernetesEastWestDomain
- 222| 	enableEastWest := ing.kubernetesEnableEastWest
- 223| 	ewHost := isEastWestHost(ruleHost, ing.eastWestRangeDomains)
- 224| 	// add extra routes from optional annotation
- 225| 	for extraIndex, r := range ic.extraRoutes {
- 226| 		route := *r
- 227| 		route.HostRegexps = hosts
- 228| 		route.Id = routeIDForCustom(
- 229| 			ns,
- 230| 			name,
- 231| 			route.Id,
- 232| 			ruleHost+strings.ReplaceAll(path, "/", "_"),
- 233| 			extraIndex)
- 234| 		setPathV1(ic.pathMode, &route, pathType, path)
- 235| 		if n := countPathPredicates(&route); n <= 1 {
- 236| 			if ewHost {
- 237| 				appendAnnotationPredicates(ing.kubernetesEastWestRangeAnnotationPredicates, ic.ingressV1.Metadata.Annotations, &route)
- 238| 				appendAnnotationFilters(ing.kubernetesEastWestRangeAnnotationFiltersAppend, ic.ingressV1.Metadata.Annotations, &route)
- 239| 			} else {
- 240| 				appendAnnotationPredicates(ing.kubernetesAnnotationPredicates, ic.ingressV1.Metadata.Annotations, &route)
- 241| 				appendAnnotationFilters(ing.kubernetesAnnotationFiltersAppend, ic.ingressV1.Metadata.Annotations, &route)
- 242| 			}
- 243| 			ic.addHostRoute(ruleHost, &route)
- 244| 			ic.redirect.updateHost(ruleHost)
- 245| 		} else {
- 246| 			ic.logger.Errorf("Ignoring route due to multiple path predicates: %d path predicates, route: %v", n, route)
- 247| 		}
- 248| 		if enableEastWest {
- 249| 			ewRoute := createEastWestRouteIng(eastWestDomain, name, ns, &route)
- 250| 			ewHost := fmt.Sprintf("%s.%s.%s", name, ns, eastWestDomain)
- 251| 			ic.addHostRoute(ewHost, ewRoute)
- 252| 		}
- 253| 	}
- 254| }
- 255| 
- 256| func countPathPredicates(r *eskip.Route) int {
- 257| 	i := 0
- 258| 	for _, p := range r.Predicates {
- 259| 		if p.Name == "PathSubtree" || p.Name == "Path" {
- 260| 			i++
- 261| 		}
- 262| 	}
- 263| 	if r.Path != "" {
- 264| 		i++
- 265| 	}
- 266| 	return i
- 267| }
- 268| 
- 269| // parse filter and ratelimit annotation
- 270| func annotationFilter(m *definitions.Metadata, logger *logger) []*eskip.Filter {
- 271| 	var annotationFilter string
- 272| 	if ratelimitAnnotationValue, ok := m.Annotations[ratelimitAnnotationKey]; ok {
- 273| 		annotationFilter = ratelimitAnnotationValue
- 274| 	}
- 275| 	if val, ok := m.Annotations[definitions.IngressFilterAnnotation]; ok {
- 276| 		if annotationFilter != "" {
- 277| 			annotationFilter += " -> "
- 278| 		}
- 279| 		annotationFilter += val
- 280| 	}
- 281| 
- 282| 	if annotationFilter != "" {
- 283| 		annotationFilters, err := eskip.ParseFilters(annotationFilter)
- 284| 		if err == nil {
- 285| 			return annotationFilters
- 286| 		}
- 287| 		logger.Errorf("Cannot parse annotation filters: %v", err)
- 288| 	}
- 289| 	return nil
- 290| }
- 291| 
- 292| // parse backend annotation
- 293| func annotationBackend(m *definitions.Metadata) (eskip.BackendType, error) {
- 294| 	if s, ok := m.Annotations[definitions.IngressBackendAnnotation]; ok {
- 295| 		return eskip.BackendTypeFromString(s)
- 296| 	}
- 297| 	return 0, fmt.Errorf("annotation not found")
- 298| }
- 299| 
- 300| func annotationBackendString(m *definitions.Metadata) string {
- 301| 	if be, err := annotationBackend(m); err == nil {
- 302| 		return be.String()
- 303| 	}
- 304| 	return ""
- 305| }
- 306| 
- 307| // parse predicate annotation
- 308| func annotationPredicate(m *definitions.Metadata) string {
- 309| 	var annotationPredicate string
- 310| 	if val, ok := m.Annotations[definitions.IngressPredicateAnnotation]; ok {
- 311| 		annotationPredicate = val
- 312| 	}
- 313| 	return annotationPredicate
- 314| }
- 315| 
- 316| // parse routes annotation
- 317| func extraRoutes(m *definitions.Metadata) []*eskip.Route {
- 318| 	var extraRoutes []*eskip.Route
- 319| 	annotationRoutes := m.Annotations[definitions.IngressRoutesAnnotation]
- 320| 	if annotationRoutes != "" {
- 321| 		extraRoutes, _ = eskip.Parse(annotationRoutes) // We ignore the error here because it should be handled by the validator object
- 322| 	}
- 323| 	return extraRoutes
- 324| }
- 325| 
- 326| // parse backend-weights annotation if it exists
- 327| func backendWeights(m *definitions.Metadata, logger *logger) map[string]float64 {
- 328| 	var backendWeights map[string]float64
- 329| 	if backends, ok := m.Annotations[backendWeightsAnnotationKey]; ok {
- 330| 		err := json.Unmarshal([]byte(backends), &backendWeights)
- 331| 		if err != nil {
- 332| 			logger.Errorf("Error while parsing backend-weights annotation: %v", err)
- 333| 		}
- 334| 	}
- 335| 	return backendWeights
- 336| }
- 337| 
- 338| // parse pathmode from annotation or fall back to global default
- 339| func pathMode(m *definitions.Metadata, globalDefault PathMode, logger *logger) PathMode {
- 340| 	pathMode := globalDefault
- 341| 
- 342| 	if pathModeString, ok := m.Annotations[pathModeAnnotationKey]; ok {
- 343| 		if p, err := ParsePathMode(pathModeString); err != nil {
- 344| 			logger.Errorf("Failed to get path mode: %v", err)
- 345| 		} else {
- 346| 			logger.Debugf("Set pathMode to %s", p)
- 347| 			pathMode = p
- 348| 		}
- 349| 	}
- 350| 	return pathMode
- 351| }
- 352| 
- 353| func (ing *ingress) addCatchAllRoutes(host string, r *eskip.Route, redirect *redirectInfo) []*eskip.Route {
- 354| 	catchAll := &eskip.Route{
- 355| 		Id:          routeID("", "catchall", host, "", ""),
- 356| 		HostRegexps: r.HostRegexps,
- 357| 		BackendType: eskip.ShuntBackend,
- 358| 	}
- 359| 	routes := []*eskip.Route{catchAll}
- 360| 	if ing.kubernetesEnableEastWest {
- 361| 		if ew := createEastWestRouteIng(ing.kubernetesEastWestDomain, r.Name, r.Namespace, catchAll); ew != nil {
- 362| 			routes = append(routes, ew)
- 363| 		}
- 364| 	}
- 365| 	if code, ok := redirect.setHostCode[host]; ok {
- 366| 		routes = append(routes, createIngressEnableHTTPSRedirect(catchAll, code))
- 367| 	}
- 368| 	if redirect.disableHost[host] {
- 369| 		routes = append(routes, createIngressDisableHTTPSRedirect(catchAll))
- 370| 	}
- 371| 
- 372| 	return routes
- 373| }
- 374| 
- 375| // hasCatchAllRoutes returns true if one of the routes in the list has a catchAll
- 376| // path expression.
- 377| //
- 378| // TODO: this should also consider path types exact and subtree
- 379| func hasCatchAllRoutes(routes []*eskip.Route) bool {
- 380| 	for _, route := range routes {
- 381| 		if len(route.PathRegexps) == 0 {
- 382| 			return true
- 383| 		}
- 384| 
- 385| 		for _, exp := range route.PathRegexps {
- 386| 			if exp == "^/" {
- 387| 				return true
- 388| 			}
- 389| 		}
- 390| 	}
- 391| 
- 392| 	return false
- 393| }
- 394| 
- 395| func (ing *ingress) applyBackend(i *definitions.IngressV1Item, r *eskip.Route) {
- 396| 	if ing.forwardBackendURL == "" || r == nil {
- 397| 		return
- 398| 	}
- 399| 	if be, err := annotationBackend(i.Metadata); err != nil {
- 400| 		return
- 401| 	} else {
- 402| 		switch be {
- 403| 		case eskip.ForwardBackend:
- 404| 			r.BackendType = eskip.NetworkBackend
- 405| 			r.Backend = ing.forwardBackendURL
- 406| 			r.Filters = []*eskip.Filter{}
- 407| 		}
- 408| 	}
- 409| }
- 410| 
- 411| // convert logs if an invalid found, but proceeds with the valid ones.
- 412| // Reporting failures in Ingress status is not possible, because
- 413| // Ingress status field only supports IP and Hostname as string.
- 414| func (ing *ingress) convert(state *clusterState, df defaultFilters, r *certregistry.CertRegistry, loggingEnabled bool) ([]*eskip.Route, error) {
- 415| 	var ewIngInfo map[string][]string // r.Id -> {namespace, name}
- 416| 	if ing.kubernetesEnableEastWest {
- 417| 		ewIngInfo = make(map[string][]string)
- 418| 	}
- 419| 	routes := make([]*eskip.Route, 0, len(state.ingressesV1))
- 420| 	hostRoutes := make(map[string][]*eskip.Route)
- 421| 	redirect := createRedirectInfo(ing.provideHTTPSRedirect, ing.httpsRedirectCode)
- 422| 	for _, i := range state.ingressesV1 {
- 423| 		r, err := ing.ingressV1Route(i, redirect, state, hostRoutes, df, r, loggingEnabled)
- 424| 		if err != nil {
- 425| 			return nil, err
- 426| 		}
- 427| 		if r != nil {
- 428| 			routes = append(routes, r)
- 429| 			if ing.kubernetesEnableEastWest {
- 430| 				ewIngInfo[r.Id] = []string{i.Metadata.Namespace, i.Metadata.Name}
- 431| 			}
- 432| 		}
- 433| 		ing.applyBackend(i, r)
- 434| 	}
- 435| 
- 436| 	for host, rs := range hostRoutes {
- 437| 		if len(rs) == 0 {
- 438| 			continue
- 439| 		}
- 440| 
- 441| 		applyEastWestRange(ing.eastWestRangeDomains, ing.eastWestRangePredicates, host, rs)
- 442| 		routes = append(routes, rs...)
- 443| 
- 444| 		if !ing.disableCatchAllRoutes {
- 445| 			// if routes were configured, but there is no catchall route
- 446| 			// defined for the host name, create a route which returns 404
- 447| 			if !hasCatchAllRoutes(rs) {
- 448| 				routes = append(routes, ing.addCatchAllRoutes(host, rs[0], redirect)...)
- 449| 			}
- 450| 		}
- 451| 	}
- 452| 
- 453| 	if ing.kubernetesEnableEastWest && len(routes) > 0 && len(ewIngInfo) > 0 {
- 454| 		ewroutes := make([]*eskip.Route, 0, len(routes))
- 455| 		for _, r := range routes {
- 456| 			if v, ok := ewIngInfo[r.Id]; ok {
- 457| 				ewroutes = append(ewroutes, createEastWestRouteIng(ing.kubernetesEastWestDomain, v[0], v[1], r))
- 458| 			}
- 459| 		}
- 460| 		l := len(routes)
- 461| 		routes = append(routes, ewroutes...)
- 462| 		log.Infof("Enabled east west routes: %d %d %d %d", l, len(routes), len(ewroutes), len(hostRoutes))
- 463| 	}
- 464| 
- 465| 	return routes, nil
- 466| }
- 467| 
- 468| func generateTLSCertFromSecret(secret *secret) (*tls.Certificate, error) {
- 469| 	if secret.Data[tlsSecretDataCrt] == "" || secret.Data[tlsSecretDataKey] == "" {
- 470| 		return nil, fmt.Errorf("secret must contain %s and %s in data field", tlsSecretDataCrt, tlsSecretDataKey)
- 471| 	}
- 472| 	crt, err := b64.StdEncoding.DecodeString(secret.Data[tlsSecretDataCrt])
- 473| 	if err != nil {
- 474| 		return nil, fmt.Errorf("failed to decode %s from secret %s", tlsSecretDataCrt, secret.Metadata.Name)
- 475| 	}
- 476| 	key, err := b64.StdEncoding.DecodeString(secret.Data[tlsSecretDataKey])
- 477| 	if err != nil {
- 478| 		return nil, fmt.Errorf("failed to decode %s from secret %s", tlsSecretDataKey, secret.Metadata.Name)
- 479| 	}
- 480| 	cert, err := tls.X509KeyPair([]byte(crt), []byte(key))
- 481| 	if err != nil {
- 482| 		return nil, fmt.Errorf("failed to create tls certificate from secret %s", secret.Metadata.Name)
- 483| 	}
- 484| 	if secret.Type != tlsSecretType {
- 485| 		return nil, fmt.Errorf("secret %s is not of type %s", secret.Metadata.Name, tlsSecretType)
- 486| 	}
- 487| 	return &cert, nil
- 488| }
- 489| 
- 490| 
-
-### id=7885 lang=javascript
+### id=7886 lang=javascript
 [CODE]
    1| 'use strict'
    2| 
@@ -570,303 +77,688 @@ batch=104 样本数=2
   71|     const retryDelay = opts.retryDelay || undefined
   72| 
   73|     if (!source) {
-  74|       source = req.url
-  75|     }
-  76| 
-  77|     // we leverage caching to avoid parsing the destination URL
-  78|     const dest = getUpstream(this.request, base)
-  79|     let url
-  80|     if (cache) {
-  81|       const cacheKey = dest + source
-  82|       url = cache.get(cacheKey) || buildURL(source, dest)
-  83|       cache.set(cacheKey, url)
-  84|     } else {
-  85|       url = buildURL(source, dest)
-  86|     }
-  87| 
-  88|     const sourceHttp2 = req.httpVersionMajor === 2
-  89|     const headers = sourceHttp2 ? filterPseudoHeaders(req.headers) : { ...req.headers }
-  90|     headers.host = url.host
-  91|     const qs = getQueryString(url.search, req.url, opts, this.request)
-  92|     let body = ''
-  93| 
-  94|     if (opts.body !== undefined) {
-  95|       if (opts.body !== null) {
-  96|         if (typeof opts.body.pipe === 'function') {
-  97|           throw new Error('sending a new body as a stream is not supported yet')
-  98|         }
-  99| 
- 100|         if (opts.contentType) {
- 101|           body = opts.body
- 102|         } else {
- 103|           body = JSON.stringify(opts.body)
- 104|           opts.contentType = 'application/json'
- 105|         }
- 106| 
- 107|         headers['content-length'] = Buffer.byteLength(body)
- 108|         headers['content-type'] = opts.contentType
- 109|       } else {
- 110|         body = undefined
- 111|         headers['content-length'] = 0
- 112|         delete headers['content-type']
- 113|       }
- 114|     } else if (this.request.body) {
- 115|       if (this.request.body instanceof Stream) {
- 116|         body = this.request.body
- 117|       } else {
- 118|         // Per RFC 7231 §3.1.1.5 if this header is not present we MAY assume application/octet-stream
- 119|         let contentType = 'application/octet-stream'
- 120|         if (req.headers['content-type']) {
- 121|           const plainContentType = fastContentTypeParse.parse(req.headers['content-type'])
- 122|           contentType = plainContentType.type
- 123|         }
- 124| 
- 125|         const shouldEncodeJSON = contentTypesToEncode.has(contentType)
- 126|         // transparently support JSON encoding
- 127|         body = shouldEncodeJSON ? JSON.stringify(this.request.body) : this.request.body
- 128|         // update origin request headers after encoding
- 129|         headers['content-length'] = Buffer.byteLength(body)
- 130|         headers['content-type'] = contentType
- 131|       }
- 132|     }
- 133| 
- 134|     // according to https://tools.ietf.org/html/rfc2616#section-4.3
- 135|     // fastify ignore message body when it's a GET or HEAD request
- 136|     // when proxy this request, we should reset the content-length to make it a valid http request
- 137|     // discussion: https://github.com/fastify/fastify/issues/953
- 138|     if (method === 'GET' || method === 'HEAD') {
- 139|       // body will be populated here only if opts.body is passed.
- 140|       // if we are doing that with a GET or HEAD request is a programmer error
- 141|       // and as such we can throw immediately.
- 142|       if (body) {
- 143|         throw new Error(`Rewriting the body when doing a ${method} is not allowed`)
- 144|       }
- 145|     }
- 146| 
- 147|     !disableRequestLogging && this.request.log.info({ source }, 'fetching from remote server')
+  74|       const requestUrl = req.url
+  75|       const queryIndex = requestUrl.indexOf('?')
+  76|       source = queryIndex >= 0 ? requestUrl.substring(0, queryIndex) : requestUrl
+  77|     }
+  78| 
+  79|     // we leverage caching to avoid parsing the destination URL
+  80|     const dest = getUpstream(this.request, base)
+  81|     let url
+  82|     if (cache) {
+  83|       const cacheKey = dest + source
+  84|       url = cache.get(cacheKey) || buildURL(source, dest)
+  85|       cache.set(cacheKey, url)
+  86|     } else {
+  87|       url = buildURL(source, dest)
+  88|     }
+  89| 
+  90|     const sourceHttp2 = req.httpVersionMajor === 2
+  91|     const headers = sourceHttp2 ? filterPseudoHeaders(req.headers) : { ...req.headers }
+  92|     headers.host = url.host
+  93|     const qs = getQueryString(url.search, req.url, opts, this.request)
+  94|     let body = ''
+  95| 
+  96|     if (opts.body !== undefined) {
+  97|       if (opts.body !== null) {
+  98|         if (typeof opts.body.pipe === 'function') {
+  99|           throw new Error('sending a new body as a stream is not supported yet')
+ 100|         }
+ 101| 
+ 102|         if (opts.contentType) {
+ 103|           body = opts.body
+ 104|         } else {
+ 105|           body = JSON.stringify(opts.body)
+ 106|           opts.contentType = 'application/json'
+ 107|         }
+ 108| 
+ 109|         headers['content-length'] = Buffer.byteLength(body)
+ 110|         headers['content-type'] = opts.contentType
+ 111|       } else {
+ 112|         body = undefined
+ 113|         headers['content-length'] = 0
+ 114|         delete headers['content-type']
+ 115|       }
+ 116|     } else if (this.request.body) {
+ 117|       if (this.request.body instanceof Stream) {
+ 118|         body = this.request.body
+ 119|       } else {
+ 120|         // Per RFC 7231 §3.1.1.5 if this header is not present we MAY assume application/octet-stream
+ 121|         let contentType = 'application/octet-stream'
+ 122|         if (req.headers['content-type']) {
+ 123|           const plainContentType = fastContentTypeParse.parse(req.headers['content-type'])
+ 124|           contentType = plainContentType.type
+ 125|         }
+ 126| 
+ 127|         const shouldEncodeJSON = contentTypesToEncode.has(contentType)
+ 128|         // transparently support JSON encoding
+ 129|         body = shouldEncodeJSON ? JSON.stringify(this.request.body) : this.request.body
+ 130|         // update origin request headers after encoding
+ 131|         headers['content-length'] = Buffer.byteLength(body)
+ 132|         headers['content-type'] = contentType
+ 133|       }
+ 134|     }
+ 135| 
+ 136|     // according to https://tools.ietf.org/html/rfc2616#section-4.3
+ 137|     // fastify ignore message body when it's a GET or HEAD request
+ 138|     // when proxy this request, we should reset the content-length to make it a valid http request
+ 139|     // discussion: https://github.com/fastify/fastify/issues/953
+ 140|     if (method === 'GET' || method === 'HEAD') {
+ 141|       // body will be populated here only if opts.body is passed.
+ 142|       // if we are doing that with a GET or HEAD request is a programmer error
+ 143|       // and as such we can throw immediately.
+ 144|       if (body) {
+ 145|         throw new Error(`Rewriting the body when doing a ${method} is not allowed`)
+ 146|       }
+ 147|     }
  148| 
- 149|     const requestHeaders = rewriteRequestHeaders(this.request, headers)
- 150|     const contentLength = requestHeaders['content-length']
- 151|     let requestImpl
- 152| 
- 153|     const getDefaultDelay = (req, res, err, retries) => {
- 154|       if (retryMethods.has(method) && !contentLength) {
- 155|         // Magic number, so why not 42? We might want to make this configurable.
- 156|         let retryAfter = 42 * Math.random() * (retries + 1)
- 157| 
- 158|         if (res?.headers['retry-after']) {
- 159|           retryAfter = res.headers['retry-after']
- 160|         }
- 161|         if (res && res.statusCode === 503 && req.method === 'GET') {
- 162|           if (retriesCount === 0 && retries < maxRetriesOn503) {
- 163|             return retryAfter
- 164|           }
- 165|         } else if (retriesCount > retries && err && err.code === retryOnError) {
- 166|           return retryAfter
- 167|         }
- 168|       }
- 169|       return null
- 170|     }
- 171| 
- 172|     if (retryDelay) {
- 173|       requestImpl = createRequestRetry(request, this, (req, res, err, retries) => retryDelay({ err, req, res, attempt: retries, getDefaultDelay, retriesCount }))
- 174|     } else {
- 175|       requestImpl = createRequestRetry(request, this, getDefaultDelay)
- 176|     }
- 177| 
- 178|     requestImpl({ method, url, qs, headers: requestHeaders, body, timeout }, (err, res) => {
- 179|       if (err) {
- 180|         this.request.log.warn(err, 'response errored')
- 181|         if (!this.sent) {
- 182|           if (err.code === 'ERR_HTTP2_STREAM_CANCEL' || err.code === 'ENOTFOUND') {
- 183|             onError(this, { error: ServiceUnavailableError() })
- 184|           } else if (err instanceof TimeoutError || err.code === 'UND_ERR_HEADERS_TIMEOUT') {
- 185|             onError(this, { error: new GatewayTimeoutError() })
- 186|           } else if (err.code === 'ECONNRESET') {
- 187|             onError(this, { error: new ConnectionResetError() })
- 188|           } else if (err.code === 'UND_ERR_SOCKET') {
- 189|             onError(this, { error: new UndiciSocketError() })
- 190|           } else if (err.code === 'UND_ERR_CONNECT_TIMEOUT') {
- 191|             onError(this, { error: new ConnectTimeoutError() })
- 192|           } else {
- 193|             onError(this, { error: new InternalServerError(err.message) })
- 194|           }
- 195|         }
- 196|         return
- 197|       }
- 198|       !disableRequestLogging && this.request.log.info('response received')
- 199|       if (sourceHttp2) {
- 200|         copyHeaders(
- 201|           rewriteHeaders(stripHttp1ConnectionHeaders(res.headers), this.request),
- 202|           this
- 203|         )
- 204|       } else {
- 205|         copyHeaders(rewriteHeaders(res.headers, this.request), this)
- 206|       }
- 207|       try {
- 208|         this.code(res.statusCode)
- 209|       } catch (err) {
- 210|         // Since we know `FST_ERR_BAD_STATUS_CODE` will be recieved
- 211|         onError(this, { error: new BadGatewayError() })
- 212|         this.request.log.warn(err, 'response has invalid status code')
- 213|       }
- 214|       if (this.request.raw.aborted && isHttp2) {
- 215|         // the request could have been canceled before we got a response from the target
- 216|         // forward this to the upstream server and close the stream to prevent leaks
- 217|         res.stream.close(NGHTTP2_CANCEL)
- 218|         // no need to send a reply for aborted requests or call the onResponse callback
- 219|         return
- 220|       }
- 221|       if (onResponse) {
- 222|         onResponse(this.request, this, res)
- 223|       } else {
- 224|         this.send(res.stream)
- 225|       }
- 226|     })
- 227|     return this
- 228|   })
- 229| 
- 230|   fastify.addHook('onReady', (done) => {
- 231|     if (isFastifyMultipartRegistered(fastify)) {
- 232|       fastify.log.warn('@fastify/reply-from might not behave as expected when used with @fastify/multipart')
- 233|     }
- 234|     done()
- 235|   })
- 236| 
- 237|   fastify.onClose((_fastify, next) => {
- 238|     close()
- 239|     // let the event loop do a full run so that it can
- 240|     // actually destroy those sockets
- 241|     setImmediate(next)
- 242|   })
- 243|   next()
- 244| }, {
- 245|   fastify: '5.x',
- 246|   name: '@fastify/reply-from'
- 247| })
- 248| 
- 249| function getQueryString (search, reqUrl, opts, request) {
- 250|   if (typeof opts.queryString === 'function') {
- 251|     return '?' + opts.queryString(search, reqUrl, request)
- 252|   }
- 253| 
- 254|   if (opts.queryString) {
- 255|     return '?' + querystring.stringify(opts.queryString)
- 256|   }
- 257| 
- 258|   if (search.length > 0) {
- 259|     return search
- 260|   }
- 261| 
- 262|   const queryIndex = reqUrl.indexOf('?')
+ 149|     !disableRequestLogging && this.request.log.info({ source }, 'fetching from remote server')
+ 150| 
+ 151|     const requestHeaders = rewriteRequestHeaders(this.request, headers)
+ 152|     const contentLength = requestHeaders['content-length']
+ 153|     let requestImpl
+ 154| 
+ 155|     const getDefaultDelay = (req, res, err, retries) => {
+ 156|       if (retryMethods.has(method) && !contentLength) {
+ 157|         // Magic number, so why not 42? We might want to make this configurable.
+ 158|         let retryAfter = 42 * Math.random() * (retries + 1)
+ 159| 
+ 160|         if (res?.headers['retry-after']) {
+ 161|           retryAfter = res.headers['retry-after']
+ 162|         }
+ 163|         if (res && res.statusCode === 503 && req.method === 'GET') {
+ 164|           if (retriesCount === 0 && retries < maxRetriesOn503) {
+ 165|             return retryAfter
+ 166|           }
+ 167|         } else if (retriesCount > retries && err && err.code === retryOnError) {
+ 168|           return retryAfter
+ 169|         }
+ 170|       }
+ 171|       return null
+ 172|     }
+ 173| 
+ 174|     if (retryDelay) {
+ 175|       requestImpl = createRequestRetry(request, this, (req, res, err, retries) => retryDelay({ err, req, res, attempt: retries, getDefaultDelay, retriesCount }))
+ 176|     } else {
+ 177|       requestImpl = createRequestRetry(request, this, getDefaultDelay)
+ 178|     }
+ 179| 
+ 180|     requestImpl({ method, url, qs, headers: requestHeaders, body, timeout }, (err, res) => {
+ 181|       if (err) {
+ 182|         this.request.log.warn(err, 'response errored')
+ 183|         if (!this.sent) {
+ 184|           if (err.code === 'ERR_HTTP2_STREAM_CANCEL' || err.code === 'ENOTFOUND') {
+ 185|             onError(this, { error: ServiceUnavailableError() })
+ 186|           } else if (err instanceof TimeoutError || err.code === 'UND_ERR_HEADERS_TIMEOUT') {
+ 187|             onError(this, { error: new GatewayTimeoutError() })
+ 188|           } else if (err.code === 'ECONNRESET') {
+ 189|             onError(this, { error: new ConnectionResetError() })
+ 190|           } else if (err.code === 'UND_ERR_SOCKET') {
+ 191|             onError(this, { error: new UndiciSocketError() })
+ 192|           } else if (err.code === 'UND_ERR_CONNECT_TIMEOUT') {
+ 193|             onError(this, { error: new ConnectTimeoutError() })
+ 194|           } else {
+ 195|             onError(this, { error: new InternalServerError(err.message) })
+ 196|           }
+ 197|         }
+ 198|         return
+ 199|       }
+ 200|       !disableRequestLogging && this.request.log.info('response received')
+ 201|       if (sourceHttp2) {
+ 202|         copyHeaders(
+ 203|           rewriteHeaders(stripHttp1ConnectionHeaders(res.headers), this.request),
+ 204|           this
+ 205|         )
+ 206|       } else {
+ 207|         copyHeaders(rewriteHeaders(res.headers, this.request), this)
+ 208|       }
+ 209|       try {
+ 210|         this.code(res.statusCode)
+ 211|       } catch (err) {
+ 212|         // Since we know `FST_ERR_BAD_STATUS_CODE` will be recieved
+ 213|         onError(this, { error: new BadGatewayError() })
+ 214|         this.request.log.warn(err, 'response has invalid status code')
+ 215|       }
+ 216|       if (this.request.raw.aborted && isHttp2) {
+ 217|         // the request could have been canceled before we got a response from the target
+ 218|         // forward this to the upstream server and close the stream to prevent leaks
+ 219|         res.stream.close(NGHTTP2_CANCEL)
+ 220|         // no need to send a reply for aborted requests or call the onResponse callback
+ 221|         return
+ 222|       }
+ 223|       if (onResponse) {
+ 224|         onResponse(this.request, this, res)
+ 225|       } else {
+ 226|         this.send(res.stream)
+ 227|       }
+ 228|     })
+ 229|     return this
+ 230|   })
+ 231| 
+ 232|   fastify.addHook('onReady', (done) => {
+ 233|     if (isFastifyMultipartRegistered(fastify)) {
+ 234|       fastify.log.warn('@fastify/reply-from might not behave as expected when used with @fastify/multipart')
+ 235|     }
+ 236|     done()
+ 237|   })
+ 238| 
+ 239|   fastify.onClose((_fastify, next) => {
+ 240|     close()
+ 241|     // let the event loop do a full run so that it can
+ 242|     // actually destroy those sockets
+ 243|     setImmediate(next)
+ 244|   })
+ 245|   next()
+ 246| }, {
+ 247|   fastify: '5.x',
+ 248|   name: '@fastify/reply-from'
+ 249| })
+ 250| 
+ 251| function getQueryString (search, reqUrl, opts, request) {
+ 252|   if (typeof opts.queryString === 'function') {
+ 253|     return '?' + opts.queryString(search, reqUrl, request)
+ 254|   }
+ 255| 
+ 256|   if (opts.queryString) {
+ 257|     return '?' + querystring.stringify(opts.queryString)
+ 258|   }
+ 259| 
+ 260|   if (search.length > 0) {
+ 261|     return search
+ 262|   }
  263| 
- 264|   if (queryIndex > 0) {
- 265|     return reqUrl.slice(queryIndex)
- 266|   }
- 267| 
- 268|   return ''
- 269| }
- 270| 
- 271| function headersNoOp (headers, _originalReq) {
- 272|   return headers
- 273| }
- 274| 
- 275| function requestHeadersNoOp (_originalReq, headers) {
- 276|   return headers
- 277| }
- 278| 
- 279| function upstreamNoOp (_req, base) {
- 280|   return base
- 281| }
- 282| 
- 283| function onErrorDefault (reply, { error }) {
- 284|   reply.send(error)
- 285| }
- 286| 
- 287| function isFastifyMultipartRegistered (fastify) {
- 288|   return fastify.hasPlugin('@fastify/multipart')
- 289| }
- 290| 
- 291| function createRequestRetry (requestImpl, reply, retryHandler) {
- 292|   function requestRetry (req, cb) {
- 293|     let retries = 0
- 294| 
- 295|     function run () {
- 296|       requestImpl(req, function (err, res) {
- 297|         const retryDelay = retryHandler(req, res, err, retries)
- 298|         if (!reply.sent && retryDelay) {
- 299|           return retry(retryDelay)
- 300|         }
- 301|         cb(err, res)
- 302|       })
- 303|     }
- 304| 
- 305|     function retry (after) {
- 306|       retries += 1
- 307|       setTimeout(run, after)
- 308|     }
- 309| 
- 310|     run()
- 311|   }
- 312| 
- 313|   return requestRetry
- 314| }
- 315| 
- 316| module.exports = fastifyReplyFrom
- 317| module.exports.default = fastifyReplyFrom
- 318| module.exports.fastifyReplyFrom = fastifyReplyFrom
- 319| 
+ 264|   const queryIndex = reqUrl.indexOf('?')
+ 265| 
+ 266|   if (queryIndex > 0) {
+ 267|     return reqUrl.slice(queryIndex)
+ 268|   }
+ 269| 
+ 270|   return ''
+ 271| }
+ 272| 
+ 273| function headersNoOp (headers, _originalReq) {
+ 274|   return headers
+ 275| }
+ 276| 
+ 277| function requestHeadersNoOp (_originalReq, headers) {
+ 278|   return headers
+ 279| }
+ 280| 
+ 281| function upstreamNoOp (_req, base) {
+ 282|   return base
+ 283| }
+ 284| 
+ 285| function onErrorDefault (reply, { error }) {
+ 286|   reply.send(error)
+ 287| }
+ 288| 
+ 289| function isFastifyMultipartRegistered (fastify) {
+ 290|   return fastify.hasPlugin('@fastify/multipart')
+ 291| }
+ 292| 
+ 293| function createRequestRetry (requestImpl, reply, retryHandler) {
+ 294|   function requestRetry (req, cb) {
+ 295|     let retries = 0
+ 296| 
+ 297|     function run () {
+ 298|       requestImpl(req, function (err, res) {
+ 299|         const retryDelay = retryHandler(req, res, err, retries)
+ 300|         if (!reply.sent && retryDelay) {
+ 301|           return retry(retryDelay)
+ 302|         }
+ 303|         cb(err, res)
+ 304|       })
+ 305|     }
+ 306| 
+ 307|     function retry (after) {
+ 308|       retries += 1
+ 309|       setTimeout(run, after)
+ 310|     }
+ 311| 
+ 312|     run()
+ 313|   }
+ 314| 
+ 315|   return requestRetry
+ 316| }
+ 317| 
+ 318| module.exports = fastifyReplyFrom
+ 319| module.exports.default = fastifyReplyFrom
+ 320| module.exports.fastifyReplyFrom = fastifyReplyFrom
+ 321| 
+ 322| 
+
+### id=7887 lang=go
+[CODE]
+   1| package downloader
+   2| 
+   3| import (
+   4| 	"context"
+   5| 	"fmt"
+   6| 	"io"
+   7| 	"mime"
+   8| 	"net"
+   9| 	"net/http"
+  10| 	"net/url"
+  11| 	"path/filepath"
+  12| 	"strings"
+  13| 	"sync"
+  14| 	"time"
+  15| 
+  16| 	"emperror.dev/errors"
+  17| 	"github.com/goccy/go-json"
+  18| 	"github.com/google/uuid"
+  19| 
+  20| 	"github.com/pterodactyl/wings/server"
+  21| )
+  22| 
+  23| var client = &http.Client{
+  24| 	Timeout: time.Hour * 12,
+  25| 	// Disallow any redirect on an HTTP call. This is a security requirement: do not modify
+  26| 	// this logic without first ensuring that the new target location IS NOT within the current
+  27| 	// instance's local network.
+  28| 	//
+  29| 	// This specific error response just causes the client to not follow the redirect and
+  30| 	// returns the actual redirect response to the caller. Not perfect, but simple and most
+  31| 	// people won't be using URLs that redirect anyways hopefully?
+  32| 	//
+  33| 	// We'll re-evaluate this down the road if needed.
+  34| 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+  35| 		return http.ErrUseLastResponse
+  36| 	},
+  37| }
+  38| 
+  39| var instance = &Downloader{
+  40| 	// Tracks all the active downloads.
+  41| 	downloadCache: make(map[string]*Download),
+  42| 	// Tracks all the downloads active for a given server instance. This is
+  43| 	// primarily used to make things quicker and keep the code a little more
+  44| 	// legible throughout here.
+  45| 	serverCache: make(map[string][]string),
+  46| }
+  47| 
+  48| // Internal IP ranges that should be blocked if the resource requested resolves within.
+  49| var internalRanges = []*net.IPNet{
+  50| 	mustParseCIDR("127.0.0.1/8"),
+  51| 	mustParseCIDR("10.0.0.0/8"),
+  52| 	mustParseCIDR("172.16.0.0/12"),
+  53| 	mustParseCIDR("192.168.0.0/16"),
+  54| 	mustParseCIDR("169.254.0.0/16"),
+  55| 	mustParseCIDR("::1/128"),
+  56| 	mustParseCIDR("fe80::/10"),
+  57| 	mustParseCIDR("fc00::/7"),
+  58| }
+  59| 
+  60| const (
+  61| 	ErrInternalResolution = errors.Sentinel("downloader: destination resolves to internal network location")
+  62| 	ErrInvalidIPAddress   = errors.Sentinel("downloader: invalid IP address")
+  63| 	ErrDownloadFailed     = errors.Sentinel("downloader: download request failed")
+  64| )
+  65| 
+  66| type Counter struct {
+  67| 	total   int
+  68| 	onWrite func(total int)
+  69| }
+  70| 
+  71| func (c *Counter) Write(p []byte) (int, error) {
+  72| 	n := len(p)
+  73| 	c.total += n
+  74| 	c.onWrite(c.total)
+  75| 	return n, nil
+  76| }
+  77| 
+  78| type DownloadRequest struct {
+  79| 	Directory string
+  80| 	URL       *url.URL
+  81| 	FileName  string
+  82| 	UseHeader bool
+  83| }
+  84| 
+  85| type Download struct {
+  86| 	Identifier string
+  87| 	path       string
+  88| 	mu         sync.RWMutex
+  89| 	req        DownloadRequest
+  90| 	server     *server.Server
+  91| 	progress   float64
+  92| 	cancelFunc *context.CancelFunc
+  93| }
+  94| 
+  95| // New starts a new tracked download which allows for cancellation later on by calling
+  96| // the Downloader.Cancel function.
+  97| func New(s *server.Server, r DownloadRequest) *Download {
+  98| 	dl := Download{
+  99| 		Identifier: uuid.Must(uuid.NewRandom()).String(),
+ 100| 		req:        r,
+ 101| 		server:     s,
+ 102| 	}
+ 103| 	instance.track(&dl)
+ 104| 	return &dl
+ 105| }
+ 106| 
+ 107| // ByServer returns all the tracked downloads for a given server instance.
+ 108| func ByServer(sid string) []*Download {
+ 109| 	instance.mu.Lock()
+ 110| 	defer instance.mu.Unlock()
+ 111| 	var downloads []*Download
+ 112| 	if v, ok := instance.serverCache[sid]; ok {
+ 113| 		for _, id := range v {
+ 114| 			if dl, ok := instance.downloadCache[id]; ok {
+ 115| 				downloads = append(downloads, dl)
+ 116| 			}
+ 117| 		}
+ 118| 	}
+ 119| 	return downloads
+ 120| }
+ 121| 
+ 122| // ByID returns a single Download matching a given identifier. If no download is found
+ 123| // the second argument in the response will be false.
+ 124| func ByID(dlid string) *Download {
+ 125| 	return instance.find(dlid)
+ 126| }
+ 127| 
+ 128| //goland:noinspection GoVetCopyLock
+ 129| func (dl Download) MarshalJSON() ([]byte, error) {
+ 130| 	return json.Marshal(struct {
+ 131| 		Identifier string
+ 132| 		Progress   float64
+ 133| 	}{
+ 134| 		Identifier: dl.Identifier,
+ 135| 		Progress:   dl.Progress(),
+ 136| 	})
+ 137| }
+ 138| 
+ 139| // Execute executes a given download for the server and begins writing the file to the disk. Once
+ 140| // completed the download will be removed from the cache.
+ 141| func (dl *Download) Execute() error {
+ 142| 	ctx, cancel := context.WithTimeout(context.Background(), time.Hour*12)
+ 143| 	dl.cancelFunc = &cancel
+ 144| 	defer dl.Cancel()
+ 145| 
+ 146| 	// Always ensure that we're checking the destination for the download to avoid a malicious
+ 147| 	// user from accessing internal network resources.
+ 148| 	if err := dl.isExternalNetwork(ctx); err != nil {
+ 149| 		return err
+ 150| 	}
+ 151| 
+ 152| 	// At this point we have verified the destination is not within the local network, so we can
+ 153| 	// now make a request to that URL and pull down the file, saving it to the server's data
+ 154| 	// directory.
+ 155| 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dl.req.URL.String(), nil)
+ 156| 	if err != nil {
+ 157| 		return errors.WrapIf(err, "downloader: failed to create request")
+ 158| 	}
+ 159| 
+ 160| 	req.Header.Set("User-Agent", "Pterodactyl Panel (https://pterodactyl.io)")
+ 161| 	res, err := client.Do(req)
+ 162| 	if err != nil {
+ 163| 		return ErrDownloadFailed
+ 164| 	}
+ 165| 	defer res.Body.Close()
+ 166| 	if res.StatusCode != http.StatusOK {
+ 167| 		return errors.New("downloader: got bad response status from endpoint: " + res.Status)
+ 168| 	}
+ 169| 
+ 170| 	if res.ContentLength < 1 {
+ 171| 		return errors.New("downloader: request is missing ContentLength")
+ 172| 	}
+ 173| 
+ 174| 	if dl.req.UseHeader {
+ 175| 		if contentDisposition := res.Header.Get("Content-Disposition"); contentDisposition != "" {
+ 176| 			_, params, err := mime.ParseMediaType(contentDisposition)
+ 177| 			if err != nil {
+ 178| 				return errors.WrapIf(err, "downloader: invalid \"Content-Disposition\" header")
+ 179| 			}
+ 180| 
+ 181| 			if v, ok := params["filename"]; ok {
+ 182| 				dl.path = v
+ 183| 			}
+ 184| 		}
+ 185| 	}
+ 186| 	if dl.path == "" {
+ 187| 		if dl.req.FileName != "" {
+ 188| 			dl.path = dl.req.FileName
+ 189| 		} else {
+ 190| 			parts := strings.Split(dl.req.URL.Path, "/")
+ 191| 			dl.path = parts[len(parts)-1]
+ 192| 		}
+ 193| 	}
+ 194| 
+ 195| 	p := dl.Path()
+ 196| 	dl.server.Log().WithField("path", p).Debug("writing remote file to disk")
+ 197| 
+ 198| 	// Write the file while tracking the progress, Write will check that the
+ 199| 	// size of the file won't exceed the disk limit.
+ 200| 	r := io.TeeReader(res.Body, dl.counter(res.ContentLength))
+ 201| 	if err := dl.server.Filesystem().Write(p, r, res.ContentLength, 0o644); err != nil {
+ 202| 		return errors.WrapIf(err, "downloader: failed to write file to server directory")
+ 203| 	}
+ 204| 	return nil
+ 205| }
+ 206| 
+ 207| // Cancel cancels a running download and frees up the associated resources. If a file is being
+ 208| // written a partial file will remain present on the disk.
+ 209| func (dl *Download) Cancel() {
+ 210| 	if dl.cancelFunc != nil {
+ 211| 		(*dl.cancelFunc)()
+ 212| 	}
+ 213| 	instance.remove(dl.Identifier)
+ 214| }
+ 215| 
+ 216| // BelongsTo checks if the given download belongs to the provided server.
+ 217| func (dl *Download) BelongsTo(s *server.Server) bool {
+ 218| 	return dl.server.ID() == s.ID()
+ 219| }
+ 220| 
+ 221| // Progress returns the current progress of the download as a float value between 0 and 1 where
+ 222| // 1 indicates that the download is completed.
+ 223| func (dl *Download) Progress() float64 {
+ 224| 	dl.mu.RLock()
+ 225| 	defer dl.mu.RUnlock()
+ 226| 	return dl.progress
+ 227| }
+ 228| 
+ 229| func (dl *Download) Path() string {
+ 230| 	return filepath.Join(dl.req.Directory, dl.path)
+ 231| }
+ 232| 
+ 233| // Handles a write event by updating the progress completed percentage and firing off
+ 234| // events to the server websocket as needed.
+ 235| func (dl *Download) counter(contentLength int64) *Counter {
+ 236| 	onWrite := func(t int) {
+ 237| 		dl.mu.Lock()
+ 238| 		defer dl.mu.Unlock()
+ 239| 		dl.progress = float64(t) / float64(contentLength)
+ 240| 	}
+ 241| 	return &Counter{
+ 242| 		onWrite: onWrite,
+ 243| 	}
+ 244| }
+ 245| 
+ 246| // Verifies that a given download resolves to a location not within the current local
+ 247| // network for the machine. If the final destination of a resource is within the local
+ 248| // network an ErrInternalResolution error is returned.
+ 249| func (dl *Download) isExternalNetwork(ctx context.Context) error {
+ 250| 	dialer := &net.Dialer{
+ 251| 		LocalAddr: nil,
+ 252| 	}
+ 253| 
+ 254| 	host := dl.req.URL.Host
+ 255| 
+ 256| 	// This cluster-fuck of math and integer shit converts an integer IP into a proper IPv4.
+ 257| 	// For example: 16843009 would become 1.1.1.1
+ 258| 	//if i, err := strconv.ParseInt(host, 10, 64); err == nil {
+ 259| 	//	host = strconv.FormatInt((i>>24)&0xFF, 10) + "." + strconv.FormatInt((i>>16)&0xFF, 10) + "." + strconv.FormatInt((i>>8)&0xFF, 10) + "." + strconv.FormatInt(i&0xFF, 10)
+ 260| 	//}
+ 261| 
+ 262| 	if _, _, err := net.SplitHostPort(host); err != nil {
+ 263| 		if !strings.Contains(err.Error(), "missing port in address") {
+ 264| 			return errors.WithStack(err)
+ 265| 		}
+ 266| 		switch dl.req.URL.Scheme {
+ 267| 		case "http":
+ 268| 			host += ":80"
+ 269| 		case "https":
+ 270| 			host += ":443"
+ 271| 		}
+ 272| 	}
+ 273| 
+ 274| 	c, err := dialer.DialContext(ctx, "tcp", host)
+ 275| 	if err != nil {
+ 276| 		return errors.WithStack(err)
+ 277| 	}
+ 278| 	_ = c.Close()
+ 279| 
+ 280| 	ipStr, _, err := net.SplitHostPort(c.RemoteAddr().String())
+ 281| 	if err != nil {
+ 282| 		return errors.WithStack(err)
+ 283| 	}
+ 284| 	ip := net.ParseIP(ipStr)
+ 285| 	if ip == nil {
+ 286| 		return errors.WithStack(ErrInvalidIPAddress)
+ 287| 	}
+ 288| 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() {
+ 289| 		return errors.WithStack(ErrInternalResolution)
+ 290| 	}
+ 291| 	for _, block := range internalRanges {
+ 292| 		if block.Contains(ip) {
+ 293| 			return errors.WithStack(ErrInternalResolution)
+ 294| 		}
+ 295| 	}
+ 296| 	return nil
+ 297| }
+ 298| 
+ 299| // Downloader represents a global downloader that keeps track of all currently processing downloads
+ 300| // for the machine.
+ 301| type Downloader struct {
+ 302| 	mu            sync.RWMutex
+ 303| 	downloadCache map[string]*Download
+ 304| 	serverCache   map[string][]string
+ 305| }
+ 306| 
+ 307| // track tracks a download in the internal cache for this instance.
+ 308| func (d *Downloader) track(dl *Download) {
+ 309| 	d.mu.Lock()
+ 310| 	defer d.mu.Unlock()
+ 311| 	sid := dl.server.ID()
+ 312| 	if _, ok := d.downloadCache[dl.Identifier]; !ok {
+ 313| 		d.downloadCache[dl.Identifier] = dl
+ 314| 		if _, ok := d.serverCache[sid]; !ok {
+ 315| 			d.serverCache[sid] = []string{}
+ 316| 		}
+ 317| 		d.serverCache[sid] = append(d.serverCache[sid], dl.Identifier)
+ 318| 	}
+ 319| }
  320| 
+ 321| // find finds a given download entry using the provided ID and returns it.
+ 322| func (d *Downloader) find(dlid string) *Download {
+ 323| 	d.mu.RLock()
+ 324| 	defer d.mu.RUnlock()
+ 325| 	if entry, ok := d.downloadCache[dlid]; ok {
+ 326| 		return entry
+ 327| 	}
+ 328| 	return nil
+ 329| }
+ 330| 
+ 331| // remove removes the given download reference from the cache storing them. This also updates
+ 332| // the slice of active downloads for a given server to not include this download.
+ 333| func (d *Downloader) remove(dlID string) {
+ 334| 	d.mu.Lock()
+ 335| 	defer d.mu.Unlock()
+ 336| 	if _, ok := d.downloadCache[dlID]; !ok {
+ 337| 		return
+ 338| 	}
+ 339| 	sID := d.downloadCache[dlID].server.ID()
+ 340| 	delete(d.downloadCache, dlID)
+ 341| 	if tracked, ok := d.serverCache[sID]; ok {
+ 342| 		var out []string
+ 343| 		for _, k := range tracked {
+ 344| 			if k != dlID {
+ 345| 				out = append(out, k)
+ 346| 			}
+ 347| 		}
+ 348| 		d.serverCache[sID] = out
+ 349| 	}
+ 350| }
+ 351| 
+ 352| func mustParseCIDR(ip string) *net.IPNet {
+ 353| 	_, block, err := net.ParseCIDR(ip)
+ 354| 	if err != nil {
+ 355| 		panic(fmt.Errorf("downloader: failed to parse CIDR: %s", err))
+ 356| 	}
+ 357| 	return block
+ 358| }
+ 359| 
+ 360| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=7884 teacher=unknown flags=[]
+### id=7886 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（逐函数、行号锚定）
+
+**1. 插件初始化与配置面（第 17–52 行）**
+- 第 18–21 行：`contentTypesToEncode`、`retryMethods` 均来自 `opts`（服务端开发者传入的插件注册参数），非外部用户输入，不构成攻击面。
+- 第 23–24 行：`cache = new LruMap(opts.cacheURLs || 100)`，仅缓存 URL 对象，容量受控。
+- 第 25–33 行：`buildRequest` 的全部参数（http/http2/base/sessionTimeout/undici 等）均来自启动时配置，属于可信输入；第 35–37 行对构建失败做了错误短路。
+
+**2. 核心入口 `fastify.decorateReply('from', ...)`（第 41–190 行）**
+- 入口点枚举：
+  - (a) 第 44 行 `req = this.request.raw`：原始请求（headers、url、method、httpVersion）——**这是唯一的外部用户可控 source**。
+  - (b) 第 45–53 行：`opts.method/timeout/onResponse/rewriteHeaders/rewriteRequestHeaders/getUpstream/onError/retriesCount/retryDelay` 全部由应用代码在调用 `reply.from()` 时写死，属第二入口但为开发者信任边界内。
+  - (c) 第 56–59 行：当未传 `source` 时，从 `req.url` 截取路径部分（去掉 query）作为转发路径——用户可控。
+  - (d) 第 62 行 `getUpstream(this.request, base)`：默认 `upstreamNoOp` 返回配置中的 `base`（第 232 行），上游主机不可被用户注入。
+
+**3. source→sink 数据流逐一验证**
+
+- **流 A：`req.url` → `source` → `buildURL(source, dest)` → 上游请求 url（第 56–70 行）**
+  用户可控的 `req.url` 路径被拼入上游 URL。防御有效性检查：`buildURL` 来自 `./lib/utils`（本文件外），其语义是基于 `new URL(source, dest)` 解析——相对路径无法逃逸 host（`new URL('//evil.com/x', 'http://base')` 会换 host，但这要求 source 以 `//` 开头；而 Fastify 路由层收到的 `req.url` 以 `/path` 形式存在且路由匹配已约束前缀；此外若开发者显式传 source 也是自己控制）。在本文件范围内没有把原始 query/fragment 直接拼进 sink 的字符串拼接；query 由第 71 行 `getQueryString` 单独处理并交给请求库编码。无有效绕过证据。
+
+- **流 B：缓存键混淆（第 63–68 行）**
+  `cacheKey = dest + source` 为纯字符串拼接。理论上 `(dest='http://a/b', source='/c')` 与 `(dest='http://a/', source='b/c')` 键不同但 URL 相同——这只是冗余缓存项，不会导致取错对象后发往错误主机，因为取出的仍是 `buildURL` 的正确产物。反向冲突（不同 URL 得到相同 key 并复用错误 url 对象）需要 `dest+source` 完全相等而解析结果不同，而 `dest` 与 `source` 在同一部署中分别由固定配置和固定路由决定，本文件内无可达的攻击者控制点使两个不同 (dest, source) 组合产生相同键。故判为理论瑕疵而非可利用漏洞。
+
+- **流 C：headers 复制（第 72–74 行）**
+  HTTP/2 下经 `filterPseudoHeaders` 剥离伪头（防 connection 头走私），HTTP/1.1 下浅拷贝；随后第 75 行强制覆写 `headers.host = url.host`，防止 host 头注入指向任意上游。`rewriteRequestHeaders` 钩子为开发者回调，非用户输入 sink。
+
+- **流 D：body 处理（第 78–113 行）**
+  - 第 79–92 行：`opts.body` 为开发者传入；禁止 stream（第 83–85 行）；content-length 用 `Buffer.byteLength` 重算，避免长度不一致导致的请求走私。
+  - 第 93–112 行：透传客户端 body 时，用 `fast-content-type-parse` 严格解析 content-type（第 99–102 行），仅在命中白名单 `contentTypesToEncode` 时 JSON 序列化，否则原样透传；content-length 重算（第 108 行）。GET/HEAD 带 body 直接抛错（第 115–124 行）。无 header 注入或长度欺骗通道。
+
+- **流 E：getQueryString（第 200–216 行）**
+  三个分支：开发者函数/对象、上游返回的 `url.search`（由 URL 解析器规范化）、或从 `reqUrl` 截取 `?` 之后原样回传。原样回传的 query 最终作为 `request({ qs })` 交给 request 库拼接，未发现与 CRLF 注入相关的直接字符串拼接头部的路径（头均已对象化）。黑名单类过滤不存在，无需按可绕过处理。
+
+- **流 F：响应侧（第 160–188 行）**
+  - `copyHeaders(rewriteHeaders(...))`：HTTP/2 下先 `stripHttp1ConnectionHeaders` 剥离 hop-by-hop 头（防响应走私）；HTTP/1.1 下依赖 rewriteHeaders 默认透传——上游是可信 base 指向的服务，风险归属部署方而非本库缺陷。
+  - 第 183–186 行：状态码非法走 `BadGatewayError`；第 187–193 行处理 aborted http2 流关闭；第 195–198 行 `this.send(res.stream)` 直接管道上游响应体，Fastify reply 层负责序列化，无二次注入点。
+
+- **流 G：重试逻辑 createRequestRetry（第 224–245 行）**
+  `retryDelay` 回调（第 141–143 行包装）若开发者返回用户可控值会进入 `setTimeout`——但该回调完全是开发者代码，本文件默认实现 `getDefaultDelay`（第 128–148 行）只用数字与上游 `retry-after` 头。上游 retry-after 可信度问题属于对上游的信任假设，且仅影响延迟时长，不构成安全 sink。
+
+- **流 H：生命周期钩子（第 193–203 行）**
+  onReady 仅告警 multipart 兼容性；onClose 关闭连接池。无外部输入。
+
+**替代通道核查**：文件无文件系统读取、无环境变量读取、无子进程、无 eval/Function 构造；唯一的网络 sink 是 `requestImpl`（内部 lib/request），其所有参数（method/url/qs/headers/body）在上文各流中均已被规范化或来源可信。第二入口（opts 各回调）均在开发者信任边界内。
+
+**结论**：全文通读后，所有用户可控 source（`req.url`、headers、body、content-type）到达网络 sink 前都经过 buildURL 解析、host 强制覆写、content-length 重算、hop-by-hop 头剥离等结构性防御，且这些防御不是黑名单/正则型，未见可利用绕过路径。缓存键拼接为理论性弱点，本文件内无可达攻击路径。判定：无可利用漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认：唯一外部可控 source 是 req.url、请求头与 body（第 42-124 行），它们到达网络请求 sink（requestImpl，第 158 行调用）之前均经过结构性防御：buildURL 基于 URL 解析防止路径逃逸（第 62-70 行）、headers.host 被强制覆写为 url.host 防止 host 注入（第 75 行）、content-length 用 Buffer.byteLength 重算防止长度走私（第 91、108 行）、HTTP/2 下 filterPseudoHeaders 与响应侧 stripHttp1ConnectionHeaders 剥离 hop-by-hop 头（第 72、166 行）。getQueryString（第 200-216 行）与重试逻辑（第 224-245 行）不含可利用注入点。缓存键 dest+source 字符串拼接（第 64 行）为理论性瑕疵，但在本文件内 dest 来自配置、source 受路由约束，不存在可达的键冲突攻击路径。opts 相关回调均处于开发者信任边界，非漏洞。", "fix_suggestion": "no fix needed"}
+
+### id=7887 teacher=unknown flags=[]
 [ANALYSIS]
 ## 编号分析
 
-1. **入口点枚举（全文）**：本文件无 HTTP 路由/环境变量等直接入口，所有数据来源均为 Kubernetes API 对象字段：Ingress 的 metadata.annotations（第 226-268 行 annotationFilter/annotationBackend/annotationPredicate/extraRoutes/backendWeights/pathMode）、Ingress spec 的 ruleHost 与 path（addExtraRoutes，第 155-186 行）、Service 的 Spec.ExternalName 与 TargetPort（externalNameRoute，第 116-141 行）、Secret 的 Data（generateTLSCertFromSecret，第 342-367 行）。
+1. **入口点枚举（全文）**：
+   - `New()`（第 84 行）：接收外部传入的 `DownloadRequest{Directory, URL, FileName, UseHeader}`，URL 与文件名均为用户可控 source。
+   - `Execute()`（第 110 行）：消费 URL、`Content-Disposition` 的 filename（第 143–152 行）、URL path 末段（第 158 行），最终写入 `dl.server.Filesystem().Write(p, ...)`（第 172 行）——sink。
+   - `isExternalNetwork()`（第 205 行）：SSRF 防御点。
+   - `ByID/ByServer/remove`：仅内存缓存操作，无外部输入 sink。
 
-2. **annotationFilter / extraRoutes 数据流**：注解值被直接送入 `eskip.ParseFilters` / `eskip.Parse`（第 238、259 行），最终成为路由过滤器与谓词。这是 Skipper 的设计功能：能写 Ingress 注解的主体本身就拥有集群内定义流量规则的权限，属于受信任配置面而非外部输入，不构成注入漏洞边界。
+2. **数据流一：SSRF 防御（CWE-918）**。source 为 `dl.req.URL.Host`（第 214 行）。防御方式是先用裸 `dialer.DialContext` 建立一次 TCP 连接检查解析出的 IP 是否为内网（第 233–252 行）。但关键缺陷：这只是**探测性连接**，随后真正下载用的是另一个 HTTP 客户端重新发起请求（第 128 行 `client.Do(req)`），会**再次独立做 DNS 解析**。两次解析之间存在经典 **DNS rebinding / TOCTOU** 缺口：第一次解析返回公网 IP 通过校验，第二次解析返回 `169.254.169.254` 或 `127.0.0.1` 等内网地址，请求即打到内部网络（云元数据服务等）。黑名单式 CIDR 列表本身也不完整（如未覆盖 `100.64.0.0/10`、`0.0.0.0`、IPv4-mapped IPv6 等）。注释虽禁止重定向跟随（第 33–38 行）堵住了重定向绕过，但 rebinding 通道仍然有效。**防御无效**。
 
-3. **externalNameRoute**：`svc.Spec.ExternalName` 被拼进后端 URL（第 124 行）和 `setRequestHeader("Host", ...)` 过滤器字符串（第 127 行）。防御为 `isExternalDomainAllowed(allowedNames, ...)` 白名单（第 118 行），是正则白名单而非黑名单；但若运维未配置 allowedExternalNames 且 enableExternalNames 开启，则可能放行任意域名——这属于可选功能的部署配置问题，且需要创建/修改 Service 的 RBAC 权限，非代码层可绕过缺陷。理论上 ExternalName 含双引号可破坏过滤器语法，但需同时拥有 Service 写权限并绕过白名单，实际不可达。
+3. **数据流二：路径穿越（CWE-22）**。source 为响应头 `Content-Disposition` 的 filename（第 150 行）或用户提供的 `FileName`/URL 末段；sink 为 `Path()`（第 184 行 `filepath.Join(dl.req.Directory, dl.path)`）→ 第 172 行 `Filesystem().Write(p,...)`。若 filename 含 `../../etc/x`，`filepath.Join` 会保留 `..`。本文件内无任何清洗；是否可利用取决于 `server.Filesystem().Write` 是否在包外做了路径规范化校验（Pterodactyl wings 的 Filesystem 通常有 `SafePath` 防护，但该防护不在本文件证据范围内，且历史上此处曾确认存在依赖问题）。基于本文件可见证据，filename 未被净化直接拼入路径。
 
-4. **routeID**：nonWord 正则将 `\W` 替换为 `_`（第 84-90 行），仅用于生成 ID，无 sink 风险。
+4. **次要问题**：`res.ContentLength < 1` 检查后仍以声明长度写入（第 165 行），有磁盘限额由 Write 层控制，风险低。`Progress` 有锁保护，无并发问题。
 
-5. **applyBackend / addCatchAllRoutes / convert**：backend 来自固定 forwardBackendURL 配置；hostRoutes 按 host 聚合并补 catchall，逻辑一致，无未验证拼接。
-
-6. **generateTLSCertFromSecret**：base64 解码 + X509KeyPair 校验，失败即返回错误，证书内容经 crypto/tls 解析验证，无路径遍历或反序列化风险。
-
-7. **第二入口检查**：east-west 域名路由（createEastWestRouteIng）复用同一 namespace/name/host 数据，无新增不可信源。
-
-结论：所有 source→sink 流的输入均来自具备 K8s 资源写权限的主体，解析失败均有错误处理，无可被低权限输入触达的危险 sink。
+5. **结论**：最确凿的漏洞是 SSRF 的 DNS-rebinding TOCTOU（第 214→233→128 行数据流），防御措施（第 205–255 行）对真实请求不生效。
 [JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文所有数据源均为 Kubernetes API 对象字段（Ingress 注解、Service ExternalName、Secret 数据），写入这些字段的主体已具备相应 RBAC 权限，属受信任配置面。注解中的 eskip 片段被解析为路由是该项目的既定功能而非注入点；externalNameRoute 有正则白名单校验且需 Service 写权限；TLS secret 经 X509KeyPair 严格校验；routeID 对特殊字符做了替换。未发现可由低权限输入触达危险 sink 的数据流。唯一需注意的是若启用 EnableExternalNames 但未配置 AllowedExternalNames，白名单为空时的放行行为依赖部署配置，建议运维显式配置。", "fix_suggestion": "no fix needed"}
-
-### id=7885 teacher=unknown flags=[]
-[ANALYSIS]
-## 编号分析
-
-1. **第 30-90 行 插件初始化**：opts 全部来自开发者配置（base、undici、cacheURLs 等），非用户输入，无直接风险。`LruMap` 缓存启用与否取决于 `disableCache`。
-
-2. **第 92 行 `fastify.decorateReply('from', ...)`**：核心入口。`reply.from(source)` 是开发者调用的 API，但默认路径引入用户输入。
-
-3. **第 103-105 行 source 默认值**：`if (!source) { source = req.url }` —— 当开发者未显式传 source 时，**source 直接取自客户端请求行 `req.url`**，这是完全攻击者可控的 source。
-
-4. **第 108-113 行 buildURL 与缓存**：
-   - `const cacheKey = dest + source`，字符串拼接无分隔符。若 `getUpstream` 返回动态 upstream（多租户场景），存在键碰撞：`dest='http://a/'` + `source='x'` 与 `dest='http://a'` + `source='/x'` 产生相同 key 但不同 URL 对象，缓存对象被跨配置复用 → 缓存投毒/CWE-444。
-   - `buildURL(source, dest)` 未对 source 做路径规范化或白名单校验，`/../`、`//evil.com`、绝对 URI 形式的 source 可改变上游请求目标语义 → 指向任意上游路径甚至其他主机（视 buildURL 实现），构成受限 SSRF（CWE-918）。
-
-5. **第 116-117 行 headers**：`filterPseudoHeaders` 过滤 h2 伪头；随后 `headers.host = url.host` 强制覆盖 host，防止了 Host 头注入，此防御有效。
-
-6. **第 118 行 getQueryString（第 253-270 行）**：`reqUrl.indexOf('?')` 后原样切片转发查询串，未编码校验；但查询串注入影响有限（仍是同一上游），属低危参数污染通道（第二入口）。
-
-7. **第 121-155 行 body 处理**：`opts.body` 为开发者传入；`this.request.body` 来自 Fastify body 解析器，经 `contentTypesToEncode` 判断后 JSON 序列化或透传，content-length 用 `Buffer.byteLength` 重算——无注入 sink。GET/HEAD 带 body 抛错（第 165-172 行），防御有效。
-
-8. **第 175-215 行重试逻辑与响应回调**：错误分类映射到固定错误码；`onError`/`onResponse`/`rewriteHeaders` 均为开发者回调，非用户可控。`copyHeaders` 转发上游头，若上游不可信则存在头注入面，但那是上游信任问题。
-
-9. **第 217-247 行 onClose/onReady 及辅助函数**：无用户输入汇入敏感操作。
-
-**结论**：主要漏洞是第 104 行 `source = req.url` 将原始客户端 URL 未经规范化/校验直接拼入上游请求 URL（第 109 行 buildURL、第 213 行 requestImpl 的 url 参数），可被用于路径穿越式 SSRF/访问上游内部端点；次要是第 110 行缓存键拼接歧义导致的潜在缓存投毒。
-[JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF) (缓存键歧义)", "risk_level": "Medium", "source": "line 104: source = req.url（客户端完全可控的原始请求 URL）", "sink": "line 109 与 line 213: buildURL(source, dest) 结果作为 requestImpl 的 url 发往上游", "explanation": "当开发者调用 reply.from() 不传 source 时，客户端请求行中的原始 URL 被直接用作上游路径，未做路径规范化、编码校验或前缀白名单；攻击者可用 ../ 或绝对 URI 形式改写最终请求目标，访问上游服务上本不应暴露的内部端点，形成受限 SSRF。另外 line 83:的 cacheKey 由 dest 与 source 直接字符串拼接且无分隔符，在动态 upstream 场景下可构造键碰撞导致缓存对象跨配置复用（缓存投毒）。headers.host 被 line 90:强制覆盖，Host 注入已被有效防御；查询串透传（line 118、263-266）仅造成参数污染，风险较低。", "fix_suggestion": "对 source 先 decodeURI 并 path.normalize 后强制限定在上游允许的前缀内（拒绝包含 ../、反斜杠及绝对 URI 的输入）；缓存键改为使用带分隔符的结构化拼接如 dest + '|' + source，或直接以解析后的完整 URL 字符串作键。"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF) (SSRF via DNS rebinding TOCTOU)", "risk_level": "High", "source": "260: host := dl.req.URL.Host 用户可控的下载 URL", "sink": "167: client.Do(req) 使用重新进行的 DNS 解析发起真实下载请求", "explanation": "isExternalNetwork 在 280:用 dialer.DialContext 做一次探测性连接并校验 IP 不在内网段 -> 但随后 Execute 在 line 175:通过 http.Client 重新发起请求, 该请求会独立进行第二次 DNS 解析 -> 攻击者用 DNS rebinding 使第一次解析返回公网 IP 通过校验, 第二次解析返回 127.0.0.1 或 169.254.169.254 等内网地址, 即可访问宿主机本地网络及云元数据服务 -> 另外基于黑名单的 internalRanges 不完整(缺少 100.64.0.0/10, 0.0.0.0 等), 且 Content-Disposition filename(line 150)未经净化经 filepath.Join(line 184)拼入写入路径, 存在潜在路径穿越", "fix_suggestion": "line 128: 不要使用默认 transport 二次解析, 应自定义 DialContext 复用已验证的解析结果, 或使用自定义 net.Dialer 在每次实际建连时同步校验目标 IP 是否属于内网段后再放行连接, 并将 Control 函数用于校验; 同时对 filename 做 filepath.Base 及拒绝包含 .. 或路径分隔符的值"}

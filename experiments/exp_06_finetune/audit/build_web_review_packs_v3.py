@@ -114,6 +114,9 @@ def main():
             next_num = max(next_num, int(mm.group(1)) + 1)
 
     all_batches = []   # (job_name, [ids])
+    emitted = set()
+    for m in manifest:
+        emitted |= set(m.get("ids", []))
     for job in jobs:
         name = job["name"]
         budget = job.get("budget", args.budget)
@@ -127,6 +130,9 @@ def main():
             groups = []
             for r in clusters:
                 mem = [m2["id"] if isinstance(m2, dict) else int(m2) for m2 in r["members"]]
+                mem = [x for x in mem if x not in emitted]
+                if len(mem) < 2:
+                    continue
                 if set(mem) & exclude or set(mem) & wave_a:
                     continue
                 if all(id2line.get(x) for x in mem):
@@ -134,7 +140,7 @@ def main():
             for g in groups:
                 all_batches.append((name, g))
         else:
-            ids = job["ids"]
+            ids = [x for x in job["ids"] if x not in emitted]
             for k in range(0, len(ids), per):
                 all_batches.append((name, ids[k:k + per]))
 
@@ -144,14 +150,20 @@ def main():
         if args.limit_packs and n_out >= args.limit_packs:
             print(f"已到 --limit-packs {args.limit_packs},剩余 {len(all_batches) - n_out} 批未生成")
             break
+        grp = [x for x in grp if x not in emitted]
+        if not grp:
+            continue
         rendered, tok, ids_ok = [], 0, []
         for wid in grp:
+            if wid in emitted:
+                continue
             s = render(wid)
-            if s is None:
+            if s is None or wid in emitted:
                 continue
             rendered.append(s)
             tok += s["tokens"]
             ids_ok.append(wid)
+            emitted.add(wid)
         if not rendered:
             continue
         while True:
@@ -167,6 +179,7 @@ def main():
         p.write_text(text, encoding="utf-8")
         manifest.append({"packet": p.name, "batch": next_num, "ids": ids_ok, "job": name,
                          "est_tokens": tok})
+        emitted |= set(ids_ok)
         n_out += 1
         print(f"  {p.name}: {len(ids_ok)} 样本 ids={ids_ok} ~{tok} tok(不含协议头)", flush=True)
     mpath.write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")

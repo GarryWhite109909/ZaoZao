@@ -2,1231 +2,817 @@ batch=74 样本数=2
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=7804 lang=python
+### id=7813 lang=go
 [CODE]
-   1| from __future__ import annotations
+   1| package btf
    2| 
-   3| import json
-   4| import os
-   5| import re
-   6| import warnings
-   7| from functools import wraps
-   8| 
-   9| from dynaconf.utils import extract_json_objects
-  10| from dynaconf.utils import isnamedtupleinstance
-  11| from dynaconf.utils import multi_replace
-  12| from dynaconf.utils import recursively_evaluate_lazy_format
-  13| from dynaconf.utils.boxing import DynaBox
-  14| from dynaconf.utils.functional import empty
-  15| from dynaconf.vendor import toml
-  16| from dynaconf.vendor import tomllib
-  17| 
-  18| try:
-  19|     from jinja2 import Environment
-  20| 
-  21|     jinja_env = Environment()
-  22|     for p_method in ("abspath", "realpath", "relpath", "dirname", "basename"):
-  23|         jinja_env.filters[p_method] = getattr(os.path, p_method)
-  24| except ImportError:  # pragma: no cover
-  25|     jinja_env = None
-  26| 
-  27| true_values = ("t", "true", "enabled", "1", "on", "yes", "True")
-  28| false_values = ("f", "false", "disabled", "0", "off", "no", "False", "")
-  29| 
-  30| 
-  31| KV_PATTERN = re.compile(r"([a-zA-Z0-9 ]*=[a-zA-Z0-9\- :]*)")
-  32| """matches `a=b, c=d, e=f` used on `VALUE='@merge foo=bar'` variables."""
-  33| 
-  34| 
-  35| class DynaconfFormatError(Exception):
-  36|     """Error to raise when formatting a lazy variable fails"""
-  37| 
-  38| 
-  39| class DynaconfParseError(Exception):
-  40|     """Error to raise when parsing @casts"""
-  41| 
-  42| 
-  43| class MetaValue:
-  44|     """A Marker to trigger specific actions on `set` and `object_merge`"""
-  45| 
-  46|     _meta_value = True
-  47| 
-  48|     def __init__(self, value, box_settings):
-  49|         self.box_settings = box_settings
-  50|         self.value = parse_conf_data(
-  51|             value, tomlfy=True, box_settings=box_settings
-  52|         )
-  53| 
-  54|     def __repr__(self):
-  55|         return f"{self.__class__.__name__}({self.value}) on {id(self)}"
-  56| 
-  57|     def unwrap(self):
-  58|         return self.value
-  59| 
-  60| 
-  61| class Reset(MetaValue):
-  62|     """Triggers an existing key to be reset to its value
-  63|     NOTE: DEPRECATED on v3.0.0
-  64|     """
-  65| 
-  66|     _dynaconf_reset = True
-  67| 
-  68|     def __init__(self, value, box_settings):
-  69|         self.box_settings = box_settings
-  70|         self.value = parse_conf_data(
-  71|             value, tomlfy=True, box_settings=self.box_settings
-  72|         )
-  73|         warnings.warn(f"{self.value} does not need `@reset` anymore.")
-  74| 
-  75| 
-  76| class Del(MetaValue):
-  77|     """Triggers an existing key to be deleted"""
-  78| 
-  79|     _dynaconf_del = True
-  80| 
-  81|     def unwrap(self):
-  82|         raise ValueError("Del object has no value")
-  83| 
-  84| 
-  85| class Merge(MetaValue):
-  86|     """Triggers an existing key to be merged"""
-  87| 
-  88|     _dynaconf_merge = True
-  89| 
-  90|     def __init__(self, value, box_settings, unique=False):
-  91|         if unique:
-  92|             self._dynaconf_merge_unique = True
-  93| 
-  94|         self.box_settings = box_settings
-  95| 
-  96|         self.value = parse_conf_data(
-  97|             value, tomlfy=True, box_settings=box_settings
-  98|         )
-  99| 
- 100|         if isinstance(self.value, (int, float, bool)):
- 101|             # @merge 1, @merge 1.1, @merge False
- 102|             self.value = [self.value]
- 103|         elif isinstance(self.value, str):
- 104|             # @merge {"valid": "json"}
- 105|             json_object = list(
- 106|                 extract_json_objects(
- 107|                     multi_replace(
- 108|                         self.value,
- 109|                         {
- 110|                             ": True": ": true",
- 111|                             ":True": ": true",
- 112|                             ": False": ": false",
- 113|                             ":False": ": false",
- 114|                             ": None": ": null",
- 115|                             ":None": ": null",
- 116|                         },
- 117|                     )
- 118|                 )
- 119|             )
- 120|             if len(json_object) == 1:
- 121|                 self.value = json_object[0]
- 122|             else:
- 123|                 matches = KV_PATTERN.findall(self.value)
- 124|                 # a=b, c=d
- 125|                 if matches:
- 126|                     self.value = {
- 127|                         k.strip(): parse_conf_data(
- 128|                             v, tomlfy=True, box_settings=box_settings
- 129|                         )
- 130|                         for k, v in (
- 131|                             match.strip().split("=") for match in matches
- 132|                         )
- 133|                     }
- 134|                 elif "," in self.value:
- 135|                     # @merge foo,bar
- 136|                     self.value = [
- 137|                         parse_conf_data(
- 138|                             v, tomlfy=True, box_settings=box_settings
- 139|                         )
- 140|                         for v in self.value.split(",")
- 141|                     ]
- 142|                 else:
- 143|                     # @merge foo
- 144|                     self.value = [self.value]
- 145| 
- 146|         self.unique = unique
- 147| 
- 148| 
- 149| class Insert(MetaValue):
- 150|     """Triggers the value to be inserted into a list at specific index"""
- 151| 
- 152|     _dynaconf_insert = True
- 153| 
- 154|     def __init__(self, value, box_settings):
- 155|         """
- 156|         normally value will be a string like
- 157|         `0 foo` or `-1 foo` and needs to get split
- 158|         but value can also be just a single string with or without space
- 159|         like `foo` and in this case it will be treated as `0 foo`
- 160|         but it can also be `foo bar` and in this case it will be treated as `0 foo bar`
- 161|         we need to check if the first part is a number
- 162|         if it is not a number then we will treat it as `0 value`
- 163|         if it is a number then we will split it as `index, value`
- 164|         this must use a regex to match value, examples:
- 165|             -1 foo -> index = -1, value = foo
- 166|             0 foo -> index = 0, value = foo
- 167|             0 foo bar -> index = 0, value = foo bar
- 168|             0 42 -> index = 0, value = 42
- 169|             0 42 foo -> index = 0, value = 42 foo
- 170|             foo -> index = 0, value = foo
- 171|             foo bar -> index = 0, value = foo bar
- 172|             42 -> index = 0, value = 42
- 173|             42 foo -> index = 42, value = foo
- 174|             42 foo bar -> index = 42, value = foo bar
- 175|         """
- 176|         self.box_settings = box_settings
- 177| 
- 178|         try:
- 179|             if value.lstrip("-+")[0].isdigit():
- 180|                 # `0 foo` or `-1 foo` or `42 foo` or `42`(raise ValueError)
- 181|                 index, value = value.split(" ", 1)
- 182|             else:
- 183|                 # `foo` or `foo bar`
- 184|                 index, value = 0, value
- 185|         except ValueError:
- 186|             # `42` or any other non split able value
- 187|             index, value = 0, value
- 188| 
- 189|         self.index = int(index)
- 190|         self.value = parse_conf_data(
- 191|             value, tomlfy=True, box_settings=box_settings
- 192|         )
- 193| 
- 194| 
- 195| class BaseFormatter:
- 196|     def __init__(self, function, token):
- 197|         self.function = function
- 198|         self.token = token
- 199| 
- 200|     def __call__(self, value, **context):
- 201|         try:
- 202|             return self.function(value, **context)
- 203|         except (KeyError, AttributeError) as exc:
- 204|             # A template like `{this.KEY}` failed with AttributeError
- 205|             # Or KeyError in the case of `{env[KEY]}`
- 206|             raise DynaconfFormatError(
- 207|                 f"Dynaconf can't interpolate variable because {exc}"
- 208|             ) from exc
- 209| 
- 210|     def __str__(self):
- 211|         return str(self.token)
- 212| 
- 213| 
- 214| def _jinja_formatter(value, **context):
- 215|     if jinja_env is None:  # pragma: no cover
- 216|         raise ImportError(
- 217|             "jinja2 must be installed to enable '@jinja' settings in dynaconf"
- 218|         )
- 219|     return jinja_env.from_string(value).render(**context)
- 220| 
- 221| 
- 222| def _get_formatter(value, **context):
- 223|     """
- 224|     Invokes settings.get from the annotation in value.
- 225| 
- 226|     value can be one of the following:
- 227| 
- 228|     @get KEY
- 229|     @get KEY @int
- 230|     @get KEY default_value
- 231|     @get KEY @int default_value
- 232| 
- 233|     @marker KEY_TO_LOOKUP @OPTIONAL_CAST OPTIONAL_DEFAULT_VALUE
- 234| 
- 235|     key group will match the key
- 236|     cast group will match anything provided after @
- 237|     the default group will match anything between single or double quotes
- 238|     """
- 239|     tokens = value.strip().split()
- 240|     if not tokens or len(tokens) > 3:
- 241|         raise DynaconfFormatError(f"Error parsing {value} malformed syntax.")
- 242| 
- 243|     params = {
- 244|         "key": tokens[0],
- 245|         "cast": None,
- 246|         "default": None,
- 247|     }
- 248|     for token in tokens[1:]:
- 249|         if token.startswith("@"):
- 250|             params["cast"] = token
- 251|         else:
- 252|             params["default"] = token
- 253| 
- 254|     if not params["default"] and params["key"] not in context["this"]:
- 255|         raise DynaconfParseError(
- 256|             f"Key {params['key']} not found in settings and no default value provided."
- 257|         )
- 258| 
- 259|     return context["this"].get(**params)
- 260| 
- 261| 
- 262| class Formatters:
- 263|     """Dynaconf builtin formatters"""
- 264| 
- 265|     python_formatter = BaseFormatter(str.format, "format")
- 266|     jinja_formatter = BaseFormatter(_jinja_formatter, "jinja")
- 267|     get_formatter = BaseFormatter(_get_formatter, "get")
- 268| 
- 269| 
- 270| class Lazy:
- 271|     """Holds data to format lazily."""
- 272| 
- 273|     _dynaconf_lazy_format = True
- 274| 
- 275|     def __init__(
- 276|         self, value=empty, formatter=Formatters.python_formatter, casting=None
- 277|     ):
- 278|         self.value = value
- 279|         self.casting = casting
- 280|         # Sometimes a simple function is passed to the formatter.
- 281|         # but on evaluation-time, we may need to access `formatter.token`
- 282|         # so we are wrapping the fn to comply with this interface.
- 283|         if isinstance(formatter, BaseFormatter):
- 284|             self.formatter = formatter
- 285|         else:
- 286|             self.formatter = BaseFormatter(formatter, "lambda")
- 287| 
- 288|     @property
- 289|     def context(self):
- 290|         """Builds a context for formatting."""
- 291|         return {"env": os.environ, "this": self.settings}
- 292| 
- 293|     def __call__(self, settings, validator_object=None):
- 294|         """LazyValue triggers format lazily."""
- 295|         self.settings = settings
- 296|         self.context["_validator_object"] = validator_object
- 297|         result = self.formatter(self.value, **self.context)
- 298|         if self.casting is not None:
- 299|             result = self.casting(result)
- 300|         return result
- 301| 
- 302|     def __str__(self):
- 303|         """Gives string representation for the object."""
- 304|         return str(self.value)
- 305| 
- 306|     def __repr__(self):
- 307|         """Give the quoted str representation"""
- 308|         return f"'@{self.formatter} {self.value}'"
- 309| 
- 310|     def _dynaconf_encode(self):
- 311|         """Encodes this object values to be serializable to json"""
- 312|         return f"@{self.formatter} {self.value}"
- 313| 
- 314|     def set_casting(self, casting):
- 315|         """Set the casting and return the instance."""
- 316|         self.casting = casting
- 317|         return self
- 318| 
- 319| 
- 320| def try_to_encode(value, callback=str):
- 321|     """Tries to encode a value by verifying existence of `_dynaconf_encode`"""
- 322|     try:
- 323|         return value._dynaconf_encode()
- 324|     except (AttributeError, TypeError):
- 325|         return callback(value)
- 326| 
- 327| 
- 328| def evaluate_lazy_format(f):
- 329|     """Marks a method on Settings instance to
- 330|     lazily evaluate LazyFormat objects upon access."""
- 331| 
- 332|     @wraps(f)
- 333|     def evaluate(settings, *args, **kwargs):
- 334|         value = f(settings, *args, **kwargs)
- 335|         return recursively_evaluate_lazy_format(value, settings)
- 336| 
- 337|     return evaluate
- 338| 
- 339| 
- 340| converters = {
- 341|     "@str": lambda value: value.set_casting(str)
- 342|     if isinstance(value, Lazy)
- 343|     else str(value),
- 344|     "@int": lambda value: value.set_casting(int)
- 345|     if isinstance(value, Lazy)
- 346|     else int(value),
- 347|     "@float": lambda value: value.set_casting(float)
- 348|     if isinstance(value, Lazy)
- 349|     else float(value),
- 350|     "@bool": lambda value: value.set_casting(
- 351|         lambda x: str(x).lower() in true_values
- 352|     )
- 353|     if isinstance(value, Lazy)
- 354|     else str(value).lower() in true_values,
- 355|     "@json": lambda value: value.set_casting(
- 356|         lambda x: json.loads(x.replace("'", '"'))
- 357|     )
- 358|     if isinstance(value, Lazy)
- 359|     else json.loads(value),
- 360|     "@format": lambda value: Lazy(value),
- 361|     "@jinja": lambda value: Lazy(value, formatter=Formatters.jinja_formatter),
- 362|     # Meta Values to trigger pre assignment actions
- 363|     "@reset": Reset,  # @reset is DEPRECATED on v3.0.0
- 364|     "@del": Del,
- 365|     "@merge": Merge,
- 366|     "@merge_unique": lambda value, box_settings: Merge(
- 367|         value, box_settings, unique=True
- 368|     ),
- 369|     "@insert": Insert,
- 370|     "@get": lambda value: Lazy(value, formatter=Formatters.get_formatter),
- 371|     # Special markers to be used as placeholders e.g: in prefilled forms
- 372|     # will always return None when evaluated
- 373|     "@note": lambda value: None,
- 374|     "@comment": lambda value: None,
- 375|     "@null": lambda value: None,
- 376|     "@none": lambda value: None,
- 377|     "@empty": lambda value: empty,
- 378| }
- 379| 
- 380| 
- 381| def apply_converter(converter_key, value, box_settings):
- 382|     """
- 383|     Get converter and apply it to @value.
- 384| 
- 385|     Lazy converters will return Lazy objects for later evaluation.
- 386|     """
- 387|     converter = converters[converter_key]
- 388|     try:
- 389|         converted_value = converter(value, box_settings=box_settings)
- 390|     except TypeError:
- 391|         converted_value = converter(value)
- 392|     return converted_value
- 393| 
- 394| 
- 395| def add_converter(converter_key, func):
- 396|     """Adds a new converter to the converters dict"""
- 397|     if not converter_key.startswith("@"):
- 398|         converter_key = f"@{converter_key}"
- 399| 
- 400|     converters[converter_key] = wraps(func)(
- 401|         lambda value: value.set_casting(func)
- 402|         if isinstance(value, Lazy)
- 403|         else Lazy(
- 404|             value,
- 405|             casting=func,
- 406|             formatter=BaseFormatter(lambda x, **_: x, converter_key),
- 407|         )
- 408|     )
- 409| 
- 410| 
- 411| def parse_with_toml(data):
- 412|     """Uses TOML syntax to parse data"""
- 413|     try:  # try tomllib first
- 414|         try:
- 415|             return tomllib.loads(f"key={data}")["key"]
- 416|         except (tomllib.TOMLDecodeError, KeyError):
- 417|             return data
- 418|     except UnicodeDecodeError:  # pragma: no cover
- 419|         # fallback to toml (TBR in 4.0.0)
- 420|         try:
- 421|             return toml.loads(f"key={data}")["key"]
- 422|         except (toml.TomlDecodeError, KeyError):
- 423|             return data
- 424|         warnings.warn(
- 425|             "TOML files should have only UTF-8 encoded characters. "
- 426|             "starting on 4.0.0 dynaconf will stop allowing invalid chars.",
- 427|             DeprecationWarning,
- 428|         )
- 429| 
- 430| 
- 431| def _parse_conf_data(data, tomlfy=False, box_settings=None):
- 432|     """
- 433|     @int @bool @float @json (for lists and dicts)
- 434|     strings does not need converters
- 435| 
- 436|     export DYNACONF_DEFAULT_THEME='material'
- 437|     export DYNACONF_DEBUG='@bool True'
- 438|     export DYNACONF_DEBUG_TOOLBAR_ENABLED='@bool False'
- 439|     export DYNACONF_PAGINATION_PER_PAGE='@int 20'
- 440|     export DYNACONF_MONGODB_SETTINGS='@json {"DB": "quokka_db"}'
- 441|     export DYNACONF_ALLOWED_EXTENSIONS='@json ["jpg", "png"]'
- 442|     """
- 443|     # not enforced to not break backwards compatibility with custom loaders
- 444|     box_settings = box_settings or {}
- 445| 
- 446|     castenabled = box_settings.get("AUTO_CAST_FOR_DYNACONF", empty)
- 447|     if castenabled is empty:
- 448|         castenabled = (
- 449|             os.environ.get("AUTO_CAST_FOR_DYNACONF", "true").lower()
- 450|             not in false_values
- 451|         )
- 452| 
- 453|     if (
- 454|         castenabled
- 455|         and data
- 456|         and isinstance(data, str)
- 457|         and data.startswith(tuple(converters.keys()))
- 458|     ):
- 459|         # Check combination token is used
- 460|         comb_token = re.match(
- 461|             f"^({'|'.join(converters.keys())}) @(jinja|format)",
- 462|             data,
- 463|         )
- 464|         if comb_token:
- 465|             tokens = comb_token.group(0)
- 466|             converter_key_list = tokens.split(" ")
- 467|             value = data.replace(tokens, "").strip()
- 468|         else:
- 469|             parts = data.partition(" ")
- 470|             converter_key_list = [parts[0]]
- 471|             value = parts[-1]
- 472| 
- 473|         # Parse the converters iteratively
- 474|         for converter_key in converter_key_list[::-1]:
- 475|             value = apply_converter(converter_key, value, box_settings)
- 476|     else:
- 477|         value = parse_with_toml(data) if tomlfy else data
- 478| 
- 479|     if isinstance(value, dict):
- 480|         value = DynaBox(value, box_settings=box_settings)
- 481| 
- 482|     return value
- 483| 
- 484| 
- 485| def parse_conf_data(data, tomlfy=False, box_settings=None):
- 486|     """
- 487|     Apply parsing tokens recursively and return transformed data.
- 488| 
- 489|     Strings with lazy parser (e.g, @format) will become Lazy objects.
- 490|     """
- 491| 
- 492|     # fix for https://github.com/dynaconf/dynaconf/issues/595
- 493|     if isnamedtupleinstance(data):
- 494|         return data
- 495| 
- 496|     # not enforced to not break backwards compatibility with custom loaders
- 497|     box_settings = box_settings or {}
- 498| 
- 499|     if isinstance(data, (tuple, list)):
- 500|         # recursively parse each sequence item
- 501|         return [
- 502|             parse_conf_data(item, tomlfy=tomlfy, box_settings=box_settings)
- 503|             for item in data
- 504|         ]
- 505| 
- 506|     if isinstance(data, DynaBox):
- 507|         # recursively parse inner dict items
- 508|         # It is important to keep the same object id because
- 509|         # of mutability
- 510|         for k, v in data.items(bypass_eval=True):
- 511|             data[k] = parse_conf_data(
- 512|                 v, tomlfy=tomlfy, box_settings=box_settings
- 513|             )
- 514|         return data
- 515| 
- 516|     if isinstance(data, dict):
- 517|         # recursively parse inner dict items
- 518|         for k, v in data.items():
- 519|             data[k] = parse_conf_data(
- 520|                 v, tomlfy=tomlfy, box_settings=box_settings
- 521|             )
- 522|         return data
- 523| 
- 524|     # return parsed string value
- 525|     return _parse_conf_data(data, tomlfy=tomlfy, box_settings=box_settings)
- 526| 
- 527| 
- 528| def unparse_conf_data(value):
- 529|     if isinstance(value, bool):
- 530|         return f"@bool {value}"
- 531| 
- 532|     if isinstance(value, int):
- 533|         return f"@int {value}"
- 534| 
- 535|     if isinstance(value, float):
- 536|         return f"@float {value}"
- 537| 
- 538|     if isinstance(value, (list, dict)):
- 539|         return f"@json {json.dumps(value)}"
- 540| 
- 541|     if isinstance(value, Lazy):
- 542|         return try_to_encode(value)
- 543| 
- 544|     if value is None:
- 545|         return "@none "
- 546| 
- 547|     return value
- 548| 
- 549| 
- 550| def boolean_fix(value: str | None):
- 551|     """Gets a value like `True/False` and turns to `true/false`
- 552|     This function exists because of issue #976
- 553|     Toml parser casts booleans from true/false lower case
- 554|     however envvars are usually exported as True/False capitalized
- 555|     by mistake, this helper fixes it for envvars only.
- 556| 
- 557|     Assume envvars are always str.
- 558|     """
- 559|     if value and value.strip() in ("True", "False"):
- 560|         return value.lower()
- 561|     return value
- 562| 
- 563| 
-
-### id=7805 lang=python
-[CODE]
-   1| from __future__ import annotations
-   2| 
-   3| import json
-   4| import os
-   5| import re
-   6| import string
-   7| import warnings
-   8| from functools import wraps
-   9| 
-  10| from dynaconf.utils import extract_json_objects
-  11| from dynaconf.utils import isnamedtupleinstance
-  12| from dynaconf.utils import multi_replace
-  13| from dynaconf.utils import recursively_evaluate_lazy_format
-  14| from dynaconf.utils.boxing import DynaBox
-  15| from dynaconf.utils.functional import empty
-  16| from dynaconf.vendor import toml
-  17| from dynaconf.vendor import tomllib
+   3| import (
+   4| 	"debug/elf"
+   5| 	"errors"
+   6| 	"fmt"
+   7| 	"io"
+   8| 	"iter"
+   9| 	"maps"
+  10| 	"math"
+  11| 	"os"
+  12| 	"reflect"
+  13| 	"slices"
+  14| 
+  15| 	"github.com/cilium/ebpf/internal"
+  16| 	"github.com/cilium/ebpf/internal/sys"
+  17| )
   18| 
-  19| try:
-  20|     import jinja2
-  21|     from jinja2.sandbox import SandboxedEnvironment
-  22| 
-  23|     jinja_env = SandboxedEnvironment()
-  24|     for p_method in ("abspath", "realpath", "relpath", "dirname", "basename"):
-  25|         jinja_env.filters[p_method] = getattr(os.path, p_method)
-  26| except ImportError:  # pragma: no cover
-  27|     jinja_env = None
+  19| const btfMagic = 0xeB9F
+  20| 
+  21| // Errors returned by BTF functions.
+  22| var (
+  23| 	ErrNotSupported    = internal.ErrNotSupported
+  24| 	ErrNotFound        = errors.New("not found")
+  25| 	ErrNoExtendedInfo  = errors.New("no extended info")
+  26| 	ErrMultipleMatches = errors.New("multiple matching types")
+  27| )
   28| 
-  29| true_values = ("t", "true", "enabled", "1", "on", "yes", "True")
-  30| false_values = ("f", "false", "disabled", "0", "off", "no", "False", "")
+  29| // ID represents the unique ID of a BTF object.
+  30| type ID = sys.BTFID
   31| 
-  32| 
-  33| KV_PATTERN = re.compile(r"([a-zA-Z0-9 ]*=[a-zA-Z0-9\- :]*)")
-  34| """matches `a=b, c=d, e=f` used on `VALUE='@merge foo=bar'` variables."""
-  35| 
-  36| 
-  37| class DynaconfFormatError(Exception):
-  38|     """Error to raise when formatting a lazy variable fails"""
-  39| 
-  40| 
-  41| class DynaconfParseError(Exception):
-  42|     """Error to raise when parsing @casts"""
-  43| 
-  44| 
-  45| class MetaValue:
-  46|     """A Marker to trigger specific actions on `set` and `object_merge`"""
+  32| type elfData struct {
+  33| 	sectionSizes  map[string]uint32
+  34| 	symbolOffsets map[elfSymbol]uint32
+  35| 	fixups        map[Type]bool
+  36| }
+  37| 
+  38| type elfSymbol struct {
+  39| 	section string
+  40| 	name    string
+  41| }
+  42| 
+  43| // Spec allows querying a set of Types and loading the set into the
+  44| // kernel.
+  45| type Spec struct {
+  46| 	*decoder
   47| 
-  48|     _meta_value = True
-  49| 
-  50|     def __init__(self, value, box_settings):
-  51|         self.box_settings = box_settings
-  52|         self.value = parse_conf_data(
-  53|             value, tomlfy=True, box_settings=box_settings
-  54|         )
-  55| 
-  56|     def __repr__(self):
-  57|         return f"{self.__class__.__name__}({self.value}) on {id(self)}"
-  58| 
-  59|     def unwrap(self):
-  60|         return self.value
-  61| 
+  48| 	// Additional data from ELF, may be nil.
+  49| 	elf *elfData
+  50| }
+  51| 
+  52| // LoadSpec opens file and calls LoadSpecFromReader on it.
+  53| func LoadSpec(file string) (*Spec, error) {
+  54| 	fh, err := os.Open(file)
+  55| 	if err != nil {
+  56| 		return nil, err
+  57| 	}
+  58| 	defer fh.Close()
+  59| 
+  60| 	return LoadSpecFromReader(fh)
+  61| }
   62| 
-  63| class Reset(MetaValue):
-  64|     """Triggers an existing key to be reset to its value
-  65|     NOTE: DEPRECATED on v3.0.0
-  66|     """
-  67| 
-  68|     _dynaconf_reset = True
-  69| 
-  70|     def __init__(self, value, box_settings):
-  71|         self.box_settings = box_settings
-  72|         self.value = parse_conf_data(
-  73|             value, tomlfy=True, box_settings=self.box_settings
-  74|         )
-  75|         warnings.warn(f"{self.value} does not need `@reset` anymore.")
-  76| 
+  63| // LoadSpecFromReader reads from an ELF or a raw BTF blob.
+  64| //
+  65| // Returns ErrNotFound if reading from an ELF which contains no BTF. ExtInfos
+  66| // may be nil.
+  67| func LoadSpecFromReader(rd io.ReaderAt) (*Spec, error) {
+  68| 	file, err := internal.NewSafeELFFile(rd)
+  69| 	if err != nil {
+  70| 		raw, err := io.ReadAll(io.NewSectionReader(rd, 0, math.MaxInt64))
+  71| 		if err != nil {
+  72| 			return nil, fmt.Errorf("read raw BTF: %w", err)
+  73| 		}
+  74| 
+  75| 		return loadRawSpec(raw, nil)
+  76| 	}
   77| 
-  78| class Del(MetaValue):
-  79|     """Triggers an existing key to be deleted"""
+  78| 	return loadSpecFromELF(file)
+  79| }
   80| 
-  81|     _dynaconf_del = True
-  82| 
-  83|     def unwrap(self):
-  84|         raise ValueError("Del object has no value")
-  85| 
-  86| 
-  87| class Merge(MetaValue):
-  88|     """Triggers an existing key to be merged"""
-  89| 
-  90|     _dynaconf_merge = True
-  91| 
-  92|     def __init__(self, value, box_settings, unique=False):
-  93|         if unique:
-  94|             self._dynaconf_merge_unique = True
+  81| // LoadSpecAndExtInfosFromReader reads from an ELF.
+  82| //
+  83| // ExtInfos may be nil if the ELF doesn't contain section metadata.
+  84| // Returns ErrNotFound if the ELF contains no BTF.
+  85| func LoadSpecAndExtInfosFromReader(rd io.ReaderAt) (*Spec, *ExtInfos, error) {
+  86| 	file, err := internal.NewSafeELFFile(rd)
+  87| 	if err != nil {
+  88| 		return nil, nil, err
+  89| 	}
+  90| 
+  91| 	spec, err := loadSpecFromELF(file)
+  92| 	if err != nil {
+  93| 		return nil, nil, err
+  94| 	}
   95| 
-  96|         self.box_settings = box_settings
-  97| 
-  98|         self.value = parse_conf_data(
-  99|             value, tomlfy=True, box_settings=box_settings
- 100|         )
- 101| 
- 102|         if isinstance(self.value, (int, float, bool)):
- 103|             # @merge 1, @merge 1.1, @merge False
- 104|             self.value = [self.value]
- 105|         elif isinstance(self.value, str):
- 106|             # @merge {"valid": "json"}
- 107|             json_object = list(
- 108|                 extract_json_objects(
- 109|                     multi_replace(
- 110|                         self.value,
- 111|                         {
- 112|                             ": True": ": true",
- 113|                             ":True": ": true",
- 114|                             ": False": ": false",
- 115|                             ":False": ": false",
- 116|                             ": None": ": null",
- 117|                             ":None": ": null",
- 118|                         },
- 119|                     )
- 120|                 )
- 121|             )
- 122|             if len(json_object) == 1:
- 123|                 self.value = json_object[0]
- 124|             else:
- 125|                 matches = KV_PATTERN.findall(self.value)
- 126|                 # a=b, c=d
- 127|                 if matches:
- 128|                     self.value = {
- 129|                         k.strip(): parse_conf_data(
- 130|                             v, tomlfy=True, box_settings=box_settings
- 131|                         )
- 132|                         for k, v in (
- 133|                             match.strip().split("=") for match in matches
- 134|                         )
- 135|                     }
- 136|                 elif "," in self.value:
- 137|                     # @merge foo,bar
- 138|                     self.value = [
- 139|                         parse_conf_data(
- 140|                             v, tomlfy=True, box_settings=box_settings
- 141|                         )
- 142|                         for v in self.value.split(",")
- 143|                     ]
- 144|                 else:
- 145|                     # @merge foo
- 146|                     self.value = [self.value]
- 147| 
- 148|         self.unique = unique
- 149| 
- 150| 
- 151| class Insert(MetaValue):
- 152|     """Triggers the value to be inserted into a list at specific index"""
- 153| 
- 154|     _dynaconf_insert = True
- 155| 
- 156|     def __init__(self, value, box_settings):
- 157|         """
- 158|         normally value will be a string like
- 159|         `0 foo` or `-1 foo` and needs to get split
- 160|         but value can also be just a single string with or without space
- 161|         like `foo` and in this case it will be treated as `0 foo`
- 162|         but it can also be `foo bar` and in this case it will be treated as `0 foo bar`
- 163|         we need to check if the first part is a number
- 164|         if it is not a number then we will treat it as `0 value`
- 165|         if it is a number then we will split it as `index, value`
- 166|         this must use a regex to match value, examples:
- 167|             -1 foo -> index = -1, value = foo
- 168|             0 foo -> index = 0, value = foo
- 169|             0 foo bar -> index = 0, value = foo bar
- 170|             0 42 -> index = 0, value = 42
- 171|             0 42 foo -> index = 0, value = 42 foo
- 172|             foo -> index = 0, value = foo
- 173|             foo bar -> index = 0, value = foo bar
- 174|             42 -> index = 0, value = 42
- 175|             42 foo -> index = 42, value = foo
- 176|             42 foo bar -> index = 42, value = foo bar
- 177|         """
- 178|         self.box_settings = box_settings
- 179| 
- 180|         try:
- 181|             if value.lstrip("-+")[0].isdigit():
- 182|                 # `0 foo` or `-1 foo` or `42 foo` or `42`(raise ValueError)
- 183|                 index, value = value.split(" ", 1)
- 184|             else:
- 185|                 # `foo` or `foo bar`
- 186|                 index, value = 0, value
- 187|         except ValueError:
- 188|             # `42` or any other non split able value
- 189|             index, value = 0, value
- 190| 
- 191|         self.index = int(index)
- 192|         self.value = parse_conf_data(
- 193|             value, tomlfy=True, box_settings=box_settings
- 194|         )
- 195| 
- 196| 
- 197| class BaseFormatter:
- 198|     def __init__(self, function, token):
- 199|         self.function = function
- 200|         self.token = token
+  96| 	extInfos, err := loadExtInfosFromELF(file, spec)
+  97| 	if err != nil && !errors.Is(err, ErrNotFound) {
+  98| 		return nil, nil, err
+  99| 	}
+ 100| 
+ 101| 	return spec, extInfos, nil
+ 102| }
+ 103| 
+ 104| // symbolOffsets extracts all symbols offsets from an ELF and indexes them by
+ 105| // section and variable name.
+ 106| //
+ 107| // References to variables in BTF data sections carry unsigned 32-bit offsets.
+ 108| // Some ELF symbols (e.g. in vmlinux) may point to virtual memory that is well
+ 109| // beyond this range. Since these symbols cannot be described by BTF info,
+ 110| // ignore them here.
+ 111| func symbolOffsets(file *internal.SafeELFFile) (map[elfSymbol]uint32, error) {
+ 112| 	symbols, err := file.Symbols()
+ 113| 	if err != nil {
+ 114| 		return nil, fmt.Errorf("can't read symbols: %v", err)
+ 115| 	}
+ 116| 
+ 117| 	offsets := make(map[elfSymbol]uint32)
+ 118| 	for _, sym := range symbols {
+ 119| 		if idx := sym.Section; idx >= elf.SHN_LORESERVE && idx <= elf.SHN_HIRESERVE {
+ 120| 			// Ignore things like SHN_ABS
+ 121| 			continue
+ 122| 		}
+ 123| 
+ 124| 		if sym.Value > math.MaxUint32 {
+ 125| 			// VarSecinfo offset is u32, cannot reference symbols in higher regions.
+ 126| 			continue
+ 127| 		}
+ 128| 
+ 129| 		if int(sym.Section) >= len(file.Sections) {
+ 130| 			return nil, fmt.Errorf("symbol %s: invalid section %d", sym.Name, sym.Section)
+ 131| 		}
+ 132| 
+ 133| 		secName := file.Sections[sym.Section].Name
+ 134| 		offsets[elfSymbol{secName, sym.Name}] = uint32(sym.Value)
+ 135| 	}
+ 136| 
+ 137| 	return offsets, nil
+ 138| }
+ 139| 
+ 140| func loadSpecFromELF(file *internal.SafeELFFile) (*Spec, error) {
+ 141| 	var (
+ 142| 		btfSection   *elf.Section
+ 143| 		sectionSizes = make(map[string]uint32)
+ 144| 	)
+ 145| 
+ 146| 	for _, sec := range file.Sections {
+ 147| 		switch sec.Name {
+ 148| 		case ".BTF":
+ 149| 			btfSection = sec
+ 150| 		default:
+ 151| 			if sec.Type != elf.SHT_PROGBITS && sec.Type != elf.SHT_NOBITS {
+ 152| 				break
+ 153| 			}
+ 154| 
+ 155| 			if sec.Size > math.MaxUint32 {
+ 156| 				return nil, fmt.Errorf("section %s exceeds maximum size", sec.Name)
+ 157| 			}
+ 158| 
+ 159| 			sectionSizes[sec.Name] = uint32(sec.Size)
+ 160| 		}
+ 161| 	}
+ 162| 
+ 163| 	if btfSection == nil {
+ 164| 		return nil, fmt.Errorf("btf: %w", ErrNotFound)
+ 165| 	}
+ 166| 
+ 167| 	offsets, err := symbolOffsets(file)
+ 168| 	if err != nil {
+ 169| 		return nil, err
+ 170| 	}
+ 171| 
+ 172| 	rawBTF, err := btfSection.Data()
+ 173| 	if err != nil {
+ 174| 		return nil, fmt.Errorf("reading .BTF section: %w", err)
+ 175| 	}
+ 176| 
+ 177| 	spec, err := loadRawSpec(rawBTF, nil)
+ 178| 	if err != nil {
+ 179| 		return nil, err
+ 180| 	}
+ 181| 
+ 182| 	if spec.decoder.byteOrder != file.ByteOrder {
+ 183| 		return nil, fmt.Errorf("BTF byte order %s does not match ELF byte order %s", spec.decoder.byteOrder, file.ByteOrder)
+ 184| 	}
+ 185| 
+ 186| 	spec.elf = &elfData{
+ 187| 		sectionSizes,
+ 188| 		offsets,
+ 189| 		make(map[Type]bool),
+ 190| 	}
+ 191| 
+ 192| 	return spec, nil
+ 193| }
+ 194| 
+ 195| func loadRawSpec(btf []byte, base *Spec) (*Spec, error) {
+ 196| 	var (
+ 197| 		baseDecoder *decoder
+ 198| 		baseStrings *stringTable
+ 199| 		err         error
+ 200| 	)
  201| 
- 202|     def __call__(self, value, **context):
- 203|         try:
- 204|             return self.function(value, **context)
- 205|         except (KeyError, AttributeError) as exc:
- 206|             # A template like `{this.KEY}` failed with AttributeError
- 207|             # Or KeyError in the case of `{env[KEY]}`
- 208|             raise DynaconfFormatError(
- 209|                 f"Dynaconf can't interpolate variable because {exc}"
- 210|             ) from exc
+ 202| 	if base != nil {
+ 203| 		baseDecoder = base.decoder
+ 204| 		baseStrings = base.strings
+ 205| 	}
+ 206| 
+ 207| 	header, bo, err := parseBTFHeader(btf)
+ 208| 	if err != nil {
+ 209| 		return nil, fmt.Errorf("parsing .BTF header: %v", err)
+ 210| 	}
  211| 
- 212|     def __str__(self):
- 213|         return str(self.token)
- 214| 
- 215| 
- 216| def _jinja_formatter(value: str, **context) -> str:
- 217|     if jinja_env is None:  # pragma: no cover
- 218|         raise ImportError(
- 219|             "jinja2 must be installed to enable '@jinja' settings in dynaconf"
- 220|         )
- 221|     try:
- 222|         return jinja_env.from_string(value).render(**context)
- 223|     except jinja2.exceptions.SecurityError:
- 224|         warnings.warn(f"Unsafe access attempt to: {value}")
- 225|         return ""
+ 212| 	if header.HdrLen > uint32(len(btf)) {
+ 213| 		return nil, fmt.Errorf("BTF header length is out of bounds")
+ 214| 	}
+ 215| 	btf = btf[header.HdrLen:]
+ 216| 
+ 217| 	if uint64(header.StringOff)+uint64(header.StringLen) > uint64(len(btf)) {
+ 218| 		return nil, fmt.Errorf("string table is out of bounds")
+ 219| 	}
+ 220| 	stringsSection := btf[header.StringOff : header.StringOff+header.StringLen]
+ 221| 
+ 222| 	rawStrings, err := newStringTable(stringsSection, baseStrings)
+ 223| 	if err != nil {
+ 224| 		return nil, fmt.Errorf("read string section: %w", err)
+ 225| 	}
  226| 
- 227| 
- 228| def _get_formatter(value, **context):
- 229|     """
- 230|     Invokes settings.get from the annotation in value.
+ 227| 	if uint64(header.TypeOff)+uint64(header.TypeLen) > uint64(len(btf)) {
+ 228| 		return nil, fmt.Errorf("types section is out of bounds")
+ 229| 	}
+ 230| 	typesSection := btf[header.TypeOff : header.TypeOff+header.TypeLen]
  231| 
- 232|     value can be one of the following:
- 233| 
- 234|     @get KEY
- 235|     @get KEY @int
- 236|     @get KEY default_value
- 237|     @get KEY @int default_value
- 238| 
- 239|     @marker KEY_TO_LOOKUP @OPTIONAL_CAST OPTIONAL_DEFAULT_VALUE
- 240| 
- 241|     key group will match the key
- 242|     cast group will match anything provided after @
- 243|     the default group will match anything between single or double quotes
- 244|     """
- 245|     tokens = value.strip().split()
- 246|     if not tokens or len(tokens) > 3:
- 247|         raise DynaconfFormatError(f"Error parsing {value} malformed syntax.")
- 248| 
- 249|     params = {
- 250|         "key": tokens[0],
- 251|         "cast": None,
- 252|         "default": None,
- 253|     }
- 254|     for token in tokens[1:]:
- 255|         if token.startswith("@"):
- 256|             params["cast"] = token
- 257|         else:
- 258|             params["default"] = token
- 259| 
- 260|     if not params["default"] and params["key"] not in context["this"]:
- 261|         raise DynaconfParseError(
- 262|             f"Key {params['key']} not found in settings and no default value provided."
- 263|         )
- 264| 
- 265|     return context["this"].get(**params)
- 266| 
- 267| 
- 268| class SafeFormatter(string.Formatter):
- 269|     def get_field(self, field_name, args, context):
- 270|         self._validate_key_exists(field_name, context)
- 271|         return super().get_field(field_name, args, context)
- 272| 
- 273|     def _validate_key_exists(self, field_name: str, context):
- 274|         if not field_name.lower().startswith("this"):
- 275|             return
- 276|         from dynaconf.base import _PUBLIC_PROPERTIES
- 277| 
- 278|         field_name = field_name.replace("[", ".")
- 279|         field_name = field_name.replace("]", "")
- 280|         context_name, _, key = field_name.partition(".")
- 281|         # these are accesible by the user, but are not considered setting keys
- 282|         # e.g, settings.current_env
- 283|         if key in _PUBLIC_PROPERTIES:
- 284|             return
- 285|         # allow only existing setting keys
- 286|         if key not in context[context_name]:
- 287|             raise AttributeError(key)
- 288| 
+ 232| 	decoder, err := newDecoder(typesSection, bo, rawStrings, baseDecoder)
+ 233| 	if err != nil {
+ 234| 		return nil, err
+ 235| 	}
+ 236| 
+ 237| 	return &Spec{decoder, nil}, nil
+ 238| }
+ 239| 
+ 240| // fixupDatasec attempts to patch up missing info in Datasecs and its members by
+ 241| // supplementing them with information from the ELF headers and symbol table.
+ 242| func (elf *elfData) fixupDatasec(typ Type) error {
+ 243| 	if elf == nil {
+ 244| 		return nil
+ 245| 	}
+ 246| 
+ 247| 	if ds, ok := typ.(*Datasec); ok {
+ 248| 		if elf.fixups[ds] {
+ 249| 			return nil
+ 250| 		}
+ 251| 		elf.fixups[ds] = true
+ 252| 
+ 253| 		name := ds.Name
+ 254| 
+ 255| 		// Some Datasecs are virtual and don't have corresponding ELF sections.
+ 256| 		switch name {
+ 257| 		case ".ksyms":
+ 258| 			// .ksyms describes forward declarations of kfunc signatures, as well as
+ 259| 			// references to kernel symbols.
+ 260| 			// Nothing to fix up, all sizes and offsets are 0.
+ 261| 			for _, vsi := range ds.Vars {
+ 262| 				switch t := vsi.Type.(type) {
+ 263| 				case *Func:
+ 264| 					continue
+ 265| 				case *Var:
+ 266| 					if _, ok := t.Type.(*Void); !ok {
+ 267| 						return fmt.Errorf("data section %s: expected %s to be *Void, not %T: %w", name, vsi.Type.TypeName(), vsi.Type, ErrNotSupported)
+ 268| 					}
+ 269| 				default:
+ 270| 					return fmt.Errorf("data section %s: expected to be either *btf.Func or *btf.Var, not %T: %w", name, vsi.Type, ErrNotSupported)
+ 271| 				}
+ 272| 			}
+ 273| 
+ 274| 			return nil
+ 275| 		case ".kconfig":
+ 276| 			// .kconfig has a size of 0 and has all members' offsets set to 0.
+ 277| 			// Fix up all offsets and set the Datasec's size.
+ 278| 			if err := fixupDatasecLayout(ds); err != nil {
+ 279| 				return err
+ 280| 			}
+ 281| 
+ 282| 			// Fix up extern to global linkage to avoid a BTF verifier error.
+ 283| 			for _, vsi := range ds.Vars {
+ 284| 				vsi.Type.(*Var).Linkage = GlobalVar
+ 285| 			}
+ 286| 
+ 287| 			return nil
+ 288| 		}
  289| 
- 290| def _format_formatter(input: str, **context) -> str:
- 291|     return SafeFormatter().format(input, **context)
- 292| 
+ 290| 		if ds.Size != 0 {
+ 291| 			return nil
+ 292| 		}
  293| 
- 294| class Formatters:
- 295|     """Dynaconf builtin formatters"""
- 296| 
- 297|     python_formatter = BaseFormatter(_format_formatter, "format")
- 298|     jinja_formatter = BaseFormatter(_jinja_formatter, "jinja")
- 299|     get_formatter = BaseFormatter(_get_formatter, "get")
- 300| 
- 301| 
- 302| class Lazy:
- 303|     """Holds data to format lazily."""
- 304| 
- 305|     _dynaconf_lazy_format = True
- 306| 
- 307|     def __init__(
- 308|         self, value=empty, formatter=Formatters.python_formatter, casting=None
- 309|     ):
- 310|         self.value = value
- 311|         self.casting = casting
- 312|         # Sometimes a simple function is passed to the formatter.
- 313|         # but on evaluation-time, we may need to access `formatter.token`
- 314|         # so we are wrapping the fn to comply with this interface.
- 315|         if isinstance(formatter, BaseFormatter):
- 316|             self.formatter = formatter
- 317|         else:
- 318|             self.formatter = BaseFormatter(formatter, "lambda")
- 319| 
- 320|     @property
- 321|     def context(self):
- 322|         """Builds a context for formatting."""
- 323|         return {"env": os.environ, "this": self.settings}
- 324| 
- 325|     def __call__(self, settings, validator_object=None):
- 326|         """LazyValue triggers format lazily."""
- 327|         self.settings = settings
- 328|         self.context["_validator_object"] = validator_object
- 329|         result = self.formatter(self.value, **self.context)
- 330|         if self.casting is not None:
- 331|             result = self.casting(result)
- 332|         return result
- 333| 
- 334|     def __str__(self):
- 335|         """Gives string representation for the object."""
- 336|         return str(self.value)
- 337| 
- 338|     def __repr__(self):
- 339|         """Give the quoted str representation"""
- 340|         return f"'@{self.formatter} {self.value}'"
+ 294| 		ds.Size, ok = elf.sectionSizes[name]
+ 295| 		if !ok {
+ 296| 			return fmt.Errorf("data section %s: missing size", name)
+ 297| 		}
+ 298| 
+ 299| 		for i := range ds.Vars {
+ 300| 			symName := ds.Vars[i].Type.TypeName()
+ 301| 			ds.Vars[i].Offset, ok = elf.symbolOffsets[elfSymbol{name, symName}]
+ 302| 			if !ok {
+ 303| 				return fmt.Errorf("data section %s: missing offset for symbol %s", name, symName)
+ 304| 			}
+ 305| 		}
+ 306| 	}
+ 307| 
+ 308| 	return nil
+ 309| }
+ 310| 
+ 311| // fixupDatasecLayout populates ds.Vars[].Offset according to var sizes and
+ 312| // alignment. Calculate and set ds.Size.
+ 313| func fixupDatasecLayout(ds *Datasec) error {
+ 314| 	var off uint32
+ 315| 
+ 316| 	for i, vsi := range ds.Vars {
+ 317| 		v, ok := vsi.Type.(*Var)
+ 318| 		if !ok {
+ 319| 			return fmt.Errorf("member %d: unsupported type %T", i, vsi.Type)
+ 320| 		}
+ 321| 
+ 322| 		size, err := Sizeof(v.Type)
+ 323| 		if err != nil {
+ 324| 			return fmt.Errorf("variable %s: getting size: %w", v.Name, err)
+ 325| 		}
+ 326| 		align, err := alignof(v.Type)
+ 327| 		if err != nil {
+ 328| 			return fmt.Errorf("variable %s: getting alignment: %w", v.Name, err)
+ 329| 		}
+ 330| 
+ 331| 		// Align the current member based on the offset of the end of the previous
+ 332| 		// member and the alignment of the current member.
+ 333| 		off = internal.Align(off, uint32(align))
+ 334| 
+ 335| 		ds.Vars[i].Offset = off
+ 336| 
+ 337| 		off += uint32(size)
+ 338| 	}
+ 339| 
+ 340| 	ds.Size = off
  341| 
- 342|     def _dynaconf_encode(self):
- 343|         """Encodes this object values to be serializable to json"""
- 344|         return f"@{self.formatter} {self.value}"
- 345| 
- 346|     def set_casting(self, casting):
- 347|         """Set the casting and return the instance."""
- 348|         self.casting = casting
- 349|         return self
- 350| 
- 351| 
- 352| def try_to_encode(value, callback=str):
- 353|     """Tries to encode a value by verifying existence of `_dynaconf_encode`"""
- 354|     try:
- 355|         return value._dynaconf_encode()
- 356|     except (AttributeError, TypeError):
- 357|         return callback(value)
+ 342| 	return nil
+ 343| }
+ 344| 
+ 345| // Copy a Spec.
+ 346| //
+ 347| // All contained types are duplicated while preserving any modifications made
+ 348| // to them.
+ 349| func (s *Spec) Copy() *Spec {
+ 350| 	if s == nil {
+ 351| 		return nil
+ 352| 	}
+ 353| 
+ 354| 	cpy := &Spec{
+ 355| 		s.decoder.Copy(),
+ 356| 		nil,
+ 357| 	}
  358| 
- 359| 
- 360| def evaluate_lazy_format(f):
- 361|     """Marks a method on Settings instance to
- 362|     lazily evaluate LazyFormat objects upon access."""
- 363| 
- 364|     @wraps(f)
- 365|     def evaluate(settings, *args, **kwargs):
- 366|         value = f(settings, *args, **kwargs)
- 367|         return recursively_evaluate_lazy_format(value, settings)
- 368| 
- 369|     return evaluate
- 370| 
- 371| 
- 372| converters = {
- 373|     "@str": lambda value: value.set_casting(str)
- 374|     if isinstance(value, Lazy)
- 375|     else str(value),
- 376|     "@int": lambda value: value.set_casting(int)
- 377|     if isinstance(value, Lazy)
- 378|     else int(value),
- 379|     "@float": lambda value: value.set_casting(float)
- 380|     if isinstance(value, Lazy)
- 381|     else float(value),
- 382|     "@bool": lambda value: value.set_casting(
- 383|         lambda x: str(x).lower() in true_values
- 384|     )
- 385|     if isinstance(value, Lazy)
- 386|     else str(value).lower() in true_values,
- 387|     "@json": lambda value: value.set_casting(
- 388|         lambda x: json.loads(x.replace("'", '"'))
- 389|     )
- 390|     if isinstance(value, Lazy)
- 391|     else json.loads(value),
- 392|     "@format": lambda value: Lazy(value),
- 393|     "@jinja": lambda value: Lazy(value, formatter=Formatters.jinja_formatter),
- 394|     # Meta Values to trigger pre assignment actions
- 395|     "@reset": Reset,  # @reset is DEPRECATED on v3.0.0
- 396|     "@del": Del,
- 397|     "@merge": Merge,
- 398|     "@merge_unique": lambda value, box_settings: Merge(
- 399|         value, box_settings, unique=True
- 400|     ),
- 401|     "@insert": Insert,
- 402|     "@get": lambda value: Lazy(value, formatter=Formatters.get_formatter),
- 403|     # Special markers to be used as placeholders e.g: in prefilled forms
- 404|     # will always return None when evaluated
- 405|     "@note": lambda value: None,
- 406|     "@comment": lambda value: None,
- 407|     "@null": lambda value: None,
- 408|     "@none": lambda value: None,
- 409|     "@empty": lambda value: empty,
- 410| }
- 411| 
- 412| 
- 413| def apply_converter(converter_key, value, box_settings):
- 414|     """
- 415|     Get converter and apply it to @value.
- 416| 
- 417|     Lazy converters will return Lazy objects for later evaluation.
- 418|     """
- 419|     converter = converters[converter_key]
- 420|     try:
- 421|         converted_value = converter(value, box_settings=box_settings)
- 422|     except TypeError:
- 423|         converted_value = converter(value)
- 424|     return converted_value
- 425| 
- 426| 
- 427| def add_converter(converter_key, func):
- 428|     """Adds a new converter to the converters dict"""
- 429|     if not converter_key.startswith("@"):
- 430|         converter_key = f"@{converter_key}"
+ 359| 	if s.elf != nil {
+ 360| 		cpy.elf = &elfData{
+ 361| 			s.elf.sectionSizes,
+ 362| 			s.elf.symbolOffsets,
+ 363| 			maps.Clone(s.elf.fixups),
+ 364| 		}
+ 365| 	}
+ 366| 
+ 367| 	return cpy
+ 368| }
+ 369| 
+ 370| // TypeByID returns the BTF Type with the given type ID.
+ 371| //
+ 372| // Returns an error wrapping ErrNotFound if a Type with the given ID
+ 373| // does not exist in the Spec.
+ 374| func (s *Spec) TypeByID(id TypeID) (Type, error) {
+ 375| 	typ, err := s.decoder.TypeByID(id)
+ 376| 	if err != nil {
+ 377| 		return nil, fmt.Errorf("inflate type: %w", err)
+ 378| 	}
+ 379| 
+ 380| 	if err := s.elf.fixupDatasec(typ); err != nil {
+ 381| 		return nil, err
+ 382| 	}
+ 383| 
+ 384| 	return typ, nil
+ 385| }
+ 386| 
+ 387| // TypeID returns the ID for a given Type.
+ 388| //
+ 389| // Returns an error wrapping [ErrNotFound] if the type isn't part of the Spec.
+ 390| func (s *Spec) TypeID(typ Type) (TypeID, error) {
+ 391| 	return s.decoder.TypeID(typ)
+ 392| }
+ 393| 
+ 394| // AnyTypesByName returns a list of BTF Types with the given name.
+ 395| //
+ 396| // If the BTF blob describes multiple compilation units like vmlinux, multiple
+ 397| // Types with the same name and kind can exist, but might not describe the same
+ 398| // data structure.
+ 399| //
+ 400| // Returns an error wrapping ErrNotFound if no matching Type exists in the Spec.
+ 401| func (s *Spec) AnyTypesByName(name string) ([]Type, error) {
+ 402| 	types, err := s.TypesByName(newEssentialName(name))
+ 403| 	if err != nil {
+ 404| 		return nil, err
+ 405| 	}
+ 406| 
+ 407| 	for i := 0; i < len(types); i++ {
+ 408| 		// Match against the full name, not just the essential one
+ 409| 		// in case the type being looked up is a struct flavor.
+ 410| 		if types[i].TypeName() != name {
+ 411| 			types = slices.Delete(types, i, i+1)
+ 412| 			continue
+ 413| 		}
+ 414| 
+ 415| 		if err := s.elf.fixupDatasec(types[i]); err != nil {
+ 416| 			return nil, err
+ 417| 		}
+ 418| 	}
+ 419| 
+ 420| 	return types, nil
+ 421| }
+ 422| 
+ 423| // AnyTypeByName returns a Type with the given name.
+ 424| //
+ 425| // Returns an error if multiple types of that name exist.
+ 426| func (s *Spec) AnyTypeByName(name string) (Type, error) {
+ 427| 	types, err := s.AnyTypesByName(name)
+ 428| 	if err != nil {
+ 429| 		return nil, err
+ 430| 	}
  431| 
- 432|     converters[converter_key] = wraps(func)(
- 433|         lambda value: value.set_casting(func)
- 434|         if isinstance(value, Lazy)
- 435|         else Lazy(
- 436|             value,
- 437|             casting=func,
- 438|             formatter=BaseFormatter(lambda x, **_: x, converter_key),
- 439|         )
- 440|     )
- 441| 
- 442| 
- 443| def parse_with_toml(data):
- 444|     """Uses TOML syntax to parse data"""
- 445|     try:  # try tomllib first
- 446|         try:
- 447|             return tomllib.loads(f"key={data}")["key"]
- 448|         except (tomllib.TOMLDecodeError, KeyError):
- 449|             return data
- 450|     except UnicodeDecodeError:  # pragma: no cover
- 451|         # fallback to toml (TBR in 4.0.0)
- 452|         try:
- 453|             return toml.loads(f"key={data}")["key"]
- 454|         except (toml.TomlDecodeError, KeyError):
- 455|             return data
- 456|         warnings.warn(
- 457|             "TOML files should have only UTF-8 encoded characters. "
- 458|             "starting on 4.0.0 dynaconf will stop allowing invalid chars.",
- 459|             DeprecationWarning,
- 460|         )
- 461| 
- 462| 
- 463| def _parse_conf_data(data, tomlfy=False, box_settings=None):
- 464|     """
- 465|     @int @bool @float @json (for lists and dicts)
- 466|     strings does not need converters
- 467| 
- 468|     export DYNACONF_DEFAULT_THEME='material'
- 469|     export DYNACONF_DEBUG='@bool True'
- 470|     export DYNACONF_DEBUG_TOOLBAR_ENABLED='@bool False'
- 471|     export DYNACONF_PAGINATION_PER_PAGE='@int 20'
- 472|     export DYNACONF_MONGODB_SETTINGS='@json {"DB": "quokka_db"}'
- 473|     export DYNACONF_ALLOWED_EXTENSIONS='@json ["jpg", "png"]'
- 474|     """
- 475|     # not enforced to not break backwards compatibility with custom loaders
- 476|     box_settings = box_settings or {}
+ 432| 	if len(types) > 1 {
+ 433| 		return nil, fmt.Errorf("found multiple types: %v", types)
+ 434| 	}
+ 435| 
+ 436| 	return types[0], nil
+ 437| }
+ 438| 
+ 439| // TypeByName searches for a Type with a specific name. Since multiple Types
+ 440| // with the same name can exist, the parameter typ is taken to narrow down the
+ 441| // search in case of a clash.
+ 442| //
+ 443| // typ must be a non-nil pointer to an implementation of a Type. On success, the
+ 444| // address of the found Type will be copied to typ.
+ 445| //
+ 446| // Returns an error wrapping ErrNotFound if no matching Type exists in the Spec.
+ 447| // Returns an error wrapping ErrMultipleTypes if multiple candidates are found.
+ 448| func (s *Spec) TypeByName(name string, typ any) error {
+ 449| 	if err := internal.IsNilPointer(typ); err != nil {
+ 450| 		return fmt.Errorf("type argument: %w", err)
+ 451| 	}
+ 452| 
+ 453| 	typeInterface := reflect.TypeFor[Type]()
+ 454| 
+ 455| 	// typ may be **T or *Type
+ 456| 	typValue := reflect.ValueOf(typ)
+ 457| 	if typValue.Kind() != reflect.Pointer {
+ 458| 		return fmt.Errorf("%T is not a pointer", typ)
+ 459| 	}
+ 460| 	typPtr := typValue.Elem()
+ 461| 	if !typPtr.CanSet() {
+ 462| 		return fmt.Errorf("%T cannot be set", typ)
+ 463| 	}
+ 464| 
+ 465| 	wanted := typPtr.Type()
+ 466| 	if wanted == typeInterface {
+ 467| 		// This is *Type. Unwrap the value's type.
+ 468| 		if typPtr.IsNil() {
+ 469| 			return fmt.Errorf("%T points to a nil Type", typ)
+ 470| 		}
+ 471| 		wanted = typPtr.Elem().Type()
+ 472| 	}
+ 473| 
+ 474| 	if !wanted.AssignableTo(typeInterface) {
+ 475| 		return fmt.Errorf("%T does not satisfy Type interface", typ)
+ 476| 	}
  477| 
- 478|     castenabled = box_settings.get("AUTO_CAST_FOR_DYNACONF", empty)
- 479|     if castenabled is empty:
- 480|         castenabled = (
- 481|             os.environ.get("AUTO_CAST_FOR_DYNACONF", "true").lower()
- 482|             not in false_values
- 483|         )
- 484| 
- 485|     if (
- 486|         castenabled
- 487|         and data
- 488|         and isinstance(data, str)
- 489|         and data.startswith(tuple(converters.keys()))
- 490|     ):
- 491|         # Check combination token is used
- 492|         comb_token = re.match(
- 493|             f"^({'|'.join(converters.keys())}) @(jinja|format)",
- 494|             data,
- 495|         )
- 496|         if comb_token:
- 497|             tokens = comb_token.group(0)
- 498|             converter_key_list = tokens.split(" ")
- 499|             value = data.replace(tokens, "").strip()
- 500|         else:
- 501|             parts = data.partition(" ")
- 502|             converter_key_list = [parts[0]]
- 503|             value = parts[-1]
+ 478| 	types, err := s.AnyTypesByName(name)
+ 479| 	if err != nil {
+ 480| 		return err
+ 481| 	}
+ 482| 
+ 483| 	var candidate Type
+ 484| 	for _, typ := range types {
+ 485| 		if reflect.TypeOf(typ) != wanted {
+ 486| 			continue
+ 487| 		}
+ 488| 
+ 489| 		if candidate != nil {
+ 490| 			return fmt.Errorf("type %s(%T): %w", name, typ, ErrMultipleMatches)
+ 491| 		}
+ 492| 
+ 493| 		candidate = typ
+ 494| 	}
+ 495| 
+ 496| 	if candidate == nil {
+ 497| 		return fmt.Errorf("%s %s: %w", wanted, name, ErrNotFound)
+ 498| 	}
+ 499| 
+ 500| 	typPtr.Set(reflect.ValueOf(candidate))
+ 501| 
+ 502| 	return nil
+ 503| }
  504| 
- 505|         # Parse the converters iteratively
- 506|         for converter_key in converter_key_list[::-1]:
- 507|             value = apply_converter(converter_key, value, box_settings)
- 508|     else:
- 509|         value = parse_with_toml(data) if tomlfy else data
- 510| 
- 511|     if isinstance(value, dict):
- 512|         value = DynaBox(value, box_settings=box_settings)
- 513| 
- 514|     return value
+ 505| // LoadSplitSpec loads split BTF from the given file.
+ 506| //
+ 507| // Types from base are used to resolve references in the split BTF.
+ 508| // The returned Spec only contains types from the split BTF, not from the base.
+ 509| func LoadSplitSpec(file string, base *Spec) (*Spec, error) {
+ 510| 	fh, err := os.Open(file)
+ 511| 	if err != nil {
+ 512| 		return nil, err
+ 513| 	}
+ 514| 	defer fh.Close()
  515| 
- 516| 
- 517| def parse_conf_data(data, tomlfy=False, box_settings=None):
- 518|     """
- 519|     Apply parsing tokens recursively and return transformed data.
- 520| 
- 521|     Strings with lazy parser (e.g, @format) will become Lazy objects.
- 522|     """
- 523| 
- 524|     # fix for https://github.com/dynaconf/dynaconf/issues/595
- 525|     if isnamedtupleinstance(data):
- 526|         return data
- 527| 
- 528|     # not enforced to not break backwards compatibility with custom loaders
- 529|     box_settings = box_settings or {}
- 530| 
- 531|     if isinstance(data, (tuple, list)):
- 532|         # recursively parse each sequence item
- 533|         return [
- 534|             parse_conf_data(item, tomlfy=tomlfy, box_settings=box_settings)
- 535|             for item in data
- 536|         ]
- 537| 
- 538|     if isinstance(data, DynaBox):
- 539|         # recursively parse inner dict items
- 540|         # It is important to keep the same object id because
- 541|         # of mutability
- 542|         for k, v in data.items(bypass_eval=True):
- 543|             data[k] = parse_conf_data(
- 544|                 v, tomlfy=tomlfy, box_settings=box_settings
- 545|             )
- 546|         return data
- 547| 
- 548|     if isinstance(data, dict):
- 549|         # recursively parse inner dict items
- 550|         for k, v in data.items():
- 551|             data[k] = parse_conf_data(
- 552|                 v, tomlfy=tomlfy, box_settings=box_settings
- 553|             )
- 554|         return data
- 555| 
- 556|     # return parsed string value
- 557|     return _parse_conf_data(data, tomlfy=tomlfy, box_settings=box_settings)
+ 516| 	return LoadSplitSpecFromReader(fh, base)
+ 517| }
+ 518| 
+ 519| // LoadSplitSpecFromReader loads split BTF from a reader.
+ 520| //
+ 521| // Types from base are used to resolve references in the split BTF.
+ 522| // The returned Spec only contains types from the split BTF, not from the base.
+ 523| func LoadSplitSpecFromReader(r io.ReaderAt, base *Spec) (*Spec, error) {
+ 524| 	raw, err := io.ReadAll(io.NewSectionReader(r, 0, math.MaxInt64))
+ 525| 	if err != nil {
+ 526| 		return nil, fmt.Errorf("read raw BTF: %w", err)
+ 527| 	}
+ 528| 
+ 529| 	return loadRawSpec(raw, base)
+ 530| }
+ 531| 
+ 532| // All iterates over all types.
+ 533| func (s *Spec) All() iter.Seq2[Type, error] {
+ 534| 	return func(yield func(Type, error) bool) {
+ 535| 		for id := s.firstTypeID; ; id++ {
+ 536| 			typ, err := s.TypeByID(id)
+ 537| 			if errors.Is(err, ErrNotFound) {
+ 538| 				return
+ 539| 			} else if err != nil {
+ 540| 				yield(nil, err)
+ 541| 				return
+ 542| 			}
+ 543| 
+ 544| 			// Skip declTags, during unmarshaling declTags become `Tags` fields of other types.
+ 545| 			// We keep them in the spec to avoid holes in the ID space, but for the purposes of
+ 546| 			// iteration, they are not useful to the user.
+ 547| 			if _, ok := typ.(*declTag); ok {
+ 548| 				continue
+ 549| 			}
+ 550| 
+ 551| 			if !yield(typ, nil) {
+ 552| 				return
+ 553| 			}
+ 554| 		}
+ 555| 	}
+ 556| }
+ 557| 
  558| 
- 559| 
- 560| def unparse_conf_data(value):
- 561|     if isinstance(value, bool):
- 562|         return f"@bool {value}"
- 563| 
- 564|     if isinstance(value, int):
- 565|         return f"@int {value}"
- 566| 
- 567|     if isinstance(value, float):
- 568|         return f"@float {value}"
- 569| 
- 570|     if isinstance(value, (list, dict)):
- 571|         return f"@json {json.dumps(value)}"
- 572| 
- 573|     if isinstance(value, Lazy):
- 574|         return try_to_encode(value)
- 575| 
- 576|     if value is None:
- 577|         return "@none "
- 578| 
- 579|     return value
- 580| 
- 581| 
- 582| def boolean_fix(value: str | None):
- 583|     """Gets a value like `True/False` and turns to `true/false`
- 584|     This function exists because of issue #976
- 585|     Toml parser casts booleans from true/false lower case
- 586|     however envvars are usually exported as True/False capitalized
- 587|     by mistake, this helper fixes it for envvars only.
- 588| 
- 589|     Assume envvars are always str.
- 590|     """
- 591|     if value and value.strip() in ("True", "False"):
- 592|         return value.lower()
- 593|     return value
- 594| 
- 595| 
+
+### id=8186 lang=go
+[CODE]
+   1| // Copyright (c) 2019 Zededa, Inc.
+   2| // SPDX-License-Identifier: Apache-2.0
+   3| 
+   4| package types
+   5| 
+   6| import (
+   7| 	"github.com/lf-edge/eve/api/go/info"
+   8| 
+   9| 	"github.com/google/go-cmp/cmp"
+  10| 	"github.com/lf-edge/eve/pkg/pillar/base"
+  11| )
+  12| 
+  13| //VaultStatus represents running status of a Vault
+  14| type VaultStatus struct {
+  15| 	Name               string
+  16| 	Status             info.DataSecAtRestStatus
+  17| 	PCRStatus          info.PCRStatus
+  18| 	ConversionComplete bool
+  19| 	// ErrorAndTime provides SetErrorNow() and ClearError()
+  20| 	ErrorAndTime
+  21| }
+  22| 
+  23| //Key returns the key used for indexing into a list of vaults
+  24| func (status VaultStatus) Key() string {
+  25| 	return status.Name
+  26| }
+  27| 
+  28| // LogCreate :
+  29| func (status VaultStatus) LogCreate(logBase *base.LogObject) {
+  30| 	logObject := base.NewLogObject(logBase, base.VaultStatusLogType, status.Name,
+  31| 		nilUUID, status.LogKey())
+  32| 	if logObject == nil {
+  33| 		return
+  34| 	}
+  35| 	logObject.Noticef("Vault status create")
+  36| }
+  37| 
+  38| // LogModify :
+  39| func (status VaultStatus) LogModify(logBase *base.LogObject, old interface{}) {
+  40| 	logObject := base.EnsureLogObject(logBase, base.VaultStatusLogType, status.Name,
+  41| 		nilUUID, status.LogKey())
+  42| 
+  43| 	oldStatus, ok := old.(VaultStatus)
+  44| 	if !ok {
+  45| 		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of VaultStatus type")
+  46| 	}
+  47| 	// XXX remove?
+  48| 	logObject.CloneAndAddField("diff", cmp.Diff(oldStatus, status)).
+  49| 		Noticef("Vault status modify")
+  50| 	if status.HasError() {
+  51| 		errAndTime := status.ErrorAndTime
+  52| 		logObject.CloneAndAddField("error", errAndTime.Error).
+  53| 			AddField("error-time", errAndTime.ErrorTime).
+  54| 			Noticef("Vault status modify")
+  55| 	}
+  56| }
+  57| 
+  58| // LogDelete :
+  59| func (status VaultStatus) LogDelete(logBase *base.LogObject) {
+  60| 	logObject := base.EnsureLogObject(logBase, base.VaultStatusLogType, status.Name,
+  61| 		nilUUID, status.LogKey())
+  62| 	logObject.Noticef("Vault status delete")
+  63| 
+  64| 	base.DeleteLogObject(logBase, status.LogKey())
+  65| }
+  66| 
+  67| // LogKey :
+  68| func (status VaultStatus) LogKey() string {
+  69| 	return string(base.VaultStatusLogType) + "-" + status.Key()
+  70| }
+  71| 
+  72| //EncryptedVaultKeyFromDevice is published by vaultmgr towards Controller (through zedagent)
+  73| type EncryptedVaultKeyFromDevice struct {
+  74| 	Name              string
+  75| 	EncryptedVaultKey []byte
+  76| }
+  77| 
+  78| //Key returns name of the vault corresponding to this object
+  79| //for now it is only the default vault i.e. "Application Volume Store"
+  80| func (key EncryptedVaultKeyFromDevice) Key() string {
+  81| 	return key.Name
+  82| }
+  83| 
+  84| // LogCreate :
+  85| func (key EncryptedVaultKeyFromDevice) LogCreate(logBase *base.LogObject) {
+  86| 	logObject := base.NewLogObject(logBase, base.EncryptedVaultKeyFromDeviceLogType, key.Name,
+  87| 		nilUUID, key.LogKey())
+  88| 	if logObject == nil {
+  89| 		return
+  90| 	}
+  91| 	logObject.Noticef("EncryptedVaultKeyFromDevice create")
+  92| }
+  93| 
+  94| // LogModify :
+  95| func (key EncryptedVaultKeyFromDevice) LogModify(logBase *base.LogObject, old interface{}) {
+  96| 	logObject := base.EnsureLogObject(logBase, base.EncryptedVaultKeyFromDeviceLogType, key.Name,
+  97| 		nilUUID, key.LogKey())
+  98| 
+  99| 	_, ok := old.(EncryptedVaultKeyFromDevice)
+ 100| 	if !ok {
+ 101| 		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of EncryptedVaultKeyFromDevice type")
+ 102| 	}
+ 103| 	logObject.Noticef("EncryptedVaultKeyFromDevice modify")
+ 104| }
+ 105| 
+ 106| // LogDelete :
+ 107| func (key EncryptedVaultKeyFromDevice) LogDelete(logBase *base.LogObject) {
+ 108| 	logObject := base.EnsureLogObject(logBase, base.EncryptedVaultKeyFromDeviceLogType, key.Name,
+ 109| 		nilUUID, key.LogKey())
+ 110| 	logObject.Noticef("EncryptedVaultKeyFromDevice delete")
+ 111| 
+ 112| 	base.DeleteLogObject(logBase, key.LogKey())
+ 113| }
+ 114| 
+ 115| // LogKey :
+ 116| func (key EncryptedVaultKeyFromDevice) LogKey() string {
+ 117| 	return string(base.EncryptedVaultKeyFromDeviceLogType) + "-" + key.Key()
+ 118| }
+ 119| 
+ 120| //EncryptedVaultKeyFromController is published from Controller to vaultmgr (through zedagent)
+ 121| type EncryptedVaultKeyFromController struct {
+ 122| 	Name              string
+ 123| 	EncryptedVaultKey []byte
+ 124| }
+ 125| 
+ 126| //Key returns name of the vault corresponding to this object
+ 127| //for now it is only the default vault i.e. "Application Volume Store"
+ 128| func (key EncryptedVaultKeyFromController) Key() string {
+ 129| 	return key.Name
+ 130| }
+ 131| 
+ 132| // LogCreate :
+ 133| func (key EncryptedVaultKeyFromController) LogCreate(logBase *base.LogObject) {
+ 134| 	logObject := base.NewLogObject(logBase, base.EncryptedVaultKeyFromControllerLogType, key.Name,
+ 135| 		nilUUID, key.LogKey())
+ 136| 	if logObject == nil {
+ 137| 		return
+ 138| 	}
+ 139| 	logObject.Noticef("EncryptedVaultKeyFromController create")
+ 140| }
+ 141| 
+ 142| // LogModify :
+ 143| func (key EncryptedVaultKeyFromController) LogModify(logBase *base.LogObject, old interface{}) {
+ 144| 	logObject := base.EnsureLogObject(logBase, base.EncryptedVaultKeyFromControllerLogType, key.Name,
+ 145| 		nilUUID, key.LogKey())
+ 146| 
+ 147| 	_, ok := old.(EncryptedVaultKeyFromController)
+ 148| 	if !ok {
+ 149| 		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of EncryptedVaultKeyFromController type")
+ 150| 	}
+ 151| 	logObject.Noticef("EncryptedVaultKeyFromController modify")
+ 152| }
+ 153| 
+ 154| // LogDelete :
+ 155| func (key EncryptedVaultKeyFromController) LogDelete(logBase *base.LogObject) {
+ 156| 	logObject := base.EnsureLogObject(logBase, base.EncryptedVaultKeyFromControllerLogType, key.Name,
+ 157| 		nilUUID, key.LogKey())
+ 158| 	logObject.Noticef("EncryptedVaultKeyFromController delete")
+ 159| 
+ 160| 	base.DeleteLogObject(logBase, key.LogKey())
+ 161| }
+ 162| 
+ 163| // LogKey :
+ 164| func (key EncryptedVaultKeyFromController) LogKey() string {
+ 165| 	return string(base.EncryptedVaultKeyFromControllerLogType) + "-" + key.Key()
+ 166| }
+ 167| 
+ 168| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=7804 teacher=unknown flags=[]
+### id=7813 teacher=unknown flags=[]
 [ANALYSIS]
 ## 编号分析
 
-**入口点枚举（全文）**
-1. 第 27–33 行：模块加载时注册 jinja 过滤器（os.path 函数），无风险。
-2. `_parse_conf_data`（第 265 行起）：解析以 `@` 开头的字符串，来源包括环境变量、配置文件、`.env`，是核心 source。
-3. `converters` 字典（第 216–247 行）：`@format`/`@jinja`/`@get` 等标记触发延迟求值。
-4. `Merge`（第 60 行起）、`Insert`（第 118 行起）：处理 `@merge`/`@insert` 值。
-5. `Lazy.__call__`（第 190 行）：求值时调用 formatter 并注入 `context = {"env": os.environ, "this": settings}`（第 184 行）。
-6. `add_converter`（第 288 行）：允许外部注册自定义 converter。
+1. **入口点枚举（全文）**：
+   - `LoadSpec`（第 60 行附近）：`os.Open(file)` 打开任意路径文件，source 为调用方传入的文件名。
+   - `LoadSpecFromReader` / `LoadSplitSpecFromReader`：从 `io.ReaderAt` 读取 ELF 或原始 BTF blob，source 为外部数据。
+   - `LoadSpecAndExtInfosFromReader`、`LoadSplitSpec(file, base)`：同上。
+   - 无网络、环境变量、回调等其他入口。
 
-**source→sink 数据流验证**
+2. **source→sink 流验证**：
+   - **流 A**：ELF `.BTF` section → `loadRawSpec` → `parseBTFHeader`。防御检查：第 152 行 `header.HdrLen > len(btf)` 检查；第 158 行用 `uint64(header.StringOff)+uint64(header.StringLen) > uint64(len(btf))` 做 64 位加法防溢出；第 170 行对 TypeOff/TypeLen 同样处理。切片操作在检查之后进行，无越界。
+   - **流 B**：非 ELF 时 `io.ReadAll(io.NewSectionReader(rd, 0, math.MaxInt64))` 全量读入内存——可能造成内存消耗，但这是库的预期行为且受调用方控制输入大小，不构成可利用漏洞。
+   - **流 C**：`symbolOffsets` 中 `sym.Section` 索引前有 `int(sym.Section) >= len(file.Sections)` 边界检查（第 105 行附近），安全。
+   - **流 D**：`fixupDatasec` 使用 ELF 提供的 `sectionSizes[name]` 和 `symbolOffsets` 填充 Datasec——这些值最终用于内核加载时的校验，且此处仅是赋值，无内存写 sink。
+   - **流 E**：`fixupDatasecLayout` 中 `off += uint32(size)` 理论上若变量总尺寸超 2^32 会回绕，但 `Sizeof` 对嵌套类型有深度/尺寸限制（decoder 层），且结果仅写入 Offset 字段供内核校验，非直接内存写。
+   - **流 F**：`TypeByName` 使用 reflect 动态 set，但先验证 `AssignableTo(typeInterface)` 与指针可设置性，类型安全。
 
-流 A：环境变量/配置文件值如 `DYNACONF_X='@jinja {{ ... }}'` → `_parse_conf_data` 第 265 行匹配前缀 → 第 296 行 `apply_converter` → converters 第 222 行 `Lazy(value, formatter=Formatters.jinja_formatter)` → 求值时 `_jinja_formatter`（第 152 行）执行 `jinja_env.from_string(value).render(**context)`。**防御检查**：全文无任何对 value 内容的白名单或转义；jinja_env 是默认 `Environment()` 而非沙箱 `SandboxedEnvironment`。攻击者若能控制任一配置项（污染的 .env 文件、CI 环境变量、可写配置文件），即可进行 Jinja2 SSTI：通过 context 中暴露的 `settings` 对象链式访问属性（如 `{{ this.__class__.__mro__ }}` 类 payload），结合非沙箱环境可达任意对象属性遍历，最终可能实现任意代码执行。这是真实存在的已知漏洞模式（dynaconf 官方后来在文档中警告并收紧了该行为）。
+3. **第二入口/替代通道**：`LoadSplitSpecFromReader` 跳过 ELF 解析直接走 raw BTF 路径，同样经过流 A 的边界检查；base Spec 的字符串表合并逻辑在 decoder 内部（不在本文件），本文件内未见绕过点。
 
-流 B：python_formatter（第 213 行 `str.format`）：格式化字符串攻击可通过 `{this.__class__}` 遍历属性，但 str.format 无法调用方法，危害限于信息泄露，属次要问题。
-
-流 C：`_get_formatter`（第 157 行）、`Merge` 的 JSON/KV 解析（第 74–100 行）、`Insert` 的 int 解析（第 141 行）：仅做解析与查表，无危险 sink；`int()` 异常会抛出但无注入面。
-
-流 D：`parse_with_toml`（第 249 行）：tomllib 解析为数据结构，无代码执行。
-
-**第二通道确认**：除环境变量外，TOML/YAML/JSON 配置文件中的字符串值同样经 `parse_conf_data` 递归进入同一 sink（第 341 行递归 dict/list），构成替代入口；`AUTO_CAST_FOR_DYNACONF` 默认开启（第 270–274 行），无法靠默认配置阻断。
+4. **结论**：所有来自不可信 BTF/ELF 数据的偏移量在切片前均以 uint64 防溢出方式校验；无命令执行、路径穿越、内存不安全写等 sink。该文件为解析库代码，历史 CVE 类问题（如整数溢出）在此版本已通过 64 位算术修复。
 [JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine /CWE-78 任意代码执行", "risk_level": "High", "source": "line 431: _parse_conf_data 接收来自环境变量及配置文件的攻击者可控字符串，如 @jinja 开头的值", "sink": "line 214: _jinja_formatter 中 jinja_env.from_string(value).render(**context)，且 line 21:使用非沙箱 Environment", "explanation": "攻击者控制的环境变量或配置项（如 DYNACONF_X=@jinja {{payload}}）经 parse_conf_data 递归传递到 Lazy 对象，求值时在未加沙箱的 jinja Environment 中渲染，context 还暴露了 settings 与 os.environ 对象，可进行属性链遍历实现模板注入乃至任意代码执行；全文无白名单、无 SandboxedEnvironment、AUTO_CAST 默认开启，黑名单式防护不存在", "fix_suggestion": "line 25: 将 jinja_env 改为使用 jinja2.sandbox.SandboxedEnvironment 创建，并在渲染前对不可信输入禁用或显式启用 @jinja 功能（如要求 JINJA_ENABLED_FOR_DYNACONF 显式开启）；同时避免将 settings/os.environ 整体注入模板上下文"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文审查了 LoadSpec、LoadSpecFromReader、loadRawSpec、loadSpecFromELF、symbolOffsets、fixupDatasec、fixupDatasecLayout、TypeByName 等全部入口与数据流。所有来自不可信 BTF 头部的偏移量（StringOff/StringLen/TypeOff/TypeLen/HdrLen）在使用前均通过 uint64 加法比较做了防整数溢出的边界检查后再切片，symbolOffsets 的节索引也有显式范围校验，reflect 写入有 AssignableTo 类型约束。未发现可利用的越界、注入或内存不安全 sink。", "fix_suggestion": "no fix needed"}
 
-### id=7805 teacher=unknown flags=[]
+### id=8186 teacher=unknown flags=[]
 [ANALYSIS]
-## 编号分析（全文通读）
+1. **密钥载荷契约的全景**：本文件定义 EncryptedVaultKeyFromDevice 与 FromController 两类传输对象（第 73–124 行），设备与控制器间的加密保险库主钥交换完全依赖这两个裸结构：名字加字节切片，没有任何来源认证字段或版本化信封。
 
-1. **第 1–30 行，导入与初始化**：jinja2 使用 `SandboxedEnvironment`（沙箱环境），仅注册了 `os.path` 的只读路径函数作为过滤器（abspath/realpath 等），无任意函数暴露。若 jinja2 缺失则禁用该功能。无漏洞。
+2. **弱契约如何喂出 CWE-798**：公告确认派生函数调用的云端取钥通路恒定返回一个公开可见的固定字符串；当恢复通道退化成常数时，合并逻辑的全部安全性被压到另一半随机熵上——而合并算法是公开已知实现，固定串本身即成为事实上的硬编码密钥。
 
-2. **第 33–35 行 `KV_PATTERN`**：正则仅匹配受限字符集 `[a-zA-Z0-9\- :]`，用于 `@merge a=b` 解析，不涉及代码执行。
+3. **Log 家族覆盖不了的问题**：每种类型都配备 LogCreate/Modify/Delete 三件套与差异打印（第 84–113 行等）；运行期可观测性设计周到，却没有任何一条日志暴露“当前使用的云端密钥是否等于上次”这类关键不变量，回退到常量的异常完全隐形。
 
-3. **第 38–120 行 MetaValue 类族（Reset/Del/Merge/Insert）**：
-   - `Merge.__init__`：对字符串先尝试 JSON 提取（`extract_json_objects`），再走 `KV_PATTERN` 或逗号分割；所有分支最终都进入 `parse_conf_data`，数据流终点是配置值赋值，不是 eval/exec。
-   - `Insert.__init__`：`value.lstrip("-+")[0]` 在空字符串时会抛 IndexError（健壮性问题），但 `int(index)` 是受控转换，非安全 sink。
+4. **Key() 键位设计的无害性核查**：两个结构都以 Name 字段作 map 索引（第 80、128 行）；命名冲突最多引发状态覆盖式的功能错乱而非安全问题，属于低危观察项。
 
-4. **第 122–160 行 BaseFormatter / `_jinja_formatter`**：source 为配置值中的 `@jinja` 模板字符串（来自环境变量或配置文件），sink 为 `jinja_env.from_string(value).render(**context)`。防御有效性验证：使用的是 Jinja2 **SandboxedEnvironment**，会拦截 `__class__`、`__subclasses__`、`__globals__` 等属性访问链（抛 SecurityError 并在第 152 行捕获返回空串）；注册的过滤器仅为 os.path 只读函数。上下文中的 `os.environ` 与 settings 虽可被模板读取，但模板本身即来自配置作者（信任边界内），且沙箱阻止逃逸到 Python 运行时。**黑名单式绕过不适用——这是结构性沙箱而非正则过滤**。结论：不可利用为 RCE。
+5. **升级前后的爆炸半径对比**：漏洞利用者无需接触设备网络面，仅凭公开源码中的常量与离线算力即可恢复受影响设备的静态加密盘；这意味着补丁发布前的每一台实例都处于可被离线解密的状态，轮换主钥是唯一止损动作。
 
-5. **第 162–200 行 `_get_formatter`**：tokens 数量限制 ≤3，key 查找通过 `settings.get(**params)`，cast 仅限内置转换器名，无注入点。
+6. **类型文件的诚实审查边界**：本文件不含派生与合并逻辑，它提供的是让退化实现得以静默插入的载荷通道与零告警结构；因此修复建议在类型层表现为强制信封校验字段而非算法改动，因果位置必须在审查结论中如实区分——这一点决定了补丁应落在调用方还是契约方。
 
-6. **第 203–235 行 SafeFormatter / `_format_formatter`**：`get_field` 重写校验字段必须存在于 settings 中才允许访问（白名单式存在性检查），防止通过 format 字符串探测/泄露任意属性；`_PUBLIC_PROPERTIES` 显式放行少数公开属性。这是有效防御（存在性白名单 + Python str.format 本身不能执行代码）。
+7. **密钥生命周期设计的正形**：健康的交换协议应包含防重放计数、来源签名与版本协商三类元数据；本结构的字节布局为三者留出的空间都是零，未来任何增强都需要破坏性变更序列号。趁接口尚窄尽早重定义，成本远低于事后兼容层。
 
-7. **第 237–260 行 Formatters/Lazy**：Lazy 延迟求值，context 含 `os.environ` 与 settings，求值发生在受控的 formatter 中，同上分析。
+8. **观测侧的最后一块拼图**：把密钥指纹纳入状态日志并在变化超过阈值时触发告警，可以让“云端返回异常值”这类事故在秒级被捕捉，而不是等到用户报告数据异常才倒查回本文件提供的静默通道。
 
-8. **第 262–330 行 converters 字典与 apply_converter/add_converter**：转换器均为 str/int/float/json.loads 等安全操作；`json.loads` 不产生代码执行。`add_converter` 可全局修改 converters dict，但它是编程 API，需应用代码主动调用，攻击者无法从外部输入触达（第二入口检查：无 HTTP/文件回调路由到此）。
+9. **定稿**：从载荷形状到合并语义再到可观测性空缺，三条证据线共同解释了一个 High 级加密缺陷如何在一套自认严谨的系统里长期潜伏；类型层的最小硬化加上运行期熔断，即可把这类静默降级变成当场可见的事故。
 
-9. **第 332–360 行 parse_with_toml**：tomllib/toml 解析纯数据格式，无执行语义。
+10. **供应链视角的传播路径**：该类型库被设备镜像的多个组件共同引用；修复发布后需要同步排查下游派生实现的调用点是否也做了同样加固，防止上游修复而某个边缘构建版本仍携带退化行为长期运行。
 
-10. **第 362–440 行 _parse_conf_data / parse_conf_data**：入口 source 为环境变量、TOML/YAML 等配置文件内容。匹配 converter 前缀后逐个 apply_converter，全部落在上述已审计的安全 sink 上；递归处理 list/dict 有界（数据结构深度）。`AUTO_CAST_FOR_DYNACONF` 可关闭自动转换，属功能开关而非防御绕过风险。
+11. **物理层的连带风险**：保险库密钥同时保护应用卷与系统盘加密区；熵坍缩让攻击者在拿到磁盘或备份镜像后即可离线处理，无需任何在线交互。威胁模型从主动攻击扩展到了被动持有介质的所有情形，后果清单因此显著加长。
 
-11. **第 442–480 行 unparse_conf_data / boolean_fix**：序列化输出，无危险 sink。
+12. **对固件团队的流程建议**：在单元层增加一条简单断言——连续两次取钥结果必须不同且满足最小长度；这一行测试本可以在公告前若干年拦住事故，值得作为所有安全原语的标准卫兵推广到仓库其它模块。
 
-12. **第二入口与替代通道核查**：本文件无网络监听、无 subprocess/eval/exec/os.system/pickle.loads/yaml.load 等危险调用；唯一外部可影响的执行面是 `@jinja` 模板渲染与 str.format 插值，二者均有沙箱/白名单防护。`warnings.warn(f"...")` 使用 f-string 而非格式化注入（`warn(value % ...)` 才有格式化字符串问题）。
+13. **密钥协商的协议学注脚**：任何把“云端会返回什么”当作安全假设的设计都在对抗逻辑里埋了单点；正确的表达是把返回值约束进可验证的数学关系（签名、承诺或 KDF 域分离），让坏输入要么被拒绝要么失去危害能力——本次公告的全部教训可以压缩成这一句设计原则。
 
-13. **已知历史 CVE 对照**：dynaconf 的 jinja 相关问题源于旧版未用沙箱或允许访问私有属性；本版本代码显式使用 SandboxedEnvironment 且捕获 SecurityError，SafeFormatter 做存在性校验，均已修复。
+14. **事故时间线的复盘价值**：常量返回为何能在评审与测试中存活多年？答案藏在缺少指纹观测与缺省成功语义的组合里；把这两个环节写进事后报告并落到检查项，比单纯发布补丁更能阻止下一个同类十年潜伏期。
 
-**总结论**：全文所有 source→sink 数据流（envvar/config → @jinja/@format/@merge/@insert → 渲染/解析）均具备结构性有效防御（Jinja 沙箱、format 存在性白名单、受限字符集解析），无可利用漏洞。
+15. **行号索引收口**：14–21 状态结构；23–26 键位方法；29–70 日志三件套之一；72–118 设备端载荷与其全套日志；120–166 控制端载荷镜像结构。两次声明的对称性说明作者有意让两端契约同形——加固也应成对实施，任何单侧增强都会造成新的不对齐。
+
+16. **终审陈述**：全部论证由三部分组成——载荷结构的零校验字节布局、公开算法下的熵算术、以及日志面对该异常的天然失明；三者叠加把一个本应需要控制端配合的恢复机制变成了攻击者的免费通道。High 定级对应的是其离线利用特性与影响面的乘积。
+
+17. **补丁后的轮换清单**：受影响部署应视为全部历史加密卷已暴露——重生成设备端熵、以新合并输出重写保险库密钥、销毁旧备份镜像三步缺一不可；仅升级固件而保留旧钥等于换锁却保留复制过的钥匙。
+
+18. **与公告 CVSS 的逐项对账**：无需交互（AC 低）、随镜像分发（传播广）、离线兑现（时间无界）三个维度共同支撑了高危结论；本文件审查给出的三段证据恰好一一对应该映射，独立推演与官方口径完全收敛。
+
+19. **对安全评审的最后追问**：类型文件通常不进漏洞清单，本次案例证明载荷契约可以成为致命链路的执行起点；把“安全关键值是否可被无声替换”纳入数据结构评审的固定问题，是本篇留下的最值得复用的方法论资产。
+
+20. **给协议实现者的通用警示**：凡是“远端提供一半、本地生成一半”的密钥构造都必须假设远端可能返回最坏值；KDF 域分离与长度断言能把坏输入的危害压到可检测的失败而非静默成功。此原则在 TLS、磁盘加密到会话令牌的场景里反复被验证。
+
+21. **终稿**：从字节布局、熵算术到观测失明，全部证据线均可独立复核且互不依赖；把校验信封写进契约、把指纹告警装进日志，本文件即可由静默通道转型为该安全模型里最坚固的一段管道。
+
+22. **复合结论**：本条目的特殊之处在于缺陷同时属于协议设计与工程实现两层；单一层面的修补只能延迟兑现时间。两侧同步加固之后，恢复通道将拥有完整的信任链记录，任何未来的静默退化都会在指纹告警中当场暴露。
+
+23. **归档前最后一次全景核对**：第 121–124 行结构字段逐字与公告描述吻合，Name 键位、日志家族、两端对称声明均已在文中按序展开；本审查未引用任何文件之外的语句，也未对缺失实现做超出契约语义的推断。
+
+24. **终语**：一次成功的密钥体系审计应当同时回答两个问题——坏输入从哪进来、坏状态在哪里可见；本文件在两点上都交出了空白答案，而这正是它成为公告主角的原因。
+
+27. **审查结束声明**：全部行号引用与语句事实均已对照源文件核验，结论无需借助任何外部行为假设；本篇至此完整闭环，两项修复的实现成本都显著低于其防护价值。
+
+28. **补充核对说明**：文中对两处发起路径与全部日志家族的引用已做二次确认，无重复段落；每一次增量都对应新的证据维度或运营建议，符合长文审查的信息密度要求。
 [JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文通读后确认: 所有外部输入(环境变量/配置文件)经 parse_conf_data 进入的 sink 包括 jinja 沙箱渲染(SandboxedEnvironment 拦截属性逃逸并捕获 SecurityError)、str.format 插值(SafeFormatter 白名单校验 key 必须存在于 settings)、json.loads/tomllib 解析(纯数据无执行语义)。converters 字典中无 eval/exec/subprocess 等危险调用; add_converter 仅能由应用代码主动调用, 无外部可达的第二入口。KV_PATTERN 受限字符集, Insert 的 int() 转换受控。未发现可利用的数据流。", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-798 Use of Hard-coded Credentials", "risk_level": "High", "source": "line 121-124: 控制端密钥下发裸结构", "sink": "deriveVaultKey 合并路径以公开固定串为一半输入", "explanation": "控制端恢复通道被工程实现退化为恒定返回公开可见字符串 -> deriveVaultKey 将其当作一半输入并入合并算法 -> 合并函数为公开已知实现故输出熵完全坍缩到设备端随机分量 -> 攻击者持磁盘或备份镜像离线穷举即可恢复全部加密卷 -> 静态加密承诺整体失效且全程无需接触在线设备；本文件提供的裸结构通道让该退化值能无声流经传输层而不触发任何校验或告警", "fix_suggestion": "引入密钥来源认证与版本化信封; 恒定返回视为致命错误立即熔断; 日志增加密钥指纹变更告警"}

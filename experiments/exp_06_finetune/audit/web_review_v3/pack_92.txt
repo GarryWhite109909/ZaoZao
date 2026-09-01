@@ -1,1279 +1,619 @@
-batch=92 样本数=4
+batch=92 样本数=2
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=7847 lang=python
+### id=7858 lang=go
 [CODE]
-   1| """Reverse proxy for admin-configured terminal servers.
-   2| 
-   3| Routes:
-   4|   GET  /                         — list terminals the user has access to
-   5|   *    /{server_id}/{path:path}  — proxy request to terminal server
-   6| """
-   7| 
-   8| import logging
-   9| import posixpath
-  10| from urllib.parse import unquote
-  11| 
-  12| import aiohttp
-  13| from fastapi import APIRouter, Depends, Request, Response, WebSocket
-  14| from fastapi.responses import JSONResponse, StreamingResponse
-  15| from open_webui.config import TERMINAL_PROXY_HEADERS
-  16| from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL
-  17| from open_webui.models.groups import Groups
-  18| from open_webui.models.users import Users
-  19| from open_webui.utils.access_control import has_connection_access
-  20| from open_webui.utils.auth import get_verified_user
-  21| from starlette.background import BackgroundTask
-  22| 
-  23| log = logging.getLogger(__name__)
-  24| 
-  25| router = APIRouter()
-  26| 
-  27| STREAMING_CONTENT_TYPES = ('application/octet-stream', 'image/', 'application/pdf')
-  28| STRIPPED_RESPONSE_HEADERS = frozenset(('transfer-encoding', 'connection', 'content-encoding', 'content-length'))
-  29| 
-  30| 
-  31| def _sanitize_proxy_path(path: str) -> str | None:
-  32|     """Sanitize a proxy path to prevent directory traversal / SSRF.
-  33| 
-  34|     Returns the cleaned path, or None if the path is invalid.
-  35|     Trailing slashes are preserved — many upstream frameworks treat
-  36|     ``/path`` and ``/path/`` differently.
-  37|     """
-  38|     # Decode until stable: a single unquote pass leaves %252e%252e as %2e%2e,
-  39|     # which the upstream then re-decodes into '..', bypassing the check below.
-  40|     decoded = path
-  41|     for _ in range(8):
-  42|         once = unquote(decoded)
-  43|         if once == decoded:
-  44|             break
-  45|         decoded = once
-  46|     had_trailing_slash = decoded.endswith('/')
-  47|     normalized = posixpath.normpath(decoded)
-  48|     # Remove any leading slashes that would reset the base
-  49|     cleaned = normalized.lstrip('/')
-  50|     # Reject if normpath resolved to parent traversal or current-dir only
-  51|     if cleaned.startswith('..') or cleaned == '.':
-  52|         return None
-  53|     # Restore trailing slash if the original path had one
-  54|     if had_trailing_slash and cleaned and not cleaned.endswith('/'):
-  55|         cleaned += '/'
-  56|     return cleaned
-  57| 
-  58| 
-  59| @router.get('/')
-  60| async def list_terminal_servers(request: Request, user=Depends(get_verified_user)):
-  61|     """Return terminal servers the authenticated user has access to."""
-  62|     connections = request.app.state.config.TERMINAL_SERVER_CONNECTIONS or []
-  63|     user_group_ids = {group.id for group in await Groups.get_groups_by_member_id(user.id)}
-  64| 
-  65|     return [
-  66|         {
-  67|             'id': connection.get('id', ''),
-  68|             'url': connection.get('url', ''),
-  69|             'name': connection.get('name', ''),
-  70|         }
-  71|         for connection in connections
-  72|         if connection.get('enabled', True) and await has_connection_access(user, connection, user_group_ids)
-  73|     ]
-  74| 
-  75| 
-  76| PROXY_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
-  77| 
-  78| 
-  79| @router.api_route('/{server_id}/{path:path}', methods=PROXY_METHODS)
-  80| async def proxy_terminal(
-  81|     server_id: str,
-  82|     path: str,
-  83|     request: Request,
-  84|     user=Depends(get_verified_user),
-  85| ):
-  86|     """Proxy a request to the admin terminal server identified by *server_id*."""
-  87|     connections = request.app.state.config.TERMINAL_SERVER_CONNECTIONS or []
-  88|     connection = next((c for c in connections if c.get('id') == server_id), None)
-  89| 
-  90|     if connection is None:
-  91|         return JSONResponse({'error': f"Terminal server '{server_id}' not found"}, status_code=404)
-  92| 
-  93|     user_group_ids = {group.id for group in await Groups.get_groups_by_member_id(user.id)}
-  94|     if not await has_connection_access(user, connection, user_group_ids):
-  95|         return JSONResponse({'error': 'Access denied'}, status_code=403)
-  96| 
-  97|     base_url = (connection.get('url') or '').rstrip('/')
-  98|     if not base_url:
-  99|         return JSONResponse({'error': 'Terminal server URL not configured'}, status_code=503)
- 100| 
- 101|     safe_path = _sanitize_proxy_path(path)
- 102|     if safe_path is None:
- 103|         return JSONResponse({'error': 'Invalid path'}, status_code=400)
- 104| 
- 105|     target_url = f'{base_url}/{safe_path}'
- 106| 
- 107|     # Route through orchestrator policy endpoint if policy_id is set
- 108|     policy_id = connection.get('policy_id')
- 109|     if policy_id:
- 110|         target_url = f'{base_url}/p/{policy_id}/{safe_path}'
- 111| 
- 112|     if request.query_params:
- 113|         target_url += f'?{request.query_params}'
- 114| 
- 115|     headers = {'X-User-Id': user.id}
- 116|     # Forward per-session cwd tracking header
- 117|     session_id = request.headers.get('x-session-id')
- 118|     if session_id:
- 119|         headers['X-Session-Id'] = session_id
- 120|     cookies = {}
- 121|     auth_type = connection.get('auth_type', 'bearer')
- 122| 
- 123|     if auth_type == 'bearer':
- 124|         headers['Authorization'] = f'Bearer {connection.get("key", "")}'
- 125|     elif auth_type == 'session':
- 126|         cookies = request.cookies
- 127|         headers['Authorization'] = f'Bearer {request.state.token.credentials}'
- 128|     elif auth_type == 'system_oauth':
- 129|         cookies = request.cookies
- 130|         oauth_token = request.headers.get('x-oauth-access-token', '')
- 131|         if oauth_token:
- 132|             headers['Authorization'] = f'Bearer {oauth_token}'
- 133|     # auth_type == "none": no Authorization header
- 134| 
- 135|     content_type = request.headers.get('content-type')
- 136|     if content_type:
- 137|         headers['Content-Type'] = content_type
- 138| 
- 139|     body = await request.body()
- 140|     session = aiohttp.ClientSession(
- 141|         timeout=aiohttp.ClientTimeout(total=300, connect=10),
- 142|         trust_env=True,
- 143|     )
- 144| 
- 145|     try:
- 146|         upstream_response = await session.request(
- 147|             method=request.method,
- 148|             url=target_url,
- 149|             headers=headers,
- 150|             cookies=cookies,
- 151|             data=body or None,
- 152|             ssl=AIOHTTP_CLIENT_SESSION_SSL,
- 153|         )
- 154| 
- 155|         upstream_content_type = upstream_response.headers.get('content-type', '')
- 156|         filtered_headers = {
- 157|             key: value
- 158|             for key, value in upstream_response.headers.items()
- 159|             if key.lower() not in STRIPPED_RESPONSE_HEADERS
- 160|         }
- 161|         if TERMINAL_PROXY_HEADERS:
- 162|             filtered_headers.update(TERMINAL_PROXY_HEADERS)
- 163| 
- 164|         # Stream binary responses directly
- 165|         if any(t in upstream_content_type for t in STREAMING_CONTENT_TYPES):
- 166| 
- 167|             async def cleanup():
- 168|                 await upstream_response.release()
- 169|                 await session.close()
- 170| 
- 171|             return StreamingResponse(
- 172|                 content=upstream_response.content.iter_any(),
- 173|                 status_code=upstream_response.status,
- 174|                 headers=filtered_headers,
- 175|                 background=BackgroundTask(cleanup),
- 176|             )
- 177| 
- 178|         # Buffer text/JSON responses
- 179|         response_body = await upstream_response.read()
- 180|         status_code = upstream_response.status
- 181|         await upstream_response.release()
- 182|         await session.close()
- 183| 
- 184|         return Response(content=response_body, status_code=status_code, headers=filtered_headers)
- 185| 
- 186|     except Exception as error:
- 187|         await session.close()
- 188|         log.exception('Terminal proxy error: %s', error)
- 189|         return JSONResponse({'error': f'Terminal proxy error: {error}'}, status_code=502)
- 190| 
- 191| 
- 192| # ---------------------------------------------------------------------------
- 193| # WebSocket proxy for interactive terminal sessions
- 194| # ---------------------------------------------------------------------------
- 195| 
- 196| 
- 197| async def _resolve_authenticated_connection(ws: WebSocket, server_id: str):
- 198|     """Authenticate a WebSocket via first-message auth and resolve the terminal server.
- 199| 
- 200|     The client must send ``{"type": "auth", "token": "<jwt>"}`` as its first
- 201|     message after connecting.
- 202| 
- 203|     Returns ``(user, connection)`` on success, or ``None`` after closing *ws*
- 204|     with an appropriate error code.
- 205|     """
- 206|     import asyncio
- 207|     import json
- 208| 
- 209|     from open_webui.utils.auth import decode_token
- 210| 
- 211|     # First-message authentication
- 212|     try:
- 213|         raw = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
- 214|         payload = json.loads(raw)
- 215|         if payload.get('type') != 'auth':
- 216|             await ws.close(code=4001, reason='Expected auth message')
- 217|             return None
- 218|         token = payload.get('token', '')
- 219|         data = decode_token(token)
- 220|         if data is None or 'id' not in data:
- 221|             await ws.close(code=4001, reason='Invalid token')
- 222|             return None
- 223|         user = await Users.get_user_by_id(data['id'])
- 224|         if user is None:
- 225|             await ws.close(code=4001, reason='User not found')
- 226|             return None
- 227|     except (asyncio.TimeoutError, json.JSONDecodeError):
- 228|         await ws.close(code=4001, reason='Auth timeout or invalid payload')
- 229|         return None
- 230|     except Exception:
- 231|         await ws.close(code=4001, reason='Invalid token')
- 232|         return None
- 233| 
- 234|     # Resolve terminal server
- 235|     connections = ws.app.state.config.TERMINAL_SERVER_CONNECTIONS or []
- 236|     connection = next((c for c in connections if c.get('id') == server_id), None)
- 237| 
- 238|     if connection is None:
- 239|         await ws.close(code=4004, reason='Terminal server not found')
- 240|         return None
- 241| 
- 242|     user_group_ids = {group.id for group in await Groups.get_groups_by_member_id(user.id)}
- 243|     if not await has_connection_access(user, connection, user_group_ids):
- 244|         await ws.close(code=4003, reason='Access denied')
- 245|         return None
- 246| 
- 247|     return user, connection
- 248| 
- 249| 
- 250| @router.websocket('/{server_id}/api/terminals/{session_id}')
- 251| async def ws_terminal(
- 252|     ws: WebSocket,
- 253|     server_id: str,
- 254|     session_id: str,
- 255| ):
- 256|     """Proxy an interactive WebSocket terminal session to a terminal server.
- 257| 
- 258|     Uses first-message auth: the client sends ``{"type": "auth", "token": "<jwt>"}``
- 259|     as its first message. The proxy validates the JWT, then connects to the
- 260|     upstream terminal server and authenticates with the server's API key.
- 261|     """
- 262|     await ws.accept()
- 263| 
- 264|     result = await _resolve_authenticated_connection(ws, server_id)
- 265|     if result is None:
- 266|         return
- 267|     user, connection = result
- 268| 
- 269|     base_url = (connection.get('url') or '').rstrip('/')
- 270|     if not base_url:
- 271|         await ws.close(code=4003, reason='Terminal server URL not configured')
- 272|         return
- 273| 
- 274|     # Build upstream WebSocket URL (no token in URL)
- 275|     ws_base = base_url.replace('https://', 'wss://').replace('http://', 'ws://')
- 276| 
- 277|     # Route through orchestrator policy endpoint if policy_id is set
- 278|     policy_id = connection.get('policy_id')
- 279|     upstream_params = {}
- 280|     # For orchestrator-backed servers, pass user_id
- 281|     upstream_params['user_id'] = user.id
- 282| 
- 283|     import urllib.parse
- 284| 
- 285|     if policy_id:
- 286|         upstream_url = f'{ws_base}/p/{policy_id}/api/terminals/{session_id}'
- 287|     else:
- 288|         upstream_url = f'{ws_base}/api/terminals/{session_id}'
- 289|     if upstream_params:
- 290|         upstream_url += f'?{urllib.parse.urlencode(upstream_params)}'
- 291| 
- 292|     session = aiohttp.ClientSession()
- 293|     try:
- 294|         async with session.ws_connect(upstream_url, ssl=AIOHTTP_CLIENT_SESSION_SSL) as upstream:
- 295|             import asyncio
- 296|             import json as _json
- 297| 
- 298|             # First-message auth to upstream terminal server
- 299|             auth_type = connection.get('auth_type', 'bearer')
- 300|             if auth_type == 'bearer':
- 301|                 key = connection.get('key', '')
- 302|                 await upstream.send_str(_json.dumps({'type': 'auth', 'token': key}))
- 303| 
- 304|             async def _client_to_upstream():
- 305|                 """Forward client → upstream."""
- 306|                 try:
- 307|                     while True:
- 308|                         msg = await ws.receive()
- 309|                         if msg['type'] == 'websocket.disconnect':
- 310|                             break
- 311|                         elif 'bytes' in msg and msg['bytes']:
- 312|                             await upstream.send_bytes(msg['bytes'])
- 313|                         elif 'text' in msg and msg['text']:
- 314|                             await upstream.send_str(msg['text'])
- 315|                 except Exception:
- 316|                     pass
- 317| 
- 318|             async def _upstream_to_client():
- 319|                 """Forward upstream → client."""
- 320|                 try:
- 321|                     async for msg in upstream:
- 322|                         if msg.type == aiohttp.WSMsgType.BINARY:
- 323|                             await ws.send_bytes(msg.data)
- 324|                         elif msg.type == aiohttp.WSMsgType.TEXT:
- 325|                             await ws.send_text(msg.data)
- 326|                         elif msg.type in (
- 327|                             aiohttp.WSMsgType.CLOSE,
- 328|                             aiohttp.WSMsgType.ERROR,
- 329|                         ):
- 330|                             break
- 331|                 except Exception:
- 332|                     pass
- 333| 
- 334|             # End the proxy as soon as either direction finishes (e.g. a
- 335|             # graceful upstream CLOSE) and cancel the sibling, which would
- 336|             # otherwise hang on a blocked ws.receive() until the browser leaves.
- 337|             tasks = [
- 338|                 asyncio.create_task(_client_to_upstream()),
- 339|                 asyncio.create_task(_upstream_to_client()),
- 340|             ]
- 341|             _done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
- 342|             for task in pending:
- 343|                 task.cancel()
- 344|                 try:
- 345|                     await task
- 346|                 except asyncio.CancelledError:
- 347|                     pass
- 348|     except Exception as e:
- 349|         log.exception('Terminal WebSocket proxy error: %s', e)
- 350|     finally:
- 351|         await session.close()
- 352|         try:
- 353|             await ws.close()
- 354|         except Exception:
- 355|             pass
- 356| 
- 357| 
-
-### id=7848 lang=python
-[CODE]
-   1| """Reverse proxy for admin-configured terminal servers.
-   2| 
-   3| Routes:
-   4|   GET  /                         — list terminals the user has access to
-   5|   *    /{server_id}/{path:path}  — proxy request to terminal server
-   6| """
-   7| 
-   8| import logging
-   9| import posixpath
-  10| from urllib.parse import unquote
-  11| 
-  12| import aiohttp
-  13| from fastapi import APIRouter, Depends, Request, Response, WebSocket
-  14| from fastapi.responses import JSONResponse, StreamingResponse
-  15| from open_webui.config import TERMINAL_PROXY_HEADERS
-  16| from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL
-  17| from open_webui.models.groups import Groups
-  18| from open_webui.models.users import Users
-  19| from open_webui.utils.access_control import has_connection_access
-  20| from open_webui.utils.auth import get_verified_user
-  21| from starlette.background import BackgroundTask
-  22| 
-  23| log = logging.getLogger(__name__)
-  24| 
-  25| router = APIRouter()
-  26| 
-  27| STREAMING_CONTENT_TYPES = ('application/octet-stream', 'image/', 'application/pdf')
-  28| STRIPPED_RESPONSE_HEADERS = frozenset(('transfer-encoding', 'connection', 'content-encoding', 'content-length'))
-  29| 
-  30| 
-  31| def _sanitize_proxy_path(path: str) -> str | None:
-  32|     """Sanitize a proxy path to prevent directory traversal / SSRF.
-  33| 
-  34|     Returns the cleaned path, or None if the path is invalid.
-  35|     Trailing slashes are preserved — many upstream frameworks treat
-  36|     ``/path`` and ``/path/`` differently.
-  37|     """
-  38|     # Decode until stable: a single unquote pass leaves %252e%252e as %2e%2e,
-  39|     # which the upstream then re-decodes into '..', bypassing the check below.
-  40|     decoded = path
-  41|     for _ in range(8):
-  42|         once = unquote(decoded)
-  43|         if once == decoded:
-  44|             break
-  45|         decoded = once
-  46|     # Fail closed: still encoded after the cap means the upstream would decode further into traversal.
-  47|     if unquote(decoded) != decoded:
-  48|         return None
-  49|     had_trailing_slash = decoded.endswith('/')
-  50|     normalized = posixpath.normpath(decoded)
-  51|     # Remove any leading slashes that would reset the base
-  52|     cleaned = normalized.lstrip('/')
-  53|     # Reject if normpath resolved to parent traversal or current-dir only
-  54|     if cleaned.startswith('..') or cleaned == '.':
-  55|         return None
-  56|     # Restore trailing slash if the original path had one
-  57|     if had_trailing_slash and cleaned and not cleaned.endswith('/'):
-  58|         cleaned += '/'
-  59|     return cleaned
-  60| 
-  61| 
-  62| @router.get('/')
-  63| async def list_terminal_servers(request: Request, user=Depends(get_verified_user)):
-  64|     """Return terminal servers the authenticated user has access to."""
-  65|     connections = request.app.state.config.TERMINAL_SERVER_CONNECTIONS or []
-  66|     user_group_ids = {group.id for group in await Groups.get_groups_by_member_id(user.id)}
-  67| 
-  68|     return [
-  69|         {
-  70|             'id': connection.get('id', ''),
-  71|             'url': connection.get('url', ''),
-  72|             'name': connection.get('name', ''),
-  73|         }
-  74|         for connection in connections
-  75|         if connection.get('enabled', True) and await has_connection_access(user, connection, user_group_ids)
-  76|     ]
-  77| 
-  78| 
-  79| PROXY_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
-  80| 
-  81| 
-  82| @router.api_route('/{server_id}/{path:path}', methods=PROXY_METHODS)
-  83| async def proxy_terminal(
-  84|     server_id: str,
-  85|     path: str,
-  86|     request: Request,
-  87|     user=Depends(get_verified_user),
-  88| ):
-  89|     """Proxy a request to the admin terminal server identified by *server_id*."""
-  90|     connections = request.app.state.config.TERMINAL_SERVER_CONNECTIONS or []
-  91|     connection = next((c for c in connections if c.get('id') == server_id), None)
-  92| 
-  93|     if connection is None:
-  94|         return JSONResponse({'error': f"Terminal server '{server_id}' not found"}, status_code=404)
-  95| 
-  96|     user_group_ids = {group.id for group in await Groups.get_groups_by_member_id(user.id)}
-  97|     if not await has_connection_access(user, connection, user_group_ids):
-  98|         return JSONResponse({'error': 'Access denied'}, status_code=403)
-  99| 
- 100|     base_url = (connection.get('url') or '').rstrip('/')
- 101|     if not base_url:
- 102|         return JSONResponse({'error': 'Terminal server URL not configured'}, status_code=503)
- 103| 
- 104|     safe_path = _sanitize_proxy_path(path)
- 105|     if safe_path is None:
- 106|         return JSONResponse({'error': 'Invalid path'}, status_code=400)
- 107| 
- 108|     target_url = f'{base_url}/{safe_path}'
- 109| 
- 110|     # Route through orchestrator policy endpoint if policy_id is set
- 111|     policy_id = connection.get('policy_id')
- 112|     if policy_id:
- 113|         target_url = f'{base_url}/p/{policy_id}/{safe_path}'
- 114| 
- 115|     if request.query_params:
- 116|         target_url += f'?{request.query_params}'
- 117| 
- 118|     headers = {'X-User-Id': user.id}
- 119|     # Forward per-session cwd tracking header
- 120|     session_id = request.headers.get('x-session-id')
- 121|     if session_id:
- 122|         headers['X-Session-Id'] = session_id
- 123|     cookies = {}
- 124|     auth_type = connection.get('auth_type', 'bearer')
- 125| 
- 126|     if auth_type == 'bearer':
- 127|         headers['Authorization'] = f'Bearer {connection.get("key", "")}'
- 128|     elif auth_type == 'session':
- 129|         cookies = request.cookies
- 130|         headers['Authorization'] = f'Bearer {request.state.token.credentials}'
- 131|     elif auth_type == 'system_oauth':
- 132|         cookies = request.cookies
- 133|         oauth_token = request.headers.get('x-oauth-access-token', '')
- 134|         if oauth_token:
- 135|             headers['Authorization'] = f'Bearer {oauth_token}'
- 136|     # auth_type == "none": no Authorization header
- 137| 
- 138|     content_type = request.headers.get('content-type')
- 139|     if content_type:
- 140|         headers['Content-Type'] = content_type
- 141| 
- 142|     body = await request.body()
- 143|     session = aiohttp.ClientSession(
- 144|         timeout=aiohttp.ClientTimeout(total=300, connect=10),
- 145|         trust_env=True,
- 146|     )
- 147| 
- 148|     try:
- 149|         upstream_response = await session.request(
- 150|             method=request.method,
- 151|             url=target_url,
- 152|             headers=headers,
- 153|             cookies=cookies,
- 154|             data=body or None,
- 155|             ssl=AIOHTTP_CLIENT_SESSION_SSL,
- 156|         )
- 157| 
- 158|         upstream_content_type = upstream_response.headers.get('content-type', '')
- 159|         filtered_headers = {
- 160|             key: value
- 161|             for key, value in upstream_response.headers.items()
- 162|             if key.lower() not in STRIPPED_RESPONSE_HEADERS
- 163|         }
- 164|         if TERMINAL_PROXY_HEADERS:
- 165|             filtered_headers.update(TERMINAL_PROXY_HEADERS)
- 166| 
- 167|         # Stream binary responses directly
- 168|         if any(t in upstream_content_type for t in STREAMING_CONTENT_TYPES):
- 169| 
- 170|             async def cleanup():
- 171|                 await upstream_response.release()
- 172|                 await session.close()
- 173| 
- 174|             return StreamingResponse(
- 175|                 content=upstream_response.content.iter_any(),
- 176|                 status_code=upstream_response.status,
- 177|                 headers=filtered_headers,
- 178|                 background=BackgroundTask(cleanup),
- 179|             )
- 180| 
- 181|         # Buffer text/JSON responses
- 182|         response_body = await upstream_response.read()
- 183|         status_code = upstream_response.status
- 184|         await upstream_response.release()
- 185|         await session.close()
- 186| 
- 187|         return Response(content=response_body, status_code=status_code, headers=filtered_headers)
- 188| 
- 189|     except Exception as error:
- 190|         await session.close()
- 191|         log.exception('Terminal proxy error: %s', error)
- 192|         return JSONResponse({'error': f'Terminal proxy error: {error}'}, status_code=502)
- 193| 
- 194| 
- 195| # ---------------------------------------------------------------------------
- 196| # WebSocket proxy for interactive terminal sessions
- 197| # ---------------------------------------------------------------------------
- 198| 
- 199| 
- 200| async def _resolve_authenticated_connection(ws: WebSocket, server_id: str):
- 201|     """Authenticate a WebSocket via first-message auth and resolve the terminal server.
- 202| 
- 203|     The client must send ``{"type": "auth", "token": "<jwt>"}`` as its first
- 204|     message after connecting.
- 205| 
- 206|     Returns ``(user, connection)`` on success, or ``None`` after closing *ws*
- 207|     with an appropriate error code.
- 208|     """
- 209|     import asyncio
- 210|     import json
- 211| 
- 212|     from open_webui.utils.auth import decode_token
- 213| 
- 214|     # First-message authentication
- 215|     try:
- 216|         raw = await asyncio.wait_for(ws.receive_text(), timeout=10.0)
- 217|         payload = json.loads(raw)
- 218|         if payload.get('type') != 'auth':
- 219|             await ws.close(code=4001, reason='Expected auth message')
- 220|             return None
- 221|         token = payload.get('token', '')
- 222|         data = decode_token(token)
- 223|         if data is None or 'id' not in data:
- 224|             await ws.close(code=4001, reason='Invalid token')
- 225|             return None
- 226|         user = await Users.get_user_by_id(data['id'])
- 227|         if user is None:
- 228|             await ws.close(code=4001, reason='User not found')
- 229|             return None
- 230|     except (asyncio.TimeoutError, json.JSONDecodeError):
- 231|         await ws.close(code=4001, reason='Auth timeout or invalid payload')
- 232|         return None
- 233|     except Exception:
- 234|         await ws.close(code=4001, reason='Invalid token')
- 235|         return None
- 236| 
- 237|     # Resolve terminal server
- 238|     connections = ws.app.state.config.TERMINAL_SERVER_CONNECTIONS or []
- 239|     connection = next((c for c in connections if c.get('id') == server_id), None)
- 240| 
- 241|     if connection is None:
- 242|         await ws.close(code=4004, reason='Terminal server not found')
- 243|         return None
- 244| 
- 245|     user_group_ids = {group.id for group in await Groups.get_groups_by_member_id(user.id)}
- 246|     if not await has_connection_access(user, connection, user_group_ids):
- 247|         await ws.close(code=4003, reason='Access denied')
- 248|         return None
- 249| 
- 250|     return user, connection
- 251| 
- 252| 
- 253| @router.websocket('/{server_id}/api/terminals/{session_id}')
- 254| async def ws_terminal(
- 255|     ws: WebSocket,
- 256|     server_id: str,
- 257|     session_id: str,
- 258| ):
- 259|     """Proxy an interactive WebSocket terminal session to a terminal server.
- 260| 
- 261|     Uses first-message auth: the client sends ``{"type": "auth", "token": "<jwt>"}``
- 262|     as its first message. The proxy validates the JWT, then connects to the
- 263|     upstream terminal server and authenticates with the server's API key.
- 264|     """
- 265|     await ws.accept()
- 266| 
- 267|     result = await _resolve_authenticated_connection(ws, server_id)
- 268|     if result is None:
- 269|         return
- 270|     user, connection = result
- 271| 
- 272|     base_url = (connection.get('url') or '').rstrip('/')
- 273|     if not base_url:
- 274|         await ws.close(code=4003, reason='Terminal server URL not configured')
- 275|         return
- 276| 
- 277|     # Build upstream WebSocket URL (no token in URL)
- 278|     ws_base = base_url.replace('https://', 'wss://').replace('http://', 'ws://')
- 279| 
- 280|     # Route through orchestrator policy endpoint if policy_id is set
- 281|     policy_id = connection.get('policy_id')
- 282|     upstream_params = {}
- 283|     # For orchestrator-backed servers, pass user_id
- 284|     upstream_params['user_id'] = user.id
- 285| 
- 286|     import urllib.parse
- 287| 
- 288|     if policy_id:
- 289|         upstream_url = f'{ws_base}/p/{policy_id}/api/terminals/{session_id}'
- 290|     else:
- 291|         upstream_url = f'{ws_base}/api/terminals/{session_id}'
- 292|     if upstream_params:
- 293|         upstream_url += f'?{urllib.parse.urlencode(upstream_params)}'
- 294| 
- 295|     session = aiohttp.ClientSession()
- 296|     try:
- 297|         async with session.ws_connect(upstream_url, ssl=AIOHTTP_CLIENT_SESSION_SSL) as upstream:
- 298|             import asyncio
- 299|             import json as _json
- 300| 
- 301|             # First-message auth to upstream terminal server
- 302|             auth_type = connection.get('auth_type', 'bearer')
- 303|             if auth_type == 'bearer':
- 304|                 key = connection.get('key', '')
- 305|                 await upstream.send_str(_json.dumps({'type': 'auth', 'token': key}))
- 306| 
- 307|             async def _client_to_upstream():
- 308|                 """Forward client → upstream."""
- 309|                 try:
- 310|                     while True:
- 311|                         msg = await ws.receive()
- 312|                         if msg['type'] == 'websocket.disconnect':
- 313|                             break
- 314|                         elif 'bytes' in msg and msg['bytes']:
- 315|                             await upstream.send_bytes(msg['bytes'])
- 316|                         elif 'text' in msg and msg['text']:
- 317|                             await upstream.send_str(msg['text'])
- 318|                 except Exception:
- 319|                     pass
- 320| 
- 321|             async def _upstream_to_client():
- 322|                 """Forward upstream → client."""
- 323|                 try:
- 324|                     async for msg in upstream:
- 325|                         if msg.type == aiohttp.WSMsgType.BINARY:
- 326|                             await ws.send_bytes(msg.data)
- 327|                         elif msg.type == aiohttp.WSMsgType.TEXT:
- 328|                             await ws.send_text(msg.data)
- 329|                         elif msg.type in (
- 330|                             aiohttp.WSMsgType.CLOSE,
- 331|                             aiohttp.WSMsgType.ERROR,
- 332|                         ):
- 333|                             break
- 334|                 except Exception:
- 335|                     pass
- 336| 
- 337|             # End the proxy as soon as either direction finishes (e.g. a
- 338|             # graceful upstream CLOSE) and cancel the sibling, which would
- 339|             # otherwise hang on a blocked ws.receive() until the browser leaves.
- 340|             tasks = [
- 341|                 asyncio.create_task(_client_to_upstream()),
- 342|                 asyncio.create_task(_upstream_to_client()),
- 343|             ]
- 344|             _done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
- 345|             for task in pending:
- 346|                 task.cancel()
- 347|                 try:
- 348|                     await task
- 349|                 except asyncio.CancelledError:
- 350|                     pass
- 351|     except Exception as e:
- 352|         log.exception('Terminal WebSocket proxy error: %s', e)
- 353|     finally:
- 354|         await session.close()
- 355|         try:
- 356|             await ws.close()
- 357|         except Exception:
- 358|             pass
- 359| 
- 360| 
-
-### id=8059 lang=python
-[CODE]
-   1| """
-   2| Experimental request context features.
-   3| 
-   4| This module provides the Experimental class which gives access to experimental
-   5| features within a request context, such as task-augmented request handling.
-   6| 
-   7| WARNING: These APIs are experimental and may change without notice.
-   8| """
-   9| 
-  10| import warnings
-  11| from collections.abc import Awaitable, Callable
-  12| from dataclasses import dataclass, field
-  13| from typing import Any, overload
+   1| // Copyright 2014 beego Author. All Rights Reserved.
+   2| //
+   3| // Licensed under the Apache License, Version 2.0 (the "License");
+   4| // you may not use this file except in compliance with the License.
+   5| // You may obtain a copy of the License at
+   6| //
+   7| //      http://www.apache.org/licenses/LICENSE-2.0
+   8| //
+   9| // Unless required by applicable law or agreed to in writing, software
+  10| // distributed under the License is distributed on an "AS IS" BASIS,
+  11| // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  12| // See the License for the specific language governing permissions and
+  13| // limitations under the License.
   14| 
-  15| from typing_extensions import deprecated
+  15| package cache
   16| 
-  17| from mcp.server.experimental.task_context import ServerTaskContext
-  18| from mcp.server.experimental.task_scope import scoped_task_id
-  19| from mcp.server.experimental.task_support import TaskSupport
-  20| from mcp.server.session import ServerSession
-  21| from mcp.shared.exceptions import McpError
-  22| from mcp.shared.experimental.tasks.helpers import MODEL_IMMEDIATE_RESPONSE_KEY, is_terminal
-  23| from mcp.types import (
-  24|     METHOD_NOT_FOUND,
-  25|     TASK_FORBIDDEN,
-  26|     TASK_REQUIRED,
-  27|     ClientCapabilities,
-  28|     CreateTaskResult,
-  29|     ErrorData,
-  30|     Result,
-  31|     TaskExecutionMode,
-  32|     TaskMetadata,
-  33|     Tool,
-  34| )
-  35| 
-  36| EXPLICIT_TASK_ID_DEPRECATION = (
-  37|     "Passing an explicit task_id to run_task is deprecated. A task created with an "
-  38|     "explicit ID is not associated with the session that created it: any requestor "
-  39|     "that presents the ID can read its status and result or cancel it, and it never "
-  40|     "appears in tasks/list. Omit task_id to let the SDK generate an ID associated "
-  41|     "with the creating session."
-  42| )
-  43| 
-  44| 
-  45| @dataclass
-  46| class Experimental:
-  47|     """
-  48|     Experimental features context for task-augmented requests.
-  49| 
-  50|     Provides helpers for validating task execution compatibility and
-  51|     running tasks with automatic lifecycle management.
-  52| 
-  53|     WARNING: This API is experimental and may change without notice.
-  54|     """
-  55| 
-  56|     task_metadata: TaskMetadata | None = None
-  57|     _client_capabilities: ClientCapabilities | None = field(default=None, repr=False)
-  58|     _session: ServerSession | None = field(default=None, repr=False)
-  59|     _task_support: TaskSupport | None = field(default=None, repr=False)
-  60| 
-  61|     @property
-  62|     def is_task(self) -> bool:
-  63|         """Check if this request is task-augmented."""
-  64|         return self.task_metadata is not None
-  65| 
-  66|     @property
-  67|     def client_supports_tasks(self) -> bool:
-  68|         """Check if the client declared task support."""
-  69|         if self._client_capabilities is None:
-  70|             return False
-  71|         return self._client_capabilities.tasks is not None
-  72| 
-  73|     def validate_task_mode(
-  74|         self,
-  75|         tool_task_mode: TaskExecutionMode | None,
-  76|         *,
-  77|         raise_error: bool = True,
-  78|     ) -> ErrorData | None:
-  79|         """
-  80|         Validate that the request is compatible with the tool's task execution mode.
-  81| 
-  82|         Per MCP spec:
-  83|         - "required": Clients MUST invoke as task. Server returns -32601 if not.
-  84|         - "forbidden" (or None): Clients MUST NOT invoke as task. Server returns -32601 if they do.
-  85|         - "optional": Either is acceptable.
-  86| 
-  87|         Args:
-  88|             tool_task_mode: The tool's execution.taskSupport value
-  89|                 ("forbidden", "optional", "required", or None)
-  90|             raise_error: If True, raises McpError on validation failure. If False, returns ErrorData.
-  91| 
-  92|         Returns:
-  93|             None if valid, ErrorData if invalid and raise_error=False
-  94| 
-  95|         Raises:
-  96|             McpError: If invalid and raise_error=True
-  97|         """
-  98| 
-  99|         mode = tool_task_mode or TASK_FORBIDDEN
- 100| 
- 101|         error: ErrorData | None = None
- 102| 
- 103|         if mode == TASK_REQUIRED and not self.is_task:
- 104|             error = ErrorData(
- 105|                 code=METHOD_NOT_FOUND,
- 106|                 message="This tool requires task-augmented invocation",
- 107|             )
- 108|         elif mode == TASK_FORBIDDEN and self.is_task:
- 109|             error = ErrorData(
- 110|                 code=METHOD_NOT_FOUND,
- 111|                 message="This tool does not support task-augmented invocation",
- 112|             )
- 113| 
- 114|         if error is not None and raise_error:
- 115|             raise McpError(error)
- 116| 
- 117|         return error
- 118| 
- 119|     def validate_for_tool(
- 120|         self,
- 121|         tool: Tool,
- 122|         *,
- 123|         raise_error: bool = True,
- 124|     ) -> ErrorData | None:
- 125|         """
- 126|         Validate that the request is compatible with the given tool.
- 127| 
- 128|         Convenience wrapper around validate_task_mode that extracts the mode from a Tool.
- 129| 
- 130|         Args:
- 131|             tool: The Tool definition
- 132|             raise_error: If True, raises McpError on validation failure.
- 133| 
- 134|         Returns:
- 135|             None if valid, ErrorData if invalid and raise_error=False
- 136|         """
- 137|         mode = tool.execution.taskSupport if tool.execution else None
- 138|         return self.validate_task_mode(mode, raise_error=raise_error)
- 139| 
- 140|     def can_use_tool(self, tool_task_mode: TaskExecutionMode | None) -> bool:
- 141|         """
- 142|         Check if this client can use a tool with the given task mode.
- 143| 
- 144|         Useful for filtering tool lists or providing warnings.
- 145|         Returns False if tool requires "required" but client doesn't support tasks.
- 146| 
- 147|         Args:
- 148|             tool_task_mode: The tool's execution.taskSupport value
- 149| 
- 150|         Returns:
- 151|             True if the client can use this tool, False otherwise
- 152|         """
- 153|         mode = tool_task_mode or TASK_FORBIDDEN
- 154|         if mode == TASK_REQUIRED and not self.client_supports_tasks:
- 155|             return False
- 156|         return True
- 157| 
- 158|     @overload
- 159|     async def run_task(
- 160|         self,
- 161|         work: Callable[[ServerTaskContext], Awaitable[Result]],
- 162|         *,
- 163|         task_id: None = None,
- 164|         model_immediate_response: str | None = None,
- 165|     ) -> CreateTaskResult: ...
- 166| 
- 167|     @overload
- 168|     @deprecated(EXPLICIT_TASK_ID_DEPRECATION)
- 169|     async def run_task(
- 170|         self,
- 171|         work: Callable[[ServerTaskContext], Awaitable[Result]],
- 172|         *,
- 173|         task_id: str,
- 174|         model_immediate_response: str | None = None,
- 175|     ) -> CreateTaskResult: ...
- 176| 
- 177|     async def run_task(
- 178|         self,
- 179|         work: Callable[[ServerTaskContext], Awaitable[Result]],
- 180|         *,
- 181|         task_id: str | None = None,
- 182|         model_immediate_response: str | None = None,
- 183|     ) -> CreateTaskResult:
- 184|         """
- 185|         Create a task, spawn background work, and return CreateTaskResult immediately.
- 186| 
- 187|         This is the recommended way to handle task-augmented tool calls. It:
- 188|         1. Creates a task in the store
- 189|         2. Spawns the work function in a background task
- 190|         3. Returns CreateTaskResult immediately
- 191| 
- 192|         The work function receives a ServerTaskContext with:
- 193|         - elicit() for sending elicitation requests
- 194|         - create_message() for sampling requests
- 195|         - update_status() for progress updates
- 196|         - complete()/fail() for finishing the task
- 197| 
- 198|         When work() returns a Result, the task is auto-completed with that result.
- 199|         If work() raises an exception, the task is auto-failed.
- 200| 
- 201|         Generated task IDs embed the session's task scope so that the default
- 202|         task handlers only serve the task to the session that created it. An
- 203|         explicitly provided `task_id` is used verbatim and is not associated
- 204|         with the session, so any session can access it through the default
- 205|         handlers; passing one is deprecated for that reason.
- 206| 
- 207|         Args:
- 208|             work: Async function that does the actual work
- 209|             task_id: Deprecated. Optional task ID, used verbatim and not
- 210|                 associated with the creating session. Omit it to let the SDK
- 211|                 generate one.
- 212|             model_immediate_response: Optional string to include in _meta as
- 213|                 io.modelcontextprotocol/model-immediate-response
- 214| 
- 215|         Returns:
- 216|             CreateTaskResult to return to the client
- 217| 
- 218|         Raises:
- 219|             RuntimeError: If task support is not enabled or task_metadata is missing
- 220| 
- 221|         Example:
- 222|             @server.call_tool()
- 223|             async def handle_tool(name: str, args: dict):
- 224|                 ctx = server.request_context
- 225| 
- 226|                 async def work(task: ServerTaskContext) -> CallToolResult:
- 227|                     result = await task.elicit(
- 228|                         message="Are you sure?",
- 229|                         requestedSchema={"type": "object", ...}
- 230|                     )
- 231|                     confirmed = result.content.get("confirm", False)
- 232|                     return CallToolResult(content=[TextContent(text="Done" if confirmed else "Cancelled")])
- 233| 
- 234|                 return await ctx.experimental.run_task(work)
- 235| 
- 236|         WARNING: This API is experimental and may change without notice.
- 237|         """
- 238|         if task_id is not None:
- 239|             warnings.warn(EXPLICIT_TASK_ID_DEPRECATION, DeprecationWarning, stacklevel=2)
- 240|         if self._task_support is None:
- 241|             raise RuntimeError("Task support not enabled. Call server.experimental.enable_tasks() first.")
- 242|         if self._session is None:
- 243|             raise RuntimeError("Session not available.")
- 244|         if self.task_metadata is None:
- 245|             raise RuntimeError(
- 246|                 "Request is not task-augmented (no task field in params). "
- 247|                 "The client must send a task-augmented request."
- 248|             )
- 249| 
- 250|         support = self._task_support
- 251|         # Access task_group via TaskSupport - raises if not in run() context
- 252|         task_group = support.task_group
- 253| 
- 254|         if task_id is None:
- 255|             session_scope = self._session.experimental.task_session_scope
- 256|             if session_scope is not None:
- 257|                 task_id = scoped_task_id(session_scope)
- 258| 
- 259|         task = await support.store.create_task(self.task_metadata, task_id)
- 260| 
- 261|         task_ctx = ServerTaskContext(
- 262|             task=task,
- 263|             store=support.store,
- 264|             session=self._session,
- 265|             queue=support.queue,
- 266|             handler=support.handler,
- 267|         )
- 268| 
- 269|         async def execute() -> None:
- 270|             try:
- 271|                 result = await work(task_ctx)
- 272|                 if not is_terminal(task_ctx.task.status):
- 273|                     await task_ctx.complete(result)
- 274|             except Exception as e:
- 275|                 if not is_terminal(task_ctx.task.status):
- 276|                     await task_ctx.fail(str(e))
- 277| 
- 278|         task_group.start_soon(execute)
- 279| 
- 280|         meta: dict[str, Any] | None = None
- 281|         if model_immediate_response is not None:
- 282|             meta = {MODEL_IMMEDIATE_RESPONSE_KEY: model_immediate_response}
- 283| 
- 284|         return CreateTaskResult(task=task, **{"_meta": meta} if meta else {})
- 285| 
- 286| 
-
-### id=8060 lang=php
-[CODE]
-   1| <?php
-   2| /**
-   3|  * Action permettant d'effacer facilement les spams de commentaires
-   4|  * (pour WikiNi 0.5 et supérieurs).
-   5|  *
-   6|  * Cette action accepte les paramétres :
-   7|  * -- "max" permettant de limiter le nombre de commentaires affichés
-   8|  * -- "logpage" permettant de spécifier la page oé sont enregistrées
-   9|  *    les suppressions effectuées
-  10|  * Exemple d'utilisation : {{erasespamedcomments max="50"}}
-  11|  *
-  12|  * @todo
-  13|  * -- pour garantir une certaine transparence, option d'envoi par mail des contenus effacés (?)
-  14|  *    (via une méthode appelée NotifyAdmin())
-  15|  * -- idéalement la derniére page affiche les résultats mais ne renettoie
-  16|  *    pas les commentaires si elle est rechargée
-  17|  * -- test pour savoir si quelque chose a bien été effacé
-  18|  * -- la présentation (style, paramétrage de limite du nombre de commentaires affichés,
-  19|  *    paramétrage de la longueur des contenus affichés, etc.)
-  20| */
-  21| use YesWiki\Core\Controller\PageController;
-  22| use YesWiki\Core\YesWikiAction;
-  23| 
-  24| class EraseSpamedCommentsAction extends YesWikiAction
-  25| {
-  26|     public function run()
-  27|     {
-  28|         $wiki = &$this->wiki;
-  29|         ob_start();
-  30|         echo "\n<!-- == Action erasespamedcomments v 0.7 ============================= -->\n";
+  17| import (
+  18| 	"bytes"
+  19| 	"context"
+  20| 	"crypto/sha256"
+  21| 	"encoding/gob"
+  22| 	"encoding/hex"
+  23| 	"encoding/json"
+  24| 	"fmt"
+  25| 	"io"
+  26| 	"os"
+  27| 	"path/filepath"
+  28| 	"strconv"
+  29| 	"strings"
+  30| 	"time"
   31| 
-  32|         // -- 2. Affichage du formulaire ---
-  33|         if (!isset($_POST['clean'])) {
-  34|             $limit = isset($this->arguments['max']) && $this->arguments['max'] > 0 ? (int)$this->arguments['max'] : 0;
-  35|             if ($comments = $wiki->LoadRecentComments($limit)) {
-  36|                 // Formulaire listant les commentaires
-  37|                 echo '<form method="post" action="' . $wiki->Href() . "\" name=\"selection\">\n";
-  38|                 $curday = '';
-  39|                 foreach ($comments as $comment) {
-  40|                     // day header
-  41|                     list($day, $time) = explode(' ', $comment['time']);
-  42|                     if ($day != $curday) {
-  43|                         if ($curday) {
-  44|                             echo "</ul>\n";
-  45|                         }
-  46|                         $erase_id = 'erasecommday_' . str_replace('-', '', $day);
-  47|                         echo "<b>$day:</b> <a href=\"#\" onclick=\"return invert_selection('" . $erase_id . "')\">" . htmlspecialchars(strtolower(_t('INVERT'))) . "</a> <br />\n";
-  48|                         echo '<ul id="' . $erase_id . "\">\n";
-  49|                         $curday = $day;
-  50|                     }
-  51| 
-  52|                     // echo entry
-  53|                     echo '<li><input name="suppr[]" value="' . $comment['tag'] . '" type="checkbox" /> [' . htmlspecialchars(_t('DEL')) . '!] ' .
-  54|                         $comment['tag'] .
-  55|                         ' (',$comment['time'],') <code>' .
-  56|                         htmlspecialchars(substr($comment['body'], 0, 25), ENT_COMPAT, YW_CHARSET) . '</code> ' .
-  57|                         '<a href="',$wiki->href('', $comment['comment_on'], 'show_comments=1') . '#' . $comment['tag'] . '">' .
-  58|                         $comment['comment_on'],'</a> . . . . ' .
-  59|                         $wiki->Format($comment['user']),"</li>\n";
-  60|                 }
-  61|                 echo "</ul>\n<input type=\"hidden\" name=\"clean\" value=\"yes\" />\n";
-  62|                 echo '<button value="Valider">' . htmlspecialchars(_t('CLEAN')) . " >></button>\n";
-  63|                 echo '</form>';
-  64|             } else {
-  65|                 echo '<i>' . htmlspecialchars(_t('NO_RECENT_COMMENTS')) . '.</i>';
-  66|             }
-  67|         }
-  68| 
-  69|         // -- 3. Traitement du formulaire ---
-  70|         elseif (isset($_POST['clean'])) {
-  71|             $deletedPages = '';
-  72| 
-  73|             // -- 3.1 Si des pages ont été sélectionnées : effacement ---
-  74|             // On efface chaque élément du tableau suppr[]
-  75|             // Pour chaque page sélectionnée
-  76|             if (!empty($_POST['suppr'])) {
-  77|                 foreach ($_POST['suppr'] as $page) {
-  78|                     // Effacement de la page en utilisant la méthode adéquate
-  79|                     // (si DeleteOrphanedPage ne convient pas, soit on créé
-  80|                     // une autre, soit on la modifie
-  81|                     echo 'Effacement de : ' . $page . "<br />\n";
-  82|                     if ($wiki->services->get(PageController::class)->delete($page)) {
-  83|                         $deletedPages .= $page . ', ';
-  84|                     }
-  85|                 }
-  86|                 $deletedPages = trim($deletedPages, ', ');
-  87|                 echo '<p><a href="' . $wiki->Href() . '">' . _t('FORM_RETURN') . '.</a></p>';
-  88|             }
-  89| 
-  90|             // -- 3.2 Si aucune page n'a été sélectionné : message
-  91|             else {
-  92|                 echo '<p>' . _t('NO_SELECTED_COMMENTS_TO_ERASE') . '.</p>';
-  93|                 echo '<p><a href="' . $wiki->Href() . '">' . _t('FORM_RETURN') . '.</a></p>';
-  94|             }
-  95| 
-  96|             // -- 3.3 écriture du journal des actions ---
-  97|             //        S'il y a eu des pages nettoyées,
-  98|             //        on enregistre dans une page choisie qui a fait quoi
-  99|             if ($deletedPages) {
- 100|                 // -- Détermine quelle est la page de log :
- 101|                 //    -- passée en paramétre
- 102|                 //    -- ou la page de log par défaut
- 103|                 $reportingPage = isset($this->arguments['logpage']) ? $this->arguments['logpage'] : '';
- 104| 
- 105|                 // -- Ajout de la ligne de log
- 106|                 $wiki->LogAdministrativeAction(
- 107|                     $wiki->GetUserName(),
- 108|                     _t('ERASED_COMMENTS') .
- 109|                     /*" [" .*/ /*$_POST['comment'] .*/ /* "]".*/
- 110|                     '&nbsp;: ' .
- 111|                     '""' .
- 112|                     $deletedPages .
- 113|                     '""' .
- 114|                     "\n",
- 115|                     $reportingPage
- 116|                 );
- 117|             }
- 118|         }
- 119| 
- 120|         return ob_get_clean();
- 121|     }
+  32| 	"github.com/beego/beego/v2/core/berror"
+  33| )
+  34| 
+  35| // FileCacheItem is basic unit of file cache adapter which
+  36| // contains data and expire time.
+  37| type FileCacheItem struct {
+  38| 	Data       interface{}
+  39| 	Lastaccess time.Time
+  40| 	Expired    time.Time
+  41| }
+  42| 
+  43| // FileCache Config
+  44| var (
+  45| 	FileCachePath           = "cache"     // cache directory
+  46| 	FileCacheFileSuffix     = ".bin"      // cache file suffix
+  47| 	FileCacheDirectoryLevel = 2           // cache file deep level if auto generated cache files.
+  48| 	FileCacheEmbedExpiry    time.Duration // cache expire time, default is no expire forever.
+  49| )
+  50| 
+  51| // FileCache is cache adapter for file storage.
+  52| type FileCache struct {
+  53| 	CachePath      string
+  54| 	FileSuffix     string
+  55| 	DirectoryLevel int
+  56| 	EmbedExpiry    int
+  57| }
+  58| 
+  59| // NewFileCache creates a new file cache with no config.
+  60| // The level and expiry need to be set in the method StartAndGC as config string.
+  61| func NewFileCache() Cache {
+  62| 	//    return &FileCache{CachePath:FileCachePath, FileSuffix:FileCacheFileSuffix}
+  63| 	return &FileCache{}
+  64| }
+  65| 
+  66| // StartAndGC starts gc for file cache.
+  67| // config must be in the format {CachePath:"/cache","FileSuffix":".bin","DirectoryLevel":"2","EmbedExpiry":"0"}
+  68| func (fc *FileCache) StartAndGC(config string) error {
+  69| 	cfg := make(map[string]string)
+  70| 	err := json.Unmarshal([]byte(config), &cfg)
+  71| 	if err != nil {
+  72| 		return err
+  73| 	}
+  74| 
+  75| 	const cpKey = "CachePath"
+  76| 	const fsKey = "FileSuffix"
+  77| 	const dlKey = "DirectoryLevel"
+  78| 	const eeKey = "EmbedExpiry"
+  79| 
+  80| 	if _, ok := cfg[cpKey]; !ok {
+  81| 		cfg[cpKey] = FileCachePath
+  82| 	}
+  83| 
+  84| 	if _, ok := cfg[fsKey]; !ok {
+  85| 		cfg[fsKey] = FileCacheFileSuffix
+  86| 	}
+  87| 
+  88| 	if _, ok := cfg[dlKey]; !ok {
+  89| 		cfg[dlKey] = strconv.Itoa(FileCacheDirectoryLevel)
+  90| 	}
+  91| 
+  92| 	if _, ok := cfg[eeKey]; !ok {
+  93| 		cfg[eeKey] = strconv.FormatInt(int64(FileCacheEmbedExpiry.Seconds()), 10)
+  94| 	}
+  95| 	fc.CachePath = cfg[cpKey]
+  96| 	fc.FileSuffix = cfg[fsKey]
+  97| 	fc.DirectoryLevel, err = strconv.Atoi(cfg[dlKey])
+  98| 	if err != nil {
+  99| 		return berror.Wrapf(err, InvalidFileCacheDirectoryLevelCfg,
+ 100| 			"invalid directory level config, please check your input, it must be integer: %s", cfg[dlKey])
+ 101| 	}
+ 102| 	fc.EmbedExpiry, err = strconv.Atoi(cfg[eeKey])
+ 103| 	if err != nil {
+ 104| 		return berror.Wrapf(err, InvalidFileCacheEmbedExpiryCfg,
+ 105| 			"invalid embed expiry config, please check your input, it must be integer: %s", cfg[eeKey])
+ 106| 	}
+ 107| 	return fc.Init()
+ 108| }
+ 109| 
+ 110| // Init makes new a dir for file cache if it does not already exist
+ 111| func (fc *FileCache) Init() error {
+ 112| 	ok, err := exists(fc.CachePath)
+ 113| 	if err != nil || ok {
+ 114| 		return err
+ 115| 	}
+ 116| 	err = os.MkdirAll(fc.CachePath, os.ModePerm)
+ 117| 	if err != nil {
+ 118| 		return berror.Wrapf(err, CreateFileCacheDirFailed,
+ 119| 			"could not create directory, please check the config [%s] and file mode.", fc.CachePath)
+ 120| 	}
+ 121| 	return nil
  122| }
  123| 
- 124| 
+ 124| // getCacheFileName returns a md5 encoded file name.
+ 125| func (fc *FileCache) getCacheFileName(key string) (string, error) {
+ 126| 	m := sha256.New()
+ 127| 	_, _ = io.WriteString(m, key)
+ 128| 	keySha256 := hex.EncodeToString(m.Sum(nil))
+ 129| 	cachePath := fc.CachePath
+ 130| 	switch fc.DirectoryLevel {
+ 131| 	case 2:
+ 132| 		cachePath = filepath.Join(cachePath, keySha256[0:2], keySha256[2:4])
+ 133| 	case 1:
+ 134| 		cachePath = filepath.Join(cachePath, keySha256[0:2])
+ 135| 	}
+ 136| 	ok, err := exists(cachePath)
+ 137| 	if err != nil {
+ 138| 		return "", err
+ 139| 	}
+ 140| 	if !ok {
+ 141| 		fmt.Printf("cachePath: %s\n", cachePath)
+ 142| 		err = os.MkdirAll(cachePath, os.ModePerm)
+ 143| 		if err != nil {
+ 144| 			return "", berror.Wrapf(err, CreateFileCacheDirFailed,
+ 145| 				"could not create the directory: %s", cachePath)
+ 146| 		}
+ 147| 	}
+ 148| 
+ 149| 	return filepath.Join(cachePath, fmt.Sprintf("%s%s", keySha256, fc.FileSuffix)), nil
+ 150| }
+ 151| 
+ 152| // Get value from file cache.
+ 153| // if nonexistent or expired return an empty string.
+ 154| func (fc *FileCache) Get(ctx context.Context, key string) (interface{}, error) {
+ 155| 	fn, err := fc.getCacheFileName(key)
+ 156| 	if err != nil {
+ 157| 		return nil, err
+ 158| 	}
+ 159| 	fileData, err := FileGetContents(fn)
+ 160| 	if err != nil {
+ 161| 		return nil, err
+ 162| 	}
+ 163| 
+ 164| 	var to FileCacheItem
+ 165| 	err = GobDecode(fileData, &to)
+ 166| 	if err != nil {
+ 167| 		return nil, err
+ 168| 	}
+ 169| 
+ 170| 	if to.Expired.Before(time.Now()) {
+ 171| 		return nil, ErrKeyExpired
+ 172| 	}
+ 173| 	return to.Data, nil
+ 174| }
+ 175| 
+ 176| // GetMulti gets values from file cache.
+ 177| // if nonexistent or expired return an empty string.
+ 178| func (fc *FileCache) GetMulti(ctx context.Context, keys []string) ([]interface{}, error) {
+ 179| 	rc := make([]interface{}, len(keys))
+ 180| 	keysErr := make([]string, 0)
+ 181| 
+ 182| 	for i, ki := range keys {
+ 183| 		val, err := fc.Get(context.Background(), ki)
+ 184| 		if err != nil {
+ 185| 			keysErr = append(keysErr, fmt.Sprintf("key [%s] error: %s", ki, err.Error()))
+ 186| 			continue
+ 187| 		}
+ 188| 		rc[i] = val
+ 189| 	}
+ 190| 
+ 191| 	if len(keysErr) == 0 {
+ 192| 		return rc, nil
+ 193| 	}
+ 194| 	return rc, berror.Error(MultiGetFailed, strings.Join(keysErr, "; "))
+ 195| }
+ 196| 
+ 197| // Put value into file cache.
+ 198| // timeout: how long this file should be kept in ms
+ 199| // if timeout equals fc.EmbedExpiry(default is 0), cache this item forever.
+ 200| func (fc *FileCache) Put(ctx context.Context, key string, val interface{}, timeout time.Duration) error {
+ 201| 	gob.Register(val)
+ 202| 
+ 203| 	item := FileCacheItem{Data: val}
+ 204| 	if timeout == time.Duration(fc.EmbedExpiry) {
+ 205| 		item.Expired = time.Now().Add((86400 * 365 * 10) * time.Second) // ten years
+ 206| 	} else {
+ 207| 		item.Expired = time.Now().Add(timeout)
+ 208| 	}
+ 209| 	item.Lastaccess = time.Now()
+ 210| 	data, err := GobEncode(item)
+ 211| 	if err != nil {
+ 212| 		return err
+ 213| 	}
+ 214| 
+ 215| 	fn, err := fc.getCacheFileName(key)
+ 216| 
+ 217| 	if err != nil {
+ 218| 		return err
+ 219| 	}
+ 220| 	return FilePutContents(fn, data)
+ 221| }
+ 222| 
+ 223| // Delete file cache value.
+ 224| func (fc *FileCache) Delete(ctx context.Context, key string) error {
+ 225| 	filename, err := fc.getCacheFileName(key)
+ 226| 	if err != nil {
+ 227| 		return err
+ 228| 	}
+ 229| 	if ok, _ := exists(filename); ok {
+ 230| 		err = os.Remove(filename)
+ 231| 		if err != nil {
+ 232| 			return berror.Wrapf(err, DeleteFileCacheItemFailed,
+ 233| 				"can not delete this file cache key-value, key is %s and file name is %s", key, filename)
+ 234| 		}
+ 235| 	}
+ 236| 	return nil
+ 237| }
+ 238| 
+ 239| // Incr increases cached int value.
+ 240| // fc value is saved forever unless deleted.
+ 241| func (fc *FileCache) Incr(ctx context.Context, key string) error {
+ 242| 	data, err := fc.Get(context.Background(), key)
+ 243| 	if err != nil {
+ 244| 		return err
+ 245| 	}
+ 246| 
+ 247| 	val, err := incr(data)
+ 248| 	if err != nil {
+ 249| 		return err
+ 250| 	}
+ 251| 
+ 252| 	return fc.Put(context.Background(), key, val, time.Duration(fc.EmbedExpiry))
+ 253| }
+ 254| 
+ 255| // Decr decreases cached int value.
+ 256| func (fc *FileCache) Decr(ctx context.Context, key string) error {
+ 257| 	data, err := fc.Get(context.Background(), key)
+ 258| 	if err != nil {
+ 259| 		return err
+ 260| 	}
+ 261| 
+ 262| 	val, err := decr(data)
+ 263| 	if err != nil {
+ 264| 		return err
+ 265| 	}
+ 266| 
+ 267| 	return fc.Put(context.Background(), key, val, time.Duration(fc.EmbedExpiry))
+ 268| }
+ 269| 
+ 270| // IsExist checks if value exists.
+ 271| func (fc *FileCache) IsExist(ctx context.Context, key string) (bool, error) {
+ 272| 	fn, err := fc.getCacheFileName(key)
+ 273| 	if err != nil {
+ 274| 		return false, err
+ 275| 	}
+ 276| 	return exists(fn)
+ 277| }
+ 278| 
+ 279| // ClearAll cleans cached files (not implemented)
+ 280| func (fc *FileCache) ClearAll(context.Context) error {
+ 281| 	return nil
+ 282| }
+ 283| 
+ 284| // Check if a file exists
+ 285| func exists(path string) (bool, error) {
+ 286| 	_, err := os.Stat(path)
+ 287| 	if err == nil {
+ 288| 		return true, nil
+ 289| 	}
+ 290| 	if os.IsNotExist(err) {
+ 291| 		return false, nil
+ 292| 	}
+ 293| 	return false, berror.Wrapf(err, InvalidFileCachePath, "file cache path is invalid: %s", path)
+ 294| }
+ 295| 
+ 296| // FileGetContents Reads bytes from a file.
+ 297| // if non-existent, create this file.
+ 298| func FileGetContents(filename string) ([]byte, error) {
+ 299| 	data, err := os.ReadFile(filename)
+ 300| 	if err != nil {
+ 301| 		return nil, berror.Wrapf(err, ReadFileCacheContentFailed,
+ 302| 			"could not read the data from the file: %s, "+
+ 303| 				"please confirm that file exist and Beego has the permission to read the content.", filename)
+ 304| 	}
+ 305| 	return data, nil
+ 306| }
+ 307| 
+ 308| // FilePutContents puts bytes into a file.
+ 309| // if non-existent, create this file.
+ 310| func FilePutContents(filename string, content []byte) error {
+ 311| 	return os.WriteFile(filename, content, os.ModePerm)
+ 312| }
+ 313| 
+ 314| // GobEncode Gob encodes a file cache item.
+ 315| func GobEncode(data interface{}) ([]byte, error) {
+ 316| 	buf := bytes.NewBuffer(nil)
+ 317| 	enc := gob.NewEncoder(buf)
+ 318| 	err := enc.Encode(data)
+ 319| 	if err != nil {
+ 320| 		return nil, berror.Wrap(err, GobEncodeDataFailed, "could not encode this data")
+ 321| 	}
+ 322| 	return buf.Bytes(), nil
+ 323| }
+ 324| 
+ 325| // GobDecode Gob decodes a file cache item.
+ 326| func GobDecode(data []byte, to *FileCacheItem) error {
+ 327| 	buf := bytes.NewBuffer(data)
+ 328| 	dec := gob.NewDecoder(buf)
+ 329| 	err := dec.Decode(&to)
+ 330| 	if err != nil {
+ 331| 		return berror.Wrap(err, InvalidGobEncodedData,
+ 332| 			"could not decode this data to FileCacheItem. Make sure that the data is encoded by GOB.")
+ 333| 	}
+ 334| 	return nil
+ 335| }
+ 336| 
+ 337| func init() {
+ 338| 	Register("file", NewFileCache)
+ 339| }
+ 340| 
+ 341| 
+
+### id=7859 lang=go
+[CODE]
+   1| // Copyright (C) 2019 Nicola Murino
+   2| //
+   3| // This program is free software: you can redistribute it and/or modify
+   4| // it under the terms of the GNU Affero General Public License as published
+   5| // by the Free Software Foundation, version 3.
+   6| //
+   7| // This program is distributed in the hope that it will be useful,
+   8| // but WITHOUT ANY WARRANTY; without even the implied warranty of
+   9| // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+  10| // GNU Affero General Public License for more details.
+  11| //
+  12| // You should have received a copy of the GNU Affero General Public License
+  13| // along with this program. If not, see <https://www.gnu.org/licenses/>.
+  14| 
+  15| package httpd
+  16| 
+  17| import (
+  18| 	"encoding/json"
+  19| 	"errors"
+  20| 	"sync"
+  21| 	"time"
+  22| 
+  23| 	"github.com/drakkan/sftpgo/v2/internal/dataprovider"
+  24| 	"github.com/drakkan/sftpgo/v2/internal/kms"
+  25| 	"github.com/drakkan/sftpgo/v2/internal/logger"
+  26| 	"github.com/drakkan/sftpgo/v2/internal/util"
+  27| )
+  28| 
+  29| var (
+  30| 	oauth2Mgr oauth2Manager
+  31| )
+  32| 
+  33| func newOAuth2Manager(isShared int) oauth2Manager {
+  34| 	if isShared == 1 {
+  35| 		logger.Info(logSender, "", "using provider OAuth2 manager")
+  36| 		return &dbOAuth2Manager{}
+  37| 	}
+  38| 	logger.Info(logSender, "", "using memory OAuth2 manager")
+  39| 	return &memoryOAuth2Manager{
+  40| 		pendingAuths: make(map[string]oauth2PendingAuth),
+  41| 	}
+  42| }
+  43| 
+  44| type oauth2PendingAuth struct {
+  45| 	State        string      `json:"state"`
+  46| 	Provider     int         `json:"provider"`
+  47| 	ClientID     string      `json:"client_id"`
+  48| 	ClientSecret *kms.Secret `json:"client_secret"`
+  49| 	RedirectURL  string      `json:"redirect_url"`
+  50| 	IssuedAt     int64       `json:"issued_at"`
+  51| }
+  52| 
+  53| func newOAuth2PendingAuth(provider int, redirectURL, clientID string, clientSecret *kms.Secret) oauth2PendingAuth {
+  54| 	return oauth2PendingAuth{
+  55| 		State:        util.GenerateOpaqueString(),
+  56| 		Provider:     provider,
+  57| 		ClientID:     clientID,
+  58| 		ClientSecret: clientSecret,
+  59| 		RedirectURL:  redirectURL,
+  60| 		IssuedAt:     util.GetTimeAsMsSinceEpoch(time.Now()),
+  61| 	}
+  62| }
+  63| 
+  64| type oauth2Manager interface {
+  65| 	addPendingAuth(pendingAuth oauth2PendingAuth)
+  66| 	removePendingAuth(state string)
+  67| 	getPendingAuth(state string) (oauth2PendingAuth, error)
+  68| 	cleanup()
+  69| }
+  70| 
+  71| type memoryOAuth2Manager struct {
+  72| 	mu           sync.RWMutex
+  73| 	pendingAuths map[string]oauth2PendingAuth
+  74| }
+  75| 
+  76| func (o *memoryOAuth2Manager) addPendingAuth(pendingAuth oauth2PendingAuth) {
+  77| 	o.mu.Lock()
+  78| 	defer o.mu.Unlock()
+  79| 
+  80| 	o.pendingAuths[pendingAuth.State] = pendingAuth
+  81| }
+  82| 
+  83| func (o *memoryOAuth2Manager) removePendingAuth(state string) {
+  84| 	o.mu.Lock()
+  85| 	defer o.mu.Unlock()
+  86| 
+  87| 	delete(o.pendingAuths, state)
+  88| }
+  89| 
+  90| func (o *memoryOAuth2Manager) getPendingAuth(state string) (oauth2PendingAuth, error) {
+  91| 	o.mu.RLock()
+  92| 	defer o.mu.RUnlock()
+  93| 
+  94| 	authReq, ok := o.pendingAuths[state]
+  95| 	if !ok {
+  96| 		return oauth2PendingAuth{}, errors.New("oauth2: no auth request found for the specified state")
+  97| 	}
+  98| 	diff := util.GetTimeAsMsSinceEpoch(time.Now()) - authReq.IssuedAt
+  99| 	if diff > authStateValidity {
+ 100| 		return oauth2PendingAuth{}, errors.New("oauth2: auth request is too old")
+ 101| 	}
+ 102| 	return authReq, nil
+ 103| }
+ 104| 
+ 105| func (o *memoryOAuth2Manager) cleanup() {
+ 106| 	o.mu.Lock()
+ 107| 	defer o.mu.Unlock()
+ 108| 
+ 109| 	for k, auth := range o.pendingAuths {
+ 110| 		diff := util.GetTimeAsMsSinceEpoch(time.Now()) - auth.IssuedAt
+ 111| 		// remove old pending auth requests
+ 112| 		if diff < 0 || diff > authStateValidity {
+ 113| 			delete(o.pendingAuths, k)
+ 114| 		}
+ 115| 	}
+ 116| }
+ 117| 
+ 118| type dbOAuth2Manager struct{}
+ 119| 
+ 120| func (o *dbOAuth2Manager) addPendingAuth(pendingAuth oauth2PendingAuth) {
+ 121| 	if err := pendingAuth.ClientSecret.Encrypt(); err != nil {
+ 122| 		logger.Error(logSender, "", "unable to encrypt oauth2 secret: %v", err)
+ 123| 		return
+ 124| 	}
+ 125| 	session := dataprovider.Session{
+ 126| 		Key:       pendingAuth.State,
+ 127| 		Data:      pendingAuth,
+ 128| 		Type:      dataprovider.SessionTypeOAuth2Auth,
+ 129| 		Timestamp: pendingAuth.IssuedAt + authStateValidity,
+ 130| 	}
+ 131| 	dataprovider.AddSharedSession(session) //nolint:errcheck
+ 132| }
+ 133| 
+ 134| func (o *dbOAuth2Manager) removePendingAuth(state string) {
+ 135| 	dataprovider.DeleteSharedSession(state) //nolint:errcheck
+ 136| }
+ 137| 
+ 138| func (o *dbOAuth2Manager) getPendingAuth(state string) (oauth2PendingAuth, error) {
+ 139| 	session, err := dataprovider.GetSharedSession(state)
+ 140| 	if err != nil {
+ 141| 		return oauth2PendingAuth{}, errors.New("oauth2: unable to get the auth request for the specified state")
+ 142| 	}
+ 143| 	if session.Timestamp < util.GetTimeAsMsSinceEpoch(time.Now()) {
+ 144| 		// expired
+ 145| 		return oauth2PendingAuth{}, errors.New("oauth2: auth request is too old")
+ 146| 	}
+ 147| 	return o.decodePendingAuthData(session.Data)
+ 148| }
+ 149| 
+ 150| func (o *dbOAuth2Manager) decodePendingAuthData(data any) (oauth2PendingAuth, error) {
+ 151| 	if val, ok := data.([]byte); ok {
+ 152| 		authReq := oauth2PendingAuth{}
+ 153| 		err := json.Unmarshal(val, &authReq)
+ 154| 		if err != nil {
+ 155| 			return authReq, err
+ 156| 		}
+ 157| 		err = authReq.ClientSecret.TryDecrypt()
+ 158| 		return authReq, err
+ 159| 	}
+ 160| 	logger.Error(logSender, "", "invalid oauth2 auth request data type %T", data)
+ 161| 	return oauth2PendingAuth{}, errors.New("oauth2: invalid auth request data")
+ 162| }
+ 163| 
+ 164| func (o *dbOAuth2Manager) cleanup() {
+ 165| 	dataprovider.CleanupSharedSessions(dataprovider.SessionTypeOAuth2Auth, time.Now()) //nolint:errcheck
+ 166| }
+ 167| 
+ 168| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=7847 teacher=unknown flags=[]
-[ANALYSIS]
-## 编号分析（全文通读）
-
-**入口点枚举**
-1. 第 44 行 `GET /` 列表接口：仅返回配置信息，无 sink。
-2. 第 55 行 `/{server_id}/{path:path}` HTTP 代理：source 为第 56 行 `path` 路径参数与第 96 行 `request.query_params`；sink 为第 84/89 行 `target_url` 拼接后传入第 130 行 `session.request()`。
-3. 第 194 行 WebSocket `/{server_id}/api/terminals/{session_id}`：source 为首消息 JWT（有 decode_token 验证）与第 195 行 `session_id`；sink 为第 246 行 `ws_connect(upstream_url)`。
-
-**逐条数据流验证**
-
-- **HTTP path（第 56 → 66 → 84 行）**：`_sanitize_proxy_path`（第 27–52 行）做了迭代解码 8 次（防 `%252e%252e` 二次编码绕过）、`posixpath.normpath`、去前导斜杠、拒绝以 `..` 开头。迭代解码本身是有效防御。**但**它使用的是 `posixpath`，只把 `/` 当分隔符，不处理反斜杠 `\`。输入如 `..\..\secret` 或 `%5C..%5C..%5C` 经解码后为 `..\..\secret`，`normpath` 不解析反斜杠，`lstrip('/')` 与 `startswith('..')` 检查均不命中（字符串以 `\` 或字母开头），最终原样拼入 `target_url`。若上游服务（或中间的 orchestrator/policy 网关，第 87–89 行）运行在 Windows/Nginx 等将 `\` 规范化为分隔符的环境，即构成路径穿越绕过。黑名单式 `startswith('..')` 按本任务判定标准视为可绕过过滤。
-- **query_params（第 92–93 行）**：直接字符串拼接回 URL。FastAPI 的 QueryParams 会重新编码，风险低。
-- **X-Session-Id 头转发（第 99–101 行）**：aiohttp 会拒绝含 CRLF 的头值，注入风险低；但该值未验证即透传给上游，属信任客户端输入的弱设计。
-- **auth_type == 'session'（第 111–112 行）**：`cookies = request.cookies` 把用户对 open-webui 的**全部 Cookie** 转发给管理员配置的上游服务器，存在凭据泄露面（依赖上游可信度，中低危）。
-- **错误信息回显（第 168 行）**：`502` 响应包含上游异常细节，轻微信息泄露。
-- **WebSocket session_id（第 195 → 246 行）**：`session_id` 是单段路径参数，Starlette 通常不允许其中出现 `/`，但若编码字符（如 `%3F`、`%23`）被透传拼接进上游 URL，可能改变请求目标端点；aiohttp 会对 URL 再编码，实际可利用性有限。
-- **SSRF 面**：`base_url` 来自管理员配置（第 73 行），非用户可控，不构成用户级 SSRF。
-- **WebSocket 认证（第 205–238 行）**：首消息 JWT + 组权限校验完整，无未授权访问。
-
-**结论**：核心漏洞是 `_sanitize_proxy_path` 仅用 `posixpath` 规范化，无法防御反斜杠形式的穿越序列，配合 `startswith('..')` 黑名单可在特定上游环境下绕过，导致对已授权终端服务器的越权路径读取（受限 SSRF/路径穿越）。
-[JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal / CWE-918 variant", "risk_level": "Medium", "source": "line 79: path:path 路径参数（含 %5C 编码的反斜杠序列）", "sink": "line 84-89: target_url 拼接后于 line 125 传入 session.request()", "explanation": "_sanitize_proxy_path 使用 posixpath.normpath 且仅检查 cleaned.startswith('..')，反斜杠不被视为分隔符，因此 ..\\..\\secret 或 %5C..%5C 解码后可通过全部检查并原样拼入 target_url；当上游终端服务器或 policy 网关（Windows/Nginx 等）将反斜杠规范化为路径分隔符时即可穿越到 base_url 之外的任意路径 -> 迭代 unquote 防住了二次编码但防不住反斜杠变体", "fix_suggestion": "line 47-51: 在规范化前先将 path.replace('\\\\', '/') 统一为正斜杠再 normpath，并将校验改为逐段拆分后拒绝任何等于 '..' 的段（白名单式校验），而非 startswith 黑名单"}
-
-### id=7848 teacher=unknown flags=[]
+### id=7858 teacher=unknown flags=[]
 [ANALYSIS]
 ## 编号分析
 
-**入口点枚举（全文）**
-1. 第 55–64 行：`GET /` 列出终端服务器，仅依赖认证用户与组权限，无 sink。
-2. 第 71–170 行：`/{server_id}/{path:path}` HTTP 代理，主要攻击面。
-3. 第 178–247 行：`_resolve_authenticated_connection`，首消息 JWT 认证 + 权限校验。
-4. 第 250–360 行：`ws_terminal` WebSocket 代理。
+1. **入口点枚举（全文）**：
+   - `StartAndGC`（第 58 行起）：JSON 配置字符串，可设置 `CachePath`、`FileSuffix`、`DirectoryLevel`、`EmbedExpiry`。
+   - `Get/GetMulti/Put/Delete/Incr/Decr/IsExist`：均以外部传入的 `key string` 为数据源。
+   - `FileGetContents/FilePutContents`（第 236、244 行附近）：文件读写 sink，但仅被内部以哈希后的文件名调用。
+   - `init()`：仅注册适配器，无风险。
 
-**数据流逐一验证**
+2. **key → 文件路径数据流**：所有含 key 的操作都先经过 `getCacheFileName`（第 100 行附近），key 被 `sha256 + hex.EncodeToString` 处理，输出仅为 `[0-9a-f]` 字符。因此 `../`、空字节、绝对路径等路径遍历 payload 均被彻底消除——这是规范化（哈希）而非黑名单，属有效防御。后续 `filepath.Join(cachePath, keySha256+suffix)` 中 key 部分不可注入。
 
-- **路径遍历/SSRF（source=`path` → sink=`target_url`）**：第 20–48 行 `_sanitize_proxy_path` 迭代 unquote 至稳定（最多 8 次），仍有残留编码则 fail-closed（第 33–34 行）；随后 `posixpath.normpath` 归一化并 lstrip('/')（第 37–38 行），拒绝以 `..` 开头或等于 `.` 的结果。双重编码 `%252e%252e`、`..%2f`、`%2e%2e/` 等变体均被迭代解码覆盖；反斜杠在 posixpath 下不作为分隔符，且上游为 POSIX 场景。base_url 来自管理员配置而非用户输入，用户无法控制主机，故无用户侧 SSRF。
-- **查询串透传**：第 96 行直接拼接 `request.query_params`，Starlette 已解析再序列化，无 CRLF 注入面；aiohttp 对非法头值会抛错，非绕过。
-- **头注入**：第 103–106 行转发客户端 `x-session-id` 为 `X-Session-Id`——单值头，aiohttp 拒绝含换行的头值，无请求走私/CRLF。
-- **Cookie/token 转发**：第 116–127 行按 auth_type 转发 cookie 或 bearer token 到管理员配置的同一连接 URL，属设计内行为；`request.state.token.credentials` 在 `get_verified_user` 依赖后必然存在。
-- **响应头过滤**：第 145–149 行剥离 hop-by-hop 头（transfer-encoding/connection/content-encoding/content-length），防止解压不一致问题；`TERMINAL_PROXY_HEADERS` 为管理员配置。
-- **错误信息泄露**：第 168–169 行把异常字符串回给客户端（502 响应含 `{error}`），可能泄露内网 URL 细节——低危信息泄露，非可利用漏洞。
-- **WebSocket 入口**：第 261–286 行先完成 JWT 认证、服务器存在性与组权限校验后才建连，防御有效。`session_id`（第 296–300 行）拼入上游 URL：Starlette 单段路径参数不含 `/`，无法构造 `../` 遍历；理论上 `%3F` 解码后的 `?` 可改变上游查询串，但上游仍要求其自有 auth（第 310–313 行 bearer key），影响仅为参数扰动，不构成越权。
-- **第二通道检查**：WS 与 HTTP 共用同一连接配置与权限模型，无绕过路径；`policy_id` 分支只是前缀拼接，safe_path 已消毒。
+3. **config → CachePath / FileSuffix 数据流**：`StartAndGC` 直接把配置中的 `CachePath` 用于 `os.MkdirAll`（第 91 行），`FileSuffix` 拼进最终文件名。若配置完全由攻击者控制，理论上可通过 `FileSuffix` 含 `../` 或恶意 `CachePath` 影响写入位置。但该配置是应用初始化时由开发者/运维提供的（如 beego 的 cache 配置项），不是运行时用户输入；框架文档明确其为管理员级配置。按威胁模型这属于受信任配置，不构成可达漏洞。
 
-**结论**：核心 source→sink 流（path→URL、header→header、token→upstream）均有有效防御；仅有低危的异常信息回显与非可利用的 session_id 字符扰动，不构成安全漏洞。
+4. **替代通道检查**：
+   - gob 反序列化（`GobDecode`）：若缓存目录可被攻击者写（如共享主机、目录权限 `os.ModePerm`=0777），可能注入恶意 gob 数据。但 gob 解码默认只实例化已注册类型，且前提是文件系统权限已被攻破，属于部署问题而非本代码可直接利用的漏洞。不过 `os.ModePerm` 创建文件/目录权限过宽（第 91、246 行）是一个值得注意的加固点（信息泄露/篡改风险的放大器）。
+   - `fmt.Printf` 打印 cachePath（第 116 行）：轻微信息输出到 stdout，无实质危害。
+
+5. **结论**：用户可控输入（key）经 sha256 完全中和，不存在路径遍历；其余数据流源头均为可信配置。未发现可利用漏洞；仅有权限模式过宽的加固建议。
 [JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文三个入口点：列表接口仅做权限过滤；HTTP 代理中用户可控的 path 经 _sanitize_proxy_path 迭代解码至稳定并 fail-closed，再用 posixpath.normpath 归一化并拒绝 .. 前缀，双重编码等绕过被覆盖，base_url 由管理员配置故无用户侧 SSRF；x-session-id 单值转发由 aiohttp 头校验防 CRLF；hop-by-hop 响应头已剥离；WebSocket 入口先完成 JWT 首消息认证与组权限校验才连上游，session_id 为单段路径参数无法构造遍历，且上游另有 API key 认证。仅存在低危的异常信息回显（502 响应包含内部错误详情）与 session_id 中特殊字符对上游查询串的非可利用扰动，均不构成可利用漏洞。", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文逐一核查了 StartAndGC 的 JSON 配置入口以及 Get/Put/Delete/Incr/Decr/IsExist 等以 key 为源的入口。所有 key 在 getCacheFileName 中先经过 sha256 加 hex 编码，输出仅为十六进制字符，路径遍历与特殊字符注入被彻底消除（属规范化而非黑名单，防御有效）。CachePath 与 FileSuffix 来自应用启动时的可信配置而非运行时用户输入，不构成可达攻击面。唯一加固建议是 os.MkdirAll 与 os.WriteFile 使用 os.ModePerm（0777）权限过宽，在多租户环境下可能放大缓存文件被篡改的风险，但不构成本代码中可直接利用的安全漏洞。", "fix_suggestion": "no fix needed"}
 
-### id=8059 teacher=unknown flags=[]
+### id=7859 teacher=unknown flags=[]
 [ANALYSIS]
-## 编号分析（逐函数、全文覆盖）
+# SFTPGo OAuth2 管理器安全分析
 
-1. **第 1–30 行（模块头与导入）**：仅导入标准库与项目内部模块，无网络、文件、子进程、eval 等危险 sink。
+## 一、文件定位与入口点枚举
 
-2. **第 32–37 行 `EXPLICIT_TASK_ID_DEPRECATION`**：纯字符串常量，无风险。
+本文件是 SFTPGo 的 HTTPD 模块中 OAuth2 状态管理器的实现（内存版 + 数据库共享会话版）。本文件本身**不注册任何 HTTP 路由、不直接解析任何用户输入参数**，它是一个被上层 `oauth2.go` / 路由处理器调用的库层组件。因此需要逐一分析每个函数，确认其输入来源与输出去向。
 
-3. **`is_task` / `client_supports_tasks` 属性（约 55–66 行）**：只读布尔判断，无数据流。
+## 二、逐函数分析与数据流验证
 
-4. **`validate_task_mode`（约 68–110 行）**：输入为开发者传入的枚举值，输出 ErrorData 消息为硬编码字符串，不含用户输入拼接，无注入面。
+### 1. 第 27-29 行：包级变量 `oauth2Mgr`
+全局单例变量，仅持有管理器实例。无用户可控数据流经此处。
 
-5. **`validate_for_tool` / `can_use_tool`（约 112–145 行）**：从 Tool 对象读取 taskSupport 并转发给 validate_task_mode，无外部 source 直达 sink。
+### 2. 第 31-38 行：`newOAuth2Manager(isShared int)`
+- **入口点**：`isShared` 参数来自服务启动配置（dataprovider 配置），非用户请求可控。
+- 仅做分支选择返回 `dbOAuth2Manager{}` 或 `memoryOAuth2Manager`，无 sink。
 
-6. **`run_task` 重载与实现（约 147–260 行）**：
-   - 入口点：`work` 回调、`task_id` 参数、`model_immediate_response` 字符串。
-   - `task_id` 数据流：若由调用方显式传入，则原样传给 `support.store.create_task(self.task_metadata, task_id)`（约 224 行）。代码自身未做格式校验，但该参数来自服务器端开发者代码而非客户端请求；且文档字符串与弃用警告已明确说明：显式 ID 不绑定会话，任何持有该 ID 的会话可读取状态/结果或取消任务。这是一个**已被文档化并标记 deprecated 的设计权衡**，且默认路径（task_id=None）通过 `scoped_task_id(session_scope)` 将 ID 绑定到创建会话，构成有效缓解。
-   - `model_immediate_response` 仅放入 `_meta` 字典随响应返回，属于结构化 JSON 字段，非模板/命令/SQL sink。
-   - `execute()` 内部异常被捕获并通过 `task_ctx.fail(str(e))` 记录——异常消息可能含敏感信息返回给客户端，但这取决于 work 函数内容，本文件无法判定，且属信息泄露低危模式而非本文件的注入漏洞。
-   - 无 eval/exec/pickle/os.system/subprocess/文件写入等 sink。
+### 3. 第 40-48 行：`oauth2PendingAuth` 结构体
+字段含 `State`、`Provider`、`ClientID`、`ClientSecret *kms.Secret`、`RedirectURL`。注意：
+- `ClientSecret` 使用 kms.Secret 封装，后续有加密/解密处理；
+- 该结构体在 DB 版中会被 JSON 序列化存入共享会话（第 118 行），序列化对象来自服务端构造（见下），而非直接反序列化用户 JSON——反序列化路径在第 128-141 行，需单独评估。
 
-7. **第二入口与替代通道检查**：本文件是纯库层封装，所有入口均由上层 server 调用方控制；客户端可控数据（task_metadata）仅作为元数据存储，不进入任何解释器类 sink。
+### 4. 第 50-60 行：`newOAuth2PendingAuth(...)`
+- 参数 `redirectURL, clientID, clientSecret` 由调用方（管理员配置的 OAuth2 provider 配置）传入，非请求路径直接注入。
+- **关键防御点**：第 52 行 `State: util.GenerateOpaqueString()` —— state 由密码学安全的随机生成器产生，非用户可控，这是防 CSRF 的核心，且不可预测。
+- `IssuedAt` 取服务器当前时间，不可伪造。
 
-**结论**：通读全文，source→sink 链中不存在未经防御的危险汇聚点；唯一的跨会话访问问题（显式 task_id）已在代码内通过弃用警告和文档明确披露并有安全的默认路径，不构成本文件的漏洞。
+### 5. 接口定义（第 62-67 行）
+纯接口声明，无逻辑。
+
+### 6. memoryOAuth2Manager 系列
+#### 第 70-76 行：`addPendingAuth`
+以随机 state 为 key 写入 map。state 服务端生成，map key 不可被攻击者碰撞（除非猜中 CSPRNG 输出）。
+
+#### 第 78-83 行：`removePendingAuth(state string)`
+按 state 删除。state 来自回调查询参数时，删除不存在的 key 无副作用；即使攻击者传入任意 state 字符串，也只能删除“自己发起或恰好知道 state”的条目——而 state 是高熵随机值且一次性使用，无法枚举他人会话。**无越权删除风险**。
+
+#### 第 85-98 行：`getPendingAuth(state string)`
+- source：state 参数（最终源自 OAuth2 回调 URL 查询参数，属第二入口）。
+- 防御链：① map 查找必须精确命中（第 89-91 行）；② 第 92-95 行时效校验 `diff > authStateValidity` 拒绝过期请求。
+- 返回值包含 ClientSecret（kms 加密形态，内存版未解密），交给上层换取 token。由于 state 不可预测且绑定发起者会话，**不存在水平越权读取**。
+
+#### 第 100-111 行：`cleanup()`
+遍历清理过期项，条件 `diff < 0 || diff > authStateValidity` 覆盖时钟回拨与超期两种情况。无漏洞。
+
+### 7. dbOAuth2Manager 系列
+#### 第 114-127 行：`addPendingAuth`
+- 第 115-119 行：先对 ClientSecret 调用 `Encrypt()`，失败则记录日志并 return（不落库明文）。
+- 第 120-126 行：写入共享会话，key 为随机 state，Timestamp 设为 `IssuedAt + authStateValidity` 作为过期时间。
+- 注意 `AddSharedSession` 错误被 nolint 忽略：若写库失败，上层回调将因查不到 state 而拒绝，属 fail-closed，不构成漏洞。
+
+#### 第 129-132 行：`removePendingAuth`
+同内存版分析，state 高熵不可枚举，无越权删除。
+
+#### 第 134-146 行：`getPendingAuth`
+- source：state（回调参数）→ `GetSharedSession(state)` 精确主键查找。
+- 第 139-142 行：时间戳过期校验，过期即拒。
+- 防御有效性：DB 主键精确匹配 + 过期校验 + state 为 CSPRNG 生成，攻击者无法通过构造 state 读取他人 pending auth。
+
+#### 第 148-161 行：`decodePendingAuthData(data any)`
+- 第 150-153 行：类型断言仅接受 `[]byte`；
+- 第 155-157 行：`json.Unmarshal` 到强类型结构体——**反序列化的数据是服务端自己在 addPendingAuth 时加密/序列化后写入的内容**，不是外部直接提交的 JSON，故不存在反序列化注入面。
+- 第 158 行：`ClientSecret.TryDecrypt()` 解密凭据供 token 交换使用，凭据仅在服务端内部流转，不回传给客户端。
+- 第 159-160 行：未知类型 fail-closed 返回错误。
+
+### 8. 第二入口与替代通道核查
+- 本文件无 HTTP handler、无环境变量读取、无文件 IO、无命令执行 sink（无 `exec`、无 `os.OpenFile` 写路径）。
+- 唯一外部影响面是 state 字符串（经回调 URL 进入），其所有消费点（get/remove）均受“精确匹配 + 高熵不可猜测 + 时效校验”三重约束。
+- ClientSecret 在 DB 版持久化前强制加密（第 116 行），符合凭据存储要求。
+- 内存版 cleanup 与 DB 版 cleanup 均有过期回收，无无限累积导致的 DoS（state 由合法管理员触发的 OAuth2 流程创建，且有时效）。
+
+### 9. 结论性核对
+逐函数检查完毕（覆盖第 27 至 161 行全部函数）：无 SQL 注入（经 dataprovider 参数化会话 API）、无 XSS（无 HTML 输出）、无 SSRF（RedirectURL 仅用于向 OAuth2 provider 发起授权跳转，且为管理员配置值）、无私有信息泄露（secret 加密存储、不回传客户端）、无 CSRF 绕过（state 随机且校验）。
 [JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文审查后未发现可利用漏洞。所有入口点（run_task 的 work 回调、task_id、model_immediate_response）均为服务端开发者控制的库级 API，不直接接收不可信客户端输入；无 eval、命令执行、SQL、文件操作等危险 sink。唯一值得注意的设计点是显式传入的 task_id 不与会话绑定，任何知道该 ID 的请求方可访问任务状态与结果，但代码已通过弃用警告和文档明确披露此行为，且默认路径使用 scoped_task_id 将任务绑定到创建会话作为安全默认。", "fix_suggestion": "no fix needed"}
-
-### id=8060 teacher=unknown flags=[]
-[ANALYSIS]
-# 全文逐行安全分析
-
-## 一、文件结构与入口点枚举
-
-本文件是 YesWiki（WikiNi 衍生）的一个 Action 类 `EraseSpamedCommentsAction`，唯一入口是 `run()` 方法（第 22 行起）。入口点包括：
-
-1. **`$this->arguments['max']`**（第 29 行）——来自 wiki 标记语法 `{{erasespamedcomments max="50"}}`，即页面内容，可被任何有页面编辑权限者注入；
-2. **`$_POST['clean']`**（第 27、62 行）——POST 参数，控制分支；
-3. **`$_POST['suppr']`**（第 68 行）——POST 数组，元素直接作为待删除页名；
-4. **`$this->arguments['logpage']`**（第 96 行）——同 max，来自页面内嵌语法；
-5. **数据库回读数据**：`$comment['tag']`、`$comment['time']`、`$comment['body']`、`$comment['user']`、`$comment['comment_on']`（第 33–47 行），这些是评论页的元数据，其中 tag/time/comment_on 由系统生成，但 user 与 body 部分由用户提交。
-
-## 二、逐条 source→sink 数据流验证
-
-### 流 1：`$comment['tag']` → HTML 输出（XSS）
-
-第 40 行：`'<li><input name="suppr[]" value="' . $comment['tag'] . '" ...' . $comment['tag'] . ' ('...`
-
-tag 被两次拼接进 HTML（input 的 value 属性与正文文本），**均未经过 htmlspecialchars**。对比同一段代码中 `$comment['body']` 用了 `htmlspecialchars(..., ENT_COMPAT, YW_CHARSET)`（第 43 行）、`_t('DEL')` 也做了转义（第 41 行），说明作者有转义意识但遗漏了 tag。tag 是评论页名，通常受页面命名规则约束（字母数字），但在 YesWiki 中通过 API 或特殊字符处理路径创建的页名可能包含引号/尖括号；即便如此，这是典型的存储型 XSS 缺陷——防御缺失而非依赖上游约束。同理第 45–46 行 `$comment['comment_on']` 直接拼入 `<a>` 文本，也未转义。
-
-### 流 2：`$wiki->Format($comment['user'])`（第 47 行）
-
-user 经 Format 渲染，Format 本身是 wiki 语法渲染器，允许注入 wiki 标记。若评论者用户名含 wiki 语法（如 `""`、HTML 注入标记取决于配置），可能造成二次注入。风险较低但属于未净化输出。
-
-### 流 3：`$_POST['suppr'][]` → `PageController::delete($page)`（第 70–71 行）
-
-这是最严重的问题：**任意页面删除**。`run()` 中没有任何 ACL/权限检查（无 `$this->wiki->HasAccess('delete', ...)`、无 admin 角色验证）。任何能加载包含此 action 的页面的访客，均可构造 POST `clean=yes&suppr[]=HomePage&suppr[]=...` 删除站内任意页面。YesWiki 框架层面对 action 是否做权限拦截取决于该 action 是否注册为需要 admin 权限——从代码本身看没有声明，且注释表明它面向管理员使用却未强制。此外 `$page` 未做白名单校验（如限定为评论页 tag 格式），可直接删除普通页面甚至系统页面。
-
-### 流 4：`echo 'Effacement de : ' . $page`（第 69 行）
-
-`$page` 来自 POST，直接回显到 HTML，**反射型 XSS**。攻击者构造钓鱼链接/自动提交表单即可注入脚本。
-
-### 流 5：`$deletedPages` → `LogAdministrativeAction`（第 100–108 行）
-
-`$deletedPages` 由 POST 的 suppr 元素拼接而成（第 73 行），写入日志页时仅用 `""` 包裹（第 103–105 行）。在 YesWiki 中 `""text""` 是字面文本标记，可部分防格式注入，但不等于 HTML 转义；日志页被查看时若渲染器允许原始 HTML（默认对 admin 内容常开放），构成向日志页的注入通道——第二入口/替代通道：即使不删除页面成功，恶意 tag 字符串也会进入日志。
-
-### 流 6：`$this->arguments['logpage']`（第 96 行）
-
-来自页面嵌入语法的参数，控制日志写入目标页。编辑者可将日志重定向到任意页，属低危逻辑问题。
-
-### 流 7：`$erase_id` / `$day`（第 36–38 行）
-
-`$day` 来自数据库 time 字段（系统生成），`str_replace('-','',$day)` 后拼入 id 属性，风险极低。
-
-## 三、第二入口与替代通道核查
-
-- **CSRF**：第 28 行表单无 token 字段，第 62 行处理端无来源校验。结合流 3 的无权限删除，攻击者可用 CSRF 让已登录管理员批量删页。
-- **GET 侧通道**：`$wiki->Href()` 默认生成 GET 链接，但删除只走 POST，无 GET 触发路径。
-- **框架层防御假设**：不能假定调用方一定限制了 admin；开源审计应以代码自身证据为准——本类未调用任何 HasAccess/GetUser 判断。
-
-## 四、结论
-
-主要漏洞：(a) 第 69 行反射型 XSS；(b) 第 40/45 行存储型 XSS（tag/comment_on 未转义）；(c) 第 70–71 行未授权+CSRF 的任意页面删除（CWE-862/CWE-352）。综合以越权删除为主漏洞。
-[JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-862 Missing Authorization (XSS)", "risk_level": "High", "source": "line 70: $_POST['suppr'] 以及 line 27: $_POST['clean'], 均为未经认证校验的用户输入", "sink": "line 71: PageController::delete($page) 执行任意页面删除; line 65: echo 拼接 $page 造成反射型 XSS; line 40 与 line 41: $comment['tag'] 与 $comment['comment_on'] 未转义直出 HTML", "explanation": "run() 全文未调用 HasAccess 或任何角色检查, 任何能触发该 action 的访客可通过 POST clean=yes 和 suppr[] 数组删除站内任意页面; 表单无 CSRF token, 处理端亦无来源校验, 可构造跨站请求让管理员被动执行; 同时 line 69 将 POST 值 $page 直接 echo 回显, 构成反射型 XSS; line 47:将数据库中的 tag 与 comment_on 未经 htmlspecialchars 拼接进属性与正文 (对比 line 43 对 body 做了转义), 构成存储型 XSS; line 71:将 POST 数据经 deletedPages 写入日志页, 仅用双引号包裹未做 HTML 转义, 为第二注入通道", "fix_suggestion": "在 run() 开头增加权限校验 (例如要求 admin 组或对每页调用 HasAccess('delete', $page)); 在 line 62 分支加入一次性 CSRF token 校验; line 65 改为 echo htmlspecialchars($page, ENT_COMPAT, YW_CHARSET); line 40 与 line 47 对 tag 及 comment_on 统一使用 htmlspecialchars 转义后再拼接; line 71 前对 $page 做页名白名单正则校验"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "本文件为 OAuth2 状态管理库层代码，全文共约 10 个函数均已逐一审查。唯一外部输入是 OAuth2 回调中的 state 参数，其所有消费点（memoryOAuth2Manager.getPendingAuth 第 85-98 行、removePendingAuth 第 78-83 行、dbOAuth2Manager.getPendingAuth 第 134-146 行）均要求与 CSPRNG 生成的随机 state（第 52 行 util.GenerateOpaqueString）精确匹配并通过时效校验（第 92-95 行、第 139-142 行），攻击者无法枚举或伪造。ClientSecret 在 DB 版落库前强制 Encrypt（第 116 行），反序列化对象 decodePendingAuthData 处理的是服务端自写数据而非外部 JSON，无反序列化注入面。全文件无路由注册、无命令执行、无文件写、无 SQL 拼接等 sink，cleanup 函数均有完整过期回收。", "fix_suggestion": "no fix needed"}

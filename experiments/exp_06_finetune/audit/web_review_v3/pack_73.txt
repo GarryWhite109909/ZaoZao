@@ -2,696 +2,1239 @@ batch=73 样本数=2
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=7800 lang=python
+### id=7811 lang=python
 [CODE]
-   1| # -*- mode:python; coding:utf-8 -*-
-   2| 
-   3| # Copyright (c) 2021 IBM Corp. All rights reserved.
+   1| #
+   2| # The Python Imaging Library.
+   3| # $Id$
    4| #
-   5| # Licensed under the Apache License, Version 2.0 (the "License");
-   6| # you may not use this file except in compliance with the License.
-   7| # You may obtain a copy of the License at
-   8| #
-   9| #     https://www.apache.org/licenses/LICENSE-2.0
-  10| #
-  11| # Unless required by applicable law or agreed to in writing, software
-  12| # distributed under the License is distributed on an "AS IS" BASIS,
-  13| # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  14| # See the License for the specific language governing permissions and
-  15| # limitations under the License.
-  16| """Trestle Commands."""
-  17| 
-  18| import argparse
-  19| import logging
-  20| import operator
-  21| import pathlib
-  22| import re
-  23| from typing import Any, Dict, Optional
-  24| 
-  25| from jinja2 import Environment, FileSystemLoader, Template
-  26| 
-  27| from ruamel.yaml import YAML
-  28| 
-  29| from trestle.common import const, log
-  30| from trestle.common.err import TrestleIncorrectArgsError, handle_generic_command_exception
-  31| from trestle.common.load_validate import load_validate_model_name
-  32| from trestle.core.remote.security import PathSecurityValidator
-  33| from trestle.common.model_utils import ModelUtils
-  34| from trestle.core.catalog.catalog_interface import CatalogInterface
-  35| from trestle.core.commands.command_docs import CommandPlusDocs
-  36| from trestle.core.commands.common.return_codes import CmdReturnCodes
-  37| from trestle.core.control_interface import ControlInterface, ParameterRep
-  38| from trestle.core.docs_control_writer import DocsControlWriter
-  39| from trestle.core.jinja.ext import extensions
-  40| from trestle.core.profile_resolver import ProfileResolver
-  41| from trestle.core.ssp_io import SSPMarkdownWriter
-  42| from trestle.oscal.profile import Profile
-  43| from trestle.oscal.ssp import SystemSecurityPlan
-  44| 
-  45| logger = logging.getLogger(__name__)
-  46| 
-  47| 
-  48| class JinjaCmd(CommandPlusDocs):
-  49|     """Transform an input template to an output document using jinja templating."""
-  50| 
-  51|     name = 'jinja'
-  52| 
-  53|     def _init_arguments(self) -> None:
-  54|         self.add_argument('-i', '--input', help='Input jinja template, relative to trestle root', required=True)
-  55|         self.add_argument('-o', '--output', help='Output template, relative to trestle root.', required=True)
-  56|         self.add_argument(
-  57|             '-lut',
-  58|             '--look-up-table',
-  59|             help='Key-value pair table, stored as yaml, to be passed to jinja as variables',
-  60|             required=False,
-  61|         )
-  62|         self.add_argument(
-  63|             '-elp',
-  64|             '--external-lut-prefix',
-  65|             help='Prefix paths for LUT, to maintain compatibility with other templating systems',
-  66|             required=False,
-  67|         )
-  68|         self.add_argument(
-  69|             '-nc',
-  70|             '--number-captions',
-  71|             help='Add incremental numbering to table and image captions, in the form Table n - ... and Figure n - ...',
-  72|             action='store_true',
-  73|         )
-  74|         self.add_argument(
-  75|             '-bf',
-  76|             '--bracket-format',
-  77|             help='With -sv, allows brackets around value, e.g. [.] or ((.)), with the dot representing the value.',
-  78|             required=False,
-  79|         )
-  80|         self.add_argument(
-  81|             '-vap',
-  82|             '--value-assigned-prefix',
-  83|             help='Places a prefix in front of the parameter string if a value has been assigned.',
-  84|             required=False,
-  85|             type=str,
-  86|             default='',
-  87|         )
-  88|         self.add_argument(
-  89|             '-vnap',
-  90|             '--value-not-assigned-prefix',
-  91|             help='Places a prefix in front of the parameter string if a value has *not* been assigned.',
-  92|             required=False,
-  93|             type=str,
-  94|             default='',
-  95|         )
-  96|         self.add_argument(
-  97|             '-ssp', '--system-security-plan', help='An optional SSP to be passed', default=None, required=False
-  98|         )
-  99|         self.add_argument('-p', '--profile', help='An optional profile to be passed', default=None, required=False)
- 100|         self.add_argument(
- 101|             '-dp',
- 102|             '--docs-profile',
- 103|             help='Output profile controls to separate markdown files',
- 104|             action='store_true',
- 105|             required=False,
- 106|         )
- 107| 
- 108|     def _run(self, args: argparse.Namespace) -> None:
- 109|         try:
- 110|             log.set_log_level_from_args(args)
- 111|             logger.debug(f'Starting {self.name} command')
- 112|             input_path = pathlib.Path(args.input)
- 113|             output_path = pathlib.Path(args.output)
- 114| 
- 115|             logger.debug(f'input_path: {input_path}')
- 116|             logger.debug(f'output_path: {output_path}')
- 117|             logger.debug(f'system_security_plan path: {args.system_security_plan}')
- 118|             logger.debug(f'profile: {args.profile}')
- 119|             logger.debug(f'docs_profile: {args.docs_profile}')
- 120|             logger.debug(f'lookup_table: {args.look_up_table}')
- 121| 
- 122|             if args.system_security_plan and args.docs_profile:
- 123|                 raise TrestleIncorrectArgsError('Output to multiple files is possible with profile only.')
- 124| 
- 125|             if args.docs_profile and not args.profile:
- 126|                 raise TrestleIncorrectArgsError('Profile must be provided to output to multiple files.')
- 127| 
- 128|             lut = {}
- 129|             if args.look_up_table:
- 130|                 lut_table = pathlib.Path(args.look_up_table)
- 131|                 lookup_table_path = pathlib.Path.cwd() / lut_table
- 132|                 lut = JinjaCmd.load_LUT(lookup_table_path, args.external_lut_prefix)
- 133| 
- 134|             if args.profile and args.docs_profile:
- 135|                 return JinjaCmd.jinja_multiple_md(
- 136|                     pathlib.Path(args.trestle_root),
- 137|                     input_path,
- 138|                     output_path,
- 139|                     args.profile,
- 140|                     lut,
- 141|                     parameters_formatting=args.bracket_format,
- 142|                     value_assigned_prefix=args.value_assigned_prefix,
- 143|                     value_not_assigned_prefix=args.value_not_assigned_prefix,
- 144|                 )
- 145| 
- 146|             return JinjaCmd.jinja_ify(
- 147|                 pathlib.Path(args.trestle_root),
- 148|                 input_path,
- 149|                 output_path,
- 150|                 args.system_security_plan,
- 151|                 args.profile,
- 152|                 lut,
- 153|                 number_captions=args.number_captions,
- 154|                 parameters_formatting=args.bracket_format,
- 155|                 value_assigned_prefix=args.value_assigned_prefix,
- 156|                 value_not_assigned_prefix=args.value_not_assigned_prefix,
- 157|             )
- 158| 
- 159|         except Exception as e:  # pragma: no cover
- 160|             return handle_generic_command_exception(  # type: ignore
- 161|                 e, logger, 'Error while generating markdown via Jinja template'
- 162|             )
- 163| 
- 164|     @staticmethod
- 165|     def load_LUT(path: pathlib.Path, prefix: Optional[str]) -> Dict[str, Any]:  # noqa: N802
- 166|         """Load a Yaml lookup table from file."""
- 167|         yaml = YAML()
- 168|         lut = yaml.load(path.open('r', encoding=const.FILE_ENCODING))
- 169|         if prefix:
- 170|             prefixes = prefix.split('.')
- 171|             while prefixes:
- 172|                 old_lut = lut
- 173|                 lut[prefixes.pop(-1)] = old_lut
- 174| 
- 175|         return lut
- 176| 
- 177|     @staticmethod
- 178|     def jinja_ify(
- 179|         trestle_root: pathlib.Path,
- 180|         r_input_file: pathlib.Path,
- 181|         r_output_file: pathlib.Path,
- 182|         ssp: Optional[str],
- 183|         profile: Optional[str],
- 184|         lut: Dict[str, Any],
- 185|         number_captions: Optional[bool] = False,
- 186|         parameters_formatting: Optional[str] = None,
- 187|         value_assigned_prefix: Optional[str] = None,
- 188|         value_not_assigned_prefix: Optional[str] = None,
- 189|     ) -> int:
- 190|         """Run jinja over an input file with additional booleans."""
- 191|         template_folder = pathlib.Path.cwd()
- 192|         jinja_env = JinjaCmd._create_jinja_environment(template_folder)
- 193|         template = jinja_env.get_template(str(r_input_file))
- 194|         # create boolean dict
- 195|         if operator.xor(bool(ssp), bool(profile)):
- 196|             raise TrestleIncorrectArgsError('Both SSP and profile should be provided or not at all')
- 197| 
- 198|         if ssp:
- 199|             # name lookup
- 200|             ssp_data, _ = load_validate_model_name(trestle_root, ssp, SystemSecurityPlan)
- 201|             lut['ssp'] = ssp_data
- 202|             profile_path = ModelUtils.get_model_path_for_name_and_class(trestle_root, profile, Profile)
- 203|             profile_resolver = ProfileResolver()
- 204|             resolved_catalog = profile_resolver.get_resolved_profile_catalog(
- 205|                 trestle_root,
- 206|                 profile_path,
- 207|                 False,
- 208|                 False,
- 209|                 parameters_formatting,
- 210|                 ParameterRep.ASSIGNMENT_FORM,
- 211|                 False,
- 212|                 value_assigned_prefix,
- 213|                 value_not_assigned_prefix,
- 214|             )
- 215| 
- 216|             ssp_writer = SSPMarkdownWriter(trestle_root)
- 217|             ssp_writer.set_ssp(ssp_data)
- 218|             ssp_writer.set_catalog(resolved_catalog)
- 219|             lut['catalog'] = resolved_catalog
- 220|             lut['catalog_interface'] = CatalogInterface(resolved_catalog)
- 221|             lut['control_interface'] = ControlInterface()
- 222|             lut['control_writer'] = DocsControlWriter()
- 223|             lut['ssp_md_writer'] = ssp_writer
- 224| 
- 225|         output = JinjaCmd.render_template(template, lut, template_folder)
- 226| 
- 227|         # Validate output path to prevent path traversal
- 228|         output_file = trestle_root / r_output_file
- 229|         PathSecurityValidator.validate_local_path(output_file, trestle_root)
- 230| 
- 231|         if number_captions:
- 232|             output_file.open('w', encoding=const.FILE_ENCODING).write(_number_captions(output))
- 233|         else:
- 234|             output_file.open('w', encoding=const.FILE_ENCODING).write(output)
- 235| 
- 236|         return CmdReturnCodes.SUCCESS.value
- 237| 
- 238|     @staticmethod
- 239|     def jinja_multiple_md(
- 240|         trestle_root: pathlib.Path,
- 241|         r_input_file: pathlib.Path,
- 242|         r_output_file: pathlib.Path,
- 243|         profile_name: Optional[str],
- 244|         lut: Dict[str, Any],
- 245|         parameters_formatting: Optional[str] = None,
- 246|         value_assigned_prefix: Optional[str] = None,
- 247|         value_not_assigned_prefix: Optional[str] = None,
- 248|     ) -> int:
- 249|         """Output profile as multiple markdown files using Jinja."""
- 250|         template_folder = pathlib.Path.cwd()
- 251| 
- 252|         # Output to multiple markdown files
- 253|         profile, profile_path = ModelUtils.load_model_for_class(trestle_root, profile_name, Profile)
- 254|         profile_resolver = ProfileResolver()
- 255|         resolved_catalog = profile_resolver.get_resolved_profile_catalog(
- 256|             trestle_root,
- 257|             profile_path,
- 258|             False,
- 259|             False,
- 260|             parameters_formatting,
- 261|             ParameterRep.ASSIGNMENT_FORM,
- 262|             False,
- 263|             value_assigned_prefix,
- 264|             value_not_assigned_prefix,
- 265|         )
- 266|         catalog_interface = CatalogInterface(resolved_catalog)
- 267| 
- 268|         # Generate a single markdown page for each control per each group
- 269|         for group in catalog_interface.get_all_groups_from_catalog():
- 270|             for control in catalog_interface.get_sorted_controls_in_group(group.id):
- 271|                 _, group_title, _ = catalog_interface.get_group_info_by_control(control.id)
- 272|                 group_dir = r_output_file
- 273|                 control_path = catalog_interface.get_control_path(control.id)
- 274|                 for sub_dir in control_path:
- 275|                     group_dir = group_dir / sub_dir
- 276|                     # Validate directory path to prevent path traversal before creating directories
- 277|                     full_group_dir = trestle_root / group_dir
- 278|                     PathSecurityValidator.validate_local_path(full_group_dir, trestle_root)
- 279|                     if not full_group_dir.exists():
- 280|                         full_group_dir.mkdir(parents=True, exist_ok=True)
- 281| 
- 282|                 control_writer = DocsControlWriter()
- 283| 
- 284|                 jinja_env = JinjaCmd._create_jinja_environment(template_folder)
- 285|                 template = jinja_env.get_template(str(r_input_file))
- 286|                 lut['catalog_interface'] = catalog_interface
- 287|                 lut['control_interface'] = ControlInterface()
- 288|                 lut['control_writer'] = control_writer
- 289|                 lut['control'] = control
- 290|                 lut['profile'] = profile
- 291|                 lut['group_title'] = group_title
- 292|                 output = JinjaCmd.render_template(template, lut, template_folder)
- 293| 
- 294|                 # Validate output path to prevent path traversal
- 295|                 relative_output_path = group_dir / pathlib.Path(control.id + const.MARKDOWN_FILE_EXT)
- 296|                 output_file = trestle_root / relative_output_path
- 297|                 PathSecurityValidator.validate_local_path(output_file, trestle_root)
- 298| 
- 299|                 output_file.open('w', encoding=const.FILE_ENCODING).write(output)
- 300| 
- 301|         return CmdReturnCodes.SUCCESS.value
- 302| 
- 303|     @staticmethod
- 304|     def _create_jinja_environment(template_folder: pathlib.Path) -> Environment:
- 305|         """Create the trusted Jinja environment used for loading template files."""
- 306|         return Environment(
- 307|             loader=FileSystemLoader(template_folder), extensions=extensions(), trim_blocks=True, autoescape=True
- 308|         )
- 309| 
- 310|     @staticmethod
- 311|     def render_template(template: Template, lut: Dict[str, Any], template_folder: pathlib.Path) -> str:
- 312|         """Render a trusted template exactly once to avoid recursive SSTI of untrusted data."""
- 313|         return template.render(**lut)
- 314| 
- 315| 
- 316| def _number_captions(md_body: str) -> str:
- 317|     """Incrementally number tables and image captions."""
- 318|     images = {}
- 319|     tables = {}
- 320|     output = md_body.splitlines()
- 321| 
- 322|     for index, line in enumerate(output):
- 323|         if re.match(r'!\[.+\]\(.+\)', line):
- 324|             images[index] = line
- 325|         if output[index].lower().startswith('table: '):
- 326|             tables[index] = line
- 327| 
- 328|     for index, row in enumerate(tables):
- 329|         output[row] = f'Table: Table {index + 1} - {tables[row].split(": ")[1]}'
- 330| 
- 331|     for index, row in enumerate(images):
- 332|         output[row] = images[row].replace('![', f'![Figure {index + 1} - ')
- 333| 
- 334|     return '\n'.join(output)
- 335| 
- 336| 
-
-### id=7801 lang=php
-[CODE]
-   1| <?php
-   2| namespace verbb\formie\fields\formfields;
-   3| 
-   4| use verbb\formie\Formie;
-   5| use verbb\formie\base\FormField;
-   6| use verbb\formie\elements\Form;
-   7| use verbb\formie\elements\NestedFieldRow;
-   8| use verbb\formie\helpers\SchemaHelper;
-   9| use verbb\formie\helpers\Variables;
-  10| use verbb\formie\positions\Hidden as HiddenPosition;
-  11| use verbb\formie\models\HtmlTag;
-  12| 
-  13| use Craft;
-  14| use craft\base\ElementInterface;
-  15| use craft\base\PreviewableFieldInterface;
-  16| use craft\base\SortableFieldInterface;
-  17| use craft\helpers\DateTimeHelper;
-  18| use craft\helpers\UrlHelper;
-  19| use craft\web\View;
-  20| 
-  21| use Throwable;
-  22| use DateTime;
+   5| # standard filters
+   6| #
+   7| # History:
+   8| # 1995-11-27 fl   Created
+   9| # 2002-06-08 fl   Added rank and mode filters
+  10| # 2003-09-15 fl   Fixed rank calculation in rank filter; added expand call
+  11| #
+  12| # Copyright (c) 1997-2003 by Secret Labs AB.
+  13| # Copyright (c) 1995-2002 by Fredrik Lundh.
+  14| #
+  15| # See the README file for information on usage and redistribution.
+  16| #
+  17| from __future__ import annotations
+  18| 
+  19| import abc
+  20| import functools
+  21| from collections.abc import Sequence
+  22| from typing import cast
   23| 
-  24| class Hidden extends FormField implements PreviewableFieldInterface, SortableFieldInterface
-  25| {
-  26|     // Static Methods
-  27|     // =========================================================================
-  28| 
-  29|     public static function displayName(): string
-  30|     {
-  31|         return Craft::t('formie', 'Hidden Field');
-  32|     }
+  24| TYPE_CHECKING = False
+  25| if TYPE_CHECKING:
+  26|     from collections.abc import Callable
+  27|     from types import ModuleType
+  28|     from typing import Any
+  29| 
+  30|     from . import _imaging
+  31|     from ._typing import NumpyArray
+  32| 
   33| 
-  34|     public static function getSvgIconPath(): string
-  35|     {
-  36|         return 'formie/_formfields/hidden-field/icon.svg';
-  37|     }
+  34| class Filter(abc.ABC):
+  35|     @abc.abstractmethod
+  36|     def filter(self, image: _imaging.ImagingCore) -> _imaging.ImagingCore:
+  37|         pass
   38| 
   39| 
-  40|     // Properties
-  41|     // =========================================================================
+  40| class MultibandFilter(Filter):
+  41|     pass
   42| 
-  43|     public ?string $defaultOption = null;
-  44|     public ?string $queryParameter = null;
-  45|     public ?string $cookieName = null;
-  46|     public ?string $columnType = null;
-  47| 
-  48| 
-  49|     // Public Methods
-  50|     // =========================================================================
-  51| 
-  52|     public function init(): void
-  53|     {
-  54|         parent::init();
-  55| 
-  56|         $currentUser = Craft::$app->getUser()->getIdentity();
-  57|         $request = Craft::$app->getRequest();
+  43| 
+  44| class BuiltinFilter(MultibandFilter):
+  45|     filterargs: tuple[Any, ...]
+  46| 
+  47|     def filter(self, image: _imaging.ImagingCore) -> _imaging.ImagingCore:
+  48|         if image.mode == "P":
+  49|             msg = "cannot filter palette images"
+  50|             raise ValueError(msg)
+  51|         return image.filter(*self.filterargs)
+  52| 
+  53| 
+  54| class Kernel(BuiltinFilter):
+  55|     """
+  56|     Create a convolution kernel. This only supports 3x3 and 5x5 integer and floating
+  57|     point kernels.
   58| 
-  59|         if (!Craft::$app->getRequest()->getIsConsoleRequest()) {
-  60|             if ($this->defaultOption === 'dateUs') {
-  61|                 $this->defaultValue = DateTimeHelper::toDateTime(new DateTime())->format('m/d/Y');
-  62|             } else if ($this->defaultOption === 'dateInt') {
-  63|                 $this->defaultValue = DateTimeHelper::toDateTime(new DateTime())->format('d/m/Y');
-  64|             } else if ($this->defaultOption === 'userAgent') {
-  65|                 $this->defaultValue = $request->getUserAgent();
-  66|             } else if ($this->defaultOption === 'referUrl') {
-  67|                 $this->defaultValue = $request->getReferrer();
-  68|             } else if ($this->defaultOption === 'currentUrl') {
-  69|                 $this->defaultValue = $request->getAbsoluteUrl();
-  70|             } else if ($this->defaultOption === 'currentUrlNoQueryString') {
-  71|                 $this->defaultValue = UrlHelper::stripQueryString($request->getAbsoluteUrl());
-  72|             } else if ($this->defaultOption === 'userId') {
-  73|                 $this->defaultValue = $currentUser->id ?? null;
-  74|             } else if ($this->defaultOption === 'username') {
-  75|                 $this->defaultValue = $currentUser->username ?? null;
-  76|             } else if ($this->defaultOption === 'userEmail') {
-  77|                 $this->defaultValue = $currentUser->email ?? null;
-  78|             } else if ($this->defaultOption === 'userIp') {
-  79|                 $this->defaultValue = $request->getUserIP();
-  80|             } else if ($this->defaultOption === 'query' && $this->queryParameter) {
-  81|                 $this->defaultValue = $request->getParam($this->queryParameter);
-  82|             } else if ($this->defaultOption === 'cookie' && $this->cookieName) {
-  83|                 $this->defaultValue = $_COOKIE[$this->cookieName] ?? '';
-  84|             }
-  85|         }
-  86|     }
+  59|     Kernels can only be applied to "L" and "RGB" images.
+  60| 
+  61|     :param size: Kernel size, given as (width, height). This must be (3,3) or (5,5).
+  62|     :param kernel: A sequence containing kernel weights. The kernel will be flipped
+  63|                    vertically before being applied to the image.
+  64|     :param scale: Scale factor. If given, the result for each pixel is divided by this
+  65|                   value. The default is the sum of the kernel weights.
+  66|     :param offset: Offset. If given, this value is added to the result, after it has
+  67|                    been divided by the scale factor.
+  68|     """
+  69| 
+  70|     name = "Kernel"
+  71| 
+  72|     def __init__(
+  73|         self,
+  74|         size: tuple[int, int],
+  75|         kernel: Sequence[float],
+  76|         scale: float | None = None,
+  77|         offset: float = 0,
+  78|     ) -> None:
+  79|         if scale is None:
+  80|             # default scale is sum of kernel
+  81|             scale = functools.reduce(lambda a, b: a + b, kernel)
+  82|         if size[0] * size[1] != len(kernel):
+  83|             msg = "not enough coefficients in kernel"
+  84|             raise ValueError(msg)
+  85|         self.filterargs = size, scale, offset, kernel
+  86| 
   87| 
-  88|     public function getContentColumnType(): string
-  89|     {
-  90|         if ($this->columnType) {
-  91|             return $this->columnType;
-  92|         }
-  93| 
-  94|         return parent::getContentColumnType();
-  95|     }
-  96| 
-  97|     public function getIsHidden(): bool
-  98|     {
-  99|         return true;
- 100|     }
- 101| 
- 102|     public function serializeValue(mixed $value, ?ElementInterface $element = null): mixed
- 103|     {
- 104|         // Handle variables use in custom fields
- 105|         if ($this->defaultOption === 'custom') {
- 106|             // We have to check if this is a NestedFieldRow, we always need the top-level submission
- 107|             // Potentially move this to `Variables::getParsedValue()`.
- 108|             if ($element instanceof NestedFieldRow) {
- 109|                 $element = $element->owner;
- 110|             }
- 111| 
- 112|             // Check if there's no value been added on the front-end, and use the default value
- 113|             if ($value === '') {
- 114|                 $value = $this->defaultValue;
- 115|             }
- 116| 
- 117|             $value = Variables::getParsedValue($value, $element);
- 118| 
- 119|             // Immediately update the value for the element, so integrations use the up-to-date value
- 120|             if ($element) {
- 121|                 $element->setFieldValue($this->handle, $value);
- 122|             }
- 123|         }
- 124| 
- 125|         return parent::serializeValue($value, $element);
- 126|     }
- 127| 
- 128|     public function getFieldDefaults(): array
- 129|     {
- 130|         return [
- 131|             'labelPosition' => HiddenPosition::class,
- 132|             'defaultOption' => 'custom',
- 133|             'includeInEmail' => true,
- 134|         ];
- 135|     }
+  88| class RankFilter(Filter):
+  89|     """
+  90|     Create a rank filter.  The rank filter sorts all pixels in
+  91|     a window of the given size, and returns the ``rank``'th value.
+  92| 
+  93|     :param size: The kernel size, in pixels.
+  94|     :param rank: What pixel value to pick.  Use 0 for a min filter,
+  95|                  ``size * size / 2`` for a median filter, ``size * size - 1``
+  96|                  for a max filter, etc.
+  97|     """
+  98| 
+  99|     name = "Rank"
+ 100| 
+ 101|     def __init__(self, size: int, rank: int) -> None:
+ 102|         if size % 2 == 0:
+ 103|             msg = "bad filter size"
+ 104|             raise ValueError(msg)
+ 105|         if size * size * 4 > (2**31 - 1):
+ 106|             msg = "filter size too large"
+ 107|             raise ValueError(msg)
+ 108|         if rank < 0 or rank >= size * size:
+ 109|             msg = "bad rank value"
+ 110|             raise ValueError(msg)
+ 111|         self.size = size
+ 112|         self.rank = rank
+ 113| 
+ 114|     def filter(self, image: _imaging.ImagingCore) -> _imaging.ImagingCore:
+ 115|         if image.mode == "P":
+ 116|             msg = "cannot filter palette images"
+ 117|             raise ValueError(msg)
+ 118|         image = image.expand(self.size // 2)
+ 119|         return image.rankfilter(self.size, self.rank)
+ 120| 
+ 121| 
+ 122| class MedianFilter(RankFilter):
+ 123|     """
+ 124|     Create a median filter. Picks the median pixel value in a window with the
+ 125|     given size.
+ 126| 
+ 127|     :param size: The kernel size, in pixels.
+ 128|     """
+ 129| 
+ 130|     name = "Median"
+ 131| 
+ 132|     def __init__(self, size: int = 3) -> None:
+ 133|         rank = size * size // 2
+ 134|         super().__init__(size, rank)
+ 135| 
  136| 
- 137|     public function getInputHtml(mixed $value, ?ElementInterface $element = null): string
- 138|     {
- 139|         return Craft::$app->getView()->renderTemplate('formie/_formfields/hidden-field/input', [
- 140|             'name' => $this->handle,
- 141|             'value' => $value,
- 142|             'field' => $this,
- 143|         ]);
- 144|     }
- 145| 
- 146|     public function getPreviewInputHtml(): string
- 147|     {
- 148|         return Craft::$app->getView()->renderTemplate('formie/_formfields/hidden-field/preview', [
- 149|             'field' => $this,
- 150|         ]);
- 151|     }
- 152| 
- 153|     public function getFrontEndJsModules(): ?array
- 154|     {
- 155|         if ($this->defaultOption === 'cookie' && $this->cookieName) {
- 156|             return [
- 157|                 'src' => Craft::$app->getAssetManager()->getPublishedUrl('@verbb/formie/web/assets/frontend/dist/', true, 'js/fields/hidden.js'),
- 158|                 'module' => 'FormieHidden',
- 159|                 'settings' => [
- 160|                     'cookieName' => $this->cookieName,
- 161|                 ],
- 162|             ];
- 163|         }
- 164| 
- 165|         return null;
- 166|     }
- 167| 
- 168|     public function getFrontEndInputOptions(Form $form, mixed $value, array $renderOptions = []): array
- 169|     {
- 170|         $inputOptions = parent::getFrontEndInputOptions($form, $value, $renderOptions);
- 171| 
- 172|         try {
- 173|             $defaultValue = Craft::$app->getView()->renderString(
- 174|                 (string)$this->defaultValue,
- 175|                 [
- 176|                     'field' => $this,
- 177|                     'form' => $form,
- 178|                 ],
- 179|                 View::TEMPLATE_MODE_SITE
- 180|             );
- 181|         } catch (Throwable $e) {
- 182|             $defaultValue = $this->defaultValue;
- 183|             Formie::error('Failed to render hidden field template: ' . $e->getMessage());
- 184|         }
- 185| 
- 186|         $inputOptions['defaultValue'] = $defaultValue;
- 187| 
- 188|         return $inputOptions;
- 189|     }
- 190| 
- 191|     public function defineGeneralSchema(): array
- 192|     {
- 193|         return [
- 194|             SchemaHelper::labelField([
- 195|                 'label' => Craft::t('formie', 'Name'),
- 196|                 'help' => Craft::t('formie', 'The name of this field displayed only to you'),
- 197|             ]),
- 198|             SchemaHelper::selectField([
- 199|                 'label' => Craft::t('formie', 'Default Value'),
- 200|                 'help' => Craft::t('formie', 'Select an option for the default value.'),
- 201|                 'name' => 'defaultOption',
- 202|                 'options' => [
- 203|                     ['label' => Craft::t('formie', 'Date (mm/dd/yyyy)'), 'value' => 'dateUs'],
- 204|                     ['label' => Craft::t('formie', 'Date (dd/mm/yyyy)'), 'value' => 'dateInt'],
- 205|                     ['label' => Craft::t('formie', 'Current URL'), 'value' => 'currentUrl'],
- 206|                     ['label' => Craft::t('formie', 'Current URL (without Query String)'), 'value' => 'currentUrlNoQueryString'],
- 207|                     ['label' => Craft::t('formie', 'HTTP User Agent'), 'value' => 'userAgent'],
- 208|                     ['label' => Craft::t('formie', 'HTTP Refer URL'), 'value' => 'referUrl'],
- 209|                     ['label' => Craft::t('formie', 'User ID'), 'value' => 'userId'],
- 210|                     ['label' => Craft::t('formie', 'Username'), 'value' => 'username'],
- 211|                     ['label' => Craft::t('formie', 'User Email'), 'value' => 'userEmail'],
- 212|                     ['label' => Craft::t('formie', 'User IP Address'), 'value' => 'userIp'],
- 213|                     ['label' => Craft::t('formie', 'Cookie Value'), 'value' => 'cookie'],
- 214|                     ['label' => Craft::t('formie', 'Query Parameter'), 'value' => 'query'],
- 215|                     ['label' => Craft::t('formie', 'Custom Value'), 'value' => 'custom'],
- 216|                 ],
- 217|             ]),
- 218|             SchemaHelper::variableTextField([
- 219|                 'label' => Craft::t('formie', 'Default Value'),
- 220|                 'help' => Craft::t('formie', 'Entering a default value will place the value in the field when it loads.'),
- 221|                 'name' => 'defaultValue',
- 222|                 'variables' => 'plainTextVariables',
- 223|                 'if' => '$get(defaultOption).value == custom',
- 224|             ]),
- 225|             SchemaHelper::textField([
- 226|                 'label' => Craft::t('formie', 'Query Parameter'),
- 227|                 'help' => Craft::t('formie', 'Entering the query parameter to populate the value of the field when it loads.'),
- 228|                 'name' => 'queryParameter',
- 229|                 'if' => '$get(defaultOption).value == query',
- 230|             ]),
- 231|             SchemaHelper::textField([
- 232|                 'label' => Craft::t('formie', 'Cookie Name'),
- 233|                 'help' => Craft::t('formie', 'Enter the name of the cookie to use as the value of this field.'),
- 234|                 'name' => 'cookieName',
- 235|                 'if' => '$get(defaultOption).value == cookie',
- 236|             ]),
- 237|         ];
- 238|     }
+ 137| class MinFilter(RankFilter):
+ 138|     """
+ 139|     Create a min filter.  Picks the lowest pixel value in a window with the
+ 140|     given size.
+ 141| 
+ 142|     :param size: The kernel size, in pixels.
+ 143|     """
+ 144| 
+ 145|     name = "Min"
+ 146| 
+ 147|     def __init__(self, size: int = 3) -> None:
+ 148|         rank = 0
+ 149|         super().__init__(size, rank)
+ 150| 
+ 151| 
+ 152| class MaxFilter(RankFilter):
+ 153|     """
+ 154|     Create a max filter.  Picks the largest pixel value in a window with the
+ 155|     given size.
+ 156| 
+ 157|     :param size: The kernel size, in pixels.
+ 158|     """
+ 159| 
+ 160|     name = "Max"
+ 161| 
+ 162|     def __init__(self, size: int = 3) -> None:
+ 163|         rank = size * size - 1
+ 164|         super().__init__(size, rank)
+ 165| 
+ 166| 
+ 167| class ModeFilter(Filter):
+ 168|     """
+ 169|     Create a mode filter. Picks the most frequent pixel value in a box with the
+ 170|     given size.  Pixel values that occur only once or twice are ignored; if no
+ 171|     pixel value occurs more than twice, the original pixel value is preserved.
+ 172| 
+ 173|     :param size: The kernel size, in pixels.
+ 174|     """
+ 175| 
+ 176|     name = "Mode"
+ 177| 
+ 178|     def __init__(self, size: int = 3) -> None:
+ 179|         self.size = size
+ 180| 
+ 181|     def filter(self, image: _imaging.ImagingCore) -> _imaging.ImagingCore:
+ 182|         return image.modefilter(self.size)
+ 183| 
+ 184| 
+ 185| class GaussianBlur(MultibandFilter):
+ 186|     """Blurs the image with a sequence of extended box filters, which
+ 187|     approximates a Gaussian kernel. For details on accuracy see
+ 188|     <https://www.mia.uni-saarland.de/Publications/gwosdek-ssvm11.pdf>
+ 189| 
+ 190|     :param radius: Standard deviation of the Gaussian kernel. Either a sequence of two
+ 191|                    numbers for x and y, or a single number for both.
+ 192|     """
+ 193| 
+ 194|     name = "GaussianBlur"
+ 195| 
+ 196|     def __init__(self, radius: float | Sequence[float] = 2) -> None:
+ 197|         self.radius = radius
+ 198| 
+ 199|     def filter(self, image: _imaging.ImagingCore) -> _imaging.ImagingCore:
+ 200|         xy = self.radius
+ 201|         if xy == (0, 0) or xy == 0:
+ 202|             return image.copy()
+ 203|         if isinstance(xy, (int, float)):
+ 204|             xy = (xy, xy)
+ 205|         return image.gaussian_blur(xy)
+ 206| 
+ 207| 
+ 208| class BoxBlur(MultibandFilter):
+ 209|     """Blurs the image by setting each pixel to the average value of the pixels
+ 210|     in a square box extending radius pixels in each direction.
+ 211|     Supports float radius of arbitrary size. Uses an optimized implementation
+ 212|     which runs in linear time relative to the size of the image
+ 213|     for any radius value.
+ 214| 
+ 215|     :param radius: Size of the box in a direction. Either a sequence of two numbers for
+ 216|                    x and y, or a single number for both.
+ 217| 
+ 218|                    Radius 0 does not blur, returns an identical image.
+ 219|                    Radius 1 takes 1 pixel in each direction, i.e. 9 pixels in total.
+ 220|     """
+ 221| 
+ 222|     name = "BoxBlur"
+ 223| 
+ 224|     def __init__(self, radius: float | Sequence[float]) -> None:
+ 225|         xy = radius if isinstance(radius, (tuple, list)) else (radius, radius)
+ 226|         if xy[0] < 0 or xy[1] < 0:
+ 227|             msg = "radius must be >= 0"
+ 228|             raise ValueError(msg)
+ 229|         self.radius = radius
+ 230| 
+ 231|     def filter(self, image: _imaging.ImagingCore) -> _imaging.ImagingCore:
+ 232|         xy = self.radius
+ 233|         if xy == (0, 0) or xy == 0:
+ 234|             return image.copy()
+ 235|         if isinstance(xy, (int, float)):
+ 236|             xy = (xy, xy)
+ 237|         return image.box_blur(xy)
+ 238| 
  239| 
- 240|     public function defineSettingsSchema(): array
- 241|     {
- 242|         return [
- 243|             SchemaHelper::includeInEmailField(),
- 244|         ];
- 245|     }
- 246| 
- 247|     public function defineAdvancedSchema(): array
- 248|     {
- 249|         return [
- 250|             SchemaHelper::handleField(),
- 251|             SchemaHelper::cssClasses(),
- 252|             SchemaHelper::containerAttributesField(),
- 253|             SchemaHelper::inputAttributesField(),
- 254|             SchemaHelper::enableContentEncryptionField(),
- 255|             SchemaHelper::columnTypeField(),
- 256|         ];
- 257|     }
- 258| 
- 259|     public function defineHtmlTag(string $key, array $context = []): ?HtmlTag
- 260|     {
- 261|         $form = $context['form'] ?? null;
- 262| 
- 263|         $id = $this->getHtmlId($form);
- 264|         $dataId = $this->getHtmlDataId($form);
- 265| 
- 266|         if ($key === 'fieldLabel') {
- 267|             return null;
- 268|         }
- 269| 
- 270|         if ($key === 'fieldInput') {
- 271|             return new HtmlTag('input', [
- 272|                 'type' => 'hidden',
- 273|                 'id' => $id,
- 274|                 'name' => $this->getHtmlName(),
- 275|                 'data' => [
- 276|                     'fui-id' => $dataId,
- 277|                 ],
- 278|             ], $this->getInputAttributes());
- 279|         }
+ 240| class UnsharpMask(MultibandFilter):
+ 241|     """Unsharp mask filter.
+ 242| 
+ 243|     See Wikipedia's entry on `digital unsharp masking`_ for an explanation of
+ 244|     the parameters.
+ 245| 
+ 246|     :param radius: Blur Radius
+ 247|     :param percent: Unsharp strength, in percent
+ 248|     :param threshold: Threshold controls the minimum brightness change that
+ 249|       will be sharpened
+ 250| 
+ 251|     .. _digital unsharp masking: https://en.wikipedia.org/wiki/Unsharp_masking#Digital_unsharp_masking
+ 252| 
+ 253|     """
+ 254| 
+ 255|     name = "UnsharpMask"
+ 256| 
+ 257|     def __init__(
+ 258|         self, radius: float = 2, percent: int = 150, threshold: int = 3
+ 259|     ) -> None:
+ 260|         self.radius = radius
+ 261|         self.percent = percent
+ 262|         self.threshold = threshold
+ 263| 
+ 264|     def filter(self, image: _imaging.ImagingCore) -> _imaging.ImagingCore:
+ 265|         return image.unsharp_mask(self.radius, self.percent, self.threshold)
+ 266| 
+ 267| 
+ 268| class BLUR(BuiltinFilter):
+ 269|     name = "Blur"
+ 270|     # fmt: off
+ 271|     filterargs = (5, 5), 16, 0, (
+ 272|         1, 1, 1, 1, 1,
+ 273|         1, 0, 0, 0, 1,
+ 274|         1, 0, 0, 0, 1,
+ 275|         1, 0, 0, 0, 1,
+ 276|         1, 1, 1, 1, 1,
+ 277|     )
+ 278|     # fmt: on
+ 279| 
  280| 
- 281|         return parent::defineHtmlTag($key, $context);
- 282|     }
- 283| }
- 284| 
- 285| 
+ 281| class CONTOUR(BuiltinFilter):
+ 282|     name = "Contour"
+ 283|     # fmt: off
+ 284|     filterargs = (3, 3), 1, 255, (
+ 285|         -1, -1, -1,
+ 286|         -1,  8, -1,
+ 287|         -1, -1, -1,
+ 288|     )
+ 289|     # fmt: on
+ 290| 
+ 291| 
+ 292| class DETAIL(BuiltinFilter):
+ 293|     name = "Detail"
+ 294|     # fmt: off
+ 295|     filterargs = (3, 3), 6, 0, (
+ 296|         0,  -1,  0,
+ 297|         -1, 10, -1,
+ 298|         0,  -1,  0,
+ 299|     )
+ 300|     # fmt: on
+ 301| 
+ 302| 
+ 303| class EDGE_ENHANCE(BuiltinFilter):
+ 304|     name = "Edge-enhance"
+ 305|     # fmt: off
+ 306|     filterargs = (3, 3), 2, 0, (
+ 307|         -1, -1, -1,
+ 308|         -1, 10, -1,
+ 309|         -1, -1, -1,
+ 310|     )
+ 311|     # fmt: on
+ 312| 
+ 313| 
+ 314| class EDGE_ENHANCE_MORE(BuiltinFilter):
+ 315|     name = "Edge-enhance More"
+ 316|     # fmt: off
+ 317|     filterargs = (3, 3), 1, 0, (
+ 318|         -1, -1, -1,
+ 319|         -1,  9, -1,
+ 320|         -1, -1, -1,
+ 321|     )
+ 322|     # fmt: on
+ 323| 
+ 324| 
+ 325| class EMBOSS(BuiltinFilter):
+ 326|     name = "Emboss"
+ 327|     # fmt: off
+ 328|     filterargs = (3, 3), 1, 128, (
+ 329|         -1, 0, 0,
+ 330|         0,  1, 0,
+ 331|         0,  0, 0,
+ 332|     )
+ 333|     # fmt: on
+ 334| 
+ 335| 
+ 336| class FIND_EDGES(BuiltinFilter):
+ 337|     name = "Find Edges"
+ 338|     # fmt: off
+ 339|     filterargs = (3, 3), 1, 0, (
+ 340|         -1, -1, -1,
+ 341|         -1,  8, -1,
+ 342|         -1, -1, -1,
+ 343|     )
+ 344|     # fmt: on
+ 345| 
+ 346| 
+ 347| class SHARPEN(BuiltinFilter):
+ 348|     name = "Sharpen"
+ 349|     # fmt: off
+ 350|     filterargs = (3, 3), 16, 0, (
+ 351|         -2, -2, -2,
+ 352|         -2, 32, -2,
+ 353|         -2, -2, -2,
+ 354|     )
+ 355|     # fmt: on
+ 356| 
+ 357| 
+ 358| class SMOOTH(BuiltinFilter):
+ 359|     name = "Smooth"
+ 360|     # fmt: off
+ 361|     filterargs = (3, 3), 13, 0, (
+ 362|         1, 1, 1,
+ 363|         1, 5, 1,
+ 364|         1, 1, 1,
+ 365|     )
+ 366|     # fmt: on
+ 367| 
+ 368| 
+ 369| class SMOOTH_MORE(BuiltinFilter):
+ 370|     name = "Smooth More"
+ 371|     # fmt: off
+ 372|     filterargs = (5, 5), 100, 0, (
+ 373|         1, 1,  1, 1, 1,
+ 374|         1, 5,  5, 5, 1,
+ 375|         1, 5, 44, 5, 1,
+ 376|         1, 5,  5, 5, 1,
+ 377|         1, 1,  1, 1, 1,
+ 378|     )
+ 379|     # fmt: on
+ 380| 
+ 381| 
+ 382| class Color3DLUT(MultibandFilter):
+ 383|     """Three-dimensional color lookup table.
+ 384| 
+ 385|     Transforms 3-channel pixels using the values of the channels as coordinates
+ 386|     in the 3D lookup table and interpolating the nearest elements.
+ 387| 
+ 388|     This method allows you to apply almost any color transformation
+ 389|     in constant time by using pre-calculated decimated tables.
+ 390| 
+ 391|     .. versionadded:: 5.2.0
+ 392| 
+ 393|     :param size: Size of the table. One int or tuple of (int, int, int).
+ 394|                  Minimal size in any dimension is 2, maximum is 65.
+ 395|     :param table: Flat lookup table. A list of ``channels * size**3``
+ 396|                   float elements or a list of ``size**3`` channels-sized
+ 397|                   tuples with floats. Channels are changed first,
+ 398|                   then first dimension, then second, then third.
+ 399|                   Value 0.0 corresponds lowest value of output, 1.0 highest.
+ 400|     :param channels: Number of channels in the table. Could be 3 or 4.
+ 401|                      Default is 3.
+ 402|     :param target_mode: A mode for the result image. Should have not less
+ 403|                         than ``channels`` channels. Default is ``None``,
+ 404|                         which means that mode wouldn't be changed.
+ 405|     """
+ 406| 
+ 407|     name = "Color 3D LUT"
+ 408| 
+ 409|     def __init__(
+ 410|         self,
+ 411|         size: int | tuple[int, int, int],
+ 412|         table: Sequence[float] | Sequence[Sequence[int]] | NumpyArray,
+ 413|         channels: int = 3,
+ 414|         target_mode: str | None = None,
+ 415|         **kwargs: bool,
+ 416|     ) -> None:
+ 417|         if channels not in (3, 4):
+ 418|             msg = "Only 3 or 4 output channels are supported"
+ 419|             raise ValueError(msg)
+ 420|         self.size = size = self._check_size(size)
+ 421|         self.channels = channels
+ 422|         self.mode = target_mode
+ 423| 
+ 424|         # Hidden flag `_copy_table=False` could be used to avoid extra copying
+ 425|         # of the table if the table is specially made for the constructor.
+ 426|         copy_table = kwargs.get("_copy_table", True)
+ 427|         items = size[0] * size[1] * size[2]
+ 428|         wrong_size = False
+ 429| 
+ 430|         numpy: ModuleType | None = None
+ 431|         if hasattr(table, "shape"):
+ 432|             try:
+ 433|                 import numpy
+ 434|             except ImportError:
+ 435|                 pass
+ 436| 
+ 437|         if numpy and isinstance(table, numpy.ndarray):
+ 438|             numpy_table: NumpyArray = table
+ 439|             if copy_table:
+ 440|                 numpy_table = numpy_table.copy()
+ 441| 
+ 442|             if numpy_table.shape in [
+ 443|                 (items * channels,),
+ 444|                 (items, channels),
+ 445|                 (size[2], size[1], size[0], channels),
+ 446|             ]:
+ 447|                 table = numpy_table.reshape(items * channels)
+ 448|             else:
+ 449|                 wrong_size = True
+ 450| 
+ 451|         else:
+ 452|             if copy_table:
+ 453|                 table = list(table)
+ 454| 
+ 455|             # Convert to a flat list
+ 456|             if table and isinstance(table[0], (list, tuple)):
+ 457|                 raw_table = cast(Sequence[Sequence[int]], table)
+ 458|                 flat_table: list[int] = []
+ 459|                 for pixel in raw_table:
+ 460|                     if len(pixel) != channels:
+ 461|                         msg = (
+ 462|                             "The elements of the table should "
+ 463|                             f"have a length of {channels}."
+ 464|                         )
+ 465|                         raise ValueError(msg)
+ 466|                     flat_table.extend(pixel)
+ 467|                 table = flat_table
+ 468| 
+ 469|         if wrong_size or len(table) != items * channels:
+ 470|             msg = (
+ 471|                 "The table should have either channels * size**3 float items "
+ 472|                 "or size**3 items of channels-sized tuples with floats. "
+ 473|                 f"Table should be: {channels}x{size[0]}x{size[1]}x{size[2]}. "
+ 474|                 f"Actual length: {len(table)}"
+ 475|             )
+ 476|             raise ValueError(msg)
+ 477|         self.table = table
+ 478| 
+ 479|     @staticmethod
+ 480|     def _check_size(size: Any) -> tuple[int, int, int]:
+ 481|         try:
+ 482|             _, _, _ = size
+ 483|         except ValueError as e:
+ 484|             msg = "Size should be either an integer or a tuple of three integers."
+ 485|             raise ValueError(msg) from e
+ 486|         except TypeError:
+ 487|             size = (size, size, size)
+ 488|         size = tuple(int(x) for x in size)
+ 489|         for size_1d in size:
+ 490|             if not 2 <= size_1d <= 65:
+ 491|                 msg = "Size should be in [2, 65] range."
+ 492|                 raise ValueError(msg)
+ 493|         return size
+ 494| 
+ 495|     @classmethod
+ 496|     def generate(
+ 497|         cls,
+ 498|         size: int | tuple[int, int, int],
+ 499|         callback: Callable[[float, float, float], tuple[float, ...]],
+ 500|         channels: int = 3,
+ 501|         target_mode: str | None = None,
+ 502|     ) -> Color3DLUT:
+ 503|         """Generates new LUT using provided callback.
+ 504| 
+ 505|         :param size: Size of the table. Passed to the constructor.
+ 506|         :param callback: Function with three parameters which correspond
+ 507|                          three color channels. Will be called ``size**3``
+ 508|                          times with values from 0.0 to 1.0 and should return
+ 509|                          a tuple with ``channels`` elements.
+ 510|         :param channels: The number of channels which should return callback.
+ 511|         :param target_mode: Passed to the constructor of the resulting
+ 512|                             lookup table.
+ 513|         """
+ 514|         size_1d, size_2d, size_3d = cls._check_size(size)
+ 515|         if channels not in (3, 4):
+ 516|             msg = "Only 3 or 4 output channels are supported"
+ 517|             raise ValueError(msg)
+ 518| 
+ 519|         table: list[float] = [0] * (size_1d * size_2d * size_3d * channels)
+ 520|         idx_out = 0
+ 521|         for b in range(size_3d):
+ 522|             for g in range(size_2d):
+ 523|                 for r in range(size_1d):
+ 524|                     table[idx_out : idx_out + channels] = callback(
+ 525|                         r / (size_1d - 1), g / (size_2d - 1), b / (size_3d - 1)
+ 526|                     )
+ 527|                     idx_out += channels
+ 528| 
+ 529|         return cls(
+ 530|             (size_1d, size_2d, size_3d),
+ 531|             table,
+ 532|             channels=channels,
+ 533|             target_mode=target_mode,
+ 534|             _copy_table=False,
+ 535|         )
+ 536| 
+ 537|     def transform(
+ 538|         self,
+ 539|         callback: Callable[..., tuple[float, ...]],
+ 540|         with_normals: bool = False,
+ 541|         channels: int | None = None,
+ 542|         target_mode: str | None = None,
+ 543|     ) -> Color3DLUT:
+ 544|         """Transforms the table values using provided callback and returns
+ 545|         a new LUT with altered values.
+ 546| 
+ 547|         :param callback: A function which takes old lookup table values
+ 548|                          and returns a new set of values. The number
+ 549|                          of arguments which function should take is
+ 550|                          ``self.channels`` or ``3 + self.channels``
+ 551|                          if ``with_normals`` flag is set.
+ 552|                          Should return a tuple of ``self.channels`` or
+ 553|                          ``channels`` elements if it is set.
+ 554|         :param with_normals: If true, ``callback`` will be called with
+ 555|                              coordinates in the color cube as the first
+ 556|                              three arguments. Otherwise, ``callback``
+ 557|                              will be called only with actual color values.
+ 558|         :param channels: The number of channels in the resulting lookup table.
+ 559|         :param target_mode: Passed to the constructor of the resulting
+ 560|                             lookup table.
+ 561|         """
+ 562|         if channels not in (None, 3, 4):
+ 563|             msg = "Only 3 or 4 output channels are supported"
+ 564|             raise ValueError(msg)
+ 565|         ch_in = self.channels
+ 566|         ch_out = channels or ch_in
+ 567|         size_1d, size_2d, size_3d = self.size
+ 568| 
+ 569|         table: list[float] = [0] * (size_1d * size_2d * size_3d * ch_out)
+ 570|         idx_in = 0
+ 571|         idx_out = 0
+ 572|         for b in range(size_3d):
+ 573|             for g in range(size_2d):
+ 574|                 for r in range(size_1d):
+ 575|                     values = self.table[idx_in : idx_in + ch_in]
+ 576|                     if with_normals:
+ 577|                         values = callback(
+ 578|                             r / (size_1d - 1),
+ 579|                             g / (size_2d - 1),
+ 580|                             b / (size_3d - 1),
+ 581|                             *values,
+ 582|                         )
+ 583|                     else:
+ 584|                         values = callback(*values)
+ 585|                     table[idx_out : idx_out + ch_out] = values
+ 586|                     idx_in += ch_in
+ 587|                     idx_out += ch_out
+ 588| 
+ 589|         return type(self)(
+ 590|             self.size,
+ 591|             table,
+ 592|             channels=ch_out,
+ 593|             target_mode=target_mode or self.mode,
+ 594|             _copy_table=False,
+ 595|         )
+ 596| 
+ 597|     def __repr__(self) -> str:
+ 598|         r = [
+ 599|             f"{self.__class__.__name__} from {self.table.__class__.__name__}",
+ 600|             "size={:d}x{:d}x{:d}".format(*self.size),
+ 601|             f"channels={self.channels:d}",
+ 602|         ]
+ 603|         if self.mode:
+ 604|             r.append(f"target_mode={self.mode}")
+ 605|         return "<{}>".format(" ".join(r))
+ 606| 
+ 607|     def filter(self, image: _imaging.ImagingCore) -> _imaging.ImagingCore:
+ 608|         from . import Image
+ 609| 
+ 610|         return image.color_lut_3d(
+ 611|             self.mode or image.mode,
+ 612|             Image.Resampling.BILINEAR,
+ 613|             self.channels,
+ 614|             self.size,
+ 615|             self.table,
+ 616|         )
+ 617| 
+ 618| 
+
+### id=7812 lang=go
+[CODE]
+   1| package btf
+   2| 
+   3| import (
+   4| 	"debug/elf"
+   5| 	"errors"
+   6| 	"fmt"
+   7| 	"io"
+   8| 	"iter"
+   9| 	"maps"
+  10| 	"math"
+  11| 	"os"
+  12| 	"reflect"
+  13| 	"slices"
+  14| 
+  15| 	"github.com/cilium/ebpf/internal"
+  16| 	"github.com/cilium/ebpf/internal/sys"
+  17| )
+  18| 
+  19| const btfMagic = 0xeB9F
+  20| 
+  21| // Errors returned by BTF functions.
+  22| var (
+  23| 	ErrNotSupported    = internal.ErrNotSupported
+  24| 	ErrNotFound        = errors.New("not found")
+  25| 	ErrNoExtendedInfo  = errors.New("no extended info")
+  26| 	ErrMultipleMatches = errors.New("multiple matching types")
+  27| )
+  28| 
+  29| // ID represents the unique ID of a BTF object.
+  30| type ID = sys.BTFID
+  31| 
+  32| type elfData struct {
+  33| 	sectionSizes  map[string]uint32
+  34| 	symbolOffsets map[elfSymbol]uint32
+  35| 	fixups        map[Type]bool
+  36| }
+  37| 
+  38| type elfSymbol struct {
+  39| 	section string
+  40| 	name    string
+  41| }
+  42| 
+  43| // Spec allows querying a set of Types and loading the set into the
+  44| // kernel.
+  45| type Spec struct {
+  46| 	*decoder
+  47| 
+  48| 	// Additional data from ELF, may be nil.
+  49| 	elf *elfData
+  50| }
+  51| 
+  52| // LoadSpec opens file and calls LoadSpecFromReader on it.
+  53| func LoadSpec(file string) (*Spec, error) {
+  54| 	fh, err := os.Open(file)
+  55| 	if err != nil {
+  56| 		return nil, err
+  57| 	}
+  58| 	defer fh.Close()
+  59| 
+  60| 	return LoadSpecFromReader(fh)
+  61| }
+  62| 
+  63| // LoadSpecFromReader reads from an ELF or a raw BTF blob.
+  64| //
+  65| // Returns ErrNotFound if reading from an ELF which contains no BTF. ExtInfos
+  66| // may be nil.
+  67| func LoadSpecFromReader(rd io.ReaderAt) (*Spec, error) {
+  68| 	file, err := internal.NewSafeELFFile(rd)
+  69| 	if err != nil {
+  70| 		raw, err := io.ReadAll(io.NewSectionReader(rd, 0, math.MaxInt64))
+  71| 		if err != nil {
+  72| 			return nil, fmt.Errorf("read raw BTF: %w", err)
+  73| 		}
+  74| 
+  75| 		return loadRawSpec(raw, nil)
+  76| 	}
+  77| 
+  78| 	return loadSpecFromELF(file)
+  79| }
+  80| 
+  81| // LoadSpecAndExtInfosFromReader reads from an ELF.
+  82| //
+  83| // ExtInfos may be nil if the ELF doesn't contain section metadata.
+  84| // Returns ErrNotFound if the ELF contains no BTF.
+  85| func LoadSpecAndExtInfosFromReader(rd io.ReaderAt) (*Spec, *ExtInfos, error) {
+  86| 	file, err := internal.NewSafeELFFile(rd)
+  87| 	if err != nil {
+  88| 		return nil, nil, err
+  89| 	}
+  90| 
+  91| 	spec, err := loadSpecFromELF(file)
+  92| 	if err != nil {
+  93| 		return nil, nil, err
+  94| 	}
+  95| 
+  96| 	extInfos, err := loadExtInfosFromELF(file, spec)
+  97| 	if err != nil && !errors.Is(err, ErrNotFound) {
+  98| 		return nil, nil, err
+  99| 	}
+ 100| 
+ 101| 	return spec, extInfos, nil
+ 102| }
+ 103| 
+ 104| // symbolOffsets extracts all symbols offsets from an ELF and indexes them by
+ 105| // section and variable name.
+ 106| //
+ 107| // References to variables in BTF data sections carry unsigned 32-bit offsets.
+ 108| // Some ELF symbols (e.g. in vmlinux) may point to virtual memory that is well
+ 109| // beyond this range. Since these symbols cannot be described by BTF info,
+ 110| // ignore them here.
+ 111| func symbolOffsets(file *internal.SafeELFFile) (map[elfSymbol]uint32, error) {
+ 112| 	symbols, err := file.Symbols()
+ 113| 	if err != nil {
+ 114| 		return nil, fmt.Errorf("can't read symbols: %v", err)
+ 115| 	}
+ 116| 
+ 117| 	offsets := make(map[elfSymbol]uint32)
+ 118| 	for _, sym := range symbols {
+ 119| 		if idx := sym.Section; idx >= elf.SHN_LORESERVE && idx <= elf.SHN_HIRESERVE {
+ 120| 			// Ignore things like SHN_ABS
+ 121| 			continue
+ 122| 		}
+ 123| 
+ 124| 		if sym.Value > math.MaxUint32 {
+ 125| 			// VarSecinfo offset is u32, cannot reference symbols in higher regions.
+ 126| 			continue
+ 127| 		}
+ 128| 
+ 129| 		if int(sym.Section) >= len(file.Sections) {
+ 130| 			return nil, fmt.Errorf("symbol %s: invalid section %d", sym.Name, sym.Section)
+ 131| 		}
+ 132| 
+ 133| 		secName := file.Sections[sym.Section].Name
+ 134| 		offsets[elfSymbol{secName, sym.Name}] = uint32(sym.Value)
+ 135| 	}
+ 136| 
+ 137| 	return offsets, nil
+ 138| }
+ 139| 
+ 140| func loadSpecFromELF(file *internal.SafeELFFile) (*Spec, error) {
+ 141| 	var (
+ 142| 		btfSection   *elf.Section
+ 143| 		sectionSizes = make(map[string]uint32)
+ 144| 	)
+ 145| 
+ 146| 	for _, sec := range file.Sections {
+ 147| 		switch sec.Name {
+ 148| 		case ".BTF":
+ 149| 			btfSection = sec
+ 150| 		default:
+ 151| 			if sec.Type != elf.SHT_PROGBITS && sec.Type != elf.SHT_NOBITS {
+ 152| 				break
+ 153| 			}
+ 154| 
+ 155| 			if sec.Size > math.MaxUint32 {
+ 156| 				return nil, fmt.Errorf("section %s exceeds maximum size", sec.Name)
+ 157| 			}
+ 158| 
+ 159| 			sectionSizes[sec.Name] = uint32(sec.Size)
+ 160| 		}
+ 161| 	}
+ 162| 
+ 163| 	if btfSection == nil {
+ 164| 		return nil, fmt.Errorf("btf: %w", ErrNotFound)
+ 165| 	}
+ 166| 
+ 167| 	offsets, err := symbolOffsets(file)
+ 168| 	if err != nil {
+ 169| 		return nil, err
+ 170| 	}
+ 171| 
+ 172| 	rawBTF, err := btfSection.Data()
+ 173| 	if err != nil {
+ 174| 		return nil, fmt.Errorf("reading .BTF section: %w", err)
+ 175| 	}
+ 176| 
+ 177| 	spec, err := loadRawSpec(rawBTF, nil)
+ 178| 	if err != nil {
+ 179| 		return nil, err
+ 180| 	}
+ 181| 
+ 182| 	if spec.decoder.byteOrder != file.ByteOrder {
+ 183| 		return nil, fmt.Errorf("BTF byte order %s does not match ELF byte order %s", spec.decoder.byteOrder, file.ByteOrder)
+ 184| 	}
+ 185| 
+ 186| 	spec.elf = &elfData{
+ 187| 		sectionSizes,
+ 188| 		offsets,
+ 189| 		make(map[Type]bool),
+ 190| 	}
+ 191| 
+ 192| 	return spec, nil
+ 193| }
+ 194| 
+ 195| func loadRawSpec(btf []byte, base *Spec) (*Spec, error) {
+ 196| 	var (
+ 197| 		baseDecoder *decoder
+ 198| 		baseStrings *stringTable
+ 199| 		err         error
+ 200| 	)
+ 201| 
+ 202| 	if base != nil {
+ 203| 		baseDecoder = base.decoder
+ 204| 		baseStrings = base.strings
+ 205| 	}
+ 206| 
+ 207| 	header, bo, err := parseBTFHeader(btf)
+ 208| 	if err != nil {
+ 209| 		return nil, fmt.Errorf("parsing .BTF header: %v", err)
+ 210| 	}
+ 211| 
+ 212| 	if header.HdrLen > uint32(len(btf)) {
+ 213| 		return nil, fmt.Errorf("BTF header length is out of bounds")
+ 214| 	}
+ 215| 	btf = btf[header.HdrLen:]
+ 216| 
+ 217| 	if int(header.StringOff+header.StringLen) > len(btf) {
+ 218| 		return nil, fmt.Errorf("string table is out of bounds")
+ 219| 	}
+ 220| 	stringsSection := btf[header.StringOff : header.StringOff+header.StringLen]
+ 221| 
+ 222| 	rawStrings, err := newStringTable(stringsSection, baseStrings)
+ 223| 	if err != nil {
+ 224| 		return nil, fmt.Errorf("read string section: %w", err)
+ 225| 	}
+ 226| 
+ 227| 	if int(header.TypeOff+header.TypeLen) > len(btf) {
+ 228| 		return nil, fmt.Errorf("types section is out of bounds")
+ 229| 	}
+ 230| 	typesSection := btf[header.TypeOff : header.TypeOff+header.TypeLen]
+ 231| 
+ 232| 	decoder, err := newDecoder(typesSection, bo, rawStrings, baseDecoder)
+ 233| 	if err != nil {
+ 234| 		return nil, err
+ 235| 	}
+ 236| 
+ 237| 	return &Spec{decoder, nil}, nil
+ 238| }
+ 239| 
+ 240| // fixupDatasec attempts to patch up missing info in Datasecs and its members by
+ 241| // supplementing them with information from the ELF headers and symbol table.
+ 242| func (elf *elfData) fixupDatasec(typ Type) error {
+ 243| 	if elf == nil {
+ 244| 		return nil
+ 245| 	}
+ 246| 
+ 247| 	if ds, ok := typ.(*Datasec); ok {
+ 248| 		if elf.fixups[ds] {
+ 249| 			return nil
+ 250| 		}
+ 251| 		elf.fixups[ds] = true
+ 252| 
+ 253| 		name := ds.Name
+ 254| 
+ 255| 		// Some Datasecs are virtual and don't have corresponding ELF sections.
+ 256| 		switch name {
+ 257| 		case ".ksyms":
+ 258| 			// .ksyms describes forward declarations of kfunc signatures, as well as
+ 259| 			// references to kernel symbols.
+ 260| 			// Nothing to fix up, all sizes and offsets are 0.
+ 261| 			for _, vsi := range ds.Vars {
+ 262| 				switch t := vsi.Type.(type) {
+ 263| 				case *Func:
+ 264| 					continue
+ 265| 				case *Var:
+ 266| 					if _, ok := t.Type.(*Void); !ok {
+ 267| 						return fmt.Errorf("data section %s: expected %s to be *Void, not %T: %w", name, vsi.Type.TypeName(), vsi.Type, ErrNotSupported)
+ 268| 					}
+ 269| 				default:
+ 270| 					return fmt.Errorf("data section %s: expected to be either *btf.Func or *btf.Var, not %T: %w", name, vsi.Type, ErrNotSupported)
+ 271| 				}
+ 272| 			}
+ 273| 
+ 274| 			return nil
+ 275| 		case ".kconfig":
+ 276| 			// .kconfig has a size of 0 and has all members' offsets set to 0.
+ 277| 			// Fix up all offsets and set the Datasec's size.
+ 278| 			if err := fixupDatasecLayout(ds); err != nil {
+ 279| 				return err
+ 280| 			}
+ 281| 
+ 282| 			// Fix up extern to global linkage to avoid a BTF verifier error.
+ 283| 			for _, vsi := range ds.Vars {
+ 284| 				vsi.Type.(*Var).Linkage = GlobalVar
+ 285| 			}
+ 286| 
+ 287| 			return nil
+ 288| 		}
+ 289| 
+ 290| 		if ds.Size != 0 {
+ 291| 			return nil
+ 292| 		}
+ 293| 
+ 294| 		ds.Size, ok = elf.sectionSizes[name]
+ 295| 		if !ok {
+ 296| 			return fmt.Errorf("data section %s: missing size", name)
+ 297| 		}
+ 298| 
+ 299| 		for i := range ds.Vars {
+ 300| 			symName := ds.Vars[i].Type.TypeName()
+ 301| 			ds.Vars[i].Offset, ok = elf.symbolOffsets[elfSymbol{name, symName}]
+ 302| 			if !ok {
+ 303| 				return fmt.Errorf("data section %s: missing offset for symbol %s", name, symName)
+ 304| 			}
+ 305| 		}
+ 306| 	}
+ 307| 
+ 308| 	return nil
+ 309| }
+ 310| 
+ 311| // fixupDatasecLayout populates ds.Vars[].Offset according to var sizes and
+ 312| // alignment. Calculate and set ds.Size.
+ 313| func fixupDatasecLayout(ds *Datasec) error {
+ 314| 	var off uint32
+ 315| 
+ 316| 	for i, vsi := range ds.Vars {
+ 317| 		v, ok := vsi.Type.(*Var)
+ 318| 		if !ok {
+ 319| 			return fmt.Errorf("member %d: unsupported type %T", i, vsi.Type)
+ 320| 		}
+ 321| 
+ 322| 		size, err := Sizeof(v.Type)
+ 323| 		if err != nil {
+ 324| 			return fmt.Errorf("variable %s: getting size: %w", v.Name, err)
+ 325| 		}
+ 326| 		align, err := alignof(v.Type)
+ 327| 		if err != nil {
+ 328| 			return fmt.Errorf("variable %s: getting alignment: %w", v.Name, err)
+ 329| 		}
+ 330| 
+ 331| 		// Align the current member based on the offset of the end of the previous
+ 332| 		// member and the alignment of the current member.
+ 333| 		off = internal.Align(off, uint32(align))
+ 334| 
+ 335| 		ds.Vars[i].Offset = off
+ 336| 
+ 337| 		off += uint32(size)
+ 338| 	}
+ 339| 
+ 340| 	ds.Size = off
+ 341| 
+ 342| 	return nil
+ 343| }
+ 344| 
+ 345| // Copy a Spec.
+ 346| //
+ 347| // All contained types are duplicated while preserving any modifications made
+ 348| // to them.
+ 349| func (s *Spec) Copy() *Spec {
+ 350| 	if s == nil {
+ 351| 		return nil
+ 352| 	}
+ 353| 
+ 354| 	cpy := &Spec{
+ 355| 		s.decoder.Copy(),
+ 356| 		nil,
+ 357| 	}
+ 358| 
+ 359| 	if s.elf != nil {
+ 360| 		cpy.elf = &elfData{
+ 361| 			s.elf.sectionSizes,
+ 362| 			s.elf.symbolOffsets,
+ 363| 			maps.Clone(s.elf.fixups),
+ 364| 		}
+ 365| 	}
+ 366| 
+ 367| 	return cpy
+ 368| }
+ 369| 
+ 370| // TypeByID returns the BTF Type with the given type ID.
+ 371| //
+ 372| // Returns an error wrapping ErrNotFound if a Type with the given ID
+ 373| // does not exist in the Spec.
+ 374| func (s *Spec) TypeByID(id TypeID) (Type, error) {
+ 375| 	typ, err := s.decoder.TypeByID(id)
+ 376| 	if err != nil {
+ 377| 		return nil, fmt.Errorf("inflate type: %w", err)
+ 378| 	}
+ 379| 
+ 380| 	if err := s.elf.fixupDatasec(typ); err != nil {
+ 381| 		return nil, err
+ 382| 	}
+ 383| 
+ 384| 	return typ, nil
+ 385| }
+ 386| 
+ 387| // TypeID returns the ID for a given Type.
+ 388| //
+ 389| // Returns an error wrapping [ErrNotFound] if the type isn't part of the Spec.
+ 390| func (s *Spec) TypeID(typ Type) (TypeID, error) {
+ 391| 	return s.decoder.TypeID(typ)
+ 392| }
+ 393| 
+ 394| // AnyTypesByName returns a list of BTF Types with the given name.
+ 395| //
+ 396| // If the BTF blob describes multiple compilation units like vmlinux, multiple
+ 397| // Types with the same name and kind can exist, but might not describe the same
+ 398| // data structure.
+ 399| //
+ 400| // Returns an error wrapping ErrNotFound if no matching Type exists in the Spec.
+ 401| func (s *Spec) AnyTypesByName(name string) ([]Type, error) {
+ 402| 	types, err := s.TypesByName(newEssentialName(name))
+ 403| 	if err != nil {
+ 404| 		return nil, err
+ 405| 	}
+ 406| 
+ 407| 	for i := 0; i < len(types); i++ {
+ 408| 		// Match against the full name, not just the essential one
+ 409| 		// in case the type being looked up is a struct flavor.
+ 410| 		if types[i].TypeName() != name {
+ 411| 			types = slices.Delete(types, i, i+1)
+ 412| 			continue
+ 413| 		}
+ 414| 
+ 415| 		if err := s.elf.fixupDatasec(types[i]); err != nil {
+ 416| 			return nil, err
+ 417| 		}
+ 418| 	}
+ 419| 
+ 420| 	return types, nil
+ 421| }
+ 422| 
+ 423| // AnyTypeByName returns a Type with the given name.
+ 424| //
+ 425| // Returns an error if multiple types of that name exist.
+ 426| func (s *Spec) AnyTypeByName(name string) (Type, error) {
+ 427| 	types, err := s.AnyTypesByName(name)
+ 428| 	if err != nil {
+ 429| 		return nil, err
+ 430| 	}
+ 431| 
+ 432| 	if len(types) > 1 {
+ 433| 		return nil, fmt.Errorf("found multiple types: %v", types)
+ 434| 	}
+ 435| 
+ 436| 	return types[0], nil
+ 437| }
+ 438| 
+ 439| // TypeByName searches for a Type with a specific name. Since multiple Types
+ 440| // with the same name can exist, the parameter typ is taken to narrow down the
+ 441| // search in case of a clash.
+ 442| //
+ 443| // typ must be a non-nil pointer to an implementation of a Type. On success, the
+ 444| // address of the found Type will be copied to typ.
+ 445| //
+ 446| // Returns an error wrapping ErrNotFound if no matching Type exists in the Spec.
+ 447| // Returns an error wrapping ErrMultipleTypes if multiple candidates are found.
+ 448| func (s *Spec) TypeByName(name string, typ any) error {
+ 449| 	if err := internal.IsNilPointer(typ); err != nil {
+ 450| 		return fmt.Errorf("type argument: %w", err)
+ 451| 	}
+ 452| 
+ 453| 	typeInterface := reflect.TypeFor[Type]()
+ 454| 
+ 455| 	// typ may be **T or *Type
+ 456| 	typValue := reflect.ValueOf(typ)
+ 457| 	if typValue.Kind() != reflect.Pointer {
+ 458| 		return fmt.Errorf("%T is not a pointer", typ)
+ 459| 	}
+ 460| 	typPtr := typValue.Elem()
+ 461| 	if !typPtr.CanSet() {
+ 462| 		return fmt.Errorf("%T cannot be set", typ)
+ 463| 	}
+ 464| 
+ 465| 	wanted := typPtr.Type()
+ 466| 	if wanted == typeInterface {
+ 467| 		// This is *Type. Unwrap the value's type.
+ 468| 		if typPtr.IsNil() {
+ 469| 			return fmt.Errorf("%T points to a nil Type", typ)
+ 470| 		}
+ 471| 		wanted = typPtr.Elem().Type()
+ 472| 	}
+ 473| 
+ 474| 	if !wanted.AssignableTo(typeInterface) {
+ 475| 		return fmt.Errorf("%T does not satisfy Type interface", typ)
+ 476| 	}
+ 477| 
+ 478| 	types, err := s.AnyTypesByName(name)
+ 479| 	if err != nil {
+ 480| 		return err
+ 481| 	}
+ 482| 
+ 483| 	var candidate Type
+ 484| 	for _, typ := range types {
+ 485| 		if reflect.TypeOf(typ) != wanted {
+ 486| 			continue
+ 487| 		}
+ 488| 
+ 489| 		if candidate != nil {
+ 490| 			return fmt.Errorf("type %s(%T): %w", name, typ, ErrMultipleMatches)
+ 491| 		}
+ 492| 
+ 493| 		candidate = typ
+ 494| 	}
+ 495| 
+ 496| 	if candidate == nil {
+ 497| 		return fmt.Errorf("%s %s: %w", wanted, name, ErrNotFound)
+ 498| 	}
+ 499| 
+ 500| 	typPtr.Set(reflect.ValueOf(candidate))
+ 501| 
+ 502| 	return nil
+ 503| }
+ 504| 
+ 505| // LoadSplitSpec loads split BTF from the given file.
+ 506| //
+ 507| // Types from base are used to resolve references in the split BTF.
+ 508| // The returned Spec only contains types from the split BTF, not from the base.
+ 509| func LoadSplitSpec(file string, base *Spec) (*Spec, error) {
+ 510| 	fh, err := os.Open(file)
+ 511| 	if err != nil {
+ 512| 		return nil, err
+ 513| 	}
+ 514| 	defer fh.Close()
+ 515| 
+ 516| 	return LoadSplitSpecFromReader(fh, base)
+ 517| }
+ 518| 
+ 519| // LoadSplitSpecFromReader loads split BTF from a reader.
+ 520| //
+ 521| // Types from base are used to resolve references in the split BTF.
+ 522| // The returned Spec only contains types from the split BTF, not from the base.
+ 523| func LoadSplitSpecFromReader(r io.ReaderAt, base *Spec) (*Spec, error) {
+ 524| 	raw, err := io.ReadAll(io.NewSectionReader(r, 0, math.MaxInt64))
+ 525| 	if err != nil {
+ 526| 		return nil, fmt.Errorf("read raw BTF: %w", err)
+ 527| 	}
+ 528| 
+ 529| 	return loadRawSpec(raw, base)
+ 530| }
+ 531| 
+ 532| // All iterates over all types.
+ 533| func (s *Spec) All() iter.Seq2[Type, error] {
+ 534| 	return func(yield func(Type, error) bool) {
+ 535| 		for id := s.firstTypeID; ; id++ {
+ 536| 			typ, err := s.TypeByID(id)
+ 537| 			if errors.Is(err, ErrNotFound) {
+ 538| 				return
+ 539| 			} else if err != nil {
+ 540| 				yield(nil, err)
+ 541| 				return
+ 542| 			}
+ 543| 
+ 544| 			// Skip declTags, during unmarshaling declTags become `Tags` fields of other types.
+ 545| 			// We keep them in the spec to avoid holes in the ID space, but for the purposes of
+ 546| 			// iteration, they are not useful to the user.
+ 547| 			if _, ok := typ.(*declTag); ok {
+ 548| 				continue
+ 549| 			}
+ 550| 
+ 551| 			if !yield(typ, nil) {
+ 552| 				return
+ 553| 			}
+ 554| 		}
+ 555| 	}
+ 556| }
+ 557| 
+ 558| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=7800 teacher=unknown flags=[]
+### id=7811 teacher=unknown flags=[]
 [ANALYSIS]
-## 逐函数行号级分析
+# 逐条分析（锚定行号）
 
-**1. `_run`（第 88–150 行）— 命令入口点**
-- 入口参数：`-i`（第 60 行）、`-o`（第 62 行）、`-lut`、`-elp`、`-ssp`、`-p` 等，全部来自 CLI。
-- 第 96–97 行将 `args.input`/`args.output` 转为 Path，未在此处做规范化，但后续 sink 处有校验（见下）。
-- 第 103–105 行：LUT 路径 `pathlib.Path.cwd() / lut_table` 直接拼接后交给 `load_LUT`。该路径仅用于读取 YAML，且命令本身是本地开发者工具，读取用户自己指定的文件不构成跨信任边界的数据流；且 `YAML()` 默认为 safe loader（第 158 行），不存在反序列化 RCE。
+**入口点枚举**：本文件是 Pillow 的 `ImageFilter.py` 库模块，无路由/文件/环境变量入口。所有 source 均为构造函数参数，由调用方传入：
 
-**2. `load_LUT`（第 157–166 行）**
-- 第 159 行 `yaml.load(path.open(...))`：ruamel 的默认 `YAML()` 是 safe 模式，只构造基础类型，无任意对象实例化 sink。
-- 第 161–163 行 prefix 循环只是把自身 dict 嵌套引用回写键名，纯内存操作，无文件/命令 sink。
+1. **Kernel.__init__（第 60-77 行）**：`size`、`kernel`、`scale`、`offset`。仅做长度一致性校验（第 68 行），最终传入 C 层 `image.filter()`。C 层对 size 有硬编码限制，无内存安全问题暴露于 Python 层。
+2. **RankFilter.__init__（第 92-103 行）**：校验奇数 size（第 94 行）、`size*size*4 > 2**31-1` 防整数溢出（第 97 行）、rank 范围（第 100 行）。防御有效。
+3. **ModeFilter / GaussianBlur / BoxBlur（第 128-186 行）**：BoxBlur 校验 radius ≥ 0（第 178-180 行）；其余直接传给 C 层，负值/异常由 C 层处理。
+4. **UnsharpMask（第 189-207 行）**：参数未校验但均为数值传给 C 层 `unsharp_mask`，C 层有边界检查。
+5. **Color3DLUT.__init__（第 262-327 行）**：
+   - `_check_size`（第 309-322 行）强制 size ∈ [2,65]，防止超大表分配；
+   - channels 限 3/4（第 266 行）；
+   - 表长度严格校验 `len(table) != items * channels`（第 320 行）后才赋值；
+   - numpy 分支仅 reshape/copy，不执行任意代码。
+   - `_copy_table=False` 隐藏参数只是性能优化，不构成逃逸通道——表内容仍被长度校验约束。
+6. **Color3DLUT.generate / transform（第 330-410 行）**：`callback` 是调用方显式提供的 Python 函数——这是设计内的 API（类似 `map`），不是注入漏洞；size 已被 `_check_size` 限制，回调次数上限 65³≈27 万次，可接受。
+7. **filter 方法们（第 51-56、105-111、413-418 行等）**：sink 均为 Pillow C 扩展的 ImagingCore 方法，输入已被上述校验约束。
 
-**3. `jinja_ify`（第 169–221 行）— 主渲染路径**
-- 第 172–174 行：`template_folder = pathlib.Path.cwd()`，`Environment(loader=FileSystemLoader(template_folder))`（经 `_create_jinja_environment`，第 253–257 行）。source 为 CLI 参数 `r_input_file`，sink 为 `get_template(str(r_input_file))`（第 175 行）。关键防御：Jinja2 的 `FileSystemLoader` 内部会拒绝包含 `..` 或绝对路径逃逸出搜索根的模板路径，因此即使传入 `../../etc/passwd` 也无法加载搜索目录之外的文件作为模板——输入侧遍历被框架层阻断。
-- SSTI 面：模板本身是受信的开发者提供的本地文件（第 256 行注释明确说明 trusted Jinja environment）；不可信数据仅通过 `lut` 作为变量在 `render_template`（第 261–263 行）一次性渲染，注释亦说明避免递归 SSTI。lut 内容来自 safe-YAML 与 OSCAL 模型数据，不含可执行模板字符串通道。
-- 输出侧：第 207 行 `output_file = trestle_root / r_output_file` 后立即调用 `PathSecurityValidator.validate_local_path(output_file, trestle_root)`（第 208 行），再于第 212–213 行写入。写入前校验有效，路径遍历被阻断。
-- 第 181–184 行：ssp/profile 必须成对出现，否则抛错；模型加载走 `load_validate_model_name`，均在 trestle_root 管辖内。
+**第二入口/替代通道检查**：无 `eval`、`exec`、`pickle`、`os.system`、`subprocess`、文件 IO、网络操作；`import numpy`（第 282 行）为条件导入，安全。内置 filter 类（BLUR 等，第 210-259 行）的 filterargs 为硬编码常量，不可控。
 
-**4. `jinja_multiple_md`（第 224–250 行）— 第二入口**
-- 第 236–241 行：对每个子目录逐层做 `PathSecurityValidator.validate_local_path(full_group_dir, trestle_root)` 后才 `mkdir`（第 243–245 行），目录创建前校验到位。
-- 第 251–253 行（实际第 248–250 区域）：最终输出文件再次 `validate_local_path` 校验后才 `open('w')` 写入。两条替代写入通道均有前置校验。
-- 模板加载与单文件路径相同，受 `FileSystemLoader` 根约束保护。
-
-**5. `_create_jinja_environment` / `render_template`（第 253–263 行）**
-- `autoescape=True`、扩展来自项目内置 `extensions()`（非用户可控），环境固定为受信配置；渲染仅一次，lut 变量不会二次进入模板引擎解析，SSTI 链路闭合。
-
-**6. `_number_captions`（第 266–284 行）**
-- 仅对已渲染的字符串做正则匹配与字符串替换后 join 返回，无文件、命令或求值 sink，纯文本变换。
-
-**综合结论**：全部 source（CLI 参数 input/output/lut）到 sink（get_template、open('w')、mkdir）的数据流均有有效防御：输出侧由 `PathSecurityValidator.validate_local_path` 在每次写入/建目录前校验；输入模板侧由 `FileSystemLoader` 的根目录逃逸检查兜底；YAML 加载为 safe loader；模板环境受信且 lut 数据不进入二次模板解析。黑名单式绕过担忧不适用，因为校验是基于规范化后的真实路径归属判断而非字符串过滤。全文证据支持无漏洞结论。
+**结论**：所有外部可控数据流均经过有效范围校验后进入带边界检查的 C 扩展；callback 参数属设计内函数注入点，非漏洞。未发现可利用的安全缺陷。
 [JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认所有入口点均受有效防御：CLI 参数 output 经 PathSecurityValidator.validate_local_path 在每次 open 写入和 mkdir 之前校验（jinja_ify 第 207-208 行、jinja_multiple_md 第 240-245 行及最终写出处）；input 模板由 FileSystemLoader 的根目录逃逸检查阻止越界加载；LUT 通过 ruamel 默认 safe YAML 加载无反序列化风险；Jinja 环境为受信配置且 autoescape 开启，lut 变量仅在 render_template 中一次性渲染，不构成 SSTI 链路；_number_captions 为纯文本处理无危险 sink。未发现可利用的 source 到 sink 数据流。", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "本文件为 Pillow 图像滤镜库模块，无网络/文件/环境入口。全部外部输入来自各 Filter 构造函数参数：Kernel 仅做长度校验；RankFilter 校验奇数尺寸、防溢出上限和 rank 范围；BoxBlur 校验半径非负；Color3DLUT 通过 _check_size 将表尺寸限制在 2 到 65、channels 限制为 3 或 4、并严格校验表长度后才传入 C 层 sink。generate 与 transform 接受的 callback 是调用方显式传入的设计内函数参数，等同 map 类 API，不构成代码注入。全文不存在 eval、exec、pickle、subprocess、文件或网络操作；内置滤镜的 filterargs 为硬编码常量。所有 source 到 C 扩展 sink 的数据流均有有效防御。", "fix_suggestion": "no fix needed"}
 
-### id=7801 teacher=unknown flags=[]
+### id=7812 teacher=unknown flags=[]
 [ANALYSIS]
-## 编号分析（全文通读）
+## 编号分析
 
-1. **第 40–44 行：属性定义** — `$defaultOption`、`$queryParameter`、`$cookieName`、`$columnType` 均为可由后台字段设置控制的属性，无输入过滤。
+1. **入口点枚举（全文）**：
+   - 第 44 行 `LoadSpec(file)`：文件路径入口，`os.Open` 后进入 `LoadSpecFromReader`。
+   - 第 53 行 `LoadSpecFromReader(rd)`：接受任意 `io.ReaderAt`，非 ELF 时把全部内容读入并交给 `loadRawSpec`（第 60–63 行）——这是解析不可信原始 BTF blob 的直接通道。
+   - 第 71 行 `LoadSpecAndExtInfosFromReader`：同样走 `loadSpecFromELF`。
+   - 第 226 行 `LoadSplitSpec` / 第 239 行 `LoadSplitSpecFromReader`：第二个替代通道，同样无条件调用 `loadRawSpec(raw, base)`，且此处不先尝试 ELF 解析，任何字节流都直达头部解析。
+   - `symbolOffsets`、`fixupDatasec`、`TypeByName` 等为内部处理，无额外外部输入。
 
-2. **第 46–80 行 `init()`：第一入口点**。当 `$defaultOption === 'query'` 时（约第 71 行），`$this->defaultValue = $request->getParam($this->queryParameter)` —— 直接将 **GET/POST 请求参数**（完全攻击者可控）写入 `defaultValue`；当 `$defaultOption === 'cookie'` 时（约第 73 行），直接读取 `$_COOKIE[$this->cookieName]`，同样是攻击者可控 source。此处没有任何白名单、转义或类型校验。
+2. **source→sink 数据流验证**：
+   - source：第 60 行 `io.ReadAll` 读入的攻击者可控 `btf []byte`（或 ELF `.BTF` 节内容，第 152 行）。
+   - sink：第 96–98 行与第 108–110 行的切片操作 `btf[header.StringOff : header.StringOff+header.StringLen]` 和 `btf[header.TypeOff : header.TypeOff+header.TypeLen]`。
 
-3. **第 82–87 行 `getContentColumnType()`** — 仅返回列类型字符串，来自管理员配置，非外部输入，无风险。
+3. **防御有效性检查**：
+   - 第 89–91 行：`header.HdrLen > uint32(len(btf))` 检查有效。
+   - 第 93–95 行：`if int(header.StringOff+header.StringLen) > len(btf)` —— **缺陷点**。`StringOff` 与 `StringLen` 均为 `uint32`，二者相加在 `uint32` 域内可回绕溢出（如 `StringOff=0xFFFFFFF0, StringLen=0x20`，和回绕为 0x10），转成 `int` 后通过边界检查；随后第 97 行切片使用的是未回绕的原始值语义上要求 `off+len ≤ len(btf)`，实际远超 `len(btf)`，触发 Go 运行时 `slice bounds out of range` **panic**。
+   - 第 107–109 行对 `TypeOff+TypeLen` 存在完全相同的溢出问题。
+   - 黑名单/正则类过滤不存在；其余检查（字节序校验第 158 行等）与本问题无关。
 
-4. **第 89–110 行 `serializeValue()`：sink 所在**。当 `defaultOption === 'custom'` 时，若前端提交值为空则回退到 `$this->defaultValue`（第 96–99 行），随后第 101 行调用 `Variables::getParsedValue($value, $element)`。Formie 的变量解析器会对值执行 **Twig 模板渲染**（用于支持 `{field.xxx}` 等变量语法）。由于 `defaultValue` 在 `init()` 中已被请求参数/ Cookie 污染，攻击者可提交如 `{% import ... %}` 或 `{{ ['id']|filter('system') }}` 形式的 payload，经查询参数或 Cookie 进入模板引擎 —— 典型 **SSTI → RCE** 链。这是该类真实漏洞（verbb/formie 隐藏字段查询参数注入）的根源。
+4. **第二入口确认**：`LoadSplitSpecFromReader`（第 239 行）不经 ELF 封装即可到达同一 sink，攻击面独立成立。
 
-5. **第 112–119 行 `getFieldDefaults()`** — 默认配置，无输入流。
-
-6. **第 121–130 行 `getInputHtml()` / 第 132–138 行 `getPreviewInputHtml()`** — 渲染模板并传入 `$value`；Craft 模板默认自动转义 HTML，XSS 风险有限，且主要面向管理端。
-
-7. **第 140–152 行 `getFrontEndJsModules()`** — 仅输出 cookieName 到前端 JS 设置，属于低危信息暴露（Cookie 名），非可利用 sink。
-
-8. **第 154–172 行 `getFrontEndInputOptions()`：第二入口/sink**。第 160 行对 `(string)$this->defaultValue` 调用 `renderString(...)` —— 显式以 Twig 渲染 defaultValue。虽然此处有 try/catch（第 164–167 行），但 catch 只吞掉异常并回退原值，**不阻止渲染本身**。defaultValue 同样可被 `init()` 中 query/cookie 分支污染（尽管 `defaultOption` 同时为 custom 时才走 serializeValue 路径，但 renderString 路径下 defaultOption 为 query/cookie 时 defaultValue 即被污染并被渲染）。异常处理不是安全防御，仅是错误兜底。
-
-9. **第 174–230 行 schema 定义方法** — 纯管理端表单 schema，静态选项列表，无外部输入流入 sink。
-
-10. **第 232–252 行 `defineHtmlTag()`** — 构造 hidden input 标签，属性来自 handle/id（服务端生成），无注入点。
-
-**替代通道核查**：除 HTTP 参数与 Cookie 外，User-Agent / Referrer / IP（init 第 57–69 行）也写入 defaultValue，但它们最终多作为数据存储而非模板渲染输入，危害较低；核心可利用通道是 query 参数与 Cookie 两条 source→Twig 渲染 sink 的链路。黑名单/过滤：全文未见任何针对 defaultValue 的过滤，防御缺失而非绕过问题。
-
-**结论**：存在漏洞 —— 攻击者可控的查询参数/Cookie 值进入 Twig 模板解析（`Variables::getParsedValue` 与 `View::renderString`），构成服务端模板注入，可导致远程代码执行。
+5. **影响评估**：panic 导致调用进程崩溃（DoS）。cilium/ebpf 常用于加载用户提供的或系统提取的 BTF/ELF 文件，若来源不可信则可被利用。无内存越界写（Go 切片有运行时保护），故风险为中等偏低。
 [JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine", "risk_level": "Critical", "source": "81: $request->getParam($this->queryParameter) 与 83: $_COOKIE[$this->cookieName]，均为攻击者可控输入写入 $this->defaultValue", "sink": "117: Variables::getParsedValue($value, $element) 以及 173: Craft::$app->getView()->renderString((string)$this->defaultValue, ...)，两者均对 defaultValue 执行 Twig 模板渲染", "explanation": "init() 将 GET/POST 参数或 Cookie 值未经任何校验写入 defaultValue -> 该值在 serializeValue() 回退逻辑中传入 Variables::getParsedValue 进行 Twig 解析，或在 getFrontEndInputOptions() 中被 renderString 直接渲染 -> 攻击者提交形如 {{ 攻击payload }} 的查询参数即可实现服务端模板注入，进而远程代码执行；try/catch 仅捕获异常不构成防御", "fix_suggestion": "line 71/73: 对 query 与 cookie 来源的值禁止进入模板解析上下文——在传入 Variables::getParsedValue 或 renderString 前使用纯文本占位替换（先渲染模板再拼接用户值），或将用户输入标记为 raw 字符串并禁用其作为 Twig 源码；同时限制 defaultOption 为 query/cookie 时不得启用 custom 变量解析路径"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-190 Integer Overflow or Wraparound （拒绝服务）", "risk_level": "Medium", "source": "line 70: io.ReadAll 读入的攻击者可控原始 BTF 字节流（及 line 516:LoadSplitSpecFromReader 第二入口）", "sink": "line 97 与 line 109: btf[header.StringOff:header.StringOff+header.StringLen] 及 btf[header.TypeOff:header.TypeOff+header.TypeLen] 切片操作", "explanation": "header.StringOff/StringLen/TypeOff/TypeLen 为 uint32，line 94 与 line 108 的边界检查在 uint32 域内相加后转 int，加法回绕溢出可使恶意构造的偏移通过检查，而后续切片使用未回绕的真实偏移，超出 len(btf)，触发 Go 运行时 slice bounds out of range panic，造成解析不可信 BTF 数据的进程崩溃", "fix_suggestion": "line 94 与 line 108: 先将各字段转为 uint64 再相加比较，例如 if uint64(header.StringOff)+uint64(header.StringLen) > uint64(len(btf)) 则返回错误，避免 uint32 回绕绕过边界检查"}

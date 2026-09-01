@@ -1,0 +1,223 @@
+batch=225 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=8402 lang=go
+[CODE]
+   1| # === file: web/routes.go ===
+   2| package web
+   3| 
+   4| import (
+   5| 	"net/http"
+   6| 
+   7| 	"example.com/app/internal/repo"
+   8| )
+   9| 
+  10| // GET /api/users?name=xxx&sort=xxx
+  11| func ListUsers(w http.ResponseWriter, r *http.Request) {
+  12| 	name := r.URL.Query().Get("name") // SOURCE-1: HTTP 查询参数, 攻击者完全可控
+  13| 	sort := r.URL.Query().Get("sort") // SOURCE-2: 第二外部输入点
+  14| 	users, err := repo.FindUsers(r.Context(), name, sort)
+  15| 	if err != nil {
+  16| 		http.Error(w, "internal error", http.StatusInternalServerError)
+  17| 		return
+  18| 	}
+  19| 	_, _ = w.Write([]byte(users))
+  20| }
+  21| 
+  22| func init() {
+  23| 	http.HandleFunc("/api/users", ListUsers)
+  24| }
+  25| 
+  26| # === file: internal/sanitize/sanitize.go ===
+  27| package sanitize
+  28| 
+  29| import (
+  30| 	"fmt"
+  31| 	"strconv"
+  32| 	"strings"
+  33| )
+  34| 
+  35| // SanitizeSQL 将模板中的 $n 占位符替换为字面量, 声称已完成净化。
+  36| // 实际 QuoteString 仅双写单引号(黑名单式字符串替换),
+  37| // 未处理反斜杠与 E'' 转义串语法, 净化并不完整。
+  38| func SanitizeSQL(sql string, args ...any) (string, error) {
+  39| 	for i := 1; i <= len(args); i++ {
+  40| 		var lit string
+  41| 		switch a := args[i-1].(type) {
+  42| 		case string:
+  43| 			lit = QuoteString(a) // 看似净化, 实则可绕过
+  44| 		case int:
+  45| 			lit = strconv.Itoa(a)
+  46| 		default:
+  47| 			return "", fmt.Errorf("invalid arg type: %T", a)
+  48| 		}
+  49| 		sql = strings.Replace(sql, "$"+strconv.Itoa(i), lit, 1)
+  50| 	}
+  51| 	return sql, nil
+  52| }
+  53| 
+  54| func QuoteString(s string) string {
+  55| 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+  56| }
+  57| 
+  58| # === file: internal/repo/repo.go ===
+  59| package repo
+  60| 
+  61| import (
+  62| 	"context"
+  63| 
+  64| 	"example.com/app/internal/sanitize"
+  65| 
+  66| 	"github.com/jackc/pgx/v5"
+  67| )
+  68| 
+  69| var conn *pgx.Conn // 由 main 包初始化
+  70| 
+  71| // FindUsers: name 走不完整的 sanitize; sort 未做任何处理直接拼接。
+  72| func FindUsers(ctx context.Context, name, sort string) (string, error) {
+  73| 	tpl := "SELECT name FROM users WHERE name = $1 ORDER BY " + sort + " LIMIT 20"
+  74| 	q, err := sanitize.SanitizeSQL(tpl, name)
+  75| 	if err != nil {
+  76| 		return "", err
+  77| 	}
+  78| 	rows, err := conn.Query(ctx, q)
+  79| 	if err != nil {
+  80| 		return "", err
+  81| 	}
+  82| 	defer rows.Close()
+  83| 	var out string
+  84| 	for rows.Next() {
+  85| 		var n string
+  86| 		if err := rows.Scan(&n); err != nil {
+  87| 			return "", err
+  88| 		}
+  89| 		out += n + "\n"
+  90| 	}
+  91| 	return out, rows.Err()
+  92| }
+  93| 
+
+### id=8507 lang=
+[CODE]
+   1| # === file: app/routes.py ===
+   2| from flask import Flask, request, jsonify
+   3| 
+   4| from app.services import register_webhook, dispatch_event
+   5| 
+   6| app = Flask(__name__)
+   7| 
+   8| 
+   9| @app.route("/api/webhooks", methods=["POST"])
+  10| def create_webhook():
+  11|     body = request.get_json(force=True)
+  12|     # SOURCE: attacker fully controls the outbound target URL
+  13|     url = body["url"]
+  14|     name = body.get("name", "hook")
+  15|     hook_id = register_webhook(name, url)
+  16|     return jsonify({"id": hook_id}), 201
+  17| 
+  18| 
+  19| @app.route("/api/events/<event>", methods=["POST"])
+  20| def fire_event(event):
+  21|     payload = request.get_json(silent=True) or {}
+  22|     dispatch_event(event, payload)
+  23|     return jsonify({"ok": True})
+  24| 
+  25| 
+  26| # === file: app/services.py ===
+  27| from app.delivery import send_webhook, validate_webhook_url
+  28| 
+  29| # in-memory registry standing in for the webhook table
+  30| _WEBHOOKS = {}
+  31| 
+  32| 
+  33| def register_webhook(name, url):
+  34|     # GUARD: whitelist validation at the entry point (scheme allow-set + resolved-IP check)
+  35|     validate_webhook_url(url)
+  36|     _WEBHOOKS[name] = {"url": url}
+  37|     return name
+  38| 
+  39| 
+  40| def dispatch_event(event, payload):
+  41|     # pass-through: stored url forwarded to delivery unmodified
+  42|     for hook in _WEBHOOKS.values():
+  43|         send_webhook(hook["url"], payload)
+  44| 
+  45| 
+  46| # === file: app/delivery.py ===
+  47| import ipaddress
+  48| import socket
+  49| from urllib.parse import urlparse
+  50| 
+  51| import requests
+  52| 
+  53| _session = requests.Session()
+  54| 
+  55| # GUARD: exact allow-set replaces the bypassable blacklist regex
+  56| _ALLOWED_SCHEMES = {"https"}
+  57| 
+  58| 
+  59| def _assert_public_ip(ip):
+  60|     # allow-list: only globally routable, non-multicast addresses may be contacted
+  61|     if not ip.is_global or ip.is_multicast:
+  62|         raise ValueError("host resolves to a non-public address")
+  63| 
+  64| 
+  65| def validate_webhook_url(url):
+  66|     if not isinstance(url, str) or not url:
+  67|         raise ValueError("url must be a non-empty string")
+  68|     parsed = urlparse(url)
+  69|     if parsed.scheme not in _ALLOWED_SCHEMES:
+  70|         raise ValueError("scheme not allowed")
+  71|     if not parsed.hostname:
+  72|         raise ValueError("hostname required")
+  73|     port = parsed.port or (443 if parsed.scheme == "https" else 80)
+  74|     try:
+  75|         infos = socket.getaddrinfo(parsed.hostname, port, proto=socket.IPPROTO_TCP)
+  76|     except socket.gaierror:
+  77|         raise ValueError("cannot resolve host")
+  78|     for info in infos:
+  79|         _assert_public_ip(ipaddress.ip_address(info[4][0]))
+  80|     return url
+  81| 
+  82| 
+  83| def send_webhook(url, payload):
+  84|     # SINK: re-validate scheme and every resolved IP immediately before the outbound call
+  85|     validate_webhook_url(url)
+  86|     resp = _session.post(url, json=payload, timeout=5, allow_redirects=False)
+  87|     return resp.status_code
+  88| 
+  89| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=8402 teacher=unknown flags=[]
+[ANALYSIS]
+分析（针对整组文件）：
+
+1. 外部输入点枚举与可达性：web/routes.go L11 `r.URL.Query().Get('name')` 与 L12 `r.URL.Query().Get('sort')` 是仅有的两个外部输入点，均在 L13 经 `repo.FindUsers` 传入 internal/repo/repo.go，最终汇于 repo.go L20 `conn.Query(ctx, q)` 这一 SQL 执行 sink，两条链路均可达。
+2. 数据流1（name 主链）防御验证：repo.go L16 调用 sanitize.SanitizeSQL，sanitize.go L17 进入 L29 `QuoteString`，其唯一防御是 `strings.ReplaceAll(s, "'", "''")`——属黑名单式字符串替换过滤，按规则视为可绕过；且未处理反斜杠与 `E''` 转义串语法，在 `standard_conforming_strings=off` 或转义串场景下攻击者可用反斜杠逃逸引号注入任意 SQL，净化位置在中间文件、覆盖面仅限单引号一个字符，不构成有效防御。
+3. 数据流2（sort）防御验证：repo.go L15 将 sort 直接字符串拼接进 `ORDER BY` 子句，全链无任何过滤、白名单或参数化，属于零防御直达 sink。
+4. 第二入口与替代通道核查：除 /api/users 路由的 name、sort 两个参数外无其他路由或输入通道；`repo.FindUsers` 仅被 `ListUsers` 唯一调用，`conn.Query` 仅在 repo.go L20 出现；即存在同一路由上的第二输入点（sort），且两条 source→sink 数据流均无完整防御，支撑 CWE-89 注入成立的结论。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "Critical", "source": "L1:line 11: r.URL.Query().Get('name') 外部 HTTP 查询参数", "sink": "L3:line 20: conn.Query(ctx, q) 执行拼接后的 SQL", "explanation": "数据流1: routes.go L11 读取 name 为可控 source, 经 L13 进入 repo.go L16 sanitize.SanitizeSQL, 在 sanitize.go L29 QuoteString 仅用 strings.ReplaceAll 双写单引号做黑名单式字符串替换, 未处理反斜杠与 E'' 转义语法, 在 standard_conforming_strings=off 或转义串场景可反斜杠逃逸注入任意 SQL, 该净化不完整不算有效防御, 最终达 repo.go L20 conn.Query 执行; 数据流2: routes.go L12 的 sort 为第二入口, 在 repo.go L15 直接拼接进 ORDER BY 子句, 全链零净化直达 L20 sink; 防御核查: 全链仅 QuoteString 一处过滤且属可绕过的字符串替换类, 无参数化绑定、无标识符白名单; 第二入口核查: 除 /api/users 的 name 与 sort 外无其他路由或间接调用, repo.FindUsers 仅被 ListUsers 调用, 两条数据流均可达 sink, CWE-89 成立", "fix_suggestion": "line 20: 放弃自实现转义与拼接, 改用 pgx 参数化查询 conn.Query(ctx, 'SELECT name FROM users WHERE name = $1 ORDER BY ' + col, name), 其中 sort 先经列名白名单映射为 col 后方可拼入"}
+
+### id=8507 teacher=unknown flags=[safe_but_cwe_in_expl]
+[ANALYSIS]
+2. 安全分析
+
+1. **入口收口**：攻击者完全可控的 `url` 在 `app/routes.py:12` 被读取并经 `app/routes.py:14` 传入 `register_webhook`；修复版在 `app/services.py:9` 于写入 `_WEBHOOKS`（`app/services.py:10`）之前先调用 `validate_webhook_url(url)`，校验失败即抛出 ValueError，恶意 URL 根本不会入库；可被 `0177.0.0.1`、`[::1]`、`localtest.me`、`2130706433` 等写法绕过的黑名单正则 `_BLOCKLIST` 已整体删除，项目中不存在残留的单点正则防御。
+
+2. **白名单机制**：`validate_webhook_url`（`app/delivery.py:19-34`）采用精确允许集——scheme 必须属于 `_ALLOWED_SCHEMES = {"https"}`（定义于 `app/delivery.py:10`，检查于 `app/delivery.py:23-24`），直接封死 `file://`、`gopher://`、`dict://` 及明文 `http://`；随后 `app/delivery.py:29` 用 `socket.getaddrinfo` 真实解析域名，`app/delivery.py:32-33` 对解析出的每一个地址执行 `_assert_public_ip`（`app/delivery.py:15-16`），仅放行全球可路由的非组播 IP。判定对象是解析后的 `ipaddress` 对象而非 URL 文本，因此 IPv6 回环、169.254.0.0/16、CGNAT、保留网段无论用何种编码书写都会被拦截。
+
+3. **汇聚点二次校验**：真正的 SINK `send_webhook`（`app/delivery.py:37`）在发起出站请求前于 `app/delivery.py:39` 重新执行同一 `validate_webhook_url`，`app/delivery.py:40` 的 `_session.post` 只有在校验通过后才会执行；请求时刻的二次解析校验同时压缩了 DNS rebinding 的 TOCTOU 窗口。
+
+4. **重定向旁路封堵**：原代码 `_session.post` 默认跟随重定向，攻击者可先注册一个合法外网 URL，再借 302 跳转把请求引向内网目标；`app/delivery.py:40` 增加 `allow_redirects=False`，确保实际连接的始终是经过校验的那个 URL，该替代通道被同一防御覆盖。
+
+5. **第二入口核查**：另一条路由 `fire_event`（`app/routes.py:18-22`）与 `dispatch_event`（`app/services.py:14-17`）只是把存量 URL 透传给 `send_webhook`；由于防御内置于 SINK 本身，无论是先注册后触发的主流程、任何模块对 `send_webhook` 的直接构造调用，还是透传循环，都必须经过 `app/delivery.py:39` 的同一道白名单闸门。全项目不存在绕过校验直达 `_session.post` 的路径，SSRF（CWE-918）数据流在入口与出口两处被独立阻断，确认无绕过后判定漏洞已消除。
+
+3. 结论
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "原 SSRF（CWE-918）数据流：攻击者在 POST /api/webhooks 传入的 url -> register_webhook 在 services.py 第9行先调用 validate_webhook_url 做白名单校验 -> 仅允许 https 方案且 getaddrinfo 解析出的全部 IP 必须为全球可路由地址 -> 通过后 URL 才被存入 _WEBHOOKS -> 触发事件时 send_webhook 在 delivery.py 第39行出站前再次执行同一校验 -> 第40行关闭重定向跟随以防 302 跳转内网 -> _session.post 仅在双重白名单通过后才会发起请求 -> 旧的黑名单正则已删除，0177.0.0.1、[::1]、localtest.me 等文本绕过全部被解析后的 IP 级检查拦截", "fix_suggestion": "no fix needed"}

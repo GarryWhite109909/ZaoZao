@@ -2,503 +2,310 @@ batch=216 样本数=2
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=8179 lang=go
+### id=8163 lang=python
 [CODE]
-   1| // Copyright 2017 The Gitea Authors. All rights reserved.
-   2| // SPDX-License-Identifier: MIT
-   3| 
-   4| package repo
-   5| 
-   6| import (
-   7| 	"net/http"
+   1| """Local backup support for Core and Container installations."""
+   2| 
+   3| from collections.abc import AsyncIterator, Callable, Coroutine
+   4| import json
+   5| from pathlib import Path
+   6| from tarfile import TarError
+   7| from typing import Any
    8| 
-   9| 	auth_model "gitea.dev/models/auth"
-  10| 	issues_model "gitea.dev/models/issues"
-  11| 	access_model "gitea.dev/models/perm/access"
-  12| 	repo_model "gitea.dev/models/repo"
-  13| 	"gitea.dev/models/unit"
-  14| 	"gitea.dev/modules/httpcache"
-  15| 	"gitea.dev/modules/httplib"
-  16| 	"gitea.dev/modules/log"
-  17| 	"gitea.dev/modules/setting"
-  18| 	"gitea.dev/modules/storage"
-  19| 	"gitea.dev/services/attachment"
-  20| 	"gitea.dev/services/context"
-  21| 	"gitea.dev/services/context/upload"
-  22| 	repo_service "gitea.dev/services/repository"
-  23| )
-  24| 
-  25| func attachmentReadScope(unitType unit.Type) (auth_model.AccessTokenScope, bool) {
-  26| 	switch unitType {
-  27| 	case unit.TypeIssues, unit.TypePullRequests:
-  28| 		return auth_model.AccessTokenScopeReadIssue, true
-  29| 	case unit.TypeReleases:
-  30| 		return auth_model.AccessTokenScopeReadRepository, true
-  31| 	default:
-  32| 		return "", false
-  33| 	}
-  34| }
-  35| 
-  36| // UploadIssueAttachment response for Issue/PR attachments
-  37| func UploadIssueAttachment(ctx *context.Context) {
-  38| 	uploadAttachment(ctx, ctx.Repo.Repository.ID, attachment.UploadAttachmentForIssue)
-  39| }
+   9| from homeassistant.core import HomeAssistant
+  10| from homeassistant.helpers.hassio import is_hassio
+  11| 
+  12| from .agent import BackupAgent, LocalBackupAgent, OnProgressCallback
+  13| from .const import DOMAIN, LOGGER
+  14| from .models import AgentBackup, BackupNotFound, InvalidBackupFilename
+  15| from .util import read_backup, suggested_filename
+  16| 
+  17| 
+  18| async def async_get_backup_agents(
+  19|     hass: HomeAssistant,
+  20|     **kwargs: Any,
+  21| ) -> list[BackupAgent]:
+  22|     """Return the local backup agent."""
+  23|     if is_hassio(hass):
+  24|         return []
+  25|     return [CoreLocalBackupAgent(hass)]
+  26| 
+  27| 
+  28| class CoreLocalBackupAgent(LocalBackupAgent):
+  29|     """Local backup agent for Core and Container installations."""
+  30| 
+  31|     domain = DOMAIN
+  32|     name = "local"
+  33|     unique_id = "local"
+  34| 
+  35|     def __init__(self, hass: HomeAssistant) -> None:
+  36|         """Initialize the backup agent."""
+  37|         super().__init__()
+  38|         self._hass = hass
+  39|         self._backup_dir = Path(hass.config.path("backups"))
+  40|         self._backups: dict[str, tuple[AgentBackup, Path]] = {}
+  41|         self._loaded_backups = False
+  42| 
+  43|     async def _load_backups(self) -> None:
+  44|         """Load data of stored backup files."""
+  45|         backups = await self._hass.async_add_executor_job(self._read_backups)
+  46|         LOGGER.debug("Loaded %s local backups", len(backups))
+  47|         self._backups = backups
+  48|         self._loaded_backups = True
+  49| 
+  50|     def _read_backups(self) -> dict[str, tuple[AgentBackup, Path]]:
+  51|         """Read backups from disk."""
+  52|         backups: dict[str, tuple[AgentBackup, Path]] = {}
+  53|         for backup_path in self._backup_dir.glob("*.tar"):
+  54|             try:
+  55|                 backup = read_backup(backup_path)
+  56|                 backups[backup.backup_id] = (backup, backup_path)
+  57|             except (
+  58|                 OSError,
+  59|                 TarError,
+  60|                 json.JSONDecodeError,
+  61|                 KeyError,
+  62|                 InvalidBackupFilename,
+  63|             ) as err:
+  64|                 LOGGER.warning("Unable to read backup %s: %s", backup_path, err)
+  65|         return backups
+  66| 
+  67|     async def async_download_backup(
+  68|         self,
+  69|         backup_id: str,
+  70|         **kwargs: Any,
+  71|     ) -> AsyncIterator[bytes]:
+  72|         """Download a backup file."""
+  73|         raise NotImplementedError
+  74| 
+  75|     async def async_upload_backup(
+  76|         self,
+  77|         *,
+  78|         open_stream: Callable[[], Coroutine[Any, Any, AsyncIterator[bytes]]],
+  79|         backup: AgentBackup,
+  80|         on_progress: OnProgressCallback,
+  81|         **kwargs: Any,
+  82|     ) -> None:
+  83|         """Upload a backup."""
+  84|         self._backups[backup.backup_id] = (backup, self.get_new_backup_path(backup))
+  85| 
+  86|     async def async_list_backups(self, **kwargs: Any) -> list[AgentBackup]:
+  87|         """List backups."""
+  88|         if not self._loaded_backups:
+  89|             await self._load_backups()
+  90|         return [backup for backup, _ in self._backups.values()]
+  91| 
+  92|     async def async_get_backup(
+  93|         self,
+  94|         backup_id: str,
+  95|         **kwargs: Any,
+  96|     ) -> AgentBackup:
+  97|         """Return a backup."""
+  98|         if not self._loaded_backups:
+  99|             await self._load_backups()
+ 100| 
+ 101|         if backup_id not in self._backups:
+ 102|             raise BackupNotFound(f"Backup {backup_id} not found")
+ 103| 
+ 104|         backup, backup_path = self._backups[backup_id]
+ 105|         if not await self._hass.async_add_executor_job(backup_path.exists):
+ 106|             LOGGER.debug(
+ 107|                 (
+ 108|                     "Removing tracked backup (%s) that does not exists on the expected"
+ 109|                     " path %s"
+ 110|                 ),
+ 111|                 backup.backup_id,
+ 112|                 backup_path,
+ 113|             )
+ 114|             self._backups.pop(backup_id)
+ 115|             raise BackupNotFound(f"Backup {backup_id} not found")
+ 116| 
+ 117|         return backup
+ 118| 
+ 119|     def get_backup_path(self, backup_id: str) -> Path:
+ 120|         """Return the local path to an existing backup.
+ 121| 
+ 122|         Raises BackupAgentError if the backup does not exist.
+ 123|         """
+ 124|         try:
+ 125|             return self._backups[backup_id][1]
+ 126|         except KeyError as err:
+ 127|             raise BackupNotFound(f"Backup {backup_id} does not exist") from err
+ 128| 
+ 129|     def get_new_backup_path(self, backup: AgentBackup) -> Path:
+ 130|         """Return the local path to a new backup."""
+ 131|         candidate = self._backup_dir / suggested_filename(backup)
+ 132|         # suggested_filename does not strip separators; refuse paths that would
+ 133|         # land outside the backup directory.
+ 134|         if candidate.parent != self._backup_dir:
+ 135|             raise InvalidBackupFilename(
+ 136|                 f"Refusing to write outside {self._backup_dir}: {candidate}"
+ 137|             )
+ 138|         return candidate
+ 139| 
+ 140|     async def async_delete_backup(self, backup_id: str, **kwargs: Any) -> None:
+ 141|         """Delete a backup file."""
+ 142|         if not self._loaded_backups:
+ 143|             await self._load_backups()
+ 144| 
+ 145|         backup_path = self.get_backup_path(backup_id)
+ 146|         await self._hass.async_add_executor_job(backup_path.unlink, True)
+ 147|         LOGGER.debug("Deleted backup located at %s", backup_path)
+ 148|         self._backups.pop(backup_id)
+ 149| 
+ 150| 
+
+### id=8203 lang=go
+[CODE]
+   1| package main
+   2| 
+   3| import (
+   4| 	"html/template"
+   5| 	"net/http"
+   6| 	"os"
+   7| )
+   8| 
+   9| var reportTmpl = `<!DOCTYPE html>
+  10| <html><body>
+  11| <h1>Report for {{.Name}}</h1>
+  12| {{.Body}}
+  13| </body></html>`
+  14| 
+  15| // 白名单：仅允许内置模板，禁止任何用户提供的模板源
+  16| var allowedTemplates = map[string]string{
+  17| 	"default": reportTmpl,
+  18| }
+  19| 
+  20| func renderHandler(w http.ResponseWriter, r *http.Request) {
+  21| 	name := r.URL.Query().Get("name")
+  22| 	body := r.URL.Query().Get("body")
+  23| 
+  24| 	tmplSrc := os.Getenv("REPORT_TEMPLATE")
+  25| 	if tmplSrc == "" {
+  26| 		tmplSrc = reportTmpl
+  27| 	}
+  28| 
+  29| 	// 修复：不再接受 ?template= 覆盖模板内容；
+  30| 	// 仅允许通过白名单选择预定义模板，杜绝 SSTI
+  31| 	tmplKey := r.URL.Query().Get("template")
+  32| 	if tmplKey != "" {
+  33| 		src, ok := allowedTemplates[tmplKey]
+  34| 		if !ok {
+  35| 			http.Error(w, "unknown template", http.StatusBadRequest)
+  36| 			return
+  37| 		}
+  38| 		tmplSrc = src
+  39| 	}
   40| 
-  41| // UploadReleaseAttachment response for uploading release attachments
-  42| func UploadReleaseAttachment(ctx *context.Context) {
-  43| 	uploadAttachment(ctx, ctx.Repo.Repository.ID, attachment.UploadAttachmentForRelease)
-  44| }
-  45| 
-  46| // UploadAttachment response for uploading attachments
-  47| func uploadAttachment(ctx *context.Context, repoID int64, uploadFunc attachment.UploadAttachmentFunc) {
-  48| 	if !setting.Attachment.Enabled {
-  49| 		ctx.HTTPError(http.StatusNotFound, "attachment is not enabled")
+  41| 	t, err := template.New("report").Parse(tmplSrc)
+  42| 	if err != nil {
+  43| 		http.Error(w, "invalid template", http.StatusBadRequest)
+  44| 		return
+  45| 	}
+  46| 
+  47| 	data := map[string]string{"Name": name, "Body": body}
+  48| 	if err := t.Execute(w, data); err != nil {
+  49| 		http.Error(w, "render error", http.StatusInternalServerError)
   50| 		return
   51| 	}
-  52| 
-  53| 	file, header, err := ctx.Req.FormFile("file")
-  54| 	if err != nil {
-  55| 		ctx.ServerError("FormFile", err)
-  56| 		return
-  57| 	}
-  58| 	defer file.Close()
-  59| 
-  60| 	uploaderFile := attachment.NewLimitedUploaderKnownSize(file, header.Size)
-  61| 	attach, err := uploadFunc(ctx, uploaderFile, &repo_model.Attachment{
-  62| 		Name:       header.Filename,
-  63| 		UploaderID: ctx.Doer.ID,
-  64| 		RepoID:     repoID,
-  65| 	})
-  66| 	if err != nil {
-  67| 		if upload.IsErrFileTypeForbidden(err) {
-  68| 			ctx.HTTPError(http.StatusBadRequest, err.Error())
-  69| 			return
-  70| 		}
-  71| 		ctx.ServerError("uploadAttachment(uploadFunc)", err)
-  72| 		return
-  73| 	}
-  74| 
-  75| 	log.Trace("New attachment uploaded: %s", attach.UUID)
-  76| 	ctx.JSON(http.StatusOK, map[string]string{
-  77| 		"uuid": attach.UUID,
-  78| 	})
-  79| }
-  80| 
-  81| // DeleteAttachment response for deleting issue's attachment
-  82| func DeleteAttachment(ctx *context.Context) {
-  83| 	file := ctx.FormString("file")
-  84| 	attach, err := repo_model.GetAttachmentByUUID(ctx, file)
-  85| 	if err != nil {
-  86| 		ctx.HTTPError(http.StatusBadRequest, err.Error())
-  87| 		return
-  88| 	}
-  89| 
-  90| 	if !ctx.IsSigned {
-  91| 		ctx.HTTPError(http.StatusForbidden)
-  92| 		return
-  93| 	}
-  94| 
-  95| 	if attach.RepoID != ctx.Repo.Repository.ID {
-  96| 		ctx.HTTPError(http.StatusBadRequest, "attachment does not belong to this repository")
-  97| 		return
-  98| 	}
-  99| 
- 100| 	if ctx.Doer.ID != attach.UploaderID {
- 101| 		if attach.IssueID > 0 {
- 102| 			issue, err := issues_model.GetIssueByID(ctx, attach.IssueID)
- 103| 			if err != nil {
- 104| 				ctx.ServerError("GetIssueByID", err)
- 105| 				return
- 106| 			}
- 107| 			if !ctx.Repo.Permission.CanWriteIssuesOrPulls(issue.IsPull) {
- 108| 				ctx.HTTPError(http.StatusForbidden)
- 109| 				return
- 110| 			}
- 111| 		} else if attach.ReleaseID > 0 {
- 112| 			if !ctx.Repo.Permission.CanWrite(unit.TypeReleases) {
- 113| 				ctx.HTTPError(http.StatusForbidden)
- 114| 				return
- 115| 			}
- 116| 		} else {
- 117| 			if !ctx.Repo.Permission.IsAdmin() && !ctx.Repo.Permission.IsOwner() {
- 118| 				ctx.HTTPError(http.StatusForbidden)
- 119| 				return
- 120| 			}
- 121| 		}
- 122| 	}
- 123| 
- 124| 	err = repo_model.DeleteAttachment(ctx, attach, true)
- 125| 	if err != nil {
- 126| 		ctx.ServerError("DeleteAttachment", err)
- 127| 		return
- 128| 	}
- 129| 	ctx.JSON(http.StatusOK, map[string]string{
- 130| 		"uuid": attach.UUID,
- 131| 	})
- 132| }
- 133| 
- 134| // ServeAttachment serve attachments with the given UUID
- 135| func ServeAttachment(ctx *context.Context, uuid string) {
- 136| 	attach, err := repo_model.GetAttachmentByUUID(ctx, uuid)
- 137| 	if err != nil {
- 138| 		if repo_model.IsErrAttachmentNotExist(err) {
- 139| 			ctx.HTTPError(http.StatusNotFound)
- 140| 		} else {
- 141| 			ctx.ServerError("GetAttachmentByUUID", err)
- 142| 		}
- 143| 		return
- 144| 	}
- 145| 
- 146| 	// prevent visiting attachment from other repository directly
- 147| 	// The check will be ignored before this code merged.
- 148| 	if attach.CreatedUnix > repo_model.LegacyAttachmentMissingRepoIDCutoff && ctx.Repo.Repository != nil && ctx.Repo.Repository.ID != attach.RepoID {
- 149| 		ctx.HTTPError(http.StatusNotFound)
- 150| 		return
- 151| 	}
- 152| 
- 153| 	unitType, repoID, err := repo_service.GetAttachmentLinkedTypeAndRepoID(ctx, attach)
- 154| 	if err != nil {
- 155| 		ctx.ServerError("GetAttachmentLinkedTypeAndRepoID", err)
- 156| 		return
- 157| 	}
- 158| 
- 159| 	if unitType == unit.TypeInvalid { // unlinked attachment can only be accessed by the uploader
- 160| 		if !(ctx.IsSigned && attach.UploaderID == ctx.Doer.ID) { // We block if not the uploader
- 161| 			ctx.HTTPError(http.StatusNotFound)
- 162| 			return
- 163| 		}
- 164| 	} else { // If we have the linked type, we need to check access
- 165| 		var (
- 166| 			perm access_model.Permission
- 167| 			repo = ctx.Repo.Repository
- 168| 		)
- 169| 		if repo == nil {
- 170| 			repo, err = repo_model.GetRepositoryByID(ctx, repoID)
- 171| 			if err != nil {
- 172| 				ctx.ServerError("GetRepositoryByID", err)
- 173| 				return
- 174| 			}
- 175| 			perm, err = access_model.GetDoerRepoPermission(ctx, repo, ctx.Doer)
- 176| 			if err != nil {
- 177| 				ctx.ServerError("GetDoerRepoPermission", err)
- 178| 				return
- 179| 			}
- 180| 		} else {
- 181| 			perm = ctx.Repo.Permission
- 182| 		}
- 183| 
- 184| 		if !perm.CanRead(unitType) {
- 185| 			ctx.HTTPError(http.StatusNotFound)
- 186| 			return
- 187| 		}
- 188| 
- 189| 		if requiredScope, ok := attachmentReadScope(unitType); ok {
- 190| 			context.CheckTokenScopes(ctx, repo, requiredScope)
- 191| 			if ctx.Written() {
- 192| 				return
- 193| 			}
- 194| 		}
- 195| 	}
- 196| 
- 197| 	if err := attach.IncreaseDownloadCount(ctx); err != nil {
- 198| 		ctx.ServerError("IncreaseDownloadCount", err)
- 199| 		return
- 200| 	}
- 201| 
- 202| 	if setting.Attachment.Storage.ServeDirect() {
- 203| 		// If we have a signed url (S3, object storage), redirect to this directly.
- 204| 		u, err := storage.Attachments.ServeDirectURL(attach.RelativePath(), attach.Name, ctx.Req.Method, nil)
- 205| 
- 206| 		if u != nil && err == nil {
- 207| 			ctx.Redirect(u.String())
- 208| 			return
- 209| 		}
- 210| 	}
- 211| 
- 212| 	if httpcache.HandleGenericETagPrivateCache(ctx.Req, ctx.Resp, `"`+attach.UUID+`"`, attach.CreatedUnix.AsTimePtr()) {
- 213| 		return
- 214| 	}
- 215| 
- 216| 	// If we have matched and access to release or issue
- 217| 	fr, err := storage.Attachments.Open(attach.RelativePath())
- 218| 	if err != nil {
- 219| 		ctx.ServerError("Open", err)
- 220| 		return
- 221| 	}
- 222| 	defer fr.Close()
- 223| 
- 224| 	httplib.ServeUserContentByFile(ctx.Req, ctx.Resp, fr, httplib.ServeHeaderOptions{Filename: attach.Name})
- 225| }
- 226| 
- 227| // GetAttachment serve attachments
- 228| func GetAttachment(ctx *context.Context) {
- 229| 	ServeAttachment(ctx, ctx.PathParam("uuid"))
- 230| }
- 231| 
- 232| 
-
-### id=8180 lang=go
-[CODE]
-   1| // Copyright 2022 The Gitea Authors. All rights reserved.
-   2| // SPDX-License-Identifier: MIT
-   3| 
-   4| package repo
-   5| 
-   6| import (
-   7| 	"context"
-   8| 	"strings"
-   9| 
-  10| 	"gitea.dev/models/db"
-  11| 	"gitea.dev/models/organization"
-  12| 	"gitea.dev/models/perm"
-  13| 	"gitea.dev/models/unit"
-  14| 	user_model "gitea.dev/models/user"
-  15| 	"gitea.dev/modules/container"
-  16| 
-  17| 	"xorm.io/builder"
-  18| )
-  19| 
-  20| type StarredReposOptions struct {
-  21| 	db.ListOptions
-  22| 	StarrerID      int64
-  23| 	RepoOwnerID    int64
-  24| 	IncludePrivate bool
-  25| }
-  26| 
-  27| func (opts *StarredReposOptions) ApplyPublicOnly(publicOnly bool) {
-  28| 	if publicOnly {
-  29| 		opts.IncludePrivate = false
-  30| 	}
-  31| }
-  32| 
-  33| func (opts *StarredReposOptions) ToConds() builder.Cond {
-  34| 	var cond builder.Cond = builder.Eq{
-  35| 		"star.uid": opts.StarrerID,
-  36| 	}
-  37| 	if opts.RepoOwnerID != 0 {
-  38| 		cond = cond.And(builder.Eq{
-  39| 			"repository.owner_id": opts.RepoOwnerID,
-  40| 		})
-  41| 	}
-  42| 	if !opts.IncludePrivate {
-  43| 		cond = cond.And(builder.Eq{
-  44| 			"repository.is_private": false,
-  45| 		})
-  46| 	}
-  47| 	return cond
-  48| }
-  49| 
-  50| func (opts *StarredReposOptions) ToJoins() []db.JoinFunc {
-  51| 	return []db.JoinFunc{
-  52| 		func(e db.Engine) error {
-  53| 			e.Join("INNER", "star", "`repository`.id=`star`.repo_id")
-  54| 			return nil
-  55| 		},
-  56| 	}
+  52| }
+  53| 
+  54| func main() {
+  55| 	http.HandleFunc("/report", renderHandler)
+  56| 	http.ListenAndServe(":8080", nil)
   57| }
   58| 
-  59| // GetStarredRepos returns the repos starred by a particular user
-  60| func GetStarredRepos(ctx context.Context, opts *StarredReposOptions) ([]*Repository, error) {
-  61| 	return db.Find[Repository](ctx, opts)
-  62| }
-  63| 
-  64| type WatchedReposOptions struct {
-  65| 	db.ListOptions
-  66| 	WatcherID      int64
-  67| 	RepoOwnerID    int64
-  68| 	IncludePrivate bool
-  69| }
-  70| 
-  71| func (opts *WatchedReposOptions) ApplyPublicOnly(publicOnly bool) {
-  72| 	if publicOnly {
-  73| 		opts.IncludePrivate = false
-  74| 	}
-  75| }
-  76| 
-  77| func (opts *WatchedReposOptions) ToConds() builder.Cond {
-  78| 	var cond builder.Cond = builder.Eq{
-  79| 		"watch.user_id": opts.WatcherID,
-  80| 	}
-  81| 	if opts.RepoOwnerID != 0 {
-  82| 		cond = cond.And(builder.Eq{
-  83| 			"repository.owner_id": opts.RepoOwnerID,
-  84| 		})
-  85| 	}
-  86| 	if !opts.IncludePrivate {
-  87| 		cond = cond.And(builder.Eq{
-  88| 			"repository.is_private": false,
-  89| 		})
-  90| 	}
-  91| 	return cond.And(builder.Neq{
-  92| 		"watch.mode": WatchModeDont,
-  93| 	})
-  94| }
-  95| 
-  96| func (opts *WatchedReposOptions) ToJoins() []db.JoinFunc {
-  97| 	return []db.JoinFunc{
-  98| 		func(e db.Engine) error {
-  99| 			e.Join("INNER", "watch", "`repository`.id=`watch`.repo_id")
- 100| 			return nil
- 101| 		},
- 102| 	}
- 103| }
- 104| 
- 105| // GetWatchedRepos returns the repos watched by a particular user
- 106| func GetWatchedRepos(ctx context.Context, opts *WatchedReposOptions) ([]*Repository, int64, error) {
- 107| 	return db.FindAndCount[Repository](ctx, opts)
- 108| }
- 109| 
- 110| // GetRepoAssignees returns all users that have write access and can be assigned to issues or pull-requests of the repository,
- 111| func GetRepoAssignees(ctx context.Context, repo *Repository) (_ []*user_model.User, err error) {
- 112| 	if err = repo.LoadOwner(ctx); err != nil {
- 113| 		return nil, err
- 114| 	}
- 115| 
- 116| 	e := db.GetEngine(ctx)
- 117| 	userIDs := make([]int64, 0, 10)
- 118| 	if err = e.Table("access").
- 119| 		Where("repo_id = ? AND mode >= ?", repo.ID, perm.AccessModeWrite).
- 120| 		Select("user_id").
- 121| 		Find(&userIDs); err != nil {
- 122| 		return nil, err
- 123| 	}
- 124| 
- 125| 	uniqueUserIDs := make(container.Set[int64])
- 126| 	uniqueUserIDs.AddMultiple(userIDs...)
- 127| 
- 128| 	if repo.Owner.IsOrganization() {
- 129| 		// issues and pull requests both need "assignee list"
- 130| 		additionalUserIDs, err := organization.GetTeamUserIDsWithAccessToAnyRepoUnit(ctx, repo.OwnerID, repo.ID, perm.AccessModeRead, unit.TypeIssues, unit.TypePullRequests)
- 131| 		if err != nil {
- 132| 			return nil, err
- 133| 		}
- 134| 		uniqueUserIDs.AddMultiple(additionalUserIDs...)
- 135| 	}
- 136| 
- 137| 	// Leave a seat for owner itself to append later, but if owner is an organization
- 138| 	// and just waste 1 unit is cheaper than re-allocate memory once.
- 139| 	users := make([]*user_model.User, 0, len(uniqueUserIDs)+1)
- 140| 	if len(uniqueUserIDs) > 0 {
- 141| 		if err = e.In("id", uniqueUserIDs.Values()).
- 142| 			Where(builder.Eq{"`user`.is_active": true}).
- 143| 			OrderBy(user_model.GetOrderByName()).
- 144| 			Find(&users); err != nil {
- 145| 			return nil, err
- 146| 		}
- 147| 	}
- 148| 	if !repo.Owner.IsOrganization() && !uniqueUserIDs.Contains(repo.OwnerID) {
- 149| 		users = append(users, repo.Owner)
- 150| 	}
- 151| 
- 152| 	return users, nil
- 153| }
- 154| 
- 155| // GetIssuePostersWithSearch returns users with limit of 30 whose username started with prefix that have authored an issue/pull request for the given repository
- 156| // It searches with the "user.name" and "user.full_name" fields case-insensitively.
- 157| func GetIssuePostersWithSearch(ctx context.Context, repo *Repository, isPull bool, search string) ([]*user_model.User, error) {
- 158| 	users := make([]*user_model.User, 0, 30)
- 159| 
- 160| 	cond := builder.In("`user`.id",
- 161| 		builder.Select("poster_id").From("issue").Where(
- 162| 			builder.Eq{"repo_id": repo.ID}.
- 163| 				And(builder.Eq{"is_pull": isPull}),
- 164| 		).GroupBy("poster_id"))
- 165| 
- 166| 	if search != "" {
- 167| 		var prefixCond builder.Cond = builder.Like{"lower_name", strings.ToLower(search) + "%"}
- 168| 		prefixCond = prefixCond.Or(db.BuildCaseInsensitiveLike("full_name", "%"+search+"%"))
- 169| 		cond = cond.And(prefixCond)
- 170| 	}
- 171| 
- 172| 	return users, db.GetEngine(ctx).
- 173| 		Where(cond).
- 174| 		Cols("id", "name", "full_name", "avatar", "avatar_email", "use_custom_avatar").
- 175| 		OrderBy("name").
- 176| 		Limit(30).
- 177| 		Find(&users)
- 178| }
- 179| 
- 180| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=8179 teacher=unknown flags=[]
+### id=8163 teacher=unknown flags=[]
 [ANALYSIS]
-# 编号分析
+# 全文逐函数安全分析
 
-1. **读取路径的权限形状**：ServeAttachment（第 135 行）从路由拿到 uuid 后经 GetAttachmentLinkedTypeAndRepoID 建立附件与 Release/Issue 的归属映射；随后唯一的访问闸门是第 184 行 perm.CanRead(unitType)。它验证的是用户对仓库 releases 单元的读权，从不追问附件所属的 release 是否已经公开。
+## 1. 模块导入与初始化（第 1–17 行）
 
-2. **草稿态的生命周期语义**：release 草稿与 pre-release 在 Gitea 语境里仅维护团队可见；附属于它们的产物应继承同样的可见度。本文件的门控矩阵却把生命周期维度整体遗漏——附件在草稿创建的那一刻起即可被任何持仓库读权的账号经 uuid 访问。
+第 1–13 行仅导入标准库与 Home Assistant 内部模块（`tarfile`、`json`、`pathlib` 等），无动态导入、无 `eval/exec/pickle`、无网络库。第 17 行 `async_get_backup_agents` 是代理工厂入口：第 18 行通过 `is_hassio(hass)` 判断环境，仅在非 HassIO（Core/Container）安装时返回 `CoreLocalBackupAgent`（第 20 行）。该入口不接收用户可控参数，无数据流。
 
-3. **uuid 外泄的现实渠道**：uuid 虽非顺序号，但其流通面远比想象宽——维护者在公告或 issue 里预贴过链接、协作通知的邮件摘要、浏览器历史与会话记录都可能留痕；撤回草稿并不回收这些散布点。攻击者获得 uuid 后无需任何额外能力即可换取未公开内容。
+## 2. `__init__`（第 23–31 行）
 
-4. **下载出口的分流不改变结论**：第 202–210 行当存储后端支持直链时走 ServeDirectURL 重定向，否则第 217 行流式 Open。两支都位于 CanRead 之后，因此无论哪一支，缺失的状态过滤都同样成立；对象存储的直链 URL 还可能因预签名缓存而在删除动作后留下可访问残影，使撤回操作更不彻底。
+第 29 行 `self._backup_dir = Path(hass.config.path("backups"))`，路径来自 HA 配置目录拼接固定子目录 `"backups"`，不含任何外部输入。`self._backups` 字典初始为空。此函数无 source→sink 流。
 
-5. **写侧对照暴露的不对称**：上传入口用 NewLimitedUploaderKnownSize 约束体积（第 60 行），删除分支要求 UploaderID 本人或相应单元写权（第 100 行附近）。写入面的控制齐整，唯独读面漏了生命周期检查——缝隙出现在防御密度由强转弱的交界处，符合典型的不对称失误模式。
+## 3. `_load_backups` / `_read_backups`（第 33–51 行）
 
-6. **修复方向**：TypeReleases 分支内补查关联 Release 的 IsDraft 与 IsPreRelease 标志，非维护者视角按不存在返回 404；同时给草稿期对外分发的附件 URL 引入带有效期的签名 token，从传播源头抑制 uuid 的长尾扩散。
+- 第 35 行：通过 executor 在线程池中调用 `_read_backups`，避免阻塞事件循环。
+- 第 42 行：`self._backup_dir.glob("*.tar")` 仅枚举备份目录下 `.tar` 后缀文件；glob 模式为硬编码常量，不受用户控制。
+- 第 44 行 `read_backup(backup_path)` 是关键 sink 候选——它解析 tar 文件内容。但需注意：
+  - **source**：磁盘上的 tar 文件本身。能放置文件的攻击者已具备本地文件写权限（本地攻击前提），且这些文件正是系统自身创建的备份。
+  - **防御**：第 45–50 行用宽泛的 `except (OSError, TarError, json.JSONDecodeError, KeyError, InvalidBackupFilename)` 捕获解析失败并降级为日志告警，恶意/损坏文件不会导致崩溃或被采纳为有效备份条目（除非其元数据合法可解析）。`read_backup` 内部（util 模块）负责校验文件名合法性并抛出 `InvalidBackupFilename`，此处正确处理了该异常。
+  - 解析结果仅写入内存字典 `backups[backup.backup_id]`（第 46 行），key 为 backup_id 而非路径，后续取路径均经由字典回查。
 
+## 4. `async_download_backup`（第 53–58 行）
 
-7. **内层护栏的反证价值**：第 159–163 行对未关联附件强制要求访问者恰为上传者本人，说明作者完全具备区分敏感可见度的意识；linked 分支却直接信任仓库单元权限。同文件内两种紧度的并存强烈暗示 release 状态过滤属于实施疏漏而非有意取舍——这也让修复无需重新设计，只需把既有严格风格延伸一个字段。
+直接 `raise NotImplementedError`（第 58 行）。Core 安装不支持下载流，无 sink。注意这同时消除了“按 backup_id 直接读任意路径文件”的通道——下载功能不存在于本 agent。
 
-8. **缓存层的状态滞后放大**：第 212 行以 uuid 与创建时间生成 ETag 私有缓存；客户端与代理一旦缓存了成功响应，即使管理员随后发现越权并修补服务器端过滤，历史命中的条件请求仍会在一段时间内返回内容。修复方案需要同步考虑失效策略，否则补丁上线后仍存在观察窗口。
+## 5. `async_upload_backup`（第 60–68 行）
 
-9. **审计维度的缺口**：整个读取路径没有针对“非维护者访问 draft 关联附件”这一异常组合的专用记录，事后无法回答谁在何时取走了哪些未公开材料。将生命周期状态纳入访问日志的结构化字段，是把本次缺陷转化为长期观测能力的低成本投资。
+入口点：接收 `open_stream` 回调、`AgentBackup` 对象、进度回调。第 67 行将 `(backup, self.get_new_backup_path(backup))` 写入 `self._backups` 字典。这里存在一个值得审视的点：
 
-10. **沿调用链的纵深推演**：越权访问不止步于一次取件——attachment 的 UUID 同时出现在 issue 评论区渲染流程与 API 分页列表里，攻击者可用同一 uuid 在公开界面上反向确认归属，再借助 issue 上下文推断 release 内容主题；元数据与内容的双通道曝光让泄露的实际价值高于文件本身。
+- **潜在路径注入点**：`get_new_backup_path` 由 `suggested_filename(backup)` 生成文件名，而 `backup.backup_id` 与名称可能来自上传请求（API 层的 source）。
+- **防御验证**：见下文对 `get_new_backup_path` 的分析——第 106–110 行有显式的父目录一致性校验，拒绝逃逸出备份目录的候选路径。因此即使 `suggested_filename` 不剥离分隔符（代码注释第 105 行明确承认这一点），路径穿越也会在第 108–110 行被拦截并抛出 `InvalidBackupFilename`。
+- 另外注意：本函数只更新内存映射，实际写盘由上层 manager 完成，且写入目标已被约束在 `self._backup_dir` 内。
 
-11. **多实例部署下的行为差分**：对象存储后端与本地盘后端在删除语义上并不对称——本地盘物理移除即失效，S3 直链模式则因预签名有效期与 CDN 缓存形成残余可达窗口。部署形态决定了同样的代码缺陷在不同实例上的暴露时长差异，运营方应按后端类型分别评估补丁后的清理动作。
+## 6. `async_list_backups`（第 70–74 行）
+
+懒加载后返回元数据列表，无参数、无文件操作 sink。
+
+## 7. `async_get_backup`（第 76–97 行）
+
+入口参数 `backup_id`（source，来自 API 层）。数据流：
+
+1. 第 82 行：`if backup_id not in self._backups: raise BackupNotFound` —— 字典键查找，键只能来自第 46 行从真实磁盘文件解析出的 `backup.backup_id`，攻击者无法注入任意键。
+2. 第 87 行：`backup_path.exists()` 经 executor 执行，路径来自字典值而非 backup_id 拼接，**不存在由 backup_id 直达文件系统的字符串拼接**。
+3. 第 89–95 行：文件缺失时清理缓存并抛异常，逻辑一致。
+
+结论：backup_id → 路径的间接映射是闭合的，无任意文件读取。
+
+## 8. `get_backup_path`（第 99–107 行）
+
+同样经 `self._backups[backup_id][1]` 字典回查（第 104 行），KeyError 转 `BackupNotFound`。sink 是“返回路径”，但路径来源受限于 `_read_backups` 枚举结果或 `get_new_backup_path` 校验后的产物。
+
+## 9. `get_new_backup_path`（第 109–117 行）——核心防御点
+
+- 第 112 行：`candidate = self._backup_dir / suggested_filename(backup)`。注释明确指出 `suggested_filename` **不会剥离分隔符**，即若 filename 含 `../../evil.tar` 或绝对路径成分，`Path.__truediv__` 对绝对路径会直接替换整个前缀。
+- 第 113–116 行：`if candidate.parent != self._backup_dir: raise InvalidBackupFilename(...)`。这是白名单式校验而非黑名单/正则：
+  - 相对穿越 `../../x.tar` → parent 变为上级目录 → 被拒；
+  - 绝对路径 `/etc/x.tar` → parent 为 `/etc` ≠ 备份目录 → 被拒；
+  - 含 `..` 单层如 `backups/../backups/x.tar` 归一化后 parent 恰等于备份目录，落点仍在目录内，无害。
+  - 该比较基于 `Path` 语义等价性，绕过空间仅限“最终仍落在备份目录内”的等价拼写，不构成漏洞。
+
+## 10. `async_delete_backup`（第 119–129 行）
+
+入口参数 `backup_id`（source）。第 125 行 `backup_path.unlink(True)` 是删除类 sink。路径获取走 `get_backup_path`（第 124 行），即必须先存在于 `_read_backups` 枚举出的合法 `.tar` 集合中，无法构造任意路径删除。第 127 行 pop 缓存保持一致性。
+
+## 11. 第二入口与替代通道核查
+
+- **替代写入通道**：除 `get_new_backup_path` 外全文无其他路径构造点（grep 级检查：`Path(` 仅出现在第 29 行和第 112 行）。
+- **下载通道**：被 NotImplementedError 封死。
+- **HassIO 环境**：第 18 行直接返回空列表，本 agent 完全不注册。
+- **竞态条件**：上传与删除间理论上存在 TOCTOU 窗口，但影响限于备份目录内的备份文件，属低危设计权衡而非可利用漏洞。
+- **异常面**：所有解析异常均被捕获记录，无未处理崩溃导致的 DoS 面。
+
+## 总结
+
+全部 source（backup_id、上传元数据、磁盘 tar 内容）到 sink（文件读写删）的数据流均经过字典闭合映射或 Path 父目录白名单校验，黑名单式过滤不存在，未发现可利用漏洞。
 [JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key （draft release 附件绕过生命周期可见性）", "risk_level": "High", "source": "line 135/228: 以外部 uuid 为准的对象寻址", "sink": "line 217: storage.Attachments.Open 流式返回草稿产物", "explanation": "低权限用户持外泄的草稿附件 uuid -> GET attachments/{uuid} -> 第 184 行仅校验仓库单元读权 -> 无 draft/prerelease 状态阻断 -> 第 217 行流出未公开内容", "fix_suggestion": "line 184 分支补查 Release.IsDraft/IsPreRelease; 草稿期附件 URL 加时效签名"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文逐函数核查：backup_id 类 source 均经 _backups 字典闭合映射到路径（第 82、104、124 行），无法拼接任意路径；唯一路径构造点 get_new_backup_path（第 109-117 行）使用 candidate.parent != self._backup_dir 的白名单式校验拦截路径穿越与绝对路径注入，非黑名单不可绕过；_read_backups（第 42-50 行）仅枚举硬编码 glob *.tar 且异常全捕获；download 通道被 NotImplementedError 封死；HassIO 下 agent 不注册。未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
 
-### id=8180 teacher=unknown flags=[]
+### id=8203 teacher=unknown flags=[safe_but_cwe_in_expl]
 [ANALYSIS]
-# 编号分析
+分析：
 
-1. **选项结构的责任倒置**：StarredReposOptions（第 20–25 行）把可见度治理交给一个普通布尔 IncludePrivate；ApplyPublicOnly（第 27–31 行）仅在调用方主动传参 publicOnly 为真时才把它关掉。“默认开放、可选收紧”的方向与本应“默认最小暴露”的原则相反，是整份文件安全语义的核心裂缝。
-
-2. **SQL 合成的实际含义**：ToConds 以 star.uid 匹配收藏者（第 35 行）为核心条件；是否附带 is_private 过滤完全取决于那个布尔位。两处查询入口 GetStarredRepos 与对应计数（第 60 行起）都原样接收 options，逐点检查成为唯一防线。
-
-3. **清单中私有行的信息含量**：repository 表行携带 description、website、owner 关联甚至Topics；收藏列表把它们序列化给调用者。攻击向量按公告口径为访问撤销后仍能获取元数据——被移除协作权的账号此前建立过的收藏关系仍然成立，只要调用路径没有强制 ApplyPublicOnly，列表依旧吐出这些行。
-
-4. **忘记收紧的必然性论证**：把安全开关交给每个 handler 自觉调用，意味着正确性依赖代码评审时的记忆而非结构保证。Gitea 的 web/API 双路由体系里收藏端点多达数个，遗漏任何一个即产生独立泄露点；这类分散式判断正是 CVE-639 家族反复出现的环境土壤。
-
-
-5. **可见度过滤的正确落点**：数据库层条件应当无条件包含 is_private=false 或显式签名过的许可上下文；语言层提供面向管理员的旁路时也应集中在一处受审查的构造器内，而不是散布在 options 字段上等待调用方自觉。
-
-6. **与侧信道的组合风险**：分页计数接口与列表接口使用同一套 conditions——当过滤缺失时，总数与条目的抖动本身就是私有库存在性的信号；攻击者可以借收录/取消收藏的前后差分推断受保护仓库的活动状态。
-
-7. **修复建议**：把 ApplyPublicOnly 的语义改为强制进入 ToConds 的前置步骤并由类型系统隐藏原始布尔；新增回归测试断言撤销权限后的账号在任何收藏端点都取不到私有行；对计数与列表两个出口同时施加同一约束避免双门不同锁。
-
-8. **跨端点的一致性义务**：收藏数据在产品里有多个投影——用户主页、个人面板、 explore 探索页可能复用同一 options 类型。每一个新投影都是一次重新决策的机会，也对应一次遗忘的可能；结构性修复把这套决策收敛为类型层不可绕过，让新增端点默认继承安全。
-
-9. **与团队协作模型的交叉**：Gitea 的访问权按协作者与团队层级授予，撤销操作会同步裁剪 repository collaborator 表；但 star 行没有随权限联动的清理逻辑，这正是公告中“曾有权者仍可获取”的机制底座。理想方案要么在权限变更时级联失效收藏行，要么在读取时实时仲裁——当前代码两者皆无。
-
-10. **计费与活跃度信号的连带污染**：私有库的组织方常依据浏览/互动指标评估曝光；泄露访问会让这些统计混入未授权读者，干扰决策同时也为攻击者提供活动基线校准。可用性之外的信任成本由此扩散到运营层面。
-
-11. **测试蓝图的具体形态**：负向用例三件套——撤销后列表不含该仓库；直接构造 options 绕过 helper 时数据库条件依然含 is_private=false；count 与 list 对同一输入返回一致的可见性口径。三者钉死后，未来任何调整 includePrivate 语义的提交都会在流水线上显式失败而不是悄悄通过评审。
-
-12. **对上游同家族缺陷的横向参照**：版本历史中反复出现“某端点缺少所属权检查”的批量修补记录，说明零散判断的生产模式在该项目内已多次付出代价；本文件的可选布尔正是这种模式的又一实例。把它纳入结构性修复批次而非单独打补丁，才能中止同类问题的循环发生。
-
-13. **JSON 序列化面的字段裁剪核查**：返回给客户端的 repository 对象若经 DTO 裁剪只保留名称与描述，泄露的直接危害会显著降低；但当前 db.Find 返回完整 Repository 实体由上层按需映射，映射层的宽松默认使所有列都具备到达网络的可能。安全审查应把序列化白名单与查询过滤视为同一道闸门的两侧，任何一侧缺失都不构成完整防线。
-
-14. **对抗枚举的频控视角**：即使元数据泄漏被评价为低敏感，攻击者仍可通过批量遍历收藏接口绘制组织内部仓库命名规律；结合 description 中的项目语汇，可为后续定向投递提供弹药。对匿名可调用的列表端点实施速率限制能把枚举成本抬升一个数量级。
-
-15. **数据库层面的最后防线**：行级安全或视图层强制 is_private=false 的兜底在极端情况下依然有价值——当某个新端点带着缺失条件的原生 options 直达数据层时，数据库侧的约束会让越权请求安静地拿不到数据而不是爆出异常。纵深防御在此场景的成本是一次性配置，收益却是永久性的失误容忍。
-
-16. **修复验收的行为探针**：上线后可用撤销账号的旧令牌周期性探测收藏接口响应差异，作为补丁有效性的长期哨兵；同时监控 count 与 list 口径差分告警。这些运行期证据补齐了静态审查无法覆盖的部署漂移问题——配置回退、分支 cherry-pick 遗漏等现实因素都可能让已修代码再次暴露。
-
-17. **行号地图与证据核对**：20–25 options 字段定义；27–31 可选收紧函数；33–37 核心条件构造；50–56 内连接收藏表；59–62 列表出口；紧随其后的计数入口共享同一 conditions。全部引用行已对源文件逐一核验，无一处推测性标注——这份审查的可复核性与结论同等重要。
-
-18. **收束评估**：该缺陷的技术含量不高，危害却因数据面广（所有历史协作关系的沉淀）而稳定存在；它属于典型的“设计意图正确、实现责任漂移”案例。Medium 定级既承认元数据敏感度有限，也如实反映利用门槛极低的现实。修复落在类型层后，此类问题的复发通道将被系统性关闭。
-
-19. **查询构造的深层解剖**：ToConds 返回的 builder.Cond 以键值对直译成 where 子句，join 由 ToJoins 注入 INNER 关联；这类链式组装的可读性极佳，却也让安全条件的缺席变得难以察觉——review 时眼睛会追随主键匹配逻辑而略过“缺了什么”。一份包含必备过滤项的清单型单元测试，是对这种阅读盲区的直接补丁。
-
-20. **给后续演进的警示**：收藏模型未来可能扩展到组织级收藏或标签分组，每一次形态扩展都会复制同一份 options 决策点；在结构收口之前，任何新增的派生查询都在继承而非修复这道裂缝。让最小暴露成为数据访问对象的出厂属性，扩展才不会变成攻击面的乘法。
-
-21. **与撤销语义的时序博弈**：权限回收在数据层即时生效，而客户端缓存的收藏列表可能长时间滞留旧视图；攻击窗口因此横跨服务端过滤缺失到用户本地缓存刷新之间的整段延迟。补丁发布说明中应明确提示部署方强制失效相关缓存，否则技术修复会被传输层的惯性部分抵消。
-
-22. **结项陈述**：全部证据链自选项字段定义起始，经条件构造、双出口直抵网络边界，每个环节都有可点名的行号与语句；缺陷的存在性不依赖任何外部行为假设。把它从可选布尔改造成结构不变式后，本文件将从泄露通道转变为其他列表类查询可以抄写的安全样板——这也是本次审查期望留下的正向资产。
+1. 第 26–27 行枚举用户可控输入点：`r.URL.Query().Get("name")`、`Get("body")`，以及第 33 行的 `Get("template")`。前两者作为数据传入模板（由 html/template 自动上下文转义），本身不构成 SSTI；真正的漏洞源是 `template` 参数。
+2. 原代码第 35–37 行将用户输入直接赋给 `tmplSrc` 并在第 41 行 `Parse(tmplSrc)` 编译执行——这是 sink：攻击者可注入 `{{printf "%s" (call .Exec ...)}}` 等模板动作实现服务端模板注入（CWE-1336）。
+3. 修复采用【白名单精确允许集】：第 17–20 行定义 `allowedTemplates` 映射，仅包含内置 `default` 模板；第 34–40 行将用户输入从“模板内容”降级为“模板键名”，只有命中白名单才取用对应内容，否则返回 400。类型正确性：映射查找保证 `tmplSrc` 只能是编译期固定的字符串常量，不可能含攻击者控制的模板语法。
+4. 位置正确性：防御位于数据进入 `Parse` 之前的唯一汇合点（第 34 行），覆盖了所有经 `?template=` 到达 sink 的路径；环境变量 `REPORT_TEMPLATE`（第 24 行）属部署侧受信配置，保持原样符合 minimal pair 要求。
+5. 攻击面覆盖完整性：即使攻击者绕过参数名大小写、重复传参或空值技巧，`allowedTemplates[tmplKey]` 精确匹配使任何未注册键都失败，不存在部分匹配或前缀绕过空间；`name`/`body` 数据流仍走 html/template 的自动转义，与原代码一致。
+6. 第二入口/替代通道检查：路由仅注册 `/report` 一个 handler（第 55 行），无其他 handler 或中间件读取 `template` 参数；`os.Getenv("REPORT_TEMPLATE")` 为运维控制面而非 HTTP 可控面，故无第二入口残留。
 [JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key （可见度过滤为可选开关）", "risk_level": "Medium", "source": "line 24: IncludePrivate bool 由调用方可选封闭", "sink": "line 60: GetStarredRepos 按 options 直接输出 repository 元数据", "explanation": "已撤销访问权的账号保留历史收藏行 -> 处理器忘记调用或误传 ApplyPublicOnly -> 第 24 行 IncludePrivate 保持真 -> ToConds 仅按 star.uid 匹配而无 is_private=false 约束 -> 第 60 行列表与计数出口原样返回私有库元数据行；该路径对匿名上下文同样成立，构成稳定的对象级越权读取面", "fix_suggestion": "line 27: 将可见度收紧改为进入查询构造前的结构强制步骤，裸布尔不再对外暴露；数据库条件层并入恒真的最小暴露约束；新增撤销后跨端点一致性回归并把 count/list 双出口纳入同一断言集合"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-1336 服务端模板注入：第 33 行 r.URL.Query().Get('template') 用户可控模板内容直接流入第 41 行 template.Parse(tmplSrc) 执行；修复采用白名单精确允许集 allowedTemplates，用户输入仅作键名选择预定义模板，未命中即拒绝，模板内容永远不可被用户控制；name 与 body 数据流保持原样，由 html/template 自动上下文转义处理，非本次修复目标", "fix_suggestion": "line 33: 将 ?template= 参数改为 allowedTemplates 白名单键名查找，禁止用户提交的字符串作为模板源传入 Parse"}

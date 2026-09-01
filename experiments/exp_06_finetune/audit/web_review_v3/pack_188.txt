@@ -2,466 +2,771 @@ batch=188 样本数=2
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=8106 lang=javascript
+### id=8098 lang=python
 [CODE]
-   1| const path = require('path');
-   2| const errors = require('@tryghost/errors');
-   3| const logging = require('@tryghost/logging');
-   4| const config = require('../../shared/config');
-   5| const storage = require('../adapters/storage');
-   6| const storageUtils = require('../adapters/storage/utils');
+   1| """Webhook delivery implementation following Standard Webhooks conventions.
+   2| 
+   3| This module implements webhook delivery patterns similar to the Standard Webhooks
+   4| specification (https://www.standardwebhooks.com), providing consistent and secure
+   5| webhook delivery with HMAC signature verification and timestamp-based replay protection.
+   6| """
    7| 
-   8| let cardFactory;
-   9| let cards;
-  10| let mobiledocHtmlRenderer;
-  11| 
-  12| module.exports = {
-  13|     get blankDocument() {
-  14|         return {
-  15|             version: '0.3.1',
-  16|             ghostVersion: '4.0',
-  17|             markups: [],
-  18|             atoms: [],
-  19|             cards: [],
-  20|             sections: [
-  21|                 [1, 'p', [
-  22|                     [0, [], 0, '']
-  23|                 ]]
-  24|             ]
-  25|         };
-  26|     },
-  27| 
-  28|     get cards() {
-  29|         if (!cards) {
-  30|             const CardFactory = require('@tryghost/kg-card-factory');
-  31|             const defaultCards = require('@tryghost/kg-default-cards');
-  32| 
-  33|             cardFactory = new CardFactory({
-  34|                 siteUrl: config.get('url'),
-  35|                 imageBaseUrl: config.get('urls:image') || '',
-  36|                 imageOptimization: config.get('imageOptimization'),
-  37|                 canTransformImage(storagePath) {
-  38|                     const imageTransform = require('@tryghost/image-transform');
-  39|                     const {ext} = path.parse(storagePath);
-  40| 
-  41|                     // NOTE: the "saveRaw" check is smelly
-  42|                     return imageTransform.canTransformFiles()
-  43|                         && imageTransform.shouldResizeFileExtension(ext)
-  44|                         && typeof storage.getStorage('images').saveRaw === 'function';
-  45|                 }
-  46|             });
+   8| import base64
+   9| import hashlib
+  10| import hmac
+  11| import json
+  12| import logging
+  13| import threading
+  14| import time
+  15| import uuid
+  16| from concurrent.futures import ThreadPoolExecutor
+  17| from datetime import datetime, timezone
+  18| 
+  19| import requests
+  20| import urllib3
+  21| from cachetools import TTLCache
+  22| from packaging.version import Version
+  23| from requests.adapters import HTTPAdapter
+  24| from urllib3.util.retry import Retry
+  25| 
+  26| from mlflow.entities.webhook import Webhook, WebhookEvent, WebhookTestResult
+  27| from mlflow.environment_variables import (
+  28|     MLFLOW_ENABLE_WORKSPACES,
+  29|     MLFLOW_WEBHOOK_CACHE_TTL,
+  30|     MLFLOW_WEBHOOK_DELIVERY_MAX_WORKERS,
+  31|     MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES,
+  32|     MLFLOW_WEBHOOK_REQUEST_TIMEOUT,
+  33| )
+  34| from mlflow.store.model_registry.abstract_store import AbstractStore
+  35| from mlflow.store.model_registry.file_store import FileStore
+  36| from mlflow.utils.validation import _validate_webhook_url
+  37| from mlflow.webhooks.constants import (
+  38|     WEBHOOK_DELIVERY_ID_HEADER,
+  39|     WEBHOOK_SIGNATURE_HEADER,
+  40|     WEBHOOK_SIGNATURE_VERSION,
+  41|     WEBHOOK_TIMESTAMP_HEADER,
+  42| )
+  43| from mlflow.webhooks.types import (
+  44|     WebhookPayload,
+  45|     get_example_payload_for_event,
+  46| )
   47| 
-  48|             cards = defaultCards.map((card) => {
-  49|                 return cardFactory.createCard(card);
-  50|             });
-  51|         }
-  52| 
-  53|         return cards;
-  54|     },
+  48| _logger = logging.getLogger(__name__)
+  49| 
+  50| # Thread pool for non-blocking webhook delivery
+  51| _webhook_delivery_executor = ThreadPoolExecutor(
+  52|     max_workers=MLFLOW_WEBHOOK_DELIVERY_MAX_WORKERS.get(),
+  53|     thread_name_prefix="webhook-delivery",
+  54| )
   55| 
-  56|     get atoms() {
-  57|         return require('@tryghost/kg-default-atoms');
-  58|     },
+  56| # Shared session for webhook requests (thread-safe)
+  57| _webhook_session: requests.Session | None = None
+  58| _webhook_session_lock: threading.Lock = threading.Lock()
   59| 
-  60|     get mobiledocHtmlRenderer() {
-  61|         if (!mobiledocHtmlRenderer) {
-  62|             const MobiledocHtmlRenderer = require('@tryghost/kg-mobiledoc-html-renderer');
-  63| 
-  64|             mobiledocHtmlRenderer = new MobiledocHtmlRenderer({
-  65|                 cards: this.cards,
-  66|                 atoms: this.atoms,
-  67|                 unknownCardHandler(args) {
-  68|                     logging.error(new errors.InternalServerError({
-  69|                         message: 'Mobiledoc card \'' + args.env.name + '\' not found.'
-  70|                     }));
-  71|                 }
-  72|             });
-  73|         }
+  60| # Cache for webhook listings by event
+  61| # TTLCache is thread-safe for basic operations, but we still use a lock for
+  62| # complex operations to ensure consistency
+  63| _webhook_cache_lock: threading.Lock = threading.Lock()
+  64| _webhook_cache: TTLCache[WebhookEvent, list[Webhook]] | None = None
+  65| 
+  66| 
+  67| def _create_webhook_session() -> requests.Session:
+  68|     """Create a new webhook session with retry configuration.
+  69| 
+  70|     Returns:
+  71|         Configured requests.Session object
+  72|     """
+  73|     max_retries = MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES.get()
   74| 
-  75|         return mobiledocHtmlRenderer;
-  76|     },
-  77| 
-  78|     render(mobiledoc, options) {
-  79|         return this.mobiledocHtmlRenderer.render(mobiledoc, options);
-  80|     },
-  81| 
-  82|     get htmlToMobiledocConverter() {
-  83|         try {
-  84|             if (process.env.CI) {
-  85|                 console.time('require @tryghost/html-to-mobiledoc'); // eslint-disable-line no-console
-  86|             }
-  87| 
-  88|             const toMobiledoc = require('@tryghost/html-to-mobiledoc').toMobiledoc;
-  89| 
-  90|             if (process.env.CI) {
-  91|                 console.timeEnd('require @tryghost/html-to-mobiledoc'); // eslint-disable-line no-console
-  92|             }
-  93| 
-  94|             return toMobiledoc;
-  95|         } catch (err) {
-  96|             return () => {
-  97|                 throw new errors.InternalServerError({
-  98|                     message: 'Unable to convert from source HTML to Mobiledoc',
-  99|                     context: 'The html-to-mobiledoc package was not installed',
- 100|                     help: 'Please review any errors from the install process by checking the Ghost logs',
- 101|                     code: 'HTML_TO_MOBILEDOC_INSTALLATION',
- 102|                     err: err
- 103|                 });
- 104|             };
- 105|         }
- 106|     },
- 107| 
- 108|     // used when force-rerendering post content to ensure that old image card
- 109|     // payloads contain width/height values to be used when generating srcsets
- 110|     populateImageSizes: async function (mobiledocJson) {
- 111|         // do not require image-size until it's requested to avoid circular dependencies
- 112|         // shared/url-utils > server/lib/mobiledoc > server/lib/image/image-size > server/adapters/storage/utils
- 113|         const {imageSize} = require('./image');
+  75|     # urllib3 >= 2.0 supports additional features
+  76|     extra_kwargs = {}
+  77|     if Version(urllib3.__version__) >= Version("2.0"):
+  78|         extra_kwargs["backoff_jitter"] = 1.0  # Add up to 1 second of jitter
+  79| 
+  80|     retry_strategy = Retry(
+  81|         total=max_retries,
+  82|         status_forcelist=[429, 500, 502, 503, 504],  # Retry on these status codes
+  83|         allowed_methods=["POST"],  # Only retry POST requests
+  84|         backoff_factor=1.0,  # Exponential backoff: 1s, 2s, 4s, etc.
+  85|         backoff_max=60.0,  # Cap maximum backoff at 60 seconds
+  86|         respect_retry_after_header=True,  # Automatically handle Retry-After headers
+  87|         raise_on_status=False,  # Don't raise on these status codes
+  88|         **extra_kwargs,
+  89|     )
+  90| 
+  91|     adapter = HTTPAdapter(max_retries=retry_strategy)
+  92|     session = requests.Session()
+  93|     session.mount("http://", adapter)
+  94|     session.mount("https://", adapter)
+  95| 
+  96|     return session
+  97| 
+  98| 
+  99| def _get_or_create_webhook_session() -> requests.Session:
+ 100|     """Get or create a shared webhook session with retry configuration.
+ 101| 
+ 102|     Returns:
+ 103|         Configured requests.Session object
+ 104|     """
+ 105|     global _webhook_session
+ 106| 
+ 107|     if _webhook_session is None:  # To avoid unnecessary locking
+ 108|         with _webhook_session_lock:
+ 109|             if _webhook_session is None:
+ 110|                 _webhook_session = _create_webhook_session()
+ 111| 
+ 112|     return _webhook_session
+ 113| 
  114| 
- 115|         async function getUnsplashSize(url) {
- 116|             const parsedUrl = new URL(url);
- 117|             parsedUrl.searchParams.delete('w');
- 118|             parsedUrl.searchParams.delete('fit');
- 119|             parsedUrl.searchParams.delete('crop');
- 120|             parsedUrl.searchParams.delete('dpr');
- 121| 
- 122|             return await imageSize.getImageSizeFromUrl(parsedUrl.href);
- 123|         }
- 124| 
- 125|         const mobiledoc = JSON.parse(mobiledocJson);
- 126| 
- 127|         const sizePromises = mobiledoc.cards.map(async (card) => {
- 128|             const [cardName, payload] = card;
- 129| 
- 130|             const needsFilling = cardName === 'image' && payload && payload.src && (!payload.width || !payload.height);
- 131|             if (!needsFilling) {
- 132|                 return;
- 133|             }
+ 115| def _generate_hmac_signature(secret: str, delivery_id: str, timestamp: str, payload: str) -> str:
+ 116|     """Generate webhook HMAC-SHA256 signature.
+ 117| 
+ 118|     Args:
+ 119|         secret: The webhook secret key
+ 120|         delivery_id: The unique delivery ID
+ 121|         timestamp: Unix timestamp as string
+ 122|         payload: The JSON payload as string
+ 123| 
+ 124|     Returns:
+ 125|         The signature in the format "v1,<base64_encoded_signature>"
+ 126|     """
+ 127|     # Signature format: delivery_id.timestamp.payload
+ 128|     signed_content = f"{delivery_id}.{timestamp}.{payload}"
+ 129|     signature = hmac.new(
+ 130|         secret.encode("utf-8"), signed_content.encode("utf-8"), hashlib.sha256
+ 131|     ).digest()
+ 132|     signature_b64 = base64.b64encode(signature).decode("utf-8")
+ 133|     return f"{WEBHOOK_SIGNATURE_VERSION},{signature_b64}"
  134| 
- 135|             const isUnsplash = payload.src.match(/images\.unsplash\.com/);
- 136|             const isRelativeImagePath = /^\/content\/images\//.test(payload.src);
- 137|             try {
- 138|                 let size;
- 139|                 if (isUnsplash) {
- 140|                     size = await getUnsplashSize(payload.src);
- 141|                 } else if (isRelativeImagePath || storageUtils.isLocalImage(payload.src)) {
- 142|                     size = await imageSize.getOriginalImageSizeFromStorageUrl(payload.src);
- 143|                 } else {
- 144|                     size = await imageSize.getImageSizeFromUrl(payload.src);
- 145|                 }
- 146| 
- 147|                 if (size && size.width && size.height) {
- 148|                     payload.width = size.width;
- 149|                     payload.height = size.height;
- 150|                 }
- 151|             } catch (e) {
- 152|                 // TODO: use debug instead?
- 153|                 logging.error(e);
- 154|             }
- 155|         });
- 156| 
- 157|         await Promise.all(sizePromises);
- 158| 
- 159|         return JSON.stringify(mobiledoc);
- 160|     },
- 161| 
- 162|     // allow config changes to be picked up - useful in tests
- 163|     reload() {
- 164|         cardFactory = null;
- 165|         cards = null;
- 166|         mobiledocHtmlRenderer = null;
- 167|     }
- 168| };
- 169| 
- 170| 
+ 135| 
+ 136| def _send_webhook_request(
+ 137|     webhook: Webhook,
+ 138|     payload: WebhookPayload,
+ 139|     event: WebhookEvent,
+ 140|     session: requests.Session,
+ 141| ) -> requests.Response:
+ 142|     """Send a webhook request to the specified URL with retry logic.
+ 143| 
+ 144|     Args:
+ 145|         webhook: The webhook object containing the URL and secret
+ 146|         payload: The payload to send
+ 147|         event: The webhook event type
+ 148|         session: Configured requests session with retry logic
+ 149| 
+ 150|     Returns:
+ 151|         requests.Response object from the webhook request
+ 152|     """
+ 153|     _validate_webhook_url(webhook.url)
+ 154| 
+ 155|     # Create webhook payload with metadata
+ 156|     webhook_payload = {
+ 157|         "entity": event.entity.value,
+ 158|         "action": event.action.value,
+ 159|         "timestamp": datetime.now(timezone.utc).isoformat(),
+ 160|         "data": payload,
+ 161|     }
+ 162|     if MLFLOW_ENABLE_WORKSPACES.get():
+ 163|         webhook_payload["workspace"] = webhook.workspace
+ 164| 
+ 165|     payload_json = json.dumps(webhook_payload)
+ 166|     payload_bytes = payload_json.encode("utf-8")
+ 167| 
+ 168|     # Generate IDs and timestamps for webhooks
+ 169|     delivery_id = str(uuid.uuid4())
+ 170|     unix_timestamp = str(int(time.time()))
+ 171| 
+ 172|     # MLflow webhook headers
+ 173|     headers = {
+ 174|         "Content-Type": "application/json",
+ 175|         WEBHOOK_DELIVERY_ID_HEADER: delivery_id,
+ 176|         WEBHOOK_TIMESTAMP_HEADER: unix_timestamp,
+ 177|     }
+ 178| 
+ 179|     # Add signature if secret is configured
+ 180|     if webhook.secret:
+ 181|         signature = _generate_hmac_signature(
+ 182|             webhook.secret, delivery_id, unix_timestamp, payload_json
+ 183|         )
+ 184|         headers[WEBHOOK_SIGNATURE_HEADER] = signature
+ 185| 
+ 186|     timeout = MLFLOW_WEBHOOK_REQUEST_TIMEOUT.get()
+ 187| 
+ 188|     try:
+ 189|         return session.post(webhook.url, data=payload_bytes, headers=headers, timeout=timeout)
+ 190|     except requests.exceptions.RetryError as e:
+ 191|         # urllib3 exhausted all retries
+ 192|         max_retries = MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES.get()
+ 193|         _logger.error(f"Webhook request to {webhook.url} failed after {max_retries} retries: {e}")
+ 194|         raise
+ 195|     except requests.RequestException as e:
+ 196|         # Other request errors
+ 197|         _logger.error(f"Webhook request to {webhook.url} failed: {e}")
+ 198|         raise
+ 199| 
+ 200| 
+ 201| def _get_or_create_webhook_cache(ttl_seconds: int) -> TTLCache[WebhookEvent, list[Webhook]]:
+ 202|     """Get or create the webhook cache with the specified TTL.
+ 203| 
+ 204|     Args:
+ 205|         ttl_seconds: Cache TTL in seconds
+ 206| 
+ 207|     Returns:
+ 208|         The webhook cache instance
+ 209|     """
+ 210|     global _webhook_cache
+ 211| 
+ 212|     if _webhook_cache is None:
+ 213|         with _webhook_cache_lock:
+ 214|             # Check again in case another thread just created it
+ 215|             if _webhook_cache is None:
+ 216|                 # Max size of 1000 should be enough for event types
+ 217|                 _webhook_cache = TTLCache(maxsize=1000, ttl=ttl_seconds)
+ 218| 
+ 219|     return _webhook_cache
+ 220| 
+ 221| 
+ 222| def _get_cached_webhooks_by_event(
+ 223|     store: AbstractStore,
+ 224|     event: WebhookEvent,
+ 225|     ttl_seconds: int,
+ 226| ) -> list[Webhook]:
+ 227|     """Get webhooks for a specific event from cache or fetch from store if cache is stale.
+ 228| 
+ 229|     Args:
+ 230|         store: The abstract store to fetch webhooks from
+ 231|         event: The webhook event to filter by
+ 232|         ttl_seconds: Cache TTL in seconds
+ 233| 
+ 234|     Returns:
+ 235|         List of webhooks subscribed to the event
+ 236|     """
+ 237|     cache = _get_or_create_webhook_cache(ttl_seconds)
+ 238| 
+ 239|     # Try to get from cache first (TTLCache handles expiry automatically)
+ 240|     cached_webhooks = cache.get(event)
+ 241|     if cached_webhooks is not None:
+ 242|         return cached_webhooks
+ 243| 
+ 244|     # Cache miss, need to fetch from store
+ 245|     with _webhook_cache_lock:
+ 246|         # Check again in case another thread just populated it
+ 247|         cached_webhooks = cache.get(event)
+ 248|         if cached_webhooks is not None:
+ 249|             return cached_webhooks
+ 250| 
+ 251|         # Fetch fresh data - only webhooks for this specific event
+ 252|         # Fetch all pages to ensure we don't miss any webhooks
+ 253|         webhooks: list[Webhook] = []
+ 254|         page_token: str | None = None
+ 255|         while True:
+ 256|             page = store.list_webhooks_by_event(event, max_results=100, page_token=page_token)
+ 257|             webhooks.extend(page)
+ 258|             if not page.token:
+ 259|                 break
+ 260|             page_token = page.token
+ 261| 
+ 262|         # Store in cache
+ 263|         cache[event] = webhooks
+ 264|         return webhooks
+ 265| 
+ 266| 
+ 267| def _send_webhook_with_error_handling(
+ 268|     webhook: Webhook,
+ 269|     payload: WebhookPayload,
+ 270|     event: WebhookEvent,
+ 271|     session: requests.Session,
+ 272| ) -> None:
+ 273|     try:
+ 274|         _send_webhook_request(webhook, payload, event, session)
+ 275|     except Exception as e:
+ 276|         _logger.error(
+ 277|             f"Failed to send webhook to {webhook.url} for event {event}: {e}",
+ 278|             exc_info=True,
+ 279|         )
+ 280| 
+ 281| 
+ 282| def _deliver_webhook_impl(
+ 283|     *,
+ 284|     event: WebhookEvent,
+ 285|     payload: WebhookPayload,
+ 286|     store: AbstractStore,
+ 287| ) -> None:
+ 288|     session = _get_or_create_webhook_session()
+ 289|     ttl_seconds = MLFLOW_WEBHOOK_CACHE_TTL.get()
+ 290| 
+ 291|     # Get only webhooks subscribed to this specific event (filtered at DB level when possible)
+ 292|     webhooks = _get_cached_webhooks_by_event(store, event, ttl_seconds)
+ 293|     for webhook in webhooks:
+ 294|         if webhook.status.is_active():
+ 295|             _webhook_delivery_executor.submit(
+ 296|                 _send_webhook_with_error_handling,
+ 297|                 webhook,
+ 298|                 payload,
+ 299|                 event,
+ 300|                 session,
+ 301|             )
+ 302| 
+ 303| 
+ 304| def deliver_webhook(
+ 305|     *,
+ 306|     event: WebhookEvent,
+ 307|     payload: WebhookPayload,
+ 308|     store: AbstractStore,
+ 309| ) -> None:
+ 310|     # Exit early if the store is a FileStore since it does not support webhook APIs
+ 311|     if isinstance(store, FileStore):
+ 312|         return
+ 313| 
+ 314|     try:
+ 315|         _deliver_webhook_impl(event=event, payload=payload, store=store)
+ 316|     except Exception as e:
+ 317|         _logger.error(
+ 318|             f"Failed to deliver webhook for event {event}: {e}",
+ 319|             exc_info=True,
+ 320|         )
+ 321| 
+ 322| 
+ 323| def test_webhook(webhook: Webhook, event: WebhookEvent | None = None) -> WebhookTestResult:
+ 324|     """Test a webhook by sending a test payload.
+ 325| 
+ 326|     Args:
+ 327|         webhook: The webhook object to test
+ 328|         event: Optional event type to test. If not specified, uses the first event from webhook.
+ 329| 
+ 330|     Returns:
+ 331|         WebhookTestResult indicating success/failure and response details
+ 332|     """
+ 333|     # Use provided event or the first event type for testing
+ 334|     test_event = event or webhook.events[0]
+ 335|     session = _get_or_create_webhook_session()
+ 336|     try:
+ 337|         test_payload = get_example_payload_for_event(test_event)
+ 338|         response = _send_webhook_request(
+ 339|             webhook=webhook, payload=test_payload, event=test_event, session=session
+ 340|         )
+ 341|         return WebhookTestResult(
+ 342|             success=response.status_code < 400,
+ 343|             response_status=response.status_code,
+ 344|             response_body=response.text,
+ 345|         )
+ 346|     except Exception as e:
+ 347|         return WebhookTestResult(
+ 348|             success=False,
+ 349|             error_message=f"Failed to test webhook: {e!r}",
+ 350|         )
+ 351| 
+ 352| 
 
-### id=8107 lang=javascript
+### id=8099 lang=python
 [CODE]
-   1| const path = require('path');
-   2| const errors = require('@tryghost/errors');
-   3| const logging = require('@tryghost/logging');
-   4| const config = require('../../shared/config');
-   5| const storage = require('../adapters/storage');
-   6| const storageUtils = require('../adapters/storage/utils');
+   1| """Webhook delivery implementation following Standard Webhooks conventions.
+   2| 
+   3| This module implements webhook delivery patterns similar to the Standard Webhooks
+   4| specification (https://www.standardwebhooks.com), providing consistent and secure
+   5| webhook delivery with HMAC signature verification and timestamp-based replay protection.
+   6| """
    7| 
-   8| let cardFactory;
-   9| let cards;
-  10| let mobiledocHtmlRenderer;
-  11| 
-  12| module.exports = {
-  13|     get blankDocument() {
-  14|         return {
-  15|             version: '0.3.1',
-  16|             ghostVersion: '4.0',
-  17|             markups: [],
-  18|             atoms: [],
-  19|             cards: [],
-  20|             sections: [
-  21|                 [1, 'p', [
-  22|                     [0, [], 0, '']
-  23|                 ]]
-  24|             ]
-  25|         };
-  26|     },
-  27| 
-  28|     get cards() {
-  29|         if (!cards) {
-  30|             const CardFactory = require('@tryghost/kg-card-factory');
-  31|             const defaultCards = require('@tryghost/kg-default-cards');
-  32| 
-  33|             cardFactory = new CardFactory({
-  34|                 siteUrl: config.get('url'),
-  35|                 imageBaseUrl: config.get('urls:image') || '',
-  36|                 imageOptimization: config.get('imageOptimization'),
-  37|                 canTransformImage(storagePath) {
-  38|                     const imageTransform = require('@tryghost/image-transform');
-  39|                     const {ext} = path.parse(storagePath);
-  40| 
-  41|                     // NOTE: the "saveRaw" check is smelly
-  42|                     return imageTransform.canTransformFiles()
-  43|                         && imageTransform.shouldResizeFileExtension(ext)
-  44|                         && typeof storage.getStorage('images').saveRaw === 'function';
-  45|                 }
-  46|             });
+   8| import base64
+   9| import hashlib
+  10| import hmac
+  11| import json
+  12| import logging
+  13| import threading
+  14| import time
+  15| import uuid
+  16| from concurrent.futures import ThreadPoolExecutor
+  17| from datetime import datetime, timezone
+  18| 
+  19| import requests
+  20| import urllib3
+  21| from cachetools import TTLCache
+  22| from packaging.version import Version
+  23| from urllib3.util.retry import Retry
+  24| 
+  25| from mlflow.entities.webhook import Webhook, WebhookEvent, WebhookTestResult
+  26| from mlflow.environment_variables import (
+  27|     MLFLOW_ENABLE_WORKSPACES,
+  28|     MLFLOW_WEBHOOK_CACHE_TTL,
+  29|     MLFLOW_WEBHOOK_DELIVERY_MAX_WORKERS,
+  30|     MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES,
+  31|     MLFLOW_WEBHOOK_REQUEST_TIMEOUT,
+  32| )
+  33| from mlflow.store.model_registry.abstract_store import AbstractStore
+  34| from mlflow.store.model_registry.file_store import FileStore
+  35| from mlflow.utils.validation import _validate_webhook_url
+  36| from mlflow.webhooks.constants import (
+  37|     WEBHOOK_DELIVERY_ID_HEADER,
+  38|     WEBHOOK_SIGNATURE_HEADER,
+  39|     WEBHOOK_SIGNATURE_VERSION,
+  40|     WEBHOOK_TIMESTAMP_HEADER,
+  41| )
+  42| from mlflow.webhooks.ssrf import SSRFProtectedHTTPAdapter
+  43| from mlflow.webhooks.types import (
+  44|     WebhookPayload,
+  45|     get_example_payload_for_event,
+  46| )
   47| 
-  48|             cards = defaultCards.map((card) => {
-  49|                 return cardFactory.createCard(card);
-  50|             });
-  51|         }
-  52| 
-  53|         return cards;
-  54|     },
+  48| _logger = logging.getLogger(__name__)
+  49| 
+  50| # Thread pool for non-blocking webhook delivery
+  51| _webhook_delivery_executor = ThreadPoolExecutor(
+  52|     max_workers=MLFLOW_WEBHOOK_DELIVERY_MAX_WORKERS.get(),
+  53|     thread_name_prefix="webhook-delivery",
+  54| )
   55| 
-  56|     get atoms() {
-  57|         return require('@tryghost/kg-default-atoms');
-  58|     },
+  56| # Shared session for webhook requests (thread-safe)
+  57| _webhook_session: requests.Session | None = None
+  58| _webhook_session_lock: threading.Lock = threading.Lock()
   59| 
-  60|     get mobiledocHtmlRenderer() {
-  61|         if (!mobiledocHtmlRenderer) {
-  62|             const MobiledocHtmlRenderer = require('@tryghost/kg-mobiledoc-html-renderer');
-  63| 
-  64|             mobiledocHtmlRenderer = new MobiledocHtmlRenderer({
-  65|                 cards: this.cards,
-  66|                 atoms: this.atoms,
-  67|                 unknownCardHandler(args) {
-  68|                     logging.error(new errors.InternalServerError({
-  69|                         message: 'Mobiledoc card \'' + args.env.name + '\' not found.'
-  70|                     }));
-  71|                 }
-  72|             });
-  73|         }
+  60| # Cache for webhook listings by event
+  61| # TTLCache is thread-safe for basic operations, but we still use a lock for
+  62| # complex operations to ensure consistency
+  63| _webhook_cache_lock: threading.Lock = threading.Lock()
+  64| _webhook_cache: TTLCache[WebhookEvent, list[Webhook]] | None = None
+  65| 
+  66| 
+  67| def _create_webhook_session() -> requests.Session:
+  68|     """Create a new webhook session with retry configuration.
+  69| 
+  70|     Returns:
+  71|         Configured requests.Session object
+  72|     """
+  73|     max_retries = MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES.get()
   74| 
-  75|         return mobiledocHtmlRenderer;
-  76|     },
-  77| 
-  78|     render(mobiledoc, options) {
-  79|         return this.mobiledocHtmlRenderer.render(mobiledoc, options);
-  80|     },
-  81| 
-  82|     get htmlToMobiledocConverter() {
-  83|         try {
-  84|             if (process.env.CI) {
-  85|                 console.time('require @tryghost/html-to-mobiledoc'); // eslint-disable-line no-console
-  86|             }
-  87| 
-  88|             const toMobiledoc = require('@tryghost/html-to-mobiledoc').toMobiledoc;
-  89| 
-  90|             if (process.env.CI) {
-  91|                 console.timeEnd('require @tryghost/html-to-mobiledoc'); // eslint-disable-line no-console
-  92|             }
-  93| 
-  94|             return toMobiledoc;
-  95|         } catch (err) {
-  96|             return () => {
-  97|                 throw new errors.InternalServerError({
-  98|                     message: 'Unable to convert from source HTML to Mobiledoc',
-  99|                     context: 'The html-to-mobiledoc package was not installed',
- 100|                     help: 'Please review any errors from the install process by checking the Ghost logs',
- 101|                     code: 'HTML_TO_MOBILEDOC_INSTALLATION',
- 102|                     err: err
- 103|                 });
- 104|             };
- 105|         }
- 106|     },
+  75|     # urllib3 >= 2.0 supports additional features
+  76|     extra_kwargs = {}
+  77|     if Version(urllib3.__version__) >= Version("2.0"):
+  78|         extra_kwargs["backoff_jitter"] = 1.0  # Add up to 1 second of jitter
+  79| 
+  80|     retry_strategy = Retry(
+  81|         total=max_retries,
+  82|         status_forcelist=[429, 500, 502, 503, 504],  # Retry on these status codes
+  83|         allowed_methods=["POST"],  # Only retry POST requests
+  84|         backoff_factor=1.0,  # Exponential backoff: 1s, 2s, 4s, etc.
+  85|         backoff_max=60.0,  # Cap maximum backoff at 60 seconds
+  86|         respect_retry_after_header=True,  # Automatically handle Retry-After headers
+  87|         raise_on_status=False,  # Don't raise on these status codes
+  88|         **extra_kwargs,
+  89|     )
+  90| 
+  91|     # SSRF-protected adapter validates each connection's peer IP is public at
+  92|     # connect time, closing the DNS-rebinding TOCTOU gap between
+  93|     # _validate_webhook_url (resolve + check) and the actual request (re-resolve).
+  94|     adapter = SSRFProtectedHTTPAdapter(max_retries=retry_strategy)
+  95|     session = requests.Session()
+  96|     # Disable env proxy handling: a proxy would make the validated peer the
+  97|     # proxy rather than the webhook destination, bypassing the SSRF check.
+  98|     session.trust_env = False
+  99|     session.mount("http://", adapter)
+ 100|     session.mount("https://", adapter)
+ 101| 
+ 102|     return session
+ 103| 
+ 104| 
+ 105| def _get_or_create_webhook_session() -> requests.Session:
+ 106|     """Get or create a shared webhook session with retry configuration.
  107| 
- 108|     // used when force-rerendering post content to ensure that old image card
- 109|     // payloads contain width/height values to be used when generating srcsets
- 110|     populateImageSizes: async function (mobiledocJson) {
- 111|         // do not require image-size until it's requested to avoid circular dependencies
- 112|         // shared/url-utils > server/lib/mobiledoc > server/lib/image/image-size > server/adapters/storage/utils
- 113|         const {imageSize} = require('./image');
- 114| 
- 115|         async function getUnsplashSize(url) {
- 116|             const parsedUrl = new URL(url);
- 117|             parsedUrl.searchParams.delete('w');
- 118|             parsedUrl.searchParams.delete('fit');
- 119|             parsedUrl.searchParams.delete('crop');
- 120|             parsedUrl.searchParams.delete('dpr');
- 121| 
- 122|             return await imageSize.getImageSizeFromUrl(parsedUrl.href);
- 123|         }
- 124| 
- 125|         const mobiledoc = JSON.parse(mobiledocJson);
- 126| 
- 127|         const sizePromises = mobiledoc.cards.map(async (card) => {
- 128|             const [cardName, payload] = card;
+ 108|     Returns:
+ 109|         Configured requests.Session object
+ 110|     """
+ 111|     global _webhook_session
+ 112| 
+ 113|     if _webhook_session is None:  # To avoid unnecessary locking
+ 114|         with _webhook_session_lock:
+ 115|             if _webhook_session is None:
+ 116|                 _webhook_session = _create_webhook_session()
+ 117| 
+ 118|     return _webhook_session
+ 119| 
+ 120| 
+ 121| def _generate_hmac_signature(secret: str, delivery_id: str, timestamp: str, payload: str) -> str:
+ 122|     """Generate webhook HMAC-SHA256 signature.
+ 123| 
+ 124|     Args:
+ 125|         secret: The webhook secret key
+ 126|         delivery_id: The unique delivery ID
+ 127|         timestamp: Unix timestamp as string
+ 128|         payload: The JSON payload as string
  129| 
- 130|             const needsFilling = cardName === 'image' && payload && payload.src && (!payload.width || !payload.height);
- 131|             if (!needsFilling) {
- 132|                 return;
- 133|             }
- 134| 
- 135|             const isUnsplash = payload.src.match(/images\.unsplash\.com/);
- 136|             const isRelativeImagePath = /^\/content\/images\//.test(payload.src);
- 137|             try {
- 138|                 let size;
- 139|                 if (isUnsplash) {
- 140|                     size = await getUnsplashSize(payload.src);
- 141|                 } else if (isRelativeImagePath || storageUtils.isLocalImage(payload.src)) {
- 142|                     size = await imageSize.getOriginalImageSizeFromStorageUrl(payload.src);
- 143|                 } else if (storageUtils.isInternalImage(payload.src)) {
- 144|                     size = await imageSize.getImageSizeFromUrl(payload.src);
- 145|                 }
- 146| 
- 147|                 if (size && size.width && size.height) {
- 148|                     payload.width = size.width;
- 149|                     payload.height = size.height;
- 150|                 }
- 151|             } catch (e) {
- 152|                 // TODO: use debug instead?
- 153|                 logging.error(e);
- 154|             }
- 155|         });
- 156| 
- 157|         await Promise.all(sizePromises);
- 158| 
- 159|         return JSON.stringify(mobiledoc);
- 160|     },
- 161| 
- 162|     // allow config changes to be picked up - useful in tests
- 163|     reload() {
- 164|         cardFactory = null;
- 165|         cards = null;
- 166|         mobiledocHtmlRenderer = null;
+ 130|     Returns:
+ 131|         The signature in the format "v1,<base64_encoded_signature>"
+ 132|     """
+ 133|     # Signature format: delivery_id.timestamp.payload
+ 134|     signed_content = f"{delivery_id}.{timestamp}.{payload}"
+ 135|     signature = hmac.new(
+ 136|         secret.encode("utf-8"), signed_content.encode("utf-8"), hashlib.sha256
+ 137|     ).digest()
+ 138|     signature_b64 = base64.b64encode(signature).decode("utf-8")
+ 139|     return f"{WEBHOOK_SIGNATURE_VERSION},{signature_b64}"
+ 140| 
+ 141| 
+ 142| def _send_webhook_request(
+ 143|     webhook: Webhook,
+ 144|     payload: WebhookPayload,
+ 145|     event: WebhookEvent,
+ 146|     session: requests.Session,
+ 147| ) -> requests.Response:
+ 148|     """Send a webhook request to the specified URL with retry logic.
+ 149| 
+ 150|     Args:
+ 151|         webhook: The webhook object containing the URL and secret
+ 152|         payload: The payload to send
+ 153|         event: The webhook event type
+ 154|         session: Configured requests session with retry logic
+ 155| 
+ 156|     Returns:
+ 157|         requests.Response object from the webhook request
+ 158|     """
+ 159|     _validate_webhook_url(webhook.url)
+ 160| 
+ 161|     # Create webhook payload with metadata
+ 162|     webhook_payload = {
+ 163|         "entity": event.entity.value,
+ 164|         "action": event.action.value,
+ 165|         "timestamp": datetime.now(timezone.utc).isoformat(),
+ 166|         "data": payload,
  167|     }
- 168| };
- 169| 
+ 168|     if MLFLOW_ENABLE_WORKSPACES.get():
+ 169|         webhook_payload["workspace"] = webhook.workspace
  170| 
+ 171|     payload_json = json.dumps(webhook_payload)
+ 172|     payload_bytes = payload_json.encode("utf-8")
+ 173| 
+ 174|     # Generate IDs and timestamps for webhooks
+ 175|     delivery_id = str(uuid.uuid4())
+ 176|     unix_timestamp = str(int(time.time()))
+ 177| 
+ 178|     # MLflow webhook headers
+ 179|     headers = {
+ 180|         "Content-Type": "application/json",
+ 181|         WEBHOOK_DELIVERY_ID_HEADER: delivery_id,
+ 182|         WEBHOOK_TIMESTAMP_HEADER: unix_timestamp,
+ 183|     }
+ 184| 
+ 185|     # Add signature if secret is configured
+ 186|     if webhook.secret:
+ 187|         signature = _generate_hmac_signature(
+ 188|             webhook.secret, delivery_id, unix_timestamp, payload_json
+ 189|         )
+ 190|         headers[WEBHOOK_SIGNATURE_HEADER] = signature
+ 191| 
+ 192|     timeout = MLFLOW_WEBHOOK_REQUEST_TIMEOUT.get()
+ 193| 
+ 194|     try:
+ 195|         return session.post(webhook.url, data=payload_bytes, headers=headers, timeout=timeout)
+ 196|     except requests.exceptions.RetryError as e:
+ 197|         # urllib3 exhausted all retries
+ 198|         max_retries = MLFLOW_WEBHOOK_REQUEST_MAX_RETRIES.get()
+ 199|         _logger.error(f"Webhook request to {webhook.url} failed after {max_retries} retries: {e}")
+ 200|         raise
+ 201|     except requests.RequestException as e:
+ 202|         # Other request errors
+ 203|         _logger.error(f"Webhook request to {webhook.url} failed: {e}")
+ 204|         raise
+ 205| 
+ 206| 
+ 207| def _get_or_create_webhook_cache(ttl_seconds: int) -> TTLCache[WebhookEvent, list[Webhook]]:
+ 208|     """Get or create the webhook cache with the specified TTL.
+ 209| 
+ 210|     Args:
+ 211|         ttl_seconds: Cache TTL in seconds
+ 212| 
+ 213|     Returns:
+ 214|         The webhook cache instance
+ 215|     """
+ 216|     global _webhook_cache
+ 217| 
+ 218|     if _webhook_cache is None:
+ 219|         with _webhook_cache_lock:
+ 220|             # Check again in case another thread just created it
+ 221|             if _webhook_cache is None:
+ 222|                 # Max size of 1000 should be enough for event types
+ 223|                 _webhook_cache = TTLCache(maxsize=1000, ttl=ttl_seconds)
+ 224| 
+ 225|     return _webhook_cache
+ 226| 
+ 227| 
+ 228| def _get_cached_webhooks_by_event(
+ 229|     store: AbstractStore,
+ 230|     event: WebhookEvent,
+ 231|     ttl_seconds: int,
+ 232| ) -> list[Webhook]:
+ 233|     """Get webhooks for a specific event from cache or fetch from store if cache is stale.
+ 234| 
+ 235|     Args:
+ 236|         store: The abstract store to fetch webhooks from
+ 237|         event: The webhook event to filter by
+ 238|         ttl_seconds: Cache TTL in seconds
+ 239| 
+ 240|     Returns:
+ 241|         List of webhooks subscribed to the event
+ 242|     """
+ 243|     cache = _get_or_create_webhook_cache(ttl_seconds)
+ 244| 
+ 245|     # Try to get from cache first (TTLCache handles expiry automatically)
+ 246|     cached_webhooks = cache.get(event)
+ 247|     if cached_webhooks is not None:
+ 248|         return cached_webhooks
+ 249| 
+ 250|     # Cache miss, need to fetch from store
+ 251|     with _webhook_cache_lock:
+ 252|         # Check again in case another thread just populated it
+ 253|         cached_webhooks = cache.get(event)
+ 254|         if cached_webhooks is not None:
+ 255|             return cached_webhooks
+ 256| 
+ 257|         # Fetch fresh data - only webhooks for this specific event
+ 258|         # Fetch all pages to ensure we don't miss any webhooks
+ 259|         webhooks: list[Webhook] = []
+ 260|         page_token: str | None = None
+ 261|         while True:
+ 262|             page = store.list_webhooks_by_event(event, max_results=100, page_token=page_token)
+ 263|             webhooks.extend(page)
+ 264|             if not page.token:
+ 265|                 break
+ 266|             page_token = page.token
+ 267| 
+ 268|         # Store in cache
+ 269|         cache[event] = webhooks
+ 270|         return webhooks
+ 271| 
+ 272| 
+ 273| def _send_webhook_with_error_handling(
+ 274|     webhook: Webhook,
+ 275|     payload: WebhookPayload,
+ 276|     event: WebhookEvent,
+ 277|     session: requests.Session,
+ 278| ) -> None:
+ 279|     try:
+ 280|         _send_webhook_request(webhook, payload, event, session)
+ 281|     except Exception as e:
+ 282|         _logger.error(
+ 283|             f"Failed to send webhook to {webhook.url} for event {event}: {e}",
+ 284|             exc_info=True,
+ 285|         )
+ 286| 
+ 287| 
+ 288| def _deliver_webhook_impl(
+ 289|     *,
+ 290|     event: WebhookEvent,
+ 291|     payload: WebhookPayload,
+ 292|     store: AbstractStore,
+ 293| ) -> None:
+ 294|     session = _get_or_create_webhook_session()
+ 295|     ttl_seconds = MLFLOW_WEBHOOK_CACHE_TTL.get()
+ 296| 
+ 297|     # Get only webhooks subscribed to this specific event (filtered at DB level when possible)
+ 298|     webhooks = _get_cached_webhooks_by_event(store, event, ttl_seconds)
+ 299|     for webhook in webhooks:
+ 300|         if webhook.status.is_active():
+ 301|             _webhook_delivery_executor.submit(
+ 302|                 _send_webhook_with_error_handling,
+ 303|                 webhook,
+ 304|                 payload,
+ 305|                 event,
+ 306|                 session,
+ 307|             )
+ 308| 
+ 309| 
+ 310| def deliver_webhook(
+ 311|     *,
+ 312|     event: WebhookEvent,
+ 313|     payload: WebhookPayload,
+ 314|     store: AbstractStore,
+ 315| ) -> None:
+ 316|     # Exit early if the store is a FileStore since it does not support webhook APIs
+ 317|     if isinstance(store, FileStore):
+ 318|         return
+ 319| 
+ 320|     try:
+ 321|         _deliver_webhook_impl(event=event, payload=payload, store=store)
+ 322|     except Exception as e:
+ 323|         _logger.error(
+ 324|             f"Failed to deliver webhook for event {event}: {e}",
+ 325|             exc_info=True,
+ 326|         )
+ 327| 
+ 328| 
+ 329| def test_webhook(webhook: Webhook, event: WebhookEvent | None = None) -> WebhookTestResult:
+ 330|     """Test a webhook by sending a test payload.
+ 331| 
+ 332|     Args:
+ 333|         webhook: The webhook object to test
+ 334|         event: Optional event type to test. If not specified, uses the first event from webhook.
+ 335| 
+ 336|     Returns:
+ 337|         WebhookTestResult indicating success/failure and response details
+ 338|     """
+ 339|     # Use provided event or the first event type for testing
+ 340|     test_event = event or webhook.events[0]
+ 341|     session = _get_or_create_webhook_session()
+ 342|     try:
+ 343|         test_payload = get_example_payload_for_event(test_event)
+ 344|         response = _send_webhook_request(
+ 345|             webhook=webhook, payload=test_payload, event=test_event, session=session
+ 346|         )
+ 347|         return WebhookTestResult(
+ 348|             success=response.status_code < 400,
+ 349|             response_status=response.status_code,
+ 350|             response_body=response.text,
+ 351|         )
+ 352|     except Exception as e:
+ 353|         return WebhookTestResult(
+ 354|             success=False,
+ 355|             error_message=f"Failed to test webhook: {e!r}",
+ 356|         )
+ 357| 
+ 358| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=8106 teacher=unknown flags=[]
+### id=8098 teacher=unknown flags=[]
 [ANALYSIS]
-# 全文逐函数安全分析
+## 编号分析
 
-## 1. 文件级入口点枚举（通读全文后归纳）
+**入口点枚举（全文）**
 
-本文件是 Ghost 的 mobiledoc 渲染库封装，全文共暴露以下对外入口：
+1. `deliver_webhook`（第284行）：事件触发通道，payload 来自内部事件，store 提供的 webhook 列表（含用户注册的 URL/secret）。
+2. `test_webhook`（第303行）：测试通道，`webhook` 对象（含任意 `url`）直接传入。
+3. 环境变量：`MLFLOW_WEBHOOK_*`、`MLFLOW_ENABLE_WORKSPACES`（第27–32行）——仅影响行为参数，非攻击面。
 
-- **第 41 行 `render(mobiledoc, options)`**：接收任意 mobiledoc JSON（来源为文章内容，即编辑器/导入通道的持久化数据），交给 `mobiledocHtmlRenderer.render`。
-- **第 47–96 行 `get htmlToMobiledocConverter`**：仅做 require 与错误包装，无用户数据流。
-- **第 100–146 行 `populateImageSizes(mobiledocJson)`**：接收序列化的 mobiledoc 字符串，解析后对 image 卡片的 `payload.src` 发起网络/存储请求——这是本文件唯一含 source→sink 数据流的函数。
-- **第 149–153 行 `reload()`**：测试用缓存重置，无风险。
-- **第 6–39 行 `blankDocument` / `cards` / `atoms` getter**：静态配置与卡片工厂初始化，无外部输入。
+**数据流验证**
 
-## 2. 逐函数数据流验证
+- 流 A：用户注册的 `webhook.url` → 第141行 `_validate_webhook_url(webhook.url)` → 第177行 `session.post(webhook.url, ...)`。防御为单一校验函数；按规则黑名单/正则类过滤视为可绕过（典型实现基于 scheme 白名单+内网 IP 黑名单，可被 DNS rebinding、重定向至内网、IPv6/十进制 IP 等绕过）。且重试配置（第76–85行）跟随 3xx 重定向时无 re-validation。**SSRF 成立（CWE-918）**。
+- 流 B：`test_webhook`（第303行）→ 第315行 `_send_webhook_request` → 第177行 POST 任意 URL → 第321–324行将 `response.text` 完整回传给调用者。这是**全读型 SSRF**：攻击者可读取内网服务（如云元数据 169.254.169.254、内部管理接口）的响应体并原样返回，危害高于盲打。
+- 流 C：HMAC 签名（第109–125行）使用 `hmac.new` 常量时间比较不适用（这里是生成端），签名覆盖 delivery_id/timestamp/payload，防篡改与重放设计正确，无漏洞。
+- 流 D：缓存（第189–245行）TTLCache + 双检锁，线程安全处理正确；但注意第273–281行：URL 校验发生在投递时而非注册时，配合缓存意味着绕过校验的 URL 可在 TTL 内反复触发。
+- 流 E：异常日志（第181、185、257行）记录完整 URL 与错误，可能泄露内网拓扑到日志，属低风险信息泄露。
 
-### 2.1 `render`（第 41–43 行）
-source：调用方传入的 `mobiledoc`（最终源自管理员/贡献者编辑器或 Koenig 导入）。sink：kg-mobiledoc-html-renderer。未知卡片走第 33–37 行的 `unknownCardHandler`，仅记录日志、不执行卡片代码；默认卡片由 CardFactory 白名单化渲染。HTML 渲染层本身依赖下游 sanitizer（Ghost 在输出端另有过滤），本文件内未发现直接 sink。此路径在本文件范围内不构成可确认漏洞。
-
-### 2.2 `populateImageSizes`（第 100–146 行）——重点
-
-**Source 链**：
-- 第 112 行 `JSON.parse(mobiledocJson)`：mobiledocJson 是已持久化的文章内容，任何有编辑权限的角色（含 Contributor）均可写入任意结构。
-- 第 117 行解构出 `cardName === 'image'` 的 `payload.src`（第 118 行条件），这是攻击者完全可控的字符串。
-
-**分支一：Unsplash 判定（第 121 行）**
-
-该正则没有锚定 host，`https://evil.com/?x=images.unsplash.com` 即可命中。命中后进入第 124 行 `getUnsplashSize(payload.src)`（第 103–110 行）：先 `new URL(url)`，删除 w/fit/crop/dpr 参数，再于第 109 行调用 `imageSize.getImageSizeFromUrl(parsedUrl.href)` —— 服务端对任意 URL 发起 HTTP GET。这是典型的 **SSRF（CWE-918）**：攻击者可用该参数形式让服务器请求内网地址（如 `http://169.254.169.254/latest/meta-data?images.unsplash.com`）。防御有效性判定：正则匹配子串不校验真实主机名，按规则视为无效防御。
-
-**分支二：相对路径判定（第 122 行）**
-
-锚定开头但只看前缀，随后第 125 行进入 `getOriginalImageSizeFromStorageUrl(payload.src)`。若 storage utils 对 `../` 未做规范化（本文件不可见其实现，无法确证），可能存在本地文件读取；但基于“结论必须基于全文证据”的要求，此处只能标记为待下游确认的疑点，不能作为定论。
-
-**分支三：兜底（第 126–127 行）**
-非 unsplash、非相对路径时直接 `getImageSizeFromUrl(payload.src)` —— 无任何域名白名单，任意 URL 均触发服务端出网请求。这实际上是比分支一更宽的 SSRF 面：即使绕不过 unsplash 正则也无所谓，因为默认分支本来就允许任意 URL。
-
-**第二入口/替代通道**：同一 `payload.src` 还会经 image 卡片渲染进入 `<img src>`（前端 XSS 由下游转义负责）；此外 `storageUtils.isLocalImage`（第 123 行）作为第三判定通道同样只是启发式判断。所有通道最终汇入同一组 imageSize 网络请求 sink。
-
-**缓解因素**：需要具备文章编辑权限的身份；响应体被丢弃（只取尺寸），泄露面主要是内网探测/盲 SSRF 与对内部服务的 GET 触发。因此风险评级为中危而非高危。
-
-### 2.3 其余函数
-- 第 14–17 行 `canTransformImage`：输入来自 storage 内部路径，非用户直控。
-- 第 50–53 行 `process.env.CI` 分支：环境变量仅控制计时日志，无注入面。
-- 第 78–88 行 catch 分支：返回抛错闭包，`err` 仅用于错误上下文，无泄漏到响应的结构性风险。
-
-## 3. 结论
-
-全文证据支持的确定漏洞是 `populateImageSizes` 中由攻击者可控的 `payload.src` 直达服务端 HTTP 请求的 SSRF（CWE-918），三处判定（unsplash 子串匹配、前缀匹配、isLocalImage 启发式）均不构成有效主机校验。
+**第二入口确认**：`test_webhook` 是独立于投递流程的第二入口，且返回响应体，是最严重的利用路径。
 [JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF)", "risk_level": "Medium", "source": "line 118: populateImageSizes 中 image 卡片 payload.src 来自可被低权限编辑角色写入的文章 mobiledoc 内容", "sink": "line 144: imageSize.getImageSizeFromUrl(payload.src) 以及 line 115:getUnsplashSize 内 parsedUrl.href, 服务端对任意 URL 发起 HTTP 请求", "explanation": "攻击者在文章中插入 image 卡片并将 src 设为内网地址 -> line 121 的 images.unsplash.com 正则未锚定主机名且 line 122:存在无白名单的兜底分支 -> 任意 src 都会直达 getImageSizeFromUrl 造成盲 SSRF, 可探测内网并触发内部 GET; line 141:前缀匹配与 isLocalImage 同样仅为启发式, 不构成有效防御", "fix_suggestion": "在 line 118 之后对 payload.src 做严格主机校验: 用 new URL 解析后比对 hostname 是否属于配置的允许域名列表(如 images.unsplash.com 与站点自身域), 拒绝私有网段 IP 与重定向跟随, 并对相对路径做 path.normalize 后强制限定在 content/images 目录内"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF) (Server-Side Request Forgery)", "risk_level": "High", "source": "line 323: test_webhook 接收含任意 url 的 webhook 对象 / 用户注册的 webhook.url", "sink": "line 189: session.post(webhook.url, ...) 以及 line 344: response_body=response.text 回传给调用者", "explanation": "用户可控的 webhook.url 经第141行 _validate_webhook_url 校验后于第177行发起服务器端请求；该单点校验属于黑名单式防御可被 DNS rebinding 或重定向绕过，且 test_webhook 在第324行把目标响应体完整返回给调用者，构成全读型 SSRF，可探测并窃取内网服务如云元数据接口的数据", "fix_suggestion": "在注册和发送时均做严格校验：解析 URL 后禁止私网/链路本地/环回地址段，禁用自动重定向或对每次重定向重新校验目标 IP，并对 test_webhook 的 response_body 做长度限制与内容脱敏"}
 
-### id=8107 teacher=unknown flags=[]
+### id=8099 teacher=unknown flags=[]
 [ANALYSIS]
-# Ghost mobiledoc 库安全分析（全文逐函数）
+## 编号分析
 
-## 1. 文件概览与入口点枚举
+1. **入口点枚举（全文）**：本模块无 HTTP 路由，入口为两个公开函数：
+   - `deliver_webhook`（第 246 行附近）：由事件系统调用，`payload` 来自内部实体数据；
+   - `test_webhook`（第 262 行附近）：由 API 层测试端点调用，`webhook` 对象（含 `webhook.url`、`webhook.secret`）来自用户注册的 webhook 记录。
+   - 外部输入 source：`webhook.url`（攻击者可控的出站目标地址）。
 
-本文件是 Ghost CMS 的 `server/lib/mobiledoc.js`，导出对象包含以下成员（即全部潜在入口/出口）：
+2. **source→sink 数据流**：`webhook.url` → `_send_webhook_request` 第 137 行 `_validate_webhook_url(webhook.url)` → 第 190 行 `session.post(webhook.url, ...)`。这是典型 SSRF sink。防御验证：
+   - 第 137 行 URL 校验（解析+解析 IP 检查）存在 DNS-rebinding TOCTOU 缺口，但第 152-158 行注释明确说明使用 `SSRFProtectedHTTPAdapter` 在**连接时**校验对端 IP 为公网地址，闭合了 rebinding 窗口；且该 adapter 挂载于 http/https 全部 scheme（第 160-161 行），重定向产生的每个新连接同样经过 adapter 校验；
+   - 第 159 行 `session.trust_env = False` 阻止环境代理绕过 IP 校验——这是对替代通道的主动封堵；
+   - 重定向通道：requests 默认跟随重定向，但每次连接均走同一 adapter，校验不被绕过。
 
-1. `blankDocument` getter —— 纯静态数据，无外部输入；
-2. `cards` getter —— 惰性初始化卡片工厂，含 `canTransformImage` 回调；
-3. `atoms` getter —— 仅 require 包；
-4. `mobiledocHtmlRenderer` getter —— 渲染器初始化，含 `unknownCardHandler` 回调；
-5. `render(mobiledoc, options)` —— 接收外部 mobiledoc JSON 的主渲染入口；
-6. `htmlToMobiledocConverter` getter —— HTML→mobiledoc 转换器，读取 `process.env.CI`；
-7. `populateImageSizes(mobiledocJson)` —— 接收外部 mobiledoc JSON 字符串的第二个入口；
-8. `reload()` —— 测试辅助，仅置空缓存。
+3. **第二入口/替代通道检查**：
+   - `test_webhook` 将 `response.text` 回传给调用者（第 276 行），若能访问内网则构成信息泄露放大器，但前置的连接时 SSRF 校验使内网不可达；
+   - 非 http/https scheme（如 file://）不匹配已挂载 adapter，但 `_validate_webhook_url` 应拒绝非 http(s) scheme（MLflow 标准校验），且 requests 对 file:// 不支持 post；
+   - HMAC 签名（第 88-105 行）使用 `hmac.new` 常量时间比较语义正确，secret 仅用于签名，无泄露路径。
 
-## 2. 逐函数 source→sink 分析
+4. **其他次要问题（非漏洞）**：
+   - 第 195 行日志记录完整 `webhook.url`——URL 本身是注册者自填的，非敏感泄露；
+   - TTLCache 缓存（第 208-240 行）可能导致已删除 webhook 短暂继续投递，属可用性/一致性问题而非安全漏洞；
+   - 线程池共享 session 有锁保护（第 68-77 行），无线程安全问题。
 
-### 2.1 blankDocument getter
-第 8–19 行：返回硬编码字面量。无 source、无 sink。**无风险**。
-
-### 2.2 cards getter 与 canTransformImage 回调
-第 21–50 行：`canTransformImage(storagePath)` 中 `storagePath` 来自内部存储层调用链，非用户直接输入；其用途仅为 `path.parse` 取扩展名并做布尔判断（第 31–36 行），不进入文件系统写路径或命令执行 sink。`require('@tryghost/image-transform')` 是固定包名，非动态拼接。**无风险**。
-
-### 2.3 atoms getter
-第 52–54 行：静态 require。**无风险**。
-
-### 2.4 mobiledocHtmlRenderer getter 与 unknownCardHandler
-第 56–71 行：`unknownCardHandler(args)` 中 `args.env.name` 被拼入错误消息字符串（第 64 行）。该值来自 mobiledoc 卡片名，理论上可被攻击者控制——但 sink 是 `logging.error`（日志记录），不是 HTML 输出、SQL、eval 或 shell。日志注入最多造成日志污染，且 Ghost 日志为结构化 JSON 记录，风险极低，不构成可利用漏洞。**低危/不计**。
-
-### 2.5 render(mobiledoc, options)
-第 73–75 行：将 mobiledoc 交给 `@tryghost/kg-mobiledoc-html-renderer` 渲染。这是核心 XSS 关注点：mobiledoc 格式本身不含原始 HTML section（HTML 由 markups 白名单 + cards 序列化生成），未知卡片走 `unknownCardHandler` 只记日志不输出内容。真正的 HTML 净化由上游（如 `kg-mobiledoc-html-renderer` 及 card factory 的序列化器）负责；本文件未引入任何绕过逻辑，也未把用户输入直接拼进 HTML 字符串。**本文件范围内无可达 XSS sink**。
-
-### 2.6 htmlToMobiledocConverter getter
-第 77–97 行：唯一的环境变量读取是 `process.env.CI`（第 81、86 行），仅用于 `console.time/timeEnd` 性能计时标签，标签为常量字符串。env 值未被读取进任何 sink。catch 分支返回抛错函数，err 对象传入 errors 构造器用于日志。**无风险**。
-
-### 2.7 populateImageSizes —— 第二入口重点审查
-
-这是第二个接收外部数据的入口（第 99–152 行），需逐条验证：
-
-- **source**：`mobiledocJson` 参数（第 118 行 `JSON.parse(mobiledocJson)`），以及其中 image 卡片的 `payload.src`（第 124–125 行）。src 可由编辑文章的用户控制。
-- **sink 1 — getUnsplashSize（第 106–113 行）**：条件为 `payload.src.match(/images\.unsplash\.com/)`（第 127 行）。注意：该正则匹配的是子串而非锚定主机，攻击者可用 `https://evil.com/?x=images.unsplash.com` 绕过——但即便绕过，sink 是 `imageSize.getImageSizeFromUrl(parsedUrl.href)`，即向该 URL 发起 GET 请求获取图片尺寸。这构成 **SSRF**：攻击者可使服务器请求内网地址。
-  - 缓解因素：Ghost 的 `getImageSizeFromUrl` 内部实现（`server/lib/image` 层）会校验 URL 协议为 http/https 并做重定向后的主机校验/私有 IP 防护（Ghost 在后续版本加入了 SSRF 防护）；此外结果仅写入 width/height 数字字段回 mobiledoc（第 143–145 行），响应体不会回显给攻击者，属于盲 SSRF，信息泄露有限。防御有效性取决于依赖包版本，本文件自身未做任何校验，正则过滤按要求视为可绕过。
-- **sink 2 — getOriginalImageSizeFromStorageUrl（第 131 行）**：条件 `/^\/content\/images\//` 锚定相对路径或 `isLocalImage`。相对路径被限制在本地存储目录语义下，由 storage adapter 解析，不存在路径穿越直达文件系统 sink 的证据（adapter 内部处理）。**有效约束**。
-- **sink 3 — getImageSizeFromUrl（第 133 行）**：条件 `storageUtils.isInternalImage(payload.src)`，即站点自身 URL 的图片，请求目标是配置的 siteUrl 域。若 isInternalImage 实现严格（前缀匹配 config url），则目标受限。**基本有效**。
-- **异常处理**：第 136–138 行 catch 后仅记日志，不中断，无 DoS 放大。
-- 结论：最可疑的数据流是「攻击者控制的 src → 弱正则判断 → 服务端 HTTP 请求」，但 (a) 该函数仅在管理员触发 force-rerender 时执行（第二入口需要已认证的编辑权限），(b) 下游 image-size 工具层承担实际 SSRF 校验，(c) 无响应回显。综合判定为不可在本文件证据下确认的可利用漏洞。
-
-### 2.8 reload()
-第 154–158 行：仅清空模块级缓存变量，无输入。**无风险**。
-
-## 3. 第二入口与替代通道核查
-
-- 替代通道：`render` 与 `populateImageSizes` 均消费同一 mobiledoc JSON 来源（数据库中的 post 内容），无其他文件/网络/env 输入通道（env 仅 CI 布尔用途）。
-- 动态 require 核查：全部 require 为字面量包名或固定相对路径（第 23、24、30、58、60、83、105 行），无用户输入参与模块解析，无 RCE。
-- 原型污染面：`payload.width/height` 直接赋值为 imageSize 返回的数字（第 143–144 行），键名为固定字面量，无 `__proto__` 注入路径。
-
-## 4. 总体结论
-
-全文通读后：所有 sink（HTTP 请求、日志、JSON 序列化）均有上游条件约束或位于可信工具层；弱正则（unsplash 子串匹配）虽按规则不算有效防御，但其可达 sink 为盲 SSRF 且需特权入口触发、依赖下游防护，本文件内无法证实可利用性。故判定无确凿漏洞。
+结论：SSRF 主 sink 具备双层有效防御（URL 校验 + 连接时 IP 校验），代理与重定向替代通道均被封堵，未发现可利用漏洞。
 [JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文逐函数审查：blankDocument 为静态数据；cards 的 canTransformImage 仅做布尔判断无敏感 sink；unknownCardHandler 将卡片名写入结构化日志属最低风险；render 依赖 kg-mobiledoc-html-renderer 的白名单序列化且未知卡片只记日志；htmlToMobiledocConverter 中 process.env.CI 仅作计时开关不进入任何 sink；populateImageSizes 是第二入口，攻击者可控的 payload.src 经三路分支分别到达 getImageSizeFromUrl 或本地存储尺寸查询，其中 unsplash 判断用子串正则可被绕过，理论上是盲 SSRF 面，但该函数仅由具备编辑权限的管理操作 force-rerender 触发，实际 SSRF 校验由下游 image-size 工具层承担且响应不回显，本文件证据不足以确认可利用漏洞；reload 无输入；所有 require 均为字面量无动态模块注入；width/height 赋值为固定键名数字无原型污染。", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文唯一的攻击者可控 source 是 webhook.url，sink 是 session.post。该数据流具备两层有效防御：_validate_webhook_url 的静态校验加上 SSRFProtectedHTTPAdapter 在每次连接时校验对端为公网 IP，闭合了 DNS rebinding TOCTOU 窗口；session.trust_env=False 封堵了代理绕过通道，adapter 挂载于全部 http/https 使重定向后的每个新连接同样受校验。test_webhook 返回 response.body 虽有信息回传面，但因内网不可达而不构成可利用问题。HMAC 签名实现正确，缓存 TTL 差异仅为一致性小瑕疵。", "fix_suggestion": "no fix needed"}

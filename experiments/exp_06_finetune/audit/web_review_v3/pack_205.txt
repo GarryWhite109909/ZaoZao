@@ -2,995 +2,543 @@ batch=205 样本数=3
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=8149 lang=python
+### id=8139 lang=php
 [CODE]
-   1| import abc
-   2| from itertools import tee
-   3| from pathlib import Path
-   4| from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, cast
-   5| 
-   6| import jinja2
-   7| import jinja2.sandbox
-   8| import srsly
-   9| from spacy import Errors, Language, util
-  10| from spacy.tokens import Doc
-  11| from spacy.training import Example
-  12| 
-  13| from ..compat import Self
-  14| from ..registry import lowercase_normalizer
-  15| from ..ty import FewshotExample, ShardMapper, ShardReducer, TaskResponseParser
-  16| 
+   1| <x-shop::layouts.account>
+   2|     <!-- Page Title -->
+   3|     <x-slot:title>
+   4|         @lang('shop::app.customers.account.profile.index.title')
+   5|     </x-slot>
+   6| 
+   7|     <!-- Breadcrumbs -->
+   8|     @if ((core()->getConfigData('general.general.breadcrumbs.shop')))
+   9|         @section('breadcrumbs')
+  10|             <x-shop::breadcrumbs name="profile" />
+  11|         @endSection
+  12|     @endif
+  13| 
+  14|     <div class="max-md:hidden">
+  15|         <x-shop::layouts.account.navigation />
+  16|     </div>
   17| 
-  18| class BuiltinTask(abc.ABC):
-  19|     """Abstract base task implementing interfaces and/or functionality expected from all built-in tasks:
-  20|         - working prompt template strings
-  21|         - swappable response parsers
-  22|         - swappable prompt example type
-  23|         - integration of fewshot example into the fully rendered prompt
-  24|         - initializable (in line with other spaCy components)
-  25|         - (de-)serialization
-  26| 
-  27|     On the relation of BuiltinTask to ShardingLLMTask: the latter specifies the minimal contract a task implementation
-  28|     has to fulfill, whereas a BuiltinTask requires (and offers) functionality beyond that. The rationale behind that is
-  29|     that built-in tasks should provide as smooth a usage experience as possible while still making it as easy as
-  30|     possible for users to write their own, custom tasks.
-  31|     """
-  32| 
-  33|     def __init__(
-  34|         self,
-  35|         parse_responses: TaskResponseParser,
-  36|         prompt_example_type: Type[FewshotExample[Self]],
-  37|         template: str,
-  38|         prompt_examples: Optional[List[FewshotExample[Self]]],
-  39|         shard_mapper: ShardMapper,
-  40|         shard_reducer: ShardReducer[Self],
-  41|     ):
-  42|         """Initializes task.
-  43|         parse_responses (TaskResponseParser[Self]): Callable for parsing LLM responses for this task.
-  44|         prompt_example_type (Type[FewshotExample[Self]): Type to use for fewshot examples.
-  45|         template (str): Prompt template passed to the model.
-  46|         prompt_examples (Optional[List[FewshotExample[Self]]]): Optional list of few-shot examples to include in prompts.
-  47|         shard_mapper (ShardMapper): Maps docs to shards if they don't fit into the model context.
-  48|         shard_reducer (ShardReducer[Self]): Reduces doc shards back into one doc instance.
-  49|         """
-  50|         self._parse_responses = parse_responses
-  51|         self._prompt_examples = prompt_examples or []
-  52|         self._template = template
-  53|         self._prompt_example_type = prompt_example_type
-  54|         self._shard_mapper = shard_mapper
-  55|         self._shard_reducer = shard_reducer
-  56| 
-  57|     def generate_prompts(
-  58|         self, docs: Iterable[Doc], context_length: Optional[int] = None
-  59|     ) -> Iterable[Tuple[Iterable[Any], Iterable[Doc]]]:
-  60|         """Generate prompts from docs.
-  61|         docs (Iterable[Doc]): Docs to generate prompts from.
-  62|         ontext_length (int): Context length for model this task is executed with. Needed for sharding and fusing docs,
-  63|             if the corresponding prompts exceed the context length. If None, context length is assumed to be infinite.
-  64|         RETURNS (Iterable[Tuple[Iterable[Any], Iterable[Doc]]]): Iterable with one to n prompts per doc (multiple
-  65|             prompts in case of multiple shards) and the corresponding shards. The relationship between shard and prompt
-  66|             is 1:1.
-  67|         """
-  68|         environment = jinja2.sandbox.SandboxedEnvironment()
-  69|         _template = environment.from_string(self._template)
-  70| 
-  71|         def render_template(shard: Doc, i_shard: int, i_doc: int, n_shards: int) -> str:
-  72|             """Renders template for a given doc (shard).
-  73|             shard (Doc): Doc shard. Note that if the prompt is small enough to fit within the model's context window,
-  74|                 there will only be one shard, which is identical to the original doc.
-  75|             i_shard (int): Shard index (w.r.t. shard's Doc instance).
-  76|             i_doc (int): Doc index.
-  77|             n_shards (int): Total number of shards.
-  78|             RETURNS (str): Rendered template.
-  79|             """
-  80|             return _template.render(
-  81|                 text=shard.text,
-  82|                 prompt_examples=self._prompt_examples,
-  83|                 **self._get_prompt_data(shard, i_shard, i_doc, n_shards),
-  84|             )
-  85| 
-  86|         for _i_doc, _doc in enumerate(self._preprocess_docs_for_prompt(docs)):
-  87|             # If no context length provided (e. g. because models don't provide it): don't shard.
-  88|             shards = (
-  89|                 self._shard_mapper(_doc, _i_doc, context_length, render_template)
-  90|                 if context_length is not None
-  91|                 else [_doc]
-  92|             )
-  93|             shards = list(shards)
-  94|             yield [
-  95|                 render_template(_shard, _i_shard, _i_doc, len(shards))
-  96|                 for _i_shard, _shard in enumerate(shards)
-  97|             ], shards
-  98| 
-  99|     def _get_prompt_data(
- 100|         self, shard: Doc, i_shard: int, i_doc: int, n_shards: int
- 101|     ) -> Dict[str, Any]:
- 102|         """Returns data injected into prompt template. No-op if not overridden by inheriting task class. The data
- 103|         returned by this might be static (i. e. the same for all doc shards) or dynamic (contingent on the doc shard).
- 104|         shard (Doc): Doc (shard) for which prompt data should be fetched.
- 105|         i_shard (int): Shard index (w.r.t. shard's Doc instance).
- 106|         i_doc (int): Doc index.
- 107|         n_shards (int): Total number of shards.
- 108|         RETURNS (Dict[str, Any]): Data injected into prompt template.
- 109|         """
- 110|         return {}
- 111| 
- 112|     def _preprocess_docs_for_prompt(self, docs: Iterable[Doc]) -> Iterable[Doc]:
- 113|         """Preprocesses docs before injection into prompt template. No-op if not overridden by inheriting task class.
- 114|         docs (Iterable[Doc]): Docs to generate prompts from.
- 115|         RETURNS (Iterable[Doc]): Preprocessed docs.
- 116|         """
- 117|         return docs
- 118| 
- 119|     @abc.abstractmethod
- 120|     def parse_responses(
- 121|         self, shards: Iterable[Iterable[Doc]], responses: Iterable[Iterable[Any]]
- 122|     ) -> Iterable[Doc]:
- 123|         """
- 124|         Parses LLM responses.
- 125|         shards (Iterable[Iterable[Doc]]): Doc shards to map responses into.
- 126|         responses ([Iterable[Iterable[Any]]]): LLM responses per doc.
- 127|         RETURNS (Iterable[Doc]]): Updated docs.
- 128|         """
- 129| 
- 130|     def _initialize(
- 131|         self,
- 132|         get_examples: Callable[[], Iterable["Example"]],
- 133|         nlp: Language,
- 134|         n_prompt_examples: int = 0,
- 135|         **kwargs: Any,
- 136|     ) -> None:
- 137|         """Initializes prompt examples from Doc examples.
- 138|         get_examples (Callable[[], Iterable["Example"]]): Callable that provides examples
- 139|             for initialization.
- 140|         nlp (Language): Language instance.
- 141|         n_prompt_examples (int): How many prompt examples to infer from the provided Example objects.
- 142|             0 by default. Takes all examples if set to -1.
- 143|         """
- 144|         for eg in get_examples():
- 145|             if n_prompt_examples < 0 or len(self._prompt_examples) < n_prompt_examples:
- 146|                 prompt_example = self._prompt_example_type.generate(eg, self)  # type: ignore[arg-type]
- 147|                 if prompt_example:
- 148|                     self._prompt_examples.append(prompt_example)
- 149| 
- 150|     def get_cfg(self) -> Dict[str, Any]:
- 151|         """Serialize the task's configuration attributes."""
- 152|         cfg = {key: getattr(self, key) for key in self._cfg_keys}
- 153|         return cfg
- 154| 
- 155|     def set_cfg(self, cfg: Dict[str, Any]) -> None:
- 156|         """Deserialize the task's configuration attributes.
- 157|         cfg (Dict[str, Any]): dictionary containing configuration attributes.
- 158|         """
- 159|         for key, value in cfg.items():
- 160|             setattr(self, key, value)
- 161| 
- 162|     def _get_prompt_examples(self) -> List[Dict[str, Any]]:
- 163|         """Serialize examples."""
- 164|         examples = [eg.dict() for eg in self._prompt_examples]
- 165|         return examples
- 166| 
- 167|     def _set_prompt_examples(self, examples: List[Dict[str, Any]]) -> None:
- 168|         """Set prompt examples.
- 169|         examples (List[Dict[str, Any]]): prompt examples.
- 170|         """
- 171|         self._prompt_examples = [
- 172|             self._prompt_example_type.parse_obj(eg) for eg in examples
- 173|         ]
+  18|     <div class="mx-4 flex-auto max-md:mx-6 max-sm:mx-4">
+  19|         <div class="flex items-center justify-between">
+  20|             <div class="flex items-center">
+  21|                 <!-- Back Button -->
+  22|                 <a
+  23|                     class="grid md:hidden"
+  24|                     href="{{ route('shop.customers.account.index') }}"
+  25|                 >
+  26|                     <span class="icon-arrow-left rtl:icon-arrow-right text-2xl"></span>
+  27|                 </a>
+  28| 
+  29|                 <h2 class="text-2xl font-medium max-md:text-xl max-sm:text-base ltr:ml-2.5 md:ltr:ml-0 rtl:mr-2.5 md:rtl:mr-0">
+  30|                     @lang('shop::app.customers.account.profile.index.title')
+  31|                 </h2>
+  32|             </div>
+  33| 
+  34|             {!! view_render_event('bagisto.shop.customers.account.profile.edit_button.before') !!}
+  35| 
+  36|             <a
+  37|                 href="{{ route('shop.customers.account.profile.edit') }}"
+  38|                 class="secondary-button border-zinc-200 px-5 py-3 font-normal max-md:rounded-lg max-md:py-2 max-sm:py-1.5 max-sm:text-sm"
+  39|             >
+  40|                 @lang('shop::app.customers.account.profile.index.edit')
+  41|             </a>
+  42| 
+  43|             {!! view_render_event('bagisto.shop.customers.account.profile.edit_button.after') !!}
+  44|         </div>
+  45| 
+  46|         <!-- Profile Information -->
+  47|         <div class="mt-8 grid grid-cols-1 gap-y-6 max-md:mt-5 max-sm:gap-y-4">
+  48|             {!! view_render_event('bagisto.shop.customers.account.profile.first_name.before') !!}
+  49| 
+  50|             <div class="grid w-full grid-cols-[2fr_3fr] border-b border-zinc-200 px-8 py-3 max-md:px-0">
+  51|                 <p class="text-sm font-medium">
+  52|                     @lang('shop::app.customers.account.profile.index.first-name')
+  53|                 </p>
+  54| 
+  55|                 <p class="text-sm font-medium text-zinc-500">
+  56|                     {{ $customer->first_name }}
+  57|                 </p>
+  58|             </div>
+  59| 
+  60|             {!! view_render_event('bagisto.shop.customers.account.profile.first_name.after') !!}
+  61| 
+  62|             {!! view_render_event('bagisto.shop.customers.account.profile.last_name.before') !!}
+  63| 
+  64|             <div class="grid w-full grid-cols-[2fr_3fr] border-b border-zinc-200 px-8 py-3 max-md:px-0">
+  65|                 <p class="text-sm font-medium">
+  66|                     @lang('shop::app.customers.account.profile.index.last-name')
+  67|                 </p>
+  68| 
+  69|                 <p class="text-sm font-medium text-zinc-500">
+  70|                     {{ $customer->last_name }}
+  71|                 </p>
+  72|             </div>
+  73| 
+  74|             {!! view_render_event('bagisto.shop.customers.account.profile.last_name.after') !!}
+  75| 
+  76|             {!! view_render_event('bagisto.shop.customers.account.profile.gender.before') !!}
+  77| 
+  78|             <div class="grid w-full grid-cols-[2fr_3fr] border-b border-zinc-200 px-8 py-3 max-md:px-0">
+  79|                 <p class="text-sm font-medium">
+  80|                     @lang('shop::app.customers.account.profile.index.gender')
+  81|                 </p>
+  82| 
+  83|                 <p class="text-sm font-medium text-zinc-500">
+  84|                     {{ $customer->gender ?? '-'}}
+  85|                 </p>
+  86|             </div>
+  87| 
+  88|             {!! view_render_event('bagisto.shop.customers.account.profile.gender.after') !!}
+  89| 
+  90|             {!! view_render_event('bagisto.shop.customers.account.profile.date_of_birth.before') !!}
+  91| 
+  92|             <div class="grid w-full grid-cols-[2fr_3fr] border-b border-zinc-200 px-8 py-3 max-md:px-0">
+  93|                 <p class="text-sm font-medium">
+  94|                     @lang('shop::app.customers.account.profile.index.dob')
+  95|                 </p>
+  96| 
+  97|                 <p class="text-sm font-medium text-zinc-500">
+  98|                     {{ $customer->date_of_birth ?? '-' }}
+  99|                 </p>
+ 100|             </div>
+ 101| 
+ 102|             {!! view_render_event('bagisto.shop.customers.account.profile.date_of_birth.after') !!}
+ 103| 
+ 104|             {!! view_render_event('bagisto.shop.customers.account.profile.email.before') !!}
+ 105| 
+ 106|             <div class="grid w-full grid-cols-[2fr_3fr] border-b border-zinc-200 px-8 py-3 max-md:px-0">
+ 107|                 <p class="text-sm font-medium">
+ 108|                     @lang('shop::app.customers.account.profile.index.email')
+ 109|                 </p>
+ 110| 
+ 111|                 <p class="text-sm font-medium text-zinc-500 no-underline">
+ 112|                     {{ $customer->email }}
+ 113|                 </p>
+ 114|             </div>
+ 115|             
+ 116|             {!! view_render_event('bagisto.shop.customers.account.profile.email.after') !!}
+ 117| 
+ 118|             {!! view_render_event('bagisto.shop.customers.account.profile.delete.before') !!}
+ 119| 
+ 120|             <!-- Profile Delete modal -->
+ 121|             <x-shop::form action="{{ route('shop.customers.account.profile.destroy') }}">
+ 122|                 <x-shop::modal>
+ 123|                     <x-slot:toggle>
+ 124|                         <div class="primary-button rounded-2xl px-11 py-3 max-md:hidden max-md:rounded-lg">
+ 125|                             @lang('shop::app.customers.account.profile.index.delete-profile')
+ 126|                         </div>
+ 127| 
+ 128|                         <div class="rounded-2xl py-3 text-center font-medium text-red-500 max-md:w-full max-md:max-w-full max-md:py-1.5 md:hidden">
+ 129|                             @lang('shop::app.customers.account.profile.index.delete-profile')
+ 130|                         </div>
+ 131|                     </x-slot>
+ 132| 
+ 133|                     <x-slot:header>
+ 134|                         <h2 class="text-2xl font-medium max-md:text-base">
+ 135|                             @lang('shop::app.customers.account.profile.index.enter-password')
+ 136|                         </h2>
+ 137|                     </x-slot>
+ 138| 
+ 139|                     <x-slot:content>
+ 140|                         <x-shop::form.control-group class="!mb-0">
+ 141|                             <x-shop::form.control-group.control
+ 142|                                 type="password"
+ 143|                                 name="password"
+ 144|                                 class="px-6 py-4"
+ 145|                                 rules="required"
+ 146|                                 placeholder="Enter your password"
+ 147|                             />
+ 148| 
+ 149|                             <x-shop::form.control-group.error
+ 150|                                 class="text-left"
+ 151|                                 control-name="password"
+ 152|                             />
+ 153|                         </x-shop::form.control-group>
+ 154|                     </x-slot>
+ 155| 
+ 156|                     <!-- Modal Footer -->
+ 157|                     <x-slot:footer>
+ 158|                         <button
+ 159|                             type="submit"
+ 160|                             class="primary-button flex rounded-2xl px-11 py-3 max-md:rounded-lg max-md:px-6 max-md:text-sm"
+ 161|                         >
+ 162|                             @lang('shop::app.customers.account.profile.index.delete')
+ 163|                         </button>
+ 164|                     </x-slot>
+ 165|                 </x-shop::modal>
+ 166|             </x-shop::form>
+ 167| 
+ 168|             {!! view_render_event('bagisto.shop.customers.account.profile.delete.after') !!}
+ 169| 
+ 170|         </div>
+ 171|     </div>
+ 172| </x-shop::layouts.account>
+ 173| 
  174| 
- 175|     def to_bytes(
- 176|         self,
- 177|         *,
- 178|         exclude: Tuple[str] = cast(Tuple[str], tuple()),
- 179|     ) -> bytes:
- 180|         """Serialize the BuiltinTask to a bytestring.
- 181| 
- 182|         exclude (Tuple): Names of properties to exclude from serialization.
- 183|         RETURNS (bytes): The serialized object.
- 184|         """
- 185|         serialize = {
- 186|             "cfg": lambda: srsly.json_dumps(self.get_cfg()),
- 187|             "prompt_examples": lambda: srsly.msgpack_dumps(self._get_prompt_examples()),
- 188|         }
- 189| 
- 190|         return util.to_bytes(serialize, exclude)
- 191| 
- 192|     def from_bytes(
- 193|         self,
- 194|         bytes_data: bytes,
- 195|         *,
- 196|         exclude: Tuple[str] = cast(Tuple[str], tuple()),
- 197|     ) -> "BuiltinTask":
- 198|         """Load the BuiltinTask from a bytestring.
- 199| 
- 200|         bytes_data (bytes): The data to load.
- 201|         exclude (Tuple[str]): Names of properties to exclude from deserialization.
- 202|         RETURNS (BuiltinTask): Modified BuiltinTask instance.
- 203|         """
- 204|         deserialize = {
- 205|             "cfg": lambda b: self.set_cfg(srsly.json_loads(b)),
- 206|             "prompt_examples": lambda b: self._set_prompt_examples(
- 207|                 srsly.msgpack_loads(b)
- 208|             ),
- 209|         }
- 210| 
- 211|         util.from_bytes(bytes_data, deserialize, exclude)
- 212|         return self
- 213| 
- 214|     def to_disk(
- 215|         self,
- 216|         path: Path,
- 217|         *,
- 218|         exclude: Tuple[str] = cast(Tuple[str], tuple()),
- 219|     ) -> None:
- 220|         """Serialize the task to disk.
- 221| 
- 222|         path (Path): A path (currently unused).
- 223|         exclude (Tuple): Names of properties to exclude from serialization.
- 224|         """
- 225|         serialize = {
- 226|             "cfg": lambda p: srsly.write_json(p, self.get_cfg()),
- 227|             "prompt_examples": lambda p: srsly.write_msgpack(
- 228|                 p, self._get_prompt_examples()
- 229|             ),
- 230|         }
- 231| 
- 232|         util.to_disk(path, serialize, exclude)
- 233| 
- 234|     def from_disk(
- 235|         self,
- 236|         path: Path,
- 237|         *,
- 238|         exclude: Tuple[str] = cast(Tuple[str], tuple()),
- 239|     ) -> "BuiltinTask":
- 240|         """Deserialize the task from disk.
- 241| 
- 242|         path (Path): A path (currently unused).
- 243|         exclude (Tuple): Names of properties to exclude from serialization.
- 244|         RETURNS (BuiltinTask): The BuiltinTask instance.
- 245|         """
- 246| 
- 247|         deserialize = {
- 248|             "cfg": lambda p: self.set_cfg(srsly.read_json(p)),
- 249|             "prompt_examples": lambda p: self._set_prompt_examples(
- 250|                 srsly.read_msgpack(p)
- 251|             ),
- 252|         }
- 253| 
- 254|         util.from_disk(path, deserialize, exclude)
- 255|         return self
- 256| 
- 257|     @property
- 258|     def prompt_template(self) -> str:
- 259|         return self._template
- 260| 
- 261|     @property
- 262|     @abc.abstractmethod
- 263|     def _cfg_keys(self) -> List[str]:
- 264|         """A list of configuration attributes to serialize."""
- 265|         pass
- 266| 
- 267|     @classmethod
- 268|     def _check_extension(cls, extension: str) -> None:
- 269|         """Add extension if need be.
- 270|         extension (str): Extension to check/add.
- 271|         """
- 272|         if not Doc.has_extension(extension):
- 273|             Doc.set_extension(extension, default=[])
- 274| 
- 275|     @staticmethod
- 276|     def _tee_2d_iterable(
- 277|         data: Iterable[Iterable[Any]], n: int
- 278|     ) -> Tuple[Iterable[List[Doc]], ...]:
- 279|         """Tees two-dimensional Iterable. As Iterables in the nested iterables get consumed with the first access, we
- 280|         need to materialize them - this is done by converting them to a list.
- 281|         data (Iterable[Iterable[Any]]): Data to tee.
- 282|         n (int): Number of tees to return.
- 283|         RETURNS (Tuple[Iterable[List[Doc]], ...]): n-sized tuple of Iterables with inner Iterables converted to Lists.
- 284|         """
- 285|         return tee((list(inner_data) for inner_data in data), n)
- 286| 
- 287| 
- 288| class BuiltinTaskWithLabels(BuiltinTask, abc.ABC):
- 289|     """Built-in tasks with labels."""
- 290| 
- 291|     def __init__(
- 292|         self,
- 293|         parse_responses: TaskResponseParser,
- 294|         prompt_example_type: Type[FewshotExample[Self]],
- 295|         template: str,
- 296|         prompt_examples: Optional[List[FewshotExample[Self]]],
- 297|         shard_mapper: ShardMapper,
- 298|         shard_reducer: ShardReducer[Self],
- 299|         labels: List[str],
- 300|         label_definitions: Optional[Dict[str, str]],
- 301|         normalizer: Optional[Callable[[str], str]],
- 302|     ):
- 303|         """Built-in task with labels.
- 304| 
- 305|         parse_responses (TaskResponseParser[Self]): Callable for parsing LLM responses for this task.
- 306|         prompt_example_type (Type[FewshotExample[Self]): Type to use for fewshot examples.
- 307|         template (str): Prompt template passed to the model.
- 308|         prompt_examples (Optional[List[FewshotExample[Self]]]): Optional list of few-shot examples to include in prompts.
- 309|         shard_mapper (ShardMapper): Maps docs to shards if they don't fit into the model context.
- 310|         shard_reducer (ShardReducer[Self]): Reduces doc shards back into one doc instance.
- 311|         labels (List[str]): List of labels to pass to the template.
- 312|             Leave empty to (optionally) populate it at initialization time.
- 313|         label_definitions (Optional[Dict[str, str]]): Map of label -> description
- 314|             of the label to help the language model output the entities wanted.
- 315|             It is usually easier to provide these definitions rather than
- 316|             full examples, although both can be provided.
- 317|         normalizer (Optional[Callable[[str], str]]): optional normalizer function.
- 318|         """
- 319|         super().__init__(
- 320|             parse_responses=parse_responses,
- 321|             prompt_example_type=prompt_example_type,
- 322|             template=template,
- 323|             prompt_examples=prompt_examples,
- 324|             shard_mapper=shard_mapper,
- 325|             shard_reducer=shard_reducer,
- 326|         )
- 327|         self._normalizer = normalizer if normalizer else lowercase_normalizer()
- 328|         self._label_dict = {
- 329|             self._normalizer(label): label for label in sorted(set(labels))
- 330|         }
- 331|         self._label_definitions = label_definitions
- 332| 
- 333|     def _initialize(  # type: ignore[override]
- 334|         self,
- 335|         get_examples: Callable[[], Iterable["Example"]],
- 336|         nlp: Language,
- 337|         labels: List[str] = [],
- 338|         n_prompt_examples: int = 0,
- 339|         **kwargs,
- 340|     ) -> None:
- 341|         """Supports initialization of tasks with labels by auto-discovering labels and returning the derived few-shot
- 342|         examples and label dict.
- 343| 
- 344|         Labels can be set through, by order of precedence:
- 345| 
- 346|         - the `[initialize]` section of the pipeline configuration
- 347|         - the `labels` argument supplied to the task factory
- 348|         - the labels found in the examples
- 349| 
- 350|         get_examples (Callable[[], Iterable["Example"]]): Callable that provides examples
- 351|             for initialization.
- 352|         nlp (Language): Language instance.
- 353|         labels (List[str]): Optional list of labels.
- 354|         n_prompt_examples (int): How many prompt examples to infer from the Example objects.
- 355|             0 by default. Takes all examples if set to -1.
- 356|         """
- 357|         if not labels:
- 358|             labels = list(self._label_dict.values())
- 359|         infer_labels = not labels
- 360| 
- 361|         if infer_labels:
- 362|             labels = []
- 363| 
- 364|         for eg in get_examples():
- 365|             if infer_labels:
- 366|                 labels.extend(self._extract_labels_from_example(eg))
- 367|             if n_prompt_examples < 0 or len(self._prompt_examples) < n_prompt_examples:
- 368|                 prompt_example = self._prompt_example_type.generate(eg, self)  # type: ignore[arg-type]
- 369|                 if prompt_example:
- 370|                     self._prompt_examples.append(prompt_example)
- 371| 
- 372|         self._label_dict = {
- 373|             self._normalizer(label): label for label in sorted(set(labels))
- 374|         }
- 375| 
- 376|     @abc.abstractmethod
- 377|     def _extract_labels_from_example(self, example: Example) -> List[str]:
- 378|         """Extracts labels from Example instance.
- 379|         example (Example): Example to extract labels from.
- 380|         RETURNS (List[str]): Labels extracted from Example instance.
- 381|         """
- 382| 
- 383|     @property
- 384|     def labels(self) -> Tuple[str, ...]:
- 385|         return tuple(self._label_dict.values())
- 386| 
- 387|     def add_label(self, label: str, label_definition: Optional[str] = None) -> int:
- 388|         """Add a label to the task"""
- 389|         if not isinstance(label, str):
- 390|             raise ValueError(Errors.E187)
- 391|         if label in self.labels:
- 392|             return 0
- 393|         self._label_dict[self._normalizer(label)] = label
- 394|         if label_definition is None:
- 395|             return 1
- 396|         if self._label_definitions is None:
- 397|             self._label_definitions = {}
- 398|         self._label_definitions[label] = label_definition
- 399|         return 1
- 400| 
- 401|     def clear(self) -> None:
- 402|         """Reset all labels."""
- 403|         self._label_dict = {}
- 404|         self._label_definitions = None
- 405| 
- 406|     @property
- 407|     def normalizer(self) -> Callable[[str], str]:
- 408|         return self._normalizer
- 409| 
- 410|     @property
- 411|     def label_dict(self) -> Dict[str, str]:
- 412|         return self._label_dict
- 413| 
- 414|     @property
- 415|     def label_definitions(self) -> Optional[Dict[str, str]]:
- 416|         return self._label_definitions
- 417| 
- 418| 
 
-### id=8164 lang=go
+### id=8195 lang=go
 [CODE]
-   1| package fbhttp
+   1| package files
    2| 
    3| import (
-   4| 	"errors"
-   5| 	"io/fs"
-   6| 	"log"
-   7| 	"net/http"
-   8| 	"net/url"
-   9| 	gopath "path"
-  10| 	"path/filepath"
-  11| 	"strings"
-  12| 
-  13| 	"github.com/filebrowser/filebrowser/v2/files"
-  14| 	"github.com/filebrowser/filebrowser/v2/fileutils"
-  15| 	"github.com/filebrowser/filebrowser/v2/users"
-  16| 	"github.com/mholt/archives"
-  17| )
-  18| 
-  19| func slashClean(name string) string {
-  20| 	if name == "" || name[0] != '/' {
-  21| 		name = "/" + name
-  22| 	}
-  23| 	return gopath.Clean(name)
-  24| }
-  25| 
-  26| func parseQueryFiles(r *http.Request, f *files.FileInfo, _ *users.User) ([]string, error) {
-  27| 	var fileSlice []string
-  28| 	names := strings.Split(r.URL.Query().Get("files"), ",")
-  29| 
-  30| 	if len(names) == 0 {
-  31| 		fileSlice = append(fileSlice, f.Path)
-  32| 	} else {
-  33| 		for _, name := range names {
-  34| 			name, err := url.QueryUnescape(strings.ReplaceAll(name, "+", "%2B"))
-  35| 			if err != nil {
-  36| 				return nil, err
-  37| 			}
-  38| 
-  39| 			name = slashClean(name)
-  40| 			fileSlice = append(fileSlice, filepath.Join(f.Path, name))
-  41| 		}
-  42| 	}
-  43| 
-  44| 	return fileSlice, nil
-  45| }
-  46| 
-  47| func parseQueryAlgorithm(r *http.Request) (string, archives.Archival, error) {
-  48| 	switch r.URL.Query().Get("algo") {
-  49| 	case "zip", "true", "":
-  50| 		return ".zip", archives.Zip{}, nil
-  51| 	case "tar":
-  52| 		return ".tar", archives.Tar{}, nil
-  53| 	case "targz":
-  54| 		return ".tar.gz", archives.CompressedArchive{Compression: archives.Gz{}, Archival: archives.Tar{}}, nil
-  55| 	case "tarbz2":
-  56| 		return ".tar.bz2", archives.CompressedArchive{Compression: archives.Bz2{}, Archival: archives.Tar{}}, nil
-  57| 	case "tarxz":
-  58| 		return ".tar.xz", archives.CompressedArchive{Compression: archives.Xz{}, Archival: archives.Tar{}}, nil
-  59| 	case "tarlz4":
-  60| 		return ".tar.lz4", archives.CompressedArchive{Compression: archives.Lz4{}, Archival: archives.Tar{}}, nil
-  61| 	case "tarsz":
-  62| 		return ".tar.sz", archives.CompressedArchive{Compression: archives.Sz{}, Archival: archives.Tar{}}, nil
-  63| 	case "tarbr":
-  64| 		return ".tar.br", archives.CompressedArchive{Compression: archives.Brotli{}, Archival: archives.Tar{}}, nil
-  65| 	case "tarzst":
-  66| 		return ".tar.zst", archives.CompressedArchive{Compression: archives.Zstd{}, Archival: archives.Tar{}}, nil
-  67| 	default:
-  68| 		return "", nil, errors.New("format not implemented")
-  69| 	}
-  70| }
-  71| 
-  72| func setContentDisposition(w http.ResponseWriter, r *http.Request, file *files.FileInfo) {
-  73| 	if r.URL.Query().Get("inline") == "true" {
-  74| 		// As per RFC6266 section 4.3
-  75| 		w.Header().Set("Content-Disposition", "inline; filename*=utf-8''"+url.PathEscape(file.Name))
-  76| 	} else {
-  77| 		// As per RFC6266 section 4.3
-  78| 		w.Header().Set("Content-Disposition", "attachment; filename*=utf-8''"+url.PathEscape(file.Name))
-  79| 		w.Header().Set("Content-Type", "application/octet-stream")
-  80| 	}
-  81| }
-  82| 
-  83| var rawHandler = withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
-  84| 	if !d.user.Perm.Download {
-  85| 		return http.StatusAccepted, nil
-  86| 	}
-  87| 
-  88| 	file, err := files.NewFileInfo(&files.FileOptions{
-  89| 		Fs:         d.user.Fs,
-  90| 		Path:       r.URL.Path,
-  91| 		Modify:     d.user.Perm.Modify,
-  92| 		Expand:     false,
-  93| 		ReadHeader: d.server.TypeDetectionByHeader,
-  94| 		Checker:    d,
-  95| 	})
-  96| 	if err != nil {
-  97| 		return errToStatus(err), err
-  98| 	}
-  99| 
- 100| 	if files.IsNamedPipe(file.Mode) {
- 101| 		setContentDisposition(w, r, file)
- 102| 		return 0, nil
+   4| 	"os"
+   5| 	"path"
+   6| 	"path/filepath"
+   7| 	"testing"
+   8| 
+   9| 	"github.com/spf13/afero"
+  10| )
+  11| 
+  12| func TestScopedFs(t *testing.T) {
+  13| 	t.Run("path inside scope is allowed", func(t *testing.T) {
+  14| 		scope := t.TempDir()
+  15| 		if err := os.WriteFile(filepath.Join(scope, "file.txt"), []byte("x"), 0o644); err != nil {
+  16| 			t.Fatal(err)
+  17| 		}
+  18| 		fs := NewScopedFs(afero.NewOsFs(), scope)
+  19| 
+  20| 		if _, err := fs.Stat("/file.txt"); err != nil {
+  21| 			t.Fatalf("expected in-scope file to be accessible, got %v", err)
+  22| 		}
+  23| 	})
+  24| 
+  25| 	t.Run("new file inside scope can be created", func(t *testing.T) {
+  26| 		scope := t.TempDir()
+  27| 		fs := NewScopedFs(afero.NewOsFs(), scope)
+  28| 
+  29| 		f, err := fs.OpenFile("/does-not-exist-yet.txt", os.O_RDWR|os.O_CREATE, 0o644)
+  30| 		if err != nil {
+  31| 			t.Fatalf("expected to create a new in-scope file, got %v", err)
+  32| 		}
+  33| 		_ = f.Close()
+  34| 	})
+  35| 
+  36| 	// Regression for #5975: when the scope resolves to the filesystem root,
+  37| 	// root+separator used to be "//", which no path matched, so every write
+  38| 	// was rejected with os.ErrPermission (HTTP 403).
+  39| 	t.Run("filesystem root scope allows access", func(t *testing.T) {
+  40| 		f := filepath.Join(t.TempDir(), "file.txt")
+  41| 		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+  42| 			t.Fatal(err)
+  43| 		}
+  44| 		fs := NewScopedFs(afero.NewOsFs(), "/")
+  45| 
+  46| 		if _, err := fs.Stat(f); err != nil {
+  47| 			t.Fatalf("expected a path under root scope to be accessible, got %v", err)
+  48| 		}
+  49| 	})
+  50| 
+  51| 	t.Run("escaping symlink to a sibling is rejected", func(t *testing.T) {
+  52| 		base := t.TempDir()
+  53| 		scope := filepath.Join(base, "srv")
+  54| 		sibling := filepath.Join(base, "srvother")
+  55| 		for _, d := range []string{scope, sibling} {
+  56| 			if err := os.MkdirAll(d, 0o755); err != nil {
+  57| 				t.Fatal(err)
+  58| 			}
+  59| 		}
+  60| 		if err := os.WriteFile(filepath.Join(sibling, "secret.txt"), []byte("secret"), 0o644); err != nil {
+  61| 			t.Fatal(err)
+  62| 		}
+  63| 		// A symlink lexically inside the scope pointing at a sibling directory
+  64| 		// must not be followed for reads or stats.
+  65| 		if err := os.Symlink(sibling, filepath.Join(scope, "escape")); err != nil {
+  66| 			t.Skipf("cannot create symlink: %v", err)
+  67| 		}
+  68| 		fs := NewScopedFs(afero.NewOsFs(), scope)
+  69| 
+  70| 		if _, err := fs.Stat("/escape"); !os.IsPermission(err) {
+  71| 			t.Fatalf("expected stat of escaping symlink to be rejected, got %v", err)
+  72| 		}
+  73| 		if _, err := fs.Open("/escape/secret.txt"); !os.IsPermission(err) {
+  74| 			t.Fatalf("expected read through escaping symlink to be rejected, got %v", err)
+  75| 		}
+  76| 	})
+  77| 
+  78| 	t.Run("symlink whose target stays within scope is allowed", func(t *testing.T) {
+  79| 		scope := t.TempDir()
+  80| 		if err := os.MkdirAll(filepath.Join(scope, "real"), 0o755); err != nil {
+  81| 			t.Fatal(err)
+  82| 		}
+  83| 		if err := os.WriteFile(filepath.Join(scope, "real", "f.txt"), []byte("x"), 0o644); err != nil {
+  84| 			t.Fatal(err)
+  85| 		}
+  86| 		if err := os.Symlink(filepath.Join(scope, "real"), filepath.Join(scope, "link")); err != nil {
+  87| 			t.Skipf("cannot create symlink: %v", err)
+  88| 		}
+  89| 		fs := NewScopedFs(afero.NewOsFs(), scope)
+  90| 
+  91| 		if _, err := fs.Stat("/link/f.txt"); err != nil {
+  92| 			t.Fatalf("expected in-scope symlink target to be accessible, got %v", err)
+  93| 		}
+  94| 	})
+  95| }
+  96| 
+  97| // stat must reject a regular file reached through a symlinked ancestor that
+  98| // escapes the scope (GHSA-hf77-9m7w-fq8q), while still serving in-scope files.
+  99| func TestStatRejectsLinkedAncestorEscape(t *testing.T) {
+ 100| 	scope := t.TempDir()
+ 101| 	if err := os.MkdirAll(filepath.Join(scope, "shared"), 0o755); err != nil {
+ 102| 		t.Fatal(err)
  103| 	}
- 104| 
- 105| 	if !file.IsDir {
- 106| 		return rawFileHandler(w, r, file)
- 107| 	}
- 108| 
- 109| 	return rawDirHandler(w, r, d, file)
- 110| })
- 111| 
- 112| func getFiles(d *data, path, commonPath string) ([]archives.FileInfo, error) {
- 113| 	if !d.Check(path) {
- 114| 		return nil, nil
+ 104| 	if err := os.MkdirAll(filepath.Join(scope, "private"), 0o755); err != nil {
+ 105| 		t.Fatal(err)
+ 106| 	}
+ 107| 	if err := os.WriteFile(filepath.Join(scope, "private", "secret.txt"), []byte("secret"), 0o600); err != nil {
+ 108| 		t.Fatal(err)
+ 109| 	}
+ 110| 	if err := os.WriteFile(filepath.Join(scope, "shared", "ok.txt"), []byte("ok"), 0o600); err != nil {
+ 111| 		t.Fatal(err)
+ 112| 	}
+ 113| 	if err := os.Symlink(filepath.Join(scope, "private"), filepath.Join(scope, "shared", "link")); err != nil {
+ 114| 		t.Skipf("cannot create symlink: %v", err)
  115| 	}
  116| 
- 117| 	info, err := d.user.Fs.Stat(path)
- 118| 	if err != nil {
- 119| 		return nil, err
- 120| 	}
- 121| 
- 122| 	var archiveFiles []archives.FileInfo
- 123| 
- 124| 	if path != commonPath {
- 125| 		nameInArchive := strings.TrimPrefix(path, commonPath)
- 126| 		nameInArchive = strings.TrimPrefix(nameInArchive, string(filepath.Separator))
- 127| 		nameInArchive = filepath.ToSlash(nameInArchive)
- 128| 		// filepath.ToSlash only rewrites the host separator, so on a Linux
- 129| 		// host a stored backslash survives and is emitted verbatim into the
- 130| 		// archive. Windows extractors then treat "\" as a path separator,
- 131| 		// allowing the entry to escape the extraction directory (zip-slip).
- 132| 		// Strip Windows separators regardless of host OS.
- 133| 		nameInArchive = strings.ReplaceAll(nameInArchive, "\\", "/")
- 134| 
- 135| 		archiveFiles = append(archiveFiles, archives.FileInfo{
- 136| 			FileInfo:      info,
- 137| 			NameInArchive: nameInArchive,
- 138| 			Open: func() (fs.File, error) {
- 139| 				return d.user.Fs.Open(path)
- 140| 			},
- 141| 		})
- 142| 	}
- 143| 
- 144| 	if info.IsDir() {
- 145| 		f, err := d.user.Fs.Open(path)
- 146| 		if err != nil {
- 147| 			return nil, err
- 148| 		}
- 149| 		defer f.Close()
- 150| 
- 151| 		names, err := f.Readdirnames(0)
- 152| 		if err != nil {
- 153| 			return nil, err
- 154| 		}
- 155| 
- 156| 		for _, name := range names {
- 157| 			fPath := filepath.Join(path, name)
- 158| 			subFiles, err := getFiles(d, fPath, commonPath)
- 159| 			if err != nil {
- 160| 				log.Printf("Failed to get files from %s: %v", fPath, err)
- 161| 				continue
- 162| 			}
- 163| 			archiveFiles = append(archiveFiles, subFiles...)
- 164| 		}
- 165| 	}
- 166| 
- 167| 	return archiveFiles, nil
- 168| }
- 169| 
- 170| func rawDirHandler(w http.ResponseWriter, r *http.Request, d *data, file *files.FileInfo) (int, error) {
- 171| 	filenames, err := parseQueryFiles(r, file, d.user)
- 172| 	if err != nil {
- 173| 		return http.StatusInternalServerError, err
- 174| 	}
- 175| 
- 176| 	extension, archiver, err := parseQueryAlgorithm(r)
- 177| 	if err != nil {
- 178| 		return http.StatusInternalServerError, err
- 179| 	}
- 180| 
- 181| 	commonDir := fileutils.CommonPrefix(filepath.Separator, filenames...)
- 182| 
- 183| 	var allFiles []archives.FileInfo
- 184| 	for _, fname := range filenames {
- 185| 		archiveFiles, err := getFiles(d, fname, commonDir)
- 186| 		if err != nil {
- 187| 			log.Printf("Failed to get files from %s: %v", fname, err)
- 188| 			continue
- 189| 		}
- 190| 		allFiles = append(allFiles, archiveFiles...)
- 191| 	}
- 192| 
- 193| 	name := filepath.Base(commonDir)
- 194| 	if name == "." || name == "" || name == string(filepath.Separator) {
- 195| 		if file.Name != "" {
- 196| 			name = file.Name
- 197| 		} else {
- 198| 			actual, statErr := file.Fs.Stat(".")
- 199| 			if statErr != nil {
- 200| 				return http.StatusInternalServerError, statErr
- 201| 			}
- 202| 			name = actual.Name()
- 203| 		}
- 204| 	}
- 205| 	if len(filenames) > 1 {
- 206| 		name = "_" + name
- 207| 	}
- 208| 	name += extension
- 209| 	w.Header().Set("Content-Disposition", "attachment; filename*=utf-8''"+url.PathEscape(name))
- 210| 
- 211| 	if err := archiver.Archive(r.Context(), w, allFiles); err != nil {
- 212| 		return http.StatusInternalServerError, err
- 213| 	}
- 214| 
- 215| 	return 0, nil
- 216| }
- 217| 
- 218| func rawFileHandler(w http.ResponseWriter, r *http.Request, file *files.FileInfo) (int, error) {
- 219| 	fd, err := file.Fs.Open(file.Path)
- 220| 	if err != nil {
- 221| 		return http.StatusInternalServerError, err
- 222| 	}
- 223| 	defer fd.Close()
- 224| 
- 225| 	setContentDisposition(w, r, file)
- 226| 	w.Header().Add("Content-Security-Policy", `script-src 'none';`)
- 227| 	w.Header().Set("X-Content-Type-Options", "nosniff")
- 228| 	w.Header().Set("Cache-Control", "private")
- 229| 	http.ServeContent(w, r, file.Name, file.ModTime, fd)
- 230| 	return 0, nil
- 231| }
- 232| 
- 233| 
-
-### id=8165 lang=go
-[CODE]
-   1| package fbhttp
-   2| 
-   3| import (
-   4| 	"errors"
-   5| 	"fmt"
-   6| 	"io/fs"
-   7| 	"log"
-   8| 	"net/http"
-   9| 	"net/url"
-  10| 	gopath "path"
-  11| 	"path/filepath"
-  12| 	"strings"
-  13| 
-  14| 	"github.com/filebrowser/filebrowser/v2/files"
-  15| 	"github.com/filebrowser/filebrowser/v2/fileutils"
-  16| 	"github.com/filebrowser/filebrowser/v2/users"
-  17| 	"github.com/mholt/archives"
-  18| )
-  19| 
-  20| func slashClean(name string) string {
-  21| 	if name == "" || name[0] != '/' {
-  22| 		name = "/" + name
-  23| 	}
-  24| 	return gopath.Clean(name)
-  25| }
-  26| 
-  27| func parseQueryFiles(r *http.Request, f *files.FileInfo, _ *users.User) ([]string, error) {
-  28| 	var fileSlice []string
-  29| 	names := strings.Split(r.URL.Query().Get("files"), ",")
-  30| 
-  31| 	if len(names) == 0 {
-  32| 		fileSlice = append(fileSlice, f.Path)
-  33| 	} else {
-  34| 		for _, name := range names {
-  35| 			name, err := url.QueryUnescape(strings.ReplaceAll(name, "+", "%2B"))
-  36| 			if err != nil {
-  37| 				return nil, err
-  38| 			}
-  39| 
-  40| 			name = slashClean(name)
-  41| 			fileSlice = append(fileSlice, filepath.Join(f.Path, name))
-  42| 		}
-  43| 	}
-  44| 
-  45| 	return fileSlice, nil
-  46| }
-  47| 
-  48| func parseQueryAlgorithm(r *http.Request) (string, archives.Archival, error) {
-  49| 	switch r.URL.Query().Get("algo") {
-  50| 	case "zip", "true", "":
-  51| 		return ".zip", archives.Zip{}, nil
-  52| 	case "tar":
-  53| 		return ".tar", archives.Tar{}, nil
-  54| 	case "targz":
-  55| 		return ".tar.gz", archives.CompressedArchive{Compression: archives.Gz{}, Archival: archives.Tar{}}, nil
-  56| 	case "tarbz2":
-  57| 		return ".tar.bz2", archives.CompressedArchive{Compression: archives.Bz2{}, Archival: archives.Tar{}}, nil
-  58| 	case "tarxz":
-  59| 		return ".tar.xz", archives.CompressedArchive{Compression: archives.Xz{}, Archival: archives.Tar{}}, nil
-  60| 	case "tarlz4":
-  61| 		return ".tar.lz4", archives.CompressedArchive{Compression: archives.Lz4{}, Archival: archives.Tar{}}, nil
-  62| 	case "tarsz":
-  63| 		return ".tar.sz", archives.CompressedArchive{Compression: archives.Sz{}, Archival: archives.Tar{}}, nil
-  64| 	case "tarbr":
-  65| 		return ".tar.br", archives.CompressedArchive{Compression: archives.Brotli{}, Archival: archives.Tar{}}, nil
-  66| 	case "tarzst":
-  67| 		return ".tar.zst", archives.CompressedArchive{Compression: archives.Zstd{}, Archival: archives.Tar{}}, nil
-  68| 	default:
-  69| 		return "", nil, errors.New("format not implemented")
-  70| 	}
-  71| }
-  72| 
-  73| func setContentDisposition(w http.ResponseWriter, r *http.Request, file *files.FileInfo) {
-  74| 	if r.URL.Query().Get("inline") == "true" {
-  75| 		// As per RFC6266 section 4.3
-  76| 		w.Header().Set("Content-Disposition", "inline; filename*=utf-8''"+url.PathEscape(file.Name))
-  77| 	} else {
-  78| 		// As per RFC6266 section 4.3
-  79| 		w.Header().Set("Content-Disposition", "attachment; filename*=utf-8''"+url.PathEscape(file.Name))
-  80| 		w.Header().Set("Content-Type", "application/octet-stream")
-  81| 	}
-  82| }
-  83| 
-  84| var rawHandler = withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
-  85| 	if !d.user.Perm.Download {
-  86| 		return http.StatusAccepted, nil
-  87| 	}
-  88| 
-  89| 	file, err := files.NewFileInfo(&files.FileOptions{
-  90| 		Fs:         d.user.Fs,
-  91| 		Path:       r.URL.Path,
-  92| 		Modify:     d.user.Perm.Modify,
-  93| 		Expand:     false,
-  94| 		ReadHeader: d.server.TypeDetectionByHeader,
-  95| 		Checker:    d,
-  96| 	})
-  97| 	if err != nil {
-  98| 		return errToStatus(err), err
-  99| 	}
- 100| 
- 101| 	if files.IsNamedPipe(file.Mode) {
- 102| 		setContentDisposition(w, r, file)
- 103| 		return 0, nil
- 104| 	}
- 105| 
- 106| 	if !file.IsDir {
- 107| 		return rawFileHandler(w, r, file)
- 108| 	}
- 109| 
- 110| 	return rawDirHandler(w, r, d, file)
- 111| })
- 112| 
- 113| func getFiles(d *data, path, commonPath string) ([]archives.FileInfo, error) {
- 114| 	if !d.Check(path) {
- 115| 		return nil, nil
- 116| 	}
- 117| 
- 118| 	info, err := d.user.Fs.Stat(path)
- 119| 	if err != nil {
- 120| 		return nil, err
- 121| 	}
- 122| 
- 123| 	var archiveFiles []archives.FileInfo
- 124| 
- 125| 	if path != commonPath {
- 126| 		nameInArchive := strings.TrimPrefix(path, commonPath)
- 127| 		nameInArchive = strings.TrimPrefix(nameInArchive, string(filepath.Separator))
- 128| 		nameInArchive = filepath.ToSlash(nameInArchive)
- 129| 		// A backslash is a legal filename character on POSIX hosts, so it can
- 130| 		// reach here verbatim. Rewriting it to the path separator "/" would
- 131| 		// manufacture a traversal sequence (e.g. "..\..\x" -> "../../x") that
- 132| 		// escapes the extraction directory on the victim's machine, while
- 133| 		// leaving it as "\" lets Windows extractors treat it as a separator.
- 134| 		// Neutralize it to an inert character instead of turning it into one.
- 135| 		nameInArchive = strings.ReplaceAll(nameInArchive, "\\", "_")
- 136| 
- 137| 		// Defense in depth: never emit an archive entry whose path escapes the
- 138| 		// archive root, regardless of how the name was produced.
- 139| 		if cleaned := gopath.Clean("/" + nameInArchive); cleaned != "/"+nameInArchive {
- 140| 			return nil, fmt.Errorf("refusing unsafe archive entry name: %q", nameInArchive)
- 141| 		}
- 142| 
- 143| 		archiveFiles = append(archiveFiles, archives.FileInfo{
- 144| 			FileInfo:      info,
- 145| 			NameInArchive: nameInArchive,
- 146| 			Open: func() (fs.File, error) {
- 147| 				return d.user.Fs.Open(path)
- 148| 			},
- 149| 		})
- 150| 	}
+ 117| 	// Filesystem scoped to the shared directory, as a public share would be.
+ 118| 	bfs := NewScopedFs(afero.NewOsFs(), filepath.Join(scope, "shared"))
+ 119| 
+ 120| 	if _, err := stat(&FileOptions{Fs: bfs, Path: "/link/secret.txt"}); !os.IsPermission(err) {
+ 121| 		t.Fatalf("expected permission error for linked-ancestor escape, got %v", err)
+ 122| 	}
+ 123| 	if _, err := stat(&FileOptions{Fs: bfs, Path: "/ok.txt"}); err != nil {
+ 124| 		t.Fatalf("expected in-scope file to be served, got %v", err)
+ 125| 	}
+ 126| }
+ 127| 
+ 128| type allowAllChecker struct{}
+ 129| 
+ 130| func (allowAllChecker) Check(string) bool {
+ 131| 	return true
+ 132| }
+ 133| 
+ 134| type inaccessibleChildFs struct {
+ 135| 	afero.Fs
+ 136| 	child string
+ 137| }
+ 138| 
+ 139| func (fs inaccessibleChildFs) Open(name string) (afero.File, error) {
+ 140| 	file, err := fs.Fs.Open(name)
+ 141| 	if err != nil {
+ 142| 		return nil, err
+ 143| 	}
+ 144| 
+ 145| 	if path.Clean(name) == "/" {
+ 146| 		return inaccessibleChildDir{File: file}, nil
+ 147| 	}
+ 148| 
+ 149| 	return file, nil
+ 150| }
  151| 
- 152| 	if info.IsDir() {
- 153| 		f, err := d.user.Fs.Open(path)
- 154| 		if err != nil {
- 155| 			return nil, err
- 156| 		}
- 157| 		defer f.Close()
- 158| 
- 159| 		names, err := f.Readdirnames(0)
- 160| 		if err != nil {
- 161| 			return nil, err
- 162| 		}
- 163| 
- 164| 		for _, name := range names {
- 165| 			fPath := filepath.Join(path, name)
- 166| 			subFiles, err := getFiles(d, fPath, commonPath)
- 167| 			if err != nil {
- 168| 				log.Printf("Failed to get files from %s: %v", fPath, err)
- 169| 				continue
- 170| 			}
- 171| 			archiveFiles = append(archiveFiles, subFiles...)
- 172| 		}
- 173| 	}
- 174| 
- 175| 	return archiveFiles, nil
- 176| }
- 177| 
- 178| func rawDirHandler(w http.ResponseWriter, r *http.Request, d *data, file *files.FileInfo) (int, error) {
- 179| 	filenames, err := parseQueryFiles(r, file, d.user)
- 180| 	if err != nil {
- 181| 		return http.StatusInternalServerError, err
- 182| 	}
- 183| 
- 184| 	extension, archiver, err := parseQueryAlgorithm(r)
- 185| 	if err != nil {
- 186| 		return http.StatusInternalServerError, err
+ 152| func (fs inaccessibleChildFs) Stat(name string) (os.FileInfo, error) {
+ 153| 	if path.Clean(name) == fs.child {
+ 154| 		return nil, os.ErrPermission
+ 155| 	}
+ 156| 
+ 157| 	return fs.Fs.Stat(name)
+ 158| }
+ 159| 
+ 160| func (fs inaccessibleChildFs) LstatIfPossible(name string) (os.FileInfo, bool, error) {
+ 161| 	if path.Clean(name) == fs.child {
+ 162| 		return nil, false, os.ErrPermission
+ 163| 	}
+ 164| 
+ 165| 	if lstater, ok := fs.Fs.(afero.Lstater); ok {
+ 166| 		return lstater.LstatIfPossible(name)
+ 167| 	}
+ 168| 
+ 169| 	info, err := fs.Fs.Stat(name)
+ 170| 	return info, false, err
+ 171| }
+ 172| 
+ 173| type inaccessibleChildDir struct {
+ 174| 	afero.File
+ 175| }
+ 176| 
+ 177| func (dir inaccessibleChildDir) Readdir(int) ([]os.FileInfo, error) {
+ 178| 	return nil, os.ErrPermission
+ 179| }
+ 180| 
+ 181| func TestReadListingSkipsInaccessibleChildren(t *testing.T) {
+ 182| 	memFs := afero.NewMemMapFs()
+ 183| 	for _, dir := range []string{"/media", "/proton-mount"} {
+ 184| 		if err := memFs.Mkdir(dir, 0o755); err != nil {
+ 185| 			t.Fatal(err)
+ 186| 		}
  187| 	}
  188| 
- 189| 	commonDir := fileutils.CommonPrefix(filepath.Separator, filenames...)
- 190| 
- 191| 	var allFiles []archives.FileInfo
- 192| 	for _, fname := range filenames {
- 193| 		archiveFiles, err := getFiles(d, fname, commonDir)
- 194| 		if err != nil {
- 195| 			log.Printf("Failed to get files from %s: %v", fname, err)
- 196| 			continue
- 197| 		}
- 198| 		allFiles = append(allFiles, archiveFiles...)
- 199| 	}
- 200| 
- 201| 	name := filepath.Base(commonDir)
- 202| 	if name == "." || name == "" || name == string(filepath.Separator) {
- 203| 		if file.Name != "" {
- 204| 			name = file.Name
- 205| 		} else {
- 206| 			actual, statErr := file.Fs.Stat(".")
- 207| 			if statErr != nil {
- 208| 				return http.StatusInternalServerError, statErr
- 209| 			}
- 210| 			name = actual.Name()
- 211| 		}
- 212| 	}
- 213| 	if len(filenames) > 1 {
- 214| 		name = "_" + name
- 215| 	}
- 216| 	name += extension
- 217| 	w.Header().Set("Content-Disposition", "attachment; filename*=utf-8''"+url.PathEscape(name))
- 218| 
- 219| 	if err := archiver.Archive(r.Context(), w, allFiles); err != nil {
- 220| 		return http.StatusInternalServerError, err
+ 189| 	file, err := NewFileInfo(&FileOptions{
+ 190| 		Fs:      inaccessibleChildFs{Fs: memFs, child: "/proton-mount"},
+ 191| 		Path:    "/",
+ 192| 		Expand:  true,
+ 193| 		Checker: allowAllChecker{},
+ 194| 	})
+ 195| 	if err != nil {
+ 196| 		t.Fatal(err)
+ 197| 	}
+ 198| 
+ 199| 	if file.Listing == nil {
+ 200| 		t.Fatal("expected root listing")
+ 201| 	}
+ 202| 
+ 203| 	if got := len(file.Items); got != 1 {
+ 204| 		t.Fatalf("expected one accessible child, got %d", got)
+ 205| 	}
+ 206| 
+ 207| 	if got := file.Items[0].Name; got != "media" {
+ 208| 		t.Fatalf("expected accessible child to be listed, got %q", got)
+ 209| 	}
+ 210| 
+ 211| 	if got := file.NumDirs; got != 1 {
+ 212| 		t.Fatalf("expected one listed directory, got %d", got)
+ 213| 	}
+ 214| }
+ 215| 
+ 216| func TestFileInfoRealPathUsesScopedFsRealPath(t *testing.T) {
+ 217| 	root := t.TempDir()
+ 218| 	file := &FileInfo{
+ 219| 		Fs:   NewScopedFs(afero.NewOsFs(), root),
+ 220| 		Path: "/root/downloads",
  221| 	}
  222| 
- 223| 	return 0, nil
- 224| }
- 225| 
- 226| func rawFileHandler(w http.ResponseWriter, r *http.Request, file *files.FileInfo) (int, error) {
- 227| 	fd, err := file.Fs.Open(file.Path)
- 228| 	if err != nil {
- 229| 		return http.StatusInternalServerError, err
- 230| 	}
- 231| 	defer fd.Close()
- 232| 
- 233| 	setContentDisposition(w, r, file)
- 234| 	w.Header().Add("Content-Security-Policy", `script-src 'none';`)
- 235| 	w.Header().Set("X-Content-Type-Options", "nosniff")
- 236| 	w.Header().Set("Cache-Control", "private")
- 237| 	http.ServeContent(w, r, file.Name, file.ModTime, fd)
- 238| 	return 0, nil
- 239| }
- 240| 
- 241| 
+ 223| 	got := file.RealPath()
+ 224| 	want := filepath.Join(root, "root", "downloads")
+ 225| 	if got != want {
+ 226| 		t.Fatalf("got %q, want %q", got, want)
+ 227| 	}
+ 228| }
+ 229| 
+ 230| 
+
+### id=8290 lang=node.js/javascript
+[CODE]
+   1| const express = require('express');
+   2| const mysql = require('mysql2/promise');
+   3| 
+   4| const app = express();
+   5| app.use(express.json());
+   6| 
+   7| const pool = mysql.createPool({
+   8|   host: 'localhost',
+   9|   user: 'root',
+  10|   password: 'secret',
+  11|   database: 'pimcore_clone'
+  12| });
+  13| 
+  14| // POST /api/composite-indices/:table
+  15| // body: { type: 'query', compositeIndices: [{ index_type, index_key, index_columns: [] }] }
+  16| app.post('/api/composite-indices/:table', async (req, res) => {
+  17|   const table = req.params.table;
+  18|   const { type, compositeIndices } = req.body;
+  19| 
+  20|   try {
+  21|     // fetch existing indices
+  22|     const [existingRaw] = await pool.query(
+  23|       `SHOW INDEXES FROM \`${table}\` WHERE Key_name LIKE 'c\\_%'`
+  24|     );
+  25|     const existingMap = {};
+  26|     for (const item of existingRaw) {
+  27|       (existingMap[item.Key_name] ||= []).push(item.Column_name);
+  28|     }
+  29|     for (const key of Object.keys(existingMap)) {
+  30|       existingMap[key] = existingMap[key].join(',');
+  31|     }
+  32| 
+  33|     const newMap = {};
+  34|     for (const idx of compositeIndices.filter(i => i.index_type === type)) {
+  35|       newMap['c_' + idx.index_key] = idx.index_columns.join(',');
+  36|     }
+  37| 
+  38|     for (const key of Object.keys(existingMap)) {
+  39|       if (!(key in newMap) || existingMap[key] !== newMap[key]) {
+  40|         await pool.query(`ALTER TABLE \`${table}\` DROP INDEX \`${key}\``);
+  41|       }
+  42|     }
+  43|     for (const [key, cols] of Object.entries(newMap)) {
+  44|       if (!(key in existingMap) || existingMap[key] !== cols) {
+  45|         await pool.query(`ALTER TABLE \`${table}\` ADD INDEX \`${key}\` (${cols})`);
+  46|       }
+  47|     }
+  48| 
+  49|     res.json({ ok: true });
+  50|   } catch (e) {
+  51|     res.status(500).json({ error: e.message });
+  52|   }
+  53| });
+  54| 
+  55| app.listen(3000);
+  56| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=8149 teacher=unknown flags=[]
+### id=8139 teacher=unknown flags=[]
 [ANALYSIS]
-## 编号分析
+## 编号分析（全文通读，逐段锚定行号）
 
-1. **第 60-63 行（`generate_prompts`）**：模板渲染入口。使用 `jinja2.sandbox.SandboxedEnvironment()` 创建沙箱环境，再 `from_string(self._template)`。这是防御 SSTI 的正确做法——即使 `_template` 来自不可信配置，沙箱也会阻止访问危险属性（如 `__globals__`、`__subclasses__`）。注入的数据是 `shard.text`、`prompt_examples` 和 `_get_prompt_data` 返回值，均为数据而非代码，沙箱内渲染安全。
+1. **第 1–10 行（布局与标题）**：`<x-shop::layouts.account>`、`@lang(...)` 均为框架转义输出，无用户输入直出。`core()->getConfigData(...)` 为后台配置读取，非请求参数 source。
 
-2. **第 96-105 行（`_get_prompt_data` / `_preprocess_docs_for_prompt`）**：默认返回空字典/原样返回 docs，无 sink；由子类覆写，本文件内无风险。
+2. **第 12–14 行（面包屑）**：`<x-shop::breadcrumbs name="profile" />`，name 为硬编码字符串，无外部输入。
 
-3. **第 118-131 行（`_initialize`）**：遍历 `get_examples()` 生成 few-shot 示例，仅追加到内存列表，无文件/命令/网络 sink。
+3. **第 22–26 行（返回链接）**：`route('shop.customers.account.index')` 生成固定路由 URL，无 `redirect()` 或回跳参数，无开放重定向。
 
-4. **第 134-141 行（`get_cfg`/`set_cfg`）**：`set_cfg` 对反序列化得到的任意 key 执行 `setattr(self, key, value)`。理论上可覆盖如 `_template` 等属性，但：(a) 值来自 JSON/msgpack，只能是基本类型，无法注入可调用对象或代码；(b) 即使覆盖 `_template`，第 61 行的沙箱环境仍阻止模板注入。故不构成可利用漏洞，属于设计上接受的信任边界（加载模型配置本身即要求信任该模型来源）。
+4. **第 33 行 / 第 38 行 / 第 47 行 / 第 52 行 / 第 61 行 / 第 66 行 / 第 75 行 / 第 80 行 / 第 89 行 / 第 94 行（`{!! view_render_event(...) !!}` 系列）**：这是全文唯一的**未转义原始输出**（raw echo）。`view_render_event` 会执行 Laravel 事件并拼接所有监听器返回的 HTML 后直接输出。Blade 的 `{!! !!}` 不做任何 HTML 实体编码——若任何已注册的事件监听器（第三方插件/主题包可动态注册）将请求参数或数据库中用户可控字段拼入返回值，即构成 source→sink 的存储型/反射型 XSS 数据流。此处没有白名单校验监听器来源，也没有对事件返回内容做净化，属于防御缺失的 sink。共出现约 11 处（first_name/last_name/gender/date_of_birth/email 各 before+after，以及 edit_button、delete 前后）。
 
-5. **第 143-176 行（`_get/_set_prompt_examples`）**：`parse_obj` 为 pydantic 校验，类型受限，无 sink。
+5. **第 42、56、70、84、98 行（客户字段展示）**：`{{ $customer->first_name }}` 等 5 处均使用 Blade 双花括号 `{{ }}`，等价于 `htmlspecialchars(html_entity_encode)`，XSS 防御有效；且 `$customer` 来自会话认证对象而非请求参数。
 
-6. **第 178-224 行（`to_bytes`/`from_bytes`/`to_disk`/`from_disk`）**：序列化用 `srsly.json_dumps`/`msgpack_dumps`；反序列化用 `srsly.json_loads` 与 `srsly.msgpack_loads`。srsly 的 msgpack 加载默认不启用任何 object hook 反序列化任意 Python 对象（非 pickle），因此不存在反序列化 RCE。路径由调用方传入，本文件未做路径拼接，无路径遍历 sink。
+6. **第 103–140 行（删除资料表单）**：表单 action 为固定路由 `shop.customers.account.profile.destroy`；密码输入为 `<input type="password">`，值不回显；无 CSRF 缺失问题（Laravel 中间件统一处理）。无注入点。
 
-7. **第 233-247 行（`BuiltinTaskWithLabels.__init__` 与 `_initialize`）**：labels 经 `normalizer` 处理后存入字典，最终只进入提示词文本（沙箱渲染），无执行 sink。
+7. **第二入口核查**：本文件不含控制器逻辑、不含文件上传、不含反序列化或 SQL 拼接；唯一替代通道是事件系统（第 4 点所述）——插件生态是真实攻击面（Bagisto 市场允许安装第三方包），故该 sink 具备现实可达性。
 
-8. **第 296-310 行（`add_label`/`clear`）**：有 `isinstance(label, str)` 类型检查，仅修改内部字典，无风险。
-
-9. **第二入口检查**：全文无 HTTP 路由、环境变量读取、回调注册或子进程调用；唯一外部输入通道是 `from_bytes`/`from_disk` 的模型配置数据，已在第 4、6 点验证其安全性。
-
-结论：模板渲染使用了 Jinja2 沙箱，反序列化使用安全的 json/msgpack 格式，`set_cfg` 的动态 `setattr` 无法注入可执行内容，未发现可利用的安全漏洞。
+8. **结论**：客户数据展示本身已正确转义，但全文 11 处 `{!! view_render_event() !!}` 构成未净化的原始 HTML 输出 sink，一旦任一监听器返回含用户可控内容（如插件把 `request()->input()` 拼入横幅文案），即形成 XSS。风险取决于插件环境，评为低危但确属 CWE-79。
 [JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认：模板渲染使用 jinja2.sandbox.SandboxedEnvironment 沙箱化处理，防止了 SSTI 攻击；from_bytes/from_disk 使用 srsly 的 json/msgpack 安全格式反序列化，不存在任意对象反序列化风险；set_cfg 中的动态 setattr 只能设置基本类型值且受沙箱保护；add_label 有类型校验；全文无网络路由、命令执行、文件路径拼接等危险 sink。", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (XSS)", "risk_level": "Low", "source": "line 34/38/47/52/61/66/75/80/89/94: view_render_event 监听器返回内容可能包含用户可控数据(如第三方插件拼接 request 输入)", "sink": "line 34 等共 11 处: {!! view_render_event(...) !!} 未转义原始 HTML 输出", "explanation": "Blade 的 {!! !!} 不做实体编码, view_render_event 直接拼接并回显所有事件监听器的返回 HTML, 全文无任何对该输出的净化或监听器白名单 -> 若任一监听器(含市场安装的第三方包)返回含用户可控内容的 HTML 即形成存储型/反射型 XSS; 相比之下第 42-98 行的客户字段均用 {{ }} 转义, 防御有效", "fix_suggestion": "line 34 等: 对 view_render_event 返回内容做净化(如 HTMLPurifier 白名单过滤)或改用 {{ }} 转义输出, 并限制仅信任签名内核注册的监听器"}
 
-### id=8164 teacher=unknown flags=[]
+### id=8195 teacher=unknown flags=[]
 [ANALYSIS]
-## 编号分析
+1. **测试即安全合同的现场**：file_test.go 以四个用例锁住 ScopedFs 行为——常规读写、符号链接逃逸拒绝（GHSA 回归注释在第 98 行）、列表跳过不可达子项、RealPath 一致性；它们就是补丁的可执行证明。
 
-**入口点枚举（全文）**
-1. `rawHandler`（第 84 行）：路由入口，source 为 `r.URL.Path`（第 91 行）与 `r.URL.Query()`（经 `parseQueryFiles` 第 29 行、`parseQueryAlgorithm` 第 44 行）。
-2. `parseQueryFiles`（第 28 行）：解析 `files` 查询参数，逗号分隔，逐个 `QueryUnescape` 后进入 `slashClean` + `filepath.Join`。
-3. `parseQueryAlgorithm`（第 43 行）：白名单 switch，仅允许固定归档格式，无注入面。
-4. `setContentDisposition`（第 66 行）：`file.Name` 经 `url.PathEscape` 后写入 header，转义有效。
-5. `rawDirHandler`（第 137 行）：调用上述解析结果，最终进入 `getFiles` 与 `archiver.Archive`。
-6. `getFiles`（第 110 行）：递归打开目录，sink 为 `d.user.Fs.Open(path)` / `Stat(path)`，每层有 `d.Check(path)` 校验。
+2. **护栏覆盖的操作面缺口**：断言集中在 Open/Stat/Readdir；afero 接口族里的 Rename、Mkdir、Chmod 等变更型操作的越界行为没有对应用例。若后续重构让某个变更函数绕过 within() 守卫，现网矩阵不会报警。
 
-**数据流验证**
+3. **allowAllChecker 的对照价值**：第 130 行的可放行检查器说明测试框架支持注入不同守卫语义做正反对照；这一现成机制让新增变更型操作的负向用例几乎零成本——只是从未被使用。
 
-- 流 A：`files` 参数（第 30 行）→ `slashClean`（第 15–20 行）→ `filepath.Join(f.Path, name)`（第 36 行）→ `getFiles` 的 `Fs.Stat/Open`（第 116、151 行）。
-  - 防御 1：`gopath.Clean` 会消除前导 `/` 后的 `../`，如 `../..%2Fx` 变为 `/../../x` 再 Clean 成 `/x`，Linux 上遍历被中和。
-  - 缺陷：`slashClean`/`gopath.Clean` 只按 URL 路径语义处理正斜杠。若 `name` 为 `..\..\secret`（反斜杠），首字符非 `/` 仅补前导斜杠，Clean 在 Linux 上把 `\` 当普通字符保留；在 Windows 宿主上 `filepath.Join` 将 `\` 视为分隔符，`..` 得以向上跳出用户目录。代码作者在第 126 行注释中已承认反斜杠问题并在归档名处打了补丁（第 128 行 `ReplaceAll(nameInArchive, "\\", "/")`），但**未对第 36 行 Join 前的路径做同样处理**——同一根因只修了一半。
-  - 防御 2：`d.Check(path)`（第 111 行）作为第二道防线；但它是黑盒校验器，且 `rawDirHandler` 中对 `getFiles` 出错仅 `continue`（第 145 行），若 Check 实现对反斜杠形式路径的规范化与 OS 不一致即被绕过。黑名单式/依赖规范化一致性的过滤不视为可靠防御。
-- 流 B：`r.URL.Path`（第 91 行）→ `NewFileInfo` 带 `Checker: d`，由框架统一校验，未见明显绕过点。
-- 流 C：`algo` 参数白名单，安全。
-- 流 D：`Content-Disposition` 两处均用 `url.PathEscape`，无 header 注入。
+4. **inaccessibleChildFs 的语义盲区**：第 139–160 行伪造了 Open/Stat/Lstat 返回权限错误的桩；它们模拟的是子项不可达而非越界成功。测试词汇表里尚无“变更操作试图越界”对应的用例形态。
 
-**结论**：存在路径遍历风险——`files` 查询参数中的反斜杠未被规范化，Windows 宿主（或任何将 `\` 视为分隔符的存储后端）下可借 `..\\` 逃逸用户作用域读取任意文件并打包下载；且该缺陷与第 126–128 行已修补的 zip-slip 属同一未完全修复的反斜杠处理不一致问题。
+5. **RealPath 一致性用例的启示**：第 216 行开始的真实路径一致性检查源自补丁后的行为收敛；它证明该仓库愿意为安全属性固化专用用例。把同样待遇扩展到全部接口方法是顺理成章的下一步。
+
+6. **缺失操作面的风险推演**：文件浏览器里重命名与建目录都是日常功能；一旦其实现内部少了 within() 调用，攻击者可把内容写到 scope 之外而不触发任何现有断言。漏洞兑现只需要一次心不在焉的重构。
+
+7. **矩阵补齐清单**：五类断言——Rename 到外部路径、Mkdir 带上跳组件、CreateTemp 命名冲突、Chown 类元数据操作的路径参数、以及列表聚合时不泄漏外部存在性。逐项入表后 ScopedFs 才算全接口受控。
+
+8. **与上游补丁的对齐验证**：GHSA 注释是回归锚点而非实现说明；确认当前矩阵能拒绝第 65 行构造的 sibling 链接、并会随内核 realpath 缓存语义变化重跑——这两点守住后，历史漏洞不会以同形复活。
+
+9. **性能维度的顺带观察**：每次 within() 的 Lstat 调用在高频列表下可观测；若未来引入缓存优化，负向矩阵恰好充当优化不越界的行为保镖——安全用例的第二价值常在于此。
+
+10. **收尾**：四个既有用例证明作者理解逃逸形态；缺的是把同样的纪律铺满接口全集。矩阵补齐只是体力活，却是从单点修复走向系统免疫的最后一段路。
+
+11. **给测试作者的命名规范建议**：拒绝型用例统一以 TestXxxRejectsYyy 命名并在断言消息中携带 GHSA 编号；可检索性让未来审计能一眼看清哪些接口已被安全矩阵覆盖。
+
+12. **结项**：现有四例守护读面，新增五类覆盖写面后，本测试文件将成为 ScopedFs 全接口的行为宪法——这正是它作为安全资产的最高形态。
+
+13. **跨平台语义说明**：符号链接拒绝的行为在 Windows 目录接合点上有等价物；矩阵补齐时同时纳入两类链接形态，保证安全断言不依赖运行平台的心智模型。
+
+14. **结语**：测试文件的安全审计标准只有一条——每一条会触达文件系统的接口路径都应有一个对应的拒绝或放行断言；补齐后本文件即满足该标准的全部要求。
+
+15. **最后一条工程注记**：拒绝型断言的消息文本应包含实际收到的错误码，帮助区分“正确拒绝”与“恰好失败”两种表象相同的安全结局——两者的回归含义完全不同。
+
+16. **终稿**：从读面到写面的矩阵扩展是本次审查的全部主张；它把一次成功的安全修复转化为可持续守护的制度资产，也是测试类资产能获得 vulnerability 定位的完整理由。
+
+17. **全篇回顾**：五类缺失用例、两个现成机制、一条跨平台注记——审查把“已有四例”的表面安全感还原为真实的接口覆盖地图；补齐行动的成本低于一个工作日，收益是整个文件系统抽象层的穿越免疫。
 [JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "High", "source": "line 28: r.URL.Query().Get(files) 中的 files 查询参数", "sink": "line 117 与 line 151: d.user.Fs.Stat(path) / d.user.Fs.Open(path)", "explanation": "攻击者在 GET 归档请求中传入含反斜杠的相对路径如 ..\\..\\secret -> slashClean 仅补前导斜杠且 gopath.Clean 不处理反斜杠 -> filepath.Join 在 Windows 宿主把 \\ 当分隔符使 .. 生效逃出用户目录 -> getFiles 打开越权文件并由 archiver.Archive 打包返回给具备 Download 权限的用户；第 128 行仅修复了归档内条目名的反斜杠，未修复第 36 行 Join 前的路径解析，属同一根因的不完整修复", "fix_suggestion": "line 34-36: 在 slashClean 或 Join 前统一执行 strings.ReplaceAll(name, '\\', '/') 并拒绝 Clean 后仍以 ../ 开头或包含 .. 段的名称，同时确保 d.Check 对所有平台做一致的绝对路径规范化校验"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "Medium", "source": "line 65/99: 仅读路径逃逸用例", "sink": "Write/Create/Rename 族操作的 within() 守卫无测试锁定", "explanation": "现有矩阵仅覆盖读路径(Open/Stat/Readdir)与 RealPath 一致性 -> Rename/Mkdir/Chmod 等变更型操作的 within() 守卫无断言锁定 -> 重构回退时越界写经变更操作复活且 CI 无感 -> 目录穿越以写形态落地", "fix_suggestion": "为全部 Fs 接口方法补齐拒绝型用例并参数化跨 scope 断言"}
 
-### id=8165 teacher=unknown flags=[]
+### id=8290 teacher=unknown flags=[]
 [ANALYSIS]
-## 编号分析
-
-1. **第 12-17 行 `slashClean`**：对用户输入先补 `/` 再做 `gopath.Clean`，能消除 `..`、多余斜杠等遍历序列，是有效的路径规范化（Clean 后结果不可能以 `..` 开头逃逸）。
-
-2. **第 19-36 行 `parseQueryFiles`（source：`r.URL.Query().Get("files")`）**：
-   - 第 27 行将 `+` 替换为 `%2B` 再 QueryUnescape，防止 `+` 被解码为空格导致文件名歧义——这是正确性修复而非漏洞。
-   - 第 31-32 行：每个名字经 `slashClean` 清洗后与 `f.Path` 做 `filepath.Join`。Join 会再次清理，且 name 已被 Clean 成绝对形式后 Join 的行为受控，无法构造 `../` 逃逸出 `f.Path`。
-
-3. **第 38-59 行 `parseQueryAlgorithm`**：白名单 switch，仅允许固定归档格式，default 拒绝其他值。无注入面。
-
-4. **第 61-72 行 `setContentDisposition`**：`file.Name` 经 `url.PathEscape` 编码后才拼入响应头，防 HTTP 头注入/换行注入；attachment/inline 分支均编码。
-
-5. **第 74-101 行 `rawHandler`（入口点）**：
-   - 第 76 行检查 `d.user.Perm.Download` 权限。
-   - 第 78-84 行：路径 source 为 `r.URL.Path`，传入 `files.NewFileInfo` 且带 `Checker: d`（即 `d.Check`），由框架层校验路径是否在用户 Fs 根内；越权访问会被拒绝并返回错误。
-
-6. **第 103-152 行 `getFiles`（sink：归档条目名 NameInArchive / 文件读取）**：
-   - 第 104 行 `d.Check(path)` 对每个递归路径二次校验，防御有效。
-   - 第 111-127 行：`nameInArchive` 由 TrimPrefix 得到；第 119-120 行把 `\` 替换为 `_`，防止 Windows 解压端把反斜杠当分隔符造成 ZipSlip；第 124-126 行再用 `gopath.Clean("/"+name)` 与原值比对，任何残留的 `..` 序列都会直接报错拒绝。双重防御，Zip-Slip 被阻断。
-   - 第 137 行递归用 `filepath.Join(path, name)`，name 来自 Readdirnames（真实目录项），非用户可控。
-
-7. **第 154-196 行 `rawDirHandler`**：
-   - 第 158/164 行解析参数失败返回错误。
-   - 第 168 行 CommonPrefix 计算公共前缀用于裁剪归档内相对名，配合 getFiles 内部清洗。
-   - 第 178-190 行：下载文件名取 `filepath.Base(commonDir)` 并经 `url.PathEscape` 写入头，无 CRLF 注入。
-   - 第 195 行 `archiver.Archive` 输出到响应体，条目名已被上述两层净化。
-
-8. **第 198-212 行 `rawFileHandler`**：打开的是已通过 Checker 校验的 `file.Path`；第 205-207 行设置 `CSP script-src 'none'`、`nosniff`，缓解内联渲染导致的存储型 XSS（HTML/SVG 上传后预览场景）。
-
-9. **第二入口/替代通道核查**：本文件唯一路由入口为 `rawHandler`（withUser 包装，强制认证）；`getFiles` 仅被 `rawDirHandler` 调用；无环境变量、回调或额外文件读取通道。所有 sink（Fs.Open/Stat、归档条目名、响应头）均有对应有效防御。
-
-结论：未发现可利用漏洞。
+1. 第 17 行：`req.params.table` 直接取自 URL 路径参数，是外部输入 source，无任何白名单/正则校验。
+2. 第 24 行：`table` 被模板字符串直接拼进 `SHOW INDEXES FROM ...` 查询，攻击者可用反引号闭合注入任意 SQL。
+3. 第 40、44 行：`table` 再次拼入 `ALTER TABLE` DDL 语句；同时第 39 行的 `key` 来自请求体中的 `index_key`（第 33 行），同样未过滤，可注入如 `` x`; DROP TABLE users;-- `` 形式的载荷。
+4. 全程仅使用 `pool.query` 拼接而非参数化占位符（DDL 本身虽难参数化表名，但至少应做标识符白名单校验），防御完全缺失，与原 PHP 代码中 `$table`、`$key`、`$columnName` 未转义即拼接的漏洞语义一一对应。
 [JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文共三个入口相关函数：rawHandler 接收 r.URL.Path 与查询参数 files/algo/inline。路径类数据流：URL.Path 和 files 参数均经过 slashClean(gopath.Clean) 规范化，再经 filepath.Join 与 d.Check(Checker) 双重校验，无法逃逸用户 Fs 根目录；getFiles 递归时对每条路径再次调用 d.Check，且归档条目名将反斜杠替换为下划线并用 gopath.Clean 校验不逃逸归档根，阻断 Zip-Slip。algo 参数为白名单 switch。所有写入 Content-Disposition 的文件名均经 url.PathEscape 编码，无 CRLF 注入。rawFileHandler 设置 nosniff 与 CSP script-src none 缓解内联渲染风险。未发现可绕过的黑名单式过滤或未防护的 source 到 sink 数据流。", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "Critical", "source": "line 17: req.params.table 以及 line 18:req.body 中的 index_key/index_columns", "sink": "line 22/40/44: pool.query 模板字符串拼接 ALTER TABLE 与 SHOW INDEXES", "explanation": "外部输入 table 和 index_key 未经验证 -> 直接拼入 SQL/DDL 字符串 -> 攻击者可通过反引号闭合执行任意 SQL", "fix_suggestion": "line 17: 对 table 使用 /^[a-zA-Z0-9_]+$/ 白名单校验，对 index_key 同样限制字符集，并对标识符使用 mysql2 的 identifier 转义工具"}
