@@ -37,6 +37,17 @@ from typing import Callable, Optional
 # scanner.py 的短路终判与 two_stage_scanner.py 的候选生成共用本表，
 # 避免两份 rule_name → taint_type / CWE / 风险等级映射漂移。
 PREFILTER_RULE_INFO: dict[str, dict[str, str]] = {
+    # 2026-09-01 补登（全规则泛化审计实锤）：secret 标记规则属**独立规则集**
+    # （_build_secret_markers，第三类，既不在 vuln_rules 也不在 safe_rules），
+    # 而元信息自检只覆盖 vuln_rules → 该规则在 11 个漏洞段命中却长期无 CWE
+    # 登记（评测器按 §9.13.1 从本表派生映射，未登记 = 静默计成"CWE不匹配"）。
+    # 自检的类别盲区已同步修复（见文件末尾元信息完整性用例）。
+    "hardcoded_secret_marker": {
+        "taint_type": "Hardcoded Credentials",
+        "cwe": "CWE-798 Use of Hard-coded Credentials",
+        "risk": "High",
+        "severity": "high",
+    },
     "sqli_string_concat": {
         "taint_type": "SQL Injection",
         "cwe": "CWE-89 SQL Injection",
@@ -2869,9 +2880,70 @@ if __name__ == "__main__":
     # 元信息完整性（2026-08-29）：每条漏洞规则都必须在 PREFILTER_RULE_INFO 登记，
     # 否则 two_stage_scanner 的 _PREFILTER_TYPE 回落 "Detected"——候选无类型标注、
     # 裁决层拿不到类型提示，且不报错（静默降级）。新规则遗漏登记由本用例拦截。
-    missing = [r.name for r in pf.vuln_rules if r.name not in PREFILTER_RULE_INFO]
+    #
+    # 2026-09-01 修复类别盲区：原实现只检查 pf.vuln_rules，而 secret 标记规则
+    # 属**独立的第三类规则集**（_build_secret_markers）——hardcoded_secret_marker
+    # 在 11 个漏洞段命中却长期无登记，自检却报告"缺失=无"。
+    # 现按"所有会产出候选的规则集"合并检查（漏洞 + secret 标记；安全规则不产出
+    # 候选、不需要 CWE 映射，故排除）。
+    _audited_rules = list(getattr(pf, "vuln_rules", [])) + list(
+        getattr(pf, "secret_markers", []) or [])
+    missing = [r.name for r in _audited_rules if r.name not in PREFILTER_RULE_INFO]
     ok_meta = not missing
     all_pass = all_pass and ok_meta
+
+    # 规则集重叠检测（2026-09-01，全规则泛化审计实锤的流程缺口）：
+    # 第五波新增 sqli_constructed_query 时**未检查与既有规则的重叠**，导致
+    # sqli_string_concat 在全部 4 种拼接形态上被完全覆盖 → 长期零命中的冗余
+    # 规则（维护负担 + 未来双计风险）。新增规则必须确认不是既有规则的子集。
+    # 检测方式：用一组标准形态样本，若规则 A 命中的样本集合是规则 B 的**子集**，
+    # 则 A 被 B 覆盖 → 报警（不自动删，交人工判断是有意细化还是冗余）。
+    _overlap_samples = [
+        ("sql拼接变量", 'q = "SELECT * FROM u WHERE n=\'" + request.args.get("n") + "\'"\ncursor.execute(q)'),
+        ("sql内联拼接", 'cursor.execute("SELECT * FROM u WHERE n=\'" + request.args.get("n") + "\'")'),
+        ("sql f-string", 'cursor.execute(f"SELECT * FROM u WHERE n=\'{request.args.get(\'n\')}\'")'),
+        ("sql 百分号", 'cursor.execute("SELECT * FROM u WHERE n=\'%s\'" % request.args.get("n"))'),
+        ("sql format", 'cursor.execute("SELECT * FROM u WHERE n=\'{}\'".format(request.args.get("n")))'),
+        ("cmd os.system", 'os.system("ping " + request.args.get("h"))'),
+        ("cmd subprocess", 'subprocess.run("ping " + request.args.get("h"), shell=True)'),
+        ("路径 open 拼接", 'open("/data/" + request.args.get("f"))'),
+        ("路径 join", 'p = os.path.join("/data", request.args.get("f"))\nopen(p)'),
+    ]
+    _coverage: dict[str, set] = {}
+    for _tag, _code in _overlap_samples:
+        for _rl in set(pf.scan(_code, "python").matched_rules or []):
+            _coverage.setdefault(_rl, set()).add(_tag)
+    # 有意分层的白名单（家族规则 ⊇ 旧具体规则，2026-09-01 人工裁决保留）：
+    # 家族规则负责类型归一与 1 跳形态，具体规则保留命中行精度并被
+    # tool_smoke_test.py / 审计映射引用；候选合并按 (族, 行) 去重，无双计。
+    _ACCEPTED_OVERLAPS = {
+        ("sqli_fstring", "sqli_constructed_query"),
+        ("sqli_percent_format", "sqli_constructed_query"),
+        ("cmd_os_system_concat", "cmd_injection_shell"),
+        ("cmd_subprocess_shell_concat", "cmd_injection_shell"),
+    }
+    _redundant = []
+    for _a, _sa in _coverage.items():
+        if not _sa:
+            continue
+        for _b, _sb in _coverage.items():
+            if _a == _b or not _sb:
+                continue
+            if _sa < _sb and (_a, _b) not in _ACCEPTED_OVERLAPS:
+                _redundant.append((_a, _b, sorted(_sa)))
+    # 白名单内的重叠仅提示（防白名单失效后无人察觉），不计入失败。
+    _accepted_seen = sorted(
+        (_a, _b) for _a, _sa in _coverage.items() if _sa
+        for _b, _sb in _coverage.items()
+        if _a != _b and _sb and _sa < _sb and (_a, _b) in _ACCEPTED_OVERLAPS
+    )
+    ok_ovl = not _redundant
+    print(f"[{'PASS' if ok_ovl else 'WARN'}] 规则集重叠检测: "
+          f"{'无冗余' if ok_ovl else '被完全覆盖的规则=' + str([(a, '⊂', b) for a, b, _ in _redundant])}"
+          f"（新增规则须确认不是既有规则的子集，防 sqli_string_concat 式冗余）")
+    if _accepted_seen:
+        print(f"[INFO] 已确认的有意分层: {[(a, '⊂', b) for a, b in _accepted_seen]}")
+
     print(f"[{'PASS' if ok_meta else 'FAIL'}] 规则元信息完整性: "
           f"缺失={missing or '无'}（未登记会导致候选类型回落 Detected）")
 

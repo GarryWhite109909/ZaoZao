@@ -415,7 +415,16 @@
             <svg class="w-4 h-4 mt-0.5 shrink-0 text-[var(--vuln-state-warning)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
             <div class="text-xs text-[var(--vuln-ink-2)] space-y-1">
               <p class="font-medium text-[var(--vuln-ink)]">资源消耗提示</p>
-              <p>每次扫描调用本地 LLM 推理，单文件约 5-15 秒。批量扫描按文件数线性增长。</p>
+              <!-- 耗时提示改为**本机实测动态值**（id-perf-hint，由 updatePerfHint 渲染）：
+                   原先写死"单文件约 5-15 秒"——实测均值 140s（87 段 × 2 轮，
+                   transformers / N=3 / Qwen3-8B），差 10~28 倍。且写死值无法反映
+                   显卡性能差异：同一份代码在独显/集显/CPU 后端上耗时可差一个量级。
+                   现用 localStorage 记录本轮实际单文件耗时（滑动平均）展示，
+                   冷启动无历史时给区间 + 明确组态依赖说明。 -->
+              <p id="perf-hint">
+                每次扫描调用本地 LLM 推理；实际耗时取决于显卡性能、推理后端与采样次数
+                （N=3 自一致率投票为默认组态）。批量扫描按文件数线性增长。
+              </p>
               <p>扫描期间请勿同时运行其他 GPU 密集任务，以免显存溢出（OOM）。</p>
               <p id="tf-resident-notice" class="hidden font-medium text-[var(--vuln-state-warning)]">Transformers 后端：首次扫描需加载基座模型，耗时较长请耐心等待；模型加载后会常驻显存/内存，直到关闭后端进程。</p>
             </div>
@@ -517,6 +526,57 @@
         /* ==================== State ==================== */
         var scanResults = [];
         var resultsExpanded = false;
+
+        /* ==================== 单文件耗时实测（动态性能提示） ====================
+           背景（2026-09-01）：前端原写死"单文件约 5-15 秒"，实测均值 140s
+           （87 段 × 2 轮，transformers 后端 / N=3 采样 / Qwen3-8B），差 10~28 倍，
+           且写死值无法反映显卡性能差异（独显/集显/CPU 后端可差一个量级）。
+           现记录每次扫描的实际单文件耗时，取滑动平均（最近 10 条）展示：
+           本机实测 > 任何写死的估算值。 */
+        var PERF_HISTORY_KEY = 'vuln_perf_history_v1';
+
+        function pushPerfSample(seconds) {
+          if (!(seconds > 0)) return;
+          // 单文件耗时上限 30min：排除"挂机/断点续跑"等非正常样本污染均值
+          if (seconds > 1800) return;
+          try {
+            var arr = JSON.parse(localStorage.getItem(PERF_HISTORY_KEY) || '[]');
+            if (!Array.isArray(arr)) arr = [];
+            arr.push(Math.round(seconds));
+            if (arr.length > 10) arr = arr.slice(-10);
+            localStorage.setItem(PERF_HISTORY_KEY, JSON.stringify(arr));
+          } catch (e) { /* localStorage 不可用时静默降级，不影响扫描 */ }
+        }
+
+        function perfAverage() {
+          try {
+            var arr = JSON.parse(localStorage.getItem(PERF_HISTORY_KEY) || '[]');
+            if (!Array.isArray(arr) || !arr.length) return null;
+            return Math.round(arr.reduce(function (a, b) { return a + b; }, 0) / arr.length);
+          } catch (e) { return null; }
+        }
+
+        function updatePerfHint() {
+          var el = document.getElementById('perf-hint');
+          if (!el) return;
+          var avg = perfAverage();
+          var base = '每次扫描调用本地 LLM 推理；实际耗时取决于显卡性能、推理后端与'
+            + '采样次数（N=3 自一致率投票为默认组态）。';
+          if (avg) {
+            var n = 1;
+            try { n = JSON.parse(localStorage.getItem(PERF_HISTORY_KEY) || '[]').length; } catch (e) {}
+            el.innerHTML = '本机实测：单文件约 <span class="font-medium text-[var(--vuln-ink)]">'
+              + avg + ' 秒</span>（最近 ' + n + ' 次平均；首次扫描含模型加载会更久）。';
+            if (n >= 3) {
+              // 有足够样本才给批量估算，避免用单次异常值外推
+              el.innerHTML += ' 10 个文件预计约 <span class="font-medium">'
+                + Math.round(avg * 10 / 60) + ' 分钟</span>。';
+            }
+            el.innerHTML += '耗时随显卡性能、推理后端与采样次数（默认 N=3）变化，批量扫描按文件数线性增长。';
+          } else {
+            el.textContent = base + '本机尚无实测数据，首次扫描完成后将显示实际耗时。';
+          }
+        }
         var currentFilter = 'all';
         /* 是否有交互式分析进行中：为 true 时在结果列表顶部渲染一个「正在分析」占位卡，
            已有卡片整体下移；分析完成后置 false 并重渲染，占位卡被结果卡替换。 */
@@ -903,6 +963,9 @@
             }
           }
           scanResults.push(r);
+          // 记录单文件实际耗时（供性能提示用本机实测值，见 pushPerfSample 注释）
+          pushPerfSample(r && (r.duration || r.total_duration));
+          updatePerfHint();
         }
         function deleteResult(id) {
           if (!id) return;
@@ -1048,8 +1111,66 @@
              nSamples 为 null 时不传（后端用默认 3） */
           var payload = { code: code, language: lang, filename: filename };
           if (nSamples) payload.n_samples = nSamples;
+          /* §8.11#1 回站领取：带 job_id 让后端完成后暂存结果；导航中断导致
+             fetch 无响应时，页面回站凭 sessionStorage 留痕领取（见 reclaim） */
+          var jobId = 'job-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+          payload.job_id = jobId;
+          try {
+            sessionStorage.setItem('scan_job_' + jobId, JSON.stringify({
+              filename: filename, lang: lang, code: code, ts: Date.now(), attempts: 0
+            }));
+          } catch (e) { /* 配额满时放弃留痕（仅失去回站领取能力） */ }
           return postJSON('/api/analyze', payload, 'single').then(function (d) {
+            try { sessionStorage.removeItem('scan_job_' + jobId); } catch (e) {}
             d._kind = 'two-stage'; d._orig = code; d._lang = lang; return d;
+          });
+        }
+
+        /* §8.11#1 回站领取：页面加载时扫描 sessionStorage 留痕，向后端领取
+           导航期间完成但未被接收的结果。404（仍在计算）时限次重试，其余
+           状态一律清痕，防止陈旧条目永久堆积。 */
+        var RECLAIM_MAX_ATTEMPTS = 5;
+        var RECLAIM_RETRY_MS = 15000;
+        function reclaimUnclaimedResults() {
+          var keys = [];
+          try {
+            for (var i = 0; i < sessionStorage.length; i++) {
+              var k = sessionStorage.key(i);
+              if (k && k.indexOf('scan_job_') === 0) keys.push(k);
+            }
+          } catch (e) { return; }
+          keys.forEach(function (k) {
+            var jobId = k.slice('scan_job_'.length);
+            var meta = null;
+            try { meta = JSON.parse(sessionStorage.getItem(k)); } catch (e) {}
+            function giveUp() { try { sessionStorage.removeItem(k); } catch (e) {} }
+            function attempt() {
+              fetch('/api/scan/result/' + encodeURIComponent(jobId)).then(function (r) {
+                if (r.status === 404) {
+                  /* 后端可能仍在计算：限次延迟重试 */
+                  var attempts = (meta && meta.attempts || 0) + 1;
+                  if (attempts <= RECLAIM_MAX_ATTEMPTS) {
+                    if (meta) { meta.attempts = attempts; }
+                    try { sessionStorage.setItem(k, JSON.stringify(meta)); } catch (e) {}
+                    setTimeout(attempt, RECLAIM_RETRY_MS);
+                  } else { giveUp(); }
+                  return null;
+                }
+                giveUp();
+                return r.ok ? r.json() : null;
+              }).then(function (d) {
+                if (!d || d.status) return; /* not_found/expired 或空响应 */
+                d._kind = 'two-stage';
+                d._orig = (meta && meta.code) || '';
+                d._lang = (meta && meta.lang) || 'python';
+                d._reclaimed = true;
+                addResult(d);
+                renderResults();
+                persistScanResults();
+                showToast('已取回上次未接收的分析结果：' + (d.filename || (meta && meta.filename) || '未知文件'), 'success');
+              }).catch(giveUp);
+            }
+            attempt();
           });
         }
 
@@ -2881,6 +3002,7 @@
         /* ==================== Init ==================== */
         renderResults();
         loadScanResults();
+        updatePerfHint();   // 用本机实测耗时渲染资源提示（无历史则显示组态说明）
         checkUIBuild();
         /* 记录本次加载的前端版本（同源请求读取 X-UI-Build 响应头） */
         try {
@@ -2894,6 +3016,8 @@
         updateRoundUI();
         loadDemoManifest();
         renderReportHistory();
+        // §8.11#1 回站领取：恢复历史结果后尝试取回导航期间完成但未被接收的扫描
+        setTimeout(reclaimUnclaimedResults, 800);
         // 延迟启动深度健康检查：让页面先把结果列表/历史等渲染完，
         // 避免慢 fetch 与首屏渲染争抢浏览器连接，页面切换更顺滑。
         setTimeout(loadHealth, 300);

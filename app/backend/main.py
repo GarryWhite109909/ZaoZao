@@ -252,6 +252,9 @@ class AnalyzeRequest(BaseModel):
     language: str = "python"
     filename: str = "pasted_code.py"
     use_rag: Optional[bool] = None
+    # 回站领取（§8.11#1）：前端生成的任务标识。结果完成后按此暂存，
+    # 导航中断后页面回站可经 GET /api/scan/result/{job_id} 取走
+    job_id: Optional[str] = Field(None, max_length=64)
 
 
 class UrlScanRequest(BaseModel):
@@ -318,6 +321,8 @@ class TwoStageRequest(BaseModel):
     filename: str = "pasted_code.py"
     n_samples: int = Field(3, ge=1, le=10)   # 自一致率采样次数（对齐 fixed5 组态）
     use_rag: Optional[bool] = None
+    # 回站领取（§8.11#1），语义同 AnalyzeRequest.job_id
+    job_id: Optional[str] = Field(None, max_length=64)
 
 
 # ---------------------------------------------------------------------------
@@ -941,6 +946,48 @@ async def _await_scan(future):
         return None, JSONResponse({"error": str(e)}, status_code=503)
 
 
+# ---------------------------------------------------------------------------
+# 最近结果暂存（2026-09-01，工具层优化指导 §8.11#1）：导航离开页面会终止前端
+# fetch，但调度器会继续跑完——结果无人接收（用户实拍"接着分析但不出结果"）。
+# 前端发起扫描时带 job_id 并在 sessionStorage 留痕；结果完成后按 job_id 暂存
+# 在此，页面回站经 GET /api/scan/result/{job_id} 领取（取走即删）。
+# 内存环形暂存（50 条 × 1h TTL），无持久化——短时间回站即可领取。
+# ---------------------------------------------------------------------------
+_UNCLAIMED_RESULTS: dict[str, tuple[float, dict]] = {}
+_UNCLAIMED_CAP = 50
+_UNCLAIMED_TTL_S = 3600.0
+_UNCLAIMED_LOCK = threading.Lock()
+
+
+def _stash_unclaimed(job_id: str, payload: dict) -> None:
+    now = time.time()
+    with _UNCLAIMED_LOCK:
+        # 顺带清理过期项，防 dict 无界增长
+        for k in [k for k, (ts, _) in _UNCLAIMED_RESULTS.items()
+                  if now - ts > _UNCLAIMED_TTL_S]:
+            del _UNCLAIMED_RESULTS[k]
+        while len(_UNCLAIMED_RESULTS) >= _UNCLAIMED_CAP:
+            _UNCLAIMED_RESULTS.pop(next(iter(_UNCLAIMED_RESULTS)))
+        _UNCLAIMED_RESULTS[job_id] = (now, payload)
+
+
+@app.get("/api/scan/result/{job_id}")
+async def get_scan_result(job_id: str):
+    """领取一个已完成但未被接收的扫描结果（取走即删）。
+
+    404=不存在或仍在计算（前端应有限重试）；410=已过期（超 1h）。
+    """
+    with _UNCLAIMED_LOCK:
+        item = _UNCLAIMED_RESULTS.pop(job_id, None)
+    if item is None:
+        return JSONResponse({"status": "not_found"}, status_code=404)
+    ts, payload = item
+    if time.time() - ts > _UNCLAIMED_TTL_S:
+        return JSONResponse({"status": "expired"}, status_code=410)
+    payload["claimed_at"] = time.time()
+    return payload
+
+
 @app.post("/api/analyze")
 async def analyze(req: AnalyzeRequest, request: Request):
     """单文件扫描（两阶段：工具召回 + LLM 裁决）。
@@ -968,6 +1015,9 @@ async def analyze(req: AnalyzeRequest, request: Request):
     out = result.to_dict()
     # 附带工具层召回监控（抽样复核计数），供前端/论文追踪 Stage 1 漏报率
     out["tool_recall_monitor"] = tool_recall_monitor_snapshot()
+    # 回站领取（§8.11#1）：带 job_id 的请求完成后暂存，导航中断可回站取回
+    if req.job_id:
+        _stash_unclaimed(req.job_id, out)
     return out
 
 
@@ -1004,6 +1054,9 @@ async def analyze_two_stage(req: TwoStageRequest, request: Request):
     out = result.to_dict()
     # 附带工具层召回监控（抽样复核计数），供前端/论文追踪 Stage 1 漏报率
     out["tool_recall_monitor"] = tool_recall_monitor_snapshot()
+    # 回站领取（§8.11#1）：SARIF 导出通道不暂存（格式不同，且无前端领取方）
+    if req.job_id:
+        _stash_unclaimed(req.job_id, out)
     return out
 
 
@@ -1244,17 +1297,31 @@ async def url_scan(req: UrlScanRequest, request: Request):
 # ---------------------------------------------------------------------------
 # GitHub 仓库扫描
 # ---------------------------------------------------------------------------
-def _clone_and_collect(req: GithubScanRequest) -> tuple[Optional[str], Optional[list], Optional[JSONResponse]]:
+# 依赖清单文件名（2026-09-01，§9.28 SCA 通道接生产）：此前仓库收集阶段
+# `ext not in EXT_TO_LANG` 把 package-lock.json 等清单在收集期丢弃，trivy 在
+# 仓库扫描中零生效（同 audit_stage1.py 已修的断点）。清单单独收集，作为
+# **项目级**证据扫描，不参与文件级 has_vulnerability 判定（§9.28.5 口径）。
+_DEP_MANIFEST_NAMES = frozenset({
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+    "composer.lock", "requirements.txt", "requirements-dev.txt",
+    "Pipfile.lock", "poetry.lock", "go.mod", "go.sum",
+    "Gemfile.lock", "Cargo.lock", "pom.xml",
+})
+_DEP_MANIFEST_CAP = 50   # 防异常仓库塞满清单拖慢 SCA
+
+
+def _clone_and_collect(req: GithubScanRequest) -> tuple[Optional[str], Optional[list], Optional[JSONResponse], list]:
     """同步：克隆仓库 + 遍历代码文件。放线程池执行，避免阻塞事件循环。
 
     Returns:
-        (error_response, None, None) 失败；
-        (None, code_files, tmp_dir) 成功（tmp_dir 需调用方清理）。
+        (error_response, None, None, []) 失败；
+        (None, code_files, tmp_dir, dep_manifests) 成功（tmp_dir 需调用方清理）。
+        dep_manifests 为依赖清单绝对路径列表（项目级 SCA 证据，非代码文件）。
     """
     # SSRF 防护：仓库地址仅允许公网 http/https（内网/回环地址在此拦截）
     url_err = validate_target_url(req.repo_url)
     if url_err:
-        return None, None, JSONResponse({"error": url_err}, status_code=400)
+        return None, None, JSONResponse({"error": url_err}, status_code=400), []
 
     tmp_dir = tempfile.mkdtemp(prefix="vuln_scan_")
     repo_name = req.repo_url.rstrip("/").split("/")[-1].replace(".git", "")
@@ -1273,11 +1340,11 @@ def _clone_and_collect(req: GithubScanRequest) -> tuple[Optional[str], Optional[
             return tmp_dir, None, JSONResponse(
                 {"error": f"git clone 失败: {result.stderr[:500]}"},
                 status_code=502,
-            )
+            ), []
     except subprocess.TimeoutExpired:
-        return tmp_dir, None, JSONResponse({"error": "git clone 超时（120s）"}, status_code=504)
+        return tmp_dir, None, JSONResponse({"error": "git clone 超时（120s）"}, status_code=504), []
     except FileNotFoundError:
-        return tmp_dir, None, JSONResponse({"error": "系统未安装 git"}, status_code=500)
+        return tmp_dir, None, JSONResponse({"error": "系统未安装 git"}, status_code=500), []
 
     # 遍历阶段**不做 max_files 截断**（2026-08-31 修复：此前 os.walk 顺序取前
     # max_files 即 break，是盲目截断——大仓库里 utils/、models/ 常排在 auth/、
@@ -1286,12 +1353,18 @@ def _clone_and_collect(req: GithubScanRequest) -> tuple[Optional[str], Optional[
     # 收集阶段仍有硬上限（防超大仓库把内存吃光），但上限远高于扫描预算，
     # 保证"选谁扫"由风险分决定而非遍历顺序。
     code_files = []
+    dep_manifests: list[str] = []   # 依赖清单（项目级 SCA 证据，§9.28）
     collected_bytes = 0
     for root, _dirs, fnames in os.walk(clone_target):
         # 按路径段精确匹配跳过依赖/版本目录（子串匹配会误伤 x.gitlab 等合法目录名）
         if set(Path(root).parts) & {".git", "node_modules", "vendor", "__pycache__"}:
             continue
         for fname in fnames:
+            # 依赖清单单独收集（不读内容、不占代码文件硬上限）——trivy 逐清单扫描
+            if (fname.lower() in _DEP_MANIFEST_NAMES
+                    and len(dep_manifests) < _DEP_MANIFEST_CAP):
+                dep_manifests.append(os.path.join(root, fname))
+                continue
             ext = Path(fname).suffix.lower()
             if ext not in EXT_TO_LANG:
                 continue
@@ -1311,21 +1384,59 @@ def _clone_and_collect(req: GithubScanRequest) -> tuple[Optional[str], Optional[
                 or collected_bytes >= COLLECT_HARD_CAP_BYTES):
             break
 
-    return tmp_dir, code_files, None
+    return tmp_dir, code_files, None, dep_manifests
+
+
+def _scan_dep_manifests(manifest_paths: list[str]) -> list[dict]:
+    """对依赖清单逐个跑 trivy fs（项目级 SCA 证据）。
+
+    失败以 error 条目留痕而非静默跳过（§9.28.6 B1 静默性同构）。
+    清单级证据**不参与**文件级 has_vulnerability 统计，避免污染 FPR 基线。
+    """
+    ext = ExternalScanner()
+    out: list[dict] = []
+    for p in manifest_paths[:_DEP_MANIFEST_CAP]:
+        name = os.path.basename(p)
+        try:
+            findings = ext.scan_sca(p)
+            out.extend({
+                "manifest": name,
+                "tool": f.tool,
+                "rule_id": f.rule_id,
+                "severity": f.severity,
+                "message": f.message[:200],
+            } for f in findings)
+        except Exception as e:
+            out.append({"manifest": name, "error": str(e)[:200]})
+    return out
 
 
 @app.post("/api/github-scan")
 async def github_scan(req: GithubScanRequest, request: Request):
-    """clone GitHub 仓库 → 遍历代码文件 → 批量扫描（LOW 优先级）。"""
+    """clone GitHub 仓库 → 遍历代码文件 → 批量扫描（LOW 优先级）。
+
+    依赖清单（package-lock/composer.lock/go.sum 等 14 种）另行跑 trivy SCA，
+    结果以 `dependency_vulnerabilities` 项目级小节返回——它是"本项目用了有
+    漏洞的库版本"的证据，不证明某个文件第 N 行触发该漏洞，故不计入
+    vulnerable/safe 统计（§9.28.5 口径：与行级判定分维度呈现）。
+    """
     client_id = resolve_client_id(request.headers.get("x-client-type"), fallback="web")
-    tmp_dir, code_files, err = await asyncio.to_thread(_clone_and_collect, req)
+    tmp_dir, code_files, err, dep_manifests = await asyncio.to_thread(_clone_and_collect, req)
 
     try:
         if err is not None:
             return err
 
+        # 依赖清单 SCA（与文件扫描并行，线程池执行不阻塞事件循环）
+        dep_task = None
+        if dep_manifests:
+            dep_task = asyncio.ensure_future(
+                asyncio.to_thread(_scan_dep_manifests, dep_manifests))
+
         if not code_files:
-            return {"repo": req.repo_url, "message": "仓库中未找到支持的代码文件"}
+            dep_vulns = await dep_task if dep_task is not None else []
+            return {"repo": req.repo_url, "message": "仓库中未找到支持的代码文件",
+                    "dependency_vulnerabilities": dep_vulns}
 
         # 按风险分在预算内选取（替代 os.walk 顺序截断）：高危文件优先获得
         # 扫描注意力，预算外的文件在响应里显式回报（不静默丢弃）。
@@ -1341,12 +1452,15 @@ async def github_scan(req: GithubScanRequest, request: Request):
             _last_batch = batch
         _record_scan(batch, source="github")
 
+        dep_vulns = await dep_task if dep_task is not None else []
         return {
             "repo": req.repo_url,
             "scanned_files": len(selected),
             "repo_files_total": len(code_files),
+            "dep_manifests_found": len(dep_manifests),
             "budget": _budget_summary(plan),
             "summary": batch.to_dict(),
+            "dependency_vulnerabilities": dep_vulns,
         }
     finally:
         if tmp_dir:

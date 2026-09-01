@@ -64,6 +64,14 @@ _SEMANTIC_TO_CWE = {
     # Hex High Entropy String / Private Key…），语义全是"硬编码密钥"。修复
     # detect-secrets 绝对路径缺陷后该工具首次产出候选，随即暴露本缺口
     # （hardcoded_secret_02.java 的 Secret Keyword 被判 B，实为类型正确）。
+    # 2026-09-01 补（全规则泛化审计）：弱随机/弱哈希的**编号粒度分歧**。
+    # 权威依据（cwe.mitre.org 4.20）：CWE-338 的 Relationships 明示
+    #   ChildOf CWE-330（Use of Insufficiently Random Values），Abstraction=Base，
+    #   Vulnerability Mapping=ALLOWED；330 是 Class 级抽象父类。
+    # 即 338 与 330 是同一缺陷的**不同精度表述**（具体"非密码学 PRNG" vs
+    # 抽象"随机值不充分"），与 §9.9.1 的 327|916 完全同构——不应判"类型错标"。
+    # （典型场景：crypto_weak_random 规则标 338，typical_19 标准答案标 330。）
+    "weak random": "338|330",
     "secret keyword": "798",
     "aws access key": "798",
     "hex high entropy string": "798",
@@ -422,12 +430,113 @@ def render_md(all_audits: list[dict], manifest: dict) -> str:
     return "\n".join(lines)
 
 
+# --- 依赖清单 SCA 通道（2026-09-01 补，§9.28）---
+#
+# 为什么需要独立这一步：two_stage_scanner 的 SCA/IaC 分流是**按后缀**的
+# （2440-2448 行）：代码文件（.py/.js/.php/...）只跑 SAST + secret，
+# SCA/IaC 仅对非代码文件启用。该分流为"单文件扫描"设计（一个 .py 文件里
+# 没有依赖清单，判据成立），但仓库审计是**逐代码文件**调用，依赖清单
+# （composer.lock / package-lock.json）从未被单独扫描 → trivy 在
+# §9.9~§9.27 的全部仓库审计中零生效。
+#
+# 实锤：php-goof 的 composer.lock 有 22 个依赖漏洞，含 §9.19 判定为
+# "A 盲区、版本敏感、零代码修复"的全部 3 条（dompdf CVE-2022-28368 RCE /
+# phpmailer CVE-2021-3603 / commonmark XSS）——工具一直在，是管道没接。
+#
+# 口径说明（重要）：SCA 产出是**项目级**（依赖清单里的 CVE），不是行级
+# （应用代码第 N 行的 CWE）。它证明"本项目用了有漏洞的库版本"，不能证明
+# "应用在某行触发了该漏洞"。因此本通道作为**独立小节**附加，不参与
+# expected_findings 的 A/B/C 判定，避免污染既有基线。
+_DEP_MANIFESTS = (
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json",
+    "composer.lock",
+    "requirements.txt", "Pipfile.lock", "poetry.lock",
+    "go.sum", "go.mod",
+    "Gemfile.lock",
+    "pom.xml", "build.gradle", "build.gradle.kts",
+)
+
+
+def collect_dep_vulns(repo: Path) -> list[dict]:
+    """扫描仓库依赖清单的已知漏洞（trivy fs，SCA 通道）。
+
+    返回 [{file, pkg, vuln_id, severity, installed, fixed, title}]；
+    工具不可用/无清单/超时时返回空列表（不中断主流程）。
+    """
+    from graduation_project.external_scanner import ExternalScanner
+    found: list[dict] = []
+    manifests = [p for name in _DEP_MANIFESTS
+                 for p in [repo / name] if p.exists()]
+    if not manifests:
+        return found
+    ext = ExternalScanner()
+    if "trivy" not in getattr(ext, "_installed", {}):
+        print("[deps] trivy 不可用，跳过依赖清单扫描")
+        return found
+    for mf in manifests:
+        try:
+            findings = ext._run_trivy_fs(str(mf))
+        except Exception as e:
+            print(f"[deps] {mf.name} 扫描失败: {type(e).__name__}: {e}")
+            continue
+        for f in findings:
+            # message 形如 "pkg: <pkg> ...\nInstalled: <ver> ..." 或纯标题
+            found.append({
+                "file": mf.name,
+                "pkg": f.message.split("\n")[0][:80],
+                "vuln_id": f.rule_id,
+                "severity": f.severity,
+                "title": f.message[:160].replace("\n", " | "),
+            })
+        print(f"[deps] {mf.name}: {len(findings)} 个依赖漏洞")
+    return found
+
+
+def _render_deps(dep_vulns: list[dict]) -> str:
+    """渲染依赖清单 SCA 小节（§9.28）。
+
+    独立小节：SCA 是项目级证据（"用了有漏洞的库"），不是行级证据
+    （"第 N 行触发漏洞"），故不并入 expected_findings 的 A/B/C 判定，
+    仅作为补充证据呈现，避免污染既有基线口径。
+    """
+    from collections import Counter
+    sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    lines = [
+        "---",
+        "",
+        "## 依赖清单 SCA 扫描（trivy fs，§9.28）",
+        "",
+        f"依赖漏洞合计 **{len(dep_vulns)}** 个：",
+        "",
+    ]
+    cnt = Counter(str(d.get("severity", "")).lower() for d in dep_vulns)
+    lines.append("| 严重度 | 数量 |")
+    lines.append("|---|---|")
+    for s in ("critical", "high", "medium", "low", "info"):
+        if cnt.get(s):
+            lines.append(f"| {s} | {cnt[s]} |")
+    lines.append("")
+    lines.append("| 清单文件 | 漏洞 ID | 严重度 | 说明 |")
+    lines.append("|---|---|---|---|")
+    for d in sorted(dep_vulns, key=lambda x: sev_rank.get(
+            str(x.get("severity", "")).lower(), 9)):
+        title = str(d.get("title", "")).replace("|", "\\|")
+        lines.append(f"| {d.get('file', '')} | {d.get('vuln_id', '')} "
+                     f"| {d.get('severity', '')} | {title[:110]} |")
+    lines.append("")
+    lines.append("> 口径：SCA 为**项目级**证据（依赖版本含已知 CVE），非行级；")
+    lines.append("> 不计入上文 A/B/C 判定（§9.28 口径说明）。")
+    return "\n".join(lines)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--repo-dir", required=True)
     ap.add_argument("--file", default=None, help="只审计单个文件（调试用）")
     ap.add_argument("--output", default=None)
+    ap.add_argument("--skip-deps", action="store_true",
+                    help="跳过依赖清单 SCA 扫描（默认对仓库模式启用）")
     args = ap.parse_args()
 
     from graduation_project.two_stage_scanner import TwoStageScanner
@@ -485,11 +594,21 @@ def main() -> None:
             mark = {"OK（候选覆盖且类型对）": "OK"}.get(e["verdict"], e["verdict"])
             print(f"  {rec['file']} L{e['line']} {e['cwe']}: {mark}")
 
+    # 依赖清单 SCA 通道（§9.28）：仅整仓审计时启用（单文件调试无意义），
+    # 作为独立小节附加，不参与 A/B/C 判定。
+    dep_vulns: list[dict] = []
+    if not args.skip_deps and not args.file:
+        print("\n--- 依赖清单 SCA 扫描（trivy fs）---")
+        dep_vulns = collect_dep_vulns(repo)
+
     fname_tag = (args.file or "all").replace("/", "_")
     out = Path(args.output) if args.output else (
         HERE / "results" / f"stage1_audit.{manifest['repo'].split('/')[-1]}.{fname_tag}.md")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render_md(all_audits, manifest), encoding="utf-8")
+    md = render_md(all_audits, manifest)
+    if dep_vulns:
+        md += "\n\n" + _render_deps(dep_vulns)
+    out.write_text(md, encoding="utf-8")
     print(f"审计清单已写入: {out}")
 
 

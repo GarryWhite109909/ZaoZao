@@ -3108,40 +3108,38 @@ class TwoStageScanner:
             # UnboundLocalError，导致整个 _aggregate 中断、前端显示"分析失败"
             # （typical_20_insecure_tls.py 实锤）。
             raw_texts: dict[str, str] = {}
-            if self._signal_registry is not None:
+            # 多数票优先（2026-09-01，工具层优化指导 §8.9 第 2 项"top1 与多漏洞
+            # 列表同源化"）：此前 signal_registry 的规则级 corrected_type 短路在
+            # 多数票**之前**——最高 severity 工具规则命中注册表映射时，模型独立
+            # 归因被无视，top1 与 vulnerability_types 脱节（typical_08_eval
+            # top1=78 vs vts=[94]、hard_cve_03 top1=798 vs vts=[89] 实锤）。
+            # 现改为：有模型类型票时 top1 取多数票类型（与模型归因同源）；
+            # 注册表映射仅兜底——模型全体未输出类型时保持 B501→CWE-295 等
+            # 历史校正能力不丢失。
+            type_votes: dict[str, list[int]] = {}
+            for a in confirmed:
+                t = (a.vulnerability_type or "").strip()
+                if not t:
+                    continue
+                raw_texts.setdefault(t, t)
+                tool_label = normalize_cwe_label(
+                    (a.finding or {}).get("taint_type") or "") or ""
+                is_echo = bool(tool_label) and (
+                    normalize_cwe_label(t) or t) == tool_label
+                sev_rank = _SEV_RANK.get(
+                    ((a.finding or {}).get("severity") or "medium").lower(), 1)
+                bucket = type_votes.setdefault(t, [0, 0, 0])
+                bucket[0] += 1
+                if not is_echo:
+                    bucket[1] += 1
+                bucket[2] = max(bucket[2], sev_rank)
+            if type_votes:
+                corrected = max(
+                    type_votes,
+                    key=lambda t: tuple(type_votes[t]),
+                )
+            elif self._signal_registry is not None:
                 corrected = self._signal_registry.corrected_taint_type(rule_id)
-            if not corrected:
-                # 多数票类型（2026-08-15 修复：原实现取"第一个非空类型"，忽略多数
-                # 信号——typical_17 中 2/5 裁决输出正确 CWE-327，但列表首个是锚定
-                # 错误的 CWE-79 被直接采信；hard_cve_07 的最终类型甚至来自另一条
-                # finding（B108）而 raw 来自 B202。投票键 = (总票数, 独立票数,
-                # 该类型所在 finding 的最高严重度)：
-                #   - 独立票 = 模型输出类型 ≠ 工具 taint_type 归一化结果（"回声票"
-                #     只是复读工具标注，无独立信息量——xss-taint 工具标 XSS、模型
-                #     跟着输出 CWE-79 是回声；B324 工具标 B324、模型独立判出
-                #     CWE-327 是独立判断，平票时独立判断胜出）
-                type_votes: dict[str, list[int]] = {}
-                for a in confirmed:
-                    t = (a.vulnerability_type or "").strip()
-                    if not t:
-                        continue
-                    raw_texts.setdefault(t, t)
-                    tool_label = normalize_cwe_label(
-                        (a.finding or {}).get("taint_type") or "") or ""
-                    is_echo = bool(tool_label) and (
-                        normalize_cwe_label(t) or t) == tool_label
-                    sev_rank = _SEV_RANK.get(
-                        ((a.finding or {}).get("severity") or "medium").lower(), 1)
-                    bucket = type_votes.setdefault(t, [0, 0, 0])
-                    bucket[0] += 1
-                    if not is_echo:
-                        bucket[1] += 1
-                    bucket[2] = max(bucket[2], sev_rank)
-                if type_votes:
-                    corrected = max(
-                        type_votes,
-                        key=lambda t: tuple(type_votes[t]),
-                    )
             # 统一走 CWE 纠正工具（cwe_normalizer）：Path Traversal → CWE-22 路径穿越，
             # 无映射时回退到 taint_type / rule_id，保证与旧管道信息格式一致。
             # 2026-08-29 修复：多数票分支此前**跳过纠正器**直接采用模型原始文本
@@ -3686,10 +3684,11 @@ if __name__ == "__main__":
 
     # 20) _aggregate 的 raw_vulnerability_type 作用域（2026-08-30 回归）：
     #     corrected 由 signal_registry 校正分支产出时（如 B501 → CWE-295），
-    #     下方多数票块被整体跳过；raw_texts 曾定义在该块内，块外访问抛
-    #     UnboundLocalError → 整个 _aggregate 中断、前端显示"分析失败"
-    #     （typical_20_insecure_tls.py 实锤；凡 top 候选命中注册表中已提交
-    #     校正的规则均受影响）。本用例用临时注册表造"已提交校正"的规则覆盖该分支。
+    #     raw_texts 曾定义在多数票块内，块外访问抛 UnboundLocalError → 整个
+    #     _aggregate 中断、前端显示"分析失败"（typical_20_insecure_tls.py 实锤）。
+    #     2026-09-01 起（§8.9#2 同源化）多数票优先于注册表，注册表兜底仅在
+    #     **模型未输出类型**时生效——本用例的裁决不带 vulnerability_type，
+    #     正好覆盖该兜底分支（raw=工具标注，保持"工具原始 → 纠正后"展示语义）。
     from graduation_project.signal_registry import SignalRegistry
     with tempfile.TemporaryDirectory() as _td:
         _reg = SignalRegistry(path=Path(_td) / "reg.json", enabled=True)
@@ -3708,18 +3707,62 @@ if __name__ == "__main__":
             confirmed=True, confidence=1.0, votes_true=3, votes_false=0, votes_invalid=0,
             reasoning="r", fix_suggestion="f", decision="confirmed_vulnerability",
             finding={"rule_id": "B501-X", "category": "sast", "severity": "high",
-                     "taint_type": "B501-X", "source": "line 1: x", "sink": "line 2: y"},
-            vulnerability_type="CWE-295 Improper Certificate Validation")]
+                     "taint_type": "B501-X", "source": "line 1: x", "sink": "line 2: y"})]
         try:
             _ts._aggregate(_res, "x = 1\ny = 2\n")
-            # registry 分支下 corrected 的"原始"就是工具标注（历史模型对工具标注的校正）
+            # 模型无类型票 → 注册表校正兜底，raw=工具标注
             ok_rawtype = (_res.vulnerability_type == "CWE-295 Improper Certificate Validation"
                           and _res.raw_vulnerability_type == "B501-X")
         except Exception as _e:          # 修复前此处抛 UnboundLocalError
             ok_rawtype = False
             print(f"      异常: {type(_e).__name__}: {_e}")
-    print(f"[{'PASS' if ok_rawtype else 'FAIL'}] §四 raw 类型作用域(registry 校正分支): "
+    print(f"[{'PASS' if ok_rawtype else 'FAIL'}] §四 raw 类型作用域(registry 兜底分支): "
           f"{_res.vulnerability_type!r} <- raw {_res.raw_vulnerability_type!r}")
+
+    # 27) top1 与模型归因同源化（2026-09-01，§8.9 第 2 项）：模型类型票存在时，
+    #     top1 必须取多数票类型，signal_registry 的规则级 corrected_type 仅兜底。
+    #     复刻 typical_08_eval 实锤：最高 severity 工具规则（注册表已提交 78 校正）
+    #     vs 模型独立归因 94——旧逻辑注册表短路 → top1=78 与 vts=[94] 脱节。
+    with tempfile.TemporaryDirectory() as _td2:
+        _reg2 = SignalRegistry(path=Path(_td2) / "reg.json", enabled=True)
+        for _f in ("a.py", "b.py"):
+            _reg2.record("crit-tool-rule", confirmed=True, n=3, votes_true=3,
+                         votes_false=0, votes_invalid=0, file=_f,
+                         taint_type="crit-tool-rule",
+                         corrected_type="CWE-78 OS Command Injection")
+        _ts2 = object.__new__(TwoStageScanner)
+        _ts2.n_samples = 3
+        _ts2._signal_registry = _reg2
+        _ts2._conformal = None
+        _ts2._counterfactual = None
+        _res2 = TwoStageResult(filename="t8.py", language="python",
+                               has_vulnerability=None, findings=[])
+        # 高严重度工具候选（注册表映射 78）+ 模型 2 票归因 94（独立票）
+        _res2.adjudications = [
+            AdjudicationVerdict(
+                confirmed=True, confidence=1.0, votes_true=3, votes_false=0,
+                votes_invalid=0, reasoning="r", decision="confirmed_vulnerability",
+                finding={"rule_id": "crit-tool-rule", "category": "sast",
+                         "severity": "critical", "taint_type": "crit-tool-rule",
+                         "source": "", "sink": "", "sink_line": 1},
+                vulnerability_type="CWE-94 Improper Control of Generation of Code"),
+            AdjudicationVerdict(
+                confirmed=True, confidence=1.0, votes_true=3, votes_false=0,
+                votes_invalid=0, reasoning="r", decision="confirmed_vulnerability",
+                finding={"rule_id": "other-rule", "category": "sast",
+                         "severity": "medium", "taint_type": "other-rule",
+                         "source": "", "sink": "", "sink_line": 2},
+                vulnerability_type="CWE-94 Improper Control of Generation of Code"),
+        ]
+        try:
+            _ts2._aggregate(_res2, "x = 1\n")
+            ok_t1src = ("CWE-94" in _res2.vulnerability_type
+                        and any("CWE-94" in t for t in (_res2.vulnerability_types or [])))
+        except Exception as _e:
+            ok_t1src = False
+            print(f"      异常: {type(_e).__name__}: {_e}")
+    print(f"[{'PASS' if ok_t1src else 'FAIL'}] §8.9#2 top1 同源化(票型>注册表): "
+          f"top1={_res2.vulnerability_type!r} vts={_res2.vulnerability_types!r} (期望 CWE-94)")
 
     # 21) 待办1（2026-08-30）：_infer_taint_type 证据上下文剥离——行上下文只说明
     #     "在哪里"，不说明"是什么"。hard_cve_03 实锤：request-data-write 的告警
@@ -4118,5 +4161,5 @@ if __name__ == "__main__":
           ok_wire, ok_chain, ok_b3, ok_b3b, ok_dedupe3, ok_dedupe4, ok_dedupe5,
           ok_rawtype, ok_strip, ok_tail, ok_trace, ok_tnorm, ok_wave4,
           ok_t_c, ok_t_c2, ok_t_c3, ok_t_a, ok_t_b, ok_t_bs, ok_t_inj,
-          ok_t_noreg, ok_t_off, ok_secret_gate])
+          ok_t_noreg, ok_t_off, ok_secret_gate, ok_t1src])
           else "=== 存在失败用例 ===")
