@@ -77,6 +77,12 @@ _SEMANTIC_TO_CWE = {
     # 缺陷语义族，工具粒度只有"缺配置"一档，双编号对齐）。
     "insecure cookie": "1004|614",
     "nosql injection": "943",
+    # 2026-08-31 第八波补（盲区层收口配套）：新 prefilter 规则的语义名映射。
+    # 117 日志注入此前无映射（log_injection 规则第四波即有，但仓库审计里
+    # 没出现过对应候选，未暴露）；1333/521 为第八波新类型。
+    "log injection": "117",
+    "redos": "1333",
+    "weak password policy": "521",
 }
 
 

@@ -64,6 +64,13 @@ _CWE_BY_KEYWORD: list[tuple[tuple[str, ...], str]] = [
      "CWE-843 Access of Resource Using Incompatible Type ('Type Confusion')"),
     (("unrestricted file upload", "unrestricted upload", "任意文件上传"),
      "CWE-434 Unrestricted Upload of File with Dangerous Type"),
+    # --- 2026-08-31 第八波补（盲区层收口配套）：只收短语级关键词，不收
+    # "regex"/"正则" 等裸技术词（回声票纪律：工具 rule_id 会经 normalize
+    # 参与"回声票"判定，裸词会把模型独立判断误判成复读工具）。
+    (("redos", "regular expression denial", "灾难性回溯", "catastrophic backtracking"),
+     "CWE-1333 Improper Neutralization of Special Elements Used in a Regular Expression"),
+    (("weak password", "password policy", "口令策略", "弱口令"),
+     "CWE-521 Weak Password Requirements"),
     (("cleartext storage", "明文存储"),
      "CWE-312 Cleartext Storage of Sensitive Information"),
     (("information exposure through error", "error message disclosure"),

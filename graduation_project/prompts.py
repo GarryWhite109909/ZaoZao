@@ -14,10 +14,11 @@ DeepSeek 安全样本优化（2026-06-30）：
 - 目标：把 deepseek-coder-v2:16b 在 exp_01 安全样本上的误报率从 100% 降到 ≤10%
 """
 
+import re
 from typing import Optional
 
 from graduation_project.schema import format_schema_for_prompt
-
+from graduation_project.cwe_normalizer import normalize_cwe_label
 
 # ---------------------------------------------------------------------------
 # 分析范围（统一文本，避免各处不一致）
@@ -858,7 +859,7 @@ def build_full_prompt_variant(
 # 并显式要求检查防御是否有效。system prompt 仍沿用 model_registry 选择的
 # system_prompt（v9max→BASE_PROMPT），与训练/主扫描保持一致。
 _TRIAGE_SCHEMA = """\
-{"is_confirmed": true/false, "vulnerability_type": "CWE-xxx 或漏洞类型名（is_confirmed=true 时必填，须基于代码实际分析而非工具标注）", "reason": "...", "fix_suggestion": "..."}
+{"is_confirmed": true/false, "vulnerability_type": "CWE-编号 漏洞名（is_confirmed=true 时必填，须与所确认候选的漏洞语义一致，基于代码分析；不同意工具标注时给出你的判断与依据）", "reason": "...", "fix_suggestion": "..."}
 """
 
 # 训练对齐的裁决 schema（2026-08-17 推导）：α0.5 训练用 ALPHA05_PROMPT 的
@@ -867,7 +868,7 @@ _TRIAGE_SCHEMA = """\
 # （triage_default recall 0.676 的根因，10 个 FN 全"reason 写对、票投假"）。
 # 本 schema 保留工具裁决的 has_vulnerability 字段（对齐训练），并复用训练 7 字段。
 _TRIAGE_ALIGNED_SCHEMA = """\
-{"has_vulnerability": true/false, "vulnerability_type": "CWE-编号 漏洞名（true 时必填，须基于代码分析而非工具标注；false 填 none）", "explanation": "数据流/成因（用 -> 描述）", "fix_suggestion": "最小局部改正；false 填 no fix needed"}
+{"has_vulnerability": true/false, "vulnerability_type": "CWE-编号 漏洞名（true 时必填，须与所确认候选的漏洞语义一致，基于代码分析；不同意工具标注时给出依据；false 填 none）", "explanation": "数据流/成因（用 -> 描述）", "fix_suggestion": "最小局部改正；false 填 no fix needed"}
 """
 
 # 候选来源可信度标注（2026-08-15 防锚定）：同一份错误提示，Q4 后端 0/3 全票
@@ -973,8 +974,18 @@ def build_triage_prompt(
     parts.append(f"- 规则: {rule_id}")
     if trust_note:
         parts.append(f"- 来源可信度: {trust_note}")
-    parts.append(f"- 漏洞类型: {taint_type}（工具猜测，仅供参考——若确认漏洞，"
-                 "vulnerability_type 必须来自你自己的分析）")
+    # CWE 编号锚（2026-08-31，§9.21 A/B 实验）：此前类型行只给语义名且明确
+    # 指令"必须来自你自己的分析"——模型拿到 "Prototype Pollution" 后须自行
+    # 映射编号，映射到近邻（917/441/862）正是 miss 形态（F9 的 prompt 侧根因）。
+    # 现把语义名的标准分类编号透出，并把"解绑指令"改为"语义一致 + 允许反驳"：
+    # 编号锚降低映射错误率；"如你的分析指向不同类型请说明依据"保留反锚定空间
+    # （counterfactual Layer 2 与 conformal 门不受影响）。
+    _norm_label = normalize_cwe_label(taint_type or "")
+    _cwe_m = re.search(r"CWE-\d+", _norm_label or "")
+    _cwe_anchor = f"，标准分类 {_cwe_m.group(0)}" if _cwe_m else ""
+    parts.append(f"- 漏洞类型: {taint_type}（工具猜测，仅供参考{_cwe_anchor}——"
+                 "若确认漏洞，vulnerability_type 须与所确认候选的漏洞语义一致；"
+                 "如你的分析指向不同类型，请给出判断依据）")
     parts.append(f"- 严重度: {severity}")
     parts.append(f"- 污染源: {source}  (line {source_line})")
     parts.append(f"- 危险点: {sink}  (line {sink_line})")
@@ -1026,9 +1037,11 @@ def build_triage_prompt(
                      "它可被编码/分隔符变体绕过（%2e%2e%2f、..\\\\、....//、双重编码），"
                      "被绕过仍是漏洞，不得仅因存在过滤代码就判安全。")
         parts.append("5. 严禁捏造代码中不存在的 API 参数或行为；判定必须基于代码实际内容。")
-        parts.append("6. 漏洞类型独立判定：工具标注的漏洞类型/规则名是模式匹配的猜测，可能完全"
-                     "错误（如把鉴权缺失标成 XSS）。你确认漏洞后，vulnerability_type 必须基于"
-                     "你自己的代码分析给出（如鉴权缺失是 CWE-862，不是工具标的类型）。")
+        parts.append("6. 漏洞类型判定：工具标注的类型/规则名是模式匹配的猜测，可能完全错误"
+                     "（如把鉴权缺失标成 XSS）。你确认漏洞后，vulnerability_type 必须基于"
+                     "你自己的代码分析给出，且与**该候选指向的漏洞语义一致**；若你认为工具"
+                     "类型标注错误，按你的分析给出并在 reason 中说明依据"
+                     "（不得照抄工具标注，也不得输出与候选语义无关的类型）。")
         parts.append(f"7. 若判定为真漏洞，输出 {'has_vulnerability' if aligned else 'is_confirmed'}=true"
                      "并给出简洁说明与修复建议；否则输出 false。")
     else:
@@ -1051,9 +1064,11 @@ def build_triage_prompt(
                      "它可被编码/分隔符变体绕过（%2e%2e%2f、..\\\\、....//、双重编码），"
                      "被绕过仍是漏洞，不得仅因存在过滤代码就判安全。")
         parts.append("4. 严禁捏造代码中不存在的 API 参数或行为；判定必须基于代码实际内容。")
-        parts.append("5. 漏洞类型独立判定：工具标注的漏洞类型/规则名是模式匹配的猜测，可能完全"
-                     "错误（如把鉴权缺失标成 XSS）。你确认漏洞后，vulnerability_type 必须基于"
-                     "你自己的代码分析给出（如鉴权缺失是 CWE-862，不是工具标的类型）。")
+        parts.append("5. 漏洞类型判定：工具标注的类型/规则名是模式匹配的猜测，可能完全错误"
+                     "（如把鉴权缺失标成 XSS）。你确认漏洞后，vulnerability_type 必须基于"
+                     "你自己的代码分析给出，且与**该候选指向的漏洞语义一致**；若你认为工具"
+                     "类型标注错误，按你的分析给出并在 reason 中说明依据"
+                     "（不得照抄工具标注，也不得输出与候选语义无关的类型）。")
         parts.append(f"6. 若判定为真漏洞，输出 {'has_vulnerability' if aligned else 'is_confirmed'}=true"
                      "并给出简洁说明与修复建议；否则输出 false。")
     parts.append("")

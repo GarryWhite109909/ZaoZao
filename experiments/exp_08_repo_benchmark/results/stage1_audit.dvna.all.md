@@ -16,7 +16,7 @@
 | CWE-639 | 107 | A 盲区（零候选） | — | — |
 | CWE-639 | 144 | A 盲区（零候选） | — | — |
 | CWE-601 | 188 | OK（候选覆盖且类型对） | prefilter+semgrep+taint_tracker·Open Redirect·L188<br>semgrep·Open Redirect·L188 | — |
-| CWE-95 | 197 | B 候选在但类型错标 | taint_tracker·Code Injection·L196 | — |
+| CWE-95 | 197 | B 候选在但类型错标 | taint_tracker·Code Injection·L197 | — |
 | CWE-502 | 218 | OK（候选覆盖且类型对） | semgrep·Insecure Deserialization·L218 | — |
 | CWE-611 | 235 | OK（候选覆盖且类型对） | semgrep·XXE·L235 | — |
 | CWE-200 | 207 | A 盲区（零候选） | — | — |
@@ -35,7 +35,7 @@
 | 进裁决 | prefilter+taint_tracker | taint_tracker:Command Injection | Command Injection | 39 | critical |
 | 去重合并 | taint_tracker | taint_tracker:Command Injection | Command Injection | 39 | critical |
 | 进裁决 | prefilter+semgrep+taint_tracker | taint_tracker:Open Redirect | Open Redirect | 188 | medium |
-| 进裁决 | taint_tracker | taint_tracker:Code Injection | Code Injection | 196 | critical |
+| 进裁决 | taint_tracker | taint_tracker:Code Injection | Code Injection | 197 | critical |
 | 去重合并 | prefilter | open_redirect | Open Redirect | 0 | medium |
 | 进裁决 | prefilter | unrestricted_file_upload | Unrestricted File Upload | 119 | medium |
 | 去重合并 | prefilter | cmd_injection_shell | Command Injection | 39 | critical |
@@ -71,7 +71,7 @@
 | 去向 | 工具 | 规则 | 类型 | 行 | 严重度 |
 |---|---|---|---|---|---|
 
-## server.js（原始候选 8 → 最终 1）
+## server.js（原始候选 8 → 最终 2）
 
 ### expected finding 覆盖情况
 
@@ -82,20 +82,21 @@
 
 | 工具 | 规则 | 类型 | 行 | 证据 | 确定性核验 |
 |---|---|---|---|---|---|
+| semgrep | models.semgrep_rules.javascript.express. | Insecure Cookie | 23 | Don’t use the default session cookie nam | 形态核验通过 |
 | detect-secrets+semgrep | models.semgrep_rules.javascript.express. | Hardcoded Credentials | 24 | A hard-coded credential was detected. It | 形态核验通过 |
 
 ### 全部原始候选去向
 
 | 去向 | 工具 | 规则 | 类型 | 行 | 严重度 |
 |---|---|---|---|---|---|
-| 被剔除/抑制 | semgrep | models.semgrep_rules.javascript.express. | models.semgrep_rules.javascript.express.security.audit.express-cookie-settings.express-cookie-session-default-name | 23 | medium |
-| 被剔除/抑制 | semgrep | models.semgrep_rules.javascript.express. | models.semgrep_rules.javascript.express.security.audit.express-cookie-settings.express-cookie-session-no-domain | 23 | medium |
-| 被剔除/抑制 | semgrep | models.semgrep_rules.javascript.express. | models.semgrep_rules.javascript.express.security.audit.express-cookie-settings.express-cookie-session-no-expires | 23 | medium |
-| 被剔除/抑制 | semgrep | models.semgrep_rules.javascript.express. | models.semgrep_rules.javascript.express.security.audit.express-cookie-settings.express-cookie-session-no-httponly | 23 | medium |
-| 被剔除/抑制 | semgrep | models.semgrep_rules.javascript.express. | models.semgrep_rules.javascript.express.security.audit.express-cookie-settings.express-cookie-session-no-path | 23 | medium |
-| 被剔除/抑制 | semgrep | models.semgrep_rules.javascript.express. | models.semgrep_rules.javascript.express.security.audit.express-cookie-settings.express-cookie-session-no-secure | 23 | medium |
+| 进裁决 | semgrep | models.semgrep_rules.javascript.express. | Insecure Cookie | 23 | medium |
+| 去重合并 | semgrep | models.semgrep_rules.javascript.express. | Insecure Cookie | 23 | medium |
+| 去重合并 | semgrep | models.semgrep_rules.javascript.express. | Insecure Cookie | 23 | medium |
+| 去重合并 | semgrep | models.semgrep_rules.javascript.express. | Insecure Cookie | 23 | medium |
+| 去重合并 | semgrep | models.semgrep_rules.javascript.express. | Insecure Cookie | 23 | medium |
+| 去重合并 | semgrep | models.semgrep_rules.javascript.express. | Insecure Cookie | 23 | medium |
 | 进裁决 | detect-secrets+semgrep | models.semgrep_rules.javascript.express. | Hardcoded Credentials | 24 | medium |
-| 去重合并 | detect-secrets | Secret Keyword | Secret Keyword | 24 | high |
+| 去重合并 | detect-secrets | Secret Keyword | Hardcoded Credentials | 24 | high |
 
 ## config/server.js（原始候选 0 → 最终 0）
 
