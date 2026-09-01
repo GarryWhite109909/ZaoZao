@@ -47,7 +47,7 @@ SINK_SIG = {
            "tar", "archive", "path.combine", "file.exists", "extractto"],
     "79": ["send", "echo", "render", "write", "innerHTML", "print"],
     "502": ["loads", "unserialize", "unmarshal", "yaml.load", "pickle"],
-    "94": ["eval", "exec"],
+    "94": ["eval", "exec", "parseExpression", "StandardEvaluationContext"],
     "1336": ["render_template_string", "Template", "render", "eval"],
     "611": ["parse", "XML", "DocumentBuilder", "ET.fromstring"],
     "918": ["requests.get", "http.Get", "http.Post", "urlopen", "curl", "client.Get", "PostAsync"],
@@ -60,7 +60,7 @@ def call_teacher(key, model, system, user, temperature, thinking="disabled"):
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
         "temperature": temperature,
-        "max_tokens": 16384,   # 放宽:长分析+长输出防截断(JSON 截断会被 G4 拒)
+        "max_tokens": 20000,   # glm-5.3-flash 思考计入 max_tokens,16k 实测发生 JSON 截断;放宽到 20k
     }
     # glm-5.3-flash 是强制思考模型:thinking disabled 会被 400 拒绝,
     # 因此 disabled 时不发送该字段(默认思考,content 输出仍干净);enabled 照发。
