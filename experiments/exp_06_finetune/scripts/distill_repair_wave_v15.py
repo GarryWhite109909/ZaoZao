@@ -164,7 +164,7 @@ def compose_system():
     return base_sys + "\n\n" + anchors.strip() + "\n"
 
 def main():
-    global MAX_CALLS
+    global MAX_CALLS, OUT_DIR
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["redistill", "groups"], required=True)
     ap.add_argument("--kits", default=str(CORPUS / "wave2"))
@@ -174,11 +174,15 @@ def main():
     ap.add_argument("--max-calls", type=int, default=400)
     ap.add_argument("--manifest",
                     default=str(BASE / "audit/redistill_manifest_v2_15_wave1.jsonl"))
+    # 多批次并行时各自独立输出目录,避免 success.jsonl 追加写冲突
+    ap.add_argument("--out", default="", help="输出目录,默认 corpus/repair_wave/_wave1_out")
     args = ap.parse_args()
     key = os.environ.get("ZHIPU_API_KEY")
     if not key:
         print("缺少 ZHIPU_API_KEY 环境变量"); sys.exit(1)
     MAX_CALLS = args.max_calls
+    if args.out:
+        OUT_DIR = Path(args.out)
 
     system = compose_system()
     OUT_DIR.mkdir(exist_ok=True)
