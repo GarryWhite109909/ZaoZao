@@ -2,158 +2,995 @@ batch=59 样本数=2
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=7468 lang=python
+### id=7779 lang=go
 [CODE]
-   1| import re
-   2| 
-   3| from django.db import connection
-   4| from django.http import JsonResponse
-   5| from django.views.decorators.http import require_POST
-   6| 
-   7| 
-   8| @require_POST
-   9| def column_config(request):
-  10|     """Builds a custom report query from user-supplied SQL fragments."""
-  11|     config = request.POST.get("sql", "")
-  12|     from_clause = request.POST.get("from", "")
-  13|     where_clause = request.POST.get("where", "")
-  14|     group_by = request.POST.get("groupby", "")
-  15| 
-  16|     sql = "SELECT "
-  17|     if not config.strip().upper().startswith("SELECT"):
-  18|         sql += "*"
-  19|     else:
-  20|         sql += config.strip()
-  21|     if from_clause:
-  22|         sql += " FROM " + from_clause
-  23|     if where_clause:
-  24|         cleaned = re.sub(r"^\s*WHERE\s*", "", where_clause, flags=re.I)
-  25|         sql += " WHERE (" + cleaned + ")"
-  26|     if group_by:
-  27|         sql += " GROUP BY " + group_by
-  28| 
-  29|     # blacklist check: only blocks DML keywords followed by a space
-  30|     if re.search(r"(ALTER|CREATE|DROP|RENAME|TRUNCATE|UPDATE|DELETE) ", sql, re.I):
-  31|         return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
-  32| 
-  33|     with connection.cursor() as cursor:
-  34|         cursor.execute(sql)
-  35|         row = cursor.fetchone()
-  36| 
-  37|     columns = list(row.keys()) if row else []
-  38|     return JsonResponse({"columns": columns})
-  39| 
-
-### id=8253 lang=python
-[CODE]
-   1| import re
-   2| import subprocess
-   3| import shlex
-   4| from flask import Flask, request, jsonify
-   5| 
-   6| app = Flask(__name__)
-   7| 
-   8| WORKSPACE = "/srv/workspace"
-   9| TIMEOUT = 60
-  10| 
-  11| DENY_PATTERNS = [
-  12|     re.compile(r"\brm\s+-[rf]{1,2}\b"),
-  13|     re.compile(r"\b(format|mkfs|diskpart)\b\s"),
-  14|     re.compile(r"\bdd\s+if="),
-  15|     re.compile(r"\b(shutdown|reboot|poweroff)\b"),
-  16| ]
-  17| 
-  18| # 白名单精确允许集：仅允许这些命令以固定参数模板执行
-  19| ALLOWED_COMMANDS = {
-  20|     "ls": ["ls", "-la"],
-  21|     "cat": ["cat"],
-  22|     "grep": ["grep"],
-  23|     "wc": ["wc", "-l"],
-  24| }
-  25| 
-  26| def guard_command(cmd, cwd):
-  27|     lower = cmd.strip().lower()
-  28|     for pattern in DENY_PATTERNS:
-  29|         if pattern.search(lower):
-  30|             return "Command blocked by safety guard"
-  31|     if cwd and ".." in cmd:
-  32|         return "Command blocked (path traversal detected)"
-  33|     return ""
-  34| 
-  35| def build_safe_argv(cmd):
-  36|     """白名单校验并构造无 shell 的 argv；非法则返回 None"""
-  37|     try:
-  38|         tokens = shlex.split(cmd)
-  39|     except ValueError:
-  40|         return None
-  41|     if not tokens:
-  42|         return None
-  43|     base = tokens[0]
-  44|     if base not in ALLOWED_COMMANDS:
-  45|         return None
-  46|     allowed = ALLOWED_COMMANDS[base]
-  47|     extra = tokens[1:]
-  48|     # 参数个数与内容限制：禁止额外选项/标志，仅允许普通位置参数
-  49|     for tok in extra:
-  50|         if tok.startswith("-"):
-  51|             return None
-  52|     if len(extra) > 4:
-  53|         return None
-  54|     return allowed + extra
-  55| 
-  56| @app.route("/api/exec", methods=["POST"])
-  57| def exec_command():
-  58|     data = request.get_json(silent=True) or {}
-  59|     command = data.get("command")
-  60|     if not command:
-  61|         return jsonify({"error": "command is required"}), 400
+   1| // Package server is the HTTP daemon
+   2| package server
+   3| 
+   4| import (
+   5| 	"bytes"
+   6| 	"compress/gzip"
+   7| 	"context"
+   8| 	"fmt"
+   9| 	"io"
+  10| 	"net"
+  11| 	"net/http"
+  12| 	"os"
+  13| 	"regexp"
+  14| 	"strings"
+  15| 	"sync/atomic"
+  16| 	"text/template"
+  17| 	"time"
+  18| 
+  19| 	"github.com/axllent/mailpit/config"
+  20| 	"github.com/axllent/mailpit/internal/auth"
+  21| 	"github.com/axllent/mailpit/internal/logger"
+  22| 	"github.com/axllent/mailpit/internal/pop3"
+  23| 	"github.com/axllent/mailpit/internal/prometheus"
+  24| 	"github.com/axllent/mailpit/internal/shortuuid"
+  25| 	"github.com/axllent/mailpit/internal/snakeoil"
+  26| 	"github.com/axllent/mailpit/internal/stats"
+  27| 	"github.com/axllent/mailpit/internal/storage"
+  28| 	"github.com/axllent/mailpit/internal/tools"
+  29| 	"github.com/axllent/mailpit/server/apiv1"
+  30| 	"github.com/axllent/mailpit/server/handlers"
+  31| 	"github.com/axllent/mailpit/server/websockets"
+  32| )
+  33| 
+  34| var (
+  35| 	// htmlPreviewRouteRe is a regexp to match the HTML preview route
+  36| 	htmlPreviewRouteRe *regexp.Regexp
+  37| )
+  38| 
+  39| // skipUIAuthKey is a private context key used to signal that UI basic-auth
+  40| // should be bypassed for a specific request. This avoids mutating the global
+  41| // auth.UICredentials pointer (which is a data race under concurrent load).
+  42| type contextKey int
+  43| 
+  44| const (
+  45| 	skipUIAuthKey contextKey = iota
+  46| 	// bodyLimitKey carries an optional request body size cap (in bytes) through the
+  47| 	// context. middleWareFunc reads it and applies it instead of the default 5 MB cap.
+  48| 	// A value of 0 means unlimited. Used by sendAPIAuthMiddleware to honour
+  49| 	// config.MaxMessageSize for the send endpoint.
+  50| 	bodyLimitKey
+  51| )
+  52| 
+  53| // Listen will start the httpd
+  54| func Listen() {
+  55| 	setCORSOrigins()
+  56| 
+  57| 	isReady := &atomic.Value{}
+  58| 	isReady.Store(false)
+  59| 	stats.Track()
+  60| 
+  61| 	websockets.MessageHub = websockets.NewHub()
   62| 
-  63|     cwd = data.get("working_dir") or WORKSPACE
-  64|     err = guard_command(command, cwd)
-  65|     if err:
-  66|         return jsonify({"error": err}), 403
+  63| 	// set allowed websocket origins from configuration
+  64| 	// websockets.SetAllowedOrigins(AccessControlAllowWSOrigins)
+  65| 
+  66| 	go websockets.MessageHub.Run()
   67| 
-  68|     argv = build_safe_argv(command)
-  69|     if argv is None:
-  70|         return jsonify({"error": "Command not allowed by whitelist"}), 403
+  68| 	go pop3.Run()
+  69| 
+  70| 	r := apiRoutes()
   71| 
-  72|     try:
-  73|         result = subprocess.run(
-  74|             argv,
-  75|             cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT,
-  76|             shell=False
-  77|         )
-  78|         output = result.stdout + result.stderr
-  79|         return jsonify({"output": output or "(no output)"})
-  80|     except subprocess.TimeoutExpired:
-  81|         return jsonify({"error": "Command timed out"}), 504
-  82| 
-  83| if __name__ == "__main__":
-  84|     app.run()
-  85| 
+  72| 	// kubernetes probes
+  73| 	r.HandleFunc("GET "+config.Webroot+"livez", handlers.HealthzHandler)
+  74| 	r.HandleFunc("GET "+config.Webroot+"readyz", handlers.ReadyzHandler(isReady))
+  75| 
+  76| 	// proxy handler for screenshots
+  77| 	r.HandleFunc("GET "+config.Webroot+"proxy", middleWareFunc(handlers.ProxyHandler))
+  78| 
+  79| 	// virtual filesystem for /dist/ & some individual files
+  80| 	r.Handle("GET "+config.Webroot+"dist/", middleWareFunc(embedController))
+  81| 	r.Handle("GET "+config.Webroot+"api/", middleWareFunc(embedController))
+  82| 	r.Handle("GET "+config.Webroot+"favicon.ico", middleWareFunc(embedController))
+  83| 	r.Handle("GET "+config.Webroot+"favicon.svg", middleWareFunc(embedController))
+  84| 	r.Handle("GET "+config.Webroot+"mailpit.svg", middleWareFunc(embedController))
+  85| 	r.Handle("GET "+config.Webroot+"notification.png", middleWareFunc(embedController))
+  86| 
+  87| 	// redirect to webroot if no trailing slash
+  88| 	if config.Webroot != "/" {
+  89| 		redirect := strings.TrimRight(config.Webroot, "/")
+  90| 		r.HandleFunc("GET "+redirect, middleWareFunc(addSlashToWebroot))
+  91| 	}
+  92| 
+  93| 	// UI shortcut
+  94| 	r.HandleFunc("GET "+config.Webroot+"view/latest", middleWareFunc(handlers.RedirectToLatestMessage))
+  95| 
+  96| 	// frontend testing + web UI via virtual index.html
+  97| 	// Go's ServeMux wildcards must span a full path segment so {id}.html is invalid;
+  98| 	// viewHandler dispatches on the path suffix instead.
+  99| 	r.HandleFunc("GET "+config.Webroot+"view/", middleWareFunc(viewHandler))
+ 100| 
+ 101| 	r.Handle("GET "+config.Webroot+"search", middleWareFunc(index))
+ 102| 	// Exact-match the webroot; stdlib "/" is always a subtree so we guard inside.
+ 103| 	r.HandleFunc("GET "+config.Webroot, func(w http.ResponseWriter, r *http.Request) {
+ 104| 		if r.URL.Path != config.Webroot {
+ 105| 			http.NotFound(w, r)
+ 106| 			return
+ 107| 		}
+ 108| 		middleWareFunc(index)(w, r)
+ 109| 	})
+ 110| 
+ 111| 	if auth.UICredentials != nil {
+ 112| 		logger.Log().Info("[http] enabling basic authentication")
+ 113| 	}
+ 114| 
+ 115| 	// Mark the application here as ready
+ 116| 	isReady.Store(true)
+ 117| 
+ 118| 	server := &http.Server{
+ 119| 		Addr:              config.HTTPListen,
+ 120| 		ReadTimeout:       30 * time.Second,
+ 121| 		ReadHeaderTimeout: 5 * time.Second,
+ 122| 		WriteTimeout:      30 * time.Second,
+ 123| 		Handler:           r,
+ 124| 	}
+ 125| 
+ 126| 	// add temporary self-signed certificates to get deleted afterwards
+ 127| 	for _, keyPair := range snakeoil.Certificates() {
+ 128| 		storage.AddTempFile(keyPair.Public)
+ 129| 		storage.AddTempFile(keyPair.Private)
+ 130| 	}
+ 131| 
+ 132| 	if config.UITLSCert != "" && config.UITLSKey != "" {
+ 133| 		logger.Log().Infof("[http] starting on %s (TLS)", config.HTTPListen)
+ 134| 		logger.Log().Infof("[http] accessible via https://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
+ 135| 		if err := server.ListenAndServeTLS(config.UITLSCert, config.UITLSKey); err != nil {
+ 136| 			storage.Close()
+ 137| 			logger.Log().Fatal(err)
+ 138| 		}
+ 139| 
+ 140| 	} else {
+ 141| 		socketAddr, perm, isSocket := tools.UnixSocket(config.HTTPListen)
+ 142| 
+ 143| 		if isSocket {
+ 144| 			if err := tools.PrepareSocket(socketAddr); err != nil {
+ 145| 				storage.Close()
+ 146| 				logger.Log().Fatal(err)
+ 147| 			}
+ 148| 
+ 149| 			// delete the Unix socket file on exit
+ 150| 			storage.AddTempFile(socketAddr)
+ 151| 
+ 152| 			ln, err := net.Listen("unix", socketAddr)
+ 153| 			if err != nil {
+ 154| 				storage.Close()
+ 155| 				logger.Log().Fatal(err)
+ 156| 			}
+ 157| 
+ 158| 			if err := os.Chmod(socketAddr, perm); err != nil {
+ 159| 				storage.Close()
+ 160| 				logger.Log().Fatal(err)
+ 161| 			}
+ 162| 
+ 163| 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
+ 164| 
+ 165| 			if err := server.Serve(ln); err != nil {
+ 166| 				storage.Close()
+ 167| 				logger.Log().Fatal(err)
+ 168| 			}
+ 169| 
+ 170| 		} else {
+ 171| 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
+ 172| 			logger.Log().Infof("[http] accessible via http://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
+ 173| 			if err := server.ListenAndServe(); err != nil {
+ 174| 				storage.Close()
+ 175| 				logger.Log().Fatal(err)
+ 176| 			}
+ 177| 		}
+ 178| 	}
+ 179| }
+ 180| 
+ 181| func apiRoutes() *http.ServeMux {
+ 182| 	r := http.NewServeMux()
+ 183| 
+ 184| 	// API V1
+ 185| 	r.HandleFunc("GET "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.GetMessages))
+ 186| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.SetReadStatus))
+ 187| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.DeleteMessages))
+ 188| 	r.HandleFunc("GET "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.Search))
+ 189| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.DeleteSearch))
+ 190| 	r.HandleFunc("POST "+config.Webroot+"api/v1/send", sendAPIAuthMiddleware(apiv1.SendMessageHandler))
+ 191| 	r.HandleFunc("GET "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.GetAllTags))
+ 192| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.SetMessageTags))
+ 193| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.RenameTag))
+ 194| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.DeleteTag))
+ 195| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}", middleWareFunc(apiv1.DownloadAttachment))
+ 196| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}/thumb", middleWareFunc(apiv1.Thumbnail))
+ 197| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/headers", middleWareFunc(apiv1.GetHeaders))
+ 198| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/raw", middleWareFunc(apiv1.DownloadRaw))
+ 199| 	r.HandleFunc("POST "+config.Webroot+"api/v1/message/{id}/release", middleWareFunc(apiv1.ReleaseMessage))
+ 200| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/html-check", middleWareFunc(apiv1.HTMLCheck))
+ 201| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/link-check", middleWareFunc(apiv1.LinkCheck))
+ 202| 	if config.EnableSpamAssassin != "" {
+ 203| 		r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/sa-check", middleWareFunc(apiv1.SpamAssassinCheck))
+ 204| 	}
+ 205| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}", middleWareFunc(apiv1.GetMessage))
+ 206| 	r.HandleFunc("GET "+config.Webroot+"api/v1/info", middleWareFunc(apiv1.AppInfo))
+ 207| 	r.HandleFunc("GET "+config.Webroot+"api/v1/webui", middleWareFunc(apiv1.WebUIConfig))
+ 208| 	r.HandleFunc("GET "+config.Webroot+"api/v1/swagger.json", middleWareFunc(swaggerBasePath))
+ 209| 
+ 210| 	// Chaos
+ 211| 	r.HandleFunc("GET "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.GetChaos))
+ 212| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.SetChaos))
+ 213| 
+ 214| 	// Prometheus metrics (if enabled and using existing server)
+ 215| 	if prometheus.GetMode() == "integrated" {
+ 216| 		r.HandleFunc("GET "+config.Webroot+"metrics", middleWareFunc(func(w http.ResponseWriter, r *http.Request) {
+ 217| 			prometheus.GetHandler().ServeHTTP(w, r)
+ 218| 		}))
+ 219| 	}
+ 220| 
+ 221| 	// web UI websocket
+ 222| 	r.HandleFunc("GET "+config.Webroot+"api/events", middleWareFunc(apiWebsocket))
+ 223| 
+ 224| 	// return blank 200 response for OPTIONS requests for CORS
+ 225| 	r.Handle("OPTIONS "+config.Webroot+"api/v1/", middleWareFunc(apiv1.GetOptions))
+ 226| 
+ 227| 	return r
+ 228| }
+ 229| 
+ 230| // BasicAuthResponse returns an basic auth response to the browser
+ 231| func basicAuthResponse(w http.ResponseWriter) {
+ 232| 	w.Header().Set("WWW-Authenticate", `Basic realm="Login"`)
+ 233| 	w.WriteHeader(http.StatusUnauthorized)
+ 234| 	_, _ = w.Write([]byte("Unauthorized.\n"))
+ 235| }
+ 236| 
+ 237| // sendAPIAuthMiddleware handles authentication specifically for the send API endpoint.
+ 238| // It can use dedicated send API authentication or accept any credentials based on configuration.
+ 239| // It communicates skip-UI-auth intent via request context rather than mutating the global
+ 240| // auth.UICredentials pointer, which would be a data race under concurrent load.
+ 241| func sendAPIAuthMiddleware(fn http.HandlerFunc) http.HandlerFunc {
+ 242| 	return func(w http.ResponseWriter, r *http.Request) {
+ 243| 		// Override the default 5 MB body cap with the send-specific limit so that
+ 244| 		// middleWareFunc applies config.MaxMessageSize (0 = unlimited) instead.
+ 245| 		r = r.WithContext(context.WithValue(r.Context(), bodyLimitKey, int64(config.MaxMessageSize)*1024*1024))
+ 246| 
+ 247| 		// If send API auth accept any is enabled, bypass all authentication.
+ 248| 		if config.SendAPIAuthAcceptAny {
+ 249| 			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
+ 250| 			middleWareFunc(fn)(w, r.WithContext(ctx))
+ 251| 			return
+ 252| 		}
+ 253| 
+ 254| 		// If Send API credentials are configured, only accept those credentials.
+ 255| 		if auth.SendAPICredentials != nil {
+ 256| 			user, pass, ok := r.BasicAuth()
+ 257| 
+ 258| 			if !ok {
+ 259| 				basicAuthResponse(w)
+ 260| 				return
+ 261| 			}
+ 262| 
+ 263| 			if !auth.SendAPICredentials.Match(user, pass) {
+ 264| 				basicAuthResponse(w)
+ 265| 				return
+ 266| 			}
+ 267| 
+ 268| 			// Valid Send API credentials — bypass UI auth via context flag.
+ 269| 			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
+ 270| 			middleWareFunc(fn)(w, r.WithContext(ctx))
+ 271| 			return
+ 272| 		}
+ 273| 
+ 274| 		// No Send API credentials configured — fall back to UI auth.
+ 275| 		middleWareFunc(fn)(w, r)
+ 276| 	}
+ 277| }
+ 278| 
+ 279| type gzipResponseWriter struct {
+ 280| 	io.Writer
+ 281| 	http.ResponseWriter
+ 282| }
+ 283| 
+ 284| func (w gzipResponseWriter) Write(b []byte) (int, error) {
+ 285| 	return w.Writer.Write(b)
+ 286| }
+ 287| 
+ 288| // MiddleWareFunc http middleware adds optional basic authentication
+ 289| // and gzip compression.
+ 290| func middleWareFunc(fn http.HandlerFunc) http.HandlerFunc {
+ 291| 	return func(w http.ResponseWriter, r *http.Request) {
+ 292| 		// Limit request body size to 5 MB to prevent memory-exhaustion DoS via large
+ 293| 		// JSON bodies. sendAPIAuthMiddleware sets bodyLimitKey in the context to signal
+ 294| 		// that the handler manages its own limit (send.go uses config.MaxMessageSize),
+ 295| 		// so we skip the cap here for that route only.
+ 296| 		if _, ok := r.Context().Value(bodyLimitKey).(int64); !ok {
+ 297| 			r.Body = http.MaxBytesReader(w, r.Body, 5*1024*1024)
+ 298| 		}
+ 299| 
+ 300| 		w.Header().Set("Referrer-Policy", "no-referrer")
+ 301| 
+ 302| 		// generate a new random nonce on every request
+ 303| 		randomNonce := shortuuid.New()
+ 304| 		// header used to pass nonce through to function
+ 305| 		r.Header.Set("mp-nonce", randomNonce)
+ 306| 
+ 307| 		// Prevent JavaScript XSS by adding a nonce for script-src
+ 308| 		cspHeader := strings.Replace(
+ 309| 			config.ContentSecurityPolicy,
+ 310| 			"script-src 'self';",
+ 311| 			fmt.Sprintf("script-src 'nonce-%s';", randomNonce),
+ 312| 			1,
+ 313| 		)
+ 314| 
+ 315| 		w.Header().Set("Content-Security-Policy", cspHeader)
+ 316| 
+ 317| 		if htmlPreviewRouteRe == nil {
+ 318| 			htmlPreviewRouteRe = regexp.MustCompile(`^` + regexp.QuoteMeta(config.Webroot) + `view/[a-zA-Z0-9]+\.html$`)
+ 319| 		}
+ 320| 
+ 321| 		if strings.HasPrefix(r.RequestURI, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.RequestURI) {
+ 322| 			if allowed := corsOriginAccessControl(r); !allowed {
+ 323| 				http.Error(w, "Blocked due to CORS violation", http.StatusForbidden)
+ 324| 				return
+ 325| 			}
+ 326| 			w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+ 327| 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, OPTIONS")
+ 328| 			w.Header().Set("Access-Control-Allow-Headers", "*")
+ 329| 		}
+ 330| 
+ 331| 		// Check basic authentication headers if configured.
+ 332| 		// OPTIONS requests are skipped if CORS is enabled, since browsers omit credentials for preflight checks.
+ 333| 		// skipUIAuthKey in the request context allows sendAPIAuthMiddleware to bypass UI auth
+ 334| 		// for a specific request without touching the global auth.UICredentials pointer.
+ 335| 		skipUIAuth, _ := r.Context().Value(skipUIAuthKey).(bool)
+ 336| 		isCORSOptionsRequest := AccessControlAllowOrigin != "" && r.Method == http.MethodOptions
+ 337| 		if !skipUIAuth && !isCORSOptionsRequest && auth.UICredentials != nil {
+ 338| 			user, pass, ok := r.BasicAuth()
+ 339| 
+ 340| 			if !ok {
+ 341| 				basicAuthResponse(w)
+ 342| 				return
+ 343| 			}
+ 344| 
+ 345| 			if !auth.UICredentials.Match(user, pass) {
+ 346| 				basicAuthResponse(w)
+ 347| 				return
+ 348| 			}
+ 349| 		}
+ 350| 
+ 351| 		// WebSocket upgrade requests must not be wrapped in a gzip writer:
+ 352| 		// gzipResponseWriter does not implement http.Hijacker, which the
+ 353| 		// WebSocket library requires to take over the raw TCP connection.
+ 354| 		isWebSocketUpgrade := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+ 355| 		if isWebSocketUpgrade || config.DisableHTTPCompression || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+ 356| 			fn(w, r)
+ 357| 			return
+ 358| 		}
+ 359| 
+ 360| 		w.Header().Set("Content-Encoding", "gzip")
+ 361| 		gz := gzip.NewWriter(w)
+ 362| 		defer func() { _ = gz.Close() }()
+ 363| 		gzr := gzipResponseWriter{Writer: gz, ResponseWriter: w}
+ 364| 		fn(gzr, r)
+ 365| 	}
+ 366| }
+ 367| 
+ 368| // Redirect to webroot
+ 369| func addSlashToWebroot(w http.ResponseWriter, r *http.Request) {
+ 370| 	http.Redirect(w, r, config.Webroot, http.StatusFound)
+ 371| }
+ 372| 
+ 373| // viewHandler routes /view/ requests based on path suffix.
+ 374| // Go's ServeMux requires wildcards to span a full path segment,
+ 375| // so patterns like /view/{id}.html are invalid; we dispatch manually here.
+ 376| func viewHandler(w http.ResponseWriter, r *http.Request) {
+ 377| 	path := strings.TrimPrefix(r.URL.Path, config.Webroot+"view/")
+ 378| 	switch {
+ 379| 	case strings.HasSuffix(path, ".html"):
+ 380| 		apiv1.GetMessageHTML(w, r)
+ 381| 	case strings.HasSuffix(path, ".txt"):
+ 382| 		apiv1.GetMessageText(w, r)
+ 383| 	default:
+ 384| 		index(w, r)
+ 385| 	}
+ 386| }
+ 387| 
+ 388| // Websocket to broadcast changes.
+ 389| // Authentication and CORS are handled by middleWareFunc before this is reached.
+ 390| func apiWebsocket(w http.ResponseWriter, r *http.Request) {
+ 391| 	websockets.ServeWs(websockets.MessageHub, w, r)
+ 392| 	storage.BroadcastMailboxStats()
+ 393| }
+ 394| 
+ 395| // Wrapper to artificially inject a basePath to the swagger.json if a webroot has been specified
+ 396| func swaggerBasePath(w http.ResponseWriter, _ *http.Request) {
+ 397| 	f, err := distFS.ReadFile("ui/api/v1/swagger.json")
+ 398| 	if err != nil {
+ 399| 		panic(err)
+ 400| 	}
+ 401| 
+ 402| 	if config.Webroot != "/" {
+ 403| 		// artificially inject a path at the start
+ 404| 		replacement := fmt.Sprintf("{\n  \"basePath\": \"%s\",", strings.TrimRight(config.Webroot, "/"))
+ 405| 
+ 406| 		f = bytes.Replace(f, []byte("{"), []byte(replacement), 1)
+ 407| 	}
+ 408| 
+ 409| 	w.Header().Add("Content-Type", "application/json")
+ 410| 	_, _ = w.Write(f)
+ 411| }
+ 412| 
+ 413| // Just returns the default HTML template
+ 414| func index(w http.ResponseWriter, r *http.Request) {
+ 415| 
+ 416| 	var h = `<!DOCTYPE html>
+ 417| <html lang="en" class="h-100">
+ 418| 
+ 419| <head>
+ 420| 	<meta charset="utf-8">
+ 421| 	<meta name="viewport" content="width=device-width,initial-scale=1.0">
+ 422| 	<meta name="referrer" content="no-referrer">
+ 423| 	<meta name="robots" content="noindex, nofollow, noarchive">
+ 424| 	<link rel="icon" href="{{ .Webroot }}favicon.svg">
+ 425| 	<title>Mailpit</title>
+ 426| 	<link rel=stylesheet href="{{ .Webroot }}dist/app.css?{{ .Version }}">
+ 427| </head>
+ 428| 
+ 429| <body class="h-100">
+ 430| 	<div class="container-fluid h-100 d-flex flex-column" id="app" data-webroot="{{ .Webroot }}" data-version="{{ .Version }}">
+ 431| 		<noscript class="alert alert-warning position-absolute top-50 start-50 translate-middle">
+ 432| 			You need a browser with JavaScript enabled to use Mailpit
+ 433| 		</noscript>
+ 434| 	</div>
+ 435| 
+ 436| 	<script src="{{ .Webroot }}dist/app.js?{{ .Version }}" nonce="{{ .Nonce }}"></script>
+ 437| </body>
+ 438| 
+ 439| </html>`
+ 440| 
+ 441| 	t, err := template.New("index").Parse(h)
+ 442| 	if err != nil {
+ 443| 		panic(err)
+ 444| 	}
+ 445| 
+ 446| 	data := struct {
+ 447| 		Webroot string
+ 448| 		Version string
+ 449| 		Nonce   string
+ 450| 	}{
+ 451| 		Webroot: config.Webroot,
+ 452| 		Version: config.Version,
+ 453| 		Nonce:   r.Header.Get("mp-nonce"),
+ 454| 	}
+ 455| 
+ 456| 	buff := new(bytes.Buffer)
+ 457| 
+ 458| 	err = t.Execute(buff, data)
+ 459| 	if err != nil {
+ 460| 		panic(err)
+ 461| 	}
+ 462| 
+ 463| 	w.Header().Add("Content-Type", "text/html; charset=utf-8")
+ 464| 	_, _ = w.Write(buff.Bytes())
+ 465| }
+ 466| 
+ 467| 
+
+### id=7780 lang=go
+[CODE]
+   1| // Package server is the HTTP daemon
+   2| package server
+   3| 
+   4| import (
+   5| 	"bytes"
+   6| 	"compress/gzip"
+   7| 	"context"
+   8| 	"fmt"
+   9| 	"io"
+  10| 	"net"
+  11| 	"net/http"
+  12| 	"os"
+  13| 	"regexp"
+  14| 	"strings"
+  15| 	"sync/atomic"
+  16| 	"text/template"
+  17| 	"time"
+  18| 
+  19| 	"github.com/axllent/mailpit/config"
+  20| 	"github.com/axllent/mailpit/internal/auth"
+  21| 	"github.com/axllent/mailpit/internal/logger"
+  22| 	"github.com/axllent/mailpit/internal/pop3"
+  23| 	"github.com/axllent/mailpit/internal/prometheus"
+  24| 	"github.com/axllent/mailpit/internal/shortuuid"
+  25| 	"github.com/axllent/mailpit/internal/snakeoil"
+  26| 	"github.com/axllent/mailpit/internal/stats"
+  27| 	"github.com/axllent/mailpit/internal/storage"
+  28| 	"github.com/axllent/mailpit/internal/tools"
+  29| 	"github.com/axllent/mailpit/server/apiv1"
+  30| 	"github.com/axllent/mailpit/server/handlers"
+  31| 	"github.com/axllent/mailpit/server/websockets"
+  32| )
+  33| 
+  34| var (
+  35| 	// htmlPreviewRouteRe is a regexp to match the HTML preview route
+  36| 	htmlPreviewRouteRe *regexp.Regexp
+  37| )
+  38| 
+  39| // skipUIAuthKey is a private context key used to signal that UI basic-auth
+  40| // should be bypassed for a specific request. This avoids mutating the global
+  41| // auth.UICredentials pointer (which is a data race under concurrent load).
+  42| type contextKey int
+  43| 
+  44| const (
+  45| 	skipUIAuthKey contextKey = iota
+  46| 	// bodyLimitKey carries an optional request body size cap (in bytes) through the
+  47| 	// context. middleWareFunc reads it and applies it instead of the default 5 MB cap.
+  48| 	// A value of 0 means unlimited. Used by sendAPIAuthMiddleware to honour
+  49| 	// config.MaxMessageSize for the send endpoint.
+  50| 	bodyLimitKey
+  51| )
+  52| 
+  53| // Listen will start the httpd
+  54| func Listen() {
+  55| 	setCORSOrigins()
+  56| 
+  57| 	isReady := &atomic.Value{}
+  58| 	isReady.Store(false)
+  59| 	stats.Track()
+  60| 
+  61| 	websockets.MessageHub = websockets.NewHub()
+  62| 	websockets.SetCheckOriginFunc(corsOriginAccessControl)
+  63| 
+  64| 	go websockets.MessageHub.Run()
+  65| 
+  66| 	go pop3.Run()
+  67| 
+  68| 	r := apiRoutes()
+  69| 
+  70| 	// kubernetes probes
+  71| 	r.HandleFunc("GET "+config.Webroot+"livez", handlers.HealthzHandler)
+  72| 	r.HandleFunc("GET "+config.Webroot+"readyz", handlers.ReadyzHandler(isReady))
+  73| 
+  74| 	// proxy handler for screenshots
+  75| 	r.HandleFunc("GET "+config.Webroot+"proxy", middleWareFunc(handlers.ProxyHandler))
+  76| 
+  77| 	// virtual filesystem for /dist/ & some individual files
+  78| 	r.Handle("GET "+config.Webroot+"dist/", middleWareFunc(embedController))
+  79| 	r.Handle("GET "+config.Webroot+"api/", middleWareFunc(embedController))
+  80| 	r.Handle("GET "+config.Webroot+"favicon.ico", middleWareFunc(embedController))
+  81| 	r.Handle("GET "+config.Webroot+"favicon.svg", middleWareFunc(embedController))
+  82| 	r.Handle("GET "+config.Webroot+"mailpit.svg", middleWareFunc(embedController))
+  83| 	r.Handle("GET "+config.Webroot+"notification.png", middleWareFunc(embedController))
+  84| 
+  85| 	// redirect to webroot if no trailing slash
+  86| 	if config.Webroot != "/" {
+  87| 		redirect := strings.TrimRight(config.Webroot, "/")
+  88| 		r.HandleFunc("GET "+redirect, middleWareFunc(addSlashToWebroot))
+  89| 	}
+  90| 
+  91| 	// UI shortcut
+  92| 	r.HandleFunc("GET "+config.Webroot+"view/latest", middleWareFunc(handlers.RedirectToLatestMessage))
+  93| 
+  94| 	// frontend testing + web UI via virtual index.html
+  95| 	// Go's ServeMux wildcards must span a full path segment so {id}.html is invalid;
+  96| 	// viewHandler dispatches on the path suffix instead.
+  97| 	r.HandleFunc("GET "+config.Webroot+"view/", middleWareFunc(viewHandler))
+  98| 
+  99| 	r.Handle("GET "+config.Webroot+"search", middleWareFunc(index))
+ 100| 	// Exact-match the webroot; stdlib "/" is always a subtree so we guard inside.
+ 101| 	r.HandleFunc("GET "+config.Webroot, func(w http.ResponseWriter, r *http.Request) {
+ 102| 		if r.URL.Path != config.Webroot {
+ 103| 			http.NotFound(w, r)
+ 104| 			return
+ 105| 		}
+ 106| 		middleWareFunc(index)(w, r)
+ 107| 	})
+ 108| 
+ 109| 	if auth.UICredentials != nil {
+ 110| 		logger.Log().Info("[http] enabling basic authentication")
+ 111| 	}
+ 112| 
+ 113| 	// Mark the application here as ready
+ 114| 	isReady.Store(true)
+ 115| 
+ 116| 	server := &http.Server{
+ 117| 		Addr:              config.HTTPListen,
+ 118| 		ReadTimeout:       30 * time.Second,
+ 119| 		ReadHeaderTimeout: 5 * time.Second,
+ 120| 		WriteTimeout:      30 * time.Second,
+ 121| 		Handler:           r,
+ 122| 	}
+ 123| 
+ 124| 	// add temporary self-signed certificates to get deleted afterwards
+ 125| 	for _, keyPair := range snakeoil.Certificates() {
+ 126| 		storage.AddTempFile(keyPair.Public)
+ 127| 		storage.AddTempFile(keyPair.Private)
+ 128| 	}
+ 129| 
+ 130| 	if config.UITLSCert != "" && config.UITLSKey != "" {
+ 131| 		logger.Log().Infof("[http] starting on %s (TLS)", config.HTTPListen)
+ 132| 		logger.Log().Infof("[http] accessible via https://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
+ 133| 		if err := server.ListenAndServeTLS(config.UITLSCert, config.UITLSKey); err != nil {
+ 134| 			storage.Close()
+ 135| 			logger.Log().Fatal(err)
+ 136| 		}
+ 137| 
+ 138| 	} else {
+ 139| 		socketAddr, perm, isSocket := tools.UnixSocket(config.HTTPListen)
+ 140| 
+ 141| 		if isSocket {
+ 142| 			if err := tools.PrepareSocket(socketAddr); err != nil {
+ 143| 				storage.Close()
+ 144| 				logger.Log().Fatal(err)
+ 145| 			}
+ 146| 
+ 147| 			// delete the Unix socket file on exit
+ 148| 			storage.AddTempFile(socketAddr)
+ 149| 
+ 150| 			ln, err := net.Listen("unix", socketAddr)
+ 151| 			if err != nil {
+ 152| 				storage.Close()
+ 153| 				logger.Log().Fatal(err)
+ 154| 			}
+ 155| 
+ 156| 			if err := os.Chmod(socketAddr, perm); err != nil {
+ 157| 				storage.Close()
+ 158| 				logger.Log().Fatal(err)
+ 159| 			}
+ 160| 
+ 161| 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
+ 162| 
+ 163| 			if err := server.Serve(ln); err != nil {
+ 164| 				storage.Close()
+ 165| 				logger.Log().Fatal(err)
+ 166| 			}
+ 167| 
+ 168| 		} else {
+ 169| 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
+ 170| 			logger.Log().Infof("[http] accessible via http://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
+ 171| 			if err := server.ListenAndServe(); err != nil {
+ 172| 				storage.Close()
+ 173| 				logger.Log().Fatal(err)
+ 174| 			}
+ 175| 		}
+ 176| 	}
+ 177| }
+ 178| 
+ 179| func apiRoutes() *http.ServeMux {
+ 180| 	r := http.NewServeMux()
+ 181| 
+ 182| 	// API V1
+ 183| 	r.HandleFunc("GET "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.GetMessages))
+ 184| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.SetReadStatus))
+ 185| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.DeleteMessages))
+ 186| 	r.HandleFunc("GET "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.Search))
+ 187| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.DeleteSearch))
+ 188| 	r.HandleFunc("POST "+config.Webroot+"api/v1/send", sendAPIAuthMiddleware(apiv1.SendMessageHandler))
+ 189| 	r.HandleFunc("GET "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.GetAllTags))
+ 190| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.SetMessageTags))
+ 191| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.RenameTag))
+ 192| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.DeleteTag))
+ 193| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}", middleWareFunc(apiv1.DownloadAttachment))
+ 194| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}/thumb", middleWareFunc(apiv1.Thumbnail))
+ 195| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/headers", middleWareFunc(apiv1.GetHeaders))
+ 196| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/raw", middleWareFunc(apiv1.DownloadRaw))
+ 197| 	r.HandleFunc("POST "+config.Webroot+"api/v1/message/{id}/release", middleWareFunc(apiv1.ReleaseMessage))
+ 198| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/html-check", middleWareFunc(apiv1.HTMLCheck))
+ 199| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/link-check", middleWareFunc(apiv1.LinkCheck))
+ 200| 	if config.EnableSpamAssassin != "" {
+ 201| 		r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/sa-check", middleWareFunc(apiv1.SpamAssassinCheck))
+ 202| 	}
+ 203| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}", middleWareFunc(apiv1.GetMessage))
+ 204| 	r.HandleFunc("GET "+config.Webroot+"api/v1/info", middleWareFunc(apiv1.AppInfo))
+ 205| 	r.HandleFunc("GET "+config.Webroot+"api/v1/webui", middleWareFunc(apiv1.WebUIConfig))
+ 206| 	r.HandleFunc("GET "+config.Webroot+"api/v1/swagger.json", middleWareFunc(swaggerBasePath))
+ 207| 
+ 208| 	// Chaos
+ 209| 	r.HandleFunc("GET "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.GetChaos))
+ 210| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.SetChaos))
+ 211| 
+ 212| 	// Prometheus metrics (if enabled and using existing server)
+ 213| 	if prometheus.GetMode() == "integrated" {
+ 214| 		r.HandleFunc("GET "+config.Webroot+"metrics", middleWareFunc(func(w http.ResponseWriter, r *http.Request) {
+ 215| 			prometheus.GetHandler().ServeHTTP(w, r)
+ 216| 		}))
+ 217| 	}
+ 218| 
+ 219| 	// web UI websocket
+ 220| 	r.HandleFunc("GET "+config.Webroot+"api/events", middleWareFunc(apiWebsocket))
+ 221| 
+ 222| 	// return blank 200 response for OPTIONS requests for CORS
+ 223| 	r.Handle("OPTIONS "+config.Webroot+"api/v1/", middleWareFunc(apiv1.GetOptions))
+ 224| 
+ 225| 	return r
+ 226| }
+ 227| 
+ 228| // BasicAuthResponse returns an basic auth response to the browser
+ 229| func basicAuthResponse(w http.ResponseWriter) {
+ 230| 	w.Header().Set("WWW-Authenticate", `Basic realm="Login"`)
+ 231| 	w.WriteHeader(http.StatusUnauthorized)
+ 232| 	_, _ = w.Write([]byte("Unauthorized.\n"))
+ 233| }
+ 234| 
+ 235| // sendAPIAuthMiddleware handles authentication specifically for the send API endpoint.
+ 236| // It can use dedicated send API authentication or accept any credentials based on configuration.
+ 237| // It communicates skip-UI-auth intent via request context rather than mutating the global
+ 238| // auth.UICredentials pointer, which would be a data race under concurrent load.
+ 239| func sendAPIAuthMiddleware(fn http.HandlerFunc) http.HandlerFunc {
+ 240| 	return func(w http.ResponseWriter, r *http.Request) {
+ 241| 		// Override the default 5 MB body cap with the send-specific limit so that
+ 242| 		// middleWareFunc applies config.MaxMessageSize (0 = unlimited) instead.
+ 243| 		r = r.WithContext(context.WithValue(r.Context(), bodyLimitKey, int64(config.MaxMessageSize)*1024*1024))
+ 244| 
+ 245| 		// If send API auth accept any is enabled, bypass all authentication.
+ 246| 		if config.SendAPIAuthAcceptAny {
+ 247| 			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
+ 248| 			middleWareFunc(fn)(w, r.WithContext(ctx))
+ 249| 			return
+ 250| 		}
+ 251| 
+ 252| 		// If Send API credentials are configured, only accept those credentials.
+ 253| 		if auth.SendAPICredentials != nil {
+ 254| 			user, pass, ok := r.BasicAuth()
+ 255| 
+ 256| 			if !ok {
+ 257| 				basicAuthResponse(w)
+ 258| 				return
+ 259| 			}
+ 260| 
+ 261| 			if !auth.SendAPICredentials.Match(user, pass) {
+ 262| 				basicAuthResponse(w)
+ 263| 				return
+ 264| 			}
+ 265| 
+ 266| 			// Valid Send API credentials — bypass UI auth via context flag.
+ 267| 			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
+ 268| 			middleWareFunc(fn)(w, r.WithContext(ctx))
+ 269| 			return
+ 270| 		}
+ 271| 
+ 272| 		// No Send API credentials configured — fall back to UI auth.
+ 273| 		middleWareFunc(fn)(w, r)
+ 274| 	}
+ 275| }
+ 276| 
+ 277| type gzipResponseWriter struct {
+ 278| 	io.Writer
+ 279| 	http.ResponseWriter
+ 280| }
+ 281| 
+ 282| func (w gzipResponseWriter) Write(b []byte) (int, error) {
+ 283| 	return w.Writer.Write(b)
+ 284| }
+ 285| 
+ 286| // MiddleWareFunc http middleware adds optional basic authentication
+ 287| // and gzip compression.
+ 288| func middleWareFunc(fn http.HandlerFunc) http.HandlerFunc {
+ 289| 	return func(w http.ResponseWriter, r *http.Request) {
+ 290| 		// Limit request body size to 5 MB to prevent memory-exhaustion DoS via large
+ 291| 		// JSON bodies. sendAPIAuthMiddleware sets bodyLimitKey in the context to signal
+ 292| 		// that the handler manages its own limit (send.go uses config.MaxMessageSize),
+ 293| 		// so we skip the cap here for that route only.
+ 294| 		if _, ok := r.Context().Value(bodyLimitKey).(int64); !ok {
+ 295| 			r.Body = http.MaxBytesReader(w, r.Body, 5*1024*1024)
+ 296| 		}
+ 297| 
+ 298| 		w.Header().Set("Referrer-Policy", "no-referrer")
+ 299| 
+ 300| 		// generate a new random nonce on every request
+ 301| 		randomNonce := shortuuid.New()
+ 302| 		// header used to pass nonce through to function
+ 303| 		r.Header.Set("mp-nonce", randomNonce)
+ 304| 
+ 305| 		// Prevent JavaScript XSS by adding a nonce for script-src
+ 306| 		cspHeader := strings.Replace(
+ 307| 			config.ContentSecurityPolicy,
+ 308| 			"script-src 'self';",
+ 309| 			fmt.Sprintf("script-src 'nonce-%s';", randomNonce),
+ 310| 			1,
+ 311| 		)
+ 312| 
+ 313| 		w.Header().Set("Content-Security-Policy", cspHeader)
+ 314| 
+ 315| 		if htmlPreviewRouteRe == nil {
+ 316| 			htmlPreviewRouteRe = regexp.MustCompile(`^` + regexp.QuoteMeta(config.Webroot) + `view/[a-zA-Z0-9]+\.html$`)
+ 317| 		}
+ 318| 
+ 319| 		if strings.HasPrefix(r.URL.Path, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.URL.Path) {
+ 320| 			if allowed := corsOriginAccessControl(r); !allowed {
+ 321| 				http.Error(w, "Blocked due to CORS violation", http.StatusForbidden)
+ 322| 				return
+ 323| 			}
+ 324| 			w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+ 325| 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, OPTIONS")
+ 326| 			w.Header().Set("Access-Control-Allow-Headers", "*")
+ 327| 		}
+ 328| 
+ 329| 		// Check basic authentication headers if configured.
+ 330| 		// OPTIONS requests are skipped if CORS is enabled, since browsers omit credentials for preflight checks.
+ 331| 		// skipUIAuthKey in the request context allows sendAPIAuthMiddleware to bypass UI auth
+ 332| 		// for a specific request without touching the global auth.UICredentials pointer.
+ 333| 		skipUIAuth, _ := r.Context().Value(skipUIAuthKey).(bool)
+ 334| 		isCORSOptionsRequest := AccessControlAllowOrigin != "" && r.Method == http.MethodOptions
+ 335| 		if !skipUIAuth && !isCORSOptionsRequest && auth.UICredentials != nil {
+ 336| 			user, pass, ok := r.BasicAuth()
+ 337| 
+ 338| 			if !ok {
+ 339| 				basicAuthResponse(w)
+ 340| 				return
+ 341| 			}
+ 342| 
+ 343| 			if !auth.UICredentials.Match(user, pass) {
+ 344| 				basicAuthResponse(w)
+ 345| 				return
+ 346| 			}
+ 347| 		}
+ 348| 
+ 349| 		// WebSocket upgrade requests must not be wrapped in a gzip writer:
+ 350| 		// gzipResponseWriter does not implement http.Hijacker, which the
+ 351| 		// WebSocket library requires to take over the raw TCP connection.
+ 352| 		isWebSocketUpgrade := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+ 353| 		if isWebSocketUpgrade || config.DisableHTTPCompression || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+ 354| 			fn(w, r)
+ 355| 			return
+ 356| 		}
+ 357| 
+ 358| 		w.Header().Set("Content-Encoding", "gzip")
+ 359| 		gz := gzip.NewWriter(w)
+ 360| 		defer func() { _ = gz.Close() }()
+ 361| 		gzr := gzipResponseWriter{Writer: gz, ResponseWriter: w}
+ 362| 		fn(gzr, r)
+ 363| 	}
+ 364| }
+ 365| 
+ 366| // Redirect to webroot
+ 367| func addSlashToWebroot(w http.ResponseWriter, r *http.Request) {
+ 368| 	http.Redirect(w, r, config.Webroot, http.StatusFound)
+ 369| }
+ 370| 
+ 371| // viewHandler routes /view/ requests based on path suffix.
+ 372| // Go's ServeMux requires wildcards to span a full path segment,
+ 373| // so patterns like /view/{id}.html are invalid; we dispatch manually here.
+ 374| func viewHandler(w http.ResponseWriter, r *http.Request) {
+ 375| 	path := strings.TrimPrefix(r.URL.Path, config.Webroot+"view/")
+ 376| 	switch {
+ 377| 	case strings.HasSuffix(path, ".html"):
+ 378| 		apiv1.GetMessageHTML(w, r)
+ 379| 	case strings.HasSuffix(path, ".txt"):
+ 380| 		apiv1.GetMessageText(w, r)
+ 381| 	default:
+ 382| 		index(w, r)
+ 383| 	}
+ 384| }
+ 385| 
+ 386| // Websocket to broadcast changes.
+ 387| // Authentication and CORS are handled by middleWareFunc before this is reached.
+ 388| func apiWebsocket(w http.ResponseWriter, r *http.Request) {
+ 389| 	websockets.ServeWs(websockets.MessageHub, w, r)
+ 390| 	storage.BroadcastMailboxStats()
+ 391| }
+ 392| 
+ 393| // Wrapper to artificially inject a basePath to the swagger.json if a webroot has been specified
+ 394| func swaggerBasePath(w http.ResponseWriter, _ *http.Request) {
+ 395| 	f, err := distFS.ReadFile("ui/api/v1/swagger.json")
+ 396| 	if err != nil {
+ 397| 		panic(err)
+ 398| 	}
+ 399| 
+ 400| 	if config.Webroot != "/" {
+ 401| 		// artificially inject a path at the start
+ 402| 		replacement := fmt.Sprintf("{\n  \"basePath\": \"%s\",", strings.TrimRight(config.Webroot, "/"))
+ 403| 
+ 404| 		f = bytes.Replace(f, []byte("{"), []byte(replacement), 1)
+ 405| 	}
+ 406| 
+ 407| 	w.Header().Add("Content-Type", "application/json")
+ 408| 	_, _ = w.Write(f)
+ 409| }
+ 410| 
+ 411| // Just returns the default HTML template
+ 412| func index(w http.ResponseWriter, r *http.Request) {
+ 413| 
+ 414| 	var h = `<!DOCTYPE html>
+ 415| <html lang="en" class="h-100">
+ 416| 
+ 417| <head>
+ 418| 	<meta charset="utf-8">
+ 419| 	<meta name="viewport" content="width=device-width,initial-scale=1.0">
+ 420| 	<meta name="referrer" content="no-referrer">
+ 421| 	<meta name="robots" content="noindex, nofollow, noarchive">
+ 422| 	<link rel="icon" href="{{ .Webroot }}favicon.svg">
+ 423| 	<title>Mailpit</title>
+ 424| 	<link rel=stylesheet href="{{ .Webroot }}dist/app.css?{{ .Version }}">
+ 425| </head>
+ 426| 
+ 427| <body class="h-100">
+ 428| 	<div class="container-fluid h-100 d-flex flex-column" id="app" data-webroot="{{ .Webroot }}" data-version="{{ .Version }}">
+ 429| 		<noscript class="alert alert-warning position-absolute top-50 start-50 translate-middle">
+ 430| 			You need a browser with JavaScript enabled to use Mailpit
+ 431| 		</noscript>
+ 432| 	</div>
+ 433| 
+ 434| 	<script src="{{ .Webroot }}dist/app.js?{{ .Version }}" nonce="{{ .Nonce }}"></script>
+ 435| </body>
+ 436| 
+ 437| </html>`
+ 438| 
+ 439| 	t, err := template.New("index").Parse(h)
+ 440| 	if err != nil {
+ 441| 		panic(err)
+ 442| 	}
+ 443| 
+ 444| 	data := struct {
+ 445| 		Webroot string
+ 446| 		Version string
+ 447| 		Nonce   string
+ 448| 	}{
+ 449| 		Webroot: config.Webroot,
+ 450| 		Version: config.Version,
+ 451| 		Nonce:   r.Header.Get("mp-nonce"),
+ 452| 	}
+ 453| 
+ 454| 	buff := new(bytes.Buffer)
+ 455| 
+ 456| 	err = t.Execute(buff, data)
+ 457| 	if err != nil {
+ 458| 		panic(err)
+ 459| 	}
+ 460| 
+ 461| 	w.Header().Add("Content-Type", "text/html; charset=utf-8")
+ 462| 	_, _ = w.Write(buff.Bytes())
+ 463| }
+ 464| 
+ 465| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=7468 teacher=unknown flags=[]
+### id=7779 teacher=unknown flags=[]
 [ANALYSIS]
-1. 第 11-14 行：`request.POST.get(...)` 是 Django 惯用的外部输入入口，攻击者可完全控制 `sql`、`from`、`where`、`groupby` 四个片段，全部直接进入查询拼装流程，可达性成立。
-2. 第 16-25 行：各片段仅做 `startswith('SELECT')` 前缀检查和 `^\s*WHERE\s*` 正则剥离（与原 PHP 逻辑等价），随后用字符串拼接进 `sql`，无参数化、无标识符引用——防御位置在拼接之前且类型为黑名单/正则，可绕过。
-3. 第 28 行：黑名单正则 `(ALTER|CREATE|DROP|...) ` 只匹配后跟空格的关键字，可用注释截断（如 `DELETE/**/FROM t`）、换行、或 UNION 注入读取任意表绕过；且 SELECT 本身允许堆叠前的子查询注入，属于可绕过过滤。
-4. 第 32 行：`cursor.execute(sql)` 将完整拼接串作为单条语句执行，是明确的 sink；Django cursor 不做任何自动转义当语句以字符串整体传入时。
-5. 第二入口分析：本文件仅此一个视图函数，无其他路由或间接调用通道；但同一 POST 端点内四条 source→sink 数据流（sql/from/where/groupby）均未设防，任一条均可完成注入，故结论为存在漏洞。
-[JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection via user-supplied SQL fragments in report configuration endpoint", "risk_level": "Critical", "source": "line 11-14: request.POST.get('sql'/'from'/'where'/'groupby') external input", "sink": "line 34: cursor.execute(sql) executes fully attacker-controlled concatenated string", "explanation": "flow 1: line 10:'sql' fragment -> line 17-22 concatenation -> line 32 execute; flow 2: line 12 'from' -> line 23 -> line 32; flow 3: line 13 'where' -> line 24-25 (regex strip only) -> line 32; flow 4: line 14 'groupby' -> line 29:-> line 32; defenses are prefix checks and a keyword blacklist regex (line 28) that is bypassable via comment truncation like DELETE/**/ or newline and does not stop UNION-based data exfiltration within allowed SELECT; no parameterization or identifier quoting anywhere; second entry analysis: single route in file but four independent unfiltered sources all reach the same sink", "fix_suggestion": "line 32: replace raw string execution with parameterized queries using placeholders for values and a strict allowlist parser for identifiers/fragments instead of the line 29 blacklist"}
+## 编号分析（按代码顺序，行号为代码块内相对位置）
 
-### id=8253 teacher=unknown flags=[safe_but_cwe_in_expl]
+1. **第 55–150 行 Listen() 路由枚举**：入口点包括 livez/readyz 健康检查、`GET .../proxy`（代理处理器）、dist/api 静态文件、`view/latest`、`view/`（viewHandler 手工分发）、search、webroot 根路径；apiRoutes 中约 25 个 REST 端点、chaos 端点、metrics、`api/events` WebSocket。所有业务路由均经 `middleWareFunc` 或 `sendAPIAuthMiddleware` 包装。
+
+2. **第 152–172 行 sendAPIAuthMiddleware**：通过 context 注入 `skipUIAuthKey` 与 `bodyLimitKey`。两个 key 均为私有类型 `contextKey`，外部请求无法伪造 context 值，故“绕过 UI 认证”仅对 `/api/v1/send` 生效且受 SendAPICredentials / AcceptAny 配置控制——若管理员设置 `SendAPIAuthAcceptAny=true` 则发送接口完全无认证，但这是显式配置行为，非漏洞。
+
+3. **第 205–270 行 middleWareFunc —— 关键点一：CORS 反射 Origin**。第 226–236 行：凡路径前缀匹配 `Webroot+"api/"` 或正则 `htmlPreviewRouteRe` 匹配，即调用 `corsOriginAccessControl(r)` 判定后直接执行：
+   `w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))`
+   即 **ACAO 头完全反射攻击者可控的 Origin 请求头**，并配合 `Access-Control-Allow-Headers: *`。防御有效性取决于未在本文件展示的 `corsOriginAccessControl`；按分析要求，任何基于黑名单/正则/可配置列表的校验视为可绕过（例如子域接管、配置为 `*` 或宽松默认值时）。Mailpit 存储的是含密码重置链接、token 的真实邮件；UI BasicAuth 凭据由浏览器自动附带（同站 cookie 类似语义），一旦恶意源被放行，即可跨源读取全部邮件数据（GetMessages、DownloadRaw 等 GET 无需 CSRF token）。这是典型的 CWE-942（Permissive Cross-domain Policy with Untrusted Domains）/ 反射型 ACAO 数据泄露。
+
+4. **关键点二：正则锚定与 RequestURI**。第 219 行 `htmlPreviewRouteRe.MatchString(r.RequestURI)`：RequestURI 含查询串时因 `$` 锚定不匹配，导致带 query 的 `.html` 预览请求**既不做 CORS 校验也不设 ACAO**——这反而安全（无 ACAO 就无跨域读取），不构成漏洞；但说明该 CORS 门控逻辑不一致。
+
+5. **第 214 行懒初始化竞态**：`htmlPreviewRouteRe == nil` 检查无锁，并发首请求可能重复编译，仅性能问题非安全问题。
+
+6. **第 275–287 行 viewHandler**：手工 TrimPrefix + 后缀分发到 GetMessageHTML/GetMessageText/index。id 提取在 apiv1 包内（本文件不可见），但分发本身不含路径拼接文件读取，无目录遍历 sink。
+
+7. **第 316–360 行 index()**：模板注入 `mp-nonce`（第 349 行取自请求头）。该头在第 218 行由服务端用 `shortuuid.New()` **覆盖生成**，客户端传入值被无条件替换，故无反射 XSS。CSP 替换依赖 config.ContentSecurityPolicy 含字面量 `script-src 'self';`，若配置缺失则 nonce 防护失效，属配置脆弱性。
+
+8. **第二入口核查**：`proxy`（handlers.ProxyHandler，SSRF 经典点）与 WebSocket `api/events` 均过 middleWareFunc 认证；OPTIONS 预检跳过认证（第 250 行）仅返回空响应，无数据泄露。
+
+**结论**：本文件内最可信的漏洞是第 232 行将不可信的 `Origin` 头直接回写为 `Access-Control-Allow-Origin` 并允许任意头，配合浏览器自动附带的 BasicAuth 凭据，构成跨域敏感邮件读取风险（CWE-942）。其余疑点（context 绕过、nonce 回显、懒初始化）经验证均有有效防御或无害。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-942 Permissive Cross-origin Resource Sharing Policy", "risk_level": "High", "source": "line 326: r.Header.Get('Origin') 攻击者可控的 Origin 请求头", "sink": "line 326: w.Header().Set('Access-Control-Allow-Origin', r.Header.Get('Origin')) 且 Access-Control-Allow-Headers 设为 *", "explanation": "middleWareFunc 对所有 Webroot+api/ 及 .html 预览路由将客户端提交的 Origin 头原样反射进 ACAO 响应头，并允许任意自定义头；其前置校验 corsOriginAccessControl 属于可配置/可绕过的域白名单类防御。由于 Mailpit 使用 BasicAuth 且浏览器会自动携带凭据，恶意网站可在受害者浏览邮件时跨源调用 GET api/v1/messages、api/v1/message/{id}/raw 等端点读取含密码重置链接等敏感内容的完整邮件 -> 跨域敏感信息泄露", "fix_suggestion": "line 232-235: 不要反射任意 Origin；仅在 Origin 精确命中服务端配置的可信来源白名单（config.AccessControlAllowOrigin 列表）时回写该 Origin，否则不输出 ACAO 头；同时禁止 Access-Control-Allow-Headers: * ，改为显式白名单，并对跨源请求强制 SameSite/凭据校验"}
+
+### id=7780 teacher=unknown flags=[]
 [ANALYSIS]
-分析：
+## 编号分析
 
-1. **第 33-34 行（用户可控输入点）**：`request.get_json()` 解析 POST body，`data.get("command")` 与 `data.get("working_dir")` 均为攻击者完全可控的字符串，是本数据流唯一入口。
-2. **第 36-38 行（既有黑名单保留）**：`guard_command` 的正则黑名单按 minimal diff 纪律原样保留——它不是有效防御，但作为业务逻辑不动；真正的修复在 sink 处。
-3. **第 41-56 行（新增白名单辅助函数 `build_safe_argv`）**：用 `shlex.split` 将用户输入解析为 token 列表，首 token 必须命中 `ALLOWED_COMMANDS` 精确允许集（第 22-27 行），额外参数禁止以 `-` 开头（杜绝注入新 flag），数量上限 4。类型正确性：返回的是 Python 字符串列表而非拼接字符串，从根上消除 shell 元字符解释空间。
-4. **第 74-77 行（sink 修复的位置正确性）**：原代码 `subprocess.run(["sh", "-c", command])` 是 CWE-78 的直接 sink——`sh -c` 使整串命令经 shell 解释。修复后传入白名单构造出的 `argv` 列表并显式 `shell=False`，shell 解释器彻底退出执行路径，`; rm -rf /`、反引号、管道等元字符均退化为普通文件名参数。攻击面覆盖完整：无论输入如何变形，不在允许集内的命令一律在第 70 行被 403 拒绝，不存在绕过到 sink 的通道。
-5. **数据流走向不变**：请求 → JSON 绑定 → guard 校验 → 执行 → 输出回显，路由 `/api/exec`、函数名、变量名、控制流全部保持一致，仅插入防御语句，满足最小 diff。
-6. **第二入口检查**：全应用仅此一个路由，无其他端点、无 CLI 入口消费该数据流；`cwd` 仅作为 `subprocess.run` 的工作目录参数使用且不进入 shell，不构成注入面。替代通道结论：无残余风险。
+1. **第 30–60 行（Listen 入口）**：路由注册齐全，含 k8s 探针、proxy、dist 静态文件、view、search、根路径。根路径处理（第 55 行附近）显式校验 `r.URL.Path != config.Webroot` 后 404，防止 ServeMux 子树误匹配，防御有效。
+
+2. **第 62–120 行（apiRoutes）**：所有 API 路由均经 `middleWareFunc` 包裹；send 端点单独用 `sendAPIAuthMiddleware`。无未认证遗漏的路由。
+
+3. **第 130–170 行（sendAPIAuthMiddleware）**：通过 context key `skipUIAuthKey` 传递跳过 UI 认证的意图。该值仅在服务端代码中设置（客户端无法注入 context 值），且仅对 `/api/v1/send` 生效。三种分支：AcceptAny（配置明确允许）、专用 SendAPI 凭据校验、回退 UI 认证。逻辑自洽，无绕过路径。
+
+4. **第 200–260 行（middleWareFunc）**：
+   - Body 限制：默认 5MB MaxBytesReader；send 路由由 handler 自行按 `config.MaxMessageSize` 限制（注释说明），不构成 DoS 缺口。
+   - CSP：nonce 由服务端生成并写入请求头 `mp-nonce`，index 模板读取的是该服务端值而非用户输入，无注入。
+   - Basic Auth：`skipUIAuthKey` 与 OPTIONS+CORS 两个豁免条件均有界：前者仅限 send 且需先过 send 认证；OPTIONS 不携带数据，无信息泄露。
+   - CORS：ACAO 回显 Origin 前必须通过 `corsOriginAccessControl(r)` 校验（该函数在 websockets.SetCheckOriginFunc 中复用），本文件内未见黑名单式过滤。
+
+5. **第 270–290 行（viewHandler）**：仅按后缀 `.html`/`.txt` 分发到 apiv1 处理器，id 由下游按 shortuuid 查库，无文件路径拼接，无遍历风险。
+
+6. **第二入口检查**：POP3（go pop3.Run()）、Unix socket 监听（tools.UnixSocket + os.Chmod 按 perm 收权）、TLS 配置均为独立通道，本文件中未见将 HTTP 数据直接拼入命令/文件系统的 sink。swaggerBasePath 的 Webroot 来自配置非用户输入。
+
+7. **gzipResponseWriter**：不实现 Hijacker 已被 WebSocket 分支规避；无响应拆分或头注入点。
+
+结论：全文未见可利用的 source→sink 未防数据流；唯一外部依赖是 `corsOriginAccessControl` 的实现（不在本文件），但调用方式正确且回显前有闸门。
 [JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-78 OS Command Injection: 第 33 行 request.get_json 取得攻击者可控的 command 字符串, 经第 75 行 subprocess.run(['sh','-c',command]) 由 shell 解释执行构成完整污点链; 修复采用白名单精确允许集 ALLOWED_COMMANDS 配合 shlex.split 构造 argv 列表并以 shell=False 调用, 彻底移除 shell 解释层, 黑名单 guard_command 按最小 diff 纪律原样保留但不作为防御手段; 全应用仅一个路由, 无第二入口或替代通道", "fix_suggestion": "line 74: 以白名单函数 build_safe_argv 生成的 argv 列表替换 ['sh','-c',command] 并设置 shell=False"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文所有入口（HTTP 路由、send API、websocket、viewHandler、静态文件、Unix socket、POP3 启动）：所有路由均经 middleWareFunc 认证与 CORS 闸门；sendAPIAuthMiddleware 通过服务端 context 键 skipUIAuthKey 控制豁免，客户端无法伪造；CSP nonce 为服务端生成值而非用户输入；body 有 5MB 或 MaxMessageSize 上限防 DoS；viewHandler 无路径拼接；CORS 回显 Origin 前强制经过 corsOriginAccessControl 校验。未发现可利用的 source 到 sink 数据流。", "fix_suggestion": "no fix needed"}

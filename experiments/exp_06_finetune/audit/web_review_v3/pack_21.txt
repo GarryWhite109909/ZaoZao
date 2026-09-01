@@ -2,89 +2,220 @@ batch=21 样本数=2
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=6920 lang=java
+### id=7260 lang=go
 [CODE]
-   1| package com.example.controller;
+   1| package replacepathregex
    2| 
-   3| import org.springframework.web.bind.annotation.*;
-   4| import org.springframework.security.access.prepost.PreAuthorize;
-   5| import org.springframework.security.core.Authentication;
-   6| import org.springframework.security.core.context.SecurityContextHolder;
-   7| import com.example.model.Order;
-   8| import com.example.repository.OrderRepository;
-   9| 
-  10| @RestController
-  11| @RequestMapping("/api/orders")
-  12| public class OrderController {
-  13| 
-  14|     private final OrderRepository orderRepository;
-  15| 
-  16|     public OrderController(OrderRepository orderRepository) {
-  17|         this.orderRepository = orderRepository;
-  18|     }
-  19| 
-  20|     @GetMapping("/{orderId}")
-  21|     public Order getOrder(@PathVariable Long orderId) {
-  22|         Order order = orderRepository.findById(orderId).orElse(null);
-  23|         if (order == null) {
-  24|             throw new RuntimeException("Order not found");
-  25|         }
-  26|         return order;
-  27|     }
-  28| }
-  29| 
-  30| 
-
-### id=6921 lang=php
-[CODE]
-   1| <?php
-   2| session_start();
-   3| $pdo = new PDO('mysql:host=localhost;dbname=billing', 'root', '');
-   4| 
-   5| if (!isset($_SESSION['user_id'])) {
-   6|     http_response_code(401);
-   7|     echo json_encode(['error' => 'Unauthorized']);
-   8|     exit;
-   9| }
+   3| import (
+   4| 	"context"
+   5| 	"fmt"
+   6| 	"net/http"
+   7| 	"net/url"
+   8| 	"regexp"
+   9| 	"strings"
   10| 
-  11| $invoiceId = $_GET['invoice_id'] ?? '';
-  12| $stmt = $pdo->prepare("SELECT * FROM invoices WHERE id = ?");
-  13| $stmt->execute([$invoiceId]);
-  14| $invoice = $stmt->fetch(PDO::FETCH_ASSOC);
+  11| 	"github.com/opentracing/opentracing-go/ext"
+  12| 	"github.com/traefik/traefik/v2/pkg/config/dynamic"
+  13| 	"github.com/traefik/traefik/v2/pkg/log"
+  14| 	"github.com/traefik/traefik/v2/pkg/middlewares"
+  15| 	"github.com/traefik/traefik/v2/pkg/middlewares/replacepath"
+  16| 	"github.com/traefik/traefik/v2/pkg/tracing"
+  17| )
+  18| 
+  19| const typeName = "ReplacePathRegex"
+  20| 
+  21| // ReplacePathRegex is a middleware used to replace the path of a URL request with a regular expression.
+  22| type replacePathRegex struct {
+  23| 	next        http.Handler
+  24| 	regexp      *regexp.Regexp
+  25| 	replacement string
+  26| 	name        string
+  27| }
+  28| 
+  29| // New creates a new replace path regex middleware.
+  30| func New(ctx context.Context, next http.Handler, config dynamic.ReplacePathRegex, name string) (http.Handler, error) {
+  31| 	log.FromContext(middlewares.GetLoggerCtx(ctx, name, typeName)).Debug("Creating middleware")
+  32| 
+  33| 	exp, err := regexp.Compile(strings.TrimSpace(config.Regex))
+  34| 	if err != nil {
+  35| 		return nil, fmt.Errorf("error compiling regular expression %s: %w", config.Regex, err)
+  36| 	}
+  37| 
+  38| 	return &replacePathRegex{
+  39| 		regexp:      exp,
+  40| 		replacement: strings.TrimSpace(config.Replacement),
+  41| 		next:        next,
+  42| 		name:        name,
+  43| 	}, nil
+  44| }
+  45| 
+  46| func (rp *replacePathRegex) GetTracingInformation() (string, ext.SpanKindEnum) {
+  47| 	return rp.name, tracing.SpanKindNoneEnum
+  48| }
+  49| 
+  50| func (rp *replacePathRegex) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+  51| 	logger := log.FromContext(middlewares.GetLoggerCtx(req.Context(), rp.name, typeName))
+  52| 
+  53| 	currentPath := req.URL.RawPath
+  54| 	if currentPath == "" {
+  55| 		currentPath = req.URL.EscapedPath()
+  56| 	}
+  57| 
+  58| 	if rp.regexp != nil && rp.regexp.MatchString(currentPath) {
+  59| 		req.Header.Add(replacepath.ReplacedPathHeader, currentPath)
+  60| 		req.URL.RawPath = rp.regexp.ReplaceAllString(currentPath, rp.replacement)
+  61| 
+  62| 		// as replacement can introduce escaped characters
+  63| 		// Path must remain an unescaped version of RawPath
+  64| 		// Doesn't handle multiple times encoded replacement (`/` => `%2F` => `%252F` => ...)
+  65| 		var err error
+  66| 		req.URL.Path, err = url.PathUnescape(req.URL.RawPath)
+  67| 		if err != nil {
+  68| 			log.FromContext(middlewares.GetLoggerCtx(context.Background(), rp.name, typeName)).Error(err)
+  69| 			http.Error(rw, err.Error(), http.StatusInternalServerError)
+  70| 			return
+  71| 		}
+  72| 
+  73| 		req.RequestURI = req.URL.RequestURI()
+  74| 
+  75| 		// Here we are sanitizing the URL when the path is not empty,
+  76| 		// as the JoinPath method is adding a leading slash if the path is empty.
+  77| 		path := req.URL.Path
+  78| 		if path != "" {
+  79| 			req.URL = req.URL.JoinPath()
+  80| 		}
+  81| 
+  82| 		// Stop here if the normalization of the path produces a different path.
+  83| 		if path != req.URL.Path {
+  84| 			logger.Debugf("Rejecting request, sanitized path: %q is not equivalent to stripped path: %q", path, req.URL.Path)
+  85| 			http.Error(rw, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+  86| 			return
+  87| 		}
+  88| 	}
+  89| 
+  90| 	rp.next.ServeHTTP(rw, req)
+  91| }
+  92| 
+  93| 
+
+### id=7261 lang=go
+[CODE]
+   1| //go:build darwin && cgo
+   2| 
+   3| // Package local provides a filesystem interface
+   4| package local
+   5| 
+   6| import (
+   7| 	"context"
+   8| 	"fmt"
+   9| 	"path/filepath"
+  10| 	"runtime"
+  11| 
+  12| 	"github.com/go-darwin/apfs"
+  13| 	"github.com/rclone/rclone/fs"
+  14| )
   15| 
-  16| if (!$invoice) {
-  17|     http_response_code(404);
-  18|     echo json_encode(['error' => 'Not found']);
-  19|     exit;
-  20| }
-  21| 
-  22| header('Content-Type: application/pdf');
-  23| echo $invoice['pdf_content'];
-  24| ?>
-  25| 
-  26| 
+  16| // Copy src to this remote using server-side copy operations.
+  17| //
+  18| // # This is stored with the remote path given
+  19| //
+  20| // # It returns the destination Object and a possible error
+  21| //
+  22| // Will only be called if src.Fs().Name() == f.Name()
+  23| //
+  24| // If it isn't possible then return fs.ErrorCantCopy
+  25| func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+  26| 	if runtime.GOOS != "darwin" || f.opt.NoClone {
+  27| 		return nil, fs.ErrorCantCopy
+  28| 	}
+  29| 	srcObj, ok := src.(*Object)
+  30| 	if !ok {
+  31| 		fs.Debugf(src, "Can't clone - not same remote type")
+  32| 		return nil, fs.ErrorCantCopy
+  33| 	}
+  34| 	if f.opt.TranslateSymlinks && srcObj.translatedLink { // in --links mode, use cloning only for regular files
+  35| 		return nil, fs.ErrorCantCopy
+  36| 	}
+  37| 
+  38| 	// Fetch metadata if --metadata is in use
+  39| 	meta, err := fs.GetMetadataOptions(ctx, f, src, fs.MetadataAsOpenOptions(ctx))
+  40| 	if err != nil {
+  41| 		return nil, fmt.Errorf("copy: failed to read metadata: %w", err)
+  42| 	}
+  43| 
+  44| 	// Create destination
+  45| 	dstObj := f.newObject(remote)
+  46| 	err = dstObj.mkdirAll()
+  47| 	if err != nil {
+  48| 		return nil, err
+  49| 	}
+  50| 
+  51| 	srcPath := srcObj.path
+  52| 	if f.opt.FollowSymlinks { // in --copy-links mode, find the real file being pointed to and pass that in instead
+  53| 		srcPath, err = filepath.EvalSymlinks(srcPath)
+  54| 		if err != nil {
+  55| 			return nil, err
+  56| 		}
+  57| 	}
+  58| 
+  59| 	err = Clone(srcPath, f.localPath(remote))
+  60| 	if err != nil {
+  61| 		return nil, err
+  62| 	}
+  63| 
+  64| 	// Set metadata if --metadata is in use
+  65| 	if meta != nil {
+  66| 		err = dstObj.writeMetadata(meta)
+  67| 		if err != nil {
+  68| 			return nil, fmt.Errorf("copy: failed to set metadata: %w", err)
+  69| 		}
+  70| 	}
+  71| 
+  72| 	return f.NewObject(ctx, remote)
+  73| }
+  74| 
+  75| // Clone uses APFS cloning if possible, otherwise falls back to copying (with full metadata preservation)
+  76| // note that this is closely related to unix.Clonefile(src, dst, unix.CLONE_NOFOLLOW) but not 100% identical
+  77| // https://opensource.apple.com/source/copyfile/copyfile-173.40.2/copyfile.c.auto.html
+  78| func Clone(src, dst string) error {
+  79| 	state := apfs.CopyFileStateAlloc()
+  80| 	defer func() {
+  81| 		if err := apfs.CopyFileStateFree(state); err != nil {
+  82| 			fs.Errorf(dst, "free state error: %v", err)
+  83| 		}
+  84| 	}()
+  85| 	cloned, err := apfs.CopyFile(src, dst, state, apfs.COPYFILE_CLONE)
+  86| 	fs.Debugf(dst, "isCloned: %v, error: %v", cloned, err)
+  87| 	return err
+  88| }
+  89| 
+  90| // Check the interfaces are satisfied
+  91| var (
+  92| 	_ fs.Copier = &Fs{}
+  93| )
+  94| 
+  95| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=6920 teacher=unknown flags=[]
+### id=7260 teacher=unknown flags=[]
 [ANALYSIS]
-分析过程：
-1. line 22: getOrder 方法无 @PreAuthorize 注解（与 IDOR 版对比，缺少认证）。
-2. line 23: orderRepository.findById(orderId) 按参数查询，无认证也无授权。
-3. 任意未认证用户修改 orderId 即可查看任意订单。
-4. 关键区分：完全无认证（无 @PreAuthorize），属于 Missing Auth 而非 IDOR。
-5. 结论：CWE-862 缺少授权检查，风险 Critical。
+1. 第 33-36 行：正则在中间件创建时编译，且来自 Traefik 动态配置（config.Regex），属于受信任的管理员/静态配置输入，并非请求级用户输入；编译失败直接返回错误，不存在运行期注入面。
+2. 第 53-56 行：currentPath 取自 req.URL.RawPath（为空则回退 EscapedPath()），即始终使用原始转义形式进行匹配与替换，避免对已解码路径做二次解释，防止 %2F 等编码绕过在替换阶段被提前解码。
+3. 第 66-71 行：替换结果通过 url.PathUnescape 同步回 req.URL.Path；若替换引入非法转义序列（如 %zz），unescape 返回错误并立即以 500 中止，不将畸形 URL 传递给下游 handler——这是对"replacement 引入转义字符"攻击面的显式防护。
+4. 第 77-87 行：关键防线。JoinPath 会触发 Go 标准库 net/url 的路径规范化（清理 ../、// 等），第 83 行比较规范化前后的 path，若不一致（说明替换产物试图构造路径穿越或非常规路径）则以 400 拒绝请求。这正是针对 CVE-2026-65600 类姊妹漏洞（replacement 构造穿越路径）的补丁：任何经 JoinPath 规范化后语义改变的路径都不可达下游。
+5. 第 90 行 rp.next.ServeHTTP 仅在第 58 行的正则匹配成功且上述全部校验通过后才执行；若正则不匹配，URL 完全未被修改，原样透传给 next，同样安全。此外第 69 行 http.Error 输出的 err 来自 PathUnescape，仅含解析错误信息，不含反射型 XSS sink（非 HTML 响应上下文）。
 [JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-862 Missing Authorization", "risk_level": "Critical", "source": "line 20: @GetMapping('/{orderId}') 方法无 @PreAuthorize 认证注解", "sink": "line 22: orderRepository.findById(orderId) 查询订单完全缺少认证和授权", "explanation": "line 21:getOrder 无 @PreAuthorize（无认证）-> line 22:findById 查任意订单 -> 任意未登录用户可访问 -> CWE-862 缺少授权（非 IDOR，因为完全无认证）", "fix_suggestion": "line 20: 应改为 在方法上添加 @PreAuthorize('isAuthenticated()') 确保用户已登录，并校验 order.getUserId() == 当前用户 ID"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "攻击面为 replacement 重写后的路径被下游消费。防御链：RawPath/EscapedPath 原始匹配 -> ReplaceAllString -> url.PathUnescape 失败即 500 拦截非法转义 -> JoinPath 规范化且前后 path 不一致即 400 拒绝路径穿越 -> 全部通过才调用 next；正则与 replacement 均来自受信动态配置而非请求输入，故 CVE-2026-65600 类漏洞在本版本不可达", "fix_suggestion": "no fix needed"}
 
-### id=6921 teacher=unknown flags=[]
+### id=7261 teacher=unknown flags=[]
 [ANALYSIS]
-分析过程：
-1. line 4-7: session_start + isset($_SESSION['user_id']) 确保用户已登录（有认证）。
-2. line 9: $_GET['invoice_id'] 获取用户可控参数。
-3. line 11: $stmt->execute([$invoiceId]) 查询发票，未校验 invoice.user_id == $_SESSION['user_id']。
-4. 关键区分：有认证（session 检查）但无授权（归属校验），属于 IDOR。
-5. 结论：CWE-639 授权绕过（IDOR），风险 High。
+1. 入口分析：Copy 函数（第 22 行）接收 remote 参数，该参数来自用户可控的远端文件名字符串，是本条数据流的 source。
+2. 第 42 行调用 `dstObj := f.newObject(remote)`，旧版 newObject 不返回 error，意味着对 remote 的编码/路径合法性校验（如 filename encoding 是否会引入路径分隔符或 ".." 等操作系统路径语法）失败时无法被检测和拦截。
+3. 第 56 行 `err = Clone(srcPath, f.localPath(remote))` 中，`f.localPath(remote)` 直接将未经验证的 remote 拼接为本地文件系统路径；若 local 后端配置的编码器省略了对路径分隔符等字符的转义，攻击者可通过构造含 "../" 或绝对路径的文件名逃逸目标目录。
+4. sink 分析：第 56 行的路径最终传入 Clone（第 71 行定义），内部经 apfs.CopyFile（第 79 行）以 COPYFILE_CLONE 执行实际文件系统写操作，构成 CWE-22 路径遍历的完整 source->sink 链。
+5. 防御缺失：函数内仅有类型断言（第 26 行）、符号链接模式判断（第 31、49 行）等检查，没有任何针对 remote 解码后内容的目录穿越校验；mkdirAll（第 43 行）同样基于未校验路径创建目录，进一步放大影响。
+6. 修复方向：newObject 与 localPath 应返回并检查 error，使编码校验失败时提前返回，阻断恶意路径到达 Clone。
 [JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key (IDOR)", "risk_level": "High", "source": "line 11: $_GET['invoice_id'] 用户可控参数", "sink": "line 13: $stmt->execute([$invoiceId]) 查询发票未校验归属", "explanation": "line 5:isset($_SESSION['user_id']) 认证通过（有认证）-> line 5:execute 查任意发票 -> 未校验 invoice.user_id == $_SESSION['user_id'] -> IDOR 授权绕过（非 Missing Auth，因为有认证）", "fix_suggestion": "line 12: 应改为 修改 SQL 为 SELECT * FROM invoices WHERE id = ? AND user_id = ?，并传入 $_SESSION['user_id'] 确保只返回当前用户的发票"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "High", "source": "line 25: func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string)", "sink": "line 59: err = Clone(srcPath, f.localPath(remote))", "explanation": "remote（外部可控文件名）-> f.newObject(remote)（无错误返回，编码校验缺失）-> f.localPath(remote) 未验证直接拼接本地路径 -> Clone -> apfs.CopyFile 写入任意路径 -> 目录遍历", "fix_suggestion": "line 59: 改为 dstPath, err := f.localPath(remote) 并在 err != nil 时返回，同时让 line 45 的 newObject 返回 error 以拦截非法编码的 remote"}

@@ -2,995 +2,1171 @@ batch=64 样本数=2
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=7779 lang=go
+### id=7789 lang=php
 [CODE]
-   1| // Package server is the HTTP daemon
-   2| package server
-   3| 
-   4| import (
-   5| 	"bytes"
-   6| 	"compress/gzip"
-   7| 	"context"
-   8| 	"fmt"
-   9| 	"io"
-  10| 	"net"
-  11| 	"net/http"
-  12| 	"os"
-  13| 	"regexp"
-  14| 	"strings"
-  15| 	"sync/atomic"
-  16| 	"text/template"
-  17| 	"time"
-  18| 
-  19| 	"github.com/axllent/mailpit/config"
-  20| 	"github.com/axllent/mailpit/internal/auth"
-  21| 	"github.com/axllent/mailpit/internal/logger"
-  22| 	"github.com/axllent/mailpit/internal/pop3"
-  23| 	"github.com/axllent/mailpit/internal/prometheus"
-  24| 	"github.com/axllent/mailpit/internal/shortuuid"
-  25| 	"github.com/axllent/mailpit/internal/snakeoil"
-  26| 	"github.com/axllent/mailpit/internal/stats"
-  27| 	"github.com/axllent/mailpit/internal/storage"
-  28| 	"github.com/axllent/mailpit/internal/tools"
-  29| 	"github.com/axllent/mailpit/server/apiv1"
-  30| 	"github.com/axllent/mailpit/server/handlers"
-  31| 	"github.com/axllent/mailpit/server/websockets"
-  32| )
+   1| <?php namespace Backend\FormWidgets;
+   2| 
+   3| use Db;
+   4| use Input;
+   5| use Event;
+   6| use Request;
+   7| use Response;
+   8| use Validator;
+   9| use Backend\Widgets\Form;
+  10| use Backend\Classes\FormField;
+  11| use Backend\Classes\FormWidgetBase;
+  12| use Winter\Storm\Filesystem\Definitions as FileDefinitions;
+  13| use ApplicationException;
+  14| use ValidationException;
+  15| use Exception;
+  16| 
+  17| /**
+  18|  * File upload field
+  19|  * Renders a form file uploader field.
+  20|  *
+  21|  * Supported options:
+  22|  * - mode: image-single, image-multi, file-single, file-multi
+  23|  * - upload-label: Add file
+  24|  * - empty-label: No file uploaded
+  25|  *
+  26|  * @package winter\wn-backend-module
+  27|  * @author Alexey Bobkov, Samuel Georges
+  28|  */
+  29| class FileUpload extends FormWidgetBase
+  30| {
+  31|     use \Backend\Traits\FormModelSaver;
+  32|     use \Backend\Traits\FormModelWidget;
   33| 
-  34| var (
-  35| 	// htmlPreviewRouteRe is a regexp to match the HTML preview route
-  36| 	htmlPreviewRouteRe *regexp.Regexp
-  37| )
-  38| 
-  39| // skipUIAuthKey is a private context key used to signal that UI basic-auth
-  40| // should be bypassed for a specific request. This avoids mutating the global
-  41| // auth.UICredentials pointer (which is a data race under concurrent load).
-  42| type contextKey int
-  43| 
-  44| const (
-  45| 	skipUIAuthKey contextKey = iota
-  46| 	// bodyLimitKey carries an optional request body size cap (in bytes) through the
-  47| 	// context. middleWareFunc reads it and applies it instead of the default 5 MB cap.
-  48| 	// A value of 0 means unlimited. Used by sendAPIAuthMiddleware to honour
-  49| 	// config.MaxMessageSize for the send endpoint.
-  50| 	bodyLimitKey
-  51| )
+  34|     //
+  35|     // Configurable properties
+  36|     //
+  37| 
+  38|     /**
+  39|      * @var string Icon class to use for the upload button.
+  40|      */
+  41|     public $iconClass;
+  42| 
+  43|     /**
+  44|      * @var string Prompt text to display for the upload button.
+  45|      */
+  46|     public $prompt;
+  47| 
+  48|     /**
+  49|      * @var int Preview image width
+  50|      */
+  51|     public $imageWidth;
   52| 
-  53| // Listen will start the httpd
-  54| func Listen() {
-  55| 	setCORSOrigins()
-  56| 
-  57| 	isReady := &atomic.Value{}
-  58| 	isReady.Store(false)
-  59| 	stats.Track()
-  60| 
-  61| 	websockets.MessageHub = websockets.NewHub()
+  53|     /**
+  54|      * @var int Preview image height
+  55|      */
+  56|     public $imageHeight;
+  57| 
+  58|     /**
+  59|      * @var mixed Collection of acceptable file types.
+  60|      */
+  61|     public $fileTypes = false;
   62| 
-  63| 	// set allowed websocket origins from configuration
-  64| 	// websockets.SetAllowedOrigins(AccessControlAllowWSOrigins)
-  65| 
-  66| 	go websockets.MessageHub.Run()
+  63|     /**
+  64|      * @var mixed Collection of acceptable mime types.
+  65|      */
+  66|     public $mimeTypes = false;
   67| 
-  68| 	go pop3.Run()
-  69| 
-  70| 	r := apiRoutes()
-  71| 
-  72| 	// kubernetes probes
-  73| 	r.HandleFunc("GET "+config.Webroot+"livez", handlers.HealthzHandler)
-  74| 	r.HandleFunc("GET "+config.Webroot+"readyz", handlers.ReadyzHandler(isReady))
-  75| 
-  76| 	// proxy handler for screenshots
-  77| 	r.HandleFunc("GET "+config.Webroot+"proxy", middleWareFunc(handlers.ProxyHandler))
-  78| 
-  79| 	// virtual filesystem for /dist/ & some individual files
-  80| 	r.Handle("GET "+config.Webroot+"dist/", middleWareFunc(embedController))
-  81| 	r.Handle("GET "+config.Webroot+"api/", middleWareFunc(embedController))
-  82| 	r.Handle("GET "+config.Webroot+"favicon.ico", middleWareFunc(embedController))
-  83| 	r.Handle("GET "+config.Webroot+"favicon.svg", middleWareFunc(embedController))
-  84| 	r.Handle("GET "+config.Webroot+"mailpit.svg", middleWareFunc(embedController))
-  85| 	r.Handle("GET "+config.Webroot+"notification.png", middleWareFunc(embedController))
-  86| 
-  87| 	// redirect to webroot if no trailing slash
-  88| 	if config.Webroot != "/" {
-  89| 		redirect := strings.TrimRight(config.Webroot, "/")
-  90| 		r.HandleFunc("GET "+redirect, middleWareFunc(addSlashToWebroot))
-  91| 	}
-  92| 
-  93| 	// UI shortcut
-  94| 	r.HandleFunc("GET "+config.Webroot+"view/latest", middleWareFunc(handlers.RedirectToLatestMessage))
-  95| 
-  96| 	// frontend testing + web UI via virtual index.html
-  97| 	// Go's ServeMux wildcards must span a full path segment so {id}.html is invalid;
-  98| 	// viewHandler dispatches on the path suffix instead.
-  99| 	r.HandleFunc("GET "+config.Webroot+"view/", middleWareFunc(viewHandler))
- 100| 
- 101| 	r.Handle("GET "+config.Webroot+"search", middleWareFunc(index))
- 102| 	// Exact-match the webroot; stdlib "/" is always a subtree so we guard inside.
- 103| 	r.HandleFunc("GET "+config.Webroot, func(w http.ResponseWriter, r *http.Request) {
- 104| 		if r.URL.Path != config.Webroot {
- 105| 			http.NotFound(w, r)
- 106| 			return
- 107| 		}
- 108| 		middleWareFunc(index)(w, r)
- 109| 	})
- 110| 
- 111| 	if auth.UICredentials != nil {
- 112| 		logger.Log().Info("[http] enabling basic authentication")
- 113| 	}
- 114| 
- 115| 	// Mark the application here as ready
- 116| 	isReady.Store(true)
- 117| 
- 118| 	server := &http.Server{
- 119| 		Addr:              config.HTTPListen,
- 120| 		ReadTimeout:       30 * time.Second,
- 121| 		ReadHeaderTimeout: 5 * time.Second,
- 122| 		WriteTimeout:      30 * time.Second,
- 123| 		Handler:           r,
- 124| 	}
- 125| 
- 126| 	// add temporary self-signed certificates to get deleted afterwards
- 127| 	for _, keyPair := range snakeoil.Certificates() {
- 128| 		storage.AddTempFile(keyPair.Public)
- 129| 		storage.AddTempFile(keyPair.Private)
- 130| 	}
- 131| 
- 132| 	if config.UITLSCert != "" && config.UITLSKey != "" {
- 133| 		logger.Log().Infof("[http] starting on %s (TLS)", config.HTTPListen)
- 134| 		logger.Log().Infof("[http] accessible via https://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
- 135| 		if err := server.ListenAndServeTLS(config.UITLSCert, config.UITLSKey); err != nil {
- 136| 			storage.Close()
- 137| 			logger.Log().Fatal(err)
- 138| 		}
- 139| 
- 140| 	} else {
- 141| 		socketAddr, perm, isSocket := tools.UnixSocket(config.HTTPListen)
- 142| 
- 143| 		if isSocket {
- 144| 			if err := tools.PrepareSocket(socketAddr); err != nil {
- 145| 				storage.Close()
- 146| 				logger.Log().Fatal(err)
- 147| 			}
- 148| 
- 149| 			// delete the Unix socket file on exit
- 150| 			storage.AddTempFile(socketAddr)
- 151| 
- 152| 			ln, err := net.Listen("unix", socketAddr)
- 153| 			if err != nil {
- 154| 				storage.Close()
- 155| 				logger.Log().Fatal(err)
- 156| 			}
- 157| 
- 158| 			if err := os.Chmod(socketAddr, perm); err != nil {
- 159| 				storage.Close()
- 160| 				logger.Log().Fatal(err)
- 161| 			}
- 162| 
- 163| 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
- 164| 
- 165| 			if err := server.Serve(ln); err != nil {
- 166| 				storage.Close()
- 167| 				logger.Log().Fatal(err)
- 168| 			}
- 169| 
- 170| 		} else {
- 171| 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
- 172| 			logger.Log().Infof("[http] accessible via http://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
- 173| 			if err := server.ListenAndServe(); err != nil {
- 174| 				storage.Close()
- 175| 				logger.Log().Fatal(err)
- 176| 			}
- 177| 		}
- 178| 	}
- 179| }
- 180| 
- 181| func apiRoutes() *http.ServeMux {
- 182| 	r := http.NewServeMux()
- 183| 
- 184| 	// API V1
- 185| 	r.HandleFunc("GET "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.GetMessages))
- 186| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.SetReadStatus))
- 187| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.DeleteMessages))
- 188| 	r.HandleFunc("GET "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.Search))
- 189| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.DeleteSearch))
- 190| 	r.HandleFunc("POST "+config.Webroot+"api/v1/send", sendAPIAuthMiddleware(apiv1.SendMessageHandler))
- 191| 	r.HandleFunc("GET "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.GetAllTags))
- 192| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.SetMessageTags))
- 193| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.RenameTag))
- 194| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.DeleteTag))
- 195| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}", middleWareFunc(apiv1.DownloadAttachment))
- 196| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}/thumb", middleWareFunc(apiv1.Thumbnail))
- 197| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/headers", middleWareFunc(apiv1.GetHeaders))
- 198| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/raw", middleWareFunc(apiv1.DownloadRaw))
- 199| 	r.HandleFunc("POST "+config.Webroot+"api/v1/message/{id}/release", middleWareFunc(apiv1.ReleaseMessage))
- 200| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/html-check", middleWareFunc(apiv1.HTMLCheck))
- 201| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/link-check", middleWareFunc(apiv1.LinkCheck))
- 202| 	if config.EnableSpamAssassin != "" {
- 203| 		r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/sa-check", middleWareFunc(apiv1.SpamAssassinCheck))
- 204| 	}
- 205| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}", middleWareFunc(apiv1.GetMessage))
- 206| 	r.HandleFunc("GET "+config.Webroot+"api/v1/info", middleWareFunc(apiv1.AppInfo))
- 207| 	r.HandleFunc("GET "+config.Webroot+"api/v1/webui", middleWareFunc(apiv1.WebUIConfig))
- 208| 	r.HandleFunc("GET "+config.Webroot+"api/v1/swagger.json", middleWareFunc(swaggerBasePath))
- 209| 
- 210| 	// Chaos
- 211| 	r.HandleFunc("GET "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.GetChaos))
- 212| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.SetChaos))
- 213| 
- 214| 	// Prometheus metrics (if enabled and using existing server)
- 215| 	if prometheus.GetMode() == "integrated" {
- 216| 		r.HandleFunc("GET "+config.Webroot+"metrics", middleWareFunc(func(w http.ResponseWriter, r *http.Request) {
- 217| 			prometheus.GetHandler().ServeHTTP(w, r)
- 218| 		}))
- 219| 	}
- 220| 
- 221| 	// web UI websocket
- 222| 	r.HandleFunc("GET "+config.Webroot+"api/events", middleWareFunc(apiWebsocket))
- 223| 
- 224| 	// return blank 200 response for OPTIONS requests for CORS
- 225| 	r.Handle("OPTIONS "+config.Webroot+"api/v1/", middleWareFunc(apiv1.GetOptions))
- 226| 
- 227| 	return r
- 228| }
- 229| 
- 230| // BasicAuthResponse returns an basic auth response to the browser
- 231| func basicAuthResponse(w http.ResponseWriter) {
- 232| 	w.Header().Set("WWW-Authenticate", `Basic realm="Login"`)
- 233| 	w.WriteHeader(http.StatusUnauthorized)
- 234| 	_, _ = w.Write([]byte("Unauthorized.\n"))
- 235| }
- 236| 
- 237| // sendAPIAuthMiddleware handles authentication specifically for the send API endpoint.
- 238| // It can use dedicated send API authentication or accept any credentials based on configuration.
- 239| // It communicates skip-UI-auth intent via request context rather than mutating the global
- 240| // auth.UICredentials pointer, which would be a data race under concurrent load.
- 241| func sendAPIAuthMiddleware(fn http.HandlerFunc) http.HandlerFunc {
- 242| 	return func(w http.ResponseWriter, r *http.Request) {
- 243| 		// Override the default 5 MB body cap with the send-specific limit so that
- 244| 		// middleWareFunc applies config.MaxMessageSize (0 = unlimited) instead.
- 245| 		r = r.WithContext(context.WithValue(r.Context(), bodyLimitKey, int64(config.MaxMessageSize)*1024*1024))
- 246| 
- 247| 		// If send API auth accept any is enabled, bypass all authentication.
- 248| 		if config.SendAPIAuthAcceptAny {
- 249| 			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
- 250| 			middleWareFunc(fn)(w, r.WithContext(ctx))
- 251| 			return
- 252| 		}
- 253| 
- 254| 		// If Send API credentials are configured, only accept those credentials.
- 255| 		if auth.SendAPICredentials != nil {
- 256| 			user, pass, ok := r.BasicAuth()
- 257| 
- 258| 			if !ok {
- 259| 				basicAuthResponse(w)
- 260| 				return
- 261| 			}
- 262| 
- 263| 			if !auth.SendAPICredentials.Match(user, pass) {
- 264| 				basicAuthResponse(w)
- 265| 				return
- 266| 			}
- 267| 
- 268| 			// Valid Send API credentials — bypass UI auth via context flag.
- 269| 			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
- 270| 			middleWareFunc(fn)(w, r.WithContext(ctx))
- 271| 			return
- 272| 		}
- 273| 
- 274| 		// No Send API credentials configured — fall back to UI auth.
- 275| 		middleWareFunc(fn)(w, r)
- 276| 	}
- 277| }
- 278| 
- 279| type gzipResponseWriter struct {
- 280| 	io.Writer
- 281| 	http.ResponseWriter
- 282| }
- 283| 
- 284| func (w gzipResponseWriter) Write(b []byte) (int, error) {
- 285| 	return w.Writer.Write(b)
- 286| }
- 287| 
- 288| // MiddleWareFunc http middleware adds optional basic authentication
- 289| // and gzip compression.
- 290| func middleWareFunc(fn http.HandlerFunc) http.HandlerFunc {
- 291| 	return func(w http.ResponseWriter, r *http.Request) {
- 292| 		// Limit request body size to 5 MB to prevent memory-exhaustion DoS via large
- 293| 		// JSON bodies. sendAPIAuthMiddleware sets bodyLimitKey in the context to signal
- 294| 		// that the handler manages its own limit (send.go uses config.MaxMessageSize),
- 295| 		// so we skip the cap here for that route only.
- 296| 		if _, ok := r.Context().Value(bodyLimitKey).(int64); !ok {
- 297| 			r.Body = http.MaxBytesReader(w, r.Body, 5*1024*1024)
- 298| 		}
- 299| 
- 300| 		w.Header().Set("Referrer-Policy", "no-referrer")
- 301| 
- 302| 		// generate a new random nonce on every request
- 303| 		randomNonce := shortuuid.New()
- 304| 		// header used to pass nonce through to function
- 305| 		r.Header.Set("mp-nonce", randomNonce)
- 306| 
- 307| 		// Prevent JavaScript XSS by adding a nonce for script-src
- 308| 		cspHeader := strings.Replace(
- 309| 			config.ContentSecurityPolicy,
- 310| 			"script-src 'self';",
- 311| 			fmt.Sprintf("script-src 'nonce-%s';", randomNonce),
- 312| 			1,
- 313| 		)
- 314| 
- 315| 		w.Header().Set("Content-Security-Policy", cspHeader)
- 316| 
- 317| 		if htmlPreviewRouteRe == nil {
- 318| 			htmlPreviewRouteRe = regexp.MustCompile(`^` + regexp.QuoteMeta(config.Webroot) + `view/[a-zA-Z0-9]+\.html$`)
- 319| 		}
- 320| 
- 321| 		if strings.HasPrefix(r.RequestURI, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.RequestURI) {
- 322| 			if allowed := corsOriginAccessControl(r); !allowed {
- 323| 				http.Error(w, "Blocked due to CORS violation", http.StatusForbidden)
- 324| 				return
- 325| 			}
- 326| 			w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
- 327| 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, OPTIONS")
- 328| 			w.Header().Set("Access-Control-Allow-Headers", "*")
- 329| 		}
- 330| 
- 331| 		// Check basic authentication headers if configured.
- 332| 		// OPTIONS requests are skipped if CORS is enabled, since browsers omit credentials for preflight checks.
- 333| 		// skipUIAuthKey in the request context allows sendAPIAuthMiddleware to bypass UI auth
- 334| 		// for a specific request without touching the global auth.UICredentials pointer.
- 335| 		skipUIAuth, _ := r.Context().Value(skipUIAuthKey).(bool)
- 336| 		isCORSOptionsRequest := AccessControlAllowOrigin != "" && r.Method == http.MethodOptions
- 337| 		if !skipUIAuth && !isCORSOptionsRequest && auth.UICredentials != nil {
- 338| 			user, pass, ok := r.BasicAuth()
- 339| 
- 340| 			if !ok {
- 341| 				basicAuthResponse(w)
- 342| 				return
- 343| 			}
- 344| 
- 345| 			if !auth.UICredentials.Match(user, pass) {
- 346| 				basicAuthResponse(w)
- 347| 				return
- 348| 			}
- 349| 		}
- 350| 
- 351| 		// WebSocket upgrade requests must not be wrapped in a gzip writer:
- 352| 		// gzipResponseWriter does not implement http.Hijacker, which the
- 353| 		// WebSocket library requires to take over the raw TCP connection.
- 354| 		isWebSocketUpgrade := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
- 355| 		if isWebSocketUpgrade || config.DisableHTTPCompression || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
- 356| 			fn(w, r)
- 357| 			return
- 358| 		}
- 359| 
- 360| 		w.Header().Set("Content-Encoding", "gzip")
- 361| 		gz := gzip.NewWriter(w)
- 362| 		defer func() { _ = gz.Close() }()
- 363| 		gzr := gzipResponseWriter{Writer: gz, ResponseWriter: w}
- 364| 		fn(gzr, r)
- 365| 	}
- 366| }
- 367| 
- 368| // Redirect to webroot
- 369| func addSlashToWebroot(w http.ResponseWriter, r *http.Request) {
- 370| 	http.Redirect(w, r, config.Webroot, http.StatusFound)
- 371| }
- 372| 
- 373| // viewHandler routes /view/ requests based on path suffix.
- 374| // Go's ServeMux requires wildcards to span a full path segment,
- 375| // so patterns like /view/{id}.html are invalid; we dispatch manually here.
- 376| func viewHandler(w http.ResponseWriter, r *http.Request) {
- 377| 	path := strings.TrimPrefix(r.URL.Path, config.Webroot+"view/")
- 378| 	switch {
- 379| 	case strings.HasSuffix(path, ".html"):
- 380| 		apiv1.GetMessageHTML(w, r)
- 381| 	case strings.HasSuffix(path, ".txt"):
- 382| 		apiv1.GetMessageText(w, r)
- 383| 	default:
- 384| 		index(w, r)
- 385| 	}
- 386| }
- 387| 
- 388| // Websocket to broadcast changes.
- 389| // Authentication and CORS are handled by middleWareFunc before this is reached.
- 390| func apiWebsocket(w http.ResponseWriter, r *http.Request) {
- 391| 	websockets.ServeWs(websockets.MessageHub, w, r)
- 392| 	storage.BroadcastMailboxStats()
- 393| }
- 394| 
- 395| // Wrapper to artificially inject a basePath to the swagger.json if a webroot has been specified
- 396| func swaggerBasePath(w http.ResponseWriter, _ *http.Request) {
- 397| 	f, err := distFS.ReadFile("ui/api/v1/swagger.json")
- 398| 	if err != nil {
- 399| 		panic(err)
- 400| 	}
- 401| 
- 402| 	if config.Webroot != "/" {
- 403| 		// artificially inject a path at the start
- 404| 		replacement := fmt.Sprintf("{\n  \"basePath\": \"%s\",", strings.TrimRight(config.Webroot, "/"))
- 405| 
- 406| 		f = bytes.Replace(f, []byte("{"), []byte(replacement), 1)
- 407| 	}
- 408| 
- 409| 	w.Header().Add("Content-Type", "application/json")
- 410| 	_, _ = w.Write(f)
- 411| }
- 412| 
- 413| // Just returns the default HTML template
- 414| func index(w http.ResponseWriter, r *http.Request) {
- 415| 
- 416| 	var h = `<!DOCTYPE html>
- 417| <html lang="en" class="h-100">
- 418| 
- 419| <head>
- 420| 	<meta charset="utf-8">
- 421| 	<meta name="viewport" content="width=device-width,initial-scale=1.0">
- 422| 	<meta name="referrer" content="no-referrer">
- 423| 	<meta name="robots" content="noindex, nofollow, noarchive">
- 424| 	<link rel="icon" href="{{ .Webroot }}favicon.svg">
- 425| 	<title>Mailpit</title>
- 426| 	<link rel=stylesheet href="{{ .Webroot }}dist/app.css?{{ .Version }}">
- 427| </head>
- 428| 
- 429| <body class="h-100">
- 430| 	<div class="container-fluid h-100 d-flex flex-column" id="app" data-webroot="{{ .Webroot }}" data-version="{{ .Version }}">
- 431| 		<noscript class="alert alert-warning position-absolute top-50 start-50 translate-middle">
- 432| 			You need a browser with JavaScript enabled to use Mailpit
- 433| 		</noscript>
- 434| 	</div>
- 435| 
- 436| 	<script src="{{ .Webroot }}dist/app.js?{{ .Version }}" nonce="{{ .Nonce }}"></script>
- 437| </body>
- 438| 
- 439| </html>`
- 440| 
- 441| 	t, err := template.New("index").Parse(h)
- 442| 	if err != nil {
- 443| 		panic(err)
- 444| 	}
- 445| 
- 446| 	data := struct {
- 447| 		Webroot string
- 448| 		Version string
- 449| 		Nonce   string
- 450| 	}{
- 451| 		Webroot: config.Webroot,
- 452| 		Version: config.Version,
- 453| 		Nonce:   r.Header.Get("mp-nonce"),
- 454| 	}
- 455| 
- 456| 	buff := new(bytes.Buffer)
- 457| 
- 458| 	err = t.Execute(buff, data)
- 459| 	if err != nil {
- 460| 		panic(err)
- 461| 	}
- 462| 
- 463| 	w.Header().Add("Content-Type", "text/html; charset=utf-8")
- 464| 	_, _ = w.Write(buff.Bytes())
- 465| }
- 466| 
- 467| 
-
-### id=7780 lang=go
-[CODE]
-   1| // Package server is the HTTP daemon
-   2| package server
-   3| 
-   4| import (
-   5| 	"bytes"
-   6| 	"compress/gzip"
-   7| 	"context"
-   8| 	"fmt"
-   9| 	"io"
-  10| 	"net"
-  11| 	"net/http"
-  12| 	"os"
-  13| 	"regexp"
-  14| 	"strings"
-  15| 	"sync/atomic"
-  16| 	"text/template"
-  17| 	"time"
-  18| 
-  19| 	"github.com/axllent/mailpit/config"
-  20| 	"github.com/axllent/mailpit/internal/auth"
-  21| 	"github.com/axllent/mailpit/internal/logger"
-  22| 	"github.com/axllent/mailpit/internal/pop3"
-  23| 	"github.com/axllent/mailpit/internal/prometheus"
-  24| 	"github.com/axllent/mailpit/internal/shortuuid"
-  25| 	"github.com/axllent/mailpit/internal/snakeoil"
-  26| 	"github.com/axllent/mailpit/internal/stats"
-  27| 	"github.com/axllent/mailpit/internal/storage"
-  28| 	"github.com/axllent/mailpit/internal/tools"
-  29| 	"github.com/axllent/mailpit/server/apiv1"
-  30| 	"github.com/axllent/mailpit/server/handlers"
-  31| 	"github.com/axllent/mailpit/server/websockets"
-  32| )
-  33| 
-  34| var (
-  35| 	// htmlPreviewRouteRe is a regexp to match the HTML preview route
-  36| 	htmlPreviewRouteRe *regexp.Regexp
-  37| )
-  38| 
-  39| // skipUIAuthKey is a private context key used to signal that UI basic-auth
-  40| // should be bypassed for a specific request. This avoids mutating the global
-  41| // auth.UICredentials pointer (which is a data race under concurrent load).
-  42| type contextKey int
-  43| 
-  44| const (
-  45| 	skipUIAuthKey contextKey = iota
-  46| 	// bodyLimitKey carries an optional request body size cap (in bytes) through the
-  47| 	// context. middleWareFunc reads it and applies it instead of the default 5 MB cap.
-  48| 	// A value of 0 means unlimited. Used by sendAPIAuthMiddleware to honour
-  49| 	// config.MaxMessageSize for the send endpoint.
-  50| 	bodyLimitKey
-  51| )
-  52| 
-  53| // Listen will start the httpd
-  54| func Listen() {
-  55| 	setCORSOrigins()
-  56| 
-  57| 	isReady := &atomic.Value{}
-  58| 	isReady.Store(false)
-  59| 	stats.Track()
-  60| 
-  61| 	websockets.MessageHub = websockets.NewHub()
-  62| 	websockets.SetCheckOriginFunc(corsOriginAccessControl)
-  63| 
-  64| 	go websockets.MessageHub.Run()
-  65| 
-  66| 	go pop3.Run()
-  67| 
-  68| 	r := apiRoutes()
-  69| 
-  70| 	// kubernetes probes
-  71| 	r.HandleFunc("GET "+config.Webroot+"livez", handlers.HealthzHandler)
-  72| 	r.HandleFunc("GET "+config.Webroot+"readyz", handlers.ReadyzHandler(isReady))
-  73| 
-  74| 	// proxy handler for screenshots
-  75| 	r.HandleFunc("GET "+config.Webroot+"proxy", middleWareFunc(handlers.ProxyHandler))
-  76| 
-  77| 	// virtual filesystem for /dist/ & some individual files
-  78| 	r.Handle("GET "+config.Webroot+"dist/", middleWareFunc(embedController))
-  79| 	r.Handle("GET "+config.Webroot+"api/", middleWareFunc(embedController))
-  80| 	r.Handle("GET "+config.Webroot+"favicon.ico", middleWareFunc(embedController))
-  81| 	r.Handle("GET "+config.Webroot+"favicon.svg", middleWareFunc(embedController))
-  82| 	r.Handle("GET "+config.Webroot+"mailpit.svg", middleWareFunc(embedController))
-  83| 	r.Handle("GET "+config.Webroot+"notification.png", middleWareFunc(embedController))
-  84| 
-  85| 	// redirect to webroot if no trailing slash
-  86| 	if config.Webroot != "/" {
-  87| 		redirect := strings.TrimRight(config.Webroot, "/")
-  88| 		r.HandleFunc("GET "+redirect, middleWareFunc(addSlashToWebroot))
-  89| 	}
+  68|     /**
+  69|      * @var mixed Max file size.
+  70|      */
+  71|     public $maxFilesize;
+  72| 
+  73|     /**
+  74|      * @var array Options used for generating thumbnails.
+  75|      */
+  76|     public $thumbOptions = [
+  77|         'mode'      => 'crop',
+  78|         'extension' => 'auto'
+  79|     ];
+  80| 
+  81|     /**
+  82|      * @var boolean Allow the user to set a caption.
+  83|      */
+  84|     public $useCaption = true;
+  85| 
+  86|     /**
+  87|      * @var boolean Automatically attaches the uploaded file on upload if the parent record exists instead of using deferred binding to attach on save of the parent record. Defaults to false.
+  88|      */
+  89|     public $attachOnUpload = false;
   90| 
-  91| 	// UI shortcut
-  92| 	r.HandleFunc("GET "+config.Webroot+"view/latest", middleWareFunc(handlers.RedirectToLatestMessage))
-  93| 
-  94| 	// frontend testing + web UI via virtual index.html
-  95| 	// Go's ServeMux wildcards must span a full path segment so {id}.html is invalid;
-  96| 	// viewHandler dispatches on the path suffix instead.
-  97| 	r.HandleFunc("GET "+config.Webroot+"view/", middleWareFunc(viewHandler))
-  98| 
-  99| 	r.Handle("GET "+config.Webroot+"search", middleWareFunc(index))
- 100| 	// Exact-match the webroot; stdlib "/" is always a subtree so we guard inside.
- 101| 	r.HandleFunc("GET "+config.Webroot, func(w http.ResponseWriter, r *http.Request) {
- 102| 		if r.URL.Path != config.Webroot {
- 103| 			http.NotFound(w, r)
- 104| 			return
- 105| 		}
- 106| 		middleWareFunc(index)(w, r)
- 107| 	})
- 108| 
- 109| 	if auth.UICredentials != nil {
- 110| 		logger.Log().Info("[http] enabling basic authentication")
- 111| 	}
- 112| 
- 113| 	// Mark the application here as ready
- 114| 	isReady.Store(true)
- 115| 
- 116| 	server := &http.Server{
- 117| 		Addr:              config.HTTPListen,
- 118| 		ReadTimeout:       30 * time.Second,
- 119| 		ReadHeaderTimeout: 5 * time.Second,
- 120| 		WriteTimeout:      30 * time.Second,
- 121| 		Handler:           r,
- 122| 	}
- 123| 
- 124| 	// add temporary self-signed certificates to get deleted afterwards
- 125| 	for _, keyPair := range snakeoil.Certificates() {
- 126| 		storage.AddTempFile(keyPair.Public)
- 127| 		storage.AddTempFile(keyPair.Private)
- 128| 	}
- 129| 
- 130| 	if config.UITLSCert != "" && config.UITLSKey != "" {
- 131| 		logger.Log().Infof("[http] starting on %s (TLS)", config.HTTPListen)
- 132| 		logger.Log().Infof("[http] accessible via https://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
- 133| 		if err := server.ListenAndServeTLS(config.UITLSCert, config.UITLSKey); err != nil {
- 134| 			storage.Close()
- 135| 			logger.Log().Fatal(err)
- 136| 		}
- 137| 
- 138| 	} else {
- 139| 		socketAddr, perm, isSocket := tools.UnixSocket(config.HTTPListen)
- 140| 
- 141| 		if isSocket {
- 142| 			if err := tools.PrepareSocket(socketAddr); err != nil {
- 143| 				storage.Close()
- 144| 				logger.Log().Fatal(err)
- 145| 			}
- 146| 
- 147| 			// delete the Unix socket file on exit
- 148| 			storage.AddTempFile(socketAddr)
- 149| 
- 150| 			ln, err := net.Listen("unix", socketAddr)
- 151| 			if err != nil {
- 152| 				storage.Close()
- 153| 				logger.Log().Fatal(err)
- 154| 			}
+  91|     //
+  92|     // Object properties
+  93|     //
+  94| 
+  95|     /**
+  96|      * @inheritDoc
+  97|      */
+  98|     protected $defaultAlias = 'fileupload';
+  99| 
+ 100|     /**
+ 101|      * @var Backend\Widgets\Form The embedded form for modifying the properties of the selected file
+ 102|      */
+ 103|     protected $configFormWidget;
+ 104| 
+ 105|     /**
+ 106|      * @inheritDoc
+ 107|      */
+ 108|     public function init()
+ 109|     {
+ 110|         $this->maxFilesize = $this->getUploadMaxFilesize();
+ 111| 
+ 112|         $this->fillFromConfig([
+ 113|             'iconClass',
+ 114|             'prompt',
+ 115|             'imageWidth',
+ 116|             'imageHeight',
+ 117|             'fileTypes',
+ 118|             'maxFilesize',
+ 119|             'mimeTypes',
+ 120|             'thumbOptions',
+ 121|             'useCaption',
+ 122|             'attachOnUpload',
+ 123|         ]);
+ 124| 
+ 125|         $this->iconClass = $this->iconClass ?? 'icon-upload';
+ 126| 
+ 127|         if ($this->formField->disabled) {
+ 128|             $this->previewMode = true;
+ 129|         }
+ 130| 
+ 131|         $this->getConfigFormWidget();
+ 132|     }
+ 133| 
+ 134|     /**
+ 135|      * @inheritDoc
+ 136|      */
+ 137|     public function render()
+ 138|     {
+ 139|         $this->prepareVars();
+ 140|         return $this->makePartial('fileupload');
+ 141|     }
+ 142| 
+ 143|     /**
+ 144|      * Prepares the view data
+ 145|      */
+ 146|     protected function prepareVars()
+ 147|     {
+ 148|         if ($this->formField->disabled) {
+ 149|             $this->previewMode = true;
+ 150|         }
+ 151| 
+ 152|         if ($this->previewMode) {
+ 153|             $this->useCaption = false;
+ 154|         }
  155| 
- 156| 			if err := os.Chmod(socketAddr, perm); err != nil {
- 157| 				storage.Close()
- 158| 				logger.Log().Fatal(err)
- 159| 			}
- 160| 
- 161| 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
- 162| 
- 163| 			if err := server.Serve(ln); err != nil {
- 164| 				storage.Close()
- 165| 				logger.Log().Fatal(err)
- 166| 			}
- 167| 
- 168| 		} else {
- 169| 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
- 170| 			logger.Log().Infof("[http] accessible via http://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
- 171| 			if err := server.ListenAndServe(); err != nil {
- 172| 				storage.Close()
- 173| 				logger.Log().Fatal(err)
- 174| 			}
- 175| 		}
- 176| 	}
- 177| }
- 178| 
- 179| func apiRoutes() *http.ServeMux {
- 180| 	r := http.NewServeMux()
- 181| 
- 182| 	// API V1
- 183| 	r.HandleFunc("GET "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.GetMessages))
- 184| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.SetReadStatus))
- 185| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.DeleteMessages))
- 186| 	r.HandleFunc("GET "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.Search))
- 187| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.DeleteSearch))
- 188| 	r.HandleFunc("POST "+config.Webroot+"api/v1/send", sendAPIAuthMiddleware(apiv1.SendMessageHandler))
- 189| 	r.HandleFunc("GET "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.GetAllTags))
- 190| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.SetMessageTags))
- 191| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.RenameTag))
- 192| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.DeleteTag))
- 193| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}", middleWareFunc(apiv1.DownloadAttachment))
- 194| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}/thumb", middleWareFunc(apiv1.Thumbnail))
- 195| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/headers", middleWareFunc(apiv1.GetHeaders))
- 196| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/raw", middleWareFunc(apiv1.DownloadRaw))
- 197| 	r.HandleFunc("POST "+config.Webroot+"api/v1/message/{id}/release", middleWareFunc(apiv1.ReleaseMessage))
- 198| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/html-check", middleWareFunc(apiv1.HTMLCheck))
- 199| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/link-check", middleWareFunc(apiv1.LinkCheck))
- 200| 	if config.EnableSpamAssassin != "" {
- 201| 		r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/sa-check", middleWareFunc(apiv1.SpamAssassinCheck))
- 202| 	}
- 203| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}", middleWareFunc(apiv1.GetMessage))
- 204| 	r.HandleFunc("GET "+config.Webroot+"api/v1/info", middleWareFunc(apiv1.AppInfo))
- 205| 	r.HandleFunc("GET "+config.Webroot+"api/v1/webui", middleWareFunc(apiv1.WebUIConfig))
- 206| 	r.HandleFunc("GET "+config.Webroot+"api/v1/swagger.json", middleWareFunc(swaggerBasePath))
+ 156|         if ($this->maxFilesize > $this->getUploadMaxFilesize()) {
+ 157|             throw new ApplicationException('Maximum allowed size for uploaded files: ' . $this->getUploadMaxFilesize());
+ 158|         }
+ 159| 
+ 160|         $this->vars['fileList'] = $fileList = $this->getFileList();
+ 161|         $this->vars['singleFile'] = $fileList->first();
+ 162|         $this->vars['displayMode'] = $this->getDisplayMode();
+ 163|         $this->vars['emptyIcon'] = $this->getConfig('emptyIcon', 'icon-upload');
+ 164|         $this->vars['imageHeight'] = $this->imageHeight;
+ 165|         $this->vars['imageWidth'] = $this->imageWidth;
+ 166|         $this->vars['acceptedFileTypes'] = $this->getAcceptedFileTypes(true);
+ 167|         $this->vars['maxFilesize'] = $this->maxFilesize;
+ 168|         $this->vars['cssDimensions'] = $this->getCssDimensions();
+ 169|         $this->vars['cssBlockDimensions'] = $this->getCssDimensions('block');
+ 170|         $this->vars['useCaption'] = $this->useCaption;
+ 171|         $this->vars['iconClass'] = $this->iconClass;
+ 172|         $this->vars['prompt'] = $this->getPromptText();
+ 173|     }
+ 174| 
+ 175|     /**
+ 176|      * Get the file record for this request, returns false if none available
+ 177|      *
+ 178|      * @return System\Models\File|false
+ 179|      */
+ 180|     protected function getFileRecord()
+ 181|     {
+ 182|         $record = false;
+ 183| 
+ 184|         if (!empty(post('file_id'))) {
+ 185|             $record = $this->getRelationModel()->find(post('file_id')) ?: false;
+ 186|         }
+ 187| 
+ 188|         return $record;
+ 189|     }
+ 190| 
+ 191|     /**
+ 192|      * Get the instantiated config Form widget
+ 193|      */
+ 194|     public function getConfigFormWidget(): Form
+ 195|     {
+ 196|         if ($this->configFormWidget) {
+ 197|             return $this->configFormWidget;
+ 198|         }
+ 199| 
+ 200|         $config = $this->makeConfig('~/modules/system/models/file/fields.yaml');
+ 201|         $config->model = $this->getFileRecord() ?: $this->getRelationModel();
+ 202|         $config->alias = $this->alias . $this->defaultAlias;
+ 203|         $config->arrayName = $this->getFieldName();
+ 204| 
+ 205|         $widget = $this->makeWidget(Form::class, $config);
+ 206|         $widget->bindToController();
  207| 
- 208| 	// Chaos
- 209| 	r.HandleFunc("GET "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.GetChaos))
- 210| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.SetChaos))
- 211| 
- 212| 	// Prometheus metrics (if enabled and using existing server)
- 213| 	if prometheus.GetMode() == "integrated" {
- 214| 		r.HandleFunc("GET "+config.Webroot+"metrics", middleWareFunc(func(w http.ResponseWriter, r *http.Request) {
- 215| 			prometheus.GetHandler().ServeHTTP(w, r)
- 216| 		}))
- 217| 	}
- 218| 
- 219| 	// web UI websocket
- 220| 	r.HandleFunc("GET "+config.Webroot+"api/events", middleWareFunc(apiWebsocket))
- 221| 
- 222| 	// return blank 200 response for OPTIONS requests for CORS
- 223| 	r.Handle("OPTIONS "+config.Webroot+"api/v1/", middleWareFunc(apiv1.GetOptions))
- 224| 
- 225| 	return r
- 226| }
- 227| 
- 228| // BasicAuthResponse returns an basic auth response to the browser
- 229| func basicAuthResponse(w http.ResponseWriter) {
- 230| 	w.Header().Set("WWW-Authenticate", `Basic realm="Login"`)
- 231| 	w.WriteHeader(http.StatusUnauthorized)
- 232| 	_, _ = w.Write([]byte("Unauthorized.\n"))
- 233| }
- 234| 
- 235| // sendAPIAuthMiddleware handles authentication specifically for the send API endpoint.
- 236| // It can use dedicated send API authentication or accept any credentials based on configuration.
- 237| // It communicates skip-UI-auth intent via request context rather than mutating the global
- 238| // auth.UICredentials pointer, which would be a data race under concurrent load.
- 239| func sendAPIAuthMiddleware(fn http.HandlerFunc) http.HandlerFunc {
- 240| 	return func(w http.ResponseWriter, r *http.Request) {
- 241| 		// Override the default 5 MB body cap with the send-specific limit so that
- 242| 		// middleWareFunc applies config.MaxMessageSize (0 = unlimited) instead.
- 243| 		r = r.WithContext(context.WithValue(r.Context(), bodyLimitKey, int64(config.MaxMessageSize)*1024*1024))
- 244| 
- 245| 		// If send API auth accept any is enabled, bypass all authentication.
- 246| 		if config.SendAPIAuthAcceptAny {
- 247| 			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
- 248| 			middleWareFunc(fn)(w, r.WithContext(ctx))
- 249| 			return
- 250| 		}
- 251| 
- 252| 		// If Send API credentials are configured, only accept those credentials.
- 253| 		if auth.SendAPICredentials != nil {
- 254| 			user, pass, ok := r.BasicAuth()
- 255| 
- 256| 			if !ok {
- 257| 				basicAuthResponse(w)
- 258| 				return
- 259| 			}
- 260| 
- 261| 			if !auth.SendAPICredentials.Match(user, pass) {
- 262| 				basicAuthResponse(w)
- 263| 				return
- 264| 			}
- 265| 
- 266| 			// Valid Send API credentials — bypass UI auth via context flag.
- 267| 			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
- 268| 			middleWareFunc(fn)(w, r.WithContext(ctx))
- 269| 			return
- 270| 		}
- 271| 
- 272| 		// No Send API credentials configured — fall back to UI auth.
- 273| 		middleWareFunc(fn)(w, r)
- 274| 	}
- 275| }
- 276| 
- 277| type gzipResponseWriter struct {
- 278| 	io.Writer
- 279| 	http.ResponseWriter
- 280| }
- 281| 
- 282| func (w gzipResponseWriter) Write(b []byte) (int, error) {
- 283| 	return w.Writer.Write(b)
- 284| }
- 285| 
- 286| // MiddleWareFunc http middleware adds optional basic authentication
- 287| // and gzip compression.
- 288| func middleWareFunc(fn http.HandlerFunc) http.HandlerFunc {
- 289| 	return func(w http.ResponseWriter, r *http.Request) {
- 290| 		// Limit request body size to 5 MB to prevent memory-exhaustion DoS via large
- 291| 		// JSON bodies. sendAPIAuthMiddleware sets bodyLimitKey in the context to signal
- 292| 		// that the handler manages its own limit (send.go uses config.MaxMessageSize),
- 293| 		// so we skip the cap here for that route only.
- 294| 		if _, ok := r.Context().Value(bodyLimitKey).(int64); !ok {
- 295| 			r.Body = http.MaxBytesReader(w, r.Body, 5*1024*1024)
- 296| 		}
- 297| 
- 298| 		w.Header().Set("Referrer-Policy", "no-referrer")
- 299| 
- 300| 		// generate a new random nonce on every request
- 301| 		randomNonce := shortuuid.New()
- 302| 		// header used to pass nonce through to function
- 303| 		r.Header.Set("mp-nonce", randomNonce)
- 304| 
- 305| 		// Prevent JavaScript XSS by adding a nonce for script-src
- 306| 		cspHeader := strings.Replace(
- 307| 			config.ContentSecurityPolicy,
- 308| 			"script-src 'self';",
- 309| 			fmt.Sprintf("script-src 'nonce-%s';", randomNonce),
- 310| 			1,
- 311| 		)
- 312| 
- 313| 		w.Header().Set("Content-Security-Policy", cspHeader)
+ 208|         return $this->configFormWidget = $widget;
+ 209|     }
+ 210| 
+ 211|     protected function getFileList()
+ 212|     {
+ 213|         $list = $this
+ 214|             ->getRelationObject()
+ 215|             ->withDeferred($this->sessionKey)
+ 216|             ->orderBy('sort_order')
+ 217|             ->get()
+ 218|         ;
+ 219| 
+ 220|         /*
+ 221|          * Decorate each file with thumb and custom download path
+ 222|          */
+ 223|         $list->each(function ($file) {
+ 224|             $this->decorateFileAttributes($file);
+ 225|         });
+ 226| 
+ 227|         return $list;
+ 228|     }
+ 229| 
+ 230|     /**
+ 231|      * Returns the display mode for the file upload. Eg: file-multi, image-single, etc.
+ 232|      */
+ 233|     protected function getDisplayMode(): string
+ 234|     {
+ 235|         $mode = $this->getConfig('mode', 'image');
+ 236| 
+ 237|         if (str_contains($mode, '-')) {
+ 238|             return $mode;
+ 239|         }
+ 240| 
+ 241|         $relationType = $this->getRelationType();
+ 242|         $mode .= ($relationType === 'attachMany' || $relationType === 'morphMany') ? '-multi' : '-single';
+ 243| 
+ 244|         return $mode;
+ 245|     }
+ 246| 
+ 247|     /**
+ 248|      * Returns the escaped and translated prompt text to display according to the type.
+ 249|      */
+ 250|     protected function getPromptText(): string
+ 251|     {
+ 252|         if ($this->prompt === null) {
+ 253|             $isMulti = ends_with($this->getDisplayMode(), 'multi');
+ 254|             $this->prompt = $isMulti
+ 255|                 ? 'backend::lang.fileupload.upload_file'
+ 256|                 : 'backend::lang.fileupload.default_prompt';
+ 257|         }
+ 258| 
+ 259|         $uploadIconStr = sprintf('<i class="%s"></i>', $this->iconClass);
+ 260|         return str_replace('%s', $uploadIconStr, e(trans($this->prompt)));
+ 261|     }
+ 262| 
+ 263|     /**
+ 264|      * Returns the CSS dimensions for the uploaded image,
+ 265|      * uses auto where no dimension is provided.
+ 266|      */
+ 267|     protected function getCssDimensions(?string $mode = null): string
+ 268|     {
+ 269|         if (!$this->imageWidth && !$this->imageHeight) {
+ 270|             return '';
+ 271|         }
+ 272| 
+ 273|         $cssDimensions = '';
+ 274| 
+ 275|         if ($mode == 'block') {
+ 276|             $cssDimensions .= $this->imageWidth
+ 277|                 ? 'width: ' . $this->imageWidth . 'px;'
+ 278|                 : 'width: ' . $this->imageHeight . 'px;';
+ 279| 
+ 280|             $cssDimensions .= ($this->imageHeight)
+ 281|                 ? 'max-height: ' . $this->imageHeight . 'px;'
+ 282|                 : 'height: auto;';
+ 283|         } else {
+ 284|             $cssDimensions .= $this->imageWidth
+ 285|                 ? 'width: ' . $this->imageWidth . 'px;'
+ 286|                 : 'width: auto;';
+ 287| 
+ 288|             $cssDimensions .= ($this->imageHeight)
+ 289|                 ? 'max-height: ' . $this->imageHeight . 'px;'
+ 290|                 : 'height: auto;';
+ 291|         }
+ 292| 
+ 293|         return $cssDimensions;
+ 294|     }
+ 295| 
+ 296|     /**
+ 297|      * Returns the specified accepted file types, or the default
+ 298|      * based on the mode. Image mode will return:
+ 299|      * - jpg,jpeg,bmp,png,gif,svg
+ 300|      * @return string
+ 301|      */
+ 302|     public function getAcceptedFileTypes($includeDot = false)
+ 303|     {
+ 304|         $types = $this->fileTypes;
+ 305| 
+ 306|         if ($types === false) {
+ 307|             $isImage = starts_with($this->getDisplayMode(), 'image');
+ 308|             $types = implode(',', FileDefinitions::get($isImage ? 'imageExtensions' : 'defaultExtensions'));
+ 309|         }
+ 310| 
+ 311|         if (!$types || $types == '*') {
+ 312|             return null;
+ 313|         }
  314| 
- 315| 		if htmlPreviewRouteRe == nil {
- 316| 			htmlPreviewRouteRe = regexp.MustCompile(`^` + regexp.QuoteMeta(config.Webroot) + `view/[a-zA-Z0-9]+\.html$`)
- 317| 		}
+ 315|         if (!is_array($types)) {
+ 316|             $types = explode(',', $types);
+ 317|         }
  318| 
- 319| 		if strings.HasPrefix(r.URL.Path, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.URL.Path) {
- 320| 			if allowed := corsOriginAccessControl(r); !allowed {
- 321| 				http.Error(w, "Blocked due to CORS violation", http.StatusForbidden)
- 322| 				return
- 323| 			}
- 324| 			w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
- 325| 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, OPTIONS")
- 326| 			w.Header().Set("Access-Control-Allow-Headers", "*")
- 327| 		}
- 328| 
- 329| 		// Check basic authentication headers if configured.
- 330| 		// OPTIONS requests are skipped if CORS is enabled, since browsers omit credentials for preflight checks.
- 331| 		// skipUIAuthKey in the request context allows sendAPIAuthMiddleware to bypass UI auth
- 332| 		// for a specific request without touching the global auth.UICredentials pointer.
- 333| 		skipUIAuth, _ := r.Context().Value(skipUIAuthKey).(bool)
- 334| 		isCORSOptionsRequest := AccessControlAllowOrigin != "" && r.Method == http.MethodOptions
- 335| 		if !skipUIAuth && !isCORSOptionsRequest && auth.UICredentials != nil {
- 336| 			user, pass, ok := r.BasicAuth()
- 337| 
- 338| 			if !ok {
- 339| 				basicAuthResponse(w)
- 340| 				return
- 341| 			}
- 342| 
- 343| 			if !auth.UICredentials.Match(user, pass) {
- 344| 				basicAuthResponse(w)
- 345| 				return
- 346| 			}
- 347| 		}
- 348| 
- 349| 		// WebSocket upgrade requests must not be wrapped in a gzip writer:
- 350| 		// gzipResponseWriter does not implement http.Hijacker, which the
- 351| 		// WebSocket library requires to take over the raw TCP connection.
- 352| 		isWebSocketUpgrade := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
- 353| 		if isWebSocketUpgrade || config.DisableHTTPCompression || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
- 354| 			fn(w, r)
- 355| 			return
- 356| 		}
- 357| 
- 358| 		w.Header().Set("Content-Encoding", "gzip")
- 359| 		gz := gzip.NewWriter(w)
- 360| 		defer func() { _ = gz.Close() }()
- 361| 		gzr := gzipResponseWriter{Writer: gz, ResponseWriter: w}
- 362| 		fn(gzr, r)
- 363| 	}
- 364| }
- 365| 
- 366| // Redirect to webroot
- 367| func addSlashToWebroot(w http.ResponseWriter, r *http.Request) {
- 368| 	http.Redirect(w, r, config.Webroot, http.StatusFound)
- 369| }
- 370| 
- 371| // viewHandler routes /view/ requests based on path suffix.
- 372| // Go's ServeMux requires wildcards to span a full path segment,
- 373| // so patterns like /view/{id}.html are invalid; we dispatch manually here.
- 374| func viewHandler(w http.ResponseWriter, r *http.Request) {
- 375| 	path := strings.TrimPrefix(r.URL.Path, config.Webroot+"view/")
- 376| 	switch {
- 377| 	case strings.HasSuffix(path, ".html"):
- 378| 		apiv1.GetMessageHTML(w, r)
- 379| 	case strings.HasSuffix(path, ".txt"):
- 380| 		apiv1.GetMessageText(w, r)
- 381| 	default:
- 382| 		index(w, r)
- 383| 	}
- 384| }
- 385| 
- 386| // Websocket to broadcast changes.
- 387| // Authentication and CORS are handled by middleWareFunc before this is reached.
- 388| func apiWebsocket(w http.ResponseWriter, r *http.Request) {
- 389| 	websockets.ServeWs(websockets.MessageHub, w, r)
- 390| 	storage.BroadcastMailboxStats()
- 391| }
- 392| 
- 393| // Wrapper to artificially inject a basePath to the swagger.json if a webroot has been specified
- 394| func swaggerBasePath(w http.ResponseWriter, _ *http.Request) {
- 395| 	f, err := distFS.ReadFile("ui/api/v1/swagger.json")
- 396| 	if err != nil {
- 397| 		panic(err)
- 398| 	}
- 399| 
- 400| 	if config.Webroot != "/" {
- 401| 		// artificially inject a path at the start
- 402| 		replacement := fmt.Sprintf("{\n  \"basePath\": \"%s\",", strings.TrimRight(config.Webroot, "/"))
- 403| 
- 404| 		f = bytes.Replace(f, []byte("{"), []byte(replacement), 1)
- 405| 	}
- 406| 
- 407| 	w.Header().Add("Content-Type", "application/json")
- 408| 	_, _ = w.Write(f)
- 409| }
- 410| 
- 411| // Just returns the default HTML template
- 412| func index(w http.ResponseWriter, r *http.Request) {
- 413| 
- 414| 	var h = `<!DOCTYPE html>
- 415| <html lang="en" class="h-100">
+ 319|         $types = array_map(function ($value) use ($includeDot) {
+ 320|             $value = trim($value);
+ 321| 
+ 322|             if (substr($value, 0, 1) == '.') {
+ 323|                 $value = substr($value, 1);
+ 324|             }
+ 325| 
+ 326|             if ($includeDot) {
+ 327|                 $value = '.'.$value;
+ 328|             }
+ 329| 
+ 330|             return $value;
+ 331|         }, $types);
+ 332| 
+ 333|         return implode(',', $types);
+ 334|     }
+ 335| 
+ 336|     /**
+ 337|      * Removes a file attachment.
+ 338|      */
+ 339|     public function onRemoveAttachment(): void
+ 340|     {
+ 341|         if ($file = $this->getFileRecord()) {
+ 342|             $this->getRelationObject()->remove($file, $this->sessionKey);
+ 343|         }
+ 344|     }
+ 345| 
+ 346|     /**
+ 347|      * Sorts file attachments.
+ 348|      *
+ 349|      * Expects (array) sortOrder [$fileId => $fileOrder] in the POST data.
+ 350|      */
+ 351|     public function onSortAttachments(): void
+ 352|     {
+ 353|         if ($sortData = post('sortOrder')) {
+ 354|             $ids = array_keys($sortData);
+ 355|             $orders = array_values($sortData);
+ 356| 
+ 357|             $fileModel = $this->getRelationModel();
+ 358|             $fileModel->setSortableOrder($ids, $orders);
+ 359|         }
+ 360|     }
+ 361| 
+ 362|     /**
+ 363|      * Loads the configuration form for an attachment, allowing title and description to be set.
+ 364|      *
+ 365|      * @throws ApplicationException if unable to find the file record
+ 366|      */
+ 367|     public function onLoadAttachmentConfig(): string
+ 368|     {
+ 369|         if ($file = $this->getFileRecord()) {
+ 370|             $file = $this->decorateFileAttributes($file);
+ 371| 
+ 372|             $this->vars['file'] = $file;
+ 373|             $this->vars['displayMode'] = $this->getDisplayMode();
+ 374|             $this->vars['cssDimensions'] = $this->getCssDimensions();
+ 375|             $this->vars['parentElementId'] = $this->getId();
+ 376| 
+ 377|             return $this->makePartial('config_form');
+ 378|         }
+ 379| 
+ 380|         throw new ApplicationException('Unable to find file, it may no longer exist');
+ 381|     }
+ 382| 
+ 383|     /**
+ 384|      * Commit the changes of the attachment configuration form.
+ 385|      */
+ 386|     public function onSaveAttachmentConfig()
+ 387|     {
+ 388|         try {
+ 389|             $formWidget = $this->getConfigFormWidget();
+ 390|             if ($file = $formWidget->model) {
+ 391|                 $modelsToSave = $this->prepareModelsToSave($file, $formWidget->getSaveData());
+ 392|                 Db::transaction(function () use ($modelsToSave, $formWidget) {
+ 393|                     foreach ($modelsToSave as $modelToSave) {
+ 394|                         $modelToSave->save(null, $formWidget->getSessionKey());
+ 395|                     }
+ 396|                 });
+ 397| 
+ 398|                 return ['displayName' => $file->title ?: $file->file_name];
+ 399|             }
+ 400| 
+ 401|             throw new ApplicationException('Unable to find file, it may no longer exist');
+ 402|         }
+ 403|         catch (Exception $ex) {
+ 404|             return json_encode(['error' => $ex->getMessage()]);
+ 405|         }
+ 406|     }
+ 407| 
+ 408|     /**
+ 409|      * @inheritDoc
+ 410|      */
+ 411|     protected function loadAssets()
+ 412|     {
+ 413|         $this->addCss('css/fileupload.css', 'core');
+ 414|         $this->addJs('js/fileupload.js', 'core');
+ 415|     }
  416| 
- 417| <head>
- 418| 	<meta charset="utf-8">
- 419| 	<meta name="viewport" content="width=device-width,initial-scale=1.0">
- 420| 	<meta name="referrer" content="no-referrer">
- 421| 	<meta name="robots" content="noindex, nofollow, noarchive">
- 422| 	<link rel="icon" href="{{ .Webroot }}favicon.svg">
- 423| 	<title>Mailpit</title>
- 424| 	<link rel=stylesheet href="{{ .Webroot }}dist/app.css?{{ .Version }}">
- 425| </head>
- 426| 
- 427| <body class="h-100">
- 428| 	<div class="container-fluid h-100 d-flex flex-column" id="app" data-webroot="{{ .Webroot }}" data-version="{{ .Version }}">
- 429| 		<noscript class="alert alert-warning position-absolute top-50 start-50 translate-middle">
- 430| 			You need a browser with JavaScript enabled to use Mailpit
- 431| 		</noscript>
- 432| 	</div>
- 433| 
- 434| 	<script src="{{ .Webroot }}dist/app.js?{{ .Version }}" nonce="{{ .Nonce }}"></script>
- 435| </body>
- 436| 
- 437| </html>`
- 438| 
- 439| 	t, err := template.New("index").Parse(h)
- 440| 	if err != nil {
- 441| 		panic(err)
- 442| 	}
- 443| 
- 444| 	data := struct {
- 445| 		Webroot string
- 446| 		Version string
- 447| 		Nonce   string
- 448| 	}{
- 449| 		Webroot: config.Webroot,
- 450| 		Version: config.Version,
- 451| 		Nonce:   r.Header.Get("mp-nonce"),
- 452| 	}
- 453| 
- 454| 	buff := new(bytes.Buffer)
- 455| 
- 456| 	err = t.Execute(buff, data)
- 457| 	if err != nil {
- 458| 		panic(err)
- 459| 	}
+ 417|     /**
+ 418|      * @inheritDoc
+ 419|      */
+ 420|     public function getSaveValue($value)
+ 421|     {
+ 422|         return FormField::NO_SAVE_DATA;
+ 423|     }
+ 424| 
+ 425|     /**
+ 426|      * Upload handler for the server-side processing of uploaded files
+ 427|      */
+ 428|     public function onUpload()
+ 429|     {
+ 430|         try {
+ 431|             $file = $this->getRelationModel();
+ 432|             $fileRelation = $this->getRelationObject();
+ 433|             $file->is_public = $fileRelation->isPublic();
+ 434| 
+ 435|             /**
+ 436|              * @event backend.formwidgets.fileupload.onUpload
+ 437|              * Provides an opportunity to process the file upload using custom logic.
+ 438|              *
+ 439|              * Example usage ()
+ 440|              */
+ 441|             if (!($data = Event::fire('backend.formwidgets.fileupload.onUpload', [$this, $file], true))) {
+ 442|                 if (!Input::hasFile('file_data')) {
+ 443|                     throw new ApplicationException('File missing from request');
+ 444|                 }
+ 445| 
+ 446|                 $validationRules = ['max:'.$file::getMaxFilesize()];
+ 447|                 $data = Input::file('file_data');
+ 448| 
+ 449|                 if (!$data->isValid()) {
+ 450|                     throw new ApplicationException('File is not valid');
+ 451|                 }
+ 452| 
+ 453|                 if ($fileTypes = $this->getAcceptedFileTypes()) {
+ 454|                     $validationRules[] = 'extensions:'.$fileTypes;
+ 455|                 }
+ 456| 
+ 457|                 if ($this->mimeTypes) {
+ 458|                     $validationRules[] = 'mimes:'.$this->mimeTypes;
+ 459|                 }
  460| 
- 461| 	w.Header().Add("Content-Type", "text/html; charset=utf-8")
- 462| 	_, _ = w.Write(buff.Bytes())
- 463| }
- 464| 
+ 461|                 $validation = Validator::make(
+ 462|                     ['file_data' => $data],
+ 463|                     ['file_data' => $validationRules]
+ 464|                 );
  465| 
+ 466|                 if ($validation->fails()) {
+ 467|                     throw new ValidationException($validation);
+ 468|                 }
+ 469|             }
+ 470| 
+ 471|             $file->data = $data;
+ 472|             $file->save();
+ 473| 
+ 474|             /**
+ 475|              * Attach directly to the parent model if it exists and attachOnUpload has been set to true
+ 476|              * else attach via deferred binding
+ 477|              */
+ 478|             $parent = $fileRelation->getParent();
+ 479|             if ($this->attachOnUpload && $parent && $parent->exists) {
+ 480|                 $fileRelation->add($file);
+ 481|             }
+ 482|             else {
+ 483|                 $fileRelation->add($file, $this->sessionKey);
+ 484|             }
+ 485| 
+ 486|             $file = $this->decorateFileAttributes($file);
+ 487| 
+ 488|             $result = [
+ 489|                 'id' => $file->id,
+ 490|                 'thumb' => $file->thumbUrl,
+ 491|                 'path' => $file->pathUrl
+ 492|             ];
+ 493| 
+ 494|             $response = Response::make($result, 200);
+ 495|         }
+ 496|         catch (Exception $ex) {
+ 497|             $response = Response::make($ex->getMessage(), 400);
+ 498|         }
+ 499| 
+ 500|         return $response;
+ 501|     }
+ 502| 
+ 503|     /**
+ 504|      * Adds the bespoke attributes used internally by this widget.
+ 505|      * - thumbUrl
+ 506|      * - pathUrl
+ 507|      * @return System\Models\File
+ 508|      */
+ 509|     protected function decorateFileAttributes($file)
+ 510|     {
+ 511|         $path = $thumb = $file->getPath();
+ 512| 
+ 513|         if ($this->imageWidth || $this->imageHeight) {
+ 514|             $thumb = $file->getThumb($this->imageWidth, $this->imageHeight, $this->thumbOptions);
+ 515|         }
+ 516| 
+ 517|         $file->pathUrl = $path;
+ 518|         $file->thumbUrl = $thumb;
+ 519| 
+ 520|         return $file;
+ 521|     }
+ 522| 
+ 523|     /**
+ 524|      * Return max upload filesize in Mb
+ 525|      * @return integer
+ 526|      */
+ 527|     protected function getUploadMaxFilesize()
+ 528|     {
+ 529|         $size = ini_get('upload_max_filesize');
+ 530|         if (preg_match('/^([\d\.]+)([KMG])$/i', $size, $match)) {
+ 531|             $pos = array_search(strtoupper($match[2]), ['K', 'M', 'G']);
+ 532|             if ($pos !== false) {
+ 533|                 $size = $match[1] * pow(1024, $pos + 1);
+ 534|             }
+ 535|         }
+ 536|         return floor($size / 1024 / 1024);
+ 537|     }
+ 538| }
+ 539| 
+ 540| 
+
+### id=7790 lang=php
+[CODE]
+   1| <?php
+   2| 
+   3| namespace Backend\FormWidgets;
+   4| 
+   5| use Backend\Classes\FormField;
+   6| use Backend\Classes\FormWidgetBase;
+   7| use Backend\Widgets\Form;
+   8| use Exception;
+   9| use Illuminate\Support\Facades\Response;
+  10| use System\Models\File;
+  11| use Winter\Storm\Exception\ApplicationException;
+  12| use Winter\Storm\Exception\ValidationException;
+  13| use Winter\Storm\Filesystem\Definitions as FileDefinitions;
+  14| use Winter\Storm\Support\Facades\DB;
+  15| use Winter\Storm\Support\Facades\Event;
+  16| use Winter\Storm\Support\Facades\Input;
+  17| use Winter\Storm\Support\Facades\Validator;
+  18| 
+  19| /**
+  20|  * File upload field
+  21|  * Renders a form file uploader field.
+  22|  *
+  23|  * Supported options:
+  24|  * - mode: image-single, image-multi, file-single, file-multi
+  25|  * - upload-label: Add file
+  26|  * - empty-label: No file uploaded
+  27|  *
+  28|  * @package winter\wn-backend-module
+  29|  * @author Alexey Bobkov, Samuel Georges
+  30|  */
+  31| class FileUpload extends FormWidgetBase
+  32| {
+  33|     use \Backend\Traits\FormModelSaver;
+  34|     use \Backend\Traits\FormModelWidget;
+  35| 
+  36|     //
+  37|     // Configurable properties
+  38|     //
+  39| 
+  40|     /**
+  41|      * @var string Icon class to use for the upload button.
+  42|      */
+  43|     public $iconClass;
+  44| 
+  45|     /**
+  46|      * @var string Prompt text to display for the upload button.
+  47|      */
+  48|     public $prompt;
+  49| 
+  50|     /**
+  51|      * @var int Preview image width
+  52|      */
+  53|     public $imageWidth;
+  54| 
+  55|     /**
+  56|      * @var int Preview image height
+  57|      */
+  58|     public $imageHeight;
+  59| 
+  60|     /**
+  61|      * @var mixed Collection of acceptable file types.
+  62|      */
+  63|     public $fileTypes = false;
+  64| 
+  65|     /**
+  66|      * @var mixed Collection of acceptable mime types.
+  67|      */
+  68|     public $mimeTypes = false;
+  69| 
+  70|     /**
+  71|      * @var mixed Max file size.
+  72|      */
+  73|     public $maxFilesize;
+  74| 
+  75|     /**
+  76|      * @var array Options used for generating thumbnails.
+  77|      */
+  78|     public $thumbOptions = [
+  79|         'mode'      => 'crop',
+  80|         'extension' => 'auto'
+  81|     ];
+  82| 
+  83|     /**
+  84|      * @var boolean Allow the user to set a caption.
+  85|      */
+  86|     public $useCaption = true;
+  87| 
+  88|     /**
+  89|      * @var boolean Automatically attaches the uploaded file on upload if the parent record exists instead of using deferred binding to attach on save of the parent record. Defaults to false.
+  90|      */
+  91|     public $attachOnUpload = false;
+  92| 
+  93|     //
+  94|     // Object properties
+  95|     //
+  96| 
+  97|     /**
+  98|      * @inheritDoc
+  99|      */
+ 100|     protected $defaultAlias = 'fileupload';
+ 101| 
+ 102|     /**
+ 103|      * @var Form The embedded form for modifying the properties of the selected file
+ 104|      */
+ 105|     protected $configFormWidget;
+ 106| 
+ 107|     /**
+ 108|      * @inheritDoc
+ 109|      */
+ 110|     public function init()
+ 111|     {
+ 112|         $this->maxFilesize = $this->getUploadMaxFilesize();
+ 113| 
+ 114|         $this->fillFromConfig([
+ 115|             'iconClass',
+ 116|             'prompt',
+ 117|             'imageWidth',
+ 118|             'imageHeight',
+ 119|             'fileTypes',
+ 120|             'maxFilesize',
+ 121|             'mimeTypes',
+ 122|             'thumbOptions',
+ 123|             'useCaption',
+ 124|             'attachOnUpload',
+ 125|         ]);
+ 126| 
+ 127|         $this->iconClass = $this->iconClass ?? 'icon-upload';
+ 128| 
+ 129|         if ($this->formField->disabled) {
+ 130|             $this->previewMode = true;
+ 131|         }
+ 132| 
+ 133|         $this->getConfigFormWidget();
+ 134|     }
+ 135| 
+ 136|     /**
+ 137|      * @inheritDoc
+ 138|      */
+ 139|     public function render()
+ 140|     {
+ 141|         $this->prepareVars();
+ 142|         return $this->makePartial('fileupload');
+ 143|     }
+ 144| 
+ 145|     /**
+ 146|      * Prepares the view data
+ 147|      */
+ 148|     protected function prepareVars()
+ 149|     {
+ 150|         if ($this->formField->disabled) {
+ 151|             $this->previewMode = true;
+ 152|         }
+ 153| 
+ 154|         if ($this->previewMode) {
+ 155|             $this->useCaption = false;
+ 156|         }
+ 157| 
+ 158|         if ($this->maxFilesize > $this->getUploadMaxFilesize()) {
+ 159|             throw new ApplicationException('Maximum allowed size for uploaded files: ' . $this->getUploadMaxFilesize());
+ 160|         }
+ 161| 
+ 162|         $this->vars['fileList'] = $fileList = $this->getFileList();
+ 163|         $this->vars['singleFile'] = $fileList->first();
+ 164|         $this->vars['displayMode'] = $this->getDisplayMode();
+ 165|         $this->vars['emptyIcon'] = $this->getConfig('emptyIcon', 'icon-upload');
+ 166|         $this->vars['imageHeight'] = $this->imageHeight;
+ 167|         $this->vars['imageWidth'] = $this->imageWidth;
+ 168|         $this->vars['acceptedFileTypes'] = $this->getAcceptedFileTypes(true);
+ 169|         $this->vars['maxFilesize'] = $this->maxFilesize;
+ 170|         $this->vars['cssDimensions'] = $this->getCssDimensions();
+ 171|         $this->vars['cssBlockDimensions'] = $this->getCssDimensions('block');
+ 172|         $this->vars['useCaption'] = $this->useCaption;
+ 173|         $this->vars['iconClass'] = $this->iconClass;
+ 174|         $this->vars['prompt'] = $this->getPromptText();
+ 175|     }
+ 176| 
+ 177|     /**
+ 178|      * Get the file record for this request, returns false if none available
+ 179|      *
+ 180|      * @return File|false
+ 181|      */
+ 182|     protected function getFileRecord()
+ 183|     {
+ 184|         $record = false;
+ 185| 
+ 186|         if (!empty(post('file_id'))) {
+ 187|             // Scope the lookup to this widget's own relation (including any files
+ 188|             // bound via the current deferred-binding session) so that an
+ 189| 
+ 190|             // System\Models\File record belonging to another model. See
+ 191|             // GHSA-3277-h8g9-qj5f.
+ 192|             $record = $this->getRelationObject()
+ 193|                 ->withDeferred($this->sessionKey)
+ 194|                 ->find(post('file_id')) ?: false;
+ 195|         }
+ 196| 
+ 197|         return $record;
+ 198|     }
+ 199| 
+ 200|     /**
+ 201|      * Get the instantiated config Form widget
+ 202|      */
+ 203|     public function getConfigFormWidget(): Form
+ 204|     {
+ 205|         if ($this->configFormWidget) {
+ 206|             return $this->configFormWidget;
+ 207|         }
+ 208| 
+ 209|         $config = $this->makeConfig('~/modules/system/models/file/fields.yaml');
+ 210|         $config->model = $this->getFileRecord() ?: $this->getRelationModel();
+ 211|         $config->alias = $this->alias . $this->defaultAlias;
+ 212|         $config->arrayName = $this->getFieldName();
+ 213| 
+ 214|         $widget = $this->makeWidget(Form::class, $config);
+ 215|         $widget->bindToController();
+ 216| 
+ 217|         return $this->configFormWidget = $widget;
+ 218|     }
+ 219| 
+ 220|     protected function getFileList()
+ 221|     {
+ 222|         $list = $this
+ 223|             ->getRelationObject()
+ 224|             ->withDeferred($this->sessionKey)
+ 225|             ->orderBy('sort_order')
+ 226|             ->get()
+ 227|         ;
+ 228| 
+ 229|         /*
+ 230|          * Decorate each file with thumb and custom download path
+ 231|          */
+ 232|         $list->each(function ($file) {
+ 233|             $this->decorateFileAttributes($file);
+ 234|         });
+ 235| 
+ 236|         return $list;
+ 237|     }
+ 238| 
+ 239|     /**
+ 240|      * Returns the display mode for the file upload. Eg: file-multi, image-single, etc.
+ 241|      */
+ 242|     protected function getDisplayMode(): string
+ 243|     {
+ 244|         $mode = $this->getConfig('mode', 'image');
+ 245| 
+ 246|         if (str_contains($mode, '-')) {
+ 247|             return $mode;
+ 248|         }
+ 249| 
+ 250|         $relationType = $this->getRelationType();
+ 251|         $mode .= ($relationType === 'attachMany' || $relationType === 'morphMany') ? '-multi' : '-single';
+ 252| 
+ 253|         return $mode;
+ 254|     }
+ 255| 
+ 256|     /**
+ 257|      * Returns the escaped and translated prompt text to display according to the type.
+ 258|      */
+ 259|     protected function getPromptText(): string
+ 260|     {
+ 261|         if ($this->prompt === null) {
+ 262|             $isMulti = ends_with($this->getDisplayMode(), 'multi');
+ 263|             $this->prompt = $isMulti
+ 264|                 ? 'backend::lang.fileupload.upload_file'
+ 265|                 : 'backend::lang.fileupload.default_prompt';
+ 266|         }
+ 267| 
+ 268|         $uploadIconStr = sprintf('<i class="%s"></i>', $this->iconClass);
+ 269|         return str_replace('%s', $uploadIconStr, e(trans($this->prompt)));
+ 270|     }
+ 271| 
+ 272|     /**
+ 273|      * Returns the CSS dimensions for the uploaded image,
+ 274|      * uses auto where no dimension is provided.
+ 275|      */
+ 276|     protected function getCssDimensions(?string $mode = null): string
+ 277|     {
+ 278|         if (!$this->imageWidth && !$this->imageHeight) {
+ 279|             return '';
+ 280|         }
+ 281| 
+ 282|         $cssDimensions = '';
+ 283| 
+ 284|         if ($mode == 'block') {
+ 285|             $cssDimensions .= $this->imageWidth
+ 286|                 ? 'width: ' . $this->imageWidth . 'px;'
+ 287|                 : 'width: ' . $this->imageHeight . 'px;';
+ 288| 
+ 289|             $cssDimensions .= ($this->imageHeight)
+ 290|                 ? 'max-height: ' . $this->imageHeight . 'px;'
+ 291|                 : 'height: auto;';
+ 292|         } else {
+ 293|             $cssDimensions .= $this->imageWidth
+ 294|                 ? 'width: ' . $this->imageWidth . 'px;'
+ 295|                 : 'width: auto;';
+ 296| 
+ 297|             $cssDimensions .= ($this->imageHeight)
+ 298|                 ? 'max-height: ' . $this->imageHeight . 'px;'
+ 299|                 : 'height: auto;';
+ 300|         }
+ 301| 
+ 302|         return $cssDimensions;
+ 303|     }
+ 304| 
+ 305|     /**
+ 306|      * Returns the specified accepted file types, or the default
+ 307|      * based on the mode. Image mode will return:
+ 308|      * - jpg,jpeg,bmp,png,gif,svg
+ 309|      * @return string
+ 310|      */
+ 311|     public function getAcceptedFileTypes($includeDot = false)
+ 312|     {
+ 313|         $types = $this->fileTypes;
+ 314| 
+ 315|         if ($types === false) {
+ 316|             $isImage = starts_with($this->getDisplayMode(), 'image');
+ 317|             $types = implode(',', FileDefinitions::get($isImage ? 'imageExtensions' : 'defaultExtensions'));
+ 318|         }
+ 319| 
+ 320|         if (!$types || $types == '*') {
+ 321|             return null;
+ 322|         }
+ 323| 
+ 324|         if (!is_array($types)) {
+ 325|             $types = explode(',', $types);
+ 326|         }
+ 327| 
+ 328|         $types = array_map(function ($value) use ($includeDot) {
+ 329|             $value = trim($value);
+ 330| 
+ 331|             if (substr($value, 0, 1) == '.') {
+ 332|                 $value = substr($value, 1);
+ 333|             }
+ 334| 
+ 335|             if ($includeDot) {
+ 336|                 $value = '.'.$value;
+ 337|             }
+ 338| 
+ 339|             return $value;
+ 340|         }, $types);
+ 341| 
+ 342|         return implode(',', $types);
+ 343|     }
+ 344| 
+ 345|     /**
+ 346|      * Removes a file attachment.
+ 347|      */
+ 348|     public function onRemoveAttachment(): void
+ 349|     {
+ 350|         if ($file = $this->getFileRecord()) {
+ 351|             $this->getRelationObject()->remove($file, $this->sessionKey);
+ 352|         }
+ 353|     }
+ 354| 
+ 355|     /**
+ 356|      * Sorts file attachments.
+ 357|      *
+ 358|      * Expects (array) sortOrder [$fileId => $fileOrder] in the POST data.
+ 359|      */
+ 360|     public function onSortAttachments(): void
+ 361|     {
+ 362|         if ($sortData = post('sortOrder')) {
+ 363|             // Only reorder files that actually belong to this widget's relation
+ 364|             // (including the current deferred-binding session), never arbitrary
+ 365|             // System\Models\File rows referenced by a posted id. See
+ 366|             // GHSA-3277-h8g9-qj5f.
+ 367|             $keyName = $this->getRelationModel()->getKeyName();
+ 368|             $validIds = $this->getRelationObject()
+ 369|                 ->withDeferred($this->sessionKey)
+ 370|                 ->pluck($keyName)
+ 371|                 ->all();
+ 372| 
+ 373|             $sortData = array_intersect_key($sortData, array_flip($validIds));
+ 374|             if (empty($sortData)) {
+ 375|                 return;
+ 376|             }
+ 377| 
+ 378|             $ids = array_keys($sortData);
+ 379|             $orders = array_values($sortData);
+ 380| 
+ 381|             $this->getRelationModel()->setSortableOrder($ids, $orders);
+ 382|         }
+ 383|     }
+ 384| 
+ 385|     /**
+ 386|      * Loads the configuration form for an attachment, allowing title and description to be set.
+ 387|      *
+ 388|      * @throws ApplicationException if unable to find the file record
+ 389|      */
+ 390|     public function onLoadAttachmentConfig(): string
+ 391|     {
+ 392|         if ($file = $this->getFileRecord()) {
+ 393|             $file = $this->decorateFileAttributes($file);
+ 394| 
+ 395|             $this->vars['file'] = $file;
+ 396|             $this->vars['displayMode'] = $this->getDisplayMode();
+ 397|             $this->vars['cssDimensions'] = $this->getCssDimensions();
+ 398|             $this->vars['parentElementId'] = $this->getId();
+ 399| 
+ 400|             return $this->makePartial('config_form');
+ 401|         }
+ 402| 
+ 403|         throw new ApplicationException('Unable to find file, it may no longer exist');
+ 404|     }
+ 405| 
+ 406|     /**
+ 407|      * Commit the changes of the attachment configuration form.
+ 408|      */
+ 409|     public function onSaveAttachmentConfig()
+ 410|     {
+ 411|         try {
+ 412|             $formWidget = $this->getConfigFormWidget();
+ 413|             if ($file = $formWidget->model) {
+ 414|                 $modelsToSave = $this->prepareModelsToSave($file, $formWidget->getSaveData());
+ 415|                 Db::transaction(function () use ($modelsToSave, $formWidget) {
+ 416|                     foreach ($modelsToSave as $modelToSave) {
+ 417|                         $modelToSave->save(null, $formWidget->getSessionKey());
+ 418|                     }
+ 419|                 });
+ 420| 
+ 421|                 return ['displayName' => $file->title ?: $file->file_name];
+ 422|             }
+ 423| 
+ 424|             throw new ApplicationException('Unable to find file, it may no longer exist');
+ 425|         }
+ 426|         catch (Exception $ex) {
+ 427|             return json_encode(['error' => $ex->getMessage()]);
+ 428|         }
+ 429|     }
+ 430| 
+ 431|     /**
+ 432|      * @inheritDoc
+ 433|      */
+ 434|     protected function loadAssets()
+ 435|     {
+ 436|         $this->addCss('css/fileupload.css', 'core');
+ 437|         $this->addJs('js/fileupload.js', 'core');
+ 438|     }
+ 439| 
+ 440|     /**
+ 441|      * @inheritDoc
+ 442|      */
+ 443|     public function getSaveValue($value)
+ 444|     {
+ 445|         return FormField::NO_SAVE_DATA;
+ 446|     }
+ 447| 
+ 448|     /**
+ 449|      * Upload handler for the server-side processing of uploaded files
+ 450|      */
+ 451|     public function onUpload()
+ 452|     {
+ 453|         try {
+ 454|             $file = $this->getRelationModel();
+ 455|             $fileRelation = $this->getRelationObject();
+ 456|             $file->is_public = $fileRelation->isPublic();
+ 457| 
+ 458|             /**
+ 459|              * @event backend.formwidgets.fileupload.onUpload
+ 460|              * Provides an opportunity to process the file upload using custom logic.
+ 461|              *
+ 462|              * Example usage ()
+ 463|              */
+ 464|             if (!($data = Event::fire('backend.formwidgets.fileupload.onUpload', [$this, $file], true))) {
+ 465|                 if (!Input::hasFile('file_data')) {
+ 466|                     throw new ApplicationException('File missing from request');
+ 467|                 }
+ 468| 
+ 469|                 $validationRules = ['max:'.$file::getMaxFilesize()];
+ 470|                 $data = Input::file('file_data');
+ 471| 
+ 472|                 if (!$data->isValid()) {
+ 473|                     throw new ApplicationException('File is not valid');
+ 474|                 }
+ 475| 
+ 476|                 if ($fileTypes = $this->getAcceptedFileTypes()) {
+ 477|                     $validationRules[] = 'extensions:'.$fileTypes;
+ 478|                 }
+ 479| 
+ 480|                 if ($this->mimeTypes) {
+ 481|                     $validationRules[] = 'mimes:'.$this->mimeTypes;
+ 482|                 }
+ 483| 
+ 484|                 $validation = Validator::make(
+ 485|                     ['file_data' => $data],
+ 486|                     ['file_data' => $validationRules]
+ 487|                 );
+ 488| 
+ 489|                 if ($validation->fails()) {
+ 490|                     throw new ValidationException($validation);
+ 491|                 }
+ 492|             }
+ 493| 
+ 494|             $file->data = $data;
+ 495|             $file->save();
+ 496| 
+ 497|             /**
+ 498|              * Attach directly to the parent model if it exists and attachOnUpload has been set to true
+ 499|              * else attach via deferred binding
+ 500|              */
+ 501|             $parent = $fileRelation->getParent();
+ 502|             if ($this->attachOnUpload && $parent && $parent->exists) {
+ 503|                 $fileRelation->add($file);
+ 504|             }
+ 505|             else {
+ 506|                 $fileRelation->add($file, $this->sessionKey);
+ 507|             }
+ 508| 
+ 509|             $file = $this->decorateFileAttributes($file);
+ 510| 
+ 511|             $result = [
+ 512|                 'id' => $file->id,
+ 513|                 'thumb' => $file->thumbUrl,
+ 514|                 'path' => $file->pathUrl
+ 515|             ];
+ 516| 
+ 517|             $response = Response::make($result, 200);
+ 518|         }
+ 519|         catch (Exception $ex) {
+ 520|             $response = Response::make($ex->getMessage(), 400);
+ 521|         }
+ 522| 
+ 523|         return $response;
+ 524|     }
+ 525| 
+ 526|     /**
+ 527|      * Adds the bespoke attributes used internally by this widget.
+ 528|      * - thumbUrl
+ 529|      * - pathUrl
+ 530|      * @return System\Models\File
+ 531|      */
+ 532|     protected function decorateFileAttributes($file)
+ 533|     {
+ 534|         $path = $thumb = $file->getPath();
+ 535| 
+ 536|         if ($this->imageWidth || $this->imageHeight) {
+ 537|             $thumb = $file->getThumb($this->imageWidth, $this->imageHeight, $this->thumbOptions);
+ 538|         }
+ 539| 
+ 540|         $file->pathUrl = $path;
+ 541|         $file->thumbUrl = $thumb;
+ 542| 
+ 543|         return $file;
+ 544|     }
+ 545| 
+ 546|     /**
+ 547|      * Return max upload filesize in Mb
+ 548|      * @return integer
+ 549|      */
+ 550|     protected function getUploadMaxFilesize()
+ 551|     {
+ 552|         $size = ini_get('upload_max_filesize');
+ 553|         if (preg_match('/^([\d\.]+)([KMG])$/i', $size, $match)) {
+ 554|             $pos = array_search(strtoupper($match[2]), ['K', 'M', 'G']);
+ 555|             if ($pos !== false) {
+ 556|                 $size = $match[1] * pow(1024, $pos + 1);
+ 557|             }
+ 558|         }
+ 559|         return floor($size / 1024 / 1024);
+ 560|     }
+ 561| }
+ 562| 
+ 563| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=7779 teacher=unknown flags=[]
+### id=7789 teacher=unknown flags=[]
 [ANALYSIS]
-## 编号分析（按代码顺序，行号为代码块内相对位置）
+## 编号分析（全文通读）
 
-1. **第 55–150 行 Listen() 路由枚举**：入口点包括 livez/readyz 健康检查、`GET .../proxy`（代理处理器）、dist/api 静态文件、`view/latest`、`view/`（viewHandler 手工分发）、search、webroot 根路径；apiRoutes 中约 25 个 REST 端点、chaos 端点、metrics、`api/events` WebSocket。所有业务路由均经 `middleWareFunc` 或 `sendAPIAuthMiddleware` 包装。
+1. **第 40 行起：类定义与配置属性**。`$fileTypes`、`$mimeTypes`、`$maxFilesize` 等均来自 YAML 配置（开发者定义），非用户输入，不构成 source。
 
-2. **第 152–172 行 sendAPIAuthMiddleware**：通过 context 注入 `skipUIAuthKey` 与 `bodyLimitKey`。两个 key 均为私有类型 `contextKey`，外部请求无法伪造 context 值，故“绕过 UI 认证”仅对 `/api/v1/send` 生效且受 SendAPICredentials / AcceptAny 配置控制——若管理员设置 `SendAPIAuthAcceptAny=true` 则发送接口完全无认证，但这是显式配置行为，非漏洞。
+2. **第 88–115 行 `init()`**：`fillFromConfig` 从字段配置读取，非请求输入；无漏洞。
 
-3. **第 205–270 行 middleWareFunc —— 关键点一：CORS 反射 Origin**。第 226–236 行：凡路径前缀匹配 `Webroot+"api/"` 或正则 `htmlPreviewRouteRe` 匹配，即调用 `corsOriginAccessControl(r)` 判定后直接执行：
-   `w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))`
-   即 **ACAO 头完全反射攻击者可控的 Origin 请求头**，并配合 `Access-Control-Allow-Headers: *`。防御有效性取决于未在本文件展示的 `corsOriginAccessControl`；按分析要求，任何基于黑名单/正则/可配置列表的校验视为可绕过（例如子域接管、配置为 `*` 或宽松默认值时）。Mailpit 存储的是含密码重置链接、token 的真实邮件；UI BasicAuth 凭据由浏览器自动附带（同站 cookie 类似语义），一旦恶意源被放行，即可跨源读取全部邮件数据（GetMessages、DownloadRaw 等 GET 无需 CSRF token）。这是典型的 CWE-942（Permissive Cross-domain Policy with Untrusted Domains）/ 反射型 ACAO 数据泄露。
+3. **第 118–124 行 `render()` / `prepareVars()`**：仅渲染，输出经 `e()` 转义（见 `getPromptText()` 第 262–272 行），XSS 面已被覆盖。
 
-4. **关键点二：正则锚定与 RequestURI**。第 219 行 `htmlPreviewRouteRe.MatchString(r.RequestURI)`：RequestURI 含查询串时因 `$` 锚定不匹配，导致带 query 的 `.html` 预览请求**既不做 CORS 校验也不设 ACAO**——这反而安全（无 ACAO 就无跨域读取），不构成漏洞；但说明该 CORS 门控逻辑不一致。
+4. **第 176–189 行 `getFileRecord()` —— 关键 source 点**：
+   ```php
+   $record = $this->getRelationModel()->find(post('file_id')) ?: false;
+   ```
+   `post('file_id')` 是完全由客户端控制的 POST 参数（source）。此处用 `find()` 直接按主键查询关联模型 `System\Models\File`，**没有将查询限定在当前父模型的关联集合内**（未加 `where($parentKey)` 或通过 `$this->getRelationObject()` 查询）。任何能访问该表单部件 AJAX handler 的后端登录用户，可传入任意 `file_id` 操作不属于其权限范围的文件记录。
 
-5. **第 214 行懒初始化竞态**：`htmlPreviewRouteRe == nil` 检查无锁，并发首请求可能重复编译，仅性能问题非安全问题。
+5. **第 296–301 行 `onRemoveAttachment()`（sink #1）**：调用 `getFileRecord()` 后直接 `$this->getRelationObject()->remove($file, ...)` 删除任意 ID 的附件 → **IDOR / 越权删除**。
 
-6. **第 275–287 行 viewHandler**：手工 TrimPrefix + 后缀分发到 GetMessageHTML/GetMessageText/index。id 提取在 apiv1 包内（本文件不可见），但分发本身不含路径拼接文件读取，无目录遍历 sink。
+6. **第 322–333 行 `onLoadAttachmentConfig()`（sink #2）**：同样使用 `getFileRecord()`，可读取任意文件记录的标题、路径等元数据并渲染返回 → 信息泄露。
 
-7. **第 316–360 行 index()**：模板注入 `mp-nonce`（第 349 行取自请求头）。该头在第 218 行由服务端用 `shortuuid.New()` **覆盖生成**，客户端传入值被无条件替换，故无反射 XSS。CSP 替换依赖 config.ContentSecurityPolicy 含字面量 `script-src 'self';`，若配置缺失则 nonce 防护失效，属配置脆弱性。
+7. **第 340–358 行 `onSaveAttachmentConfig()`（sink #3）**：`$formWidget->model` 来自 `getConfigFormWidget()` 第 199 行的 `getFileRecord() ?: $this->getRelationModel()`；随后 `prepareModelsToSave` + `save()` 将表单数据写入该文件模型 → 可篡改任意文件的 title/description 等字段。
 
-8. **第二入口核查**：`proxy`（handlers.ProxyHandler，SSRF 经典点）与 WebSocket `api/events` 均过 middleWareFunc 认证；OPTIONS 预检跳过认证（第 250 行）仅返回空响应，无数据泄露。
+8. **第 306–315 行 `onSortAttachments()`**：`post('sortOrder')` 的键直接传入 `setSortableOrder($ids, $orders)`，同样未校验 ID 归属，可越权重排他人附件排序（低危）。
 
-**结论**：本文件内最可信的漏洞是第 232 行将不可信的 `Origin` 头直接回写为 `Access-Control-Allow-Origin` 并允许任意头，配合浏览器自动附带的 BasicAuth 凭据，构成跨域敏感邮件读取风险（CWE-942）。其余疑点（context 绕过、nonce 回显、懒初始化）经验证均有有效防御或无害。
+9. **第 372–425 行 `onUpload()`**：上传走 `Input::file('file_data')`，有 `max:`、`extensions:` 校验（第 391–398 行）；扩展名黑/白名单虽可能被绕过（如 SVG 存储 XSS），但最终存储名与 MIME 由框架处理，且需后端权限，风险次要。事件钩子（第 385 行）是合法扩展点。
+
+10. **第二入口核查**：`onSortAttachments` 与 `onUpload` 均为独立 AJAX 入口；三者共享同一缺陷根因——基于 `post('file_id')` 的对象引用缺少归属（authorization）校验。防御有效性结论：代码中不存在任何对 `file_id` 所属关系的所有权检查，属缺失型漏洞而非过滤绕过。
+
+**结论**：存在 CWE-639（Authorization Bypass Through User-Controlled Key / IDOR），影响后端已认证用户横向越权操作任意附件，风险中高。
 [JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-942 Permissive Cross-origin Resource Sharing Policy", "risk_level": "High", "source": "line 326: r.Header.Get('Origin') 攻击者可控的 Origin 请求头", "sink": "line 326: w.Header().Set('Access-Control-Allow-Origin', r.Header.Get('Origin')) 且 Access-Control-Allow-Headers 设为 *", "explanation": "middleWareFunc 对所有 Webroot+api/ 及 .html 预览路由将客户端提交的 Origin 头原样反射进 ACAO 响应头，并允许任意自定义头；其前置校验 corsOriginAccessControl 属于可配置/可绕过的域白名单类防御。由于 Mailpit 使用 BasicAuth 且浏览器会自动携带凭据，恶意网站可在受害者浏览邮件时跨源调用 GET api/v1/messages、api/v1/message/{id}/raw 等端点读取含密码重置链接等敏感内容的完整邮件 -> 跨域敏感信息泄露", "fix_suggestion": "line 232-235: 不要反射任意 Origin；仅在 Origin 精确命中服务端配置的可信来源白名单（config.AccessControlAllowOrigin 列表）时回写该 Origin，否则不输出 ACAO 头；同时禁止 Access-Control-Allow-Headers: * ，改为显式白名单，并对跨源请求强制 SameSite/凭据校验"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key", "risk_level": "High", "source": "line 184: post('file_id') 用户可控的 POST 参数", "sink": "line 299: getRelationObject()->remove($file) 以及 line 341-350 onSaveAttachmentConfig 对任意文件模型的保存", "explanation": "getFileRecord 使用 getRelationModel()->find(post('file_id')) 按主键查找文件记录，未将查询范围限定在当前父模型的关联集合内，也未校验该文件属于当前会话或授权的父记录 -> 攻击者（任意后端认证用户）可通过伪造 file_id 在 onRemoveAttachment 删除任意附件、在 onLoadAttachmentConfig 读取任意附件元数据、在 onSaveAttachmentConfig 篡改任意附件属性 -> 水平越权（IDOR）", "fix_suggestion": "line 182: 将查询改为经由关系对象执行，例如 $record = $this->getRelationObject()->withDeferred($this->sessionKey)->where('id', post('file_id'))->first()，或在 find 之后校验 $file 属于当前父模型的关联集合，否则返回 false"}
 
-### id=7780 teacher=unknown flags=[]
+### id=7790 teacher=unknown flags=[]
 [ANALYSIS]
 ## 编号分析
 
-1. **第 30–60 行（Listen 入口）**：路由注册齐全，含 k8s 探针、proxy、dist 静态文件、view、search、根路径。根路径处理（第 55 行附近）显式校验 `r.URL.Path != config.Webroot` 后 404，防止 ServeMux 子树误匹配，防御有效。
+1. **入口点枚举（全文）**：该 widget 的 AJAX 入口共 5 个：`onUpload()`（第 344 行起）、`onRemoveAttachment()`（第 246 行）、`onSortAttachments()`（第 256 行）、`onLoadAttachmentConfig()`（第 288 行）、`onSaveAttachmentConfig()`（第 305 行）。另有渲染路径 `render()/prepareVars()` 和配置表单 `getConfigFormWidget()`。所有入口均受后端认证保护（Backend 控制器），但仍需检查越权。
 
-2. **第 62–120 行（apiRoutes）**：所有 API 路由均经 `middleWareFunc` 包裹；send 端点单独用 `sendAPIAuthMiddleware`。无未认证遗漏的路由。
+2. **`getFileRecord()`（第 152-170 行）**：source 为 `post('file_id')`。关键防御：查询通过 `$this->getRelationObject()->withDeferred($this->sessionKey)->find(...)`，将查找范围限定在当前 widget 所属关系的文件集合内，防止攻击者用任意 `file_id` 操作他人 `System\Models\File` 记录——这正是 GHSA-3277-h8g9-qj5f 的修复。`onRemoveAttachment` 与 `onLoadAttachmentConfig` 均经此函数，有效。
 
-3. **第 130–170 行（sendAPIAuthMiddleware）**：通过 context key `skipUIAuthKey` 传递跳过 UI 认证的意图。该值仅在服务端代码中设置（客户端无法注入 context 值），且仅对 `/api/v1/send` 生效。三种分支：AcceptAny（配置明确允许）、专用 SendAPI 凭据校验、回退 UI 认证。逻辑自洽，无绕过路径。
+3. **`onSortAttachments()`（第 256-277 行）**：source 为 `post('sortOrder')` 数组。先用 `withDeferred` 取出合法 id 集合，再 `array_intersect_key` 过滤，保证只重排本关系内的文件；随后调用 `setSortableOrder($ids, $orders)`，orders 仅作为排序整数值写入，无 SQL 注入（ORM 参数化）。防御有效。
 
-4. **第 200–260 行（middleWareFunc）**：
-   - Body 限制：默认 5MB MaxBytesReader；send 路由由 handler 自行按 `config.MaxMessageSize` 限制（注释说明），不构成 DoS 缺口。
-   - CSP：nonce 由服务端生成并写入请求头 `mp-nonce`，index 模板读取的是该服务端值而非用户输入，无注入。
-   - Basic Auth：`skipUIAuthKey` 与 OPTIONS+CORS 两个豁免条件均有界：前者仅限 send 且需先过 send 认证；OPTIONS 不携带数据，无信息泄露。
-   - CORS：ACAO 回显 Origin 前必须通过 `corsOriginAccessControl(r)` 校验（该函数在 websockets.SetCheckOriginFunc 中复用），本文件内未见黑名单式过滤。
+4. **`onSaveAttachmentConfig()`（第 305-325 行）**：通过内嵌 Form widget 保存，数据由 `fields.yaml` 定义的有限字段（title/description 等）过滤，且模型为第 2 步限定的记录，不存在任意字段写入或跨对象修改。
 
-5. **第 270–290 行（viewHandler）**：仅按后缀 `.html`/`.txt` 分发到 apiv1 处理器，id 由下游按 shortuuid 查库，无文件路径拼接，无遍历风险。
+5. **`onUpload()`（第 344 行起）**：source 为 `Input::file('file_data')`。验证链：`isValid()`、可选 `extensions:` 规则、可选 `mimes:` 规则、max size。注意：
+   - 若开发者未配置 `mimeTypes`，仅做扩展名校验——扩展名黑/白名单可被绕过（如双扩展、大小写），但 Winter 的 `System\Models\File` 存储时对文件名做了处理，且这是框架默认行为而非本代码缺陷；
+   - 默认 image 模式允许 svg 上传，svg 可含脚本导致存储型 XSS——属于已知的设计权衡（后台管理员场景），非本次代码引入的可利用漏洞；
+   - `Event::fire('backend.formwidgets.fileupload.onUpload', ..., true)` 允许插件接管验证，属正常扩展点。
 
-6. **第二入口检查**：POP3（go pop3.Run()）、Unix socket 监听（tools.UnixSocket + os.Chmod 按 perm 收权）、TLS 配置均为独立通道，本文件中未见将 HTTP 数据直接拼入命令/文件系统的 sink。swaggerBasePath 的 Webroot 来自配置非用户输入。
+6. **输出侧**：`decorateFileAttributes` 生成的 path/thumb URL 经 ORM 生成；模板中 prompt 文本经 `e()` 转义（第 216 行），CSS 尺寸来自开发者配置的整数。
 
-7. **gzipResponseWriter**：不实现 Hijacker 已被 WebSocket 分支规避；无响应拆分或头注入点。
+7. **第二通道**：`getUploadMaxFilesize` 解析 ini 值无风险；`getAcceptedFileTypes` 仅影响前端 accept 属性与服务端扩展校验，不构成 sink。
 
-结论：全文未见可利用的 source→sink 未防数据流；唯一外部依赖是 `corsOriginAccessControl` 的实现（不在本文件），但调用方式正确且回显前有闸门。
+结论：代码已包含针对 GHSA-3277-h8g9-qj5f 的作用域修复，各 source→sink 数据流均有有效防御，未发现可利用漏洞。
 [JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文所有入口（HTTP 路由、send API、websocket、viewHandler、静态文件、Unix socket、POP3 启动）：所有路由均经 middleWareFunc 认证与 CORS 闸门；sendAPIAuthMiddleware 通过服务端 context 键 skipUIAuthKey 控制豁免，客户端无法伪造；CSP nonce 为服务端生成值而非用户输入；body 有 5MB 或 MaxMessageSize 上限防 DoS；viewHandler 无路径拼接；CORS 回显 Origin 前强制经过 corsOriginAccessControl 校验。未发现可利用的 source 到 sink 数据流。", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文五个 AJAX 入口均基于 getFileRecord 或 withDeferred 限定在当前关系与 sessionKey 范围内，修复了 GHSA-3277-h8g9-qj5f 的任意 file_id 越权问题；onSortAttachments 用 array_intersect_key 过滤非法 id；onSaveAttachmentConfig 经 fields.yaml 白名单保存；onUpload 有 isValid/extensions/mimes/max 校验，ORM 参数化防 SQL 注入；输出经 e() 转义。未发现可利用漏洞。", "fix_suggestion": "no fix needed"}

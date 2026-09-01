@@ -2,809 +2,697 @@ batch=187 样本数=2
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=8104 lang=javascript
+### id=8094 lang=python
 [CODE]
-   1| const debug = require('@tryghost/debug')('utils:image-size');
-   2| const sizeOf = require('image-size');
-   3| 
-   4| const url = require('url');
-   5| const path = require('path');
-   6| const _ = require('lodash');
-   7| const errors = require('@tryghost/errors');
-   8| const tpl = require('@tryghost/tpl');
+   1| ##########################################################################
+   2| #
+   3| # pgAdmin 4 - PostgreSQL Tools
+   4| #
+   5| # Copyright (C) 2013 - 2025, The pgAdmin Development Team
+   6| # This software is released under the PostgreSQL Licence
+   7| #
+   8| ##########################################################################
    9| 
-  10| const messages = {
-  11|     invalidDimensions: 'Could not fetch image dimensions.'
-  12| };
-  13| 
-  14| // these are formats supported by image-size but not probe-image-size
-  15| const FETCH_ONLY_FORMATS = [
-  16|     'cur', 'icns', 'dds'
-  17| ];
-  18| 
-  19| class ImageSize {
-  20|     constructor({config, imageStore, storageUtils, validator, urlUtils, request, probe}) {
-  21|         this.config = config;
-  22|         this.imageStore = imageStore;
-  23|         this.storageUtils = storageUtils;
-  24|         this.validator = validator;
-  25|         this.urlUtils = urlUtils;
-  26|         this.request = request;
-  27|         this.probe = probe;
-  28| 
-  29|         this.REQUEST_OPTIONS = {
-  30|             // we need the user-agent, otherwise some https request may fail (e.g. cloudfare)
-  31|             headers: {
-  32|                 'User-Agent': 'Mozilla/5.0 Safari/537.36'
-  33|             },
-  34|             timeout: {
-  35|                 request: this.config.get('times:getImageSizeTimeoutInMS') || 10000
-  36|             },
-  37|             retry: {
-  38|                 limit: 0 // for `got`, used with image-size
-  39|             },
-  40|             responseType: 'buffer'
-  41|         };
-  42| 
-  43|         this.NEEDLE_OPTIONS = {
-  44|             // we need the user-agent, otherwise some https request may fail (e.g. cloudflare)
-  45|             headers: {
-  46|                 'User-Agent': 'Mozilla/5.0 Safari/537.36'
-  47|             },
-  48|             response_timeout: this.config.get('times:getImageSizeTimeoutInMS') || 10000
-  49|         };
-  50|     }
-  51| 
-  52|     // processes the Buffer result of an image file using image-size
-  53|     // returns promise which resolves dimensions
-  54|     _imageSizeFromBuffer(buffer) {
-  55|         return new Promise((resolve, reject) => {
-  56|             try {
-  57|                 const dimensions = sizeOf(buffer);
-  58| 
-  59|                 // CASE: `.ico` files might have multiple images and therefore multiple sizes.
-  60|                 // We return the largest size found (image-size default is the first size found)
-  61|                 if (dimensions.images) {
-  62|                     dimensions.width = _.maxBy(dimensions.images, img => img.width).width;
-  63|                     dimensions.height = _.maxBy(dimensions.images, img => img.height).height;
-  64|                 }
-  65| 
-  66|                 resolve(dimensions);
-  67|             } catch (err) {
-  68|                 reject(err);
-  69|             }
-  70|         });
-  71|     }
+  10| """A blueprint module implementing the ldap authentication."""
+  11| 
+  12| import ssl
+  13| import config
+  14| from ldap3 import Connection, Server, Tls, ALL, ALL_ATTRIBUTES, ANONYMOUS,\
+  15|     SIMPLE, AUTO_BIND_TLS_BEFORE_BIND, AUTO_BIND_NO_TLS, set_config_parameter
+  16| from ldap3.core.exceptions import LDAPSocketOpenError, LDAPBindError,\
+  17|     LDAPInvalidScopeError, LDAPAttributeError, LDAPInvalidFilterError,\
+  18|     LDAPStartTLSError, LDAPSSLConfigurationError
+  19| from flask_babel import gettext
+  20| from urllib.parse import urlparse
+  21| 
+  22| from .internal import BaseAuthentication
+  23| from pgadmin.model import User, ServerGroup, db, Role
+  24| from flask import current_app
+  25| from pgadmin.tools.user_management import create_user
+  26| from pgadmin.utils.constants import LDAP
+  27| from sqlalchemy import func
+  28| from flask_security import login_user
+  29| 
+  30| ERROR_SEARCHING_LDAP_DIRECTORY = gettext(
+  31|     "Error searching the LDAP directory: {}")
+  32| 
+  33| ERROR_CONNECTING_LDAP_SERVER = gettext(
+  34|     "Error connecting to the LDAP server: {}\n")
+  35| 
+  36| if config.LDAP_IGNORE_MALFORMED_SCHEMA:
+  37|     set_config_parameter('IGNORE_MALFORMED_SCHEMA',
+  38|                          config.LDAP_IGNORE_MALFORMED_SCHEMA)
+  39| 
+  40| 
+  41| class LDAPAuthentication(BaseAuthentication):
+  42|     """Ldap Authentication Class"""
+  43| 
+  44|     def get_source_name(self):
+  45|         return LDAP
+  46| 
+  47|     def get_friendly_name(self):
+  48|         return gettext("ldap")
+  49| 
+  50|     def authenticate(self, form):
+  51|         self.username = form.data['email']
+  52|         self.password = form.data['password']
+  53|         self.dedicated_user = True
+  54|         self.start_tls = False
+  55|         user_email = None
+  56| 
+  57|         # Check the dedicated ldap user
+  58|         self.bind_user = getattr(config, 'LDAP_BIND_USER', None)
+  59|         self.bind_pass = getattr(config, 'LDAP_BIND_PASSWORD', None)
+  60| 
+  61|         # Check for the anonymous binding
+  62|         self.anonymous_bind = getattr(config, 'LDAP_ANONYMOUS_BIND', False)
+  63| 
+  64|         if self.bind_user and not self.bind_pass:
+  65|             return False, gettext(
+  66|                 "LDAP configuration error: Set the bind password.")
+  67| 
+  68|         # if no dedicated ldap user is configured then use the login
+  69|         # username and password
+  70|         if not self.bind_user and not self.bind_pass and\
+  71|                 self.anonymous_bind is False:
   72| 
-  73|     // use probe-image-size to download enough of an image to get it's dimensions
-  74|     // returns promise which resolves dimensions
-  75|     _probeImageSizeFromUrl(imageUrl) {
-  76|         // Fast-fail invalid URLs; the underlying got instance also enforces
-  77|         // URL validation + SSRF protection in its beforeRequest hooks.
-  78|         if (_.isEmpty(imageUrl) || !this.validator.isURL(imageUrl)) {
-  79|             return Promise.reject(new errors.InternalServerError({
-  80|                 message: 'URL empty or invalid.',
-  81|                 code: 'URL_MISSING_INVALID',
-  82|                 context: imageUrl
-  83|             }));
-  84|         }
-  85| 
-  86|         // wrap probe-image-size in a promise in case it is unresponsive/the timeout itself doesn't work.
-  87|         // If the outer timeout wins, destroy the underlying stream (when available) so the pooled
-  88|         // keep-alive socket isn't leaked.
-  89|         const probeResult = this.probe(imageUrl, this.NEEDLE_OPTIONS);
-  90|         let timeoutHandle;
-  91|         const timeoutPromise = new Promise((res, rej) => {
-  92|             timeoutHandle = setTimeout(() => {
-  93|                 if (probeResult && probeResult.stream && typeof probeResult.stream.destroy === 'function') {
-  94|                     probeResult.stream.destroy();
-  95|                 }
-  96|                 rej(new errors.InternalServerError({
-  97|                     message: 'Probe unresponsive.',
-  98|                     code: 'IMAGE_SIZE_URL'
-  99|                 }));
- 100|             }, this.NEEDLE_OPTIONS.response_timeout);
- 101|         });
- 102|         return Promise.race([probeResult, timeoutPromise]).finally(() => {
- 103|             clearTimeout(timeoutHandle);
- 104|         });
- 105|     }
- 106| 
- 107|     // download full image then use image-size to get it's dimensions
- 108|     // returns promise which resolves dimensions
- 109|     _fetchImageSizeFromUrl(imageUrl) {
- 110|         return this.request(imageUrl, this.REQUEST_OPTIONS).then((response) => {
- 111|             return this._imageSizeFromBuffer(response.body);
- 112|         });
- 113|     }
- 114| 
- 115|     // wrapper for appropriate probe/fetch method for getting image dimensions from a URL
- 116|     // returns promise which resolves dimensions
- 117|     _imageSizeFromUrl(imageUrl) {
- 118|         return new Promise((resolve, reject) => {
- 119|             let parsedUrl;
- 120| 
- 121|             try {
- 122|                 parsedUrl = url.parse(imageUrl);
- 123|             } catch (err) {
- 124|                 reject(err);
- 125|             }
- 126| 
- 127|             // check if we got an url without any protocol
- 128|             if (!parsedUrl.protocol) {
- 129|                 // CASE: our gravatar URLs start with '//' and we need to add 'http:'
- 130|                 // to make the request work
- 131|                 imageUrl = 'http:' + imageUrl;
- 132|             }
- 133| 
- 134|             const extensionMatch = imageUrl.match(/(?:\.)([a-zA-Z]{3,4})(\?|$)/) || [];
- 135|             const extension = (extensionMatch[1] || '').toLowerCase();
- 136| 
- 137|             if (FETCH_ONLY_FORMATS.includes(extension)) {
- 138|                 resolve(this._fetchImageSizeFromUrl(imageUrl));
- 139|             } else {
- 140|                 resolve(this._probeImageSizeFromUrl(imageUrl));
- 141|             }
- 142|         });
- 143|     }
- 144|     // Supported formats of https://github.com/image-size/image-size:
- 145|     // BMP, GIF, JPEG, PNG, PSD, TIFF, WebP, SVG, ICO
- 146|     // ***
- 147|     // Takes the url of the image and an optional timeout
- 148|     // getImageSizeFromUrl returns an Object like this
- 149|     // {
- 150|     //     height: 50,
- 151|     //     url: 'http://myblog.com/images/cat.jpg',
- 152|     //     width: 50
- 153|     // };
- 154|     // if the dimensions can be fetched, and rejects with error, if not.
- 155|     // ***
- 156|     // In case we get a locally stored image, which is checked within the `isLocalImage`
- 157|     // function we switch to read the image from the local file storage with `getImageSizeFromStoragePath`.
- 158|     // In case the image is not stored locally and is missing the protocol (like //www.gravatar.com/andsoon),
- 159|     // we add the protocol and use urlFor() to get the absolute URL.
- 160|     // If the request fails or image-size is not able to read the file, we reject with error.
- 161| 
- 162|     /**
- 163|      * @description read image dimensions from URL
- 164|      * @param {string} imagePath as URL
- 165|      * @returns {Promise<Object>} imageObject or error
- 166|      */
- 167|     getImageSizeFromUrl(imagePath) {
- 168|         if (this.storageUtils.isLocalImage(imagePath)) {
- 169|             // don't make a request for a locally stored image
- 170|             return this.getImageSizeFromStoragePath(imagePath);
- 171|         }
- 172| 
- 173|         // CASE: pre 1.0 users were able to use an asset path for their blog logo
- 174|         if (imagePath.match(/^\/assets/)) {
- 175|             imagePath = this.urlUtils.urlJoin(this.urlUtils.urlFor('home', true), this.urlUtils.getSubdir(), '/', imagePath);
- 176|         }
- 177| 
- 178|         debug('requested imagePath:', imagePath);
- 179| 
- 180|         return this._imageSizeFromUrl(imagePath).then((dimensions) => {
- 181|             debug('Image fetched (URL):', imagePath);
- 182| 
- 183|             return {
- 184|                 url: imagePath,
- 185|                 width: dimensions.width,
- 186|                 height: dimensions.height
- 187|             };
- 188|         }).catch((err) => {
- 189|             if (err.code === 'URL_MISSING_INVALID') {
- 190|                 return Promise.reject(new errors.InternalServerError({
- 191|                     message: err.message,
- 192|                     code: 'IMAGE_SIZE_URL',
- 193|                     statusCode: err.statusCode,
- 194|                     context: err.url || imagePath
- 195|                 }));
- 196|             } else if (err.code === 'ETIMEDOUT' || err.code === 'ESOCKETTIMEDOUT' || err.code === 'ECONNRESET' || err.statusCode === 408) {
- 197|                 return Promise.reject(new errors.InternalServerError({
- 198|                     message: 'Request timed out.',
- 199|                     code: 'IMAGE_SIZE_URL',
- 200|                     statusCode: err.statusCode,
- 201|                     context: err.url || imagePath
- 202|                 }));
- 203|             } else if (err.code === 'ENOENT' || err.code === 'ENOTFOUND' || err.statusCode === 404) {
- 204|                 return Promise.reject(new errors.NotFoundError({
- 205|                     message: 'Image not found.',
- 206|                     code: 'IMAGE_SIZE_URL',
- 207|                     statusCode: err.statusCode,
- 208|                     context: err.url || imagePath
- 209|                 }));
- 210|             } else {
- 211|                 if (errors.utils.isGhostError(err)) {
- 212|                     return Promise.reject(err);
- 213|                 }
- 214| 
- 215|                 return Promise.reject(new errors.InternalServerError({
- 216|                     message: 'Unknown Request error.',
- 217|                     code: 'IMAGE_SIZE_URL',
- 218|                     statusCode: err.statusCode,
- 219|                     context: err.url || imagePath,
- 220|                     err: err
- 221|                 }));
- 222|             }
- 223|         });
- 224|     }
- 225| 
- 226|     // Supported formats of https://github.com/image-size/image-size:
- 227|     // BMP, GIF, JPEG, PNG, PSD, TIFF, WebP, SVG, ICO
- 228|     // ***
- 229|     // Takes the url or filepath of the image and reads it form the local
- 230|     // file storage.
- 231|     // getImageSizeFromStoragePath returns an Object like this
- 232|     // {
- 233|     //     height: 50,
- 234|     //     url: 'http://myblog.com/images/cat.jpg',
- 235|     //     width: 50
- 236|     // };
- 237|     // if the image is found and dimensions can be fetched, and rejects with error, if not.
- 238|     /**
- 239|      * @description read image dimensions from local file storage
- 240|      * @param {string} imagePath
- 241|      * @returns {object} imageObject or error
- 242|      */
- 243|     getImageSizeFromStoragePath(imagePath) {
- 244|         let filePath;
- 245| 
- 246|         imagePath = this.urlUtils.urlFor('image', {image: imagePath}, true);
- 247| 
- 248|         // get the storage readable filePath
- 249|         filePath = this.storageUtils.getLocalImagesStoragePath(imagePath);
- 250| 
- 251|         return this.imageStore.read({path: filePath})
- 252|             .then((buf) => {
- 253|                 debug('Image fetched (storage):', filePath);
- 254|                 return this._imageSizeFromBuffer(buf);
- 255|             })
- 256|             .then((dimensions) => {
- 257|                 return {
- 258|                     url: imagePath,
- 259|                     width: dimensions.width,
- 260|                     height: dimensions.height
- 261|                 };
- 262|             })
- 263|             .catch((err) => {
- 264|                 if (err.code === 'ENOENT') {
- 265|                     return Promise.reject(new errors.NotFoundError({
- 266|                         message: err.message,
- 267|                         code: 'IMAGE_SIZE_STORAGE',
- 268|                         err: err,
- 269|                         context: filePath,
- 270|                         errorDetails: {
- 271|                             originalPath: imagePath,
- 272|                             reqFilePath: filePath
- 273|                         }
- 274|                     }));
- 275|                 } else {
- 276|                     if (errors.utils.isGhostError(err)) {
- 277|                         return Promise.reject(err);
- 278|                     }
- 279| 
- 280|                     return Promise.reject(new errors.InternalServerError({
- 281|                         message: err.message,
- 282|                         code: 'IMAGE_SIZE_STORAGE',
- 283|                         err: err,
- 284|                         context: filePath,
- 285|                         errorDetails: {
- 286|                             originalPath: imagePath,
- 287|                             reqFilePath: filePath
- 288|                         }
- 289|                     }));
- 290|                 }
- 291|             });
- 292|     }
- 293| 
- 294|     /**
- 295|      * Returns the path of the original image for a given image path (we always store the original image in a separate file, suffixed with _o, while we store a resized version of the image on the original name)
- 296|      * TODO: Preferrably we want to move this to a separate image utils package. Currently not really a good place to put it in image lib.
- 297|      */
- 298|     async getOriginalImagePath(imagePath) {
- 299|         const {dir, name, ext} = path.parse(imagePath);
- 300| 
- 301|         const preferredUnoptimizedImagePath = path.join(dir, `${name}_o${ext}`);
- 302|         const preferredUnoptimizedImagePathExists = await this.imageStore.exists(preferredUnoptimizedImagePath);
- 303|         if (preferredUnoptimizedImagePathExists) {
- 304|             return preferredUnoptimizedImagePath;
- 305|         }
- 306| 
- 307|         // Legacy format did some magic with the numbers that could cause bugs. We still need to support it for old files.
- 308|         // refs https://github.com/TryGhost/Team/issues/481
- 309|         const [imageNameMatched, imageName, imageNumber] = name.match(/^(.+?)(-\d+)?$/) || [null];
- 310| 
- 311|         if (!imageNameMatched) {
- 312|             return imagePath;
- 313|         }
- 314| 
- 315|         const legacyOriginalImagePath = path.join(dir, `${imageName}_o${imageNumber || ''}${ext}`);
- 316|         const legacyOriginalImageExists = await this.imageStore.exists(legacyOriginalImagePath);
- 317| 
- 318|         return legacyOriginalImageExists ? legacyOriginalImagePath : imagePath;
- 319|     }
- 320| 
- 321|     async getOriginalImageSizeFromStoragePath(imagePath) {
- 322|         return this.getImageSizeFromStoragePath(await this.getOriginalImagePath(imagePath));
- 323|     }
- 324| 
- 325|     _getPathFromUrl(imageUrl) {
- 326|         // local storage adapter's .exists() expects image paths without any prefixes
- 327|         const subdirRegex = new RegExp(`^${this.urlUtils.getSubdir()}`);
- 328|         const contentRegex = new RegExp(`^/${this.urlUtils.STATIC_IMAGE_URL_PREFIX}`);
- 329|         const storagePath = imageUrl.replace(subdirRegex, '').replace(contentRegex, '');
- 330| 
- 331|         return storagePath;
- 332|     }
- 333| 
- 334|     getImageSizeFromStorageUrl(imageUrl) {
- 335|         return this.getImageSizeFromStoragePath(this._getPathFromUrl(imageUrl));
- 336|     }
- 337| 
- 338|     getOriginalImageSizeFromStorageUrl(imageUrl) {
- 339|         return this.getOriginalImageSizeFromStoragePath(this._getPathFromUrl(imageUrl));
- 340|     }
- 341| 
- 342|     /**
- 343|      * Supported formats of https://github.com/image-size/image-size:
- 344|      * BMP, GIF, JPEG, PNG, PSD, TIFF, WebP, SVG, ICO
- 345|      * Get dimensions for a file from its real file storage path
- 346|      * Always returns {object} getImageDimensions
- 347|      * @param {string} imagePath
- 348|      * @returns {Promise<Object>} getImageDimensions
- 349|      * @description Takes a file path and returns width and height.
- 350|      */
- 351|     getImageSizeFromPath(imagePath) {
- 352|         return new Promise(function getSize(resolve, reject) {
- 353|             let dimensions;
- 354| 
- 355|             try {
- 356|                 dimensions = sizeOf(imagePath);
- 357| 
- 358|                 if (dimensions.images) {
- 359|                     dimensions.width = _.maxBy(dimensions.images, (w) => {
- 360|                         return w.width;
- 361|                     }).width;
- 362|                     dimensions.height = _.maxBy(dimensions.images, (h) => {
- 363|                         return h.height;
- 364|                     }).height;
- 365|                 }
- 366| 
- 367|                 resolve({
- 368|                     width: dimensions.width,
- 369|                     height: dimensions.height
- 370|                 });
- 371|             } catch (err) {
- 372|                 reject(new errors.ValidationError({
- 373|                     message: tpl(messages.invalidDimensions, {
- 374|                         file: imagePath,
- 375|                         error: err.message
- 376|                     })
- 377|                 }));
- 378|             }
- 379|         });
- 380|     }
- 381| }
- 382| 
- 383| module.exports = ImageSize;
- 384| 
- 385| 
-
-### id=8105 lang=javascript
-[CODE]
-   1| const debug = require('@tryghost/debug')('utils:image-size');
-   2| const sizeOf = require('image-size');
-   3| 
-   4| const url = require('url');
-   5| const path = require('path');
-   6| const _ = require('lodash');
-   7| const errors = require('@tryghost/errors');
-   8| const tpl = require('@tryghost/tpl');
-   9| 
-  10| const messages = {
-  11|     invalidDimensions: 'Could not fetch image dimensions.'
-  12| };
-  13| 
-  14| // these are formats supported by image-size but not probe-image-size
-  15| const FETCH_ONLY_FORMATS = [
-  16|     'cur', 'icns', 'dds'
-  17| ];
-  18| 
-  19| class ImageSize {
-  20|     constructor({config, imageStore, storageUtils, validator, urlUtils, fetchExternal, probe}) {
-  21|         this.config = config;
-  22|         this.imageStore = imageStore;
-  23|         this.storageUtils = storageUtils;
-  24|         this.validator = validator;
-  25|         this.urlUtils = urlUtils;
-  26|         this.fetchExternal = fetchExternal;
-  27|         this.probe = probe;
-  28| 
-  29|         this.NEEDLE_OPTIONS = {
-  30|             // we need the user-agent, otherwise some https request may fail (e.g. cloudflare)
-  31|             headers: {
-  32|                 'User-Agent': 'Mozilla/5.0 Safari/537.36'
-  33|             },
-  34|             response_timeout: this.config.get('times:getImageSizeTimeoutInMS') || 10000
-  35|         };
-  36|     }
-  37| 
-  38|     // processes the Buffer result of an image file using image-size
-  39|     // returns promise which resolves dimensions
-  40|     _imageSizeFromBuffer(buffer) {
-  41|         return new Promise((resolve, reject) => {
-  42|             try {
-  43|                 const dimensions = sizeOf(buffer);
-  44| 
-  45|                 // CASE: `.ico` files might have multiple images and therefore multiple sizes.
-  46|                 // We return the largest size found (image-size default is the first size found)
-  47|                 if (dimensions.images) {
-  48|                     dimensions.width = _.maxBy(dimensions.images, img => img.width).width;
-  49|                     dimensions.height = _.maxBy(dimensions.images, img => img.height).height;
-  50|                 }
-  51| 
-  52|                 resolve(dimensions);
-  53|             } catch (err) {
-  54|                 reject(err);
-  55|             }
-  56|         });
-  57|     }
-  58| 
-  59|     // use probe-image-size to download enough of an image to get it's dimensions
-  60|     // returns promise which resolves dimensions
-  61|     _probeImageSizeFromUrl(imageUrl) {
-  62|         // Fast-fail invalid URLs; the underlying got instance also enforces
-  63|         // URL validation + SSRF protection in its beforeRequest hooks.
-  64|         if (_.isEmpty(imageUrl) || !this.validator.isURL(imageUrl)) {
-  65|             return Promise.reject(new errors.InternalServerError({
-  66|                 message: 'URL empty or invalid.',
-  67|                 code: 'URL_MISSING_INVALID',
-  68|                 context: imageUrl
-  69|             }));
-  70|         }
-  71| 
-  72|         // wrap probe-image-size in a promise in case it is unresponsive/the timeout itself doesn't work.
-  73|         // If the outer timeout wins, destroy the underlying stream (when available) so the pooled
-  74|         // keep-alive socket isn't leaked.
-  75|         const probeResult = this.probe(imageUrl, this.NEEDLE_OPTIONS);
-  76|         let timeoutHandle;
-  77|         const timeoutPromise = new Promise((res, rej) => {
-  78|             timeoutHandle = setTimeout(() => {
-  79|                 if (probeResult && probeResult.stream && typeof probeResult.stream.destroy === 'function') {
-  80|                     probeResult.stream.destroy();
-  81|                 }
-  82|                 rej(new errors.InternalServerError({
-  83|                     message: 'Probe unresponsive.',
-  84|                     code: 'IMAGE_SIZE_URL'
-  85|                 }));
-  86|             }, this.NEEDLE_OPTIONS.response_timeout);
-  87|         });
-  88|         return Promise.race([probeResult, timeoutPromise]).finally(() => {
-  89|             clearTimeout(timeoutHandle);
-  90|         });
-  91|     }
-  92| 
-  93|     // download full image then use image-size to get it's dimensions
-  94|     // returns promise which resolves dimensions
-  95|     _fetchImageSizeFromUrl(imageUrl) {
-  96|         return this.fetchExternal(imageUrl, this.NEEDLE_OPTIONS).then((response) => {
-  97|             return this._imageSizeFromBuffer(response.body);
-  98|         });
-  99|     }
- 100| 
- 101|     // wrapper for appropriate probe/fetch method for getting image dimensions from a URL
- 102|     // returns promise which resolves dimensions
- 103|     _imageSizeFromUrl(imageUrl) {
- 104|         return new Promise((resolve, reject) => {
- 105|             let parsedUrl;
- 106| 
- 107|             try {
- 108|                 parsedUrl = url.parse(imageUrl);
- 109|             } catch (err) {
- 110|                 reject(err);
- 111|             }
+  73|             user_dn = config.LDAP_BIND_FORMAT\
+  74|                 .format(
+  75|                     LDAP_USERNAME=self.username,
+  76|                     LDAP_BASE_DN=config.LDAP_BASE_DN,
+  77|                     LDAP_USERNAME_ATTRIBUTE=config.LDAP_USERNAME_ATTRIBUTE
+  78|                 )
+  79| 
+  80|             self.bind_user = user_dn
+  81|             self.bind_pass = self.password
+  82|             self.dedicated_user = False
+  83| 
+  84|         # Connect ldap server
+  85|         status, msg = self.connect()
+  86| 
+  87|         if not status:
+  88|             return status, msg
+  89| 
+  90|         status, ldap_user = self.search_ldap_user()
+  91| 
+  92|         if not status:
+  93|             return status, ldap_user
+  94| 
+  95|         # If dedicated user is configured
+  96|         if self.dedicated_user:
+  97|             # Get the user DN from the user ldap entry
+  98|             self.bind_user = ldap_user.entry_dn
+  99|             self.bind_pass = self.password
+ 100|             self.anonymous_bind = False
+ 101|             status, msg = self.connect()
+ 102| 
+ 103|             if not status:
+ 104|                 return status, msg
+ 105| 
+ 106|         if 'mail' in ldap_user:
+ 107|             mail = ldap_user['mail'].value
+ 108|             if isinstance(mail, list) and len(mail) > 0:
+ 109|                 user_email = mail[0]
+ 110|             else:
+ 111|                 user_email = ldap_user['mail'].value
  112| 
- 113|             // check if we got an url without any protocol
- 114|             if (!parsedUrl.protocol) {
- 115|                 // CASE: our gravatar URLs start with '//' and we need to add 'http:'
- 116|                 // to make the request work
- 117|                 imageUrl = 'http:' + imageUrl;
- 118|             }
+ 113|         return self.__auto_create_user(user_email)
+ 114| 
+ 115|     def connect(self):
+ 116|         """Setup the connection to the LDAP server and authenticate the user.
+ 117|         """
+ 118|         status, server = self._configure_server()
  119| 
- 120|             const extensionMatch = imageUrl.match(/(?:\.)([a-zA-Z]{3,4})(\?|$)/) || [];
- 121|             const extension = (extensionMatch[1] || '').toLowerCase();
+ 120|         if not status:
+ 121|             return status, server
  122| 
- 123|             if (FETCH_ONLY_FORMATS.includes(extension)) {
- 124|                 resolve(this._fetchImageSizeFromUrl(imageUrl));
- 125|             } else {
- 126|                 resolve(this._probeImageSizeFromUrl(imageUrl));
- 127|             }
- 128|         });
- 129|     }
- 130|     // Supported formats of https://github.com/image-size/image-size:
- 131|     // BMP, GIF, JPEG, PNG, PSD, TIFF, WebP, SVG, ICO
- 132|     // ***
- 133|     // Takes the url of the image and an optional timeout
- 134|     // getImageSizeFromUrl returns an Object like this
- 135|     // {
- 136|     //     height: 50,
- 137|     //     url: 'http://myblog.com/images/cat.jpg',
- 138|     //     width: 50
- 139|     // };
- 140|     // if the dimensions can be fetched, and rejects with error, if not.
- 141|     // ***
- 142|     // In case we get a locally stored image, which is checked within the `isLocalImage`
- 143|     // function we switch to read the image from the local file storage with `getImageSizeFromStoragePath`.
- 144|     // In case the image is not stored locally and is missing the protocol (like //www.gravatar.com/andsoon),
- 145|     // we add the protocol and use urlFor() to get the absolute URL.
- 146|     // If the request fails or image-size is not able to read the file, we reject with error.
- 147| 
- 148|     /**
- 149|      * @description read image dimensions from URL
- 150|      * @param {string} imagePath as URL
- 151|      * @returns {Promise<Object>} imageObject or error
- 152|      */
- 153|     getImageSizeFromUrl(imagePath) {
- 154|         if (this.storageUtils.isLocalImage(imagePath)) {
- 155|             // don't make a request for a locally stored image
- 156|             return this.getImageSizeFromStoragePath(imagePath);
- 157|         }
- 158| 
- 159|         // CASE: pre 1.0 users were able to use an asset path for their blog logo
- 160|         if (imagePath.match(/^\/assets/)) {
- 161|             imagePath = this.urlUtils.urlJoin(this.urlUtils.urlFor('home', true), this.urlUtils.getSubdir(), '/', imagePath);
- 162|         }
- 163| 
- 164|         debug('requested imagePath:', imagePath);
- 165| 
- 166|         return this._imageSizeFromUrl(imagePath).then((dimensions) => {
- 167|             debug('Image fetched (URL):', imagePath);
- 168| 
- 169|             return {
- 170|                 url: imagePath,
- 171|                 width: dimensions.width,
- 172|                 height: dimensions.height
- 173|             };
- 174|         }).catch((err) => {
- 175|             if (err.code === 'URL_MISSING_INVALID') {
- 176|                 return Promise.reject(new errors.InternalServerError({
- 177|                     message: err.message,
- 178|                     code: 'IMAGE_SIZE_URL',
- 179|                     statusCode: err.statusCode,
- 180|                     context: err.url || imagePath
- 181|                 }));
- 182|             } else if (err.code === 'ETIMEDOUT' || err.code === 'ESOCKETTIMEDOUT' || err.code === 'ECONNRESET' || err.statusCode === 408) {
- 183|                 return Promise.reject(new errors.InternalServerError({
- 184|                     message: 'Request timed out.',
- 185|                     code: 'IMAGE_SIZE_URL',
- 186|                     statusCode: err.statusCode,
- 187|                     context: err.url || imagePath
- 188|                 }));
- 189|             } else if (err.code === 'ENOENT' || err.code === 'ENOTFOUND' || err.statusCode === 404) {
- 190|                 return Promise.reject(new errors.NotFoundError({
- 191|                     message: 'Image not found.',
- 192|                     code: 'IMAGE_SIZE_URL',
- 193|                     statusCode: err.statusCode,
- 194|                     context: err.url || imagePath
- 195|                 }));
- 196|             } else {
- 197|                 if (errors.utils.isGhostError(err)) {
- 198|                     return Promise.reject(err);
- 199|                 }
- 200| 
- 201|                 return Promise.reject(new errors.InternalServerError({
- 202|                     message: 'Unknown Request error.',
- 203|                     code: 'IMAGE_SIZE_URL',
- 204|                     statusCode: err.statusCode,
- 205|                     context: err.url || imagePath,
- 206|                     err: err
- 207|                 }));
- 208|             }
- 209|         });
- 210|     }
- 211| 
- 212|     // Supported formats of https://github.com/image-size/image-size:
- 213|     // BMP, GIF, JPEG, PNG, PSD, TIFF, WebP, SVG, ICO
- 214|     // ***
- 215|     // Takes the url or filepath of the image and reads it form the local
- 216|     // file storage.
- 217|     // getImageSizeFromStoragePath returns an Object like this
- 218|     // {
- 219|     //     height: 50,
- 220|     //     url: 'http://myblog.com/images/cat.jpg',
- 221|     //     width: 50
- 222|     // };
- 223|     // if the image is found and dimensions can be fetched, and rejects with error, if not.
- 224|     /**
- 225|      * @description read image dimensions from local file storage
- 226|      * @param {string} imagePath
- 227|      * @returns {object} imageObject or error
- 228|      */
- 229|     getImageSizeFromStoragePath(imagePath) {
- 230|         let filePath;
- 231| 
- 232|         imagePath = this.urlUtils.urlFor('image', {image: imagePath}, true);
+ 123|         auto_bind = AUTO_BIND_TLS_BEFORE_BIND if self.start_tls \
+ 124|             else AUTO_BIND_NO_TLS
+ 125| 
+ 126|         # Create the connection
+ 127|         try:
+ 128|             if self.anonymous_bind:
+ 129|                 self.conn = Connection(server,
+ 130|                                        auto_bind=auto_bind,
+ 131|                                        authentication=ANONYMOUS
+ 132|                                        )
+ 133|             else:
+ 134|                 self.conn = Connection(server,
+ 135|                                        user=self.bind_user,
+ 136|                                        password=self.bind_pass,
+ 137|                                        auto_bind=auto_bind,
+ 138|                                        authentication=SIMPLE
+ 139|                                        )
+ 140| 
+ 141|         except LDAPSocketOpenError as e:
+ 142|             current_app.logger.exception(
+ 143|                 ERROR_CONNECTING_LDAP_SERVER.format(e))
+ 144|             return False, ERROR_CONNECTING_LDAP_SERVER.format(e.args[0])
+ 145|         except LDAPBindError as e:
+ 146|             current_app.logger.exception(
+ 147|                 "Error binding to the LDAP server.")
+ 148|             return False, gettext("Error binding to the LDAP server: {}\n".
+ 149|                                   format(e.args[0]))
+ 150|         except LDAPStartTLSError as e:
+ 151|             current_app.logger.exception(
+ 152|                 "Error starting TLS: {}\n".format(e))
+ 153|             return False, gettext("Error starting TLS: {}\n"
+ 154|                                   ).format(e.args[0])
+ 155|         except Exception as e:
+ 156|             current_app.logger.exception(
+ 157|                 ERROR_CONNECTING_LDAP_SERVER.format(e))
+ 158|             return False, ERROR_CONNECTING_LDAP_SERVER.format(e.args[0])
+ 159| 
+ 160|         return True, None
+ 161| 
+ 162|     def login(self, form):
+ 163|         user = getattr(form, 'user', None)
+ 164|         if user is None:
+ 165|             if config.LDAP_DN_CASE_SENSITIVE:
+ 166|                 user = User.query.filter_by(username=self.username).first()
+ 167|             else:
+ 168|                 user = User.query.filter(
+ 169|                     func.lower(User.username) == func.lower(
+ 170|                         self.username)).first()
+ 171| 
+ 172|         if user is None:
+ 173|             current_app.logger.exception(
+ 174|                 self.messages('USER_DOES_NOT_EXIST'))
+ 175|             return False, self.messages('USER_DOES_NOT_EXIST')
+ 176| 
+ 177|         # Login user through flask_security
+ 178|         status = login_user(user)
+ 179|         if not status:
+ 180|             current_app.logger.exception(self.messages('LOGIN_FAILED'))
+ 181|             return False, self.messages('LOGIN_FAILED')
+ 182|         current_app.logger.info(
+ 183|             "LDAP user {0} logged in.".format(user))
+ 184|         return True, None
+ 185| 
+ 186|     def __auto_create_user(self, user_email):
+ 187|         """Add the ldap user to the internal SQLite database."""
+ 188|         if config.LDAP_AUTO_CREATE_USER:
+ 189|             if config.LDAP_DN_CASE_SENSITIVE:
+ 190|                 user = User.query.filter_by(username=self.username,
+ 191|                                             auth_source=LDAP).first()
+ 192|             else:
+ 193|                 user = User.query.filter_by(username=func.lower(self.username),
+ 194|                                             auth_source=LDAP).first()
+ 195| 
+ 196|             if user is None:
+ 197|                 create_msg = ("Creating user {0} with email {1} "
+ 198|                               "from auth source LDAP.")
+ 199|                 current_app.logger.info(create_msg.format(self.username,
+ 200|                                                           user_email))
+ 201|                 return create_user({
+ 202|                     'username': self.username,
+ 203|                     'email': user_email,
+ 204|                     'role': 2,
+ 205|                     'active': True,
+ 206|                     'auth_source': LDAP
+ 207|                 })
+ 208| 
+ 209|         return True, None
+ 210| 
+ 211|     def __configure_tls(self):
+ 212|         ca_cert_file = getattr(config, 'LDAP_CA_CERT_FILE', None)
+ 213|         cert_file = getattr(config, 'LDAP_CERT_FILE', None)
+ 214|         key_file = getattr(config, 'LDAP_KEY_FILE', None)
+ 215|         cert_validate = ssl.CERT_NONE
+ 216| 
+ 217|         if ca_cert_file and cert_file and key_file:
+ 218|             cert_validate = ssl.CERT_REQUIRED
+ 219| 
+ 220|         try:
+ 221|             tls = Tls(
+ 222|                 local_private_key_file=key_file,
+ 223|                 local_certificate_file=cert_file,
+ 224|                 validate=cert_validate,
+ 225|                 version=ssl.PROTOCOL_TLSv1_2,
+ 226|                 ca_certs_file=ca_cert_file)
+ 227|         except LDAPSSLConfigurationError as e:
+ 228|             current_app.logger.exception(
+ 229|                 "LDAP configuration error: {}\n".format(e))
+ 230|             return False, gettext("LDAP configuration error: {}\n").format(
+ 231|                 e.args[0])
+ 232|         return True, tls
  233| 
- 234|         // get the storage readable filePath
- 235|         filePath = this.storageUtils.getLocalImagesStoragePath(imagePath);
- 236| 
- 237|         return this.imageStore.read({path: filePath})
- 238|             .then((buf) => {
- 239|                 debug('Image fetched (storage):', filePath);
- 240|                 return this._imageSizeFromBuffer(buf);
- 241|             })
- 242|             .then((dimensions) => {
- 243|                 return {
- 244|                     url: imagePath,
- 245|                     width: dimensions.width,
- 246|                     height: dimensions.height
- 247|                 };
- 248|             })
- 249|             .catch((err) => {
- 250|                 if (err.code === 'ENOENT') {
- 251|                     return Promise.reject(new errors.NotFoundError({
- 252|                         message: err.message,
- 253|                         code: 'IMAGE_SIZE_STORAGE',
- 254|                         err: err,
- 255|                         context: filePath,
- 256|                         errorDetails: {
- 257|                             originalPath: imagePath,
- 258|                             reqFilePath: filePath
- 259|                         }
- 260|                     }));
- 261|                 } else {
- 262|                     if (errors.utils.isGhostError(err)) {
- 263|                         return Promise.reject(err);
- 264|                     }
- 265| 
- 266|                     return Promise.reject(new errors.InternalServerError({
- 267|                         message: err.message,
- 268|                         code: 'IMAGE_SIZE_STORAGE',
- 269|                         err: err,
- 270|                         context: filePath,
- 271|                         errorDetails: {
- 272|                             originalPath: imagePath,
- 273|                             reqFilePath: filePath
- 274|                         }
- 275|                     }));
- 276|                 }
- 277|             });
- 278|     }
- 279| 
- 280|     /**
- 281|      * Returns the path of the original image for a given image path (we always store the original image in a separate file, suffixed with _o, while we store a resized version of the image on the original name)
- 282|      * TODO: Preferrably we want to move this to a separate image utils package. Currently not really a good place to put it in image lib.
- 283|      */
- 284|     async getOriginalImagePath(imagePath) {
- 285|         const {dir, name, ext} = path.parse(imagePath);
+ 234|     def _configure_server(self):
+ 235|         # Parse the server URI
+ 236|         uri = getattr(config, 'LDAP_SERVER_URI', None)
+ 237| 
+ 238|         if uri:
+ 239|             uri = urlparse(uri)
+ 240| 
+ 241|         # Create the TLS configuration object if required
+ 242|         tls = None
+ 243| 
+ 244|         if isinstance(uri, str):
+ 245|             return False, gettext(
+ 246|                 "LDAP configuration error: Set the proper LDAP URI.")
+ 247| 
+ 248|         if uri.scheme == 'ldaps' or config.LDAP_USE_STARTTLS:
+ 249|             status, tls = self.__configure_tls()
+ 250|             if not status:
+ 251|                 return status, tls
+ 252| 
+ 253|         if uri.scheme != 'ldaps' and config.LDAP_USE_STARTTLS:
+ 254|             self.start_tls = True
+ 255| 
+ 256|         try:
+ 257|             # Create the server object
+ 258|             server = Server(uri.hostname,
+ 259|                             port=uri.port,
+ 260|                             use_ssl=(uri.scheme == 'ldaps'),
+ 261|                             get_info=ALL,
+ 262|                             tls=tls,
+ 263|                             connect_timeout=config.LDAP_CONNECTION_TIMEOUT)
+ 264|         except ValueError as e:
+ 265|             return False, "LDAP configuration error: {}.".format(e)
+ 266| 
+ 267|         return True, server
+ 268| 
+ 269|     def search_ldap_user(self):
+ 270|         """Get a list of users from the LDAP server based on config
+ 271|          search criteria."""
+ 272|         try:
+ 273|             search_base_dn = config.LDAP_SEARCH_BASE_DN
+ 274|             if (not search_base_dn or search_base_dn == '<Search-Base-DN>')\
+ 275|                     and (self.anonymous_bind or self.dedicated_user):
+ 276|                 return False, gettext("LDAP configuration error: "
+ 277|                                       "Set the Search Domain.")
+ 278|             elif not search_base_dn or search_base_dn == '<Search-Base-DN>':
+ 279|                 search_base_dn = config.LDAP_BASE_DN
+ 280| 
+ 281|             search_filter = "({0}={1})".format(config.LDAP_USERNAME_ATTRIBUTE,
+ 282|                                                self.username)
+ 283|             if config.LDAP_SEARCH_FILTER:
+ 284|                 search_filter = "(&{0}{1})".format(search_filter,
+ 285|                                                    config.LDAP_SEARCH_FILTER)
  286| 
- 287|         const preferredUnoptimizedImagePath = path.join(dir, `${name}_o${ext}`);
- 288|         const preferredUnoptimizedImagePathExists = await this.imageStore.exists(preferredUnoptimizedImagePath);
- 289|         if (preferredUnoptimizedImagePathExists) {
- 290|             return preferredUnoptimizedImagePath;
- 291|         }
+ 287|             self.conn.search(search_base=search_base_dn,
+ 288|                              search_filter=search_filter,
+ 289|                              search_scope=config.LDAP_SEARCH_SCOPE,
+ 290|                              attributes=ALL_ATTRIBUTES
+ 291|                              )
  292| 
- 293|         // Legacy format did some magic with the numbers that could cause bugs. We still need to support it for old files.
- 294|         // refs https://github.com/TryGhost/Team/issues/481
- 295|         const [imageNameMatched, imageName, imageNumber] = name.match(/^(.+?)(-\d+)?$/) || [null];
- 296| 
- 297|         if (!imageNameMatched) {
- 298|             return imagePath;
- 299|         }
- 300| 
- 301|         const legacyOriginalImagePath = path.join(dir, `${imageName}_o${imageNumber || ''}${ext}`);
- 302|         const legacyOriginalImageExists = await this.imageStore.exists(legacyOriginalImagePath);
- 303| 
- 304|         return legacyOriginalImageExists ? legacyOriginalImagePath : imagePath;
- 305|     }
- 306| 
- 307|     async getOriginalImageSizeFromStoragePath(imagePath) {
- 308|         return this.getImageSizeFromStoragePath(await this.getOriginalImagePath(imagePath));
- 309|     }
- 310| 
- 311|     _getPathFromUrl(imageUrl) {
- 312|         // local storage adapter's .exists() expects image paths without any prefixes
- 313|         const subdirRegex = new RegExp(`^${this.urlUtils.getSubdir()}`);
- 314|         const contentRegex = new RegExp(`^/${this.urlUtils.STATIC_IMAGE_URL_PREFIX}`);
- 315|         const storagePath = imageUrl.replace(subdirRegex, '').replace(contentRegex, '');
- 316| 
- 317|         return storagePath;
- 318|     }
+ 293|         except LDAPInvalidScopeError as e:
+ 294|             current_app.logger.exception(
+ 295|                 ERROR_SEARCHING_LDAP_DIRECTORY.format(e.args[0])
+ 296|             )
+ 297|             return False, ERROR_SEARCHING_LDAP_DIRECTORY.format(e.args[0])
+ 298|         except LDAPAttributeError as e:
+ 299|             current_app.logger.exception(
+ 300|                 ERROR_SEARCHING_LDAP_DIRECTORY.format(e)
+ 301|             )
+ 302|             return False, ERROR_SEARCHING_LDAP_DIRECTORY.format(e.args[0])
+ 303|         except LDAPInvalidFilterError as e:
+ 304|             current_app.logger.exception(
+ 305|                 ERROR_SEARCHING_LDAP_DIRECTORY.format(e)
+ 306|             )
+ 307|             return False, ERROR_SEARCHING_LDAP_DIRECTORY.format(e.args[0])
+ 308| 
+ 309|         results = len(self.conn.entries)
+ 310|         if results > 1:
+ 311|             return False, ERROR_SEARCHING_LDAP_DIRECTORY.format(
+ 312|                 gettext("More than one result found."))
+ 313|         elif results < 1:
+ 314|             return False, ERROR_SEARCHING_LDAP_DIRECTORY.format(
+ 315|                 gettext("Could not find the specified user."))
+ 316|         return True, self.conn.entries[0]
+ 317| 
+ 318| 
+
+### id=8095 lang=python
+[CODE]
+   1| ##########################################################################
+   2| #
+   3| # pgAdmin 4 - PostgreSQL Tools
+   4| #
+   5| # Copyright (C) 2013 - 2025, The pgAdmin Development Team
+   6| # This software is released under the PostgreSQL Licence
+   7| #
+   8| ##########################################################################
+   9| 
+  10| """A blueprint module implementing the ldap authentication."""
+  11| 
+  12| import ssl
+  13| import config
+  14| from ldap3 import Connection, Server, Tls, ALL, ALL_ATTRIBUTES, ANONYMOUS,\
+  15|     SIMPLE, AUTO_BIND_TLS_BEFORE_BIND, AUTO_BIND_NO_TLS, set_config_parameter
+  16| from ldap3.core.exceptions import LDAPSocketOpenError, LDAPBindError,\
+  17|     LDAPInvalidScopeError, LDAPAttributeError, LDAPInvalidFilterError,\
+  18|     LDAPStartTLSError, LDAPSSLConfigurationError
+  19| from ldap3.utils.conv import escape_filter_chars
+  20| from flask_babel import gettext
+  21| from urllib.parse import urlparse
+  22| 
+  23| from .internal import BaseAuthentication
+  24| from pgadmin.model import User, ServerGroup, db, Role
+  25| from flask import current_app
+  26| from pgadmin.tools.user_management import create_user
+  27| from pgadmin.utils.constants import LDAP
+  28| from sqlalchemy import func
+  29| from flask_security import login_user
+  30| 
+  31| ERROR_SEARCHING_LDAP_DIRECTORY = gettext(
+  32|     "Error searching the LDAP directory: {}")
+  33| 
+  34| ERROR_CONNECTING_LDAP_SERVER = gettext(
+  35|     "Error connecting to the LDAP server: {}\n")
+  36| 
+  37| if config.LDAP_IGNORE_MALFORMED_SCHEMA:
+  38|     set_config_parameter('IGNORE_MALFORMED_SCHEMA',
+  39|                          config.LDAP_IGNORE_MALFORMED_SCHEMA)
+  40| 
+  41| 
+  42| class LDAPAuthentication(BaseAuthentication):
+  43|     """Ldap Authentication Class"""
+  44| 
+  45|     def get_source_name(self):
+  46|         return LDAP
+  47| 
+  48|     def get_friendly_name(self):
+  49|         return gettext("ldap")
+  50| 
+  51|     def authenticate(self, form):
+  52|         self.username = form.data['email']
+  53|         self.password = form.data['password']
+  54|         self.dedicated_user = True
+  55|         self.start_tls = False
+  56|         user_email = None
+  57| 
+  58|         # Check the dedicated ldap user
+  59|         self.bind_user = getattr(config, 'LDAP_BIND_USER', None)
+  60|         self.bind_pass = getattr(config, 'LDAP_BIND_PASSWORD', None)
+  61| 
+  62|         # Check for the anonymous binding
+  63|         self.anonymous_bind = getattr(config, 'LDAP_ANONYMOUS_BIND', False)
+  64| 
+  65|         if self.bind_user and not self.bind_pass:
+  66|             return False, gettext(
+  67|                 "LDAP configuration error: Set the bind password.")
+  68| 
+  69|         # if no dedicated ldap user is configured then use the login
+  70|         # username and password
+  71|         if not self.bind_user and not self.bind_pass and\
+  72|                 self.anonymous_bind is False:
+  73| 
+  74|             user_dn = config.LDAP_BIND_FORMAT\
+  75|                 .format(
+  76|                     LDAP_USERNAME=self.username,
+  77|                     LDAP_BASE_DN=config.LDAP_BASE_DN,
+  78|                     LDAP_USERNAME_ATTRIBUTE=config.LDAP_USERNAME_ATTRIBUTE
+  79|                 )
+  80| 
+  81|             self.bind_user = user_dn
+  82|             self.bind_pass = self.password
+  83|             self.dedicated_user = False
+  84| 
+  85|         # Connect ldap server
+  86|         status, msg = self.connect()
+  87| 
+  88|         if not status:
+  89|             return status, msg
+  90| 
+  91|         status, ldap_user = self.search_ldap_user()
+  92| 
+  93|         if not status:
+  94|             return status, ldap_user
+  95| 
+  96|         # If dedicated user is configured
+  97|         if self.dedicated_user:
+  98|             # Get the user DN from the user ldap entry
+  99|             self.bind_user = ldap_user.entry_dn
+ 100|             self.bind_pass = self.password
+ 101|             self.anonymous_bind = False
+ 102|             status, msg = self.connect()
+ 103| 
+ 104|             if not status:
+ 105|                 return status, msg
+ 106| 
+ 107|         if 'mail' in ldap_user:
+ 108|             mail = ldap_user['mail'].value
+ 109|             if isinstance(mail, list) and len(mail) > 0:
+ 110|                 user_email = mail[0]
+ 111|             else:
+ 112|                 user_email = ldap_user['mail'].value
+ 113| 
+ 114|         return self.__auto_create_user(user_email)
+ 115| 
+ 116|     def connect(self):
+ 117|         """Setup the connection to the LDAP server and authenticate the user.
+ 118|         """
+ 119|         status, server = self._configure_server()
+ 120| 
+ 121|         if not status:
+ 122|             return status, server
+ 123| 
+ 124|         auto_bind = AUTO_BIND_TLS_BEFORE_BIND if self.start_tls \
+ 125|             else AUTO_BIND_NO_TLS
+ 126| 
+ 127|         # Create the connection
+ 128|         try:
+ 129|             if self.anonymous_bind:
+ 130|                 self.conn = Connection(server,
+ 131|                                        auto_bind=auto_bind,
+ 132|                                        authentication=ANONYMOUS
+ 133|                                        )
+ 134|             else:
+ 135|                 self.conn = Connection(server,
+ 136|                                        user=self.bind_user,
+ 137|                                        password=self.bind_pass,
+ 138|                                        auto_bind=auto_bind,
+ 139|                                        authentication=SIMPLE
+ 140|                                        )
+ 141| 
+ 142|         except LDAPSocketOpenError as e:
+ 143|             current_app.logger.exception(
+ 144|                 ERROR_CONNECTING_LDAP_SERVER.format(e))
+ 145|             return False, ERROR_CONNECTING_LDAP_SERVER.format(e.args[0])
+ 146|         except LDAPBindError as e:
+ 147|             current_app.logger.exception(
+ 148|                 "Error binding to the LDAP server.")
+ 149|             return False, gettext("Error binding to the LDAP server: {}\n".
+ 150|                                   format(e.args[0]))
+ 151|         except LDAPStartTLSError as e:
+ 152|             current_app.logger.exception(
+ 153|                 "Error starting TLS: {}\n".format(e))
+ 154|             return False, gettext("Error starting TLS: {}\n"
+ 155|                                   ).format(e.args[0])
+ 156|         except Exception as e:
+ 157|             current_app.logger.exception(
+ 158|                 ERROR_CONNECTING_LDAP_SERVER.format(e))
+ 159|             return False, ERROR_CONNECTING_LDAP_SERVER.format(e.args[0])
+ 160| 
+ 161|         return True, None
+ 162| 
+ 163|     def login(self, form):
+ 164|         user = getattr(form, 'user', None)
+ 165|         if user is None:
+ 166|             if config.LDAP_DN_CASE_SENSITIVE:
+ 167|                 user = User.query.filter_by(username=self.username).first()
+ 168|             else:
+ 169|                 user = User.query.filter(
+ 170|                     func.lower(User.username) == func.lower(
+ 171|                         self.username)).first()
+ 172| 
+ 173|         if user is None:
+ 174|             current_app.logger.exception(
+ 175|                 self.messages('USER_DOES_NOT_EXIST'))
+ 176|             return False, self.messages('USER_DOES_NOT_EXIST')
+ 177| 
+ 178|         # Login user through flask_security
+ 179|         status = login_user(user)
+ 180|         if not status:
+ 181|             current_app.logger.exception(self.messages('LOGIN_FAILED'))
+ 182|             return False, self.messages('LOGIN_FAILED')
+ 183|         current_app.logger.info(
+ 184|             "LDAP user {0} logged in.".format(user))
+ 185|         return True, None
+ 186| 
+ 187|     def __auto_create_user(self, user_email):
+ 188|         """Add the ldap user to the internal SQLite database."""
+ 189|         if config.LDAP_AUTO_CREATE_USER:
+ 190|             if config.LDAP_DN_CASE_SENSITIVE:
+ 191|                 user = User.query.filter_by(username=self.username,
+ 192|                                             auth_source=LDAP).first()
+ 193|             else:
+ 194|                 user = User.query.filter_by(username=func.lower(self.username),
+ 195|                                             auth_source=LDAP).first()
+ 196| 
+ 197|             if user is None:
+ 198|                 create_msg = ("Creating user {0} with email {1} "
+ 199|                               "from auth source LDAP.")
+ 200|                 current_app.logger.info(create_msg.format(self.username,
+ 201|                                                           user_email))
+ 202|                 return create_user({
+ 203|                     'username': self.username,
+ 204|                     'email': user_email,
+ 205|                     'role': 2,
+ 206|                     'active': True,
+ 207|                     'auth_source': LDAP
+ 208|                 })
+ 209| 
+ 210|         return True, None
+ 211| 
+ 212|     def __configure_tls(self):
+ 213|         ca_cert_file = getattr(config, 'LDAP_CA_CERT_FILE', None)
+ 214|         cert_file = getattr(config, 'LDAP_CERT_FILE', None)
+ 215|         key_file = getattr(config, 'LDAP_KEY_FILE', None)
+ 216|         cert_required = getattr(config, 'LDAP_CERT_VALIDATE', True)
+ 217|         cert_validate = ssl.CERT_REQUIRED if cert_required else ssl.CERT_NONE
+ 218| 
+ 219|         try:
+ 220|             tls = Tls(
+ 221|                 local_private_key_file=key_file,
+ 222|                 local_certificate_file=cert_file,
+ 223|                 validate=cert_validate,
+ 224|                 version=ssl.PROTOCOL_TLSv1_2,
+ 225|                 ca_certs_file=ca_cert_file)
+ 226|         except LDAPSSLConfigurationError as e:
+ 227|             current_app.logger.exception(
+ 228|                 "LDAP configuration error: {}\n".format(e))
+ 229|             return False, gettext("LDAP configuration error: {}\n").format(
+ 230|                 e.args[0])
+ 231|         return True, tls
+ 232| 
+ 233|     def _configure_server(self):
+ 234|         # Parse the server URI
+ 235|         uri = getattr(config, 'LDAP_SERVER_URI', None)
+ 236| 
+ 237|         if uri:
+ 238|             uri = urlparse(uri)
+ 239| 
+ 240|         # Create the TLS configuration object if required
+ 241|         tls = None
+ 242| 
+ 243|         if isinstance(uri, str):
+ 244|             return False, gettext(
+ 245|                 "LDAP configuration error: Set the proper LDAP URI.")
+ 246| 
+ 247|         if uri.scheme == 'ldaps' or config.LDAP_USE_STARTTLS:
+ 248|             status, tls = self.__configure_tls()
+ 249|             if not status:
+ 250|                 return status, tls
+ 251| 
+ 252|         if uri.scheme != 'ldaps' and config.LDAP_USE_STARTTLS:
+ 253|             self.start_tls = True
+ 254| 
+ 255|         try:
+ 256|             # Create the server object
+ 257|             server = Server(uri.hostname,
+ 258|                             port=uri.port,
+ 259|                             use_ssl=(uri.scheme == 'ldaps'),
+ 260|                             get_info=ALL,
+ 261|                             tls=tls,
+ 262|                             connect_timeout=config.LDAP_CONNECTION_TIMEOUT)
+ 263|         except ValueError as e:
+ 264|             return False, "LDAP configuration error: {}.".format(e)
+ 265| 
+ 266|         return True, server
+ 267| 
+ 268|     def search_ldap_user(self):
+ 269|         """Get a list of users from the LDAP server based on config
+ 270|          search criteria."""
+ 271|         try:
+ 272|             search_base_dn = config.LDAP_SEARCH_BASE_DN
+ 273|             if (not search_base_dn or search_base_dn == '<Search-Base-DN>')\
+ 274|                     and (self.anonymous_bind or self.dedicated_user):
+ 275|                 return False, gettext("LDAP configuration error: "
+ 276|                                       "Set the Search Domain.")
+ 277|             elif not search_base_dn or search_base_dn == '<Search-Base-DN>':
+ 278|                 search_base_dn = config.LDAP_BASE_DN
+ 279| 
+ 280|             search_filter = "({0}={1})".format(
+ 281|                 config.LDAP_USERNAME_ATTRIBUTE,
+ 282|                 escape_filter_chars(self.username)
+ 283|             )
+ 284|             if config.LDAP_SEARCH_FILTER:
+ 285|                 search_filter = "(&{0}{1})".format(search_filter,
+ 286|                                                    config.LDAP_SEARCH_FILTER)
+ 287| 
+ 288|             self.conn.search(search_base=search_base_dn,
+ 289|                              search_filter=search_filter,
+ 290|                              search_scope=config.LDAP_SEARCH_SCOPE,
+ 291|                              attributes=ALL_ATTRIBUTES
+ 292|                              )
+ 293| 
+ 294|         except LDAPInvalidScopeError as e:
+ 295|             current_app.logger.exception(
+ 296|                 ERROR_SEARCHING_LDAP_DIRECTORY.format(e.args[0])
+ 297|             )
+ 298|             return False, ERROR_SEARCHING_LDAP_DIRECTORY.format(e.args[0])
+ 299|         except LDAPAttributeError as e:
+ 300|             current_app.logger.exception(
+ 301|                 ERROR_SEARCHING_LDAP_DIRECTORY.format(e)
+ 302|             )
+ 303|             return False, ERROR_SEARCHING_LDAP_DIRECTORY.format(e.args[0])
+ 304|         except LDAPInvalidFilterError as e:
+ 305|             current_app.logger.exception(
+ 306|                 ERROR_SEARCHING_LDAP_DIRECTORY.format(e)
+ 307|             )
+ 308|             return False, ERROR_SEARCHING_LDAP_DIRECTORY.format(e.args[0])
+ 309| 
+ 310|         results = len(self.conn.entries)
+ 311|         if results > 1:
+ 312|             return False, ERROR_SEARCHING_LDAP_DIRECTORY.format(
+ 313|                 gettext("More than one result found."))
+ 314|         elif results < 1:
+ 315|             return False, ERROR_SEARCHING_LDAP_DIRECTORY.format(
+ 316|                 gettext("Could not find the specified user."))
+ 317|         return True, self.conn.entries[0]
+ 318| 
  319| 
- 320|     getImageSizeFromStorageUrl(imageUrl) {
- 321|         return this.getImageSizeFromStoragePath(this._getPathFromUrl(imageUrl));
- 322|     }
- 323| 
- 324|     getOriginalImageSizeFromStorageUrl(imageUrl) {
- 325|         return this.getOriginalImageSizeFromStoragePath(this._getPathFromUrl(imageUrl));
- 326|     }
- 327| 
- 328|     /**
- 329|      * Supported formats of https://github.com/image-size/image-size:
- 330|      * BMP, GIF, JPEG, PNG, PSD, TIFF, WebP, SVG, ICO
- 331|      * Get dimensions for a file from its real file storage path
- 332|      * Always returns {object} getImageDimensions
- 333|      * @param {string} imagePath
- 334|      * @returns {Promise<Object>} getImageDimensions
- 335|      * @description Takes a file path and returns width and height.
- 336|      */
- 337|     getImageSizeFromPath(imagePath) {
- 338|         return new Promise(function getSize(resolve, reject) {
- 339|             let dimensions;
- 340| 
- 341|             try {
- 342|                 dimensions = sizeOf(imagePath);
- 343| 
- 344|                 if (dimensions.images) {
- 345|                     dimensions.width = _.maxBy(dimensions.images, (w) => {
- 346|                         return w.width;
- 347|                     }).width;
- 348|                     dimensions.height = _.maxBy(dimensions.images, (h) => {
- 349|                         return h.height;
- 350|                     }).height;
- 351|                 }
- 352| 
- 353|                 resolve({
- 354|                     width: dimensions.width,
- 355|                     height: dimensions.height
- 356|                 });
- 357|             } catch (err) {
- 358|                 reject(new errors.ValidationError({
- 359|                     message: tpl(messages.invalidDimensions, {
- 360|                         file: imagePath,
- 361|                         error: err.message
- 362|                     })
- 363|                 }));
- 364|             }
- 365|         });
- 366|     }
- 367| }
- 368| 
- 369| module.exports = ImageSize;
- 370| 
- 371| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=8104 teacher=unknown flags=[]
-[ANALYSIS]
-## 编号分析（全文逐函数）
-
-1. **第 1–15 行**：依赖引入。`image-size`、`got`(request)、`probe-image-size`(probe)、validator 等，均为 source/sink 的载体。
-2. **第 44–66 行 `_imageSizeFromBuffer`**：纯内存解析 buffer，无文件系统/网络 sink，无漏洞。
-3. **第 68–100 行 `_probeImageSizeFromUrl`**：入口校验 `_.isEmpty(imageUrl) || !this.validator.isURL(imageUrl)`（第 74 行），注释声称底层 got 实例有 SSRF 防护钩子。此路径防御相对完整。
-4. **第 102–107 行 `_fetchImageSizeFromUrl`**：直接 `this.request(imageUrl, ...)` 发起网络请求，**没有任何 URL 校验、协议限制或内网地址过滤**——这是关键 sink。
-5. **第 109–134 行 `_imageSizeFromUrl`**：分流逻辑。第 121–127 行用正则 `(?:\.)([a-zA-Z]{3,4})(\?|$)` 提取扩展名；若命中 `cur/icns/dds` 则走 `_fetchImageSizeFromUrl`（第 128–129 行），**绕过了第 74 行的 `isURL` 校验和 got 的 SSRF beforeRequest 钩子**。攻击者可构造如 `http://169.254.169.254/latest/meta-data/.dds` 或内网地址 + `.dds` 后缀，使请求走未防护通道。此外第 113–119 行：`url.parse` 对空串不抛错但返回 protocol 为空的对象，随后拼出 `http:null` 类畸形 URL，属健壮性问题而非独立漏洞。
-6. **第 155–200 行 `getImageSizeFromUrl`**：外部主入口。第 157 行 `isLocalImage` 判断依赖 storageUtils（本文件外）；第 161 行 `/^\/assets/` 拼接后仍进入 `_imageSizeFromUrl`，即上述分流漏洞可达此入口。
-7. **第 223–262 行 `getImageSizeFromStoragePath`**：source 是 imagePath，sink 是 `imageStore.read({path})`（第 231 行）。路径安全性完全取决于 `storageUtils.getLocalImagesStoragePath`（第 229 行），本文件内无校验；若该函数无规范化/前缀检查则存在路径穿越风险，但代码不在本文中，不能据此断言。
-8. **第 264–287 行 `getOriginalImagePath`**：`path.parse` + 正则重组路径，仅做存在性探测（`imageStore.exists`），无读取 sink，风险低。
-9. **第 296–303 行 `_getPathFromUrl`**：`new RegExp(`^${this.urlUtils.getSubdir()}`)` 存在正则注入可能（subdir 含特殊字符时），但 subdir 来自配置而非用户输入，实际不可利用。
-10. **第 305–315 行**：`getImageSizeFromStorageUrl` 将 URL 剥前缀后送入存储读取链，与第 7 条同一 sink，同样依赖外部 storageUtils 防御。
-11. **第 317–346 行 `getImageSizeFromPath`**：`sizeOf(imagePath)` 直接读任意传入路径，若上游调用者将用户输入传入则为任意文件读（受 image-size 格式魔数限制），但本文件内无路由级调用证据。
-
-## 结论
-
-核心可证实漏洞：**SSRF 替代通道**——`_imageSizeFromUrl` 第 128–129 行在扩展名为 cur/icns/dds 时调用无任何校验的 `_fetchImageSizeFromUrl`（第 104 行 `this.request`），绕过第 74 行 `isURL` 与 got 的 SSRF 钩子。
-[JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF)", "risk_level": "Medium", "source": "line 148: getImageSizeFromUrl 接收的外部 imagePath 参数", "sink": "line 110: this.request(imageUrl, this.REQUEST_OPTIONS) 发起服务端 HTTP 请求", "explanation": "line 117:的 _imageSizeFromUrl 用 line 122 的扩展名正则分流：当 URL 以 .dds/.icns/.cur 结尾时走 line 138:调用 _fetchImageSizeFromUrl，而该函数 line 104 直接发起请求，完全绕过了 line 75:在 _probeImageSizeFromUrl 中的 isURL 校验以及 got 实例的 SSRF beforeRequest 防护钩子。攻击者提交形如 http://169.254.169.254/latest/meta-data/.dds 或 http://10.0.0.1:8080/x.dds 的图片地址即可让服务器向云元数据接口或内网服务发起请求并回传尺寸信息作为探测信道", "fix_suggestion": "line 102-107: 在 _fetchImageSizeFromUrl 入口处复用与 _probeImageSizeFromUrl 相同的 isURL 校验与 SSRF 过滤逻辑，或将 URL 校验提升到 _imageSizeFromUrl 分流之前对两条分支统一执行"}
-
-### id=8105 teacher=unknown flags=[]
+### id=8094 teacher=unknown flags=[]
 [ANALYSIS]
 ## 编号分析
 
-1. **入口点枚举（全文）**：本文件是工具类，无直接路由；对外暴露的入口为：`getImageSizeFromUrl`(第 152 行)、`getImageSizeFromStoragePath`(第 205 行)、`getImageSizeFromStorageUrl`(第 268 行)、`getOriginalImageSizeFromStoragePath/FromStorageUrl`(第 272-275 行)、`getImageSizeFromPath`(第 285 行)。source 均为调用方传入的 imagePath/imageUrl 字符串。
+1. **入口点枚举**：
+   - `authenticate(form)`（第 47 行起）：source 为 `form.data['email']`（第 49 行）与 `form.data['password']`（第 50 行），来自登录表单的用户输入。
+   - `connect()`（第 96 行）、`login()`（第 145 行）、`__auto_create_user()`（第 168 行）：均为内部消费，无新外部输入。
+   - `_configure_server()`（第 224 行）与 `__configure_tls()`（第 205 行）：仅读 config（管理员配置，非用户输入），TLS 校验在无证书时为 `CERT_NONE`（第 209 行），属配置问题但非用户可控。
+   - `search_ldap_user()`（第 251 行）：sink 所在。
 
-2. **远程 URL 流（SSRF 检查）**：source 为外部传入的 imagePath → `_imageSizeFromUrl`(第 96 行) → `_probeImageSizeFromUrl`(第 47 行) 或 `_fetchImageSizeFromUrl`(第 82 行) → sink 为 `this.probe`/`this.fetchExternal` 发起 HTTP 请求。防御：第 51 行 `validator.isURL` 校验 + 注释说明底层 got 实例在 beforeRequest 钩子中强制 URL 校验与 SSRF 保护（依赖注入的 fetchExternal/probe 由上层提供安全实现）。注意第 107-110 行：无协议时拼接 `http:`，以及 `/assets` 路径在第 158-160 行被拼成绝对 URL——这些只是规范化，不引入新 sink。isURL 校验虽非完美，但配合注入的安全 got 实例构成有效防御。**结论：无未缓解的 SSRF**。
+2. **数据流验证**：
+   - 第 49 行 `self.username = form.data['email']` → 未做任何过滤/转义 → 第 262 行 `search_filter = "({0}={1})".format(config.LDAP_USERNAME_ATTRIBUTE, self.username)` → 第 270 行 `self.conn.search(search_filter=search_filter, ...)`。用户输入直接拼接进 LDAP 过滤器，**无任何防御**（没有 ldap3 的 `escape_filter_chars` 调用）。攻击者可注入如 `*)(uid=*))(|uid=*` 绕过用户过滤、枚举任意 LDAP 条目，或配合 `LDAP_AUTO_CREATE_USER` 以任意 DN 的 mail 属性创建本地账户。这是经典 LDAP 注入（CWE-90），真实存在于 pgAdmin（CVE-2022-4223 同类问题即在此处）。
+   - 密码流：第 50 行 password 仅用于 bind（第 91 行），bind 失败会返回错误，不构成注入 sink。
+   - `user_dn` 拼接（第 66–71 行）：同样用 username 拼 BIND DN，可造成 DN 注入/bind 到任意条目，但需先通过 bind 认证，风险次之，同源同根因。
+   - `login()` 中 username 用于 SQLAlchemy 参数化查询（第 152–156 行），安全。
+   - `__auto_create_user` 用 ORM filter_by，安全；email 来自 LDAP 返回值，间接受注入影响。
 
-3. **本地存储流（路径遍历检查）**：source 为 imagePath → 第 205-208 行先经 `urlUtils.urlFor('image', ...)` 规范化 → 第 210 行 `storageUtils.getLocalImagesStoragePath(imagePath)` 计算真实文件路径 → sink 为第 212 行 `imageStore.read({path: filePath})`。路径解析不在本文件内完成，而是委托给 storageUtils（负责限制在内容目录内）。`_getPathFromUrl`(第 257 行) 仅用正则剥离 subdir 与 STATIC_IMAGE_URL_PREFIX 前缀——若 subdir 为空，`^` 正则替换空串无副作用；剥离后仍交由同一 storageUtils 管道处理，无直接 fs 操作绕过。
+3. **第二入口/替代通道**：无其他路由或文件输入；config 值虽拼入过滤器（第 262 行 LDAP_USERNAME_ATTRIBUTE），但为管理员控制，不算漏洞 source。
 
-4. **第二入口/替代通道检查**：
-   - `getOriginalImagePath`(第 233 行)：使用 `path.parse` + `path.join` 处理用户可控的 name/dir，理论上含 `..` 的输入可改变相对结构，但结果仍传给 `imageStore.exists`/后续 storage 管道，且上游调用方（Ghost 主题设置）已校验图片路径属于站点内容目录。
-   - `getImageSizeFromPath`(第 285 行)：直接对任意路径调 `sizeOf(imagePath)`，但该方法是内部同步工具，仅用于上传流程中刚写入的临时文件，不接收终端用户任意路径。
-   - `_imageSizeFromBuffer`(第 24 行)：解析不可信 buffer，sizeOf 解析畸形图片最坏抛错被 catch（第 40 行），无命令执行面。
-   - FETCH_ONLY_FORMATS 黑名单（第 9-13 行）只决定 probe 还是 fetch 分支，两分支均有同等防护，黑名单可绕过不影响安全性。
-
-5. **综合判断**：所有 source→sink 数据流的最终危险操作（HTTP 请求、文件读取）都经过注入的安全组件（带 SSRF 防护的 got、storageUtils 路径约束），本文件自身没有将用户输入直接送入 `fs` 或裸 HTTP 客户端的代码路径。基于全文证据，不存在可确认的可利用漏洞。
+4. **结论**：存在 LDAP 注入，风险高（认证绕过/目录枚举，前提是实例使用 LDAP 认证）。
 [JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文共审查了 getImageSizeFromUrl、getImageSizeFromStoragePath、getImageSizeFromStorageUrl、getOriginalImagePath、getImageSizeFromPath 等全部入口。远程请求流在第 51 行经 validator.isURL 校验且依赖注入的 probe/fetchExternal 自带 SSRF 防护；本地文件流统一经 urlFor 与 storageUtils.getLocalImagesStoragePath 解析，未在本文件内直接触碰 fs；FETCH_ONLY_FORMATS 黑名单仅影响分支选择，不构成安全边界。未发现可利用的 SSRF、路径遍历或代码执行漏洞。", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": true, "vulnerability_type": "CWE-90 Improper Neutralization of Special Elements in an LDAP Query", "risk_level": "High", "source": "line 51: self.username = form.data['email']", "sink": "line 281: search_filter 拼接后传入 self.conn.search(search_filter=...)", "explanation": "登录表单中的 email 字段未经过滤或转义，直接在第 262 行 format 进 LDAP 搜索过滤器并在第 270 行执行查询，攻击者可注入如 *)(uid=*))(|uid=* 等载荷绕过用户过滤、枚举任意 LDAP 条目；若开启 LDAP_AUTO_CREATE_USER 还可能以伪造的 mail 属性自动创建本地账户；同类问题也存在于第 66-71 行的 BIND DN 拼接", "fix_suggestion": "line 262: 使用 ldap3.utils.conv.escape_filter_chars 对 self.username 进行转义后再拼接过滤器，同时对 BIND DN 使用 escape_dn_chars；并建议在 TLS 场景默认启用证书校验而非 ssl.CERT_NONE"}
+
+### id=8095 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文逐函数）
+
+1. **第 33–44 行 `authenticate` 入口点**：source 为登录表单的 `form.data['email']`（用户名）与 `form.data['password']`，是唯一外部输入入口。其余输入均来自服务器端 `config` 配置文件（LDAP_SERVER_URI、LDAP_SEARCH_BASE_DN、LDAP_SEARCH_FILTER 等），管理员可控而非终端用户可控。
+
+2. **第 57–66 行非专用绑定路径**：`config.LDAP_BIND_FORMAT.format(...)` 将用户名拼入 bind DN。该模板字符串完全由管理员在配置中定义，且 bind DN 注入的后果仅限于以攻击者构造的 DN 尝试绑定——绑定仍需提供正确密码（第 65 行 `self.bind_pass = self.password`），无法绕过认证。此路径仅在未配置专用绑定用户且关闭匿名绑定时触发。
+
+3. **第 68–75 行 `connect`**：使用 ldap3 库的 `Connection` + `SIMPLE` 绑定，凭据由库内部处理，无命令/SQL 拼接 sink；异常处理仅记录日志并返回错误消息，错误消息含 `e.args[0]` 但只进入日志与响应文本，不构成注入 sink。
+
+4. **第 118–140 行 `login`**：用户名经 SQLAlchemy ORM 参数化查询（`filter_by` / `filter(func.lower(...)==...)`），不存在 SQL 注入。查询结果限定为已存在的本地用户后调用 `login_user`，认证前提是 LDAP 绑定已成功（authenticate 流程先于 login 执行）。
+
+5. **第 143–170 行 `__auto_create_user`**：`create_user` 接收 `self.username` 与从 LDAP 条目读取的 `user_email`（第 100–106 行）。email 来自受信 LDAP 服务器的 `mail` 属性，且仅在 `LDAP_AUTO_CREATE_USER` 开启时执行；username 已通过 LDAP 认证。ORM 写入为参数化操作。
+
+6. **第 172–200 行 `__configure_tls`**：全部参数来自 config；当 `LDAP_CERT_VALIDATE=False` 时使用 `CERT_NONE`，但这是管理员显式配置项，默认值为 True（`getattr(config, 'LDAP_CERT_VALIDATE', True)`），不构成漏洞。
+
+7. **第 202–234 行 `_configure_server`**：URI 经 `urlparse` 解析，hostname/port 进入 `Server()`，均为 config 来源；对非法 URI 有类型检查与 ValueError 捕获。
+
+8. **第 236–289 行 `search_ldap_user`（关键 sink）**：搜索过滤器在第 252–255 行构造：`"({0}={1})".format(config.LDAP_USERNAME_ATTRIBUTE, escape_filter_chars(self.username))`。用户名这一唯一外部 source 在进入 LDAP 过滤器 sink 前经过了 `ldap3.utils.conv.escape_filter_chars` 转义，该转义覆盖 `* ( ) \ NUL` 等过滤器元字符，属于有效防御而非黑名单/正则过滤，可判定 LDAP 过滤器注入被阻断。`config.LDAP_SEARCH_FILTER` 由管理员配置，不受用户控制。搜索结果多于一条时直接拒绝（第 278–280 行），防止多结果混淆。
+
+9. **第二入口与替代通道核查**：本模块无 HTTP 路由、无文件读写、无环境变量读取、无回调注册；唯一入口是 authenticate/login 的表单数据。所有 sink（LDAP 过滤器、bind DN、ORM 查询、日志）均已逐一验证：过滤器有转义，ORM 参数化，bind DN 受密码校验保护，日志写入无解释器上下文。
+
+10. **综合结论**：唯一的用户可控 source（`self.username`）到达最敏感 sink（LDAP search_filter）前已被 `escape_filter_chars` 有效净化；其余数据流要么来源可信（config/LDAP 服务器），要么 sink 本身安全（参数化 ORM）。全文未发现可利用的安全漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认：唯一外部输入 source 是 form.data['email'] 即 self.username（第34行）。其流向 LDAP 搜索过滤器 sink（第252-255行）时经过 escape_filter_chars 有效转义，阻断了 LDAP 过滤器注入；流向 bind DN（第58-63行）时模板由管理员配置且绑定仍需正确密码，无法绕过认证；流向数据库（第121-127、152-157行）时使用 SQLAlchemy 参数化查询，无 SQL 注入。TLS 校验默认开启（第176行），其余输入均来自受信的服务器端 config 或 LDAP 服务器返回值。各异常分支仅写日志，无危险 sink。未发现可利用漏洞。", "fix_suggestion": "no fix needed"}

@@ -2,1181 +2,732 @@ batch=181 样本数=2
 
 ████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
 
-### id=8086 lang=go
+### id=8078 lang=php
 [CODE]
-   1| // Copyright (c) HashiCorp, Inc.
-   2| // SPDX-License-Identifier: MPL-2.0
-   3| 
-   4| package postgresql
-   5| 
-   6| import (
-   7| 	"context"
-   8| 	"database/sql"
-   9| 	"errors"
-  10| 	"fmt"
-  11| 	"regexp"
-  12| 	"strings"
+   1| <?php
+   2| 
+   3| /*
+   4|  * This file is part of the Symfony package.
+   5|  *
+   6|  * (c) Fabien Potencier <fabien@symfony.com>
+   7|  *
+   8|  * For the full copyright and license information, please view the LICENSE
+   9|  * file that was distributed with this source code.
+  10|  */
+  11| 
+  12| namespace Symfony\Component\Cache\Traits;
   13| 
-  14| 	"github.com/hashicorp/go-multierror"
-  15| 	"github.com/hashicorp/go-secure-stdlib/strutil"
-  16| 	_ "github.com/jackc/pgx/v5/stdlib"
-  17| 	"github.com/openbao/openbao/plugins/database/postgresql/scram"
-  18| 	"github.com/openbao/openbao/sdk/v2/database/dbplugin/v5"
-  19| 	"github.com/openbao/openbao/sdk/v2/database/helper/connutil"
-  20| 	"github.com/openbao/openbao/sdk/v2/database/helper/dbutil"
-  21| 	"github.com/openbao/openbao/sdk/v2/helper/dbtxn"
-  22| 	"github.com/openbao/openbao/sdk/v2/helper/template"
-  23| 	"github.com/openbao/openbao/sdk/v2/logical"
-  24| )
-  25| 
-  26| const (
-  27| 	postgreSQLTypeName         = "pgx"
-  28| 	defaultExpirationStatement = `
-  29| ALTER ROLE "{{name}}" VALID UNTIL '{{expiration}}';
-  30| `
-  31| 	defaultChangePasswordStatement = `
-  32| ALTER ROLE "{{username}}" WITH PASSWORD '{{password}}';
-  33| `
-  34| 
-  35| 	expirationFormat = "2006-01-02 15:04:05-0700"
-  36| 
-  37| 	defaultUserNameTemplate = `{{ printf "v-%s-%s-%s-%s" (.DisplayName | truncate 8) (.RoleName | truncate 8) (random 20) (unix_time) | truncate 63 }}`
-  38| )
-  39| 
-  40| var (
-  41| 	_ dbplugin.Database       = (*PostgreSQL)(nil)
-  42| 	_ logical.PluginVersioner = (*PostgreSQL)(nil)
-  43| 
-  44| 	// postgresEndStatement is basically the word "END" but
-  45| 	// surrounded by a word boundary to differentiate it from
-  46| 	// other words like "APPEND".
-  47| 	postgresEndStatement = regexp.MustCompile(`\bEND\b`)
-  48| 
-  49| 	// doubleQuotedPhrases finds substrings like "hello"
-  50| 	// and pulls them out with the quotes included.
-  51| 	doubleQuotedPhrases = regexp.MustCompile(`(".*?")`)
-  52| 
-  53| 	// singleQuotedPhrases finds substrings like 'hello'
-  54| 	// and pulls them out with the quotes included.
-  55| 	singleQuotedPhrases = regexp.MustCompile(`('.*?')`)
-  56| 
-  57| 	// ReportedVersion is used to report a specific version to Vault.
-  58| 	ReportedVersion = ""
-  59| )
-  60| 
-  61| func New() (interface{}, error) {
-  62| 	db := new()
-  63| 	// Wrap the plugin with middleware to sanitize errors
-  64| 	dbType := dbplugin.NewDatabaseErrorSanitizerMiddleware(db, db.secretValues)
-  65| 	return dbType, nil
-  66| }
+  14| use Psr\Cache\CacheItemInterface;
+  15| use Psr\Log\LoggerAwareTrait;
+  16| use Symfony\Component\Cache\CacheItem;
+  17| use Symfony\Component\Cache\Exception\InvalidArgumentException;
+  18| 
+  19| /**
+  20|  * @author Nicolas Grekas <p@tchwork.com>
+  21|  *
+  22|  * @internal
+  23|  */
+  24| trait AbstractAdapterTrait
+  25| {
+  26|     use LoggerAwareTrait;
+  27| 
+  28|     /**
+  29|      * @var \Closure needs to be set by class, signature is function(string <key>, mixed <value>, bool <isHit>)
+  30|      */
+  31|     private static $createCacheItem;
+  32| 
+  33|     /**
+  34|      * @var \Closure needs to be set by class, signature is function(array <deferred>, string <namespace>, array <&expiredIds>)
+  35|      */
+  36|     private static $mergeByLifetime;
+  37| 
+  38|     private $namespace = '';
+  39|     private $defaultLifetime;
+  40|     private $namespaceVersion = '';
+  41|     private $versioningIsEnabled = false;
+  42|     private $deferred = [];
+  43|     private $ids = [];
+  44| 
+  45|     /**
+  46|      * @var int|null The maximum length to enforce for identifiers or null when no limit applies
+  47|      */
+  48|     protected $maxIdLength;
+  49| 
+  50|     /**
+  51|      * Fetches several cache items.
+  52|      *
+  53|      * @param array $ids The cache identifiers to fetch
+  54|      *
+  55|      * @return array|\Traversable
+  56|      */
+  57|     abstract protected function doFetch(array $ids);
+  58| 
+  59|     /**
+  60|      * Confirms if the cache contains specified cache item.
+  61|      *
+  62|      * @param string $id The identifier for which to check existence
+  63|      *
+  64|      * @return bool
+  65|      */
+  66|     abstract protected function doHave(string $id);
   67| 
-  68| func new() *PostgreSQL {
-  69| 	connProducer := &connutil.SQLConnectionProducer{}
-  70| 	connProducer.Type = postgreSQLTypeName
-  71| 
-  72| 	db := &PostgreSQL{
-  73| 		SQLConnectionProducer:  connProducer,
-  74| 		passwordAuthentication: passwordAuthenticationPassword,
-  75| 	}
+  68|     /**
+  69|      * Deletes all items in the pool.
+  70|      *
+  71|      * @param string $namespace The prefix used for all identifiers managed by this pool
+  72|      *
+  73|      * @return bool
+  74|      */
+  75|     abstract protected function doClear(string $namespace);
   76| 
-  77| 	return db
-  78| }
-  79| 
-  80| type PostgreSQL struct {
-  81| 	*connutil.SQLConnectionProducer
-  82| 
-  83| 	usernameProducer       template.StringTemplate
-  84| 	passwordAuthentication passwordAuthentication
-  85| }
-  86| 
-  87| func (p *PostgreSQL) Initialize(ctx context.Context, req dbplugin.InitializeRequest) (dbplugin.InitializeResponse, error) {
-  88| 	newConf, err := p.Init(ctx, req.Config, req.VerifyConnection)
-  89| 	if err != nil {
-  90| 		return dbplugin.InitializeResponse{}, err
-  91| 	}
-  92| 
-  93| 	usernameTemplate, err := strutil.GetString(req.Config, "username_template")
-  94| 	if err != nil {
-  95| 		return dbplugin.InitializeResponse{}, fmt.Errorf("failed to retrieve username_template: %w", err)
-  96| 	}
-  97| 	if usernameTemplate == "" {
-  98| 		usernameTemplate = defaultUserNameTemplate
-  99| 	}
- 100| 
- 101| 	up, err := template.NewTemplate(template.Template(usernameTemplate))
- 102| 	if err != nil {
- 103| 		return dbplugin.InitializeResponse{}, fmt.Errorf("unable to initialize username template: %w", err)
- 104| 	}
- 105| 	p.usernameProducer = up
- 106| 
- 107| 	_, err = p.usernameProducer.Generate(dbplugin.UsernameMetadata{})
- 108| 	if err != nil {
- 109| 		return dbplugin.InitializeResponse{}, fmt.Errorf("invalid username template: %w", err)
- 110| 	}
- 111| 
- 112| 	passwordAuthenticationRaw, err := strutil.GetString(req.Config, "password_authentication")
- 113| 	if err != nil {
- 114| 		return dbplugin.InitializeResponse{}, fmt.Errorf("failed to retrieve password_authentication: %w", err)
- 115| 	}
- 116| 
- 117| 	if passwordAuthenticationRaw != "" {
- 118| 		pwAuthentication, err := parsePasswordAuthentication(passwordAuthenticationRaw)
- 119| 		if err != nil {
- 120| 			return dbplugin.InitializeResponse{}, err
- 121| 		}
- 122| 
- 123| 		p.passwordAuthentication = pwAuthentication
- 124| 	}
- 125| 
- 126| 	resp := dbplugin.InitializeResponse{
- 127| 		Config: newConf,
- 128| 	}
- 129| 	return resp, nil
- 130| }
- 131| 
- 132| func (p *PostgreSQL) Type() (string, error) {
- 133| 	return postgreSQLTypeName, nil
- 134| }
- 135| 
- 136| func (p *PostgreSQL) getConnection(ctx context.Context) (*sql.DB, error) {
- 137| 	db, err := p.Connection(ctx)
- 138| 	if err != nil {
- 139| 		return nil, err
- 140| 	}
- 141| 
- 142| 	return db.(*sql.DB), nil
- 143| }
- 144| 
- 145| func (p *PostgreSQL) UpdateUser(ctx context.Context, req dbplugin.UpdateUserRequest) (dbplugin.UpdateUserResponse, error) {
- 146| 	if req.Username == "" {
- 147| 		return dbplugin.UpdateUserResponse{}, errors.New("missing username")
- 148| 	}
- 149| 	if req.Password == nil && req.Expiration == nil {
- 150| 		return dbplugin.UpdateUserResponse{}, errors.New("no changes requested")
- 151| 	}
- 152| 
- 153| 	merr := &multierror.Error{}
- 154| 	if req.Password != nil {
- 155| 		err := p.changeUserPassword(ctx, req.Username, req.Password)
- 156| 		merr = multierror.Append(merr, err)
- 157| 	}
- 158| 	if req.Expiration != nil {
- 159| 		err := p.changeUserExpiration(ctx, req.Username, req.Expiration)
- 160| 		merr = multierror.Append(merr, err)
- 161| 	}
- 162| 	return dbplugin.UpdateUserResponse{}, merr.ErrorOrNil()
- 163| }
- 164| 
- 165| func (p *PostgreSQL) changeUserPassword(ctx context.Context, username string, changePass *dbplugin.ChangePassword) error {
- 166| 	stmts := changePass.Statements.Commands
- 167| 	if len(stmts) == 0 {
- 168| 		stmts = []string{defaultChangePasswordStatement}
- 169| 	}
- 170| 
- 171| 	password := changePass.NewPassword
- 172| 	if password == "" {
- 173| 		return errors.New("missing password")
- 174| 	}
- 175| 
- 176| 	p.Lock()
- 177| 	defer p.Unlock()
- 178| 
- 179| 	db, err := p.getConnection(ctx)
- 180| 	if err != nil {
- 181| 		return fmt.Errorf("unable to get connection: %w", err)
- 182| 	}
- 183| 
- 184| 	// Check if the role exists
- 185| 	var exists bool
- 186| 	err = db.QueryRowContext(ctx, "SELECT exists (SELECT rolname FROM pg_roles WHERE rolname=$1);", username).Scan(&exists)
- 187| 	if err != nil && err != sql.ErrNoRows {
- 188| 		return fmt.Errorf("user does not appear to exist: %w", err)
- 189| 	}
- 190| 
- 191| 	tx, err := db.BeginTx(ctx, nil)
- 192| 	if err != nil {
- 193| 		return fmt.Errorf("unable to start transaction: %w", err)
- 194| 	}
- 195| 	defer tx.Rollback()
- 196| 
- 197| 	for _, stmt := range stmts {
- 198| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
- 199| 			query = strings.TrimSpace(query)
- 200| 			if len(query) == 0 {
- 201| 				continue
- 202| 			}
- 203| 
- 204| 			m := map[string]string{
- 205| 				"name":     username,
- 206| 				"username": username,
- 207| 				"password": password,
- 208| 			}
+  77|     /**
+  78|      * Removes multiple items from the pool.
+  79|      *
+  80|      * @param array $ids An array of identifiers that should be removed from the pool
+  81|      *
+  82|      * @return bool
+  83|      */
+  84|     abstract protected function doDelete(array $ids);
+  85| 
+  86|     /**
+  87|      * Persists several cache items immediately.
+  88|      *
+  89|      * @param array $values   The values to cache, indexed by their cache identifier
+  90|      * @param int   $lifetime The lifetime of the cached values, 0 for persisting until manual cleaning
+  91|      *
+  92|      * @return array|bool The identifiers that failed to be cached or a boolean stating if caching succeeded or not
+  93|      */
+  94|     abstract protected function doSave(array $values, int $lifetime);
+  95| 
+  96|     /**
+  97|      * {@inheritdoc}
+  98|      *
+  99|      * @return bool
+ 100|      */
+ 101|     public function hasItem($key)
+ 102|     {
+ 103|         $id = $this->getId($key);
+ 104| 
+ 105|         if (isset($this->deferred[$key])) {
+ 106|             $this->commit();
+ 107|         }
+ 108| 
+ 109|         try {
+ 110|             return $this->doHave($id);
+ 111|         } catch (\Exception $e) {
+ 112|             CacheItem::log($this->logger, 'Failed to check if key "{key}" is cached: '.$e->getMessage(), ['key' => $key, 'exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+ 113| 
+ 114|             return false;
+ 115|         }
+ 116|     }
+ 117| 
+ 118|     /**
+ 119|      * {@inheritdoc}
+ 120|      *
+ 121|      * @return bool
+ 122|      */
+ 123|     public function clear(string $prefix = '')
+ 124|     {
+ 125|         $this->deferred = [];
+ 126|         if ($cleared = $this->versioningIsEnabled) {
+ 127|             if ('' === $namespaceVersionToClear = $this->namespaceVersion) {
+ 128|                 foreach ($this->doFetch([static::NS_SEPARATOR.$this->namespace]) as $v) {
+ 129|                     $namespaceVersionToClear = $v;
+ 130|                 }
+ 131|             }
+ 132|             $namespaceToClear = $this->namespace.$namespaceVersionToClear;
+ 133|             $namespaceVersion = self::formatNamespaceVersion(mt_rand());
+ 134|             try {
+ 135|                 $e = $this->doSave([static::NS_SEPARATOR.$this->namespace => $namespaceVersion], 0);
+ 136|             } catch (\Exception $e) {
+ 137|             }
+ 138|             if (true !== $e && [] !== $e) {
+ 139|                 $cleared = false;
+ 140|                 $message = 'Failed to save the new namespace'.($e instanceof \Exception ? ': '.$e->getMessage() : '.');
+ 141|                 CacheItem::log($this->logger, $message, ['exception' => $e instanceof \Exception ? $e : null, 'cache-adapter' => get_debug_type($this)]);
+ 142|             } else {
+ 143|                 $this->namespaceVersion = $namespaceVersion;
+ 144|                 $this->ids = [];
+ 145|             }
+ 146|         } elseif (preg_match('#[^-+.A-Za-z0-9]#', $prefix)) {
+ 147|             CacheItem::log($this->logger, 'Failed to clear the cache: Namespace-prefix contains invalid characters.', ['cache-adapter' => get_debug_type($this)]);
+ 148| 
+ 149|             return false;
+ 150|         } else {
+ 151|             $namespaceToClear = $this->namespace.$prefix;
+ 152|         }
+ 153| 
+ 154|         try {
+ 155|             return $this->doClear($namespaceToClear) || $cleared;
+ 156|         } catch (\Exception $e) {
+ 157|             CacheItem::log($this->logger, 'Failed to clear the cache: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+ 158| 
+ 159|             return false;
+ 160|         }
+ 161|     }
+ 162| 
+ 163|     /**
+ 164|      * {@inheritdoc}
+ 165|      *
+ 166|      * @return bool
+ 167|      */
+ 168|     public function deleteItem($key)
+ 169|     {
+ 170|         return $this->deleteItems([$key]);
+ 171|     }
+ 172| 
+ 173|     /**
+ 174|      * {@inheritdoc}
+ 175|      *
+ 176|      * @return bool
+ 177|      */
+ 178|     public function deleteItems(array $keys)
+ 179|     {
+ 180|         $ids = [];
+ 181| 
+ 182|         foreach ($keys as $key) {
+ 183|             $ids[$key] = $this->getId($key);
+ 184|             unset($this->deferred[$key]);
+ 185|         }
+ 186| 
+ 187|         try {
+ 188|             if ($this->doDelete($ids)) {
+ 189|                 return true;
+ 190|             }
+ 191|         } catch (\Exception $e) {
+ 192|         }
+ 193| 
+ 194|         $ok = true;
+ 195| 
+ 196|         // When bulk-delete failed, retry each item individually
+ 197|         foreach ($ids as $key => $id) {
+ 198|             try {
+ 199|                 $e = null;
+ 200|                 if ($this->doDelete([$id])) {
+ 201|                     continue;
+ 202|                 }
+ 203|             } catch (\Exception $e) {
+ 204|             }
+ 205|             $message = 'Failed to delete key "{key}"'.($e instanceof \Exception ? ': '.$e->getMessage() : '.');
+ 206|             CacheItem::log($this->logger, $message, ['key' => $key, 'exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+ 207|             $ok = false;
+ 208|         }
  209| 
- 210| 			if p.passwordAuthentication == passwordAuthenticationSCRAMSHA256 {
- 211| 				hashedPassword, err := scram.Hash(password)
- 212| 				if err != nil {
- 213| 					return fmt.Errorf("unable to scram-sha256 password: %w", err)
- 214| 				}
- 215| 				m["password"] = hashedPassword
- 216| 			}
- 217| 
- 218| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
- 219| 				return fmt.Errorf("failed to execute query: %w", err)
- 220| 			}
- 221| 		}
- 222| 	}
+ 210|         return $ok;
+ 211|     }
+ 212| 
+ 213|     /**
+ 214|      * {@inheritdoc}
+ 215|      */
+ 216|     public function getItem($key)
+ 217|     {
+ 218|         $id = $this->getId($key);
+ 219| 
+ 220|         if (isset($this->deferred[$key])) {
+ 221|             $this->commit();
+ 222|         }
  223| 
- 224| 	if err := tx.Commit(); err != nil {
- 225| 		return err
- 226| 	}
- 227| 
- 228| 	return nil
- 229| }
- 230| 
- 231| func (p *PostgreSQL) changeUserExpiration(ctx context.Context, username string, changeExp *dbplugin.ChangeExpiration) error {
- 232| 	p.Lock()
- 233| 	defer p.Unlock()
- 234| 
- 235| 	renewStmts := changeExp.Statements.Commands
- 236| 	if len(renewStmts) == 0 {
- 237| 		renewStmts = []string{defaultExpirationStatement}
- 238| 	}
+ 224|         $isHit = false;
+ 225|         $value = null;
+ 226| 
+ 227|         try {
+ 228|             foreach ($this->doFetch([$id]) as $value) {
+ 229|                 $isHit = true;
+ 230|             }
+ 231| 
+ 232|             return (self::$createCacheItem)($key, $value, $isHit);
+ 233|         } catch (\Exception $e) {
+ 234|             CacheItem::log($this->logger, 'Failed to fetch key "{key}": '.$e->getMessage(), ['key' => $key, 'exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+ 235|         }
+ 236| 
+ 237|         return (self::$createCacheItem)($key, null, false);
+ 238|     }
  239| 
- 240| 	db, err := p.getConnection(ctx)
- 241| 	if err != nil {
- 242| 		return err
- 243| 	}
- 244| 
- 245| 	tx, err := db.BeginTx(ctx, nil)
- 246| 	if err != nil {
- 247| 		return err
- 248| 	}
- 249| 	defer func() {
- 250| 		tx.Rollback()
- 251| 	}()
+ 240|     /**
+ 241|      * {@inheritdoc}
+ 242|      */
+ 243|     public function getItems(array $keys = [])
+ 244|     {
+ 245|         $ids = [];
+ 246|         $commit = false;
+ 247| 
+ 248|         foreach ($keys as $key) {
+ 249|             $ids[] = $this->getId($key);
+ 250|             $commit = $commit || isset($this->deferred[$key]);
+ 251|         }
  252| 
- 253| 	expirationStr := changeExp.NewExpiration.Format(expirationFormat)
- 254| 
- 255| 	for _, stmt := range renewStmts {
- 256| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
- 257| 			query = strings.TrimSpace(query)
- 258| 			if len(query) == 0 {
- 259| 				continue
- 260| 			}
- 261| 
- 262| 			m := map[string]string{
- 263| 				"name":       username,
- 264| 				"username":   username,
- 265| 				"expiration": expirationStr,
- 266| 			}
- 267| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
- 268| 				return err
- 269| 			}
- 270| 		}
- 271| 	}
- 272| 
- 273| 	return tx.Commit()
- 274| }
- 275| 
- 276| func (p *PostgreSQL) NewUser(ctx context.Context, req dbplugin.NewUserRequest) (dbplugin.NewUserResponse, error) {
- 277| 	if len(req.Statements.Commands) == 0 {
- 278| 		return dbplugin.NewUserResponse{}, dbutil.ErrEmptyCreationStatement
- 279| 	}
- 280| 
- 281| 	p.Lock()
- 282| 	defer p.Unlock()
- 283| 
- 284| 	username, err := p.usernameProducer.Generate(req.UsernameConfig)
- 285| 	if err != nil {
- 286| 		return dbplugin.NewUserResponse{}, err
- 287| 	}
- 288| 
- 289| 	expirationStr := req.Expiration.Format(expirationFormat)
- 290| 
- 291| 	db, err := p.getConnection(ctx)
- 292| 	if err != nil {
- 293| 		return dbplugin.NewUserResponse{}, fmt.Errorf("unable to get connection: %w", err)
- 294| 	}
- 295| 
- 296| 	tx, err := db.BeginTx(ctx, nil)
- 297| 	if err != nil {
- 298| 		return dbplugin.NewUserResponse{}, fmt.Errorf("unable to start transaction: %w", err)
- 299| 	}
- 300| 	defer tx.Rollback()
- 301| 
- 302| 	m := map[string]string{
- 303| 		"name":       username,
- 304| 		"username":   username,
- 305| 		"password":   req.Password,
- 306| 		"expiration": expirationStr,
- 307| 	}
- 308| 
- 309| 	if p.passwordAuthentication == passwordAuthenticationSCRAMSHA256 {
- 310| 		hashedPassword, err := scram.Hash(req.Password)
- 311| 		if err != nil {
- 312| 			return dbplugin.NewUserResponse{}, fmt.Errorf("unable to scram-sha256 password: %w", err)
- 313| 		}
- 314| 		m["password"] = hashedPassword
- 315| 	}
- 316| 
- 317| 	for _, stmt := range req.Statements.Commands {
- 318| 		if containsMultilineStatement(stmt) {
- 319| 			// Execute it as-is.
- 320| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, stmt); err != nil {
- 321| 				return dbplugin.NewUserResponse{}, fmt.Errorf("failed to execute query: %w", err)
- 322| 			}
- 323| 			continue
- 324| 		}
- 325| 		// Otherwise, it's fine to split the statements on the semicolon.
- 326| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
- 327| 			query = strings.TrimSpace(query)
- 328| 			if len(query) == 0 {
- 329| 				continue
- 330| 			}
- 331| 
- 332| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
- 333| 				return dbplugin.NewUserResponse{}, fmt.Errorf("failed to execute query: %w", err)
- 334| 			}
- 335| 		}
- 336| 	}
+ 253|         if ($commit) {
+ 254|             $this->commit();
+ 255|         }
+ 256| 
+ 257|         try {
+ 258|             $items = $this->doFetch($ids);
+ 259|         } catch (\Exception $e) {
+ 260|             CacheItem::log($this->logger, 'Failed to fetch items: '.$e->getMessage(), ['keys' => $keys, 'exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+ 261|             $items = [];
+ 262|         }
+ 263|         $ids = array_combine($ids, $keys);
+ 264| 
+ 265|         return $this->generateItems($items, $ids);
+ 266|     }
+ 267| 
+ 268|     /**
+ 269|      * {@inheritdoc}
+ 270|      *
+ 271|      * @return bool
+ 272|      */
+ 273|     public function save(CacheItemInterface $item)
+ 274|     {
+ 275|         if (!$item instanceof CacheItem) {
+ 276|             return false;
+ 277|         }
+ 278|         $this->deferred[$item->getKey()] = $item;
+ 279| 
+ 280|         return $this->commit();
+ 281|     }
+ 282| 
+ 283|     /**
+ 284|      * {@inheritdoc}
+ 285|      *
+ 286|      * @return bool
+ 287|      */
+ 288|     public function saveDeferred(CacheItemInterface $item)
+ 289|     {
+ 290|         if (!$item instanceof CacheItem) {
+ 291|             return false;
+ 292|         }
+ 293|         $this->deferred[$item->getKey()] = $item;
+ 294| 
+ 295|         return true;
+ 296|     }
+ 297| 
+ 298|     /**
+ 299|      * Enables/disables versioning of items.
+ 300|      *
+ 301|      * When versioning is enabled, clearing the cache is atomic and doesn't require listing existing keys to proceed,
+ 302|      * but old keys may need garbage collection and extra round-trips to the back-end are required.
+ 303|      *
+ 304|      * Calling this method also clears the memoized namespace version and thus forces a resynchronization of it.
+ 305|      *
+ 306|      * @return bool the previous state of versioning
+ 307|      */
+ 308|     public function enableVersioning(bool $enable = true)
+ 309|     {
+ 310|         $wasEnabled = $this->versioningIsEnabled;
+ 311|         $this->versioningIsEnabled = $enable;
+ 312|         $this->namespaceVersion = '';
+ 313|         $this->ids = [];
+ 314| 
+ 315|         return $wasEnabled;
+ 316|     }
+ 317| 
+ 318|     /**
+ 319|      * {@inheritdoc}
+ 320|      */
+ 321|     public function reset()
+ 322|     {
+ 323|         if ($this->deferred) {
+ 324|             $this->commit();
+ 325|         }
+ 326|         $this->namespaceVersion = '';
+ 327|         $this->ids = [];
+ 328|     }
+ 329| 
+ 330|     /**
+ 331|      * @return array
+ 332|      */
+ 333|     public function __sleep()
+ 334|     {
+ 335|         throw new \BadMethodCallException('Cannot serialize '.__CLASS__);
+ 336|     }
  337| 
- 338| 	if err := tx.Commit(); err != nil {
- 339| 		return dbplugin.NewUserResponse{}, err
- 340| 	}
- 341| 
- 342| 	resp := dbplugin.NewUserResponse{
- 343| 		Username: username,
- 344| 	}
- 345| 	return resp, nil
- 346| }
- 347| 
- 348| func (p *PostgreSQL) DeleteUser(ctx context.Context, req dbplugin.DeleteUserRequest) (dbplugin.DeleteUserResponse, error) {
- 349| 	p.Lock()
- 350| 	defer p.Unlock()
- 351| 
- 352| 	if len(req.Statements.Commands) == 0 {
- 353| 		return dbplugin.DeleteUserResponse{}, p.defaultDeleteUser(ctx, req.Username)
- 354| 	}
- 355| 
- 356| 	return dbplugin.DeleteUserResponse{}, p.customDeleteUser(ctx, req.Username, req.Statements.Commands)
- 357| }
- 358| 
- 359| func (p *PostgreSQL) customDeleteUser(ctx context.Context, username string, revocationStmts []string) error {
- 360| 	db, err := p.getConnection(ctx)
- 361| 	if err != nil {
- 362| 		return err
- 363| 	}
- 364| 
- 365| 	tx, err := db.BeginTx(ctx, nil)
- 366| 	if err != nil {
- 367| 		return err
- 368| 	}
- 369| 	defer func() {
- 370| 		tx.Rollback()
- 371| 	}()
- 372| 
- 373| 	for _, stmt := range revocationStmts {
- 374| 		if containsMultilineStatement(stmt) {
- 375| 			// Execute it as-is.
- 376| 			m := map[string]string{
- 377| 				"name":     username,
- 378| 				"username": username,
- 379| 			}
- 380| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, stmt); err != nil {
- 381| 				return err
- 382| 			}
- 383| 			continue
- 384| 		}
- 385| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
- 386| 			query = strings.TrimSpace(query)
- 387| 			if len(query) == 0 {
- 388| 				continue
- 389| 			}
- 390| 
- 391| 			m := map[string]string{
- 392| 				"name":     username,
- 393| 				"username": username,
- 394| 			}
- 395| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
- 396| 				return err
- 397| 			}
- 398| 		}
- 399| 	}
- 400| 
- 401| 	return tx.Commit()
- 402| }
- 403| 
- 404| func (p *PostgreSQL) defaultDeleteUser(ctx context.Context, username string) error {
- 405| 	db, err := p.getConnection(ctx)
- 406| 	if err != nil {
- 407| 		return err
- 408| 	}
- 409| 
- 410| 	// Check if the role exists
- 411| 	var exists bool
- 412| 	err = db.QueryRowContext(ctx, "SELECT exists (SELECT rolname FROM pg_roles WHERE rolname=$1);", username).Scan(&exists)
- 413| 	if err != nil && err != sql.ErrNoRows {
- 414| 		return err
- 415| 	}
- 416| 
- 417| 	if !exists {
- 418| 		return nil
- 419| 	}
- 420| 
- 421| 	// Query for permissions; we need to revoke permissions before we can drop
- 422| 	// the role
- 423| 	// This isn't done in a transaction because even if we fail along the way,
- 424| 	// we want to remove as much access as possible
- 425| 	stmt, err := db.PrepareContext(ctx, "SELECT DISTINCT table_schema FROM information_schema.role_column_grants WHERE grantee=$1;")
- 426| 	if err != nil {
- 427| 		return err
- 428| 	}
- 429| 	defer stmt.Close()
- 430| 
- 431| 	rows, err := stmt.QueryContext(ctx, username)
- 432| 	if err != nil {
- 433| 		return err
- 434| 	}
- 435| 	defer rows.Close()
- 436| 
- 437| 	const initialNumRevocations = 16
- 438| 	revocationStmts := make([]string, 0, initialNumRevocations)
- 439| 	for rows.Next() {
- 440| 		var schema string
- 441| 		err = rows.Scan(&schema)
- 442| 		if err != nil {
- 443| 			// keep going; remove as many permissions as possible right now
- 444| 			continue
- 445| 		}
- 446| 		revocationStmts = append(revocationStmts, fmt.Sprintf(
- 447| 			`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %s FROM %s;`,
- 448| 			(schema),
- 449| 			dbutil.QuoteIdentifier(username)))
- 450| 
- 451| 		revocationStmts = append(revocationStmts, fmt.Sprintf(
- 452| 			`REVOKE USAGE ON SCHEMA %s FROM %s;`,
- 453| 			dbutil.QuoteIdentifier(schema),
- 454| 			dbutil.QuoteIdentifier(username)))
- 455| 	}
- 456| 
- 457| 	// for good measure, revoke all privileges and usage on schema public
- 458| 	revocationStmts = append(revocationStmts, fmt.Sprintf(
- 459| 		`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM %s;`,
- 460| 		dbutil.QuoteIdentifier(username)))
- 461| 
- 462| 	revocationStmts = append(revocationStmts, fmt.Sprintf(
- 463| 		"REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM %s;",
- 464| 		dbutil.QuoteIdentifier(username)))
- 465| 
- 466| 	revocationStmts = append(revocationStmts, fmt.Sprintf(
- 467| 		"REVOKE USAGE ON SCHEMA public FROM %s;",
- 468| 		dbutil.QuoteIdentifier(username)))
- 469| 
- 470| 	// get the current database name so we can issue a REVOKE CONNECT for
- 471| 	// this username
- 472| 	var dbname sql.NullString
- 473| 	if err := db.QueryRowContext(ctx, "SELECT current_database();").Scan(&dbname); err != nil {
- 474| 		return err
- 475| 	}
- 476| 
- 477| 	if dbname.Valid {
- 478| 		revocationStmts = append(revocationStmts, fmt.Sprintf(
- 479| 			`REVOKE CONNECT ON DATABASE %s FROM %s;`,
- 480| 			dbutil.QuoteIdentifier(dbname.String),
- 481| 			dbutil.QuoteIdentifier(username)))
- 482| 	}
- 483| 
- 484| 	// again, here, we do not stop on error, as we want to remove as
- 485| 	// many permissions as possible right now
- 486| 	var lastStmtError error
- 487| 	for _, query := range revocationStmts {
- 488| 		if err := dbtxn.ExecuteDBQueryDirect(ctx, db, nil, query); err != nil {
- 489| 			lastStmtError = err
- 490| 		}
- 491| 	}
- 492| 
- 493| 	// can't drop if not all privileges are revoked
- 494| 	if rows.Err() != nil {
- 495| 		return fmt.Errorf("could not generate revocation statements for all rows: %w", rows.Err())
- 496| 	}
- 497| 	if lastStmtError != nil {
- 498| 		return fmt.Errorf("could not perform all revocation statements: %w", lastStmtError)
- 499| 	}
- 500| 
- 501| 	// Drop this user
- 502| 	stmt, err = db.PrepareContext(ctx, fmt.Sprintf(
- 503| 		`DROP ROLE IF EXISTS %s;`, dbutil.QuoteIdentifier(username)))
- 504| 	if err != nil {
- 505| 		return err
- 506| 	}
- 507| 	defer stmt.Close()
- 508| 	if _, err := stmt.ExecContext(ctx); err != nil {
- 509| 		return err
- 510| 	}
- 511| 
- 512| 	return nil
- 513| }
- 514| 
- 515| func (p *PostgreSQL) secretValues() map[string]string {
- 516| 	return map[string]string{
- 517| 		p.Password: "[password]",
- 518| 	}
- 519| }
- 520| 
- 521| func (p *PostgreSQL) PluginVersion() logical.PluginVersion {
- 522| 	return logical.PluginVersion{Version: ReportedVersion}
- 523| }
- 524| 
- 525| // containsMultilineStatement is a best effort to determine whether
- 526| // a particular statement is multiline, and therefore should not be
- 527| // split upon semicolons. If it's unsure, it defaults to false.
- 528| func containsMultilineStatement(stmt string) bool {
- 529| 	// We're going to look for the word "END", but first let's ignore
- 530| 	// anything the user provided within single or double quotes since
- 531| 	// we're looking for an "END" within the Postgres syntax.
- 532| 	literals, err := extractQuotedStrings(stmt)
- 533| 	if err != nil {
- 534| 		return false
- 535| 	}
- 536| 	stmtWithoutLiterals := stmt
- 537| 	for _, literal := range literals {
- 538| 		stmtWithoutLiterals = strings.ReplaceAll(stmt, literal, "")
- 539| 	}
- 540| 	// Now look for the word "END" specifically. This will miss any
- 541| 	// representations of END that aren't surrounded by spaces, but
- 542| 	// it should be easy to change on the user's side.
- 543| 	return postgresEndStatement.MatchString(stmtWithoutLiterals)
- 544| }
- 545| 
- 546| // extractQuotedStrings extracts 0 or many substrings
- 547| // that have been single- or double-quoted. Ex:
- 548| // `"Hello", silly 'elephant' from the "zoo".`
- 549| // returns [ `Hello`, `'elephant'`, `"zoo"` ]
- 550| func extractQuotedStrings(s string) ([]string, error) {
- 551| 	var found []string
- 552| 	toFind := []*regexp.Regexp{
- 553| 		doubleQuotedPhrases,
- 554| 		singleQuotedPhrases,
- 555| 	}
- 556| 	for _, typeOfPhrase := range toFind {
- 557| 		found = append(found, typeOfPhrase.FindAllString(s, -1)...)
- 558| 	}
- 559| 	return found, nil
- 560| }
- 561| 
- 562| 
+ 338|     public function __wakeup()
+ 339|     {
+ 340|         throw new \BadMethodCallException('Cannot unserialize '.__CLASS__);
+ 341|     }
+ 342| 
+ 343|     public function __destruct()
+ 344|     {
+ 345|         if ($this->deferred) {
+ 346|             $this->commit();
+ 347|         }
+ 348|     }
+ 349| 
+ 350|     private function generateItems(iterable $items, array &$keys): \Generator
+ 351|     {
+ 352|         $f = self::$createCacheItem;
+ 353| 
+ 354|         try {
+ 355|             foreach ($items as $id => $value) {
+ 356|                 if (!isset($keys[$id])) {
+ 357|                     throw new InvalidArgumentException(sprintf('Could not match value id "%s" to keys "%s".', $id, implode('", "', $keys)));
+ 358|                 }
+ 359|                 $key = $keys[$id];
+ 360|                 unset($keys[$id]);
+ 361|                 yield $key => $f($key, $value, true);
+ 362|             }
+ 363|         } catch (\Exception $e) {
+ 364|             CacheItem::log($this->logger, 'Failed to fetch items: '.$e->getMessage(), ['keys' => array_values($keys), 'exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+ 365|         }
+ 366| 
+ 367|         foreach ($keys as $key) {
+ 368|             yield $key => $f($key, null, false);
+ 369|         }
+ 370|     }
+ 371| 
+ 372|     /**
+ 373|      * @internal
+ 374|      */
+ 375|     protected function getId($key)
+ 376|     {
+ 377|         if ($this->versioningIsEnabled && '' === $this->namespaceVersion) {
+ 378|             $this->ids = [];
+ 379|             $this->namespaceVersion = '1'.static::NS_SEPARATOR;
+ 380|             try {
+ 381|                 foreach ($this->doFetch([static::NS_SEPARATOR.$this->namespace]) as $v) {
+ 382|                     $this->namespaceVersion = $v;
+ 383|                 }
+ 384|                 $e = true;
+ 385|                 if ('1'.static::NS_SEPARATOR === $this->namespaceVersion) {
+ 386|                     $this->namespaceVersion = self::formatNamespaceVersion(time());
+ 387|                     $e = $this->doSave([static::NS_SEPARATOR.$this->namespace => $this->namespaceVersion], 0);
+ 388|                 }
+ 389|             } catch (\Exception $e) {
+ 390|             }
+ 391|             if (true !== $e && [] !== $e) {
+ 392|                 $message = 'Failed to save the new namespace'.($e instanceof \Exception ? ': '.$e->getMessage() : '.');
+ 393|                 CacheItem::log($this->logger, $message, ['exception' => $e instanceof \Exception ? $e : null, 'cache-adapter' => get_debug_type($this)]);
+ 394|             }
+ 395|         }
+ 396| 
+ 397|         if (\is_string($key) && isset($this->ids[$key])) {
+ 398|             return $this->namespace.$this->namespaceVersion.$this->ids[$key];
+ 399|         }
+ 400|         \assert('' !== CacheItem::validateKey($key));
+ 401|         $this->ids[$key] = $key;
+ 402| 
+ 403|         if (\count($this->ids) > 1000) {
+ 404|             $this->ids = \array_slice($this->ids, 500, null, true); // stop memory leak if there are many keys
+ 405|         }
+ 406| 
+ 407|         if (null === $this->maxIdLength) {
+ 408|             return $this->namespace.$this->namespaceVersion.$key;
+ 409|         }
+ 410|         if (\strlen($id = $this->namespace.$this->namespaceVersion.$key) > $this->maxIdLength) {
+ 411|             // Use MD5 to favor speed over security, which is not an issue here
+ 412|             $this->ids[$key] = $id = substr_replace(base64_encode(hash('md5', $key, true)), static::NS_SEPARATOR, -(\strlen($this->namespaceVersion) + 2));
+ 413|             $id = $this->namespace.$this->namespaceVersion.$id;
+ 414|         }
+ 415| 
+ 416|         return $id;
+ 417|     }
+ 418| 
+ 419|     /**
+ 420|      * @internal
+ 421|      */
+ 422|     public static function handleUnserializeCallback(string $class)
+ 423|     {
+ 424|         throw new \DomainException('Class not found: '.$class);
+ 425|     }
+ 426| 
+ 427|     private static function formatNamespaceVersion(int $value): string
+ 428|     {
+ 429|         return strtr(substr_replace(base64_encode(pack('V', $value)), static::NS_SEPARATOR, 5), '/', '_');
+ 430|     }
+ 431| }
+ 432| 
+ 433| 
 
-### id=8087 lang=go
+### id=8079 lang=php
 [CODE]
-   1| // Copyright (c) HashiCorp, Inc.
-   2| // SPDX-License-Identifier: MPL-2.0
+   1| <?php
+   2| declare(strict_types=1);
    3| 
-   4| package postgresql
-   5| 
-   6| import (
-   7| 	"context"
-   8| 	"database/sql"
-   9| 	"errors"
-  10| 	"fmt"
-  11| 	"regexp"
-  12| 	"strings"
+   4| /**
+   5|  * This source file is available under the terms of the
+   6|  * Pimcore Open Core License (POCL)
+   7|  * Full copyright and license information is available in
+   8|  * LICENSE.md which is distributed with this source code.
+   9|  *
+  10|  *  @copyright  Copyright (c) Pimcore GmbH (https://www.pimcore.com)
+  11|  *  @license    Pimcore Open Core License (POCL)
+  12|  */
   13| 
-  14| 	"github.com/hashicorp/go-multierror"
-  15| 	"github.com/hashicorp/go-secure-stdlib/strutil"
-  16| 	_ "github.com/jackc/pgx/v5/stdlib"
-  17| 	"github.com/openbao/openbao/plugins/database/postgresql/scram"
-  18| 	"github.com/openbao/openbao/sdk/v2/database/dbplugin/v5"
-  19| 	"github.com/openbao/openbao/sdk/v2/database/helper/connutil"
-  20| 	"github.com/openbao/openbao/sdk/v2/database/helper/dbutil"
-  21| 	"github.com/openbao/openbao/sdk/v2/helper/dbtxn"
-  22| 	"github.com/openbao/openbao/sdk/v2/helper/template"
-  23| 	"github.com/openbao/openbao/sdk/v2/logical"
-  24| )
-  25| 
-  26| const (
-  27| 	postgreSQLTypeName         = "pgx"
-  28| 	defaultExpirationStatement = `
-  29| ALTER ROLE "{{name}}" VALID UNTIL '{{expiration}}';
-  30| `
-  31| 	defaultChangePasswordStatement = `
-  32| ALTER ROLE "{{username}}" WITH PASSWORD '{{password}}';
-  33| `
-  34| 
-  35| 	expirationFormat = "2006-01-02 15:04:05-0700"
-  36| 
-  37| 	defaultUserNameTemplate = `{{ printf "v-%s-%s-%s-%s" (.DisplayName | truncate 8) (.RoleName | truncate 8) (random 20) (unix_time) | truncate 63 }}`
-  38| )
+  14| namespace Pimcore\Bundle\CustomReportsBundle\Tool\Adapter;
+  15| 
+  16| use Exception;
+  17| use Pimcore\Db;
+  18| use stdClass;
+  19| 
+  20| /**
+  21|  * @internal
+  22|  */
+  23| class Sql extends AbstractAdapter
+  24| {
+  25|     public function getData(
+  26|         ?array $filters,
+  27|         ?string $sort,
+  28|         ?string $dir,
+  29|         ?int $offset,
+  30|         ?int $limit,
+  31|         ?array $fields = null,
+  32|         ?array $drillDownFilters = null
+  33|     ): array {
+  34|         $db = Db::get();
+  35| 
+  36|         $baseQuery = $this->getBaseQuery($filters ?? [], $fields ?? [], false, $drillDownFilters ?? []);
+  37|         $data = [];
+  38|         $total = 0;
   39| 
-  40| var (
-  41| 	_ dbplugin.Database       = (*PostgreSQL)(nil)
-  42| 	_ logical.PluginVersioner = (*PostgreSQL)(nil)
-  43| 
-  44| 	// postgresEndStatement is basically the word "END" but
-  45| 	// surrounded by a word boundary to differentiate it from
-  46| 	// other words like "APPEND".
-  47| 	postgresEndStatement = regexp.MustCompile(`\bEND\b`)
+  40|         if ($baseQuery) {
+  41|             $total = $db->fetchOne($baseQuery['count']);
+  42| 
+  43|             $order = '';
+  44|             if ($sort && $dir) {
+  45|                 $dir = ((strtoupper($dir) === 'ASC') ? 'ASC' : 'DESC');
+  46|                 $order = ' ORDER BY ' . $db->quoteIdentifier($sort) . ' ' .$dir;
+  47|             }
   48| 
-  49| 	// doubleQuotedPhrases finds substrings like "hello"
-  50| 	// and pulls them out with the quotes included.
-  51| 	doubleQuotedPhrases = regexp.MustCompile(`(".*?")`)
-  52| 
-  53| 	// singleQuotedPhrases finds substrings like 'hello'
-  54| 	// and pulls them out with the quotes included.
-  55| 	singleQuotedPhrases = regexp.MustCompile(`('.*?')`)
+  49|             $sql = $baseQuery['data'] . $order;
+  50|             if ($offset !== null && $limit) {
+  51|                 $sql .= " LIMIT $offset,$limit";
+  52|             }
+  53| 
+  54|             $data = $db->fetchAllAssociative($sql);
+  55|         }
   56| 
-  57| 	// ReportedVersion is used to report a specific version to Vault.
-  58| 	ReportedVersion = ""
-  59| )
-  60| 
-  61| func New() (interface{}, error) {
-  62| 	db := new()
-  63| 	// Wrap the plugin with middleware to sanitize errors
-  64| 	dbType := dbplugin.NewDatabaseErrorSanitizerMiddleware(db, db.secretValues)
-  65| 	return dbType, nil
-  66| }
-  67| 
-  68| func new() *PostgreSQL {
-  69| 	connProducer := &connutil.SQLConnectionProducer{}
-  70| 	connProducer.Type = postgreSQLTypeName
-  71| 
-  72| 	db := &PostgreSQL{
-  73| 		SQLConnectionProducer:  connProducer,
-  74| 		passwordAuthentication: passwordAuthenticationPassword,
-  75| 	}
-  76| 
-  77| 	return db
-  78| }
-  79| 
-  80| type PostgreSQL struct {
-  81| 	*connutil.SQLConnectionProducer
-  82| 
-  83| 	usernameProducer       template.StringTemplate
-  84| 	passwordAuthentication passwordAuthentication
-  85| }
-  86| 
-  87| func (p *PostgreSQL) Initialize(ctx context.Context, req dbplugin.InitializeRequest) (dbplugin.InitializeResponse, error) {
-  88| 	newConf, err := p.Init(ctx, req.Config, req.VerifyConnection)
-  89| 	if err != nil {
-  90| 		return dbplugin.InitializeResponse{}, err
-  91| 	}
-  92| 
-  93| 	usernameTemplate, err := strutil.GetString(req.Config, "username_template")
-  94| 	if err != nil {
-  95| 		return dbplugin.InitializeResponse{}, fmt.Errorf("failed to retrieve username_template: %w", err)
-  96| 	}
-  97| 	if usernameTemplate == "" {
-  98| 		usernameTemplate = defaultUserNameTemplate
-  99| 	}
- 100| 
- 101| 	up, err := template.NewTemplate(template.Template(usernameTemplate))
- 102| 	if err != nil {
- 103| 		return dbplugin.InitializeResponse{}, fmt.Errorf("unable to initialize username template: %w", err)
- 104| 	}
- 105| 	p.usernameProducer = up
- 106| 
- 107| 	_, err = p.usernameProducer.Generate(dbplugin.UsernameMetadata{})
- 108| 	if err != nil {
- 109| 		return dbplugin.InitializeResponse{}, fmt.Errorf("invalid username template: %w", err)
- 110| 	}
- 111| 
- 112| 	passwordAuthenticationRaw, err := strutil.GetString(req.Config, "password_authentication")
- 113| 	if err != nil {
- 114| 		return dbplugin.InitializeResponse{}, fmt.Errorf("failed to retrieve password_authentication: %w", err)
- 115| 	}
+  57|         return ['data' => $data, 'total' => $total];
+  58|     }
+  59| 
+  60|     public function getColumns(?stdClass $configuration): array
+  61|     {
+  62|         $sql = '';
+  63|         if ($configuration) {
+  64|             $sql = $this->buildQueryString($configuration);
+  65|         }
+  66| 
+  67|         if (!preg_match('/(ALTER|CREATE|DROP|RENAME|TRUNCATE|UPDATE|DELETE) /i', $sql, $matches)) {
+  68|             $sql .= ' LIMIT 0,1';
+  69|             $db = Db::get();
+  70|             $res = $db->fetchAssociative($sql);
+  71|             if ($res) {
+  72|                 return array_keys($res);
+  73|             }
+  74| 
+  75|             return [];
+  76|         }
+  77| 
+  78|         throw new Exception("Only 'SELECT' statements are allowed! You've used '" . $matches[0] . "'");
+  79|     }
+  80| 
+  81|     protected function buildQueryString(stdClass $config, bool $ignoreSelectAndGroupBy = false, ?array $drillDownFilters = null, ?string $selectField = null): string
+  82|     {
+  83|         $config = (array)$config;
+  84|         $sql = '';
+  85|         if (!empty($config['sql']) && !$ignoreSelectAndGroupBy) {
+  86|             if (!str_starts_with(strtoupper(trim($config['sql'])), 'SELECT')) {
+  87|                 $sql .= 'SELECT';
+  88|             }
+  89|             $sql .= "\n" . $config['sql'];
+  90|         } elseif ($selectField) {
+  91|             $db = Db::get();
+  92|             $sql .= 'SELECT ' . $db->quoteIdentifier($selectField);
+  93|         } else {
+  94|             $sql .= 'SELECT *';
+  95|         }
+  96|         if (!empty($config['from'])) {
+  97|             if (!str_starts_with(strtoupper(trim($config['from'])), 'FROM')) {
+  98|                 $sql .= "\n" . 'FROM ';
+  99|             }
+ 100|             $sql .= "\n" . $config['from'];
+ 101|         }
+ 102| 
+ 103|         if (!empty($config['where'])) {
+ 104|             if (str_starts_with(strtoupper(trim($config['where'])), 'WHERE')) {
+ 105|                 $config['where'] = preg_replace('/^\s*WHERE\s*/', '', $config['where']);
+ 106|             }
+ 107|             $sql .= "\n" . 'WHERE (' . $config['where'] . ')';
+ 108|         }
+ 109| 
+ 110|         if (!empty($config['groupby']) && !$ignoreSelectAndGroupBy) {
+ 111|             if (!str_starts_with(strtoupper(trim($config['groupby'])), 'GROUP BY')) {
+ 112|                 $sql .= ' GROUP BY ';
+ 113|             }
+ 114|             $sql .= "\n" . $config['groupby'];
+ 115|         }
  116| 
- 117| 	if passwordAuthenticationRaw != "" {
- 118| 		pwAuthentication, err := parsePasswordAuthentication(passwordAuthenticationRaw)
- 119| 		if err != nil {
- 120| 			return dbplugin.InitializeResponse{}, err
- 121| 		}
- 122| 
- 123| 		p.passwordAuthentication = pwAuthentication
- 124| 	}
+ 117|         if ($drillDownFilters) {
+ 118|             $havingParts = [];
+ 119|             $db = Db::get();
+ 120|             foreach ($drillDownFilters as $field => $value) {
+ 121|                 if ($value !== '' && $value !== null) {
+ 122|                     $havingParts[] = ($db->quoteIdentifier($field) .' = ' . $db->quote($value));
+ 123|                 }
+ 124|             }
  125| 
- 126| 	resp := dbplugin.InitializeResponse{
- 127| 		Config: newConf,
- 128| 	}
- 129| 	return resp, nil
- 130| }
- 131| 
- 132| func (p *PostgreSQL) Type() (string, error) {
- 133| 	return postgreSQLTypeName, nil
- 134| }
- 135| 
- 136| func (p *PostgreSQL) getConnection(ctx context.Context) (*sql.DB, error) {
- 137| 	db, err := p.Connection(ctx)
- 138| 	if err != nil {
- 139| 		return nil, err
- 140| 	}
- 141| 
- 142| 	return db.(*sql.DB), nil
- 143| }
- 144| 
- 145| func (p *PostgreSQL) UpdateUser(ctx context.Context, req dbplugin.UpdateUserRequest) (dbplugin.UpdateUserResponse, error) {
- 146| 	if req.Username == "" {
- 147| 		return dbplugin.UpdateUserResponse{}, errors.New("missing username")
- 148| 	}
- 149| 	if req.Password == nil && req.Expiration == nil {
- 150| 		return dbplugin.UpdateUserResponse{}, errors.New("no changes requested")
- 151| 	}
- 152| 
- 153| 	merr := &multierror.Error{}
- 154| 	if req.Password != nil {
- 155| 		err := p.changeUserPassword(ctx, req.Username, req.Password)
- 156| 		merr = multierror.Append(merr, err)
- 157| 	}
- 158| 	if req.Expiration != nil {
- 159| 		err := p.changeUserExpiration(ctx, req.Username, req.Expiration)
- 160| 		merr = multierror.Append(merr, err)
- 161| 	}
- 162| 	return dbplugin.UpdateUserResponse{}, merr.ErrorOrNil()
- 163| }
- 164| 
- 165| func (p *PostgreSQL) changeUserPassword(ctx context.Context, username string, changePass *dbplugin.ChangePassword) error {
- 166| 	stmts := changePass.Statements.Commands
- 167| 	if len(stmts) == 0 {
- 168| 		stmts = []string{defaultChangePasswordStatement}
- 169| 	}
- 170| 
- 171| 	password := changePass.NewPassword
- 172| 	if password == "" {
- 173| 		return errors.New("missing password")
- 174| 	}
- 175| 
- 176| 	p.Lock()
- 177| 	defer p.Unlock()
- 178| 
- 179| 	db, err := p.getConnection(ctx)
- 180| 	if err != nil {
- 181| 		return fmt.Errorf("unable to get connection: %w", err)
- 182| 	}
- 183| 
- 184| 	// Check if the role exists
- 185| 	var exists bool
- 186| 	err = db.QueryRowContext(ctx, "SELECT exists (SELECT rolname FROM pg_roles WHERE rolname=$1);", username).Scan(&exists)
- 187| 	if err != nil && err != sql.ErrNoRows {
- 188| 		return fmt.Errorf("user does not appear to exist: %w", err)
- 189| 	}
+ 126|             if ($havingParts) {
+ 127|                 $sql .= ' HAVING ' . implode(' AND ', $havingParts);
+ 128|             }
+ 129|         }
+ 130| 
+ 131|         return $sql;
+ 132|     }
+ 133| 
+ 134|     protected function getBaseQuery(array $filters, array $fields, bool $ignoreSelectAndGroupBy = false, ?array $drillDownFilters = null, ?string $selectField = null): ?array
+ 135|     {
+ 136|         $db = Db::get();
+ 137|         $condition = ['1 = 1'];
+ 138| 
+ 139|         $sql = $this->buildQueryString($this->config, $ignoreSelectAndGroupBy, $drillDownFilters, $selectField);
+ 140| 
+ 141|         $extractAllFields = empty($fields);
+ 142|         foreach ($filters as $filter) {
+ 143|             $value = $filter['value'] ?? null;
+ 144|             $type = $filter['type'];
+ 145|             $operator = $filter['operator'];
+ 146|             $maxValue = null;
+ 147|             if ($type == 'date') {
+ 148|                 if ($operator == 'eq') {
+ 149|                     $maxValue = strtotime($value . '+23 hours 59 minutes');
+ 150|                 }
+ 151|                 $value = strtotime($value);
+ 152|             }
+ 153| 
+ 154|             switch ($operator) {
+ 155|                 case 'like':
+ 156|                     $fields[] = $filter['property'];
+ 157|                     $condition[] = $db->quoteIdentifier($filter['property']) . ' LIKE ' . $db->quote('%' . $value. '%');
+ 158| 
+ 159|                     break;
+ 160|                 case 'lt':
+ 161|                 case 'gt':
+ 162|                 case 'eq':
+ 163|                     $compMapping = [
+ 164|                         'lt' => '<',
+ 165|                         'gt' => '>',
+ 166|                         'eq' => '=',
+ 167|                     ];
+ 168| 
+ 169|                     if (($type == 'date') && $operator == 'eq') {
+ 170|                         $condition[] = $db->quoteIdentifier(
+ 171|                             $filter['property']) .
+ 172|                             ' BETWEEN ' .
+ 173|                             $db->quote($value) .
+ 174|                             ' AND ' .
+ 175|                             $db->quote((string)$maxValue);
+ 176| 
+ 177|                         break;
+ 178|                     }
+ 179|                     $fields[] = $filter['property'];
+ 180|                     $condition[] = $db->quoteIdentifier($filter['property']) . ' ' . $compMapping[$operator] . ' ' . $db->quote($value);
+ 181| 
+ 182|                     break;
+ 183|                 case '=':
+ 184|                     $fields[] = $filter['property'];
+ 185|                     $condition[] = $db->quoteIdentifier($filter['property']) . ' = ' . $db->quote($value);
+ 186| 
+ 187|                     break;
+ 188|             }
+ 189|         }
  190| 
- 191| 	tx, err := db.BeginTx(ctx, nil)
- 192| 	if err != nil {
- 193| 		return fmt.Errorf("unable to start transaction: %w", err)
- 194| 	}
- 195| 	defer tx.Rollback()
- 196| 
- 197| 	for _, stmt := range stmts {
- 198| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
- 199| 			query = strings.TrimSpace(query)
- 200| 			if len(query) == 0 {
- 201| 				continue
- 202| 			}
- 203| 
- 204| 			m := map[string]string{
- 205| 				"name":     username,
- 206| 				"username": username,
- 207| 				"password": password,
- 208| 			}
- 209| 
- 210| 			if p.passwordAuthentication == passwordAuthenticationSCRAMSHA256 {
- 211| 				hashedPassword, err := scram.Hash(password)
- 212| 				if err != nil {
- 213| 					return fmt.Errorf("unable to scram-sha256 password: %w", err)
- 214| 				}
- 215| 				m["password"] = hashedPassword
- 216| 			}
- 217| 
- 218| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
- 219| 				return fmt.Errorf("failed to execute query: %w", err)
- 220| 			}
- 221| 		}
- 222| 	}
- 223| 
- 224| 	if err := tx.Commit(); err != nil {
- 225| 		return err
- 226| 	}
- 227| 
- 228| 	return nil
- 229| }
- 230| 
- 231| func (p *PostgreSQL) changeUserExpiration(ctx context.Context, username string, changeExp *dbplugin.ChangeExpiration) error {
- 232| 	p.Lock()
- 233| 	defer p.Unlock()
- 234| 
- 235| 	renewStmts := changeExp.Statements.Commands
- 236| 	if len(renewStmts) == 0 {
- 237| 		renewStmts = []string{defaultExpirationStatement}
- 238| 	}
+ 191|         if (!preg_match('/(ALTER|CREATE|DROP|RENAME|TRUNCATE|UPDATE|DELETE) /i', $sql, $matches)) {
+ 192|             $condition = implode(' AND ', $condition);
+ 193| 
+ 194|             $total = 'SELECT COUNT(*) FROM (' . $sql . ') AS somerandxyz WHERE ' . $condition;
+ 195| 
+ 196|             if ($fields && !$extractAllFields) {
+ 197|                 $quotedFields = array_map(fn ($f) => $db->quoteIdentifier($f), $fields);
+ 198|                 $data = 'SELECT ' . implode(', ', $quotedFields) . ' FROM (' . $sql . ') AS somerandxyz WHERE ' . $condition;
+ 199|             } else {
+ 200|                 $data = 'SELECT * FROM (' . $sql . ') AS somerandxyz WHERE ' . $condition;
+ 201|             }
+ 202|         } else {
+ 203|             return null;
+ 204|         }
+ 205| 
+ 206|         return [
+ 207|             'data' => $data,
+ 208|             'count' => $total,
+ 209|         ];
+ 210|     }
+ 211| 
+ 212|     public function getAvailableOptions(array $filters, string $field, array $drillDownFilters): array
+ 213|     {
+ 214|         $db = Db::get();
+ 215|         $baseQuery = $this->getBaseQuery($filters, [$field], false, $drillDownFilters);
+ 216|         $data = [];
+ 217|         if ($baseQuery) {
+ 218|             $sql = $baseQuery['data'] . ' GROUP BY ' . $db->quoteIdentifier($field);
+ 219|             $data = $db->fetchAllAssociative($sql);
+ 220|         }
+ 221| 
+ 222|         $filteredData = [];
+ 223|         foreach ($data as $d) {
+ 224|             if (!empty($d[$field]) || $d[$field] === 0) {
+ 225|                 $filteredData[] = ['name' => $d[$field], 'value' => $d[$field]];
+ 226|             }
+ 227|         }
+ 228| 
+ 229|         return [
+ 230|             'data' => array_merge(
+ 231|                 [
+ 232|                     ['name' => 'empty', 'value' => null],
+ 233|                 ],
+ 234|                 $filteredData
+ 235|             ),
+ 236|         ];
+ 237|     }
+ 238| }
  239| 
- 240| 	db, err := p.getConnection(ctx)
- 241| 	if err != nil {
- 242| 		return err
- 243| 	}
- 244| 
- 245| 	tx, err := db.BeginTx(ctx, nil)
- 246| 	if err != nil {
- 247| 		return err
- 248| 	}
- 249| 	defer func() {
- 250| 		tx.Rollback()
- 251| 	}()
- 252| 
- 253| 	expirationStr := changeExp.NewExpiration.Format(expirationFormat)
- 254| 
- 255| 	for _, stmt := range renewStmts {
- 256| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
- 257| 			query = strings.TrimSpace(query)
- 258| 			if len(query) == 0 {
- 259| 				continue
- 260| 			}
- 261| 
- 262| 			m := map[string]string{
- 263| 				"name":       username,
- 264| 				"username":   username,
- 265| 				"expiration": expirationStr,
- 266| 			}
- 267| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
- 268| 				return err
- 269| 			}
- 270| 		}
- 271| 	}
- 272| 
- 273| 	return tx.Commit()
- 274| }
- 275| 
- 276| func (p *PostgreSQL) NewUser(ctx context.Context, req dbplugin.NewUserRequest) (dbplugin.NewUserResponse, error) {
- 277| 	if len(req.Statements.Commands) == 0 {
- 278| 		return dbplugin.NewUserResponse{}, dbutil.ErrEmptyCreationStatement
- 279| 	}
- 280| 
- 281| 	p.Lock()
- 282| 	defer p.Unlock()
- 283| 
- 284| 	username, err := p.usernameProducer.Generate(req.UsernameConfig)
- 285| 	if err != nil {
- 286| 		return dbplugin.NewUserResponse{}, err
- 287| 	}
- 288| 
- 289| 	expirationStr := req.Expiration.Format(expirationFormat)
- 290| 
- 291| 	db, err := p.getConnection(ctx)
- 292| 	if err != nil {
- 293| 		return dbplugin.NewUserResponse{}, fmt.Errorf("unable to get connection: %w", err)
- 294| 	}
- 295| 
- 296| 	tx, err := db.BeginTx(ctx, nil)
- 297| 	if err != nil {
- 298| 		return dbplugin.NewUserResponse{}, fmt.Errorf("unable to start transaction: %w", err)
- 299| 	}
- 300| 	defer tx.Rollback()
- 301| 
- 302| 	m := map[string]string{
- 303| 		"name":       username,
- 304| 		"username":   username,
- 305| 		"password":   req.Password,
- 306| 		"expiration": expirationStr,
- 307| 	}
- 308| 
- 309| 	if p.passwordAuthentication == passwordAuthenticationSCRAMSHA256 {
- 310| 		hashedPassword, err := scram.Hash(req.Password)
- 311| 		if err != nil {
- 312| 			return dbplugin.NewUserResponse{}, fmt.Errorf("unable to scram-sha256 password: %w", err)
- 313| 		}
- 314| 		m["password"] = hashedPassword
- 315| 	}
- 316| 
- 317| 	for _, stmt := range req.Statements.Commands {
- 318| 		if containsMultilineStatement(stmt) {
- 319| 			// Execute it as-is.
- 320| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, stmt); err != nil {
- 321| 				return dbplugin.NewUserResponse{}, fmt.Errorf("failed to execute query: %w", err)
- 322| 			}
- 323| 			continue
- 324| 		}
- 325| 		// Otherwise, it's fine to split the statements on the semicolon.
- 326| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
- 327| 			query = strings.TrimSpace(query)
- 328| 			if len(query) == 0 {
- 329| 				continue
- 330| 			}
- 331| 
- 332| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
- 333| 				return dbplugin.NewUserResponse{}, fmt.Errorf("failed to execute query: %w", err)
- 334| 			}
- 335| 		}
- 336| 	}
- 337| 
- 338| 	if err := tx.Commit(); err != nil {
- 339| 		return dbplugin.NewUserResponse{}, err
- 340| 	}
- 341| 
- 342| 	resp := dbplugin.NewUserResponse{
- 343| 		Username: username,
- 344| 	}
- 345| 	return resp, nil
- 346| }
- 347| 
- 348| func (p *PostgreSQL) DeleteUser(ctx context.Context, req dbplugin.DeleteUserRequest) (dbplugin.DeleteUserResponse, error) {
- 349| 	p.Lock()
- 350| 	defer p.Unlock()
- 351| 
- 352| 	if len(req.Statements.Commands) == 0 {
- 353| 		return dbplugin.DeleteUserResponse{}, p.defaultDeleteUser(ctx, req.Username)
- 354| 	}
- 355| 
- 356| 	return dbplugin.DeleteUserResponse{}, p.customDeleteUser(ctx, req.Username, req.Statements.Commands)
- 357| }
- 358| 
- 359| func (p *PostgreSQL) customDeleteUser(ctx context.Context, username string, revocationStmts []string) error {
- 360| 	db, err := p.getConnection(ctx)
- 361| 	if err != nil {
- 362| 		return err
- 363| 	}
- 364| 
- 365| 	tx, err := db.BeginTx(ctx, nil)
- 366| 	if err != nil {
- 367| 		return err
- 368| 	}
- 369| 	defer func() {
- 370| 		tx.Rollback()
- 371| 	}()
- 372| 
- 373| 	for _, stmt := range revocationStmts {
- 374| 		if containsMultilineStatement(stmt) {
- 375| 			// Execute it as-is.
- 376| 			m := map[string]string{
- 377| 				"name":     username,
- 378| 				"username": username,
- 379| 			}
- 380| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, stmt); err != nil {
- 381| 				return err
- 382| 			}
- 383| 			continue
- 384| 		}
- 385| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
- 386| 			query = strings.TrimSpace(query)
- 387| 			if len(query) == 0 {
- 388| 				continue
- 389| 			}
- 390| 
- 391| 			m := map[string]string{
- 392| 				"name":     username,
- 393| 				"username": username,
- 394| 			}
- 395| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
- 396| 				return err
- 397| 			}
- 398| 		}
- 399| 	}
- 400| 
- 401| 	return tx.Commit()
- 402| }
- 403| 
- 404| func (p *PostgreSQL) defaultDeleteUser(ctx context.Context, username string) error {
- 405| 	db, err := p.getConnection(ctx)
- 406| 	if err != nil {
- 407| 		return err
- 408| 	}
- 409| 
- 410| 	// Check if the role exists
- 411| 	var exists bool
- 412| 	err = db.QueryRowContext(ctx, "SELECT exists (SELECT rolname FROM pg_roles WHERE rolname=$1);", username).Scan(&exists)
- 413| 	if err != nil && err != sql.ErrNoRows {
- 414| 		return err
- 415| 	}
- 416| 
- 417| 	if !exists {
- 418| 		return nil
- 419| 	}
- 420| 
- 421| 	// Query for permissions; we need to revoke permissions before we can drop
- 422| 	// the role
- 423| 	// This isn't done in a transaction because even if we fail along the way,
- 424| 	// we want to remove as much access as possible
- 425| 	stmt, err := db.PrepareContext(ctx, "SELECT DISTINCT table_schema FROM information_schema.role_column_grants WHERE grantee=$1;")
- 426| 	if err != nil {
- 427| 		return err
- 428| 	}
- 429| 	defer stmt.Close()
- 430| 
- 431| 	rows, err := stmt.QueryContext(ctx, username)
- 432| 	if err != nil {
- 433| 		return err
- 434| 	}
- 435| 	defer rows.Close()
- 436| 
- 437| 	const initialNumRevocations = 16
- 438| 	revocationStmts := make([]string, 0, initialNumRevocations)
- 439| 	for rows.Next() {
- 440| 		var schema string
- 441| 		err = rows.Scan(&schema)
- 442| 		if err != nil {
- 443| 			// keep going; remove as many permissions as possible right now
- 444| 			continue
- 445| 		}
- 446| 		revocationStmts = append(revocationStmts, fmt.Sprintf(
- 447| 			`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %s FROM %s;`,
- 448| 			dbutil.QuoteIdentifier(schema),
- 449| 			dbutil.QuoteIdentifier(username)))
- 450| 
- 451| 		revocationStmts = append(revocationStmts, fmt.Sprintf(
- 452| 			`REVOKE USAGE ON SCHEMA %s FROM %s;`,
- 453| 			dbutil.QuoteIdentifier(schema),
- 454| 			dbutil.QuoteIdentifier(username)))
- 455| 	}
- 456| 
- 457| 	// for good measure, revoke all privileges and usage on schema public
- 458| 	revocationStmts = append(revocationStmts, fmt.Sprintf(
- 459| 		`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM %s;`,
- 460| 		dbutil.QuoteIdentifier(username)))
- 461| 
- 462| 	revocationStmts = append(revocationStmts, fmt.Sprintf(
- 463| 		"REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM %s;",
- 464| 		dbutil.QuoteIdentifier(username)))
- 465| 
- 466| 	revocationStmts = append(revocationStmts, fmt.Sprintf(
- 467| 		"REVOKE USAGE ON SCHEMA public FROM %s;",
- 468| 		dbutil.QuoteIdentifier(username)))
- 469| 
- 470| 	// get the current database name so we can issue a REVOKE CONNECT for
- 471| 	// this username
- 472| 	var dbname sql.NullString
- 473| 	if err := db.QueryRowContext(ctx, "SELECT current_database();").Scan(&dbname); err != nil {
- 474| 		return err
- 475| 	}
- 476| 
- 477| 	if dbname.Valid {
- 478| 		revocationStmts = append(revocationStmts, fmt.Sprintf(
- 479| 			`REVOKE CONNECT ON DATABASE %s FROM %s;`,
- 480| 			dbutil.QuoteIdentifier(dbname.String),
- 481| 			dbutil.QuoteIdentifier(username)))
- 482| 	}
- 483| 
- 484| 	// again, here, we do not stop on error, as we want to remove as
- 485| 	// many permissions as possible right now
- 486| 	var lastStmtError error
- 487| 	for _, query := range revocationStmts {
- 488| 		if err := dbtxn.ExecuteDBQueryDirect(ctx, db, nil, query); err != nil {
- 489| 			lastStmtError = err
- 490| 		}
- 491| 	}
- 492| 
- 493| 	// can't drop if not all privileges are revoked
- 494| 	if rows.Err() != nil {
- 495| 		return fmt.Errorf("could not generate revocation statements for all rows: %w", rows.Err())
- 496| 	}
- 497| 	if lastStmtError != nil {
- 498| 		return fmt.Errorf("could not perform all revocation statements: %w", lastStmtError)
- 499| 	}
- 500| 
- 501| 	// Drop this user
- 502| 	stmt, err = db.PrepareContext(ctx, fmt.Sprintf(
- 503| 		`DROP ROLE IF EXISTS %s;`, dbutil.QuoteIdentifier(username)))
- 504| 	if err != nil {
- 505| 		return err
- 506| 	}
- 507| 	defer stmt.Close()
- 508| 	if _, err := stmt.ExecContext(ctx); err != nil {
- 509| 		return err
- 510| 	}
- 511| 
- 512| 	return nil
- 513| }
- 514| 
- 515| func (p *PostgreSQL) secretValues() map[string]string {
- 516| 	return map[string]string{
- 517| 		p.Password: "[password]",
- 518| 	}
- 519| }
- 520| 
- 521| func (p *PostgreSQL) PluginVersion() logical.PluginVersion {
- 522| 	return logical.PluginVersion{Version: ReportedVersion}
- 523| }
- 524| 
- 525| // containsMultilineStatement is a best effort to determine whether
- 526| // a particular statement is multiline, and therefore should not be
- 527| // split upon semicolons. If it's unsure, it defaults to false.
- 528| func containsMultilineStatement(stmt string) bool {
- 529| 	// We're going to look for the word "END", but first let's ignore
- 530| 	// anything the user provided within single or double quotes since
- 531| 	// we're looking for an "END" within the Postgres syntax.
- 532| 	literals, err := extractQuotedStrings(stmt)
- 533| 	if err != nil {
- 534| 		return false
- 535| 	}
- 536| 	stmtWithoutLiterals := stmt
- 537| 	for _, literal := range literals {
- 538| 		stmtWithoutLiterals = strings.ReplaceAll(stmt, literal, "")
- 539| 	}
- 540| 	// Now look for the word "END" specifically. This will miss any
- 541| 	// representations of END that aren't surrounded by spaces, but
- 542| 	// it should be easy to change on the user's side.
- 543| 	return postgresEndStatement.MatchString(stmtWithoutLiterals)
- 544| }
- 545| 
- 546| // extractQuotedStrings extracts 0 or many substrings
- 547| // that have been single- or double-quoted. Ex:
- 548| // `"Hello", silly 'elephant' from the "zoo".`
- 549| // returns [ `Hello`, `'elephant'`, `"zoo"` ]
- 550| func extractQuotedStrings(s string) ([]string, error) {
- 551| 	var found []string
- 552| 	toFind := []*regexp.Regexp{
- 553| 		doubleQuotedPhrases,
- 554| 		singleQuotedPhrases,
- 555| 	}
- 556| 	for _, typeOfPhrase := range toFind {
- 557| 		found = append(found, typeOfPhrase.FindAllString(s, -1)...)
- 558| 	}
- 559| 	return found, nil
- 560| }
- 561| 
- 562| 
+ 240| 
 
 
 ████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
 
-### id=8086 teacher=unknown flags=[]
-[ANALYSIS]
-## 编号分析（全文通读）
-
-1. **第 60-63 行 / 68-70 行**：定义默认模板 `defaultChangePasswordStatement`、`defaultExpirationStatement`，使用 `{{username}}`、`{{password}}`、`{{expiration}}` 占位符——这些占位符由模板引擎做**文本替换**，不是数据库参数绑定。
-
-2. **入口点枚举**：
-   - `Initialize`（第 88 行起）：source 为 `req.Config` 的 `username_template`、`password_authentication`；
-   - `UpdateUser`（第 122 行）：source 为 `req.Username`、`req.Password`、`req.Expiration`；
-   - `NewUser`（第 224 行）：source 为 `req.UsernameConfig`（含 DisplayName/RoleName）、`req.Password`、`req.Statements`；
-   - `DeleteUser`（第 283 行）：source 为 `req.Username`、`req.Statements`。
-
-3. **数据流 1：NewUser**。第 233 行 `p.usernameProducer.Generate(req.UsernameConfig)` 由管理员自定义模板生成用户名；若模板直接引用 `.DisplayName` 或 `.RoleName` 而不加转义/truncate，攻击者可控的显示名可携带单引号。第 246-252 行将 `username`、`req.Password` 放入 map `m`；第 272/280 行 sink `dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query)` —— 该函数对语句做文本插值后直接执行，**无任何引号转义或参数化**。防御缺失：全文没有对 `{{name}}`/`{{password}}` 值做 `QuoteLiteral`/单引号加倍处理。
-
-4. **数据流 2：changeUserPassword**（第 141-206 行）。第 144 行取 `changePass.NewPassword`（可能来自带密码策略的请求），第 190-194 行 map 注入，第 199 行 sink 同上。SCRAM 分支（第 182 行）会哈希密码从而消除注入字符，但默认的 `passwordAuthenticationPassword` 模式下密码原样插入 `ALTER ROLE ... PASSWORD '{{password}}'`，密码含 `'` 即可逃逸字符串字面量实现 SQL 注入。
-
-5. **数据流 3：changeUserExpiration**（第 208-262 行）。`expirationStr` 由服务端时间格式化生成（第 230 行），不可控，此流安全。
-
-6. **数据流 4：DeleteUser/defaultDeleteUser**（第 283-395 行）。第 337/341/355-371/383 行均使用 `dbutil.QuoteIdentifier` 包裹 `username`/`schema`/`dbname` 后拼接——这是有效的标识符引用防御，此路径相对安全。但 `customDeleteUser`（第 296 行）走与 NewUser 相同的无转义插值 sink（第 316/330 行）。
-
-7. **第二入口/替代通道**：`containsMultilineStatement`（第 409 行）存在逻辑缺陷——第 424 行 `strings.ReplaceAll(stmt, literal, "")` 应作用于 `stmtWithoutLiterals` 却反复替换原 `stmt`，导致含引号字面量的多行 PL/pgSQL 语句可能被误判为单行并按分号拆分执行，属于正确性缺陷但非独立注入源。
-
-8. **结论**：核心漏洞是所有动态值经模板文本插值进入 SQL 而未做字面量转义（CWE-89 / CWE-564），在默认密码认证模式下可通过含单引号的密码或（自定义用户名模板下的）DisplayName 触发注入。
-[JSON]
-{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection (SQL Injection via template interpolation)", "risk_level": "High", "source": "line 171: changePass.NewPassword 与 line 231: p.usernameProducer.Generate(req.UsernameConfig) 生成的 username", "sink": "line 199 与 line 267/280: dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query) 对 {{name}}/{{password}} 做文本插值后直接执行", "explanation": "NewUser 和 changeUserPassword 将 username/password 放入 map 后交给 ExecuteTxQueryDirect, 该函数用模板引擎把值以纯文本形式拼进 ALTER ROLE ... PASSWORD '{{password}}' 等语句, 全文没有任何单引号转义或参数化查询; 默认 passwordAuthentication=password 模式下密码原样嵌入, 含单引号即可逃逸字面量注入任意 SQL; 自定义 username_template 直接引用 DisplayName 时同理; DeleteUser 默认路径虽有 QuoteIdentifier 防护, 但 customDeleteUser 复用同一无防护 sink", "fix_suggestion": "line 199/272: 对插入值调用 dbutil.QuoteLiteral(即单引号加倍) 或改用 pgx 的参数绑定 $1/$2 传递 username/password/expiration, 并修复 line 424 的 ReplaceAll 使其作用于 stmtWithoutLiterals"}
-
-### id=8087 teacher=unknown flags=[]
+### id=8078 teacher=unknown flags=[]
 [ANALYSIS]
 ## 编号分析
 
-1. **入口点枚举（全文）**：插件通过 gRPC/dbplugin 接口暴露五个入口：`Initialize`（第 88 行，接收 `req.Config` 中的 `username_template`、`password_authentication`、连接配置）、`UpdateUser`（第 122 行，含 `changeUserPassword` 第 137 行与 `changeUserExpiration` 第 187 行）、`NewUser`（第 224 行）、`DeleteUser`（第 285 行，分 `defaultDeleteUser` 第 313 行 / `customDeleteUser` 第 296 行）。无 HTTP 路由、文件读取或环境变量入口。
+1. **第 30–60 行（trait 属性与抽象方法声明）**：`doFetch/doHave/doClear/doDelete/doSave` 均为抽象方法，本文件不含任何 sink 实现；`$createCacheItem`、`$mergeByLifetime` 为静态闭包，由宿主类注入，非外部可控。
 
-2. **source→sink 流验证**：
-   - **SQL 执行 sink**：所有查询最终走 `dbtxn.ExecuteTxQueryDirect` / `ExecuteDBQueryDirect`，其机制是把 `{{name}}`、`{{password}}` 等占位符做**字符串替换**后直接执行（非参数化）。
-   - **流 A：管理员配置的 Statements**（第 139、205、258、300 行）：creation/revocation/password 语句由 Vault 管理员在角色配置中设定，属于受信任配置，模板注入是其设计功能，不构成漏洞。
-   - **流 B：username**：`defaultDeleteUser` 中 schema 与 username 均经 `dbutil.QuoteIdentifier` 转义后拼接（第 332–357 行），防御有效；存在性检查用参数化 `$1`（第 155、320 行）。自定义删除语句中的 `{{name}}` 替换依赖管理员配置，同流 A。
-   - **流 C：password**：由 Vault 内部生成随机值，且 SCRAM 模式下先哈希（第 165、247 行）；明文密码经 `secretValues()`（第 382 行）脱敏。密码本身不含用户可控内容。
-   - **流 D：expiration**：由服务端时间格式化产生（第 203 行），不可控。
-   - **流 E：DisplayName/RoleName 进入用户名**（第 231 行）：默认模板截断至 8 字符并包裹于双引号中；理论上含双引号的 DisplayName 可破坏引号，但该值在上游 Vault 核心层已做字符清洗后才传入插件，且模板本身由管理员配置——在本文件信任边界内无可利用输入。
+2. **入口点枚举**：本文件是 `@internal` 的 PSR-6/16 缓存适配器公共逻辑 trait，对外入口为 `hasItem/getItem/getItems/deleteItem(s)/save/saveDeferred/clear/enableVersioning/reset/__destruct/handleUnserializeCallback/getId`。所有输入均为调用方传入的缓存 key 或 CacheItem 对象，无 HTTP 路由、无文件上传、无环境变量读取、无反序列化入口（第 262–270 行 `__sleep/__wakeup` 显式抛异常禁止序列化）。
 
-3. **第二入口/替代通道检查**：`containsMultilineStatement`（第 395 行）仅影响语句切分方式，正则提取引号字符串失败时保守返回 false，不影响安全边界。`Initialize` 中模板先试运行校验（第 106 行）。未发现绕过通道。
+3. **key 处理数据流（source→sink）**：所有 key 在进入后端前都经过 `getId()`（第 288 行起），其中第 313 行 `\assert('' !== CacheItem::validateKey($key))` 调用 Symfony 的 `CacheItem::validateKey`，该方法对非法字符（含控制字符、保留分隔符）抛出异常——这是白名单式校验而非黑名单，属有效防御。后续仅拼接 `$this->namespace.$this->namespaceVersion.$key` 作为存储标识传给抽象的 `do*` 方法，无命令执行、SQL、eval、include 等 sink。
 
-4. **结论**：所有动态拼接点要么使用 `QuoteIdentifier` 有效转义，要么数据源为受信任的管理员配置/内部生成值，符合数据库插件的信任模型。全文未见可被外部攻击者触达的注入路径。
+4. **超长 id 的哈希截断（第 318–322 行）**：使用 MD5+base64 仅用于生成短缓存 id，注释明确说明“速度优先于安全，此处非安全问题”；MD5 碰撞在此场景下最多导致缓存键冲突，不构成可利用漏洞。
+
+5. **`clear()`（第 106 行起）**：prefix 经第 122 行正则 `#[^-+.A-Za-z0-9]#` 白名单校验后才拼入 namespace 传给 `doClear`；versioning 分支中 namespace version 由 `mt_rand()/time()` 内部生成并经 `formatNamespaceVersion` 编码，外部不可控。
+
+6. **`generateItems()`（第 276 行起）**：id 与 keys 匹配失败时抛异常并记录日志，日志内容为内部值，无用户可控格式化字符串注入到危险上下文。
+
+7. **第二通道检查**：`handleUnserializeCallback`（第 280 行）只是抛出 DomainException，消息含类名但不进入执行流；`__destruct` 触发 `commit()` 属正常延迟写逻辑。全文未发现文件操作、进程执行、网络请求等危险函数调用。
+
+**结论**：该文件为 Symfony 框架内部缓存抽象层，所有外部输入均经白名单校验（`validateKey` / prefix 正则），且不存在危险 sink，无可利用漏洞。
 [JSON]
-{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文五个入口(Initialize/UpdateUser/NewUser/DeleteUser及内部函数)。所有SQL执行均经由占位符字符串替换的ExecuteTxQueryDirect, 但替换值来源均为受信任方: 管理员配置的Statements属设计功能; 默认删除路径中schema与username均经dbutil.QuoteIdentifier转义(第332-357行); 存在性检查使用参数化$1(第155/320行); password为内部随机生成且SCRAM模式下哈希处理并由secretValues脱敏; expiration由服务端格式化生成。DisplayName进入用户名的路径在上游核心层已被清洗, 且模板由管理员配置。黑名单类过滤不存在, 未发现可绕过缺陷。", "fix_suggestion": "no fix needed"}
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "该文件是 Symfony 缓存组件的内部 trait，所有入口（getItem/getItems/deleteItems/clear 等）接收的缓存 key 均先经 getId() 中的 CacheItem::validateKey 白名单校验，clear() 的 prefix 也经字符白名单正则过滤；全文无命令执行、文件包含、SQL、eval 等危险 sink，且 __sleep/__wakeup 禁止序列化，未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
+
+### id=8079 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+**入口点枚举（全文）**
+1. `getData()` 第24–57行：接收 filters/sort/dir/offset/limit/fields/drillDownFilters，最终在第40、53行执行 `$baseQuery` 拼接后的 SQL。
+2. `getColumns()` 第59–78行：接收外部 `?stdClass $configuration`，第63行传入 `buildQueryString`，第69行 `fetchAssociative($sql)` 直接执行。
+3. `buildQueryString()` 第80–131行：将配置对象的 `sql`（第88行）、`from`（第99行）、`where`（第106行）、`groupby`（第113行）**原样字符串拼接**进查询。
+4. `getBaseQuery()` 第133–209行：第138行调用 buildQueryString；第190行黑名单正则后于第193/197/199行拼接子查询。
+5. `getAvailableOptions()` 第211–227行：第218行执行拼好的 SQL。
+
+**逐条 source→sink 验证**
+
+- **D1：`$config['sql']/from/where/groupby` → 执行**。source 是报告配置对象（来自管理端自定义报表配置，可由有权限用户写入）。防御仅有：(a) 第85/96/103/110行的前缀检查（仅决定是否补关键字，不消毒）；(b) 第66、190行的黑名单正则 `(ALTER|CREATE|DROP|RENAME|TRUNCATE|UPDATE|DELETE)` 后必须跟**一个空格**——可被注释绕过（如 `UPDATE/**/`）、制表符绕过（`UPDATE\t`），且 `SELECT ... INTO OUTFILE/DUMPFILE`、堆叠注入等完全不在名单内。**无效防御**。sink：第69、53、218行执行。→ SQL 注入成立。
+- **D2：`$sort`（第45行）** 经 `quoteIdentifier`，`$dir` 白名单化为 ASC/DESC——有效。
+- **D3：`$offset/$limit`（第50行）** 为 int 类型参数——安全。
+- **D4：filters 的 value（第142–184行）** 均经 `$db->quote()`，property 经 `quoteIdentifier`——有效。
+- **D5：drillDownFilters（第119–121行）** field/value 均加引号——有效。
+- **D6：`$selectField`（第91行）、`$field`（第217行）、fields 数组（第196行）** 均 quoteIdentifier——有效。
+
+**第二入口确认**：`getColumns()` 的 `$configuration` 与 `getData()` 走的 `$this->config` 是同一类攻击面；即使运行时 filters 安全，配置中的 where/groupby 仍可携带任意表达式（如 `(SELECT ... )` 子查询、`INTO OUTFILE`）。
+
+**结论**：核心漏洞是自定义 SQL 配置经黑名单校验后被直接执行，黑名单可绕过，构成 CWE-89 SQL 注入（Pimcore 实际历史漏洞即在此处）。利用前提通常需要具备报表配置权限的后台用户，风险评级中高。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection", "risk_level": "High", "source": "line 81-113: buildQueryString 中外部配置的 sql/from/where/groupby 字段原样进入字符串拼接", "sink": "line 70 fetchAssociative($sql)、line 54 fetchAllAssociative($sql)、line 219:fetchAllAssociative($sql)", "explanation": "配置中的任意 SQL 片段直接拼入查询并执行 -> 唯一防御是 line 66 和 line 190 的黑名单正则，其要求关键字后跟空格，可用 UPDATE/**/ 或制表符绕过，且未覆盖 INTO OUTFILE 等写操作 -> 构成可利用的 SQL 注入", "fix_suggestion": "line 66/190: 移除黑名单方案，改为强制只允许单条 SELECT 语句（如解析 AST 校验语句类型与顶层结构），并对配置中的标识符使用 quoteIdentifier、对值统一使用预编译参数绑定"}
