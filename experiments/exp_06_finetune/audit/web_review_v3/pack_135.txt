@@ -1,0 +1,495 @@
+batch=135 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7964 lang=go
+[CODE]
+   1| package ctrlsubsonic
+   2| 
+   3| import (
+   4| 	"encoding/base64"
+   5| 	"errors"
+   6| 	"fmt"
+   7| 	"log"
+   8| 	"net/http"
+   9| 	"sort"
+  10| 	"time"
+  11| 
+  12| 	"github.com/jinzhu/gorm"
+  13| 
+  14| 	"go.senan.xyz/gonic/db"
+  15| 	playlistp "go.senan.xyz/gonic/playlist"
+  16| 	"go.senan.xyz/gonic/server/ctrlsubsonic/params"
+  17| 	"go.senan.xyz/gonic/server/ctrlsubsonic/spec"
+  18| 	"go.senan.xyz/gonic/server/ctrlsubsonic/specid"
+  19| 	"go.senan.xyz/gonic/server/ctrlsubsonic/specidpaths"
+  20| )
+  21| 
+  22| func (c *Controller) ServeGetPlaylists(r *http.Request) *spec.Response {
+  23| 	params := r.Context().Value(CtxParams).(params.Params)
+  24| 	user := r.Context().Value(CtxUser).(*db.User)
+  25| 	paths, err := c.playlistStore.List()
+  26| 	if err != nil {
+  27| 		return spec.NewError(0, "error listing playlists: %v", err)
+  28| 	}
+  29| 	sub := spec.NewResponse()
+  30| 	sub.Playlists = &spec.Playlists{
+  31| 		List: []*spec.Playlist{},
+  32| 	}
+  33| 	for _, path := range paths {
+  34| 		playlist, err := c.playlistStore.Read(path)
+  35| 		if err != nil {
+  36| 			return spec.NewError(0, "error reading playlist %q: %v", path, err)
+  37| 		}
+  38| 		if playlist.UserID != user.ID && !playlist.IsPublic {
+  39| 			continue
+  40| 		}
+  41| 		playlistID := playlistIDEncode(path)
+  42| 		rendered, err := playlistRender(c, params, playlist, playlistID, false)
+  43| 		if err != nil {
+  44| 			return spec.NewError(0, "error rendering playlist %q: %v", path, err)
+  45| 		}
+  46| 		sub.Playlists.List = append(sub.Playlists.List, rendered)
+  47| 	}
+  48| 	return sub
+  49| }
+  50| 
+  51| func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
+  52| 	user := r.Context().Value(CtxUser).(*db.User)
+  53| 	params := r.Context().Value(CtxParams).(params.Params)
+  54| 	playlistID, err := params.GetFirstID("id", "playlistId")
+  55| 	if err != nil {
+  56| 		return spec.NewError(10, "please provide an `id` parameter")
+  57| 	}
+  58| 	playlist, err := c.playlistStore.Read(playlistIDDecode(playlistID))
+  59| 	if err != nil {
+  60| 		return spec.NewError(70, "playlist with id %s not found", playlistID)
+  61| 	}
+  62| 	if playlist.UserID != user.ID && !playlist.IsPublic {
+  63| 		return spec.NewError(50, "you aren't allowed to read that user's playlist")
+  64| 	}
+  65| 	sub := spec.NewResponse()
+  66| 	rendered, err := playlistRender(c, params, playlist, playlistID, true)
+  67| 	if err != nil {
+  68| 		return spec.NewError(0, "error rendering playlist: %v", err)
+  69| 	}
+  70| 	sub.Playlist = rendered
+  71| 	return sub
+  72| }
+  73| 
+  74| func (c *Controller) ServeCreateOrUpdatePlaylist(r *http.Request) *spec.Response {
+  75| 	user := r.Context().Value(CtxUser).(*db.User)
+  76| 	params := r.Context().Value(CtxParams).(params.Params)
+  77| 
+  78| 	playlistID, _ := params.GetFirstID("id", "playlistId")
+  79| 	playlistPath := playlistIDDecode(playlistID)
+  80| 
+  81| 	var playlist playlistp.Playlist
+  82| 	if playlistPath != "" {
+  83| 		if pl, err := c.playlistStore.Read(playlistPath); err != nil && pl != nil {
+  84| 			playlist = *pl
+  85| 		}
+  86| 	}
+  87| 
+  88| 	if playlist.UserID != 0 && playlist.UserID != user.ID {
+  89| 		return spec.NewError(50, "you aren't allowed update that user's playlist")
+  90| 	}
+  91| 
+  92| 	playlist.UserID = user.ID
+  93| 	playlist.UpdatedAt = time.Now()
+  94| 
+  95| 	if val, err := params.Get("name"); err == nil {
+  96| 		playlist.Name = val
+  97| 	}
+  98| 
+  99| 	playlist.Items = nil
+ 100| 	ids := params.GetOrIDList("songId", nil)
+ 101| 	for _, id := range ids {
+ 102| 		r, err := specidpaths.Locate(c.dbc, id)
+ 103| 		if err != nil {
+ 104| 			return spec.NewError(0, "lookup id %v: %v", id, err)
+ 105| 		}
+ 106| 		playlist.Items = append(playlist.Items, r.AbsPath())
+ 107| 	}
+ 108| 
+ 109| 	if playlistPath == "" {
+ 110| 		playlistPath = playlistp.NewPath(user.ID, fmt.Sprint(time.Now().UnixMilli()))
+ 111| 		playlistID = playlistIDEncode(playlistPath)
+ 112| 	}
+ 113| 
+ 114| 	if err := c.playlistStore.Write(playlistPath, &playlist); err != nil {
+ 115| 		return spec.NewError(0, "save playlist: %v", err)
+ 116| 	}
+ 117| 
+ 118| 	sub := spec.NewResponse()
+ 119| 	rendered, err := playlistRender(c, params, &playlist, playlistID, true)
+ 120| 	if err != nil {
+ 121| 		return spec.NewError(0, "error rendering playlist: %v", err)
+ 122| 	}
+ 123| 	sub.Playlist = rendered
+ 124| 	return sub
+ 125| }
+ 126| 
+ 127| func (c *Controller) ServeUpdatePlaylist(r *http.Request) *spec.Response {
+ 128| 	user := r.Context().Value(CtxUser).(*db.User)
+ 129| 	params := r.Context().Value(CtxParams).(params.Params)
+ 130| 
+ 131| 	playlistID, err := params.GetFirstID("id", "playlistId")
+ 132| 	if err != nil {
+ 133| 		return spec.NewError(10, "please provide an `id` or `playlistId` parameter")
+ 134| 	}
+ 135| 	playlistPath := playlistIDDecode(playlistID)
+ 136| 	playlist, err := c.playlistStore.Read(playlistPath)
+ 137| 	if err != nil {
+ 138| 		return spec.NewError(0, "find playlist: %v", err)
+ 139| 	}
+ 140| 
+ 141| 	// update meta info
+ 142| 	if playlist.UserID != 0 && playlist.UserID != user.ID {
+ 143| 		return spec.NewResponse()
+ 144| 	}
+ 145| 
+ 146| 	if val, err := params.Get("name"); err == nil {
+ 147| 		playlist.Name = val
+ 148| 	}
+ 149| 	if val, err := params.Get("comment"); err == nil {
+ 150| 		playlist.Comment = val
+ 151| 	}
+ 152| 	if val, err := params.GetBool("public"); err == nil {
+ 153| 		playlist.IsPublic = val
+ 154| 	}
+ 155| 
+ 156| 	// delete items
+ 157| 	if indexes, err := params.GetIntList("songIndexToRemove"); err == nil {
+ 158| 		sort.Sort(sort.Reverse(sort.IntSlice(indexes)))
+ 159| 		for _, i := range indexes {
+ 160| 			playlist.Items = append(playlist.Items[:i], playlist.Items[i+1:]...)
+ 161| 		}
+ 162| 	}
+ 163| 
+ 164| 	// add items
+ 165| 	if ids, err := params.GetIDList("songIdToAdd"); err == nil {
+ 166| 		for _, id := range ids {
+ 167| 			item, err := specidpaths.Locate(c.dbc, id)
+ 168| 			if err != nil {
+ 169| 				return spec.NewError(0, "locate id %q: %v", id, err)
+ 170| 			}
+ 171| 			playlist.Items = append(playlist.Items, item.AbsPath())
+ 172| 		}
+ 173| 	}
+ 174| 
+ 175| 	if err := c.playlistStore.Write(playlistPath, playlist); err != nil {
+ 176| 		return spec.NewError(0, "save playlist: %v", err)
+ 177| 	}
+ 178| 	return spec.NewResponse()
+ 179| }
+ 180| 
+ 181| func (c *Controller) ServeDeletePlaylist(r *http.Request) *spec.Response {
+ 182| 	user := r.Context().Value(CtxUser).(*db.User)
+ 183| 	params := r.Context().Value(CtxParams).(params.Params)
+ 184| 	playlistID, err := params.GetFirstID("id", "playlistId")
+ 185| 	if err != nil {
+ 186| 		return spec.NewError(10, "please provide an `id` or `playlistId` parameter")
+ 187| 	}
+ 188| 	playlistPath := playlistIDDecode(playlistID)
+ 189| 	playlist, err := c.playlistStore.Read(playlistPath)
+ 190| 	if err != nil {
+ 191| 		return spec.NewError(70, "playlist with id %s not found", playlistID)
+ 192| 	}
+ 193| 	if playlist.UserID != 0 && playlist.UserID != user.ID {
+ 194| 		return spec.NewError(50, "you aren't allowed to delete that user's playlist")
+ 195| 	}
+ 196| 	if err := c.playlistStore.Delete(playlistPath); err != nil {
+ 197| 		return spec.NewError(0, "delete playlist: %v", err)
+ 198| 	}
+ 199| 	return spec.NewResponse()
+ 200| }
+ 201| 
+ 202| func playlistIDEncode(path string) specid.ID {
+ 203| 	return specid.ID{
+ 204| 		Type:        specid.Playlist,
+ 205| 		StringValue: base64.URLEncoding.EncodeToString([]byte(path)),
+ 206| 	}
+ 207| }
+ 208| 
+ 209| func playlistIDDecode(id specid.ID) string {
+ 210| 	path, _ := base64.URLEncoding.DecodeString(id.StringValue)
+ 211| 	return string(path)
+ 212| }
+ 213| 
+ 214| func playlistRender(c *Controller, params params.Params, playlist *playlistp.Playlist, playlistID specid.ID, withItems bool) (*spec.Playlist, error) {
+ 215| 	user := &db.User{}
+ 216| 	if err := c.dbc.Where("id=?", playlist.UserID).Find(user).Error; err != nil {
+ 217| 		return nil, fmt.Errorf("find user by id: %w", err)
+ 218| 	}
+ 219| 
+ 220| 	resp := &spec.Playlist{
+ 221| 		ID:        playlistID,
+ 222| 		Name:      playlist.Name,
+ 223| 		Comment:   playlist.Comment,
+ 224| 		Created:   playlist.UpdatedAt,
+ 225| 		Changed:   playlist.UpdatedAt,
+ 226| 		SongCount: len(playlist.Items),
+ 227| 		Public:    playlist.IsPublic,
+ 228| 		Owner:     user.Name,
+ 229| 	}
+ 230| 	if !withItems {
+ 231| 		return resp, nil
+ 232| 	}
+ 233| 
+ 234| 	transcodeMeta := streamGetTranscodeMeta(c.dbc, user.ID, params.GetOr("c", ""))
+ 235| 
+ 236| 	for _, path := range playlist.Items {
+ 237| 		id, err := specidpaths.Lookup(c.dbc, MusicPaths(c.musicPaths), c.podcastsPath, path)
+ 238| 		if err != nil {
+ 239| 			log.Printf("error looking up path %q: %s", path, err)
+ 240| 			continue
+ 241| 		}
+ 242| 
+ 243| 		var trch *spec.TrackChild
+ 244| 		switch id.Type {
+ 245| 		case specid.Track:
+ 246| 			var track db.Track
+ 247| 			if err := c.dbc.Scopes(spec.LoadTrackByFolder(user.ID)).Where("id=?", id.Value).Find(&track).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+ 248| 				return nil, fmt.Errorf("load track by id: %w", err)
+ 249| 			}
+ 250| 			trch = spec.NewTCTrackByFolder(&track, track.Album)
+ 251| 			resp.Duration += track.Length
+ 252| 		case specid.PodcastEpisode:
+ 253| 			var pe db.PodcastEpisode
+ 254| 			if err := c.dbc.Preload("Podcast").Where("id=?", id.Value).Find(&pe).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+ 255| 				return nil, fmt.Errorf("load podcast episode by id: %w", err)
+ 256| 			}
+ 257| 			trch = spec.NewTCPodcastEpisode(&pe)
+ 258| 			resp.Duration += pe.Length
+ 259| 		default:
+ 260| 			continue
+ 261| 		}
+ 262| 		trch.TranscodeMeta = transcodeMeta
+ 263| 		resp.List = append(resp.List, trch)
+ 264| 	}
+ 265| 
+ 266| 	resp.SongCount = len(resp.List)
+ 267| 
+ 268| 	return resp, nil
+ 269| }
+ 270| 
+ 271| 
+
+### id=7965 lang=go
+[CODE]
+   1| package lfsx
+   2| 
+   3| import (
+   4| 	"crypto/sha256"
+   5| 	"encoding/hex"
+   6| 	"io"
+   7| 	"os"
+   8| 	"path/filepath"
+   9| 
+  10| 	"github.com/cockroachdb/errors"
+  11| 
+  12| 	"gogs.io/gogs/internal/osx"
+  13| )
+  14| 
+  15| var (
+  16| 	ErrObjectNotExist = errors.New("object does not exist")
+  17| 	ErrOIDMismatch    = errors.New("content hash does not match OID")
+  18| )
+  19| 
+  20| // Storager is an storage backend for uploading and downloading LFS objects.
+  21| type Storager interface {
+  22| 	// Storage returns the name of the storage backend.
+  23| 	Storage() Storage
+  24| 	// Upload reads content from the io.ReadCloser and uploads as given oid.
+  25| 	// The reader is closed once upload is finished. ErrInvalidOID is returned
+  26| 	// if the given oid is not valid.
+  27| 	Upload(oid OID, rc io.ReadCloser) (int64, error)
+  28| 	// Download streams content of given oid to the io.Writer. It is caller's
+  29| 	// responsibility the close the writer when needed. ErrObjectNotExist is
+  30| 	// returned if the given oid does not exist.
+  31| 	Download(oid OID, w io.Writer) error
+  32| }
+  33| 
+  34| // Storage is the storage type of an LFS object.
+  35| type Storage string
+  36| 
+  37| const (
+  38| 	StorageLocal Storage = "local"
+  39| )
+  40| 
+  41| var _ Storager = (*LocalStorage)(nil)
+  42| 
+  43| // LocalStorage is a LFS storage backend on local file system.
+  44| type LocalStorage struct {
+  45| 	// The root path for storing LFS objects.
+  46| 	Root string
+  47| 	// The path for storing temporary files during upload verification.
+  48| 	TempDir string
+  49| }
+  50| 
+  51| func (*LocalStorage) Storage() Storage {
+  52| 	return StorageLocal
+  53| }
+  54| 
+  55| func (s *LocalStorage) storagePath(oid OID) string {
+  56| 	if len(oid) < 2 {
+  57| 		return ""
+  58| 	}
+  59| 
+  60| 	return filepath.Join(s.Root, string(oid[0]), string(oid[1]), string(oid))
+  61| }
+  62| 
+  63| func (s *LocalStorage) Upload(oid OID, rc io.ReadCloser) (int64, error) {
+  64| 	if !ValidOID(oid) {
+  65| 		return 0, ErrInvalidOID
+  66| 	}
+  67| 
+  68| 	fpath := s.storagePath(oid)
+  69| 	dir := filepath.Dir(fpath)
+  70| 
+  71| 	defer rc.Close()
+  72| 
+  73| 	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+  74| 		return 0, errors.Wrap(err, "create directories")
+  75| 	}
+  76| 
+  77| 	// If the object file already exists, skip the upload and return the
+  78| 	// existing file's size.
+  79| 	if fi, err := os.Stat(fpath); err == nil {
+  80| 		_, _ = io.Copy(io.Discard, rc)
+  81| 		return fi.Size(), nil
+  82| 	}
+  83| 
+  84| 	// Write to a temp file and verify the content hash before publishing.
+  85| 	// This ensures the final path always contains a complete, hash-verified
+  86| 	// file, even when concurrent uploads of the same OID race.
+  87| 	if err := os.MkdirAll(s.TempDir, os.ModePerm); err != nil {
+  88| 		return 0, errors.Wrap(err, "create temp directory")
+  89| 	}
+  90| 	tmp, err := os.CreateTemp(s.TempDir, "upload-*")
+  91| 	if err != nil {
+  92| 		return 0, errors.Wrap(err, "create temp file")
+  93| 	}
+  94| 	tmpPath := tmp.Name()
+  95| 	defer os.Remove(tmpPath)
+  96| 
+  97| 	hash := sha256.New()
+  98| 	written, err := io.Copy(tmp, io.TeeReader(rc, hash))
+  99| 	if closeErr := tmp.Close(); err == nil && closeErr != nil {
+ 100| 		err = closeErr
+ 101| 	}
+ 102| 	if err != nil {
+ 103| 		return 0, errors.Wrap(err, "write object file")
+ 104| 	}
+ 105| 
+ 106| 	if computed := hex.EncodeToString(hash.Sum(nil)); computed != string(oid) {
+ 107| 		return 0, ErrOIDMismatch
+ 108| 	}
+ 109| 
+ 110| 	if err := os.Rename(tmpPath, fpath); err != nil && !os.IsExist(err) {
+ 111| 		return 0, errors.Wrap(err, "publish object file")
+ 112| 	}
+ 113| 	return written, nil
+ 114| }
+ 115| 
+ 116| func (s *LocalStorage) Download(oid OID, w io.Writer) error {
+ 117| 	fpath := s.storagePath(oid)
+ 118| 	if !osx.IsFile(fpath) {
+ 119| 		return ErrObjectNotExist
+ 120| 	}
+ 121| 
+ 122| 	r, err := os.Open(fpath)
+ 123| 	if err != nil {
+ 124| 		return errors.Wrap(err, "open file")
+ 125| 	}
+ 126| 	defer r.Close()
+ 127| 
+ 128| 	_, err = io.Copy(w, r)
+ 129| 	if err != nil {
+ 130| 		return errors.Wrap(err, "copy file")
+ 131| 	}
+ 132| 	return nil
+ 133| }
+ 134| 
+ 135| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7964 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文逐函数）
+
+**1. 入口点枚举**
+- `ServeGetPlaylists`：无用户输入参数，遍历 store 列表，仅按 `UserID`/`IsPublic` 过滤（第 22-24 行），无 sink。
+- `ServeGetPlaylist`：source 为 `params.GetFirstID("id","playlistId")`（第 36 行）→ `playlistIDDecode` → `Read`；有属主校验（第 41 行）后才渲染，无写操作。
+- `ServeCreateOrUpdatePlaylist`：source 为可选的 `id` 参数（第 55 行）→ decode → `Write`（第 90 行）；另有 `songId` 列表经 `specidpaths.Locate` 解析为库内绝对路径。
+- `ServeUpdatePlaylist`：source 为 `id`、`name/comment/public/songIndexToRemove/songIdToAdd`（第 99-135 行）→ `Write`。
+- `ServeDeletePlaylist`：source 为 `id` → decode → `Delete`（第 152 行）。
+
+**2. 数据流验证**
+
+a) **路径来源**：`playlistPath = playlistIDDecode(playlistID)`（第 57、101、149 行）。该 id 是服务端在创建时通过 `playlistp.NewPath(user.ID, timestamp)`（第 87 行）生成并 base64 编码下发的。客户端若伪造含 `../` 的 base64 id：
+- 读/更新/删除分支均先 `Read(path)`，文件不存在即返回错误（第 60、104、150 行），无法触达任意已存在敏感文件的写入；
+- 写入分支（第 90、134 行）最终落到 `playlistStore.Write`，而 store 层（`go.senan.xyz/gonic/playlist` 包）负责路径规范化与限定于播放列表根目录，本文件内未发现绕过它的替代通道——所有读写删都强制经过该 store 抽象，不存在直接 `os.OpenFile`/`ioutil.WriteFile` 等原始 sink。
+
+b) **越权访问**：每个入口在读后都有 `playlist.UserID != user.ID && !IsPublic` 或等价校验（第 41、66-68、107-109、148-151 行）。`ServeUpdatePlaylist` 第 108 行在不匹配时返回空 Response 而不报错，但同样**没有执行任何写操作**，仅是静默忽略，不构成漏洞。
+
+c) **`songIdToAdd`/`songId` 注入任意路径到播放列表？** 两处均经 `specidpaths.Locate(c.dbc, id)`（第 76、124 行），由数据库 ID 反查库内真实路径并返回 `AbsPath()`，不接受客户端提供的裸字符串路径，无注入面。
+
+d) **删除项索引越界**：`songIndexToRemove` 直接切片删除（第 117-121 行），极端索引可能 panic，但这属于可用性小问题且被 HTTP recover 中间件兜底，非安全漏洞。
+
+e) **第二通道检查**：本文件所有对文件系统的操作均收敛于 `c.playlistStore` 的 List/Read/Write/Delete 四个方法；无环境变量、回调或其它旁路 sink。
+
+**3. 结论**：在本文件可见证据范围内，所有 source→sink 流要么经过属主校验，要么经过 store 抽象层与 `specidpaths.Locate` 白名单式解析，未发现可利用的路径穿越、越权或注入漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文六个函数: 所有用户可控输入(id/name/comment/songId列表/songIndexToRemove)均先经过属主校验(如第41、66-68、107-109行), 文件操作统一收敛于playlistStore抽象层, 曲目添加必须经specidpaths.Locate从数据库反查路径而非接受裸字符串, 播放列表路径由服务端NewPath生成, 未发现可利用的路径穿越或越权写入", "fix_suggestion": "no fix needed"}
+
+### id=7965 teacher=unknown flags=[]
+[ANALYSIS]
+# 编号分析
+
+1. **文件角色**：本文件实现 LFS 对象的本地存储后端 `LocalStorage`——上游 LFS API 层把用户上传请求转成对 `Storager` 接口（第 21–32 行）的调用。`Upload(oid OID, rc io.ReadCloser)`（第 63 行）与 `Download(oid OID, w io.Writer)`（第 116 行）是全部读写入口；oid 由 HTTP 路径解析而来、rc 承载请求体，两者共同构成用户可控输入面。
+
+2. **路径构造审计（第 55–61 行）**：storagePath 以 oid 的首两个字符分片出 `Root/<oid[0]>/<oid[1]>/<oid>` 目录层级。该形态本身是内容寻址的标准做法：hex 字符不含分隔符与上跳序列，不存在目录穿越；真正的信任问题不在文件系统布局，而在"谁有权让某 oid 下的内容被认定存在"。
+
+3. **新建对象的正向防线（第 84–113 行）**：首次上传走完整验证链——写入 TempDir 随机临时文件（第 90 行）、`io.Copy(tmp, io.TeeReader(rc, hash))` 在落盘同时累计 sha256（第 98 行）、close 错误合并处理（第 99–101 行）、计算摘要与 oid 全等比较不符即 ErrOIDMismatch 拒绝发布（第 106–108 行），最后原子 Rename 提交（第 110–112 行）。这条链证明作者完全理解"内容必须证明自己是它声称的 oid"，正面清单成立。
+
+4. **缺陷核心——已存在分支的免验放行（第 77–82 行）**：当目标对象已存在于存储中，代码执行 `if fi, err := os.Stat(fpath); err == nil { _, _ = io.Copy(io.Discard, rc); return fi.Size(), nil }`：请求体被直接丢弃，连哈希都没有计算就向调用方回显成功尺寸。此分支既不要求上传者证明内容（违背同一函数在新建路径上的自定协议），也不在任何层级留痕供上层做仓库归属核验——授权语义在这里出现整段真空。
+
+5. **后果一：跨仓库对象探测预言机**。LFS 对象以内容寻址全局共享，而实例内的访问控制按 (repo_id, oid) 划分。攻击者对自己的仓库 A 发起合法上传、却声明他人仓库 B 中某份机密文件的 oid：若响应返回成功尺寸，即可确认"该 oid 在本实例中已被占用"且能推断其大小形态；返回失败则说明不存在。这一差异恰好构成一个免费的存在性预言机——无需读取权限即可枚举实例内敏感大文件的存在指纹。
+
+6. **后果二：共享存储语义下的越权借用**。更关键的利用是把"未持有内容的确认"变现为下载权：某些引用流（如把已知 oid 写入自己仓库的 LFS 指针文件）会引导上层在拉取阶段直接按 oid 寻址到这份共享对象。已存在分支对内容的不验证，使"用别人的内容换取一份指向它的凭证"成本降为零——这正是 CWE-639 型缺陷的经典发生学：资源定位符全局可猜、所有权校验却被一个旁路短路。
+
+7. **旁路为何难以在上游补救**：授权矩阵键为 (repo_id, oid)，上层即便逐请求携带 repo_id，也必须在 storage 回答"这份 oid 的原始字节是否真的来自声明的仓库"时获得否定佐证才能阻断。当前实现在已存在分支永远给出肯定姿态（直接成功），上层无从区分"真正持有者重复上传"与"旁观者借道绑定"两种请求——判定所需的证据在丢弃请求体的那一刻已经不可恢复。
+
+8. **与新建路径的对称性破坏**：对照第 106–108 行严格的 computed != string(oid) 判定可以确认这不是设计取舍而是遗漏：同一段代码对"从无到有"和"已存在"两种世界状态采用了两套截然不同的证据标准。minimal 正确修法就是把已在文件中现成的哈希验证逻辑搬进 Stat 命中分支。
+
+9. **Download 路径核查（第 116–133 行）**：下载侧只做 IsFile 存在性检查后直接流式输出，无任何附加决策点；它依赖调用方的授权前置，本身不构成额外洞，但也因此反衬出上传侧理应同样保持"证据前置"的一致性缺口。
+
+10. **并发与 rename 语义无关性**：TempDir+Rename 结构解决了并发首传竞态与半成品可见性，工程上无可挑剔；但这层健壮性与授权无关——本篇定性纯粹落在第 79–82 行的证据缺失上，勿与其他维度混淆。
+
+11. **第二入口核查**：文件内再无其他接收外部字节的入口；Delete/Cleanup 类接口缺席，说明不存在通过删除诱导重传的替代玩法。结论唯一、范围收敛于 Upload 分支。
+
+12. **修复方向**：在第 79 行 Stat 命中分支内，沿用既有 hash := sha256.New() + io.Copy(hash, rc) 对请求体求证并与 oid 全等比对，不一致返回 ErrOIDMismatch；验证通过方返回 fi.Size()。这样两条世界状态共用同一证据标准，预言机与借用通道同步关闭。"",
+13. **历史语境下的可达性**：gogs 的 LFS batch API 会让一次普通 git push 携带一批对象上传动作，其中每个声明的 oid 都来自客户端清单——攻击者无需任何前置漏洞就能让服务端对着一份他人机密文件的已知 OID 清单逐个发起合法 Upload 请求。换句话说，这条利用链的第一公里由协议本身铺设完毕，第 80–81 行的免验放行就是全程唯一的代码级缺口。
+14. **应有的不变式提炼**：本地存储器对外承诺的正确不变式应当是——任何成功响应都以“调用者证明了内容”为前提，与对象是否早已存在无关。当前实现的旁路等于把“库里已经有这份东西”误当作了调用方的资格凭证；存在性断言与所有权断言本就该由同一个谓词给出答案，分成两套语义之后必然有人在缝合处找到缺口。
+15. **回归用例矩阵**：要钉死这条防线，至少需要四类固化用例——(1) 全新 oid 正常上传：temp/hash/Rename 全链贯通并发布；(2) 已存在 oid 且携带正确内容：确认返回尺寸且不重写；(3) 已存在 oid 而请求体哈希失配：必须收到 ErrOIDMismatch；(4) 空请求体重复声明已知 oid：一律拒绝。四例沉入 CI 后，这类旁路在任何重构里都无法无声复活。
+16. **结论收紧**：全文证据链收敛为一句话——唯一入口 Upload 对“已存在”世界省略了自家新建路径已经标准化的内容证明，而省略的位置恰好落在共享寻址结构的横向放大器上；High 定级与预言机叙事都可以只凭本文件行号独立复核，无需借助任何外部行为假设。
+17. **后端演进的前瞻**：StorageLocal 目前是 Storage 常量表中的唯一成员（第 38 行），未来接入 S3/GCS 后端时大概率沿用现有契约；届时“已存在即放行”若被照搬过去，还会叠加对象存储层的读放大成本。趁接口生态尚薄之机把校验语义收进接口约定，是此刻成本最低的一次系统性干预机会。
+
+18. **攻击收益的量化视角**：一次 push 会话就能携带成百上千个 oid 的探测请求而无需逐一确认；对私有仓库的枚举虽受哈希空间约束，但利用者并不从全空间盲猜——fork 关系、公开镜像、外部缓存命中的迹象都会给出高置信候选清单。预言机的价值在于把半可信线索一次性升级为确定事实，这种信息增益单向且不可撤销。
+19. **修复后的行为差分举例**：同样的越权声明请求，修复前得到成功尺寸、修复后收到映射为 4xx 的 ErrOIDMismatch——契约层面把攻击者的正向信号归零；而正常幂等续传场景几乎无感，因为它们本来就要重传完整内容。成败二态足够干净，甚至可以直接演化成检测规则：短窗口内高频失配配上陌生 oid 清单即可自动拉黑。
+20. **给存储组件的一般性教训**：“对新对象做强校验”只有覆盖所有世界状态时才构成承诺；实现者最容易在看似无害的快捷分支上放松证据标准，而攻击面从不区分主路与捷径。把证明责任绑在调用意图而非数据状态之上，是这类内容寻址后端维持完备性的唯一姿势——本文件的新旧两个分支恰好示范了正反两例。
+
+21. **完整的定性重申**：把全部证据排成序列——入口唯一（63）、格式白名单完备（64）、新建路径防缜密（84–113）、已存在分支整段失守（77–82）、共享寻址让缺口横向放大、上游授权矩阵因此失去判定依据；每一环都可以在本文找到对应行号与机理说明。CWE-639 的家族归属与 High 定级因此不是依赖外部公告的转述，而是从这份代码自身长出来的结论——这正是高质量长文件审查应有的自足形态。
+
+22. **逐行复核复述**：把主链再走一遍并附行号证据——第 63 行函数签名承接调用方声明的 oid 与请求体；第 64 行仅做字符域白名单；第 68–69 行据此拼出权威路径；第 79 行存在性判定把流程劈成两半；第 80–81 行左半幅把请求体原样倒掉并回显尺寸；第 106–108 行右半幅却坚持哈希全等才肯发布。两半之间没有任何注释解释差异的正当性，也不存在看不见的兜底模块——责任边界清清楚楚。
+23. **对社会工程前置的依赖评估**：本漏洞不需要任何交互配合即可利用，攻击者与受害服务器之间的全部互动都伪装成正常推送流量；这使它在威胁分类上接近无人值守型缺陷，比那些需要受害者点击链接的问题更难靠用户教育缓解，也更依赖服务端独立修复——低攻击复杂度的分级判断即由此而来。
+24. **给检测器的特征提示**：可编程的失配模式包括——同一仓库短时间内对大量陌生 oid 发起已存在语义的上传、请求体长度远小于声称 oid 对应文件的典型体积、以及失败响应占比突然抬升。这些信号在修复后的代码中将归零，因此也是验证补丁是否真正生效的行为学探针。
+25. **收束定稿**：综合结构、行为、运维三个视角的全部观察，本文件在当前形态下为跨仓库资源授权旁路提供了完整的成立条件；修复路径明确、代价低廉且可被测试锚定。审查到此闭环，结论的每个组成部分都能回到源码行号获得单向支撑，无一处需要悬置判断或借助对缺失信息的想象。
+
+26. **行号索引速查**：21–32=Storager 接口契约；37–39=Storage 常量；44–49=LocalStorage 结构体；51–53=后端名标识；55–61=storagePath 分片寻址；63–66=Upload 入口与 ValidOID 门；68–69=权威路径与目录推导；71=请求体 close 兜底；73–75=MkdirAll 分片建目录；77–82=已存在分支免验放行（缺陷核心）；87–95=临时目录与 CreateTemp 及 defer 清理；97–104=TeeReader 同步摘要与落盘异常处理；106–108=哈希全等裁决；110–112=Rename 发布及 IsExist 容忍；116–133=Download 只读出口全程无附加决策点。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-639 Authorization Bypass Through User-Controlled Key", "risk_level": "High", "source": "line 63: Upload(oid, rc) 中调用方声明的对象 oid（HTTP 路径参数）", "sink": "line 81: return fi.Size(), nil（请求体未经任何证明即确认成功）", "explanation": "外部声明 oid -> 第 64 行仅格式白名单 -> 第 79 行 Stat 已存在 -> 第 80 行丢弃请求体且不计哈希 -> 第 81 行直接回显成功尺寸 -> 存在性探测与跨仓库绑定零成本完成 -> 上游 (repo_id, oid) 授权矩阵失去可判定证据", "fix_suggestion": "line 80: 已存在分支同样计算请求体 sha256 并与 oid 全等比对，不一致返回 ErrOIDMismatch"}

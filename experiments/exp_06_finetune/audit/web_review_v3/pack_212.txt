@@ -1,0 +1,493 @@
+batch=212 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=8168 lang=python
+[CODE]
+   1| """Prompty loader — loads .prompty files into typed Prompty objects.
+   2| 
+   3| The loader splits frontmatter (YAML) from the markdown body, resolves
+   4| ``${protocol:value}`` references (env vars, file includes), and
+   5| delegates to ``Prompty.load()`` from the generated model package.
+   6| """
+   7| 
+   8| from __future__ import annotations
+   9| 
+  10| import json
+  11| import os
+  12| from collections.abc import Callable
+  13| from pathlib import Path
+  14| from typing import Any
+  15| 
+  16| import yaml
+  17| 
+  18| from ..model import LoadContext, Prompty, SaveContext
+  19| from .utils import load_prompty, load_prompty_async
+  20| 
+  21| __all__ = ["load", "load_async", "default_save_context"]
+  22| 
+  23| 
+  24| # ---------------------------------------------------------------------------
+  25| # Public API
+  26| # ---------------------------------------------------------------------------
+  27| 
+  28| 
+  29| def load(path: str | Path) -> Prompty:
+  30|     """Load a ``.prompty`` file and return a typed ``Prompty``.
+  31| 
+  32|     Parameters
+  33|     ----------
+  34|     path:
+  35|         File system path to a ``.prompty`` file.
+  36| 
+  37|     Returns
+  38|     -------
+  39|     Prompty
+  40|         Fully typed prompt definition.
+  41|     """
+  42|     path = Path(path).resolve()
+  43|     if not path.exists():
+  44|         raise FileNotFoundError(f"Prompty file not found: {path}")
+  45| 
+  46|     # 1. Split frontmatter + body
+  47|     data = load_prompty(path)
+  48| 
+  49|     # 2–7 shared pipeline
+  50|     return _build_agent(data, path)
+  51| 
+  52| 
+  53| async def load_async(path: str | Path) -> Prompty:
+  54|     """Async variant of :func:`load`."""
+  55|     path = Path(path).resolve()
+  56|     if not path.exists():
+  57|         raise FileNotFoundError(f"Prompty file not found: {path}")
+  58| 
+  59|     data = await load_prompty_async(path)
+  60|     return _build_agent(data, path)
+  61| 
+  62| 
+  63| def default_save_context(**kwargs: Any) -> SaveContext:
+  64|     """Return a ``SaveContext`` that strips internal ``__``-prefixed metadata keys.
+  65| 
+  66|     This is the save-side counterpart to the ``LoadContext`` used during
+  67|     :func:`load`. Pass it to ``agent.save()``, ``agent.to_yaml()``, or
+  68|     ``agent.to_json()`` to keep serialised output clean.
+  69|     """
+  70| 
+  71|     def _strip_internals(data: dict[str, Any]) -> dict[str, Any]:
+  72|         meta = data.get("metadata")
+  73|         if isinstance(meta, dict):
+  74|             cleaned = {k: v for k, v in meta.items() if not k.startswith("__")}
+  75|             if cleaned:
+  76|                 data["metadata"] = cleaned
+  77|             else:
+  78|                 data.pop("metadata", None)
+  79|         return data
+  80| 
+  81|     return SaveContext(post_save=_strip_internals, **kwargs)
+  82| 
+  83| 
+  84| # ---------------------------------------------------------------------------
+  85| # Internal pipeline
+  86| # ---------------------------------------------------------------------------
+  87| 
+  88| 
+  89| def _build_agent(data: dict[str, Any] | str, path: Path) -> Prompty:
+  90|     """Shared pipeline that transforms raw frontmatter dict into a Prompty."""
+  91| 
+  92|     # Handle body-only files (no frontmatter — parse returns a string)
+  93|     if isinstance(data, str):
+  94|         data = {"instructions": data}
+  95|     if not isinstance(data, dict):
+  96|         data = {}
+  97| 
+  98|     # 2. Load via Prompty.load() with pre_process for ${protocol:value} expansion
+  99|     ctx = LoadContext(pre_process=_pre_process(path))
+ 100|     agent = Prompty.load(data, ctx)
+ 101| 
+ 102|     # Store source path for PromptyTool resolution (relative path lookups)
+ 103|     if agent.metadata is None:
+ 104|         agent.metadata = {}
+ 105|     agent.metadata["__source_path"] = str(path)
+ 106| 
+ 107|     return agent
+ 108| 
+ 109| 
+ 110| # ---------------------------------------------------------------------------
+ 111| # Reference resolution via pre_process
+ 112| # ---------------------------------------------------------------------------
+ 113| 
+ 114| 
+ 115| def _pre_process(agent_file: Path) -> Callable[[Any], Any]:
+ 116|     """Return a ``pre_process`` callback that resolves ``${protocol:value}``
+ 117|     references in every dict the loader visits.
+ 118| 
+ 119|     Supported protocols:
+ 120| 
+ 121|     * ``${env:VAR_NAME}`` — environment variable (required)
+ 122|     * ``${env:VAR_NAME:default}`` — environment variable with default
+ 123|     * ``${file:relative/path}`` — load file content (JSON / YAML / text)
+ 124|     """
+ 125| 
+ 126|     def process(data: Any) -> Any:
+ 127|         if not isinstance(data, dict):
+ 128|             return data
+ 129| 
+ 130|         for key, value in list(data.items()):
+ 131|             if not isinstance(value, str) or not value.startswith("${"):
+ 132|                 continue
+ 133| 
+ 134|             # Must end with }
+ 135|             if not value.endswith("}"):
+ 136|                 continue
+ 137| 
+ 138|             inner = value[2:-1]
+ 139|             protocol, _, val = inner.partition(":")
+ 140|             protocol = protocol.lower()
+ 141| 
+ 142|             if protocol == "env":
+ 143|                 # Support ${env:VAR:default}
+ 144|                 var_name, _, default = val.partition(":")
+ 145|                 env_val = os.environ.get(var_name)
+ 146|                 if env_val is None:
+ 147|                     if default:
+ 148|                         data[key] = default
+ 149|                     else:
+ 150|                         raise ValueError(f"Environment variable '{var_name}' not set for key '{key}'")
+ 151|                 else:
+ 152|                     data[key] = env_val
+ 153| 
+ 154|             elif protocol == "file":
+ 155|                 relative_path = (agent_file.parent / val).resolve()
+ 156|                 if not relative_path.exists():
+ 157|                     raise FileNotFoundError(
+ 158|                         f"Referenced file '{val}' not found for key '{key}' (resolved to {relative_path})"
+ 159|                     )
+ 160|                 data[key] = _load_file_content(relative_path)
+ 161| 
+ 162|         return data
+ 163| 
+ 164|     return process
+ 165| 
+ 166| 
+ 167| def _load_file_content(path: Path) -> Any:
+ 168|     """Load a file as JSON, YAML, or plain text based on its extension."""
+ 169|     with open(path, encoding="utf-8") as f:
+ 170|         if path.suffix == ".json":
+ 171|             return json.load(f)
+ 172|         elif path.suffix in (".yml", ".yaml"):
+ 173|             return yaml.safe_load(f)
+ 174|         else:
+ 175|             return f.read()
+ 176| 
+ 177| 
+
+### id=8169 lang=python
+[CODE]
+   1| """Prompty loader — loads .prompty files into typed Prompty objects.
+   2| 
+   3| The loader splits frontmatter (YAML) from the markdown body, resolves
+   4| ``${protocol:value}`` references (env vars, file includes), and
+   5| delegates to ``Prompty.load()`` from the generated model package.
+   6| """
+   7| 
+   8| from __future__ import annotations
+   9| 
+  10| import json
+  11| import os
+  12| from collections.abc import Callable, Sequence
+  13| from pathlib import Path
+  14| from typing import Any
+  15| 
+  16| import yaml
+  17| 
+  18| from ..model import LoadContext, Prompty, SaveContext
+  19| from .utils import load_prompty, load_prompty_async
+  20| 
+  21| __all__ = ["load", "load_async", "default_save_context"]
+  22| 
+  23| 
+  24| # ---------------------------------------------------------------------------
+  25| # Public API
+  26| # ---------------------------------------------------------------------------
+  27| 
+  28| 
+  29| def load(path: str | Path, *, allowed_file_roots: Sequence[str | Path] | None = None) -> Prompty:
+  30|     """Load a ``.prompty`` file and return a typed ``Prompty``.
+  31| 
+  32|     Parameters
+  33|     ----------
+  34|     path:
+  35|         File system path to a ``.prompty`` file.
+  36|     allowed_file_roots:
+  37|         Additional directories that ``${file:...}`` references may read from.
+  38|         The prompt file's directory is always allowed. References that resolve
+  39|         outside all allowed roots after canonicalization are rejected.
+  40| 
+  41|     Returns
+  42|     -------
+  43|     Prompty
+  44|         Fully typed prompt definition.
+  45|     """
+  46|     path = Path(path).resolve()
+  47|     if not path.exists():
+  48|         raise FileNotFoundError(f"Prompty file not found: {path}")
+  49| 
+  50|     # 1. Split frontmatter + body
+  51|     data = load_prompty(path)
+  52| 
+  53|     # 2–7 shared pipeline
+  54|     return _build_agent(data, path, allowed_file_roots=allowed_file_roots)
+  55| 
+  56| 
+  57| async def load_async(path: str | Path, *, allowed_file_roots: Sequence[str | Path] | None = None) -> Prompty:
+  58|     """Async variant of :func:`load`."""
+  59|     path = Path(path).resolve()
+  60|     if not path.exists():
+  61|         raise FileNotFoundError(f"Prompty file not found: {path}")
+  62| 
+  63|     data = await load_prompty_async(path)
+  64|     return _build_agent(data, path, allowed_file_roots=allowed_file_roots)
+  65| 
+  66| 
+  67| def default_save_context(**kwargs: Any) -> SaveContext:
+  68|     """Return a ``SaveContext`` that strips internal ``__``-prefixed metadata keys.
+  69| 
+  70|     This is the save-side counterpart to the ``LoadContext`` used during
+  71|     :func:`load`. Pass it to ``agent.save()``, ``agent.to_yaml()``, or
+  72|     ``agent.to_json()`` to keep serialised output clean.
+  73|     """
+  74| 
+  75|     def _strip_internals(data: dict[str, Any]) -> dict[str, Any]:
+  76|         meta = data.get("metadata")
+  77|         if isinstance(meta, dict):
+  78|             cleaned = {k: v for k, v in meta.items() if not k.startswith("__")}
+  79|             if cleaned:
+  80|                 data["metadata"] = cleaned
+  81|             else:
+  82|                 data.pop("metadata", None)
+  83|         return data
+  84| 
+  85|     return SaveContext(post_save=_strip_internals, **kwargs)
+  86| 
+  87| 
+  88| # ---------------------------------------------------------------------------
+  89| # Internal pipeline
+  90| # ---------------------------------------------------------------------------
+  91| 
+  92| 
+  93| def _build_agent(
+  94|     data: dict[str, Any] | str,
+  95|     path: Path,
+  96|     *,
+  97|     allowed_file_roots: Sequence[str | Path] | None = None,
+  98| ) -> Prompty:
+  99|     """Shared pipeline that transforms raw frontmatter dict into a Prompty."""
+ 100| 
+ 101|     # Handle body-only files (no frontmatter — parse returns a string)
+ 102|     if isinstance(data, str):
+ 103|         data = {"instructions": data}
+ 104|     if not isinstance(data, dict):
+ 105|         data = {}
+ 106| 
+ 107|     # 2. Load via Prompty.load() with pre_process for ${protocol:value} expansion
+ 108|     ctx = LoadContext(pre_process=_pre_process(path, allowed_file_roots=allowed_file_roots))
+ 109|     agent = Prompty.load(data, ctx)
+ 110| 
+ 111|     # Store source path for PromptyTool resolution (relative path lookups)
+ 112|     if agent.metadata is None:
+ 113|         agent.metadata = {}
+ 114|     agent.metadata["__source_path"] = str(path)
+ 115| 
+ 116|     return agent
+ 117| 
+ 118| 
+ 119| # ---------------------------------------------------------------------------
+ 120| # Reference resolution via pre_process
+ 121| # ---------------------------------------------------------------------------
+ 122| 
+ 123| 
+ 124| def _pre_process(
+ 125|     agent_file: Path,
+ 126|     *,
+ 127|     allowed_file_roots: Sequence[str | Path] | None = None,
+ 128| ) -> Callable[[Any], Any]:
+ 129|     """Return a ``pre_process`` callback that resolves ``${protocol:value}``
+ 130|     references in every dict the loader visits.
+ 131| 
+ 132|     Supported protocols:
+ 133| 
+ 134|     * ``${env:VAR_NAME}`` — environment variable (required)
+ 135|     * ``${env:VAR_NAME:default}`` — environment variable with default
+ 136|     * ``${file:relative/path}`` — load file content (JSON / YAML / text)
+ 137| 
+ 138|     File references are limited to the prompt directory by default. Callers may
+ 139|     provide additional allowed roots via ``allowed_file_roots``.
+ 140|     """
+ 141| 
+ 142|     def process(data: Any) -> Any:
+ 143|         if not isinstance(data, dict):
+ 144|             return data
+ 145| 
+ 146|         for key, value in list(data.items()):
+ 147|             if not isinstance(value, str) or not value.startswith("${"):
+ 148|                 continue
+ 149| 
+ 150|             # Must end with }
+ 151|             if not value.endswith("}"):
+ 152|                 continue
+ 153| 
+ 154|             inner = value[2:-1]
+ 155|             protocol, _, val = inner.partition(":")
+ 156|             protocol = protocol.lower()
+ 157| 
+ 158|             if protocol == "env":
+ 159|                 # Support ${env:VAR:default}
+ 160|                 var_name, _, default = val.partition(":")
+ 161|                 env_val = os.environ.get(var_name)
+ 162|                 if env_val is None:
+ 163|                     if default:
+ 164|                         data[key] = default
+ 165|                     else:
+ 166|                         raise ValueError(f"Environment variable '{var_name}' not set for key '{key}'")
+ 167|                 else:
+ 168|                     data[key] = env_val
+ 169| 
+ 170|             elif protocol == "file":
+ 171|                 file_path = _resolve_file_reference(agent_file, val, allowed_file_roots)
+ 172|                 if not file_path.exists():
+ 173|                     raise FileNotFoundError(
+ 174|                         f"Referenced file '{val}' not found for key '{key}' (resolved to {file_path})"
+ 175|                     )
+ 176|                 data[key] = _load_file_content(file_path)
+ 177| 
+ 178|         return data
+ 179| 
+ 180|     return process
+ 181| 
+ 182| 
+ 183| def _resolve_file_reference(
+ 184|     agent_file: Path,
+ 185|     reference: str,
+ 186|     allowed_file_roots: Sequence[str | Path] | None,
+ 187| ) -> Path:
+ 188|     """Resolve and validate a ``${file:...}`` reference."""
+ 189|     prompt_root = agent_file.parent.resolve()
+ 190|     allowed_roots = [prompt_root, *(Path(root).resolve() for root in allowed_file_roots or ())]
+ 191| 
+ 192|     candidate = Path(reference)
+ 193|     if not candidate.is_absolute():
+ 194|         candidate = prompt_root / candidate
+ 195| 
+ 196|     resolved = candidate.resolve()
+ 197|     if not any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots):
+ 198|         roots = ", ".join(str(root) for root in allowed_roots)
+ 199|         raise ValueError(
+ 200|             f"File reference '{reference}' resolves outside allowed roots for '{agent_file}'. Allowed roots: {roots}"
+ 201|         )
+ 202| 
+ 203|     return resolved
+ 204| 
+ 205| 
+ 206| def _load_file_content(path: Path) -> Any:
+ 207|     """Load a file as JSON, YAML, or plain text based on its extension."""
+ 208|     with open(path, encoding="utf-8") as f:
+ 209|         if path.suffix == ".json":
+ 210|             return json.load(f)
+ 211|         elif path.suffix in (".yml", ".yaml"):
+ 212|             return yaml.safe_load(f)
+ 213|         else:
+ 214|             return f.read()
+ 215| 
+ 216| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=8168 teacher=unknown flags=[]
+[ANALYSIS]
+# 全文逐函数安全分析
+
+## 0. 文件结构总览与入口点枚举
+
+本文件为 Prompty 加载器，全文共约 160 行。逐一枚举所有入口点（source）：
+
+1. **文件路径参数**：`load(path)`（第 27 行）、`load_async(path)`（第 41 行）——外部传入的 `.prompty` 文件路径；
+2. **YAML frontmatter 内容**：由 `load_prompty` 解析出的 `data` 字典（第 31、45 行），其中任意键值可被攻击者控制（若 prompty 文件来自不可信来源）；
+3. **环境变量**：`${env:VAR}` 协议读取 `os.environ`（第 106 行）；
+4. **二级文件包含**：`${file:relative/path}` 协议触发 `_load_file_content`（第 113 行 → 第 137 行），可读任意扩展名文件；
+5. **回调通道**：`_pre_process` 作为 `LoadContext(pre_process=...)` 回调注入（第 68 行），在 `Prompty.load` 内部对每个 dict 触发——这是第二入口/替代通道，任何经过该 context 的嵌套 dict 都会执行协议解析；
+6. **保存侧回调**：`default_save_context` 的 `_strip_internals`（第 55–62 行），仅做键过滤，无 sink。
+
+## 1. `load()`（第 27–38 行）
+
+- 第 28 行：`path = Path(path).resolve()` —— 仅规范化路径，**无任何目录白名单/根目录约束**。攻击者控制的 path 可指向文件系统任意位置。
+- 第 29–30 行：仅检查存在性。
+- 第 31 行：`load_prompty(path)` 读入并解析 YAML（sink：文件读取 + YAML 解析；使用的是项目内 utils，此处假定 frontmatter 用 safe_load，但即便如此内容仍进入后续流程）。
+- 第 33 行：进入 `_build_agent`。
+
+数据流：`path(外部) → resolve → load_prompty 读文件 → _build_agent`。防御：无。这是第一个未验证的 source。
+
+## 2. `load_async()`（第 41–46 行）
+
+与 `load` 完全对称（第 42 行 resolve、第 44 行 await 异步读取、第 46 行同一 `_build_agent`）。所有结论同样适用，属第二入口的镜像通道。
+
+## 3. `default_save_context()`（第 49–62 行）
+
+- 第 55–62 行：`_strip_internals` 只删除 metadata 中 `__` 前缀键。这是输出净化，不涉及危险 sink（无 eval/exec/os.system/subprocess/yaml.dump unsafe）。唯一注意点：它只清洗 `metadata` 子字典，其他位置的 `__` 键不被清除，但这属于信息泄露面而非可利用漏洞，且依赖调用方如何序列化。判定：无直接漏洞。
+
+## 4. `_build_agent()`（第 65–81 行）
+
+- 第 70–72 行：body-only 时把整段 markdown 塞进 `instructions`，无过滤——但 markdown 内容最终只是模型提示词文本，非代码 sink。
+- 第 75 行：`ctx = LoadContext(pre_process=_pre_process(path))` —— 关键：把基于 attacker-controlled path 构造的回调注入加载管线。
+- 第 76 行：`Prompty.load(data, ctx)` —— pre_process 会对 data 中**每一个嵌套 dict** 执行（替代通道确认：即使顶层值不是 `${...}` 字符串，深层嵌套的字符串值也会被解析）。
+
+## 5. `_pre_process()` / 内部 `process()`（第 88–121 行）—— 核心风险区
+
+- 第 96–99 行：匹配 `${...}` 格式，黑名单式检查（startswith `${`、endswith `}`），按本任务判定标准视为可绕过/弱防御，且这里本来就没有更严格的校验。
+- 第 101 行：`inner = value[2:-1]` 后 `partition(":")`，protocol 未做白名单外的任何限制——但实际只处理 `env` 和 `file` 两个分支，未知协议被静默忽略（第 121 行隐式跳过），不算命令注入面。
+- **`${env:VAR:default}` 分支（第 104–112 行）**：
+  - 第 106 行 `os.environ.get(var_name)` —— source 为进程环境变量。若 prompty 文件不可信，攻击者可让配置读取任意环境变量（如 `API_KEY`、`AWS_SECRET_ACCESS_KEY`）并注入到 prompt/metadata 中，随后可能随序列化或请求外发——**敏感信息泄露（CWE-200/CWE-214）**。
+  - 第 109 行 default 注入同理。
+- **`${file:relative/path}` 分支（第 113–118 行）**：
+  - 第 114 行：`relative_path = (agent_file.parent / val).resolve()` —— **关键缺陷**：`Path.__truediv__` 遇到绝对路径 `val`（如 `/etc/passwd` 或 Windows `C:/...`）时直接丢弃左侧基路径；且 `..%2F` 式的 `../../..` 在 resolve 后同样逃逸出 agent_file.parent。**没有任何 `is_relative_to(agent_file.parent)` 校验**。
+  - 第 115–117 行：仅检查存在性后即放行。
+  - 第 118 行：`data[key] = _load_file_content(relative_path)` —— sink：任意文件读取，结果写入配置对象。
+- 完整链路验证：source = 不可信 `.prompty` frontmatter 中的字符串值（第 96 行起处理）→ 绕过仅有格式检查 → 第 114 行路径拼接无 containment 检查 → 第 118/137 行 open() 读取 → 内容成为 agent 配置的一部分，可经 `to_yaml()/to_json()` 或后续 LLM 调用外泄。防御有效性：**无有效防御**（resolve 不等于沙箱化；存在性检查不构成访问控制）。
+
+## 6. `_load_file_content()`（第 124–140 行）
+
+- 第 128 行：`open(path, encoding="utf-8")` —— 直接打开上一步传入的未校验路径，sink 确认。
+- 第 129–130 行：`.json` → `json.load`（安全解析器）；第 131–132 行：yaml 用 `safe_load`（非 `load`，无反序列化 RCE）；第 133–134 行：**任意扩展名回退为纯文本读取**——意味着 `.prompty`、`.env`、私钥等任何文件都可被读出。注意没有 `.py` 执行、没有 pickle，故不构成代码执行，但任意读成立。
+
+## 7. 第二入口与替代通道复核
+
+- 异步入口（第 41 行）复用同一 `_pre_process`，漏洞等价可达；
+- 嵌套 dict 遍历（第 94–95 行 `for key, value in list(data.items())` 仅一层？——注意 process 只遍历当前层，但 `Prompty.load` 对每个子 dict 再次调用 pre_process，形成递归覆盖，深层 `${file:...}` 同样触发）；
+- `__source_path`（第 80 行）存入 metadata，配合 `default_save_context` 的 `__` 剥离逻辑，说明作者意识到内部键需隐藏，侧面印证 metadata 可能被导出——加强泄露链可信度。
+
+## 结论
+
+主要漏洞：`${file:}` 协议路径穿越导致任意文件读取（CWE-22），次要：`${env:}` 可窃取环境变量（CWE-200）。前提是 prompty 文件部分可控（典型威胁模型：用户加载第三方共享的 .prompty）。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "High", "source": "line 92-101: attacker-controlled ${file:path} string from untrusted .prompty frontmatter", "sink": "line 155:relative_path=(agent_file.parent/val).resolve() without containment check -> line 169 open(path) -> line 175:f.read()", "explanation": "untrusted frontmatter value -> weak format-only check at line 96-99 -> line 155 truediv+resolve allows absolute paths and .. escape -> line 115 only existence check -> line 160:_load_file_content -> line 169 open reads any file (fallback text branch line 133-134 covers all extensions) -> content stored into agent config and may be exfiltrated via serialization or LLM call; secondary flow: ${env:VAR} at line 121:reads arbitrary environment variables into config; async entry line 5:and nested-dict callback channel via Prompty.load reach the same sink; boundary: exploitability requires an untrusted .prompty file (shared repo/community template) — trusted-environment config files are outside the attack surface", "fix_suggestion": "after line 114 add containment validation such as resolved.relative_to(agent_file.parent.resolve()) raising on failure, reject absolute val before joining, restrict file protocol to an allowlisted directory and extension set, and gate env protocol behind an explicit opt-in flag"}
+
+### id=8169 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **入口点枚举（全文）**：`load`（第 33 行）与 `load_async`（第 55 行）接收用户可控的 `path`；`_pre_process` 内的 `process` 回调（第 105 行起）处理 frontmatter 中所有字符串值，是 `${env:...}` / `${file:...}` 的 source；`default_save_context`（第 66 行）仅做序列化清洗，无危险 sink。
+
+2. **`path` → 文件读取流**：第 35 行 `Path(path).resolve()` 后 `load_prompty(path)` 读取。路径由调用方显式提供且必须存在，属预期功能（加载指定文件），非注入型漏洞。
+
+3. **`${env:VAR}` 流**：source 为 YAML 值中的 `${env:` 前缀字符串（第 110–112 行解析），sink 为 `os.environ.get(var_name)`（第 121 行）。读取环境变量写入配置对象，不涉及命令执行或路径逃逸；变量名来自 prompt 文件本身（受信输入），无有效攻击面。
+
+4. **`${file:...}` 流——重点验证**：source 同上，sink 为 `_load_file_content`（第 152 行 `open(path)`）。防御在 `_resolve_file_reference`（第 138–150 行）：相对路径锚定到 `prompt_root`，随后 `candidate.resolve()` 做**规范化+符号链接解析**，再用 `resolved.is_relative_to(root)` 白名单校验（第 147 行）。这是基于规范化绝对路径的白名单比较，不是黑名单/正则，`../`、符号链接指向根外等绕过均会被 resolve 后拦截。防御**有效**。
+
+5. **第二入口/替代通道**：`allowed_file_roots` 由调用方传入（第 34、56 行），若调用方传入过宽根目录则扩大可读范围，但这是调用方授权行为，非库内漏洞。`yaml.safe_load`（第 156 行）避免了反序列化 RCE；`json.load` 安全。
+
+6. **其他 sink 排查**：全文无 `eval/exec/subprocess/os.system/pickle` 等危险 sink；`_strip_internals` 仅操作 dict 键。
+
+7. **结论**：所有 source→sink 流均有有效白名单校验或无危险 sink，未发现可利用漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文：${file:...} 引用经 _resolve_file_reference 使用 Path.resolve 规范化并做 allowed_roots 白名单校验（第 138-150 行），可有效阻止路径穿越与符号链接逃逸；${env:...} 仅读取环境变量无危险 sink；YAML 使用 safe_load 无反序列化风险；全文不存在 eval、subprocess 等危险 sink。", "fix_suggestion": "no fix needed"}

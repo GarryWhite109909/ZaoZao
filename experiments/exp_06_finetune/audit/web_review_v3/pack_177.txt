@@ -1,0 +1,978 @@
+batch=177 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=8076 lang=go
+[CODE]
+   1| package duckdb_parser
+   2| 
+   3| import (
+   4| 	"bytes"
+   5| 	"embed"
+   6| 	"fmt"
+   7| 	"sort"
+   8| 	"strings"
+   9| 	"text/template"
+  10| 
+  11| 	"github.com/kubev2v/migration-planner/pkg/estimations/complexity"
+  12| )
+  13| 
+  14| //go:embed templates/*.tmpl
+  15| var templateFS embed.FS
+  16| 
+  17| // getTemplate reads a template from the embedded filesystem.
+  18| func getTemplate(name string) (string, error) {
+  19| 	content, err := templateFS.ReadFile("templates/" + name + ".go.tmpl")
+  20| 	if err != nil {
+  21| 		return "", fmt.Errorf("reading template %s: %w", name, err)
+  22| 	}
+  23| 	return string(content), nil
+  24| }
+  25| 
+  26| // mustGetTemplate reads a template and panics on error (for init-time loading).
+  27| func mustGetTemplate(name string) string {
+  28| 	content, err := getTemplate(name)
+  29| 	if err != nil {
+  30| 		panic(err)
+  31| 	}
+  32| 	return content
+  33| }
+  34| 
+  35| // QueryBuilder builds SQL queries from templates.
+  36| type QueryBuilder struct{}
+  37| 
+  38| // NewBuilder creates a new Builder.
+  39| func NewBuilder() *QueryBuilder {
+  40| 	return &QueryBuilder{}
+  41| }
+  42| 
+  43| type ingestParams struct {
+  44| 	FilePath string
+  45| }
+  46| 
+  47| // CreateSchemaQuery returns queries to create all RVTools tables with proper schema.
+  48| func (b *QueryBuilder) CreateSchemaQuery() (string, error) {
+  49| 	return b.buildQuery("create_schema", mustGetTemplate("create_schema"), nil)
+  50| }
+  51| 
+  52| // IngestRvtoolsQuery returns a query that inserts data from an RVTools Excel file into schema tables.
+  53| func (b *QueryBuilder) IngestRvtoolsQuery(filePath string) (string, error) {
+  54| 	return b.buildQuery("ingest_rvtools", mustGetTemplate("ingest_rvtools"), ingestParams{FilePath: filePath})
+  55| }
+  56| 
+  57| // IngestSqliteQuery returns a query that creates RVTools-shaped tables from a forklift SQLite database.
+  58| func (b *QueryBuilder) IngestSqliteQuery(filePath string) (string, error) {
+  59| 	return b.buildQuery("ingest_sqlite", mustGetTemplate("ingest_sqlite"), ingestParams{FilePath: filePath})
+  60| }
+  61| 
+  62| // queryParams holds all template parameters for queries.
+  63| type queryParams struct {
+  64| 	NetworkColumns          string
+  65| 	ClusterFilter           string
+  66| 	OSFilter                string
+  67| 	PowerStateFilter        string
+  68| 	VmIDFilter              string
+  69| 	VMListFilter            string
+  70| 	Category                string
+  71| 	OSCaseClauses           string
+  72| 	ComplexityMatrixClauses string
+  73| 	Limit                   int
+  74| 	Offset                  int
+  75| }
+  76| 
+  77| // VMQuery builds the VM query with filters and pagination.
+  78| func (b *QueryBuilder) VMQuery(filters Filters, options Options) (string, error) {
+  79| 	const maxNetworkNumbers = 8 // RVTools vInfo has Network #1 through Network #8
+  80| 	quoted := make([]string, 0, maxNetworkNumbers)
+  81| 	for i := 1; i <= maxNetworkNumbers; i++ {
+  82| 		quoted = append(quoted, fmt.Sprintf(`i."Network #%d"`, i))
+  83| 	}
+  84| 	networkColumns := strings.Join(quoted, ", ")
+  85| 
+  86| 	params := queryParams{
+  87| 		NetworkColumns:   networkColumns,
+  88| 		ClusterFilter:    escapeSQLString(filters.Cluster),
+  89| 		OSFilter:         escapeSQLString(filters.OS),
+  90| 		PowerStateFilter: escapeSQLString(filters.PowerState),
+  91| 		VmIDFilter:       escapeSQLString(filters.VmId),
+  92| 		VMListFilter:     buildVMListFilter(filters.VMList, "i"),
+  93| 		Limit:            options.Limit,
+  94| 		Offset:           options.Offset,
+  95| 	}
+  96| 	return b.buildQuery("vm_query", mustGetTemplate("vm_query"), params)
+  97| }
+  98| 
+  99| // DatastoreQuery builds the datastore query with filters and pagination.
+ 100| func (b *QueryBuilder) DatastoreQuery(filters Filters, options Options) (string, error) {
+ 101| 	params := queryParams{
+ 102| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 103| 		Limit:         options.Limit,
+ 104| 		Offset:        options.Offset,
+ 105| 	}
+ 106| 	return b.buildQuery("datastore_query", mustGetTemplate("datastore_query"), params)
+ 107| }
+ 108| 
+ 109| // NetworkQuery builds the network query with filters and pagination.
+ 110| func (b *QueryBuilder) NetworkQuery(filters Filters, options Options) (string, error) {
+ 111| 	params := queryParams{
+ 112| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 113| 		Limit:         options.Limit,
+ 114| 		Offset:        options.Offset,
+ 115| 	}
+ 116| 	return b.buildQuery("network_query", mustGetTemplate("network_query"), params)
+ 117| }
+ 118| 
+ 119| // HostQuery builds the host query with filters and pagination.
+ 120| func (b *QueryBuilder) HostQuery(filters Filters, options Options) (string, error) {
+ 121| 	params := queryParams{
+ 122| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 123| 		Limit:         options.Limit,
+ 124| 		Offset:        options.Offset,
+ 125| 	}
+ 126| 	return b.buildQuery("host_query", mustGetTemplate("host_query"), params)
+ 127| }
+ 128| 
+ 129| // OsQuery builds the OS summary query with filters.
+ 130| func (b *QueryBuilder) OsQuery(filters Filters) (string, error) {
+ 131| 	params := queryParams{
+ 132| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 133| 		VMListFilter:  buildVMListFilter(filters.VMList, "v"),
+ 134| 	}
+ 135| 	return b.buildQuery("os_query", mustGetTemplate("os_query"), params)
+ 136| }
+ 137| 
+ 138| // ClustersQuery builds the clusters query.
+ 139| func (b *QueryBuilder) ClustersQuery() (string, error) {
+ 140| 	return b.buildQuery("clusters_query", mustGetTemplate("clusters_query"), nil)
+ 141| }
+ 142| 
+ 143| // ClusterDatacentersQuery builds the cluster to datacenter mapping query.
+ 144| func (b *QueryBuilder) ClusterDatacentersQuery() (string, error) {
+ 145| 	return b.buildQuery("cluster_datacenters_query", mustGetTemplate("cluster_datacenters_query"), nil)
+ 146| }
+ 147| 
+ 148| // ClusterObjectIDsQuery builds the cluster name to Object ID mapping query.
+ 149| func (b *QueryBuilder) ClusterObjectIDsQuery() (string, error) {
+ 150| 	return b.buildQuery("cluster_object_ids_query", mustGetTemplate("cluster_object_ids_query"), nil)
+ 151| }
+ 152| 
+ 153| // ClusterFeaturesQuery builds query to get cluster features.
+ 154| func (b *QueryBuilder) ClusterFeaturesQuery(clusterName string) (string, error) {
+ 155| 	params := struct{ ClusterName string }{ClusterName: escapeSQLString(clusterName)}
+ 156| 	return b.buildQuery("cluster_features_query", mustGetTemplate("cluster_features_query"), params)
+ 157| }
+ 158| 
+ 159| // VMCountQuery builds the VM count query with filters.
+ 160| func (b *QueryBuilder) VMCountQuery(filters Filters) (string, error) {
+ 161| 	params := queryParams{
+ 162| 		ClusterFilter:    escapeSQLString(filters.Cluster),
+ 163| 		PowerStateFilter: escapeSQLString(filters.PowerState),
+ 164| 		VMListFilter:     buildVMListFilter(filters.VMList, ""),
+ 165| 	}
+ 166| 	return b.buildQuery("vm_count_query", mustGetTemplate("vm_count_query"), params)
+ 167| }
+ 168| 
+ 169| // PowerStateCountsQuery builds the power state counts query.
+ 170| func (b *QueryBuilder) PowerStateCountsQuery(filters Filters) (string, error) {
+ 171| 	params := queryParams{
+ 172| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 173| 		VMListFilter:  buildVMListFilter(filters.VMList, ""),
+ 174| 	}
+ 175| 	return b.buildQuery("power_state_counts_query", mustGetTemplate("power_state_counts_query"), params)
+ 176| }
+ 177| 
+ 178| // HostPowerStateCountsQuery builds the host power state counts query.
+ 179| func (b *QueryBuilder) HostPowerStateCountsQuery(filters Filters) (string, error) {
+ 180| 	params := queryParams{
+ 181| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 182| 	}
+ 183| 	return b.buildQuery("host_power_state_counts_query", mustGetTemplate("host_power_state_counts_query"), params)
+ 184| }
+ 185| 
+ 186| // CPUTierQuery builds the CPU tier distribution query.
+ 187| func (b *QueryBuilder) CPUTierQuery(filters Filters) (string, error) {
+ 188| 	params := queryParams{
+ 189| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 190| 		VMListFilter:  buildVMListFilter(filters.VMList, ""),
+ 191| 	}
+ 192| 	return b.buildQuery("cpu_tier_query", mustGetTemplate("cpu_tier_query"), params)
+ 193| }
+ 194| 
+ 195| // MemoryTierQuery builds the memory tier distribution query.
+ 196| func (b *QueryBuilder) MemoryTierQuery(filters Filters) (string, error) {
+ 197| 	params := queryParams{
+ 198| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 199| 		VMListFilter:  buildVMListFilter(filters.VMList, ""),
+ 200| 	}
+ 201| 	return b.buildQuery("memory_tier_query", mustGetTemplate("memory_tier_query"), params)
+ 202| }
+ 203| 
+ 204| // NicTierQuery builds the NIC count tier distribution query.
+ 205| func (b *QueryBuilder) NicTierQuery(filters Filters) (string, error) {
+ 206| 	params := queryParams{
+ 207| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 208| 		VMListFilter:  buildVMListFilter(filters.VMList, "i"),
+ 209| 	}
+ 210| 	return b.buildQuery("nic_tier_query", mustGetTemplate("nic_tier_query"), params)
+ 211| }
+ 212| 
+ 213| // ComplexityDistributionQuery builds the complexity distribution query.
+ 214| func (b *QueryBuilder) ComplexityDistributionQuery(filters Filters) (string, error) {
+ 215| 	params := queryParams{
+ 216| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 217| 		VMListFilter:  buildVMListFilter(filters.VMList, "i"),
+ 218| 	}
+ 219| 	return b.buildQuery("complexity_distribution_query", mustGetTemplate("complexity_distribution_query"), params)
+ 220| }
+ 221| 
+ 222| // DiskSizeTierQuery builds the disk size tier distribution query.
+ 223| func (b *QueryBuilder) DiskSizeTierQuery(filters Filters) (string, error) {
+ 224| 	params := queryParams{
+ 225| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 226| 		VMListFilter:  buildVMListFilter(filters.VMList, "i"),
+ 227| 	}
+ 228| 	return b.buildQuery("disk_size_tier_query", mustGetTemplate("disk_size_tier_query"), params)
+ 229| }
+ 230| 
+ 231| // DiskComplexityTierQuery builds the disk complexity tier distribution query.
+ 232| func (b *QueryBuilder) DiskComplexityTierQuery(filters Filters) (string, error) {
+ 233| 	params := queryParams{
+ 234| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 235| 		VMListFilter:  buildVMListFilter(filters.VMList, "i"),
+ 236| 	}
+ 237| 	return b.buildQuery("disk_complexity_tier_query", mustGetTemplate("disk_complexity_tier_query"), params)
+ 238| }
+ 239| 
+ 240| // DiskTypeSummaryQuery builds the disk type summary query.
+ 241| func (b *QueryBuilder) DiskTypeSummaryQuery(filters Filters) (string, error) {
+ 242| 	params := queryParams{
+ 243| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 244| 		VMListFilter:  buildVMListFilter(filters.VMList, ""),
+ 245| 	}
+ 246| 	return b.buildQuery("disk_type_summary_query", mustGetTemplate("disk_type_summary_query"), params)
+ 247| }
+ 248| 
+ 249| // ResourceTotalsQuery builds the resource totals query.
+ 250| func (b *QueryBuilder) ResourceTotalsQuery(filters Filters) (string, error) {
+ 251| 	params := queryParams{
+ 252| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 253| 		VMListFilter:  buildVMListFilter(filters.VMList, "i"),
+ 254| 	}
+ 255| 	return b.buildQuery("resource_totals_query", mustGetTemplate("resource_totals_query"), params)
+ 256| }
+ 257| 
+ 258| // AllocatedVCPUsQuery builds the allocated vCPUs query.
+ 259| func (b *QueryBuilder) AllocatedVCPUsQuery(filters Filters) (string, error) {
+ 260| 	params := queryParams{
+ 261| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 262| 		VMListFilter:  buildVMListFilter(filters.VMList, ""),
+ 263| 	}
+ 264| 	return b.buildQuery("allocated_vcpus_query", mustGetTemplate("allocated_vcpus_query"), params)
+ 265| }
+ 266| 
+ 267| // AllocatedMemoryQuery builds the allocated memory query.
+ 268| func (b *QueryBuilder) AllocatedMemoryQuery(filters Filters) (string, error) {
+ 269| 	params := queryParams{
+ 270| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 271| 		VMListFilter:  buildVMListFilter(filters.VMList, ""),
+ 272| 	}
+ 273| 	return b.buildQuery("allocated_memory_query", mustGetTemplate("allocated_memory_query"), params)
+ 274| }
+ 275| 
+ 276| // TotalHostCPUsQuery builds the total host CPUs query.
+ 277| func (b *QueryBuilder) TotalHostCPUsQuery(filters Filters) (string, error) {
+ 278| 	params := queryParams{
+ 279| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 280| 	}
+ 281| 	return b.buildQuery("total_host_cpus_query", mustGetTemplate("total_host_cpus_query"), params)
+ 282| }
+ 283| 
+ 284| // TotalHostMemoryQuery builds the total host memory query.
+ 285| func (b *QueryBuilder) TotalHostMemoryQuery(filters Filters) (string, error) {
+ 286| 	params := queryParams{
+ 287| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 288| 	}
+ 289| 	return b.buildQuery("total_host_memory_query", mustGetTemplate("total_host_memory_query"), params)
+ 290| }
+ 291| 
+ 292| // VMCountByNetworkQuery builds the VM count by network query.
+ 293| func (b *QueryBuilder) VMCountByNetworkQuery(filters Filters) (string, error) {
+ 294| 	params := queryParams{
+ 295| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 296| 		VMListFilter:  buildVMListFilter(filters.VMList, "i"),
+ 297| 	}
+ 298| 	return b.buildQuery("vm_count_by_network_query", mustGetTemplate("vm_count_by_network_query"), params)
+ 299| }
+ 300| 
+ 301| // DatacenterCountQuery builds the datacenter count query.
+ 302| func (b *QueryBuilder) DatacenterCountQuery() (string, error) {
+ 303| 	return b.buildQuery("datacenter_count_query", mustGetTemplate("datacenter_count_query"), nil)
+ 304| }
+ 305| 
+ 306| // ClustersPerDatacenterQuery builds the clusters per datacenter query.
+ 307| func (b *QueryBuilder) ClustersPerDatacenterQuery() (string, error) {
+ 308| 	return b.buildQuery("clusters_per_datacenter_query", mustGetTemplate("clusters_per_datacenter_query"), nil)
+ 309| }
+ 310| 
+ 311| // MigratableCountQuery builds the migratable VMs count query.
+ 312| func (b *QueryBuilder) MigratableCountQuery(filters Filters) (string, error) {
+ 313| 	params := queryParams{
+ 314| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 315| 		VMListFilter:  buildVMListFilter(filters.VMList, "i"),
+ 316| 	}
+ 317| 	return b.buildQuery("migratable_count_query", mustGetTemplate("migratable_count_query"), params)
+ 318| }
+ 319| 
+ 320| // MigratableWithWarningsCountQuery builds the migratable with warnings count query.
+ 321| func (b *QueryBuilder) MigratableWithWarningsCountQuery(filters Filters) (string, error) {
+ 322| 	params := queryParams{
+ 323| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 324| 		VMListFilter:  buildVMListFilter(filters.VMList, "i"),
+ 325| 	}
+ 326| 	return b.buildQuery("migratable_with_warnings_count_query", mustGetTemplate("migratable_with_warnings_count_query"), params)
+ 327| }
+ 328| 
+ 329| // NotMigratableCountQuery builds the not migratable VMs count query.
+ 330| func (b *QueryBuilder) NotMigratableCountQuery(filters Filters) (string, error) {
+ 331| 	params := queryParams{
+ 332| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 333| 		VMListFilter:  buildVMListFilter(filters.VMList, "i"),
+ 334| 	}
+ 335| 	return b.buildQuery("not_migratable_count_query", mustGetTemplate("not_migratable_count_query"), params)
+ 336| }
+ 337| 
+ 338| // MigrationIssuesQuery builds the migration issues query.
+ 339| func (b *QueryBuilder) MigrationIssuesQuery(filters Filters, category string) (string, error) {
+ 340| 	params := queryParams{
+ 341| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 342| 		Category:      escapeSQLString(category),
+ 343| 		VMListFilter:  buildVMListFilter(filters.VMList, "i"),
+ 344| 	}
+ 345| 	return b.buildQuery("migration_issues_query", mustGetTemplate("migration_issues_query"), params)
+ 346| }
+ 347| 
+ 348| // ResourceBreakdownsQuery builds the resource breakdowns query.
+ 349| func (b *QueryBuilder) ResourceBreakdownsQuery(filters Filters) (string, error) {
+ 350| 	params := queryParams{
+ 351| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 352| 		VMListFilter:  buildVMListFilter(filters.VMList, "i"),
+ 353| 	}
+ 354| 	return b.buildQuery("resource_breakdowns_query", mustGetTemplate("resource_breakdowns_query"), params)
+ 355| }
+ 356| 
+ 357| // AboutQuery builds the query for the single `about` table row (API/product/uuid).
+ 358| func (b *QueryBuilder) AboutQuery() (string, error) {
+ 359| 	return b.buildQuery("about_query", mustGetTemplate("about_query"), nil)
+ 360| }
+ 361| 
+ 362| // VMsWithSharedDisksCountQuery builds the VMs with shared disks count query.
+ 363| func (b *QueryBuilder) VMsWithSharedDisksCountQuery(filters Filters) (string, error) {
+ 364| 	params := queryParams{
+ 365| 		ClusterFilter: escapeSQLString(filters.Cluster),
+ 366| 		VMListFilter:  buildVMListFilter(filters.VMList, "i"),
+ 367| 	}
+ 368| 	return b.buildQuery("vms_with_shared_disks_count_query", mustGetTemplate("vms_with_shared_disks_count_query"), params)
+ 369| }
+ 370| 
+ 371| // generateOSCaseClauses reads complexity.OSDifficultyScores and generates SQL WHEN clauses.
+ 372| func generateOSCaseClauses() string {
+ 373| 	scoreToLevel := map[int]string{
+ 374| 		1: "easy",
+ 375| 		2: "medium",
+ 376| 		3: "hard",
+ 377| 		4: "database",
+ 378| 	}
+ 379| 	var clauses []string
+ 380| 	for keyword, score := range complexity.OSDifficultyScores {
+ 381| 		level := scoreToLevel[score]
+ 382| 		clauses = append(clauses, fmt.Sprintf(
+ 383| 			"            WHEN LOWER(effective_os) LIKE '%%%s%%' THEN '%s'", strings.ToLower(keyword), level))
+ 384| 	}
+ 385| 	sort.Strings(clauses) // deterministic output
+ 386| 	return strings.Join(clauses, "\n")
+ 387| }
+ 388| 
+ 389| // generateComplexityMatrixCaseClauses reads complexity.ComplexityMatrix and generates
+ 390| // SQL WHEN clauses for the combined OS+disk complexity CASE expression.
+ 391| func generateComplexityMatrixCaseClauses() string {
+ 392| 	osScoreToLevel := map[complexity.Score]string{
+ 393| 		0: "unsupported",
+ 394| 		1: "easy",
+ 395| 		2: "medium",
+ 396| 		3: "hard",
+ 397| 		4: "database",
+ 398| 	}
+ 399| 	diskScoreToLevel := map[complexity.Score]string{
+ 400| 		1: "easy",
+ 401| 		2: "medium",
+ 402| 		3: "hard",
+ 403| 		4: "whiteglove",
+ 404| 	}
+ 405| 
+ 406| 	// Collect and sort outer (OS) keys for deterministic output.
+ 407| 	osKeys := make([]complexity.Score, 0, len(complexity.ComplexityMatrix))
+ 408| 	for osScore := range complexity.ComplexityMatrix {
+ 409| 		osKeys = append(osKeys, osScore)
+ 410| 	}
+ 411| 	sort.Ints(osKeys)
+ 412| 
+ 413| 	var clauses []string
+ 414| 	for _, osScore := range osKeys {
+ 415| 		inner := complexity.ComplexityMatrix[osScore]
+ 416| 		osLevel := osScoreToLevel[osScore]
+ 417| 
+ 418| 		// Collect and sort inner (disk) keys for deterministic output.
+ 419| 		diskKeys := make([]complexity.Score, 0, len(inner))
+ 420| 		for diskScore := range inner {
+ 421| 			diskKeys = append(diskKeys, diskScore)
+ 422| 		}
+ 423| 		sort.Ints(diskKeys)
+ 424| 
+ 425| 		for _, diskScore := range diskKeys {
+ 426| 			combined := inner[diskScore]
+ 427| 			diskLevel := diskScoreToLevel[diskScore]
+ 428| 			clauses = append(clauses, fmt.Sprintf(
+ 429| 				"            WHEN o.os_level = '%s' AND dl.disk_level = '%s' THEN %d",
+ 430| 				osLevel, diskLevel, combined))
+ 431| 		}
+ 432| 	}
+ 433| 	return strings.Join(clauses, "\n")
+ 434| }
+ 435| 
+ 436| // PopulateComplexityQuery returns a query that computes and stores per-VM migration complexity.
+ 437| func (b *QueryBuilder) PopulateComplexityQuery() (string, error) {
+ 438| 	params := queryParams{
+ 439| 		OSCaseClauses:           generateOSCaseClauses(),
+ 440| 		ComplexityMatrixClauses: generateComplexityMatrixCaseClauses(),
+ 441| 	}
+ 442| 	return b.buildQuery("populate_complexity", mustGetTemplate("populate_complexity"), params)
+ 443| }
+ 444| 
+ 445| // buildVMListFilter creates a SQL IN clause for filtering by VM IDs.
+ 446| // Returns an empty string if the VMList is empty.
+ 447| // tableAlias is the optional table alias (e.g., "i") - use empty string for no alias.
+ 448| func buildVMListFilter(vmList []string, tableAlias string) string {
+ 449| 	if len(vmList) == 0 {
+ 450| 		return ""
+ 451| 	}
+ 452| 
+ 453| 	// Escape and quote each VM ID
+ 454| 	quoted := make([]string, len(vmList))
+ 455| 	for i, vmID := range vmList {
+ 456| 		// Escape single quotes by doubling them
+ 457| 		escaped := strings.ReplaceAll(vmID, "'", "''")
+ 458| 		quoted[i] = fmt.Sprintf("'%s'", escaped)
+ 459| 	}
+ 460| 
+ 461| 	// Build column reference with or without alias
+ 462| 	columnRef := "\"VM ID\""
+ 463| 	if tableAlias != "" {
+ 464| 		columnRef = fmt.Sprintf("%s.\"VM ID\"", tableAlias)
+ 465| 	}
+ 466| 
+ 467| 	return fmt.Sprintf(" AND %s IN (%s)", columnRef, strings.Join(quoted, ", "))
+ 468| }
+ 469| 
+ 470| func (b *QueryBuilder) buildQuery(name, tmplContent string, params any) (string, error) {
+ 471| 	tmpl, err := template.New(name).Parse(tmplContent)
+ 472| 	if err != nil {
+ 473| 		return "", err
+ 474| 	}
+ 475| 	var buf bytes.Buffer
+ 476| 	if err := tmpl.Execute(&buf, params); err != nil {
+ 477| 		return "", err
+ 478| 	}
+ 479| 	return strings.TrimSpace(buf.String()), nil
+ 480| }
+ 481| 
+ 482| 
+
+### id=8077 lang=php
+[CODE]
+   1| <?php
+   2| 
+   3| /*
+   4|  * This file is part of the Symfony package.
+   5|  *
+   6|  * (c) Fabien Potencier <fabien@symfony.com>
+   7|  *
+   8|  * For the full copyright and license information, please view the LICENSE
+   9|  * file that was distributed with this source code.
+  10|  */
+  11| 
+  12| namespace Symfony\Component\Cache\Traits;
+  13| 
+  14| use Psr\Cache\CacheItemInterface;
+  15| use Psr\Log\LoggerAwareTrait;
+  16| use Symfony\Component\Cache\CacheItem;
+  17| use Symfony\Component\Cache\Exception\InvalidArgumentException;
+  18| 
+  19| /**
+  20|  * @author Nicolas Grekas <p@tchwork.com>
+  21|  *
+  22|  * @internal
+  23|  */
+  24| trait AbstractAdapterTrait
+  25| {
+  26|     use LoggerAwareTrait;
+  27| 
+  28|     /**
+  29|      * @var \Closure needs to be set by class, signature is function(string <key>, mixed <value>, bool <isHit>)
+  30|      */
+  31|     private static $createCacheItem;
+  32| 
+  33|     /**
+  34|      * @var \Closure needs to be set by class, signature is function(array <deferred>, string <namespace>, array <&expiredIds>)
+  35|      */
+  36|     private static $mergeByLifetime;
+  37| 
+  38|     private $namespace = '';
+  39|     private $defaultLifetime;
+  40|     private $namespaceVersion = '';
+  41|     private $versioningIsEnabled = false;
+  42|     private $deferred = [];
+  43|     private $ids = [];
+  44| 
+  45|     /**
+  46|      * @var int|null The maximum length to enforce for identifiers or null when no limit applies
+  47|      */
+  48|     protected $maxIdLength;
+  49| 
+  50|     /**
+  51|      * Fetches several cache items.
+  52|      *
+  53|      * @param array $ids The cache identifiers to fetch
+  54|      *
+  55|      * @return array|\Traversable
+  56|      */
+  57|     abstract protected function doFetch(array $ids);
+  58| 
+  59|     /**
+  60|      * Confirms if the cache contains specified cache item.
+  61|      *
+  62|      * @param string $id The identifier for which to check existence
+  63|      *
+  64|      * @return bool
+  65|      */
+  66|     abstract protected function doHave(string $id);
+  67| 
+  68|     /**
+  69|      * Deletes all items in the pool.
+  70|      *
+  71|      * @param string $namespace The prefix used for all identifiers managed by this pool
+  72|      *
+  73|      * @return bool
+  74|      */
+  75|     abstract protected function doClear(string $namespace);
+  76| 
+  77|     /**
+  78|      * Removes multiple items from the pool.
+  79|      *
+  80|      * @param array $ids An array of identifiers that should be removed from the pool
+  81|      *
+  82|      * @return bool
+  83|      */
+  84|     abstract protected function doDelete(array $ids);
+  85| 
+  86|     /**
+  87|      * Persists several cache items immediately.
+  88|      *
+  89|      * @param array $values   The values to cache, indexed by their cache identifier
+  90|      * @param int   $lifetime The lifetime of the cached values, 0 for persisting until manual cleaning
+  91|      *
+  92|      * @return array|bool The identifiers that failed to be cached or a boolean stating if caching succeeded or not
+  93|      */
+  94|     abstract protected function doSave(array $values, int $lifetime);
+  95| 
+  96|     /**
+  97|      * {@inheritdoc}
+  98|      *
+  99|      * @return bool
+ 100|      */
+ 101|     public function hasItem($key)
+ 102|     {
+ 103|         $id = $this->getId($key);
+ 104| 
+ 105|         if (isset($this->deferred[$key])) {
+ 106|             $this->commit();
+ 107|         }
+ 108| 
+ 109|         try {
+ 110|             return $this->doHave($id);
+ 111|         } catch (\Exception $e) {
+ 112|             CacheItem::log($this->logger, 'Failed to check if key "{key}" is cached: '.$e->getMessage(), ['key' => $key, 'exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+ 113| 
+ 114|             return false;
+ 115|         }
+ 116|     }
+ 117| 
+ 118|     /**
+ 119|      * {@inheritdoc}
+ 120|      *
+ 121|      * @return bool
+ 122|      */
+ 123|     public function clear(string $prefix = '')
+ 124|     {
+ 125|         $this->deferred = [];
+ 126|         if ($cleared = $this->versioningIsEnabled) {
+ 127|             if ('' === $namespaceVersionToClear = $this->namespaceVersion) {
+ 128|                 foreach ($this->doFetch([static::NS_SEPARATOR.$this->namespace]) as $v) {
+ 129|                     $namespaceVersionToClear = $v;
+ 130|                 }
+ 131|             }
+ 132|             $namespaceToClear = $this->namespace.$namespaceVersionToClear;
+ 133|             $namespaceVersion = self::formatNamespaceVersion(mt_rand());
+ 134|             try {
+ 135|                 $e = $this->doSave([static::NS_SEPARATOR.$this->namespace => $namespaceVersion], 0);
+ 136|             } catch (\Exception $e) {
+ 137|             }
+ 138|             if (true !== $e && [] !== $e) {
+ 139|                 $cleared = false;
+ 140|                 $message = 'Failed to save the new namespace'.($e instanceof \Exception ? ': '.$e->getMessage() : '.');
+ 141|                 CacheItem::log($this->logger, $message, ['exception' => $e instanceof \Exception ? $e : null, 'cache-adapter' => get_debug_type($this)]);
+ 142|             } else {
+ 143|                 $this->namespaceVersion = $namespaceVersion;
+ 144|                 $this->ids = [];
+ 145|             }
+ 146|         } else {
+ 147|             $namespaceToClear = $this->namespace.$prefix;
+ 148|         }
+ 149| 
+ 150|         try {
+ 151|             return $this->doClear($namespaceToClear) || $cleared;
+ 152|         } catch (\Exception $e) {
+ 153|             CacheItem::log($this->logger, 'Failed to clear the cache: '.$e->getMessage(), ['exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+ 154| 
+ 155|             return false;
+ 156|         }
+ 157|     }
+ 158| 
+ 159|     /**
+ 160|      * {@inheritdoc}
+ 161|      *
+ 162|      * @return bool
+ 163|      */
+ 164|     public function deleteItem($key)
+ 165|     {
+ 166|         return $this->deleteItems([$key]);
+ 167|     }
+ 168| 
+ 169|     /**
+ 170|      * {@inheritdoc}
+ 171|      *
+ 172|      * @return bool
+ 173|      */
+ 174|     public function deleteItems(array $keys)
+ 175|     {
+ 176|         $ids = [];
+ 177| 
+ 178|         foreach ($keys as $key) {
+ 179|             $ids[$key] = $this->getId($key);
+ 180|             unset($this->deferred[$key]);
+ 181|         }
+ 182| 
+ 183|         try {
+ 184|             if ($this->doDelete($ids)) {
+ 185|                 return true;
+ 186|             }
+ 187|         } catch (\Exception $e) {
+ 188|         }
+ 189| 
+ 190|         $ok = true;
+ 191| 
+ 192|         // When bulk-delete failed, retry each item individually
+ 193|         foreach ($ids as $key => $id) {
+ 194|             try {
+ 195|                 $e = null;
+ 196|                 if ($this->doDelete([$id])) {
+ 197|                     continue;
+ 198|                 }
+ 199|             } catch (\Exception $e) {
+ 200|             }
+ 201|             $message = 'Failed to delete key "{key}"'.($e instanceof \Exception ? ': '.$e->getMessage() : '.');
+ 202|             CacheItem::log($this->logger, $message, ['key' => $key, 'exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+ 203|             $ok = false;
+ 204|         }
+ 205| 
+ 206|         return $ok;
+ 207|     }
+ 208| 
+ 209|     /**
+ 210|      * {@inheritdoc}
+ 211|      */
+ 212|     public function getItem($key)
+ 213|     {
+ 214|         $id = $this->getId($key);
+ 215| 
+ 216|         if (isset($this->deferred[$key])) {
+ 217|             $this->commit();
+ 218|         }
+ 219| 
+ 220|         $isHit = false;
+ 221|         $value = null;
+ 222| 
+ 223|         try {
+ 224|             foreach ($this->doFetch([$id]) as $value) {
+ 225|                 $isHit = true;
+ 226|             }
+ 227| 
+ 228|             return (self::$createCacheItem)($key, $value, $isHit);
+ 229|         } catch (\Exception $e) {
+ 230|             CacheItem::log($this->logger, 'Failed to fetch key "{key}": '.$e->getMessage(), ['key' => $key, 'exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+ 231|         }
+ 232| 
+ 233|         return (self::$createCacheItem)($key, null, false);
+ 234|     }
+ 235| 
+ 236|     /**
+ 237|      * {@inheritdoc}
+ 238|      */
+ 239|     public function getItems(array $keys = [])
+ 240|     {
+ 241|         $ids = [];
+ 242|         $commit = false;
+ 243| 
+ 244|         foreach ($keys as $key) {
+ 245|             $ids[] = $this->getId($key);
+ 246|             $commit = $commit || isset($this->deferred[$key]);
+ 247|         }
+ 248| 
+ 249|         if ($commit) {
+ 250|             $this->commit();
+ 251|         }
+ 252| 
+ 253|         try {
+ 254|             $items = $this->doFetch($ids);
+ 255|         } catch (\Exception $e) {
+ 256|             CacheItem::log($this->logger, 'Failed to fetch items: '.$e->getMessage(), ['keys' => $keys, 'exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+ 257|             $items = [];
+ 258|         }
+ 259|         $ids = array_combine($ids, $keys);
+ 260| 
+ 261|         return $this->generateItems($items, $ids);
+ 262|     }
+ 263| 
+ 264|     /**
+ 265|      * {@inheritdoc}
+ 266|      *
+ 267|      * @return bool
+ 268|      */
+ 269|     public function save(CacheItemInterface $item)
+ 270|     {
+ 271|         if (!$item instanceof CacheItem) {
+ 272|             return false;
+ 273|         }
+ 274|         $this->deferred[$item->getKey()] = $item;
+ 275| 
+ 276|         return $this->commit();
+ 277|     }
+ 278| 
+ 279|     /**
+ 280|      * {@inheritdoc}
+ 281|      *
+ 282|      * @return bool
+ 283|      */
+ 284|     public function saveDeferred(CacheItemInterface $item)
+ 285|     {
+ 286|         if (!$item instanceof CacheItem) {
+ 287|             return false;
+ 288|         }
+ 289|         $this->deferred[$item->getKey()] = $item;
+ 290| 
+ 291|         return true;
+ 292|     }
+ 293| 
+ 294|     /**
+ 295|      * Enables/disables versioning of items.
+ 296|      *
+ 297|      * When versioning is enabled, clearing the cache is atomic and doesn't require listing existing keys to proceed,
+ 298|      * but old keys may need garbage collection and extra round-trips to the back-end are required.
+ 299|      *
+ 300|      * Calling this method also clears the memoized namespace version and thus forces a resynchronization of it.
+ 301|      *
+ 302|      * @return bool the previous state of versioning
+ 303|      */
+ 304|     public function enableVersioning(bool $enable = true)
+ 305|     {
+ 306|         $wasEnabled = $this->versioningIsEnabled;
+ 307|         $this->versioningIsEnabled = $enable;
+ 308|         $this->namespaceVersion = '';
+ 309|         $this->ids = [];
+ 310| 
+ 311|         return $wasEnabled;
+ 312|     }
+ 313| 
+ 314|     /**
+ 315|      * {@inheritdoc}
+ 316|      */
+ 317|     public function reset()
+ 318|     {
+ 319|         if ($this->deferred) {
+ 320|             $this->commit();
+ 321|         }
+ 322|         $this->namespaceVersion = '';
+ 323|         $this->ids = [];
+ 324|     }
+ 325| 
+ 326|     /**
+ 327|      * @return array
+ 328|      */
+ 329|     public function __sleep()
+ 330|     {
+ 331|         throw new \BadMethodCallException('Cannot serialize '.__CLASS__);
+ 332|     }
+ 333| 
+ 334|     public function __wakeup()
+ 335|     {
+ 336|         throw new \BadMethodCallException('Cannot unserialize '.__CLASS__);
+ 337|     }
+ 338| 
+ 339|     public function __destruct()
+ 340|     {
+ 341|         if ($this->deferred) {
+ 342|             $this->commit();
+ 343|         }
+ 344|     }
+ 345| 
+ 346|     private function generateItems(iterable $items, array &$keys): \Generator
+ 347|     {
+ 348|         $f = self::$createCacheItem;
+ 349| 
+ 350|         try {
+ 351|             foreach ($items as $id => $value) {
+ 352|                 if (!isset($keys[$id])) {
+ 353|                     throw new InvalidArgumentException(sprintf('Could not match value id "%s" to keys "%s".', $id, implode('", "', $keys)));
+ 354|                 }
+ 355|                 $key = $keys[$id];
+ 356|                 unset($keys[$id]);
+ 357|                 yield $key => $f($key, $value, true);
+ 358|             }
+ 359|         } catch (\Exception $e) {
+ 360|             CacheItem::log($this->logger, 'Failed to fetch items: '.$e->getMessage(), ['keys' => array_values($keys), 'exception' => $e, 'cache-adapter' => get_debug_type($this)]);
+ 361|         }
+ 362| 
+ 363|         foreach ($keys as $key) {
+ 364|             yield $key => $f($key, null, false);
+ 365|         }
+ 366|     }
+ 367| 
+ 368|     /**
+ 369|      * @internal
+ 370|      */
+ 371|     protected function getId($key)
+ 372|     {
+ 373|         if ($this->versioningIsEnabled && '' === $this->namespaceVersion) {
+ 374|             $this->ids = [];
+ 375|             $this->namespaceVersion = '1'.static::NS_SEPARATOR;
+ 376|             try {
+ 377|                 foreach ($this->doFetch([static::NS_SEPARATOR.$this->namespace]) as $v) {
+ 378|                     $this->namespaceVersion = $v;
+ 379|                 }
+ 380|                 $e = true;
+ 381|                 if ('1'.static::NS_SEPARATOR === $this->namespaceVersion) {
+ 382|                     $this->namespaceVersion = self::formatNamespaceVersion(time());
+ 383|                     $e = $this->doSave([static::NS_SEPARATOR.$this->namespace => $this->namespaceVersion], 0);
+ 384|                 }
+ 385|             } catch (\Exception $e) {
+ 386|             }
+ 387|             if (true !== $e && [] !== $e) {
+ 388|                 $message = 'Failed to save the new namespace'.($e instanceof \Exception ? ': '.$e->getMessage() : '.');
+ 389|                 CacheItem::log($this->logger, $message, ['exception' => $e instanceof \Exception ? $e : null, 'cache-adapter' => get_debug_type($this)]);
+ 390|             }
+ 391|         }
+ 392| 
+ 393|         if (\is_string($key) && isset($this->ids[$key])) {
+ 394|             return $this->namespace.$this->namespaceVersion.$this->ids[$key];
+ 395|         }
+ 396|         \assert('' !== CacheItem::validateKey($key));
+ 397|         $this->ids[$key] = $key;
+ 398| 
+ 399|         if (\count($this->ids) > 1000) {
+ 400|             $this->ids = \array_slice($this->ids, 500, null, true); // stop memory leak if there are many keys
+ 401|         }
+ 402| 
+ 403|         if (null === $this->maxIdLength) {
+ 404|             return $this->namespace.$this->namespaceVersion.$key;
+ 405|         }
+ 406|         if (\strlen($id = $this->namespace.$this->namespaceVersion.$key) > $this->maxIdLength) {
+ 407|             // Use MD5 to favor speed over security, which is not an issue here
+ 408|             $this->ids[$key] = $id = substr_replace(base64_encode(hash('md5', $key, true)), static::NS_SEPARATOR, -(\strlen($this->namespaceVersion) + 2));
+ 409|             $id = $this->namespace.$this->namespaceVersion.$id;
+ 410|         }
+ 411| 
+ 412|         return $id;
+ 413|     }
+ 414| 
+ 415|     /**
+ 416|      * @internal
+ 417|      */
+ 418|     public static function handleUnserializeCallback(string $class)
+ 419|     {
+ 420|         throw new \DomainException('Class not found: '.$class);
+ 421|     }
+ 422| 
+ 423|     private static function formatNamespaceVersion(int $value): string
+ 424|     {
+ 425|         return strtr(substr_replace(base64_encode(pack('V', $value)), static::NS_SEPARATOR, 5), '/', '_');
+ 426|     }
+ 427| }
+ 428| 
+ 429| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=8076 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文通读）
+
+1. **第 18-26 行 `getTemplate`/`mustGetTemplate`**：模板名来自硬编码字符串（如 `"create_schema"`），`embed.FS` 为编译期内嵌，无外部输入进入文件路径拼接。**无路径穿越风险**。
+
+2. **第 39-47 行 `IngestRvtoolsQuery` / `IngestSqliteQuery`**：`filePath` 未经转义直接注入模板参数（`ingestParams{FilePath: filePath}`）。但该函数是内部构建器 API，调用方为服务端自身读取本地 RVTools Excel 文件 / SQLite 数据库的固定流程，路径由服务器配置或上传后落盘的服务器端临时文件决定，非用户可控字符串直接拼入；且此包不暴露 HTTP 入口。**本文件范围内无可利用 source→sink 流**。
+
+3. **第 60-90 行 `VMQuery`**：所有字符串过滤器（Cluster/OS/PowerState/VmId）均经 `escapeSQLString` 转义后作为模板字符串值渲染进 SQL 字面量；`NetworkColumns` 由循环内常量整数生成（第 63-66 行），不可控；Limit/Offset 为 int 类型，text/template 渲染数字无法携带 SQL 元字符。
+
+4. **第 93-160 行 Datastore/Network/Host/Os/Clusters 等查询**：模式同上——仅 ClusterFilter 经 `escapeSQLString`，VMList 经 `buildVMListFilter`，其余字段为空或常量。
+
+5. **第 118-124 行 `ClusterFeaturesQuery`**：clusterName 经 `escapeSQLString` 后传入单字段结构体，防御与其它入口一致。
+
+6. **第 322-347 行 `buildVMListFilter`**：对每个 VM ID 执行 `strings.ReplaceAll(vmID, "'", "''")`（第 332 行）后以单引号包裹。这是标准的引号加倍转义，在 DuckDB 字符串字面量上下文中可有效阻断引号逃逸；元素只出现在 `IN (...)` 的字符串位置，不存在标识符/注释注入位。反斜杠在 DuckDB 标准字符串中无转义语义，不构成绕过通道。
+
+7. **第 350-366 行 `generateOSCaseClauses`**：keyword 来自编译期常量表 `complexity.OSDifficultyScores`，level 来自封闭 map 映射，均非外部输入。
+
+8. **第 369-409 行 `generateComplexityMatrixCaseClauses`**：全部数据来自编译期常量矩阵与封闭映射表，输出确定且不可被外部影响。
+
+9. **第 411-417 行 `PopulateComplexityQuery`**：仅组合上述两个常量生成的子句。
+
+10. **第 419-432 行 `buildQuery`**：使用 text/template 自动 HTML 转义不影响 SQL，但所有插值点已在构造 params 时完成转义，模板本身为内嵌可信内容。无二次解析、无用户可控模板名。
+
+11. **第二入口核查**：全文件唯一外部形态输入是各 Query 方法的 filters/options/category/filePath 参数；除 filePath 外全部经转义或类型约束。无环境变量、无回调、无路由直接绑定。
+
+12. **替代通道核查**：`escapeSQLString` 实现不在本文件，但其用途限定于将值放入单引号字面量，配合 `buildVMListFilter` 的同类策略，未见黑名单式可绕过过滤。
+
+综上：本文件内所有用户可达的数据流均经有效转义或类型约束，未发现可利用的 SQL 注入或其他漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文逐一核查了约30个查询构建函数：所有字符串过滤器（Cluster/OS/PowerState/VmId/category/VMList）均经 escapeSQLString 或 buildVMListFilter 的单引号加倍转义后嵌入 SQL 字面量；NetworkColumns 由常量整数循环生成；Limit/Offset 为 int 类型；generateOSCaseClauses 与 generateComplexityMatrixCaseClauses 仅使用编译期常量表；模板来自 embed.FS 且模板名为硬编码。IngestRvtoolsQuery 与 IngestSqliteQuery 的 filePath 未转义，但其为服务端内部文件处理流程使用的路径，在本包范围内不构成用户可控的注入通道。未发现可利用的 source 到 sink 数据流。", "fix_suggestion": "no fix needed"}
+
+### id=8077 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文通读）
+
+**入口点枚举**：本文件是 trait，无 HTTP 路由；所有外部输入均来自调用方传入的参数：`hasItem($key)`、`getItem($key)`、`getItems(array $keys)`、`deleteItems(array $keys)`、`clear(string $prefix)`、`save/saveDeferred($item)`。这些 key/prefix 最终来自应用层，可能源自用户请求。
+
+**数据流逐一验证**：
+
+1. **第 96 行 `getId($key)` 是唯一汇聚点**：所有公开方法（第 78/117/135/160/193 行）都先调用 `$this->getId($key)` 再传给抽象 sink（`doFetch/doHave/doDelete/doSave`）。
+2. **关键防御缺陷——第 271 行**：
+   ```php
+   \assert('' !== CacheItem::validateKey($key));
+   ```
+   键校验仅通过 `assert()` 执行。在生产环境（`zend.assertions=0` 或 `assert.exception` 关闭且编译剥离），该断言被完全跳过，`CacheItem::validateKey()` 的黑名单/字符校验形同虚设。按分析要求，依赖可被关闭的断言不算有效防御。
+3. **sink 侧无二次防御**：`doFetch/doSave/doDelete` 均为抽象方法（第 55–88 行），trait 内未对拼接后的 id 做任何转义或白名单检查；具体后端（如 Redis/Memcached/Doctrine Dbal）中，未校验的 key 可携带换行符、分隔符或超长内容，导致缓存键注入/跨命名空间污染/后端协议级问题。
+4. **替代通道**：
+   - 第 130 行 `clear(string $prefix)`：`$prefix` 在非 versioning 分支直接拼入 `$namespaceToClear`（第 113 行）并传给 `doClear()`，同样未经任何校验，是第二入口。
+   - 第 246–252 行：当 id 超过 `maxIdLength` 时用 MD5+base64 哈希截断，这是长度缓解而非注入防御，且仅在配置了 maxIdLength 时生效。
+   - 第 283 行 `handleUnserializeCallback` 只是抛异常，无反序列化 sink；`__wakeup/__sleep`（第 226–234 行）已禁止序列化，无 POP 链风险。
+5. **结论**：source 为各公开方法的 `$key`/`$prefix` 参数，sink 为经 `getId` 拼接后传入的 `doFetch/doSave/doDelete/doClear`。由于唯一校验点位于可被生产配置禁用的 `assert()` 中，构成不充分的输入验证（CWE-20 / CWE-1287），实际影响依后端适配器而定（键注入、缓存投毒）。这与 Symfony 后续将 `assert` 替换为显式 `if (!\is_string($key) || '' === $key ... ) throw` 的修复一致。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-20 不充分的输入验证(缓存键注入)", "risk_level": "Medium", "source": "line 75/117/135/160/193: 公开方法接收外部传入的 $key 与 line 130 clear() 接收的 $prefix", "sink": "line 269-281 getId() 拼接 namespace 后传入 doFetch/doHave/doDelete/doSave/doClear", "explanation": "line 396:仅用 \\assert('' !== CacheItem::validateKey($key)) 校验缓存键, 生产环境 zend.assertions=0 时断言被剥离, 未校验的 key/prefix 直接拼入缓存标识符传给底层适配器, 可造成键注入或跨命名空间缓存污染; line 255:的 $prefix 同样无任何校验即拼入 doClear 参数, 属第二入口; MD5 截断(line 246-252)仅为长度缓解非注入防御", "fix_suggestion": "line 274: 将 assert 替换为显式运行时校验, 如 if (!\\is_string($key) || !preg_match('/^[A-Za-z0-9_.]{1,'.$max.'}$/', $key)) throw new InvalidArgumentException(...), 并对 clear() 的 $prefix 施加同样的字符白名单校验"}

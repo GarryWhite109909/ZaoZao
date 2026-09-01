@@ -1,0 +1,1954 @@
+你是独立安全审查员,审查"矛盾对/近重复簇":同一(或近同)代码被标注了不同结论的多个样本。你的任务是判断【哪一侧的标注正确】——这类样本的价值恰在于标签关系,请务必做逐行对比后再下结论。
+
+【方法】
+1. 并排读两侧代码,找出全部差异行(diff 已给出);
+2. 判断差异是否足以支撑两侧不同的标签(如:加一行 uint64 转换消除了溢出 → 有洞/安全分化成立;仅删了无效防御 → "安全侧"存疑);
+3. 对每侧独立核对 CWE/风险级;
+4. 常见陷阱:两侧都错(同码同错)、差异行不是决定性行、上游库行为误断。
+
+【输出格式】每簇输出一行 JSON(不要代码块):
+{"ids": [idA, idB], "label_correct": "A|B|both|neither|partial", "decisive_diff": "决定性差异的一句话", "issues": ["每侧的问题,如 A:CWE 应为 xxx"], "note": "一句话理由"}
+label_correct: A=仅 A 侧标注正确;B=仅 B 侧;both=两侧标注各对其样本成立(如漏洞版/修复版);neither=两侧都错;partial=一侧对另一侧部分对。
+每簇之后不需要汇总;所有簇输出完即结束。
+
+【簇】
+
+
+════ 簇 ids=7468,8253 ════
+
+── A 侧样本 id=7468 ──
+【教师标注】has_vulnerability=True, CWE-89 SQL Injection via user-supplied SQL fragments in report configuration endpoint, risk=Critical
+【explanation】flow 1: line 10:'sql' fragment -> line 17-22 concatenation -> line 32 execute; flow 2: line 12 'from' -> line 23 -> line 32; flow 3: line 13 'where' -> line 24-25 (regex strip only) -> line 32; flow 4: line 14 'groupby' -> line 29:-> line 32; defenses are prefix checks and a keyword blacklist regex 
+【代码(39 行)】
+   1| import re
+   2| 
+   3| from django.db import connection
+   4| from django.http import JsonResponse
+   5| from django.views.decorators.http import require_POST
+   6| 
+   7| 
+   8| @require_POST
+   9| def column_config(request):
+  10|     """Builds a custom report query from user-supplied SQL fragments."""
+  11|     config = request.POST.get("sql", "")
+  12|     from_clause = request.POST.get("from", "")
+  13|     where_clause = request.POST.get("where", "")
+  14|     group_by = request.POST.get("groupby", "")
+  15| 
+  16|     sql = "SELECT "
+  17|     if not config.strip().upper().startswith("SELECT"):
+  18|         sql += "*"
+  19|     else:
+  20|         sql += config.strip()
+  21|     if from_clause:
+  22|         sql += " FROM " + from_clause
+  23|     if where_clause:
+  24|         cleaned = re.sub(r"^\s*WHERE\s*", "", where_clause, flags=re.I)
+  25|         sql += " WHERE (" + cleaned + ")"
+  26|     if group_by:
+  27|         sql += " GROUP BY " + group_by
+  28| 
+  29|     # blacklist check: only blocks DML keywords followed by a space
+  30|     if re.search(r"(ALTER|CREATE|DROP|RENAME|TRUNCATE|UPDATE|DELETE) ", sql, re.I):
+  31|         return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
+  32| 
+  33|     with connection.cursor() as cursor:
+  34|         cursor.execute(sql)
+  35|         row = cursor.fetchone()
+  36| 
+  37|     columns = list(row.keys()) if row else []
+  38|     return JsonResponse({"columns": columns})
+  39| 
+
+── B 侧样本 id=8253 ──
+【教师标注】has_vulnerability=False, none, risk=None
+【explanation】原漏洞为 CWE-78 OS Command Injection: 第 33 行 request.get_json 取得攻击者可控的 command 字符串, 经第 75 行 subprocess.run(['sh','-c',command]) 由 shell 解释执行构成完整污点链; 修复采用白名单精确允许集 ALLOWED_COMMANDS 配合 shlex.split 构造 argv 列表并以 shell=False 调用, 彻底移除 shell 解释层, 黑名单 guard_command 按最小 diff 纪律原样保留但不作为防御手段; 全应用仅一个路由, 无第二入口或替代通道
+【代码(85 行)】
+   1| import re
+   2| import subprocess
+   3| import shlex
+   4| from flask import Flask, request, jsonify
+   5| 
+   6| app = Flask(__name__)
+   7| 
+   8| WORKSPACE = "/srv/workspace"
+   9| TIMEOUT = 60
+  10| 
+  11| DENY_PATTERNS = [
+  12|     re.compile(r"\brm\s+-[rf]{1,2}\b"),
+  13|     re.compile(r"\b(format|mkfs|diskpart)\b\s"),
+  14|     re.compile(r"\bdd\s+if="),
+  15|     re.compile(r"\b(shutdown|reboot|poweroff)\b"),
+  16| ]
+  17| 
+  18| # 白名单精确允许集：仅允许这些命令以固定参数模板执行
+  19| ALLOWED_COMMANDS = {
+  20|     "ls": ["ls", "-la"],
+  21|     "cat": ["cat"],
+  22|     "grep": ["grep"],
+  23|     "wc": ["wc", "-l"],
+  24| }
+  25| 
+  26| def guard_command(cmd, cwd):
+  27|     lower = cmd.strip().lower()
+  28|     for pattern in DENY_PATTERNS:
+  29|         if pattern.search(lower):
+  30|             return "Command blocked by safety guard"
+  31|     if cwd and ".." in cmd:
+  32|         return "Command blocked (path traversal detected)"
+  33|     return ""
+  34| 
+  35| def build_safe_argv(cmd):
+  36|     """白名单校验并构造无 shell 的 argv；非法则返回 None"""
+  37|     try:
+  38|         tokens = shlex.split(cmd)
+  39|     except ValueError:
+  40|         return None
+  41|     if not tokens:
+  42|         return None
+  43|     base = tokens[0]
+  44|     if base not in ALLOWED_COMMANDS:
+  45|         return None
+  46|     allowed = ALLOWED_COMMANDS[base]
+  47|     extra = tokens[1:]
+  48|     # 参数个数与内容限制：禁止额外选项/标志，仅允许普通位置参数
+  49|     for tok in extra:
+  50|         if tok.startswith("-"):
+  51|             return None
+  52|     if len(extra) > 4:
+  53|         return None
+  54|     return allowed + extra
+  55| 
+  56| @app.route("/api/exec", methods=["POST"])
+  57| def exec_command():
+  58|     data = request.get_json(silent=True) or {}
+  59|     command = data.get("command")
+  60|     if not command:
+  61|         return jsonify({"error": "command is required"}), 400
+  62| 
+  63|     cwd = data.get("working_dir") or WORKSPACE
+  64|     err = guard_command(command, cwd)
+  65|     if err:
+  66|         return jsonify({"error": err}), 403
+  67| 
+  68|     argv = build_safe_argv(command)
+  69|     if argv is None:
+  70|         return jsonify({"error": "Command not allowed by whitelist"}), 403
+  71| 
+  72|     try:
+  73|         result = subprocess.run(
+  74|             argv,
+  75|             cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT,
+  76|             shell=False
+  77|         )
+  78|         output = result.stdout + result.stderr
+  79|         return jsonify({"output": output or "(no output)"})
+  80|     except subprocess.TimeoutExpired:
+  81|         return jsonify({"error": "Command timed out"}), 504
+  82| 
+  83| if __name__ == "__main__":
+  84|     app.run()
+  85| 
+
+【两侧代码 diff(前 60 行)】
+--- id7468
++++ id8253
+@@ -1,39 +1,85 @@
+ import re
++import subprocess
++import shlex
++from flask import Flask, request, jsonify
+ 
+-from django.db import connection
+-from django.http import JsonResponse
+-from django.views.decorators.http import require_POST
++app = Flask(__name__)
+ 
++WORKSPACE = "/srv/workspace"
++TIMEOUT = 60
+ 
+-@require_POST
+-def column_config(request):
+-    """Builds a custom report query from user-supplied SQL fragments."""
+-    config = request.POST.get("sql", "")
+-    from_clause = request.POST.get("from", "")
+-    where_clause = request.POST.get("where", "")
+-    group_by = request.POST.get("groupby", "")
++DENY_PATTERNS = [
++    re.compile(r"\brm\s+-[rf]{1,2}\b"),
++    re.compile(r"\b(format|mkfs|diskpart)\b\s"),
++    re.compile(r"\bdd\s+if="),
++    re.compile(r"\b(shutdown|reboot|poweroff)\b"),
++]
+ 
+-    sql = "SELECT "
+-    if not config.strip().upper().startswith("SELECT"):
+-        sql += "*"
+-    else:
+-        sql += config.strip()
+-    if from_clause:
+-        sql += " FROM " + from_clause
+-    if where_clause:
+-        cleaned = re.sub(r"^\s*WHERE\s*", "", where_clause, flags=re.I)
+-        sql += " WHERE (" + cleaned + ")"
+-    if group_by:
+-        sql += " GROUP BY " + group_by
++# 白名单精确允许集：仅允许这些命令以固定参数模板执行
++ALLOWED_COMMANDS = {
++    "ls": ["ls", "-la"],
++    "cat": ["cat"],
++    "grep": ["grep"],
++    "wc": ["wc", "-l"],
++}
+ 
+-    # blacklist check: only blocks DML keywords followed by a space
+-    if re.search(r"(ALTER|CREATE|DROP|RENAME|TRUNCATE|UPDATE|DELETE) ", sql, re.I):
+-        return JsonResponse({"error": "Only SELECT statements are allowed"}, status=400)
++def guard_command(cmd, cwd):
++    lower = cmd.strip().lower()
++    for pattern in DENY_PATTERNS:
++        if pattern.search(lower):
++            return "Command blocked by safety guard"
++    if cwd and ".." in cmd:
++        return "Command blocked (path traversal detected)"
+
+
+════ 簇 ids=7480,8257 ════
+
+── A 侧样本 id=7480 ──
+【教师标注】has_vulnerability=True, CWE-22 Path Traversal /任意文件写入, risk=High
+【explanation】流一：plugin_input.go GetPluginRef(L9-17) 读取 TRIVY_PLUGIN_REF/os.Args[2]，经 manager.go ResolvePluginPath(L7-13) 的 ReplaceAll 删除 .. 属黑名单字符串替换可被 ....// 与绝对路径绕过，最终到达 install.go Install(L10) 的 os.Create 实现任意路径写；流二：plugin_input.go GetOutputTarget(L21) 读取 TRIVY_OUTPUT_FILE 无任何处理直达 install.go WriteOutput(L27) 
+【代码(67 行)】
+   1| # === file: gen_1.go ===
+   2| # === file: cmd/plugin_input.go ===
+   3| package cmd
+   4| 
+   5| import (
+   6| 	"os"
+   7| 	"strings"
+   8| )
+   9| 
+  10| // GetPluginRef 从外部输入读取插件引用（source）
+  11| func GetPluginRef() string {
+  12| 	ref := os.Getenv("TRIVY_PLUGIN_REF")
+  13| 	if ref == "" {
+  14| 		if len(os.Args) > 2 && os.Args[1] == "plugin" {
+  15| 			ref = os.Args[2]
+  16| 		}
+  17| 	}
+  18| 	// 仅做表面清理：去掉空白与反引号，未校验路径穿越字符
+  19| 	return strings.Trim(strings.TrimSpace(ref), "`")
+  20| }
+  21| 
+  22| // GetOutputTarget 读取输出目标文件名（第二入口 source）
+  23| func GetOutputTarget() string {
+  24| 	return os.Getenv("TRIVY_OUTPUT_FILE")
+  25| }
+  26| 
+  27| # === file: gen_2.go ===
+  28| # === file: pkg/plugin/install.go ===
+  29| package plugin
+  30| 
+  31| import (
+  32| 	"io"
+  33| 	"os"
+  34| 	"path/filepath"
+  35| )
+  36| 
+  37| // Install 将下载的插件归档写入解析后的目标路径（sink）
+  38| func Install(dataHome, ref string) error {
+  39| 	target := ResolvePluginPath(dataHome, ref)
+  40| 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+  41| 		return err
+  42| 	}
+  43| 	dst, err := os.Create(target)
+  44| 	if err != nil {
+  45| 		return err
+  46| 	}
+  47| 	defer dst.Close()
+  48| 	src, err := os.Open(archiveFor(ref))
+  49| 	if err != nil {
+  50| 		return err
+  51| 	}
+  52| 	defer src.Close()
+  53| 	_, err = io.Copy(dst, src)
+  54| 	return err
+  55| }
+  56| 
+  57| // WriteOutput 第二条流：把扫描结果写到外部指定的文件路径（sink）
+  58| func WriteOutput(target string, data []byte) error {
+  59| 	f, err := os.Create(target)
+  60| 	if err != nil {
+  61| 		return err
+  62| 	}
+  63| 	defer f.Close()
+  64| 	_, err = f.Write(data)
+  65| 	return err
+  66| }
+  67| 
+
+── B 侧样本 id=8257 ──
+【教师标注】has_vulnerability=False, none, risk=None
+【explanation】原代码存在两条 CWE-79 存储型 XSS 数据流：其一为 history 中 revision html 未净化经 th:utext 渲染；其二为 restore 中任意 html 未校验直接持久化到帖子正文；修复采用 Jsoup Safelist.basicWithImages() 白名单净化，分别在渲染前与写库前执行，函数名、路由、变量名与控制流保持最小 diff 不变
+【代码(44 行)】
+   1| package com.example.ghost.controller;
+   2| 
+   3| import org.springframework.stereotype.Controller;
+   4| import org.springframework.ui.Model;
+   5| import org.springframework.web.bind.annotation.*;
+   6| import org.springframework.jdbc.core.JdbcTemplate;
+   7| import org.jsoup.Jsoup;
+   8| import org.jsoup.safety.Safelist;
+   9| 
+  10| @Controller
+  11| @RequestMapping("/admin/posts")
+  12| public class PostHistoryController {
+  13| 
+  14|     private final JdbcTemplate jdbc;
+  15| 
+  16|     public PostHistoryController(JdbcTemplate jdbc) {
+  17|         this.jdbc = jdbc;
+  18|     }
+  19| 
+  20|     // 查看历史修订：将数据库中存储的 revision html 经白名单净化后注入模板
+  21|     @GetMapping("/{postId}/history")
+  22|     public String history(@PathVariable Long postId, Model model) {
+  23|         var revisions = jdbc.queryForList(
+  24|             "SELECT id, title, html FROM post_revisions WHERE post_id = ? ORDER BY created_at DESC", postId);
+  25|         for (var r : revisions) {
+  26|             r.put("html", Jsoup.clean((String) r.get("html"), Safelist.basicWithImages()));
+  27|         }
+  28|         model.addAttribute("revisions", revisions);
+  29|         return "post-history"; // Thymeleaf 模板中使用 th:utext="${r['html']}" 渲染
+  30|     }
+  31| 
+  32|     // 恢复修订：把 staff 用户提交的 revision html 经白名单净化后写回当前帖子的正文
+  33|     @PostMapping("/{postId}/restore")
+  34|     @ResponseBody
+  35|     public String restore(@PathVariable Long postId, @RequestParam("revisionId") long revisionId) {
+  36|         String html = jdbc.queryForObject(
+  37|             "SELECT html FROM post_revisions WHERE id = ? AND post_id = ?", String.class, revisionId, postId);
+  38|         // 白名单净化后再持久化为帖子正文，其他 staff 打开该帖不会触发脚本执行
+  39|         String safeHtml = Jsoup.clean(html, Safelist.basicWithImages());
+  40|         jdbc.update("UPDATE posts SET html = ? WHERE id = ?", safeHtml, postId);
+  41|         return "restored";
+  42|     }
+  43| }
+  44| 
+
+【两侧代码 diff(前 60 行)】
+--- id7480
++++ id8257
+@@ -1,67 +1,44 @@
+-# === file: gen_1.go ===
+-# === file: cmd/plugin_input.go ===
+-package cmd
++package com.example.ghost.controller;
+ 
+-import (
+-	"os"
+-	"strings"
+-)
++import org.springframework.stereotype.Controller;
++import org.springframework.ui.Model;
++import org.springframework.web.bind.annotation.*;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.jsoup.Jsoup;
++import org.jsoup.safety.Safelist;
+ 
+-// GetPluginRef 从外部输入读取插件引用（source）
+-func GetPluginRef() string {
+-	ref := os.Getenv("TRIVY_PLUGIN_REF")
+-	if ref == "" {
+-		if len(os.Args) > 2 && os.Args[1] == "plugin" {
+-			ref = os.Args[2]
+-		}
+-	}
+-	// 仅做表面清理：去掉空白与反引号，未校验路径穿越字符
+-	return strings.Trim(strings.TrimSpace(ref), "`")
++@Controller
++@RequestMapping("/admin/posts")
++public class PostHistoryController {
++
++    private final JdbcTemplate jdbc;
++
++    public PostHistoryController(JdbcTemplate jdbc) {
++        this.jdbc = jdbc;
++    }
++
++    // 查看历史修订：将数据库中存储的 revision html 经白名单净化后注入模板
++    @GetMapping("/{postId}/history")
++    public String history(@PathVariable Long postId, Model model) {
++        var revisions = jdbc.queryForList(
++            "SELECT id, title, html FROM post_revisions WHERE post_id = ? ORDER BY created_at DESC", postId);
++        for (var r : revisions) {
++            r.put("html", Jsoup.clean((String) r.get("html"), Safelist.basicWithImages()));
++        }
++        model.addAttribute("revisions", revisions);
++        return "post-history"; // Thymeleaf 模板中使用 th:utext="${r['html']}" 渲染
++    }
++
++    // 恢复修订：把 staff 用户提交的 revision html 经白名单净化后写回当前帖子的正文
++    @PostMapping("/{postId}/restore")
++    @ResponseBody
++    public String restore(@PathVariable Long postId, @RequestParam("revisionId") long revisionId) {
++        String html = jdbc.queryForObject(
++            "SELECT html FROM post_revisions WHERE id = ? AND post_id = ?", String.class, revisionId, postId);
++        // 白名单净化后再持久化为帖子正文，其他 staff 打开该帖不会触发脚本执行
++        String safeHtml = Jsoup.clean(html, Safelist.basicWithImages());
++        jdbc.update("UPDATE posts SET html = ? WHERE id = ?", safeHtml, postId);
+
+
+════ 簇 ids=7482,8270 ════
+
+── A 侧样本 id=7482 ──
+【教师标注】has_vulnerability=True, CWE-22 Path Traversal, risk=Critical
+【explanation】流1: Controller L17 request->all() 取 identifier 经 L19 传入 AppService; 流2: AppService L18 仅用 str_replace 黑名单删除 ../ 与 ..\, 可被 ....// 嵌套绕过, 属无效净化; 流3: AppService L20 将未净化的相对路径传入 PathResolver; sink 处 PathResolver L14 直接 baseDir 拼接并 file_get_contents, 无 realpath 前缀校验; 全链无有效防御; 组内无第二入口或其他替代路由, 单一 download 链
+【代码(75 行)】
+   1| # === file: app/Controller/AppStoreController.php ===
+   2| <?php
+   3| declare(strict_types=1);
+   4| 
+   5| namespace Plugin\MineAdmin\AppStore\Controller;
+   6| 
+   7| use App\Http\Common\Result;
+   8| use Hyperf\HttpServer\Annotation\Controller;
+   9| use Hyperf\HttpServer\Annotation\PostMapping;
+  10| use Plugin\MineAdmin\AppStore\Service\AppService;
+  11| 
+  12| #[Controller(prefix: 'admin/plugin/store')]
+  13| class AppStoreController
+  14| {
+  15|     public function __construct(private AppService $service) {}
+  16| 
+  17|     #[PostMapping('download')]
+  18|     public function download(): Result
+  19|     {
+  20| 
+  21|         $params = $this->request->all();
+  22|         $result = $this->service->downloadPackage($params);
+  23|         return $this->success(['result' => $result]);
+  24|     }
+  25| 
+  26|     private function success(array $data = []): Result
+  27|     {
+  28|         return new Result($data);
+  29|     }
+  30| }
+  31| 
+  32| # === file: app/Service/AppService.php ===
+  33| <?php
+  34| declare(strict_types=1);
+  35| 
+  36| namespace Plugin\MineAdmin\AppStore\Service;
+  37| 
+  38| use Plugin\MineAdmin\AppStore\Support\PathResolver;
+  39| 
+  40| class AppService
+  41| {
+  42|     public function __construct(private PathResolver $resolver) {}
+  43| 
+  44|     public function downloadPackage(array $params): array
+  45|     {
+  46|         $identifier = (string) ($params['identifier'] ?? '');
+  47|         // 看似净化：仅做字符串替换过滤 ../ 与 ..\ —— 黑名单替换可被嵌套绕过（....//）
+  48|         $cleaned = str_replace(['../', '..\'], '', $identifier);
+  49|         // 纯传递：将"净化后"的值交给路径解析器
+  50|         $path = $this->resolver->resolveDownloadPath($cleaned);
+  51|         return ['file' => $path];
+  52|     }
+  53| }
+  54| 
+  55| # === file: app/Support/PathResolver.php ===
+  56| <?php
+  57| declare(strict_types=1);
+  58| 
+  59| namespace Plugin\MineAdmin\AppStore\Support;
+  60| 
+  61| class PathResolver
+  62| {
+  63|     private string $baseDir = BASE_PATH . '/runtime/appstore/';
+  64| 
+  65|     public function resolveDownloadPath(string $name): string
+  66|     {
+  67| 
+  68|         $full = $this->baseDir . $name;
+  69|         if (!is_file($full)) {
+  70|             throw new \RuntimeException('app package not found');
+  71|         }
+  72|         return file_get_contents($full);
+  73|     }
+  74| }
+  75| 
+
+── B 侧样本 id=8270 ──
+【教师标注】has_vulnerability=False, none, risk=None
+【explanation】缓存读取改为第 14 行 JSON 解析，仅能产出基础类型且异常兜底，pickle 对象注入机制在格式层面不可达
+【代码(22 行)】
+   1| from fastapi import FastAPI, Request
+   2| import json
+   3| import redis
+   4| 
+   5| app = FastAPI()
+   6| rds = redis.Redis(host="localhost", port=6379, db=0)
+   7| 
+   8| @app.get("/cache/{key}")
+   9| async def get_cached_aggregate(key: str):
+  10|     raw = rds.get(key)
+  11|     if raw is None:
+  12|         return {"error": "not found"}
+  13|     # 防御: JSON 替代 pickle，解析器白名单式地只能产出基础类型
+  14|     obj = json.loads(raw)
+  15|     return {"result": str(obj)}
+  16| 
+  17| @app.post("/cache/{key}")
+  18| async def put_cached_aggregate(key: str, request: Request):
+  19|     body = await request.body()
+  20|     rds.set(key, body)
+  21|     return {"status": "stored"}
+  22| 
+
+【两侧代码 diff(前 60 行)】
+--- id7482
++++ id8270
+@@ -1,75 +1,22 @@
+-# === file: app/Controller/AppStoreController.php ===
+-<?php
+-declare(strict_types=1);
++from fastapi import FastAPI, Request
++import json
++import redis
+ 
+-namespace Plugin\MineAdmin\AppStore\Controller;
++app = FastAPI()
++rds = redis.Redis(host="localhost", port=6379, db=0)
+ 
+-use App\Http\Common\Result;
+-use Hyperf\HttpServer\Annotation\Controller;
+-use Hyperf\HttpServer\Annotation\PostMapping;
+-use Plugin\MineAdmin\AppStore\Service\AppService;
++@app.get("/cache/{key}")
++async def get_cached_aggregate(key: str):
++    raw = rds.get(key)
++    if raw is None:
++        return {"error": "not found"}
++    # 防御: JSON 替代 pickle，解析器白名单式地只能产出基础类型
++    obj = json.loads(raw)
++    return {"result": str(obj)}
+ 
+-#[Controller(prefix: 'admin/plugin/store')]
+-class AppStoreController
+-{
+-    public function __construct(private AppService $service) {}
++@app.post("/cache/{key}")
++async def put_cached_aggregate(key: str, request: Request):
++    body = await request.body()
++    rds.set(key, body)
++    return {"status": "stored"}
+ 
+-    #[PostMapping('download')]
+-    public function download(): Result
+-    {
+-
+-        $params = $this->request->all();
+-        $result = $this->service->downloadPackage($params);
+-        return $this->success(['result' => $result]);
+-    }
+-
+-    private function success(array $data = []): Result
+-    {
+-        return new Result($data);
+-    }
+-}
+-
+-# === file: app/Service/AppService.php ===
+-<?php
+-declare(strict_types=1);
+-
+-namespace Plugin\MineAdmin\AppStore\Service;
+-
+-use Plugin\MineAdmin\AppStore\Support\PathResolver;
+-
+
+
+════ 簇 ids=7515,8315 ════
+
+── A 侧样本 id=7515 ──
+【教师标注】has_vulnerability=True, CWE-601 URL Redirection to Untrusted Site (Open Redirect), risk=Medium
+【explanation】redirectUri -> startsWith 前缀匹配 -> https://app.com.evil.com 或 https://app.com@evil.com 等以合法前缀开头的恶意域名通过校验 -> 重定向到攻击者站点 -> 可窃取授权码/token
+【代码(47 行)】
+   1| package org.hswebframework.web.oauth2.server;
+   2| 
+   3| import lombok.Getter;
+   4| import lombok.Setter;
+   5| import org.hswebframework.web.oauth2.ErrorType;
+   6| import org.hswebframework.web.oauth2.OAuth2Exception;
+   7| import org.springframework.util.ObjectUtils;
+   8| import org.springframework.util.StringUtils;
+   9| 
+  10| import jakarta.validation.constraints.NotBlank;
+  11| 
+  12| @Getter
+  13| @Setter
+  14| public class OAuth2Client {
+  15| 
+  16|     @NotBlank
+  17|     private String clientId;
+  18| 
+  19|     @NotBlank
+  20|     private String clientSecret;
+  21| 
+  22|     @NotBlank
+  23|     private String name;
+  24| 
+  25|     private String description;
+  26| 
+  27|     @NotBlank
+  28|     private String redirectUrl;
+  29| 
+  30|     //client 所属用户
+  31|     private String userId;
+  32| 
+  33|     public void validateRedirectUri(String redirectUri) {
+  34|         if (ObjectUtils.isEmpty(redirectUri) || (!redirectUri.startsWith(this.redirectUrl))) {
+  35|             throw new OAuth2Exception(ErrorType.ILLEGAL_REDIRECT_URI);
+  36|         }
+  37|     }
+  38| 
+  39|     public void validateSecret(String secret) {
+  40|         if (ObjectUtils.isEmpty(secret) || (!secret.equals(this.clientSecret))) {
+  41|             throw new OAuth2Exception(ErrorType.ILLEGAL_CLIENT_SECRET);
+  42|         }
+  43|     }
+  44| 
+  45| }
+  46| 
+  47| 
+
+── B 侧样本 id=8315 ──
+【教师标注】has_vulnerability=True, CWE-22 Path Traversal, risk=High
+【explanation】流A主链: L1:line 27 反序列化得到攻击者可控 Path 经 L2:line 50:ReplaceAll 仅删除字面 .. 属黑名单式字符串替换, 可被 %2e%2e%2f 或 .%2e/ 编码绕过, 随后在 L3:line 19 被 Sprintf 拼入上游 URL, line 24 构造请求, line 29 实际发出, 可穿透至本机任意敏感路径如 /debug/pprof 或管理接口; 流B: L1:line 14 的 Query 经 L2:line 52:仅 TrimSpace 后于 L3:line 17:直接拼入 URL, 是到达同一 sink 的替代通道且同样无防御; 流
+【代码(93 行)】
+   1| # === file: internal/tunnel/session.go ===
+   2| package tunnel
+   3| 
+   4| import (
+   5| 	"encoding/json"
+   6| 	"io"
+   7| 	"net"
+   8| )
+   9| 
+  10| // RequestMessage is decoded straight from the public relay socket.
+  11| type RequestMessage struct {
+  12| 	RequestID  string              `json:"id"`
+  13| 	Method     string              `json:"method"`
+  14| 	Path       string              `json:"path"`
+  15| 	Query      string              `json:"query"`
+  16| 	Headers    map[string][]string `json:"headers"`
+  17| 	BodyBase64 string              `json:"body"`
+  18| }
+  19| 
+  20| // ReadRequest reads one framed message off the wire and returns it
+  21| // with every field, including Path, completely unvalidated.
+  22| func ReadRequest(conn net.Conn) (RequestMessage, error) {
+  23| 	var msg RequestMessage
+  24| 	data, err := io.ReadAll(io.LimitReader(conn, 1<<20))
+  25| 	if err != nil {
+  26| 		return msg, err
+  27| 	}
+  28| 	if err := json.Unmarshal(data, &msg); err != nil {
+  29| 		return msg, err
+  30| 	}
+  31| 	return msg, nil
+  32| }
+  33| 
+  34| # === file: internal/tunnel/dispatch.go ===
+  35| package tunnel
+  36| 
+  37| import (
+  38| 	"strings"
+  39| 
+  40| 	"openhole/internal/local"
+  41| )
+  42| 
+  43| // HandleFrame is the only dispatcher wired to the public relay.
+  44| func HandleFrame(conn net.Conn, host string, port int) error {
+  45| 	req, err := ReadRequest(conn)
+  46| 	if err != nil {
+  47| 		return err
+  48| 	}
+  49| 	// Looks defensive but is only a literal-substring blacklist:
+  50| 	// %2e%2e%2f, .%2e/ and mixed encodings pass through unchanged.
+  51| 	req.Path = strings.ReplaceAll(req.Path, "..", "")
+  52| 	req.Query = strings.TrimSpace(req.Query)
+  53| 	return local.ForwardToLocal(req, host, port)
+  54| }
+  55| 
+  56| # === file: internal/local/forward.go ===
+  57| package local
+  58| 
+  59| import (
+  60| 	"bytes"
+  61| 	"encoding/base64"
+  62| 	"fmt"
+  63| 	"io"
+  64| 	"net/http"
+  65| 	"time"
+  66| 
+  67| 	"openhole/internal/tunnel"
+  68| )
+  69| 
+  70| const maxBodyBytes = 10 * 1024 * 1024
+  71| 
+  72| // ForwardToLocal concatenates req.Path into the upstream URL and fires
+  73| // the request. No path canonicalization happens anywhere downstream.
+  74| func ForwardToLocal(req tunnel.RequestMessage, host string, port int) error {
+  75| 	target := fmt.Sprintf("http://%s:%d%s", host, port, req.Path)
+  76| 	if req.Query != "" {
+  77| 		target += "?" + req.Query
+  78| 	}
+  79| 	body, _ := base64.StdEncoding.DecodeString(req.BodyBase64)
+  80| 	httpReq, err := http.NewRequest(req.Method, target, bytes.NewReader(body))
+  81| 	if err != nil {
+  82| 		return err
+  83| 	}
+  84| 	hc := &http.Client{Timeout: 30 * time.Second}
+  85| 	resp, err := hc.Do(httpReq)
+  86| 	if err != nil {
+  87| 		return err
+  88| 	}
+  89| 	defer resp.Body.Close()
+  90| 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
+  91| 	return nil
+  92| }
+  93| 
+
+【两侧代码 diff(前 60 行)】
+--- id7515
++++ id8315
+@@ -1,47 +1,93 @@
+-package org.hswebframework.web.oauth2.server;
++# === file: internal/tunnel/session.go ===
++package tunnel
+ 
+-import lombok.Getter;
+-import lombok.Setter;
+-import org.hswebframework.web.oauth2.ErrorType;
+-import org.hswebframework.web.oauth2.OAuth2Exception;
+-import org.springframework.util.ObjectUtils;
+-import org.springframework.util.StringUtils;
++import (
++	"encoding/json"
++	"io"
++	"net"
++)
+ 
+-import jakarta.validation.constraints.NotBlank;
+-
+-@Getter
+-@Setter
+-public class OAuth2Client {
+-
+-    @NotBlank
+-    private String clientId;
+-
+-    @NotBlank
+-    private String clientSecret;
+-
+-    @NotBlank
+-    private String name;
+-
+-    private String description;
+-
+-    @NotBlank
+-    private String redirectUrl;
+-
+-    //client 所属用户
+-    private String userId;
+-
+-    public void validateRedirectUri(String redirectUri) {
+-        if (ObjectUtils.isEmpty(redirectUri) || (!redirectUri.startsWith(this.redirectUrl))) {
+-            throw new OAuth2Exception(ErrorType.ILLEGAL_REDIRECT_URI);
+-        }
+-    }
+-
+-    public void validateSecret(String secret) {
+-        if (ObjectUtils.isEmpty(secret) || (!secret.equals(this.clientSecret))) {
+-            throw new OAuth2Exception(ErrorType.ILLEGAL_CLIENT_SECRET);
+-        }
+-    }
+-
++// RequestMessage is decoded straight from the public relay socket.
++type RequestMessage struct {
++	RequestID  string              `json:"id"`
++	Method     string              `json:"method"`
++	Path       string              `json:"path"`
++	Query      string              `json:"query"`
+
+
+════ 簇 ids=7725,7753 ════
+
+── A 侧样本 id=7725 ──
+【教师标注】has_vulnerability=False, none, risk=None
+【explanation】line 106:cmd 用户可控 -> line 113:cmd.split(' ') 追加进列表 -> line 112:Popen 列表形式调用且无 shell=True，argv[0] 固定为 line 108:get_adb() 的 adb 路径，前缀均为常量/配置值，无 shell 或执行语义参数，载荷仅成为 adb 普通 argv 元素，污点链在 line 112:因列表形式不经 shell 解释而断裂，不构成主机命令注入
+【代码(126 行)】
+   1| # ---- 文件级上下文（imports/全局量，仅供参考） ----
+   2| 
+   3| # === 文件级上下文（imports / 全局常量 / 类骨架） ===
+   4| 
+   5| # -*- coding: utf_8 -*-
+   6| 
+   7| """Dynamic Analyzer Operations."""
+   8| 
+   9| import json
+  10| 
+  11| import logging
+  12| 
+  13| import os
+  14| 
+  15| import random
+  16| 
+  17| import shlex
+  18| 
+  19| import subprocess
+  20| 
+  21| import threading
+  22| 
+  23| from pathlib import Path
+  24| 
+  25| from django.conf import settings
+  26| 
+  27| from django.views.decorators.http import require_http_methods
+  28| 
+  29| from mobsf.DynamicAnalyzer.views.common.shared import (
+  30| 
+  31|     invalid_params,
+  32| 
+  33|     send_response,
+  34| 
+  35| )
+  36| 
+  37| from mobsf.MobSF.security import is_attack_pattern
+  38| 
+  39| from mobsf.DynamicAnalyzer.views.android.environment import (
+  40| 
+  41|     Environment,
+  42| 
+  43| )
+  44| 
+  45| from mobsf.MobSF.security import cmd_injection_check
+  46| 
+  47| from mobsf.MobSF.utils import (
+  48| 
+  49|     docker_translate_localhost,
+  50| 
+  51|     get_adb,
+  52| 
+  53|     get_device,
+  54| 
+  55|     is_md5,
+  56| 
+  57|     is_number,
+  58| 
+  59| )
+  60| 
+  61| from mobsf.StaticAnalyzer.models import StaticAnalyzerAndroid
+  62| 
+  63| from mobsf.MobSF.views.authentication import (
+  64| 
+  65|     login_required,
+  66| 
+  67| )
+  68| 
+  69| from mobsf.MobSF.views.authorization import (
+  70| 
+  71|     Permissions,
+  72| 
+  73|     permission_required,
+  74| 
+  75| )
+  76| 
+  77| logger = logging.getLogger(__name__)
+  78| 
+  79| # Helpers
+  80| 
+  81| # AJAX
+  82| 
+  83| # AJAX
+  84| 
+  85| # AJAX
+  86| 
+  87| # AJAX
+  88| 
+  89| # AJAX
+  90| 
+  91| # AJAX
+  92| 
+  93| # AJAX
+  94| 
+  95| # AJAX
+  96| 
+  97| # AJAX
+  98| 
+  99| 
+ 100| 
+ 101| # === 当前分析目标：函数 execute_adb ===
+ 102| 
+ 103| 102| def execute_adb(request, api=False):
+ 104| 103|     """Execute ADB Commands."""
+ 105| 104|     data = {'status': 'ok', 'message': ''}
+ 106| 105|     cmd = request.POST['cmd']
+ 107| 106|     if cmd:
+ 108| 107|         args = [get_adb(),
+ 109| 108|                 '-s',
+ 110| 109|                 get_device()]
+ 111| 110|         try:
+ 112| 111|             proc = subprocess.Popen(
+ 113| 112|                 args + cmd.split(' '),  # lgtm [py/command-line-injection]
+ 114| 113|                 stdout=subprocess.PIPE,  # Expected, cmd execute inside VM/AVD
+ 115| 114|                 stderr=subprocess.PIPE)
+ 116| 115|             stdout, stderr = proc.communicate()
+ 117| 116|         except Exception:
+ 118| 117|             logger.exception('Executing ADB Commands')
+ 119| 118|         if stdout or stderr:
+ 120| 119|             out = stdout or stderr
+ 121| 120|             out = out.decode('utf8', 'ignore')
+ 122| 121|         else:
+ 123| 122|             out = ''
+ 124| 123|         data = {'status': 'ok', 'message': out}
+ 125| 124|     return send_response(data, api)
+ 126| 
+
+── B 侧样本 id=7753 ──
+【教师标注】has_vulnerability=False, none, risk=None
+【explanation】helper 仅返回输入，无危险 sink，不构成漏洞
+【代码(6 行)】
+   1| 1| 
+   2| 2| # === file: helper.py ===
+   3| 3| def get_user_input(request, param, default=""):
+   4| 4|     return request.args.get(param, default)
+   5| 5| 
+   6| 
+
+【两侧代码 diff(前 60 行)】
+--- id7725
++++ id7753
+@@ -1,126 +1,6 @@
+-# ---- 文件级上下文（imports/全局量，仅供参考） ----
++1| 
++2| # === file: helper.py ===
++3| def get_user_input(request, param, default=""):
++4|     return request.args.get(param, default)
++5| 
+ 
+-# === 文件级上下文（imports / 全局常量 / 类骨架） ===
+-
+-# -*- coding: utf_8 -*-
+-
+-"""Dynamic Analyzer Operations."""
+-
+-import json
+-
+-import logging
+-
+-import os
+-
+-import random
+-
+-import shlex
+-
+-import subprocess
+-
+-import threading
+-
+-from pathlib import Path
+-
+-from django.conf import settings
+-
+-from django.views.decorators.http import require_http_methods
+-
+-from mobsf.DynamicAnalyzer.views.common.shared import (
+-
+-    invalid_params,
+-
+-    send_response,
+-
+-)
+-
+-from mobsf.MobSF.security import is_attack_pattern
+-
+-from mobsf.DynamicAnalyzer.views.android.environment import (
+-
+-    Environment,
+-
+-)
+-
+-from mobsf.MobSF.security import cmd_injection_check
+-
+-from mobsf.MobSF.utils import (
+-
+-    docker_translate_localhost,
+-
+-    get_adb,
+-
+
+
+════ 簇 ids=7779,7780 ════
+
+── A 侧样本 id=7779 ──
+【教师标注】has_vulnerability=True, CWE-942 Permissive Cross-origin Resource Sharing Policy, risk=High
+【explanation】middleWareFunc 对所有 Webroot+api/ 及 .html 预览路由将客户端提交的 Origin 头原样反射进 ACAO 响应头，并允许任意自定义头；其前置校验 corsOriginAccessControl 属于可配置/可绕过的域白名单类防御。由于 Mailpit 使用 BasicAuth 且浏览器会自动携带凭据，恶意网站可在受害者浏览邮件时跨源调用 GET api/v1/messages、api/v1/message/{id}/raw 等端点读取含密码重置链接等敏感内容的完整邮件 -> 跨域敏感信息泄露
+【代码(467 行)】
+   1| // Package server is the HTTP daemon
+   2| package server
+   3| 
+   4| import (
+   5| 	"bytes"
+   6| 	"compress/gzip"
+   7| 	"context"
+   8| 	"fmt"
+   9| 	"io"
+  10| 	"net"
+  11| 	"net/http"
+  12| 	"os"
+  13| 	"regexp"
+  14| 	"strings"
+  15| 	"sync/atomic"
+  16| 	"text/template"
+  17| 	"time"
+  18| 
+  19| 	"github.com/axllent/mailpit/config"
+  20| 	"github.com/axllent/mailpit/internal/auth"
+  21| 	"github.com/axllent/mailpit/internal/logger"
+  22| 	"github.com/axllent/mailpit/internal/pop3"
+  23| 	"github.com/axllent/mailpit/internal/prometheus"
+  24| 	"github.com/axllent/mailpit/internal/shortuuid"
+  25| 	"github.com/axllent/mailpit/internal/snakeoil"
+  26| 	"github.com/axllent/mailpit/internal/stats"
+  27| 	"github.com/axllent/mailpit/internal/storage"
+  28| 	"github.com/axllent/mailpit/internal/tools"
+  29| 	"github.com/axllent/mailpit/server/apiv1"
+  30| 	"github.com/axllent/mailpit/server/handlers"
+  31| 	"github.com/axllent/mailpit/server/websockets"
+  32| )
+  33| 
+  34| var (
+  35| 	// htmlPreviewRouteRe is a regexp to match the HTML preview route
+  36| 	htmlPreviewRouteRe *regexp.Regexp
+  37| )
+  38| 
+  39| // skipUIAuthKey is a private context key used to signal that UI basic-auth
+  40| // should be bypassed for a specific request. This avoids mutating the global
+  41| // auth.UICredentials pointer (which is a data race under concurrent load).
+  42| type contextKey int
+  43| 
+  44| const (
+  45| 	skipUIAuthKey contextKey = iota
+  46| 	// bodyLimitKey carries an optional request body size cap (in bytes) through the
+  47| 	// context. middleWareFunc reads it and applies it instead of the default 5 MB cap.
+  48| 	// A value of 0 means unlimited. Used by sendAPIAuthMiddleware to honour
+  49| 	// config.MaxMessageSize for the send endpoint.
+  50| 	bodyLimitKey
+  51| )
+  52| 
+  53| // Listen will start the httpd
+  54| func Listen() {
+  55| 	setCORSOrigins()
+  56| 
+  57| 	isReady := &atomic.Value{}
+  58| 	isReady.Store(false)
+  59| 	stats.Track()
+  60| 
+  61| 	websockets.MessageHub = websockets.NewHub()
+  62| 
+  63| 	// set allowed websocket origins from configuration
+  64| 	// websockets.SetAllowedOrigins(AccessControlAllowWSOrigins)
+  65| 
+  66| 	go websockets.MessageHub.Run()
+  67| 
+  68| 	go pop3.Run()
+  69| 
+  70| 	r := apiRoutes()
+  71| 
+  72| 	// kubernetes probes
+  73| 	r.HandleFunc("GET "+config.Webroot+"livez", handlers.HealthzHandler)
+  74| 	r.HandleFunc("GET "+config.Webroot+"readyz", handlers.ReadyzHandler(isReady))
+  75| 
+  76| 	// proxy handler for screenshots
+  77| 	r.HandleFunc("GET "+config.Webroot+"proxy", middleWareFunc(handlers.ProxyHandler))
+  78| 
+  79| 	// virtual filesystem for /dist/ & some individual files
+  80| 	r.Handle("GET "+config.Webroot+"dist/", middleWareFunc(embedController))
+  81| 	r.Handle("GET "+config.Webroot+"api/", middleWareFunc(embedController))
+  82| 	r.Handle("GET "+config.Webroot+"favicon.ico", middleWareFunc(embedController))
+  83| 	r.Handle("GET "+config.Webroot+"favicon.svg", middleWareFunc(embedController))
+  84| 	r.Handle("GET "+config.Webroot+"mailpit.svg", middleWareFunc(embedController))
+  85| 	r.Handle("GET "+config.Webroot+"notification.png", middleWareFunc(embedController))
+  86| 
+  87| 	// redirect to webroot if no trailing slash
+  88| 	if config.Webroot != "/" {
+  89| 		redirect := strings.TrimRight(config.Webroot, "/")
+  90| 		r.HandleFunc("GET "+redirect, middleWareFunc(addSlashToWebroot))
+  91| 	}
+  92| 
+  93| 	// UI shortcut
+  94| 	r.HandleFunc("GET "+config.Webroot+"view/latest", middleWareFunc(handlers.RedirectToLatestMessage))
+  95| 
+  96| 	// frontend testing + web UI via virtual index.html
+  97| 	// Go's ServeMux wildcards must span a full path segment so {id}.html is invalid;
+  98| 	// viewHandler dispatches on the path suffix instead.
+  99| 	r.HandleFunc("GET "+config.Webroot+"view/", middleWareFunc(viewHandler))
+ 100| 
+ 101| 	r.Handle("GET "+config.Webroot+"search", middleWareFunc(index))
+ 102| 	// Exact-match the webroot; stdlib "/" is always a subtree so we guard inside.
+ 103| 	r.HandleFunc("GET "+config.Webroot, func(w http.ResponseWriter, r *http.Request) {
+ 104| 		if r.URL.Path != config.Webroot {
+ 105| 			http.NotFound(w, r)
+ 106| 			return
+ 107| 		}
+ 108| 		middleWareFunc(index)(w, r)
+ 109| 	})
+ 110| 
+ 111| 	if auth.UICredentials != nil {
+ 112| 		logger.Log().Info("[http] enabling basic authentication")
+ 113| 	}
+ 114| 
+ 115| 	// Mark the application here as ready
+ 116| 	isReady.Store(true)
+ 117| 
+ 118| 	server := &http.Server{
+ 119| 		Addr:              config.HTTPListen,
+ 120| 		ReadTimeout:       30 * time.Second,
+ 121| 		ReadHeaderTimeout: 5 * time.Second,
+ 122| 		WriteTimeout:      30 * time.Second,
+ 123| 		Handler:           r,
+ 124| 	}
+ 125| 
+ 126| 	// add temporary self-signed certificates to get deleted afterwards
+ 127| 	for _, keyPair := range snakeoil.Certificates() {
+ 128| 		storage.AddTempFile(keyPair.Public)
+ 129| 		storage.AddTempFile(keyPair.Private)
+ 130| 	}
+ 131| 
+ 132| 	if config.UITLSCert != "" && config.UITLSKey != "" {
+ 133| 		logger.Log().Infof("[http] starting on %s (TLS)", config.HTTPListen)
+ 134| 		logger.Log().Infof("[http] accessible via https://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
+ 135| 		if err := server.ListenAndServeTLS(config.UITLSCert, config.UITLSKey); err != nil {
+ 136| 			storage.Close()
+ 137| 			logger.Log().Fatal(err)
+ 138| 		}
+ 139| 
+ 140| 	} else {
+ 141| 		socketAddr, perm, isSocket := tools.UnixSocket(config.HTTPListen)
+ 142| 
+ 143| 		if isSocket {
+ 144| 			if err := tools.PrepareSocket(socketAddr); err != nil {
+ 145| 				storage.Close()
+ 146| 				logger.Log().Fatal(err)
+ 147| 			}
+ 148| 
+ 149| 			// delete the Unix socket file on exit
+ 150| 			storage.AddTempFile(socketAddr)
+ 151| 
+ 152| 			ln, err := net.Listen("unix", socketAddr)
+ 153| 			if err != nil {
+ 154| 				storage.Close()
+ 155| 				logger.Log().Fatal(err)
+ 156| 			}
+ 157| 
+ 158| 			if err := os.Chmod(socketAddr, perm); err != nil {
+ 159| 				storage.Close()
+ 160| 				logger.Log().Fatal(err)
+ 161| 			}
+ 162| 
+ 163| 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
+ 164| 
+ 165| 			if err := server.Serve(ln); err != nil {
+ 166| 				storage.Close()
+ 167| 				logger.Log().Fatal(err)
+ 168| 			}
+ 169| 
+ 170| 		} else {
+ 171| 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
+ 172| 			logger.Log().Infof("[http] accessible via http://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
+ 173| 			if err := server.ListenAndServe(); err != nil {
+ 174| 				storage.Close()
+ 175| 				logger.Log().Fatal(err)
+ 176| 			}
+ 177| 		}
+ 178| 	}
+ 179| }
+ 180| 
+ 181| func apiRoutes() *http.ServeMux {
+ 182| 	r := http.NewServeMux()
+ 183| 
+ 184| 	// API V1
+ 185| 	r.HandleFunc("GET "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.GetMessages))
+ 186| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.SetReadStatus))
+ 187| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.DeleteMessages))
+ 188| 	r.HandleFunc("GET "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.Search))
+ 189| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.DeleteSearch))
+ 190| 	r.HandleFunc("POST "+config.Webroot+"api/v1/send", sendAPIAuthMiddleware(apiv1.SendMessageHandler))
+ 191| 	r.HandleFunc("GET "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.GetAllTags))
+ 192| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.SetMessageTags))
+ 193| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.RenameTag))
+ 194| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.DeleteTag))
+ 195| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}", middleWareFunc(apiv1.DownloadAttachment))
+ 196| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}/thumb", middleWareFunc(apiv1.Thumbnail))
+ 197| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/headers", middleWareFunc(apiv1.GetHeaders))
+ 198| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/raw", middleWareFunc(apiv1.DownloadRaw))
+ 199| 	r.HandleFunc("POST "+config.Webroot+"api/v1/message/{id}/release", middleWareFunc(apiv1.ReleaseMessage))
+ 200| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/html-check", middleWareFunc(apiv1.HTMLCheck))
+ 201| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/link-check", middleWareFunc(apiv1.LinkCheck))
+ 202| 	if config.EnableSpamAssassin != "" {
+ 203| 		r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/sa-check", middleWareFunc(apiv1.SpamAssassinCheck))
+ 204| 	}
+ 205| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}", middleWareFunc(apiv1.GetMessage))
+ 206| 	r.HandleFunc("GET "+config.Webroot+"api/v1/info", middleWareFunc(apiv1.AppInfo))
+ 207| 	r.HandleFunc("GET "+config.Webroot+"api/v1/webui", middleWareFunc(apiv1.WebUIConfig))
+ 208| 	r.HandleFunc("GET "+config.Webroot+"api/v1/swagger.json", middleWareFunc(swaggerBasePath))
+ 209| 
+ 210| 	// Chaos
+ 211| 	r.HandleFunc("GET "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.GetChaos))
+ 212| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.SetChaos))
+ 213| 
+ 214| 	// Prometheus metrics (if enabled and using existing server)
+ 215| 	if prometheus.GetMode() == "integrated" {
+ 216| 		r.HandleFunc("GET "+config.Webroot+"metrics", middleWareFunc(func(w http.ResponseWriter, r *http.Request) {
+ 217| 			prometheus.GetHandler().ServeHTTP(w, r)
+ 218| 		}))
+ 219| 	}
+ 220| 
+ 221| 	// web UI websocket
+ 222| 	r.HandleFunc("GET "+config.Webroot+"api/events", middleWareFunc(apiWebsocket))
+ 223| 
+ 224| 	// return blank 200 response for OPTIONS requests for CORS
+ 225| 	r.Handle("OPTIONS "+config.Webroot+"api/v1/", middleWareFunc(apiv1.GetOptions))
+ 226| 
+ 227| 	return r
+ 228| }
+ 229| 
+ 230| // BasicAuthResponse returns an basic auth response to the browser
+ 231| func basicAuthResponse(w http.ResponseWriter) {
+ 232| 	w.Header().Set("WWW-Authenticate", `Basic realm="Login"`)
+ 233| 	w.WriteHeader(http.StatusUnauthorized)
+ 234| 	_, _ = w.Write([]byte("Unauthorized.\n"))
+ 235| }
+ 236| 
+ 237| // sendAPIAuthMiddleware handles authentication specifically for the send API endpoint.
+ 238| // It can use dedicated send API authentication or accept any credentials based on configuration.
+ 239| // It communicates skip-UI-auth intent via request context rather than mutating the global
+ 240| // auth.UICredentials pointer, which would be a data race under concurrent load.
+ 241| func sendAPIAuthMiddleware(fn http.HandlerFunc) http.HandlerFunc {
+ 242| 	return func(w http.ResponseWriter, r *http.Request) {
+ 243| 		// Override the default 5 MB body cap with the send-specific limit so that
+ 244| 		// middleWareFunc applies config.MaxMessageSize (0 = unlimited) instead.
+ 245| 		r = r.WithContext(context.WithValue(r.Context(), bodyLimitKey, int64(config.MaxMessageSize)*1024*1024))
+ 246| 
+ 247| 		// If send API auth accept any is enabled, bypass all authentication.
+ 248| 		if config.SendAPIAuthAcceptAny {
+ 249| 			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
+ 250| 			middleWareFunc(fn)(w, r.WithContext(ctx))
+ 251| 			return
+ 252| 		}
+ 253| 
+ 254| 		// If Send API credentials are configured, only accept those credentials.
+ 255| 		if auth.SendAPICredentials != nil {
+ 256| 			user, pass, ok := r.BasicAuth()
+ 257| 
+ 258| 			if !ok {
+ 259| 				basicAuthResponse(w)
+ 260| 				return
+ 261| 			}
+ 262| 
+ 263| 			if !auth.SendAPICredentials.Match(user, pass) {
+ 264| 				basicAuthResponse(w)
+ 265| 				return
+ 266| 			}
+ 267| 
+ 268| 			// Valid Send API credentials — bypass UI auth via context flag.
+ 269| 			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
+ 270| 			middleWareFunc(fn)(w, r.WithContext(ctx))
+ 271| 			return
+ 272| 		}
+ 273| 
+ 274| 		// No Send API credentials configured — fall back to UI auth.
+ 275| 		middleWareFunc(fn)(w, r)
+ 276| 	}
+ 277| }
+ 278| 
+ 279| type gzipResponseWriter struct {
+ 280| 	io.Writer
+ 281| 	http.ResponseWriter
+ 282| }
+ 283| 
+ 284| func (w gzipResponseWriter) Write(b []byte) (int, error) {
+ 285| 	return w.Writer.Write(b)
+ 286| }
+ 287| 
+ 288| // MiddleWareFunc http middleware adds optional basic authentication
+ 289| // and gzip compression.
+ 290| func middleWareFunc(fn http.HandlerFunc) http.HandlerFunc {
+ 291| 	return func(w http.ResponseWriter, r *http.Request) {
+ 292| 		// Limit request body size to 5 MB to prevent memory-exhaustion DoS via large
+ 293| 		// JSON bodies. sendAPIAuthMiddleware sets bodyLimitKey in the context to signal
+ 294| 		// that the handler manages its own limit (send.go uses config.MaxMessageSize),
+ 295| 		// so we skip the cap here for that route only.
+ 296| 		if _, ok := r.Context().Value(bodyLimitKey).(int64); !ok {
+ 297| 			r.Body = http.MaxBytesReader(w, r.Body, 5*1024*1024)
+ 298| 		}
+ 299| 
+ 300| 		w.Header().Set("Referrer-Policy", "no-referrer")
+ 301| 
+ 302| 		// generate a new random nonce on every request
+ 303| 		randomNonce := shortuuid.New()
+ 304| 		// header used to pass nonce through to function
+ 305| 		r.Header.Set("mp-nonce", randomNonce)
+ 306| 
+ 307| 		// Prevent JavaScript XSS by adding a nonce for script-src
+ 308| 		cspHeader := strings.Replace(
+ 309| 			config.ContentSecurityPolicy,
+ 310| 			"script-src 'self';",
+ 311| 			fmt.Sprintf("script-src 'nonce-%s';", randomNonce),
+ 312| 			1,
+ 313| 		)
+ 314| 
+ 315| 		w.Header().Set("Content-Security-Policy", cspHeader)
+ 316| 
+ 317| 		if htmlPreviewRouteRe == nil {
+ 318| 			htmlPreviewRouteRe = regexp.MustCompile(`^` + regexp.QuoteMeta(config.Webroot) + `view/[a-zA-Z0-9]+\.html$`)
+ 319| 		}
+ 320| 
+ 321| 		if strings.HasPrefix(r.RequestURI, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.RequestURI) {
+ 322| 			if allowed := corsOriginAccessControl(r); !allowed {
+ 323| 				http.Error(w, "Blocked due to CORS violation", http.StatusForbidden)
+ 324| 				return
+ 325| 			}
+ 326| 			w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+ 327| 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, OPTIONS")
+ 328| 			w.Header().Set("Access-Control-Allow-Headers", "*")
+ 329| 		}
+ 330| 
+ 331| 		// Check basic authentication headers if configured.
+ 332| 		// OPTIONS requests are skipped if CORS is enabled, since browsers omit credentials for preflight checks.
+ 333| 		// skipUIAuthKey in the request context allows sendAPIAuthMiddleware to bypass UI auth
+ 334| 		// for a specific request without touching the global auth.UICredentials pointer.
+ 335| 		skipUIAuth, _ := r.Context().Value(skipUIAuthKey).(bool)
+ 336| 		isCORSOptionsRequest := AccessControlAllowOrigin != "" && r.Method == http.MethodOptions
+ 337| 		if !skipUIAuth && !isCORSOptionsRequest && auth.UICredentials != nil {
+ 338| 			user, pass, ok := r.BasicAuth()
+ 339| 
+ 340| 			if !ok {
+ 341| 				basicAuthResponse(w)
+ 342| 				return
+ 343| 			}
+ 344| 
+ 345| 			if !auth.UICredentials.Match(user, pass) {
+ 346| 				basicAuthResponse(w)
+ 347| 				return
+ 348| 			}
+ 349| 		}
+ 350| 
+ 351| 		// WebSocket upgrade requests must not be wrapped in a gzip writer:
+ 352| 		// gzipResponseWriter does not implement http.Hijacker, which the
+ 353| 		// WebSocket library requires to take over the raw TCP connection.
+ 354| 		isWebSocketUpgrade := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+ 355| 		if isWebSocketUpgrade || config.DisableHTTPCompression || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+ 356| 			fn(w, r)
+ 357| 			return
+ 358| 		}
+ 359| 
+ 360| 		w.Header().Set("Content-Encoding", "gzip")
+ 361| 		gz := gzip.NewWriter(w)
+ 362| 		defer func() { _ = gz.Close() }()
+ 363| 		gzr := gzipResponseWriter{Writer: gz, ResponseWriter: w}
+ 364| 		fn(gzr, r)
+ 365| 	}
+ 366| }
+ 367| 
+ 368| // Redirect to webroot
+ 369| func addSlashToWebroot(w http.ResponseWriter, r *http.Request) {
+ 370| 	http.Redirect(w, r, config.Webroot, http.StatusFound)
+ 371| }
+ 372| 
+ 373| // viewHandler routes /view/ requests based on path suffix.
+ 374| // Go's ServeMux requires wildcards to span a full path segment,
+ 375| // so patterns like /view/{id}.html are invalid; we dispatch manually here.
+ 376| func viewHandler(w http.ResponseWriter, r *http.Request) {
+ 377| 	path := strings.TrimPrefix(r.URL.Path, config.Webroot+"view/")
+ 378| 	switch {
+ 379| 	case strings.HasSuffix(path, ".html"):
+ 380| 		apiv1.GetMessageHTML(w, r)
+ 381| 	case strings.HasSuffix(path, ".txt"):
+ 382| 		apiv1.GetMessageText(w, r)
+ 383| 	default:
+ 384| 		index(w, r)
+ 385| 	}
+ 386| }
+ 387| 
+ 388| // Websocket to broadcast changes.
+ 389| // Authentication and CORS are handled by middleWareFunc before this is reached.
+ 390| func apiWebsocket(w http.ResponseWriter, r *http.Request) {
+ 391| 	websockets.ServeWs(websockets.MessageHub, w, r)
+ 392| 	storage.BroadcastMailboxStats()
+ 393| }
+ 394| 
+ 395| // Wrapper to artificially inject a basePath to the swagger.json if a webroot has been specified
+ 396| func swaggerBasePath(w http.ResponseWriter, _ *http.Request) {
+ 397| 	f, err := distFS.ReadFile("ui/api/v1/swagger.json")
+ 398| 	if err != nil {
+ 399| 		panic(err)
+ 400| 	}
+ 401| 
+ 402| 	if config.Webroot != "/" {
+ 403| 		// artificially inject a path at the start
+ 404| 		replacement := fmt.Sprintf("{\n  \"basePath\": \"%s\",", strings.TrimRight(config.Webroot, "/"))
+ 405| 
+ 406| 		f = bytes.Replace(f, []byte("{"), []byte(replacement), 1)
+ 407| 	}
+ 408| 
+ 409| 	w.Header().Add("Content-Type", "application/json")
+ 410| 	_, _ = w.Write(f)
+ 411| }
+ 412| 
+ 413| // Just returns the default HTML template
+ 414| func index(w http.ResponseWriter, r *http.Request) {
+ 415| 
+ 416| 	var h = `<!DOCTYPE html>
+ 417| <html lang="en" class="h-100">
+ 418| 
+ 419| <head>
+ 420| 	<meta charset="utf-8">
+ 421| 	<meta name="viewport" content="width=device-width,initial-scale=1.0">
+ 422| 	<meta name="referrer" content="no-referrer">
+ 423| 	<meta name="robots" content="noindex, nofollow, noarchive">
+ 424| 	<link rel="icon" href="{{ .Webroot }}favicon.svg">
+ 425| 	<title>Mailpit</title>
+ 426| 	<link rel=stylesheet href="{{ .Webroot }}dist/app.css?{{ .Version }}">
+ 427| </head>
+ 428| 
+ 429| <body class="h-100">
+ 430| 	<div class="container-fluid h-100 d-flex flex-column" id="app" data-webroot="{{ .Webroot }}" data-version="{{ .Version }}">
+ 431| 		<noscript class="alert alert-warning position-absolute top-50 start-50 translate-middle">
+ 432| 			You need a browser with JavaScript enabled to use Mailpit
+ 433| 		</noscript>
+ 434| 	</div>
+ 435| 
+ 436| 	<script src="{{ .Webroot }}dist/app.js?{{ .Version }}" nonce="{{ .Nonce }}"></script>
+ 437| </body>
+ 438| 
+ 439| </html>`
+ 440| 
+ 441| 	t, err := template.New("index").Parse(h)
+ 442| 	if err != nil {
+ 443| 		panic(err)
+ 444| 	}
+ 445| 
+ 446| 	data := struct {
+ 447| 		Webroot string
+ 448| 		Version string
+ 449| 		Nonce   string
+ 450| 	}{
+ 451| 		Webroot: config.Webroot,
+ 452| 		Version: config.Version,
+ 453| 		Nonce:   r.Header.Get("mp-nonce"),
+ 454| 	}
+ 455| 
+ 456| 	buff := new(bytes.Buffer)
+ 457| 
+ 458| 	err = t.Execute(buff, data)
+ 459| 	if err != nil {
+ 460| 		panic(err)
+ 461| 	}
+ 462| 
+ 463| 	w.Header().Add("Content-Type", "text/html; charset=utf-8")
+ 464| 	_, _ = w.Write(buff.Bytes())
+ 465| }
+ 466| 
+ 467| 
+
+── B 侧样本 id=7780 ──
+【教师标注】has_vulnerability=False, none, risk=None
+【explanation】通读全文所有入口（HTTP 路由、send API、websocket、viewHandler、静态文件、Unix socket、POP3 启动）：所有路由均经 middleWareFunc 认证与 CORS 闸门；sendAPIAuthMiddleware 通过服务端 context 键 skipUIAuthKey 控制豁免，客户端无法伪造；CSP nonce 为服务端生成值而非用户输入；body 有 5MB 或 MaxMessageSize 上限防 DoS；viewHandler 无路径拼接；CORS 回显 Origin 前强制经过 corsOriginAccessControl 校验。未
+【代码(465 行)】
+   1| // Package server is the HTTP daemon
+   2| package server
+   3| 
+   4| import (
+   5| 	"bytes"
+   6| 	"compress/gzip"
+   7| 	"context"
+   8| 	"fmt"
+   9| 	"io"
+  10| 	"net"
+  11| 	"net/http"
+  12| 	"os"
+  13| 	"regexp"
+  14| 	"strings"
+  15| 	"sync/atomic"
+  16| 	"text/template"
+  17| 	"time"
+  18| 
+  19| 	"github.com/axllent/mailpit/config"
+  20| 	"github.com/axllent/mailpit/internal/auth"
+  21| 	"github.com/axllent/mailpit/internal/logger"
+  22| 	"github.com/axllent/mailpit/internal/pop3"
+  23| 	"github.com/axllent/mailpit/internal/prometheus"
+  24| 	"github.com/axllent/mailpit/internal/shortuuid"
+  25| 	"github.com/axllent/mailpit/internal/snakeoil"
+  26| 	"github.com/axllent/mailpit/internal/stats"
+  27| 	"github.com/axllent/mailpit/internal/storage"
+  28| 	"github.com/axllent/mailpit/internal/tools"
+  29| 	"github.com/axllent/mailpit/server/apiv1"
+  30| 	"github.com/axllent/mailpit/server/handlers"
+  31| 	"github.com/axllent/mailpit/server/websockets"
+  32| )
+  33| 
+  34| var (
+  35| 	// htmlPreviewRouteRe is a regexp to match the HTML preview route
+  36| 	htmlPreviewRouteRe *regexp.Regexp
+  37| )
+  38| 
+  39| // skipUIAuthKey is a private context key used to signal that UI basic-auth
+  40| // should be bypassed for a specific request. This avoids mutating the global
+  41| // auth.UICredentials pointer (which is a data race under concurrent load).
+  42| type contextKey int
+  43| 
+  44| const (
+  45| 	skipUIAuthKey contextKey = iota
+  46| 	// bodyLimitKey carries an optional request body size cap (in bytes) through the
+  47| 	// context. middleWareFunc reads it and applies it instead of the default 5 MB cap.
+  48| 	// A value of 0 means unlimited. Used by sendAPIAuthMiddleware to honour
+  49| 	// config.MaxMessageSize for the send endpoint.
+  50| 	bodyLimitKey
+  51| )
+  52| 
+  53| // Listen will start the httpd
+  54| func Listen() {
+  55| 	setCORSOrigins()
+  56| 
+  57| 	isReady := &atomic.Value{}
+  58| 	isReady.Store(false)
+  59| 	stats.Track()
+  60| 
+  61| 	websockets.MessageHub = websockets.NewHub()
+  62| 	websockets.SetCheckOriginFunc(corsOriginAccessControl)
+  63| 
+  64| 	go websockets.MessageHub.Run()
+  65| 
+  66| 	go pop3.Run()
+  67| 
+  68| 	r := apiRoutes()
+  69| 
+  70| 	// kubernetes probes
+  71| 	r.HandleFunc("GET "+config.Webroot+"livez", handlers.HealthzHandler)
+  72| 	r.HandleFunc("GET "+config.Webroot+"readyz", handlers.ReadyzHandler(isReady))
+  73| 
+  74| 	// proxy handler for screenshots
+  75| 	r.HandleFunc("GET "+config.Webroot+"proxy", middleWareFunc(handlers.ProxyHandler))
+  76| 
+  77| 	// virtual filesystem for /dist/ & some individual files
+  78| 	r.Handle("GET "+config.Webroot+"dist/", middleWareFunc(embedController))
+  79| 	r.Handle("GET "+config.Webroot+"api/", middleWareFunc(embedController))
+  80| 	r.Handle("GET "+config.Webroot+"favicon.ico", middleWareFunc(embedController))
+  81| 	r.Handle("GET "+config.Webroot+"favicon.svg", middleWareFunc(embedController))
+  82| 	r.Handle("GET "+config.Webroot+"mailpit.svg", middleWareFunc(embedController))
+  83| 	r.Handle("GET "+config.Webroot+"notification.png", middleWareFunc(embedController))
+  84| 
+  85| 	// redirect to webroot if no trailing slash
+  86| 	if config.Webroot != "/" {
+  87| 		redirect := strings.TrimRight(config.Webroot, "/")
+  88| 		r.HandleFunc("GET "+redirect, middleWareFunc(addSlashToWebroot))
+  89| 	}
+  90| 
+  91| 	// UI shortcut
+  92| 	r.HandleFunc("GET "+config.Webroot+"view/latest", middleWareFunc(handlers.RedirectToLatestMessage))
+  93| 
+  94| 	// frontend testing + web UI via virtual index.html
+  95| 	// Go's ServeMux wildcards must span a full path segment so {id}.html is invalid;
+  96| 	// viewHandler dispatches on the path suffix instead.
+  97| 	r.HandleFunc("GET "+config.Webroot+"view/", middleWareFunc(viewHandler))
+  98| 
+  99| 	r.Handle("GET "+config.Webroot+"search", middleWareFunc(index))
+ 100| 	// Exact-match the webroot; stdlib "/" is always a subtree so we guard inside.
+ 101| 	r.HandleFunc("GET "+config.Webroot, func(w http.ResponseWriter, r *http.Request) {
+ 102| 		if r.URL.Path != config.Webroot {
+ 103| 			http.NotFound(w, r)
+ 104| 			return
+ 105| 		}
+ 106| 		middleWareFunc(index)(w, r)
+ 107| 	})
+ 108| 
+ 109| 	if auth.UICredentials != nil {
+ 110| 		logger.Log().Info("[http] enabling basic authentication")
+ 111| 	}
+ 112| 
+ 113| 	// Mark the application here as ready
+ 114| 	isReady.Store(true)
+ 115| 
+ 116| 	server := &http.Server{
+ 117| 		Addr:              config.HTTPListen,
+ 118| 		ReadTimeout:       30 * time.Second,
+ 119| 		ReadHeaderTimeout: 5 * time.Second,
+ 120| 		WriteTimeout:      30 * time.Second,
+ 121| 		Handler:           r,
+ 122| 	}
+ 123| 
+ 124| 	// add temporary self-signed certificates to get deleted afterwards
+ 125| 	for _, keyPair := range snakeoil.Certificates() {
+ 126| 		storage.AddTempFile(keyPair.Public)
+ 127| 		storage.AddTempFile(keyPair.Private)
+ 128| 	}
+ 129| 
+ 130| 	if config.UITLSCert != "" && config.UITLSKey != "" {
+ 131| 		logger.Log().Infof("[http] starting on %s (TLS)", config.HTTPListen)
+ 132| 		logger.Log().Infof("[http] accessible via https://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
+ 133| 		if err := server.ListenAndServeTLS(config.UITLSCert, config.UITLSKey); err != nil {
+ 134| 			storage.Close()
+ 135| 			logger.Log().Fatal(err)
+ 136| 		}
+ 137| 
+ 138| 	} else {
+ 139| 		socketAddr, perm, isSocket := tools.UnixSocket(config.HTTPListen)
+ 140| 
+ 141| 		if isSocket {
+ 142| 			if err := tools.PrepareSocket(socketAddr); err != nil {
+ 143| 				storage.Close()
+ 144| 				logger.Log().Fatal(err)
+ 145| 			}
+ 146| 
+ 147| 			// delete the Unix socket file on exit
+ 148| 			storage.AddTempFile(socketAddr)
+ 149| 
+ 150| 			ln, err := net.Listen("unix", socketAddr)
+ 151| 			if err != nil {
+ 152| 				storage.Close()
+ 153| 				logger.Log().Fatal(err)
+ 154| 			}
+ 155| 
+ 156| 			if err := os.Chmod(socketAddr, perm); err != nil {
+ 157| 				storage.Close()
+ 158| 				logger.Log().Fatal(err)
+ 159| 			}
+ 160| 
+ 161| 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
+ 162| 
+ 163| 			if err := server.Serve(ln); err != nil {
+ 164| 				storage.Close()
+ 165| 				logger.Log().Fatal(err)
+ 166| 			}
+ 167| 
+ 168| 		} else {
+ 169| 			logger.Log().Infof("[http] starting on %s", config.HTTPListen)
+ 170| 			logger.Log().Infof("[http] accessible via http://%s%s", logger.CleanHTTPIP(config.HTTPListen), config.Webroot)
+ 171| 			if err := server.ListenAndServe(); err != nil {
+ 172| 				storage.Close()
+ 173| 				logger.Log().Fatal(err)
+ 174| 			}
+ 175| 		}
+ 176| 	}
+ 177| }
+ 178| 
+ 179| func apiRoutes() *http.ServeMux {
+ 180| 	r := http.NewServeMux()
+ 181| 
+ 182| 	// API V1
+ 183| 	r.HandleFunc("GET "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.GetMessages))
+ 184| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.SetReadStatus))
+ 185| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/messages", middleWareFunc(apiv1.DeleteMessages))
+ 186| 	r.HandleFunc("GET "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.Search))
+ 187| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/search", middleWareFunc(apiv1.DeleteSearch))
+ 188| 	r.HandleFunc("POST "+config.Webroot+"api/v1/send", sendAPIAuthMiddleware(apiv1.SendMessageHandler))
+ 189| 	r.HandleFunc("GET "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.GetAllTags))
+ 190| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags", middleWareFunc(apiv1.SetMessageTags))
+ 191| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.RenameTag))
+ 192| 	r.HandleFunc("DELETE "+config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.DeleteTag))
+ 193| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}", middleWareFunc(apiv1.DownloadAttachment))
+ 194| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/part/{partID}/thumb", middleWareFunc(apiv1.Thumbnail))
+ 195| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/headers", middleWareFunc(apiv1.GetHeaders))
+ 196| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/raw", middleWareFunc(apiv1.DownloadRaw))
+ 197| 	r.HandleFunc("POST "+config.Webroot+"api/v1/message/{id}/release", middleWareFunc(apiv1.ReleaseMessage))
+ 198| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/html-check", middleWareFunc(apiv1.HTMLCheck))
+ 199| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/link-check", middleWareFunc(apiv1.LinkCheck))
+ 200| 	if config.EnableSpamAssassin != "" {
+ 201| 		r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}/sa-check", middleWareFunc(apiv1.SpamAssassinCheck))
+ 202| 	}
+ 203| 	r.HandleFunc("GET "+config.Webroot+"api/v1/message/{id}", middleWareFunc(apiv1.GetMessage))
+ 204| 	r.HandleFunc("GET "+config.Webroot+"api/v1/info", middleWareFunc(apiv1.AppInfo))
+ 205| 	r.HandleFunc("GET "+config.Webroot+"api/v1/webui", middleWareFunc(apiv1.WebUIConfig))
+ 206| 	r.HandleFunc("GET "+config.Webroot+"api/v1/swagger.json", middleWareFunc(swaggerBasePath))
+ 207| 
+ 208| 	// Chaos
+ 209| 	r.HandleFunc("GET "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.GetChaos))
+ 210| 	r.HandleFunc("PUT "+config.Webroot+"api/v1/chaos", middleWareFunc(apiv1.SetChaos))
+ 211| 
+ 212| 	// Prometheus metrics (if enabled and using existing server)
+ 213| 	if prometheus.GetMode() == "integrated" {
+ 214| 		r.HandleFunc("GET "+config.Webroot+"metrics", middleWareFunc(func(w http.ResponseWriter, r *http.Request) {
+ 215| 			prometheus.GetHandler().ServeHTTP(w, r)
+ 216| 		}))
+ 217| 	}
+ 218| 
+ 219| 	// web UI websocket
+ 220| 	r.HandleFunc("GET "+config.Webroot+"api/events", middleWareFunc(apiWebsocket))
+ 221| 
+ 222| 	// return blank 200 response for OPTIONS requests for CORS
+ 223| 	r.Handle("OPTIONS "+config.Webroot+"api/v1/", middleWareFunc(apiv1.GetOptions))
+ 224| 
+ 225| 	return r
+ 226| }
+ 227| 
+ 228| // BasicAuthResponse returns an basic auth response to the browser
+ 229| func basicAuthResponse(w http.ResponseWriter) {
+ 230| 	w.Header().Set("WWW-Authenticate", `Basic realm="Login"`)
+ 231| 	w.WriteHeader(http.StatusUnauthorized)
+ 232| 	_, _ = w.Write([]byte("Unauthorized.\n"))
+ 233| }
+ 234| 
+ 235| // sendAPIAuthMiddleware handles authentication specifically for the send API endpoint.
+ 236| // It can use dedicated send API authentication or accept any credentials based on configuration.
+ 237| // It communicates skip-UI-auth intent via request context rather than mutating the global
+ 238| // auth.UICredentials pointer, which would be a data race under concurrent load.
+ 239| func sendAPIAuthMiddleware(fn http.HandlerFunc) http.HandlerFunc {
+ 240| 	return func(w http.ResponseWriter, r *http.Request) {
+ 241| 		// Override the default 5 MB body cap with the send-specific limit so that
+ 242| 		// middleWareFunc applies config.MaxMessageSize (0 = unlimited) instead.
+ 243| 		r = r.WithContext(context.WithValue(r.Context(), bodyLimitKey, int64(config.MaxMessageSize)*1024*1024))
+ 244| 
+ 245| 		// If send API auth accept any is enabled, bypass all authentication.
+ 246| 		if config.SendAPIAuthAcceptAny {
+ 247| 			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
+ 248| 			middleWareFunc(fn)(w, r.WithContext(ctx))
+ 249| 			return
+ 250| 		}
+ 251| 
+ 252| 		// If Send API credentials are configured, only accept those credentials.
+ 253| 		if auth.SendAPICredentials != nil {
+ 254| 			user, pass, ok := r.BasicAuth()
+ 255| 
+ 256| 			if !ok {
+ 257| 				basicAuthResponse(w)
+ 258| 				return
+ 259| 			}
+ 260| 
+ 261| 			if !auth.SendAPICredentials.Match(user, pass) {
+ 262| 				basicAuthResponse(w)
+ 263| 				return
+ 264| 			}
+ 265| 
+ 266| 			// Valid Send API credentials — bypass UI auth via context flag.
+ 267| 			ctx := context.WithValue(r.Context(), skipUIAuthKey, true)
+ 268| 			middleWareFunc(fn)(w, r.WithContext(ctx))
+ 269| 			return
+ 270| 		}
+ 271| 
+ 272| 		// No Send API credentials configured — fall back to UI auth.
+ 273| 		middleWareFunc(fn)(w, r)
+ 274| 	}
+ 275| }
+ 276| 
+ 277| type gzipResponseWriter struct {
+ 278| 	io.Writer
+ 279| 	http.ResponseWriter
+ 280| }
+ 281| 
+ 282| func (w gzipResponseWriter) Write(b []byte) (int, error) {
+ 283| 	return w.Writer.Write(b)
+ 284| }
+ 285| 
+ 286| // MiddleWareFunc http middleware adds optional basic authentication
+ 287| // and gzip compression.
+ 288| func middleWareFunc(fn http.HandlerFunc) http.HandlerFunc {
+ 289| 	return func(w http.ResponseWriter, r *http.Request) {
+ 290| 		// Limit request body size to 5 MB to prevent memory-exhaustion DoS via large
+ 291| 		// JSON bodies. sendAPIAuthMiddleware sets bodyLimitKey in the context to signal
+ 292| 		// that the handler manages its own limit (send.go uses config.MaxMessageSize),
+ 293| 		// so we skip the cap here for that route only.
+ 294| 		if _, ok := r.Context().Value(bodyLimitKey).(int64); !ok {
+ 295| 			r.Body = http.MaxBytesReader(w, r.Body, 5*1024*1024)
+ 296| 		}
+ 297| 
+ 298| 		w.Header().Set("Referrer-Policy", "no-referrer")
+ 299| 
+ 300| 		// generate a new random nonce on every request
+ 301| 		randomNonce := shortuuid.New()
+ 302| 		// header used to pass nonce through to function
+ 303| 		r.Header.Set("mp-nonce", randomNonce)
+ 304| 
+ 305| 		// Prevent JavaScript XSS by adding a nonce for script-src
+ 306| 		cspHeader := strings.Replace(
+ 307| 			config.ContentSecurityPolicy,
+ 308| 			"script-src 'self';",
+ 309| 			fmt.Sprintf("script-src 'nonce-%s';", randomNonce),
+ 310| 			1,
+ 311| 		)
+ 312| 
+ 313| 		w.Header().Set("Content-Security-Policy", cspHeader)
+ 314| 
+ 315| 		if htmlPreviewRouteRe == nil {
+ 316| 			htmlPreviewRouteRe = regexp.MustCompile(`^` + regexp.QuoteMeta(config.Webroot) + `view/[a-zA-Z0-9]+\.html$`)
+ 317| 		}
+ 318| 
+ 319| 		if strings.HasPrefix(r.URL.Path, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.URL.Path) {
+ 320| 			if allowed := corsOriginAccessControl(r); !allowed {
+ 321| 				http.Error(w, "Blocked due to CORS violation", http.StatusForbidden)
+ 322| 				return
+ 323| 			}
+ 324| 			w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+ 325| 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, OPTIONS")
+ 326| 			w.Header().Set("Access-Control-Allow-Headers", "*")
+ 327| 		}
+ 328| 
+ 329| 		// Check basic authentication headers if configured.
+ 330| 		// OPTIONS requests are skipped if CORS is enabled, since browsers omit credentials for preflight checks.
+ 331| 		// skipUIAuthKey in the request context allows sendAPIAuthMiddleware to bypass UI auth
+ 332| 		// for a specific request without touching the global auth.UICredentials pointer.
+ 333| 		skipUIAuth, _ := r.Context().Value(skipUIAuthKey).(bool)
+ 334| 		isCORSOptionsRequest := AccessControlAllowOrigin != "" && r.Method == http.MethodOptions
+ 335| 		if !skipUIAuth && !isCORSOptionsRequest && auth.UICredentials != nil {
+ 336| 			user, pass, ok := r.BasicAuth()
+ 337| 
+ 338| 			if !ok {
+ 339| 				basicAuthResponse(w)
+ 340| 				return
+ 341| 			}
+ 342| 
+ 343| 			if !auth.UICredentials.Match(user, pass) {
+ 344| 				basicAuthResponse(w)
+ 345| 				return
+ 346| 			}
+ 347| 		}
+ 348| 
+ 349| 		// WebSocket upgrade requests must not be wrapped in a gzip writer:
+ 350| 		// gzipResponseWriter does not implement http.Hijacker, which the
+ 351| 		// WebSocket library requires to take over the raw TCP connection.
+ 352| 		isWebSocketUpgrade := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+ 353| 		if isWebSocketUpgrade || config.DisableHTTPCompression || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+ 354| 			fn(w, r)
+ 355| 			return
+ 356| 		}
+ 357| 
+ 358| 		w.Header().Set("Content-Encoding", "gzip")
+ 359| 		gz := gzip.NewWriter(w)
+ 360| 		defer func() { _ = gz.Close() }()
+ 361| 		gzr := gzipResponseWriter{Writer: gz, ResponseWriter: w}
+ 362| 		fn(gzr, r)
+ 363| 	}
+ 364| }
+ 365| 
+ 366| // Redirect to webroot
+ 367| func addSlashToWebroot(w http.ResponseWriter, r *http.Request) {
+ 368| 	http.Redirect(w, r, config.Webroot, http.StatusFound)
+ 369| }
+ 370| 
+ 371| // viewHandler routes /view/ requests based on path suffix.
+ 372| // Go's ServeMux requires wildcards to span a full path segment,
+ 373| // so patterns like /view/{id}.html are invalid; we dispatch manually here.
+ 374| func viewHandler(w http.ResponseWriter, r *http.Request) {
+ 375| 	path := strings.TrimPrefix(r.URL.Path, config.Webroot+"view/")
+ 376| 	switch {
+ 377| 	case strings.HasSuffix(path, ".html"):
+ 378| 		apiv1.GetMessageHTML(w, r)
+ 379| 	case strings.HasSuffix(path, ".txt"):
+ 380| 		apiv1.GetMessageText(w, r)
+ 381| 	default:
+ 382| 		index(w, r)
+ 383| 	}
+ 384| }
+ 385| 
+ 386| // Websocket to broadcast changes.
+ 387| // Authentication and CORS are handled by middleWareFunc before this is reached.
+ 388| func apiWebsocket(w http.ResponseWriter, r *http.Request) {
+ 389| 	websockets.ServeWs(websockets.MessageHub, w, r)
+ 390| 	storage.BroadcastMailboxStats()
+ 391| }
+ 392| 
+ 393| // Wrapper to artificially inject a basePath to the swagger.json if a webroot has been specified
+ 394| func swaggerBasePath(w http.ResponseWriter, _ *http.Request) {
+ 395| 	f, err := distFS.ReadFile("ui/api/v1/swagger.json")
+ 396| 	if err != nil {
+ 397| 		panic(err)
+ 398| 	}
+ 399| 
+ 400| 	if config.Webroot != "/" {
+ 401| 		// artificially inject a path at the start
+ 402| 		replacement := fmt.Sprintf("{\n  \"basePath\": \"%s\",", strings.TrimRight(config.Webroot, "/"))
+ 403| 
+ 404| 		f = bytes.Replace(f, []byte("{"), []byte(replacement), 1)
+ 405| 	}
+ 406| 
+ 407| 	w.Header().Add("Content-Type", "application/json")
+ 408| 	_, _ = w.Write(f)
+ 409| }
+ 410| 
+ 411| // Just returns the default HTML template
+ 412| func index(w http.ResponseWriter, r *http.Request) {
+ 413| 
+ 414| 	var h = `<!DOCTYPE html>
+ 415| <html lang="en" class="h-100">
+ 416| 
+ 417| <head>
+ 418| 	<meta charset="utf-8">
+ 419| 	<meta name="viewport" content="width=device-width,initial-scale=1.0">
+ 420| 	<meta name="referrer" content="no-referrer">
+ 421| 	<meta name="robots" content="noindex, nofollow, noarchive">
+ 422| 	<link rel="icon" href="{{ .Webroot }}favicon.svg">
+ 423| 	<title>Mailpit</title>
+ 424| 	<link rel=stylesheet href="{{ .Webroot }}dist/app.css?{{ .Version }}">
+ 425| </head>
+ 426| 
+ 427| <body class="h-100">
+ 428| 	<div class="container-fluid h-100 d-flex flex-column" id="app" data-webroot="{{ .Webroot }}" data-version="{{ .Version }}">
+ 429| 		<noscript class="alert alert-warning position-absolute top-50 start-50 translate-middle">
+ 430| 			You need a browser with JavaScript enabled to use Mailpit
+ 431| 		</noscript>
+ 432| 	</div>
+ 433| 
+ 434| 	<script src="{{ .Webroot }}dist/app.js?{{ .Version }}" nonce="{{ .Nonce }}"></script>
+ 435| </body>
+ 436| 
+ 437| </html>`
+ 438| 
+ 439| 	t, err := template.New("index").Parse(h)
+ 440| 	if err != nil {
+ 441| 		panic(err)
+ 442| 	}
+ 443| 
+ 444| 	data := struct {
+ 445| 		Webroot string
+ 446| 		Version string
+ 447| 		Nonce   string
+ 448| 	}{
+ 449| 		Webroot: config.Webroot,
+ 450| 		Version: config.Version,
+ 451| 		Nonce:   r.Header.Get("mp-nonce"),
+ 452| 	}
+ 453| 
+ 454| 	buff := new(bytes.Buffer)
+ 455| 
+ 456| 	err = t.Execute(buff, data)
+ 457| 	if err != nil {
+ 458| 		panic(err)
+ 459| 	}
+ 460| 
+ 461| 	w.Header().Add("Content-Type", "text/html; charset=utf-8")
+ 462| 	_, _ = w.Write(buff.Bytes())
+ 463| }
+ 464| 
+ 465| 
+
+【两侧代码 diff(前 60 行)】
+--- id7779
++++ id7780
+@@ -61,5 +61,3 @@
+ 	websockets.MessageHub = websockets.NewHub()
+-
+-	// set allowed websocket origins from configuration
+-	// websockets.SetAllowedOrigins(AccessControlAllowWSOrigins)
++	websockets.SetCheckOriginFunc(corsOriginAccessControl)
+ 
+@@ -320,3 +318,3 @@
+ 
+-		if strings.HasPrefix(r.RequestURI, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.RequestURI) {
++		if strings.HasPrefix(r.URL.Path, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.URL.Path) {
+ 			if allowed := corsOriginAccessControl(r); !allowed {

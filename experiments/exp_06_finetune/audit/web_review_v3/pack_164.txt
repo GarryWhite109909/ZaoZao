@@ -1,0 +1,930 @@
+batch=164 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=8039 lang=go
+[CODE]
+   1| package session
+   2| 
+   3| import (
+   4| 	goContext "context"
+   5| 	"errors"
+   6| 	"fmt"
+   7| 	"strings"
+   8| 	"time"
+   9| 
+  10| 	v1Role "github.com/KubeOperator/kubepi/internal/model/v1/role"
+  11| 	v1System "github.com/KubeOperator/kubepi/internal/model/v1/system"
+  12| 	v1User "github.com/KubeOperator/kubepi/internal/model/v1/user"
+  13| 	"github.com/KubeOperator/kubepi/internal/server"
+  14| 	"github.com/KubeOperator/kubepi/internal/service/v1/cluster"
+  15| 	"github.com/KubeOperator/kubepi/internal/service/v1/common"
+  16| 	"github.com/KubeOperator/kubepi/internal/service/v1/ldap"
+  17| 	"github.com/KubeOperator/kubepi/internal/service/v1/role"
+  18| 	"github.com/KubeOperator/kubepi/internal/service/v1/rolebinding"
+  19| 	v1SystemService "github.com/KubeOperator/kubepi/internal/service/v1/system"
+  20| 	"github.com/KubeOperator/kubepi/internal/service/v1/user"
+  21| 	"github.com/KubeOperator/kubepi/pkg/collectons"
+  22| 	"github.com/KubeOperator/kubepi/pkg/kubernetes"
+  23| 	"github.com/KubeOperator/kubepi/pkg/logging"
+  24| 	"github.com/KubeOperator/kubepi/pkg/network/ip"
+  25| 	"github.com/KubeOperator/kubepi/pkg/terminal"
+  26| 	"github.com/asdine/storm/v3"
+  27| 	"github.com/kataras/iris/v12"
+  28| 	"github.com/kataras/iris/v12/context"
+  29| 	"github.com/kataras/iris/v12/middleware/jwt"
+  30| 	"golang.org/x/crypto/bcrypt"
+  31| 	v1 "k8s.io/api/rbac/v1"
+  32| 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+  33| )
+  34| 
+  35| var JwtSigKey = []byte("signature_hmac_secret_shared_key")
+  36| var jwtMaxAge = 10 * time.Minute
+  37| 
+  38| type Handler struct {
+  39| 	userService        user.Service
+  40| 	roleService        role.Service
+  41| 	clusterService     cluster.Service
+  42| 	rolebindingService rolebinding.Service
+  43| 	ldapService        ldap.Service
+  44| 	jwtSigner          *jwt.Signer
+  45| }
+  46| 
+  47| func NewHandler() *Handler {
+  48| 	return &Handler{
+  49| 		clusterService:     cluster.NewService(),
+  50| 		userService:        user.NewService(),
+  51| 		roleService:        role.NewService(),
+  52| 		rolebindingService: rolebinding.NewService(),
+  53| 		ldapService:        ldap.NewService(),
+  54| 		jwtSigner:          jwt.NewSigner(jwt.HS256, JwtSigKey, jwtMaxAge),
+  55| 	}
+  56| }
+  57| 
+  58| func (h *Handler) IsLogin() iris.Handler {
+  59| 	return func(ctx *context.Context) {
+  60| 		session := server.SessionMgr.Start(ctx)
+  61| 		loginUser := session.Get("profile")
+  62| 		if loginUser == nil {
+  63| 			ctx.StatusCode(iris.StatusOK)
+  64| 			ctx.Values().Set("data", false)
+  65| 			return
+  66| 		}
+  67| 		p, ok := loginUser.(UserProfile)
+  68| 		if !ok {
+  69| 			ctx.StatusCode(iris.StatusInternalServerError)
+  70| 			ctx.Values().Set("message", "can not parse to session user")
+  71| 			return
+  72| 		}
+  73| 		if p.Mfa.Enable {
+  74| 			if !p.Mfa.Approved {
+  75| 				ctx.StatusCode(iris.StatusUnauthorized)
+  76| 				ctx.Values().Set("message", "no login user")
+  77| 				return
+  78| 			}
+  79| 		} else {
+  80| 			if err := session.Man.ShiftExpiration(ctx); err != nil {
+  81| 				ctx.StatusCode(iris.StatusInternalServerError)
+  82| 				ctx.Values().Set("message", fmt.Errorf("shift expiration falied, err: %v", err))
+  83| 				return
+  84| 			}
+  85| 			ctx.StatusCode(iris.StatusOK)
+  86| 			ctx.Values().Set("data", loginUser != nil)
+  87| 		}
+  88| 	}
+  89| }
+  90| 
+  91| // Auth
+  92| // @Tags sessions
+  93| // @Summary User Login
+  94| // @Description User Login
+  95| // @Accept  json
+  96| // @Produce  json
+  97| // @Param request body LoginCredential true "request"
+  98| // @Router /sessions [post]
+  99| func (h *Handler) Login() iris.Handler {
+ 100| 	return func(ctx *context.Context) {
+ 101| 		var loginCredential LoginCredential
+ 102| 		if err := ctx.ReadJSON(&loginCredential); err != nil {
+ 103| 			ctx.StatusCode(iris.StatusBadRequest)
+ 104| 			ctx.Values().Set("message", err.Error())
+ 105| 			return
+ 106| 		}
+ 107| 		u, err := h.userService.GetByNameOrEmail(loginCredential.Username, common.DBOptions{})
+ 108| 		if err != nil {
+ 109| 			if errors.Is(err, storm.ErrNotFound) {
+ 110| 				ctx.StatusCode(iris.StatusBadRequest)
+ 111| 				ctx.Values().Set("message", "username or password error")
+ 112| 				return
+ 113| 			}
+ 114| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 115| 			ctx.Values().Set("message", fmt.Sprintf("query user %s failed ,: %s", loginCredential.Username, err.Error()))
+ 116| 			return
+ 117| 		}
+ 118| 
+ 119| 		if u.Type == v1User.LDAP {
+ 120| 			if !h.ldapService.CheckStatus() {
+ 121| 				ctx.StatusCode(iris.StatusInternalServerError)
+ 122| 				ctx.Values().Set("message", "ldap is not enable!")
+ 123| 				return
+ 124| 			}
+ 125| 			if err := h.ldapService.Login(*u, loginCredential.Password, common.DBOptions{}); err != nil {
+ 126| 				ctx.StatusCode(iris.StatusInternalServerError)
+ 127| 				ctx.Values().Set("message", "username or password error")
+ 128| 				return
+ 129| 			}
+ 130| 		} else {
+ 131| 			if err := bcrypt.CompareHashAndPassword([]byte(u.Authenticate.Password), []byte(loginCredential.Password)); err != nil {
+ 132| 				ctx.StatusCode(iris.StatusBadRequest)
+ 133| 				ctx.Values().Set("message", "username or password error")
+ 134| 				return
+ 135| 			}
+ 136| 		}
+ 137| 
+ 138| 		permissions, err := h.aggregateResourcePermissions(loginCredential.Username)
+ 139| 		if err != nil {
+ 140| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 141| 			ctx.Values().Set("message", err.Error())
+ 142| 			return
+ 143| 		}
+ 144| 		profile := UserProfile{
+ 145| 			Name:                u.Name,
+ 146| 			NickName:            u.NickName,
+ 147| 			Email:               u.Email,
+ 148| 			Language:            u.Language,
+ 149| 			ResourcePermissions: permissions,
+ 150| 			IsAdministrator:     u.IsAdmin,
+ 151| 			Mfa: Mfa{
+ 152| 				Secret:   u.Mfa.Secret,
+ 153| 				Enable:   u.Mfa.Enable,
+ 154| 				Approved: false,
+ 155| 			},
+ 156| 		}
+ 157| 
+ 158| 		authMethod := loginCredential.AuthMethod
+ 159| 
+ 160| 		switch authMethod {
+ 161| 		case "jwt":
+ 162| 			token, err := h.jwtSigner.Sign(profile)
+ 163| 			if err != nil {
+ 164| 				ctx.StatusCode(iris.StatusInternalServerError)
+ 165| 				ctx.Values().Set("message", err.Error())
+ 166| 			}
+ 167| 			ctx.StatusCode(iris.StatusOK)
+ 168| 			ctx.Values().Set("token", token)
+ 169| 			return
+ 170| 		default:
+ 171| 			session := server.SessionMgr.Start(ctx)
+ 172| 			session.Set("profile", profile)
+ 173| 		}
+ 174| 
+ 175| 		ctx.StatusCode(iris.StatusOK)
+ 176| 		go saveLoginLog(ctx, profile.Name)
+ 177| 		ctx.Values().Set("data", profile)
+ 178| 	}
+ 179| }
+ 180| 
+ 181| func saveLoginLog(ctx *context.Context, userName string) {
+ 182| 	var logItem v1System.LoginLog
+ 183| 	logItem.UserName = userName
+ 184| 	logItem.Ip = ctx.RemoteAddr()
+ 185| 	qqWry, err := ip.NewQQwry()
+ 186| 	if err != nil {
+ 187| 		server.Logger().Errorf("load qqwry datas failed: %s", err)
+ 188| 	}
+ 189| 	res := qqWry.Find(logItem.Ip)
+ 190| 	logItem.City = res.Area
+ 191| 	systemService := v1SystemService.NewService()
+ 192| 	systemService.CreateLoginLog(&logItem, common.DBOptions{})
+ 193| }
+ 194| 
+ 195| func (h *Handler) aggregateResourcePermissions(name string) (map[string][]string, error) {
+ 196| 	userRoleBindings, err := h.rolebindingService.GetRoleBindingBySubject(v1Role.Subject{
+ 197| 		Kind: "User",
+ 198| 		Name: name,
+ 199| 	}, common.DBOptions{})
+ 200| 	if err != nil && !errors.As(err, &storm.ErrNotFound) {
+ 201| 		return nil, err
+ 202| 	}
+ 203| 
+ 204| 	var roleNames []string
+ 205| 	for i := range userRoleBindings {
+ 206| 		roleNames = append(roleNames, userRoleBindings[i].RoleRef)
+ 207| 	}
+ 208| 
+ 209| 	rs, err := h.roleService.GetByNames(roleNames, common.DBOptions{})
+ 210| 	if err != nil && !errors.As(err, &storm.ErrNotFound) {
+ 211| 		return nil, err
+ 212| 	}
+ 213| 	mapping := map[string]*collectons.StringSet{}
+ 214| 	var policyRoles []v1Role.PolicyRule
+ 215| 	//merge permissions
+ 216| 	for i := range rs {
+ 217| 		for j := range rs[i].Rules {
+ 218| 			policyRoles = append(policyRoles, rs[i].Rules[j])
+ 219| 		}
+ 220| 	}
+ 221| 	for i := range policyRoles {
+ 222| 		for j := range policyRoles[i].Resource {
+ 223| 			_, ok := mapping[policyRoles[i].Resource[j]]
+ 224| 			if !ok {
+ 225| 				mapping[policyRoles[i].Resource[j]] = collectons.NewStringSet()
+ 226| 			}
+ 227| 			for k := range policyRoles[i].Verbs {
+ 228| 				mapping[policyRoles[i].Resource[j]].Add(policyRoles[i].Verbs[k])
+ 229| 				if policyRoles[i].Verbs[k] == "*" {
+ 230| 					break
+ 231| 				}
+ 232| 			}
+ 233| 			if policyRoles[i].Resource[j] == "*" {
+ 234| 				break
+ 235| 			}
+ 236| 		}
+ 237| 	}
+ 238| 	resourceMapping := map[string][]string{}
+ 239| 	for key := range mapping {
+ 240| 		resourceMapping[key] = mapping[key].ToSlice()
+ 241| 	}
+ 242| 	return resourceMapping, nil
+ 243| }
+ 244| 
+ 245| func (h *Handler) Logout() iris.Handler {
+ 246| 	return func(ctx *context.Context) {
+ 247| 		session := server.SessionMgr.Start(ctx)
+ 248| 		loginUser := session.Get("profile")
+ 249| 		if loginUser == nil {
+ 250| 			ctx.StatusCode(iris.StatusUnauthorized)
+ 251| 			ctx.Values().Set("message", "no login user")
+ 252| 			return
+ 253| 		}
+ 254| 		session.Delete("profile")
+ 255| 		logging.LogSessions.Clean()
+ 256| 		terminal.TerminalSessions.Clean()
+ 257| 		ctx.StatusCode(iris.StatusOK)
+ 258| 		ctx.Values().Set("data", "logout success")
+ 259| 	}
+ 260| }
+ 261| 
+ 262| func (h *Handler) GetProfile() iris.Handler {
+ 263| 	return func(ctx *context.Context) {
+ 264| 		session := server.SessionMgr.Start(ctx)
+ 265| 		loginUser := session.Get("profile")
+ 266| 		if loginUser == nil {
+ 267| 			ctx.StatusCode(iris.StatusUnauthorized)
+ 268| 			ctx.Values().Set("message", "no login user")
+ 269| 			return
+ 270| 		}
+ 271| 		p, ok := loginUser.(UserProfile)
+ 272| 		if !ok {
+ 273| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 274| 			ctx.Values().Set("message", "can not parse to session user")
+ 275| 			return
+ 276| 		}
+ 277| 
+ 278| 		user, err := h.userService.GetByNameOrEmail(p.Name, common.DBOptions{})
+ 279| 		if err != nil {
+ 280| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 281| 			ctx.Values().Set("message", err.Error())
+ 282| 			return
+ 283| 		}
+ 284| 		p = UserProfile{
+ 285| 			Name:            user.Name,
+ 286| 			NickName:        user.NickName,
+ 287| 			Email:           user.Email,
+ 288| 			Language:        user.Language,
+ 289| 			IsAdministrator: user.IsAdmin,
+ 290| 		}
+ 291| 		if !user.IsAdmin {
+ 292| 			permissions, err := h.aggregateResourcePermissions(p.Name)
+ 293| 			if err != nil {
+ 294| 				ctx.StatusCode(iris.StatusInternalServerError)
+ 295| 				ctx.Values().Set("message", err.Error())
+ 296| 				return
+ 297| 			}
+ 298| 			p.ResourcePermissions = permissions
+ 299| 		}
+ 300| 		session.Set("profile", p)
+ 301| 		ctx.StatusCode(iris.StatusOK)
+ 302| 		ctx.Values().Set("data", p)
+ 303| 	}
+ 304| }
+ 305| 
+ 306| func (h *Handler) ListUserNamespace() iris.Handler {
+ 307| 	return func(ctx *context.Context) {
+ 308| 		name := ctx.Params().GetString("cluster_name")
+ 309| 		c, err := h.clusterService.Get(name, common.DBOptions{})
+ 310| 		if err != nil {
+ 311| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 312| 			ctx.Values().Set("message", fmt.Sprintf("get cluster failed: %s", err.Error()))
+ 313| 			return
+ 314| 		}
+ 315| 		session := server.SessionMgr.Start(ctx)
+ 316| 		u := session.Get("profile")
+ 317| 		profile := u.(UserProfile)
+ 318| 
+ 319| 		k := kubernetes.NewKubernetes(c)
+ 320| 		ns, err := k.GetUserNamespaceNames(profile.Name, profile.IsAdministrator)
+ 321| 		if err != nil {
+ 322| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 323| 			ctx.Values().Set("message", err)
+ 324| 			return
+ 325| 		}
+ 326| 		ctx.Values().Set("data", ns)
+ 327| 	}
+ 328| }
+ 329| 
+ 330| func (h *Handler) GetClusterProfile() iris.Handler {
+ 331| 	return func(ctx *context.Context) {
+ 332| 		session := server.SessionMgr.Start(ctx)
+ 333| 		clusterName := ctx.Params().GetString("cluster_name")
+ 334| 		namesapce := ctx.URLParam("namespace")
+ 335| 		c, err := h.clusterService.Get(clusterName, common.DBOptions{})
+ 336| 		if err != nil {
+ 337| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 338| 			ctx.Values().Set("message", err.Error())
+ 339| 			return
+ 340| 		}
+ 341| 		k := kubernetes.NewKubernetes(c)
+ 342| 		client, err := k.Client()
+ 343| 		if err != nil {
+ 344| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 345| 			ctx.Values().Set("message", fmt.Sprintf("get k8s client failed: %s", err.Error()))
+ 346| 			return
+ 347| 		}
+ 348| 		u := session.Get("profile")
+ 349| 		profile := u.(UserProfile)
+ 350| 
+ 351| 		if profile.IsAdministrator {
+ 352| 			crp := ClusterUserProfile{
+ 353| 				UserProfile:  profile,
+ 354| 				ClusterRoles: []v1.ClusterRole{},
+ 355| 			}
+ 356| 			ctx.Values().Set("data", &crp)
+ 357| 			return
+ 358| 		}
+ 359| 
+ 360| 		labels := []string{
+ 361| 			fmt.Sprintf("%s=%s", kubernetes.LabelManageKey, "kubepi"),
+ 362| 			fmt.Sprintf("%s=%s", kubernetes.LabelClusterId, c.UUID),
+ 363| 			fmt.Sprintf("%s=%s", kubernetes.LabelUsername, profile.Name),
+ 364| 		}
+ 365| 		clusterRoleBindings, err := client.RbacV1().ClusterRoleBindings().List(goContext.TODO(), metav1.ListOptions{
+ 366| 			LabelSelector: strings.Join(labels, ","),
+ 367| 		})
+ 368| 		if err != nil {
+ 369| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 370| 			ctx.Values().Set("message", fmt.Sprintf("get cluster-role-binding failed: %s", err.Error()))
+ 371| 			return
+ 372| 		}
+ 373| 		rolebindings, err := client.RbacV1().RoleBindings(namesapce).List(goContext.TODO(), metav1.ListOptions{
+ 374| 			LabelSelector: strings.Join(labels, ","),
+ 375| 		})
+ 376| 		if err != nil {
+ 377| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 378| 			ctx.Values().Set("message", fmt.Sprintf("get role-binding failed: %s", err.Error()))
+ 379| 			return
+ 380| 		}
+ 381| 		roleSet := map[string]struct{}{}
+ 382| 		for i := range clusterRoleBindings.Items {
+ 383| 			for j := range clusterRoleBindings.Items[i].Subjects {
+ 384| 				if clusterRoleBindings.Items[i].Subjects[j].Kind == "User" {
+ 385| 					roleSet[clusterRoleBindings.Items[i].RoleRef.Name] = struct{}{}
+ 386| 				}
+ 387| 			}
+ 388| 		}
+ 389| 		for i := range rolebindings.Items {
+ 390| 			for j := range rolebindings.Items[i].Subjects {
+ 391| 				if rolebindings.Items[i].Subjects[j].Kind == "User" {
+ 392| 					roleSet[rolebindings.Items[i].RoleRef.Name] = struct{}{}
+ 393| 				}
+ 394| 			}
+ 395| 		}
+ 396| 		var roles []v1.ClusterRole
+ 397| 		for key := range roleSet {
+ 398| 			r, err := client.RbacV1().ClusterRoles().Get(goContext.TODO(), key, metav1.GetOptions{})
+ 399| 			if err != nil {
+ 400| 				ctx.StatusCode(iris.StatusInternalServerError)
+ 401| 				ctx.Values().Set("message", fmt.Sprintf("get cluster-role failed: %s", err.Error()))
+ 402| 				return
+ 403| 			}
+ 404| 			roles = append(roles, *r)
+ 405| 		}
+ 406| 
+ 407| 		crp := ClusterUserProfile{
+ 408| 			UserProfile:  profile,
+ 409| 			ClusterRoles: roles,
+ 410| 		}
+ 411| 		if len(roles) <= 0 {
+ 412| 			ctx.StatusCode(iris.StatusForbidden)
+ 413| 			return
+ 414| 		}
+ 415| 		ctx.Values().Set("data", &crp)
+ 416| 	}
+ 417| }
+ 418| 
+ 419| func Install(parent iris.Party) {
+ 420| 	handler := NewHandler()
+ 421| 	sp := parent.Party("/sessions")
+ 422| 	sp.Post("", handler.Login())
+ 423| 	sp.Delete("", handler.Logout())
+ 424| 	sp.Get("", handler.GetProfile())
+ 425| 	sp.Get("/:cluster_name", handler.GetClusterProfile())
+ 426| 	sp.Get("/status", handler.IsLogin())
+ 427| 	sp.Get("/:cluster_name/namespaces", handler.ListUserNamespace())
+ 428| 	sp.Put("", handler.UpdateProfile())
+ 429| 	sp.Put("/password", handler.UpdatePassword())
+ 430| }
+ 431| 
+ 432| 
+
+### id=8040 lang=go
+[CODE]
+   1| package session
+   2| 
+   3| import (
+   4| 	goContext "context"
+   5| 	"errors"
+   6| 	"fmt"
+   7| 	"strings"
+   8| 	"time"
+   9| 
+  10| 	v1Role "github.com/KubeOperator/kubepi/internal/model/v1/role"
+  11| 	v1System "github.com/KubeOperator/kubepi/internal/model/v1/system"
+  12| 	v1User "github.com/KubeOperator/kubepi/internal/model/v1/user"
+  13| 	"github.com/KubeOperator/kubepi/internal/server"
+  14| 	"github.com/KubeOperator/kubepi/internal/service/v1/cluster"
+  15| 	"github.com/KubeOperator/kubepi/internal/service/v1/common"
+  16| 	"github.com/KubeOperator/kubepi/internal/service/v1/ldap"
+  17| 	"github.com/KubeOperator/kubepi/internal/service/v1/role"
+  18| 	"github.com/KubeOperator/kubepi/internal/service/v1/rolebinding"
+  19| 	v1SystemService "github.com/KubeOperator/kubepi/internal/service/v1/system"
+  20| 	"github.com/KubeOperator/kubepi/internal/service/v1/user"
+  21| 	"github.com/KubeOperator/kubepi/pkg/collectons"
+  22| 	"github.com/KubeOperator/kubepi/pkg/kubernetes"
+  23| 	"github.com/KubeOperator/kubepi/pkg/logging"
+  24| 	"github.com/KubeOperator/kubepi/pkg/network/ip"
+  25| 	"github.com/KubeOperator/kubepi/pkg/terminal"
+  26| 	"github.com/asdine/storm/v3"
+  27| 	"github.com/kataras/iris/v12"
+  28| 	"github.com/kataras/iris/v12/context"
+  29| 	"github.com/kataras/iris/v12/middleware/jwt"
+  30| 	"golang.org/x/crypto/bcrypt"
+  31| 	v1 "k8s.io/api/rbac/v1"
+  32| 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+  33| )
+  34| 
+  35| var jwtMaxAge = 10 * time.Minute
+  36| 
+  37| type Handler struct {
+  38| 	userService        user.Service
+  39| 	roleService        role.Service
+  40| 	clusterService     cluster.Service
+  41| 	rolebindingService rolebinding.Service
+  42| 	ldapService        ldap.Service
+  43| 	jwtSigner          *jwt.Signer
+  44| }
+  45| 
+  46| func NewHandler() *Handler {
+  47| 	return &Handler{
+  48| 		clusterService:     cluster.NewService(),
+  49| 		userService:        user.NewService(),
+  50| 		roleService:        role.NewService(),
+  51| 		rolebindingService: rolebinding.NewService(),
+  52| 		ldapService:        ldap.NewService(),
+  53| 		jwtSigner:          jwt.NewSigner(jwt.HS256, server.Config().Spec.Jwt.Key, jwtMaxAge),
+  54| 	}
+  55| }
+  56| 
+  57| func (h *Handler) IsLogin() iris.Handler {
+  58| 	return func(ctx *context.Context) {
+  59| 		session := server.SessionMgr.Start(ctx)
+  60| 		loginUser := session.Get("profile")
+  61| 		if loginUser == nil {
+  62| 			ctx.StatusCode(iris.StatusOK)
+  63| 			ctx.Values().Set("data", false)
+  64| 			return
+  65| 		}
+  66| 		p, ok := loginUser.(UserProfile)
+  67| 		if !ok {
+  68| 			ctx.StatusCode(iris.StatusInternalServerError)
+  69| 			ctx.Values().Set("message", "can not parse to session user")
+  70| 			return
+  71| 		}
+  72| 		if p.Mfa.Enable {
+  73| 			if !p.Mfa.Approved {
+  74| 				ctx.StatusCode(iris.StatusUnauthorized)
+  75| 				ctx.Values().Set("message", "no login user")
+  76| 				return
+  77| 			}
+  78| 		} else {
+  79| 			if err := session.Man.ShiftExpiration(ctx); err != nil {
+  80| 				ctx.StatusCode(iris.StatusInternalServerError)
+  81| 				ctx.Values().Set("message", fmt.Errorf("shift expiration falied, err: %v", err))
+  82| 				return
+  83| 			}
+  84| 			ctx.StatusCode(iris.StatusOK)
+  85| 			ctx.Values().Set("data", loginUser != nil)
+  86| 		}
+  87| 	}
+  88| }
+  89| 
+  90| // Auth
+  91| // @Tags sessions
+  92| // @Summary User Login
+  93| // @Description User Login
+  94| // @Accept  json
+  95| // @Produce  json
+  96| // @Param request body LoginCredential true "request"
+  97| // @Router /sessions [post]
+  98| func (h *Handler) Login() iris.Handler {
+  99| 	return func(ctx *context.Context) {
+ 100| 		var loginCredential LoginCredential
+ 101| 		if err := ctx.ReadJSON(&loginCredential); err != nil {
+ 102| 			ctx.StatusCode(iris.StatusBadRequest)
+ 103| 			ctx.Values().Set("message", err.Error())
+ 104| 			return
+ 105| 		}
+ 106| 		u, err := h.userService.GetByNameOrEmail(loginCredential.Username, common.DBOptions{})
+ 107| 		if err != nil {
+ 108| 			if errors.Is(err, storm.ErrNotFound) {
+ 109| 				ctx.StatusCode(iris.StatusBadRequest)
+ 110| 				ctx.Values().Set("message", "username or password error")
+ 111| 				return
+ 112| 			}
+ 113| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 114| 			ctx.Values().Set("message", fmt.Sprintf("query user %s failed ,: %s", loginCredential.Username, err.Error()))
+ 115| 			return
+ 116| 		}
+ 117| 
+ 118| 		if u.Type == v1User.LDAP {
+ 119| 			if !h.ldapService.CheckStatus() {
+ 120| 				ctx.StatusCode(iris.StatusInternalServerError)
+ 121| 				ctx.Values().Set("message", "ldap is not enable!")
+ 122| 				return
+ 123| 			}
+ 124| 			if err := h.ldapService.Login(*u, loginCredential.Password, common.DBOptions{}); err != nil {
+ 125| 				ctx.StatusCode(iris.StatusInternalServerError)
+ 126| 				ctx.Values().Set("message", "username or password error")
+ 127| 				return
+ 128| 			}
+ 129| 		} else {
+ 130| 			if err := bcrypt.CompareHashAndPassword([]byte(u.Authenticate.Password), []byte(loginCredential.Password)); err != nil {
+ 131| 				ctx.StatusCode(iris.StatusBadRequest)
+ 132| 				ctx.Values().Set("message", "username or password error")
+ 133| 				return
+ 134| 			}
+ 135| 		}
+ 136| 
+ 137| 		permissions, err := h.aggregateResourcePermissions(loginCredential.Username)
+ 138| 		if err != nil {
+ 139| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 140| 			ctx.Values().Set("message", err.Error())
+ 141| 			return
+ 142| 		}
+ 143| 		profile := UserProfile{
+ 144| 			Name:                u.Name,
+ 145| 			NickName:            u.NickName,
+ 146| 			Email:               u.Email,
+ 147| 			Language:            u.Language,
+ 148| 			ResourcePermissions: permissions,
+ 149| 			IsAdministrator:     u.IsAdmin,
+ 150| 			Mfa: Mfa{
+ 151| 				Secret:   u.Mfa.Secret,
+ 152| 				Enable:   u.Mfa.Enable,
+ 153| 				Approved: false,
+ 154| 			},
+ 155| 		}
+ 156| 
+ 157| 		authMethod := loginCredential.AuthMethod
+ 158| 
+ 159| 		switch authMethod {
+ 160| 		case "jwt":
+ 161| 			token, err := h.jwtSigner.Sign(profile)
+ 162| 			if err != nil {
+ 163| 				ctx.StatusCode(iris.StatusInternalServerError)
+ 164| 				ctx.Values().Set("message", err.Error())
+ 165| 			}
+ 166| 			ctx.StatusCode(iris.StatusOK)
+ 167| 			ctx.Values().Set("token", token)
+ 168| 			return
+ 169| 		default:
+ 170| 			session := server.SessionMgr.Start(ctx)
+ 171| 			session.Set("profile", profile)
+ 172| 		}
+ 173| 
+ 174| 		ctx.StatusCode(iris.StatusOK)
+ 175| 		go saveLoginLog(ctx, profile.Name)
+ 176| 		ctx.Values().Set("data", profile)
+ 177| 	}
+ 178| }
+ 179| 
+ 180| func saveLoginLog(ctx *context.Context, userName string) {
+ 181| 	var logItem v1System.LoginLog
+ 182| 	logItem.UserName = userName
+ 183| 	logItem.Ip = ctx.RemoteAddr()
+ 184| 	qqWry, err := ip.NewQQwry()
+ 185| 	if err != nil {
+ 186| 		server.Logger().Errorf("load qqwry datas failed: %s", err)
+ 187| 	}
+ 188| 	res := qqWry.Find(logItem.Ip)
+ 189| 	logItem.City = res.Area
+ 190| 	systemService := v1SystemService.NewService()
+ 191| 	systemService.CreateLoginLog(&logItem, common.DBOptions{})
+ 192| }
+ 193| 
+ 194| func (h *Handler) aggregateResourcePermissions(name string) (map[string][]string, error) {
+ 195| 	userRoleBindings, err := h.rolebindingService.GetRoleBindingBySubject(v1Role.Subject{
+ 196| 		Kind: "User",
+ 197| 		Name: name,
+ 198| 	}, common.DBOptions{})
+ 199| 	if err != nil && !errors.As(err, &storm.ErrNotFound) {
+ 200| 		return nil, err
+ 201| 	}
+ 202| 
+ 203| 	var roleNames []string
+ 204| 	for i := range userRoleBindings {
+ 205| 		roleNames = append(roleNames, userRoleBindings[i].RoleRef)
+ 206| 	}
+ 207| 
+ 208| 	rs, err := h.roleService.GetByNames(roleNames, common.DBOptions{})
+ 209| 	if err != nil && !errors.As(err, &storm.ErrNotFound) {
+ 210| 		return nil, err
+ 211| 	}
+ 212| 	mapping := map[string]*collectons.StringSet{}
+ 213| 	var policyRoles []v1Role.PolicyRule
+ 214| 	//merge permissions
+ 215| 	for i := range rs {
+ 216| 		for j := range rs[i].Rules {
+ 217| 			policyRoles = append(policyRoles, rs[i].Rules[j])
+ 218| 		}
+ 219| 	}
+ 220| 	for i := range policyRoles {
+ 221| 		for j := range policyRoles[i].Resource {
+ 222| 			_, ok := mapping[policyRoles[i].Resource[j]]
+ 223| 			if !ok {
+ 224| 				mapping[policyRoles[i].Resource[j]] = collectons.NewStringSet()
+ 225| 			}
+ 226| 			for k := range policyRoles[i].Verbs {
+ 227| 				mapping[policyRoles[i].Resource[j]].Add(policyRoles[i].Verbs[k])
+ 228| 				if policyRoles[i].Verbs[k] == "*" {
+ 229| 					break
+ 230| 				}
+ 231| 			}
+ 232| 			if policyRoles[i].Resource[j] == "*" {
+ 233| 				break
+ 234| 			}
+ 235| 		}
+ 236| 	}
+ 237| 	resourceMapping := map[string][]string{}
+ 238| 	for key := range mapping {
+ 239| 		resourceMapping[key] = mapping[key].ToSlice()
+ 240| 	}
+ 241| 	return resourceMapping, nil
+ 242| }
+ 243| 
+ 244| func (h *Handler) Logout() iris.Handler {
+ 245| 	return func(ctx *context.Context) {
+ 246| 		session := server.SessionMgr.Start(ctx)
+ 247| 		loginUser := session.Get("profile")
+ 248| 		if loginUser == nil {
+ 249| 			ctx.StatusCode(iris.StatusUnauthorized)
+ 250| 			ctx.Values().Set("message", "no login user")
+ 251| 			return
+ 252| 		}
+ 253| 		session.Delete("profile")
+ 254| 		logging.LogSessions.Clean()
+ 255| 		terminal.TerminalSessions.Clean()
+ 256| 		ctx.StatusCode(iris.StatusOK)
+ 257| 		ctx.Values().Set("data", "logout success")
+ 258| 	}
+ 259| }
+ 260| 
+ 261| func (h *Handler) GetProfile() iris.Handler {
+ 262| 	return func(ctx *context.Context) {
+ 263| 		session := server.SessionMgr.Start(ctx)
+ 264| 		loginUser := session.Get("profile")
+ 265| 		if loginUser == nil {
+ 266| 			ctx.StatusCode(iris.StatusUnauthorized)
+ 267| 			ctx.Values().Set("message", "no login user")
+ 268| 			return
+ 269| 		}
+ 270| 		p, ok := loginUser.(UserProfile)
+ 271| 		if !ok {
+ 272| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 273| 			ctx.Values().Set("message", "can not parse to session user")
+ 274| 			return
+ 275| 		}
+ 276| 
+ 277| 		user, err := h.userService.GetByNameOrEmail(p.Name, common.DBOptions{})
+ 278| 		if err != nil {
+ 279| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 280| 			ctx.Values().Set("message", err.Error())
+ 281| 			return
+ 282| 		}
+ 283| 		p = UserProfile{
+ 284| 			Name:            user.Name,
+ 285| 			NickName:        user.NickName,
+ 286| 			Email:           user.Email,
+ 287| 			Language:        user.Language,
+ 288| 			IsAdministrator: user.IsAdmin,
+ 289| 		}
+ 290| 		if !user.IsAdmin {
+ 291| 			permissions, err := h.aggregateResourcePermissions(p.Name)
+ 292| 			if err != nil {
+ 293| 				ctx.StatusCode(iris.StatusInternalServerError)
+ 294| 				ctx.Values().Set("message", err.Error())
+ 295| 				return
+ 296| 			}
+ 297| 			p.ResourcePermissions = permissions
+ 298| 		}
+ 299| 		session.Set("profile", p)
+ 300| 		ctx.StatusCode(iris.StatusOK)
+ 301| 		ctx.Values().Set("data", p)
+ 302| 	}
+ 303| }
+ 304| 
+ 305| func (h *Handler) ListUserNamespace() iris.Handler {
+ 306| 	return func(ctx *context.Context) {
+ 307| 		name := ctx.Params().GetString("cluster_name")
+ 308| 		c, err := h.clusterService.Get(name, common.DBOptions{})
+ 309| 		if err != nil {
+ 310| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 311| 			ctx.Values().Set("message", fmt.Sprintf("get cluster failed: %s", err.Error()))
+ 312| 			return
+ 313| 		}
+ 314| 		session := server.SessionMgr.Start(ctx)
+ 315| 		u := session.Get("profile")
+ 316| 		profile := u.(UserProfile)
+ 317| 
+ 318| 		k := kubernetes.NewKubernetes(c)
+ 319| 		ns, err := k.GetUserNamespaceNames(profile.Name, profile.IsAdministrator)
+ 320| 		if err != nil {
+ 321| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 322| 			ctx.Values().Set("message", err)
+ 323| 			return
+ 324| 		}
+ 325| 		ctx.Values().Set("data", ns)
+ 326| 	}
+ 327| }
+ 328| 
+ 329| func (h *Handler) GetClusterProfile() iris.Handler {
+ 330| 	return func(ctx *context.Context) {
+ 331| 		session := server.SessionMgr.Start(ctx)
+ 332| 		clusterName := ctx.Params().GetString("cluster_name")
+ 333| 		namesapce := ctx.URLParam("namespace")
+ 334| 		c, err := h.clusterService.Get(clusterName, common.DBOptions{})
+ 335| 		if err != nil {
+ 336| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 337| 			ctx.Values().Set("message", err.Error())
+ 338| 			return
+ 339| 		}
+ 340| 		k := kubernetes.NewKubernetes(c)
+ 341| 		client, err := k.Client()
+ 342| 		if err != nil {
+ 343| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 344| 			ctx.Values().Set("message", fmt.Sprintf("get k8s client failed: %s", err.Error()))
+ 345| 			return
+ 346| 		}
+ 347| 		u := session.Get("profile")
+ 348| 		profile := u.(UserProfile)
+ 349| 
+ 350| 		if profile.IsAdministrator {
+ 351| 			crp := ClusterUserProfile{
+ 352| 				UserProfile:  profile,
+ 353| 				ClusterRoles: []v1.ClusterRole{},
+ 354| 			}
+ 355| 			ctx.Values().Set("data", &crp)
+ 356| 			return
+ 357| 		}
+ 358| 
+ 359| 		labels := []string{
+ 360| 			fmt.Sprintf("%s=%s", kubernetes.LabelManageKey, "kubepi"),
+ 361| 			fmt.Sprintf("%s=%s", kubernetes.LabelClusterId, c.UUID),
+ 362| 			fmt.Sprintf("%s=%s", kubernetes.LabelUsername, profile.Name),
+ 363| 		}
+ 364| 		clusterRoleBindings, err := client.RbacV1().ClusterRoleBindings().List(goContext.TODO(), metav1.ListOptions{
+ 365| 			LabelSelector: strings.Join(labels, ","),
+ 366| 		})
+ 367| 		if err != nil {
+ 368| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 369| 			ctx.Values().Set("message", fmt.Sprintf("get cluster-role-binding failed: %s", err.Error()))
+ 370| 			return
+ 371| 		}
+ 372| 		rolebindings, err := client.RbacV1().RoleBindings(namesapce).List(goContext.TODO(), metav1.ListOptions{
+ 373| 			LabelSelector: strings.Join(labels, ","),
+ 374| 		})
+ 375| 		if err != nil {
+ 376| 			ctx.StatusCode(iris.StatusInternalServerError)
+ 377| 			ctx.Values().Set("message", fmt.Sprintf("get role-binding failed: %s", err.Error()))
+ 378| 			return
+ 379| 		}
+ 380| 		roleSet := map[string]struct{}{}
+ 381| 		for i := range clusterRoleBindings.Items {
+ 382| 			for j := range clusterRoleBindings.Items[i].Subjects {
+ 383| 				if clusterRoleBindings.Items[i].Subjects[j].Kind == "User" {
+ 384| 					roleSet[clusterRoleBindings.Items[i].RoleRef.Name] = struct{}{}
+ 385| 				}
+ 386| 			}
+ 387| 		}
+ 388| 		for i := range rolebindings.Items {
+ 389| 			for j := range rolebindings.Items[i].Subjects {
+ 390| 				if rolebindings.Items[i].Subjects[j].Kind == "User" {
+ 391| 					roleSet[rolebindings.Items[i].RoleRef.Name] = struct{}{}
+ 392| 				}
+ 393| 			}
+ 394| 		}
+ 395| 		var roles []v1.ClusterRole
+ 396| 		for key := range roleSet {
+ 397| 			r, err := client.RbacV1().ClusterRoles().Get(goContext.TODO(), key, metav1.GetOptions{})
+ 398| 			if err != nil {
+ 399| 				ctx.StatusCode(iris.StatusInternalServerError)
+ 400| 				ctx.Values().Set("message", fmt.Sprintf("get cluster-role failed: %s", err.Error()))
+ 401| 				return
+ 402| 			}
+ 403| 			roles = append(roles, *r)
+ 404| 		}
+ 405| 
+ 406| 		crp := ClusterUserProfile{
+ 407| 			UserProfile:  profile,
+ 408| 			ClusterRoles: roles,
+ 409| 		}
+ 410| 		if len(roles) <= 0 {
+ 411| 			ctx.StatusCode(iris.StatusForbidden)
+ 412| 			return
+ 413| 		}
+ 414| 		ctx.Values().Set("data", &crp)
+ 415| 	}
+ 416| }
+ 417| 
+ 418| func Install(parent iris.Party) {
+ 419| 	handler := NewHandler()
+ 420| 	sp := parent.Party("/sessions")
+ 421| 	sp.Post("", handler.Login())
+ 422| 	sp.Delete("", handler.Logout())
+ 423| 	sp.Get("", handler.GetProfile())
+ 424| 	sp.Get("/:cluster_name", handler.GetClusterProfile())
+ 425| 	sp.Get("/status", handler.IsLogin())
+ 426| 	sp.Get("/:cluster_name/namespaces", handler.ListUserNamespace())
+ 427| 	sp.Put("", handler.UpdateProfile())
+ 428| 	sp.Put("/password", handler.UpdatePassword())
+ 429| }
+ 430| 
+ 431| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=8039 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **第 41 行 `JwtSigKey`**：JWT 签名密钥硬编码为公开字符串 `signature_hmac_secret_shared_key`，且为包级变量无任何配置覆盖。攻击者可用该密钥伪造任意用户（含管理员）的 JWT，属于 CWE-798/CWE-321 硬编码凭证。这是全文最严重的漏洞。
+
+2. **第 165–180 行 Login 的 jwt 分支**：MFA 校验（`Approved: false`，第 152 行）在密码验证后、签发 token 前并未阻断——即使 `u.Mfa.Enable == true` 且未通过二次认证，`jwt` 分支仍直接 `Sign(profile)` 返回 token。持有有效密码的攻击者可绕过 MFA 获得 JWT，属 CWE-308/CWE-287 认证绕过。
+
+3. **第 236–248 行 GetProfile**：从数据库重建 profile 后直接 `session.Set("profile", p)`，新构造的 `p` 未携带 `Mfa` 字段（零值 Enable=false）。若在 MFA 待审批状态下调用 GET /sessions（GetProfile 无 MFA 检查），会话中的 Mfa 标志被清空，后续 `IsLogin`（第 60–66 行）判定 `p.Mfa.Enable==false` 直接放行并续期会话——第二条 MFA 绕过通道。
+
+4. **第 258–262、286–290 行 ListUserNamespace / GetClusterProfile**：`profile := u.(UserProfile)` 无 ok 判断，未登录时 u 为 nil，类型断言 panic 导致 DoS（CWE-476），且这两个入口依赖外层中间件做鉴权，本文件内无防御。
+
+5. **第 96 行 saveLoginLog**：goroutine 中使用请求 ctx 取 RemoteAddr，ctx 复用风险低；qqwry 加载失败后仍调用 `qqWry.Find` 可能 nil 解引用 panic（第 100–103 行），仅影响日志 goroutine。
+
+6. **第 118–160 行 aggregateResourcePermissions**：`errors.As(err, &storm.ErrNotFound)` 用法错误（应为 errors.Is），ErrNotFound 时返回错误导致登录失败，属功能缺陷非安全漏洞。
+
+主要可利用链：攻击者读取开源代码获得硬编码密钥 → 自行 HS256 签发 `IsAdministrator:true` 的 UserProfile JWT → 以管理员身份访问所有接口。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-798 Use of Hard-coded Credentials (MFA 绕过)", "risk_level": "Critical", "source": "line 41: 硬编码 JwtSigKey; line 154: Mfa.Approved 为 false", "sink": "line 162: h.jwtSigner.Sign(profile) 签发 token; line 300: session.Set 覆盖 Mfa 状态", "explanation": "第 41 行将 JWT HMAC 密钥硬编码在开源代码中，任何人可用它伪造 IsAdministrator 为 true 的任意用户 token 实现完全接管 -> 第 176 行 jwt 分支在 Mfa.Enable 为 true 且 Approved 为 false 时仍签发 token，绕过 MFA -> 第 247 行 GetProfile 重建 profile 时丢失 Mfa 字段并写回会话，使 IsLogin 的 MFA 校验失效，构成第二绕过通道", "fix_suggestion": "line 41: 从环境变量或配置文件加载随机生成的签名密钥并定期轮换; line 176: 在 jwt 分支前校验 Mfa.Enable 时拒绝签发直至二次认证完成; line 248: 重建 profile 时保留原会话中的 Mfa 状态"}
+
+### id=8040 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文逐函数）
+
+1. **第 33–36 行（NewHandler）**：JWT 签名密钥来自 `server.Config().Spec.Jwt.Key`，为服务端配置，非用户可控 source；HS256 + 10 分钟有效期，无硬编码密钥证据。
+
+2. **第 38–66 行（IsLogin）**：入口 `GET /sessions/status`。仅读取会话中的 profile，无外部输入流入敏感 sink；MFA 未批准时返回 401，逻辑正确。
+
+3. **第 68–140 行（Login）**：入口 `POST /sessions`，source 为 JSON body 的 Username/Password。
+   - 第 73 行 `GetByNameOrEmail` 使用 storm ORM 按字段查询，非拼接 SQL，无注入面；
+   - 第 88 行 bcrypt 校验、第 82 行 LDAP 校验均先验证凭据后才构造 profile；
+   - 第 118 行 JWT 仅在密码校验通过后签发；session 写入同理。错误信息统一为 'username or password error'，无用户枚举差异（LDAP 分支用 500 略有不一致，但非可利用漏洞）。
+
+4. **第 142–158 行（saveLoginLog）**：`ctx.RemoteAddr()` 与 QQwry 归属地查询写入日志库，经 ORM 存储，无命令执行/注入 sink。
+
+5. **第 160–205 行（aggregateResourcePermissions）**：内部权限聚合，输入来自数据库 rolebinding/role，无外部 source 直达 sink。
+
+6. **第 207–224 行（Logout）**：删除会话并清理终端会话，无风险。
+
+7. **第 226–262 行（GetProfile）**：从会话取用户名查库后回写会话；管理员跳过权限聚合属正常设计。无外部可控路径参数。
+
+8. **第 264–283 行（ListUserNamespace）**：入口含路径参数 `cluster_name`，但仅用于 `clusterService.Get`（ORM 主键查询）和获取 K8s 客户端，未拼接到任何执行型 sink。
+
+9. **第 285–356 行（GetClusterProfile）**：`cluster_name`、`namespace` 参数用于 K8s API 客户端调用（LabelSelector 由服务端常量与 profile.Name 拼接）。profile.Name 来自已认证会话而非请求体；LabelSelector 值中若用户名含特殊字符最坏导致查询失败，不构成提权或注入。所有 RBAC 查询以当前用户身份过滤，非管理员无法枚举他人绑定。
+
+10. **第 358–367 行（Install 路由注册）**：全部路由均在 parent Party 下，依赖全局认证中间件（本文件外），文件内无匿名放行逻辑。
+
+**第二入口/替代通道检查**：本文件无文件上传、环境变量读取、回调注册；JWT 与 session 双通道均要求先通过密码校验，无旁路。
+
+**防御有效性**：ORM 参数化查询（非黑名单/正则）、bcrypt、会话/JWT 双重校验均为有效防御。
+
+结论：通读全文后未发现可达的 source→sink 危险数据流，判定无安全漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文逐函数分析：登录入口使用 storm ORM 参数化查询与 bcrypt 校验，JWT 仅在凭据验证通过后签发；路径参数 cluster_name 与 namespace 仅用于 ORM 主键查询和 K8s API 调用，LabelSelector 由服务端常量与会话内用户名拼接，不存在外部输入直达命令执行、SQL 注入或越权 sink 的数据流；所有敏感操作均依赖已认证会话，未发现第二入口或替代通道绕过。", "fix_suggestion": "no fix needed"}

@@ -1,0 +1,862 @@
+batch=140 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7974 lang=go
+[CODE]
+   1| // Copyright 2023 The Inspektor Gadget authors
+   2| //
+   3| // Licensed under the Apache License, Version 2.0 (the "License");
+   4| // you may not use this file except in compliance with the License.
+   5| // You may obtain a copy of the License at
+   6| //
+   7| //     http://www.apache.org/licenses/LICENSE-2.0
+   8| //
+   9| // Unless required by applicable law or agreed to in writing, software
+  10| // distributed under the License is distributed on an "AS IS" BASIS,
+  11| // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  12| // See the License for the specific language governing permissions and
+  13| // limitations under the License.
+  14| 
+  15| package image
+  16| 
+  17| import (
+  18| 	"context"
+  19| 	"embed"
+  20| 	"errors"
+  21| 	"fmt"
+  22| 	"os"
+  23| 	"os/exec"
+  24| 	"path/filepath"
+  25| 	"runtime"
+  26| 	"slices"
+  27| 	"strconv"
+  28| 	"strings"
+  29| 	"time"
+  30| 
+  31| 	"github.com/docker/docker/api/types/container"
+  32| 	"github.com/docker/docker/api/types/filters"
+  33| 	"github.com/docker/docker/api/types/image"
+  34| 	"github.com/docker/docker/api/types/mount"
+  35| 	"github.com/docker/docker/client"
+  36| 	"github.com/docker/docker/pkg/stdcopy"
+  37| 	"github.com/moby/moby/pkg/jsonmessage"
+  38| 	"github.com/spf13/cobra"
+  39| 	"golang.org/x/term"
+  40| 	"gopkg.in/yaml.v3"
+  41| 
+  42| 	"github.com/inspektor-gadget/inspektor-gadget/cmd/common"
+  43| 	"github.com/inspektor-gadget/inspektor-gadget/pkg/oci"
+  44| )
+  45| 
+  46| //go:embed helpers
+  47| var helpersFS embed.FS
+  48| 
+  49| // It can be overridden at build time
+  50| var builderImage = "ghcr.io/inspektor-gadget/gadget-builder:main"
+  51| 
+  52| const (
+  53| 	DEFAULT_EBPF_SOURCE = "program.bpf.c"
+  54| 	DEFAULT_WASM        = "" // Wasm is optional; unset by default
+  55| 	DEFAULT_METADATA    = "gadget.yaml"
+  56| )
+  57| 
+  58| type buildFile struct {
+  59| 	EBPFSource string `yaml:"ebpfsource"`
+  60| 	Wasm       string `yaml:"wasm"`
+  61| 	Metadata   string `yaml:"metadata"`
+  62| }
+  63| 
+  64| type cmdOpts struct {
+  65| 	path             string
+  66| 	file             string
+  67| 	fileChanged      bool
+  68| 	image            string
+  69| 	local            bool
+  70| 	outputDir        string
+  71| 	builderImage     string
+  72| 	builderImagePull string
+  73| 	updateMetadata   bool
+  74| 	validateMetadata bool
+  75| 	btfgen           bool
+  76| 	btfhubarchive    string
+  77| }
+  78| 
+  79| func NewBuildCmd() *cobra.Command {
+  80| 	opts := &cmdOpts{}
+  81| 
+  82| 	cmd := &cobra.Command{
+  83| 		Use:          "build PATH",
+  84| 		Short:        "Build a gadget image",
+  85| 		SilenceUsage: true,
+  86| 		Args:         cobra.ExactArgs(1),
+  87| 		RunE: func(cmd *cobra.Command, args []string) error {
+  88| 			if opts.local && opts.builderImage != builderImage {
+  89| 				return fmt.Errorf("--local and --builder-image cannot be used at the same time")
+  90| 			}
+  91| 
+  92| 			// Validate builderImagePull flag by checking it against a list of valid values
+  93| 			validValues := []string{"always", "missing", "never"}
+  94| 			if !slices.Contains(validValues, opts.builderImagePull) {
+  95| 				return fmt.Errorf("invalid value for --builder-image-pull: %s. Valid values are %s", opts.builderImagePull, strings.Join(validValues, ","))
+  96| 			}
+  97| 
+  98| 			fFlag := cmd.Flags().Lookup("file")
+  99| 			opts.fileChanged = fFlag.Changed
+ 100| 
+ 101| 			opts.path = args[0]
+ 102| 
+ 103| 			return runBuild(cmd, opts)
+ 104| 		},
+ 105| 	}
+ 106| 
+ 107| 	cmd.Flags().StringVarP(&opts.file, "file", "f", "build.yaml", "Path to build.yaml")
+ 108| 	cmd.Flags().BoolVarP(&opts.local, "local", "l", false, "Build using local tools")
+ 109| 	cmd.Flags().StringVarP(&opts.outputDir, "output", "o", "", "Path to a folder to store generated files while building")
+ 110| 	cmd.Flags().StringVarP(&opts.image, "tag", "t", "", "Name for the built image (format name:tag)")
+ 111| 	cmd.Flags().StringVar(&opts.builderImage, "builder-image", builderImage, "Builder image to use")
+ 112| 	cmd.Flags().StringVar(&opts.builderImagePull, "builder-image-pull", "always", "Specify when the builder image should be pulled [always, missing, never]")
+ 113| 	cmd.Flags().BoolVar(&opts.updateMetadata, "update-metadata", false, "Update the metadata according to the eBPF code")
+ 114| 	cmd.Flags().BoolVar(&opts.validateMetadata, "validate-metadata", true, "Validate the metadata file before building the gadget image")
+ 115| 
+ 116| 	cmd.Flags().BoolVar(&opts.btfgen, "btfgen", false, "Enable btfgen")
+ 117| 	cmd.Flags().StringVar(&opts.btfhubarchive, "btfhub-archive", "", "Path to the location of the btfhub-archive files")
+ 118| 
+ 119| 	return cmd
+ 120| }
+ 121| 
+ 122| type buildOptions struct {
+ 123| 	outputDir         string
+ 124| 	forceColorsFlag   string
+ 125| 	ebpfSourcePath    string
+ 126| 	wasmSourcePath    string
+ 127| 	btfgen            bool
+ 128| 	btfHubArchivePath string
+ 129| 	useInTreeHeaders  string
+ 130| }
+ 131| 
+ 132| func buildCmd(options buildOptions) []string {
+ 133| 	cmd := []string{
+ 134| 		"make", "-f", filepath.Join(options.outputDir, "Makefile.build"),
+ 135| 		"-j", fmt.Sprintf("%d", runtime.NumCPU()),
+ 136| 		"OUTPUTDIR=" + options.outputDir,
+ 137| 		"FORCE_COLORS=" + options.forceColorsFlag,
+ 138| 		"USE_IN_TREE_HEADERS=" + options.useInTreeHeaders,
+ 139| 	}
+ 140| 
+ 141| 	if options.ebpfSourcePath != "" {
+ 142| 		cmd = append(cmd, "EBPFSOURCE="+options.ebpfSourcePath, "ebpf")
+ 143| 	}
+ 144| 	if options.wasmSourcePath != "" {
+ 145| 		cmd = append(cmd, "WASM="+options.wasmSourcePath, "wasm")
+ 146| 	}
+ 147| 	if options.btfgen {
+ 148| 		cmd = append(cmd, "BTFHUB_ARCHIVE="+options.btfHubArchivePath, "btfgen")
+ 149| 	}
+ 150| 
+ 151| 	return cmd
+ 152| }
+ 153| 
+ 154| func runBuild(cmd *cobra.Command, opts *cmdOpts) error {
+ 155| 	conf := &buildFile{
+ 156| 		EBPFSource: DEFAULT_EBPF_SOURCE,
+ 157| 		Wasm:       DEFAULT_WASM,
+ 158| 		Metadata:   DEFAULT_METADATA,
+ 159| 	}
+ 160| 
+ 161| 	var buildContent []byte
+ 162| 	var err error
+ 163| 
+ 164| 	if opts.fileChanged {
+ 165| 		buildContent, err = os.ReadFile(opts.file)
+ 166| 		if err != nil {
+ 167| 			return fmt.Errorf("reading build file: %w", err)
+ 168| 		}
+ 169| 	} else {
+ 170| 		// The user specified the path but not the file. Use the default file build.yaml
+ 171| 		buildContent, err = os.ReadFile(filepath.Join(opts.path, opts.file))
+ 172| 		if err != nil && !errors.Is(err, os.ErrNotExist) {
+ 173| 			return fmt.Errorf("reading build file: %w", err)
+ 174| 		}
+ 175| 	}
+ 176| 
+ 177| 	if opts.btfgen && opts.btfhubarchive == "" {
+ 178| 		return errors.New("btfgen requires --btfhub-archive")
+ 179| 	}
+ 180| 
+ 181| 	if opts.btfgen {
+ 182| 		cmd.Printf("btfgen is enabled, building will take a while...\n")
+ 183| 	}
+ 184| 
+ 185| 	if err := yaml.Unmarshal(buildContent, conf); err != nil {
+ 186| 		return fmt.Errorf("unmarshaling build.yaml: %w", err)
+ 187| 	}
+ 188| 
+ 189| 	if opts.outputDir != "" {
+ 190| 		if _, err := os.Stat(opts.outputDir); err != nil {
+ 191| 			return err
+ 192| 		}
+ 193| 	} else {
+ 194| 		// make a temp folder to store the build results
+ 195| 		tmpDir, err := os.MkdirTemp("", "gadget-build-")
+ 196| 		if err != nil {
+ 197| 			return fmt.Errorf("creating temp dir: %w", err)
+ 198| 		}
+ 199| 		defer os.RemoveAll(tmpDir)
+ 200| 
+ 201| 		opts.outputDir = tmpDir
+ 202| 	}
+ 203| 
+ 204| 	if opts.path != "." {
+ 205| 		cwd, err := os.Getwd()
+ 206| 		if err != nil {
+ 207| 			return fmt.Errorf("getting current directory: %w", err)
+ 208| 		}
+ 209| 		defer os.Chdir(cwd)
+ 210| 
+ 211| 		if err := os.Chdir(opts.path); err != nil {
+ 212| 			return fmt.Errorf("changing directory: %w", err)
+ 213| 		}
+ 214| 	}
+ 215| 
+ 216| 	if _, err := os.Stat(conf.EBPFSource); errors.Is(err, os.ErrNotExist) {
+ 217| 		if conf.EBPFSource != DEFAULT_EBPF_SOURCE {
+ 218| 			return fmt.Errorf("source file %q not found", conf.EBPFSource)
+ 219| 		}
+ 220| 		conf.EBPFSource = ""
+ 221| 	}
+ 222| 
+ 223| 	var hasEBPFSource, hasMetadata, hasWasm, hasGo bool
+ 224| 	if conf.EBPFSource != "" {
+ 225| 		if _, err := os.Stat(conf.EBPFSource); err == nil {
+ 226| 			hasEBPFSource = true
+ 227| 		}
+ 228| 	}
+ 229| 	if conf.Metadata != "" {
+ 230| 		if _, err := os.Stat(conf.Metadata); err == nil {
+ 231| 			hasMetadata = true
+ 232| 		}
+ 233| 	}
+ 234| 	if conf.Wasm != "" {
+ 235| 		if _, err := os.Stat(conf.Wasm); err == nil {
+ 236| 			hasWasm = true
+ 237| 		}
+ 238| 	}
+ 239| 
+ 240| 	goFolder := "./go"
+ 241| 
+ 242| 	if _, err := os.Stat(goFolder); err == nil {
+ 243| 		_ = filepath.Walk(goFolder, func(path string, info os.FileInfo, err error) error {
+ 244| 			if err != nil {
+ 245| 				return err
+ 246| 			}
+ 247| 			if !info.IsDir() && strings.HasSuffix(info.Name(), ".go") {
+ 248| 				hasGo = true
+ 249| 				return filepath.SkipDir
+ 250| 			}
+ 251| 			return nil
+ 252| 		})
+ 253| 	}
+ 254| 
+ 255| 	if !hasEBPFSource && !hasMetadata && !hasWasm && !hasGo {
+ 256| 		return fmt.Errorf("at least one of ebpf source (program.bpf.c), metadata (gadget.yaml), .go files (present in go folder) or wasm module is required")
+ 257| 	}
+ 258| 
+ 259| 	// copy helper files
+ 260| 	files, err := helpersFS.ReadDir("helpers")
+ 261| 	if err != nil {
+ 262| 		return fmt.Errorf("reading helpers: %w", err)
+ 263| 	}
+ 264| 
+ 265| 	for _, file := range files {
+ 266| 		if file.IsDir() {
+ 267| 			continue
+ 268| 		}
+ 269| 
+ 270| 		data, err := helpersFS.ReadFile(filepath.Join("helpers", file.Name()))
+ 271| 		if err != nil {
+ 272| 			return fmt.Errorf("reading helper file: %w", err)
+ 273| 		}
+ 274| 
+ 275| 		if err := os.WriteFile(filepath.Join(opts.outputDir, file.Name()), data, 0o600); err != nil {
+ 276| 			return fmt.Errorf("writing helper file: %w", err)
+ 277| 		}
+ 278| 	}
+ 279| 
+ 280| 	if conf.EBPFSource != "" || conf.Wasm != "" {
+ 281| 		if opts.local {
+ 282| 			cmd := buildCmd(buildOptions{
+ 283| 				outputDir:         opts.outputDir,
+ 284| 				ebpfSourcePath:    conf.EBPFSource,
+ 285| 				wasmSourcePath:    conf.Wasm,
+ 286| 				btfHubArchivePath: opts.btfhubarchive,
+ 287| 				btfgen:            opts.btfgen,
+ 288| 			})
+ 289| 			command := exec.Command(cmd[0], cmd[1:]...)
+ 290| 			out, err := command.CombinedOutput()
+ 291| 			if err != nil {
+ 292| 				return fmt.Errorf("build script: %w: %s", err, out)
+ 293| 			}
+ 294| 			if common.Verbose {
+ 295| 				fmt.Printf("Build logs start:\n%s\nBuild logs end\n", string(out))
+ 296| 			}
+ 297| 		} else {
+ 298| 			if err := buildInContainer(opts, conf); err != nil {
+ 299| 				return err
+ 300| 			}
+ 301| 		}
+ 302| 	}
+ 303| 
+ 304| 	// TODO: make this configurable?
+ 305| 	archs := []string{oci.ArchAmd64, oci.ArchArm64}
+ 306| 	objectsPaths := map[string]*oci.ObjectPath{}
+ 307| 
+ 308| 	for _, arch := range archs {
+ 309| 		obj := &oci.ObjectPath{}
+ 310| 
+ 311| 		if conf.EBPFSource != "" {
+ 312| 			obj.EBPF = filepath.Join(opts.outputDir, arch+".bpf.o")
+ 313| 		}
+ 314| 
+ 315| 		// TODO: the same wasm file is provided for all architectures. Should we allow per-arch
+ 316| 		// wasm files?
+ 317| 		if strings.HasSuffix(conf.Wasm, ".wasm") {
+ 318| 			// User provided an already-built wasm file
+ 319| 			obj.Wasm = conf.Wasm
+ 320| 		} else if conf.Wasm != "" {
+ 321| 			// User provided a source file to build wasm from
+ 322| 			obj.Wasm = filepath.Join(opts.outputDir, "program.wasm")
+ 323| 		}
+ 324| 
+ 325| 		if opts.btfgen {
+ 326| 			archClean := arch
+ 327| 			if arch == oci.ArchAmd64 {
+ 328| 				archClean = "x86_64"
+ 329| 			}
+ 330| 
+ 331| 			obj.Btfgen = filepath.Join(opts.outputDir, fmt.Sprintf("btfs-%s.tar.gz", archClean))
+ 332| 		}
+ 333| 
+ 334| 		objectsPaths[arch] = obj
+ 335| 	}
+ 336| 
+ 337| 	buildOpts := &oci.BuildGadgetImageOpts{
+ 338| 		EBPFSourcePath:   conf.EBPFSource,
+ 339| 		ObjectPaths:      objectsPaths,
+ 340| 		MetadataPath:     conf.Metadata,
+ 341| 		UpdateMetadata:   opts.updateMetadata,
+ 342| 		ValidateMetadata: opts.validateMetadata,
+ 343| 	}
+ 344| 
+ 345| 	if sourceDateEpoch, ok := os.LookupEnv("SOURCE_DATE_EPOCH"); ok {
+ 346| 		sde, err := strconv.ParseInt(sourceDateEpoch, 10, 64)
+ 347| 		if err != nil {
+ 348| 			return fmt.Errorf("invalid SOURCE_DATE_EPOCH: %w", err)
+ 349| 		}
+ 350| 		buildOpts.CreatedDate = time.Unix(sde, 0).UTC().Format(time.RFC3339)
+ 351| 	} else {
+ 352| 		buildOpts.CreatedDate = time.Now().Format(time.RFC3339)
+ 353| 	}
+ 354| 
+ 355| 	desc, err := oci.BuildGadgetImage(context.TODO(), buildOpts, opts.image)
+ 356| 	if err != nil {
+ 357| 		return err
+ 358| 	}
+ 359| 
+ 360| 	cmd.Printf("Successfully built %s\n", desc.String())
+ 361| 
+ 362| 	return nil
+ 363| }
+ 364| 
+ 365| func pullImage(ctx context.Context, cli *client.Client, imageReference string) error {
+ 366| 	fmt.Printf("Pulling builder image %s\n", imageReference)
+ 367| 	reader, err := cli.ImagePull(ctx, imageReference, image.PullOptions{})
+ 368| 	if err != nil {
+ 369| 		return fmt.Errorf("pulling builder image: %w", err)
+ 370| 	}
+ 371| 	defer reader.Close()
+ 372| 
+ 373| 	out := os.Stdout
+ 374| 	outFd := out.Fd()
+ 375| 	isTTY := term.IsTerminal(int(outFd))
+ 376| 	return jsonmessage.DisplayJSONMessagesStream(reader, out, outFd, isTTY, nil)
+ 377| }
+ 378| 
+ 379| func isImageLocallyAvailable(ctx context.Context, cli *client.Client, imageReference string) (bool, error) {
+ 380| 	f := filters.NewArgs()
+ 381| 	f.Add("reference", imageReference)
+ 382| 
+ 383| 	images, err := cli.ImageList(ctx, image.ListOptions{Filters: f})
+ 384| 	if err != nil {
+ 385| 		return false, fmt.Errorf("listing images: %w", err)
+ 386| 	}
+ 387| 
+ 388| 	for _, img := range images {
+ 389| 		for _, tag := range img.RepoTags {
+ 390| 			if tag == imageReference {
+ 391| 				return true, nil
+ 392| 			}
+ 393| 		}
+ 394| 		for _, digest := range img.RepoDigests {
+ 395| 			if digest == imageReference {
+ 396| 				return true, nil
+ 397| 			}
+ 398| 		}
+ 399| 	}
+ 400| 	return false, nil
+ 401| }
+ 402| 
+ 403| func ensureBuilderImage(ctx context.Context, cli *client.Client, builderImage string, builderImagePull string) error {
+ 404| 	switch builderImagePull {
+ 405| 	case "always":
+ 406| 		return pullImage(ctx, cli, builderImage)
+ 407| 	case "missing":
+ 408| 		localAvailable, err := isImageLocallyAvailable(ctx, cli, builderImage)
+ 409| 		if err != nil {
+ 410| 			return err
+ 411| 		}
+ 412| 		if !localAvailable {
+ 413| 			return pullImage(ctx, cli, builderImage)
+ 414| 		}
+ 415| 	case "never":
+ 416| 		localAvailable, err := isImageLocallyAvailable(ctx, cli, builderImage)
+ 417| 		if err != nil {
+ 418| 			return err
+ 419| 		}
+ 420| 		if !localAvailable {
+ 421| 			return fmt.Errorf("image %s is not available locally and pull is disabled", builderImage)
+ 422| 		}
+ 423| 	default:
+ 424| 		return fmt.Errorf("invalid --builder-image-pull value: %s", builderImagePull)
+ 425| 	}
+ 426| 	return nil
+ 427| }
+ 428| 
+ 429| func buildInContainer(opts *cmdOpts, conf *buildFile) error {
+ 430| 	cwd, err := os.Getwd()
+ 431| 	if err != nil {
+ 432| 		return fmt.Errorf("getting current directory: %w", err)
+ 433| 	}
+ 434| 
+ 435| 	ctx := context.TODO()
+ 436| 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+ 437| 	if err != nil {
+ 438| 		return fmt.Errorf("creating docker client: %w", err)
+ 439| 	}
+ 440| 	defer cli.Close()
+ 441| 
+ 442| 	if err := ensureBuilderImage(ctx, cli, opts.builderImage, opts.builderImagePull); err != nil {
+ 443| 		return err
+ 444| 	}
+ 445| 
+ 446| 	// where the gadget source code is mounted in the container
+ 447| 	gadgetSourcePath := "/work"
+ 448| 	pathHost := cwd
+ 449| 
+ 450| 	inspektorGadetSrcPath := os.Getenv("IG_SOURCE_PATH")
+ 451| 	useInTreeHeaders := "false"
+ 452| 	if inspektorGadetSrcPath != "" {
+ 453| 		pathHost = inspektorGadetSrcPath
+ 454| 		// find the gadget relative path to the inspektor-gadget source
+ 455| 		if !strings.HasPrefix(cwd, inspektorGadetSrcPath) {
+ 456| 			return fmt.Errorf("the current directory %q is not under the inspektor-gadget source path %q", cwd, inspektorGadetSrcPath)
+ 457| 		}
+ 458| 		gadgetRelativePath := strings.TrimPrefix(cwd, inspektorGadetSrcPath)
+ 459| 		gadgetSourcePath = filepath.Join("/work", gadgetRelativePath)
+ 460| 
+ 461| 		// use in-tree headers too
+ 462| 		useInTreeHeaders = "true"
+ 463| 	}
+ 464| 
+ 465| 	buildOpts := buildOptions{
+ 466| 		outputDir:         "/out",
+ 467| 		btfgen:            opts.btfgen,
+ 468| 		btfHubArchivePath: "/btfhub-archive",
+ 469| 		useInTreeHeaders:  useInTreeHeaders,
+ 470| 	}
+ 471| 
+ 472| 	if conf.Wasm != "" {
+ 473| 		buildOpts.wasmSourcePath = filepath.Join(gadgetSourcePath, conf.Wasm)
+ 474| 	}
+ 475| 
+ 476| 	if conf.EBPFSource != "" {
+ 477| 		buildOpts.ebpfSourcePath = filepath.Join(gadgetSourcePath, conf.EBPFSource)
+ 478| 	}
+ 479| 
+ 480| 	if term.IsTerminal(int(os.Stdout.Fd())) && term.IsTerminal(int(os.Stderr.Fd())) {
+ 481| 		buildOpts.forceColorsFlag = "true"
+ 482| 	}
+ 483| 
+ 484| 	cmd := buildCmd(buildOpts)
+ 485| 
+ 486| 	// The work mount ReadOnly field is updated as false, to allow Cargo.lock to compiled in /work folder for rust source code.
+ 487| 	mounts := []mount.Mount{
+ 488| 		{
+ 489| 			Type:     mount.TypeBind,
+ 490| 			Target:   "/work",
+ 491| 			Source:   pathHost,
+ 492| 			ReadOnly: false,
+ 493| 		},
+ 494| 		{
+ 495| 			Type:   mount.TypeBind,
+ 496| 			Target: "/out",
+ 497| 			Source: opts.outputDir,
+ 498| 		},
+ 499| 	}
+ 500| 
+ 501| 	if opts.btfgen {
+ 502| 		mounts = append(mounts, mount.Mount{
+ 503| 			Type:   mount.TypeBind,
+ 504| 			Target: "/btfhub-archive",
+ 505| 			Source: opts.btfhubarchive,
+ 506| 		})
+ 507| 	}
+ 508| 
+ 509| 	resp, err := cli.ContainerCreate(
+ 510| 		ctx,
+ 511| 		&container.Config{
+ 512| 			Image:      opts.builderImage,
+ 513| 			Cmd:        cmd,
+ 514| 			WorkingDir: gadgetSourcePath,
+ 515| 			User:       fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+ 516| 		},
+ 517| 		&container.HostConfig{
+ 518| 			Mounts: mounts,
+ 519| 		},
+ 520| 		nil, nil, "",
+ 521| 	)
+ 522| 	if err != nil {
+ 523| 		return fmt.Errorf("creating builder container: %w", err)
+ 524| 	}
+ 525| 	defer func() {
+ 526| 		if err := cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{}); err != nil {
+ 527| 			fmt.Printf("Failed to remove builder container: %s\n", err)
+ 528| 		}
+ 529| 	}()
+ 530| 
+ 531| 	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+ 532| 		return fmt.Errorf("starting builder container: %w", err)
+ 533| 	}
+ 534| 
+ 535| 	var status container.WaitResponse
+ 536| 
+ 537| 	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+ 538| 	select {
+ 539| 	case err := <-errCh:
+ 540| 		if err != nil {
+ 541| 			return fmt.Errorf("waiting for builder container: %w", err)
+ 542| 		}
+ 543| 	case status = <-statusCh:
+ 544| 	}
+ 545| 
+ 546| 	outputOpts := container.LogsOptions{ShowStderr: true}
+ 547| 
+ 548| 	if status.StatusCode != 0 || common.Verbose {
+ 549| 		outputOpts.ShowStdout = true
+ 550| 	}
+ 551| 
+ 552| 	out, err := cli.ContainerLogs(ctx, resp.ID, outputOpts)
+ 553| 	if err != nil {
+ 554| 		return fmt.Errorf("getting builder container logs: %w", err)
+ 555| 	}
+ 556| 
+ 557| 	fmt.Println("Build logs start:")
+ 558| 	stdcopy.StdCopy(os.Stdout, os.Stderr, out)
+ 559| 	fmt.Println("Build logs end")
+ 560| 
+ 561| 	if status.StatusCode != 0 {
+ 562| 		return fmt.Errorf("builder container exited with status %d", status.StatusCode)
+ 563| 	}
+ 564| 
+ 565| 	return nil
+ 566| }
+ 567| 
+ 568| 
+
+### id=7975 lang=python
+[CODE]
+   1| """
+   2| MCP Handler for CLI.
+   3| 
+   4| Provides Model Context Protocol server integration.
+   5| Usage: praisonai "prompt" --mcp "npx -y @modelcontextprotocol/server-filesystem ."
+   6| """
+   7| 
+   8| import os
+   9| import shlex
+  10| from typing import Any, Dict, Tuple, List
+  11| from .base import FlagHandler
+  12| 
+  13| # Executables allowed as MCP server commands from the CLI.
+  14| # The SDK MCP() class is intentionally unrestricted — developers control their own inputs.
+  15| ALLOWED_MCP_COMMANDS = {
+  16|     "npx", "npx.cmd", "npx.exe",
+  17|     "node", "node.exe",
+  18|     "python", "python3", "python.exe", "python3.exe",
+  19|     "uvx", "uvx.exe",
+  20|     "uv", "uv.exe",
+  21|     "docker", "docker.exe",
+  22|     "deno", "deno.exe",
+  23|     "bun", "bun.exe",
+  24|     "pipx",
+  25| }
+  26| 
+  27| 
+  28| class MCPHandler(FlagHandler):
+  29|     """
+  30|     Handler for --mcp flag.
+  31|     
+  32|     Integrates MCP (Model Context Protocol) servers as tools for agents.
+  33|     
+  34|     Example:
+  35|         praisonai "List files" --mcp "npx -y @modelcontextprotocol/server-filesystem ."
+  36|         praisonai "Search web" --mcp "npx -y @modelcontextprotocol/server-brave-search" --mcp-env "BRAVE_API_KEY=xxx"
+  37|     """
+  38|     
+  39|     @property
+  40|     def feature_name(self) -> str:
+  41|         return "mcp"
+  42|     
+  43|     @property
+  44|     def flag_name(self) -> str:
+  45|         return "mcp"
+  46|     
+  47|     @property
+  48|     def flag_help(self) -> str:
+  49|         return "MCP server command (e.g., 'npx -y @modelcontextprotocol/server-filesystem .')"
+  50|     
+  51|     def check_dependencies(self) -> Tuple[bool, str]:
+  52|         """Check if MCP is available."""
+  53|         try:
+  54|             import importlib.util
+  55|             if importlib.util.find_spec("praisonaiagents") is not None:
+  56|                 # Check if MCP module is available
+  57|                 from praisonaiagents import MCP
+  58|                 if MCP is not None:
+  59|                     return True, ""
+  60|             return False, "MCP requires praisonaiagents with MCP support"
+  61|         except ImportError:
+  62|             return False, "praisonaiagents not installed. Install with: pip install praisonaiagents"
+  63|     
+  64|     def parse_mcp_command(self, command: str, env_vars: str = None) -> Tuple[str, List[str], Dict[str, str]]:
+  65|         """
+  66|         Parse MCP command string into command, args, and environment.
+  67|         
+  68|         Args:
+  69|             command: Full MCP command string
+  70|             env_vars: Optional comma-separated environment variables (KEY=value,KEY2=value2)
+  71|             
+  72|         Returns:
+  73|             Tuple of (command, args, env_dict)
+  74|             
+  75|         Raises:
+  76|             ValueError: If the command executable is not in the allowed list.
+  77|         """
+  78|         # Parse command using shell-like splitting
+  79|         parts = shlex.split(command)
+  80|         if not parts:
+  81|             return "", [], {}
+  82|         
+  83|         cmd = parts[0]
+  84|         args = parts[1:] if len(parts) > 1 else []
+  85|         
+  86|         # Validate executable against allowlist
+  87|         basename = os.path.basename(cmd)
+  88|         if basename not in ALLOWED_MCP_COMMANDS:
+  89|             raise ValueError(
+  90|                 f"Command '{cmd}' is not in the allowed MCP executables list. "
+  91|                 f"Allowed: {', '.join(sorted(ALLOWED_MCP_COMMANDS - {c for c in ALLOWED_MCP_COMMANDS if '.' in c}))}"
+  92|             )
+  93|         
+  94|         # Parse environment variables
+  95|         env = {}
+  96|         if env_vars:
+  97|             for pair in env_vars.split(','):
+  98|                 if '=' in pair:
+  99|                     key, value = pair.split('=', 1)
+ 100|                     env[key.strip()] = value.strip()
+ 101|         
+ 102|         return cmd, args, env
+ 103|     
+ 104|     def create_mcp_tools(self, command: str, env_vars: str = None, timeout: int = 30) -> Any:
+ 105|         """
+ 106|         Create MCP tools from command.
+ 107|         
+ 108|         Args:
+ 109|             command: MCP server command
+ 110|             env_vars: Optional environment variables
+ 111|             timeout: Connection timeout in seconds
+ 112|             
+ 113|         Returns:
+ 114|             MCP instance or None if unavailable
+ 115|         """
+ 116|         available, msg = self.check_dependencies()
+ 117|         if not available:
+ 118|             self.print_status(msg, "error")
+ 119|             return None
+ 120|         
+ 121|         from praisonaiagents import MCP
+ 122|         
+ 123|         try:
+ 124|             cmd, args, env = self.parse_mcp_command(command, env_vars)
+ 125|         except ValueError as e:
+ 126|             self.print_status(str(e), "error")
+ 127|             return None
+ 128|         
+ 129|         if not cmd:
+ 130|             self.print_status("Invalid MCP command", "error")
+ 131|             return None
+ 132|         
+ 133|         try:
+ 134|             mcp = MCP(
+ 135|                 command=cmd,
+ 136|                 args=args,
+ 137|                 env=env if env else None,
+ 138|                 timeout=timeout
+ 139|             )
+ 140|             self.print_status(f"🔌 MCP server connected: {cmd}", "success")
+ 141|             return mcp
+ 142|         except Exception as e:
+ 143|             self.print_status(f"Failed to connect to MCP server: {e}", "error")
+ 144|             return None
+ 145|     
+ 146|     def apply_to_agent_config(self, config: Dict[str, Any], flag_value: Any) -> Dict[str, Any]:
+ 147|         """
+ 148|         Apply MCP configuration to agent config.
+ 149|         
+ 150|         Args:
+ 151|             config: Agent configuration dictionary
+ 152|             flag_value: MCP command string or dict with command and env
+ 153|             
+ 154|         Returns:
+ 155|             Modified configuration with MCP tools
+ 156|         """
+ 157|         if not flag_value:
+ 158|             return config
+ 159|         
+ 160|         # Handle both string and dict formats
+ 161|         if isinstance(flag_value, str):
+ 162|             mcp = self.create_mcp_tools(flag_value)
+ 163|         elif isinstance(flag_value, dict):
+ 164|             mcp = self.create_mcp_tools(
+ 165|                 flag_value.get('command', ''),
+ 166|                 flag_value.get('env', ''),
+ 167|                 flag_value.get('timeout', 30)
+ 168|             )
+ 169|         else:
+ 170|             return config
+ 171|         
+ 172|         if mcp:
+ 173|             # Add MCP tools to existing tools
+ 174|             existing_tools = config.get('tools', [])
+ 175|             if isinstance(existing_tools, list):
+ 176|                 existing_tools.extend(list(mcp))
+ 177|             else:
+ 178|                 existing_tools = list(mcp)
+ 179|             config['tools'] = existing_tools
+ 180|             config['_mcp_instance'] = mcp  # Store for cleanup
+ 181|         
+ 182|         return config
+ 183|     
+ 184|     def execute(self, command: str = None, env_vars: str = None, **kwargs) -> Any:
+ 185|         """
+ 186|         Execute MCP setup.
+ 187|         
+ 188|         Args:
+ 189|             command: MCP server command
+ 190|             env_vars: Environment variables
+ 191|             
+ 192|         Returns:
+ 193|             MCP instance or None
+ 194|         """
+ 195|         if not command:
+ 196|             self.print_status("No MCP command provided", "error")
+ 197|             return None
+ 198|         
+ 199|         return self.create_mcp_tools(command, env_vars)
+ 200| 
+ 201| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7974 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文通读）
+
+1. **入口点枚举**：
+   - L96-135 `NewBuildCmd`：CLI 参数 `PATH`、`--file`、`--local`、`--output`、`--tag`、`--builder-image`、`--builder-image-pull`、`--update-metadata`、`--validate-metadata`、`--btfgen`、`--btfhub-archive`。
+   - L155-170：读取用户提供的 `build.yaml`（YAML 反序列化 source）。
+   - L345：环境变量 `IG_SOURCE_PATH`。
+   - L372：环境变量 `SOURCE_DATE_EPOCH`。
+   - Docker socket（`client.FromEnv`，L347）作为间接通道。
+
+2. **数据流验证**：
+   - **流 A**：`build.yaml` 的 `ebpfsource/wasm/metadata` → `buildCmd()`（L128-149）拼入 make 命令行参数 → `exec.Command`（L246）。这是本地开发者对自己机器执行命令，source 与 sink 同属调用者信任域，无提权边界跨越；且参数以 argv 形式传递而非 shell 字符串拼接，无 shell 注入面。非漏洞。
+   - **流 B**：`opts.btfhubarchive` → bind mount Source（L394-398）→ 容器内 `/btfhub-archive`。同样是本地用户自愿挂载自己的目录。非漏洞。
+   - **流 C**：`IG_SOURCE_PATH` → `pathHost` → bind mount `/work`（L385-390）。L354-358 用 `strings.HasPrefix(cwd, inspektorGadetSrcPath)` 校验——该前缀检查可被 `/ig-src` vs `/ig-src-evil` 绕过，属于不严谨的校验；但 `IG_SOURCE_PATH` 本身就是运行者自己设置的环境变量，挂载的是运行者本机目录，不存在跨信任边界的攻击者可控输入，故不构成可利用漏洞。
+   - **流 D**：`opts.path` → `os.Chdir`（L191-195）。路径遍历无意义——用户本来就有任意文件系统访问权。
+   - **流 E**：`opts.builderImage` → `pullImage`/`ContainerCreate.Image`。镜像名由本地用户指定，拉取任意镜像是预期功能。
+   - **流 F**：`SOURCE_DATE_EPOCH` → `strconv.ParseInt`（L372-379），已做错误处理，仅影响时间戳字符串。
+
+3. **第二入口/替代通道**：Docker API 通道中所有容器配置均由上述本地输入派生；`helpersFS` 为 embed 只读内容写入 outputDir（L215-228），不可控。
+
+4. **结论**：所有 source→sink 流均在单一信任域（本地运行 CLI 的用户）内完成，无远程攻击者可控输入到达敏感 sink；exec 使用 argv 数组避免 shell 解释；YAML 用 `yaml.Unmarshal` 到强类型结构体，无反序列化代码执行风险。未发现可利用安全漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文入口点包括 CLI 参数、build.yaml 文件、IG_SOURCE_PATH 与 SOURCE_DATE_EPOCH 环境变量及 Docker socket。所有数据流的 source 与 sink 均处于同一信任域：运行该构建命令的本地用户。exec.Command 使用 argv 数组传递参数而非 shell 拼接，无命令注入面；docker bind mount 与 builder image 引用均为用户自愿指定的本机资源；yaml.Unmarshal 解析到强类型结构体，无反序列化执行风险。L354 的 strings.HasPrefix 校验虽不够严谨（可用前缀相似路径绕过），但 IG_SOURCE_PATH 本身由同一用户设置，不构成跨信任边界攻击面。", "fix_suggestion": "no fix needed"}
+
+### id=7975 teacher=unknown flags=[]
+[ANALYSIS]
+# MCPHandler 安全分析（全文逐函数）
+
+## 一、入口点枚举（全文覆盖）
+
+本文件无 HTTP 路由，入口点为 CLI 层面的调用链：
+
+1. **`execute()`（第 152–166 行）**：CLI `--mcp` 与 `--mcp-env` 标志的最终分发入口。`command` 来自用户命令行参数，`env_vars` 同理。
+2. **`apply_to_agent_config()`（第 106–150 行）**：第二入口。`flag_value` 可为字符串或字典（含 `command`、`env`、`timeout` 键），同样源自 CLI 参数解析。
+3. **环境变量通道**：`--mcp-env "KEY=value"` 经 `parse_mcp_command()` 第 84–89 行注入子进程 env——这是替代注入通道，需单独验证。
+4. **文件/回调**：本文件不读文件、不注册回调；`check_dependencies()` 仅做 import 探测。
+
+## 二、source→sink 数据流逐条验证
+
+### 流 1：CLI command → shlex.split → 白名单校验 → 子进程执行
+
+- source：第 153 行 `command: str = None` 参数（CLI 用户输入）。
+- 中间处理：第 68 行 `shlex.split(command)` —— 正确的 shell 级拆分，防止引号逃逸拼接。
+- sink：第 137–142 行 `MCP(command=cmd, args=args, ...)`，最终由 praisonaiagents SDK 以 stdio 方式 spawn 子进程。
+- 防御验证：第 75–81 行取 `os.path.basename(cmd)` 后比对 `ALLOWED_MCP_COMMANDS`（第 17–31 行）。关键点：
+  - basename 校验阻断了路径遍历写法（如 `/bin/sh`、`../../evil.py`），因为 basename 必须命中白名单；
+  - 白名单内均为 npx/node/python/docker 等**本身即代码执行器**的工具。但注释（第 14–15 行）明确声明这是有意设计：SDK 的 MCP() 类“intentionally unrestricted — developers control their own inputs”，CLI 层白名单是产品边界而非安全边界；
+  - 绕过评估：即使绕过白名单（例如通过 `npx -y <恶意包>` 拉取任意 npm 包，或 `python -c '...'`），其前提是攻击者已能控制 CLI 命令行参数——本地 CLI 用户运行任意命令本就是其自身权限内的操作，不构成权限提升。此威胁模型下不算漏洞。
+
+### 流 2：env_vars → env dict → 子进程环境
+
+- source：第 154 行 `env_vars` / 第 121 行 `flag_value.get('env', '')`。
+- 处理：第 84–89 行按逗号切分、`split('=', 1)` 构造 dict，仅 `.strip()` 清洗。
+- sink：第 139 行 `MCP(..., env=env ...)`。
+- 验证：无过滤键名，理论上可注入 `LD_PRELOAD`、`PATH` 等敏感变量以影响子进程加载行为。但同样受限于威胁模型：输入者即本机 CLI 用户，可设置任意进程环境，无越权边界被突破。且 env 只传给白名单内的可信启动器。判定：非有效漏洞。
+
+### 流 3：apply_to_agent_config 字典分支
+
+- 第 117–124 行：dict 输入直接透传给 `create_mcp_tools`，最终仍走流 1 的同一白名单校验（第 75 行），防御一致有效。无旁路。
+
+### 流 4：错误信息回显
+
+- 第 79–82 行 ValueError 含原始 `cmd`，第 91 行 print_status 回显；第 145 行异常信息回显。CLI 场景输出到终端，无 HTML/XSS sink，无日志注入型持久化 sink。无害。
+
+### 流 5：check_dependencies（第 44–57 行）
+
+- 仅 `importlib.util.find_spec` 与 import，无外部输入参与，无 sink。
+
+## 三、第二入口与替代通道核查
+
+- `execute()` 与 `apply_to_agent_config()` 是两条独立入口，但均收敛到 `create_mcp_tools()` → `parse_mcp_command()`，校验逻辑单点化（第 75 行），不存在跳过白名单的第三条路径。
+- 全文搜索确认没有 `eval/exec/os.system/subprocess.Popen(shell=True)` 直接调用；唯一执行 sink 在 SDK 内部，且受白名单前置约束。
+- timeout 参数（第 122 行）来自 dict，类型未强校验，但仅作连接超时数值使用，非危险 sink。
+
+## 四、结论依据
+
+所有 source→sink 流均经过单点白名单校验；白名单“过宽”（允许 python/npx 等通用执行器）在 CLI 本地工具语境下与项目声明的威胁模型一致（开发者自控输入），不构成跨信任边界的注入。无黑名单式可绕过过滤，无 shell=True 拼接，无未校验的反序列化。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文两条入口 execute 与 apply_to_agent_config 均收敛至 parse_mcp_command 第75行的 basename 白名单校验, shlex.split 正确拆分, 无 shell=True 拼接或 eval 类 sink; 白名单允许 python/npx 等通用执行器属有意设计(第14-15行注释), 威胁模型为本地开发者自控输入, 不构成跨信任边界漏洞; env_vars 注入通道同理受限; 错误回显仅输出终端无 XSS sink.", "fix_suggestion": "no fix needed"}

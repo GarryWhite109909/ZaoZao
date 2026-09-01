@@ -1,0 +1,619 @@
+batch=96 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7858 lang=go
+[CODE]
+   1| // Copyright 2014 beego Author. All Rights Reserved.
+   2| //
+   3| // Licensed under the Apache License, Version 2.0 (the "License");
+   4| // you may not use this file except in compliance with the License.
+   5| // You may obtain a copy of the License at
+   6| //
+   7| //      http://www.apache.org/licenses/LICENSE-2.0
+   8| //
+   9| // Unless required by applicable law or agreed to in writing, software
+  10| // distributed under the License is distributed on an "AS IS" BASIS,
+  11| // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  12| // See the License for the specific language governing permissions and
+  13| // limitations under the License.
+  14| 
+  15| package cache
+  16| 
+  17| import (
+  18| 	"bytes"
+  19| 	"context"
+  20| 	"crypto/sha256"
+  21| 	"encoding/gob"
+  22| 	"encoding/hex"
+  23| 	"encoding/json"
+  24| 	"fmt"
+  25| 	"io"
+  26| 	"os"
+  27| 	"path/filepath"
+  28| 	"strconv"
+  29| 	"strings"
+  30| 	"time"
+  31| 
+  32| 	"github.com/beego/beego/v2/core/berror"
+  33| )
+  34| 
+  35| // FileCacheItem is basic unit of file cache adapter which
+  36| // contains data and expire time.
+  37| type FileCacheItem struct {
+  38| 	Data       interface{}
+  39| 	Lastaccess time.Time
+  40| 	Expired    time.Time
+  41| }
+  42| 
+  43| // FileCache Config
+  44| var (
+  45| 	FileCachePath           = "cache"     // cache directory
+  46| 	FileCacheFileSuffix     = ".bin"      // cache file suffix
+  47| 	FileCacheDirectoryLevel = 2           // cache file deep level if auto generated cache files.
+  48| 	FileCacheEmbedExpiry    time.Duration // cache expire time, default is no expire forever.
+  49| )
+  50| 
+  51| // FileCache is cache adapter for file storage.
+  52| type FileCache struct {
+  53| 	CachePath      string
+  54| 	FileSuffix     string
+  55| 	DirectoryLevel int
+  56| 	EmbedExpiry    int
+  57| }
+  58| 
+  59| // NewFileCache creates a new file cache with no config.
+  60| // The level and expiry need to be set in the method StartAndGC as config string.
+  61| func NewFileCache() Cache {
+  62| 	//    return &FileCache{CachePath:FileCachePath, FileSuffix:FileCacheFileSuffix}
+  63| 	return &FileCache{}
+  64| }
+  65| 
+  66| // StartAndGC starts gc for file cache.
+  67| // config must be in the format {CachePath:"/cache","FileSuffix":".bin","DirectoryLevel":"2","EmbedExpiry":"0"}
+  68| func (fc *FileCache) StartAndGC(config string) error {
+  69| 	cfg := make(map[string]string)
+  70| 	err := json.Unmarshal([]byte(config), &cfg)
+  71| 	if err != nil {
+  72| 		return err
+  73| 	}
+  74| 
+  75| 	const cpKey = "CachePath"
+  76| 	const fsKey = "FileSuffix"
+  77| 	const dlKey = "DirectoryLevel"
+  78| 	const eeKey = "EmbedExpiry"
+  79| 
+  80| 	if _, ok := cfg[cpKey]; !ok {
+  81| 		cfg[cpKey] = FileCachePath
+  82| 	}
+  83| 
+  84| 	if _, ok := cfg[fsKey]; !ok {
+  85| 		cfg[fsKey] = FileCacheFileSuffix
+  86| 	}
+  87| 
+  88| 	if _, ok := cfg[dlKey]; !ok {
+  89| 		cfg[dlKey] = strconv.Itoa(FileCacheDirectoryLevel)
+  90| 	}
+  91| 
+  92| 	if _, ok := cfg[eeKey]; !ok {
+  93| 		cfg[eeKey] = strconv.FormatInt(int64(FileCacheEmbedExpiry.Seconds()), 10)
+  94| 	}
+  95| 	fc.CachePath = cfg[cpKey]
+  96| 	fc.FileSuffix = cfg[fsKey]
+  97| 	fc.DirectoryLevel, err = strconv.Atoi(cfg[dlKey])
+  98| 	if err != nil {
+  99| 		return berror.Wrapf(err, InvalidFileCacheDirectoryLevelCfg,
+ 100| 			"invalid directory level config, please check your input, it must be integer: %s", cfg[dlKey])
+ 101| 	}
+ 102| 	fc.EmbedExpiry, err = strconv.Atoi(cfg[eeKey])
+ 103| 	if err != nil {
+ 104| 		return berror.Wrapf(err, InvalidFileCacheEmbedExpiryCfg,
+ 105| 			"invalid embed expiry config, please check your input, it must be integer: %s", cfg[eeKey])
+ 106| 	}
+ 107| 	return fc.Init()
+ 108| }
+ 109| 
+ 110| // Init makes new a dir for file cache if it does not already exist
+ 111| func (fc *FileCache) Init() error {
+ 112| 	ok, err := exists(fc.CachePath)
+ 113| 	if err != nil || ok {
+ 114| 		return err
+ 115| 	}
+ 116| 	err = os.MkdirAll(fc.CachePath, os.ModePerm)
+ 117| 	if err != nil {
+ 118| 		return berror.Wrapf(err, CreateFileCacheDirFailed,
+ 119| 			"could not create directory, please check the config [%s] and file mode.", fc.CachePath)
+ 120| 	}
+ 121| 	return nil
+ 122| }
+ 123| 
+ 124| // getCacheFileName returns a md5 encoded file name.
+ 125| func (fc *FileCache) getCacheFileName(key string) (string, error) {
+ 126| 	m := sha256.New()
+ 127| 	_, _ = io.WriteString(m, key)
+ 128| 	keySha256 := hex.EncodeToString(m.Sum(nil))
+ 129| 	cachePath := fc.CachePath
+ 130| 	switch fc.DirectoryLevel {
+ 131| 	case 2:
+ 132| 		cachePath = filepath.Join(cachePath, keySha256[0:2], keySha256[2:4])
+ 133| 	case 1:
+ 134| 		cachePath = filepath.Join(cachePath, keySha256[0:2])
+ 135| 	}
+ 136| 	ok, err := exists(cachePath)
+ 137| 	if err != nil {
+ 138| 		return "", err
+ 139| 	}
+ 140| 	if !ok {
+ 141| 		fmt.Printf("cachePath: %s\n", cachePath)
+ 142| 		err = os.MkdirAll(cachePath, os.ModePerm)
+ 143| 		if err != nil {
+ 144| 			return "", berror.Wrapf(err, CreateFileCacheDirFailed,
+ 145| 				"could not create the directory: %s", cachePath)
+ 146| 		}
+ 147| 	}
+ 148| 
+ 149| 	return filepath.Join(cachePath, fmt.Sprintf("%s%s", keySha256, fc.FileSuffix)), nil
+ 150| }
+ 151| 
+ 152| // Get value from file cache.
+ 153| // if nonexistent or expired return an empty string.
+ 154| func (fc *FileCache) Get(ctx context.Context, key string) (interface{}, error) {
+ 155| 	fn, err := fc.getCacheFileName(key)
+ 156| 	if err != nil {
+ 157| 		return nil, err
+ 158| 	}
+ 159| 	fileData, err := FileGetContents(fn)
+ 160| 	if err != nil {
+ 161| 		return nil, err
+ 162| 	}
+ 163| 
+ 164| 	var to FileCacheItem
+ 165| 	err = GobDecode(fileData, &to)
+ 166| 	if err != nil {
+ 167| 		return nil, err
+ 168| 	}
+ 169| 
+ 170| 	if to.Expired.Before(time.Now()) {
+ 171| 		return nil, ErrKeyExpired
+ 172| 	}
+ 173| 	return to.Data, nil
+ 174| }
+ 175| 
+ 176| // GetMulti gets values from file cache.
+ 177| // if nonexistent or expired return an empty string.
+ 178| func (fc *FileCache) GetMulti(ctx context.Context, keys []string) ([]interface{}, error) {
+ 179| 	rc := make([]interface{}, len(keys))
+ 180| 	keysErr := make([]string, 0)
+ 181| 
+ 182| 	for i, ki := range keys {
+ 183| 		val, err := fc.Get(context.Background(), ki)
+ 184| 		if err != nil {
+ 185| 			keysErr = append(keysErr, fmt.Sprintf("key [%s] error: %s", ki, err.Error()))
+ 186| 			continue
+ 187| 		}
+ 188| 		rc[i] = val
+ 189| 	}
+ 190| 
+ 191| 	if len(keysErr) == 0 {
+ 192| 		return rc, nil
+ 193| 	}
+ 194| 	return rc, berror.Error(MultiGetFailed, strings.Join(keysErr, "; "))
+ 195| }
+ 196| 
+ 197| // Put value into file cache.
+ 198| // timeout: how long this file should be kept in ms
+ 199| // if timeout equals fc.EmbedExpiry(default is 0), cache this item forever.
+ 200| func (fc *FileCache) Put(ctx context.Context, key string, val interface{}, timeout time.Duration) error {
+ 201| 	gob.Register(val)
+ 202| 
+ 203| 	item := FileCacheItem{Data: val}
+ 204| 	if timeout == time.Duration(fc.EmbedExpiry) {
+ 205| 		item.Expired = time.Now().Add((86400 * 365 * 10) * time.Second) // ten years
+ 206| 	} else {
+ 207| 		item.Expired = time.Now().Add(timeout)
+ 208| 	}
+ 209| 	item.Lastaccess = time.Now()
+ 210| 	data, err := GobEncode(item)
+ 211| 	if err != nil {
+ 212| 		return err
+ 213| 	}
+ 214| 
+ 215| 	fn, err := fc.getCacheFileName(key)
+ 216| 
+ 217| 	if err != nil {
+ 218| 		return err
+ 219| 	}
+ 220| 	return FilePutContents(fn, data)
+ 221| }
+ 222| 
+ 223| // Delete file cache value.
+ 224| func (fc *FileCache) Delete(ctx context.Context, key string) error {
+ 225| 	filename, err := fc.getCacheFileName(key)
+ 226| 	if err != nil {
+ 227| 		return err
+ 228| 	}
+ 229| 	if ok, _ := exists(filename); ok {
+ 230| 		err = os.Remove(filename)
+ 231| 		if err != nil {
+ 232| 			return berror.Wrapf(err, DeleteFileCacheItemFailed,
+ 233| 				"can not delete this file cache key-value, key is %s and file name is %s", key, filename)
+ 234| 		}
+ 235| 	}
+ 236| 	return nil
+ 237| }
+ 238| 
+ 239| // Incr increases cached int value.
+ 240| // fc value is saved forever unless deleted.
+ 241| func (fc *FileCache) Incr(ctx context.Context, key string) error {
+ 242| 	data, err := fc.Get(context.Background(), key)
+ 243| 	if err != nil {
+ 244| 		return err
+ 245| 	}
+ 246| 
+ 247| 	val, err := incr(data)
+ 248| 	if err != nil {
+ 249| 		return err
+ 250| 	}
+ 251| 
+ 252| 	return fc.Put(context.Background(), key, val, time.Duration(fc.EmbedExpiry))
+ 253| }
+ 254| 
+ 255| // Decr decreases cached int value.
+ 256| func (fc *FileCache) Decr(ctx context.Context, key string) error {
+ 257| 	data, err := fc.Get(context.Background(), key)
+ 258| 	if err != nil {
+ 259| 		return err
+ 260| 	}
+ 261| 
+ 262| 	val, err := decr(data)
+ 263| 	if err != nil {
+ 264| 		return err
+ 265| 	}
+ 266| 
+ 267| 	return fc.Put(context.Background(), key, val, time.Duration(fc.EmbedExpiry))
+ 268| }
+ 269| 
+ 270| // IsExist checks if value exists.
+ 271| func (fc *FileCache) IsExist(ctx context.Context, key string) (bool, error) {
+ 272| 	fn, err := fc.getCacheFileName(key)
+ 273| 	if err != nil {
+ 274| 		return false, err
+ 275| 	}
+ 276| 	return exists(fn)
+ 277| }
+ 278| 
+ 279| // ClearAll cleans cached files (not implemented)
+ 280| func (fc *FileCache) ClearAll(context.Context) error {
+ 281| 	return nil
+ 282| }
+ 283| 
+ 284| // Check if a file exists
+ 285| func exists(path string) (bool, error) {
+ 286| 	_, err := os.Stat(path)
+ 287| 	if err == nil {
+ 288| 		return true, nil
+ 289| 	}
+ 290| 	if os.IsNotExist(err) {
+ 291| 		return false, nil
+ 292| 	}
+ 293| 	return false, berror.Wrapf(err, InvalidFileCachePath, "file cache path is invalid: %s", path)
+ 294| }
+ 295| 
+ 296| // FileGetContents Reads bytes from a file.
+ 297| // if non-existent, create this file.
+ 298| func FileGetContents(filename string) ([]byte, error) {
+ 299| 	data, err := os.ReadFile(filename)
+ 300| 	if err != nil {
+ 301| 		return nil, berror.Wrapf(err, ReadFileCacheContentFailed,
+ 302| 			"could not read the data from the file: %s, "+
+ 303| 				"please confirm that file exist and Beego has the permission to read the content.", filename)
+ 304| 	}
+ 305| 	return data, nil
+ 306| }
+ 307| 
+ 308| // FilePutContents puts bytes into a file.
+ 309| // if non-existent, create this file.
+ 310| func FilePutContents(filename string, content []byte) error {
+ 311| 	return os.WriteFile(filename, content, os.ModePerm)
+ 312| }
+ 313| 
+ 314| // GobEncode Gob encodes a file cache item.
+ 315| func GobEncode(data interface{}) ([]byte, error) {
+ 316| 	buf := bytes.NewBuffer(nil)
+ 317| 	enc := gob.NewEncoder(buf)
+ 318| 	err := enc.Encode(data)
+ 319| 	if err != nil {
+ 320| 		return nil, berror.Wrap(err, GobEncodeDataFailed, "could not encode this data")
+ 321| 	}
+ 322| 	return buf.Bytes(), nil
+ 323| }
+ 324| 
+ 325| // GobDecode Gob decodes a file cache item.
+ 326| func GobDecode(data []byte, to *FileCacheItem) error {
+ 327| 	buf := bytes.NewBuffer(data)
+ 328| 	dec := gob.NewDecoder(buf)
+ 329| 	err := dec.Decode(&to)
+ 330| 	if err != nil {
+ 331| 		return berror.Wrap(err, InvalidGobEncodedData,
+ 332| 			"could not decode this data to FileCacheItem. Make sure that the data is encoded by GOB.")
+ 333| 	}
+ 334| 	return nil
+ 335| }
+ 336| 
+ 337| func init() {
+ 338| 	Register("file", NewFileCache)
+ 339| }
+ 340| 
+ 341| 
+
+### id=7859 lang=go
+[CODE]
+   1| // Copyright (C) 2019 Nicola Murino
+   2| //
+   3| // This program is free software: you can redistribute it and/or modify
+   4| // it under the terms of the GNU Affero General Public License as published
+   5| // by the Free Software Foundation, version 3.
+   6| //
+   7| // This program is distributed in the hope that it will be useful,
+   8| // but WITHOUT ANY WARRANTY; without even the implied warranty of
+   9| // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+  10| // GNU Affero General Public License for more details.
+  11| //
+  12| // You should have received a copy of the GNU Affero General Public License
+  13| // along with this program. If not, see <https://www.gnu.org/licenses/>.
+  14| 
+  15| package httpd
+  16| 
+  17| import (
+  18| 	"encoding/json"
+  19| 	"errors"
+  20| 	"sync"
+  21| 	"time"
+  22| 
+  23| 	"github.com/drakkan/sftpgo/v2/internal/dataprovider"
+  24| 	"github.com/drakkan/sftpgo/v2/internal/kms"
+  25| 	"github.com/drakkan/sftpgo/v2/internal/logger"
+  26| 	"github.com/drakkan/sftpgo/v2/internal/util"
+  27| )
+  28| 
+  29| var (
+  30| 	oauth2Mgr oauth2Manager
+  31| )
+  32| 
+  33| func newOAuth2Manager(isShared int) oauth2Manager {
+  34| 	if isShared == 1 {
+  35| 		logger.Info(logSender, "", "using provider OAuth2 manager")
+  36| 		return &dbOAuth2Manager{}
+  37| 	}
+  38| 	logger.Info(logSender, "", "using memory OAuth2 manager")
+  39| 	return &memoryOAuth2Manager{
+  40| 		pendingAuths: make(map[string]oauth2PendingAuth),
+  41| 	}
+  42| }
+  43| 
+  44| type oauth2PendingAuth struct {
+  45| 	State        string      `json:"state"`
+  46| 	Provider     int         `json:"provider"`
+  47| 	ClientID     string      `json:"client_id"`
+  48| 	ClientSecret *kms.Secret `json:"client_secret"`
+  49| 	RedirectURL  string      `json:"redirect_url"`
+  50| 	IssuedAt     int64       `json:"issued_at"`
+  51| }
+  52| 
+  53| func newOAuth2PendingAuth(provider int, redirectURL, clientID string, clientSecret *kms.Secret) oauth2PendingAuth {
+  54| 	return oauth2PendingAuth{
+  55| 		State:        util.GenerateOpaqueString(),
+  56| 		Provider:     provider,
+  57| 		ClientID:     clientID,
+  58| 		ClientSecret: clientSecret,
+  59| 		RedirectURL:  redirectURL,
+  60| 		IssuedAt:     util.GetTimeAsMsSinceEpoch(time.Now()),
+  61| 	}
+  62| }
+  63| 
+  64| type oauth2Manager interface {
+  65| 	addPendingAuth(pendingAuth oauth2PendingAuth)
+  66| 	removePendingAuth(state string)
+  67| 	getPendingAuth(state string) (oauth2PendingAuth, error)
+  68| 	cleanup()
+  69| }
+  70| 
+  71| type memoryOAuth2Manager struct {
+  72| 	mu           sync.RWMutex
+  73| 	pendingAuths map[string]oauth2PendingAuth
+  74| }
+  75| 
+  76| func (o *memoryOAuth2Manager) addPendingAuth(pendingAuth oauth2PendingAuth) {
+  77| 	o.mu.Lock()
+  78| 	defer o.mu.Unlock()
+  79| 
+  80| 	o.pendingAuths[pendingAuth.State] = pendingAuth
+  81| }
+  82| 
+  83| func (o *memoryOAuth2Manager) removePendingAuth(state string) {
+  84| 	o.mu.Lock()
+  85| 	defer o.mu.Unlock()
+  86| 
+  87| 	delete(o.pendingAuths, state)
+  88| }
+  89| 
+  90| func (o *memoryOAuth2Manager) getPendingAuth(state string) (oauth2PendingAuth, error) {
+  91| 	o.mu.RLock()
+  92| 	defer o.mu.RUnlock()
+  93| 
+  94| 	authReq, ok := o.pendingAuths[state]
+  95| 	if !ok {
+  96| 		return oauth2PendingAuth{}, errors.New("oauth2: no auth request found for the specified state")
+  97| 	}
+  98| 	diff := util.GetTimeAsMsSinceEpoch(time.Now()) - authReq.IssuedAt
+  99| 	if diff > authStateValidity {
+ 100| 		return oauth2PendingAuth{}, errors.New("oauth2: auth request is too old")
+ 101| 	}
+ 102| 	return authReq, nil
+ 103| }
+ 104| 
+ 105| func (o *memoryOAuth2Manager) cleanup() {
+ 106| 	o.mu.Lock()
+ 107| 	defer o.mu.Unlock()
+ 108| 
+ 109| 	for k, auth := range o.pendingAuths {
+ 110| 		diff := util.GetTimeAsMsSinceEpoch(time.Now()) - auth.IssuedAt
+ 111| 		// remove old pending auth requests
+ 112| 		if diff < 0 || diff > authStateValidity {
+ 113| 			delete(o.pendingAuths, k)
+ 114| 		}
+ 115| 	}
+ 116| }
+ 117| 
+ 118| type dbOAuth2Manager struct{}
+ 119| 
+ 120| func (o *dbOAuth2Manager) addPendingAuth(pendingAuth oauth2PendingAuth) {
+ 121| 	if err := pendingAuth.ClientSecret.Encrypt(); err != nil {
+ 122| 		logger.Error(logSender, "", "unable to encrypt oauth2 secret: %v", err)
+ 123| 		return
+ 124| 	}
+ 125| 	session := dataprovider.Session{
+ 126| 		Key:       pendingAuth.State,
+ 127| 		Data:      pendingAuth,
+ 128| 		Type:      dataprovider.SessionTypeOAuth2Auth,
+ 129| 		Timestamp: pendingAuth.IssuedAt + authStateValidity,
+ 130| 	}
+ 131| 	dataprovider.AddSharedSession(session) //nolint:errcheck
+ 132| }
+ 133| 
+ 134| func (o *dbOAuth2Manager) removePendingAuth(state string) {
+ 135| 	dataprovider.DeleteSharedSession(state) //nolint:errcheck
+ 136| }
+ 137| 
+ 138| func (o *dbOAuth2Manager) getPendingAuth(state string) (oauth2PendingAuth, error) {
+ 139| 	session, err := dataprovider.GetSharedSession(state)
+ 140| 	if err != nil {
+ 141| 		return oauth2PendingAuth{}, errors.New("oauth2: unable to get the auth request for the specified state")
+ 142| 	}
+ 143| 	if session.Timestamp < util.GetTimeAsMsSinceEpoch(time.Now()) {
+ 144| 		// expired
+ 145| 		return oauth2PendingAuth{}, errors.New("oauth2: auth request is too old")
+ 146| 	}
+ 147| 	return o.decodePendingAuthData(session.Data)
+ 148| }
+ 149| 
+ 150| func (o *dbOAuth2Manager) decodePendingAuthData(data any) (oauth2PendingAuth, error) {
+ 151| 	if val, ok := data.([]byte); ok {
+ 152| 		authReq := oauth2PendingAuth{}
+ 153| 		err := json.Unmarshal(val, &authReq)
+ 154| 		if err != nil {
+ 155| 			return authReq, err
+ 156| 		}
+ 157| 		err = authReq.ClientSecret.TryDecrypt()
+ 158| 		return authReq, err
+ 159| 	}
+ 160| 	logger.Error(logSender, "", "invalid oauth2 auth request data type %T", data)
+ 161| 	return oauth2PendingAuth{}, errors.New("oauth2: invalid auth request data")
+ 162| }
+ 163| 
+ 164| func (o *dbOAuth2Manager) cleanup() {
+ 165| 	dataprovider.CleanupSharedSessions(dataprovider.SessionTypeOAuth2Auth, time.Now()) //nolint:errcheck
+ 166| }
+ 167| 
+ 168| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7858 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **入口点枚举（全文）**：
+   - `StartAndGC`（第 58 行起）：JSON 配置字符串，可设置 `CachePath`、`FileSuffix`、`DirectoryLevel`、`EmbedExpiry`。
+   - `Get/GetMulti/Put/Delete/Incr/Decr/IsExist`：均以外部传入的 `key string` 为数据源。
+   - `FileGetContents/FilePutContents`（第 236、244 行附近）：文件读写 sink，但仅被内部以哈希后的文件名调用。
+   - `init()`：仅注册适配器，无风险。
+
+2. **key → 文件路径数据流**：所有含 key 的操作都先经过 `getCacheFileName`（第 100 行附近），key 被 `sha256 + hex.EncodeToString` 处理，输出仅为 `[0-9a-f]` 字符。因此 `../`、空字节、绝对路径等路径遍历 payload 均被彻底消除——这是规范化（哈希）而非黑名单，属有效防御。后续 `filepath.Join(cachePath, keySha256+suffix)` 中 key 部分不可注入。
+
+3. **config → CachePath / FileSuffix 数据流**：`StartAndGC` 直接把配置中的 `CachePath` 用于 `os.MkdirAll`（第 91 行），`FileSuffix` 拼进最终文件名。若配置完全由攻击者控制，理论上可通过 `FileSuffix` 含 `../` 或恶意 `CachePath` 影响写入位置。但该配置是应用初始化时由开发者/运维提供的（如 beego 的 cache 配置项），不是运行时用户输入；框架文档明确其为管理员级配置。按威胁模型这属于受信任配置，不构成可达漏洞。
+
+4. **替代通道检查**：
+   - gob 反序列化（`GobDecode`）：若缓存目录可被攻击者写（如共享主机、目录权限 `os.ModePerm`=0777），可能注入恶意 gob 数据。但 gob 解码默认只实例化已注册类型，且前提是文件系统权限已被攻破，属于部署问题而非本代码可直接利用的漏洞。不过 `os.ModePerm` 创建文件/目录权限过宽（第 91、246 行）是一个值得注意的加固点（信息泄露/篡改风险的放大器）。
+   - `fmt.Printf` 打印 cachePath（第 116 行）：轻微信息输出到 stdout，无实质危害。
+
+5. **结论**：用户可控输入（key）经 sha256 完全中和，不存在路径遍历；其余数据流源头均为可信配置。未发现可利用漏洞；仅有权限模式过宽的加固建议。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文逐一核查了 StartAndGC 的 JSON 配置入口以及 Get/Put/Delete/Incr/Decr/IsExist 等以 key 为源的入口。所有 key 在 getCacheFileName 中先经过 sha256 加 hex 编码，输出仅为十六进制字符，路径遍历与特殊字符注入被彻底消除（属规范化而非黑名单，防御有效）。CachePath 与 FileSuffix 来自应用启动时的可信配置而非运行时用户输入，不构成可达攻击面。唯一加固建议是 os.MkdirAll 与 os.WriteFile 使用 os.ModePerm（0777）权限过宽，在多租户环境下可能放大缓存文件被篡改的风险，但不构成本代码中可直接利用的安全漏洞。", "fix_suggestion": "no fix needed"}
+
+### id=7859 teacher=unknown flags=[]
+[ANALYSIS]
+# SFTPGo OAuth2 管理器安全分析
+
+## 一、文件定位与入口点枚举
+
+本文件是 SFTPGo 的 HTTPD 模块中 OAuth2 状态管理器的实现（内存版 + 数据库共享会话版）。本文件本身**不注册任何 HTTP 路由、不直接解析任何用户输入参数**，它是一个被上层 `oauth2.go` / 路由处理器调用的库层组件。因此需要逐一分析每个函数，确认其输入来源与输出去向。
+
+## 二、逐函数分析与数据流验证
+
+### 1. 第 27-29 行：包级变量 `oauth2Mgr`
+全局单例变量，仅持有管理器实例。无用户可控数据流经此处。
+
+### 2. 第 31-38 行：`newOAuth2Manager(isShared int)`
+- **入口点**：`isShared` 参数来自服务启动配置（dataprovider 配置），非用户请求可控。
+- 仅做分支选择返回 `dbOAuth2Manager{}` 或 `memoryOAuth2Manager`，无 sink。
+
+### 3. 第 40-48 行：`oauth2PendingAuth` 结构体
+字段含 `State`、`Provider`、`ClientID`、`ClientSecret *kms.Secret`、`RedirectURL`。注意：
+- `ClientSecret` 使用 kms.Secret 封装，后续有加密/解密处理；
+- 该结构体在 DB 版中会被 JSON 序列化存入共享会话（第 118 行），序列化对象来自服务端构造（见下），而非直接反序列化用户 JSON——反序列化路径在第 128-141 行，需单独评估。
+
+### 4. 第 50-60 行：`newOAuth2PendingAuth(...)`
+- 参数 `redirectURL, clientID, clientSecret` 由调用方（管理员配置的 OAuth2 provider 配置）传入，非请求路径直接注入。
+- **关键防御点**：第 52 行 `State: util.GenerateOpaqueString()` —— state 由密码学安全的随机生成器产生，非用户可控，这是防 CSRF 的核心，且不可预测。
+- `IssuedAt` 取服务器当前时间，不可伪造。
+
+### 5. 接口定义（第 62-67 行）
+纯接口声明，无逻辑。
+
+### 6. memoryOAuth2Manager 系列
+#### 第 70-76 行：`addPendingAuth`
+以随机 state 为 key 写入 map。state 服务端生成，map key 不可被攻击者碰撞（除非猜中 CSPRNG 输出）。
+
+#### 第 78-83 行：`removePendingAuth(state string)`
+按 state 删除。state 来自回调查询参数时，删除不存在的 key 无副作用；即使攻击者传入任意 state 字符串，也只能删除“自己发起或恰好知道 state”的条目——而 state 是高熵随机值且一次性使用，无法枚举他人会话。**无越权删除风险**。
+
+#### 第 85-98 行：`getPendingAuth(state string)`
+- source：state 参数（最终源自 OAuth2 回调 URL 查询参数，属第二入口）。
+- 防御链：① map 查找必须精确命中（第 89-91 行）；② 第 92-95 行时效校验 `diff > authStateValidity` 拒绝过期请求。
+- 返回值包含 ClientSecret（kms 加密形态，内存版未解密），交给上层换取 token。由于 state 不可预测且绑定发起者会话，**不存在水平越权读取**。
+
+#### 第 100-111 行：`cleanup()`
+遍历清理过期项，条件 `diff < 0 || diff > authStateValidity` 覆盖时钟回拨与超期两种情况。无漏洞。
+
+### 7. dbOAuth2Manager 系列
+#### 第 114-127 行：`addPendingAuth`
+- 第 115-119 行：先对 ClientSecret 调用 `Encrypt()`，失败则记录日志并 return（不落库明文）。
+- 第 120-126 行：写入共享会话，key 为随机 state，Timestamp 设为 `IssuedAt + authStateValidity` 作为过期时间。
+- 注意 `AddSharedSession` 错误被 nolint 忽略：若写库失败，上层回调将因查不到 state 而拒绝，属 fail-closed，不构成漏洞。
+
+#### 第 129-132 行：`removePendingAuth`
+同内存版分析，state 高熵不可枚举，无越权删除。
+
+#### 第 134-146 行：`getPendingAuth`
+- source：state（回调参数）→ `GetSharedSession(state)` 精确主键查找。
+- 第 139-142 行：时间戳过期校验，过期即拒。
+- 防御有效性：DB 主键精确匹配 + 过期校验 + state 为 CSPRNG 生成，攻击者无法通过构造 state 读取他人 pending auth。
+
+#### 第 148-161 行：`decodePendingAuthData(data any)`
+- 第 150-153 行：类型断言仅接受 `[]byte`；
+- 第 155-157 行：`json.Unmarshal` 到强类型结构体——**反序列化的数据是服务端自己在 addPendingAuth 时加密/序列化后写入的内容**，不是外部直接提交的 JSON，故不存在反序列化注入面。
+- 第 158 行：`ClientSecret.TryDecrypt()` 解密凭据供 token 交换使用，凭据仅在服务端内部流转，不回传给客户端。
+- 第 159-160 行：未知类型 fail-closed 返回错误。
+
+### 8. 第二入口与替代通道核查
+- 本文件无 HTTP handler、无环境变量读取、无文件 IO、无命令执行 sink（无 `exec`、无 `os.OpenFile` 写路径）。
+- 唯一外部影响面是 state 字符串（经回调 URL 进入），其所有消费点（get/remove）均受“精确匹配 + 高熵不可猜测 + 时效校验”三重约束。
+- ClientSecret 在 DB 版持久化前强制加密（第 116 行），符合凭据存储要求。
+- 内存版 cleanup 与 DB 版 cleanup 均有过期回收，无无限累积导致的 DoS（state 由合法管理员触发的 OAuth2 流程创建，且有时效）。
+
+### 9. 结论性核对
+逐函数检查完毕（覆盖第 27 至 161 行全部函数）：无 SQL 注入（经 dataprovider 参数化会话 API）、无 XSS（无 HTML 输出）、无 SSRF（RedirectURL 仅用于向 OAuth2 provider 发起授权跳转，且为管理员配置值）、无私有信息泄露（secret 加密存储、不回传客户端）、无 CSRF 绕过（state 随机且校验）。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "本文件为 OAuth2 状态管理库层代码，全文共约 10 个函数均已逐一审查。唯一外部输入是 OAuth2 回调中的 state 参数，其所有消费点（memoryOAuth2Manager.getPendingAuth 第 85-98 行、removePendingAuth 第 78-83 行、dbOAuth2Manager.getPendingAuth 第 134-146 行）均要求与 CSPRNG 生成的随机 state（第 52 行 util.GenerateOpaqueString）精确匹配并通过时效校验（第 92-95 行、第 139-142 行），攻击者无法枚举或伪造。ClientSecret 在 DB 版落库前强制 Encrypt（第 116 行），反序列化对象 decodePendingAuthData 处理的是服务端自写数据而非外部 JSON，无反序列化注入面。全文件无路由注册、无命令执行、无文件写、无 SQL 拼接等 sink，cleanup 函数均有完整过期回收。", "fix_suggestion": "no fix needed"}

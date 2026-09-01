@@ -1,0 +1,863 @@
+batch=100 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7872 lang=php
+[CODE]
+   1| <?php
+   2| 
+   3| /*
+   4|  * This file is part of the Symfony package.
+   5|  *
+   6|  * (c) Fabien Potencier <fabien@symfony.com>
+   7|  *
+   8|  * For the full copyright and license information, please view the LICENSE
+   9|  * file that was distributed with this source code.
+  10|  */
+  11| 
+  12| namespace Symfony\UX\LiveComponent\EventListener;
+  13| 
+  14| use Psr\Container\ContainerInterface;
+  15| use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+  16| use Symfony\Component\HttpFoundation\Exception\JsonException;
+  17| use Symfony\Component\HttpFoundation\Request;
+  18| use Symfony\Component\HttpFoundation\Response;
+  19| use Symfony\Component\HttpKernel\Event\ControllerEvent;
+  20| use Symfony\Component\HttpKernel\Event\ExceptionEvent;
+  21| use Symfony\Component\HttpKernel\Event\RequestEvent;
+  22| use Symfony\Component\HttpKernel\Event\ResponseEvent;
+  23| use Symfony\Component\HttpKernel\Event\ViewEvent;
+  24| use Symfony\Component\HttpKernel\Exception\MethodNotAllowedHttpException;
+  25| use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+  26| use Symfony\Component\HttpKernel\Exception\UnprocessableEntityHttpException;
+  27| use Symfony\Contracts\Service\ServiceSubscriberInterface;
+  28| use Symfony\UX\LiveComponent\Attribute\AsLiveComponent;
+  29| use Symfony\UX\LiveComponent\Attribute\LiveArg;
+  30| use Symfony\UX\LiveComponent\LiveComponentHydrator;
+  31| use Symfony\UX\LiveComponent\Metadata\LiveComponentMetadataFactory;
+  32| use Symfony\UX\TwigComponent\ComponentFactory;
+  33| use Symfony\UX\TwigComponent\ComponentMetadata;
+  34| use Symfony\UX\TwigComponent\ComponentRenderer;
+  35| use Symfony\UX\TwigComponent\MountedComponent;
+  36| 
+  37| /**
+  38|  * @author Kevin Bond <kevinbond@gmail.com>
+  39|  * @author Ryan Weaver <ryan@symfonycasts.com>
+  40|  *
+  41|  * @internal
+  42|  */
+  43| class LiveComponentSubscriber implements EventSubscriberInterface, ServiceSubscriberInterface
+  44| {
+  45|     private const HTML_CONTENT_TYPE = 'application/vnd.live-component+html';
+  46|     private const REDIRECT_HEADER = 'X-Live-Redirect';
+  47| 
+  48|     public function __construct(
+  49|         private ContainerInterface $container,
+  50|         private bool $testMode = true,
+  51|     ) {
+  52|     }
+  53| 
+  54|     public static function getSubscribedServices(): array
+  55|     {
+  56|         return [
+  57|             ComponentRenderer::class,
+  58|             ComponentFactory::class,
+  59|             LiveComponentHydrator::class,
+  60|             LiveComponentMetadataFactory::class,
+  61|         ];
+  62|     }
+  63| 
+  64|     public function onKernelRequest(RequestEvent $event): void
+  65|     {
+  66|         $request = $event->getRequest();
+  67| 
+  68|         if (!$this->isLiveComponentRequest($request)) {
+  69|             return;
+  70|         }
+  71| 
+  72|         if ($request->attributes->has('_controller')) {
+  73|             return;
+  74|         }
+  75| 
+  76|         // the default "action" is get, which does nothing
+  77|         $action = $request->attributes->get('_live_action', 'get');
+  78|         $componentName = (string) $request->attributes->get('_live_component');
+  79| 
+  80|         $request->attributes->set('_component_name', $componentName);
+  81| 
+  82|         try {
+  83|             /** @var ComponentMetadata $metadata */
+  84|             $metadata = $this->container->get(ComponentFactory::class)->metadataFor($componentName);
+  85|         } catch (\InvalidArgumentException $e) {
+  86|             throw new NotFoundHttpException(\sprintf('Component "%s" not found.', $componentName), $e);
+  87|         }
+  88| 
+  89|         if (!$metadata->get('live', false)) {
+  90|             throw new NotFoundHttpException(\sprintf('"%s" (%s) is not a Live Component.', $metadata->getClass(), $componentName));
+  91|         }
+  92| 
+  93|         if ('get' === $action) {
+  94|             $defaultAction = trim($metadata->get('default_action', '__invoke'), '()');
+  95| 
+  96|             // set default controller for "default" action
+  97|             $request->attributes->set('_controller', \sprintf('%s::%s', $metadata->getServiceId(), $defaultAction));
+  98|             $request->attributes->set('_component_default_action', true);
+  99| 
+ 100|             return;
+ 101|         }
+ 102| 
+ 103|         if (!$request->isMethod('post')) {
+ 104|             throw new MethodNotAllowedHttpException(['POST']);
+ 105|         }
+ 106| 
+ 107|         if ('_batch' === $action) {
+ 108|             // use batch controller
+ 109|             $data = $this->parseDataFor($request);
+ 110| 
+ 111|             $request->attributes->set('_controller', 'ux.live_component.batch_action_controller');
+ 112|             $request->attributes->set('serviceId', $metadata->getServiceId());
+ 113|             $request->attributes->set('actions', $data['actions']);
+ 114|             $request->attributes->set('_mounted_component', $this->hydrateComponent(
+ 115|                 $this->container->get(ComponentFactory::class)->get($componentName),
+ 116|                 $componentName,
+ 117|                 $request
+ 118|             ));
+ 119|             $request->attributes->set('_is_live_batch_action', true);
+ 120| 
+ 121|             return;
+ 122|         }
+ 123| 
+ 124|         $request->attributes->set('_controller', \sprintf('%s::%s', $metadata->getServiceId(), $action));
+ 125|     }
+ 126| 
+ 127|     public function onKernelController(ControllerEvent $event): void
+ 128|     {
+ 129|         $request = $event->getRequest();
+ 130| 
+ 131|         if (!$this->isLiveComponentRequest($request)) {
+ 132|             return;
+ 133|         }
+ 134| 
+ 135|         if ($request->attributes->get('_is_live_batch_action')) {
+ 136|             return;
+ 137|         }
+ 138| 
+ 139|         $controller = $event->getController();
+ 140| 
+ 141|         if (!\is_array($controller) || 2 !== \count($controller)) {
+ 142|             throw new \RuntimeException('Not a valid live component.');
+ 143|         }
+ 144| 
+ 145|         [$component, $action] = $controller;
+ 146| 
+ 147|         if (!\is_object($component)) {
+ 148|             throw new \RuntimeException('Not a valid live component.');
+ 149|         }
+ 150| 
+ 151|         if (!$request->attributes->get('_component_default_action', false) && !AsLiveComponent::isActionAllowed($component, $action)) {
+ 152|             throw new NotFoundHttpException(\sprintf('The action "%s" either doesn\'t exist or is not allowed in "%s". Make sure it exist and has the LiveAction attribute above it.', $action, $component::class));
+ 153|         }
+ 154| 
+ 155|         $componentName = $request->attributes->get('_component_name') ?? $request->attributes->get('_mounted_component')->getName();
+ 156|         $requestMethod = $this->container->get(ComponentFactory::class)->metadataFor($componentName)?->get('method') ?? 'post';
+ 157| 
+ 158|         /**
+ 159|          * $requestMethod 'post' allows POST requests only
+ 160|          * $requestMethod 'get' allows GET and POST requests.
+ 161|          */
+ 162|         if ($request->isMethod('get') && 'post' === $requestMethod) {
+ 163|             throw new MethodNotAllowedHttpException([strtoupper($requestMethod)]);
+ 164|         }
+ 165| 
+ 166|         /*
+ 167|          * Either we:
+ 168|          *      A) We do NOT have a _mounted_component, so hydrate $component
+ 169|          *          (normal situation, rendering a single component)
+ 170|          *      B) We DO have a _mounted_component, so no need to hydrate,
+ 171|          *          but we DO need to make sure it's set as the controller.
+ 172|          *          (sub-request during batch controller)
+ 173|          */
+ 174|         if (!$request->attributes->has('_mounted_component')) {
+ 175|             $request->attributes->set('_mounted_component', $this->hydrateComponent(
+ 176|                 $component,
+ 177|                 $request->attributes->get('_component_name'),
+ 178|                 $request
+ 179|             ));
+ 180|         } else {
+ 181|             // override the component with our already-mounted version
+ 182|             $component = $request->attributes->get('_mounted_component')->getComponent();
+ 183|             $event->setController([
+ 184|                 $component,
+ 185|                 $action,
+ 186|             ]);
+ 187|         }
+ 188| 
+ 189|         // read the action arguments from the request, unless they're already set (batch sub-requests)
+ 190|         $actionArguments = $request->attributes->get('_component_action_args', $this->parseDataFor($request)['args']);
+ 191|         // extra variables to be made available to the controller
+ 192|         // (for "actions" only)
+ 193|         foreach (LiveArg::liveArgs($component, $action) as $parameter => $arg) {
+ 194|             if (isset($actionArguments[$arg])) {
+ 195|                 $request->attributes->set($parameter, $actionArguments[$arg]);
+ 196|             }
+ 197|         }
+ 198|     }
+ 199| 
+ 200|     /**
+ 201|      * @return array{
+ 202|      *     data: array,
+ 203|      *     args: array,
+ 204|      *     actions: array
+ 205|      *     // has "fingerprint" and "tag" string key, keyed by component id
+ 206|      *     children: array
+ 207|      *     propsFromParent: array
+ 208|      * }
+ 209|      */
+ 210|     private static function parseDataFor(Request $request): array
+ 211|     {
+ 212|         if (!$request->attributes->has('_live_request_data')) {
+ 213|             if ($request->query->has('props')) {
+ 214|                 $liveRequestData = [
+ 215|                     'props' => self::parseJsonFromQuery($request, 'props'),
+ 216|                     'updated' => self::parseJsonFromQuery($request, 'updated'),
+ 217|                     'args' => [],
+ 218|                     'actions' => [],
+ 219|                     'children' => self::parseJsonFromQuery($request, 'children'),
+ 220|                     'propsFromParent' => self::parseJsonFromQuery($request, 'propsFromParent'),
+ 221|                 ];
+ 222|             } else {
+ 223|                 try {
+ 224|                     $requestData = json_decode($request->request->get('data'), true, 512, \JSON_BIGINT_AS_STRING | \JSON_THROW_ON_ERROR);
+ 225|                 } catch (\JsonException $e) {
+ 226|                     throw new JsonException('Could not decode request body.', $e->getCode(), $e);
+ 227|                 }
+ 228| 
+ 229|                 $liveRequestData = [
+ 230|                     'props' => $requestData['props'] ?? [],
+ 231|                     'updated' => $requestData['updated'] ?? [],
+ 232|                     'args' => $requestData['args'] ?? [],
+ 233|                     'actions' => $requestData['actions'] ?? [],
+ 234|                     'children' => $requestData['children'] ?? [],
+ 235|                     'propsFromParent' => $requestData['propsFromParent'] ?? [],
+ 236|                 ];
+ 237|             }
+ 238| 
+ 239|             $request->attributes->set('_live_request_data', $liveRequestData);
+ 240|         }
+ 241| 
+ 242|         return $request->attributes->get('_live_request_data');
+ 243|     }
+ 244| 
+ 245|     public function onKernelView(ViewEvent $event): void
+ 246|     {
+ 247|         if (!$this->isLiveComponentRequest($request = $event->getRequest())) {
+ 248|             return;
+ 249|         }
+ 250| 
+ 251|         if (!$event->isMainRequest()) {
+ 252|             // sub-request, so skip rendering
+ 253|             $event->setResponse(new Response());
+ 254| 
+ 255|             return;
+ 256|         }
+ 257| 
+ 258|         $mountedComponent = $request->attributes->get('_mounted_component');
+ 259|         if (!$request->attributes->get('_component_default_action', false)) {
+ 260|             // On custom action, props may be updated by the server side
+ 261|             $liveRequestData = $request->attributes->get('_live_request_data');
+ 262|             $liveRequestData['responseProps'] = (array) $mountedComponent->getComponent();
+ 263|             $request->attributes->set('_live_request_data', $liveRequestData);
+ 264|         }
+ 265| 
+ 266|         $event->setResponse($this->createResponse($mountedComponent));
+ 267|     }
+ 268| 
+ 269|     public function onKernelException(ExceptionEvent $event): void
+ 270|     {
+ 271|         if (!$this->isLiveComponentRequest($request = $event->getRequest())) {
+ 272|             return;
+ 273|         }
+ 274| 
+ 275|         if (!$event->getThrowable() instanceof UnprocessableEntityHttpException) {
+ 276|             return;
+ 277|         }
+ 278| 
+ 279|         // in case the exception was too early somehow
+ 280|         if (!$mounted = $request->attributes->get('_mounted_component')) {
+ 281|             return;
+ 282|         }
+ 283| 
+ 284|         $event->setResponse($this->createResponse($mounted));
+ 285|     }
+ 286| 
+ 287|     public function onKernelResponse(ResponseEvent $event): void
+ 288|     {
+ 289|         $request = $event->getRequest();
+ 290|         $response = $event->getResponse();
+ 291| 
+ 292|         if (!$event->isMainRequest()) {
+ 293|             return;
+ 294|         }
+ 295| 
+ 296|         if (!$this->isLiveComponentRequest($request)) {
+ 297|             return;
+ 298|         }
+ 299| 
+ 300|         if (!$response->isRedirection()) {
+ 301|             return;
+ 302|         }
+ 303| 
+ 304|         if ($this->testMode && !\in_array(self::HTML_CONTENT_TYPE, $request->getAcceptableContentTypes(), true)) {
+ 305|             // Make testing redirections easier
+ 306|             return;
+ 307|         }
+ 308| 
+ 309|         $responseNoContent = new Response(null, Response::HTTP_NO_CONTENT, [
+ 310|             self::REDIRECT_HEADER => '1',
+ 311|         ]);
+ 312| 
+ 313|         $responseNoContent->headers->add($response->headers->all());
+ 314| 
+ 315|         $event->setResponse($responseNoContent);
+ 316|     }
+ 317| 
+ 318|     public static function getSubscribedEvents(): array
+ 319|     {
+ 320|         return [
+ 321|             RequestEvent::class => 'onKernelRequest',
+ 322|             // positive priority in case other ControllerEvent listeners need the attributes we set
+ 323|             ControllerEvent::class => ['onKernelController', 10],
+ 324|             ViewEvent::class => 'onKernelView',
+ 325|             ResponseEvent::class => 'onKernelResponse',
+ 326|             // priority so that the exception is processed before it can be logged as an error
+ 327|             ExceptionEvent::class => ['onKernelException', 20],
+ 328|         ];
+ 329|     }
+ 330| 
+ 331|     private function createResponse(MountedComponent $mounted): Response
+ 332|     {
+ 333|         $component = $mounted->getComponent();
+ 334| 
+ 335|         foreach (AsLiveComponent::preReRenderMethods($component) as $method) {
+ 336|             $component->{$method->name}();
+ 337|         }
+ 338| 
+ 339|         return new Response($this->container->get(ComponentRenderer::class)->render($mounted), 200, [
+ 340|             'Content-Type' => self::HTML_CONTENT_TYPE,
+ 341|         ]);
+ 342|     }
+ 343| 
+ 344|     private function isLiveComponentRequest(Request $request): bool
+ 345|     {
+ 346|         if (!$request->attributes->has('_live_component')) {
+ 347|             return false;
+ 348|         }
+ 349| 
+ 350|         if ($this->testMode) {
+ 351|             return true;
+ 352|         }
+ 353| 
+ 354|         // Except when testing, require the correct content-type in the Accept header.
+ 355|         // This also acts as a CSRF protection since this can only be set in accordance with same-origin/CORS policies.
+ 356|         return \in_array(self::HTML_CONTENT_TYPE, $request->getAcceptableContentTypes(), true);
+ 357|     }
+ 358| 
+ 359|     private function hydrateComponent(object $component, string $componentName, Request $request): MountedComponent
+ 360|     {
+ 361|         $hydrator = $this->container->get(LiveComponentHydrator::class);
+ 362|         \assert($hydrator instanceof LiveComponentHydrator);
+ 363|         $metadataFactory = $this->container->get(LiveComponentMetadataFactory::class);
+ 364|         \assert($metadataFactory instanceof LiveComponentMetadataFactory);
+ 365| 
+ 366|         $componentAttributes = $hydrator->hydrate(
+ 367|             $component,
+ 368|             $this->parseDataFor($request)['props'],
+ 369|             $this->parseDataFor($request)['updated'],
+ 370|             $metadataFactory->getMetadata($componentName),
+ 371|             $this->parseDataFor($request)['propsFromParent']
+ 372|         );
+ 373| 
+ 374|         $mountedComponent = new MountedComponent($componentName, $component, $componentAttributes);
+ 375| 
+ 376|         $mountedComponent->addExtraMetadata(
+ 377|             InterceptChildComponentRenderSubscriber::CHILDREN_FINGERPRINTS_METADATA_KEY,
+ 378|             $this->parseDataFor($request)['children']
+ 379|         );
+ 380| 
+ 381|         return $mountedComponent;
+ 382|     }
+ 383| 
+ 384|     private static function parseJsonFromQuery(Request $request, string $key): array
+ 385|     {
+ 386|         if (!$request->query->has($key)) {
+ 387|             return [];
+ 388|         }
+ 389| 
+ 390|         try {
+ 391|             return json_decode($request->query->get($key), true, 512, \JSON_THROW_ON_ERROR);
+ 392|         } catch (\JsonException $exception) {
+ 393|             throw new JsonException(\sprintf('Invalid JSON on query string "%s".', $key), 0, $exception);
+ 394|         }
+ 395|     }
+ 396| }
+ 397| 
+ 398| 
+
+### id=7873 lang=php
+[CODE]
+   1| <?php
+   2| 
+   3| /*
+   4|  * This file is part of the Symfony package.
+   5|  *
+   6|  * (c) Fabien Potencier <fabien@symfony.com>
+   7|  *
+   8|  * For the full copyright and license information, please view the LICENSE
+   9|  * file that was distributed with this source code.
+  10|  */
+  11| 
+  12| namespace Symfony\UX\LiveComponent\EventListener;
+  13| 
+  14| use Psr\Container\ContainerInterface;
+  15| use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+  16| use Symfony\Component\HttpFoundation\Exception\JsonException;
+  17| use Symfony\Component\HttpFoundation\Request;
+  18| use Symfony\Component\HttpFoundation\Response;
+  19| use Symfony\Component\HttpKernel\Event\ControllerEvent;
+  20| use Symfony\Component\HttpKernel\Event\ExceptionEvent;
+  21| use Symfony\Component\HttpKernel\Event\RequestEvent;
+  22| use Symfony\Component\HttpKernel\Event\ResponseEvent;
+  23| use Symfony\Component\HttpKernel\Event\ViewEvent;
+  24| use Symfony\Component\HttpKernel\Exception\MethodNotAllowedHttpException;
+  25| use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+  26| use Symfony\Component\HttpKernel\Exception\UnprocessableEntityHttpException;
+  27| use Symfony\Contracts\Service\ServiceSubscriberInterface;
+  28| use Symfony\UX\LiveComponent\Attribute\AsLiveComponent;
+  29| use Symfony\UX\LiveComponent\Attribute\LiveArg;
+  30| use Symfony\UX\LiveComponent\LiveComponentHydrator;
+  31| use Symfony\UX\LiveComponent\Metadata\LiveComponentMetadataFactory;
+  32| use Symfony\UX\TwigComponent\ComponentFactory;
+  33| use Symfony\UX\TwigComponent\ComponentMetadata;
+  34| use Symfony\UX\TwigComponent\ComponentRenderer;
+  35| use Symfony\UX\TwigComponent\MountedComponent;
+  36| 
+  37| /**
+  38|  * @author Kevin Bond <kevinbond@gmail.com>
+  39|  * @author Ryan Weaver <ryan@symfonycasts.com>
+  40|  *
+  41|  * @internal
+  42|  */
+  43| class LiveComponentSubscriber implements EventSubscriberInterface, ServiceSubscriberInterface
+  44| {
+  45|     private const HTML_CONTENT_TYPE = 'application/vnd.live-component+html';
+  46|     private const REDIRECT_HEADER = 'X-Live-Redirect';
+  47| 
+  48|     public function __construct(
+  49|         private ContainerInterface $container,
+  50|         private bool $testMode = true,
+  51|     ) {
+  52|     }
+  53| 
+  54|     public static function getSubscribedServices(): array
+  55|     {
+  56|         return [
+  57|             ComponentRenderer::class,
+  58|             ComponentFactory::class,
+  59|             LiveComponentHydrator::class,
+  60|             LiveComponentMetadataFactory::class,
+  61|         ];
+  62|     }
+  63| 
+  64|     public function onKernelRequest(RequestEvent $event): void
+  65|     {
+  66|         $request = $event->getRequest();
+  67| 
+  68|         if (!$this->isLiveComponentRequest($request)) {
+  69|             return;
+  70|         }
+  71| 
+  72|         if ($request->attributes->has('_controller')) {
+  73|             return;
+  74|         }
+  75| 
+  76|         // the default "action" is get, which does nothing
+  77|         $action = $request->attributes->get('_live_action', 'get');
+  78|         $componentName = (string) $request->attributes->get('_live_component');
+  79| 
+  80|         $request->attributes->set('_component_name', $componentName);
+  81| 
+  82|         try {
+  83|             /** @var ComponentMetadata $metadata */
+  84|             $metadata = $this->container->get(ComponentFactory::class)->metadataFor($componentName);
+  85|         } catch (\InvalidArgumentException $e) {
+  86|             throw new NotFoundHttpException(\sprintf('Component "%s" not found.', $componentName), $e);
+  87|         }
+  88| 
+  89|         if (!$metadata->get('live', false)) {
+  90|             throw new NotFoundHttpException(\sprintf('"%s" (%s) is not a Live Component.', $metadata->getClass(), $componentName));
+  91|         }
+  92| 
+  93|         if ('get' === $action) {
+  94|             $defaultAction = trim($metadata->get('default_action', '__invoke'), '()');
+  95| 
+  96|             // set default controller for "default" action
+  97|             $request->attributes->set('_controller', \sprintf('%s::%s', $metadata->getServiceId(), $defaultAction));
+  98|             $request->attributes->set('_component_default_action', true);
+  99| 
+ 100|             return;
+ 101|         }
+ 102| 
+ 103|         if (!$request->isMethod('post')) {
+ 104|             throw new MethodNotAllowedHttpException(['POST']);
+ 105|         }
+ 106| 
+ 107|         if ('_batch' === $action) {
+ 108|             // use batch controller
+ 109|             $data = $this->parseDataFor($request);
+ 110| 
+ 111|             $request->attributes->set('_controller', 'ux.live_component.batch_action_controller');
+ 112|             $request->attributes->set('serviceId', $metadata->getServiceId());
+ 113|             $request->attributes->set('actions', $data['actions']);
+ 114|             $request->attributes->set('_mounted_component', $this->hydrateComponent(
+ 115|                 $this->container->get(ComponentFactory::class)->get($componentName),
+ 116|                 $componentName,
+ 117|                 $request
+ 118|             ));
+ 119|             $request->attributes->set('_is_live_batch_action', true);
+ 120| 
+ 121|             return;
+ 122|         }
+ 123| 
+ 124|         $request->attributes->set('_controller', \sprintf('%s::%s', $metadata->getServiceId(), $action));
+ 125|     }
+ 126| 
+ 127|     public function onKernelController(ControllerEvent $event): void
+ 128|     {
+ 129|         $request = $event->getRequest();
+ 130| 
+ 131|         if (!$this->isLiveComponentRequest($request)) {
+ 132|             return;
+ 133|         }
+ 134| 
+ 135|         if ($request->attributes->get('_is_live_batch_action')) {
+ 136|             return;
+ 137|         }
+ 138| 
+ 139|         $controller = $event->getController();
+ 140| 
+ 141|         if (!\is_array($controller) || 2 !== \count($controller)) {
+ 142|             throw new \RuntimeException('Not a valid live component.');
+ 143|         }
+ 144| 
+ 145|         [$component, $action] = $controller;
+ 146| 
+ 147|         if (!\is_object($component)) {
+ 148|             throw new \RuntimeException('Not a valid live component.');
+ 149|         }
+ 150| 
+ 151|         if (!$request->attributes->get('_component_default_action', false) && !AsLiveComponent::isActionAllowed($component, $action)) {
+ 152|             throw new NotFoundHttpException(\sprintf('The action "%s" either doesn\'t exist or is not allowed in "%s". Make sure it exist and has the LiveAction attribute above it.', $action, $component::class));
+ 153|         }
+ 154| 
+ 155|         $componentName = $request->attributes->get('_component_name') ?? $request->attributes->get('_mounted_component')->getName();
+ 156|         $requestMethod = $this->container->get(ComponentFactory::class)->metadataFor($componentName)?->get('method') ?? 'post';
+ 157| 
+ 158|         /**
+ 159|          * $requestMethod 'post' allows POST requests only
+ 160|          * $requestMethod 'get' allows GET and POST requests.
+ 161|          */
+ 162|         if ($request->isMethod('get') && 'post' === $requestMethod) {
+ 163|             throw new MethodNotAllowedHttpException([strtoupper($requestMethod)]);
+ 164|         }
+ 165| 
+ 166|         /*
+ 167|          * Either we:
+ 168|          *      A) We do NOT have a _mounted_component, so hydrate $component
+ 169|          *          (normal situation, rendering a single component)
+ 170|          *      B) We DO have a _mounted_component, so no need to hydrate,
+ 171|          *          but we DO need to make sure it's set as the controller.
+ 172|          *          (sub-request during batch controller)
+ 173|          */
+ 174|         if (!$request->attributes->has('_mounted_component')) {
+ 175|             $request->attributes->set('_mounted_component', $this->hydrateComponent(
+ 176|                 $component,
+ 177|                 $request->attributes->get('_component_name'),
+ 178|                 $request
+ 179|             ));
+ 180|         } else {
+ 181|             // override the component with our already-mounted version
+ 182|             $component = $request->attributes->get('_mounted_component')->getComponent();
+ 183|             $event->setController([
+ 184|                 $component,
+ 185|                 $action,
+ 186|             ]);
+ 187|         }
+ 188| 
+ 189|         // read the action arguments from the request, unless they're already set (batch sub-requests)
+ 190|         $actionArguments = $request->attributes->get('_component_action_args', $this->parseDataFor($request)['args']);
+ 191|         // extra variables to be made available to the controller
+ 192|         // (for "actions" only)
+ 193|         foreach (LiveArg::liveArgs($component, $action) as $parameter => $arg) {
+ 194|             if (isset($actionArguments[$arg])) {
+ 195|                 $request->attributes->set($parameter, $actionArguments[$arg]);
+ 196|             }
+ 197|         }
+ 198|     }
+ 199| 
+ 200|     /**
+ 201|      * @return array{
+ 202|      *     data: array,
+ 203|      *     args: array,
+ 204|      *     actions: array
+ 205|      *     // has "fingerprint" and "tag" string key, keyed by component id
+ 206|      *     children: array
+ 207|      *     propsFromParent: array
+ 208|      * }
+ 209|      */
+ 210|     private static function parseDataFor(Request $request): array
+ 211|     {
+ 212|         if (!$request->attributes->has('_live_request_data')) {
+ 213|             if ($request->query->has('props')) {
+ 214|                 $liveRequestData = [
+ 215|                     'props' => self::parseJsonFromQuery($request, 'props'),
+ 216|                     'updated' => self::parseJsonFromQuery($request, 'updated'),
+ 217|                     'args' => [],
+ 218|                     'actions' => [],
+ 219|                     'children' => self::parseJsonFromQuery($request, 'children'),
+ 220|                     'propsFromParent' => self::parseJsonFromQuery($request, 'propsFromParent'),
+ 221|                 ];
+ 222|             } else {
+ 223|                 try {
+ 224|                     $requestData = json_decode($request->request->get('data'), true, 512, \JSON_BIGINT_AS_STRING | \JSON_THROW_ON_ERROR);
+ 225|                 } catch (\JsonException $e) {
+ 226|                     throw new JsonException('Could not decode request body.', $e->getCode(), $e);
+ 227|                 }
+ 228| 
+ 229|                 $liveRequestData = [
+ 230|                     'props' => $requestData['props'] ?? [],
+ 231|                     'updated' => $requestData['updated'] ?? [],
+ 232|                     'args' => $requestData['args'] ?? [],
+ 233|                     'actions' => $requestData['actions'] ?? [],
+ 234|                     'children' => $requestData['children'] ?? [],
+ 235|                     'propsFromParent' => $requestData['propsFromParent'] ?? [],
+ 236|                 ];
+ 237|             }
+ 238| 
+ 239|             $request->attributes->set('_live_request_data', $liveRequestData);
+ 240|         }
+ 241| 
+ 242|         return $request->attributes->get('_live_request_data');
+ 243|     }
+ 244| 
+ 245|     public function onKernelView(ViewEvent $event): void
+ 246|     {
+ 247|         if (!$this->isLiveComponentRequest($request = $event->getRequest())) {
+ 248|             return;
+ 249|         }
+ 250| 
+ 251|         if (!$event->isMainRequest()) {
+ 252|             // sub-request, so skip rendering
+ 253|             $event->setResponse(new Response());
+ 254| 
+ 255|             return;
+ 256|         }
+ 257| 
+ 258|         $mountedComponent = $request->attributes->get('_mounted_component');
+ 259|         if (!$request->attributes->get('_component_default_action', false)) {
+ 260|             // On custom action, props may be updated by the server side
+ 261|             $liveRequestData = $request->attributes->get('_live_request_data');
+ 262|             $liveRequestData['responseProps'] = (array) $mountedComponent->getComponent();
+ 263|             $request->attributes->set('_live_request_data', $liveRequestData);
+ 264|         }
+ 265| 
+ 266|         $event->setResponse($this->createResponse($mountedComponent));
+ 267|     }
+ 268| 
+ 269|     public function onKernelException(ExceptionEvent $event): void
+ 270|     {
+ 271|         if (!$this->isLiveComponentRequest($request = $event->getRequest())) {
+ 272|             return;
+ 273|         }
+ 274| 
+ 275|         if (!$event->getThrowable() instanceof UnprocessableEntityHttpException) {
+ 276|             return;
+ 277|         }
+ 278| 
+ 279|         // in case the exception was too early somehow
+ 280|         if (!$mounted = $request->attributes->get('_mounted_component')) {
+ 281|             return;
+ 282|         }
+ 283| 
+ 284|         $event->setResponse($this->createResponse($mounted));
+ 285|     }
+ 286| 
+ 287|     public function onKernelResponse(ResponseEvent $event): void
+ 288|     {
+ 289|         $request = $event->getRequest();
+ 290|         $response = $event->getResponse();
+ 291| 
+ 292|         if (!$event->isMainRequest()) {
+ 293|             return;
+ 294|         }
+ 295| 
+ 296|         if (!$this->isLiveComponentRequest($request)) {
+ 297|             return;
+ 298|         }
+ 299| 
+ 300|         if (!$response->isRedirection()) {
+ 301|             return;
+ 302|         }
+ 303| 
+ 304|         if ($this->testMode && !\in_array(self::HTML_CONTENT_TYPE, $request->getAcceptableContentTypes(), true)) {
+ 305|             // Make testing redirections easier
+ 306|             return;
+ 307|         }
+ 308| 
+ 309|         $responseNoContent = new Response(null, Response::HTTP_NO_CONTENT, [
+ 310|             self::REDIRECT_HEADER => '1',
+ 311|         ]);
+ 312| 
+ 313|         $responseNoContent->headers->add($response->headers->all());
+ 314| 
+ 315|         $event->setResponse($responseNoContent);
+ 316|     }
+ 317| 
+ 318|     public static function getSubscribedEvents(): array
+ 319|     {
+ 320|         return [
+ 321|             RequestEvent::class => 'onKernelRequest',
+ 322|             // positive priority in case other ControllerEvent listeners need the attributes we set
+ 323|             ControllerEvent::class => ['onKernelController', 10],
+ 324|             ViewEvent::class => 'onKernelView',
+ 325|             ResponseEvent::class => 'onKernelResponse',
+ 326|             // priority so that the exception is processed before it can be logged as an error
+ 327|             ExceptionEvent::class => ['onKernelException', 20],
+ 328|         ];
+ 329|     }
+ 330| 
+ 331|     private function createResponse(MountedComponent $mounted): Response
+ 332|     {
+ 333|         $component = $mounted->getComponent();
+ 334| 
+ 335|         foreach (AsLiveComponent::preReRenderMethods($component) as $method) {
+ 336|             $component->{$method->name}();
+ 337|         }
+ 338| 
+ 339|         return new Response($this->container->get(ComponentRenderer::class)->render($mounted), 200, [
+ 340|             'Content-Type' => self::HTML_CONTENT_TYPE,
+ 341|         ]);
+ 342|     }
+ 343| 
+ 344|     private function isLiveComponentRequest(Request $request): bool
+ 345|     {
+ 346|         if (!$request->attributes->has('_live_component')) {
+ 347|             return false;
+ 348|         }
+ 349| 
+ 350|         if ($this->testMode) {
+ 351|             return true;
+ 352|         }
+ 353| 
+ 354|         // Require a non-CORS-safelisted request header to force a preflight on
+ 355|         // cross-origin requests (which Symfony does not answer for LiveComponent
+ 356|         // endpoints), preventing CSRF. The Accept header alone is insufficient
+ 357|         // because it is CORS-safelisted (Fetch spec §3.2.2) and can be set
+ 358|         // cross-origin without a preflight.
+ 359|         if ('XMLHttpRequest' !== $request->headers->get('X-Requested-With')) {
+ 360|             return false;
+ 361|         }
+ 362| 
+ 363|         return \in_array(self::HTML_CONTENT_TYPE, $request->getAcceptableContentTypes(), true);
+ 364|     }
+ 365| 
+ 366|     private function hydrateComponent(object $component, string $componentName, Request $request): MountedComponent
+ 367|     {
+ 368|         $hydrator = $this->container->get(LiveComponentHydrator::class);
+ 369|         \assert($hydrator instanceof LiveComponentHydrator);
+ 370|         $metadataFactory = $this->container->get(LiveComponentMetadataFactory::class);
+ 371|         \assert($metadataFactory instanceof LiveComponentMetadataFactory);
+ 372| 
+ 373|         $componentAttributes = $hydrator->hydrate(
+ 374|             $component,
+ 375|             $this->parseDataFor($request)['props'],
+ 376|             $this->parseDataFor($request)['updated'],
+ 377|             $metadataFactory->getMetadata($componentName),
+ 378|             $this->parseDataFor($request)['propsFromParent']
+ 379|         );
+ 380| 
+ 381|         $mountedComponent = new MountedComponent($componentName, $component, $componentAttributes);
+ 382| 
+ 383|         $mountedComponent->addExtraMetadata(
+ 384|             InterceptChildComponentRenderSubscriber::CHILDREN_FINGERPRINTS_METADATA_KEY,
+ 385|             $this->parseDataFor($request)['children']
+ 386|         );
+ 387| 
+ 388|         return $mountedComponent;
+ 389|     }
+ 390| 
+ 391|     private static function parseJsonFromQuery(Request $request, string $key): array
+ 392|     {
+ 393|         if (!$request->query->has($key)) {
+ 394|             return [];
+ 395|         }
+ 396| 
+ 397|         try {
+ 398|             return json_decode($request->query->get($key), true, 512, \JSON_THROW_ON_ERROR);
+ 399|         } catch (\JsonException $exception) {
+ 400|             throw new JsonException(\sprintf('Invalid JSON on query string "%s".', $key), 0, $exception);
+ 401|         }
+ 402|     }
+ 403| }
+ 404| 
+ 405| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7872 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **入口点枚举（全文）**
+   - 第 60 行 `onKernelRequest`：路由属性 `_live_component`、`_live_action` 来自请求路由配置；随后第 118–124 行处理 `_batch` 动作。
+   - 第 129 行 `onKernelController`：校验动作是否被 `#[LiveAction]` 允许。
+   - 第 176–216 行 `parseDataFor`：source 为 `$request->query` 的 `props/updated/children/propsFromParent`（GET）与 POST body 的 `data` 字段，产出 `args/actions/props` 等。
+   - 第 219、257、276、299 行：View / Exception / Response 监听器，均以 `isLiveComponentRequest`（第 338 行）做门禁。
+   - 第 371 行 `parseJsonFromQuery`：仅 JSON 解析，无注入 sink。
+
+2. **source→sink 数据流验证**
+   - **流 A**：`_live_action`（第 66 行）→ 第 126 行 `sprintf('%s::%s', $metadata->getServiceId(), $action)` 拼接控制器。类名来自容器服务 ID（非用户输入），方法名 `$action` 用户可控，但第 141 行 `AsLiveComponent::isActionAllowed` 白名单校验拦截——对普通动作有效防御。但注意：默认动作路径（第 84–90 行）设置 `_component_default_action = true`，跳过白名单，不过其方法名取自组件元数据 `default_action`，非用户输入，安全。
+   - **流 B（关键）**：第 118 行 `_batch === $action` 时，设置 `_controller = 'ux.live_component.batch_action_controller'` 并标记 `_is_live_batch_action`（第 124 行）。回到第 133–135 行：`if ($request->attributes->get('_is_live_batch_action')) { return; }` —— **直接跳过 `isActionAllowed` 白名单检查**。batch 控制器随后对同一组件发起子请求执行 `actions` 数组中的任意方法名（来自 POST body `data.actions`，第 205 行），子请求中因存在 `_mounted_component` 走第 163–168 行分支覆盖控制器为 `[已挂载组件, 任意action]`，且该检查同样被跳过。即用户可控的方法名在未经验证的情况下作为 `$component->{$method}()` 形式调用（另见第 356 行 `preReRenderMethods` 仅限带属性的钩子，不构成此通道）。这是 source（POST body）→ sink（任意对象方法调用）的完整可利用链。
+   - **流 C**：hydrate 数据（第 385–391 行）交给 `LiveComponentHydrator`，本文件内无 sink，依赖 hydrator 自身安全（有 dehydrator 属性白名单），不算本文件漏洞。
+   - **流 D**：CSRF 防线在第 344–349 行：依赖 Accept 头 content-type + 同源策略，注释明示；属框架级缓解，但不能阻止上述已认证同源请求内的方法调用绕过。
+
+3. **第二入口/替代通道**：GET query 的 `props` 等同样进入 hydrate，但最终 sink 相同且受 hydrator 约束；`_batch` 是唯一绕过动作白名单的替代通道。
+
+4. **结论**：对应 Symfony UX 已知漏洞（CVE-2024-51736 类似问题）：batch 动作路径完全绕过 `LiveAction` 属性白名单，允许调用 Live 组件上任意公共方法（包括未暴露为动作的内部方法），可能导致信息泄露或状态篡改。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-352 Cross-Site Request Forgery (CSRF)", "risk_level": "High", "source": "外部页面可对 Live 组件端点发起跨站请求；请求唯一门禁是 isLiveComponentRequest 的 HTTP 头检查（line 344-357，line 355-356 注释自称 CSRF 保护）", "sink": "组件 action 执行：门禁仅凭 Accept: application/vnd.live-component 头（跨站 fetch 可设置），无独立 CSRF 令牌校验", "explanation": "教师的核心绕过链不成立：M3 取上游 BatchActionController 证实 batch 子请求经 Request::duplicate(attributes:[...]) 创建——Symfony duplicate 整体替换 attributes，原始请求 line 119 设置的 _is_live_batch_action 不进入子请求，『子请求中跳过 isActionAllowed 白名单』的链路为虚构，引用的 CVE 亦张冠李戴。真实缺陷（M3 provenance diff 证实样本即修复前上游原版，相似度 0.99）：请求合法性仅凭 Accept 头门禁（line 344-357），跨站 fetch 可设置该头，CSRF 保护（上游注释自称）可被绕过——上游 2.36.0/3.1.0 经 GHSA-4m4j-hmqq-3gxm 修复，在 isLiveComponentRequest 增加 X-Requested-With 校验（跨域 fetch 携带自定义头需通过 CORS 预检，故不可伪造）。", "fix_suggestion": "line 344-357: 按 GHSA-4m4j-hmqq-3gxm 修复——isLiveComponentRequest 增加 X-Requested-With 头校验，Accept 头检查不得单独作为 CSRF 门禁；同时删除 _is_live_batch_action 无条件提前返回（该属性经子请求 duplicate 后不传播，现逻辑不构成额外防线）"}
+
+### id=7873 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **入口点枚举（全文）**
+   - `onKernelRequest`（约第 66–130 行）：source 为请求属性 `_live_component`、`_live_action`，以及 POST body 的 `data` 字段（经 `parseDataFor`）和 query 参数 `props/updated/children/propsFromParent`。
+   - `onKernelController`（第 132–190 行）：读取 action 与组件实例，解析 action args。
+   - `onKernelView` / `onKernelException` / `onKernelResponse`：渲染与重定向处理，无用户输入直接进入危险 sink。
+   - `parseDataFor`（第 197–235 行）：JSON 解析入口，query 与 body 两条通道。
+   - `hydrateComponent`（第 313–333 行）：将用户 props 喂给 hydrator。
+
+2. **数据流验证**
+   - **action 名 → 控制器拼接**（第 127 行 `\sprintf('%s::%s', $metadata->getServiceId(), $action)`）：`$action` 来自路由属性 `_live_action`。看似动态方法调用 sink，但第 158–160 行 `AsLiveComponent::isActionAllowed` 白名单校验（仅允许标注 `LiveAction` 属性的方法），默认 action 路径（第 87 行）取自组件元数据而非用户输入。防御有效。
+   - **batch 路径**（第 100–113 行）：`_batch` 固定路由到 `ux.live_component.batch_action_controller`，actions 数据交由该控制器处理，本文件不直接执行；子请求仍走 `isActionAllowed` 校验（第 158 行对非 batch 生效，batch 子请求中 controller 已被替换为已挂载组件且 action 校验逻辑保留）。无任意方法调用。
+   - **props/updated → hydrate**（第 320–326 行）：用户可控数据进入 `LiveComponentHydrator::hydrate`，但该 hydrator 有基于 checksum/签名与类型声明的反序列化防护（不在本文件内），本文件未发现绕过点。
+   - **CSRF 防御**（`isLiveComponentRequest` 第 296–311 行）：非 testMode 下要求非 CORS-safelisted 头 `X-Requested-With: XMLHttpRequest` 且 Accept 包含自定义 content-type，强制跨域预检，防 CSRF 有效。注意构造函数 `$testMode` 默认为 true——若生产环境未显式关闭，则 CSRF 检查被完全跳过，这是配置风险而非代码逻辑漏洞。
+   - **JSON 解析**（第 224、337–347 行）：`JSON_THROW_ON_ERROR` + 异常转 JsonException，无注入面。
+   - **响应处理**（第 238–290 行）：渲染输出由 Twig 组件渲染器完成（自动转义），重定向响应仅复制头并置 204，无开放重定向或头注入证据。
+
+3. **第二入口/替代通道**：query 串 `props` 通道（GET 渲染）最终同样进入受签名保护的 hydrator 与白名单 action 机制，与 POST 通道一致，无旁路。
+
+4. **结论**：全文范围内所有 source→sink 流均有有效防御（action 白名单、CSRF 双头校验、hydrator 签名）。唯一隐患是 `testMode` 默认 true 属部署配置问题，非本文件可利用漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认：动态控制器拼接的 action 名受 AsLiveComponent::isActionAllowed 白名单约束；默认 action 取自组件元数据而非用户输入；用户可控 props 经带签名的 LiveComponentHydrator 反序列化；CSRF 由强制预检的非 CORS-safelisted 头 X-Requested-With 加自定义 Accept 类型双重防御；JSON 解析使用 THROW_ON_ERROR 无注入面。唯一风险是构造函数 testMode 默认为 true，若生产环境误配会跳过 CSRF 检查，属配置问题而非本文件代码漏洞。", "fix_suggestion": "no fix needed"}

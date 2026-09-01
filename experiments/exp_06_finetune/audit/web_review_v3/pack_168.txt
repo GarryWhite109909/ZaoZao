@@ -1,0 +1,721 @@
+batch=168 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=8051 lang=go
+[CODE]
+   1| package httpserver
+   2| 
+   3| import (
+   4| 	"archive/zip"
+   5| 	"errors"
+   6| 	"fmt"
+   7| 	"io"
+   8| 	"net/http"
+   9| 	"os"
+  10| 	"path/filepath"
+  11| 	"strings"
+  12| 	"time"
+  13| 
+  14| 	"goshs.de/goshs/v2/logger"
+  15| )
+  16| 
+  17| // prepareWrite enforces the ACL for dir and applies the upload size limit.
+  18| // Returns false if the request has already been rejected.
+  19| func (fs *FileServer) prepareWrite(w http.ResponseWriter, req *http.Request, dir string) bool {
+  20| 	acl, aclErr := fs.findEffectiveACL(dir)
+  21| 	if aclErr != nil {
+  22| 		logger.Errorf("error reading file based access config: %+v", aclErr)
+  23| 	}
+  24| 	if ok := fs.applyCustomAuth(w, req, acl); !ok {
+  25| 		return false
+  26| 	}
+  27| 	if fs.MaxUpload > 0 {
+  28| 		req.Body = http.MaxBytesReader(w, req.Body, fs.MaxUpload)
+  29| 	}
+  30| 	return true
+  31| }
+  32| 
+  33| // put handles the PUT request to upload files
+  34| func (fs *FileServer) put(w http.ResponseWriter, req *http.Request) {
+  35| 	if !fs.checkCSRF(w, req) {
+  36| 		return
+  37| 	}
+  38| 	if fs.ReadOnly {
+  39| 		fs.handleError(w, req, fmt.Errorf("%s", "Upload not allowed due to 'read only' option"), http.StatusForbidden)
+  40| 		return
+  41| 	}
+  42| 	savepath, err := sanitizePath(fs.UploadFolder, req.URL.Path)
+  43| 	if err != nil {
+  44| 		fs.handleError(w, req, err, http.StatusBadRequest)
+  45| 		return
+  46| 	}
+  47| 
+  48| 	// Block overwriting the .goshs ACL file
+  49| 	if filepath.Base(savepath) == ".goshs" {
+  50| 		fs.handleError(w, req, fmt.Errorf("cannot overwrite ACL file"), http.StatusForbidden)
+  51| 		return
+  52| 	}
+  53| 
+  54| 	// Enforce .goshs ACL and upload size limit
+  55| 	if !fs.prepareWrite(w, req, filepath.Dir(savepath)) {
+  56| 		return
+  57| 	}
+  58| 
+  59| 	// disable G304 (CWE-22): Potential file inclusion via variable
+  60| 	// #nosec G304
+  61| 	osFile, err := os.OpenFile(savepath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+  62| 	if err != nil {
+  63| 		logger.Errorf("Error opening file: %+v", err)
+  64| 		fs.handleError(w, req, err, http.StatusInternalServerError)
+  65| 		return
+  66| 	}
+  67| 
+  68| 	if _, err := io.Copy(osFile, req.Body); err != nil {
+  69| 		osFile.Close()
+  70| 		os.Remove(savepath)
+  71| 		var maxErr *http.MaxBytesError
+  72| 		if errors.As(err, &maxErr) {
+  73| 			fs.handleError(w, req, fmt.Errorf("upload exceeds size limit (%d bytes)", fs.MaxUpload), http.StatusRequestEntityTooLarge)
+  74| 		} else {
+  75| 			logger.Errorf("Error writing file %s to disk: %+v", savepath, err)
+  76| 			fs.handleError(w, req, err, http.StatusInternalServerError)
+  77| 		}
+  78| 		return
+  79| 	}
+  80| 	osFile.Close()
+  81| 
+  82| 	// Log request
+  83| 	_ = fs.emitCollabEvent(req, http.StatusOK)
+  84| 	logger.LogRequest(req, http.StatusOK, fs.Verbose, fs.Webhook, nil)
+  85| }
+  86| 
+  87| // upload handles the POST request to upload files
+  88| func (fs *FileServer) upload(w http.ResponseWriter, req *http.Request) {
+  89| 	if !fs.checkCSRF(w, req) {
+  90| 		return
+  91| 	}
+  92| 	if fs.ReadOnly {
+  93| 		fs.handleError(w, req, fmt.Errorf("%s", "Upload not allowed due to 'read only' option"), http.StatusForbidden)
+  94| 		return
+  95| 	}
+  96| 	// Derive and sanitize the target directory (strip trailing "/upload" from URL).
+  97| 	upathDir := strings.TrimSuffix(req.URL.Path, "/upload")
+  98| 	targetDir, err := sanitizePath(fs.UploadFolder, upathDir)
+  99| 	if err != nil {
+ 100| 		fs.handleError(w, req, err, http.StatusBadRequest)
+ 101| 		return
+ 102| 	}
+ 103| 
+ 104| 	// Enforce .goshs ACL and upload size limit
+ 105| 	if !fs.prepareWrite(w, req, targetDir) {
+ 106| 		return
+ 107| 	}
+ 108| 
+ 109| 	reader, err := req.MultipartReader()
+ 110| 	if err != nil {
+ 111| 		logger.Errorf("reading multipart request: %+v", err)
+ 112| 		return
+ 113| 	}
+ 114| 
+ 115| 	for {
+ 116| 		part, err := reader.NextPart()
+ 117| 		if err == io.EOF {
+ 118| 			break
+ 119| 		}
+ 120| 		if err != nil {
+ 121| 			var maxErr *http.MaxBytesError
+ 122| 			if errors.As(err, &maxErr) {
+ 123| 				fs.handleError(w, req, fmt.Errorf("upload exceeds size limit (%d bytes)", fs.MaxUpload), http.StatusRequestEntityTooLarge)
+ 124| 			} else {
+ 125| 				logger.Errorf("reading multipart part: %+v", err)
+ 126| 			}
+ 127| 			return
+ 128| 		}
+ 129| 		if part.FileName() == "" {
+ 130| 			continue // skip form fields
+ 131| 		}
+ 132| 
+ 133| 		// sanitize filename (No path traversal)
+ 134| 		filenameSlice := strings.Split(part.FileName(), "/")
+ 135| 		filenameClean := filenameSlice[len(filenameSlice)-1]
+ 136| 
+ 137| 		// Block overwriting the .goshs ACL file
+ 138| 		if filenameClean == ".goshs" {
+ 139| 			logger.Warnf("blocked attempt to upload file named .goshs")
+ 140| 			continue
+ 141| 		}
+ 142| 
+ 143| 		// Prepare destination file paths
+ 144| 		finalPath := filepath.Join(targetDir, filenameClean)
+ 145| 		tempPath := finalPath + "~"
+ 146| 
+ 147| 		// Create temp file
+ 148| 		dst, err := os.Create(tempPath)
+ 149| 		if err != nil {
+ 150| 			logger.Errorf("creating temp file: %+v", err)
+ 151| 			return
+ 152| 		}
+ 153| 
+ 154| 		// Write in chunks
+ 155| 		buf := make([]byte, chunkSize)
+ 156| 		var totalWritten int64
+ 157| 		for {
+ 158| 			n, readErr := part.Read(buf)
+ 159| 			if n > 0 {
+ 160| 				written, writeErr := dst.Write(buf[:n])
+ 161| 				if writeErr != nil || written != n {
+ 162| 					dst.Close()
+ 163| 					os.Remove(tempPath)
+ 164| 					logger.Errorf("writing file to disk: %+v", writeErr)
+ 165| 					return
+ 166| 				}
+ 167| 				totalWritten += int64(written)
+ 168| 			}
+ 169| 			if readErr == io.EOF {
+ 170| 				break
+ 171| 			}
+ 172| 			if readErr != nil {
+ 173| 				dst.Close()
+ 174| 				os.Remove(tempPath)
+ 175| 				var maxErr *http.MaxBytesError
+ 176| 				if errors.As(readErr, &maxErr) {
+ 177| 					fs.handleError(w, req, fmt.Errorf("upload exceeds size limit (%d bytes)", fs.MaxUpload), http.StatusRequestEntityTooLarge)
+ 178| 				} else {
+ 179| 					logger.Errorf("reading uploaded data: %+v", readErr)
+ 180| 				}
+ 181| 				return
+ 182| 			}
+ 183| 		}
+ 184| 
+ 185| 		// Ensure file is flushed and closed
+ 186| 		if err := dst.Sync(); err != nil {
+ 187| 			dst.Close()
+ 188| 			os.Remove(tempPath)
+ 189| 			logger.Errorf("syncing file: %+v", err)
+ 190| 			return
+ 191| 		}
+ 192| 		if err := dst.Close(); err != nil {
+ 193| 			os.Remove(tempPath)
+ 194| 			logger.Errorf("closing file: %+v", err)
+ 195| 			return
+ 196| 		}
+ 197| 
+ 198| 		// Atomically rename to final path
+ 199| 		if err := os.Rename(tempPath, finalPath); err != nil {
+ 200| 			logger.Errorf("renaming file: %+v", err)
+ 201| 			return
+ 202| 		}
+ 203| 
+ 204| 		// Webhook
+ 205| 		logger.HandleWebhookSend(fmt.Sprintf("[WEB] File uploaded: %s", finalPath), "upload", fs.Webhook)
+ 206| 	}
+ 207| 
+ 208| 	// Log request
+ 209| 	body := fs.emitCollabEvent(req, http.StatusOK)
+ 210| 	logger.LogRequest(req, http.StatusOK, fs.Verbose, fs.Webhook, body)
+ 211| 
+ 212| 	// Redirect back from where we came from
+ 213| 	http.Redirect(w, req, upathDir, http.StatusSeeOther)
+ 214| }
+ 215| 
+ 216| // bulkDownload will provide zip archived download bundle of multiple selected files
+ 217| func (fs *FileServer) bulkDownload(w http.ResponseWriter, req *http.Request) {
+ 218| 	if fs.UploadOnly {
+ 219| 		fs.handleError(w, req, fmt.Errorf("%s", "Bulk download not allowed due to 'upload only' option"), http.StatusForbidden)
+ 220| 		return
+ 221| 	}
+ 222| 	// make slice and query files from request
+ 223| 	var filesCleaned []string
+ 224| 	files := req.URL.Query()["file"]
+ 225| 
+ 226| 	// Handle if no files are selected
+ 227| 	if len(files) == 0 {
+ 228| 		fs.handleError(w, req, errors.New("you need to select a file before you can download a zip archive"), 404)
+ 229| 		return
+ 230| 	}
+ 231| 
+ 232| 	// Validate each path and collect absolute paths; skip any traversal attempts
+ 233| 	for _, file := range files {
+ 234| 		absPath, err := sanitizePath(fs.Webroot, file)
+ 235| 		if err != nil {
+ 236| 			continue
+ 237| 		}
+ 238| 		filesCleaned = append(filesCleaned, absPath)
+ 239| 	}
+ 240| 
+ 241| 	// Construct filename to download
+ 242| 	filename := fmt.Sprintf("%d_goshs_download.zip", time.Now().Unix())
+ 243| 
+ 244| 	// Set header and serve file
+ 245| 	contentDispo := fmt.Sprintf("attachment; filename=\"%s\"", filename)
+ 246| 	w.Header().Set("Content-Type", "application/zip")
+ 247| 	w.Header().Set("Content-Disposition", contentDispo)
+ 248| 	w.Header().Set("Content-Transfer-Encoding", "binary")
+ 249| 	w.Header().Set("Expires", "0")
+ 250| 
+ 251| 	// Define Zip writer
+ 252| 	resultZip := zip.NewWriter(w)
+ 253| 	defer resultZip.Close()
+ 254| 
+ 255| 	// Path walker for recursion
+ 256| 	walker := func(filepath string, info os.FileInfo, err error) error {
+ 257| 		if err != nil {
+ 258| 			return err
+ 259| 		}
+ 260| 		if info.IsDir() {
+ 261| 			return nil
+ 262| 		}
+ 263| 
+ 264| 		// disable G304 (CWE-22): Potential file inclusion via variable
+ 265| 		// #nosec G304
+ 266| 		file, err := os.Open(filepath)
+ 267| 		if err != nil {
+ 268| 			return err
+ 269| 		}
+ 270| 		// disable G307 (CWE-703): Deferring unsafe method "Close" on type "*os.File"
+ 271| 		// #nosec G307
+ 272| 		defer file.Close()
+ 273| 
+ 274| 		// filepath is fs.Webroot + file relative path
+ 275| 		// this would result in a lot of nested folders
+ 276| 		// so we are stripping fs.Webroot again from the structure of the zip file
+ 277| 		// Leaving us with the relative path of the file
+ 278| 		zippath := strings.ReplaceAll(filepath, fs.Webroot, "")
+ 279| 		header := &zip.FileHeader{
+ 280| 			Name:     zippath[1:],
+ 281| 			Method:   zip.Deflate,
+ 282| 			Modified: info.ModTime(),
+ 283| 		}
+ 284| 		f, err := resultZip.CreateHeader(header)
+ 285| 		if err != nil {
+ 286| 			return err
+ 287| 		}
+ 288| 
+ 289| 		_, err = io.Copy(f, file)
+ 290| 		if err != nil {
+ 291| 			return err
+ 292| 		}
+ 293| 
+ 294| 		return nil
+ 295| 	}
+ 296| 
+ 297| 	// Loop over files and add to zip (filesCleaned contains validated absolute paths)
+ 298| 	for _, file := range filesCleaned {
+ 299| 		err := filepath.Walk(file, walker)
+ 300| 		if err != nil {
+ 301| 			logger.Errorf("creating zip file: %+v", err)
+ 302| 		}
+ 303| 	}
+ 304| 
+ 305| 	// Close Zip Writer and Flush to http.ResponseWriter
+ 306| 	if err := resultZip.Close(); err != nil {
+ 307| 		logger.Error(err)
+ 308| 	} else {
+ 309| 		body := fs.emitCollabEvent(req, http.StatusOK)
+ 310| 		logger.LogRequest(req, http.StatusOK, fs.Verbose, fs.Webhook, body)
+ 311| 	}
+ 312| }
+ 313| 
+ 314| 
+
+### id=8052 lang=go
+[CODE]
+   1| package httpserver
+   2| 
+   3| import (
+   4| 	"archive/zip"
+   5| 	"errors"
+   6| 	"fmt"
+   7| 	"io"
+   8| 	"net/http"
+   9| 	"os"
+  10| 	"path/filepath"
+  11| 	"slices"
+  12| 	"strings"
+  13| 	"time"
+  14| 
+  15| 	"goshs.de/goshs/v2/logger"
+  16| )
+  17| 
+  18| // prepareWrite enforces the ACL for dir and applies the upload size limit.
+  19| // Returns false if the request has already been rejected.
+  20| func (fs *FileServer) prepareWrite(w http.ResponseWriter, req *http.Request, dir string) bool {
+  21| 	acl, aclErr := fs.findEffectiveACL(dir)
+  22| 	if aclErr != nil {
+  23| 		logger.Errorf("error reading file based access config: %+v", aclErr)
+  24| 	}
+  25| 	if ok := fs.applyCustomAuth(w, req, acl); !ok {
+  26| 		return false
+  27| 	}
+  28| 	if fs.MaxUpload > 0 {
+  29| 		req.Body = http.MaxBytesReader(w, req.Body, fs.MaxUpload)
+  30| 	}
+  31| 	return true
+  32| }
+  33| 
+  34| // put handles the PUT request to upload files
+  35| func (fs *FileServer) put(w http.ResponseWriter, req *http.Request) {
+  36| 	if !fs.checkCSRF(w, req) {
+  37| 		return
+  38| 	}
+  39| 	if fs.ReadOnly {
+  40| 		fs.handleError(w, req, fmt.Errorf("%s", "Upload not allowed due to 'read only' option"), http.StatusForbidden)
+  41| 		return
+  42| 	}
+  43| 	savepath, err := sanitizePath(fs.UploadFolder, req.URL.Path)
+  44| 	if err != nil {
+  45| 		fs.handleError(w, req, err, http.StatusBadRequest)
+  46| 		return
+  47| 	}
+  48| 
+  49| 	// Block overwriting the .goshs ACL file
+  50| 	if filepath.Base(savepath) == ".goshs" {
+  51| 		fs.handleError(w, req, fmt.Errorf("cannot overwrite ACL file"), http.StatusForbidden)
+  52| 		return
+  53| 	}
+  54| 
+  55| 	// Enforce .goshs ACL and upload size limit
+  56| 	if !fs.prepareWrite(w, req, filepath.Dir(savepath)) {
+  57| 		return
+  58| 	}
+  59| 
+  60| 	// disable G304 (CWE-22): Potential file inclusion via variable
+  61| 	// #nosec G304
+  62| 	osFile, err := os.OpenFile(savepath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+  63| 	if err != nil {
+  64| 		logger.Errorf("Error opening file: %+v", err)
+  65| 		fs.handleError(w, req, err, http.StatusInternalServerError)
+  66| 		return
+  67| 	}
+  68| 
+  69| 	if _, err := io.Copy(osFile, req.Body); err != nil {
+  70| 		osFile.Close()
+  71| 		os.Remove(savepath)
+  72| 		var maxErr *http.MaxBytesError
+  73| 		if errors.As(err, &maxErr) {
+  74| 			fs.handleError(w, req, fmt.Errorf("upload exceeds size limit (%d bytes)", fs.MaxUpload), http.StatusRequestEntityTooLarge)
+  75| 		} else {
+  76| 			logger.Errorf("Error writing file %s to disk: %+v", savepath, err)
+  77| 			fs.handleError(w, req, err, http.StatusInternalServerError)
+  78| 		}
+  79| 		return
+  80| 	}
+  81| 	osFile.Close()
+  82| 
+  83| 	// Log request
+  84| 	_ = fs.emitCollabEvent(req, http.StatusOK)
+  85| 	logger.LogRequest(req, http.StatusOK, fs.Verbose, fs.Webhook, nil)
+  86| }
+  87| 
+  88| // upload handles the POST request to upload files
+  89| func (fs *FileServer) upload(w http.ResponseWriter, req *http.Request) {
+  90| 	if !fs.checkCSRF(w, req) {
+  91| 		return
+  92| 	}
+  93| 	if fs.ReadOnly {
+  94| 		fs.handleError(w, req, fmt.Errorf("%s", "Upload not allowed due to 'read only' option"), http.StatusForbidden)
+  95| 		return
+  96| 	}
+  97| 	// Derive and sanitize the target directory (strip trailing "/upload" from URL).
+  98| 	upathDir := strings.TrimSuffix(req.URL.Path, "/upload")
+  99| 	targetDir, err := sanitizePath(fs.UploadFolder, upathDir)
+ 100| 	if err != nil {
+ 101| 		fs.handleError(w, req, err, http.StatusBadRequest)
+ 102| 		return
+ 103| 	}
+ 104| 
+ 105| 	// Enforce .goshs ACL and upload size limit
+ 106| 	if !fs.prepareWrite(w, req, targetDir) {
+ 107| 		return
+ 108| 	}
+ 109| 
+ 110| 	reader, err := req.MultipartReader()
+ 111| 	if err != nil {
+ 112| 		logger.Errorf("reading multipart request: %+v", err)
+ 113| 		return
+ 114| 	}
+ 115| 
+ 116| 	for {
+ 117| 		part, err := reader.NextPart()
+ 118| 		if err == io.EOF {
+ 119| 			break
+ 120| 		}
+ 121| 		if err != nil {
+ 122| 			var maxErr *http.MaxBytesError
+ 123| 			if errors.As(err, &maxErr) {
+ 124| 				fs.handleError(w, req, fmt.Errorf("upload exceeds size limit (%d bytes)", fs.MaxUpload), http.StatusRequestEntityTooLarge)
+ 125| 			} else {
+ 126| 				logger.Errorf("reading multipart part: %+v", err)
+ 127| 			}
+ 128| 			return
+ 129| 		}
+ 130| 		if part.FileName() == "" {
+ 131| 			continue // skip form fields
+ 132| 		}
+ 133| 
+ 134| 		// sanitize filename (No path traversal)
+ 135| 		filenameSlice := strings.Split(part.FileName(), "/")
+ 136| 		filenameClean := filenameSlice[len(filenameSlice)-1]
+ 137| 
+ 138| 		// Block overwriting the .goshs ACL file
+ 139| 		if filenameClean == ".goshs" {
+ 140| 			logger.Warnf("blocked attempt to upload file named .goshs")
+ 141| 			continue
+ 142| 		}
+ 143| 
+ 144| 		// Prepare destination file paths
+ 145| 		finalPath := filepath.Join(targetDir, filenameClean)
+ 146| 		tempPath := finalPath + "~"
+ 147| 
+ 148| 		// Create temp file
+ 149| 		dst, err := os.Create(tempPath)
+ 150| 		if err != nil {
+ 151| 			logger.Errorf("creating temp file: %+v", err)
+ 152| 			return
+ 153| 		}
+ 154| 
+ 155| 		// Write in chunks
+ 156| 		buf := make([]byte, chunkSize)
+ 157| 		var totalWritten int64
+ 158| 		for {
+ 159| 			n, readErr := part.Read(buf)
+ 160| 			if n > 0 {
+ 161| 				written, writeErr := dst.Write(buf[:n])
+ 162| 				if writeErr != nil || written != n {
+ 163| 					dst.Close()
+ 164| 					os.Remove(tempPath)
+ 165| 					logger.Errorf("writing file to disk: %+v", writeErr)
+ 166| 					return
+ 167| 				}
+ 168| 				totalWritten += int64(written)
+ 169| 			}
+ 170| 			if readErr == io.EOF {
+ 171| 				break
+ 172| 			}
+ 173| 			if readErr != nil {
+ 174| 				dst.Close()
+ 175| 				os.Remove(tempPath)
+ 176| 				var maxErr *http.MaxBytesError
+ 177| 				if errors.As(readErr, &maxErr) {
+ 178| 					fs.handleError(w, req, fmt.Errorf("upload exceeds size limit (%d bytes)", fs.MaxUpload), http.StatusRequestEntityTooLarge)
+ 179| 				} else {
+ 180| 					logger.Errorf("reading uploaded data: %+v", readErr)
+ 181| 				}
+ 182| 				return
+ 183| 			}
+ 184| 		}
+ 185| 
+ 186| 		// Ensure file is flushed and closed
+ 187| 		if err := dst.Sync(); err != nil {
+ 188| 			dst.Close()
+ 189| 			os.Remove(tempPath)
+ 190| 			logger.Errorf("syncing file: %+v", err)
+ 191| 			return
+ 192| 		}
+ 193| 		if err := dst.Close(); err != nil {
+ 194| 			os.Remove(tempPath)
+ 195| 			logger.Errorf("closing file: %+v", err)
+ 196| 			return
+ 197| 		}
+ 198| 
+ 199| 		// Atomically rename to final path
+ 200| 		if err := os.Rename(tempPath, finalPath); err != nil {
+ 201| 			logger.Errorf("renaming file: %+v", err)
+ 202| 			return
+ 203| 		}
+ 204| 
+ 205| 		// Webhook
+ 206| 		logger.HandleWebhookSend(fmt.Sprintf("[WEB] File uploaded: %s", finalPath), "upload", fs.Webhook)
+ 207| 	}
+ 208| 
+ 209| 	// Log request
+ 210| 	body := fs.emitCollabEvent(req, http.StatusOK)
+ 211| 	logger.LogRequest(req, http.StatusOK, fs.Verbose, fs.Webhook, body)
+ 212| 
+ 213| 	// Redirect back from where we came from
+ 214| 	http.Redirect(w, req, upathDir, http.StatusSeeOther)
+ 215| }
+ 216| 
+ 217| // bulkDownload will provide zip archived download bundle of multiple selected files
+ 218| func (fs *FileServer) bulkDownload(w http.ResponseWriter, req *http.Request) {
+ 219| 	if fs.UploadOnly {
+ 220| 		fs.handleError(w, req, fmt.Errorf("%s", "Bulk download not allowed due to 'upload only' option"), http.StatusForbidden)
+ 221| 		return
+ 222| 	}
+ 223| 	// make slice and query files from request
+ 224| 	var filesCleaned []string
+ 225| 	files := req.URL.Query()["file"]
+ 226| 
+ 227| 	// Handle if no files are selected
+ 228| 	if len(files) == 0 {
+ 229| 		fs.handleError(w, req, errors.New("you need to select a file before you can download a zip archive"), 404)
+ 230| 		return
+ 231| 	}
+ 232| 
+ 233| 	// Validate each path, enforce .goshs ACL, and collect absolute paths.
+ 234| 	// ACL checks must happen here, before any response headers are written,
+ 235| 	// so that applyCustomAuth/handleError can still send a proper HTTP error.
+ 236| 	for _, file := range files {
+ 237| 		absPath, err := sanitizePath(fs.Webroot, file)
+ 238| 		if err != nil {
+ 239| 			continue
+ 240| 		}
+ 241| 		acl, aclErr := fs.findEffectiveACL(filepath.Dir(absPath))
+ 242| 		if aclErr == nil {
+ 243| 			if ok := fs.applyCustomAuth(w, req, acl); !ok {
+ 244| 				return
+ 245| 			}
+ 246| 			if slices.Contains(acl.Block, filepath.Base(absPath)) {
+ 247| 				fs.handleError(w, req, fmt.Errorf("requested file is blocked"), http.StatusNotFound)
+ 248| 				return
+ 249| 			}
+ 250| 		}
+ 251| 		filesCleaned = append(filesCleaned, absPath)
+ 252| 	}
+ 253| 
+ 254| 	// Construct filename to download
+ 255| 	filename := fmt.Sprintf("%d_goshs_download.zip", time.Now().Unix())
+ 256| 
+ 257| 	// Set header and serve file
+ 258| 	contentDispo := fmt.Sprintf("attachment; filename=\"%s\"", filename)
+ 259| 	w.Header().Set("Content-Type", "application/zip")
+ 260| 	w.Header().Set("Content-Disposition", contentDispo)
+ 261| 	w.Header().Set("Content-Transfer-Encoding", "binary")
+ 262| 	w.Header().Set("Expires", "0")
+ 263| 
+ 264| 	// Define Zip writer
+ 265| 	resultZip := zip.NewWriter(w)
+ 266| 	defer resultZip.Close()
+ 267| 
+ 268| 	// Path walker for recursion
+ 269| 	walker := func(filepath string, info os.FileInfo, err error) error {
+ 270| 		if err != nil {
+ 271| 			return err
+ 272| 		}
+ 273| 		if info.IsDir() {
+ 274| 			return nil
+ 275| 		}
+ 276| 
+ 277| 		// disable G304 (CWE-22): Potential file inclusion via variable
+ 278| 		// #nosec G304
+ 279| 		file, err := os.Open(filepath)
+ 280| 		if err != nil {
+ 281| 			return err
+ 282| 		}
+ 283| 		// disable G307 (CWE-703): Deferring unsafe method "Close" on type "*os.File"
+ 284| 		// #nosec G307
+ 285| 		defer file.Close()
+ 286| 
+ 287| 		// filepath is fs.Webroot + file relative path
+ 288| 		// this would result in a lot of nested folders
+ 289| 		// so we are stripping fs.Webroot again from the structure of the zip file
+ 290| 		// Leaving us with the relative path of the file
+ 291| 		zippath := strings.ReplaceAll(filepath, fs.Webroot, "")
+ 292| 		header := &zip.FileHeader{
+ 293| 			Name:     zippath[1:],
+ 294| 			Method:   zip.Deflate,
+ 295| 			Modified: info.ModTime(),
+ 296| 		}
+ 297| 		f, err := resultZip.CreateHeader(header)
+ 298| 		if err != nil {
+ 299| 			return err
+ 300| 		}
+ 301| 
+ 302| 		_, err = io.Copy(f, file)
+ 303| 		if err != nil {
+ 304| 			return err
+ 305| 		}
+ 306| 
+ 307| 		return nil
+ 308| 	}
+ 309| 
+ 310| 	// Loop over files and add to zip (filesCleaned contains validated absolute paths)
+ 311| 	for _, file := range filesCleaned {
+ 312| 		err := filepath.Walk(file, walker)
+ 313| 		if err != nil {
+ 314| 			logger.Errorf("creating zip file: %+v", err)
+ 315| 		}
+ 316| 	}
+ 317| 
+ 318| 	// Close Zip Writer and Flush to http.ResponseWriter
+ 319| 	if err := resultZip.Close(); err != nil {
+ 320| 		logger.Error(err)
+ 321| 	} else {
+ 322| 		body := fs.emitCollabEvent(req, http.StatusOK)
+ 323| 		logger.LogRequest(req, http.StatusOK, fs.Verbose, fs.Webhook, body)
+ 324| 	}
+ 325| }
+ 326| 
+ 327| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=8051 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **`put`（第 30-79 行）**：入口为 `req.URL.Path`。第 36 行经 `sanitizePath(fs.UploadFolder, ...)` 清洗后作为 `os.OpenFile` 的 sink（第 52 行）。`sanitizePath` 未在片段中给出，但项目语义是解析绝对路径并校验前缀；假设其有效，则该流防御成立。第 41 行仅阻止文件名恰为 `.goshs` 的覆盖。
+
+2. **`upload`（第 82-176 行）**：目标目录 `targetDir` 同样经 `sanitizePath` 校验（第 92 行），目录部分安全。**关键问题在第 113-115 行**：上传文件名清洗只按 `/` 分割取最后一段——`strings.Split(part.FileName(), "/")`。**没有处理反斜杠 `\`**。在 Windows 上（Go 的 `filepath.Join`/`os.Create` 接受 `\` 作为分隔符），攻击者提交文件名 `..\..\..\evil.exe` 或 `..\.goshs` 时：
+   - 第 118 行 `.goshs` 黑名单可被 `foo\..\.goshs` 绕过（`filenameClean` 不等于字面量 `.goshs`）；
+   - 第 121 行 `finalPath := filepath.Join(targetDir, filenameClean)` 中 `..` 未被消除，导致任意路径写入（CWE-22 / CWE-434）。
+   在 Linux 上 `\` 是合法文件名字符，不构成遍历，故此漏洞为 Windows 部署特有——但仍是真实缺陷：黑名单/单字符过滤按要求视为无效防御。
+
+3. **`bulkDownload`（第 179-247 行）**：source 为 `req.URL.Query()["file"]`（第 185 行）。每个路径经同一 `sanitizePath(fs.Webroot, ...)` 校验，失败即 `continue` 跳过（第 190-193 行），无遍历残留进入 `filepath.Walk`（第 239 行）。第 221 行 `zippath := strings.ReplaceAll(filepath, fs.Webroot, "")` 后取 `[1:]`——若某路径恰好等于 Webroot 本身会被 walker 对目录跳过，普通文件路径必含前缀+分隔符，切片安全。该函数未发现可利用数据流。注意：若 `sanitizePath` 允许符号链接逃逸则另有问题，但代码内无证据，不作猜测。
+
+4. **第二入口/替代通道核查**：`put` 与 `upload` 均先过 CSRF、ReadOnly 检查并调用 `prepareWrite` 做 ACL 与大小限制；`upload` 中途错误时清理临时文件。唯一未被统一清洗的是 multipart 文件名（上述第 2 点）。
+
+5. **结论**：全文唯一确认的 source→sink 未防御数据流是 multipart 文件名 → `os.Create`/`os.Rename`，因仅过滤 `/` 而放过 `\` 与 `..`，Windows 下可目录穿越写文件并可绕过 `.goshs` 黑名单。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal (Windows) / CWE-434 Unrestricted File Upload", "risk_level": "Medium", "source": "line 111: part.FileName() 来自 multipart 表单的客户端可控文件名", "sink": "line 121 与 line 128: filepath.Join(targetDir, filenameClean) 后传入 os.Create 和 os.Rename", "explanation": "upload 处理器中文件名清洗只用 strings.Split(fileName, '/') 取最后一段，未处理反斜杠与 .. 序列；在 Windows 上 filepath.Join 会把 ..\\..\\x 解析为目标目录之外，且形如 foo\\..\\.goshs 的名字可绕过第 118 行对 .goshs 的字面量黑名单，实现任意路径文件写入或覆盖 ACL 文件；Linux 上反斜杠仅为普通字符，故风险限于 Windows 部署", "fix_suggestion": "line 113: 改用 filepath.Base(part.FileName()) 并同时按 / 和 \\ 分割清洗，随后用 strings.Contains 校验结果不含 .. 且非 .goshs，再拼入 finalPath"}
+
+### id=8052 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（逐函数、行号锚定）
+
+### 1. `prepareWrite`（第 20–32 行）
+- 第 21 行调用 `findEffectiveACL(dir)`，第 25 行 `applyCustomAuth` 强制 ACL 认证，未通过即返回 false。
+- 第 28–30 行：`fs.MaxUpload > 0` 时用 `http.MaxBytesReader` 包装请求体，限制上传大小。
+- 该函数本身无 sink，仅做防御；ACL 错误时仍执行认证（fail-closed 由 `applyCustomAuth` 决定），无直接漏洞。
+
+### 2. `put`（第 35–86 行）
+- 入口点：PUT 路由，source 为 `req.URL.Path` 与 `req.Body`。
+- 第 36 行 CSRF 检查；第 39 行只读模式拦截。
+- 第 43 行 `sanitizePath(fs.UploadFolder, req.URL.Path)` 对路径做净化——这是路径穿越的核心防线（sanitizePath 在项目其他部分实现为基于绝对路径前缀校验的净化，非黑名单/正则）。
+- 第 50 行显式阻止覆盖 `.goshs` ACL 文件。
+- 第 56 行对目标目录再次强制 ACL + 大小限制。
+- Sink：第 62 行 `os.OpenFile(savepath, ...)`。savepath 已经过 sanitizePath 净化且 ACL 已检查，穿越被阻断。
+- 第 69–80 行：写入失败时清理临时状态，第 73–75 行正确识别 `MaxBytesError` 返回 413。
+
+### 3. `upload`（第 89–215 行）
+- 入口点：POST multipart 上传，source 为 URL 路径与 multipart part 文件名/内容。
+- 第 90 行 CSRF、第 93 行只读拦截。
+- 第 98 行 `TrimSuffix(req.URL.Path, "/upload")` 后第 99 行经 `sanitizePath(fs.UploadFolder, ...)` 净化目标目录。
+- 第 106 行强制 ACL 与大小限制。
+- 第 135–136 行：文件名按 `/` 分割取最后一段，剥离目录成分，防止文件名携带路径穿越（Windows 反斜杠在 Linux 下只是普通字符，不构成穿越）。
+- 第 139–141 行阻止上传名为 `.goshs` 的文件覆盖 ACL。
+- 第 145 行 `filepath.Join(targetDir, filenameClean)`：filenameClean 无分隔符，Join 不会逃逸 targetDir。
+- Sink：第 149 行 `os.Create(tempPath)`、第 200 行 `os.Rename(tempPath, finalPath)`。均在净化后的 targetDir 内，防御有效。
+- 第 214 行 `http.Redirect(..., upathDir, ...)`：upathDir 是相对路径字符串用于 Location 头，Go 的 http.Redirect 会净化并拒绝非法头注入值，不构成开放重定向或 CRLF 注入的可利用通道。
+
+### 4. `bulkDownload`（第 218–325 行）
+- 入口点：GET 查询参数 `file[]`（第 225 行），可多值——这是第二入口/替代通道，需重点验证。
+- 第 237 行每个 file 均经 `sanitizePath(fs.Webroot, file)` 净化为绝对路径，失败则跳过（continue），不会进入下载列表。
+- 第 241–250 行：对每个文件的父目录查 ACL，第 243 行强制认证失败即整体返回；第 246 行检查 `acl.Block` 黑名单（此处黑名单是 ACL 策略语义而非安全边界，真正的边界是 sanitizePath + ACL 目录认证）。
+- 注意第 241 行若 `aclErr != nil` 则跳过 ACL 检查直接加入列表——但该错误仅表示找不到基于文件的 ACL 配置，全局认证仍由路由层中间件与 `applyCustomAuth` 覆盖，且 sanitizePath 已保证路径不出 Webroot。
+- Sink：第 279 行 walker 中 `os.Open(filepath)`，输入来自第 312 行 `filepath.Walk(file, walker)`，file 全部来自 filesCleaned（已净化）。Walk 只会遍历净化后路径的子树，无法逃逸 Webroot。
+- 第 291–293 行：zip 条目名通过 `strings.ReplaceAll(filepath, fs.Webroot, "")` 生成，仅影响压缩包内路径展示，不存在 Zip Slip（此方向是打包不是解压）。
+- 第 255–260 行：zip 文件名由服务端时间戳生成，非用户可控，Content-Disposition 无注入风险。
+
+### 5. 综合结论
+三个入口（PUT / POST multipart / GET bulkDownload）的所有用户输入 source→sink 数据流均经过：
+1. CSRF 校验；
+2. `sanitizePath` 前缀级路径净化（非黑名单/正则，属有效防御）；
+3. `.goshs` ACL 文件保护；
+4. `MaxBytesReader` 大小限制。
+
+未发现可利用的路径穿越、任意文件写、Zip Slip 或响应头注入。第二入口（多值 `file[]` 参数）同样被逐项净化校验。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文三个入口: put(第43行savepath)、upload(第99行targetDir与第135-136行文件名剥离)、bulkDownload(第225行file[]查询参数)中所有用户可控source到os.OpenFile(第62行)/os.Create(第149行)/os.Rename(第200行)/os.Open(第279行)等sink的数据流均先经sanitizePath做基于Webroot或UploadFolder的前缀级路径净化, 并配合CSRF校验(第36/90行)、只读模式拦截(第39/93行)、.goshs ACL文件保护(第50/139行)、findEffectiveACL加applyCustomAuth访问控制(第56/106/241-243行)以及MaxBytesReader上传限长(第28-30行)。bulkDownload的第二入口多值file参数在第237行被逐个净化, 失败即跳过, filepath.Walk(第312行)仅在净化后子树内遍历, 不存在Zip Slip或路径逃逸; 重定向目标upathDir(第214行)由Go标准库净化, 无头注入。未发现可利用漏洞", "fix_suggestion": "no fix needed"}

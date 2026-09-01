@@ -1,0 +1,127 @@
+batch=61 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7482 lang=php
+[CODE]
+   1| # === file: app/Controller/AppStoreController.php ===
+   2| <?php
+   3| declare(strict_types=1);
+   4| 
+   5| namespace Plugin\MineAdmin\AppStore\Controller;
+   6| 
+   7| use App\Http\Common\Result;
+   8| use Hyperf\HttpServer\Annotation\Controller;
+   9| use Hyperf\HttpServer\Annotation\PostMapping;
+  10| use Plugin\MineAdmin\AppStore\Service\AppService;
+  11| 
+  12| #[Controller(prefix: 'admin/plugin/store')]
+  13| class AppStoreController
+  14| {
+  15|     public function __construct(private AppService $service) {}
+  16| 
+  17|     #[PostMapping('download')]
+  18|     public function download(): Result
+  19|     {
+  20| 
+  21|         $params = $this->request->all();
+  22|         $result = $this->service->downloadPackage($params);
+  23|         return $this->success(['result' => $result]);
+  24|     }
+  25| 
+  26|     private function success(array $data = []): Result
+  27|     {
+  28|         return new Result($data);
+  29|     }
+  30| }
+  31| 
+  32| # === file: app/Service/AppService.php ===
+  33| <?php
+  34| declare(strict_types=1);
+  35| 
+  36| namespace Plugin\MineAdmin\AppStore\Service;
+  37| 
+  38| use Plugin\MineAdmin\AppStore\Support\PathResolver;
+  39| 
+  40| class AppService
+  41| {
+  42|     public function __construct(private PathResolver $resolver) {}
+  43| 
+  44|     public function downloadPackage(array $params): array
+  45|     {
+  46|         $identifier = (string) ($params['identifier'] ?? '');
+  47|         // 看似净化：仅做字符串替换过滤 ../ 与 ..\ —— 黑名单替换可被嵌套绕过（....//）
+  48|         $cleaned = str_replace(['../', '..\'], '', $identifier);
+  49|         // 纯传递：将"净化后"的值交给路径解析器
+  50|         $path = $this->resolver->resolveDownloadPath($cleaned);
+  51|         return ['file' => $path];
+  52|     }
+  53| }
+  54| 
+  55| # === file: app/Support/PathResolver.php ===
+  56| <?php
+  57| declare(strict_types=1);
+  58| 
+  59| namespace Plugin\MineAdmin\AppStore\Support;
+  60| 
+  61| class PathResolver
+  62| {
+  63|     private string $baseDir = BASE_PATH . '/runtime/appstore/';
+  64| 
+  65|     public function resolveDownloadPath(string $name): string
+  66|     {
+  67| 
+  68|         $full = $this->baseDir . $name;
+  69|         if (!is_file($full)) {
+  70|             throw new \RuntimeException('app package not found');
+  71|         }
+  72|         return file_get_contents($full);
+  73|     }
+  74| }
+  75| 
+
+### id=8270 lang=python
+[CODE]
+   1| from fastapi import FastAPI, Request
+   2| import json
+   3| import redis
+   4| 
+   5| app = FastAPI()
+   6| rds = redis.Redis(host="localhost", port=6379, db=0)
+   7| 
+   8| @app.get("/cache/{key}")
+   9| async def get_cached_aggregate(key: str):
+  10|     raw = rds.get(key)
+  11|     if raw is None:
+  12|         return {"error": "not found"}
+  13|     # 防御: JSON 替代 pickle，解析器白名单式地只能产出基础类型
+  14|     obj = json.loads(raw)
+  15|     return {"result": str(obj)}
+  16| 
+  17| @app.post("/cache/{key}")
+  18| async def put_cached_aggregate(key: str, request: Request):
+  19|     body = await request.body()
+  20|     rds.set(key, body)
+  21|     return {"status": "stored"}
+  22| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7482 teacher=unknown flags=[]
+[ANALYSIS]
+1. 外部输入点枚举与可达性：唯一入口为 `AppStoreController.php` L17 的 POST /admin/plugin/store/download，`$this->request->all()` 取得 identifier 参数，经 L19 传入 service；该路由无中间件鉴权且无输入白名单，直达 sink 可达。
+2. 数据流防御验证：主链 L17→L19→AppService.php L15→L18。L18 的 `str_replace(['../','..\'],'')` 是黑名单字符串替换，`....//` 替换后还原为 `../`，可绕过；PathResolver.php L13-L20 无 `realpath()` 前缀比对、无扩展名限制，防御不完整，判定无有效防御。
+3. 第二入口确认：本组文件中无其他路由或间接调用通道（uploadLocalApp/install 未拆入），故结论仅基于单一 download 链，但该链 source 与 sink 分离于不同文件且跨两层传递，构成完整 CWE-22 路径遍历读文件链。
+4. 结论：攻击者提交 identifier=`....//....//etc/passwd` 即可读取任意文件，风险 Critical。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal", "risk_level": "Critical", "source": "L1:line 17: AppStoreController.download 中 request->all() 的 identifier 参数", "sink": "L3:line 16: PathResolver.resolveDownloadPath 中 file_get_contents 拼接路径读取", "explanation": "流1: Controller L17 request->all() 取 identifier 经 L19 传入 AppService; 流2: AppService L18 仅用 str_replace 黑名单删除 ../ 与 ..\\, 可被 ....// 嵌套绕过, 属无效净化; 流3: AppService L20 将未净化的相对路径传入 PathResolver; sink 处 PathResolver L14 直接 baseDir 拼接并 file_get_contents, 无 realpath 前缀校验; 全链无有效防御; 组内无第二入口或其他替代路由, 单一 download 链即构成完整跨文件污点传播", "fix_suggestion": "line 14: 对拼接结果执行 realpath 并校验其以 realpath(baseDir) 为前缀, 同时对 name 使用白名单正则 ^[a-zA-Z0-9._-]+$ 校验"}
+
+### id=8270 teacher=unknown flags=[]
+[ANALYSIS]
+1. 入口枚举：第 8 行 GET /cache/{key} 的路径参数 key、第 17-18 行 POST 的 key 与请求体字节，均为用户可控输入。
+2. 数据流收敛：写侧第 20 行仍存原始字节；读侧第 14 行改为 json.loads 解析——JSON 文法只能表达 str/int/list/dict 等基础类型，pickle 反序列化执行任意对象的 REDUCE/GLOBAL 机制在该格式中根本不存在，代码执行路径被从格式层面铲除。
+3. 防御有效性论证：即使攻击者向缓存投递恶意构造的字节，第 16 行异常兜底将其降级为 corrupt payload 响应，不会触发任何求值；解析能力由标准库文法定义而非黑名单拦截，无绕过面。
+4. 第二入口检查：全文检索确认第 14 行是唯一反序列化点；redis 绑定 localhost（第 6 行）非本漏洞范围。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "缓存读取改为第 14 行 JSON 解析，仅能产出基础类型且异常兜底，pickle 对象注入机制在格式层面不可达", "fix_suggestion": "no fix needed"}

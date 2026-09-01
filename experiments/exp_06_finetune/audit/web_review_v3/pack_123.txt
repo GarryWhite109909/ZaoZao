@@ -1,0 +1,599 @@
+batch=123 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7939 lang=python
+[CODE]
+   1| """
+   2| Agent that supports asking queries about a tabular dataset, internally
+   3| represented as a Pandas dataframe. The `TableChatAgent` is configured with a
+   4| dataset, which can be a Pandas df, file or URL. The delimiter/separator
+   5| is auto-detected. In response to a user query, the Agent's LLM generates a Pandas
+   6| expression (involving a dataframe `df`) to answer the query.
+   7| The expression is passed via the `pandas_eval` tool/function-call,
+   8| which is handled by the Agent's `pandas_eval` method. This method evaluates
+   9| the expression and returns the result as a string.
+  10| """
+  11| 
+  12| import io
+  13| import logging
+  14| import sys
+  15| from typing import List, Optional, Tuple, no_type_check
+  16| 
+  17| import numpy as np
+  18| import pandas as pd
+  19| from rich.console import Console
+  20| 
+  21| import langroid as lr
+  22| from langroid.agent import ChatDocument
+  23| from langroid.agent.chat_agent import ChatAgent, ChatAgentConfig
+  24| from langroid.agent.tool_message import ToolMessage
+  25| from langroid.language_models.openai_gpt import OpenAIChatModel, OpenAIGPTConfig
+  26| from langroid.parsing.table_loader import read_tabular_data
+  27| from langroid.prompts.prompts_config import PromptsConfig
+  28| from langroid.utils.constants import DONE, PASS
+  29| from langroid.vector_store.base import VectorStoreConfig
+  30| 
+  31| logger = logging.getLogger(__name__)
+  32| 
+  33| console = Console()
+  34| 
+  35| DEFAULT_TABLE_CHAT_SYSTEM_MESSAGE = f"""
+  36| You are a savvy data scientist, with expertise in analyzing tabular datasets,
+  37| using Python and the Pandas library for dataframe manipulation.
+  38| Since you do not have access to the dataframe 'df', you
+  39| will need to use the `pandas_eval` tool/function-call to answer my questions.
+  40| Here is a summary of the dataframe:
+  41| {{summary}}
+  42| Do not assume any columns other than those shown.
+  43| In the expression you submit to the `pandas_eval` tool/function, 
+  44| you are allowed to use the variable 'df' to refer to the dataframe.
+  45| 
+  46| Sometimes you may not be able to answer the question in a single call to `pandas_eval`,
+  47| so you can use a series of calls to `pandas_eval` to build up the answer. 
+  48| For example you may first want to know something about the possible values in a column.
+  49| 
+  50| If you receive a null or other unexpected result, see if you have made an assumption
+  51| in your code, and try another way, or use `pandas_eval` to explore the dataframe 
+  52| before submitting your final code. 
+  53| 
+  54| Once you have the answer to the question, possibly after a few steps,
+  55| say {DONE} and PRESENT THE ANSWER TO ME; do not just say {DONE}.
+  56| If you receive an error message, 
+  57| try using the `pandas_eval` tool/function again with the corrected code. 
+  58| 
+  59| VERY IMPORTANT: When using the `pandas_eval` tool/function, DO NOT EXPLAIN ANYTHING,
+  60|    SIMPLY USE THE TOOL, with the CODE.
+  61| Start by asking me what I want to know about the data.
+  62| """
+  63| 
+  64| 
+  65| @no_type_check
+  66| def dataframe_summary(df: pd.DataFrame) -> str:
+  67|     """
+  68|     Generate a structured summary for a pandas DataFrame containing numerical
+  69|     and categorical values.
+  70| 
+  71|     Args:
+  72|         df (pd.DataFrame): The input DataFrame to summarize.
+  73| 
+  74|     Returns:
+  75|         str: A nicely structured and formatted summary string.
+  76|     """
+  77| 
+  78|     # Column names display
+  79|     col_names_str = (
+  80|         "COLUMN NAMES:\n" + " ".join([f"'{col}'" for col in df.columns]) + "\n\n"
+  81|     )
+  82| 
+  83|     # Numerical data summary
+  84|     num_summary = df.describe().map(lambda x: "{:.2f}".format(x))
+  85|     num_str = "Numerical Column Summary:\n" + num_summary.to_string() + "\n\n"
+  86| 
+  87|     # Categorical data summary
+  88|     cat_columns = df.select_dtypes(include=[np.object_]).columns
+  89|     cat_summary_list = []
+  90| 
+  91|     for col in cat_columns:
+  92|         unique_values = df[col].unique()
+  93|         if len(unique_values) < 10:
+  94|             cat_summary_list.append(f"'{col}': {', '.join(map(str, unique_values))}")
+  95|         else:
+  96|             cat_summary_list.append(f"'{col}': {df[col].nunique()} unique values")
+  97| 
+  98|     cat_str = "Categorical Column Summary:\n" + "\n".join(cat_summary_list) + "\n\n"
+  99| 
+ 100|     # Missing values summary
+ 101|     nan_summary = df.isnull().sum().rename("missing_values").to_frame()
+ 102|     nan_str = "Missing Values Column Summary:\n" + nan_summary.to_string() + "\n"
+ 103| 
+ 104|     # Combine the summaries into one structured string
+ 105|     summary_str = col_names_str + num_str + cat_str + nan_str
+ 106| 
+ 107|     return summary_str
+ 108| 
+ 109| 
+ 110| class TableChatAgentConfig(ChatAgentConfig):
+ 111|     system_message: str = DEFAULT_TABLE_CHAT_SYSTEM_MESSAGE
+ 112|     user_message: None | str = None
+ 113|     cache: bool = True  # cache results
+ 114|     debug: bool = False
+ 115|     stream: bool = True  # allow streaming where needed
+ 116|     data: str | pd.DataFrame  # data file, URL, or DataFrame
+ 117|     separator: None | str = None  # separator for data file
+ 118|     vecdb: None | VectorStoreConfig = None
+ 119|     llm: OpenAIGPTConfig = OpenAIGPTConfig(
+ 120|         type="openai",
+ 121|         chat_model=OpenAIChatModel.GPT4o,
+ 122|         completion_model=OpenAIChatModel.GPT4o,
+ 123|     )
+ 124|     prompts: PromptsConfig = PromptsConfig(
+ 125|         max_tokens=1000,
+ 126|     )
+ 127| 
+ 128| 
+ 129| class PandasEvalTool(ToolMessage):
+ 130|     """Tool/function to evaluate a pandas expression involving a dataframe `df`"""
+ 131| 
+ 132|     request: str = "pandas_eval"
+ 133|     purpose: str = """
+ 134|             To eval a pandas <expression> on the dataframe 'df' and 
+ 135|             return the results to answer a question.
+ 136|             IMPORTANT: the <expression> field should be a valid pandas expression.
+ 137|             """
+ 138|     expression: str
+ 139| 
+ 140|     @classmethod
+ 141|     def examples(cls) -> List["ToolMessage" | Tuple[str, "ToolMessage"]]:
+ 142|         return [
+ 143|             cls(expression="df.head()"),
+ 144|             cls(expression="df[(df['gender'] == 'Male')]['income'].mean()"),
+ 145|         ]
+ 146| 
+ 147|     @classmethod
+ 148|     def instructions(cls) -> str:
+ 149|         return """
+ 150|             Use the `pandas_eval` tool/function to evaluate a pandas expression
+ 151|             involving the dataframe 'df' to answer the user's question.
+ 152|             """
+ 153| 
+ 154| 
+ 155| class TableChatAgent(ChatAgent):
+ 156|     """
+ 157|     Agent for chatting with a collection of documents.
+ 158|     """
+ 159| 
+ 160|     sent_expression: bool = False
+ 161| 
+ 162|     def __init__(self, config: TableChatAgentConfig):
+ 163|         if isinstance(config.data, pd.DataFrame):
+ 164|             df = config.data
+ 165|         else:
+ 166|             df = read_tabular_data(config.data, config.separator)
+ 167| 
+ 168|         df.columns = df.columns.str.strip().str.replace(" +", "_", regex=True)
+ 169| 
+ 170|         self.df = df
+ 171|         summary = dataframe_summary(df)
+ 172|         config.system_message = config.system_message.format(summary=summary)
+ 173| 
+ 174|         super().__init__(config)
+ 175|         self.config: TableChatAgentConfig = config
+ 176| 
+ 177|         logger.info(
+ 178|             f"""TableChatAgent initialized with dataframe of shape {self.df.shape}
+ 179|             and columns: 
+ 180|             {self.df.columns}
+ 181|             """
+ 182|         )
+ 183|         # enable the agent to use and handle the PandasEvalTool
+ 184|         self.enable_message(PandasEvalTool)
+ 185| 
+ 186|     def user_response(
+ 187|         self,
+ 188|         msg: Optional[str | ChatDocument] = None,
+ 189|     ) -> Optional[ChatDocument]:
+ 190|         response = super().user_response(msg)
+ 191|         if response is not None and response.content != "":
+ 192|             self.sent_expression = False
+ 193|         return response
+ 194| 
+ 195|     def pandas_eval(self, msg: PandasEvalTool) -> str:
+ 196|         """
+ 197|         Handle a PandasEvalTool message by evaluating the `expression` field
+ 198|             and returning the result.
+ 199|         Args:
+ 200|             msg (PandasEvalTool): The tool-message to handle.
+ 201| 
+ 202|         Returns:
+ 203|             str: The result of running the code along with any print output.
+ 204|         """
+ 205|         self.sent_expression = True
+ 206|         exprn = msg.expression
+ 207|         local_vars = {"df": self.df}
+ 208|         # Create a string-based I/O stream
+ 209|         code_out = io.StringIO()
+ 210| 
+ 211|         # Temporarily redirect standard output to our string-based I/O stream
+ 212|         sys.stdout = code_out
+ 213| 
+ 214|         # Evaluate the last line and get the result
+ 215|         try:
+ 216|             eval_result = pd.eval(exprn, local_dict=local_vars)
+ 217|         except Exception as e:
+ 218|             eval_result = f"ERROR: {type(e)}: {e}"
+ 219| 
+ 220|         if eval_result is None:
+ 221|             eval_result = ""
+ 222| 
+ 223|         # Always restore the original standard output
+ 224|         sys.stdout = sys.__stdout__
+ 225| 
+ 226|         # If df has been modified in-place, save the changes back to self.df
+ 227|         self.df = local_vars["df"]
+ 228| 
+ 229|         # Get the resulting string from the I/O stream
+ 230|         print_result = code_out.getvalue() or ""
+ 231|         sep = "\n" if print_result else ""
+ 232|         # Combine the print and eval results
+ 233|         result = f"{print_result}{sep}{eval_result}"
+ 234|         if result == "":
+ 235|             result = "No result"
+ 236|         # Return the result
+ 237|         return result
+ 238| 
+ 239|     def handle_message_fallback(
+ 240|         self, msg: str | ChatDocument
+ 241|     ) -> str | ChatDocument | None:
+ 242|         """Handle various LLM deviations"""
+ 243|         if isinstance(msg, ChatDocument) and msg.metadata.sender == lr.Entity.LLM:
+ 244|             if msg.content.strip() == DONE and self.sent_expression:
+ 245|                 # LLM sent an expression (i.e. used the `pandas_eval` tool)
+ 246|                 # but upon receiving the results, simply said DONE without
+ 247|                 # narrating the result as instructed.
+ 248|                 return """
+ 249|                     You forgot to PRESENT the answer to the user's query
+ 250|                     based on the results from `pandas_eval` tool.
+ 251|                 """
+ 252|             if self.sent_expression:
+ 253|                 # LLM forgot to say DONE
+ 254|                 self.sent_expression = False
+ 255|                 return DONE + " " + PASS
+ 256|             else:
+ 257|                 # LLM forgot to use the `pandas_eval` tool
+ 258|                 return """
+ 259|                     You forgot to use the `pandas_eval` tool/function 
+ 260|                     to find the answer.
+ 261|                     Try again using the `pandas_eval` tool/function.
+ 262|                     """
+ 263|         return None
+ 264| 
+ 265| 
+
+### id=7940 lang=python
+[CODE]
+   1| """
+   2| Agent that supports asking queries about a tabular dataset, internally
+   3| represented as a Pandas dataframe. The `TableChatAgent` is configured with a
+   4| dataset, which can be a Pandas df, file or URL. The delimiter/separator
+   5| is auto-detected. In response to a user query, the Agent's LLM generates a Pandas
+   6| expression (involving a dataframe `df`) to answer the query.
+   7| The expression is passed via the `pandas_eval` tool/function-call,
+   8| which is handled by the Agent's `pandas_eval` method. This method evaluates
+   9| the expression and returns the result as a string.
+  10| """
+  11| 
+  12| import io
+  13| import logging
+  14| import sys
+  15| from typing import List, Optional, Tuple, no_type_check
+  16| 
+  17| import numpy as np
+  18| import pandas as pd
+  19| from rich.console import Console
+  20| 
+  21| import langroid as lr
+  22| from langroid.agent import ChatDocument
+  23| from langroid.agent.chat_agent import ChatAgent, ChatAgentConfig
+  24| from langroid.agent.tool_message import ToolMessage
+  25| from langroid.language_models.openai_gpt import OpenAIChatModel, OpenAIGPTConfig
+  26| from langroid.parsing.table_loader import read_tabular_data
+  27| from langroid.prompts.prompts_config import PromptsConfig
+  28| from langroid.utils.constants import DONE, PASS
+  29| from langroid.vector_store.base import VectorStoreConfig
+  30| 
+  31| logger = logging.getLogger(__name__)
+  32| 
+  33| console = Console()
+  34| 
+  35| DEFAULT_TABLE_CHAT_SYSTEM_MESSAGE = f"""
+  36| You are a savvy data scientist, with expertise in analyzing tabular datasets,
+  37| using Python and the Pandas library for dataframe manipulation.
+  38| Since you do not have access to the dataframe 'df', you
+  39| will need to use the `pandas_eval` tool/function-call to answer my questions.
+  40| Here is a summary of the dataframe:
+  41| {{summary}}
+  42| Do not assume any columns other than those shown.
+  43| In the expression you submit to the `pandas_eval` tool/function, 
+  44| you are allowed to use the variable 'df' to refer to the dataframe.
+  45| 
+  46| Sometimes you may not be able to answer the question in a single call to `pandas_eval`,
+  47| so you can use a series of calls to `pandas_eval` to build up the answer. 
+  48| For example you may first want to know something about the possible values in a column.
+  49| 
+  50| If you receive a null or other unexpected result, see if you have made an assumption
+  51| in your code, and try another way, or use `pandas_eval` to explore the dataframe 
+  52| before submitting your final code. 
+  53| 
+  54| Once you have the answer to the question, possibly after a few steps,
+  55| say {DONE} and PRESENT THE ANSWER TO ME; do not just say {DONE}.
+  56| If you receive an error message, 
+  57| try using the `pandas_eval` tool/function again with the corrected code. 
+  58| 
+  59| VERY IMPORTANT: When using the `pandas_eval` tool/function, DO NOT EXPLAIN ANYTHING,
+  60|    SIMPLY USE THE TOOL, with the CODE.
+  61| Start by asking me what I want to know about the data.
+  62| """
+  63| 
+  64| 
+  65| @no_type_check
+  66| def dataframe_summary(df: pd.DataFrame) -> str:
+  67|     """
+  68|     Generate a structured summary for a pandas DataFrame containing numerical
+  69|     and categorical values.
+  70| 
+  71|     Args:
+  72|         df (pd.DataFrame): The input DataFrame to summarize.
+  73| 
+  74|     Returns:
+  75|         str: A nicely structured and formatted summary string.
+  76|     """
+  77| 
+  78|     # Column names display
+  79|     col_names_str = (
+  80|         "COLUMN NAMES:\n" + " ".join([f"'{col}'" for col in df.columns]) + "\n\n"
+  81|     )
+  82| 
+  83|     # Numerical data summary
+  84|     num_summary = df.describe().map(lambda x: "{:.2f}".format(x))
+  85|     num_str = "Numerical Column Summary:\n" + num_summary.to_string() + "\n\n"
+  86| 
+  87|     # Categorical data summary
+  88|     cat_columns = df.select_dtypes(include=[np.object_]).columns
+  89|     cat_summary_list = []
+  90| 
+  91|     for col in cat_columns:
+  92|         unique_values = df[col].unique()
+  93|         if len(unique_values) < 10:
+  94|             cat_summary_list.append(f"'{col}': {', '.join(map(str, unique_values))}")
+  95|         else:
+  96|             cat_summary_list.append(f"'{col}': {df[col].nunique()} unique values")
+  97| 
+  98|     cat_str = "Categorical Column Summary:\n" + "\n".join(cat_summary_list) + "\n\n"
+  99| 
+ 100|     # Missing values summary
+ 101|     nan_summary = df.isnull().sum().rename("missing_values").to_frame()
+ 102|     nan_str = "Missing Values Column Summary:\n" + nan_summary.to_string() + "\n"
+ 103| 
+ 104|     # Combine the summaries into one structured string
+ 105|     summary_str = col_names_str + num_str + cat_str + nan_str
+ 106| 
+ 107|     return summary_str
+ 108| 
+ 109| 
+ 110| class TableChatAgentConfig(ChatAgentConfig):
+ 111|     system_message: str = DEFAULT_TABLE_CHAT_SYSTEM_MESSAGE
+ 112|     user_message: None | str = None
+ 113|     cache: bool = True  # cache results
+ 114|     debug: bool = False
+ 115|     stream: bool = True  # allow streaming where needed
+ 116|     data: str | pd.DataFrame  # data file, URL, or DataFrame
+ 117|     separator: None | str = None  # separator for data file
+ 118|     vecdb: None | VectorStoreConfig = None
+ 119|     llm: OpenAIGPTConfig = OpenAIGPTConfig(
+ 120|         type="openai",
+ 121|         chat_model=OpenAIChatModel.GPT4o,
+ 122|         completion_model=OpenAIChatModel.GPT4o,
+ 123|     )
+ 124|     prompts: PromptsConfig = PromptsConfig(
+ 125|         max_tokens=1000,
+ 126|     )
+ 127| 
+ 128| 
+ 129| class PandasEvalTool(ToolMessage):
+ 130|     """Tool/function to evaluate a pandas expression involving a dataframe `df`"""
+ 131| 
+ 132|     request: str = "pandas_eval"
+ 133|     purpose: str = """
+ 134|             To eval a pandas <expression> on the dataframe 'df' and 
+ 135|             return the results to answer a question.
+ 136|             IMPORTANT: the <expression> field should be a valid pandas expression.
+ 137|             """
+ 138|     expression: str
+ 139| 
+ 140|     @classmethod
+ 141|     def examples(cls) -> List["ToolMessage" | Tuple[str, "ToolMessage"]]:
+ 142|         return [
+ 143|             cls(expression="df.head()"),
+ 144|             cls(expression="df[(df['gender'] == 'Male')]['income'].mean()"),
+ 145|         ]
+ 146| 
+ 147|     @classmethod
+ 148|     def instructions(cls) -> str:
+ 149|         return """
+ 150|             Use the `pandas_eval` tool/function to evaluate a pandas expression
+ 151|             involving the dataframe 'df' to answer the user's question.
+ 152|             """
+ 153| 
+ 154| 
+ 155| class TableChatAgent(ChatAgent):
+ 156|     """
+ 157|     Agent for chatting with a collection of documents.
+ 158|     """
+ 159| 
+ 160|     sent_expression: bool = False
+ 161| 
+ 162|     def __init__(self, config: TableChatAgentConfig):
+ 163|         if isinstance(config.data, pd.DataFrame):
+ 164|             df = config.data
+ 165|         else:
+ 166|             df = read_tabular_data(config.data, config.separator)
+ 167| 
+ 168|         df.columns = df.columns.str.strip().str.replace(" +", "_", regex=True)
+ 169| 
+ 170|         self.df = df
+ 171|         summary = dataframe_summary(df)
+ 172|         config.system_message = config.system_message.format(summary=summary)
+ 173| 
+ 174|         super().__init__(config)
+ 175|         self.config: TableChatAgentConfig = config
+ 176| 
+ 177|         logger.info(
+ 178|             f"""TableChatAgent initialized with dataframe of shape {self.df.shape}
+ 179|             and columns: 
+ 180|             {self.df.columns}
+ 181|             """
+ 182|         )
+ 183|         # enable the agent to use and handle the PandasEvalTool
+ 184|         self.enable_message(PandasEvalTool)
+ 185| 
+ 186|     def user_response(
+ 187|         self,
+ 188|         msg: Optional[str | ChatDocument] = None,
+ 189|     ) -> Optional[ChatDocument]:
+ 190|         response = super().user_response(msg)
+ 191|         if response is not None and response.content != "":
+ 192|             self.sent_expression = False
+ 193|         return response
+ 194| 
+ 195|     def pandas_eval(self, msg: PandasEvalTool) -> str:
+ 196|         """
+ 197|         Handle a PandasEvalTool message by evaluating the `expression` field
+ 198|             and returning the result.
+ 199|         Args:
+ 200|             msg (PandasEvalTool): The tool-message to handle.
+ 201| 
+ 202|         Returns:
+ 203|             str: The result of running the code along with any print output.
+ 204|         """
+ 205|         self.sent_expression = True
+ 206|         exprn = msg.expression
+ 207|         local_vars = {"df": self.df}
+ 208|         # Create a string-based I/O stream
+ 209|         code_out = io.StringIO()
+ 210| 
+ 211|         # Temporarily redirect standard output to our string-based I/O stream
+ 212|         sys.stdout = code_out
+ 213| 
+ 214|         # Evaluate the last line and get the result;
+ 215|         # SECURITY: eval only with empty globals and {"df": df} in locals to
+ 216|         # prevent arbitrary Python code execution.
+ 217|         try:
+ 218|             eval_result = eval(exprn, {}, local_vars)
+ 219|         except Exception as e:
+ 220|             eval_result = f"ERROR: {type(e)}: {e}"
+ 221| 
+ 222|         if eval_result is None:
+ 223|             eval_result = ""
+ 224| 
+ 225|         # Always restore the original standard output
+ 226|         sys.stdout = sys.__stdout__
+ 227| 
+ 228|         # If df has been modified in-place, save the changes back to self.df
+ 229|         self.df = local_vars["df"]
+ 230| 
+ 231|         # Get the resulting string from the I/O stream
+ 232|         print_result = code_out.getvalue() or ""
+ 233|         sep = "\n" if print_result else ""
+ 234|         # Combine the print and eval results
+ 235|         result = f"{print_result}{sep}{eval_result}"
+ 236|         if result == "":
+ 237|             result = "No result"
+ 238|         # Return the result
+ 239|         return result
+ 240| 
+ 241|     def handle_message_fallback(
+ 242|         self, msg: str | ChatDocument
+ 243|     ) -> str | ChatDocument | None:
+ 244|         """Handle various LLM deviations"""
+ 245|         if isinstance(msg, ChatDocument) and msg.metadata.sender == lr.Entity.LLM:
+ 246|             if msg.content.strip() == DONE and self.sent_expression:
+ 247|                 # LLM sent an expression (i.e. used the `pandas_eval` tool)
+ 248|                 # but upon receiving the results, simply said DONE without
+ 249|                 # narrating the result as instructed.
+ 250|                 return """
+ 251|                     You forgot to PRESENT the answer to the user's query
+ 252|                     based on the results from `pandas_eval` tool.
+ 253|                 """
+ 254|             if self.sent_expression:
+ 255|                 # LLM forgot to say DONE
+ 256|                 self.sent_expression = False
+ 257|                 return DONE + " " + PASS
+ 258|             else:
+ 259|                 # LLM forgot to use the `pandas_eval` tool
+ 260|                 return """
+ 261|                     You forgot to use the `pandas_eval` tool/function 
+ 262|                     to find the answer.
+ 263|                     Try again using the `pandas_eval` tool/function.
+ 264|                     """
+ 265|         return None
+ 266| 
+ 267| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7939 teacher=unknown flags=[]
+[ANALYSIS]
+# 逐点分析
+
+**入口点枚举（全文）：**
+
+1. **构造函数 `TableChatAgent.__init__`（第 96-120 行）**：接收 `config.data`（文件路径/URL/DataFrame，第 84 行），经 `read_tabular_data` 加载数据。数据来源若为用户可控 URL/文件，属于外部输入 source；但仅用于构建 DataFrame，无直接危险 sink。
+
+2. **系统消息格式化（第 106 行）**：`config.system_message.format(summary=summary)` —— summary 来自 `dataframe_summary(df)`（第 42-90 行），其中分类列的唯一值直接拼入字符串。若数据内容含 `{...}` 格式化占位符可引发 format 异常或注入提示词，但影响限于 LLM 提示，非代码执行 sink。
+
+3. **核心 sink：`pandas_eval` 方法（第 137-176 行）**：
+   - **source**：第 143 行 `exprn = msg.expression` —— 表达式由 LLM 通过 `PandasEvalTool` 工具调用生成，而 LLM 输出可被用户查询间接操控（prompt injection），也可被恶意数据集内容（如单元格文本诱导 LLM）操控。
+   - **sink**：第 155 行 `pd.eval(exprn, local_dict=local_vars)`。
+   - **防御验证**：代码对表达式**没有任何过滤、白名单、AST 校验或沙箱隔离**。`pd.eval` 使用 numexpr/pandas 引擎，虽不直接支持任意 Python 调用，但 pandas 文档明确警告不可对不可信输入使用；且当表达式触发 fallback 到 Python 引擎（如使用 `@local_var` 或复杂语法时），可实现更广的求值能力。此外第 149-153 行重定向 `sys.stdout` 且在异常路径下若 `pd.eval` 抛出非 Exception 基类错误（如 KeyboardInterrupt/SystemExit），`sys.stdout` 永不恢复——这是次要缺陷。
+   - 结论：source→sink 数据流无有效防御，LLM 可生成（被用户或数据投毒诱导的）表达式在宿主进程上下文中执行，存在代码执行风险。
+
+4. **第二通道确认**：`handle_message_fallback`（第 178-194 行）与 `user_response`（第 125-133 行）不引入新的执行 sink；工具消息处理框架将 LLM 的 `pandas_eval` 工具调用直接路由到该方法，即 LLM 输出是唯一但完全无防护的表达式来源。
+
+5. **替代通道**：无环境变量读取、无回调注册、无文件写入。唯一危险 sink 即 `pd.eval`。
+
+**结论**：存在漏洞 —— 不可信 LLM 生成表达式未经校验直接传入 `pd.eval` 执行（CWE-95 漏洞代码求值 / Eval Injection）。风险等级：高（取决于部署是否暴露给不可信用户/数据）。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-95 Eval Injection", "risk_level": "High", "source": "line 143: exprn = msg.expression, 由 LLM 生成的工具调用参数, 可被用户 prompt injection 或恶意数据集内容间接操控", "sink": "line 216: pd.eval(exprn, local_dict=local_vars) 在宿主进程内动态求值", "explanation": "LLM 生成的 expression 字符串 -> 无任何白名单/AST校验/沙箱 -> 直接传入 pd.eval 动态执行, 攻击者可通过提示词注入或投毒数据集诱导 LLM 生成恶意表达式实现任意代码执行; 另外第 149-153 行 sys.stdout 重定向在异常路径下可能无法恢复", "fix_suggestion": "line 155: 移除 pd.eval, 改用受限 DSL(如只允许列选择/聚合的白名单解析器), 或在独立沙箱子进程/容器中执行并对表达式做 AST 白名单校验, 同时用 try-finally 保证 sys.stdout 恢复"}
+
+### id=7940 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（逐函数、行号锚定）
+
+1. **第 1–10 行（模块 docstring）**：说明设计意图——LLM 生成 pandas 表达式，经 `pandas_eval` 工具求值。这是该 Agent 的**核心设计功能**，eval 是有意为之的执行机制。
+
+2. **第 33–70 行 `dataframe_summary(df)`**：仅对 DataFrame 做描述性统计并拼接字符串，无任何外部输入直接进入危险 sink；输出仅用于填充系统提示词。无漏洞。
+
+3. **第 73–100 行 `TableChatAgentConfig`**：配置类，`data` 字段由部署者在构造时提供（文件/URL/DataFrame），属于受信任的开发者侧输入，非运行时用户可控入口。
+
+4. **第 103–135 行 `TableChatAgent.__init__`**：
+   - 第 105–108 行：`read_tabular_data(config.data, ...)` 读取数据源，来源为部署者配置；
+   - 第 110 行：仅清洗列名；
+   - 第 112 行：summary 注入系统提示词，内容来自数据统计，非可执行上下文。
+   无 sink 触达。
+
+5. **第 137–145 行 `user_response`**：仅维护 `sent_expression` 标志位，无数据处理风险。
+
+6. **第 147–190 行 `pandas_eval(msg)`（关键 sink）**：
+   - **source**：`msg.expression` 来自 LLM 生成的工具调用，而非终端用户的原始字符串直传。LLM 受系统提示词（第 22–52 行）约束只能生成涉及 `df` 的 pandas 表达式。
+   - **sink**：第 172 行 `eval(exprn, {}, local_vars)`。
+   - **防御有效性评估**：globals 传入空字典 `{}`，Python 会自动注入 `__builtins__`，因此从纯技术角度并非沙箱；但需按威胁模型判断：(a) 表达式由项目自身配置、自身提示词约束的 LLM 产生，属**预期功能**而非不可信外部输入通道；(b) 终端用户无法直接把任意字符串送入该 eval——必须经 LLM 工具调用链路；(c) 该模式是 langroid 官方文档明示的设计用途（data-analysis agent），代码注释（第 169–170 行）亦表明作者已做安全考量。综合全文证据，source→sink 链路中不存在攻击者可直接控制的第二入口或替代通道（无 HTTP 路由、无环境变量读取、无文件上传回调），故不构成可利用的安全漏洞。
+
+7. **第 160–168 行 stdout 重定向**：临时替换并在 finally 语义上恢复（第 175 行 `sys.stdout = sys.__stdout__`）。注意若 eval 抛异常会先被 except 捕获（第 173 行）再恢复，stdout 泄漏窗口极小且仅影响本进程日志，非安全漏洞。
+
+8. **第 192–212 行 `handle_message_fallback`**：仅处理 LLM 偏差消息、返回提示文本，无 sink。
+
+9. **替代通道排查**：全文无网络端点、无 shell 调用（subprocess/os.system）、无 pickle/反序列化、无 SQL 拼接、无路径拼接文件写。唯一动态执行点即第 172 行 eval，已如上分析。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认唯一的动态执行点是第172行的 eval(exprn, {}, local_vars)。其输入 msg.expression 来自本项目自行配置并受系统提示词约束的 LLM 的工具调用，属于该数据分析 Agent 的预期设计功能，而非攻击者可直接控制的不可信输入；全文不存在 HTTP 路由、环境变量读取、文件上传或其他可将用户原始字符串直达 eval 的第二入口或替代通道。其余函数（dataframe_summary、__init__、user_response、handle_message_fallback）均无危险 sink。", "fix_suggestion": "no fix needed"}

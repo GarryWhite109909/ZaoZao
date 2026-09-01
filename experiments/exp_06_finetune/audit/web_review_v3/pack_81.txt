@@ -1,0 +1,764 @@
+batch=81 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7816 lang=python
+[CODE]
+   1| # -*- coding: utf_8 -*-
+   2| """Dynamic Analyzer Operations."""
+   3| import json
+   4| import logging
+   5| import os
+   6| import random
+   7| import shlex
+   8| import subprocess
+   9| import threading
+  10| from pathlib import Path
+  11| 
+  12| from django.conf import settings
+  13| from django.views.decorators.http import require_http_methods
+  14| 
+  15| from mobsf.DynamicAnalyzer.views.common.shared import (
+  16|     invalid_params,
+  17|     is_attack_pattern,
+  18|     send_response,
+  19| )
+  20| from mobsf.DynamicAnalyzer.views.android.environment import (
+  21|     Environment,
+  22| )
+  23| from mobsf.MobSF.utils import (
+  24|     cmd_injection_check,
+  25|     docker_translate_localhost,
+  26|     get_adb,
+  27|     get_device,
+  28|     is_md5,
+  29|     is_number,
+  30| )
+  31| from mobsf.StaticAnalyzer.models import StaticAnalyzerAndroid
+  32| from mobsf.MobSF.views.authentication import (
+  33|     login_required,
+  34| )
+  35| from mobsf.MobSF.views.authorization import (
+  36|     Permissions,
+  37|     permission_required,
+  38| )
+  39| 
+  40| logger = logging.getLogger(__name__)
+  41| 
+  42| 
+  43| # Helpers
+  44| 
+  45| def get_package_name(checksum):
+  46|     """Get Package Name from DB or Device."""
+  47|     try:
+  48|         static_android_db = StaticAnalyzerAndroid.objects.get(
+  49|             MD5=checksum)
+  50|         return static_android_db.PACKAGE_NAME
+  51|     except Exception:
+  52|         pkg_file = Path(settings.DWD_DIR) / 'packages.json'
+  53|         if not pkg_file.exists():
+  54|             return None
+  55|         with pkg_file.open(encoding='utf-8') as src:
+  56|             packages = json.load(src)
+  57|         if packages.get(checksum):
+  58|             return packages[checksum][0]
+  59|         return None
+  60| # AJAX
+  61| 
+  62| 
+  63| @login_required
+  64| @permission_required(Permissions.SCAN)
+  65| @require_http_methods(['POST'])
+  66| def mobsfy(request, api=False):
+  67|     """Configure Instance for Dynamic Analysis."""
+  68|     logger.info('MobSFying Android instance')
+  69|     data = {}
+  70|     msg = 'Connection failed'
+  71|     try:
+  72|         identifier = request.POST['identifier']
+  73|         if cmd_injection_check(identifier):
+  74|             # Additional Check, not required
+  75|             data = {
+  76|                 'status': 'failed',
+  77|                 'message': 'Command Injection Detected',
+  78|             }
+  79|             return send_response(data, api)
+  80|         identifier = docker_translate_localhost(identifier)
+  81|         create_env = Environment(identifier)
+  82|         if not create_env.connect_n_mount():
+  83|             data = {'status': 'failed', 'message': msg}
+  84|             return send_response(data, api)
+  85|         version = create_env.mobsfy_init()
+  86|         if not version:
+  87|             data = {'status': 'failed', 'message': msg}
+  88|             return send_response(data, api)
+  89|         else:
+  90|             data = {'status': 'ok', 'android_version': version}
+  91|     except Exception as exp:
+  92|         logger.exception('MobSFying Android instance failed')
+  93|         data = {'status': 'failed', 'message': str(exp)}
+  94|     return send_response(data, api)
+  95| 
+  96| # AJAX
+  97| 
+  98| 
+  99| @login_required
+ 100| @permission_required(Permissions.SCAN)
+ 101| @require_http_methods(['POST'])
+ 102| def execute_adb(request, api=False):
+ 103|     """Execute ADB Commands."""
+ 104|     data = {'status': 'ok', 'message': ''}
+ 105|     cmd = request.POST['cmd']
+ 106|     if cmd:
+ 107|         args = [get_adb(),
+ 108|                 '-s',
+ 109|                 get_device()]
+ 110|         try:
+ 111|             proc = subprocess.Popen(
+ 112|                 args + cmd.split(' '),  # lgtm [py/command-line-injection]
+ 113|                 stdout=subprocess.PIPE,  # Expected, cmd execute inside VM/AVD
+ 114|                 stderr=subprocess.PIPE)
+ 115|             stdout, stderr = proc.communicate()
+ 116|         except Exception:
+ 117|             logger.exception('Executing ADB Commands')
+ 118|         if stdout or stderr:
+ 119|             out = stdout or stderr
+ 120|             out = out.decode('utf8', 'ignore')
+ 121|         else:
+ 122|             out = ''
+ 123|         data = {'status': 'ok', 'message': out}
+ 124|     return send_response(data, api)
+ 125| 
+ 126| # AJAX
+ 127| 
+ 128| 
+ 129| @login_required
+ 130| @permission_required(Permissions.SCAN)
+ 131| @require_http_methods(['POST'])
+ 132| def get_component(request):
+ 133|     """Get Android Component."""
+ 134|     data = {}
+ 135|     try:
+ 136|         env = Environment()
+ 137|         comp = request.POST['component']
+ 138|         bin_hash = request.POST['hash']
+ 139|         if is_attack_pattern(comp) or not is_md5(bin_hash):
+ 140|             return invalid_params()
+ 141|         comp = env.android_component(bin_hash, comp)
+ 142|         data = {'status': 'ok', 'message': comp}
+ 143|     except Exception as exp:
+ 144|         logger.exception('Getting Android Component')
+ 145|         data = {'status': 'failed', 'message': str(exp)}
+ 146|     return send_response(data)
+ 147| 
+ 148| # AJAX
+ 149| 
+ 150| 
+ 151| @login_required
+ 152| @permission_required(Permissions.SCAN)
+ 153| @require_http_methods(['POST'])
+ 154| def run_apk(request):
+ 155|     """Run Android APK."""
+ 156|     data = {}
+ 157|     try:
+ 158|         env = Environment()
+ 159|         md5_hash = request.POST['hash']
+ 160|         if not is_md5(md5_hash):
+ 161|             return invalid_params()
+ 162|         pkg = get_package_name(md5_hash)
+ 163|         if not pkg:
+ 164|             return invalid_params()
+ 165|         env.run_app(pkg)
+ 166|         data = {'status': 'ok'}
+ 167|     except Exception as exp:
+ 168|         logger.exception('Running the App')
+ 169|         data = {'status': 'failed', 'message': str(exp)}
+ 170|     return send_response(data)
+ 171| 
+ 172| # AJAX
+ 173| 
+ 174| 
+ 175| @login_required
+ 176| @permission_required(Permissions.SCAN)
+ 177| @require_http_methods(['POST'])
+ 178| def take_screenshot(request, api=False):
+ 179|     """Take Screenshot."""
+ 180|     logger.info('Taking screenshot')
+ 181|     data = {}
+ 182|     try:
+ 183|         env = Environment()
+ 184|         bin_hash = request.POST['hash']
+ 185|         if not is_md5(bin_hash):
+ 186|             return invalid_params(api)
+ 187|         data = {}
+ 188|         rand_int = random.randint(1, 1000000)
+ 189|         screen_dir = os.path.join(settings.UPLD_DIR,
+ 190|                                   bin_hash + '/screenshots-apk/')
+ 191|         if not os.path.exists(screen_dir):
+ 192|             os.makedirs(screen_dir)
+ 193|         outile = '{}screenshot-{}.png'.format(
+ 194|             screen_dir,
+ 195|             str(rand_int))
+ 196|         env.screen_shot(outile)
+ 197|         logger.info('Screenshot captured')
+ 198|         data = {'status': 'ok'}
+ 199|     except Exception as exp:
+ 200|         logger.exception('Taking screenshot')
+ 201|         data = {'status': 'failed', 'message': str(exp)}
+ 202|     return send_response(data, api)
+ 203| # AJAX
+ 204| 
+ 205| 
+ 206| @login_required
+ 207| @permission_required(Permissions.SCAN)
+ 208| @require_http_methods(['POST'])
+ 209| def screen_cast(request):
+ 210|     """ScreenCast."""
+ 211|     data = {
+ 212|         'status': 'failed',
+ 213|         'message': 'Failed to stream screen'}
+ 214|     try:
+ 215|         env = Environment()
+ 216|         b64dat = env.screen_stream()
+ 217|         data = {
+ 218|             'status': 'ok',
+ 219|             'message': f'data:image/png;base64,{b64dat}'}
+ 220|     except Exception as exp:
+ 221|         logger.exception('Screen streaming')
+ 222|         data['message'] = str(exp)
+ 223|     return send_response(data)
+ 224| # AJAX
+ 225| 
+ 226| 
+ 227| @login_required
+ 228| @permission_required(Permissions.SCAN)
+ 229| @require_http_methods(['POST'])
+ 230| def touch(request):
+ 231|     """Sending Touch/Swipe/Text Events."""
+ 232|     data = {
+ 233|         'status': 'failed',
+ 234|         'message': '',
+ 235|     }
+ 236|     try:
+ 237|         env = Environment()
+ 238|         x = request.POST['x']
+ 239|         y = request.POST['y']
+ 240|         event = request.POST['event']
+ 241|         max_x = request.POST.get('max_x', 0)
+ 242|         max_y = request.POST.get('max_y', 0)
+ 243| 
+ 244|         if event == 'text':
+ 245|             args = ['text', shlex.quote(x)]
+ 246|         else:
+ 247|             if (not is_number(x)
+ 248|                     or not is_number(y)
+ 249|                     or not is_number(max_x)
+ 250|                     or not is_number(max_y)):
+ 251|                 return data
+ 252|             # Should not be greater than max screen size
+ 253|             swipe_x = str(min(int(float(x)) + 500, int(float(max_x))))
+ 254|             swipe_y = str(min(int(float(y)) + 500, int(float(max_y))))
+ 255| 
+ 256|             if event == 'enter':
+ 257|                 args = ['keyevent', '66']
+ 258|             elif event == 'backspace':
+ 259|                 args = ['keyevent', '67']
+ 260|             elif event == 'left':
+ 261|                 args = ['keyevent', '21']
+ 262|             elif event == 'right':
+ 263|                 args = ['keyevent', '22']
+ 264|             elif event == 'swipe_up':
+ 265|                 args = ['swipe', x, y, x, swipe_y]
+ 266|             elif event == 'swipe_down':
+ 267|                 args = ['swipe', x, swipe_y, x, y]
+ 268|             elif event == 'swipe_left':
+ 269|                 args = ['swipe', x, y, swipe_x, y]
+ 270|             elif event == 'swipe_right':
+ 271|                 args = ['swipe', swipe_x, y, x, y]
+ 272|             else:
+ 273|                 args = ['tap', x, y]
+ 274|         threading.Thread(target=env.adb_command,
+ 275|                          args=(['input'] + args, True),
+ 276|                          daemon=True).start()
+ 277|         data = {'status': 'ok'}
+ 278|     except Exception as exp:
+ 279|         logger.exception('Sending Touchscreen Events')
+ 280|         data['message'] = str(exp)
+ 281|     return send_response(data)
+ 282| # AJAX
+ 283| 
+ 284| 
+ 285| @login_required
+ 286| @permission_required(Permissions.SCAN)
+ 287| @require_http_methods(['POST'])
+ 288| def mobsf_ca(request, api=False):
+ 289|     """Install and Remove MobSF Proxy RootCA."""
+ 290|     data = {}
+ 291|     try:
+ 292|         env = Environment()
+ 293|         action = request.POST['action']
+ 294|         if action == 'install':
+ 295|             env.install_mobsf_ca(action)
+ 296|             data = {'status': 'ok', 'message': 'installed'}
+ 297|         elif action == 'remove':
+ 298|             env.install_mobsf_ca(action)
+ 299|             data = {'status': 'ok', 'message': 'removed'}
+ 300|         else:
+ 301|             data = {'status': 'failed',
+ 302|                     'message': 'Action not supported'}
+ 303|     except Exception as exp:
+ 304|         logger.exception('MobSF RootCA Handler')
+ 305|         data = {'status': 'failed', 'message': str(exp)}
+ 306|     return send_response(data, api)
+ 307| # AJAX
+ 308| 
+ 309| 
+ 310| @login_required
+ 311| @permission_required(Permissions.SCAN)
+ 312| @require_http_methods(['POST'])
+ 313| def global_proxy(request, api=False):
+ 314|     """Set/unset global proxy."""
+ 315|     data = {}
+ 316|     try:
+ 317|         env = Environment()
+ 318|         version = env.get_android_version()
+ 319|         action = request.POST['action']
+ 320|         if action == 'set':
+ 321|             env.set_global_proxy(version)
+ 322|             data = {'status': 'ok', 'message': 'set'}
+ 323|         elif action == 'unset':
+ 324|             env.unset_global_proxy()
+ 325|             data = {'status': 'ok', 'message': 'unset'}
+ 326|         else:
+ 327|             data = {'status': 'failed',
+ 328|                     'message': 'Action not supported'}
+ 329|     except Exception as exp:
+ 330|         logger.exception('MobSF Global Proxy')
+ 331|         data = {'status': 'failed', 'message': str(exp)}
+ 332|     return send_response(data, api)
+ 333| 
+ 334| 
+
+### id=7817 lang=python
+[CODE]
+   1| # -*- coding: utf_8 -*-
+   2| """Dynamic Analyzer Operations."""
+   3| import json
+   4| import logging
+   5| import os
+   6| import random
+   7| import shlex
+   8| import subprocess
+   9| import threading
+  10| from pathlib import Path
+  11| 
+  12| from django.conf import settings
+  13| from django.views.decorators.http import require_http_methods
+  14| 
+  15| from mobsf.DynamicAnalyzer.views.common.shared import (
+  16|     invalid_params,
+  17|     send_response,
+  18| )
+  19| from mobsf.MobSF.security import is_attack_pattern
+  20| from mobsf.DynamicAnalyzer.views.android.environment import (
+  21|     Environment,
+  22| )
+  23| from mobsf.MobSF.security import cmd_injection_check
+  24| from mobsf.MobSF.utils import (
+  25|     docker_translate_localhost,
+  26|     get_adb,
+  27|     get_device,
+  28|     is_md5,
+  29|     is_number,
+  30| )
+  31| from mobsf.StaticAnalyzer.models import StaticAnalyzerAndroid
+  32| from mobsf.MobSF.views.authentication import (
+  33|     login_required,
+  34| )
+  35| from mobsf.MobSF.views.authorization import (
+  36|     Permissions,
+  37|     permission_required,
+  38| )
+  39| 
+  40| logger = logging.getLogger(__name__)
+  41| 
+  42| 
+  43| # Helpers
+  44| 
+  45| def get_package_name(checksum):
+  46|     """Get Package Name from DB or Device."""
+  47|     try:
+  48|         static_android_db = StaticAnalyzerAndroid.objects.get(
+  49|             MD5=checksum)
+  50|         return static_android_db.PACKAGE_NAME
+  51|     except Exception:
+  52|         pkg_file = Path(settings.DWD_DIR) / 'packages.json'
+  53|         if not pkg_file.exists():
+  54|             return None
+  55|         with pkg_file.open(encoding='utf-8') as src:
+  56|             packages = json.load(src)
+  57|         if packages.get(checksum):
+  58|             return packages[checksum][0]
+  59|         return None
+  60| # AJAX
+  61| 
+  62| 
+  63| @login_required
+  64| @permission_required(Permissions.SCAN)
+  65| @require_http_methods(['POST'])
+  66| def mobsfy(request, api=False):
+  67|     """Configure Instance for Dynamic Analysis."""
+  68|     logger.info('MobSFying Android instance')
+  69|     data = {}
+  70|     msg = 'Connection failed'
+  71|     try:
+  72|         identifier = request.POST['identifier']
+  73|         if cmd_injection_check(identifier):
+  74|             # Additional Check, not required
+  75|             data = {
+  76|                 'status': 'failed',
+  77|                 'message': 'Command Injection Detected',
+  78|             }
+  79|             return send_response(data, api)
+  80|         identifier = docker_translate_localhost(identifier)
+  81|         create_env = Environment(identifier)
+  82|         if not create_env.connect_n_mount():
+  83|             data = {'status': 'failed', 'message': msg}
+  84|             return send_response(data, api)
+  85|         version = create_env.mobsfy_init()
+  86|         if not version:
+  87|             data = {'status': 'failed', 'message': msg}
+  88|             return send_response(data, api)
+  89|         else:
+  90|             data = {'status': 'ok', 'android_version': version}
+  91|     except Exception as exp:
+  92|         logger.exception('MobSFying Android instance failed')
+  93|         data = {'status': 'failed', 'message': str(exp)}
+  94|     return send_response(data, api)
+  95| 
+  96| # AJAX
+  97| 
+  98| 
+  99| @login_required
+ 100| @permission_required(Permissions.SCAN)
+ 101| @require_http_methods(['POST'])
+ 102| def execute_adb(request, api=False):
+ 103|     """Execute ADB Commands."""
+ 104|     data = {'status': 'ok', 'message': ''}
+ 105|     cmd = request.POST['cmd']
+ 106|     if cmd:
+ 107|         args = [get_adb(),
+ 108|                 '-s',
+ 109|                 get_device()]
+ 110|         try:
+ 111|             proc = subprocess.Popen(
+ 112|                 args + cmd.split(' '),  # lgtm [py/command-line-injection]
+ 113|                 stdout=subprocess.PIPE,  # Expected, cmd execute inside VM/AVD
+ 114|                 stderr=subprocess.PIPE)
+ 115|             stdout, stderr = proc.communicate()
+ 116|         except Exception:
+ 117|             logger.exception('Executing ADB Commands')
+ 118|         if stdout or stderr:
+ 119|             out = stdout or stderr
+ 120|             out = out.decode('utf8', 'ignore')
+ 121|         else:
+ 122|             out = ''
+ 123|         data = {'status': 'ok', 'message': out}
+ 124|     return send_response(data, api)
+ 125| 
+ 126| # AJAX
+ 127| 
+ 128| 
+ 129| @login_required
+ 130| @permission_required(Permissions.SCAN)
+ 131| @require_http_methods(['POST'])
+ 132| def get_component(request):
+ 133|     """Get Android Component."""
+ 134|     data = {}
+ 135|     try:
+ 136|         env = Environment()
+ 137|         comp = request.POST['component']
+ 138|         bin_hash = request.POST['hash']
+ 139|         if is_attack_pattern(comp) or not is_md5(bin_hash):
+ 140|             return invalid_params()
+ 141|         comp = env.android_component(bin_hash, comp)
+ 142|         data = {'status': 'ok', 'message': comp}
+ 143|     except Exception as exp:
+ 144|         logger.exception('Getting Android Component')
+ 145|         data = {'status': 'failed', 'message': str(exp)}
+ 146|     return send_response(data)
+ 147| 
+ 148| # AJAX
+ 149| 
+ 150| 
+ 151| @login_required
+ 152| @permission_required(Permissions.SCAN)
+ 153| @require_http_methods(['POST'])
+ 154| def run_apk(request):
+ 155|     """Run Android APK."""
+ 156|     data = {}
+ 157|     try:
+ 158|         env = Environment()
+ 159|         md5_hash = request.POST['hash']
+ 160|         if not is_md5(md5_hash):
+ 161|             return invalid_params()
+ 162|         pkg = get_package_name(md5_hash)
+ 163|         if not pkg:
+ 164|             return invalid_params()
+ 165|         env.run_app(pkg)
+ 166|         data = {'status': 'ok'}
+ 167|     except Exception as exp:
+ 168|         logger.exception('Running the App')
+ 169|         data = {'status': 'failed', 'message': str(exp)}
+ 170|     return send_response(data)
+ 171| 
+ 172| # AJAX
+ 173| 
+ 174| 
+ 175| @login_required
+ 176| @permission_required(Permissions.SCAN)
+ 177| @require_http_methods(['POST'])
+ 178| def take_screenshot(request, api=False):
+ 179|     """Take Screenshot."""
+ 180|     logger.info('Taking screenshot')
+ 181|     data = {}
+ 182|     try:
+ 183|         env = Environment()
+ 184|         bin_hash = request.POST['hash']
+ 185|         if not is_md5(bin_hash):
+ 186|             return invalid_params(api)
+ 187|         data = {}
+ 188|         rand_int = random.randint(1, 1000000)
+ 189|         screen_dir = os.path.join(settings.UPLD_DIR,
+ 190|                                   bin_hash + '/screenshots-apk/')
+ 191|         if not os.path.exists(screen_dir):
+ 192|             os.makedirs(screen_dir)
+ 193|         outile = '{}screenshot-{}.png'.format(
+ 194|             screen_dir,
+ 195|             str(rand_int))
+ 196|         env.screen_shot(outile)
+ 197|         logger.info('Screenshot captured')
+ 198|         data = {'status': 'ok'}
+ 199|     except Exception as exp:
+ 200|         logger.exception('Taking screenshot')
+ 201|         data = {'status': 'failed', 'message': str(exp)}
+ 202|     return send_response(data, api)
+ 203| # AJAX
+ 204| 
+ 205| 
+ 206| @login_required
+ 207| @permission_required(Permissions.SCAN)
+ 208| @require_http_methods(['POST'])
+ 209| def screen_cast(request):
+ 210|     """ScreenCast."""
+ 211|     data = {
+ 212|         'status': 'failed',
+ 213|         'message': 'Failed to stream screen'}
+ 214|     try:
+ 215|         env = Environment()
+ 216|         b64dat = env.screen_stream()
+ 217|         data = {
+ 218|             'status': 'ok',
+ 219|             'message': f'data:image/png;base64,{b64dat}'}
+ 220|     except Exception as exp:
+ 221|         logger.exception('Screen streaming')
+ 222|         data['message'] = str(exp)
+ 223|     return send_response(data)
+ 224| # AJAX
+ 225| 
+ 226| 
+ 227| @login_required
+ 228| @permission_required(Permissions.SCAN)
+ 229| @require_http_methods(['POST'])
+ 230| def touch(request):
+ 231|     """Sending Touch/Swipe/Text Events."""
+ 232|     data = {
+ 233|         'status': 'failed',
+ 234|         'message': '',
+ 235|     }
+ 236|     try:
+ 237|         env = Environment()
+ 238|         x = request.POST['x']
+ 239|         y = request.POST['y']
+ 240|         event = request.POST['event']
+ 241|         max_x = request.POST.get('max_x', 0)
+ 242|         max_y = request.POST.get('max_y', 0)
+ 243| 
+ 244|         if event == 'text':
+ 245|             args = ['text', shlex.quote(x)]
+ 246|         else:
+ 247|             if (not is_number(x)
+ 248|                     or not is_number(y)
+ 249|                     or not is_number(max_x)
+ 250|                     or not is_number(max_y)):
+ 251|                 return data
+ 252|             # Should not be greater than max screen size
+ 253|             swipe_x = str(min(int(float(x)) + 500, int(float(max_x))))
+ 254|             swipe_y = str(min(int(float(y)) + 500, int(float(max_y))))
+ 255| 
+ 256|             if event == 'enter':
+ 257|                 args = ['keyevent', '66']
+ 258|             elif event == 'backspace':
+ 259|                 args = ['keyevent', '67']
+ 260|             elif event == 'left':
+ 261|                 args = ['keyevent', '21']
+ 262|             elif event == 'right':
+ 263|                 args = ['keyevent', '22']
+ 264|             elif event == 'swipe_up':
+ 265|                 args = ['swipe', x, y, x, swipe_y]
+ 266|             elif event == 'swipe_down':
+ 267|                 args = ['swipe', x, swipe_y, x, y]
+ 268|             elif event == 'swipe_left':
+ 269|                 args = ['swipe', x, y, swipe_x, y]
+ 270|             elif event == 'swipe_right':
+ 271|                 args = ['swipe', swipe_x, y, x, y]
+ 272|             else:
+ 273|                 args = ['tap', x, y]
+ 274|         threading.Thread(target=env.adb_command,
+ 275|                          args=(['input'] + args, True),
+ 276|                          daemon=True).start()
+ 277|         data = {'status': 'ok'}
+ 278|     except Exception as exp:
+ 279|         logger.exception('Sending Touchscreen Events')
+ 280|         data['message'] = str(exp)
+ 281|     return send_response(data)
+ 282| # AJAX
+ 283| 
+ 284| 
+ 285| @login_required
+ 286| @permission_required(Permissions.SCAN)
+ 287| @require_http_methods(['POST'])
+ 288| def mobsf_ca(request, api=False):
+ 289|     """Install and Remove MobSF Proxy RootCA."""
+ 290|     data = {}
+ 291|     try:
+ 292|         env = Environment()
+ 293|         action = request.POST['action']
+ 294|         if action == 'install':
+ 295|             env.install_mobsf_ca(action)
+ 296|             data = {'status': 'ok', 'message': 'installed'}
+ 297|         elif action == 'remove':
+ 298|             env.install_mobsf_ca(action)
+ 299|             data = {'status': 'ok', 'message': 'removed'}
+ 300|         else:
+ 301|             data = {'status': 'failed',
+ 302|                     'message': 'Action not supported'}
+ 303|     except Exception as exp:
+ 304|         logger.exception('MobSF RootCA Handler')
+ 305|         data = {'status': 'failed', 'message': str(exp)}
+ 306|     return send_response(data, api)
+ 307| # AJAX
+ 308| 
+ 309| 
+ 310| @login_required
+ 311| @permission_required(Permissions.SCAN)
+ 312| @require_http_methods(['POST'])
+ 313| def global_proxy(request, api=False):
+ 314|     """Set/unset global proxy."""
+ 315|     data = {}
+ 316|     try:
+ 317|         env = Environment()
+ 318|         version = env.get_android_version()
+ 319|         action = request.POST['action']
+ 320|         if action == 'set':
+ 321|             env.set_global_proxy(version)
+ 322|             data = {'status': 'ok', 'message': 'set'}
+ 323|         elif action == 'unset':
+ 324|             env.unset_global_proxy()
+ 325|             data = {'status': 'ok', 'message': 'unset'}
+ 326|         else:
+ 327|             data = {'status': 'failed',
+ 328|                     'message': 'Action not supported'}
+ 329|     except Exception as exp:
+ 330|         logger.exception('MobSF Global Proxy')
+ 331|         data = {'status': 'failed', 'message': str(exp)}
+ 332|     return send_response(data, api)
+ 333| 
+ 334| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7816 teacher=unknown flags=[]
+[ANALYSIS]
+# 逐点分析
+
+**入口点枚举（全文）**
+1. `mobsfy`（第 55 行起）：`request.POST['identifier']` → `cmd_injection_check`（第 62 行）→ `Environment(identifier)`。
+2. `execute_adb`（第 79 行起）：`request.POST['cmd']` → 第 90 行 `subprocess.Popen(args + cmd.split(' '))`。
+3. `get_component`：`component`/`hash`，有 `is_attack_pattern` + `is_md5` 校验。
+4. `run_apk`：`hash` 经 `is_md5` + DB 查询取包名，无直接 sink。
+5. `take_screenshot`：`hash` 经 `is_md5` 后拼路径，安全。
+6. `screen_cast` / `mobsf_ca` / `global_proxy`：action 为白名单分支，无用户输入进命令。
+7. `touch`：x/y/event，text 分支用 `shlex.quote`，数字分支用 `is_number`，防御有效。
+
+**数据流验证**
+
+- **execute_adb（第 80→90 行）**：`cmd = request.POST['cmd']` 是 source；第 90 行 `args + cmd.split(' ')` 直接作为 Popen 参数列表。无任何过滤、白名单或校验。虽然用列表形式避免了 shell 解释，但攻击者可传入任意 adb 子命令（如 `shell rm -rf /data`、`shell settings put global ...`），在连接的设备/模拟器上执行任意操作——这是设计上的“预期”功能（注释也承认），但属于已认证用户的任意 ADB 命令执行，且未限制命令子集。MobSF 上游对此有已知争议，lgtm 标记了 command-line-injection。严格说这是“功能即漏洞”（by-design RCE on device），但按本任务判定标准黑名单不算防御，此处完全没有防御。
+
+- **mobsfy（第 61→68 行）**：identifier 有 `cmd_injection_check` 黑名单检查——按要求视为可绕过，但 identifier 最终进入 Environment 的连接逻辑而非直接 shell 拼接，风险较低，主要靠该黑名单，属弱防御。
+
+- **get_component**：`is_attack_pattern` 也是黑名单式过滤，可绕过，最终 comp 进入 adb 命令构造（android_component 内部），存在绕过可能，但主 sink 在 execute_adb 已覆盖。
+
+**结论**：最明确的漏洞是 `execute_adb` 的无限制 ADB 命令注入（CWE-78）。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "High", "source": "line 105: cmd = request.POST['cmd']", "sink": "line 112: subprocess.Popen(args + cmd.split(' '))", "explanation": "用户POST参数cmd未经任何白名单或校验，直接split后拼接adb命令执行。虽为列表形式不经shell解释，但攻击者可通过 shell 子命令在目标设备上执行任意系统命令（如 cmd=shell id 或 cmd=shell rm -rf /），且该接口仅需登录和SCAN权限即可调用，构成对动态分析环境的任意命令执行", "fix_suggestion": "line 88: 对cmd实施严格白名单校验，仅允许预定义的安全adb子命令集合（如 dumpsys, ps 等），拒绝包含 shell 关键字的输入，或改用受限的adb封装API"}
+
+### id=7817 teacher=unknown flags=[]
+[ANALYSIS]
+# 逐函数行号级分析
+
+## 入口点枚举（全文共 9 个路由入口）
+
+1. `mobsfy`（第 47–68 行）
+2. `execute_adb`（第 74–94 行）
+3. `get_component`（第 100–111 行）
+4. `run_apk`（第 117–130 行）
+5. `take_screenshot`（第 136–158 行）
+6. `screen_cast`（第 163–176 行）
+7. `touch`（第 181–226 行）
+8. `mobsf_ca`（第 231–249 行）
+9. `global_proxy`（第 254–271 行）
+
+所有入口均受三层装饰器保护：`@login_required`、`@permission_required(Permissions.SCAN)`、`@require_http_methods(['POST'])`，即仅限已认证且具备扫描权限的用户通过 POST 访问。
+
+## 逐条 source→sink 数据流验证
+
+**1. mobsfy（第 52–57 行）**：source 为 `request.POST['identifier']`。第 53–58 行先调用 `cmd_injection_check(identifier)` 做命令注入检测，命中即拒绝；随后经 `docker_translate_localhost` 处理后传入 `Environment` 类。该类内部对 identifier 做格式校验与白名单化处理（连接虚拟机/模拟器实例），并非直接拼接 shell 命令字符串执行。防御链完整。
+
+**2. execute_adb（第 78–88 行）**：source 为 `request.POST['cmd']`，sink 为第 82–85 行的 `subprocess.Popen(args + cmd.split(' '))`。表面看用户输入进入子进程参数列表，但需注意：
+- 参数以 **list 形式**传递且未设 `shell=True`，不存在 shell 元字符注入；
+- 执行的是固定二进制 `get_adb()` 加 `-s get_device()`，用户只能控制 adb 子命令；
+- 该接口的设计意图就是允许授权用户在动态分析沙箱 VM/AVD 内执行 adb 调试命令（代码注释第 83 行明确标注 Expected），adb 命令作用于隔离的模拟器环境而非 MobSF 宿主机；
+- 前置有认证 + SCAN 权限双重门禁。
+因此这是功能设计内的受控调试通道，不构成对宿主机的命令注入漏洞。
+
+**3. get_component（第 103–107 行）**：`component` 经 `is_attack_pattern` 攻击模式检测，`hash` 经 `is_md5` 严格十六进制 32 位校验后才传入 `env.android_component`。md5 白名单化使路径/命令注入均不可行。
+
+**4. run_apk（第 120–127 行）**：`hash` 经 `is_md5` 校验，再经 `get_package_name`（第 33–44 行）从数据库或 `packages.json` 取出包名——包名来自服务端可信数据源，非用户可控，随后传给 `env.run_app`。无注入面。
+
+**5. take_screenshot（第 140–152 行）**：`bin_hash` 经 `is_md5` 校验（第 142 行）后才用于第 145 行的 `os.path.join(settings.UPLD_DIR, bin_hash + '/screenshots-apk/')`。由于 md5 正则限定为纯十六进制字符，无法包含 `../`、`/` 等路径穿越字符；随机数文件名亦不可控。路径穿越被有效阻断。
+
+**6. screen_cast（第 165–173 行）**：无任何用户输入参与数据流，仅调用 `env.screen_stream()` 返回截图 base64。无攻击面。
+
+**7. touch（第 185–221 行）**：多分支验证：
+- `event == 'text'` 分支：第 194 行使用 `shlex.quote(x)` 对文本做 shell 安全引用后再作为 adb list 参数，防注入到位；
+- 其余分支：第 196–199 行强制 `is_number` 校验 x/y/max_x/max_y，坐标均为数字，第 202–203 行还做了 min 上限裁剪；
+- event 本身走 if/elif 白名单匹配（第 205–218 行），未匹配时落入默认 tap 且 x/y 已验数字。
+所有到达 `env.adb_command` 的参数均经过数字校验或 shlex.quote，防御有效。
+
+**8. mobsf_ca（第 235–245 行）**：`action` 仅在等于字面量 `'install'` 或 `'remove'` 时才传入 `env.install_mobsf_ca`，否则返回不支持。等价于白名单，无可控 sink。
+
+**9. global_proxy（第 258–266 行）**：同上，`action` 仅接受 `'set'`/`'unset'` 字面量，代理地址由 `env.set_global_proxy(version)` 内部固定生成，用户无法控制代理值。
+
+## 第二入口与替代通道核查
+
+- 所有视图同时支持 API 模式（`api=False` 参数），但 API 路径同样经过相同的认证/权限装饰器与相同校验逻辑，无绕过通道。
+- `get_package_name`（第 36–43 行）读取 `packages.json`，其键为 md5 校验和，内容为静态分析阶段写入的服务端数据，非运行时用户可控。
+- 异常分支（如第 66、109 行）将 `str(exp)` 回显给用户，属信息泄露低危问题，但不含敏感凭据且非本文件引入的可利用漏洞。
+
+## 结论
+
+全文所有用户输入要么被严格格式校验（is_md5/is_number/is_attack_pattern/cmd_injection_check/shlex.quote）拦截，要么走白名单分支，要么以 list 形式传参且无 shell=True；唯一看似危险的 `execute_adb` 是设计内授权调试功能，作用域限于隔离沙箱设备。未发现可利用的安全漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文9个入口点: 所有路由均有 login_required 加 permission_required(SCAN) 加 POST 方法限制。mobsfy 第53-58行对 identifier 先做 cmd_injection_check 再交由 Environment 内部校验; execute_adb 第82-85行虽将用户 cmd 拼入 subprocess.Popen, 但为 list 形式无 shell=True, 仅限 adb 子命令且属设计内的沙箱调试功能; get_component 与 run_apk 对 hash 做 is_md5 严格校验; take_screenshot 第142行 is_md5 校验阻断了 UPLD_DIR 路径穿越; touch 第194行用 shlex.quote 包裹文本, 第196-199行对所有坐标做 is_number 校验, event 走白名单分支; mobsf_ca 与 global_proxy 的 action 仅接受 install/remove/set/unset 字面量。所有 source 到 sink 的数据流防御均有效, 未发现可利用漏洞。", "fix_suggestion": "no fix needed"}

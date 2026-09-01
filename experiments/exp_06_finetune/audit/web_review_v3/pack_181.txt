@@ -1,0 +1,1182 @@
+batch=181 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=8086 lang=go
+[CODE]
+   1| // Copyright (c) HashiCorp, Inc.
+   2| // SPDX-License-Identifier: MPL-2.0
+   3| 
+   4| package postgresql
+   5| 
+   6| import (
+   7| 	"context"
+   8| 	"database/sql"
+   9| 	"errors"
+  10| 	"fmt"
+  11| 	"regexp"
+  12| 	"strings"
+  13| 
+  14| 	"github.com/hashicorp/go-multierror"
+  15| 	"github.com/hashicorp/go-secure-stdlib/strutil"
+  16| 	_ "github.com/jackc/pgx/v5/stdlib"
+  17| 	"github.com/openbao/openbao/plugins/database/postgresql/scram"
+  18| 	"github.com/openbao/openbao/sdk/v2/database/dbplugin/v5"
+  19| 	"github.com/openbao/openbao/sdk/v2/database/helper/connutil"
+  20| 	"github.com/openbao/openbao/sdk/v2/database/helper/dbutil"
+  21| 	"github.com/openbao/openbao/sdk/v2/helper/dbtxn"
+  22| 	"github.com/openbao/openbao/sdk/v2/helper/template"
+  23| 	"github.com/openbao/openbao/sdk/v2/logical"
+  24| )
+  25| 
+  26| const (
+  27| 	postgreSQLTypeName         = "pgx"
+  28| 	defaultExpirationStatement = `
+  29| ALTER ROLE "{{name}}" VALID UNTIL '{{expiration}}';
+  30| `
+  31| 	defaultChangePasswordStatement = `
+  32| ALTER ROLE "{{username}}" WITH PASSWORD '{{password}}';
+  33| `
+  34| 
+  35| 	expirationFormat = "2006-01-02 15:04:05-0700"
+  36| 
+  37| 	defaultUserNameTemplate = `{{ printf "v-%s-%s-%s-%s" (.DisplayName | truncate 8) (.RoleName | truncate 8) (random 20) (unix_time) | truncate 63 }}`
+  38| )
+  39| 
+  40| var (
+  41| 	_ dbplugin.Database       = (*PostgreSQL)(nil)
+  42| 	_ logical.PluginVersioner = (*PostgreSQL)(nil)
+  43| 
+  44| 	// postgresEndStatement is basically the word "END" but
+  45| 	// surrounded by a word boundary to differentiate it from
+  46| 	// other words like "APPEND".
+  47| 	postgresEndStatement = regexp.MustCompile(`\bEND\b`)
+  48| 
+  49| 	// doubleQuotedPhrases finds substrings like "hello"
+  50| 	// and pulls them out with the quotes included.
+  51| 	doubleQuotedPhrases = regexp.MustCompile(`(".*?")`)
+  52| 
+  53| 	// singleQuotedPhrases finds substrings like 'hello'
+  54| 	// and pulls them out with the quotes included.
+  55| 	singleQuotedPhrases = regexp.MustCompile(`('.*?')`)
+  56| 
+  57| 	// ReportedVersion is used to report a specific version to Vault.
+  58| 	ReportedVersion = ""
+  59| )
+  60| 
+  61| func New() (interface{}, error) {
+  62| 	db := new()
+  63| 	// Wrap the plugin with middleware to sanitize errors
+  64| 	dbType := dbplugin.NewDatabaseErrorSanitizerMiddleware(db, db.secretValues)
+  65| 	return dbType, nil
+  66| }
+  67| 
+  68| func new() *PostgreSQL {
+  69| 	connProducer := &connutil.SQLConnectionProducer{}
+  70| 	connProducer.Type = postgreSQLTypeName
+  71| 
+  72| 	db := &PostgreSQL{
+  73| 		SQLConnectionProducer:  connProducer,
+  74| 		passwordAuthentication: passwordAuthenticationPassword,
+  75| 	}
+  76| 
+  77| 	return db
+  78| }
+  79| 
+  80| type PostgreSQL struct {
+  81| 	*connutil.SQLConnectionProducer
+  82| 
+  83| 	usernameProducer       template.StringTemplate
+  84| 	passwordAuthentication passwordAuthentication
+  85| }
+  86| 
+  87| func (p *PostgreSQL) Initialize(ctx context.Context, req dbplugin.InitializeRequest) (dbplugin.InitializeResponse, error) {
+  88| 	newConf, err := p.Init(ctx, req.Config, req.VerifyConnection)
+  89| 	if err != nil {
+  90| 		return dbplugin.InitializeResponse{}, err
+  91| 	}
+  92| 
+  93| 	usernameTemplate, err := strutil.GetString(req.Config, "username_template")
+  94| 	if err != nil {
+  95| 		return dbplugin.InitializeResponse{}, fmt.Errorf("failed to retrieve username_template: %w", err)
+  96| 	}
+  97| 	if usernameTemplate == "" {
+  98| 		usernameTemplate = defaultUserNameTemplate
+  99| 	}
+ 100| 
+ 101| 	up, err := template.NewTemplate(template.Template(usernameTemplate))
+ 102| 	if err != nil {
+ 103| 		return dbplugin.InitializeResponse{}, fmt.Errorf("unable to initialize username template: %w", err)
+ 104| 	}
+ 105| 	p.usernameProducer = up
+ 106| 
+ 107| 	_, err = p.usernameProducer.Generate(dbplugin.UsernameMetadata{})
+ 108| 	if err != nil {
+ 109| 		return dbplugin.InitializeResponse{}, fmt.Errorf("invalid username template: %w", err)
+ 110| 	}
+ 111| 
+ 112| 	passwordAuthenticationRaw, err := strutil.GetString(req.Config, "password_authentication")
+ 113| 	if err != nil {
+ 114| 		return dbplugin.InitializeResponse{}, fmt.Errorf("failed to retrieve password_authentication: %w", err)
+ 115| 	}
+ 116| 
+ 117| 	if passwordAuthenticationRaw != "" {
+ 118| 		pwAuthentication, err := parsePasswordAuthentication(passwordAuthenticationRaw)
+ 119| 		if err != nil {
+ 120| 			return dbplugin.InitializeResponse{}, err
+ 121| 		}
+ 122| 
+ 123| 		p.passwordAuthentication = pwAuthentication
+ 124| 	}
+ 125| 
+ 126| 	resp := dbplugin.InitializeResponse{
+ 127| 		Config: newConf,
+ 128| 	}
+ 129| 	return resp, nil
+ 130| }
+ 131| 
+ 132| func (p *PostgreSQL) Type() (string, error) {
+ 133| 	return postgreSQLTypeName, nil
+ 134| }
+ 135| 
+ 136| func (p *PostgreSQL) getConnection(ctx context.Context) (*sql.DB, error) {
+ 137| 	db, err := p.Connection(ctx)
+ 138| 	if err != nil {
+ 139| 		return nil, err
+ 140| 	}
+ 141| 
+ 142| 	return db.(*sql.DB), nil
+ 143| }
+ 144| 
+ 145| func (p *PostgreSQL) UpdateUser(ctx context.Context, req dbplugin.UpdateUserRequest) (dbplugin.UpdateUserResponse, error) {
+ 146| 	if req.Username == "" {
+ 147| 		return dbplugin.UpdateUserResponse{}, errors.New("missing username")
+ 148| 	}
+ 149| 	if req.Password == nil && req.Expiration == nil {
+ 150| 		return dbplugin.UpdateUserResponse{}, errors.New("no changes requested")
+ 151| 	}
+ 152| 
+ 153| 	merr := &multierror.Error{}
+ 154| 	if req.Password != nil {
+ 155| 		err := p.changeUserPassword(ctx, req.Username, req.Password)
+ 156| 		merr = multierror.Append(merr, err)
+ 157| 	}
+ 158| 	if req.Expiration != nil {
+ 159| 		err := p.changeUserExpiration(ctx, req.Username, req.Expiration)
+ 160| 		merr = multierror.Append(merr, err)
+ 161| 	}
+ 162| 	return dbplugin.UpdateUserResponse{}, merr.ErrorOrNil()
+ 163| }
+ 164| 
+ 165| func (p *PostgreSQL) changeUserPassword(ctx context.Context, username string, changePass *dbplugin.ChangePassword) error {
+ 166| 	stmts := changePass.Statements.Commands
+ 167| 	if len(stmts) == 0 {
+ 168| 		stmts = []string{defaultChangePasswordStatement}
+ 169| 	}
+ 170| 
+ 171| 	password := changePass.NewPassword
+ 172| 	if password == "" {
+ 173| 		return errors.New("missing password")
+ 174| 	}
+ 175| 
+ 176| 	p.Lock()
+ 177| 	defer p.Unlock()
+ 178| 
+ 179| 	db, err := p.getConnection(ctx)
+ 180| 	if err != nil {
+ 181| 		return fmt.Errorf("unable to get connection: %w", err)
+ 182| 	}
+ 183| 
+ 184| 	// Check if the role exists
+ 185| 	var exists bool
+ 186| 	err = db.QueryRowContext(ctx, "SELECT exists (SELECT rolname FROM pg_roles WHERE rolname=$1);", username).Scan(&exists)
+ 187| 	if err != nil && err != sql.ErrNoRows {
+ 188| 		return fmt.Errorf("user does not appear to exist: %w", err)
+ 189| 	}
+ 190| 
+ 191| 	tx, err := db.BeginTx(ctx, nil)
+ 192| 	if err != nil {
+ 193| 		return fmt.Errorf("unable to start transaction: %w", err)
+ 194| 	}
+ 195| 	defer tx.Rollback()
+ 196| 
+ 197| 	for _, stmt := range stmts {
+ 198| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
+ 199| 			query = strings.TrimSpace(query)
+ 200| 			if len(query) == 0 {
+ 201| 				continue
+ 202| 			}
+ 203| 
+ 204| 			m := map[string]string{
+ 205| 				"name":     username,
+ 206| 				"username": username,
+ 207| 				"password": password,
+ 208| 			}
+ 209| 
+ 210| 			if p.passwordAuthentication == passwordAuthenticationSCRAMSHA256 {
+ 211| 				hashedPassword, err := scram.Hash(password)
+ 212| 				if err != nil {
+ 213| 					return fmt.Errorf("unable to scram-sha256 password: %w", err)
+ 214| 				}
+ 215| 				m["password"] = hashedPassword
+ 216| 			}
+ 217| 
+ 218| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
+ 219| 				return fmt.Errorf("failed to execute query: %w", err)
+ 220| 			}
+ 221| 		}
+ 222| 	}
+ 223| 
+ 224| 	if err := tx.Commit(); err != nil {
+ 225| 		return err
+ 226| 	}
+ 227| 
+ 228| 	return nil
+ 229| }
+ 230| 
+ 231| func (p *PostgreSQL) changeUserExpiration(ctx context.Context, username string, changeExp *dbplugin.ChangeExpiration) error {
+ 232| 	p.Lock()
+ 233| 	defer p.Unlock()
+ 234| 
+ 235| 	renewStmts := changeExp.Statements.Commands
+ 236| 	if len(renewStmts) == 0 {
+ 237| 		renewStmts = []string{defaultExpirationStatement}
+ 238| 	}
+ 239| 
+ 240| 	db, err := p.getConnection(ctx)
+ 241| 	if err != nil {
+ 242| 		return err
+ 243| 	}
+ 244| 
+ 245| 	tx, err := db.BeginTx(ctx, nil)
+ 246| 	if err != nil {
+ 247| 		return err
+ 248| 	}
+ 249| 	defer func() {
+ 250| 		tx.Rollback()
+ 251| 	}()
+ 252| 
+ 253| 	expirationStr := changeExp.NewExpiration.Format(expirationFormat)
+ 254| 
+ 255| 	for _, stmt := range renewStmts {
+ 256| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
+ 257| 			query = strings.TrimSpace(query)
+ 258| 			if len(query) == 0 {
+ 259| 				continue
+ 260| 			}
+ 261| 
+ 262| 			m := map[string]string{
+ 263| 				"name":       username,
+ 264| 				"username":   username,
+ 265| 				"expiration": expirationStr,
+ 266| 			}
+ 267| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
+ 268| 				return err
+ 269| 			}
+ 270| 		}
+ 271| 	}
+ 272| 
+ 273| 	return tx.Commit()
+ 274| }
+ 275| 
+ 276| func (p *PostgreSQL) NewUser(ctx context.Context, req dbplugin.NewUserRequest) (dbplugin.NewUserResponse, error) {
+ 277| 	if len(req.Statements.Commands) == 0 {
+ 278| 		return dbplugin.NewUserResponse{}, dbutil.ErrEmptyCreationStatement
+ 279| 	}
+ 280| 
+ 281| 	p.Lock()
+ 282| 	defer p.Unlock()
+ 283| 
+ 284| 	username, err := p.usernameProducer.Generate(req.UsernameConfig)
+ 285| 	if err != nil {
+ 286| 		return dbplugin.NewUserResponse{}, err
+ 287| 	}
+ 288| 
+ 289| 	expirationStr := req.Expiration.Format(expirationFormat)
+ 290| 
+ 291| 	db, err := p.getConnection(ctx)
+ 292| 	if err != nil {
+ 293| 		return dbplugin.NewUserResponse{}, fmt.Errorf("unable to get connection: %w", err)
+ 294| 	}
+ 295| 
+ 296| 	tx, err := db.BeginTx(ctx, nil)
+ 297| 	if err != nil {
+ 298| 		return dbplugin.NewUserResponse{}, fmt.Errorf("unable to start transaction: %w", err)
+ 299| 	}
+ 300| 	defer tx.Rollback()
+ 301| 
+ 302| 	m := map[string]string{
+ 303| 		"name":       username,
+ 304| 		"username":   username,
+ 305| 		"password":   req.Password,
+ 306| 		"expiration": expirationStr,
+ 307| 	}
+ 308| 
+ 309| 	if p.passwordAuthentication == passwordAuthenticationSCRAMSHA256 {
+ 310| 		hashedPassword, err := scram.Hash(req.Password)
+ 311| 		if err != nil {
+ 312| 			return dbplugin.NewUserResponse{}, fmt.Errorf("unable to scram-sha256 password: %w", err)
+ 313| 		}
+ 314| 		m["password"] = hashedPassword
+ 315| 	}
+ 316| 
+ 317| 	for _, stmt := range req.Statements.Commands {
+ 318| 		if containsMultilineStatement(stmt) {
+ 319| 			// Execute it as-is.
+ 320| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, stmt); err != nil {
+ 321| 				return dbplugin.NewUserResponse{}, fmt.Errorf("failed to execute query: %w", err)
+ 322| 			}
+ 323| 			continue
+ 324| 		}
+ 325| 		// Otherwise, it's fine to split the statements on the semicolon.
+ 326| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
+ 327| 			query = strings.TrimSpace(query)
+ 328| 			if len(query) == 0 {
+ 329| 				continue
+ 330| 			}
+ 331| 
+ 332| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
+ 333| 				return dbplugin.NewUserResponse{}, fmt.Errorf("failed to execute query: %w", err)
+ 334| 			}
+ 335| 		}
+ 336| 	}
+ 337| 
+ 338| 	if err := tx.Commit(); err != nil {
+ 339| 		return dbplugin.NewUserResponse{}, err
+ 340| 	}
+ 341| 
+ 342| 	resp := dbplugin.NewUserResponse{
+ 343| 		Username: username,
+ 344| 	}
+ 345| 	return resp, nil
+ 346| }
+ 347| 
+ 348| func (p *PostgreSQL) DeleteUser(ctx context.Context, req dbplugin.DeleteUserRequest) (dbplugin.DeleteUserResponse, error) {
+ 349| 	p.Lock()
+ 350| 	defer p.Unlock()
+ 351| 
+ 352| 	if len(req.Statements.Commands) == 0 {
+ 353| 		return dbplugin.DeleteUserResponse{}, p.defaultDeleteUser(ctx, req.Username)
+ 354| 	}
+ 355| 
+ 356| 	return dbplugin.DeleteUserResponse{}, p.customDeleteUser(ctx, req.Username, req.Statements.Commands)
+ 357| }
+ 358| 
+ 359| func (p *PostgreSQL) customDeleteUser(ctx context.Context, username string, revocationStmts []string) error {
+ 360| 	db, err := p.getConnection(ctx)
+ 361| 	if err != nil {
+ 362| 		return err
+ 363| 	}
+ 364| 
+ 365| 	tx, err := db.BeginTx(ctx, nil)
+ 366| 	if err != nil {
+ 367| 		return err
+ 368| 	}
+ 369| 	defer func() {
+ 370| 		tx.Rollback()
+ 371| 	}()
+ 372| 
+ 373| 	for _, stmt := range revocationStmts {
+ 374| 		if containsMultilineStatement(stmt) {
+ 375| 			// Execute it as-is.
+ 376| 			m := map[string]string{
+ 377| 				"name":     username,
+ 378| 				"username": username,
+ 379| 			}
+ 380| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, stmt); err != nil {
+ 381| 				return err
+ 382| 			}
+ 383| 			continue
+ 384| 		}
+ 385| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
+ 386| 			query = strings.TrimSpace(query)
+ 387| 			if len(query) == 0 {
+ 388| 				continue
+ 389| 			}
+ 390| 
+ 391| 			m := map[string]string{
+ 392| 				"name":     username,
+ 393| 				"username": username,
+ 394| 			}
+ 395| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
+ 396| 				return err
+ 397| 			}
+ 398| 		}
+ 399| 	}
+ 400| 
+ 401| 	return tx.Commit()
+ 402| }
+ 403| 
+ 404| func (p *PostgreSQL) defaultDeleteUser(ctx context.Context, username string) error {
+ 405| 	db, err := p.getConnection(ctx)
+ 406| 	if err != nil {
+ 407| 		return err
+ 408| 	}
+ 409| 
+ 410| 	// Check if the role exists
+ 411| 	var exists bool
+ 412| 	err = db.QueryRowContext(ctx, "SELECT exists (SELECT rolname FROM pg_roles WHERE rolname=$1);", username).Scan(&exists)
+ 413| 	if err != nil && err != sql.ErrNoRows {
+ 414| 		return err
+ 415| 	}
+ 416| 
+ 417| 	if !exists {
+ 418| 		return nil
+ 419| 	}
+ 420| 
+ 421| 	// Query for permissions; we need to revoke permissions before we can drop
+ 422| 	// the role
+ 423| 	// This isn't done in a transaction because even if we fail along the way,
+ 424| 	// we want to remove as much access as possible
+ 425| 	stmt, err := db.PrepareContext(ctx, "SELECT DISTINCT table_schema FROM information_schema.role_column_grants WHERE grantee=$1;")
+ 426| 	if err != nil {
+ 427| 		return err
+ 428| 	}
+ 429| 	defer stmt.Close()
+ 430| 
+ 431| 	rows, err := stmt.QueryContext(ctx, username)
+ 432| 	if err != nil {
+ 433| 		return err
+ 434| 	}
+ 435| 	defer rows.Close()
+ 436| 
+ 437| 	const initialNumRevocations = 16
+ 438| 	revocationStmts := make([]string, 0, initialNumRevocations)
+ 439| 	for rows.Next() {
+ 440| 		var schema string
+ 441| 		err = rows.Scan(&schema)
+ 442| 		if err != nil {
+ 443| 			// keep going; remove as many permissions as possible right now
+ 444| 			continue
+ 445| 		}
+ 446| 		revocationStmts = append(revocationStmts, fmt.Sprintf(
+ 447| 			`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %s FROM %s;`,
+ 448| 			(schema),
+ 449| 			dbutil.QuoteIdentifier(username)))
+ 450| 
+ 451| 		revocationStmts = append(revocationStmts, fmt.Sprintf(
+ 452| 			`REVOKE USAGE ON SCHEMA %s FROM %s;`,
+ 453| 			dbutil.QuoteIdentifier(schema),
+ 454| 			dbutil.QuoteIdentifier(username)))
+ 455| 	}
+ 456| 
+ 457| 	// for good measure, revoke all privileges and usage on schema public
+ 458| 	revocationStmts = append(revocationStmts, fmt.Sprintf(
+ 459| 		`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM %s;`,
+ 460| 		dbutil.QuoteIdentifier(username)))
+ 461| 
+ 462| 	revocationStmts = append(revocationStmts, fmt.Sprintf(
+ 463| 		"REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM %s;",
+ 464| 		dbutil.QuoteIdentifier(username)))
+ 465| 
+ 466| 	revocationStmts = append(revocationStmts, fmt.Sprintf(
+ 467| 		"REVOKE USAGE ON SCHEMA public FROM %s;",
+ 468| 		dbutil.QuoteIdentifier(username)))
+ 469| 
+ 470| 	// get the current database name so we can issue a REVOKE CONNECT for
+ 471| 	// this username
+ 472| 	var dbname sql.NullString
+ 473| 	if err := db.QueryRowContext(ctx, "SELECT current_database();").Scan(&dbname); err != nil {
+ 474| 		return err
+ 475| 	}
+ 476| 
+ 477| 	if dbname.Valid {
+ 478| 		revocationStmts = append(revocationStmts, fmt.Sprintf(
+ 479| 			`REVOKE CONNECT ON DATABASE %s FROM %s;`,
+ 480| 			dbutil.QuoteIdentifier(dbname.String),
+ 481| 			dbutil.QuoteIdentifier(username)))
+ 482| 	}
+ 483| 
+ 484| 	// again, here, we do not stop on error, as we want to remove as
+ 485| 	// many permissions as possible right now
+ 486| 	var lastStmtError error
+ 487| 	for _, query := range revocationStmts {
+ 488| 		if err := dbtxn.ExecuteDBQueryDirect(ctx, db, nil, query); err != nil {
+ 489| 			lastStmtError = err
+ 490| 		}
+ 491| 	}
+ 492| 
+ 493| 	// can't drop if not all privileges are revoked
+ 494| 	if rows.Err() != nil {
+ 495| 		return fmt.Errorf("could not generate revocation statements for all rows: %w", rows.Err())
+ 496| 	}
+ 497| 	if lastStmtError != nil {
+ 498| 		return fmt.Errorf("could not perform all revocation statements: %w", lastStmtError)
+ 499| 	}
+ 500| 
+ 501| 	// Drop this user
+ 502| 	stmt, err = db.PrepareContext(ctx, fmt.Sprintf(
+ 503| 		`DROP ROLE IF EXISTS %s;`, dbutil.QuoteIdentifier(username)))
+ 504| 	if err != nil {
+ 505| 		return err
+ 506| 	}
+ 507| 	defer stmt.Close()
+ 508| 	if _, err := stmt.ExecContext(ctx); err != nil {
+ 509| 		return err
+ 510| 	}
+ 511| 
+ 512| 	return nil
+ 513| }
+ 514| 
+ 515| func (p *PostgreSQL) secretValues() map[string]string {
+ 516| 	return map[string]string{
+ 517| 		p.Password: "[password]",
+ 518| 	}
+ 519| }
+ 520| 
+ 521| func (p *PostgreSQL) PluginVersion() logical.PluginVersion {
+ 522| 	return logical.PluginVersion{Version: ReportedVersion}
+ 523| }
+ 524| 
+ 525| // containsMultilineStatement is a best effort to determine whether
+ 526| // a particular statement is multiline, and therefore should not be
+ 527| // split upon semicolons. If it's unsure, it defaults to false.
+ 528| func containsMultilineStatement(stmt string) bool {
+ 529| 	// We're going to look for the word "END", but first let's ignore
+ 530| 	// anything the user provided within single or double quotes since
+ 531| 	// we're looking for an "END" within the Postgres syntax.
+ 532| 	literals, err := extractQuotedStrings(stmt)
+ 533| 	if err != nil {
+ 534| 		return false
+ 535| 	}
+ 536| 	stmtWithoutLiterals := stmt
+ 537| 	for _, literal := range literals {
+ 538| 		stmtWithoutLiterals = strings.ReplaceAll(stmt, literal, "")
+ 539| 	}
+ 540| 	// Now look for the word "END" specifically. This will miss any
+ 541| 	// representations of END that aren't surrounded by spaces, but
+ 542| 	// it should be easy to change on the user's side.
+ 543| 	return postgresEndStatement.MatchString(stmtWithoutLiterals)
+ 544| }
+ 545| 
+ 546| // extractQuotedStrings extracts 0 or many substrings
+ 547| // that have been single- or double-quoted. Ex:
+ 548| // `"Hello", silly 'elephant' from the "zoo".`
+ 549| // returns [ `Hello`, `'elephant'`, `"zoo"` ]
+ 550| func extractQuotedStrings(s string) ([]string, error) {
+ 551| 	var found []string
+ 552| 	toFind := []*regexp.Regexp{
+ 553| 		doubleQuotedPhrases,
+ 554| 		singleQuotedPhrases,
+ 555| 	}
+ 556| 	for _, typeOfPhrase := range toFind {
+ 557| 		found = append(found, typeOfPhrase.FindAllString(s, -1)...)
+ 558| 	}
+ 559| 	return found, nil
+ 560| }
+ 561| 
+ 562| 
+
+### id=8087 lang=go
+[CODE]
+   1| // Copyright (c) HashiCorp, Inc.
+   2| // SPDX-License-Identifier: MPL-2.0
+   3| 
+   4| package postgresql
+   5| 
+   6| import (
+   7| 	"context"
+   8| 	"database/sql"
+   9| 	"errors"
+  10| 	"fmt"
+  11| 	"regexp"
+  12| 	"strings"
+  13| 
+  14| 	"github.com/hashicorp/go-multierror"
+  15| 	"github.com/hashicorp/go-secure-stdlib/strutil"
+  16| 	_ "github.com/jackc/pgx/v5/stdlib"
+  17| 	"github.com/openbao/openbao/plugins/database/postgresql/scram"
+  18| 	"github.com/openbao/openbao/sdk/v2/database/dbplugin/v5"
+  19| 	"github.com/openbao/openbao/sdk/v2/database/helper/connutil"
+  20| 	"github.com/openbao/openbao/sdk/v2/database/helper/dbutil"
+  21| 	"github.com/openbao/openbao/sdk/v2/helper/dbtxn"
+  22| 	"github.com/openbao/openbao/sdk/v2/helper/template"
+  23| 	"github.com/openbao/openbao/sdk/v2/logical"
+  24| )
+  25| 
+  26| const (
+  27| 	postgreSQLTypeName         = "pgx"
+  28| 	defaultExpirationStatement = `
+  29| ALTER ROLE "{{name}}" VALID UNTIL '{{expiration}}';
+  30| `
+  31| 	defaultChangePasswordStatement = `
+  32| ALTER ROLE "{{username}}" WITH PASSWORD '{{password}}';
+  33| `
+  34| 
+  35| 	expirationFormat = "2006-01-02 15:04:05-0700"
+  36| 
+  37| 	defaultUserNameTemplate = `{{ printf "v-%s-%s-%s-%s" (.DisplayName | truncate 8) (.RoleName | truncate 8) (random 20) (unix_time) | truncate 63 }}`
+  38| )
+  39| 
+  40| var (
+  41| 	_ dbplugin.Database       = (*PostgreSQL)(nil)
+  42| 	_ logical.PluginVersioner = (*PostgreSQL)(nil)
+  43| 
+  44| 	// postgresEndStatement is basically the word "END" but
+  45| 	// surrounded by a word boundary to differentiate it from
+  46| 	// other words like "APPEND".
+  47| 	postgresEndStatement = regexp.MustCompile(`\bEND\b`)
+  48| 
+  49| 	// doubleQuotedPhrases finds substrings like "hello"
+  50| 	// and pulls them out with the quotes included.
+  51| 	doubleQuotedPhrases = regexp.MustCompile(`(".*?")`)
+  52| 
+  53| 	// singleQuotedPhrases finds substrings like 'hello'
+  54| 	// and pulls them out with the quotes included.
+  55| 	singleQuotedPhrases = regexp.MustCompile(`('.*?')`)
+  56| 
+  57| 	// ReportedVersion is used to report a specific version to Vault.
+  58| 	ReportedVersion = ""
+  59| )
+  60| 
+  61| func New() (interface{}, error) {
+  62| 	db := new()
+  63| 	// Wrap the plugin with middleware to sanitize errors
+  64| 	dbType := dbplugin.NewDatabaseErrorSanitizerMiddleware(db, db.secretValues)
+  65| 	return dbType, nil
+  66| }
+  67| 
+  68| func new() *PostgreSQL {
+  69| 	connProducer := &connutil.SQLConnectionProducer{}
+  70| 	connProducer.Type = postgreSQLTypeName
+  71| 
+  72| 	db := &PostgreSQL{
+  73| 		SQLConnectionProducer:  connProducer,
+  74| 		passwordAuthentication: passwordAuthenticationPassword,
+  75| 	}
+  76| 
+  77| 	return db
+  78| }
+  79| 
+  80| type PostgreSQL struct {
+  81| 	*connutil.SQLConnectionProducer
+  82| 
+  83| 	usernameProducer       template.StringTemplate
+  84| 	passwordAuthentication passwordAuthentication
+  85| }
+  86| 
+  87| func (p *PostgreSQL) Initialize(ctx context.Context, req dbplugin.InitializeRequest) (dbplugin.InitializeResponse, error) {
+  88| 	newConf, err := p.Init(ctx, req.Config, req.VerifyConnection)
+  89| 	if err != nil {
+  90| 		return dbplugin.InitializeResponse{}, err
+  91| 	}
+  92| 
+  93| 	usernameTemplate, err := strutil.GetString(req.Config, "username_template")
+  94| 	if err != nil {
+  95| 		return dbplugin.InitializeResponse{}, fmt.Errorf("failed to retrieve username_template: %w", err)
+  96| 	}
+  97| 	if usernameTemplate == "" {
+  98| 		usernameTemplate = defaultUserNameTemplate
+  99| 	}
+ 100| 
+ 101| 	up, err := template.NewTemplate(template.Template(usernameTemplate))
+ 102| 	if err != nil {
+ 103| 		return dbplugin.InitializeResponse{}, fmt.Errorf("unable to initialize username template: %w", err)
+ 104| 	}
+ 105| 	p.usernameProducer = up
+ 106| 
+ 107| 	_, err = p.usernameProducer.Generate(dbplugin.UsernameMetadata{})
+ 108| 	if err != nil {
+ 109| 		return dbplugin.InitializeResponse{}, fmt.Errorf("invalid username template: %w", err)
+ 110| 	}
+ 111| 
+ 112| 	passwordAuthenticationRaw, err := strutil.GetString(req.Config, "password_authentication")
+ 113| 	if err != nil {
+ 114| 		return dbplugin.InitializeResponse{}, fmt.Errorf("failed to retrieve password_authentication: %w", err)
+ 115| 	}
+ 116| 
+ 117| 	if passwordAuthenticationRaw != "" {
+ 118| 		pwAuthentication, err := parsePasswordAuthentication(passwordAuthenticationRaw)
+ 119| 		if err != nil {
+ 120| 			return dbplugin.InitializeResponse{}, err
+ 121| 		}
+ 122| 
+ 123| 		p.passwordAuthentication = pwAuthentication
+ 124| 	}
+ 125| 
+ 126| 	resp := dbplugin.InitializeResponse{
+ 127| 		Config: newConf,
+ 128| 	}
+ 129| 	return resp, nil
+ 130| }
+ 131| 
+ 132| func (p *PostgreSQL) Type() (string, error) {
+ 133| 	return postgreSQLTypeName, nil
+ 134| }
+ 135| 
+ 136| func (p *PostgreSQL) getConnection(ctx context.Context) (*sql.DB, error) {
+ 137| 	db, err := p.Connection(ctx)
+ 138| 	if err != nil {
+ 139| 		return nil, err
+ 140| 	}
+ 141| 
+ 142| 	return db.(*sql.DB), nil
+ 143| }
+ 144| 
+ 145| func (p *PostgreSQL) UpdateUser(ctx context.Context, req dbplugin.UpdateUserRequest) (dbplugin.UpdateUserResponse, error) {
+ 146| 	if req.Username == "" {
+ 147| 		return dbplugin.UpdateUserResponse{}, errors.New("missing username")
+ 148| 	}
+ 149| 	if req.Password == nil && req.Expiration == nil {
+ 150| 		return dbplugin.UpdateUserResponse{}, errors.New("no changes requested")
+ 151| 	}
+ 152| 
+ 153| 	merr := &multierror.Error{}
+ 154| 	if req.Password != nil {
+ 155| 		err := p.changeUserPassword(ctx, req.Username, req.Password)
+ 156| 		merr = multierror.Append(merr, err)
+ 157| 	}
+ 158| 	if req.Expiration != nil {
+ 159| 		err := p.changeUserExpiration(ctx, req.Username, req.Expiration)
+ 160| 		merr = multierror.Append(merr, err)
+ 161| 	}
+ 162| 	return dbplugin.UpdateUserResponse{}, merr.ErrorOrNil()
+ 163| }
+ 164| 
+ 165| func (p *PostgreSQL) changeUserPassword(ctx context.Context, username string, changePass *dbplugin.ChangePassword) error {
+ 166| 	stmts := changePass.Statements.Commands
+ 167| 	if len(stmts) == 0 {
+ 168| 		stmts = []string{defaultChangePasswordStatement}
+ 169| 	}
+ 170| 
+ 171| 	password := changePass.NewPassword
+ 172| 	if password == "" {
+ 173| 		return errors.New("missing password")
+ 174| 	}
+ 175| 
+ 176| 	p.Lock()
+ 177| 	defer p.Unlock()
+ 178| 
+ 179| 	db, err := p.getConnection(ctx)
+ 180| 	if err != nil {
+ 181| 		return fmt.Errorf("unable to get connection: %w", err)
+ 182| 	}
+ 183| 
+ 184| 	// Check if the role exists
+ 185| 	var exists bool
+ 186| 	err = db.QueryRowContext(ctx, "SELECT exists (SELECT rolname FROM pg_roles WHERE rolname=$1);", username).Scan(&exists)
+ 187| 	if err != nil && err != sql.ErrNoRows {
+ 188| 		return fmt.Errorf("user does not appear to exist: %w", err)
+ 189| 	}
+ 190| 
+ 191| 	tx, err := db.BeginTx(ctx, nil)
+ 192| 	if err != nil {
+ 193| 		return fmt.Errorf("unable to start transaction: %w", err)
+ 194| 	}
+ 195| 	defer tx.Rollback()
+ 196| 
+ 197| 	for _, stmt := range stmts {
+ 198| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
+ 199| 			query = strings.TrimSpace(query)
+ 200| 			if len(query) == 0 {
+ 201| 				continue
+ 202| 			}
+ 203| 
+ 204| 			m := map[string]string{
+ 205| 				"name":     username,
+ 206| 				"username": username,
+ 207| 				"password": password,
+ 208| 			}
+ 209| 
+ 210| 			if p.passwordAuthentication == passwordAuthenticationSCRAMSHA256 {
+ 211| 				hashedPassword, err := scram.Hash(password)
+ 212| 				if err != nil {
+ 213| 					return fmt.Errorf("unable to scram-sha256 password: %w", err)
+ 214| 				}
+ 215| 				m["password"] = hashedPassword
+ 216| 			}
+ 217| 
+ 218| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
+ 219| 				return fmt.Errorf("failed to execute query: %w", err)
+ 220| 			}
+ 221| 		}
+ 222| 	}
+ 223| 
+ 224| 	if err := tx.Commit(); err != nil {
+ 225| 		return err
+ 226| 	}
+ 227| 
+ 228| 	return nil
+ 229| }
+ 230| 
+ 231| func (p *PostgreSQL) changeUserExpiration(ctx context.Context, username string, changeExp *dbplugin.ChangeExpiration) error {
+ 232| 	p.Lock()
+ 233| 	defer p.Unlock()
+ 234| 
+ 235| 	renewStmts := changeExp.Statements.Commands
+ 236| 	if len(renewStmts) == 0 {
+ 237| 		renewStmts = []string{defaultExpirationStatement}
+ 238| 	}
+ 239| 
+ 240| 	db, err := p.getConnection(ctx)
+ 241| 	if err != nil {
+ 242| 		return err
+ 243| 	}
+ 244| 
+ 245| 	tx, err := db.BeginTx(ctx, nil)
+ 246| 	if err != nil {
+ 247| 		return err
+ 248| 	}
+ 249| 	defer func() {
+ 250| 		tx.Rollback()
+ 251| 	}()
+ 252| 
+ 253| 	expirationStr := changeExp.NewExpiration.Format(expirationFormat)
+ 254| 
+ 255| 	for _, stmt := range renewStmts {
+ 256| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
+ 257| 			query = strings.TrimSpace(query)
+ 258| 			if len(query) == 0 {
+ 259| 				continue
+ 260| 			}
+ 261| 
+ 262| 			m := map[string]string{
+ 263| 				"name":       username,
+ 264| 				"username":   username,
+ 265| 				"expiration": expirationStr,
+ 266| 			}
+ 267| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
+ 268| 				return err
+ 269| 			}
+ 270| 		}
+ 271| 	}
+ 272| 
+ 273| 	return tx.Commit()
+ 274| }
+ 275| 
+ 276| func (p *PostgreSQL) NewUser(ctx context.Context, req dbplugin.NewUserRequest) (dbplugin.NewUserResponse, error) {
+ 277| 	if len(req.Statements.Commands) == 0 {
+ 278| 		return dbplugin.NewUserResponse{}, dbutil.ErrEmptyCreationStatement
+ 279| 	}
+ 280| 
+ 281| 	p.Lock()
+ 282| 	defer p.Unlock()
+ 283| 
+ 284| 	username, err := p.usernameProducer.Generate(req.UsernameConfig)
+ 285| 	if err != nil {
+ 286| 		return dbplugin.NewUserResponse{}, err
+ 287| 	}
+ 288| 
+ 289| 	expirationStr := req.Expiration.Format(expirationFormat)
+ 290| 
+ 291| 	db, err := p.getConnection(ctx)
+ 292| 	if err != nil {
+ 293| 		return dbplugin.NewUserResponse{}, fmt.Errorf("unable to get connection: %w", err)
+ 294| 	}
+ 295| 
+ 296| 	tx, err := db.BeginTx(ctx, nil)
+ 297| 	if err != nil {
+ 298| 		return dbplugin.NewUserResponse{}, fmt.Errorf("unable to start transaction: %w", err)
+ 299| 	}
+ 300| 	defer tx.Rollback()
+ 301| 
+ 302| 	m := map[string]string{
+ 303| 		"name":       username,
+ 304| 		"username":   username,
+ 305| 		"password":   req.Password,
+ 306| 		"expiration": expirationStr,
+ 307| 	}
+ 308| 
+ 309| 	if p.passwordAuthentication == passwordAuthenticationSCRAMSHA256 {
+ 310| 		hashedPassword, err := scram.Hash(req.Password)
+ 311| 		if err != nil {
+ 312| 			return dbplugin.NewUserResponse{}, fmt.Errorf("unable to scram-sha256 password: %w", err)
+ 313| 		}
+ 314| 		m["password"] = hashedPassword
+ 315| 	}
+ 316| 
+ 317| 	for _, stmt := range req.Statements.Commands {
+ 318| 		if containsMultilineStatement(stmt) {
+ 319| 			// Execute it as-is.
+ 320| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, stmt); err != nil {
+ 321| 				return dbplugin.NewUserResponse{}, fmt.Errorf("failed to execute query: %w", err)
+ 322| 			}
+ 323| 			continue
+ 324| 		}
+ 325| 		// Otherwise, it's fine to split the statements on the semicolon.
+ 326| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
+ 327| 			query = strings.TrimSpace(query)
+ 328| 			if len(query) == 0 {
+ 329| 				continue
+ 330| 			}
+ 331| 
+ 332| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
+ 333| 				return dbplugin.NewUserResponse{}, fmt.Errorf("failed to execute query: %w", err)
+ 334| 			}
+ 335| 		}
+ 336| 	}
+ 337| 
+ 338| 	if err := tx.Commit(); err != nil {
+ 339| 		return dbplugin.NewUserResponse{}, err
+ 340| 	}
+ 341| 
+ 342| 	resp := dbplugin.NewUserResponse{
+ 343| 		Username: username,
+ 344| 	}
+ 345| 	return resp, nil
+ 346| }
+ 347| 
+ 348| func (p *PostgreSQL) DeleteUser(ctx context.Context, req dbplugin.DeleteUserRequest) (dbplugin.DeleteUserResponse, error) {
+ 349| 	p.Lock()
+ 350| 	defer p.Unlock()
+ 351| 
+ 352| 	if len(req.Statements.Commands) == 0 {
+ 353| 		return dbplugin.DeleteUserResponse{}, p.defaultDeleteUser(ctx, req.Username)
+ 354| 	}
+ 355| 
+ 356| 	return dbplugin.DeleteUserResponse{}, p.customDeleteUser(ctx, req.Username, req.Statements.Commands)
+ 357| }
+ 358| 
+ 359| func (p *PostgreSQL) customDeleteUser(ctx context.Context, username string, revocationStmts []string) error {
+ 360| 	db, err := p.getConnection(ctx)
+ 361| 	if err != nil {
+ 362| 		return err
+ 363| 	}
+ 364| 
+ 365| 	tx, err := db.BeginTx(ctx, nil)
+ 366| 	if err != nil {
+ 367| 		return err
+ 368| 	}
+ 369| 	defer func() {
+ 370| 		tx.Rollback()
+ 371| 	}()
+ 372| 
+ 373| 	for _, stmt := range revocationStmts {
+ 374| 		if containsMultilineStatement(stmt) {
+ 375| 			// Execute it as-is.
+ 376| 			m := map[string]string{
+ 377| 				"name":     username,
+ 378| 				"username": username,
+ 379| 			}
+ 380| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, stmt); err != nil {
+ 381| 				return err
+ 382| 			}
+ 383| 			continue
+ 384| 		}
+ 385| 		for _, query := range strutil.ParseArbitraryStringSlice(stmt, ";") {
+ 386| 			query = strings.TrimSpace(query)
+ 387| 			if len(query) == 0 {
+ 388| 				continue
+ 389| 			}
+ 390| 
+ 391| 			m := map[string]string{
+ 392| 				"name":     username,
+ 393| 				"username": username,
+ 394| 			}
+ 395| 			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
+ 396| 				return err
+ 397| 			}
+ 398| 		}
+ 399| 	}
+ 400| 
+ 401| 	return tx.Commit()
+ 402| }
+ 403| 
+ 404| func (p *PostgreSQL) defaultDeleteUser(ctx context.Context, username string) error {
+ 405| 	db, err := p.getConnection(ctx)
+ 406| 	if err != nil {
+ 407| 		return err
+ 408| 	}
+ 409| 
+ 410| 	// Check if the role exists
+ 411| 	var exists bool
+ 412| 	err = db.QueryRowContext(ctx, "SELECT exists (SELECT rolname FROM pg_roles WHERE rolname=$1);", username).Scan(&exists)
+ 413| 	if err != nil && err != sql.ErrNoRows {
+ 414| 		return err
+ 415| 	}
+ 416| 
+ 417| 	if !exists {
+ 418| 		return nil
+ 419| 	}
+ 420| 
+ 421| 	// Query for permissions; we need to revoke permissions before we can drop
+ 422| 	// the role
+ 423| 	// This isn't done in a transaction because even if we fail along the way,
+ 424| 	// we want to remove as much access as possible
+ 425| 	stmt, err := db.PrepareContext(ctx, "SELECT DISTINCT table_schema FROM information_schema.role_column_grants WHERE grantee=$1;")
+ 426| 	if err != nil {
+ 427| 		return err
+ 428| 	}
+ 429| 	defer stmt.Close()
+ 430| 
+ 431| 	rows, err := stmt.QueryContext(ctx, username)
+ 432| 	if err != nil {
+ 433| 		return err
+ 434| 	}
+ 435| 	defer rows.Close()
+ 436| 
+ 437| 	const initialNumRevocations = 16
+ 438| 	revocationStmts := make([]string, 0, initialNumRevocations)
+ 439| 	for rows.Next() {
+ 440| 		var schema string
+ 441| 		err = rows.Scan(&schema)
+ 442| 		if err != nil {
+ 443| 			// keep going; remove as many permissions as possible right now
+ 444| 			continue
+ 445| 		}
+ 446| 		revocationStmts = append(revocationStmts, fmt.Sprintf(
+ 447| 			`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %s FROM %s;`,
+ 448| 			dbutil.QuoteIdentifier(schema),
+ 449| 			dbutil.QuoteIdentifier(username)))
+ 450| 
+ 451| 		revocationStmts = append(revocationStmts, fmt.Sprintf(
+ 452| 			`REVOKE USAGE ON SCHEMA %s FROM %s;`,
+ 453| 			dbutil.QuoteIdentifier(schema),
+ 454| 			dbutil.QuoteIdentifier(username)))
+ 455| 	}
+ 456| 
+ 457| 	// for good measure, revoke all privileges and usage on schema public
+ 458| 	revocationStmts = append(revocationStmts, fmt.Sprintf(
+ 459| 		`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM %s;`,
+ 460| 		dbutil.QuoteIdentifier(username)))
+ 461| 
+ 462| 	revocationStmts = append(revocationStmts, fmt.Sprintf(
+ 463| 		"REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM %s;",
+ 464| 		dbutil.QuoteIdentifier(username)))
+ 465| 
+ 466| 	revocationStmts = append(revocationStmts, fmt.Sprintf(
+ 467| 		"REVOKE USAGE ON SCHEMA public FROM %s;",
+ 468| 		dbutil.QuoteIdentifier(username)))
+ 469| 
+ 470| 	// get the current database name so we can issue a REVOKE CONNECT for
+ 471| 	// this username
+ 472| 	var dbname sql.NullString
+ 473| 	if err := db.QueryRowContext(ctx, "SELECT current_database();").Scan(&dbname); err != nil {
+ 474| 		return err
+ 475| 	}
+ 476| 
+ 477| 	if dbname.Valid {
+ 478| 		revocationStmts = append(revocationStmts, fmt.Sprintf(
+ 479| 			`REVOKE CONNECT ON DATABASE %s FROM %s;`,
+ 480| 			dbutil.QuoteIdentifier(dbname.String),
+ 481| 			dbutil.QuoteIdentifier(username)))
+ 482| 	}
+ 483| 
+ 484| 	// again, here, we do not stop on error, as we want to remove as
+ 485| 	// many permissions as possible right now
+ 486| 	var lastStmtError error
+ 487| 	for _, query := range revocationStmts {
+ 488| 		if err := dbtxn.ExecuteDBQueryDirect(ctx, db, nil, query); err != nil {
+ 489| 			lastStmtError = err
+ 490| 		}
+ 491| 	}
+ 492| 
+ 493| 	// can't drop if not all privileges are revoked
+ 494| 	if rows.Err() != nil {
+ 495| 		return fmt.Errorf("could not generate revocation statements for all rows: %w", rows.Err())
+ 496| 	}
+ 497| 	if lastStmtError != nil {
+ 498| 		return fmt.Errorf("could not perform all revocation statements: %w", lastStmtError)
+ 499| 	}
+ 500| 
+ 501| 	// Drop this user
+ 502| 	stmt, err = db.PrepareContext(ctx, fmt.Sprintf(
+ 503| 		`DROP ROLE IF EXISTS %s;`, dbutil.QuoteIdentifier(username)))
+ 504| 	if err != nil {
+ 505| 		return err
+ 506| 	}
+ 507| 	defer stmt.Close()
+ 508| 	if _, err := stmt.ExecContext(ctx); err != nil {
+ 509| 		return err
+ 510| 	}
+ 511| 
+ 512| 	return nil
+ 513| }
+ 514| 
+ 515| func (p *PostgreSQL) secretValues() map[string]string {
+ 516| 	return map[string]string{
+ 517| 		p.Password: "[password]",
+ 518| 	}
+ 519| }
+ 520| 
+ 521| func (p *PostgreSQL) PluginVersion() logical.PluginVersion {
+ 522| 	return logical.PluginVersion{Version: ReportedVersion}
+ 523| }
+ 524| 
+ 525| // containsMultilineStatement is a best effort to determine whether
+ 526| // a particular statement is multiline, and therefore should not be
+ 527| // split upon semicolons. If it's unsure, it defaults to false.
+ 528| func containsMultilineStatement(stmt string) bool {
+ 529| 	// We're going to look for the word "END", but first let's ignore
+ 530| 	// anything the user provided within single or double quotes since
+ 531| 	// we're looking for an "END" within the Postgres syntax.
+ 532| 	literals, err := extractQuotedStrings(stmt)
+ 533| 	if err != nil {
+ 534| 		return false
+ 535| 	}
+ 536| 	stmtWithoutLiterals := stmt
+ 537| 	for _, literal := range literals {
+ 538| 		stmtWithoutLiterals = strings.ReplaceAll(stmt, literal, "")
+ 539| 	}
+ 540| 	// Now look for the word "END" specifically. This will miss any
+ 541| 	// representations of END that aren't surrounded by spaces, but
+ 542| 	// it should be easy to change on the user's side.
+ 543| 	return postgresEndStatement.MatchString(stmtWithoutLiterals)
+ 544| }
+ 545| 
+ 546| // extractQuotedStrings extracts 0 or many substrings
+ 547| // that have been single- or double-quoted. Ex:
+ 548| // `"Hello", silly 'elephant' from the "zoo".`
+ 549| // returns [ `Hello`, `'elephant'`, `"zoo"` ]
+ 550| func extractQuotedStrings(s string) ([]string, error) {
+ 551| 	var found []string
+ 552| 	toFind := []*regexp.Regexp{
+ 553| 		doubleQuotedPhrases,
+ 554| 		singleQuotedPhrases,
+ 555| 	}
+ 556| 	for _, typeOfPhrase := range toFind {
+ 557| 		found = append(found, typeOfPhrase.FindAllString(s, -1)...)
+ 558| 	}
+ 559| 	return found, nil
+ 560| }
+ 561| 
+ 562| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=8086 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文通读）
+
+1. **第 60-63 行 / 68-70 行**：定义默认模板 `defaultChangePasswordStatement`、`defaultExpirationStatement`，使用 `{{username}}`、`{{password}}`、`{{expiration}}` 占位符——这些占位符由模板引擎做**文本替换**，不是数据库参数绑定。
+
+2. **入口点枚举**：
+   - `Initialize`（第 88 行起）：source 为 `req.Config` 的 `username_template`、`password_authentication`；
+   - `UpdateUser`（第 122 行）：source 为 `req.Username`、`req.Password`、`req.Expiration`；
+   - `NewUser`（第 224 行）：source 为 `req.UsernameConfig`（含 DisplayName/RoleName）、`req.Password`、`req.Statements`；
+   - `DeleteUser`（第 283 行）：source 为 `req.Username`、`req.Statements`。
+
+3. **数据流 1：NewUser**。第 233 行 `p.usernameProducer.Generate(req.UsernameConfig)` 由管理员自定义模板生成用户名；若模板直接引用 `.DisplayName` 或 `.RoleName` 而不加转义/truncate，攻击者可控的显示名可携带单引号。第 246-252 行将 `username`、`req.Password` 放入 map `m`；第 272/280 行 sink `dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query)` —— 该函数对语句做文本插值后直接执行，**无任何引号转义或参数化**。防御缺失：全文没有对 `{{name}}`/`{{password}}` 值做 `QuoteLiteral`/单引号加倍处理。
+
+4. **数据流 2：changeUserPassword**（第 141-206 行）。第 144 行取 `changePass.NewPassword`（可能来自带密码策略的请求），第 190-194 行 map 注入，第 199 行 sink 同上。SCRAM 分支（第 182 行）会哈希密码从而消除注入字符，但默认的 `passwordAuthenticationPassword` 模式下密码原样插入 `ALTER ROLE ... PASSWORD '{{password}}'`，密码含 `'` 即可逃逸字符串字面量实现 SQL 注入。
+
+5. **数据流 3：changeUserExpiration**（第 208-262 行）。`expirationStr` 由服务端时间格式化生成（第 230 行），不可控，此流安全。
+
+6. **数据流 4：DeleteUser/defaultDeleteUser**（第 283-395 行）。第 337/341/355-371/383 行均使用 `dbutil.QuoteIdentifier` 包裹 `username`/`schema`/`dbname` 后拼接——这是有效的标识符引用防御，此路径相对安全。但 `customDeleteUser`（第 296 行）走与 NewUser 相同的无转义插值 sink（第 316/330 行）。
+
+7. **第二入口/替代通道**：`containsMultilineStatement`（第 409 行）存在逻辑缺陷——第 424 行 `strings.ReplaceAll(stmt, literal, "")` 应作用于 `stmtWithoutLiterals` 却反复替换原 `stmt`，导致含引号字面量的多行 PL/pgSQL 语句可能被误判为单行并按分号拆分执行，属于正确性缺陷但非独立注入源。
+
+8. **结论**：核心漏洞是所有动态值经模板文本插值进入 SQL 而未做字面量转义（CWE-89 / CWE-564），在默认密码认证模式下可通过含单引号的密码或（自定义用户名模板下的）DisplayName 触发注入。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-89 SQL Injection (SQL Injection via template interpolation)", "risk_level": "High", "source": "line 171: changePass.NewPassword 与 line 231: p.usernameProducer.Generate(req.UsernameConfig) 生成的 username", "sink": "line 199 与 line 267/280: dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query) 对 {{name}}/{{password}} 做文本插值后直接执行", "explanation": "NewUser 和 changeUserPassword 将 username/password 放入 map 后交给 ExecuteTxQueryDirect, 该函数用模板引擎把值以纯文本形式拼进 ALTER ROLE ... PASSWORD '{{password}}' 等语句, 全文没有任何单引号转义或参数化查询; 默认 passwordAuthentication=password 模式下密码原样嵌入, 含单引号即可逃逸字面量注入任意 SQL; 自定义 username_template 直接引用 DisplayName 时同理; DeleteUser 默认路径虽有 QuoteIdentifier 防护, 但 customDeleteUser 复用同一无防护 sink", "fix_suggestion": "line 199/272: 对插入值调用 dbutil.QuoteLiteral(即单引号加倍) 或改用 pgx 的参数绑定 $1/$2 传递 username/password/expiration, 并修复 line 424 的 ReplaceAll 使其作用于 stmtWithoutLiterals"}
+
+### id=8087 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **入口点枚举（全文）**：插件通过 gRPC/dbplugin 接口暴露五个入口：`Initialize`（第 88 行，接收 `req.Config` 中的 `username_template`、`password_authentication`、连接配置）、`UpdateUser`（第 122 行，含 `changeUserPassword` 第 137 行与 `changeUserExpiration` 第 187 行）、`NewUser`（第 224 行）、`DeleteUser`（第 285 行，分 `defaultDeleteUser` 第 313 行 / `customDeleteUser` 第 296 行）。无 HTTP 路由、文件读取或环境变量入口。
+
+2. **source→sink 流验证**：
+   - **SQL 执行 sink**：所有查询最终走 `dbtxn.ExecuteTxQueryDirect` / `ExecuteDBQueryDirect`，其机制是把 `{{name}}`、`{{password}}` 等占位符做**字符串替换**后直接执行（非参数化）。
+   - **流 A：管理员配置的 Statements**（第 139、205、258、300 行）：creation/revocation/password 语句由 Vault 管理员在角色配置中设定，属于受信任配置，模板注入是其设计功能，不构成漏洞。
+   - **流 B：username**：`defaultDeleteUser` 中 schema 与 username 均经 `dbutil.QuoteIdentifier` 转义后拼接（第 332–357 行），防御有效；存在性检查用参数化 `$1`（第 155、320 行）。自定义删除语句中的 `{{name}}` 替换依赖管理员配置，同流 A。
+   - **流 C：password**：由 Vault 内部生成随机值，且 SCRAM 模式下先哈希（第 165、247 行）；明文密码经 `secretValues()`（第 382 行）脱敏。密码本身不含用户可控内容。
+   - **流 D：expiration**：由服务端时间格式化产生（第 203 行），不可控。
+   - **流 E：DisplayName/RoleName 进入用户名**（第 231 行）：默认模板截断至 8 字符并包裹于双引号中；理论上含双引号的 DisplayName 可破坏引号，但该值在上游 Vault 核心层已做字符清洗后才传入插件，且模板本身由管理员配置——在本文件信任边界内无可利用输入。
+
+3. **第二入口/替代通道检查**：`containsMultilineStatement`（第 395 行）仅影响语句切分方式，正则提取引号字符串失败时保守返回 false，不影响安全边界。`Initialize` 中模板先试运行校验（第 106 行）。未发现绕过通道。
+
+4. **结论**：所有动态拼接点要么使用 `QuoteIdentifier` 有效转义，要么数据源为受信任的管理员配置/内部生成值，符合数据库插件的信任模型。全文未见可被外部攻击者触达的注入路径。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文五个入口(Initialize/UpdateUser/NewUser/DeleteUser及内部函数)。所有SQL执行均经由占位符字符串替换的ExecuteTxQueryDirect, 但替换值来源均为受信任方: 管理员配置的Statements属设计功能; 默认删除路径中schema与username均经dbutil.QuoteIdentifier转义(第332-357行); 存在性检查使用参数化$1(第155/320行); password为内部随机生成且SCRAM模式下哈希处理并由secretValues脱敏; expiration由服务端格式化生成。DisplayName进入用户名的路径在上游核心层已被清洗, 且模板由管理员配置。黑名单类过滤不存在, 未发现可绕过缺陷。", "fix_suggestion": "no fix needed"}

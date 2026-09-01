@@ -1,0 +1,1668 @@
+batch=6 样本数=5
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=8025 lang=python
+[CODE]
+   1| from __future__ import annotations
+   2| 
+   3| import hashlib
+   4| import os
+   5| import time
+   6| import typing
+   7| import urllib.parse
+   8| import warnings
+   9| from dataclasses import dataclass, field
+  10| 
+  11| import fastapi
+  12| from fastapi.responses import RedirectResponse
+  13| from huggingface_hub import get_token, whoami
+  14| 
+  15| from gradio.utils import get_space
+  16| 
+  17| OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID")
+  18| OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET")
+  19| OAUTH_SCOPES = os.environ.get("OAUTH_SCOPES")
+  20| OPENID_PROVIDER_URL = os.environ.get("OPENID_PROVIDER_URL")
+  21| 
+  22| MAX_REDIRECTS = 2
+  23| 
+  24| 
+  25| def attach_oauth(app: fastapi.FastAPI):
+  26|     try:
+  27|         from starlette.middleware.sessions import SessionMiddleware
+  28|     except ImportError as e:
+  29|         raise ImportError(
+  30|             "Cannot initialize OAuth to due a missing library. Please run `pip install gradio[oauth]` or add "
+  31|             "`gradio[oauth]` to your requirements.txt file in order to install the required dependencies."
+  32|         ) from e
+  33| 
+  34|     # Add `/login/huggingface`, `/login/callback` and `/logout` routes to enable OAuth in the Gradio app.
+  35|     # If the app is running in a Space, OAuth is enabled normally. Otherwise, we mock the "real" routes to make the
+  36|     # user log in with a fake user profile - without any calls to hf.co.
+  37| 
+  38|     if get_space() is not None:
+  39|         _add_oauth_routes(app)
+  40|     else:
+  41|         _add_mocked_oauth_routes(app)
+  42| 
+  43|     # Session Middleware requires a secret key to sign the cookies. Let's use a hash
+  44|     # of the OAuth secret key to make it unique to the Space + updated in case OAuth
+  45|     # config gets updated.
+  46|     session_secret = (OAUTH_CLIENT_SECRET or "") + "-v4"
+  47|     # ^ if we change the session cookie format in the future, we can bump the version of the session secret to make
+  48|     #   sure cookies are invalidated. Otherwise some users with an old cookie format might get a HTTP 500 error.
+  49|     app.add_middleware(
+  50|         SessionMiddleware,  # type: ignore
+  51|         secret_key=hashlib.sha256(session_secret.encode()).hexdigest(),
+  52|         same_site="none",
+  53|         https_only=True,
+  54|     )
+  55| 
+  56| 
+  57| def _add_oauth_routes(app: fastapi.FastAPI) -> None:
+  58|     """Add OAuth routes to the FastAPI app (login, callback handler and logout)."""
+  59|     try:
+  60|         from authlib.integrations.base_client.errors import MismatchingStateError
+  61|         from authlib.integrations.starlette_client import OAuth
+  62|     except ImportError as e:
+  63|         raise ImportError(
+  64|             "Cannot initialize OAuth to due a missing library. Please run `pip install gradio[oauth]` or add "
+  65|             "`gradio[oauth]` to your requirements.txt file in order to install the required dependencies."
+  66|         ) from e
+  67| 
+  68|     # Check environment variables
+  69|     msg = (
+  70|         "OAuth is required but {} environment variable is not set. Make sure you've enabled OAuth in your Space by"
+  71|         " setting `hf_oauth: true` in the Space metadata."
+  72|     )
+  73| 
+  74|     if OAUTH_CLIENT_ID is None:
+  75|         raise ValueError(msg.format("OAUTH_CLIENT_ID"))
+  76|     if OAUTH_CLIENT_SECRET is None:
+  77|         raise ValueError(msg.format("OAUTH_CLIENT_SECRET"))
+  78|     if OAUTH_SCOPES is None:
+  79|         raise ValueError(msg.format("OAUTH_SCOPES"))
+  80|     if OPENID_PROVIDER_URL is None:
+  81|         raise ValueError(msg.format("OPENID_PROVIDER_URL"))
+  82| 
+  83|     # Register OAuth server
+  84|     oauth = OAuth()
+  85|     oauth.register(
+  86|         name="huggingface",
+  87|         client_id=OAUTH_CLIENT_ID,
+  88|         client_secret=OAUTH_CLIENT_SECRET,
+  89|         client_kwargs={"scope": OAUTH_SCOPES},
+  90|         server_metadata_url=OPENID_PROVIDER_URL + "/.well-known/openid-configuration",
+  91|     )
+  92| 
+  93|     # Define OAuth routes
+  94|     @app.get("/login/huggingface")
+  95|     async def oauth_login(request: fastapi.Request):
+  96|         """Endpoint that redirects to HF OAuth page."""
+  97|         # Define target (where to redirect after login)
+  98|         redirect_uri = _generate_redirect_uri(request)
+  99|         return await oauth.huggingface.authorize_redirect(request, redirect_uri)  # type: ignore
+ 100| 
+ 101|     @app.get("/login/callback")
+ 102|     async def oauth_redirect_callback(request: fastapi.Request) -> RedirectResponse:
+ 103|         """Endpoint that handles the OAuth callback."""
+ 104|         try:
+ 105|             oauth_info = await oauth.huggingface.authorize_access_token(request)  # type: ignore
+ 106|         except MismatchingStateError:
+ 107|             # If the state mismatch, it is very likely that the cookie is corrupted.
+ 108|             # There is a bug reported in authlib that causes the token to grow indefinitely if the user tries to login
+ 109|             # repeatedly. Since cookies cannot get bigger than 4kb, the token will be truncated at some point - hence
+ 110|             # losing the state. A workaround is to delete the cookie and redirect the user to the login page again.
+ 111|             # See https://github.com/lepture/authlib/issues/622 for more details.
+ 112| 
+ 113|             # Delete all keys that are related to the OAuth state, just in case
+ 114|             for key in list(request.session.keys()):
+ 115|                 if key.startswith("_state_huggingface"):
+ 116|                     request.session.pop(key)
+ 117| 
+ 118|             # Parse query params
+ 119|             nb_redirects = int(request.query_params.get("_nb_redirects", 0))
+ 120|             target_url = request.query_params.get("_target_url")
+ 121| 
+ 122|             # Build /login URI with the same query params as before and bump nb_redirects count
+ 123|             query_params: dict[str, str | int] = {"_nb_redirects": nb_redirects + 1}
+ 124|             if target_url:
+ 125|                 query_params["_target_url"] = target_url
+ 126| 
+ 127|             login_uri = f"/login/huggingface?{urllib.parse.urlencode(query_params)}"
+ 128| 
+ 129|             # If the user is redirected more than 3 times, it is very likely that the cookie is not working properly.
+ 130|             # (e.g. browser is blocking third-party cookies in iframe). In this case, redirect the user in the
+ 131|             # non-iframe view.
+ 132|             if nb_redirects > MAX_REDIRECTS:
+ 133|                 host = os.environ.get("SPACE_HOST")
+ 134|                 if host is None:  # cannot happen in a Space
+ 135|                     raise RuntimeError(
+ 136|                         "Gradio is not running in a Space (SPACE_HOST environment variable is not set)."
+ 137|                         " Cannot redirect to non-iframe view."
+ 138|                     ) from None
+ 139|                 host_url = "https://" + host.rstrip("/")
+ 140|                 return RedirectResponse(host_url + login_uri)
+ 141| 
+ 142|             # Redirect the user to the login page again
+ 143|             return RedirectResponse(login_uri)
+ 144| 
+ 145|         # OAuth login worked => store the user info in the session and redirect
+ 146|         request.session["oauth_info"] = oauth_info
+ 147|         return _redirect_to_target(request)
+ 148| 
+ 149|     @app.get("/logout")
+ 150|     async def oauth_logout(request: fastapi.Request) -> RedirectResponse:
+ 151|         """Endpoint that logs out the user (e.g. delete cookie session)."""
+ 152|         request.session.pop("oauth_info", None)
+ 153|         return _redirect_to_target(request)
+ 154| 
+ 155| 
+ 156| def _add_mocked_oauth_routes(app: fastapi.FastAPI) -> None:
+ 157|     """Add fake oauth routes if Gradio is run locally and OAuth is enabled.
+ 158| 
+ 159|     Clicking on a gr.LoginButton will have the same behavior as in a Space (i.e. gets redirected in a new tab) but
+ 160|     instead of authenticating with HF, a mocked user profile is added to the session.
+ 161|     """
+ 162|     warnings.warn(
+ 163|         "Gradio does not support OAuth features outside of a Space environment. To help"
+ 164|         " you debug your app locally, the login and logout buttons are mocked with your"
+ 165|         " profile. To make it work, your machine must be logged in to Huggingface."
+ 166|     )
+ 167|     mocked_oauth_info = _get_mocked_oauth_info()
+ 168| 
+ 169|     # Define OAuth routes
+ 170|     @app.get("/login/huggingface")
+ 171|     async def oauth_login(request: fastapi.Request):  # noqa: ARG001
+ 172|         """Fake endpoint that redirects to HF OAuth page."""
+ 173|         # Define target (where to redirect after login)
+ 174|         redirect_uri = _generate_redirect_uri(request)
+ 175|         return RedirectResponse(
+ 176|             "/login/callback?" + urllib.parse.urlencode({"_target_url": redirect_uri})
+ 177|         )
+ 178| 
+ 179|     @app.get("/login/callback")
+ 180|     async def oauth_redirect_callback(request: fastapi.Request) -> RedirectResponse:
+ 181|         """Endpoint that handles the OAuth callback."""
+ 182|         request.session["oauth_info"] = mocked_oauth_info
+ 183|         return _redirect_to_target(request)
+ 184| 
+ 185|     @app.get("/logout")
+ 186|     async def oauth_logout(request: fastapi.Request) -> RedirectResponse:
+ 187|         """Endpoint that logs out the user (e.g. delete cookie session)."""
+ 188|         request.session.pop("oauth_info", None)
+ 189|         return _redirect_to_target(request)
+ 190| 
+ 191| 
+ 192| def _generate_redirect_uri(request: fastapi.Request) -> str:
+ 193|     if "_target_url" in request.query_params:
+ 194|         # if `_target_url` already in query params => respect it
+ 195|         target = request.query_params["_target_url"]
+ 196|     else:
+ 197|         # otherwise => keep query params
+ 198|         target = "/?" + urllib.parse.urlencode(request.query_params)
+ 199| 
+ 200|     # On Spaces, the redirect URI must always be https://<space_host>/login/callback,
+ 201|     # so if a custom domain is used, we need to replace it with the hf.space URL
+ 202|     if space_host := os.getenv("SPACE_HOST"):
+ 203|         print(f"SPACE_HOST: {space_host}")
+ 204|         space_host = space_host.split(",")[
+ 205|             0
+ 206|         ]  # When custom domain is used, SPACE_HOST is a comma-separated list
+ 207|         print(f"SPACE_HOST after split: {space_host}")
+ 208|         redirect_uri = f"https://{space_host}/login/callback?{urllib.parse.urlencode({'_target_url': target})}"
+ 209|         print(f"Redirect URI: {redirect_uri}")
+ 210|         return redirect_uri
+ 211| 
+ 212|     redirect_uri = request.url_for("oauth_redirect_callback").include_query_params(
+ 213|         _target_url=target
+ 214|     )
+ 215|     redirect_uri_as_str = str(redirect_uri)
+ 216|     return redirect_uri_as_str
+ 217| 
+ 218| 
+ 219| def _redirect_to_target(
+ 220|     request: fastapi.Request, default_target: str = "/"
+ 221| ) -> RedirectResponse:
+ 222|     target = request.query_params.get("_target_url", default_target)
+ 223|     # Prevent open redirect by stripping scheme/host and only using the path.
+ 224|     parsed = urllib.parse.urlparse(target)
+ 225|     safe_target = parsed.path or "/"
+ 226|     if parsed.query:
+ 227|         safe_target += "?" + parsed.query
+ 228|     if parsed.fragment:
+ 229|         safe_target += "#" + parsed.fragment
+ 230|     return RedirectResponse(safe_target)
+ 231| 
+ 232| 
+ 233| @dataclass
+ 234| class OAuthProfile(typing.Dict):  # inherit from Dict for backward compatibility
+ 235|     """
+ 236|     A Gradio OAuthProfile object that can be used to inject the profile of a user in a
+ 237|     function. If a function expects `OAuthProfile` or `Optional[OAuthProfile]` as input,
+ 238|     the value will be injected from the FastAPI session if the user is logged in. If the
+ 239|     user is not logged in and the function expects `OAuthProfile`, an error will be
+ 240|     raised.
+ 241| 
+ 242|     Attributes:
+ 243|         name (str): The name of the user (e.g. 'Abubakar Abid').
+ 244|         username (str): The username of the user (e.g. 'abidlabs')
+ 245|         profile (str): The profile URL of the user (e.g. 'https://huggingface.co/abidlabs').
+ 246|         picture (str): The profile picture URL of the user.
+ 247| 
+ 248|     Example:
+ 249|         import gradio as gr
+ 250|         from typing import Optional
+ 251| 
+ 252| 
+ 253|         def hello(profile: Optional[gr.OAuthProfile]) -> str:
+ 254|             if profile is None:
+ 255|                 return "I don't know you."
+ 256|             return f"Hello {profile.name}"
+ 257| 
+ 258| 
+ 259|         with gr.Blocks() as demo:
+ 260|             gr.LoginButton()
+ 261|             gr.Markdown().attach_load_event(hello, None)
+ 262|     """
+ 263| 
+ 264|     name: str = field(init=False)
+ 265|     username: str = field(init=False)
+ 266|     profile: str = field(init=False)
+ 267|     picture: str = field(init=False)
+ 268| 
+ 269|     def __init__(self, data: dict):  # hack to make OAuthProfile backward compatible
+ 270|         self.update(data)
+ 271|         self.name = self["name"]
+ 272|         self.username = self["preferred_username"]
+ 273|         self.profile = self["profile"]
+ 274|         self.picture = self["picture"]
+ 275| 
+ 276| 
+ 277| @dataclass
+ 278| class OAuthToken:
+ 279|     """
+ 280|     A Gradio OAuthToken object that can be used to inject the access token of a user in a
+ 281|     function. If a function expects `OAuthToken` or `Optional[OAuthToken]` as input,
+ 282|     the value will be injected from the FastAPI session if the user is logged in. If the
+ 283|     user is not logged in and the function expects `OAuthToken`, an error will be
+ 284|     raised.
+ 285| 
+ 286|     Attributes:
+ 287|         token (str): The access token of the user.
+ 288|         scope (str): The scope of the access token.
+ 289|         expires_at (int): The expiration timestamp of the access token.
+ 290| 
+ 291|     Example:
+ 292|         import gradio as gr
+ 293|         from typing import Optional
+ 294|         from huggingface_hub import whoami
+ 295| 
+ 296| 
+ 297|         def list_organizations(oauth_token: Optional[gr.OAuthToken]) -> str:
+ 298|             if oauth_token is None:
+ 299|                 return "Please log in to list organizations."
+ 300|             org_names = [org["name"] for org in whoami(oauth_token.token)["orgs"]]
+ 301|             return f"You belong to {', '.join(org_names)}."
+ 302| 
+ 303| 
+ 304|         with gr.Blocks() as demo:
+ 305|             gr.LoginButton()
+ 306|             gr.Markdown().attach_load_event(list_organizations, None)
+ 307|     """
+ 308| 
+ 309|     token: str
+ 310|     scope: str
+ 311|     expires_at: int
+ 312| 
+ 313| 
+ 314| def _get_mocked_oauth_info() -> typing.Dict:
+ 315|     token = get_token()
+ 316|     if token is None:
+ 317|         raise ValueError(
+ 318|             "Your machine must be logged in to HF to debug a Gradio app locally. Please"
+ 319|             " run `huggingface-cli login` or set `HF_TOKEN` as environment variable "
+ 320|             "with one of your access token. You can generate a new token in your "
+ 321|             "settings page (https://huggingface.co/settings/tokens)."
+ 322|         )
+ 323| 
+ 324|     user = whoami()
+ 325|     if user["type"] != "user":
+ 326|         raise ValueError(
+ 327|             "Your machine is not logged in with a personal account. Please use a "
+ 328|             "personal access token. You can generate a new token in your settings page"
+ 329|             " (https://huggingface.co/settings/tokens)."
+ 330|         )
+ 331| 
+ 332|     return {
+ 333|         "access_token": "mock-oauth-token-for-local-dev",
+ 334|         "token_type": "bearer",
+ 335|         "expires_in": 3600,
+ 336|         "id_token": "AAAAAAAAAAAAAAAAAAAAAAAAAA",
+ 337|         "scope": "openid profile",
+ 338|         "expires_at": int(time.time()) + 8 * 60 * 60,  # 8 hours
+ 339|         "userinfo": {
+ 340|             "sub": "11111111111111111111111",
+ 341|             "name": user["fullname"],
+ 342|             "preferred_username": user["name"],
+ 343|             "profile": f"https://huggingface.co/{user['name']}",
+ 344|             "picture": user["avatarUrl"],
+ 345|             "website": "",
+ 346|             "aud": "00000000-0000-0000-0000-000000000000",
+ 347|             "auth_time": 1691672844,
+ 348|             "nonce": "aaaaaaaaaaaaaaaaaaa",
+ 349|             "iat": 1691672844,
+ 350|             "exp": 1691676444,
+ 351|             "iss": "https://huggingface.co",
+ 352|         },
+ 353|     }
+ 354| 
+ 355| 
+
+### id=8176 lang=go
+[CODE]
+   1| /*
+   2| Copyright 2023 The Nuclio Authors.
+   3| 
+   4| Licensed under the Apache License, Version 2.0 (the "License");
+   5| you may not use this file except in compliance with the License.
+   6| You may obtain a copy of the License at
+   7| 
+   8|     http://www.apache.org/licenses/LICENSE-2.0
+   9| 
+  10| Unless required by applicable law or agreed to in writing, software
+  11| distributed under the License is distributed on an "AS IS" BASIS,
+  12| WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  13| See the License for the specific language governing permissions and
+  14| limitations under the License.
+  15| */
+  16| 
+  17| package common
+  18| 
+  19| import (
+  20| 	"bufio"
+  21| 	"bytes"
+  22| 	"context"
+  23| 	"fmt"
+  24| 	"math/rand"
+  25| 	"net/http"
+  26| 	"os"
+  27| 	"path"
+  28| 	"path/filepath"
+  29| 	"reflect"
+  30| 	"regexp"
+  31| 	"runtime"
+  32| 	"runtime/debug"
+  33| 	"strconv"
+  34| 	"strings"
+  35| 	"text/template"
+  36| 	"time"
+  37| 	"unicode/utf8"
+  38| 	"unsafe"
+  39| 
+  40| 	"github.com/microcosm-cc/bluemonday"
+  41| 	"github.com/nuclio/errors"
+  42| 	"github.com/nuclio/logger"
+  43| 	"golang.org/x/net/html"
+  44| 	apiresource "k8s.io/apimachinery/pkg/api/resource"
+  45| 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+  46| 	"k8s.io/apimachinery/pkg/labels"
+  47| )
+  48| 
+  49| var SmallLettersAndNumbers = []rune("abcdefghijklmnopqrstuvwxyz1234567890")
+  50| var LettersAndNumbers = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890")
+  51| var seededRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+  52| var containerHostname string
+  53| var specialCharPattern = regexp.MustCompile(`[^\w@%+=:,./-]`)
+  54| 
+  55| // IsFile returns true if the object @ path is a file
+  56| func IsFile(path string) bool {
+  57| 	info, err := os.Stat(path)
+  58| 	if err != nil {
+  59| 		return false
+  60| 	}
+  61| 	return info.Mode().IsRegular()
+  62| }
+  63| 
+  64| // IsDir returns true if the object @ path is a dir
+  65| func IsDir(path string) bool {
+  66| 	info, err := os.Stat(path)
+  67| 	if err != nil {
+  68| 		return false
+  69| 	}
+  70| 
+  71| 	return info.IsDir()
+  72| }
+  73| 
+  74| // SanitizePath cleans and resolves the given file path to an absolute path.
+  75| // This prevents path traversal and ensures consistency in file handling.
+  76| func SanitizePath(path string) (string, error) {
+  77| 	// Clean the input path to eliminate any redundant or unsafe elements.
+  78| 	// Example: "/foo/../bar" becomes "/bar"
+  79| 	cleanPath := filepath.Clean(path)
+  80| 
+  81| 	// Convert to absolute path to avoid ambiguity and ensure safe file access.
+  82| 	absPath, err := filepath.Abs(cleanPath)
+  83| 	if err != nil {
+  84| 		return "", errors.Wrap(err, "Failed to get absolute path")
+  85| 	}
+  86| 
+  87| 	return absPath, nil
+  88| }
+  89| 
+  90| // FileExists returns true if the file @ path exists
+  91| func FileExists(path string) bool {
+  92| 	_, err := os.Stat(path)
+  93| 	return err == nil
+  94| }
+  95| 
+  96| // EnsureDirExists checks if the directory exists, creates it if it doesn't
+  97| func EnsureDirExists(ctx context.Context, loggerInstance logger.Logger, dir string) error {
+  98| 	if _, err := os.Stat(dir); os.IsNotExist(err) {
+  99| 		loggerInstance.DebugWithCtx(ctx,
+ 100| 			"Creating directory as it does not exist",
+ 101| 			"directory", dir)
+ 102| 
+ 103| 		// we need 755 permission to allow running nuclio function with non-root SecurityContext
+ 104| 		if err := os.MkdirAll(dir, 0755); err != nil {
+ 105| 			return err
+ 106| 		}
+ 107| 	}
+ 108| 	return nil
+ 109| }
+ 110| 
+ 111| // StringSliceToIntSlice converts slices of strings to slices of int. e.g. ["1", "3"] -> [1, 3]
+ 112| func StringSliceToIntSlice(stringSlice []string) ([]int, error) {
+ 113| 	var result []int
+ 114| 
+ 115| 	for _, stringValue := range stringSlice {
+ 116| 		var intValue int
+ 117| 		var err error
+ 118| 
+ 119| 		if intValue, err = strconv.Atoi(stringValue); err != nil {
+ 120| 			return nil, err
+ 121| 		}
+ 122| 
+ 123| 		result = append(result, intValue)
+ 124| 	}
+ 125| 
+ 126| 	return result, nil
+ 127| }
+ 128| 
+ 129| // StringSliceContainsString returns whether the input str is in the slice
+ 130| func StringSliceContainsString(slice []string, str string) bool {
+ 131| 	for _, stringInSlice := range slice {
+ 132| 		if stringInSlice == str {
+ 133| 			return true
+ 134| 		}
+ 135| 	}
+ 136| 
+ 137| 	return false
+ 138| }
+ 139| 
+ 140| // StringSliceContainsStringPrefix returns whether the input str has prefix
+ 141| func StringSliceContainsStringPrefix(prefixes []string, str string) bool {
+ 142| 	for _, prefix := range prefixes {
+ 143| 		if strings.HasPrefix(str, prefix) {
+ 144| 			return true
+ 145| 		}
+ 146| 	}
+ 147| 	return false
+ 148| }
+ 149| 
+ 150| // StringSliceContainsStringSuffix returns whether the input str has suffix
+ 151| func StringSliceContainsStringSuffix(prefixes []string, str string) bool {
+ 152| 	for _, prefix := range prefixes {
+ 153| 		if strings.HasSuffix(str, prefix) {
+ 154| 			return true
+ 155| 		}
+ 156| 	}
+ 157| 	return false
+ 158| }
+ 159| 
+ 160| // StringSliceContainsStringCaseInsensitive returns whether the input str is in the slice case-insensitive
+ 161| func StringSliceContainsStringCaseInsensitive(slice []string, str string) bool {
+ 162| 	for _, stringInSlice := range slice {
+ 163| 		if strings.EqualFold(stringInSlice, str) {
+ 164| 			return true
+ 165| 		}
+ 166| 	}
+ 167| 
+ 168| 	return false
+ 169| }
+ 170| 
+ 171| // PrependStringToStringSlice prepends a string to a string slice
+ 172| func PrependStringToStringSlice(slice []string, str string) []string {
+ 173| 	slice = append(slice, "")
+ 174| 	copy(slice[1:], slice)
+ 175| 	slice[0] = str
+ 176| 	return slice
+ 177| }
+ 178| 
+ 179| // PrependStringsToStringSlice prepends multiple strings to a string slice
+ 180| func PrependStringsToStringSlice(slice []string, strs ...string) []string {
+ 181| 	totalLen := len(slice) + len(strs)
+ 182| 	slice = append(slice, make([]string, len(strs))...)
+ 183| 	copy(slice[len(strs):], slice)
+ 184| 	copy(slice, strs)
+ 185| 	return slice[:totalLen]
+ 186| }
+ 187| 
+ 188| // RemoveANSIColorsFromString strips out ANSI Colors chars from string
+ 189| // example: "\u001b[31mHelloWorld" -> "HelloWorld"
+ 190| func RemoveANSIColorsFromString(s string) string {
+ 191| 	ansi := "[\u001B\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))"
+ 192| 	re := regexp.MustCompile(ansi)
+ 193| 
+ 194| 	return re.ReplaceAllString(s, "")
+ 195| }
+ 196| 
+ 197| // RetryUntilSuccessful calls callback every interval for duration until it returns true
+ 198| func RetryUntilSuccessful(duration time.Duration, interval time.Duration, callback func() bool) error {
+ 199| 	return retryUntilSuccessful(duration, interval, func(int) (bool, error) {
+ 200| 
+ 201| 		// callback results indicate whether to retry
+ 202| 		return !callback(), nil
+ 203| 	})
+ 204| }
+ 205| 
+ 206| // RetryUntilSuccessfulOnErrorPatterns calls callback every interval for duration as long as error pattern is matched
+ 207| // the callback argument retryCounter is the number of times the callback was called
+ 208| func RetryUntilSuccessfulOnErrorPatterns(
+ 209| 	duration time.Duration,
+ 210| 	interval time.Duration,
+ 211| 	errorRegexPatterns []string,
+ 212| 	callback func(retryCounter int) (string, error)) error {
+ 213| 
+ 214| 	return retryUntilSuccessful(duration, interval, func(retryCounter int) (bool, error) {
+ 215| 		callbackErrorStr, err := callback(retryCounter)
+ 216| 
+ 217| 		if callbackErrorStr == "" {
+ 218| 
+ 219| 			// no error message means no retry needed
+ 220| 			return false, err
+ 221| 		}
+ 222| 
+ 223| 		// find a matching error pattern
+ 224| 		if !MatchStringPatterns(errorRegexPatterns, callbackErrorStr) {
+ 225| 
+ 226| 			// no error pattern found, dont retry, bail
+ 227| 			return false, errors.Errorf("Failed matching an error pattern for callback: %s", callbackErrorStr)
+ 228| 		}
+ 229| 
+ 230| 		return true, err
+ 231| 
+ 232| 	})
+ 233| }
+ 234| 
+ 235| // retryUntilSuccessful calls callback every interval until duration as long as it should retry
+ 236| func retryUntilSuccessful(duration time.Duration,
+ 237| 	interval time.Duration,
+ 238| 	callback func(int) (bool, error)) error {
+ 239| 	var lastErr error
+ 240| 	timedOutErrorMessage := "Timed out waiting until successful"
+ 241| 	deadline := time.Now().Add(duration)
+ 242| 
+ 243| 	// while we haven't passed the deadline
+ 244| 	var retryCounter int
+ 245| 	for !time.Now().After(deadline) {
+ 246| 		shouldRetry, err := callback(retryCounter)
+ 247| 		lastErr = err
+ 248| 		if !shouldRetry {
+ 249| 			return err
+ 250| 		}
+ 251| 		retryCounter++
+ 252| 		time.Sleep(interval)
+ 253| 		continue
+ 254| 
+ 255| 	}
+ 256| 	if lastErr != nil {
+ 257| 
+ 258| 		// wrap last error
+ 259| 		return errors.Wrapf(lastErr, "%s", timedOutErrorMessage)
+ 260| 	}
+ 261| 
+ 262| 	// duration expired without any last error
+ 263| 	return errors.Errorf("%s", timedOutErrorMessage)
+ 264| }
+ 265| 
+ 266| // RunningInContainer returns true if currently running in a container, false otherwise
+ 267| func RunningInContainer() bool {
+ 268| 	return FileExists("/.dockerenv")
+ 269| }
+ 270| 
+ 271| // RunningContainerHostname returns the hostname (aka container id) of the running container
+ 272| func RunningContainerHostname() (string, error) {
+ 273| 	if !RunningInContainer() {
+ 274| 		return "", errors.New("Not running in container")
+ 275| 	}
+ 276| 	if containerHostname != "" {
+ 277| 		return containerHostname, nil
+ 278| 	}
+ 279| 	containerID, err := os.ReadFile("/etc/hostname")
+ 280| 	if err != nil {
+ 281| 		return "", errors.Wrap(err, "Failed to open docker daemon config file")
+ 282| 	}
+ 283| 	containerHostname = strings.TrimSpace(string(containerID))
+ 284| 	return containerHostname, nil
+ 285| }
+ 286| 
+ 287| func StripPrefixes(input string, prefixes []string) string {
+ 288| 	for _, prefix := range prefixes {
+ 289| 		if strings.HasPrefix(input, prefix) {
+ 290| 			return strings.TrimPrefix(input, prefix)
+ 291| 		}
+ 292| 	}
+ 293| 	return input
+ 294| }
+ 295| 
+ 296| func StripSuffixes(input string, suffixes []string) string {
+ 297| 	for _, suffix := range suffixes {
+ 298| 		if strings.HasSuffix(input, suffix) {
+ 299| 			return strings.TrimSuffix(input, suffix)
+ 300| 		}
+ 301| 	}
+ 302| 	return input
+ 303| }
+ 304| 
+ 305| // RemoveEmptyLines removes all empty lines from a string
+ 306| func RemoveEmptyLines(input string) string {
+ 307| 	var nonEmptyLines []string
+ 308| 
+ 309| 	scanner := bufio.NewScanner(strings.NewReader(input))
+ 310| 
+ 311| 	// iterate over input line by line. if the line is not empty, shove it to the list
+ 312| 	for scanner.Scan() {
+ 313| 		line := scanner.Text()
+ 314| 
+ 315| 		if len(line) != 0 {
+ 316| 			nonEmptyLines = append(nonEmptyLines, line)
+ 317| 		}
+ 318| 	}
+ 319| 
+ 320| 	// join the strings with a newline between them
+ 321| 	return strings.Join(nonEmptyLines, "\n")
+ 322| }
+ 323| 
+ 324| // GenerateStringMatchVerifier generates a function that returns whether a given string matches the specified string
+ 325| func GenerateStringMatchVerifier(str string) func(string) bool {
+ 326| 	return func(toMatch string) bool {
+ 327| 		return toMatch == str
+ 328| 	}
+ 329| }
+ 330| 
+ 331| // RemoveWindowsCarriage removes windows carriage character '\r' when it follows by '\n'
+ 332| func RemoveWindowsCarriage(b []byte) []byte {
+ 333| 	n := utf8.RuneCount(b)
+ 334| 	for i := 0; i < n-1; i++ {
+ 335| 		if b[i] == '\r' && b[i+1] == '\n' {
+ 336| 
+ 337| 			// remove \r, keep \n
+ 338| 			b = append(b[:i], b[i+1:]...)
+ 339| 			n--
+ 340| 		}
+ 341| 	}
+ 342| 	return b
+ 343| }
+ 344| 
+ 345| func FixEscapeChars(s string) string {
+ 346| 	escapeCharsMap := map[string]string{
+ 347| 		"\\n":  "\n",
+ 348| 		"\\t":  "\t",
+ 349| 		"\\\\": "\\",
+ 350| 		"\\\"": "\"",
+ 351| 	}
+ 352| 
+ 353| 	for oldChar, newChar := range escapeCharsMap {
+ 354| 		s = strings.ReplaceAll(s, oldChar, newChar)
+ 355| 	}
+ 356| 
+ 357| 	return s
+ 358| }
+ 359| 
+ 360| func GetEnvOrDefaultString(key string, defaultValue string) string {
+ 361| 	value := os.Getenv(key)
+ 362| 	switch value {
+ 363| 	case "":
+ 364| 		return defaultValue
+ 365| 	case "nil", "none":
+ 366| 		return ""
+ 367| 	}
+ 368| 	return value
+ 369| }
+ 370| 
+ 371| func GetEnvOrDefaultBool(key string, defaultValue bool) bool {
+ 372| 	return strings.ToLower(GetEnvOrDefaultString(key, strconv.FormatBool(defaultValue))) == "true"
+ 373| }
+ 374| 
+ 375| func GetEnvOrDefaultInt(key string, defaultValue int) int {
+ 376| 	valueInt, err := strconv.Atoi(GetEnvOrDefaultString(key, strconv.Itoa(defaultValue)))
+ 377| 	if err != nil {
+ 378| 		return defaultValue
+ 379| 	}
+ 380| 	return valueInt
+ 381| }
+ 382| 
+ 383| // IsJavaProjectDir Checks if the given @dirPath is in a java project structure
+ 384| // for example if the following dir existed "/my-project/src/main/java" then IsJavaProjectDir("/my-project") -> true
+ 385| func IsJavaProjectDir(dirPath string) bool {
+ 386| 	javaProjectStructurePath := path.Join(dirPath, "src", "main", "java")
+ 387| 	if _, err := os.Stat(javaProjectStructurePath); err != nil {
+ 388| 		return false
+ 389| 	}
+ 390| 
+ 391| 	return true
+ 392| }
+ 393| 
+ 394| func RenderTemplate(text string, data map[string]interface{}) (string, error) {
+ 395| 	templateToRender, err := template.New("t").Parse(text)
+ 396| 	if err != nil {
+ 397| 		return "", errors.Wrap(err, "Failed to create template")
+ 398| 	}
+ 399| 
+ 400| 	return renderTemplate(templateToRender, data)
+ 401| }
+ 402| 
+ 403| func RenderTemplateWithCustomDelimiters(text string,
+ 404| 	data map[string]interface{},
+ 405| 	leftDelimiter string,
+ 406| 	rightDelimiter string) (string, error) {
+ 407| 
+ 408| 	templateToRender, err := template.New("t").
+ 409| 		Delims(leftDelimiter, rightDelimiter).
+ 410| 		Parse(text)
+ 411| 	if err != nil {
+ 412| 		return "", errors.Wrap(err, "Failed to create template with custom delimiters")
+ 413| 	}
+ 414| 
+ 415| 	return renderTemplate(templateToRender, data)
+ 416| }
+ 417| 
+ 418| func renderTemplate(templateToRender *template.Template, data map[string]interface{}) (string, error) {
+ 419| 	var templateToRenderBuffer bytes.Buffer
+ 420| 	if err := templateToRender.Execute(&templateToRenderBuffer, &data); err != nil {
+ 421| 		return "", errors.Wrap(err, "Failed to execute template rendering")
+ 422| 	}
+ 423| 
+ 424| 	return templateToRenderBuffer.String(), nil
+ 425| }
+ 426| 
+ 427| func GetDurationOrInfinite(timeout *time.Duration) time.Duration {
+ 428| 	if timeout != nil {
+ 429| 		return *timeout
+ 430| 	}
+ 431| 
+ 432| 	// essentially infinite
+ 433| 	return 100 * 365 * 24 * time.Hour
+ 434| }
+ 435| 
+ 436| func GetSourceDir() string {
+ 437| 
+ 438| 	// get caller filename
+ 439| 	_, fileName, _, _ := runtime.Caller(0)
+ 440| 
+ 441| 	// get filename dir
+ 442| 	dirName := path.Dir(fileName)
+ 443| 
+ 444| 	for {
+ 445| 
+ 446| 		// we determine source dir by having a `go.mod` file there
+ 447| 		if _, err := os.Stat(filepath.Join(dirName, "go.mod")); !os.IsNotExist(err) {
+ 448| 			return dirName
+ 449| 		}
+ 450| 
+ 451| 		// if we didn't find source yet, try on parent dir
+ 452| 		dirName = filepath.Dir(dirName)
+ 453| 
+ 454| 		// we're out of parents, stop here
+ 455| 		if dirName == "/" {
+ 456| 			return dirName
+ 457| 		}
+ 458| 	}
+ 459| }
+ 460| 
+ 461| // Quote returns a shell-escaped version of the string s. The returned value
+ 462| // is a string that can safely be used as one token in a shell command line.
+ 463| func Quote(s string) string {
+ 464| 	if len(s) == 0 {
+ 465| 		return "''"
+ 466| 	}
+ 467| 	if specialCharPattern.MatchString(s) {
+ 468| 		return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+ 469| 	}
+ 470| 
+ 471| 	return s
+ 472| }
+ 473| 
+ 474| func ByteSliceToString(b []byte) string {
+ 475| 
+ 476| 	// https://golang.org/src/strings/builder.go#L45
+ 477| 	// effectively converts bytes to string
+ 478| 	// !! use with caution as returned string is mutable !!
+ 479| 	return *(*string)(unsafe.Pointer(&b))
+ 480| }
+ 481| 
+ 482| func MatchStringPatterns(patterns []string, s string) bool {
+ 483| 	for _, pattern := range patterns {
+ 484| 		if regexp.MustCompile(pattern).MatchString(s) {
+ 485| 
+ 486| 			// one matching pattern is enough
+ 487| 			return true
+ 488| 		}
+ 489| 	}
+ 490| 	return false
+ 491| }
+ 492| 
+ 493| func CompileImageName(registryURL string, imageName string) string {
+ 494| 	return strings.TrimSuffix(registryURL, "/") + "/" + imageName
+ 495| }
+ 496| 
+ 497| func AnyPositiveInSliceInt64(numbers []int64) bool {
+ 498| 	for _, number := range numbers {
+ 499| 		if number >= 0 {
+ 500| 			return true
+ 501| 		}
+ 502| 	}
+ 503| 	return false
+ 504| }
+ 505| 
+ 506| func GenerateRandomString(length int, letters []rune) string {
+ 507| 	randomString := make([]rune, length)
+ 508| 	for i := range randomString {
+ 509| 		randomString[i] = letters[seededRand.Intn(len(letters))]
+ 510| 	}
+ 511| 
+ 512| 	return string(randomString)
+ 513| }
+ 514| 
+ 515| func CatchAndLogPanicWithOptions(ctx context.Context,
+ 516| 	loggerInstance logger.Logger,
+ 517| 	actionName string,
+ 518| 	options *CatchAndLogPanicOptions) error {
+ 519| 	if err := recover(); err != nil {
+ 520| 		callStack := debug.Stack()
+ 521| 		LogPanic(ctx, loggerInstance, actionName, options.Args, callStack, err)
+ 522| 
+ 523| 		asErr := ErrorFromRecoveredError(err)
+ 524| 		if options.CustomHandler != nil {
+ 525| 			options.CustomHandler(asErr)
+ 526| 		}
+ 527| 		return asErr
+ 528| 	}
+ 529| 	return nil
+ 530| }
+ 531| 
+ 532| // LabelsMapMatchByLabelSelector returns whether a labelsMap is matched by an encoded label selector
+ 533| // corresponding to https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
+ 534| //
+ 535| // Example:
+ 536| //
+ 537| //	labelsMap:
+ 538| //	  a: b
+ 539| //	  c: d
+ 540| //	encodedLabelSelector: a=b
+ 541| //
+ 542| // returns true
+ 543| func LabelsMapMatchByLabelSelector(labelSelector string, labelsMap map[string]string) (bool, error) {
+ 544| 
+ 545| 	parsedLabelSelector, err := metav1.ParseToLabelSelector(labelSelector)
+ 546| 	if err != nil {
+ 547| 		return false, errors.Wrap(err, "Failed to parse label selector")
+ 548| 	}
+ 549| 	selector, err := metav1.LabelSelectorAsSelector(parsedLabelSelector)
+ 550| 	if err != nil {
+ 551| 		return false, errors.Wrap(err, "Failed to get selector from label selector")
+ 552| 	}
+ 553| 	return selector.Matches(labels.Set(labelsMap)), nil
+ 554| }
+ 555| 
+ 556| // GetRuntimeNameAndVersion return runtime name and version.
+ 557| // e.g. go:1.8 -> go, 1.8
+ 558| func GetRuntimeNameAndVersion(runtime string) (string, string) {
+ 559| 
+ 560| 	switch runtimeAndVersion := strings.Split(runtime, ":"); len(runtimeAndVersion) {
+ 561| 
+ 562| 	// if both are passed (e.g. python:3.12) - return them both
+ 563| 	case 2:
+ 564| 		return runtimeAndVersion[0], runtimeAndVersion[1]
+ 565| 
+ 566| 	// otherwise - return the first element (e.g. go -> go)
+ 567| 	default:
+ 568| 		return runtimeAndVersion[0], ""
+ 569| 	}
+ 570| 
+ 571| }
+ 572| 
+ 573| func LogPanic(ctx context.Context,
+ 574| 	loggerInstance logger.Logger,
+ 575| 	actionName string,
+ 576| 	args []interface{},
+ 577| 	callStack []byte,
+ 578| 	err interface{}) {
+ 579| 
+ 580| 	logArgs := []interface{}{
+ 581| 		"err", err,
+ 582| 		"stack", string(callStack),
+ 583| 	}
+ 584| 
+ 585| 	if args != nil {
+ 586| 		logArgs = append(logArgs, args...)
+ 587| 	}
+ 588| 
+ 589| 	loggerInstance.ErrorWithCtx(ctx, "Panic caught while "+actionName, logArgs...)
+ 590| }
+ 591| 
+ 592| func ErrorFromRecoveredError(recoveredError interface{}) error {
+ 593| 	switch typedErr := recoveredError.(type) {
+ 594| 	case string:
+ 595| 		return errors.New(typedErr)
+ 596| 	case error:
+ 597| 		return typedErr
+ 598| 	default:
+ 599| 		return errors.New(fmt.Sprintf("Unknown error type: %s", reflect.TypeOf(typedErr)))
+ 600| 	}
+ 601| }
+ 602| 
+ 603| func ParseQuantityOrDefault(value string,
+ 604| 	defaultValue string,
+ 605| 	loggerInstance logger.Logger) apiresource.Quantity {
+ 606| 
+ 607| 	// no value was given, use default
+ 608| 	if value == "" {
+ 609| 		value = defaultValue
+ 610| 	}
+ 611| 
+ 612| 	quantity, err := apiresource.ParseQuantity(value)
+ 613| 	if err != nil {
+ 614| 		loggerInstance.WarnWith("Failed parsing quantity, assigning default value",
+ 615| 			"defaultValue", defaultValue,
+ 616| 			"err", err.Error())
+ 617| 		quantity = apiresource.MustParse(defaultValue)
+ 618| 	}
+ 619| 	return quantity
+ 620| }
+ 621| 
+ 622| func RemoveDuplicatesFromSliceString(slice []string) []string {
+ 623| 	keys := make(map[string]bool)
+ 624| 	var list []string
+ 625| 	for _, entry := range slice {
+ 626| 		if _, value := keys[entry]; !value {
+ 627| 			keys[entry] = true
+ 628| 			list = append(list, entry)
+ 629| 		}
+ 630| 	}
+ 631| 	return list
+ 632| }
+ 633| 
+ 634| func RemoveStringSliceItemsFromStringSlice(slice []string, itemsToRemove []string) []string {
+ 635| 	var list []string
+ 636| 	for _, item := range slice {
+ 637| 		if !StringSliceContainsString(itemsToRemove, item) {
+ 638| 			list = append(list, item)
+ 639| 		}
+ 640| 	}
+ 641| 	return list
+ 642| }
+ 643| 
+ 644| // PopulateFieldsFromValues populates empty fields with values if the value is not zero.
+ 645| // the fieldsToValues argument is a map of pointers to fields to populate and values.
+ 646| func PopulateFieldsFromValues[T string | bool | int](fieldsToValues map[*T]T) {
+ 647| 	var zeroValue T
+ 648| 	for field, value := range fieldsToValues {
+ 649| 		if *field == zeroValue && value != zeroValue {
+ 650| 			*field = value
+ 651| 		}
+ 652| 	}
+ 653| }
+ 654| 
+ 655| // SanitizeResponseData tries to parse byte data as html. if it succeeds, it is returned sanitized,
+ 656| // otherwise the original data is returned.
+ 657| // func SanitizeResponseData(data []byte) []byte {
+ 658| func SanitizeResponseData(data []byte, headers http.Header) []byte {
+ 659| 	// check if the content type contains html or javascript
+ 660| 	contentType := headers.Get("Content-Type")
+ 661| 	if contentType == "" || (!strings.Contains(contentType, "html") && !strings.Contains(contentType, "javascript")) {
+ 662| 		return data
+ 663| 	}
+ 664| 
+ 665| 	// attempt to parse the input data as HTML
+ 666| 	_, err := html.Parse(bytes.NewReader(data))
+ 667| 	if err != nil {
+ 668| 		// if there is an error in parsing, it's not HTML, return data as is
+ 669| 		return data
+ 670| 	}
+ 671| 
+ 672| 	// the data is HTML, sanitize it
+ 673| 	policy := bluemonday.UGCPolicy()
+ 674| 	sanitizedData := policy.Sanitize(string(data))
+ 675| 	return []byte(sanitizedData)
+ 676| }
+ 677| 
+ 678| // GetFunctionName returns the actual name of a function variable
+ 679| func GetFunctionName(function interface{}) string {
+ 680| 	fullName := runtime.FuncForPC(reflect.ValueOf(function).Pointer()).Name()
+ 681| 	parts := strings.Split(fullName, ".")
+ 682| 	shortName := parts[len(parts)-1]
+ 683| 
+ 684| 	// Methods passed by reference have a suffix of "-fm"
+ 685| 	shortName = strings.TrimSuffix(shortName, "-fm")
+ 686| 
+ 687| 	return shortName
+ 688| }
+ 689| 
+ 690| func Pointer[T any](v T) *T {
+ 691| 	return &v
+ 692| }
+ 693| 
+ 694| // ImageHasRegistry returns true if the image string includes an explicit registry domain.
+ 695| // A registry is assumed present if the first component contains a '.' or ':' (e.g., "registry.io/image").
+ 696| func ImageHasRegistry(image string) bool {
+ 697| 	image = strings.TrimSpace(image)
+ 698| 	slashIndex := strings.Index(image, "/")
+ 699| 	if slashIndex == -1 {
+ 700| 		return false
+ 701| 	}
+ 702| 	firstSegment := image[:slashIndex]
+ 703| 	return strings.Contains(firstSegment, ".") || strings.Contains(firstSegment, ":")
+ 704| }
+ 705| 
+ 706| 
+
+### id=8141 lang=php
+[CODE]
+   1| <?php
+   2| 
+   3| /**
+   4|  * @package    Grav\Common
+   5|  *
+   6|  * @copyright  Copyright (c) 2015 - 2025 Trilby Media, LLC. All rights reserved.
+   7|  * @license    MIT License; see LICENSE file for details.
+   8|  */
+   9| 
+  10| namespace Grav\Common;
+  11| 
+  12| use Exception;
+  13| use Grav\Common\Config\Config;
+  14| use Grav\Common\Filesystem\Folder;
+  15| use Grav\Common\Page\Pages;
+  16| use Rhukster\DomSanitizer\DOMSanitizer;
+  17| use function chr;
+  18| use function count;
+  19| use function is_array;
+  20| use function is_string;
+  21| 
+  22| /**
+  23|  * Class Security
+  24|  * @package Grav\Common
+  25|  */
+  26| class Security
+  27| {
+  28|     /**
+  29|      * @param string $filepath
+  30|      * @param array|null $options
+  31|      * @return string|null
+  32|      */
+  33|     public static function detectXssFromSvgFile(string $filepath, ?array $options = null): ?string
+  34|     {
+  35|         if (file_exists($filepath) && Grav::instance()['config']->get('security.sanitize_svg')) {
+  36|             $content = file_get_contents($filepath);
+  37| 
+  38|             return static::detectXss($content, $options);
+  39|         }
+  40| 
+  41|         return null;
+  42|     }
+  43| 
+  44|     /**
+  45|      * Sanitize SVG string for XSS code
+  46|      *
+  47|      * @param string $svg
+  48|      * @return string
+  49|      */
+  50|     public static function sanitizeSvgString(string $svg): string
+  51|     {
+  52|         if (Grav::instance()['config']->get('security.sanitize_svg')) {
+  53|             $sanitizer = new DOMSanitizer(DOMSanitizer::SVG);
+  54|             $sanitizer->addDisallowedAttributes(['href', 'xlink:href']);
+  55|             $sanitized = $sanitizer->sanitize($svg);
+  56|             if (is_string($sanitized)) {
+  57|                 $svg = $sanitized;
+  58|             }
+  59|         }
+  60| 
+  61|         return $svg;
+  62|     }
+  63| 
+  64|     /**
+  65|      * Sanitize SVG for XSS code
+  66|      *
+  67|      * @param string $file
+  68|      * @return void
+  69|      */
+  70|     public static function sanitizeSVG(string $file): void
+  71|     {
+  72|         if (file_exists($file) && Grav::instance()['config']->get('security.sanitize_svg')) {
+  73|             $sanitizer = new DOMSanitizer(DOMSanitizer::SVG);
+  74|             $sanitizer->addDisallowedAttributes(['href', 'xlink:href']);
+  75|             $original_svg = file_get_contents($file);
+  76|             $clean_svg = $sanitizer->sanitize($original_svg);
+  77| 
+  78|             // Quarantine bad SVG files and throw exception
+  79|             if ($clean_svg !== false ) {
+  80|                 file_put_contents($file, $clean_svg);
+  81|             } else {
+  82|                 $quarantine_file = Utils::basename($file);
+  83|                 $quarantine_dir = 'log://quarantine';
+  84|                 Folder::mkdir($quarantine_dir);
+  85|                 file_put_contents("$quarantine_dir/$quarantine_file", $original_svg);
+  86|                 unlink($file);
+  87|                 throw new Exception('SVG could not be sanitized, it has been moved to the logs/quarantine folder');
+  88|             }
+  89|         }
+  90|     }
+  91| 
+  92|     /**
+  93|      * Detect XSS code in Grav pages
+  94|      *
+  95|      * @param Pages $pages
+  96|      * @param bool $route
+  97|      * @param callable|null $status
+  98|      * @return array
+  99|      */
+ 100|     public static function detectXssFromPages(Pages $pages, $route = true, ?callable $status = null)
+ 101|     {
+ 102|         $routes = $pages->getList(null, 0, true);
+ 103| 
+ 104|         // Remove duplicate for homepage
+ 105|         unset($routes['/']);
+ 106| 
+ 107|         $list = [];
+ 108| 
+ 109|         // This needs Symfony 4.1 to work
+ 110|         $status && $status([
+ 111|             'type' => 'count',
+ 112|             'steps' => count($routes),
+ 113|         ]);
+ 114| 
+ 115|         foreach (array_keys($routes) as $route) {
+ 116|             $status && $status([
+ 117|                 'type' => 'progress',
+ 118|             ]);
+ 119| 
+ 120|             try {
+ 121|                 $page = $pages->find($route);
+ 122|                 if ($page->exists()) {
+ 123|                     // call the content to load/cache it
+ 124|                     $header = (array) $page->header();
+ 125|                     $content = $page->value('content');
+ 126| 
+ 127|                     $data = ['header' => $header, 'content' => $content];
+ 128|                     $results = static::detectXssFromArray($data);
+ 129| 
+ 130|                     if (!empty($results)) {
+ 131|                         $list[$page->rawRoute()] = $results;
+ 132|                     }
+ 133|                 }
+ 134|             } catch (Exception) {
+ 135|                 continue;
+ 136|             }
+ 137|         }
+ 138| 
+ 139|         return $list;
+ 140|     }
+ 141| 
+ 142|     /**
+ 143|      * Detect XSS in an array or strings such as $_POST or $_GET
+ 144|      *
+ 145|      * @param array $array      Array such as $_POST or $_GET
+ 146|      * @param array|null $options Extra options to be passed.
+ 147|      * @param string $prefix    Prefix for returned values.
+ 148|      * @return array            Returns flatten list of potentially dangerous input values, such as 'data.content'.
+ 149|      */
+ 150|     public static function detectXssFromArray(array $array, string $prefix = '', ?array $options = null)
+ 151|     {
+ 152|         if (null === $options) {
+ 153|             $options = static::getXssDefaults();
+ 154|         }
+ 155| 
+ 156|         $list = [[]];
+ 157|         foreach ($array as $key => $value) {
+ 158|             if (is_array($value)) {
+ 159|                 $list[] = static::detectXssFromArray($value, $prefix . $key . '.', $options);
+ 160|             }
+ 161|             if ($result = static::detectXss($value, $options)) {
+ 162|                 $list[] = [$prefix . $key => $result];
+ 163|             }
+ 164|         }
+ 165| 
+ 166|         return array_merge(...$list);
+ 167|     }
+ 168| 
+ 169|     /**
+ 170|      * Determine if string potentially has a XSS attack. This simple function does not catch all XSS and it is likely to
+ 171|      *
+ 172|      * return false positives because of it tags all potentially dangerous HTML tags and attributes without looking into
+ 173|      * their content.
+ 174|      *
+ 175|      * @param string|null $string The string to run XSS detection logic on
+ 176|      * @param array|null $options
+ 177|      * @return string|null       Type of XSS vector if the given `$string` may contain XSS, false otherwise.
+ 178|      *
+ 179|      * Copies the code from: https://github.com/symphonycms/xssfilter/blob/master/extension.driver.php#L138
+ 180|      */
+ 181|     public static function detectXss($string, ?array $options = null): ?string
+ 182|     {
+ 183|         // Skip any null or non string values
+ 184|         if (null === $string || !is_string($string) || empty($string)) {
+ 185|             return null;
+ 186|         }
+ 187| 
+ 188|         if (null === $options) {
+ 189|             $options = static::getXssDefaults();
+ 190|         }
+ 191| 
+ 192|         $enabled_rules = (array)($options['enabled_rules'] ?? null);
+ 193|         $dangerous_tags = (array)($options['dangerous_tags'] ?? null);
+ 194|         if (!$dangerous_tags) {
+ 195|             $enabled_rules['dangerous_tags'] = false;
+ 196|         }
+ 197|         $invalid_protocols = (array)($options['invalid_protocols'] ?? null);
+ 198|         if (!$invalid_protocols) {
+ 199|             $enabled_rules['invalid_protocols'] = false;
+ 200|         }
+ 201|         $enabled_rules = array_filter($enabled_rules, static fn($val) => !empty($val));
+ 202|         if (!$enabled_rules) {
+ 203|             return null;
+ 204|         }
+ 205| 
+ 206|         // Keep a copy of the original string before cleaning up
+ 207|         $orig = $string;
+ 208| 
+ 209|         // URL decode
+ 210|         $string = urldecode($string);
+ 211| 
+ 212|         // Convert Hexadecimals
+ 213|         $string = (string)preg_replace_callback('!(&#|\\\)[xX]([0-9a-fA-F]+);?!u', static fn($m) => chr(hexdec((string) $m[2])), $string);
+ 214| 
+ 215|         // Clean up entities
+ 216|         $string = preg_replace('!(&#[0-9]+);?!u', '$1;', $string);
+ 217| 
+ 218|         // Decode entities
+ 219|         $string = html_entity_decode((string) $string, ENT_NOQUOTES | ENT_HTML5, 'UTF-8');
+ 220| 
+ 221|         // Strip whitespace characters
+ 222|         $string = preg_replace('!\s!u', ' ', $string);
+ 223|         $stripped = preg_replace('!\s!u', '', (string) $string);
+ 224| 
+ 225|         // Set the patterns we'll test against
+ 226|         $patterns = [
+ 227|             // Match any attribute starting with "on" or xmlns
+ 228|             'on_events' => '#(<[^>]+[a-z\x00-\x20\"\'\/])(on[a-z]+|xmlns)\s*=[\s|\'\"].*[\s|\'\"]>#iUu',
+ 229| 
+ 230|             // Match javascript:, livescript:, vbscript:, mocha:, feed: and data: protocols
+ 231|             'invalid_protocols' => '#(' . implode('|', array_map('preg_quote', $invalid_protocols, ['#'])) . ')(:|\&\#58)\S.*?#iUu',
+ 232| 
+ 233|             // Match -moz-bindings
+ 234|             'moz_binding' => '#-moz-binding[a-z\x00-\x20]*:#u',
+ 235| 
+ 236|             // Match style attributes
+ 237|             'html_inline_styles' => '#(<[^>]+[a-z\x00-\x20\"\'\/])(style=[^>]*(url\:|x\:expression).*)>?#iUu',
+ 238| 
+ 239|             // Match potentially dangerous tags
+ 240|             'dangerous_tags' => '#</*(' . implode('|', array_map('preg_quote', $dangerous_tags, ['#'])) . ')[^>]*>?#ui'
+ 241|         ];
+ 242| 
+ 243|         // Iterate over rules and return label if fail
+ 244|         foreach ($patterns as $name => $regex) {
+ 245|             if (!empty($enabled_rules[$name])) {
+ 246|                 if (preg_match($regex, (string) $string) || preg_match($regex, (string) $stripped) || preg_match($regex, $orig)) {
+ 247|                     return $name;
+ 248|                 }
+ 249|             }
+ 250|         }
+ 251| 
+ 252|         return null;
+ 253|     }
+ 254| 
+ 255|     public static function getXssDefaults(): array
+ 256|     {
+ 257|         /** @var Config $config */
+ 258|         $config = Grav::instance()['config'];
+ 259| 
+ 260|         return [
+ 261|             'enabled_rules' => $config->get('security.xss_enabled'),
+ 262|             'dangerous_tags' => array_map('trim', $config->get('security.xss_dangerous_tags')),
+ 263|             'invalid_protocols' => array_map('trim', $config->get('security.xss_invalid_protocols')),
+ 264|         ];
+ 265|     }
+ 266| 
+ 267|     public static function cleanDangerousTwig(string $string): string
+ 268|     {
+ 269|         if ($string === '') {
+ 270|             return $string;
+ 271|         }
+ 272| 
+ 273|         $bad_twig = [
+ 274|             'twig_array_map',
+ 275|             'twig_array_filter',
+ 276|             'call_user_func',
+ 277|             'registerUndefinedFunctionCallback',
+ 278|             'undefined_functions',
+ 279|             'twig.getFunction',
+ 280|             'core.setEscaper',
+ 281|             'twig.safe_functions',
+ 282|             'read_file',
+ 283|         ];
+ 284| 
+ 285|         $string = preg_replace('/(({{\s*|{%\s*)[^}]*?(' . implode('|', $bad_twig) . ')[^}]*?(\s*}}|\s*%}))/i', '{# $1 #}', $string);
+ 286| 
+ 287|         foreach ($bad_twig as $func) {
+ 288|             $string = preg_replace('/\b' . preg_quote($func, '/') . '(\s*\([^)]*\))?\b/i', '{# $1 #}', $string);
+ 289|         }
+ 290| 
+ 291|         return $string;
+ 292|     }
+ 293| }
+ 294| 
+ 295| 
+
+### id=1289 lang=ini
+[CODE]
+   1| [Unit]
+   2| Description=DataSync Worker Service
+   3| After=network.target
+   4| 
+   5| [Service]
+   6| Type=simple
+   7| User=root
+   8| WorkingDirectory=/opt/datasync
+   9| EnvironmentFile=/etc/datasync/env.conf
+  10| ExecStartPre=/opt/datasync/scripts/preflight.sh
+  11| ExecStart=/usr/bin/python3 /opt/datasync/worker.py
+  12| Restart=on-failure
+  13| RestartSec=5
+  14| # 以下为部署时由 deploy.sh 写入的配置
+  15| Environment=DB_PASSWORD=admin123
+  16| Environment=API_TOKEN=sk_live_9f8e7d6c5b4a
+  17| LimitNOFILE=65536
+  18| 
+  19| [Install]
+  20| WantedBy=multi-user.target
+  21| 
+  22| 
+
+### id=1724 lang=javascript
+[CODE]
+   1| // order-service.js
+   2| const express = require('express');
+   3| const { parseString } = require('xml2js');
+   4| const router = express.Router();
+   5| 
+   6| // 订单查询接口 - 支持XML格式的请求体
+   7| router.post('/query', (req, res) => {
+   8|     const xmlData = req.body;
+   9|     
+  10|     if (!xmlData || typeof xmlData !== 'string') {
+  11|         return res.status(400).json({ error: 'Invalid XML payload' });
+  12|     }
+  13| 
+  14|     // 解析用户提交的XML
+  15|     parseString(xmlData, { explicitArray: false }, (err, result) => {
+  16|         if (err) {
+  17|             return res.status(400).json({ error: 'Malformed XML' });
+  18|         }
+  19| 
+  20|         try {
+  21|             // 从XML中提取查询条件
+  22|             const orderId = result.order.query.orderId;
+  23|             const userId = result.order.query.userId;
+  24|             
+  25|             // 模拟数据库查询
+  26|             const orderInfo = findOrder(orderId, userId);
+  27|             
+  28|             if (orderInfo) {
+  29|                 res.json({ success: true, data: orderInfo });
+  30|             } else {
+  31|                 res.status(404).json({ error: 'Order not found' });
+  32|             }
+  33|         } catch (e) {
+  34|             res.status(500).json({ error: 'Internal processing error' });
+  35|         }
+  36|     });
+  37| });
+  38| 
+  39| function findOrder(orderId, userId) {
+  40|     // 模拟订单数据
+  41|     const orders = [
+  42|         { id: '1001', user: 'alice', amount: 299.00, status: 'shipped' },
+  43|         { id: '1002', user: 'bob', amount: 1599.50, status: 'pending' },
+  44|         { id: '1003', user: 'carol', amount: 89.90, status: 'delivered' }
+  45|     ];
+  46|     
+  47|     return orders.find(o => o.id === orderId && o.user === userId) || null;
+  48| }
+  49| 
+  50| module.exports = router;
+  51| 
+  52| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=8025 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文逐函数）
+
+**1. 环境变量读取（第 15–18 行）**
+`OAUTH_CLIENT_ID/SECRET/SCOPES`、`OPENID_PROVIDER_URL` 均来自环境变量，仅在 Space 部署环境中由平台注入，非用户可控输入。无直接 sink。
+
+**2. `attach_oauth`（第 21–49 行）**
+- 第 26–27 行：根据 `get_space()` 选择真实或 mock 路由。
+- 第 38–45 行：SessionMiddleware 的 secret 由 `OAUTH_CLIENT_SECRET` 派生（sha256），非硬编码密钥；`https_only=True`、`same_site="none"`（iframe 场景所需）。cookie 有签名保护。
+
+**3. `_add_oauth_routes`（第 52–137 行）——真实 OAuth 路由**
+- `/login/huggingface`（第 71–76 行）：redirect_uri 由 `_generate_redirect_uri` 生成；在 Space 中强制为 `https://{SPACE_HOST}/login/callback`（见第 6 点），host 来自环境变量而非请求，攻击者无法注入任意 host。
+- `/login/callback`（第 79–127 行）：token 获取由 authlib `authorize_access_token` 完成，含 state 校验（MismatchingStateError 分支只是重试逻辑）。`_nb_redirects` 经 `int()` 转换（第 97 行），仅控制重定向次数上限（`MAX_REDIRECTS=2`），最终跳转到固定的 `https://{SPACE_HOST}` + login_uri，login_uri 只含数值与 urlencode 后的 target，且后续仍会经过 `_redirect_to_target` 清洗。
+- `/logout`（第 130–133 行）：仅清除 session 键，然后走 `_redirect_to_target`。
+
+**4. `_add_mocked_oauth_routes`（第 140–176 行）——本地 mock 路由**
+- 仅当 `get_space() is None`（本地开发）时注册；`/login/callback` 直接写入开发者本人机器上的 `whoami()` 信息。此为已知的有意设计（本地调试用），生产 Space 中不存在该路由，不构成可利用漏洞。
+
+**5. `_generate_redirect_uri`（第 179–201 行）**
+- 第 180–184 行：`_target_url` 取自查询参数（source：用户输入），但只作为 **query 参数值** 嵌入 redirect_uri，经 `urlencode` 编码，不会改变 URL 的 host/path 结构。
+- 第 186–194 行：Space 中 host 强制取自 `SPACE_HOST` 环境变量（并 split 处理自定义域名列表），用户无法控制重定向目标主机。
+
+**6. `_redirect_to_target`（第 204–215 行）——关键 sink 分析**
+- source：`request.query_params.get('_target_url')`（第 206 行），完全用户可控。
+- sink：`RedirectResponse(safe_target)`（第 215 行）。
+- 防御验证：第 207–214 行使用 `urllib.parse.urlparse(target)` 解析后**只保留 `parsed.path`**，scheme 与 netloc 被丢弃，因此 `//evil.com`、`https://evil.com`、`javascript:` 等开放重定向 payload 均被剥离为纯路径；path 以 `/` 开头时不会跳离当前域。query/fragment 虽被保留，但它们附着在同源路径之后，不能构成跨域重定向。该防御是结构性的（白名单式只取 path），非黑名单/正则，视为有效。
+- 边界情况：若 path 为空则回退到 `/`（第 208 行 `or '/'`），无绕过空间。
+
+**7. `OAuthProfile` / `OAuthToken` / `_get_mocked_oauth_info`（第 218–316 行）**
+- 数据类仅做字典包装，无网络/文件 sink。
+- `_get_mocked_oauth_info` 使用本机 token 调 `whoami()`，数据写入 session cookie（签名保护），不外泄给第三方。
+
+**8. 第二入口与替代通道核查**
+- 全部三个路由（login、callback、logout）的出站重定向最终都收敛到 `_redirect_to_target` 或固定 SPACE_HOST 前缀，无遗漏的 raw `RedirectResponse(request.query_params[...])`。
+- 无文件读写、命令执行、SQL、eval 等 sink；session cookie 由签名中间件保护，伪造 `oauth_info` 需要知道 secret。
+
+**结论**：唯一的用户可控 source→sink 流（`_target_url` → RedirectResponse）已被结构性防御（urlparse 后仅取 path）有效阻断；其余重定向目标均锚定环境变量中的 SPACE_HOST。未发现可利用漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文共三组路由入口（/login/huggingface、/login/callback、/logout，含真实与mock两套）。唯一用户可控的重定向参数 _target_url 在 _redirect_to_target 中经 urlparse 解析后仅保留 path 部分，scheme 与 netloc 被丢弃，开放重定向被结构性阻断；Space 环境下其余重定向 host 均锚定环境变量 SPACE_HOST。mock 路由仅在本地开发注册，属有意设计。session cookie 由签名中间件保护，无其他危险 sink。", "fix_suggestion": "no fix needed"}
+
+### id=8176 teacher=unknown flags=[]
+[ANALYSIS]
+分析过程：
+1. 本文件为 nuclio 平台工具库 common/helper.go（706 行）。SanitizePath（line 76）只做 filepath.Clean（line 79）+ filepath.Abs（line 82）。
+2. “SanitizePath 不做 base 包含性校验”属实——但这是加固建议而非文件内漏洞：本文件是库层，任何输入都由调用方传入，文件内不存在攻击者可控 source（无 HTTP/请求参数入口），source 端在本文件之外。
+3. FileExists（line 91）/EnsureDirExists（line 97）不构成危险 sink：前者仅 os.Stat 存在性探测，后者创建目录层级，两者都不读写文件内容；原判定把它们作为“越界读写原语”的 sink 声明不成立。
+4. 原叙述中“Dashboard 构建接口把请求字段拼进路径流向挂载/复制”发生在其他文件，按本任务“只计文件内可见污点流”的口径属 out-of-file 推测，不能作为本文件判 vuln 的依据。
+5. 结论：文件内无 source→sink 可利用路径，判 safe；SanitizePath 的限界缺失记为库级加固项。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "SanitizePath（line 76）仅 filepath.Clean+Abs、确无 base 包含性校验，但本文件为库层：文件内无攻击者可控 source；FileExists（line 91）仅存在性探测、EnsureDirExists（line 97）仅建目录，均非内容读写型 sink；原判定描述的构建接口路径拼接发生在文件外，按文件内污点流口径不可采信。判 safe，SanitizePath 缺限界记为库级加固项", "fix_suggestion": "no fix needed；加固建议：SanitizePath 增加 base 参数并断言返回值满足前缀包含（resolved.relative_to(base)），调用方迁移前记录未限界告警，并补多级上跳/绝对根/符号链接三类负向单测"}
+
+### id=8141 teacher=unknown flags=[safe_but_cwe_in_expl]
+[ANALYSIS]
+## 编号分析
+
+1. **第 33–41 行 `detectXssFromSvgFile`**：source 为任意文件路径 `$filepath`（由调用方传入，通常来自用户上传的媒体文件），sink 为 `file_get_contents` 后进入 `detectXss`。防御仅依赖配置开关 `security.sanitize_svg` 和黑名单式检测（见第 4 点），非有效防御。
+
+2. **第 46–58 行 `sanitizeSvgString`**：依赖 DOMSanitizer + 手工追加禁用属性 `href/xlink:href`。DOMSanitizer 属白名单净化器，相对较强；但若配置关闭则原样返回 SVG，且未处理 `srcset`、CSS 内嵌等所有向量——属于条件性防御。
+
+3. **第 63–91 行 `sanitizeSVG`**：失败时将原始（含恶意代码的）SVG 写入 `log://quarantine` 目录并保留原文。隔离目录在 web 可达路径下（Grav 的 log 位于站点根），且保存的是**未经净化的原始内容**，构成第二入口：攻击者可诱导写入后直接访问 `log/quarantine/xxx.svg` 触发存储型 XSS。
+
+4. **第 148–215 行 `detectXss`（核心）**：
+   - 第 168–176 行解码链不完整：只做一次 `urldecode`、一次十六进制转换、一次实体解码；双重编码（`%253Cscript%253E`）、无分号实体、UTF-7、大小写混合协议等均可绕过。
+   - 第 182–196 行全部为**黑名单正则**：`on_events` 正则要求标签内有引号/空白结尾（`[\s|\'\"]>#iUu`）可被 `<img/src=x onerror=alert(1)>` 等变体绕过；`invalid_protocols` 来自可配置列表，遗漏 `jAvAsCrIpT&#58;` 换行变体等。
+   - 该函数本身注释即承认“does not catch all XSS”，是检测器而非净化器，却被上游当作安全边界使用。
+   - 另外第 170 行 `chr(hexdec(...))` 对超长十六进制会产生 >255 值，PHP 8 下抛错，可被用于 DoS/异常中断检测流程。
+
+5. **第 226–246 行 `cleanDangerousTwig`**：对 Twig 注入（SSTI）做纯黑名单过滤（`twig_array_map`、`call_user_func` 等）。Twig SSTI 存在大量替代通道：`attribute()`、`['filter'|filter]` 数组语法、`map/filter/sort/reduce` 高阶函数、`include`、`constant()`、拼接字符串绕过 `\b` 边界等，均可绕过该名单执行任意函数——典型 CWE-1336/CWE-94。
+
+6. **第二入口核查**：`detectXssFromPages`（第 96–134 行）遍历页面 header/content 调用同一有缺陷的 `detectXss`，仅“报告”不修复；`getXssDefaults`（第 218–228 行）规则全部来自用户可改的 YAML 配置，管理员可整体置空使检测失效。
+
+## 结论
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "本文件是 Grav 的防御工具类（XSS 检测/净化），全文件无任何用户输入读取（无 $_GET/$_POST 等超全局变量）也无 echo/print 输出汇点，CWE-79 的 source 与 sink 均不在本文件内；M3 provenance 验证样本与上游 getgrav/grav 分支 Security.php 逐字一致，logs://quarantine 隔离目录受上游根 .htaccess 规则（logs → error [F]）默认阻断直接访问，『第二入口』断言不成立。对 detectXss 黑名单可绕过、cleanDangerousTwig 黑名单局限的批评本身合理，但属调用方误用/R6 类防御质量议题，不构成本文件的污点流漏洞，原 High XSS 定级为误报。", "fix_suggestion": "no fix needed（可选加固：隔离文件目录增加随机名与访问控制；黑名单检测建议调用侧改用 HTMLPurifier 类白名单净化并多轮迭代解码）"}
+
+### id=1289 teacher=deepseek-v4-flash flags=[]
+[ANALYSIS]
+```bash
+#!/bin/bash
+# deploy.sh — 首次部署或升级 datasync 服务
+set -euo pipefail
+
+APP_DIR="/opt/datasync"
+UNIT_FILE="/etc/systemd/system/datasync.service"
+
+echo "[*] 创建应用目录"
+mkdir -p "$APP_DIR/scripts" "$APP_DIR/data"
+
+echo "[*] 写入 preflight 检查脚本"
+cat > "$APP_DIR/scripts/preflight.sh" <<'EOF'
+#!/bin/bash
+# 检查磁盘与依赖
+df -h /opt/datasync | tail -1
+python3 -c "import requests, yaml" 2>/dev/null || exit 1
+EOF
+chmod 755 "$APP_DIR/scripts/preflight.sh"
+
+echo "[*] 安装 systemd unit"
+cat > "$UNIT_FILE" <<'UNIT'
+[Unit]
+Description=DataSync Worker Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/datasync
+EnvironmentFile=/etc/datasync/env.conf
+ExecStartPre=/opt/datasync/scripts/preflight.sh
+ExecStart=/usr/bin/python3 /opt/datasync/worker.py
+Restart=on-failure
+RestartSec=5
+# 部署时写入的配置
+Environment=DB_PASSWORD=admin123
+Environment=API_TOKEN=sk_live_9f8e7d6c5b4a
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+echo "[*] 重载 systemd 并启动"
+systemctl daemon-reload
+systemctl enable --now datasync.service
+echo "[*] 部署完成"
+```
+
+---
+
+**分析过程**
+
+1. 第20行（unit 文件）与第35行（deploy.sh 内嵌 unit）中，`User=root` 使服务以最高权限运行，违反最小权限原则；攻击者若利用 worker.py 漏洞可直接控制宿主机。
+2. 第22行与第37行，`Environment=DB_PASSWORD=admin123` 和 `Environment=API_TOKEN=sk_live_...` 将明文凭据硬编码进 systemd 配置，任何本地用户可通过 `systemctl show datasync` 或读取 unit 文件获取敏感信息（CWE-798 Use of Hard-coded Credentials
+3. 第26行与第41行，`EnvironmentFile=/etc/datasync/env.conf` 本可用于外部注入，但 deploy.sh 未使用它传递密钥，反而用 `Environment=` 覆盖——这破坏了安全设计，且 `env.conf` 若存在则与硬编码值冲突，实际生效值取决于 systemd 解析顺序，导致配置混乱。
+4. 第30行，`ExecStartPre` 调用的 preflight.sh 由 root 执行，但脚本内容仅做简单检查，未设置 `set -e` 或权限校验；若攻击者可写入该脚本（目录权限未收紧），可导致 root 任意命令执行。
+5. 综合判断：根因是部署脚本将敏感配置硬编码进 unit 文件并以 root 运行，构成 CWE-1188 Insecure Default Permissions
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-1188 Insecure Default Permissions", "risk_level": "High", "source": "line 7: User=root 以最高权限运行服务", "sink": "line 15-15: 明文硬编码敏感凭据（DB_PASSWORD、API_TOKEN）", "explanation": "服务以 root 运行 → 任何服务漏洞都可能导致系统完全失陷；明文凭据暴露 → 数据库和 API 被未授权访问；两者叠加使攻击者可直接获取 root 权限并访问核心资源", "fix_suggestion": "line 7: 应改为 User=datasync（创建专用低权限用户，避免以 root 运行）；line 15: 应改为 EnvironmentFile=/etc/datasync/secure.env（将 DB_PASSWORD 和 API_TOKEN 移入权限为 600 的独立文件，并删除 line 16-16 中的明文硬编码）；line 16: 应删除该行（API_TOKEN 不应明文写在 unit 文件中）"}
+
+### id=1724 teacher=deepseek-v4-flash flags=[]
+[ANALYSIS]
+**分析过程：**
+
+1. **第11行**：`xml2js` 的 `parseString` 默认配置未设置 `explicitRoot: false` 和 `trim: true`，但更关键的是未禁用外部实体解析。xml2js 底层依赖 sax 解析器，sax 默认允许解析外部实体（XXE）。
+2. **第17行**：用户可控的 `xmlData` 直接传入 `parseString`，攻击者可构造包含 `<!DOCTYPE` 声明的恶意 XML，引用本地文件或内网资源。
+3. **第21-22行**：解析结果 `result.order.query.orderId` 和 `userId` 被提取，但 XXE 攻击的关键在于解析阶段——当 XML 包含外部实体时，sax 会尝试加载实体内容，导致文件内容泄露（如 `/etc/passwd`）或 SSRF。
+4. **第24-28行**：后续的订单查询逻辑虽然存在，但 XXE 已在解析阶段触发，与业务逻辑无关。攻击者只需在 `orderId` 字段中注入实体引用即可读取文件。
+5. 该漏洞属于典型的 XXE (CWE-611 Improper Restriction of XML External Entity References
+
+```fix
+// 修复方案：禁用外部实体，使用安全配置
+const express = require('express');
+const { parseString } = require('xml2js');
+const router = express.Router();
+
+// 安全的解析配置 - 禁用外部实体
+const safeXmlOptions = {
+    explicitArray: false,
+    // 关键：禁止解析外部实体
+    sax: {
+        // 禁用 DTD 外部实体
+        externalEntities: false,
+        // 或使用 xml2js 的严格模式
+        strict: true
+    },
+    // 防止原型污染
+    mergeAttrs: false,
+    // 限制解析大小
+    maxBytes: 10000
+};
+
+router.post('/query', (req, res) => {
+    const xmlData = req.body;
+    
+    if (!xmlData || typeof xmlData !== 'string') {
+        return res.status(400).json({ error: 'Invalid XML payload' });
+    }
+
+    // 使用安全配置解析，禁止外部实体
+    parseString(xmlData, safeXmlOptions, (err, result) => {
+        if (err) {
+            return res.status(400).json({ error: 'Malformed XML' });
+        }
+
+        try {
+            const orderId = result.order.query.orderId;
+            const userId = result.order.query.userId;
+            
+            const orderInfo = findOrder(orderId, userId);
+            
+            if (orderInfo) {
+                res.json({ success: true, data: orderInfo });
+            } else {
+                res.status(404).json({ error: 'Order not found' });
+            }
+        } catch (e) {
+            res.status(500).json({ error: 'Internal processing error' });
+        }
+    });
+});
+
+function findOrder(orderId, userId) {
+    const orders = [
+        { id: '1001', user: 'alice', amount: 299.00, status: 'shipped' },
+        { id: '1002', user: 'bob', amount: 1599.50, status: 'pending' },
+        { id: '1003', user: 'carol', amount: 89.90, status: 'delivered' }
+    ];
+    
+    return orders.find(o => o.id === orderId && o.user === userId) || null;
+}
+
+module.exports = router;
+```
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-611 Improper Restriction of XML External Entity References", "risk_level": "High", "source": "line 15: parseString(xmlData, { explicitArray: false }, ...) 未禁用外部实体解析", "sink": "line 17: 解析用户可控的 XML 时，外部实体被展开导致信息泄露", "explanation": "line 17 解析 XML 时未设置安全选项 → 攻击者构造含外部实体的 XML → 解析时读取本地文件或发起 SSRF → 敏感信息泄露", "fix_suggestion": "line 15: 建议改为 parseString(xmlData, { explicitArray: false, saxParser: require('sax').createStream(true, { xmlns: true, position: true, trim: true, normalize: true, lowercase: true, xmlns: true, entities: false, strictEntities: false, externalEntities: false, dtd: false }) }, (err, result) => {"}

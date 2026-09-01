@@ -1,0 +1,1052 @@
+batch=90 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7840 lang=python
+[CODE]
+   1| #!/usr/bin/env python3
+   2| """
+   3| Gemini MCP Server - Simple CLI Bridge
+   4| Version 1.3.0
+   5| A minimal MCP server to interface with Gemini AI via the gemini CLI.
+   6| Created by @shelakh/elyin
+   7| """
+   8| 
+   9| from __future__ import annotations
+  10| 
+  11| import logging
+  12| import os
+  13| import shutil
+  14| import subprocess
+  15| from pathlib import Path
+  16| 
+  17| from mcp.server.fastmcp import FastMCP
+  18| 
+  19| mcp = FastMCP("gemini-assistant")
+  20| 
+  21| # Inline attachment safeguards — tuned for quick, safe transfers.
+  22| MAX_INLINE_FILE_COUNT = int(os.getenv("GEMINI_BRIDGE_MAX_INLINE_FILE_COUNT", "10"))
+  23| MAX_INLINE_TOTAL_BYTES = int(os.getenv("GEMINI_BRIDGE_MAX_INLINE_TOTAL_BYTES", str(512 * 1024)))
+  24| MAX_INLINE_FILE_BYTES = int(os.getenv("GEMINI_BRIDGE_MAX_INLINE_FILE_BYTES", str(256 * 1024)))
+  25| INLINE_CHUNK_HEAD_BYTES = int(os.getenv("GEMINI_BRIDGE_INLINE_HEAD_BYTES", str(64 * 1024)))
+  26| INLINE_CHUNK_TAIL_BYTES = int(os.getenv("GEMINI_BRIDGE_INLINE_TAIL_BYTES", str(32 * 1024)))
+  27| 
+  28| 
+  29| def _normalize_model_name(model: str | None) -> str:
+  30|     """
+  31|     Normalize user-provided model identifiers to canonical Gemini CLI model names.
+  32|     Defaults to gemini-2.5-flash when not provided or unrecognized.
+  33| 
+  34|     Accepted forms:
+  35|     - "flash", "2.5-flash", "gemini-2.5-flash" -> gemini-2.5-flash
+  36|     - "pro", "2.5-pro", "gemini-2.5-pro" -> gemini-2.5-pro
+  37|     - "flash-lite", "2.5-flash-lite", "2.5-lite", "gemini-2.5-flash-lite", "gemini-2.5-lite" -> gemini-2.5-flash-lite
+  38|     - "3-pro", "gemini-3-pro", "gemini-3-pro-preview" -> gemini-3-pro-preview
+  39|     - "3-flash", "gemini-3-flash", "gemini-3-flash-preview" -> gemini-3-flash-preview
+  40|     - "3.1-pro", "gemini-3.1-pro", "gemini-3.1-pro-preview" -> gemini-3.1-pro-preview
+  41|     - "3.1-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-flash-lite-preview" -> gemini-3.1-flash-lite-preview
+  42|     - "auto" -> auto (model router, lets CLI choose optimal model)
+  43|     """
+  44|     if not model:
+  45|         return "gemini-2.5-flash"
+  46|     value = model.strip().lower()
+  47| 
+  48|     # Gemini 2.5 aliases
+  49|     if value in {"flash", "2.5-flash", "gemini-2.5-flash"}:
+  50|         return "gemini-2.5-flash"
+  51|     if value in {"pro", "2.5-pro", "gemini-2.5-pro"}:
+  52|         return "gemini-2.5-pro"
+  53| 
+  54|     # Gemini 2.5 Lite
+  55|     if value in {"flash-lite", "2.5-flash-lite", "2.5-lite", "gemini-2.5-flash-lite", "gemini-2.5-lite"}:
+  56|         return "gemini-2.5-flash-lite"
+  57| 
+  58|     # Gemini 3 aliases (preview models)
+  59|     if value in {"3-pro", "gemini-3-pro", "gemini-3-pro-preview"}:
+  60|         return "gemini-3-pro-preview"
+  61|     if value in {"3-flash", "gemini-3-flash", "gemini-3-flash-preview"}:
+  62|         return "gemini-3-flash-preview"
+  63| 
+  64|     # Gemini 3.1 series
+  65|     if value in {"3.1-pro", "gemini-3.1-pro", "gemini-3.1-pro-preview"}:
+  66|         return "gemini-3.1-pro-preview"
+  67|     if value in {"3.1-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-flash-lite-preview"}:
+  68|         return "gemini-3.1-flash-lite-preview"
+  69| 
+  70|     # Model router (let CLI choose best model)
+  71|     if value == "auto":
+  72|         return "auto"
+  73| 
+  74|     # Pass through any other gemini-* model name
+  75|     if value.startswith("gemini-"):
+  76|         return value
+  77| 
+  78|     # Fallback to flash for anything else
+  79|     return "gemini-2.5-flash"
+  80| 
+  81| 
+  82| def _get_timeout() -> int:
+  83|     """
+  84|     Get the timeout value from environment variable GEMINI_BRIDGE_TIMEOUT.
+  85|     Defaults to 60 seconds if not set or invalid.
+  86|     
+  87|     Returns:
+  88|         Timeout value in seconds (positive integer)
+  89|     """
+  90|     timeout_str = os.getenv("GEMINI_BRIDGE_TIMEOUT")
+  91|     if not timeout_str:
+  92|         return 60
+  93| 
+  94|     try:
+  95|         timeout = int(timeout_str)
+  96|         if timeout <= 0:
+  97|             logging.warning("Invalid GEMINI_BRIDGE_TIMEOUT value '%s' (must be positive). Using default 60 seconds.", timeout_str)
+  98|             return 60
+  99|         return timeout
+ 100|     except ValueError:
+ 101|         logging.warning("Invalid GEMINI_BRIDGE_TIMEOUT value '%s' (must be integer). Using default 60 seconds.", timeout_str)
+ 102|         return 60
+ 103| 
+ 104| 
+ 105| def _coerce_timeout(timeout_seconds: int | None) -> int:
+ 106|     """Return a positive timeout, preferring explicit overrides."""
+ 107|     if timeout_seconds is None:
+ 108|         return _get_timeout()
+ 109| 
+ 110|     try:
+ 111|         timeout = int(timeout_seconds)
+ 112|     except (TypeError, ValueError):
+ 113|         logging.warning(
+ 114|             "Invalid timeout override '%s' (must be integer). Using default.",
+ 115|             timeout_seconds,
+ 116|         )
+ 117|         return _get_timeout()
+ 118| 
+ 119|     if timeout <= 0:
+ 120|         logging.warning(
+ 121|             "Invalid timeout override '%s' (must be positive). Using default.",
+ 122|             timeout_seconds,
+ 123|         )
+ 124|         return _get_timeout()
+ 125| 
+ 126|     return timeout
+ 127| 
+ 128| 
+ 129| def _resolve_path(directory: str, candidate: str) -> tuple[str, str | None]:
+ 130|     """Return absolute path and relative display path rooted at directory."""
+ 131|     candidate_path = Path(candidate)
+ 132|     abs_path = (
+ 133|         str(candidate_path)
+ 134|         if candidate_path.is_absolute()
+ 135|         else str(Path(directory) / candidate)
+ 136|     )
+ 137|     try:
+ 138|         rel_path = os.path.relpath(abs_path, directory)
+ 139|     except ValueError:
+ 140|         rel_path = None
+ 141|     if rel_path and rel_path.startswith(".."):
+ 142|         rel_path = None
+ 143|     return abs_path, rel_path
+ 144| 
+ 145| 
+ 146| def _read_file_for_inline(abs_path: str) -> tuple[str, bool, int]:
+ 147|     """Read file with truncation safeguards.
+ 148| 
+ 149|     Returns tuple of (content, truncated flag, bytes_used).
+ 150|     """
+ 151|     abs_path_obj = Path(abs_path)
+ 152|     size = abs_path_obj.stat().st_size
+ 153|     truncated = False
+ 154| 
+ 155|     if size <= MAX_INLINE_FILE_BYTES:
+ 156|         with abs_path_obj.open(encoding="utf-8", errors="ignore") as handle:
+ 157|             content = handle.read()
+ 158|         return content, truncated, min(size, MAX_INLINE_FILE_BYTES)
+ 159| 
+ 160|     truncated = True
+ 161|     head_bytes = max(INLINE_CHUNK_HEAD_BYTES, 1)
+ 162|     tail_bytes = max(INLINE_CHUNK_TAIL_BYTES, 0)
+ 163| 
+ 164|     with abs_path_obj.open("rb") as handle:
+ 165|         head = handle.read(head_bytes)
+ 166|         tail = b""
+ 167|         if tail_bytes > 0 and size > head_bytes:
+ 168|             handle.seek(max(size - tail_bytes, 0))
+ 169|             tail = handle.read(tail_bytes)
+ 170| 
+ 171|     head_text = head.decode("utf-8", errors="ignore")
+ 172|     tail_text = tail.decode("utf-8", errors="ignore") if tail else ""
+ 173| 
+ 174|     snippet = head_text
+ 175|     if tail_text:
+ 176|         snippet += "\n\n[... truncated ...]\n\n" + tail_text
+ 177| 
+ 178|     bytes_counted = min(size, MAX_INLINE_FILE_BYTES)
+ 179|     return snippet, truncated, bytes_counted
+ 180| 
+ 181| 
+ 182| def _prepare_inline_payload(directory: str, files: list[str]) -> tuple[str, list[str]]:
+ 183|     """Return stdin payload for inline mode and any warnings."""
+ 184|     warnings: list[str] = []
+ 185|     file_blocks: list[str] = []
+ 186|     total_bytes = 0
+ 187|     processed = 0
+ 188| 
+ 189|     if MAX_INLINE_FILE_COUNT <= 0:
+ 190|         warnings.append("Inline attachments disabled via MAX_INLINE_FILE_COUNT<=0")
+ 191|         return "", warnings
+ 192| 
+ 193|     for original_path in files:
+ 194|         abs_path, rel_path = _resolve_path(directory, original_path)
+ 195|         display_name = rel_path or Path(abs_path).name
+ 196| 
+ 197|         if not Path(abs_path).exists():
+ 198|             warnings.append(f"Skipped missing file: {display_name}")
+ 199|             continue
+ 200| 
+ 201|         if processed >= MAX_INLINE_FILE_COUNT:
+ 202|             warnings.append(
+ 203|                 f"Inline file limit reached ({MAX_INLINE_FILE_COUNT}); skipped remaining attachments",
+ 204|             )
+ 205|             break
+ 206| 
+ 207|         try:
+ 208|             content, truncated, bytes_used = _read_file_for_inline(abs_path)
+ 209|         except Exception as exc:  # IOError or decoding issues
+ 210|             warnings.append(f"Error reading {display_name}: {exc}")
+ 211|             continue
+ 212| 
+ 213|         if total_bytes + bytes_used > MAX_INLINE_TOTAL_BYTES:
+ 214|             warnings.append(
+ 215|                 f"Inline payload exceeded {MAX_INLINE_TOTAL_BYTES} bytes; skipped {display_name} and remaining attachments",
+ 216|             )
+ 217|             break
+ 218| 
+ 219|         block_header = f"=== {display_name} ==="
+ 220|         if truncated:
+ 221|             block_header += "\n[gemini-bridge] Content truncated for inline transfer"
+ 222|         file_blocks.append(f"{block_header}\n{content}")
+ 223| 
+ 224|         if truncated:
+ 225|             warnings.append(
+ 226|                 f"Truncated {display_name}; only the first {INLINE_CHUNK_HEAD_BYTES}B and last {INLINE_CHUNK_TAIL_BYTES}B were sent",
+ 227|             )
+ 228| 
+ 229|         total_bytes += bytes_used
+ 230|         processed += 1
+ 231| 
+ 232|     payload = "\n\n".join(file_blocks)
+ 233|     return payload, warnings
+ 234| 
+ 235| 
+ 236| def _prepare_at_command_prompt(directory: str, files: list[str]) -> tuple[str, list[str]]:
+ 237|     """Return prompt lines for @-command usage and warnings."""
+ 238|     warnings: list[str] = []
+ 239|     prompt_lines: list[str] = []
+ 240| 
+ 241|     for original_path in files:
+ 242|         abs_path, rel_path = _resolve_path(directory, original_path)
+ 243|         if not Path(abs_path).exists():
+ 244|             warnings.append(f"Skipped missing file: {original_path}")
+ 245|             continue
+ 246|         if rel_path is None:
+ 247|             warnings.append(
+ 248|                 f"Skipped file outside working directory: {original_path}",
+ 249|             )
+ 250|             continue
+ 251|         prompt_lines.append(f"@{rel_path}")
+ 252| 
+ 253|     if not prompt_lines:
+ 254|         warnings.append("No readable files resolved for @ command; prompt unchanged")
+ 255| 
+ 256|     prompt = "\n".join(prompt_lines)
+ 257|     return prompt, warnings
+ 258| 
+ 259| 
+ 260| def execute_gemini_simple(
+ 261|     query: str,
+ 262|     directory: str = ".",
+ 263|     model: str | None = None,
+ 264|     timeout_seconds: int | None = None,
+ 265| ) -> str:
+ 266|     """
+ 267|     Execute gemini CLI command for simple queries without file attachments.
+ 268|     
+ 269|     Args:
+ 270|         query: The prompt to send to Gemini
+ 271|         directory: Working directory for the command
+ 272|         model: Optional model name (flash, pro, etc.)
+ 273|         
+ 274|     Returns:
+ 275|         CLI output or error message
+ 276|     """
+ 277|     # Check if gemini CLI is available
+ 278|     if not shutil.which("gemini"):
+ 279|         return "Error: Gemini CLI not found. Install with: npm install -g @google/gemini-cli"
+ 280| 
+ 281|     # Validate directory
+ 282|     if not Path(directory).is_dir():
+ 283|         return f"Error: Directory does not exist: {directory}"
+ 284|     
+ 285|     # Build command - use stdin for input to avoid hanging
+ 286|     selected_model = _normalize_model_name(model)
+ 287|     cmd = ["gemini", "-m", selected_model]
+ 288|     
+ 289|     # Execute CLI command - simple timeout, no retries
+ 290|     timeout = _coerce_timeout(timeout_seconds)
+ 291|     try:
+ 292|         result = subprocess.run(
+ 293|             cmd,
+ 294|             cwd=directory,
+ 295|             capture_output=True,
+ 296|             text=True,
+ 297|             timeout=timeout,
+ 298|             input=query
+ 299|         )
+ 300|         
+ 301|         if result.returncode == 0:
+ 302|             return result.stdout.strip() if result.stdout.strip() else "No output from Gemini CLI"
+ 303|         else:
+ 304|             error_msg = result.stderr.strip()
+ 305|             # Provide helpful suggestions for common errors
+ 306|             if "not available" in error_msg.lower() or "unauthorized" in error_msg.lower():
+ 307|                 return f"Gemini CLI Error: Model '{selected_model}' may not be available for your account. Try: 'flash', 'flash-lite', or 'auto'. Details: {error_msg}"
+ 308|             elif "authentication" in error_msg.lower() or "auth" in error_msg.lower():
+ 309|                 return f"Gemini CLI Error: Authentication required. Run: gemini auth login. Details: {error_msg}"
+ 310|             else:
+ 311|                 return f"Gemini CLI Error: {error_msg}"
+ 312| 
+ 313|     except subprocess.TimeoutExpired:
+ 314|         return f"Error: Gemini CLI command timed out after {timeout} seconds. Try increasing timeout or simplifying your query."
+ 315|     except FileNotFoundError:
+ 316|         return "Error: Gemini CLI not found. Install with: npm install -g @google/gemini-cli"
+ 317|     except Exception as e:
+ 318|         return f"Error executing Gemini CLI: {str(e)}"
+ 319| 
+ 320| 
+ 321| def execute_gemini_with_files(
+ 322|     query: str,
+ 323|     directory: str = ".",
+ 324|     files: list[str] | None = None,
+ 325|     model: str | None = None,
+ 326|     timeout_seconds: int | None = None,
+ 327|     mode: str = "inline",
+ 328| ) -> str:
+ 329|     """
+ 330|     Execute gemini CLI command with file attachments.
+ 331|     
+ 332|     Args:
+ 333|         query: The prompt to send to Gemini
+ 334|         directory: Working directory for the command
+ 335|         files: List of file paths to attach (relative to directory)
+ 336|         model: Optional model name (flash, pro, etc.)
+ 337|         
+ 338|     Returns:
+ 339|         CLI output or error message
+ 340|     """
+ 341|     # Check if gemini CLI is available
+ 342|     if not shutil.which("gemini"):
+ 343|         return "Error: Gemini CLI not found. Install with: npm install -g @google/gemini-cli"
+ 344| 
+ 345|     # Validate directory
+ 346|     if not Path(directory).is_dir():
+ 347|         return f"Error: Directory does not exist: {directory}"
+ 348|     
+ 349|     # Validate files parameter
+ 350|     if not files:
+ 351|         return "Error: No files provided for file attachment mode"
+ 352|     
+ 353|     # Build command - use stdin for input to avoid hanging
+ 354|     selected_model = _normalize_model_name(model)
+ 355|     cmd = ["gemini", "-m", selected_model]
+ 356| 
+ 357|     mode_normalized = mode.lower()
+ 358|     warnings: list[str]
+ 359| 
+ 360|     if mode_normalized not in {"inline", "at_command"}:
+ 361|         return f"Error: Unsupported files mode '{mode}'. Use 'inline' or 'at_command'."
+ 362| 
+ 363|     if mode_normalized == "inline":
+ 364|         inline_payload, warnings = _prepare_inline_payload(directory, files)
+ 365|         stdin_pieces = [piece for piece in [inline_payload, query] if piece]
+ 366|         stdin_content = "\n\n".join(stdin_pieces)
+ 367|     else:
+ 368|         at_prompt, warnings = _prepare_at_command_prompt(directory, files)
+ 369|         stdin_pieces = [piece for piece in [at_prompt, query] if piece]
+ 370|         stdin_content = "\n\n".join(stdin_pieces)
+ 371| 
+ 372|     # Execute CLI command - simple timeout, no retries
+ 373|     timeout = _coerce_timeout(timeout_seconds)
+ 374|     try:
+ 375|         result = subprocess.run(
+ 376|             cmd,
+ 377|             cwd=directory,
+ 378|             capture_output=True,
+ 379|             text=True,
+ 380|             timeout=timeout,
+ 381|             input=stdin_content
+ 382|         )
+ 383| 
+ 384|         if result.returncode == 0:
+ 385|             output = result.stdout.strip() if result.stdout.strip() else "No output from Gemini CLI"
+ 386|         else:
+ 387|             error_msg = result.stderr.strip()
+ 388|             # Provide helpful suggestions for common errors
+ 389|             if "not available" in error_msg.lower() or "unauthorized" in error_msg.lower():
+ 390|                 output = f"Gemini CLI Error: Model '{selected_model}' may not be available for your account. Try: 'flash', 'flash-lite', or 'auto'. Details: {error_msg}"
+ 391|             elif "authentication" in error_msg.lower() or "auth" in error_msg.lower():
+ 392|                 output = f"Gemini CLI Error: Authentication required. Run: gemini auth login. Details: {error_msg}"
+ 393|             else:
+ 394|                 output = f"Gemini CLI Error: {error_msg}"
+ 395| 
+ 396|         if warnings:
+ 397|             warning_block = "Warnings:\n" + "\n".join(f"- {w}" for w in warnings)
+ 398|             return f"{warning_block}\n\n{output}"
+ 399|         return output
+ 400| 
+ 401|     except subprocess.TimeoutExpired:
+ 402|         return f"Error: Gemini CLI command timed out after {timeout} seconds. Try increasing timeout or simplifying your query."
+ 403|     except FileNotFoundError:
+ 404|         return "Error: Gemini CLI not found. Install with: npm install -g @google/gemini-cli"
+ 405|     except Exception as e:
+ 406|         return f"Error executing Gemini CLI: {str(e)}"
+ 407| 
+ 408| 
+ 409| @mcp.tool()
+ 410| def consult_gemini(
+ 411|     query: str,
+ 412|     directory: str,
+ 413|     model: str | None = None,
+ 414|     timeout_seconds: int | None = None,
+ 415| ) -> str:
+ 416|     """Send a query directly to the Gemini CLI.
+ 417| 
+ 418|     Args:
+ 419|         query: Prompt text forwarded verbatim to the CLI.
+ 420|         directory: Working directory used for command execution.
+ 421|         model: Optional model alias (``flash``, ``pro``) or full Gemini model id.
+ 422|         timeout_seconds: Optional per-call timeout override in seconds.
+ 423| 
+ 424|     Returns:
+ 425|         Gemini's response text or an explanatory error string.
+ 426|     """
+ 427|     return execute_gemini_simple(query, directory, model, timeout_seconds)
+ 428| 
+ 429| 
+ 430| @mcp.tool()
+ 431| def consult_gemini_with_files(
+ 432|     query: str,
+ 433|     directory: str,
+ 434|     files: list[str] | None = None,
+ 435|     model: str | None = None,
+ 436|     timeout_seconds: int | None = None,
+ 437|     mode: str = "inline",
+ 438| ) -> str:
+ 439|     """Send a query to the Gemini CLI with file context.
+ 440| 
+ 441|     Args:
+ 442|         query: Prompt text forwarded to the CLI.
+ 443|         directory: Working directory used for resolving relative file paths.
+ 444|         files: Relative or absolute file paths to include alongside the prompt.
+ 445|         model: Optional model alias (``flash``, ``pro``) or full Gemini model id.
+ 446|         timeout_seconds: Optional per-call timeout override in seconds.
+ 447|         mode: ``"inline"`` streams truncated snippets; ``"at_command"`` emits
+ 448|             ``@path`` directives so Gemini CLI resolves files itself.
+ 449| 
+ 450|     Returns:
+ 451|         Gemini's response or an explanatory error string with any warnings.
+ 452|     """
+ 453|     if not files:
+ 454|         return "Error: files parameter is required for consult_gemini_with_files"
+ 455|     return execute_gemini_with_files(query, directory, files, model, timeout_seconds, mode)
+ 456| 
+ 457| 
+ 458| @mcp.tool()
+ 459| def web_search(
+ 460|     query: str,
+ 461|     directory: str = ".",
+ 462|     model: str | None = None,
+ 463|     timeout_seconds: int | None = None,
+ 464| ) -> str:
+ 465|     """Ask Gemini queries with web search context.
+ 466| 
+ 467|     Note: This uses Gemini CLI's automatic web search capability.
+ 468|     The model determines when to search based on query context.
+ 469|     Best-effort web search - not guaranteed for every query.
+ 470| 
+ 471|     Args:
+ 472|         query: Search query or question to look up on the web
+ 473|         directory: Working directory for command execution
+ 474|         model: Optional model alias (flash, pro, or custom)
+ 475|         timeout_seconds: Optional per-call timeout override in seconds
+ 476| 
+ 477|     Returns:
+ 478|         Gemini's response with potential web sources
+ 479|     """
+ 480|     search_prompt = f"Please use web search to find current information about: {query}"
+ 481|     return execute_gemini_simple(search_prompt, directory, model, timeout_seconds)
+ 482| 
+ 483| 
+ 484| def main():
+ 485|     """Entry point for the MCP server."""
+ 486|     mcp.run()
+ 487| 
+ 488| 
+ 489| if __name__ == "__main__":
+ 490|     main()
+ 491| 
+ 492| 
+
+### id=7841 lang=python
+[CODE]
+   1| #!/usr/bin/env python3
+   2| """
+   3| Gemini MCP Server - Simple CLI Bridge
+   4| Version 1.3.1
+   5| A minimal MCP server to interface with Gemini AI via the gemini CLI.
+   6| Created by @shelakh/elyin
+   7| """
+   8| 
+   9| from __future__ import annotations
+  10| 
+  11| import logging
+  12| import os
+  13| import shutil
+  14| import subprocess
+  15| from pathlib import Path
+  16| 
+  17| from mcp.server.fastmcp import FastMCP
+  18| 
+  19| mcp = FastMCP("gemini-assistant")
+  20| 
+  21| # Inline attachment safeguards — tuned for quick, safe transfers.
+  22| MAX_INLINE_FILE_COUNT = int(os.getenv("GEMINI_BRIDGE_MAX_INLINE_FILE_COUNT", "10"))
+  23| MAX_INLINE_TOTAL_BYTES = int(os.getenv("GEMINI_BRIDGE_MAX_INLINE_TOTAL_BYTES", str(512 * 1024)))
+  24| MAX_INLINE_FILE_BYTES = int(os.getenv("GEMINI_BRIDGE_MAX_INLINE_FILE_BYTES", str(256 * 1024)))
+  25| INLINE_CHUNK_HEAD_BYTES = int(os.getenv("GEMINI_BRIDGE_INLINE_HEAD_BYTES", str(64 * 1024)))
+  26| INLINE_CHUNK_TAIL_BYTES = int(os.getenv("GEMINI_BRIDGE_INLINE_TAIL_BYTES", str(32 * 1024)))
+  27| 
+  28| 
+  29| def _normalize_model_name(model: str | None) -> str:
+  30|     """
+  31|     Normalize user-provided model identifiers to canonical Gemini CLI model names.
+  32|     Defaults to gemini-2.5-flash when not provided or unrecognized.
+  33| 
+  34|     Accepted forms:
+  35|     - "flash", "2.5-flash", "gemini-2.5-flash" -> gemini-2.5-flash
+  36|     - "pro", "2.5-pro", "gemini-2.5-pro" -> gemini-2.5-pro
+  37|     - "flash-lite", "2.5-flash-lite", "2.5-lite", "gemini-2.5-flash-lite", "gemini-2.5-lite" -> gemini-2.5-flash-lite
+  38|     - "3-pro", "gemini-3-pro", "gemini-3-pro-preview" -> gemini-3-pro-preview
+  39|     - "3-flash", "gemini-3-flash", "gemini-3-flash-preview" -> gemini-3-flash-preview
+  40|     - "3.1-pro", "gemini-3.1-pro", "gemini-3.1-pro-preview" -> gemini-3.1-pro-preview
+  41|     - "3.1-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-flash-lite-preview" -> gemini-3.1-flash-lite-preview
+  42|     - "auto" -> auto (model router, lets CLI choose optimal model)
+  43|     """
+  44|     if not model:
+  45|         return "gemini-2.5-flash"
+  46|     value = model.strip().lower()
+  47| 
+  48|     # Gemini 2.5 aliases
+  49|     if value in {"flash", "2.5-flash", "gemini-2.5-flash"}:
+  50|         return "gemini-2.5-flash"
+  51|     if value in {"pro", "2.5-pro", "gemini-2.5-pro"}:
+  52|         return "gemini-2.5-pro"
+  53| 
+  54|     # Gemini 2.5 Lite
+  55|     if value in {"flash-lite", "2.5-flash-lite", "2.5-lite", "gemini-2.5-flash-lite", "gemini-2.5-lite"}:
+  56|         return "gemini-2.5-flash-lite"
+  57| 
+  58|     # Gemini 3 aliases (preview models)
+  59|     if value in {"3-pro", "gemini-3-pro", "gemini-3-pro-preview"}:
+  60|         return "gemini-3-pro-preview"
+  61|     if value in {"3-flash", "gemini-3-flash", "gemini-3-flash-preview"}:
+  62|         return "gemini-3-flash-preview"
+  63| 
+  64|     # Gemini 3.1 series
+  65|     if value in {"3.1-pro", "gemini-3.1-pro", "gemini-3.1-pro-preview"}:
+  66|         return "gemini-3.1-pro-preview"
+  67|     if value in {"3.1-flash-lite", "gemini-3.1-flash-lite", "gemini-3.1-flash-lite-preview"}:
+  68|         return "gemini-3.1-flash-lite-preview"
+  69| 
+  70|     # Model router (let CLI choose best model)
+  71|     if value == "auto":
+  72|         return "auto"
+  73| 
+  74|     # Pass through any other gemini-* model name
+  75|     if value.startswith("gemini-"):
+  76|         return value
+  77| 
+  78|     # Fallback to flash for anything else
+  79|     return "gemini-2.5-flash"
+  80| 
+  81| 
+  82| def _get_timeout() -> int:
+  83|     """
+  84|     Get the timeout value from environment variable GEMINI_BRIDGE_TIMEOUT.
+  85|     Defaults to 60 seconds if not set or invalid.
+  86|     
+  87|     Returns:
+  88|         Timeout value in seconds (positive integer)
+  89|     """
+  90|     timeout_str = os.getenv("GEMINI_BRIDGE_TIMEOUT")
+  91|     if not timeout_str:
+  92|         return 60
+  93| 
+  94|     try:
+  95|         timeout = int(timeout_str)
+  96|         if timeout <= 0:
+  97|             logging.warning("Invalid GEMINI_BRIDGE_TIMEOUT value '%s' (must be positive). Using default 60 seconds.", timeout_str)
+  98|             return 60
+  99|         return timeout
+ 100|     except ValueError:
+ 101|         logging.warning("Invalid GEMINI_BRIDGE_TIMEOUT value '%s' (must be integer). Using default 60 seconds.", timeout_str)
+ 102|         return 60
+ 103| 
+ 104| 
+ 105| def _coerce_timeout(timeout_seconds: int | None) -> int:
+ 106|     """Return a positive timeout, preferring explicit overrides."""
+ 107|     if timeout_seconds is None:
+ 108|         return _get_timeout()
+ 109| 
+ 110|     try:
+ 111|         timeout = int(timeout_seconds)
+ 112|     except (TypeError, ValueError):
+ 113|         logging.warning(
+ 114|             "Invalid timeout override '%s' (must be integer). Using default.",
+ 115|             timeout_seconds,
+ 116|         )
+ 117|         return _get_timeout()
+ 118| 
+ 119|     if timeout <= 0:
+ 120|         logging.warning(
+ 121|             "Invalid timeout override '%s' (must be positive). Using default.",
+ 122|             timeout_seconds,
+ 123|         )
+ 124|         return _get_timeout()
+ 125| 
+ 126|     return timeout
+ 127| 
+ 128| 
+ 129| def _resolve_path(directory: str, candidate: str) -> tuple[str, str | None]:
+ 130|     """Return absolute path and a display path confined to ``directory``.
+ 131| 
+ 132|     ``rel_path`` is ``None`` when the candidate escapes the directory root via
+ 133|     an absolute path, ``..`` traversal, or a symlink pointing outside it.
+ 134|     Both the root and the candidate are resolved (symlinks followed) so the
+ 135|     containment check cannot be bypassed; callers must refuse a ``None``.
+ 136|     """
+ 137|     root = Path(directory).resolve()
+ 138|     candidate_path = Path(candidate)
+ 139|     abs_path = (
+ 140|         candidate_path if candidate_path.is_absolute() else root / candidate
+ 141|     ).resolve()
+ 142|     try:
+ 143|         rel_path = str(abs_path.relative_to(root))
+ 144|     except ValueError:
+ 145|         rel_path = None
+ 146|     return str(abs_path), rel_path
+ 147| 
+ 148| 
+ 149| def _read_file_for_inline(abs_path: str) -> tuple[str, bool, int]:
+ 150|     """Read file with truncation safeguards.
+ 151| 
+ 152|     Returns tuple of (content, truncated flag, bytes_used).
+ 153|     """
+ 154|     abs_path_obj = Path(abs_path)
+ 155|     size = abs_path_obj.stat().st_size
+ 156|     truncated = False
+ 157| 
+ 158|     if size <= MAX_INLINE_FILE_BYTES:
+ 159|         with abs_path_obj.open(encoding="utf-8", errors="ignore") as handle:
+ 160|             content = handle.read()
+ 161|         return content, truncated, min(size, MAX_INLINE_FILE_BYTES)
+ 162| 
+ 163|     truncated = True
+ 164|     head_bytes = max(INLINE_CHUNK_HEAD_BYTES, 1)
+ 165|     tail_bytes = max(INLINE_CHUNK_TAIL_BYTES, 0)
+ 166| 
+ 167|     with abs_path_obj.open("rb") as handle:
+ 168|         head = handle.read(head_bytes)
+ 169|         tail = b""
+ 170|         if tail_bytes > 0 and size > head_bytes:
+ 171|             handle.seek(max(size - tail_bytes, 0))
+ 172|             tail = handle.read(tail_bytes)
+ 173| 
+ 174|     head_text = head.decode("utf-8", errors="ignore")
+ 175|     tail_text = tail.decode("utf-8", errors="ignore") if tail else ""
+ 176| 
+ 177|     snippet = head_text
+ 178|     if tail_text:
+ 179|         snippet += "\n\n[... truncated ...]\n\n" + tail_text
+ 180| 
+ 181|     bytes_counted = min(size, MAX_INLINE_FILE_BYTES)
+ 182|     return snippet, truncated, bytes_counted
+ 183| 
+ 184| 
+ 185| def _prepare_inline_payload(directory: str, files: list[str]) -> tuple[str, list[str]]:
+ 186|     """Return stdin payload for inline mode and any warnings."""
+ 187|     warnings: list[str] = []
+ 188|     file_blocks: list[str] = []
+ 189|     total_bytes = 0
+ 190|     processed = 0
+ 191| 
+ 192|     if MAX_INLINE_FILE_COUNT <= 0:
+ 193|         warnings.append("Inline attachments disabled via MAX_INLINE_FILE_COUNT<=0")
+ 194|         return "", warnings
+ 195| 
+ 196|     for original_path in files:
+ 197|         abs_path, rel_path = _resolve_path(directory, original_path)
+ 198|         if rel_path is None:
+ 199|             warnings.append(
+ 200|                 f"Skipped file outside working directory: {original_path}",
+ 201|             )
+ 202|             continue
+ 203|         display_name = rel_path
+ 204| 
+ 205|         if not Path(abs_path).exists():
+ 206|             warnings.append(f"Skipped missing file: {display_name}")
+ 207|             continue
+ 208| 
+ 209|         if processed >= MAX_INLINE_FILE_COUNT:
+ 210|             warnings.append(
+ 211|                 f"Inline file limit reached ({MAX_INLINE_FILE_COUNT}); skipped remaining attachments",
+ 212|             )
+ 213|             break
+ 214| 
+ 215|         try:
+ 216|             content, truncated, bytes_used = _read_file_for_inline(abs_path)
+ 217|         except Exception as exc:  # IOError or decoding issues
+ 218|             warnings.append(f"Error reading {display_name}: {exc}")
+ 219|             continue
+ 220| 
+ 221|         if total_bytes + bytes_used > MAX_INLINE_TOTAL_BYTES:
+ 222|             warnings.append(
+ 223|                 f"Inline payload exceeded {MAX_INLINE_TOTAL_BYTES} bytes; skipped {display_name} and remaining attachments",
+ 224|             )
+ 225|             break
+ 226| 
+ 227|         block_header = f"=== {display_name} ==="
+ 228|         if truncated:
+ 229|             block_header += "\n[gemini-bridge] Content truncated for inline transfer"
+ 230|         file_blocks.append(f"{block_header}\n{content}")
+ 231| 
+ 232|         if truncated:
+ 233|             warnings.append(
+ 234|                 f"Truncated {display_name}; only the first {INLINE_CHUNK_HEAD_BYTES}B and last {INLINE_CHUNK_TAIL_BYTES}B were sent",
+ 235|             )
+ 236| 
+ 237|         total_bytes += bytes_used
+ 238|         processed += 1
+ 239| 
+ 240|     payload = "\n\n".join(file_blocks)
+ 241|     return payload, warnings
+ 242| 
+ 243| 
+ 244| def _prepare_at_command_prompt(directory: str, files: list[str]) -> tuple[str, list[str]]:
+ 245|     """Return prompt lines for @-command usage and warnings."""
+ 246|     warnings: list[str] = []
+ 247|     prompt_lines: list[str] = []
+ 248| 
+ 249|     for original_path in files:
+ 250|         abs_path, rel_path = _resolve_path(directory, original_path)
+ 251|         if not Path(abs_path).exists():
+ 252|             warnings.append(f"Skipped missing file: {original_path}")
+ 253|             continue
+ 254|         if rel_path is None:
+ 255|             warnings.append(
+ 256|                 f"Skipped file outside working directory: {original_path}",
+ 257|             )
+ 258|             continue
+ 259|         prompt_lines.append(f"@{rel_path}")
+ 260| 
+ 261|     if not prompt_lines:
+ 262|         warnings.append("No readable files resolved for @ command; prompt unchanged")
+ 263| 
+ 264|     prompt = "\n".join(prompt_lines)
+ 265|     return prompt, warnings
+ 266| 
+ 267| 
+ 268| def execute_gemini_simple(
+ 269|     query: str,
+ 270|     directory: str = ".",
+ 271|     model: str | None = None,
+ 272|     timeout_seconds: int | None = None,
+ 273| ) -> str:
+ 274|     """
+ 275|     Execute gemini CLI command for simple queries without file attachments.
+ 276|     
+ 277|     Args:
+ 278|         query: The prompt to send to Gemini
+ 279|         directory: Working directory for the command
+ 280|         model: Optional model name (flash, pro, etc.)
+ 281|         
+ 282|     Returns:
+ 283|         CLI output or error message
+ 284|     """
+ 285|     # Check if gemini CLI is available
+ 286|     if not shutil.which("gemini"):
+ 287|         return "Error: Gemini CLI not found. Install with: npm install -g @google/gemini-cli"
+ 288| 
+ 289|     # Validate directory
+ 290|     if not Path(directory).is_dir():
+ 291|         return f"Error: Directory does not exist: {directory}"
+ 292|     
+ 293|     # Build command - use stdin for input to avoid hanging
+ 294|     selected_model = _normalize_model_name(model)
+ 295|     cmd = ["gemini", "-m", selected_model]
+ 296|     
+ 297|     # Execute CLI command - simple timeout, no retries
+ 298|     timeout = _coerce_timeout(timeout_seconds)
+ 299|     try:
+ 300|         result = subprocess.run(
+ 301|             cmd,
+ 302|             cwd=directory,
+ 303|             capture_output=True,
+ 304|             text=True,
+ 305|             timeout=timeout,
+ 306|             input=query
+ 307|         )
+ 308|         
+ 309|         if result.returncode == 0:
+ 310|             return result.stdout.strip() if result.stdout.strip() else "No output from Gemini CLI"
+ 311|         else:
+ 312|             error_msg = result.stderr.strip()
+ 313|             # Provide helpful suggestions for common errors
+ 314|             if "not available" in error_msg.lower() or "unauthorized" in error_msg.lower():
+ 315|                 return f"Gemini CLI Error: Model '{selected_model}' may not be available for your account. Try: 'flash', 'flash-lite', or 'auto'. Details: {error_msg}"
+ 316|             elif "authentication" in error_msg.lower() or "auth" in error_msg.lower():
+ 317|                 return f"Gemini CLI Error: Authentication required. Run: gemini auth login. Details: {error_msg}"
+ 318|             else:
+ 319|                 return f"Gemini CLI Error: {error_msg}"
+ 320| 
+ 321|     except subprocess.TimeoutExpired:
+ 322|         return f"Error: Gemini CLI command timed out after {timeout} seconds. Try increasing timeout or simplifying your query."
+ 323|     except FileNotFoundError:
+ 324|         return "Error: Gemini CLI not found. Install with: npm install -g @google/gemini-cli"
+ 325|     except Exception as e:
+ 326|         return f"Error executing Gemini CLI: {str(e)}"
+ 327| 
+ 328| 
+ 329| def execute_gemini_with_files(
+ 330|     query: str,
+ 331|     directory: str = ".",
+ 332|     files: list[str] | None = None,
+ 333|     model: str | None = None,
+ 334|     timeout_seconds: int | None = None,
+ 335|     mode: str = "inline",
+ 336| ) -> str:
+ 337|     """
+ 338|     Execute gemini CLI command with file attachments.
+ 339|     
+ 340|     Args:
+ 341|         query: The prompt to send to Gemini
+ 342|         directory: Working directory for the command
+ 343|         files: List of file paths to attach (relative to directory)
+ 344|         model: Optional model name (flash, pro, etc.)
+ 345|         
+ 346|     Returns:
+ 347|         CLI output or error message
+ 348|     """
+ 349|     # Check if gemini CLI is available
+ 350|     if not shutil.which("gemini"):
+ 351|         return "Error: Gemini CLI not found. Install with: npm install -g @google/gemini-cli"
+ 352| 
+ 353|     # Validate directory
+ 354|     if not Path(directory).is_dir():
+ 355|         return f"Error: Directory does not exist: {directory}"
+ 356|     
+ 357|     # Validate files parameter
+ 358|     if not files:
+ 359|         return "Error: No files provided for file attachment mode"
+ 360|     
+ 361|     # Build command - use stdin for input to avoid hanging
+ 362|     selected_model = _normalize_model_name(model)
+ 363|     cmd = ["gemini", "-m", selected_model]
+ 364| 
+ 365|     mode_normalized = mode.lower()
+ 366|     warnings: list[str]
+ 367| 
+ 368|     if mode_normalized not in {"inline", "at_command"}:
+ 369|         return f"Error: Unsupported files mode '{mode}'. Use 'inline' or 'at_command'."
+ 370| 
+ 371|     if mode_normalized == "inline":
+ 372|         inline_payload, warnings = _prepare_inline_payload(directory, files)
+ 373|         stdin_pieces = [piece for piece in [inline_payload, query] if piece]
+ 374|         stdin_content = "\n\n".join(stdin_pieces)
+ 375|     else:
+ 376|         at_prompt, warnings = _prepare_at_command_prompt(directory, files)
+ 377|         stdin_pieces = [piece for piece in [at_prompt, query] if piece]
+ 378|         stdin_content = "\n\n".join(stdin_pieces)
+ 379| 
+ 380|     # Execute CLI command - simple timeout, no retries
+ 381|     timeout = _coerce_timeout(timeout_seconds)
+ 382|     try:
+ 383|         result = subprocess.run(
+ 384|             cmd,
+ 385|             cwd=directory,
+ 386|             capture_output=True,
+ 387|             text=True,
+ 388|             timeout=timeout,
+ 389|             input=stdin_content
+ 390|         )
+ 391| 
+ 392|         if result.returncode == 0:
+ 393|             output = result.stdout.strip() if result.stdout.strip() else "No output from Gemini CLI"
+ 394|         else:
+ 395|             error_msg = result.stderr.strip()
+ 396|             # Provide helpful suggestions for common errors
+ 397|             if "not available" in error_msg.lower() or "unauthorized" in error_msg.lower():
+ 398|                 output = f"Gemini CLI Error: Model '{selected_model}' may not be available for your account. Try: 'flash', 'flash-lite', or 'auto'. Details: {error_msg}"
+ 399|             elif "authentication" in error_msg.lower() or "auth" in error_msg.lower():
+ 400|                 output = f"Gemini CLI Error: Authentication required. Run: gemini auth login. Details: {error_msg}"
+ 401|             else:
+ 402|                 output = f"Gemini CLI Error: {error_msg}"
+ 403| 
+ 404|         if warnings:
+ 405|             warning_block = "Warnings:\n" + "\n".join(f"- {w}" for w in warnings)
+ 406|             return f"{warning_block}\n\n{output}"
+ 407|         return output
+ 408| 
+ 409|     except subprocess.TimeoutExpired:
+ 410|         return f"Error: Gemini CLI command timed out after {timeout} seconds. Try increasing timeout or simplifying your query."
+ 411|     except FileNotFoundError:
+ 412|         return "Error: Gemini CLI not found. Install with: npm install -g @google/gemini-cli"
+ 413|     except Exception as e:
+ 414|         return f"Error executing Gemini CLI: {str(e)}"
+ 415| 
+ 416| 
+ 417| @mcp.tool()
+ 418| def consult_gemini(
+ 419|     query: str,
+ 420|     directory: str,
+ 421|     model: str | None = None,
+ 422|     timeout_seconds: int | None = None,
+ 423| ) -> str:
+ 424|     """Send a query directly to the Gemini CLI.
+ 425| 
+ 426|     Args:
+ 427|         query: Prompt text forwarded verbatim to the CLI.
+ 428|         directory: Working directory used for command execution.
+ 429|         model: Optional model alias (``flash``, ``pro``) or full Gemini model id.
+ 430|         timeout_seconds: Optional per-call timeout override in seconds.
+ 431| 
+ 432|     Returns:
+ 433|         Gemini's response text or an explanatory error string.
+ 434|     """
+ 435|     return execute_gemini_simple(query, directory, model, timeout_seconds)
+ 436| 
+ 437| 
+ 438| @mcp.tool()
+ 439| def consult_gemini_with_files(
+ 440|     query: str,
+ 441|     directory: str,
+ 442|     files: list[str] | None = None,
+ 443|     model: str | None = None,
+ 444|     timeout_seconds: int | None = None,
+ 445|     mode: str = "inline",
+ 446| ) -> str:
+ 447|     """Send a query to the Gemini CLI with file context.
+ 448| 
+ 449|     Args:
+ 450|         query: Prompt text forwarded to the CLI.
+ 451|         directory: Working directory used for resolving relative file paths.
+ 452|         files: File paths to include alongside the prompt. Paths must resolve
+ 453|             inside ``directory``; entries pointing outside it are skipped.
+ 454|         model: Optional model alias (``flash``, ``pro``) or full Gemini model id.
+ 455|         timeout_seconds: Optional per-call timeout override in seconds.
+ 456|         mode: ``"inline"`` streams truncated snippets; ``"at_command"`` emits
+ 457|             ``@path`` directives so Gemini CLI resolves files itself.
+ 458| 
+ 459|     Returns:
+ 460|         Gemini's response or an explanatory error string with any warnings.
+ 461|     """
+ 462|     if not files:
+ 463|         return "Error: files parameter is required for consult_gemini_with_files"
+ 464|     return execute_gemini_with_files(query, directory, files, model, timeout_seconds, mode)
+ 465| 
+ 466| 
+ 467| @mcp.tool()
+ 468| def web_search(
+ 469|     query: str,
+ 470|     directory: str = ".",
+ 471|     model: str | None = None,
+ 472|     timeout_seconds: int | None = None,
+ 473| ) -> str:
+ 474|     """Ask Gemini queries with web search context.
+ 475| 
+ 476|     Note: This uses Gemini CLI's automatic web search capability.
+ 477|     The model determines when to search based on query context.
+ 478|     Best-effort web search - not guaranteed for every query.
+ 479| 
+ 480|     Args:
+ 481|         query: Search query or question to look up on the web
+ 482|         directory: Working directory for command execution
+ 483|         model: Optional model alias (flash, pro, or custom)
+ 484|         timeout_seconds: Optional per-call timeout override in seconds
+ 485| 
+ 486|     Returns:
+ 487|         Gemini's response with potential web sources
+ 488|     """
+ 489|     search_prompt = f"Please use web search to find current information about: {query}"
+ 490|     return execute_gemini_simple(search_prompt, directory, model, timeout_seconds)
+ 491| 
+ 492| 
+ 493| def main():
+ 494|     """Entry point for the MCP server."""
+ 495|     mcp.run()
+ 496| 
+ 497| 
+ 498| if __name__ == "__main__":
+ 499|     main()
+ 500| 
+ 501| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7840 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **入口点枚举（全文）**：本文件是 MCP server，入口即三个 `@mcp.tool()`：`consult_gemini`、`consult_gemini_with_files`、`web_search`，均由远程 MCP 客户端调用；另有环境变量入口（第 21–25 行的 `GEMINI_BRIDGE_*`、`_get_timeout` 读 `GEMINI_BRIDGE_TIMEOUT`）。无其他路由/回调。
+
+2. **model 参数**（`_normalize_model_name`）：白名单映射，未匹配且以 `gemini-` 开头才透传，否则回退默认。随后作为 `cmd = ["gemini", "-m", selected_model]` 的 argv 元素传入 `subprocess.run`（无 shell），不构成命令注入。透传任意 `gemini-*` 字符串风险极低。
+
+3. **query 参数**：通过 `subprocess.run(..., input=query)` 走 stdin，无 shell 拼接，无注入。
+
+4. **directory 参数**：仅检查 `is_dir()`，无任何根目录约束——MCP 客户端可指定任意目录执行 CLI。这本身扩大攻击面但主要危害体现在下条。
+
+5. **核心漏洞 —— files 参数任意文件读取并外传**：
+   - source：`consult_gemini_with_files` 的 `files` 列表（MCP 客户端完全可控）。
+   - `_resolve_path` 中：若 candidate 是绝对路径则直接采用（`abs_path = str(candidate_path)`）；相对路径也未阻止 `../` 穿越——只把越界的 `rel_path` 置 None 用于显示，**abs_path 照样返回**。
+   - 在 **inline 模式**（`_prepare_inline_payload`）：对 `rel_path is None`（目录外文件）没有任何拦截，直接调用 `_read_file_for_inline(abs_path)` 读取内容，拼进 payload 经 stdin 发给 gemini CLI 上传至 Google 云端 LLM。即 MCP 客户端可读取宿主机任意可读文件（如 `~/.ssh/id_rsa`、`.env`、`/etc/passwd`）并把内容外发到第三方服务。
+   - 对比：**at_command 模式**（`_prepare_at_command_prompt`）在 `rel_path is None` 时明确跳过目录外文件——说明作者意识到该威胁模型，但 inline 模式遗漏了同等防护，属不一致防御。
+   - sink：`_read_file_for_inline` 的 `handle.read()` / head+tail 读取，及后续 `subprocess.run(input=stdin_content)` 外发。
+
+6. **防御有效性核验**：inline 模式的限制只有大小/数量截断（防 DoS），与路径边界无关；黑名单/正则不存在；故无有效缓解。CWE 归类为 CWE-22（路径穿越导致任意文件读取）并可叠加 CWE-200 信息暴露（数据外发第三方 LLM）。
+
+7. **次要问题**：`directory` 无根约束 + `at_command` 模式允许在任意 cwd 内让 CLI 自行读 cwd 下文件；以及 LLM 输出原样返回给客户端（提示注入面），但主结论以第 5 条为准。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal / Arbitrary File Read) with CWE-200 information exposure", "risk_level": "High", "source": "line ~330: consult_gemini_with_files 的 files 参数（MCP 客户端可控，含绝对路径或 ../ 相对路径）", "sink": "line ~150: _read_file_for_inline 中 handle.read() 读取任意路径文件，随后经 subprocess.run 的 input 外发给 gemini CLI 上传至云端 LLM", "explanation": "_resolve_path 对绝对路径直接采纳、对 ../ 穿越仅在显示用 rel_path 上置 None 但仍返回 abs_path；inline 模式的 _prepare_inline_payload 不检查 rel_path 是否为 None 即读取并发送文件内容，而 at_command 模式有此检查，证明防御缺失属实现疏漏 -> 攻击者可通过 MCP 工具调用读取宿主任意可读文件并将内容外泄到第三方 AI 服务", "fix_suggestion": "line ~130: 在 _resolve_path 或 _prepare_inline_payload 中当 rel_path 为 None（文件位于 directory 之外）时跳过该文件，与 _prepare_at_command_prompt 保持一致；同时对 directory 参数增加允许根目录白名单校验"}
+
+### id=7841 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **入口点枚举（全文）**：MCP 工具共三个——`consult_gemini`（第 285 行附近）、`consult_gemini_with_files`、`web_search`。外部可控参数：`query`、`directory`、`files`、`model`、`timeout_seconds`、`mode`。环境变量：`GEMINI_BRIDGE_MAX_INLINE_*`、`GEMINI_BRIDGE_TIMEOUT` 等（第 22–27 行），仅由本机部署者设置，非远程 source。
+
+2. **命令注入 sink 检查**：唯一 sink 是 `subprocess.run(cmd, ...)`（第 168 行、第 253 行），`cmd = ["gemini", "-m", selected_model]`，列表形式且无 `shell=True`，参数不经过 shell 解析；`query` 通过 `input=` 走 stdin（第 174 行），不会成为 argv。无注入。
+
+3. **model 数据流**：`_normalize_model_name`（第 31 行起）先做白名单集合匹配，未命中时仅放行 `gemini-` 前缀值（第 68–69 行）。由于前缀限定为 `gemini-`，不可能以 `-` 开头构造额外 CLI 选项（如 `-yolo`/`--sandbox` 类 flag），作为单个 argv 元素传入也无需转义。防御有效。
+
+4. **路径穿越数据流**：source 为 `files` 列表，sink 为 `_read_file_for_inline` 的文件读取及 `@{rel_path}` 拼接。`_resolve_path`（第 88 行）对 root 与候选路径均 `.resolve()`（跟随符号链接后判定），再用 `relative_to(root)` 做包含性检查，绝对路径、`..`、指向目录外的符号链接均返回 `None` 并被调用方跳过（第 205 行、第 232 行）。这是基于规范化真实路径的白名单式检查，非黑名单，防御有效。
+
+5. **残余风险（低危/设计固有）**：
+   - `_resolve_path` 返回后到实际打开文件之间存在符号链接竞态窗口（TOCTOU），本地攻击者可换链读取目录外文件；但 MCP server 与攻击面均为本机信任域，风险极低。
+   - inline 模式将目录内文件内容拼入 prompt（第 219 行），存在间接提示注入可能，属此类工具的固有设计而非代码缺陷。
+   - `directory` 参数允许任意目录是工具声明的功能语义。
+   - 环境变量数值解析有 try/except 或 int() 直接调用（第 22–26 行），异常配置可致启动崩溃，非安全问题。
+
+6. **第二入口/替代通道**：无网络监听、无回调、无临时文件写、无 eval/exec/pickle；`web_search` 仅拼接字符串进 stdin，同样安全。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文核查三个 MCP 工具入口与全部数据流：subprocess.run 使用列表参数且无 shell，query 经 stdin 传递；model 经白名单加 gemini- 前缀限制，无法注入以 - 开头的 CLI 选项；files 路径经 resolve 加 relative_to 的包含性校验，绝对路径、.. 与外指符号链接均被拒绝。仅存理论性符号链接 TOCTOU 竞态与提示注入类固有设计问题，均不构成可利用的代码级安全漏洞。", "fix_suggestion": "no fix needed"}

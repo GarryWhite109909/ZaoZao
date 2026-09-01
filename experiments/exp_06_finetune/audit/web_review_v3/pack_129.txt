@@ -1,0 +1,1098 @@
+batch=129 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7952 lang=java
+[CODE]
+   1| /*
+   2|  * The contents of this file are subject to the terms of the Common Development and
+   3|  * Distribution License (the License). You may not use this file except in compliance with the
+   4|  * License.
+   5|  *
+   6|  * You can obtain a copy of the License at legal/CDDLv1.0.txt. See the License for the
+   7|  * specific language governing permission and limitations under the License.
+   8|  *
+   9|  * When distributing Covered Software, include this CDDL Header Notice in each file and include
+  10|  * the License file at legal/CDDLv1.0.txt. If applicable, add the following below the CDDL
+  11|  * Header, with the fields enclosed by brackets [] replaced by your own identifying
+  12|  * information: "Portions Copyright [year] [name of copyright owner]".
+  13|  *
+  14|  * Copyright 2006-2009 Sun Microsystems, Inc.
+  15|  * Portions Copyright 2011-2016 ForgeRock AS.
+  16|  */
+  17| package org.opends.server.extensions;
+  18| 
+  19| import static org.opends.messages.CoreMessages.*;
+  20| import static org.opends.messages.ExtensionMessages.*;
+  21| import static org.opends.server.util.ServerConstants.*;
+  22| import static org.opends.server.util.StaticUtils.*;
+  23| 
+  24| import java.util.List;
+  25| 
+  26| import org.forgerock.i18n.LocalizableMessage;
+  27| import org.forgerock.i18n.LocalizedIllegalArgumentException;
+  28| import org.forgerock.i18n.slf4j.LocalizedLogger;
+  29| import org.forgerock.opendj.config.server.ConfigChangeResult;
+  30| import org.forgerock.opendj.config.server.ConfigException;
+  31| import org.forgerock.opendj.ldap.ByteString;
+  32| import org.forgerock.opendj.ldap.DN;
+  33| import org.forgerock.opendj.ldap.ResultCode;
+  34| import org.forgerock.opendj.config.server.ConfigurationChangeListener;
+  35| import org.forgerock.opendj.server.config.server.PlainSASLMechanismHandlerCfg;
+  36| import org.forgerock.opendj.server.config.server.SASLMechanismHandlerCfg;
+  37| import org.opends.server.api.AuthenticationPolicyState;
+  38| import org.opends.server.api.IdentityMapper;
+  39| import org.opends.server.api.SASLMechanismHandler;
+  40| import org.opends.server.core.BindOperation;
+  41| import org.opends.server.core.DirectoryServer;
+  42| import org.opends.server.protocols.internal.InternalClientConnection;
+  43| import org.opends.server.types.AuthenticationInfo;
+  44| import org.opends.server.types.DirectoryException;
+  45| import org.opends.server.types.Entry;
+  46| import org.opends.server.types.InitializationException;
+  47| import org.opends.server.types.Privilege;
+  48| 
+  49| /**
+  50|  * This class provides an implementation of a SASL mechanism that uses
+  51|  * plain-text authentication.  It is based on the proposal defined in
+  52|  * draft-ietf-sasl-plain-08 in which the SASL credentials are in the form:
+  53|  * <BR>
+  54|  * <BLOCKQUOTE>[authzid] UTF8NULL authcid UTF8NULL passwd</BLOCKQUOTE>
+  55|  * <BR>
+  56|  * Note that this is a weak mechanism by itself and does not offer any
+  57|  * protection for the password, so it may need to be used in conjunction with a
+  58|  * connection security provider to prevent exposing the password.
+  59|  */
+  60| public class PlainSASLMechanismHandler
+  61|        extends SASLMechanismHandler<PlainSASLMechanismHandlerCfg>
+  62|        implements ConfigurationChangeListener<
+  63|                        PlainSASLMechanismHandlerCfg>
+  64| {
+  65|   private static final LocalizedLogger logger = LocalizedLogger.getLoggerForThisClass();
+  66| 
+  67|   /** The identity mapper that will be used to map ID strings to user entries. */
+  68|   private IdentityMapper<?> identityMapper;
+  69| 
+  70|   /** The current configuration for this SASL mechanism handler. */
+  71|   private PlainSASLMechanismHandlerCfg currentConfig;
+  72| 
+  73|   /**
+  74|    * Creates a new instance of this SASL mechanism handler.  No initialization
+  75|    * should be done in this method, as it should all be performed in the
+  76|    * <CODE>initializeSASLMechanismHandler</CODE> method.
+  77|    */
+  78|   public PlainSASLMechanismHandler()
+  79|   {
+  80|     super();
+  81|   }
+  82| 
+  83|   @Override
+  84|   public void initializeSASLMechanismHandler(
+  85|                    PlainSASLMechanismHandlerCfg configuration)
+  86|          throws ConfigException, InitializationException
+  87|   {
+  88|     configuration.addPlainChangeListener(this);
+  89|     currentConfig = configuration;
+  90| 
+  91|     // Get the identity mapper that should be used to find users.
+  92|     DN identityMapperDN = configuration.getIdentityMapperDN();
+  93|     identityMapper = DirectoryServer.getIdentityMapper(identityMapperDN);
+  94| 
+  95|     DirectoryServer.registerSASLMechanismHandler(SASL_MECHANISM_PLAIN, this);
+  96|   }
+  97| 
+  98|   @Override
+  99|   public void finalizeSASLMechanismHandler()
+ 100|   {
+ 101|     currentConfig.removePlainChangeListener(this);
+ 102|     DirectoryServer.deregisterSASLMechanismHandler(SASL_MECHANISM_PLAIN);
+ 103|   }
+ 104| 
+ 105|   @Override
+ 106|   public void processSASLBind(BindOperation bindOperation)
+ 107|   {
+ 108|     // Get the SASL credentials provided by the user and decode them.
+ 109|     String authzID  = null;
+ 110|     String authcID  = null;
+ 111|     String password = null;
+ 112| 
+ 113|     ByteString saslCredentials = bindOperation.getSASLCredentials();
+ 114|     if (saslCredentials == null)
+ 115|     {
+ 116|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 117| 
+ 118|       LocalizableMessage message = ERR_SASLPLAIN_NO_SASL_CREDENTIALS.get();
+ 119|       bindOperation.setAuthFailureReason(message);
+ 120|       return;
+ 121|     }
+ 122| 
+ 123|     String credString = saslCredentials.toString();
+ 124|     int    length     = credString.length();
+ 125|     int    nullPos1   = credString.indexOf('\u0000');
+ 126|     if (nullPos1 < 0)
+ 127|     {
+ 128|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 129| 
+ 130|       LocalizableMessage message = ERR_SASLPLAIN_NO_NULLS_IN_CREDENTIALS.get();
+ 131|       bindOperation.setAuthFailureReason(message);
+ 132|       return;
+ 133|     }
+ 134| 
+ 135|     if (nullPos1 > 0)
+ 136|     {
+ 137|       authzID = credString.substring(0, nullPos1);
+ 138|     }
+ 139| 
+ 140|     int nullPos2 = credString.indexOf('\u0000', nullPos1+1);
+ 141|     if (nullPos2 < 0)
+ 142|     {
+ 143|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 144| 
+ 145|       LocalizableMessage message = ERR_SASLPLAIN_NO_SECOND_NULL.get();
+ 146|       bindOperation.setAuthFailureReason(message);
+ 147|       return;
+ 148|     }
+ 149| 
+ 150|     if (nullPos2 == (nullPos1+1))
+ 151|     {
+ 152|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 153| 
+ 154|       LocalizableMessage message = ERR_SASLPLAIN_ZERO_LENGTH_AUTHCID.get();
+ 155|       bindOperation.setAuthFailureReason(message);
+ 156|       return;
+ 157|     }
+ 158| 
+ 159|     if (nullPos2 == (length-1))
+ 160|     {
+ 161|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 162| 
+ 163|       LocalizableMessage message = ERR_SASLPLAIN_ZERO_LENGTH_PASSWORD.get();
+ 164|       bindOperation.setAuthFailureReason(message);
+ 165|       return;
+ 166|     }
+ 167| 
+ 168|     authcID  = credString.substring(nullPos1+1, nullPos2);
+ 169|     password = credString.substring(nullPos2+1);
+ 170| 
+ 171|     // Get the user entry for the authentication ID.  Allow for an
+ 172|     // authentication ID that is just a username (as per the SASL PLAIN spec),
+ 173|     // but also allow a value in the authzid form specified in RFC 2829.
+ 174|     Entry  userEntry    = null;
+ 175|     String lowerAuthcID = toLowerCase(authcID);
+ 176|     if (lowerAuthcID.startsWith("dn:"))
+ 177|     {
+ 178|       // Try to decode the user DN and retrieve the corresponding entry.
+ 179|       DN userDN;
+ 180|       try
+ 181|       {
+ 182|         userDN = DN.valueOf(authcID.substring(3));
+ 183|       }
+ 184|       catch (LocalizedIllegalArgumentException e)
+ 185|       {
+ 186|         logger.traceException(e);
+ 187| 
+ 188|         bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 189|         bindOperation.setAuthFailureReason(
+ 190|             ERR_SASLPLAIN_CANNOT_DECODE_AUTHCID_AS_DN.get(authcID, e.getMessageObject()));
+ 191|         return;
+ 192|       }
+ 193| 
+ 194|       if (userDN.isRootDN())
+ 195|       {
+ 196|         bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 197|         bindOperation.setAuthFailureReason(ERR_SASLPLAIN_AUTHCID_IS_NULL_DN.get());
+ 198|         return;
+ 199|       }
+ 200| 
+ 201|       DN rootDN = DirectoryServer.getActualRootBindDN(userDN);
+ 202|       if (rootDN != null)
+ 203|       {
+ 204|         userDN = rootDN;
+ 205|       }
+ 206| 
+ 207|       try
+ 208|       {
+ 209|         userEntry = DirectoryServer.getEntry(userDN);
+ 210|       }
+ 211|       catch (DirectoryException de)
+ 212|       {
+ 213|         logger.traceException(de);
+ 214| 
+ 215|         bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 216| 
+ 217|         LocalizableMessage message = ERR_SASLPLAIN_CANNOT_GET_ENTRY_BY_DN.get(userDN, de.getMessageObject());
+ 218|         bindOperation.setAuthFailureReason(message);
+ 219|         return;
+ 220|       }
+ 221|     }
+ 222|     else
+ 223|     {
+ 224|       // Use the identity mapper to resolve the username to an entry.
+ 225|       if (lowerAuthcID.startsWith("u:"))
+ 226|       {
+ 227|         authcID = authcID.substring(2);
+ 228|       }
+ 229| 
+ 230|       try
+ 231|       {
+ 232|         userEntry = identityMapper.getEntryForID(authcID);
+ 233|       }
+ 234|       catch (DirectoryException de)
+ 235|       {
+ 236|         logger.traceException(de);
+ 237| 
+ 238|         bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 239| 
+ 240|         LocalizableMessage message = ERR_SASLPLAIN_CANNOT_MAP_USERNAME.get(authcID, de.getMessageObject());
+ 241|         bindOperation.setAuthFailureReason(message);
+ 242|         return;
+ 243|       }
+ 244|     }
+ 245| 
+ 246|     // At this point, we should have a user entry.  If we don't then fail.
+ 247|     if (userEntry == null)
+ 248|     {
+ 249|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 250| 
+ 251|       LocalizableMessage message = ERR_SASLPLAIN_NO_MATCHING_ENTRIES.get(authcID);
+ 252|       bindOperation.setAuthFailureReason(message);
+ 253|       return;
+ 254|     }
+ 255|     else
+ 256|     {
+ 257|       bindOperation.setSASLAuthUserEntry(userEntry);
+ 258|     }
+ 259| 
+ 260|     // If an authorization ID was provided, then make sure that it is
+ 261|     // acceptable.
+ 262|     Entry authZEntry = userEntry;
+ 263|     if (authzID != null)
+ 264|     {
+ 265|       String lowerAuthzID = toLowerCase(authzID);
+ 266|       if (lowerAuthzID.startsWith("dn:"))
+ 267|       {
+ 268|         DN authzDN;
+ 269|         try
+ 270|         {
+ 271|           authzDN = DN.valueOf(authzID.substring(3));
+ 272|         }
+ 273|         catch (LocalizedIllegalArgumentException e)
+ 274|         {
+ 275|           logger.traceException(e);
+ 276| 
+ 277|           bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 278|           bindOperation.setAuthFailureReason(ERR_SASLPLAIN_AUTHZID_INVALID_DN.get(authzID, e.getMessageObject()));
+ 279|           return;
+ 280|         }
+ 281| 
+ 282|         DN actualAuthzDN = DirectoryServer.getActualRootBindDN(authzDN);
+ 283|         if (actualAuthzDN != null)
+ 284|         {
+ 285|           authzDN = actualAuthzDN;
+ 286|         }
+ 287| 
+ 288|         if (! authzDN.equals(userEntry.getName()))
+ 289|         {
+ 290|           AuthenticationInfo tempAuthInfo =
+ 291|             new AuthenticationInfo(userEntry,
+ 292|                      DirectoryServer.isRootDN(userEntry.getName()));
+ 293|           InternalClientConnection tempConn =
+ 294|                new InternalClientConnection(tempAuthInfo);
+ 295|           if (! tempConn.hasPrivilege(Privilege.PROXIED_AUTH, bindOperation))
+ 296|           {
+ 297|             bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 298| 
+ 299|             LocalizableMessage message = ERR_SASLPLAIN_AUTHZID_INSUFFICIENT_PRIVILEGES.get(userEntry.getName());
+ 300|             bindOperation.setAuthFailureReason(message);
+ 301|             return;
+ 302|           }
+ 303| 
+ 304|           if (authzDN.isRootDN())
+ 305|           {
+ 306|             authZEntry = null;
+ 307|           }
+ 308|           else
+ 309|           {
+ 310|             try
+ 311|             {
+ 312|               authZEntry = DirectoryServer.getEntry(authzDN);
+ 313|               if (authZEntry == null)
+ 314|               {
+ 315|                 bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 316| 
+ 317|                 LocalizableMessage message = ERR_SASLPLAIN_AUTHZID_NO_SUCH_ENTRY.get(authzDN);
+ 318|                 bindOperation.setAuthFailureReason(message);
+ 319|                 return;
+ 320|               }
+ 321|             }
+ 322|             catch (DirectoryException de)
+ 323|             {
+ 324|               logger.traceException(de);
+ 325| 
+ 326|               bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 327| 
+ 328|               LocalizableMessage message = ERR_SASLPLAIN_AUTHZID_CANNOT_GET_ENTRY.get(authzDN, de.getMessageObject());
+ 329|               bindOperation.setAuthFailureReason(message);
+ 330|               return;
+ 331|             }
+ 332|           }
+ 333|         }
+ 334|       }
+ 335|       else
+ 336|       {
+ 337|         String idStr;
+ 338|         if (lowerAuthzID.startsWith("u:"))
+ 339|         {
+ 340|           idStr = authzID.substring(2);
+ 341|         }
+ 342|         else
+ 343|         {
+ 344|           idStr = authzID;
+ 345|         }
+ 346| 
+ 347|         if (idStr.length() == 0)
+ 348|         {
+ 349|           authZEntry = null;
+ 350|         }
+ 351|         else
+ 352|         {
+ 353|           try
+ 354|           {
+ 355|             authZEntry = identityMapper.getEntryForID(idStr);
+ 356|             if (authZEntry == null)
+ 357|             {
+ 358|               bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 359| 
+ 360|               LocalizableMessage message = ERR_SASLPLAIN_AUTHZID_NO_MAPPED_ENTRY.get(
+ 361|                       authzID);
+ 362|               bindOperation.setAuthFailureReason(message);
+ 363|               return;
+ 364|             }
+ 365|           }
+ 366|           catch (DirectoryException de)
+ 367|           {
+ 368|             logger.traceException(de);
+ 369| 
+ 370|             bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 371| 
+ 372|             LocalizableMessage message = ERR_SASLPLAIN_AUTHZID_CANNOT_MAP_AUTHZID.get(
+ 373|                     authzID, de.getMessageObject());
+ 374|             bindOperation.setAuthFailureReason(message);
+ 375|             return;
+ 376|           }
+ 377|         }
+ 378| 
+ 379|         if (authZEntry == null || !authZEntry.getName().equals(userEntry.getName()))
+ 380|         {
+ 381|           AuthenticationInfo tempAuthInfo =
+ 382|             new AuthenticationInfo(userEntry,
+ 383|                      DirectoryServer.isRootDN(userEntry.getName()));
+ 384|           InternalClientConnection tempConn =
+ 385|                new InternalClientConnection(tempAuthInfo);
+ 386|           if (! tempConn.hasPrivilege(Privilege.PROXIED_AUTH, bindOperation))
+ 387|           {
+ 388|             bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 389| 
+ 390|             LocalizableMessage message = ERR_SASLPLAIN_AUTHZID_INSUFFICIENT_PRIVILEGES.get(userEntry.getName());
+ 391|             bindOperation.setAuthFailureReason(message);
+ 392|             return;
+ 393|           }
+ 394|         }
+ 395|       }
+ 396|     }
+ 397| 
+ 398|     // Get the password policy for the user and use it to determine if the
+ 399|     // provided password was correct.
+ 400|     try
+ 401|     {
+ 402|       // FIXME: we should store store the auth state in with the bind operation
+ 403|       // so that any state updates, such as cached passwords, are persisted to
+ 404|       // the user's entry when the bind completes.
+ 405|       AuthenticationPolicyState authState = AuthenticationPolicyState.forUser(
+ 406|           userEntry, false);
+ 407| 
+ 408|       if (authState.isDisabled())
+ 409|       {
+ 410|         // Check to see if the user is administratively disabled or locked.
+ 411|         bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 412|         LocalizableMessage message = ERR_BIND_OPERATION_ACCOUNT_DISABLED.get();
+ 413|         bindOperation.setAuthFailureReason(message);
+ 414|         return;
+ 415|       }
+ 416| 
+ 417|       if (!authState.passwordMatches(ByteString.valueOfUtf8(password)))
+ 418|       {
+ 419|         bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 420|         LocalizableMessage message = ERR_SASLPLAIN_INVALID_PASSWORD.get();
+ 421|         bindOperation.setAuthFailureReason(message);
+ 422|         return;
+ 423|       }
+ 424|     }
+ 425|     catch (Exception e)
+ 426|     {
+ 427|       logger.traceException(e);
+ 428| 
+ 429|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 430| 
+ 431|       LocalizableMessage message = ERR_SASLPLAIN_CANNOT_CHECK_PASSWORD_VALIDITY.get(userEntry.getName(), e);
+ 432|       bindOperation.setAuthFailureReason(message);
+ 433|       return;
+ 434|     }
+ 435| 
+ 436|     // If we've gotten here, then the authentication was successful.
+ 437|     bindOperation.setResultCode(ResultCode.SUCCESS);
+ 438| 
+ 439|     AuthenticationInfo authInfo =
+ 440|          new AuthenticationInfo(userEntry, authZEntry, SASL_MECHANISM_PLAIN,
+ 441|                                 bindOperation.getSASLCredentials(),
+ 442|                                 DirectoryServer.isRootDN(userEntry.getName()));
+ 443|     bindOperation.setAuthenticationInfo(authInfo);
+ 444|     return;
+ 445|   }
+ 446| 
+ 447|   @Override
+ 448|   public boolean isPasswordBased(String mechanism)
+ 449|   {
+ 450|     // This is a password-based mechanism.
+ 451|     return true;
+ 452|   }
+ 453| 
+ 454|   @Override
+ 455|   public boolean isSecure(String mechanism)
+ 456|   {
+ 457|     // This is not a secure mechanism.
+ 458|     return false;
+ 459|   }
+ 460| 
+ 461|   @Override
+ 462|   public boolean isConfigurationAcceptable(
+ 463|                       SASLMechanismHandlerCfg configuration,
+ 464|                       List<LocalizableMessage> unacceptableReasons)
+ 465|   {
+ 466|     PlainSASLMechanismHandlerCfg config =
+ 467|          (PlainSASLMechanismHandlerCfg) configuration;
+ 468|     return isConfigurationChangeAcceptable(config, unacceptableReasons);
+ 469|   }
+ 470| 
+ 471|   @Override
+ 472|   public boolean isConfigurationChangeAcceptable(
+ 473|                       PlainSASLMechanismHandlerCfg configuration,
+ 474|                       List<LocalizableMessage> unacceptableReasons)
+ 475|   {
+ 476|     return true;
+ 477|   }
+ 478| 
+ 479|   @Override
+ 480|   public ConfigChangeResult applyConfigurationChange(
+ 481|               PlainSASLMechanismHandlerCfg configuration)
+ 482|   {
+ 483|     final ConfigChangeResult ccr = new ConfigChangeResult();
+ 484| 
+ 485|     // Get the identity mapper that should be used to find users.
+ 486|     DN identityMapperDN = configuration.getIdentityMapperDN();
+ 487|     identityMapper = DirectoryServer.getIdentityMapper(identityMapperDN);
+ 488|     currentConfig  = configuration;
+ 489| 
+ 490|     return ccr;
+ 491|   }
+ 492| }
+ 493| 
+ 494| 
+
+### id=7953 lang=java
+[CODE]
+   1| /*
+   2|  * The contents of this file are subject to the terms of the Common Development and
+   3|  * Distribution License (the License). You may not use this file except in compliance with the
+   4|  * License.
+   5|  *
+   6|  * You can obtain a copy of the License at legal/CDDLv1.0.txt. See the License for the
+   7|  * specific language governing permission and limitations under the License.
+   8|  *
+   9|  * When distributing Covered Software, include this CDDL Header Notice in each file and include
+  10|  * the License file at legal/CDDLv1.0.txt. If applicable, add the following below the CDDL
+  11|  * Header, with the fields enclosed by brackets [] replaced by your own identifying
+  12|  * information: "Portions Copyright [year] [name of copyright owner]".
+  13|  *
+  14|  * Copyright 2006-2009 Sun Microsystems, Inc.
+  15|  * Portions Copyright 2011-2016 ForgeRock AS.
+  16|  * Portions Copyrighted 2026 3A Systems, LLC.
+  17|  */
+  18| package org.opends.server.extensions;
+  19| 
+  20| import static org.opends.messages.CoreMessages.*;
+  21| import static org.opends.messages.ExtensionMessages.*;
+  22| import static org.opends.server.util.ServerConstants.*;
+  23| import static org.opends.server.util.StaticUtils.*;
+  24| 
+  25| import java.util.List;
+  26| 
+  27| import org.forgerock.i18n.LocalizableMessage;
+  28| import org.forgerock.i18n.LocalizedIllegalArgumentException;
+  29| import org.forgerock.i18n.slf4j.LocalizedLogger;
+  30| import org.forgerock.opendj.config.server.ConfigChangeResult;
+  31| import org.forgerock.opendj.config.server.ConfigException;
+  32| import org.forgerock.opendj.ldap.ByteString;
+  33| import org.forgerock.opendj.ldap.DN;
+  34| import org.forgerock.opendj.ldap.ResultCode;
+  35| import org.forgerock.opendj.config.server.ConfigurationChangeListener;
+  36| import org.forgerock.opendj.server.config.server.PlainSASLMechanismHandlerCfg;
+  37| import org.forgerock.opendj.server.config.server.SASLMechanismHandlerCfg;
+  38| import org.opends.server.api.AuthenticationPolicyState;
+  39| import org.opends.server.api.IdentityMapper;
+  40| import org.opends.server.api.SASLMechanismHandler;
+  41| import org.opends.server.core.BindOperation;
+  42| import org.opends.server.core.DirectoryServer;
+  43| import org.opends.server.protocols.internal.InternalClientConnection;
+  44| import org.opends.server.types.AuthenticationInfo;
+  45| import org.opends.server.types.DirectoryException;
+  46| import org.opends.server.types.Entry;
+  47| import org.opends.server.types.InitializationException;
+  48| import org.opends.server.types.Privilege;
+  49| 
+  50| /**
+  51|  * This class provides an implementation of a SASL mechanism that uses
+  52|  * plain-text authentication.  It is based on the proposal defined in
+  53|  * draft-ietf-sasl-plain-08 in which the SASL credentials are in the form:
+  54|  * <BR>
+  55|  * <BLOCKQUOTE>[authzid] UTF8NULL authcid UTF8NULL passwd</BLOCKQUOTE>
+  56|  * <BR>
+  57|  * Note that this is a weak mechanism by itself and does not offer any
+  58|  * protection for the password, so it may need to be used in conjunction with a
+  59|  * connection security provider to prevent exposing the password.
+  60|  */
+  61| public class PlainSASLMechanismHandler
+  62|        extends SASLMechanismHandler<PlainSASLMechanismHandlerCfg>
+  63|        implements ConfigurationChangeListener<
+  64|                        PlainSASLMechanismHandlerCfg>
+  65| {
+  66|   private static final LocalizedLogger logger = LocalizedLogger.getLoggerForThisClass();
+  67| 
+  68|   /** The identity mapper that will be used to map ID strings to user entries. */
+  69|   private IdentityMapper<?> identityMapper;
+  70| 
+  71|   /** The current configuration for this SASL mechanism handler. */
+  72|   private PlainSASLMechanismHandlerCfg currentConfig;
+  73| 
+  74|   /**
+  75|    * Creates a new instance of this SASL mechanism handler.  No initialization
+  76|    * should be done in this method, as it should all be performed in the
+  77|    * <CODE>initializeSASLMechanismHandler</CODE> method.
+  78|    */
+  79|   public PlainSASLMechanismHandler()
+  80|   {
+  81|     super();
+  82|   }
+  83| 
+  84|   @Override
+  85|   public void initializeSASLMechanismHandler(
+  86|                    PlainSASLMechanismHandlerCfg configuration)
+  87|          throws ConfigException, InitializationException
+  88|   {
+  89|     configuration.addPlainChangeListener(this);
+  90|     currentConfig = configuration;
+  91| 
+  92|     // Get the identity mapper that should be used to find users.
+  93|     DN identityMapperDN = configuration.getIdentityMapperDN();
+  94|     identityMapper = DirectoryServer.getIdentityMapper(identityMapperDN);
+  95| 
+  96|     DirectoryServer.registerSASLMechanismHandler(SASL_MECHANISM_PLAIN, this);
+  97|   }
+  98| 
+  99|   @Override
+ 100|   public void finalizeSASLMechanismHandler()
+ 101|   {
+ 102|     currentConfig.removePlainChangeListener(this);
+ 103|     DirectoryServer.deregisterSASLMechanismHandler(SASL_MECHANISM_PLAIN);
+ 104|   }
+ 105| 
+ 106|   @Override
+ 107|   public void processSASLBind(BindOperation bindOperation)
+ 108|   {
+ 109|     // Get the SASL credentials provided by the user and decode them.
+ 110|     String authzID  = null;
+ 111|     String authcID  = null;
+ 112|     String password = null;
+ 113| 
+ 114|     ByteString saslCredentials = bindOperation.getSASLCredentials();
+ 115|     if (saslCredentials == null)
+ 116|     {
+ 117|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 118| 
+ 119|       LocalizableMessage message = ERR_SASLPLAIN_NO_SASL_CREDENTIALS.get();
+ 120|       bindOperation.setAuthFailureReason(message);
+ 121|       return;
+ 122|     }
+ 123| 
+ 124|     String credString = saslCredentials.toString();
+ 125|     int    length     = credString.length();
+ 126|     int    nullPos1   = credString.indexOf('\u0000');
+ 127|     if (nullPos1 < 0)
+ 128|     {
+ 129|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 130| 
+ 131|       LocalizableMessage message = ERR_SASLPLAIN_NO_NULLS_IN_CREDENTIALS.get();
+ 132|       bindOperation.setAuthFailureReason(message);
+ 133|       return;
+ 134|     }
+ 135| 
+ 136|     if (nullPos1 > 0)
+ 137|     {
+ 138|       authzID = credString.substring(0, nullPos1);
+ 139|     }
+ 140| 
+ 141|     int nullPos2 = credString.indexOf('\u0000', nullPos1+1);
+ 142|     if (nullPos2 < 0)
+ 143|     {
+ 144|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 145| 
+ 146|       LocalizableMessage message = ERR_SASLPLAIN_NO_SECOND_NULL.get();
+ 147|       bindOperation.setAuthFailureReason(message);
+ 148|       return;
+ 149|     }
+ 150| 
+ 151|     if (nullPos2 == (nullPos1+1))
+ 152|     {
+ 153|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 154| 
+ 155|       LocalizableMessage message = ERR_SASLPLAIN_ZERO_LENGTH_AUTHCID.get();
+ 156|       bindOperation.setAuthFailureReason(message);
+ 157|       return;
+ 158|     }
+ 159| 
+ 160|     if (nullPos2 == (length-1))
+ 161|     {
+ 162|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 163| 
+ 164|       LocalizableMessage message = ERR_SASLPLAIN_ZERO_LENGTH_PASSWORD.get();
+ 165|       bindOperation.setAuthFailureReason(message);
+ 166|       return;
+ 167|     }
+ 168| 
+ 169|     authcID  = credString.substring(nullPos1+1, nullPos2);
+ 170|     password = credString.substring(nullPos2+1);
+ 171| 
+ 172|     // Get the user entry for the authentication ID.  Allow for an
+ 173|     // authentication ID that is just a username (as per the SASL PLAIN spec),
+ 174|     // but also allow a value in the authzid form specified in RFC 2829.
+ 175|     Entry  userEntry    = null;
+ 176|     String lowerAuthcID = toLowerCase(authcID);
+ 177|     if (lowerAuthcID.startsWith("dn:"))
+ 178|     {
+ 179|       // Try to decode the user DN and retrieve the corresponding entry.
+ 180|       DN userDN;
+ 181|       try
+ 182|       {
+ 183|         userDN = DN.valueOf(authcID.substring(3));
+ 184|       }
+ 185|       catch (LocalizedIllegalArgumentException e)
+ 186|       {
+ 187|         logger.traceException(e);
+ 188| 
+ 189|         bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 190|         bindOperation.setAuthFailureReason(
+ 191|             ERR_SASLPLAIN_CANNOT_DECODE_AUTHCID_AS_DN.get(authcID, e.getMessageObject()));
+ 192|         return;
+ 193|       }
+ 194| 
+ 195|       if (userDN.isRootDN())
+ 196|       {
+ 197|         bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 198|         bindOperation.setAuthFailureReason(ERR_SASLPLAIN_AUTHCID_IS_NULL_DN.get());
+ 199|         return;
+ 200|       }
+ 201| 
+ 202|       DN rootDN = DirectoryServer.getActualRootBindDN(userDN);
+ 203|       if (rootDN != null)
+ 204|       {
+ 205|         userDN = rootDN;
+ 206|       }
+ 207| 
+ 208|       try
+ 209|       {
+ 210|         userEntry = DirectoryServer.getEntry(userDN);
+ 211|       }
+ 212|       catch (DirectoryException de)
+ 213|       {
+ 214|         logger.traceException(de);
+ 215| 
+ 216|         bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 217| 
+ 218|         LocalizableMessage message = ERR_SASLPLAIN_CANNOT_GET_ENTRY_BY_DN.get(userDN, de.getMessageObject());
+ 219|         bindOperation.setAuthFailureReason(message);
+ 220|         return;
+ 221|       }
+ 222|     }
+ 223|     else
+ 224|     {
+ 225|       // Use the identity mapper to resolve the username to an entry.
+ 226|       if (lowerAuthcID.startsWith("u:"))
+ 227|       {
+ 228|         authcID = authcID.substring(2);
+ 229|       }
+ 230| 
+ 231|       try
+ 232|       {
+ 233|         userEntry = identityMapper.getEntryForID(authcID);
+ 234|       }
+ 235|       catch (DirectoryException de)
+ 236|       {
+ 237|         logger.traceException(de);
+ 238| 
+ 239|         bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 240| 
+ 241|         LocalizableMessage message = ERR_SASLPLAIN_CANNOT_MAP_USERNAME.get(authcID, de.getMessageObject());
+ 242|         bindOperation.setAuthFailureReason(message);
+ 243|         return;
+ 244|       }
+ 245|     }
+ 246| 
+ 247|     // At this point, we should have a user entry.  If we don't then fail.
+ 248|     if (userEntry == null)
+ 249|     {
+ 250|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 251| 
+ 252|       LocalizableMessage message = ERR_SASLPLAIN_NO_MATCHING_ENTRIES.get(authcID);
+ 253|       bindOperation.setAuthFailureReason(message);
+ 254|       return;
+ 255|     }
+ 256|     else
+ 257|     {
+ 258|       bindOperation.setSASLAuthUserEntry(userEntry);
+ 259|     }
+ 260| 
+ 261|     // If an authorization ID was provided, then make sure that it is
+ 262|     // acceptable.
+ 263|     Entry authZEntry = userEntry;
+ 264|     if (authzID != null)
+ 265|     {
+ 266|       String lowerAuthzID = toLowerCase(authzID);
+ 267|       if (lowerAuthzID.startsWith("dn:"))
+ 268|       {
+ 269|         DN authzDN;
+ 270|         try
+ 271|         {
+ 272|           authzDN = DN.valueOf(authzID.substring(3));
+ 273|         }
+ 274|         catch (LocalizedIllegalArgumentException e)
+ 275|         {
+ 276|           logger.traceException(e);
+ 277| 
+ 278|           bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 279|           bindOperation.setAuthFailureReason(ERR_SASLPLAIN_AUTHZID_INVALID_DN.get(authzID, e.getMessageObject()));
+ 280|           return;
+ 281|         }
+ 282| 
+ 283|         DN actualAuthzDN = DirectoryServer.getActualRootBindDN(authzDN);
+ 284|         if (actualAuthzDN != null)
+ 285|         {
+ 286|           authzDN = actualAuthzDN;
+ 287|         }
+ 288| 
+ 289|         if (! authzDN.equals(userEntry.getName()))
+ 290|         {
+ 291|           AuthenticationInfo tempAuthInfo =
+ 292|             new AuthenticationInfo(userEntry,
+ 293|                      DirectoryServer.isRootDN(userEntry.getName()));
+ 294|           InternalClientConnection tempConn =
+ 295|                new InternalClientConnection(tempAuthInfo);
+ 296|           if (! tempConn.hasPrivilege(Privilege.PROXIED_AUTH, bindOperation))
+ 297|           {
+ 298|             bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 299| 
+ 300|             LocalizableMessage message = ERR_SASLPLAIN_AUTHZID_INSUFFICIENT_PRIVILEGES.get(userEntry.getName());
+ 301|             bindOperation.setAuthFailureReason(message);
+ 302|             return;
+ 303|           }
+ 304| 
+ 305|           if (authzDN.isRootDN())
+ 306|           {
+ 307|             authZEntry = null;
+ 308|           }
+ 309|           else
+ 310|           {
+ 311|             try
+ 312|             {
+ 313|               authZEntry = DirectoryServer.getEntry(authzDN);
+ 314|               if (authZEntry == null)
+ 315|               {
+ 316|                 bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 317| 
+ 318|                 LocalizableMessage message = ERR_SASLPLAIN_AUTHZID_NO_SUCH_ENTRY.get(authzDN);
+ 319|                 bindOperation.setAuthFailureReason(message);
+ 320|                 return;
+ 321|               }
+ 322|             }
+ 323|             catch (DirectoryException de)
+ 324|             {
+ 325|               logger.traceException(de);
+ 326| 
+ 327|               bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 328| 
+ 329|               LocalizableMessage message = ERR_SASLPLAIN_AUTHZID_CANNOT_GET_ENTRY.get(authzDN, de.getMessageObject());
+ 330|               bindOperation.setAuthFailureReason(message);
+ 331|               return;
+ 332|             }
+ 333|           }
+ 334| 
+ 335|           if (! checkProxyAccess(bindOperation, userEntry, authZEntry))
+ 336|           {
+ 337|             return;
+ 338|           }
+ 339|         }
+ 340|       }
+ 341|       else
+ 342|       {
+ 343|         String idStr;
+ 344|         if (lowerAuthzID.startsWith("u:"))
+ 345|         {
+ 346|           idStr = authzID.substring(2);
+ 347|         }
+ 348|         else
+ 349|         {
+ 350|           idStr = authzID;
+ 351|         }
+ 352| 
+ 353|         if (idStr.length() == 0)
+ 354|         {
+ 355|           authZEntry = null;
+ 356|         }
+ 357|         else
+ 358|         {
+ 359|           try
+ 360|           {
+ 361|             authZEntry = identityMapper.getEntryForID(idStr);
+ 362|             if (authZEntry == null)
+ 363|             {
+ 364|               bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 365| 
+ 366|               LocalizableMessage message = ERR_SASLPLAIN_AUTHZID_NO_MAPPED_ENTRY.get(
+ 367|                       authzID);
+ 368|               bindOperation.setAuthFailureReason(message);
+ 369|               return;
+ 370|             }
+ 371|           }
+ 372|           catch (DirectoryException de)
+ 373|           {
+ 374|             logger.traceException(de);
+ 375| 
+ 376|             bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 377| 
+ 378|             LocalizableMessage message = ERR_SASLPLAIN_AUTHZID_CANNOT_MAP_AUTHZID.get(
+ 379|                     authzID, de.getMessageObject());
+ 380|             bindOperation.setAuthFailureReason(message);
+ 381|             return;
+ 382|           }
+ 383|         }
+ 384| 
+ 385|         if (authZEntry == null || !authZEntry.getName().equals(userEntry.getName()))
+ 386|         {
+ 387|           AuthenticationInfo tempAuthInfo =
+ 388|             new AuthenticationInfo(userEntry,
+ 389|                      DirectoryServer.isRootDN(userEntry.getName()));
+ 390|           InternalClientConnection tempConn =
+ 391|                new InternalClientConnection(tempAuthInfo);
+ 392|           if (! tempConn.hasPrivilege(Privilege.PROXIED_AUTH, bindOperation))
+ 393|           {
+ 394|             bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 395| 
+ 396|             LocalizableMessage message = ERR_SASLPLAIN_AUTHZID_INSUFFICIENT_PRIVILEGES.get(userEntry.getName());
+ 397|             bindOperation.setAuthFailureReason(message);
+ 398|             return;
+ 399|           }
+ 400| 
+ 401|           if (! checkProxyAccess(bindOperation, userEntry, authZEntry))
+ 402|           {
+ 403|             return;
+ 404|           }
+ 405|         }
+ 406|       }
+ 407|     }
+ 408| 
+ 409|     // Get the password policy for the user and use it to determine if the
+ 410|     // provided password was correct.
+ 411|     try
+ 412|     {
+ 413|       // FIXME: we should store store the auth state in with the bind operation
+ 414|       // so that any state updates, such as cached passwords, are persisted to
+ 415|       // the user's entry when the bind completes.
+ 416|       AuthenticationPolicyState authState = AuthenticationPolicyState.forUser(
+ 417|           userEntry, false);
+ 418| 
+ 419|       if (authState.isDisabled())
+ 420|       {
+ 421|         // Check to see if the user is administratively disabled or locked.
+ 422|         bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 423|         LocalizableMessage message = ERR_BIND_OPERATION_ACCOUNT_DISABLED.get();
+ 424|         bindOperation.setAuthFailureReason(message);
+ 425|         return;
+ 426|       }
+ 427| 
+ 428|       if (!authState.passwordMatches(ByteString.valueOfUtf8(password)))
+ 429|       {
+ 430|         bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 431|         LocalizableMessage message = ERR_SASLPLAIN_INVALID_PASSWORD.get();
+ 432|         bindOperation.setAuthFailureReason(message);
+ 433|         return;
+ 434|       }
+ 435|     }
+ 436|     catch (Exception e)
+ 437|     {
+ 438|       logger.traceException(e);
+ 439| 
+ 440|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 441| 
+ 442|       LocalizableMessage message = ERR_SASLPLAIN_CANNOT_CHECK_PASSWORD_VALIDITY.get(userEntry.getName(), e);
+ 443|       bindOperation.setAuthFailureReason(message);
+ 444|       return;
+ 445|     }
+ 446| 
+ 447|     // If we've gotten here, then the authentication was successful.
+ 448|     bindOperation.setResultCode(ResultCode.SUCCESS);
+ 449| 
+ 450|     AuthenticationInfo authInfo =
+ 451|          new AuthenticationInfo(userEntry, authZEntry, SASL_MECHANISM_PLAIN,
+ 452|                                 bindOperation.getSASLCredentials(),
+ 453|                                 DirectoryServer.isRootDN(userEntry.getName()));
+ 454|     bindOperation.setAuthenticationInfo(authInfo);
+ 455|     return;
+ 456|   }
+ 457| 
+ 458|   /**
+ 459|    * Checks whether the authenticated user is allowed by the access control
+ 460|    * subsystem to assume the given authorization identity (i.e. holds the
+ 461|    * "proxy" access control right for the target entry), and if not sets the
+ 462|    * bind failure result. This delegates to {@link SASLContext#hasProxyAccess}
+ 463|    * so that SASL PLAIN enforces the same ACI scope check as the proxied
+ 464|    * authorization controls and the DIGEST-MD5 / GSSAPI {@code authzid}, in
+ 465|    * addition to the {@code PROXIED_AUTH} privilege check. The denial uses the
+ 466|    * same {@code INVALID_CREDENTIALS} result and message as DIGEST-MD5 / GSSAPI
+ 467|    * so a client cannot distinguish a missing privilege from a missing proxy
+ 468|    * grant.
+ 469|    *
+ 470|    * @param  bindOperation  The bind operation being processed.
+ 471|    * @param  authEntry      The authenticated user entry (the proxy user).
+ 472|    * @param  authZEntry     The entry to be assumed, or {@code null} for the
+ 473|    *                        anonymous / root authorization identity.
+ 474|    * @return  {@code true} if the access control configuration permits the
+ 475|    *          authenticated user to assume the authorization identity.
+ 476|    */
+ 477|   private boolean checkProxyAccess(BindOperation bindOperation, Entry authEntry, Entry authZEntry)
+ 478|   {
+ 479|     if (! SASLContext.hasProxyAccess(authEntry, authZEntry, bindOperation))
+ 480|     {
+ 481|       bindOperation.setResultCode(ResultCode.INVALID_CREDENTIALS);
+ 482|       bindOperation.setAuthFailureReason(
+ 483|           ERR_SASL_AUTHZID_INSUFFICIENT_ACCESS.get(authEntry.getName()));
+ 484|       return false;
+ 485|     }
+ 486|     return true;
+ 487|   }
+ 488| 
+ 489|   @Override
+ 490|   public boolean isPasswordBased(String mechanism)
+ 491|   {
+ 492|     // This is a password-based mechanism.
+ 493|     return true;
+ 494|   }
+ 495| 
+ 496|   @Override
+ 497|   public boolean isSecure(String mechanism)
+ 498|   {
+ 499|     // This is not a secure mechanism.
+ 500|     return false;
+ 501|   }
+ 502| 
+ 503|   @Override
+ 504|   public boolean isConfigurationAcceptable(
+ 505|                       SASLMechanismHandlerCfg configuration,
+ 506|                       List<LocalizableMessage> unacceptableReasons)
+ 507|   {
+ 508|     PlainSASLMechanismHandlerCfg config =
+ 509|          (PlainSASLMechanismHandlerCfg) configuration;
+ 510|     return isConfigurationChangeAcceptable(config, unacceptableReasons);
+ 511|   }
+ 512| 
+ 513|   @Override
+ 514|   public boolean isConfigurationChangeAcceptable(
+ 515|                       PlainSASLMechanismHandlerCfg configuration,
+ 516|                       List<LocalizableMessage> unacceptableReasons)
+ 517|   {
+ 518|     return true;
+ 519|   }
+ 520| 
+ 521|   @Override
+ 522|   public ConfigChangeResult applyConfigurationChange(
+ 523|               PlainSASLMechanismHandlerCfg configuration)
+ 524|   {
+ 525|     final ConfigChangeResult ccr = new ConfigChangeResult();
+ 526| 
+ 527|     // Get the identity mapper that should be used to find users.
+ 528|     DN identityMapperDN = configuration.getIdentityMapperDN();
+ 529|     identityMapper = DirectoryServer.getIdentityMapper(identityMapperDN);
+ 530|     currentConfig  = configuration;
+ 531| 
+ 532|     return ccr;
+ 533|   }
+ 534| }
+ 535| 
+ 536| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7952 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **入口点枚举（全文通读）**
+   - 唯一外部入口：`processSASLBind(BindOperation)`（约第 105 行起），source 为 `bindOperation.getSASLCredentials()`（第 109 行附近），即客户端 LDAP Bind 请求中的 SASL PLAIN 凭据字符串。
+   - 次要入口：配置回调 `applyConfigurationChange` / `isConfigurationChangeAcceptable`（文件末尾），仅读取管理端配置的 identity mapper DN，无用户可控数据流入危险 sink，且 `isConfigurationChangeAcceptable` 直接返回 true 属于宽松但非可利用漏洞（mapper DN 由管理员配置）。
+
+2. **凭据解析数据流**
+   - 第 116–150 行：按 `\u0000` 切分出 authzID、authcID、password。边界检查完整（缺 NULL、空 authcID、空密码均拒绝），无越界或注入问题。切分结果只进入 DN 解析、identity mapper 查询和密码比较，不进入命令/SQL/反序列化 sink。
+
+3. **authcID 处理**
+   - `dn:` 分支（第 160 行起）：`DN.valueOf` 解析失败即拒绝；root DN 被显式拒绝；`getActualRootBindDN` 归一化后取条目。取不到条目即失败。无绕过路径。
+   - 否则走 `identityMapper.getEntryForID(authcID)`，异常/null 均拒绝。
+
+4. **authzID 处理（关键授权检查）**
+   - `dn:` 分支：若 authzDN ≠ 认证用户 DN，则构造临时 InternalClientConnection 并强制校验 `PROXIED_AUTH` 特权（第 245 行附近），缺失即拒绝——防御有效。
+   - `u:` 分支：空 idStr 置 authZEntry=null，但随后第 300 行附近的 `authZEntry == null || !equals(...)` 同样触发特权校验——防御有效。
+   - 结论：不存在未授权的代理身份切换（无 CWE-285 可利用路径）。
+
+5. **口令验证**
+   - 第 330 行附近：先检查账户禁用，再 `authState.passwordMatches(...)` 使用策略层比较（内部为哈希比较），明文口令未落日志（错误消息不含 password）。无时序旁路可在此文件层面确认的高危问题。
+
+6. **次要观察（非可利用漏洞）**
+   - 第 205 行附近在口令验证**之前**调用 `setSASLAuthUserEntry(userEntry)`，理论上把候选条目提前挂到操作对象上；但后续任何失败路径均返回 INVALID_CREDENTIALS，且该值仅在 bind 成功语义下被消费，不构成认证绕过。
+   - `isSecure` 返回 false，正确提示需 TLS 保护，属设计声明而非缺陷。
+
+7. **第二入口/替代通道**：无其他读环境变量、文件、回调参数的通道；全文仅上述入口。
+
+综合：所有 source→sink 流均有有效防御（结构化解析 + 特权强制校验 + 策略层口令比较），未发现可利用的安全漏洞。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-208 (信息泄露/时序侧信道, 低危观察项)", "risk_level": "Low", "source": "line ~109: bindOperation.getSASLCredentials() 客户端提供的 SASL PLAIN 凭据", "sink": "line ~205: 口令验证前调用 bindOperation.setSASLAuthUserEntry(userEntry) 提前暴露候选用户条目", "explanation": "逐条验证了全部数据流：凭据解析边界检查完整；authcID 的 dn 与 u 分支均正确处理异常与空条目；authzID 的 dn 与 u 分支在身份不一致时均强制校验 PROXIED_AUTH 特权，无法未授权代理；口令经 AuthenticationPolicyState.passwordMatches 安全比较且不写入日志。唯一可指出的弱点是 setSASLAuthUserEntry 在口令验证之前执行，可能向下游监听器提前泄露候选条目引用并引入轻微时序差异，但不构成认证绕过", "fix_suggestion": "line ~205: 将 bindOperation.setSASLAuthUserEntry(userEntry) 移至 passwordMatches 校验成功之后再调用，确保仅在认证成功时暴露用户条目"}
+
+### id=7953 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **入口点枚举（全文通读）**：本文件唯一外部入口是 `processSASLBind`（第 88 行起），由 LDAP Bind 操作回调触发。source 为 `bindOperation.getSASLCredentials()`（第 96 行），解析出三个攻击者可控值：`authzID`、`authcID`、`password`。其余入口仅为配置回调 `applyConfigurationChange` / `isConfigurationChangeAcceptable`（第 262–285 行），仅接受管理员配置的 identity mapper DN，无用户输入，无风险。
+
+2. **数据流 1：authcID 以 `dn:` 开头（第 133–172 行）**：`authcID.substring(3)` → `DN.valueOf()`（第 139 行）。`DN.valueOf` 是类型安全的 DN 解析器，非法输入抛异常被捕获并返回 INVALID_CREDENTIALS，无注入 sink。随后显式拒绝 root DN（第 145 行），再经 `getActualRootBindDN` 归一化后取 entry——但注意：此处仅取得 entry，密码校验在后面统一执行（第 246 行 `passwordMatches`），不存在绕过认证直接登录的路径。
+
+3. **数据流 2：authcID 走 identity mapper（第 173–193 行）**：`identityMapper.getEntryForID(authcID)`。mapper 内部自行构造搜索过滤器并做转义/编码，本文件未拼接任何过滤字符串，非本文件可利用面。
+
+4. **数据流 3：authzid 授权身份（第 199–240 行）——关键越权检查点**：
+   - `dn:` 形式：若 `authzDN` 与认证用户 DN 不同，则构造临时连接并强制检查 `Privilege.PROXIED_AUTH`（第 213–222 行），随后调用 `checkProxyAccess`（第 238 行）→ `SASLContext.hasProxyAccess` 执行 ACI 范围检查；任一失败即拒绝。防御有效且不可绕过（非黑名单/正则）。
+   - `u:` 或裸 ID 形式（第 226–257 行）：同样逻辑——映射出的 authZEntry 与 userEntry 不一致时，先查 PROXIED_AUTH 特权，再做 ACI 检查；空 authzid 置 null 也走同一特权+ACI 检查分支，与 DIGEST-MD5/GSSAPI 行为一致。
+   - 两分支均无“先授权后验证”或漏检路径。
+
+5. **数据流 4：password（第 245–250 行）**：仅传入 `AuthenticationPolicyState.passwordMatches` 做哈希比对，失败即拒绝；账户禁用状态先行检查（第 235 行）。无明文存储、无日志泄露（错误消息只含攻击者自己提交的 authcID/authzID，不含密码）。
+
+6. **第二通道/替代入口核查**：文件中无文件 IO、环境变量、反序列化、命令执行、JNDI 查找等 sink；`isSecure` 返回 false 仅是机制声明，提示需配合 TLS，属设计文档而非漏洞。
+
+7. **结论**：所有 source→sink 流均有结构性防御（类型化 DN 解析、特权+ACI 双重代理授权检查、集中式口令校验），无可绕过点，全文未见注入或越权路径。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文唯一入口 processSASLBind 中，authcID 经 DN.valueOf 类型化解析或 identityMapper 安全查询，authzid 变更授权身份时强制执行 PROXIED_AUTH 特权与 SASLContext.hasProxyAccess 的 ACI 双重检查，password 仅经 passwordMatches 哈希比对，无注入或越权 sink，防御均为结构性检查而非黑名单，无法绕过。", "fix_suggestion": "no fix needed"}

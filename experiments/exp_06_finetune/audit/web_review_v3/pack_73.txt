@@ -1,0 +1,697 @@
+batch=73 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7800 lang=python
+[CODE]
+   1| # -*- mode:python; coding:utf-8 -*-
+   2| 
+   3| # Copyright (c) 2021 IBM Corp. All rights reserved.
+   4| #
+   5| # Licensed under the Apache License, Version 2.0 (the "License");
+   6| # you may not use this file except in compliance with the License.
+   7| # You may obtain a copy of the License at
+   8| #
+   9| #     https://www.apache.org/licenses/LICENSE-2.0
+  10| #
+  11| # Unless required by applicable law or agreed to in writing, software
+  12| # distributed under the License is distributed on an "AS IS" BASIS,
+  13| # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  14| # See the License for the specific language governing permissions and
+  15| # limitations under the License.
+  16| """Trestle Commands."""
+  17| 
+  18| import argparse
+  19| import logging
+  20| import operator
+  21| import pathlib
+  22| import re
+  23| from typing import Any, Dict, Optional
+  24| 
+  25| from jinja2 import Environment, FileSystemLoader, Template
+  26| 
+  27| from ruamel.yaml import YAML
+  28| 
+  29| from trestle.common import const, log
+  30| from trestle.common.err import TrestleIncorrectArgsError, handle_generic_command_exception
+  31| from trestle.common.load_validate import load_validate_model_name
+  32| from trestle.core.remote.security import PathSecurityValidator
+  33| from trestle.common.model_utils import ModelUtils
+  34| from trestle.core.catalog.catalog_interface import CatalogInterface
+  35| from trestle.core.commands.command_docs import CommandPlusDocs
+  36| from trestle.core.commands.common.return_codes import CmdReturnCodes
+  37| from trestle.core.control_interface import ControlInterface, ParameterRep
+  38| from trestle.core.docs_control_writer import DocsControlWriter
+  39| from trestle.core.jinja.ext import extensions
+  40| from trestle.core.profile_resolver import ProfileResolver
+  41| from trestle.core.ssp_io import SSPMarkdownWriter
+  42| from trestle.oscal.profile import Profile
+  43| from trestle.oscal.ssp import SystemSecurityPlan
+  44| 
+  45| logger = logging.getLogger(__name__)
+  46| 
+  47| 
+  48| class JinjaCmd(CommandPlusDocs):
+  49|     """Transform an input template to an output document using jinja templating."""
+  50| 
+  51|     name = 'jinja'
+  52| 
+  53|     def _init_arguments(self) -> None:
+  54|         self.add_argument('-i', '--input', help='Input jinja template, relative to trestle root', required=True)
+  55|         self.add_argument('-o', '--output', help='Output template, relative to trestle root.', required=True)
+  56|         self.add_argument(
+  57|             '-lut',
+  58|             '--look-up-table',
+  59|             help='Key-value pair table, stored as yaml, to be passed to jinja as variables',
+  60|             required=False,
+  61|         )
+  62|         self.add_argument(
+  63|             '-elp',
+  64|             '--external-lut-prefix',
+  65|             help='Prefix paths for LUT, to maintain compatibility with other templating systems',
+  66|             required=False,
+  67|         )
+  68|         self.add_argument(
+  69|             '-nc',
+  70|             '--number-captions',
+  71|             help='Add incremental numbering to table and image captions, in the form Table n - ... and Figure n - ...',
+  72|             action='store_true',
+  73|         )
+  74|         self.add_argument(
+  75|             '-bf',
+  76|             '--bracket-format',
+  77|             help='With -sv, allows brackets around value, e.g. [.] or ((.)), with the dot representing the value.',
+  78|             required=False,
+  79|         )
+  80|         self.add_argument(
+  81|             '-vap',
+  82|             '--value-assigned-prefix',
+  83|             help='Places a prefix in front of the parameter string if a value has been assigned.',
+  84|             required=False,
+  85|             type=str,
+  86|             default='',
+  87|         )
+  88|         self.add_argument(
+  89|             '-vnap',
+  90|             '--value-not-assigned-prefix',
+  91|             help='Places a prefix in front of the parameter string if a value has *not* been assigned.',
+  92|             required=False,
+  93|             type=str,
+  94|             default='',
+  95|         )
+  96|         self.add_argument(
+  97|             '-ssp', '--system-security-plan', help='An optional SSP to be passed', default=None, required=False
+  98|         )
+  99|         self.add_argument('-p', '--profile', help='An optional profile to be passed', default=None, required=False)
+ 100|         self.add_argument(
+ 101|             '-dp',
+ 102|             '--docs-profile',
+ 103|             help='Output profile controls to separate markdown files',
+ 104|             action='store_true',
+ 105|             required=False,
+ 106|         )
+ 107| 
+ 108|     def _run(self, args: argparse.Namespace) -> None:
+ 109|         try:
+ 110|             log.set_log_level_from_args(args)
+ 111|             logger.debug(f'Starting {self.name} command')
+ 112|             input_path = pathlib.Path(args.input)
+ 113|             output_path = pathlib.Path(args.output)
+ 114| 
+ 115|             logger.debug(f'input_path: {input_path}')
+ 116|             logger.debug(f'output_path: {output_path}')
+ 117|             logger.debug(f'system_security_plan path: {args.system_security_plan}')
+ 118|             logger.debug(f'profile: {args.profile}')
+ 119|             logger.debug(f'docs_profile: {args.docs_profile}')
+ 120|             logger.debug(f'lookup_table: {args.look_up_table}')
+ 121| 
+ 122|             if args.system_security_plan and args.docs_profile:
+ 123|                 raise TrestleIncorrectArgsError('Output to multiple files is possible with profile only.')
+ 124| 
+ 125|             if args.docs_profile and not args.profile:
+ 126|                 raise TrestleIncorrectArgsError('Profile must be provided to output to multiple files.')
+ 127| 
+ 128|             lut = {}
+ 129|             if args.look_up_table:
+ 130|                 lut_table = pathlib.Path(args.look_up_table)
+ 131|                 lookup_table_path = pathlib.Path.cwd() / lut_table
+ 132|                 lut = JinjaCmd.load_LUT(lookup_table_path, args.external_lut_prefix)
+ 133| 
+ 134|             if args.profile and args.docs_profile:
+ 135|                 return JinjaCmd.jinja_multiple_md(
+ 136|                     pathlib.Path(args.trestle_root),
+ 137|                     input_path,
+ 138|                     output_path,
+ 139|                     args.profile,
+ 140|                     lut,
+ 141|                     parameters_formatting=args.bracket_format,
+ 142|                     value_assigned_prefix=args.value_assigned_prefix,
+ 143|                     value_not_assigned_prefix=args.value_not_assigned_prefix,
+ 144|                 )
+ 145| 
+ 146|             return JinjaCmd.jinja_ify(
+ 147|                 pathlib.Path(args.trestle_root),
+ 148|                 input_path,
+ 149|                 output_path,
+ 150|                 args.system_security_plan,
+ 151|                 args.profile,
+ 152|                 lut,
+ 153|                 number_captions=args.number_captions,
+ 154|                 parameters_formatting=args.bracket_format,
+ 155|                 value_assigned_prefix=args.value_assigned_prefix,
+ 156|                 value_not_assigned_prefix=args.value_not_assigned_prefix,
+ 157|             )
+ 158| 
+ 159|         except Exception as e:  # pragma: no cover
+ 160|             return handle_generic_command_exception(  # type: ignore
+ 161|                 e, logger, 'Error while generating markdown via Jinja template'
+ 162|             )
+ 163| 
+ 164|     @staticmethod
+ 165|     def load_LUT(path: pathlib.Path, prefix: Optional[str]) -> Dict[str, Any]:  # noqa: N802
+ 166|         """Load a Yaml lookup table from file."""
+ 167|         yaml = YAML()
+ 168|         lut = yaml.load(path.open('r', encoding=const.FILE_ENCODING))
+ 169|         if prefix:
+ 170|             prefixes = prefix.split('.')
+ 171|             while prefixes:
+ 172|                 old_lut = lut
+ 173|                 lut[prefixes.pop(-1)] = old_lut
+ 174| 
+ 175|         return lut
+ 176| 
+ 177|     @staticmethod
+ 178|     def jinja_ify(
+ 179|         trestle_root: pathlib.Path,
+ 180|         r_input_file: pathlib.Path,
+ 181|         r_output_file: pathlib.Path,
+ 182|         ssp: Optional[str],
+ 183|         profile: Optional[str],
+ 184|         lut: Dict[str, Any],
+ 185|         number_captions: Optional[bool] = False,
+ 186|         parameters_formatting: Optional[str] = None,
+ 187|         value_assigned_prefix: Optional[str] = None,
+ 188|         value_not_assigned_prefix: Optional[str] = None,
+ 189|     ) -> int:
+ 190|         """Run jinja over an input file with additional booleans."""
+ 191|         template_folder = pathlib.Path.cwd()
+ 192|         jinja_env = JinjaCmd._create_jinja_environment(template_folder)
+ 193|         template = jinja_env.get_template(str(r_input_file))
+ 194|         # create boolean dict
+ 195|         if operator.xor(bool(ssp), bool(profile)):
+ 196|             raise TrestleIncorrectArgsError('Both SSP and profile should be provided or not at all')
+ 197| 
+ 198|         if ssp:
+ 199|             # name lookup
+ 200|             ssp_data, _ = load_validate_model_name(trestle_root, ssp, SystemSecurityPlan)
+ 201|             lut['ssp'] = ssp_data
+ 202|             profile_path = ModelUtils.get_model_path_for_name_and_class(trestle_root, profile, Profile)
+ 203|             profile_resolver = ProfileResolver()
+ 204|             resolved_catalog = profile_resolver.get_resolved_profile_catalog(
+ 205|                 trestle_root,
+ 206|                 profile_path,
+ 207|                 False,
+ 208|                 False,
+ 209|                 parameters_formatting,
+ 210|                 ParameterRep.ASSIGNMENT_FORM,
+ 211|                 False,
+ 212|                 value_assigned_prefix,
+ 213|                 value_not_assigned_prefix,
+ 214|             )
+ 215| 
+ 216|             ssp_writer = SSPMarkdownWriter(trestle_root)
+ 217|             ssp_writer.set_ssp(ssp_data)
+ 218|             ssp_writer.set_catalog(resolved_catalog)
+ 219|             lut['catalog'] = resolved_catalog
+ 220|             lut['catalog_interface'] = CatalogInterface(resolved_catalog)
+ 221|             lut['control_interface'] = ControlInterface()
+ 222|             lut['control_writer'] = DocsControlWriter()
+ 223|             lut['ssp_md_writer'] = ssp_writer
+ 224| 
+ 225|         output = JinjaCmd.render_template(template, lut, template_folder)
+ 226| 
+ 227|         # Validate output path to prevent path traversal
+ 228|         output_file = trestle_root / r_output_file
+ 229|         PathSecurityValidator.validate_local_path(output_file, trestle_root)
+ 230| 
+ 231|         if number_captions:
+ 232|             output_file.open('w', encoding=const.FILE_ENCODING).write(_number_captions(output))
+ 233|         else:
+ 234|             output_file.open('w', encoding=const.FILE_ENCODING).write(output)
+ 235| 
+ 236|         return CmdReturnCodes.SUCCESS.value
+ 237| 
+ 238|     @staticmethod
+ 239|     def jinja_multiple_md(
+ 240|         trestle_root: pathlib.Path,
+ 241|         r_input_file: pathlib.Path,
+ 242|         r_output_file: pathlib.Path,
+ 243|         profile_name: Optional[str],
+ 244|         lut: Dict[str, Any],
+ 245|         parameters_formatting: Optional[str] = None,
+ 246|         value_assigned_prefix: Optional[str] = None,
+ 247|         value_not_assigned_prefix: Optional[str] = None,
+ 248|     ) -> int:
+ 249|         """Output profile as multiple markdown files using Jinja."""
+ 250|         template_folder = pathlib.Path.cwd()
+ 251| 
+ 252|         # Output to multiple markdown files
+ 253|         profile, profile_path = ModelUtils.load_model_for_class(trestle_root, profile_name, Profile)
+ 254|         profile_resolver = ProfileResolver()
+ 255|         resolved_catalog = profile_resolver.get_resolved_profile_catalog(
+ 256|             trestle_root,
+ 257|             profile_path,
+ 258|             False,
+ 259|             False,
+ 260|             parameters_formatting,
+ 261|             ParameterRep.ASSIGNMENT_FORM,
+ 262|             False,
+ 263|             value_assigned_prefix,
+ 264|             value_not_assigned_prefix,
+ 265|         )
+ 266|         catalog_interface = CatalogInterface(resolved_catalog)
+ 267| 
+ 268|         # Generate a single markdown page for each control per each group
+ 269|         for group in catalog_interface.get_all_groups_from_catalog():
+ 270|             for control in catalog_interface.get_sorted_controls_in_group(group.id):
+ 271|                 _, group_title, _ = catalog_interface.get_group_info_by_control(control.id)
+ 272|                 group_dir = r_output_file
+ 273|                 control_path = catalog_interface.get_control_path(control.id)
+ 274|                 for sub_dir in control_path:
+ 275|                     group_dir = group_dir / sub_dir
+ 276|                     # Validate directory path to prevent path traversal before creating directories
+ 277|                     full_group_dir = trestle_root / group_dir
+ 278|                     PathSecurityValidator.validate_local_path(full_group_dir, trestle_root)
+ 279|                     if not full_group_dir.exists():
+ 280|                         full_group_dir.mkdir(parents=True, exist_ok=True)
+ 281| 
+ 282|                 control_writer = DocsControlWriter()
+ 283| 
+ 284|                 jinja_env = JinjaCmd._create_jinja_environment(template_folder)
+ 285|                 template = jinja_env.get_template(str(r_input_file))
+ 286|                 lut['catalog_interface'] = catalog_interface
+ 287|                 lut['control_interface'] = ControlInterface()
+ 288|                 lut['control_writer'] = control_writer
+ 289|                 lut['control'] = control
+ 290|                 lut['profile'] = profile
+ 291|                 lut['group_title'] = group_title
+ 292|                 output = JinjaCmd.render_template(template, lut, template_folder)
+ 293| 
+ 294|                 # Validate output path to prevent path traversal
+ 295|                 relative_output_path = group_dir / pathlib.Path(control.id + const.MARKDOWN_FILE_EXT)
+ 296|                 output_file = trestle_root / relative_output_path
+ 297|                 PathSecurityValidator.validate_local_path(output_file, trestle_root)
+ 298| 
+ 299|                 output_file.open('w', encoding=const.FILE_ENCODING).write(output)
+ 300| 
+ 301|         return CmdReturnCodes.SUCCESS.value
+ 302| 
+ 303|     @staticmethod
+ 304|     def _create_jinja_environment(template_folder: pathlib.Path) -> Environment:
+ 305|         """Create the trusted Jinja environment used for loading template files."""
+ 306|         return Environment(
+ 307|             loader=FileSystemLoader(template_folder), extensions=extensions(), trim_blocks=True, autoescape=True
+ 308|         )
+ 309| 
+ 310|     @staticmethod
+ 311|     def render_template(template: Template, lut: Dict[str, Any], template_folder: pathlib.Path) -> str:
+ 312|         """Render a trusted template exactly once to avoid recursive SSTI of untrusted data."""
+ 313|         return template.render(**lut)
+ 314| 
+ 315| 
+ 316| def _number_captions(md_body: str) -> str:
+ 317|     """Incrementally number tables and image captions."""
+ 318|     images = {}
+ 319|     tables = {}
+ 320|     output = md_body.splitlines()
+ 321| 
+ 322|     for index, line in enumerate(output):
+ 323|         if re.match(r'!\[.+\]\(.+\)', line):
+ 324|             images[index] = line
+ 325|         if output[index].lower().startswith('table: '):
+ 326|             tables[index] = line
+ 327| 
+ 328|     for index, row in enumerate(tables):
+ 329|         output[row] = f'Table: Table {index + 1} - {tables[row].split(": ")[1]}'
+ 330| 
+ 331|     for index, row in enumerate(images):
+ 332|         output[row] = images[row].replace('![', f'![Figure {index + 1} - ')
+ 333| 
+ 334|     return '\n'.join(output)
+ 335| 
+ 336| 
+
+### id=7801 lang=php
+[CODE]
+   1| <?php
+   2| namespace verbb\formie\fields\formfields;
+   3| 
+   4| use verbb\formie\Formie;
+   5| use verbb\formie\base\FormField;
+   6| use verbb\formie\elements\Form;
+   7| use verbb\formie\elements\NestedFieldRow;
+   8| use verbb\formie\helpers\SchemaHelper;
+   9| use verbb\formie\helpers\Variables;
+  10| use verbb\formie\positions\Hidden as HiddenPosition;
+  11| use verbb\formie\models\HtmlTag;
+  12| 
+  13| use Craft;
+  14| use craft\base\ElementInterface;
+  15| use craft\base\PreviewableFieldInterface;
+  16| use craft\base\SortableFieldInterface;
+  17| use craft\helpers\DateTimeHelper;
+  18| use craft\helpers\UrlHelper;
+  19| use craft\web\View;
+  20| 
+  21| use Throwable;
+  22| use DateTime;
+  23| 
+  24| class Hidden extends FormField implements PreviewableFieldInterface, SortableFieldInterface
+  25| {
+  26|     // Static Methods
+  27|     // =========================================================================
+  28| 
+  29|     public static function displayName(): string
+  30|     {
+  31|         return Craft::t('formie', 'Hidden Field');
+  32|     }
+  33| 
+  34|     public static function getSvgIconPath(): string
+  35|     {
+  36|         return 'formie/_formfields/hidden-field/icon.svg';
+  37|     }
+  38| 
+  39| 
+  40|     // Properties
+  41|     // =========================================================================
+  42| 
+  43|     public ?string $defaultOption = null;
+  44|     public ?string $queryParameter = null;
+  45|     public ?string $cookieName = null;
+  46|     public ?string $columnType = null;
+  47| 
+  48| 
+  49|     // Public Methods
+  50|     // =========================================================================
+  51| 
+  52|     public function init(): void
+  53|     {
+  54|         parent::init();
+  55| 
+  56|         $currentUser = Craft::$app->getUser()->getIdentity();
+  57|         $request = Craft::$app->getRequest();
+  58| 
+  59|         if (!Craft::$app->getRequest()->getIsConsoleRequest()) {
+  60|             if ($this->defaultOption === 'dateUs') {
+  61|                 $this->defaultValue = DateTimeHelper::toDateTime(new DateTime())->format('m/d/Y');
+  62|             } else if ($this->defaultOption === 'dateInt') {
+  63|                 $this->defaultValue = DateTimeHelper::toDateTime(new DateTime())->format('d/m/Y');
+  64|             } else if ($this->defaultOption === 'userAgent') {
+  65|                 $this->defaultValue = $request->getUserAgent();
+  66|             } else if ($this->defaultOption === 'referUrl') {
+  67|                 $this->defaultValue = $request->getReferrer();
+  68|             } else if ($this->defaultOption === 'currentUrl') {
+  69|                 $this->defaultValue = $request->getAbsoluteUrl();
+  70|             } else if ($this->defaultOption === 'currentUrlNoQueryString') {
+  71|                 $this->defaultValue = UrlHelper::stripQueryString($request->getAbsoluteUrl());
+  72|             } else if ($this->defaultOption === 'userId') {
+  73|                 $this->defaultValue = $currentUser->id ?? null;
+  74|             } else if ($this->defaultOption === 'username') {
+  75|                 $this->defaultValue = $currentUser->username ?? null;
+  76|             } else if ($this->defaultOption === 'userEmail') {
+  77|                 $this->defaultValue = $currentUser->email ?? null;
+  78|             } else if ($this->defaultOption === 'userIp') {
+  79|                 $this->defaultValue = $request->getUserIP();
+  80|             } else if ($this->defaultOption === 'query' && $this->queryParameter) {
+  81|                 $this->defaultValue = $request->getParam($this->queryParameter);
+  82|             } else if ($this->defaultOption === 'cookie' && $this->cookieName) {
+  83|                 $this->defaultValue = $_COOKIE[$this->cookieName] ?? '';
+  84|             }
+  85|         }
+  86|     }
+  87| 
+  88|     public function getContentColumnType(): string
+  89|     {
+  90|         if ($this->columnType) {
+  91|             return $this->columnType;
+  92|         }
+  93| 
+  94|         return parent::getContentColumnType();
+  95|     }
+  96| 
+  97|     public function getIsHidden(): bool
+  98|     {
+  99|         return true;
+ 100|     }
+ 101| 
+ 102|     public function serializeValue(mixed $value, ?ElementInterface $element = null): mixed
+ 103|     {
+ 104|         // Handle variables use in custom fields
+ 105|         if ($this->defaultOption === 'custom') {
+ 106|             // We have to check if this is a NestedFieldRow, we always need the top-level submission
+ 107|             // Potentially move this to `Variables::getParsedValue()`.
+ 108|             if ($element instanceof NestedFieldRow) {
+ 109|                 $element = $element->owner;
+ 110|             }
+ 111| 
+ 112|             // Check if there's no value been added on the front-end, and use the default value
+ 113|             if ($value === '') {
+ 114|                 $value = $this->defaultValue;
+ 115|             }
+ 116| 
+ 117|             $value = Variables::getParsedValue($value, $element);
+ 118| 
+ 119|             // Immediately update the value for the element, so integrations use the up-to-date value
+ 120|             if ($element) {
+ 121|                 $element->setFieldValue($this->handle, $value);
+ 122|             }
+ 123|         }
+ 124| 
+ 125|         return parent::serializeValue($value, $element);
+ 126|     }
+ 127| 
+ 128|     public function getFieldDefaults(): array
+ 129|     {
+ 130|         return [
+ 131|             'labelPosition' => HiddenPosition::class,
+ 132|             'defaultOption' => 'custom',
+ 133|             'includeInEmail' => true,
+ 134|         ];
+ 135|     }
+ 136| 
+ 137|     public function getInputHtml(mixed $value, ?ElementInterface $element = null): string
+ 138|     {
+ 139|         return Craft::$app->getView()->renderTemplate('formie/_formfields/hidden-field/input', [
+ 140|             'name' => $this->handle,
+ 141|             'value' => $value,
+ 142|             'field' => $this,
+ 143|         ]);
+ 144|     }
+ 145| 
+ 146|     public function getPreviewInputHtml(): string
+ 147|     {
+ 148|         return Craft::$app->getView()->renderTemplate('formie/_formfields/hidden-field/preview', [
+ 149|             'field' => $this,
+ 150|         ]);
+ 151|     }
+ 152| 
+ 153|     public function getFrontEndJsModules(): ?array
+ 154|     {
+ 155|         if ($this->defaultOption === 'cookie' && $this->cookieName) {
+ 156|             return [
+ 157|                 'src' => Craft::$app->getAssetManager()->getPublishedUrl('@verbb/formie/web/assets/frontend/dist/', true, 'js/fields/hidden.js'),
+ 158|                 'module' => 'FormieHidden',
+ 159|                 'settings' => [
+ 160|                     'cookieName' => $this->cookieName,
+ 161|                 ],
+ 162|             ];
+ 163|         }
+ 164| 
+ 165|         return null;
+ 166|     }
+ 167| 
+ 168|     public function getFrontEndInputOptions(Form $form, mixed $value, array $renderOptions = []): array
+ 169|     {
+ 170|         $inputOptions = parent::getFrontEndInputOptions($form, $value, $renderOptions);
+ 171| 
+ 172|         try {
+ 173|             $defaultValue = Craft::$app->getView()->renderString(
+ 174|                 (string)$this->defaultValue,
+ 175|                 [
+ 176|                     'field' => $this,
+ 177|                     'form' => $form,
+ 178|                 ],
+ 179|                 View::TEMPLATE_MODE_SITE
+ 180|             );
+ 181|         } catch (Throwable $e) {
+ 182|             $defaultValue = $this->defaultValue;
+ 183|             Formie::error('Failed to render hidden field template: ' . $e->getMessage());
+ 184|         }
+ 185| 
+ 186|         $inputOptions['defaultValue'] = $defaultValue;
+ 187| 
+ 188|         return $inputOptions;
+ 189|     }
+ 190| 
+ 191|     public function defineGeneralSchema(): array
+ 192|     {
+ 193|         return [
+ 194|             SchemaHelper::labelField([
+ 195|                 'label' => Craft::t('formie', 'Name'),
+ 196|                 'help' => Craft::t('formie', 'The name of this field displayed only to you'),
+ 197|             ]),
+ 198|             SchemaHelper::selectField([
+ 199|                 'label' => Craft::t('formie', 'Default Value'),
+ 200|                 'help' => Craft::t('formie', 'Select an option for the default value.'),
+ 201|                 'name' => 'defaultOption',
+ 202|                 'options' => [
+ 203|                     ['label' => Craft::t('formie', 'Date (mm/dd/yyyy)'), 'value' => 'dateUs'],
+ 204|                     ['label' => Craft::t('formie', 'Date (dd/mm/yyyy)'), 'value' => 'dateInt'],
+ 205|                     ['label' => Craft::t('formie', 'Current URL'), 'value' => 'currentUrl'],
+ 206|                     ['label' => Craft::t('formie', 'Current URL (without Query String)'), 'value' => 'currentUrlNoQueryString'],
+ 207|                     ['label' => Craft::t('formie', 'HTTP User Agent'), 'value' => 'userAgent'],
+ 208|                     ['label' => Craft::t('formie', 'HTTP Refer URL'), 'value' => 'referUrl'],
+ 209|                     ['label' => Craft::t('formie', 'User ID'), 'value' => 'userId'],
+ 210|                     ['label' => Craft::t('formie', 'Username'), 'value' => 'username'],
+ 211|                     ['label' => Craft::t('formie', 'User Email'), 'value' => 'userEmail'],
+ 212|                     ['label' => Craft::t('formie', 'User IP Address'), 'value' => 'userIp'],
+ 213|                     ['label' => Craft::t('formie', 'Cookie Value'), 'value' => 'cookie'],
+ 214|                     ['label' => Craft::t('formie', 'Query Parameter'), 'value' => 'query'],
+ 215|                     ['label' => Craft::t('formie', 'Custom Value'), 'value' => 'custom'],
+ 216|                 ],
+ 217|             ]),
+ 218|             SchemaHelper::variableTextField([
+ 219|                 'label' => Craft::t('formie', 'Default Value'),
+ 220|                 'help' => Craft::t('formie', 'Entering a default value will place the value in the field when it loads.'),
+ 221|                 'name' => 'defaultValue',
+ 222|                 'variables' => 'plainTextVariables',
+ 223|                 'if' => '$get(defaultOption).value == custom',
+ 224|             ]),
+ 225|             SchemaHelper::textField([
+ 226|                 'label' => Craft::t('formie', 'Query Parameter'),
+ 227|                 'help' => Craft::t('formie', 'Entering the query parameter to populate the value of the field when it loads.'),
+ 228|                 'name' => 'queryParameter',
+ 229|                 'if' => '$get(defaultOption).value == query',
+ 230|             ]),
+ 231|             SchemaHelper::textField([
+ 232|                 'label' => Craft::t('formie', 'Cookie Name'),
+ 233|                 'help' => Craft::t('formie', 'Enter the name of the cookie to use as the value of this field.'),
+ 234|                 'name' => 'cookieName',
+ 235|                 'if' => '$get(defaultOption).value == cookie',
+ 236|             ]),
+ 237|         ];
+ 238|     }
+ 239| 
+ 240|     public function defineSettingsSchema(): array
+ 241|     {
+ 242|         return [
+ 243|             SchemaHelper::includeInEmailField(),
+ 244|         ];
+ 245|     }
+ 246| 
+ 247|     public function defineAdvancedSchema(): array
+ 248|     {
+ 249|         return [
+ 250|             SchemaHelper::handleField(),
+ 251|             SchemaHelper::cssClasses(),
+ 252|             SchemaHelper::containerAttributesField(),
+ 253|             SchemaHelper::inputAttributesField(),
+ 254|             SchemaHelper::enableContentEncryptionField(),
+ 255|             SchemaHelper::columnTypeField(),
+ 256|         ];
+ 257|     }
+ 258| 
+ 259|     public function defineHtmlTag(string $key, array $context = []): ?HtmlTag
+ 260|     {
+ 261|         $form = $context['form'] ?? null;
+ 262| 
+ 263|         $id = $this->getHtmlId($form);
+ 264|         $dataId = $this->getHtmlDataId($form);
+ 265| 
+ 266|         if ($key === 'fieldLabel') {
+ 267|             return null;
+ 268|         }
+ 269| 
+ 270|         if ($key === 'fieldInput') {
+ 271|             return new HtmlTag('input', [
+ 272|                 'type' => 'hidden',
+ 273|                 'id' => $id,
+ 274|                 'name' => $this->getHtmlName(),
+ 275|                 'data' => [
+ 276|                     'fui-id' => $dataId,
+ 277|                 ],
+ 278|             ], $this->getInputAttributes());
+ 279|         }
+ 280| 
+ 281|         return parent::defineHtmlTag($key, $context);
+ 282|     }
+ 283| }
+ 284| 
+ 285| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7800 teacher=unknown flags=[]
+[ANALYSIS]
+## 逐函数行号级分析
+
+**1. `_run`（第 88–150 行）— 命令入口点**
+- 入口参数：`-i`（第 60 行）、`-o`（第 62 行）、`-lut`、`-elp`、`-ssp`、`-p` 等，全部来自 CLI。
+- 第 96–97 行将 `args.input`/`args.output` 转为 Path，未在此处做规范化，但后续 sink 处有校验（见下）。
+- 第 103–105 行：LUT 路径 `pathlib.Path.cwd() / lut_table` 直接拼接后交给 `load_LUT`。该路径仅用于读取 YAML，且命令本身是本地开发者工具，读取用户自己指定的文件不构成跨信任边界的数据流；且 `YAML()` 默认为 safe loader（第 158 行），不存在反序列化 RCE。
+
+**2. `load_LUT`（第 157–166 行）**
+- 第 159 行 `yaml.load(path.open(...))`：ruamel 的默认 `YAML()` 是 safe 模式，只构造基础类型，无任意对象实例化 sink。
+- 第 161–163 行 prefix 循环只是把自身 dict 嵌套引用回写键名，纯内存操作，无文件/命令 sink。
+
+**3. `jinja_ify`（第 169–221 行）— 主渲染路径**
+- 第 172–174 行：`template_folder = pathlib.Path.cwd()`，`Environment(loader=FileSystemLoader(template_folder))`（经 `_create_jinja_environment`，第 253–257 行）。source 为 CLI 参数 `r_input_file`，sink 为 `get_template(str(r_input_file))`（第 175 行）。关键防御：Jinja2 的 `FileSystemLoader` 内部会拒绝包含 `..` 或绝对路径逃逸出搜索根的模板路径，因此即使传入 `../../etc/passwd` 也无法加载搜索目录之外的文件作为模板——输入侧遍历被框架层阻断。
+- SSTI 面：模板本身是受信的开发者提供的本地文件（第 256 行注释明确说明 trusted Jinja environment）；不可信数据仅通过 `lut` 作为变量在 `render_template`（第 261–263 行）一次性渲染，注释亦说明避免递归 SSTI。lut 内容来自 safe-YAML 与 OSCAL 模型数据，不含可执行模板字符串通道。
+- 输出侧：第 207 行 `output_file = trestle_root / r_output_file` 后立即调用 `PathSecurityValidator.validate_local_path(output_file, trestle_root)`（第 208 行），再于第 212–213 行写入。写入前校验有效，路径遍历被阻断。
+- 第 181–184 行：ssp/profile 必须成对出现，否则抛错；模型加载走 `load_validate_model_name`，均在 trestle_root 管辖内。
+
+**4. `jinja_multiple_md`（第 224–250 行）— 第二入口**
+- 第 236–241 行：对每个子目录逐层做 `PathSecurityValidator.validate_local_path(full_group_dir, trestle_root)` 后才 `mkdir`（第 243–245 行），目录创建前校验到位。
+- 第 251–253 行（实际第 248–250 区域）：最终输出文件再次 `validate_local_path` 校验后才 `open('w')` 写入。两条替代写入通道均有前置校验。
+- 模板加载与单文件路径相同，受 `FileSystemLoader` 根约束保护。
+
+**5. `_create_jinja_environment` / `render_template`（第 253–263 行）**
+- `autoescape=True`、扩展来自项目内置 `extensions()`（非用户可控），环境固定为受信配置；渲染仅一次，lut 变量不会二次进入模板引擎解析，SSTI 链路闭合。
+
+**6. `_number_captions`（第 266–284 行）**
+- 仅对已渲染的字符串做正则匹配与字符串替换后 join 返回，无文件、命令或求值 sink，纯文本变换。
+
+**综合结论**：全部 source（CLI 参数 input/output/lut）到 sink（get_template、open('w')、mkdir）的数据流均有有效防御：输出侧由 `PathSecurityValidator.validate_local_path` 在每次写入/建目录前校验；输入模板侧由 `FileSystemLoader` 的根目录逃逸检查兜底；YAML 加载为 safe loader；模板环境受信且 lut 数据不进入二次模板解析。黑名单式绕过担忧不适用，因为校验是基于规范化后的真实路径归属判断而非字符串过滤。全文证据支持无漏洞结论。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认所有入口点均受有效防御：CLI 参数 output 经 PathSecurityValidator.validate_local_path 在每次 open 写入和 mkdir 之前校验（jinja_ify 第 207-208 行、jinja_multiple_md 第 240-245 行及最终写出处）；input 模板由 FileSystemLoader 的根目录逃逸检查阻止越界加载；LUT 通过 ruamel 默认 safe YAML 加载无反序列化风险；Jinja 环境为受信配置且 autoescape 开启，lut 变量仅在 render_template 中一次性渲染，不构成 SSTI 链路；_number_captions 为纯文本处理无危险 sink。未发现可利用的 source 到 sink 数据流。", "fix_suggestion": "no fix needed"}
+
+### id=7801 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文通读）
+
+1. **第 40–44 行：属性定义** — `$defaultOption`、`$queryParameter`、`$cookieName`、`$columnType` 均为可由后台字段设置控制的属性，无输入过滤。
+
+2. **第 46–80 行 `init()`：第一入口点**。当 `$defaultOption === 'query'` 时（约第 71 行），`$this->defaultValue = $request->getParam($this->queryParameter)` —— 直接将 **GET/POST 请求参数**（完全攻击者可控）写入 `defaultValue`；当 `$defaultOption === 'cookie'` 时（约第 73 行），直接读取 `$_COOKIE[$this->cookieName]`，同样是攻击者可控 source。此处没有任何白名单、转义或类型校验。
+
+3. **第 82–87 行 `getContentColumnType()`** — 仅返回列类型字符串，来自管理员配置，非外部输入，无风险。
+
+4. **第 89–110 行 `serializeValue()`：sink 所在**。当 `defaultOption === 'custom'` 时，若前端提交值为空则回退到 `$this->defaultValue`（第 96–99 行），随后第 101 行调用 `Variables::getParsedValue($value, $element)`。Formie 的变量解析器会对值执行 **Twig 模板渲染**（用于支持 `{field.xxx}` 等变量语法）。由于 `defaultValue` 在 `init()` 中已被请求参数/ Cookie 污染，攻击者可提交如 `{% import ... %}` 或 `{{ ['id']|filter('system') }}` 形式的 payload，经查询参数或 Cookie 进入模板引擎 —— 典型 **SSTI → RCE** 链。这是该类真实漏洞（verbb/formie 隐藏字段查询参数注入）的根源。
+
+5. **第 112–119 行 `getFieldDefaults()`** — 默认配置，无输入流。
+
+6. **第 121–130 行 `getInputHtml()` / 第 132–138 行 `getPreviewInputHtml()`** — 渲染模板并传入 `$value`；Craft 模板默认自动转义 HTML，XSS 风险有限，且主要面向管理端。
+
+7. **第 140–152 行 `getFrontEndJsModules()`** — 仅输出 cookieName 到前端 JS 设置，属于低危信息暴露（Cookie 名），非可利用 sink。
+
+8. **第 154–172 行 `getFrontEndInputOptions()`：第二入口/sink**。第 160 行对 `(string)$this->defaultValue` 调用 `renderString(...)` —— 显式以 Twig 渲染 defaultValue。虽然此处有 try/catch（第 164–167 行），但 catch 只吞掉异常并回退原值，**不阻止渲染本身**。defaultValue 同样可被 `init()` 中 query/cookie 分支污染（尽管 `defaultOption` 同时为 custom 时才走 serializeValue 路径，但 renderString 路径下 defaultOption 为 query/cookie 时 defaultValue 即被污染并被渲染）。异常处理不是安全防御，仅是错误兜底。
+
+9. **第 174–230 行 schema 定义方法** — 纯管理端表单 schema，静态选项列表，无外部输入流入 sink。
+
+10. **第 232–252 行 `defineHtmlTag()`** — 构造 hidden input 标签，属性来自 handle/id（服务端生成），无注入点。
+
+**替代通道核查**：除 HTTP 参数与 Cookie 外，User-Agent / Referrer / IP（init 第 57–69 行）也写入 defaultValue，但它们最终多作为数据存储而非模板渲染输入，危害较低；核心可利用通道是 query 参数与 Cookie 两条 source→Twig 渲染 sink 的链路。黑名单/过滤：全文未见任何针对 defaultValue 的过滤，防御缺失而非绕过问题。
+
+**结论**：存在漏洞 —— 攻击者可控的查询参数/Cookie 值进入 Twig 模板解析（`Variables::getParsedValue` 与 `View::renderString`），构成服务端模板注入，可导致远程代码执行。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-1336 Improper Neutralization of Special Elements Used in a Template Engine", "risk_level": "Critical", "source": "81: $request->getParam($this->queryParameter) 与 83: $_COOKIE[$this->cookieName]，均为攻击者可控输入写入 $this->defaultValue", "sink": "117: Variables::getParsedValue($value, $element) 以及 173: Craft::$app->getView()->renderString((string)$this->defaultValue, ...)，两者均对 defaultValue 执行 Twig 模板渲染", "explanation": "init() 将 GET/POST 参数或 Cookie 值未经任何校验写入 defaultValue -> 该值在 serializeValue() 回退逻辑中传入 Variables::getParsedValue 进行 Twig 解析，或在 getFrontEndInputOptions() 中被 renderString 直接渲染 -> 攻击者提交形如 {{ 攻击payload }} 的查询参数即可实现服务端模板注入，进而远程代码执行；try/catch 仅捕获异常不构成防御", "fix_suggestion": "line 71/73: 对 query 与 cookie 来源的值禁止进入模板解析上下文——在传入 Variables::getParsedValue 或 renderString 前使用纯文本占位替换（先渲染模板再拼接用户值），或将用户输入标记为 raw 字符串并禁用其作为 Twig 源码；同时限制 defaultOption 为 query/cookie 时不得启用 custom 变量解析路径"}
