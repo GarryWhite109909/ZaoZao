@@ -22,7 +22,8 @@ OUT_DIRS = [BASE / "corpus/repair_wave/_wave1_out_g21_22",
             BASE / "corpus/repair_wave/_wave1_out_g23_24",
             BASE / "corpus/repair_wave/_wave1_out_g23b",
             BASE / "corpus/repair_wave/_wave1_out_g24_tail",  # g24 后半并行批
-            BASE / "corpus/repair_wave/_wave1_out_g2122_retry"]  # G4 拒收重试批
+            BASE / "corpus/repair_wave/_wave1_out_g2122_retry",  # G4 拒收重试批
+            BASE / "corpus/repair_wave/_wave1_out_g22b"]  # g22b 危害具体化 + 拒收重试
 OUT_LOG = BASE / "audit/adjudicate_v2_15/verify_g2124_out.txt"
 JSON_BLOCK = re.compile(r"```json\s*(.*?)```", re.S)
 
@@ -54,6 +55,10 @@ EXPECT = {
     "g22-race-e3b": ({"362"}, ["污点链", "完整链", "可直接确认", "竞态", "并发"], [], "E3 TOCTOU"),
     "g22-race-e2a": ({"362"}, ["竞态", "并发"], [], "E2 无锁读改写"),
     "g22-race-e2b": ({"362"}, ["竞态", "并发"], [], "E2 非原子 get/set"),
+    # ---- g22b 危害具体化补做(原样本危害不显著导致退守 safe)----
+    "g22b-race-01": ({"362", "367"}, ["竞态", "并发", "锁", "事务"], [], "提现限额 TOCTOU,可超额取款"),
+    "g22b-race-02": ({"362", "367"}, ["竞态", "并发", "锁", "约束"], [], "并发注册 TOCTOU,可覆盖他人账号"),
+    "g22b-log-01": ({"117"}, ["污点链", "完整链", "可直接确认"], [], "E3 UA 头注入审计日志"),
     # ---- g23 F10 伴生凭证 ----
     "g23-csrf-01": ({"352"}, ["798", "硬编码", "凭证", "密钥"], [], "主 352,伴生 798"),
     "g23-csrf-02": ({"352"}, ["798", "硬编码", "凭证", "密钥"], [], "主 352,伴生 798"),
@@ -100,6 +105,13 @@ F11_BAN = ["需运行时验证", "证据不足", "无法确认", "不能确认",
 F11_GROUPS = ("g22-",)
 # 352 组修复禁转义类叙事(语义错位)
 NO_ESCAPE_FIX = ("g24-csrf-01", "g24-csrf-02", "g24-csrf-03")
+# 判 safe 且经人工复核认可的样本:原 kit 主洞危害不显著(无实际安全影响),
+# 教师退守 safe 站得住,不按期望类型判 FAIL;样本本身留作安全侧候选,不入库。
+SAFE_OK = {
+    "g22-log-e2b",  # 函数形参写日志,片段内无可见 source,注入不可证
+    "g22-race-e3b",  # TOCTOU 但并发双写同一 placeholder,无后果
+    "g22-race-e2a",  # 计数器 +=1 非原子,只影响指标精度
+}
 
 LOG = []
 def P(*a):
@@ -145,6 +157,7 @@ def main():
 
     verdict = Counter()
     problems = []
+    safe_notes = []
     for o, (exp_cwes, anchors, bans, note) in sorted(EXPECT.items()):
         r = recs.get(o)
         if r is None:
@@ -162,6 +175,14 @@ def main():
         fix = str(j.get("fix_suggestion", ""))
 
         issues = []
+        # 判 safe 且人工复核认可:不按期望类型判 FAIL,改计 SAFE
+        if o in SAFE_OK and hv == "False":
+            verdict["SAFE(人工认可)"] += 1
+            safe_notes.append(f"{o} [{note}]: 判 safe,人工复核认可(原 kit 危害不显著)")
+            for b in F11_BAN:
+                if b in expl:
+                    problems.append(f"{o}: safe 侧出现 F11 反模式表述:{b}")
+            continue
         if hv != "True":
             issues.append(f"hv={hv}")
         if cwe not in exp_cwes:
