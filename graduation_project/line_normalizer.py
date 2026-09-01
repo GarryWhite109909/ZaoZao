@@ -265,7 +265,9 @@ def normalize_line_numbers(
         propagated = False
         if fixed is None and orig is not None and delta and delta != 0:
             candidate = orig + delta
-            if candidate >= 1:  # 传播结果必须落在合法行号范围
+            # 2026-08-31 修复：补上界校验（原实现仅 candidate >= 1，
+            # 数据侧 v2_15 校准抽验实锤传播可越界到不存在的行，如 orig49+delta35→84）
+            if 1 <= candidate <= len(code_lines):
                 fixed, propagated = candidate, True
         if fixed is not None and orig is not None and fixed != orig:
             out.append(f"line {fixed}:{m.group('content')}")
