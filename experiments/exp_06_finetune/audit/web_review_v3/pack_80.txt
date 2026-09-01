@@ -1,0 +1,501 @@
+batch=80 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7814 lang=go
+[CODE]
+   1| package zerogod
+   2| 
+   3| import (
+   4| 	"context"
+   5| 	"crypto/tls"
+   6| 	"fmt"
+   7| 	"net"
+   8| 	"strings"
+   9| 
+  10| 	"github.com/evilsocket/islazy/ops"
+  11| 	"github.com/evilsocket/islazy/tui"
+  12| )
+  13| 
+  14| type Handler struct {
+  15| 	TLS    bool
+  16| 	Handle func(ctx *HandlerContext)
+  17| }
+  18| 
+  19| // TODO: possibly autodetect from peeking at the first bytes sent by the client
+  20| var TCP_HANDLERS = map[string]Handler{
+  21| 	"_ipp": {
+  22| 		Handle: ippClientHandler,
+  23| 	},
+  24| 	"_ipps": {
+  25| 		TLS:    true,
+  26| 		Handle: ippClientHandler,
+  27| 	},
+  28| 	"_http": {
+  29| 		Handle: httpClientHandler,
+  30| 	},
+  31| 	"_https": {
+  32| 		TLS:    true,
+  33| 		Handle: httpClientHandler,
+  34| 	},
+  35| }
+  36| 
+  37| type Acceptor struct {
+  38| 	mod           *ZeroGod
+  39| 	srvHost       string
+  40| 	proto         string
+  41| 	port          uint16
+  42| 	service       string
+  43| 	tlsConfig     *tls.Config
+  44| 	tcpListener   net.Listener
+  45| 	udpListener   *net.UDPConn
+  46| 	running       bool
+  47| 	context       context.Context
+  48| 	ctxCancel     context.CancelFunc
+  49| 	handler       Handler
+  50| 	ippAttributes map[string]string
+  51| 	httpPaths     map[string]string
+  52| }
+  53| 
+  54| type HandlerContext struct {
+  55| 	service       string
+  56| 	mod           *ZeroGod
+  57| 	client        net.Conn
+  58| 	srvHost       string
+  59| 	srvPort       int
+  60| 	srvTLS        bool
+  61| 	ippAttributes map[string]string
+  62| 	httpPaths     map[string]string
+  63| }
+  64| 
+  65| func NewAcceptor(mod *ZeroGod, service string, srvHost string, port uint16, tlsConfig *tls.Config, ippAttributes map[string]string, httpPaths map[string]string) *Acceptor {
+  66| 	context, ctcCancel := context.WithCancel(context.Background())
+  67| 	proto := ops.Ternary(strings.Contains(service, "_tcp"), "tcp", "udp").(string)
+  68| 
+  69| 	acceptor := Acceptor{
+  70| 		mod:           mod,
+  71| 		port:          port,
+  72| 		proto:         proto,
+  73| 		service:       service,
+  74| 		context:       context,
+  75| 		ctxCancel:     ctcCancel,
+  76| 		srvHost:       srvHost,
+  77| 		ippAttributes: ippAttributes,
+  78| 		httpPaths:     httpPaths,
+  79| 	}
+  80| 
+  81| 	for svcName, svcHandler := range TCP_HANDLERS {
+  82| 		if strings.Contains(service, svcName) {
+  83| 			if svcHandler.TLS {
+  84| 				acceptor.tlsConfig = tlsConfig
+  85| 			}
+  86| 			acceptor.handler = svcHandler
+  87| 			break
+  88| 		}
+  89| 	}
+  90| 
+  91| 	if acceptor.handler.Handle == nil {
+  92| 		mod.Warning("no protocol handler found for service %s, using generic %s dump handler", tui.Yellow(service), proto)
+  93| 		acceptor.handler.Handle = handleGenericTCP
+  94| 	} else {
+  95| 		mod.Info("found %s %s protocol handler (tls=%v)", proto, tui.Green(service), acceptor.tlsConfig != nil)
+  96| 	}
+  97| 
+  98| 	return &acceptor
+  99| }
+ 100| 
+ 101| func (a *Acceptor) startTCP() (err error) {
+ 102| 	var lc net.ListenConfig
+ 103| 	if a.tcpListener, err = lc.Listen(a.context, "tcp", fmt.Sprintf("0.0.0.0:%d", a.port)); err != nil {
+ 104| 		return err
+ 105| 	}
+ 106| 	if a.tlsConfig != nil {
+ 107| 		a.tcpListener = tls.NewListener(a.tcpListener, a.tlsConfig)
+ 108| 	}
+ 109| 
+ 110| 	a.running = true
+ 111| 	go func() {
+ 112| 		a.mod.Debug("%s listener for port %d (%s) started", a.proto, a.port, tui.Green(a.service))
+ 113| 		for a.running {
+ 114| 			if conn, err := a.tcpListener.Accept(); err != nil {
+ 115| 				if a.running {
+ 116| 					a.mod.Error("%v", err)
+ 117| 				}
+ 118| 			} else {
+ 119| 				a.mod.Debug("accepted %s connection for service %s (port %d): %v", a.proto, tui.Green(a.service), a.port, conn.RemoteAddr())
+ 120| 				go func() {
+ 121| 					ctx := &HandlerContext{
+ 122| 						service:       a.service,
+ 123| 						mod:           a.mod,
+ 124| 						client:        conn,
+ 125| 						srvHost:       a.srvHost,
+ 126| 						srvPort:       int(a.port),
+ 127| 						srvTLS:        a.tlsConfig != nil,
+ 128| 						ippAttributes: a.ippAttributes,
+ 129| 						httpPaths:     a.httpPaths,
+ 130| 					}
+ 131| 					defer func() {
+ 132| 						if r := recover(); r != nil {
+ 133| 							a.mod.Error("panic in %s handler for %s: %v", a.service, conn.RemoteAddr(), r)
+ 134| 						}
+ 135| 					}()
+ 136| 					a.handler.Handle(ctx)
+ 137| 				}()
+ 138| 			}
+ 139| 		}
+ 140| 		a.mod.Debug("%s listener for port %d (%s) stopped", a.proto, a.port, tui.Green(a.service))
+ 141| 	}()
+ 142| 
+ 143| 	return nil
+ 144| }
+ 145| 
+ 146| func (a *Acceptor) startUDP() (err error) {
+ 147| 	if udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%d", a.port)); err != nil {
+ 148| 		return err
+ 149| 	} else if a.udpListener, err = net.ListenUDP("udp", udpAddr); err != nil {
+ 150| 		return err
+ 151| 	} else {
+ 152| 		a.running = true
+ 153| 		go func() {
+ 154| 			var buffer [4096]byte
+ 155| 
+ 156| 			a.mod.Info("%s listener for port %d (%s) started", a.proto, a.port, tui.Green(a.service))
+ 157| 
+ 158| 			for a.running {
+ 159| 				if n, addr, err := a.udpListener.ReadFromUDP(buffer[0:]); err != nil {
+ 160| 					a.mod.Warning("error reading udp packet: %v", err)
+ 161| 				} else if n <= 0 {
+ 162| 					a.mod.Info("empty read")
+ 163| 				} else {
+ 164| 					a.mod.Info("%v:\n%s", addr, Dump(buffer[0:n]))
+ 165| 				}
+ 166| 			}
+ 167| 
+ 168| 			a.mod.Info("%s listener for port %d (%s) stopped", a.proto, a.port, tui.Green(a.service))
+ 169| 		}()
+ 170| 	}
+ 171| 
+ 172| 	return nil
+ 173| }
+ 174| 
+ 175| func (a *Acceptor) Start() (err error) {
+ 176| 	if a.proto == "tcp" {
+ 177| 		return a.startTCP()
+ 178| 	} else {
+ 179| 		return a.startUDP()
+ 180| 	}
+ 181| }
+ 182| 
+ 183| func (a *Acceptor) Stop() {
+ 184| 	a.mod.Debug("stopping %s listener for port %d", a.proto, a.port)
+ 185| 	a.running = false
+ 186| 
+ 187| 	if a.proto == "tcp" {
+ 188| 		a.ctxCancel()
+ 189| 		<-a.context.Done()
+ 190| 		a.tcpListener.Close()
+ 191| 	} else {
+ 192| 		a.udpListener.Close()
+ 193| 	}
+ 194| 
+ 195| 	a.mod.Debug("%s listener for port %d stopped", a.proto, a.port)
+ 196| }
+ 197| 
+ 198| 
+
+### id=7815 lang=python
+[CODE]
+   1| """
+   2| Pure Python RLE (Run-Length Encoding) codec implementation.
+   3| 
+   4| This module provides pure Python implementations of Apple PackBits RLE encoding
+   5| and decoding. PackBits is a simple byte-oriented run-length compression scheme
+   6| used in PSD files for channel data compression.
+   7| 
+   8| **Note**: This is the fallback implementation. A faster Cython version is available
+   9| in ``_rle.pyx`` and will be used automatically if compiled. The Cython version can
+  10| be 10-100x faster, especially for large images.
+  11| 
+  12| Algorithm overview:
+  13| 
+  14| The PackBits algorithm uses a single header byte to indicate:
+  15| - Values 0-127: Copy the next (n+1) literal bytes
+  16| - Values 129-255: Repeat the next byte (257-n) times
+  17| - Value 128: No-op (typically not used)
+  18| 
+  19| Encoding example::
+  20|     Input:  [A, A, A, B, C, C, C, C]
+  21|     Output: [130, A, 1, B, 131, C]
+  22|             (repeat A 3x, copy B 1x, repeat C 4x)
+  23| 
+  24| The encoder analyzes the input stream to find runs of identical bytes (for RLE
+  25| compression) and sequences of varying bytes (stored literally). It balances
+  26| between these modes to achieve optimal compression.
+  27| 
+  28| Functions:
+  29| 
+  30| - :py:func:`decode`: Decompress RLE-encoded data to raw bytes
+  31| - :py:func:`encode`: Compress raw bytes using RLE encoding
+  32| 
+  33| Example usage::
+  34| 
+  35|     from psd_tools.compression.rle import encode, decode
+  36| 
+  37|     # Encode raw data
+  38|     raw_data = b'\x00' * 100 + b'\xff' * 50
+  39|     compressed = encode(raw_data)
+  40| 
+  41|     # Decode back to raw
+  42|     decompressed = decode(compressed, len(raw_data))
+  43|     assert decompressed == raw_data
+  44| 
+  45| Performance notes:
+  46| 
+  47| - RLE works best for images with large uniform areas (solid colors, gradients)
+  48| - Worst case: file size can increase by ~0.4% for random data
+  49| - Best case: massive compression for solid colors (100:1 or better)
+  50| 
+  51| The pure Python implementation is used as a reference and fallback. For
+  52| production use with large files, ensure the Cython version is compiled by
+  53| installing with build tools available.
+  54| """
+  55| 
+  56| 
+  57| def decode(data: bytes, size: int) -> bytes:
+  58|     """decode(data, size) -> bytes
+  59| 
+  60|     Apple PackBits RLE decoder.
+  61| 
+  62|     Tolerant implementation: runs that would exceed *size* are clipped at the
+  63|     row boundary, runs whose input is truncated copy what is available, and any
+  64|     remaining bytes are zero-padded.  The function always returns exactly *size*
+  65|     bytes without raising.
+  66|     """
+  67| 
+  68|     i, j = 0, 0
+  69|     length = len(data)
+  70|     data = bytearray(data)
+  71|     result = bytearray(size)  # pre-allocated and zero-filled
+  72| 
+  73|     while i < length and j < size:
+  74|         i, bit = i + 1, data[i]
+  75|         if bit > 128:
+  76|             bit = 256 - bit
+  77|             if i >= length:  # lone repeat header at end of stream — stop
+  78|                 break
+  79|             actual = min(1 + bit, size - j)  # clip at remaining output space
+  80|             result[j : j + actual] = bytes([data[i]]) * actual
+  81|             j += actual
+  82|             i += 1
+  83|         elif bit < 128:
+  84|             copy_count = 1 + bit
+  85|             available = length - i
+  86|             actual = min(copy_count, available, size - j)  # clip to input and output
+  87|             result[j : j + actual] = data[i : i + actual]
+  88|             j += actual
+  89|             i += min(copy_count, available)  # advance by declared amount or to end
+  90|         # bit == 128: no-op
+  91| 
+  92|     return bytes(result)
+  93| 
+  94| 
+  95| def encode(data: bytes) -> bytes:
+  96|     """encode(data) -> bytes
+  97| 
+  98|     Apple PackBits RLE encoder.
+  99|     """
+ 100| 
+ 101|     MAX_LEN = 0xFF >> 1
+ 102|     length = len(data)
+ 103|     i = 0
+ 104|     j = 0
+ 105|     result = bytearray()
+ 106| 
+ 107|     if length == 0:
+ 108|         return data
+ 109|     if length == 1:
+ 110|         result.extend((0, data[0]))
+ 111|         return result
+ 112| 
+ 113|     while i < length:
+ 114|         if j + 1 < length and data[j] == data[j + 1]:
+ 115|             while j < length:
+ 116|                 if j - i >= MAX_LEN:
+ 117|                     break
+ 118|                 if j + 1 >= length or data[j] != data[j + 1]:
+ 119|                     break
+ 120|                 j += 1
+ 121|             result.extend((256 - (j - i), data[i]))
+ 122|             i = j = j + 1
+ 123|         else:
+ 124|             while j < length:
+ 125|                 if j - i >= MAX_LEN:
+ 126|                     break
+ 127|                 if j + 1 < length and (data[j] != data[j + 1]):
+ 128|                     pass
+ 129|                 # NOTE: There's no space saved from encoding length 2 repetitions.
+ 130|                 #: For example:
+ 131|                 #  A  B  C  D  D  E  F  G  G  G  G  G  G  H  I  J  J  K
+ 132|                 #: could be encoded as either of the following:
+ 133|                 # +2  A  B  C -1  D +1  E  F -5  G +1  H  I -1  J +0  K
+ 134|                 # +6  A  B  C  D  D  E  F -5  G +3  H  I  J  J  K
+ 135|                 elif (
+ 136|                     ((j + 2 == length) or (MAX_LEN - (j - i) <= 2))
+ 137|                     and not (j + 1 == length)
+ 138|                     and (data[j] == data[j + 1])
+ 139|                 ):
+ 140|                     break
+ 141|                 elif j + 2 < length and (data[j] == data[j + 1] == data[j + 2]):
+ 142|                     break
+ 143|                 j += 1
+ 144|             result.append(j - i - 1)
+ 145|             result.extend(data[i:j])
+ 146|             i = j
+ 147|     return bytes(result)
+ 148| 
+ 149| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7814 teacher=unknown flags=[safe_but_cwe_in_expl]
+[ANALYSIS]
+# zerogod/acceptor.go 全文安全分析
+
+## 一、文件结构与入口点枚举
+
+本文件是 ZeroGod（一个 mDNS/DNS-SD 服务欺骗工具，类似 bettercap 的 zeroconf 模块）的监听器封装。全文共包含以下函数与数据结构，逐一分析：
+
+1. `TCP_HANDLERS` 全局映射（第 14–27 行）
+2. `Acceptor` 结构体定义（第 29–41 行）
+3. `HandlerContext` 结构体定义（第 43–53 行）
+4. `NewAcceptor` 构造函数（第 55–85 行）
+5. `(*Acceptor).startTCP`（第 87–133 行）
+6. `(*Acceptor).startUDP`（第 135–166 行）
+7. `(*Acceptor).Start`（第 168–174 行）
+8. `(*Acceptor).Stop`（第 176–190 行）
+
+## 二、逐函数入口点与 source→sink 分析
+
+### 1. TCP_HANDLERS 映射（第 14–27 行）
+
+四个条目：`_ipp`、`_ipps`、`_http`、`_https`。这是静态配置表，非用户输入可控。唯一的动态性在于 `NewAcceptor` 中通过 `strings.Contains(service, svcName)` 匹配（第 66 行）。注意匹配顺序依赖 Go map 遍历的随机性：若 service 同时含 `_http` 与 `_ipps` 等子串，命中的 handler 不确定——这是一个**功能性缺陷**（非确定性 handler 选择），但不是可利用的安全漏洞，因为所有 handler 都在本模块内实现且 panic 有 recover 保护。
+
+### 2. NewAcceptor（第 55–85 行）
+
+**source**：`service` 字符串参数（最终来自 mDNS 广播的服务类型名，即网络对端可控输入）。
+**sink**：
+- 第 60 行：`strings.Contains(service, "_tcp")` → 仅决定 proto 为 "tcp"/"udp"，无注入面。
+- 第 67–72 行：仅用于 map 查找比较，不进入任何解释器/shell/路径。
+- 第 76 行：`mod.Warning("no protocol handler found for service %s ...", tui.Yellow(service), ...)` —— `service` 作为格式化参数传入，非格式串本身，无 format string 注入。
+- 第 80 行：`mod.Info("found %s %s protocol handler (tls=%v)", ...)` 同上。
+
+结论：`service` 只流向日志与字符串比较，不流向命令执行、文件路径或 SQL 等 sink。日志注入（伪造换行）在 tui 日志场景下风险极低且非本文件职责。
+
+### 3. startTCP（第 87–133 行）
+
+**入口点**：`net.Listen("tcp", "0.0.0.0:%d")`（第 90 行）——绑定所有接口。这是工具的设计意图（局域网服务欺骗），但值得指出：若运行环境有不受信网络接口，监听会暴露到该网络。这属于部署配置问题，代码层面无缺陷。
+
+第 92–94 行：TLS 包装，tlsConfig 由调用方提供，本文件不构造证书逻辑。
+
+第 100–132 行 accept 循环：
+- 每个 conn 启动 goroutine（第 108 行），构造 HandlerContext 并调用 `a.handler.Handle(ctx)`（第 130 行）。
+- **关键防御点**：第 126–129 行 `defer func(){ if r := recover(); r != nil { a.mod.Error(...) } }()`。这确保任意客户端发送的畸形数据导致 handler panic 时不会击穿整个进程。注意 recover 在 defer 中位于 Handle 调用之后注册于同一 defer 内——defer 注册在第 126 行，Handle 调用在第 130 行，顺序正确，recover 有效覆盖 Handle 执行期间的所有 panic。
+- 无连接数限制、无超时设置（未调用 `conn.SetDeadline`）：恶意客户端可通过大量慢速连接消耗资源（goroutine/fd 耗尽）。这是**资源耗尽类弱点（CWE-400 类似）**，但作为主动欺骗工具，其威胁模型是攻击者对抗场景，且实际协议 handler（ipp/http，不在本文件内）通常自行处理读写；本文件本身不读取客户端数据，因此慢速连接最多占用一个 goroutine + 一个 fd。属于低危健壮性问题而非典型可利用漏洞。
+- 客户端数据在本文件中不被解析：`conn.RemoteAddr()`（第 103、128 行）仅用于日志。
+
+### 4. startUDP（第 135–166 行）
+
+**入口点**：UDP socket 绑定 `0.0.0.0:port`（第 137–139 行）。
+**source→sink**：第 152 行 `ReadFromUDP(buffer[0:])` 读入网络数据（source），第 156 行 `a.mod.Info("%v:\n%s", addr, Dump(buffer[0:n]))` —— 数据经 `Dump` 后作为格式化参数输出到日志。验证：
+- 格式串是字面量，用户数据在参数位，无 format string 注入；
+- `buffer[0:n]` 切片边界由 ReadFromUDP 返回值保证，无越界；
+- `Dump`（外部函数）负责十六进制转储，即使内容含控制字符也只是日志污染，无执行 sink。
+- 固定 4096 字节缓冲区，UDP 单包天然受限，无溢出可能（Go slice 安全）。
+
+### 5. Start / Stop（第 168–190 行）
+
+纯状态分发与关闭逻辑。第 182–184 行 TCP 停止路径：先 `ctxCancel()` 再等待 context Done 再 Close listener——关闭顺序合理。第 187 行 UDP 直接 Close。无输入参与，无漏洞面。唯一小瑕疵：`running=false` 与并发 Accept 循环之间无锁同步（data race on bool），但 Go 中这只是良性竞争，Accept 会因 listener Close 返回错误退出循环，不构成安全问题。
+
+## 三、第二入口与替代通道核查
+
+- **替代通道 1（mDNS 广播内容）**：`service`、`ippAttributes`、`httpPaths` 均来自上游 mDNS 解析（本文件外），本文件中它们只被透传给 HandlerContext 和用于 Contains 匹配/日志，无 sink。
+- **替代通道 2（客户端连接数据）**：TCP 数据完全交给 ippClientHandler/httpClientHandler/handleGenericTCP（外部文件）；UDP 数据只做 Dump 日志。本文件自身不存在将网络字节流导向 exec/file/net 写回的 sink。
+- **黑名单/正则检查**：本文件未使用任何黑名单或正则过滤，故不存在“过滤可绕过”问题。
+
+## 四、综合结论
+
+通读全文后：所有网络输入（service 名、UDP 包内容、TCP 连接）在本文件内的 sink 仅为日志输出，均为格式化参数位置，无注入、无溢出、无路径遍历、无命令执行。panic 被 recover 兜底。存在的仅有两个低危健壮性事项：(1) 监听 0.0.0.0 且 TCP 无连接数限制/超时，理论上可被资源耗尽；(2) handler 匹配用 Contains 且 map 遍历无序，可能导致 handler 选择不确定。均不构成可利用的安全漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文：网络输入包括 mDNS 服务名字符串(第55行参数)、TCP客户端连接(第100行Accept)、UDP数据包(第152行ReadFromUDP)。这些source在本文件内的sink仅为日志输出(第76、80、128、156行)，全部以格式化参数形式传入字面量格式串，无format string注入、无命令执行、无文件操作、无内存越界(Go slice边界由ReadFromUDP返回值保证)。panic由第126-129行的recover兜底，畸形客户端数据不会击穿进程。发现两处低危健壮性问题但不构成可利用漏洞：一是startTCP对每个连接无限流无超时(第108行goroutine无上限)，理论上可被慢速连接耗尽fd和goroutine(CWE-400类)；二是第65-73行用strings.Contains配合map无序遍历匹配handler，当服务名同时命中多个关键字时handler选择不确定，属功能缺陷。此外监听0.0.0.0是该欺骗工具的设计意图，属部署考量。", "fix_suggestion": "no fix needed"}
+
+### id=7815 teacher=unknown flags=[]
+[ANALYSIS]
+# PackBits RLE 编解码器安全分析
+
+## 一、文件结构总览与入口点枚举
+
+本文件是 psd_tools 项目的纯 Python PackBits RLE 回退实现，全文共两个公开函数：
+
+1. `decode(data: bytes, size: int)` —— 第 41 行起定义
+2. `encode(data: bytes) -> bytes` —— 第 76 行起定义
+
+**入口点（source）枚举：**
+- `decode` 的参数 `data`：来自 PSD 文件中压缩的通道行数据，属于不可信外部输入（攻击者可控的文件字节流），第 42 行签名处。
+- `decode` 的参数 `size`：通常为图像宽度×通道字节数，一般由 PSD 文件头派生，也可能间接受攻击者影响。
+- `encode` 的参数 `data`：通常是程序内部生成的原始像素数据，可信度较高，但仍需验证其行为是否可被恶意输入触发异常。
+
+**汇点（sink）枚举：**
+- 第 47-48 行：`data = bytearray(data)`、`result = bytearray(size)` —— 内存分配。
+- 第 53、60、61 行：切片赋值 `result[j : j + actual] = ...` 与 `data[i : i + actual]` 切片读取。
+- 第 84-118 行：`result.extend(...)`、`result.append(...)`、`result.extend(data[i:j])`。
+
+## 二、逐函数逐数据流分析
+
+### 函数 1：`decode`（第 41-73 行）
+
+**数据流 D1：`data` → `bytearray(data)`（第 47 行）**
+source 为外部字节串。`bytearray()` 构造仅做内存拷贝，无解析逻辑，无注入面。防御：无需防御，无 sink 风险。✅ 安全。
+
+**数据流 D2：`size` → `bytearray(size)`（第 48 行）**
+若 `size` 来自恶意 PSD 头（如超大宽度），此处可能造成大额内存分配——但这是所有图像解码器的固有 DoS 面，且分配量受调用方约束，非本模块可修复问题；同时分配失败会抛 `MemoryError` 而非内存破坏。判定为低风险设计权衡，不构成代码级漏洞。⚠️ 备注。
+
+**数据流 D3：头部字节 `bit` → 分支处理（第 51-69 行）**
+- 第 52 行 `i, bit = i + 1, data[i]`：循环条件 `i < length` 保证 `data[i]` 不越界。✅
+- RLE 重复分支（第 54-59 行）：`actual = min(1 + bit, size - j)`（第 57 行）。关键点：进入该分支时已确认 `j < size`（while 条件），故 `size - j ≥ 1`，`actual ≥ 1`，不会出现负数或零长度导致死循环；写入范围 `result[j : j+actual]` 被 `min` 截断在输出缓冲区内。**这是对经典 PackBits 解码器缓冲区溢出漏洞的有效防御**（许多 C 实现因缺少此 clip 而溢出）。✅
+- 字面拷贝分支（第 60-64 行）：`actual = min(copy_count, available, size - j)` 同时钳制输入剩余量与输出剩余量，双向上界均有效。第 64 行 `i += min(copy_count, available)` 按声明长度推进，即使实际拷贝被截断也不会回退或跳过越界。✅
+- `bit == 128` no-op（第 68 行注释）：仅消耗一个字节，正确。✅
+- 孤立重复头在流末尾（第 55-56 行 `if i >= length: break`）：防止 `data[i]` 在下一轮越界。✅
+- 终止性：每轮迭代 `i` 至少加 1（第 52 行无条件执行），`j` 单调不减且受 `size` 上界约束，循环必然终止，无死循环 DoS。✅
+- 返回值恒为 `size` 字节（零填充，第 48 行预分配保证），无信息泄露（不会把未初始化内存返回给调用方）。✅
+
+**结论：decode 无整数溢出、无越界读写、无死循环、无未初始化内存泄露。**
+
+### 函数 2：`encode`（第 76-118 行）
+
+**数据流 E1：空/单字节输入（第 82-86 行）**
+`length == 0` 直接返回原对象；`length == 1` 输出 `(0, data[0])`。边界正确。✅
+
+**数据流 E2：重复游程分支（第 88-95 行）**
+内层 while 由 `j - i >= MAX_LEN`（MAX_LEN=127）和流末尾双重 break 约束，`j` 有界；第 94 行 `result.extend((256 - (j - i), data[i]))` 中 `j - i ∈ [1, 127]`，头部字节落在合法区间 [129, 255]。✅
+
+**数据流 E3：字面分支（第 96-117 行）**
+- 第 99-107 行的内层循环各 break 条件均基于 `j < length` 前提下的索引比较，最坏情况 `j` 推进到 `length`，无越界读。
+- 第 108 行 `result.append(j - i - 1)`：需验证 `j > i`。进入 else 分支的前提是 `not (data[j] == data[j+1])` 或 `j+1 >= length`：
+  - 若 `j+1 < length` 且两字节不等，则外层 while 条件保证本轮至少执行一次 `j += 1`（第 106 行 pass 后落到循环尾隐式自增？——注意第 105-106 行是 `pass`，真正的自增在第 107 行之后的循环体末尾……实际上内层 while 循环体最后一条语句即第 107 行 `j += 1`，每次迭代必执行，除非先命中某个 break）。因此离开循环时必有 `j > i`，`j - i - 1 ≥ 0`，头部字节 ∈ [0, 126]，合法。✅
+  - 若 `j+1 == length`（最后一个字节），同样至少自增一次后由 `j < length` 退出，`j = i + 1`，append(0)，随后 extend 一个字节。✅
+- 第 116 行 `result.extend(data[i:j])`：切片自动钳制，无越界。✅
+- 输出膨胀上界：字面块最多 127 数据字节 + 1 头部 ≈ 0.8% 膨胀，无放大攻击面。✅
+
+## 三、第二入口与替代通道检查
+
+- 本模块无 I/O、无网络、无子进程、无 `eval`/`exec`/`pickle`、无路径操作、无环境变量读取——不存在替代攻击通道。
+- Cython 版本（docstring 提及 `_rle.pyx`）不在本文件范围内，本次结论仅覆盖此 Python 实现。
+- `decode` 是典型的 parser 入口（PSD 文件数据直接可达），但其所有写操作均经 `min` 三重钳制，黑名单式过滤不存在，也不需要。
+- 唯一理论风险是第 48 行 `bytearray(size)` 在 `size` 极大时的资源消耗，但这属于调用方（psd_tools 上层尺寸校验）职责，且抛出的是安全异常而非内存破坏，按业界惯例不计为模块级漏洞。
+
+## 四、最终结论
+
+全部 source→sink 数据流均有有效的结构性防御（min 钳制 + 循环不变量），未发现可利用漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文后逐一验证了 decode 与 encode 两条函数的全部数据流。decode 中外部可控输入 data 与 size 到 result 缓冲区写入的所有路径均受 min(copy_count, available, size - j) 三重钳制保护（第57、61行），重复分支在孤立头部时有提前 break 防越界（第55-56行），循环每轮 i 必然递增保证终止性，返回值恒为 size 字节且由零填充预分配，无未初始化内存泄露。encode 中所有索引 j 受 MAX_LEN=127 与 length 双重约束，头部字节取值始终落在 PackBits 合法区间，切片操作自带钳制。模块无任何 I/O、反序列化、命令执行等替代攻击通道，黑名单过滤不存在也无需存在。唯一备注是 bytearray(size) 在 size 极大时的内存占用属上层调用方职责且以安全异常失败，不构成本模块漏洞。", "fix_suggestion": "no fix needed"}

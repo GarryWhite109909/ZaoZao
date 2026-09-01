@@ -1,0 +1,703 @@
+batch=91 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7844 lang=go
+[CODE]
+   1| package httpserver
+   2| 
+   3| import (
+   4| 	"archive/zip"
+   5| 	"errors"
+   6| 	"fmt"
+   7| 	"io"
+   8| 	"net/http"
+   9| 	"os"
+  10| 	"path/filepath"
+  11| 	"slices"
+  12| 	"strings"
+  13| 	"time"
+  14| 
+  15| 	"goshs.de/goshs/v2/logger"
+  16| )
+  17| 
+  18| // prepareWrite enforces the ACL for dir and applies the upload size limit.
+  19| // Returns false if the request has already been rejected.
+  20| func (fs *FileServer) prepareWrite(w http.ResponseWriter, req *http.Request, dir string) bool {
+  21| 	acl, aclErr := fs.findEffectiveACL(dir)
+  22| 	if aclErr != nil {
+  23| 		logger.Errorf("error reading file based access config: %+v", aclErr)
+  24| 	}
+  25| 	if ok := fs.applyCustomAuth(w, req, acl); !ok {
+  26| 		return false
+  27| 	}
+  28| 	if fs.MaxUpload > 0 {
+  29| 		req.Body = http.MaxBytesReader(w, req.Body, fs.MaxUpload)
+  30| 	}
+  31| 	return true
+  32| }
+  33| 
+  34| // put handles the PUT request to upload files
+  35| func (fs *FileServer) put(w http.ResponseWriter, req *http.Request) {
+  36| 	if !fs.checkCSRF(w, req) {
+  37| 		return
+  38| 	}
+  39| 	if fs.ReadOnly {
+  40| 		fs.handleError(w, req, fmt.Errorf("%s", "Upload not allowed due to 'read only' option"), http.StatusForbidden)
+  41| 		return
+  42| 	}
+  43| 	savepath, err := sanitizePath(fs.UploadFolder, req.URL.Path)
+  44| 	if err != nil {
+  45| 		fs.handleError(w, req, err, http.StatusBadRequest)
+  46| 		return
+  47| 	}
+  48| 
+  49| 	// Block overwriting the .goshs ACL file
+  50| 	if filepath.Base(savepath) == ".goshs" {
+  51| 		fs.handleError(w, req, fmt.Errorf("cannot overwrite ACL file"), http.StatusForbidden)
+  52| 		return
+  53| 	}
+  54| 
+  55| 	// Enforce .goshs ACL and upload size limit
+  56| 	if !fs.prepareWrite(w, req, filepath.Dir(savepath)) {
+  57| 		return
+  58| 	}
+  59| 
+  60| 	// disable G304 (CWE-22): Potential file inclusion via variable
+  61| 	// #nosec G304
+  62| 	osFile, err := os.OpenFile(savepath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+  63| 	if err != nil {
+  64| 		logger.Errorf("Error opening file: %+v", err)
+  65| 		fs.handleError(w, req, err, http.StatusInternalServerError)
+  66| 		return
+  67| 	}
+  68| 
+  69| 	if _, err := io.Copy(osFile, req.Body); err != nil {
+  70| 		osFile.Close()
+  71| 		os.Remove(savepath)
+  72| 		var maxErr *http.MaxBytesError
+  73| 		if errors.As(err, &maxErr) {
+  74| 			fs.handleError(w, req, fmt.Errorf("upload exceeds size limit (%d bytes)", fs.MaxUpload), http.StatusRequestEntityTooLarge)
+  75| 		} else {
+  76| 			logger.Errorf("Error writing file %s to disk: %+v", savepath, err)
+  77| 			fs.handleError(w, req, err, http.StatusInternalServerError)
+  78| 		}
+  79| 		return
+  80| 	}
+  81| 	osFile.Close()
+  82| 
+  83| 	// Log request
+  84| 	_ = fs.emitCollabEvent(req, http.StatusOK)
+  85| 	logger.LogRequest(req, http.StatusOK, fs.Verbose, fs.Webhook, nil)
+  86| }
+  87| 
+  88| // upload handles the POST request to upload files
+  89| func (fs *FileServer) upload(w http.ResponseWriter, req *http.Request) {
+  90| 	if !fs.checkCSRF(w, req) {
+  91| 		return
+  92| 	}
+  93| 	if fs.ReadOnly {
+  94| 		fs.handleError(w, req, fmt.Errorf("%s", "Upload not allowed due to 'read only' option"), http.StatusForbidden)
+  95| 		return
+  96| 	}
+  97| 	// Derive and sanitize the target directory (strip trailing "/upload" from URL).
+  98| 	upathDir := strings.TrimSuffix(req.URL.Path, "/upload")
+  99| 	targetDir, err := sanitizePath(fs.UploadFolder, upathDir)
+ 100| 	if err != nil {
+ 101| 		fs.handleError(w, req, err, http.StatusBadRequest)
+ 102| 		return
+ 103| 	}
+ 104| 
+ 105| 	// Enforce .goshs ACL and upload size limit
+ 106| 	if !fs.prepareWrite(w, req, targetDir) {
+ 107| 		return
+ 108| 	}
+ 109| 
+ 110| 	reader, err := req.MultipartReader()
+ 111| 	if err != nil {
+ 112| 		logger.Errorf("reading multipart request: %+v", err)
+ 113| 		return
+ 114| 	}
+ 115| 
+ 116| 	for {
+ 117| 		part, err := reader.NextPart()
+ 118| 		if err == io.EOF {
+ 119| 			break
+ 120| 		}
+ 121| 		if err != nil {
+ 122| 			var maxErr *http.MaxBytesError
+ 123| 			if errors.As(err, &maxErr) {
+ 124| 				fs.handleError(w, req, fmt.Errorf("upload exceeds size limit (%d bytes)", fs.MaxUpload), http.StatusRequestEntityTooLarge)
+ 125| 			} else {
+ 126| 				logger.Errorf("reading multipart part: %+v", err)
+ 127| 			}
+ 128| 			return
+ 129| 		}
+ 130| 		if part.FileName() == "" {
+ 131| 			continue // skip form fields
+ 132| 		}
+ 133| 
+ 134| 		// sanitize filename (No path traversal). part.FileName() already applies
+ 135| 		// filepath.Base, but that still lets ".." through, and filepath.Join with
+ 136| 		// ".." would resolve to the parent of targetDir — writing outside the
+ 137| 		// served tree. Reject any name that is empty, "." or ".." after cleaning.
+ 138| 		filenameSlice := strings.Split(part.FileName(), "/")
+ 139| 		filenameClean := filenameSlice[len(filenameSlice)-1]
+ 140| 
+ 141| 		if filenameClean == "" || filenameClean == "." || filenameClean == ".." {
+ 142| 			logger.Warnf("blocked upload with invalid filename %q", part.FileName())
+ 143| 			continue
+ 144| 		}
+ 145| 
+ 146| 		// Block overwriting the .goshs ACL file
+ 147| 		if filenameClean == ".goshs" {
+ 148| 			logger.Warnf("blocked attempt to upload file named .goshs")
+ 149| 			continue
+ 150| 		}
+ 151| 
+ 152| 		// Prepare destination file paths
+ 153| 		finalPath := filepath.Join(targetDir, filenameClean)
+ 154| 		tempPath := finalPath + "~"
+ 155| 
+ 156| 		// Defence in depth: ensure the resolved destination stays inside targetDir
+ 157| 		// even if filenameClean ever slips a separator or traversal past the checks
+ 158| 		// above.
+ 159| 		if _, err := sanitizePath(targetDir, filenameClean); err != nil {
+ 160| 			logger.Warnf("blocked upload escaping target directory: %q", part.FileName())
+ 161| 			continue
+ 162| 		}
+ 163| 
+ 164| 		// Create temp file
+ 165| 		dst, err := os.Create(tempPath)
+ 166| 		if err != nil {
+ 167| 			logger.Errorf("creating temp file: %+v", err)
+ 168| 			return
+ 169| 		}
+ 170| 
+ 171| 		// Write in chunks
+ 172| 		buf := make([]byte, chunkSize)
+ 173| 		var totalWritten int64
+ 174| 		for {
+ 175| 			n, readErr := part.Read(buf)
+ 176| 			if n > 0 {
+ 177| 				written, writeErr := dst.Write(buf[:n])
+ 178| 				if writeErr != nil || written != n {
+ 179| 					dst.Close()
+ 180| 					os.Remove(tempPath)
+ 181| 					logger.Errorf("writing file to disk: %+v", writeErr)
+ 182| 					return
+ 183| 				}
+ 184| 				totalWritten += int64(written)
+ 185| 			}
+ 186| 			if readErr == io.EOF {
+ 187| 				break
+ 188| 			}
+ 189| 			if readErr != nil {
+ 190| 				dst.Close()
+ 191| 				os.Remove(tempPath)
+ 192| 				var maxErr *http.MaxBytesError
+ 193| 				if errors.As(readErr, &maxErr) {
+ 194| 					fs.handleError(w, req, fmt.Errorf("upload exceeds size limit (%d bytes)", fs.MaxUpload), http.StatusRequestEntityTooLarge)
+ 195| 				} else {
+ 196| 					logger.Errorf("reading uploaded data: %+v", readErr)
+ 197| 				}
+ 198| 				return
+ 199| 			}
+ 200| 		}
+ 201| 
+ 202| 		// Ensure file is flushed and closed
+ 203| 		if err := dst.Sync(); err != nil {
+ 204| 			dst.Close()
+ 205| 			os.Remove(tempPath)
+ 206| 			logger.Errorf("syncing file: %+v", err)
+ 207| 			return
+ 208| 		}
+ 209| 		if err := dst.Close(); err != nil {
+ 210| 			os.Remove(tempPath)
+ 211| 			logger.Errorf("closing file: %+v", err)
+ 212| 			return
+ 213| 		}
+ 214| 
+ 215| 		// Atomically rename to final path
+ 216| 		if err := os.Rename(tempPath, finalPath); err != nil {
+ 217| 			logger.Errorf("renaming file: %+v", err)
+ 218| 			return
+ 219| 		}
+ 220| 
+ 221| 		// Webhook
+ 222| 		logger.HandleWebhookSend(fmt.Sprintf("[WEB] File uploaded: %s", finalPath), "upload", fs.Webhook)
+ 223| 	}
+ 224| 
+ 225| 	// Log request
+ 226| 	body := fs.emitCollabEvent(req, http.StatusOK)
+ 227| 	logger.LogRequest(req, http.StatusOK, fs.Verbose, fs.Webhook, body)
+ 228| 
+ 229| 	// Redirect back from where we came from
+ 230| 	http.Redirect(w, req, upathDir, http.StatusSeeOther)
+ 231| }
+ 232| 
+ 233| // bulkDownload will provide zip archived download bundle of multiple selected files
+ 234| func (fs *FileServer) bulkDownload(w http.ResponseWriter, req *http.Request) {
+ 235| 	if fs.UploadOnly {
+ 236| 		fs.handleError(w, req, fmt.Errorf("%s", "Bulk download not allowed due to 'upload only' option"), http.StatusForbidden)
+ 237| 		return
+ 238| 	}
+ 239| 	// make slice and query files from request
+ 240| 	var filesCleaned []string
+ 241| 	files := req.URL.Query()["file"]
+ 242| 
+ 243| 	// Handle if no files are selected
+ 244| 	if len(files) == 0 {
+ 245| 		fs.handleError(w, req, errors.New("you need to select a file before you can download a zip archive"), 404)
+ 246| 		return
+ 247| 	}
+ 248| 
+ 249| 	// Validate each path, enforce .goshs ACL, and collect absolute paths.
+ 250| 	// ACL checks must happen here, before any response headers are written,
+ 251| 	// so that applyCustomAuth/handleError can still send a proper HTTP error.
+ 252| 	for _, file := range files {
+ 253| 		absPath, err := sanitizePath(fs.Webroot, file)
+ 254| 		if err != nil {
+ 255| 			continue
+ 256| 		}
+ 257| 		// Determine the directory whose ACL governs this selection. For a
+ 258| 		// directory we must start the (upward-walking) ACL lookup at the
+ 259| 		// directory itself, otherwise a .goshs placed *inside* the selected
+ 260| 		// directory would be ignored. For a file we start at its parent.
+ 261| 		governing := absPath
+ 262| 		if info, statErr := os.Stat(absPath); statErr != nil || !info.IsDir() {
+ 263| 			governing = filepath.Dir(absPath)
+ 264| 		}
+ 265| 		acl, aclErr := fs.findEffectiveACL(governing)
+ 266| 		if aclErr == nil {
+ 267| 			if ok := fs.applyCustomAuth(w, req, acl); !ok {
+ 268| 				return
+ 269| 			}
+ 270| 			if slices.Contains(acl.Block, filepath.Base(absPath)) {
+ 271| 				fs.handleError(w, req, fmt.Errorf("requested file is blocked"), http.StatusNotFound)
+ 272| 				return
+ 273| 			}
+ 274| 		}
+ 275| 		filesCleaned = append(filesCleaned, absPath)
+ 276| 	}
+ 277| 
+ 278| 	// Construct filename to download
+ 279| 	filename := fmt.Sprintf("%d_goshs_download.zip", time.Now().Unix())
+ 280| 
+ 281| 	// Set header and serve file
+ 282| 	contentDispo := fmt.Sprintf("attachment; filename=\"%s\"", filename)
+ 283| 	w.Header().Set("Content-Type", "application/zip")
+ 284| 	w.Header().Set("Content-Disposition", contentDispo)
+ 285| 	w.Header().Set("Content-Transfer-Encoding", "binary")
+ 286| 	w.Header().Set("Expires", "0")
+ 287| 
+ 288| 	// Define Zip writer
+ 289| 	resultZip := zip.NewWriter(w)
+ 290| 	defer resultZip.Close()
+ 291| 
+ 292| 	// Path walker for recursion
+ 293| 	walker := func(walkPath string, info os.FileInfo, err error) error {
+ 294| 		if err != nil {
+ 295| 			return err
+ 296| 		}
+ 297| 		if info.IsDir() {
+ 298| 			return nil
+ 299| 		}
+ 300| 
+ 301| 		// Never include the ACL config file itself — it contains credential hashes.
+ 302| 		if filepath.Base(walkPath) == ".goshs" {
+ 303| 			return nil
+ 304| 		}
+ 305| 
+ 306| 		// Re-enforce the effective ACL for this file's own directory. The
+ 307| 		// top-level selection was already checked above, but filepath.Walk
+ 308| 		// descends into nested directories that may carry their own restrictive
+ 309| 		// .goshs (auth or block list). Response headers are already written at
+ 310| 		// this point, so we cannot prompt — silently skip files the caller is
+ 311| 		// not allowed to read instead of leaking them into the archive.
+ 312| 		if acl, aclErr := fs.findEffectiveACL(filepath.Dir(walkPath)); aclErr == nil {
+ 313| 			if !aclSatisfied(req, acl) {
+ 314| 				return nil
+ 315| 			}
+ 316| 			if slices.Contains(acl.Block, filepath.Base(walkPath)) {
+ 317| 				return nil
+ 318| 			}
+ 319| 		}
+ 320| 
+ 321| 		// disable G304 (CWE-22): Potential file inclusion via variable
+ 322| 		// #nosec G304
+ 323| 		file, err := os.Open(walkPath)
+ 324| 		if err != nil {
+ 325| 			return err
+ 326| 		}
+ 327| 		// disable G307 (CWE-703): Deferring unsafe method "Close" on type "*os.File"
+ 328| 		// #nosec G307
+ 329| 		defer file.Close()
+ 330| 
+ 331| 		// walkPath is fs.Webroot + file relative path
+ 332| 		// this would result in a lot of nested folders
+ 333| 		// so we are stripping fs.Webroot again from the structure of the zip file
+ 334| 		// Leaving us with the relative path of the file
+ 335| 		zippath := strings.ReplaceAll(walkPath, fs.Webroot, "")
+ 336| 		header := &zip.FileHeader{
+ 337| 			Name:     zippath[1:],
+ 338| 			Method:   zip.Deflate,
+ 339| 			Modified: info.ModTime(),
+ 340| 		}
+ 341| 		f, err := resultZip.CreateHeader(header)
+ 342| 		if err != nil {
+ 343| 			return err
+ 344| 		}
+ 345| 
+ 346| 		_, err = io.Copy(f, file)
+ 347| 		if err != nil {
+ 348| 			return err
+ 349| 		}
+ 350| 
+ 351| 		return nil
+ 352| 	}
+ 353| 
+ 354| 	// Loop over files and add to zip (filesCleaned contains validated absolute paths)
+ 355| 	for _, file := range filesCleaned {
+ 356| 		err := filepath.Walk(file, walker)
+ 357| 		if err != nil {
+ 358| 			logger.Errorf("creating zip file: %+v", err)
+ 359| 		}
+ 360| 	}
+ 361| 
+ 362| 	// Close Zip Writer and Flush to http.ResponseWriter
+ 363| 	if err := resultZip.Close(); err != nil {
+ 364| 		logger.Error(err)
+ 365| 	} else {
+ 366| 		body := fs.emitCollabEvent(req, http.StatusOK)
+ 367| 		logger.LogRequest(req, http.StatusOK, fs.Verbose, fs.Webhook, body)
+ 368| 	}
+ 369| }
+ 370| 
+ 371| 
+
+### id=7845 lang=go
+[CODE]
+   1| package handles
+   2| 
+   3| import (
+   4| 	"fmt"
+   5| 	"regexp"
+   6| 	"slices"
+   7| 
+   8| 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+   9| 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+  10| 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
+  11| 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+  12| 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+  13| 	"github.com/OpenListTeam/OpenList/v4/pkg/generic"
+  14| 	"github.com/OpenListTeam/OpenList/v4/server/common"
+  15| 	"github.com/gin-gonic/gin"
+  16| 	"github.com/pkg/errors"
+  17| )
+  18| 
+  19| type RecursiveMoveReq struct {
+  20| 	SrcDir         string `json:"src_dir"`
+  21| 	DstDir         string `json:"dst_dir"`
+  22| 	ConflictPolicy string `json:"conflict_policy"`
+  23| }
+  24| 
+  25| // FsRecursiveMove recursively moves files (individual item permission checks skipped for performance).
+  26| func FsRecursiveMove(c *gin.Context) {
+  27| 	var req RecursiveMoveReq
+  28| 	if err := c.ShouldBind(&req); err != nil {
+  29| 		common.ErrorResp(c, err, 400)
+  30| 		return
+  31| 	}
+  32| 
+  33| 	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+  34| 	if !user.CanMove() {
+  35| 		common.ErrorResp(c, errs.PermissionDenied, 403)
+  36| 		return
+  37| 	}
+  38| 	srcDir, err := user.JoinPath(req.SrcDir)
+  39| 	if err != nil {
+  40| 		common.ErrorResp(c, err, 403)
+  41| 		return
+  42| 	}
+  43| 	srcMeta, err := op.GetNearestMeta(srcDir)
+  44| 	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+  45| 		common.ErrorResp(c, err, 500, true)
+  46| 		return
+  47| 	}
+  48| 	if !common.CanWrite(user, srcMeta, srcDir) {
+  49| 		common.ErrorResp(c, errs.PermissionDenied, 403)
+  50| 		return
+  51| 	}
+  52| 	common.GinAppendValues(c, conf.MetaKey, srcMeta)
+  53| 
+  54| 	dstDir, err := user.JoinPath(req.DstDir)
+  55| 	if err != nil {
+  56| 		common.ErrorResp(c, err, 403)
+  57| 		return
+  58| 	}
+  59| 	dstMeta, err := op.GetNearestMeta(dstDir)
+  60| 	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+  61| 		common.ErrorResp(c, err, 500, true)
+  62| 		return
+  63| 	}
+  64| 	if !common.CanWrite(user, dstMeta, dstDir) {
+  65| 		common.ErrorResp(c, errs.PermissionDenied, 403)
+  66| 		return
+  67| 	}
+  68| 
+  69| 	rootFiles, err := fs.List(c.Request.Context(), srcDir, &fs.ListArgs{})
+  70| 	if err != nil {
+  71| 		common.ErrorResp(c, err, 500)
+  72| 		return
+  73| 	}
+  74| 
+  75| 	var existingFileNames []string
+  76| 	if req.ConflictPolicy != OVERWRITE {
+  77| 		dstFiles, err := fs.List(c.Request.Context(), dstDir, &fs.ListArgs{})
+  78| 		if err != nil {
+  79| 			common.ErrorResp(c, err, 500)
+  80| 			return
+  81| 		}
+  82| 		existingFileNames = make([]string, 0, len(dstFiles))
+  83| 		for _, dstFile := range dstFiles {
+  84| 			existingFileNames = append(existingFileNames, dstFile.GetName())
+  85| 		}
+  86| 	}
+  87| 
+  88| 	// record the file path
+  89| 	filePathMap := make(map[model.Obj]string)
+  90| 	movingFiles := generic.NewQueue[model.Obj]()
+  91| 	movingFileNames := make([]string, 0, len(rootFiles))
+  92| 	for _, file := range rootFiles {
+  93| 		movingFiles.Push(file)
+  94| 		filePathMap[file] = srcDir
+  95| 	}
+  96| 
+  97| 	for !movingFiles.IsEmpty() {
+  98| 
+  99| 		movingFile := movingFiles.Pop()
+ 100| 		movingFilePath := filePathMap[movingFile]
+ 101| 		movingFileName := fmt.Sprintf("%s/%s", movingFilePath, movingFile.GetName())
+ 102| 		if movingFile.IsDir() {
+ 103| 			// directory, recursive move
+ 104| 			subFilePath := movingFileName
+ 105| 			subFiles, err := fs.List(c.Request.Context(), movingFileName, &fs.ListArgs{Refresh: true})
+ 106| 			if err != nil {
+ 107| 				common.ErrorResp(c, err, 500)
+ 108| 				return
+ 109| 			}
+ 110| 			for _, subFile := range subFiles {
+ 111| 				movingFiles.Push(subFile)
+ 112| 				filePathMap[subFile] = subFilePath
+ 113| 			}
+ 114| 		} else {
+ 115| 			if movingFilePath == dstDir {
+ 116| 				// same directory, don't move
+ 117| 				continue
+ 118| 			}
+ 119| 
+ 120| 			if slices.Contains(existingFileNames, movingFile.GetName()) {
+ 121| 				if req.ConflictPolicy == CANCEL {
+ 122| 					common.ErrorStrResp(c, fmt.Sprintf("file [%s] exists", movingFile.GetName()), 403)
+ 123| 					return
+ 124| 				} else if req.ConflictPolicy == SKIP {
+ 125| 					continue
+ 126| 				}
+ 127| 			} else if req.ConflictPolicy != OVERWRITE {
+ 128| 				existingFileNames = append(existingFileNames, movingFile.GetName())
+ 129| 			}
+ 130| 			movingFileNames = append(movingFileNames, movingFileName)
+ 131| 
+ 132| 		}
+ 133| 
+ 134| 	}
+ 135| 
+ 136| 	var count = 0
+ 137| 	for i, fileName := range movingFileNames {
+ 138| 		// move
+ 139| 		_, err := fs.Move(c.Request.Context(), fileName, dstDir, len(movingFileNames) > i+1)
+ 140| 		if err != nil {
+ 141| 			common.ErrorResp(c, err, 500)
+ 142| 			return
+ 143| 		}
+ 144| 		count++
+ 145| 	}
+ 146| 
+ 147| 	common.SuccessWithMsgResp(c, fmt.Sprintf("Successfully moved %d %s", count, common.Pluralize(count, "file", "files")))
+ 148| }
+ 149| 
+ 150| type BatchRenameReq struct {
+ 151| 	SrcDir        string `json:"src_dir"`
+ 152| 	RenameObjects []struct {
+ 153| 		SrcName string `json:"src_name"`
+ 154| 		NewName string `json:"new_name"`
+ 155| 	} `json:"rename_objects"`
+ 156| }
+ 157| 
+ 158| // FsBatchRename performs batch rename (individual item permission checks skipped for performance).
+ 159| func FsBatchRename(c *gin.Context) {
+ 160| 	var req BatchRenameReq
+ 161| 	if err := c.ShouldBind(&req); err != nil {
+ 162| 		common.ErrorResp(c, err, 400)
+ 163| 		return
+ 164| 	}
+ 165| 	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+ 166| 	if !user.CanRename() {
+ 167| 		common.ErrorResp(c, errs.PermissionDenied, 403)
+ 168| 		return
+ 169| 	}
+ 170| 
+ 171| 	reqPath, err := user.JoinPath(req.SrcDir)
+ 172| 	if err != nil {
+ 173| 		common.ErrorResp(c, err, 403)
+ 174| 		return
+ 175| 	}
+ 176| 
+ 177| 	meta, err := op.GetNearestMeta(reqPath)
+ 178| 	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+ 179| 		common.ErrorResp(c, err, 500, true)
+ 180| 		return
+ 181| 	}
+ 182| 	if !common.CanWrite(user, meta, reqPath) {
+ 183| 		common.ErrorResp(c, errs.PermissionDenied, 403)
+ 184| 		return
+ 185| 	}
+ 186| 	common.GinAppendValues(c, conf.MetaKey, meta)
+ 187| 	for _, renameObject := range req.RenameObjects {
+ 188| 		if renameObject.SrcName == "" || renameObject.NewName == "" {
+ 189| 			continue
+ 190| 		}
+ 191| 		err = checkRelativePath(renameObject.NewName)
+ 192| 		if err != nil {
+ 193| 			common.ErrorResp(c, err, 403)
+ 194| 			return
+ 195| 		}
+ 196| 		filePath := fmt.Sprintf("%s/%s", reqPath, renameObject.SrcName)
+ 197| 		if err := fs.Rename(c.Request.Context(), filePath, renameObject.NewName); err != nil {
+ 198| 			common.ErrorResp(c, err, 500)
+ 199| 			return
+ 200| 		}
+ 201| 	}
+ 202| 	common.SuccessResp(c)
+ 203| }
+ 204| 
+ 205| type RegexRenameReq struct {
+ 206| 	SrcDir       string `json:"src_dir"`
+ 207| 	SrcNameRegex string `json:"src_name_regex"`
+ 208| 	NewNameRegex string `json:"new_name_regex"`
+ 209| }
+ 210| 
+ 211| // FsRegexRename renames files by regex (individual item permission checks skipped for performance).
+ 212| func FsRegexRename(c *gin.Context) {
+ 213| 	var req RegexRenameReq
+ 214| 	if err := c.ShouldBind(&req); err != nil {
+ 215| 		common.ErrorResp(c, err, 400)
+ 216| 		return
+ 217| 	}
+ 218| 	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+ 219| 	if !user.CanRename() {
+ 220| 		common.ErrorResp(c, errs.PermissionDenied, 403)
+ 221| 		return
+ 222| 	}
+ 223| 
+ 224| 	reqPath, err := user.JoinPath(req.SrcDir)
+ 225| 	if err != nil {
+ 226| 		common.ErrorResp(c, err, 403)
+ 227| 		return
+ 228| 	}
+ 229| 
+ 230| 	meta, err := op.GetNearestMeta(reqPath)
+ 231| 	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+ 232| 		common.ErrorResp(c, err, 500, true)
+ 233| 		return
+ 234| 	}
+ 235| 	if !common.CanWrite(user, meta, reqPath) {
+ 236| 		common.ErrorResp(c, errs.PermissionDenied, 403)
+ 237| 		return
+ 238| 	}
+ 239| 	common.GinAppendValues(c, conf.MetaKey, meta)
+ 240| 
+ 241| 	srcRegexp, err := regexp.Compile(req.SrcNameRegex)
+ 242| 	if err != nil {
+ 243| 		common.ErrorResp(c, err, 500)
+ 244| 		return
+ 245| 	}
+ 246| 
+ 247| 	files, err := fs.List(c.Request.Context(), reqPath, &fs.ListArgs{})
+ 248| 	if err != nil {
+ 249| 		common.ErrorResp(c, err, 500)
+ 250| 		return
+ 251| 	}
+ 252| 
+ 253| 	for _, file := range files {
+ 254| 		if srcRegexp.MatchString(file.GetName()) {
+ 255| 			newFileName := srcRegexp.ReplaceAllString(file.GetName(), req.NewNameRegex)
+ 256| 			err := checkRelativePath(newFileName)
+ 257| 			if err != nil {
+ 258| 				common.ErrorResp(c, err, 403)
+ 259| 				return
+ 260| 			}
+ 261| 			filePath := fmt.Sprintf("%s/%s", reqPath, file.GetName())
+ 262| 			if err := fs.Rename(c.Request.Context(), filePath, newFileName); err != nil {
+ 263| 				common.ErrorResp(c, err, 500)
+ 264| 				return
+ 265| 			}
+ 266| 		}
+ 267| 
+ 268| 	}
+ 269| 
+ 270| 	common.SuccessResp(c)
+ 271| }
+ 272| 
+ 273| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7844 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **put（第 27–76 行）**：source 为 `req.URL.Path`，sink 为 `os.OpenFile(savepath)`。经 `sanitizePath(fs.UploadFolder, ...)` 清洗（第 35 行），并有 `.goshs` 覆盖拦截（第 41 行）、ACL 检查与 MaxBytesReader（prepareWrite）。若 sanitizePath 正确拒绝 `..` 逃逸，则无路径穿越。防御依赖 sanitizePath 实现，但同文件其他路径均复用它，且 upload 中还有纵深校验佐证其语义。
+
+2. **upload（第 79–190 行）**：source 为 multipart 的 `part.FileName()`，sink 为 `os.Create(tempPath)`/`os.Rename`。文件名先按 `/` 取末段（第 111–113 行），显式拒绝空、`.`、`..`（第 115 行），并阻止 `.goshs`（第 122 行）；随后第 131 行再用 `sanitizePath(targetDir, filenameClean)` 做纵深校验，确保解析结果不逃逸 targetDir。反斜杠在 Linux 上非分隔符，即使 Windows 场景也会被第 131 行的 sanitize 拦截。ACL 在写前对 targetDir 生效（第 90 行）。未发现有效绕过链。
+
+3. **bulkDownload（第 193 行起）**：source 为 `req.URL.Query()["file"]`，sink 为 `os.Open(walkPath)` 与 zip 打包。
+   - 每个 file 经 `sanitizePath(fs.Webroot, file)` 校验（第 205 行），失败即跳过；
+   - 对选中项执行 ACL（applyCustomAuth + Block 列表，第 216–226 行）；
+   - walker 内对每个实际打包文件再次执行 `findEffectiveACL` + `aclSatisfied` + Block 检查（第 262–270 行），并排除 `.goshs` 本身（第 254 行），防止嵌套目录中受限文件泄露及凭据哈希外泄；
+   - 目录递归不会逃出 Webroot，因为入口已被 sanitizePath 限制。
+
+4. **次要观察**：walker 中 `findEffectiveACL` 出错时（aclErr != nil）会跳过检查直接打包（fail-open），以及 `zippath[1:]` 在 Webroot 异常时可能产生错误相对路径——均为健壮性问题而非可利用漏洞；ACL 缺失视为允许是该类工具的常见设计。
+
+5. **第二入口核查**：put 与 upload 是仅有的两个写入口，均受 CSRF、ReadOnly、ACL、大小限制约束；bulkDownload 是唯一批量读入口，已双重 ACL 校验。未发现替代通道绕过。
+
+结论：全文未见可利用的 source→sink 漏洞；关键清洗点均有纵深防御。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "逐行审查了 put、upload、bulkDownload 三个入口。上传路径经 sanitizePath 清洗且文件名有黑名单加 sanitizePath 纵深双重校验；.goshs ACL 文件在写入和打包两条通道均被阻断；bulkDownload 对每个查询文件做 sanitizePath 校验并在 walker 内对每个实际打包文件二次执行 ACL 与 Block 检查，防止嵌套目录越权读取。唯一弱点是 findEffectiveACL 出错时 walker 采用 fail-open 策略跳过检查，以及 aclErr 时仍将文件加入打包列表，但这属于设计取舍与健壮性问题，在无法证明可利用的前提下不构成确认漏洞。", "fix_suggestion": "no fix needed"}
+
+### id=7845 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+**入口点枚举（全文三个 handler，均为 POST JSON body）**
+1. `FsRecursiveMove`：`src_dir`、`dst_dir`、`conflict_policy`。
+2. `FsBatchRename`：`src_dir` + `rename_objects[].src_name / new_name`。
+3. `FsRegexRename`：`src_dir`、`src_name_regex`、`new_name_regex`。
+
+**逐函数数据流验证**
+
+- **FsRecursiveMove（第 26–148 行）**：第 38 行 `user.JoinPath(req.SrcDir)` 与第 54 行对 `DstDir` 做路径归一化与用户根目录约束；后续所有被移动文件路径（第 101、105 行）均来自 `fs.List` 返回的真实目录项拼接，不直接采信用户输入的文件名。冲突策略仅影响覆盖/跳过逻辑，无 sink 可控注入。结论：无路径穿越。
+
+- **FsBatchRename（第 159–204 行）**：
+  - 第 172 行 `user.JoinPath(req.SrcDir)` 有效约束了目录基路径；
+  - 第 192 行只对 `NewName` 调用了 `checkRelativePath` 防穿越；
+  - **第 189 行仅检查 `SrcName == ""`，随后第 197 行 `filePath := fmt.Sprintf("%s/%s", reqPath, renameObject.SrcName)` 直接拼接，未做任何相对路径校验**；
+  - 第 198 行 `fs.Rename(ctx, filePath, ...)` 为 sink。攻击者传 `src_name: "../../../../etc/target"` 即可重命名用户授权范围之外的文件（source→sink 全程无有效防御，`JoinPath` 只作用于 `req.SrcDir`，不覆盖逐项 `SrcName`）。这是典型的第二入口遗漏：同一结构体中一个字段过滤、另一个字段漏过滤。
+
+- **FsRegexRename（第 214–271 行）**：第 256 行由正则替换生成的新名在第 257 行经过 `checkRelativePath` 校验，防御有效（假设该函数拒绝 `..`）；源路径第 262 行来自真实列出的文件名，不可控。注意第 243 行 `regexp.Compile` 使用 Go RE2，无 ReDoS。结论：此函数安全。
+
+**替代通道检查**：三个接口权限位不同（move/rename），但都要求写权限；批量重命名接口是唯一存在未校验 source 的通道，无法被其他两个接口的防御间接弥补。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-22 Path Traversal (improper limitation of a pathname to a restricted directory)", "risk_level": "High", "source": "line 153: 用户可控的 rename_objects[].src_name，仅在188做空串检查", "sink": "196: filePath := fmt.Sprintf(`%s/%s`, reqPath, renameObject.SrcName) 后传入 fs.Rename", "explanation": "FsBatchRename 中171 JoinPath 只约束了 req.SrcDir 基目录，第 192 行仅对 NewName 调用 checkRelativePath，而 SrcName 未做任何相对路径校验即在第 197 行拼入文件路径并作为 fs.Rename 的源路径执行，攻击者可用形如 ../../.. 的 src_name 重命名其授权目录之外的任意文件，造成越权写操作；对比同文件 FsRegexRename 第 257 行对新名做了校验，证明此处属遗漏。另有教师漏报的越权面：line 25 注释自认 FsRecursiveMove『为性能跳过逐项权限检查』——handler 仅对顶层 srcDir/dstDir 做 CanWrite（line 48/64），递归下钻的子目录（line 105 fs.List）与逐项 fs.Move 均无权限校验，持有顶层写权限的用户可移动/覆盖同树内无写权限子目录的内容，放大 CWE-22 的可达面。", "fix_suggestion": "line 196 之前对 renameObject.SrcName 同样调用 checkRelativePath 并在失败时返回 403，或改用安全的路径拼接函数拒绝包含 .. 及绝对路径成分的输入。；递归移动路径上对每个下钻目录补 CanWrite 校验（或拒绝跨目录树移动），SrcName 除空串外同样过 checkRelativePath（与 NewName 对齐）"}

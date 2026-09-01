@@ -55,14 +55,18 @@ SINK_SIG = {
 
 def call_teacher(key, model, system, user, temperature, thinking="disabled"):
     global CALL_N, TOK_IN, TOK_OUT
-    body = json.dumps({
+    payload = {
         "model": model,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
         "temperature": temperature,
-        "thinking": {"type": thinking},
         "max_tokens": 16384,   # 放宽:长分析+长输出防截断(JSON 截断会被 G4 拒)
-    }).encode("utf-8")
+    }
+    # glm-5.3-flash 是强制思考模型:thinking disabled 会被 400 拒绝,
+    # 因此 disabled 时不发送该字段(默认思考,content 输出仍干净);enabled 照发。
+    if thinking != "disabled":
+        payload["thinking"] = {"type": thinking}
+    body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(API_URL, data=body, headers={
         "Content-Type": "application/json",
         "Authorization": f"Bearer {key}",
@@ -73,8 +77,8 @@ def call_teacher(key, model, system, user, temperature, thinking="disabled"):
             raise RuntimeError(f"预算用尽({MAX_CALLS} 次调用)")
         try:
             t0 = time.time()
-            # 900s:智谱算力紧张时排队+生成可能都要等很久(用户实测 ~1 分钟等待常见)
-            with urllib.request.urlopen(req, timeout=900) as resp:
+            # 1800s:智谱算力紧张时排队+思考模型长生成可能远超 15 分钟(用户要求放宽防误判)
+            with urllib.request.urlopen(req, timeout=1800) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             CALL_N += 1
             u = data.get("usage", {})
@@ -216,6 +220,9 @@ def main():
             n_skip += 1
             continue
         user = t["user"]
+        if t.get("hint"):   # groups 模式与 redistill 模式统一支持 hint 注入
+            user += ("\n\n【前期审计已实测的事实(供参考;仍需你在分析中独立核对代码)】\n"
+                     + t["hint"])
         code_m = CODE_FENCE.search(user)
         code = code_m.group(1) if code_m else ""
         t0 = time.time()

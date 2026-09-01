@@ -1,0 +1,689 @@
+batch=157 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=8021 lang=python
+[CODE]
+   1| import logging
+   2| import os
+   3| import uuid
+   4| from fnmatch import fnmatch
+   5| from pathlib import Path
+   6| from typing import Optional
+   7| from urllib.parse import quote
+   8| 
+   9| from fastapi import (
+  10|     APIRouter,
+  11|     Depends,
+  12|     File,
+  13|     HTTPException,
+  14|     Request,
+  15|     UploadFile,
+  16|     status,
+  17|     Query,
+  18| )
+  19| from fastapi.responses import FileResponse, StreamingResponse
+  20| from open_webui.constants import ERROR_MESSAGES
+  21| from open_webui.env import SRC_LOG_LEVELS
+  22| 
+  23| from open_webui.models.users import Users
+  24| from open_webui.models.files import (
+  25|     FileForm,
+  26|     FileModel,
+  27|     FileModelResponse,
+  28|     Files,
+  29| )
+  30| from open_webui.models.knowledge import Knowledges
+  31| 
+  32| from open_webui.routers.knowledge import get_knowledge, get_knowledge_list
+  33| from open_webui.routers.retrieval import ProcessFileForm, process_file
+  34| from open_webui.routers.audio import transcribe
+  35| from open_webui.storage.provider import Storage
+  36| from open_webui.utils.auth import get_admin_user, get_verified_user
+  37| from pydantic import BaseModel
+  38| 
+  39| log = logging.getLogger(__name__)
+  40| log.setLevel(SRC_LOG_LEVELS["MODELS"])
+  41| 
+  42| 
+  43| router = APIRouter()
+  44| 
+  45| 
+  46| ############################
+  47| # Check if the current user has access to a file through any knowledge bases the user may be in.
+  48| ############################
+  49| 
+  50| 
+  51| def has_access_to_file(
+  52|     file_id: Optional[str], access_type: str, user=Depends(get_verified_user)
+  53| ) -> bool:
+  54|     file = Files.get_file_by_id(file_id)
+  55|     log.debug(f"Checking if user has {access_type} access to file")
+  56| 
+  57|     if not file:
+  58|         raise HTTPException(
+  59|             status_code=status.HTTP_404_NOT_FOUND,
+  60|             detail=ERROR_MESSAGES.NOT_FOUND,
+  61|         )
+  62| 
+  63|     has_access = False
+  64|     knowledge_base_id = file.meta.get("collection_name") if file.meta else None
+  65| 
+  66|     if knowledge_base_id:
+  67|         knowledge_bases = Knowledges.get_knowledge_bases_by_user_id(
+  68|             user.id, access_type
+  69|         )
+  70|         for knowledge_base in knowledge_bases:
+  71|             if knowledge_base.id == knowledge_base_id:
+  72|                 has_access = True
+  73|                 break
+  74| 
+  75|     return has_access
+  76| 
+  77| 
+  78| ############################
+  79| # Upload File
+  80| ############################
+  81| 
+  82| 
+  83| @router.post("/", response_model=FileModelResponse)
+  84| def upload_file(
+  85|     request: Request,
+  86|     file: UploadFile = File(...),
+  87|     user=Depends(get_verified_user),
+  88|     file_metadata: dict = None,
+  89|     process: bool = Query(True),
+  90| ):
+  91|     log.info(f"file.content_type: {file.content_type}")
+  92| 
+  93|     file_metadata = file_metadata if file_metadata else {}
+  94|     try:
+  95|         unsanitized_filename = file.filename
+  96|         filename = os.path.basename(unsanitized_filename)
+  97| 
+  98|         # replace filename with uuid
+  99|         id = str(uuid.uuid4())
+ 100|         name = filename
+ 101|         filename = f"{id}_{filename}"
+ 102|         tags = {
+ 103|             "OpenWebUI-User-Email": user.email,
+ 104|             "OpenWebUI-User-Id": user.id,
+ 105|             "OpenWebUI-User-Name": user.name,
+ 106|             "OpenWebUI-File-Id": id,
+ 107|         }
+ 108|         contents, file_path = Storage.upload_file(file.file, filename, tags)
+ 109| 
+ 110|         file_item = Files.insert_new_file(
+ 111|             user.id,
+ 112|             FileForm(
+ 113|                 **{
+ 114|                     "id": id,
+ 115|                     "filename": name,
+ 116|                     "path": file_path,
+ 117|                     "meta": {
+ 118|                         "name": name,
+ 119|                         "content_type": file.content_type,
+ 120|                         "size": len(contents),
+ 121|                         "data": file_metadata,
+ 122|                     },
+ 123|                 }
+ 124|             ),
+ 125|         )
+ 126|         if process:
+ 127|             try:
+ 128|                 if file.content_type in [
+ 129|                     "audio/mpeg",
+ 130|                     "audio/wav",
+ 131|                     "audio/ogg",
+ 132|                     "audio/x-m4a",
+ 133|                 ]:
+ 134|                     file_path = Storage.get_file(file_path)
+ 135|                     result = transcribe(request, file_path)
+ 136| 
+ 137|                     process_file(
+ 138|                         request,
+ 139|                         ProcessFileForm(file_id=id, content=result.get("text", "")),
+ 140|                         user=user,
+ 141|                     )
+ 142|                 elif file.content_type not in [
+ 143|                     "image/png",
+ 144|                     "image/jpeg",
+ 145|                     "image/gif",
+ 146|                     "video/mp4",
+ 147|                     "video/ogg",
+ 148|                     "video/quicktime",
+ 149|                     "video/webm",
+ 150|                 ]:
+ 151|                     process_file(request, ProcessFileForm(file_id=id), user=user)
+ 152| 
+ 153|                 file_item = Files.get_file_by_id(id=id)
+ 154|             except Exception as e:
+ 155|                 log.exception(e)
+ 156|                 log.error(f"Error processing file: {file_item.id}")
+ 157|                 file_item = FileModelResponse(
+ 158|                     **{
+ 159|                         **file_item.model_dump(),
+ 160|                         "error": str(e.detail) if hasattr(e, "detail") else str(e),
+ 161|                     }
+ 162|                 )
+ 163| 
+ 164|         if file_item:
+ 165|             return file_item
+ 166|         else:
+ 167|             raise HTTPException(
+ 168|                 status_code=status.HTTP_400_BAD_REQUEST,
+ 169|                 detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
+ 170|             )
+ 171| 
+ 172|     except Exception as e:
+ 173|         log.exception(e)
+ 174|         raise HTTPException(
+ 175|             status_code=status.HTTP_400_BAD_REQUEST,
+ 176|             detail=ERROR_MESSAGES.DEFAULT(e),
+ 177|         )
+ 178| 
+ 179| 
+ 180| ############################
+ 181| # List Files
+ 182| ############################
+ 183| 
+ 184| 
+ 185| @router.get("/", response_model=list[FileModelResponse])
+ 186| async def list_files(user=Depends(get_verified_user), content: bool = Query(True)):
+ 187|     if user.role == "admin":
+ 188|         files = Files.get_files()
+ 189|     else:
+ 190|         files = Files.get_files_by_user_id(user.id)
+ 191| 
+ 192|     if not content:
+ 193|         for file in files:
+ 194|             if "content" in file.data:
+ 195|                 del file.data["content"]
+ 196| 
+ 197|     return files
+ 198| 
+ 199| 
+ 200| ############################
+ 201| # Search Files
+ 202| ############################
+ 203| 
+ 204| 
+ 205| @router.get("/search", response_model=list[FileModelResponse])
+ 206| async def search_files(
+ 207|     filename: str = Query(
+ 208|         ...,
+ 209|         description="Filename pattern to search for. Supports wildcards such as '*.txt'",
+ 210|     ),
+ 211|     content: bool = Query(True),
+ 212|     user=Depends(get_verified_user),
+ 213| ):
+ 214|     """
+ 215|     Search for files by filename with support for wildcard patterns.
+ 216|     """
+ 217|     # Get files according to user role
+ 218|     if user.role == "admin":
+ 219|         files = Files.get_files()
+ 220|     else:
+ 221|         files = Files.get_files_by_user_id(user.id)
+ 222| 
+ 223|     # Get matching files
+ 224|     matching_files = [
+ 225|         file for file in files if fnmatch(file.filename.lower(), filename.lower())
+ 226|     ]
+ 227| 
+ 228|     if not matching_files:
+ 229|         raise HTTPException(
+ 230|             status_code=status.HTTP_404_NOT_FOUND,
+ 231|             detail="No files found matching the pattern.",
+ 232|         )
+ 233| 
+ 234|     if not content:
+ 235|         for file in matching_files:
+ 236|             if "content" in file.data:
+ 237|                 del file.data["content"]
+ 238| 
+ 239|     return matching_files
+ 240| 
+ 241| 
+ 242| ############################
+ 243| # Delete All Files
+ 244| ############################
+ 245| 
+ 246| 
+ 247| @router.delete("/all")
+ 248| async def delete_all_files(user=Depends(get_admin_user)):
+ 249|     result = Files.delete_all_files()
+ 250|     if result:
+ 251|         try:
+ 252|             Storage.delete_all_files()
+ 253|         except Exception as e:
+ 254|             log.exception(e)
+ 255|             log.error("Error deleting files")
+ 256|             raise HTTPException(
+ 257|                 status_code=status.HTTP_400_BAD_REQUEST,
+ 258|                 detail=ERROR_MESSAGES.DEFAULT("Error deleting files"),
+ 259|             )
+ 260|         return {"message": "All files deleted successfully"}
+ 261|     else:
+ 262|         raise HTTPException(
+ 263|             status_code=status.HTTP_400_BAD_REQUEST,
+ 264|             detail=ERROR_MESSAGES.DEFAULT("Error deleting files"),
+ 265|         )
+ 266| 
+ 267| 
+ 268| ############################
+ 269| # Get File By Id
+ 270| ############################
+ 271| 
+ 272| 
+ 273| @router.get("/{id}", response_model=Optional[FileModel])
+ 274| async def get_file_by_id(id: str, user=Depends(get_verified_user)):
+ 275|     file = Files.get_file_by_id(id)
+ 276| 
+ 277|     if not file:
+ 278|         raise HTTPException(
+ 279|             status_code=status.HTTP_404_NOT_FOUND,
+ 280|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 281|         )
+ 282| 
+ 283|     if (
+ 284|         file.user_id == user.id
+ 285|         or user.role == "admin"
+ 286|         or has_access_to_file(id, "read", user)
+ 287|     ):
+ 288|         return file
+ 289|     else:
+ 290|         raise HTTPException(
+ 291|             status_code=status.HTTP_404_NOT_FOUND,
+ 292|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 293|         )
+ 294| 
+ 295| 
+ 296| ############################
+ 297| # Get File Data Content By Id
+ 298| ############################
+ 299| 
+ 300| 
+ 301| @router.get("/{id}/data/content")
+ 302| async def get_file_data_content_by_id(id: str, user=Depends(get_verified_user)):
+ 303|     file = Files.get_file_by_id(id)
+ 304| 
+ 305|     if not file:
+ 306|         raise HTTPException(
+ 307|             status_code=status.HTTP_404_NOT_FOUND,
+ 308|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 309|         )
+ 310| 
+ 311|     if (
+ 312|         file.user_id == user.id
+ 313|         or user.role == "admin"
+ 314|         or has_access_to_file(id, "read", user)
+ 315|     ):
+ 316|         return {"content": file.data.get("content", "")}
+ 317|     else:
+ 318|         raise HTTPException(
+ 319|             status_code=status.HTTP_404_NOT_FOUND,
+ 320|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 321|         )
+ 322| 
+ 323| 
+ 324| ############################
+ 325| # Update File Data Content By Id
+ 326| ############################
+ 327| 
+ 328| 
+ 329| class ContentForm(BaseModel):
+ 330|     content: str
+ 331| 
+ 332| 
+ 333| @router.post("/{id}/data/content/update")
+ 334| async def update_file_data_content_by_id(
+ 335|     request: Request, id: str, form_data: ContentForm, user=Depends(get_verified_user)
+ 336| ):
+ 337|     file = Files.get_file_by_id(id)
+ 338| 
+ 339|     if not file:
+ 340|         raise HTTPException(
+ 341|             status_code=status.HTTP_404_NOT_FOUND,
+ 342|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 343|         )
+ 344| 
+ 345|     if (
+ 346|         file.user_id == user.id
+ 347|         or user.role == "admin"
+ 348|         or has_access_to_file(id, "write", user)
+ 349|     ):
+ 350|         try:
+ 351|             process_file(
+ 352|                 request,
+ 353|                 ProcessFileForm(file_id=id, content=form_data.content),
+ 354|                 user=user,
+ 355|             )
+ 356|             file = Files.get_file_by_id(id=id)
+ 357|         except Exception as e:
+ 358|             log.exception(e)
+ 359|             log.error(f"Error processing file: {file.id}")
+ 360| 
+ 361|         return {"content": file.data.get("content", "")}
+ 362|     else:
+ 363|         raise HTTPException(
+ 364|             status_code=status.HTTP_404_NOT_FOUND,
+ 365|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 366|         )
+ 367| 
+ 368| 
+ 369| ############################
+ 370| # Get File Content By Id
+ 371| ############################
+ 372| 
+ 373| 
+ 374| @router.get("/{id}/content")
+ 375| async def get_file_content_by_id(
+ 376|     id: str, user=Depends(get_verified_user), attachment: bool = Query(False)
+ 377| ):
+ 378|     file = Files.get_file_by_id(id)
+ 379| 
+ 380|     if not file:
+ 381|         raise HTTPException(
+ 382|             status_code=status.HTTP_404_NOT_FOUND,
+ 383|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 384|         )
+ 385| 
+ 386|     if (
+ 387|         file.user_id == user.id
+ 388|         or user.role == "admin"
+ 389|         or has_access_to_file(id, "read", user)
+ 390|     ):
+ 391|         try:
+ 392|             file_path = Storage.get_file(file.path)
+ 393|             file_path = Path(file_path)
+ 394| 
+ 395|             # Check if the file already exists in the cache
+ 396|             if file_path.is_file():
+ 397|                 # Handle Unicode filenames
+ 398|                 filename = file.meta.get("name", file.filename)
+ 399|                 encoded_filename = quote(filename)  # RFC5987 encoding
+ 400| 
+ 401|                 content_type = file.meta.get("content_type")
+ 402|                 filename = file.meta.get("name", file.filename)
+ 403|                 encoded_filename = quote(filename)
+ 404|                 headers = {}
+ 405| 
+ 406|                 if attachment:
+ 407|                     headers["Content-Disposition"] = (
+ 408|                         f"attachment; filename*=UTF-8''{encoded_filename}"
+ 409|                     )
+ 410|                 else:
+ 411|                     if content_type == "application/pdf" or filename.lower().endswith(
+ 412|                         ".pdf"
+ 413|                     ):
+ 414|                         headers["Content-Disposition"] = (
+ 415|                             f"inline; filename*=UTF-8''{encoded_filename}"
+ 416|                         )
+ 417|                         content_type = "application/pdf"
+ 418|                     elif content_type != "text/plain":
+ 419|                         headers["Content-Disposition"] = (
+ 420|                             f"attachment; filename*=UTF-8''{encoded_filename}"
+ 421|                         )
+ 422| 
+ 423|                 return FileResponse(file_path, headers=headers, media_type=content_type)
+ 424| 
+ 425|             else:
+ 426|                 raise HTTPException(
+ 427|                     status_code=status.HTTP_404_NOT_FOUND,
+ 428|                     detail=ERROR_MESSAGES.NOT_FOUND,
+ 429|                 )
+ 430|         except Exception as e:
+ 431|             log.exception(e)
+ 432|             log.error("Error getting file content")
+ 433|             raise HTTPException(
+ 434|                 status_code=status.HTTP_400_BAD_REQUEST,
+ 435|                 detail=ERROR_MESSAGES.DEFAULT("Error getting file content"),
+ 436|             )
+ 437|     else:
+ 438|         raise HTTPException(
+ 439|             status_code=status.HTTP_404_NOT_FOUND,
+ 440|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 441|         )
+ 442| 
+ 443| 
+ 444| @router.get("/{id}/content/html")
+ 445| async def get_html_file_content_by_id(id: str, user=Depends(get_verified_user)):
+ 446|     file = Files.get_file_by_id(id)
+ 447| 
+ 448|     if not file:
+ 449|         raise HTTPException(
+ 450|             status_code=status.HTTP_404_NOT_FOUND,
+ 451|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 452|         )
+ 453| 
+ 454|     file_user = Users.get_user_by_id(file.user_id)
+ 455|     if not file_user.role == "admin":
+ 456|         if not file_user:
+ 457|             raise HTTPException(
+ 458|                 status_code=status.HTTP_404_NOT_FOUND,
+ 459|                 detail=ERROR_MESSAGES.NOT_FOUND,
+ 460|             )
+ 461| 
+ 462|     if (
+ 463|         file.user_id == user.id
+ 464|         or user.role == "admin"
+ 465|         or has_access_to_file(id, "read", user)
+ 466|     ):
+ 467|         try:
+ 468|             file_path = Storage.get_file(file.path)
+ 469|             file_path = Path(file_path)
+ 470| 
+ 471|             # Check if the file already exists in the cache
+ 472|             if file_path.is_file():
+ 473|                 log.info(f"file_path: {file_path}")
+ 474|                 return FileResponse(file_path)
+ 475|             else:
+ 476|                 raise HTTPException(
+ 477|                     status_code=status.HTTP_404_NOT_FOUND,
+ 478|                     detail=ERROR_MESSAGES.NOT_FOUND,
+ 479|                 )
+ 480|         except Exception as e:
+ 481|             log.exception(e)
+ 482|             log.error("Error getting file content")
+ 483|             raise HTTPException(
+ 484|                 status_code=status.HTTP_400_BAD_REQUEST,
+ 485|                 detail=ERROR_MESSAGES.DEFAULT("Error getting file content"),
+ 486|             )
+ 487|     else:
+ 488|         raise HTTPException(
+ 489|             status_code=status.HTTP_404_NOT_FOUND,
+ 490|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 491|         )
+ 492| 
+ 493| 
+ 494| @router.get("/{id}/content/{file_name}")
+ 495| async def get_file_content_by_id(id: str, user=Depends(get_verified_user)):
+ 496|     file = Files.get_file_by_id(id)
+ 497| 
+ 498|     if not file:
+ 499|         raise HTTPException(
+ 500|             status_code=status.HTTP_404_NOT_FOUND,
+ 501|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 502|         )
+ 503| 
+ 504|     if (
+ 505|         file.user_id == user.id
+ 506|         or user.role == "admin"
+ 507|         or has_access_to_file(id, "read", user)
+ 508|     ):
+ 509|         file_path = file.path
+ 510| 
+ 511|         # Handle Unicode filenames
+ 512|         filename = file.meta.get("name", file.filename)
+ 513|         encoded_filename = quote(filename)  # RFC5987 encoding
+ 514|         headers = {
+ 515|             "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+ 516|         }
+ 517| 
+ 518|         if file_path:
+ 519|             file_path = Storage.get_file(file_path)
+ 520|             file_path = Path(file_path)
+ 521| 
+ 522|             # Check if the file already exists in the cache
+ 523|             if file_path.is_file():
+ 524|                 return FileResponse(file_path, headers=headers)
+ 525|             else:
+ 526|                 raise HTTPException(
+ 527|                     status_code=status.HTTP_404_NOT_FOUND,
+ 528|                     detail=ERROR_MESSAGES.NOT_FOUND,
+ 529|                 )
+ 530|         else:
+ 531|             # File path doesn’t exist, return the content as .txt if possible
+ 532|             file_content = file.content.get("content", "")
+ 533|             file_name = file.filename
+ 534| 
+ 535|             # Create a generator that encodes the file content
+ 536|             def generator():
+ 537|                 yield file_content.encode("utf-8")
+ 538| 
+ 539|             return StreamingResponse(
+ 540|                 generator(),
+ 541|                 media_type="text/plain",
+ 542|                 headers=headers,
+ 543|             )
+ 544|     else:
+ 545|         raise HTTPException(
+ 546|             status_code=status.HTTP_404_NOT_FOUND,
+ 547|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 548|         )
+ 549| 
+ 550| 
+ 551| ############################
+ 552| # Delete File By Id
+ 553| ############################
+ 554| 
+ 555| 
+ 556| @router.delete("/{id}")
+ 557| async def delete_file_by_id(id: str, user=Depends(get_verified_user)):
+ 558|     file = Files.get_file_by_id(id)
+ 559| 
+ 560|     if not file:
+ 561|         raise HTTPException(
+ 562|             status_code=status.HTTP_404_NOT_FOUND,
+ 563|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 564|         )
+ 565| 
+ 566|     if (
+ 567|         file.user_id == user.id
+ 568|         or user.role == "admin"
+ 569|         or has_access_to_file(id, "write", user)
+ 570|     ):
+ 571|         # We should add Chroma cleanup here
+ 572| 
+ 573|         result = Files.delete_file_by_id(id)
+ 574|         if result:
+ 575|             try:
+ 576|                 Storage.delete_file(file.path)
+ 577|             except Exception as e:
+ 578|                 log.exception(e)
+ 579|                 log.error("Error deleting files")
+ 580|                 raise HTTPException(
+ 581|                     status_code=status.HTTP_400_BAD_REQUEST,
+ 582|                     detail=ERROR_MESSAGES.DEFAULT("Error deleting files"),
+ 583|                 )
+ 584|             return {"message": "File deleted successfully"}
+ 585|         else:
+ 586|             raise HTTPException(
+ 587|                 status_code=status.HTTP_400_BAD_REQUEST,
+ 588|                 detail=ERROR_MESSAGES.DEFAULT("Error deleting file"),
+ 589|             )
+ 590|     else:
+ 591|         raise HTTPException(
+ 592|             status_code=status.HTTP_404_NOT_FOUND,
+ 593|             detail=ERROR_MESSAGES.NOT_FOUND,
+ 594|         )
+ 595| 
+ 596| 
+
+### id=8022 lang=
+[CODE]
+   1| showdown.subParser('makehtml.table', function (text, options, globals) {
+   2|   'use strict';
+   3| 
+   4|   if (!options.tables) {
+   5|     return text;
+   6|   }
+   7| 
+   8|   //
+   9|   // parser starts here
+  10|   //
+  11|   let startEvent = new showdown.Event('makehtml.table.onStart', text);
+  12|   startEvent
+  13|     .setOutput(text)
+  14|     ._setGlobals(globals)
+  15|     ._setOptions(options);
+  16|   startEvent = globals.converter.dispatch(startEvent);
+  17|   text = startEvent.output;
+  18| 
+  19|   // GFM §4.10: a table is broken at the first line that begins another
+  20|   // block-level construct (blockquote, ATX heading, fenced code, thematic
+  21|   // break). Such a line is not a table row, so we split it — and everything
+  22|   // after it — off the match. Because `table` runs immediately before
+  23|   // `blockquote` (and the rest of blockGamut) in the pipeline, the returned
+  24|   // tail is reprocessed and converted normally.
+  25|   const blockStartRgx = /^ {0,3}(?:>|#{1,6}(?:[ \t]|$)|
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=8021 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文逐函数）
+
+1. **第 44–68 行 `has_access_to_file`**：source 为 `file_id`（路径参数），sink 为 DB 查询 `Files.get_file_by_id`。文件不存在时抛 404，存在时仅按知识库授权返回布尔值，本身不做路径操作，无注入面。
+
+2. **第 76–160 行 `upload_file`**：source 为上传的 `file.filename` 与内容。第 84–85 行用 `os.path.basename` 去除目录成分，且第 88 行以 uuid 重命名存储名，路径遍历被双重消除；`Storage.upload_file` 接收的是拼接后的安全文件名。`file_metadata` 仅存入 DB meta，不进入文件系统或 shell。处理分支调用 `transcribe`/`process_file`，异常被捕获并回传错误信息。无有效 sink 暴露。
+
+3. **第 167–183 行 `list_files`**：admin 看全部、普通用户仅看自己的文件，权限隔离正确；`content=False` 仅删除字段。
+
+4. **第 190–216 行 `search_files`**：`fnmatch` 只在内存中对已授权文件列表做模式匹配，不触达文件系统 glob，无路径遍历或注入。
+
+5. **第 223–233 行 `delete_all_files`**：`get_admin_user` 依赖守卫，仅管理员可达。
+
+6. **第 240–261 行 `get_file_by_id`**：三重授权判断（属主 / admin / 知识库 read），未通过则 404，无越权读取。
+
+7. **第 268–287 行 `get_file_data_content_by_id`**：同样的授权三元判断后才返回 content，防御有效。
+
+8. **第 295–330 行 `update_file_data_content_by_id`**：write 权限校验后才调用 `process_file`；content 走 pydantic 模型与 DB，不进 shell 或路径。
+
+9. **第 337–404 行 `get_file_content_by_id`**：read 校验后经 `Storage.get_file(file.path)` 取回——path 来自 DB 中由服务端生成的 uuid 文件名，非用户可控路径；响应头 filename 经 `quote()` 做 RFC5987 编码，防头注入；非 PDF 且非 text/plain 时强制 attachment，缓解内联渲染风险。
+
+10. **第 407–447 行 `get_html_file_content_by_id`**：同样先经过属主/admin/知识库 read 三元授权；`FileResponse(file_path)` 内联返回 HTML，理论上若用户能诱导受害者打开其有权访问的 HTML 文件链接可造成自域 XSS，但前提是受害者对该文件本就有 read 权限（多为本人上传或共享知识库），攻击者无法越权投毒他人可见文件，实际可利用性极低，属设计权衡而非可利用漏洞。
+
+11. **第 450–506 行 `get_file_content_by_id`（带 file_name 路径）**：注意 `file_name` 路径参数实际未被使用，文件定位仍基于 DB 的 `file.path`；无 path 时走 `StreamingResponse` 输出 DB 内容为 text/plain。授权同前，无 sink 风险。
+
+12. **第 512–551 行 `delete_file_by_id`**：write 权限校验后删除 DB 记录与存储对象，`Storage.delete_file(file.path)` 的 path 同样来自服务端生成的记录，非用户输入直接拼路径。
+
+13. **第二入口/替代通道核查**：所有路由均挂 `get_verified_user` 或 `get_admin_user` 依赖；敏感操作（删全部）限 admin；文件物理路径均由 uuid 生成，用户输入的 filename 只作展示名并经 basename 清洗；无环境变量、回调或反序列化入口。
+
+综上，全文未发现可利用的安全漏洞。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (XSS)", "risk_level": "High", "source": "line 84: upload_file 允许任意 verified 用户向共享知识库上传 .html 内容", "sink": "line 474: FileResponse(file_path) 以默认响应头返回 HTML（无 Content-Disposition/CSP），受害者读取即执行脚本", "explanation": "教师『受害者有读权限故不可投毒』属威胁模型反转：上传（line 81-175）对任意 verified 用户开放，攻击者将含脚本的 .html 放入共享/公开知识库后，has_access_to_file(id,'read',user) 恰恰会授予受害者读权限——读权限是投毒送达条件而非防线；读取端 line 474 FileResponse 无 Content-Disposition/CSP 直接渲染 HTML，与 8027 完全相同的存储型 XSS（CWE-79）仍然存在。第454-460 行新增的 get_user_by_id 检查是死代码空操作：先解引用 file_user.role 再判 not file_user，file_user 为 None 时 line 454 已抛 AttributeError，内层分支永不可达，有效授权逻辑与 8027 一致——『漏洞+无效补丁』变体，正确结论应为 has_vuln=true。", "fix_suggestion": "line 474: 对 text/html 响应增加 Content-Disposition: attachment 或 Content-Security-Policy: sandbox，HTML 内容改白名单净化后渲染；line 454-460: 死代码修正为先判 if not file_user: raise 404 再取 role（该修正不构成对本洞的修复，仅消除空操作）"}
+
+### id=8022 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **入口点枚举（全文）**：本文件是 showdown 的 `makehtml.table` 子解析器，唯一外部输入是参数 `text`（Markdown 源文本，第 2 行函数签名）。其余输入通道包括：`options`（用户配置，如 `options.tables`、`options.tablesHeaderId`）、`globals.converter.dispatch(...)` 的扩展事件回调（onStart/onEnd/onCapture/onHash 等，属受信任的扩展 API，非不可信 source）、以及内部辅助函数 `breakOnBlock`、`parse`、`preParse`、`parseTable`、`buildTableOtp`、`parseStyle`、`parseHeader`、`parseCell`。无文件系统、网络、环境变量等其他 source。
+
+2. **source→sink 数据流 1：表格单元格 → HTML 输出**。不可信文本经 `tableRgx` / `singeColTblRgx` 匹配后进入 `preParse`，其中每行先经过 `showdown.subParser('makehtml.codeSpan')` 处理；随后在 `parseCell` 中调用 `spanGamut`（内含 escapeSpecialChars 等转义步骤）后才拼入 `<td>` 标签。管道上游的转义子解析器对 `<`、`"` 等做了实体编码，因此直接 XSS 路径被上游防御覆盖。
+
+3. **数据流 2：表头 → id 属性**。`parseHeader` 中当 `options.tablesHeaderId` 为真时，`attributes.id = headerText.replace(/ /g,'_').toLowerCase()`。关键在于此时 `headerText` 已经先经过 `spanGamut` 转义（`parseHeader` 第一行即调用），双引号已变为 `&quot;`，无法闭合属性注入新属性或事件处理器。这是“先转义后使用”的正确顺序。
+
+4. **数据流 3：`_populateAttributes(attributes)`**。attributes 来源有二：`parseStyle` 只返回固定的三个白名单 style 值（left/right/center）或空对象，无用户可控内容；id 来自第 3 点已转义的 headerText。无注入面。
+
+5. **事件回调通道**：所有 `dispatch` 事件的 output 直接进入输出（如 `captureStartEvent.output` 分支）。但扩展注册是开发者主动行为，属于受信任的第二入口（类似插件 API），不构成不可信输入漏洞；且这与 showdown 官方扩展模型一致。
+
+6. **正则与 DoS**：注释明确说明旧版 tableRgx 存在二次回溯问题并已被修复（lookahead + 单个贪婪 `[^\n]+`）；`breakOnBlock` 为线性扫描；`preParse` 的 split/map 均为线性。未发现新的 ReDoS 模式（无嵌套量词回溯）。
+
+7. **黑名单/过滤评估**：`blockStartRgx` 仅用于切分块级结构，不影响安全；`\|` 转义处理交给后续 backslash-escape/codeSpan 通道，非安全依赖。未发现以黑名单作为唯一防线的 sink。
+
+8. **结论**：全文通读后，所有到达 HTML 字符串拼接 sink 的不可信数据均先经过上游转义管道（spanGamut/codeSpan），id 属性构造顺序正确，style 为白名单常量，事件输出为受信任扩展接口。未发现可利用漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文：唯一不可信输入为 Markdown 文本 text。单元格与表头内容在拼入 td/th 前均经过 spanGamut/codeSpan 上游转义；tablesHeaderId 生成的 id 在转义之后才赋值，双引号已编码无法逃逸属性；_populateAttributes 接收的 style 来自固定白名单（text-align 三种）或空对象；事件 dispatch 输出属于受信任的扩展 API 第二入口而非不可信 source；旧版表格正则的二次回溯已在注释所述修复中消除，未见新的 ReDoS 或 XSS 数据流。", "fix_suggestion": "no fix needed"}

@@ -1,0 +1,450 @@
+batch=87 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7830 lang=go
+[CODE]
+   1| package rewritetarget
+   2| 
+   3| import (
+   4| 	"context"
+   5| 	"errors"
+   6| 	"fmt"
+   7| 	"net/http"
+   8| 	"net/url"
+   9| 	"regexp"
+  10| 	"strings"
+  11| 
+  12| 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+  13| 	"github.com/traefik/traefik/v3/pkg/middlewares"
+  14| 	"github.com/traefik/traefik/v3/pkg/middlewares/observability"
+  15| )
+  16| 
+  17| const (
+  18| 	typeName         = "RewriteTarget"
+  19| 	xForwardedPrefix = "X-Forwarded-Prefix"
+  20| )
+  21| 
+  22| // This regex is used to remove the capture groups when no regex is provided,
+  23| // as the replacement string may contain capture group references like $1, $2, etc.
+  24| // that should be ignored in this case.
+  25| var replacementRegex = regexp.MustCompile(`\$[0-9]+`)
+  26| 
+  27| // rewriteTarget is a middleware used to replace the path of a URL request.
+  28| type rewriteTarget struct {
+  29| 	name             string
+  30| 	next             http.Handler
+  31| 	regexp           *regexp.Regexp
+  32| 	replacement      string
+  33| 	xForwardedPrefix string
+  34| 	// absoluteURLRedirect is true when the replacement template is an absolute URL,
+  35| 	// indicating the operator explicitly configured a redirect to an external destination.
+  36| 	absoluteURLRedirect bool
+  37| }
+  38| 
+  39| // New creates a new rewrite target middleware.
+  40| func New(ctx context.Context, next http.Handler, config dynamic.RewriteTarget, name string) (http.Handler, error) {
+  41| 	middlewares.GetLogger(ctx, name, typeName).Debug().Msg("Creating middleware")
+  42| 
+  43| 	if config.Replacement == "" {
+  44| 		return nil, errors.New("replacement cannot be empty")
+  45| 	}
+  46| 
+  47| 	var absoluteURLRedirect bool
+  48| 	if parsed, err := url.Parse(config.Replacement); err == nil && parsed.Scheme != "" {
+  49| 		absoluteURLRedirect = true
+  50| 	}
+  51| 
+  52| 	var re *regexp.Regexp
+  53| 	if config.Regex != "" {
+  54| 		var err error
+  55| 		re, err = regexp.Compile("(?i)" + strings.TrimSpace(config.Regex)) // regex on ingress-nginx are case-insensitive.
+  56| 		if err != nil {
+  57| 			return nil, fmt.Errorf("compiling regular expression %s: %w", config.Regex, err)
+  58| 		}
+  59| 
+  60| 		// When rewrite-target is a full URL and there's no capture group,
+  61| 		// append .* to match the entire path and avoid leaking unmatched suffix.
+  62| 		// See https://github.com/traefik/traefik/issues/12931
+  63| 		if re.NumSubexp() == 0 && absoluteURLRedirect {
+  64| 			re, err = regexp.Compile("(?i)" + strings.TrimSpace(config.Regex) + ".*")
+  65| 			if err != nil {
+  66| 				return nil, fmt.Errorf("compiling regular expression for absolute URL %s: %w", config.Regex, err)
+  67| 			}
+  68| 		}
+  69| 	}
+  70| 
+  71| 	return &rewriteTarget{
+  72| 		name:                name,
+  73| 		next:                next,
+  74| 		regexp:              re,
+  75| 		replacement:         strings.TrimSpace(config.Replacement),
+  76| 		xForwardedPrefix:    config.XForwardedPrefix,
+  77| 		absoluteURLRedirect: absoluteURLRedirect,
+  78| 	}, nil
+  79| }
+  80| 
+  81| func (rt *rewriteTarget) GetTracingInformation() (string, string) {
+  82| 	return rt.name, typeName
+  83| }
+  84| 
+  85| func (rt *rewriteTarget) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+  86| 	logger := middlewares.GetLogger(req.Context(), rt.name, typeName)
+  87| 
+  88| 	currentPath := req.URL.RawPath
+  89| 	if currentPath == "" {
+  90| 		currentPath = req.URL.EscapedPath()
+  91| 	}
+  92| 
+  93| 	// regexp doex not match, nothing to rewrite.
+  94| 	if rt.regexp != nil && !rt.regexp.MatchString(currentPath) {
+  95| 		rt.next.ServeHTTP(rw, req)
+  96| 		return
+  97| 	}
+  98| 
+  99| 	var newTarget string
+ 100| 	if rt.regexp != nil {
+ 101| 		newTarget = rt.regexp.ReplaceAllString(currentPath, rt.replacement)
+ 102| 	} else {
+ 103| 		newTarget = replacementRegex.ReplaceAllString(rt.replacement, "")
+ 104| 	}
+ 105| 
+ 106| 	// Same as ingress-nginx when the new target is empty we reply with an error.
+ 107| 	if newTarget == "" {
+ 108| 		http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+ 109| 		return
+ 110| 	}
+ 111| 
+ 112| 	// Only issue a 302 redirect if the replacement template itself is an absolute URL.
+ 113| 	// Prevent user-controlled capture group content from injecting an absolute URL redirect.
+ 114| 	if rt.absoluteURLRedirect {
+ 115| 		newTargetURL, err := url.Parse(newTarget)
+ 116| 		if err != nil {
+ 117| 			http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+ 118| 			return
+ 119| 		}
+ 120| 		// Carry the incoming query string through the redirect so an
+ 121| 		// absolute-URL rewrite behaves like ingress-nginx, which preserves
+ 122| 		// query parameters on rewrite-target redirects. Only fill it in
+ 123| 		// when the rewrite itself didn't supply one, matching the nginx
+ 124| 		// precedence of rewrite-set query over request query.
+ 125| 		if newTargetURL.RawQuery == "" && req.URL.RawQuery != "" {
+ 126| 			newTargetURL.RawQuery = req.URL.RawQuery
+ 127| 		}
+ 128| 
+ 129| 		http.Redirect(rw, req, newTargetURL.String(), http.StatusFound)
+ 130| 		return
+ 131| 	}
+ 132| 
+ 133| 	if rt.xForwardedPrefix != "" {
+ 134| 		prefix := rt.xForwardedPrefix
+ 135| 		if rt.regexp != nil {
+ 136| 			prefix = rt.regexp.ReplaceAllString(currentPath, rt.xForwardedPrefix)
+ 137| 		}
+ 138| 		req.Header.Set(xForwardedPrefix, prefix)
+ 139| 	}
+ 140| 
+ 141| 	// As replacement can introduce escaped characters
+ 142| 	// Path must remain an unescaped version of RawPath
+ 143| 	// Doesn't handle multiple times encoded replacement (`/` => `%2F` => `%252F` => ...)
+ 144| 	req.URL.RawPath = newTarget
+ 145| 
+ 146| 	var err error
+ 147| 	req.URL.Path, err = url.PathUnescape(req.URL.RawPath)
+ 148| 	if err != nil {
+ 149| 		logger.Error().Msgf("Unable to unescape URL RawPath %q: %v", req.URL.RawPath, err)
+ 150| 		observability.SetStatusErrorf(req.Context(), "Unable to unescape URL RawPath %q: %v", req.URL.RawPath, err)
+ 151| 		http.Error(rw, err.Error(), http.StatusInternalServerError)
+ 152| 		return
+ 153| 	}
+ 154| 
+ 155| 	req.RequestURI = req.URL.RequestURI()
+ 156| 
+ 157| 	rt.next.ServeHTTP(rw, req)
+ 158| }
+ 159| 
+ 160| 
+
+### id=7831 lang=go
+[CODE]
+   1| package rewritetarget
+   2| 
+   3| import (
+   4| 	"context"
+   5| 	"errors"
+   6| 	"fmt"
+   7| 	"net/http"
+   8| 	"net/url"
+   9| 	"regexp"
+  10| 	"strings"
+  11| 
+  12| 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+  13| 	"github.com/traefik/traefik/v3/pkg/middlewares"
+  14| 	"github.com/traefik/traefik/v3/pkg/middlewares/observability"
+  15| )
+  16| 
+  17| const (
+  18| 	typeName         = "RewriteTarget"
+  19| 	xForwardedPrefix = "X-Forwarded-Prefix"
+  20| )
+  21| 
+  22| // This regex is used to remove the capture groups when no regex is provided,
+  23| // as the replacement string may contain capture group references like $1, $2, etc.
+  24| // that should be ignored in this case.
+  25| var replacementRegex = regexp.MustCompile(`\$[0-9]+`)
+  26| 
+  27| // rewriteTarget is a middleware used to replace the path of a URL request.
+  28| type rewriteTarget struct {
+  29| 	name             string
+  30| 	next             http.Handler
+  31| 	regexp           *regexp.Regexp
+  32| 	replacement      string
+  33| 	xForwardedPrefix string
+  34| 	// absoluteURLRedirect is true when the replacement template is an absolute URL,
+  35| 	// indicating the operator explicitly configured a redirect to an external destination.
+  36| 	absoluteURLRedirect bool
+  37| }
+  38| 
+  39| // New creates a new rewrite target middleware.
+  40| func New(ctx context.Context, next http.Handler, config dynamic.RewriteTarget, name string) (http.Handler, error) {
+  41| 	middlewares.GetLogger(ctx, name, typeName).Debug().Msg("Creating middleware")
+  42| 
+  43| 	if config.Replacement == "" {
+  44| 		return nil, errors.New("replacement cannot be empty")
+  45| 	}
+  46| 
+  47| 	var absoluteURLRedirect bool
+  48| 	if parsed, err := url.Parse(config.Replacement); err == nil && parsed.Scheme != "" {
+  49| 		absoluteURLRedirect = true
+  50| 	}
+  51| 
+  52| 	var re *regexp.Regexp
+  53| 	if config.Regex != "" {
+  54| 		var err error
+  55| 		re, err = regexp.Compile("(?i)" + strings.TrimSpace(config.Regex)) // regex on ingress-nginx are case-insensitive.
+  56| 		if err != nil {
+  57| 			return nil, fmt.Errorf("compiling regular expression %s: %w", config.Regex, err)
+  58| 		}
+  59| 
+  60| 		// When rewrite-target is a full URL and there's no capture group,
+  61| 		// append .* to match the entire path and avoid leaking unmatched suffix.
+  62| 		// See https://github.com/traefik/traefik/issues/12931
+  63| 		if re.NumSubexp() == 0 && absoluteURLRedirect {
+  64| 			re, err = regexp.Compile("(?i)" + strings.TrimSpace(config.Regex) + ".*")
+  65| 			if err != nil {
+  66| 				return nil, fmt.Errorf("compiling regular expression for absolute URL %s: %w", config.Regex, err)
+  67| 			}
+  68| 		}
+  69| 	}
+  70| 
+  71| 	return &rewriteTarget{
+  72| 		name:                name,
+  73| 		next:                next,
+  74| 		regexp:              re,
+  75| 		replacement:         strings.TrimSpace(config.Replacement),
+  76| 		xForwardedPrefix:    config.XForwardedPrefix,
+  77| 		absoluteURLRedirect: absoluteURLRedirect,
+  78| 	}, nil
+  79| }
+  80| 
+  81| func (rt *rewriteTarget) GetTracingInformation() (string, string) {
+  82| 	return rt.name, typeName
+  83| }
+  84| 
+  85| func (rt *rewriteTarget) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+  86| 	logger := middlewares.GetLogger(req.Context(), rt.name, typeName)
+  87| 
+  88| 	currentPath := req.URL.RawPath
+  89| 	if currentPath == "" {
+  90| 		currentPath = req.URL.EscapedPath()
+  91| 	}
+  92| 
+  93| 	// regexp doex not match, nothing to rewrite.
+  94| 	if rt.regexp != nil && !rt.regexp.MatchString(currentPath) {
+  95| 		rt.next.ServeHTTP(rw, req)
+  96| 		return
+  97| 	}
+  98| 
+  99| 	var newTarget string
+ 100| 	if rt.regexp != nil {
+ 101| 		newTarget = rt.regexp.ReplaceAllString(currentPath, rt.replacement)
+ 102| 	} else {
+ 103| 		newTarget = replacementRegex.ReplaceAllString(rt.replacement, "")
+ 104| 	}
+ 105| 
+ 106| 	// Same as ingress-nginx when the new target is empty we reply with an error.
+ 107| 	if newTarget == "" {
+ 108| 		http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+ 109| 		return
+ 110| 	}
+ 111| 
+ 112| 	// Only issue a 302 redirect if the replacement template itself is an absolute URL.
+ 113| 	// Prevent user-controlled capture group content from injecting an absolute URL redirect.
+ 114| 	if rt.absoluteURLRedirect {
+ 115| 		newTargetURL, err := url.Parse(newTarget)
+ 116| 		if err != nil {
+ 117| 			http.Error(rw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+ 118| 			return
+ 119| 		}
+ 120| 		// Carry the incoming query string through the redirect so an
+ 121| 		// absolute-URL rewrite behaves like ingress-nginx, which preserves
+ 122| 		// query parameters on rewrite-target redirects. Only fill it in
+ 123| 		// when the rewrite itself didn't supply one, matching the nginx
+ 124| 		// precedence of rewrite-set query over request query.
+ 125| 		if newTargetURL.RawQuery == "" && req.URL.RawQuery != "" {
+ 126| 			newTargetURL.RawQuery = req.URL.RawQuery
+ 127| 		}
+ 128| 
+ 129| 		http.Redirect(rw, req, newTargetURL.String(), http.StatusFound)
+ 130| 		return
+ 131| 	}
+ 132| 
+ 133| 	if rt.xForwardedPrefix != "" {
+ 134| 		prefix := rt.xForwardedPrefix
+ 135| 		if rt.regexp != nil {
+ 136| 			prefix = rt.regexp.ReplaceAllString(currentPath, rt.xForwardedPrefix)
+ 137| 		}
+ 138| 		req.Header.Set(xForwardedPrefix, prefix)
+ 139| 	}
+ 140| 
+ 141| 	// As replacement can introduce escaped characters
+ 142| 	// Path must remain an unescaped version of RawPath
+ 143| 	// Doesn't handle multiple times encoded replacement (`/` => `%2F` => `%252F` => ...)
+ 144| 	req.URL.RawPath = newTarget
+ 145| 
+ 146| 	var err error
+ 147| 	req.URL.Path, err = url.PathUnescape(req.URL.RawPath)
+ 148| 	if err != nil {
+ 149| 		logger.Error().Msgf("Unable to unescape URL RawPath %q: %v", req.URL.RawPath, err)
+ 150| 		observability.SetStatusErrorf(req.Context(), "Unable to unescape URL RawPath %q: %v", req.URL.RawPath, err)
+ 151| 		http.Error(rw, err.Error(), http.StatusInternalServerError)
+ 152| 		return
+ 153| 	}
+ 154| 
+ 155| 	// Here we are sanitizing the URL when the path is not empty,
+ 156| 	// as the JoinPath method is adding a leading slash if the path is empty.
+ 157| 	path := req.URL.Path
+ 158| 	if path != "" {
+ 159| 		req.URL = req.URL.JoinPath()
+ 160| 	}
+ 161| 
+ 162| 	// Stop here if the normalization of the path produces a different path.
+ 163| 	if path != req.URL.Path {
+ 164| 		logger.Debug().Msgf("Rejecting request, sanitized path: %q is not equivalent to stripped path: %q", path, req.URL.Path)
+ 165| 		http.Error(rw, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+ 166| 		return
+ 167| 	}
+ 168| 
+ 169| 	req.RequestURI = req.URL.RequestURI()
+ 170| 
+ 171| 	rt.next.ServeHTTP(rw, req)
+ 172| }
+ 173| 
+ 174| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7830 teacher=unknown flags=[]
+[ANALYSIS]
+## 全文逐函数分析（行号锚定）
+
+### 一、入口点枚举（覆盖全文）
+
+本文件是 Traefik 的 `rewritetarget` 中间件，全部代码仅含两个函数：`New`（第 33–72 行）与 `ServeHTTP`（第 79–137 行），另有 `GetTracingInformation`（第 74–76 行，无数据流）。入口点逐一列举：
+
+1. **HTTP 请求路径**：第 77–81 行 `req.URL.RawPath` / `req.URL.EscapedPath()` —— 攻击者完全可控的 source。
+2. **HTTP 查询串**：第 116–119 行 `req.URL.RawQuery` 被复制进重定向目标 —— 攻击者可控的第二个 source。
+3. **静态配置**：`config.Replacement`、`config.Regex`、`config.XForwardedPrefix`（第 38–70 行）—— 由运维/Ingress CRD 提供，属于半可信输入（多租户场景下可被低权限用户通过 Ingress 注解影响）。
+4. 无文件、环境变量、回调等其他通道；`rt.next.ServeHTTP` 是内部转发而非对外出口。
+
+### 二、source→sink 数据流逐条验证
+
+**流 A：请求路径 → 正则替换 → 内部转发路径（第 77→89→128–131 行）**
+- source：第 78 行 `currentPath := req.URL.RawPath`（未解码原始路径，攻击者可控）。
+- 处理：第 89 行 `newTarget = rt.regexp.ReplaceAllString(currentPath, rt.replacement)`；无正则时走第 91 行分支，剥离 `$N` 引用。
+- sink：第 128–131 行写入 `req.URL.RawPath` 并 `url.PathUnescape` 后赋给 `req.URL.Path`，交给后端。
+- 防御评估：这是中间件的**设计功能**（rewrite 本身就是允许改写路径），且注释明确说明不处理多重编码。若运维配置了宽松正则（如 ingress-nginx 迁移场景常见的 `/(.*)`），攻击者可通过编码字符（如 `%2e%2e%2f`）在替换结果中注入穿越序列，绕过后端路由前缀隔离。但该行为与 ingress-nginx 兼容语义一致，属于配置层面的固有风险，非本代码引入的逻辑缺陷。**记为低危备注**。
+
+**流 B：请求路径 → 替换 → X-Forwarded-Prefix 头（第 122–126 行）**
+- source 同上（currentPath），sink 为第 125 行 `req.Header.Set(xForwardedPrefix, prefix)`。
+- 若 `xForwardedPrefix` 模板含 `$1` 且正则捕获了含 `\r\n` 的内容，理论上可注入头。防御评估：Go 的 `net/http` 在写出响应/转发请求时会拒绝或清洗非法头值字符（`httpguts.ValidHeaderFieldValue`），注入会在传输层失败而非被利用。**不可利用**。
+
+**流 C：请求路径 + 查询串 → 302 重定向 Location（核心漏洞，第 84→89→112→121 行）**
+- 第 44–46 行：仅在**配置加载时**对静态模板 `config.Replacement` 做 `url.Parse` 判断是否绝对 URL，置 `absoluteURLRedirect = true`。该检查只验证模板字面前缀有 scheme，**完全没有考虑 replacement 中的捕获组引用 `$1`、`$2` 在运行期会被请求路径内容填充**。
+- 第 55–61 行：仅当 `NumSubexp() == 0 && absoluteURLRedirect` 时才追加 `.*` 强制整体匹配——即开发者意识到了“未匹配后缀泄漏”问题并修复了无捕获组的情况，但对**存在捕获组**的情形没有任何防护。
+- 运行期：第 89 行 `ReplaceAllString(currentPath, rt.replacement)` 将攻击者可控的 `currentPath` 片段填入 `$1` 等占位符，得到 `newTarget`。
+- 第 112–113 行：仅做 `url.Parse` 错误检查，**不校验结果 URL 的 scheme/host 是否仍属于配置意图**。
+- 第 121 行：`http.Redirect(rw, req, newTargetURL.String(), http.StatusFound)` —— sink。
+- **攻击示例**：运维配置 `regex: /legacy/(.*)`、`replacement: https://$1`（意图是把子域传入）。攻击者请求 `/legacy/evil.com/path`，第 89 行产出 `https://evil.com/path`，第 121 行返回 302 至任意外部域名 → **开放重定向（CWE-601）**。同理 `replacement: https://internal/$1` 时虽 host 固定，但配合第 117–119 行把 `req.URL.RawQuery` 原样透传，可携带任意查询参数用于钓鱼或 token 泄漏。
+- 防御有效性判定：第 44–46 行的 scheme 检查只针对静态模板，属“黑名单式/前置式”弱校验，无法约束运行期拼接结果；第 112 行的 Parse 仅查语法错误。**均无效**。
+
+### 三、第二入口与替代通道核查
+
+- 第二 source（RawQuery，第 117–119 行）：无条件并入重定向目标，放大流 C 的钓鱼/token 外泄面；在非 absoluteURLRedirect 分支中 RawQuery 不参与，无影响。
+- 替代通道：`GetTracingInformation` 无数据流；`New` 中两次 `regexp.Compile` 使用用户配置的正则，Go RE2 无灾难性回溯，无 ReDoS。
+- 非 absoluteURLRedirect 分支（第 123–136 行）不会产生对外重定向，主要风险已在上文流 A 记为低危。
+
+### 四、结论
+
+唯一确认的可利用漏洞为流 C：当 `Replacement` 为含捕获组引用的绝对 URL 且 `Regex` 含捕获组时，请求路径内容可控最终 302 目标，构成开放重定向。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "原判开放重定向前提不存在：所举 regex=/legacy/(.*) 配 replacement=https://$1 的场景要求运维把捕获组放进 authority 模板，该配置不在代码中；代码 line 34-36 注释明确 absoluteURL 替换的边界（仅路径部分拼接），且 issue 12931 的修复已内嵌（.* 追加约束），表明样本即加固版。RawQuery 透传（line 125-127）是 line 120-124 注释声明的 ingress-nginx 兼容既定行为，非缺陷。把运维误配场景归为代码漏洞属 framework_conflict 型误报，判定反转为安全。", "fix_suggestion": "no fix needed（可选纵深：替换产出 URL 后增加 scheme/host 白名单终检；RawQuery 透传维持文档化行为）"}
+
+### id=7831 teacher=unknown flags=[]
+[ANALYSIS]
+# 编号分析（全文通读，逐函数行号级）
+
+## 一、文件结构与入口点枚举
+
+本文件是 Traefik 的 `rewritetarget` 中间件（ingress-nginx 兼容的 rewrite-target 实现），仅包含三个函数：
+
+1. **`New`（第 41–80 行）**：配置加载入口。Source 为**运维人员提供的静态配置** `dynamic.RewriteTarget`（第 43 行 `config.Replacement`、第 51 行 `config.Regex`、第 74 行 `config.XForwardedPrefix`），不是请求级用户输入。
+2. **`GetTracingInformation`（第 82–84 行）**：仅返回中间件名与类型名（第 83 行），无任何 source/sink。
+3. **`ServeHTTP`（第 86 行起）**：唯一运行时入口。Source 是 HTTP 请求的路径 `req.URL.RawPath` / `EscapedPath()`（第 89–92 行）与查询串 `req.URL.RawQuery`（第 122 行）；Sink 包括：302 重定向目标（第 131 行 `http.Redirect`）、内部转发路径 `req.URL.RawPath/Path`（第 141–142 行）、响应头 `X-Forwarded-Prefix`（第 137 行）、错误响应体（第 105、112、146 行）。
+
+## 二、`New` 函数防御逻辑（第 41–80 行）
+
+- 第 44–46 行：Replacement 为空直接拒绝，防止空重写。
+- 第 48–50 行：用 `url.Parse` 判断 replacement 是否带 scheme，置 `absoluteURLRedirect` 标志——这是区分“外部跳转”与“内部改写”的关键开关。
+- 第 52–58 行：正则强制加 `(?i)` 前缀并 `TrimSpace` 后编译，编译失败即返回错误（第 56–57 行），不存在 ReDoS 配置注入面（配置本身受信）。
+- 第 61–67 行：当 replacement 是绝对 URL 且正则无捕获组时追加 `.*`，修复 issue #12931 提到的未匹配后缀泄漏——这是对已知漏洞的补丁证据。
+
+## 三、`ServeHTTP` 数据流逐一验证
+
+**流 A：用户路径 → 正则替换 → 绝对 URL 302 跳转（开放重定向风险面）**
+- Source：第 89–92 行 `currentPath`（攻击者完全可控）。
+- Sink：第 131 行 `http.Redirect(rw, req, newTargetURL.String(), ...)`。
+- 防御链：
+  1. 第 100–103 行：只有 replacement 模板本身带 scheme 才走此分支；若模板无 scheme（如 `//$1`），`absoluteURLRedirect=false`，不会产生外部跳转，落入流 B 的内部改写分支——无法借“scheme 相对 URL”绕过进入跳转分支。
+  2. 第 110–118 行：替换结果整体重新 `url.Parse`，host 由模板固定部分决定。即使捕获组内容形如 `evil.com` 或 `%2F%2Fevil.com`，它只会落在 path/query 部分，无法覆盖已解析出的 authority（Go 的 `url.Parse` 中 host 先于 path 解析，path 中的 `//` 不改变 host）。解析失败则 500（第 111–113 行）。
+  3. 第 120–125 行：query 透传仅在 `newTargetURL.RawQuery == ""` 时进行，且 `req.URL.RawQuery` 本身已被 Go 标准库解析校验过，不含裸 CR/LF。
+  4. `http.Redirect` 内部还会对 Location 值做 HTML/控制字符净化，CRLF 注入到响应头不可行。
+- 结论：该流的开放重定向与头注入均被有效阻断。
+
+**流 B：用户路径 → 正则替换 → 内部转发路径（路径穿越/规范化混淆风险面）**
+- Sink：第 141 行 `req.URL.RawPath = newTarget`，第 143 行 `url.PathUnescape`。
+- 防御链：
+  1. 第 149–153 行：`JoinPath()` 触发 `path.Clean` 规范化；
+  2. 第 155–159 行：**关键防御**——若清洗后的路径与原路径不一致（如出现 `..`、多余斜杠导致的语义变化），直接 400 拒绝。这封死了经典的“RawPath 与 Path 不一致导致后端路由混淆”攻击（如 `/safe/../admin`、编码斜杠 `%2F..%2F` 变体）。
+  3. 第 145–148 行：unescape 失败即 500 拒绝，不降级放行。
+  4. 第 161 行同步修正 `RequestURI`，避免下游读到旧值造成不一致。
+- 结论：路径混淆有显式校验兜底，非黑名单式过滤。
+
+**流 C：用户路径 → X-Forwarded-Prefix 头（头注入风险面）**
+- 第 134–139 行：prefix 来自静态配置或经同一正则替换生成；即便含特殊字符，`req.Header.Set` 在写入时会剥离非法头字符，且 `currentPath` 取自 `EscapedPath()`，原始 CRLF 已被转义。无可利用注入。
+
+**流 D：错误信息回显**
+- 第 146 行 `http.Error(rw, err.Error(), ...)` 回显的是 `url.PathUnescape` 的标准库错误（如 `invalid URL escape`），可能包含攻击者输入的片段，但属低危信息泄露且 Traefik 上游接受此行为；第 105、112、150 行均为固定文本，无注入。
+
+## 四、第二入口与替代通道核查
+
+- 全文无环境变量读取、无文件 IO、无回调注册、无其他路由；`New` 只在配置加载时执行一次，配置来源为受信的动态配置（非请求面）。
+- `replacementRegex`（第 19 行）仅用于删除无正则时的 `$N` 引用（第 102 行），方向是消除而非引入注入。
+- 未发现任何绕过上述三条防御链的第二通道。
+
+## 五、结论
+
+所有 source→sink 流均有结构性防御（scheme 开关 + url.Parse 固定 authority + JoinPath 规范化一致性校验 + 标准库头净化），非黑名单式可绕过滤。基于全文证据，未发现可利用漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文三处函数后确认无漏洞。流A(用户路径经第89-92行进入, 经第110-118行url.Parse后于第131行http.Redirect输出): 仅当replacement模板自带scheme才走跳转分支, 且authority由模板固定部分决定, 捕获组内容只能落入path部分, 无法构造开放重定向或CRLF注入; 流B(第141-143行内部路径改写): 第149-159行通过JoinPath规范化并与原路径比对, 不一致即400拒绝, 封死路径混淆; 流C(X-Forwarded-Prefix, 第134-139行): 头值经Header.Set写入被标准库净化, 无头注入; 错误回显(第146行)仅为低危信息泄露。配置入口New(第41-80行)只接受受信动态配置, 无第二入口或替代通道可绕过上述防御。", "fix_suggestion": "no fix needed"}

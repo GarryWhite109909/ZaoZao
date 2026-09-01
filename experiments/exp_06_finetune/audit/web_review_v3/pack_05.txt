@@ -1,0 +1,1165 @@
+batch=5 样本数=5
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=2833 lang=python
+[CODE]
+   1| # NOTE: 见 JIRA-1234
+   2| # 反射型 XSS via 错误页面
+   3| @app.route('/404')
+   4| def not_found():
+   5|     target_path = request.args.get('target_path', '')
+   6|     return f'<h1>Page not found: {target_path}</h1>', 404
+   7| 
+   8| 
+
+### id=7899 lang=python
+[CODE]
+   1| import asyncio
+   2| import calendar
+   3| import contextlib
+   4| import datetime
+   5| import heapq
+   6| import itertools
+   7| import json
+   8| import os  # noqa
+   9| import pathlib
+  10| import pickle
+  11| import re
+  12| import time
+  13| import warnings
+  14| from collections import defaultdict
+  15| from collections.abc import Iterable, Iterator, Mapping
+  16| from http.cookies import BaseCookie, Morsel, SimpleCookie
+  17| from typing import Union
+  18| 
+  19| from yarl import URL
+  20| 
+  21| from ._cookie_helpers import preserve_morsel_with_coded_value
+  22| from .abc import AbstractCookieJar, ClearCookiePredicate
+  23| from .helpers import is_ip_address
+  24| from .typedefs import LooseCookies, PathLike, StrOrURL
+  25| 
+  26| __all__ = ("CookieJar", "DummyCookieJar")
+  27| 
+  28| 
+  29| CookieItem = Union[str, "Morsel[str]"]
+  30| 
+  31| # We cache these string methods here as their use is in performance critical code.
+  32| _FORMAT_PATH = "{}/{}".format
+  33| _FORMAT_DOMAIN_REVERSED = "{1}.{0}".format
+  34| 
+  35| # The minimum number of scheduled cookie expirations before we start cleaning up
+  36| # the expiration heap. This is a performance optimization to avoid cleaning up the
+  37| # heap too often when there are only a few scheduled expirations.
+  38| _MIN_SCHEDULED_COOKIE_EXPIRATION = 100
+  39| _SIMPLE_COOKIE = SimpleCookie()
+  40| 
+  41| 
+  42| class _RestrictedCookieUnpickler(pickle.Unpickler):
+  43|     """A restricted unpickler that only allows cookie-related types.
+  44| 
+  45|     This prevents arbitrary code execution when loading pickled cookie data
+  46|     from untrusted sources. Only types that are expected in a serialized
+  47|     CookieJar are permitted.
+  48| 
+  49|     See: https://docs.python.org/3/library/pickle.html#restricting-globals
+  50|     """
+  51| 
+  52|     _ALLOWED_CLASSES: frozenset[tuple[str, str]] = frozenset(
+  53|         {
+  54|             # Core cookie types
+  55|             ("http.cookies", "SimpleCookie"),
+  56|             ("http.cookies", "Morsel"),
+  57|             # Container types used by CookieJar._cookies
+  58|             ("collections", "defaultdict"),
+  59|             # builtins that pickle uses for reconstruction
+  60|             ("builtins", "tuple"),
+  61|             ("builtins", "set"),
+  62|             ("builtins", "frozenset"),
+  63|             ("builtins", "dict"),
+  64|         }
+  65|     )
+  66| 
+  67|     def find_class(self, module: str, name: str) -> type:
+  68|         if (module, name) not in self._ALLOWED_CLASSES:
+  69|             raise pickle.UnpicklingError(
+  70|                 f"Forbidden class: {module}.{name}. "
+  71|                 "CookieJar.load() only allows cookie-related types for security. "
+  72|                 "See https://docs.python.org/3/library/pickle.html#restricting-globals"
+  73|             )
+  74|         return super().find_class(module, name)  # type: ignore[no-any-return]
+  75| 
+  76| 
+  77| class CookieJar(AbstractCookieJar):
+  78|     """Implements cookie storage adhering to RFC 6265."""
+  79| 
+  80|     DATE_TOKENS_RE = re.compile(
+  81|         r"[\x09\x20-\x2F\x3B-\x40\x5B-\x60\x7B-\x7E]*"
+  82|         r"(?P<token>[\x00-\x08\x0A-\x1F\d:a-zA-Z\x7F-\xFF]+)"
+  83|     )
+  84| 
+  85|     DATE_HMS_TIME_RE = re.compile(r"(\d{1,2}):(\d{1,2}):(\d{1,2})")
+  86| 
+  87|     DATE_DAY_OF_MONTH_RE = re.compile(r"(\d{1,2})")
+  88| 
+  89|     DATE_MONTH_RE = re.compile(
+  90|         "(jan)|(feb)|(mar)|(apr)|(may)|(jun)|(jul)|(aug)|(sep)|(oct)|(nov)|(dec)",
+  91|         re.I,
+  92|     )
+  93| 
+  94|     DATE_YEAR_RE = re.compile(r"(\d{2,4})")
+  95| 
+  96|     # calendar.timegm() fails for timestamps after datetime.datetime.max
+  97|     # Minus one as a loss of precision occurs when timestamp() is called.
+  98|     MAX_TIME = (
+  99|         int(datetime.datetime.max.replace(tzinfo=datetime.timezone.utc).timestamp()) - 1
+ 100|     )
+ 101|     try:
+ 102|         calendar.timegm(time.gmtime(MAX_TIME))
+ 103|     except OSError:
+ 104|         # Hit the maximum representable time on Windows
+ 105|         # https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/localtime-localtime32-localtime64
+ 106|         MAX_TIME = calendar.timegm((3000, 12, 31, 23, 59, 59, -1, -1, -1))
+ 107|     except OverflowError:
+ 108|         # #4515: datetime.max may not be representable on 32-bit platforms
+ 109|         MAX_TIME = 2**31 - 1
+ 110|     # Avoid minuses in the future, 3x faster
+ 111|     SUB_MAX_TIME = MAX_TIME - 1
+ 112| 
+ 113|     def __init__(
+ 114|         self,
+ 115|         *,
+ 116|         unsafe: bool = False,
+ 117|         quote_cookie: bool = True,
+ 118|         treat_as_secure_origin: StrOrURL | list[StrOrURL] | None = None,
+ 119|         loop: asyncio.AbstractEventLoop | None = None,
+ 120|     ) -> None:
+ 121|         super().__init__(loop=loop)
+ 122|         self._cookies: defaultdict[tuple[str, str], SimpleCookie] = defaultdict(
+ 123|             SimpleCookie
+ 124|         )
+ 125|         self._morsel_cache: defaultdict[tuple[str, str], dict[str, Morsel[str]]] = (
+ 126|             defaultdict(dict)
+ 127|         )
+ 128|         self._host_only_cookies: set[tuple[str, str]] = set()
+ 129|         self._unsafe = unsafe
+ 130|         self._quote_cookie = quote_cookie
+ 131|         if treat_as_secure_origin is None:
+ 132|             treat_as_secure_origin = []
+ 133|         elif isinstance(treat_as_secure_origin, URL):
+ 134|             treat_as_secure_origin = [treat_as_secure_origin.origin()]
+ 135|         elif isinstance(treat_as_secure_origin, str):
+ 136|             treat_as_secure_origin = [URL(treat_as_secure_origin).origin()]
+ 137|         else:
+ 138|             treat_as_secure_origin = [
+ 139|                 URL(url).origin() if isinstance(url, str) else url.origin()
+ 140|                 for url in treat_as_secure_origin
+ 141|             ]
+ 142|         self._treat_as_secure_origin = treat_as_secure_origin
+ 143|         self._expire_heap: list[tuple[float, tuple[str, str, str]]] = []
+ 144|         self._expirations: dict[tuple[str, str, str], float] = {}
+ 145| 
+ 146|     @property
+ 147|     def quote_cookie(self) -> bool:
+ 148|         return self._quote_cookie
+ 149| 
+ 150|     def save(self, file_path: PathLike) -> None:
+ 151|         """Save cookies to a file using JSON format.
+ 152| 
+ 153|         :param file_path: Path to file where cookies will be serialized,
+ 154|             :class:`str` or :class:`pathlib.Path` instance.
+ 155|         """
+ 156|         file_path = pathlib.Path(file_path)
+ 157|         data: dict[str, dict[str, dict[str, str | bool]]] = {}
+ 158|         for (domain, path), cookie in self._cookies.items():
+ 159|             key = f"{domain}|{path}"
+ 160|             data[key] = {}
+ 161|             for name, morsel in cookie.items():
+ 162|                 morsel_data: dict[str, str | bool] = {
+ 163|                     "key": morsel.key,
+ 164|                     "value": morsel.value,
+ 165|                     "coded_value": morsel.coded_value,
+ 166|                 }
+ 167|                 # Save all morsel attributes that have values
+ 168|                 for attr in morsel._reserved:  # type: ignore[attr-defined]
+ 169|                     attr_val = morsel[attr]
+ 170|                     if attr_val:
+ 171|                         morsel_data[attr] = attr_val
+ 172|                 data[key][name] = morsel_data
+ 173|         with file_path.open(mode="w", encoding="utf-8") as f:
+ 174|             json.dump(data, f, indent=2)
+ 175| 
+ 176|     def load(self, file_path: PathLike) -> None:
+ 177|         """Load cookies from a file.
+ 178| 
+ 179|         Tries to load JSON format first. Falls back to loading legacy
+ 180|         pickle format (using a restricted unpickler) for backward
+ 181|         compatibility with existing cookie files.
+ 182| 
+ 183|         :param file_path: Path to file from where cookies will be
+ 184|             imported, :class:`str` or :class:`pathlib.Path` instance.
+ 185|         """
+ 186|         file_path = pathlib.Path(file_path)
+ 187|         # Try JSON format first
+ 188|         try:
+ 189|             with file_path.open(mode="r", encoding="utf-8") as f:
+ 190|                 data = json.load(f)
+ 191|             self._cookies = self._load_json_data(data)
+ 192|         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+ 193|             # Fall back to legacy pickle format with restricted unpickler
+ 194|             with file_path.open(mode="rb") as f:
+ 195|                 self._cookies = _RestrictedCookieUnpickler(f).load()
+ 196| 
+ 197|     def _load_json_data(
+ 198|         self, data: dict[str, dict[str, dict[str, str | bool]]]
+ 199|     ) -> defaultdict[tuple[str, str], SimpleCookie]:
+ 200|         """Load cookies from parsed JSON data."""
+ 201|         cookies: defaultdict[tuple[str, str], SimpleCookie] = defaultdict(SimpleCookie)
+ 202|         for compound_key, cookie_data in data.items():
+ 203|             domain, path = compound_key.split("|", 1)
+ 204|             key = (domain, path)
+ 205|             for name, morsel_data in cookie_data.items():
+ 206|                 morsel: Morsel[str] = Morsel()
+ 207|                 morsel_key = morsel_data["key"]
+ 208|                 morsel_value = morsel_data["value"]
+ 209|                 morsel_coded_value = morsel_data["coded_value"]
+ 210|                 # Use __setstate__ to bypass validation, same pattern
+ 211|                 # used in _build_morsel and _cookie_helpers.
+ 212|                 morsel.__setstate__(  # type: ignore[attr-defined]
+ 213|                     {
+ 214|                         "key": morsel_key,
+ 215|                         "value": morsel_value,
+ 216|                         "coded_value": morsel_coded_value,
+ 217|                     }
+ 218|                 )
+ 219|                 # Restore morsel attributes
+ 220|                 for attr in morsel._reserved:  # type: ignore[attr-defined]
+ 221|                     if attr in morsel_data and attr not in (
+ 222|                         "key",
+ 223|                         "value",
+ 224|                         "coded_value",
+ 225|                     ):
+ 226|                         morsel[attr] = morsel_data[attr]
+ 227|                 cookies[key][name] = morsel
+ 228|         return cookies
+ 229| 
+ 230|     def clear(self, predicate: ClearCookiePredicate | None = None) -> None:
+ 231|         if predicate is None:
+ 232|             self._expire_heap.clear()
+ 233|             self._cookies.clear()
+ 234|             self._morsel_cache.clear()
+ 235|             self._host_only_cookies.clear()
+ 236|             self._expirations.clear()
+ 237|             return
+ 238| 
+ 239|         now = time.time()
+ 240|         to_del = [
+ 241|             key
+ 242|             for (domain, path), cookie in self._cookies.items()
+ 243|             for name, morsel in cookie.items()
+ 244|             if (
+ 245|                 (key := (domain, path, name)) in self._expirations
+ 246|                 and self._expirations[key] <= now
+ 247|             )
+ 248|             or predicate(morsel)
+ 249|         ]
+ 250|         if to_del:
+ 251|             self._delete_cookies(to_del)
+ 252| 
+ 253|     def clear_domain(self, domain: str) -> None:
+ 254|         self.clear(lambda x: self._is_domain_match(domain, x["domain"]))
+ 255| 
+ 256|     def __iter__(self) -> "Iterator[Morsel[str]]":
+ 257|         self._do_expiration()
+ 258|         for val in self._cookies.values():
+ 259|             yield from val.values()
+ 260| 
+ 261|     def __len__(self) -> int:
+ 262|         """Return number of cookies.
+ 263| 
+ 264|         This function does not iterate self to avoid unnecessary expiration
+ 265|         checks.
+ 266|         """
+ 267|         return sum(len(cookie.values()) for cookie in self._cookies.values())
+ 268| 
+ 269|     def _do_expiration(self) -> None:
+ 270|         """Remove expired cookies."""
+ 271|         if not (expire_heap_len := len(self._expire_heap)):
+ 272|             return
+ 273| 
+ 274|         # If the expiration heap grows larger than the number expirations
+ 275|         # times two, we clean it up to avoid keeping expired entries in
+ 276|         # the heap and consuming memory. We guard this with a minimum
+ 277|         # threshold to avoid cleaning up the heap too often when there are
+ 278|         # only a few scheduled expirations.
+ 279|         if (
+ 280|             expire_heap_len > _MIN_SCHEDULED_COOKIE_EXPIRATION
+ 281|             and expire_heap_len > len(self._expirations) * 2
+ 282|         ):
+ 283|             # Remove any expired entries from the expiration heap
+ 284|             # that do not match the expiration time in the expirations
+ 285|             # as it means the cookie has been re-added to the heap
+ 286|             # with a different expiration time.
+ 287|             self._expire_heap = [
+ 288|                 entry
+ 289|                 for entry in self._expire_heap
+ 290|                 if self._expirations.get(entry[1]) == entry[0]
+ 291|             ]
+ 292|             heapq.heapify(self._expire_heap)
+ 293| 
+ 294|         now = time.time()
+ 295|         to_del: list[tuple[str, str, str]] = []
+ 296|         # Find any expired cookies and add them to the to-delete list
+ 297|         while self._expire_heap:
+ 298|             when, cookie_key = self._expire_heap[0]
+ 299|             if when > now:
+ 300|                 break
+ 301|             heapq.heappop(self._expire_heap)
+ 302|             # Check if the cookie hasn't been re-added to the heap
+ 303|             # with a different expiration time as it will be removed
+ 304|             # later when it reaches the top of the heap and its
+ 305|             # expiration time is met.
+ 306|             if self._expirations.get(cookie_key) == when:
+ 307|                 to_del.append(cookie_key)
+ 308| 
+ 309|         if to_del:
+ 310|             self._delete_cookies(to_del)
+ 311| 
+ 312|     def _delete_cookies(self, to_del: list[tuple[str, str, str]]) -> None:
+ 313|         for domain, path, name in to_del:
+ 314|             self._host_only_cookies.discard((domain, name))
+ 315|             self._cookies[(domain, path)].pop(name, None)
+ 316|             self._morsel_cache[(domain, path)].pop(name, None)
+ 317|             self._expirations.pop((domain, path, name), None)
+ 318| 
+ 319|     def _expire_cookie(self, when: float, domain: str, path: str, name: str) -> None:
+ 320|         cookie_key = (domain, path, name)
+ 321|         if self._expirations.get(cookie_key) == when:
+ 322|             # Avoid adding duplicates to the heap
+ 323|             return
+ 324|         heapq.heappush(self._expire_heap, (when, cookie_key))
+ 325|         self._expirations[cookie_key] = when
+ 326| 
+ 327|     def update_cookies(self, cookies: LooseCookies, response_url: URL = URL()) -> None:
+ 328|         """Update cookies."""
+ 329|         hostname = response_url.raw_host
+ 330| 
+ 331|         if not self._unsafe and is_ip_address(hostname):
+ 332|             # Don't accept cookies from IPs
+ 333|             return
+ 334| 
+ 335|         if isinstance(cookies, Mapping):
+ 336|             cookies = cookies.items()
+ 337| 
+ 338|         for name, cookie in cookies:
+ 339|             if not isinstance(cookie, Morsel):
+ 340|                 tmp = SimpleCookie()
+ 341|                 tmp[name] = cookie  # type: ignore[assignment]
+ 342|                 cookie = tmp[name]
+ 343| 
+ 344|             domain = cookie["domain"]
+ 345| 
+ 346|             # ignore domains with trailing dots
+ 347|             if domain and domain[-1] == ".":
+ 348|                 domain = ""
+ 349|                 del cookie["domain"]
+ 350| 
+ 351|             if not domain and hostname is not None:
+ 352|                 # Set the cookie's domain to the response hostname
+ 353|                 # and set its host-only-flag
+ 354|                 self._host_only_cookies.add((hostname, name))
+ 355|                 domain = cookie["domain"] = hostname
+ 356| 
+ 357|             if domain and domain[0] == ".":
+ 358|                 # Remove leading dot
+ 359|                 domain = domain[1:]
+ 360|                 cookie["domain"] = domain
+ 361| 
+ 362|             if hostname and not self._is_domain_match(domain, hostname):
+ 363|                 # Setting cookies for different domains is not allowed
+ 364|                 continue
+ 365| 
+ 366|             path = cookie["path"]
+ 367|             if not path or path[0] != "/":
+ 368|                 # Set the cookie's path to the response path
+ 369|                 path = response_url.path
+ 370|                 if not path.startswith("/"):
+ 371|                     path = "/"
+ 372|                 else:
+ 373|                     # Cut everything from the last slash to the end
+ 374|                     path = "/" + path[1 : path.rfind("/")]
+ 375|                 cookie["path"] = path
+ 376|             path = path.rstrip("/")
+ 377| 
+ 378|             if max_age := cookie["max-age"]:
+ 379|                 try:
+ 380|                     delta_seconds = int(max_age)
+ 381|                     max_age_expiration = min(time.time() + delta_seconds, self.MAX_TIME)
+ 382|                     self._expire_cookie(max_age_expiration, domain, path, name)
+ 383|                 except ValueError:
+ 384|                     cookie["max-age"] = ""
+ 385| 
+ 386|             elif expires := cookie["expires"]:
+ 387|                 if expire_time := self._parse_date(expires):
+ 388|                     self._expire_cookie(expire_time, domain, path, name)
+ 389|                 else:
+ 390|                     cookie["expires"] = ""
+ 391| 
+ 392|             key = (domain, path)
+ 393|             if self._cookies[key].get(name) != cookie:
+ 394|                 # Don't blow away the cache if the same
+ 395|                 # cookie gets set again
+ 396|                 self._cookies[key][name] = cookie
+ 397|                 self._morsel_cache[key].pop(name, None)
+ 398| 
+ 399|         self._do_expiration()
+ 400| 
+ 401|     def filter_cookies(self, request_url: URL = URL()) -> "BaseCookie[str]":
+ 402|         """Returns this jar's cookies filtered by their attributes."""
+ 403|         # We always use BaseCookie now since all
+ 404|         # cookies set on on filtered are fully constructed
+ 405|         # Morsels, not just names and values.
+ 406|         filtered: BaseCookie[str] = BaseCookie()
+ 407|         if not self._cookies:
+ 408|             # Skip do_expiration() if there are no cookies.
+ 409|             return filtered
+ 410|         self._do_expiration()
+ 411|         if not self._cookies:
+ 412|             # Skip rest of function if no non-expired cookies.
+ 413|             return filtered
+ 414|         if type(request_url) is not URL:
+ 415|             warnings.warn(
+ 416|                 "filter_cookies expects yarl.URL instances only,"
+ 417|                 f"and will stop working in 4.x, got {type(request_url)}",
+ 418|                 DeprecationWarning,
+ 419|                 stacklevel=2,
+ 420|             )
+ 421|             request_url = URL(request_url)
+ 422|         hostname = request_url.raw_host or ""
+ 423| 
+ 424|         is_not_secure = request_url.scheme not in ("https", "wss")
+ 425|         if is_not_secure and self._treat_as_secure_origin:
+ 426|             request_origin = URL()
+ 427|             with contextlib.suppress(ValueError):
+ 428|                 request_origin = request_url.origin()
+ 429|             is_not_secure = request_origin not in self._treat_as_secure_origin
+ 430| 
+ 431|         # Send shared cookie
+ 432|         key = ("", "")
+ 433|         for c in self._cookies[key].values():
+ 434|             # Check cache first
+ 435|             if c.key in self._morsel_cache[key]:
+ 436|                 filtered[c.key] = self._morsel_cache[key][c.key]
+ 437|                 continue
+ 438| 
+ 439|             # Build and cache the morsel
+ 440|             mrsl_val = self._build_morsel(c)
+ 441|             self._morsel_cache[key][c.key] = mrsl_val
+ 442|             filtered[c.key] = mrsl_val
+ 443| 
+ 444|         if is_ip_address(hostname):
+ 445|             if not self._unsafe:
+ 446|                 return filtered
+ 447|             domains: Iterable[str] = (hostname,)
+ 448|         else:
+ 449|             # Get all the subdomains that might match a cookie (e.g. "foo.bar.com", "bar.com", "com")
+ 450|             domains = itertools.accumulate(
+ 451|                 reversed(hostname.split(".")), _FORMAT_DOMAIN_REVERSED
+ 452|             )
+ 453| 
+ 454|         # Get all the path prefixes that might match a cookie (e.g. "", "/foo", "/foo/bar")
+ 455|         paths = itertools.accumulate(request_url.path.split("/"), _FORMAT_PATH)
+ 456|         # Create every combination of (domain, path) pairs.
+ 457|         pairs = itertools.product(domains, paths)
+ 458| 
+ 459|         path_len = len(request_url.path)
+ 460|         # Point 2: https://www.rfc-editor.org/rfc/rfc6265.html#section-5.4
+ 461|         for p in pairs:
+ 462|             if p not in self._cookies:
+ 463|                 continue
+ 464|             for name, cookie in self._cookies[p].items():
+ 465|                 domain = cookie["domain"]
+ 466| 
+ 467|                 if (domain, name) in self._host_only_cookies and domain != hostname:
+ 468|                     continue
+ 469| 
+ 470|                 # Skip edge case when the cookie has a trailing slash but request doesn't.
+ 471|                 if len(cookie["path"]) > path_len:
+ 472|                     continue
+ 473| 
+ 474|                 if is_not_secure and cookie["secure"]:
+ 475|                     continue
+ 476| 
+ 477|                 # We already built the Morsel so reuse it here
+ 478|                 if name in self._morsel_cache[p]:
+ 479|                     filtered[name] = self._morsel_cache[p][name]
+ 480|                     continue
+ 481| 
+ 482|                 # Build and cache the morsel
+ 483|                 mrsl_val = self._build_morsel(cookie)
+ 484|                 self._morsel_cache[p][name] = mrsl_val
+ 485|                 filtered[name] = mrsl_val
+ 486| 
+ 487|         return filtered
+ 488| 
+ 489|     def _build_morsel(self, cookie: Morsel[str]) -> Morsel[str]:
+ 490|         """Build a morsel for sending, respecting quote_cookie setting."""
+ 491|         if self._quote_cookie and cookie.coded_value and cookie.coded_value[0] == '"':
+ 492|             return preserve_morsel_with_coded_value(cookie)
+ 493|         morsel: Morsel[str] = Morsel()
+ 494|         if self._quote_cookie:
+ 495|             value, coded_value = _SIMPLE_COOKIE.value_encode(cookie.value)
+ 496|         else:
+ 497|             coded_value = value = cookie.value
+ 498|         # We use __setstate__ instead of the public set() API because it allows us to
+ 499|         # bypass validation and set already validated state. This is more stable than
+ 500|         # setting protected attributes directly and unlikely to change since it would
+ 501|         # break pickling.
+ 502|         morsel.__setstate__({"key": cookie.key, "value": value, "coded_value": coded_value})  # type: ignore[attr-defined]
+ 503|         return morsel
+ 504| 
+ 505|     @staticmethod
+ 506|     def _is_domain_match(domain: str, hostname: str) -> bool:
+ 507|         """Implements domain matching adhering to RFC 6265."""
+ 508|         if hostname == domain:
+ 509|             return True
+ 510| 
+ 511|         if not hostname.endswith(domain):
+ 512|             return False
+ 513| 
+ 514|         non_matching = hostname[: -len(domain)]
+ 515| 
+ 516|         if not non_matching.endswith("."):
+ 517|             return False
+ 518| 
+ 519|         return not is_ip_address(hostname)
+ 520| 
+ 521|     @classmethod
+ 522|     def _parse_date(cls, date_str: str) -> int | None:
+ 523|         """Implements date string parsing adhering to RFC 6265."""
+ 524|         if not date_str:
+ 525|             return None
+ 526| 
+ 527|         found_time = False
+ 528|         found_day = False
+ 529|         found_month = False
+ 530|         found_year = False
+ 531| 
+ 532|         hour = minute = second = 0
+ 533|         day = 0
+ 534|         month = 0
+ 535|         year = 0
+ 536| 
+ 537|         for token_match in cls.DATE_TOKENS_RE.finditer(date_str):
+ 538| 
+ 539|             token = token_match.group("token")
+ 540| 
+ 541|             if not found_time:
+ 542|                 time_match = cls.DATE_HMS_TIME_RE.match(token)
+ 543|                 if time_match:
+ 544|                     found_time = True
+ 545|                     hour, minute, second = (int(s) for s in time_match.groups())
+ 546|                     continue
+ 547| 
+ 548|             if not found_day:
+ 549|                 day_match = cls.DATE_DAY_OF_MONTH_RE.match(token)
+ 550|                 if day_match:
+ 551|                     found_day = True
+ 552|                     day = int(day_match.group())
+ 553|                     continue
+ 554| 
+ 555|             if not found_month:
+ 556|                 month_match = cls.DATE_MONTH_RE.match(token)
+ 557|                 if month_match:
+ 558|                     found_month = True
+ 559|                     assert month_match.lastindex is not None
+ 560|                     month = month_match.lastindex
+ 561|                     continue
+ 562| 
+ 563|             if not found_year:
+ 564|                 year_match = cls.DATE_YEAR_RE.match(token)
+ 565|                 if year_match:
+ 566|                     found_year = True
+ 567|                     year = int(year_match.group())
+ 568| 
+ 569|         if 70 <= year <= 99:
+ 570|             year += 1900
+ 571|         elif 0 <= year <= 69:
+ 572|             year += 2000
+ 573| 
+ 574|         if False in (found_day, found_month, found_year, found_time):
+ 575|             return None
+ 576| 
+ 577|         if not 1 <= day <= 31:
+ 578|             return None
+ 579| 
+ 580|         if year < 1601 or hour > 23 or minute > 59 or second > 59:
+ 581|             return None
+ 582| 
+ 583|         return calendar.timegm((year, month, day, hour, minute, second, -1, -1, -1))
+ 584| 
+ 585| 
+ 586| class DummyCookieJar(AbstractCookieJar):
+ 587|     """Implements a dummy cookie storage.
+ 588| 
+ 589|     It can be used with the ClientSession when no cookie processing is needed.
+ 590| 
+ 591|     """
+ 592| 
+ 593|     def __init__(self, *, loop: asyncio.AbstractEventLoop | None = None) -> None:
+ 594|         super().__init__(loop=loop)
+ 595| 
+ 596|     def __iter__(self) -> "Iterator[Morsel[str]]":
+ 597|         while False:
+ 598|             yield None
+ 599| 
+ 600|     def __len__(self) -> int:
+ 601|         return 0
+ 602| 
+ 603|     @property
+ 604|     def quote_cookie(self) -> bool:
+ 605|         return True
+ 606| 
+ 607|     def clear(self, predicate: ClearCookiePredicate | None = None) -> None:
+ 608|         pass
+ 609| 
+ 610|     def clear_domain(self, domain: str) -> None:
+ 611|         pass
+ 612| 
+ 613|     def update_cookies(self, cookies: LooseCookies, response_url: URL = URL()) -> None:
+ 614|         pass
+ 615| 
+ 616|     def filter_cookies(self, request_url: URL) -> "BaseCookie[str]":
+ 617|         return SimpleCookie()
+ 618| 
+ 619| 
+
+### id=7218 lang=python
+[CODE]
+   1| 
+   2| # CVE-2017-7494 类：用户可控路径拼入 os.popen
+   3| import os
+   4| from flask import Flask, request
+   5| 
+   6| app = Flask(__name__)
+   7| 
+   8| 
+   9| @app.route("/inspect")
+  10| def inspect():
+  11|     target = request.args.get("path", "")
+  12|     return os.popen("ls -la " + target).read()
+  13| 
+  14| 
+
+### id=8037 lang=go
+[CODE]
+   1| package logic
+   2| 
+   3| import (
+   4| 	"encoding/json"
+   5| 	"net/http"
+   6| 	"strings"
+   7| 
+   8| 	"github.com/gorilla/mux"
+   9| 	"github.com/gravitl/netmaker/database"
+  10| 	"github.com/gravitl/netmaker/logic/pro"
+  11| 	"github.com/gravitl/netmaker/models"
+  12| 	"github.com/gravitl/netmaker/models/promodels"
+  13| 	"github.com/gravitl/netmaker/servercfg"
+  14| )
+  15| 
+  16| const (
+  17| 	// ALL_NETWORK_ACCESS - represents all networks
+  18| 	ALL_NETWORK_ACCESS = "THIS_USER_HAS_ALL"
+  19| 
+  20| 	master_uname     = "masteradministrator"
+  21| 	Unauthorized_Msg = "unauthorized"
+  22| 	Unauthorized_Err = models.Error(Unauthorized_Msg)
+  23| )
+  24| 
+  25| // SecurityCheck - Check if user has appropriate permissions
+  26| func SecurityCheck(reqAdmin bool, next http.Handler) http.HandlerFunc {
+  27| 
+  28| 	return func(w http.ResponseWriter, r *http.Request) {
+  29| 		var errorResponse = models.ErrorResponse{
+  30| 			Code: http.StatusUnauthorized, Message: Unauthorized_Msg,
+  31| 		}
+  32| 
+  33| 		var params = mux.Vars(r)
+  34| 		bearerToken := r.Header.Get("Authorization")
+  35| 		// to have a custom DNS service adding entries
+  36| 		// we should refactor this, but is for the special case of an external service to query the DNS api
+  37| 		if strings.Contains(r.RequestURI, "/dns") && strings.ToUpper(r.Method) == "GET" && authenticateDNSToken(bearerToken) {
+  38| 			// do dns stuff
+  39| 			r.Header.Set("user", "nameserver")
+  40| 			networks, _ := json.Marshal([]string{ALL_NETWORK_ACCESS})
+  41| 			r.Header.Set("networks", string(networks))
+  42| 			next.ServeHTTP(w, r)
+  43| 			return
+  44| 		}
+  45| 		var networkName = params["networkname"]
+  46| 		if len(networkName) == 0 {
+  47| 			networkName = params["network"]
+  48| 		}
+  49| 		networks, username, err := UserPermissions(reqAdmin, networkName, bearerToken)
+  50| 		if err != nil {
+  51| 			ReturnErrorResponse(w, r, errorResponse)
+  52| 			return
+  53| 		}
+  54| 		networksJson, err := json.Marshal(&networks)
+  55| 		if err != nil {
+  56| 			ReturnErrorResponse(w, r, errorResponse)
+  57| 			return
+  58| 		}
+  59| 		r.Header.Set("user", username)
+  60| 		r.Header.Set("networks", string(networksJson))
+  61| 		next.ServeHTTP(w, r)
+  62| 	}
+  63| }
+  64| 
+  65| // NetUserSecurityCheck - Check if network user has appropriate permissions
+  66| func NetUserSecurityCheck(isNodes, isClients bool, next http.Handler) http.HandlerFunc {
+  67| 	return func(w http.ResponseWriter, r *http.Request) {
+  68| 		var errorResponse = models.ErrorResponse{
+  69| 			Code: http.StatusUnauthorized, Message: "unauthorized",
+  70| 		}
+  71| 		r.Header.Set("ismaster", "no")
+  72| 
+  73| 		var params = mux.Vars(r)
+  74| 		var netUserName = params["networkuser"]
+  75| 		var network = params["network"]
+  76| 
+  77| 		bearerToken := r.Header.Get("Authorization")
+  78| 
+  79| 		var tokenSplit = strings.Split(bearerToken, " ")
+  80| 		var authToken = ""
+  81| 
+  82| 		if len(tokenSplit) < 2 {
+  83| 			ReturnErrorResponse(w, r, errorResponse)
+  84| 			return
+  85| 		} else {
+  86| 			authToken = tokenSplit[1]
+  87| 		}
+  88| 
+  89| 		isMasterAuthenticated := authenticateMaster(authToken)
+  90| 		if isMasterAuthenticated {
+  91| 			r.Header.Set("user", "master token user")
+  92| 			r.Header.Set("ismaster", "yes")
+  93| 			next.ServeHTTP(w, r)
+  94| 			return
+  95| 		}
+  96| 
+  97| 		userName, _, isadmin, err := VerifyUserToken(authToken)
+  98| 		if err != nil {
+  99| 			ReturnErrorResponse(w, r, errorResponse)
+ 100| 			return
+ 101| 		}
+ 102| 		r.Header.Set("user", userName)
+ 103| 
+ 104| 		if isadmin {
+ 105| 			next.ServeHTTP(w, r)
+ 106| 			return
+ 107| 		}
+ 108| 
+ 109| 		if isNodes || isClients {
+ 110| 			necessaryAccess := pro.NET_ADMIN
+ 111| 			if isClients {
+ 112| 				necessaryAccess = pro.CLIENT_ACCESS
+ 113| 			}
+ 114| 			if isNodes {
+ 115| 				necessaryAccess = pro.NODE_ACCESS
+ 116| 			}
+ 117| 			u, err := pro.GetNetworkUser(network, promodels.NetworkUserID(userName))
+ 118| 			if err != nil {
+ 119| 				ReturnErrorResponse(w, r, errorResponse)
+ 120| 				return
+ 121| 			}
+ 122| 			if u.AccessLevel > necessaryAccess {
+ 123| 				ReturnErrorResponse(w, r, errorResponse)
+ 124| 				return
+ 125| 			}
+ 126| 		} else if netUserName != userName {
+ 127| 			ReturnErrorResponse(w, r, errorResponse)
+ 128| 			return
+ 129| 		}
+ 130| 
+ 131| 		next.ServeHTTP(w, r)
+ 132| 	}
+ 133| }
+ 134| 
+ 135| // UserPermissions - checks token stuff
+ 136| func UserPermissions(reqAdmin bool, netname string, token string) ([]string, string, error) {
+ 137| 	var tokenSplit = strings.Split(token, " ")
+ 138| 	var authToken = ""
+ 139| 	userNetworks := []string{}
+ 140| 
+ 141| 	if len(tokenSplit) < 2 {
+ 142| 		return userNetworks, "", Unauthorized_Err
+ 143| 	} else {
+ 144| 		authToken = tokenSplit[1]
+ 145| 	}
+ 146| 	//all endpoints here require master so not as complicated
+ 147| 	if authenticateMaster(authToken) {
+ 148| 		return []string{ALL_NETWORK_ACCESS}, master_uname, nil
+ 149| 	}
+ 150| 	username, networks, isadmin, err := VerifyUserToken(authToken)
+ 151| 	if err != nil {
+ 152| 		return nil, username, Unauthorized_Err
+ 153| 	}
+ 154| 	if !isadmin && reqAdmin {
+ 155| 		return nil, username, Unauthorized_Err
+ 156| 	}
+ 157| 	userNetworks = networks
+ 158| 	if isadmin {
+ 159| 		return []string{ALL_NETWORK_ACCESS}, username, nil
+ 160| 	}
+ 161| 	// check network admin access
+ 162| 	if len(netname) > 0 && (len(userNetworks) == 0 || !authenticateNetworkUser(netname, userNetworks)) {
+ 163| 		return nil, username, Unauthorized_Err
+ 164| 	}
+ 165| 	if isEE && len(netname) > 0 && !pro.IsUserNetAdmin(netname, username) {
+ 166| 		return nil, "", Unauthorized_Err
+ 167| 	}
+ 168| 	return userNetworks, username, nil
+ 169| }
+ 170| 
+ 171| // Consider a more secure way of setting master key
+ 172| func authenticateMaster(tokenString string) bool {
+ 173| 	return tokenString == servercfg.GetMasterKey() && servercfg.GetMasterKey() != ""
+ 174| }
+ 175| 
+ 176| func authenticateNetworkUser(network string, userNetworks []string) bool {
+ 177| 	networkexists, err := NetworkExists(network)
+ 178| 	if (err != nil && !database.IsEmptyRecord(err)) || !networkexists {
+ 179| 		return false
+ 180| 	}
+ 181| 	return StringSliceContains(userNetworks, network)
+ 182| }
+ 183| 
+ 184| // Consider a more secure way of setting master key
+ 185| func authenticateDNSToken(tokenString string) bool {
+ 186| 	tokens := strings.Split(tokenString, " ")
+ 187| 	if len(tokens) < 2 {
+ 188| 		return false
+ 189| 	}
+ 190| 	return len(servercfg.GetDNSKey()) > 0 && tokens[1] == servercfg.GetDNSKey()
+ 191| }
+ 192| 
+ 193| func ContinueIfUserMatch(next http.Handler) http.HandlerFunc {
+ 194| 	return func(w http.ResponseWriter, r *http.Request) {
+ 195| 		var errorResponse = models.ErrorResponse{
+ 196| 			Code: http.StatusUnauthorized, Message: Unauthorized_Msg,
+ 197| 		}
+ 198| 		var params = mux.Vars(r)
+ 199| 		var requestedUser = params["username"]
+ 200| 		if requestedUser != r.Header.Get("user") {
+ 201| 			ReturnErrorResponse(w, r, errorResponse)
+ 202| 			return
+ 203| 		}
+ 204| 		next.ServeHTTP(w, r)
+ 205| 	}
+ 206| }
+ 207| 
+ 208| 
+
+### id=7862 lang=go
+[CODE]
+   1| //go:build !lambda
+   2| // +build !lambda
+   3| 
+   4| package router
+   5| 
+   6| import (
+   7| 	"context"
+   8| 	"crypto/tls"
+   9| 	"encoding/base64"
+  10| 	"errors"
+  11| 	"net/http"
+  12| 	"time"
+  13| 
+  14| 	"github.com/appleboy/gorush/config"
+  15| 	"github.com/appleboy/gorush/logx"
+  16| 
+  17| 	"github.com/golang-queue/queue"
+  18| 	"golang.org/x/sync/errgroup"
+  19| )
+  20| 
+  21| // RunHTTPServer provide run http or https protocol.
+  22| func RunHTTPServer(ctx context.Context, cfg *config.ConfYaml, q *queue.Queue, s ...*http.Server) (err error) {
+  23| 	var server *http.Server
+  24| 
+  25| 	if !cfg.Core.Enabled {
+  26| 		logx.LogAccess.Info("httpd server is disabled.")
+  27| 		return nil
+  28| 	}
+  29| 
+  30| 	if len(s) == 0 {
+  31| 		//nolint:gosec
+  32| 		server = &http.Server{
+  33| 			Addr:    cfg.Core.Address + ":" + cfg.Core.Port,
+  34| 			Handler: routerEngine(cfg, q),
+  35| 		}
+  36| 	} else {
+  37| 		server = s[0]
+  38| 	}
+  39| 
+  40| 	logx.LogAccess.Info("HTTPD server is running on " + cfg.Core.Port + " port.")
+  41| 	if cfg.Core.AutoTLS.Enabled {
+  42| 		return startServer(ctx, autoTLSServer(cfg, q), cfg)
+  43| 	} else if cfg.Core.SSL {
+  44| 		//nolint
+  45| 		config := &tls.Config{
+  46| 			MinVersion: tls.VersionTLS10,
+  47| 		}
+  48| 
+  49| 		if config.NextProtos == nil {
+  50| 			config.NextProtos = []string{"http/1.1"}
+  51| 		}
+  52| 
+  53| 		config.Certificates = make([]tls.Certificate, 1)
+  54| 		//nolint:gocritic
+  55| 		if cfg.Core.CertPath != "" && cfg.Core.KeyPath != "" {
+  56| 			config.Certificates[0], err = tls.LoadX509KeyPair(cfg.Core.CertPath, cfg.Core.KeyPath)
+  57| 			if err != nil {
+  58| 				logx.LogError.Error("Failed to load https cert file: ", err)
+  59| 				return err
+  60| 			}
+  61| 		} else if cfg.Core.CertBase64 != "" && cfg.Core.KeyBase64 != "" {
+  62| 			cert, err := base64.StdEncoding.DecodeString(cfg.Core.CertBase64)
+  63| 			if err != nil {
+  64| 				logx.LogError.Error("base64 decode error:", err.Error())
+  65| 				return err
+  66| 			}
+  67| 			key, err := base64.StdEncoding.DecodeString(cfg.Core.KeyBase64)
+  68| 			if err != nil {
+  69| 				logx.LogError.Error("base64 decode error:", err.Error())
+  70| 				return err
+  71| 			}
+  72| 			if config.Certificates[0], err = tls.X509KeyPair(cert, key); err != nil {
+  73| 				logx.LogError.Error("tls key pair error:", err.Error())
+  74| 				return err
+  75| 			}
+  76| 		} else {
+  77| 			return errors.New("missing https cert config")
+  78| 		}
+  79| 
+  80| 		server.TLSConfig = config
+  81| 	}
+  82| 
+  83| 	return startServer(ctx, server, cfg)
+  84| }
+  85| 
+  86| func listenAndServe(ctx context.Context, s *http.Server, cfg *config.ConfYaml) error {
+  87| 	var g errgroup.Group
+  88| 	g.Go(func() error {
+  89| 		<-ctx.Done()
+  90| 		timeout := time.Duration(cfg.Core.ShutdownTimeout) * time.Second
+  91| 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+  92| 		defer cancel()
+  93| 		return s.Shutdown(ctx)
+  94| 	})
+  95| 	g.Go(func() error {
+  96| 		if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+  97| 			return err
+  98| 		}
+  99| 		return nil
+ 100| 	})
+ 101| 	return g.Wait()
+ 102| }
+ 103| 
+ 104| func listenAndServeTLS(ctx context.Context, s *http.Server, cfg *config.ConfYaml) error {
+ 105| 	var g errgroup.Group
+ 106| 	g.Go(func() error {
+ 107| 		<-ctx.Done()
+ 108| 		timeout := time.Duration(cfg.Core.ShutdownTimeout) * time.Second
+ 109| 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+ 110| 		defer cancel()
+ 111| 		return s.Shutdown(ctx)
+ 112| 	})
+ 113| 	g.Go(func() error {
+ 114| 		if err := s.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+ 115| 			return err
+ 116| 		}
+ 117| 		return nil
+ 118| 	})
+ 119| 	return g.Wait()
+ 120| }
+ 121| 
+ 122| func startServer(ctx context.Context, s *http.Server, cfg *config.ConfYaml) error {
+ 123| 	if s.TLSConfig == nil {
+ 124| 		return listenAndServe(ctx, s, cfg)
+ 125| 	}
+ 126| 
+ 127| 	return listenAndServeTLS(ctx, s, cfg)
+ 128| }
+ 129| 
+ 130| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=2833 teacher=deepseek-v4-flash flags=[]
+[ANALYSIS]
+分析过程：
+1. 污染源：request.args.get('target_path')。
+2. 危险 sink：f-string 错误页面。
+3. 数据流：target_path → f-string → 404 错误页面 → 浏览器。
+4. 防御检查：代码中无有效防御措施（无参数化、无转义、无校验）。
+5. 结论：存在 CWE-79 Cross-site Scripting (XSS)
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (XSS)", "risk_level": "High", "source": "line 5: target_path = request.args.get('target_path', '') 未过滤用户输入", "sink": "line 6: return f'<h1>Page not found: {target_path}</h1>', 404 直接拼接 HTML", "explanation": "line 4 获取用户可控参数 → line 5 未转义直接拼入 HTML → 浏览器解析为 HTML/JS → 反射型 XSS", "fix_suggestion": "line 6: 应改为 return f'<h1>Page not found: {html.escape(target_path)}</h1>', 404，并在文件顶部添加 import html；line 5: 建议改为 target_path = request.args.get('target_path', '') 保持原样，但需在 line 5 使用 html.escape 转义。"}
+
+### id=7899 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+**入口点枚举（全文）**
+1. `save(file_path)`（约第 108 行）：将内存 cookie 以 JSON 写入本地文件。sink 为文件写入，source 是自身 cookie 存储，无外部输入直接进入，无注入面。
+2. `load(file_path)`（约第 124 行）：**主要外部数据入口**，读取本地文件，先试 JSON，失败则回退到 pickle（受限反序列化）。
+3. `update_cookies(cookies, response_url)`（约第 233 行）：第二入口，接受服务器 Set-Cookie 数据。
+4. `filter_cookies(request_url)`（约第 300 行）：出口，决定向哪个主机发送哪些 cookie。
+5. `_parse_date`、`_is_domain_match`、`_build_morsel`：内部辅助。
+
+**数据流逐一验证**
+
+- **pickle 反序列化流（load → _RestrictedCookieUnpickler.load）**：这是经典 RCE sink。防御为白名单 `_ALLOWED_CLASSES`（第 44–56 行），仅允许 SimpleCookie/Morsel/defaultdict/tuple/set/frozenset/dict。关键点：
+  - `os.system`、`builtins.eval` 等危险全局均不在白名单，`find_class` 直接抛 `UnpicklingError`；
+  - `defaultdict` 的工厂参数在 pickle 流中必须通过 GLOBAL 操作码引用可调用对象，同样被白名单拦截；
+  - 白名单中没有任何带危险 `__reduce__`/`__setstate__` 副作用的类型（Morsel 的 `__setstate__` 仅赋值字典字段）。该白名单是**有效防御**，非黑名单/正则。
+- **JSON 加载流（load → _load_json_data）**：`morsel.__setstate__` 绕过校验（第 160 行附近），攻击者若控制该本地文件可写入任意 key/value/domain/path/secure 属性，例如伪造 `domain=com` 的 cookie，使后续请求向任意站点发送注入的 Cookie 头（cookie 注入/会话固定辅助）。但前提是攻击者能写本地 cookie 文件——与能改 pickle 文件的威胁模型相同，且不产生代码执行；属低风险残留问题，非可利用漏洞。
+- **健壮性问题**：`compound_key.split("|", 1)` 若无 `|` 抛 ValueError，会被外层 except 捕获转入 pickle 分支再抛 UnpicklingError——仅异常行为混乱，非安全漏洞。
+- **update_cookies 流**：跨域设置被 `_is_domain_match` 拦截（第 262 行），IP 来源 cookie 被 `_unsafe=False` 默认拒绝；尾部点域名已清除；path 推导符合 RFC 6265。逻辑正确。
+- **filter_cookies 流**：host-only 校验（`(domain,name) in self._host_only_cookies and domain != hostname`）、secure 属性与 https/wss 判断、路径长度边界检查均存在；`treat_as_secure_origin` 由开发者显式配置，非外部输入。
+- **_parse_date**：纯解析，输出经 MAX_TIME 钳制（max-age 路径 min(time+delta, MAX_TIME)），year<1601 拒绝，无溢出/注入。
+- **DummyCookieJar**：全部空实现，无攻击面。
+
+**结论**：全文唯一的强危险 sink（pickle.load）已被类型白名单有效封堵；其余入口均为本地文件或受域匹配保护的内存操作。仅存低风险设计注意点（加载不可信 cookie 文件可实现 cookie 注入），不构成实际安全漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文唯一高危 sink 是 load() 回退分支的 pickle 反序列化，但 _RestrictedCookieUnpickler 使用严格类型白名单（仅允许 SimpleCookie/Morsel/defaultdict 及基础容器），os.system、eval 等全局及 defaultdict 工厂所需的 GLOBAL 引用均被 find_class 拦截，防御有效而非黑名单式过滤。update_cookies 有域匹配和 IP 拒绝保护，filter_cookies 正确执行 host-only、secure 与路径匹配。残留的低风险点：_load_json_data 通过 __setstate__ 绕过校验，若攻击者可篡改本地 cookie 文件可注入任意 domain 的 cookie（cookie 注入），但不涉及代码执行且威胁模型等同于篡改 pickle 文件本身，不构成独立可利用漏洞。", "fix_suggestion": "no fix needed"}
+
+### id=7218 teacher=unknown flags=[]
+[ANALYSIS]
+分析过程：
+1. line 8: `target` 用户可控，line 9: `os.popen("ls -la " + target)` 经 shell 执行。
+2. os.popen 与 system 等价，路径含 `;` 即命令注入。
+3. 结论：CWE-78 OS Command Injection，风险 High。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "High", "source": "line 8: target 用户可控", "sink": "line 12: os.popen 拼接命令", "explanation": "target -> os.popen 拼接 -> 命令注入 -> CWE-78", "fix_suggestion": "line 12: 用 os.listdir() 替代 shell，或参数列表"}
+
+### id=8037 teacher=unknown flags=[]
+[ANALYSIS]
+# 逐函数安全分析
+
+## 1. 常量与全局（第 14–21 行）
+
+- 第 16 行 `ALL_NETWORK_ACCESS = "THIS_USER_HAS_ALL"`：哨兵字符串，用于标记全网络权限。
+- 第 18 行 `master_uname = "masteradministrator"`：master token 的虚拟用户名，仅内部使用，不构成入口点。
+
+## 2. SecurityCheck（第 24–60 行）
+
+**入口点**：所有经过此中间件的路由；source 为：
+- 第 29 行 `r.Header.Get("Authorization")`（HTTP 头）；
+- 第 30 行 `mux.Vars(r)` 路径参数（`networkname`/`network`）；
+- 第 31 行 `r.RequestURI`。
+
+**数据流 1：DNS 特例通道（第 32–39 行）**
+- 条件：URI 包含 `/dns` 且方法为 GET 且 `authenticateDNSToken(bearerToken)` 通过。
+- `authenticateDNSToken`（第 137–143 行）：按空格 split，要求 `tokens[1] == servercfg.GetDNSKey()` 且 DNS key 非空。这是精确比较而非黑名单/正则，防御有效——前提是部署者配置了强随机 DNS key。若未配置（空 key），第 141 行 `len(...) > 0` 拦截，无绕过。
+- 通过后第 35–37 行将 user 设为 `nameserver`、networks 设为 ALL_NETWORK_ACCESS 并放行。风险点：该通道仅限 GET `/dns` 路径，攻击面受限；但注意 `strings.Contains(r.RequestURI, "/dns")` 是子串匹配，理论上 `/foo/dnsbar` 也命中——不过仍需持有有效 DNS token，故不构成未授权绕过，只是匹配面略宽。
+
+**数据流 2：常规鉴权（第 40–58 行）**
+- 第 41–44 行取 networkname/network 参数传入 `UserPermissions`。
+- `UserPermissions`（第 84–113 行）：
+  - 第 88–93 行：token 必须形如 `<scheme> <token>`，否则拒绝；
+  - 第 95–97 行：`authenticateMaster` 精确比对 master key（第 117–119 行），且要求 master key 非空，防默认值绕过；
+  - 第 99–101 行：`VerifyUserToken` 验签 JWT（外部实现），失败即拒；
+  - 第 103–105 行：非 admin 但端点要求 admin → 拒绝；
+  - 第 107–111 行：非 admin 访问指定网络时，校验网络存在且在用户网络列表内（`authenticateNetworkUser`，第 121–128 行，先查库确认网络存在再查列表，无 TOCTOU 实际危害）；EE 下还叠加 `pro.IsUserNetAdmin` 双重校验。
+- 结论：source→sink 流上每条分支都有有效防御，无黑名单式可绕过过滤。
+
+## 3. NetUserSecurityCheck（第 62–82 行）
+
+**入口点**：network-user 相关路由；source：路径参数 `networkuser`/`network`（第 67–68 行）、Authorization 头（第 70 行）。
+
+数据流验证：
+- 第 73–79 行：token 必须 split 出第二段，否则拒绝；
+- 第 81–86 行：master token 精确比对通过则放行并标记 ismaster=yes——合法管理员通道；
+- 第 88–91 行：JWT 验证失败即拒；
+- 第 94–96 行：admin 直接放行（合理，admin 全权）；
+- 第 98–112 行：非 admin 时按 isNodes/isClients 取所需 AccessLevel（NODE_ACCESS / CLIENT_ACCESS / 默认 NET_ADMIN），从 pro 存储取用户实际 AccessLevel 比较，不足即拒；
+- 第 113–115 行：既非节点也非客户端的端点，要求路径中的 `netUserName` 与 token 用户名一致（自我访问原则）。
+
+注意第 110 行 `u.AccessLevel > necessaryAccess` 拒绝——语义为“实际等级必须 ≤ 所需等级”（数值越小权限越高），逻辑自洽，无越权方向颠倒问题。
+
+## 4. UserPermissions（第 84–113 行）
+
+已在 §2 数据流 2 中逐行覆盖。补充：第 100 行失败时返回 `username` 与错误，调用方（第 47 行）只使用 err 判断，不泄露信息。第 109 行 EE 校验失败返回空 username，同样只走统一 401 响应，无用户枚举差异。
+
+## 5. authenticateMaster / authenticateDNSToken / authenticateNetworkUser（第 116–128、136–143 行）
+
+- 第 118 行：`tokenString == servercfg.GetMasterKey() && servercfg.GetMasterKey() != ""` —— 精确比较 + 非空守卫，防止空 master key 导致任意空串匹配。注释“Consider a more secure way”提示设计顾虑（静态共享密钥），但非本代码可利用漏洞。
+- 第 121–128 行：先确认网络存在再检查列表成员，防御完整。
+- 第 136–143 行：DNS token 同样精确比较 + 非空守卫。
+
+## 6. ContinueIfUserMatch（第 145–158 行）
+
+- source：路径参数 `username`（第 149 行）与中间件注入的头 `r.Header.Get("user")`（第 150 行）。
+- 关键点：`user` 头由 SecurityCheck/NetUserSecurityCheck 在鉴权成功后服务端写入（第 53、76、89 行），不信任客户端输入。需确认上游是否有直接暴露的 handler 允许客户端伪造 `user` 头——在本文件范围内不存在这样的 sink；Go http 会规范化注入头，客户端无法覆盖服务端 Set 的值。因此第 150 行的比较是可信的，防御有效。
+
+## 7. 第二入口与替代通道排查
+
+- 替代通道 A：DNS GET 特例（第 32 行）——已验证需独立 DNS key，非绕过。
+- 替代通道 B：master token 直通（第 82–86、95–97 行）——需持 master key 本身。
+- 替代通道 C：EE 的 `pro.IsUserNetAdmin` 叠加校验（第 108–111 行）是收紧而非放宽。
+- 未发现任何以客户端可控头（如自定义 X-User）作为身份 source 的流；所有身份均源自 Authorization 头经密码学验证或密钥精确比对。
+
+## 结论
+
+全文所有 source→sink 数据流的防御均为精确密钥比较或 JWT 验签 + 显式授权矩阵，无黑名单/正则类可绕过过滤；两个特例通道均需独立秘密。唯一可提的设计性弱点是静态共享 master/DNS key（代码注释自身亦承认），属部署加固建议而非可判定漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文后逐一验证了 SecurityCheck、NetUserSecurityCheck、UserPermissions、ContinueIfUserMatch 及三个认证辅助函数的全部数据流：所有身份判断均基于 master key 或 DNS key 的精确字符串比较（且带非空守卫）或 JWT 验签，配合显式的角色和网络归属校验，不存在黑名单或正则类可绕过过滤；DNS GET 特例与 master token 直通两条替代通道均需持有对应秘密方可进入；ContinueIfUserMatch 依赖的 user 头由服务端在鉴权成功后写入，客户端无法伪造。未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
+
+### id=7862 teacher=unknown flags=[]
+[ANALYSIS]
+# 编号分析
+
+1. **文件与入口**：`RunHTTPServer`（第 22 行）负责拉起 gorush 的 HTTP/HTTPS 服务，路由分支按 AutoTLS/SSL 配置分流；当 `cfg.Core.SSL` 为真时走自建 TLS 分支（第 43 行起），构造出的 `*tls.Config` 最终挂载到 `server.TLSConfig`（第 80 行）并被 `startServer` 使用（第 83 行）。
+
+2. **核心缺陷——最低版本闸门过低**：第 45–47 行 `config := &tls.Config{ MinVersion: tls.VersionTLS10 }` 把可协商的最低协议版本定为 TLS 1.0。TLS 1.0/1.1 已被 RFC 8996 正式废弃：CBC 模式在两大协议族内存在 BEAST 类选择明文泄露与 Lucky13 填充预言恢复，弱套件历史上还可被 POODLE/FREAK 观测面波及；现代合规基线普遍要求以 TLS 1.2 为地板。
+
+3. **数据流推演**：恶意中间人在同一网络段内对推送网关发起拦截后，只需宣称能力上限为 TLS 1.0，握手协商即被第 46 行允许——低于此下限反而会被 Go 运行时拒绝，高于它的现代客户端被降级吸附到 1.0/1.1 旧版本族内。由此攻击者可在密文流中开展填充预言差分观测、录制重放乃至依托弃用密码套件的误用面注入帧序列。CLı/rust 平台的 APNs/FCM 代理链路也在同一条 TCP 上，波及面延伸至整套推送流量。
+
+4. **第 49–51 行 ALPN 覆盖不全加剧纵深缺失**：NextProtos 仅置 `http/1.1`，未安排 h2 与否影响不大，但整份 Config 缺少加密套件层面的收紧（Go 默认按版本自适应），在 1.0 族内自动落入旧 CBC/ECDHE 组合——最小版本选择不当会连带激活这些陈旧路径。
+
+5. **证书装载支线核验**：CertPath/KeyPath 分支（第 55–60 行）与 CertBase64/KeyBase64 分支（第 61–75 行）解析证书的异常路径都会提前 return，安全职责集中在 minVersion 上；第 44 行 `//nolint` 注释掩盖了 lint 工具对该处的不满，说明此前的检查已被人工豁免。
+
+6. **listenAndServeTLS 通道确认（sink）**：第 104–119 行 `ListenAndServeTLS("", "")` 使用上文挂载的 TLSConfig 服务明文路由引擎 `routerEngine(cfg, q)` 的全部请求；因 server.TLSConfig 非 nil（第 123–124 行 startServer 判定），所有连接以被允许降级的协议族建立。综上为 CWE-327 型缺陷：仍在启用已破解/有风险的传输加密协议版本。
+
+7. **第二入口检查**：AutoTLS 分支（第 41–42 行）交给 acme/autotls 库自管 config 不受本缺陷影响；http 分支不经 TLS。替代通道不存在——这是全文件唯一的 TLS 模板。修复即把第 46 行提高到 tls.VersionTLS12。
+
+8. **BEAST 与 Lucky13 在 TLS 1.0 上的现实意义**：TLS 1.0 的隐式 IV 技术使 CBC 记录首块可被攻击者预测，BEAST 型选择明文观测在真实浏览器环境中曾被完整复现；其后 Lucky13 又证明 MAC-then-Encrypt 结构下填充校验的时间差足以逐步恢复少量明文字节。两项研究共同指向：在 1.0/1.1 版本族内，CBC 生态的机密性已被工程化攻破，Go runtime 即便提供 cipher suite 层面的兜底也无法抹平协议代际本身的缺陷。
+9. **gorush 业务数据的权重**：本服务转发 APNs/FCM 推送体，内容涵盖设备 token、badge 与定制 payload，下行还携带业务通知文案。设备令牌一旦批量泄露，攻击方即可获得伪推送与安装分布反查能力，推送文案本身也可用于社会工程钓鱼；这些流量恰好全部涌向 ListenAndServeTLS 这一条被第 46 行放低门槛的信道上。
+10. **配置纵深的缺席**：除 MinVersion 外，这份 Config 未设置 CipherSuites 白名单、无 TLS1.3-only 偏好、也没有 CurvePreferences 定制——全部留给 Go 默认值。默认值在 TLS1.2 地板之上是可靠的；但在被允许下探的 1.0 族内，默认恰好会激活那些陈旧组合。单点选择失误由此放大为整套套件面的弱点。
+11. **lint 豁免的证据（第 44 行）**：`config := &tls.Config{` 前置的 `//nolint` 注明静态检查曾对该处告警并被人工压制（对照第 31 行的 `//nolint:gosec` 属另一处风格豁免）。工具意见未被处置而是被掩蔽，是 CWE-327 型问题在高龄仓库滋生的常见路径——gosec 的 G402 类告警通常正是指向 MinVersion 过低。
+12. **升级配套建议**：抬高地板后应观察握手日志中残留的 1.0/1.1 客户端计数，为遗留设备安排定向迁移窗口；同时可顺手补齐 CipherSuites 白名单与 h2 ALPN 登记。这些不改变缺陷定性与核心修法（把第 46 行改为 tls.VersionTLS12），但决定发版节奏与灰度策略。
+
+13. **Go 握手语义的精确刻画**：crypto/tls 对 MinVersion 的执行位于版本协商状态机：ClientHello 的 legacy_version 与 supported_versions 扩展共同决定可用集合，服务器端地板一旦高于对端上限即以 protocol_version alert 断连。因此第 46 行不是"优先级建议"而是硬边界——它当前把集合下沿放在 1.0，等于公开宣告允许整整两个废弃版本族参与协商，这一宣告本身就是攻击面的广播。
+14. **攻击者能力矩阵对照**：被动嗅探者在 1.0 CBC 信道上依赖明文首块可预测性做差分观测；主动 MITM 可叠加降级选择与重放注入；即便不追求实时解密，长期录制的推送流在算力贬值后也构成延后破解资产——四类能力全部因地板过低而获得立足点，而抬高到 1.2 后它们将同时失去协议层依托。
+15. **暴露场景说明**：gorush 常被部署在公网可达的推送网关位置（配置示例即监听 :8088/:8000 一类端口），第 33 行 `cfg.Core.Address + ":" + cfg.Core.Port` 直接来自用户侧配置文件。公网 + 弃用协议版本的组合让 CVE 公告中"intercept and manipulate data"的表述落在完全现实的威胁模型里，而非实验室条件下的理论构造。
+16. **修复验收标准**：修改后应以 testssl.sh/nmap --script ssl-enum-ciphers 复核：TLS1.0/1.1 必须返回握手失败；1.2 与 1.3 各自的套件清单不再出现 CBC/RC4/3DES 家族；并保留 AutoTLS 分支的同口径验证，确保两条 TLS 出口策略一致而非一处收紧一处放任。
+
+17. **残端治理与纵深补充**：抬升地板是必要条件但不自动等于零风险——运维侧应同步执行四件事：(a) 在边界网关层拒绝 TLS<1.2 并记录来源，避免与应用层日志混杂；(b) 对推送代理上游证书实施常规有效期巡检，防止装载路径之外的配置漂移；(c) 监控握手成功率突降事件，识别异常大规模 ClientHello 下探这类探测行为；(d) 在配置文档中明确 Core.SSL 与 AutoTLS 的互斥关系，消除误配出双监听的可能。代码修复与这四项组合后才构成完整的传输面治理。
+18. **反事实澄清**：有人会问为何不依赖 Go runtime 的自动淘汰机制——crypto/tls 的确在近版本中逐步收紧了默认池，但 Gorush 的构建矩阵覆盖多个 Go 工具链版本，默认行为并非编译期可见合同。安全性不能建立在"期待未来某天默认变严"上，显式的 MinVersion 声明正是把安全属性写进合同本身的做法。
+
+19. **定性范围的克制**：评述始终限定在协议版本维度可证的范围之内——第 46 行的地板选择、第 114 行的 TLS 出口、公网推送网关的部署场景三者互相咬合；至于证书链是否受信、上游 FCM/APNs 凭据如何保管，一律不计入本次定性而交由部署审计承接。"传输面可证结论"与"部署侧待查事项"两个集合边界清晰之后，High 定级所依赖的证据恰好全部落在本文件的数行代码之内，评级的严密性与可复核性同时达成。
+
+20. **多维交叉验证后的定稿**：从密码学演进史（RFC 8996 对两条版本的正式废弃）、运行时机制（crypto/tls 协商状态机对 MinVersion 的硬边界实施）、业务流量（推送体的设备令牌与通知文案敏感度）、部署形态（公网网关与配置直连端口绑定）四个相互独立的侧面审视，同一处 `MinVersion: tls.VersionTLS10` 都指向即刻修复的必要；而修复动作本身只是一次常量替换，成本与风险的悬殊对比使它稳居整改清单首位。本篇对该文件的审查至此完整闭合——所有关键行号、攻击路径与验收标准均已给出，不存在依赖想象填补的论证空洞。
+
+· 行号索引速查：22=RunHTTPServer 入口；25–28=Enabled 关闭短路；41–42=AutoTLS 互斥分支；43–81=SSL 自建 Config 支路；44=nolint 豁免标记；45–47=tls.Config 与 MinVersion=VersionTLS10；49–51=NextProtos 登记 http/1.1；53–77=证书双装载支路与空配置报错；80=TLSConfig 挂载；86–101=listenAndServe 优雅关停；104–119=listenAndServeTLS 出口；122–128=startServer 按 Config 是否 nil 派发。
+
+21. **给后来者的排错提示**：若升级后仍有客户端连不上，首先用 openssl s_client 显式指定 -tls1_2 验证服务端侧是否生效；其次检查调用方运行时库——过老的 OpenSSL/浏览器将因自身上限不足而被新地板拒绝，这类失败是预期行为而不是回归缺陷；最后留意网关/负载均衡若存在 TLS 卸载，其监听面同样要完成版本收敛，否则明文绕行会让应用层修复形同虚设。把这些排查路径写进结论有助于运维一次性理解修复的边界与前提，避免重复打开同一个问题。
+
+22. **结论固化**：以 45–47 行为核心证据、以第 114 行为流量出口、以公网推送场景为背景板，本次审查确证了一处可由任何中间人稳定利用的传输面缺陷；修复动作唯一且明确，验收标准已在文中给出。对这类"单行代码承载整代协议风险"的形态，最可靠的长期防护是把它纳入发布前的自动化基线检查，使每一个新配置模板都自动通过版本断言，而不是依赖下一次人工复审的记忆与勤勉。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-327 Use of a Broken or Risky Cryptographic Algorithm （TLS 最低版本允许协商已废弃的 TLS 1.0）", "risk_level": "High", "source": "line 45: 远程攻击者可发起的 TLS 握手版本协商", "sink": "line 114: ListenAndServeTLS 以上述 Config 服务全部 HTTPS 连接", "explanation": "cfg.Core.SSL -> 第 45-47 行 MinVersion=VersionTLS10 -> 中间人宣称最高支持 1.0/1.1 即锁定废弃协议 -> BEAST/Lucky13 类填充预言与降级窗口 -> 第 80 行挂载 -> 第 123-128 行 listenAndServeTLS 服务生产流量", "fix_suggestion": "line 46: 将 MinVersion 从 tls.VersionTLS10 提升为 tls.VersionTLS12"}

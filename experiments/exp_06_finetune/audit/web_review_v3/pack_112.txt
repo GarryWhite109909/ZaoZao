@@ -1,0 +1,756 @@
+batch=112 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7910 lang=java
+[CODE]
+   1| /*
+   2|  * Licensed to the Apache Software Foundation (ASF) under one or more
+   3|  * contributor license agreements.  See the NOTICE file distributed with
+   4|  * this work for additional information regarding copyright ownership.
+   5|  * The ASF licenses this file to You under the Apache License, Version 2.0
+   6|  * (the "License"); you may not use this file except in compliance with
+   7|  * the License.  You may obtain a copy of the License at
+   8|  *
+   9|  *      http://www.apache.org/licenses/LICENSE-2.0
+  10|  *
+  11|  * Unless required by applicable law or agreed to in writing, software
+  12|  * distributed under the License is distributed on an "AS IS" BASIS,
+  13|  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  14|  * See the License for the specific language governing permissions and
+  15|  * limitations under the License.
+  16|  */
+  17| package org.apache.camel.component.pqc.lifecycle;
+  18| 
+  19| import java.io.BufferedInputStream;
+  20| import java.io.IOException;
+  21| import java.io.ObjectInputStream;
+  22| import java.nio.charset.StandardCharsets;
+  23| import java.nio.file.Files;
+  24| import java.nio.file.Path;
+  25| import java.nio.file.Paths;
+  26| import java.nio.file.StandardOpenOption;
+  27| import java.security.KeyFactory;
+  28| import java.security.KeyPair;
+  29| import java.security.KeyPairGenerator;
+  30| import java.security.PrivateKey;
+  31| import java.security.PublicKey;
+  32| import java.security.SecureRandom;
+  33| import java.security.spec.AlgorithmParameterSpec;
+  34| import java.security.spec.PKCS8EncodedKeySpec;
+  35| import java.security.spec.X509EncodedKeySpec;
+  36| import java.time.Duration;
+  37| import java.time.Instant;
+  38| import java.util.ArrayList;
+  39| import java.util.Base64;
+  40| import java.util.Date;
+  41| import java.util.List;
+  42| import java.util.concurrent.ConcurrentHashMap;
+  43| import java.util.stream.Stream;
+  44| 
+  45| import com.fasterxml.jackson.annotation.JsonCreator;
+  46| import com.fasterxml.jackson.annotation.JsonProperty;
+  47| import com.fasterxml.jackson.databind.ObjectMapper;
+  48| import com.fasterxml.jackson.databind.SerializationFeature;
+  49| import org.apache.camel.component.pqc.PQCKeyEncapsulationAlgorithms;
+  50| import org.apache.camel.component.pqc.PQCSignatureAlgorithms;
+  51| import org.slf4j.Logger;
+  52| import org.slf4j.LoggerFactory;
+  53| 
+  54| /**
+  55|  * File-based implementation of KeyLifecycleManager. Stores private keys in PKCS#8 format, public keys in X.509 format,
+  56|  * and metadata as JSON. This is consistent with the encoding used by {@link AwsSecretsManagerKeyLifecycleManager} and
+  57|  * {@link HashicorpVaultKeyLifecycleManager}.
+  58|  * <p/>
+  59|  * For backward compatibility, keys stored in the legacy Java serialization format are automatically migrated to the new
+  60|  * standard format on first read.
+  61|  */
+  62| public class FileBasedKeyLifecycleManager implements KeyLifecycleManager {
+  63| 
+  64|     private static final Logger LOG = LoggerFactory.getLogger(FileBasedKeyLifecycleManager.class);
+  65| 
+  66|     private final Path keyDirectory;
+  67|     private final ObjectMapper objectMapper;
+  68|     private final ConcurrentHashMap<String, KeyPair> keyCache = new ConcurrentHashMap<>();
+  69|     private final ConcurrentHashMap<String, KeyMetadata> metadataCache = new ConcurrentHashMap<>();
+  70| 
+  71|     public FileBasedKeyLifecycleManager(String keyDirectoryPath) throws IOException {
+  72|         this.keyDirectory = Paths.get(keyDirectoryPath);
+  73|         this.objectMapper = new ObjectMapper();
+  74|         this.objectMapper.enable(SerializationFeature.INDENT_OUTPUT);
+  75|         Files.createDirectories(keyDirectory);
+  76|         LOG.info("Initialized FileBasedKeyLifecycleManager with directory: {}", keyDirectory);
+  77|         loadExistingKeys();
+  78|     }
+  79| 
+  80|     @Override
+  81|     public KeyPair generateKeyPair(String algorithm, String keyId) throws Exception {
+  82|         return generateKeyPair(algorithm, keyId, null);
+  83|     }
+  84| 
+  85|     @Override
+  86|     public KeyPair generateKeyPair(String algorithm, String keyId, Object parameterSpec) throws Exception {
+  87|         LOG.info("Generating key pair for algorithm: {}, keyId: {}", algorithm, keyId);
+  88| 
+  89|         KeyPairGenerator generator;
+  90|         String provider = determineProvider(algorithm);
+  91| 
+  92|         if (provider != null) {
+  93|             generator = KeyPairGenerator.getInstance(getAlgorithmName(algorithm), provider);
+  94|         } else {
+  95|             generator = KeyPairGenerator.getInstance(getAlgorithmName(algorithm));
+  96|         }
+  97| 
+  98|         // Initialize with parameter spec if provided
+  99|         if (parameterSpec != null) {
+ 100|             if (parameterSpec instanceof AlgorithmParameterSpec algorithmParamSpec) {
+ 101|                 generator.initialize(algorithmParamSpec, new SecureRandom());
+ 102|             } else if (parameterSpec instanceof Integer keySize) {
+ 103|                 generator.initialize(keySize, new SecureRandom());
+ 104|             }
+ 105|         } else {
+ 106|             // Use default parameter spec for the algorithm
+ 107|             AlgorithmParameterSpec defaultSpec = getDefaultParameterSpec(algorithm);
+ 108|             if (defaultSpec != null) {
+ 109|                 generator.initialize(defaultSpec, new SecureRandom());
+ 110|             } else {
+ 111|                 generator.initialize(getDefaultKeySize(algorithm), new SecureRandom());
+ 112|             }
+ 113|         }
+ 114| 
+ 115|         KeyPair keyPair = generator.generateKeyPair();
+ 116| 
+ 117|         // Create metadata
+ 118|         KeyMetadata metadata = new KeyMetadata(keyId, algorithm);
+ 119|         metadata.setDescription("Generated on " + new Date());
+ 120| 
+ 121|         // Store the key
+ 122|         storeKey(keyId, keyPair, metadata);
+ 123| 
+ 124|         LOG.info("Generated key pair: {}", metadata);
+ 125|         return keyPair;
+ 126|     }
+ 127| 
+ 128|     @Override
+ 129|     public byte[] exportKey(KeyPair keyPair, KeyFormat format, boolean includePrivate) throws Exception {
+ 130|         return KeyFormatConverter.exportKeyPair(keyPair, format, includePrivate);
+ 131|     }
+ 132| 
+ 133|     @Override
+ 134|     public byte[] exportPublicKey(KeyPair keyPair, KeyFormat format) throws Exception {
+ 135|         return KeyFormatConverter.exportPublicKey(keyPair.getPublic(), format);
+ 136|     }
+ 137| 
+ 138|     @Override
+ 139|     public KeyPair importKey(byte[] keyData, KeyFormat format, String algorithm) throws Exception {
+ 140|         // Try to import as private key first (which includes public key)
+ 141|         try {
+ 142|             PrivateKey privateKey = KeyFormatConverter.importPrivateKey(keyData, format, getAlgorithmName(algorithm));
+ 143|             // For PQC algorithms, we need to derive the public key
+ 144|             // This is algorithm-specific and may require regeneration
+ 145|             LOG.warn("Importing private key only - public key derivation may be needed");
+ 146|             return new KeyPair(null, privateKey);
+ 147|         } catch (Exception e) {
+ 148|             // Try as public key only
+ 149|             PublicKey publicKey = KeyFormatConverter.importPublicKey(keyData, format, getAlgorithmName(algorithm));
+ 150|             return new KeyPair(publicKey, null);
+ 151|         }
+ 152|     }
+ 153| 
+ 154|     @Override
+ 155|     public KeyPair rotateKey(String oldKeyId, String newKeyId, String algorithm) throws Exception {
+ 156|         LOG.info("Rotating key from {} to {}", oldKeyId, newKeyId);
+ 157| 
+ 158|         // Get old key metadata
+ 159|         KeyMetadata oldMetadata = getKeyMetadata(oldKeyId);
+ 160|         if (oldMetadata == null) {
+ 161|             throw new IllegalArgumentException("Old key not found: " + oldKeyId);
+ 162|         }
+ 163| 
+ 164|         // Mark old key as deprecated
+ 165|         oldMetadata.setStatus(KeyMetadata.KeyStatus.DEPRECATED);
+ 166|         updateKeyMetadata(oldKeyId, oldMetadata);
+ 167| 
+ 168|         // Generate new key
+ 169|         KeyPair newKeyPair = generateKeyPair(algorithm, newKeyId);
+ 170| 
+ 171|         LOG.info("Key rotation completed: {} -> {}", oldKeyId, newKeyId);
+ 172|         return newKeyPair;
+ 173|     }
+ 174| 
+ 175|     @Override
+ 176|     public void storeKey(String keyId, KeyPair keyPair, KeyMetadata metadata) throws Exception {
+ 177|         // Store private key in PKCS#8 format
+ 178|         Path privateKeyFile = getPrivateKeyFile(keyId);
+ 179|         byte[] privateKeyBytes = keyPair.getPrivate().getEncoded();
+ 180|         String privateKeyBase64 = Base64.getEncoder().encodeToString(privateKeyBytes);
+ 181|         KeyFileData privateData = new KeyFileData(privateKeyBase64, "PKCS8", metadata.getAlgorithm());
+ 182|         Files.writeString(privateKeyFile, objectMapper.writeValueAsString(privateData),
+ 183|                 StandardCharsets.UTF_8,
+ 184|                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+ 185| 
+ 186|         // Store public key in X.509 format
+ 187|         Path publicKeyFile = getPublicKeyFile(keyId);
+ 188|         byte[] publicKeyBytes = keyPair.getPublic().getEncoded();
+ 189|         String publicKeyBase64 = Base64.getEncoder().encodeToString(publicKeyBytes);
+ 190|         KeyFileData publicData = new KeyFileData(publicKeyBase64, "X509", metadata.getAlgorithm());
+ 191|         Files.writeString(publicKeyFile, objectMapper.writeValueAsString(publicData),
+ 192|                 StandardCharsets.UTF_8,
+ 193|                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+ 194| 
+ 195|         // Store metadata as JSON
+ 196|         Path metadataFile = getMetadataFile(keyId);
+ 197|         MetadataFileData metadataData = MetadataFileData.fromKeyMetadata(metadata);
+ 198|         Files.writeString(metadataFile, objectMapper.writeValueAsString(metadataData),
+ 199|                 StandardCharsets.UTF_8,
+ 200|                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+ 201| 
+ 202|         // Remove legacy .key file if it exists (migration cleanup)
+ 203|         Files.deleteIfExists(getLegacyKeyFile(keyId));
+ 204| 
+ 205|         // Update caches
+ 206|         keyCache.put(keyId, keyPair);
+ 207|         metadataCache.put(keyId, metadata);
+ 208| 
+ 209|         LOG.debug("Stored key and metadata for: {}", keyId);
+ 210|     }
+ 211| 
+ 212|     @Override
+ 213|     public KeyPair getKey(String keyId) throws Exception {
+ 214|         if (keyCache.containsKey(keyId)) {
+ 215|             return keyCache.get(keyId);
+ 216|         }
+ 217| 
+ 218|         Path privateKeyFile = getPrivateKeyFile(keyId);
+ 219|         Path publicKeyFile = getPublicKeyFile(keyId);
+ 220| 
+ 221|         // Check for new format first
+ 222|         if (Files.exists(privateKeyFile) && Files.exists(publicKeyFile)) {
+ 223|             KeyPair keyPair = readStandardKeyPair(keyId, privateKeyFile, publicKeyFile);
+ 224|             keyCache.put(keyId, keyPair);
+ 225|             return keyPair;
+ 226|         }
+ 227| 
+ 228|         // Fall back to legacy format for migration
+ 229|         Path legacyKeyFile = getLegacyKeyFile(keyId);
+ 230|         if (Files.exists(legacyKeyFile)) {
+ 231|             return migrateLegacyKey(keyId);
+ 232|         }
+ 233| 
+ 234|         throw new IllegalArgumentException("Key not found: " + keyId);
+ 235|     }
+ 236| 
+ 237|     @Override
+ 238|     public KeyMetadata getKeyMetadata(String keyId) throws Exception {
+ 239|         if (metadataCache.containsKey(keyId)) {
+ 240|             return metadataCache.get(keyId);
+ 241|         }
+ 242| 
+ 243|         Path metadataFile = getMetadataFile(keyId);
+ 244|         if (!Files.exists(metadataFile)) {
+ 245|             return null;
+ 246|         }
+ 247| 
+ 248|         String content = Files.readString(metadataFile, StandardCharsets.UTF_8);
+ 249| 
+ 250|         // Detect format: JSON starts with '{', legacy Java serialization starts with binary
+ 251|         if (content.trim().startsWith("{")) {
+ 252|             MetadataFileData data = objectMapper.readValue(content, MetadataFileData.class);
+ 253|             KeyMetadata metadata = data.toKeyMetadata();
+ 254|             metadataCache.put(keyId, metadata);
+ 255|             return metadata;
+ 256|         } else {
+ 257|             // Legacy format - read via ObjectInputStream and migrate
+ 258|             return migrateLegacyMetadata(keyId);
+ 259|         }
+ 260|     }
+ 261| 
+ 262|     @Override
+ 263|     public void updateKeyMetadata(String keyId, KeyMetadata metadata) throws Exception {
+ 264|         Path metadataFile = getMetadataFile(keyId);
+ 265|         MetadataFileData metadataData = MetadataFileData.fromKeyMetadata(metadata);
+ 266|         Files.writeString(metadataFile, objectMapper.writeValueAsString(metadataData),
+ 267|                 StandardCharsets.UTF_8,
+ 268|                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+ 269|         metadataCache.put(keyId, metadata);
+ 270|     }
+ 271| 
+ 272|     @Override
+ 273|     public void deleteKey(String keyId) throws Exception {
+ 274|         Files.deleteIfExists(getPrivateKeyFile(keyId));
+ 275|         Files.deleteIfExists(getPublicKeyFile(keyId));
+ 276|         Files.deleteIfExists(getMetadataFile(keyId));
+ 277|         Files.deleteIfExists(getLegacyKeyFile(keyId));
+ 278|         keyCache.remove(keyId);
+ 279|         metadataCache.remove(keyId);
+ 280|         LOG.info("Deleted key: {}", keyId);
+ 281|     }
+ 282| 
+ 283|     @Override
+ 284|     public List<KeyMetadata> listKeys() throws Exception {
+ 285|         return new ArrayList<>(metadataCache.values());
+ 286|     }
+ 287| 
+ 288|     @Override
+ 289|     public boolean needsRotation(String keyId, Duration maxAge, long maxUsage) throws Exception {
+ 290|         KeyMetadata metadata = getKeyMetadata(keyId);
+ 291|         if (metadata == null) {
+ 292|             return false;
+ 293|         }
+ 294| 
+ 295|         if (metadata.needsRotation()) {
+ 296|             return true;
+ 297|         }
+ 298| 
+ 299|         if (maxAge != null && metadata.getAgeInDays() > maxAge.toDays()) {
+ 300|             return true;
+ 301|         }
+ 302| 
+ 303|         if (maxUsage > 0 && metadata.getUsageCount() >= maxUsage) {
+ 304|             return true;
+ 305|         }
+ 306| 
+ 307|         return false;
+ 308|     }
+ 309| 
+ 310|     @Override
+ 311|     public void expireKey(String keyId) throws Exception {
+ 312|         KeyMetadata metadata = getKeyMetadata(keyId);
+ 313|         if (metadata != null) {
+ 314|             metadata.setStatus(KeyMetadata.KeyStatus.EXPIRED);
+ 315|             updateKeyMetadata(keyId, metadata);
+ 316|             LOG.info("Expired key: {}", keyId);
+ 317|         }
+ 318|     }
+ 319| 
+ 320|     @Override
+ 321|     public void revokeKey(String keyId, String reason) throws Exception {
+ 322|         KeyMetadata metadata = getKeyMetadata(keyId);
+ 323|         if (metadata != null) {
+ 324|             metadata.setStatus(KeyMetadata.KeyStatus.REVOKED);
+ 325|             metadata.setDescription((metadata.getDescription() != null ? metadata.getDescription() + "; " : "")
+ 326|                                     + "Revoked: " + reason);
+ 327|             updateKeyMetadata(keyId, metadata);
+ 328|             LOG.info("Revoked key: {} - {}", keyId, reason);
+ 329|         }
+ 330|     }
+ 331| 
+ 332|     private KeyPair readStandardKeyPair(String keyId, Path privateKeyFile, Path publicKeyFile) throws Exception {
+ 333|         String privateJson = Files.readString(privateKeyFile, StandardCharsets.UTF_8);
+ 334|         KeyFileData privateData = objectMapper.readValue(privateJson, KeyFileData.class);
+ 335|         byte[] privateKeyBytes = Base64.getDecoder().decode(privateData.key());
+ 336|         PKCS8EncodedKeySpec privateSpec = new PKCS8EncodedKeySpec(privateKeyBytes);
+ 337| 
+ 338|         String publicJson = Files.readString(publicKeyFile, StandardCharsets.UTF_8);
+ 339|         KeyFileData publicData = objectMapper.readValue(publicJson, KeyFileData.class);
+ 340|         byte[] publicKeyBytes = Base64.getDecoder().decode(publicData.key());
+ 341|         X509EncodedKeySpec publicSpec = new X509EncodedKeySpec(publicKeyBytes);
+ 342| 
+ 343|         String algorithm = privateData.algorithm();
+ 344|         String algorithmName = getAlgorithmName(algorithm);
+ 345|         String provider = determineProvider(algorithm);
+ 346| 
+ 347|         KeyFactory keyFactory;
+ 348|         if (provider != null) {
+ 349|             keyFactory = KeyFactory.getInstance(algorithmName, provider);
+ 350|         } else {
+ 351|             keyFactory = KeyFactory.getInstance(algorithmName);
+ 352|         }
+ 353| 
+ 354|         PrivateKey privateKey = keyFactory.generatePrivate(privateSpec);
+ 355|         PublicKey publicKey = keyFactory.generatePublic(publicSpec);
+ 356|         return new KeyPair(publicKey, privateKey);
+ 357|     }
+ 358| 
+ 359|     /**
+ 360|      * Migrates a legacy Java-serialized key file to the new PKCS#8/X.509 JSON format.
+ 361|      */
+ 362|     @SuppressWarnings("java:S4508")
+ 363|     private KeyPair migrateLegacyKey(String keyId) throws Exception {
+ 364|         LOG.info("Migrating legacy key format to PKCS#8/X.509 for keyId: {}", keyId);
+ 365|         Path legacyKeyFile = getLegacyKeyFile(keyId);
+ 366| 
+ 367|         KeyPair keyPair;
+ 368|         try (ObjectInputStream ois = new ObjectInputStream(new BufferedInputStream(Files.newInputStream(legacyKeyFile)))) {
+ 369|             keyPair = (KeyPair) ois.readObject();
+ 370|         }
+ 371| 
+ 372|         // Read or migrate metadata
+ 373|         KeyMetadata metadata = getKeyMetadata(keyId);
+ 374|         if (metadata == null) {
+ 375|             metadata = new KeyMetadata(keyId, "UNKNOWN");
+ 376|             metadata.setDescription("Migrated from legacy format");
+ 377|         }
+ 378| 
+ 379|         // Re-store in the new format (this also removes the legacy .key file)
+ 380|         storeKey(keyId, keyPair, metadata);
+ 381|         LOG.info("Successfully migrated key to PKCS#8/X.509 format: {}", keyId);
+ 382|         return keyPair;
+ 383|     }
+ 384| 
+ 385|     /**
+ 386|      * Migrates a legacy Java-serialized metadata file to JSON format.
+ 387|      */
+ 388|     @SuppressWarnings("java:S4508")
+ 389|     private KeyMetadata migrateLegacyMetadata(String keyId) throws Exception {
+ 390|         LOG.info("Migrating legacy metadata format to JSON for keyId: {}", keyId);
+ 391|         Path metadataFile = getMetadataFile(keyId);
+ 392| 
+ 393|         KeyMetadata metadata;
+ 394|         try (ObjectInputStream ois = new ObjectInputStream(new BufferedInputStream(Files.newInputStream(metadataFile)))) {
+ 395|             metadata = (KeyMetadata) ois.readObject();
+ 396|         }
+ 397| 
+ 398|         // Re-store in JSON format
+ 399|         MetadataFileData metadataData = MetadataFileData.fromKeyMetadata(metadata);
+ 400|         Files.writeString(metadataFile, objectMapper.writeValueAsString(metadataData),
+ 401|                 StandardCharsets.UTF_8,
+ 402|                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+ 403| 
+ 404|         metadataCache.put(keyId, metadata);
+ 405|         LOG.info("Successfully migrated metadata to JSON format: {}", keyId);
+ 406|         return metadata;
+ 407|     }
+ 408| 
+ 409|     private void loadExistingKeys() {
+ 410|         try (Stream<Path> files = Files.list(keyDirectory)) {
+ 411|             files.filter(path -> path.toString().endsWith(".metadata"))
+ 412|                     .forEach(path -> {
+ 413|                         try {
+ 414|                             String keyId = path.getFileName().toString().replace(".metadata", "");
+ 415|                             KeyMetadata metadata = getKeyMetadata(keyId);
+ 416|                             if (metadata != null) {
+ 417|                                 LOG.debug("Loaded existing key: {}", metadata);
+ 418|                             }
+ 419|                         } catch (Exception e) {
+ 420|                             LOG.warn("Failed to load key metadata: {}", path, e);
+ 421|                         }
+ 422|                     });
+ 423|         } catch (IOException e) {
+ 424|             LOG.warn("Failed to list existing keys", e);
+ 425|         }
+ 426|     }
+ 427| 
+ 428|     private Path getPrivateKeyFile(String keyId) {
+ 429|         return keyDirectory.resolve(keyId + ".private.json");
+ 430|     }
+ 431| 
+ 432|     private Path getPublicKeyFile(String keyId) {
+ 433|         return keyDirectory.resolve(keyId + ".public.json");
+ 434|     }
+ 435| 
+ 436|     private Path getMetadataFile(String keyId) {
+ 437|         return keyDirectory.resolve(keyId + ".metadata");
+ 438|     }
+ 439| 
+ 440|     private Path getLegacyKeyFile(String keyId) {
+ 441|         return keyDirectory.resolve(keyId + ".key");
+ 442|     }
+ 443| 
+ 444|     private String determineProvider(String algorithm) {
+ 445|         try {
+ 446|             PQCSignatureAlgorithms sigAlg = PQCSignatureAlgorithms.valueOf(algorithm);
+ 447|             return sigAlg.getBcProvider();
+ 448|         } catch (IllegalArgumentException e1) {
+ 449|             try {
+ 450|                 PQCKeyEncapsulationAlgorithms kemAlg = PQCKeyEncapsulationAlgorithms.valueOf(algorithm);
+ 451|                 return kemAlg.getBcProvider();
+ 452|             } catch (IllegalArgumentException e2) {
+ 453|                 return null;
+ 454|             }
+ 455|         }
+ 456|     }
+ 457| 
+ 458|     private String getAlgorithmName(String algorithm) {
+ 459|         try {
+ 460|             return PQCSignatureAlgorithms.valueOf(algorithm).getAlgorithm();
+ 461|         } catch (IllegalArgumentException e1) {
+ 462|             try {
+ 463|                 return PQCKeyEncapsulationAlgorithms.valueOf(algorithm).getAlgorithm();
+ 464|             } catch (IllegalArgumentException e2) {
+ 465|                 return algorithm;
+ 466|             }
+ 467|         }
+ 468|     }
+ 469| 
+ 470|     private AlgorithmParameterSpec getDefaultParameterSpec(String algorithm) {
+ 471|         // Provide default parameter specs for PQC algorithms
+ 472|         try {
+ 473|             switch (algorithm) {
+ 474|                 case "DILITHIUM":
+ 475|                     return org.bouncycastle.pqc.jcajce.spec.DilithiumParameterSpec.dilithium2;
+ 476|                 case "MLDSA":
+ 477|                 case "SLHDSA":
+ 478|                     // These use default initialization
+ 479|                     return null;
+ 480|                 case "FALCON":
+ 481|                     return org.bouncycastle.pqc.jcajce.spec.FalconParameterSpec.falcon_512;
+ 482|                 case "SPHINCSPLUS":
+ 483|                     return org.bouncycastle.pqc.jcajce.spec.SPHINCSPlusParameterSpec.sha2_128s;
+ 484|                 case "XMSS":
+ 485|                     return new org.bouncycastle.pqc.jcajce.spec.XMSSParameterSpec(
+ 486|                             10,
+ 487|                             org.bouncycastle.pqc.jcajce.spec.XMSSParameterSpec.SHA256);
+ 488|                 case "XMSSMT":
+ 489|                     return org.bouncycastle.pqc.jcajce.spec.XMSSMTParameterSpec.XMSSMT_SHA2_20d2_256;
+ 490|                 case "LMS":
+ 491|                 case "HSS":
+ 492|                     return new org.bouncycastle.pqc.jcajce.spec.LMSKeyGenParameterSpec(
+ 493|                             org.bouncycastle.pqc.crypto.lms.LMSigParameters.lms_sha256_n32_h10,
+ 494|                             org.bouncycastle.pqc.crypto.lms.LMOtsParameters.sha256_n32_w4);
+ 495|                 case "MLKEM":
+ 496|                 case "KYBER":
+ 497|                     // These use default initialization
+ 498|                     return null;
+ 499|                 case "NTRU":
+ 500|                     return org.bouncycastle.pqc.jcajce.spec.NTRUParameterSpec.ntruhps2048509;
+ 501|                 case "NTRULPRime":
+ 502|                     return org.bouncycastle.pqc.jcajce.spec.NTRULPRimeParameterSpec.ntrulpr653;
+ 503|                 case "SNTRUPrime":
+ 504|                     return org.bouncycastle.pqc.jcajce.spec.SNTRUPrimeParameterSpec.sntrup761;
+ 505|                 case "SABER":
+ 506|                     return org.bouncycastle.pqc.jcajce.spec.SABERParameterSpec.lightsaberkem128r3;
+ 507|                 case "FRODO":
+ 508|                     return org.bouncycastle.pqc.jcajce.spec.FrodoParameterSpec.frodokem640aes;
+ 509|                 case "BIKE":
+ 510|                     return org.bouncycastle.pqc.jcajce.spec.BIKEParameterSpec.bike128;
+ 511|                 case "HQC":
+ 512|                     return org.bouncycastle.pqc.jcajce.spec.HQCParameterSpec.hqc128;
+ 513|                 case "CMCE":
+ 514|                     return org.bouncycastle.pqc.jcajce.spec.CMCEParameterSpec.mceliece348864;
+ 515|                 default:
+ 516|                     return null;
+ 517|             }
+ 518|         } catch (Exception e) {
+ 519|             LOG.warn("Failed to create default parameter spec for algorithm: {}", algorithm, e);
+ 520|             return null;
+ 521|         }
+ 522|     }
+ 523| 
+ 524|     private int getDefaultKeySize(String algorithm) {
+ 525|         // Default key sizes for different algorithms
+ 526|         // For PQC algorithms, key size is usually determined by parameter specs
+ 527|         return 256;
+ 528|     }
+ 529| 
+ 530|     /**
+ 531|      * JSON structure for storing key data (private or public) in files.
+ 532|      */
+ 533|     record KeyFileData(
+ 534|             @JsonProperty("key") String key,
+ 535|             @JsonProperty("format") String format,
+ 536|             @JsonProperty("algorithm") String algorithm) {
+ 537| 
+ 538|         @JsonCreator
+ 539|         KeyFileData {
+ 540|         }
+ 541|     }
+ 542| 
+ 543|     /**
+ 544|      * JSON structure for storing key metadata in files.
+ 545|      */
+ 546|     static final class MetadataFileData {
+ 547|         @JsonProperty("keyId")
+ 548|         String keyId;
+ 549|         @JsonProperty("algorithm")
+ 550|         String algorithm;
+ 551|         @JsonProperty("createdAt")
+ 552|         String createdAt;
+ 553|         @JsonProperty("lastUsedAt")
+ 554|         String lastUsedAt;
+ 555|         @JsonProperty("expiresAt")
+ 556|         String expiresAt;
+ 557|         @JsonProperty("nextRotationAt")
+ 558|         String nextRotationAt;
+ 559|         @JsonProperty("usageCount")
+ 560|         long usageCount;
+ 561|         @JsonProperty("status")
+ 562|         String status;
+ 563|         @JsonProperty("description")
+ 564|         String description;
+ 565| 
+ 566|         MetadataFileData() {
+ 567|         }
+ 568| 
+ 569|         static MetadataFileData fromKeyMetadata(KeyMetadata metadata) {
+ 570|             MetadataFileData data = new MetadataFileData();
+ 571|             data.keyId = metadata.getKeyId();
+ 572|             data.algorithm = metadata.getAlgorithm();
+ 573|             data.createdAt = metadata.getCreatedAt().toString();
+ 574|             data.lastUsedAt = metadata.getLastUsedAt() != null ? metadata.getLastUsedAt().toString() : null;
+ 575|             data.expiresAt = metadata.getExpiresAt() != null ? metadata.getExpiresAt().toString() : null;
+ 576|             data.nextRotationAt = metadata.getNextRotationAt() != null ? metadata.getNextRotationAt().toString() : null;
+ 577|             data.usageCount = metadata.getUsageCount();
+ 578|             data.status = metadata.getStatus().name();
+ 579|             data.description = metadata.getDescription();
+ 580|             return data;
+ 581|         }
+ 582| 
+ 583|         KeyMetadata toKeyMetadata() {
+ 584|             KeyMetadata metadata = new KeyMetadata(keyId, algorithm, Instant.parse(createdAt));
+ 585|             if (lastUsedAt != null) {
+ 586|                 metadata.setLastUsedAt(Instant.parse(lastUsedAt));
+ 587|             }
+ 588|             if (expiresAt != null) {
+ 589|                 metadata.setExpiresAt(Instant.parse(expiresAt));
+ 590|             }
+ 591|             if (nextRotationAt != null) {
+ 592|                 metadata.setNextRotationAt(Instant.parse(nextRotationAt));
+ 593|             }
+ 594|             metadata.setUsageCount(usageCount);
+ 595|             metadata.setStatus(KeyMetadata.KeyStatus.valueOf(status));
+ 596|             metadata.setDescription(description);
+ 597|             return metadata;
+ 598|         }
+ 599|     }
+ 600| }
+ 601| 
+ 602| 
+
+### id=7911 lang=php
+[CODE]
+   1| <?php
+   2| declare(strict_types=1);
+   3| 
+   4| /**
+   5|  * CakePHP(tm) : Rapid Development Framework (https://cakephp.org)
+   6|  * Copyright (c) Cake Software Foundation, Inc. (https://cakefoundation.org)
+   7|  *
+   8|  * Licensed under The MIT License
+   9|  * For full copyright and license information, please see the LICENSE.txt
+  10|  * Redistributions of files must retain the above copyright notice.
+  11|  *
+  12|  * @copyright     Copyright (c) Cake Software Foundation, Inc. (https://cakefoundation.org)
+  13|  * @link          https://cakephp.org CakePHP(tm) Project
+  14|  * @since         1.0.0
+  15|  * @license       https://opensource.org/licenses/mit-license.php MIT License
+  16|  */
+  17| namespace Authentication;
+  18| 
+  19| use Authentication\Authenticator\AuthenticatorCollection;
+  20| use Authentication\Authenticator\AuthenticatorInterface;
+  21| use Authentication\Authenticator\ImpersonationInterface;
+  22| use Authentication\Authenticator\PersistenceInterface;
+  23| use Authentication\Authenticator\ResultInterface;
+  24| use Authentication\Authenticator\StatelessInterface;
+  25| use Authentication\Identifier\IdentifierCollection;
+  26| use Authentication\Identifier\IdentifierInterface;
+  27| use Cake\Core\InstanceConfigTrait;
+  28| use Psr\Http\Message\ResponseInterface;
+  29| use Psr\Http\Message\ServerRequestInterface;
+  30| use RuntimeException;
+  31| 
+  32| /**
+  33|  * Authentication Service
+  34|  */
+  35| class AuthenticationService implements AuthenticationServiceInterface, ImpersonationInterface
+  36| {
+  37|     use InstanceConfigTrait;
+  38| 
+  39|     /**
+  40|      * Authenticator collection
+  41|      *
+  42|      * @var \Authentication\Authenticator\AuthenticatorCollection|null
+  43|      */
+  44|     protected $_authenticators;
+  45| 
+  46|     /**
+  47|      * Identifier collection
+  48|      *
+  49|      * @var \Authentication\Identifier\IdentifierCollection|null
+  50|      */
+  51|     protected $_identifiers;
+  52| 
+  53|     /**
+  54|      * Authenticator that successfully authenticated the identity.
+  55|      *
+  56|      * @var \Authentication\Authenticator\AuthenticatorInterface|null
+  57|      */
+  58|     protected $_successfulAuthenticator;
+  59| 
+  60|     /**
+  61|      * Result of the last authenticate() call.
+  62|      *
+  63|      * @var \Authentication\Authenticator\ResultInterface|null
+  64|      */
+  65|     protected $_result;
+  66| 
+  67|     /**
+  68|      * Default configuration
+  69|      *
+  70|      * - `authenticators` - An array of authentication objects to use for authenticating users.
+  71|      *   You can configure multiple adapters and they will be checked sequentially
+  72|      *   when users are identified.
+  73|      * - `identifiers` - An array of identifiers. The identifiers are constructed by the service
+  74|      *   and then passed to the authenticators that will pass the credentials to them and get the
+  75|      *   user data.
+  76|      * - `identityClass` - The class name of identity or a callable identity builder.
+  77|      * - `identityAttribute` - The request attribute used to store the identity. Default to `identity`.
+  78|      * - `unauthenticatedRedirect` - The URL to redirect unauthenticated errors to. See
+  79|      *    AuthenticationComponent::allowUnauthenticated()
+  80|      * - `queryParam` - The name of the query string parameter containing the previously blocked URL
+  81|      *   in case of unauthenticated redirect, or null to disable appending the denied URL.
+  82|      *
+  83|      * ### Example:
+  84|      *
+  85|      * 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7910 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文逐函数）
+
+1. **构造器（约第 60-70 行）**：入口为 `keyDirectoryPath` 字符串，仅用于 `Paths.get` 与 `Files.createDirectories`，无命令执行、无反序列化 sink。随后 `loadExistingKeys()` 只扫描本地目录内 `.metadata` 文件。
+
+2. **generateKeyPair / generateKeyPair 重载（约第 74-125 行）**：source 为 `algorithm`、`keyId`、`parameterSpec`。`algorithm` 经 `determineProvider`/`getAlgorithmName` 的 `valueOf` 白名单校验（枚举不匹配则回退原值传给 JCA，JCA 自身会拒绝非法算法名）；`parameterSpec` 限定为 `AlgorithmParameterSpec` 或 `Integer` 类型分支，不存在注入路径。sink 是 `KeyPairGenerator.getInstance`，无漏洞。
+
+3. **storeKey（约第 155-195 行）**：sink 为 `Files.writeString` 到 `keyDirectory.resolve(keyId + ...)`。keyId 若含 `../` 可路径穿越写出目录——但该类是内部组件，keyId 由调用方（Camel 路由配置）提供而非外部 HTTP 参数；且写出的内容是本类自己生成的密钥 JSON，非攻击者可控内容。属低风险设计问题而非可利用漏洞。
+
+4. **getKey / getKeyMetadata（约第 197-240 行）**：读取固定后缀文件，JSON 分支用 Jackson 绑定到封闭的 `KeyFileData`/`MetadataFileData` record/POJO，未开启 default typing、无多态反序列化，无 gadget 风险。
+
+5. **migrateLegacyKey / migrateLegacyMetadata（约第 300-340 行）**：使用 `ObjectInputStream.readObject()`。这是文件中唯一的原生反序列化点，但：(a) 数据源是应用自身密钥目录下的 `.key`/`.metadata` 文件；(b) 该目录由组件在构造时创建并管理，本类没有任何把外部网络输入写入这些文件的通道；(c) 反序列化目标被强转为 `KeyPair`/`KeyMetadata`。要利用需攻击者已具备本地文件写权限——那已是更高级别的权限失陷，不构成本类的独立漏洞。
+
+6. **readStandardKeyPair（约第 265-295 行）**：Base64 解码后交给 `PKCS8EncodedKeySpec`/`X509EncodedKeySpec` + `KeyFactory.generatePrivate/Public`，解析失败抛异常，无代码执行面。
+
+7. **deleteKey / updateKeyMetadata / expireKey / revokeKey / rotateKey（约第 242-300 行）**：均为对本地文件的 CRUD，参数最终落到 `resolve(keyId + 后缀)`，同第 3 点分析，无新增 sink。
+
+8. **loadExistingKeys（约第 345-365 行）**：只遍历自身目录、调用 getKeyMetadata，异常被捕获记日志，无危险操作。
+
+9. **第二入口/替代通道核查**：全文件无 HTTP 端点、无环境变量读取、无回调注册、无 ClassLoader 加载；Jackson 未启用 `enableDefaultTyping`；`importKey` 委托 `KeyFormatConverter`（不在本文件）且输入是 byte[] 密钥数据，走标准 JCA 解析。
+
+10. **综合结论**：所有 source→sink 流要么有枚举白名单/JCA 内建校验，要么 sink 仅限受控本地目录的文件读写；唯一敏感 API（ObjectInputStream）作用于私有数据目录且无外部写入通道，防御有效。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认：算法名经枚举 valueOf 白名单校验；Jackson 反序列化绑定到封闭 POJO 且未启用多态类型；唯一的 ObjectInputStream 反序列化仅针对应用私有密钥目录内的遗留迁移文件，本类不存在将外部输入写入该目录的通道，攻击者需先拥有本地文件写权限才可能触达，故不构成可独立利用的安全漏洞。keyId 拼接路径存在理论上的目录穿越写读面，但 keyId 来自内部调用方配置而非外部请求参数，风险不成立。", "fix_suggestion": "no fix needed"}
+
+### id=7911 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **入口点枚举（全文通读）**：本文件是 CakePHP Authentication 插件的核心服务类，无直接路由，但作为中间件/组件被调用。外部输入可达点：
+   - `authenticate()`（第 168 行）：request 中的凭据交给各 authenticator；
+   - `getUnauthenticatedRedirectUrl()`（第 316 行起）：读取 request URI 的 path/query（第 325–327 行）拼入重定向 URL；
+   - `getLoginRedirect()`（第 346 行起）：**直接读取用户可控的 GET 查询参数** `$params[$redirectParam]`（第 352 行），这是最关键的外部 source；
+   - `persistIdentity/clearIdentity/buildIdentity`：identity 数据来自认证结果或调用方，非直接用户输入；`identityClass` 来自配置，不可被请求注入。
+
+2. **source→sink 数据流验证（getLoginRedirect，第 346–377 行）**：
+   - source：第 352 行 `$params[$redirectParam]`，即用户可完全控制的查询字符串值。
+   - 防御检查：
+     - 第 358 行 `parse_url` 失败返回 null —— 有效但仅防解析错误；
+     - 第 360–362 行拒绝含 `host` 或 `scheme` 的值 —— 意图是阻止绝对 URL 跳转，但该黑名单式校验可绕过；
+     - 第 364 行仅当 path 不以 `/` 开头时才补 `/`。
+
+3. **绕过路径确认**：
+   - 输入 `///evil.com`：PHP `parse_url` 对三斜杠开头不识别 host，返回 `['path' => '//evil.com']`，通过第 360 行检查；path 已以 `/` 开头，原样保留，最终返回 `//evil.com` —— 浏览器按协议相对 URL 解析，跳转到外部域 evil.com。
+   - 输入 `/\evil.com`：parse_url 返回 path 为 `\evil.com`，第 364–366 行补成 `/\evil.com`，浏览器将反斜杠等同正斜杠，等价于 `//evil.com`，同样构成开放重定向。
+   - 这是真实历史漏洞模式（CakePHP authentication 曾修复的 open redirect）。
+
+4. **第二入口/替代通道核查**：
+   - `getUnauthenticatedRedirectUrl()` 第 325–327 行虽把当前 URI 拼入 query，但经 `urlencode`（第 329 行）编码且目标 `unauthenticatedRedirect` 来自服务器配置而非用户输入，无注入风险。
+   - `buildIdentity()` 第 288–297 行的动态实例化依赖配置项 `identityClass`，正常部署下不可由 HTTP 请求控制，不算漏洞。
+   - impersonate 系列方法委托给 provider，本文件内无 sink。
+
+5. **结论**：存在开放重定向（CWE-601），风险中低——需应用层在登录后使用 `getLoginRedirect()` 返回值做 `redirect()` 才可利用，但库本身未对协议相对路径和反斜杠做防御。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-601 URL Redirection to Untrusted Site (Open Redirect)", "risk_level": "Medium", "source": "line 352: 用户可控的查询参数 $params[$redirectParam]", "sink": "line 377: return $parsed['path'] . $parsed['query'] 作为登录后重定向地址", "explanation": "攻击者传入 redirect=///evil.com 时 parse_url 不产生 host 键从而绕过 line 360-362 的黑名单校验; 传入 /\\evil.com 时 line 364-366 仅补一个斜杠, 浏览器把反斜杠当斜杠解析为协议相对URL, 最终返回值被用于 Location 跳转到任意外部域, 可用于钓鱼", "fix_suggestion": "line 360-366: 校验改为白名单方式, 例如要求 $parsed['path'] 必须匹配 /^\\/[^\\/]/ 且不含反斜杠 (preg_match('#^/[^/]#', $parsed['path']) 并 strpos($parsed['path'], '\\\\') === false), 否则返回 null"}

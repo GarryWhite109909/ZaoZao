@@ -1,0 +1,1277 @@
+batch=144 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7986 lang=go
+[CODE]
+   1| package executor
+   2| 
+   3| import (
+   4| 	config "github.com/OliveTin/OliveTin/internal/config"
+   5| 	"github.com/OliveTin/OliveTin/internal/entities"
+   6| 	"github.com/OliveTin/OliveTin/internal/tpl"
+   7| 	log "github.com/sirupsen/logrus"
+   8| 
+   9| 	"fmt"
+  10| 	"net/mail"
+  11| 	"net/url"
+  12| 	"regexp"
+  13| 	"strings"
+  14| 	"time"
+  15| )
+  16| 
+  17| var (
+  18| 	typecheckRegex = map[string]string{
+  19| 		"very_dangerous_raw_string": "",
+  20| 		"int":                       `^\d+$`,
+  21| 		"unicode_identifier":        `^[\w\-\.\_\d]+$`,
+  22| 		"ascii":                     `^[a-zA-Z0-9]+$`,
+  23| 		"ascii_identifier":          `^[a-zA-Z0-9\-\._]+$`,
+  24| 		"shell_safe_identifier":     `^[a-zA-Z0-9@\.\_\+\-]+$`,
+  25| 		"ascii_sentence":            `^[a-zA-Z0-9\-\._, ]+$`,
+  26| 	}
+  27| )
+  28| 
+  29| // parseExecArray parses all exec arguments in the action.
+  30| func parseExecArray(action *config.Action, values map[string]string, entity *entities.Entity) ([]string, error) {
+  31| 	parsed := make([]string, len(action.Exec))
+  32| 
+  33| 	for i, segment := range action.Exec {
+  34| 		out, err := parseExecSegment(segment, values, entity)
+  35| 		if err != nil {
+  36| 			return nil, err
+  37| 		}
+  38| 		parsed[i] = out
+  39| 	}
+  40| 	return parsed, nil
+  41| }
+  42| 
+  43| func parseActionExec(values map[string]string, action *config.Action, entity *entities.Entity) ([]string, error) {
+  44| 	if action == nil {
+  45| 		return nil, fmt.Errorf("action is nil")
+  46| 	}
+  47| 	if err := validateArguments(values, action); err != nil {
+  48| 		return nil, err
+  49| 	}
+  50| 
+  51| 	parsed, err := parseExecArray(action, values, entity)
+  52| 
+  53| 	if err != nil {
+  54| 		return nil, err
+  55| 	}
+  56| 
+  57| 	logParsedExec(action, parsed, values)
+  58| 	return parsed, nil
+  59| }
+  60| 
+  61| func parseExecSegment(arg string, values map[string]string, entity *entities.Entity) (string, error) {
+  62| 	return tpl.ParseTemplateWithActionContext(arg, entity, values)
+  63| }
+  64| 
+  65| func validateArguments(values map[string]string, action *config.Action) error {
+  66| 	for _, arg := range action.Arguments {
+  67| 		if err := typecheckActionArgument(&arg, values[arg.Name], action); err != nil {
+  68| 			return err
+  69| 		}
+  70| 		log.WithFields(log.Fields{"name": arg.Name, "value": values[arg.Name]}).Debugf("Arg assigned")
+  71| 	}
+  72| 	return nil
+  73| }
+  74| 
+  75| func logParsedExec(action *config.Action, parsed []string, values map[string]string) {
+  76| 	redacted := redactExecArgs(parsed, action.Arguments, values)
+  77| 	log.WithFields(log.Fields{"actionTitle": action.Title, "cmd": redacted}).Infof("Action parse args - After (Exec)")
+  78| }
+  79| 
+  80| func parseActionArguments(req *ExecutionRequest) (string, error) {
+  81| 	log.WithFields(log.Fields{
+  82| 		"actionTitle": req.Binding.Action.Title,
+  83| 		"cmd":         req.Binding.Action.Shell,
+  84| 	}).Infof("Action parse args - Before")
+  85| 
+  86| 	for _, arg := range req.Binding.Action.Arguments {
+  87| 		argName := arg.Name
+  88| 		argValue := req.Arguments[argName]
+  89| 
+  90| 		err := typecheckActionArgument(&arg, argValue, req.Binding.Action)
+  91| 
+  92| 		if err != nil {
+  93| 			return "", err
+  94| 		}
+  95| 
+  96| 		log.WithFields(log.Fields{
+  97| 			"name":  argName,
+  98| 			"value": argValue,
+  99| 		}).Debugf("Arg assigned")
+ 100| 	}
+ 101| 
+ 102| 	parsedShellCommand, err := tpl.ParseTemplateWithActionContext(req.Binding.Action.Shell, req.Binding.Entity, req.Arguments)
+ 103| 
+ 104| 	if err != nil {
+ 105| 		return "", err
+ 106| 	}
+ 107| 
+ 108| 	redactedShellCommand := redactShellCommand(parsedShellCommand, req.Binding.Action.Arguments, req.Arguments)
+ 109| 
+ 110| 	log.WithFields(log.Fields{
+ 111| 		"actionTitle": req.Binding.Action.Title,
+ 112| 		"cmd":         redactedShellCommand,
+ 113| 	}).Infof("Action parse args - After")
+ 114| 
+ 115| 	return parsedShellCommand, nil
+ 116| }
+ 117| 
+ 118| //gocyclo:ignore
+ 119| func redactShellCommand(shellCommand string, arguments []config.ActionArgument, argumentValues map[string]string) string {
+ 120| 	for _, arg := range arguments {
+ 121| 		if arg.Type == "password" {
+ 122| 			argValue, exists := argumentValues[arg.Name]
+ 123| 
+ 124| 			if !exists {
+ 125| 				log.Warnf("Redact shell command: Argument %s not found in values", arg.Name)
+ 126| 				continue
+ 127| 			}
+ 128| 
+ 129| 			if argValue == "" {
+ 130| 				continue
+ 131| 			}
+ 132| 
+ 133| 			shellCommand = strings.ReplaceAll(shellCommand, argValue, "<redacted>")
+ 134| 		}
+ 135| 	}
+ 136| 
+ 137| 	return shellCommand
+ 138| }
+ 139| 
+ 140| //gocyclo:ignore
+ 141| func redactExecArgs(execArgs []string, arguments []config.ActionArgument, argumentValues map[string]string) []string {
+ 142| 	redacted := make([]string, len(execArgs))
+ 143| 	for i, arg := range execArgs {
+ 144| 		redacted[i] = redactShellCommand(arg, arguments, argumentValues)
+ 145| 	}
+ 146| 	return redacted
+ 147| }
+ 148| 
+ 149| func argumentSkipsValidation(arg *config.ActionArgument) bool {
+ 150| 	switch arg.Type {
+ 151| 	case "confirmation", "html":
+ 152| 		return true
+ 153| 	default:
+ 154| 		return false
+ 155| 	}
+ 156| }
+ 157| 
+ 158| func typecheckActionArgument(arg *config.ActionArgument, value string, action *config.Action) error {
+ 159| 	if argumentSkipsValidation(arg) {
+ 160| 		return nil
+ 161| 	}
+ 162| 
+ 163| 	if arg.Name == "" {
+ 164| 		return fmt.Errorf("argument name cannot be empty")
+ 165| 	}
+ 166| 
+ 167| 	return typecheckActionArgumentFound(value, arg)
+ 168| }
+ 169| 
+ 170| // ValidateArgument validates a single argument value using the same logic as the executor.
+ 171| // It applies mangling transformations and performs full validation including null checks,
+ 172| // choice validation, and type safety checks.
+ 173| func ValidateArgument(arg *config.ActionArgument, value string, action *config.Action) error {
+ 174| 	if arg == nil {
+ 175| 		return fmt.Errorf("ValidateArgument: arg is nil")
+ 176| 	}
+ 177| 
+ 178| 	if action == nil {
+ 179| 		return fmt.Errorf("ValidateArgument: action is nil")
+ 180| 	}
+ 181| 
+ 182| 	// Apply mangling transformations
+ 183| 	mangledValue := MangleArgumentValue(arg, value, action.Title)
+ 184| 
+ 185| 	// Use the same validation path as the executor
+ 186| 	return typecheckActionArgument(arg, mangledValue, action)
+ 187| }
+ 188| 
+ 189| func typecheckActionArgumentFound(value string, arg *config.ActionArgument) error {
+ 190| 	if value == "" {
+ 191| 		return typecheckNull(arg)
+ 192| 	}
+ 193| 
+ 194| 	if arg.Type == "checklist" {
+ 195| 		return typecheckChecklist(value, arg)
+ 196| 	}
+ 197| 
+ 198| 	if len(arg.Choices) > 0 {
+ 199| 		return typecheckChoice(value, arg)
+ 200| 	}
+ 201| 
+ 202| 	return TypeSafetyCheck(arg.Name, value, arg.Type)
+ 203| }
+ 204| 
+ 205| // TypeSafetyCheck checks argument values match a specific type. The types are
+ 206| // defined in typecheckRegex, and, you guessed it, uses regex to check for allowed
+ 207| // characters.
+ 208| //
+ 209| //gocyclo:ignore
+ 210| func TypeSafetyCheck(name string, value string, argumentType string) error {
+ 211| 	switch argumentType {
+ 212| 	case "password":
+ 213| 		return nil
+ 214| 	case "raw_string_multiline":
+ 215| 		return nil
+ 216| 	case "checkbox":
+ 217| 		return nil
+ 218| 	case "checklist":
+ 219| 		return nil
+ 220| 	case "email":
+ 221| 		return typeSafetyCheckEmail(value)
+ 222| 	case "url":
+ 223| 		return typeSafetyCheckUrl(value)
+ 224| 	case "datetime":
+ 225| 		return typeSafetyCheckDatetime(value)
+ 226| 	}
+ 227| 
+ 228| 	return typeSafetyCheckRegex(name, value, argumentType)
+ 229| }
+ 230| 
+ 231| func typecheckNull(arg *config.ActionArgument) error {
+ 232| 	if arg.RejectNull {
+ 233| 		return fmt.Errorf("null values are not allowed")
+ 234| 	}
+ 235| 
+ 236| 	return nil
+ 237| }
+ 238| 
+ 239| func typecheckChecklist(value string, arg *config.ActionArgument) error {
+ 240| 	if len(arg.Choices) == 0 {
+ 241| 		return fmt.Errorf("checklist argument %q requires choices", arg.Name)
+ 242| 	}
+ 243| 
+ 244| 	segments, err := config.ParseChecklistValue(value)
+ 245| 	if err != nil {
+ 246| 		return err
+ 247| 	}
+ 248| 
+ 249| 	return typecheckChecklistSegments(segments, arg)
+ 250| }
+ 251| 
+ 252| func typecheckChecklistSegments(segments []string, arg *config.ActionArgument) error {
+ 253| 	for _, segment := range segments {
+ 254| 		if err := typecheckChecklistSegment(segment, arg); err != nil {
+ 255| 			return err
+ 256| 		}
+ 257| 	}
+ 258| 
+ 259| 	return nil
+ 260| }
+ 261| 
+ 262| func typecheckChecklistSegment(segment string, arg *config.ActionArgument) error {
+ 263| 	if segment == "" {
+ 264| 		return fmt.Errorf("checklist argument %q contains an empty segment", arg.Name)
+ 265| 	}
+ 266| 
+ 267| 	return typecheckChoice(segment, arg)
+ 268| }
+ 269| 
+ 270| func typecheckChoice(value string, arg *config.ActionArgument) error {
+ 271| 	if arg.Entity != "" {
+ 272| 		return typecheckChoiceEntity(value, arg)
+ 273| 	}
+ 274| 
+ 275| 	for _, choice := range arg.Choices {
+ 276| 		if value == choice.Value {
+ 277| 			return nil
+ 278| 		}
+ 279| 	}
+ 280| 
+ 281| 	return fmt.Errorf("argument value is not one of the predefined choices")
+ 282| }
+ 283| 
+ 284| func typecheckChoiceEntity(value string, arg *config.ActionArgument) error {
+ 285| 	templateChoice := arg.Choices[0].Value
+ 286| 
+ 287| 	for _, ent := range entities.GetEntityInstances(arg.Entity) {
+ 288| 		choice := tpl.ParseTemplateOfActionBeforeExec(templateChoice, ent)
+ 289| 
+ 290| 		if value == choice {
+ 291| 			return nil
+ 292| 		}
+ 293| 	}
+ 294| 
+ 295| 	return fmt.Errorf("argument value cannot be found in entities")
+ 296| }
+ 297| 
+ 298| func typeSafetyCheckEmail(value string) error {
+ 299| 	_, err := mail.ParseAddress(value)
+ 300| 	if err != nil {
+ 301| 		log.WithField("type", "email").Debugf("Email argument type check failed")
+ 302| 		return err
+ 303| 	}
+ 304| 	return nil
+ 305| }
+ 306| 
+ 307| func typeSafetyCheckDatetime(value string) error {
+ 308| 	_, err := time.Parse("2006-01-02T15:04:05", value)
+ 309| 
+ 310| 	if err != nil {
+ 311| 		return err
+ 312| 	}
+ 313| 
+ 314| 	return nil
+ 315| }
+ 316| 
+ 317| func typeSafetyCheckRegex(name string, value string, argumentType string) error {
+ 318| 	pattern := ""
+ 319| 
+ 320| 	if strings.HasPrefix(argumentType, "regex:") {
+ 321| 		pattern = strings.Replace(argumentType, "regex:", "", 1)
+ 322| 	} else {
+ 323| 		found := false
+ 324| 		pattern, found = typecheckRegex[argumentType]
+ 325| 
+ 326| 		if !found {
+ 327| 			return fmt.Errorf("argument type not implemented %v for arg: %v", argumentType, name)
+ 328| 		}
+ 329| 	}
+ 330| 
+ 331| 	matches, _ := regexp.MatchString(pattern, value)
+ 332| 
+ 333| 	if !matches {
+ 334| 		log.WithFields(log.Fields{
+ 335| 			"name":    name,
+ 336| 			"value":   value,
+ 337| 			"type":    argumentType,
+ 338| 			"pattern": pattern,
+ 339| 		}).Warn("Arg type check safety failure")
+ 340| 
+ 341| 		return fmt.Errorf("invalid argument %v, doesn't match %v", name, argumentType)
+ 342| 	}
+ 343| 
+ 344| 	return nil
+ 345| }
+ 346| 
+ 347| func typeSafetyCheckUrl(value string) error {
+ 348| 	_, err := url.ParseRequestURI(value)
+ 349| 
+ 350| 	return err
+ 351| }
+ 352| 
+ 353| func checkShellArgumentSafety(action *config.Action) error {
+ 354| 	if action.Shell == "" {
+ 355| 		return nil
+ 356| 	}
+ 357| 	unsafe := map[string]struct{}{"url": {}, "email": {}, "raw_string_multiline": {}, "very_dangerous_raw_string": {}, "password": {}}
+ 358| 	for _, arg := range action.Arguments {
+ 359| 		if _, bad := unsafe[arg.Type]; bad {
+ 360| 			return fmt.Errorf("unsafe argument type '%s' cannot be used with Shell execution. Use 'exec' instead. See https://docs.olivetin.app/action_execution/shellvsexec.html", arg.Type)
+ 361| 		}
+ 362| 	}
+ 363| 	return nil
+ 364| }
+ 365| 
+ 366| func mangleInvalidArgumentValues(req *ExecutionRequest) {
+ 367| 	for _, arg := range req.Binding.Action.Arguments {
+ 368| 		if arg.Type == "datetime" {
+ 369| 			mangleInvalidDatetimeValues(req, &arg)
+ 370| 		}
+ 371| 
+ 372| 		mangleCheckboxValues(req, &arg)
+ 373| 		mangleChecklistValues(req, &arg)
+ 374| 	}
+ 375| }
+ 376| 
+ 377| func mangleCheckboxValues(req *ExecutionRequest, arg *config.ActionArgument) {
+ 378| 	if arg.Type != "checkbox" {
+ 379| 		return
+ 380| 	}
+ 381| 
+ 382| 	log.Infof("Checking checkbox values for argument %s in action %s", arg.Name, req.Binding.Action.Title)
+ 383| 
+ 384| 	for i, v := range arg.Choices {
+ 385| 		choice := &arg.Choices[i]
+ 386| 
+ 387| 		if req.Arguments[arg.Name] == choice.Title {
+ 388| 			log.WithFields(log.Fields{
+ 389| 				"arg":         arg.Name,
+ 390| 				"choice":      v,
+ 391| 				"oldValue":    req.Arguments[arg.Name],
+ 392| 				"newValue":    choice.Value,
+ 393| 				"actionTitle": req.Binding.Action.Title,
+ 394| 			}).Infof("Mangled checkbox value")
+ 395| 
+ 396| 			req.Arguments[arg.Name] = choice.Value
+ 397| 		}
+ 398| 	}
+ 399| }
+ 400| 
+ 401| func mangleInvalidDatetimeValues(req *ExecutionRequest, arg *config.ActionArgument) {
+ 402| 	value, exists := req.Arguments[arg.Name]
+ 403| 
+ 404| 	if !exists || value == "" {
+ 405| 		return
+ 406| 	}
+ 407| 
+ 408| 	timestamp, err := time.Parse("2006-01-02T15:04", value)
+ 409| 
+ 410| 	if err == nil {
+ 411| 		log.WithFields(log.Fields{
+ 412| 			"arg":         arg.Name,
+ 413| 			"value":       value,
+ 414| 			"actionTitle": req.Binding.Action.Title,
+ 415| 		}).Warnf("Mangled invalid datetime value without seconds to :00 seconds, this issue is commonly caused by Android browsers.")
+ 416| 
+ 417| 		req.Arguments[arg.Name] = timestamp.Format("2006-01-02T15:04:05")
+ 418| 	}
+ 419| }
+ 420| 
+ 421| // MangleArgumentValue applies mangling transformations to a single argument value.
+ 422| // This is used by the validation API to ensure the value matches what would be
+ 423| // used during actual execution.
+ 424| func MangleArgumentValue(arg *config.ActionArgument, value string, actionTitle string) string {
+ 425| 	if arg == nil {
+ 426| 		log.Debugf("MangleArgumentValue called with nil arg, returning value unchanged")
+ 427| 		return value
+ 428| 	}
+ 429| 
+ 430| 	return mangleArgumentValueByType(arg, value, actionTitle)
+ 431| }
+ 432| 
+ 433| func mangleArgumentValueByType(arg *config.ActionArgument, value string, actionTitle string) string {
+ 434| 	switch arg.Type {
+ 435| 	case "datetime":
+ 436| 		return mangleDatetimeValue(arg, value, actionTitle)
+ 437| 	case "checkbox":
+ 438| 		return mangleCheckboxValue(arg, value, actionTitle)
+ 439| 	case "checklist":
+ 440| 		return mangleChecklistValue(arg, value, actionTitle)
+ 441| 	default:
+ 442| 		return value
+ 443| 	}
+ 444| }
+ 445| 
+ 446| func mangleDatetimeValue(arg *config.ActionArgument, value string, actionTitle string) string {
+ 447| 	if arg == nil {
+ 448| 		log.Debugf("mangleDatetimeValue called with nil arg, returning value unchanged")
+ 449| 		return value
+ 450| 	}
+ 451| 
+ 452| 	if value == "" {
+ 453| 		return value
+ 454| 	}
+ 455| 
+ 456| 	timestamp, err := time.Parse("2006-01-02T15:04", value)
+ 457| 	if err != nil {
+ 458| 		return value
+ 459| 	}
+ 460| 
+ 461| 	log.WithFields(log.Fields{
+ 462| 		"arg":         arg.Name,
+ 463| 		"value":       value,
+ 464| 		"actionTitle": actionTitle,
+ 465| 	}).Warnf("Mangled invalid datetime value without seconds to :00 seconds, this issue is commonly caused by Android browsers.")
+ 466| 
+ 467| 	return timestamp.Format("2006-01-02T15:04:05")
+ 468| }
+ 469| 
+ 470| func mangleCheckboxValue(arg *config.ActionArgument, value string, actionTitle string) string {
+ 471| 	if arg == nil {
+ 472| 		log.Debugf("mangleCheckboxValue called with nil arg, returning value unchanged")
+ 473| 		return value
+ 474| 	}
+ 475| 
+ 476| 	return mangleChoiceSegment(arg, value, actionTitle)
+ 477| }
+ 478| 
+ 479| func mangleChecklistValues(req *ExecutionRequest, arg *config.ActionArgument) {
+ 480| 	if arg.Type != "checklist" {
+ 481| 		return
+ 482| 	}
+ 483| 
+ 484| 	value, exists := req.Arguments[arg.Name]
+ 485| 	if !exists || value == "" {
+ 486| 		return
+ 487| 	}
+ 488| 
+ 489| 	req.Arguments[arg.Name] = mangleChecklistValue(arg, value, req.Binding.Action.Title)
+ 490| }
+ 491| 
+ 492| func mangleChecklistValue(arg *config.ActionArgument, value string, actionTitle string) string {
+ 493| 	if arg == nil || value == "" {
+ 494| 		return value
+ 495| 	}
+ 496| 
+ 497| 	segments, err := config.ParseChecklistValue(value)
+ 498| 	if err != nil {
+ 499| 		return value
+ 500| 	}
+ 501| 
+ 502| 	return mangleChecklistSegments(arg, segments, value, actionTitle)
+ 503| }
+ 504| 
+ 505| func mangleChecklistSegments(arg *config.ActionArgument, segments []string, fallback string, actionTitle string) string {
+ 506| 	mangled := make([]string, len(segments))
+ 507| 	for i, segment := range segments {
+ 508| 		mangled[i] = mangleChecklistSegment(arg, segment, actionTitle)
+ 509| 	}
+ 510| 
+ 511| 	formatted, err := config.FormatChecklistValue(mangled)
+ 512| 	if err != nil {
+ 513| 		return fallback
+ 514| 	}
+ 515| 
+ 516| 	return formatted
+ 517| }
+ 518| 
+ 519| func mangleChecklistSegment(arg *config.ActionArgument, segment string, actionTitle string) string {
+ 520| 	trimmed := strings.TrimSpace(segment)
+ 521| 	if trimmed == "" {
+ 522| 		return ""
+ 523| 	}
+ 524| 
+ 525| 	return mangleChoiceSegment(arg, trimmed, actionTitle)
+ 526| }
+ 527| 
+ 528| func mangleChoiceSegment(arg *config.ActionArgument, value string, actionTitle string) string {
+ 529| 	if mapped, ok := mangleChoiceSegmentEntity(arg, value, actionTitle); ok {
+ 530| 		return mapped
+ 531| 	}
+ 532| 
+ 533| 	return mangleChoiceSegmentStatic(arg, value, actionTitle)
+ 534| }
+ 535| 
+ 536| func mangleChoiceSegmentEntity(arg *config.ActionArgument, value string, actionTitle string) (string, bool) {
+ 537| 	if arg.Entity == "" || len(arg.Choices) == 0 {
+ 538| 		return value, false
+ 539| 	}
+ 540| 
+ 541| 	return mangleEntityTemplateChoiceSegment(arg.Choices[0], arg.Entity, arg.Name, value, actionTitle)
+ 542| }
+ 543| 
+ 544| func mangleEntityTemplateChoiceSegment(templateChoice config.ActionArgumentChoice, entityName string, argName string, value string, actionTitle string) (string, bool) {
+ 545| 	for _, ent := range entities.GetEntityInstancesOrdered(entityName) {
+ 546| 		expandedTitle := tpl.ParseTemplateOfActionBeforeExec(templateChoice.Title, ent)
+ 547| 		if value != expandedTitle {
+ 548| 			continue
+ 549| 		}
+ 550| 
+ 551| 		expandedValue := tpl.ParseTemplateOfActionBeforeExec(templateChoice.Value, ent)
+ 552| 		log.WithFields(log.Fields{
+ 553| 			"arg":         argName,
+ 554| 			"oldValue":    value,
+ 555| 			"newValue":    expandedValue,
+ 556| 			"actionTitle": actionTitle,
+ 557| 		}).Infof("Mangled entity choice segment")
+ 558| 
+ 559| 		return expandedValue, true
+ 560| 	}
+ 561| 
+ 562| 	return value, false
+ 563| }
+ 564| 
+ 565| func mangleChoiceSegmentStatic(arg *config.ActionArgument, value string, actionTitle string) string {
+ 566| 	for _, choice := range arg.Choices {
+ 567| 		if value == choice.Title {
+ 568| 			log.WithFields(log.Fields{
+ 569| 				"arg":         arg.Name,
+ 570| 				"oldValue":    value,
+ 571| 				"newValue":    choice.Value,
+ 572| 				"actionTitle": actionTitle,
+ 573| 			}).Infof("Mangled choice segment")
+ 574| 
+ 575| 			return choice.Value
+ 576| 		}
+ 577| 	}
+ 578| 
+ 579| 	return value
+ 580| }
+ 581| 
+ 582| 
+
+### id=7987 lang=go
+[CODE]
+   1| package executor
+   2| 
+   3| import (
+   4| 	config "github.com/OliveTin/OliveTin/internal/config"
+   5| 	"github.com/OliveTin/OliveTin/internal/entities"
+   6| 	"github.com/OliveTin/OliveTin/internal/tpl"
+   7| 	log "github.com/sirupsen/logrus"
+   8| 
+   9| 	"fmt"
+  10| 	"net/mail"
+  11| 	"net/url"
+  12| 	"regexp"
+  13| 	"strings"
+  14| 	"time"
+  15| )
+  16| 
+  17| var (
+  18| 	typecheckRegex = map[string]string{
+  19| 		"very_dangerous_raw_string": "",
+  20| 		"int":                       `^\d+$`,
+  21| 		"unicode_identifier":        `^[\w\-\.\_\d]+$`,
+  22| 		"ascii":                     `^[a-zA-Z0-9]+$`,
+  23| 		"ascii_identifier":          `^[a-zA-Z0-9\-\._]+$`,
+  24| 		"shell_safe_identifier":     `^[a-zA-Z0-9@\.\_\+\-]+$`,
+  25| 		"ascii_sentence":            `^[a-zA-Z0-9\-\._, ]+$`,
+  26| 	}
+  27| )
+  28| 
+  29| // parseExecArray parses all exec arguments in the action.
+  30| func parseExecArray(action *config.Action, values map[string]string, entity *entities.Entity) ([]string, error) {
+  31| 	parsed := make([]string, len(action.Exec))
+  32| 
+  33| 	for i, segment := range action.Exec {
+  34| 		out, err := parseExecSegment(segment, values, entity)
+  35| 		if err != nil {
+  36| 			return nil, err
+  37| 		}
+  38| 		parsed[i] = out
+  39| 	}
+  40| 	return parsed, nil
+  41| }
+  42| 
+  43| func parseActionExec(values map[string]string, action *config.Action, entity *entities.Entity) ([]string, error) {
+  44| 	if action == nil {
+  45| 		return nil, fmt.Errorf("action is nil")
+  46| 	}
+  47| 	if err := validateArguments(values, action); err != nil {
+  48| 		return nil, err
+  49| 	}
+  50| 
+  51| 	parsed, err := parseExecArray(action, values, entity)
+  52| 
+  53| 	if err != nil {
+  54| 		return nil, err
+  55| 	}
+  56| 
+  57| 	logParsedExec(action, parsed, values)
+  58| 	return parsed, nil
+  59| }
+  60| 
+  61| func parseExecSegment(arg string, values map[string]string, entity *entities.Entity) (string, error) {
+  62| 	return tpl.ParseTemplateWithActionContext(arg, entity, values)
+  63| }
+  64| 
+  65| func validateArguments(values map[string]string, action *config.Action) error {
+  66| 	for _, arg := range action.Arguments {
+  67| 		if err := typecheckActionArgument(&arg, values[arg.Name], action); err != nil {
+  68| 			return err
+  69| 		}
+  70| 		log.WithFields(log.Fields{"name": arg.Name, "value": values[arg.Name]}).Debugf("Arg assigned")
+  71| 	}
+  72| 	return nil
+  73| }
+  74| 
+  75| func logParsedExec(action *config.Action, parsed []string, values map[string]string) {
+  76| 	redacted := redactExecArgs(parsed, action.Arguments, values)
+  77| 	log.WithFields(log.Fields{"actionTitle": action.Title, "cmd": redacted}).Infof("Action parse args - After (Exec)")
+  78| }
+  79| 
+  80| func parseActionArguments(req *ExecutionRequest) (string, error) {
+  81| 	log.WithFields(log.Fields{
+  82| 		"actionTitle": req.Binding.Action.Title,
+  83| 		"cmd":         req.Binding.Action.Shell,
+  84| 	}).Infof("Action parse args - Before")
+  85| 
+  86| 	for _, arg := range req.Binding.Action.Arguments {
+  87| 		argName := arg.Name
+  88| 		argValue := req.Arguments[argName]
+  89| 
+  90| 		err := typecheckActionArgument(&arg, argValue, req.Binding.Action)
+  91| 
+  92| 		if err != nil {
+  93| 			return "", err
+  94| 		}
+  95| 
+  96| 		log.WithFields(log.Fields{
+  97| 			"name":  argName,
+  98| 			"value": argValue,
+  99| 		}).Debugf("Arg assigned")
+ 100| 	}
+ 101| 
+ 102| 	parsedShellCommand, err := tpl.ParseTemplateWithActionContext(req.Binding.Action.Shell, req.Binding.Entity, req.Arguments)
+ 103| 
+ 104| 	if err != nil {
+ 105| 		return "", err
+ 106| 	}
+ 107| 
+ 108| 	redactedShellCommand := redactShellCommand(parsedShellCommand, req.Binding.Action.Arguments, req.Arguments)
+ 109| 
+ 110| 	log.WithFields(log.Fields{
+ 111| 		"actionTitle": req.Binding.Action.Title,
+ 112| 		"cmd":         redactedShellCommand,
+ 113| 	}).Infof("Action parse args - After")
+ 114| 
+ 115| 	return parsedShellCommand, nil
+ 116| }
+ 117| 
+ 118| //gocyclo:ignore
+ 119| func redactShellCommand(shellCommand string, arguments []config.ActionArgument, argumentValues map[string]string) string {
+ 120| 	for _, arg := range arguments {
+ 121| 		if arg.Type == "password" {
+ 122| 			argValue, exists := argumentValues[arg.Name]
+ 123| 
+ 124| 			if !exists {
+ 125| 				log.Warnf("Redact shell command: Argument %s not found in values", arg.Name)
+ 126| 				continue
+ 127| 			}
+ 128| 
+ 129| 			if argValue == "" {
+ 130| 				continue
+ 131| 			}
+ 132| 
+ 133| 			shellCommand = strings.ReplaceAll(shellCommand, argValue, "<redacted>")
+ 134| 		}
+ 135| 	}
+ 136| 
+ 137| 	return shellCommand
+ 138| }
+ 139| 
+ 140| //gocyclo:ignore
+ 141| func redactExecArgs(execArgs []string, arguments []config.ActionArgument, argumentValues map[string]string) []string {
+ 142| 	redacted := make([]string, len(execArgs))
+ 143| 	for i, arg := range execArgs {
+ 144| 		redacted[i] = redactShellCommand(arg, arguments, argumentValues)
+ 145| 	}
+ 146| 	return redacted
+ 147| }
+ 148| 
+ 149| func argumentSkipsValidation(arg *config.ActionArgument) bool {
+ 150| 	switch arg.Type {
+ 151| 	case "confirmation", "html":
+ 152| 		return true
+ 153| 	default:
+ 154| 		return false
+ 155| 	}
+ 156| }
+ 157| 
+ 158| func typecheckActionArgument(arg *config.ActionArgument, value string, action *config.Action) error {
+ 159| 	if argumentSkipsValidation(arg) {
+ 160| 		return nil
+ 161| 	}
+ 162| 
+ 163| 	if arg.Name == "" {
+ 164| 		return fmt.Errorf("argument name cannot be empty")
+ 165| 	}
+ 166| 
+ 167| 	return typecheckActionArgumentFound(value, arg)
+ 168| }
+ 169| 
+ 170| // ValidateArgument validates a single argument value using the same logic as the executor.
+ 171| // It applies mangling transformations and performs full validation including null checks,
+ 172| // choice validation, and type safety checks.
+ 173| func ValidateArgument(arg *config.ActionArgument, value string, action *config.Action) error {
+ 174| 	if arg == nil {
+ 175| 		return fmt.Errorf("ValidateArgument: arg is nil")
+ 176| 	}
+ 177| 
+ 178| 	if action == nil {
+ 179| 		return fmt.Errorf("ValidateArgument: action is nil")
+ 180| 	}
+ 181| 
+ 182| 	// Apply mangling transformations
+ 183| 	mangledValue := MangleArgumentValue(arg, value, action.Title)
+ 184| 
+ 185| 	// Use the same validation path as the executor
+ 186| 	return typecheckActionArgument(arg, mangledValue, action)
+ 187| }
+ 188| 
+ 189| func typecheckActionArgumentFound(value string, arg *config.ActionArgument) error {
+ 190| 	if value == "" {
+ 191| 		return typecheckNull(arg)
+ 192| 	}
+ 193| 
+ 194| 	if arg.Type == "checklist" {
+ 195| 		return typecheckChecklist(value, arg)
+ 196| 	}
+ 197| 
+ 198| 	if len(arg.Choices) > 0 {
+ 199| 		return typecheckChoice(value, arg)
+ 200| 	}
+ 201| 
+ 202| 	return TypeSafetyCheck(arg.Name, value, arg.Type)
+ 203| }
+ 204| 
+ 205| // TypeSafetyCheck checks argument values match a specific type. The types are
+ 206| // defined in typecheckRegex, and, you guessed it, uses regex to check for allowed
+ 207| // characters.
+ 208| //
+ 209| //gocyclo:ignore
+ 210| func TypeSafetyCheck(name string, value string, argumentType string) error {
+ 211| 	switch argumentType {
+ 212| 	case "password":
+ 213| 		return nil
+ 214| 	case "raw_string_multiline":
+ 215| 		return nil
+ 216| 	case "checkbox":
+ 217| 		return nil
+ 218| 	case "checklist":
+ 219| 		return nil
+ 220| 	case "email":
+ 221| 		return typeSafetyCheckEmail(value)
+ 222| 	case "url":
+ 223| 		return typeSafetyCheckUrl(value)
+ 224| 	case "datetime":
+ 225| 		return typeSafetyCheckDatetime(value)
+ 226| 	}
+ 227| 
+ 228| 	return typeSafetyCheckRegex(name, value, argumentType)
+ 229| }
+ 230| 
+ 231| func typecheckNull(arg *config.ActionArgument) error {
+ 232| 	if arg.RejectNull {
+ 233| 		return fmt.Errorf("null values are not allowed")
+ 234| 	}
+ 235| 
+ 236| 	return nil
+ 237| }
+ 238| 
+ 239| func typecheckChecklist(value string, arg *config.ActionArgument) error {
+ 240| 	if len(arg.Choices) == 0 {
+ 241| 		return fmt.Errorf("checklist argument %q requires choices", arg.Name)
+ 242| 	}
+ 243| 
+ 244| 	segments, err := config.ParseChecklistValue(value)
+ 245| 	if err != nil {
+ 246| 		return err
+ 247| 	}
+ 248| 
+ 249| 	return typecheckChecklistSegments(segments, arg)
+ 250| }
+ 251| 
+ 252| func typecheckChecklistSegments(segments []string, arg *config.ActionArgument) error {
+ 253| 	for _, segment := range segments {
+ 254| 		if err := typecheckChecklistSegment(segment, arg); err != nil {
+ 255| 			return err
+ 256| 		}
+ 257| 	}
+ 258| 
+ 259| 	return nil
+ 260| }
+ 261| 
+ 262| func typecheckChecklistSegment(segment string, arg *config.ActionArgument) error {
+ 263| 	if segment == "" {
+ 264| 		return fmt.Errorf("checklist argument %q contains an empty segment", arg.Name)
+ 265| 	}
+ 266| 
+ 267| 	return typecheckChoice(segment, arg)
+ 268| }
+ 269| 
+ 270| func typecheckChoice(value string, arg *config.ActionArgument) error {
+ 271| 	if arg.Entity != "" {
+ 272| 		return typecheckChoiceEntity(value, arg)
+ 273| 	}
+ 274| 
+ 275| 	for _, choice := range arg.Choices {
+ 276| 		if value == choice.Value {
+ 277| 			return nil
+ 278| 		}
+ 279| 	}
+ 280| 
+ 281| 	return fmt.Errorf("argument value is not one of the predefined choices")
+ 282| }
+ 283| 
+ 284| func typecheckChoiceEntity(value string, arg *config.ActionArgument) error {
+ 285| 	templateChoice := arg.Choices[0].Value
+ 286| 
+ 287| 	for _, ent := range entities.GetEntityInstances(arg.Entity) {
+ 288| 		choice := tpl.ParseTemplateOfActionBeforeExec(templateChoice, ent)
+ 289| 
+ 290| 		if value == choice {
+ 291| 			return nil
+ 292| 		}
+ 293| 	}
+ 294| 
+ 295| 	return fmt.Errorf("argument value cannot be found in entities")
+ 296| }
+ 297| 
+ 298| func typeSafetyCheckEmail(value string) error {
+ 299| 	_, err := mail.ParseAddress(value)
+ 300| 	if err != nil {
+ 301| 		log.WithField("type", "email").Debugf("Email argument type check failed")
+ 302| 		return err
+ 303| 	}
+ 304| 	return nil
+ 305| }
+ 306| 
+ 307| func typeSafetyCheckDatetime(value string) error {
+ 308| 	_, err := time.Parse("2006-01-02T15:04:05", value)
+ 309| 
+ 310| 	if err != nil {
+ 311| 		return err
+ 312| 	}
+ 313| 
+ 314| 	return nil
+ 315| }
+ 316| 
+ 317| func anchorCustomRegexPattern(pattern string) string {
+ 318| 	if strings.HasPrefix(pattern, "^") && strings.HasSuffix(pattern, "$") {
+ 319| 		return pattern
+ 320| 	}
+ 321| 
+ 322| 	return "^(?:" + pattern + ")$"
+ 323| }
+ 324| 
+ 325| func typeSafetyCheckRegex(name string, value string, argumentType string) error {
+ 326| 	pattern := ""
+ 327| 	isCustomRegex := strings.HasPrefix(argumentType, "regex:")
+ 328| 
+ 329| 	if isCustomRegex {
+ 330| 		pattern = strings.TrimPrefix(argumentType, "regex:")
+ 331| 		pattern = anchorCustomRegexPattern(pattern)
+ 332| 	} else {
+ 333| 		found := false
+ 334| 		pattern, found = typecheckRegex[argumentType]
+ 335| 
+ 336| 		if !found {
+ 337| 			return fmt.Errorf("argument type not implemented %v for arg: %v", argumentType, name)
+ 338| 		}
+ 339| 	}
+ 340| 
+ 341| 	matches, _ := regexp.MatchString(pattern, value)
+ 342| 
+ 343| 	if !matches {
+ 344| 		log.WithFields(log.Fields{
+ 345| 			"name":    name,
+ 346| 			"value":   value,
+ 347| 			"type":    argumentType,
+ 348| 			"pattern": pattern,
+ 349| 		}).Warn("Arg type check safety failure")
+ 350| 
+ 351| 		return fmt.Errorf("invalid argument %v, doesn't match %v", name, argumentType)
+ 352| 	}
+ 353| 
+ 354| 	return nil
+ 355| }
+ 356| 
+ 357| func typeSafetyCheckUrl(value string) error {
+ 358| 	parsed, err := url.ParseRequestURI(value)
+ 359| 	if err != nil {
+ 360| 		return err
+ 361| 	}
+ 362| 
+ 363| 	scheme := strings.ToLower(parsed.Scheme)
+ 364| 	if scheme != "http" && scheme != "https" {
+ 365| 		return fmt.Errorf("url scheme %q is not allowed; only http and https are permitted", parsed.Scheme)
+ 366| 	}
+ 367| 
+ 368| 	return nil
+ 369| }
+ 370| 
+ 371| var shellUnsafeArgumentTypes = map[string]struct{}{
+ 372| 	"url":                       {},
+ 373| 	"email":                     {},
+ 374| 	"raw_string_multiline":      {},
+ 375| 	"very_dangerous_raw_string": {},
+ 376| 	"password":                  {},
+ 377| 	"html":                      {},
+ 378| 	"confirmation":              {},
+ 379| }
+ 380| 
+ 381| func isUnsafeShellArgumentType(arg *config.ActionArgument) bool {
+ 382| 	if strings.HasPrefix(arg.Type, "regex:") {
+ 383| 		return true
+ 384| 	}
+ 385| 
+ 386| 	_, inMap := shellUnsafeArgumentTypes[arg.Type]
+ 387| 	return inMap || (arg.Type == "checkbox" && len(arg.Choices) == 0)
+ 388| }
+ 389| 
+ 390| func checkShellArgumentSafety(action *config.Action) error {
+ 391| 	if action.Shell == "" {
+ 392| 		return nil
+ 393| 	}
+ 394| 
+ 395| 	for i := range action.Arguments {
+ 396| 		arg := &action.Arguments[i]
+ 397| 		if isUnsafeShellArgumentType(arg) {
+ 398| 			return fmt.Errorf("unsafe argument type '%s' cannot be used with Shell execution. Use 'exec' instead. See https://docs.olivetin.app/action_execution/shellvsexec.html", arg.Type)
+ 399| 		}
+ 400| 	}
+ 401| 
+ 402| 	return nil
+ 403| }
+ 404| 
+ 405| func mangleInvalidArgumentValues(req *ExecutionRequest) {
+ 406| 	for _, arg := range req.Binding.Action.Arguments {
+ 407| 		if arg.Type == "datetime" {
+ 408| 			mangleInvalidDatetimeValues(req, &arg)
+ 409| 		}
+ 410| 
+ 411| 		mangleCheckboxValues(req, &arg)
+ 412| 		mangleChecklistValues(req, &arg)
+ 413| 	}
+ 414| }
+ 415| 
+ 416| func mangleCheckboxValues(req *ExecutionRequest, arg *config.ActionArgument) {
+ 417| 	if arg.Type != "checkbox" {
+ 418| 		return
+ 419| 	}
+ 420| 
+ 421| 	log.Infof("Checking checkbox values for argument %s in action %s", arg.Name, req.Binding.Action.Title)
+ 422| 
+ 423| 	for i, v := range arg.Choices {
+ 424| 		choice := &arg.Choices[i]
+ 425| 
+ 426| 		if req.Arguments[arg.Name] == choice.Title {
+ 427| 			log.WithFields(log.Fields{
+ 428| 				"arg":         arg.Name,
+ 429| 				"choice":      v,
+ 430| 				"oldValue":    req.Arguments[arg.Name],
+ 431| 				"newValue":    choice.Value,
+ 432| 				"actionTitle": req.Binding.Action.Title,
+ 433| 			}).Infof("Mangled checkbox value")
+ 434| 
+ 435| 			req.Arguments[arg.Name] = choice.Value
+ 436| 		}
+ 437| 	}
+ 438| }
+ 439| 
+ 440| func mangleInvalidDatetimeValues(req *ExecutionRequest, arg *config.ActionArgument) {
+ 441| 	value, exists := req.Arguments[arg.Name]
+ 442| 
+ 443| 	if !exists || value == "" {
+ 444| 		return
+ 445| 	}
+ 446| 
+ 447| 	timestamp, err := time.Parse("2006-01-02T15:04", value)
+ 448| 
+ 449| 	if err == nil {
+ 450| 		log.WithFields(log.Fields{
+ 451| 			"arg":         arg.Name,
+ 452| 			"value":       value,
+ 453| 			"actionTitle": req.Binding.Action.Title,
+ 454| 		}).Warnf("Mangled invalid datetime value without seconds to :00 seconds, this issue is commonly caused by Android browsers.")
+ 455| 
+ 456| 		req.Arguments[arg.Name] = timestamp.Format("2006-01-02T15:04:05")
+ 457| 	}
+ 458| }
+ 459| 
+ 460| // MangleArgumentValue applies mangling transformations to a single argument value.
+ 461| // This is used by the validation API to ensure the value matches what would be
+ 462| // used during actual execution.
+ 463| func MangleArgumentValue(arg *config.ActionArgument, value string, actionTitle string) string {
+ 464| 	if arg == nil {
+ 465| 		log.Debugf("MangleArgumentValue called with nil arg, returning value unchanged")
+ 466| 		return value
+ 467| 	}
+ 468| 
+ 469| 	return mangleArgumentValueByType(arg, value, actionTitle)
+ 470| }
+ 471| 
+ 472| func mangleArgumentValueByType(arg *config.ActionArgument, value string, actionTitle string) string {
+ 473| 	switch arg.Type {
+ 474| 	case "datetime":
+ 475| 		return mangleDatetimeValue(arg, value, actionTitle)
+ 476| 	case "checkbox":
+ 477| 		return mangleCheckboxValue(arg, value, actionTitle)
+ 478| 	case "checklist":
+ 479| 		return mangleChecklistValue(arg, value, actionTitle)
+ 480| 	default:
+ 481| 		return value
+ 482| 	}
+ 483| }
+ 484| 
+ 485| func mangleDatetimeValue(arg *config.ActionArgument, value string, actionTitle string) string {
+ 486| 	if arg == nil {
+ 487| 		log.Debugf("mangleDatetimeValue called with nil arg, returning value unchanged")
+ 488| 		return value
+ 489| 	}
+ 490| 
+ 491| 	if value == "" {
+ 492| 		return value
+ 493| 	}
+ 494| 
+ 495| 	timestamp, err := time.Parse("2006-01-02T15:04", value)
+ 496| 	if err != nil {
+ 497| 		return value
+ 498| 	}
+ 499| 
+ 500| 	log.WithFields(log.Fields{
+ 501| 		"arg":         arg.Name,
+ 502| 		"value":       value,
+ 503| 		"actionTitle": actionTitle,
+ 504| 	}).Warnf("Mangled invalid datetime value without seconds to :00 seconds, this issue is commonly caused by Android browsers.")
+ 505| 
+ 506| 	return timestamp.Format("2006-01-02T15:04:05")
+ 507| }
+ 508| 
+ 509| func mangleCheckboxValue(arg *config.ActionArgument, value string, actionTitle string) string {
+ 510| 	if arg == nil {
+ 511| 		log.Debugf("mangleCheckboxValue called with nil arg, returning value unchanged")
+ 512| 		return value
+ 513| 	}
+ 514| 
+ 515| 	return mangleChoiceSegment(arg, value, actionTitle)
+ 516| }
+ 517| 
+ 518| func mangleChecklistValues(req *ExecutionRequest, arg *config.ActionArgument) {
+ 519| 	if arg.Type != "checklist" {
+ 520| 		return
+ 521| 	}
+ 522| 
+ 523| 	value, exists := req.Arguments[arg.Name]
+ 524| 	if !exists || value == "" {
+ 525| 		return
+ 526| 	}
+ 527| 
+ 528| 	req.Arguments[arg.Name] = mangleChecklistValue(arg, value, req.Binding.Action.Title)
+ 529| }
+ 530| 
+ 531| func mangleChecklistValue(arg *config.ActionArgument, value string, actionTitle string) string {
+ 532| 	if arg == nil || value == "" {
+ 533| 		return value
+ 534| 	}
+ 535| 
+ 536| 	segments, err := config.ParseChecklistValue(value)
+ 537| 	if err != nil {
+ 538| 		return value
+ 539| 	}
+ 540| 
+ 541| 	return mangleChecklistSegments(arg, segments, value, actionTitle)
+ 542| }
+ 543| 
+ 544| func mangleChecklistSegments(arg *config.ActionArgument, segments []string, fallback string, actionTitle string) string {
+ 545| 	mangled := make([]string, len(segments))
+ 546| 	for i, segment := range segments {
+ 547| 		mangled[i] = mangleChecklistSegment(arg, segment, actionTitle)
+ 548| 	}
+ 549| 
+ 550| 	formatted, err := config.FormatChecklistValue(mangled)
+ 551| 	if err != nil {
+ 552| 		return fallback
+ 553| 	}
+ 554| 
+ 555| 	return formatted
+ 556| }
+ 557| 
+ 558| func mangleChecklistSegment(arg *config.ActionArgument, segment string, actionTitle string) string {
+ 559| 	trimmed := strings.TrimSpace(segment)
+ 560| 	if trimmed == "" {
+ 561| 		return ""
+ 562| 	}
+ 563| 
+ 564| 	return mangleChoiceSegment(arg, trimmed, actionTitle)
+ 565| }
+ 566| 
+ 567| func mangleChoiceSegment(arg *config.ActionArgument, value string, actionTitle string) string {
+ 568| 	if mapped, ok := mangleChoiceSegmentEntity(arg, value, actionTitle); ok {
+ 569| 		return mapped
+ 570| 	}
+ 571| 
+ 572| 	return mangleChoiceSegmentStatic(arg, value, actionTitle)
+ 573| }
+ 574| 
+ 575| func mangleChoiceSegmentEntity(arg *config.ActionArgument, value string, actionTitle string) (string, bool) {
+ 576| 	if arg.Entity == "" || len(arg.Choices) == 0 {
+ 577| 		return value, false
+ 578| 	}
+ 579| 
+ 580| 	return mangleEntityTemplateChoiceSegment(arg.Choices[0], arg.Entity, arg.Name, value, actionTitle)
+ 581| }
+ 582| 
+ 583| func mangleEntityTemplateChoiceSegment(templateChoice config.ActionArgumentChoice, entityName string, argName string, value string, actionTitle string) (string, bool) {
+ 584| 	for _, ent := range entities.GetEntityInstancesOrdered(entityName) {
+ 585| 		expandedTitle := tpl.ParseTemplateOfActionBeforeExec(templateChoice.Title, ent)
+ 586| 		if value != expandedTitle {
+ 587| 			continue
+ 588| 		}
+ 589| 
+ 590| 		expandedValue := tpl.ParseTemplateOfActionBeforeExec(templateChoice.Value, ent)
+ 591| 		log.WithFields(log.Fields{
+ 592| 			"arg":         argName,
+ 593| 			"oldValue":    value,
+ 594| 			"newValue":    expandedValue,
+ 595| 			"actionTitle": actionTitle,
+ 596| 		}).Infof("Mangled entity choice segment")
+ 597| 
+ 598| 		return expandedValue, true
+ 599| 	}
+ 600| 
+ 601| 	return value, false
+ 602| }
+ 603| 
+ 604| func mangleChoiceSegmentStatic(arg *config.ActionArgument, value string, actionTitle string) string {
+ 605| 	for _, choice := range arg.Choices {
+ 606| 		if value == choice.Title {
+ 607| 			log.WithFields(log.Fields{
+ 608| 				"arg":         arg.Name,
+ 609| 				"oldValue":    value,
+ 610| 				"newValue":    choice.Value,
+ 611| 				"actionTitle": actionTitle,
+ 612| 			}).Infof("Mangled choice segment")
+ 613| 
+ 614| 			return choice.Value
+ 615| 		}
+ 616| 	}
+ 617| 
+ 618| 	return value
+ 619| }
+ 620| 
+ 621| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7986 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文逐函数）
+
+1. **第 22-34 行 `parseExecArray` / 第 36-50 行 `parseActionExec`**：入口为 `values map[string]string`（来自 HTTP 请求参数），先 `validateArguments` 再逐段模板解析。注意 `validateArguments` 只遍历 `action.Arguments` 中**已声明**的参数。
+
+2. **第 52-55 行 `parseExecSegment`**：直接把用户值交给 `tpl.ParseTemplateWithActionContext`，无二次过滤——防御完全依赖上游 typecheck。
+
+3. **第 57-67 行 `validateArguments`**：只校验声明过的 arg；`values` 中**未在配置中声明的多余键不会被任何检查**，但它们仍会传入模板上下文（见第 2 点），可被注入到 exec/shell 命令中 —— 第二入口/替代通道漏洞。
+
+4. **第 69-104 行 `parseActionArguments`**：同样只对声明的 arg 做 typecheck，然后第 88 行把整个 `req.Arguments`（含未声明键）传入 Shell 模板，产出 `parsedShellCommand` 作为最终执行的命令字符串 —— **sink：shell 命令拼接**。
+
+5. **第 106-133 行 redact 函数**：仅日志脱敏，非安全边界。
+
+6. **第 135-141 行 `argumentSkipsValidation`**：`confirmation`、`html` 类型完全跳过校验；若其值进入模板即未过滤输入。
+
+7. **第 143-190 行 typecheck 系列 / 第 192-215 行 `TypeSafetyCheck`**：
+   - 第 196-201 行：`password`、`raw_string_multiline`、`checkbox`、`checklist` 直接 `return nil`，**零字符校验**；
+   - 第 178-180 行 `very_dangerous_raw_string` 的正则为空串 `""`（第 26 行），`regexp.MatchString("", v)` 恒真，等于放行任意内容。
+   - 其余类型（int/ascii 等）是白名单正则，属有效防御。
+
+8. **第 217-238 行 checklist 校验**：每段走 `typecheckChoice` 白名单，有效；但若 Choices 为空已在第 220 行拒绝，OK。
+
+9. **第 296-311 行 `checkShellArgumentSafety`**：本应阻止 unsafe 类型与 Shell 同用，但**本文件内没有任何调用点**（`parseActionArguments` 未调用它）；即使在外部被调用，也只覆盖部分类型，且 `very_dangerous_raw_string` 在列而 `html`/`confirmation` 不在列。
+
+10. **第 313-470 行 mangle 系列**：datetime/checkbox/checklist 值改写，均映射到预定义 choice.Value 或格式化时间，不引入新注入面；`mangleChecklistValue` 解析失败时原样返回 fallback（第 443-445 行），随后仍会被 typecheck 拦截（checklist 有 choices 时），风险有限。
+
+### 数据流结论
+- source：HTTP 请求参数 `req.Arguments` / `values`（含未声明键）→ sink：第 88 行模板展开后的 Shell 命令、第 53 行 exec 参数。
+- 有效防御：白名单正则类型、choices 白名单。
+- 无效/缺失防御：(a) `password`/`raw_string_multiline`/`checkbox`/`checklist`/`very_dangerous_raw_string` 无字符校验；(b) 未声明的额外请求参数完全绕过 `validateArguments` 却仍进入模板上下文；(c) `checkShellArgumentSafety` 在本执行路径未被强制调用。三者均可导致命令注入（CWE-78）。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-78 OS Command Injection", "risk_level": "High", "source": "line 88: req.Arguments 用户提交的请求参数，包括未在 action.Arguments 中声明的额外键", "sink": "line 83: tpl.ParseTemplateWithActionContext 展开进 action.Shell 生成的 parsedShellCommand，以及 line 53 展开进各 exec 段", "explanation": "validateArguments 与 parseActionArguments 只校验配置中声明的参数，values 映射中未声明的键不做任何 typecheck 却仍传入模板上下文并被拼入 shell/exec 命令；同时 TypeSafetyCheck 对 password、raw_string_multiline、checkbox、checklist 直接 return nil，very_dangerous_raw_string 的正则为空串恒匹配，这些类型的任意用户输入可注入命令；checkShellArgumentSafety 虽定义于 line 296 但在该执行路径未被调用，无法作为兜底", "fix_suggestion": "line 57-67 与 line 76-86: 在构建模板上下文前拒绝所有未在 action.Arguments 中声明的参数键；line 192-215: 对进入 Shell 的所有类型强制非空字符白名单校验，并在 parseActionArguments 入口处强制调用 checkShellArgumentSafety"}
+
+### id=7987 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **第 10–19 行 typecheckRegex**：定义各类型白名单正则。注意 `very_dangerous_raw_string` 的模式为空字符串——空正则匹配任意输入，等于无校验。但该类型被显式命名为“非常危险”，且在第 262–270 行的 `shellUnsafeArgumentTypes` 中被列入黑名单（见第 6 步），不能用于 Shell 执行，故不构成直接漏洞。
+
+2. **第 21–33 行 parseExecArray / 第 35–47 行 parseActionExec**：exec 数组路径。每个 segment 先经第 49–53 行 `parseExecSegment` 模板渲染，但渲染前必须通过第 39 行 `validateArguments` → 第 76–89 行 `typecheckActionArgument`，source（用户提交的 `values`）到 sink（命令参数）之间有强制校验闸门。
+
+3. **第 55–74 行 parseActionArguments**：shell 路径。第 57–66 行对每个声明的 argument 逐一执行 `typecheckActionArgument`，失败即返回错误；之后才在第 68 行做模板渲染生成 shell 命令。校验先于 sink，顺序正确。
+
+4. **第 91–172 行 redact 函数与 argumentSkipsValidation**：仅影响日志脱敏，非安全边界。`confirmation`/`html` 跳过校验，但二者均在 `shellUnsafeArgumentTypes` 黑名单中，无法进入 Shell。
+
+5. **第 174–244 行 typecheck 系列**：
+   - 空值走 `typecheckNull`（RejectNull 可拒绝）；
+   - checklist 逐段走 `typecheckChoice`；
+   - 有 Choices 时（第 190–193 行）强制精确匹配预定义值或实体实例值，用户无法注入任意串——这封堵了 checkbox/checklist 绕过路径；
+   - `TypeSafetyCheck`（第 205 行起）中 `checkbox`/`checklist` 直接放行看似可疑，但由于第 190 行的 Choices 分支优先拦截，实际不可达任意值。
+
+6. **第 258–275 行 isUnsafeShellArgumentType / checkShellArgumentSafety**：第二道防线。凡 `regex:` 前缀、url、email、multiline、raw_string、password、html、confirmation、无 Choices 的 checkbox 一律禁止与 `Shell` 同用，强制走 `exec`（数组形式，不经 shell 解释）。这是对黑名单正则可绕过性（如 `very_dangerous_raw_string`）的有效兜底。
+
+7. **第 277–300 行 mangleInvalidArgumentValues 及后续 mangle 函数**：仅在合法值域内做标题→值的映射转换（datetime 补秒、choice 标题映射），映射失败时保留原值并交由后续 typecheck 拦截，不会引入未校验数据。
+
+8. **email/url/datetime 校验（第 296–320 行附近）**：`mail.ParseAddress`、scheme 白名单 http/https、严格时间格式解析，均为标准库强校验；且这些类型同时被禁止用于 Shell，风险进一步收敛。
+
+9. **替代通道检查**：文件内两条执行路径（exec 与 shell）均独立调用同一 `typecheckActionArgument`；`ValidateArgument`（第 118 行起）复用相同校验逻辑供 API 使用，无绕过分支。唯一理论残留是模板若引用了未在 `action.Arguments` 中声明的键值，其值不会经过本校验——但该行为取决于本文件之外的模板实现，就本文件证据而言不存在可确认的漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文通读后未发现可确认漏洞。用户输入（req.Arguments/values）到达命令构造 sink 前，必须经过 typecheckActionArgument 强制校验：有 Choices 的参数强制白名单精确匹配，其余类型用锚定正则或标准库解析校验。空模式的 very_dangerous_raw_string 等危险类型被 shellUnsafeArgumentTypes 黑名单禁止用于 Shell 执行，构成有效第二道防线。mangle 函数仅在合法值域内做映射，不引入未校验数据。exec 与 shell 两条路径均复用同一校验逻辑，无绕过分支。", "fix_suggestion": "no fix needed"}

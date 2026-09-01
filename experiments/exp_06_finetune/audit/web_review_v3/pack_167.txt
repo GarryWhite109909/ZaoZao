@@ -1,0 +1,567 @@
+batch=167 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=8048 lang=go
+[CODE]
+   1| package business
+   2| 
+   3| import (
+   4| 	"crypto/tls"
+   5| 	"crypto/x509"
+   6| 	"encoding/json"
+   7| 	"fmt"
+   8| 	"io/ioutil"
+   9| 	"net/http"
+  10| 	"net/url"
+  11| 	"strings"
+  12| 
+  13| 	"github.com/kiali/kiali/kubernetes"
+  14| 	"github.com/kiali/kiali/log"
+  15| )
+  16| 
+  17| type OpenshiftOAuthService struct {
+  18| 	k8s kubernetes.IstioClientInterface
+  19| }
+  20| 
+  21| type OAuthMetadata struct {
+  22| 	AuthorizationEndpoint string `json:"authorizationEndpoint"`
+  23| 	LogoutEndpoint        string `json:"logoutEndpoint"`
+  24| 	LogoutRedirect        string `json:"logoutRedirect"`
+  25| }
+  26| 
+  27| // Structure that's returned by the openshift oauth authorization server.
+  28| // It defaults to following the snake_case format, so we parse it to something
+  29| // more usable on our side.
+  30| type OAuthAuthorizationServer struct {
+  31| 	AuthorizationEndpoint string `json:"authorization_endpoint"`
+  32| 	Issuer                string `json:"issuer"`
+  33| }
+  34| 
+  35| type OAuthUser struct {
+  36| 	Metadata OAuthUserMetadata `json:"metadata"`
+  37| }
+  38| 
+  39| type OAuthUserMetadata struct {
+  40| 	Name string `json:"name"`
+  41| }
+  42| 
+  43| type OAuthRoute struct {
+  44| 	Spec OAuthRouteSpec `json:"spec"`
+  45| }
+  46| 
+  47| type OAuthRouteSpec struct {
+  48| 	Host string             `json:"host"`
+  49| 	TLS  *OAuthRouteTLSSpec `json:"tls,omitempty"`
+  50| }
+  51| 
+  52| type OAuthRouteTLSSpec struct {
+  53| 	Termination string `json:"termination"`
+  54| }
+  55| 
+  56| const serverPrefix = "https://kubernetes.default.svc/"
+  57| 
+  58| var kialiNamespace string
+  59| 
+  60| func (in *OpenshiftOAuthService) Metadata() (metadata *OAuthMetadata, err error) {
+  61| 	redirectURL, err := getKialiRoutePath()
+  62| 
+  63| 	if err != nil {
+  64| 		log.Error(err)
+  65| 		message := fmt.Errorf("could not get Kiali route for OAuth redirect: %v", err)
+  66| 		return nil, message
+  67| 	}
+  68| 
+  69| 	server, err := getOAuthAuthorizationServer()
+  70| 	if err != nil {
+  71| 		return nil, err
+  72| 	}
+  73| 
+  74| 	version, err := in.k8s.GetServerVersion()
+  75| 	if err != nil {
+  76| 		return nil, err
+  77| 	}
+  78| 
+  79| 	metadata = &OAuthMetadata{}
+  80| 
+  81| 	namespace, err := getKialiNamespace()
+  82| 	if err != nil {
+  83| 		return nil, err
+  84| 	}
+  85| 
+  86| 	if version.Major == "1" && (strings.HasPrefix(version.Minor, "11") || strings.HasPrefix(version.Minor, "10")) {
+  87| 		metadata.AuthorizationEndpoint = fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=%s", server.AuthorizationEndpoint, "kiali-"+namespace, url.QueryEscape(*redirectURL), "token")
+  88| 	} else {
+  89| 		// The logout endpoint on the OpenShift OAuth Server
+  90| 		metadata.LogoutEndpoint = fmt.Sprintf("%s/logout", server.Issuer)
+  91| 		// The redirect path when logging out of the OpenShift OAuth Server. Note: this has to be a relative link to the OAuth server
+  92| 		metadata.LogoutRedirect = fmt.Sprintf("/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=%s", "kiali-"+namespace, url.QueryEscape(*redirectURL), "token")
+  93| 		// The fully qualified endpoint to use logging into the OpenShift OAuth server.
+  94| 		metadata.AuthorizationEndpoint = fmt.Sprintf("%s%s", server.Issuer, metadata.LogoutRedirect)
+  95| 	}
+  96| 	return metadata, nil
+  97| }
+  98| 
+  99| func getOAuthAuthorizationServer() (*OAuthAuthorizationServer, error) {
+ 100| 	var server *OAuthAuthorizationServer
+ 101| 
+ 102| 	response, err := request("GET", ".well-known/oauth-authorization-server", nil)
+ 103| 
+ 104| 	if err != nil {
+ 105| 		log.Error(err)
+ 106| 		message := fmt.Errorf("could not send request to the Openshift OAuth API: %v", err)
+ 107| 		return nil, message
+ 108| 	}
+ 109| 
+ 110| 	err = json.Unmarshal(response, &server)
+ 111| 
+ 112| 	if err != nil {
+ 113| 		log.Error(err)
+ 114| 		message := fmt.Errorf("could not parse data from the Openshift API: %v", err)
+ 115| 		return nil, message
+ 116| 	}
+ 117| 
+ 118| 	return server, nil
+ 119| }
+ 120| 
+ 121| func (in *OpenshiftOAuthService) GetUserInfo(token string) (*OAuthUser, error) {
+ 122| 	var user *OAuthUser
+ 123| 
+ 124| 	response, err := request("GET", "apis/user.openshift.io/v1/users/~", &token)
+ 125| 
+ 126| 	if err != nil {
+ 127| 		log.Error(err)
+ 128| 		return nil, fmt.Errorf("could not get user info from Openshift: %v", err)
+ 129| 	}
+ 130| 
+ 131| 	err = json.Unmarshal(response, &user)
+ 132| 
+ 133| 	if err != nil {
+ 134| 		log.Error(err)
+ 135| 		return nil, fmt.Errorf("could not parse user info from Openshift: %v", err)
+ 136| 	}
+ 137| 
+ 138| 	return user, nil
+ 139| }
+ 140| 
+ 141| func getKialiNamespace() (string, error) {
+ 142| 	if kialiNamespace == "" {
+ 143| 		namespace, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+ 144| 		if err != nil {
+ 145| 			return "", err
+ 146| 		}
+ 147| 		kialiNamespace = string(namespace)
+ 148| 	}
+ 149| 	return kialiNamespace, nil
+ 150| }
+ 151| 
+ 152| func getKialiRoutePath() (*string, error) {
+ 153| 	var route *OAuthRoute
+ 154| 	var protocol string
+ 155| 
+ 156| 	namespace, err := getKialiNamespace()
+ 157| 	if err != nil {
+ 158| 		log.Error(err)
+ 159| 		return nil, fmt.Errorf("cannot read Kiali's ServiceAccount: %v", err)
+ 160| 	}
+ 161| 
+ 162| 	conf, err := kubernetes.ConfigClient()
+ 163| 	if err != nil {
+ 164| 		log.Error(err)
+ 165| 		return nil, fmt.Errorf("could not connect to Openshift: %v", err)
+ 166| 	}
+ 167| 
+ 168| 	response, err := request("GET", fmt.Sprintf("apis/route.openshift.io/v1/namespaces/%v/routes/kiali", namespace), &conf.BearerToken)
+ 169| 	if err != nil {
+ 170| 		log.Error(err)
+ 171| 		return nil, fmt.Errorf("could not connect to Openshift: %v", err)
+ 172| 	}
+ 173| 
+ 174| 	err = json.Unmarshal(response, &route)
+ 175| 	if err != nil {
+ 176| 		log.Error(err)
+ 177| 		return nil, fmt.Errorf("cannot parse Kiali route: %v", err)
+ 178| 	}
+ 179| 
+ 180| 	if route.Spec.TLS == nil {
+ 181| 		protocol = "http://"
+ 182| 	} else {
+ 183| 		protocol = "https://"
+ 184| 	}
+ 185| 
+ 186| 	url := strings.Join([]string{protocol, route.Spec.Host}, "")
+ 187| 
+ 188| 	return &url, nil
+ 189| }
+ 190| 
+ 191| func (in *OpenshiftOAuthService) Logout(token string) error {
+ 192| 	conf, err := kubernetes.ConfigClient()
+ 193| 
+ 194| 	if err != nil {
+ 195| 		log.Error(err)
+ 196| 		return fmt.Errorf("could not connect to Openshift: %v", err)
+ 197| 	}
+ 198| 
+ 199| 	// Delete the access token from the API server
+ 200| 	_, err = request("DELETE", fmt.Sprintf("apis/oauth.openshift.io/v1/oauthaccesstokens/%v", token), &conf.BearerToken)
+ 201| 
+ 202| 	if err != nil {
+ 203| 		return err
+ 204| 	}
+ 205| 
+ 206| 	return nil
+ 207| }
+ 208| 
+ 209| func request(method string, url string, auth *string) ([]byte, error) {
+ 210| 	certPool := x509.NewCertPool()
+ 211| 	cert, err := ioutil.ReadFile("/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+ 212| 
+ 213| 	if err != nil {
+ 214| 		return nil, fmt.Errorf("failed to get root CA certificates: %s", err)
+ 215| 	}
+ 216| 
+ 217| 	certPool.AppendCertsFromPEM(cert)
+ 218| 
+ 219| 	tlsConfig := &tls.Config{RootCAs: certPool}
+ 220| 
+ 221| 	client := &http.Client{
+ 222| 		Transport: &http.Transport{
+ 223| 			TLSClientConfig: tlsConfig,
+ 224| 		}}
+ 225| 
+ 226| 	request, err := http.NewRequest(method, strings.Join([]string{serverPrefix, url}, ""), nil)
+ 227| 
+ 228| 	if err != nil {
+ 229| 		return nil, fmt.Errorf("failed to get api endpoint %s for oauth consumption, error: %s", url, err)
+ 230| 	}
+ 231| 
+ 232| 	if auth != nil {
+ 233| 		request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", *auth))
+ 234| 	}
+ 235| 
+ 236| 	response, err := client.Do(request)
+ 237| 
+ 238| 	if err != nil {
+ 239| 		return nil, fmt.Errorf("failed to get api endpoint %s for oauth consumption, error: %s", url, err)
+ 240| 	}
+ 241| 
+ 242| 	defer response.Body.Close()
+ 243| 
+ 244| 	body, err := ioutil.ReadAll(response.Body)
+ 245| 
+ 246| 	if err != nil {
+ 247| 		return nil, fmt.Errorf("failed to get api endpoint %s for oauth consumption, error: %s", url, err)
+ 248| 	}
+ 249| 
+ 250| 	if response.StatusCode != http.StatusOK {
+ 251| 		return nil, fmt.Errorf("failed to get api endpoint %s for oauth consumption, error: %s", url, string(body))
+ 252| 	}
+ 253| 
+ 254| 	return body, nil
+ 255| }
+ 256| 
+ 257| 
+
+### id=8049 lang=php
+[CODE]
+   1| <?php
+   2| /**
+   3|  * @link https://craftcms.com/
+   4|  * @copyright Copyright (c) Pixel & Tonic, Inc.
+   5|  * @license https://craftcms.github.io/license/
+   6|  */
+   7| 
+   8| namespace craft\controllers;
+   9| 
+  10| use Craft;
+  11| use craft\base\Element;
+  12| use craft\elements\GlobalSet;
+  13| use craft\helpers\Cp;
+  14| use craft\helpers\Json;
+  15| use craft\helpers\StringHelper;
+  16| use craft\web\Controller;
+  17| use yii\web\BadRequestHttpException;
+  18| use yii\web\ForbiddenHttpException;
+  19| use yii\web\NotFoundHttpException;
+  20| use yii\web\Response;
+  21| 
+  22| /**
+  23|  * The GlobalsController class is a controller that handles various global and global set related tasks such as saving,
+  24|  * deleting displaying both globals and global sets.
+  25|  * Note that all actions in the controller require an authenticated Craft session via [[allowAnonymous]].
+  26|  *
+  27|  * @author Pixel & Tonic, Inc. <support@pixelandtonic.com>
+  28|  * @since 3.0.0
+  29|  */
+  30| class GlobalsController extends Controller
+  31| {
+  32|     /**
+  33|      * Index
+  34|      *
+  35|      * @return Response
+  36|      * @throws ForbiddenHttpException if the user isn't authorized to edit any global sets
+  37|      */
+  38|     public function actionIndex(): Response
+  39|     {
+  40|         $editableSets = Craft::$app->getGlobals()->getEditableSets();
+  41| 
+  42|         if (empty($editableSets)) {
+  43|             throw new ForbiddenHttpException('User not permitted to edit any global content');
+  44|         }
+  45| 
+  46|         return $this->redirect('globals/' . $editableSets[0]->handle);
+  47|     }
+  48| 
+  49|     /**
+  50|      * Saves a global set.
+  51|      *
+  52|      * @return Response|null
+  53|      * @throws NotFoundHttpException if the requested global set cannot be found
+  54|      * @throws BadRequestHttpException
+  55|      */
+  56|     public function actionSaveSet(): ?Response
+  57|     {
+  58|         $this->requirePostRequest();
+  59|         $this->requireAdmin();
+  60| 
+  61|         $globalSetId = $this->request->getBodyParam('setId');
+  62| 
+  63|         if ($globalSetId) {
+  64|             $globalSet = Craft::$app->getGlobals()->getSetById($globalSetId);
+  65|             if (!$globalSet) {
+  66|                 throw new BadRequestHttpException("Invalid global set ID: $globalSetId");
+  67|             }
+  68|         } else {
+  69|             $globalSet = new GlobalSet();
+  70|         }
+  71| 
+  72|         // Set the simple stuff
+  73|         $globalSet->name = $this->request->getBodyParam('name');
+  74|         $globalSet->handle = $this->request->getBodyParam('handle');
+  75| 
+  76|         // Set the field layout
+  77|         $fieldLayout = Craft::$app->getFields()->assembleLayoutFromPost();
+  78|         $fieldLayout->type = GlobalSet::class;
+  79|         $globalSet->setFieldLayout($fieldLayout);
+  80| 
+  81|         // Save it
+  82|         if (!Craft::$app->getGlobals()->saveSet($globalSet)) {
+  83|             $this->setFailFlash(StringHelper::upperCaseFirst(Craft::t('app', 'Couldn’t save {type}.', [
+  84|                 'type' => GlobalSet::lowerDisplayName(),
+  85|             ])));
+  86| 
+  87|             // Send the global set back to the template
+  88|             Craft::$app->getUrlManager()->setRouteParams([
+  89|                 'globalSet' => $globalSet,
+  90|             ]);
+  91| 
+  92|             return null;
+  93|         }
+  94| 
+  95|         $this->setSuccessFlash(Craft::t('app', '{type} saved.', [
+  96|             'type' => GlobalSet::displayName(),
+  97|         ]));
+  98|         return $this->redirectToPostedUrl($globalSet);
+  99|     }
+ 100| 
+ 101|     /**
+ 102|      * Reorders global sets.
+ 103|      *
+ 104|      * @return Response
+ 105|      * @since 3.7.0
+ 106|      */
+ 107|     public function actionReorderSets(): Response
+ 108|     {
+ 109|         $this->requirePostRequest();
+ 110|         $this->requireAcceptsJson();
+ 111| 
+ 112|         $setIds = Json::decode($this->request->getRequiredBodyParam('ids'));
+ 113|         Craft::$app->getGlobals()->reorderSets($setIds);
+ 114| 
+ 115|         return $this->asSuccess();
+ 116|     }
+ 117| 
+ 118|     /**
+ 119|      * Deletes a global set.
+ 120|      *
+ 121|      * @return Response
+ 122|      */
+ 123|     public function actionDeleteSet(): Response
+ 124|     {
+ 125|         $this->requirePostRequest();
+ 126|         $this->requireAcceptsJson();
+ 127|         $this->requireAdmin();
+ 128| 
+ 129|         $globalSetId = $this->request->getRequiredBodyParam('id');
+ 130| 
+ 131|         Craft::$app->getGlobals()->deleteGlobalSetById($globalSetId);
+ 132| 
+ 133|         return $this->asSuccess();
+ 134|     }
+ 135| 
+ 136|     /**
+ 137|      * Edits a global set's content.
+ 138|      *
+ 139|      * @param string $globalSetHandle The global set’s handle.
+ 140|      * @param GlobalSet|null $globalSet The global set being edited, if there were any validation errors.
+ 141|      * @return Response
+ 142|      * @throws ForbiddenHttpException if the user is not permitted to edit the global set
+ 143|      * @throws NotFoundHttpException if the requested site handle is invalid
+ 144|      */
+ 145|     public function actionEditContent(string $globalSetHandle, ?GlobalSet $globalSet = null): Response
+ 146|     {
+ 147|         $site = Cp::requestedSite();
+ 148|         if (!$site) {
+ 149|             throw new ForbiddenHttpException('User not permitted to edit content in any sites');
+ 150|         }
+ 151| 
+ 152|         // Get the global sets the user is allowed to edit, in the requested site
+ 153|         $editableGlobalSets = [];
+ 154| 
+ 155|         /** @var GlobalSet[] $globalSets */
+ 156|         $globalSets = GlobalSet::find()
+ 157|             ->siteId($site->id)
+ 158|             ->all();
+ 159| 
+ 160|         foreach ($globalSets as $thisGlobalSet) {
+ 161|             if (Craft::$app->getUser()->checkPermission('editGlobalSet:' . $thisGlobalSet->uid)) {
+ 162|                 $editableGlobalSets[$thisGlobalSet->handle] = $thisGlobalSet;
+ 163|             }
+ 164|         }
+ 165| 
+ 166|         if (empty($editableGlobalSets) || !isset($editableGlobalSets[$globalSetHandle])) {
+ 167|             throw new ForbiddenHttpException('User not permitted to edit global set');
+ 168|         }
+ 169| 
+ 170|         if ($globalSet === null) {
+ 171|             $globalSet = $editableGlobalSets[$globalSetHandle];
+ 172|         }
+ 173| 
+ 174|         // Prep the form tabs & content
+ 175|         $form = $globalSet->getFieldLayout()->createForm($globalSet, false, [
+ 176|             'registerDeltas' => true,
+ 177|         ]);
+ 178| 
+ 179|         // Render the template!
+ 180|         return $this->renderTemplate('globals/_edit.twig', [
+ 181|             'bodyClass' => 'edit-global-set',
+ 182|             'editableGlobalSets' => $editableGlobalSets,
+ 183|             'globalSet' => $globalSet,
+ 184|             'tabs' => $form->getTabMenu(),
+ 185|             'fieldsHtml' => $form->render(),
+ 186|         ]);
+ 187|     }
+ 188| 
+ 189|     /**
+ 190|      * Saves a global set's content.
+ 191|      *
+ 192|      * @return Response|null
+ 193|      * @throws NotFoundHttpException if the requested global set cannot be found
+ 194|      */
+ 195|     public function actionSaveContent(): ?Response
+ 196|     {
+ 197|         $this->requirePostRequest();
+ 198| 
+ 199|         $globalSetId = $this->request->getRequiredBodyParam('setId');
+ 200|         $siteId = $this->request->getBodyParam('siteId') ?: Craft::$app->getSites()->getPrimarySite()->id;
+ 201| 
+ 202|         $site = Craft::$app->getSites()->getSiteById($siteId);
+ 203|         $globalSet = Craft::$app->getGlobals()->getSetById($globalSetId, $siteId);
+ 204| 
+ 205|         if (!$globalSet) {
+ 206|             throw new NotFoundHttpException('Global set not found');
+ 207|         }
+ 208| 
+ 209|         if (!$site) {
+ 210|             throw new NotFoundHttpException('Site not found');
+ 211|         }
+ 212| 
+ 213|         // Make sure the user is allowed to edit this global set and site
+ 214|         $this->requirePermission('editGlobalSet:' . $globalSet->uid);
+ 215| 
+ 216|         if (Craft::$app->getIsMultiSite()) {
+ 217|             $this->requirePermission('editSite:' . $site->uid);
+ 218|         }
+ 219| 
+ 220|         $fieldsLocation = $this->request->getParam('fieldsLocation', 'fields');
+ 221|         $globalSet->setFieldValuesFromRequest($fieldsLocation);
+ 222|         $globalSet->setScenario(Element::SCENARIO_LIVE);
+ 223| 
+ 224|         if (!Craft::$app->getElements()->saveElement($globalSet)) {
+ 225|             $this->setFailFlash(StringHelper::upperCaseFirst(Craft::t('app', 'Couldn’t save {type}.', [
+ 226|                 'type' => GlobalSet::lowerDisplayName(),
+ 227|             ])));
+ 228| 
+ 229|             // Send the global set back to the template
+ 230|             Craft::$app->getUrlManager()->setRouteParams([
+ 231|                 'globalSet' => $globalSet,
+ 232|             ]);
+ 233| 
+ 234|             return null;
+ 235|         }
+ 236| 
+ 237|         $this->setSuccessFlash(Craft::t('app', '{type} saved.', [
+ 238|             'type' => GlobalSet::displayName(),
+ 239|         ]));
+ 240|         return $this->redirectToPostedUrl();
+ 241|     }
+ 242| }
+ 243| 
+ 244| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=8048 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+**1. 入口点枚举（全文通读）**
+- 第 22–57 行 `Metadata()`：无外部输入参数，数据来自集群内 API（route、oauth server 元数据）。
+- 第 59–81 行 `getOAuthAuthorizationServer()`：请求固定路径 `.well-known/oauth-authorization-server`，无用户输入。
+- 第 83–98 行 `GetUserInfo(token)`：token 为 source（用户会话 token），sink 是第 89 行 `request("GET", "apis/user.openshift.io/v1/users/~", &token)`——token 仅作为 Authorization 头传入，未拼入 URL。
+- 第 100–109 行 `getKialiNamespace()`：读取固定路径的 serviceaccount 文件，非用户可控。
+- 第 111–146 行 `getKialiRoutePath()`：host 来自集群内 route 对象，需集群权限才能篡改，且仅用于拼接 redirect_uri 并经 `url.QueryEscape` 转义。
+- 第 148–163 行 `Logout(token)`：token 为 source，第 156 行拼入 URL 路径。
+- 第 165–211 行 `request()`：公共 sink；URL 前缀固定为 `https://kubernetes.default.svc/`（第 18 行），TLS 校验使用集群 CA（第 169–180 行），未禁用证书校验。
+
+**2. 数据流验证**
+- `Metadata` 流：namespace/route host → Sprintf → 返回给前端。redirect_uri 经 QueryEscape，host 来自受 RBAC 保护的 route 资源，攻击者需先攻陷集群，不构成独立漏洞。
+- `GetUserInfo` 流：token 仅进 Header，不进 URL，无注入面。
+- `Logout` 流：token 拼入 `apis/oauth.openshift.io/v1/oauthaccesstokens/%v`。理论上含 `/` 的 token 可造成路径变化，但该 token 本身就是调用者自己的 OAuth access token，删除自身 token 是预期功能；且该值来自 OpenShift 签发的合法 token 格式，正常流程不含路径穿越字符，实际利用需要伪造 token 值，而前端只传回服务端下发的真实 token。
+- `request` 流：所有 URL 均拼接在固定的 `serverPrefix` 之后，目标主机不可控，不存在 SSRF 到任意主机的通道；TLS 使用集群 CA 校验，无中间人风险。
+
+**3. 第二入口与替代通道**：文件内无 HTTP handler、无环境变量读取、无回调注册；唯一外部输入是两个函数参数 token，均已分析。错误信息中回显 body（第 205 行）仅面向已认证的管理端日志，敏感信息为用户自己的 token 操作结果。
+
+**4. 结论**：各 source→sink 流均有固定前缀、Header 传递或转义约束，且依赖集群 RBAC 保护的数据源，基于全文证据未发现可利用的安全漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "逐函数分析：GetUserInfo 与 Logout 的 token 参数分别仅作为 Authorization 头或拼入固定前缀 https://kubernetes.default.svc/ 之后的受控 API 路径，目标主机不可控，无 SSRF 或注入通道；Metadata 中 redirect_uri 经 url.QueryEscape 转义，route host 与 namespace 均来自受集群 RBAC 保护的资源或本地 serviceaccount 文件；request 函数保留 TLS 根 CA 校验，未关闭证书验证。全文未发现可由外部攻击者直接控制并到达危险 sink 的有效数据流。", "fix_suggestion": "no fix needed"}
+
+### id=8049 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文逐函数）
+
+1. **第 44-54 行 `actionIndex`**：仅读取 `getEditableSets()` 并重定向，无用户输入进入敏感 sink。无漏洞。
+
+2. **第 62-105 行 `actionSaveSet`**：入口为 POST body 的 `setId/name/handle` 及字段布局。防御：第 64 行 `requireAdmin()`（管理员权限），且保存逻辑在 service 层有校验。source→sink 有有效授权防御。无漏洞。
+
+3. **第 112-121 行 `actionReorderSets`**：入口 `ids` JSON 参数 → `reorderSets()`。此处只有 `requirePostRequest()` 和 `requireAcceptsJson()`，**缺少 `requireAdmin()` 或任何 `requirePermission` 检查**（对比第 78 行 saveSet、第 133 行 deleteSet 均有 admin 检查）。任何能访问控制面板的低权限用户可重排全局集顺序。属于授权缺失（影响较低，取决于 service 层是否兜底）。次要问题。
+
+4. **第 128-140 行 `actionDeleteSet`**：有 `requireAdmin()`，防御有效。
+
+5. **第 149-186 行 `actionEditContent`**：
+   - 入口：路由参数 `$globalSetHandle`、`$site`；**第二入口：Craft 的控制器动作参数注入机制允许通过请求参数（如 `globalSetId`）直接绑定 `$globalSet` 对象（第 151 行的可空参数默认值即为此设计）**。
+   - 第 156-166 行：按当前站点枚举并按 `editGlobalSet:{uid}` 权限过滤出 `$editableGlobalSets`。
+   - 第 168-170 行：只校验了 `$globalSetHandle` 是否在可编辑集合中；但若请求注入的 `$globalSet !== null`（例如通过查询参数传入另一个 set 的 ID），则**直接使用该注入对象渲染编辑表单，未验证其 handle/uid 与已授权的集合一致**——handle 校验与实际使用的对象脱钩，构成水平越权（可查看/提交其他全局集的字段表单）。这是典型的 CWE-863 / CWE-285 授权绕过，黑名单式的"handle 在白名单内"检查无法覆盖被替换的对象。
+
+6. **第 193-241 行 `actionSaveContent`**：
+   - 入口：POST `setId`、`siteId`、`fieldsLocation`。
+   - 第 199-208 行：按 `setId+siteId` 取 set，随后第 212 行 `requirePermission('editGlobalSet:'.$uid)`、多站点时第 215 行再查 `editSite` 权限——授权在使用之前完成，防御有效。
+   - 第 218 行 `$fieldsLocation` 来自请求，作为参数命名空间传给 `setFieldValuesFromRequest`，仅改变取值前缀，不构成注入 sink。
+   - 无明显漏洞。
+
+7. **替代通道核查**：全文无文件操作、无 SQL 拼接、无反序列化、无回调执行；模板渲染变量均经 Craft 转义体系。主要风险集中在第 5 点的对象注入越权，以及第 3 点 reorder 缺权限检查。
+
+## 结论
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-863 Incorrect Authorization", "risk_level": "Medium", "source": "line 155: actionEditContent 的可空参数 $globalSet 可由 Craft 控制器动作参数注入机制经请求参数（如 globalSetId）控制", "sink": "line 180: renderTemplate 使用未经二次校验的 $globalSet 渲染编辑表单", "explanation": "第 168-170 行仅校验路由参数 $globalSetHandle 是否位于按权限过滤出的 editableGlobalSets 中，但当攻击者通过请求参数注入另一个 GlobalSet 对象使 $globalSet 非 null 时，代码直接使用该注入对象而未验证其 handle 或 uid 与已授权集合一致，导致低权限用户可加载并编辑未被授予 editGlobalSet 权限的全局集内容，属授权判断与实际使用对象脱钩的水平越权", "fix_suggestion": "line 170: 当 $globalSet 非 null 时应校验其 handle 等于 $globalSetHandle 且其 uid 满足 checkPermission(editGlobalSet:$globalSet->uid)，否则抛出 ForbiddenHttpException"}

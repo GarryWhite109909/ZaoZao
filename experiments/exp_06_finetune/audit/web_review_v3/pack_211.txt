@@ -1,0 +1,311 @@
+batch=211 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=8163 lang=python
+[CODE]
+   1| """Local backup support for Core and Container installations."""
+   2| 
+   3| from collections.abc import AsyncIterator, Callable, Coroutine
+   4| import json
+   5| from pathlib import Path
+   6| from tarfile import TarError
+   7| from typing import Any
+   8| 
+   9| from homeassistant.core import HomeAssistant
+  10| from homeassistant.helpers.hassio import is_hassio
+  11| 
+  12| from .agent import BackupAgent, LocalBackupAgent, OnProgressCallback
+  13| from .const import DOMAIN, LOGGER
+  14| from .models import AgentBackup, BackupNotFound, InvalidBackupFilename
+  15| from .util import read_backup, suggested_filename
+  16| 
+  17| 
+  18| async def async_get_backup_agents(
+  19|     hass: HomeAssistant,
+  20|     **kwargs: Any,
+  21| ) -> list[BackupAgent]:
+  22|     """Return the local backup agent."""
+  23|     if is_hassio(hass):
+  24|         return []
+  25|     return [CoreLocalBackupAgent(hass)]
+  26| 
+  27| 
+  28| class CoreLocalBackupAgent(LocalBackupAgent):
+  29|     """Local backup agent for Core and Container installations."""
+  30| 
+  31|     domain = DOMAIN
+  32|     name = "local"
+  33|     unique_id = "local"
+  34| 
+  35|     def __init__(self, hass: HomeAssistant) -> None:
+  36|         """Initialize the backup agent."""
+  37|         super().__init__()
+  38|         self._hass = hass
+  39|         self._backup_dir = Path(hass.config.path("backups"))
+  40|         self._backups: dict[str, tuple[AgentBackup, Path]] = {}
+  41|         self._loaded_backups = False
+  42| 
+  43|     async def _load_backups(self) -> None:
+  44|         """Load data of stored backup files."""
+  45|         backups = await self._hass.async_add_executor_job(self._read_backups)
+  46|         LOGGER.debug("Loaded %s local backups", len(backups))
+  47|         self._backups = backups
+  48|         self._loaded_backups = True
+  49| 
+  50|     def _read_backups(self) -> dict[str, tuple[AgentBackup, Path]]:
+  51|         """Read backups from disk."""
+  52|         backups: dict[str, tuple[AgentBackup, Path]] = {}
+  53|         for backup_path in self._backup_dir.glob("*.tar"):
+  54|             try:
+  55|                 backup = read_backup(backup_path)
+  56|                 backups[backup.backup_id] = (backup, backup_path)
+  57|             except (
+  58|                 OSError,
+  59|                 TarError,
+  60|                 json.JSONDecodeError,
+  61|                 KeyError,
+  62|                 InvalidBackupFilename,
+  63|             ) as err:
+  64|                 LOGGER.warning("Unable to read backup %s: %s", backup_path, err)
+  65|         return backups
+  66| 
+  67|     async def async_download_backup(
+  68|         self,
+  69|         backup_id: str,
+  70|         **kwargs: Any,
+  71|     ) -> AsyncIterator[bytes]:
+  72|         """Download a backup file."""
+  73|         raise NotImplementedError
+  74| 
+  75|     async def async_upload_backup(
+  76|         self,
+  77|         *,
+  78|         open_stream: Callable[[], Coroutine[Any, Any, AsyncIterator[bytes]]],
+  79|         backup: AgentBackup,
+  80|         on_progress: OnProgressCallback,
+  81|         **kwargs: Any,
+  82|     ) -> None:
+  83|         """Upload a backup."""
+  84|         self._backups[backup.backup_id] = (backup, self.get_new_backup_path(backup))
+  85| 
+  86|     async def async_list_backups(self, **kwargs: Any) -> list[AgentBackup]:
+  87|         """List backups."""
+  88|         if not self._loaded_backups:
+  89|             await self._load_backups()
+  90|         return [backup for backup, _ in self._backups.values()]
+  91| 
+  92|     async def async_get_backup(
+  93|         self,
+  94|         backup_id: str,
+  95|         **kwargs: Any,
+  96|     ) -> AgentBackup:
+  97|         """Return a backup."""
+  98|         if not self._loaded_backups:
+  99|             await self._load_backups()
+ 100| 
+ 101|         if backup_id not in self._backups:
+ 102|             raise BackupNotFound(f"Backup {backup_id} not found")
+ 103| 
+ 104|         backup, backup_path = self._backups[backup_id]
+ 105|         if not await self._hass.async_add_executor_job(backup_path.exists):
+ 106|             LOGGER.debug(
+ 107|                 (
+ 108|                     "Removing tracked backup (%s) that does not exists on the expected"
+ 109|                     " path %s"
+ 110|                 ),
+ 111|                 backup.backup_id,
+ 112|                 backup_path,
+ 113|             )
+ 114|             self._backups.pop(backup_id)
+ 115|             raise BackupNotFound(f"Backup {backup_id} not found")
+ 116| 
+ 117|         return backup
+ 118| 
+ 119|     def get_backup_path(self, backup_id: str) -> Path:
+ 120|         """Return the local path to an existing backup.
+ 121| 
+ 122|         Raises BackupAgentError if the backup does not exist.
+ 123|         """
+ 124|         try:
+ 125|             return self._backups[backup_id][1]
+ 126|         except KeyError as err:
+ 127|             raise BackupNotFound(f"Backup {backup_id} does not exist") from err
+ 128| 
+ 129|     def get_new_backup_path(self, backup: AgentBackup) -> Path:
+ 130|         """Return the local path to a new backup."""
+ 131|         candidate = self._backup_dir / suggested_filename(backup)
+ 132|         # suggested_filename does not strip separators; refuse paths that would
+ 133|         # land outside the backup directory.
+ 134|         if candidate.parent != self._backup_dir:
+ 135|             raise InvalidBackupFilename(
+ 136|                 f"Refusing to write outside {self._backup_dir}: {candidate}"
+ 137|             )
+ 138|         return candidate
+ 139| 
+ 140|     async def async_delete_backup(self, backup_id: str, **kwargs: Any) -> None:
+ 141|         """Delete a backup file."""
+ 142|         if not self._loaded_backups:
+ 143|             await self._load_backups()
+ 144| 
+ 145|         backup_path = self.get_backup_path(backup_id)
+ 146|         await self._hass.async_add_executor_job(backup_path.unlink, True)
+ 147|         LOGGER.debug("Deleted backup located at %s", backup_path)
+ 148|         self._backups.pop(backup_id)
+ 149| 
+ 150| 
+
+### id=8203 lang=go
+[CODE]
+   1| package main
+   2| 
+   3| import (
+   4| 	"html/template"
+   5| 	"net/http"
+   6| 	"os"
+   7| )
+   8| 
+   9| var reportTmpl = `<!DOCTYPE html>
+  10| <html><body>
+  11| <h1>Report for {{.Name}}</h1>
+  12| {{.Body}}
+  13| </body></html>`
+  14| 
+  15| // 白名单：仅允许内置模板，禁止任何用户提供的模板源
+  16| var allowedTemplates = map[string]string{
+  17| 	"default": reportTmpl,
+  18| }
+  19| 
+  20| func renderHandler(w http.ResponseWriter, r *http.Request) {
+  21| 	name := r.URL.Query().Get("name")
+  22| 	body := r.URL.Query().Get("body")
+  23| 
+  24| 	tmplSrc := os.Getenv("REPORT_TEMPLATE")
+  25| 	if tmplSrc == "" {
+  26| 		tmplSrc = reportTmpl
+  27| 	}
+  28| 
+  29| 	// 修复：不再接受 ?template= 覆盖模板内容；
+  30| 	// 仅允许通过白名单选择预定义模板，杜绝 SSTI
+  31| 	tmplKey := r.URL.Query().Get("template")
+  32| 	if tmplKey != "" {
+  33| 		src, ok := allowedTemplates[tmplKey]
+  34| 		if !ok {
+  35| 			http.Error(w, "unknown template", http.StatusBadRequest)
+  36| 			return
+  37| 		}
+  38| 		tmplSrc = src
+  39| 	}
+  40| 
+  41| 	t, err := template.New("report").Parse(tmplSrc)
+  42| 	if err != nil {
+  43| 		http.Error(w, "invalid template", http.StatusBadRequest)
+  44| 		return
+  45| 	}
+  46| 
+  47| 	data := map[string]string{"Name": name, "Body": body}
+  48| 	if err := t.Execute(w, data); err != nil {
+  49| 		http.Error(w, "render error", http.StatusInternalServerError)
+  50| 		return
+  51| 	}
+  52| }
+  53| 
+  54| func main() {
+  55| 	http.HandleFunc("/report", renderHandler)
+  56| 	http.ListenAndServe(":8080", nil)
+  57| }
+  58| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=8163 teacher=unknown flags=[]
+[ANALYSIS]
+# 全文逐函数安全分析
+
+## 1. 模块导入与初始化（第 1–17 行）
+
+第 1–13 行仅导入标准库与 Home Assistant 内部模块（`tarfile`、`json`、`pathlib` 等），无动态导入、无 `eval/exec/pickle`、无网络库。第 17 行 `async_get_backup_agents` 是代理工厂入口：第 18 行通过 `is_hassio(hass)` 判断环境，仅在非 HassIO（Core/Container）安装时返回 `CoreLocalBackupAgent`（第 20 行）。该入口不接收用户可控参数，无数据流。
+
+## 2. `__init__`（第 23–31 行）
+
+第 29 行 `self._backup_dir = Path(hass.config.path("backups"))`，路径来自 HA 配置目录拼接固定子目录 `"backups"`，不含任何外部输入。`self._backups` 字典初始为空。此函数无 source→sink 流。
+
+## 3. `_load_backups` / `_read_backups`（第 33–51 行）
+
+- 第 35 行：通过 executor 在线程池中调用 `_read_backups`，避免阻塞事件循环。
+- 第 42 行：`self._backup_dir.glob("*.tar")` 仅枚举备份目录下 `.tar` 后缀文件；glob 模式为硬编码常量，不受用户控制。
+- 第 44 行 `read_backup(backup_path)` 是关键 sink 候选——它解析 tar 文件内容。但需注意：
+  - **source**：磁盘上的 tar 文件本身。能放置文件的攻击者已具备本地文件写权限（本地攻击前提），且这些文件正是系统自身创建的备份。
+  - **防御**：第 45–50 行用宽泛的 `except (OSError, TarError, json.JSONDecodeError, KeyError, InvalidBackupFilename)` 捕获解析失败并降级为日志告警，恶意/损坏文件不会导致崩溃或被采纳为有效备份条目（除非其元数据合法可解析）。`read_backup` 内部（util 模块）负责校验文件名合法性并抛出 `InvalidBackupFilename`，此处正确处理了该异常。
+  - 解析结果仅写入内存字典 `backups[backup.backup_id]`（第 46 行），key 为 backup_id 而非路径，后续取路径均经由字典回查。
+
+## 4. `async_download_backup`（第 53–58 行）
+
+直接 `raise NotImplementedError`（第 58 行）。Core 安装不支持下载流，无 sink。注意这同时消除了“按 backup_id 直接读任意路径文件”的通道——下载功能不存在于本 agent。
+
+## 5. `async_upload_backup`（第 60–68 行）
+
+入口点：接收 `open_stream` 回调、`AgentBackup` 对象、进度回调。第 67 行将 `(backup, self.get_new_backup_path(backup))` 写入 `self._backups` 字典。这里存在一个值得审视的点：
+
+- **潜在路径注入点**：`get_new_backup_path` 由 `suggested_filename(backup)` 生成文件名，而 `backup.backup_id` 与名称可能来自上传请求（API 层的 source）。
+- **防御验证**：见下文对 `get_new_backup_path` 的分析——第 106–110 行有显式的父目录一致性校验，拒绝逃逸出备份目录的候选路径。因此即使 `suggested_filename` 不剥离分隔符（代码注释第 105 行明确承认这一点），路径穿越也会在第 108–110 行被拦截并抛出 `InvalidBackupFilename`。
+- 另外注意：本函数只更新内存映射，实际写盘由上层 manager 完成，且写入目标已被约束在 `self._backup_dir` 内。
+
+## 6. `async_list_backups`（第 70–74 行）
+
+懒加载后返回元数据列表，无参数、无文件操作 sink。
+
+## 7. `async_get_backup`（第 76–97 行）
+
+入口参数 `backup_id`（source，来自 API 层）。数据流：
+
+1. 第 82 行：`if backup_id not in self._backups: raise BackupNotFound` —— 字典键查找，键只能来自第 46 行从真实磁盘文件解析出的 `backup.backup_id`，攻击者无法注入任意键。
+2. 第 87 行：`backup_path.exists()` 经 executor 执行，路径来自字典值而非 backup_id 拼接，**不存在由 backup_id 直达文件系统的字符串拼接**。
+3. 第 89–95 行：文件缺失时清理缓存并抛异常，逻辑一致。
+
+结论：backup_id → 路径的间接映射是闭合的，无任意文件读取。
+
+## 8. `get_backup_path`（第 99–107 行）
+
+同样经 `self._backups[backup_id][1]` 字典回查（第 104 行），KeyError 转 `BackupNotFound`。sink 是“返回路径”，但路径来源受限于 `_read_backups` 枚举结果或 `get_new_backup_path` 校验后的产物。
+
+## 9. `get_new_backup_path`（第 109–117 行）——核心防御点
+
+- 第 112 行：`candidate = self._backup_dir / suggested_filename(backup)`。注释明确指出 `suggested_filename` **不会剥离分隔符**，即若 filename 含 `../../evil.tar` 或绝对路径成分，`Path.__truediv__` 对绝对路径会直接替换整个前缀。
+- 第 113–116 行：`if candidate.parent != self._backup_dir: raise InvalidBackupFilename(...)`。这是白名单式校验而非黑名单/正则：
+  - 相对穿越 `../../x.tar` → parent 变为上级目录 → 被拒；
+  - 绝对路径 `/etc/x.tar` → parent 为 `/etc` ≠ 备份目录 → 被拒；
+  - 含 `..` 单层如 `backups/../backups/x.tar` 归一化后 parent 恰等于备份目录，落点仍在目录内，无害。
+  - 该比较基于 `Path` 语义等价性，绕过空间仅限“最终仍落在备份目录内”的等价拼写，不构成漏洞。
+
+## 10. `async_delete_backup`（第 119–129 行）
+
+入口参数 `backup_id`（source）。第 125 行 `backup_path.unlink(True)` 是删除类 sink。路径获取走 `get_backup_path`（第 124 行），即必须先存在于 `_read_backups` 枚举出的合法 `.tar` 集合中，无法构造任意路径删除。第 127 行 pop 缓存保持一致性。
+
+## 11. 第二入口与替代通道核查
+
+- **替代写入通道**：除 `get_new_backup_path` 外全文无其他路径构造点（grep 级检查：`Path(` 仅出现在第 29 行和第 112 行）。
+- **下载通道**：被 NotImplementedError 封死。
+- **HassIO 环境**：第 18 行直接返回空列表，本 agent 完全不注册。
+- **竞态条件**：上传与删除间理论上存在 TOCTOU 窗口，但影响限于备份目录内的备份文件，属低危设计权衡而非可利用漏洞。
+- **异常面**：所有解析异常均被捕获记录，无未处理崩溃导致的 DoS 面。
+
+## 总结
+
+全部 source（backup_id、上传元数据、磁盘 tar 内容）到 sink（文件读写删）的数据流均经过字典闭合映射或 Path 父目录白名单校验，黑名单式过滤不存在，未发现可利用漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文逐函数核查：backup_id 类 source 均经 _backups 字典闭合映射到路径（第 82、104、124 行），无法拼接任意路径；唯一路径构造点 get_new_backup_path（第 109-117 行）使用 candidate.parent != self._backup_dir 的白名单式校验拦截路径穿越与绝对路径注入，非黑名单不可绕过；_read_backups（第 42-50 行）仅枚举硬编码 glob *.tar 且异常全捕获；download 通道被 NotImplementedError 封死；HassIO 下 agent 不注册。未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
+
+### id=8203 teacher=unknown flags=[safe_but_cwe_in_expl]
+[ANALYSIS]
+分析：
+
+1. 第 26–27 行枚举用户可控输入点：`r.URL.Query().Get("name")`、`Get("body")`，以及第 33 行的 `Get("template")`。前两者作为数据传入模板（由 html/template 自动上下文转义），本身不构成 SSTI；真正的漏洞源是 `template` 参数。
+2. 原代码第 35–37 行将用户输入直接赋给 `tmplSrc` 并在第 41 行 `Parse(tmplSrc)` 编译执行——这是 sink：攻击者可注入 `{{printf "%s" (call .Exec ...)}}` 等模板动作实现服务端模板注入（CWE-1336）。
+3. 修复采用【白名单精确允许集】：第 17–20 行定义 `allowedTemplates` 映射，仅包含内置 `default` 模板；第 34–40 行将用户输入从“模板内容”降级为“模板键名”，只有命中白名单才取用对应内容，否则返回 400。类型正确性：映射查找保证 `tmplSrc` 只能是编译期固定的字符串常量，不可能含攻击者控制的模板语法。
+4. 位置正确性：防御位于数据进入 `Parse` 之前的唯一汇合点（第 34 行），覆盖了所有经 `?template=` 到达 sink 的路径；环境变量 `REPORT_TEMPLATE`（第 24 行）属部署侧受信配置，保持原样符合 minimal pair 要求。
+5. 攻击面覆盖完整性：即使攻击者绕过参数名大小写、重复传参或空值技巧，`allowedTemplates[tmplKey]` 精确匹配使任何未注册键都失败，不存在部分匹配或前缀绕过空间；`name`/`body` 数据流仍走 html/template 的自动转义，与原代码一致。
+6. 第二入口/替代通道检查：路由仅注册 `/report` 一个 handler（第 55 行），无其他 handler 或中间件读取 `template` 参数；`os.Getenv("REPORT_TEMPLATE")` 为运维控制面而非 HTTP 可控面，故无第二入口残留。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "原漏洞为 CWE-1336 服务端模板注入：第 33 行 r.URL.Query().Get('template') 用户可控模板内容直接流入第 41 行 template.Parse(tmplSrc) 执行；修复采用白名单精确允许集 allowedTemplates，用户输入仅作键名选择预定义模板，未命中即拒绝，模板内容永远不可被用户控制；name 与 body 数据流保持原样，由 html/template 自动上下文转义处理，非本次修复目标", "fix_suggestion": "line 33: 将 ?template= 参数改为 allowedTemplates 白名单键名查找，禁止用户提交的字符串作为模板源传入 Parse"}

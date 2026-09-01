@@ -1,0 +1,587 @@
+batch=101 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7878 lang=go
+[CODE]
+   1| package httpserver
+   2| 
+   3| import (
+   4| 	"archive/zip"
+   5| 	"bytes"
+   6| 	"errors"
+   7| 	"fmt"
+   8| 	"io"
+   9| 	"net/http"
+  10| 	"os"
+  11| 	"path/filepath"
+  12| 	"strings"
+  13| 	"time"
+  14| 
+  15| 	"goshs.de/goshs/v2/logger"
+  16| )
+  17| 
+  18| // put handles the PUT request to upload files
+  19| func (fs *FileServer) put(w http.ResponseWriter, req *http.Request) {
+  20| 	if !fs.checkCSRF(w, req) {
+  21| 		return
+  22| 	}
+  23| 	if fs.ReadOnly {
+  24| 		fs.handleError(w, req, fmt.Errorf("%s", "Upload not allowed due to 'read only' option"), http.StatusForbidden)
+  25| 		return
+  26| 	}
+  27| 	savepath, err := sanitizePath(fs.UploadFolder, req.URL.Path)
+  28| 	if err != nil {
+  29| 		fs.handleError(w, req, err, http.StatusBadRequest)
+  30| 		return
+  31| 	}
+  32| 
+  33| 	// Block overwriting the .goshs ACL file
+  34| 	if filepath.Base(savepath) == ".goshs" {
+  35| 		fs.handleError(w, req, fmt.Errorf("cannot overwrite ACL file"), http.StatusForbidden)
+  36| 		return
+  37| 	}
+  38| 
+  39| 	// Enforce .goshs ACL (recursive: walks up to webroot)
+  40| 	targetDir := filepath.Dir(savepath)
+  41| 	acl, aclErr := fs.findEffectiveACL(targetDir)
+  42| 	if aclErr != nil {
+  43| 		logger.Errorf("error reading file based access config: %+v", aclErr)
+  44| 	}
+  45| 	if ok := fs.applyCustomAuth(w, req, acl); !ok {
+  46| 		return
+  47| 	}
+  48| 
+  49| 	body, err := io.ReadAll(req.Body)
+  50| 	if err != nil {
+  51| 		logger.Errorf("unable to read PUT request body: %+v", err)
+  52| 		return
+  53| 	}
+  54| 	defer req.Body.Close()
+  55| 
+  56| 	reader := bytes.NewReader(body)
+  57| 
+  58| 	// disable G304 (CWE-22): Potential file inclusion via variable
+  59| 	// #nosec G304
+  60| 	osFile, err := os.OpenFile(savepath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+  61| 	if err != nil {
+  62| 		logger.Errorf("Error opening file: %+v", err)
+  63| 		fs.handleError(w, req, err, http.StatusInternalServerError)
+  64| 		return
+  65| 	}
+  66| 	defer osFile.Close()
+  67| 
+  68| 	if _, err := io.Copy(osFile, reader); err != nil {
+  69| 		logger.Errorf("Error writing file %s to disk: %+v", savepath, err)
+  70| 		fs.handleError(w, req, err, http.StatusInternalServerError)
+  71| 		return
+  72| 	}
+  73| 
+  74| 	// Log request
+  75| 	_ = fs.emitCollabEvent(req, http.StatusOK)
+  76| 	logger.LogRequest(req, http.StatusOK, fs.Verbose, fs.Webhook, body)
+  77| }
+  78| 
+  79| // upload handles the POST request to upload files
+  80| func (fs *FileServer) upload(w http.ResponseWriter, req *http.Request) {
+  81| 	if !fs.checkCSRF(w, req) {
+  82| 		return
+  83| 	}
+  84| 	if fs.ReadOnly {
+  85| 		fs.handleError(w, req, fmt.Errorf("%s", "Upload not allowed due to 'read only' option"), http.StatusForbidden)
+  86| 		return
+  87| 	}
+  88| 	// Derive and sanitize the target directory (strip trailing "/upload" from URL).
+  89| 	upathDir := strings.TrimSuffix(req.URL.Path, "/upload")
+  90| 	targetDir, err := sanitizePath(fs.UploadFolder, upathDir)
+  91| 	if err != nil {
+  92| 		fs.handleError(w, req, err, http.StatusBadRequest)
+  93| 		return
+  94| 	}
+  95| 
+  96| 	// Enforce .goshs ACL (recursive: walks up to webroot)
+  97| 	acl, aclErr := fs.findEffectiveACL(targetDir)
+  98| 	if aclErr != nil {
+  99| 		logger.Errorf("error reading file based access config: %+v", aclErr)
+ 100| 	}
+ 101| 	if ok := fs.applyCustomAuth(w, req, acl); !ok {
+ 102| 		return
+ 103| 	}
+ 104| 
+ 105| 	reader, err := req.MultipartReader()
+ 106| 	if err != nil {
+ 107| 		logger.Errorf("reading multipart request: %+v", err)
+ 108| 		return
+ 109| 	}
+ 110| 
+ 111| 	for {
+ 112| 		part, err := reader.NextPart()
+ 113| 		if err == io.EOF {
+ 114| 			break
+ 115| 		}
+ 116| 		if err != nil {
+ 117| 			logger.Errorf("reading multipart part: %+v", err)
+ 118| 			return
+ 119| 		}
+ 120| 		if part.FileName() == "" {
+ 121| 			continue // skip form fields
+ 122| 		}
+ 123| 
+ 124| 		// sanitize filename (No path traversal)
+ 125| 		filenameSlice := strings.Split(part.FileName(), "/")
+ 126| 		filenameClean := filenameSlice[len(filenameSlice)-1]
+ 127| 
+ 128| 		// Block overwriting the .goshs ACL file
+ 129| 		if filenameClean == ".goshs" {
+ 130| 			logger.Warnf("blocked attempt to upload file named .goshs")
+ 131| 			continue
+ 132| 		}
+ 133| 
+ 134| 		// Prepare destination file paths
+ 135| 		finalPath := filepath.Join(targetDir, filenameClean)
+ 136| 		tempPath := finalPath + "~"
+ 137| 
+ 138| 		// Create temp file
+ 139| 		dst, err := os.Create(tempPath)
+ 140| 		if err != nil {
+ 141| 			logger.Errorf("creating temp file: %+v", err)
+ 142| 			return
+ 143| 		}
+ 144| 
+ 145| 		// Write in chunks
+ 146| 		buf := make([]byte, chunkSize)
+ 147| 		var totalWritten int64
+ 148| 		for {
+ 149| 			n, readErr := part.Read(buf)
+ 150| 			if n > 0 {
+ 151| 				written, writeErr := dst.Write(buf[:n])
+ 152| 				if writeErr != nil || written != n {
+ 153| 					dst.Close()
+ 154| 					os.Remove(tempPath)
+ 155| 					logger.Errorf("writing file to disk: %+v", writeErr)
+ 156| 					return
+ 157| 				}
+ 158| 				totalWritten += int64(written)
+ 159| 			}
+ 160| 			if readErr == io.EOF {
+ 161| 				break
+ 162| 			}
+ 163| 			if readErr != nil {
+ 164| 				dst.Close()
+ 165| 				os.Remove(tempPath)
+ 166| 				logger.Errorf("reading uploaded data: %+v", readErr)
+ 167| 				return
+ 168| 			}
+ 169| 		}
+ 170| 
+ 171| 		// Ensure file is flushed and closed
+ 172| 		if err := dst.Sync(); err != nil {
+ 173| 			dst.Close()
+ 174| 			os.Remove(tempPath)
+ 175| 			logger.Errorf("syncing file: %+v", err)
+ 176| 			return
+ 177| 		}
+ 178| 		if err := dst.Close(); err != nil {
+ 179| 			os.Remove(tempPath)
+ 180| 			logger.Errorf("closing file: %+v", err)
+ 181| 			return
+ 182| 		}
+ 183| 
+ 184| 		// Atomically rename to final path
+ 185| 		if err := os.Rename(tempPath, finalPath); err != nil {
+ 186| 			logger.Errorf("renaming file: %+v", err)
+ 187| 			return
+ 188| 		}
+ 189| 
+ 190| 		// Webhook
+ 191| 		logger.HandleWebhookSend(fmt.Sprintf("[WEB] File uploaded: %s", finalPath), "upload", fs.Webhook)
+ 192| 	}
+ 193| 
+ 194| 	// Log request
+ 195| 	body := fs.emitCollabEvent(req, http.StatusOK)
+ 196| 	logger.LogRequest(req, http.StatusOK, fs.Verbose, fs.Webhook, body)
+ 197| 
+ 198| 	// Redirect back from where we came from
+ 199| 	http.Redirect(w, req, upathDir, http.StatusSeeOther)
+ 200| }
+ 201| 
+ 202| // bulkDownload will provide zip archived download bundle of multiple selected files
+ 203| func (fs *FileServer) bulkDownload(w http.ResponseWriter, req *http.Request) {
+ 204| 	if fs.UploadOnly {
+ 205| 		fs.handleError(w, req, fmt.Errorf("%s", "Bulk download not allowed due to 'upload only' option"), http.StatusForbidden)
+ 206| 		return
+ 207| 	}
+ 208| 	// make slice and query files from request
+ 209| 	var filesCleaned []string
+ 210| 	files := req.URL.Query()["file"]
+ 211| 
+ 212| 	// Handle if no files are selected
+ 213| 	if len(files) == 0 {
+ 214| 		fs.handleError(w, req, errors.New("you need to select a file before you can download a zip archive"), 404)
+ 215| 	}
+ 216| 
+ 217| 	// Validate each path and collect absolute paths; skip any traversal attempts
+ 218| 	for _, file := range files {
+ 219| 		absPath, err := sanitizePath(fs.Webroot, file)
+ 220| 		if err != nil {
+ 221| 			continue
+ 222| 		}
+ 223| 		filesCleaned = append(filesCleaned, absPath)
+ 224| 	}
+ 225| 
+ 226| 	// Construct filename to download
+ 227| 	filename := fmt.Sprintf("%d_goshs_download.zip", time.Now().Unix())
+ 228| 
+ 229| 	// Set header and serve file
+ 230| 	contentDispo := fmt.Sprintf("attachment; filename=\"%s\"", filename)
+ 231| 	w.Header().Set("Content-Type", "application/zip")
+ 232| 	w.Header().Set("Content-Disposition", contentDispo)
+ 233| 	w.Header().Set("Content-Transfer-Encoding", "binary")
+ 234| 	w.Header().Set("Expires", "0")
+ 235| 
+ 236| 	// Define Zip writer
+ 237| 	resultZip := zip.NewWriter(w)
+ 238| 	defer resultZip.Close()
+ 239| 
+ 240| 	// Path walker for recursion
+ 241| 	walker := func(filepath string, info os.FileInfo, err error) error {
+ 242| 		if err != nil {
+ 243| 			return err
+ 244| 		}
+ 245| 		if info.IsDir() {
+ 246| 			return nil
+ 247| 		}
+ 248| 
+ 249| 		// disable G304 (CWE-22): Potential file inclusion via variable
+ 250| 		// #nosec G304
+ 251| 		file, err := os.Open(filepath)
+ 252| 		if err != nil {
+ 253| 			return err
+ 254| 		}
+ 255| 		// disable G307 (CWE-703): Deferring unsafe method "Close" on type "*os.File"
+ 256| 		// #nosec G307
+ 257| 		defer file.Close()
+ 258| 
+ 259| 		// filepath is fs.Webroot + file relative path
+ 260| 		// this would result in a lot of nested folders
+ 261| 		// so we are stripping fs.Webroot again from the structure of the zip file
+ 262| 		// Leaving us with the relative path of the file
+ 263| 		zippath := strings.ReplaceAll(filepath, fs.Webroot, "")
+ 264| 		header := &zip.FileHeader{
+ 265| 			Name:     zippath[1:],
+ 266| 			Method:   zip.Deflate,
+ 267| 			Modified: info.ModTime(),
+ 268| 		}
+ 269| 		f, err := resultZip.CreateHeader(header)
+ 270| 		if err != nil {
+ 271| 			return err
+ 272| 		}
+ 273| 
+ 274| 		_, err = io.Copy(f, file)
+ 275| 		if err != nil {
+ 276| 			return err
+ 277| 		}
+ 278| 
+ 279| 		return nil
+ 280| 	}
+ 281| 
+ 282| 	// Loop over files and add to zip (filesCleaned contains validated absolute paths)
+ 283| 	for _, file := range filesCleaned {
+ 284| 		err := filepath.Walk(file, walker)
+ 285| 		if err != nil {
+ 286| 			logger.Errorf("creating zip file: %+v", err)
+ 287| 		}
+ 288| 	}
+ 289| 
+ 290| 	// Close Zip Writer and Flush to http.ResponseWriter
+ 291| 	if err := resultZip.Close(); err != nil {
+ 292| 		logger.Error(err)
+ 293| 	} else {
+ 294| 		body := fs.emitCollabEvent(req, http.StatusOK)
+ 295| 		logger.LogRequest(req, http.StatusOK, fs.Verbose, fs.Webhook, body)
+ 296| 	}
+ 297| }
+ 298| 
+ 299| 
+
+### id=7879 lang=javascript
+[CODE]
+   1| /**
+   2|  * Copyright (c) 2015-present, Facebook, Inc.
+   3|  *
+   4|  * This source code is licensed under the MIT license found in the
+   5|  * LICENSE file at
+   6|  * https://github.com/facebookincubator/create-react-app/blob/master/LICENSE
+   7|  */
+   8| 
+   9| const fs = require('fs')
+  10| const url = require('url')
+  11| const path = require('path')
+  12| const chalk = require('chalk')
+  13| const address = require('address')
+  14| 
+  15| const defaultConfig = {
+  16|   logLevel: 'silent',
+  17|   secure: false,
+  18|   changeOrigin: true,
+  19|   ws: true,
+  20|   xfwd: true
+  21| }
+  22| 
+  23| module.exports = function prepareProxy (proxy, appPublicFolder) {
+  24|   // `proxy` lets you specify alternate servers for specific requests.
+  25|   // It can either be a string or an object conforming to the Webpack dev server proxy configuration
+  26|   // https://webpack.github.io/docs/webpack-dev-server.html
+  27|   if (!proxy) {
+  28|     return undefined
+  29|   }
+  30|   if (Array.isArray(proxy) || (typeof proxy !== 'object' && typeof proxy !== 'string')) {
+  31|     console.log(
+  32|       chalk.red(
+  33|         'When specified, "proxy" in package.json must be a string or an object.'
+  34|       )
+  35|     )
+  36|     console.log(
+  37|       chalk.red('Instead, the type of "proxy" was "' + typeof proxy + '".')
+  38|     )
+  39|     console.log(
+  40|       chalk.red(
+  41|         'Either remove "proxy" from package.json, or make it an object.'
+  42|       )
+  43|     )
+  44|     process.exit(1)
+  45|   }
+  46| 
+  47|   // Otherwise, if proxy is specified, we will let it handle any request except for files in the public folder.
+  48|   function mayProxy (pathname) {
+  49|     const maybePublicPath = path.resolve(appPublicFolder, pathname.slice(1))
+  50|     return !fs.existsSync(maybePublicPath)
+  51|   }
+  52| 
+  53|   function createProxyEntry (target, usersOnProxyReq, context) {
+  54|     // #2478
+  55|     // There're a little-known use case that the `target` field is an object rather than a string
+  56|     // https://github.com/chimurai/http-proxy-middleware/blob/master/recipes/https.md
+  57|     if (typeof target === 'string' && process.platform === 'win32') {
+  58|       target = resolveLoopback(target)
+  59|     }
+  60|     return {
+  61|       target,
+  62|       context (pathname, req) {
+  63|         // is a static asset
+  64|         if (!mayProxy(pathname)) {
+  65|           return false
+  66|         }
+  67|         if (context) {
+  68|           // Explicit context, e.g. /api
+  69|           return pathname.match(context)
+  70|         } else {
+  71|           // not a static request
+  72|           if (req.method !== 'GET') {
+  73|             return true
+  74|           }
+  75|           // Heuristics: if request `accept`s text/html, we pick /index.html.
+  76|           // Modern browsers include text/html into `accept` header when navigating.
+  77|           // However API calls like `fetch()` won’t generally accept text/html.
+  78|           // If this heuristic doesn’t work well for you, use a custom `proxy` object.
+  79|           return (
+  80|             req.headers.accept &&
+  81|             req.headers.accept.indexOf('text/html') === -1
+  82|           )
+  83|         }
+  84|       },
+  85|       onProxyReq (proxyReq, req, res) {
+  86|         if (usersOnProxyReq) {
+  87|           usersOnProxyReq(proxyReq, req, res)
+  88|         }
+  89|         // Browsers may send Origin headers even with same-origin
+  90|         // requests. To prevent CORS issues, we have to change
+  91|         // the Origin to match the target URL.
+  92|         if (!proxyReq.agent && proxyReq.getHeader('origin')) {
+  93|           proxyReq.setHeader('origin', target)
+  94|         }
+  95|       },
+  96|       onError: onProxyError(target)
+  97|     }
+  98|   }
+  99| 
+ 100|   // Support proxy as a string for those who are using the simple proxy option
+ 101|   if (typeof proxy === 'string') {
+ 102|     if (!/^http(s)?:\/\//.test(proxy)) {
+ 103|       console.log(
+ 104|         chalk.red(
+ 105|           'When "proxy" is specified in package.json it must start with either http:// or https://'
+ 106|         )
+ 107|       )
+ 108|       process.exit(1)
+ 109|     }
+ 110| 
+ 111|     return [
+ 112|       Object.assign({}, defaultConfig, createProxyEntry(proxy))
+ 113|     ]
+ 114|   }
+ 115| 
+ 116|   // Otherwise, proxy is an object so create an array of proxies to pass to webpackDevServer
+ 117|   return Object.keys(proxy).map(context => {
+ 118|     const config = proxy[context]
+ 119|     if (!config.hasOwnProperty('target')) {
+ 120|       console.log(
+ 121|         chalk.red(
+ 122|           'When `proxy` in package.json is an object, each `context` object must have a ' +
+ 123|             '`target` property specified as a url string'
+ 124|         )
+ 125|       )
+ 126|       process.exit(1)
+ 127|     }
+ 128|     const entry = createProxyEntry(config.target, config.onProxyReq, context)
+ 129|     return Object.assign({}, defaultConfig, config, entry)
+ 130|   })
+ 131| }
+ 132| 
+ 133| function resolveLoopback (proxy) {
+ 134|   const o = url.parse(proxy)
+ 135|   o.host = undefined
+ 136|   if (o.hostname !== 'localhost') {
+ 137|     return proxy
+ 138|   }
+ 139|   // Unfortunately, many languages (unlike node) do not yet support IPv6.
+ 140|   // This means even though localhost resolves to ::1, the application
+ 141|   // must fall back to IPv4 (on 127.0.0.1).
+ 142|   // We can re-enable this in a few years.
+ 143|   /* try {
+ 144|     o.hostname = address.ipv6() ? '::1' : '127.0.0.1';
+ 145|   } catch (_ignored) {
+ 146|     o.hostname = '127.0.0.1';
+ 147|   }*/
+ 148| 
+ 149|   try {
+ 150|     // Check if we're on a network; if we are, chances are we can resolve
+ 151|     // localhost. Otherwise, we can just be safe and assume localhost is
+ 152|     // IPv4 for maximum compatibility.
+ 153|     if (!address.ip()) {
+ 154|       o.hostname = '127.0.0.1'
+ 155|     }
+ 156|   } catch (_ignored) {
+ 157|     o.hostname = '127.0.0.1'
+ 158|   }
+ 159|   return url.format(o)
+ 160| }
+ 161| 
+ 162| // We need to provide a custom onError function for httpProxyMiddleware.
+ 163| // It allows us to log custom error messages on the console.
+ 164| function onProxyError (proxy) {
+ 165|   return (err, req, res) => {
+ 166|     const host = req.headers && req.headers.host
+ 167|     console.log(
+ 168|       chalk.red('Proxy error:') +
+ 169|         ' Could not proxy request ' +
+ 170|         chalk.cyan(req.url) +
+ 171|         ' from ' +
+ 172|         chalk.cyan(host) +
+ 173|         ' to ' +
+ 174|         chalk.cyan(proxy) +
+ 175|         '.'
+ 176|     )
+ 177|     console.log(
+ 178|       'See https://nodejs.org/api/errors.html#errors_common_system_errors for more information (' +
+ 179|         chalk.cyan(err.code) +
+ 180|         ').'
+ 181|     )
+ 182|     console.log()
+ 183| 
+ 184|     // And immediately send the proper error response to the client.
+ 185|     // Otherwise, the request will eventually timeout with ERR_EMPTY_RESPONSE on the client side.
+ 186|     if (res.writeHead && !res.headersSent) {
+ 187|       res.writeHead(500)
+ 188|     }
+ 189|     res.end(
+ 190|       'Proxy error: Could not proxy request ' +
+ 191|         req.url +
+ 192|         ' from ' +
+ 193|         host +
+ 194|         ' to ' +
+ 195|         proxy +
+ 196|         ' (' +
+ 197|         err.code +
+ 198|         ').'
+ 199|     )
+ 200|   }
+ 201| }
+ 202| 
+ 203| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7878 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文逐函数）
+
+**1. `put`（第 17–72 行）**
+- 入口点：PUT 路由，source 为 `req.URL.Path` 与 `req.Body`。
+- 第 23 行 `sanitizePath(fs.UploadFolder, req.URL.Path)`：目标路径先经过统一净化函数处理。按 goshs 的实现，`sanitizePath` 会将路径与 UploadFolder 拼接后取绝对路径并校验仍在 webroot 内，`../` 等穿越序列会被规范化或直接报错（第 24–27 行错误即返回 400）。因此第 47 行 `os.OpenFile(savepath, ...)` 这个 sink 的路径参数是受净化的，不存在目录穿越写。
+- 第 30 行额外阻止写入 `.goshs` ACL 文件；第 36–44 行对目标目录向上递归查找 ACL 并执行自定义认证，防止越权写入受限目录。
+- Body 内容仅作为文件数据写入（io.Copy），无命令/模板 sink。
+
+**2. `upload`（第 75–160 行）**
+- 入口点：POST multipart 上传，source 为 `req.URL.Path`（第 83 行）与 `part.FileName()`。
+- 第 84–86 行同样经 `sanitizePath` 净化目标目录。
+- 第 103–105 行文件名只取 `/` 分割后的最后一段，剥离任何目录成分——Windows 反斜杠在 Linux 上只是普通字符，不构成穿越；即便含 `\` 也落在 targetDir 内部，不逃逸 webroot。
+- 第 108 行阻止覆盖 `.goshs`；第 89–97 行 ACL 递归校验 + 自定义认证。
+- 第 116 行 `filepath.Join(targetDir, filenameClean)` 中 filenameClean 已无分隔符可穿越，sink 安全。
+
+**3. `bulkDownload`（第 163–243 行）**
+- 入口点：GET 查询参数 `file`（第 169 行），可多值。
+- 第 181–185 行：每个 file 都经 `sanitizePath(fs.Webroot, file)` 校验，失败则 `continue` 跳过——穿越路径不会进入 `filesCleaned`，因此第 232 行 `filepath.Walk(file, walker)` 及 walker 内第 190 行 `os.Open(filepath)` 只会触及 webroot 内的文件。
+- 第 199 行 zip 内路径仅做字符串替换用于归档命名，不影响读取位置；zip 路径不含 `../` 前缀拼接（是剥离 webroot 后的相对路径），解压侧风险不由此函数引入。
+- 第 174–177 行空文件列表仅返回 404 错误页但未 return，属轻微逻辑瑕疵（继续执行生成空 zip），非安全漏洞。
+- 无 CSRF 检查于 bulkDownload，但下载为只读操作且需已知路径，配合 sanitizePath 不构成穿越读写。
+
+**4. 替代通道核查**：三个 handler 均独立调用 `sanitizePath`；没有其他未净化的 URL.Path / FileName → 文件 API 数据流。`#nosec G304/G307` 注释只是抑制 lint 告警，实际防御由 sanitizePath 提供，属于有效白名单式校验而非黑名单。
+
+**结论**：所有 source→sink 流均经 `sanitizePath` 规范化+边界校验，另有 `.goshs` 保护、ACL 递归强制、multipart 文件名剥离等多层防御，未发现可利用漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文三个入口: put(第23行)与upload(第85行)的目标路径均经sanitizePath(fs.UploadFolder/UploadFolder, req.URL.Path)校验, 失败即400; upload中part.FileName()在第104-105行按斜杠分割仅保留末段, 无法穿越; put第30行与upload第109行阻止覆盖.goshs ACL文件, 且两处均通过findEffectiveACL递归向上强制ACL认证; bulkDownload(第169行)的file查询参数逐个经sanitizePath(fs.Webroot, ...)校验, 失败即continue跳过, 因此第232行filepath.Walk与walker内os.Open只会访问webroot内文件。所有source到文件系统sink的数据流均有有效的路径规范化+边界校验(非黑名单), 未发现可绕过的目录穿越或任意文件读写漏洞。唯一瑕疵是bulkDownload第176行404后缺少return导致可能生成空zip, 属功能性小问题而非安全漏洞。", "fix_suggestion": "no fix needed"}
+
+### id=7879 teacher=unknown flags=[]
+[ANALYSIS]
+# 全文通读与编号分析
+
+## 入口点枚举（全文）
+
+1. **模块入口 `prepareProxy(proxy, appPublicFolder)`（第 17 行）**：`proxy` 来自项目 package.json 的配置（开发者可控，非远程攻击者直接可控）；`appPublicFolder` 为固定路径。
+2. **HTTP 请求入口（间接）**：返回的代理配置被 webpack-dev-server 使用，每个进入 dev server 的请求都会触发：
+   - `context(pathname, req)` 回调（第 44 行）——攻击者可控 `pathname`、`req.method`、`req.headers.accept`；
+   - `onProxyReq(proxyReq, req, res)`（第 62 行）——攻击者可控请求头（如 `origin`）；
+   - `onError` 回调即 `onProxyError(target)` 返回的函数（第 88 行）——攻击者可控 `req.url`、`req.headers.host`。
+3. **环境/平台通道**：第 41 行 `process.platform === 'win32'` 触发 `resolveLoopback`；无其他环境变量读取。
+
+## 逐函数数据流分析
+
+### 1. `prepareProxy`（第 17–100 行）
+- 第 19–34 行：类型校验，非法则退出。防御有效（仅影响开发者配置）。
+- 第 84–89 行：字符串型 proxy 必须匹配 `/^http(s)?:\/\//`——这是**格式校验而非安全边界**，且 source 是本地 package.json，不构成远程注入面。
+
+### 2. `mayProxy(pathname)`（第 36–40 行）
+- `path.resolve(appPublicFolder, pathname.slice(1))`：`pathname` 形如 `/..%2f..` 时，http-proxy-middleware 传入的是解码后的路径，`../` 可使 resolve 跳出 public 目录。但该函数的用途只是“判断文件是否存在以决定是否走代理”——存在目录穿越探测的可能性（通过响应差异区分文件是否存在），但仅限 dev server 本地场景，且不产生文件读取 sink。属低危信息泄露面，非本次主要结论。
+
+### 3. `createProxyEntry`（第 39–80 行）
+- 第 45–58 行 context 判断：`req.headers.accept.indexOf('text/html')` 仅是路由启发式，无 sink。
+- 第 63–67 行：将 `origin` 头改写为 `target`——`target` 来自配置，无外部拼接。
+
+### 4. `resolveLoopback`（第 103–126 行）
+- 仅处理 hostname 为 localhost 的情形，输出经 `url.format`，无注入点。
+
+### 5. `onProxyError(proxy)`（第 129–152 行）★ 关键 sink
+- **source**：第 131 行 `const host = req.headers && req.headers.host` —— HTTP `Host` 请求头，完全由客户端控制；第 132 行 `req.url` —— 客户端控制的请求 URL。
+- **sink 1（日志）**：第 133–139 行拼入 console.log —— 终端注入，低危。
+- **sink 2（HTTP 响应体）**：第 149–151 行 `res.end('Proxy error: Could not proxy request ' + req.url + ' from ' + host + ...)` —— 攻击者可通过发送带恶意 `Host` 头或恶意 URL 的请求（只要能令代理出错，例如 target 不可达），使 payload 原样回显到响应体。若错误页被浏览器渲染为 HTML（dev server 场景下 Content-Type 常为 text/html），`Host: <script>alert(1)</script>` 即构成**反射型 XSS**；同时未编码的头部内容还可能造成响应拆分风险（CWE-113）。中间没有任何 HTML 编码/校验防御。
+- **sink 3**：第 143 行 `res.writeHead(500)` 未传 statusMessage，故头注入主要落在响应体路径。
+
+## 第二入口验证
+- 替代通道：`req.url` 同样在第 137、150 行被反射，即使 Host 头被前端代理规范化，URL 路径（含 `<`、`"` 等）仍可达同一 sink，构成第二入口，证实漏洞不可通过单点过滤消除。
+
+## 结论
+全文唯一确认的 source→sink 无防御数据流是：客户端可控的 `Host` 头 / `req.url`（第 131–132 行）→ 字符串拼接 → `res.end`（第 150 行）响应体，无任何转义，形成反射型 XSS / 响应注入。这是 create-react-app 的已知问题类别（dev server 错误页反射）。其余路径（package.json 配置、loopback 处理）均为开发者本地输入，不构成远程可利用面。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-79 Cross-site Scripting (XSS) / CWE-113 响应注入", "risk_level": "Medium", "source": "line 166: req.headers.host 与 req.url 由客户端请求完全控制", "sink": "line 149-151: res.end 直接字符串拼接 req.url 与 host 写入 HTTP 响应体", "explanation": "攻击者向 dev server 发送携带恶意 Host 头或含 HTML 元素的 URL 的请求并令代理出错(如 target 不可达) -> onProxyError 被回调 -> 第 150 行将未编码的 host 与 req.url 拼接进 500 错误响应体 -> 浏览器按 text/html 渲染时执行脚本; 第二入口: req.url 在第 137 与 150 行均被反射, 无法靠单一过滤消除; 全文无任何 HTML 编码或白名单校验", "fix_suggestion": "line 149-151: 对 req.url 与 host 做 HTML 实体编码后再拼接, 或改为 res.end(JSON.stringify({error: err.code})) 等结构化输出并设置 Content-Type 为 application/json"}

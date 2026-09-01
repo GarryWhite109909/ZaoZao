@@ -1,0 +1,1092 @@
+batch=185 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=8100 lang=python
+[CODE]
+   1| # -*- mode:python; coding:utf-8 -*-
+   2| 
+   3| # Copyright (c) 2026 The OSCAL Compass Authors.
+   4| #
+   5| # Licensed under the Apache License, Version 2.0 (the "License");
+   6| # you may not use this file except in compliance with the License.
+   7| # You may obtain a copy of the License at
+   8| #
+   9| #     https://www.apache.org/licenses/LICENSE-2.0
+  10| #
+  11| # Unless required by applicable law or agreed to in writing, software
+  12| # distributed under the License is distributed on an "AS IS" BASIS,
+  13| # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  14| # See the License for the specific language governing permissions and
+  15| # limitations under the License.
+  16| """
+  17| Security validation utilities for remote fetching operations.
+  18| 
+  19| This module provides security controls to prevent SSRF, path traversal,
+  20| and arbitrary file access vulnerabilities.
+  21| """
+  22| 
+  23| import ipaddress
+  24| import logging
+  25| import os
+  26| import pathlib
+  27| import socket
+  28| from typing import Optional, Set
+  29| from urllib import parse
+  30| 
+  31| from trestle.common.err import TrestleError
+  32| 
+  33| 
+  34| def get_block_private_ips_config() -> bool:
+  35|     """Get the TRESTLE_BLOCK_PRIVATE_IPS configuration from environment.
+  36| 
+  37|     Returns:
+  38|         True if private IPs should be blocked, False otherwise (default).
+  39| 
+  40|     The environment variable can be set to:
+  41|     - 'true', '1', 'yes', 'on' (case-insensitive) to enable blocking
+  42|     - Any other value or unset to disable blocking (allow private IPs)
+  43|     """
+  44|     env_value = os.environ.get('TRESTLE_BLOCK_PRIVATE_IPS', '').lower()
+  45|     return env_value in ('true', '1', 'yes', 'on')
+  46| 
+  47| 
+  48| logger = logging.getLogger(__name__)
+  49| 
+  50| # Always blocked - zero legitimate use for OSCAL fetching
+  51| # These ranges are blocked regardless of configuration
+  52| ALWAYS_BLOCKED_NETWORKS = [
+  53|     ipaddress.ip_network('127.0.0.0/8'),  # Loopback
+  54|     ipaddress.ip_network('::1/128'),  # IPv6 loopback
+  55|     ipaddress.ip_network('169.254.0.0/16'),  # Link-local (includes metadata endpoints)
+  56|     ipaddress.ip_network('fe80::/10'),  # IPv6 link-local
+  57| ]
+  58| 
+  59| # RFC 1918 private ranges - optionally blocked based on configuration
+  60| # These are allowed by default to support private GitLab/internal OSCAL repositories
+  61| PRIVATE_IP_NETWORKS = [
+  62|     ipaddress.ip_network('10.0.0.0/8'),
+  63|     ipaddress.ip_network('172.16.0.0/12'),
+  64|     ipaddress.ip_network('192.168.0.0/16'),
+  65|     ipaddress.ip_network('fc00::/7'),  # IPv6 unique local
+  66| ]
+  67| 
+  68| # Cloud metadata endpoints that should be blocked
+  69| # These are always blocked regardless of configuration
+  70| METADATA_HOSTNAMES = {
+  71|     '169.254.169.254',  # AWS, Azure, GCP
+  72|     'metadata.google.internal',  # GCP
+  73|     'metadata.azure.com',  # Azure (alternative)
+  74|     '100.100.100.200',  # Alibaba Cloud
+  75| }
+  76| 
+  77| 
+  78| class URLSecurityValidator:
+  79|     """Validates URLs to prevent SSRF attacks.
+  80| 
+  81|     Implements two-tiered SSRF protection:
+  82|     1. Always blocked: loopback, link-local, and cloud metadata endpoints
+  83|     2. Optionally blocked: RFC 1918 private ranges (configurable via block_private_ips)
+  84|     """
+  85| 
+  86|     def __init__(self, block_private_ips: bool = False, allowed_domains: Optional[Set[str]] = None):
+  87|         """Initialize URL security validator.
+  88| 
+  89|         Args:
+  90|             block_private_ips: If True, block RFC 1918 private IP ranges (default: False).
+  91|                               Always-blocked ranges (loopback, link-local, metadata) are blocked regardless.
+  92|             allowed_domains: Optional set of allowed domain names. If provided, only these domains are allowed.
+  93|         """
+  94|         self.block_private_ips = block_private_ips
+  95|         self.allowed_domains = allowed_domains
+  96| 
+  97|     def validate_url(self, url: str) -> None:
+  98|         """Validate a URL for security issues.
+  99| 
+ 100|         This method resolves the hostname and validates all resolved IPs to prevent SSRF attacks.
+ 101| 
+ 102|         To mitigate DNS rebinding attacks, this validation is called both at initialization and
+ 103|         immediately before each fetch operation, minimizing the TOCTOU window.
+ 104| 
+ 105|         Args:
+ 106|             url: The URL to validate
+ 107| 
+ 108|         Raises:
+ 109|             TrestleError: If the URL is deemed unsafe
+ 110|         """
+ 111|         parsed = self._parse_and_validate_url(url)
+ 112|         # hostname is guaranteed to be non-None by _parse_and_validate_url
+ 113|         hostname = parsed.hostname.lower()  # type: ignore
+ 114| 
+ 115|         self._check_metadata_endpoints(hostname)
+ 116|         self._check_domain_allowlist(hostname)
+ 117| 
+ 118|         ip_addresses = self._resolve_hostname(hostname)
+ 119| 
+ 120|         for ip_str in ip_addresses:
+ 121|             ip_addr = self._parse_ip_address(ip_str, hostname)
+ 122|             self._check_blocked_networks(ip_addr, hostname)
+ 123|             self._check_private_networks(ip_addr, hostname)
+ 124| 
+ 125|         self._check_suspicious_ports(parsed, url)
+ 126| 
+ 127|     def _parse_and_validate_url(self, url: str) -> parse.ParseResult:
+ 128|         """Parse and validate basic URL structure."""
+ 129|         try:
+ 130|             parsed = parse.urlparse(url)
+ 131|         except Exception as e:
+ 132|             raise TrestleError(f'Invalid URL format: {url}') from e
+ 133| 
+ 134|         if not parsed.scheme or not parsed.hostname:
+ 135|             raise TrestleError(f'URL must include scheme and hostname: {url}')
+ 136| 
+ 137|         if parsed.scheme not in ['https', 'sftp']:
+ 138|             raise TrestleError(f'Only HTTPS or SFTP schemes are allowed for remote URLs, got: {parsed.scheme}')
+ 139| 
+ 140|         return parsed
+ 141| 
+ 142|     def _check_metadata_endpoints(self, hostname: str) -> None:
+ 143|         """Check if hostname is a blocked metadata endpoint."""
+ 144|         if hostname in METADATA_HOSTNAMES:
+ 145|             raise TrestleError(
+ 146|                 f'Access to cloud metadata endpoints is not allowed: {hostname}. '
+ 147|                 'This is a security restriction to prevent SSRF attacks.'
+ 148|             )
+ 149| 
+ 150|     def _check_domain_allowlist(self, hostname: str) -> None:
+ 151|         """Check if hostname is in the allowed domains list."""
+ 152|         if self.allowed_domains is not None:
+ 153|             if hostname not in self.allowed_domains:
+ 154|                 raise TrestleError(
+ 155|                     f'Domain {hostname} is not in the allowed domains list. '
+ 156|                     f'Allowed domains: {", ".join(sorted(self.allowed_domains))}'
+ 157|                 )
+ 158| 
+ 159|     def _resolve_hostname(self, hostname: str) -> list:
+ 160|         """Resolve hostname to IP addresses."""
+ 161|         try:
+ 162|             addr_info = socket.getaddrinfo(hostname, None)
+ 163|             ip_addresses = [str(info[4][0]) for info in addr_info]
+ 164|         except socket.gaierror as e:
+ 165|             raise TrestleError(f'Unable to resolve hostname {hostname}: {e}') from e
+ 166| 
+ 167|         if not ip_addresses:
+ 168|             raise TrestleError(f'No IP addresses resolved for hostname {hostname}')
+ 169| 
+ 170|         return ip_addresses
+ 171| 
+ 172|     def _parse_ip_address(self, ip_str: str, hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+ 173|         """Parse IP address string."""
+ 174|         try:
+ 175|             return ipaddress.ip_address(ip_str)
+ 176|         except ValueError as e:
+ 177|             raise TrestleError(f'Invalid IP address {ip_str} for hostname {hostname}: {e}') from e
+ 178| 
+ 179|     def _check_blocked_networks(self, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address, hostname: str) -> None:
+ 180|         """Check if IP is in always-blocked networks (Tier 1)."""
+ 181|         for network in ALWAYS_BLOCKED_NETWORKS:
+ 182|             if ip_addr in network:
+ 183|                 raise TrestleError(
+ 184|                     f'Access to {network} addresses is blocked: {hostname} resolves to {ip_addr}. '
+ 185|                     f'This range includes loopback, link-local, and cloud metadata endpoints. '
+ 186|                     f'This is a security restriction to prevent SSRF attacks.'
+ 187|                 )
+ 188| 
+ 189|     def _check_private_networks(self, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address, hostname: str) -> None:
+ 190|         """Check if IP is in private networks (Tier 2)."""
+ 191|         if self.block_private_ips:
+ 192|             self._block_private_ip(ip_addr, hostname)
+ 193|         else:
+ 194|             self._warn_private_ip(ip_addr, hostname)
+ 195| 
+ 196|     def _block_private_ip(self, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address, hostname: str) -> None:
+ 197|         """Block access to private IP addresses when configured."""
+ 198|         for network in PRIVATE_IP_NETWORKS:
+ 199|             if ip_addr in network:
+ 200|                 raise TrestleError(
+ 201|                     f'Access to private IP addresses is blocked: {hostname} resolves to {ip_addr} '
+ 202|                     f'which is in private network {network}. '
+ 203|                     f'This is blocked because TRESTLE_BLOCK_PRIVATE_IPS is enabled. '
+ 204|                     f'To allow access to private networks, unset this environment variable.'
+ 205|                 )
+ 206| 
+ 207|     def _warn_private_ip(self, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address, hostname: str) -> None:
+ 208|         """Log warning when accessing private IP addresses."""
+ 209|         for network in PRIVATE_IP_NETWORKS:
+ 210|             if ip_addr in network:
+ 211|                 logger.warning(
+ 212|                     f'Accessing private IP address: {hostname} resolves to {ip_addr} in network {network}. '
+ 213|                     f'This is allowed by default to support private GitLab/internal OSCAL repositories. '
+ 214|                     f'To block private IPs, set TRESTLE_BLOCK_PRIVATE_IPS=true.'
+ 215|                 )
+ 216|                 break  # Only log once per IP
+ 217| 
+ 218|     def _check_suspicious_ports(self, parsed: parse.ParseResult, url: str) -> None:
+ 219|         """Check for non-standard ports."""
+ 220|         if parsed.port is not None:
+ 221|             if (
+ 222|                 parsed.scheme == 'https'
+ 223|                 and parsed.port not in [443]
+ 224|                 or parsed.scheme == 'sftp'
+ 225|                 and parsed.port not in [22]
+ 226|             ):
+ 227|                 logger.warning(
+ 228|                     f'Non-standard port {parsed.port} detected in URL {url}. This may indicate a security risk.'
+ 229|                 )
+ 230| 
+ 231| 
+ 232| class PathSecurityValidator:
+ 233|     """Validator for ensuring file paths remain within allowed boundaries."""
+ 234| 
+ 235|     @staticmethod
+ 236|     def validate_url_path_for_cache(url_path: str) -> None:
+ 237|         """
+ 238|         Validate a URL path component to prevent path traversal attacks.
+ 239| 
+ 240|         Detects path traversal attempts (..) and raises an exception to block the attack.
+ 241|         This prevents directory traversal attacks when constructing cache file paths.
+ 242| 
+ 243|         Args:
+ 244|             url_path: The path component from a URL (e.g., from urlparse().path)
+ 245| 
+ 246|         Raises:
+ 247|             TrestleError: If path contains traversal sequences (..)
+ 248| 
+ 249|         Example:
+ 250|             >>> PathSecurityValidator.validate_url_path_for_cache('/normal/path.json')  # No exception
+ 251|             >>> PathSecurityValidator.validate_url_path_for_cache('/../../../etc/passwd')  # Raises TrestleError
+ 252|         """
+ 253|         # Check for path traversal sequences
+ 254|         if '..' in url_path:
+ 255|             raise TrestleError(
+ 256|                 f'Security violation: Path traversal blocked. '
+ 257|                 f'URL path "{url_path}" contains ".." sequences which could '
+ 258|                 f'allow writing files outside the cache directory.'
+ 259|             )
+ 260| 
+ 261|     @staticmethod
+ 262|     def validate_cache_path(cache_path: pathlib.Path, cache_root: pathlib.Path) -> None:
+ 263|         """
+ 264|         Validate that a cache file path stays within the cache directory.
+ 265| 
+ 266|         Uses path resolution and relative_to() to ensure the resolved cache path
+ 267|         is actually within the cache root directory, preventing path traversal attacks.
+ 268| 
+ 269|         Args:
+ 270|             cache_path: The proposed cache file path to validate
+ 271|             cache_root: The root cache directory that must contain the cache_path
+ 272| 
+ 273|         Raises:
+ 274|             TrestleError: If cache_path resolves outside cache_root
+ 275| 
+ 276|         Example:
+ 277|             >>> cache_root = pathlib.Path('/home/user/.trestle/cache')
+ 278|             >>> cache_path = cache_root / 'evil.com' / '..' / '..' / 'etc' / 'passwd'
+ 279|             >>> validate_cache_path(cache_path, cache_root)  # Raises TrestleError
+ 280|         """
+ 281|         # Resolve both paths to absolute, normalized paths
+ 282|         resolved_cache = cache_path.resolve()
+ 283|         resolved_root = cache_root.resolve()
+ 284| 
+ 285|         try:
+ 286|             # Check if cache path is relative to (within) cache root
+ 287|             resolved_cache.relative_to(resolved_root)
+ 288| 
+ 289|         except ValueError as e:
+ 290|             # relative_to() raises ValueError if path is not relative to root
+ 291|             raise TrestleError(
+ 292|                 f'Security violation: Cache path traversal blocked. '
+ 293|                 f'Attempted to write to "{resolved_cache}" which is outside '
+ 294|                 f'the cache directory "{resolved_root}"'
+ 295|             ) from e
+ 296|         except Exception as e:
+ 297|             raise TrestleError(f'Error validating cache path "{cache_path}": {e}') from e
+ 298| 
+ 299|     @staticmethod
+ 300|     def validate_trestle_uri_path(uri_path: str) -> None:
+ 301|         """
+ 302|         Validate a trestle:// URI path component to prevent path traversal attacks.
+ 303| 
+ 304|         Detects path traversal attempts (..) in trestle:// URIs and raises an exception.
+ 305|         This prevents directory traversal when resolving trestle:// references.
+ 306| 
+ 307|         Args:
+ 308|             uri_path: The path component after 'trestle://' prefix
+ 309| 
+ 310|         Raises:
+ 311|             TrestleError: If path contains traversal sequences (..)
+ 312| 
+ 313|         Example:
+ 314|             >>> PathSecurityValidator.validate_trestle_uri_path('catalogs/nist/catalog.json')  # No exception
+ 315|             >>> PathSecurityValidator.validate_trestle_uri_path('../../etc/passwd')  # Raises TrestleError
+ 316|         """
+ 317|         # Check for path traversal sequences
+ 318|         if '..' in uri_path:
+ 319|             raise TrestleError(
+ 320|                 f'Security violation: Path traversal blocked in trestle:// URI. '
+ 321|                 f'URI path "{uri_path}" contains ".." sequences which could '
+ 322|                 f'allow reading files outside the trestle workspace.'
+ 323|             )
+ 324| 
+ 325|     @staticmethod
+ 326|     def validate_local_path(local_path: pathlib.Path, trestle_root: pathlib.Path) -> None:
+ 327|         """
+ 328|         Validate that a local file path stays within the trestle workspace.
+ 329| 
+ 330|         Uses path resolution and is_relative_to() to ensure the resolved local path
+ 331|         is actually within the trestle root directory, preventing path traversal attacks.
+ 332| 
+ 333|         Args:
+ 334|             local_path: The proposed local file path to validate
+ 335|             trestle_root: The trestle root directory that must contain the local_path
+ 336| 
+ 337|         Raises:
+ 338|             TrestleError: If local_path resolves outside trestle_root
+ 339| 
+ 340|         Example:
+ 341|             >>> trestle_root = pathlib.Path('/home/user/trestle-workspace')
+ 342|             >>> local_path = trestle_root / 'catalogs' / '..' / '..' / 'etc' / 'passwd'
+ 343|             >>> validate_local_path(local_path, trestle_root)  # Raises TrestleError
+ 344|         """
+ 345|         # Resolve both paths to absolute, normalized paths
+ 346|         resolved_local = local_path.resolve()
+ 347|         resolved_root = trestle_root.resolve()
+ 348| 
+ 349|         try:
+ 350|             # Check if local path is relative to (within) trestle root
+ 351|             resolved_local.relative_to(resolved_root)
+ 352| 
+ 353|         except ValueError as e:
+ 354|             # relative_to() raises ValueError if path is not relative to root
+ 355|             raise TrestleError(
+ 356|                 f'Security violation: Path traversal blocked. '
+ 357|                 f'Attempted to access "{resolved_local}" which is outside '
+ 358|                 f'the trestle workspace "{resolved_root}"'
+ 359|             ) from e
+ 360|         except Exception as e:
+ 361|             raise TrestleError(f'Error validating local path "{local_path}": {e}') from e
+ 362| 
+ 363|     @staticmethod
+ 364|     def validate_local_file_path(
+ 365|         workspace_root: pathlib.Path, file_path: pathlib.Path, allow_outside_workspace: bool = False
+ 366|     ) -> None:
+ 367|         """Validate that a local file path is safe to access.
+ 368| 
+ 369|         This method provides defense-in-depth protection against arbitrary file access
+ 370|         by validating both workspace boundaries and blocking known sensitive system files.
+ 371| 
+ 372|         Args:
+ 373|             workspace_root: The trestle workspace root directory
+ 374|             file_path: The file path to validate
+ 375|             allow_outside_workspace: If True, allow access to files outside workspace (default: False)
+ 376| 
+ 377|         Raises:
+ 378|             TrestleError: If the path is deemed unsafe
+ 379| 
+ 380|         Example:
+ 381|             >>> workspace = pathlib.Path('/home/user/trestle-workspace')
+ 382|             >>> file_path = pathlib.Path('/etc/passwd')
+ 383|             >>> validate_local_file_path(workspace, file_path, allow_outside_workspace=False)
+ 384|             # Raises TrestleError: Access to files outside workspace not allowed
+ 385|             >>> validate_local_file_path(workspace, file_path, allow_outside_workspace=True)
+ 386|             # Raises TrestleError: Attempt to access sensitive system file
+ 387|         """
+ 388|         resolved_workspace = workspace_root.resolve()
+ 389|         resolved_file = file_path.resolve()
+ 390| 
+ 391|         try:
+ 392|             if not allow_outside_workspace:
+ 393|                 # Ensure file is within workspace
+ 394|                 resolved_file.relative_to(resolved_workspace)
+ 395|         except ValueError as e:
+ 396|             if not allow_outside_workspace:
+ 397|                 raise TrestleError(
+ 398|                     f'Access to files outside the trestle workspace is not allowed: {file_path}. '
+ 399|                     'This is a security restriction to prevent arbitrary file access.'
+ 400|                 ) from e
+ 401| 
+ 402|         # Additional checks for sensitive system files
+ 403|         # This provides defense-in-depth even when allow_outside_workspace=True
+ 404|         # Comprehensive list covering Linux, macOS, and Windows
+ 405|         sensitive_paths = [
+ 406|             # Linux/Unix system files
+ 407|             '/etc/passwd',
+ 408|             '/etc/shadow',
+ 409|             '/etc/group',
+ 410|             '/etc/gshadow',
+ 411|             '/etc/sudoers',
+ 412|             '/etc/hosts',
+ 413|             '/etc/ssh',
+ 414|             '/etc/ssl',
+ 415|             '/etc/pki',
+ 416|             '/etc/security',
+ 417|             '/proc/self/environ',
+ 418|             '/proc/self/cmdline',
+ 419|             '/proc/self/maps',
+ 420|             '/sys/class/net',
+ 421|             # User credential files (Linux/macOS)
+ 422|             '/.ssh',
+ 423|             '/.aws',
+ 424|             '/.gnupg',
+ 425|             '/.docker',
+ 426|             '/.kube',
+ 427|             '/.config/gcloud',
+ 428|             '/root/.ssh',
+ 429|             '/root/.aws',
+ 430|             '/root/.gnupg',
+ 431|             # macOS specific
+ 432|             '/Library/Keychains',
+ 433|             '/Library/',  # Broad but catches user home directories
+ 434|             # Windows system directories
+ 435|             'C:\\Windows\\System32',
+ 436|             'C:\\Windows\\SysWOW64',
+ 437|             'C:\\Windows\\System',
+ 438|             'C:\\Windows\\security',
+ 439|             'C:\\ProgramData\\Microsoft\\Crypto',
+ 440|             # Windows credential files
+ 441|             '\\AppData\\Local\\Microsoft\\Credentials',
+ 442|             '\\AppData\\Roaming\\Microsoft\\Credentials',
+ 443|             '\\AppData\\Local\\Microsoft\\Vault',
+ 444|             # Common sensitive config locations
+ 445|             '/var/log',
+ 446|             '/var/run',
+ 447|             'C:\\Windows\\Logs',
+ 448|             # Database files
+ 449|             '/var/lib/mysql',
+ 450|             '/var/lib/postgresql',
+ 451|             'C:\\Program Files\\MySQL',
+ 452|             'C:\\Program Files\\PostgreSQL',
+ 453|         ]
+ 454| 
+ 455|         # Check if the resolved path contains any sensitive patterns
+ 456|         # Use both the original path and resolved path for checking
+ 457|         file_str = str(resolved_file).lower()
+ 458|         original_str = str(file_path).lower()
+ 459| 
+ 460|         for sensitive in sensitive_paths:
+ 461|             sensitive_lower = sensitive.lower()
+ 462|             # Check both original and resolved paths
+ 463|             if sensitive_lower in file_str or sensitive_lower in original_str:
+ 464|                 raise TrestleError(
+ 465|                     f'Attempt to access potentially sensitive system file: {file_path}. '
+ 466|                     'This may indicate a security issue.'
+ 467|                 )
+ 468| 
+ 469| 
+ 470| # Made with Bob
+ 471| 
+ 472| 
+
+### id=8101 lang=python
+[CODE]
+   1| # -*- mode:python; coding:utf-8 -*-
+   2| 
+   3| # Copyright (c) 2026 The OSCAL Compass Authors.
+   4| #
+   5| # Licensed under the Apache License, Version 2.0 (the "License");
+   6| # you may not use this file except in compliance with the License.
+   7| # You may obtain a copy of the License at
+   8| #
+   9| #     https://www.apache.org/licenses/LICENSE-2.0
+  10| #
+  11| # Unless required by applicable law or agreed to in writing, software
+  12| # distributed under the License is distributed on an "AS IS" BASIS,
+  13| # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  14| # See the License for the specific language governing permissions and
+  15| # limitations under the License.
+  16| """
+  17| Security validation utilities for remote fetching operations.
+  18| 
+  19| This module provides security controls to prevent SSRF, path traversal,
+  20| and arbitrary file access vulnerabilities.
+  21| """
+  22| 
+  23| import ipaddress
+  24| import logging
+  25| import os
+  26| import pathlib
+  27| import socket
+  28| from typing import Optional, Set
+  29| from urllib import parse
+  30| 
+  31| from trestle.common.err import TrestleError
+  32| 
+  33| 
+  34| def get_block_private_ips_config() -> bool:
+  35|     """Get the TRESTLE_BLOCK_PRIVATE_IPS configuration from environment.
+  36| 
+  37|     Returns:
+  38|         True if private IPs should be blocked, False otherwise (default).
+  39| 
+  40|     The environment variable can be set to:
+  41|     - 'true', '1', 'yes', 'on' (case-insensitive) to enable blocking
+  42|     - Any other value or unset to disable blocking (allow private IPs)
+  43|     """
+  44|     env_value = os.environ.get('TRESTLE_BLOCK_PRIVATE_IPS', '').lower()
+  45|     return env_value in ('true', '1', 'yes', 'on')
+  46| 
+  47| 
+  48| logger = logging.getLogger(__name__)
+  49| 
+  50| # Always blocked - zero legitimate use for OSCAL fetching
+  51| # These ranges are blocked regardless of configuration
+  52| ALWAYS_BLOCKED_NETWORKS = [
+  53|     ipaddress.ip_network('127.0.0.0/8'),  # IPv4 loopback
+  54|     ipaddress.ip_network('::1/128'),  # IPv6 loopback
+  55|     ipaddress.ip_network('169.254.0.0/16'),  # IPv4 link-local (includes metadata endpoints)
+  56|     ipaddress.ip_network('fe80::/10'),  # IPv6 link-local
+  57|     ipaddress.ip_network('0.0.0.0/8'),  # IPv4 "this network", reaches localhost on Linux
+  58|     ipaddress.ip_network('::/128'),  # IPv6 unspecified address
+  59| ]
+  60| 
+  61| # RFC 1918 private ranges - optionally blocked based on configuration
+  62| # These are allowed by default to support private GitLab/internal OSCAL repositories
+  63| PRIVATE_IP_NETWORKS = [
+  64|     ipaddress.ip_network('10.0.0.0/8'),
+  65|     ipaddress.ip_network('172.16.0.0/12'),
+  66|     ipaddress.ip_network('192.168.0.0/16'),
+  67|     ipaddress.ip_network('fc00::/7'),  # IPv6 unique local
+  68| ]
+  69| 
+  70| # Cloud metadata endpoints that should be blocked
+  71| # These are always blocked regardless of configuration
+  72| METADATA_HOSTNAMES = {
+  73|     '169.254.169.254',  # AWS, Azure, GCP
+  74|     'metadata.google.internal',  # GCP
+  75|     'metadata.azure.com',  # Azure (alternative)
+  76|     '100.100.100.200',  # Alibaba Cloud
+  77| }
+  78| 
+  79| 
+  80| class URLSecurityValidator:
+  81|     """Validates URLs to prevent SSRF attacks.
+  82| 
+  83|     Implements two-tiered SSRF protection:
+  84|     1. Always blocked: loopback, link-local, and cloud metadata endpoints
+  85|     2. Optionally blocked: RFC 1918 private ranges (configurable via block_private_ips)
+  86|     """
+  87| 
+  88|     def __init__(self, block_private_ips: bool = False, allowed_domains: Optional[Set[str]] = None):
+  89|         """Initialize URL security validator.
+  90| 
+  91|         Args:
+  92|             block_private_ips: If True, block RFC 1918 private IP ranges (default: False).
+  93|                               Always-blocked ranges (loopback, link-local, metadata) are blocked regardless.
+  94|             allowed_domains: Optional set of allowed domain names. If provided, only these domains are allowed.
+  95|         """
+  96|         self.block_private_ips = block_private_ips
+  97|         self.allowed_domains = allowed_domains
+  98| 
+  99|     def validate_url(self, url: str) -> None:
+ 100|         """Validate a URL for security issues.
+ 101| 
+ 102|         This method resolves the hostname and validates all resolved IPs to prevent SSRF attacks.
+ 103| 
+ 104|         To mitigate DNS rebinding attacks, this validation is called both at initialization and
+ 105|         immediately before each fetch operation, minimizing the TOCTOU window.
+ 106| 
+ 107|         Args:
+ 108|             url: The URL to validate
+ 109| 
+ 110|         Raises:
+ 111|             TrestleError: If the URL is deemed unsafe
+ 112|         """
+ 113|         parsed = self._parse_and_validate_url(url)
+ 114|         # hostname is guaranteed to be non-None by _parse_and_validate_url
+ 115|         hostname = parsed.hostname.lower()  # type: ignore
+ 116| 
+ 117|         self._check_metadata_endpoints(hostname)
+ 118|         self._check_domain_allowlist(hostname)
+ 119| 
+ 120|         ip_addresses = self._resolve_hostname(hostname)
+ 121| 
+ 122|         for ip_str in ip_addresses:
+ 123|             ip_addr = self._parse_ip_address(ip_str, hostname)
+ 124|             # Canonicalize IPv4-mapped IPv6 addresses before validation
+ 125|             ip_addr = self._canonicalize_ip(ip_addr)
+ 126|             self._check_blocked_networks(ip_addr, hostname)
+ 127|             self._check_private_networks(ip_addr, hostname)
+ 128| 
+ 129|         self._check_suspicious_ports(parsed, url)
+ 130| 
+ 131|     def _canonicalize_ip(
+ 132|         self, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address
+ 133|     ) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+ 134|         """Canonicalize IPv4-mapped IPv6 addresses to their IPv4 form.
+ 135| 
+ 136|         IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) are converted to their canonical
+ 137|         IPv4 form to ensure consistent validation against IPv4 network ranges.
+ 138| 
+ 139|         Args:
+ 140|             ip_addr: The IP address to canonicalize
+ 141| 
+ 142|         Returns:
+ 143|             The canonical IP address (IPv4 if it was IPv4-mapped IPv6, otherwise unchanged)
+ 144|         """
+ 145|         if isinstance(ip_addr, ipaddress.IPv6Address) and ip_addr.ipv4_mapped is not None:
+ 146|             return ip_addr.ipv4_mapped
+ 147|         return ip_addr
+ 148| 
+ 149|     def _parse_and_validate_url(self, url: str) -> parse.ParseResult:
+ 150|         """Parse and validate basic URL structure."""
+ 151|         try:
+ 152|             parsed = parse.urlparse(url)
+ 153|         except Exception as e:
+ 154|             raise TrestleError(f'Invalid URL format: {url}') from e
+ 155| 
+ 156|         if not parsed.scheme or not parsed.hostname:
+ 157|             raise TrestleError(f'URL must include scheme and hostname: {url}')
+ 158| 
+ 159|         if parsed.scheme not in ['https', 'sftp']:
+ 160|             raise TrestleError(f'Only HTTPS or SFTP schemes are allowed for remote URLs, got: {parsed.scheme}')
+ 161| 
+ 162|         return parsed
+ 163| 
+ 164|     def _check_metadata_endpoints(self, hostname: str) -> None:
+ 165|         """Check if hostname is a blocked metadata endpoint.
+ 166| 
+ 167|         Canonicalizes bracketed IPv6 literal hostnames to handle IPv4-mapped
+ 168|         IPv6 addresses (e.g., [::ffff:169.254.169.254]) before checking.
+ 169| 
+ 170|         Note: This method is for URL-literal hostnames only (i.e., when the hostname
+ 171|         in the URL itself is an IPv6 literal). DNS-resolved IPs are canonicalized
+ 172|         upstream in validate_url via _canonicalize_ip before hostname-level checks.
+ 173|         """
+ 174|         # Canonicalize bracketed IPv6 literal hostnames
+ 175|         canonical = hostname.strip('[]')
+ 176|         try:
+ 177|             canonical_ip = ipaddress.ip_address(canonical)
+ 178|             if isinstance(canonical_ip, ipaddress.IPv6Address) and canonical_ip.ipv4_mapped:
+ 179|                 canonical = str(canonical_ip.ipv4_mapped)
+ 180|         except ValueError:
+ 181|             # Not an IP literal, use original hostname
+ 182|             canonical = hostname
+ 183| 
+ 184|         if canonical in METADATA_HOSTNAMES:
+ 185|             raise TrestleError(
+ 186|                 f'Access to cloud metadata endpoints is not allowed: {hostname}. '
+ 187|                 'This is a security restriction to prevent SSRF attacks.'
+ 188|             )
+ 189| 
+ 190|     def _check_domain_allowlist(self, hostname: str) -> None:
+ 191|         """Check if hostname is in the allowed domains list."""
+ 192|         if self.allowed_domains is not None:
+ 193|             if hostname not in self.allowed_domains:
+ 194|                 raise TrestleError(
+ 195|                     f'Domain {hostname} is not in the allowed domains list. '
+ 196|                     f'Allowed domains: {", ".join(sorted(self.allowed_domains))}'
+ 197|                 )
+ 198| 
+ 199|     def _resolve_hostname(self, hostname: str) -> list:
+ 200|         """Resolve hostname to IP addresses."""
+ 201|         try:
+ 202|             addr_info = socket.getaddrinfo(hostname, None)
+ 203|             ip_addresses = [str(info[4][0]) for info in addr_info]
+ 204|         except socket.gaierror as e:
+ 205|             raise TrestleError(f'Unable to resolve hostname {hostname}: {e}') from e
+ 206| 
+ 207|         if not ip_addresses:
+ 208|             raise TrestleError(f'No IP addresses resolved for hostname {hostname}')
+ 209| 
+ 210|         return ip_addresses
+ 211| 
+ 212|     def _parse_ip_address(self, ip_str: str, hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+ 213|         """Parse IP address string."""
+ 214|         try:
+ 215|             return ipaddress.ip_address(ip_str)
+ 216|         except ValueError as e:
+ 217|             raise TrestleError(f'Invalid IP address {ip_str} for hostname {hostname}: {e}') from e
+ 218| 
+ 219|     def _check_blocked_networks(self, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address, hostname: str) -> None:
+ 220|         """Check if IP is in always-blocked networks (Tier 1).
+ 221| 
+ 222|         Note: ip_addr should already be canonicalized by validate_url before calling this method.
+ 223|         """
+ 224|         # Defensive check: ensure IPv4-mapped IPv6 addresses are canonicalized
+ 225|         # This protects against future refactoring that might skip canonicalization
+ 226|         if isinstance(ip_addr, ipaddress.IPv6Address) and ip_addr.ipv4_mapped is not None:
+ 227|             raise TrestleError(
+ 228|                 f'Internal error: IP address {ip_addr} should have been canonicalized before network checks. '
+ 229|                 'IPv4-mapped IPv6 addresses must be converted to IPv4 form.'
+ 230|             )
+ 231| 
+ 232|         for network in ALWAYS_BLOCKED_NETWORKS:
+ 233|             # Only check if IP version matches network version to avoid TypeError
+ 234|             if ip_addr.version == network.version and ip_addr in network:
+ 235|                 raise TrestleError(
+ 236|                     f'Access to {network} addresses is blocked: {hostname} resolves to {ip_addr}. '
+ 237|                     f'This range includes loopback, link-local, and cloud metadata endpoints. '
+ 238|                     f'This is a security restriction to prevent SSRF attacks.'
+ 239|                 )
+ 240| 
+ 241|     def _check_private_networks(self, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address, hostname: str) -> None:
+ 242|         """Check if IP is in private networks (Tier 2)."""
+ 243|         if self.block_private_ips:
+ 244|             self._block_private_ip(ip_addr, hostname)
+ 245|         else:
+ 246|             self._warn_private_ip(ip_addr, hostname)
+ 247| 
+ 248|     def _block_private_ip(self, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address, hostname: str) -> None:
+ 249|         """Block access to private IP addresses when configured.
+ 250| 
+ 251|         Note: ip_addr should already be canonicalized by validate_url before calling this method.
+ 252|         """
+ 253|         # Defensive check: ensure IPv4-mapped IPv6 addresses are canonicalized
+ 254|         if isinstance(ip_addr, ipaddress.IPv6Address) and ip_addr.ipv4_mapped is not None:
+ 255|             raise TrestleError(
+ 256|                 f'Internal error: IP address {ip_addr} should have been canonicalized before network checks. '
+ 257|                 'IPv4-mapped IPv6 addresses must be converted to IPv4 form.'
+ 258|             )
+ 259| 
+ 260|         for network in PRIVATE_IP_NETWORKS:
+ 261|             # Only check if IP version matches network version to avoid TypeError
+ 262|             if ip_addr.version == network.version and ip_addr in network:
+ 263|                 raise TrestleError(
+ 264|                     f'Access to private IP addresses is blocked: {hostname} resolves to {ip_addr} '
+ 265|                     f'which is in private network {network}. '
+ 266|                     f'This is blocked because TRESTLE_BLOCK_PRIVATE_IPS is enabled. '
+ 267|                     f'To allow access to private networks, unset this environment variable.'
+ 268|                 )
+ 269| 
+ 270|     def _warn_private_ip(self, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address, hostname: str) -> None:
+ 271|         """Log warning when accessing private IP addresses.
+ 272| 
+ 273|         Note: ip_addr should already be canonicalized by validate_url before calling this method.
+ 274|         """
+ 275|         # Defensive check: ensure IPv4-mapped IPv6 addresses are canonicalized
+ 276|         if isinstance(ip_addr, ipaddress.IPv6Address) and ip_addr.ipv4_mapped is not None:
+ 277|             raise TrestleError(
+ 278|                 f'Internal error: IP address {ip_addr} should have been canonicalized before network checks. '
+ 279|                 'IPv4-mapped IPv6 addresses must be converted to IPv4 form.'
+ 280|             )
+ 281| 
+ 282|         for network in PRIVATE_IP_NETWORKS:
+ 283|             # Only check if IP version matches network version to avoid TypeError
+ 284|             if ip_addr.version == network.version and ip_addr in network:
+ 285|                 logger.warning(
+ 286|                     f'Accessing private IP address: {hostname} resolves to {ip_addr} in network {network}. '
+ 287|                     f'This is allowed by default to support private GitLab/internal OSCAL repositories. '
+ 288|                     f'To block private IPs, set TRESTLE_BLOCK_PRIVATE_IPS=true.'
+ 289|                 )
+ 290|                 break  # Only log once per IP
+ 291| 
+ 292|     def _check_suspicious_ports(self, parsed: parse.ParseResult, url: str) -> None:
+ 293|         """Check for non-standard ports."""
+ 294|         if parsed.port is not None:
+ 295|             if (
+ 296|                 parsed.scheme == 'https'
+ 297|                 and parsed.port not in [443]
+ 298|                 or parsed.scheme == 'sftp'
+ 299|                 and parsed.port not in [22]
+ 300|             ):
+ 301|                 logger.warning(
+ 302|                     f'Non-standard port {parsed.port} detected in URL {url}. This may indicate a security risk.'
+ 303|                 )
+ 304| 
+ 305| 
+ 306| class PathSecurityValidator:
+ 307|     """Validator for ensuring file paths remain within allowed boundaries."""
+ 308| 
+ 309|     @staticmethod
+ 310|     def validate_url_path_for_cache(url_path: str) -> None:
+ 311|         """
+ 312|         Validate a URL path component to prevent path traversal attacks.
+ 313| 
+ 314|         Detects path traversal attempts (..) and raises an exception to block the attack.
+ 315|         This prevents directory traversal attacks when constructing cache file paths.
+ 316| 
+ 317|         Args:
+ 318|             url_path: The path component from a URL (e.g., from urlparse().path)
+ 319| 
+ 320|         Raises:
+ 321|             TrestleError: If path contains traversal sequences (..)
+ 322| 
+ 323|         Example:
+ 324|             >>> PathSecurityValidator.validate_url_path_for_cache('/normal/path.json')  # No exception
+ 325|             >>> PathSecurityValidator.validate_url_path_for_cache('/../../../etc/passwd')  # Raises TrestleError
+ 326|         """
+ 327|         # Check for path traversal sequences
+ 328|         if '..' in url_path:
+ 329|             raise TrestleError(
+ 330|                 f'Security violation: Path traversal blocked. '
+ 331|                 f'URL path "{url_path}" contains ".." sequences which could '
+ 332|                 f'allow writing files outside the cache directory.'
+ 333|             )
+ 334| 
+ 335|     @staticmethod
+ 336|     def validate_cache_path(cache_path: pathlib.Path, cache_root: pathlib.Path) -> None:
+ 337|         """
+ 338|         Validate that a cache file path stays within the cache directory.
+ 339| 
+ 340|         Uses path resolution and relative_to() to ensure the resolved cache path
+ 341|         is actually within the cache root directory, preventing path traversal attacks.
+ 342| 
+ 343|         Args:
+ 344|             cache_path: The proposed cache file path to validate
+ 345|             cache_root: The root cache directory that must contain the cache_path
+ 346| 
+ 347|         Raises:
+ 348|             TrestleError: If cache_path resolves outside cache_root
+ 349| 
+ 350|         Example:
+ 351|             >>> cache_root = pathlib.Path('/home/user/.trestle/cache')
+ 352|             >>> cache_path = cache_root / 'evil.com' / '..' / '..' / 'etc' / 'passwd'
+ 353|             >>> validate_cache_path(cache_path, cache_root)  # Raises TrestleError
+ 354|         """
+ 355|         # Resolve both paths to absolute, normalized paths
+ 356|         resolved_cache = cache_path.resolve()
+ 357|         resolved_root = cache_root.resolve()
+ 358| 
+ 359|         try:
+ 360|             # Check if cache path is relative to (within) cache root
+ 361|             resolved_cache.relative_to(resolved_root)
+ 362| 
+ 363|         except ValueError as e:
+ 364|             # relative_to() raises ValueError if path is not relative to root
+ 365|             raise TrestleError(
+ 366|                 f'Security violation: Cache path traversal blocked. '
+ 367|                 f'Attempted to write to "{resolved_cache}" which is outside '
+ 368|                 f'the cache directory "{resolved_root}"'
+ 369|             ) from e
+ 370|         except Exception as e:
+ 371|             raise TrestleError(f'Error validating cache path "{cache_path}": {e}') from e
+ 372| 
+ 373|     @staticmethod
+ 374|     def validate_trestle_uri_path(uri_path: str) -> None:
+ 375|         """
+ 376|         Validate a trestle:// URI path component to prevent path traversal attacks.
+ 377| 
+ 378|         Detects path traversal attempts (..) in trestle:// URIs and raises an exception.
+ 379|         This prevents directory traversal when resolving trestle:// references.
+ 380| 
+ 381|         Args:
+ 382|             uri_path: The path component after 'trestle://' prefix
+ 383| 
+ 384|         Raises:
+ 385|             TrestleError: If path contains traversal sequences (..)
+ 386| 
+ 387|         Example:
+ 388|             >>> PathSecurityValidator.validate_trestle_uri_path('catalogs/nist/catalog.json')  # No exception
+ 389|             >>> PathSecurityValidator.validate_trestle_uri_path('../../etc/passwd')  # Raises TrestleError
+ 390|         """
+ 391|         # Check for path traversal sequences
+ 392|         if '..' in uri_path:
+ 393|             raise TrestleError(
+ 394|                 f'Security violation: Path traversal blocked in trestle:// URI. '
+ 395|                 f'URI path "{uri_path}" contains ".." sequences which could '
+ 396|                 f'allow reading files outside the trestle workspace.'
+ 397|             )
+ 398| 
+ 399|     @staticmethod
+ 400|     def validate_local_path(local_path: pathlib.Path, trestle_root: pathlib.Path) -> None:
+ 401|         """
+ 402|         Validate that a local file path stays within the trestle workspace.
+ 403| 
+ 404|         Uses path resolution and is_relative_to() to ensure the resolved local path
+ 405|         is actually within the trestle root directory, preventing path traversal attacks.
+ 406| 
+ 407|         Args:
+ 408|             local_path: The proposed local file path to validate
+ 409|             trestle_root: The trestle root directory that must contain the local_path
+ 410| 
+ 411|         Raises:
+ 412|             TrestleError: If local_path resolves outside trestle_root
+ 413| 
+ 414|         Example:
+ 415|             >>> trestle_root = pathlib.Path('/home/user/trestle-workspace')
+ 416|             >>> local_path = trestle_root / 'catalogs' / '..' / '..' / 'etc' / 'passwd'
+ 417|             >>> validate_local_path(local_path, trestle_root)  # Raises TrestleError
+ 418|         """
+ 419|         # Resolve both paths to absolute, normalized paths
+ 420|         resolved_local = local_path.resolve()
+ 421|         resolved_root = trestle_root.resolve()
+ 422| 
+ 423|         try:
+ 424|             # Check if local path is relative to (within) trestle root
+ 425|             resolved_local.relative_to(resolved_root)
+ 426| 
+ 427|         except ValueError as e:
+ 428|             # relative_to() raises ValueError if path is not relative to root
+ 429|             raise TrestleError(
+ 430|                 f'Security violation: Path traversal blocked. '
+ 431|                 f'Attempted to access "{resolved_local}" which is outside '
+ 432|                 f'the trestle workspace "{resolved_root}"'
+ 433|             ) from e
+ 434|         except Exception as e:
+ 435|             raise TrestleError(f'Error validating local path "{local_path}": {e}') from e
+ 436| 
+ 437|     @staticmethod
+ 438|     def validate_local_file_path(
+ 439|         workspace_root: pathlib.Path, file_path: pathlib.Path, allow_outside_workspace: bool = False
+ 440|     ) -> None:
+ 441|         """Validate that a local file path is safe to access.
+ 442| 
+ 443|         This method provides defense-in-depth protection against arbitrary file access
+ 444|         by validating both workspace boundaries and blocking known sensitive system files.
+ 445| 
+ 446|         Args:
+ 447|             workspace_root: The trestle workspace root directory
+ 448|             file_path: The file path to validate
+ 449|             allow_outside_workspace: If True, allow access to files outside workspace (default: False)
+ 450| 
+ 451|         Raises:
+ 452|             TrestleError: If the path is deemed unsafe
+ 453| 
+ 454|         Example:
+ 455|             >>> workspace = pathlib.Path('/home/user/trestle-workspace')
+ 456|             >>> file_path = pathlib.Path('/etc/passwd')
+ 457|             >>> validate_local_file_path(workspace, file_path, allow_outside_workspace=False)
+ 458|             # Raises TrestleError: Access to files outside workspace not allowed
+ 459|             >>> validate_local_file_path(workspace, file_path, allow_outside_workspace=True)
+ 460|             # Raises TrestleError: Attempt to access sensitive system file
+ 461|         """
+ 462|         resolved_workspace = workspace_root.resolve()
+ 463|         resolved_file = file_path.resolve()
+ 464| 
+ 465|         try:
+ 466|             if not allow_outside_workspace:
+ 467|                 # Ensure file is within workspace
+ 468|                 resolved_file.relative_to(resolved_workspace)
+ 469|         except ValueError as e:
+ 470|             if not allow_outside_workspace:
+ 471|                 raise TrestleError(
+ 472|                     f'Access to files outside the trestle workspace is not allowed: {file_path}. '
+ 473|                     'This is a security restriction to prevent arbitrary file access.'
+ 474|                 ) from e
+ 475| 
+ 476|         # Additional checks for sensitive system files
+ 477|         # This provides defense-in-depth even when allow_outside_workspace=True
+ 478|         # Comprehensive list covering Linux, macOS, and Windows
+ 479|         sensitive_paths = [
+ 480|             # Linux/Unix system files
+ 481|             '/etc/passwd',
+ 482|             '/etc/shadow',
+ 483|             '/etc/group',
+ 484|             '/etc/gshadow',
+ 485|             '/etc/sudoers',
+ 486|             '/etc/hosts',
+ 487|             '/etc/ssh',
+ 488|             '/etc/ssl',
+ 489|             '/etc/pki',
+ 490|             '/etc/security',
+ 491|             '/proc/self/environ',
+ 492|             '/proc/self/cmdline',
+ 493|             '/proc/self/maps',
+ 494|             '/sys/class/net',
+ 495|             # User credential files (Linux/macOS)
+ 496|             '/.ssh',
+ 497|             '/.aws',
+ 498|             '/.gnupg',
+ 499|             '/.docker',
+ 500|             '/.kube',
+ 501|             '/.config/gcloud',
+ 502|             '/root/.ssh',
+ 503|             '/root/.aws',
+ 504|             '/root/.gnupg',
+ 505|             # macOS specific
+ 506|             '/Library/Keychains',
+ 507|             '/Library/',  # Broad but catches user home directories
+ 508|             # Windows system directories
+ 509|             'C:\\Windows\\System32',
+ 510|             'C:\\Windows\\SysWOW64',
+ 511|             'C:\\Windows\\System',
+ 512|             'C:\\Windows\\security',
+ 513|             'C:\\ProgramData\\Microsoft\\Crypto',
+ 514|             # Windows credential files
+ 515|             '\\AppData\\Local\\Microsoft\\Credentials',
+ 516|             '\\AppData\\Roaming\\Microsoft\\Credentials',
+ 517|             '\\AppData\\Local\\Microsoft\\Vault',
+ 518|             # Common sensitive config locations
+ 519|             '/var/log',
+ 520|             '/var/run',
+ 521|             'C:\\Windows\\Logs',
+ 522|             # Database files
+ 523|             '/var/lib/mysql',
+ 524|             '/var/lib/postgresql',
+ 525|             'C:\\Program Files\\MySQL',
+ 526|             'C:\\Program Files\\PostgreSQL',
+ 527|         ]
+ 528| 
+ 529|         # Check if the resolved path contains any sensitive patterns
+ 530|         # Use both the original path and resolved path for checking
+ 531|         file_str = str(resolved_file).lower()
+ 532|         original_str = str(file_path).lower()
+ 533| 
+ 534|         for sensitive in sensitive_paths:
+ 535|             sensitive_lower = sensitive.lower()
+ 536|             # Check both original and resolved paths
+ 537|             if sensitive_lower in file_str or sensitive_lower in original_str:
+ 538|                 raise TrestleError(
+ 539|                     f'Attempt to access potentially sensitive system file: {file_path}. '
+ 540|                     'This may indicate a security issue.'
+ 541|                 )
+ 542| 
+ 543| 
+ 544| # Made with Bob
+ 545| 
+ 546| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=8100 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文逐函数）
+
+**入口点枚举**
+- E1：环境变量 `TRESTLE_BLOCK_PRIVATE_IPS`（第 33 行）→ 第 34 行读取，控制私有网段拦截开关。
+- E2：`URLSecurityValidator.validate_url(url)`（第 76 行）——外部 URL 输入，SSRF 防线核心。
+- E3：`PathSecurityValidator.validate_url_path_for_cache(url_path)`（第 193 行）——缓存路径的 URL path 分量。
+- E4：`validate_cache_path`（第 220 行）、`validate_trestle_uri_path`（第 248 行）、`validate_local_path`（第 275 行）、`validate_local_file_path`（第 300 行）。
+
+**数据流与防御验证**
+
+1. **E2→IP 检查（第 76–110 行）**：解析 scheme 白名单（https/sftp，第 99 行）、元数据主机名黑名单（第 116 行）、域名白名单（第 128 行）、DNS 解析后逐一检查 IP（第 84–89 行）。防御结构合理，但存在以下绕过：
+
+2. **IPv4-mapped IPv6 绕过 Tier-1 黑名单（关键漏洞）**：第 88 行 `_resolve_hostname` 用 `socket.getaddrinfo(hostname, None)`，AF_UNSPEC 下对 A 记录可能返回形如 `::ffff:127.0.0.1` 的映射地址。第 90 行 `ipaddress.ip_address()` 将其解析为 **IPv6Address**；第 105 行 `ip_addr in network` 对 IPv6 地址 vs IPv4 网络（如 `127.0.0.0/8`、`169.254.0.0/16`）返回 False 而非报错。因此 loopback/link-local/云元数据 IP 可通过 `::ffff:` 形式完全绕过 ALWAYS_BLOCKED_NETWORKS（第 46–51 行），构成 SSRF（CWE-918）。RFC1918 检查同理失效。
+
+3. **元数据防护依赖主机名字符串黑名单（第 55–60 行 + 第 116 行）**：`100.100.100.200`（阿里云元数据）不在任何被封锁的 IP 网段内（非 link-local），仅靠字面量主机名匹配。攻击者使用解析到该 IP 的任意其他域名（或直接用数字 IP 变体写法经 DNS）即可访问阿里云元数据服务。黑名单式防御可绕过。
+
+4. **DNS rebinding TOCTOU（CWE-367）**：第 70–72 行 docstring 自述“最小化 TOCTOU 窗口”，但验证时解析的 IP 与实际 fetch 时库重新解析的 IP 之间无绑定（未 pin IP），窗口依然存在——验证通过后 DNS 可切换到内网地址。
+
+5. **默认允许私有网段（第 33–34 行 + 第 152 行）**：`TRESTLE_BLOCK_PRIVATE_IPS` 默认关闭，RFC1918 仅告警不阻断（第 178 行），内网 SSRF 默认可达——设计权衡但扩大攻击面。
+
+6. **E3 `'..'` 子串检查（第 209 行）**：纯子串匹配属弱过滤——若上游传入未解码的 `%2e%2e%2f` 则漏检；同时误杀合法文件名（如 `data..v2.json`）。不过 E4 的 `resolve()+relative_to()`（第 237–240、288–291 行）是有效的规范化边界校验，构成纵深防御，故路径遍历实际风险被显著缓解。
+
+7. **敏感文件清单为子串匹配黑名单（第 352–437 行）**：当 `allow_outside_workspace=True` 时仅靠该清单拦截，任意其他绝对路径（如 `/etc/cron.d/x`、`/home/u/.bashrc`）均可读——按设计放行任意文件读取，且 `/Library/` 这类宽匹配易误杀。
+
+**结论**：存在真实可利用漏洞，最严重的是第 2 条（mapped-IPv6 绕过 Tier-1 封锁）与第 3 条（元数据 IP 非网段封锁），叠加第 4 条 rebinding。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF) / CWE-367 DNS Rebinding TOCTOU", "risk_level": "High", "source": "line 70: validate_url 接收外部可控 URL 的 hostname", "sink": "line 105 与 line 116: 基于 IP 网段与主机名黑名单的网络访问判定", "explanation": "line 162:getaddrinfo 可能返回 ::ffff:127.0.0.1 等 IPv4-mapped IPv6 地址, line 172:解析为 IPv6Address 后在 line 105 对 IPv4 网络(127.0.0.0/8, 169.254.0.0/16)的成员判断返回 False, 导致 Tier-1 永久封锁(含云元数据 169.254.169.254)被完全绕过; 另外 line 74:元数据防护中 100.100.100.200 不属于任何被封网段, 仅靠主机名字面量黑名单(line 116), 使用解析到该 IP 的其他域名即可访问阿里云元数据; 且验证用 DNS 解析与实际 fetch 重新解析之间无 IP 固定, 存在 rebinding TOCTOU", "fix_suggestion": "line 90: 解析后若为 IPv6 且含 ipv4_mapped 属性则转换为对应 IPv4Address 再做网段判断(ip_addr.ipv4_mapped); 同时将云元数据 IP 改为按网段/IP 直接封锁而非主机名黑名单, 并在实际建立连接时固定已验证的 IP(pin IP 或校验连接目标地址)"}
+
+### id=8101 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **第 40-44 行 `get_block_private_ips_config`**：仅读取环境变量 `TRESTLE_BLOCK_PRIVATE_IPS`，返回布尔值，无 sink，不构成数据流漏洞。默认关闭私有 IP 拦截是文档化的设计决策（支持内网 GitLab），且 loopback/link-local/元数据端点始终被拦截（第 47-56 行 ALWAYS_BLOCKED_NETWORKS），云元数据 SSRF 主风险已被覆盖。
+
+2. **第 59-77 行构造函数与常量**：`block_private_ips` 默认 False 属于明确记录的权衡，非缺陷。
+
+3. **第 92-110 行 `validate_url`**：完整流程——解析 URL（scheme 白名单 https/sftp，第 141-143 行）→ 元数据主机名检查 → 域名白名单 → DNS 解析并逐一校验所有 IP → 端口检查。对每个解析出的 IP 都执行 `_check_blocked_networks` 与 `_check_private_networks`，不存在只检查第一个地址的遗漏。
+
+4. **第 113-127 行 `_canonicalize_ip`**：将 IPv4-mapped IPv6（::ffff:a.b.c.d）归一化为 IPv4 形式，防止用 `::ffff:169.254.169.254` 绕过 IPv4 黑名单；且 `_check_blocked_networks`/`_block_private_ip`/`_warn_private_ip` 内部还有防御性二次检查（第 205-210、246-250、268-272 行），即使上游漏归一化也会抛错而非放行。
+
+5. **第 130-144 行 `_parse_and_validate_url`**：强制 scheme 为 https/sftp，排除 file://、gopher://、http 重定向到明文等入口。
+
+6. **第 147-172 行 `_check_metadata_endpoints`**：对括号包裹的 IPv6 字面量先归一化再比对 METADATA_HOSTNAMES，覆盖 `[::ffff:169.254.169.254]` 变体。
+
+7. **第 175-183 行 `_check_domain_allowlist`**：精确匹配白名单，非黑名单式过滤。
+
+8. **第 186-200 行 `_resolve_hostname`**：解析失败或空结果均抛错，不会静默放行。
+
+9. **第 283-295 行 `validate_url_path_for_cache` / 第 298-337 行 `validate_cache_path`**：前者拦截 `..` 序列；后者使用 `resolve()` + `relative_to()` 做规范化后的边界校验，是有效防御（非黑名单/正则），符号链接经 resolve 解析后仍受约束。
+
+10. **第 340-361 行 `validate_trestle_uri_path` / 第 364-398 行 `validate_local_path`**：同样采用 `..` 检查 + resolve/relative_to 双重校验，路径穿越被阻断。
+
+11. **第 401-500 行 `validate_local_file_path`**：工作区边界校验 + 敏感系统文件清单双重防御；即便 `allow_outside_workspace=True` 也保留敏感文件黑名单兜底。该黑名单虽理论上不完备（如 `/etc/cron.d` 未列出），但它是纵深防御的第二层，第一层工作区边界校验才是主控制，且此方法本身不是唯一防线。
+
+12. **第二入口与替代通道检查**：全文无 HTTP 路由、回调、反序列化、命令执行（subprocess/os.system）、eval/exec 等 sink；文件操作类 sink 均有上述边界校验前置；URL 类 sink（fetch）由 validate_url 在初始化和每次 fetch 前调用（第 99-101 行 docstring 明确说明缓解 TOCTOU/DNS rebinding）。DNS rebinding 的 TOCTOU 窗口仍理论存在（校验与实际连接之间），但代码已通过双次校验将窗口最小化，属于已知残余风险而非可判定漏洞。
+
+13. **结论**：各 source→sink 数据流均有有效防御（resolve+relative_to 边界校验、IP 全量解析校验、IPv4-mapped 归一化、scheme 白名单），未发现可利用的安全漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文后确认: URL 校验器对所有 DNS 解析结果逐一做黑名单网络与可选私网检查(第 92-110 行), 并通过 _canonicalize_ip 及三处防御性二次检查封堵 IPv4-mapped IPv6 绕过; scheme 白名单限制为 https/sftp; 云元数据端点始终拦截。路径校验器采用 resolve 加 relative_to 的规范化边界校验(第 298-398 行)而非单纯正则, 对缓存路径/trestle URI/本地路径均有效; validate_local_file_path 额外提供敏感文件纵深防御。全文无路由、反序列化、命令执行等替代入口或未防护 sink。残余的 DNS rebinding TOCTOU 窗口已通过初始化与每次 fetch 前双次校验最小化, 属于已知设计权衡而非可利用漏洞。", "fix_suggestion": "no fix needed"}

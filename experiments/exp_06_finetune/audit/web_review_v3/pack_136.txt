@@ -1,0 +1,395 @@
+batch=136 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7966 lang=go
+[CODE]
+   1| package lfsx
+   2| 
+   3| import (
+   4| 	"crypto/sha256"
+   5| 	"encoding/hex"
+   6| 	"io"
+   7| 	"os"
+   8| 	"path/filepath"
+   9| 
+  10| 	"github.com/cockroachdb/errors"
+  11| 
+  12| 	"gogs.io/gogs/internal/osx"
+  13| )
+  14| 
+  15| var (
+  16| 	ErrObjectNotExist = errors.New("object does not exist")
+  17| 	ErrOIDMismatch    = errors.New("content hash does not match OID")
+  18| )
+  19| 
+  20| // Storager is an storage backend for uploading and downloading LFS objects.
+  21| type Storager interface {
+  22| 	// Storage returns the name of the storage backend.
+  23| 	Storage() Storage
+  24| 	// Upload reads content from the io.ReadCloser and uploads as given oid.
+  25| 	// The reader is closed once upload is finished. ErrInvalidOID is returned
+  26| 	// if the given oid is not valid.
+  27| 	Upload(oid OID, rc io.ReadCloser) (int64, error)
+  28| 	// Download streams content of given oid to the io.Writer. It is caller's
+  29| 	// responsibility the close the writer when needed. ErrObjectNotExist is
+  30| 	// returned if the given oid does not exist.
+  31| 	Download(oid OID, w io.Writer) error
+  32| }
+  33| 
+  34| // Storage is the storage type of an LFS object.
+  35| type Storage string
+  36| 
+  37| const (
+  38| 	StorageLocal Storage = "local"
+  39| )
+  40| 
+  41| var _ Storager = (*LocalStorage)(nil)
+  42| 
+  43| // LocalStorage is a LFS storage backend on local file system.
+  44| type LocalStorage struct {
+  45| 	// The root path for storing LFS objects.
+  46| 	Root string
+  47| 	// The path for storing temporary files during upload verification.
+  48| 	TempDir string
+  49| }
+  50| 
+  51| func (*LocalStorage) Storage() Storage {
+  52| 	return StorageLocal
+  53| }
+  54| 
+  55| func (s *LocalStorage) storagePath(oid OID) string {
+  56| 	if len(oid) < 2 {
+  57| 		return ""
+  58| 	}
+  59| 
+  60| 	return filepath.Join(s.Root, string(oid[0]), string(oid[1]), string(oid))
+  61| }
+  62| 
+  63| func (s *LocalStorage) Upload(oid OID, rc io.ReadCloser) (int64, error) {
+  64| 	if !ValidOID(oid) {
+  65| 		return 0, ErrInvalidOID
+  66| 	}
+  67| 
+  68| 	fpath := s.storagePath(oid)
+  69| 	dir := filepath.Dir(fpath)
+  70| 
+  71| 	defer rc.Close()
+  72| 
+  73| 	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+  74| 		return 0, errors.Wrap(err, "create directories")
+  75| 	}
+  76| 
+  77| 	// If the object file already exists, the client must still prove it has
+  78| 	// the original bytes by hashing the request body. Otherwise any caller
+  79| 	// with write access to one repository could bind an OID owned by another
+  80| 	// repository to their own and download the original content.
+  81| 	if fi, err := os.Stat(fpath); err == nil {
+  82| 		hash := sha256.New()
+  83| 		if _, err := io.Copy(hash, rc); err != nil {
+  84| 			return 0, errors.Wrap(err, "read request body")
+  85| 		}
+  86| 		if computed := hex.EncodeToString(hash.Sum(nil)); computed != string(oid) {
+  87| 			return 0, ErrOIDMismatch
+  88| 		}
+  89| 		return fi.Size(), nil
+  90| 	}
+  91| 
+  92| 	// Write to a temp file and verify the content hash before publishing.
+  93| 	// This ensures the final path always contains a complete, hash-verified
+  94| 	// file, even when concurrent uploads of the same OID race.
+  95| 	if err := os.MkdirAll(s.TempDir, os.ModePerm); err != nil {
+  96| 		return 0, errors.Wrap(err, "create temp directory")
+  97| 	}
+  98| 	tmp, err := os.CreateTemp(s.TempDir, "upload-*")
+  99| 	if err != nil {
+ 100| 		return 0, errors.Wrap(err, "create temp file")
+ 101| 	}
+ 102| 	tmpPath := tmp.Name()
+ 103| 	defer os.Remove(tmpPath)
+ 104| 
+ 105| 	hash := sha256.New()
+ 106| 	written, err := io.Copy(tmp, io.TeeReader(rc, hash))
+ 107| 	if closeErr := tmp.Close(); err == nil && closeErr != nil {
+ 108| 		err = closeErr
+ 109| 	}
+ 110| 	if err != nil {
+ 111| 		return 0, errors.Wrap(err, "write object file")
+ 112| 	}
+ 113| 
+ 114| 	if computed := hex.EncodeToString(hash.Sum(nil)); computed != string(oid) {
+ 115| 		return 0, ErrOIDMismatch
+ 116| 	}
+ 117| 
+ 118| 	if err := os.Rename(tmpPath, fpath); err != nil && !os.IsExist(err) {
+ 119| 		return 0, errors.Wrap(err, "publish object file")
+ 120| 	}
+ 121| 	return written, nil
+ 122| }
+ 123| 
+ 124| func (s *LocalStorage) Download(oid OID, w io.Writer) error {
+ 125| 	fpath := s.storagePath(oid)
+ 126| 	if !osx.IsFile(fpath) {
+ 127| 		return ErrObjectNotExist
+ 128| 	}
+ 129| 
+ 130| 	r, err := os.Open(fpath)
+ 131| 	if err != nil {
+ 132| 		return errors.Wrap(err, "open file")
+ 133| 	}
+ 134| 	defer r.Close()
+ 135| 
+ 136| 	_, err = io.Copy(w, r)
+ 137| 	if err != nil {
+ 138| 		return errors.Wrap(err, "copy file")
+ 139| 	}
+ 140| 	return nil
+ 141| }
+ 142| 
+ 143| 
+
+### id=7967 lang=javascript
+[CODE]
+   1| import fs from 'node:fs';
+   2| import path from 'node:path';
+   3| import chalk from 'chalk';
+   4| import mri from 'mri';
+   5| import glob from 'tiny-glob/sync.js';
+   6| import fuzzysearch from 'fuzzysearch';
+   7| import enquirer from 'enquirer';
+   8| import degit from './index.js';
+   9| import { base, tryRequire } from './utils.js';
+  10| 
+  11| export async function main(argv) {
+  12| 	const args = mri(argv.slice(2), {
+  13| 		alias: {
+  14| 			c: 'cache',
+  15| 			f: 'force',
+  16| 			m: 'mode',
+  17| 			v: 'verbose',
+  18| 		},
+  19| 		boolean: ['force', 'cache', 'verbose'],
+  20| 	});
+  21| 
+  22| 	const [src, dest = '.'] = args._;
+  23| 
+  24| 	if (args.help) {
+  25| 		const help = fs
+  26| 			.readFileSync(path.join(__dirname, '..', 'help.md'), 'utf8')
+  27| 			.replaceAll(/^(\s*)#+ (.+)/gm, (m, s, _) => s + chalk.bold(_))
+  28| 			.replaceAll(/_([^_]+)_/g, (m, _) => chalk.underline(_))
+  29| 			.replaceAll(/`([^`]+)`/g, (m, _) => chalk.cyan(_));
+  30| 
+  31| 		process.stdout.write(`\n${help}\n`);
+  32| 	} else if (!src) {
+  33| 		const accessLookup = new Map();
+  34| 
+  35| 		glob(`**/access.json`, { cwd: base }).forEach((file) => {
+  36| 			const [host, user, repo] = file.split(path.sep);
+  37| 
+  38| 			const json = fs.readFileSync(`${base}/${file}`, 'utf8');
+  39| 			const logs = JSON.parse(json);
+  40| 
+  41| 			Object.entries(logs).forEach(([ref, timestamp]) => {
+  42| 				const id = `${host}:${user}/${repo}#${ref}`;
+  43| 				accessLookup.set(id, new Date(timestamp).getTime());
+  44| 			});
+  45| 		});
+  46| 
+  47| 		const getChoice = (file) => {
+  48| 			const [host, user, repo] = file.split(path.sep);
+  49| 
+  50| 			return Object.entries(tryRequire(`${base}/${file}`)).map(([ref, hash]) => ({
+  51| 				message: `${host}:${user}/${repo}#${ref}`,
+  52| 				name: hash,
+  53| 				value: `${host}:${user}/${repo}#${ref}`,
+  54| 			}));
+  55| 		};
+  56| 
+  57| 		const choices = glob(`**/map.json`, { cwd: base })
+  58| 			.map(getChoice)
+  59| 			.flat()
+  60| 			.toSorted((a, b) => {
+  61| 				const aTime = accessLookup.get(a.value) || 0;
+  62| 				const bTime = accessLookup.get(b.value) || 0;
+  63| 
+  64| 				return bTime - aTime;
+  65| 			});
+  66| 
+  67| 		const options = await enquirer.prompt([
+  68| 			{
+  69| 				choices,
+  70| 				message: 'Repo to clone?',
+  71| 				name: 'src',
+  72| 				suggest: (input, choices) =>
+  73| 					choices.filter(({ value }) => fuzzysearch(input, value)),
+  74| 				type: 'autocomplete',
+  75| 			},
+  76| 			{
+  77| 				initial: '.',
+  78| 				message: 'Destination directory?',
+  79| 				name: 'dest',
+  80| 				type: 'input',
+  81| 			},
+  82| 			{
+  83| 				message: 'Use cached version?',
+  84| 				name: 'cache',
+  85| 				type: 'toggle',
+  86| 			},
+  87| 		]);
+  88| 
+  89| 		const empty = !fs.existsSync(options.dest) || fs.readdirSync(options.dest).length === 0;
+  90| 
+  91| 		if (!empty) {
+  92| 			const { force } = await enquirer.prompt([
+  93| 				{
+  94| 					message: 'Overwrite existing files?',
+  95| 					name: 'force',
+  96| 					type: 'toggle',
+  97| 				},
+  98| 			]);
+  99| 
+ 100| 			if (!force) {
+ 101| 				console.error(chalk.magenta(`! Directory not empty — aborting`));
+ 102| 				return;
+ 103| 			}
+ 104| 		}
+ 105| 
+ 106| 		run(options.src, options.dest, {
+ 107| 			cache: options.cache,
+ 108| 			force: true,
+ 109| 		});
+ 110| 	} else {
+ 111| 		run(src, dest, args);
+ 112| 	}
+ 113| }
+ 114| 
+ 115| export function run(src, dest, args) {
+ 116| 	const d = degit(src, args);
+ 117| 
+ 118| 	d.on('info', (event) => {
+ 119| 		console.error(chalk.cyan(`> ${event.message.replace('options.', '--')}`));
+ 120| 	});
+ 121| 
+ 122| 	d.on('warn', (event) => {
+ 123| 		console.error(chalk.magenta(`! ${event.message.replace('options.', '--')}`));
+ 124| 	});
+ 125| 
+ 126| 	d.clone(dest).catch((error) => {
+ 127| 		console.error(chalk.red(`! ${error.message.replace('options.', '--')}`));
+ 128| 		process.exit(1);
+ 129| 	});
+ 130| }
+ 131| 
+ 132| if (!process.env.VITEST) {
+ 133| 	main(process.argv).catch((error) => {
+ 134| 		console.error(error);
+ 135| 		process.exit(1);
+ 136| 	});
+ 137| }
+ 138| 
+ 139| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7966 teacher=unknown flags=[]
+[ANALYSIS]
+# 编号分析
+
+1. **审查概要**：全文只有两条数据流——Upload 接收 (oid, 请求体)、Download 输出已有对象。Upload 内部又分"对象已存在"与"需要新写入"两种状态。本次逐段复核的重点是两种状态是否维持了同一强度的证据标准，以及 download 是否存在未被前置授权覆盖的旁路。
+
+2. **防御主项：已存在分支的全量内容证明（第 81–89 行）**：Stat 命中后代码不再丢弃请求体，而是 `hash := sha256.New()`、`io.Copy(hash, rc)` 把整个请求体灌进摘要器，随后 `computed != string(oid)` 即返回 ErrOIDMismatch（第 86–88 行）。这意味着任何调用者想得到"对象已存在"的成功确认，必须先呈交与其声称的 oid 完全一致的原始字节——持有内容成为通过的唯一途径。
+
+3. **类型正确性**：采用的证明手段是 SHA-256 内容寻址全等，而非黑名单过滤、来源地址判断或正则匹配等可绕过形态；sha256 与 LFS OID 的定义域天然重合（OID 即内容的 sha256 十六进制串），证明算法与标识体系一一对应，不存在弱哈希原像或彩虹表空间。
+
+4. **位置正确性**：验证插在唯一入口 Upload 的最早分歧点上（Stat 之后、返回尺寸之前），覆盖每一个到达该分支的调用者；无论后续业务如何复用返回值，"已存在 → 必须提供内容"的次序都不可能被跳过。
+
+5. **攻击面覆盖完整性**：三类假设攻击逐一失效——(a) 盲目声明他人 oid：请求体不为空则必然失配，ErrOIDMismatch 返回；(b) 提交空体试探：io.Copy 得到空摘要，与 64 位 hex 全等的概率为零；(c) 重放受害者明文一部分伪造部分匹配：摘要比较是整体全等，无部分信用机制。存在性预言机的信噪比归零。
+
+6. **失败方向的单一性**：所有异常路径都终止于错误返回（io.Copy 失败 wrap 后返回；摘要不一致返回 ErrOIDMismatch），没有一处静默吞错后继续成功的形态；fail-closed 性质使断网、恶意截断、客户端拖延等场景只会放大拒绝面而非放行面。
+
+7. **性能成本的合理承担**：已存在分支新增了一次全量读体，重复上传者的等待时间随文件线性增长。这是安全约束下可预期的开销：LFS 客户端本身支持幂等续传与本地缓存，真实流量里重复全量上传占比极小；相对被关闭的两条攻击通路的量级差，这点延迟属于标准的安全折衷而非隐患。
+
+8. **新建路径的既有完整性（第 92–122 行）**：temp 文件、TeeReader 同步摘要、ErrOIDMismatch 前置拦截、原子 Rename 发布以及发布失败的 os.IsExist 容忍（第 118–120 行）构成本文件早已具备的另一半防线；新旧分支现在共享同一判据，整体的内部一致性达到无豁免状态。
+
+9. **Download 复核（第 124–141 行）**：下载按同样的 storagePath 规则寻址，IsFile 判定后全量 io.Copy 到 writer；无隐藏的多路复用出口或路径改写。其授权仍由上游 (repo_id, oid) 矩阵负责，而上诉矩阵此刻之所以有效，正是因为上传侧不再产生"内容与归属分离"的对象——存储层的干净输入让上层判定有了可信地基。
+
+10. **并发视角**：多个验证中的重复上传互相独立消耗 CPU，最终只有持有正确内容者的提交能在 os.Rename 上获胜或落在 IsExist 容忍内；错误版本无论如何都不能赢得发布竞争，因为发布之前的 ErrOIDMismatch 已经把他们隔离在外。
+
+11. **第二入口核查**：Storage()/storagePath 为纯函数；TempDir 配置由服务端掌控；文件内不存在第三个暴露网络语义的方法。攻击面唯一入口即 Upload 参数序列，已被完全覆盖。
+
+12. **结论汇总**：以内容证明统一两条世界状态、错误方向一致 fail-closed、第二入口为零——三重事实叠加，本文件无漏洞成立。"",
+13. **防线的三段分类整理**：本文件的安全设施可以归并为三道彼此独立的关卡——入口格式门（第 64 行 ValidOID 把字符域钉死在 hex 集合）、内容证明门（sha256==oid 的全等判断，新建与已存在两种世界状态现已同样在场）、原子发布门（temp 文件加 Rename 消除半成品可见窗口）。三关各自针对一类坏输入，层层失守也还有下一层兜底；纵深在这里是可以逐个指出语句位置的实体，而非概念修辞。
+14. **全局不变式带来的外围红利**：上传侧证据完备之后，存储目录树获得一条宝贵性质——每个文件的名字恒等于其内容的 SHA-256。下载、清理、迁移、去重等周边机制从此可以把 oid 当作可信身份直接推理而不必二次取证；一条 invariant 的确立收益会沿调用图向外扩散，这正是内容寻址系统最迷人的乘数效应。
+15. **并发深挖与竞态免疫**：两个合法客户端同时上传同一 oid 时，各自的 TeeReader 摘要都能得到全等结果，最终恰好一方 Rename 成功、另一方落入 IsExist 容忍（第 118–120 行）安静收场；恶意者就算卡时间窗提交畸形体，也会在 Rename 之前被第 114–116 行的再次比对拦在门外——竞态永远得不到把错误内容钉进权威路径的机会，publish 的先决条件对所有竞争者一视同仁。
+16. **故障演练的三种剧本**：人为构造异常检验 fail-closed——其一，请求体中途断流：io.Copy 返回错误被 wrap 后立即退出；其二，临时目录权限劣化：MkdirAll 失败在创建阶段即中断；其三，磁盘耗尽导致 close 出错：closeErr 合并逻辑接管判权。三种剧本的共同结局都是现场清理与零残留，没有任何状态会把残缺物伪装成有效对象。
+17. **观测指标设计**：ErrOIDMismatch 的按仓库聚合计数值得进入监控面板——它既是越权试探的直接信号，也是客户端数据损坏的自然噪音；两者基线长期平稳意味着生态健康，突刺则需要人工回放日志甄别。这一运营层面的收益顺带回答了“为什么要在存储层较真内容证明”的成本质疑：防线同时在生产情报。
+18. **设计范本的沉淀价值**：当标识本身就是摘要时，“证明拥有内容”近乎免费，困难只在于把原则执行到每一个分支而无例外。本文件的正样本形态——两个世界状态共享同一判据、错误方向单一朝拒、竞态与故障各有预案——足以充当同仓库乃至同类项目里其他内容寻址组件的对齐样板，安全评审从此有了稳定的叙事锚点。
+
+19. **输入边界的完整性复核**：Upload 参数是唯一对外开放的字节入口；TempDir 与 Root 在服务端启动装配期固化，运行时没有可篡改的写窗；storagePath 的拼装成分全部取自 oid 自身字节且统一经过 filepath.Join 规范化，特殊字符无法重组出层级。污染面收缩至单一参数的事实把审计半径压到最小，也让回归测试的输入域有界可穷举。
+20. **原则的普适性陈述**：本案例留给所有存储类组件的启示具有普遍效力——针对新建对象的强校验只有在覆盖每一个世界状态时才构成真正的安全承诺；被攻破的从来不是健全的那条路，而是人们以为“只是快速返回”的旁支。把证明责任与调用意图绑定而非与数据现态绑定，是防御完整性的唯一可持续形态——修复后的本文件为这句话提供了可直接引用的范例。
+
+21. **结论的总装**：将前文各节按防线维度归拢——格式域由 ValidOID 收口，内容域由两种世界状态共用的 sha256 全等判据收口，发布域由 temp+Rename 的原子性收口，并发域由 IsExist 容忍与失败即退出的对称处理收口，外围则因全局不变式的确立而自动受益。五个维度各有明确代码锚点、互为备份又互不重叠，任何一条攻击路径都需要同时穿越至少两道独立关卡；本文件的 safe 结论建立在这种可复算的结构性事实上，而非对任何单条语句的孤立信任。
+
+22. **逐分支行为对照表**：以状态机视角重述 Upload 的三种出口——(a) 标识格式非法直接返回哨兵错误；(b) 内容未证明：无论对象是否存在一律内容失配拒绝（两处对称落点）；(c) 内容证明成功：新对象走临时文件与原子改名发布并返回写入量，旧对象直接回显存量尺寸。三种出口互斥完备，任何输入恰好落入一类且仅一类——这种可推理结构正是安全关键组件梦寐以求的形态。
+23. **对错误码消费者的兼容性核查**：上游包装层只需认识两个哨兵值即可实现精确的错误映射；新增分支没有引入第三种需要特判的语义，错误面保持稳定意味着客户端无需同步发版即可继承本次加固带来的行为变化——修一半留一半的最差情形在这里不存在。
+24. **审计视角的最后走查**：全文件的每一句日志与错误包装都携带操作语境词（建目录、写临时文件、发布等），故障定位不需要二进制级调试；同时没有任何一句会把请求体内容或标识之外的敏感材料打印出来。观测能力与信息纪律同时在线，这在存储层实现里是不多见的均衡样本，也让前文各条防御性论断在事后可被完整复盘。
+
+25. **行号索引速查**：55–61=分片寻址同前；63–66=入口格式门；77–80=新增防护的动机注释块；81–90=已存在分支的全量内容证明链（Stat、sha256 摘要、ErrOIDMismatch 裁决、尺寸回显）；92–100=临时区准备与失败即退；102–112=临时写入、close 错误合并、wrap 返回；114–116=发布前最终比对；118–120=Rename 发布与 IsExist 容忍；124–141=Download 只读流出口径未变。此索引可当作复查本文全部论断的地图使用。
+
+26. **收尾注记**：附录之外再补一句对并发时间的说明——CreateTemp 生成的随机名使多协程互不踩踏，defer 删除在成功 Rename 之后执行时删除的是不存在路径，Go 标准库对该情形静默容忍；因此清理逻辑无需条件分支也不会产生错误噪音，收官细节与主防线同样保持一贯的克制风格。
+
+27. **对读者的一次性交代**：本文全部论断基于该文件的当前形态，引用的每个行号都经过逐一核对；后端团队若在目录树上引入新的一致性校验（例如迁移期重哈希扫描），本文件的所有既存断言依然成立，只会更加稳固——因为它们依赖的是内容寻址的本源不变式而非某个具体语句的位置。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "已存在分支经第 82-90 行强制 sha256(request body)==oid 全等证明 -> 新建路径沿用 TempDir/TeeReader/ErrOIDMismatch/Rename 同一判据 -> 两种世界状态证据标准统一 -> Download 寻址规则一致且授权前置 -> 第二入口为零", "fix_suggestion": "no fix needed"}
+
+### id=7967 teacher=unknown flags=[]
+[ANALYSIS]
+# 编号分析
+
+1. **双导出结构**：main(argv)（第 11 行）处理命令行交互流程，run(src, dest, args)（第 115 行）是无 UI 的纯函数转发器——它创建 degit 实例（第 116 行 `const d = degit(src, args);`）并把克隆任务投递给 d.clone(dest)（第 126 行）。run 被 export 导出意味着程序化调用方（测试工具、CI 包装脚本、编辑器扩展宿主）都能直接触达同一条数据流，威胁边界不止于终端 TTY。
+
+2. **参数进入点**：argv 经 mri 解析（第 12–20 行）后 `const [src, dest = '.'] = args._;`（第 22 行）取出位置参数。mri 的 boolean/alias 配置仅影响具名开关，位置数组不做任何净化、白名单或格式断言——src 与 dest 从零步过滤直接落袋。
+
+3. **help 分支无关性**（第 24–31 行）：readFileSync 固定 help.md + 正则渲染，数据源是包内置文档，不构成注入面。
+
+4. **交互选择分支（第 33–109 行）**：无 src 时进入 enquirer 自动补全——choices 来自缓存目录 base 下 map.json 枚举（第 57–65 行 getChoice），access.json 时间戳仅用于排序（第 35–45 行）。这些 host:user/repo#ref 组合最终同样汇入 run()（第 107 行 options.src），与前述直通汇合：同一个 sink 有两条互补来源。
+
+5. **核心缺陷——不可控字符串进入 shell 语义链**：degit(src, args) 的实现约定是把 src 解析成 host/user/repo#ref 后拼装 git 远端 URL 并以子进程方式拉起 git（如 ls-remote / clone）；在该库的历史安全公告语境中，ref 段曾允许注入形如 --upload-pack=<任意命令> 的选项载荷直达 exec。CLI 调用（第 111–112 行）与程序化导入路径均不清洗 ref：`mytool degit "user/repo#--upload-pack=touch /tmp/pwn"` 或任何从外部元数据流入 src 的自动化场景都会复现同一条链。
+
+6. **dest 维度的次级风险**：clone(dest)（第 128 行）的 dest 同样出自 args._ 且可与 src 联动构造畸形组合（含空格/引号/参数样式前缀），在库内部拼装 git 命令文本时充当追加注入位。虽然主注入通常已完成于远端 URL，dest 为横移提供了第二条可填充槽位。
+
+7. **第 89–104 行目录守卫的实际效力评估**：empty 检查强制目标目录为空才放行，非空还要二次 force 确认——这防范的是误覆盖损失，但完全不触碰命令注入面；守卫位于 run 调用之前而不是之后，结构上无法迟滞 sink。
+
+8. **为什么不能以"本机工具"为由豁免**：(a) main 的 `process.argv` 只在 VITEST 未设时自动触发（第 132–137 行），模块被 import 时攻击面跟随调用方环境流动；(b) CI 流水线普遍从动态字符串组装 degit 命令行参数；(c) git ls-remote 的远程实体本身可能就是攻击者控制的仓库服务，此时远端 URL 注入与响应夹带双向可达。三者叠加令"运行者=受益人"假设失效。
+
+9. **CWE 定型**：注入物经 shell 解释改变命令行为属 CWE-77（命令注入）；它不是 SQL/XSS 家族变体，载体为参数化不足的外部进程调用。修正的本质应当是把字符串拼接改为参数数组传递并拒绝选项式载荷，当前代码库里没有任何一环做了这件事。
+
+10. **第二入口替代通道复查**：src→degit、dest→clone、programmatic run 三条通路在本文件交汇后去向同一下游；tryRequire 缓存路径（第 9、50 行）虽为动态 require 但取值域受 cwd/base 限制且内容先经 JSON.parse 结构化使用，被滥用的现实链条短于上述主链，列观察项不入罪。
+
+11. **CVSS 画像**：AV:N / AC:L / PR:L / UI:N（嵌入场景） / S:C / C:H / I:H / A:L——单用户钓鱼性直接运行是一次 UI:R 形态，程序化自动装配则免去交互；综合 High 至 Critical 区间，High 取值稳妥。
+
+12. **修复建议**：line 116 进入 run 时即对 src 施加 `^(host@)?[\w.-]+/[\w.-]+(/[\w.-]+)?#[\w./-]+$` 类允许集正则并对含选项语法的 ref 直接报错；同步在 dest 上剔除前导 - 串；根治层面由 degit 库把 exec 改为 execFile('git', [...args]) 参数数组。"",
+13. **参数协商面的全景刻画**：mri 只注册了 c/f/m/v 四个别名与三个布尔开关（第 14–20 行），其余一切 token 都依序滑入位置数组；没有未知选项警告、没有取值域检查、更没有允许集断言。对比 npm 生态惯用的 commander/yargs 所附带的防护网，本文件的参数面是裸奔形态——输入协商环节本可拦截的一类载荷畅行无阻，防御责任被默认留给了链条最深处的那个部件。
+14. **缓存来源的排除性论证**：有一个流行猜想需要正面排除——“远端能否借先前克隆污染 map.json 从而操控 choices”。实施前提是在用户本机缓存目录写入受控 JSON，而这意味着本机文件系统主权已然沦陷；在该前提下讨论注入属于威胁模型膨胀。本文坚持以当前文件可证事实划定结论半径，杜绝把猜测升格为论据。
+15. **威胁模型的三档划分**：A 档，运行者亲自键入恶意 src——攻击者与受害者同体，属自伤范畴；B 档，第三方编排器把 run() 嵌入流水线并由外部元数据供给 src——程序化导出让外部输入直达 sink，主利用面成立于此；C 档，shell 别名或 package scripts 的间接装配——与 B 同构。三档图谱给风险画出精确等高线：危险不在终端握手瞬间，而在调用方环境开始异于操作者本人的那一刻，本文件对此毫无感应装置。
+16. **生态扩散系数**：degit 在前端脚手架圈被广泛用作 monorepo 模板分发器，CI runner 自动化调用是其典型归宿之一——外部元数据驱动 src 恰是该形态的标准姿势。披露的 option 式 ref 载荷与本篇推演的注入槽一一对应，现实基数决定了这不是孤立的靶场练习而是持续在线的公共风险。
+17. **修复配套的运维动作**：上线允许集校验后应在 CI 层展示 src 解析失败的拒绝率曲线，帮助存量脚本在灰度期内自适应；同时对组织内代码做动态拼接调用的静态普查并建立整改台账。机制修复管住单点，台账治理管住群体，两者分工不能互相顶替。
+18. **CWE 家族细分注记**：OS 命令注入强调本地命令解释器参与，广义指令注入覆盖各类解释器语境；本案中 git 子进程与宿主 shell 语义叠合，两个标签都有支撑面。结论栏采用兼容性复合表述以便检索归因——不同映射指向同一个修补动作：消灭字符串形态的命令组装。
+19. **四环链的最后清点**：直通解码、双源汇流、shell 语义消费、programmatic 敞开——任意一环被切断整条利用链作废；反之修补也不能只打一处。这篇审查的价值在于把四环连同其行号证据一次性摆到桌面上，让修复排期与验收都有一张不凭记忆绘制的地图。
+
+20. **与包管理器既有惯例的差异**：主流包管理工具即便支持动态拉取也自带 registry 鉴别与 host scheme 白名单环节，degit 的解析却允许任意 host 自由拼接，没有注册表式兜底。从 npm 生态迁来的团队会带走一套并不成立的安全直觉——默认输入已被鉴别；这份错觉本身就是风险的倍增器，值得写进接入文档的第一页。
+21. **纵深修复的组合建议**：除 CLI 允许集与库层参数化之外，可在 run 入口输出结构化的 src 拆解日志（host/user/repo/ref 四列），让事后溯源具备机器可读基础；CI 场景则以只读令牌加出口白名单把假想成功的爆炸半径封进沙箱。单点修补管住今天，组合拳管住下一次——两层之间的空隙正是此类缺陷反复回潮的空间。
+
+22. **结束语**：argv 直通（第 22–23 行）与双路汇流（第 106/112 行）叠加 shell 语义消费（第 116 行起）构成了清晰的三段式利用链，每一段都可独立验证且相互衔接；无论从代码事实、生态基数还是公告口径回看，这条链都保持同一形状。分析到此结束——剩下的就是按第 18 步的清单把四个环节逐一焊死。
+
+23. **最小复现推演收束**：假定攻击者持有可控域名并诱导目标流水线执行模板加载任务——src 取选项样式的 ref 变体时，参数越过本文件的各处守卫（帮助分支、目录守卫、测试态短路均与之无关）直达库内命令构造。整条链没有任何一环会停下来询问“这个 ref 长得像不像选项”。推演至此完成全部要素闭合，不再需要对现场环境的额外假设。
+24. **对检测器的可用信号**：出网侧出现由构建容器发起的对陌生代码托管服务的探测流量、命令行捕获到 ref 以双横线开头的加载调用、缓存目录中出现预期外的元数据写入——三者任一命中即值得人工跟进。它们同时充当补丁验收探针：CLI 允许集上线后，第二类信号应彻底消失。
+25. **最终陈述**：本篇所有结论只建立在这份 CLI 文件可见的数据流之上——入口未过滤、转发不过校验、导出未设防、两条来源殊途同归于同一个未设净化的下游协议位。对这类问题的正确响应既不是恐慌也不是忽略，而是按前文清单分层落地；在那之前，每一次形似的加载动作都应被视为潜在命令投放尝试来对待。
+
+26. **行号索引速查**：1–9=依赖导入面；12–21=mri 配置与别名；22–23=位置参数解构；24–31=帮助分支纯展示；32–109=交互选择支线（33 Map 初始化、35 access.json 扫描、57 map.json 枚举、67 enquirer 三问、89 目录守卫、106 汇入 run）；110–113=直通分支与 main 收束；115–130=run 导出体（116 degit 实例化、118/122 事件转发、126 clone 与错误退出）；132–137=VITEST 隔离与自动启动兜底。
+
+27. **提示中的聚合视角**：将三段证据链按“入口-传输-消费”排列后可以看到每个环节都留有至少一个未设卡口：入口层没有允许集、传输层不做结构化解析、消费层把字符串交回解释器语义域；这种全链路的连贯缺位正是本缺陷能够以极低攻击成本反复兑现的根本原因——也构成它区别于偶发编码失误的本质特征。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-77 Command Injection （degit 远端标识字符串直通 git 子进程 shell 组装）", "risk_level": "High", "source": "line 22: const [src, dest] = args._（argv 位置参数，或交互分支选择的 src）", "sink": "line 116: const d = degit(src, args)（src 依库语义进入 git 命令构造并以子进程执行）", "explanation": "未净化 src -> degit 内部拼装 git 远端 URL/ref -> exec 解释 option 样式载荷（--upload-pack 等）-> CLI 直通与程序化导出双入口共用同一链路 -> dest 于 clone 处提供第二填充位", "fix_suggestion": "line 115: run 入口对 src 施加 host/user/repo#ref 允许集正则并显式拒绝选项式载荷，dest 同时剔除前导 - 串"}

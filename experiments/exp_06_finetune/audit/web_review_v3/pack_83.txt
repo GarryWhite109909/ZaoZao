@@ -1,0 +1,490 @@
+batch=83 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7822 lang=go
+[CODE]
+   1| package iceberg
+   2| 
+   3| import (
+   4| 	"net/http"
+   5| 
+   6| 	"github.com/gorilla/mux"
+   7| 	"github.com/seaweedfs/seaweedfs/weed/glog"
+   8| 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+   9| 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+  10| 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+  11| 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
+  12| )
+  13| 
+  14| // FilerClient provides access to the filer for storage operations.
+  15| type FilerClient interface {
+  16| 	WithFilerClient(streamingMode bool, fn func(client filer_pb.SeaweedFilerClient) error) error
+  17| }
+  18| 
+  19| type S3Authenticator interface {
+  20| 	AuthenticateRequest(r *http.Request) (string, interface{}, s3err.ErrorCode)
+  21| 	DefaultAllow() bool
+  22| }
+  23| 
+  24| // CredentialValidator validates S3 access key / secret key pairs
+  25| // and provides credential lookup for OAuth token verification.
+  26| type CredentialValidator interface {
+  27| 	// ValidateS3Credential checks if the access key and secret key are valid.
+  28| 	// Returns the identity name and identity object on success.
+  29| 	ValidateS3Credential(accessKey, secretKey string) (identityName string, identity interface{}, err error)
+  30| 	// GetCredentialByAccessKey looks up a credential by access key.
+  31| 	// Returns the identity name, identity object, and secret key.
+  32| 	// Used for verifying Bearer tokens signed with a specific credential.
+  33| 	GetCredentialByAccessKey(accessKey string) (identityName string, identity interface{}, secretKey string, err error)
+  34| }
+  35| 
+  36| // Server implements the Iceberg REST Catalog API.
+  37| type Server struct {
+  38| 	filerClient         FilerClient
+  39| 	tablesManager       *s3tables.Manager
+  40| 	prefix              string // optional prefix for routes
+  41| 	authenticator       S3Authenticator
+  42| 	credentialValidator CredentialValidator
+  43| 	s3Endpoint          string // http(s):// URL advertised in LoadTable FileIO config
+  44| }
+  45| 
+  46| // NewServer creates a new Iceberg REST Catalog server.
+  47| func NewServer(filerClient FilerClient, authenticator S3Authenticator) *Server {
+  48| 	manager := s3tables.NewManager()
+  49| 	return &Server{
+  50| 		filerClient:   filerClient,
+  51| 		tablesManager: manager,
+  52| 		prefix:        "",
+  53| 		authenticator: authenticator,
+  54| 	}
+  55| }
+  56| 
+  57| // SetCredentialValidator sets the credential validator for OAuth token support.
+  58| func (s *Server) SetCredentialValidator(cv CredentialValidator) {
+  59| 	s.credentialValidator = cv
+  60| }
+  61| 
+  62| // SetS3Endpoint configures the S3 endpoint URL to vend to clients as part of
+  63| // the LoadTable FileIO config, so they can read table data files directly
+  64| // without separately discovering the S3 API address. See issue #9103.
+  65| func (s *Server) SetS3Endpoint(endpoint string) {
+  66| 	s.s3Endpoint = endpoint
+  67| }
+  68| 
+  69| // RegisterRoutes registers Iceberg REST API routes on the provided router.
+  70| func (s *Server) RegisterRoutes(router *mux.Router) {
+  71| 	// Add middleware to log all requests/responses
+  72| 	router.Use(loggingMiddleware)
+  73| 
+  74| 	// Configuration endpoint - no auth needed for config
+  75| 	router.HandleFunc("/v1/config", s.handleConfig).Methods(http.MethodGet)
+  76| 
+  77| 	// OAuth2 token endpoint - no auth needed (this IS the auth endpoint)
+  78| 	router.HandleFunc("/v1/oauth/tokens", s.handleOAuthTokens).Methods(http.MethodPost)
+  79| 
+  80| 	// Namespace endpoints - wrapped with Auth middleware
+  81| 	router.HandleFunc("/v1/namespaces", s.Auth(s.handleListNamespaces)).Methods(http.MethodGet)
+  82| 	router.HandleFunc("/v1/namespaces", s.Auth(s.handleCreateNamespace)).Methods(http.MethodPost)
+  83| 	router.HandleFunc("/v1/namespaces/{namespace}", s.Auth(s.handleGetNamespace)).Methods(http.MethodGet)
+  84| 	router.HandleFunc("/v1/namespaces/{namespace}", s.Auth(s.handleNamespaceExists)).Methods(http.MethodHead)
+  85| 	router.HandleFunc("/v1/namespaces/{namespace}", s.Auth(s.handleDropNamespace)).Methods(http.MethodDelete)
+  86| 
+  87| 	// Table endpoints - wrapped with Auth middleware
+  88| 	router.HandleFunc("/v1/namespaces/{namespace}/tables", s.Auth(s.handleListTables)).Methods(http.MethodGet)
+  89| 	router.HandleFunc("/v1/namespaces/{namespace}/tables", s.Auth(s.handleCreateTable)).Methods(http.MethodPost)
+  90| 	router.HandleFunc("/v1/namespaces/{namespace}/tables/{table}", s.Auth(s.handleLoadTable)).Methods(http.MethodGet)
+  91| 	router.HandleFunc("/v1/namespaces/{namespace}/tables/{table}", s.Auth(s.handleTableExists)).Methods(http.MethodHead)
+  92| 	router.HandleFunc("/v1/namespaces/{namespace}/tables/{table}", s.Auth(s.handleDropTable)).Methods(http.MethodDelete)
+  93| 	router.HandleFunc("/v1/namespaces/{namespace}/tables/{table}", s.Auth(s.handleUpdateTable)).Methods(http.MethodPost)
+  94| 
+  95| 	// With prefix support - wrapped with Auth middleware
+  96| 	router.HandleFunc("/v1/{prefix}/namespaces", s.Auth(s.handleListNamespaces)).Methods(http.MethodGet)
+  97| 	router.HandleFunc("/v1/{prefix}/namespaces", s.Auth(s.handleCreateNamespace)).Methods(http.MethodPost)
+  98| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}", s.Auth(s.handleGetNamespace)).Methods(http.MethodGet)
+  99| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}", s.Auth(s.handleNamespaceExists)).Methods(http.MethodHead)
+ 100| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}", s.Auth(s.handleDropNamespace)).Methods(http.MethodDelete)
+ 101| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables", s.Auth(s.handleListTables)).Methods(http.MethodGet)
+ 102| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables", s.Auth(s.handleCreateTable)).Methods(http.MethodPost)
+ 103| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables/{table}", s.Auth(s.handleLoadTable)).Methods(http.MethodGet)
+ 104| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables/{table}", s.Auth(s.handleTableExists)).Methods(http.MethodHead)
+ 105| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables/{table}", s.Auth(s.handleDropTable)).Methods(http.MethodDelete)
+ 106| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables/{table}", s.Auth(s.handleUpdateTable)).Methods(http.MethodPost)
+ 107| 
+ 108| 	// Catch-all for debugging
+ 109| 	router.PathPrefix("/").HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 110| 		glog.V(2).Infof("Catch-all route hit: %s %s", r.Method, r.RequestURI)
+ 111| 		writeError(w, http.StatusNotFound, "NotFound", "Path not found")
+ 112| 	})
+ 113| 
+ 114| 	glog.V(2).Infof("Registered Iceberg REST Catalog routes")
+ 115| }
+ 116| 
+ 117| func loggingMiddleware(next http.Handler) http.Handler {
+ 118| 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 119| 		glog.V(2).Infof("Iceberg REST request: %s %s from %s", r.Method, r.RequestURI, r.RemoteAddr)
+ 120| 
+ 121| 		// Log all headers for debugging
+ 122| 		glog.V(2).Infof("Iceberg REST headers:")
+ 123| 		for name, values := range r.Header {
+ 124| 			for _, value := range values {
+ 125| 				// Redact sensitive headers
+ 126| 				if name == "Authorization" && len(value) > 20 {
+ 127| 					glog.V(2).Infof("  %s: %s...%s", name, value[:20], value[len(value)-10:])
+ 128| 				} else {
+ 129| 					glog.V(2).Infof("  %s: %s", name, value)
+ 130| 				}
+ 131| 			}
+ 132| 		}
+ 133| 
+ 134| 		// Create a response writer that captures the status code
+ 135| 		wrapped := &responseWriter{ResponseWriter: w}
+ 136| 		next.ServeHTTP(wrapped, r)
+ 137| 
+ 138| 		glog.V(2).Infof("Iceberg REST response: %s %s -> %d", r.Method, r.RequestURI, wrapped.statusCode)
+ 139| 	})
+ 140| }
+ 141| 
+ 142| type responseWriter struct {
+ 143| 	http.ResponseWriter
+ 144| 	statusCode int
+ 145| }
+ 146| 
+ 147| func (w *responseWriter) WriteHeader(code int) {
+ 148| 	w.statusCode = code
+ 149| 	w.ResponseWriter.WriteHeader(code)
+ 150| }
+ 151| 
+ 152| func (s *Server) Auth(handler http.HandlerFunc) http.HandlerFunc {
+ 153| 	return func(w http.ResponseWriter, r *http.Request) {
+ 154| 		// Try Bearer token authentication first (from OAuth2 flow)
+ 155| 		if identityName, identity, ok := s.authenticateBearer(r); ok {
+ 156| 			ctx := r.Context()
+ 157| 			ctx = s3_constants.SetIdentityNameInContext(ctx, identityName)
+ 158| 			if identity != nil {
+ 159| 				ctx = s3_constants.SetIdentityInContext(ctx, identity)
+ 160| 			}
+ 161| 			r = r.WithContext(ctx)
+ 162| 			handler(w, r)
+ 163| 			return
+ 164| 		}
+ 165| 
+ 166| 		if s.authenticator == nil {
+ 167| 			writeError(w, http.StatusUnauthorized, "NotAuthorizedException", "Authentication required")
+ 168| 			return
+ 169| 		}
+ 170| 
+ 171| 		identityName, identity, errCode := s.authenticator.AuthenticateRequest(r)
+ 172| 		if errCode != s3err.ErrNone {
+ 173| 			// If authentication failed but DefaultAllow is enabled, proceed without identity
+ 174| 			if s.authenticator.DefaultAllow() {
+ 175| 				glog.V(2).Infof("Iceberg: AuthenticateRequest failed (%v), but DefaultAllow is true, proceeding", errCode)
+ 176| 			} else {
+ 177| 				apiErr := s3err.GetAPIError(errCode)
+ 178| 				errorType := "RESTException"
+ 179| 				switch apiErr.HTTPStatusCode {
+ 180| 				case http.StatusForbidden:
+ 181| 					errorType = "ForbiddenException"
+ 182| 				case http.StatusUnauthorized:
+ 183| 					errorType = "NotAuthorizedException"
+ 184| 				case http.StatusBadRequest:
+ 185| 					errorType = "BadRequestException"
+ 186| 				case http.StatusInternalServerError:
+ 187| 					errorType = "InternalServerError"
+ 188| 				}
+ 189| 				writeError(w, apiErr.HTTPStatusCode, errorType, apiErr.Description)
+ 190| 				return
+ 191| 			}
+ 192| 		}
+ 193| 
+ 194| 		if identityName != "" || identity != nil {
+ 195| 			ctx := r.Context()
+ 196| 			if identityName != "" {
+ 197| 				ctx = s3_constants.SetIdentityNameInContext(ctx, identityName)
+ 198| 			}
+ 199| 			if identity != nil {
+ 200| 				ctx = s3_constants.SetIdentityInContext(ctx, identity)
+ 201| 			}
+ 202| 			r = r.WithContext(ctx)
+ 203| 		}
+ 204| 
+ 205| 		handler(w, r)
+ 206| 	}
+ 207| }
+ 208| 
+ 209| 
+
+### id=7823 lang=go
+[CODE]
+   1| package iceberg
+   2| 
+   3| import (
+   4| 	"net/http"
+   5| 
+   6| 	"github.com/gorilla/mux"
+   7| 	"github.com/seaweedfs/seaweedfs/weed/glog"
+   8| 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+   9| 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+  10| 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+  11| 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
+  12| )
+  13| 
+  14| // FilerClient provides access to the filer for storage operations.
+  15| type FilerClient interface {
+  16| 	WithFilerClient(streamingMode bool, fn func(client filer_pb.SeaweedFilerClient) error) error
+  17| }
+  18| 
+  19| type S3Authenticator interface {
+  20| 	AuthenticateRequest(r *http.Request) (string, interface{}, s3err.ErrorCode)
+  21| 	DefaultAllow() bool
+  22| }
+  23| 
+  24| // CredentialValidator validates S3 access key / secret key pairs
+  25| // and provides credential lookup for OAuth token verification.
+  26| type CredentialValidator interface {
+  27| 	// ValidateS3Credential checks if the access key and secret key are valid.
+  28| 	// Returns the identity name and identity object on success.
+  29| 	ValidateS3Credential(accessKey, secretKey string) (identityName string, identity interface{}, err error)
+  30| 	// GetCredentialByAccessKey looks up a credential by access key.
+  31| 	// Returns the identity name, identity object, and secret key.
+  32| 	// Used for verifying Bearer tokens signed with a specific credential.
+  33| 	GetCredentialByAccessKey(accessKey string) (identityName string, identity interface{}, secretKey string, err error)
+  34| }
+  35| 
+  36| // Server implements the Iceberg REST Catalog API.
+  37| type Server struct {
+  38| 	filerClient         FilerClient
+  39| 	tablesManager       *s3tables.Manager
+  40| 	prefix              string // optional prefix for routes
+  41| 	authenticator       S3Authenticator
+  42| 	credentialValidator CredentialValidator
+  43| 	s3Endpoint          string // http(s):// URL advertised in LoadTable FileIO config
+  44| }
+  45| 
+  46| // NewServer creates a new Iceberg REST Catalog server.
+  47| func NewServer(filerClient FilerClient, authenticator S3Authenticator) *Server {
+  48| 	manager := s3tables.NewManager()
+  49| 	return &Server{
+  50| 		filerClient:   filerClient,
+  51| 		tablesManager: manager,
+  52| 		prefix:        "",
+  53| 		authenticator: authenticator,
+  54| 	}
+  55| }
+  56| 
+  57| // SetCredentialValidator sets the credential validator for OAuth token support.
+  58| func (s *Server) SetCredentialValidator(cv CredentialValidator) {
+  59| 	s.credentialValidator = cv
+  60| }
+  61| 
+  62| // SetS3Endpoint configures the S3 endpoint URL to vend to clients as part of
+  63| // the LoadTable FileIO config, so they can read table data files directly
+  64| // without separately discovering the S3 API address. See issue #9103.
+  65| func (s *Server) SetS3Endpoint(endpoint string) {
+  66| 	s.s3Endpoint = endpoint
+  67| }
+  68| 
+  69| // RegisterRoutes registers Iceberg REST API routes on the provided router.
+  70| func (s *Server) RegisterRoutes(router *mux.Router) {
+  71| 	// Add middleware to log all requests/responses
+  72| 	router.Use(loggingMiddleware)
+  73| 
+  74| 	// Reject `..`/`.`/NUL in {prefix}/{namespace}/{table} vars before any
+  75| 	// handler runs. The router uses SkipClean(true), so traversal segments
+  76| 	// would otherwise reach path.Join in stage-marker / location builders.
+  77| 	// Registered after loggingMiddleware so rejected requests still get
+  78| 	// audit-logged.
+  79| 	router.Use(validateRequestPath)
+  80| 
+  81| 	// Configuration endpoint - no auth needed for config
+  82| 	router.HandleFunc("/v1/config", s.handleConfig).Methods(http.MethodGet)
+  83| 
+  84| 	// OAuth2 token endpoint - no auth needed (this IS the auth endpoint)
+  85| 	router.HandleFunc("/v1/oauth/tokens", s.handleOAuthTokens).Methods(http.MethodPost)
+  86| 
+  87| 	// Namespace endpoints - wrapped with Auth middleware
+  88| 	router.HandleFunc("/v1/namespaces", s.Auth(s.handleListNamespaces)).Methods(http.MethodGet)
+  89| 	router.HandleFunc("/v1/namespaces", s.Auth(s.handleCreateNamespace)).Methods(http.MethodPost)
+  90| 	router.HandleFunc("/v1/namespaces/{namespace}", s.Auth(s.handleGetNamespace)).Methods(http.MethodGet)
+  91| 	router.HandleFunc("/v1/namespaces/{namespace}", s.Auth(s.handleNamespaceExists)).Methods(http.MethodHead)
+  92| 	router.HandleFunc("/v1/namespaces/{namespace}", s.Auth(s.handleDropNamespace)).Methods(http.MethodDelete)
+  93| 
+  94| 	// Table endpoints - wrapped with Auth middleware
+  95| 	router.HandleFunc("/v1/namespaces/{namespace}/tables", s.Auth(s.handleListTables)).Methods(http.MethodGet)
+  96| 	router.HandleFunc("/v1/namespaces/{namespace}/tables", s.Auth(s.handleCreateTable)).Methods(http.MethodPost)
+  97| 	router.HandleFunc("/v1/namespaces/{namespace}/tables/{table}", s.Auth(s.handleLoadTable)).Methods(http.MethodGet)
+  98| 	router.HandleFunc("/v1/namespaces/{namespace}/tables/{table}", s.Auth(s.handleTableExists)).Methods(http.MethodHead)
+  99| 	router.HandleFunc("/v1/namespaces/{namespace}/tables/{table}", s.Auth(s.handleDropTable)).Methods(http.MethodDelete)
+ 100| 	router.HandleFunc("/v1/namespaces/{namespace}/tables/{table}", s.Auth(s.handleUpdateTable)).Methods(http.MethodPost)
+ 101| 
+ 102| 	// With prefix support - wrapped with Auth middleware
+ 103| 	router.HandleFunc("/v1/{prefix}/namespaces", s.Auth(s.handleListNamespaces)).Methods(http.MethodGet)
+ 104| 	router.HandleFunc("/v1/{prefix}/namespaces", s.Auth(s.handleCreateNamespace)).Methods(http.MethodPost)
+ 105| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}", s.Auth(s.handleGetNamespace)).Methods(http.MethodGet)
+ 106| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}", s.Auth(s.handleNamespaceExists)).Methods(http.MethodHead)
+ 107| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}", s.Auth(s.handleDropNamespace)).Methods(http.MethodDelete)
+ 108| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables", s.Auth(s.handleListTables)).Methods(http.MethodGet)
+ 109| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables", s.Auth(s.handleCreateTable)).Methods(http.MethodPost)
+ 110| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables/{table}", s.Auth(s.handleLoadTable)).Methods(http.MethodGet)
+ 111| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables/{table}", s.Auth(s.handleTableExists)).Methods(http.MethodHead)
+ 112| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables/{table}", s.Auth(s.handleDropTable)).Methods(http.MethodDelete)
+ 113| 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}/tables/{table}", s.Auth(s.handleUpdateTable)).Methods(http.MethodPost)
+ 114| 
+ 115| 	// Catch-all for debugging
+ 116| 	router.PathPrefix("/").HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 117| 		glog.V(2).Infof("Catch-all route hit: %s %s", r.Method, r.RequestURI)
+ 118| 		writeError(w, http.StatusNotFound, "NotFound", "Path not found")
+ 119| 	})
+ 120| 
+ 121| 	glog.V(2).Infof("Registered Iceberg REST Catalog routes")
+ 122| }
+ 123| 
+ 124| func loggingMiddleware(next http.Handler) http.Handler {
+ 125| 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 126| 		glog.V(2).Infof("Iceberg REST request: %s %s from %s", r.Method, r.RequestURI, r.RemoteAddr)
+ 127| 
+ 128| 		// Log all headers for debugging
+ 129| 		glog.V(2).Infof("Iceberg REST headers:")
+ 130| 		for name, values := range r.Header {
+ 131| 			for _, value := range values {
+ 132| 				// Redact sensitive headers
+ 133| 				if name == "Authorization" && len(value) > 20 {
+ 134| 					glog.V(2).Infof("  %s: %s...%s", name, value[:20], value[len(value)-10:])
+ 135| 				} else {
+ 136| 					glog.V(2).Infof("  %s: %s", name, value)
+ 137| 				}
+ 138| 			}
+ 139| 		}
+ 140| 
+ 141| 		// Create a response writer that captures the status code
+ 142| 		wrapped := &responseWriter{ResponseWriter: w}
+ 143| 		next.ServeHTTP(wrapped, r)
+ 144| 
+ 145| 		glog.V(2).Infof("Iceberg REST response: %s %s -> %d", r.Method, r.RequestURI, wrapped.statusCode)
+ 146| 	})
+ 147| }
+ 148| 
+ 149| type responseWriter struct {
+ 150| 	http.ResponseWriter
+ 151| 	statusCode int
+ 152| }
+ 153| 
+ 154| func (w *responseWriter) WriteHeader(code int) {
+ 155| 	w.statusCode = code
+ 156| 	w.ResponseWriter.WriteHeader(code)
+ 157| }
+ 158| 
+ 159| func (s *Server) Auth(handler http.HandlerFunc) http.HandlerFunc {
+ 160| 	return func(w http.ResponseWriter, r *http.Request) {
+ 161| 		// Try Bearer token authentication first (from OAuth2 flow)
+ 162| 		if identityName, identity, ok := s.authenticateBearer(r); ok {
+ 163| 			ctx := r.Context()
+ 164| 			ctx = s3_constants.SetIdentityNameInContext(ctx, identityName)
+ 165| 			if identity != nil {
+ 166| 				ctx = s3_constants.SetIdentityInContext(ctx, identity)
+ 167| 			}
+ 168| 			r = r.WithContext(ctx)
+ 169| 			handler(w, r)
+ 170| 			return
+ 171| 		}
+ 172| 
+ 173| 		if s.authenticator == nil {
+ 174| 			writeError(w, http.StatusUnauthorized, "NotAuthorizedException", "Authentication required")
+ 175| 			return
+ 176| 		}
+ 177| 
+ 178| 		identityName, identity, errCode := s.authenticator.AuthenticateRequest(r)
+ 179| 		if errCode != s3err.ErrNone {
+ 180| 			// If authentication failed but DefaultAllow is enabled, proceed without identity
+ 181| 			if s.authenticator.DefaultAllow() {
+ 182| 				glog.V(2).Infof("Iceberg: AuthenticateRequest failed (%v), but DefaultAllow is true, proceeding", errCode)
+ 183| 			} else {
+ 184| 				apiErr := s3err.GetAPIError(errCode)
+ 185| 				errorType := "RESTException"
+ 186| 				switch apiErr.HTTPStatusCode {
+ 187| 				case http.StatusForbidden:
+ 188| 					errorType = "ForbiddenException"
+ 189| 				case http.StatusUnauthorized:
+ 190| 					errorType = "NotAuthorizedException"
+ 191| 				case http.StatusBadRequest:
+ 192| 					errorType = "BadRequestException"
+ 193| 				case http.StatusInternalServerError:
+ 194| 					errorType = "InternalServerError"
+ 195| 				}
+ 196| 				writeError(w, apiErr.HTTPStatusCode, errorType, apiErr.Description)
+ 197| 				return
+ 198| 			}
+ 199| 		}
+ 200| 
+ 201| 		if identityName != "" || identity != nil {
+ 202| 			ctx := r.Context()
+ 203| 			if identityName != "" {
+ 204| 				ctx = s3_constants.SetIdentityNameInContext(ctx, identityName)
+ 205| 			}
+ 206| 			if identity != nil {
+ 207| 				ctx = s3_constants.SetIdentityInContext(ctx, identity)
+ 208| 			}
+ 209| 			r = r.WithContext(ctx)
+ 210| 		}
+ 211| 
+ 212| 		handler(w, r)
+ 213| 	}
+ 214| }
+ 215| 
+ 216| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7822 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（逐函数通读全文）
+
+1. **第 1–60 行：接口与结构体定义**。`Server` 持有 `authenticator`、`credentialValidator`、`s3Endpoint` 等字段，无直接 sink。
+
+2. **第 62–75 行：`NewServer`**。仅初始化，无输入来源。
+
+3. **第 77–130 行：`RegisterRoutes` 路由注册（入口点枚举）**：
+   - `/v1/config` GET —— 无认证（第 84 行），配置端点通常可接受；
+   - `/v1/oauth/tokens` POST —— 无认证（第 87 行），本身即认证端点，但 handler 不在本文件，无法验证其内部逻辑；
+   - 所有 namespace/table 端点均包 `s.Auth(...)`（第 89–113 行）；
+   - 带前缀的重复路由 `{prefix}` 同样包 `Auth`（第 115–126 行）——第二入口通道存在但同样经过认证中间件，无绕过；
+   - 第 128–131 行 catch-all 仅记录日志并返回 404。
+
+4. **第 133–160 行：`loggingMiddleware` —— 发现问题点一**。第 141–147 行遍历打印**所有请求头**。对 `Authorization` 头仅在长度 >20 时做“首 20 + 尾 10”截断——对于典型 Bearer token（几十到上百字符），这实际上泄露了 token 的绝大部分内容；且该“脱敏”是黑名单式（只处理名为 `Authorization` 的头），`Cookie`、`X-Amz-Security-Token`、代理凭证等其他敏感头被**完整明文写入日志**。source：请求头（第 142 行）；sink：`glog.V(2).Infof`（第 144/146 行）。属于 CWE-532（敏感信息写入日志文件）。注意 `V(2)` 是否启用取决于日志级别配置，但代码层面无任何强制防护。
+
+5. **第 162–172 行：`responseWriter`**。纯包装，无漏洞。
+
+6. **第 174–226 行：`Auth` 中间件 —— 发现问题点二（条件性认证绕过）**：
+   - 第 177–187 行先尝试 Bearer 认证，成功则放行，正常；
+   - 第 189–191 行 authenticator 为 nil 时拒绝，正确；
+   - 第 196–210 行：当 `AuthenticateRequest` 返回错误码时，若 `DefaultAllow()` 为 true（第 200 行），则**在认证失败的情况下继续执行受保护 handler**，且此时 identity 为空——所有 namespace/table 的增删改查端点对未认证请求开放。这是典型的 CWE-306（关键操作缺少身份验证）/ fail-open 设计。虽然依赖部署时开启 `DefaultAllow`，但代码把“认证失败”与“匿名放行”混为一条路径，且不区分错误类型（签名错误 vs 未携带凭证），构成真实风险面；
+   - 第 212–222 行将 identity 写入 context 后调用 handler。
+
+7. **替代通道核查**：带 prefix 路由（第 115–126 行）与标准路由共用同一组 handler 和同一 `Auth` 包装，无遗漏；catch-all 不触达业务逻辑；本文件内无文件/环境变量/回调等额外 source。
+
+8. **防御有效性评估**：Authorization 头的截断属黑名单式部分脱敏，可被短 token 或其他头名绕过，不算有效防御；`DefaultAllow` 分支无任何补偿控制（如审计标记、限流）。
+
+## 结论
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-532 敏感信息写入日志 + CWE-306 条件性认证绕过", "risk_level": "High", "source": "line 123: 遍历 r.Header 全部请求头（含 Authorization/Cookie）；line 175: AuthenticateRequest 失败结果", "sink": "line 138: glog.V(2).Infof 明文输出请求头；line 175: DefaultAllow 为真时认证失败仍放行受保护 handler", "explanation": "loggingMiddleware 将除 Authorization 外的所有头（Cookie 等）完整写入日志，且 Authorization 仅做首20尾10截断，长 Bearer token 大部分内容仍泄露 -> 凭证经日志外泄；Auth 中间件在认证失败且 DefaultAllow 开启时不加身份直接执行 namespace/table 增删改查 -> fail-open 认证绕过", "fix_suggestion": "line 141-147: 改为白名单方式仅记录非敏感头，或对所有 Authorization/Cookie 类头完全脱敏；line 199-205: 移除 DefaultAllow 时对失败认证的静默放行，或至少要求显式匿名模式并记录审计事件"}
+
+### id=7823 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **路由注册（RegisterRoutes，约第 88–140 行）**：枚举全部入口点——`/v1/config`（GET，无认证）、`/v1/oauth/tokens`（POST，无认证）、namespaces/tables 的 CRUD 路由（均经 `s.Auth` 包装）、带 `{prefix}` 的第二组等价路由、以及 catch-all 404。无遗漏的未认证数据面端点；config 与 oauth/tokens 无认证属设计使然。
+
+2. **路径遍历防御（约第 96–100 行）**：注册了 `validateRequestPath` 中间件，注释明确说明因 router 使用 `SkipClean(true)` 需在 handler 前拒绝 `..`/`.`/NUL。该中间件实现体不在本段代码中，无法验证其有效性，但设计意图正确且先于所有 handler 执行。注意：若按本任务判定标准“黑名单过滤视为可绕过”，此处属黑名单式校验，但被拒绝的是字面 `..` 段而非模式匹配，且文件被截断无法证伪，不能据此断言漏洞。
+
+3. **日志中间件（loggingMiddleware，约第 142–165 行）**：对 `Authorization` 头仅在 `len(value) > 20` 时部分脱敏（首 20 + 尾 10 字符）；**长度 ≤20 的凭证会被完整写入日志**（第 152 行 else 分支）。这是一个真实的信息泄露缺陷：短 Bearer token / 短签名会明文落入 glog 日志。风险较低（需日志访问权 + 特定短凭证），但确为 source→sink 数据流：HTTP 头 → glog 文件，脱敏逻辑存在条件性失效。
+
+4. **Auth 中间件（约第 178–230 行）**：三条通道：(a) Bearer token 经 `authenticateBearer`；(b) S3 签名经 `authenticator.AuthenticateRequest`；(c) **失败但 `DefaultAllow()` 为真时放行且不设 identity**（第 197–200 行）。(c) 是显式的部署配置语义（匿名允许），非代码缺陷，但在开启 DefaultAllow 的部署中等同于关闭 Iceberg 目录的授权边界——属于配置性风险提示而非本文件漏洞。
+
+5. **第二入口检查**：带 `{prefix}` 的重复路由组与主路由共用同一 Auth 包装和同一 validateRequestPath 中间件，无旁路。catch-all 仅返回 404 并记录 URI（URI 含潜在敏感 query 参数进入 V(2) 级调试日志，默认不输出）。
+
+6. **截断声明**：handlers（handleLoadTable 等）、validateRequestPath、authenticateBearer 的实现不在给定片段内，其内部 source→sink 无法基于证据判定；结论仅覆盖所给全文。
+
+综合：唯一可证实的问题是第 3 点的 Authorization 头条件性脱敏失败（≤20 字符时全量记录）。其余入口均有 Auth 或设计上无需认证，未见可利用的注入/遍历/越权数据流。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "HTTP Authorization header", "sink": "glog.V(2).Infof debug log", "explanation": "通读全文后：所有数据面路由均经 s.Auth 认证包装，/v1/config 与 /v1/oauth/tokens 无认证属设计使然；带 {prefix} 的第二组路由复用相同中间件无旁路；路径遍历由 validateRequestPath 在 handler 前统一拦截（实现体不在片段内）。唯一可证实的缺陷是 loggingMiddleware 对 Authorization 头仅当长度大于 20 时才脱敏，长度不超过 20 的凭证会被完整写入调试日志，构成低风险信息泄露；DefaultAllow 放行是显式配置语义而非代码漏洞。", "fix_suggestion": "将 Authorization 头一律完全脱敏或仅记录 scheme（如 Bearer ***），不依赖长度阈值；同时建议补充 validateRequestPath 实现以确认拒绝逻辑覆盖编码变体"}

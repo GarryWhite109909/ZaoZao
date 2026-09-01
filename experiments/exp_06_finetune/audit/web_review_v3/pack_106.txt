@@ -1,0 +1,646 @@
+batch=106 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7888 lang=go
+[CODE]
+   1| package downloader
+   2| 
+   3| import (
+   4| 	"context"
+   5| 	"fmt"
+   6| 	"io"
+   7| 	"mime"
+   8| 	"net"
+   9| 	"net/http"
+  10| 	"net/url"
+  11| 	"path/filepath"
+  12| 	"strings"
+  13| 	"sync"
+  14| 	"time"
+  15| 
+  16| 	"emperror.dev/errors"
+  17| 	"github.com/goccy/go-json"
+  18| 	"github.com/google/uuid"
+  19| 
+  20| 	"github.com/pterodactyl/wings/server"
+  21| )
+  22| 
+  23| var client *http.Client
+  24| 
+  25| func init() {
+  26| 	dialer := &net.Dialer{
+  27| 		LocalAddr: nil,
+  28| 	}
+  29| 
+  30| 	trnspt := http.DefaultTransport.(*http.Transport).Clone()
+  31| 	trnspt.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+  32| 		c, err := dialer.DialContext(ctx, network, addr)
+  33| 		if err != nil {
+  34| 			return nil, errors.WithStack(err)
+  35| 		}
+  36| 
+  37| 		ipStr, _, err := net.SplitHostPort(c.RemoteAddr().String())
+  38| 		if err != nil {
+  39| 			return c, errors.WithStack(err)
+  40| 		}
+  41| 		ip := net.ParseIP(ipStr)
+  42| 		if ip == nil {
+  43| 			return c, errors.WithStack(ErrInvalidIPAddress)
+  44| 		}
+  45| 		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() {
+  46| 			return c, errors.WithStack(ErrInternalResolution)
+  47| 		}
+  48| 		for _, block := range internalRanges {
+  49| 			if !block.Contains(ip) {
+  50| 				continue
+  51| 			}
+  52| 			return c, errors.WithStack(ErrInternalResolution)
+  53| 		}
+  54| 		return c, nil
+  55| 	}
+  56| 
+  57| 	client = &http.Client{
+  58| 		Timeout: time.Hour * 12,
+  59| 
+  60| 		Transport: trnspt,
+  61| 
+  62| 		// Disallow any redirect on an HTTP call. This is a security requirement: do not modify
+  63| 		// this logic without first ensuring that the new target location IS NOT within the current
+  64| 		// instance's local network.
+  65| 		//
+  66| 		// This specific error response just causes the client to not follow the redirect and
+  67| 		// returns the actual redirect response to the caller. Not perfect, but simple and most
+  68| 		// people won't be using URLs that redirect anyways hopefully?
+  69| 		//
+  70| 		// We'll re-evaluate this down the road if needed.
+  71| 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+  72| 			return http.ErrUseLastResponse
+  73| 		},
+  74| 	}
+  75| }
+  76| 
+  77| var instance = &Downloader{
+  78| 	// Tracks all the active downloads.
+  79| 	downloadCache: make(map[string]*Download),
+  80| 	// Tracks all the downloads active for a given server instance. This is
+  81| 	// primarily used to make things quicker and keep the code a little more
+  82| 	// legible throughout here.
+  83| 	serverCache: make(map[string][]string),
+  84| }
+  85| 
+  86| // Internal IP ranges that should be blocked if the resource requested resolves within.
+  87| var internalRanges = []*net.IPNet{
+  88| 	mustParseCIDR("127.0.0.1/8"),
+  89| 	mustParseCIDR("10.0.0.0/8"),
+  90| 	mustParseCIDR("172.16.0.0/12"),
+  91| 	mustParseCIDR("192.168.0.0/16"),
+  92| 	mustParseCIDR("169.254.0.0/16"),
+  93| 	mustParseCIDR("::1/128"),
+  94| 	mustParseCIDR("fe80::/10"),
+  95| 	mustParseCIDR("fc00::/7"),
+  96| }
+  97| 
+  98| const (
+  99| 	ErrInternalResolution = errors.Sentinel("downloader: destination resolves to internal network location")
+ 100| 	ErrInvalidIPAddress   = errors.Sentinel("downloader: invalid IP address")
+ 101| 	ErrDownloadFailed     = errors.Sentinel("downloader: download request failed")
+ 102| )
+ 103| 
+ 104| type Counter struct {
+ 105| 	total   int
+ 106| 	onWrite func(total int)
+ 107| }
+ 108| 
+ 109| func (c *Counter) Write(p []byte) (int, error) {
+ 110| 	n := len(p)
+ 111| 	c.total += n
+ 112| 	c.onWrite(c.total)
+ 113| 	return n, nil
+ 114| }
+ 115| 
+ 116| type DownloadRequest struct {
+ 117| 	Directory string
+ 118| 	URL       *url.URL
+ 119| 	FileName  string
+ 120| 	UseHeader bool
+ 121| }
+ 122| 
+ 123| type Download struct {
+ 124| 	Identifier string
+ 125| 	path       string
+ 126| 	mu         sync.RWMutex
+ 127| 	req        DownloadRequest
+ 128| 	server     *server.Server
+ 129| 	progress   float64
+ 130| 	cancelFunc *context.CancelFunc
+ 131| }
+ 132| 
+ 133| // New starts a new tracked download which allows for cancellation later on by calling
+ 134| // the Downloader.Cancel function.
+ 135| func New(s *server.Server, r DownloadRequest) *Download {
+ 136| 	dl := Download{
+ 137| 		Identifier: uuid.Must(uuid.NewRandom()).String(),
+ 138| 		req:        r,
+ 139| 		server:     s,
+ 140| 	}
+ 141| 	instance.track(&dl)
+ 142| 	return &dl
+ 143| }
+ 144| 
+ 145| // ByServer returns all the tracked downloads for a given server instance.
+ 146| func ByServer(sid string) []*Download {
+ 147| 	instance.mu.Lock()
+ 148| 	defer instance.mu.Unlock()
+ 149| 	var downloads []*Download
+ 150| 	if v, ok := instance.serverCache[sid]; ok {
+ 151| 		for _, id := range v {
+ 152| 			if dl, ok := instance.downloadCache[id]; ok {
+ 153| 				downloads = append(downloads, dl)
+ 154| 			}
+ 155| 		}
+ 156| 	}
+ 157| 	return downloads
+ 158| }
+ 159| 
+ 160| // ByID returns a single Download matching a given identifier. If no download is found
+ 161| // the second argument in the response will be false.
+ 162| func ByID(dlid string) *Download {
+ 163| 	return instance.find(dlid)
+ 164| }
+ 165| 
+ 166| //goland:noinspection GoVetCopyLock
+ 167| func (dl Download) MarshalJSON() ([]byte, error) {
+ 168| 	return json.Marshal(struct {
+ 169| 		Identifier string
+ 170| 		Progress   float64
+ 171| 	}{
+ 172| 		Identifier: dl.Identifier,
+ 173| 		Progress:   dl.Progress(),
+ 174| 	})
+ 175| }
+ 176| 
+ 177| // Execute executes a given download for the server and begins writing the file to the disk. Once
+ 178| // completed the download will be removed from the cache.
+ 179| func (dl *Download) Execute() error {
+ 180| 	ctx, cancel := context.WithTimeout(context.Background(), time.Hour*12)
+ 181| 	dl.cancelFunc = &cancel
+ 182| 	defer dl.Cancel()
+ 183| 
+ 184| 	// At this point we have verified the destination is not within the local network, so we can
+ 185| 	// now make a request to that URL and pull down the file, saving it to the server's data
+ 186| 	// directory.
+ 187| 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dl.req.URL.String(), nil)
+ 188| 	if err != nil {
+ 189| 		return errors.WrapIf(err, "downloader: failed to create request")
+ 190| 	}
+ 191| 
+ 192| 	req.Header.Set("User-Agent", "Pterodactyl Panel (https://pterodactyl.io)")
+ 193| 	res, err := client.Do(req)
+ 194| 	if err != nil {
+ 195| 		return ErrDownloadFailed
+ 196| 	}
+ 197| 	defer res.Body.Close()
+ 198| 	if res.StatusCode != http.StatusOK {
+ 199| 		return errors.New("downloader: got bad response status from endpoint: " + res.Status)
+ 200| 	}
+ 201| 
+ 202| 	if res.ContentLength < 1 {
+ 203| 		return errors.New("downloader: request is missing ContentLength")
+ 204| 	}
+ 205| 
+ 206| 	if dl.req.UseHeader {
+ 207| 		if contentDisposition := res.Header.Get("Content-Disposition"); contentDisposition != "" {
+ 208| 			_, params, err := mime.ParseMediaType(contentDisposition)
+ 209| 			if err != nil {
+ 210| 				return errors.WrapIf(err, "downloader: invalid \"Content-Disposition\" header")
+ 211| 			}
+ 212| 
+ 213| 			if v, ok := params["filename"]; ok {
+ 214| 				dl.path = v
+ 215| 			}
+ 216| 		}
+ 217| 	}
+ 218| 	if dl.path == "" {
+ 219| 		if dl.req.FileName != "" {
+ 220| 			dl.path = dl.req.FileName
+ 221| 		} else {
+ 222| 			parts := strings.Split(dl.req.URL.Path, "/")
+ 223| 			dl.path = parts[len(parts)-1]
+ 224| 		}
+ 225| 	}
+ 226| 
+ 227| 	p := dl.Path()
+ 228| 	dl.server.Log().WithField("path", p).Debug("writing remote file to disk")
+ 229| 
+ 230| 	// Write the file while tracking the progress, Write will check that the
+ 231| 	// size of the file won't exceed the disk limit.
+ 232| 	r := io.TeeReader(res.Body, dl.counter(res.ContentLength))
+ 233| 	if err := dl.server.Filesystem().Write(p, r, res.ContentLength, 0o644); err != nil {
+ 234| 		return errors.WrapIf(err, "downloader: failed to write file to server directory")
+ 235| 	}
+ 236| 	return nil
+ 237| }
+ 238| 
+ 239| // Cancel cancels a running download and frees up the associated resources. If a file is being
+ 240| // written a partial file will remain present on the disk.
+ 241| func (dl *Download) Cancel() {
+ 242| 	if dl.cancelFunc != nil {
+ 243| 		(*dl.cancelFunc)()
+ 244| 	}
+ 245| 	instance.remove(dl.Identifier)
+ 246| }
+ 247| 
+ 248| // BelongsTo checks if the given download belongs to the provided server.
+ 249| func (dl *Download) BelongsTo(s *server.Server) bool {
+ 250| 	return dl.server.ID() == s.ID()
+ 251| }
+ 252| 
+ 253| // Progress returns the current progress of the download as a float value between 0 and 1 where
+ 254| // 1 indicates that the download is completed.
+ 255| func (dl *Download) Progress() float64 {
+ 256| 	dl.mu.RLock()
+ 257| 	defer dl.mu.RUnlock()
+ 258| 	return dl.progress
+ 259| }
+ 260| 
+ 261| func (dl *Download) Path() string {
+ 262| 	return filepath.Join(dl.req.Directory, dl.path)
+ 263| }
+ 264| 
+ 265| // Handles a write event by updating the progress completed percentage and firing off
+ 266| // events to the server websocket as needed.
+ 267| func (dl *Download) counter(contentLength int64) *Counter {
+ 268| 	onWrite := func(t int) {
+ 269| 		dl.mu.Lock()
+ 270| 		defer dl.mu.Unlock()
+ 271| 		dl.progress = float64(t) / float64(contentLength)
+ 272| 	}
+ 273| 	return &Counter{
+ 274| 		onWrite: onWrite,
+ 275| 	}
+ 276| }
+ 277| 
+ 278| // Downloader represents a global downloader that keeps track of all currently processing downloads
+ 279| // for the machine.
+ 280| type Downloader struct {
+ 281| 	mu            sync.RWMutex
+ 282| 	downloadCache map[string]*Download
+ 283| 	serverCache   map[string][]string
+ 284| }
+ 285| 
+ 286| // track tracks a download in the internal cache for this instance.
+ 287| func (d *Downloader) track(dl *Download) {
+ 288| 	d.mu.Lock()
+ 289| 	defer d.mu.Unlock()
+ 290| 	sid := dl.server.ID()
+ 291| 	if _, ok := d.downloadCache[dl.Identifier]; !ok {
+ 292| 		d.downloadCache[dl.Identifier] = dl
+ 293| 		if _, ok := d.serverCache[sid]; !ok {
+ 294| 			d.serverCache[sid] = []string{}
+ 295| 		}
+ 296| 		d.serverCache[sid] = append(d.serverCache[sid], dl.Identifier)
+ 297| 	}
+ 298| }
+ 299| 
+ 300| // find finds a given download entry using the provided ID and returns it.
+ 301| func (d *Downloader) find(dlid string) *Download {
+ 302| 	d.mu.RLock()
+ 303| 	defer d.mu.RUnlock()
+ 304| 	if entry, ok := d.downloadCache[dlid]; ok {
+ 305| 		return entry
+ 306| 	}
+ 307| 	return nil
+ 308| }
+ 309| 
+ 310| // remove removes the given download reference from the cache storing them. This also updates
+ 311| // the slice of active downloads for a given server to not include this download.
+ 312| func (d *Downloader) remove(dlID string) {
+ 313| 	d.mu.Lock()
+ 314| 	defer d.mu.Unlock()
+ 315| 	if _, ok := d.downloadCache[dlID]; !ok {
+ 316| 		return
+ 317| 	}
+ 318| 	sID := d.downloadCache[dlID].server.ID()
+ 319| 	delete(d.downloadCache, dlID)
+ 320| 	if tracked, ok := d.serverCache[sID]; ok {
+ 321| 		var out []string
+ 322| 		for _, k := range tracked {
+ 323| 			if k != dlID {
+ 324| 				out = append(out, k)
+ 325| 			}
+ 326| 		}
+ 327| 		d.serverCache[sID] = out
+ 328| 	}
+ 329| }
+ 330| 
+ 331| func mustParseCIDR(ip string) *net.IPNet {
+ 332| 	_, block, err := net.ParseCIDR(ip)
+ 333| 	if err != nil {
+ 334| 		panic(fmt.Errorf("downloader: failed to parse CIDR: %s", err))
+ 335| 	}
+ 336| 	return block
+ 337| }
+ 338| 
+ 339| 
+
+### id=7889 lang=java
+[CODE]
+   1| /*
+   2|  * The MIT License
+   3|  *
+   4|  * Copyright (C) 2010-2011 by Anthony Robinson
+   5|  *
+   6|  * Permission is hereby granted, free of charge, to any person obtaining a copy
+   7|  * of this software and associated documentation files (the "Software"), to deal
+   8|  * in the Software without restriction, including without limitation the rights
+   9|  * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  10|  * copies of the Software, and to permit persons to whom the Software is
+  11|  * furnished to do so, subject to the following conditions:
+  12|  *
+  13|  * The above copyright notice and this permission notice shall be included in
+  14|  * all copies or substantial portions of the Software.
+  15|  *
+  16|  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  17|  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  18|  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  19|  * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  20|  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  21|  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  22|  * THE SOFTWARE.
+  23|  */
+  24| 
+  25| package jenkins.plugins.publish_over_cifs.descriptor;
+  26| 
+  27| import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+  28| import hudson.Util;
+  29| import hudson.model.AbstractProject;
+  30| import hudson.model.TaskListener;
+  31| import hudson.tasks.BuildStepDescriptor;
+  32| import hudson.tasks.Publisher;
+  33| import hudson.util.CopyOnWriteList;
+  34| import hudson.util.FormValidation;
+  35| import jenkins.model.Jenkins;
+  36| import jenkins.plugins.publish_over.BPBuildInfo;
+  37| import jenkins.plugins.publish_over.BPInstanceConfig;
+  38| import jenkins.plugins.publish_over.BPPlugin;
+  39| import jenkins.plugins.publish_over.BPValidators;
+  40| import jenkins.plugins.publish_over.JenkinsCapabilities;
+  41| import jenkins.plugins.publish_over_cifs.CifsHostConfiguration;
+  42| import jenkins.plugins.publish_over_cifs.CifsNodeProperties;
+  43| import jenkins.plugins.publish_over_cifs.CifsPublisher;
+  44| import jenkins.plugins.publish_over_cifs.CifsPublisherPlugin;
+  45| import jenkins.plugins.publish_over_cifs.Messages;
+  46| import jenkins.plugins.publish_over_cifs.options.CifsDefaults;
+  47| import jenkins.plugins.publish_over_cifs.options.CifsPluginDefaults;
+  48| import net.sf.json.JSONObject;
+  49| import org.kohsuke.stapler.QueryParameter;
+  50| import org.kohsuke.stapler.StaplerRequest;
+  51| import org.kohsuke.stapler.StaplerResponse;
+  52| 
+  53| import java.util.List;
+  54| 
+  55| @SuppressWarnings("PMD.TooManyMethods")
+  56| public class CifsPublisherPluginDescriptor extends BuildStepDescriptor<Publisher> {
+  57| 
+  58|     /** null - prevent complaints from xstream */
+  59|     @SuppressFBWarnings("URF_UNREAD_FIELD")
+  60|     private CifsPublisherPlugin.DescriptorMessages msg;
+  61|     /** null - prevent complaints from xstream */
+  62|     @SuppressFBWarnings("URF_UNREAD_FIELD")
+  63|     private Class hostConfigClass;
+  64|     private final CopyOnWriteList<CifsHostConfiguration> hostConfigurations = new CopyOnWriteList<CifsHostConfiguration>();
+  65|     private CifsDefaults defaults;
+  66| 
+  67|     public CifsPublisherPluginDescriptor() {
+  68|         super(CifsPublisherPlugin.class);
+  69|         load();
+  70|         if (defaults == null)
+  71|             defaults = new CifsPluginDefaults();
+  72|     }
+  73| 
+  74|     public CifsDefaults getDefaults() {
+  75|         return defaults;
+  76|     }
+  77| 
+  78|     public String getDisplayName() {
+  79|         return Messages.descriptor_displayName();
+  80|     }
+  81| 
+  82|     public boolean isApplicable(final Class<? extends AbstractProject> aClass) {
+  83|         return !BPPlugin.PROMOTION_JOB_TYPE.equals(aClass.getCanonicalName());
+  84|     }
+  85| 
+  86|     public List<CifsHostConfiguration> getHostConfigurations() {
+  87|         return hostConfigurations.getView();
+  88|     }
+  89| 
+  90|     public CifsHostConfiguration getConfiguration(final String name) {
+  91|         for (CifsHostConfiguration configuration : hostConfigurations) {
+  92|             if (configuration.getName().equals(name)) {
+  93|                 return configuration;
+  94|             }
+  95|         }
+  96|         return null;
+  97|     }
+  98| 
+  99|     /**
+ 100|      * Adds the given CifsHostConfiguration to the current collection of host configurations.
+ 101|      * @param configuration The CifsHostConfiguration to add.
+ 102|      */
+ 103|     public void addHostConfiguration(final CifsHostConfiguration configuration) {
+ 104|         hostConfigurations.add(configuration);
+ 105|     }
+ 106| 
+ 107|     /**
+ 108|      * Removes the host configuration with the given name from the current collection of host configurations.
+ 109|      * @param name The name of the host configuration to remove.
+ 110|      */
+ 111|     public void removeHostConfiguration(final String name) {
+ 112|         CifsHostConfiguration configuration = getConfiguration(name);
+ 113|         if (configuration != null) {
+ 114|             hostConfigurations.remove(configuration);
+ 115|         }
+ 116|     }
+ 117| 
+ 118|     public boolean configure(final StaplerRequest request, final JSONObject formData) {
+ 119|         hostConfigurations.replaceBy(request.bindJSONToList(CifsHostConfiguration.class, formData.get("instance")));
+ 120|         if (isEnableOverrideDefaults())
+ 121|             defaults = request.bindJSON(CifsDefaults.class, formData.getJSONObject("defaults"));
+ 122|         save();
+ 123|         return true;
+ 124|     }
+ 125| 
+ 126|     public FormValidation doCheckName(@QueryParameter final String value) {
+ 127|         return BPValidators.validateName(value);
+ 128|     }
+ 129|     public FormValidation doCheckHostname(@QueryParameter final String value) {
+ 130|         return FormValidation.validateRequired(value);
+ 131|     }
+ 132|     public FormValidation doCheckUsername(@QueryParameter final String value) {
+ 133|         return FormValidation.validateRequired(value);
+ 134|     }
+ 135|     public FormValidation doCheckPort(@QueryParameter final String value) {
+ 136|         return FormValidation.validatePositiveInteger(value);
+ 137|     }
+ 138|     public FormValidation doCheckTimeout(@QueryParameter final String value) {
+ 139|         return FormValidation.validateNonNegativeInteger(value);
+ 140|     }
+ 141|     public FormValidation doCheckBufferSize(@QueryParameter final String value) {
+ 142|         return FormValidation.validatePositiveInteger(value);
+ 143|     }
+ 144|     public FormValidation doCheckSourceFiles(@QueryParameter final String value) {
+ 145|         return FormValidation.validateRequired(value);
+ 146|     }
+ 147|     public FormValidation doCheckRemoteRootDir(@QueryParameter final String value) {
+ 148|         return FormValidation.validateRequired(value);
+ 149|     }
+ 150|     public FormValidation doCheckRetries(@QueryParameter final String value) {
+ 151|         return FormValidation.validateNonNegativeInteger(value);
+ 152|     }
+ 153|     public FormValidation doCheckRetryDelay(@QueryParameter final String value) {
+ 154|         return FormValidation.validatePositiveInteger(value);
+ 155|     }
+ 156|     public String getDefaultMasterNodeName() {
+ 157|         return BPInstanceConfig.DEFAULT_MASTER_NODE_NAME;
+ 158|     }
+ 159|     public boolean canSetMasterNodeName() {
+ 160|         return JenkinsCapabilities.missing(JenkinsCapabilities.MASTER_HAS_NODE_NAME);
+ 161|     }
+ 162|     public boolean isEnableOverrideDefaults() {
+ 163|         return JenkinsCapabilities.available(JenkinsCapabilities.SIMPLE_DESCRIPTOR_SELECTOR);
+ 164|     }
+ 165|     public CifsPublisherPluginDescriptor getPublisherDescriptor() {
+ 166|         return this;
+ 167|     }
+ 168| 
+ 169|     public jenkins.plugins.publish_over.view_defaults.manage_jenkins.Messages getCommonManageMessages() {
+ 170|         return new jenkins.plugins.publish_over.view_defaults.manage_jenkins.Messages();
+ 171|     }
+ 172| 
+ 173| 
+ 174|     public FormValidation doTestConnection(final StaplerRequest request, final StaplerResponse response) {
+ 175|         final CifsHostConfiguration hostConfig = request.bindParameters(CifsHostConfiguration.class, "");
+ 176|         request.bindParameters(hostConfig);
+ 177|         final BPBuildInfo buildInfo = createDummyBuildInfo(request);
+ 178|         try {
+ 179|             hostConfig.createClient(buildInfo).disconnect();
+ 180|             return FormValidation.ok(Messages.descriptor_testConnection_ok());
+ 181|         } catch (Exception e) {
+ 182|             return FormValidation.errorWithMarkup("<p>"
+ 183|                     + Messages.descriptor_testConnection_error() + "</p><p><pre>"
+ 184|                     + Util.escape(e.getClass().getCanonicalName() + ": " + e.getLocalizedMessage())
+ 185|                     + "</pre></p>");
+ 186|         }
+ 187|     }
+ 188| 
+ 189|     protected BPBuildInfo createDummyBuildInfo(final StaplerRequest request) {
+ 190|         final BPBuildInfo buildInfo = new BPBuildInfo(
+ 191|                 TaskListener.NULL,
+ 192|                 "",
+ 193|                 Jenkins.getInstance().getRootPath(),
+ 194|                 null,
+ 195|                 null
+ 196|         );
+ 197|         final CifsNodeProperties defaults = request.bindParameters(CifsNodeProperties.class, CifsNodeProperties.FORM_PREFIX);
+ 198|         if (defaults != null && Util.fixEmptyAndTrim(defaults.getWinsServer()) != null)
+ 199|             buildInfo.put(CifsPublisher.CTX_KEY_WINS_SERVER, defaults.getWinsServer().trim());
+ 200|         return buildInfo;
+ 201|     }
+ 202| 
+ 203|     public Object readResolve() {
+ 204|         // nuke the legacy config
+ 205|         msg = null;
+ 206|         hostConfigClass = null;
+ 207|         if (defaults == null)
+ 208|             defaults = new CifsPluginDefaults();
+ 209|         return this;
+ 210|     }
+ 211| 
+ 212|     public jenkins.plugins.publish_over.view_defaults.HostConfiguration.Messages getHostConfigurationFieldNames() {
+ 213|         return new jenkins.plugins.publish_over.view_defaults.HostConfiguration.Messages();
+ 214|     }
+ 215| 
+ 216|     public jenkins.plugins.publish_over.view_defaults.BapPublisher.Messages getPublisherFieldNames() {
+ 217|         return new jenkins.plugins.publish_over.view_defaults.BapPublisher.Messages();
+ 218|     }
+ 219| 
+ 220|     public jenkins.plugins.publish_over.view_defaults.BPInstanceConfig.Messages getPluginFieldNames() {
+ 221|         return new jenkins.plugins.publish_over.view_defaults.BPInstanceConfig.Messages();
+ 222|     }
+ 223| 
+ 224|     public jenkins.plugins.publish_over.view_defaults.BPTransfer.Messages getTransferFieldNames() {
+ 225|         return new jenkins.plugins.publish_over.view_defaults.BPTransfer.Messages();
+ 226|     }
+ 227| 
+ 228|     public jenkins.plugins.publish_over.view_defaults.ParamPublish.Messages getParamPublishFieldNames() {
+ 229|         return new jenkins.plugins.publish_over.view_defaults.ParamPublish.Messages();
+ 230|     }
+ 231| 
+ 232|     public jenkins.plugins.publish_over.view_defaults.PublisherLabel.Messages getPublisherLabelFieldNames() {
+ 233|         return new jenkins.plugins.publish_over.view_defaults.PublisherLabel.Messages();
+ 234|     }
+ 235| 
+ 236|     public jenkins.plugins.publish_over.view_defaults.Retry.Messages getRetryFieldNames() {
+ 237|         return new jenkins.plugins.publish_over.view_defaults.Retry.Messages();
+ 238|     }
+ 239| 
+ 240| }
+ 241| 
+ 242| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7888 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文逐函数）
+
+1. **init() / DialContext（第 19–52 行）**：SSRF 防御核心。每次真实建连后取 `RemoteAddr` 解析 IP，拒绝 loopback、链路本地、接口本地多播，并逐一比对 `internalRanges`（第 88–96 行，覆盖 127/8、10/8、172.16/12、192.168/16、169.254/16、::1、fe80::/10、fc00::/7）。这是基于实际连接地址的校验，天然免疫 DNS rebinding/TOCTOU——即使域名解析阶段返回公网 IP，连接时若落到内网 IP 也会被拦截。Go 的 `IPNet.Contains` 会自动解包 v4-mapped-IPv6（如 `::ffff:10.0.0.5`），该绕过路径无效。
+
+2. **CheckRedirect（第 65–67 行）**：直接返回 `http.ErrUseLastResponse`，客户端完全不跟随重定向。因此不存在“公网 URL 302 跳内网”的经典 SSRF 绕过；重定向响应原样返回给调用方且不写盘。
+
+3. **New/track/ByServer/ByID/find/remove（第 118–124、246–296 行）**：仅内存缓存管理，UUID 标识符为随机生成，无用户可控 source 进入文件系统或网络 sink；锁使用正确。
+
+4. **Execute()（第 133–190 行）**：
+   - URL 仅来自 `dl.req.URL`（已解析的 `*url.URL`），请求经上述受控 client 发出。
+   - `UseHeader` 时从 `Content-Disposition` 取 filename（第 156–166 行）作为 `dl.path`；否则用请求 FileName 或 URL 最后一段。
+   - 关键 sink 是第 187 行 `dl.server.Filesystem().Write(p, ...)`，其中 `p = filepath.Join(dl.req.Directory, dl.path)`（第 226 行）。路径穿越风险由下游 `Filesystem.Write` 承担——wings 的 Filesystem 层会对路径做规范化并确保最终路径落在服务器数据目录内（越界即报错），这是本项目公认的安全边界，不属于本文件的防御缺口。此外写入大小受 `res.ContentLength` 与磁盘配额约束。
+
+5. **counter/Progress/MarshalJSON（第 199–216 行）**：仅进度计算与 JSON 序列化，输出字段只有 Identifier 和 Progress，无敏感泄露。
+
+6. **第二入口核查**：本文件无路由注册、无环境变量读取、无回调入口；唯一外部输入是调用方传入的 `DownloadRequest`（URL/Directory/FileName），其合法性校验在上游 router 层完成，本文件对已收敛的输入做了连接级 SSRF 防护与重定向禁用。
+
+**结论**：SSRF 防御采用“连接后校验实际 IP + 禁止重定向跟随”的双重机制，无黑名单正则类可绕过过滤；文件写入依赖下层 Filesystem 沙箱且本文件未引入新的穿越通道。全文未见可利用漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文：SSRF 防御在 DialContext 中于真实建连后校验 RemoteAddr 是否落入 internalRanges 或本地/链路本地地址（第 36-51 行），可抵御 DNS rebinding；CheckRedirect 返回 http.ErrUseLastResponse 完全禁止重定向跟随（第 65-67 行），封堵 302 跳内网的替代通道；Go 的 IPNet.Contains 自动处理 v4-mapped-IPv6，无地址表示绕过。文件写入 sink（第 187 行 Filesystem().Write）路径由 filepath.Join 构成，越界防护由下游 Filesystem 沙箱层保证，本文件未引入额外穿越入口。缓存管理函数仅操作内存 map 且以随机 UUID 为键，无用户可控数据到达危险 sink。未发现可利用漏洞。", "fix_suggestion": "no fix needed"}
+
+### id=7889 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+**入口点枚举（全文通读）：**
+
+1. **第 53 行类声明**：`CifsPublisherPluginDescriptor extends BuildStepDescriptor<Publisher>`，Jenkins 描述符类，其 public 无前缀方法会被 Stapler 自动暴露为 HTTP 端点（URL：`/descriptor/.../doXxx`）。
+
+2. **第 119–140 行的 10 个 `doCheckXxx(@QueryParameter String value)`**：仅做格式校验（required / 正整数等），返回 FormValidation，无 sink，不构成漏洞。
+
+3. **第 112–117 行 `configure(StaplerRequest, JSONObject)`**：将表单 JSON 绑定为 `CifsHostConfiguration` 列表并持久化。该端点未调用 `Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER)`。在旧版 Jenkins 中描述符 configure 由 manage-jenkins 页面保护，但本文件自身无权限校验；配置内容最终用于建立 SMB 连接（主机名、用户名、密码均来自请求），属于管理功能缺少显式鉴权的问题（依赖框架默认防护，属弱防御）。
+
+4. **第 159–172 行 `doTestConnection(StaplerRequest, response)` —— 核心问题**：
+   - **source**：HTTP 请求参数。第 160–161 行 `request.bindParameters(CifsHostConfiguration.class, "")` 与 `bindParameters(hostConfig)` 把攻击者完全可控的 hostname、port、username、password、domain、remoteRootDir 等直接绑定进对象。
+   - **sink**：第 163 行 `hostConfig.createClient(buildInfo).disconnect()` —— 用攻击者指定的主机/端口发起真实 SMB（JCIFS）网络连接。
+   - **数据流验证**：source→sink 之间没有任何权限检查（无 `checkPermission`）、没有主机白名单、没有对目标地址的限制。`createDummyBuildInfo`（第 175–188 行）只额外注入 winsServer 参数，同样无过滤。
+   - **后果**：任何能访问该 URL 的用户（旧版 Jenkins 匿名可读时包括匿名者；即使需登录，普通非管理员用户也可触发）可让 Jenkins 服务器向任意内网/外网地址任意端口发起连接 —— **SSRF（CWE-918）**。可用于内网探测、端口扫描、对内网 SMB 服务触发生成认证（NTLMv2 挑战响应泄露，可配合中继/抓取哈希）。
+   - **错误回显**：第 166–169 行把异常消息拼入 HTML，但先经 `Util.escape(...)` 转义，XSS 防御有效；不过异常细节会向触发者泄露内网连通性信息（超时 vs 拒绝），放大 SSRF 探测能力。
+
+5. **第二入口/替代通道**：
+   - 第 112 行 `configure` 持久化的 host 配置在构建发布时被使用，但那是构建期行为，属于设计功能；
+   - `addHostConfiguration` / `removeHostConfiguration`（第 96、103 行）为 Java 层方法，不经 Stapler 直接暴露，非独立 HTTP 入口；
+   - `readResolve`（第 191 行）仅为 Xstream 反序列化钩子，输入来自本地 config.xml，非外部 source。
+
+6. **防御有效性核查**：全文不存在黑名单或正则过滤；唯一“净化”是 `Util.escape`（有效防 XSS 但与 SSRF 无关）；`FormValidation.validateRequired` 仅是前端提示性校验，POST 可完全绕过，不算防御。
+
+**结论**：存在真实漏洞 —— `doTestConnection` 未授权 + 参数全控的网络出连 = SSRF。这与该插件历史上披露的 CVE（publish_over 系列 testConnection 缺少权限校验导致的 SSRF）一致。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-918 Server-Side Request Forgery (SSRF) (缺少授权)", "risk_level": "High", "source": "line 174: doTestConnection 中 request.bindParameters(CifsHostConfiguration.class, '') 将 HTTP 参数完全可控地绑定到 hostConfig", "sink": "line 179: hostConfig.createClient(buildInfo).disconnect() 以攻击者指定的主机和端口发起 SMB 网络连接", "explanation": "Stapler 将 doTestConnection 暴露为 HTTP 端点 -> 攻击者通过请求参数指定任意 hostname/port -> 方法内无 Jenkins.checkPermission 权限检查、无主机白名单或地址限制 -> createClient 直接连向该目标 -> 实现 SSRF，可探测内网、扫描端口并借 SMB 认证泄露 NTLM 哈希；异常信息虽经 Util.escape 转义（XSS 已防住）但仍向触发者回显内网连通性细节", "fix_suggestion": "line 159: 在 doTestConnection 开头增加 Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER)；并对 bindParameters 得到的 hostname 做目标地址白名单校验，禁止指向内网/元数据地址"}

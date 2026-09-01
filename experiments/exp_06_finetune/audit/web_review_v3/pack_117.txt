@@ -1,0 +1,689 @@
+batch=117 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7924 lang=go
+[CODE]
+   1| package auth
+   2| 
+   3| import (
+   4| 	"context"
+   5| 	"crypto/ecdsa"
+   6| 	"crypto/ed25519"
+   7| 	"crypto/elliptic"
+   8| 	"crypto/sha512"
+   9| 	"encoding/base64"
+  10| 	"encoding/hex"
+  11| 	"errors"
+  12| 	"fmt"
+  13| 	"math/big"
+  14| 	"net"
+  15| 	"regexp"
+  16| 	"strings"
+  17| 	"time"
+  18| 
+  19| 	"github.com/modelcontextprotocol/registry/internal/auth"
+  20| 	"github.com/modelcontextprotocol/registry/internal/config"
+  21| )
+  22| 
+  23| // ErrSignatureMismatch is returned by VerifySignature when the signature is structurally
+  24| // valid but does not verify against the public key. Distinguishing this from structural
+  25| // failures (wrong size, bad key format) lets the caller add fingerprint hints only when
+  26| // the failure is actually a "wrong key" situation.
+  27| var ErrSignatureMismatch = errors.New("signature does not match public key")
+  28| 
+  29| // MCPProofRecordPattern matches a well-formed MCPv1 DNS/HTTP proof record:
+  30| // "v=MCPv1; k=<algo>; p=<base64-public-key>". Shared so callers checking for the
+  31| // presence of a valid record see exactly what the parser will accept.
+  32| var MCPProofRecordPattern = regexp.MustCompile(`v=MCPv1;\s*k=([^;]+);\s*p=([A-Za-z0-9+/=]+)`)
+  33| 
+  34| // CryptoAlgorithm represents the cryptographic algorithm used for a public key
+  35| type CryptoAlgorithm string
+  36| 
+  37| const (
+  38| 	AlgorithmEd25519 CryptoAlgorithm = "ed25519"
+  39| 
+  40| 	// ECDSA with NIST P-384 curve
+  41| 	// public key is in compressed format
+  42| 	// signature is in R || S format
+  43| 	AlgorithmECDSAP384 CryptoAlgorithm = "ecdsap384"
+  44| )
+  45| 
+  46| // PublicKeyInfo contains a public key along with its algorithm type
+  47| type PublicKeyInfo struct {
+  48| 	Algorithm CryptoAlgorithm
+  49| 	Key       any
+  50| }
+  51| 
+  52| // SignatureTokenExchangeInput represents the common input structure for token exchange
+  53| type SignatureTokenExchangeInput struct {
+  54| 	Domain          string `json:"domain" doc:"Domain name" example:"example.com" required:"true"`
+  55| 	Timestamp       string `json:"timestamp" doc:"RFC3339 timestamp" example:"2023-01-01T00:00:00Z" required:"true"`
+  56| 	SignedTimestamp string `json:"signed_timestamp" doc:"Hex-encoded signature of timestamp" example:"abcdef1234567890" required:"true"`
+  57| }
+  58| 
+  59| // KeyFetcher defines a function type for fetching keys from external sources
+  60| type KeyFetcher func(ctx context.Context, domain string) ([]string, error)
+  61| 
+  62| // CoreAuthHandler represents the common handler structure
+  63| type CoreAuthHandler struct {
+  64| 	config     *config.Config
+  65| 	jwtManager *auth.JWTManager
+  66| }
+  67| 
+  68| // NewCoreAuthHandler creates a new core authentication handler
+  69| func NewCoreAuthHandler(cfg *config.Config) *CoreAuthHandler {
+  70| 	return &CoreAuthHandler{
+  71| 		config:     cfg,
+  72| 		jwtManager: auth.NewJWTManager(cfg),
+  73| 	}
+  74| }
+  75| 
+  76| // ValidateDomainAndTimestamp validates the domain format and timestamp
+  77| func ValidateDomainAndTimestamp(domain, timestamp string) (*time.Time, error) {
+  78| 	if !IsValidDomain(domain) {
+  79| 		return nil, fmt.Errorf("invalid domain format")
+  80| 	}
+  81| 
+  82| 	ts, err := time.Parse(time.RFC3339, timestamp)
+  83| 	if err != nil {
+  84| 		return nil, fmt.Errorf("invalid timestamp format: %w", err)
+  85| 	}
+  86| 
+  87| 	// Check timestamp is within 15 seconds, to allow for clock skew
+  88| 	now := time.Now()
+  89| 	if ts.Before(now.Add(-15*time.Second)) || ts.After(now.Add(15*time.Second)) {
+  90| 		return nil, fmt.Errorf("timestamp outside valid window (±15 seconds)")
+  91| 	}
+  92| 
+  93| 	return &ts, nil
+  94| }
+  95| 
+  96| func DecodeAndValidateSignature(signedTimestamp string) ([]byte, error) {
+  97| 	signature, err := hex.DecodeString(signedTimestamp)
+  98| 	if err != nil {
+  99| 		return nil, fmt.Errorf("invalid signature format, must be hex: %w", err)
+ 100| 	}
+ 101| 
+ 102| 	return signature, nil
+ 103| }
+ 104| 
+ 105| func VerifySignatureWithKeys(publicKeys []PublicKeyInfo, messageBytes []byte, signature []byte) error {
+ 106| 	var lastErr error
+ 107| 	allMismatch := true
+ 108| 	for _, publicKeyInfo := range publicKeys {
+ 109| 		err := publicKeyInfo.VerifySignature(messageBytes, signature)
+ 110| 		if err == nil {
+ 111| 			return nil
+ 112| 		}
+ 113| 		lastErr = err
+ 114| 		if !errors.Is(err, ErrSignatureMismatch) {
+ 115| 			allMismatch = false
+ 116| 		}
+ 117| 	}
+ 118| 
+ 119| 	// If at least one key failed for a structural reason (wrong size, unsupported algorithm),
+ 120| 	// surface that error directly — it's more actionable than a generic "didn't match" message.
+ 121| 	if !allMismatch {
+ 122| 		return lastErr
+ 123| 	}
+ 124| 
+ 125| 	// Every key was tried and produced a clean cryptographic mismatch. Include short
+ 126| 	// fingerprints of every key that was tried so users can tell which published keys the
+ 127| 	// registry actually saw — the most common cause of this error is a stale record left
+ 128| 	// behind after a key rotation, which is otherwise indistinguishable from a generic
+ 129| 	// crypto failure.
+ 130| 	fingerprints := make([]string, 0, len(publicKeys))
+ 131| 	for _, publicKeyInfo := range publicKeys {
+ 132| 		fingerprints = append(fingerprints, publicKeyInfo.Fingerprint())
+ 133| 	}
+ 134| 	if len(publicKeys) == 1 {
+ 135| 		return fmt.Errorf(
+ 136| 			"signature verification failed (tried published key %s); "+
+ 137| 				"if this is not the key you are signing with, the published record may be stale",
+ 138| 			fingerprints[0],
+ 139| 		)
+ 140| 	}
+ 141| 	return fmt.Errorf(
+ 142| 		"signature verification failed against all %d published keys (tried: %s); "+
+ 143| 			"if you recently rotated keys, remove any stale records from the apex domain",
+ 144| 		len(publicKeys), strings.Join(fingerprints, ", "),
+ 145| 	)
+ 146| }
+ 147| 
+ 148| // Fingerprint returns a short, human-readable identifier for the public key.
+ 149| // Format: "<algorithm>:<first 8 base64 chars of the raw key>". Public keys are not secret,
+ 150| // but truncating keeps error messages readable.
+ 151| func (pki *PublicKeyInfo) Fingerprint() string {
+ 152| 	const prefixLen = 8
+ 153| 	var raw []byte
+ 154| 	switch pki.Algorithm {
+ 155| 	case AlgorithmEd25519:
+ 156| 		if k, ok := pki.Key.(ed25519.PublicKey); ok {
+ 157| 			raw = k
+ 158| 		}
+ 159| 	case AlgorithmECDSAP384:
+ 160| 		if k, ok := pki.Key.(ecdsa.PublicKey); ok {
+ 161| 			raw = elliptic.MarshalCompressed(k.Curve, k.X, k.Y) //nolint:staticcheck // SA1019: matches the encoding used in DNS records
+ 162| 		}
+ 163| 	}
+ 164| 	if len(raw) == 0 {
+ 165| 		return fmt.Sprintf("%s:unknown", pki.Algorithm)
+ 166| 	}
+ 167| 	encoded := base64.StdEncoding.EncodeToString(raw)
+ 168| 	if len(encoded) > prefixLen {
+ 169| 		encoded = encoded[:prefixLen]
+ 170| 	}
+ 171| 	return fmt.Sprintf("%s:%s", pki.Algorithm, encoded)
+ 172| }
+ 173| 
+ 174| // VerifySignature verifies a signature using the appropriate algorithm
+ 175| func (pki *PublicKeyInfo) VerifySignature(message, signature []byte) error {
+ 176| 	switch pki.Algorithm {
+ 177| 	case AlgorithmEd25519:
+ 178| 		if ed25519Key, ok := pki.Key.(ed25519.PublicKey); ok {
+ 179| 			if len(signature) != ed25519.SignatureSize {
+ 180| 				return fmt.Errorf("invalid signature size for Ed25519")
+ 181| 			}
+ 182| 			if !ed25519.Verify(ed25519Key, message, signature) {
+ 183| 				return fmt.Errorf("Ed25519: %w", ErrSignatureMismatch)
+ 184| 			}
+ 185| 			return nil
+ 186| 		}
+ 187| 	case AlgorithmECDSAP384:
+ 188| 		if ecdsaKey, ok := pki.Key.(ecdsa.PublicKey); ok {
+ 189| 			if len(signature) != 96 {
+ 190| 				return fmt.Errorf("invalid signature size for ECDSA P-384")
+ 191| 			}
+ 192| 			r := new(big.Int).SetBytes(signature[:48])
+ 193| 			s := new(big.Int).SetBytes(signature[48:])
+ 194| 			digest := sha512.Sum384(message)
+ 195| 			if !ecdsa.Verify(&ecdsaKey, digest[:], r, s) {
+ 196| 				return fmt.Errorf("ECDSA P-384: %w", ErrSignatureMismatch)
+ 197| 			}
+ 198| 			return nil
+ 199| 		}
+ 200| 	}
+ 201| 	return fmt.Errorf("unsupported public key algorithm")
+ 202| }
+ 203| 
+ 204| // BuildPermissions builds permissions for a domain with optional subdomain support
+ 205| func BuildPermissions(domain string, includeSubdomains bool) []auth.Permission {
+ 206| 	reverseDomain := ReverseString(domain)
+ 207| 
+ 208| 	permissions := []auth.Permission{
+ 209| 		// Grant permissions for the exact domain (e.g., com.example/*)
+ 210| 		{
+ 211| 			Action:          auth.PermissionActionPublish,
+ 212| 			ResourcePattern: fmt.Sprintf("%s/*", reverseDomain),
+ 213| 		},
+ 214| 	}
+ 215| 
+ 216| 	if includeSubdomains {
+ 217| 		permissions = append(permissions, auth.Permission{
+ 218| 			Action:          auth.PermissionActionPublish,
+ 219| 			ResourcePattern: fmt.Sprintf("%s.*", reverseDomain),
+ 220| 		})
+ 221| 	}
+ 222| 
+ 223| 	return permissions
+ 224| }
+ 225| 
+ 226| // CreateJWTClaimsAndToken creates JWT claims and generates a token response
+ 227| func (h *CoreAuthHandler) CreateJWTClaimsAndToken(ctx context.Context, authMethod auth.Method, domain string, permissions []auth.Permission) (*auth.TokenResponse, error) {
+ 228| 	// Create JWT claims
+ 229| 	jwtClaims := auth.JWTClaims{
+ 230| 		AuthMethod:        authMethod,
+ 231| 		AuthMethodSubject: domain,
+ 232| 		Permissions:       permissions,
+ 233| 	}
+ 234| 
+ 235| 	// Generate Registry JWT token
+ 236| 	tokenResponse, err := h.jwtManager.GenerateTokenResponse(ctx, jwtClaims)
+ 237| 	if err != nil {
+ 238| 		return nil, fmt.Errorf("failed to generate JWT token: %w", err)
+ 239| 	}
+ 240| 
+ 241| 	return tokenResponse, nil
+ 242| }
+ 243| 
+ 244| // ExchangeToken is a shared method for token exchange that takes a key fetcher function,
+ 245| // subdomain inclusion flag, and auth method
+ 246| func (h *CoreAuthHandler) ExchangeToken(
+ 247| 	ctx context.Context,
+ 248| 	domain, timestamp, signedTimestamp string,
+ 249| 	keyFetcher KeyFetcher,
+ 250| 	includeSubdomains bool,
+ 251| 	authMethod auth.Method) (*auth.TokenResponse, error) {
+ 252| 	_, err := ValidateDomainAndTimestamp(domain, timestamp)
+ 253| 	if err != nil {
+ 254| 		return nil, err
+ 255| 	}
+ 256| 
+ 257| 	signature, err := DecodeAndValidateSignature(signedTimestamp)
+ 258| 	if err != nil {
+ 259| 		return nil, err
+ 260| 	}
+ 261| 
+ 262| 	keyStrings, err := keyFetcher(ctx, domain)
+ 263| 	if err != nil {
+ 264| 		return nil, fmt.Errorf("failed to fetch keys: %w", err)
+ 265| 	}
+ 266| 
+ 267| 	publicKeysAndErrors := ParseMCPKeysFromStrings(keyStrings)
+ 268| 	if len(publicKeysAndErrors) == 0 {
+ 269| 		switch authMethod {
+ 270| 		case auth.MethodHTTP:
+ 271| 			return nil, fmt.Errorf("no MCP public key found in HTTP response")
+ 272| 		case auth.MethodDNS:
+ 273| 			return nil, fmt.Errorf("no MCP public key found in DNS TXT records")
+ 274| 		case auth.MethodGitHubAT, auth.MethodGitHubOIDC, auth.MethodOIDC, auth.MethodNone:
+ 275| 		default:
+ 276| 			return nil, fmt.Errorf("no MCP public key found using %s authentication", authMethod)
+ 277| 		}
+ 278| 	}
+ 279| 
+ 280| 	// provide a specific error message if there's only one key found
+ 281| 	if len(publicKeysAndErrors) == 1 && publicKeysAndErrors[0].error != nil {
+ 282| 		return nil, publicKeysAndErrors[0].error
+ 283| 	}
+ 284| 
+ 285| 	var publicKeys []PublicKeyInfo
+ 286| 	for _, pke := range publicKeysAndErrors {
+ 287| 		if pke.error == nil {
+ 288| 			publicKeys = append(publicKeys, *pke.PublicKeyInfo)
+ 289| 		}
+ 290| 	}
+ 291| 
+ 292| 	if len(publicKeys) == 0 {
+ 293| 		return nil, fmt.Errorf("no valid MCP public key found")
+ 294| 	}
+ 295| 
+ 296| 	messageBytes := []byte(timestamp)
+ 297| 	err = VerifySignatureWithKeys(publicKeys, messageBytes, signature)
+ 298| 	if err != nil {
+ 299| 		return nil, err
+ 300| 	}
+ 301| 
+ 302| 	permissions := BuildPermissions(domain, includeSubdomains)
+ 303| 
+ 304| 	return h.CreateJWTClaimsAndToken(ctx, authMethod, domain, permissions)
+ 305| }
+ 306| 
+ 307| func ParseMCPKeysFromStrings(inputs []string) []struct {
+ 308| 	*PublicKeyInfo
+ 309| 	error
+ 310| } {
+ 311| 	var publicKeys []struct {
+ 312| 		*PublicKeyInfo
+ 313| 		error
+ 314| 	}
+ 315| 
+ 316| 	for _, record := range inputs {
+ 317| 		if matches := MCPProofRecordPattern.FindStringSubmatch(record); len(matches) == 3 {
+ 318| 			publicKey, err := ParsePublicKey(matches[1], matches[2])
+ 319| 			publicKeys = append(publicKeys, struct {
+ 320| 				*PublicKeyInfo
+ 321| 				error
+ 322| 			}{publicKey, err})
+ 323| 		}
+ 324| 	}
+ 325| 
+ 326| 	return publicKeys
+ 327| }
+ 328| 
+ 329| func ParsePublicKey(algorithm, publicKey string) (*PublicKeyInfo, error) {
+ 330| 	publicKeyBytes, err := base64.StdEncoding.DecodeString(publicKey)
+ 331| 	if err != nil {
+ 332| 		return nil, fmt.Errorf("failed to decode public key: %w", err)
+ 333| 	}
+ 334| 
+ 335| 	// match to a supported crypto algorithm
+ 336| 	switch algorithm {
+ 337| 	case string(AlgorithmEd25519):
+ 338| 		if len(publicKeyBytes) != ed25519.PublicKeySize {
+ 339| 			return nil, fmt.Errorf("invalid Ed25519 public key size")
+ 340| 		}
+ 341| 		return &PublicKeyInfo{
+ 342| 			Algorithm: AlgorithmEd25519,
+ 343| 			Key:       ed25519.PublicKey(publicKeyBytes),
+ 344| 		}, nil
+ 345| 	case string(AlgorithmECDSAP384):
+ 346| 		if len(publicKeyBytes) != 49 {
+ 347| 			return nil, fmt.Errorf("invalid ECDSA P-384 public key size")
+ 348| 		}
+ 349| 		if publicKeyBytes[0] != 0x02 && publicKeyBytes[0] != 0x03 {
+ 350| 			return nil, fmt.Errorf("invalid ECDSA P-384 public key format (must be compressed, with a leading 0x02 or 0x03 byte)")
+ 351| 		}
+ 352| 		curve := elliptic.P384()
+ 353| 		x, y := elliptic.UnmarshalCompressed(curve, publicKeyBytes)
+ 354| 		if x == nil || y == nil {
+ 355| 			return nil, fmt.Errorf("failed to decompress ECDSA P-384 public key")
+ 356| 		}
+ 357| 		return &PublicKeyInfo{
+ 358| 			Algorithm: AlgorithmECDSAP384,
+ 359| 			Key:       ecdsa.PublicKey{Curve: curve, X: x, Y: y},
+ 360| 		}, nil
+ 361| 	}
+ 362| 
+ 363| 	return nil, fmt.Errorf("unsupported public key algorithm: %s", algorithm)
+ 364| }
+ 365| 
+ 366| // ReverseString reverses a domain string (example.com -> com.example)
+ 367| func ReverseString(domain string) string {
+ 368| 	parts := strings.Split(domain, ".")
+ 369| 	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+ 370| 		parts[i], parts[j] = parts[j], parts[i]
+ 371| 	}
+ 372| 	return strings.Join(parts, ".")
+ 373| }
+ 374| 
+ 375| func IsValidDomain(domain string) bool {
+ 376| 	if len(domain) == 0 || len(domain) > 253 {
+ 377| 		return false
+ 378| 	}
+ 379| 
+ 380| 	// Reject IP literals — this auth method proves domain ownership, not IP
+ 381| 	// ownership, and IP literals are an SSRF vector into internal networks.
+ 382| 	if net.ParseIP(domain) != nil {
+ 383| 		return false
+ 384| 	}
+ 385| 
+ 386| 	// Require at least one dot — rejects single-label names like "localhost"
+ 387| 	// or "kubernetes" that resolve only inside private networks.
+ 388| 	if !strings.Contains(domain, ".") {
+ 389| 		return false
+ 390| 	}
+ 391| 
+ 392| 	// Check for valid characters and structure
+ 393| 	domainPattern := regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$`)
+ 394| 	return domainPattern.MatchString(domain)
+ 395| }
+ 396| 
+ 397| 
+
+### id=7925 lang=java
+[CODE]
+   1| /*
+   2|  * Copyright 2016 Red Hat, Inc. and/or its affiliates
+   3|  * and other contributors as indicated by the @author tags.
+   4|  *
+   5|  * Licensed under the Apache License, Version 2.0 (the "License");
+   6|  * you may not use this file except in compliance with the License.
+   7|  * You may obtain a copy of the License at
+   8|  *
+   9|  * http://www.apache.org/licenses/LICENSE-2.0
+  10|  *
+  11|  * Unless required by applicable law or agreed to in writing, software
+  12|  * distributed under the License is distributed on an "AS IS" BASIS,
+  13|  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  14|  * See the License for the specific language governing permissions and
+  15|  * limitations under the License.
+  16|  */
+  17| 
+  18| package org.keycloak.protocol.oidc.utils;
+  19| 
+  20| import java.net.URI;
+  21| import java.util.Arrays;
+  22| import java.util.Collection;
+  23| import java.util.HashSet;
+  24| import java.util.Set;
+  25| import java.util.TreeSet;
+  26| import java.util.regex.Pattern;
+  27| 
+  28| import org.keycloak.common.util.KeycloakUriBuilder;
+  29| import org.keycloak.common.util.UriUtils;
+  30| import org.keycloak.models.ClientModel;
+  31| import org.keycloak.models.Constants;
+  32| import org.keycloak.models.KeycloakSession;
+  33| import org.keycloak.models.KeycloakUriInfo;
+  34| import org.keycloak.models.RealmModel;
+  35| import org.keycloak.services.Urls;
+  36| import org.keycloak.services.util.ResolveRelative;
+  37| 
+  38| import org.jboss.logging.Logger;
+  39| 
+  40| /**
+  41|  * @author <a href="mailto:sthorger@redhat.com">Stian Thorgersen</a>
+  42|  */
+  43| public class RedirectUtils {
+  44| 
+  45|     public static final Set<String> LOOPBACK_INTERFACES = new HashSet<>(Arrays.asList("localhost", "127.0.0.1", "[::1]"));
+  46| 
+  47|     private static final Logger logger = Logger.getLogger(RedirectUtils.class);
+  48| 
+  49|     public static String verifyRedirectUri(KeycloakSession session, String redirectUri, ClientModel client) {
+  50|         return verifyRedirectUri(session, redirectUri, client, true);
+  51|     }
+  52| 
+  53|     public static String verifyRedirectUri(KeycloakSession session, String redirectUri, ClientModel client, boolean requireRedirectUri) {
+  54|         if (client != null)
+  55|             return verifyRedirectUri(session, client.getRootUrl(), redirectUri, client.getRedirectUris(), requireRedirectUri);
+  56|         return null;
+  57|     }
+  58| 
+  59|     public static Set<String> resolveValidRedirects(KeycloakSession session, String rootUrl, Set<String> validRedirects) {
+  60|         // If the valid redirect URI is relative (no scheme, host, port) then use the request's scheme, host, and port
+  61|         // the set is ordered by length to get the longest match first
+  62|         Set<String> resolveValidRedirects = new TreeSet<>((String s1, String s2) -> s1.length() == s2.length()? s1.compareTo(s2) : s1.length() < s2.length()? 1 : -1);
+  63|         for (String validRedirect : validRedirects) {
+  64|             if (validRedirect.startsWith("/")) {
+  65|                 validRedirect = relativeToAbsoluteURI(session, rootUrl, validRedirect);
+  66|                 logger.debugv("replacing relative valid redirect with: {0}", validRedirect);
+  67|             }
+  68|             resolveValidRedirects.add(validRedirect);
+  69|         }
+  70|         return resolveValidRedirects;
+  71|     }
+  72| 
+  73|     public static String verifyRedirectUri(KeycloakSession session, String rootUrl, String redirectUri, Set<String> validRedirects, boolean requireRedirectUri) {
+  74|         KeycloakUriInfo uriInfo = session.getContext().getUri();
+  75|         RealmModel realm = session.getContext().getRealm();
+  76| 
+  77|         if (redirectUri == null) {
+  78|             if (!requireRedirectUri) {
+  79|                 redirectUri = getSingleValidRedirectUri(validRedirects);
+  80|             }
+  81| 
+  82|             if (redirectUri == null) {
+  83|                 logger.debug("No Redirect URI parameter specified");
+  84|                 return null;
+  85|             }
+  86|         } else if (validRedirects.isEmpty()) {
+  87|             logger.debug("No Redirect URIs supplied");
+  88|             redirectUri = null;
+  89|         } else {
+  90|             URI originalRedirect = toUri(redirectUri);
+  91|             if (originalRedirect == null) {
+  92|                 // invalid URI passed as redirectUri
+  93|                 return null;
+  94|             }
+  95| 
+  96|             // check if the passed URI allows wildcards
+  97|             boolean allowWildcards = areWildcardsAllowed(originalRedirect);
+  98| 
+  99|             String r = redirectUri;
+ 100|             Set<String> resolveValidRedirects = resolveValidRedirects(session, rootUrl, validRedirects);
+ 101| 
+ 102|             String valid = matchesRedirects(resolveValidRedirects, r, allowWildcards);
+ 103| 
+ 104|             if (valid == null && "http".equals(originalRedirect.getScheme()) && LOOPBACK_INTERFACES.contains(originalRedirect.getHost())) {
+ 105|                 String redirectWithDefaultPort = KeycloakUriBuilder.fromUri(originalRedirect).port(80).buildAsString();
+ 106|                 valid = matchesRedirects(resolveValidRedirects, redirectWithDefaultPort, allowWildcards);
+ 107|             }
+ 108| 
+ 109|             if (valid != null && !originalRedirect.isAbsolute()) {
+ 110|                 // return absolute if the original URI is relative
+ 111|                 if (!redirectUri.startsWith("/")) {
+ 112|                     redirectUri = "/" + redirectUri;
+ 113|                 }
+ 114|                 redirectUri = relativeToAbsoluteURI(session, rootUrl, redirectUri);
+ 115|             }
+ 116| 
+ 117|             String scheme = originalRedirect.getScheme();
+ 118|             if (valid != null && scheme != null) {
+ 119|                 // check the scheme is valid, it should be http(s) or explicitly allowed by the validation
+ 120|                 if (!valid.startsWith(scheme + ":") && !"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
+ 121|                     logger.debugf("Invalid URI because scheme is not allowed: %s", redirectUri);
+ 122|                     valid = null;
+ 123|                 }
+ 124|             }
+ 125| 
+ 126|             redirectUri = valid != null ? redirectUri : null;
+ 127|         }
+ 128| 
+ 129|         if (Constants.INSTALLED_APP_URN.equals(redirectUri)) {
+ 130|             return Urls.realmInstalledAppUrnCallback(uriInfo.getBaseUri(), realm.getName()).toString();
+ 131|         } else {
+ 132|             return redirectUri;
+ 133|         }
+ 134|     }
+ 135| 
+ 136|     private static URI toUri(String redirectUri) {
+ 137|         URI uri = null;
+ 138|         if (redirectUri != null) {
+ 139|             try {
+ 140|                 uri = URI.create(redirectUri);
+ 141|             } catch (IllegalArgumentException cause) {
+ 142|                 logger.debugf(cause, "Invalid redirect uri %s", redirectUri);
+ 143|             } catch (Exception cause) {
+ 144|                 logger.debugf(cause, "Unexpected error when parsing redirect uri %s", redirectUri);
+ 145|             }
+ 146|         }
+ 147|         return uri;
+ 148|     }
+ 149| 
+ 150|     // any access to parent folder /../ is unsafe with or without encoding
+ 151|     private final static Pattern UNSAFE_PATH_PATTERN = Pattern.compile(
+ 152|             "(/|%2[fF]|%5[cC]|\\\\)(%2[eE]|\\.){2}(/|%2[fF]|%5[cC]|\\\\)|(/|%2[fF]|%5[cC]|\\\\)(%2[eE]|\\.){2}$");
+ 153| 
+ 154|     private static boolean areWildcardsAllowed(URI redirectUri) {
+ 155|         // wildcars are only allowed if no user-info and no unsafe pattern in path
+ 156|         return redirectUri.getRawUserInfo() == null
+ 157|                 && (redirectUri.getRawPath() == null || !UNSAFE_PATH_PATTERN.matcher(redirectUri.getRawPath()).find());
+ 158|     }
+ 159| 
+ 160|     private static String relativeToAbsoluteURI(KeycloakSession session, String rootUrl, String relative) {
+ 161|         if (rootUrl != null) {
+ 162|             rootUrl = ResolveRelative.resolveRootUrl(session, rootUrl);
+ 163|         }
+ 164| 
+ 165|         if (rootUrl == null || rootUrl.isEmpty()) {
+ 166|             rootUrl = UriUtils.getOrigin(session.getContext().getUri().getBaseUri());
+ 167|         }
+ 168|         StringBuilder sb = new StringBuilder();
+ 169|         sb.append(rootUrl);
+ 170|         sb.append(relative);
+ 171|         return sb.toString();
+ 172|     }
+ 173| 
+ 174|     // return the String that matched the redirect or null if not matched
+ 175|     private static String matchesRedirects(Set<String> validRedirects, String redirect, boolean allowWildcards) {
+ 176|         logger.tracef("matchesRedirects: redirect URL to check: %s, allow wildcards: %b, Configured valid redirect URLs: %s", redirect, allowWildcards, validRedirects);
+ 177|         for (String validRedirect : validRedirects) {
+ 178|             if ("*".equals(validRedirect)) {
+ 179|                 // the valid redirect * is a full wildcard for http(s) even if the redirect URI does not allow wildcards
+ 180|                 return validRedirect;
+ 181|             } else if (validRedirect.endsWith("*") && !validRedirect.contains("?") && allowWildcards) {
+ 182|                 // strip off the query or fragment components - we don't check them when wildcards are effective
+ 183|                 int idx = redirect.indexOf('?');
+ 184|                 if (idx == -1) {
+ 185|                     idx = redirect.indexOf('#');
+ 186|                 }
+ 187|                 String r = idx == -1 ? redirect : redirect.substring(0, idx);
+ 188|                 // strip off *
+ 189|                 int length = validRedirect.length() - 1;
+ 190|                 validRedirect = validRedirect.substring(0, length);
+ 191|                 if (r.startsWith(validRedirect)) return validRedirect;
+ 192|                 // strip off trailing '/'
+ 193|                 if (length - 1 > 0 && validRedirect.charAt(length - 1) == '/') length--;
+ 194|                 validRedirect = validRedirect.substring(0, length);
+ 195|                 if (validRedirect.equals(r)) return validRedirect;
+ 196|             } else if (validRedirect.equals(redirect)) return validRedirect;
+ 197|         }
+ 198|         return null;
+ 199|     }
+ 200| 
+ 201|     private static String getSingleValidRedirectUri(Collection<String> validRedirects) {
+ 202|         if (validRedirects.size() != 1) return null;
+ 203|         String validRedirect = validRedirects.iterator().next();
+ 204|         return validateRedirectUriWildcard(validRedirect);
+ 205|     }
+ 206| 
+ 207|     public static String validateRedirectUriWildcard(String redirectUri) {
+ 208|         if (redirectUri == null)
+ 209|             return null;
+ 210| 
+ 211|         int idx = redirectUri.indexOf("/*");
+ 212|         if (idx > -1) {
+ 213|             redirectUri = redirectUri.substring(0, idx);
+ 214|         }
+ 215|         return redirectUri;
+ 216|     }
+ 217| }
+ 218| 
+ 219| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7924 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（锚定行号）
+
+1. **入口点枚举**：本文件无 HTTP 路由，唯一外部输入面是 `ExchangeToken`（第 152 行起）的参数 `domain/timestamp/signedTimestamp`，以及经 `KeyFetcher` 回调（第 160 行）从外部（DNS TXT / HTTP）取回的密钥字符串。下游函数：`ValidateDomainAndTimestamp`(第 57)、`DecodeAndValidateSignature`(第 73)、`ParseMCPKeysFromStrings`(第 216)、`VerifySignatureWithKeys`(第 81)、`BuildPermissions`(第 130)、`CreateJWTClaimsAndToken`(第 143)。
+
+2. **domain 验证**（第 233–257 行 `IsValidDomain`）：长度限制、拒绝 IP 字面量（第 240 行，明确防 SSRF）、要求含点（第 245 行，拒绝内网单标签名如 localhost/kubernetes）、正则严格锚定且只允许 `[a-zA-Z0-9-]` 与点。正则虽属黑名单式判断，但此处字符集极窄且完全锚定，无法注入通配符或路径穿越字符进入 JWT 权限模式。
+
+3. **timestamp 验证**（第 62–70 行）：RFC3339 解析 + ±15 秒窗口，签名消息即 timestamp 原文（第 205 行），重放窗口受限于 15 秒且需私钥签名，可接受。
+
+4. **signature 数据流**：hex 解码（第 75–79）→ 按 Ed25519/P-384 校验长度并调用标准库 `ed25519.Verify` / `ecdsa.Verify`（第 110–127 行），使用 SHA-384 摘要与 P-384 匹配；无私钥混淆或 malleability 处理问题（ecdsa.Verify 拒绝非规范 s 的行为由标准库保证）。公钥来源是域名所有者自发布的 DNS/HTTP 记录，验证逻辑正确绑定 domain→key→signature。
+
+5. **权限构造**（第 130–141 行）：`ReverseString` 后生成 `com.example/*` 及可选 `com.example.*` 子域通配——子域授权是该认证模型的既定语义（DNS 记录发布于 apex 即声明对子域的控制），非漏洞。
+
+6. **解析健壮性**（第 216–262 行）：正则提取 k/p 后按算法白名单 switch（第 242 行起），不支持的算法直接报错；base64 解码错误被捕获返回，无 panic 路径（`elliptic.UnmarshalCompressed` 失败返回 nil 已检查，第 256–258 行）。`Fingerprint` 对类型断言失败有兜底（第 103–105 行）。
+
+7. **次要观察**（非漏洞）：±15 秒窗口内同一签名理论上可换取多次 token，但每次都需有效私钥签名，风险可忽略；`IsValidDomain` 允许大写字母导致大小写变体可能绕过 DNS 缓存层面的去重，但密钥仍须由该域真实控制者签名，不影响安全边界。
+
+**结论**：所有 source→sink 流均有有效防御（严格白名单正则、IP/单标签拒绝、时间窗、标准库密码学验证、算法白名单），未发现可利用漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文审查了 ExchangeToken 入口及其全部下游函数：domain 经 IsValidDomain 严格校验（拒绝 IP 字面量与单标签内网名，正则完全锚定仅允许安全字符）；timestamp 有 ±15 秒窗口限制；签名验证使用标准库 ed25519.Verify 与 ecdsa.Verify 且先做长度与算法白名单校验；公钥来自域名自身发布的 DNS/HTTP 记录并与 domain 正确绑定；BuildPermissions 生成的子域通配符是该认证模型的既定语义而非提权。未发现可绕过的过滤或可达的注入 sink。", "fix_suggestion": "no fix needed"}
+
+### id=7925 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+**入口点枚举（全文）**
+- 第 41–43 行：`verifyRedirectUri(session, redirectUri, client)` — 公开入口，redirectUri 来自 OAuth/OIDC 请求参数（外部可控 source）。
+- 第 45–49 行：带 `requireRedirectUri` 的重载，同样透传外部 redirectUri。
+- 第 51–62 行：`resolveValidRedirects` — 处理管理员配置的相对 redirect。
+- 第 64–117 行：核心校验逻辑 `verifyRedirectUri(...)`。
+- 第 119–133 行：`toUri` 解析。
+- 第 136–141 行：`UNSAFE_PATH_PATTERN` 防目录穿越。
+- 第 143–146 行：`areWildcardsAllowed`。
+- 第 148–160 行：`relativeToAbsoluteURI`。
+- 第 162–190 行：`matchesRedirects` — 匹配 sink 前的判定逻辑。
+- 第 192–205 行：无参 redirect 时取唯一合法值。
+
+**数据流验证**
+
+1. **source**：第 41 行参数 `redirectUri`（攻击者通过授权请求的 `redirect_uri` 参数完全控制）→ **sink**：第 116 行 `return redirectUri`（返回后用于颁发授权码的重定向）。
+
+2. **防御检查**：
+   - 第 71–73 行：URI 解析失败即拒绝 — 有效。
+   - 第 76–78 行：`matchesRedirects` 白名单匹配 — 见下述缺陷。
+   - 第 80–85 行：仅针对 localhost 的端口归一化，不构成绕过面。
+   - 第 99–106 行：scheme 校验只限制为 http/https 或与匹配项前缀一致，不能阻止主机伪造。
+   - 第 136–141、143–146 行：`UNSAFE_PATH_PATTERN` 与 userinfo 检查仅在允许通配符时收紧路径，但见缺陷 2。
+
+3. **漏洞一（主要）：通配符前缀匹配缺少边界分隔符**
+   - 第 168–171 行：当配置如 `https://client.example.com/*` 且 `allowWildcards=true` 时，去掉 `*` 得到前缀 `https://client.example.com`，然后执行 `r.startsWith(validRedirect)`。攻击者提交 `https://client.example.com.evil.com/callback` 即可满足 `startsWith` —— 前缀后没有要求 `/`、`?`、`#` 等边界字符，导致匹配到攻击者控制的域名，形成开放重定向（可窃取 authorization code）。这是真实历史漏洞模式（Keycloak 曾修复过类似问题，加入边界字符校验）。
+
+4. **漏洞二：`*` 全通配 + 相对路径组合**
+   - 第 164–166 行：配置为 `*` 时任意 http(s) URI 直接返回 `"*"`，随后第 116 行原样返回攻击者 URI。这依赖管理员显式配置，属设计行为，但结合第 107–112 行对非绝对 URI 的拼接，若 redirect 为 `//evil.com`（协议相对），`isAbsolute()` 为 false，会拼到 rootUrl 后，此路径被缓解；但绝对 https URI 在 `*` 配置下无任何主机校验。
+
+5. **第二通道**：第 86–95 行 localhost 端口 80 归一化分支最终也走同一个有缺陷的 `matchesRedirects`，同样受漏洞一影响；`getSingleValidRedirectUri`（第 192–205 行）截断 `/*` 后不再做匹配，但该值来自服务端配置，风险低。
+
+6. **黑名单评估**：`UNSAFE_PATH_PATTERN` 是正则黑名单，按本任务判定标准视为可绕过（例如利用未覆盖的编码组合），但它只影响是否允许通配符，主漏洞不依赖它被绕过即可成立。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-601 URL Redirection to Untrusted Site (Open Redirect)", "risk_level": "High", "source": "line 49: verifyRedirectUri 的外部参数 redirect_uri", "sink": "line 132: return redirectUri 返回给调用方用于授权码重定向", "explanation": "攻击者在授权请求中传入 redirect_uri=https://client.example.com.evil.com/cb -> 客户端配置了通配符 https://client.example.com/* 且 URI 无 userinfo 无穿越路径使 areWildcardsAllowed 为真 -> line 170 r.startsWith(https://client.example.com) 因缺少边界分隔符而误判匹配 -> line 116 原样返回攻击者域名 -> 授权码被重定向到攻击者站点造成代码劫持", "fix_suggestion": "line 170: 在 startsWith 判断后追加边界校验，要求前缀之后紧跟 / ? # 或字符串结束（并比较时忽略大小写），同时建议对通配符匹配的主机部分做精确域名比对而非纯字符串前缀"}

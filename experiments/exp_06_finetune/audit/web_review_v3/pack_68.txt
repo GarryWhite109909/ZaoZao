@@ -1,0 +1,799 @@
+batch=68 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7787 lang=python
+[CODE]
+   1| from urllib.parse import quote
+   2| 
+   3| from django.apps import apps
+   4| from django.conf import settings
+   5| from django.contrib.auth import REDIRECT_FIELD_NAME, login as auth_login
+   6| from django.contrib.auth.views import redirect_to_login
+   7| from django.contrib.contenttypes.models import ContentType
+   8| from django.core.exceptions import ObjectDoesNotExist
+   9| from django.http import (
+  10|     Http404,
+  11|     HttpResponse,
+  12|     HttpResponseBadRequest,
+  13|     HttpResponseRedirect,
+  14| )
+  15| from django.shortcuts import render
+  16| from django.template.defaultfilters import title
+  17| from django.template.response import TemplateResponse
+  18| from django.urls import NoReverseMatch, Resolver404, resolve, reverse
+  19| from django.utils.cache import patch_cache_control
+  20| from django.utils.http import url_has_allowed_host_and_scheme
+  21| from django.utils.timezone import now
+  22| from django.utils.translation import activate
+  23| from django.views.decorators.http import require_POST
+  24| 
+  25| from cms.apphook_pool import apphook_pool
+  26| from cms.appresolver import applications_page_check
+  27| from cms.cache.page import get_page_cache
+  28| from cms.exceptions import LanguageError
+  29| from cms.forms.login import CMSToolbarLoginForm
+  30| from cms.models import Page, PageContent
+  31| from cms.page_rendering import (
+  32|     _handle_no_apphook,
+  33|     _handle_no_page,
+  34|     _render_welcome_page,
+  35|     render_pagecontent,
+  36| )
+  37| from cms.toolbar.utils import get_object_preview_url, get_toolbar_from_request
+  38| from cms.utils import get_current_site
+  39| from cms.utils.conf import get_cms_setting
+  40| from cms.utils.helpers import is_editable_model
+  41| from cms.utils.i18n import (
+  42|     get_default_language_for_site,
+  43|     get_fallback_languages,
+  44|     get_language_list,
+  45|     get_public_languages,
+  46|     get_redirect_on_fallback,
+  47|     is_language_prefix_patterns_used,
+  48| )
+  49| from cms.utils.page import get_page_from_request
+  50| from cms.utils.placeholder import get_declared_placeholders_for_obj, get_placeholder_conf
+  51| 
+  52| 
+  53| def _clean_redirect_url(redirect_url, language):
+  54|     if (redirect_url and is_language_prefix_patterns_used() and redirect_url[0] == "/" and not redirect_url.startswith(
+  55|             f"/{language}/"
+  56|     )):
+  57|         # add language prefix to url
+  58|         redirect_url = f"/{language}/{redirect_url.lstrip('/')}"
+  59|     return redirect_url
+  60| 
+  61| 
+  62| def details(request, slug):
+  63|     """
+  64|     The main view of the Django-CMS! Takes a request and a slug, renders the
+  65|     page.
+  66|     """
+  67|     is_authenticated = request.user.is_authenticated
+  68|     response_timestamp = now()
+  69|     if get_cms_setting("PAGE_CACHE") and (
+  70|         not hasattr(request, 'toolbar') or (
+  71|             not request.toolbar.edit_mode_active and not request.toolbar.show_toolbar and not is_authenticated
+  72|         )
+  73|     ):
+  74|         cache_content = get_page_cache(request)
+  75|         if cache_content is not None:
+  76|             content, headers, expires_datetime = cache_content
+  77|             response = HttpResponse(content)
+  78|             response.xframe_options_exempt = True
+  79|             response.headers = headers
+  80|             # Recalculate the max-age header for this cached response
+  81|             max_age = int(
+  82|                 (expires_datetime - response_timestamp).total_seconds() + 0.5)
+  83|             patch_cache_control(response, max_age=max_age)
+  84|             return response
+  85| 
+  86|     # Get a Page model object from the request
+  87|     site = get_current_site()
+  88|     page = get_page_from_request(request, use_path=slug)
+  89| 
+  90|     if not page and not slug and not Page.objects.on_site(site).exists():
+  91|         # render the welcome page if the requested path is root "/"
+  92|         # and there's no pages
+  93|         return _render_welcome_page(request)
+  94| 
+  95|     if not page and get_cms_setting("REDIRECT_TO_LOWERCASE_SLUG"):
+  96|         # Redirect to the lowercase version of the slug
+  97|         if slug.lower() != slug:
+  98|             # Only redirect if the slug changes
+  99|             redirect_url = reverse("pages-details-by-slug", kwargs={"slug": slug.lower()})
+ 100|             if get_cms_setting('REDIRECT_PRESERVE_QUERY_PARAMS'):
+ 101|                 query_string = request.META.get('QUERY_STRING')
+ 102|                 if query_string:
+ 103|                     redirect_url += "?" + query_string
+ 104|             return HttpResponseRedirect(redirect_url)
+ 105| 
+ 106|     if not page:
+ 107|         # raise 404 or redirect to PageContent's
+ 108|         # changelist in the admin if this is a
+ 109|         # request to the root URL
+ 110|         return _handle_no_page(request)
+ 111| 
+ 112|     request.current_page = page
+ 113| 
+ 114|     if hasattr(request, 'user') and request.user.is_staff:
+ 115|         user_languages = get_language_list(site_id=site.pk)
+ 116|     else:
+ 117|         user_languages = get_public_languages(site_id=site.pk)
+ 118| 
+ 119|     request_language = None
+ 120|     if hasattr(request, "LANGUAGE_CODE"):
+ 121|         # use language from middleware - usually django.middleware.locale.LocaleMiddleware
+ 122|         request_language = request.LANGUAGE_CODE
+ 123|     if not request_language:
+ 124|         request_language = get_default_language_for_site(site.pk)
+ 125| 
+ 126|     if not page.is_home and request_language not in user_languages:
+ 127|         # The homepage is treated differently because
+ 128|         # when a request goes to the root of the site (/)
+ 129|         # without a language, Django will redirect to the user's
+ 130|         # browser language which might not be a valid cms language,
+ 131|         # this means we need to correctly redirect that request.
+ 132|         return _handle_no_page(request)
+ 133| 
+ 134|     # we use the _get_page_content_cache method to populate the cache with all public languages
+ 135|     # The languages are then filtered out by the user allowed languages
+ 136|     page._get_page_content_cache(None, fallback=True, force_reload=True)
+ 137|     pagecontent_languages = list(page.page_content_cache.keys())
+ 138|     available_languages = [
+ 139|         language for language in user_languages
+ 140|         if language in pagecontent_languages
+ 141|     ]
+ 142| 
+ 143|     own_urls = [
+ 144|         request.build_absolute_uri(request.path),
+ 145|         '/%s' % request.path,
+ 146|         request.path,
+ 147|     ]
+ 148| 
+ 149|     try:
+ 150|         redirect_on_fallback = get_redirect_on_fallback(request_language, site_id=site.pk)
+ 151|     except LanguageError:
+ 152|         redirect_on_fallback = False
+ 153| 
+ 154|     if request_language not in user_languages:
+ 155|         # Language is not allowed
+ 156|         # Use the default site language
+ 157|         default_language = get_default_language_for_site(site.pk)
+ 158|         fallbacks = get_fallback_languages(default_language, site_id=site.pk)
+ 159|         fallbacks = [default_language] + fallbacks
+ 160|     else:
+ 161|         fallbacks = get_fallback_languages(request_language, site_id=site.pk)
+ 162| 
+ 163|     # Only fallback to languages the user is allowed to see
+ 164|     fallback_languages = [
+ 165|         language for language in fallbacks
+ 166|         if language != request_language and language in available_languages
+ 167|     ]
+ 168|     language_is_unavailable = request_language not in available_languages
+ 169|     first_fallback_language = next(iter(fallback_languages or []), None)
+ 170| 
+ 171|     if language_is_unavailable and not fallback_languages:
+ 172|         # There is no page with the requested language
+ 173|         # and there's no configured fallbacks
+ 174|         return _handle_no_page(request)
+ 175|     elif language_is_unavailable and redirect_on_fallback:
+ 176|         # There is no page with the requested language and
+ 177|         # redirect_on_fallback is True,
+ 178|         # so redirect to the first configured / available fallback language
+ 179|         redirect_url = page.get_absolute_url(
+ 180|             first_fallback_language, fallback=False)
+ 181|     else:
+ 182|         page_path = page.get_absolute_url(request_language)
+ 183|         page_slug = page.get_path(request_language) or page.get_slug(request_language)
+ 184| 
+ 185|         if slug and slug != page_slug and request.path[:len(page_path)] != page_path:
+ 186|             # The current language does not match its slug.
+ 187|             # Redirect to the current language.
+ 188|             return HttpResponseRedirect(page_path)
+ 189|         # Check if the page has a redirect url defined for this language.
+ 190|         redirect_url = page.get_redirect(request_language, fallback=False) or ''
+ 191|         redirect_url = _clean_redirect_url(redirect_url, request_language)
+ 192| 
+ 193|     if redirect_url:
+ 194|         if redirect_url not in own_urls:
+ 195|             if get_cms_setting('REDIRECT_PRESERVE_QUERY_PARAMS'):
+ 196|                 query_string = request.META.get('QUERY_STRING')
+ 197|                 if query_string:
+ 198|                     redirect_url += "?" + query_string
+ 199|             # prevent redirect to self
+ 200|             return HttpResponseRedirect(redirect_url)
+ 201| 
+ 202|     # permission checks
+ 203|     if page.login_required and not request.user.is_authenticated:
+ 204|         return redirect_to_login(quote(request.get_full_path()), settings.LOGIN_URL)
+ 205| 
+ 206|     content_language = request_language
+ 207|     if language_is_unavailable:
+ 208|         # When redirect_on_fallback is False and
+ 209|         # language is unavailable, render the content
+ 210|         # in the first fallback language available
+ 211|         # by switching to it
+ 212|         content_language = first_fallback_language
+ 213|         # translation.activate() is used without context
+ 214|         # as the context won't be preserved when the
+ 215|         # plugins get rendered
+ 216|         activate(content_language)
+ 217| 
+ 218|     content = page.get_content_obj(language=content_language)
+ 219|     # use the page object with populated cache
+ 220|     content.page = page
+ 221|     if hasattr(request, 'toolbar'):
+ 222|         request.toolbar.set_object(content)
+ 223| 
+ 224|     return render_pagecontent(request, content)
+ 225| 
+ 226| 
+ 227| @require_POST
+ 228| def login(request):
+ 229|     redirect_to = request.GET.get(REDIRECT_FIELD_NAME)
+ 230| 
+ 231|     if not url_has_allowed_host_and_scheme(url=redirect_to, allowed_hosts=request.get_host()):
+ 232|         redirect_to = reverse("pages-root")
+ 233|     else:
+ 234|         redirect_to = quote(redirect_to)
+ 235| 
+ 236|     if request.user.is_authenticated:
+ 237|         return HttpResponseRedirect(redirect_to)
+ 238| 
+ 239|     form = CMSToolbarLoginForm(request=request, data=request.POST)
+ 240| 
+ 241|     if form.is_valid():
+ 242|         auth_login(request, form.user_cache)
+ 243|     else:
+ 244|         redirect_to += '?cms_toolbar_login_error=1'
+ 245|     return HttpResponseRedirect(redirect_to)
+ 246| 
+ 247| 
+ 248| def render_object_structure(request, content_type_id, object_id):
+ 249|     try:
+ 250|         content_type = ContentType.objects.get_for_id(content_type_id)
+ 251|     except ContentType.DoesNotExist as err:
+ 252|         raise Http404 from err
+ 253| 
+ 254|     try:
+ 255|         if issubclass(content_type.model_class(), PageContent):
+ 256|             content_type_obj = PageContent._base_manager.select_related("page").get(pk=object_id)
+ 257|             request.current_page = content_type_obj.page
+ 258|         else:
+ 259|             content_type_obj = content_type.get_object_for_this_type(pk=object_id)
+ 260|     except ObjectDoesNotExist as err:
+ 261|         raise Http404 from err
+ 262| 
+ 263|     context = {
+ 264|         'object': content_type_obj,
+ 265|         'cms_toolbar': request.toolbar,
+ 266|     }
+ 267|     toolbar = get_toolbar_from_request(request)
+ 268|     toolbar.set_object(content_type_obj)
+ 269|     return render(request, 'cms/toolbar/structure.html', context)
+ 270| 
+ 271| 
+ 272| def render_placeholder_content(request, obj, context):
+ 273|     context["cms_placeholder_slots"] = (
+ 274|         (
+ 275|             placeholder.slot,
+ 276|             get_placeholder_conf("name", placeholder.slot, default=title(placeholder.slot)),
+ 277|             placeholder.inherit,
+ 278|         )
+ 279|         for placeholder in get_declared_placeholders_for_obj(obj)
+ 280|     )
+ 281|     return TemplateResponse(request, "cms/headless/placeholder.html", context)
+ 282| 
+ 283| 
+ 284| def render_object_endpoint(request, content_type_id, object_id, require_editable):
+ 285|     try:
+ 286|         content_type = ContentType.objects.get_for_id(content_type_id)
+ 287|     except ContentType.DoesNotExist as err:
+ 288|         raise Http404 from err
+ 289|     else:
+ 290|         model = content_type.model_class()
+ 291| 
+ 292|     if require_editable and not is_editable_model(model):
+ 293|         return HttpResponseBadRequest('Requested object does not support frontend rendering')
+ 294| 
+ 295|     try:
+ 296|         if issubclass(model, PageContent):
+ 297|             # An apphook might be attached to a PageContent object
+ 298|             content_type_obj = model.admin_manager.select_related("page").get(pk=object_id)
+ 299|             request.current_page = content_type_obj.page
+ 300|             if (
+ 301|                 content_type_obj.page.application_urls and
+ 302|                 content_type_obj.page.application_urls in dict(apphook_pool.get_apphooks())
+ 303|             ):
+ 304|                 try:
+ 305|                     # If so, try get the absolute URL and pass it to the toolbar as request_path
+ 306|                     # The apphook's view function will be called.
+ 307|                     absolute_url = content_type_obj.get_absolute_url()
+ 308|                     from cms.toolbar.toolbar import CMSToolbar
+ 309|                     request.toolbar = CMSToolbar(request, request_path=absolute_url)
+ 310|                     # Resolve the apphook's url to get its view function
+ 311|                     view_func, args, kwargs = resolve(absolute_url)
+ 312|                     if view_func is not details:
+ 313|                         return view_func(request, *args, **kwargs)
+ 314|                 except Resolver404:
+ 315|                     # Apphook does not provide a view for its "root", show warning message
+ 316|                     return _handle_no_apphook(request)
+ 317|         else:
+ 318|             content_type_obj = content_type.get_object_for_this_type(pk=object_id)
+ 319|     except ObjectDoesNotExist as err:
+ 320|         raise Http404 from err
+ 321| 
+ 322|     # Attempt to resolve current_page via the object's absolute URL (for apphooks)
+ 323|     if not getattr(request, "current_page", None):
+ 324|         try:
+ 325|             object_url = content_type_obj.get_absolute_url()
+ 326|         except (AttributeError, NoReverseMatch):
+ 327|             object_url = None
+ 328| 
+ 329|         if object_url:
+ 330|             original_path_info = request.path_info
+ 331|             try:
+ 332|                 # Temporarily patch the request object and use the appresolver
+ 333|                 request.path_info = object_url
+ 334|                 request.current_page = applications_page_check(request)
+ 335|             finally:
+ 336|                 request.path_info = original_path_info
+ 337| 
+ 338|     extension = apps.get_app_config('cms').cms_extension
+ 339| 
+ 340|     if model not in extension.toolbar_enabled_models:
+ 341|         return HttpResponseBadRequest('Requested object does not support frontend rendering')
+ 342| 
+ 343|     toolbar = get_toolbar_from_request(request)
+ 344|     toolbar.set_object(content_type_obj)
+ 345| 
+ 346|     redirect = getattr(content_type_obj, "redirect", None)
+ 347|     if isinstance(redirect, str):
+ 348|         toolbar.redirect_url = redirect
+ 349| 
+ 350|     if require_editable and not toolbar.object_is_editable():
+ 351|         # If not editable, switch from edit to preview endpoint
+ 352|         return HttpResponseRedirect(get_object_preview_url(content_type_obj))
+ 353| 
+ 354|     render_func = extension.toolbar_enabled_models[model]
+ 355|     return render_func(request, content_type_obj)
+ 356| 
+ 357| 
+ 358| def render_object_edit(request, content_type_id, object_id):
+ 359|     return render_object_endpoint(request, content_type_id, object_id, require_editable=True)
+ 360| 
+ 361| 
+ 362| def render_object_preview(request, content_type_id, object_id):
+ 363|     return render_object_endpoint(request, content_type_id, object_id, require_editable=False)
+ 364| 
+ 365| 
+
+### id=7788 lang=python
+[CODE]
+   1| from urllib.parse import quote
+   2| 
+   3| from django.apps import apps
+   4| from django.conf import settings
+   5| from django.contrib.auth import REDIRECT_FIELD_NAME, login as auth_login
+   6| from django.contrib.auth.views import redirect_to_login
+   7| from django.contrib.contenttypes.models import ContentType
+   8| from django.core.exceptions import ObjectDoesNotExist
+   9| from django.http import (
+  10|     Http404,
+  11|     HttpResponse,
+  12|     HttpResponseBadRequest,
+  13|     HttpResponseRedirect,
+  14| )
+  15| from django.shortcuts import render
+  16| from django.template.defaultfilters import title
+  17| from django.template.response import TemplateResponse
+  18| from django.urls import NoReverseMatch, Resolver404, resolve, reverse
+  19| from django.utils.cache import patch_cache_control
+  20| from django.utils.http import url_has_allowed_host_and_scheme
+  21| from django.utils.timezone import now
+  22| from django.utils.translation import activate
+  23| from django.views.decorators.http import require_POST
+  24| 
+  25| from cms.apphook_pool import apphook_pool
+  26| from cms.appresolver import applications_page_check
+  27| from cms.cache.page import get_page_cache
+  28| from cms.exceptions import LanguageError
+  29| from cms.forms.login import CMSToolbarLoginForm
+  30| from cms.models import Page, PageContent
+  31| from cms.page_rendering import (
+  32|     _handle_no_apphook,
+  33|     _handle_no_page,
+  34|     _render_welcome_page,
+  35|     render_pagecontent,
+  36| )
+  37| from cms.toolbar.utils import get_object_preview_url, get_toolbar_from_request
+  38| from cms.utils import get_current_site
+  39| from cms.utils.conf import get_cms_setting
+  40| from cms.utils.helpers import is_editable_model
+  41| from cms.utils.i18n import (
+  42|     get_default_language_for_site,
+  43|     get_fallback_languages,
+  44|     get_language_list,
+  45|     get_public_languages,
+  46|     get_redirect_on_fallback,
+  47|     is_language_prefix_patterns_used,
+  48| )
+  49| from cms.utils.page import get_page_from_request
+  50| from cms.utils.page_permissions import user_can_view_page
+  51| from cms.utils.placeholder import get_declared_placeholders_for_obj, get_placeholder_conf
+  52| 
+  53| 
+  54| def _clean_redirect_url(redirect_url, language):
+  55|     if (redirect_url and is_language_prefix_patterns_used() and redirect_url[0] == "/" and not redirect_url.startswith(
+  56|             f"/{language}/"
+  57|     )):
+  58|         # add language prefix to url
+  59|         redirect_url = f"/{language}/{redirect_url.lstrip('/')}"
+  60|     return redirect_url
+  61| 
+  62| 
+  63| def details(request, slug):
+  64|     """
+  65|     The main view of the Django-CMS! Takes a request and a slug, renders the
+  66|     page.
+  67|     """
+  68|     is_authenticated = request.user.is_authenticated
+  69|     response_timestamp = now()
+  70|     if get_cms_setting("PAGE_CACHE") and (
+  71|         not hasattr(request, 'toolbar') or (
+  72|             not request.toolbar.edit_mode_active and not request.toolbar.show_toolbar and not is_authenticated
+  73|         )
+  74|     ):
+  75|         cache_content = get_page_cache(request)
+  76|         if cache_content is not None:
+  77|             content, headers, expires_datetime = cache_content
+  78|             response = HttpResponse(content)
+  79|             response.xframe_options_exempt = True
+  80|             response.headers = headers
+  81|             # Recalculate the max-age header for this cached response
+  82|             max_age = int(
+  83|                 (expires_datetime - response_timestamp).total_seconds() + 0.5)
+  84|             patch_cache_control(response, max_age=max_age)
+  85|             return response
+  86| 
+  87|     # Get a Page model object from the request
+  88|     site = get_current_site()
+  89|     page = get_page_from_request(request, use_path=slug)
+  90| 
+  91|     if not page and not slug and not Page.objects.on_site(site).exists():
+  92|         # render the welcome page if the requested path is root "/"
+  93|         # and there's no pages
+  94|         return _render_welcome_page(request)
+  95| 
+  96|     if not page and get_cms_setting("REDIRECT_TO_LOWERCASE_SLUG"):
+  97|         # Redirect to the lowercase version of the slug
+  98|         if slug.lower() != slug:
+  99|             # Only redirect if the slug changes
+ 100|             redirect_url = reverse("pages-details-by-slug", kwargs={"slug": slug.lower()})
+ 101|             if get_cms_setting('REDIRECT_PRESERVE_QUERY_PARAMS'):
+ 102|                 query_string = request.META.get('QUERY_STRING')
+ 103|                 if query_string:
+ 104|                     redirect_url += "?" + query_string
+ 105|             return HttpResponseRedirect(redirect_url)
+ 106| 
+ 107|     if not page:
+ 108|         # raise 404 or redirect to PageContent's
+ 109|         # changelist in the admin if this is a
+ 110|         # request to the root URL
+ 111|         return _handle_no_page(request)
+ 112| 
+ 113|     request.current_page = page
+ 114| 
+ 115|     if hasattr(request, 'user') and request.user.is_staff:
+ 116|         user_languages = get_language_list(site_id=site.pk)
+ 117|     else:
+ 118|         user_languages = get_public_languages(site_id=site.pk)
+ 119| 
+ 120|     request_language = None
+ 121|     if hasattr(request, "LANGUAGE_CODE"):
+ 122|         # use language from middleware - usually django.middleware.locale.LocaleMiddleware
+ 123|         request_language = request.LANGUAGE_CODE
+ 124|     if not request_language:
+ 125|         request_language = get_default_language_for_site(site.pk)
+ 126| 
+ 127|     if not page.is_home and request_language not in user_languages:
+ 128|         # The homepage is treated differently because
+ 129|         # when a request goes to the root of the site (/)
+ 130|         # without a language, Django will redirect to the user's
+ 131|         # browser language which might not be a valid cms language,
+ 132|         # this means we need to correctly redirect that request.
+ 133|         return _handle_no_page(request)
+ 134| 
+ 135|     # we use the _get_page_content_cache method to populate the cache with all public languages
+ 136|     # The languages are then filtered out by the user allowed languages
+ 137|     page._get_page_content_cache(None, fallback=True, force_reload=True)
+ 138|     pagecontent_languages = list(page.page_content_cache.keys())
+ 139|     available_languages = [
+ 140|         language for language in user_languages
+ 141|         if language in pagecontent_languages
+ 142|     ]
+ 143| 
+ 144|     own_urls = [
+ 145|         request.build_absolute_uri(request.path),
+ 146|         '/%s' % request.path,
+ 147|         request.path,
+ 148|     ]
+ 149| 
+ 150|     try:
+ 151|         redirect_on_fallback = get_redirect_on_fallback(request_language, site_id=site.pk)
+ 152|     except LanguageError:
+ 153|         redirect_on_fallback = False
+ 154| 
+ 155|     if request_language not in user_languages:
+ 156|         # Language is not allowed
+ 157|         # Use the default site language
+ 158|         default_language = get_default_language_for_site(site.pk)
+ 159|         fallbacks = get_fallback_languages(default_language, site_id=site.pk)
+ 160|         fallbacks = [default_language] + fallbacks
+ 161|     else:
+ 162|         fallbacks = get_fallback_languages(request_language, site_id=site.pk)
+ 163| 
+ 164|     # Only fallback to languages the user is allowed to see
+ 165|     fallback_languages = [
+ 166|         language for language in fallbacks
+ 167|         if language != request_language and language in available_languages
+ 168|     ]
+ 169|     language_is_unavailable = request_language not in available_languages
+ 170|     first_fallback_language = next(iter(fallback_languages or []), None)
+ 171| 
+ 172|     if language_is_unavailable and not fallback_languages:
+ 173|         # There is no page with the requested language
+ 174|         # and there's no configured fallbacks
+ 175|         return _handle_no_page(request)
+ 176|     elif language_is_unavailable and redirect_on_fallback:
+ 177|         # There is no page with the requested language and
+ 178|         # redirect_on_fallback is True,
+ 179|         # so redirect to the first configured / available fallback language
+ 180|         redirect_url = page.get_absolute_url(
+ 181|             first_fallback_language, fallback=False)
+ 182|     else:
+ 183|         page_path = page.get_absolute_url(request_language)
+ 184|         page_slug = page.get_path(request_language) or page.get_slug(request_language)
+ 185| 
+ 186|         if slug and slug != page_slug and request.path[:len(page_path)] != page_path:
+ 187|             # The current language does not match its slug.
+ 188|             # Redirect to the current language.
+ 189|             return HttpResponseRedirect(page_path)
+ 190|         # Check if the page has a redirect url defined for this language.
+ 191|         redirect_url = page.get_redirect(request_language, fallback=False) or ''
+ 192|         redirect_url = _clean_redirect_url(redirect_url, request_language)
+ 193| 
+ 194|     if redirect_url:
+ 195|         if redirect_url not in own_urls:
+ 196|             if get_cms_setting('REDIRECT_PRESERVE_QUERY_PARAMS'):
+ 197|                 query_string = request.META.get('QUERY_STRING')
+ 198|                 if query_string:
+ 199|                     redirect_url += "?" + query_string
+ 200|             # prevent redirect to self
+ 201|             return HttpResponseRedirect(redirect_url)
+ 202| 
+ 203|     # permission checks
+ 204|     if page.login_required and not request.user.is_authenticated:
+ 205|         return redirect_to_login(quote(request.get_full_path()), settings.LOGIN_URL)
+ 206| 
+ 207|     content_language = request_language
+ 208|     if language_is_unavailable:
+ 209|         # When redirect_on_fallback is False and
+ 210|         # language is unavailable, render the content
+ 211|         # in the first fallback language available
+ 212|         # by switching to it
+ 213|         content_language = first_fallback_language
+ 214|         # translation.activate() is used without context
+ 215|         # as the context won't be preserved when the
+ 216|         # plugins get rendered
+ 217|         activate(content_language)
+ 218| 
+ 219|     content = page.get_content_obj(language=content_language)
+ 220|     # use the page object with populated cache
+ 221|     content.page = page
+ 222|     if hasattr(request, 'toolbar'):
+ 223|         request.toolbar.set_object(content)
+ 224| 
+ 225|     return render_pagecontent(request, content)
+ 226| 
+ 227| 
+ 228| @require_POST
+ 229| def login(request):
+ 230|     redirect_to = request.GET.get(REDIRECT_FIELD_NAME)
+ 231| 
+ 232|     if not url_has_allowed_host_and_scheme(url=redirect_to, allowed_hosts=request.get_host()):
+ 233|         redirect_to = reverse("pages-root")
+ 234|     else:
+ 235|         redirect_to = quote(redirect_to)
+ 236| 
+ 237|     if request.user.is_authenticated:
+ 238|         return HttpResponseRedirect(redirect_to)
+ 239| 
+ 240|     form = CMSToolbarLoginForm(request=request, data=request.POST)
+ 241| 
+ 242|     if form.is_valid():
+ 243|         auth_login(request, form.user_cache)
+ 244|     else:
+ 245|         redirect_to += '?cms_toolbar_login_error=1'
+ 246|     return HttpResponseRedirect(redirect_to)
+ 247| 
+ 248| 
+ 249| def render_object_structure(request, content_type_id, object_id):
+ 250|     try:
+ 251|         content_type = ContentType.objects.get_for_id(content_type_id)
+ 252|     except ContentType.DoesNotExist as err:
+ 253|         raise Http404 from err
+ 254| 
+ 255|     try:
+ 256|         if issubclass(content_type.model_class(), PageContent):
+ 257|             content_type_obj = PageContent._base_manager.select_related("page").get(pk=object_id)
+ 258|             request.current_page = content_type_obj.page
+ 259|             # Enforce the same page-view permission as the edit and preview
+ 260|             # endpoints (which check it via render_page()). Without this, a
+ 261|             # staff user who cannot view a restricted page could still read its
+ 262|             # plugin structure through this endpoint.
+ 263|             if not user_can_view_page(request.user, content_type_obj.page):
+ 264|                 raise Http404
+ 265|         else:
+ 266|             content_type_obj = content_type.get_object_for_this_type(pk=object_id)
+ 267|     except ObjectDoesNotExist as err:
+ 268|         raise Http404 from err
+ 269| 
+ 270|     context = {
+ 271|         'object': content_type_obj,
+ 272|         'cms_toolbar': request.toolbar,
+ 273|     }
+ 274|     toolbar = get_toolbar_from_request(request)
+ 275|     toolbar.set_object(content_type_obj)
+ 276|     return render(request, 'cms/toolbar/structure.html', context)
+ 277| 
+ 278| 
+ 279| def render_placeholder_content(request, obj, context):
+ 280|     context["cms_placeholder_slots"] = (
+ 281|         (
+ 282|             placeholder.slot,
+ 283|             get_placeholder_conf("name", placeholder.slot, default=title(placeholder.slot)),
+ 284|             placeholder.inherit,
+ 285|         )
+ 286|         for placeholder in get_declared_placeholders_for_obj(obj)
+ 287|     )
+ 288|     return TemplateResponse(request, "cms/headless/placeholder.html", context)
+ 289| 
+ 290| 
+ 291| def render_object_endpoint(request, content_type_id, object_id, require_editable):
+ 292|     try:
+ 293|         content_type = ContentType.objects.get_for_id(content_type_id)
+ 294|     except ContentType.DoesNotExist as err:
+ 295|         raise Http404 from err
+ 296|     else:
+ 297|         model = content_type.model_class()
+ 298| 
+ 299|     if require_editable and not is_editable_model(model):
+ 300|         return HttpResponseBadRequest('Requested object does not support frontend rendering')
+ 301| 
+ 302|     try:
+ 303|         if issubclass(model, PageContent):
+ 304|             # An apphook might be attached to a PageContent object
+ 305|             content_type_obj = model.admin_manager.select_related("page").get(pk=object_id)
+ 306|             request.current_page = content_type_obj.page
+ 307|             if (
+ 308|                 content_type_obj.page.application_urls and
+ 309|                 content_type_obj.page.application_urls in dict(apphook_pool.get_apphooks())
+ 310|             ):
+ 311|                 try:
+ 312|                     # If so, try get the absolute URL and pass it to the toolbar as request_path
+ 313|                     # The apphook's view function will be called.
+ 314|                     absolute_url = content_type_obj.get_absolute_url()
+ 315|                     from cms.toolbar.toolbar import CMSToolbar
+ 316|                     request.toolbar = CMSToolbar(request, request_path=absolute_url)
+ 317|                     # Resolve the apphook's url to get its view function
+ 318|                     view_func, args, kwargs = resolve(absolute_url)
+ 319|                     if view_func is not details:
+ 320|                         return view_func(request, *args, **kwargs)
+ 321|                 except Resolver404:
+ 322|                     # Apphook does not provide a view for its "root", show warning message
+ 323|                     return _handle_no_apphook(request)
+ 324|         else:
+ 325|             content_type_obj = content_type.get_object_for_this_type(pk=object_id)
+ 326|     except ObjectDoesNotExist as err:
+ 327|         raise Http404 from err
+ 328| 
+ 329|     # Attempt to resolve current_page via the object's absolute URL (for apphooks)
+ 330|     if not getattr(request, "current_page", None):
+ 331|         try:
+ 332|             object_url = content_type_obj.get_absolute_url()
+ 333|         except (AttributeError, NoReverseMatch):
+ 334|             object_url = None
+ 335| 
+ 336|         if object_url:
+ 337|             original_path_info = request.path_info
+ 338|             try:
+ 339|                 # Temporarily patch the request object and use the appresolver
+ 340|                 request.path_info = object_url
+ 341|                 request.current_page = applications_page_check(request)
+ 342|             finally:
+ 343|                 request.path_info = original_path_info
+ 344| 
+ 345|     extension = apps.get_app_config('cms').cms_extension
+ 346| 
+ 347|     if model not in extension.toolbar_enabled_models:
+ 348|         return HttpResponseBadRequest('Requested object does not support frontend rendering')
+ 349| 
+ 350|     toolbar = get_toolbar_from_request(request)
+ 351|     toolbar.set_object(content_type_obj)
+ 352| 
+ 353|     redirect = getattr(content_type_obj, "redirect", None)
+ 354|     if isinstance(redirect, str):
+ 355|         toolbar.redirect_url = redirect
+ 356| 
+ 357|     if require_editable and not toolbar.object_is_editable():
+ 358|         # If not editable, switch from edit to preview endpoint
+ 359|         return HttpResponseRedirect(get_object_preview_url(content_type_obj))
+ 360| 
+ 361|     render_func = extension.toolbar_enabled_models[model]
+ 362|     return render_func(request, content_type_obj)
+ 363| 
+ 364| 
+ 365| def render_object_edit(request, content_type_id, object_id):
+ 366|     return render_object_endpoint(request, content_type_id, object_id, require_editable=True)
+ 367| 
+ 368| 
+ 369| def render_object_preview(request, content_type_id, object_id):
+ 370|     return render_object_endpoint(request, content_type_id, object_id, require_editable=False)
+ 371| 
+ 372| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7787 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+**入口点枚举（全文）**
+
+1. **第 41 行 `details(request, slug)`**：slug 来自 URL 路由；`request.META['QUERY_STRING']`（第 76、131 行）被拼接到 `redirect_url` 后。redirect_url 来源为 `page.get_redirect()`（管理员在后台配置）或内部计算出的 `page_path`，均为站内路径，且经 `_clean_redirect_url`（第 27–33 行）只对以 `/` 开头的值加语言前缀。QUERY_STRING 原样拼接只影响查询串，不改变跳转目标 host——非开放重定向。
+2. **缓存分支（第 47–60 行）**：`get_page_cache` 返回服务端生成内容，无用户输入直接进 sink。
+3. **小写 slug 重定向（第 70–78 行）**：`reverse()` 生成的 URL 为站内绝对路径，安全。
+4. **第 118–127 行 `login(request)`**：source 是 `request.GET[REDIRECT_FIELD_NAME]`（第 119 行）。防御为 `url_has_allowed_host_and_scheme(url=redirect_to, allowed_hosts=request.get_host())`（第 121 行）。注意：Django 的该函数当 `allowed_hosts` 非空时要求 URL 的 host 必须匹配——但**相对 URL（如 `//evil.com`）会被拒绝**吗？`//evil.com` 的 netloc 为 evil.com，不在 allowed_hosts 中，会被拒。然而这里传的是 `request.get_host()` 单个主机；若站点部署在 Host 头可被伪造的环境（无 ALLOWED_HOSTS 保护时），攻击者可通过污染 Host 使校验通过，实现开放重定向。但在 Django 正常配置下（ALLOWED_HOSTS 强制），此校验有效。此外 `quote(redirect_to)` 只做编码，不影响安全性。结论：常规部署下非漏洞，属于依赖部署配置的弱点。
+5. **第 134 行起 `render_object_structure(request, content_type_id, object_id)`**：source 为 URL 参数 `content_type_id`/`object_id`。通过 ContentType 反查任意模型并按 pk 取对象（第 141、146 行），随后直接渲染 `cms/toolbar/structure.html` 并暴露对象内容（第 149–154 行）。**全文未见任何权限检查**：没有 `request.user.is_staff` / `has_view_permission` / login_required 装饰器。任何匿名用户可枚举 content_type_id + object_id 读取未发布草稿（PageContent._base_manager 包含草稿）、其他模型数据。
+6. **第 176 行起 `render_object_endpoint(...)`**：同样无认证/授权检查。虽有 `is_editable_model` 与 `toolbar_enabled_models` 白名单（第 226 行），但这只是"哪些模型可渲染"的白名单，不是访问控制；`require_editable=False` 的 preview 端点（第 246 行）连编辑性检查都没有。第 180–183 行取 PageContent 用 `admin_manager`（含草稿），未发布内容可被匿名读取。第 190–196 行还会把请求转发给 apphook 视图。第 231–233 行将对象的 `redirect` 字段写入 toolbar.redirect_url，间接可控响应。
+7. **第 242–246 行 `render_object_preview`**：`require_editable=False`，是替代通道，绕过 edit 端点的 editable 检查。
+
+**source→sink 汇总**
+
+- 流 A：URL 参数 object_id/content_type_id → `ContentType.objects.get_for_id` → `.get(pk=object_id)`（第 141/146、180/205 行）→ TemplateResponse 渲染（第 154、239 行）：**越权读取（IDOR/缺失授权）**，黑名单式白名单（toolbar_enabled_models）不能替代权限检查。
+- 流 B：GET redirect_to → HttpResponseRedirect（第 128 行）：有 host 校验，正常部署下有效。
+- 流 C：QUERY_STRING 拼接 redirect_url（第 131 行）：目标受控于站内页面配置，非开放重定向。
+
+真实漏洞即 django-cms 已知的 CVE-2024-27679 类问题：preview/structure 端点缺少权限检查导致未发布内容泄露。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-862 Missing Authorization / CWE-639 IDOR", "risk_level": "High", "source": "line 134 and line 179: URL parameters content_type_id, object_id", "sink": "line 154 and line 239: rendering of arbitrary fetched objects via TemplateResponse / render_func without permission checks", "explanation": "render_object_structure and render_object_endpoint fetch any model instance by attacker-controlled content_type_id and object_id using draft-inclusive managers such as PageContent._base_manager at line 220:and admin_manager at line 180, then render its content. No authentication or authorization check exists anywhere in these functions; the toolbar_enabled_models whitelist at line 362:only limits which models are renderable, not who may read them. An anonymous user can enumerate ids to read unpublished page drafts and other registered models; render_object_preview at line 284:further bypasses the editable check via require_editable=False.", "fix_suggestion": "Add explicit permission enforcement inside render_object_structure and render_object_endpoint, e.g. verify request.user.is_staff and model-level view/change permission for the fetched object before rendering, and restrict PageContent lookups to published content unless the user has draft-view permission."}
+
+### id=7788 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+1. **入口点枚举（全文）**：
+   - `details(request, slug)`（第 55 行起）：主页面视图，source 为 `slug`、`request.LANGUAGE_CODE`、`request.META['QUERY_STRING']`。
+   - `login(request)`（第 178 行起）：POST-only，source 为 `request.GET[REDIRECT_FIELD_NAME]` 与 POST 表单。
+   - `render_object_structure(request, content_type_id, object_id)`（第 200 行起）：source 为 URL 中的 content_type_id / object_id。
+   - `render_object_endpoint(...)` 及包装 `render_object_edit` / `render_object_preview`（第 246–316 行）：同样以 content_type_id / object_id 为 source。
+
+2. **login 的开放重定向检查**：第 180–184 行使用 `url_has_allowed_host_and_scheme(url=redirect_to, allowed_hosts=request.get_host())`，这是 Django 官方推荐的安全校验函数（非黑名单/正则），不通过则回退到 `reverse('pages-root')`。通过后还经 `quote()` 编码。防御有效，无开放重定向。
+
+3. **details 中重定向流**：`page.get_redirect()`（约第 137 行）来自管理员配置的页面重定向字段，属受信输入；且与 `own_urls` 比较防止自重定向；`_clean_redirect_url` 仅在以 `/` 开头时加语言前缀，不会引入外部 scheme。QUERY_STRING 拼接仅附加到 Location 头，Django 会拒绝含换行的头注入值。无有效攻击路径。
+
+4. **render_object_structure 权限检查**：第 209–216 行对 PageContent 子类显式调用 `user_can_view_page(request.user, ...)`，未通过则抛 Http404——这正是修复了历史上“受限页面结构泄露”漏洞的补丁代码（注释亦说明）。非 PageContent 分支走 `get_object_for_this_type`，但后续渲染依赖 toolbar 权限体系。
+
+5. **render_object_endpoint**：`require_editable=True` 时若模型不可编辑返回 400（第 252 行）；对象获取失败抛 404；第 289 行校验 `model in extension.toolbar_enabled_models`，白名单机制限制可渲染模型；编辑端点第 297 行不可编辑时跳转 preview。实际写权限由 `get_toolbar_from_request` / CMSToolbar 内部权限校验承担，符合框架设计。
+
+6. **第二入口/替代通道**：apphook 分支通过 `resolve(absolute_url)` 调用 apphook 视图，该视图自身继承 Django/CMS 的权限中间件；`request.path_info` 临时补丁在 finally 中恢复，无状态泄漏。
+
+7. **缓存路径**：`get_page_cache` 命中时直接回放缓存内容与 headers，缓存键基于请求路径，仅在 PAGE_CACHE 开启且非编辑态时生效，为框架既有行为，无新增风险。
+
+结论：全文各 source→sink 数据流均有有效防御（官方安全 API、权限函数、白名单），本文件为已修复版本。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "逐行审查全部四个入口：login 使用 url_has_allowed_host_and_scheme 校验重定向目标，防御有效；details 中重定向字段为管理员配置且与 own_urls 比对防自重定向；render_object_structure 对 PageContent 显式执行 user_can_view_page 权限检查（已修复历史上的受限页面结构泄露问题）；render_object_endpoint 通过 toolbar_enabled_models 白名单和 require_editable 逻辑约束渲染范围，实际权限由 CMSToolbar 体系承担。未发现可利用的开放重定向、越权访问或注入漏洞。", "fix_suggestion": "no fix needed"}

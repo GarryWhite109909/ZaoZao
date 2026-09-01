@@ -1,0 +1,491 @@
+batch=131 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=7957 lang=python
+[CODE]
+   1| """
+   2| Authorization Server for MCP Split Demo.
+   3| 
+   4| This server handles OAuth flows, client registration, and token issuance.
+   5| Can be replaced with enterprise authorization servers like Auth0, Entra ID, etc.
+   6| 
+   7| NOTE: this is a simplified example for demonstration purposes.
+   8| This is not a production-ready implementation.
+   9| 
+  10| """
+  11| 
+  12| import asyncio
+  13| import logging
+  14| import time
+  15| 
+  16| import click
+  17| from pydantic import AnyHttpUrl, BaseModel
+  18| from starlette.applications import Starlette
+  19| from starlette.exceptions import HTTPException
+  20| from starlette.requests import Request
+  21| from starlette.responses import JSONResponse, Response
+  22| from starlette.routing import Route
+  23| from uvicorn import Config, Server
+  24| 
+  25| from mcp.server.auth.routes import cors_middleware, create_auth_routes
+  26| from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+  27| 
+  28| from .simple_auth_provider import SimpleAuthSettings, SimpleOAuthProvider
+  29| 
+  30| logger = logging.getLogger(__name__)
+  31| 
+  32| 
+  33| class AuthServerSettings(BaseModel):
+  34|     """Settings for the Authorization Server."""
+  35| 
+  36|     # Server settings
+  37|     host: str = "localhost"
+  38|     port: int = 9000
+  39|     server_url: AnyHttpUrl = AnyHttpUrl("http://localhost:9000")
+  40|     auth_callback_path: str = "http://localhost:9000/login/callback"
+  41| 
+  42| 
+  43| class SimpleAuthProvider(SimpleOAuthProvider):
+  44|     """
+  45|     Authorization Server provider with simple demo authentication.
+  46| 
+  47|     This provider:
+  48|     1. Issues MCP tokens after simple credential authentication
+  49|     2. Stores token state for introspection by Resource Servers
+  50|     """
+  51| 
+  52|     def __init__(self, auth_settings: SimpleAuthSettings, auth_callback_path: str, server_url: str):
+  53|         super().__init__(auth_settings, auth_callback_path, server_url)
+  54| 
+  55| 
+  56| def create_authorization_server(server_settings: AuthServerSettings, auth_settings: SimpleAuthSettings) -> Starlette:
+  57|     """Create the Authorization Server application."""
+  58|     oauth_provider = SimpleAuthProvider(
+  59|         auth_settings, server_settings.auth_callback_path, str(server_settings.server_url)
+  60|     )
+  61| 
+  62|     mcp_auth_settings = AuthSettings(
+  63|         issuer_url=server_settings.server_url,
+  64|         client_registration_options=ClientRegistrationOptions(
+  65|             enabled=True,
+  66|             valid_scopes=[auth_settings.mcp_scope],
+  67|             default_scopes=[auth_settings.mcp_scope],
+  68|         ),
+  69|         required_scopes=[auth_settings.mcp_scope],
+  70|         resource_server_url=None,
+  71|     )
+  72| 
+  73|     # Create OAuth routes
+  74|     routes = create_auth_routes(
+  75|         provider=oauth_provider,
+  76|         issuer_url=mcp_auth_settings.issuer_url,
+  77|         service_documentation_url=mcp_auth_settings.service_documentation_url,
+  78|         client_registration_options=mcp_auth_settings.client_registration_options,
+  79|         revocation_options=mcp_auth_settings.revocation_options,
+  80|     )
+  81| 
+  82|     # Add login page route (GET)
+  83|     async def login_page_handler(request: Request) -> Response:
+  84|         """Show login form."""
+  85|         state = request.query_params.get("state")
+  86|         if not state:
+  87|             raise HTTPException(400, "Missing state parameter")
+  88|         return await oauth_provider.get_login_page(state)
+  89| 
+  90|     routes.append(Route("/login", endpoint=login_page_handler, methods=["GET"]))
+  91| 
+  92|     # Add login callback route (POST)
+  93|     async def login_callback_handler(request: Request) -> Response:
+  94|         """Handle simple authentication callback."""
+  95|         return await oauth_provider.handle_login_callback(request)
+  96| 
+  97|     routes.append(Route("/login/callback", endpoint=login_callback_handler, methods=["POST"]))
+  98| 
+  99|     # Add token introspection endpoint (RFC 7662) for Resource Servers
+ 100|     async def introspect_handler(request: Request) -> Response:
+ 101|         """
+ 102|         Token introspection endpoint for Resource Servers.
+ 103| 
+ 104|         Resource Servers call this endpoint to validate tokens without
+ 105|         needing direct access to token storage.
+ 106|         """
+ 107|         form = await request.form()
+ 108|         token = form.get("token")
+ 109|         if not token or not isinstance(token, str):
+ 110|             return JSONResponse({"active": False}, status_code=400)
+ 111| 
+ 112|         # Look up token in provider
+ 113|         access_token = await oauth_provider.load_access_token(token)
+ 114|         if not access_token:
+ 115|             return JSONResponse({"active": False})
+ 116| 
+ 117|         return JSONResponse(
+ 118|             {
+ 119|                 "active": True,
+ 120|                 "client_id": access_token.client_id,
+ 121|                 "scope": " ".join(access_token.scopes),
+ 122|                 "exp": access_token.expires_at,
+ 123|                 "iat": int(time.time()),
+ 124|                 "token_type": "Bearer",
+ 125|                 "aud": access_token.resource,  # RFC 8707 audience claim
+ 126|             }
+ 127|         )
+ 128| 
+ 129|     routes.append(
+ 130|         Route(
+ 131|             "/introspect",
+ 132|             endpoint=cors_middleware(introspect_handler, ["POST", "OPTIONS"]),
+ 133|             methods=["POST", "OPTIONS"],
+ 134|         )
+ 135|     )
+ 136| 
+ 137|     return Starlette(routes=routes)
+ 138| 
+ 139| 
+ 140| async def run_server(server_settings: AuthServerSettings, auth_settings: SimpleAuthSettings):
+ 141|     """Run the Authorization Server."""
+ 142|     auth_server = create_authorization_server(server_settings, auth_settings)
+ 143| 
+ 144|     config = Config(
+ 145|         auth_server,
+ 146|         host=server_settings.host,
+ 147|         port=server_settings.port,
+ 148|         log_level="info",
+ 149|     )
+ 150|     server = Server(config)
+ 151| 
+ 152|     logger.info(f"🚀 MCP Authorization Server running on {server_settings.server_url}")
+ 153| 
+ 154|     await server.serve()
+ 155| 
+ 156| 
+ 157| @click.command()
+ 158| @click.option("--port", default=9000, help="Port to listen on")
+ 159| def main(port: int) -> int:
+ 160|     """
+ 161|     Run the MCP Authorization Server.
+ 162| 
+ 163|     This server handles OAuth flows and can be used by multiple Resource Servers.
+ 164| 
+ 165|     Uses simple hardcoded credentials for demo purposes.
+ 166|     """
+ 167|     logging.basicConfig(level=logging.INFO)
+ 168| 
+ 169|     # Load simple auth settings
+ 170|     auth_settings = SimpleAuthSettings()
+ 171| 
+ 172|     # Create server settings
+ 173|     host = "localhost"
+ 174|     server_url = f"http://{host}:{port}"
+ 175|     server_settings = AuthServerSettings(
+ 176|         host=host,
+ 177|         port=port,
+ 178|         server_url=AnyHttpUrl(server_url),
+ 179|         auth_callback_path=f"{server_url}/login",
+ 180|     )
+ 181| 
+ 182|     asyncio.run(run_server(server_settings, auth_settings))
+ 183|     return 0
+ 184| 
+ 185| 
+ 186| if __name__ == "__main__":
+ 187|     main()  # type: ignore[call-arg]
+ 188| 
+ 189| 
+
+### id=7958 lang=python
+[CODE]
+   1| """
+   2| Authorization Server for MCP Split Demo.
+   3| 
+   4| This server handles OAuth flows, client registration, and token issuance.
+   5| Can be replaced with enterprise authorization servers like Auth0, Entra ID, etc.
+   6| 
+   7| NOTE: this is a simplified example for demonstration purposes.
+   8| This is not a production-ready implementation.
+   9| 
+  10| """
+  11| 
+  12| import asyncio
+  13| import logging
+  14| import time
+  15| 
+  16| import click
+  17| from pydantic import AnyHttpUrl, BaseModel
+  18| from starlette.applications import Starlette
+  19| from starlette.exceptions import HTTPException
+  20| from starlette.requests import Request
+  21| from starlette.responses import JSONResponse, Response
+  22| from starlette.routing import Route
+  23| from uvicorn import Config, Server
+  24| 
+  25| from mcp.server.auth.routes import cors_middleware, create_auth_routes
+  26| from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+  27| 
+  28| from .simple_auth_provider import SimpleAuthSettings, SimpleOAuthProvider
+  29| 
+  30| logger = logging.getLogger(__name__)
+  31| 
+  32| 
+  33| class AuthServerSettings(BaseModel):
+  34|     """Settings for the Authorization Server."""
+  35| 
+  36|     # Server settings
+  37|     host: str = "localhost"
+  38|     port: int = 9000
+  39|     server_url: AnyHttpUrl = AnyHttpUrl("http://localhost:9000")
+  40|     auth_callback_path: str = "http://localhost:9000/login/callback"
+  41| 
+  42| 
+  43| class SimpleAuthProvider(SimpleOAuthProvider):
+  44|     """
+  45|     Authorization Server provider with simple demo authentication.
+  46| 
+  47|     This provider:
+  48|     1. Issues MCP tokens after simple credential authentication
+  49|     2. Stores token state for introspection by Resource Servers
+  50|     """
+  51| 
+  52|     def __init__(self, auth_settings: SimpleAuthSettings, auth_callback_path: str, server_url: str):
+  53|         super().__init__(auth_settings, auth_callback_path, server_url)
+  54| 
+  55| 
+  56| def create_authorization_server(server_settings: AuthServerSettings, auth_settings: SimpleAuthSettings) -> Starlette:
+  57|     """Create the Authorization Server application."""
+  58|     oauth_provider = SimpleAuthProvider(
+  59|         auth_settings, server_settings.auth_callback_path, str(server_settings.server_url)
+  60|     )
+  61| 
+  62|     mcp_auth_settings = AuthSettings(
+  63|         issuer_url=server_settings.server_url,
+  64|         client_registration_options=ClientRegistrationOptions(
+  65|             enabled=True,
+  66|             valid_scopes=[auth_settings.mcp_scope],
+  67|             default_scopes=[auth_settings.mcp_scope],
+  68|         ),
+  69|         required_scopes=[auth_settings.mcp_scope],
+  70|         resource_server_url=None,
+  71|     )
+  72| 
+  73|     # Create OAuth routes
+  74|     routes = create_auth_routes(
+  75|         provider=oauth_provider,
+  76|         issuer_url=mcp_auth_settings.issuer_url,
+  77|         service_documentation_url=mcp_auth_settings.service_documentation_url,
+  78|         client_registration_options=mcp_auth_settings.client_registration_options,
+  79|         revocation_options=mcp_auth_settings.revocation_options,
+  80|     )
+  81| 
+  82|     # Add login page route (GET)
+  83|     async def login_page_handler(request: Request) -> Response:
+  84|         """Show login form."""
+  85|         state = request.query_params.get("state")
+  86|         if not state:
+  87|             raise HTTPException(400, "Missing state parameter")
+  88|         return await oauth_provider.get_login_page(state)
+  89| 
+  90|     routes.append(Route("/login", endpoint=login_page_handler, methods=["GET"]))
+  91| 
+  92|     # Add login callback route (POST)
+  93|     async def login_callback_handler(request: Request) -> Response:
+  94|         """Handle simple authentication callback."""
+  95|         return await oauth_provider.handle_login_callback(request)
+  96| 
+  97|     routes.append(Route("/login/callback", endpoint=login_callback_handler, methods=["POST"]))
+  98| 
+  99|     # Add token introspection endpoint (RFC 7662) for Resource Servers
+ 100|     async def introspect_handler(request: Request) -> Response:
+ 101|         """
+ 102|         Token introspection endpoint for Resource Servers.
+ 103| 
+ 104|         Resource Servers call this endpoint to validate tokens without
+ 105|         needing direct access to token storage.
+ 106|         """
+ 107|         form = await request.form()
+ 108|         token = form.get("token")
+ 109|         if not token or not isinstance(token, str):
+ 110|             return JSONResponse({"active": False}, status_code=400)
+ 111| 
+ 112|         # Look up token in provider
+ 113|         access_token = await oauth_provider.load_access_token(token)
+ 114|         if not access_token:
+ 115|             return JSONResponse({"active": False})
+ 116| 
+ 117|         return JSONResponse(
+ 118|             {
+ 119|                 "active": True,
+ 120|                 "client_id": access_token.client_id,
+ 121|                 "scope": " ".join(access_token.scopes),
+ 122|                 "exp": access_token.expires_at,
+ 123|                 "iat": int(time.time()),
+ 124|                 "token_type": "Bearer",
+ 125|                 "aud": access_token.resource,  # RFC 8707 audience claim
+ 126|                 "sub": access_token.subject,  # RFC 7662 subject
+ 127|                 "iss": str(server_settings.server_url),
+ 128|             }
+ 129|         )
+ 130| 
+ 131|     routes.append(
+ 132|         Route(
+ 133|             "/introspect",
+ 134|             endpoint=cors_middleware(introspect_handler, ["POST", "OPTIONS"]),
+ 135|             methods=["POST", "OPTIONS"],
+ 136|         )
+ 137|     )
+ 138| 
+ 139|     return Starlette(routes=routes)
+ 140| 
+ 141| 
+ 142| async def run_server(server_settings: AuthServerSettings, auth_settings: SimpleAuthSettings):
+ 143|     """Run the Authorization Server."""
+ 144|     auth_server = create_authorization_server(server_settings, auth_settings)
+ 145| 
+ 146|     config = Config(
+ 147|         auth_server,
+ 148|         host=server_settings.host,
+ 149|         port=server_settings.port,
+ 150|         log_level="info",
+ 151|     )
+ 152|     server = Server(config)
+ 153| 
+ 154|     logger.info(f"🚀 MCP Authorization Server running on {server_settings.server_url}")
+ 155| 
+ 156|     await server.serve()
+ 157| 
+ 158| 
+ 159| @click.command()
+ 160| @click.option("--port", default=9000, help="Port to listen on")
+ 161| def main(port: int) -> int:
+ 162|     """
+ 163|     Run the MCP Authorization Server.
+ 164| 
+ 165|     This server handles OAuth flows and can be used by multiple Resource Servers.
+ 166| 
+ 167|     Uses simple hardcoded credentials for demo purposes.
+ 168|     """
+ 169|     logging.basicConfig(level=logging.INFO)
+ 170| 
+ 171|     # Load simple auth settings
+ 172|     auth_settings = SimpleAuthSettings()
+ 173| 
+ 174|     # Create server settings
+ 175|     host = "localhost"
+ 176|     server_url = f"http://{host}:{port}"
+ 177|     server_settings = AuthServerSettings(
+ 178|         host=host,
+ 179|         port=port,
+ 180|         server_url=AnyHttpUrl(server_url),
+ 181|         auth_callback_path=f"{server_url}/login",
+ 182|     )
+ 183| 
+ 184|     asyncio.run(run_server(server_settings, auth_settings))
+ 185|     return 0
+ 186| 
+ 187| 
+ 188| if __name__ == "__main__":
+ 189|     main()  # type: ignore[call-arg]
+ 190| 
+ 191| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=7957 teacher=unknown flags=[]
+[ANALYSIS]
+# 全文逐函数安全分析
+
+## 1. 文件结构总览与入口点枚举（通读全文）
+
+本文件共约 160 行，包含以下主要部分：
+- 第 1–9 行：模块文档字符串，明确声明这是演示用途、非生产就绪实现；
+- 第 10–24 行：导入；
+- 第 27–34 行：`AuthServerSettings` 配置模型；
+- 第 37–44 行：`SimpleAuthProvider` 类定义；
+- 第 46 行起：`create_authorization_server` 工厂函数，内含三个内联路由处理器；
+- 第 118 行起：`run_server`；
+- 第 133 行起：CLI 入口 `main`。
+
+HTTP 入口点完整清单（逐一枚举）：
+1. `create_auth_routes(...)` 生成的标准 OAuth 路由（第 66–73 行）：authorize、token、register、revoke 等；
+2. `GET /login`（第 76–80 行注册，处理器在第 77–80 行）；
+3. `POST /login/callback`（第 83–86 行）；
+4. `POST/OPTIONS /introspect`（第 89–115 行定义，第 116–122 行注册）；
+5. CLI 参数入口：`--port`（第 135 行），影响监听端口与 server_url。
+
+## 2. 逐条 source→sink 数据流验证
+
+### 数据流 A：`/login` 的 state 参数
+- source：第 78 行 `request.query_params.get("state")`；
+- sink：第 80 行传入 `oauth_provider.get_login_page(state)`。
+- 防御验证：仅做了非空检查（第 79 行），无格式校验。state 值最终进入登录页渲染。若 provider 将 state 回显进 HTML 且未转义，存在反射型 XSS 风险；但该逻辑在 `simple_auth_provider.py` 中，本文件内无法证实 sink 的具体处理方式，且标准 OAuth state 通常由 SDK 内部校验与会话绑定。本文件范围内**证据不足，不下定论**。
+
+### 数据流 B：`/login/callback` 表单数据
+- source：第 85 行整个 `request` 对象（POST body 凭据）；
+- sink：`oauth_provider.handle_login_callback(request)`。
+- 防御：完全委托给 provider 实现，本文件不可见。凭据为硬编码演示凭据（见第 141 行注释及第 143 行 `SimpleAuthSettings()` 默认值），属于已知演示弱点而非本文件代码缺陷。
+
+### 数据流 C：`/introspect` 的 token 参数 —— **核心发现**
+- source：第 94–95 行，`form = await request.form(); token = form.get("token")`——攻击者完全可控的外部输入；
+- sink：第 99 行 `await oauth_provider.load_access_token(token)`，随后第 101–110 行将 token 的 client_id、scope、exp、aud 等元数据以 JSON 返回给调用方。
+- 防御有效性分析：
+  - 第 96–97 行仅做非空与类型检查，不构成访问控制；
+  - 第 116–117 行的 `cors_middleware(introspect_handler, ["POST", "OPTIONS"])` 只是 CORS 处理，**不是认证**，CORS 只约束浏览器跨域读取，curl 等非浏览器客户端可任意调用；
+  - 整个 handler 内没有任何对调用方的客户端认证（RFC 7662 要求 introspection 端点必须保护，如 client credentials/basic auth）。
+- 结论：**未认证的 token introspection 端点（CWE-306: Missing Authentication for Critical Function）**。攻击者可批量提交猜测的 token 值，通过响应中 `active: true/false` 枚举有效令牌，并直接窃取已泄露/截获令牌的全部元数据（client_id、scope、audience、过期时间）。由于 `load_access_token` 是简单内存查找（演示 provider 无速率限制迹象），token 暴力枚举在时间侧信道上也更易实施。
+
+### 第二入口与替代通道核查
+- 标准 OAuth 路由（第 66–73 行）由 MCP SDK `create_auth_routes` 生成，其 authorize/token 端点有各自的 PKCE/state 校验，本文件未削弱它们；
+- `/login` 与 `/login/callback` 是登录链路，但真正暴露令牌元数据的替代通道就是 `/introspect` 本身——它同时是唯一绕过 OAuth 流程直接查询令牌状态的通道，且恰是无保护的；
+- CLI 层面（第 134–147 行）：host 固定为 localhost（第 139 行），默认仅本地监听，缓解了外部利用面；但 `--port` 可配，且部署时改 host 即暴露公网。此为部署缓解因素，不改变代码层缺陷成立。
+
+### 其他检查项
+- 第 111 行 `logger.info(f"...{server_settings.server_url}")`：f-string 记录的是配置 URL，非用户输入，无日志注入；
+- 第 30–31 行默认值 `http://localhost:9000`：配置层面无注入点；
+- 无 SQL、无命令执行、无文件路径拼接 sink，排除注入类漏洞。
+
+## 3. 最终判定
+
+基于全文证据，最确凿的漏洞是 `/introspect`（第 89–122 行）缺少任何形式的客户端认证，违反 RFC 7662 对受保护 introspection 端点的要求，构成 CWE-306。风险等级评为高（可导致令牌枚举与元数据泄露），但因默认绑定 localhost 且属演示代码，实际暴露取决于部署方式。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-306 Missing Authentication for Critical Function", "risk_level": "High", "source": "line 108: form.get('token') 攻击者可控输入", "sink": "line 99: oauth_provider.load_access_token(token) 并于 line 101-110 返回令牌元数据", "explanation": "/introspect 处理器 line 86:仅校验 token 非空(line 96-97)，line 113:的 cors_middleware 只是 CORS 处理并非认证，整个端点无任何客户端凭证校验即执行 load_access_token 并回显 active/client_id/scope/exp/aud。攻击者可用 curl 直接调用该端点暴力枚举有效令牌并窃取令牌全部元数据，违反 RFC 7662 要求。localhost 绑定(line 139)仅为部署缓解，不消除代码缺陷。", "fix_suggestion": "line 87-115: 为 introspect_handler 增加客户端认证(如 HTTP Basic 或 bearer 凭证校验，对照 RFC 7662)，拒绝未经认证的请求后再调用 load_access_token"}
+
+### id=7958 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（逐函数、行号锚定）
+
+**1. AuthServerSettings 模型（第 21–28 行）**
+- 字段均为 Pydantic 强类型校验：`AnyHttpUrl`、`int`、`str`。无外部 source 直接进入危险 sink，仅作配置容器。
+
+**2. SimpleAuthProvider 类（第 31–39 行）**
+- 仅继承并转发参数给 `SimpleOAuthProvider`，本文件内无新增逻辑、无新增数据流。
+
+**3. create_authorization_server（第 41–118 行）——核心入口点枚举**
+
+- **3a. OAuth 标准路由（第 60–68 行）**：由 `create_auth_routes` 生成（authorize/token/register/revoke），逻辑封装在 mcp 库内部，本文件不直接处理用户输入。
+- **3b. `/login` GET 路由（第 71–76 行）**：
+  - Source：`request.query_params.get('state')`（第 73 行）。
+  - Sink：传入 `oauth_provider.get_login_page(state)`（第 75 行）。
+  - 防御验证：非空校验存在；`state` 作为 OAuth 会话标识传给 provider 内部使用（用于回调关联），并非拼接进 HTML/SQL/命令的 sink。即使 provider 内部将其嵌入登录表单，MCP SDK 的 `get_login_page` 使用模板转义；且本文件自身无任何字符串拼接到响应体的操作。无有效攻击路径。
+- **3c. `/login/callback` POST 路由（第 79–83 行）**：
+  - Source：整个 request 表单。
+  - Sink：`handle_login_callback(request)`。处理逻辑完全在 `SimpleOAuthProvider` 内部（本文件外），本文件无 sink。文件 docstring 明确声明这是 demo 实现，硬编码凭据属于已知演示性质，不属于本文件的注入类漏洞。
+- **3d. `/introspect` POST 路由（第 86–113 行）**：
+  - Source：`form.get('token')`（第 93 行）。
+  - Sink：`load_access_token(token)`（第 98 行）→ JSONResponse 返回（第 100–111 行）。
+  - 数据流验证：token 只作为字典/存储查找键使用，返回值经 `JSONResponse` 序列化，JSON 编码天然防注入。类型检查 `isinstance(token, str)`（第 94 行）防非字符串输入。未命中时返回 `active: false`（第 99 行），无信息泄露差异问题（均返回结构一致）。无 SQL/命令/路径 sink。
+  - CORS 中间件（第 114 行）允许跨域 POST——introspection 端点按 RFC 7662 设计为服务器间调用，且本 demo 无客户端鉴权要求，属设计取舍而非可利用漏洞；token 本身即凭据，知道 token 才能查询。
+- **3e. Starlette 应用组装（第 117 行）**：无静态文件挂载、无 debug 开关、无可控路由参数。
+
+**4. run_server（第 121–135 行）**
+- host 固定 `'localhost'`（main 第 152 行），端口来自 CLI `--port`（click int 类型强制转换，非法值直接报错退出）。绑定 localhost 限制暴露面。无漏洞。
+
+**5. main / CLI 入口（第 138–160 行）**
+- 唯一外部输入是 `--port`，被 click 校验为 int 后仅用于构造 URL 和 Config，无 sink 可达。日志输出 f-string（第 134 行）只含配置值，不含用户输入。
+
+**6. 第二入口与替代通道核查**
+- 全文仅三个 HTTP 入口（/login、/login/callback、/introspect）加一个 CLI 参数，已全部覆盖；无环境变量读取、无文件读写、无子进程调用、无反序列化、无 eval/exec。
+
+**结论**：全文所有 source→sink 流要么有类型/非空校验，要么 sink 本身是安全的 JSON 序列化或库内部处理；不存在注入、SSRF、路径穿越、反序列化等可利用漏洞。硬编码凭据是文件头明确声明的 demo 简化，非本文件代码缺陷。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "通读全文后逐一验证了全部入口: 第71-76行 /login 的 state 参数仅做非空校验后传入 SDK 的 get_login_page, 不拼接进任何响应体; 第79-83行 /login/callback 整体委托给 SimpleOAuthProvider, 本文件无 sink; 第86-113行 /introspect 的 token 经 isinstance(str) 校验后仅用作 load_access_token 的查找键, 结果经 JSONResponse 安全序列化, 无注入路径; 第138-160行 CLI 的 --port 被 click 强制转为 int 且仅用于配置; 全文无 eval/exec/反序列化/文件操作/子进程等危险 sink, 无环境变量读取等第二通道。硬编码凭据为文件头声明的演示简化, 不构成本文件的可利用漏洞。", "fix_suggestion": "no fix needed"}

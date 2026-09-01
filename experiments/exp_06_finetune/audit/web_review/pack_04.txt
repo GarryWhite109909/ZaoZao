@@ -1,0 +1,957 @@
+你是独立安全审查员,对一份漏洞分析数据集的样本做质检。对每个样本:忽略给出的教师结论,自己读代码独立判断,再对比教师结论找差异。
+
+【常见教师错误方向(逐条对照)】
+1. bash/eval 引号语义:双引号内 ; | \ 不作分隔;但 $( ) 反引号会展开;eval 场景二次解析可逃逸;shlex.quote 后不可注入
+2. 诱饵注释不可信:代码注释自称"漏洞点/真正漏洞"不是依据,必须找到对应数据流
+3. SSTI 先分位:常量模板+输入走形参=数据位(非 SSTI);输入拼进模板源码=模板位(成立);escape 不处理花括号
+4. Path.Combine/os.path.join 的 rooted-path 与 .. 逃逸;node 列表参数中 argv[0] 可控仍是注入
+5. 硬编码密钥/OTP 常量本身即漏洞,恒时比较救不了
+6. 行号必须与编号代码核对(行内自标注释的行号不可信)
+7. CWE 归类:shell 元字符=78 非 88/95;硬编码加密密钥=321;HQL=943;mass assignment=915;堆溢出=122;双free=415/UAF=416;信息泄露=200;缓存投毒XSS=79
+8. 风险校准:未认证 RCE/接管=Critical;反射 XSS/DoS=Medium;需部署假设的降级并声明
+
+【输出格式】每个样本输出一行 JSON(不要代码块):
+{"id": <样本id>, "verdict": "AGREE|DISAGREE|UNSURE", "teacher_hv_correct": true/false, "cwe_should": "CWE-xxx 或 none", "issues": ["发现的问题,每条一句"], "note": "一句话理由"}
+最后一个样本之后,单独输出一行汇总:{"packet_done": true, "agree": n, "disagree": n, "unsure": n}
+
+【样本】
+── 样本 id=7980(裁决参考) | 代码共 379 行 ──
+【教师结论】has_vulnerability=True, CWE-200 Exposure of Sensitive Information, risk=High
+【source】line 72: ListMCPServicesByIDs 接收外部传入的 ids 参数
+【sink】line 80: 直接返回未经 MaskSensitiveData 脱敏的 services 给调用方
+【explanation】ListMCPServices 在 line 78:对每条记录调用 MaskSensitiveData 脱敏，但功能等价的替代查询入口 ListMCPServicesByIDs 缺少该步骤，攻击者可通过批量 ID 查询通道获取 EnvVars、Headers、AuthConfig 中存储的明文凭据，形成脱敏绕过
+【fix_suggestion】line 83: 在 return 前对每个 service 调用 MaskSensitiveData，与 ListMCPServices 保持一致
+【代码】
+   1| package service
+   2| 
+   3| import (
+   4| 	"context"
+   5| 	"fmt"
+   6| 	"time"
+   7| 
+   8| 	"github.com/Tencent/WeKnora/internal/logger"
+   9| 	"github.com/Tencent/WeKnora/internal/mcp"
+  10| 	"github.com/Tencent/WeKnora/internal/types"
+  11| 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+  12| 	secutils "github.com/Tencent/WeKnora/internal/utils"
+  13| )
+  14| 
+  15| // mcpServiceService implements MCPServiceService interface
+  16| type mcpServiceService struct {
+  17| 	mcpServiceRepo interfaces.MCPServiceRepository
+  18| 	mcpManager     *mcp.MCPManager
+  19| }
+  20| 
+  21| // NewMCPServiceService creates a new MCP service service
+  22| func NewMCPServiceService(
+  23| 	mcpServiceRepo interfaces.MCPServiceRepository,
+  24| 	mcpManager *mcp.MCPManager,
+  25| ) interfaces.MCPServiceService {
+  26| 	return &mcpServiceService{
+  27| 		mcpServiceRepo: mcpServiceRepo,
+  28| 		mcpManager:     mcpManager,
+  29| 	}
+  30| }
+  31| 
+  32| // CreateMCPService creates a new MCP service
+  33| func (s *mcpServiceService) CreateMCPService(ctx context.Context, service *types.MCPService) error {
+  34| 	// Set default advanced config if not provided
+  35| 	if service.AdvancedConfig == nil {
+  36| 		service.AdvancedConfig = types.GetDefaultAdvancedConfig()
+  37| 	}
+  38| 
+  39| 	// Set timestamps
+  40| 	service.CreatedAt = time.Now()
+  41| 	service.UpdatedAt = time.Now()
+  42| 
+  43| 	if err := s.mcpServiceRepo.Create(ctx, service); err != nil {
+  44| 		logger.GetLogger(ctx).Errorf("Failed to create MCP service: %v", err)
+  45| 		return fmt.Errorf("failed to create MCP service: %w", err)
+  46| 	}
+  47| 
+  48| 	return nil
+  49| }
+  50| 
+  51| // GetMCPServiceByID retrieves an MCP service by ID
+  52| func (s *mcpServiceService) GetMCPServiceByID(
+  53| 	ctx context.Context,
+  54| 	tenantID uint64,
+  55| 	id string,
+  56| ) (*types.MCPService, error) {
+  57| 	service, err := s.mcpServiceRepo.GetByID(ctx, tenantID, id)
+  58| 	if err != nil {
+  59| 		logger.GetLogger(ctx).Errorf("Failed to get MCP service: %v", err)
+  60| 		return nil, fmt.Errorf("failed to get MCP service: %w", err)
+  61| 	}
+  62| 
+  63| 	if service == nil {
+  64| 		return nil, fmt.Errorf("MCP service not found")
+  65| 	}
+  66| 
+  67| 	return service, nil
+  68| }
+  69| 
+  70| // ListMCPServices lists all MCP services for a tenant
+  71| func (s *mcpServiceService) ListMCPServices(ctx context.Context, tenantID uint64) ([]*types.MCPService, error) {
+  72| 	services, err := s.mcpServiceRepo.List(ctx, tenantID)
+  73| 	if err != nil {
+  74| 		logger.GetLogger(ctx).Errorf("Failed to list MCP services: %v", err)
+  75| 		return nil, fmt.Errorf("failed to list MCP services: %w", err)
+  76| 	}
+  77| 
+  78| 	// Mask sensitive data for list view
+  79| 	for _, service := range services {
+  80| 		service.MaskSensitiveData()
+  81| 	}
+  82| 
+  83| 	return services, nil
+  84| }
+  85| 
+  86| // ListMCPServicesByIDs retrieves multiple MCP services by IDs
+  87| func (s *mcpServiceService) ListMCPServicesByIDs(
+  88| 	ctx context.Context,
+  89| 	tenantID uint64,
+  90| 	ids []string,
+  91| ) ([]*types.MCPService, error) {
+  92| 	if len(ids) == 0 {
+  93| 		return []*types.MCPService{}, nil
+  94| 	}
+  95| 
+  96| 	services, err := s.mcpServiceRepo.ListByIDs(ctx, tenantID, ids)
+  97| 	if err != nil {
+  98| 		logger.GetLogger(ctx).Errorf("Failed to list MCP services by IDs: %v", err)
+  99| 		return nil, fmt.Errorf("failed to list MCP services by IDs: %w", err)
+ 100| 	}
+ 101| 
+ 102| 	return services, nil
+ 103| }
+ 104| 
+ 105| // UpdateMCPService updates an MCP service
+ 106| func (s *mcpServiceService) UpdateMCPService(ctx context.Context, service *types.MCPService) error {
+ 107| 	// Check if service exists
+ 108| 	existing, err := s.mcpServiceRepo.GetByID(ctx, service.TenantID, service.ID)
+ 109| 	if err != nil {
+ 110| 		return fmt.Errorf("failed to get MCP service: %w", err)
+ 111| 	}
+ 112| 	if existing == nil {
+ 113| 		return fmt.Errorf("MCP service not found")
+ 114| 	}
+ 115| 
+ 116| 	// Store old enabled state BEFORE any updates
+ 117| 	oldEnabled := existing.Enabled
+ 118| 
+ 119| 	// Merge updates: only update fields that are provided (non-zero or explicitly set)
+ 120| 	// This ensures that false values for enabled field are properly updated
+ 121| 	// Handler ensures that service.Enabled is only set if "enabled" key exists in the request
+ 122| 	// So we can safely update enabled field if service.Name is empty (indicating partial update)
+ 123| 	// or if we're updating other fields (indicating full update)
+ 124| 	// For enabled field, we'll update it if this is a partial update (only enabled) or if it's explicitly set
+ 125| 	if service.Name == "" {
+ 126| 		// Partial update - only update enabled field
+ 127| 		existing.Enabled = service.Enabled
+ 128| 	} else {
+ 129| 		// Full update - update all fields including enabled
+ 130| 		existing.Name = service.Name
+ 131| 		if service.Description != existing.Description {
+ 132| 			existing.Description = service.Description
+ 133| 		}
+ 134| 		existing.Enabled = service.Enabled
+ 135| 		if service.TransportType != "" {
+ 136| 			existing.TransportType = service.TransportType
+ 137| 		}
+ 138| 		if service.URL != nil {
+ 139| 			existing.URL = service.URL
+ 140| 		}
+ 141| 		if service.StdioConfig != nil {
+ 142| 			existing.StdioConfig = service.StdioConfig
+ 143| 		}
+ 144| 		if service.EnvVars != nil {
+ 145| 			existing.EnvVars = service.EnvVars
+ 146| 		}
+ 147| 		if service.Headers != nil {
+ 148| 			existing.Headers = service.Headers
+ 149| 		}
+ 150| 		if service.AuthConfig != nil {
+ 151| 			existing.AuthConfig = service.AuthConfig
+ 152| 		}
+ 153| 		if service.AdvancedConfig != nil {
+ 154| 			existing.AdvancedConfig = service.AdvancedConfig
+ 155| 		}
+ 156| 	}
+ 157| 
+ 158| 	// Update timestamp
+ 159| 	existing.UpdatedAt = time.Now()
+ 160| 
+ 161| 	if err := s.mcpServiceRepo.Update(ctx, existing); err != nil {
+ 162| 		logger.GetLogger(ctx).Errorf("Failed to update MCP service: %v", err)
+ 163| 		return fmt.Errorf("failed to update MCP service: %w", err)
+ 164| 	}
+ 165| 
+ 166| 	// Check if critical configuration changed (URL/StdioConfig, transport type, or auth config)
+ 167| 	configChanged := false
+ 168| 	if service.URL != nil && existing.URL != nil && *service.URL != *existing.URL {
+ 169| 		configChanged = true
+ 170| 	} else if (service.URL != nil) != (existing.URL != nil) {
+ 171| 		configChanged = true
+ 172| 	}
+ 173| 	if service.StdioConfig != nil && existing.StdioConfig != nil {
+ 174| 		if service.StdioConfig.Command != existing.StdioConfig.Command ||
+ 175| 			!equalStringSlices(service.StdioConfig.Args, existing.StdioConfig.Args) {
+ 176| 			configChanged = true
+ 177| 		}
+ 178| 	} else if (service.StdioConfig != nil) != (existing.StdioConfig != nil) {
+ 179| 		configChanged = true
+ 180| 	}
+ 181| 	if service.TransportType != "" && service.TransportType != existing.TransportType {
+ 182| 		configChanged = true
+ 183| 	}
+ 184| 	if service.AuthConfig != nil {
+ 185| 		configChanged = true
+ 186| 	}
+ 187| 	name := secutils.SanitizeForLog(existing.Name)
+ 188| 	// Close existing client connection if:
+ 189| 	// 1. Service is now disabled (need to close connection)
+ 190| 	// 2. Critical configuration changed (need to reconnect with new config)
+ 191| 	if !existing.Enabled {
+ 192| 		s.mcpManager.CloseClient(service.ID)
+ 193| 		logger.GetLogger(ctx).Infof("MCP service disabled, connection closed: %s (ID: %s)", name, service.ID)
+ 194| 	} else if configChanged {
+ 195| 		s.mcpManager.CloseClient(service.ID)
+ 196| 		logger.GetLogger(ctx).Infof("MCP service config changed, connection closed: %s (ID: %s)", name, service.ID)
+ 197| 	} else if oldEnabled != existing.Enabled && existing.Enabled {
+ 198| 		// Service was just enabled (was disabled, now enabled)
+ 199| 		// Close any existing connection to ensure clean state
+ 200| 		s.mcpManager.CloseClient(service.ID)
+ 201| 		logger.GetLogger(ctx).Infof("MCP service enabled, existing connection closed: %s (ID: %s)", name, service.ID)
+ 202| 	}
+ 203| 
+ 204| 	logger.GetLogger(ctx).Infof("MCP service updated: %s (ID: %s), enabled: %v", name, service.ID, existing.Enabled)
+ 205| 	return nil
+ 206| }
+ 207| 
+ 208| // DeleteMCPService deletes an MCP service
+ 209| func (s *mcpServiceService) DeleteMCPService(ctx context.Context, tenantID uint64, id string) error {
+ 210| 	// Check if service exists
+ 211| 	existing, err := s.mcpServiceRepo.GetByID(ctx, tenantID, id)
+ 212| 	if err != nil {
+ 213| 		return fmt.Errorf("failed to get MCP service: %w", err)
+ 214| 	}
+ 215| 	if existing == nil {
+ 216| 		return fmt.Errorf("MCP service not found")
+ 217| 	}
+ 218| 
+ 219| 	// Close client connection
+ 220| 	s.mcpManager.CloseClient(id)
+ 221| 
+ 222| 	if err := s.mcpServiceRepo.Delete(ctx, tenantID, id); err != nil {
+ 223| 		logger.GetLogger(ctx).Errorf("Failed to delete MCP service: %v", err)
+ 224| 		return fmt.Errorf("failed to delete MCP service: %w", err)
+ 225| 	}
+ 226| 
+ 227| 	logger.GetLogger(ctx).Infof("MCP service deleted: %s (ID: %s)", secutils.SanitizeForLog(existing.Name), id)
+ 228| 	return nil
+ 229| }
+ 230| 
+ 231| // TestMCPService tests the connection to an MCP service and returns available tools/resources
+ 232| func (s *mcpServiceService) TestMCPService(
+ 233| 	ctx context.Context,
+ 234| 	tenantID uint64,
+ 235| 	id string,
+ 236| ) (*types.MCPTestResult, error) {
+ 237| 	// Get service
+ 238| 	service, err := s.mcpServiceRepo.GetByID(ctx, tenantID, id)
+ 239| 	if err != nil {
+ 240| 		return nil, fmt.Errorf("failed to get MCP service: %w", err)
+ 241| 	}
+ 242| 	if service == nil {
+ 243| 		return nil, fmt.Errorf("MCP service not found")
+ 244| 	}
+ 245| 
+ 246| 	// Create temporary client for testing
+ 247| 	config := &mcp.ClientConfig{
+ 248| 		Service: service,
+ 249| 	}
+ 250| 
+ 251| 	client, err := mcp.NewMCPClient(config)
+ 252| 	if err != nil {
+ 253| 		return &types.MCPTestResult{
+ 254| 			Success: false,
+ 255| 			Message: fmt.Sprintf("Failed to create client: %v", err),
+ 256| 		}, nil
+ 257| 	}
+ 258| 
+ 259| 	// Connect
+ 260| 	testCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+ 261| 	defer cancel()
+ 262| 
+ 263| 	if err := client.Connect(testCtx); err != nil {
+ 264| 		return &types.MCPTestResult{
+ 265| 			Success: false,
+ 266| 			Message: fmt.Sprintf("Connection failed: %v", err),
+ 267| 		}, nil
+ 268| 	}
+ 269| 	defer client.Disconnect()
+ 270| 
+ 271| 	// Initialize
+ 272| 	initResult, err := client.Initialize(testCtx)
+ 273| 	if err != nil {
+ 274| 		return &types.MCPTestResult{
+ 275| 			Success: false,
+ 276| 			Message: fmt.Sprintf("Initialization failed: %v", err),
+ 277| 		}, nil
+ 278| 	}
+ 279| 
+ 280| 	// List tools
+ 281| 	tools, err := client.ListTools(testCtx)
+ 282| 	if err != nil {
+ 283| 		logger.GetLogger(ctx).Warnf("Failed to list tools: %v", err)
+ 284| 		tools = []*types.MCPTool{}
+ 285| 	}
+ 286| 
+ 287| 	// List resources
+ 288| 	resources, err := client.ListResources(testCtx)
+ 289| 	if err != nil {
+ 290| 		logger.GetLogger(ctx).Warnf("Failed to list resources: %v", err)
+ 291| 		resources = []*types.MCPResource{}
+ 292| 	}
+ 293| 
+ 294| 	return &types.MCPTestResult{
+ 295| 		Success: true,
+ 296| 		Message: fmt.Sprintf(
+ 297| 			"Connected successfully to %s v%s",
+ 298| 			initResult.ServerInfo.Name,
+ 299| 			initResult.ServerInfo.Version,
+ 300| 		),
+ 301| 		Tools:     tools,
+ 302| 		Resources: resources,
+ 303| 	}, nil
+ 304| }
+ 305| 
+ 306| // GetMCPServiceTools retrieves the list of tools from an MCP service
+ 307| func (s *mcpServiceService) GetMCPServiceTools(
+ 308| 	ctx context.Context,
+ 309| 	tenantID uint64,
+ 310| 	id string,
+ 311| ) ([]*types.MCPTool, error) {
+ 312| 	// Get service
+ 313| 	service, err := s.mcpServiceRepo.GetByID(ctx, tenantID, id)
+ 314| 	if err != nil {
+ 315| 		return nil, fmt.Errorf("failed to get MCP service: %w", err)
+ 316| 	}
+ 317| 	if service == nil {
+ 318| 		return nil, fmt.Errorf("MCP service not found")
+ 319| 	}
+ 320| 
+ 321| 	// Get or create client
+ 322| 	client, err := s.mcpManager.GetOrCreateClient(service)
+ 323| 	if err != nil {
+ 324| 		return nil, fmt.Errorf("failed to get MCP client: %w", err)
+ 325| 	}
+ 326| 
+ 327| 	// List tools
+ 328| 	tools, err := client.ListTools(ctx)
+ 329| 	if err != nil {
+ 330| 		return nil, fmt.Errorf("failed to list tools: %w", err)
+ 331| 	}
+ 332| 
+ 333| 	return tools, nil
+ 334| }
+ 335| 
+ 336| // GetMCPServiceResources retrieves the list of resources from an MCP service
+ 337| func (s *mcpServiceService) GetMCPServiceResources(
+ 338| 	ctx context.Context,
+ 339| 	tenantID uint64,
+ 340| 	id string,
+ 341| ) ([]*types.MCPResource, error) {
+ 342| 	// Get service
+ 343| 	service, err := s.mcpServiceRepo.GetByID(ctx, tenantID, id)
+ 344| 	if err != nil {
+ 345| 		return nil, fmt.Errorf("failed to get MCP service: %w", err)
+ 346| 	}
+ 347| 	if service == nil {
+ 348| 		return nil, fmt.Errorf("MCP service not found")
+ 349| 	}
+ 350| 
+ 351| 	// Get or create client
+ 352| 	client, err := s.mcpManager.GetOrCreateClient(service)
+ 353| 	if err != nil {
+ 354| 		return nil, fmt.Errorf("failed to get MCP client: %w", err)
+ 355| 	}
+ 356| 
+ 357| 	// List resources
+ 358| 	resources, err := client.ListResources(ctx)
+ 359| 	if err != nil {
+ 360| 		return nil, fmt.Errorf("failed to list resources: %w", err)
+ 361| 	}
+ 362| 
+ 363| 	return resources, nil
+ 364| }
+ 365| 
+ 366| // equalStringSlices compares two string slices for equality
+ 367| func equalStringSlices(a, b []string) bool {
+ 368| 	if len(a) != len(b) {
+ 369| 		return false
+ 370| 	}
+ 371| 	for i := range a {
+ 372| 		if a[i] != b[i] {
+ 373| 			return false
+ 374| 		}
+ 375| 	}
+ 376| 	return true
+ 377| }
+ 378| 
+ 379| 
+
+── 样本 id=7531(裁决参考) | 代码共 51 行 ──
+【教师结论】has_vulnerability=True, CWE-78 OS Command Injection, risk=High
+【source】line 21-20: host, username, password, command 参数
+【sink】line 49: run_command(ssh_command) 经 shell 执行拼接字符串
+【explanation】host/username 未做任何转义 -> f-string 拼接 -> run_command 交由 shell 执行 -> 本地命令注入；password/command 的单引号 replace 过滤不完整且远端 shell 会二次解析，可被 $() 或反引号绕过
+【fix_suggestion】line 29-32: 改用 subprocess 列表形式传参（不经 shell），并对 host/username 做严格格式白名单校验
+【代码】
+   1| """
+   2| SSH Pass tool for executing remote commands via SSH using password authentication.
+   3| 
+   4| Example of generalization: to execute a local command we use a bash wrapper
+   5| in `generic_linux_command` and in `execute_cli_command` -> `cai.tools.misc.cli_utils`
+   6| Using these wrappers, commands like `ssh` or `netcat` usually get trapped
+   7| by the LLM, so prompt engineering is used to execute the command locally
+   8| and return the result. Another solution is to implement interactive CLIs, for now this command
+   9| covers all SSH use cases. A much more logical and simpler implementation than
+  10| `hackingbuddyGPT` `https://github.com/ipa-lab/hackingBuddyGPT`
+  11| It handles privilege escalation very well and is autonomous regarding SSH password input,
+  12| something that hasn't been seen in other cybersecurity frameworks yet (Feb 2025)
+  13| """  # noqa: E501
+  14| 
+  15| from cai.tools.common import run_command  # pylint: disable=E0401 # noqa: E501
+  16| from cai.sdk.agents import function_tool
+  17| 
+  18| 
+  19| @function_tool
+  20| def run_ssh_command_with_credentials(
+  21|         host: str,
+  22|         username: str,
+  23|         password: str,
+  24|         command: str,
+  25|         port: int = 22) -> str:
+  26|     """
+  27|     Execute a command on a remote host via SSH using password authentication.
+  28| 
+  29|     Args:
+  30|         host: Remote host address
+  31|         username: SSH username
+  32|         password: SSH password
+  33|         command: Command to execute on remote host
+  34|         port: SSH port (default: 22)
+  35| 
+  36|     Returns:
+  37|         str: Output from the remote command execution
+  38|     """
+  39|     # Escape special characters in password and command to prevent shell injection
+  40|     escaped_password = password.replace("'", "'\\''")
+  41|     escaped_command = command.replace("'", "'\\''")
+  42|     
+  43|     ssh_command = (
+  44|         f"sshpass -p '{escaped_password}' "
+  45|         f"ssh -o StrictHostKeyChecking=no "
+  46|         f"{username}@{host} -p {port} "
+  47|         f"'{escaped_command}'"
+  48|     )
+  49|     return run_command(ssh_command)
+  50| 
+  51| 
+
+── 样本 id=1717(裁决参考) | 代码共 58 行 ──
+【教师结论】has_vulnerability=True, CWE-78 OS Command Injection, risk=High
+【source】line 36: String fullCommand = "cat " + filePath + " | grep " + command; 直接拼接用户输入 command
+【sink】line 37: Runtime.getRuntime().exec(fullCommand) 执行含用户输入的拼接命令
+【explanation】line 24 获取用户 command → line 31 未过滤直接拼接 → line 32 exec 执行 → 攻击者注入 ; rm -rf / 等命令 → 任意命令执行
+【fix_suggestion】line 36: 应改为 String fullCommand = "cat " + filePath + " | grep -- " + command.replaceAll("[^a-zA-Z0-9_\\-]", "");；line 32: 建议改为使用参数化方式，如 ProcessBuilder pb = new ProcessBuilder("bash", "-c", "cat " + filePath + " | grep -- " + command); Process process = pb.start();
+【代码】
+   1| import org.springframework.web.bind.annotation.*;
+   2| import org.springframework.http.*;
+   3| import org.springframework.beans.factory.annotation.Autowired;
+   4| import java.io.*;
+   5| import java.util.*;
+   6| 
+   7| @RestController
+   8| @RequestMapping("/api")
+   9| public class CommandController {
+  10| 
+  11|     @Autowired
+  12|     private AuditService auditService;
+  13| 
+  14|     // 模拟从配置或数据库获取白名单目录
+  15|     private static final String BASE_DIR = "/var/data/";
+  16| 
+  17|     @PostMapping("/process")
+  18|     public ResponseEntity<String> process(@RequestBody Map<String, String> payload) {
+  19|         String fileId = payload.get("fileId");
+  20|         String command = payload.get("command");
+  21| 
+  22|         if (fileId == null || command == null) {
+  23|             return ResponseEntity.badRequest().body("Missing parameters");
+  24|         }
+  25| 
+  26|         // 基础校验：只允许处理数字ID
+  27|         if (!fileId.matches("\\d+")) {
+  28|             return ResponseEntity.badRequest().body("Invalid fileId");
+  29|         }
+  30| 
+  31|         // 构造文件路径
+  32|         String filePath = BASE_DIR + fileId + ".txt";
+  33| 
+  34|         try {
+  35|             // 漏洞行：拼接用户输入到系统命令
+  36|             String fullCommand = "cat " + filePath + " | grep " + command;
+  37|             Process process = Runtime.getRuntime().exec(fullCommand);
+  38|             
+  39|             BufferedReader reader = new BufferedReader(
+  40|                 new InputStreamReader(process.getInputStream()));
+  41|             StringBuilder output = new StringBuilder();
+  42|             String line;
+  43|             while ((line = reader.readLine()) != null) {
+  44|                 output.append(line).append("\n");
+  45|             }
+  46|             
+  47|             auditService.log("executed: " + fullCommand, "INFO");
+  48|             return ResponseEntity.ok(output.toString());
+  49|             
+  50|         } catch (IOException e) {
+  51|             auditService.log("execution failed: " + e.getMessage(), "ERROR");
+  52|             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+  53|                     .body("Execution error");
+  54|         }
+  55|     }
+  56| }
+  57| 
+  58| 
+
+── 样本 id=2559(裁决参考) | 代码共 58 行 ──
+【教师结论】has_vulnerability=True, CWE-610 Externally Controlled Reference to a Resource in Another Sphere, risk=High
+【source】line 13: this.configPath = envPath; 外部可控路径未校验
+【sink】line 22: Path path = Paths.get(configPath); 直接使用外部路径
+【explanation】line 11:接受系统属性 app.config.path → line 18:直接构造 Path → line 26:打开文件流 → 攻击者可读取任意文件
+【fix_suggestion】line 12: 应改为 this.configPath = validateAndResolvePath(envPath); 并新增校验方法，确保路径为绝对路径且位于允许的配置目录（如 /etc/app/）内；line 22: 应改为 Path path = Paths.get(configPath).toRealPath(); 并在读取前检查 path.startsWith(Paths.get(\"/etc/app/\").toRealPath())；line 34: 应改为 try (InputStream is = Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS)) 以防止符号链接逃逸。
+【代码】
+   1| import java.io.*;
+   2| import java.nio.file.*;
+   3| import java.util.Properties;
+   4| 
+   5| public class ConfigLoader {
+   6|     private Properties config = new Properties();
+   7|     private String configPath;
+   8| 
+   9|     public ConfigLoader() {
+  10|         // 默认配置路径，但允许通过系统属性覆盖
+  11|         String envPath = System.getProperty("app.config.path");
+  12|         if (envPath != null && !envPath.trim().isEmpty()) {
+  13|             this.configPath = envPath;  // line 12: 外部可控路径，未做任何校验
+  14|         } else {
+  15|             this.configPath = "/etc/app/default.properties";
+  16|         }
+  17|     }
+  18| 
+  19|     public void loadConfig() {
+  20|         try {
+  21|             // 根据路径读取配置文件
+  22|             Path path = Paths.get(configPath);  // line 19: 直接使用外部路径
+  23|             if (!Files.exists(path)) {
+  24|                 System.err.println("配置文件不存在: " + configPath);
+  25|                 return;
+  26|             }
+  27| 
+  28|             // 确保是文件而非目录
+  29|             if (Files.isDirectory(path)) {
+  30|                 throw new IOException("配置路径是目录而非文件");
+  31|             }
+  32| 
+  33|             // 读取配置内容
+  34|             try (InputStream is = Files.newInputStream(path)) {
+  35|                 config.load(is);
+  36|                 System.out.println("成功加载配置: " + configPath);
+  37|             }
+  38| 
+  39|             // 模拟后续配置使用
+  40|             String dbUrl = config.getProperty("db.url", "jdbc:mysql://localhost/default");
+  41|             System.out.println("数据库连接: " + dbUrl);
+  42| 
+  43|         } catch (IOException e) {
+  44|             System.err.println("加载配置失败: " + e.getMessage());
+  45|         }
+  46|     }
+  47| 
+  48|     public String getConfigValue(String key) {
+  49|         return config.getProperty(key);
+  50|     }
+  51| 
+  52|     public static void main(String[] args) {
+  53|         ConfigLoader loader = new ConfigLoader();
+  54|         loader.loadConfig();
+  55|     }
+  56| }
+  57| 
+  58| 
+
+── 样本 id=7301(裁决参考) | 代码共 70 行 ──
+【教师结论】has_vulnerability=True, CWE-79 Cross-site Scripting (XSS), risk=High
+【source】line 7: return new this(pieceJSON.string, pieceJSON.attributes)
+【sink】line 7: pieceJSON.attributes 未校验的 href 最终被渲染为 <a href> 插入 DOM
+【explanation】不可信 JSON 输入 -> fromJSON 直接采用 pieceJSON.attributes(含 href) -> Piece 构造器保存属性 -> toJSON/渲染层以该 href 生成 <a> 标签 -> javascript: 等伪协议导致存储型 XSS
+【fix_suggestion】line 7: 对 attributes 做浅拷贝并用 DOMPurify.isValidAttribute("a", "href", attributes.href) 校验，不合法则 delete attributes.href 后再构造 piece
+【代码】
+   1| import Piece from "trix/models/piece"
+   2| 
+   3| import { normalizeNewlines } from "trix/core/helpers"
+   4| 
+   5| export default class StringPiece extends Piece {
+   6|   static fromJSON(pieceJSON) {
+   7|     return new this(pieceJSON.string, pieceJSON.attributes)
+   8|   }
+   9| 
+  10|   constructor(string) {
+  11|     super(...arguments)
+  12|     this.string = normalizeNewlines(string)
+  13|     this.length = this.string.length
+  14|   }
+  15| 
+  16|   getValue() {
+  17|     return this.string
+  18|   }
+  19| 
+  20|   toString() {
+  21|     return this.string.toString()
+  22|   }
+  23| 
+  24|   isBlockBreak() {
+  25|     return this.toString() === "\n" && this.getAttribute("blockBreak") === true
+  26|   }
+  27| 
+  28|   toJSON() {
+  29|     const result = super.toJSON(...arguments)
+  30|     result.string = this.string
+  31|     return result
+  32|   }
+  33| 
+  34|   // Splittable
+  35| 
+  36|   canBeConsolidatedWith(piece) {
+  37|     return piece && this.hasSameConstructorAs(piece) && this.hasSameAttributesAsPiece(piece)
+  38|   }
+  39| 
+  40|   consolidateWith(piece) {
+  41|     return new this.constructor(this.toString() + piece.toString(), this.attributes)
+  42|   }
+  43| 
+  44|   splitAtOffset(offset) {
+  45|     let left, right
+  46|     if (offset === 0) {
+  47|       left = null
+  48|       right = this
+  49|     } else if (offset === this.length) {
+  50|       left = this
+  51|       right = null
+  52|     } else {
+  53|       left = new this.constructor(this.string.slice(0, offset), this.attributes)
+  54|       right = new this.constructor(this.string.slice(offset), this.attributes)
+  55|     }
+  56|     return [ left, right ]
+  57|   }
+  58| 
+  59|   toConsole() {
+  60|     let { string } = this
+  61|     if (string.length > 15) {
+  62|       string = string.slice(0, 14) + "…"
+  63|     }
+  64|     return JSON.stringify(string.toString())
+  65|   }
+  66| }
+  67| 
+  68| Piece.registerType("string", StringPiece)
+  69| 
+  70| 
+
+── 样本 id=8184(裁决参考) | 代码共 243 行 ──
+【教师结论】has_vulnerability=True, CWE-915 对象级批量赋值污染工作流状态位（草稿归属/派生更新标记可被请求直写）, risk=High
+【source】line 34/46: 公开状态门闩字段
+【sink】line 228: updatingFromDerivative 参与保存决策
+【explanation】外部请求 -> Controller 层 setAttributes 批量填充 -> 三十余个公开状态位无差别落库 -> draftId/isProvisionalDraft 篡改越过创建者隔离读取或覆盖他人在途内容 -> updatingFromDerivative 使保存流程绕过父级一致性检查 -> 数据完整性与机密性双损失；模板注入链亦可借展示路径二次激活；攻击者仅需低权登录即可构造请求，五段后果链全部无需任何竞态或环境配合。修复具备单点性与可回滚性：白名单常量一处定义、全生态继承、异常路径显式可观测
+【fix_suggestion】line 18: 实现类定义赋值白名单剔除全部工作流字段; 对归属关系做会话级校验; 新增审计事件记录状态位变更; 白名单纳入代码生成模板; 修复后扫描存量草稿归属一致性
+【代码】
+   1| <?php
+   2| /**
+   3|  * @link https://craftcms.com/
+   4|  * @copyright Copyright (c) Pixel & Tonic, Inc.
+   5|  * @license https://craftcms.github.io/license/
+   6|  */
+   7| 
+   8| namespace craft\base;
+   9| 
+  10| use DateTime;
+  11| 
+  12| /**
+  13|  * ElementTrait implements the common methods and properties for element classes.
+  14|  *
+  15|  * @author Pixel & Tonic, Inc. <support@pixelandtonic.com>
+  16|  * @since 3.0.0
+  17|  */
+  18| trait ElementTrait
+  19| {
+  20|     /**
+  21|      * @var int|null The element’s ID
+  22|      */
+  23|     public ?int $id = null;
+  24| 
+  25|     /**
+  26|      * @var string|null The element’s temporary ID (only used if the element’s URI format contains {id})
+  27|      */
+  28|     public ?string $tempId = null;
+  29| 
+  30|     /**
+  31|      * @var int|null The ID of the draft’s row in the `drafts` table
+  32|      * @since 3.2.0
+  33|      */
+  34|     public ?int $draftId = null;
+  35| 
+  36|     /**
+  37|      * @var int|null The ID of the revision’s row in the `revisions` table
+  38|      * @since 3.2.0
+  39|      */
+  40|     public ?int $revisionId = null;
+  41| 
+  42|     /**
+  43|      * @var bool Whether this is a provisional draft.
+  44|      * @since 3.7.0
+  45|      */
+  46|     public bool $isProvisionalDraft = false;
+  47| 
+  48|     /**
+  49|      * @var string|null The element’s UID
+  50|      */
+  51|     public ?string $uid = null;
+  52| 
+  53|     /**
+  54|      * @var int|null The ID of the element’s record in the `elements_sites` table
+  55|      * @since 3.5.2
+  56|      */
+  57|     public ?int $siteSettingsId = null;
+  58| 
+  59|     /**
+  60|      * @var int|null The element’s field layout ID
+  61|      */
+  62|     public ?int $fieldLayoutId = null;
+  63| 
+  64|     /**
+  65|      * @var int|null The element’s structure ID
+  66|      */
+  67|     public ?int $structureId = null;
+  68| 
+  69|     /**
+  70|      * @var int|null The element’s content row ID
+  71|      */
+  72|     public ?int $contentId = null;
+  73| 
+  74|     /**
+  75|      * @var bool Whether the element is enabled
+  76|      */
+  77|     public bool $enabled = true;
+  78| 
+  79|     /**
+  80|      * @var bool Whether the element is archived
+  81|      */
+  82|     public bool $archived = false;
+  83| 
+  84|     /**
+  85|      * @var int|null The site ID the element is associated with
+  86|      */
+  87|     public ?int $siteId = null;
+  88| 
+  89|     /**
+  90|      * @var string|null The element’s title
+  91|      */
+  92|     public ?string $title = null;
+  93| 
+  94|     /**
+  95|      * @var string|null The element’s slug
+  96|      */
+  97|     public ?string $slug = null;
+  98| 
+  99|     /**
+ 100|      * @var string|null The element’s URI
+ 101|      */
+ 102|     public ?string $uri = null;
+ 103| 
+ 104|     /**
+ 105|      * @var DateTime|null The date that the element was created
+ 106|      */
+ 107|     public ?DateTime $dateCreated = null;
+ 108| 
+ 109|     /**
+ 110|      * @var DateTime|null The date that the element was last updated
+ 111|      */
+ 112|     public ?DateTime $dateUpdated = null;
+ 113| 
+ 114|     /**
+ 115|      * @var DateTime|null The date that the canonical element was last merged into this one
+ 116|      * @since 3.7.0
+ 117|      */
+ 118|     public ?DateTime $dateLastMerged = null;
+ 119| 
+ 120|     /**
+ 121|      * @var DateTime|null The date that the element was trashed
+ 122|      * @since 3.2.0
+ 123|      */
+ 124|     public ?DateTime $dateDeleted = null;
+ 125| 
+ 126|     /**
+ 127|      * @var int|null The element’s structure’s root ID
+ 128|      */
+ 129|     public ?int $root = null;
+ 130| 
+ 131|     /**
+ 132|      * @var int|null The element’s left position within its structure
+ 133|      */
+ 134|     public ?int $lft = null;
+ 135| 
+ 136|     /**
+ 137|      * @var int|null The element’s right position within its structure
+ 138|      */
+ 139|     public ?int $rgt = null;
+ 140| 
+ 141|     /**
+ 142|      * @var int|null The element’s level within its structure
+ 143|      */
+ 144|     public ?int $level = null;
+ 145| 
+ 146|     /**
+ 147|      * @var int|null The element’s search score, if the [[\craft\elements\db\ElementQuery::search]] parameter was used when querying for the element
+ 148|      */
+ 149|     public ?int $searchScore = null;
+ 150| 
+ 151|     /**
+ 152|      * @var bool Whether the element has been soft-deleted.
+ 153|      */
+ 154|     public bool $trashed = false;
+ 155| 
+ 156|     /**
+ 157|      * @var bool Whether the element is still awaiting its custom field values
+ 158|      */
+ 159|     public bool $awaitingFieldValues = false;
+ 160| 
+ 161|     /**
+ 162|      * @var bool Whether the element is being saved in the context of propagating another site's version of the element.
+ 163|      */
+ 164|     public bool $propagating = false;
+ 165| 
+ 166|     /**
+ 167|      * @var bool Whether the element is currently being validated via BaseRelationField::validateRelatedElements()
+ 168|      * @since 4.5.10
+ 169|      * @deprecated in 4.5.13
+ 170|      */
+ 171|     public bool $validatingRelatedElement = false;
+ 172| 
+ 173|     /**
+ 174|      * @var bool Whether all element attributes should be propagated across all its supported sites, even if that means
+ 175|      * overwriting existing site-specific values.
+ 176|      * @since 3.2.0
+ 177|      */
+ 178|     public bool $propagateAll = false;
+ 179| 
+ 180|     /**
+ 181|      * @var int[] The site IDs that the element was just propagated to for the first time.
+ 182|      * @since 3.2.9
+ 183|      */
+ 184|     public array $newSiteIds = [];
+ 185| 
+ 186|     /**
+ 187|      * @var bool Whether the element is being saved to the current site for the first time.
+ 188|      * @since 3.7.15
+ 189|      */
+ 190|     public bool $isNewForSite = false;
+ 191| 
+ 192|     /**
+ 193|      * @var bool Whether this is for a newly-created site.
+ 194|      * @since 4.14.9
+ 195|      */
+ 196|     public bool $isNewSite = false;
+ 197| 
+ 198|     /**
+ 199|      * @var bool Whether the element is being resaved by a ResaveElement job or a `resave` console command.
+ 200|      * @since 3.1.22
+ 201|      */
+ 202|     public bool $resaving = false;
+ 203| 
+ 204|     /**
+ 205|      * @var ElementInterface|null The element that this element is duplicating.
+ 206|      */
+ 207|     public ?ElementInterface $duplicateOf = null;
+ 208| 
+ 209|     /**
+ 210|      * @var bool Whether the element is being saved for the first time in a normal state (not as a draft or revision).
+ 211|      * @since 3.7.5
+ 212|      */
+ 213|     public bool $firstSave = false;
+ 214| 
+ 215|     /**
+ 216|      * @var bool Whether recent changes to the canonical element are being merged into this element.
+ 217|      * @since 3.7.0
+ 218|      */
+ 219|     public bool $mergingCanonicalChanges = false;
+ 220| 
+ 221|     /**
+ 222|      * @var bool Whether the element is being updated from a derivative element, such as a draft or revision.
+ 223|      *
+ 224|      * If this is true, the derivative element can be accessed via [[duplicateOf]].
+ 225|      *
+ 226|      * @since 3.7.0
+ 227|      */
+ 228|     public bool $updatingFromDerivative = false;
+ 229| 
+ 230|     /**
+ 231|      * @var bool Whether the element is currently being previewed.
+ 232|      * @since 3.2.0
+ 233|      */
+ 234|     public bool $previewing = false;
+ 235| 
+ 236|     /**
+ 237|      * @var bool Whether the element is being hard-deleted.
+ 238|      * @since 3.2.0
+ 239|      */
+ 240|     public bool $hardDelete = false;
+ 241| }
+ 242| 
+ 243| 
+
+── 样本 id=6347(裁决参考) | 代码共 26 行 ──
+【教师结论】has_vulnerability=False, none, risk=None
+【source】N/A
+【sink】N/A
+【explanation】用户输入密码 -> PBKDF2WithHmacSHA256（固定 100000 次迭代、固定盐与密钥长度）-> 生成耗时恒定的哈希；哈希与 STORED_HASH -> MessageDigest.isEqual 常数时间比较 -> 比较耗时不受字节匹配进度影响，攻击者无法通过响应时间侧信道推断哈希信息，故不存在时序攻击漏洞。
+【fix_suggestion】no fix needed
+【代码】
+   1| // HashVerifySafe.java
+   2| import org.springframework.web.bind.annotation.*;
+   3| import java.security.MessageDigest;
+   4| import javax.crypto.SecretKeyFactory;
+   5| import javax.crypto.spec.PBEKeySpec;
+   6| 
+   7| @RestController
+   8| public class HashVerifySafe {
+   9|     private static final byte[] STORED_HASH = hashPassword("admin123");
+  10| 
+  11|     @PostMapping("/login")
+  12|     public String login(@RequestParam String password) throws Exception {
+  13|         byte[] input = hashPassword(password);
+  14|         if (MessageDigest.isEqual(input, STORED_HASH)) {
+  15|             return "ok";
+  16|         }
+  17|         return "invalid";
+  18|     }
+  19| 
+  20|     private static byte[] hashPassword(String pwd) throws Exception {
+  21|         PBEKeySpec spec = new PBEKeySpec(pwd.toCharArray(), new byte[16], 100000, 256);
+  22|         return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+  23|     }
+  24| }
+  25| 
+  26| 

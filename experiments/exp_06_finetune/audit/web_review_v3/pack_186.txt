@@ -1,0 +1,852 @@
+batch=186 样本数=2
+
+████ 第 0 步区:以下为本批全部 [CODE](先独立重解,勿看后文)████
+
+### id=8102 lang=go
+[CODE]
+   1| package s3
+   2| 
+   3| import (
+   4| 	"context"
+   5| 	"fmt"
+   6| 	"io"
+   7| 	"net/http"
+   8| 	"reflect"
+   9| 	"strings"
+  10| 
+  11| 	"github.com/aws/aws-sdk-go/aws"
+  12| 	"github.com/aws/aws-sdk-go/aws/awserr"
+  13| 	"github.com/aws/aws-sdk-go/aws/credentials"
+  14| 	"github.com/aws/aws-sdk-go/aws/request"
+  15| 	"github.com/aws/aws-sdk-go/aws/session"
+  16| 	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
+  17| 	"github.com/aws/aws-sdk-go/service/s3"
+  18| 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
+  19| 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+  20| 	"github.com/seaweedfs/seaweedfs/weed/filer"
+  21| 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+  22| 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
+  23| 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
+  24| 	"github.com/seaweedfs/seaweedfs/weed/util"
+  25| 	"github.com/seaweedfs/seaweedfs/weed/util/version"
+  26| )
+  27| 
+  28| func init() {
+  29| 	remote_storage.RemoteStorageClientMakers["s3"] = new(s3RemoteStorageMaker)
+  30| }
+  31| 
+  32| type s3RemoteStorageMaker struct{}
+  33| 
+  34| func (s s3RemoteStorageMaker) HasBucket() bool {
+  35| 	return true
+  36| }
+  37| 
+  38| func (s s3RemoteStorageMaker) Make(conf *remote_pb.RemoteConf) (remote_storage.RemoteStorageClient, error) {
+  39| 	client := &s3RemoteStorageClient{
+  40| 		supportTagging: true,
+  41| 		conf:           conf,
+  42| 	}
+  43| 	config := &aws.Config{
+  44| 		Region:                        aws.String(conf.S3Region),
+  45| 		Endpoint:                      aws.String(conf.S3Endpoint),
+  46| 		S3ForcePathStyle:              aws.Bool(conf.S3ForcePathStyle),
+  47| 		S3DisableContentMD5Validation: aws.Bool(true),
+  48| 	}
+  49| 	if conf.S3AccessKey != "" && conf.S3SecretKey != "" {
+  50| 		config.Credentials = credentials.NewStaticCredentials(conf.S3AccessKey, conf.S3SecretKey, "")
+  51| 	} else if conf.S3AccessKey == "" && conf.S3SecretKey == "" {
+  52| 		// Explicitly disable signing for public buckets.
+  53| 		config.Credentials = credentials.AnonymousCredentials
+  54| 	}
+  55| 
+  56| 	sess, err := session.NewSession(config)
+  57| 	if err != nil {
+  58| 		return nil, fmt.Errorf("create aws session: %w", err)
+  59| 	}
+  60| 	if conf.S3V4Signature {
+  61| 		sess.Handlers.Sign.PushBackNamed(v4.SignRequestHandler)
+  62| 	}
+  63| 	sess.Handlers.Build.PushBack(func(r *request.Request) {
+  64| 		r.HTTPRequest.Header.Set("User-Agent", "SeaweedFS/"+version.VERSION_NUMBER)
+  65| 	})
+  66| 	sess.Handlers.Build.PushFront(skipSha256PayloadSigning)
+  67| 	client.conn = s3.New(sess)
+  68| 	return client, nil
+  69| }
+  70| 
+  71| type s3RemoteStorageClient struct {
+  72| 	conf           *remote_pb.RemoteConf
+  73| 	conn           s3iface.S3API
+  74| 	supportTagging bool
+  75| }
+  76| 
+  77| var _ = remote_storage.RemoteStorageClient(&s3RemoteStorageClient{supportTagging: true})
+  78| 
+  79| func (s *s3RemoteStorageClient) Traverse(remote *remote_pb.RemoteStorageLocation, visitFn remote_storage.VisitFunc) (err error) {
+  80| 
+  81| 	pathKey := remote.Path[1:]
+  82| 
+  83| 	listInput := &s3.ListObjectsV2Input{
+  84| 		Bucket:              aws.String(remote.Bucket),
+  85| 		ContinuationToken:   nil,
+  86| 		Delimiter:           nil, // not aws.String("/"), iterate through all entries
+  87| 		EncodingType:        nil,
+  88| 		ExpectedBucketOwner: nil,
+  89| 		FetchOwner:          nil,
+  90| 		MaxKeys:             nil, // aws.Int64(1000),
+  91| 		Prefix:              aws.String(pathKey),
+  92| 		RequestPayer:        nil,
+  93| 		StartAfter:          nil,
+  94| 	}
+  95| 	isLastPage := false
+  96| 	for !isLastPage && err == nil {
+  97| 		var localErr error
+  98| 		listErr := s.conn.ListObjectsV2Pages(listInput, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+  99| 			for _, content := range page.Contents {
+ 100| 				key := *content.Key
+ 101| 				key = "/" + key
+ 102| 				dir, name := util.FullPath(key).DirAndName()
+ 103| 				remoteEntry := &filer_pb.RemoteEntry{
+ 104| 					StorageName: s.conf.Name,
+ 105| 				}
+ 106| 				if content.LastModified != nil {
+ 107| 					remoteEntry.RemoteMtime = content.LastModified.Unix()
+ 108| 				}
+ 109| 				if content.Size != nil {
+ 110| 					remoteEntry.RemoteSize = *content.Size
+ 111| 				}
+ 112| 				if content.ETag != nil {
+ 113| 					remoteEntry.RemoteETag = *content.ETag
+ 114| 				}
+ 115| 				if err := visitFn(dir, name, false, remoteEntry); err != nil {
+ 116| 					localErr = err
+ 117| 					return false
+ 118| 				}
+ 119| 			}
+ 120| 			listInput.ContinuationToken = page.NextContinuationToken
+ 121| 			isLastPage = lastPage
+ 122| 			return true
+ 123| 		})
+ 124| 		if listErr != nil {
+ 125| 			err = fmt.Errorf("list %v: %w", remote, listErr)
+ 126| 		}
+ 127| 		if localErr != nil {
+ 128| 			err = fmt.Errorf("process %v: %w", remote, localErr)
+ 129| 		}
+ 130| 	}
+ 131| 	return
+ 132| }
+ 133| 
+ 134| func (s *s3RemoteStorageClient) ListDirectory(ctx context.Context, loc *remote_pb.RemoteStorageLocation, visitFn remote_storage.VisitFunc) error {
+ 135| 	pathKey := loc.Path[1:]
+ 136| 	if pathKey != "" && !strings.HasSuffix(pathKey, "/") {
+ 137| 		pathKey += "/"
+ 138| 	}
+ 139| 
+ 140| 	listInput := &s3.ListObjectsV2Input{
+ 141| 		Bucket:    aws.String(loc.Bucket),
+ 142| 		Prefix:    aws.String(pathKey),
+ 143| 		Delimiter: aws.String("/"),
+ 144| 	}
+ 145| 
+ 146| 	var localErr error
+ 147| 	listErr := s.conn.ListObjectsV2PagesWithContext(ctx, listInput, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+ 148| 		for _, prefix := range page.CommonPrefixes {
+ 149| 			if prefix.Prefix == nil {
+ 150| 				continue
+ 151| 			}
+ 152| 			dirKey := "/" + strings.TrimSuffix(*prefix.Prefix, "/")
+ 153| 			dir, name := util.FullPath(dirKey).DirAndName()
+ 154| 			if err := visitFn(dir, name, true, nil); err != nil {
+ 155| 				localErr = err
+ 156| 				return false
+ 157| 			}
+ 158| 		}
+ 159| 		for _, content := range page.Contents {
+ 160| 			key := "/" + *content.Key
+ 161| 			if strings.HasSuffix(key, "/") {
+ 162| 				continue // skip directory markers
+ 163| 			}
+ 164| 			dir, name := util.FullPath(key).DirAndName()
+ 165| 			remoteEntry := &filer_pb.RemoteEntry{
+ 166| 				StorageName: s.conf.Name,
+ 167| 			}
+ 168| 			if content.LastModified != nil {
+ 169| 				remoteEntry.RemoteMtime = content.LastModified.Unix()
+ 170| 			}
+ 171| 			if content.Size != nil {
+ 172| 				remoteEntry.RemoteSize = *content.Size
+ 173| 			}
+ 174| 			if content.ETag != nil {
+ 175| 				remoteEntry.RemoteETag = *content.ETag
+ 176| 			}
+ 177| 			if err := visitFn(dir, name, false, remoteEntry); err != nil {
+ 178| 				localErr = err
+ 179| 				return false
+ 180| 			}
+ 181| 		}
+ 182| 		return true
+ 183| 	})
+ 184| 	if listErr != nil {
+ 185| 		return fmt.Errorf("list directory %v: %w", loc, listErr)
+ 186| 	}
+ 187| 	if localErr != nil {
+ 188| 		return fmt.Errorf("process directory %v: %w", loc, localErr)
+ 189| 	}
+ 190| 	return nil
+ 191| }
+ 192| 
+ 193| func (s *s3RemoteStorageClient) StatFile(loc *remote_pb.RemoteStorageLocation) (remoteEntry *filer_pb.RemoteEntry, err error) {
+ 194| 	resp, err := s.conn.HeadObject(&s3.HeadObjectInput{
+ 195| 		Bucket: aws.String(loc.Bucket),
+ 196| 		Key:    aws.String(loc.Path[1:]),
+ 197| 	})
+ 198| 	if err != nil {
+ 199| 		if reqErr, ok := err.(awserr.RequestFailure); ok && reqErr.StatusCode() == http.StatusNotFound {
+ 200| 			return nil, remote_storage.ErrRemoteObjectNotFound
+ 201| 		}
+ 202| 		return nil, fmt.Errorf("stat s3 %s%s: %w", loc.Bucket, loc.Path, err)
+ 203| 	}
+ 204| 	remoteEntry = &filer_pb.RemoteEntry{
+ 205| 		StorageName: s.conf.Name,
+ 206| 	}
+ 207| 	if resp.ContentLength != nil {
+ 208| 		remoteEntry.RemoteSize = *resp.ContentLength
+ 209| 	}
+ 210| 	if resp.LastModified != nil {
+ 211| 		remoteEntry.RemoteMtime = resp.LastModified.Unix()
+ 212| 	}
+ 213| 	if resp.ETag != nil {
+ 214| 		remoteEntry.RemoteETag = *resp.ETag
+ 215| 	}
+ 216| 	return remoteEntry, nil
+ 217| }
+ 218| 
+ 219| func (s *s3RemoteStorageClient) ReadFile(loc *remote_pb.RemoteStorageLocation, offset int64, size int64) (data []byte, err error) {
+ 220| 	return s.ReadFileWithConcurrency(loc, offset, size, 5)
+ 221| }
+ 222| 
+ 223| func (s *s3RemoteStorageClient) ReadFileWithConcurrency(loc *remote_pb.RemoteStorageLocation, offset int64, size int64, concurrency int) (data []byte, err error) {
+ 224| 	if concurrency <= 0 {
+ 225| 		concurrency = 5
+ 226| 	}
+ 227| 	downloader := s3manager.NewDownloaderWithClient(s.conn, func(u *s3manager.Downloader) {
+ 228| 		u.PartSize = int64(4 * 1024 * 1024)
+ 229| 		u.Concurrency = concurrency
+ 230| 	})
+ 231| 
+ 232| 	dataSlice := make([]byte, int(size))
+ 233| 	writerAt := aws.NewWriteAtBuffer(dataSlice)
+ 234| 
+ 235| 	_, err = downloader.Download(writerAt, &s3.GetObjectInput{
+ 236| 		Bucket: aws.String(loc.Bucket),
+ 237| 		Key:    aws.String(loc.Path[1:]),
+ 238| 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+size-1)),
+ 239| 	})
+ 240| 	if err != nil {
+ 241| 		return nil, fmt.Errorf("failed to download file %s%s: %v", loc.Bucket, loc.Path, err)
+ 242| 	}
+ 243| 
+ 244| 	return writerAt.Bytes(), nil
+ 245| }
+ 246| 
+ 247| func (s *s3RemoteStorageClient) WriteDirectory(loc *remote_pb.RemoteStorageLocation, entry *filer_pb.Entry) (err error) {
+ 248| 	return nil
+ 249| }
+ 250| 
+ 251| func (s *s3RemoteStorageClient) RemoveDirectory(loc *remote_pb.RemoteStorageLocation) (err error) {
+ 252| 	return nil
+ 253| }
+ 254| 
+ 255| func (s *s3RemoteStorageClient) WriteFile(loc *remote_pb.RemoteStorageLocation, entry *filer_pb.Entry, reader io.Reader) (remoteEntry *filer_pb.RemoteEntry, err error) {
+ 256| 
+ 257| 	fileSize := int64(filer.FileSize(entry))
+ 258| 
+ 259| 	partSize := int64(8 * 1024 * 1024) // The minimum/default allowed part size is 5MB
+ 260| 	for partSize*1000 < fileSize {
+ 261| 		partSize *= 4
+ 262| 	}
+ 263| 
+ 264| 	// Create an uploader with the session and custom options
+ 265| 	uploader := s3manager.NewUploaderWithClient(s.conn, func(u *s3manager.Uploader) {
+ 266| 		u.PartSize = partSize
+ 267| 		u.Concurrency = 1
+ 268| 	})
+ 269| 
+ 270| 	// process tagging
+ 271| 	tags := ""
+ 272| 	var awsTags *string
+ 273| 	// openstack swift doesn't support s3 object tagging
+ 274| 	if s.conf.S3SupportTagging {
+ 275| 		for k, v := range entry.Extended {
+ 276| 			if len(tags) > 0 {
+ 277| 				tags = tags + "&"
+ 278| 			}
+ 279| 			tags = tags + k + "=" + string(v)
+ 280| 		}
+ 281| 		awsTags = aws.String(tags)
+ 282| 	}
+ 283| 
+ 284| 	// Upload the file to S3.
+ 285| 	uploadInput := &s3manager.UploadInput{
+ 286| 		Bucket:  aws.String(loc.Bucket),
+ 287| 		Key:     aws.String(loc.Path[1:]),
+ 288| 		Body:    reader,
+ 289| 		Tagging: awsTags,
+ 290| 	}
+ 291| 	if s.conf.S3StorageClass != "" {
+ 292| 		uploadInput.StorageClass = aws.String(s.conf.S3StorageClass)
+ 293| 	}
+ 294| 	_, err = uploader.Upload(uploadInput)
+ 295| 
+ 296| 	//in case it fails to upload
+ 297| 	if err != nil {
+ 298| 		return nil, fmt.Errorf("upload to %s/%s%s: %v", loc.Name, loc.Bucket, loc.Path, err)
+ 299| 	}
+ 300| 
+ 301| 	// read back the remote entry
+ 302| 	return s.readFileRemoteEntry(loc)
+ 303| 
+ 304| }
+ 305| 
+ 306| func toTagging(attributes map[string][]byte) *s3.Tagging {
+ 307| 	tagging := &s3.Tagging{}
+ 308| 	for k, v := range attributes {
+ 309| 		tagging.TagSet = append(tagging.TagSet, &s3.Tag{
+ 310| 			Key:   aws.String(k),
+ 311| 			Value: aws.String(string(v)),
+ 312| 		})
+ 313| 	}
+ 314| 	return tagging
+ 315| }
+ 316| 
+ 317| func (s *s3RemoteStorageClient) readFileRemoteEntry(loc *remote_pb.RemoteStorageLocation) (*filer_pb.RemoteEntry, error) {
+ 318| 	return s.StatFile(loc)
+ 319| }
+ 320| 
+ 321| func (s *s3RemoteStorageClient) UpdateFileMetadata(loc *remote_pb.RemoteStorageLocation, oldEntry *filer_pb.Entry, newEntry *filer_pb.Entry) (err error) {
+ 322| 	if reflect.DeepEqual(oldEntry.Extended, newEntry.Extended) {
+ 323| 		return nil
+ 324| 	}
+ 325| 	tagging := toTagging(newEntry.Extended)
+ 326| 	if len(tagging.TagSet) > 0 {
+ 327| 		_, err = s.conn.PutObjectTagging(&s3.PutObjectTaggingInput{
+ 328| 			Bucket:  aws.String(loc.Bucket),
+ 329| 			Key:     aws.String(loc.Path[1:]),
+ 330| 			Tagging: toTagging(newEntry.Extended),
+ 331| 		})
+ 332| 	} else {
+ 333| 		_, err = s.conn.DeleteObjectTagging(&s3.DeleteObjectTaggingInput{
+ 334| 			Bucket: aws.String(loc.Bucket),
+ 335| 			Key:    aws.String(loc.Path[1:]),
+ 336| 		})
+ 337| 	}
+ 338| 	return
+ 339| }
+ 340| func (s *s3RemoteStorageClient) DeleteFile(loc *remote_pb.RemoteStorageLocation) (err error) {
+ 341| 	_, err = s.conn.DeleteObject(&s3.DeleteObjectInput{
+ 342| 		Bucket: aws.String(loc.Bucket),
+ 343| 		Key:    aws.String(loc.Path[1:]),
+ 344| 	})
+ 345| 	return
+ 346| }
+ 347| 
+ 348| func (s *s3RemoteStorageClient) ListBuckets() (buckets []*remote_storage.Bucket, err error) {
+ 349| 	resp, err := s.conn.ListBuckets(&s3.ListBucketsInput{})
+ 350| 	if err != nil {
+ 351| 		return nil, fmt.Errorf("list buckets: %w", err)
+ 352| 	}
+ 353| 	for _, b := range resp.Buckets {
+ 354| 		buckets = append(buckets, &remote_storage.Bucket{
+ 355| 			Name:      *b.Name,
+ 356| 			CreatedAt: *b.CreationDate,
+ 357| 		})
+ 358| 	}
+ 359| 	return
+ 360| }
+ 361| 
+ 362| func (s *s3RemoteStorageClient) CreateBucket(name string) (err error) {
+ 363| 	_, err = s.conn.CreateBucket(&s3.CreateBucketInput{
+ 364| 		ACL:                        nil,
+ 365| 		Bucket:                     aws.String(name),
+ 366| 		CreateBucketConfiguration:  nil,
+ 367| 		GrantFullControl:           nil,
+ 368| 		GrantRead:                  nil,
+ 369| 		GrantReadACP:               nil,
+ 370| 		GrantWrite:                 nil,
+ 371| 		GrantWriteACP:              nil,
+ 372| 		ObjectLockEnabledForBucket: nil,
+ 373| 	})
+ 374| 	if err != nil {
+ 375| 		return fmt.Errorf("%s create bucket %s: %v", s.conf.Name, name, err)
+ 376| 	}
+ 377| 	return
+ 378| }
+ 379| 
+ 380| func (s *s3RemoteStorageClient) DeleteBucket(name string) (err error) {
+ 381| 	_, err = s.conn.DeleteBucket(&s3.DeleteBucketInput{
+ 382| 		Bucket: aws.String(name),
+ 383| 	})
+ 384| 	if err != nil {
+ 385| 		return fmt.Errorf("delete bucket %s: %v", name, err)
+ 386| 	}
+ 387| 	return
+ 388| }
+ 389| 
+ 390| 
+
+### id=8103 lang=go
+[CODE]
+   1| package s3
+   2| 
+   3| import (
+   4| 	"context"
+   5| 	"fmt"
+   6| 	"io"
+   7| 	"net/http"
+   8| 	"reflect"
+   9| 	"strings"
+  10| 
+  11| 	"github.com/aws/aws-sdk-go/aws"
+  12| 	"github.com/aws/aws-sdk-go/aws/awserr"
+  13| 	"github.com/aws/aws-sdk-go/aws/credentials"
+  14| 	"github.com/aws/aws-sdk-go/aws/request"
+  15| 	"github.com/aws/aws-sdk-go/aws/session"
+  16| 	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
+  17| 	"github.com/aws/aws-sdk-go/service/s3"
+  18| 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
+  19| 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+  20| 	"github.com/seaweedfs/seaweedfs/weed/filer"
+  21| 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+  22| 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
+  23| 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
+  24| 	"github.com/seaweedfs/seaweedfs/weed/util"
+  25| 	"github.com/seaweedfs/seaweedfs/weed/util/version"
+  26| )
+  27| 
+  28| func init() {
+  29| 	remote_storage.RemoteStorageClientMakers["s3"] = new(s3RemoteStorageMaker)
+  30| }
+  31| 
+  32| type s3RemoteStorageMaker struct{}
+  33| 
+  34| func (s s3RemoteStorageMaker) HasBucket() bool {
+  35| 	return true
+  36| }
+  37| 
+  38| func (s s3RemoteStorageMaker) Make(conf *remote_pb.RemoteConf) (remote_storage.RemoteStorageClient, error) {
+  39| 	return MakeWithHTTPClient(conf, nil)
+  40| }
+  41| 
+  42| // MakeWithHTTPClient builds an s3 remote storage client using the supplied
+  43| // *http.Client (or the AWS SDK default when nil). Callers that need to pin
+  44| // the dial path against DNS rebinding can pass a client whose transport has
+  45| // a guarded DialContext.
+  46| func MakeWithHTTPClient(conf *remote_pb.RemoteConf, httpClient *http.Client) (remote_storage.RemoteStorageClient, error) {
+  47| 	client := &s3RemoteStorageClient{
+  48| 		supportTagging: true,
+  49| 		conf:           conf,
+  50| 	}
+  51| 	config := &aws.Config{
+  52| 		Region:                        aws.String(conf.S3Region),
+  53| 		Endpoint:                      aws.String(conf.S3Endpoint),
+  54| 		S3ForcePathStyle:              aws.Bool(conf.S3ForcePathStyle),
+  55| 		S3DisableContentMD5Validation: aws.Bool(true),
+  56| 	}
+  57| 	if httpClient != nil {
+  58| 		config.HTTPClient = httpClient
+  59| 	}
+  60| 	if conf.S3AccessKey != "" && conf.S3SecretKey != "" {
+  61| 		config.Credentials = credentials.NewStaticCredentials(conf.S3AccessKey, conf.S3SecretKey, "")
+  62| 	} else if conf.S3AccessKey == "" && conf.S3SecretKey == "" {
+  63| 		// Explicitly disable signing for public buckets.
+  64| 		config.Credentials = credentials.AnonymousCredentials
+  65| 	}
+  66| 
+  67| 	sess, err := session.NewSession(config)
+  68| 	if err != nil {
+  69| 		return nil, fmt.Errorf("create aws session: %w", err)
+  70| 	}
+  71| 	if conf.S3V4Signature {
+  72| 		sess.Handlers.Sign.PushBackNamed(v4.SignRequestHandler)
+  73| 	}
+  74| 	sess.Handlers.Build.PushBack(func(r *request.Request) {
+  75| 		r.HTTPRequest.Header.Set("User-Agent", "SeaweedFS/"+version.VERSION_NUMBER)
+  76| 	})
+  77| 	sess.Handlers.Build.PushFront(skipSha256PayloadSigning)
+  78| 	client.conn = s3.New(sess)
+  79| 	return client, nil
+  80| }
+  81| 
+  82| type s3RemoteStorageClient struct {
+  83| 	conf           *remote_pb.RemoteConf
+  84| 	conn           s3iface.S3API
+  85| 	supportTagging bool
+  86| }
+  87| 
+  88| var _ = remote_storage.RemoteStorageClient(&s3RemoteStorageClient{supportTagging: true})
+  89| 
+  90| func (s *s3RemoteStorageClient) Traverse(remote *remote_pb.RemoteStorageLocation, visitFn remote_storage.VisitFunc) (err error) {
+  91| 
+  92| 	pathKey := remote.Path[1:]
+  93| 
+  94| 	listInput := &s3.ListObjectsV2Input{
+  95| 		Bucket:              aws.String(remote.Bucket),
+  96| 		ContinuationToken:   nil,
+  97| 		Delimiter:           nil, // not aws.String("/"), iterate through all entries
+  98| 		EncodingType:        nil,
+  99| 		ExpectedBucketOwner: nil,
+ 100| 		FetchOwner:          nil,
+ 101| 		MaxKeys:             nil, // aws.Int64(1000),
+ 102| 		Prefix:              aws.String(pathKey),
+ 103| 		RequestPayer:        nil,
+ 104| 		StartAfter:          nil,
+ 105| 	}
+ 106| 	isLastPage := false
+ 107| 	for !isLastPage && err == nil {
+ 108| 		var localErr error
+ 109| 		listErr := s.conn.ListObjectsV2Pages(listInput, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+ 110| 			for _, content := range page.Contents {
+ 111| 				key := *content.Key
+ 112| 				key = "/" + key
+ 113| 				dir, name := util.FullPath(key).DirAndName()
+ 114| 				remoteEntry := &filer_pb.RemoteEntry{
+ 115| 					StorageName: s.conf.Name,
+ 116| 				}
+ 117| 				if content.LastModified != nil {
+ 118| 					remoteEntry.RemoteMtime = content.LastModified.Unix()
+ 119| 				}
+ 120| 				if content.Size != nil {
+ 121| 					remoteEntry.RemoteSize = *content.Size
+ 122| 				}
+ 123| 				if content.ETag != nil {
+ 124| 					remoteEntry.RemoteETag = *content.ETag
+ 125| 				}
+ 126| 				if err := visitFn(dir, name, false, remoteEntry); err != nil {
+ 127| 					localErr = err
+ 128| 					return false
+ 129| 				}
+ 130| 			}
+ 131| 			listInput.ContinuationToken = page.NextContinuationToken
+ 132| 			isLastPage = lastPage
+ 133| 			return true
+ 134| 		})
+ 135| 		if listErr != nil {
+ 136| 			err = fmt.Errorf("list %v: %w", remote, listErr)
+ 137| 		}
+ 138| 		if localErr != nil {
+ 139| 			err = fmt.Errorf("process %v: %w", remote, localErr)
+ 140| 		}
+ 141| 	}
+ 142| 	return
+ 143| }
+ 144| 
+ 145| func (s *s3RemoteStorageClient) ListDirectory(ctx context.Context, loc *remote_pb.RemoteStorageLocation, visitFn remote_storage.VisitFunc) error {
+ 146| 	pathKey := loc.Path[1:]
+ 147| 	if pathKey != "" && !strings.HasSuffix(pathKey, "/") {
+ 148| 		pathKey += "/"
+ 149| 	}
+ 150| 
+ 151| 	listInput := &s3.ListObjectsV2Input{
+ 152| 		Bucket:    aws.String(loc.Bucket),
+ 153| 		Prefix:    aws.String(pathKey),
+ 154| 		Delimiter: aws.String("/"),
+ 155| 	}
+ 156| 
+ 157| 	var localErr error
+ 158| 	listErr := s.conn.ListObjectsV2PagesWithContext(ctx, listInput, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+ 159| 		for _, prefix := range page.CommonPrefixes {
+ 160| 			if prefix.Prefix == nil {
+ 161| 				continue
+ 162| 			}
+ 163| 			dirKey := "/" + strings.TrimSuffix(*prefix.Prefix, "/")
+ 164| 			dir, name := util.FullPath(dirKey).DirAndName()
+ 165| 			if err := visitFn(dir, name, true, nil); err != nil {
+ 166| 				localErr = err
+ 167| 				return false
+ 168| 			}
+ 169| 		}
+ 170| 		for _, content := range page.Contents {
+ 171| 			key := "/" + *content.Key
+ 172| 			if strings.HasSuffix(key, "/") {
+ 173| 				continue // skip directory markers
+ 174| 			}
+ 175| 			dir, name := util.FullPath(key).DirAndName()
+ 176| 			remoteEntry := &filer_pb.RemoteEntry{
+ 177| 				StorageName: s.conf.Name,
+ 178| 			}
+ 179| 			if content.LastModified != nil {
+ 180| 				remoteEntry.RemoteMtime = content.LastModified.Unix()
+ 181| 			}
+ 182| 			if content.Size != nil {
+ 183| 				remoteEntry.RemoteSize = *content.Size
+ 184| 			}
+ 185| 			if content.ETag != nil {
+ 186| 				remoteEntry.RemoteETag = *content.ETag
+ 187| 			}
+ 188| 			if err := visitFn(dir, name, false, remoteEntry); err != nil {
+ 189| 				localErr = err
+ 190| 				return false
+ 191| 			}
+ 192| 		}
+ 193| 		return true
+ 194| 	})
+ 195| 	if listErr != nil {
+ 196| 		return fmt.Errorf("list directory %v: %w", loc, listErr)
+ 197| 	}
+ 198| 	if localErr != nil {
+ 199| 		return fmt.Errorf("process directory %v: %w", loc, localErr)
+ 200| 	}
+ 201| 	return nil
+ 202| }
+ 203| 
+ 204| func (s *s3RemoteStorageClient) StatFile(loc *remote_pb.RemoteStorageLocation) (remoteEntry *filer_pb.RemoteEntry, err error) {
+ 205| 	resp, err := s.conn.HeadObject(&s3.HeadObjectInput{
+ 206| 		Bucket: aws.String(loc.Bucket),
+ 207| 		Key:    aws.String(loc.Path[1:]),
+ 208| 	})
+ 209| 	if err != nil {
+ 210| 		if reqErr, ok := err.(awserr.RequestFailure); ok && reqErr.StatusCode() == http.StatusNotFound {
+ 211| 			return nil, remote_storage.ErrRemoteObjectNotFound
+ 212| 		}
+ 213| 		return nil, fmt.Errorf("stat s3 %s%s: %w", loc.Bucket, loc.Path, err)
+ 214| 	}
+ 215| 	remoteEntry = &filer_pb.RemoteEntry{
+ 216| 		StorageName: s.conf.Name,
+ 217| 	}
+ 218| 	if resp.ContentLength != nil {
+ 219| 		remoteEntry.RemoteSize = *resp.ContentLength
+ 220| 	}
+ 221| 	if resp.LastModified != nil {
+ 222| 		remoteEntry.RemoteMtime = resp.LastModified.Unix()
+ 223| 	}
+ 224| 	if resp.ETag != nil {
+ 225| 		remoteEntry.RemoteETag = *resp.ETag
+ 226| 	}
+ 227| 	return remoteEntry, nil
+ 228| }
+ 229| 
+ 230| func (s *s3RemoteStorageClient) ReadFile(loc *remote_pb.RemoteStorageLocation, offset int64, size int64) (data []byte, err error) {
+ 231| 	return s.ReadFileWithConcurrency(loc, offset, size, 5)
+ 232| }
+ 233| 
+ 234| func (s *s3RemoteStorageClient) ReadFileWithConcurrency(loc *remote_pb.RemoteStorageLocation, offset int64, size int64, concurrency int) (data []byte, err error) {
+ 235| 	if concurrency <= 0 {
+ 236| 		concurrency = 5
+ 237| 	}
+ 238| 	downloader := s3manager.NewDownloaderWithClient(s.conn, func(u *s3manager.Downloader) {
+ 239| 		u.PartSize = int64(4 * 1024 * 1024)
+ 240| 		u.Concurrency = concurrency
+ 241| 	})
+ 242| 
+ 243| 	dataSlice := make([]byte, int(size))
+ 244| 	writerAt := aws.NewWriteAtBuffer(dataSlice)
+ 245| 
+ 246| 	_, err = downloader.Download(writerAt, &s3.GetObjectInput{
+ 247| 		Bucket: aws.String(loc.Bucket),
+ 248| 		Key:    aws.String(loc.Path[1:]),
+ 249| 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+size-1)),
+ 250| 	})
+ 251| 	if err != nil {
+ 252| 		return nil, fmt.Errorf("failed to download file %s%s: %v", loc.Bucket, loc.Path, err)
+ 253| 	}
+ 254| 
+ 255| 	return writerAt.Bytes(), nil
+ 256| }
+ 257| 
+ 258| func (s *s3RemoteStorageClient) WriteDirectory(loc *remote_pb.RemoteStorageLocation, entry *filer_pb.Entry) (err error) {
+ 259| 	return nil
+ 260| }
+ 261| 
+ 262| func (s *s3RemoteStorageClient) RemoveDirectory(loc *remote_pb.RemoteStorageLocation) (err error) {
+ 263| 	return nil
+ 264| }
+ 265| 
+ 266| func (s *s3RemoteStorageClient) WriteFile(loc *remote_pb.RemoteStorageLocation, entry *filer_pb.Entry, reader io.Reader) (remoteEntry *filer_pb.RemoteEntry, err error) {
+ 267| 
+ 268| 	fileSize := int64(filer.FileSize(entry))
+ 269| 
+ 270| 	partSize := int64(8 * 1024 * 1024) // The minimum/default allowed part size is 5MB
+ 271| 	for partSize*1000 < fileSize {
+ 272| 		partSize *= 4
+ 273| 	}
+ 274| 
+ 275| 	// Create an uploader with the session and custom options
+ 276| 	uploader := s3manager.NewUploaderWithClient(s.conn, func(u *s3manager.Uploader) {
+ 277| 		u.PartSize = partSize
+ 278| 		u.Concurrency = 1
+ 279| 	})
+ 280| 
+ 281| 	// process tagging
+ 282| 	tags := ""
+ 283| 	var awsTags *string
+ 284| 	// openstack swift doesn't support s3 object tagging
+ 285| 	if s.conf.S3SupportTagging {
+ 286| 		for k, v := range entry.Extended {
+ 287| 			if len(tags) > 0 {
+ 288| 				tags = tags + "&"
+ 289| 			}
+ 290| 			tags = tags + k + "=" + string(v)
+ 291| 		}
+ 292| 		awsTags = aws.String(tags)
+ 293| 	}
+ 294| 
+ 295| 	// Upload the file to S3.
+ 296| 	uploadInput := &s3manager.UploadInput{
+ 297| 		Bucket:  aws.String(loc.Bucket),
+ 298| 		Key:     aws.String(loc.Path[1:]),
+ 299| 		Body:    reader,
+ 300| 		Tagging: awsTags,
+ 301| 	}
+ 302| 	if s.conf.S3StorageClass != "" {
+ 303| 		uploadInput.StorageClass = aws.String(s.conf.S3StorageClass)
+ 304| 	}
+ 305| 	_, err = uploader.Upload(uploadInput)
+ 306| 
+ 307| 	//in case it fails to upload
+ 308| 	if err != nil {
+ 309| 		return nil, fmt.Errorf("upload to %s/%s%s: %v", loc.Name, loc.Bucket, loc.Path, err)
+ 310| 	}
+ 311| 
+ 312| 	// read back the remote entry
+ 313| 	return s.readFileRemoteEntry(loc)
+ 314| 
+ 315| }
+ 316| 
+ 317| func toTagging(attributes map[string][]byte) *s3.Tagging {
+ 318| 	tagging := &s3.Tagging{}
+ 319| 	for k, v := range attributes {
+ 320| 		tagging.TagSet = append(tagging.TagSet, &s3.Tag{
+ 321| 			Key:   aws.String(k),
+ 322| 			Value: aws.String(string(v)),
+ 323| 		})
+ 324| 	}
+ 325| 	return tagging
+ 326| }
+ 327| 
+ 328| func (s *s3RemoteStorageClient) readFileRemoteEntry(loc *remote_pb.RemoteStorageLocation) (*filer_pb.RemoteEntry, error) {
+ 329| 	return s.StatFile(loc)
+ 330| }
+ 331| 
+ 332| func (s *s3RemoteStorageClient) UpdateFileMetadata(loc *remote_pb.RemoteStorageLocation, oldEntry *filer_pb.Entry, newEntry *filer_pb.Entry) (err error) {
+ 333| 	if reflect.DeepEqual(oldEntry.Extended, newEntry.Extended) {
+ 334| 		return nil
+ 335| 	}
+ 336| 	tagging := toTagging(newEntry.Extended)
+ 337| 	if len(tagging.TagSet) > 0 {
+ 338| 		_, err = s.conn.PutObjectTagging(&s3.PutObjectTaggingInput{
+ 339| 			Bucket:  aws.String(loc.Bucket),
+ 340| 			Key:     aws.String(loc.Path[1:]),
+ 341| 			Tagging: toTagging(newEntry.Extended),
+ 342| 		})
+ 343| 	} else {
+ 344| 		_, err = s.conn.DeleteObjectTagging(&s3.DeleteObjectTaggingInput{
+ 345| 			Bucket: aws.String(loc.Bucket),
+ 346| 			Key:    aws.String(loc.Path[1:]),
+ 347| 		})
+ 348| 	}
+ 349| 	return
+ 350| }
+ 351| func (s *s3RemoteStorageClient) DeleteFile(loc *remote_pb.RemoteStorageLocation) (err error) {
+ 352| 	_, err = s.conn.DeleteObject(&s3.DeleteObjectInput{
+ 353| 		Bucket: aws.String(loc.Bucket),
+ 354| 		Key:    aws.String(loc.Path[1:]),
+ 355| 	})
+ 356| 	return
+ 357| }
+ 358| 
+ 359| func (s *s3RemoteStorageClient) ListBuckets() (buckets []*remote_storage.Bucket, err error) {
+ 360| 	resp, err := s.conn.ListBuckets(&s3.ListBucketsInput{})
+ 361| 	if err != nil {
+ 362| 		return nil, fmt.Errorf("list buckets: %w", err)
+ 363| 	}
+ 364| 	for _, b := range resp.Buckets {
+ 365| 		buckets = append(buckets, &remote_storage.Bucket{
+ 366| 			Name:      *b.Name,
+ 367| 			CreatedAt: *b.CreationDate,
+ 368| 		})
+ 369| 	}
+ 370| 	return
+ 371| }
+ 372| 
+ 373| func (s *s3RemoteStorageClient) CreateBucket(name string) (err error) {
+ 374| 	_, err = s.conn.CreateBucket(&s3.CreateBucketInput{
+ 375| 		ACL:                        nil,
+ 376| 		Bucket:                     aws.String(name),
+ 377| 		CreateBucketConfiguration:  nil,
+ 378| 		GrantFullControl:           nil,
+ 379| 		GrantRead:                  nil,
+ 380| 		GrantReadACP:               nil,
+ 381| 		GrantWrite:                 nil,
+ 382| 		GrantWriteACP:              nil,
+ 383| 		ObjectLockEnabledForBucket: nil,
+ 384| 	})
+ 385| 	if err != nil {
+ 386| 		return fmt.Errorf("%s create bucket %s: %v", s.conf.Name, name, err)
+ 387| 	}
+ 388| 	return
+ 389| }
+ 390| 
+ 391| func (s *s3RemoteStorageClient) DeleteBucket(name string) (err error) {
+ 392| 	_, err = s.conn.DeleteBucket(&s3.DeleteBucketInput{
+ 393| 		Bucket: aws.String(name),
+ 394| 	})
+ 395| 	if err != nil {
+ 396| 		return fmt.Errorf("delete bucket %s: %v", name, err)
+ 397| 	}
+ 398| 	return
+ 399| }
+ 400| 
+ 401| 
+
+
+████ 第 1-5 步区:核对用 [ANALYSIS]/[JSON](读完上区再来看这里)████
+
+### id=8102 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析
+
+**入口点枚举（全文通读）**
+本文件是 SeaweedFS 的 S3 远程存储客户端插件，通过 `init()`（第 27-29 行）注册到 `remote_storage.RemoteStorageClientMakers["s3"]`。所有入口均为内部接口方法，source 来自 `remote_pb.RemoteConf`（存储配置）、`remote_pb.RemoteStorageLocation`（路径）和 `filer_pb.Entry`（文件元数据，含用户可控的 `Extended` 扩展属性）。无 HTTP 路由、无环境变量、无回调注入点。
+
+**逐条数据流验证**
+
+1. **第 38-66 行 Make**：`conf.S3Endpoint/S3Region/AccessKey/SecretKey` 直接进入 AWS SDK 配置。这些值来自管理员配置的 remote storage conf（需 filer 管理权限写入），属于受信配置面；且 SDK 会做基本校验。不构成漏洞。
+2. **第 76-129 行 Traverse / 第 131-188 行 ListDirectory**：`loc.Bucket/Path` 进入 `ListObjectsV2Input.Prefix/Bucket`。这些是 AWS SDK 的结构化参数字段，非拼接进 URL 字符串，SDK 内部会正确编码；不存在前缀注入扩大列举范围的问题——prefix 本身就是调用方语义的一部分。防御有效（参数化 API）。
+3. **第 190-214 行 StatFile / 第 232-242 行 Download / 第 339 行 DeleteObject**：同理，`loc.Path[1:]` 作为结构化 `Key` 参数传入，非 sink 型字符串拼接。安全。
+4. **第 220-242 行 ReadFileWithConcurrency**：若 `size <= 0`，第 235 行生成非法 Range 头 `bytes=N-(N-1)`，会导致请求失败或异常行为——属于健壮性缺陷而非安全漏洞（无可控越界读取，Range 由服务端裁剪）。
+5. **⚠️ 第 252-301 行 WriteFile —— 标签注入**：当 `conf.S3SupportTagging` 为真时，第 273-277 行将 `entry.Extended` 的键值直接字符串拼接：
+   ```go
+   tags = tags + k + "=" + string(v)
+   ```
+   第 287 行将其作为 `UploadInput.Tagging` 上传。S3 的 Tagging 参数是 URL 查询串格式（`key1=value1&key2=value2`）。`entry.Extended` 是文件扩展属性，可由任何有该目录写权限的客户端通过 filer 的元数据接口任意设置。攻击者只需在键或值中放入 `&` 或 `=` 字符（如值为 `a&admin=true&x=y`），即可在未编码的情况下注入额外的对象标签对。这是典型的注入型缺陷（CWE-74 / 编码缺失 CWE-116），黑名单/过滤不存在，属可绕过类别之外的根本性缺失编码。对比第 304-313 行的 `toTagging()` 使用结构化 `s3.Tag` API（SDK 自动编码），说明作者知道正确做法但 WriteFile 未使用。
+6. **第 319-337 行 UpdateFileMetadata**：使用 `toTagging()` 结构化 API，安全（与第 5 条形成对照，佐证第 5 条是真实疏漏）。
+7. **第 345-383 行 ListBuckets/CreateBucket/DeleteBucket**：bucket 名来自配置/管理操作，进入结构化参数，安全。
+
+**第二入口/替代通道检查**：同一 Extended 数据也流经 UpdateFileMetadata（已用结构化 API），故唯一未防护通道是 WriteFile 的上传标签路径。
+[JSON]
+{"has_vulnerability": true, "vulnerability_type": "CWE-74 (Injection) / CWE-116 (Improper Encoding)", "risk_level": "Medium", "source": "line 275: for k, v := range entry.Extended —— 用户可通过 filer 元数据接口控制的文件扩展属性", "sink": "line 277+287: tags = tags + k + '=' + string(v) 后作为 UploadInput.Tagging 上传", "explanation": "entry.Extended 的键值未经 URL 编码直接按 '&' 和 '=' 拼接成 S3 Tagging 查询串 -> 攻击者在扩展属性中嵌入 '&'/'=' 即可向远端 S3 对象注入任意额外标签对 -> 可能污染下游基于标签的策略/计费/生命周期规则；对照 line 306:的 toTagging 使用结构化 API 可证此为遗漏", "fix_suggestion": "line 277: 对每个键值使用 url.QueryEscape(k)+'='+url.QueryEscape(string(v)) 进行编码，或改用 line 306 的 toTagging 配合 PutObjectTagging 结构化 API 设置标签"}
+
+### id=8103 teacher=unknown flags=[]
+[ANALYSIS]
+## 编号分析（全文逐函数）
+
+1. **init / Make / MakeWithHTTPClient（第 27–79 行）**：入口为 `remote_pb.RemoteConf` 配置对象，来自管理员配置而非外部请求。`S3Endpoint`、`S3AccessKey/SecretKey` 直接进入 AWS SDK config——这是设计用途（配置即信任边界），且 SDK 内部对 endpoint/key 做转义与签名处理，不构成注入 sink。匿名凭证分支（第 55–57 行）仅用于公共桶，无凭据泄漏。
+
+2. **Traverse（第 84–130 行）**：`remote.Path[1:]` 作为 `Prefix` 传入 `ListObjectsV2Input`。source 是内部 filer 路径，sink 是 AWS SDK API 参数；SDK 对 key/prefix 做参数化编码，无 shell/SQL/路径穿越类 sink。返回值经 `visitFn` 回调，属正常数据流。
+
+3. **ListDirectory（第 132–180 行）**：同上，`loc.Path[1:]` 加后缀 `/` 后作为 Prefix；无拼接进 URL、命令或文件系统路径的 sink。目录标记跳过逻辑正确。
+
+4. **StatFile（第 182–204 行）**：HeadObject 的 Bucket/Key 均由 SDK 编码传输；错误信息中包含 `loc.Bucket/loc.Path` 仅用于日志/错误返回，非注入点。
+
+5. **ReadFile / ReadFileWithConcurrency（第 206–233 行）**：`offset`、`size` 来自上层 filer 同步逻辑（内部整型），拼入 Range 头 `bytes=%d-%d`。若 `size<=0` 会产生非法 Range 或 `make([]byte, int(size))` panic（size 为负时），但该函数无任何外部 HTTP/请求入口直接控制这两个 int64 参数，调用方（filer remote sync）保证合法范围，属健壮性问题而非可利用漏洞。
+
+6. **WriteFile（第 243–289 行）**：tag 拼接 `tags = tags + k + "=" + string(v)`（第 262–268 行）——Extended 元数据的 key/value 若含 `&` 或 `=` 可能造成 tag 字符串歧义，但 S3 Tagging header 由 SDK URL 编码传输，最坏结果是 tag 键值解析错乱，不影响安全边界（无越权、无注入执行）。
+
+7. **UpdateFileMetadata / DeleteFile / ListBuckets / CreateBucket / DeleteBucket（第 299–352 行）**：所有 Bucket/Key 均直接传入 AWS SDK 输入结构体，SDK 负责 XML/URL 编码；bucket 名来自远程存储配置或已校验的 filer 目录名，无未验证的外部 source 直达 sink。
+
+8. **第二入口检查**：本文件无 HTTP handler、无环境变量读取、无回调注册（除 init 注册 client maker）。唯一对外交互是 AWS SDK 出站调用。不存在 SSRF 面：endpoint 完全由管理员配置的 `RemoteConf` 决定，普通用户请求无法触达。
+
+**结论**：全部 source→sink 流均以 AWS SDK 结构化 API 为终点，SDK 提供有效编码防御；无用户可控输入直达危险 sink；无认证绕过、无注入、无 SSRF 可利用面。未发现安全漏洞。
+[JSON]
+{"has_vulnerability": false, "vulnerability_type": "none", "risk_level": "None", "source": "N/A", "sink": "N/A", "explanation": "全文通读后确认：该文件是 SeaweedFS 的 S3 远程存储客户端适配层，无任何 HTTP 路由、环境变量或用户请求入口。所有数据流（loc.Bucket、loc.Path、conf.S3Endpoint、entry.Extended 等）均源自管理员配置的 RemoteConf 或内部 filer 元数据，最终 sink 全部是 AWS SDK 的结构化输入结构体（ListObjectsV2Input、GetObjectInput、UploadInput 等），由 SDK 负责参数编码与签名，不存在注入、SSRF 或路径穿越的可利用通道。ReadFileWithConcurrency 中 offset/size 若为负理论上会 panic，但调用方为内部同步逻辑，非攻击者可控入口；WriteFile 中 tag 字符串拼接最多导致 tag 键值解析歧义，不构成安全漏洞。", "fix_suggestion": "no fix needed"}
