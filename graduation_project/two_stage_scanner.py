@@ -293,6 +293,10 @@ _STANDARD_TAINT_TYPES = frozenset({
     # 此前全部被当"无主告警"剔除（CWE-1004/614 类 cookie flag 缺陷无类型承接）。
     "Insecure Cookie",
     "Unrestricted File Upload",                           # CWE-434（unrestricted_file_upload）
+    # --- 第八波（2026-08-31，盲区层收口）：prefilter 新规则类型的白名单
+    # 登记（同第四波配套纪律——防未来外部工具命中同形态时被当"无主告警"剔除）。
+    "ReDoS",                                              # CWE-1333（redos_nested_quantifier）
+    "Weak Password Policy",                               # CWE-521（weak_password_policy_regex）
 })
 
 # sast/iac 告警 evidence 中"告警行上下文"片段的标记（P0.3 追加 / _infer_taint_type
@@ -3502,8 +3506,12 @@ if __name__ == "__main__":
     p_sast = build_triage_prompt(sast_f, "code", "python")
     p_taint = build_triage_prompt(taint_f, "code", "python")
     p_taint_empty = build_triage_prompt(empty_taint_f, "code", "python")
+    # CWE 编号锚断言（2026-08-31，§9.21 A/B）：taint_f 的语义名 "SQL Injection"
+    # 须在类型行透出标准分类 "CWE-89"；sast_f 的裸规则号 "B608" 无映射 → 无锚但
+    # 仍须带"语义一致"指令（旧断言引用的 "CWE-862" 是已删除的示例文本）。
     ok_anchor = ("历史误报率高" in p_sast and "独立判定" in p_sast
-                 and "历史误报率高" not in p_taint and "CWE-862" in p_sast
+                 and "历史误报率高" not in p_taint
+                 and "语义一致" in p_sast and "标准分类 CWE-89" in p_taint
                  and "数据流链" in p_taint and "断点" in p_taint
                  and "历史误报率高" in p_taint_empty)
     print(f"[{'PASS' if ok_anchor else 'FAIL'}] 裁决prompt信任分级: "

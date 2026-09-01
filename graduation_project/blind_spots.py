@@ -214,6 +214,80 @@ _BLIND_SPOT_RULES: list[tuple[str, re.Pattern, str, int]] = [
                 r"math\.random\(|new\s+random\(|mt_rand\(|rand\(\s*\))", re.I),
      "使用了非密码学安全随机数，工具无法判定其是否用于安全敏感值"
      "（token/密钥/盐/口令重置码），请确认该随机值是否可被预测。", 2),
+
+    # =========================================================================
+    # --- 2026-08-31 第八波：盲区层收口（指导文档 §9.20.2 / §8.5 复核后补入）---
+    #
+    # 背景：本轮核验发现，指导文档里归入"盲区提醒层"的多类形态在本表中
+    # **没有对应规则**——会话固定/CSRF 授权族（87 段 typical_15/16/22 实测
+    # 0 提醒）、Spring POJO 绑定（hard_cve_05 0 提醒）、NodeGoat 的密码明文
+    # 落库与 http 明文服务（均 0 提醒）。它们此前"既未修、也未提醒"。
+    # 本批 5 条把"有行级形态可提示"的类接进提醒层；备注：
+    #   - ReDoS / 服务端 console 日志注入 / 弱口令正则 / 312 参数直赋落库
+    #     已升级为 prefilter finding 通道（见 prefilter.py 第八波），不再重复；
+    #   - missing authorization 的"敏感操作"定义仍待标签治理定案（§8.8 缓期
+    #     维持），本批不越权代行；
+    #   - CSRF 不做精确判定，仅在"写方法路由"这一语言级事实上提醒。
+    # =========================================================================
+
+    # --- 会话固定（CWE-384，typical_16 实锤 0 提醒）------------------------ priority 3
+    (AUTHORIZATION,
+     re.compile(r"(?:req(?:uest)?\.session|(?<![\w.])session)\s*"
+                r"(?:\.\s*|\[\s*['\"]?)(?:user|userid|uid|username|account|"
+                r"login|email|member)\w*['\"]?\s*\]?\s*=[^=]", re.I),
+     "登录态被写入会话存储，工具无法判定写入前是否重新生成了会话标识"
+     "（session regeneration），请确认是否存在会话固定风险。", 3),
+
+    # --- 状态变更路由的访问控制 / CSRF（CWE-352/862，typical_22 实锤 0 提醒）---
+    # 触发只依赖语言级事实：路由声明为写方法（Flask/FastAPI methods=[POST..] /
+    # Spring @Post|Put|DeleteMapping）。是否有防护属业务语义，交给模型确认。
+    # 不收裸 Express app.post(：服务端仓库几乎每文件都有，提醒无差别泛滥。
+    (AUTHORIZATION,
+     re.compile(r"@(?:\w+\.)?route\s*\([^)]*methods\s*=\s*\[[^\]]*"
+                r"['\"](?:POST|PUT|DELETE|PATCH)['\"][^\]]*\]"
+                r"|@(?:Post|Put|Delete|Patch)Mapping\b", re.I),
+     "该路由声明为状态变更方法（POST/PUT/DELETE/PATCH），工具无法判定其是否"
+     "具备访问控制与 CSRF 防护，请确认是否存在 token 校验与权限检查。", 3),
+
+    # --- Spring MVC POJO 参数绑定（CWE-915/Spring4Shell 面，hard_cve_05 实锤
+    #     0 提醒）------------------------------------------------------------- priority 3
+    # 语言级事实：@*Mapping 方法以业务对象作形参时，请求参数自动绑定到同名字段
+    # （Spring MVC 官方行为）。漏洞不在"用了绑定"而在"未限定可绑定字段"——
+    # 写成 finding 会 FP 掉所有正常 controller（§9.12.1 原判正确），但作为
+    # 提醒恰如其分。排除显式标量注解形参（@RequestParam/@PathVariable 等）。
+    (FRAMEWORK,
+     re.compile(r"@(?:Request|Post|Put|Patch|Delete)Mapping[^\n]*\n"
+                r"(?:[ \t]*@[^\n]*\n)*"
+                r"[ \t]*(?:public|protected|private)?[^\n(]*?\(\s*"
+                r"(?:@[A-Za-z]+\s+)?"
+                r"(?!(?:String|Integer|Long|Boolean|Double|Float|BigDecimal|Model|"
+                r"ModelMap|MultipartFile|Principal|BindingResult|Errors|SessionStatus|"
+                r"Locale|Map|List|Pageable|Authentication|HttpServletRequest|"
+                r"HttpServletResponse|HttpSession)\b)"
+                r"[A-Z][\w<>\[\].]*\s+[a-z]\w*\s*(?=[,)])", re.I),
+     "Spring MVC 处理方法以业务对象作形参，请求参数会自动绑定到同名字段，"
+     "工具无法判定可绑定字段是否受白名单限制，请确认敏感字段（如 role/"
+     "isAdmin/price）能否被外部绑定覆盖。", 3),
+
+    # --- 口令明文落库（CWE-256，NodeGoat user-dao L25 实锤 0 提醒）---------
+    # 为什么不做 finding：password 字段的请求取值行在登录流程安全样本
+    # （safe_11 bcrypt 形态）完全同形，文件级规则区分不了"哈希后入库"与
+    # "明文入库"；提醒层的价值在于"入库前是否哈希"值得模型看一眼。
+    # 右侧仅认裸标识符/简写属性——bcrypt.hashSync(...) 这类已哈希写法豁免。
+    (CRYPTO,
+     re.compile(r"\.\s*(?:password|passwd|pwd)\w*\s*=\s*[A-Za-z_$][\w$]*\s*[;,)\n]"
+                r"|(?:^|[{,\s])(?:password|passwd|pwd)\s*:\s*[A-Za-z_$][\w$]*\s*[,}]"
+                r"|(?:^|[{,\s])(?:password|passwd|pwd)\s*(?:,\s*(?://|$)|//)", re.I | re.M),
+     "口令字段被赋值或随对象写入持久化，工具无法判定入库前是否已做单向加密"
+     "（哈希加盐），请确认存储链路是否存在明文口令。", 2),
+
+    # --- http 明文服务（CWE-319 面，NodeGoat server.js L145 实锤 0 提醒）---
+    # 语言级事实：http.createServer 与 https.createServer 是不同 API 名，
+    # 无第二语义；是否有碍取决于部署（TLS 终结/反代），属提醒不属判定。
+    (CONFIG,
+     re.compile(r"\bhttp\.createServer\s*\(", re.I),
+     "服务端以 http 模块明文监听，工具无法判定部署链路中是否有 TLS 终结"
+     "（反向代理/网关），请确认传输层加密由哪一层负责。", 2),
 ]
 
 # --- 授权盲区的变量流追踪（AUTHORIZATION 专用）--------------------------------
@@ -700,7 +774,51 @@ if __name__ == "__main__":
     print(f"[{'PASS' if ok12 else 'FAIL'}] 收益闸门(短文件回退): "
           f"盲区={rep12.count}, ctx={'None(回退整文件)' if ctx12 is None else '片段'}")
 
+    # 13) 第八波·盲区层收口（会话固定/写方法路由/Spring POJO 绑定/密码明文/
+    #     http 明文服务）——指导文档 §9.20.2 / §8.5 复核后补入的 5 条提醒
+    wave8_py = "\n".join([
+        "@app.route('/transfer', methods=['POST'])",   # 写方法路由
+        "def transfer():",
+        "    session['user_id'] = username",            # 会话固定形态
+        "    return 'ok'",
+    ])
+    rep13a = scan_blind_spots(wave8_py)
+    cats13a = {(s.category, s.line_start) for s in rep13a.spots}
+    ok13a = (any(c == 'authorization' and l == 1 for c, l in cats13a)
+             and any(c == 'authorization' and l == 3 for c, l in cats13a))
+    wave8_java = "\n".join([
+        "class UserController {",
+        "    @PostMapping(\"/users/add\")",
+        "    public String addUser(UserForm form) { return form.getName(); }",
+        "}",
+    ])
+    rep13b = scan_blind_spots(wave8_java)
+    ok13b = any(s.category == 'framework' for s in rep13b.spots)
+    wave8_js = "\n".join([
+        "const usersCol = db.collection('users');",
+        "this.addUser = (userName, password, cb) => {",
+        "    const user = { password, //received from request param",
+        "    };",
+        "    http.createServer(app).listen(4000);",
+        "    cb(null);",
+        "};",
+    ])
+    rep13c = scan_blind_spots(wave8_js)
+    cats13c = {s.category for s in rep13c.spots}
+    ok13c = 'crypto' in cats13c and 'config' in cats13c
+    # 负样本：String 标量形参不是 POJO 绑定；https 服务不是明文
+    neg_spring = "\n".join([
+        "@PostMapping(\"/ok\")",
+        "public String ok(String name) { return name; }",
+    ])
+    ok13d = not any(s.category == 'framework'
+                    for s in scan_blind_spots(neg_spring).spots)
+    ok13 = ok13a and ok13b and ok13c and ok13d
+    print(f"[{'PASS' if ok13 else 'FAIL'}] 第八波收口提醒: "
+          f"py授权={sorted(cats13a)}, java绑定={ok13b}, js密码+http={ok13c}, "
+          f"String负样本={ok13d}")
+
     all_ok = all([ok1, ok2, ok3, ok4, ok5, ok6, ok7, ok8,
-                  ok9, ok10, ok11, ok12])
+                  ok9, ok10, ok11, ok12, ok13])
     print(f"\n{'=== 自检通过 ===' if all_ok else '!!! 自检失败 !!!'}")
     sys.exit(0 if all_ok else 1)

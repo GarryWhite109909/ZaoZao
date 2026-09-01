@@ -70,13 +70,13 @@
 
 | CWE | 行 | 判定 | 覆盖候选（工具/类型/行）| 被剔除的相关候选 |
 |---|---|---|---|---|
-| CWE-798 | 4 | OK（候选覆盖且类型对） | detect-secrets·Secret Keyword·L4 | — |
+| CWE-798 | 4 | OK（候选覆盖且类型对） | detect-secrets·Hardcoded Credentials·L4 | — |
 
 ### 全部原始候选去向
 
 | 去向 | 工具 | 规则 | 类型 | 行 | 严重度 |
 |---|---|---|---|---|---|
-| 进裁决 | detect-secrets | Secret Keyword | Secret Keyword | 4 | high |
+| 进裁决 | detect-secrets | Secret Keyword | Hardcoded Credentials | 4 | high |
 
 ## mail.php（原始候选 0 → 最终 0）
 

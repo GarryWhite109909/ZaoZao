@@ -187,6 +187,35 @@ PREFILTER_RULE_INFO: dict[str, dict[str, str]] = {
         "risk": "Medium",
         "severity": "medium",
     },
+    # --- 2026-08-31 第八波：盲区层收口（§9.20.2 清单复核 + NodeGoat 审计）---
+    # 本波三条 + 312 参数形态补规则，把指导文档 §9.20.2 里"既未修也未提醒"
+    # 的项里**有标准形态可写**的四类接进 finding 通道；其余（CWE-256 密码
+    # 明文落库、http 明文服务、会话固定、Spring POJO 绑定）走 blind_spots
+    # 提醒层（见 blind_spots.py 同日注）。
+    "redos_nested_quantifier": {
+        "taint_type": "ReDoS",
+        "cwe": "CWE-1333 Improper Neutralization of Special Elements Used in a Regular Expression",
+        "risk": "Medium",
+        "severity": "medium",
+    },
+    "log_injection_console": {
+        "taint_type": "Log Injection",
+        "cwe": "CWE-117 Improper Output Neutralization for Logs",
+        "risk": "Low",
+        "severity": "low",
+    },
+    "weak_password_policy_regex": {
+        "taint_type": "Weak Password Policy",
+        "cwe": "CWE-521 Weak Password Requirements",
+        "risk": "Medium",
+        "severity": "medium",
+    },
+    "cleartext_sensitive_storage_field": {
+        "taint_type": "Cleartext Storage of Sensitive Information",
+        "cwe": "CWE-312 Cleartext Storage of Sensitive Information",
+        "risk": "High",
+        "severity": "high",
+    },
     # --- 2026-08-31 第四波：长尾注入族（工具层优化指导 §五之五 零召回清单）---
     # 全部按"库/语言标准 API + 标准安全开关"声明（泛化纪律三关卡），不针对样本：
     #   XXE   → 解析器加固开关缺失（resolve_entities/disallow-doctype 等标准参数）
@@ -535,6 +564,74 @@ _XSS_SAFE_RE = re.compile(
 # 再拼进命令行是命令注入的标准修复（shlex.quote / escapeshellarg 等）。
 _CMD_SAFE_RE = re.compile(
     r"shlex\.quote|shlex\.join|pipes\.quote|escapeshellarg|escapeshellcmd",
+    re.IGNORECASE,
+)
+
+# --- 2026-08-31 第八波：盲区层收口配套守卫 ---
+
+# JS 服务端上下文（log_injection_console 的文件级门）：console.* 的 CWE-117
+# 语义只在服务端成立（浏览器端 console 是开发工具输出，§9.20.2 "运行时双语义"）。
+# 解法不是逐行判语义，而是文件级判定——两类信号（任一命中即服务端模块）：
+#   ① require/启动 API：Node 服务端框架标准名，无第二语义；
+#   ② Express handler 惯用法：req.session/body/query/params 与
+#     res.render/send/redirect/json 只存在于服务端请求处理代码（nodegoat
+#     session.js 实锤：handler 模块自身不 require express，靠惯用法判定）。
+# 浏览器端文件（无以上形态）整类豁免。
+_JS_SERVER_CTX_RE = re.compile(
+    r"require\s*\(\s*['\"](?:express|http|https|koa|fastify|restify|@hapi/hapi|next)['\"]\s*\)"
+    r"|http\.createServer\s*\(|https\.createServer\s*\("
+    r"|\b(?:app|server|router)\.listen\s*\("
+    r"|\breq\s*\.\s*(?:session|body|query|params|headers|cookies)\b"
+    r"|\bres\s*\.\s*(?:render|send|redirect|json|status|sendFile|sendStatus)\b",
+)
+
+# 嵌套量词（ReDoS 的结构性特征）：分组内含量词、分组后紧跟量词（/([0-9]+)+/）。
+# 回溯次数随输入长度指数增长——语言级事实，与具体样本拼写无关。判定时只认
+# 出现在正则字面量/正则字符串**内部**的出现（裸写 (a+b)*c 是算术，不是正则）。
+_REDOS_NESTED_RE = re.compile(r"\((?:[^()\n\\]|\\.)*[+*]\)\s*[+*{]")
+# 动态求用（AND 条件，文件级）：只写不用的正则没有 ReDoS 攻击面。
+_REDOS_DYNAMIC_USE_RE = re.compile(
+    r"\.(?:test|match|exec|search)\s*\(\s*[A-Za-z_$]"
+    r"|\bre\.(?:match|search|fullmatch|findall|sub)\s*\(")
+
+# 弱口令策略（CWE-521）：pass/pwd 词根标识符赋值 ← `.{1,N}` 任意字符有界量词
+# 正则。语言级事实：`.{1,N}` = 接受 1~N 个**任意字符**，无字符类/长度下限
+# 要求，是最直白的弱策略声明（session.js L144 实锤：PASS_RE = /^.{1,20}$/）。
+# 词根 pass/pwd 是"口令策略"的标准命名语义（与 CWE-521 的对象一致），其他
+# 用途（搜索框长度限制）不用此命名形态。行级 AND：标识符正则 + 量词正则
+# （量词须在 /.../ 字面量或引号字符串内部，由同一正则的跨度约束保证）。
+_WEAK_PW_IDENT_RE = re.compile(r"(?:pass(?:word)?|pwd)\w*\s*=", re.IGNORECASE)
+_WEAK_PW_ANY_QUANT_RE = re.compile(
+    r"/[^/\n]*\\?\.\s*\{\s*1\s*,\s*\d{1,3}\s*\}[^/\n]*/"
+    r"|['\"][^'\"]*\\?\.\s*\{\s*1\s*,\s*\d{1,3}\s*\}[^'\"]*['\"]")
+
+# Mongo 持久化上下文（cleartext_sensitive_storage_field 用）：独立的守卫，
+# **不复用 _NOSQL_CTX_RE**——本规则的精度主门是"敏感字段直赋 + 文档持久化
+# 调用"双 AND，上下文只做第二重保险；扩 _NOSQL_CTX_RE 会连带放宽
+# nosql_query_injection 的触发面（nodegoat 的 findOne({userName: x}) 会
+# 新增噪声候选），违反"安全样本/噪声候选零新增"纪律。db.collection( 是
+# Mongo 原生驱动的专有 API（语言级事实），与 _NOSQL_CTX_RE 的 require 形态
+# 同一事实集。
+_MONGO_PERSIST_CTX_RE = re.compile(
+    r"db\s*\.\s*collection\s*\(|MongoClient|mongoose|\bmongo(?:db|js)\b",
+    re.IGNORECASE,
+)
+
+# Mongo/文档库持久化调用（对象名排除 cipher/decipher——profile-dao 实锤：
+# encrypt 工具函数里的 cipher.update( 与数据持久化无关，不能当持久化证据）。
+_MONGO_PERSIST_CALL_RE = re.compile(
+    r"(?:^|[^\w.])(?!(?:de)?cipher\b)[\w$]+\.(?:update(?:_one|_many)?|"
+    r"replace_one|insert(?:_one|_many)?|save)\s*\(")
+
+# 敏感字段「参数/变量直赋」形态（cleartext_sensitive_storage_field 用）：
+# helper/DAO 层的敏感字段以函数形参进入（updateUser = (..., ssn, ...) →
+# user.ssn = ssn;），与"请求直取"形态同构——都是敏感字段未经字段级加密
+# 进入持久化。右侧仅认**裸标识符**（= 后不是函数调用）：user.ssn = encrypt(ssn)
+# 的已加密写法天然豁免。password/passwd 不入本表（CWE-256 归盲区提醒层，
+# 见规则注释）。
+_SENSITIVE_FIELD_ASSIGN_RE = re.compile(
+    r"\.\s*(?:ccn|cc_?num|credit_?card|card_?num(?:ber)?|cardnum|cvv|cvc|ssn|"
+    r"social_?security|iban|passport_?no)\w*\s*=\s*[A-Za-z_$][\w$]*\s*[;,)\n]",
     re.IGNORECASE,
 )
 
@@ -1395,6 +1492,62 @@ class Prefilter:
             category="vuln",
         ))
 
+        # --- ReDoS·嵌套量词正则（2026-08-31 第八波，CWE-1333）---
+        # 详见 _redos_hit_line。指导文档 §9.20.2 原判"需对正则字面量做正则
+        # 分析（新能力域），列为未来规则机会"——本轮核实：嵌套量词是纯结构
+        # 特征（分组内含量词 + 分组后紧跟量词），行级正则可判，非能力域外。
+        # NodeGoat profile.js L59 实锤（/([0-9]+)+\#/，官方注释明示 ReDoS）。
+        rules.append(_Rule(
+            name="redos_nested_quantifier",
+            patterns=[],
+            match_func=lambda code: self._redos_hit_line(code) > 0,
+            line_func=lambda code: self._redos_hit_line(code),
+            category="vuln",
+        ))
+
+        # --- 服务端 console.* 日志注入（2026-08-31 第八波，CWE-117）---
+        # 详见 _console_log_hit_line。§9.20.2 原判"运行时双语义，正则层不可
+        # 判"——本轮复核：双语义可由**文件级** require/启动 API 守卫判定
+        # （_JS_SERVER_CTX_RE，Node 服务端框架标准名，无第二语义），不是
+        # 不可判。实测 nodegoat 全仓"console.非字面量参数"仅 1~2 行，
+        # "噪声不可控"的担忧不成立（那是 res.render 泛形态的问题，不是
+        # console 的问题）。浏览器端文件（无服务端上下文）整类豁免。
+        rules.append(_Rule(
+            name="log_injection_console",
+            patterns=[],
+            match_func=lambda code: (bool(_JS_SERVER_CTX_RE.search(code))
+                                     and self._console_log_hit_line(code) > 0),
+            line_func=lambda code: self._console_log_hit_line(code),
+            category="vuln",
+        ))
+
+        # --- 弱口令策略正则（2026-08-31 第八波，CWE-521）---
+        # 详见 _weak_pw_regex_line。pass/pwd 词根标识符 ← `.{1,N}` 任意字符
+        # 有界量词——最直白的弱策略声明，语言级事实，无样本拼写。
+        rules.append(_Rule(
+            name="weak_password_policy_regex",
+            patterns=[],
+            match_func=lambda code: self._weak_pw_regex_line(code) > 0,
+            line_func=lambda code: self._weak_pw_regex_line(code),
+            category="vuln",
+        ))
+
+        # --- 敏感字段明文落库·参数直赋形态（2026-08-31 第八波，CWE-312）---
+        # 详见 _cleartext_field_hit_line。与 cleartext_sensitive_storage
+        # （请求直取形态）互补：DAO/helper 层的敏感字段以**函数形参**进入
+        # （nodegoat profile-dao L62 实锤：updateUser = (..., ssn, ...) →
+        # user.ssn = ssn; → users.update(...)）。password 不入本表——密码
+        # 字段在登录流程安全样本（safe_11）同形，文件级 AND 区分不了
+        # "哈希后入库"与"明文入库"，做成 finding 会误伤；CWE-256 归
+        # blind_spots 提醒层。
+        rules.append(_Rule(
+            name="cleartext_sensitive_storage_field",
+            patterns=[],
+            match_func=lambda code: self._cleartext_field_hit_line(code) > 0,
+            line_func=lambda code: self._cleartext_field_hit_line(code),
+            category="vuln",
+        ))
+
         return rules
 
     # ------------------------------------------------------------------
@@ -1683,6 +1836,112 @@ class Prefilter:
         CSRF 校验的标准实现，会话内令牌比对不构成有告警价值的时序侧信道）。
         """
         return self._timing_hit_line(code) > 0
+
+    # ------------------------------------------------------------------
+    # 2026-08-31 第八波：盲区层收口（行号定位与匹配同源，命中行 = 漏洞主体行）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _strip_block_comments_keep_lines(code: str) -> str:
+        """剥 /* */ 块注释，用等量换行占位保行号（§9.20 教训②的共用实现）。
+
+        教学仓库把"官方修复代码"整块注释在旁（NodeGoat 风格），形态与漏洞
+        完全一致——不剥块注释会命中注释行。已在 nosql_where / 本波三条规则
+        统一使用；新的行级规则默认先走这里再逐行判。
+        """
+        return re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"),
+                      code or "", flags=re.DOTALL)
+
+    def _redos_hit_line(self, code: str) -> int:
+        """嵌套量词正则（ReDoS，CWE-1333）行号定位（1-based；0=未命中）。
+
+        结构性特征：正则字面量内部出现「分组内含量词、分组后紧跟量词」
+        （/([0-9]+)+/、/(a|aa)*$/ 形态的前者）——回溯次数随输入长度指数
+        增长。裸算术 (a+b)*c 同形但不在正则字面量内，不触发（量词正则只在
+        字面量跨度内搜索）。
+        AND 条件（文件级）：存在动态求用（.test/.match/.exec/re.match…，
+        实参为标识符）——只写不用的正则没有 ReDoS 攻击面。
+        注释处理：剥块注释（保行号）+ 整行注释；行内注释里的正则不剥
+        （已剥会在 URL // 形态误伤，属已知边界）。
+        """
+        if not _REDOS_DYNAMIC_USE_RE.search(_code_wo_comment_lines(code or "")):
+            return 0
+        code = self._strip_block_comments_keep_lines(code)
+        for i, line in enumerate(code.splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith(("//", "#", "*", "/*", "--")):
+                continue
+            # 正则字面量跨度：首字符非 *（防 // 与 /*），支持 \/ 转义
+            for m in re.finditer(r"/(?![/*])(?:[^/\\\n]|\\.)+/[gimsuy]*", line):
+                if _REDOS_NESTED_RE.search(m.group(0)):
+                    return i
+        return 0
+
+    def _console_log_hit_line(self, code: str) -> int:
+        """服务端 console.* 日志注入行号定位（1-based；0=未命中）。
+
+        调用前提（match_func 已判）：_JS_SERVER_CTX_RE 命中——console.* 的
+        CWE-117 语义只在服务端成立。行级条件：console.(log|error|warn|
+        info|debug) 的参数区在剥离字符串字面量后**仍含标识符**——注入面是
+        变量的值（含 ${} 插值，共享原语保留），纯字面量日志无注入面。
+        """
+        code = self._strip_block_comments_keep_lines(code)
+        for i, line in enumerate(code.splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith(("//", "#", "*", "/*", "--")):
+                continue
+            m = re.search(r"\bconsole\.(?:log|error|warn|info|debug)\s*\(", line)
+            if not m:
+                continue
+            # 调用整体落在行内注释后半段的形态（前置位置含 //）
+            probe = line[: m.start()]
+            if "//" in probe:
+                continue
+            bare = _strip_str_literals(line[m.end():])
+            if re.search(r"[A-Za-z_$][\w$]*", bare):
+                return i
+        return 0
+
+    def _weak_pw_regex_line(self, code: str) -> int:
+        """弱口令策略正则（CWE-521）行号定位（1-based；0=未命中）。
+
+        行级 AND：pass/pwd 词根标识符赋值（PASS_RE = / PASSWORD_RE = …）
+        + `.{1,N}` 任意字符有界量词出现在 /.../ 字面量或引号字符串内。
+        `[\S]+@[\S]+` 这类邮箱正则无数值有界量词，天然不命中。
+        """
+        code = self._strip_block_comments_keep_lines(code)
+        for i, line in enumerate(code.splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith(("//", "#", "*", "/*", "--")):
+                continue
+            if _WEAK_PW_IDENT_RE.search(line) and _WEAK_PW_ANY_QUANT_RE.search(line):
+                return i
+        return 0
+
+    def _cleartext_field_hit_line(self, code: str) -> int:
+        """敏感字段「参数直赋」落库行号定位（1-based；0=未命中）。
+
+        三重 AND（精度主门是前两个，上下文是第二重保险）：
+          ① Mongo 持久化上下文（_MONGO_PERSIST_CTX_RE：db.collection( 等
+             专有 API）——**不复用 _NOSQL_CTX_RE**，避免连带放宽
+             nosql_query_injection 触发面（见该常量处注释）；
+          ② 文档持久化调用（_MONGO_PERSIST_CALL_RE：update/insert/save，
+             对象名排除 cipher/decipher——profile-dao 的 cipher.update(
+             是加密工具函数，不能当持久化证据）；
+          ③ `obj.<敏感字段> = 裸标识符`（_SENSITIVE_FIELD_ASSIGN_RE，右侧
+             非函数调用——encrypt(ssn) 的已加密写法天然豁免）。
+        """
+        if not (_MONGO_PERSIST_CTX_RE.search(code or "")
+                and _MONGO_PERSIST_CALL_RE.search(code or "")):
+            return 0
+        code2 = self._strip_block_comments_keep_lines(code)
+        for i, line in enumerate(code2.splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith(("//", "#", "*", "/*", "--")):
+                continue
+            if _SENSITIVE_FIELD_ASSIGN_RE.search(line):
+                return i
+        return 0
+
 
     @staticmethod
     def _both_sides_external(line: str) -> bool:
@@ -2494,6 +2753,64 @@ if __name__ == "__main__":
          True, "high"),
         ("整数溢出(不触发,常量操作数)",
          'int total = PRICE_UNIT * MAX_QTY;',
+         None, "low"),
+
+        # --- 2026-08-31 第八波：盲区层收口（正样本 = NodeGoat 审计实锤形态；
+        # 负样本 = 同名 API 的常见无漏洞语义，负样本集须穷举 API 常见语义）---
+        # ReDoS：嵌套量词 + 动态求用；负样本覆盖"算术括号"与"单量词分组"
+        ("ReDoS嵌套量词(漏洞,JS字面量+test)",
+         'const regexPattern = /([0-9]+)+#/;\n'
+         'const ok = regexPattern.test(bankRouting);',
+         True, "high"),
+        ("ReDoS(不触发,算术括号非正则)",
+         'const n = (a + b) * 2;',
+         None, "low"),
+        ("ReDoS(不触发,单量词分组)",
+         'const re = /^([0-9]+)#/;\n'
+         'ok = re.test(v);',
+         None, "low"),
+        # 服务端 console 日志注入：文件级服务端门 + 剥字符串后含变量
+        ("console日志注入(漏洞,req.session门+变量参数)",
+         'const express = require("express");\n'
+         'console.log("Error: attempt to login with invalid user: ", userName);',
+         True, "high"),
+        ("console日志注入(漏洞,res.render惯用法门)",
+         'handler = (req, res) => {\n'
+         '  console.log(`user agent: ${req.headers["user-agent"]}`);\n'
+         '  res.render("index");\n'
+         '};',
+         True, "high"),
+        ("console(不触发,浏览器端无服务端门)",
+         'console.log("user clicked", evt.target);',
+         None, "low"),
+        ("console(不触发,服务端但纯字面量参数)",
+         'const express = require("express");\n'
+         'console.log("server started on port 4000");',
+         None, "low"),
+        # 弱口令策略：pass 词根 + .{1,N} 有界任意字符量词
+        ("弱口令策略(漏洞,PASS_RE={1,20})",
+         'const PASS_RE = /^.{1,20}$/;',
+         True, "high"),
+        ("弱口令策略(不触发,邮箱正则无数值有界量词)",
+         'const EMAIL_RE = /^[\\S]+@[^@]+\\.[a-z]{2,}$/;',
+         None, "low"),
+        ("弱口令策略(不触发,非pass词根)",
+         'const LIMIT_RE = /^.{1,50}$/;',
+         None, "low"),
+        # 312 参数直赋落库：mongo 上下文 + 持久化调用 + 敏感字段裸标识符直赋
+        ("312参数直赋(漏洞,ssn→users.update)",
+         'const usersCol = db.collection("users");\n'
+         'this.updateUser = (userId, ssn, callback) => {\n'
+         '  user.ssn = ssn;\n'
+         '  usersCol.update({userId: userId}, user);\n'
+         '};',
+         True, "high"),
+        ("312参数直赋(不触发,cipher.update非持久化)",
+         'const enc = `${cipher.update(data, "utf8", "hex")} ${cipher.final("hex")}`;',
+         None, "low"),
+        ("312参数直赋(不触发,已加密写法豁免)",
+         'const col = db.collection("users");\n'
+         'col.update({uid}, {ssn: encrypt(ssn)});\n',
          None, "low"),
 
         # --- 安全特征 ---
