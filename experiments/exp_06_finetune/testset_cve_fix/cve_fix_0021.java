@@ -1,4 +1,4 @@
-// Inspired by CVE-2018-1000117 (OpenMRS) - XXE in XML parser
+// Pattern reference: CVE-2018-1000117 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:XXE in XML parser
 // Real pattern: XML input parsed without disabling external entities
 import java.io.*;
 import javax.xml.parsers.*;

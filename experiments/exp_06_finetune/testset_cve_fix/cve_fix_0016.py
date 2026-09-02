@@ -1,4 +1,4 @@
-# Inspired by CVE-2018-1000229 (es-file-server) - path traversal in file read
+# Pattern reference: CVE-2018-1000229 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:path traversal in file read
 # Real pattern: filename from user input joined to base path without normalization check
 import os
 from flask import Flask, request, send_file, abort

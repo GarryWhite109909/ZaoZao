@@ -1,4 +1,4 @@
-# Inspired by CVE-2019-15052 (Pydio) - command injection in file operations
+# Pattern reference: CVE-2019-15052 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:command injection in file operations
 # Real pattern: filename from user input passed to shell command
 import os
 import subprocess

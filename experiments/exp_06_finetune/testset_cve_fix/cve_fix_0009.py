@@ -1,4 +1,4 @@
-# Inspired by CVE-2019-12419 (Apache Fineract) - SQL injection in loan schedule
+# Pattern reference: CVE-2019-12419 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:SQL injection in loan schedule
 # Real pattern: user-controlled path param concatenated into SQL query
 import sqlite3
 from flask import Flask, request, jsonify

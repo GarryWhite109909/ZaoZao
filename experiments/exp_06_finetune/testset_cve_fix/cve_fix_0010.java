@@ -1,4 +1,4 @@
-// Inspired by CVE-2020-9488 (Apache SkyWalking) - SQL injection in metric query
+// Pattern reference: CVE-2020-9488 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:SQL injection in metric query
 import java.sql.*;
 import java.util.*;
 import javax.servlet.http.*;

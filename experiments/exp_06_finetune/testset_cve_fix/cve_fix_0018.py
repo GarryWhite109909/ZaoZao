@@ -1,4 +1,4 @@
-# Inspired by CVE-2018-1000544 (OpenMRS) - hardcoded database credentials
+# Pattern reference: CVE-2018-1000544 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:hardcoded database credentials
 # Real pattern: credentials hardcoded in source code
 import mysql.connector
 from flask import Flask, jsonify

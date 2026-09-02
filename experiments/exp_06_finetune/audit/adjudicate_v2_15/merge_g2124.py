@@ -27,13 +27,24 @@ OUT_DIRS = [BASE / "corpus/repair_wave/_wave1_out_g21_22",
             BASE / "corpus/repair_wave/_wave1_out_g23_24",
             BASE / "corpus/repair_wave/_wave1_out_g23b",
             BASE / "corpus/repair_wave/_wave1_out_g24_tail",  # g24 后半并行批(与 g23_24 有重叠,按 orig 去重)
-            BASE / "corpus/repair_wave/_wave1_out_g2122_retry"]  # G4 拒收重试批
+            BASE / "corpus/repair_wave/_wave1_out_g2122_retry",  # G4 拒收重试批
+            BASE / "corpus/repair_wave/_wave1_out_g22b",  # g22b 危害具体化 + 拒收重试
+            BASE / "corpus/repair_wave/_wave1_out_g24_final",  # g24 收尾重试批(batchC)
+            BASE / "corpus/repair_wave/_wave1_out_g24_c2",  # g24-csrf-04 精简hint重试(batchC2)
+            BASE / "corpus/repair_wave/_wave1_out_g25",  # g25 safe 侧防御演示(batchC 续,D9 尾项第6项)
+            BASE / "corpus/repair_wave/_wave1_out_g26",  # g26 命令语言注入(真77)+338/329 补样
+            BASE / "corpus/repair_wave/_wave1_out_g26_retry"]  # g26 G4 拒收重试批
 GROUPS = [
     ("g21-", "g21_crypto_boundary.jsonl", "g21/crypto_boundary"),
     ("g22-", "g22_evidence_confidence.jsonl", "g22/evidence_confidence"),
+    ("g22b-", "g22_evidence_confidence.jsonl", "g22/evidence_confidence"),  # g22b 补做包回同一溯源包
     ("g23-", "g23_primary_vs_secret.jsonl", "g23/primary_vs_secret"),
     ("g23b-", "g23_primary_vs_secret.jsonl", "g23/primary_vs_secret"),  # 补做包并回同一溯源包
     ("g24-", "g24_case_anchors.jsonl", "g24/case_anchors"),
+    ("g25-", "g25_safe_defense.jsonl", "g25/safe_defense"),  # safe 侧配置/开关 + realpath 归一防御演示
+    ("g26-cmdlang-", "g26_command_language.jsonl", "g26/command_language"),  # 真 CWE-77:非 OS 命令语言注入
+    ("g26-c338-", "g26_crypto_weak_prng.jsonl", "g26/crypto_weak_prng"),  # 338 弱 PRNG 补样
+    ("g26-c329-", "g26_crypto_nonce.jsonl", "g26/crypto_nonce"),  # 329 固定 IV/nonce 补样
 ]
 OUT_LOG = BASE / "audit/adjudicate_v2_15/merge_g2124_out.txt"
 
@@ -50,6 +61,8 @@ DROP = {
     "g23-idor-02",  # 实判 798,期望 639
     "g23-authz-02",  # 实判 798,期望 862
     "g23-up-01",  # 实判 798,期望 434
+    "g23-idor-03",  # 实判 862,期望 639(近邻混淆,见 verify_g2124_out.txt;639 目标由 g23b-del/transfer 承担)
+    "g24-php-04",  # 实判 862,期望 843(in_array 松散比较近邻混淆;843 目标由 php-01/02/03 承担)
 }
 
 LOG = []

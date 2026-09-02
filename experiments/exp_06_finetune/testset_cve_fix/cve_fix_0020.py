@@ -1,4 +1,4 @@
-# Inspired by CVE-2021-26855 (ProxyLogon) - SSRF via user-controlled URL
+# Pattern reference: CVE-2021-26855 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:SSRF via user-controlled URL
 # Real pattern: user-controlled URL fetched server-side without validation
 import requests
 from flask import Flask, request, jsonify
