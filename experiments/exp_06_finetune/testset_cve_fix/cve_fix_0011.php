@@ -1,5 +1,5 @@
 <?php
-// Inspired by CVE-2021-24288 (WPCode plugin) - SQL injection in shortcode
+// Pattern reference: CVE-2021-24288 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:SQL injection in shortcode
 // Real pattern: shortcode attribute concatenated into SQL query
 
 class WPCode_Query {

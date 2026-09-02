@@ -23,7 +23,9 @@ OUT_DIRS = [BASE / "corpus/repair_wave/_wave1_out_g21_22",
             BASE / "corpus/repair_wave/_wave1_out_g23b",
             BASE / "corpus/repair_wave/_wave1_out_g24_tail",  # g24 后半并行批
             BASE / "corpus/repair_wave/_wave1_out_g2122_retry",  # G4 拒收重试批
-            BASE / "corpus/repair_wave/_wave1_out_g22b"]  # g22b 危害具体化 + 拒收重试
+            BASE / "corpus/repair_wave/_wave1_out_g22b",  # g22b 危害具体化 + 拒收重试
+            BASE / "corpus/repair_wave/_wave1_out_g24_final",  # g24 收尾重试批(batchC)
+            BASE / "corpus/repair_wave/_wave1_out_g24_c2"]  # g24-csrf-04 精简hint重试(batchC2)
 OUT_LOG = BASE / "audit/adjudicate_v2_15/verify_g2124_out.txt"
 JSON_BLOCK = re.compile(r"```json\s*(.*?)```", re.S)
 

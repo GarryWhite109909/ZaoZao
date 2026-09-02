@@ -1,4 +1,4 @@
-// Inspired by CVE-2020-27844 (StarIotLink) - command injection in device ping
+// Pattern reference: CVE-2020-27844 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:command injection in device ping
 // Real pattern: host from user input passed to child_process.exec
 const express = require('express');
 const { exec } = require('child_process');

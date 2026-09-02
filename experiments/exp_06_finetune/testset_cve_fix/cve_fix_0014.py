@@ -1,4 +1,4 @@
-# Inspired by CVE-2020-7981 (Inteno IOPS) - stored XSS in ping log
+# Pattern reference: CVE-2020-7981 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:stored XSS in ping log
 # Real pattern: user input reflected in HTML without escaping
 from flask import Flask, request, make_response
 

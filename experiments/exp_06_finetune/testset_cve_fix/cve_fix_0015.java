@@ -1,4 +1,4 @@
-// Inspired by CVE-2021-24188 (Simple Buttons) - XSS in button label
+// Pattern reference: CVE-2021-24188 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:XSS in button label
 // Real pattern: user input written to HTML output via PrintWriter without escaping
 import java.io.*;
 import javax.servlet.*;

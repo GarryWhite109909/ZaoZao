@@ -1,4 +1,4 @@
-# Inspired by CVE-2019-3398 (Confluence) - Server-Side Template Injection
+# Pattern reference: CVE-2019-3398 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:Server-Side Template Injection
 # Real pattern: user-controlled template content passed to render_template_string
 from flask import Flask, request, render_template_string, jsonify
 

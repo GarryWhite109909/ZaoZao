@@ -1,4 +1,4 @@
-// Inspired by CVE-2019-3396 (Confluence) - path traversal in zip extraction
+// Pattern reference: CVE-2019-3396 —— 模式参考(非该 CVE 的官方归因;标签基于代码形态)。原形态:path traversal in zip extraction
 // Real pattern: zip entry name joined to target dir without normalization
 import java.io.*;
 import java.util.zip.*;

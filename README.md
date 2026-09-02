@@ -2,10 +2,13 @@
 
 > 本地部署的开源大语言模型驱动的代码漏洞检测系统，对比传统基于规则的静态分析工具，验证 LLM 在代码安全审计中的语义理解优势。
 
-[![最佳模型](https://img.shields.io/badge/最佳模型-v9max-blue)](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)
+[![发布模型](https://img.shields.io/badge/发布模型-v9max-blue)](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)
 [![基座](https://img.shields.io/badge/基座-Qwen3--8B--Instruct-green)](docs/方法.md)
-[![状态](https://img.shields.io/badge/状态-两阶段架构fixed5达标-green)](规划.md)
+[![系统结果](https://img.shields.io/badge/两阶段fixed5-recall_1.000_/_FPR_0.043-green)](#核心结果)
+[![数据主线](https://img.shields.io/badge/α0.6训练集-v2_15_10167条待训-orange)](docs/实验路线图.md)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey)]()
+
+> 📖 **只想用扫描器？** 跳过本页细节，直接看[《用户手册》](docs/用户手册.md)——按任务组织的安装、上手与排查指南。
 
 ## 目录
 
@@ -79,9 +82,10 @@ bash app/launcher/start_linux_macos.sh
 3. **自动安装后端专属依赖**——若选择 Transformers / LlamaCPP，启动器会按当前 OS 与 GPU 自动下载正确的 `torch` / `transformers` / `peft` / `bitsandbytes` / `llama-cpp-python`（支持 Windows/Linux/macOS × NVIDIA/AMD/Apple/CPU）
 4. **检测并安装 Ollama**——使用 Ollama 后端时自动安装/启动（其他后端跳过）
 5. **硬件检测与自适应配置**——自动检测 GPU/CPU/RAM，按显存分档选择推理参数（`num_ctx` / `num_gpu` / 量化等级）
-6. **拉取模型**——Ollama 后端自动下载 `garrywhite109909/graduation-vuln-scanner:v9max`（约 5 GB，Q4 量化）；若拉取失败则回退到官方 `qwen3:8b`
-7. **启动后端**——FastAPI 服务监听 `http://127.0.0.1:8765`
-8. **打开浏览器**——自动跳转到 `http://localhost:8765`
+6. **拉取模型 / 定位 adapter**——Ollama 后端自动下载发布模型 `garrywhite109909/graduation-vuln-scanner:v9max`（约 5 GB，Q4 量化），拉取失败则回退官方 `qwen3:8b`；若项目 `models/` 下存在自研 LoRA adapter（α0.5 stage2），且运行时兼容，则自动切换 **Transformers 进程内后端**（保 LoRA FP16 精度）
+7. **召回传统安全工具**——自动安装 Bandit / Semgrep / Gitleaks / Trivy / pip-audit / detect-secrets（两阶段 Stage 1 工具召回依赖；缺哪个静默跳过哪个）
+8. **启动后端**——FastAPI 服务监听 `http://127.0.0.1:8765`
+9. **打开浏览器**——自动跳转到 `http://localhost:8765`
 
 > 首次启动因需下载模型（约 5 GB）或后端依赖（torch 等约 2-4 GB），耗时取决于网速，请耐心等待。后续启动通常 10 秒内完成。
 
@@ -144,18 +148,22 @@ start http://localhost:8765       # Windows
 
 ### 切换推理后端
 
-默认使用 **Ollama** 后端（兼容性最好、对硬件要求最低）。如需使用进程内后端复现论文中的 95% CVE-fix recall，可在启动器提示时选择 `Transformers` 或 `LlamaCPP`，或在启动前设置环境变量：
+后端按以下优先级**自动解析**（`graduation_project/transformers_client.py` `resolve_default_backend`）：
+
+1. `VULN_SCANNER_BACKEND` 显式设置时优先（`ollama` / `transformers` / `llamacpp`）；
+2. 配置了 `VULN_SCANNER_ADAPTER`，或 `models/` 下探测到合法 LoRA adapter（优先 α0.5 stage2）**且运行时兼容**时，自动选 **Transformers**——Q4 基座（NF4）+ FP16 LoRA 进程内推理，保 LoRA 增量精度，是论文指标的复现形态；
+3. 否则回退 **Ollama**（GGUF Q4_K_M 合并量化的发布模型 v9max）——兼容性最好、依赖最少的一键启动形态；探测到 adapter 但本机跑不动 transformers 时也会自动回退并打印告警。
 
 ```bash
 # Transformers 后端（NF4 基座 + FP16 LoRA，需 6GB+ 显存或足够内存）
 export VULN_SCANNER_BACKEND=transformers
-export VULN_SCANNER_ADAPTER=/path/to/v9max_lora
+export VULN_SCANNER_ADAPTER=/path/to/alpha05_stage2_lora
 bash app/launcher/start_linux_macos.sh
 
-# LlamaCPP 后端（Q4 GGUF + 运行时 LoRA，实验性）
+# LlamaCPP 后端（Q4 GGUF + 运行时 FP16 LoRA，实验性）
 export VULN_SCANNER_BACKEND=llamacpp
 export VULN_SCANNER_GGUF=/path/to/qwen3-8b-q4_k_m.gguf
-export VULN_SCANNER_ADAPTER=/path/to/v9max_lora
+export VULN_SCANNER_ADAPTER=/path/to/alpha05_stage2_lora
 bash app/launcher/start_linux_macos.sh
 ```
 
@@ -191,8 +199,9 @@ Windows 使用 `set` 代替 `export`。选择进程内后端后，启动器会�
 | `VULN_SCANNER_BACKEND` | 自动解析 | 推理后端：`ollama` / `transformers` / `llamacpp`；未设置但配了 `VULN_SCANNER_ADAPTER` 或在 `models/` 下探测到 adapter 时自动选 `transformers` |
 | `VULN_SCANNER_ADAPTER` | 自动探测 `models/` | Transformers/LlamaCPP 后端：LoRA adapter 目录（含 `adapter_model.safetensors`）。未设置时自动查找项目根目录 `models/` 下的合法 adapter 目录 |
 | `VULN_SCANNER_GGUF` | 无 | LlamaCPP 后端必填：Q4 GGUF 基座文件路径 |
-| `VULN_SCANNER_MODEL` | `garrywhite109909/graduation-vuln-scanner:v9max` | Ollama 模型名 |
+| `VULN_SCANNER_MODEL` | `garrywhite109909/graduation-vuln-scanner:v9max` | Ollama 后端使用的发布模型名 |
 | `VULN_SCANNER_FALLBACK_MODEL` | `qwen3:8b` | 主模型拉取失败时的回退模型 |
+| `VULN_SCANNER_RECHECK_RATE` | `0.1` | 两阶段扫描 `sampled` 组态下无候选文件的抽样复核比例（生产默认 `full_recheck` 全量复核，此变量仅 sampled 组态生效） |
 | `VULN_SCANNER_AUTO_INSTALL_DEPS` | 未设置 | `1` 强制重新检查/升级依赖；`0` 禁用自动安装（只打印手动命令） |
 | `VULN_SCANNER_PIP_INDEX` | 无 | 覆盖 pip 镜像源，例如 `https://pypi.tuna.tsinghua.edu.cn/simple` |
 | `VULN_SCANNER_RAG` | `0` | 设为 `1` 启用 RAG 知识库增强 |
@@ -216,6 +225,7 @@ Windows 使用 `set` 代替 `export`。选择进程内后端后，启动器会�
 
 | 页面 | 路径 | 功能 |
 |------|------|------|
+| 欢迎页 | `/welcome.html` | 首次访问的引导页（系统定位与入口导航） |
 | 仪表盘 | `/index.html` | 扫描历史统计、引擎健康状态、最近发现漏洞一览 |
 | 扫描工作台 | `/scan.html` | 核心扫描入口，支持四种输入方式 |
 | CWE 样本库 | `/cwe.html` | 16 类常见 CWE 漏洞的代码示例与修复方案（可搜索） |
@@ -265,7 +275,7 @@ Windows 使用 `set` 代替 `export`。选择进程内后端后，启动器会�
 |------|------|
 | 多模型投票 | 勾选后选择 ≥ 2 个模型，系统顺序加载各模型并投票聚合结果（更准但更慢） |
 | 两阶段扫描 | 系统**唯一**扫描路径（工具召回 + LLM 自一致率裁决），无需勾选即生效；本开关仅控制下方采样数设置是否可调 |
-| 自一致率采样数 | 两阶段 LLM 裁决的采样次数（1~10，默认 5）。采样越多越准、越慢；取消勾选时用默认 5 |
+| 自一致率采样数 | 两阶段 LLM 裁决的采样次数（1~10，默认 3，与论文 fixed5 评估组态一致）。采样越多越准、越慢 |
 
 > 外部工具（Bandit / Semgrep / Gitleaks / Trivy）已内置于两阶段 Stage 1 工具召回，
 > 无需单独勾选：密钥（secret）与依赖漏洞（SCA）类发现由确定性工具直接报告，
@@ -425,7 +435,7 @@ vsce package   # 生成 vuln-scanner-1.2.1.vsix
 
 #### 使用流程
 
-1. 启动后端服务（双击 `start_windows.bat`，选 Web 模式 / 插件模式 / 全部均可，后端会常驻后台）
+1. 启动后端服务（双击 `start_windows.bat` 或运行 `start_linux_macos.sh`，后端常驻后台）
 2. 在 VS Code 中打开任意项目或单个代码文件
 3. 打开代码文件 → 右键 → 「AI 漏洞扫描: 分析当前文件」
 4. 扫描结果以 Webview 面板展示，包含漏洞判定、CWE 类型、风险等级、修复建议
@@ -452,7 +462,7 @@ IntelliJ 插件提供编辑器内选中代码的扫描功能，结果以气球�
 
 #### 使用方式
 
-1. 启动后端服务（双击 `start_windows.bat`，选 Web 模式 / 插件模式 / 全部均可，后端会常驻后台）
+1. 启动后端服务（双击 `start_windows.bat` 或运行 `start_linux_macos.sh`，后端常驻后台）
 2. 在 IntelliJ IDEA 中打开任意项目或代码文件
 3. 在编辑器中**选中要扫描的代码**（未选中时扫描整个文件）
 4. 右键 → **AI 漏洞扫描**（或快捷键 `Ctrl+Shift+V`）
@@ -537,30 +547,38 @@ IntelliJ 插件提供编辑器内选中代码的扫描功能，结果以气球�
 | **工具链 fixed5（当前，干净环境）** | **1.000** | **0.043** | **0.862** | TP=53 FN=0 TN=22 FP=1，review 11 |
 
 - 唯一 FP 为 `hard_crossfile_01_input`（CWE-441 缺失型漏洞，无确定性校验手段，已知可接受遗留，论文写局限）
+- **真实 CVE 验证（CVE-fix 20 段，解析器修复后 2026-08-20）**：两阶段 recall **0.882** / strict_recall **0.882**（cwe_mismatch=0），反超纯 LLM 同模型对照（recall 0.850 / strict 0.800）——工具证据链 + 训练对齐裁决的真实收益首次在真实集上体现
 - **工具层提示质量审计**（五指标 A-E，`prompt_quality_audit.py`）：工具召回覆盖率 A 59.0% / 提示到点率 B 86.1% / 误导率 D 14.3%（剩余缺口=逻辑漏洞无专用规则，归训练侧 Nivis-α1）
 - 结果文件：`experiments/exp_07_two_stage_eval/results/exp_07_two_stage_eval.nivis-alpha0.triage_train_aligned.20260818_104203.json`；演进基线见 [docs/方法论_工具模型自适应闭环.md](docs/方法论_工具模型自适应闭环.md) §13.1b
 
+### 模型侧现状（截至 2026-09-02）
+
+- **当前最佳已评估模型 = Nivis-α0.5**（Qwen3-8B 两阶段训练：stage1 打底 + stage2 回收 dev 续训，7972 条）：纯 LLM 形态 combined 变体 recall 0.967 / FPR 0.154 / strict_recall 0.770；接两阶段工具链后即上表 fixed5（recall 1.000 / FPR 0.043）。默认运行组态为 **Transformers + α0.5 stage2 adapter**（保 LoRA FP16 精度）。
+- **Ollama Registry 发布物 = v9max**（`garrywhite109909/graduation-vuln-scanner:v9max`，Q4_K_M 合并量化）：面向一键启动用户，指标低于 HF 管道形态（见下文量化缺口说明）。
+- **Nivis-α0.6 = 下一轮训练目标，数据已就绪待训**：训练集 `final_train_chatml_alpha06_v2_15.jsonl`（**10167 条**，2026-09-02 写回冻结），历经 v2_0~v2_15 共 15 个审计版本；测试面扩至 **157 段**（87 合成 + 50 真实 CVE 滚动 dev（SHA-256 冻结）+ 20 CVE-fix），并完成 MITRE v4.20 官方目录 + NVD/GHSA 逐条核对（94% 匹配，11 处错标全部修复）。路线图见 [docs/实验路线图.md](docs/实验路线图.md)。
+
 ### 模型级结果（v9max，已发布形态）
 
-当前已发布最佳模型 **v9max**（Qwen3-8B-Instruct + 双模型蒸馏数据 7692 条，云端 A800 bf16 全精度 LoRA r=8 + rsLoRA 训练，Q4_K_M 量化部署）。后续版本 **Nivis-α0**（8616 条）与 **Nivis-α0.5**（两阶段训练：stage1 best + stage2 回收 dev 续训，7972 条）已完成训练并在 exp_07 两阶段评估中验证（见上表）。
+v9max（Qwen3-8B-Instruct + 双模型蒸馏数据 7692 条，云端 A800 bf16 全精度 LoRA r=8 + rsLoRA 训练，Q4_K_M 量化部署）是当前 Ollama Registry 上的发布模型。
 
-下表为 **HF 评估管道**（evaluate.py：NF4 4bit 基座 + FP16 LoRA 增量叠加）的结果：
+下表为 **HF 评估管道**（evaluate.py：NF4 4bit 基座 + FP16 LoRA 增量叠加）的结果，**strict 列为 2026-08-18 CWE 纠正口径**（关键词归一 + evidence 守卫 + 父子族匹配后重算，与旧"未纠正"数字不可混用）：
 
-| 测试集 | 样本数 | recall | FPR | accuracy | strict_recall |
+| 测试集 | 样本数 | recall | FPR | accuracy | strict_recall（纠正口径） |
 |---|---|---|---|---|---|
-| 合成集（87 段） | 87 | **1.000** | 0.423 | 0.874 | **0.607** |
-| CVE-fix 真实集 | 20 | **0.950** | - | - | 0.650 |
+| 合成集（87 段） | 87 | **1.000** | 0.423 | 0.874 | 0.656 |
+| CVE-fix 真实集 | 20 | **0.950** | - | 0.950 | 0.750 |
 
-**发布形态（Ollama GGUF Q4_K_M 合并量化）指标低于上表**——G0 方法学修复重跑（2026-08-08）实测：CVE-fix 真实集 recall **0.75~0.79**（base 15/19 含 1 条 parse_fail；combined 15/20）、合成集 recall 0.93~0.95。缺口来源不是"量化 vs 未量化"，而是**两种 4-bit 管道的差异**：HF 管道 LoRA 增量保持 FP16 精度，Ollama 发布形态把 base+LoRA 合并后整体压进 Q4_K_M，LoRA 信号被一并重量化。新装的 transformers 进程内后端（NF4 基座 + FP16 LoRA，设 `VULN_SCANNER_ADAPTER` 启用）可在部署侧复现 HF 管道精度。
+**发布形态（Ollama GGUF Q4_K_M 合并量化）指标低于上表**——G0 方法学修复重跑（2026-08-08）实测：CVE-fix 真实集 recall **0.75~0.79**（base 15/19 含 1 条 parse_fail；combined 15/20）、合成集 recall 0.93~0.95。缺口来源不是"量化 vs 未量化"，而是**两种 4-bit 管道的差异**：HF 管道 LoRA 增量保持 FP16 精度，Ollama 发布形态把 base+LoRA 合并后整体压进 Q4_K_M，LoRA 信号被一并重量化（transformers 后端已将 merge 通道永久关闭，从代码层锁定发布口径）。新装的 transformers 进程内后端（NF4 基座 + FP16 LoRA，设 `VULN_SCANNER_ADAPTER` 启用）可在部署侧复现 HF 管道精度。
 
-与 Qwen3-8B 零样本锚点基线对比，v9max 将 **合成集 strict_recall 从 0.459 提升到 0.607（+14.8pp）**、recall 保持 1.000（0 FN），同时将 **CVE-fix 真实集 recall 从 0.375 提升到 0.950（+57.5pp，HF 管道；Ollama 发布形态为 0.75~0.79）**，大幅增强真实漏洞检出能力（合成集虚高 59.2pp 的问题在真实集上被有效收敛）。
+与 Qwen3-8B 零样本锚点基线对比，v9max 的核心收益集中在**判别与泛化**：**CVE-fix 真实集 recall 从 0.375 提升到 0.950（+57.5pp，HF 管道；Ollama 发布形态为 0.75~0.79）**，合成集 recall 保持 1.000（0 FN）——合成集虚高 59.2pp 的问题在真实集上被有效收敛。需要如实说明的是：**CWE 归因（strict 口径）单靠 SFT 并未提升**（纠正口径下合成集 strict_recall baseline 0.705 → v9max 0.656，不升反降），归因能力的补足走的是后处理纠正（CWE Normalizer / LineNormalizer）与两阶段架构（fixed5 strict_recall 0.811）两条路——这也是本项目"SFT 收益集中在判别与格式，归因需架构补足"这一核心结论的来源。
 
-> FPR（合成集 0.423）偏高，根因是模型"模式匹配 > 深度理解"，对部分防御措施（subprocess 参数化列表、shlex.quote、whitelist+abspath）产生误报；用户结论"误报总比漏报好"，FPR 收敛留待最终模型 Nivis-alpha.1 通过 DPO/GRPO/CoT 教学解决。
+> FPR（合成集 0.423）偏高的根因是模型"模式匹配 > 深度理解"，对部分防御措施（subprocess 参数化列表、shlex.quote、whitelist+abspath）产生误报。**该问题已由两阶段架构收敛**：共形预测 + 反事实验证 + 确定性证据门的 2.5 代信任层把系统级 FPR 压到 fixed5 的 **0.043**（见上表）；模型侧的进一步收敛（DPO/GRPO 偏好优化）规划于 Nivis-α1。
 
 ```text
-strict_recall(合成集):  baseline 0.459 → v5 0.590 → v9max 0.607
-CVE-fix recall(真实集):  baseline 0.375 → v5 0.571 → v9max 0.950（HF 管道）
-                         v9max Ollama 发布形态（GGUF Q4_K_M）: 0.75~0.79（G0 重跑，2026-08-08）
+CWE-fix recall(真实集):   baseline 0.375 → v5 0.571 → v9max 0.950（HF 管道）
+                          v9max Ollama 发布形态（GGUF Q4_K_M）: 0.75~0.79（G0 重跑，2026-08-08）
+strict_recall(合成集, 纠正口径): baseline 0.705 → v9max 0.656（SFT 未注入 CWE 知识，如实披露）
+系统级（α0.5 + 两阶段工具链 fixed5）: recall 1.000 / FPR 0.043 / strict_recall 0.811
 ```
 > 完整台账见 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)；v9max 训练与评估详见 [docs/论文/第5章_训练主线.md](docs/论文/第5章_训练主线.md)。
 
@@ -568,7 +586,7 @@ CVE-fix recall(真实集):  baseline 0.375 → v5 0.571 → v9max 0.950（HF 管
 
 ## 当前状态与待决策
 
-> **截至 2026-08-18**：exp_01~05 零样本基线 + Prompt 消融已完成；exp_06 完成训练主线并发布 **v9max**；后续 **Nivis-α0 / α0.5** 已完成训练。2026-08-12~18 完成 **exp_07 两阶段工具链架构**（工具召回 + LLM 裁决 + 共形/反事实门控 + 信号回填），α0.5 上 fixed5 全量验证达标（recall 1.000 / FPR 0.043，2026-08-18 已提交推送）。最终模型 **Nivis-alpha.1** 将完成 DPO/GRPO、数据飞轮与 CoT 教学，收敛 FPR 与 CWE 归因。
+> **截至 2026-09-02**：exp_01~05 零样本基线 + Prompt 消融已完成；exp_06 完成 v2~v9 本地迭代、**v9max** 发布与 **Nivis-α0 / α0.5** 两阶段训练；exp_07 两阶段工具链架构达标（fixed5：recall 1.000 / FPR 0.043）。2026-08-22 起进入 **α0.6 数据工程**：训练集经 v2_0~v2_15 共 15 个审计版本演进至 **10167 条冻结**，测试面扩至 157 段并完成官方口径核对。下一站：α0.6 云端训练与评估（P1/P2），以及 Nivis-α1（DPO/GRPO 偏好优化，方案与脚本已就绪）。
 
 > **2026-08-08 追加**：`fix_suggestion` 已从"完整可运行修复代码（``` 围栏）"改为
 > **行号锚定的单行局部修复建议**（如 `line 3: 应改为 ...`），原因：客户端 6K~8K
@@ -580,8 +598,10 @@ CVE-fix recall(真实集):  baseline 0.375 → v5 0.571 → v9max 0.950（HF 管
 |---|---|---|
 | v9max 发布 | 双模型蒸馏 7692 条 → A800 bf16 训练 → Q4_K_M 发布为 Ollama 模型 | ✅ 已完成 |
 | Nivis-α0 / α0.5 | α0（8616 条，V3_PROMPT）→ α0.5 两阶段训练（7972 条，stage2 回收 dev） | ✅ 已训练并评估（exp_07） |
-| 两阶段架构验证 | 工具召回 + LLM 裁决 + 共形/反事实门控，α0.5 fixed5 全量达标（recall 1.000 / FPR 0.043） | ✅ 已完成（2026-08-18） |
-| Nivis-alpha.1 | DPO/GRPO 偏好优化 + 数据飞轮 + CoT 教学，收敛剩余 FPR 与 CWE 归因 | ⏳ 后续计划 |
+| 两阶段架构验证 | 工具召回 + LLM 裁决 + 共形/反事实门控，α0.5 fixed5 全量达标（recall 1.000 / FPR 0.043）；CVE-fix 真实集 0.882（解析器修复后） | ✅ 已完成（2026-08-18/20） |
+| α0.6 数据工程 | 训练集 v2_0~v2_15 共 15 版审计演进 → **v2_15 = 10167 条冻结**；6 轮递进审计（机检全量 → 语义深审 510 条 → 人工裁决 → 官方口径核对）；g20~g26 辨析组 81 条定向样本；测试面 157 段（新增 50 段真实 CVE 滚动 dev，SHA-256 冻结），MITRE v4.20 + NVD/GHSA 逐条核对、11 处错标修复 | ✅ 数据就绪（2026-09-02） |
+| α0.6 训练与评估 | 云端 SFT（复用 rsLoRA r8 配方）→ L0/L1/CVE-fix 三层回归 → 与 fixed5 逐样本 diff | ⏳ 未启动（P1/P2，见 [实验路线图](docs/实验路线图.md)） |
+| Nivis-α1 | DPO/GRPO 偏好优化 + 数据飞轮，收敛剩余 FPR 与 CWE 归因；GRPO 奖励函数（防 reward-hacking 三道闸）与 DPO 脚本已实现 | ⏳ 规划与脚本就绪，未训练 |
 
 ***
 
@@ -619,7 +639,9 @@ CVE-fix recall(真实集):  baseline 0.375 → v5 0.571 → v9max 0.950（HF 管
 | 角色 | 模型 | 阶段 |
 | --- | --- | --- |
 | 推理基座 | `qwen2.5-coder:7b` | exp_01 ~ exp_05 |
-| 训练 student(当前/已发布) | `Qwen/Qwen3-8B` + LoRA (r=8, rsLoRA) | exp_06 云端 A800 训练 v9max |
+| 训练 student(已发布) | `Qwen/Qwen3-8B` + LoRA (r=8, rsLoRA) | exp_06 云端 A800 训练 v9max |
+| 训练 student(当前最佳) | `Qwen/Qwen3-8B` + LoRA (r=8, rsLoRA)，两阶段 stage1+stage2 | exp_06 α0（8616 条）/ α0.5（7972 条） |
+| 训练 student(下一轮) | `Qwen/Qwen3-8B` + LoRA (r=8, rsLoRA) | exp_06 α0.6（训练集 v2_15 = 10167 条已冻结，待训） |
 | 训练 student(本地历史) | `Qwen/Qwen3-8B` + 4bit QLoRA (r=8, rsLoRA) | exp_06 P2 本地 SFT v5 |
 | 训练 student(历史) | Qwen2.5-Coder-7B-Base → KnItLM CPT (r=64) → merge 到 Instruct | exp_06 Phase 1-3(已归档) |
 | PD teacher(已暂缓) | `qwen3-coder:30b`（MoE） | exp_06 Phase 4(已归档) |
@@ -634,7 +656,7 @@ CVE-fix recall(真实集):  baseline 0.375 → v5 0.571 → v9max 0.950（HF 管
 
 ## 项目结构
 
-> 提示：大模型权重（`*.safetensors`/`*.gguf`）、`__pycache__/`、`*.log`、`outputs/` 中间 checkpoint 以及 `data/chroma_db/` 均已通过 [`.gitignore`](.gitignore) 排除。核心模块为 `graduation_project/`，实验按 `exp_01~06` 分阶段存放。
+> 提示：大模型权重（`*.safetensors`/`*.gguf`）、`__pycache__/`、`*.log`、`outputs/` 中间 checkpoint 以及 `data/chroma_db/` 均已通过 [`.gitignore`](.gitignore) 排除。核心模块为 `graduation_project/`，实验按 `exp_01~07` 分阶段存放（exp_07 为两阶段工具链评估）。
 
 <details>
 <summary>点击展开完整项目结构</summary>
@@ -675,9 +697,12 @@ Graduation-Project/
 │   │   ├── 对话_内部备忘.md               #     AI 对话过程记录（内部）
 │   │   └── 必须手动学习的地方_内部备忘.md #     手工操作备忘（内部）
 │   ├── 项目进展摘要.md                    #   面向导师/评审的一页纸进展摘要 ⭐
-│   ├── 方法.md                            #   训练方法体系（QLoRA SFT、rsLoRA、DPO 尝试、评估指标）
-│   ├── 过程.md                            #   实验过程记录（exp_01 ~ exp_06 时间线）
-│   ├── 论文/                              #   毕业论文章节草稿
+│   ├── 实验路线图.md                      #   alpha06 → alpha1 执行顺序权威（P0~P5 阶段依赖与 Exit 判据）⭐
+│   ├── 测试集建设方案.md                  #   评估体系细则（三层测试面 157 段）
+│   ├── 训练优化计划.md                    #   本轮 SFT 优化依据
+│   ├── 方法论_工具模型自适应闭环.md        #   exp_07 两阶段架构决策全集（4.8 万字）
+│   ├── 方法.md / 过程.md                  #   训练方法体系 / 实验过程时间线
+│   ├── 论文/                              #   毕业论文章节草稿 + 答辩素材库（素材库_论文写作素材收集.md）+ PPT 框架
 │   │   ├── 大纲.md                        #     论文结构与各章节数据映射
 │   │   ├── 第1章_绪论.md                  #     研究背景、问题、贡献
 │   │   └── 第5章_训练主线.md              #     exp_06 P0-P3 核心实验与结果
@@ -766,57 +791,29 @@ Graduation-Project/
 │   └── exp_06_finetune/                   # 阶段六：网络安全专用模型训练(Qwen3-8B 路线)
 │       ├── data/                          #   训练数据（入库以保证复现性）
 │       │   ├── README.md                  #     数据字典：每个 jsonl 的状态与生成方式
-│       │   ├── train_chatml_v5_clean.jsonl#     当前最佳 SFT 训练集（749 条）
-│       │   ├── train_chatml_v6_hard_neg.jsonl   # v6 hard-negative 失败尝试（已归档）
-│       │   ├── dpo_merged.jsonl           #     DPO 训练集（104 条，本地未使用）
-│       │   ├── dpo_fp_pairs_v5.jsonl      #     基于 v5 FP 构造的 DPO pair（6 条）
-│       │   ├── distill_corpus_annotated_v2.jsonl  # 教师 CoT 蒸馏 400 条（历史资产）
+│       │   ├── final_train_chatml_alpha06_v2_15.jsonl  # 当前训练主线 α0.6 数据（10167 条，2026-09-02 冻结）
+│       │   ├── final_train_chatml_alpha05.jsonl        # α0.5 训练集（7972 条，当前最佳模型）
+│       │   ├── final_train_chatml_v3.jsonl             # α0 训练集（8616 条）
 │       │   ├── _archive_cpt/              #     CPT 路线已归档数据
 │       │   ├── _archive_supplement/       #     Phase 3 supplement 已归档
 │       │   └── supplement_*.jsonl         #     各类对抗性补充样本（历史资产）
-│       ├── configs/                       #   TunableOp 离线调优产物（RDNA4 加速）
-│       │   ├── tunableop_untuned0.csv     #     Step 1：录制所有 GEMM shape
-│       │   └── tunableop_tuned.csv        #     Step 2：调优后的最优 kernel 选择表（训练自动加载）
-│       ├── scripts/                       #   训练 / 评估 / 数据生成脚本
-│       │   ├── train_qlora.py             #     QLoRA SFT 主训练脚本
-│       │   ├── train_dpo.py               #     DPO 训练脚本（本地不可行）
-│       │   ├── evaluate.py                #     评估脚本（支持 best/checkpoint-N/final）
-│       │   ├── build_dataset.py           #     手写样本 → train_chatml.jsonl
-│       │   ├── combine_and_augment.py     #     合并蒸馏 + 手写 + 补充样本
-│       │   ├── generate_distill_data.py   #     教师模型 CoT 蒸馏数据生成
-│       │   ├── generate_fp_dpo_pairs.py   #     从评估结果提取 FP DPO pair
-│       │   ├── merge_dpo_data.py          #     合并多版 DPO 数据
-│       │   ├── build_v6_hard_negative.py  #     构建 v6 hard-negative 数据
-│       │   ├── audit_leakage_precise.py   #     训练-测试泄漏审计
-│       │   ├── compare_results.py         #     多评估结果对比
-│       │   ├── prepare_cve_fix_testset.py #     CVE-fix 真实集抓取
-│       │   └── run_eval_suite.py          #     评估流水线驱动
+│       ├── corpus/                        #   蒸馏与审计语料（α0.6 数据工程）
+│       │   ├── rolling_dev/               #     50 段真实 CVE 滚动 dev 集（frozen_lock.json SHA-256 冻结）
+│       │   └── repair_wave/               #     g20~g26 辨析组蒸馏溯源包与教师输出
+│       ├── audit/                         #   v2.12→v2_15 六轮数据审计产物（机检/语义深审/人工裁决/官方口径核对）
+│       ├── testset_cve_fix/               #   CVE-fix 真实集 20 段（含 label_basis 官方/手写标注来源）
+│       ├── scripts/                       #   训练 / 评估 / 数据生成脚本（train_qlora / evaluate / build_alpha06_* 等）
+│       ├── cloud_train/                   #   云端 A800 训练脚本与日志（v9max）
 │       ├── outputs/                       #   训练产物（不入库；仅保留 best/，中间 checkpoint 已清理）
-│       │   ├── lora_r8_a16_e3_lr0.0001_s42_rslora_v5/best/  # 当前最佳 SFT adapter
-│       │   ├── lora_r8_a16_e3_lr0.0001_s42_rsloraqwen3_8b_sft_p2_v3/best/  # v3 adapter
-│       │   ├── lora_r8_a16_e3_lr0.0001_s42_rsloraqwen3_8b_sft_p2_v4/best/  # v4（泄漏，历史）
-│       │   ├── _archive_v6_hard_neg_failed/  # v6 失败归档
-│       │   ├── _archive_dpo_failed_4bit_grad_zero/  # DPO 失败归档
-│       │   ├── _archive_qwen25_7b/        #     Qwen2.5 时代所有 adapter
-│       │   └── knitlm_cpt_r64_a128_e1.0_lr2e-05_rslora/best/  # Phase 3 CPT（历史）
-│       ├── results/                       #   评估结果 JSON + 实验台账
-│       │   ├── EXPERIMENT_LEDGER.md       #     实验台账（每次评估必登）
-│       │   ├── baseline/                  #     Qwen3-8B 零样本基线与参考模型
-│       │   ├── v2/                        #     SFT v2 评估结果
-│       │   ├── v3/                        #     SFT v3 评估结果
-│       │   ├── v4_failed/                 #     SFT v4（已废弃，训练-测试泄漏）
-│       │   ├── v5/                        #     SFT v5 评估结果（历史最佳，已被 v9max 超越）
-│       │   ├── v6_failed/                 #     SFT v6 hard-negative（已归档）
-│       │   ├── phase1_sweep_summary.md    #     Phase 1 sweep 汇总表（历史）
-│       │   ├── phase2_summary.md          #     Phase 2 汇总表（历史）
-│       │   ├── phase3_summary.md          #     Phase 3 汇总表（历史）
-│       │   └── _archive_qwen25/           #     Qwen2.5 时代所有评估结果
-│       ├── testset_cve_fix/               #   CVE-fix 独立测试集（真实 commit，需 GITHUB_TOKEN）
-│       │   ├── cve_fix_000*.py/js/java    #     修复前代码片段
-│       │   └── manifest.json              #     测试集清单
-│       └── logs/                          #   训练日志（不入库；train_log_*.json 含 dev_loss 曲线）
-└── data/                                  # 本地持久化数据（不入库，见 .gitignore；首次运行 build_knowledge.py 后自动生成）
-    └── chroma_db/                         #   Chroma 向量数据库
+│       └── results/                       #   评估结果 JSON + 实验台账 EXPERIMENT_LEDGER.md
+│   ├── exp_07_two_stage_eval/             # 阶段七：两阶段工具链评估（fixed 系列，论文主数据）
+│   │   ├── eval_two_stage.py              #   两阶段评估驱动（--no-signal-feedback 评估隔离）
+│   │   ├── prompt_quality_audit.py        #   工具层提示质量审计五指标（A~E）
+│   │   └── results/                       #   fixed1~fixed5 结果 JSON + 信号注册表
+│   ├── prefilter_eval/                    # 附：预筛层独立评估（coverage 13.8% 实测）
+├── data/                                  # 本地持久化数据（不入库，见 .gitignore；首次运行 build_knowledge.py 后自动生成）
+│   └── chroma_db/                         #   Chroma 向量数据库（bge-m3 向量）
+└── releases/                              # 插件发布物（VS Code .vsix / IntelliJ .zip）
 ```
 
 </details>
@@ -825,7 +822,7 @@ Graduation-Project/
 
 ## 当前进度
 
-> **总体状态**：零样本推理基线（exp_01~05）已全部完成；训练主线（exp_06）完成 v2→v9 本地迭代、**v9max** 发布与 **Nivis-α0/α0.5** 训练。2026-08-12~18 完成 **exp_07 两阶段工具链架构**评估并达标（fixed5：recall 1.000 / FPR 0.043）。G0 方法学修复已全量重跑。详细进度见 [规划.md](规划.md) 与 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)。
+> **总体状态**：零样本推理基线（exp_01~05）已全部完成；训练主线（exp_06）完成 v2→v9 本地迭代、**v9max** 发布与 **Nivis-α0/α0.5** 两阶段训练；exp_07 两阶段工具链架构评估达标（fixed5：recall 1.000 / FPR 0.043）。2026-08-22 起转入 **α0.6 数据工程**（蒸馏扩充 + 六轮审计 + 官方口径核对），训练集 v2_15 = 10167 条已冻结待训。详细进度见 [规划.md](规划.md)、[docs/实验路线图.md](docs/实验路线图.md) 与 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)。
 
 ### ✅ 阶段一：LLM 漏洞检测能力摸底（exp_01，2026-06-28）
 
@@ -867,7 +864,7 @@ Graduation-Project/
 
 - **双模型 API 蒸馏**：DeepSeek V4-Flash / GLM-5.2 双模型 API 蒸馏生成大规模训练数据（Kimi K3 未参与实际蒸馏），原始约 10700 条，经 CWE 归一化、泄漏审计、矛盾/重复清洗后最终 **7692 条**（漏洞 3493 / 安全 4199，安全占比 54.6%）。计划配比 1:3，清洗后实际约 1:1.2。
 - **云端 A800 训练**：Qwen3-8B bf16 全精度 LoRA（r=8 + alpha=16 + dropout=0.1 + rsLoRA），train 6539 / dev 1153，2 epoch，lr=1e-4，max_seq 6144，1636 步，约 4.1h，train_loss ≈ 0.529。
-- **v9max 评估**（HF 管道：NF4 基座 + FP16 LoRA）：合成集 87 段 recall 1.000 / FPR 0.423 / strict_recall 0.607；真实 CVE-fix 20 段 recall 0.95 / strict_recall 0.65 / fix_extracted 17/20，大幅增强真实漏洞检出。
+- **v9max 评估**（HF 管道：NF4 基座 + FP16 LoRA）：合成集 87 段 recall 1.000 / FPR 0.423 / strict_recall 0.656（纠正口径）；真实 CVE-fix 20 段 recall 0.95 / strict_recall 0.750（纠正口径）/ fix_extracted 17/20，大幅增强真实漏洞检出。
 - **G0 方法学修复重跑（2026-08-08）**：文件名泄漏修复后全量重跑。Ollama 发布形态（GGUF Q4_K_M 合并量化）CVE-fix recall 实测 0.75~0.79（base 15/19 含 1 parse_fail；combined 15/20），与 HF 管道 0.95 的缺口来自 LoRA 增量是否保 FP16 精度；exp_05 消融结论（combined 变体最优）在 v9max 合成集上成立（FPR 19.2%→7.7%），但不迁移到真实 CVE。详见 [docs/过程.md](docs/过程.md) 2026-08-08 节。
 - **发布**：Q4_K_M 量化，发布为 Ollama 模型 `garrywhite109909/graduation-vuln-scanner:v9max`。
 - 详见 [docs/论文/第5章_训练主线.md](docs/论文/第5章_训练主线.md)、[docs/v9max_数据生成提示词.md](docs/v9max_数据生成提示词.md) 与 [docs/过程.md](docs/过程.md)
@@ -880,6 +877,14 @@ Graduation-Project/
 - **提示质量审计固化**：五指标（召回覆盖率/到点率/噪音率/误导率/一致性）脚本 `prompt_quality_audit.py`，fixed5：A 59.0% / B 86.1% / D 14.3%，作为论文"工具层提示质量"证据。
 - **评估方法学教训落档**：抑制池跨跑污染（必须 `--no-signal-feedback`）、in-sample 共形校准泄漏、测试集反向拟合=答案泄漏（严禁）、归因分流铁律（工具问题本代修、模型问题归训练侧）。
 - 详见 [docs/过程.md](docs/过程.md) 2026-08-09~18 节、[docs/会话记忆匣_20260818.md](docs/会话记忆匣_20260818.md)
+
+### ✅ 阶段九：α0.6 数据工程（2026-08-22 ~ 09-02，当前所处阶段）
+
+- **蒸馏与合并（P0.1~P0.3）**：minimal-pairs 教师蒸馏 592 条（泄漏审计 0、格式 0）→ 合并构建 alpha06-v3 训练集并冻结（8316 条，2026-08-23）→ 后续经 v2_0~v2_15 共 15 个审计版本演进，终版 **v2_15 = 10167 条**（2026-09-02 写回）。
+- **六轮递进审计**：v2.12 十项机检全量体检 → v2_13 中期审查修复 → v2_14 agent 全量审计（脚本层 10021 条 + 语义层 17 批 510 条深审，产出 72 删 / 234 修 / 19 存疑清单）→ v2_15 wave1 修复（教师漏判 13 条重蒸馏 + 转义强污染约 313 条批量修复 + 23 条逐条人工裁决）→ 官方口径测试集审查 → s9 全量非语义机检（C1~C11）。产物在 `experiments/exp_06_finetune/audit/`。
+- **辨析组定向补样**：从 α0.5 前端实拍归纳 **F1~F12 十二种实证失败模式**，构建 g20~g26 七组辨析对抗样本累计入库 81 条（密码学编号族互斥 / 证据置信度 / 主漏洞 vs 伴生凭证 / 案例锚 / 防御识别 safe / CWE-77 命令语言域）。
+- **测试面扩至 157 段 + 官方口径核对**：新增 rolling_dev 50 段真实 CVE（SHA-256 冻结锁，"不参与训练/选型"纪律）；对 87 + 50 + 20 三套测试集逐条核对 MITRE v4.20 官方目录与 NVD/GHSA 字段（68 个真实 CVE），94% 匹配、确认错标 11 处全部修复（含 P0/P1/P2 三轮），手写样本补 `label_basis` 标注区分官方归因与模式参考。
+- 详见 [docs/实验路线图.md](docs/实验路线图.md)（P0~P5 阶段依赖与 Exit 判据）与 `experiments/exp_06_finetune/audit/` 各轮审计报告
 
 ***
 
@@ -916,9 +921,12 @@ Graduation-Project/
 | P2 v8 | 对比 CoT SFT | 引入判别性对比 CoT | FN↑、FP 激增（判别焦虑 + 冲突信号） | 对比 CoT 得不偿失 |
 | P2 v9 | SFT 收敛 | 清洗冲突样本 + 多样安全代码 + 降 epoch | 数据到极限，转云端放大 | 本地数据量是硬瓶颈 |
 | P3 | DPO | `dpo_merged.jsonl` 104 条偏好对 | 本地 16GB GPU 不可行（8bit OOM、4bit 梯度失效） | 消费级 GPU 硬件约束 → 转云 |
-| **v9max** | **双模型蒸馏 + A800 训练** | 7692 条蒸馏数据 + bf16 LoRA(r=8,rsLoRA) | **合成集 recall 1.000 / FPR 0.423 / strict_recall 0.607；CVE-fix recall 0.95（HF 管道）；Ollama 发布形态 CVE-fix recall 0.75~0.79（G0 重跑）** | **本地探索 → 云端放大路线验证** |
+| **v9max** | **双模型蒸馏 + A800 训练** | 7692 条蒸馏数据 + bf16 LoRA(r=8,rsLoRA) | **合成集 recall 1.000 / FPR 0.423 / strict_recall 0.656（纠正口径）；CVE-fix recall 0.95（HF 管道）；Ollama 发布形态 CVE-fix recall 0.75~0.79（G0 重跑）** | **本地探索 → 云端放大路线验证** |
+| α0 | 数据继续清洗链 | 8616 条（quality_final + 6 个补充集，system 统一 combined） | 合成集 acc 0.953（merge + few_shot）/ FPR 0.038；CVE-fix recall 0.80~0.90（Ollama） | 二次蒸馏 + 数据清洗显著压 FPR |
+| α0.5 | 两阶段训练 | 7972 条，stage1 打底 + stage2 回收 dev 续训 | 纯 LLM combined 0.967/0.154/strict 0.770；接两阶段工具链 = fixed5 **1.000/0.043/strict 0.811** | 小样本两阶段续训 + 工具链协同达标 |
+| α0.6 | 数据工程（待训） | 训练集 v2_15 = 10167 条（15 版审计 + 辨析组 81 条），测试面 157 段官方口径核对 | 模型未训练，无指标 | 数据可信度制度化：六轮审计、逐条官方背书 |
 
-> 详细数据见 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)；方法体系见 [docs/方法.md](docs/方法.md) 与 [docs/论文/第5章_训练主线.md](docs/论文/第5章_训练主线.md)。
+> 详细数据见 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)；方法体系见 [docs/方法.md](docs/方法.md) 与 [docs/论文/第5章_训练主线.md](docs/论文/第5章_训练主线.md)。注意：表中 P2 各版本的 strict_recall 为**历史未纠正口径**，与 v9max 起标注的"纠正口径"（CWE 归一 + evidence 守卫 + 父子族匹配）不可直接对比；跨版本引用一律以纠正口径为准。
 
 **SFT 训练趋势（v2~v6）**
 
@@ -938,6 +946,8 @@ Graduation-Project/
 4. **数据可信度优先**（Qwen3-8B SFT）：v4 因训练-测试泄漏产生漂亮但不可信的指标；v5 清洗后指标更可信，也更能指导后续决策。
 5. **偏好优化受限**（DPO）：理论上可降 FPR，但本地 16GB GPU 无法承载 8B DPO 双前向，需在更大显存或云实例上验证。
 6. **本地探索 → 云端放大**：消费级 GPU 上完成小规模快速迭代（v2~v9）与方法验证，数据与配置成熟后迁移云端 A800 全精度大规模训练（v9max），兼顾探索效率与最终质量。
+7. **架构协同收敛 FPR**（α0.5 + exp_07）：模型侧 SFT 无法收敛的误报，由"工具召回 + LLM 裁决 + 共形/反事实/证据门"的两阶段信任层收敛到 fixed5 的 FPR 0.043——问题归因决定修在模型侧还是架构侧。
+8. **数据可信度制度化**（α0.6 数据工程）：从"一次性清洗"升级为"每版数据必过审计"的制度——15 个数据版本逐版构建报告、六轮递进审计、ground truth 逐条官方口径背书。
 
 ### 📌 核心论点与论文定位
 
@@ -966,7 +976,7 @@ LLM 单样本推理耗时高于传统工具，但输出包含自然语言解释�
 
 #### 3. 答辩核心故事线
 
-> 传统静态分析工具在 CI/CD 流水线中表现优秀，但面对复杂业务逻辑、绕过式过滤、跨函数污点等场景时力不从心。本系统采用**两阶段架构**：Stage 1 工具层（Semgrep 污点流 / AST 轻量污点 / 正则预筛 / 外部密钥·依赖·SAST·IaC 工具）并行召回候选 finding；Stage 2 本地部署的开源大语言模型对候选做封闭二分类裁决（N 次采样自一致率置信度），辅以 RAG 知识库、代码切片与行号纠正。在模型侧，先在本地 16GB 消费级 GPU 上通过 QLoRA 快速迭代 SFT（v2~v9）打磨方法、数据与配置，再以 **DeepSeek V4-Flash / Kimi K3 / GLM-5.2 三模型蒸馏**产出 7692 条训练数据，迁移到**云端 A800 GPU bf16 全精度训练**，发布 **v9max** 模型。v9max 将合成集 strict_recall 从 0.459 提升至 0.607、recall 保持 1.000（0 FN），并将真实 CVE-fix recall 从 0.375 大幅提升至 0.950，同时保留了可解释的修复代码与自然语言解释。FPR 偏高（0.423）的收敛作为最终模型 Nivis-alpha.1（DPO/GRPO + 数据飞轮 + CoT 教学）的后继工作。实验证明了 LLM 在代码安全审计中的差异化价值，并验证了"本地探索→云端放大"的消费级 GPU 训练路线。
+> 传统静态分析工具在 CI/CD 流水线中表现优秀，但面对复杂业务逻辑、绕过式过滤、跨函数污点等场景时力不从心。本系统采用**两阶段架构**：Stage 1 工具层（Semgrep 污点流 / AST 轻量污点 / 正则预筛 / 外部密钥·依赖·SAST·IaC 工具）并行召回候选 finding；Stage 2 本地部署的开源大语言模型对候选做封闭二分类裁决（N 次采样自一致率置信度，prompt 与训练分布对齐），辅以代码切片、CWE/行号确定性纠正与共形预测 + 反事实验证信任门控。模型侧，先在本地 16GB 消费级 GPU 上通过 QLoRA 快速迭代 SFT（v2~v9）打磨方法、数据与配置，再以 **DeepSeek V4-Flash / GLM-5.2 双模型蒸馏**产出 7692 条训练数据，迁移到**云端 A800 GPU bf16 全精度训练**发布 v9max；随后两阶段训练（stage1 + stage2 回收 dev 续训）得到 α0.5。最终系统在 87 段干净评估下达到 **recall 1.000 / FPR 0.043 / strict_recall 0.811**，并在真实 CVE-fix 集上验证（两阶段 recall 0.882）；v9max 将真实 CVE-fix recall 从 0.375 提升至 0.950（HF 管道）。当前进入 α0.6 数据工程收尾：训练集经 15 个审计版本演进至 10167 条冻结，测试面扩至 157 段并逐条对齐 MITRE/NVD 官方口径；下一步为 α0.6 云端训练与 Nivis-α1 偏好优化（DPO/GRPO，脚本与奖励函数已就绪）。实验证明了 LLM 在代码安全审计中的差异化价值，并沉淀了一套"数据可信度优先、评估隔离、归因分流"的严谨实验方法论。
 
 ***
 
@@ -979,25 +989,29 @@ LLM 单样本推理耗时高于传统工具，但输出包含自然语言解释�
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │  数据层                                                              │
-│  CVE/CWE/OWASP 知识  +  手写/蒸馏/增强 CoT 样本  +  87 段合成测试集        │
-│  + 真实 CVE-fix held-out 测试集 + DPO 偏好对（待云 GPU 复用）              │
+│  CVE/CWE/OWASP 知识  +  手写/蒸馏/增强 CoT 样本 + 辨析组对抗样本          │
+│  + 三层测试面 157 段（87 合成 + 50 真实 CVE 滚动 dev + 20 CVE-fix）      │
+│  + DPO 偏好对（待云端复用）+ α0.6 训练集 v2_15（10167 条，已冻结）         │
 └─────────────────────────────────────────────────────────────────────┘
                                   ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │  训练层（exp_06，Qwen3-8B 路线）                                       │
-│  本地 QLoRA SFT 迭代(v2~v9) ──► 三模型蒸馏 7692 条 ──► A800 bf16 训练 v9max │
-│                                           │                         │
-│                  Nivis-alpha.1: DPO/GRPO + 数据飞轮 + CoT（后续）      │
+│  本地 QLoRA SFT 迭代(v2~v9) ──► 双模型蒸馏 7692 条 ──► A800 训练 v9max   │
+│         ──► α0(8616) ──► α0.5 两阶段(7972) ──► α0.6(10167 条待训)       │
+│                  Nivis-α1: DPO/GRPO + 数据飞轮（规划，脚本就绪）         │
 └─────────────────────────────────────────────────────────────────────┘
                                   ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│  推理层（exp_01~05 + exp_06 评估）                                      │
-│  源代码 ──► AST 切片 ──► RAG 检索 CWE 知识 ──► LLM 推理 ──► 结构化 verdict │
+│  推理层（两阶段架构，exp_07）                                           │
+│  源代码 ──► Stage1 工具召回(污点/预筛/外部工具并行) ──► 有候选?           │
+│    ├─ 是 ──► Stage2 LLM 封闭裁决(N 采样自一致率) ─┐                     │
+│    └─ 否 ──► 全量 LLM 复核兜底(生产默认 full_recheck)┤→ 信任层门控        │
+│              (共形预测/反事实/确定性证据门) ──► 结构化 verdict + SARIF   │
 └─────────────────────────────────────────────────────────────────────┘
                                   ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │  评估层                                                              │
-│  严格指标（CWE 对齐） / 合成集 + CVE-fix 真实集 / 错题闭环                │
+│  严格指标（CWE 纠正口径） / 157 段三层测试面 / 提示质量五指标 / 错题闭环    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1008,7 +1022,7 @@ LLM 单样本推理耗时高于传统工具，但输出包含自然语言解释�
 | 量化 | bitsandbytes 4-bit NF4 + double quant | 8B 模型在 16 GB 显存可训 SFT（本地探索） | `train_qlora.py` |
 | LoRA 优化 | **rsLoRA**（缩放因子 1/√r） | 高 rank 训练稳定、效果优于标准 LoRA | v9max 使用 r=8, alpha=16 |
 | 监督微调 | **SFT**：Qwen3-8B + LoRA(r=8, rsLoRA) | 提升 CWE 归因与真实 CVE 泛化 | 本地 QLoRA(v2~v9) + 云端 A800 bf16(v9max) |
-| 对齐(计划) | **DPO / GRPO**（偏好优化） | 用偏好对降低 FPR、校准判断边界 | Nivis-alpha.1 阶段（云 GPU 放大） |
+| 对齐(计划) | **DPO / GRPO**（偏好优化） | 用偏好对降低 FPR、校准判断边界 | Nivis-α1 阶段（云 GPU 放大；奖励函数与训练脚本已就绪，未训练） |
 | 加速 | **AOTRITON** attention、TunableOp 离线调优 | ROCm/RDNA4 上训练加速 | `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` |
 | 数据工程 | CoT 蒸馏、数据增强、泄漏审计、错题闭环 | 保证训练数据质量与可信度 | `build_dataset.py` / `audit_leakage_precise.py` / `generate_fp_dpo_pairs.py` |
 
@@ -1018,10 +1032,11 @@ LLM 单样本推理耗时高于传统工具，但输出包含自然语言解释�
 | --- | --- | --- |
 | Stage 1 工具召回 | Semgrep taint（整文件污点流）/ TaintTracker（AST 轻量污点）/ Prefilter（正则）| 并行召回候选 finding，含 source→sink 证据链与行号锚点 |
 | Stage 1 外部工具 | Gitleaks / detect-secrets（密钥）、Trivy fs / pip-audit（依赖）、Bandit / Semgrep 规则（SAST）、Trivy config（IaC）| 位置型发现；secret/sca 直出、sast/iac 进裁决 |
-| Stage 2 LLM 裁决 | 封闭二分类（is_confirmed）+ N 次采样自一致率置信度 | 只对候选 finding 判定真伪，非开放全文生成 |
-| 知识检索 | ChromaDB + `all-MiniLM-L6-v2` / `bge-small-en-v1.5` | 72 条 CWE/OWASP 知识，Top-K 注入裁决 prompt（`VULN_SCANNER_RAG` 控制） |
+| Stage 2 LLM 裁决 | 封闭二分类（`has_vulnerability`，triage_train_aligned 与训练分布对齐；双格式解析兜底）+ N 次采样自一致率置信度 | 只对候选 finding 判定真伪，非开放全文生成 |
+| 信任层（2.5 代） | 共形预测（统计门控）+ 反事实扰动（因果门控）+ 确定性证据门（零 LLM 成本）+ 信号注册表回填 | 判定分级 confirmed/review/dismissed；模型回填工具记忆过四重门控 |
+| 知识检索 | ChromaDB + `BAAI/bge-m3`（多语言，中文知识库检索质量优先） | 72 条 CWE/OWASP 知识，Top-K 注入裁决 prompt（`VULN_SCANNER_RAG` 控制） |
 | 无候选兜底 | 抽样复核（10%）/ `no_candidate_mode=full_recheck` 全量复核 | 监控工具层漏报率；安全关键场景消除"无证据判安全" |
-| Prompt 协议 | SYSTEM_PROMPT（7 字段）+ triage schema（is_confirmed/reason/fix_suggestion）| 主扫描与裁决层分离；解析失败走约束解码兜底 |
+| Prompt 协议 | SYSTEM_PROMPT（7 字段）+ triage schema（has_vulnerability/reason/fix_suggestion，模型注册表按模型绑定 prompt 变体）| 主扫描与裁决层分离；解析失败走约束解码兜底 |
 
 ### 6.4 评估层
 
@@ -1040,7 +1055,7 @@ LLM 单样本推理耗时高于传统工具，但输出包含自然语言解释�
 | 后端服务 | FastAPI (`app/backend/main.py`) | ✅ 已上线 |
 | 前端界面 | 原生 HTML + Tailwind CSS (`app/backend/static/`) | ✅ 已上线 |
 | 批量扫描 | NDJSON 流式响应 + 前端 SSE 解析 | ✅ 已上线 |
-| 报告导出 | Markdown（`/api/report`、`/api/report/single`） | ✅ 后端已提供，前端待接入下载按钮 |
+| 报告导出 | Markdown（`/api/report`、`/api/report/single`） | ✅ 已上线（前端「下载报告」按钮 + 插件端展示） |
 | 污点流分析 | 同函数 source→sink 启发式匹配 (`graduation_project/taint_tracker.py`) | ✅ 已集成（两阶段 Stage 1 默认启用） |
 | 修复建议验证 | 语法校验 + 危险模式移除检查 (`graduation_project/fix_verifier.py` + `/api/verify-fix`) | ✅ 已上线 |
 | 外部工具召回 | Bandit / Semgrep / Gitleaks / Trivy / pip-audit / detect-secrets (`graduation_project/external_scanner.py`，内置于两阶段 Stage 1；`/api/external-scan` 保留为纯直出入口) | ✅ 已集成（工具未安装时静默跳过；secret/sca 直出、sast/iac 进裁决） |
@@ -1080,8 +1095,9 @@ LLM 单样本推理耗时高于传统工具，但输出包含自然语言解释�
 └──────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────┐
-│  训练与评估流水线（`experiments/exp_06_finetune/`）              │
-│  本地 SFT(v2~v9) → 三模型蒸馏 → A800 训练 v9max → 下一步 Nivis-alpha.1 │
+│  训练与评估流水线（`experiments/`）                              │
+│  本地 SFT(v2~v9) → 双模型蒸馏 → A800 训练 v9max                  │
+│    → α0 / α0.5 两阶段 → α0.6 数据工程(10167 条冻结) → α1 规划     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -1091,7 +1107,12 @@ LLM 单样本推理耗时高于传统工具，但输出包含自然语言解释�
 
 ### 模型发布与部署（给别人用）
 
-当前已发布模型为 **v9max**（`garrywhite109909/graduation-vuln-scanner:v9max`），启动器会自动检测并 pull。历史版本 `:v5` 仍保留，可通过设置 `VULN_SCANNER_MODEL` 切换。
+模型有两套形态，按需选择：
+
+- **Ollama Registry 发布物**：`garrywhite109909/graduation-vuln-scanner:v9max`（Q4_K_M 合并量化，约 4.7GB）——一键启动 / 无 GPU 依赖场景的默认拉取模型；
+- **HF 管道运行组态**：Transformers 后端 + **α0.5 stage2 LoRA adapter**（NF4 基座 + FP16 增量，`models/adapter_alpha05_stage2` 自动探测）——保 LoRA FP16 精度，是论文指标对应的运行形态，也是当前开发/演示的默认组态。
+
+历史版本 `:v5` 仍保留，可通过设置 `VULN_SCANNER_MODEL` 切换。
 
 #### 1. 用户侧下载并应用模型
 
@@ -1142,7 +1163,7 @@ VULN_SCANNER_MODEL=garrywhite109909/graduation-vuln-scanner:v9max python -m app.
 | CLI | `VULN_SCANNER_MODEL=... python -m app.launcher.vuln_scanner_cli scan file.py` |
 | VS Code 插件 | 在插件设置或启动脚本中设置环境变量 |
 
-缺省模型为 `garrywhite109909/graduation-vuln-scanner:v9max`（v9max，当前已发布版本）。
+缺省模型为 `garrywhite109909/graduation-vuln-scanner:v9max`（v9max，Ollama 后端默认发布物；Transformers 后端不走此变量，走 `VULN_SCANNER_ADAPTER` 自动探测）。
 
 #### 4. 重新发布模型（开发者/台式机执行）
 
@@ -1188,13 +1209,15 @@ ollama serve   # 若未启动
 
 > **环境约定**：所有实验脚本（尤其 exp\_03 / exp\_04 RAG 相关）依赖 `chromadb`、`sentence-transformers` 等包，这些只在 `graproj` conda 环境中安装。请在运行任何实验前激活该环境，否则会出现 `ModuleNotFoundError`。
 >
-> **离线运行约定**：`graduation_project/chroma_manager.py` 已强制离线模式（`HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1`），运行时不会从 HuggingFace 下载 embedding 模型。首次使用前请确保 `bge-small-en-v1.5` 已缓存到本地：
+> **离线运行约定**：`graduation_project/chroma_manager.py` 已强制离线模式（`HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1`），运行时不会从 HuggingFace 下载 embedding 模型。RAG 向量模型已选型为 **`BAAI/bge-m3`**（多语言模型——知识库以中文漏洞资料为主，原 `bge-small-en-v1.5` 仅支持英文、中文向量化质量差）。首次使用前请确保 `bge-m3` 已缓存到本地：
 >
 > ```bash
 > # 在有网络的环境执行一次即可（国内可用 HF 镜像: HF_ENDPOINT=https://hf-mirror.com）
-> python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')"
-> # 默认缓存到 ~/.cache/huggingface/hub/models--BAAI--bge-small-en-v1.5
+> python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-m3')"
+> # 默认缓存到 ~/.cache/huggingface/hub/models--BAAI--bge-m3
 > ```
+>
+> ⚠️ 若本机存在旧版 RAG 数据（`data/chroma_db/` 由 bge-small-en-v1.5 构建），必须**先删除该目录**再用新模型重建（`cd experiments/exp_03_rag_knowledge/knowledge_data && python3 build_knowledge.py`），否则新旧向量空间不一致会导致检索结果错乱。
 >
 > 若缓存路径非默认，可设置 `export CHROMA_EMBEDDING_MODEL_PATH=/path/to/local/model`。
 
@@ -1419,7 +1442,8 @@ CI = [center - margin, center + margin]
 | 问题 | 原因 | 解决方案 |
 |------|------|----------|
 | `ModuleNotFoundError: No module named 'chromadb'` | 未安装 RAG 依赖 | `pip install -r requirements.txt`（chromadb 在依赖列表中） |
-| RAG 扫描报错 `embedding model not found` | embedding 模型未缓存到本地 | 在有网络的环境执行一次：`python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')"`；国内可用 `HF_ENDPOINT=https://hf-mirror.com` 镜像 |
+| RAG 扫描报错 `embedding model not found` | embedding 模型未缓存到本地 | 在有网络的环境执行一次：`python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-m3')"`；国内可用 `HF_ENDPOINT=https://hf-mirror.com` 镜像 |
+| RAG 检索结果明显不对 | `data/chroma_db/` 由旧模型（bge-small-en-v1.5）构建，与当前 bge-m3 向量空间不一致 | 删除 `data/chroma_db/` 后重建：`cd experiments/exp_03_rag_knowledge/knowledge_data && python3 build_knowledge.py` |
 | RAG 向量库为空 | 未运行 `build_knowledge.py` 初始化知识库 | `cd experiments/exp_03_rag_knowledge/knowledge_data && python3 build_knowledge.py` |
 | 自定义 embedding 缓存路径 | 默认缓存路径 `~/.cache/huggingface/` 不可写 | `export CHROMA_EMBEDDING_MODEL_PATH=/path/to/local/model` |
 
@@ -1443,7 +1467,7 @@ CI = [center - margin, center + margin]
 
 ## 约定与备注
 
-- 本阶段聚焦核心算法验证与专用模型训练，前后端工程化框架已落地（详见"技术架构与全栈"§6.5）。仪表盘等页面仍有部分静态占位数据待接入后端。
+- 核心算法验证与专用模型训练已完成（v9max 发布 / α0.5 两阶段达标 / α0.6 数据冻结待训），前后端工程化框架已落地（详见"技术架构与全栈"§6.5）。
 - 所有实验过程、Prompt 迭代与训练日志均已保留，作为后续论文撰写的原始依据。
 - 模型名称需与 Ollama 中实际可用的模型名一致。
 - **显存管理约定**：每次实验脚本跑完必须主动从显存卸载模型（Ollama `keep_alive=0`），多模型场景下避免爆显存。`run_experiment.py` 默认在末尾卸载，如需保留加 `--keep-loaded`。

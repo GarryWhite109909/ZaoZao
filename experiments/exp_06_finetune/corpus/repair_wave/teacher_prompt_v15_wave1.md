@@ -154,16 +154,69 @@ CWE-352(攻击面是"借用已认证会话发请求",不是"脚本注入");仅�
 后 === 严格比较 / === 强比较;CWE-200/204(信息暴露/时序)至多是伴生视角,不得
 作为该场景主类型。
 
-【CWE-77 vs CWE-78 边界】CWE-78 专指 OS shell 解释层在场的命令注入:输入拼进
-命令串交给 os.system/shell=True/bash -c/Node exec 家族,shell 元字符(; | & $()
-反引号)获得解释权。CWE-77 是命令注入泛化(78 的父类):无 shell 解释层但命令或
-参数整体可控——如 subprocess/shlex.split(用户命令) 列表形式且命令名/参数由输入
-决定、非 OS 的命令解释器或库 API 执行。先判"有没有 shell 解释层",再选编号。
+【CWE-77 vs CWE-78 边界(2026-09-02 按 MITRE 官方 4.20 修正)】CWE-78 = OS 命令注入,
+**不要求 shell 解释层在场**,官方含两种亚型:①输入含命令分隔符等特殊元素,拼进命令串
+经 shell/system()/execSync 执行(元字符注入);②应用接受输入**完全选择运行哪个程序**
+——subprocess.run([user_cmd]) 列表形式、exec.Command(用户命令)、spawn(用户命令名)
+等无 shell 形态,命令名/参数整体可控,同样判 **CWE-78**(第二亚型;无 shell 时攻击者
+仅不能同行组合多条命令,危害略降但仍可控任意程序)。
+CWE-77 = 命令注入泛化父类,**专用于非 OS shell 的命令语言**注入:sed 脚本表达式
+(CVE-2022-1509)、SNMP 命令(CVE-2020-11698)、MVG 图形语言(CVE-2019-12921)、
+IMAP/SMTP 命令、LDAP/正则等自定义命令语言。**OS 命令场景一律判 78,禁止因"无
+shell"而改判 77**(官方明确警告 77 常被误用)。仅当注入目标是非 OS 的命令解释器/
+协议命令语言时才判 77。
 
 【CWE-94 vs CWE-95 边界】CWE-95:输入作为"指令"直接进入动态求值(eval()/exec()
 的求值语义,输入即被执行的表达式/语句)。CWE-94:输入作为"代码素材"参与代码
 文本的**生成**再执行(输入被拼接进生成的源码/函数体/表达式模板再 compile+exec,
 含 SpEL/OGNL 表达式注入)。输入被直接求值 → 95;输入被拼进生成的代码文本 → 94。
+
+【CWE-88 参数注入(2026-09-02 增,官方口径测试集审查 §四组1)】程序名硬编码固定、
+用户输入只落到**参数位**并能注入额外开关/选项(如 git rebase --exec <x>) →
+CWE-88。注意**评测口径**:NVD 惯例对"参数注入导致 RCE"常标 CWE-77(如 Gogs
+CVE 官方标 77),在真实 CVE 集上按 NVD 口径判 77 亦可接受;训练集一律按官方
+精确语义标 88/77(非 OS 命令语言),不做混淆。
+
+【CWE-347 vs CWE-327 双口径(2026-09-02 增,官方口径测试集审查 §四组6)】
+JWT/签名场景存在官方语义与 NVD 实践的分裂,两者都对、按来源标注:
+- **验签这一步没做/做错**(alg=none 不校验、密钥取自未验证头部) → **CWE-347**
+  (Improper Verification of Cryptographic Signature),官方语义最精确;
+- **算法本身弱/被破解**(用 MD5/SHA1 做签名摘要) → **CWE-327**。
+NVD 对部分 JWT CVE(如 Parse Server)官方标 327,测试集维持其来源标注并记
+dual-convention;蒸馏产出按上述官方语义取 347,不得因见到 NVD 标 327 而改判。
+
+【CWE-918 vs CWE-441 边界(2026-09-02 增,官方口径测试集审查 §四组4)】
+服务端替攻击者**取回 URL 内容**(fetch/urlopen 目标未校验) → CWE-918 SSRF;
+攻击者借产品的**身份/网络位置**发请求(loopback 信任、directConnect 转发,
+"request would appear to be coming from the product") → CWE-441;
+骗用户浏览器跳转到外站(响应 Location/redirect) → CWE-601。
+
+【CWE-352 不是主洞终点(2026-09-02 增)】CSRF 常只是**投递链**而非根因:若
+advisory/NVD 标了别的 CWE(如 CSV 导入 unserialize → CWE-502),主洞跟 advisory
+标根因,CSRF 仅作伴生写入 explanation(见 F10 主次规则)。
+
+## 追加层六:safe 侧防御识别(g25 防御演示组,2026-09-02 增)
+
+遇到"危险 API + 可达输入"的形状时,**先检查文件内是否存在有效防御代码,再决定是否
+判洞**,不得见到危险 sink 就默认判洞:
+
+- 配置/开关防御(实测 FP 64% 来源,模型历史 100% 全盲):显式开启安全选项 = 攻击面关闭。
+  例如 requests verify=True(且服务端证书被验证)/ ssl 默认校验上下文 / 未设
+  InsecureSkipVerify 的 TLS 配置 / 危险反序列化组件被配置禁用 / debug 关闭。
+  —— 判定:有危险 sink 但攻击面被安全配置显式关闭 → safe,explanation 锚句
+  "安全配置项被显式设置 → 对应攻击面关闭";除非文件内存在"关闭该配置"的可达路径,
+  才判 vuln。
+- realpath/归一防御(实测 FP 来源,模型历史 100% 全盲):路径在拼接/打开前先做
+  归一(realpath/normalize/Clean/Resolve)并**前缀或白名单校验**,拦截 ../ 逃逸。
+  例:realpath(user_path) 后校验 startswith(BASE_DIR) / Path.resolve 后做目录前缀
+  校验 / filepath.Clean + strings.HasPrefix / send_file 前 realpath+允许目录白名单。
+  —— 判定:归一 + 目录前缀校验(锚后内容逐字符比对,含 .. 归一后再判) → safe;
+  仅 normalize 不做前缀校验、或只做 contains 检查仍可 ../ 逃逸 → vuln(CWE-22)。
+- 区分"防御有效"与"伪防御"(对照 R8):防御须真实可达、非永假分支、非空壳组件;
+  校验目标是路径本身(归一后),不是后缀/文件名包含(可绕过)。
+
+双向要求:判 vuln 必须给出文件内攻击者可控 source 到 sink 的完整链且防御确被旁路;
+判 safe 的 explanation 必须指明"哪一行哪段防御代码关闭了哪个攻击面"并记录加固边界。
 
 ## 输出纪律(硬性)
 
