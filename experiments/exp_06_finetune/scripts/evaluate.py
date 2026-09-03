@@ -59,6 +59,7 @@ from experiments.utils import (
     load_manifest, read_sample_code, compute_detection_metrics,
     compute_repeat_metrics, save_results_json,
 )
+from experiments.scoring import build_record, instance_metrics  # 实例级 micro/macro 记账（2026-09-03）
 
 # Ollama 后端（延迟导入，仅 --ollama-model 时使用）
 _ollama_client = None
@@ -192,6 +193,13 @@ def compute_strict_metrics(results: list[dict]) -> dict:
     vuln_total_with_parse_fail = vuln_total + parse_fail_count  # 含 parse_fail 的漏洞样本
     strict_recall_with_parse_fail = strict_tp / vuln_total_with_parse_fail if vuln_total_with_parse_fail else None
 
+    # 实例级记账（2026-09-03）：strict 的"命中任一 CWE 即算"会高估多漏洞样本的
+    # 覆盖（3 个漏洞只找出 1 个记满分）。micro 按 (样本, 预期CWE) 逐实例记 0/1，
+    # macro 按 CWE 类别平均暴露小类盲区。判定复用同一套 cwe_family_match，
+    # model_cwe 提取链路与上方 strict 循环一致（experiments/scoring.py）。
+    # 只增键不改键：历史结果文件解析方不受影响。
+    inst = instance_metrics([build_record(r) for r in results])
+
     return {
         "strict_tp": strict_tp,
         "strict_fn": strict_fn,
@@ -200,6 +208,12 @@ def compute_strict_metrics(results: list[dict]) -> dict:
         "strict_recall": round(strict_recall, 4) if strict_recall is not None else None,
         "strict_recall_with_parse_fail": round(strict_recall_with_parse_fail, 4) if strict_recall_with_parse_fail is not None else None,
         "strict_accuracy": round(strict_accuracy, 4) if strict_accuracy is not None else None,
+        "instance_total": inst["instance_total"],
+        "instance_hits": inst["instance_hits"],
+        "instance_recall_micro": inst["instance_recall_micro"],
+        "instance_recall_macro": inst["instance_recall_macro"],
+        "full_coverage_rate": inst["full_coverage_rate"],
+        "per_cwe_recall": inst["per_cwe_recall"],
     }
 
 
@@ -1100,6 +1114,9 @@ def main():
         print(f"  strict_recall: {strict_metrics['strict_recall']}  (loose recall={metrics['recall']})")
         print(f"  strict_recall_with_parse_fail: {strict_metrics['strict_recall_with_parse_fail']}  (含 parse_fail 的召回率)")
         print(f"  strict_accuracy: {strict_metrics['strict_accuracy']}  (loose accuracy={metrics['accuracy']})")
+        print(f"  instance_recall_micro: {strict_metrics['instance_recall_micro']}  "
+              f"(macro={strict_metrics['instance_recall_macro']}, 全覆盖率={strict_metrics['full_coverage_rate']}, "
+              f"实例 {strict_metrics['instance_hits']}/{strict_metrics['instance_total']})")
 
         # 修复建议评估（主指标：给出建议 + 行号锚定）
         fix_verifier = FixVerifier(timeout=30)
