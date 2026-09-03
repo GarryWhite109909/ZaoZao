@@ -128,7 +128,13 @@ PREFILTER_RULE_INFO: dict[str, dict[str, str]] = {
     },
     "timing_unsafe_compare": {
         "taint_type": "Timing Attack",
-        "cwe": "CWE-208 Timing Side Channel",
+        # 2026-09-01 修正（全规则泛化审计，MITRE 官方定义核对）：
+        # 原标 CWE-208 Timing Side Channel——208 只适用于"逐字节提前退出"
+        # 的时序侧信道（如 Python == 对秘密比较）。本规则的实际命中场景
+        # 是 PHP == 松散比较（0e md5 碰撞），MITRE 定义为
+        # 843 Type Confusion（松散比较语义碰撞），不是 208。
+        # → 改标 843；审计器已建 208|843 同语义组兼容两种场景。
+        "cwe": "CWE-843 Access of Resource Using Incompatible Type",
         "risk": "Medium",
         "severity": "medium",
     },
