@@ -22,7 +22,7 @@ ax.set_xlim(0, 14)
 ax.set_ylim(0, 8)
 ax.axis("off")
 
-ax.set_title("数据可信度保障体系", fontsize=16, fontweight="bold", pad=20, color="#1a1a1a")
+ax.set_title("数据可信度保障体系", fontsize=16, fontweight="bold", pad=20, color="#24343F")
 
 # ---------- 辅助函数 ----------
 def hbox(ax, x, y, w, h, title, lines, facecolor, edgecolor, title_fs=10, text_fs=8.5):
@@ -49,11 +49,11 @@ def make_arrow(ax, x1, y1, x2, y2, color="#4a4a4a", lw=1.4):
 
 # ---------- 三列标题 ----------
 ax.text(2.3, 7.35, "问题发现", ha="center", va="center", fontsize=12,
-        fontweight="bold", color="#c62828")
+        fontweight="bold", color="#B8524A")
 ax.text(7.0, 7.35, "审计与验证机制", ha="center", va="center", fontsize=12,
-        fontweight="bold", color="#1565c0")
+        fontweight="bold", color="#4A7FA5")
 ax.text(11.7, 7.35, "评估隔离", ha="center", va="center", fontsize=12,
-        fontweight="bold", color="#2e7d32")
+        fontweight="bold", color="#4E7A72")
 
 # ---------- 三列 box（每列从同一顶部起，等距分布，底部对齐，文字不溢出） ----------
 BOX_W = 3.6
@@ -71,7 +71,7 @@ left_boxes = [
 left_ys = [COL_TOP - i * (COL_TOP - COL_BOTTOM - BOX_H) / 2 for i in range(3)]
 left_objs = []
 for (title, lines), y in zip(left_boxes, left_ys):
-    left_objs.append(hbox(ax, left_x, y, BOX_W, BOX_H, title, lines, "#c62828", "#c62828"))
+    left_objs.append(hbox(ax, left_x, y, BOX_W, BOX_H, title, lines, "#B8524A", "#B8524A"))
 
 # 中列：5 项
 center_x = 5.2
@@ -85,7 +85,7 @@ center_boxes = [
 center_ys = [COL_TOP - i * (COL_TOP - COL_BOTTOM - BOX_H) / 4 for i in range(5)]
 center_objs = []
 for (title, lines), y in zip(center_boxes, center_ys):
-    center_objs.append(hbox(ax, center_x, y, BOX_W, BOX_H, title, lines, "#1565c0", "#1565c0"))
+    center_objs.append(hbox(ax, center_x, y, BOX_W, BOX_H, title, lines, "#4A7FA5", "#4A7FA5"))
 
 # 右列：4 项
 right_x = 9.9
@@ -98,7 +98,7 @@ right_boxes = [
 right_ys = [COL_TOP - i * (COL_TOP - COL_BOTTOM - BOX_H) / 3 for i in range(4)]
 right_objs = []
 for (title, lines), y in zip(right_boxes, right_ys):
-    right_objs.append(hbox(ax, right_x, y, BOX_W, BOX_H, title, lines, "#2e7d32", "#2e7d32"))
+    right_objs.append(hbox(ax, right_x, y, BOX_W, BOX_H, title, lines, "#6FA39B", "#6FA39B"))
 
 # ---------- 底部结果框（下移消除重叠） ----------
 RB_X = 3.8
@@ -106,11 +106,11 @@ RB_Y = 0.25
 RB_W = 6.4
 RB_H = 0.85
 result_box = FancyBboxPatch((RB_X, RB_Y), RB_W, RB_H, boxstyle="round,pad=0.03,rounding_size=0.12",
-                            facecolor="#5e35b1", edgecolor="#5e35b1", linewidth=1.5, alpha=0.95)
+                            facecolor="#1F3644", edgecolor="#1F3644", linewidth=1.5, alpha=0.95)
 ax.add_patch(result_box)
 ax.text(7.0, 0.68, "fixed5 干净评估结果", ha="center", va="center",
         fontsize=11, fontweight="bold", color="white")
-ax.text(7.0, 0.42, "recall 1.000  /  FPR 0.043  /  strict_recall 0.811", ha="center", va="center",
+ax.text(7.0, 0.42, "recall 1.000  /  FPR 0.0435  /  strict_recall 0.774", ha="center", va="center",
         fontsize=9.5, color="white")
 
 rb_top = RB_Y + RB_H        # = 1.10
@@ -129,7 +129,7 @@ make_arrow(ax, right_objs[-1]["cx"], rb_top, rb_right, rb_top, color="#999999", 
 
 # ---------- 底部说明 ----------
 ax.text(7.0, 0.08, "核心原则：任何指标提升须先经「删除泄露后重跑」验证；数据可信度优先于指标绝对值。",
-        ha="center", va="center", fontsize=9.5, color="#4a4a4a")
+        ha="center", va="center", fontsize=9.5, color="#7C8B96")
 
 fig.tight_layout()
 fig.savefig("data_credibility_system.png", dpi=170)
