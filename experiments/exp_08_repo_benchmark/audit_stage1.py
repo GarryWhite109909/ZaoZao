@@ -72,6 +72,17 @@ _SEMANTIC_TO_CWE = {
     # 抽象"随机值不充分"），与 §9.9.1 的 327|916 完全同构——不应判"类型错标"。
     # （典型场景：crypto_weak_random 规则标 338，typical_19 标准答案标 330。）
     "weak random": "338|330",
+    # 2026-09-01 补（MITRE 官方定义核对，全规则泛化审计）：CWE-329 限定 CBC 模式，
+    # CWE-1204 是泛 IV 弱化（不限模式）。我们的 crypto_hardcoded_iv 规则命中
+    # "IV = b"..." "（硬编码 IV），不仅限 CBC——也可能用于 GCM/CTR 等模式。
+    # 329 和 1204 是同一缺陷的不同模式覆盖范围 → 同语义组。
+    "hardcoded iv": "329|1204",
+    # 2026-09-01 补（全规则泛化审计定性）：timing_unsafe_compare 在 PHP 弱比较
+    # 场景（== 0e 碰撞）应标 843 Type Confusion 而非 208 Timing Side Channel。
+    # MITRE 定义区分：208=时序侧信道（逐字节提前退出），843=类型混淆（松散比较
+    # 语义碰撞）。两种场景都可能合理（Python == 秘密 → 208；PHP == → 843），
+    # 故建同语义组而非改规则。
+    "timing": "208|843",
     "secret keyword": "798",
     "aws access key": "798",
     "hex high entropy string": "798",

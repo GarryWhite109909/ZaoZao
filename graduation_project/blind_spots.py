@@ -288,6 +288,51 @@ _BLIND_SPOT_RULES: list[tuple[str, re.Pattern, str, int]] = [
      re.compile(r"\bhttp\.createServer\s*\(", re.I),
      "服务端以 http 模块明文监听，工具无法判定部署链路中是否有 TLS 终结"
      "（反向代理/网关），请确认传输层加密由哪一层负责。", 2),
+
+    # =========================================================================
+    # --- 2026-09-01 第二批：盲区层缺口补齐（全规则泛化审计 r3/r4 实锤）-------
+    #
+    # 审计发现：LDAP 注入 / XML 外部实体解析 / Go 语句拼接在盲区层均为
+    # 零覆盖——形态规则（prefilter/taint_tracker）能命中部分，但盲区提醒
+    # 层没有对应规则，导致这些族在形态不精确命中时"既未修也未提醒"。
+    # =========================================================================
+
+    # --- LDAP 注入（CWE-90，盲区层原有零覆盖，prefilter 只覆盖 Python）------
+    # 语言级事实：LDAP filter 语法 "(uid=...)" 是 LDAP 查询的标准构造，
+    # 外部输入拼入 filter 字符串 = 攻击者可注入 LDAP 语法改变查询逻辑。
+    # 不限于 search_s：simple_bind 的 DN 拼接同样可注入。
+    (TRUST_BOUNDARY,
+     re.compile(r"(?:search_s?\s*\(|simple_bind\s*\(|ldap_search\s*\()"
+                r"[^)]*(?:\+\s*\w|f['\"]|\.\s*(?:format|replace)\s*\(|%\s*\w)"
+                r"|\(\s*(?:uid|cn|sn|ou|mail|dc)\s*=\s*['\"]?\s*[\.\+\{%]", re.I),
+     "外部输入被拼入 LDAP 查询过滤器，工具无法判定该值是否经过 LDAP 转义"
+     "（ldap.filter.escape_filter_chars 或参数化绑定），请确认是否存在 "
+     "LDAP 注入风险。", 3),
+
+    # --- XML 外部实体解析（CWE-611，盲区层原有零覆盖）------------------------
+    # 语言级事实：xml.etree.ElementTree.fromstring / lxml.etree.fromstring /
+    # xml.dom.minidom.parseString 是 Python XML 解析的标准 API 名。
+    # 是否禁用了外部实体取决于解析器配置（defusedxml / resolve_entities），
+    # 正则层不可判——提醒层的价值在于让模型确认解析器加固状态。
+    (SERIALIZATION,
+     re.compile(r"(?:xml\.etree\.ElementTree|xml\.dom\.minidom)"
+                r"\s*\.\s*(?:fromstring|parse|parseString)\s*\("
+                r"|(?:fromstring|parseString)\s*\(\s*(?:request\.|body|data|input)"
+                r"|xml\.parsers\.expat\b"
+                r"|libxml2\b|simplexml_load", re.I),
+     "XML 解析器直接解析外部数据，工具无法判定该解析器是否禁用了外部实体"
+     "（XXE）与 DTD，请确认是否使用了 defusedxml 或等效加固配置。", 3),
+
+    # --- Go 语句拼接（盲区层原有零覆盖，Go 工具层整体不支持）-----------------
+    # 语言级事实：Go 的 exec.Command("sh","-c",input) 是 shell 注入标准形态；
+    # db.Query("..."+input) 是 SQL 拼接标准形态。Go 工具层不支持
+    # （tree_sitter_go 未装），盲区提醒是唯一防线。
+    (FRAMEWORK,
+     re.compile(r"exec\.Command\s*\([^)]*[\"']sh[\"'][^)]*[\"']-c[\"']"
+                r"|exec\.command\s*\([^)]*[\"']sh[\"'][^)]*[\"']-c[\"']"
+                r"|(?:db\.)?(?:query|exec|queryrow)\s*\(\s*[\"`][^\"`]*\+", re.I),
+     "Go 代码检测到 shell/SQL 语句拼接，工具层不支持 Go 污点分析，"
+     "请确认拼接的内容是否包含未经净化的外部输入。", 3),
 ]
 
 # --- 授权盲区的变量流追踪（AUTHORIZATION 专用）--------------------------------
