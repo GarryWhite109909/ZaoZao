@@ -3260,3 +3260,64 @@ github-scan（本节）。
 | §8.11#1 回站领取（job_id 暂存 + 前端拉取） | main.py + scan.html | 9-01 |
 | patchpair_diff 反向样本度量修复 | exp_08_repo_benchmark/patchpair_diff.py | 9-01 |
 | 前端回站领取 / nodegoat 归因修正 / §9.26~9.30 全部记录 | 本文 §9.26~§9.30 | 9-01 |
+
+### 9.23 第九波：基线对账驱动——自研 taint 规则补结构性安全建模（2026-09-05）
+
+> 触发：纯工具基线（无 LLM 裁决）首次跑通后，混跑（官方+自研）FPR 46.2% vs
+> 纯官方 23.1%，用户质疑"规则不符合原理"。逐条验尸证实：**全部 6 个 FP
+> 增量是自研 taint 规则缺少结构性安全建模**——不是"设计内高 FPR"。
+
+#### 9.23.1 归因（87 段混跑 vs 纯官方，逐条验尸）
+
+| FP 样本 | 命中规则 | 源码事实 | 根因 |
+|---|---|---|---|
+| safe_01 / safe_05 / noise_01 / noise_02 | python-sqli-taint | `cursor.execute(query, (username, password))` 参数化 | sink 匹配**整调用**——污点流入第二实参（参数元组）也命中 |
+| safe_07 | 同上 | 参数化 + 正则校验 | 同上（参数化这一项即致命） |
+| safe_03 | python-cmdi-taint | `subprocess.run(["ping","-c","1", host])` 列表形无 shell | sink 无 shell=True 门——列表形构造上无 shell 元字符解释 |
+
+**原理分界线（本轮固化）**：
+- **结构性安全**（参数化=查询文本与数据分列实参；列表形+无 shell=无解释器；
+  类型收敛 int/float）→ **规则层必须建模**——安全由构造保证，无需语义判断，
+  官方规则同样如此（focus-metavariable 只取查询文本作 sink）；
+- **语义性防御**（replace/strip/正则校验后拼接）→ **留在裁决层**——可绕过
+  （hard_bypass 系列的存在本身就是证明），规则层建模会漏掉假防御真漏洞。
+
+此前把前者也丢给裁决层，纯工具口径 FPR 翻倍；全管线口径下这些候选虽被
+裁决否决，但属于纯浪费的裁决调用（safe 文件 5 条 × N=3 采样）。
+
+#### 9.23.2 修复（两条 yaml，全部过实测验证）
+
+| 文件 | 改动 |
+|---|---|
+| `sqli_taint.yaml` | sink 改 `patterns` + `focus-metavariable: $Q`——只取查询文本（首参），参数化传参天然不进 sink |
+| `cmdi_taint.yaml` | sink 分两组：os.system/popen/getoutput（恒经 /bin/sh）整参；subprocess 族 AND `shell=True` 门 + focus 首参 |
+
+**TP 保护核查**（改前逐一确认形态）：4 个 cmdi TP 全是 shell=True/os.system 形态
+（typical_03、bypass_02、cve_0012、hard_cve_01）；sqli TP 全是拼接进查询文本
+（1 跳变量 cve_0012 的 `cmd` 变量形态实测保留）。hard_bypass 系列（replace/strip
+假防御）不受影响——它们没有参数化/列表形结构。
+
+#### 9.23.3 验证矩阵（三场，全部通过）
+
+| 场景 | 结果 |
+|---|---|
+| 单文件直测（semgrep 1.172） | 6 FP 全消失；6 TP 全保留（含 kwarg 省略号语法 `subprocess.run(..., shell=True, ...)` 实测可用）|
+| 纯工具基线·87 段混跑 | TP37 TN20 **FP6** FN24（与纯官方**逐项一致**）——FPR 46.2%→23.1%，recall 60.7% 不变 |
+| 纯工具基线·cve_fix 混跑 | 16/20 = 80.0% 不变（0009/0012/0014/0018/0019 佐证保留）|
+| 全管线 87 段 dump 回归 | 总候选 124→119（-5 全部为安全文件垃圾候选：noise_01/02、safe_01/05/07）；**真漏洞样本 taint 候选零丢失**；零召回×真 3 段清单不变；安全样本候选 17→12 条（改善）|
+| 冒烟 | 10 PASS / 0 FAIL（semgrep 本地 taint 规则召回用例通过——链提取机制不受 focus 影响）|
+
+**预存行为澄清（非本轮回归）**：OSS semgrep 的纯 taint 候选 source/sink 文本
+一直为空（`extra.metavars` 不注入，pro 引擎的 dataflow_trace 才有）——旧版规则
+直测对照实验证实与 focus 改动无关；管线靠 TaintTracker 合并候选供链、
+prompts.py 对"链为空 taint"降级位置型信任（§五之三既有设计），行为不变。
+
+#### 9.23.4 基线数据的正确读法（写论文时用）
+
+- "自研规则在 87 段 0 增量 TP、只添 6 FP"是**文件级、无裁决层**口径的读数；
+  修复后自研规则的独立价值 = **佐证与链级证据**（87 段 15 处 + cve_fix 5 处
+  文件上与官方规则交叉命中，全管线中并入多工具候选降低单票否决风险），
+  以及修复前无法体现的"零 FP 代价"；
+- 自研 vs 官方的**定位差**应如实写：官方规则是"独立探测器"，自研规则是
+  "裁决层的候选生成器"（结构性安全在规则层、语义防御在裁决层的两层分工）；
+  修复后两条路线在纯工具口径可比（FPR 持平、语义防御类召回仍高于官方）。

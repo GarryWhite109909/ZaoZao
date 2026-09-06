@@ -32,6 +32,30 @@
 
 **红线规则**：后续任何训练后评估，recall 不得低于 0.95（红线），FPR / parse_fail / strict_recall 须有改善方算达标。
 
+### 纯基座 Qwen3-8B（transformers NF4，无 LoRA）+ combined 提示（2026-09-05/06）
+
+> 首次在 transformers 端补齐"纯基座"对照（此前基线均为 Ollama 后端/微调模型）。
+> 命令：`evaluate.py --mode baseline --variant combined --model-id models/transformers/Qwen3-8B`，
+> temperature=0 贪心解码，4bit NF4，max_new_tokens=2048，HF_HUB_OFFLINE=1。
+
+| 测试集 | 结果文件 | recall | FPR | accuracy | strict_recall | parse_fail | 平均耗时 |
+|---|---|---|---|---|---|---|---|
+| 87 合成集 | `exp_06_eval.baseline.combined.20260906_020559.json` | **0.918** (56/61) | 0.192 | 0.885 | 0.689 (CWE 不匹配 14) | 0 | 43.9s |
+| 20 CVE-fix | `exp_06_eval.baseline.combined.20260905_231805.json` | **0.750** (15/20) | -（全漏洞集） | - | 0.700 | 0 | 53.7s |
+
+**关键读数**：
+- 87 集 recall 0.918 与 α0（微调）持平，但 FPR 0.192 vs α0 0.038——**微调的主要收益在压误报**（-15.4pp）而非提召回。
+- 20 集 recall 0.750 vs v9max HF 管道 0.950——真实 CVE 上微调增益 +20pp。FN=0001/0003/0004/0005/0007，其中 0001/0005 与纯 semgrep FN 重叠（"过度信任防御"族），0002/0006 仅 semgrep 漏、基座 LLM 检出，体现工具/模型互补。
+- 与 Ollama qwen3:8b 基线锚点（recall 0.967 / FPR 0.269 / strict 0.459）相比：本口径 strict_recall 0.689 明显更高，但 prompt（combined）、后端、量化均不同，**不可直接归因单变量**，仅作参考。
+
+**纯 semgrep（仅官方规则 security-audit + owasp-top-ten 本地快照，无自研 taint 规则）对照**（exp_02 口径，2026-09-05）：
+| 测试集 | TP/FN | recall | FPR | accuracy | 结果文件（exp_02_baseline_tools/results/） |
+|---|---|---|---|---|---|
+| 87 合成集 | 37/24 | 0.607 | 0.231 | 0.655 | `exp_02_baseline_tools.nomodel.semgrep.samples.20260905_231648.json` |
+| 20 CVE-fix | 16/4 | 0.800 | - | - | `exp_02_baseline_tools.nomodel.semgrep.testset_cve_fix.20260905_231822.json` |
+
+（附：官方+自研 taint 混合规则版 87 集 recall 同 0.607 但 FPR 0.462——旧版自研 taint 规则在该集只添 6 FP 未添 TP，见 `*.20260905_230003.json`。**2026-09-05 深夜基线对账驱动修复**：sqli/cmdi taint 规则 sink 收窄为查询文本（首参），参数化查询在构造上不再匹配——复验混跑 FPR 0.231 与纯官方持平（`*.20260905_235724.json`），详见 工具层优化指导 文档与规则文件头注。）
+
 ## 二、Qwen3-8B 时代历史评估（保留供对比，不作锚点）
 
 | 时间 | 文件 | 说明 | 状态 |

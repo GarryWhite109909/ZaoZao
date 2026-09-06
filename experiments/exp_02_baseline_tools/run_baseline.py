@@ -184,13 +184,16 @@ def run_bandit(
     return result
 
 
-def run_semgrep(sample_path: Path, config: str = "auto") -> dict:
+def run_semgrep(sample_path: Path, configs: list[str] | None = None) -> dict:
     """调用 Semgrep 分析单个文件，返回统一结构。
 
     Args:
         sample_path: 待测文件
-        config: Semgrep 规则集，默认 auto（自动从 registry 拉取）
+        configs: Semgrep 规则集列表，默认 ["auto"]（自动从 registry 拉取）。
+            多个配置各自展开为一个 --config flag（如本地 registry 快照 +
+            自研 taint 规则目录，与 Stage1 external_scanner 同口径）。
     """
+    configs = configs or ["auto"]
     result = {
         "tool": "semgrep",
         "supported": True,
@@ -202,9 +205,13 @@ def run_semgrep(sample_path: Path, config: str = "auto") -> dict:
 
     start = time.time()
     try:
-        # --json 输出 JSON；--config 指定规则集；--quiet 抑制进度条
+        # --json 输出 JSON；--config 指定规则集（可多个）；--quiet 抑制进度条
+        cmd = ["semgrep", "--json", "--quiet"]
+        for cfg in configs:
+            cmd += ["--config", cfg]
+        cmd.append(str(sample_path))
         proc = subprocess.run(
-            ["semgrep", "--json", "--quiet", "--config", config, str(sample_path)],
+            cmd,
             capture_output=True,
             text=True,
             timeout=120,
@@ -251,7 +258,13 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0,
                         help="只跑前 N 个样本，0 表示全部")
     parser.add_argument("--semgrep-config", default="auto",
-                        help="Semgrep 规则集（默认 auto，可选 p/default、p/owasp 等）")
+                        help="Semgrep 规则集（默认 auto；逗号分隔可传多个，如 "
+                             "models/semgrep_rules,graduation_project/semgrep_rules）")
+    parser.add_argument("--manifest-path", type=str, default=None,
+                        help="测试集 manifest 路径（默认 exp_01 14 段；"
+                             "87 段合成集 / 20 段 CVE-fix 需显式指定）")
+    parser.add_argument("--samples-dir", type=str, default=None,
+                        help="测试集代码样本目录（默认与 manifest 同目录）")
     parser.add_argument("--bandit-min-severity", default="LOW",
                         choices=["LOW", "MEDIUM", "HIGH", "CRITICAL"],
                         help="Bandit 最小 severity 阈值（默认 LOW）")
@@ -260,8 +273,12 @@ def main() -> int:
                         help="Bandit 最小 confidence 阈值（默认 MEDIUM）")
     args = parser.parse_args()
 
+    # 测试集可覆盖（87 段合成集 / 20 段 CVE-fix），默认 exp_01 14 段
+    manifest_path = Path(args.manifest_path) if args.manifest_path else MANIFEST_PATH
+    samples_dir = Path(args.samples_dir) if args.samples_dir else manifest_path.parent
+
     try:
-        manifest, samples = load_manifest(MANIFEST_PATH)
+        manifest, samples = load_manifest(manifest_path)
     except (FileNotFoundError, KeyError) as e:
         print(f"[错误] {e}", file=sys.stderr)
         return 1
@@ -269,31 +286,35 @@ def main() -> int:
         samples = samples[: args.limit]
 
     tools_to_run = ["bandit", "semgrep"] if args.tool == "all" else [args.tool]
+    semgrep_configs = [c.strip() for c in args.semgrep_config.split(",") if c.strip()]
 
     results = new_results_envelope(
         experiment="exp_02_baseline_tools",
         tools=tools_to_run,
-        semgrep_config=args.semgrep_config,
+        semgrep_config=semgrep_configs,
         bandit_min_severity=args.bandit_min_severity,
         bandit_min_confidence=args.bandit_min_confidence,
-        samples_source=str(SAMPLES_DIR.relative_to(SCRIPT_DIR.parent)),
+        manifest_path=str(manifest_path),
+        samples_source=str(samples_dir),
     )
 
-    # 带时间戳的结果路径，避免每次运行覆盖 results.json
+    # 带时间戳的结果路径，避免每次运行覆盖 results.json；
+    # tag 附带 manifest 目录名，区分 87 合成集 / CVE-fix 20 等不同测试集
     results_path = default_results_path(
         RESULTS_DIR,
         experiment="exp_02_baseline_tools",
-        extra_tag=".".join(tools_to_run),
+        extra_tag=".".join(tools_to_run + [manifest_path.parent.name]),
     )
 
     total = len(samples)
     print(f"[信息] 共 {total} 个样本，工具: {tools_to_run}")
-    print(f"[信息] 样本目录: {SAMPLES_DIR}")
+    print(f"[信息] 测试集 manifest: {manifest_path}")
+    print(f"[信息] 样本目录: {samples_dir}")
     print(f"[信息] 结果文件: {results_path}")
 
     for idx, sample_meta in enumerate(samples, 1):
         filename = sample_meta["file"]
-        sample_path = SAMPLES_DIR / filename
+        sample_path = samples_dir / filename
         if not sample_path.exists():
             print(f"[{idx}/{total}] [跳过] 样本不存在: {sample_path}", file=sys.stderr)
             continue
@@ -320,7 +341,7 @@ def main() -> int:
                 # Bandit 按 severity/confidence 过滤后判定
                 findings_for_verdict = t_result.get("filtered_findings", t_result["findings"])
             else:
-                t_result = run_semgrep(sample_path, config=args.semgrep_config)
+                t_result = run_semgrep(sample_path, configs=semgrep_configs)
                 findings_for_verdict = t_result["findings"]
 
             # 判定：有 finding → True；无 finding 且 supported → False；不支持/出错 → None
