@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AI 漏洞扫描器 —— 一键卸载（Linux / macOS）
+# 凿凿 AI 漏洞扫描器 —— 一键卸载（Linux / macOS）
 # 用法:
 #   bash uninstall.sh              # 交互确认模式
 #   bash uninstall.sh --yes        # 全自动
@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "============================================================"
-echo "  AI 漏洞扫描器 —— 一键卸载"
+echo "  凿凿 AI 漏洞扫描器 —— 一键卸载"
 echo "  将清理：后端进程、Python 依赖、Ollama 及模型、"
 echo "          NVIDIA/ROCm/Apple 加速栈、本地数据、"
 echo "          编辑器插件、项目文件夹"

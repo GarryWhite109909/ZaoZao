@@ -1,13 +1,15 @@
 /**
- * AI 漏洞扫描器 VSCode 插件 v1.2.1
+ * 凿凿 VSCode 插件 v1.3.0
  *
  * 功能：
- *  1. 右键编辑器 → "分析当前文件" → 调用后端 API → Webview 展示结果
+ *  1. 右键编辑器 → "分析当前文件" → 调用后端 /api/analyze（两阶段：工具召回 +
+ *     LLM 裁决 + 共形/反事实/证据门信任层）→ Webview 展示结论与信任层明细
  *  2. 命令面板 → "批量扫描工作区" → 递归扫描所有代码文件 → 汇总报告
  *  3. 资源管理器右键文件夹 → "扫描指定文件夹"
- *  4. 发现漏洞时在编辑器中标记诊断波浪线（基于 source/sink 定位）
+ *  4. 漏洞诊断标记：按 adjudications[].finding.sink_line/source_line 精确定位，
+ *     支持一处文件多个漏洞；无 adjudications 时回退旧顶层字段定位（兼容旧后端）
  *  5. 状态栏显示扫描状态与漏洞计数
- *  6. 可选：保存文件时自动扫描
+ *  6. 可选：保存文件时自动扫描（1.5s 防抖合并连续保存）
  *
  * 依赖：仅用 Node.js 内置模块（http），无需 npm install
  * 调试：在 VSCode 中打开本目录，按 F5 启动扩展开发宿主
@@ -40,6 +42,13 @@ const EXT_TO_LANG = {
   ".vue": "javascript", ".svelte": "javascript",
 };
 
+// 批量扫描默认排除项（与 package.json 的 workspaceExclude 默认值一致；
+// 用户把配置清空时也回退到它，否则 findFiles 会连 node_modules 一起扫）
+const DEFAULT_EXCLUDES = [
+  "**/node_modules/**", "**/.git/**", "**/vendor/**",
+  "**/__pycache__/**", "**/dist/**", "**/build/**",
+];
+
 // 全局状态
 let diagnosticCollection;
 let statusBar;
@@ -54,13 +63,13 @@ function activate(context) {
   context.subscriptions.push(diagnosticCollection);
 
   // 输出通道
-  outputChannel = vscode.window.createOutputChannel("AI 漏洞扫描器");
+  outputChannel = vscode.window.createOutputChannel("凿凿");
   context.subscriptions.push(outputChannel);
 
   // 状态栏
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
   statusBar.command = "vulnScanner.scanWorkspace";
-  statusBar.text = "$(shield) 漏洞扫描";
+  statusBar.text = "$(shield) 凿凿扫描";
   statusBar.tooltip = "点击批量扫描工作区";
   statusBar.show();
   context.subscriptions.push(statusBar);
@@ -121,7 +130,7 @@ function activate(context) {
     "vulnScanner.clearDiagnostics",
     () => {
       diagnosticCollection.clear();
-      statusBar.text = "$(shield) 漏洞扫描";
+      statusBar.text = "$(shield) 凿凿扫描";
       statusBar.tooltip = "点击批量扫描工作区";
       statusBar.backgroundColor = undefined; // 同时清除漏洞告警的红色背景
       vscode.window.showInformationMessage("已清除所有漏洞诊断标记");
@@ -133,24 +142,37 @@ function activate(context) {
   // ---- 保存后自动扫描 ----
   // 注意：必须用 onDidSave（保存完成后异步触发），不能用 onWillSave + waitUntil——
   // 后者会让 VSCode 等待扫描请求（最长 requestTimeout，默认 300s）才真正落盘，卡死保存。
+  // 防抖（1.5s）：格式化/多步保存会连续触发 onDidSave，逐次发请求会让两阶段扫描
+  // 在调度队列里互相排队、状态栏来回跳；合并为最后一次保存后统一扫。
+  let saveTimer = null;
+  let savePendingDoc = null;
   const saveListener = vscode.workspace.onDidSaveTextDocument((doc) => {
     const config = vscode.workspace.getConfiguration("vulnScanner");
     if (!config.get("autoScanOnSave", false)) return;
     if (!isSupportedDoc(doc)) return;
 
-    // 异步执行，不阻塞保存流程；失败时仅提示，不清除已有诊断
-    (async () => {
-      statusBar.text = "$(loading~spin) 保存后自动扫描中...";
-      statusBar.tooltip = `正在扫描: ${vscode.workspace.asRelativePath(doc.uri)}`;
-      const result = await callAnalyzeApi(doc, undefined, "single");
-      if (result && !result.error && result.has_vulnerability !== undefined) {
-        applyDiagnostics(doc, result);
-        updateStatusBarForSingle(result);
-      } else if (result && result.error) {
-        statusBar.text = "$(shield) 自动扫描失败";
-        statusBar.tooltip = result.error;
-      }
-    })();
+    savePendingDoc = doc; // 连续保存只保留最后一个版本
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      const pending = savePendingDoc;
+      savePendingDoc = null;
+      if (!pending) return;
+
+      // 异步执行，不阻塞保存流程；失败时仅提示，不清除已有诊断
+      (async () => {
+        statusBar.text = "$(loading~spin) 保存后自动扫描中...";
+        statusBar.tooltip = `正在扫描: ${vscode.workspace.asRelativePath(pending.uri)}`;
+        const result = await callAnalyzeApi(pending, undefined, "single");
+        if (result && !result.error && result.has_vulnerability !== undefined) {
+          applyDiagnostics(pending, result);
+          updateStatusBarForSingle(result);
+        } else if (result && result.error) {
+          statusBar.text = "$(shield) 自动扫描失败";
+          statusBar.tooltip = result.error;
+        }
+      })();
+    }, 1500);
   });
   context.subscriptions.push(saveListener);
 }
@@ -182,7 +204,7 @@ async function analyzeDocument(doc, context) {
   const result = await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: `AI 漏洞扫描: ${filename}`,
+      title: `凿凿扫描: ${filename}`,
       cancellable: false,
     },
     async () => {
@@ -337,13 +359,15 @@ async function scanFolder(folderUri, context) {
 async function collectFiles(baseUri, maxResults) {
   if (maxResults <= 0) return [];
   const config = vscode.workspace.getConfiguration("vulnScanner");
-  const excludePatterns = config.get("workspaceExclude", []);
+  // 用户清空 workspaceExclude 时回退默认值（空数组 = 不排除任何目录，会扫进 node_modules）
+  const configured = config.get("workspaceExclude", DEFAULT_EXCLUDES);
+  const excludePatterns = Array.isArray(configured) && configured.length ? configured : DEFAULT_EXCLUDES;
 
   const includePattern = new vscode.RelativePattern(
     baseUri.fsPath,
     "**/*.{py,js,ts,jsx,tsx,java,php,go,html,htm,vue,svelte}"
   );
-  const excludePattern = excludePatterns.length ? `{${excludePatterns.join(",")}}` : null;
+  const excludePattern = `{${excludePatterns.join(",")}}`;
 
   try {
     return await vscode.workspace.findFiles(includePattern, excludePattern, maxResults);
@@ -380,7 +404,7 @@ async function runBatchScan(files, label, context) {
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "AI 漏洞扫描: 批量扫描",
+      title: "凿凿扫描: 批量扫描",
       cancellable: true,
     },
     async (progress, token) => {
@@ -499,6 +523,43 @@ function extToLangId(fileUri) {
 // ---------------------------------------------------------------------------
 // 诊断标记
 // ---------------------------------------------------------------------------
+/**
+ * 从扫描结果提取诊断目标（一处目标 = 一个漏洞）。
+ *
+ * 两阶段响应：每个 confirmed 的 adjudication 一处，定位用 finding 的
+ * sink_line/source_line 精确行号（后端结构化行号，比文本解析可靠）；
+ * 旧后端（无 adjudications）：回退顶层 sink/source 文本定位。
+ */
+function collectDiagnosticTargets(result) {
+  const targets = [];
+  if (Array.isArray(result.adjudications)) {
+    for (const adj of result.adjudications) {
+      if (!adj || adj.confirmed !== true) continue;
+      const f = adj.finding || {};
+      const line = [f.sink_line, f.source_line].find((n) => Number.isInteger(n) && n > 0);
+      targets.push({
+        severity: mapRiskToSeverity(f.severity || result.risk_level),
+        line: line || null, // 1 起始；null = 需文本定位
+        sink: f.sink || result.sink,
+        source: f.source || result.source,
+        type: adj.vulnerability_type || f.taint_type || result.vulnerability_type || "",
+        message: adj.reasoning || result.explanation || "",
+      });
+    }
+  }
+  if (!targets.length && result.has_vulnerability === true) {
+    targets.push({
+      severity: mapRiskToSeverity(result.risk_level),
+      line: null,
+      sink: result.sink,
+      source: result.source,
+      type: result.vulnerability_type || "",
+      message: result.explanation || "",
+    });
+  }
+  return targets;
+}
+
 function applyDiagnostics(doc, result) {
   if (!diagnosticCollection) return;
   if (result.has_vulnerability !== true) {
@@ -507,55 +568,59 @@ function applyDiagnostics(doc, result) {
     return;
   }
 
-  const severity = mapRiskToSeverity(result.risk_level);
   const code = doc.getText();
   const lines = code.split("\n");
-
   const diagnostics = [];
+  const usedLines = new Set(); // 同一行多个 finding 合并为一条，避免波浪线叠加
 
-  // 基于 sink / source 定位漏洞行
-  const locators = [result.sink, result.source].filter((s) => s && s !== "N/A");
-  let located = false;
-
-  for (const locator of locators) {
-    if (located) break;
-    // 优先解析 `line N:` 行号锚点（模型输出的精确行号，比 token 匹配可靠）
-    const anchoredLine = extractLineAnchor(locator);
-    if (anchoredLine !== null) {
-      const i = anchoredLine - 1;
-      if (i >= 0 && i < lines.length) {
-        diagnostics.push(makeDiagnosticAtLine(i, lines, result, severity));
-        located = true;
-        break;
-      }
-    }
-    // 无有效锚点时才回退到 token 匹配（可能误标首个同名标识符行）
-    const tokens = extractTokens(locator);
-    for (const token of tokens) {
-      if (located) break;
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].includes(token)) {
-          diagnostics.push(makeDiagnosticAtLine(i, lines, result, severity));
-          located = true;
-          break;
-        }
-      }
+  for (const target of collectDiagnosticTargets(result)) {
+    const located = locateTargetLine(target, lines);
+    if (located !== null) {
+      if (usedLines.has(located)) continue;
+      usedLines.add(located);
+      diagnostics.push(makeDiagnosticAtLine(located, lines, target));
     }
   }
 
-  // 定位失败：标记第一行
-  if (!located) {
+  // 全部定位失败：标记第一行（文件级兜底）
+  if (!diagnostics.length) {
     const range = new vscode.Range(0, 0, 0, lines[0] ? lines[0].length : 0);
     diagnostics.push(
       new vscode.Diagnostic(
         range,
         `[${result.vulnerability_type}] ${result.risk_level} — ${result.explanation || "发现漏洞"}`,
-        severity
+        mapRiskToSeverity(result.risk_level)
       )
     );
   }
 
   diagnosticCollection.set(doc.uri, diagnostics);
+}
+
+/** 把一个诊断目标定位到行号（0 起始）；失败返回 null。 */
+function locateTargetLine(target, lines) {
+  // 1) 后端结构化行号（1 起始）直接换算
+  if (target.line !== null && target.line <= lines.length) {
+    return target.line - 1;
+  }
+  // 2) 顶层 sink/source 文本里的 `line N:` 锚点
+  for (const locator of [target.sink, target.source]) {
+    if (!locator || locator === "N/A") continue;
+    const anchored = extractLineAnchor(locator);
+    if (anchored !== null && anchored - 1 < lines.length) {
+      return anchored - 1;
+    }
+  }
+  // 3) 无锚点时回退 token 匹配（可能误标首个同名标识符行）
+  for (const locator of [target.sink, target.source]) {
+    if (!locator || locator === "N/A") continue;
+    for (const token of extractTokens(locator)) {
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].includes(token)) return i;
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -570,16 +635,16 @@ function extractLineAnchor(text) {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
-/** 构造第 i 行（0 起始）的诊断对象。 */
-function makeDiagnosticAtLine(i, lines, result, severity) {
+/** 构造第 i 行（0 起始）的诊断对象。target 为 collectDiagnosticTargets 的条目。 */
+function makeDiagnosticAtLine(i, lines, target) {
   const line = lines[i] || "";
   const startChar = line.search(/\S/);
   const col = startChar >= 0 ? startChar : 0;
   const range = new vscode.Range(i, col, i, line.length);
   return new vscode.Diagnostic(
     range,
-    `[${result.vulnerability_type}] ${result.risk_level} — ${result.explanation || result.sink}`,
-    severity
+    `[${target.type}] — ${target.message || target.sink || "发现漏洞"}`,
+    target.severity
   );
 }
 
@@ -715,6 +780,76 @@ function showBatchPanel(results, vulnerable, safe, errors, context) {
   batchPanel.webview.html = renderBatchHtml(results, vulnList, vulnerable, safe, errors, iconUri, wordUri);
 }
 
+// ---- 信任层展示辅助：decision / 共形 / 反事实 / 证据门 的中文标签 ----
+function decisionLabel(d) {
+  const map = {
+    confirmed_vulnerability: "确认漏洞（高置信）",
+    confirmed_review: "确认漏洞（建议复核）",
+    dismissed_safe: "驳回（高置信安全）",
+    dismissed_review: "驳回（低置信）",
+    direct: "确定性直出（密钥/依赖，无 LLM 采样）",
+  };
+  return map[d] || d || "—";
+}
+
+function conformalLabel(c) {
+  const map = { vulnerable: "判漏洞", safe: "判安全", uncertain: "不确定" };
+  return map[c] || c || "—";
+}
+
+function counterfactualLabel(cf) {
+  if (!cf || typeof cf !== "object") return "未启用";
+  if (!cf.applicable) return "不适用";
+  if (cf.flipped === true) return "扰动后翻转（模型理解防御，结论降级）";
+  if (cf.already_defended) return "原代码已有防御（候选多为误报）";
+  if (cf.flipped === false) return "扰动后结论不变（非模式匹配）";
+  return "不可判定";
+}
+
+function gateLabel(g) {
+  const map = { sink_defended: "sink 已有防御", no_input_entry: "无输入入口" };
+  return map[g] || g;
+}
+
+/** 两阶段信任层区块：裁决明细 + 人工复核清单。非两阶段响应返回空串。 */
+function trustSectionHtml(r) {
+  if (!Array.isArray(r.adjudications) || !r.adjudications.length) return "";
+  const rows = r.adjudications
+    .map((adj) => {
+      if (!adj) return "";
+      const f = adj.finding || {};
+      const confirmed = adj.confirmed === true;
+      const conf = typeof adj.confidence === "number" ? `${Math.round(adj.confidence * 100)}%` : "—";
+      const votes = `${adj.votes_true ?? 0} 真 / ${adj.votes_false ?? 0} 假 / ${adj.votes_invalid ?? 0} 无效`;
+      const line = [f.sink_line, f.source_line].find((n) => Number.isInteger(n) && n > 0);
+      const cf = counterfactualLabel(adj.counterfactual);
+      return `<tr>
+<td><span class="verdict ${confirmed ? "v-yes" : "v-no"}">${confirmed ? "判真" : "驳回"}</span></td>
+<td>${escapeHtml(decisionLabel(adj.decision))}<br><span class="sub">置信度 ${escapeHtml(conf)}（${escapeHtml(votes)}）</span></td>
+<td>${escapeHtml(adj.vulnerability_type || f.taint_type || "—")}</td>
+<td>共形 ${escapeHtml(conformalLabel(adj.conformal_set))}<br><span class="sub">反事实: ${escapeHtml(cf)}</span></td>
+<td>${escapeHtml(line ? `第 ${line} 行` : "—")}<br><span class="sub">${adj.evidence_gate ? "证据门: " + escapeHtml(gateLabel(adj.evidence_gate)) : "未拦截"}</span></td>
+</tr>`;
+    })
+    .join("");
+
+  let reviewerHtml = "";
+  if (Array.isArray(r.reviewer_findings) && r.reviewer_findings.length) {
+    const items = r.reviewer_findings
+      .map((rv) => {
+        const f = rv.finding || {};
+        const conf = typeof rv.confidence === "number" ? `${Math.round(rv.confidence * 100)}%` : "—";
+        return `<li>${escapeHtml(rv.vulnerability_type || f.taint_type || "未知类型")} — 置信度 ${escapeHtml(conf)}，${escapeHtml(decisionLabel(rv.decision))}</li>`;
+      })
+      .join("");
+    reviewerHtml = `<div class="review-box"><b>需人工复核（${r.reviewer_findings.length} 项低置信候选）</b><ul>${items}</ul></div>`;
+  }
+
+  return `<div class="trust"><div class="field-label">信任层明细（Stage 2 裁决 ${r.adjudications.length} 项候选）</div>
+<table class="adj"><thead><tr><th>结论</th><th>裁决档位 / 置信度</th><th>类型</th><th>共形 / 反事实</th><th>位置 / 证据门</th></tr></thead>
+<tbody>${rows}</tbody></table>${reviewerHtml}</div>`;
+}
+
 function renderHtml(r, isVuln, isSafe, isError, iconUri, wordUri) {
   const statusColor = isVuln ? "#ea4335" : isSafe ? "#34a853" : "#f9ab00";
   const statusText = isVuln ? "发现漏洞" : isSafe ? "未发现漏洞" : "无法判定";
@@ -742,10 +877,21 @@ details { margin-top: 16px; }
 summary { cursor: pointer; color: #1e7ea0; }
 pre { background: #f7f8fa; border: 1px solid #e4e7ec; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
 .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; background: ${statusColor}; color: #fff; }
+.trust { margin-top: 16px; }
+.trust .field-label { margin-bottom: 8px; }
+table.adj { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.adj th, table.adj td { padding: 6px 8px; border-bottom: 1px solid #e4e7ec; text-align: left; vertical-align: top; }
+table.adj th { background: #f7f8fa; font-weight: 600; }
+.verdict { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; color: #fff; }
+.verdict.v-yes { background: #b3261e; }
+.verdict.v-no { background: #1e7e34; }
+.sub { color: #9aa4b2; font-size: 11px; }
+.review-box { margin-top: 10px; background: rgba(249, 171, 0, 0.10); border: 1px solid rgba(249, 171, 0, 0.4); padding: 10px 12px; border-radius: 6px; font-size: 12px; }
+.review-box ul { margin: 6px 0 0 18px; padding: 0; }
 </style>
 </head>
 <body>
-<div class="logo-row"><img class="icon" src="${iconUri}" alt=""><img class="word" src="${wordUri}" alt="Nivis"></div>
+<div class="logo-row"><img class="icon" src="${iconUri}" alt=""><img class="word" src="${wordUri}" alt="凿凿"></div>
 <div class="header">
   <h1>${escapeHtml(r.filename || "")}</h1>
   <div class="status">${statusText} ${r.risk_level ? `<span class="badge">${escapeHtml(r.risk_level)}</span>` : ""} <span style="color:#9aa4b2;font-size:12px">${r.duration || 0}s</span></div>
@@ -756,17 +902,39 @@ ${isError ? `<div style="color:#ea4335">错误: ${escapeHtml(r.error || "未知"
 <div class="meta">
   <div>语言: ${escapeHtml(r.language || "")}</div>
   ${r.vulnerability_type && r.vulnerability_type !== "none" ? `<div>漏洞类型: ${escapeHtml(r.vulnerability_type)}</div>` : ""}
+  ${Array.isArray(r.vulnerability_types) && r.vulnerability_types.length > 1 ? `<div>全部确认类型: ${escapeHtml(r.vulnerability_types.join("、"))}</div>` : ""}
   ${r.source && r.source !== "N/A" ? `<div>污染来源: ${escapeHtml(r.source)}</div>` : ""}
   ${r.sink && r.sink !== "N/A" ? `<div>触发点: ${escapeHtml(r.sink)}</div>` : ""}
 </div>
+
+${trustSectionHtml(r)}
 
 ${r.explanation ? `<div class="field"><div class="field-label">分析说明</div><div class="field-value">${escapeHtml(r.explanation)}</div></div>` : ""}
 
 ${isVuln && r.fix_suggestion ? `<div class="fix"><div class="label">修复建议</div><div>${escapeHtml(r.fix_suggestion)}</div></div>` : ""}
 
-${r.raw_output ? `<details><summary>查看模型分析过程</summary><pre>${escapeHtml(r.raw_output)}</pre></details>` : ""}
+${modelProcessHtml(r)}
 </body>
 </html>`;
+}
+
+/**
+ * 「查看模型分析过程」区块。
+ * 两阶段模式下顶层 raw_output 为空（裁决原始输出在 adjudications[].raw_outputs），
+ * 回退取首个判真裁决的 reasoning + N 次采样原文；都没有时返回空串（不渲染）。
+ */
+function modelProcessHtml(r) {
+  let content = r.raw_output || "";
+  if (!content && Array.isArray(r.adjudications)) {
+    const confirmed = r.adjudications.find((a) => a && a.confirmed === true);
+    if (confirmed) {
+      const samples = Array.isArray(confirmed.raw_outputs) ? confirmed.raw_outputs.filter(Boolean) : [];
+      content = samples.length
+        ? `${confirmed.reasoning || ""}${samples.map((s) => "\n──── 采样 ────\n" + s).join("")}`
+        : confirmed.reasoning || "";
+    }
+  }
+  return content ? `<details><summary>查看模型分析过程</summary><pre>${escapeHtml(content)}</pre></details>` : "";
 }
 
 function renderBatchHtml(results, vulnList, vulnerable, safe, errors, iconUri, wordUri) {
@@ -805,7 +973,7 @@ td:first-child { font-family: monospace; }
 </style>
 </head>
 <body>
-<div class="logo-row"><img class="icon" src="${iconUri}" alt=""><img class="word" src="${wordUri}" alt="Nivis"></div>
+<div class="logo-row"><img class="icon" src="${iconUri}" alt=""><img class="word" src="${wordUri}" alt="凿凿"></div>
 <h1>批量扫描汇总</h1>
 <div class="summary">
   <div class="card total"><div class="num">${results.length}</div><div class="label">总文件</div></div>
@@ -822,7 +990,7 @@ ${vulnList.length ? `
 </table>
 ` : "<p style='color:#34a853;margin-top:16px'>✓ 未发现漏洞</p>"}
 
-<p style="color:#9aa4b2;font-size:12px;margin-top:24px">详细分析见输出面板（Output → AI 漏洞扫描器）</p>
+<p style="color:#9aa4b2;font-size:12px;margin-top:24px">详细分析见输出面板（Output → 凿凿）</p>
 </body>
 </html>`;
 }
@@ -838,4 +1006,11 @@ function escapeHtml(text) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate };
+// 导出内部纯函数供测试桩使用（下划线前缀，非公开 API）
+module.exports = {
+  activate,
+  deactivate,
+  _collectDiagnosticTargets: collectDiagnosticTargets,
+  _trustSectionHtml: trustSectionHtml,
+  _modelProcessHtml: modelProcessHtml,
+};

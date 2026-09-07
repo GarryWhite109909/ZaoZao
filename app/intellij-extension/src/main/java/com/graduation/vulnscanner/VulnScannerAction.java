@@ -29,28 +29,52 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 
 /**
- * AI 漏洞扫描器 IntelliJ 插件动作（桩代码）。
+ * 凿凿 IntelliJ 插件动作。
  *
  * 功能：
  *   1. 获取编辑器中当前选中的代码（未选中时取整个文件内容）
- *   2. 通过 HTTP POST 发送到后端 {@code http://localhost:8765/api/analyze}
- *   3. 将扫描结果通过通知（Notification）展示给用户
+ *   2. 通过 HTTP POST 发送到后端 {@code /api/analyze}（后端已统一为两阶段架构：
+ *      Stage 1 工具召回 + Stage 2 LLM 裁决 + 共形/反事实/证据门信任层）
+ *   3. 解析 TwoStageResult 响应（{@link BackendResponseParser}，Gson 树解析），
+ *      以通知展示结论与信任层摘要
  *
- * 注意：本文件为桩代码，需在 IntelliJ Platform SDK 环境下编译运行。
- * 未配置 SDK 时无法构建，请参阅同目录 README.md。
+ * Shift+点击动作可修改后端地址（支持填基础地址 http://localhost:8765，
+ * 也兼容完整的 /api/analyze 端点，内部自动归一化）。
+ * 构建需 IntelliJ Platform SDK（Gson 由平台捆绑提供），参见同目录 README.md。
  */
 public class VulnScannerAction extends AnAction {
 
     /** 后端 API 默认地址（用户可在弹窗中修改，持久化到 IDE Properties） */
-    private static final String DEFAULT_BACKEND_URL = "http://localhost:8765/api/analyze";
+    private static final String DEFAULT_BACKEND_URL = "http://localhost:8765";
     private static final String BACKEND_URL_KEY = "vulnScanner.backendUrl";
+    private static final String ANALYZE_PATH = "/api/analyze";
     /** HTTP 请求超时（毫秒） */
     private static final int TIMEOUT_MS = (int) TimeUnit.MINUTES.toMillis(5);
+    /** 通知文本上限（Balloon 容量有限，超大内容会撑坏 UI） */
+    private static final int NOTIFICATION_MAX_CHARS = 1500;
 
-    /** 读取用户配置的后端地址，未配置时返回默认值。 */
+    /** 读取用户配置的后端地址（兼容历史保存的完整端点 URL），并归一化为端点。 */
     private static String getBackendUrl() {
         String saved = PropertiesComponent.getInstance().getValue(BACKEND_URL_KEY);
-        return (saved != null && !saved.trim().isEmpty()) ? saved.trim() : DEFAULT_BACKEND_URL;
+        String base = (saved != null && !saved.trim().isEmpty()) ? saved.trim() : DEFAULT_BACKEND_URL;
+        return normalizeEndpoint(base);
+    }
+
+    /**
+     * 归一化后端地址为完整分析端点：
+     *   http://localhost:8765                        → http://localhost:8765/api/analyze
+     *   http://localhost:8765/                       → http://localhost:8765/api/analyze
+     *   http://localhost:8765/api/analyze（历史配置）  → 原样保留
+     */
+    static String normalizeEndpoint(String base) {
+        String url = base.trim();
+        while (url.endsWith("/")) {
+            url = url.substring(0, url.length() - 1);
+        }
+        if (!url.contains("/api/")) {
+            url = url + ANALYZE_PATH;
+        }
+        return url;
     }
 
     @Override
@@ -67,13 +91,14 @@ public class VulnScannerAction extends AnAction {
         // Shift+点击动作时，弹出后端地址配置框
         java.awt.event.InputEvent inputEvent = e.getInputEvent();
         if (inputEvent != null && inputEvent.isShiftDown()) {
-            String current = getBackendUrl();
+            String current = PropertiesComponent.getInstance().getValue(BACKEND_URL_KEY, DEFAULT_BACKEND_URL);
             String updated = Messages.showInputDialog(project,
-                    "后端扫描服务地址：", "配置 Nivis 后端",
+                    "后端扫描服务地址（填基础地址或完整端点均可）：", "配置 凿凿 后端",
                     Messages.getQuestionIcon(), current, null);
             if (updated != null) {
-                PropertiesComponent.getInstance().setValue(BACKEND_URL_KEY, updated.trim());
-                showNotification(project, "已更新后端地址：" + updated.trim(), NotificationType.INFORMATION);
+                String trimmed = updated.trim();
+                PropertiesComponent.getInstance().setValue(BACKEND_URL_KEY, trimmed);
+                showNotification(project, "已更新后端地址：" + normalizeEndpoint(trimmed), NotificationType.INFORMATION);
             }
             return;
         }
@@ -100,22 +125,39 @@ public class VulnScannerAction extends AnAction {
         // 在后台线程发起 HTTP 请求，避免阻塞 EDT
         final String backendUrl = getBackendUrl();
         final String requestBody = buildRequestBody(code, language, filename);
-        ProgressManager.getInstance().run(new Task.Backgroundable(project, "AI 漏洞扫描中...", true) {
+        ProgressManager.getInstance().run(new Task.Backgroundable(project, "凿凿 漏洞扫描中...", true) {
             @Override
             public void run(@NotNull ProgressIndicator indicator) {
                 indicator.setIndeterminate(true);
-                indicator.setText("正在调用后端分析接口...");
+                indicator.setText("正在调用后端分析接口（两阶段 + 信任层）...");
                 try {
                     String response = postJson(backendUrl, requestBody);
-                    String summary = parseResult(response);
-                    showNotification(project, summary, NotificationType.INFORMATION);
-                } catch (IOException ex) {
-                    showNotification(project, "扫描失败：无法连接后端 (" + backendUrl + ")。" +
-                            "请确保后端服务已启动（Shift+点击本动作可修改后端地址）。\n详情：" + ex.getMessage(),
+                    BackendResponseParser.ScanResult result = BackendResponseParser.parse(response);
+                    NotificationType type = notificationTypeOf(result);
+                    showNotification(project, BackendResponseParser.buildNotification(result), type);
+                } catch (Exception ex) {
+                    // IOException = 连接失败；IllegalArgumentException 等 = 地址配置无效
+                    String reason = (ex instanceof IOException)
+                            ? "后端服务未启动或网络不通。详情：" + ex.getMessage()
+                            : "地址或请求构造无效：" + ex.getMessage();
+                    showNotification(project,
+                            "扫描失败：无法连接后端 (" + backendUrl + ")\n"
+                                    + reason + "\n（Shift+点击本动作可修改后端地址）",
                             NotificationType.ERROR);
                 }
             }
         });
+    }
+
+    /** 按解析结果选择通知级别。 */
+    private static NotificationType notificationTypeOf(BackendResponseParser.ScanResult r) {
+        if (r.parseFailed || (r.error != null && !r.error.isEmpty())) {
+            return NotificationType.ERROR;
+        }
+        if (Boolean.TRUE.equals(r.hasVuln)) {
+            return NotificationType.WARNING;
+        }
+        return NotificationType.INFORMATION;
     }
 
     @Override
@@ -195,124 +237,6 @@ public class VulnScannerAction extends AnAction {
         }
     }
 
-    /**
-     * 从后端 JSON 响应中提取关键信息，生成用户可读的摘要。
-     * 后端返回字段：has_vulnerability / vulnerability_type / risk_level / explanation。
-     * 错误响应：{"error": "..."} 或 FastAPI 校验错误 {"detail": [...]}。
-     */
-    private String parseResult(String response) {
-        if (response == null || response.trim().isEmpty()) {
-            return "后端返回空响应";
-        }
-        // 优先识别错误响应（原先直接按正常结果解析，422 会误入"无法判定"）
-        String error = extractJsonField(response, "error");
-        if (error != null && !error.isEmpty()) {
-            return "扫描失败: " + error;
-        }
-        String detail = extractJsonField(response, "detail");
-        if (detail != null && extractJsonField(response, "has_vulnerability") == null) {
-            // FastAPI 422 的 detail 是数组（[{"loc":...,"msg":"..."}]），提取首个 msg
-            if (detail.startsWith("[") || detail.isEmpty()) {
-                String msg = extractJsonField(response, "msg");
-                return "请求被后端拒绝" + (msg != null ? ": " + msg : "（参数校验失败）");
-            }
-            return "请求被后端拒绝: " + detail;
-        }
-        String hasVuln = extractJsonField(response, "has_vulnerability");
-        if ("true".equalsIgnoreCase(hasVuln)) {
-            String vulnType = extractJsonField(response, "vulnerability_type");
-            String risk = extractJsonField(response, "risk_level");
-            String sink = extractJsonField(response, "sink");
-            return "⚠ 发现漏洞\n"
-                    + "类型: " + nullSafe(vulnType) + "\n"
-                    + "风险: " + nullSafe(risk) + "\n"
-                    + "触发点: " + nullSafe(sink)
-                    + "\n\n详见后端 Web 界面的修复建议。";
-        } else if ("false".equalsIgnoreCase(hasVuln)) {
-            return "✓ 未发现漏洞";
-        }
-        return "扫描结果无法判定\n原始响应:\n" + response;
-    }
-
-    /**
-     * 从 JSON 文本中提取指定字段值（手写解析，避免引入 JSON 库）。
-     * 原先的正则 "([^\"]*)" 遇到值内含转义引号 \" 会截断；
-     * 本实现逐字符扫描字符串、正确处理 \" \\ \n \\uXXXX 等转义，
-     * 且要求 key 前是 '{' 或 ','，避免误匹配字段值里出现的同名文本。
-     */
-    private String extractJsonField(String json, String field) {
-        String key = "\"" + field + "\"";
-        int idx = json.indexOf(key);
-        while (idx >= 0) {
-            // key 前一个非空白字符必须是 '{' 或 ','（真正的对象键位置）
-            int prev = idx - 1;
-            while (prev >= 0 && Character.isWhitespace(json.charAt(prev))) prev--;
-            boolean keyPosition = prev >= 0 && (json.charAt(prev) == '{' || json.charAt(prev) == ',');
-            if (keyPosition) {
-                int i = idx + key.length();
-                while (i < json.length() && Character.isWhitespace(json.charAt(i))) i++;
-                if (i < json.length() && json.charAt(i) == ':') {
-                    i++;
-                    while (i < json.length() && Character.isWhitespace(json.charAt(i))) i++;
-                    if (i >= json.length()) return null;
-                    if (json.charAt(i) == '"') {
-                        return parseJsonString(json, i + 1);
-                    }
-                    // 字面量 true / false / null / 数字
-                    int j = i;
-                    while (j < json.length() && ",}] \t\r\n".indexOf(json.charAt(j)) < 0) j++;
-                    return json.substring(i, j);
-                }
-            }
-            idx = json.indexOf(key, idx + key.length());
-        }
-        return null;
-    }
-
-    /** 从 openingQuote 之后开始解析 JSON 字符串，正确处理转义序列。 */
-    private String parseJsonString(String json, int start) {
-        StringBuilder sb = new StringBuilder();
-        int i = start;
-        while (i < json.length()) {
-            char ch = json.charAt(i);
-            if (ch == '\\' && i + 1 < json.length()) {
-                char esc = json.charAt(i + 1);
-                switch (esc) {
-                    case '"': sb.append('"'); break;
-                    case '\\': sb.append('\\'); break;
-                    case '/': sb.append('/'); break;
-                    case 'n': sb.append('\n'); break;
-                    case 't': sb.append('\t'); break;
-                    case 'r': sb.append('\r'); break;
-                    case 'b': sb.append('\b'); break;
-                    case 'f': sb.append('\f'); break;
-                    case 'u':
-                        if (i + 5 < json.length()) {
-                            try {
-                                // 用 Character.toChars 展开码点，避免 (char) 单字符拆坏代理对（emoji 等 BMP 外字符）
-                                int codePoint = Integer.parseInt(json.substring(i + 2, i + 6), 16);
-                                sb.append(Character.toChars(codePoint));
-                            } catch (NumberFormatException ignored) { /* 非法转义按原样跳过 */ }
-                            i += 4;
-                        }
-                        break;
-                    default: sb.append(esc);
-                }
-                i += 2;
-            } else if (ch == '"') {
-                return sb.toString();
-            } else {
-                sb.append(ch);
-                i++;
-            }
-        }
-        return sb.toString(); // 未闭合字符串，尽力返回已解析部分
-    }
-
-    private String nullSafe(String s) {
-        return (s == null || s.isEmpty() || "N/A".equalsIgnoreCase(s)) ? "无" : s;
-    }
-
     /** 转义 JSON 字符串值中的特殊字符。 */
     private String escapeJson(String text) {
         StringBuilder sb = new StringBuilder(text.length() + 16);
@@ -337,11 +261,13 @@ public class VulnScannerAction extends AnAction {
 
     /**
      * 弹出通知（方法名不能叫 notify，否则与 Object#notify 冲突）。
+     * 内容统一截断，防止超大响应（N 采样 raw_outputs）撑坏 Balloon。
      */
     private void showNotification(Project project, String content, NotificationType type) {
+        String safe = BackendResponseParser.truncate(content, NOTIFICATION_MAX_CHARS);
         NotificationGroupManager.getInstance()
-                .getNotificationGroup("AI 漏洞扫描器")
-                .createNotification(content, type)
+                .getNotificationGroup("凿凿")
+                .createNotification(safe, type)
                 .notify(project);
     }
 }

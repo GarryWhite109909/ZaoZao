@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI 漏洞扫描器 —— 一键卸载程序（跨平台，适配各种硬件）
+凿凿 AI 漏洞扫描器 —— 一键卸载程序（跨平台，适配各种硬件）
 
 设计目标：面向所有用户，无论其硬件是 NVIDIA / AMD(ROCm) / Apple Silicon / 纯 CPU，
 脚本会先探测本机实际安装了哪些组件，再按需清理，不会误删不存在的依赖。
@@ -735,7 +735,7 @@ def _fix_console_encoding():
 
 def main():
     _fix_console_encoding()
-    ap = argparse.ArgumentParser(description="AI 漏洞扫描器一键卸载程序")
+    ap = argparse.ArgumentParser(description="凿凿 AI 漏洞扫描器一键卸载程序")
     ap.add_argument("--yes", action="store_true", help="全自动，跳过所有确认")
     ap.add_argument("--dry-run", action="store_true", help="只打印将执行的动作，不删除")
     ap.add_argument("--keep-project", action="store_true", help="保留项目文件夹")
@@ -770,7 +770,7 @@ def main():
             project_root = Path.cwd()
 
     print("=" * 60)
-    print("  AI 漏洞扫描器 —— 一键卸载")
+    print("  凿凿 AI 漏洞扫描器 —— 一键卸载")
     print("  硬件自适应：探测到才清理，未安装的组件自动跳过")
     print("=" * 60)
     print(f"  目标项目: {project_root}")

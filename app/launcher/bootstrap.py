@@ -1466,7 +1466,7 @@ def select_mode() -> str:
         "web" / "plugin" / "all"
     """
     print("=" * 60)
-    print("  AI 漏洞扫描器 —— 启动模式选择")
+    print("  凿凿 AI 漏洞扫描器 —— 启动模式选择")
     print("=" * 60)
     print("  后端服务始终启动（Web 与插件共用同一后端）")
     print("  [1] Web 模式    —— 后端 + 浏览器（仅用 Web 应用）")
@@ -1515,7 +1515,7 @@ def main():
     mode = select_mode()
     print()
     print("=" * 60)
-    print("  AI 漏洞扫描器 —— 启动中（模式: %s）" % mode)
+    print("  凿凿 AI 漏洞扫描器 —— 启动中（模式: %s）" % mode)
     print("=" * 60)
 
     # 0. 选择并锁定推理后端
@@ -1739,7 +1739,7 @@ def main():
         print_plugin_hint(PORT)
 
     print(f"\n{'=' * 60}")
-    print(f"  AI 漏洞扫描器已启动（模式: {mode}）")
+    print(f"  凿凿 AI 漏洞扫描器已启动（模式: {mode}）")
     print(f"  访问地址：http://localhost:{PORT}")
     print(f"  API 文档：http://localhost:{PORT}/docs")
     print(f"  队列状态：http://localhost:{PORT}/api/queue/status")

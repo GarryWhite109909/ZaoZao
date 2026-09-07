@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 SARIF_VERSION = "2.1.0"
 SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
-TOOL_NAME = "Nivis AI Vulnerability Scanner"
+TOOL_NAME = "ZaoZao AI Vulnerability Scanner"
 TOOL_INFO_URI = "https://github.com/GarryWhite109909/Graduation-Project"
 
 # 旧管道 risk_level → SARIF level

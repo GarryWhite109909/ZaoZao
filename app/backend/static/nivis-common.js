@@ -985,19 +985,19 @@
             </div>\
           </section>\
           <section>\
-            <h3 class="text-xs font-semibold uppercase tracking-wider mb-3" style="color: var(--vuln-ink-3)">关于 Nivis</h3>\
+            <h3 class="text-xs font-semibold uppercase tracking-wider mb-3" style="color: var(--vuln-ink-3)">关于 凿凿</h3>\
             <div class="flex items-center gap-3 mb-4 p-3 rounded-lg" style="background: color-mix(in srgb, var(--vuln-brand) 6%, transparent); border: 1px solid color-mix(in srgb, var(--vuln-brand) 15%, var(--vuln-line));">\
               <span class="nivis-logo" aria-hidden="true">\
                 <img src="./logo/图标logo.png" class="logo-light" alt="" width="36" height="36">\
                 <img src="./logo/图标logo深色版.png" class="logo-dark" alt="" width="36" height="36">\
               </span>\
               <div>\
-                <div class="text-base font-semibold" style="color: var(--vuln-ink)">Nivis</div>\
+                <div class="text-base font-semibold" style="color: var(--vuln-ink)" >凿凿</div>\
                 <div class="text-xs" style="color: var(--vuln-ink-3)">版本 2.0.0</div>\
               </div>\
             </div>\
             <p class="text-sm leading-relaxed mb-4" style="color: var(--vuln-ink-2)">\
-              Nivis 是一款本地部署的 AI 代码漏洞静态分析平台。基于 <span class="font-mono text-xs px-1 py-0.5 rounded" style="background: var(--vuln-surface-2); color: var(--vuln-brand)">Qwen3-8B</span> 多轮微调的安全分析模型，结合静态规则引擎，识别 SQL 注入、XSS、命令注入、路径穿越、反序列化等常见安全漏洞。所有分析在本地完成，代码不上传云端。\
+              凿凿 是一款本地部署的 AI 代码漏洞静态分析平台。基于 <span class="font-mono text-xs px-1 py-0.5 rounded" style="background: var(--vuln-surface-2); color: var(--vuln-brand)">Qwen3-8B</span> 多轮微调的安全分析模型，结合静态规则引擎，识别 SQL 注入、XSS、命令注入、路径穿越、反序列化等常见安全漏洞。所有分析在本地完成，代码不上传云端。\
             </p>\
             <div class="space-y-2">\
               <div class="text-xs font-semibold mb-2" style="color: var(--vuln-ink)">使用指南</div>\

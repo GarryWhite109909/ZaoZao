@@ -329,7 +329,7 @@ class TwoStageRequest(BaseModel):
 # FastAPI app
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="AI 漏洞扫描器",
+    title="凿凿 AI 漏洞扫描器",
     description="基于 LLM 的代码安全审计系统 API",
     version="1.2.0",
 )
@@ -2604,7 +2604,7 @@ else:
     async def index():
         return """
         <html><body>
-        <h1>AI 漏洞扫描器 API</h1>
+        <h1>凿凿 AI 漏洞扫描器 API</h1>
         <p>后端已启动。前端静态资源未构建（app/backend/static/ 不存在）。</p>
         <p>API 文档：<a href="/docs">/docs</a></p>
         </body></html>

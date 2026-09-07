@@ -1,5 +1,5 @@
 """
-AI 漏洞扫描器 —— 命令行工具。
+凿凿 AI 漏洞扫描器 —— 命令行工具。
 
 直接复用 app.backend.services.scanner.Scanner，无需启动 FastAPI 后端即可使用。
 
@@ -592,7 +592,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="vuln-scanner",
-        description="AI 漏洞扫描器命令行工具 —— 基于 LLM 的代码安全审计",
+        description="凿凿 AI 漏洞扫描器命令行工具 —— 基于 LLM 的代码安全审计",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
