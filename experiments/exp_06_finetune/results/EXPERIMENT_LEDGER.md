@@ -32,6 +32,24 @@
 
 **红线规则**：后续任何训练后评估，recall 不得低于 0.95（红线），FPR / parse_fail / strict_recall 须有改善方算达标。
 
+### rolling_dev 50 真实集四路线对照（2026-09-07）
+
+> 测试集：`corpus/rolling_dev`（50 段真实 CVE 修复前代码，全漏洞，Go14/Py13/PHP8/Java8/JS7，官方口径标签已修正）。
+> 纯 LLM 均 combined 提示、temperature=0 贪心；两阶段为 anchor 同款配置（transformers α0.5-stage2 裁决、combined_nosource、N=3、ctx16384、full_recheck、四路工具全开）。
+
+| 路线 | 结果文件 | 检出 | recall（有效内） | recall（含 parse_fail） | strict | 备注 |
+|---|---|---|---|---|---|---|
+| 纯 semgrep（官方规则） | exp_02 `…semgrep.rolling_dev.20260907_003727.json` | 3/50 | **0.060** | 0.060 | - | 多语言真实 CVE 几乎全盲（Go/PHP 无覆盖） |
+| 纯基座+combined | `exp_06_eval.baseline.combined.20260907_013044.json` | 13/37 | **0.351** | 0.26 | 0.081 | parse_fail 13 = CUDA OOM（16GB 硬件边界，非能力） |
+| α0.5+combined | `exp_06_eval.finetuned_custom.combined.20260907_073657.json` | 22/37 | **0.595** | 0.44 | 0.135 | SFT 增益 +24pp；CWE 错标 17（冷门编号归因难） |
+| 两阶段 anchor 同款 | exp_07 `…combined_nosource.20260907_013050.json` | 20/31 已裁决 | **0.645** | - | - | 19 段转人工（38%）；11 FN 中 10 个为 Stage1 盲区（862/22/327/611/601/94/95 等） |
+
+**关键读数**：
+- semgrep 在本集 6% vs cve-fix20 集 80%——规则工具表现强依赖语言/类型分布，"80% 召回"不可外推。
+- 四路线梯度 6%→35%→59%→64.5%（另 38% 转人工）：SFT 与两阶段各贡献一层增益，但多语言真实 CVE 仍是硬问题。
+- 纯 LLM 双双 13 段 CUDA OOM：16GB 显存 + 长文件 + 2048 tokens 输出的硬约束，论文引用需注明；两阶段因 CodeSlicer 切小上下文无此问题。
+- strict 普遍低（0.081/0.135）：rolling_dev 冷门 CWE（1336/843/862/639）归因是当前最大短板，与 α0.6 弱点挖掘方向一致。
+
 ### 纯基座 Qwen3-8B（transformers NF4，无 LoRA）+ combined 提示（2026-09-05/06）
 
 > 首次在 transformers 端补齐"纯基座"对照（此前基线均为 Ollama 后端/微调模型）。
