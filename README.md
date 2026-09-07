@@ -391,7 +391,7 @@ VS Code 插件提供编辑器内直接扫描、诊断标记、工作区批量扫
 
 **方式 A：从 VSIX 安装（推荐，普通用户）**
 
-1. 下载插件包 [`releases/vuln-scanner-1.2.1.vsix`](releases/vuln-scanner-1.2.1.vsix)（仓库已附带，clone 后可直接使用；注意：附带包为 1.2.1，不含信任层明细等最新功能）
+1. 下载插件包 [`releases/vuln-scanner-1.3.0.vsix`](releases/vuln-scanner-1.3.0.vsix)（仓库已附带，clone 后可直接使用，含信任层明细、多漏洞诊断等最新功能）
 2. 打开 VS Code → 左侧扩展面板 → 右上角 `⋯` → **从 VSIX 安装**
 3. 选择 `.vsix` 文件 → 安装完成 → 重载窗口
 
