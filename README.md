@@ -494,7 +494,7 @@ IntelliJ 插件提供编辑器内选中代码的扫描功能，结果以气球�
 脚本会按本机实际检测结果动态清理：
 
 1. 后端进程（端口 8765）与 Ollama 服务进程；
-2. 当前 Python 环境中的本项目相关包（torch、fastapi、chromadb、sentence-transformers、tree-sitter 等）；
+2. 当前 Python 环境中的本项目相关包（torch、fastapi、chromadb、sentence-transformers、tree-sitter、vllm 等）与 pip 下载缓存；
 3. Ollama 拉取的模型（`~/.ollama`，以及 `OLLAMA_MODELS` 指定的目录）；
 4. Ollama 本体：Windows（winget/官方卸载器）、macOS（Homebrew/官方 App）、Linux（apt/dnf/pacman/zypper/apk/官方脚本）；
 5. Linux 系统级 CUDA / ROCm 组件（需 sudo，仅 apt 系发行版）；
@@ -507,7 +507,7 @@ IntelliJ 插件提供编辑器内选中代码的扫描功能，结果以气球�
 - **外部扫描工具**（bandit / semgrep / gitleaks / trivy）：这些是共享系统工具，可能被其他项目使用，卸载脚本不会动它们；如需删除请按安装方式手动卸载（如 `pip uninstall bandit semgrep`、`choco uninstall gitleaks trivy`）；
 - **conda 环境本身**：卸载脚本只清当前环境里的包，不会删除任何 conda 环境；
 - **npm 全局包**（如 `@vscode/vsce`）：如需删除请手动 `npm uninstall -g @vscode/vsce`。
-- **其他项目也在用的通用基础库**（如 urllib3、certifi、typing-extensions 等）：脚本只卸载本项目直接/间接相关的顶层包，保留这类共享基础库，避免影响同一环境里的其他程序。
+- **部分共享基础库**（urllib3、certifi、typing-extensions 等）：脚本保留这类通用网络/类型基础库，避免影响同一环境里的其他程序。但注意：**numpy / scipy / pandas / scikit-learn 等科学计算包也在清理列表里**（本项目按需安装的大体积依赖），若同一环境还有其他项目用到它们，请留意确认提示，必要时改用 `--dry-run` 先查看或将依赖装在独立虚拟环境。
 
 ### 注意事项
 

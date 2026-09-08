@@ -15,7 +15,7 @@
   [6] 推理加速栈    —— NVIDIA CUDA / AMD ROCm（Linux 系统级 apt 包 + /opt/rocm，需 sudo）
   [7] 本地运行数据  —— data/chroma_db、outputs/、logs/、models/、__pycache__、egg-info、HF/torch 缓存
   [8] 编辑器插件    —— VS Code / IntelliJ 中已安装的本项目插件（尽力而为）
-  [9] 项目文件夹    —— 删除整个 Graduation-Project/（自动切换工作目录后删除，Windows 可用）
+  [9] 项目文件夹    —— 删除整个项目目录（ZaoZao / 历史 Graduation-Project，自动切换工作目录后删除，Windows 可用）
 
 安全机制：
   - 默认交互式确认，每一步列出将删除的内容与预估占用
@@ -39,7 +39,8 @@ from pathlib import Path
 # ===========================================================================
 # 常量
 # ===========================================================================
-PROJECT_DIR_HINT = "Graduation-Project"          # 项目文件夹名
+# 仓库 2026-09-08 由 Graduation-Project 更名为 ZaoZao；两个名字都要能识别
+PROJECT_DIR_HINTS = ["ZaoZao", "Graduation-Project"]
 BACKEND_PORTS = [8765]                            # 后端监听端口
 # 本项目直接/间接依赖的顶层包名（pip uninstall 用）
 PIP_PACKAGES = [
@@ -100,6 +101,10 @@ PIP_OPTIONAL = [
     "posthog",
     "tenacity",
     "pypika",
+    # requirements.txt 显式列出但此前漏掉的
+    "socksio",
+    # vLLM 推理后端（app/launcher/vllm_server.py）
+    "vllm",
 ]
 # 新框架（两阶段/外部扫描）经系统包管理器安装的二进制工具：
 # 键=命令名，值=(winget 包ID, brew 包名, Linux 包名)。卸载时按平台探测后清理。
@@ -233,6 +238,7 @@ def stop_processes(ui: UI):
         if sys.platform == "win32":
             run(["taskkill", "/F", "/IM", "ollama.exe"])
             run(["taskkill", "/F", "/IM", "ollama_runners.exe"])
+            run(["taskkill", "/F", "/IM", "ollama app.exe"])
         else:
             r = run(["pkill", "-9", "-x", "ollama"], timeout=10)
             if r.returncode != 0:
@@ -493,19 +499,26 @@ def uninstall_python_deps(ui: UI):
         if key in installed:
             to_remove.append(pkg)
     if not to_remove:
-        ui.ok("当前环境未发现本项目相关 Python 包，跳过")
-        return
-    ui.warn(f"将卸载 {len(to_remove)} 个 Python 包: {', '.join(to_remove[:12])}...")
-    if ui.dry:
-        ui.warn("模拟模式：以上包不会实际卸载")
-        return
-    if ui.yes or ui.confirm(f"{len(to_remove)} 个 Python 包"):
-        r = run([sys.executable, "-m", "pip", "uninstall", "-y"] + to_remove, timeout=600)
-        if getattr(r, "returncode", -1) == 0:
-            ui.ok("已卸载 Python 依赖")
+        ui.ok("当前环境未发现本项目相关 Python 包，跳过包卸载")
+    else:
+        ui.warn(f"将卸载 {len(to_remove)} 个 Python 包: {', '.join(to_remove[:12])}...")
+        if ui.dry:
+            ui.warn("模拟模式：以上包不会实际卸载")
+        elif ui.yes or ui.confirm(f"{len(to_remove)} 个 Python 包"):
+            r = run([sys.executable, "-m", "pip", "uninstall", "-y"] + to_remove, timeout=600)
+            if getattr(r, "returncode", -1) == 0:
+                ui.ok("已卸载 Python 依赖")
+            else:
+                ui.warn("pip 卸载可能未完全成功，可手动执行 pip uninstall -y "
+                        + " ".join(to_remove))
+
+    # pip 下载缓存（torch 等大 wheel 装完后缓存可达数 GB，与已装包无关，单独清理）
+    if ui.confirm("清理 pip 下载缓存（pip cache purge）"):
+        r = run([sys.executable, "-m", "pip", "cache", "purge"], timeout=120)
+        if r.returncode == 0:
+            ui.ok("pip 下载缓存已清理")
         else:
-            ui.warn("pip 卸载可能未完全成功，可手动执行 pip uninstall -y "
-                    + " ".join(to_remove))
+            ui.warn("pip 缓存清理失败，可手动执行: python -m pip cache purge")
 
 
 # ===========================================================================
@@ -733,6 +746,16 @@ def _fix_console_encoding():
             pass
 
 
+def _looks_like_project_root(p: Path) -> bool:
+    """判断目录是否像本项目根目录，避免回退到 cwd 后误删无关目录。
+
+    注意：不能把 uninstall.py 自身当标记——脚本被单独复制到别处运行时
+    cwd 里总有它，保护就失效了。
+    """
+    markers = ["pyproject.toml", "requirements.txt", "app/backend/main.py"]
+    return p.is_dir() and any((p / m).exists() for m in markers)
+
+
 def main():
     _fix_console_encoding()
     ap = argparse.ArgumentParser(description="凿凿 AI 漏洞扫描器一键卸载程序")
@@ -757,17 +780,22 @@ def main():
     elif args.project:
         project_root = Path(args.project).resolve()
     else:
-        # 自动探测：向上找 Graduation-Project
+        # 自动探测：向上找项目目录（兼容更名后的 ZaoZao 与历史名 Graduation-Project）
         cand = Path(__file__).resolve()
         project_root = None
         for p in [cand, cand.parent, cand.parent.parent, cand.parent.parent.parent,
                   cand.parent.parent.parent.parent]:
-            if p.name == PROJECT_DIR_HINT:
+            if p.name in PROJECT_DIR_HINTS:
                 project_root = p
                 break
         if project_root is None:
-            # 最后手段：当前目录
+            # 最后手段：当前目录。必须"长得像项目根"才允许继续，
+            # 否则 --yes 模式下会把 cwd 整个删掉（历史隐患）。
             project_root = Path.cwd()
+            if not _looks_like_project_root(project_root):
+                ui.err(f"无法定位项目目录（当前目录 {project_root} 不像项目根）。")
+                ui.err("请 cd 进项目根目录后重跑，或用 --project /path/to/project 显式指定。")
+                sys.exit(2)
 
     print("=" * 60)
     print("  凿凿 AI 漏洞扫描器 —— 一键卸载")
