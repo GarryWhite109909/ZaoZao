@@ -1,40 +1,48 @@
-# 基于大语言模型的代码安全分析系统
+# 凿凿 ZaoZao — 基于大语言模型的代码安全分析系统
 
-> 本地部署的开源大语言模型驱动的代码漏洞检测系统，对比传统基于规则的静态分析工具，验证 LLM 在代码安全审计中的语义理解优势。
+> 本地部署的开源大语言模型驱动的代码漏洞检测系统：传统工具是"模式匹配"，凿凿是"语义理解"——每个漏洞结论都附带完整证据链。
 >
-> 产品名**「凿凿」**（英文名 **ZaoZao**），取自「言之凿凿」——每个漏洞结论都附带完整证据链；底层模型系列名为 **Nivis**（α0 / α0.5 / α0.6 / α1）；「码安管家」为比赛项目名。
+> 产品名**「凿凿」**（英文名 **ZaoZao**），取自「言之凿凿」。底层模型系列名为 **Nivis**，发布于 Ollama Registry 的模型为 `garrywhite109909/graduation-vuln-scanner:v9max`。
 
-[![发布模型](https://img.shields.io/badge/发布模型-v9max-blue)](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)
-[![基座](https://img.shields.io/badge/基座-Qwen3--8B--Instruct-green)](docs/方法.md)
-[![系统结果](https://img.shields.io/badge/两阶段fixed5-recall_1.000_/_FPR_0.043-green)](#核心结果)
-[![数据主线](https://img.shields.io/badge/α0.6训练集-v2_15_10167条待训-orange)](docs/实验路线图.md)
+[![发布模型](https://img.shields.io/badge/发布模型-v9max-blue)](https://ollama.com/garrywhite109909/graduation-vuln-scanner)
+[![平台](https://img.shields.io/badge/平台-Windows_/_Linux_/_macOS-green)](#后端平台支持矩阵)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey)]()
 
-> 📖 **只想用扫描器？** 跳过本页细节，直接看[《用户手册》](docs/用户手册.md)——按任务组织的安装、上手与排查指南。
+> 📖 **本页只讲怎么用。** 想了解这个项目是怎么一步步做出来的（选题、实验、模型训练的完整历程），看[《项目历程》](docs/项目历程.md)；按任务组织的详细手册见[《用户手册》](docs/用户手册.md)。
 
 ## 目录
 
+- [它能做什么](#它能做什么)
 - [快速开始](#快速开始)
+  - [前置条件](#前置条件)
+  - [一键启动（推荐）](#一键启动推荐)
+  - [手动启动](#手动启动)
+  - [切换推理后端](#切换推理后端)
+  - [环境变量配置](#环境变量配置)
 - [使用指南](#使用指南)
   - [Web 界面](#web-界面)
   - [命令行工具 CLI](#命令行工具-cli)
   - [VS Code 插件](#vs-code-插件)
   - [IntelliJ 插件](#intellij-插件)
 - [卸载](#卸载)
-- [核心结果](#核心结果)
-- [当前状态与待决策](#当前状态与待决策)
-- [项目简介](#项目简介)
-- [实验环境](#实验环境)
-- [项目结构](#项目结构)
-- [当前进度](#当前进度)
-- [研究主线与实验体系](#研究主线与实验体系)
-- [技术架构与全栈](#技术架构与全栈)
-- [模型部署与版本管理](#模型部署与版本管理)
-- [实验复现](#实验复现)
-- [评估方法学](#评估方法学)
-- [参考资源](#参考资源)
 - [故障排查](#故障排查)
-- [约定与备注](#约定与备注)
+- [目录结构](#目录结构)
+
+***
+
+## 它能做什么
+
+对源代码进行安全审计，输出**漏洞判定 + CWE 类型 + 风险等级 + 污点来源/触发点 + 自然语言解释 + 修复建议**，与传统规则工具（Bandit / Semgrep）互补：
+
+| 维度 | 传统工具（Bandit/Semgrep） | 凿凿（LLM 驱动） |
+| ---- | -------------------------- | ---------------- |
+| 检测方式 | 固定规则模式匹配 | 代码语义理解、上下文感知 |
+| 漏洞覆盖 | 已知漏洞模式 | 可发现变体/非典型漏洞 |
+| 输出形式 | 漏洞类型 + 规则编号 | 自然语言解释 + 修复建议 |
+| 多语言 | 工具专属规则集 | 跨语言统一理解 |
+| 误报控制 | 规则泛化能力差 | 上下文判断过滤/净化逻辑 |
+
+扫描采用**两阶段架构**：Stage 1 由传统安全工具（Bandit / Semgrep / Gitleaks / Trivy）召回候选并直接报告密钥与依赖类发现，Stage 2 由本地大模型对 SAST 类候选做语义裁决——所有结论经一致性采样、共形预测、反事实验证与证据门分级，低置信候选进入人工复核清单，而不是假装确定。
 
 ***
 
@@ -63,12 +71,12 @@
 >
 > 完整平台支持见下方「[后端平台支持矩阵](#后端平台支持矩阵)」。
 
-### 路径一：终端用户（只想用扫描器）
+### 一键启动（推荐）
 
-适合只想使用漏洞扫描功能、不需要复现实验的用户。一条命令搞定。
+一条命令搞定，启动脚本会自动完成其余所有事情：
 
 ```bash
-git clone <repo-url> && cd Graduation-Project
+git clone https://github.com/GarryWhite109909/ZaoZao.git && cd ZaoZao
 
 # Windows
 app\launcher\start_windows.bat
@@ -102,33 +110,7 @@ bash app/launcher/start_linux_macos.sh
 > 之后启动器会自己用 `OLLAMA_MODELS=models/ollama` 启动 Ollama，模型全部落在项目目录，前端状态一致。
 > **Windows / macOS 无需此步骤**（winget/brew 安装不注册系统服务，启动器直接接管）。
 
-### 路径二：开发者 / 复现实验
-
-适合需要复现实验、修改代码或参与开发的用户。需手动管理 conda 环境。
-
-```bash
-git clone <repo-url> && cd Graduation-Project
-
-# 1. 创建并激活 conda 环境（推荐）
-conda create -n graproj python=3.11 -y
-conda activate graproj
-
-# 2. 安装依赖 + 注册核心包
-pip install -r requirements.txt
-pip install -e .
-
-# 3. 启动扫描器（与路径一相同的启动脚本，但使用当前 conda 环境）
-bash app/launcher/start_linux_macos.sh    # Linux / macOS
-app\launcher\start_windows.bat            # Windows
-
-# 4. 复现实验（详见「实验复现」章节）
-ollama pull qwen2.5-coder:7b              # 实验基座模型
-cd experiments/exp_01_basic_scan && python3 run_experiment.py
-```
-
-> **环境约定**：所有实验脚本（尤其 exp_03 / exp_04 RAG 相关）依赖 `chromadb`、`sentence-transformers` 等包，这些只在 `graproj` conda 环境中安装。请在运行任何实验前激活该环境，否则会出现 `ModuleNotFoundError`。
-
-### 手动启动（不用启动脚本）
+### 手动启动
 
 如果不想用启动脚本（例如已在 IDE 中配置好环境），可以手动分步启动：
 
@@ -150,10 +132,10 @@ start http://localhost:8765       # Windows
 
 ### 切换推理后端
 
-后端按以下优先级**自动解析**（`graduation_project/transformers_client.py` `resolve_default_backend`）：
+后端按以下优先级**自动解析**：
 
 1. `VULN_SCANNER_BACKEND` 显式设置时优先（`ollama` / `transformers` / `llamacpp`）；
-2. 配置了 `VULN_SCANNER_ADAPTER`，或 `models/` 下探测到合法 LoRA adapter（优先 α0.5 stage2）**且运行时兼容**时，自动选 **Transformers**——Q4 基座（NF4）+ FP16 LoRA 进程内推理，保 LoRA 增量精度，是论文指标的复现形态；
+2. 配置了 `VULN_SCANNER_ADAPTER`，或 `models/` 下探测到合法 LoRA adapter（优先 α0.5 stage2）**且运行时兼容**时，自动选 **Transformers**——Q4 基座（NF4）+ FP16 LoRA 进程内推理，精度最高；
 3. 否则回退 **Ollama**（GGUF Q4_K_M 合并量化的发布模型 v9max）——兼容性最好、依赖最少的一键启动形态；探测到 adapter 但本机跑不动 transformers 时也会自动回退并打印告警。
 
 ```bash
@@ -219,13 +201,11 @@ Windows 使用 `set` 代替 `export`。选择进程内后端后，启动器会�
 
 ## 使用指南
 
-系统提供**四种**使用方式：**Web 界面**、**命令行工具**、**VS Code 插件**、**IntelliJ 插件**。四种方式暂时共享同一个后端服务，功能对等。
+系统提供**四种**使用方式：**Web 界面**、**命令行工具**、**VS Code 插件**、**IntelliJ 插件**。四种方式共享同一个后端服务，功能对等。
 
 ### Web 界面
 
-启动后端后浏览器访问 `http://localhost:8765`，包含四个页面：
-
-#### 页面总览
+启动后端后浏览器访问 `http://localhost:8765`，包含五个页面：
 
 | 页面 | 路径 | 功能 |
 |------|------|------|
@@ -279,7 +259,7 @@ Windows 使用 `set` 代替 `export`。选择进程内后端后，启动器会�
 |------|------|
 | 多模型投票 | 勾选后选择 ≥ 2 个模型，系统顺序加载各模型并投票聚合结果（更准但更慢） |
 | 两阶段扫描 | 系统**唯一**扫描路径（工具召回 + LLM 自一致率裁决），无需勾选即生效；本开关仅控制下方采样数设置是否可调 |
-| 自一致率采样数 | 两阶段 LLM 裁决的采样次数（1~10，默认 3，与论文 fixed5 评估组态一致）。采样越多越准、越慢 |
+| 自一致率采样数 | 两阶段 LLM 裁决的采样次数（1~10，默认 3）。采样越多越准、越慢 |
 
 > 外部工具（Bandit / Semgrep / Gitleaks / Trivy）已内置于两阶段 Stage 1 工具召回，
 > 无需单独勾选：密钥（secret）与依赖漏洞（SCA）类发现由确定性工具直接报告，
@@ -295,6 +275,7 @@ Windows 使用 `set` 代替 `export`。选择进程内后端后，启动器会�
 - **Source & Sink**：污点来源与触发点（如适用）
 - **漏洞说明**：自然语言解释漏洞原理
 - **修复建议**：可执行的修复代码或方案
+- **信任层明细**：裁决档位、一致性置信度、共形预测、反事实验证与证据门；低置信候选列入人工复核清单
 - **模型原始输出**：LLM 的完整 JSON 输出
 
 #### API 文档
@@ -504,11 +485,9 @@ IntelliJ 插件提供编辑器内选中代码的扫描功能，结果以气球�
 
 依赖装进哪个 Python 环境，就必须用哪个环境卸载：
 
-- **路径一（终端用户）**：依赖是启动器用系统 Python 自动安装的，直接运行卸载脚本即可；
-- **conda / venv 用户**：安装时先激活过环境，卸载前也必须先激活同一个环境（如 `conda activate graproj`）再运行卸载脚本；
-- 卸载脚本只清理“运行它的那个 Python 环境”，换环境运行会提示“未发现本项目相关包”并跳过，等于没有真正卸载。
-
-> 实验/训练环境（`graproj`、`AI` 等）是开发者自用环境，普通用户不需要创建。**不要在实验/训练环境里运行卸载**——它会把训练相关包（transformers、peft、accelerate 等）和共享缓存一并删掉。
+- **一键启动用户**：依赖是启动器用系统 Python 自动安装的，直接运行卸载脚本即可；
+- **conda / venv 用户**：安装时先激活过环境，卸载前也必须先激活同一个环境再运行卸载脚本；
+- 卸载脚本只清理"运行它的那个 Python 环境"，换环境运行会提示"未发现本项目相关包"并跳过，等于没有真正卸载。
 
 ### 卸载范围
 
@@ -526,7 +505,7 @@ IntelliJ 插件提供编辑器内选中代码的扫描功能，结果以气球�
 ### 不会自动删除的内容
 
 - **外部扫描工具**（bandit / semgrep / gitleaks / trivy）：这些是共享系统工具，可能被其他项目使用，卸载脚本不会动它们；如需删除请按安装方式手动卸载（如 `pip uninstall bandit semgrep`、`choco uninstall gitleaks trivy`）；
-- **conda 环境本身**（如 `graproj`、`AI`）：卸载脚本只清当前环境里的包，不会删除任何 conda 环境；开发者如需清理可自行 `conda env remove -n graproj`；
+- **conda 环境本身**：卸载脚本只清当前环境里的包，不会删除任何 conda 环境；
 - **npm 全局包**（如 `@vscode/vsce`）：如需删除请手动 `npm uninstall -g @vscode/vsce`。
 - **其他项目也在用的通用基础库**（如 urllib3、certifi、typing-extensions 等）：脚本只卸载本项目直接/间接相关的顶层包，保留这类共享基础库，避免影响同一环境里的其他程序。
 
@@ -538,898 +517,27 @@ IntelliJ 插件提供编辑器内选中代码的扫描功能，结果以气球�
 
 ***
 
-## 核心结果
-
-### 两阶段系统级结果（exp_07，最新，2026-08-18）
-
-**两阶段架构（Stage 1 工具召回 + Stage 2 LLM 裁决 + 共形/反事实门控）在 Nivis-α0.5 上全量验证达标**（87 段测试集，干净环境 `--no-signal-feedback`，裁决式 prompt `triage_train_aligned`）：
-
-| 配置 | recall（不含 review） | FPR | accuracy | 明细 |
-|---|---|---|---|---|
-| 纯 LLM（α0.5，combined 变体） | 0.967 | 0.154 | 0.931 | 对照基线 |
-| 工具链 fixed3（历史，带污染） | 0.982 | 0.167 | 0.862 | 演进参考 |
-| **工具链 fixed5（当前，干净环境）** | **1.000** | **0.043** | **0.862** | TP=53 FN=0 TN=22 FP=1，review 11 |
-
-- 唯一 FP 为 `hard_crossfile_01_input`（CWE-441 缺失型漏洞，无确定性校验手段，已知可接受遗留，论文写局限）
-- **真实 CVE 验证（CVE-fix 20 段，解析器修复后 2026-08-20）**：两阶段 recall **0.882** / strict_recall **0.882**（cwe_mismatch=0），反超纯 LLM 同模型对照（recall 0.850 / strict 0.800）——工具证据链 + 训练对齐裁决的真实收益首次在真实集上体现
-- **工具层提示质量审计**（五指标 A-E，`prompt_quality_audit.py`）：工具召回覆盖率 A 59.0% / 提示到点率 B 86.1% / 误导率 D 14.3%（剩余缺口=逻辑漏洞无专用规则，归训练侧 Nivis-α1）
-- 结果文件：`experiments/exp_07_two_stage_eval/results/exp_07_two_stage_eval.nivis-alpha0.triage_train_aligned.20260818_104203.json`；演进基线见 [docs/方法论_工具模型自适应闭环.md](docs/方法论_工具模型自适应闭环.md) §13.1b
-
-### 模型侧现状（截至 2026-09-02）
-
-- **当前最佳已评估模型 = Nivis-α0.5**（Qwen3-8B 两阶段训练：stage1 打底 + stage2 回收 dev 续训，7972 条）：纯 LLM 形态 combined 变体 recall 0.967 / FPR 0.154 / strict_recall 0.770；接两阶段工具链后即上表 fixed5（recall 1.000 / FPR 0.043）。默认运行组态为 **Transformers + α0.5 stage2 adapter**（保 LoRA FP16 精度）。
-- **Ollama Registry 发布物 = v9max**（`garrywhite109909/graduation-vuln-scanner:v9max`，Q4_K_M 合并量化）：面向一键启动用户，指标低于 HF 管道形态（见下文量化缺口说明）。
-- **Nivis-α0.6 = 下一轮训练目标，数据已就绪待训**：训练集 `final_train_chatml_alpha06_v2_15.jsonl`（**10167 条**，2026-09-02 写回冻结），历经 v2_0~v2_15 共 15 个审计版本；测试面扩至 **157 段**（87 合成 + 50 真实 CVE 滚动 dev（SHA-256 冻结）+ 20 CVE-fix），并完成 MITRE v4.20 官方目录 + NVD/GHSA 逐条核对（94% 匹配，11 处错标全部修复）。路线图见 [docs/实验路线图.md](docs/实验路线图.md)。
-
-### 模型级结果（v9max，已发布形态）
-
-v9max（Qwen3-8B-Instruct + 双模型蒸馏数据 7692 条，云端 A800 bf16 全精度 LoRA r=8 + rsLoRA 训练，Q4_K_M 量化部署）是当前 Ollama Registry 上的发布模型。
-
-下表为 **HF 评估管道**（evaluate.py：NF4 4bit 基座 + FP16 LoRA 增量叠加）的结果，**strict 列为 2026-08-18 CWE 纠正口径**（关键词归一 + evidence 守卫 + 父子族匹配后重算，与旧"未纠正"数字不可混用）：
-
-| 测试集 | 样本数 | recall | FPR | accuracy | strict_recall（纠正口径） |
-|---|---|---|---|---|---|
-| 合成集（87 段） | 87 | **1.000** | 0.423 | 0.874 | 0.656 |
-| CVE-fix 真实集 | 20 | **0.950** | - | 0.950 | 0.750 |
-
-**发布形态（Ollama GGUF Q4_K_M 合并量化）指标低于上表**——G0 方法学修复重跑（2026-08-08）实测：CVE-fix 真实集 recall **0.75~0.79**（base 15/19 含 1 条 parse_fail；combined 15/20）、合成集 recall 0.93~0.95。缺口来源不是"量化 vs 未量化"，而是**两种 4-bit 管道的差异**：HF 管道 LoRA 增量保持 FP16 精度，Ollama 发布形态把 base+LoRA 合并后整体压进 Q4_K_M，LoRA 信号被一并重量化（transformers 后端已将 merge 通道永久关闭，从代码层锁定发布口径）。新装的 transformers 进程内后端（NF4 基座 + FP16 LoRA，设 `VULN_SCANNER_ADAPTER` 启用）可在部署侧复现 HF 管道精度。
-
-与 Qwen3-8B 零样本锚点基线对比，v9max 的核心收益集中在**判别与泛化**：**CVE-fix 真实集 recall 从 0.375 提升到 0.950（+57.5pp，HF 管道；Ollama 发布形态为 0.75~0.79）**，合成集 recall 保持 1.000（0 FN）——合成集虚高 59.2pp 的问题在真实集上被有效收敛。需要如实说明的是：**CWE 归因（strict 口径）单靠 SFT 并未提升**（纠正口径下合成集 strict_recall baseline 0.705 → v9max 0.656，不升反降），归因能力的补足走的是后处理纠正（CWE Normalizer / LineNormalizer）与两阶段架构（fixed5 strict_recall 0.811）两条路——这也是本项目"SFT 收益集中在判别与格式，归因需架构补足"这一核心结论的来源。
-
-> FPR（合成集 0.423）偏高的根因是模型"模式匹配 > 深度理解"，对部分防御措施（subprocess 参数化列表、shlex.quote、whitelist+abspath）产生误报。**该问题已由两阶段架构收敛**：共形预测 + 反事实验证 + 确定性证据门的 2.5 代信任层把系统级 FPR 压到 fixed5 的 **0.043**（见上表）；模型侧的进一步收敛（DPO/GRPO 偏好优化）规划于 Nivis-α1。
-
-```text
-CWE-fix recall(真实集):   baseline 0.375 → v5 0.571 → v9max 0.950（HF 管道）
-                          v9max Ollama 发布形态（GGUF Q4_K_M）: 0.75~0.79（G0 重跑，2026-08-08）
-strict_recall(合成集, 纠正口径): baseline 0.705 → v9max 0.656（SFT 未注入 CWE 知识，如实披露）
-系统级（α0.5 + 两阶段工具链 fixed5）: recall 1.000 / FPR 0.043 / strict_recall 0.811
-```
-> 完整台账见 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)；v9max 训练与评估详见 [docs/论文/第5章_训练主线.md](docs/论文/第5章_训练主线.md)。
-
-***
-
-## 当前状态与待决策
-
-> **截至 2026-09-02**：exp_01~05 零样本基线 + Prompt 消融已完成；exp_06 完成 v2~v9 本地迭代、**v9max** 发布与 **Nivis-α0 / α0.5** 两阶段训练；exp_07 两阶段工具链架构达标（fixed5：recall 1.000 / FPR 0.043）。2026-08-22 起进入 **α0.6 数据工程**：训练集经 v2_0~v2_15 共 15 个审计版本演进至 **10167 条冻结**，测试面扩至 157 段并完成官方口径核对。下一站：α0.6 云端训练与评估（P1/P2），以及 Nivis-α1（DPO/GRPO 偏好优化，方案与脚本已就绪）。
-
-> **2026-08-08 追加**：`fix_suggestion` 已从"完整可运行修复代码（``` 围栏）"改为
-> **行号锚定的单行局部修复建议**（如 `line 3: 应改为 ...`），原因：客户端 6K~8K
-> 上下文放不下完整修复代码，且 FixVerifier 已证伪（14/15 空建议是模型没输出，不是
-> 验证器问题）。schema/evaluate/verify-fix 已同步新口径，训练数据统一转换脚本见
-> `experiments/exp_06_finetune/scripts/convert_fix_to_localized.py`。
-
-| 阶段 | 内容 | 状态 |
-|---|---|---|
-| v9max 发布 | 双模型蒸馏 7692 条 → A800 bf16 训练 → Q4_K_M 发布为 Ollama 模型 | ✅ 已完成 |
-| Nivis-α0 / α0.5 | α0（8616 条，V3_PROMPT）→ α0.5 两阶段训练（7972 条，stage2 回收 dev） | ✅ 已训练并评估（exp_07） |
-| 两阶段架构验证 | 工具召回 + LLM 裁决 + 共形/反事实门控，α0.5 fixed5 全量达标（recall 1.000 / FPR 0.043）；CVE-fix 真实集 0.882（解析器修复后） | ✅ 已完成（2026-08-18/20） |
-| α0.6 数据工程 | 训练集 v2_0~v2_15 共 15 版审计演进 → **v2_15 = 10167 条冻结**；6 轮递进审计（机检全量 → 语义深审 510 条 → 人工裁决 → 官方口径核对）；g20~g26 辨析组 81 条定向样本；测试面 157 段（新增 50 段真实 CVE 滚动 dev，SHA-256 冻结），MITRE v4.20 + NVD/GHSA 逐条核对、11 处错标修复 | ✅ 数据就绪（2026-09-02） |
-| α0.6 训练与评估 | 云端 SFT（复用 rsLoRA r8 配方）→ L0/L1/CVE-fix 三层回归 → 与 fixed5 逐样本 diff | ⏳ 未启动（P1/P2，见 [实验路线图](docs/实验路线图.md)） |
-| Nivis-α1 | DPO/GRPO 偏好优化 + 数据飞轮，收敛剩余 FPR 与 CWE 归因；GRPO 奖励函数（防 reward-hacking 三道闸）与 DPO 脚本已实现 | ⏳ 规划与脚本就绪，未训练 |
-
-***
-
-## 项目简介
-
-利用本地部署的开源大语言模型对源代码进行安全审计，目标是构建一个相比传统静态分析工具（Bandit / Semgrep / CodeQL）具备以下优势的系统：
-
-| 维度   | 传统工具（Bandit/Semgrep） | 本系统（LLM 驱动）          |
-| ---- | -------------------- | -------------------- |
-| 检测方式 | 固定规则模式匹配             | 代码语义理解、上下文感知         |
-| 漏洞覆盖 | 已知漏洞模式               | 可发现变体/非典型漏洞          |
-| 输出形式 | 漏洞类型 + 规则编号          | 自然语言解释 + 修复建议 + 修复代码 |
-| 多语言  | 工具专属规则集              | 跨语言统一理解              |
-| 误报控制 | 规则泛化能力差              | 上下文判断过滤/净化逻辑         |
-
-**核心卖点**：传统工具是"模式匹配"，本系统是"语义理解"。
-
-***
-
-## 实验环境
-
-| 项目 | 配置 |
-| --- | --- |
-| CPU | AMD Ryzen 5 9600X × 12 |
-| 内存 | 32 GB |
-| 显卡 | AMD Radeon RX 9060 XT 16 GB |
-| 操作系统 | Ubuntu 26.04 LTS（内核 7.0.0-15-generic） |
-| 桌面环境 | GNOME 50 / Wayland |
-| GPU 驱动 / 计算栈 | ROCm 7.2.4 + PyTorch 2.11.0+rocm7.2 |
-| Python 环境 | miniconda `graproj`（Python 3.11） |
-| 本地 LLM 服务 | Ollama |
-
-### 模型清单
-
-| 角色 | 模型 | 阶段 |
-| --- | --- | --- |
-| 推理基座 | `qwen2.5-coder:7b` | exp_01 ~ exp_05 |
-| 训练 student(已发布) | `Qwen/Qwen3-8B` + LoRA (r=8, rsLoRA) | exp_06 云端 A800 训练 v9max |
-| 训练 student(当前最佳) | `Qwen/Qwen3-8B` + LoRA (r=8, rsLoRA)，两阶段 stage1+stage2 | exp_06 α0（8616 条）/ α0.5（7972 条） |
-| 训练 student(下一轮) | `Qwen/Qwen3-8B` + LoRA (r=8, rsLoRA) | exp_06 α0.6（训练集 v2_15 = 10167 条已冻结，待训） |
-| 训练 student(本地历史) | `Qwen/Qwen3-8B` + 4bit QLoRA (r=8, rsLoRA) | exp_06 P2 本地 SFT v5 |
-| 训练 student(历史) | Qwen2.5-Coder-7B-Base → KnItLM CPT (r=64) → merge 到 Instruct | exp_06 Phase 1-3(已归档) |
-| PD teacher(已暂缓) | `qwen3-coder:30b`（MoE） | exp_06 Phase 4(已归档) |
-| 蒸馏 teacher | DeepSeek V4-Flash / GLM-5.2（Kimi K3 未参与） | 双模型 API 蒸馏（7692 条） |
-| 对照模型 | `deepseek-coder-v2:16b` / `qwen2.5-coder:14b` / `gemma4:12b` / `gemma4:26b` / `gpt-oss:20b` | exp_04 多模型对比 |
-
-> 完整环境清单（Embedding 模型、向量库版本、传统工具版本等）见 [规划.md](规划.md) "实验环境"小节；训练与推理全链路技术栈见本文"技术架构与全栈"小节。
->
-> 注：模型权重不入库（见 `.gitignore`）。推理基座需 `ollama pull qwen2.5-coder:7b`；训练基座从 HuggingFace 拉取。以上为台式机实验环境，笔记本仅用于代码编辑与文档审查。
-
-***
-
-## 项目结构
-
-> 提示：大模型权重（`*.safetensors`/`*.gguf`）、`__pycache__/`、`*.log`、`outputs/` 中间 checkpoint 以及 `data/chroma_db/` 均已通过 [`.gitignore`](.gitignore) 排除。核心模块为 `graduation_project/`，实验按 `exp_01~07` 分阶段存放（exp_07 为两阶段工具链评估）。
-
-<details>
-<summary>点击展开完整项目结构</summary>
-
-```
-Graduation-Project/
-├── README.md                              # 本文档
-├── .gitignore                             # 排除大模型/缓存/日志/中间 checkpoint
-├── pyproject.toml                         # 项目元数据 + 依赖声明（支持 pip install -e .）
-├── requirements.txt                       # 锁版本依赖清单
-├── uninstall.py                           # 跨平台卸载主脚本（Windows/Linux/macOS）
-├── uninstall.sh                           # Linux/macOS 卸载入口
-├── uninstall_windows.bat                  # Windows 卸载入口
-├── TODO.md                                # 代码审查问题清单（处理进度跟踪）
-├── 规划.md                                 # 项目阶段规划与进度（唯一进度源）
-├── app/                                   # Web 应用与启动器
-│   ├── backend/                           #   FastAPI 后端 + 静态前端页面
-│   │   ├── main.py                        #     API 入口（/api/* 路由）
-│   │   ├── services/                      #     扫描/抓取/报告服务
-│   │   └── static/                        #     HTML 前端（仪表盘/扫描台/CWE/态势）
-│   ├── launcher/                          #   一键启动器
-│   │   ├── bootstrap.py                   #     检测 Ollama/模型/启动后端/开浏览器
-│   │   ├── start_windows.bat              #     Windows 一键启动
-│   │   ├── start_linux_macos.sh           #     Linux/macOS 一键启动
-│   │   └── vuln_scanner_cli.py            #     命令行扫描入口
-│   ├── vscode-extension/                  #   VS Code 插件
-│   └── intellij-extension/                #   IntelliJ 插件
-├── docs/                                  # 设计文档与改进建议
-│   ├── _archive/                          #   历史建议归档
-│   │   ├── glm的建议_20260628.md          #     GLM 给出的改进路线建议
-│   │   ├── kimi的建议_20260628.md         #     Kimi 给出的智能体分工建议
-│   │   ├── 临时提示词_下一步计划_20260706.md #   exp_01~03 时代八大修复建议（已归档）
-│   │   ├── wenti_20260719.md              #     r16_e5 时代问题分析笔记（历史快照）
-│   │   ├── 方法_20260719_qwen25.md        #     Qwen2.5 时代训练方法体系（已归档）
-│   │   ├── cpt_建议_20260719.md           #     CPT 数据策略建议（已归档）
-│   │   ├── 改进_历史分析_20260710.md      #     r8_e1 训练问题分析（已归档）
-│   │   ├── 脚本审查遗留问题_20260722.md   #     全脚本审查遗留项（已归档）
-│   │   ├── 对话_内部备忘.md               #     AI 对话过程记录（内部）
-│   │   └── 必须手动学习的地方_内部备忘.md #     手工操作备忘（内部）
-│   ├── 项目进展摘要.md                    #   面向导师/评审的一页纸进展摘要 ⭐
-│   ├── 实验路线图.md                      #   alpha06 → alpha1 执行顺序权威（P0~P5 阶段依赖与 Exit 判据）⭐
-│   ├── 测试集建设方案.md                  #   评估体系细则（三层测试面 157 段）
-│   ├── 训练优化计划.md                    #   本轮 SFT 优化依据
-│   ├── 方法论_工具模型自适应闭环.md        #   exp_07 两阶段架构决策全集（4.8 万字）
-│   ├── 方法.md / 过程.md                  #   训练方法体系 / 实验过程时间线
-│   ├── 论文/                              #   毕业论文章节草稿 + 答辩素材库（素材库_论文写作素材收集.md）+ PPT 框架
-│   │   ├── 大纲.md                        #     论文结构与各章节数据映射
-│   │   ├── 第1章_绪论.md                  #     研究背景、问题、贡献
-│   │   └── 第5章_训练主线.md              #     exp_06 P0-P3 核心实验与结果
-├── tools/                                 # 环境工具脚本（ROCm 安装/回滚等）
-│   ├── install_rocm_7.2.4.sh              #   ROCm 7.2.4 安装脚本
-│   └── revert_rocm_to_ubuntu.sh           #   ROCm 回滚到 Ubuntu 仓库版本脚本
-├── graduation_project/                    # 核心代码库（pip install -e . 后可全局 import）
-│   ├── __init__.py
-│   ├── schema.py                          # 统一输出 schema（VERDICT_SCHEMA 唯一来源 + 解析函数）
-│   ├── result_types.py                    # 扫描结果容器（SingleResult/BatchResult，核心层通用）
-│   ├── prompts.py                         # 统一 Prompt 模板（SYSTEM_PROMPT + build_user_prompt）
-│   ├── llm_client.py                      # Ollama LLM 客户端（支持 RAG 增强）
-│   ├── transformers_client.py             # Transformers 进程内推理后端（Q4 基座 + FP16 LoRA）
-│   ├── llamacpp_client.py                 # llama.cpp 客户端（GGUF 本地推理）
-│   ├── vllm_client.py                     # vLLM 推理加速客户端
-│   ├── chroma_manager.py                  # Chroma 向量数据库管理器（add / upsert / query）
-│   ├── code_slicer.py                     # AST 代码切片器（tree-sitter，长文件按函数/块切分）
-│   ├── prefilter.py                       # 传统规则预筛层（明显漏洞/安全样本短路跳过 LLM）
-│   ├── taint_tracker.py                   # 轻量污点分析（同函数 source→sink 启发式匹配）
-│   ├── external_scanner.py                # 外部工具扫描（Bandit / Semgrep / Gitleaks / Trivy）
-│   ├── two_stage_scanner.py               # 两阶段架构：工具召回候选 + LLM 自一致率裁决
-│   ├── fix_verifier.py                    # 修复建议验证（语法校验 + 危险模式移除检查）
-│   ├── sarif_report.py                    # SARIF 2.1.0 报告导出
-│   ├── paths.py                           # 路径解析（项目根 / 模型 / LoRA adapter）
-│   └── semgrep_rules/                     #   Stage 1 工具召回规则（sqli/cmdi/codei taint）
-├── app/backend/services/                  # 业务服务层（复用核心包，依赖 app 注册表/编排）
-│   ├── scanner.py                         #   扫描编排（LLM 推理 + 切片 + RAG + 预筛）
-│   ├── multi_model_scanner.py             #   多模型投票扫描（顺序加载/卸载避免 OOM）
-│   ├── model_registry.py                  #   模型注册表（允许模型 + prompt 变体选择）
-│   └── reporter.py                        #   扫描报告生成（单文件/汇总）
-├── experiments/                           # 实验目录（按阶段编号）
-│   ├── exp_01~05_summary.md               #   零样本推理基线五实验核心结论串讲 ⭐
-│   ├── utils.py                           #   实验公共工具（manifest 加载 / 指标统计 / 结果落盘）
-│   ├── exp_01_basic_scan/                 # 阶段一：LLM 漏洞检测能力摸底
-│   │   ├── run_experiment.py              #   批量测试脚本（调 Ollama API + 增量落盘 + 自动卸载显存）
-│   │   ├── exp_01_report.md               #   实验报告
-│   │   ├── samples/                       #   14 段漏洞代码样本
-│   │   │   ├── manifest.json              #     样本清单（含期望标签）
-│   │   │   ├── sql_injection_01.py / 02.py
-│   │   │   ├── xss_01.php / 02.js
-│   │   │   ├── command_injection_01.py / 02.js
-│   │   │   ├── path_traversal_01.py / 02.java
-│   │   │   ├── hardcoded_secret_01.py / 02.java
-│   │   │   ├── insecure_deserialization_01.py / 02.java
-│   │   │   ├── safe_01_parameterized_query.py
-│   │   │   └── safe_02_subprocess_list.py
-│   │       └── results/
-│   │           ├── results.qwen2.5-coder-7b.20260630.json   # 14 次推理的完整原始输出（带时间戳）
-│   │           └── results.qwen2.5-coder-7b.json            # 同上内容副本
-│   ├── exp_02_baseline_tools/             # 阶段二：传统工具对比基线
-│   │   ├── run_baseline.py                #   Bandit + Semgrep 批量调用脚本
-│   │   ├── exp_02_report.md               #   实验报告（含 LLM vs 传统工具横向对比）
-│   │   ├── README.md                      #   实验说明
-│   │   └── results/                       #   复用 exp_01 样本，结果按工具分组
-│   ├── exp_03_rag_knowledge/              # 阶段三：RAG 知识库增强
-│   │   ├── run_rag_experiment.py          #   RAG+LLM 批量对比实验脚本
-│   │   ├── exp_03_report.md               #   实验报告（纯 LLM vs RAG+LLM 对比）
-│   │   ├── results/                       #   实验结果
-│   │   └── knowledge_data/
-│   │       ├── knowledge.json             #   漏洞知识条目（手工编写，72 条，覆盖 39 类 CWE）
-│   │       ├── build_knowledge.py         #   从 JSON 加载 → upsert 入库 Chroma（幂等可重复运行）
-│   │       └── test_rag.py                #   单样本快速验证脚本（正式实验用 run_rag_experiment.py）
-│   ├── exp_04_hard_samples/               # 阶段四：难样本压力测试 + 消融实验 + 多模型对比
-│   │   ├── samples/                       #   87 段扩展样本（v2/v3，典型 36 + 安全 18 + 难 27 + 噪音 6）
-│   │   │   ├── manifest.json              #     12 列 ground truth 标注
-│   │   │   ├── typical_*.py/php/js         #     典型漏洞样本
-│   │   │   ├── safe_*.py                  #     安全对照样本
-│   │   │   ├── hard_bypass_*.py            #     绕过式过滤难样本
-│   │   │   ├── hard_crossfile_*_{input,sink}.py  # 跨文件污点流难样本
-│   │   │   ├── hard_cve_*.py              #     真实 CVE 片段难样本
-│   │   │   ├── hard_longfile_*.py         #     长文件隐藏漏洞难样本
-│   │   │   ├── hard_owasp_*.py            #     OWASP/DVWA 风格难样本
-│   │   │   └── noise_*.py                 #     混淆/噪音样本
-│   │   ├── run_experiment.py              #   P1-4：纯 LLM 重复实验 + 置信区间（--repeat N）
-│   │   ├── run_rag_experiment.py          #   P1-5/P2-8：RAG 消融对照（--mode）+ Top-K（--top-k）
-│   │   ├── run_v3_qwen7b_all.sh           #   v3 qwen7b 顺序跑 4 组消融 + 3 个 Top-K 的驱动脚本
-│   │   ├── run_v3_multi_model.sh          #   v3 多模型横向对比驱动脚本（6 模型 × 87 段）
-│   │   ├── rerun_fix_samples.py           #   结果审查修复重跑脚本
-│   │   ├── generate_report.py             #   从 results/ 汇总生成 exp_04_report.md
-│   │   ├── exp_04_report.md               #   实验报告（P1-4 + P1-5 + P2-8 + 多模型对比综合分析）
-│   │   └── results/                       #   所有实验结果 JSON（含 _archive 历史版本）
-│   ├── exp_05_prompt_ablation/            # 阶段五：Prompt 工程消融对比
-│   │   ├── run_ablation.py                #   零样本 / Few-shot / 思维链 / 安全模式白名单 对比
-│   │   ├── exp_05_report.md               #   实验报告
-│   │   └── results/                       #   消融实验结果 JSON
-│   └── exp_06_finetune/                   # 阶段六：网络安全专用模型训练(Qwen3-8B 路线)
-│       ├── data/                          #   训练数据（入库以保证复现性）
-│       │   ├── README.md                  #     数据字典：每个 jsonl 的状态与生成方式
-│       │   ├── final_train_chatml_alpha06_v2_15.jsonl  # 当前训练主线 α0.6 数据（10167 条，2026-09-02 冻结）
-│       │   ├── final_train_chatml_alpha05.jsonl        # α0.5 训练集（7972 条，当前最佳模型）
-│       │   ├── final_train_chatml_v3.jsonl             # α0 训练集（8616 条）
-│       │   ├── _archive_cpt/              #     CPT 路线已归档数据
-│       │   ├── _archive_supplement/       #     Phase 3 supplement 已归档
-│       │   └── supplement_*.jsonl         #     各类对抗性补充样本（历史资产）
-│       ├── corpus/                        #   蒸馏与审计语料（α0.6 数据工程）
-│       │   ├── rolling_dev/               #     50 段真实 CVE 滚动 dev 集（frozen_lock.json SHA-256 冻结）
-│       │   └── repair_wave/               #     g20~g26 辨析组蒸馏溯源包与教师输出
-│       ├── audit/                         #   v2.12→v2_15 六轮数据审计产物（机检/语义深审/人工裁决/官方口径核对）
-│       ├── testset_cve_fix/               #   CVE-fix 真实集 20 段（含 label_basis 官方/手写标注来源）
-│       ├── scripts/                       #   训练 / 评估 / 数据生成脚本（train_qlora / evaluate / build_alpha06_* 等）
-│       ├── cloud_train/                   #   云端 A800 训练脚本与日志（v9max）
-│       ├── outputs/                       #   训练产物（不入库；仅保留 best/，中间 checkpoint 已清理）
-│       └── results/                       #   评估结果 JSON + 实验台账 EXPERIMENT_LEDGER.md
-│   ├── exp_07_two_stage_eval/             # 阶段七：两阶段工具链评估（fixed 系列，论文主数据）
-│   │   ├── eval_two_stage.py              #   两阶段评估驱动（--no-signal-feedback 评估隔离）
-│   │   ├── prompt_quality_audit.py        #   工具层提示质量审计五指标（A~E）
-│   │   └── results/                       #   fixed1~fixed5 结果 JSON + 信号注册表
-│   ├── prefilter_eval/                    # 附：预筛层独立评估（coverage 13.8% 实测）
-├── data/                                  # 本地持久化数据（不入库，见 .gitignore；首次运行 build_knowledge.py 后自动生成）
-│   └── chroma_db/                         #   Chroma 向量数据库（bge-m3 向量）
-└── releases/                              # 插件发布物（VS Code .vsix / IntelliJ .zip）
-```
-
-</details>
-
-***
-
-## 当前进度
-
-> **总体状态**：零样本推理基线（exp_01~05）已全部完成；训练主线（exp_06）完成 v2→v9 本地迭代、**v9max** 发布与 **Nivis-α0/α0.5** 两阶段训练；exp_07 两阶段工具链架构评估达标（fixed5：recall 1.000 / FPR 0.043）。2026-08-22 起转入 **α0.6 数据工程**（蒸馏扩充 + 六轮审计 + 官方口径核对），训练集 v2_15 = 10167 条已冻结待训。详细进度见 [规划.md](规划.md)、[docs/实验路线图.md](docs/实验路线图.md) 与 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)。
-
-### ✅ 阶段一：LLM 漏洞检测能力摸底（exp_01，2026-06-28）
-
-- **qwen2.5-coder:7b**：14 段典型样本召回率 100%、误报率 0%、准确率 100%，平均 7.65s/样本
-- 详见 [exp_01_report.md](experiments/exp_01_basic_scan/exp_01_report.md)
-
-### ✅ 阶段二：传统工具对比基线（exp_02，2026-06-29）
-
-- path_traversal_01.py 由 LLM 唯一检出，体现语义理解对模式匹配的优势；完整耗时与准确率对比见"研究主线与实验体系"小节中的"核心论点与论文定位"
-- 详见 [exp_02_report.md](experiments/exp_02_baseline_tools/exp_02_report.md)
-
-### ✅ 阶段三：RAG 知识库增强（exp_03，2026-06-29）
-
-- 知识库 39→72 条，覆盖 39 类 CWE；qwen7b 在 RAG+LLM 下准确率 100%
-- 详见 [exp_03_report.md](experiments/exp_03_rag_knowledge/exp_03_report.md)
-
-### ✅ 阶段四：难样本压力测试 + 多模型对比（exp_04 v3，2026-07-05）
-
-- v3 修复后 87 段样本（答案泄露已修复），qwen7b 纯 LLM 多数表决 recall=83.3%、FPR=33.3%、accuracy=78.2%
-- 6 模型横向对比：gemma4:12b/26b 最优（准确率 94.3%），deepseek 误报率最高（44.4%）
-- 详见 [exp_04_report.md](experiments/exp_04_hard_samples/exp_04_report.md)
-
-### ✅ 阶段五：Prompt 工程消融（exp_05，2026-07-06 首轮；2026-08-02 在 Qwen3-8B 上重做）
-
-- **首轮（qwen2.5-coder:7b）**：对比零样本 / Few-shot / 思维链（CoT）/ 安全模式白名单 四种 Prompt 策略，CoT 在 recall 上表现最优（95%）。
-- **重做（Qwen3-8B，`ablation_v2`）**：在 87 段合成集上系统对比 8 种提示词变体，**`+consistency`（一致性约束）综合最优**——recall 0.967 / FPR 0.115 / accuracy 0.943，同时显著优于 base（recall 0.934 / FPR 0.192 / accuracy 0.897）。
-- 结论：约束一致性（要求判定理由与结论自洽）能在不牺牲召回的前提下显著压低误报，是零样本条件下最有效的轻量手段；但 Prompt 工程触及天花板，无法替代模型层面的领域知识注入。
-- 详见 [exp_05_report.md](experiments/exp_05_prompt_ablation/exp_05_report.md) 与 `experiments/exp_05_prompt_ablation/results/exp_05_prompt_ablation_v2.qwen3-8b.ablation_v2.repeat1.20260802_*.json`
-
-### ✅ 阶段六：网络安全专用模型训练（exp_06 P0-P3，Qwen3-8B 路线，2026-07-27 起）
-
-- **P0 parse_fail 修复**：max_tokens 1024→2048，parse_fail 18/87 → 0/87，新锚点 recall 0.967 / FPR 0.269 / strict_recall 0.459。
-- **P1 CVE-fix 真实集校准**：8 样本真实 CVE-fix baseline recall 0.375，确认合成集虚高 59.2pp。
-- **P2 本地 SFT 迭代**：v2/v3/v4/v5/v6/v7/v8/v9 多版迭代；v4 因测试集泄漏被废弃；v6 hard-negative 负迁移、v8 对比 CoT 判别焦虑被归档；v7 真实 CVE 泛化飞跃，v9 数据到极限转云端。
-- **P3 DPO 本地不可行**：8bit OOM、4bit 梯度失效；DPO 数据保留待云 GPU 复用，成为"本地探索→云端放大"路线的转折点。
-- 详见 [规划.md](规划.md) §三/§四、[EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md) 与 [docs/论文/第5章_训练主线.md](docs/论文/第5章_训练主线.md)
-
-### ✅ 阶段七：双模型蒸馏 + 云端 A800 训练 v9max 发布（2026-08-02 ~ 08-07）
-
-- **双模型 API 蒸馏**：DeepSeek V4-Flash / GLM-5.2 双模型 API 蒸馏生成大规模训练数据（Kimi K3 未参与实际蒸馏），原始约 10700 条，经 CWE 归一化、泄漏审计、矛盾/重复清洗后最终 **7692 条**（漏洞 3493 / 安全 4199，安全占比 54.6%）。计划配比 1:3，清洗后实际约 1:1.2。
-- **云端 A800 训练**：Qwen3-8B bf16 全精度 LoRA（r=8 + alpha=16 + dropout=0.1 + rsLoRA），train 6539 / dev 1153，2 epoch，lr=1e-4，max_seq 6144，1636 步，约 4.1h，train_loss ≈ 0.529。
-- **v9max 评估**（HF 管道：NF4 基座 + FP16 LoRA）：合成集 87 段 recall 1.000 / FPR 0.423 / strict_recall 0.656（纠正口径）；真实 CVE-fix 20 段 recall 0.95 / strict_recall 0.750（纠正口径）/ fix_extracted 17/20，大幅增强真实漏洞检出。
-- **G0 方法学修复重跑（2026-08-08）**：文件名泄漏修复后全量重跑。Ollama 发布形态（GGUF Q4_K_M 合并量化）CVE-fix recall 实测 0.75~0.79（base 15/19 含 1 parse_fail；combined 15/20），与 HF 管道 0.95 的缺口来自 LoRA 增量是否保 FP16 精度；exp_05 消融结论（combined 变体最优）在 v9max 合成集上成立（FPR 19.2%→7.7%），但不迁移到真实 CVE。详见 [docs/过程.md](docs/过程.md) 2026-08-08 节。
-- **发布**：Q4_K_M 量化，发布为 Ollama 模型 `garrywhite109909/graduation-vuln-scanner:v9max`。
-- 详见 [docs/论文/第5章_训练主线.md](docs/论文/第5章_训练主线.md)、[docs/v9max_数据生成提示词.md](docs/v9max_数据生成提示词.md) 与 [docs/过程.md](docs/过程.md)
-
-### ✅ 阶段八：两阶段工具链架构评估与达标（exp_07，2026-08-12 ~ 08-18）
-
-- **对照实验触发方法论转变**：工具链修复前 recall 0.936 / FPR 0.191，26 个非正确样本归因显示 62% 为工具漏召（无 source 型漏洞纯 LLM 判对 15/16）→ 放弃"按漏洞类型补规则"，转向**自适应闭环**（工具定位 + LLM 语义兜底 + 裁决置信回填）。决策全集见 [docs/方法论_工具模型自适应闭环.md](docs/方法论_工具模型自适应闭环.md)。
-- **2.5 代架构**（共形预测统计门控 + 反事实反事实验证金标准门控 + 信号注册表回填，含信任分级/全票门槛/跨样本聚合/双向撤销）：α0 ollama 端五档演进 0.936/0.191 → **0.966/0.105**（recall/FPR），三维同时优于纯 LLM（0.934/0.154）。
-- **α0.5 + 裁决式 prompt（triage_train_aligned）fixed 系列演进**：fixed3 0.982/0.167（带跨跑污染，保留作对比）→ **fixed5 干净环境 1.000/0.043**（TP=53 FN=0 TN=22 FP=1，唯一 FP 为 CWE-441 缺失型已知遗留），2026-08-18 达标提交推送（`fcff343` + `b6fc7d6`）。
-- **提示质量审计固化**：五指标（召回覆盖率/到点率/噪音率/误导率/一致性）脚本 `prompt_quality_audit.py`，fixed5：A 59.0% / B 86.1% / D 14.3%，作为论文"工具层提示质量"证据。
-- **评估方法学教训落档**：抑制池跨跑污染（必须 `--no-signal-feedback`）、in-sample 共形校准泄漏、测试集反向拟合=答案泄漏（严禁）、归因分流铁律（工具问题本代修、模型问题归训练侧）。
-- 详见 [docs/过程.md](docs/过程.md) 2026-08-09~18 节、[docs/会话记忆匣_20260818.md](docs/会话记忆匣_20260818.md)
-
-### ✅ 阶段九：α0.6 数据工程（2026-08-22 ~ 09-02，当前所处阶段）
-
-- **蒸馏与合并（P0.1~P0.3）**：minimal-pairs 教师蒸馏 592 条（泄漏审计 0、格式 0）→ 合并构建 alpha06-v3 训练集并冻结（8316 条，2026-08-23）→ 后续经 v2_0~v2_15 共 15 个审计版本演进，终版 **v2_15 = 10167 条**（2026-09-02 写回）。
-- **六轮递进审计**：v2.12 十项机检全量体检 → v2_13 中期审查修复 → v2_14 agent 全量审计（脚本层 10021 条 + 语义层 17 批 510 条深审，产出 72 删 / 234 修 / 19 存疑清单）→ v2_15 wave1 修复（教师漏判 13 条重蒸馏 + 转义强污染约 313 条批量修复 + 23 条逐条人工裁决）→ 官方口径测试集审查 → s9 全量非语义机检（C1~C11）。产物在 `experiments/exp_06_finetune/audit/`。
-- **辨析组定向补样**：从 α0.5 前端实拍归纳 **F1~F12 十二种实证失败模式**，构建 g20~g26 七组辨析对抗样本累计入库 81 条（密码学编号族互斥 / 证据置信度 / 主漏洞 vs 伴生凭证 / 案例锚 / 防御识别 safe / CWE-77 命令语言域）。
-- **测试面扩至 157 段 + 官方口径核对**：新增 rolling_dev 50 段真实 CVE（SHA-256 冻结锁，"不参与训练/选型"纪律）；对 87 + 50 + 20 三套测试集逐条核对 MITRE v4.20 官方目录与 NVD/GHSA 字段（68 个真实 CVE），94% 匹配、确认错标 11 处全部修复（含 P0/P1/P2 三轮），手写样本补 `label_basis` 标注区分官方归因与模式参考。
-- 详见 [docs/实验路线图.md](docs/实验路线图.md)（P0~P5 阶段依赖与 Exit 判据）与 `experiments/exp_06_finetune/audit/` 各轮审计报告
-
-***
-
-## 研究主线与实验体系
-
-> 本项目不是简单"用 LLM 跑一遍样本"，而是一条从**零样本推理**到**领域知识注入**再到**推理分布校准**的完整研究链。"当前进度"已给出各阶段结果，本节说明实验之间的逻辑关系、方法演进与论文定位。
-
-### 主线一：零样本与增强推理（exp_01 ~ exp_05）
-
-验证"本地开源 LLM 能否在不做任何训练的情况下完成代码安全审计"，并逐步探索增强手段。
-
-| 实验 | 核心问题 | 关键结论 | 论文定位 |
-| --- | --- | --- | --- |
-| exp_01 | 典型漏洞检出下限 | qwen2.5-coder:7b 在 14 段典型样本上 recall/FPR/accuracy 均达 100%，证明基座能力足够 | 能力基线 |
-| exp_02 | 与传统工具（Bandit / Semgrep）的对比 | LLM 在 path_traversal 等语义依赖场景显著优于规则工具；但单样本耗时更高 | 差异化价值 |
-| exp_03 | RAG 知识库能否提升判定质量 | 72 条 CWE/OWASP 知识 + Chroma 检索，典型样本准确率保持 100%，难样本上提供可解释依据 | 知识增强 |
-| exp_04 | 难样本压力测试与消融 | v3 87 段样本（修复答案泄露后）上纯 LLM accuracy=78.2%；RAG 消融显示知识相关性价值有限，模型基座已掌握典型模式 | 能力边界 |
-| exp_05 | Prompt 工程消融 | Qwen3-8B 上系统对比 8 种变体，`+consistency`（一致性约束）最优：recall 0.967 / FPR 0.115 / accuracy 0.943；CoT 单独召回 88.5% | 工程优化/能力边界 |
-
-### 主线二：网络安全专用模型（exp_06，Qwen3-8B 路线）
-
-当零样本能力触顶后，转入训练主线。2026-07-22 将基座从 Qwen2.5-Coder-7B 切换为 Qwen3-8B，目标是**在 8B 规模上通过高效微调提升 CWE 归因能力**，并保持本地可部署。
-
-| 阶段 | 方法 | 核心变更 | 结果 | 方法论意义 |
-| --- | --- | --- | --- | --- |
-| P0 | parse_fail 修复 | max_tokens 1024→2048 | parse_fail 18/87 → 0/87；暴露真实 FPR 27% / strict_recall 46% | 评估基础设施必须先修，否则指标被蒙蔽 |
-| P1 | CVE-fix 真实集 | NVD-by-CWE 抓取 8 真实 CVE-fix | 合成集 recall 0.967 vs CVE-fix recall 0.375，虚高 59.2pp | 合成集不能替代真实 CVE 泛化评估 |
-| P2 v2 | QLoRA SFT | 复用 Qwen2.5 时代 823 条数据 | strict_recall 0.459→0.623；CVE-fix recall 0.375→0.625 | 旧数据兼容 Qwen3，但 CWE 归因仍弱 |
-| P2 v3 | SFT + CWE 统一 + CoT 重写 | 36 条 CWE 统一 + 107 条 CoT 重写 + 9 条 LDAP | 合成集 recall 0.984 / FPR 0.192；CVE-fix recall 回退 0.500 | CoT 清单化对真实 CVE 隐蔽模式更钝 |
-| P2 v4 | SFT + 反清单式 prompt | 数据流推理导向 prompt + 7 条 CWE-441 | 指标看似改善，但存在训练-测试泄漏 | **数据可信度比指标绝对值更重要** |
-| **P2 v5** | **SFT + 泄漏清洗** | 删除 100 条泄漏/近泄漏样本 + 10 条弱密码学 | **recall 1.000 / FPR 0.231 / strict_recall 0.590；CVE-fix recall 0.571** | **首个可信评估基线** |
-| P2 v6 | hard-negative SFT | v5 + 6 个 FP 正确拒绝 CoT | FPR↓ 但 recall 和 CVE-fix 泛化受损 | 简单 hard-negative 得不偿失 |
-| P2 v7 | 实战专用 SFT | 针对 CWE-90/441/190 盲区 + 反事实 CoT | CVE-fix(20) recall 0.800 / strict_recall 0.650 | 针对真实漏洞盲区补样本 |
-| P2 v8 | 对比 CoT SFT | 引入判别性对比 CoT | FN↑、FP 激增（判别焦虑 + 冲突信号） | 对比 CoT 得不偿失 |
-| P2 v9 | SFT 收敛 | 清洗冲突样本 + 多样安全代码 + 降 epoch | 数据到极限，转云端放大 | 本地数据量是硬瓶颈 |
-| P3 | DPO | `dpo_merged.jsonl` 104 条偏好对 | 本地 16GB GPU 不可行（8bit OOM、4bit 梯度失效） | 消费级 GPU 硬件约束 → 转云 |
-| **v9max** | **双模型蒸馏 + A800 训练** | 7692 条蒸馏数据 + bf16 LoRA(r=8,rsLoRA) | **合成集 recall 1.000 / FPR 0.423 / strict_recall 0.656（纠正口径）；CVE-fix recall 0.95（HF 管道）；Ollama 发布形态 CVE-fix recall 0.75~0.79（G0 重跑）** | **本地探索 → 云端放大路线验证** |
-| α0 | 数据继续清洗链 | 8616 条（quality_final + 6 个补充集，system 统一 combined） | 合成集 acc 0.953（merge + few_shot）/ FPR 0.038；CVE-fix recall 0.80~0.90（Ollama） | 二次蒸馏 + 数据清洗显著压 FPR |
-| α0.5 | 两阶段训练 | 7972 条，stage1 打底 + stage2 回收 dev 续训 | 纯 LLM combined 0.967/0.154/strict 0.770；接两阶段工具链 = fixed5 **1.000/0.043/strict 0.811** | 小样本两阶段续训 + 工具链协同达标 |
-| α0.6 | 数据工程（待训） | 训练集 v2_15 = 10167 条（15 版审计 + 辨析组 81 条），测试面 157 段官方口径核对 | 模型未训练，无指标 | 数据可信度制度化：六轮审计、逐条官方背书 |
-
-> 详细数据见 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)；方法体系见 [docs/方法.md](docs/方法.md) 与 [docs/论文/第5章_训练主线.md](docs/论文/第5章_训练主线.md)。注意：表中 P2 各版本的 strict_recall 为**历史未纠正口径**，与 v9max 起标注的"纠正口径"（CWE 归一 + evidence 守卫 + 父子族匹配）不可直接对比；跨版本引用一律以纠正口径为准。
-
-**SFT 训练趋势（v2~v6）**
-
-![SFT v2~v6 训练与验证 loss 趋势](experiments/exp_06_finetune/results/figures/sft_v2_v6_loss_trends.png)
-
-![SFT 各版本关键指标趋势](experiments/exp_06_finetune/results/figures/sft_v2_v6_metric_trends.png)
-
-> 左图：v4/v5/v6 首步 loss 依次降低，反映数据与模型对齐度改善；v5 在 epoch2 取得最低 eval_loss。右图：v5 在合成集 recall 达 1.000，v6 因 hard-negative 引入导致 CVE-fix recall 明显回退。数据来源：`experiments/exp_06_finetune/logs/` 与 [EXPERIMENT_LEDGER.md](experiments/exp_06_finetune/results/EXPERIMENT_LEDGER.md)。
-
-### 方法论演进：从"风格微调"到"数据可信度优先"
-
-本项目在训练主线上完成了一次关键认知升级：
-
-1. **风格微调**（r=8 LoRA SFT）：只能调整输出格式，对强基座而言是轻量校准；Qwen3-8B 上可提升 strict_recall 但无法显著降 FPR。
-2. **容量迷信**（r=32 + 高 lr）：增大容量并不能自动带来知识，反而引入过拟合（Qwen2.5 时代 Phase 2 已证伪）。
-3. **知识注入尝试**（KnItLM CPT，Qwen2.5 时代）：base 模型 CPT 可注入领域知识，但会引发参数化查询幻觉等副作用；Qwen3-8B 切换后已暂缓。
-4. **数据可信度优先**（Qwen3-8B SFT）：v4 因训练-测试泄漏产生漂亮但不可信的指标；v5 清洗后指标更可信，也更能指导后续决策。
-5. **偏好优化受限**（DPO）：理论上可降 FPR，但本地 16GB GPU 无法承载 8B DPO 双前向，需在更大显存或云实例上验证。
-6. **本地探索 → 云端放大**：消费级 GPU 上完成小规模快速迭代（v2~v9）与方法验证，数据与配置成熟后迁移云端 A800 全精度大规模训练（v9max），兼顾探索效率与最终质量。
-7. **架构协同收敛 FPR**（α0.5 + exp_07）：模型侧 SFT 无法收敛的误报，由"工具召回 + LLM 裁决 + 共形/反事实/证据门"的两阶段信任层收敛到 fixed5 的 FPR 0.043——问题归因决定修在模型侧还是架构侧。
-8. **数据可信度制度化**（α0.6 数据工程）：从"一次性清洗"升级为"每版数据必过审计"的制度——15 个数据版本逐版构建报告、六轮递进审计、ground truth 逐条官方口径背书。
-
-### 📌 核心论点与论文定位
-
-#### 1. 速度 vs 质量的权衡论证
-
-LLM 单样本推理耗时高于传统工具，但输出包含自然语言解释与可执行修复代码，可把人工审计理解时间从"逐条核对告警"降到"阅读一段解释"。**核心论点**：将 LLM 定位为"增强审计"工具而非"替代"，衡量整体效率时应计入人工理解成本。
-
-| 指标 | Bandit | Semgrep | LLM (qwen2.5-coder:7b) |
-| --- | --- | --- | --- |
-| 单样本耗时 | ~0.5s | ~2s | ~7.65s |
-| 人工理解时间 | ~30 分钟/漏洞 | ~30 分钟/漏洞 | ~5 分钟/漏洞 |
-| 修复代码生成 | ❌ | ❌ | ✅ |
-| 典型样本准确率 | 75.0%（8 个 Python 样本） | 78.6%（14 个全语言样本） | 100%（14 个全语言样本） |
-| 难样本准确率（P1-5 单次口径） | - | - | 88.5%（RAG K=5）/ 88.5%（纯 LLM） |
-| 难样本准确率（P1-4 多数表决） | - | - | 78.2%（纯 LLM，repeat=3） |
-
-#### 2. 配置门槛的应对
-
-| 优化方向 | 方案 | 论文定位 |
-| --- | --- | --- |
-| 模型轻量化 | qwen2.5-coder:7b 主审（7B dense，约 4-5GB），多模型作为对照 | 降低门槛论证 |
-| 专用模型 | Qwen3-8B + QLoRA SFT 迭代 → 网络安全专用 8B 模型 | 核心创新点 |
-| 批处理 | vLLM 一次分析多文件 | 摊薄加载时间 |
-| 混合架构 | 传统工具先筛，LLM 只审可疑文件 | 工程化优化 |
-| 训练效率 | QLoRA + rsLoRA + AOTRITON，16 GB 可训 8B | 可行性论证 |
-
-#### 3. 答辩核心故事线
-
-> 传统静态分析工具在 CI/CD 流水线中表现优秀，但面对复杂业务逻辑、绕过式过滤、跨函数污点等场景时力不从心。本系统采用**两阶段架构**：Stage 1 工具层（Semgrep 污点流 / AST 轻量污点 / 正则预筛 / 外部密钥·依赖·SAST·IaC 工具）并行召回候选 finding；Stage 2 本地部署的开源大语言模型对候选做封闭二分类裁决（N 次采样自一致率置信度，prompt 与训练分布对齐），辅以代码切片、CWE/行号确定性纠正与共形预测 + 反事实验证信任门控。模型侧，先在本地 16GB 消费级 GPU 上通过 QLoRA 快速迭代 SFT（v2~v9）打磨方法、数据与配置，再以 **DeepSeek V4-Flash / GLM-5.2 双模型蒸馏**产出 7692 条训练数据，迁移到**云端 A800 GPU bf16 全精度训练**发布 v9max；随后两阶段训练（stage1 + stage2 回收 dev 续训）得到 α0.5。最终系统在 87 段干净评估下达到 **recall 1.000 / FPR 0.043 / strict_recall 0.811**，并在真实 CVE-fix 集上验证（两阶段 recall 0.882）；v9max 将真实 CVE-fix recall 从 0.375 提升至 0.950（HF 管道）。当前进入 α0.6 数据工程收尾：训练集经 15 个审计版本演进至 10167 条冻结，测试面扩至 157 段并逐条对齐 MITRE/NVD 官方口径；下一步为 α0.6 云端训练与 Nivis-α1 偏好优化（DPO/GRPO，脚本与奖励函数已就绪）。实验证明了 LLM 在代码安全审计中的差异化价值，并沉淀了一套"数据可信度优先、评估隔离、归因分流"的严谨实验方法论。
-
-***
-
-## 技术架构与全栈
-
-> 本节描述从数据到模型、从训练到推理、从评估到工程化的完整技术链路。硬件与模型清单见"实验环境"，详细方法论文档见 [docs/方法.md](docs/方法.md)。
-
-### 6.1 全链路数据流
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  数据层                                                              │
-│  CVE/CWE/OWASP 知识  +  手写/蒸馏/增强 CoT 样本 + 辨析组对抗样本          │
-│  + 三层测试面 157 段（87 合成 + 50 真实 CVE 滚动 dev + 20 CVE-fix）      │
-│  + DPO 偏好对（待云端复用）+ α0.6 训练集 v2_15（10167 条，已冻结）         │
-└─────────────────────────────────────────────────────────────────────┘
-                                  ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│  训练层（exp_06，Qwen3-8B 路线）                                       │
-│  本地 QLoRA SFT 迭代(v2~v9) ──► 双模型蒸馏 7692 条 ──► A800 训练 v9max   │
-│         ──► α0(8616) ──► α0.5 两阶段(7972) ──► α0.6(10167 条待训)       │
-│                  Nivis-α1: DPO/GRPO + 数据飞轮（规划，脚本就绪）         │
-└─────────────────────────────────────────────────────────────────────┘
-                                  ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│  推理层（两阶段架构，exp_07）                                           │
-│  源代码 ──► Stage1 工具召回(污点/预筛/外部工具并行) ──► 有候选?           │
-│    ├─ 是 ──► Stage2 LLM 封闭裁决(N 采样自一致率) ─┐                     │
-│    └─ 否 ──► 全量 LLM 复核兜底(生产默认 full_recheck)┤→ 信任层门控        │
-│              (共形预测/反事实/确定性证据门) ──► 结构化 verdict + SARIF   │
-└─────────────────────────────────────────────────────────────────────┘
-                                  ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│  评估层                                                              │
-│  严格指标（CWE 纠正口径） / 157 段三层测试面 / 提示质量五指标 / 错题闭环    │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### 6.2 训练层：高效参数微调与知识注入
-
-| 层级 | 技术 | 作用 | 项目落地 |
-| --- | --- | --- | --- |
-| 量化 | bitsandbytes 4-bit NF4 + double quant | 8B 模型在 16 GB 显存可训 SFT（本地探索） | `train_qlora.py` |
-| LoRA 优化 | **rsLoRA**（缩放因子 1/√r） | 高 rank 训练稳定、效果优于标准 LoRA | v9max 使用 r=8, alpha=16 |
-| 监督微调 | **SFT**：Qwen3-8B + LoRA(r=8, rsLoRA) | 提升 CWE 归因与真实 CVE 泛化 | 本地 QLoRA(v2~v9) + 云端 A800 bf16(v9max) |
-| 对齐(计划) | **DPO / GRPO**（偏好优化） | 用偏好对降低 FPR、校准判断边界 | Nivis-α1 阶段（云 GPU 放大；奖励函数与训练脚本已就绪，未训练） |
-| 加速 | **AOTRITON** attention、TunableOp 离线调优 | ROCm/RDNA4 上训练加速 | `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` |
-| 数据工程 | CoT 蒸馏、数据增强、泄漏审计、错题闭环 | 保证训练数据质量与可信度 | `build_dataset.py` / `audit_leakage_precise.py` / `generate_fp_dpo_pairs.py` |
-
-### 6.3 推理层：工具召回 + LLM 裁决（两阶段架构）
-
-| 层 | 技术 | 说明 |
-| --- | --- | --- |
-| Stage 1 工具召回 | Semgrep taint（整文件污点流）/ TaintTracker（AST 轻量污点）/ Prefilter（正则）| 并行召回候选 finding，含 source→sink 证据链与行号锚点 |
-| Stage 1 外部工具 | Gitleaks / detect-secrets（密钥）、Trivy fs / pip-audit（依赖）、Bandit / Semgrep 规则（SAST）、Trivy config（IaC）| 位置型发现；secret/sca 直出、sast/iac 进裁决 |
-| Stage 2 LLM 裁决 | 封闭二分类（`has_vulnerability`，triage_train_aligned 与训练分布对齐；双格式解析兜底）+ N 次采样自一致率置信度 | 只对候选 finding 判定真伪，非开放全文生成 |
-| 信任层（2.5 代） | 共形预测（统计门控）+ 反事实扰动（因果门控）+ 确定性证据门（零 LLM 成本）+ 信号注册表回填 | 判定分级 confirmed/review/dismissed；模型回填工具记忆过四重门控 |
-| 知识检索 | ChromaDB + `BAAI/bge-m3`（多语言，中文知识库检索质量优先） | 72 条 CWE/OWASP 知识，Top-K 注入裁决 prompt（`VULN_SCANNER_RAG` 控制） |
-| 无候选兜底 | 抽样复核（10%）/ `no_candidate_mode=full_recheck` 全量复核 | 监控工具层漏报率；安全关键场景消除"无证据判安全" |
-| Prompt 协议 | SYSTEM_PROMPT（7 字段）+ triage schema（has_vulnerability/reason/fix_suggestion，模型注册表按模型绑定 prompt 变体）| 主扫描与裁决层分离；解析失败走约束解码兜底 |
-
-### 6.4 评估层
-
-| 能力 | 实现 |
-| --- | --- |
-| 指标口径 | 单次口径 + 多数表决口径；严格 recall（CWE 对齐）+ 宽松 recall |
-| 置信区间 | Wilson score interval（比例接近 0/1 时更稳定） |
-| 消融对照 | RAG / pure / random / irrelevant 四组对照 |
-| 错误分析 | 分 CWE 类型统计、幻觉率、CWE 错标数、source/sink 真实性校验 |
-| 错题闭环 | `extract_phase3_errors.py` 等脚本支持 Phase N vs Phase N+1 回归追踪 |
-
-### 6.5 工程化层（已落地）
-
-| 方向 | 实现方案 | 状态 |
-| --- | --- | --- |
-| 后端服务 | FastAPI (`app/backend/main.py`) | ✅ 已上线 |
-| 前端界面 | 原生 HTML + Tailwind CSS (`app/backend/static/`) | ✅ 已上线 |
-| 批量扫描 | NDJSON 流式响应 + 前端 SSE 解析 | ✅ 已上线 |
-| 报告导出 | Markdown（`/api/report`、`/api/report/single`） | ✅ 已上线（前端「下载报告」按钮 + 插件端展示） |
-| 污点流分析 | 同函数 source→sink 启发式匹配 (`graduation_project/taint_tracker.py`) | ✅ 已集成（两阶段 Stage 1 默认启用） |
-| 修复建议验证 | 语法校验 + 危险模式移除检查 (`graduation_project/fix_verifier.py` + `/api/verify-fix`) | ✅ 已上线 |
-| 外部工具召回 | Bandit / Semgrep / Gitleaks / Trivy / pip-audit / detect-secrets (`graduation_project/external_scanner.py`，内置于两阶段 Stage 1；`/api/external-scan` 保留为纯直出入口) | ✅ 已集成（工具未安装时静默跳过；secret/sca 直出、sast/iac 进裁决） |
-| 多模型投票 | `/api/multi-model-scan`（顺序加载 ≥2 模型投票聚合） | ✅ 已上线 |
-| vLLM 推理后端 | `/api/vllm-analyze`（OpenAI 兼容 API，走两阶段管线） | ✅ 已上线 |
-
-### 6.6 系统架构（运行时）
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  用户界面（`app/backend/static/` 纯静态页面）                   │
-│  仪表盘 │ 扫描工作台 │ CWE 样本库 │ 安全态势                    │
-└──────────────────────────────────────────────────────────────┘
-                              ↓
-┌──────────────────────────────────────────────────────────────┐
-│  后端服务（FastAPI，127.0.0.1:8765）                            │
-│  /api/analyze │ /api/batch │ /api/url-scan │ /api/github-scan  │
-│  /api/external-scan │ /api/verify-fix │ /api/multi-model-scan │
-│  /api/vllm-analyze │ /api/report │ /api/health                 │
-└──────────────────────────────────────────────────────────────┘
-                              ↓
-┌──────────────────────────────────────────────────────────────┐
-│  核心分析引擎（`graduation_project/`）                          │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │ Stage 1 工具召回（并行，近零成本）                          │ │
-│  │  Semgrep taint │ TaintTracker │ Prefilter │ 外部工具      │ │
-│  │  （污点流）      （AST 污点）    （正则）    （密钥/依赖/     │ │
-│  │                                │  SAST/IaC）             │ │
-│  └─────────────────────────────────────────────────────────┘ │
-│                              ↓                                │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │ Stage 2 LLM 裁决（N 次采样自一致率置信度）                   │ │
-│  │  候选 finding → 封闭二分类真伪判定 → 裁决分级               │ │
-│  │  无候选 → 抽样复核 / full_recheck 全量复核                 │ │
-│  └─────────────────────────────────────────────────────────┘ │
-│  辅助：CodeSlicer（裁决上下文切片）│ RAG 检索 │ 行号纠正       │
-└──────────────────────────────────────────────────────────────┘
-                              ↓
-┌──────────────────────────────────────────────────────────────┐
-│  训练与评估流水线（`experiments/`）                              │
-│  本地 SFT(v2~v9) → 双模型蒸馏 → A800 训练 v9max                  │
-│    → α0 / α0.5 两阶段 → α0.6 数据工程(10167 条冻结) → α1 规划     │
-└──────────────────────────────────────────────────────────────┘
-```
-
-***
-
-## 模型部署与版本管理
-
-### 模型发布与部署（给别人用）
-
-模型有两套形态，按需选择：
-
-- **Ollama Registry 发布物**：`garrywhite109909/graduation-vuln-scanner:v9max`（Q4_K_M 合并量化，约 4.7GB）——一键启动 / 无 GPU 依赖场景的默认拉取模型；
-- **HF 管道运行组态**：Transformers 后端 + **α0.5 stage2 LoRA adapter**（NF4 基座 + FP16 增量，`models/adapter_alpha05_stage2` 自动探测）——保 LoRA FP16 精度，是论文指标对应的运行形态，也是当前开发/演示的默认组态。
-
-历史版本 `:v5` 仍保留，可通过设置 `VULN_SCANNER_MODEL` 切换。
-
-#### 1. 用户侧下载并应用模型
-
-**方式 A：Ollama Registry（推荐，最简单）**
-
-```bash
-# 启动器会自动检测并 pull 模型
-python -m app.launcher.bootstrap
-
-# 或显式指定（与默认值相同）
-VULN_SCANNER_MODEL=garrywhite109909/graduation-vuln-scanner:v9max python -m app.launcher.bootstrap
-
-# 在环境变量/启动脚本中永久设置
-export VULN_SCANNER_MODEL=garrywhite109909/graduation-vuln-scanner:v9max
-bash app/launcher/start_linux_macos.sh
-```
-
-**方式 B：直接下载 GGUF（无法访问 Ollama Registry 时）**
-
-```bash
-python tools/download_model.py \
-  --source gguf \
-  --url https://github.com/<user>/<repo>/releases/download/<tag>/merged_v9max-q4_k_m.gguf \
-  --model garrywhite109909/graduation-vuln-scanner:v9max
-
-VULN_SCANNER_MODEL=garrywhite109909/graduation-vuln-scanner:v9max python -m app.launcher.bootstrap
-```
-
-#### 2. 8GB 显存适配说明
-
-- 默认使用 **Q4_K_M 量化**，模型权重约 **4.7GB**
-- 推理时 activations/KV cache 额外占用，建议 `num_ctx=8192`（已在 `Modelfile` 中设置）
-- 若仍报 OOM，可进一步降低 `num_ctx` 到 4096：
-  ```bash
-  echo 'PARAMETER num_ctx 4096' >> outputs/Modelfile_v9max
-  ollama create garrywhite109909/graduation-vuln-scanner:v9max-4k -f outputs/Modelfile_v9max
-  VULN_SCANNER_MODEL=garrywhite109909/graduation-vuln-scanner:v9max-4k python -m app.launcher.bootstrap
-  ```
-
-#### 3. 模型版本切换
-
-`app/` 所有入口均读取环境变量 `VULN_SCANNER_MODEL`：
-
-| 入口 | 切换方式 |
-|---|---|
-| Web 后端 | `VULN_SCANNER_MODEL=... uvicorn app.backend.main:app` |
-| 启动器 | `VULN_SCANNER_MODEL=... python -m app.launcher.bootstrap` |
-| CLI | `VULN_SCANNER_MODEL=... python -m app.launcher.vuln_scanner_cli scan file.py` |
-| VS Code 插件 | 在插件设置或启动脚本中设置环境变量 |
-
-缺省模型为 `garrywhite109909/graduation-vuln-scanner:v9max`（v9max，Ollama 后端默认发布物；Transformers 后端不走此变量，走 `VULN_SCANNER_ADAPTER` 自动探测）。
-
-#### 4. 重新发布模型（开发者/台式机执行）
-
-若后续训练出新版本，可用 `release_model.sh` 重新打包：
-
-```bash
-# 合并 LoRA → HF 格式 → GGUF Q4_K_M → Ollama 模型
-bash tools/release_model.sh \
-  --version v9max \
-  --adapter experiments/exp_06_finetune/cloud_train \
-  --base Qwen/Qwen3-8B \
-  --ollama-name garrywhite109909/graduation-vuln-scanner:v9max
-
-# 推送到 Ollama Registry（可选，需要登录）
-ollama push garrywhite109909/graduation-vuln-scanner:v9max
-```
-
-脚本会自动：
-- 调用 `tools/merge_lora.py` 合并 adapter 到 base 模型
-- 克隆/编译 `llama.cpp`
-- 转换为 `f16` GGUF，再量化为 `Q4_K_M`（约 4.7GB，**适配 8GB 显存**）
-- 生成 `Modelfile` 并执行 `ollama create`
-
-## 实验复现
-
-### 环境准备（所有实验的前置步骤，只需执行一次）
-
-```bash
-cd Graduation-Project
-
-# 使用 conda 环境 graproj（项目所有依赖与工具均在此环境中）
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate graproj
-
-# 安装依赖 + 注册 graduation_project 为可导入包
-pip install -r requirements.txt
-pip install -e .
-
-# 确保 Ollama 已运行且默认主模型已下载
-ollama pull qwen2.5-coder:7b
-ollama serve   # 若未启动
-```
-
-> **环境约定**：所有实验脚本（尤其 exp\_03 / exp\_04 RAG 相关）依赖 `chromadb`、`sentence-transformers` 等包，这些只在 `graproj` conda 环境中安装。请在运行任何实验前激活该环境，否则会出现 `ModuleNotFoundError`。
->
-> **离线运行约定**：`graduation_project/chroma_manager.py` 已强制离线模式（`HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1`），运行时不会从 HuggingFace 下载 embedding 模型。RAG 向量模型已选型为 **`BAAI/bge-m3`**（多语言模型——知识库以中文漏洞资料为主，原 `bge-small-en-v1.5` 仅支持英文、中文向量化质量差）。首次使用前请确保 `bge-m3` 已缓存到本地：
->
-> ```bash
-> # 在有网络的环境执行一次即可（国内可用 HF 镜像: HF_ENDPOINT=https://hf-mirror.com）
-> python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-m3')"
-> # 默认缓存到 ~/.cache/huggingface/hub/models--BAAI--bge-m3
-> ```
->
-> ⚠️ 若本机存在旧版 RAG 数据（`data/chroma_db/` 由 bge-small-en-v1.5 构建），必须**先删除该目录**再用新模型重建（`cd experiments/exp_03_rag_knowledge/knowledge_data && python3 build_knowledge.py`），否则新旧向量空间不一致会导致检索结果错乱。
->
-> 若缓存路径非默认，可设置 `export CHROMA_EMBEDDING_MODEL_PATH=/path/to/local/model`。
-
-### 跑第一阶段实验（exp\_01）
-
-```bash
-cd experiments/exp_01_basic_scan
-
-python3 run_experiment.py                       # 跑全部 14 个样本（默认 qwen2.5-coder:7b）
-python3 run_experiment.py --limit 3             # 只跑前 3 个（快速调试）
-python3 run_experiment.py --model deepseek-coder-v2:16b --temperature 0.1   # 切换对照模型
-python3 run_experiment.py --keep-loaded         # 跑完保留模型在显存（默认卸载）
-```
-
-结果默认写入 `results/exp_01_basic_scan.<model>.<timestamp>.json`，每跑完一个样本即增量落盘，中途可断点查看。历史主结果见 `results/results.qwen2.5-coder-7b.20260630.json`。
-
-### 跑第二阶段实验（exp\_02，传统工具对比基线）
-
-```bash
-cd experiments/exp_02_baseline_tools
-
-# 需先安装工具：pip install bandit semgrep
-python3 run_baseline.py                         # Bandit + Semgrep 都跑
-python3 run_baseline.py --tool bandit           # 只跑 Bandit
-python3 run_baseline.py --tool semgrep          # 只跑 Semgrep
-python3 run_baseline.py --limit 3               # 只跑前 3 个样本（调试）
-```
-
-复用 exp\_01 的 14 段样本，结果按工具分组写入 `results/results.json`。
-
-### 跑第三阶段实验（exp\_03，RAG 知识库增强）
-
-```bash
-# 1. 构建漏洞知识库（首次运行，会下载 embedding 模型）
-cd experiments/exp_03_rag_knowledge/knowledge_data
-python3 build_knowledge.py                      # 从 knowledge.json upsert 72 条知识 → Chroma
-
-# 2. 批量对比实验：纯 LLM vs RAG+LLM
-cd ..
-python3 run_rag_experiment.py                   # 跑全部 14 个样本（默认 qwen2.5-coder:7b）
-python3 run_rag_experiment.py --top-k 5         # 检索 Top-5 知识
-python3 run_rag_experiment.py --limit 3         # 只跑前 3 个（调试）
-python3 run_rag_experiment.py --model deepseek-coder-v2:16b  # 切换对照模型
-
-# 3. 单样本快速验证（可选，正式实验用 run_rag_experiment.py）
-cd knowledge_data
-python3 test_rag.py
-```
-
-### 跑第四阶段实验（exp\_04，难样本压力测试 + 消融对照）
-
-```bash
-cd experiments/exp_04_hard_samples
-
-# P1-4：纯 LLM 重复实验 + 95% 置信区间（默认 --repeat 3，约 95 分钟）
-python3 run_experiment.py --repeat 3
-python3 run_experiment.py --repeat 3 --limit 3      # 只跑前 3 个样本（调试）
-
-# P1-5：RAG 消融对照（4 组分别运行，每组约 30 分钟）
-python3 run_rag_experiment.py --mode rag            # A 组：RAG+LLM
-python3 run_rag_experiment.py --mode pure           # B 组：纯 LLM
-python3 run_rag_experiment.py --mode random         # C 组：随机知识注入
-python3 run_rag_experiment.py --mode irrelevant     # D 组：等长无关文本注入
-
-# P2-8：Top-K 对比（K=1,3,5,10）
-python3 run_rag_experiment.py --mode rag --top-k 1
-python3 run_rag_experiment.py --mode rag --top-k 5
-python3 run_rag_experiment.py --mode rag --top-k 10
-
-# 一键顺序跑完 P1-5 + P2-8（约 4 小时，需 P1-4 已完成释放显存）
-nohup bash run_ablation_and_topk.sh > results/ablation_topk.run.log 2>&1 &
-
-# 生成最终报告
-python3 generate_report.py
-```
-
-***
-
-## 参考资源
-
-### 工具与平台
-
-- **传统代码审计**：[Semgrep](https://semgrep.dev/) / [CodeQL](https://codeql.github.com/) / [Bandit](https://bandit.readthedocs.io/)
-- **LLM 安全应用**：[Garak](https://github.com/leondz/garak) / Promptmap
-- **漏洞管理平台**：[OpenVAS](https://www.openvas.org/) / [Nuclei](https://github.com/projectdiscovery/nuclei)
-- **数据集来源**：[OWASP WebGoat](https://owasp.org/www-project-webgoat/) / CVE PoC 仓库 / CodeQL 测试用例
-
-### 难样本设计参考（exp\_04）
-
-以下资料用于设计 exp\_04 中的真实 CVE 片段与 OWASP 风格难样本（详见 `experiments/exp_04_hard_samples/samples/manifest.json`）：
-
-- **CVE-2017-7494 Samba 远程命令执行**：`hard_cve_01_samba_2017_7494.py` 的设计依据
-- **Python 日志注入（原引用 CVE-2021-44228 Log4j，已重命名去除误导）**：`hard_cve_02_python_log_injection.py` 的设计依据
-- **CVE-2025-4517 Python tarfile 路径穿越**：`hard_cve_03_tarfile_2025_4517.py` 的设计依据
-- **Python urllib SSRF（原引用 CVE-2025-54381 BentoML，已重命名去除误导）**：`hard_cve_04_ssrf_urllib.py` 的设计依据
-- **Top 10 Python Security Vulnerabilities** (aikido.dev)：典型 Python 漏洞模式参考
-- **Insecure Deserialization in Python** (semgrep.dev)：pickle / yaml 反序列化样本参考
-- **Vulnerable Web Application examples** (offensive360.com)：OWASP/DVWA 风格样本参考
-- **aiohttp CVE-2024-23334 路径穿越 PoC** (exploit-db.com)：路径穿越绕过样本参考
-
-> 每段 CVE 样本文件头部的注释中标注了对应的 CVE 编号与原始漏洞描述，便于追溯。
-
-### 训练与微调方法（exp_06）
-
-本项目在训练主线上借鉴并落地了以下近期 PEFT / 知识注入 / 显存优化方法：
-
-| 方法 | 核心思想 | 本项目用途 | 来源 |
-| --- | --- | --- | --- |
-| **rsLoRA** | LoRA 缩放因子从 `1/r` 改为 `1/√r`，高 rank 更稳定 | v5 SFT 使用 r=8, alpha=16 | Hayou et al. 2024 |
-| **QLoRA** | 4bit 量化 + LoRA，大模型在消费级 GPU 可训 | Qwen3-8B SFT 训练 | Dettmers et al. 2023 |
-| **DPO** | 直接偏好优化，用偏好对校准模型 | 尝试降低 FPR（本地 16GB 不可行，数据保留） | Rafailov et al. 2023 |
-| **AOTRITON / TunableOp** | ROCm 上的 Triton Flash Attention 与 GEMM 离线调优 | RDNA4 训练加速 | AMD / PyTorch 官方博客 |
-| **KnItLM** (历史) | base 模型 CPT + LoRA → merge 到 Instruct | Qwen2.5 时代 Phase 3 核心突破，已归档 | ICLR 2026 投稿 |
-| **Prompt Distillation** (历史) | 用 teacher 的 token 分布蒸馏 student | Qwen2.5 时代 Phase 4，已归档 | TMLR 2025 |
-
-> 更系统的文献梳理与适用性分析见 [docs/方法.md](docs/方法.md) §8 与 §10。
-
-***
-
-## 评估方法学
-
-为保证实验结果在论文/答辩中可被复现与质疑，本项目的指标定义、置信区间、口径选择都遵循以下规则。
-
-### 9.1 混淆矩阵与基础指标
-
-| 预测 \ 实际   | 漏洞（expected\_present=True） | 安全（expected\_present=False） |
-| --------- | -------------------------- | --------------------------- |
-| **判定为漏洞** | TP（真阳性）                    | FP（误报）                      |
-| **判定为安全** | FN（漏报）                     | TN（真阴性）                     |
-
-- **召回率（Recall）** = TP / (TP + FN)：漏洞样本被检出的比例
-- **误报率（FPR）** = FP / (FP + TN)：安全样本被误判为漏洞的比例
-- **准确率（Accuracy）** = (TP + TN) / (TP + TN + FP + FN)：总体判定正确率
-- **无效样本**：模型输出无法解析为有效 JSON 时计入 invalid，不计入 TP/FP/FN/TN
-
-### 9.2 重复实验与多数表决（P1-4）
-
-`temperature=0.1` 不等于确定性输出，模型每次推理仍有随机性。每个样本连续跑 N 次（默认 N=3）：
-
-- **多数表决**：N 次中判定为漏洞的比例 ≥ 50% 则最终判为漏洞；平票时保守判 True
-- **一致率**：max(True 次数, False 次数) / 有效次数，反映模型对该样本的判定稳定性
-- 一致率 < 2/3 的样本在报告中单独列出，作为"模型判定不稳定"的证据
-
-### 9.3 置信区间（Wilson score interval）
-
-采用 Wilson score interval 而非正态近似，因前者在比例接近 0 或 1（如 100% 召回率）时更稳定：
-
-```
-center = (p + z²/(2n)) / (1 + z²/n)
-margin = z · √(p(1-p)/n + z²/(4n²)) / (1 + z²/n)
-CI = [center - margin, center + margin]
-```
-
-其中 `p` 为样本比例，`n` 为样本数，`z=1.96` 对应 95% 置信度。例如 8/10 准确率的 95% CI 为 \[49.0%, 94.3%]，而非简单的 80% ± x。
-
-### 9.4 耗时统计
-
-单点耗时无意义，报告中同时给出：
-
-- **均值**：所有样本耗时的算术平均
-- **中位数**：更稳健，不受异常值影响（论文引用推荐用此）
-- **标准差**：反映耗时波动
-- **p95**：95 分位数，反映长尾
-- **最长/最短**：异常值定位（如 safe\_02 因模型对安全样本过度分析导致耗时最长）
-
-### 9.5 RAG 消融对照（P1-5）
-
-为证明 RAG 提升来自知识相关性而非"prompt 变长"，对比 4 组：
-
-| 组别               | 注入内容              | 验证目的             |
-| ---------------- | ----------------- | ---------------- |
-| A 组 (rag)        | 按代码语义检索 Top-K 知识  | 当前实现（baseline）   |
-| B 组 (pure)       | 无 RAG 上下文         | 排除 RAG 干扰        |
-| C 组 (random)     | 知识库随机抽 K 条（与样本无关） | 排除"注入任何知识都有用"    |
-| D 组 (irrelevant) | 与漏洞无关但长度相近的文本     | 排除"prompt 变长就有用" |
-
-**论证逻辑**：只有当 A 组显著优于 B/C/D 三组时，才能论证 RAG 真正有用；若 A ≈ C 或 A ≈ D，则提升仅来自 prompt 变长或随机注入。
-
-### 9.6 评估口径
-
-每个实验同时给出两种口径：
-
-- **单次口径**：所有 run 拉平统计（如 42 样本 × 3 次 = 126 次判定），适合和 exp\_01\~03 历史数据对比
-- **多数表决口径**：每个样本 N 次投票后的最终判定，更贴近实际使用场景
-
-***
-
 ## 故障排查
 
 ### Semgrep 规则本地化（离线可用，随仓库分发）
 
-系统使用的 Semgrep registry 规则包（`p/security-audit`、`p/owasp-top-ten`）已本地化为 **`models/semgrep_rules/`** 并随仓库入库（1.7MB 纯文本，MIT 开源，版本固定利于实验可复现）。扫描完全离线运行，克隆仓库即可用，无需联网拉取规则（在线 registry 包无持久缓存、离线不可用）。
+系统使用的 Semgrep registry 规则包（`p/security-audit`、`p/owasp-top-ten`）已本地化为 **`models/semgrep_rules/`** 并随仓库入库（纯文本，MIT 开源，版本固定）。扫描完全离线运行，克隆仓库即可用，无需联网拉取规则。
 
-- **更新规则**（semgrep 社区更新时手动覆盖）：`python tools/fetch_semgrep_rules.py`（幂等，已存在则跳过；需联网，国内环境可设代理 `HTTPS_PROXY=http://127.0.0.1:7897`）
+- **更新规则**（semgrep 社区更新时手动覆盖）：`python tools/fetch_semgrep_rules.py`（幂等，已存在则跳过；需联网）
 - **校验状态**：`python tools/fetch_semgrep_rules.py --check`
-- 规则文件缺失时（如手动删除），`external_scanner` 自动降级为在线拉取（并提示）。
+- 规则文件缺失时（如手动删除），工具层自动降级为在线拉取（并提示）。
 
 ### 启动相关
 
 | 问题 | 原因 | 解决方案 |
 |------|------|----------|
-| `ModuleNotFoundError: No module named 'app.launcher.bootstrap'` | 未在项目根目录 `Graduation-Project/` 下运行 | 确保 `cd Graduation-Project` 后再执行启动脚本；`start_windows.bat` 已内置 `cd /d "%~dp0\..\.."` 自动切到根目录 |
-| `pip install` 找不到 `requirements.txt` 或 `pyproject.toml` | 当前目录不是项目根目录 | `cd Graduation-Project` 后再 `pip install -r requirements.txt && pip install -e .` |
-| `ModuleNotFoundError: No module named 'fastapi'`（或 `chromadb` / `tree_sitter` 等） | 依赖未安装或未激活正确的 conda 环境 | 路径一：重新运行启动脚本（会自动安装）；路径二：`conda activate graproj` 后重新 `pip install -r requirements.txt` |
+| `ModuleNotFoundError: No module named 'app.launcher.bootstrap'` | 未在项目根目录下运行 | 确保 `cd` 到项目根目录后再执行启动脚本；`start_windows.bat` 已内置自动切到根目录 |
+| `pip install` 找不到 `requirements.txt` 或 `pyproject.toml` | 当前目录不是项目根目录 | `cd` 到项目根目录后再 `pip install -r requirements.txt && pip install -e .` |
+| `ModuleNotFoundError: No module named 'fastapi'`（或 `chromadb` / `tree_sitter` 等） | 依赖未安装 | 重新运行启动脚本（会自动安装），或手动 `pip install -r requirements.txt` |
 | 启动器提示 `Ollama 自动安装失败` | winget/brew 不可用或网络问题 | 手动从 [ollama.com/download](https://ollama.com/download) 下载安装，安装后重启终端再运行启动脚本 |
 | 启动器提示 `Ollama 已安装但不在 PATH 中` | 安装后 PATH 未刷新 | 重启终端；或手动将 Ollama 安装路径加入系统 PATH |
 | 后端启动超时 | 端口 8765 被占用 | 检查端口：`netstat -ano \| findstr 8765`（Windows）/ `lsof -i :8765`（Linux/macOS），杀掉占用进程后重试 |
-| Linux 上模型没统一到项目目录 / 前端状态不一致 | 系统级 `ollama.service`（systemd）仍用系统存储占用 11434 | 执行一次 `sudo systemctl disable --now ollama`，再由启动器用 `OLLAMA_MODELS=models/ollama` 启动（详见「快速开始」Linux 提示） |
+| Linux 上模型没统一到项目目录 / 前端状态不一致 | 系统级 `ollama.service`（systemd）仍用系统存储占用 11434 | 执行一次 `sudo systemctl disable --now ollama`，再由启动器用 `OLLAMA_MODELS=models/ollama` 启动（详见「一键启动」Linux 提示） |
 
 ### 模型相关
 
@@ -1438,7 +546,7 @@ CI = [center - margin, center + margin]
 | 模型下载超时或失败 | 网络不稳定或 Ollama Registry 不可达 | 手动重试：`ollama pull garrywhite109909/graduation-vuln-scanner:v9max`；若持续失败可改用回退模型：`set VULN_SCANNER_MODEL=qwen3:8b` |
 | 扫描结果全为"无法判定" | 模型未正确加载或输出格式不匹配 | 运行 `python -m app.launcher.vuln_scanner_cli health` 检查模型可用性；确认模型名与 Ollama 中一致 |
 | 推理速度极慢（> 60s/文件） | 无 GPU 回退到 CPU 推理 | 检查启动日志中 `[硬件检测]` 行；CPU 模式约为 GPU 的 1/10 速度，属正常现象 |
-| OOM（显存溢出） | `num_ctx` 过大或显存不足 | 降低上下文窗口：创建 4K 版模型（见「模型部署与版本管理」§8GB 显存适配说明） |
+| OOM（显存溢出） | `num_ctx` 过大或显存不足 | 降低上下文窗口：设置环境变量 `VULN_SCANNER_NUM_CTX=4096` |
 | Transformers/LlamaCPP 后端报 DLL / 编译类错误（RTX 50 系列） | Blackwell 架构缺少对应 CUDA Toolkit | 在 Linux 上运行（Linux 端支持性较好），或改用默认 Ollama 后端；Windows 下 LlamaCPP 暂不支持 RTX 50 系列与 AMD 显卡（见「后端平台支持矩阵」） |
 
 ### RAG / 向量库相关
@@ -1447,8 +555,7 @@ CI = [center - margin, center + margin]
 |------|------|----------|
 | `ModuleNotFoundError: No module named 'chromadb'` | 未安装 RAG 依赖 | `pip install -r requirements.txt`（chromadb 在依赖列表中） |
 | RAG 扫描报错 `embedding model not found` | embedding 模型未缓存到本地 | 在有网络的环境执行一次：`python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-m3')"`；国内可用 `HF_ENDPOINT=https://hf-mirror.com` 镜像 |
-| RAG 检索结果明显不对 | `data/chroma_db/` 由旧模型（bge-small-en-v1.5）构建，与当前 bge-m3 向量空间不一致 | 删除 `data/chroma_db/` 后重建：`cd experiments/exp_03_rag_knowledge/knowledge_data && python3 build_knowledge.py` |
-| RAG 向量库为空 | 未运行 `build_knowledge.py` 初始化知识库 | `cd experiments/exp_03_rag_knowledge/knowledge_data && python3 build_knowledge.py` |
+| RAG 检索结果明显不对 / 向量库为空 | `data/chroma_db/` 未构建或由旧 embedding 模型构建 | 删除 `data/chroma_db/` 后重建：`cd experiments/exp_03_rag_knowledge/knowledge_data && python3 build_knowledge.py` |
 | 自定义 embedding 缓存路径 | 默认缓存路径 `~/.cache/huggingface/` 不可写 | `export CHROMA_EMBEDDING_MODEL_PATH=/path/to/local/model` |
 
 ### 插件相关
@@ -1464,16 +571,34 @@ CI = [center - margin, center + margin]
 
 | 问题 | 原因 | 解决方案 |
 |------|------|----------|
-| VS Code / PyCharm 中大量红色错误标记 | Python 解释器选错、依赖未安装、模块路径未配置 | 1. 选择正确的 conda 环境解释器；2. 在项目根目录执行 `pip install -e .`；3. 在 `.vscode/settings.json` 中配置 `python.analysis.extraPaths` 指向项目根目录 |
+| VS Code / PyCharm 中大量红色错误标记 | Python 解释器选错、依赖未安装、模块路径未配置 | 1. 选择正确的 Python 解释器；2. 在项目根目录执行 `pip install -e .`；3. 在 `.vscode/settings.json` 中配置 `python.analysis.extraPaths` 指向项目根目录 |
 | 类型检查器报类型不匹配 | Pyright/mypy 严格模式误报 | 不影响运行，可在 `pyproject.toml` 中调整类型检查严格度 |
 
 ***
 
-## 约定与备注
+## 目录结构
 
-- 核心算法验证与专用模型训练已完成（v9max 发布 / α0.5 两阶段达标 / α0.6 数据冻结待训），前后端工程化框架已落地（详见"技术架构与全栈"§6.5）。
-- 所有实验过程、Prompt 迭代与训练日志均已保留，作为后续论文撰写的原始依据。
-- 模型名称需与 Ollama 中实际可用的模型名一致。
-- **显存管理约定**：每次实验脚本跑完必须主动从显存卸载模型（Ollama `keep_alive=0`），多模型场景下避免爆显存。`run_experiment.py` 默认在末尾卸载，如需保留加 `--keep-loaded`。
-- 大模型文件（`.gguf` / `.bin` / `.safetensors` 等）绝不入库，见 `.gitignore`。
-- **RAG 向量库**：`data/chroma_db/` 为本地持久化数据，不入库（见 `.gitignore`），需在本地通过 `build_knowledge.py` 自行构建。
+用户常用到的目录与文件：
+
+```
+ZaoZao/
+├── app/                        # 软件本体
+│   ├── backend/                #   FastAPI 后端（REST API + 两阶段扫描引擎）
+│   ├── frontend/               #   Web 界面（静态页面，由后端直接托管）
+│   ├── launcher/               #   跨平台启动器（一键启动 + 依赖自动安装）
+│   ├── vscode-extension/       #   VS Code 插件源码
+│   └── intellij-extension/     #   IntelliJ 插件源码
+├── releases/                   # 插件安装包（vsix / zip，clone 后可直接安装）
+├── models/
+│   └── semgrep_rules/          # 本地化 Semgrep 规则（离线可用）
+├── graduation_project/         # 核心 Python 包（LLM 客户端 / schema / prompts / 两阶段扫描器）
+├── data/                       # 本地运行数据（chroma 向量库等，不入库）
+├── docs/
+│   ├── 用户手册.md              # 按任务组织的详细使用手册
+│   └── 项目历程.md              # 项目从选题到成品的完整历程（给老师/评委看）
+├── requirements.txt
+├── uninstall.py / uninstall_windows.bat / uninstall.sh
+└── README.md
+```
+
+> `experiments/` 与 `graduation_project/` 中还包含完整的实验与训练代码，属于研究部分——它们的来龙去脉见[《项目历程》](docs/项目历程.md)。
