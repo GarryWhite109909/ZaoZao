@@ -487,7 +487,7 @@ def check_inprocess_backend_ready(backend: str) -> bool:
             print("[错误] transformers 后端需要 LoRA adapter 目录")
             print("  （目录内需含 adapter_model.safetensors / adapter_model.bin）")
             print(f"  推荐做法：将 adapter 放到 {models_dir / 'adapter'}")
-            print("  示例: set VULN_SCANNER_ADAPTER=D:\\code\\Graduation-Project\\models\\adapter")
+            print("  示例: set VULN_SCANNER_ADAPTER=D:\\code\\ZaoZao\\models\\adapter")
             ok = False
         elif not Path(adapter).is_dir():
             print(f"[错误] LoRA adapter 路径不存在: {adapter}")
@@ -554,7 +554,7 @@ def check_inprocess_backend_ready(backend: str) -> bool:
         if not model:
             print("[错误] vllm 后端需要 VULN_SCANNER_VLLM_MODEL 指向基座模型")
             print("  （HF id 或本地 AWQ/GPTQ 量化目录，需含 config.json）")
-            print(f"  示例: set VULN_SCANNER_VLLM_MODEL=D:\\code\\Graduation-Project\\models\\vllm\\Qwen3-8B-AWQ")
+            print(f"  示例: set VULN_SCANNER_VLLM_MODEL=D:\\code\\ZaoZao\\models\\vllm\\Qwen3-8B-AWQ")
             print(f"  或将量化目录放到 {models_dir}\\vllm（设置页可下载 Qwen/Qwen3-8B-AWQ）")
             ok = False
         elif not (model.startswith("/") or ":" in model or "\\" in model or "." in model):
