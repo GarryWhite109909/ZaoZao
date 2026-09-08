@@ -183,10 +183,12 @@ Windows 使用 `set` 代替 `export`。选择进程内后端后，启动器会�
 | 后端 | 平台 | NVIDIA CUDA | RTX 50 系（Blackwell） | AMD(ROCm) | Apple Silicon | 纯 CPU |
 |------|------|------------|----------------------|-----------|---------------|--------|
 | **Ollama**（默认） | Windows / Linux / macOS | ✅ | ✅（内置运行时自带 CUDA） | ✅ | ✅ | ✅ |
-| **Transformers** | Linux | ✅ | ✅ | ✅（ROCm 预览） | ✅（慢速 CPU 路径） | ✅ |
-| | Windows | ✅ | ⚠️ 需额外 CUDA Toolkit | ❌（不支持 AMD） | — | ✅ |
-| **LlamaCPP** | Linux | ✅ | ✅ | ✅ | ✅ | ✅ |
-| | Windows | ✅ | ❌（暂不支持） | ❌（暂不支持） | — | ✅ |
+| **Transformers** | Linux | ✅ | ✅ | ✅（ROCm 预览） | N/A* | ✅ |
+| | Windows | ✅ | ⚠️ 需额外 CUDA Toolkit | ❌（不支持 AMD） | N/A* | ✅ |
+| **LlamaCPP** | Linux | ✅ | ✅ | ✅ | N/A* | ✅ |
+| | Windows | ✅ | ❌（暂不支持） | ❌（暂不支持） | N/A* | ✅ |
+
+> \* **N/A** = 该组合不存在：Apple Silicon 是 macOS 专属硬件，Linux / Windows 下没有这一列的概念。Apple Silicon 设备请安装 macOS 后运行——Ollama 后端原生支持；Transformers / LlamaCPP 在 macOS 上可使用 `start_linux_macos.sh`（Metal/CPU 路径）。
 
 > **结论**：追求设备兼容性优先选 **Ollama** 后端；确认要在 Windows 上使用进程内后端（Transformers / LlamaCPP）时，请先核对上表——**Transformers 的 Windows 端不支持 AMD，LlamaCPP 的 Windows 端暂不支持 RTX 50 系与 AMD**。若你使用上述受限组合，建议改用 Linux 或回退 Ollama。
 >
