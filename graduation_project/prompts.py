@@ -225,6 +225,12 @@ EVAL_SYSTEM_VARIANTS = (
     # 自一致漂移（分析对但投假，recall 0.676 根因）。此变体 system=ALPHA05_PROMPT
     # （训练原样）+ 输出 schema 对齐 has_vulnerability。
     "triage_train_aligned",  # 训练格式对齐裁决（system=ALPHA05_PROMPT + has_vulnerability schema）
+    # ---- 知识增补裁决变体（2026-09-18）----
+    # ALPHA05_PROMPT + 判别/防御知识块（源自 α06 蒸馏 prompt 判别笔记 + alpha06 评测
+    # 归因）：切片可达性规则救"入口不可见=不可达"式 FN，CWE 判别轴救归因摇摆，
+    # risk_level 分档定义救 review 分裂。schema/示例与 ALPHA05_PROMPT 完全一致。
+    "triage_kp",         # 知识增补裁决（system=ALPHA05_KP_PROMPT + has_vulnerability schema）
+    "triage_kp_a",       # 仅切片可达性规则（system=ALPHA05_KP_A_PROMPT；87 集安全、真实集救命的最小集）
     # ---- α0.5 精简 prompt 消融（2026-08-15）----
     # α0.5 训练统一用 ALPHA05_PROMPT（1495 字）。假设：SFT 已内化要求，推理 prompt
     # 过长反而注意力稀释。三档梯度验证：原样(1495) → 精简(~800) → 极简(~400)。
@@ -339,6 +345,10 @@ def get_eval_system_prompt(variant: str) -> str:
         return _build_triage_independent_prompt()
     if variant == "triage_train_aligned":
         return ALPHA05_PROMPT  # 训练原样 system（has_vulnerability 格式，对齐裁决 schema）
+    if variant == "triage_kp":
+        return ALPHA05_KP_PROMPT  # 知识增补（schema/示例不变，仅追加判别细则）
+    if variant == "triage_kp_a":
+        return ALPHA05_KP_A_PROMPT  # 仅切片可达性规则（最小增补集）
     if variant == "alpha05":
         return ALPHA05_PROMPT
     if variant == "alpha05_lite":
@@ -780,6 +790,69 @@ def _build_alpha05_prompt() -> str:
 
 
 ALPHA05_PROMPT = _build_alpha05_prompt()
+
+
+def _build_knowledge_supplement() -> str:
+    """triage_kp 知识增补块（2026-09-18）—— 从 α06 蒸馏 prompt 的判别笔记提炼。
+
+    背景：α06 在真实 CVE 集（cve_fix20 / rolling_dev50）二元召回大幅回退而 87 合成
+    集持平。归因（exp_07 alpha06 评测 + 训练数据审计）发现两个可由推理侧知识弥补的
+    断点：
+      1. v2_26 训练数据安全侧 22% 用"入口封闭/不可达"式论证（α05 仅 5%）——模型
+         在切片场景把"入口不可见"当"不可达"→ 无候选复核层判真 14→7 腰斩。蒸馏
+         prompt 的"样本外假设不得单独支撑 true"规则在切片考卷上就是召回杀手。
+      2. ALPHA05_PROMPT 从未定义 95/90/943/918/441/190 等判别轴与 risk_level
+         分档标准——归因摇摆与 review 分裂的部分根因。
+    本块只追加知识，不改 ALPHA05_PROMPT 的 schema、示例与输出格式（解析器兼容）。
+    """
+    return (
+        "\n【判别与防御细则（分析时逐条核对）】\n"
+        "A. 切片可达性：代码常是不完整切片，入口（路由/调用方/框架装配）在样本外 ≠ 不可达。"
+        "判定只看样本内的 sink 与防御：入口不可见时按可达处理，在 source 标注「入口在样本外」"
+        "并把风险等级降一档；仅当样本内存在覆盖全部可达数据流的有效防御或常量传播时才判安全。"
+        "代码注释可能撒谎，只依据代码真实行为。\n"
+        "B. 注入按最终消费方判编号：OS 程序执行（含 [\"sh\",\"-c\",输入]、shell:true）=78；"
+        "eval/exec/Function/preg_replace /e 的求值位=95（整段直传或拼接皆同）；"
+        "模板源码串位=1336；SQL 含 ORM raw=89；MongoDB/HQL=943；LDAP 过滤器=90；"
+        "XPath=643；SpEL/OGNL/EL=917；printf 格式串位=134。\n"
+        "C. 路径/文件：出现 ../ 或绝对路径可控=22；仅文件名可控=73。未净化输入进入浏览器"
+        "执行上下文=79，按最终渲染上下文判。\n"
+        "D. 授权四件套：无授权检查=862；查了但对象用户可控(IDOR)=639；关键功能无认证=306；"
+        "状态变更仅靠 Cookie 无 token=352。JWT alg=none=347（不是 327）。\n"
+        "E. 反序列化：不可信数据进 readObject/pickle/unserialize=502；受限反序列化器（白名单"
+        "既无执行型构造、来源池封闭）是有效防御。XML 允许外部实体/DTD=611。\n"
+        "F. 请求伪造：服务端取回 URL 且目的地未校验=918；借产品身份转发内部请求=441；"
+        "骗浏览器跳转=601。\n"
+        "G. 整数溢出：不可信输入参与长度/偏移/数量运算后用于边界检查、分配或寻址且检查"
+        "可被溢出绕过=190（经典形态 off+len 溢出为负放行）；纯算术回绕不流向边界操作不报。\n"
+        "H. 防御有效性的边界：参数化只覆盖值位——表名/列名/ORDER BY 等标识符位回退拼接"
+        "仍是 89；黑名单/单点 replace 是伪防御，判断前先找具体绕过串；组合防御要逐层拆开核验。\n"
+        "I. 风险分档：Critical=可达 RCE/认证绕过/凭证直接泄露（链上每跳样本内可证）；"
+        "High=注入/SSRF/XSS/越权读写；Medium=信息泄露/配置错误/有限 DoS/未使用硬编码凭证；"
+        "Low=影响极小。\n"
+    )
+
+
+ALPHA05_KP_PROMPT = ALPHA05_PROMPT + _build_knowledge_supplement()
+
+
+def _build_kp_a_supplement() -> str:
+    """triage_kp_a 拆分变体（2026-09-18）—— 只保留 A 条切片可达性规则。
+
+    背景：triage_kp 全量块在 cve_fix20 +14.4pp 但 87 集破 1.0（safe_09 被 D 条
+    授权围猎误报、2 FN 伴随候选漂移）。本变体只保留真实集救命的切片规则 +
+    注释警示，不带判别轴/风险分档等收紧性细则，目标：真实集增益不破 87 基线。
+    """
+    return (
+        "\n【切片可达性判定规则】\n"
+        "代码常是不完整切片：入口（路由/调用方/框架装配）在样本外 ≠ 不可达。"
+        "判定只看样本内的 sink 与防御：入口不可见时按可达处理，在 source 标注"
+        "「入口在样本外」并把风险等级降一档；仅当样本内存在覆盖全部可达数据流的"
+        "有效防御或常量传播时才判安全。代码注释可能撒谎，只依据代码真实行为。\n"
+    )
+
+
+ALPHA05_KP_A_PROMPT = ALPHA05_PROMPT + _build_kp_a_supplement()
 
 
 def _build_alpha05_lite_prompt() -> str:

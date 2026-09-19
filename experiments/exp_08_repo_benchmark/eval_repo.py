@@ -67,10 +67,15 @@ def judge_file(ts, code: str, lang: str, fname: str) -> dict:
 
 
 def compare(rec: dict, judged: dict) -> dict:
-    """发现级比对：expected_findings vs 系统确认的类型集合（行号放宽为文件级命中）。"""
+    """发现级比对：expected_findings vs 系统确认的类型集合（行号放宽为文件级命中）。
+    CWE 归一化：manifest 存 "CWE-89"、确认提取出 "89"，两侧统一为数字串再比对
+    （2026-09-18 修复：此前字符串不等导致发现命中恒 0）。"""
+    def norm(c) -> str:
+        m = _CWE_RE.search(str(c) or "")
+        return m.group(1) if m else str(c or "")
     exp = rec.get("expected_findings") or []
-    exp_cwes = {f["cwe"] for f in exp if f.get("cwe")}
-    got_cwes = {f.get("cwe") for f in judged["confirmed"] if f.get("cwe")}
+    exp_cwes = {norm(f["cwe"]) for f in exp if f.get("cwe")}
+    got_cwes = {norm(f.get("cwe")) for f in judged["confirmed"] if f.get("cwe")}
     hit = exp_cwes & got_cwes
     return {"expected_cwes": sorted(exp_cwes),
             "got_cwes": sorted(got_cwes),
@@ -110,6 +115,14 @@ def main() -> None:
     from graduation_project.transformers_client import create_llm_client
     from graduation_project.paths import resolve_base_model_path, resolve_adapter_path
     from graduation_project.prompts import ALPHA05_PROMPT
+
+    # 评估环境隔离（与 eval_two_stage.py 同纪律）：signal_feedback 开启时禁读
+    # 生产 models/signal_registry.json，注册表隔离到结果目录下的独立文件——
+    # 防止历史评估样本的抑制池跨跑污染生产工具链（fixed3 期间实测教训）。
+    from graduation_project.signal_registry import reset_signal_registry
+    iso_reg = out.parent / f"signal_registry.repo_eval.{manifest['repo'].split('/')[-1]}.{ts_out}.json"
+    reset_signal_registry(path=iso_reg)
+    print(f"[eval] ⚠ signal_feedback 启用：使用隔离注册表 {iso_reg}（不污染生产）")
 
     client = create_llm_client(
         "transformers",
