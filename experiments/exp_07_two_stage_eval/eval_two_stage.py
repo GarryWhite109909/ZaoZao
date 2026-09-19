@@ -354,7 +354,9 @@ def main() -> None:
         use_conformal=not args.no_conformal,
         use_signal_feedback=not args.no_signal_feedback,
         use_counterfactual=not args.no_counterfactual,
-        triage_aligned=(args.variant == "triage_train_aligned"),
+        # triage_kp 与 triage_train_aligned 同用 has_vulnerability 裁决 schema
+        # （system 不同：KP 变体追加判别知识块，schema/示例不变）
+        triage_aligned=(args.variant in ("triage_train_aligned", "triage_kp", "triage_kp_a")),
     )
     # 共形预测器校准：从历史评估结果（adjudications 的投票 + 已知标签）拟合阈值
     if not args.no_conformal and scanner._conformal is not None and args.calibrate_from:
