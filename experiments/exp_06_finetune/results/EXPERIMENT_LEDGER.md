@@ -74,6 +74,34 @@
 
 （附：官方+自研 taint 混合规则版 87 集 recall 同 0.607 但 FPR 0.462——旧版自研 taint 规则在该集只添 6 FP 未添 TP，见 `*.20260905_230003.json`。**2026-09-05 深夜基线对账驱动修复**：sqli/cmdi taint 规则 sink 收窄为查询文本（首参），参数化查询在构造上不再匹配——复验混跑 FPR 0.231 与纯官方持平（`*.20260905_235724.json`），详见 工具层优化指导 文档与规则文件头注。）
 
+### α06（v2_26）全量评测与归因战役（2026-09-18/19）
+
+> 组态：wave8 同款（transformers NF4 + adapter_alpha06_stage2、N=3、T=0.7、ctx16384、full_recheck、
+> 四路工具与信任层全开）。triage_kp = ALPHA05_PROMPT + 判别知识块（源自 α06 蒸馏 prompt 判别笔记）；
+> triage_kp_a = 仅切片可达性规则。21:19 起 kpa/kp 实验含 87 集。
+
+**主表**（recall；87 附 FPR）：
+
+| 组态 | 87 合成 | cve_fix20 | rolling_dev50 |
+|---|---|---|---|
+| α06·triage（wave8 组态） | **1.000** / 0.0385 | 0.722 | 0.393 |
+| α06·triage_kp | 0.961 | **0.867** | 0.394 |
+| α06·triage_kp_a | 0.979 | 0.778 | - |
+| α06·combined_nosource | - | 0.778 | 0.250 |
+| α0.5·triage（对照） | 1.000（=wave8） | **0.941** | 0.600 |
+| α0.5·combined_nosource（对照） | - | 0.941（09-01 锚点） | 0.645（09-07） |
+
+仓库级（exp_08 首次全量，文件级检出/类型命中）：dvna 2/2、nodegoat 11/16、php-goof 5/6、vflask 2/2；类型命中 10~25%，多报多为 GT 清单外疑似真发现（待人工定性）。
+
+**归因结论（2×2 矩阵，rolling_dev50 / cve_fix20 各一组）**：
+- **权重是主因**：同 prompt 下 α0.5→α06 rolling_dev -39.5pp（cns）/ -20.7pp（triage）；α0.5 对 prompt 不敏感（cvefix 双 prompt 均 0.941），α06 敏感（0.722~0.867）。
+- **87 集 vs 真实集的 trade**：α06 87 集持平略优（FPR 0.0435→0.0385），真实集回退。推理侧知识注入按线性比率交易（kp：cvefix +14.4pp 换 87 -3.9pp；kpa 最小集也破 1.0 且 review 8→14）——**prompt 只能交易不能修复**，SFT 权重对 system 漂移脆弱，训练/推理对齐原则再次验证。
+- **rolling_dev 工具召回天花板**：37/50 无工具候选，无候选复核判真数 α0.5=14/17、α06=4/7/9——该集提升须靠 α07 数据 + 工具层，prompt 无解。
+
+**溯源结论（v2_26 训练数据，详见会话记录）**：α06 波次新增行封闭式安全论证率 19.1%（α05 4.5%），毒源为 r2_regen 型批次（99% false + 教师被指令"必须找出使其安全的有效防御"）；教师不识具体 CVE 时高估样本内防御（与评测 FN 同一失败模式）；实锤考卷泄漏 1 处（Glances CVE-2023-33976 训练行 9967 标签 false vs 考卷 corpus_00067/00068 期望 true CWE-78，0913 patch 波次入库前未重跑簇审计）。α07 六条配方：删 9967+重跑簇审计、r2 指令去立场化、防御反证门、封闭式论证率入 check_style（阈值 8%）、硬安全批次配额化、v2_26 构建脚本补落库。
+
+结果文件：`exp_07_two_stage_eval/results/exp_07_{full87,cvefix20,rollingdev50}.alpha06_*`（triage/kp/kp_a/cns × 三集）+ `alpha05_triage_aligned` 对照 + `exp_08_repo_benchmark/results/repo_eval.*.alpha06.*`；脚本 `exp_07_two_stage_eval/run_alpha06_*.sh`（均可 --resume）。
+
 ## 二、Qwen3-8B 时代历史评估（保留供对比，不作锚点）
 
 | 时间 | 文件 | 说明 | 状态 |
