@@ -1,0 +1,944 @@
+# 代码安全分析请求 — 请认真分析
+
+> 我是做安全研究的，正在提升自己对代码审计的判断力。你的分析过程对我最有价值——
+> 请把你脑子里的推理步骤全部写出来，包括你排除掉的方向和为什么排除。
+> 下面是我整理的分析报告格式，请按这个结构写，方便我对照学习。
+
+---
+
+## 我需要你做的
+
+我会逐条消息发案例包给你，每包开头有【代码审计案例包】标记，包内有 `### id=...` 行标明案例编号。对每个代码样本做完整、独立的安全分析：**每条分析的第一行写 `### <案例编号> <版本A|版本B|全文>`**（编号照抄我给的 id），然后按以下格式逐项写，每一项都要有具体的行号和代码片段作为证据（片段用半角反引号包裹）：
+
+```
+入口: L<行号> <通道> <参数名> | 次要: <如有>
+    （通道别只看 HTTP 参数——配置文件、环境变量、命令行参数、stdin、文件流、DB 回读、内部 API 传参都算，我以前漏报最多的就是这些）
+链: L<行> <动作> → L<行> <动作> → L<行> <危险操作>
+    （判"安全"时本栏改写为: 未发现可达污点流，原因: <入口不可控 / sink 前防御封死 / 常量传播>）
+防御:
+  L<行> <机制> → 有效: <为什么攻击者过不去>
+  L<行> <机制> → 伪防御: <给出具体绕过字符串或 payload 片段>
+载荷: <能跑通的最短利用代码或 HTTP 请求>（要语义上真能触发——别拿会被引号/转义吃掉的字符串凑数）
+组合链: <如果多个缺陷串在一起危害更大，写出 A→B→C>
+锚句: 非 CWE-XX 因 <一句话>；非 CWE-YY 因 <一句话>
+结论: 存在漏洞=<true|false> | CWE-XXX <官方名> | <Critical|High|Medium|Low>
+修复: <行号 + 具体怎么改；用到的函数/模块必须在当前代码里已存在，别建议调用不存在的辅助函数>
+```
+
+---
+
+## 几个我踩过的坑，帮你避开
+
+1. "黑名单可绕过"这种话信息量为零——请把**具体绕过字符串**写出来（`....//`、`$()`、`%0a`、大小写变体），我才能真正理解防御为什么失败。
+2. **代码里的注释经常在撒谎**（"这里安全"其实有洞、"这里有洞"其实防御有效），注释里自己标的行号也经常是错的——请只看代码真实行为和真实行位，忽略注释声称的一切。
+3. 有些防御是**组合生效**的（A 单独不行 + B 单独不行 = AB 一起封死），请逐层拆开看，别只看单点。
+4. 如果硬编码的密钥/token 可以伪造会话或签名，从而**绕过看似存在的认证门**，这就是一条组合链，请写出来。
+5. 代码执行类的编号判别轴是**哪个解释器最终消费这个字符串**：shell 消费 → CWE-78（`execSync(shell:true)`、`["sh","-c",输入]` 都算，有无显式 shell 层不论）；`eval()`/`assert()`/`new Function()`/`preg_replace /e` 动态求值消费 → CWE-95/94 族（细分见判别笔记）；模板引擎把输入当代码渲染 → CWE-1336——三者别混。另外 `eval("var x = " + input)` 和 `eval(input)` 在我这里是同一类，别按"直接进 vs 拼接进"分成两种定性。
+6. 如果你是**从部署/运维角度**认为"这不会被打到"，那属于我的业务决策范围——请只报告代码层面可达的攻击面，部署上的事我自己判断。
+7. 如果某个判断**依赖我没贴出来的代码**（调用方、框架行为、运行环境、被截断的函数体），请显式标一句"样本外假设"——我要练习区分"代码内可证"和"凭经验猜测"。如果代码明显被截断了，直接告诉我要补哪段，别猜着补全分析。
+8. 我经常一条消息连发几个案例：**每个案例的行号、变量名、结论请逐条独立核对**——我遇到过把上一个样本的行号和结论串写到下一个样本的情况。
+9. 还有一类我容易漏的：**没有传统污点流的设计/配置缺陷**也请照实报告——弱协议/弱算法（TLS 1.0/SSL、MD5/SHA1——签名/MAC 用途和口令存储的快哈希都算）、不完整禁用列表/可绕过黑名单当防线、服务以 root 等过度权限运行（CWE-250）、可预测随机数生成令牌密钥（CWE-338）、禁用证书校验且无补偿控制（CWE-295）、硬编码凭证（CWE-798）——这些都给对应的 CWE。
+
+---
+
+## 样本类型说明
+
+你看到的代码有三种来源：
+- **单文件**：直接分析完整文件
+- **差分对**：同一个文件的两个版本（版本A、版本B）。请**分别独立分析**，版本A 的分析中不要参考版本 B 的任何内容；也不要因为"两个版本不一样"就预设哪个有问题——每个版本只按它自己的代码判
+- **文件切片**：大文件的一个片段，可能缺少上下文——不可达的方向请标注"样本外"
+
+**特殊：带官方结论的复核包**（包头标 `| redistill`，包内有"官方结论（待你验证）"区块）。这类是我自己推不稳的案例：把官方结论当作**待验证假设**，从代码出发推出支持它的完整证据链（污点路径/防御链逐行号）；如果你的推导确实到不了那个结论，写 `disagree: <哪一步断了、代码事实是什么>`——推不出来直说是有价值的，**禁止为凑结论编造不存在的行号、变量或数据流**。其中结论为"安全"的复核包：`防御:` 栏必须逐段给出**行号 + 什么机制 + 为什么不可旁路**，一句"已有校验"不合格。
+
+---
+
+## 我的判别笔记（结论里的 CWE 编号请按这份对齐；笔记本身整理错了也请直接指出）
+
+先问"注入的目标是什么"，再定编号：
+- sink 是 OS 程序执行 → CWE-78（**有没有 shell 层都算**，`["sh","-c",输入]` 也是 78）；注入的是"非 OS 的命令语言"（sed 脚本、IMAP/SMTP、应用配置语言）→ CWE-77；命令名固定、输入只落参数位 → CWE-88——**前提是输入能注入参数结构**（前导 `-`/`--` 被当新选项，如 `ssh -oProxyCommand=`、`tar --checkpoint-action=exec=`，或固定命令对该参数二次解析）；argv 单元素完整传递、无选项语义、无二次解析 = 无漏洞，别硬凑 88
+- 不可信数据进入 `eval()/exec()/Function()/preg_replace /e` 等**动态求值调用的求值位** → CWE-95——无论整段直传还是拼进代码文本（我查过 MITRE 4.20：95 是 94 的 Variant 子类，映射按更具体的 sink 优先，**拼接与否不影响 95 定位**；旧笔记"拼接主记 94"的统一口径已作废，统一主记 95，正文可注明旧口径差异）；拼出的代码**落盘后再执行**——写入 .py/.js/.sh 交解释器、存库后取出执行——正文注明 CWE-96；生成代码走**非求值器**的编译/执行路径（动态 import 之外的生成-编译链）或需父类兜底 → 94；输入进入**模板源码字符串位**被引擎渲染 → CWE-1336（`render(name=user)` 只是变量值，不算）；printf/format 的**格式串位**被控 → CWE-134；框架表达式求值器（SpEL/OGNL/EL）→ CWE-917；终端 ANSI/OSC 转义序列未净化 → CWE-150
+- sink 是 SQL（含 ORM raw）→ CWE-89；非 SQL 的查询逻辑（MongoDB 操作符、HQL）→ CWE-943（HQL 也有记 89 的惯例，本笔记统一 943，主编号别摇摆）；XPath → CWE-643；LDAP 过滤器 → CWE-90
+- 路径/文件名外部可控：出现 `../` 或等价目录上跳（含 `..\`、`%2e%2e%2f`、`..%c0%af`、symlink 逃逸）→ CWE-22；攻击者直接控绝对路径（如 `/etc/passwd`，无上跳）按本笔记也主记 22、正文可注明 CWE-73；仅文件名可控、目录不可控 → CWE-73
+- 未净化输入进入浏览器执行上下文（HTML/属性/JS 字符串）→ CWE-79，按**最终渲染上下文**判，不看变量叫什么
+- 不可信数据进反序列化器（readObject/pickle/unserialize）→ CWE-502（仅解析 JSON 等纯数据格式不算）。**受限反序列化器是有效防御**：`find_class`/resolve 白名单要同时满足（a）白名单内没有把输入当逻辑执行的构造器/方法、（b）可调用对象来源池封闭（REDUCE 链无法二段提升）才算防御有效。自写持久化通道（未验签的存储回读）算不算不可信输入看信任边界：攻击者取得该通道写入权的成本低于直接 RCE 成本 → 按 502 计，否则降为纵深防御缺失。XML 解析允许外部实体/DTD 且输入不可信 → CWE-611；把不可信流直接交给 JAXP 系列（`XPath.evaluate(InputSource,…)`、`Validator.validate(StreamSource)`、`Transformer.transform`）未设 `disallow-doctype-decl` 同样是 611，**`FEATURE_SECURE_PROCESSING` 不算有效防御**；纯实体膨胀 DoS（billion laughs、无外部实体）→ 正文注明 CWE-776，按 DoS 档定级
+- 服务端取回 URL 内容且目的地未校验 → CWE-918；借产品的身份/网络位置发请求（回环信任），最贴形是产品作为**非预期代理**把外部请求转交内部高权限服务 → CWE-441；内部服务"只信 localhost 所以不鉴权"按缺失认证/授权记 CWE-306/862，不算 441；骗浏览器跳转 → CWE-601
+- 没有授权检查 → CWE-862；查了但对象用户可控（IDOR）→ CWE-639；关键功能连认证都没有 → CWE-306；状态变更端点只靠自动携带的 Cookie、无 token/Origin 校验 → CWE-352。**SameSite 只有 Strict（或 Lax 且变更端点非 GET）才算一层防御**——Lax 在顶层导航 GET 上照带 Cookie；浏览器对未声明 SameSite 的 Cookie 默认按 Lax 处理，样本没写 SameSite 时别想当然按有防护算
+- JWT `alg=none` / 签名验证被禁用 → CWE-347（不是 327：不是算法弱，是验证被关了）
+- 用户可控动态键写入共享 dict/对象 → CWE-915（Python dict 没有原型链，禁止写"原型污染"叙事）；**JavaScript** 的 `obj[k]=v` 且 k 可为 `__proto__`/`constructor` → 正文注明 CWE-1321，同样不写"原型污染"字样敷衍、要写出完整链
+- 整数溢出/回绕：不可信输入进长度/偏移/索引/数量位，参与 `a + b`/`a * b`/移位/位掩码运算或宽窄类型转换后用于**边界检查、分配、拷贝、寻址**，且检查本身可被溢出绕过 → CWE-190（经典形态：`off + len > b.length` 在 `off+len` 溢出为负时放行，正确写法是 `len > b.length - off`）；JS 的索引回绕/负值规整缺陷（`index += origin`、位掩码寻址）同判；溢出结果没流向边界检查/分配/寻址的纯算术回绕不报或降档
+- 参数化/预编译/占位符查询 = SQL 注入的**有效防御，但只覆盖值位**；表名/列名/`ORDER BY` 字段/排序方向等标识符位不可绑定，回退拼接仍是 89——判"安全"前核对参数化覆盖了**所有**输入可达位；单点 replace/黑名单字符过滤 = **伪防御**（要核它漏了什么字符、作用位置对不对）
+- 硬编码凭证字面量用于认证/加密/签名 → CWE-798（"定义了但没使用"也是 798，风险降档即可；正文可加注更精确编号：在用且用于加密/签名的密钥 → CWE-321，未使用的配置项 → CWE-547）
+
+---
+
+## 风险等级我目前这么定（觉得哪条不合理，说出你的定法和理由）
+
+- Critical = 可达 RCE / 认证绕过 / 凭证直接泄露（认证门后就是 RCE 仍算 Critical）；"可达"要求**链上每一跳都在样本内可证**（路径、表名、组件行为全部代码内），任一跳依赖样本外（web root 可写、目标装有特定组件、上游权限）→ 记 High 并标"理论链"；凭证直接泄露限定为**可直接动用**的（私钥、数据库/服务账号口令、能伪造会话或签名的 secret），"像凭证但代码内无使用点"按 798 未使用降档
+- High = 注入类 / SSRF / XSS / 越权读写；没有利用链演示的理论 RCE 也记 High；等级按**组合链最坏情形**判，但同样受上一条"样本内可证"约束；Critical 与 High 两可时记 High 并写明理由，不虚高
+- Medium = 信息泄露 / 配置错误 / 有限 DoS / 定义未使用的硬编码凭证
+- Low = 影响极小
+
+---
+
+## 会话约定（以本提示词为准，不要自行增改）
+
+- 首条消息只有这段提示词、没有案例包时：直接给对判别笔记/风险等级的核对意见（有就写，没有只回"就绪"），然后等我发包，不要复述提示词。
+- 输出栏位以上面模板为准：**不新增"排除方向""次要发现"等独立栏位**——排除理由写进对应栏正文，次要发现并入修复栏前正文；自查清单**照常逐条打印**，不要改成静默执行。
+- 样本外假设不得单独支撑"存在漏洞=true"；整个判定悬在外部代码上时，列出需要我补的具体片段（调用点/类定义/函数体/依赖版本），能判的部分照判并标明影响范围。
+
+---
+
+## 输出末尾请自查
+
+- [ ] 每条分析第一行是否是 `### <案例编号> <版本>`？我发的每个案例、每个版本是否都各有一条分析？
+- [ ] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [ ] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [ ] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [ ] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [ ] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [ ] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [ ] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [ ] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（值位之外的表名/列名/排序位没有回退拼接）？
+
+最后：你的回复会被我原样归档进笔记库，请只写代码分析内容本身——不要客套话，不要"以下是分析""希望有帮助"之类的流程性文字。
+
+【代码审计案例包 | diffpair】
+
+### id=diffpair-corpus_00314 lang=python
+#### 版本A（415 行）
+```python
+import abc
+from itertools import tee
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, cast
+
+import jinja2
+import srsly
+from spacy import Errors, Language, util
+from spacy.tokens import Doc
+from spacy.training import Example
+
+from ..compat import Self
+from ..registry import lowercase_normalizer
+from ..ty import FewshotExample, ShardMapper, ShardReducer, TaskResponseParser
+
+
+class BuiltinTask(abc.ABC):
+    """Abstract base task implementing interfaces and/or functionality expected from all built-in tasks:
+        - working prompt template strings
+        - swappable response parsers
+        - swappable prompt example type
+        - integration of fewshot example into the fully rendered prompt
+        - initializable (in line with other spaCy components)
+        - (de-)serialization
+
+    On the relation of BuiltinTask to ShardingLLMTask: the latter specifies the minimal contract a task implementation
+    has to fulfill, whereas a BuiltinTask requires (and offers) functionality beyond that. The rationale behind that is
+    that built-in tasks should provide as smooth a usage experience as possible while still making it as easy as
+    possible for users to write their own, custom tasks.
+    """
+
+    def __init__(
+        self,
+        parse_responses: TaskResponseParser,
+        prompt_example_type: Type[FewshotExample[Self]],
+        template: str,
+        prompt_examples: Optional[List[FewshotExample[Self]]],
+        shard_mapper: ShardMapper,
+        shard_reducer: ShardReducer[Self],
+    ):
+        """Initializes task.
+        parse_responses (TaskResponseParser[Self]): Callable for parsing LLM responses for this task.
+        prompt_example_type (Type[FewshotExample[Self]): Type to use for fewshot examples.
+        template (str): Prompt template passed to the model.
+        prompt_examples (Optional[List[FewshotExample[Self]]]): Optional list of few-shot examples to include in prompts.
+        shard_mapper (ShardMapper): Maps docs to shards if they don't fit into the model context.
+        shard_reducer (ShardReducer[Self]): Reduces doc shards back into one doc instance.
+        """
+        self._parse_responses = parse_responses
+        self._prompt_examples = prompt_examples or []
+        self._template = template
+        self._prompt_example_type = prompt_example_type
+        self._shard_mapper = shard_mapper
+        self._shard_reducer = shard_reducer
+
+    def generate_prompts(
+        self, docs: Iterable[Doc], context_length: Optional[int] = None
+    ) -> Iterable[Tuple[Iterable[Any], Iterable[Doc]]]:
+        """Generate prompts from docs.
+        docs (Iterable[Doc]): Docs to generate prompts from.
+        ontext_length (int): Context length for model this task is executed with. Needed for sharding and fusing docs,
+            if the corresponding prompts exceed the context length. If None, context length is assumed to be infinite.
+        RETURNS (Iterable[Tuple[Iterable[Any], Iterable[Doc]]]): Iterable with one to n prompts per doc (multiple
+            prompts in case of multiple shards) and the corresponding shards. The relationship between shard and prompt
+            is 1:1.
+        """
+        environment = jinja2.Environment()
+        _template = environment.from_string(self._template)
+
+        def render_template(shard: Doc, i_shard: int, i_doc: int, n_shards: int) -> str:
+            """Renders template for a given doc (shard).
+            shard (Doc): Doc shard. Note that if the prompt is small enough to fit within the model's context window,
+                there will only be one shard, which is identical to the original doc.
+            i_shard (int): Shard index (w.r.t. shard's Doc instance).
+            i_doc (int): Doc index.
+            n_shards (int): Total number of shards.
+            RETURNS (str): Rendered template.
+            """
+            return _template.render(
+                text=shard.text,
+                prompt_examples=self._prompt_examples,
+                **self._get_prompt_data(shard, i_shard, i_doc, n_shards),
+            )
+
+        for _i_doc, _doc in enumerate(self._preprocess_docs_for_prompt(docs)):
+            # If no context length provided (e. g. because models don't provide it): don't shard.
+            shards = (
+                self._shard_mapper(_doc, _i_doc, context_length, render_template)
+                if context_length is not None
+                else [_doc]
+            )
+            shards = list(shards)
+            yield [
+                render_template(_shard, _i_shard, _i_doc, len(shards))
+                for _i_shard, _shard in enumerate(shards)
+            ], shards
+
+    def _get_prompt_data(
+        self, shard: Doc, i_shard: int, i_doc: int, n_shards: int
+    ) -> Dict[str, Any]:
+        """Returns data injected into prompt template. No-op if not overridden by inheriting task class. The data
+        returned by this might be static (i. e. the same for all doc shards) or dynamic (contingent on the doc shard).
+        shard (Doc): Doc (shard) for which prompt data should be fetched.
+        i_shard (int): Shard index (w.r.t. shard's Doc instance).
+        i_doc (int): Doc index.
+        n_shards (int): Total number of shards.
+        RETURNS (Dict[str, Any]): Data injected into prompt template.
+        """
+        return {}
+
+    def _preprocess_docs_for_prompt(self, docs: Iterable[Doc]) -> Iterable[Doc]:
+        """Preprocesses docs before injection into prompt template. No-op if not overridden by inheriting task class.
+        docs (Iterable[Doc]): Docs to generate prompts from.
+        RETURNS (Iterable[Doc]): Preprocessed docs.
+        """
+        return docs
+
+    @abc.abstractmethod
+    def parse_responses(
+        self, shards: Iterable[Iterable[Doc]], responses: Iterable[Iterable[Any]]
+    ) -> Iterable[Doc]:
+        """
+        Parses LLM responses.
+        shards (Iterable[Iterable[Doc]]): Doc shards to map responses into.
+        responses ([Iterable[Iterable[Any]]]): LLM responses per doc.
+        RETURNS (Iterable[Doc]]): Updated docs.
+        """
+
+    def _initialize(
+        self,
+        get_examples: Callable[[], Iterable["Example"]],
+        nlp: Language,
+        n_prompt_examples: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        """Initializes prompt examples from Doc examples.
+        get_examples (Callable[[], Iterable["Example"]]): Callable that provides examples
+            for initialization.
+        nlp (Language): Language instance.
+        n_prompt_examples (int): How many prompt examples to infer from the provided Example objects.
+            0 by default. Takes all examples if set to -1.
+        """
+        for eg in get_examples():
+            if n_prompt_examples < 0 or len(self._prompt_examples) < n_prompt_examples:
+                prompt_example = self._prompt_example_type.generate(eg, self)  # type: ignore[arg-type]
+                if prompt_example:
+                    self._prompt_examples.append(prompt_example)
+
+    def get_cfg(self) -> Dict[str, Any]:
+        """Serialize the task's configuration attributes."""
+        cfg = {key: getattr(self, key) for key in self._cfg_keys}
+        return cfg
+
+    def set_cfg(self, cfg: Dict[str, Any]) -> None:
+        """Deserialize the task's configuration attributes.
+        cfg (Dict[str, Any]): dictionary containing configuration attributes.
+        """
+        for key, value in cfg.items():
+            setattr(self, key, value)
+
+    def _get_prompt_examples(self) -> List[Dict[str, Any]]:
+        """Serialize examples."""
+        examples = [eg.dict() for eg in self._prompt_examples]
+        return examples
+
+    def _set_prompt_examples(self, examples: List[Dict[str, Any]]) -> None:
+        """Set prompt examples.
+        examples (List[Dict[str, Any]]): prompt examples.
+        """
+        self._prompt_examples = [
+            self._prompt_example_type.parse_obj(eg) for eg in examples
+        ]
+
+    def to_bytes(
+        self,
+        *,
+        exclude: Tuple[str] = cast(Tuple[str], tuple()),
+    ) -> bytes:
+        """Serialize the BuiltinTask to a bytestring.
+
+        exclude (Tuple): Names of properties to exclude from serialization.
+        RETURNS (bytes): The serialized object.
+        """
+        serialize = {
+            "cfg": lambda: srsly.json_dumps(self.get_cfg()),
+            "prompt_examples": lambda: srsly.msgpack_dumps(self._get_prompt_examples()),
+        }
+
+        return util.to_bytes(serialize, exclude)
+
+    def from_bytes(
+        self,
+        bytes_data: bytes,
+        *,
+        exclude: Tuple[str] = cast(Tuple[str], tuple()),
+    ) -> "BuiltinTask":
+        """Load the BuiltinTask from a bytestring.
+
+        bytes_data (bytes): The data to load.
+        exclude (Tuple[str]): Names of properties to exclude from deserialization.
+        RETURNS (BuiltinTask): Modified BuiltinTask instance.
+        """
+        deserialize = {
+            "cfg": lambda b: self.set_cfg(srsly.json_loads(b)),
+            "prompt_examples": lambda b: self._set_prompt_examples(
+                srsly.msgpack_loads(b)
+            ),
+        }
+
+        util.from_bytes(bytes_data, deserialize, exclude)
+        return self
+
+    def to_disk(
+        self,
+        path: Path,
+        *,
+        exclude: Tuple[str] = cast(Tuple[str], tuple()),
+    ) -> None:
+        """Serialize the task to disk.
+
+        path (Path): A path (currently unused).
+        exclude (Tuple): Names of properties to exclude from serialization.
+        """
+        serialize = {
+            "cfg": lambda p: srsly.write_json(p, self.get_cfg()),
+            "prompt_examples": lambda p: srsly.write_msgpack(
+                p, self._get_prompt_examples()
+            ),
+        }
+
+        util.to_disk(path, serialize, exclude)
+
+    def from_disk(
+        self,
+        path: Path,
+        *,
+        exclude: Tuple[str] = cast(Tuple[str], tuple()),
+    ) -> "BuiltinTask":
+        """Deserialize the task from disk.
+
+        path (Path): A path (currently unused).
+        exclude (Tuple): Names of properties to exclude from serialization.
+        RETURNS (BuiltinTask): The BuiltinTask instance.
+        """
+
+        deserialize = {
+            "cfg": lambda p: self.set_cfg(srsly.read_json(p)),
+            "prompt_examples": lambda p: self._set_prompt_examples(
+                srsly.read_msgpack(p)
+            ),
+        }
+
+        util.from_disk(path, deserialize, exclude)
+        return self
+
+    @property
+    def prompt_template(self) -> str:
+        return self._template
+
+    @property
+    @abc.abstractmethod
+    def _cfg_keys(self) -> List[str]:
+        """A list of configuration attributes to serialize."""
+        pass
+
+    @classmethod
+    def _check_extension(cls, extension: str) -> None:
+        """Add extension if need be.
+        extension (str): Extension to check/add.
+        """
+        if not Doc.has_extension(extension):
+            Doc.set_extension(extension, default=[])
+
+    @staticmethod
+    def _tee_2d_iterable(
+        data: Iterable[Iterable[Any]], n: int
+    ) -> Tuple[Iterable[List[Doc]], ...]:
+        """Tees two-dimensional Iterable. As Iterables in the nested iterables get consumed with the first access, we
+        need to materialize them - this is done by converting them to a list.
+        data (Iterable[Iterable[Any]]): Data to tee.
+        n (int): Number of tees to return.
+        RETURNS (Tuple[Iterable[List[Doc]], ...]): n-sized tuple of Iterables with inner Iterables converted to Lists.
+        """
+        return tee((list(inner_data) for inner_data in data), n)
+
+
+class BuiltinTaskWithLabels(BuiltinTask, abc.ABC):
+    """Built-in tasks with labels."""
+
+    def __init__(
+        self,
+        parse_responses: TaskResponseParser,
+        prompt_example_type: Type[FewshotExample[Self]],
+        template: str,
+        prompt_examples: Optional[List[FewshotExample[Self]]],
+        shard_mapper: ShardMapper,
+        shard_reducer: ShardReducer[Self],
+        labels: List[str],
+        label_definitions: Optional[Dict[str, str]],
+        normalizer: Optional[Callable[[str], str]],
+    ):
+        """Built-in task with labels.
+
+        parse_responses (TaskResponseParser[Self]): Callable for parsing LLM responses for this task.
+        prompt_example_type (Type[FewshotExample[Self]): Type to use for fewshot examples.
+        template (str): Prompt template passed to the model.
+        prompt_examples (Optional[List[FewshotExample[Self]]]): Optional list of few-shot examples to include in prompts.
+        shard_mapper (ShardMapper): Maps docs to shards if they don't fit into the model context.
+        shard_reducer (ShardReducer[Self]): Reduces doc shards back into one doc instance.
+        labels (List[str]): List of labels to pass to the template.
+            Leave empty to (optionally) populate it at initialization time.
+        label_definitions (Optional[Dict[str, str]]): Map of label -> description
+            of the label to help the language model output the entities wanted.
+            It is usually easier to provide these definitions rather than
+            full examples, although both can be provided.
+        normalizer (Optional[Callable[[str], str]]): optional normalizer function.
+        """
+        super().__init__(
+            parse_responses=parse_responses,
+            prompt_example_type=prompt_example_type,
+            template=template,
+            prompt_examples=prompt_examples,
+            shard_mapper=shard_mapper,
+            shard_reducer=shard_reducer,
+        )
+        self._normalizer = normalizer if normalizer else lowercase_normalizer()
+        self._label_dict = {
+            self._normalizer(label): label for label in sorted(set(labels))
+        }
+        self._label_definitions = label_definitions
+
+    def _initialize(  # type: ignore[override]
+        self,
+        get_examples: Callable[[], Iterable["Example"]],
+        nlp: Language,
+        labels: List[str] = [],
+        n_prompt_examples: int = 0,
+        **kwargs,
+    ) -> None:
+        """Supports initialization of tasks with labels by auto-discovering labels and returning the derived few-shot
+        examples and label dict.
+
+        Labels can be set through, by order of precedence:
+
+        - the `[initialize]` section of the pipeline configuration
+        - the `labels` argument supplied to the task factory
+        - the labels found in the examples
+
+        get_examples (Callable[[], Iterable["Example"]]): Callable that provides examples
+            for initialization.
+        nlp (Language): Language instance.
+        labels (List[str]): Optional list of labels.
+        n_prompt_examples (int): How many prompt examples to infer from the Example objects.
+            0 by default. Takes all examples if set to -1.
+        """
+        if not labels:
+            labels = list(self._label_dict.values())
+        infer_labels = not labels
+
+        if infer_labels:
+            labels = []
+
+        for eg in get_examples():
+            if infer_labels:
+                labels.extend(self._extract_labels_from_example(eg))
+            if n_prompt_examples < 0 or len(self._prompt_examples) < n_prompt_examples:
+                prompt_example = self._prompt_example_type.generate(eg, self)  # type: ignore[arg-type]
+                if prompt_example:
+                    self._prompt_examples.append(prompt_example)
+
+        self._label_dict = {
+            self._normalizer(label): label for label in sorted(set(labels))
+        }
+
+    @abc.abstractmethod
+    def _extract_labels_from_example(self, example: Example) -> List[str]:
+        """Extracts labels from Example instance.
+        example (Example): Example to extract labels from.
+        RETURNS (List[str]): Labels extracted from Example instance.
+        """
+
+    @property
+    def labels(self) -> Tuple[str, ...]:
+        return tuple(self._label_dict.values())
+
+    def add_label(self, label: str, label_definition: Optional[str] = None) -> int:
+        """Add a label to the task"""
+        if not isinstance(label, str):
+            raise ValueError(Errors.E187)
+        if label in self.labels:
+            return 0
+        self._label_dict[self._normalizer(label)] = label
+        if label_definition is None:
+            return 1
+        if self._label_definitions is None:
+            self._label_definitions = {}
+        self._label_definitions[label] = label_definition
+        return 1
+
+    def clear(self) -> None:
+        """Reset all labels."""
+        self._label_dict = {}
+        self._label_definitions = None
+
+    @property
+    def normalizer(self) -> Callable[[str], str]:
+        return self._normalizer
+
+    @property
+    def label_dict(self) -> Dict[str, str]:
+        return self._label_dict
+
+    @property
+    def label_definitions(self) -> Optional[Dict[str, str]]:
+        return self._label_definitions
+```
+#### 版本B（416 行）
+```python
+import abc
+from itertools import tee
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, cast
+
+import jinja2
+import jinja2.sandbox
+import srsly
+from spacy import Errors, Language, util
+from spacy.tokens import Doc
+from spacy.training import Example
+
+from ..compat import Self
+from ..registry import lowercase_normalizer
+from ..ty import FewshotExample, ShardMapper, ShardReducer, TaskResponseParser
+
+
+class BuiltinTask(abc.ABC):
+    """Abstract base task implementing interfaces and/or functionality expected from all built-in tasks:
+        - working prompt template strings
+        - swappable response parsers
+        - swappable prompt example type
+        - integration of fewshot example into the fully rendered prompt
+        - initializable (in line with other spaCy components)
+        - (de-)serialization
+
+    On the relation of BuiltinTask to ShardingLLMTask: the latter specifies the minimal contract a task implementation
+    has to fulfill, whereas a BuiltinTask requires (and offers) functionality beyond that. The rationale behind that is
+    that built-in tasks should provide as smooth a usage experience as possible while still making it as easy as
+    possible for users to write their own, custom tasks.
+    """
+
+    def __init__(
+        self,
+        parse_responses: TaskResponseParser,
+        prompt_example_type: Type[FewshotExample[Self]],
+        template: str,
+        prompt_examples: Optional[List[FewshotExample[Self]]],
+        shard_mapper: ShardMapper,
+        shard_reducer: ShardReducer[Self],
+    ):
+        """Initializes task.
+        parse_responses (TaskResponseParser[Self]): Callable for parsing LLM responses for this task.
+        prompt_example_type (Type[FewshotExample[Self]): Type to use for fewshot examples.
+        template (str): Prompt template passed to the model.
+        prompt_examples (Optional[List[FewshotExample[Self]]]): Optional list of few-shot examples to include in prompts.
+        shard_mapper (ShardMapper): Maps docs to shards if they don't fit into the model context.
+        shard_reducer (ShardReducer[Self]): Reduces doc shards back into one doc instance.
+        """
+        self._parse_responses = parse_responses
+        self._prompt_examples = prompt_examples or []
+        self._template = template
+        self._prompt_example_type = prompt_example_type
+        self._shard_mapper = shard_mapper
+        self._shard_reducer = shard_reducer
+
+    def generate_prompts(
+        self, docs: Iterable[Doc], context_length: Optional[int] = None
+    ) -> Iterable[Tuple[Iterable[Any], Iterable[Doc]]]:
+        """Generate prompts from docs.
+        docs (Iterable[Doc]): Docs to generate prompts from.
+        ontext_length (int): Context length for model this task is executed with. Needed for sharding and fusing docs,
+            if the corresponding prompts exceed the context length. If None, context length is assumed to be infinite.
+        RETURNS (Iterable[Tuple[Iterable[Any], Iterable[Doc]]]): Iterable with one to n prompts per doc (multiple
+            prompts in case of multiple shards) and the corresponding shards. The relationship between shard and prompt
+            is 1:1.
+        """
+        environment = jinja2.sandbox.SandboxedEnvironment()
+        _template = environment.from_string(self._template)
+
+        def render_template(shard: Doc, i_shard: int, i_doc: int, n_shards: int) -> str:
+            """Renders template for a given doc (shard).
+            shard (Doc): Doc shard. Note that if the prompt is small enough to fit within the model's context window,
+                there will only be one shard, which is identical to the original doc.
+            i_shard (int): Shard index (w.r.t. shard's Doc instance).
+            i_doc (int): Doc index.
+            n_shards (int): Total number of shards.
+            RETURNS (str): Rendered template.
+            """
+            return _template.render(
+                text=shard.text,
+                prompt_examples=self._prompt_examples,
+                **self._get_prompt_data(shard, i_shard, i_doc, n_shards),
+            )
+
+        for _i_doc, _doc in enumerate(self._preprocess_docs_for_prompt(docs)):
+            # If no context length provided (e. g. because models don't provide it): don't shard.
+            shards = (
+                self._shard_mapper(_doc, _i_doc, context_length, render_template)
+                if context_length is not None
+                else [_doc]
+            )
+            shards = list(shards)
+            yield [
+                render_template(_shard, _i_shard, _i_doc, len(shards))
+                for _i_shard, _shard in enumerate(shards)
+            ], shards
+
+    def _get_prompt_data(
+        self, shard: Doc, i_shard: int, i_doc: int, n_shards: int
+    ) -> Dict[str, Any]:
+        """Returns data injected into prompt template. No-op if not overridden by inheriting task class. The data
+        returned by this might be static (i. e. the same for all doc shards) or dynamic (contingent on the doc shard).
+        shard (Doc): Doc (shard) for which prompt data should be fetched.
+        i_shard (int): Shard index (w.r.t. shard's Doc instance).
+        i_doc (int): Doc index.
+        n_shards (int): Total number of shards.
+        RETURNS (Dict[str, Any]): Data injected into prompt template.
+        """
+        return {}
+
+    def _preprocess_docs_for_prompt(self, docs: Iterable[Doc]) -> Iterable[Doc]:
+        """Preprocesses docs before injection into prompt template. No-op if not overridden by inheriting task class.
+        docs (Iterable[Doc]): Docs to generate prompts from.
+        RETURNS (Iterable[Doc]): Preprocessed docs.
+        """
+        return docs
+
+    @abc.abstractmethod
+    def parse_responses(
+        self, shards: Iterable[Iterable[Doc]], responses: Iterable[Iterable[Any]]
+    ) -> Iterable[Doc]:
+        """
+        Parses LLM responses.
+        shards (Iterable[Iterable[Doc]]): Doc shards to map responses into.
+        responses ([Iterable[Iterable[Any]]]): LLM responses per doc.
+        RETURNS (Iterable[Doc]]): Updated docs.
+        """
+
+    def _initialize(
+        self,
+        get_examples: Callable[[], Iterable["Example"]],
+        nlp: Language,
+        n_prompt_examples: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        """Initializes prompt examples from Doc examples.
+        get_examples (Callable[[], Iterable["Example"]]): Callable that provides examples
+            for initialization.
+        nlp (Language): Language instance.
+        n_prompt_examples (int): How many prompt examples to infer from the provided Example objects.
+            0 by default. Takes all examples if set to -1.
+        """
+        for eg in get_examples():
+            if n_prompt_examples < 0 or len(self._prompt_examples) < n_prompt_examples:
+                prompt_example = self._prompt_example_type.generate(eg, self)  # type: ignore[arg-type]
+                if prompt_example:
+                    self._prompt_examples.append(prompt_example)
+
+    def get_cfg(self) -> Dict[str, Any]:
+        """Serialize the task's configuration attributes."""
+        cfg = {key: getattr(self, key) for key in self._cfg_keys}
+        return cfg
+
+    def set_cfg(self, cfg: Dict[str, Any]) -> None:
+        """Deserialize the task's configuration attributes.
+        cfg (Dict[str, Any]): dictionary containing configuration attributes.
+        """
+        for key, value in cfg.items():
+            setattr(self, key, value)
+
+    def _get_prompt_examples(self) -> List[Dict[str, Any]]:
+        """Serialize examples."""
+        examples = [eg.dict() for eg in self._prompt_examples]
+        return examples
+
+    def _set_prompt_examples(self, examples: List[Dict[str, Any]]) -> None:
+        """Set prompt examples.
+        examples (List[Dict[str, Any]]): prompt examples.
+        """
+        self._prompt_examples = [
+            self._prompt_example_type.parse_obj(eg) for eg in examples
+        ]
+
+    def to_bytes(
+        self,
+        *,
+        exclude: Tuple[str] = cast(Tuple[str], tuple()),
+    ) -> bytes:
+        """Serialize the BuiltinTask to a bytestring.
+
+        exclude (Tuple): Names of properties to exclude from serialization.
+        RETURNS (bytes): The serialized object.
+        """
+        serialize = {
+            "cfg": lambda: srsly.json_dumps(self.get_cfg()),
+            "prompt_examples": lambda: srsly.msgpack_dumps(self._get_prompt_examples()),
+        }
+
+        return util.to_bytes(serialize, exclude)
+
+    def from_bytes(
+        self,
+        bytes_data: bytes,
+        *,
+        exclude: Tuple[str] = cast(Tuple[str], tuple()),
+    ) -> "BuiltinTask":
+        """Load the BuiltinTask from a bytestring.
+
+        bytes_data (bytes): The data to load.
+        exclude (Tuple[str]): Names of properties to exclude from deserialization.
+        RETURNS (BuiltinTask): Modified BuiltinTask instance.
+        """
+        deserialize = {
+            "cfg": lambda b: self.set_cfg(srsly.json_loads(b)),
+            "prompt_examples": lambda b: self._set_prompt_examples(
+                srsly.msgpack_loads(b)
+            ),
+        }
+
+        util.from_bytes(bytes_data, deserialize, exclude)
+        return self
+
+    def to_disk(
+        self,
+        path: Path,
+        *,
+        exclude: Tuple[str] = cast(Tuple[str], tuple()),
+    ) -> None:
+        """Serialize the task to disk.
+
+        path (Path): A path (currently unused).
+        exclude (Tuple): Names of properties to exclude from serialization.
+        """
+        serialize = {
+            "cfg": lambda p: srsly.write_json(p, self.get_cfg()),
+            "prompt_examples": lambda p: srsly.write_msgpack(
+                p, self._get_prompt_examples()
+            ),
+        }
+
+        util.to_disk(path, serialize, exclude)
+
+    def from_disk(
+        self,
+        path: Path,
+        *,
+        exclude: Tuple[str] = cast(Tuple[str], tuple()),
+    ) -> "BuiltinTask":
+        """Deserialize the task from disk.
+
+        path (Path): A path (currently unused).
+        exclude (Tuple): Names of properties to exclude from serialization.
+        RETURNS (BuiltinTask): The BuiltinTask instance.
+        """
+
+        deserialize = {
+            "cfg": lambda p: self.set_cfg(srsly.read_json(p)),
+            "prompt_examples": lambda p: self._set_prompt_examples(
+                srsly.read_msgpack(p)
+            ),
+        }
+
+        util.from_disk(path, deserialize, exclude)
+        return self
+
+    @property
+    def prompt_template(self) -> str:
+        return self._template
+
+    @property
+    @abc.abstractmethod
+    def _cfg_keys(self) -> List[str]:
+        """A list of configuration attributes to serialize."""
+        pass
+
+    @classmethod
+    def _check_extension(cls, extension: str) -> None:
+        """Add extension if need be.
+        extension (str): Extension to check/add.
+        """
+        if not Doc.has_extension(extension):
+            Doc.set_extension(extension, default=[])
+
+    @staticmethod
+    def _tee_2d_iterable(
+        data: Iterable[Iterable[Any]], n: int
+    ) -> Tuple[Iterable[List[Doc]], ...]:
+        """Tees two-dimensional Iterable. As Iterables in the nested iterables get consumed with the first access, we
+        need to materialize them - this is done by converting them to a list.
+        data (Iterable[Iterable[Any]]): Data to tee.
+        n (int): Number of tees to return.
+        RETURNS (Tuple[Iterable[List[Doc]], ...]): n-sized tuple of Iterables with inner Iterables converted to Lists.
+        """
+        return tee((list(inner_data) for inner_data in data), n)
+
+
+class BuiltinTaskWithLabels(BuiltinTask, abc.ABC):
+    """Built-in tasks with labels."""
+
+    def __init__(
+        self,
+        parse_responses: TaskResponseParser,
+        prompt_example_type: Type[FewshotExample[Self]],
+        template: str,
+        prompt_examples: Optional[List[FewshotExample[Self]]],
+        shard_mapper: ShardMapper,
+        shard_reducer: ShardReducer[Self],
+        labels: List[str],
+        label_definitions: Optional[Dict[str, str]],
+        normalizer: Optional[Callable[[str], str]],
+    ):
+        """Built-in task with labels.
+
+        parse_responses (TaskResponseParser[Self]): Callable for parsing LLM responses for this task.
+        prompt_example_type (Type[FewshotExample[Self]): Type to use for fewshot examples.
+        template (str): Prompt template passed to the model.
+        prompt_examples (Optional[List[FewshotExample[Self]]]): Optional list of few-shot examples to include in prompts.
+        shard_mapper (ShardMapper): Maps docs to shards if they don't fit into the model context.
+        shard_reducer (ShardReducer[Self]): Reduces doc shards back into one doc instance.
+        labels (List[str]): List of labels to pass to the template.
+            Leave empty to (optionally) populate it at initialization time.
+        label_definitions (Optional[Dict[str, str]]): Map of label -> description
+            of the label to help the language model output the entities wanted.
+            It is usually easier to provide these definitions rather than
+            full examples, although both can be provided.
+        normalizer (Optional[Callable[[str], str]]): optional normalizer function.
+        """
+        super().__init__(
+            parse_responses=parse_responses,
+            prompt_example_type=prompt_example_type,
+            template=template,
+            prompt_examples=prompt_examples,
+            shard_mapper=shard_mapper,
+            shard_reducer=shard_reducer,
+        )
+        self._normalizer = normalizer if normalizer else lowercase_normalizer()
+        self._label_dict = {
+            self._normalizer(label): label for label in sorted(set(labels))
+        }
+        self._label_definitions = label_definitions
+
+    def _initialize(  # type: ignore[override]
+        self,
+        get_examples: Callable[[], Iterable["Example"]],
+        nlp: Language,
+        labels: List[str] = [],
+        n_prompt_examples: int = 0,
+        **kwargs,
+    ) -> None:
+        """Supports initialization of tasks with labels by auto-discovering labels and returning the derived few-shot
+        examples and label dict.
+
+        Labels can be set through, by order of precedence:
+
+        - the `[initialize]` section of the pipeline configuration
+        - the `labels` argument supplied to the task factory
+        - the labels found in the examples
+
+        get_examples (Callable[[], Iterable["Example"]]): Callable that provides examples
+            for initialization.
+        nlp (Language): Language instance.
+        labels (List[str]): Optional list of labels.
+        n_prompt_examples (int): How many prompt examples to infer from the Example objects.
+            0 by default. Takes all examples if set to -1.
+        """
+        if not labels:
+            labels = list(self._label_dict.values())
+        infer_labels = not labels
+
+        if infer_labels:
+            labels = []
+
+        for eg in get_examples():
+            if infer_labels:
+                labels.extend(self._extract_labels_from_example(eg))
+            if n_prompt_examples < 0 or len(self._prompt_examples) < n_prompt_examples:
+                prompt_example = self._prompt_example_type.generate(eg, self)  # type: ignore[arg-type]
+                if prompt_example:
+                    self._prompt_examples.append(prompt_example)
+
+        self._label_dict = {
+            self._normalizer(label): label for label in sorted(set(labels))
+        }
+
+    @abc.abstractmethod
+    def _extract_labels_from_example(self, example: Example) -> List[str]:
+        """Extracts labels from Example instance.
+        example (Example): Example to extract labels from.
+        RETURNS (List[str]): Labels extracted from Example instance.
+        """
+
+    @property
+    def labels(self) -> Tuple[str, ...]:
+        return tuple(self._label_dict.values())
+
+    def add_label(self, label: str, label_definition: Optional[str] = None) -> int:
+        """Add a label to the task"""
+        if not isinstance(label, str):
+            raise ValueError(Errors.E187)
+        if label in self.labels:
+            return 0
+        self._label_dict[self._normalizer(label)] = label
+        if label_definition is None:
+            return 1
+        if self._label_definitions is None:
+            self._label_definitions = {}
+        self._label_definitions[label] = label_definition
+        return 1
+
+    def clear(self) -> None:
+        """Reset all labels."""
+        self._label_dict = {}
+        self._label_definitions = None
+
+    @property
+    def normalizer(self) -> Callable[[str], str]:
+        return self._normalizer
+
+    @property
+    def label_dict(self) -> Dict[str, str]:
+        return self._label_dict
+
+    @property
+    def label_definitions(self) -> Optional[Dict[str, str]]:
+        return self._label_definitions
+```

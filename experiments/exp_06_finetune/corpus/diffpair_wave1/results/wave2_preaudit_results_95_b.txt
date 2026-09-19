@@ -1,0 +1,173 @@
+### wave2-95-06 版本A
+入口: L10 环境变量 `ALERT_FORMULA`（os.environ.get） | 次要: L11 作用域字典 events/total 仅为求值变量绑定，非污点位
+链: L10 读取环境变量整串 → L11 `eval(formula, {"__builtins__": {}}, {...})` 求值位消费不可信串 → L11 任意表达式执行，经对象图逃逸触达 os 模块（L6 已 `import os`）
+防御:
+  L11 空 builtins `{"__builtins__": {}}` → 伪防御: 只切断名字查找，切不断属性图——从字面量自带的 `__class__` 起链即可绕过，绕过串 `().__class__.__base__.__subclasses__()`，见载荷
+载荷: 环境变量 `ALERT_FORMULA='[c for c in ().__class__.__base__.__subclasses__() if c.__name__=="_wrap_close"][0].__init__.__globals__["system"]("id")'` → eval 求值时经 `__subclasses__` 找到 os 模块内部类，取其 `__globals__["system"]` 执行 `system("id")`（样本外假设: 目标类存在于 CPython 类图依赖 os 模块实现细节，CPython 3.x 标准实现下成立；L6 的 import 保证 os 已加载）
+组合链: 无——单点 eval 即终局任意代码执行
+锚句: 非 CWE-94，因 MITRE 4.20 中 95 是 94 的 Variant 子类、sink 更具体者优先，不可信数据进 eval 求值位统一主记 95（笔记旧口径"拼接记 94"已作废）；非 CWE-78，因最终消费该串的是 Python 求值器而非 OS shell
+结论: 存在漏洞=true | CWE-95 Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection') | Critical
+修复: L11 删除 eval：将 ALERT_FORMULA 改为预置公式名（如 "strict5"）经固定字典映射到代码内常量表达式；或以 `ast.parse(formula, mode="eval")` + 全节点 isinstance 白名单 + operator 函数映射的显式解释器求值（标准库 ast/operator），公式文本不再进入任何求值器
+
+### wave2-95-06 版本B
+入口: L28 环境变量 `ALERT_FORMULA` | 次要: L27 函数参数 events/total（仅作为数值绑定消费）
+链: 未发现可达污点流，原因: L29 `ast.parse(formula, mode="eval")` 后输入不再进入任何求值器；L30-L32 全节点白名单 + L34-L45 显式遍历解释器使数据只作为数值参与运算
+防御:
+  L30-L32 ast.walk 全节点 isinstance 校验 → 有效: `ast.Attribute`/`ast.Call`/`ast.Subscript`/`ast.Lambda` 均不在 ALLOWED_NODES，`().__class__` 形态的属性链在 `ast.Attribute` 节点处即被 `raise ValueError("node not allowed")` 拦截；L29 mode="eval" 还拒绝多语句
+  L41-L42 ast.Name 只查固定字典 `{"events": events, "total": total}` → 有效: 名字解析封闭，无 getattr/exec 面；未知名触发 KeyError 而非求值
+  L36/L38 OPS/CMP 固定映射（L22-L25）→ 有效: 运算语义白名单化为 operator.add/mul/gt 等，不存在字符串再求值
+次要: L36 经 L23 `ast.Mult: operator.mul` 允许 `Constant("A") * Constant(99999999)` 型字符串重复，可造成内存膨胀有限 DoS，入口为运维环境变量、影响自身进程，不改变主判定
+组合链: 无
+锚句: 非 CWE-95，因代码中不存在 eval/exec/Function 类求值消费点；非 CWE-190，因运算结果不流向边界检查/分配/寻址
+结论: 存在漏洞=false | CWE-95 Eval Injection（求值器已移除、白名单防御有效未触发） | Low
+修复: 无必须项；可选加固：L34-L45 的 ev 对 ast.Constant 字符串参与 ast.Mult 时限制重复长度，避免上述有限 DoS
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？（环境变量、函数参数均已枚举）
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？（版本A载荷的 CPython 类图细节）
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-95-07 版本A
+入口: L11 HTTP POST /filters/preview body 字段 `predicate` | 次要: L12 `rows`（决定回调是否被执行，攻击者自给 `[1]` 即可触发）
+链: L11 取 body.predicate → L15 `new Function("item", `return (${predicate});`)` 将整串构造为动态函数体 → L19 `rows.filter(fn)` 触发求值 → 任意 JS 执行（函数体在全局作用域，`process` 可达）
+防御:
+  L14-L18 try/catch + 400 → 伪防御: 仅捕获构造期 SyntaxError（语法坏串被拒），对语法合法的恶意谓词无任何拦截，RCE 载荷恰好是合法表达式
+载荷: `POST /filters/preview` body `{"predicate":"process.mainModule.require('child_process').execSync('id').toString()","rows":[1]}` → L19 filter 调用 fn 执行 execSync；`require` 经 CJS 入口的 process.mainModule 可达（样本内 L6 `require("express")` 证明 CJS 运行形态）（样本外假设: 若运行在移除 process.mainModule 的极新 Node 版本，需改用 globalThis 上其他逃生口，求值本身不受影响）
+组合链: 无——单点动态求值即完整 RCE
+锚句: 非 CWE-94，因按 MITRE 4.20 映射 new Function 求值位消费不可信数据主记 95（Variant 优先，拼接与否不影响定位）；非 CWE-79，因响应仅回显 `{count}` 数值，谓词串不在响应中渲染
+结论: 存在漏洞=true | CWE-95 Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection') | Critical
+修复: L15 删除 new Function：将谓词改为受限结构 `{op, field, value}`，以固定映射表（如 `{">=": (a,b)=>a>=b}`）+ 字段白名单查表求值；L11 对 body 做结构与类型校验，拒绝自由文本谓词
+
+### wave2-95-07 版本B
+入口: L39 HTTP POST body 字段 `rule`（{op, field, value}） | 次要: L40 `rows`
+链: 未发现可达污点流，原因: L41-L42 查表不命中即 undefined，L43 返回 400；L44 谓词由固定闭包组成，无任何动态求值/字符串拼接
+防御:
+  L41 `OPS[rule && rule.op]` → 有效: op 只能命中 gte/lte/eq 三个固定实现（L31-L35），注入串如 `"__proto__"`、`"constructor"` 在字面量表上取值为 undefined
+  L42 `FIELDS[rule && rule.field]` → 有效: field 只能命中 score/age（L36），无属性路径注入面
+  L43 `if (!op || !field)` → 有效: 双查表缺一即拒
+  L44 `op(field(item), rule.value)` → 有效: rule.value 仅作为比较运算数进入固定函数，永不进入解释器
+组合链: 无
+锚句: 非 CWE-95，因不存在 Function/eval 消费点；非 CWE-915，因 OPS/FIELDS 是封闭字面量表，rule 的键不会被写入任何共享对象
+结论: 存在漏洞=false | CWE-95 Eval Injection（动态求值已移除、查表白名单防御有效未触发） | Low
+修复: 无必须项；可选：L43 对 rule.value 加 Number.isFinite 类型校验，避免非数值比较造成业务误判（行为问题，非安全问题）
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？（版本A载荷的 Node 版本保留）
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-95-08 版本A
+入口: L14 方法参数 `ruleExpr`（check() 入参通道；注释称由运营后台下发，调用点未贴——来源可控性属样本外假设） | 次要: 无
+链: L17-L18 engine.put 绑定 spend/vip → L18 `engine.eval(ruleExpr)` 将整串作为 JavaScript 求值 → 引擎内 Java 互操作触达 `java.lang.Runtime` → OS 命令执行
+防御:
+  L19 `Boolean.TRUE.equals(out)` → 伪防御: 只在求值完成后规整返回值类型，对求值过程零约束——恶意 ruleExpr 的副作用在 L18 已发生，返回什么不影响
+  L17-L18 engine.put 仅绑定 spend/vip → 伪防御: 绑定只是向引擎暴露符号，未限制引擎内可达对象；getEngineByName("js") 默认开启 Java 互操作，`java.lang.Runtime` 直接可达
+载荷: `ruleExpr = "java.lang.Runtime.getRuntime().exec('id')"`（等价 `Java.type('java.lang.Runtime')...`）（样本外假设: 引擎存在性依赖 JDK ≤14 自带 Nashorn 或 classpath 存在 nashorn/GraalJS；无引擎的 JDK 下 getEngineByName 返回 null，L18 变 NPE——两种情形均基于未贴出的运行环境）
+组合链: 无
+锚句: 非 CWE-94，因 Java ScriptEngine 求值位消费不可信数据按更具体 sink 统一主记 95（对齐判别笔记第 5 条口径）；非 CWE-78，因第一级 sink 是脚本引擎而非 OS shell，OS 命令是引擎互操作的第二跳
+结论: 存在漏洞=true | CWE-95 Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection') | High
+修复: L18 删除引擎求值：将规则收敛为结构化对象（枚举 field/op + 数值 value，switch 分发）；若必须保留脚本，构造引擎时挂 ClassFilter/`--no-java` 等价配置禁用 Java 互操作，并对 ruleExpr 做语法结构白名单
+（定级说明: eval → 任意 Java 调用链样本内可证，但"Nashorn 引擎存在且允许互操作"这一跳依赖 JDK 版本/依赖，悬于样本外 → 按纪律记 High 并标理论链；若运行时确为 JDK ≤14 默认部署，则为 Critical）
+
+### wave2-95-08 版本B
+入口: L34 方法参数 `c`（record Condition，含 field/op/value） | 次要: 方法参数 spend/vip（数值/布尔消费位）
+链: 未发现可达污点流，原因: 输入是类型封闭的枚举 record，L35-L43 全部 switch 分发到算术比较，无字符串进入任何解释器
+防御:
+  L29-L30 `enum Field` / `enum Op` 封闭集 → 有效: field/op 无法携带任意字符串，非法值在构造 Condition 时即被类型系统拒绝，不存在"先构造再求值"的通道
+  L35-L38 `switch (c.field())` 仅映射到方法参数 spend/vip → 有效: 无名称反射、无求值、无未知分支（switch 对 enum 全覆盖）
+  L39-L43 `switch (c.op())` GT/GTE/EQ 三个纯比较分支 → 有效: 运算语义固定，value 仅作比较数
+组合链: 无
+锚句: 非 CWE-95，因代码中不存在 ScriptEngine/eval 类求值点；非 CWE-88，因无 OS 命令参数结构
+结论: 存在漏洞=false | CWE-95 Eval Injection（求值器已移除、类型封闭防御有效未触发） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？（方法入参通道已核）
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？（ruleExpr 来源、JDK 引擎可用性）
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？（check() 的调用方未贴，已注明样本外）
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-95-09 版本A
+入口: L8 HTTP POST `$_POST` 全量键值（键名即通道——动态变量名注入） | 次要: 无
+链: 未发现可达污点流，原因: L10 `$$key = $value` 确为用户控键名直写 PHP 变量表的注入点（CWE-915 形态模式，键名攻击者全控），但 L12 `$$'is_admin'` 不是合法 PHP 语法——可变变量 `$$` 之后只能跟变量名/`${expr}`，字符串字面量触发 Parse error；PHP 整文件先编译后执行，Parse error 使全文件零执行，唯一提权消费点 L13 `grant_admin()` 在样本内不可达。需补: L12 的真实形态（如 `$is_admin ?? false` 或 `${'is_admin'}`）——若按意图补齐，`POST is_admin=1` 经 L10 覆盖后 L12-L13 提权即成立；该可达性以未贴出的修复形态为前提，不作为本判定依据
+防御: 无任何防御机制——L8-L11 foreach 无键名过滤，变量表全开放；链不可达的原因是缺陷本体写坏（L12 语法错误）导致文件无法编译，而非任何机制拦截
+载荷: 样本内无（文件不可执行）；条件性（前提: L12 修复为合法的 `$is_admin ?? false`）: `POST /prefs/import.php` body `is_admin=1&theme=dark` → L10 `$is_admin="1"` → L13 grant_admin()
+组合链: 变量覆盖（L10）→ is_admin 置真 → grant_admin 提权（条件性，见上）
+锚句: 非 CWE-502，因无反序列化器，值以字符串进入变量表；非 CWE-639，因不涉及查询对象 ID，注入目标是变量命名空间（模式本身若可达应主记 CWE-915 Improperly Controlled Modification of Dynamically-Determined Object Attributes）
+结论: 存在漏洞=false | CWE-915 动态变量注入（模式存在但文件因 L12 Parse error 不可执行，链不可达） | Low
+修复: L10 删除 `$$key = $value`：改为收集进固定数组（`$prefs[$key] = $value`）并对 `$key` 做 in_array 严格白名单校验；L12 的 is_admin 判定改从 `$_SESSION` 读取而非请求注入的变量
+
+### wave2-95-09 版本B
+入口: L25 HTTP POST `$_POST` 键值 | 次要: L31 `$_SESSION`（服务端读取位，非请求污点）
+链: 未发现可达污点流，原因: L26-L28 白名单过滤后只写入普通数组 `$prefs`（L29），文件中不存在 `$$` 可变变量赋值；L31 管理判定读取 `$_SESSION`，与请求输入隔离
+防御:
+  L26-L28 `in_array($key, $ALLOWED_PREFS, true)` → 有效: theme/pagesize/lang 之外的任意键（含 is_admin 或任意覆盖目标）被 continue 跳过；strict=true 防止 `0=="theme"` 类宽松比较伪造命中
+  L29 `$prefs[$key] = $value` → 有效: 写入局部普通数组而非变量表，且 $key 已被白名单限定为三个字面量之一；PHP 数组无原型链，键写入无提升面
+  L31 `($_SESSION['is_admin'] ?? false) === true` → 有效: $_POST 无法写 $_SESSION（独立 superglobal）；`=== true` 排除 "1"/1 等真值伪造
+组合链: 无
+锚句: 非 CWE-915，因键写入目标为局部数组且键名封闭；非 CWE-352，因未见状态变更依赖 Cookie 自动携带的判据，鉴权读 $_SESSION 值（是否存在 CSRF 样本外，不在此定性）
+结论: 存在漏洞=false | CWE-915 动态变量注入（可变变量已移除、白名单防御有效未触发） | Low
+修复: 无必须项；可选：L34 save_prefs($prefs) 对 value 增加长度/类型约束（业务健壮性，非安全缺陷）
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？（$_POST、$_SESSION 均已核）
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？（L12 真实形态已索要）
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？（L12 语法非法，已索要真实形态而非猜着补全）
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-95-10 版本A
+入口: L13 HTTP POST `$_POST['body']` | 次要: 无
+链: 未发现可达污点流，原因: L10 确实把捕获组拼进替换串并挂 `/e` 修饰符（求值位消费用户数据，CWE-95 形态的 sink 在代码中存在），但链被代码自带的版本悖论封死——L8 `function render_bbcode(string $text): string` 的返回类型声明是 PHP 7.0+ 语法，PHP ≤5.6 解析该文件直接 Parse error（全文件零执行）；而 PHP ≥7.0 已移除 `/e`（preg_replace 不再求值替换串，返回 NULL 并发 E_WARNING），NULL 与 L8 `: string` 返回类型冲突触发 TypeError 致命错误，L13 的 echo 永不执行。两个运行时分支下均无可达求值流
+防御:
+  L8 `: string` 返回类型声明（PHP 7.0+ 语法）→ 有效（就可达性而言）: 把能解析本文件的运行时锁定在 PHP ≥7.0，而该运行时下 `/e` 已失效——`/e` 的生效前提（≤5.6）与文件的可解析前提（≥7.0）无交集
+  L10 `/e` 修饰符 → 非防御而是缺陷本体: 其求值在可解析运行时中根本不发生（返回 NULL + E_WARNING），NULL 又与 `: string` 冲突触发 TypeError
+载荷: 样本内无；条件性（样本外假设: 部署副本去掉 L8 的 `string $text`/`: string` 声明并运行 PHP ≤5.6）: `body=[b]{${system('id')}}[/b]` → `$1` 插值进 `strtoupper("{...}")` 双引号串，`${...}` 插值求值执行 system（副作用执行，返回值作变量名查找失败不影响）
+组合链: 无
+锚句: 非 CWE-95，因在所有可解析该文件的运行时（PHP ≥7.0）中求值位已不生效，样本内未发现可达求值流（若实际部署副本与贴出版本不同需重审）；非 CWE-79，因 PHP ≥7.0 分支下 TypeError 使 L13 回显不执行、PHP ≤5.6 分支下 Parse error，同样无可达输出流
+结论: 存在漏洞=false | CWE-95 Eval Injection（/e 求值位存在但被类型声明与 PHP 版本互斥封死，链不可达） | Low
+修复: L10 改用 `preg_replace_callback('/\[b\](.*?)\[\/b\]/', function ($m) { return strtoupper($m[1]); }, $text)`——替换值来自回调返回值，捕获组仅作数据传递，不经求值器；保留 L8 类型声明
+
+### wave2-95-10 版本B
+入口: L27 HTTP POST `$_POST['body']` | 次要: 无
+链: L27 取 body → L20-L24 `preg_replace_callback` 仅将捕获组作为数据传给 `strtoupper`（无求值）→ L27 `echo render_bbcode($_POST['body'])` 将处理结果连同未匹配文本原样写回 HTTP 响应 → 浏览器执行上下文
+防御:
+  L20-L24 preg_replace_callback + 闭包 → 有效: 替换值来自函数返回值，`$m[1]` 是纯数据，代码中不存在任何求值器消费点（/e 方向封死）
+  L27 echo 直出 → 伪防御: 函数只处理 `[b]` 段，其余输入原样返回；文件内无 htmlspecialchars 等输出编码，任意 HTML/JS 原样回显
+载荷: `POST` body `<img src=x onerror=alert(1)>` → 不匹配 `\[b\]` 模式、原样通过 L20-L24 直出到响应，浏览器在默认 text/html 上下文执行（样本外假设: 依赖该脚本经 web SAPI 输出且未另行设置 Content-Type；PHP 默认 text/html，若上游统一编码层存在则另判）
+组合链: 无
+锚句: 非 CWE-95，因替换串不再进入任何求值器，回调内执行的是固定函数 strtoupper；非 CWE-22，因无文件路径参与
+结论: 存在漏洞=true | CWE-79 Improper Neutralization of User Input During Web Page Generation ('Cross-site Scripting') | High
+修复: L27 输出前编码：`echo htmlspecialchars(render_bbcode($_POST['body']), ENT_QUOTES, 'UTF-8');`（htmlspecialchars 为 PHP 内建）；或对 [b] 段生成标记时对 `$m[1]` 单独编码
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？（$_POST 通道已核）
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？（PHP 运行版本、SAPI Content-Type）
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？

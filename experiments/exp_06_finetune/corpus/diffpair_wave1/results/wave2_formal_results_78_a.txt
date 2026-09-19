@@ -1,0 +1,221 @@
+### wave2-78-S-01 版本A
+入口: L8 HTTP GET `/diag/ping` 查询参数 `host`（`request.args.get("host", "127.0.0.1")`，默认值仅在参数缺失时生效）| 次要: 路由无任何认证/授权检查，攻击面直达
+链: L8 `host = request.args.get("host", "127.0.0.1")` 取得完全可控字符串 → L10 f-string 将其插值进 `"ping -c 1 {host}"` 整条命令串 → L10 `subprocess.run(..., shell=True)` 把整串交 OS shell（POSIX 下 /bin/sh）做文法解析并执行
+防御:
+  L10 `timeout=5` → 与 shell 文法无关、只限进程时长，非防御
+  L8 默认值 `"127.0.0.1"` → 传参即覆盖，非防御
+  全样本无任何过滤/转义/白名单/argv 化 → 伪防御为空集: `?host=127.0.0.1;id` 中的 `;` 原样到达 shell 被解析为命令分隔符
+载荷: `GET /diag/ping?host=127.0.0.1%3Bid` → shell 实际执行 `ping -c 1 127.0.0.1;id`，`id` 输出随 L11 返回的 `r.stdout` 回传给攻击者（Windows cmd 目标上分隔符为 `&` 且命令名换成本机命令，如 `?host=127.0.0.1%26whoami`）
+组合链: 单缺陷即达任意命令执行，注入输出经 L11 直接回显，侦察/落料一步完成，无需串联第二缺陷。定级说明: 链上每一跳（HTTP 参数→f-string→shell=True→回显）均在本样本 11 行内可证、无样本外依赖，符合 Critical=可达 RCE 口径
+锚句: 非 CWE-88 因输入不落入固定命令的参数槽位，整条命令串可被 `;`/`&&`/`|`/反引号改写结构；非 CWE-95 因最终消费方是 OS shell 解释器而非 eval/Function 等动态求值器；非 CWE-77 因注入目标是 OS 命令解释器而非应用级命令语言
+结论: 存在漏洞=true | CWE-78 OS Command Injection（OS 命令注入）| Critical
+修复: L10 去掉 `shell=True` 改 argv 列表形式 `subprocess.run(["ping", "-c", "1", host], capture_output=True, timeout=5)`——`subprocess` 已在 L1 import，host 落入单一 argv 槽位后 shell 文法彻底不参与；若业务必须保留 shell 形式，需在 L8 之后对 host 做 POSIX shell 转义（标准库 `shlex.quote`，当前样本未 import，需新增导入），但 argv 形式更彻底
+
+### wave2-78-S-01 版本B
+入口: L8 HTTP GET 查询参数 `host`（`request.args.get("host", "127.0.0.1")`）| 次要: 路由无认证；已核对非 HTTP 通道——样本内不存在环境变量/配置文件/stdin/DB 回读等入口，唯一污点源即该参数
+链: 未发现可达污点流，原因: sink 前防御封死——L9 `subprocess.run(["ping", "-c", "1", host], capture_output=True, timeout=5)` 不带 `shell=True`，host 作为 argv 第 4 元素经 execve 原样传给 ping 进程，OS shell 不介入，`;`/`&&`/`$()`/反引号/`>` 全部退化为普通字符；命令名 `ping` 与 `-c`、`1` 为字面常量，入口无改写命令结构的能力
+防御:
+  L9 argv 列表执行（无 shell 层）→ 有效: 每个元素精确对应一个 argv 槽位，host 无论取值如何都只是 ping 的一个位置参数，不存在可引入新命令/新选项分隔语义的文法层
+  L9 前三个元素 `"ping"`、`"-c"`、`"1"` 为字面量 → 有效: 命令主体封死，入口只能影响末位参数值
+载荷: 无可用载荷。反证: `GET /diag/ping?host=127.0.0.1%3Bid` 下 L9 的 argv 为 `["ping","-c","1","127.0.0.1;id"]`，ping 将 `127.0.0.1;id` 整体视为主机名并解析失败退出，`id` 不执行
+组合链: 无——无 shell 文法层，也无落盘回读环节可借道，单点防御封死全部路径
+锚句: 非 CWE-78 因无命令解释器参与、输入不进入 shell 文法；非 CWE-88 因 host 作为完整单元素传递且 ping 对该槽位无执行类选项语义（host 以 `-` 开头至多被 ping 当自身选项，无可执行后果，按笔记"argv 单元素完整传递、无二次解析 = 无漏洞"不硬凑）
+结论: 存在漏洞=false | CWE-78 OS Command Injection（OS 命令注入）| Low
+修复: 无需修改。次要: host 以 `-` 开头会被 ping 当自身选项解析（如 `-f`），但 ping 无执行/读文件类选项、无实际危害，如需彻底封死可在 L9 前校验 host 不以 `-` 开头（str 内建方法即可，纵深防御非必需）
+
+自查清单（wave2-78-S-01）:
+- [x] 每条分析第一行为 `### <案例编号> <版本>`；本包两版本各一条，无遗漏
+- [x] 行号均在本版本代码块内真实存在（A: L1-L11，B: L1-L10）；`host`/`subprocess`/`request.args` 等变量名均在代码中出现
+- [x] 判"有漏洞"（版本A）时已逐条核对 timeout、默认值并确认无有效防御
+- [x] 判"安全"（版本B）时已枚举全部入口（仅 HTTP host，无其他通道）并逐段核验 argv 无 shell 层的防御
+- [x] 版本A 分析未引用版本B；两结论均只来自各自代码
+- [x] 无依赖样本外代码/环境的判断
+- [x] 未串写其他样本的行号/结论
+- [x] 代码完整，无缺失部分需索取
+- [x] 本包判"安全"未依据 SQL 参数化（不适用）；安全性依据是"无 shell 层"，已核对 argv 覆盖所有输入可达位
+
+### wave2-78-S-01b 版本A
+入口: L8 HTTP GET `/diag/traceroute` 查询参数 `host`（`request.args.get("host", "127.0.0.1")`）| 次要: 路由无认证/授权检查
+链: L8 `host` 完全可控 → L9 f-string 插值进 `"traceroute -m 5 {host} > /tmp/trace.txt"` → L9 `os.system(...)` 将整串交 OS shell 执行——`os.system` 等价 C `system()`，恒经 `/bin/sh -c`，字符串里的 `>` 重定向本身就是整串被 shell 文法消费的直接证据
+防御:
+  L8 默认值 `"127.0.0.1"` → 传参即覆盖，非防御
+  L9 无任何转义/引用/白名单，且 `> /tmp/trace.txt` 本身是 shell 重定向语法 → 伪防御为空集: `;` 与 `>` 均被 shell 按文法消费
+  L10 `open("/tmp/trace.txt", ...)` 路径为常量 → 非防御亦非注入位（host 不参与路径构造），但构成回显通道的一环，见组合链
+载荷: `GET /diag/traceroute?host=127.0.0.1%3Bid` → shell 执行 `traceroute -m 5 127.0.0.1;id > /tmp/trace.txt`，重定向只作用于 `id` 一段，`id` 的 stdout 落入 /tmp/trace.txt，L10 回读后 L11 原样返回——注入命令的输出直接进入 HTTP 响应，回显通道现成
+组合链: L9 注入点与 L10→L11 回读回显天然串联，任意命令执行加输出回传一步到位，无需第二缺陷。定级说明: 链上每一跳（HTTP→f-string→os.system→回读回显）均在本样本 11 行内可证，符合 Critical=可达 RCE 口径。次要发现: L9 固定写 `/tmp/trace.txt` 为共享可预测路径，多用户主机上存在符号链接竞态（CWE-377）写面，根治方案见修复栏一并消除
+锚句: 非 CWE-22 因 `/tmp/trace.txt` 是代码内常量路径，host 不参与 Python 层路径构造（`>` 重定向是 shell 行为，已归入 78 的注入后果）；非 CWE-95 因消费方是 OS shell 而非动态求值器；非 CWE-77 因注入目标是 OS 命令解释器而非应用级命令语言
+结论: 存在漏洞=true | CWE-78 OS Command Injection（OS 命令注入）| Critical
+修复: L9 改为 argv 形式 `subprocess.run(["traceroute", "-m", "5", host], capture_output=True, timeout=30)`，同时删除 `> /tmp/trace.txt` 落盘与 L10/L11 的文件回读（直接返回 `r.stdout.decode(errors="replace")` 即可）——需把 L1 `import os` 换成 `import subprocess`（标准库，当前样本未 import，属新增导入而非虚构函数）；此改法同时消除命令注入与 /tmp 符号链接竞态两个面
+
+### wave2-78-S-01b 版本B
+入口: L8 HTTP GET 查询参数 `host`（`request.args.get("host", "127.0.0.1")`）| 次要: 路由无认证；非 HTTP 通道核对——样本内无环境变量/配置/stdin/文件流入口，唯一污点源即该参数
+链: 未发现可达污点流，原因: sink 前防御封死——L9 `subprocess.run(["traceroute", "-m", "5", host], capture_output=True, timeout=30)` 无 `shell=True`，host 作为 argv 第 4 元素原样传递，shell 文法（`;`、`>`、`$()`）无介入点；命令名 `traceroute` 与 `-m`、`5` 为字面常量
+防御:
+  L9 argv 列表执行（无 shell 层）→ 有效: host 永远只是一个 argv 元素，traceroute 收到字面字符串，无法分裂成命令序列
+  L10 直接返回 `r.stdout.decode(errors="replace")` → 有效（就注入面而言）: 回读的是子进程捕获的 stdout，不存在"注入命令写文件→代码回读文件"的旁路通道
+载荷: 无可用载荷。反证: `GET /diag/traceroute?host=127.0.0.1%3Bid` 下 L9 的 argv 为 `["traceroute","-m","5","127.0.0.1;id"]`，traceroute 将 `127.0.0.1;id` 整体视为主机名并报错退出，`id` 不执行；`>` 也不再有任何重定向语义
+组合链: 无——无 shell 层且无落盘回读，两层各自独立封死
+锚句: 非 CWE-78 因无命令解释器参与；非 CWE-73 因 L10 返回的是捕获的进程输出而非按用户输入寻址的文件路径（样本内不存在按 host 拼路径的 open）
+结论: 存在漏洞=false | CWE-78 OS Command Injection（OS 命令注入）| Low
+修复: 无需修改。次要: host 以 `-` 开头会被 traceroute 当自身选项解析，但 traceroute 无执行类选项、无实际危害；如需收紧可在 L9 前校验 host 不以 `-` 开头（纵深防御非必需）
+
+自查清单（wave2-78-S-01b）:
+- [x] 每条分析第一行为 `### <案例编号> <版本>`；本包两版本各一条，无遗漏
+- [x] 行号均在本版本代码块内真实存在（A: L1-L11，B: L1-L10）；`os.system`/`/tmp/trace.txt`/`r.stdout` 等均在代码中出现
+- [x] 判"有漏洞"（版本A）时已逐条核对默认值、回读逻辑并确认无有效防御
+- [x] 判"安全"（版本B）时已枚举全部入口（仅 HTTP host）并逐段核验 argv 无 shell 层与 stdout 回读两点防御
+- [x] 版本A 分析未引用版本B；两结论均只来自各自代码
+- [x] 无依赖样本外代码/环境的判断（/tmp 符号链接竞态已作为次要发现注明条件，不支撑主结论）
+- [x] 未串写其他样本的行号/结论
+- [x] 代码完整，无缺失部分需索取
+- [x] 本包判"安全"未依据 SQL 参数化（不适用）；已核对 argv 覆盖 host 这一唯一输入可达位
+
+### wave2-78-S-02 版本A
+入口: L8 HTTP GET `/nslookup` 查询参数 `host`（`request.args.get("host", "example.com")`）| 次要: 路由无认证/授权检查
+链: L8 `host` 完全可控 → L9 `"nslookup " + host` 裸字符串拼接 → L10 `subprocess.run(cmd, shell=True, ...)` 整串交 OS shell 解析执行
+防御:
+  L10 `timeout=5` → 只限进程时长，非防御
+  L8 默认值 `"example.com"` → 传参即覆盖，非防御
+  L9 为裸拼接 `"nslookup " + host`，无引用/转义 → 伪防御为空集: `;`/`&&`/反引号/`$()`/`|` 原样可达 shell
+载荷: `GET /nslookup?host=example.com%3Bid` → shell 执行 `nslookup example.com;id`，`id` 输出混入 L11 返回的 `r.stdout`
+组合链: 单缺陷直达任意命令执行。定级说明: HTTP 入口→拼接→shell=True→回显，每一跳均在样本 11 行内可证、无样本外依赖，符合 Critical=可达 RCE 口径
+锚句: 非 CWE-88 因命令结构整体可被 shell 改写，不是固定命令的参数槽位问题；非 CWE-95 因消费方是 OS shell 而非动态求值器
+结论: 存在漏洞=true | CWE-78 OS Command Injection（OS 命令注入）| Critical
+修复: L10 改 argv 形式 `subprocess.run(["nslookup", host], capture_output=True, timeout=5)`——`subprocess` 已在 L1 import，argv 形式下 L9 的拼接可一并删除；若业务必须保留 shell 形式，则需对 host 做 POSIX shell 转义（标准库 `shlex`，当前样本未 import，需新增导入），但 argv 形式更彻底且跨平台一致
+
+### wave2-78-S-02 版本B
+入口: L8 HTTP GET 查询参数 `host`（`request.args.get("host", "example.com")`）| 次要: 路由无认证；非 HTTP 通道核对——无其他入口
+链: 未发现可达污点流，原因: sink 前防御封死——L10 `"nslookup " + shlex.quote(host)` 对 host 做 POSIX shell 引用编码后仍走 L11 `shell=True`，但编码输出在任何输入下都被 POSIX sh 解析为不多于一个字面 token，命令结构不可改写。前提标注: 该有效性依赖目标 shell 为 POSIX sh（/bin/sh），属样本外假设，见防御栏
+防御:
+  L10 `shlex.quote(host)` → 有效（POSIX sh 下）: 该函数把元字符整体包进单引号、内嵌单引号转为 `'"'"'` 序列，`;`/`&&`/`|`/`$()`/反引号在引号内全部失去文法语义；`?host=a%3Bid` 产出 `nslookup 'a;id'`，sh 视为单 token
+  样本外假设标注: 上述机制不覆盖 Windows——cmd.exe 不认单引号引用，绕过串 `x&whoami&rem `（URL 编码 `x%26whoami%26rem%20`）经 quote 得 `'x&whoami&rem '`，cmd 在两处 `&` 拆分为 `nslookup 'x`、`whoami`、`rem '` 三段，`whoami` 实际执行；该情形依赖样本未给出的部署环境，按纪律不据此判存在漏洞=true，仅显式标注
+  L11 `timeout=5` → 非防御亦非绕过点，只限进程时长（列出以示已核对）
+载荷: POSIX 目标下无可用载荷。反证: `GET /nslookup?host=example.com%3Bid` → L10 产出 `nslookup 'example.com;id'`，`;` 在单引号内失义，`id` 不执行；Windows cmd 目标下（样本外假设情形）绕过串见防御栏
+组合链: 无——POSIX 语义下单点编码即封死整条链；残留面只有 Windows shell 假设，已在防御栏单列
+锚句: 非 CWE-78 因 POSIX sh 语义下命令结构不可改写（Windows 情形属环境假设，不足以支撑 true）；非 CWE-88 因 quote 后的 host 不可能引入新 token 或选项分隔结构
+结论: 存在漏洞=false | CWE-78 OS Command Injection（OS 命令注入）| Low
+修复: 若要消除对目标 shell 种类的依赖，L11 改 argv 形式 `subprocess.run(["nslookup", host], capture_output=True, timeout=5)` 并删除 L9/L10（`subprocess` 已在 L1 import）；argv 形式在 POSIX 与 Windows 上行为一致。次要: L9 函数体内的 `import shlex` 每次调用重复执行，若保留现方案可上移到文件头，属代码整洁问题非安全问题
+
+自查清单（wave2-78-S-02）:
+- [x] 每条分析第一行为 `### <案例编号> <版本>`；本包两版本各一条，无遗漏
+- [x] 行号均在本版本代码块内真实存在（A: L1-L11，B: L1-L12）；`shlex.quote`/`shell=True`/`cmd` 等均在代码中出现
+- [x] 判"有漏洞"（版本A）时已逐条核对 timeout、默认值、裸拼接并确认无有效防御
+- [x] 判"安全"（版本B）时已枚举全部入口并逐段核验 quote 机制（含 Windows 反例的具体绕过串）
+- [x] 版本A 分析未引用版本B；两结论均只来自各自代码
+- [x] 版本B 的"安全"判定依赖目标 shell 为 POSIX sh，已在防御栏标注"样本外假设"，且未据此判 true
+- [x] 未串写其他样本的行号/结论
+- [x] 代码完整，无缺失部分需索取
+- [x] 本包判"安全"未依据 SQL 参数化（不适用）；已核对 shlex.quote 覆盖 host 这一唯一输入可达位
+
+### wave2-78-S-03 版本A
+入口: L6 HTTP GET `/tools/run` 查询参数 `tool`（`req.query.tool || "uptime"`）、L7 查询参数 `arg`（`req.query.arg || ""`）——两个并列的完全可控入口 | 次要: 无认证中间件，L14 `app.listen(8080)` 默认监听全部网卡
+链: L6/L7 两入口取得完全可控字符串 → L8 模板串 `` `${tool} ${arg}` `` 拼成整条命令 → L8 `exec(...)`（child_process）默认经 `/bin/sh -c` 执行整串——连命令名本身都由 `tool` 决定，攻击者甚至不需要元字符
+防御:
+  L6/L7 `|| "uptime"`、`|| ""` → 仅缺省兜底，传参即覆盖，非防御
+  L8 `{ timeout: 5000 }` → 只限进程时长，非防御
+  L9/L10 回调中的 err/stdout 处理 → 只是响应逻辑，不构成过滤，非防御
+  全样本无白名单/转义 → 伪防御为空集: `exec` 默认经 `/bin/sh -c`，命令名与参数两个自由度全部可控
+载荷: `GET /tools/run?tool=id`（命令串 `id `，直接以任意程序名执行）；或 `GET /tools/run?tool=uptime&arg=%3Bid`（命令串 `uptime ;id`，`id` 输出经 L10 `res.type("text").send(stdout)` 回显）
+组合链: `tool` 与 `arg` 双入口叠加在同一个 sink 上——既可任选程序又可注入 shell 语法，属同一缺陷的两个自由度而非需串联的两个独立缺陷。定级说明: 入口→模板串→exec 的 shell 解释→stdout 回显，每一跳均在样本 14 行内可证、无样本外依赖，符合 Critical=可达 RCE 口径
+锚句: 非 CWE-95 因消费方是 OS shell 而非 JS 求值器（`exec` 的参数是被 shell 执行的命令串，不是被求值的 JS 代码）；非 CWE-88 因命令结构可被整体改写；非 CWE-79 因 L10 以 `res.type("text")` 发送纯文本，非 HTML/JS 执行上下文
+结论: 存在漏洞=true | CWE-78 OS Command Injection（OS 命令注入）| Critical
+修复: L2 改 `const { execFile } = require("child_process");`（模块已在样本中 require，仅补命名导出），L8 改 argv 形式 `execFile(<固定bin>, [<固定args>, arg], { timeout: 5000 }, ...)`，并为 `tool` 建常量白名单映射（工具名→bin/args 的常量表，未命中返回 400）；`arg` 保持为单一 argv 元素传入，全程不经 shell
+
+### wave2-78-S-03 版本B
+入口: L11 HTTP GET 查询参数 `tool`（白名单查表键）、L12 查询参数 `arg`（argv 尾参）| 次要: 无认证中间件；非 HTTP 通道核对——无其他入口
+链: 未发现可达污点流，原因: sink 前防御封死——L13 `ALLOWED_TOOLS[tool]` 把命令名封死在 L5-L8 常量表的两个字面 bin（`"uptime"`、`"df"`）内，L14 未命中即 400；`arg` 虽完全可控，但 L15 `execFile(...)` 默认不经过任何 shell，arg 作为单一 argv 元素传递，shell 文法无介入点
+防御:
+  L13/L14 常量表白名单 + 未命中 400 → 有效: `?tool=sh&arg=-c%20id` 等任意非白名单键都走 L14 的 `{ error: "tool not allowed" }`；特别核验 `?tool=__proto__`——该键沿原型链命中 `Object.prototype` 返回真值、可通过 L14 的 `!entry` 判断，但 `entry.bin` 为 `undefined`，L15 `execFile(undefined, ...)` 同步抛 `ERR_INVALID_ARG_TYPE`，无任何命令执行，白名单未被实际绕过（L13 为原型链读取，无用户控键写入对象的事实，无 CWE-1321）
+  L15 `execFile`（无 shell 层）→ 有效: arg 中的 `;`、`$()`、反引号、换行都只是目标程序收到的一个字面参数（Node execFile 默认 `shell: false`）
+  L15 `...(entry.args || [])` 与 arg 合成 argv → 有效: `entry.args` 为常量 `["-h"]` 或缺省，arg 只能落在 argv 末位
+载荷: 无可用载荷。反证: `GET /tools/run?tool=uptime&arg=%3Bid` → L15 的 argv 为 `["uptime", ";id"]`，uptime 忽略该无意义参数，`id` 不执行；`GET /tools/run?tool=sh` → L14 返回 400
+组合链: 无——白名单封命令名、无 shell 封文法注入，两层独立成立、任一单点即封死
+锚句: 非 CWE-78 因 execFile 不经 shell、无命令解释器文法介入；非 CWE-88 因 arg 虽可携前导 `-` 进入参数位，但白名单内 uptime/df 均无执行类选项语义（df 的输出列选项至多调整显示），按"无二次解析出危险结构"不判漏洞
+结论: 存在漏洞=false | CWE-78 OS Command Injection（OS 命令注入）| Low
+修复: 无需修改。次要: 若未来白名单加入带危险选项语义的工具，arg 的前导 `-` 选项注入面会变成实际危害，建议在 L15 前校验 arg 非空且不以 `-` 开头（纵深防御，当前两个 bin 无可利用选项）
+
+自查清单（wave2-78-S-03）:
+- [x] 每条分析第一行为 `### <案例编号> <版本>`；本包两版本各一条，无遗漏
+- [x] 行号均在本版本代码块内真实存在（A: L1-L14，B: L1-L21）；`ALLOWED_TOOLS`/`entry.bin`/`execFile`/`res.type` 等均在代码中出现
+- [x] 判"有漏洞"（版本A）时已逐条核对 `||` 兜底、timeout、回调处理并确认无有效防御
+- [x] 判"安全"（版本B）时已枚举 tool/arg 两入口并核验白名单与无 shell 两层，含 `__proto__`/`constructor` 键的特殊核验
+- [x] 版本A 分析未引用版本B；两结论均只来自各自代码
+- [x] `__proto__` 查表行为依据 JS 语言内建语义（非缺失的样本外代码）；无其他样本外依赖
+- [x] 未串写其他样本的行号/结论
+- [x] 代码完整，无缺失部分需索取
+- [x] 本包判"安全"未依据 SQL 参数化（不适用）；已核对 arg 落 argv 末位且白名单两 bin 无危险选项语义
+
+### wave2-78-S-04 版本A
+入口: L8 HTTP GET `/report/build` 查询参数 `kind`（`request.args.get("kind", "weekly")`）、L9 查询参数 `date`（`request.args.get("date", "1970-01-01")`）——两个并列可控入口 | 次要: 路由无认证/授权检查
+链: L8/L9 两入口取得完全可控字符串 → L11 f-string 插值拼出整条命令 `"/usr/bin/report --kind {choice} --date {date}"` → L12 `subprocess.run(cmd, shell=True, ...)` 整串交 OS shell 执行，两个可控位任一即可注入
+防御:
+  L10 注释 → 注释不构成行为，非防御
+  L12 `timeout=30` → 只限进程时长，非防御
+  L8/L9 默认值 → 传参即覆盖，非防御
+  全样本无转义/引用/白名单 → 伪防御为空集，`kind` 与 `date` 两个位任一注入即可改写命令结构
+载荷: `GET /report/build?date=%3Bid` → 命令串 `/usr/bin/report --kind weekly --date ;id`，shell 在 `;` 处断开: 前半 report 因缺参数值报错无碍，`id` 独立执行，输出随 L13 返回的 `r.stdout` 回显；等价地 `?kind=weekly%3Bid` 在 `--kind` 值位注入
+组合链: kind 与 date 双注入位共用同一 sink，属同一缺陷的两个自由度。定级说明: 入口→f-string→shell=True→回显，每一跳均在样本 13 行内可证、无样本外依赖，符合 Critical=可达 RCE 口径
+锚句: 非 CWE-88 因整条命令串可被 shell 改写结构而非固定命令的参数槽位问题；非 CWE-95 因消费方是 OS shell 而非动态求值器
+结论: 存在漏洞=true | CWE-78 OS Command Injection（OS 命令注入）| Critical
+修复: 在 L6 前定义模块级常量映射表（kind→固定 argv 前缀，如 `{"weekly": ["/usr/bin/report", "--kind", "weekly"], ...}`），L11/L12 改为: 查表未命中返回 400，命中后 `subprocess.run(<表中argv前缀> + ["--date", date], capture_output=True, timeout=30)`——命令主体全部常量化，date 作为末位单一 argv 元素传入且全程无 `shell=True`（`subprocess` 已在 L1 import）
+
+### wave2-78-S-04 版本B
+入口: L12 HTTP GET 查询参数 `kind`（查表键）、L13 查询参数 `date`（argv 值参）| 次要: 路由无认证；非 HTTP 通道核对——无其他入口
+链: 未发现可达污点流，原因: sink 前防御封死——kind 在 L15 查 L5-L8 的 `CMD_TEMPLATES` 常量表，未命中走 L16/L17 返回 400，命令名与 `--kind` 值均为字面量；date 虽完全可控，但 L18 `subprocess.run(argv, capture_output=True, timeout=30)` 无 `shell=True`，date 作为 argv 单元素落在 `--date` 值位，shell 文法无介入点
+防御:
+  L15/L16 `CMD_TEMPLATES[choice]` 查表 + `KeyError` 捕获 → 有效: `?kind=weekly;id` 不在表中，返回 `("bad kind", 400)`，choice 永远只可能是 `"weekly"`/`"daily"`，命令主体不可改写
+  L18 argv 列表执行（无 shell 层）→ 有效: `?date=%3Bid` 时 argv 末位为字面 `";id"`，由 `/usr/bin/report` 作为选项值自行消费，shell 不执行任何注入
+  L15 `CMD_TEMPLATES[choice] + ["--date", date]` 用 `+` 生成新列表 → 有效（就状态而言）: 不改动模板内的共享列表对象，多次请求不会向模板累积 `--date` 项（若此处误用 `.append` 会引入跨请求状态污染，现写法无此问题）
+载荷: 无可用载荷。反证: `GET /report/build?kind=daily&date=%3Bid` → L18 的 argv 为 `["/usr/bin/report","--kind","daily","--date",";id"]`，`;id` 是 report 的选项值，无 shell 参与；`GET /report/build?kind=rm` → L17 返回 400
+组合链: 无——kind 白名单与无 shell 两层独立封死；date 的残留面仅剩 `/usr/bin/report` 自身的选项解析语义，该程序体不在样本内（样本外假设: report 对 `--date` 值位无执行/读文件类行为；该假设即便不成立，缺陷也在 report 程序而非本样本代码的注入构造）
+锚句: 非 CWE-78 因无 shell 层且命令主体经常量表白名单；非 CWE-88 因 date 落在 `--date` 的值位被 report 作为单值消费，样本内无证据表明该值位能二次解析出新选项/执行结构（report 源码未提供，样本外假设已标注）
+结论: 存在漏洞=false | CWE-78 OS Command Injection（OS 命令注入）| Low
+修复: 无需修改。可选纵深: L13 之后对 date 做字符集校验（如 `date.replace("-", "").isdigit()`，str 内建方法即可），进一步收窄传给 report 的值面，属非必需加固
+
+自查清单（wave2-78-S-04）:
+- [x] 每条分析第一行为 `### <案例编号> <版本>`；本包两版本各一条，无遗漏
+- [x] 行号均在本版本代码块内真实存在（A: L1-L13，B: L1-L19）；`CMD_TEMPLATES`/`KeyError`/`choice`/`date` 等均在代码中出现
+- [x] 判"有漏洞"（版本A）时已逐条核对注释、timeout、默认值并确认无有效防御
+- [x] 判"安全"（版本B）时已枚举 kind/date 两入口并核验查表、无 shell、`+` 拷贝三层
+- [x] 版本A 分析未引用版本B；两结论均只来自各自代码
+- [x] 版本B 残留面涉及 `/usr/bin/report` 程序自身语义，已标"样本外假设"且未据此判 true
+- [x] 未串写其他样本的行号/结论
+- [x] 代码完整，无缺失部分需索取
+- [x] 本包判"安全"未依据 SQL 参数化（不适用）；date 值位已核对无非 SQL 回退拼接问题
+
+### wave2-78-S-04b 版本A
+入口: L8 包级函数参数 `kind`、`date`（内部 API 传参通道，非 HTTP；调用点未包含在样本内——样本外假设: 存在将外部输入传入 `Build` 的调用方，攻击面可达性依赖此假设）| 次要: 函数自身无其他输入通道
+链: L8 `kind`、`date` 进入 → L9 `fmt.Sprintf("/usr/bin/report --kind %s --date %s", kind, date)` 拼出整条命令串 → L10 `exec.Command("sh", "-c", cmd).Output()` 将整串交给 /bin/sh 解释执行——按判别笔记 `["sh","-c",输入]` 形态明确归 CWE-78（此处恰有显式 shell 层）
+防御:
+  L10 固定的 `"sh", "-c"` → 只是执行器形态，不构成过滤，非防御
+  L9 `fmt.Sprintf` 无转义/引用/白名单 → 伪防御为空集: `;`/`&&`/反引号/`$()` 原样可达 /bin/sh
+载荷: 若调用方存在 `Build("weekly", "1970-01-01;id")` 这样的外部输入路径 → L9 产出 `/usr/bin/report --kind weekly --date 1970-01-01;id`，sh 在 `;` 处断开执行 `id`，其 stdout 经 L10 `.Output()` 进入返回值 `([]byte, error)` 交给调用方（是否最终回显给攻击者取决于调用方，样本外）
+组合链: 单缺陷即达任意命令执行。定级说明: sink 链（参数→Sprintf→sh -c）每一跳均在样本 11 行内可证，但入口是否被攻击者触达依赖样本外的调用方代码——按"任一跳依赖样本外记 High 并标理论链"与"两可记 High"的纪律定 High 而非 Critical
+锚句: 非 CWE-95 因消费方是 OS shell 而非动态求值器；非 CWE-77 因注入目标是 OS 命令解释器而非 sed/IMAP/应用配置语言等非 OS 命令语言
+结论: 存在漏洞=true | CWE-78 OS Command Injection（OS 命令注入）| High
+修复: L10 改为 `exec.Command("/usr/bin/report", "--kind", kind, "--date", date).Output()`——去掉 sh -c 层、argv 逐元素传递（`fmt`/`exec` 均已在 L3-L6 import，改动限于 L9/L10，L9 的 Sprintf 可一并删除）；若 kind 取值有限，进一步在调用侧以常量映射表约束 kind
+
+### wave2-78-S-04b 版本B
+入口: L16 包级函数参数 `kind`、`date`（内部 API 传参通道）| 次要: 无其他输入通道
+链: 未发现可达污点流，原因: sink 前防御封死——kind 在 L17 查 L9-L12 的 `reportArgs` 常量映射，未命中走 L19 返回错误；date 受 L21 `dateRE.MatchString` 锚定正则约束；L25 `exec.Command(argv[0], argv[1:]...)` 无 shell 层，参数逐元素传递
+防御:
+  L17-L20 `reportArgs[kind]` 白名单查表 → 有效: kind 只能命中 `"weekly"`/`"daily"` 两条常量 argv，Go map 为字符串键哈希表、无原型链类特殊键语义，`kind="weekly;id"` 命中失败走 L19 的 `fmt.Errorf("kind not allowed")`
+  L21-L23 `^\d{4}-\d{2}-\d{2}$` 锚定正则 → 有效: 仅接受 4位数字-2位-2位形态，date 不可能以 `-` 开头形成新选项、不可能含 `;`/空白/`$()`/反引号；且 Go regexp 默认 `$` 匹配文本末尾（非 Perl 的"末个换行前"语义），`date="1970-01-01\n"` 也被拒——即使正则放行换行，L25 无 shell 层，换行也无文法意义，双层独立
+  L25 `exec.Command(argv[0], argv[1:]...)`（无 shell）→ 有效: `argv[0]` 恒为常量 `"/usr/bin/report"`，date 作为末位单元素传递，无命令解释器消费点
+  L24 `append(append([]string{}, argv...), "--date", date)` 先拷贝再追加 → 有效（就状态而言）: 不改动 `reportArgs` 中的共享切片，多次调用不会向模板累积 `--date` 项
+载荷: 无可用载荷。反证: `Build("daily", "; id")` → L21 正则拒绝返回 `bad date`；`Build("weekly;id", "1970-01-01")` → L17 查表失败返回 `kind not allowed`；`Build("weekly", "1970-01-01;id")` → L21 拒绝。三条绕过尝试均被封死
+组合链: 无——白名单、锚定正则、无 shell 三层独立成立，任一单点即封死
+锚句: 非 CWE-78 因无 shell 消费层且两个可控位分别受常量表白名单与锚定白名单正则约束；非 CWE-190 因 date 只被校验和传递、不参与长度/偏移/索引算术；非 CWE-88 因 date 不可能形成前导 `-` 选项结构、kind 经 map 白名单无参数结构注入位
+结论: 存在漏洞=false | CWE-78 OS Command Injection（OS 命令注入）| Low
+修复: 无需修改
+
+自查清单（wave2-78-S-04b）:
+- [x] 每条分析第一行为 `### <案例编号> <版本>`；本包两版本各一条，无遗漏
+- [x] 行号均在本版本代码块内真实存在（A: L1-L11，B: L1-L26）；`fmt.Sprintf`/`exec.Command`/`reportArgs`/`dateRE`/`MatchString` 等均在代码中出现
+- [x] 判"有漏洞"（版本A）时已按笔记将 `["sh","-c",输入]` 归 78 并确认无防御可排除
+- [x] 判"安全"（版本B）时已枚举 kind/date 两入口并核验白名单、锚定正则、无 shell、切片拷贝四层
+- [x] 版本A 分析未引用版本B；两结论均只来自各自代码
+- [x] 版本A 入口可达性依赖调用方（样本外假设已在入口栏标注，并据此按纪律定 High 而非 Critical）；版本B 判定样本内闭环
+- [x] 未串写其他样本的行号/结论
+- [x] 代码完整，无缺失部分需索取
+- [x] 本包判"安全"未依据 SQL 参数化（不适用）；date 的正则为锚定白名单形、kind 为 map 查表，均已核对覆盖全部输入可达位

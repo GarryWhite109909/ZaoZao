@@ -1,0 +1,537 @@
+### wave2-78-S-01 版本A
+入口: L8 HTTP GET /diag/ping 参数 host | 次要: 无（路由无鉴权，可直接调用）
+链: L8 host 取自 request.args → L10 f-string 拼进 shell 命令串 `f"ping -c 1 {host}"` → L10 `subprocess.run(..., shell=True)` 整串交 /bin/sh -c 执行
+防御:
+  L10 timeout=5 → 伪防御: 仅限制子进程运行时长，不影响 sh 对元字符的解析，注入命令照常执行
+  L11 errors="replace" → 伪防御: 仅影响输出字节解码，与输入处理无关
+载荷: `GET /diag/ping?host=127.0.0.1%3Bcat%20/etc/passwd` → sh 执行 `ping -c 1 127.0.0.1;cat /etc/passwd`，L11 将 cat 输出回显给攻击者
+组合链: 单缺陷已构成完整 RCE；L11 回显 stdout → 带回显任意命令执行，无需盲注通道
+锚句: 非 CWE-95，因字符串消费方是 /bin/sh 解释器而非 eval 类求值器；非 CWE-88，因输入并非固定命令的单个参数位，而是参与整条被 shell 解释的命令串
+结论: 存在漏洞=true | CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | Critical
+修复: L10 改为 `subprocess.run(["ping", "-c", "1", host], capture_output=True, timeout=5)`——列表 argv 跳过 shell 层（L1 已 import subprocess），host 独立传参后元字符失去 shell 语义
+
+### wave2-78-S-01 版本B
+入口: L8 HTTP GET /diag/ping 参数 host | 次要: 无
+链: 未发现可达污点流，原因: L9 `subprocess.run(["ping", "-c", "1", host], ...)` 列表 argv 且无 shell=True，host 恒为 ping 的单个参数值，不存在解释元字符的 shell 层
+防御:
+  L9 列表 argv（无 shell）→ 有效: 即使 host=`;id` 或 `&&cat /etc/passwd`，argv 为 ["ping","-c","1",";id"]，execv 原样传参，ping 将其当参数文本，无 sh 解析发生
+  L9 timeout=5 → 辅助限制: 仅限运行时长，非注入防御
+载荷: 无——`?host=127.0.0.1;id` 只会让 ping 报无效参数，id 不会执行
+组合链: 无；L8 唯一变量位已被列表 argv 形态整体覆盖
+锚句: 非 CWE-78，因无 shell 消费方；非 CWE-88，因 host 固定在参数位且 ping 选项集无执行语义
+结论: 存在漏洞=false | CWE-78 OS Command Injection（防御有效未触发） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用值位之外的回退拼接问题）？
+
+### wave2-78-S-01b 版本A
+入口: L8 HTTP GET /diag/traceroute 参数 host | 次要: L10-L11 响应回读 /tmp/trace.txt 文件内容
+链: L8 host → L9 f-string 拼接 `f"traceroute -m 5 {host} > /tmp/trace.txt"` → L9 os.system（恒经 /bin/sh -c）→ 任意命令执行；L10-L11 回读该文件并返回
+防御: 无——L9 os.system 只有整串 shell 执行一种形态；`> /tmp/trace.txt` 重定向是命令串组成部分，同样受注入控制
+载荷: `GET /diag/traceroute?host=127.0.0.1%3Bcat%20/etc/passwd%3E/tmp/trace.txt` → sh 执行 `traceroute -m 5 127.0.0.1;cat /etc/passwd>/tmp/trace.txt`，重定向把回显文件改写为命令输出，L10-L11 读取后带回显返回
+组合链: 注入（L9）→ 输出落固定文件（L9 重定向）→ 响应回读（L10-L11）→ 构成盲打到回显的 RCE 闭环
+锚句: 非 CWE-95，因消费方是 sh 而非求值器；非 CWE-73，因读取路径 /tmp/trace.txt 是常量，仅内容被间接控制，根因仍是命令注入
+结论: 存在漏洞=true | CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | Critical
+修复: 文件头部加 `import subprocess`，L9 改为 `r = subprocess.run(["traceroute", "-m", "5", host], capture_output=True, timeout=30)`，L11 改为 `return r.stdout.decode(errors="replace")`，删除临时文件中转
+
+### wave2-78-S-01b 版本B
+入口: L8 HTTP GET /diag/traceroute 参数 host | 次要: 无
+链: 未发现可达污点流，原因: L9 `subprocess.run(["traceroute", "-m", "5", host], ...)` 列表 argv 且无 shell，host 恒为 traceroute 单个参数值，无元字符解释层
+防御:
+  L9 列表 argv（无 shell）→ 有效: host 中 `;`、`>`、反引号均为字面参数文本；输出改为 r.stdout 直接返回，原中转文件链路整体不存在
+  L9 timeout=30 → 辅助限制: 仅限运行时长
+载荷: 无——`?host=127.0.0.1;cat /etc/passwd` 只会让 traceroute 把其当目标主机名处理失败
+组合链: 无
+锚句: 非 CWE-78，因无 shell 层；非 CWE-22/73，因输入不再接触任何文件路径
+结论: 存在漏洞=false | CWE-78 OS Command Injection（防御有效未触发） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-02 版本A
+入口: L8 HTTP GET /nslookup 参数 host
+链: L8 host → L9 `"nslookup " + host` 字符串拼接 → L10 `subprocess.run(cmd, shell=True)` → /bin/sh 解释整条命令
+防御: 无——L10 timeout=5 与 L11 errors="replace" 均与注入无关
+载荷: `GET /nslookup?host=example.com%3Bid` → sh 执行 `nslookup example.com;id`，id 同步执行，L11 回显输出
+组合链: 单缺陷即完整带外回显 RCE；L11 回显 stdout，无需盲打
+锚句: 非 CWE-95，因消费方是 sh；非 CWE-77，因注入目标是 OS shell 语法而非应用层命令语言
+结论: 存在漏洞=true | CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | Critical
+修复: L9-L10 改为 `subprocess.run(["nslookup", host], capture_output=True, timeout=5)`（列表形态跳过 sh；L1 已 import subprocess），host 独立传参
+
+### wave2-78-S-02 版本B
+入口: L8 HTTP GET /nslookup 参数 host
+链: 未发现可达污点流，原因: L10 host 先经 `shlex.quote(host)` 处理再拼接，L11 shell=True 收到的是常量前缀加单个引号包裹参数
+防御:
+  L10 shlex.quote → 有效（POSIX shell）: 含元字符时以单引号包裹并将内部单引号转义为 `'"'"'`，sh 展开后恒为单一字面参数，`;id` 变为 `';id'` 成为 nslookup 的参数
+  样本外假设: shlex.quote 的保证仅针对 POSIX shell（/bin/sh）；若运行在 Windows（COMSPEC 为 cmd.exe）该防御不等价，样本未给出平台信息，按常规 POSIX 部署判
+载荷: 无——`?host=a;id` 实际执行 `nslookup 'a;id'`，id 不会执行
+组合链: 无
+锚句: 非 CWE-78，因元字符在 sh 解析前已被引号中和；非 CWE-88，因 host 仍只是 nslookup 的参数值位
+结论: 存在漏洞=false | CWE-78 OS Command Injection（shlex.quote 防御有效） | Low
+修复: 无需修改；若要更彻底，L11 可改为 `subprocess.run(["nslookup", host], ...)` 完全跳过 shell 层
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-02b 版本A
+入口: L4 方法 ping 的 host 参数（内部 API 传参；样本未贴调用点，样本外假设：host 是否外部可控需调用方样本确认）
+链: 未发现 shell 注入污点流——L6 `Runtime.exec("ping -c 1 " + host)` 是单字符串 exec：Java 先按空白把整串 StringTokenizer 切分为 argv 数组再 execv，全程无 shell 解释器产生；L5 注释"经默认 sh 语义"与真实行为不符，注释在撒谎
+防御:
+  L6 Runtime.exec(String) 空白切分 → 有效（对 shell 注入而言）: host 中 `;`、`&&`、反引号只是被切分的普通 argv token，无 /bin/sh 消费它们
+  残余面: host 含空格可拆出额外 argv 元素、可注入 ping 选项（如 host=`-f`），但 ping 选项集无执行类语义，无可达危害
+载荷: 无——host=`127.0.0.1;id` 实际执行 argv ["ping","-c","1","127.0.0.1;id"]，ping 将 `;id` 当参数文本，无命令执行
+组合链: 无
+锚句: 非 CWE-78，因无 shell 消费方（Runtime.exec(String) 不等于 sh -c）；不记 CWE-88 漏洞，因参数结构注入前提虽成立（空白切分+前导 `-` 可传入），ping 的选项集无执行语义，不可达
+结论: 存在漏洞=false | CWE-78 OS Command Injection（无 shell 层未触发） | Low
+修复: L6 改为 `new ProcessBuilder("ping", "-c", "1", host).start()`，消除空白切分（host 含空格也只是单参数）；同时删除 L5 与行为不符的注释
+
+### wave2-78-S-02b 版本B
+入口: L4 方法 ping 的 host 参数（内部 API 传参；样本外假设：是否外部可控需调用方确认）
+链: 未发现可达污点流，原因: L5 `new ProcessBuilder("ping", "-c", "1", host)` 逐元素构造 argv，host 整体处于 ping 参数位，无 shell、无空白再切分
+防御:
+  L5 ProcessBuilder 列表形态 → 有效: host 含 `;`、空格、`-` 均只是 ping 的单个参数文本，无解释器再解析
+载荷: 无
+组合链: 无
+锚句: 非 CWE-78，因无 shell；非 CWE-88，因 host 固定参数位且 ping 无危险选项语义
+结论: 存在漏洞=false | CWE-78 OS Command Injection（防御有效） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-03 版本A
+入口: L6 HTTP GET /tools/run 参数 tool | 次要: L7 参数 arg（两者同入一条命令串）
+链: L6 tool → L8 模板串 `exec(\`${tool} ${arg}\`)` → L8 exec 默认经 /bin/sh -c 产生 shell → 任意命令执行；L14 app.listen(8080) 服务监听在样本内成立
+防御: 无——L8 timeout:5000 仅限时长；L9-L10 错误/回显逻辑与防御无关
+载荷: `GET /tools/run?tool=cat%20/etc/passwd` → sh 执行 `cat /etc/passwd`，L10 返回输出
+组合链: L6 tool 与 L7 arg 双可控，注入面冗余，堵其一仍有另一；单缺陷即完整带回显 RCE
+锚句: 非 CWE-95，因消费方是 /bin/sh 而非 JS eval；非 CWE-79，因输出以 text/plain 返回（L10），且根缺陷是注入本身
+结论: 存在漏洞=true | CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | Critical
+修复: L2 增加 execFile 引入，建立 工具名→固定 bin/固定参数 的白名单映射，L6 校验 tool 不在映射即 400，L8 改为 `execFile(entry.bin, [...固定参数, arg], ...)` 数组传参
+
+### wave2-78-S-03 版本B
+入口: L11 HTTP GET /tools/run 参数 tool | 次要: L12 参数 arg
+链: 未发现可达污点流，原因: L13 `ALLOWED_TOOLS[tool]` 中 tool 仅作白名单键；L15 `execFile(entry.bin, [...(entry.args || []), arg])` 的 bin 恒为常量，arg 为单个 argv 元素，execFile 不产生 shell
+防御:
+  L13-L14 白名单校验 → 有效: tool 非 uptime/diskfree 即 400；变体 tool=`__proto__`/`constructor` 会命中原型链继承对象从而通过 `!entry` 检查，但此时 entry.bin 为 undefined，execFile 抛错走 400/500 分支，无任何执行语义
+  L15 execFile 数组传参 → 有效: 无 shell 层，arg 中 `;`、`&&`、`$()` 无语义，df/uptime 亦无危险选项语义
+载荷: 无
+组合链: 无
+锚句: 非 CWE-78，因无 shell 且 bin 为常量；非 CWE-915/1321，因 tool 只作读取侧键，样本内不存在 `obj[k]=v` 动态写入共享对象
+结论: 存在漏洞=false | CWE-78 OS Command Injection（白名单+execFile 防御有效） | Low
+修复: 无需修改；加固可给 L13 查找加 hasOwnProperty 判断，拒绝原型链键，避免无谓 500
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-04 版本A
+入口: L8 HTTP GET /report/build 参数 kind | 次要: L9 参数 date（同入一条命令串）
+链: L8 kind、L9 date → L11 f-string 拼出整条命令 `f"/usr/bin/report --kind {choice} --date {date}"` → L12 shell=True → sh 解释
+防御: 无——L12 timeout=30、L13 errors="replace" 与注入无关
+载荷: `GET /report/build?kind=weekly&date=1970-01-01%3Bid` → sh 执行 `/usr/bin/report --kind weekly --date 1970-01-01;id`（即使 /usr/bin/report 不存在，`;` 后注入段照常运行），L13 回显输出
+组合链: kind 与 date 两个可控位冗余，堵其一仍有另一；单缺陷即完整带回显 RCE
+锚句: 非 CWE-95，因消费方是 sh；非 CWE-22，因输入进入命令串而非路径
+结论: 存在漏洞=true | CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | Critical
+修复: L11-L12 改为 kind 固定值白名单映射（映射到常量 argv 前缀），非白名单返回 400；执行改 `subprocess.run(prefix_argv + ["--date", date], capture_output=True, timeout=30)` 列表形态（L1 已 import subprocess）
+
+### wave2-78-S-04 版本B
+入口: L12 HTTP GET /report/build 参数 kind | 次要: L13 参数 date
+链: 未发现可达污点流，原因: L15 `CMD_TEMPLATES[choice] + ["--date", date]` 中 kind 仅作白名单键（L16-L17 KeyError 即 400），命令前缀全为常量，date 仅作 `--date` 的值，L18 无 shell
+防御:
+  L15-L17 kind 白名单 → 有效: 非 weekly/daily 一律 400，无法进入 argv
+  L18 列表 argv 无 shell=True → 有效: date 中 `;`、空格、`$()` 均为字面参数文本，目标程序将其作为 --date 值消费
+载荷: 无——`?kind=weekly&date=;id` 只会让 report 收到一个奇怪的日期值
+组合链: 无
+锚句: 非 CWE-78，因无 shell 且前缀全常量；非 CWE-88，因 date 固定在 --date 值位，样本内无可证的执行类选项语义
+结论: 存在漏洞=false | CWE-78 OS Command Injection（白名单+列表形态防御有效） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-04b 版本A
+入口: L8 Build 函数的 kind、date 参数（内部 API 传参；样本未贴调用点，样本外假设：参数是否外部可控需调用方样本确认）
+链: L8 kind/date → L9 `fmt.Sprintf("/usr/bin/report --kind %s --date %s", kind, date)` 拼接整条命令 → L10 `exec.Command("sh", "-c", cmd)` → sh -c 解释整串，注入成立
+防御: 无——L9-L10 无校验、无转义、无列表拆分
+载荷: kind=`weekly`、date=`1970-01-01;id` → sh 执行 `/usr/bin/report --kind weekly --date 1970-01-01;id`，`;id` 段执行（与 report 二进制是否存在无关）
+组合链: 单缺陷即完整 RCE；因调用方一跳在样本外，整体按理论链定级
+锚句: 非 CWE-95，因消费方是 sh；非 CWE-88，因输入参与整条被 sh 解释的命令串而非单个参数位
+结论: 存在漏洞=true | CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | High
+修复: L9-L10 改为 `exec.Command("/usr/bin/report", "--kind", kind, "--date", date).Output()`，并对 kind（仅 weekly/daily）与 date（`^\d{4}-\d{2}-\d{2}$` 正则）做白名单校验，删除 sh -c 中转
+
+### wave2-78-S-04b 版本B
+入口: L16 Build 函数的 kind、date 参数（内部 API 传参；样本外假设：是否外部可控需调用方确认）
+链: 未发现可达污点流，原因: L17-L20 kind 须命中 reportArgs 白名单；L21-L23 date 须匹配锚定正则 `^\d{4}-\d{2}-\d{2}$`；L25 `exec.Command(argv[0], argv[1:]...)` 列表形态无 shell
+防御:
+  L17-L20 kind 白名单 → 有效: 非白名单直接报错返回，不构造 argv
+  L14 + L21-L23 date 锚定正则（^…$）→ 有效: 仅数字与连字符可通过，`;`、`$`、空格、反引号全部拒绝
+  L25 exec.Command 列表形态 → 有效: 无 sh 中转，即使漏网也只是单参数文本
+载荷: 无
+组合链: 无
+锚句: 非 CWE-78，因无 shell 且白名单+锚定正则双前置拦截；非 CWE-190，因 date 仅作参数值，不参与长度/索引算术
+结论: 存在漏洞=false | CWE-78 OS Command Injection（三重防御有效） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-05 版本A
+入口: L4 extract 方法的 archive 参数（内部 API 传参；样本未贴调用点，样本外假设：archive 是否外部可控需调用方样本确认）
+链: 未发现可达的注入污点流——L6 `Runtime.exec("sh -c 'unzip -o " + archive + " -d /srv/tmp'")` 是单字符串 exec：Java 先按空白把整串切分为 argv（引号不参与分组），sh -c 的脚本参数恒为第 3 个 token `'unzip`（引号不闭合），archive 只落入 $0 之后的参数展开位、永不进入脚本；sh 对 `'unzip` 立即报 unexpected EOF 语法错误退出，unzip 主体与注入内容均不执行
+防御:
+  L6 Runtime.exec(String) 空白切分 → 有效（事实层面）: 作者期望的单引号分组在 Java 层已被拆散，L5 注释"单字符串命令 + shell 解释"描述的行为并不存在
+  残余细节: archive 即使含空白也无法改变布局——sh -c 只消费 `-c` 后第 3 个 token，脚本位恒为 `'unzip`，无任何布局能把注入内容送进脚本位
+载荷: 无——archive=`x' ; id ; '` 实际执行 argv ["sh","-c","'unzip","-o","x","'",";","id",...]，sh 报语法错误退出，id 不执行
+组合链: 无
+锚句: 非 CWE-78，因 sh 的脚本位是常量、可控数据永不进入脚本被消费；非 CWE-22，因 archive 仅是参数文本，未作为路径被读取或写入
+结论: 存在漏洞=false | CWE-78 OS Command Injection（预期注入被 Runtime.exec 单串切分破坏，不可达） | Low
+修复: L6 改为 `new ProcessBuilder("unzip", "-o", archive, "-d", "/srv/tmp").start()`——无 shell、列表形态，同时消除当前"命令恒语法错误"的失效行为；并更正 L5 误导性注释
+
+### wave2-78-S-05 版本B
+入口: L6 extract 方法的 archive 参数（内部 API 传参；样本外假设：是否外部可控需调用方确认）
+链: 未发现可达污点流，原因: L7 `new ProcessBuilder(List.of("unzip", "-o", archive, "-d", "/srv/tmp"))` 逐元素构造 argv，archive 整体处于 unzip 参数位，无 shell、无空白再切分
+防御:
+  L7 List.of 固定 argv 骨架 → 有效: archive 含 `;`、引号、空格、`-` 均只是单个参数文本；unzip 选项集无执行类语义
+载荷: 无
+组合链: 无
+锚句: 非 CWE-78，因无 shell；非 CWE-88，因 archive 固定参数位且 unzip 无危险选项语义
+结论: 存在漏洞=false | CWE-78 OS Command Injection（防御有效） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-06 版本A
+入口: L7 Resolve 函数的 host 参数（内部 API 传参；样本未贴调用点，样本外假设：host 是否外部可控需调用方样本确认）
+链: L7 host → L9 `"dig +short "+host` 拼接 → L9 `exec.Command("sh", "-c", cmd)` → sh -c 解释整条命令，注入成立
+防御: 无——L9 无校验、无转义、无列表拆分
+载荷: host=`example.com;id` → sh 执行 `dig +short example.com;id`，id 运行；Output() 会收集 stderr，注入命令亦可写文件或反连外带
+组合链: 单缺陷即完整 RCE；因调用方一跳在样本外，整体按理论链定级
+锚句: 非 CWE-95，因消费方是 /bin/sh；非 CWE-77，因注入目标是 OS shell 语法而非应用命令语言
+结论: 存在漏洞=true | CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | High
+修复: L9 改为 `exec.Command("dig", "+short", host).Output()`，删除 sh 中转，host 单参数传递
+
+### wave2-78-S-06 版本B
+入口: L7 Resolve 函数的 host 参数（内部 API 传参；样本外假设：是否外部可控需调用方确认）
+链: 未发现可达污点流，原因: L9 `exec.Command("dig", "+short", host)` 逐元素构造 argv，host 整体处于 dig 参数位，无 shell
+防御:
+  L9 exec.Command 列表形态（无 sh）→ 有效: host 中 `;`、反引号、`$()`、空格均为字面参数文本，无解释器再解析
+载荷: 无
+组合链: 无
+锚句: 非 CWE-78，因无 shell 层；非 CWE-88，因 host 固定在 +short 的参数值位，dig 选项集无执行语义
+结论: 存在漏洞=false | CWE-78 OS Command Injection（防御有效） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-07 版本A
+入口: L6 HTTP GET /whois 参数 domain
+链: L6 domain → L7 模板串 `exec(\`whois ${domain}\`)` → L7 exec 默认经 /bin/sh -c → 任意命令执行；L13 app.listen(8080) 服务监听在样本内成立
+防御: 无——L7 timeout:5000 仅限时长；L8-L9 错误处理与防御无关
+载荷: `GET /whois?domain=example.com%3Bid` → sh 执行 `whois example.com;id`，L9 回显 id 输出
+组合链: 单缺陷即完整带回显 RCE
+锚句: 非 CWE-95，因消费方是 sh；非 CWE-79，因输出以 text/plain 返回，不进入 HTML 上下文
+结论: 存在漏洞=true | CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | Critical
+修复: L2 增加 execFile 引入，L7 改为 `execFile("whois", [domain], { timeout: 5000 }, ...)`，domain 作为单个参数传递
+
+### wave2-78-S-07 版本B
+入口: L6 HTTP GET /whois 参数 domain
+链: 未发现可达污点流，原因: L7 `execFile("whois", [domain], ...)` 无 shell，domain 整体处于 whois 参数位
+防御:
+  L7 execFile 数组传参 → 有效: domain 中 `;`、`&&`、反引号、空格均为参数文本；whois 选项集（如 -h）无命令执行语义
+载荷: 无
+组合链: 无
+锚句: 非 CWE-78，因无 shell；非 CWE-88，因 domain 固定参数位且 whois 无危险选项语义
+结论: 存在漏洞=false | CWE-78 OS Command Injection（防御有效） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-08 版本A
+入口: L3 HTTP GET（PHP 脚本直接访问）参数 host
+链: L3 `$_GET['host']` → L4 `"ping -c 1 " . $host` 拼接 → L4 shell_exec（内部经 /bin/sh -c）→ 任意命令执行；L6 echo $out 回显
+防御: 无——L5 header 仅设置响应类型
+载荷: `GET /api/ping.php?host=127.0.0.1%3Bcat%20/etc/passwd` → sh 执行 `ping -c 1 127.0.0.1;cat /etc/passwd`，L6 回显输出
+组合链: 单缺陷即完整带回显 RCE
+锚句: 非 CWE-95，因消费方是 sh；非 CWE-79，因响应为纯文本输出，且根缺陷是注入
+结论: 存在漏洞=true | CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | Critical
+修复: L4 拼接前先校验 host——`preg_match('/^[A-Za-z0-9.-]+$/', $host)` 不匹配即拒绝输出错误并退出，仅白名单字符可进入命令串
+
+### wave2-78-S-08 版本B
+入口: L3 HTTP GET 参数 host
+链: 未发现可达污点流，原因: L4 host 先经 `escapeshellarg($host)` 处理再拼接，shell_exec 收到的是常量前缀加单个引号包裹参数
+防御:
+  L4 escapeshellarg → 有效（POSIX shell）: 单引号包裹并转义内部单引号，sh 展开后恒为单一字面参数，`;id` 变为 `';id'` 成为 ping 参数
+  样本外假设: escapeshellarg 的保证针对 POSIX shell；Windows 下 shell 语义不同则不等价，样本未给平台信息，按常规 POSIX 部署判
+载荷: 无——`?host=a;id` 实际执行 `ping -c 1 'a;id'`，id 不会执行
+组合链: 无
+锚句: 非 CWE-78，因元字符在 sh 解析前已被引号中和；非 CWE-88，因 host 仍只是 ping 的参数值位
+结论: 存在漏洞=false | CWE-78 OS Command Injection（escapeshellarg 防御有效） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-09 版本A
+入口: L8 HTTP GET /ops/run 参数 cmd
+链: L8 user_cmd → L10 `subprocess.run(["sh", "-c", user_cmd], ...)`——列表形态不构成防御：user_cmd 占据 sh -c 的整个脚本位，被 sh 按命令语言原样解释
+防御: 无——L9 注释自述"以为用了列表形式就安全"，恰说明列表仅避免了命令串二次切分，脚本位仍完全受控
+载荷: `GET /ops/run?cmd=cat%20/etc/passwd` → sh 执行 `cat /etc/passwd`，L11 回显输出
+组合链: 单缺陷即完整带回显 RCE
+锚句: 非 CWE-95，因消费方是执行 OS 命令的 sh 解释器，按判别笔记归 78 而非 94/95；非 CWE-88，因输入不是参数位而是整条命令脚本
+结论: 存在漏洞=true | CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | Critical
+修复: L10 删除 `["sh", "-c", user_cmd]` 形态，改为 命令名→常量argv 的映射查表：user_cmd 仅作键，查不到返回 400，执行恒用常量列表（如 `{"date": ["date", "-u"]}`）
+
+### wave2-78-S-09 版本B
+入口: L12 HTTP GET /ops/run 参数 cmd
+链: 未发现可达污点流，原因: L14 `ALLOWED_COMMANDS[user_cmd]` 中 user_cmd 仅作字典查表键，L17 subprocess.run 收到的 argv 全为常量（L6-L7），user_cmd 永不进入命令文本
+防御:
+  L5-L8 白名单映射 + L14-L16 KeyError 拒绝 → 有效: 仅 echo/date 两键通过，其余任何值（含 shell 元字符）返回 400
+  L17 常量 argv 无 shell=True → 有效: 即使白名单被绕过也无用户数据可拼接进命令
+载荷: 无——`?cmd=id` 返回 400；`?cmd=date` 只执行固定的 `date -u`
+组合链: 无
+锚句: 非 CWE-78，因输入不触达命令文本；非 CWE-915，因对常量 dict 仅作只读查找，无动态写入共享对象
+结论: 存在漏洞=false | CWE-78 OS Command Injection（白名单防御有效） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-09b 版本A
+入口: L7 Fetch 函数的 userRepo 参数（内部 API 传参；样本未贴调用点，样本外假设：userRepo 是否外部可控需调用方样本确认）
+链: L7 userRepo → L9 `"--upload-pack="+userRepo` 拼进 git 选项值 → L9 `exec.Command("git", "clone", ...)` → git 将 --upload-pack 值作为远端 helper 程序在本地拉起执行：值含 shell 元字符时 git 以 sh -c 执行，注入命令先于仓库校验运行
+防御: 无——L9 无任何校验或前缀限制；L8 注释与真实行为一致
+载荷: userRepo=`touch /tmp/pwned` → 执行 `git clone --upload-pack=touch /tmp/pwned example/repo`，git 在本地以 sh -c 拉起该 helper，touch 执行（将 touch 换成任意命令即任意执行）
+组合链: 单缺陷即完整 RCE；因调用方一跳在样本外，整体按理论链定级
+锚句: 非 CWE-95，因最终消费是 git/sh 执行 OS 程序，归 78；非 CWE-77，因注入的是 OS 层可执行程序路径而非应用命令语言
+结论: 存在漏洞=true | CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | High
+修复: L9 将 --upload-pack 从用户输入中移除（删除该选项或固定为常量值），userRepo 先做主机前缀白名单校验，校验通过后再以 `https://` 固定 scheme 传给 git clone
+
+### wave2-78-S-09b 版本B
+入口: L11 Fetch 函数的 userRepo 参数（内部 API 传参；样本外假设：是否外部可控需调用方确认）
+链: 未发现可达污点流，原因: L13-L21 前缀白名单校验（不通过即拒绝）→ L22 `repoURL := "https://" + userRepo` 强制 https scheme → L23 `exec.Command("git", "clone", repoURL)` 无 shell、无用户可控 git 选项
+防御:
+  L9 + L13-L21 HasPrefix 白名单 → 有效: userRepo 必须以 github.com/example/ 或 git.example.com/mirror/ 开头，`--upload-pack=...` 形态的选项注入不满足任何前缀，在 L20 被拒
+  L22 固定 `https://` scheme → 有效: 排除 `ext::`、`ssh://` 等 git 传输中可携带命令执行的 URL scheme；URL 路径部分无执行语义
+  L23 exec.Command 列表形态 → 有效: 无 shell，userRepo 即使含元字符也只是单个 URL 参数文本
+载荷: 无——userRepo=`--upload-pack=touch /tmp/x` 被白名单拒绝；`github.com/example/x` 只能发起正常 https clone
+组合链: 无
+锚句: 非 CWE-78，因无 shell 且无用户可控选项位；非 CWE-918，因克隆目标受白名单限定于固定主机前缀，不构成任意 URL 取回
+结论: 存在漏洞=false | CWE-78 OS Command Injection（白名单+scheme 限定+无 shell 防御有效） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-10 版本A
+入口: L8 HTTP GET /admin/svc 参数 action
+链: L8 action → L10 f-string `f"sudo systemctl {action} order-service"` 拼接 → L10-L11 shell=True → sh 解释 → 任意命令执行
+防御: 无——L10 timeout=10 与注入无关；路由本身无鉴权（样本内无任何认证检查）
+载荷: `GET /admin/svc?action=status%3Bid%3B` → sh 执行 `sudo systemctl status` 后接 `id`（分号切分为独立命令，末尾 order-service 作为新命令名失败但不影响 id），L12 回显输出
+组合链: 单缺陷即完整带回显 RCE（以 web 进程用户身份）；sudo 项只影响注入段能否借 sudo 提权，不影响注入本身成立
+锚句: 非 CWE-95，因消费方是 sh；非 CWE-250，因并非程序自身以过度权限运行，而是注入导致命令执行（提权维度依赖样本外 sudoers 配置）
+结论: 存在漏洞=true | CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | Critical
+修复: L10-L11 改为 action 白名单映射（action→固定 argv，如 ["sudo","-n","/usr/bin/systemctl","status","order-service"]），非白名单返回 400，subprocess.run 列表形态无 shell
+
+### wave2-78-S-10 版本B
+入口: L12 HTTP GET /admin/svc 参数 action
+链: 未发现可达污点流，原因: L14 `ACTIONS[action]` 中 action 仅作白名单键，L17 subprocess.run 收到的 argv 全为常量（L6-L7）
+防御:
+  L5-L8 白名单映射 + L14-L16 KeyError 拒绝 → 有效: 仅 status/restart 通过，其余值（含 `;id` 等注入形态）返回 400
+  L6-L7 常量 argv（绝对路径 /usr/bin/systemctl + 固定单元名）→ 有效: 无用户数据进入命令文本；`-n` 非交互模式避免 sudo 挂起等待密码
+载荷: 无——`?action=shutdown` 返回 400；`?action=status;id` 同样被 KeyError 拒绝
+组合链: 无
+锚句: 非 CWE-78，因输入仅作白名单键不触达命令文本；非 CWE-250/269，因特权操作目标（单元名、动作集）固定为常量，无用户可控提权参数
+结论: 存在漏洞=false | CWE-78 OS Command Injection（白名单防御有效） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-10b 版本A
+入口: L4 runAs 方法的 user、job 参数（内部 API 传参；样本未贴调用点，样本外假设：参数是否外部可控需调用方样本确认）
+链: 未发现 shell 注入污点流——L6 `Runtime.exec("sudo -u " + user + " /usr/bin/batch-run " + job)` 单字符串 exec 按空白切分为 argv，全程无 shell，`;`、反引号均为普通 token
+防御:
+  L6 Runtime.exec(String) 空白切分 → 有效（对 shell 注入而言）: 无解释器消费元字符
+  残余面 1: user 完全可控并处于 `sudo -u` 的目标用户参数位（如 user=`root`），是否构成提权取决于 sudoers 规则 → 样本外假设，需 sudoers 配置
+  残余面 2: job 含空格可拆出额外 argv 元素进入 batch-run 的参数位（参数注入），危险语义取决于 batch-run 的参数解析 → 样本外假设，需 batch-run 实现
+载荷: 无样本内可证的载荷——user=`root` 可能触发提权（取决于 sudoers）；job=`--flag` 仅改变 batch-run 行为（行为未知）
+组合链: user 可控（L6）→ sudo -u 目标用户可控 → 若 sudoers 放行任意 -u 则提权；链上两跳均依赖样本外配置/实现，整链不可样本内证明
+锚句: 非 CWE-78，因 Runtime.exec(String) 无 shell 层；非 CWE-250，因并非程序自身过度权限，而是提权面悬于样本外 sudoers 配置
+结论: 存在漏洞=false | CWE-78 OS Command Injection（无 shell 层未触发；残余提权/参数注入面均依赖样本外） | Low
+修复: L6 改为 `new ProcessBuilder("sudo", "-n", "-u", user, "/usr/bin/batch-run", job).start()` 消除空白切分；并对 user 建立固定目标用户白名单、对 job 建立 名称→固定脚本路径 映射，二者只允许取常量
+
+### wave2-78-S-10b 版本B
+入口: L11 runAs 方法的 user、job 参数（内部 API 传参；样本外假设：是否外部可控需调用方确认）
+链: 未发现可达污点流，原因: L12 `RUN_USERS.contains(user)` 与 `JOBS.containsKey(job)` 先拒绝 → L15-L16 `List.of("sudo", "-n", "-u", user, "/usr/bin/batch-run", JOBS.get(job))` 中 user 恒为常量 batch、job 传入的是映射出的固定脚本路径
+防御:
+  L7 RUN_USERS 白名单 + L12 校验 → 有效: user 只能取 batch，sudo -u 目标用户不可控
+  L8-L9 JOBS 映射 + L12 校验 → 有效: job 仅作查表键，进入 argv 的是常量脚本路径，job 原始值永不进入命令
+  L15-L16 ProcessBuilder 列表形态 → 有效: 无 shell、无空白再切分；`-n` 防止 sudo 交互挂起
+载荷: 无——user=`root` 被 L12 拒绝；job=`nightly;id` 同样被 containsKey 拒绝
+组合链: 无
+锚句: 非 CWE-78，因无 shell 且 argv 各位皆常量；非 CWE-269，因目标用户与 job 集合对常量封闭，无用户可控提权参数
+结论: 存在漏洞=false | CWE-78 OS Command Injection（白名单+列表形态防御有效） | Low
+修复: 无需修改
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？
+
+### wave2-78-S-15 版本A
+入口: L7 Purge 函数的 name 参数（内部 API 传参；样本未贴调用点，样本外假设：name 是否外部可控需调用方样本确认）
+链: 未发现可达的注入污点流——L9 `exec.Command("find", "/var/tmp", "-name", name, "-exec", "rm", "-rf", "{}", ";")` 逐元素构造 argv，无 shell；name 仅占 `-name` 的值位，`-exec` 之后的参数组（rm -rf {} ;）全为常量，输入无法改变 argv 结构；L8 注释称"name 可携带 ; 与 {} 注入执行体"与 argv 构造方式不符，注释在撒谎
+防御:
+  L9 exec.Command 列表形态（Go 不做空白再切分）→ 有效: name 无法像 shell 拼接那样重构参数，`;`、`{}` 只是模式字符
+  残余面: `-name` 仅匹配 basename 且搜索根固定 /var/tmp，name 无法目录逃逸；但 name=`*` 会把删除范围扩大到 /var/tmp 下全部条目——若该函数被外部输入触达即构成破坏性删除，是否成立取决于参数可控性 → 样本外假设
+载荷: 无——name=`; touch /tmp/x` 只是 find 的模式（匹配不到任何文件），注入命令不执行
+组合链: 无
+锚句: 非 CWE-78，因无 shell 且 -exec 执行体为常量；非 CWE-22，因 -name 只匹配 basename，name 无法引入路径穿越
+结论: 存在漏洞=false | CWE-78 OS Command Injection（注释声称的注入不可达） | Low
+修复: 注入面无需修改；建议 L9 后对 name 增加字符白名单（如仅 `[A-Za-z0-9._-]`，排除 `*?[` 等模式元字符）使删除范围符合预期，并更正 L8 错误注释避免误导后续审计
+
+### wave2-78-S-15 版本B
+入口: L12 Purge 函数的 name 参数（内部 API 传参；样本未贴调用点，样本外假设：name 是否外部可控需调用方样本确认）
+链: L12 name → L13-L15 正则校验（存在缺陷：字符类包含 `.`）→ L16 `filepath.Join("/var/tmp", filepath.Base(name))` → name=`..` 时 filepath.Base("..") 返回 `..`，Join 得到 `/var` → L17 `exec.Command("rm", "-rf", "/var")` 删除目标逃出受限目录
+防御:
+  L13-L15 nameRE `^[a-zA-Z0-9._-]{1,64}$` → 伪防御: `.` 在允许字符类内，name=`..` 完整匹配通过（1-64 长度亦满足）；name=`.` 同样通过
+  L16 filepath.Base → 伪防御: 对 `..` 这种特殊值 Base 原样返回（Base 只取最后元素/去尾分隔符，不解析 dotdot），随后 Join("/var/tmp", "..") 在 Clean 时抵消 tmp 段得到 `/var`；name=`.` 则得到 `/var/tmp` 本身
+载荷: name=`..` → L16 target=`/var`，L17 执行 `rm -rf /var`；name=`.` → `rm -rf /var/tmp`（进程对目标有删除权限时即越界删除）
+组合链: name=`..` 输入（L12）→ 正则放行（L13）→ Base 原样返回（L16）→ Join 目录抵消（L16）→ rm -rf 越界删除（L17）
+锚句: 非 CWE-78，因无 shell、无命令串拼接，rm 参数为单一元素；非 CWE-73，因并非攻击者直接指定绝对路径，而是受限目录内的 `..` 穿越逃逸
+结论: 存在漏洞=true | CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') | Medium
+修复: L13-L15 校验中显式拒绝 `.` 与 `..`（如 `if name == "." || name == ".." { return nil, fmt.Errorf("name not allowed") }`），或 L16 改为校验 `filepath.Base(name) != name` 时拒绝；最低限度在 L17 执行前断言 strings.HasPrefix(filepath.Clean(target), "/var/tmp/")
+
+自查清单:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（本案例无 SQL，不适用）？

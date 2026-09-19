@@ -1,0 +1,669 @@
+【蒸馏批次 redistill | 样本数=8】
+
+### id=redistill-line-165 lang=c flags=[arbitrate]
+#### 代码（63 行）
+```c
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/fs.h>
+#include <linux/device.h>
+#include <linux/mutex.h>
+
+#define DEVICE_NAME "vuln_drv"
+#define IOCTL_CMD _IOW('v', 1, struct ioctl_arg)
+
+struct ioctl_arg {
+    size_t len;
+    char data[256];
+};
+
+static DEFINE_MUTEX(drv_lock);
+static char *kernel_buf;
+static size_t buf_size = 128;
+
+static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    struct ioctl_arg user_arg;
+    int ret = 0;
+
+    if (copy_from_user(&user_arg, (void __user *)arg, sizeof(user_arg)))
+        return -EFAULT;
+
+    mutex_lock(&drv_lock);
+
+    if (cmd == IOCTL_CMD) {
+        if (user_arg.len > buf_size) {
+            ret = -EINVAL;
+            goto out;
+        }
+        // 第28行：漏洞点——未验证 user_arg.len 与 kernel_buf 实际分配大小
+        memcpy(kernel_buf, user_arg.data, user_arg.len);
+    }
+
+out:
+    mutex_unlock(&drv_lock);
+    return ret;
+}
+
+static int __init drv_init(void)
+{
+    kernel_buf = kmalloc(buf_size, GFP_KERNEL);
+    if (!kernel_buf)
+        return -ENOMEM;
+    return 0;
+}
+
+static void __exit drv_exit(void)
+{
+    kfree(kernel_buf);
+    kernel_buf = NULL;  // 第52行：防御——释放后置NULL
+}
+
+module_init(drv_init);
+module_exit(drv_exit);
+MODULE_LICENSE("GPL");
+
+
+```
+
+### id=redistill-line-1665 lang=python flags=[arbitrate]
+#### 代码（61 行）
+```python
+import os
+import json
+
+class ConfigLoader:
+    def __init__(self):
+        self._cache = {}
+        self._loaded_files = []
+
+    def load_config(self, filepath):
+        if filepath in self._cache:
+            return self._cache[filepath]
+        if not os.path.exists(filepath):
+            return None
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+        # 模拟将配置对象注册到全局管理器
+        ConfigManager.register(self, filepath)
+        self._cache[filepath] = data
+        return data
+
+    def unload_config(self, filepath):
+        if filepath in self._cache:
+            del self._cache[filepath]
+            # 清理后仍保留文件路径引用
+            self._loaded_files.append(filepath)
+
+    def get_loaded_files(self):
+        return self._loaded_files
+
+
+class ConfigManager:
+    _instances = {}
+
+    @classmethod
+    def register(cls, loader, path):
+        # 存储引用，但不检查loader是否已被unload
+        cls._instances[path] = loader
+
+    @classmethod
+    def get_loader(cls, path):
+        return cls._instances.get(path)
+
+
+def main():
+    loader = ConfigLoader()
+    path = "config.json"
+    # 先加载配置
+    loader.load_config(path)
+    # 然后卸载
+    loader.unload_config(path)
+    # 之后通过全局管理器获取loader（此时loader对象仍存在但缓存已清）
+    cached_loader = ConfigManager.get_loader(path)
+    if cached_loader:
+        # 此处尝试访问已被unload的loader的缓存（UAF场景）
+        data = cached_loader._cache.get(path)  # 漏洞行：28
+        print(data)
+
+
+if __name__ == "__main__":
+    main()
+
+
+```
+
+### id=redistill-line-218 lang=cpp flags=[arbitrate]
+#### 代码（82 行）
+```cpp
+#include <iostream>
+#include <thread>
+#include <mutex>
+#include <vector>
+
+class SharedBuffer {
+public:
+    SharedBuffer() : data_(nullptr), size_(0) {}
+
+    ~SharedBuffer() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        delete[] data_;
+    }
+
+    void allocate(size_t size) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (data_ != nullptr) {
+            delete[] data_;
+        }
+        data_ = new int[size];
+        size_ = size;
+    }
+
+    void resize(size_t new_size) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (new_size == size_) return;
+        if (data_ != nullptr) {
+            delete[] data_;
+        }
+        data_ = new int[new_size];
+        size_ = new_size;
+    }
+
+    int read(size_t index) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (index >= size_) return -1;
+        return data_[index];
+    }
+
+    void write(size_t index, int value) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (index >= size_) return;
+        data_[index] = value;
+    }
+
+private:
+    int* data_;
+    size_t size_;
+    std::mutex mtx_;
+};
+
+void writer_thread(SharedBuffer& buf) {
+    for (int i = 0; i < 10; ++i) {
+        buf.resize(100);
+        buf.write(i, i * 2);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+void reader_thread(SharedBuffer& buf) {
+    for (int i = 0; i < 10; ++i) {
+        int val = buf.read(i);
+        if (val != -1) {
+            std::cout << "Read: " << val << std::endl;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+}
+
+int main() {
+    SharedBuffer buf;
+    buf.allocate(50);
+
+    std::thread t1(writer_thread, std::ref(buf));
+    std::thread t2(reader_thread, std::ref(buf));
+
+    t1.join();
+    t2.join();
+
+    return 0;
+}
+
+
+```
+
+### id=redistill-line-227 lang=c flags=[arbitrate]
+#### 代码（83 行）
+```c
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/device.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/mutex.h>
+
+#define DEVICE_NAME "vuln_drv"
+#define IOCTL_FREE 0x1001
+#define IOCTL_USE  0x1002
+
+static struct mutex lock;
+static char *buffer;
+static int buffer_allocated;
+
+static int dev_open(struct inode *inode, struct file *filp) {
+    return 0;
+}
+
+static long dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
+    int ret = 0;
+
+    mutex_lock(&lock);   // line 20
+
+    switch (cmd) {
+        case IOCTL_FREE:
+            if (buffer_allocated) {          // line 24
+                kfree(buffer);               // line 25
+                buffer_allocated = 0;        // line 26
+                // 注意：buffer 指针未置 NULL
+            }
+            break;
+
+        case IOCTL_USE:
+            if (buffer_allocated) {          // line 32
+                buffer[0] = 'A';             // line 33 正常使用
+            } else {
+                ret = -EFAULT;               // 防御：未分配时拒绝
+            }
+            break;
+
+        default:
+            ret = -EINVAL;
+            break;
+    }
+
+    mutex_unlock(&lock);   // line 41
+    return ret;
+}
+
+static int __init dev_init(void) {
+    mutex_init(&lock);
+    buffer = kmalloc(128, GFP_KERNEL);      // line 46
+    if (!buffer) {
+        return -ENOMEM;
+    }
+    buffer_allocated = 1;
+    return 0;
+}
+
+static void __exit dev_exit(void) {
+    if (buffer_allocated) {
+        kfree(buffer);                       // line 54
+        buffer_allocated = 0;
+    }
+}
+
+static struct file_operations fops = {
+    .open = dev_open,
+    .unlocked_ioctl = dev_ioctl,
+};
+
+static struct miscdevice mdev = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name = DEVICE_NAME,
+    .fops = &fops,
+};
+
+module_init(dev_init);
+module_exit(dev_exit);
+MODULE_LICENSE("GPL");
+
+
+```
+
+### id=redistill-line-235 lang=c flags=[arbitrate]
+#### 代码（94 行）
+```c
+#include <linux/module.h>
+#include <linux/kernel.h>
+include <linux/device.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/fs.h>
+
+#define DRV_NAME "vulndrv"
+#define BUF_SIZE 0x20          // 32 bytes
+#define COPY_FROM_USER(dest, src, n) copy_from_user(dest, src, n)
+
+struct drv_device {
+    char name[16];
+    struct cdev cdev;
+    struct device *dev;
+};
+
+static struct drv_device *drv;
+static char *k_buf;
+
+static int drv_open(struct inode *inode, struct file *filp)
+{
+    return 0;
+}
+
+static ssize_t drv_read(struct file *filp, char __user *user_buf,
+                        size_t count, loff_t *off)
+{
+    size_t len = count > BUF_SIZE ? BUF_SIZE : count;
+    if (copy_to_user(user_buf, k_buf, len))
+        return -EFAULT;
+    return len;
+}
+
+static ssize_t drv_write(struct file *filp, const char __user *user_buf,
+                         size_t count, loff_t *off)
+{
+    size_t copy_len;
+    void *temp;
+
+    if (count > BUF_SIZE * 4)    // 允许大请求，但内部截断
+        return -EINVAL;
+
+    // 分配临时缓冲区，避免直接操作内核缓冲
+    temp = kmalloc(count, GFP_KERNEL);
+    if (!temp)
+        return -ENOMEM;
+
+    if (COPY_FROM_USER(temp, user_buf, count)) {
+        kfree(temp);
+        return -EFAULT;
+    }
+
+    // 关键：根据实际拷贝长度计算复制到 k_buf 的大小
+    copy_len = count > BUF_SIZE ? BUF_SIZE : count;
+    memcpy(k_buf, temp, copy_len);   // line 44: 潜在溢出，若 count < BUF_SIZE 但 copy_len = count 且 temp 未初始化部分
+    kfree(temp);
+    return count;
+}
+
+static const struct file_operations fops = {
+    .owner = THIS_MODULE,
+    .open = drv_open,
+    .read = drv_read,
+    .write = drv_write,
+};
+
+static int __init drv_init(void)
+{
+    k_buf = kzalloc(BUF_SIZE, GFP_KERNEL);
+    if (!k_buf)
+        return -ENOMEM;
+
+    drv = kzalloc(sizeof(*drv), GFP_KERNEL);
+    if (!drv) {
+        kfree(k_buf);
+        return -ENOMEM;
+    }
+
+    cdev_init(&drv->cdev, &fops);
+    // 实际注册省略（alloc_chrdev_region 等）
+    return 0;
+}
+
+static void __exit drv_exit(void)
+{
+    kfree(k_buf);
+    kfree(drv);
+}
+
+module_init(drv_init);
+module_exit(drv_exit);
+MODULE_LICENSE("GPL");
+
+
+```
+
+### id=redistill-line-3020 lang=go flags=[arbitrate]
+#### 代码（109 行）
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os/exec"
+	"strings"
+	"time"
+)
+
+// WhitelistedCommands defines the only commands that can be scheduled
+var WhitelistedCommands = map[string]bool{
+	"backup":     true,
+	"cleanup":    true,
+	"healthcheck": true,
+}
+
+// scheduledTask represents a cron-like job definition
+type scheduledTask struct {
+	Name        string
+	Command     string
+	Args        []string
+	Schedule    string
+}
+
+// runTask executes a scheduled task safely
+func runTask(ctx context.Context, task scheduledTask) error {
+	// Validate task name against whitelist
+	if !WhitelistedCommands[task.Name] {
+		return fmt.Errorf("task %q is not whitelisted", task.Name)
+	}
+
+	// Build command with explicit list arguments, never a shell string
+	cmd := exec.CommandContext(ctx, task.Command, task.Args...)
+	
+	// Explicitly disable shell invocation
+	cmd.Shell = false
+
+	log.Printf("Executing task %s with args: %v", task.Name, task.Args)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("task %s failed: %v, output: %s", task.Name, err, string(output))
+	}
+
+	log.Printf("Task %s completed successfully", task.Name)
+	return nil
+}
+
+// scheduleTasks simulates a scheduler that parses user-provided task definitions
+func scheduleTasks(tasks []scheduledTask) {
+	ctx := context.Background()
+	for _, task := range tasks {
+		// Simulate cron-like scheduling
+		go func(t scheduledTask) {
+			ticker := time.NewTicker(1 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := runTask(ctx, t); err != nil {
+						log.Printf("Scheduled task error: %v", err)
+					}
+				}
+			}
+		}(task)
+	}
+}
+
+func main() {
+	// User-supplied task definitions (simulating untrusted input)
+	userTasks := []scheduledTask{
+		{
+			Name:     "backup",
+			Command:  "/usr/bin/backup-script",
+			Args:     []string{"--source", "/data", "--dest", "/backup"},
+			Schedule: "*/5 * * * *",
+		},
+		{
+			Name:     "cleanup",
+			Command:  "/usr/bin/cleanup-tmp",
+			Args:     []string{"--older-than", "7d"},
+			Schedule: "0 3 * * *",
+		},
+		// Malicious attempt: not in whitelist
+		{
+			Name:     "system('rm -rf /')",
+			Command:  "/bin/sh",
+			Args:     []string{"-c", "rm -rf /"},
+			Schedule: "*/1 * * * *",
+		},
+	}
+
+	// Validate and schedule only whitelisted tasks
+	var validTasks []scheduledTask
+	for _, task := range userTasks {
+		if WhitelistedCommands[task.Name] {
+			validTasks = append(validTasks, task)
+		} else {
+			log.Printf("Rejected non-whitelisted task: %s", task.Name)
+		}
+	}
+
+	scheduleTasks(validTasks)
+	select {} // block forever
+}
+
+
+```
+
+### id=redistill-line-3489 lang=java flags=[arbitrate]
+#### 代码（66 行）
+```java
+// 用户认证服务 - 基于 LDAP 的用户登录
+import org.springframework.ldap.core.LdapTemplate;
+import org.springframework.ldap.support.LdapNameBuilder;
+import org.springframework.stereotype.Service;
+import javax.naming.Name;
+import javax.naming.directory.Attributes;
+import javax.naming.directory.BasicAttributes;
+
+@Service
+public class LdapAuthService {
+    
+    private final LdapTemplate ldapTemplate;
+    
+    public LdapAuthService(LdapTemplate ldapTemplate) {
+        this.ldapTemplate = ldapTemplate;
+    }
+    
+    /**
+     * 用户登录认证
+     * @param username 用户名（未经任何转义）
+     * @param password 密码
+     * @return 认证结果
+     */
+    public boolean authenticate(String username, String password) {
+        // 第1行：直接使用用户输入构造 DN —— 潜在注入点
+        String userDn = "uid=" + username + ",ou=users,dc=example,dc=com";
+        
+        // 第2行：使用原始输入进行 LDAP 搜索（非认证操作）
+        Name searchBase = LdapNameBuilder.newInstance("ou=users,dc=example,dc=com").build();
+        String filter = "(uid=" + username + ")";
+        
+        // 第3行：尝试认证（可能触发 LDAP 注入）
+        try {
+            // 使用 bind 认证方式
+            return ldapTemplate.authenticate(searchBase, filter, password);
+        } catch (Exception e) {
+            // 记录日志但不返回具体错误
+            System.err.println("LDAP authentication failed for user: " + username);
+            return false;
+        }
+    }
+    
+    /**
+     * 备用认证方法 - 使用 escapeValue 转义
+     */
+    public boolean authenticateSafe(String username, String password) {
+        // 第4行：使用 LdapEncoder 进行转义
+        String safeUsername = LdapEncoder.filterEncode(username);
+        String userDn = "uid=" + safeUsername + ",ou=users,dc=example,dc=com";
+        
+        // 第5行：转义后的过滤条件
+        String filter = "(uid=" + safeUsername + ")";
+        
+        try {
+            return ldapTemplate.authenticate(
+                LdapNameBuilder.newInstance("ou=users,dc=example,dc=com").build(),
+                filter, 
+                password
+            );
+        } catch (Exception e) {
+            System.err.println("LDAP authentication failed");
+            return false;
+        }
+    }
+}
+
+
+```
+
+### id=redistill-line-3900 lang=python flags=[arbitrate]
+#### 代码（62 行）
+```python
+# Django 视图：导出用户活动日志为 CSV
+import csv
+import io
+from django.http import HttpResponse
+from django.contrib.auth.decorators import login_required
+from django.views.decorators.http import require_GET
+from .models import ActivityLog
+
+@login_required
+@require_GET
+def export_activity_logs(request):
+    """
+    导出当前用户的活动日志，格式为 CSV。
+    支持按操作类型筛选，操作类型通过 query 参数传递。
+    """
+    user = request.user
+    # 从 query string 获取操作类型，默认 'all' 表示全部
+    action_filter = request.GET.get('action', 'all')
+
+    # 防御迷惑点：看似用 replace 清理，实际未阻断注入
+    # 实际操作类型是预定义的，但此处未做严格校验
+    action_filter = action_filter.replace(';', '').replace('--', '')
+    # 注意：这里没有调用数据库，而是用 Python 过滤，所以 SQL 注入不适用
+    # 但 CWE-943 关注的是数据导出逻辑的注入，比如 CSV 公式注入
+
+    # 查询当前用户的活动日志
+    logs = ActivityLog.objects.filter(user=user)
+
+    # 如果指定了操作类型，则按操作类型过滤
+    if action_filter != 'all':
+        # 使用 startswith 做前缀匹配，看似安全，但未规范化路径
+        # 实际业务中操作类型是 'login', 'logout', 'download' 等
+        # 此处直接使用用户输入做前缀匹配，可能导致逻辑绕过
+        logs = [log for log in logs if log.action.startswith(action_filter)]
+
+    # 生成 CSV
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['时间', '操作', '详情'])
+
+    for log in logs:
+        # 防御：对 CSV 内容进行转义，防止公式注入
+        def safe_csv_field(value):
+            # 将值转为字符串
+            value = str(value)
+            # 防御：如果以 =, +, -, @ 开头，则加单引号前缀
+            if value.startswith(('=', '+', '-', '@')):
+                return "'" + value
+            return value
+
+        # 注意：详情字段可能包含用户输入，但这里做了转义
+        writer.writerow([
+            safe_csv_field(log.timestamp),
+            safe_csv_field(log.action),
+            safe_csv_field(log.details)
+        ])
+
+    # 返回 CSV 响应
+    response = HttpResponse(output.getvalue(), content_type='text/csv')
+    response['Content-Disposition'] = 'attachment; filename="activity_logs.csv"'
+    return response
+
+
+```

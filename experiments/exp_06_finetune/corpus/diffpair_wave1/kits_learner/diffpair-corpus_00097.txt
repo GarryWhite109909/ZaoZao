@@ -1,0 +1,751 @@
+# 代码安全分析请求 — 请认真分析
+
+> 我是做安全研究的，正在提升自己对代码审计的判断力。你的分析过程对我最有价值——
+> 请把你脑子里的推理步骤全部写出来，包括你排除掉的方向和为什么排除。
+> 下面是我整理的分析报告格式，请按这个结构写，方便我对照学习。
+
+---
+
+## 我需要你做的
+
+我会逐条消息发案例包给你，每包开头有【代码审计案例包】标记，包内有 `### id=...` 行标明案例编号。对每个代码样本做完整、独立的安全分析：**每条分析的第一行写 `### <案例编号> <版本A|版本B|全文>`**（编号照抄我给的 id），然后按以下格式逐项写，每一项都要有具体的行号和代码片段作为证据（片段用半角反引号包裹）：
+
+```
+入口: L<行号> <通道> <参数名> | 次要: <如有>
+    （通道别只看 HTTP 参数——配置文件、环境变量、命令行参数、stdin、文件流、DB 回读、内部 API 传参都算，我以前漏报最多的就是这些）
+链: L<行> <动作> → L<行> <动作> → L<行> <危险操作>
+    （判"安全"时本栏改写为: 未发现可达污点流，原因: <入口不可控 / sink 前防御封死 / 常量传播>）
+防御:
+  L<行> <机制> → 有效: <为什么攻击者过不去>
+  L<行> <机制> → 伪防御: <给出具体绕过字符串或 payload 片段>
+载荷: <能跑通的最短利用代码或 HTTP 请求>（要语义上真能触发——别拿会被引号/转义吃掉的字符串凑数）
+组合链: <如果多个缺陷串在一起危害更大，写出 A→B→C>
+锚句: 非 CWE-XX 因 <一句话>；非 CWE-YY 因 <一句话>
+结论: 存在漏洞=<true|false> | CWE-XXX <官方名> | <Critical|High|Medium|Low>
+修复: <行号 + 具体怎么改；用到的函数/模块必须在当前代码里已存在，别建议调用不存在的辅助函数>
+```
+
+---
+
+## 几个我踩过的坑，帮你避开
+
+1. "黑名单可绕过"这种话信息量为零——请把**具体绕过字符串**写出来（`....//`、`$()`、`%0a`、大小写变体），我才能真正理解防御为什么失败。
+2. **代码里的注释经常在撒谎**（"这里安全"其实有洞、"这里有洞"其实防御有效），注释里自己标的行号也经常是错的——请只看代码真实行为和真实行位，忽略注释声称的一切。
+3. 有些防御是**组合生效**的（A 单独不行 + B 单独不行 = AB 一起封死），请逐层拆开看，别只看单点。
+4. 如果硬编码的密钥/token 可以伪造会话或签名，从而**绕过看似存在的认证门**，这就是一条组合链，请写出来。
+5. 代码执行类的编号判别轴是**哪个解释器最终消费这个字符串**：shell 消费 → CWE-78（`execSync(shell:true)`、`["sh","-c",输入]` 都算，有无显式 shell 层不论）；`eval()`/`assert()`/`new Function()`/`preg_replace /e` 动态求值消费 → CWE-95/94 族（细分见判别笔记）；模板引擎把输入当代码渲染 → CWE-1336——三者别混。另外 `eval("var x = " + input)` 和 `eval(input)` 在我这里是同一类，别按"直接进 vs 拼接进"分成两种定性。
+6. 如果你是**从部署/运维角度**认为"这不会被打到"，那属于我的业务决策范围——请只报告代码层面可达的攻击面，部署上的事我自己判断。
+7. 如果某个判断**依赖我没贴出来的代码**（调用方、框架行为、运行环境、被截断的函数体），请显式标一句"样本外假设"——我要练习区分"代码内可证"和"凭经验猜测"。如果代码明显被截断了，直接告诉我要补哪段，别猜着补全分析。
+8. 我经常一条消息连发几个案例：**每个案例的行号、变量名、结论请逐条独立核对**——我遇到过把上一个样本的行号和结论串写到下一个样本的情况。
+9. 还有一类我容易漏的：**没有传统污点流的设计/配置缺陷**也请照实报告——弱协议/弱算法（TLS 1.0/SSL、MD5/SHA1——签名/MAC 用途和口令存储的快哈希都算）、不完整禁用列表/可绕过黑名单当防线、服务以 root 等过度权限运行（CWE-250）、可预测随机数生成令牌密钥（CWE-338）、禁用证书校验且无补偿控制（CWE-295）、硬编码凭证（CWE-798）——这些都给对应的 CWE。
+
+---
+
+## 样本类型说明
+
+你看到的代码有三种来源：
+- **单文件**：直接分析完整文件
+- **差分对**：同一个文件的两个版本（版本A、版本B）。请**分别独立分析**，版本A 的分析中不要参考版本 B 的任何内容；也不要因为"两个版本不一样"就预设哪个有问题——每个版本只按它自己的代码判
+- **文件切片**：大文件的一个片段，可能缺少上下文——不可达的方向请标注"样本外"
+
+**特殊：带官方结论的复核包**（包头标 `| redistill`，包内有"官方结论（待你验证）"区块）。这类是我自己推不稳的案例：把官方结论当作**待验证假设**，从代码出发推出支持它的完整证据链（污点路径/防御链逐行号）；如果你的推导确实到不了那个结论，写 `disagree: <哪一步断了、代码事实是什么>`——推不出来直说是有价值的，**禁止为凑结论编造不存在的行号、变量或数据流**。其中结论为"安全"的复核包：`防御:` 栏必须逐段给出**行号 + 什么机制 + 为什么不可旁路**，一句"已有校验"不合格。
+
+---
+
+## 我的判别笔记（结论里的 CWE 编号请按这份对齐；笔记本身整理错了也请直接指出）
+
+先问"注入的目标是什么"，再定编号：
+- sink 是 OS 程序执行 → CWE-78（**有没有 shell 层都算**，`["sh","-c",输入]` 也是 78）；注入的是"非 OS 的命令语言"（sed 脚本、IMAP/SMTP、应用配置语言）→ CWE-77；命令名固定、输入只落参数位 → CWE-88——**前提是输入能注入参数结构**（前导 `-`/`--` 被当新选项，如 `ssh -oProxyCommand=`、`tar --checkpoint-action=exec=`，或固定命令对该参数二次解析）；argv 单元素完整传递、无选项语义、无二次解析 = 无漏洞，别硬凑 88
+- 不可信数据进入 `eval()/exec()/Function()/preg_replace /e` 等**动态求值调用的求值位** → CWE-95——无论整段直传还是拼进代码文本（我查过 MITRE 4.20：95 是 94 的 Variant 子类，映射按更具体的 sink 优先，**拼接与否不影响 95 定位**；旧笔记"拼接主记 94"的统一口径已作废，统一主记 95，正文可注明旧口径差异）；拼出的代码**落盘后再执行**——写入 .py/.js/.sh 交解释器、存库后取出执行——正文注明 CWE-96；生成代码走**非求值器**的编译/执行路径（动态 import 之外的生成-编译链）或需父类兜底 → 94；输入进入**模板源码字符串位**被引擎渲染 → CWE-1336（`render(name=user)` 只是变量值，不算）；printf/format 的**格式串位**被控 → CWE-134；框架表达式求值器（SpEL/OGNL/EL）→ CWE-917；终端 ANSI/OSC 转义序列未净化 → CWE-150
+- sink 是 SQL（含 ORM raw）→ CWE-89；非 SQL 的查询逻辑（MongoDB 操作符、HQL）→ CWE-943（HQL 也有记 89 的惯例，本笔记统一 943，主编号别摇摆）；XPath → CWE-643；LDAP 过滤器 → CWE-90
+- 路径/文件名外部可控：出现 `../` 或等价目录上跳（含 `..\`、`%2e%2e%2f`、`..%c0%af`、symlink 逃逸）→ CWE-22；攻击者直接控绝对路径（如 `/etc/passwd`，无上跳）按本笔记也主记 22、正文可注明 CWE-73；仅文件名可控、目录不可控 → CWE-73
+- 未净化输入进入浏览器执行上下文（HTML/属性/JS 字符串）→ CWE-79，按**最终渲染上下文**判，不看变量叫什么
+- 不可信数据进反序列化器（readObject/pickle/unserialize）→ CWE-502（仅解析 JSON 等纯数据格式不算）。**受限反序列化器是有效防御**：`find_class`/resolve 白名单要同时满足（a）白名单内没有把输入当逻辑执行的构造器/方法、（b）可调用对象来源池封闭（REDUCE 链无法二段提升）才算防御有效。自写持久化通道（未验签的存储回读）算不算不可信输入看信任边界：攻击者取得该通道写入权的成本低于直接 RCE 成本 → 按 502 计，否则降为纵深防御缺失。XML 解析允许外部实体/DTD 且输入不可信 → CWE-611；把不可信流直接交给 JAXP 系列（`XPath.evaluate(InputSource,…)`、`Validator.validate(StreamSource)`、`Transformer.transform`）未设 `disallow-doctype-decl` 同样是 611，**`FEATURE_SECURE_PROCESSING` 不算有效防御**；纯实体膨胀 DoS（billion laughs、无外部实体）→ 正文注明 CWE-776，按 DoS 档定级
+- 服务端取回 URL 内容且目的地未校验 → CWE-918；借产品的身份/网络位置发请求（回环信任），最贴形是产品作为**非预期代理**把外部请求转交内部高权限服务 → CWE-441；内部服务"只信 localhost 所以不鉴权"按缺失认证/授权记 CWE-306/862，不算 441；骗浏览器跳转 → CWE-601
+- 没有授权检查 → CWE-862；查了但对象用户可控（IDOR）→ CWE-639；关键功能连认证都没有 → CWE-306；状态变更端点只靠自动携带的 Cookie、无 token/Origin 校验 → CWE-352。**SameSite 只有 Strict（或 Lax 且变更端点非 GET）才算一层防御**——Lax 在顶层导航 GET 上照带 Cookie；浏览器对未声明 SameSite 的 Cookie 默认按 Lax 处理，样本没写 SameSite 时别想当然按有防护算
+- JWT `alg=none` / 签名验证被禁用 → CWE-347（不是 327：不是算法弱，是验证被关了）
+- 用户可控动态键写入共享 dict/对象 → CWE-915（Python dict 没有原型链，禁止写"原型污染"叙事）；**JavaScript** 的 `obj[k]=v` 且 k 可为 `__proto__`/`constructor` → 正文注明 CWE-1321，同样不写"原型污染"字样敷衍、要写出完整链
+- 整数溢出/回绕：不可信输入进长度/偏移/索引/数量位，参与 `a + b`/`a * b`/移位/位掩码运算或宽窄类型转换后用于**边界检查、分配、拷贝、寻址**，且检查本身可被溢出绕过 → CWE-190（经典形态：`off + len > b.length` 在 `off+len` 溢出为负时放行，正确写法是 `len > b.length - off`）；JS 的索引回绕/负值规整缺陷（`index += origin`、位掩码寻址）同判；溢出结果没流向边界检查/分配/寻址的纯算术回绕不报或降档
+- 参数化/预编译/占位符查询 = SQL 注入的**有效防御，但只覆盖值位**；表名/列名/`ORDER BY` 字段/排序方向等标识符位不可绑定，回退拼接仍是 89——判"安全"前核对参数化覆盖了**所有**输入可达位；单点 replace/黑名单字符过滤 = **伪防御**（要核它漏了什么字符、作用位置对不对）
+- 硬编码凭证字面量用于认证/加密/签名 → CWE-798（"定义了但没使用"也是 798，风险降档即可；正文可加注更精确编号：在用且用于加密/签名的密钥 → CWE-321，未使用的配置项 → CWE-547）
+
+---
+
+## 风险等级我目前这么定（觉得哪条不合理，说出你的定法和理由）
+
+- Critical = 可达 RCE / 认证绕过 / 凭证直接泄露（认证门后就是 RCE 仍算 Critical）；"可达"要求**链上每一跳都在样本内可证**（路径、表名、组件行为全部代码内），任一跳依赖样本外（web root 可写、目标装有特定组件、上游权限）→ 记 High 并标"理论链"；凭证直接泄露限定为**可直接动用**的（私钥、数据库/服务账号口令、能伪造会话或签名的 secret），"像凭证但代码内无使用点"按 798 未使用降档
+- High = 注入类 / SSRF / XSS / 越权读写；没有利用链演示的理论 RCE 也记 High；等级按**组合链最坏情形**判，但同样受上一条"样本内可证"约束；Critical 与 High 两可时记 High 并写明理由，不虚高
+- Medium = 信息泄露 / 配置错误 / 有限 DoS / 定义未使用的硬编码凭证
+- Low = 影响极小
+
+---
+
+## 会话约定（以本提示词为准，不要自行增改）
+
+- 首条消息只有这段提示词、没有案例包时：直接给对判别笔记/风险等级的核对意见（有就写，没有只回"就绪"），然后等我发包，不要复述提示词。
+- 输出栏位以上面模板为准：**不新增"排除方向""次要发现"等独立栏位**——排除理由写进对应栏正文，次要发现并入修复栏前正文；自查清单**照常逐条打印**，不要改成静默执行。
+- 样本外假设不得单独支撑"存在漏洞=true"；整个判定悬在外部代码上时，列出需要我补的具体片段（调用点/类定义/函数体/依赖版本），能判的部分照判并标明影响范围。
+
+---
+
+## 输出末尾请自查
+
+- [ ] 每条分析第一行是否是 `### <案例编号> <版本>`？我发的每个案例、每个版本是否都各有一条分析？
+- [ ] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [ ] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [ ] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [ ] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [ ] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [ ] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [ ] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [ ] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（值位之外的表名/列名/排序位没有回退拼接）？
+
+最后：你的回复会被我原样归档进笔记库，请只写代码分析内容本身——不要客套话，不要"以下是分析""希望有帮助"之类的流程性文字。
+
+【代码审计案例包 | diffpair】
+
+### id=diffpair-corpus_00097 lang=javascript
+#### 版本A（318 行）
+```javascript
+'use strict'
+
+const http2 = require('node:http2')
+const fp = require('fastify-plugin')
+const { LruMap } = require('toad-cache')
+const querystring = require('fast-querystring')
+const fastContentTypeParse = require('fast-content-type-parse')
+const Stream = require('node:stream')
+const buildRequest = require('./lib/request')
+const {
+  filterPseudoHeaders,
+  copyHeaders,
+  stripHttp1ConnectionHeaders,
+  buildURL
+} = require('./lib/utils')
+
+const {
+  TimeoutError,
+  ServiceUnavailableError,
+  GatewayTimeoutError,
+  ConnectionResetError,
+  ConnectTimeoutError,
+  UndiciSocketError,
+  InternalServerError,
+  BadGatewayError
+} = require('./lib/errors')
+
+const { NGHTTP2_CANCEL } = http2.constants
+
+const fastifyReplyFrom = fp(function from (fastify, opts, next) {
+  const contentTypesToEncode = new Set([
+    'application/json',
+    ...(opts.contentTypesToEncode || [])
+  ])
+
+  const retryMethods = new Set(opts.retryMethods || [
+    'GET', 'HEAD', 'OPTIONS', 'TRACE'])
+
+  const cache = opts.disableCache ? undefined : new LruMap(opts.cacheURLs || 100)
+  const base = opts.base
+  const requestBuilt = buildRequest({
+    http: opts.http,
+    http2: opts.http2,
+    base,
+    sessionTimeout: opts.sessionTimeout,
+    undici: opts.undici,
+    globalAgent: opts.globalAgent,
+    destroyAgent: opts.destroyAgent
+  })
+
+  const isHttp2 = !!opts.http2
+  if (requestBuilt instanceof Error) {
+    next(requestBuilt)
+    return
+  }
+  const { request, close, retryOnError } = requestBuilt
+  const disableRequestLogging = opts.disableRequestLogging || false
+
+  fastify.decorateReply('from', function (source, opts) {
+    opts = opts || {}
+    const req = this.request.raw
+    const method = opts.method || req.method
+    const timeout = opts.timeout
+    const onResponse = opts.onResponse
+    const rewriteHeaders = opts.rewriteHeaders || headersNoOp
+    const rewriteRequestHeaders = opts.rewriteRequestHeaders || requestHeadersNoOp
+    const getUpstream = opts.getUpstream || upstreamNoOp
+    const onError = opts.onError || onErrorDefault
+    const retriesCount = opts.retriesCount || 0
+    const maxRetriesOn503 = opts.maxRetriesOn503 || 10
+    const retryDelay = opts.retryDelay || undefined
+
+    if (!source) {
+      source = req.url
+    }
+
+    // we leverage caching to avoid parsing the destination URL
+    const dest = getUpstream(this.request, base)
+    let url
+    if (cache) {
+      const cacheKey = dest + source
+      url = cache.get(cacheKey) || buildURL(source, dest)
+      cache.set(cacheKey, url)
+    } else {
+      url = buildURL(source, dest)
+    }
+
+    const sourceHttp2 = req.httpVersionMajor === 2
+    const headers = sourceHttp2 ? filterPseudoHeaders(req.headers) : { ...req.headers }
+    headers.host = url.host
+    const qs = getQueryString(url.search, req.url, opts, this.request)
+    let body = ''
+
+    if (opts.body !== undefined) {
+      if (opts.body !== null) {
+        if (typeof opts.body.pipe === 'function') {
+          throw new Error('sending a new body as a stream is not supported yet')
+        }
+
+        if (opts.contentType) {
+          body = opts.body
+        } else {
+          body = JSON.stringify(opts.body)
+          opts.contentType = 'application/json'
+        }
+
+        headers['content-length'] = Buffer.byteLength(body)
+        headers['content-type'] = opts.contentType
+      } else {
+        body = undefined
+        headers['content-length'] = 0
+        delete headers['content-type']
+      }
+    } else if (this.request.body) {
+      if (this.request.body instanceof Stream) {
+        body = this.request.body
+      } else {
+        // Per RFC 7231 §3.1.1.5 if this header is not present we MAY assume application/octet-stream
+        let contentType = 'application/octet-stream'
+        if (req.headers['content-type']) {
+          const plainContentType = fastContentTypeParse.parse(req.headers['content-type'])
+          contentType = plainContentType.type
+        }
+
+        const shouldEncodeJSON = contentTypesToEncode.has(contentType)
+        // transparently support JSON encoding
+        body = shouldEncodeJSON ? JSON.stringify(this.request.body) : this.request.body
+        // update origin request headers after encoding
+        headers['content-length'] = Buffer.byteLength(body)
+        headers['content-type'] = contentType
+      }
+    }
+
+    // according to https://tools.ietf.org/html/rfc2616#section-4.3
+    // fastify ignore message body when it's a GET or HEAD request
+    // when proxy this request, we should reset the content-length to make it a valid http request
+    // discussion: https://github.com/fastify/fastify/issues/953
+    if (method === 'GET' || method === 'HEAD') {
+      // body will be populated here only if opts.body is passed.
+      // if we are doing that with a GET or HEAD request is a programmer error
+      // and as such we can throw immediately.
+      if (body) {
+        throw new Error(`Rewriting the body when doing a ${method} is not allowed`)
+      }
+    }
+
+    !disableRequestLogging && this.request.log.info({ source }, 'fetching from remote server')
+
+    const requestHeaders = rewriteRequestHeaders(this.request, headers)
+    const contentLength = requestHeaders['content-length']
+    let requestImpl
+
+    const getDefaultDelay = (req, res, err, retries) => {
+      if (retryMethods.has(method) && !contentLength) {
+        // Magic number, so why not 42? We might want to make this configurable.
+        let retryAfter = 42 * Math.random() * (retries + 1)
+
+        if (res?.headers['retry-after']) {
+          retryAfter = res.headers['retry-after']
+        }
+        if (res && res.statusCode === 503 && req.method === 'GET') {
+          if (retriesCount === 0 && retries < maxRetriesOn503) {
+            return retryAfter
+          }
+        } else if (retriesCount > retries && err && err.code === retryOnError) {
+          return retryAfter
+        }
+      }
+      return null
+    }
+
+    if (retryDelay) {
+      requestImpl = createRequestRetry(request, this, (req, res, err, retries) => retryDelay({ err, req, res, attempt: retries, getDefaultDelay, retriesCount }))
+    } else {
+      requestImpl = createRequestRetry(request, this, getDefaultDelay)
+    }
+
+    requestImpl({ method, url, qs, headers: requestHeaders, body, timeout }, (err, res) => {
+      if (err) {
+        this.request.log.warn(err, 'response errored')
+        if (!this.sent) {
+          if (err.code === 'ERR_HTTP2_STREAM_CANCEL' || err.code === 'ENOTFOUND') {
+            onError(this, { error: ServiceUnavailableError() })
+          } else if (err instanceof TimeoutError || err.code === 'UND_ERR_HEADERS_TIMEOUT') {
+            onError(this, { error: new GatewayTimeoutError() })
+          } else if (err.code === 'ECONNRESET') {
+            onError(this, { error: new ConnectionResetError() })
+          } else if (err.code === 'UND_ERR_SOCKET') {
+            onError(this, { error: new UndiciSocketError() })
+          } else if (err.code === 'UND_ERR_CONNECT_TIMEOUT') {
+            onError(this, { error: new ConnectTimeoutError() })
+          } else {
+            onError(this, { error: new InternalServerError(err.message) })
+          }
+        }
+        return
+      }
+      !disableRequestLogging && this.request.log.info('response received')
+      if (sourceHttp2) {
+        copyHeaders(
+          rewriteHeaders(stripHttp1ConnectionHeaders(res.headers), this.request),
+          this
+        )
+      } else {
+        copyHeaders(rewriteHeaders(res.headers, this.request), this)
+      }
+      try {
+        this.code(res.statusCode)
+      } catch (err) {
+        // Since we know `FST_ERR_BAD_STATUS_CODE` will be recieved
+        onError(this, { error: new BadGatewayError() })
+        this.request.log.warn(err, 'response has invalid status code')
+      }
+      if (this.request.raw.aborted && isHttp2) {
+        // the request could have been canceled before we got a response from the target
+        // forward this to the upstream server and close the stream to prevent leaks
+        res.stream.close(NGHTTP2_CANCEL)
+        // no need to send a reply for aborted requests or call the onResponse callback
+        return
+      }
+      if (onResponse) {
+        onResponse(this.request, this, res)
+      } else {
+        this.send(res.stream)
+      }
+    })
+    return this
+  })
+
+  fastify.addHook('onReady', (done) => {
+    if (isFastifyMultipartRegistered(fastify)) {
+      fastify.log.warn('@fastify/reply-from might not behave as expected when used with @fastify/multipart')
+    }
+    done()
+  })
+
+  fastify.onClose((_fastify, next) => {
+    close()
+    // let the event loop do a full run so that it can
+    // actually destroy those sockets
+    setImmediate(next)
+  })
+  next()
+}, {
+  fastify: '5.x',
+  name: '@fastify/reply-from'
+})
+
+function getQueryString (search, reqUrl, opts, request) {
+  if (typeof opts.queryString === 'function') {
+    return '?' + opts.queryString(search, reqUrl, request)
+  }
+
+  if (opts.queryString) {
+    return '?' + querystring.stringify(opts.queryString)
+  }
+
+  if (search.length > 0) {
+    return search
+  }
+
+  const queryIndex = reqUrl.indexOf('?')
+
+  if (queryIndex > 0) {
+    return reqUrl.slice(queryIndex)
+  }
+
+  return ''
+}
+
+function headersNoOp (headers, _originalReq) {
+  return headers
+}
+
+function requestHeadersNoOp (_originalReq, headers) {
+  return headers
+}
+
+function upstreamNoOp (_req, base) {
+  return base
+}
+
+function onErrorDefault (reply, { error }) {
+  reply.send(error)
+}
+
+function isFastifyMultipartRegistered (fastify) {
+  return fastify.hasPlugin('@fastify/multipart')
+}
+
+function createRequestRetry (requestImpl, reply, retryHandler) {
+  function requestRetry (req, cb) {
+    let retries = 0
+
+    function run () {
+      requestImpl(req, function (err, res) {
+        const retryDelay = retryHandler(req, res, err, retries)
+        if (!reply.sent && retryDelay) {
+          return retry(retryDelay)
+        }
+        cb(err, res)
+      })
+    }
+
+    function retry (after) {
+      retries += 1
+      setTimeout(run, after)
+    }
+
+    run()
+  }
+
+  return requestRetry
+}
+
+module.exports = fastifyReplyFrom
+module.exports.default = fastifyReplyFrom
+module.exports.fastifyReplyFrom = fastifyReplyFrom
+```
+#### 版本B（320 行）
+```javascript
+'use strict'
+
+const http2 = require('node:http2')
+const fp = require('fastify-plugin')
+const { LruMap } = require('toad-cache')
+const querystring = require('fast-querystring')
+const fastContentTypeParse = require('fast-content-type-parse')
+const Stream = require('node:stream')
+const buildRequest = require('./lib/request')
+const {
+  filterPseudoHeaders,
+  copyHeaders,
+  stripHttp1ConnectionHeaders,
+  buildURL
+} = require('./lib/utils')
+
+const {
+  TimeoutError,
+  ServiceUnavailableError,
+  GatewayTimeoutError,
+  ConnectionResetError,
+  ConnectTimeoutError,
+  UndiciSocketError,
+  InternalServerError,
+  BadGatewayError
+} = require('./lib/errors')
+
+const { NGHTTP2_CANCEL } = http2.constants
+
+const fastifyReplyFrom = fp(function from (fastify, opts, next) {
+  const contentTypesToEncode = new Set([
+    'application/json',
+    ...(opts.contentTypesToEncode || [])
+  ])
+
+  const retryMethods = new Set(opts.retryMethods || [
+    'GET', 'HEAD', 'OPTIONS', 'TRACE'])
+
+  const cache = opts.disableCache ? undefined : new LruMap(opts.cacheURLs || 100)
+  const base = opts.base
+  const requestBuilt = buildRequest({
+    http: opts.http,
+    http2: opts.http2,
+    base,
+    sessionTimeout: opts.sessionTimeout,
+    undici: opts.undici,
+    globalAgent: opts.globalAgent,
+    destroyAgent: opts.destroyAgent
+  })
+
+  const isHttp2 = !!opts.http2
+  if (requestBuilt instanceof Error) {
+    next(requestBuilt)
+    return
+  }
+  const { request, close, retryOnError } = requestBuilt
+  const disableRequestLogging = opts.disableRequestLogging || false
+
+  fastify.decorateReply('from', function (source, opts) {
+    opts = opts || {}
+    const req = this.request.raw
+    const method = opts.method || req.method
+    const timeout = opts.timeout
+    const onResponse = opts.onResponse
+    const rewriteHeaders = opts.rewriteHeaders || headersNoOp
+    const rewriteRequestHeaders = opts.rewriteRequestHeaders || requestHeadersNoOp
+    const getUpstream = opts.getUpstream || upstreamNoOp
+    const onError = opts.onError || onErrorDefault
+    const retriesCount = opts.retriesCount || 0
+    const maxRetriesOn503 = opts.maxRetriesOn503 || 10
+    const retryDelay = opts.retryDelay || undefined
+
+    if (!source) {
+      const requestUrl = req.url
+      const queryIndex = requestUrl.indexOf('?')
+      source = queryIndex >= 0 ? requestUrl.substring(0, queryIndex) : requestUrl
+    }
+
+    // we leverage caching to avoid parsing the destination URL
+    const dest = getUpstream(this.request, base)
+    let url
+    if (cache) {
+      const cacheKey = dest + source
+      url = cache.get(cacheKey) || buildURL(source, dest)
+      cache.set(cacheKey, url)
+    } else {
+      url = buildURL(source, dest)
+    }
+
+    const sourceHttp2 = req.httpVersionMajor === 2
+    const headers = sourceHttp2 ? filterPseudoHeaders(req.headers) : { ...req.headers }
+    headers.host = url.host
+    const qs = getQueryString(url.search, req.url, opts, this.request)
+    let body = ''
+
+    if (opts.body !== undefined) {
+      if (opts.body !== null) {
+        if (typeof opts.body.pipe === 'function') {
+          throw new Error('sending a new body as a stream is not supported yet')
+        }
+
+        if (opts.contentType) {
+          body = opts.body
+        } else {
+          body = JSON.stringify(opts.body)
+          opts.contentType = 'application/json'
+        }
+
+        headers['content-length'] = Buffer.byteLength(body)
+        headers['content-type'] = opts.contentType
+      } else {
+        body = undefined
+        headers['content-length'] = 0
+        delete headers['content-type']
+      }
+    } else if (this.request.body) {
+      if (this.request.body instanceof Stream) {
+        body = this.request.body
+      } else {
+        // Per RFC 7231 §3.1.1.5 if this header is not present we MAY assume application/octet-stream
+        let contentType = 'application/octet-stream'
+        if (req.headers['content-type']) {
+          const plainContentType = fastContentTypeParse.parse(req.headers['content-type'])
+          contentType = plainContentType.type
+        }
+
+        const shouldEncodeJSON = contentTypesToEncode.has(contentType)
+        // transparently support JSON encoding
+        body = shouldEncodeJSON ? JSON.stringify(this.request.body) : this.request.body
+        // update origin request headers after encoding
+        headers['content-length'] = Buffer.byteLength(body)
+        headers['content-type'] = contentType
+      }
+    }
+
+    // according to https://tools.ietf.org/html/rfc2616#section-4.3
+    // fastify ignore message body when it's a GET or HEAD request
+    // when proxy this request, we should reset the content-length to make it a valid http request
+    // discussion: https://github.com/fastify/fastify/issues/953
+    if (method === 'GET' || method === 'HEAD') {
+      // body will be populated here only if opts.body is passed.
+      // if we are doing that with a GET or HEAD request is a programmer error
+      // and as such we can throw immediately.
+      if (body) {
+        throw new Error(`Rewriting the body when doing a ${method} is not allowed`)
+      }
+    }
+
+    !disableRequestLogging && this.request.log.info({ source }, 'fetching from remote server')
+
+    const requestHeaders = rewriteRequestHeaders(this.request, headers)
+    const contentLength = requestHeaders['content-length']
+    let requestImpl
+
+    const getDefaultDelay = (req, res, err, retries) => {
+      if (retryMethods.has(method) && !contentLength) {
+        // Magic number, so why not 42? We might want to make this configurable.
+        let retryAfter = 42 * Math.random() * (retries + 1)
+
+        if (res?.headers['retry-after']) {
+          retryAfter = res.headers['retry-after']
+        }
+        if (res && res.statusCode === 503 && req.method === 'GET') {
+          if (retriesCount === 0 && retries < maxRetriesOn503) {
+            return retryAfter
+          }
+        } else if (retriesCount > retries && err && err.code === retryOnError) {
+          return retryAfter
+        }
+      }
+      return null
+    }
+
+    if (retryDelay) {
+      requestImpl = createRequestRetry(request, this, (req, res, err, retries) => retryDelay({ err, req, res, attempt: retries, getDefaultDelay, retriesCount }))
+    } else {
+      requestImpl = createRequestRetry(request, this, getDefaultDelay)
+    }
+
+    requestImpl({ method, url, qs, headers: requestHeaders, body, timeout }, (err, res) => {
+      if (err) {
+        this.request.log.warn(err, 'response errored')
+        if (!this.sent) {
+          if (err.code === 'ERR_HTTP2_STREAM_CANCEL' || err.code === 'ENOTFOUND') {
+            onError(this, { error: ServiceUnavailableError() })
+          } else if (err instanceof TimeoutError || err.code === 'UND_ERR_HEADERS_TIMEOUT') {
+            onError(this, { error: new GatewayTimeoutError() })
+          } else if (err.code === 'ECONNRESET') {
+            onError(this, { error: new ConnectionResetError() })
+          } else if (err.code === 'UND_ERR_SOCKET') {
+            onError(this, { error: new UndiciSocketError() })
+          } else if (err.code === 'UND_ERR_CONNECT_TIMEOUT') {
+            onError(this, { error: new ConnectTimeoutError() })
+          } else {
+            onError(this, { error: new InternalServerError(err.message) })
+          }
+        }
+        return
+      }
+      !disableRequestLogging && this.request.log.info('response received')
+      if (sourceHttp2) {
+        copyHeaders(
+          rewriteHeaders(stripHttp1ConnectionHeaders(res.headers), this.request),
+          this
+        )
+      } else {
+        copyHeaders(rewriteHeaders(res.headers, this.request), this)
+      }
+      try {
+        this.code(res.statusCode)
+      } catch (err) {
+        // Since we know `FST_ERR_BAD_STATUS_CODE` will be recieved
+        onError(this, { error: new BadGatewayError() })
+        this.request.log.warn(err, 'response has invalid status code')
+      }
+      if (this.request.raw.aborted && isHttp2) {
+        // the request could have been canceled before we got a response from the target
+        // forward this to the upstream server and close the stream to prevent leaks
+        res.stream.close(NGHTTP2_CANCEL)
+        // no need to send a reply for aborted requests or call the onResponse callback
+        return
+      }
+      if (onResponse) {
+        onResponse(this.request, this, res)
+      } else {
+        this.send(res.stream)
+      }
+    })
+    return this
+  })
+
+  fastify.addHook('onReady', (done) => {
+    if (isFastifyMultipartRegistered(fastify)) {
+      fastify.log.warn('@fastify/reply-from might not behave as expected when used with @fastify/multipart')
+    }
+    done()
+  })
+
+  fastify.onClose((_fastify, next) => {
+    close()
+    // let the event loop do a full run so that it can
+    // actually destroy those sockets
+    setImmediate(next)
+  })
+  next()
+}, {
+  fastify: '5.x',
+  name: '@fastify/reply-from'
+})
+
+function getQueryString (search, reqUrl, opts, request) {
+  if (typeof opts.queryString === 'function') {
+    return '?' + opts.queryString(search, reqUrl, request)
+  }
+
+  if (opts.queryString) {
+    return '?' + querystring.stringify(opts.queryString)
+  }
+
+  if (search.length > 0) {
+    return search
+  }
+
+  const queryIndex = reqUrl.indexOf('?')
+
+  if (queryIndex > 0) {
+    return reqUrl.slice(queryIndex)
+  }
+
+  return ''
+}
+
+function headersNoOp (headers, _originalReq) {
+  return headers
+}
+
+function requestHeadersNoOp (_originalReq, headers) {
+  return headers
+}
+
+function upstreamNoOp (_req, base) {
+  return base
+}
+
+function onErrorDefault (reply, { error }) {
+  reply.send(error)
+}
+
+function isFastifyMultipartRegistered (fastify) {
+  return fastify.hasPlugin('@fastify/multipart')
+}
+
+function createRequestRetry (requestImpl, reply, retryHandler) {
+  function requestRetry (req, cb) {
+    let retries = 0
+
+    function run () {
+      requestImpl(req, function (err, res) {
+        const retryDelay = retryHandler(req, res, err, retries)
+        if (!reply.sent && retryDelay) {
+          return retry(retryDelay)
+        }
+        cb(err, res)
+      })
+    }
+
+    function retry (after) {
+      retries += 1
+      setTimeout(run, after)
+    }
+
+    run()
+  }
+
+  return requestRetry
+}
+
+module.exports = fastifyReplyFrom
+module.exports.default = fastifyReplyFrom
+module.exports.fastifyReplyFrom = fastifyReplyFrom
+```

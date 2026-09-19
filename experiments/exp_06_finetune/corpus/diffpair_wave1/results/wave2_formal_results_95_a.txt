@@ -1,0 +1,270 @@
+### wave2-95-01 版本A
+入口: L4 配置文件通道（open(path) 读 rules.json，L5 `json.load(f)`）参数 rules["predicate"]，L9 进入求值 | 次要: L3 path 形参可改配置来源（调用方样本外，非攻击面）
+链: L4 `open(path, encoding="utf-8")` 读入配置 → L5 `json.load(f)` 解析出 rules["predicate"] 字符串 → L9 `eval(rules["predicate"])` 执行任意 Python 表达式（eval 未传 globals/locals，直接获得模块全局含 `__builtins__`、json、load_rules 及调用方局部 order、rules）。L8 注释声称"运营后台可被租户改写"，该写入链不在样本内，租户能否写 rules.json 标样本外假设
+防御: 无 —— L3-L9 之间无白名单、无 AST 校验、无沙箱；eval 使用默认完整命名空间，L8 注释不可作为防御证据
+载荷: rules.json 中写入 `"predicate": "__import__('os').system('id') or True"` → L9 eval 执行系统命令并返回真值（`__import__` 经默认 globals 可达）
+组合链: 样本外运营后台写权限 → L9 eval RCE → 同进程读取 order/rules 与运行环境凭证（若低权租户可写规则，即任意租户→服务器 RCE）
+锚句: 非 CWE-78 因最终消费该字符串的是 Python eval 求值器而非 OS shell；非 CWE-96 因表达式直接在求值位消费，未落盘/入库后再执行
+结论: 存在漏洞=true | CWE-95 动态求值代码中指令未正确中和（"Eval Injection"） | High
+修复: L9 移除 eval；把 rules["predicate"] 改为结构化规则（json 已在 L5 使用，无需新依赖），如 {"field":"vip","op":"gt","value":0}，在 L9-L11 用 order[r["field"]] 与比较运算符原生实现；rules.json 的写入口（样本外运营后台）按租户隔离并审核。若必须保留表达式能力，需新增导入标准库 ast 做白名单解析（样本内未导入，属新增依赖）
+
+### wave2-95-01 版本B
+入口: L10 配置文件通道（open/rules.json，L11 `json.load(f)`）参数 rules["predicate"]，L25 传入 restricted_eval | 次要: L9 path 形参可改配置来源（调用方样本外）
+链: 未发现可达污点流，原因: sink 前防御封死 —— L14 `ast.parse(expr, mode="eval")` 只产语法树，L15-L21 逐节点白名单校验通过后才到 L22 `eval(compile(tree, "<rule>", "eval"), ...)`，任意表达式无法以未校验节点抵达求值位
+防御:
+  L16 节点类型白名单 ALLOWED_NODES → 有效: ast.Call/ast.Subscript/ast.Import/ast.BinOp 均不在 L4-L6 元组内，`__import__("os").system("id")` 在 L15 ast.walk 时命中未放行节点即 L17 raise
+  L18 Attribute 白名单 + L20 Name 白名单 → 有效: 属性链逃逸起点被封死——`order.__class__` 的 attr `__class__` 不在 ALLOWED_ATTRS（L18 拦截），裸名 `__import__`/`__builtins__` 不在 ALLOWED_ATTRS（L20 拦截）
+  L22 `{"__builtins__": {}}` → 有效（纵深）: 与前两层组合生效，即使有漏网名字也无内建可取
+载荷: 无能跑通的利用；`"predicate": "__import__('os').system('id')"` 在 L16 命中 ast.Call 抛 ValueError("node not allowed")；`"order.__class__"` 在 L18 抛 ValueError("attr not allowed")
+组合链: 无（入口即便被样本外租户控制，L16+L18+L20+L22 组合后无可达危险操作）
+锚句: 非 CWE-95 因 L22 的 eval 只消费经 L15-L21 校验的受限 AST；非 CWE-94 因无代码生成/落盘/编译执行链
+结论: 存在漏洞=false | 无 | 无
+修复: 次要功能缺陷: L20 的 Name 白名单复用 ALLOWED_ATTRS 但未含 "order"，导致 L25 传入的任何引用 order 的合法规则（如 "order.vip == true"）都在 L20 被 raise——白名单意外过严，规则引擎实际不可用；如需恢复功能，把 "order" 单独加入 Name 白名单（L18 的 Attribute attr 白名单保持不变，dunder 属性仍被拒，不削弱防御）
+
+自查清单:
+- [x] 每条分析第一行为 `### wave2-95-01 版本A|版本B`，A/B 各一条
+- [x] 行号按包内代码片段 1 起算全部真实；load_rules、apply_discount、restricted_eval、ALLOWED_NODES、ALLOWED_ATTRS、order、rules 均在代码中出现
+- [x] 版本A判"有漏洞"已逐条排除防御（样本内无校验层；eval 未传 globals，空 builtins 不适用已写明）
+- [x] 版本B判"安全"已枚举全部入口（rules.json 配置文件、L9 path 形参）并逐段核验 L16/L18/L20/L22 三层防御
+- [x] 版本A分析未引用版本B；结论只来自各版本自身代码
+- [x] "租户可写 rules.json"依赖样本外写入链，已标样本外假设
+- [x] 未串写其他样本的行号/结论
+- [x] 调用方/写入口缺失处未猜补，标样本外
+- [x] 版本B判"安全"未依据参数化；白名单已核对全部输入可达位（节点类型/属性/名字三层，eval locals 仅 order 键）
+
+### wave2-95-02 版本A
+入口: L1 配置文件通道（require("./rules.json")）参数 config.eligibilityExpr，L5 进入求值 | 次要: 无
+链: L1 `require("./rules.json")` 读入配置 → L5 `eval(config.eligibilityExpr)` 在 eligible 作用域内直接求值（直接 eval 的作用域链含模块级 require）→ L5 求值结果立即以 `(user)` 调用。L4 注释声称"运营端可改写"，rules.json 写入链样本内不可证，标样本外假设
+防御: 无 —— L1-L5 之间无白名单、无结构化校验；eval 直接消费配置字符串且处于模块函数作用域（非间接 eval）
+载荷: rules.json 中写入 `"eligibilityExpr": "function(u){ return require('child_process').execSync('id').toString().length > 0 }"` → L5 eval 返回该函数并以 user 调用，execSync 执行系统命令
+组合链: 样本外运营端写权限 → eval RCE → 读取进程环境变量与部署凭证
+锚句: 非 CWE-94 因 new Function/编译落盘链不存在，是 eval 直接求值位（按判别笔记统一主记 95，拼接与否不影响定位）；非 CWE-78 因消费字符串的是 JS 求值器而非 OS shell
+结论: 存在漏洞=true | CWE-95 动态求值代码中指令未正确中和（"Eval Injection"） | High
+修复: L5 移除 eval；把 eligibilityExpr 改为结构化规则对象 {op,field,value}，在 L5 用显式 if/比较运算符实现固定几种 op，取键前用 Object.prototype.hasOwnProperty.call 做自有属性校验（JS 内建）；同时收紧样本外运营端对 rules.json 的写权限
+
+### wave2-95-02 版本B
+入口: L1 配置文件通道（require("./rules.json")）参数 config.eligibilityTree，L12 读入、L13/L14 作映射键 | 次要: 无
+链: 未发现可达污点流，原因: sink 前防御封死 —— L13/L14 只在 OPS/FIELDS 固定映射表中查函数，配置值永不进入求值器；L16 中 rule.value 只作为比较操作数
+防御:
+  L5-L7/L9 映射表白名单（键→固定函数） → 有效: eligibilityTree 无字符串→代码的求值位，op/field 必须命中映射表才能取到函数
+  L15 `if (!fn || !field) return false` → 有效: 未知 op/field 直接拒绝，无回退拼接路径
+  残余: L13/L14 `OPS[rule.op]`/`FIELDS[rule.field]` 沿原型链查找 → 伪防御（边界）: rule.op=`"constructor"` 命中继承的 Object 构造器（truthy）通过 L15，使 L16 退化为恒真调用——但影响仅限比较语义（与写入方直接配一条 value 极低的合法规则等价），无代码执行，且 rules.json 写入权本身在样本外，故不构成可利用漏洞，列加固项
+载荷: 无可执行利用；`{"op":"constructor","field":"constructor","value":1}` 只让 L16 返回普通对象（truthy），不触达任何求值器
+组合链: 无
+锚句: 非 CWE-95 因 L5-L16 无 eval/new Function，输入只落函数查找键与比较操作数位；非 CWE-1321 因 L13/L14 是读侧键查找，未发生 obj[k]=v 的原型属性写入
+结论: 存在漏洞=false | 无 | 无
+修复: 次要: L13/L14 取键前用 `Object.prototype.hasOwnProperty.call(OPS, rule.op)`（JS 内建）限定自有属性，堵 `"constructor"`/`"__proto__"` 等继承键；L12 对 config.eligibilityTree 缺失无判空（为 undefined 时 L13 取 rule.op 抛 TypeError），建议与 L15 一致回退 false
+
+自查清单:
+- [x] 每条分析第一行为 `### wave2-95-02 版本A|版本B`，A/B 各一条
+- [x] 行号按包内代码片段 1 起算全部真实；config、eligible、OPS、FIELDS、rule、fn、field 均在代码中出现
+- [x] 版本A判"有漏洞"已逐条排除防御（样本内无校验层已写明）
+- [x] 版本B判"安全"已枚举全部入口（rules.json 配置通道）并核验映射表白名单与 L15 回退；L13/L14 原型链键残余如实列边界并说明为何不构成漏洞
+- [x] 版本A分析未引用版本B；结论只来自各版本自身代码
+- [x] "运营端写 rules.json"依赖样本外写入链，已标样本外假设
+- [x] 未串写其他样本的行号/结论
+- [x] 缺调用方未猜补，标样本外
+- [x] 版本B判"安全"未依据参数化；映射键位（含继承键边界）已逐项核对
+
+### wave2-95-03 版本A
+入口: L7 HTTP 通道（GET /leaderboard，Flask request.args）参数 key | 次要: L8 load_rows 未在样本内定义（样本外假设，仅影响程序可运行性，不在污点路径）
+链: L7 `request.args.get("key", "row.score")` 取得攻击者完全可控字符串 → L10 `rows.sort(key=lambda row: eval(key_expr), reverse=True)` 在排序键位执行任意 Python 表达式（eval 未传 globals，含 `__builtins__`）。污点链 L7→L10 每一跳均在样本内可证
+防御: 无 —— L7-L10 之间无字段白名单、无 AST 校验、无沙箱；eval 默认命名空间完整
+载荷: `GET /leaderboard?key=__import__('os').popen('id').read()`（空格/括号按需 URL 编码）→ L10 lambda 首次求值即执行命令，输出作为排序键返回值
+组合链: 匿名可达（样本内 L5-L11 未见任何鉴权装饰器/会话校验）→ 无条件 RCE → 读取服务端环境与数据
+锚句: 非 CWE-78 因 sink 是 Python eval 求值器而非 shell 派生；非 CWE-89 因无 SQL 消费位，rows.sort 是进程内内存排序
+结论: 存在漏洞=true | CWE-95 动态求值代码中指令未正确中和（"Eval Injection"） | Critical
+修复: L10 前加 `if key not in {"score","timestamp","name"}: return "bad key", 400`（集合字面量与语言内建），L10 改 `rows.sort(key=attrgetter(key), reverse=True)` 或 `key=lambda row: getattr(row, key)`（getattr 为内建）；彻底移除 eval
+
+### wave2-95-03 版本B
+入口: L9 HTTP 通道（GET /leaderboard，request.args）参数 key | 次要: L12 load_rows 样本外未定义（非污点位）
+链: 未发现可达污点流，原因: sink 前防御封死 —— L10 白名单拒绝后，L13 `attrgetter(key)` 只消费命中固定集合的属性名，无字符串→代码求值路径
+防御:
+  L5 KEY_FIELDS 集合白名单 → 有效: 仅 score/timestamp/name 可通过，`score.__class__`、`__import__` 等不在集合内在 L10 被拒并返回 400
+  L13 attrgetter(key) → 有效: attrgetter 按属性名取值（固定 getattr 语义），不把 key 当代码编译执行
+载荷: 无；`?key=__import__('os').popen('id').read()` 被 L10 拒绝，返回 400 "bad key"
+组合链: 无
+锚句: 非 CWE-95 因 L13 无求值器消费 key 字符串；非 CWE-73/22 因 key 只落属性名位，不进文件路径
+结论: 存在漏洞=false | 无 | 无
+修复: 次要: rows 元素若缺少白名单属性，L13 attrgetter 抛 AttributeError；可在 L13 前用内建 getattr(rows[0], key, None) 做存在性探测，仅健壮性建议
+
+自查清单:
+- [x] 每条分析第一行为 `### wave2-95-03 版本A|版本B`，A/B 各一条
+- [x] 行号按包内代码片段 1 起算全部真实；key_expr、load_rows、KEY_FIELDS、attrgetter 均在代码中出现
+- [x] 版本A判"有漏洞"已逐条排除防御（样本内无校验层已写明），Critical 依据污点链 L7→L10 每跳样本内可证
+- [x] 版本B判"安全"已枚举全部入口（HTTP query）并核验 L5 集合白名单 + L13 attrgetter
+- [x] 版本A分析未引用版本B；结论只来自各版本自身代码
+- [x] load_rows 未定义、依赖样本外，已标样本外假设
+- [x] 未串写其他样本的行号/结论
+- [x] 缺 load_rows 定义未猜补，标样本外
+- [x] 版本B判"安全"未依据参数化；key 只落属性名位、无其他输入可达位已核对
+
+### wave2-95-04 版本A
+入口: L3 HTTP 通道（$_GET['segment']）参数 segment | 次要: L4 load_users 未在样本内定义（样本外假设，非污点位）
+链: L3 `$_GET['segment'] ?? 'true'` 取得攻击者完全可控字符串 → L8 `eval("return {$segment};")` 双引号插值后把 segment 作为 PHP 代码执行（eval 共享当前变量作用域，无沙箱）。污点链 L3→L8 每一跳均在样本内可证；L7 注释称营销后台租户可控，写入链样本外，标样本外假设
+防御: 无 —— L3-L8 之间无白名单、无模式校验、无沙箱
+载荷: `GET /api/segment.php?segment=system('id')` → L8 执行 `return system('id');`，命令执行且输出随响应回显、返回值作真值判定
+组合链: 匿名可达（样本内无会话/鉴权检查）→ RCE → 结合 L4 用户数据源（样本外）进一步窃取数据
+锚句: 非 CWE-78 因主 sink 是 PHP eval 求值位（eval 内再调 system 属二段触达，主判 95）；非 CWE-79 因注入位是服务端代码求值而非浏览器渲染上下文
+结论: 存在漏洞=true | CWE-95 动态求值代码中指令未正确中和（"Eval Injection"） | Critical
+修复: L8 移除 eval；segment 改为数组条件（segment[op]=gt&segment[field]=spend&segment[value]=100），L8 前用 `in_array($cond['op'], ['gt','eq','in'], true)` 与 `in_array($cond['field'], ['vip','spend','age'], true)` 双白名单校验后做原生比较（in_array 为 PHP 内建）
+
+### wave2-95-04 版本B
+入口: L16 HTTP 通道（$_GET['segment']）参数 segment（可标量可数组），L17 归一后 L21 传入 evalCondition | 次要: L18 load_users 样本外未定义（非污点位）
+链: 未发现可达污点流，原因: sink 前防御封死 —— L10 对 op/field 双白名单校验，L13 只能调用 L3-L5 三个固定箭头函数，比较值只落操作数位，样本内无 eval
+防御:
+  L10 `isset($ALLOWED_OPS[$cond['op']])` → 有效: op 只能命中 L3-L5 的 in/gt/eq 三键，`segment[op]=system` 直接 L11 return false；键未设时 isset 短路同样拒绝
+  L10 `in_array($cond['field'], $ALLOWED_FIELDS, true)` 严格白名单 → 有效: field 仅 vip/spend/age，L13 的 `$u[$cond['field']]` 取值位被封死，无任意属性/超全局触达
+  L17 `is_array($segment) ? $segment : []` → 有效: 标量 segment 退化为空数组，evalCondition 走 L10 return false
+载荷: 无；`?segment[op]=gt&segment[field]=spend&segment[value]=1` 仅产生普通整数比较
+组合链: 无
+锚句: 非 CWE-95 因样本内已无 eval 调用位；非 CWE-88 因 op/field 由白名单数组承载且无命令结构可注入
+结论: 存在漏洞=false | 无 | 无
+修复: 次要: L3 'in' 用非严格 in_array、L5 'eq' 用 ==，PHP 弱比较存在类型戏法（如 value 数组含 0 与数字字符串字段比较）导致规则语义漂移，建议统一严格比较（in_array($a,$b,true) 与 ===）
+
+自查清单:
+- [x] 每条分析第一行为 `### wave2-95-04 版本A|版本B`，A/B 各一条
+- [x] 行号按包内代码片段 1 起算全部真实；$segment、$ALLOWED_OPS、$ALLOWED_FIELDS、evalCondition、$cond、$u 均在代码中出现
+- [x] 版本A判"有漏洞"已逐条排除防御（样本内无校验层已写明），Critical 依据污点链 L3→L8 每跳样本内可证
+- [x] 版本B判"安全"已枚举全部入口（$_GET 标量/数组两种形态）并核验 L10 双白名单 + L17 归一
+- [x] 版本A分析未引用版本B；结论只来自各版本自身代码
+- [x] load_users 定义与营销后台写链依赖样本外，已标样本外假设
+- [x] 未串写其他样本的行号/结论
+- [x] 缺 load_users 定义未猜补，标样本外
+- [x] 版本B判"安全"未依据参数化；op/field/value 三个输入可达位均已核对，弱比较残余已列次要
+
+### wave2-95-05 版本A
+入口: L5 配置文件通道（cp.read("alerts.ini")）参数 [alert] expression，L7 取出、L8-L9 求值 | 次要: L12/L15/L18 的 SENSORS 读数非攻击面
+链: L5 `cp.read("alerts.ini")` 读入配置 → L7 `cp.get("alert", "expression")` 取得表达式字符串 → L8 `compile(expr, "<alert>", "eval")` 编译 → L9 `eval(code, ...)` 执行。配置中心下发/租户可编辑的写入链（L6 注释）样本内不可证，标样本外假设
+防御:
+  L9 `{"__builtins__": {}}` → 伪防御: 置空内建只封名字查找，不封字面量属性遍历——`().__class__.__bases__[0].__subclasses__()` 从空元组出发即可枚举全部已加载类，再经 `__init__.__globals__` 取回模块函数，空 builtins 沙箱对字面量逃逸无效
+载荷: alerts.ini 写入 `[alert] expression = [c for c in ().__class__.__bases__[0].__subclasses__() if c.__name__=='_wrap_close'][0].__init__.__globals__['system']('id')` → L9 eval 求值期间执行系统命令（_wrap_close 由 os 模块定义，本进程是否已加载 os 依赖运行环境，标样本外假设；类列表随 Python 版本有差异）
+组合链: 配置中心下发权（样本外）→ 空 builtins 逃逸 RCE → 读取进程环境与传感器数据源凭证
+锚句: 非 CWE-94 因 compile+eval 是直接求值位消费字符串，无生成代码落盘/编译链（按判别笔记主记 95）；非 CWE-502 因无反序列化器参与
+结论: 存在漏洞=true | CWE-95 动态求值代码中指令未正确中和（"Eval Injection"） | High
+修复: L8-L9 移除 compile/eval；expression 改为结构化数值阈值（configparser 已在 L1 导入、现成方法）: ini 存 cpu_max/mem_max，L9 用原生比较 `cpu_load() > cp.getfloat("alert","cpu_max") or mem_use() > cp.getfloat("alert","mem_max")`；若必须保留表达式，需新增导入标准库 ast 做白名单解析
+
+### wave2-95-05 版本B
+入口: L11 配置文件通道（cp.read("alerts.ini")）参数 [alert] expression，L12 取出、L13 ast.parse | 次要: L23/L26/L29 的 SENSORS 读数非攻击面
+链: 未发现可达污点流，原因: sink 前防御封死 —— L14-L18 双白名单校验后，L19-L20 的 eval 只消费受限 AST，且求值命名空间仅 cpu/mem 两个变量、builtins 为空
+防御:
+  L15-L16 节点类型白名单 → 有效: ast.Attribute/ast.Call/ast.Subscript/ast.BinOp 不在 L4-L6 表内，`().__class__...` 属性链在 L14 ast.walk 时命中 Attribute 即 L16 raise
+  L17-L18 名字白名单 → 有效: 裸名仅允许 cpu/mem（L7 ALLOWED_NAMES），`__import__`/`__class__` 等名字直接拒绝
+  L19-L20 `{"__builtins__": {}}` → 有效（纵深）: 与前两层组合生效
+载荷: 无；`expression = ().__class__.__bases__[0].__subclasses__()` 在 L15 命中 ast.Attribute 抛 ValueError("node not allowed")
+组合链: 无
+锚句: 非 CWE-95 因 L19 eval 只消费经 L14-L18 校验的 AST，无任意表达式可达求值位；非 CWE-400 因放行节点仅常量与单变量比较，无资源放大构造
+结论: 存在漏洞=false | 无 | 无
+修复: 次要: ALLOWED_NODES 未含 ast.USub，`-cpu > 0.9` 这类合法阈值会在 L15 被拒（功能偏严非安全缺陷）；如需支持，将 ast.USub 加入 L5 元组即可，求值侧无需改动
+
+自查清单:
+- [x] 每条分析第一行为 `### wave2-95-05 版本A|版本B`，A/B 各一条
+- [x] 行号按包内代码片段 1 起算全部真实；alert_threshold_from_config、ALLOWED_NODES、ALLOWED_NAMES、cpu_load、mem_use、read_sensor、SENSORS 均在代码中出现
+- [x] 版本A判"有漏洞"已逐条排除唯一防御（L9 空 builtins）并给出字面量逃逸 payload
+- [x] 版本B判"安全"已枚举全部入口（alerts.ini 配置文件）并逐段核验 L15/L17/L19 三层防御
+- [x] 版本A分析未引用版本B；结论只来自各版本自身代码
+- [x] 配置中心/租户写权与 payload 类列表依赖环境，均已标样本外假设
+- [x] 未串写其他样本的行号/结论
+- [x] 缺配置中心实现未猜补，标样本外
+- [x] 版本B判"安全"未依据参数化；节点类型/名字位全部输入可达位已核对
+
+### wave2-95-06 版本A
+入口: L5 环境变量通道（os.environ.get("ALERT_FORMULA")）参数 ALERT_FORMULA | 次要: L5 缺省值为常量，非攻击面
+链: L5 `os.environ.get("ALERT_FORMULA", "events / total * 100 > 5")` 取得表达式 → L6 `eval(formula, {"__builtins__": {}}, {...})` 执行。L4 注释称运维可在部署环境注入，注入前提（部署环境控制权）样本内不可证，标样本外假设
+防御:
+  L6 `{"__builtins__": {}}` → 伪防御: 空 builtins 不封字面量属性遍历——`[].__class__.__base__.__subclasses__()` 枚举已加载类后经 `__init__.__globals__` 取回模块函数；L1 `import os` 使 os 自身必在逃逸终点可达
+载荷: 环境变量 `ALERT_FORMULA=[c for c in ().__class__.__bases__[0].__subclasses__() if c.__name__=='_wrap_close'][0].__init__.__globals__['system']('id')` → L6 eval 求值期间执行系统命令（os 由本文件 L1 导入保证 _wrap_close 已加载；类下标经列表推导按类名定位，随 CPython 版本差异标样本外假设）
+组合链: 部署环境变量注入权（样本外，如 CI/CD 或容器 env 注入）→ eval 逃逸 RCE → 同进程窃取凭证
+锚句: 非 CWE-94 因无 compile/代码生成链，eval 为直接求值位（主记 95）；非 CWE-78 因消费字符串的是 Python 求值器而非 OS shell
+结论: 存在漏洞=true | CWE-95 动态求值代码中指令未正确中和（"Eval Injection"） | High
+修复: L5-L6 移除 eval；ALERT_FORMULA 改为数值阈值环境变量（如 ALERT_THRESHOLD），L6 用原生比较 `events / total * 100 > float(os.environ.get("ALERT_THRESHOLD","5"))`（os 与内建 float 均现成）；环境变量写权属部署面，由运维侧收敛（样本外）
+
+### wave2-95-06 版本B
+入口: L14 环境变量通道（os.environ.get("ALERT_FORMULA")）参数 ALERT_FORMULA，L15 ast.parse | 次要: 无
+链: 未发现可达污点流，原因: sink 前防御封死 —— L16-L18 节点白名单 + L20-L29 自写树遍历解释器，formula 字符串全程无任何求值器消费
+防御:
+  L16-L18 节点类型白名单 → 有效: ast.Call/ast.Attribute/ast.Subscript 不在 L5-L7 表内，属性链逃逸构造在 L16 ast.walk 时被 L18 raise 拒绝
+  L20-L29 自写解释器 → 有效: 求值只走 L8-L11 的 operator 映射（add/sub/mul/truediv/gt/lt/ge/le/eq），L28 名字仅解析 events/total 两键、未知键 KeyError 即失败关闭；样本内不存在 eval/compile 消费点
+载荷: 无；`ALERT_FORMULA=__import__("os").system("id")` 在 L17 命中 ast.Call 抛 ValueError("node not allowed")
+组合链: 无
+锚句: 非 CWE-95 因 formula 仅被 ast.parse 解析为语法树，无任何动态求值调用；非 CWE-190 因 BinOp 走 Python 原生大整数/浮点运算，无宽窄类型转换参与边界检查/寻址
+结论: 存在漏洞=false | 无 | 无
+修复: 次要: L22 对 total=0（如常量表达式 `events/0>1`）抛 ZeroDivisionError、L28 未知名字抛 KeyError，均未捕获；建议 L22 前判零回退、L28 改 .get 后显式 raise 统一异常类型（operator.truediv 已在 L9 使用），仅健壮性
+
+自查清单:
+- [x] 每条分析第一行为 `### wave2-95-06 版本A|版本B`，A/B 各一条
+- [x] 行号按包内代码片段 1 起算全部真实；compute_alert_rate、formula、ev、OPS、CMP、ALLOWED_NODES 均在代码中出现
+- [x] 版本A判"有漏洞"已逐条排除唯一防御（L6 空 builtins）并给出逃逸 payload
+- [x] 版本B判"安全"已枚举全部入口（环境变量）并核验 L16-L18 白名单 + L20-L29 解释器、确认无 eval 消费点
+- [x] 版本A分析未引用版本B；结论只来自各版本自身代码
+- [x] 环境变量注入权与 payload 类列表环境差异，均已标样本外假设
+- [x] 未串写其他样本的行号/结论
+- [x] 缺部署环境信息未猜补，标样本外
+- [x] 版本B判"安全"未依据参数化；BinOp/Compare/Constant/Name 全部输入可达位的求值映射已逐项核对
+
+### wave2-95-07 版本A
+入口: L5 HTTP 通道（POST /filters/preview，express.json body）参数 predicate | 次要: L7 rows 同为请求参数（数量位，可叠 DoS）
+链: L6 `const { predicate } = req.body` 取得完整谓词字符串 → L10 `new Function("item", `return (${predicate});`)` 把其编译为函数体 → L14 `rows.filter(fn)` 执行编译出的任意代码。污点链 L6→L10→L14 每一跳均在样本内可证
+防御: 无 —— L10 的 try/catch 只捕获语法错误后返回 400（L12），不限制函数体内容；new Function 体运行于全局作用域，Node 的 process 全局可达
+载荷: `curl -X POST http://127.0.0.1:8080/filters/preview -H 'Content-Type: application/json' -d '{"predicate":"process.mainModule.require('child_process').execSync('id').toString().length>0","rows":[{}]}'` → L14 filter 执行函数体，execSync 运行命令（process.mainModule 依赖应用作为主模块启动，标样本外假设）
+组合链: 匿名可达（L1-L18 无鉴权中间件）→ RCE → 读环境变量/凭证；另 L7 rows 数量与 L10 谓词复杂度可控，可叠加资源耗尽
+锚句: 非 CWE-78 因最终消费字符串的是 V8 的 Function 编译器而非 shell 派生；非 CWE-94 因 new Function 即动态求值位，按判别笔记统一主记 95
+结论: 存在漏洞=true | CWE-95 动态求值代码中指令未正确中和（"Eval Injection"） | Critical
+修复: L10 移除 new Function；rule 改结构 {op,field,value}，L14 用固定映射（op→比较函数、field→取值函数）+ Object.prototype.hasOwnProperty.call 自有属性校验后 `rows.filter(item => opFn(fieldFn(item), rule.value))`（均为 JS 内建）
+
+### wave2-95-07 版本B
+入口: L12 HTTP 通道（POST /filters/preview body）参数 rule（op/field/value），L15/L16 作映射键 | 次要: L14 rows 由请求方自带
+链: 未发现可达污点流，原因: sink 前防御封死 —— L15/L16 只查固定映射表，L18 输入只落比较操作数位，样本内无编译/求值器
+防御:
+  L5-L10 OPS/FIELDS 映射表白名单 → 有效: 输入不再进入任何 new Function/eval（求值路径已消除），op/field 命中映射表才取到函数
+  L17 `if (!op || !field) return res.status(400)...` → 有效: 未知 op/field 直接拒绝
+  残余: L15/L16 `OPS[rule && rule.op]` 沿原型链查找 → 伪防御（边界）: rule.op=`"constructor"` 命中继承的 Object 构造器通过 L17，L18 退化为恒真；rule.field=`"toString"` 使 field(item) 变为 item.toString()——但 L14 rows 由请求方自带、L19 仅回 count，无服务端数据可泄露或触达，不构成可利用漏洞，列加固项
+载荷: 无安全利用；`{"rule":{"op":"constructor","field":"constructor","value":1},"rows":[{"a":1}]}` 仅使 L18 对每行返回 truthy（count=rows.length），属语义退化
+组合链: 无
+锚句: 非 CWE-95 因 L5-L19 无 eval/new Function/编译位；非 CWE-639 因 rows 由请求方提供（L14），不存在服务端对象按 key 越权读取
+结论: 存在漏洞=false | 无 | 无
+修复: L15/L16 取键前用 `Object.prototype.hasOwnProperty.call(OPS, rule.op)` / `call(FIELDS, rule.field)`（JS 内建）限定自有属性，堵 `"constructor"`/`"__proto__"`/`"toString"` 继承键；次要: L14 对 rows 非数组未校验（rows 为对象时 L18 filter 抛 TypeError→500），建议 Array.isArray 归一（内建）
+
+自查清单:
+- [x] 每条分析第一行为 `### wave2-95-07 版本A|版本B`，A/B 各一条
+- [x] 行号按包内代码片段 1 起算全部真实；predicate、fn、OPS、FIELDS、rule、out 均在代码中出现
+- [x] 版本A判"有漏洞"已逐条排除防御（try/catch 只捕语法错误已写明），Critical 依据污点链 L6→L10→L14 每跳样本内可证
+- [x] 版本B判"安全"已枚举全部入口（POST body 的 rule 与 rows）并核验映射表白名单 + L17 回退；原型链键残余如实列边界
+- [x] 版本A分析未引用版本B；结论只来自各版本自身代码
+- [x] process.mainModule 依赖应用启动方式，已标样本外假设
+- [x] 未串写其他样本的行号/结论
+- [x] 缺部署/启动方式未猜补，标样本外
+- [x] 版本B判"安全"未依据参数化；op/field 键位与 value 操作数位全部输入可达位已核对
+
+### wave2-95-08 版本A
+入口: L9 内部 API 传参通道（check 方法参数 ruleExpr） | 次要: L10 注释称由运营后台下发，写入链样本外
+链: L11-L12 `engine.put("spend", spend)`/`engine.put("vip", vip)` 绑定变量 → L13 `engine.eval(ruleExpr)` 在 js 引擎（Nashorn/GraalJS）中执行任意脚本。污点链 L9→L13 样本内可证；引擎的 Java 桥接默认行为依赖 JDK 版本/引擎实现，标样本外假设
+防御: 无 —— L13 eval 未设置任何脚本沙箱/ClassFilter/白名单；L11-L12 的 put 只是把变量送入脚本作用域，不构成防御
+载荷: `ruleExpr = "java.lang.Runtime.getRuntime().exec('id')"`（Nashorn 默认暴露 java 命名空间）或 `"Java.type('java.lang.Runtime').getRuntime().exec('id')"` → L13 eval 期间执行系统命令（引擎可用性依赖环境: JDK15+ 无内建 Nashorn 时 L7 getEngineByName("js") 返回 null，标样本外假设）
+组合链: 运营后台写权限（样本外）→ L13 任意脚本 → 经 Java 桥 RCE → 读取应用凭证；L7 engine 为实例字段，脚本还可污染引擎全局状态影响后续调用
+锚句: 非 CWE-94 因 ScriptEngine.eval 即脚本求值位，按判别笔记统一主记 95（无生成源码再编译链）；非 CWE-78 因消费字符串的是 JS 引擎而非 OS shell（脚本内触达 Runtime.exec 属二段）
+结论: 存在漏洞=true | CWE-95 动态求值代码中指令未正确中和（"Eval Injection"） | High
+修复: L13 移除脚本引擎，ruleExpr 改结构化条件: 用枚举 Field/Op + switch 原生比较（语言内建），删除 L3-L4 导入与 L7 引擎实例；若业务确需脚本，须换用支持 ClassFilter/禁用 Java 桥的引擎配置（依赖引擎版本与选项，样本外）
+
+### wave2-95-08 版本B
+入口: L10 内部 API 传参通道（check 方法参数 Condition c、spend、vip） | 次要: 调用方如何从外部输入构造 Condition 样本外
+链: 未发现可达污点流，原因: 入口不可控达成危险位 —— c.field()/c.op() 为枚举类型（L5-L6），取值域编译期封死；L11-L19 只做原生 int 比较，无字符串求值/反射/执行位
+防御:
+  L5-L6 枚举约束 + L8 record 类型 → 有效: field/op 只能是枚举实例，任意字符串无法表达非法操作；value 仅 int，只落比较操作数位
+  L11-L14 与 L15-L19 switch 穷举（无 default、无反射） → 有效: actual 与 c.value() 只参与 >/>=/== 原生比较，不存在语义逃逸
+载荷: 无；不存在能让 L11-L19 执行任意语义的输入形态
+组合链: 无
+锚句: 非 CWE-95 因样本内无脚本引擎或任何求值器；非 CWE-88 因操作符由枚举承载而非命令参数结构，无选项注入面
+结论: 存在漏洞=false | 无 | 无
+修复: 次要: 调用方若从 JSON 反序列化 Condition（样本外），建议关闭未知枚举值容忍策略；L8 record 未做 value 值域校验，无安全影响，仅契约建议
+
+自查清单:
+- [x] 每条分析第一行为 `### wave2-95-08 版本A|版本B`，A/B 各一条
+- [x] 行号按包内代码片段 1 起算全部真实；ScriptEngine、ScriptEngineManager、engine、check、Condition、Field、Op 均在代码中出现
+- [x] 版本A判"有漏洞"已逐条排除防御（无沙箱、put 非防御已写明）
+- [x] 版本B判"安全"已枚举全部入口（方法参数通道）并核验 L5-L6 枚举 + L8 record + L11-L19 switch 穷举
+- [x] 版本A分析未引用版本B；结论只来自各版本自身代码
+- [x] ruleExpr 下发链、引擎 java 桥行为、JDK15+ 引擎可用性，均已标样本外假设
+- [x] 未串写其他样本的行号/结论
+- [x] 缺调用方与运行环境未猜补，标样本外
+- [x] 版本B判"安全"未依据参数化；取值域由类型系统封死、无其他输入可达位已核对

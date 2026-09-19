@@ -1,0 +1,182 @@
+### wave2-95-11 版本A
+入口: L6 方法参数（内部 API 传参）`ruleScript` | 次要: L6 `amount`（double 数值，不构成污点）
+    说明: 「租户在定价控制台编辑」来自注释与调用方，调用方代码未在样本内——外部可达性属样本外假设；但 L6→L10 对入参的无条件求值在样本内可证。
+链: L6 `ruleScript` 入参 → L8 `new GroovyShell()`（未传入任何 CompilerConfiguration，无沙箱配置）→ L10 `shell.evaluate(ruleScript)` 以 Groovy 解释器在求值位消费整段脚本 → 脚本内可直达 `Runtime`/`ProcessBuilder` 执行 OS 命令
+防御:
+  无——L8 `new GroovyShell()` 未配置任何定制器/限制，L10 求值前对 `ruleScript` 无校验、无白名单、无净化。
+载荷: `ruleScript` 取值 `"id".execute().text; 1`：Groovy 对字符串调用 `execute()` 起进程执行 `id`，末行补 `1` 使返回值为 Number 以通过 L11 `((Number) out).doubleValue()` 强转（即便强转失败，命令也已执行）。等价形式 `["sh","-c","id"].execute().text`。
+组合链: 租户可编辑定价规则（样本外假设）→ discount() 无沙箱求值 → Groovy 任意代码执行 → 读取进程环境/数据库凭证 → 横向。
+锚句: 非 CWE-78 因 字符串首先由 Groovy 解释器在动态求值位消费，OS 命令是求值结果内的后续影响；非 CWE-94 因 按 MITRE 4.20 口径 95 是 94 的 Variant、sink 是动态求值位，主记 95。
+结论: 存在漏洞=true | CWE-95 Eval Injection | High
+修复: L10 不应无条件求值租户文本：改为受限 DSL——预置规则常量表查表执行（`ruleScript` 仅作键）；若业务必须保留动态脚本，须在 L8 构造 shell 时启用编译期 AST 白名单（限定可调用接收者类与 Token 集）后再在 L10 求值，并在 L6 入口侧对 ruleScript 来源做服务端鉴权与审计。需补样本：`discount` 的全部调用点，以确认租户输入是否真达此处。
+
+### wave2-95-11 版本B
+入口: L9 方法参数（内部 API 传参）`ruleScript` | 次要: L9 `amount`（double，不构成污点）
+链: 未发现可达污点流，原因: sink 前防御封死——L18 `shell.evaluate(ruleScript)` 所用 shell 由 L16 `new GroovyShell(cfg)` 构造，`cfg` 在 L14-15 挂载 L10-13 配置的 `SecureASTCustomizer`，脚本在求值前经编译期 AST 校验，非白名单构造编译即拒。
+防御:
+  L11 `setDisallowedMethods(List.of("execute", "invokeMethod"))` → 单独看是伪防御: 名称黑名单，`getRuntime`、`start` 等其它方法名不受限，方法指针/动态方法名可绕开名称检查；仅作为 L12 的补充层，不作为安全依据。
+  L12 `setAllowedReceivers(List.of(java.lang.Math.class.getName(), java.lang.Double.class.getName()))` → 有效: 方法调用接收者类型的编译期白名单——`Runtime.getRuntime()`、`new ProcessBuilder("id").start()`、`"id".execute()` 的接收者类型（Runtime/ProcessBuilder/String）均不在白名单，标准静态类型解析下编译即拒；白名单内 Math/Double 无危险方法。这是主防线，故 L11 黑名单可被绕过不改变结论。
+  L13 `setIndirectImportCheckEnabled(true)` → 有效(辅助): 对代码中以全限定名直接引用且未导入的类加编译期检查，压缩 `new java.lang.ProcessBuilder(...)` 这类构造器引用空间。
+  残余面（样本外假设）: 构造器调用、语句与 Token 未配置白名单；接收者校验依赖编译期静态类型推断，动态类型接收者是否 fail-closed、闭包体覆盖范围随 Groovy 版本而异。这些残余均依赖样本外库版本行为，不能单独支撑"存在漏洞=true"；需补: 生产 Groovy 版本号、对 `def o = 动态值; o.execute()` 形态的编译实测。
+载荷: 无能跑通的利用。尝试 1: `"id".execute()` → 名称 `execute` 被 L11 拒且接收者 String 不在 L12 白名单；尝试 2: `new java.lang.ProcessBuilder("id").start()` → `start()` 接收者 ProcessBuilder 被 L12 拒（构造器本身未受限属残余面）；尝试 3: `Runtime.getRuntime().exec("id")` → 接收者 Runtime 被 L12 拒。
+组合链: 无——L12 单层白名单已封死常规执行路径；若未来放宽 L12，L11 名称黑名单不构成后备防线。
+锚句: 非 CWE-78 因 无字符串进入 OS 执行层，输入先被编译期 AST 校验拦截；非 CWE-94 因 sink 仍为动态求值位，按笔记口径主记 95（残余评估对象同为 95）。
+结论: 存在漏洞=false | CWE-95 Eval Injection | Low
+修复: L10 之后补全白名单维度——`setAllowedConstructors` 与 Token 级白名单（`SecureASTCustomizer` 已在 L4 导入，对应 setter 均存在），把"允许什么"而非"禁止什么"作为唯一依据；并以生产 Groovy 版本对动态接收者形态做编译实测（样本外验证）。L11 黑名单保留但不作为安全依据。
+
+自查清单（95-11）:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？我发的每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？（入口仅方法参数，样本内无配置/环境变量等通道）
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？（已列: `discount` 调用点缺失）
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（值位之外的表名/列名/排序位没有回退拼接）？（本包无 SQL sink）
+
+### wave2-95-12 版本A
+入口: L9 HTTP GET /report query 参数 `filter`（`request.args.get("filter", ...)`）| 次要: L8 `load_orders()` 未在样本内定义（样本外假设: 返回含 `amount` 列的 DataFrame）
+链: L9 `expr` 取参 → L11 `df.query(expr, engine="python")` 将整段未净化文本交给 pandas 表达式求值器（`engine="python"` 走 Python `eval` 语义的求值路径）→ 表达式注入 → （样本外假设: 具体逃逸面随 pandas 版本）逃逸至属性链/builtins 执行 OS 命令
+防御:
+  无——L11 直接把 query 参数作为表达式求值；pandas 官方文档明确 `query`/`eval` 不可用于不可信输入。L10 注释与真实行为一致，但注释不作为依据。
+载荷: `GET /report?filter=exec%28%22import%20os%3Bos.system%28%27id%27%29%22%29`（即 `filter=exec("import os;os.system('id')")`）；保守验证注入面: `?filter=amount.__class__`。exec/builtins 是否暴露、Call 节点是否被 pandas 求值器放行随 pandas 版本而定——样本外假设；表达式文本进入求值器本身样本内可证。
+组合链: 表达式注入 → pandas 求值器逃逸（样本外假设）→ OS 命令 → 凭证/订单数据外带。
+锚句: 非 CWE-89 因 全程无 SQL 文本，`query()` 是 DataFrame 过滤不是 SQL sink；非 CWE-943 因 表达式由 Python 语义求值器消费而非查询引擎，污染位是求值位。
+结论: 存在漏洞=true | CWE-95 Eval Injection | High
+修复: L9 改为拆分参数 col/op/value；L11 弃用 `query()` 文本求值，改为「列白名单（如 `{"amount","qty"}`）+ 运算符查表（内联 lambda 字典如 `{">": lambda a,b: a>b}`，无需新依赖）+ 值类型收敛」生成布尔掩码后 `df[mask]`。需补样本: `load_orders` 定义以确认可用列。
+
+### wave2-95-12 版本B
+入口: L16 HTTP query 参数 `col`、L17 `op`、L18 `value` | 次要: L15 `load_orders()`（样本外）
+链: 未发现可达污点流，原因: sink 前防御封死——L19 `build_mask(df, col, op, ...)` 内 L9-10 白名单先校验 `col`/`op`，L11 `CMP[op](df[col], value)` 仅以查表得到的比较函数生成布尔 Series，输入从不进入任何求值器；L20 `df[mask]` 只消费布尔掩码。
+防御:
+  L9 `if col not in ALLOWED_COLS or op not in CMP`（L5 `ALLOWED_COLS = {"amount", "qty"}`、L6 `CMP` 四运算符字典）→ 有效: 列名先于取列校验，注入形态（如 `amount);__import__`、`amount > 0 and ...`）在 L10 即抛 `ValueError`；op 只能命中四个固定键。
+  L11 `CMP[op](df[col], value)` → 有效: 运算符以查表方式选择，不存在字符串拼接进表达式文本的路径。
+  L19 `type(df[col].iloc[0])(value)` → 有效: 以首行单元格类型（int/float/str 等）作构造器收敛 value——构造器不是求值器，无代码执行面；类型来自数据而非攻击者可注入的代码。
+  残余: L19 对空 DataFrame 抛 `IndexError`（500，功能性）；列类型为字符串时按字符串比较（功能性）。均非代码执行。
+载荷: 无能跑通的利用——`?col=amount&op=>&value=100` 为正常路径；`?col=amount);__import__%28%22os%22%29&op=>&value=1` 在 L9 被拒。
+组合链: 无。
+锚句: 非 CWE-89 因 列名仅用于 DataFrame 索引，无 SQL 文本；非 CWE-79 因 输出为 `to_json` 的数值序列，无 HTML/属性渲染位。
+结论: 存在漏洞=false | CWE-95 Eval Injection | Low
+修复: 无安全必修。次要发现: L19 前判 `df[col].empty` 防空表 500（pandas API 已在用）；L15 `load_orders` 未在样本内（样本外）。
+
+自查清单（95-12）:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？我发的每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？（入口仅 query 参数 col/op/value，样本内无其它通道）
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？（已列: `load_orders` 定义缺失）
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（值位之外的表名/列名/排序位没有回退拼接）？（本包无 SQL sink，列名位已由 L9 白名单覆盖）
+
+### wave2-95-13 版本A
+入口: L8 HTTP GET /integrate query 参数 `expr`（`request.args.get("expr", "x**2")`）
+链: L8 `expr_text` 取参 → L10 `sympy.sympify(expr_text)` → sympify 内部以 Python `eval` 求值输入文本（官方文档明示不可用于不可信输入）→ 任意 Python 表达式执行
+防御:
+  无——L10 直接求值；L9 注释所述行为与代码一致，但不作为依据。
+载荷: `GET /integrate?expr=__import__%28%22os%22%29.system%28%22id%22%29`（sympify 的求值命名空间由 `from sympy import *` 构造，`__builtins__` 随之可用，`__import__` 直达；该命名空间细节属 sympy 库行为——样本外假设）。更稳的属性链形态: `().__class__.__bases__[0].__subclasses__()...`。
+组合链: 表达式求值 → 命名空间逃逸（样本外假设）→ OS 命令 → 数据外带。
+锚句: 非 CWE-78 因 消费位是 Python 求值器不是 shell；非 CWE-502 因 无反序列化器参与。
+结论: 存在漏洞=true | CWE-95 Eval Injection | High
+修复: L10 前对 `expr_text` 做语法白名单校验后再交 sympify——新增 stdlib `import ast`，`ast.parse(mode="eval")` 后 `ast.walk` 逐节点校验（仅允许算术节点与常量，`ast.Name` 限定 `x`，禁止 Call/Attribute/Subscript），校验失败直接 400。次要发现: L12 `str(...)` 经 Flask 默认以 text/html 返回，`expr=Symbol("...")` 注入的符号名会被原样反射——修复后应显式以 JSON 响应包装返回值。
+
+### wave2-95-13 版本B
+入口: L11 HTTP GET /integrate query 参数 `expr`
+链: 未发现可达污点流，原因: sink 前防御封死——L12 `ast.parse(expr_text, mode="eval")` 后，L13-17 对整棵语法树逐节点白名单校验，L18 `sympify` 收到的文本被约束为纯算术表达式。且按代码真实行为，根节点类型 `ast.Expression`（`ast.parse(mode="eval")` 的返回类型）不在 L6-7 白名单内，L13 `ast.walk` 首个产出的即根节点、L14-15 立即抛 `ValueError`——任何输入（含默认值 `x**2`）都无法到达 L18，fail-closed。
+防御:
+  L13 `ast.walk(tree)` + L14-15 `isinstance(node, ALLOWED_NODES)`（L6-7 仅含 BinOp/UnaryOp/Constant/Name/Load 与 Add/Sub/Mult/Div/Pow/USub/UAdd）→ 有效: 逃逸必需的 `ast.Call`/`ast.Attribute`/`ast.Subscript`/`ast.Lambda` 一律不在白名单；walk 覆盖全部节点（含 `//`、`%`、矩阵乘等运算符子节点，均被拒）；且根节点 `ast.Expression` 本身被拒 → 校验对一切输入无条件失败，不存在任何可绕过输入。
+  L16-17 `isinstance(node, ast.Name) and node.id != "x"` → 有效: 即便根节点问题修复，可引用的名字只有 `x`，`__import__`/`eval`/`open` 等名无法出现。
+  L18 `sympify` → 有效: 可达输入仅为纯算术表达式，求值位无可调用对象（未知名按 sympy 语义落为 Symbol，运算符重载限于数学运算）。
+载荷: 无——任何输入（含默认 `x**2`）在 L13-15 因根节点 `ast.Expression` 不在 L6-7 白名单被拒，L18 不可达。
+组合链: 无。
+残余: 功能性缺陷——白名单未包含 `ast.Expression`（或未从 `tree.body` 起遍历），端点对所有请求 500（安全上 fail-closed，非漏洞）；修复后 `x**9**9**9` 类指数爆炸仍可造成 CPU 消耗（次要 DoS）。
+锚句: 非 CWE-190 因 Pow 指数不参与边界检查/分配/寻址，溢出无安全后果；非 CWE-79 因 端点不可达且输出为数学结果文本。
+结论: 存在漏洞=false | CWE-95 Eval Injection | Low
+修复: L6-7 白名单元组加入 `ast.Expression`（最小修复）以恢复功能；如需防资源耗尽，对 `ast.Pow` 的指数 Constant 设数值上限；L16-17、L18 保持不变。
+
+自查清单（95-13）:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？我发的每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？（入口仅 query 参数 expr）
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？（sympify 命名空间细节、ast 根节点行为按 stdlib 标准语义判定）
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（值位之外的表名/列名/排序位没有回退拼接）？（本包无 SQL sink）
+
+### wave2-95-14 版本A
+入口: L5 HTTP POST /reports/pivot 参数 `formula`（`params['formula']`，query/form 通道）| 次要: L4 `JSON.parse(request.body.read)` 请求体（纯数据解析，非污点 sink）
+链: L5 `formula` 取参 → L7 `rows.map { |x| eval(formula) }` 以 Ruby `eval` 求值整段攻击者文本 → 任意 Ruby 代码执行 → `system`/反引号执行 OS 命令
+防御:
+  无——L5 无校验、L7 直接求值；L6 注释与真实行为一致但不作为依据。
+载荷: `POST /reports/pivot?formula=system%28%27id%27%29`，请求体 `[1]`（须非空数组，否则 `map` 不执行块、eval 不触发）→ `eval("system('id')")` 在路由上下文内调用 Kernel#system 执行 `id`。
+组合链: 路由无认证（L3 仅 `post '/reports/pivot'`，样本内无任何 auth 中间件）→ 匿名 eval RCE → 读取环境变量/凭证 → 横向。每一跳均样本内可证。
+锚句: 非 CWE-78 因 输入由 Ruby 解释器在 eval 求值位消费，OS 命令是脚本内后续可达影响；非 CWE-502 因 `JSON.parse` 只生成数据结构，未进入对象反序列化器。
+结论: 存在漏洞=true | CWE-95 Eval Injection | Critical
+修复: L7 弃用 eval——用常量公式表替代: 预置 `FORMULAS = {'double' => ->(x){x*2}, ...}`，`formula` 仅作 Hash 键，查不到即 `halt 400`（Sinatra 的 halt 为框架既有能力）；L4 前补 `require 'json'`（当前文件缺失，能否解析依赖 sinatra 是否传递加载 json——样本外假设）并限制请求体大小。次要发现: 无认证门这一点独立于 eval 缺陷成立。
+
+### wave2-95-14 版本B
+入口: L10 HTTP POST /reports/pivot 参数 `formula` | 次要: L9 请求体 `JSON.parse`（纯数据）
+链: 未发现可达污点流，原因: 常量传播——L11 `fn = ALLOWED_FORMULAS[formula]` 把输入仅作 Hash 键做精确匹配，命中的是 L4-6 预置的三个 lambda 之一，L13 `fn.call(x.to_f)` 执行的是代码内常量闭包；输入文本从不进入任何求值器。
+防御:
+  L4-6 `ALLOWED_FORMULAS`（`.freeze`，三个预置 lambda）→ 有效: 动态公式面被替换为封闭集合，不存在按文本生成代码的路径。
+  L11 Hash 精确键匹配 → 有效: `system('id')`、`x*2; system(...)` 等任何注入串都不是合法键，查表结果为 nil。
+  L12 `halt 400, 'bad formula' unless fn` → 有效: 未命中即中断响应，fail-closed。
+  L13 `fn.call(x.to_f)` → 有效: 元素先收敛为 Float 再进入预置 lambda，无求值面。
+载荷: 无能跑通的利用——`?formula=system('id')` 在 L12 得 400；`?formula=double` 仅执行 `x * 2`。
+组合链: 无。
+锚句: 非 CWE-502 因 JSON 是纯数据格式解析；非 CWE-79 因 `to_json` 输出数值数组，无 HTML 渲染位。
+结论: 存在漏洞=false | CWE-95 Eval Injection | Low
+修复: 无安全必修。次要发现: L9 未限制请求体大小（大数组可拉高内存/时延）；L13 对 Hash/Array 元素 `to_f` 抛 NoMethodError（500），可按需收敛元素类型。
+
+自查清单（95-14）:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？我发的每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？（入口为 params['formula'] 与请求体，请求体仅经纯数据 JSON.parse）
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？（sinatra 是否传递加载 json 库）
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？（已列: 版本A 缺 `require 'json'`）
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（值位之外的表名/列名/排序位没有回退拼接）？（本包无 SQL sink）
+
+### wave2-95-15 版本A
+入口: L8 HTTP POST /rule/engine JSON 体 `rule`（`body.get("rule")`，整段表达式）| 次要: L9 JSON 体 `ctx`（整字典）
+链: L8 `rule` 取值 → L11 `eval(rule, {"__builtins__": {}}, ctx)` 以 Python `eval` 求值整段表达式 → 属性链逃逸 → OS 命令执行
+防御:
+  L11 `{"__builtins__": {}}` → 伪防御: 空 builtins 只阻断 builtins 名字直引；`().__class__.__bases__[0].__subclasses__()` 从对象字面量出发即可枚举进程已加载类（stdlib 内存在可用 gadget），再经 `__init__.__globals__` 取 `os` 执行命令——全程不引用任何 builtins 名字。
+  L10 注释宣称"名字空间白名单仅限业务字段" → 伪防御（注释撒谎）: L9 `ctx = body.get("ctx", {})` 无任何过滤，`rule` 内可引用的名字与值全部由请求体决定。
+载荷: `POST /rule/engine`，体 `{"rule": "().__class__.__bases__[0].__subclasses__()[-4].__init__.__globals__['os'].system('id')", "ctx": {}}`。可用子类与其索引取决于目标进程已加载的模块——样本外假设（逃逸机制本身为标准 Python 语义，样本内可证；具体 gadget 索引需按环境确定）。
+组合链: 表达式逃逸 → os.system RCE →（样本外）凭证窃取/横向。
+锚句: 非 CWE-915 因 `ctx` 是 eval 的局部命名空间而非共享/持久对象的动态键写入；非 CWE-502 因 `get_json` 仅解析纯数据格式。
+结论: 存在漏洞=true | CWE-95 Eval Injection | High
+修复: L9 对 `ctx` 键做白名单过滤（仅保留业务字段）；L11 弃用对原始文本 eval——新增 stdlib `import ast`，`ast.parse` 后逐节点白名单校验（比较/布尔/常量节点，`ast.Name` 限定业务字段，样本内可见的如 L8 默认值中的 `amount`），再对校验后的语法树 `compile` 求值；把 L10 注释承诺的白名单落实为代码。
+
+### wave2-95-15 版本B
+入口: L13 HTTP POST /rule/engine JSON 体 `rule` | 次要: L14 JSON 体 `ctx`（经白名单过滤后进入求值命名空间）
+链: 未发现可达污点流，原因: sink 前防御封死——L15 `ast.parse(rule, mode="eval")` 的语法树经 L16-20 逐节点白名单校验后，L21 `eval(compile(tree, "<rule>", "eval"), {"__builtins__": {}}, ctx)` 求值的是校验过的同一棵树，无"校验文本≠求值文本"差分。且按代码真实行为，根节点 `ast.Expression` 不在 L5-7 白名单内，L16-18 对一切输入立即抛 `ValueError`，L21 不可达（fail-closed，全量 500）。
+防御:
+  L5-7 `ALLOWED_NODES`（仅 BoolOp/UnaryOp/Compare/Name/Load/Constant 与 And/Or/Not/Gt/Lt/GtE/LtE/Eq）→ 有效: 无 `ast.Call`/`ast.Attribute`/`ast.Subscript`/`ast.BinOp`，逃逸必需节点全部缺席；根节点 `ast.Expression` 也被拒 → 无任何输入可达 sink。
+  L19-20 `node.id not in ALLOWED_NAMES`（L8 `{"amount", "vip", "region", "qty"}`）→ 有效: 即便修复根节点问题，可引用名字仅四个业务字段，无 builtins/危险名。
+  L14 `ctx = {k: v for k, v in ... if k in ALLOWED_NAMES}` → 有效: 进入求值命名空间的键被白名单收敛，攻击者无法携带额外对象。
+  L21 `compile(tree, "<rule>", "eval")` 校验后编译 → 有效: 求值对象与校验对象为同一 AST，消除解析器差分绕过（对比直接 `eval(rule)`）。
+载荷: 无——含默认值 `amount < 100` 在内的一切 `rule` 都在 L17-18 被拒。
+组合链: 无。
+残余（修复根节点问题后仍成立）: 无 BinOp → 算术类规则被拒（功能性收缩，非漏洞）。
+锚句: 非 CWE-915 因 ctx 键已被 L14 过滤且仅为求值局部命名空间；非 CWE-190 因 无整数运算参与边界检查/寻址。
+结论: 存在漏洞=false | CWE-95 Eval Injection | Low
+修复: L5-7 白名单元组加入 `ast.Expression`（最小修复）以恢复功能；保持 L14、L19-20、L21 不变；如需算术规则再加 BinOp 及其运算符节点。
+
+自查清单（95-15）:
+- [x] 每条分析第一行是否是 `### <案例编号> <版本>`？我发的每个案例、每个版本是否都各有一条分析？
+- [x] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [x] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [x] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [x] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [x] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [x] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [x] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [x] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（值位之外的表名/列名/排序位没有回退拼接）？（本包无 SQL sink）
