@@ -42,7 +42,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# 项目根目录（Graduation-Project/）
+# 项目根目录（目录名通常为 ZaoZao，历史名 Graduation-Project；以 pyproject.toml 为锚点，与目录名解耦）
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -51,7 +51,11 @@ if str(PROJECT_ROOT) not in sys.path:
 # 保证 --help / 参数解析在依赖缺失时也能工作。
 try:
     from app.backend.services.model_registry import get_default_model as _get_default_model
-    DEFAULT_MODEL = os.environ.get("VULN_SCANNER_MODEL", _get_default_model())
+    from graduation_project.transformers_client import resolve_default_backend as _resolve_default_backend
+    # 与后端服务 scanner.py 同口径：transformers/vllm 用本地 LoRA 形态 α0.5，ollama 用已发布的 v9max
+    DEFAULT_MODEL = os.environ.get(
+        "VULN_SCANNER_MODEL", _get_default_model(_resolve_default_backend()),
+    )
 except Exception:
     DEFAULT_MODEL = os.environ.get("VULN_SCANNER_MODEL", "garrywhite109909/graduation-vuln-scanner:v9max")
 FALLBACK_MODEL = os.environ.get("VULN_SCANNER_FALLBACK_MODEL", "qwen3:8b")

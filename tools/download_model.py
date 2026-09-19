@@ -8,7 +8,7 @@
 2. 直接下载 GGUF（适合无法访问 Ollama Registry 的环境）
    python tools/download_model.py \
        --source gguf \
-       --url https://github.com/GarryWhite109909/Graduation-Project/releases/download/v1.0/merged_v5-q4_k_m.gguf \
+       --url https://github.com/GarryWhite109909/ZaoZao/releases/download/v1.0/merged_v5-q4_k_m.gguf \
        --model graduation-vuln-scanner:v9max
 
 国内网络加速：source=gguf 时，若 URL 指向 github.com，默认自动加 ghproxy 前缀

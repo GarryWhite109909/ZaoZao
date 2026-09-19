@@ -76,7 +76,7 @@ class OllamaClient:
         # 延迟导入避免顶层循环依赖。
         if model is None:
             from app.backend.services.model_registry import get_default_model
-            model = get_default_model()
+            model = get_default_model("ollama")
         self.base_url = base_url
         self.model = model
         self.api_generate = f"{base_url}/api/generate"
@@ -448,7 +448,7 @@ class OllamaClient:
 
 if __name__ == "__main__":
     from app.backend.services.model_registry import get_default_model
-    client = OllamaClient(model=get_default_model())
+    client = OllamaClient(model=get_default_model("ollama"))
     
     # 检查连接
     if not client.check_connection():

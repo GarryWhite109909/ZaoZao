@@ -56,6 +56,7 @@ from app.backend.services.model_registry import (
     get_default_model,
     get_prompt_for_model,
     is_allowed,
+    is_ollama_published,
     normalize_ollama_name,
 )
 from app.backend.services.scheduler import (
@@ -1773,6 +1774,16 @@ async def models_pull(req: ModelActionRequest):
     if not is_allowed(model):
         return JSONResponse(
             {"error": f"模型 {model} 不在允许列表中"}, status_code=403,
+        )
+    # 分发形态保护：distribution == "transformers" 的条目（如 Nivis-α0.5）只随
+    # 本地 LoRA adapter 分发，未发布到 Ollama Registry，ollama pull 必然失败。
+    if not is_ollama_published(model):
+        return JSONResponse(
+            {"error": f"模型 {model} 是本地 LoRA adapter 形态（transformers 后端），"
+                      "未发布到 Ollama Registry，无法在线拉取；请在模型管理中选择"
+                      " v9max / α0 / v5 等已发布模型，或在本机 models/ 放置 LoRA "
+                      "adapter 后由 transformers 后端自动加载。"},
+            status_code=400,
         )
     gate = _model_mgmt_gate("pull")
     if gate is not None:

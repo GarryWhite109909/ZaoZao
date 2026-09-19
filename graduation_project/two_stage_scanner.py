@@ -3051,7 +3051,7 @@ class TwoStageScanner:
             return None
         try:
             results = self._chroma.query(
-                collection_name="vuln_knowledge",
+                collection_name="vulnerability_knowledge",  # 与知识库构建脚本/持久化 DB 一致
                 query_text=code[:2000],
                 n_results=3,
             )

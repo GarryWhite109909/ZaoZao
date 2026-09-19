@@ -1,12 +1,15 @@
 @echo off
-REM NOTE: Do NOT use `chcp 65001` here. This batch file may live under a path
-REM containing non-ASCII characters (e.g. a Chinese folder name). Switching
-REM the code page to UTF-8 while cmd still parses the script (and the
-REM expanded %~dp0 path) with the system ANSI code page causes the parser to
-REM misread multi-byte characters and "eat" the tail of a command, producing
-REM errors like "'ec' is not recognized" or "'cy_installer' is not recognized".
-REM Keeping the default code page keeps the non-ASCII path self-consistent.
-REM All echo'd text in this file is ASCII, so no mojibake.
+REM NOTE: Keep EVERY byte of this file ASCII-only. No Chinese comments/echo.
+REM cmd.exe parses this file with the system ANSI code page (GBK on zh-CN
+REM Windows). Multi-byte text - even inside REM lines - desyncs the parser
+REM and the tail of the line gets executed as a command, producing errors
+REM like "'<mojibake>' is not recognized as an internal or external command".
+REM Repro 2026-09-19: Chinese REM lines added on 2026-08-20 broke this rule
+REM and shipped exactly such errors on default zh-CN consoles.
+REM Do NOT add `chcp 65001` either: it has the same tail-eating effect when
+REM the path (expanded %~dp0) contains non-ASCII characters.
+REM Chinese guidance is printed by the Python launcher (bootstrap), which
+REM writes to the console through Unicode APIs and is immune to code pages.
 cd /d "%~dp0\..\.."
 for %%I in ("%~dp0..\..") do set "VULN_PROJECT_ROOT=%%~fI"
 set "OLLAMA_MODELS=%VULN_PROJECT_ROOT%\models\ollama"
@@ -22,43 +25,45 @@ REM build and re-exec across envs, to avoid dependency fragmentation (torch
 REM OK but missing tree_sitter / security tools installed elsewhere).
 REM dependency_installer will install missing torch on the fly.
 REM
-REM 2026-08-20: 每个关键步骤都检查 errorlevel 并显示明确错误再暂停，
-REM 避免"假 python / pip 失败"被 2>nul 吞掉导致双击后静默退出、
-REM 用户看不到任何报错。失败即停，用户能立即看到问题出在哪一步。
+REM 2026-08-20: check errorlevel after every critical step and pause with a
+REM clear message, so a fake python / failed pip is no longer swallowed by
+REM 2^>nul and a double-click no longer exits silently. Stop on first
+REM failure: the user must see exactly which step broke.
 REM =====================================================================
 set "PY=%PYTHON%"
 if "%PY%"=="" set "PY=python"
 echo [Setup] Using interpreter: %PY%
 
-REM ---- 0) 前置校验：python 真的能跑吗（防 Microsoft Store 假 python / 未安装）----
+REM ---- 0) Sanity check: is python really runnable (anti fake python) ----
 "%PY%" --version >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo [错误] 找不到可用的 Python 解释器: "%PY%"
-    echo   请先安装 Python 3.10+（勾选 "Add Python to PATH"），
-    echo   或设置 PYTHON 环境变量指向真实 python.exe 后重试。
-    echo   下载: https://www.python.org/downloads/
+    echo [ERROR] No usable Python interpreter: "%PY%"
+    echo   Install Python 3.10+ and check "Add Python to PATH",
+    echo   or set the PYTHON env var to a real python.exe and retry.
+    echo   Download: https://www.python.org/downloads/
     echo.
     pause
     exit /b 1
 )
 
-REM ---- 1) 首次运行依赖安装 ----
+REM ---- 1) First-run dependency installation ----
 "%PY%" -c "import fastapi, uvicorn, pydantic, requests, tree_sitter, tree_sitter_python, tree_sitter_javascript, tree_sitter_java, tree_sitter_php, tree_sitter_typescript, chromadb, sentence_transformers, psutil" >nul 2>&1
 if errorlevel 1 (
     echo [Setup] First run: installing core dependencies...
 
-    REM Install CPU torch for embeddings ONLY if this interpreter has no torch at all;
-    REM skip when it already has a hardware-matched torch (CUDA/ROCm), to avoid
-    REM overwriting the matching build with the CPU one.
+    REM Install CPU torch for embeddings ONLY if this interpreter has no torch
+    REM at all; skip when it already has a hardware-matched torch build
+    REM (CUDA/ROCm), to avoid overwriting the matching build with the CPU one.
     "%PY%" -c "import torch" >nul 2>&1
     if errorlevel 1 (
         echo [Setup] Installing CPU torch...
         "%PY%" -m pip install --index-url https://download.pytorch.org/whl/cpu torch
         if errorlevel 1 (
             echo.
-            echo [错误] CPU torch 安装失败。请检查网络后重试，
-            echo   或手动执行: "%PY%" -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+            echo [ERROR] CPU torch installation failed. Check the network and retry,
+            echo   or run manually:
+            echo   "%PY%" -m pip install --index-url https://download.pytorch.org/whl/cpu torch
             echo.
             pause
             exit /b 1
@@ -70,8 +75,8 @@ if errorlevel 1 (
     "%PY%" -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
     if errorlevel 1 (
         echo.
-        echo [错误] 核心依赖安装失败（requirements.txt）。
-        echo   请检查网络连接，或手动执行:
+        echo [ERROR] Core dependency installation failed: requirements.txt.
+        echo   Check the network connection, or run manually:
         echo   "%PY%" -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
         echo.
         pause
@@ -81,8 +86,9 @@ if errorlevel 1 (
     "%PY%" -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e .
     if errorlevel 1 (
         echo.
-        echo [错误] 项目包安装失败（pip install -e .）。
-        echo   请手动执行: "%PY%" -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e .
+        echo [ERROR] Project package installation failed: pip install -e .
+        echo   Run manually:
+        echo   "%PY%" -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e .
         echo.
         pause
         exit /b 1
@@ -90,26 +96,27 @@ if errorlevel 1 (
     echo [Setup] Core dependencies installed.
 )
 
-REM ---- 2) 安全工具（可选跳过：set VULN_SCANNER_SKIP_TOOLS=1）----
+REM ---- 2) Security tools - optionally skip: set VULN_SCANNER_SKIP_TOOLS=1 ----
 if not "%VULN_SCANNER_SKIP_TOOLS%"=="1" (
     echo [Setup] Checking/installing security tools ^(latest stable^)...
     "%PY%" -m app.launcher.dependency_installer tools
     if errorlevel 1 (
         echo.
-        echo [警告] 安全工具安装未完全成功（不影响核心两阶段扫描，可稍后手动修复）。
-        echo   可设置 VULN_SCANNER_SKIP_TOOLS=1 跳过本步骤后重新启动。
+        echo [WARN] Security tool installation did not fully succeed.
+        echo   This does not affect the core two-stage scanning; fix it later.
+        echo   Set VULN_SCANNER_SKIP_TOOLS=1 to skip this step on next start.
         echo.
     )
 )
 
-REM ---- 3) 显式指定的后端依赖（可选）----
+REM ---- 3) Explicit backend dependencies - optional ----
 if not "%VULN_SCANNER_BACKEND%"=="" (
     if "%VULN_SCANNER_BACKEND%"=="transformers" (
         echo [Setup] Pre-installing transformers backend deps...
         "%PY%" -m app.launcher.dependency_installer transformers
         if errorlevel 1 (
             echo.
-            echo [警告] transformers 后端依赖安装未完全成功，启动器将继续尝试。
+            echo [WARN] transformers backend deps not fully installed; launcher will keep trying.
             echo.
         )
     )
@@ -118,18 +125,18 @@ if not "%VULN_SCANNER_BACKEND%"=="" (
         "%PY%" -m app.launcher.dependency_installer llamacpp
         if errorlevel 1 (
             echo.
-            echo [警告] llamacpp 后端依赖安装未完全成功，启动器将继续尝试。
+            echo [WARN] llamacpp backend deps not fully installed; launcher will keep trying.
             echo.
         )
     )
 )
 
-REM ---- 4) 启动器 ----
+REM ---- 4) Launcher ----
 "%PY%" -m app.launcher.bootstrap
 if errorlevel 1 (
     echo.
-    echo [错误] 启动器退出（错误码 %errorlevel%）。
-    echo   上方应有具体错误信息；若没有，请手动执行下面命令查看完整输出:
+    echo [ERROR] Launcher exited with an error. Details should be above.
+    echo   If nothing is shown, run this manually to see the full output:
     echo   "%PY%" -m app.launcher.bootstrap
     echo.
     pause

@@ -46,15 +46,16 @@ from graduation_project.transformers_client import (
     resolve_default_backend,
 )
 
-# 项目根目录（Graduation-Project/）
+# 项目根目录（目录名通常为 ZaoZao，历史名 Graduation-Project；以 pyproject.toml 为锚点，与目录名解耦）
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-# 默认模型（从模型注册表读取当前默认版本，如 v9max；导入失败时回退到 v9max 全名）
+# 默认模型（导入期后端尚未解析，先用 Ollama 发布形态的 v9max 兜底；
+# main() 中 select_backend() 完成后会按实际后端再次 setdefault）
 try:
     from app.backend.services.model_registry import (
         get_default_model as _get_default_model,
         normalize_ollama_name as _normalize_ollama_name,
     )
-    DEFAULT_MODEL = os.environ.get("VULN_SCANNER_MODEL", _get_default_model())
+    DEFAULT_MODEL = os.environ.get("VULN_SCANNER_MODEL", _get_default_model("ollama"))
 except Exception:
     _normalize_ollama_name = lambda name: name  # noqa: E731
     DEFAULT_MODEL = os.environ.get("VULN_SCANNER_MODEL", "garrywhite109909/graduation-vuln-scanner:v9max")
@@ -62,6 +63,14 @@ except Exception:
 FALLBACK_MODEL = os.environ.get("VULN_SCANNER_FALLBACK_MODEL", "qwen3:8b")
 # 后端端口
 PORT = 8765
+
+
+def _default_model_for(backend: str) -> str:
+    """按推理后端返回默认模型（注册表导入失败时回退 v9max 全名）。"""
+    try:
+        return _get_default_model(backend)
+    except Exception:
+        return DEFAULT_MODEL
 
 
 def resolve_backend() -> str:
@@ -1521,10 +1530,15 @@ def main():
     # 0. 选择并锁定推理后端
     backend = select_backend()
     os.environ["VULN_SCANNER_BACKEND"] = backend
+    # 按后端锁定默认模型（后端子进程继承本环境变量）：transformers/vllm 用本地 LoRA
+    # 形态 α0.5（ALPHA05_PROMPT 对齐），ollama/llamacpp（含一键启动的干净机器）用
+    # 已公开发布、可自动 `ollama pull` 的 v9max。用户显式设置时不覆盖。
+    os.environ.setdefault("VULN_SCANNER_MODEL", _default_model_for(backend))
     # transformers 后端 LoRA 合并通道已永久关闭：TransformersClient 恒以运行时叠加
     # （不合并，保留 FP16 精度）加载，不再设置 VULN_SCANNER_MERGE，也不询问用户。
     use_ollama = backend == "ollama"
     print(f"[启动器] 推理后端: {backend}")
+    print(f"[启动器] 默认模型: {os.environ.get('VULN_SCANNER_MODEL')}")
 
     # 模型存储锁定：后端已写死读取项目 models/ 下的模型，因此**任何平台**都把
     # Ollama 存储锁到项目 models/ollama、并把旧位置（默认 ~/.ollama/models）已有

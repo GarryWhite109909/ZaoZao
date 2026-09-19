@@ -28,9 +28,6 @@ from graduation_project.paths import resolve_adapter_path, resolve_base_model_pa
 from graduation_project.result_types import SingleResult
 from graduation_project.transformers_client import resolve_default_backend
 
-# 默认模型：从环境变量读取，缺省为注册表中的默认模型（当前 α0，已训练未评估；
-# 论文口径当前已发布最佳仍为 v9max，二者区分见素材库「写作口径须知」）
-DEFAULT_MODEL = os.environ.get("VULN_SCANNER_MODEL", get_default_model())
 # 回退模型：官方 Qwen3-8B（未微调，用户首次未 pull 自定义模型时可用）
 FALLBACK_MODEL = os.environ.get("VULN_SCANNER_FALLBACK_MODEL", "qwen3:8b")
 
@@ -40,13 +37,18 @@ def _resolve_default_backend() -> str:
 
 
 DEFAULT_BACKEND = _resolve_default_backend()
+# 默认模型：从环境变量读取；缺省按后端区分——transformers/vllm 用本地 LoRA 形态的
+# α0.5，ollama/llamacpp（含一键启动的干净机器）用已公开发布、可自动拉取的 v9max。
+DEFAULT_MODEL = os.environ.get(
+    "VULN_SCANNER_MODEL", get_default_model(DEFAULT_BACKEND),
+)
 # transformers 后端加载参数（Q4 基座 + FP16 LoRA）
 DEFAULT_TRANSFORMERS_MODEL_ID = os.environ.get("VULN_SCANNER_MODEL_ID", "") or resolve_base_model_path()
 # LoRA adapter 路径：优先 VULN_SCANNER_ADAPTER，其次自动探测项目根目录 models/
 DEFAULT_TRANSFORMERS_ADAPTER = resolve_adapter_path()
 DEFAULT_TRANSFORMERS_NUM_CTX = int(os.environ.get("VULN_SCANNER_NUM_CTX", "6144"))
-# Chroma 知识库集合名
-KNOWLEDGE_COLLECTION = "vuln_knowledge"
+# Chroma 知识库集合名（与 data/chroma_db 构建脚本、知识库数据保持一致）
+KNOWLEDGE_COLLECTION = "vulnerability_knowledge"
 
 # 预筛规则名 → (CWE 标签, 风险等级)：预筛短路时给出与 LLM 一致的信息格式。
 # 元数据统一来自 prefilter.PREFILTER_RULE_INFO，避免与两阶段扫描器两份映射漂移。

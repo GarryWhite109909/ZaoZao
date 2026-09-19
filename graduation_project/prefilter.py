@@ -1919,7 +1919,7 @@ class Prefilter:
         return 0
 
     def _weak_pw_regex_line(self, code: str) -> int:
-        """弱口令策略正则（CWE-521）行号定位（1-based；0=未命中）。
+        r"""弱口令策略正则（CWE-521）行号定位（1-based；0=未命中）。
 
         行级 AND：pass/pwd 词根标识符赋值（PASS_RE = / PASSWORD_RE = …）
         + `.{1,N}` 任意字符有界量词出现在 /.../ 字面量或引号字符串内。
