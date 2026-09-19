@@ -18,6 +18,18 @@
   6. 漏洞模式正则只记录不强制：来源（CVE + 修复 commit 的 parent 版本）本身就是
      漏洞存在的证据，标签噪声由教师蒸馏环节二次校验。
 
+★ 2026-09-13 取材管道治本修复（对应 `_gap_disposition_20260913.md` §6）：
+  背景：GAP 163 块（占 needs_review 的 98%）根因是取材只截 patch 命中的单文件，
+        未带调用链上下游 → 教师只能标注「需补 X」，而 X 的实现文件根本不在样本内。
+  修复：
+    ① patch 补回 `diff --git` 头 + 落 commit 级文件清单台账（patch_meta/<CVE>.json）
+       —— 此前 API 的 files[].patch 只含 hunk（实测 305/305 全缺头），
+          且同 CVE 多文件互相覆盖同一个 patches/<CVE>.patch
+    ② `--max-files-per-cve` 默认 1 → 3，并加「锚点扩展」：
+       命中文件里的相对 import 若指向同批改动的其他文件，自动补入队列
+    ③ 新增 per-sample 元数据 `commit_sibling_files` / `commit_meta_file`，
+       供门 A 做文件级机检、供"需补 X"机械定位
+
 用法：
   export GITHUB_TOKEN=ghp_xxx            # 必需（GHSA 与 GitHub API 共用）
   python build_cve_corpus.py --target-train 300 --dev-cap 50 --resume
@@ -195,7 +207,9 @@ def main():
                         help="发现源：ghsa（默认，commit 密度高）/ nvd / both")
     parser.add_argument("--ghsa-max-pages", type=int, default=20,
                         help="每个 CWE 最多遍历多少页 GHSA（每页 100 条）")
-    parser.add_argument("--max-files-per-cve", type=int, default=1)
+    parser.add_argument("--max-files-per-cve", type=int, default=3,
+                        help="每个 CVE 最多取几个文件（2026-09-13 由 1 改为 3："
+                             "只截 top-1 会丢调用链上下游，导致教师标注『需补 X』）")
     parser.add_argument("--max-files-scan", type=int, default=10)
     parser.add_argument("--min-stars", type=int, default=3)
     parser.add_argument("--min-file-size", type=int, default=400)
@@ -300,15 +314,78 @@ def main():
             stats["oversize_commit"] += 1
             return False
 
-        taken = 0
-        scanned = 0
-        for f in detail.get("files", []):
-            if taken >= args.max_files_per_cve or scanned >= args.max_files_scan:
-                break
+        commit_files = detail.get("files", [])
+
+        # ★ 2026-09-13 治本修复①：把「这个 CVE 改了哪几个文件」的完整清单落盘。
+        #   GitHub API 的 files[].patch 只含 hunk（无 diff --git 头），且
+        #   同一 CVE 的多个文件此前会互相覆盖 patches/<CVE>.patch。
+        #   落一份 commit 级台账后：
+        #     - 门 A 才有文件级机检基础（"取材文件是否命中 CVE 机制词"）
+        #     - 教师标注"需补 X"时可机械定位 X 是否在同批改动内
+        #     - 取材可自检"只截 top-1 时漏掉了哪些同批文件"
+        commit_ledger_path = CORPUS_DIR / "patch_meta" / f"{cve_id.replace('/', '_')}.json"
+        commit_ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        commit_ledger_path.write_text(json.dumps({
+            "cve_id": cve_id,
+            "repo": repo_key,
+            "fix_sha": sha,
+            "parent_sha": parent_sha,
+            "files": [
+                {"filename": cf.get("filename"),
+                 "status": cf.get("status"),
+                 "additions": cf.get("additions"),
+                 "deletions": cf.get("deletions"),
+                 "has_patch": bool(cf.get("patch")),
+                 "lang": lang_of_file(cf.get("filename", "")),
+                 "excluded": is_excluded_file(cf.get("filename", "") or "")}
+                for cf in commit_files
+            ],
+        }, ensure_ascii=False, indent=1), encoding="utf-8")
+
+        # ★ 治本修复②：按锚点扩展取材 —— 取「命中文件」+ 其在同批改动中的
+        #   直接依赖文件（同目录、被 import/引用者）。避免只截 top-1 导致
+        #   调用链上下游丢失（教师标注"需补 X"的根因）。
+        def _expand_anchor(fname: str, code_text: str):
+            """从命中文件里的相对 import 抽取同批改动中的依赖文件。"""
+            deps = set()
+            for m in re.finditer(r"""(?:from|import|require\s*\(|include\s*\(|use\s+)[\s'"]*([\w./@-]+)""",
+                                 code_text or ""):
+                tok = m.group(1)
+                if not tok.startswith((".", "/")):
+                    continue
+                stem = Path(fname).parent / tok
+                deps.add(str(stem).replace("\\", "/"))
+            out = []
+            for f2 in commit_files:
+                fn2 = f2.get("filename", "")
+                if fn2 == fname or f2.get("status") == "removed":
+                    continue
+                if not lang_of_file(fn2) or is_excluded_file(fn2):
+                    continue
+                base2 = Path(fn2).stem
+                if any(base2 == Path(d).stem or fn2.endswith(d) for d in deps):
+                    out.append(f2)
+            return out
+
+        # 先按原顺序筛出可取的候选文件（保持"命中文件优先"的既有行为）
+        candidates = []
+        for f in commit_files:
             fname = f.get("filename", "")
             if not lang_of_file(fname) or is_excluded_file(fname):
                 continue
             if f.get("status") == "removed":
+                continue
+            candidates.append(f)
+
+        taken = 0
+        scanned = 0
+        taken_names = set()
+        while candidates and scanned < args.max_files_scan:
+            f = candidates.pop(0)
+            if taken >= args.max_files_per_cve:
+                break
+            fname = f.get("filename", "")
+            if fname in taken_names:
                 continue
             scanned += 1
 
@@ -328,9 +405,17 @@ def main():
             patch_file = ""
             if patch:
                 # 用 CVE ID 命名（全局唯一）——此前按 corpus_NNNNN 命名，
-                # 两池同号互相覆盖（2026-08-22 事故：350 应存实存 265）
-                patch_file = f"patches/{cve_id.replace('/', '_')}.patch"
-                (CORPUS_DIR / patch_file).write_text(patch, encoding="utf-8")
+                # 两池同号互相覆盖（2026-08-22 事故：350 应存实存 265）。
+                # 多文件时追加路径哈希后缀，避免同 CVE 内互相覆盖。
+                suffix = ""
+                if taken > 0:
+                    suffix = f".{hashlib.md5(fname.encode()).hexdigest()[:8]}"
+                patch_file = f"patches/{cve_id.replace('/', '_')}{suffix}.patch"
+                # ★ 治本修复① 续：补回 `diff --git` 头（API 的 patch 字段只含 hunk）。
+                header = (f"diff --git a/{fname} b/{fname}\n"
+                          f"--- a/{fname}\n"
+                          f"+++ b/{fname}\n")
+                (CORPUS_DIR / patch_file).write_text(header + patch, encoding="utf-8")
 
             matched = detect_vuln_patterns(code)
             sample = {
@@ -354,6 +439,11 @@ def main():
                 "pattern_not_matched": len(matched) == 0,
                 "frameworks": detect_frameworks(code),
                 "patch_file": patch_file,
+                # ★ 治本新增元数据：同批改动文件清单（供门 A 与"需补 X"定位）
+                "commit_meta_file": f"patch_meta/{cve_id.replace('/', '_')}.json",
+                "commit_sibling_files": [cf.get("filename") for cf in commit_files
+                                         if cf.get("filename") != fname],
+                "is_anchor_expanded": taken > 0,
                 "_built": time.strftime("%Y-%m-%d"),
             }
             pool_manifests[pool]["samples"].append(sample)
@@ -361,6 +451,7 @@ def main():
             seen_cves.add(cve_id)
             seen_shas.add(sha)
             taken += 1
+            taken_names.add(fname)
             stats["saved"] += 1
             if pool == "train_pool":
                 n_train += 1
@@ -372,6 +463,12 @@ def main():
             print(f"    ✓ [{pool}] {base_name} {fname} "
                   f"({sample['language']}, {len(code)}B, pat={len(matched)})")
             save_all()
+
+            # 锚点扩展：把命中文件的同批依赖文件插入队列头部（仅当还有配额）
+            if taken < args.max_files_per_cve:
+                for dep in _expand_anchor(fname, code):
+                    if dep.get("filename") not in taken_names:
+                        candidates.insert(0, dep)
         if taken == 0:
             stats["no_file"] += 1
         return taken > 0

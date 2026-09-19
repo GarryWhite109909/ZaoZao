@@ -29,6 +29,9 @@
   - 数据太大可选 --subset 限制条数做快速验证
   - assistant_only_loss=True 需要 chat_template 包含 {% generation %} 标签，
     Qwen3 默认模板不含此标签，脚本已自动注入修改后的模板
+  - --liger 启用 liger-kernel 融合算子（RMSNorm/SwiGLU/RoPE + fused linear CE），
+    16384 长序列下省显存提速；需先 pip install liger-kernel
+  - 默认按长度分桶（group_by_length，减少 batch 内 padding 浪费），--no-group-by-length 可关
   - --recycle-dev 注意：回收后 dev 的 eval_loss 不再代表泛化（模型已见过），
     最终泛化指标必须用独立测试集（如 testset_cve_fix）评估
 """
@@ -187,6 +190,27 @@ def split_train_dev(dataset: Dataset, dev_ratio: float, seed: int = 42):
     return Dataset.from_list(train_records), Dataset.from_list(dev_records)
 
 
+def make_sft_config(**kwargs) -> SFTConfig:
+    """构造 SFTConfig，兼容新旧 TRL/transformers 差异。
+
+    新版 transformers/TRL 可能从 SFTConfig 移除 group_by_length / use_liger_kernel
+    等字段（直接传会 TypeError）。策略：先用必选参数构造，可选参数逐个尝试加回；
+    不被接受时以属性方式补挂（底层 Trainer 若仍读取该属性则生效，否则无操作降级）：
+      - 降级 group_by_length：仅多耗 padding 显存，不影响正确性
+      - 降级 use_liger_kernel：16384 长度下显存压力增大，必要时调小 --batch-size
+    """
+    optional = {k: kwargs.pop(k) for k in ("group_by_length", "use_liger_kernel") if k in kwargs}
+    cfg = SFTConfig(**kwargs)
+    for k, v in optional.items():
+        try:
+            cfg = SFTConfig(**kwargs, **{k: v})
+            print(f"SFTConfig: 接受 {k}={v}")
+        except TypeError:
+            setattr(cfg, k, v)
+            print(f"⚠️ SFTConfig 不接受 {k}，已降级为属性补挂（若底层不支持则该功能不生效）")
+    return cfg
+
+
 def main():
     parser = argparse.ArgumentParser(description="云端 LoRA 微调 Qwen3-8B（bf16 原生）")
     parser.add_argument("--epochs", type=int, default=2)
@@ -221,6 +245,10 @@ def main():
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"],
                         help="混合精度（A100+ 用 bf16；旧卡无 bf16 用 fp16）")
+    parser.add_argument("--liger", action="store_true",
+                        help="启用 liger-kernel 融合算子（16384 长序列省显存提速；需 pip install liger-kernel）")
+    parser.add_argument("--no-group-by-length", action="store_true",
+                        help="关闭按长度分桶（默认开启：减少 batch 内 padding 浪费）")
     # 第 2 阶段：回收 dev 集（final training on full data）
     parser.add_argument("--recycle-dev", action="store_true",
                         help="阶段1（分 dev 看 eval loss 曲线 + 选 best）完成后，把 dev 集回收进训练，"
@@ -307,7 +335,7 @@ def main():
 
     short_run = args.max_steps > 0
 
-    sft_config = SFTConfig(
+    sft_config = make_sft_config(
         output_dir=str(output_dir),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -341,6 +369,8 @@ def main():
         greater_is_better=False,
         per_device_eval_batch_size=args.batch_size,
         dataloader_pin_memory=False,
+        use_liger_kernel=args.liger,
+        group_by_length=not args.no_group_by_length,
     )
 
     trainer = SFTTrainer(
@@ -383,7 +413,7 @@ def main():
         recycled_dir = output_dir / "recycled"
         print(f"\n[阶段2/回收dev] 把 {len(dev_dataset)} 条 dev 并回训练，全量 {full_len} 条续训 "
               f"{args.recycle_epochs} epoch ≈ {recycle_steps} 步（从阶段1 best 继续，关闭 eval）")
-        sft_config2 = SFTConfig(
+        sft_config2 = make_sft_config(
             output_dir=str(recycled_dir),
             num_train_epochs=args.recycle_epochs,
             per_device_train_batch_size=args.batch_size,
@@ -411,6 +441,8 @@ def main():
             logging_dir=str(LOG_DIR),
             eval_strategy="no",          # 曲线已在阶段1确认，回收阶段不再评估
             dataloader_pin_memory=False,
+            use_liger_kernel=args.liger,
+            group_by_length=not args.no_group_by_length,
         )
         # model 在阶段1结束时已回滚到 best（load_best_model_at_end=True）
         trainer2 = SFTTrainer(
