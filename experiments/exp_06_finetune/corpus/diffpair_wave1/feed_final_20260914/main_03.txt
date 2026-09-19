@@ -1,0 +1,1073 @@
+【代码审计案例包 | diffpair】
+
+### id=diffpair-corpus_00280 lang=javascript
+#### 版本A（230 行）
+```javascript
+/**
+ * @typedef {import('got').Got} Got
+ * @typedef {import('got').ExtendOptions} ExtendOptions
+ */
+
+const got = /** @type {Got} */ (/** @type {unknown} */ (require('got')));
+const net = require('net');
+const dnsPromises = require('dns').promises;
+const errors = require('@tryghost/errors');
+const config = require('../../shared/config');
+const validator = require('@tryghost/validator');
+
+/**
+ * Normalize an IPv4 address from any format (decimal, octal, hex, integer)
+ * to standard dotted-decimal notation using the WHATWG URL parser.
+ * Returns null if the address is not a valid IPv4 address.
+ */
+function normalizeIPv4(addr) {
+    try {
+        const normalized = new URL('http://' + addr + '/').hostname;
+        if (net.isIPv4(normalized)) {
+            return normalized;
+        }
+    } catch {
+        // URL parsing failed
+    }
+    return null;
+}
+
+/**
+ * Normalize an IPv6 address from any expanded form (e.g. 0:0:0:0:0:0:0:1)
+ * to compressed notation (e.g. ::1) using the WHATWG URL parser.
+ * Returns null if the address is not a valid IPv6 address.
+ */
+function normalizeIPv6(addr) {
+    try {
+        const hostname = new URL('http://[' + addr + ']/').hostname;
+        // hostname includes brackets, strip them
+        const normalized = hostname.slice(1, -1);
+        if (net.isIPv6(normalized)) {
+            return normalized;
+        }
+    } catch {
+        // URL parsing failed
+    }
+    return null;
+}
+
+/**
+ * Check if a normalized (dotted-decimal) IPv4 address falls in a private/reserved range.
+ */
+function isPrivateIPv4(addr) {
+    const parts = addr.split('.');
+    const a = parseInt(parts[0], 10);
+    const b = parseInt(parts[1], 10);
+
+    // 10.0.0.0/8
+    if (a === 10) {
+        return true;
+    }
+    // 172.16.0.0/12
+    if (a === 172 && b >= 16 && b <= 31) {
+        return true;
+    }
+    // 192.168.0.0/16
+    if (a === 192 && b === 168) {
+        return true;
+    }
+    // 127.0.0.0/8
+    if (a === 127) {
+        return true;
+    }
+    // 169.254.0.0/16
+    if (a === 169 && b === 254) {
+        return true;
+    }
+    // 100.64.0.0/10 (carrier-grade NAT, RFC 6598)
+    if (a === 100 && b >= 64 && b <= 127) {
+        return true;
+    }
+    // 198.18.0.0/15 (benchmarking, RFC 2544)
+    if (a === 198 && (b === 18 || b === 19)) {
+        return true;
+    }
+    // 0.0.0.0/8
+    if (a === 0) {
+        return true;
+    }
+    // 240.0.0.0/4 (reserved) and 255.255.255.255 (broadcast)
+    if (a >= 240) {
+        return true;
+    }
+    return false;
+}
+
+function isPrivateIp(addr) {
+    // Fail closed: treat missing/empty values as private
+    if (!addr) {
+        return true;
+    }
+
+    // Check for IPv4-mapped IPv6 in dotted notation (e.g. ::ffff:192.168.0.1)
+    const v4DottedMatch = addr.match(/^::ffff:(\d[\d.]+)$/i);
+    if (v4DottedMatch) {
+        const normalized = normalizeIPv4(v4DottedMatch[1]);
+        if (normalized) {
+            return isPrivateIPv4(normalized);
+        }
+        return true;
+    }
+
+    // Check for IPv4-mapped IPv6 in hex notation (e.g. ::ffff:7f00:1)
+    const v4HexMatch = addr.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (v4HexMatch) {
+        const hi = parseInt(v4HexMatch[1], 16);
+        const lo = parseInt(v4HexMatch[2], 16);
+        const mapped = ((hi >> 8) & 0xff) + '.' + (hi & 0xff) + '.' + ((lo >> 8) & 0xff) + '.' + (lo & 0xff);
+        return isPrivateIPv4(mapped);
+    }
+
+    // Try normalizing as IPv4 (handles decimal, octal, hex, and integer notation)
+    const normalized = normalizeIPv4(addr);
+    if (normalized) {
+        return isPrivateIPv4(normalized);
+    }
+
+    // IPv6 checks
+    const normalized6 = normalizeIPv6(addr);
+    if (normalized6) {
+        // ::1 loopback, :: unspecified
+        if (normalized6 === '::1' || normalized6 === '::' || normalized6 === '::0') {
+            return true;
+        }
+        // fc00::/7 unique local
+        if (/^f[cd][0-9a-f]{2}:/i.test(normalized6)) {
+            return true;
+        }
+        // fe80::/10 link-local
+        if (/^fe[89ab][0-9a-f]:/i.test(normalized6)) {
+            return true;
+        }
+        // Re-check for IPv4-mapped IPv6 after normalization
+        // Handles expanded forms like 0:0:0:0:0:ffff:127.0.0.1 which normalize to ::ffff:...
+        const v4DottedNorm = normalized6.match(/^::ffff:(\d[\d.]+)$/i);
+        if (v4DottedNorm) {
+            const normV4 = normalizeIPv4(v4DottedNorm[1]);
+            if (normV4) {
+                return isPrivateIPv4(normV4);
+            }
+            return true;
+        }
+        const v4HexNorm = normalized6.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+        if (v4HexNorm) {
+            const hi = parseInt(v4HexNorm[1], 16);
+            const lo = parseInt(v4HexNorm[2], 16);
+            const mapped = ((hi >> 8) & 0xff) + '.' + (hi & 0xff) + '.' + ((lo >> 8) & 0xff) + '.' + (lo & 0xff);
+            return isPrivateIPv4(mapped);
+        }
+        return false;
+    }
+
+    // Unrecognized format - fail closed
+    return true;
+}
+
+async function errorIfHostnameResolvesToPrivateIp(options) {
+    // Allow all requests if we are in development mode
+    if (config.get('env') === 'development') {
+        return;
+    }
+
+    // allow requests through to local Ghost instance
+    const siteUrl = new URL(config.get('url'));
+    const requestUrl = new URL(options.url.href);
+    if (requestUrl.host === siteUrl.host) {
+        return;
+    }
+
+    const result = await dnsPromises.lookup(options.url.hostname);
+
+    if (isPrivateIp(result.address)) {
+        return Promise.reject(new errors.InternalServerError({
+            message: 'URL resolves to a non-permitted private IP block',
+            code: 'URL_PRIVATE_INVALID',
+            context: options.url.href
+        }));
+    }
+}
+
+async function errorIfInvalidUrl(options) {
+    if (config.get('env') === 'development') {
+        return;
+    }
+
+    if (!options.url.hostname || !validator.isURL(options.url.hostname)) {
+        throw new errors.InternalServerError({
+            message: 'URL invalid.',
+            code: 'URL_MISSING_INVALID',
+            context: options.url.href
+        });
+    }
+}
+
+async function disableRetries(options) {
+    // Force disable retries
+    options.retry = {
+        limit: 0,
+        calculateDelay: () => 0
+    };
+    options.timeout = 5000;
+}
+
+// same as our normal request lib but if any request in a redirect chain resolves
+// to a private IP address it will be blocked before the request is made.
+/** @type {ExtendOptions} */
+const gotOpts = {
+    headers: {
+        'user-agent': 'Ghost(https://github.com/TryGhost/Ghost)'
+    },
+    timeout: 10000, // default is no timeout
+    hooks: {
+        init: process.env.NODE_ENV?.startsWith('test') ? [disableRetries] : [],
+        beforeRequest: [errorIfInvalidUrl, errorIfHostnameResolvesToPrivateIp],
+        beforeRedirect: [errorIfHostnameResolvesToPrivateIp]
+    }
+};
+
+const externalRequest = got.extend(gotOpts);
+externalRequest.isPrivateIp = isPrivateIp;
+module.exports = externalRequest;
+```
+#### 版本B（289 行）
+```javascript
+/**
+ * @typedef {import('got').Got} Got
+ * @typedef {import('got').ExtendOptions} ExtendOptions
+ */
+
+const got = /** @type {Got} */ (/** @type {unknown} */ (require('got')));
+const dns = require('dns');
+const net = require('net');
+const dnsPromises = require('dns').promises;
+const errors = require('@tryghost/errors');
+const config = require('../../shared/config');
+const validator = require('@tryghost/validator');
+
+/**
+ * Normalize an IPv4 address from any format (decimal, octal, hex, integer)
+ * to standard dotted-decimal notation using the WHATWG URL parser.
+ * Returns null if the address is not a valid IPv4 address.
+ */
+function normalizeIPv4(addr) {
+    try {
+        const normalized = new URL('http://' + addr + '/').hostname;
+        if (net.isIPv4(normalized)) {
+            return normalized;
+        }
+    } catch {
+        // URL parsing failed
+    }
+    return null;
+}
+
+/**
+ * Normalize an IPv6 address from any expanded form (e.g. 0:0:0:0:0:0:0:1)
+ * to compressed notation (e.g. ::1) using the WHATWG URL parser.
+ * Returns null if the address is not a valid IPv6 address.
+ */
+function normalizeIPv6(addr) {
+    try {
+        const hostname = new URL('http://[' + addr + ']/').hostname;
+        // hostname includes brackets, strip them
+        const normalized = hostname.slice(1, -1);
+        if (net.isIPv6(normalized)) {
+            return normalized;
+        }
+    } catch {
+        // URL parsing failed
+    }
+    return null;
+}
+
+/**
+ * Check if a normalized (dotted-decimal) IPv4 address falls in a private/reserved range.
+ */
+function isPrivateIPv4(addr) {
+    const parts = addr.split('.');
+    const a = parseInt(parts[0], 10);
+    const b = parseInt(parts[1], 10);
+
+    // 10.0.0.0/8
+    if (a === 10) {
+        return true;
+    }
+    // 172.16.0.0/12
+    if (a === 172 && b >= 16 && b <= 31) {
+        return true;
+    }
+    // 192.168.0.0/16
+    if (a === 192 && b === 168) {
+        return true;
+    }
+    // 127.0.0.0/8
+    if (a === 127) {
+        return true;
+    }
+    // 169.254.0.0/16
+    if (a === 169 && b === 254) {
+        return true;
+    }
+    // 100.64.0.0/10 (carrier-grade NAT, RFC 6598)
+    if (a === 100 && b >= 64 && b <= 127) {
+        return true;
+    }
+    // 198.18.0.0/15 (benchmarking, RFC 2544)
+    if (a === 198 && (b === 18 || b === 19)) {
+        return true;
+    }
+    // 0.0.0.0/8
+    if (a === 0) {
+        return true;
+    }
+    // 240.0.0.0/4 (reserved) and 255.255.255.255 (broadcast)
+    if (a >= 240) {
+        return true;
+    }
+    return false;
+}
+
+function isPrivateIp(addr) {
+    // Fail closed: treat missing/empty values as private
+    if (!addr) {
+        return true;
+    }
+
+    // Check for IPv4-mapped IPv6 in dotted notation (e.g. ::ffff:192.168.0.1)
+    const v4DottedMatch = addr.match(/^::ffff:(\d[\d.]+)$/i);
+    if (v4DottedMatch) {
+        const normalized = normalizeIPv4(v4DottedMatch[1]);
+        if (normalized) {
+            return isPrivateIPv4(normalized);
+        }
+        return true;
+    }
+
+    // Check for IPv4-mapped IPv6 in hex notation (e.g. ::ffff:7f00:1)
+    const v4HexMatch = addr.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (v4HexMatch) {
+        const hi = parseInt(v4HexMatch[1], 16);
+        const lo = parseInt(v4HexMatch[2], 16);
+        const mapped = ((hi >> 8) & 0xff) + '.' + (hi & 0xff) + '.' + ((lo >> 8) & 0xff) + '.' + (lo & 0xff);
+        return isPrivateIPv4(mapped);
+    }
+
+    // Try normalizing as IPv4 (handles decimal, octal, hex, and integer notation)
+    const normalized = normalizeIPv4(addr);
+    if (normalized) {
+        return isPrivateIPv4(normalized);
+    }
+
+    // IPv6 checks
+    const normalized6 = normalizeIPv6(addr);
+    if (normalized6) {
+        // ::1 loopback, :: unspecified
+        if (normalized6 === '::1' || normalized6 === '::' || normalized6 === '::0') {
+            return true;
+        }
+        // fc00::/7 unique local
+        if (/^f[cd][0-9a-f]{2}:/i.test(normalized6)) {
+            return true;
+        }
+        // fe80::/10 link-local
+        if (/^fe[89ab][0-9a-f]:/i.test(normalized6)) {
+            return true;
+        }
+        // Re-check for IPv4-mapped IPv6 after normalization
+        // Handles expanded forms like 0:0:0:0:0:ffff:127.0.0.1 which normalize to ::ffff:...
+        const v4DottedNorm = normalized6.match(/^::ffff:(\d[\d.]+)$/i);
+        if (v4DottedNorm) {
+            const normV4 = normalizeIPv4(v4DottedNorm[1]);
+            if (normV4) {
+                return isPrivateIPv4(normV4);
+            }
+            return true;
+        }
+        const v4HexNorm = normalized6.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+        if (v4HexNorm) {
+            const hi = parseInt(v4HexNorm[1], 16);
+            const lo = parseInt(v4HexNorm[2], 16);
+            const mapped = ((hi >> 8) & 0xff) + '.' + (hi & 0xff) + '.' + ((lo >> 8) & 0xff) + '.' + (lo & 0xff);
+            return isPrivateIPv4(mapped);
+        }
+        return false;
+    }
+
+    // Unrecognized format - fail closed
+    return true;
+}
+
+async function errorIfHostnameResolvesToPrivateIp(options) {
+    // Allow all requests if we are in development mode
+    if (config.get('env') === 'development') {
+        return;
+    }
+
+    // allow requests through to local Ghost instance
+    const siteUrl = new URL(config.get('url'));
+    const requestUrl = new URL(options.url.href);
+    if (requestUrl.host === siteUrl.host) {
+        return;
+    }
+
+    const result = await dnsPromises.lookup(options.url.hostname);
+
+    if (isPrivateIp(result.address)) {
+        return Promise.reject(new errors.InternalServerError({
+            message: 'URL resolves to a non-permitted private IP block',
+            code: 'URL_PRIVATE_INVALID',
+            context: options.url.href
+        }));
+    }
+}
+
+async function errorIfInvalidUrl(options) {
+    if (config.get('env') === 'development') {
+        return;
+    }
+
+    if (!options.url.hostname || !validator.isURL(options.url.hostname)) {
+        throw new errors.InternalServerError({
+            message: 'URL invalid.',
+            code: 'URL_MISSING_INVALID',
+            context: options.url.href
+        });
+    }
+}
+
+async function disableRetries(options) {
+    // Force disable retries
+    options.retry = {
+        limit: 0,
+        calculateDelay: () => 0
+    };
+    options.timeout = 5000;
+}
+
+/**
+ * Install a custom dnsLookup on the request options that validates the resolved
+ * IP at connection time. This eliminates the DNS rebinding / TOCTOU gap between
+ * the beforeRequest DNS check and the actual TCP connection: the IP validated
+ * here is the same one Node's http module will connect to.
+ */
+function installSafeDnsLookup(options) {
+    if (config.get('env') === 'development') {
+        return;
+    }
+
+    const siteUrl = new URL(config.get('url'));
+    if (options.url.host === siteUrl.host) {
+        return;
+    }
+
+    const requestHref = options.url.href;
+    // Use 'lookup' (the native http.request option) rather than 'dnsLookup'
+    // (got's public API property which doesn't flow to the native request).
+    options.lookup = (hostname, dnsOpts, callback) => {
+        if (typeof dnsOpts === 'function') {
+            callback = dnsOpts;
+            dnsOpts = {};
+        }
+        dns.lookup(hostname, dnsOpts, (err, addressOrResult, family) => {
+            if (err) {
+                return callback(err, addressOrResult, family);
+            }
+            // When all:true, result is an array of {address, family} objects
+            if (dnsOpts && dnsOpts.all) {
+                const results = /** @type {{address: string, family: number}[]} */ (addressOrResult);
+                for (const entry of results) {
+                    if (isPrivateIp(entry.address)) {
+                        return callback(new errors.InternalServerError({
+                            message: 'URL resolves to a non-permitted private IP block',
+                            code: 'URL_PRIVATE_INVALID',
+                            context: requestHref
+                        }));
+                    }
+                }
+                return callback(null, results);
+            }
+            if (isPrivateIp(/** @type {string} */ (addressOrResult))) {
+                return callback(new errors.InternalServerError({
+                    message: 'URL resolves to a non-permitted private IP block',
+                    code: 'URL_PRIVATE_INVALID',
+                    context: requestHref
+                }));
+            }
+            callback(null, addressOrResult, family);
+        });
+    };
+}
+
+// same as our normal request lib but if any request in a redirect chain resolves
+// to a private IP address it will be blocked before the request is made.
+// The beforeRequest hooks provide a first-pass DNS check with clear error messages.
+// installSafeDnsLookup provides the authoritative gate at the connection layer,
+// preventing DNS rebinding attacks where the IP changes between check and connect.
+/** @type {ExtendOptions} */
+const gotOpts = {
+    headers: {
+        'user-agent': 'Ghost(https://github.com/TryGhost/Ghost)'
+    },
+    timeout: 10000, // default is no timeout
+    hooks: {
+        init: process.env.NODE_ENV?.startsWith('test') ? [disableRetries] : [],
+        beforeRequest: [errorIfInvalidUrl, errorIfHostnameResolvesToPrivateIp, installSafeDnsLookup],
+        beforeRedirect: [errorIfHostnameResolvesToPrivateIp, installSafeDnsLookup]
+    }
+};
+
+const externalRequest = got.extend(gotOpts);
+externalRequest.isPrivateIp = isPrivateIp;
+externalRequest._installSafeDnsLookup = installSafeDnsLookup;
+module.exports = externalRequest;
+```
+
+
+======================================================================
+
+【代码审计案例包 | diffpair】
+
+### id=diffpair-corpus_00299 lang=python
+#### 版本A（261 行）
+```python
+"""Inference backend abstraction for OpenMed.
+
+Provides a protocol for pluggable inference backends (HuggingFace, MLX, etc.)
+and auto-detection logic for selecting the best available backend on the
+current platform.
+"""
+
+from __future__ import annotations
+
+import logging
+import platform
+import warnings
+from typing import Any, Callable, Dict, List, Literal, Optional, Protocol, runtime_checkable
+
+logger = logging.getLogger(__name__)
+_warned_substitutions: set[str] = set()
+
+
+@runtime_checkable
+class InferenceBackend(Protocol):
+    """Protocol for inference backends.
+
+    Each backend must be able to report availability and create a callable
+    pipeline that accepts text and returns a list of entity dicts in the
+    HuggingFace ``token-classification`` output format::
+
+        [{"entity_group": str, "score": float, "word": str,
+          "start": int, "end": int}, ...]
+    """
+
+    def is_available(self) -> bool:
+        """Return True if this backend's dependencies are installed."""
+        ...
+
+    def create_pipeline(
+        self,
+        model_name: str,
+        task: str = "token-classification",
+        aggregation_strategy: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Callable:
+        """Create an inference pipeline for *model_name*.
+
+        Returns a callable ``pipeline(text, **kw) -> List[Dict]``.
+        """
+        ...
+
+
+class HuggingFaceBackend:
+    """Backend using HuggingFace Transformers + PyTorch."""
+
+    def __init__(self, config: Any = None) -> None:
+        self._config = config
+
+    def is_available(self) -> bool:
+        from openmed.core.models import HF_AVAILABLE
+        return HF_AVAILABLE
+
+    def create_pipeline(
+        self,
+        model_name: str,
+        task: str = "token-classification",
+        aggregation_strategy: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Callable:
+        from openmed.core.models import ModelLoader
+        loader = ModelLoader(self._config)
+        return loader._create_hf_pipeline(
+            model_name,
+            task=task,
+            aggregation_strategy=aggregation_strategy,
+            **kwargs,
+        )
+
+
+class MLXBackend:
+    """Backend using Apple MLX for hardware-accelerated inference."""
+
+    def __init__(self, config: Any = None) -> None:
+        self._config = config
+
+    def is_available(self) -> bool:
+        if platform.system() != "Darwin":
+            return False
+        try:
+            import mlx.core  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def create_pipeline(
+        self,
+        model_name: str,
+        task: str = "token-classification",
+        aggregation_strategy: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Callable:
+        from openmed.mlx.inference import create_mlx_pipeline
+        return create_mlx_pipeline(
+            model_name,
+            aggregation_strategy=aggregation_strategy,
+            config=self._config,
+            **kwargs,
+        )
+
+
+# -- Backend registry and auto-detection ------------------------------------
+
+_BACKENDS: Dict[str, type] = {
+    "hf": HuggingFaceBackend,
+    "mlx": MLXBackend,
+}
+
+
+def get_backend(
+    name: Optional[str] = None,
+    config: Any = None,
+) -> InferenceBackend:
+    """Return the requested backend, or auto-detect the best available one.
+
+    Args:
+        name: ``"hf"``, ``"mlx"``, or ``None`` for auto-detect.
+        config: OpenMedConfig to pass to the backend.
+
+    Auto-detection order:
+        1. MLX — if on Apple Silicon *and* ``mlx`` is importable.
+        2. HuggingFace — default fallback.
+    """
+    if name is not None:
+        if name not in _BACKENDS:
+            raise ValueError(
+                f"Unknown backend {name!r}. Available: {sorted(_BACKENDS)}"
+            )
+        backend = _BACKENDS[name](config)
+        if not backend.is_available():
+            raise RuntimeError(
+                f"Backend {name!r} is not available. "
+                f"Install its dependencies first."
+            )
+        return backend
+
+    # Auto-detect: prefer MLX on Apple Silicon
+    for candidate_name in ("mlx", "hf"):
+        candidate = _BACKENDS[candidate_name](config)
+        if candidate.is_available():
+            logger.info("Auto-selected inference backend: %s", candidate_name)
+            return candidate
+
+    raise RuntimeError(
+        "No inference backend available. "
+        "Install at least one: pip install openmed[hf] or pip install openmed[mlx]"
+    )
+
+
+# -- Privacy-filter routing ------------------------------------------------
+
+# Default Torch fallback for the original OpenAI Privacy Filter MLX artifacts
+# (``OpenMed/privacy-filter-mlx``, ``OpenMed/privacy-filter-mlx-8bit``). When
+# a user passes one of these IDs on a non-Apple-Silicon host we silently fall
+# back to the upstream PyTorch model and emit a one-time warning so they
+# understand the substitution.
+PRIVACY_FILTER_TORCH_FALLBACK = "openai/privacy-filter"
+
+
+# Family-aware Torch fallbacks. Order matters: the first matching marker
+# wins. Add new privacy-filter families here as they're introduced so an
+# MLX-only request from Linux falls back to the same family's PyTorch model
+# (not the unrelated default).
+_TORCH_FALLBACK_BY_FAMILY: tuple[tuple[str, str], ...] = (
+    ("multilingual", "OpenMed/privacy-filter-multilingual"),
+    ("nemotron", "OpenMed/privacy-filter-nemotron"),
+)
+
+
+def _torch_fallback_for(model_name: str) -> str:
+    """Pick the Torch fallback that matches ``model_name``'s family.
+
+    Substring-based to keep adding new families a one-line change.
+    """
+    name_lc = (model_name or "").lower()
+    for marker, repo in _TORCH_FALLBACK_BY_FAMILY:
+        if marker in name_lc:
+            return repo
+    return PRIVACY_FILTER_TORCH_FALLBACK
+
+
+def select_privacy_filter_backend(
+    model_name: str,
+) -> Literal["mlx", "torch"]:
+    """Pick MLX or Torch for a privacy-filter-family ``model_name``.
+
+    Returns ``"mlx"`` only when (a) MLX is importable on the current
+    machine, and (b) the requested model is itself an MLX artifact
+    (its name contains ``"mlx"`` or its on-disk metadata identifies as
+    one). Otherwise returns ``"torch"`` — including when an MLX-only
+    model name is requested on a non-Mac host, in which case the caller
+    should substitute :data:`PRIVACY_FILTER_TORCH_FALLBACK` for the
+    actual download.
+    """
+    name_lc = (model_name or "").lower()
+    is_mlx_artifact = "mlx" in name_lc
+
+    if not is_mlx_artifact:
+        # Some artifacts identify as MLX only via their on-disk metadata.
+        try:
+            from .pii import _is_privacy_filter_artifact_path
+            is_mlx_artifact = _is_privacy_filter_artifact_path(model_name)
+        except ImportError:  # pragma: no cover
+            is_mlx_artifact = False
+
+    if is_mlx_artifact and MLXBackend().is_available():
+        return "mlx"
+    return "torch"
+
+
+def resolve_privacy_filter_model(
+    model_name: str,
+    backend: Literal["mlx", "torch"],
+) -> str:
+    """Map a privacy-filter ``model_name`` to the actual artifact for ``backend``.
+
+    On Linux/Windows where MLX is unavailable, an ``OpenMed/privacy-filter-mlx*``
+    request needs to download the upstream PyTorch model instead. This
+    helper performs that substitution and emits a one-time UserWarning
+    so the user understands the swap.
+    """
+    if backend == "mlx":
+        return model_name
+
+    if "mlx" in (model_name or "").lower():
+        target = _torch_fallback_for(model_name)
+        if model_name not in _warned_substitutions:
+            warnings.warn(
+                f"OpenMed: {model_name!r} is an MLX-only artifact and "
+                f"cannot run on this host. Substituting "
+                f"{target!r} via Transformers. "
+                "To silence, request the PyTorch model directly.",
+                UserWarning,
+                stacklevel=3,
+            )
+            _warned_substitutions.add(model_name)
+        return target
+    return model_name
+
+
+def create_privacy_filter_pipeline(model_name: str) -> Callable:
+    """Build a privacy-filter pipeline appropriate for the host.
+
+    Returns a callable ``pipeline(text) -> List[Dict]`` whose output
+    schema matches the HuggingFace ``token-classification`` pipeline so
+    downstream OpenMed code is backend-agnostic.
+    """
+    backend = select_privacy_filter_backend(model_name)
+    actual_model = resolve_privacy_filter_model(model_name, backend)
+
+    if backend == "mlx":
+        from openmed.mlx.inference import create_mlx_pipeline
+        return create_mlx_pipeline(actual_model)
+
+    from openmed.torch.privacy_filter import PrivacyFilterTorchPipeline
+    return PrivacyFilterTorchPipeline(actual_model)
+```
+#### 版本B（271 行）
+```python
+"""Inference backend abstraction for OpenMed.
+
+Provides a protocol for pluggable inference backends (HuggingFace, MLX, etc.)
+and auto-detection logic for selecting the best available backend on the
+current platform.
+"""
+
+from __future__ import annotations
+
+import logging
+import platform
+import warnings
+from typing import Any, Callable, Dict, List, Literal, Optional, Protocol, runtime_checkable
+
+logger = logging.getLogger(__name__)
+_warned_substitutions: set[str] = set()
+
+
+@runtime_checkable
+class InferenceBackend(Protocol):
+    """Protocol for inference backends.
+
+    Each backend must be able to report availability and create a callable
+    pipeline that accepts text and returns a list of entity dicts in the
+    HuggingFace ``token-classification`` output format::
+
+        [{"entity_group": str, "score": float, "word": str,
+          "start": int, "end": int}, ...]
+    """
+
+    def is_available(self) -> bool:
+        """Return True if this backend's dependencies are installed."""
+        ...
+
+    def create_pipeline(
+        self,
+        model_name: str,
+        task: str = "token-classification",
+        aggregation_strategy: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Callable:
+        """Create an inference pipeline for *model_name*.
+
+        Returns a callable ``pipeline(text, **kw) -> List[Dict]``.
+        """
+        ...
+
+
+class HuggingFaceBackend:
+    """Backend using HuggingFace Transformers + PyTorch."""
+
+    def __init__(self, config: Any = None) -> None:
+        self._config = config
+
+    def is_available(self) -> bool:
+        from openmed.core.models import HF_AVAILABLE
+        return HF_AVAILABLE
+
+    def create_pipeline(
+        self,
+        model_name: str,
+        task: str = "token-classification",
+        aggregation_strategy: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Callable:
+        from openmed.core.models import ModelLoader
+        loader = ModelLoader(self._config)
+        return loader._create_hf_pipeline(
+            model_name,
+            task=task,
+            aggregation_strategy=aggregation_strategy,
+            **kwargs,
+        )
+
+
+class MLXBackend:
+    """Backend using Apple MLX for hardware-accelerated inference."""
+
+    def __init__(self, config: Any = None) -> None:
+        self._config = config
+
+    def is_available(self) -> bool:
+        if platform.system() != "Darwin":
+            return False
+        try:
+            import mlx.core  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def create_pipeline(
+        self,
+        model_name: str,
+        task: str = "token-classification",
+        aggregation_strategy: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Callable:
+        from openmed.mlx.inference import create_mlx_pipeline
+        return create_mlx_pipeline(
+            model_name,
+            aggregation_strategy=aggregation_strategy,
+            config=self._config,
+            **kwargs,
+        )
+
+
+# -- Backend registry and auto-detection ------------------------------------
+
+_BACKENDS: Dict[str, type] = {
+    "hf": HuggingFaceBackend,
+    "mlx": MLXBackend,
+}
+
+
+def get_backend(
+    name: Optional[str] = None,
+    config: Any = None,
+) -> InferenceBackend:
+    """Return the requested backend, or auto-detect the best available one.
+
+    Args:
+        name: ``"hf"``, ``"mlx"``, or ``None`` for auto-detect.
+        config: OpenMedConfig to pass to the backend.
+
+    Auto-detection order:
+        1. MLX — if on Apple Silicon *and* ``mlx`` is importable.
+        2. HuggingFace — default fallback.
+    """
+    if name is not None:
+        if name not in _BACKENDS:
+            raise ValueError(
+                f"Unknown backend {name!r}. Available: {sorted(_BACKENDS)}"
+            )
+        backend = _BACKENDS[name](config)
+        if not backend.is_available():
+            raise RuntimeError(
+                f"Backend {name!r} is not available. "
+                f"Install its dependencies first."
+            )
+        return backend
+
+    # Auto-detect: prefer MLX on Apple Silicon
+    for candidate_name in ("mlx", "hf"):
+        candidate = _BACKENDS[candidate_name](config)
+        if candidate.is_available():
+            logger.info("Auto-selected inference backend: %s", candidate_name)
+            return candidate
+
+    raise RuntimeError(
+        "No inference backend available. "
+        "Install at least one: pip install openmed[hf] or pip install openmed[mlx]"
+    )
+
+
+# -- Privacy-filter routing ------------------------------------------------
+
+# Default Torch fallback for the original OpenAI Privacy Filter MLX artifacts
+# (``OpenMed/privacy-filter-mlx``, ``OpenMed/privacy-filter-mlx-8bit``). When
+# a user passes one of these IDs on a non-Apple-Silicon host we silently fall
+# back to the upstream PyTorch model and emit a one-time warning so they
+# understand the substitution.
+PRIVACY_FILTER_TORCH_FALLBACK = "openai/privacy-filter"
+
+
+# Family-aware Torch fallbacks. Order matters: the first matching marker
+# wins. Add new privacy-filter families here as they're introduced so an
+# MLX-only request from Linux falls back to the same family's PyTorch model
+# (not the unrelated default).
+_TORCH_FALLBACK_BY_FAMILY: tuple[tuple[str, str], ...] = (
+    ("multilingual", "OpenMed/privacy-filter-multilingual"),
+    ("nemotron", "OpenMed/privacy-filter-nemotron"),
+)
+
+
+def _torch_fallback_for(model_name: str) -> str:
+    """Pick the Torch fallback that matches ``model_name``'s family.
+
+    Substring-based to keep adding new families a one-line change.
+    """
+    name_lc = (model_name or "").lower()
+    for marker, repo in _TORCH_FALLBACK_BY_FAMILY:
+        if marker in name_lc:
+            return repo
+    return PRIVACY_FILTER_TORCH_FALLBACK
+
+
+def select_privacy_filter_backend(
+    model_name: str,
+) -> Literal["mlx", "torch"]:
+    """Pick MLX or Torch for a privacy-filter-family ``model_name``.
+
+    Returns ``"mlx"`` only when (a) MLX is importable on the current
+    machine, and (b) the requested model is itself an MLX artifact
+    (its name contains ``"mlx"`` or its on-disk metadata identifies as
+    one). Otherwise returns ``"torch"`` — including when an MLX-only
+    model name is requested on a non-Mac host, in which case the caller
+    should substitute :data:`PRIVACY_FILTER_TORCH_FALLBACK` for the
+    actual download.
+    """
+    name_lc = (model_name or "").lower()
+    is_mlx_artifact = "mlx" in name_lc
+
+    if not is_mlx_artifact:
+        # Some artifacts identify as MLX only via their on-disk metadata.
+        try:
+            from .pii import _is_privacy_filter_artifact_path
+            is_mlx_artifact = _is_privacy_filter_artifact_path(model_name)
+        except ImportError:  # pragma: no cover
+            is_mlx_artifact = False
+
+    if is_mlx_artifact and MLXBackend().is_available():
+        return "mlx"
+    return "torch"
+
+
+def resolve_privacy_filter_model(
+    model_name: str,
+    backend: Literal["mlx", "torch"],
+) -> str:
+    """Map a privacy-filter ``model_name`` to the actual artifact for ``backend``.
+
+    On Linux/Windows where MLX is unavailable, an ``OpenMed/privacy-filter-mlx*``
+    request needs to download the upstream PyTorch model instead. This
+    helper performs that substitution and emits a one-time UserWarning
+    so the user understands the swap.
+    """
+    if backend == "mlx":
+        return model_name
+
+    if "mlx" in (model_name or "").lower():
+        target = _torch_fallback_for(model_name)
+        if model_name not in _warned_substitutions:
+            warnings.warn(
+                f"OpenMed: {model_name!r} is an MLX-only artifact and "
+                f"cannot run on this host. Substituting "
+                f"{target!r} via Transformers. "
+                "To silence, request the PyTorch model directly.",
+                UserWarning,
+                stacklevel=3,
+            )
+            _warned_substitutions.add(model_name)
+        return target
+    return model_name
+
+
+def create_privacy_filter_pipeline(model_name: str) -> Callable:
+    """Build a privacy-filter pipeline appropriate for the host.
+
+    Returns a callable ``pipeline(text) -> List[Dict]`` whose output
+    schema matches the HuggingFace ``token-classification`` pipeline so
+    downstream OpenMed code is backend-agnostic.
+    """
+    backend = select_privacy_filter_backend(model_name)
+    actual_model = resolve_privacy_filter_model(model_name, backend)
+
+    if backend == "mlx":
+        from openmed.mlx.inference import create_mlx_pipeline
+        return create_mlx_pipeline(actual_model)
+
+    from openmed.torch.privacy_filter import (
+        PrivacyFilterTorchPipeline,
+        is_trusted_for_remote_code,
+    )
+    # ``trust_remote_code=True`` is required to import the custom modeling
+    # code shipped inside first-party privacy-filter repos. Only enable it
+    # when the resolved model is on the allowlist; the pipeline itself
+    # double-checks and raises ``ValueError`` if the gate is bypassed.
+    return PrivacyFilterTorchPipeline(
+        actual_model,
+        trust_remote_code=is_trusted_for_remote_code(actual_model),
+    )
+```

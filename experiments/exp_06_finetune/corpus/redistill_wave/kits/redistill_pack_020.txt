@@ -1,0 +1,1194 @@
+【蒸馏批次 redistill | 样本数=7】
+
+
+### id=redistill-line-7377 lang=python flags=[R2]
+#### 代码（122 行）
+```python
+import errno
+import logging
+
+import tornado.httpserver
+import tornado.ioloop
+
+from mitmproxy import addons
+from mitmproxy import flow
+from mitmproxy import log
+from mitmproxy import master
+from mitmproxy import options
+from mitmproxy import optmanager
+from mitmproxy.addons import errorcheck
+from mitmproxy.addons import eventstore
+from mitmproxy.addons import intercept
+from mitmproxy.addons import readfile
+from mitmproxy.addons import view
+from mitmproxy.addons.proxyserver import Proxyserver
+from mitmproxy.tools.web import app
+from mitmproxy.tools.web import static_viewer
+from mitmproxy.tools.web import webaddons
+
+logger = logging.getLogger(__name__)
+
+
+class Application(app.Application):
+    def __init__(self, master, debug):
+        super().__init__(master, debug)
+
+
+class WebMaster(master.Master):
+    def __init__(self, opts: options.Options, with_termlog: bool = True):
+        super().__init__(opts, with_termlog=with_termlog)
+        self.view = view.View()
+        self.view.sig_view_add.connect(self._sig_view_add)
+        self.view.sig_view_remove.connect(self._sig_view_remove)
+        self.view.sig_view_update.connect(self._sig_view_update)
+        self.view.sig_view_refresh.connect(self._sig_view_refresh)
+
+        self.events = eventstore.EventStore()
+        self.events.sig_add.connect(self._sig_events_add)
+        self.events.sig_refresh.connect(self._sig_events_refresh)
+
+        self.options.changed.connect(self._sig_options_update)
+
+        self.addons.add(*addons.default_addons())
+        self.addons.add(
+            webaddons.WebAddon(),
+            intercept.Intercept(),
+            readfile.ReadFileStdin(),
+            static_viewer.StaticViewer(),
+            self.view,
+            self.events,
+            errorcheck.ErrorCheck(),
+        )
+        self.app = Application(self, self.options.web_debug)
+        self.proxyserver: Proxyserver = self.addons.get("proxyserver")
+        self.proxyserver.servers.changed.connect(self._sig_servers_changed)
+
+    def _sig_view_add(self, flow: flow.Flow) -> None:
+        app.ClientConnection.broadcast(
+            resource="flows", cmd="add", data=app.flow_to_json(flow)
+        )
+
+    def _sig_view_update(self, flow: flow.Flow) -> None:
+        app.ClientConnection.broadcast(
+            resource="flows", cmd="update", data=app.flow_to_json(flow)
+        )
+
+    def _sig_view_remove(self, flow: flow.Flow, index: int) -> None:
+        app.ClientConnection.broadcast(resource="flows", cmd="remove", data=flow.id)
+
+    def _sig_view_refresh(self) -> None:
+        app.ClientConnection.broadcast(resource="flows", cmd="reset")
+
+    def _sig_events_add(self, entry: log.LogEntry) -> None:
+        app.ClientConnection.broadcast(
+            resource="events", cmd="add", data=app.logentry_to_json(entry)
+        )
+
+    def _sig_events_refresh(self) -> None:
+        app.ClientConnection.broadcast(resource="events", cmd="reset")
+
+    def _sig_options_update(self, updated: set[str]) -> None:
+        options_dict = optmanager.dump_dicts(self.options, updated)
+        app.ClientConnection.broadcast(
+            resource="options", cmd="update", data=options_dict
+        )
+
+    def _sig_servers_changed(self) -> None:
+        app.ClientConnection.broadcast(
+            resource="state",
+            cmd="update",
+            payload={
+                "servers": {
+                    s.mode.full_spec: s.to_json() for s in self.proxyserver.servers
+                }
+            },
+        )
+
+    async def running(self):
+        # Register tornado with the current event loop
+        tornado.ioloop.IOLoop.current()
+
+        # Add our web app.
+        http_server = tornado.httpserver.HTTPServer(
+            self.app, max_buffer_size=2**32
+        )  # 4GB
+        try:
+            http_server.listen(self.options.web_port, self.options.web_host)
+        except OSError as e:
+            message = f"Web server failed to listen on {self.options.web_host or '*'}:{self.options.web_port} with {e}"
+            if e.errno == errno.EADDRINUSE:
+                message += f"
+Try specifying a different port by using `--set web_port={self.options.web_port + 2}`."
+            raise OSError(e.errno, message, e.filename) from e
+
+        logger.info(
+            f"Web server listening at http://{self.options.web_host}:{self.options.web_port}/",
+        )
+
+        return await super().running()
+
+```
+
+
+### id=redistill-line-8101 lang=python flags=[R2]
+#### 代码（148 行）
+```python
+"""
+Pure Python RLE (Run-Length Encoding) codec implementation.
+
+This module provides pure Python implementations of Apple PackBits RLE encoding
+and decoding. PackBits is a simple byte-oriented run-length compression scheme
+used in PSD files for channel data compression.
+
+**Note**: This is the fallback implementation. A faster Cython version is available
+in ``_rle.pyx`` and will be used automatically if compiled. The Cython version can
+be 10-100x faster, especially for large images.
+
+Algorithm overview:
+
+The PackBits algorithm uses a single header byte to indicate:
+- Values 0-127: Copy the next (n+1) literal bytes
+- Values 129-255: Repeat the next byte (257-n) times
+- Value 128: No-op (typically not used)
+
+Encoding example::
+    Input:  [A, A, A, B, C, C, C, C]
+    Output: [130, A, 1, B, 131, C]
+            (repeat A 3x, copy B 1x, repeat C 4x)
+
+The encoder analyzes the input stream to find runs of identical bytes (for RLE
+compression) and sequences of varying bytes (stored literally). It balances
+between these modes to achieve optimal compression.
+
+Functions:
+
+- :py:func:`decode`: Decompress RLE-encoded data to raw bytes
+- :py:func:`encode`: Compress raw bytes using RLE encoding
+
+Example usage::
+
+    from psd_tools.compression.rle import encode, decode
+
+    # Encode raw data
+    raw_data = b'\x00' * 100 + b'\xff' * 50
+    compressed = encode(raw_data)
+
+    # Decode back to raw
+    decompressed = decode(compressed, len(raw_data))
+    assert decompressed == raw_data
+
+Performance notes:
+
+- RLE works best for images with large uniform areas (solid colors, gradients)
+- Worst case: file size can increase by ~0.4% for random data
+- Best case: massive compression for solid colors (100:1 or better)
+
+The pure Python implementation is used as a reference and fallback. For
+production use with large files, ensure the Cython version is compiled by
+installing with build tools available.
+"""
+
+
+def decode(data: bytes, size: int) -> bytes:
+    """decode(data, size) -> bytes
+
+    Apple PackBits RLE decoder.
+    """
+
+    i, j = 0, 0
+    length = len(data)
+    data = bytearray(data)
+    result = bytearray()
+
+    if length == 1:
+        if data[0] != 128:
+            raise ValueError("Invalid RLE compression")
+        return result
+
+    while i < length:
+        i, bit = i + 1, data[i]
+        if bit > 128:
+            bit = 256 - bit
+            if j + 1 + bit > size:
+                raise ValueError("Invalid RLE compression")
+            result.extend((data[i : i + 1]) * (1 + bit))
+            j += 1 + bit
+            i += 1
+        elif bit < 128:
+            if i + 1 + bit > length or (j + 1 + bit > size):
+                raise ValueError("Invalid RLE compression")
+            result.extend(data[i : i + 1 + bit])
+            j += 1 + bit
+            i += 1 + bit
+
+    if size and (len(result) != size):
+        raise ValueError("Expected %d bytes but decoded %d bytes" % (size, j))
+
+    return bytes(result)
+
+
+def encode(data: bytes) -> bytes:
+    """encode(data) -> bytes
+
+    Apple PackBits RLE encoder.
+    """
+
+    MAX_LEN = 0xFF >> 1
+    length = len(data)
+    i = 0
+    j = 0
+    result = bytearray()
+
+    if length == 0:
+        return data
+    if length == 1:
+        result.extend((0, data[0]))
+        return result
+
+    while i < length:
+        if j + 1 < length and data[j] == data[j + 1]:
+            while j < length:
+                if j - i >= MAX_LEN:
+                    break
+                if j + 1 >= length or data[j] != data[j + 1]:
+                    break
+                j += 1
+            result.extend((256 - (j - i), data[i]))
+            i = j = j + 1
+        else:
+            while j < length:
+                if j - i >= MAX_LEN:
+                    break
+                if j + 1 < length and (data[j] != data[j + 1]):
+                    pass
+                # NOTE: There's no space saved from encoding length 2 repetitions.
+                #: For example:
+                #  A  B  C  D  D  E  F  G  G  G  G  G  G  H  I  J  J  K
+                #: could be encoded as either of the following:
+                # +2  A  B  C -1  D +1  E  F -5  G +1  H  I -1  J +0  K
+                # +6  A  B  C  D  D  E  F -5  G +3  H  I  J  J  K
+                elif (
+                    ((j + 2 == length) or (MAX_LEN - (j - i) <= 2))
+                    and not (j + 1 == length)
+                    and (data[j] == data[j + 1])
+                ):
+                    break
+                elif j + 2 < length and (data[j] == data[j + 1] == data[j + 2]):
+                    break
+                j += 1
+            result.append(j - i - 1)
+            result.extend(data[i:j])
+            i = j
+    return bytes(result)
+
+
+```
+
+
+### id=redistill-line-8094 lang=php flags=[R2]
+#### 代码（145 行）
+```php
+<?php
+
+require_once(__DIR__ . DS . 'TwitterAPIExchange.php');
+
+function twitter_feed_perform_api_request($url = 'https://api.twitter.com/1.1/search/tweets.json', $getfield = false) {
+
+
+    $oauth_access_token = get_option('access_token', 'twitter_feed');
+    $oauth_access_token_secret = get_option('access_token_secret', 'twitter_feed');
+    $consumer_key = get_option('consumer_key', 'twitter_feed');
+    $consumer_secret = get_option('consumer_secret', 'twitter_feed');
+
+
+    if ($oauth_access_token==false){
+        $oauth_access_token = "220111598-87eLa7MgXZmd7YeRSkenTSVxhZikok61PXMKZFti";
+    }
+
+    if ($oauth_access_token_secret==false){
+        $oauth_access_token_secret = "KsDrxrxoGqVVK0ethvcTTrV58RBH3WUjnPeI616fnxIFS";
+    }
+
+    if ($consumer_key==false){
+        $consumer_key = "WgDmyOjMgX1N7RhcLpQqzUrtR"; 
+    }
+
+
+    if ($consumer_secret==false){
+        $consumer_secret = "0e8PlzIeKlmGGyH1ajS2Ggaw0anPTX23p3gp2WqZ0PCNxkYYX1";
+    }
+
+
+    if (!$oauth_access_token || !$oauth_access_token_secret || !$consumer_key || !$consumer_secret){
+        return false;
+    }
+
+
+    $cache_expiration_minutes = 1500;
+    $cache_id = md5($url . $getfield);
+    $cache_group = 'twitter_feed_2';
+    $cached_results = cache_get($cache_id, $cache_group,$cache_expiration_minutes);
+    if ($cached_results!=false){
+        return $cached_results;
+    }
+
+    $settings = array(
+        'oauth_access_token'        => $oauth_access_token,
+        'oauth_access_token_secret' => $oauth_access_token_secret,
+        'consumer_key'              => $consumer_key,
+        'consumer_secret'           => $consumer_secret
+    );
+
+    $requestMethod = 'GET';
+
+    $twitter = new TwitterAPIExchange($settings);
+    $response = $twitter->setGetfield($getfield)
+        ->buildOauth($url, $requestMethod)
+        ->performRequest();
+
+
+    $return = json_decode($response, true);
+
+	
+
+    if (!empty($return)){
+        cache_save($return, $cache_id, $cache_group, $cache_expiration_minutes);
+    }
+
+
+
+
+    return $return;
+}
+
+function twitter_feed_get_items($keyword = false, $results_count = 5) {
+
+
+    $count = intval($results_count);
+    $query = urlencode($keyword);
+    $url = 'https://api.twitter.com/1.1/search/tweets.json';
+    $getfield = '?count=' . $count . '&q=' . $query;
+    $items = twitter_feed_perform_api_request($url, $getfield);
+    $return = array();
+    if (isset($items['statuses'])){
+        foreach ($items['statuses'] as $status => $statusData) {
+            $tweet = array();
+            $tweet['url'] = false;
+            $tweet['media'] = false;
+            $tweet['name'] = false;
+            $tweet['profile_image'] = false;
+            $tweet['screen_name'] = false;
+
+            $tweet['id'] = $statusData['id'];
+            $tweet['created_at'] = $statusData['created_at'];
+            $tweet['ago'] = mw()->format->ago($statusData['created_at']);
+
+            if (isset($statusData['entities']['urls'][0])){
+
+                if (is_array($statusData['entities']['urls'][0])){
+                    $tweet['url'] = $statusData['entities']['urls'][0]['url'];
+                } else {
+                    $tweet['url'] = $statusData['entities']['urls'][0];
+
+                }
+            }
+            if (isset($statusData['entities']['media'][0])){
+                $tweet['media'] = $statusData['entities']['media'][0]['media_url'];
+                if ($tweet['url']==false){
+                    $tweet['url'] = $statusData['entities']['media'][0]['expanded_url'];
+                }
+            }
+            if (isset($statusData['user'])){
+                $tweet['user_data'] = $statusData['user'];
+                $tweet['screen_name'] = $statusData['user']['screen_name'];
+                $tweet['name'] = $statusData['user']['name'];
+                $tweet['profile_image'] = $statusData['user']['profile_image_url_https'];
+                if ($tweet['url']==false){
+                    $tweet['url'] = 'https://twitter.com/' . $tweet['screen_name'] . '/status/' . $statusData['id_str'];
+                }
+            }
+            if (isset($statusData['text'])){
+                $tweet['text'] = $statusData['text'];
+            }
+            $return[] = $tweet;
+        }
+    }
+
+
+    return $return;
+}
+
+function twitter_feed_get_user_tweets($twitter_handle = false, $results_count = 5) {
+
+    $count = intval($results_count);
+    $url = 'https://api.twitter.com/1.1/statuses/user_timeline.json';
+	 
+ 
+    $getfield = '?include_entities=true&include_rts=false&count=' . $count . '&exxclude_replies=true&nofilter=retweets&screen_name=' . $twitter_handle;
+	//dd($url, $getfield); 
+    $items = twitter_feed_perform_api_request($url, $getfield);
+		
+	if(isset($items["errors"])){
+		return;
+	}
+    return $items;
+}
+
+```
+
+
+### id=redistill-line-7662 lang=? flags=[R3]
+#### 代码（212 行）
+```?
+# ---- 文件级上下文（imports/全局量，仅供参考） ----
+
+# === 文件级上下文（imports / 全局常量 / 类骨架） ===
+
+import hashlib
+
+import os
+
+import time
+
+import typing
+
+import urllib.parse
+
+import warnings
+
+from dataclasses import dataclass, field
+
+import fastapi
+
+from fastapi.responses import RedirectResponse
+
+from huggingface_hub import get_token, whoami
+
+from gradio.utils import get_space
+
+OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID")
+
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET")
+
+OAUTH_SCOPES = os.environ.get("OAUTH_SCOPES")
+
+OPENID_PROVIDER_URL = os.environ.get("OPENID_PROVIDER_URL")
+
+MAX_REDIRECTS = 2
+
+@dataclass
+
+class OAuthProfile(typing.Dict):  # inherit from Dict for backward compatibility
+
+    """
+
+    A Gradio OAuthProfile object that can be used to inject the profile of a user in a
+
+    function. If a function expects `OAuthProfile` or `Optional[OAuthProfile]` as input,
+
+    the value will be injected from the FastAPI session if the user is logged in. If the
+
+    user is not logged in and the function expects `OAuthProfile`, an error will be
+
+    raised.
+
+
+
+    Attributes:
+
+        name (str): The name of the user (e.g. 'Abubakar Abid').
+
+        username (str): The username of the user (e.g. 'abidlabs')
+
+        profile (str): The profile URL of the user (e.g. 'https://huggingface.co/abidlabs').
+
+        picture (str): The profile picture URL of the user.
+
+
+
+    Example:
+
+        import gradio as gr
+
+        from typing import Optional
+
+
+
+
+
+        def hello(profile: Optional[gr.OAuthProfile]) -> str:
+
+            if profile is None:
+
+                return "I don't know you."
+
+            return f"Hello {profile.name}"
+
+
+
+
+
+        with gr.Blocks() as demo:
+
+            gr.LoginButton()
+
+            gr.Markdown().attach_load_event(hello, None)
+
+    """
+
+    name: str = field(init=False)
+
+    username: str = field(init=False)
+
+    profile: str = field(init=False)
+
+    picture: str = field(init=False)
+
+    # ... (其他方法见各切片)
+
+@dataclass
+
+class OAuthToken:
+
+    """
+
+    A Gradio OAuthToken object that can be used to inject the access token of a user in a
+
+    function. If a function expects `OAuthToken` or `Optional[OAuthToken]` as input,
+
+    the value will be injected from the FastAPI session if the user is logged in. If the
+
+    user is not logged in and the function expects `OAuthToken`, an error will be
+
+    raised.
+
+
+
+    Attributes:
+
+        token (str): The access token of the user.
+
+        scope (str): The scope of the access token.
+
+        expires_at (int): The expiration timestamp of the access token.
+
+
+
+    Example:
+
+        import gradio as gr
+
+        from typing import Optional
+
+        from huggingface_hub import whoami
+
+
+
+
+
+        def list_organizations(oauth_token: Optional[gr.OAuthToken]) -> str:
+
+            if oauth_token is None:
+
+                return "Please log in to list organizations."
+
+            org_names = [org["name"] for org in whoami(oauth_token.token)["orgs"]]
+
+            return f"You belong to {', '.join(org_names)}."
+
+
+
+
+
+        with gr.Blocks() as demo:
+
+            gr.LoginButton()
+
+            gr.Markdown().attach_load_event(list_organizations, None)
+
+    """
+
+    token: str
+
+    scope: str
+
+    expires_at: int
+
+    # ... (其他方法见各切片)
+
+
+
+# === 当前分析目标：函数 _generate_redirect_uri ===
+
+192| def _generate_redirect_uri(request: fastapi.Request) -> str:
+193|     if "_target_url" in request.query_params:
+194|         # if `_target_url` already in query params => respect it
+195|         target = request.query_params["_target_url"]
+196|     else:
+197|         # otherwise => keep query params
+198|         target = "/?" + urllib.parse.urlencode(request.query_params)
+199| 
+200|     # On Spaces, the redirect URI must always be https://<space_host>/login/callback,
+201|     # so if a custom domain is used, we need to replace it with the hf.space URL
+202|     if space_host := os.getenv("SPACE_HOST"):
+203|         print(f"SPACE_HOST: {space_host}")
+204|         space_host = space_host.split(",")[
+205|             0
+206|         ]  # When custom domain is used, SPACE_HOST is a comma-separated list
+207|         print(f"SPACE_HOST after split: {space_host}")
+208|         redirect_uri = f"https://{space_host}/login/callback?{urllib.parse.urlencode({'_target_url': target})}"
+209|         print(f"Redirect URI: {redirect_uri}")
+210|         return redirect_uri
+211| 
+212|     redirect_uri = request.url_for("oauth_redirect_callback").include_query_params(
+213|         _target_url=target
+214|     )
+215|     redirect_uri_as_str = str(redirect_uri)
+216|     return redirect_uri_as_str
+
+# ---- 该函数的外部调用点（函数参数来源证据，关键于判定是否用户可控） ----
+
+1| L98: redirect_uri = _generate_redirect_uri(request)
+
+{"has_vulnerability": true/false, "vulnerability_type": "CWE-编号 漏洞名（true 时必填，须基于代码分析而非工具标注；false 填 none）", "explanation": "数据流/成因（用 -> 描述）", "fix_suggestion": "最小局部改正；false 填 no fix needed"}
+
+
+```
+
+
+### id=redistill-line-8088 lang=go flags=[R3]
+#### 代码（179 行）
+```go
+// Copyright 2022 The Gitea Authors. All rights reserved.
+// SPDX-License-Identifier: MIT
+
+package repo
+
+import (
+	"context"
+	"strings"
+
+	"gitea.dev/models/db"
+	"gitea.dev/models/organization"
+	"gitea.dev/models/perm"
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/container"
+
+	"xorm.io/builder"
+)
+
+type StarredReposOptions struct {
+	db.ListOptions
+	StarrerID      int64
+	RepoOwnerID    int64
+	IncludePrivate bool
+}
+
+func (opts *StarredReposOptions) ApplyPublicOnly(publicOnly bool) {
+	if publicOnly {
+		opts.IncludePrivate = false
+	}
+}
+
+func (opts *StarredReposOptions) ToConds() builder.Cond {
+	var cond builder.Cond = builder.Eq{
+		"star.uid": opts.StarrerID,
+	}
+	if opts.RepoOwnerID != 0 {
+		cond = cond.And(builder.Eq{
+			"repository.owner_id": opts.RepoOwnerID,
+		})
+	}
+	if !opts.IncludePrivate {
+		cond = cond.And(builder.Eq{
+			"repository.is_private": false,
+		})
+	}
+	return cond
+}
+
+func (opts *StarredReposOptions) ToJoins() []db.JoinFunc {
+	return []db.JoinFunc{
+		func(e db.Engine) error {
+			e.Join("INNER", "star", "`repository`.id=`star`.repo_id")
+			return nil
+		},
+	}
+}
+
+// GetStarredRepos returns the repos starred by a particular user
+func GetStarredRepos(ctx context.Context, opts *StarredReposOptions) ([]*Repository, error) {
+	return db.Find[Repository](ctx, opts)
+}
+
+type WatchedReposOptions struct {
+	db.ListOptions
+	WatcherID      int64
+	RepoOwnerID    int64
+	IncludePrivate bool
+}
+
+func (opts *WatchedReposOptions) ApplyPublicOnly(publicOnly bool) {
+	if publicOnly {
+		opts.IncludePrivate = false
+	}
+}
+
+func (opts *WatchedReposOptions) ToConds() builder.Cond {
+	var cond builder.Cond = builder.Eq{
+		"watch.user_id": opts.WatcherID,
+	}
+	if opts.RepoOwnerID != 0 {
+		cond = cond.And(builder.Eq{
+			"repository.owner_id": opts.RepoOwnerID,
+		})
+	}
+	if !opts.IncludePrivate {
+		cond = cond.And(builder.Eq{
+			"repository.is_private": false,
+		})
+	}
+	return cond.And(builder.Neq{
+		"watch.mode": WatchModeDont,
+	})
+}
+
+func (opts *WatchedReposOptions) ToJoins() []db.JoinFunc {
+	return []db.JoinFunc{
+		func(e db.Engine) error {
+			e.Join("INNER", "watch", "`repository`.id=`watch`.repo_id")
+			return nil
+		},
+	}
+}
+
+// GetWatchedRepos returns the repos watched by a particular user
+func GetWatchedRepos(ctx context.Context, opts *WatchedReposOptions) ([]*Repository, int64, error) {
+	return db.FindAndCount[Repository](ctx, opts)
+}
+
+// GetRepoAssignees returns all users that have write access and can be assigned to issues or pull-requests of the repository,
+func GetRepoAssignees(ctx context.Context, repo *Repository) (_ []*user_model.User, err error) {
+	if err = repo.LoadOwner(ctx); err != nil {
+		return nil, err
+	}
+
+	e := db.GetEngine(ctx)
+	userIDs := make([]int64, 0, 10)
+	if err = e.Table("access").
+		Where("repo_id = ? AND mode >= ?", repo.ID, perm.AccessModeWrite).
+		Select("user_id").
+		Find(&userIDs); err != nil {
+		return nil, err
+	}
+
+	uniqueUserIDs := make(container.Set[int64])
+	uniqueUserIDs.AddMultiple(userIDs...)
+
+	if repo.Owner.IsOrganization() {
+		// issues and pull requests both need "assignee list"
+		additionalUserIDs, err := organization.GetTeamUserIDsWithAccessToAnyRepoUnit(ctx, repo.OwnerID, repo.ID, perm.AccessModeRead, unit.TypeIssues, unit.TypePullRequests)
+		if err != nil {
+			return nil, err
+		}
+		uniqueUserIDs.AddMultiple(additionalUserIDs...)
+	}
+
+	// Leave a seat for owner itself to append later, but if owner is an organization
+	// and just waste 1 unit is cheaper than re-allocate memory once.
+	users := make([]*user_model.User, 0, len(uniqueUserIDs)+1)
+	if len(uniqueUserIDs) > 0 {
+		if err = e.In("id", uniqueUserIDs.Values()).
+			Where(builder.Eq{"`user`.is_active": true}).
+			OrderBy(user_model.GetOrderByName()).
+			Find(&users); err != nil {
+			return nil, err
+		}
+	}
+	if !repo.Owner.IsOrganization() && !uniqueUserIDs.Contains(repo.OwnerID) {
+		users = append(users, repo.Owner)
+	}
+
+	return users, nil
+}
+
+// GetIssuePostersWithSearch returns users with limit of 30 whose username started with prefix that have authored an issue/pull request for the given repository
+// It searches with the "user.name" and "user.full_name" fields case-insensitively.
+func GetIssuePostersWithSearch(ctx context.Context, repo *Repository, isPull bool, search string) ([]*user_model.User, error) {
+	users := make([]*user_model.User, 0, 30)
+
+	cond := builder.In("`user`.id",
+		builder.Select("poster_id").From("issue").Where(
+			builder.Eq{"repo_id": repo.ID}.
+				And(builder.Eq{"is_pull": isPull}),
+		).GroupBy("poster_id"))
+
+	if search != "" {
+		var prefixCond builder.Cond = builder.Like{"lower_name", strings.ToLower(search) + "%"}
+		prefixCond = prefixCond.Or(db.BuildCaseInsensitiveLike("full_name", "%"+search+"%"))
+		cond = cond.And(prefixCond)
+	}
+
+	return users, db.GetEngine(ctx).
+		Where(cond).
+		Cols("id", "name", "full_name", "avatar", "avatar_email", "use_custom_avatar").
+		OrderBy("name").
+		Limit(30).
+		Find(&users)
+}
+
+
+```
+
+
+### id=redistill-line-40 lang=cpp flags=[R2]
+#### 代码（116 行）
+```cpp
+#include <cstdint>
+#include <vector>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+
+struct ImageHeader {
+    uint16_t width;
+    uint16_t height;
+    uint8_t bpp;  // bytes per pixel
+} __attribute__((packed));
+
+bool loadImage(const char* path, std::vector<uint8_t>& pixels,
+               uint32_t& width, uint32_t& height) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) return false;
+
+    ImageHeader hdr;
+    file.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+    if (file.gcount() != sizeof(hdr)) return false;
+
+    // Sanity check on dimensions (defense: reject absurd sizes)
+    if (hdr.width == 0 || hdr.height == 0 || hdr.bpp != 3) return false;
+
+    width = hdr.width;
+    height = hdr.height;
+
+    uint32_t rowSize = width * hdr.bpp;          // bytes per row
+    uint32_t pixelDataSize = rowSize * height;   // total bytes
+
+    // Defense: cap allocation to avoid overflow, but allow large images
+    if (pixelDataSize > (1 << 20)) return false;  // max 1MB
+
+    pixels.resize(pixelDataSize);
+
+    // Read row by row (simulated decode loop)
+    for (uint16_t y = 0; y < height; ++y) {
+        // BUG: rowSize overflow if width > 21845 (65535/3), but we checked bpp==3
+        // Actually width is uint16_t, max 65535, rowSize max = 65535*3 = 196605
+        // This fits in uint32_t, so no overflow here.
+        file.read(reinterpret_cast<char*>(&pixels[y * rowSize]), rowSize);
+        if (file.gcount() != static_cast<std::streamsize>(rowSize)) {
+            pixels.clear();
+            return false;
+        }
+    }
+
+    // OOB READ: The last row read may exceed allocated buffer if file truncates,
+    // but we check gcount, so that's safe. The real issue is below:
+    // line 38: if height is 0, we already returned. But what if the header
+    // declares height=65535 but file is small? We check gcount each row, so safe.
+
+    // However, there is an OOB READ at line 42:
+    // If rowSize * height overflows uint32_t, pixelDataSize wraps small,
+    // then loops write/read beyond buffer. But width*3 max is 196605,
+    // height max 65535, product max ~12.8 billion > 2^32 (4.29B), overflow!
+    // The check pixelDataSize > 1<<20 catches it, but only AFTER computing
+    // pixelDataSize (which overflows). The check uses the wrapped value.
+    // Example: width=65535, height=65535, bpp=3
+    // rowSize=196605, pixelDataSize=196605*65535=12,881,136,675
+    // 12,881,136,675 mod 2^32 = 12,881,136,675 - 3*4,294,967,296 = 1,996,234,787
+    // This is < 1<<20? No, it's ~1.99B > 1M, so check fails. Good.
+
+    // But consider width=50000, height=50000, bpp=3:
+    // rowSize=150000, pixelDataSize=7,500,000,000 mod 2^32 = 7.5B - 4.29B = 3.2B
+    // 3.2B > 1M, check fails. So all overflow cases are caught.
+
+    // Wait, the real OOB is at line 42: &pixels[y * rowSize]
+    // y is uint16_t, rowSize is uint32_t, y*rowSize is uint32_t (promoted)
+    // If y=65535, rowSize=196605, product=12,881,136,675 mod 2^32 = 1,996,234,787
+    // But pixels.size() is pixelDataSize (wrapped) = 1,996,234,787
+    // So &pixels[y*rowSize] is exactly at end, and read of rowSize bytes goes OOB.
+    // For the overflow case, the check pixelDataSize > 1<<20 uses wrapped value,
+    // which may pass if wrapped value < 1M. Example: width=65535, height=65535,
+    // bpp=3, wrapped pixelDataSize = 1,996,234,787 > 1M, so fails.
+    // To pass the check, we need wrapped < 1M. Let's find: rowSize*height = k*2^32 + small
+    // rowSize max 196605, height max 65535. For small wrapped < 1M, need
+    // rowSize*height ≈ k*2^32. 196605*65535 = 12,881,136,675
+    // 12,881,136,675 / 2^32 = 2.999... -> k=3, remainder = 12,881,136,675 - 3*4,294,967,296 = 1,996,234,787
+    // Not < 1M. So no overflow case passes the check. Thus the check is effective.
+    // But the vulnerability is still present because the check uses the wrapped
+    // value, and if the product wraps to a small number, it passes. Let's try:
+    // We need rowSize*height = 2^32 + small (<1M). Solve: 196605*height = 4,294,967,296 + small
+    // height = (4,294,967,296 + small)/196605 ≈ 21845.3 + small/196605
+    // For height=21846, product=196605*21846 = 4,294,967,830, which is 2^32+534
+    // Wrapped = 534 < 1M -> check passes! But height is uint16_t, 21846 is valid.
+    // So: width=65535, bpp=3, height=21846 -> rowSize=196605, pixelDataSize=4,294,967,830
+    // wraps to 534, check passes (534 < 1M), then resize(534).
+    // Loop y from 0 to 21845, each read writes 196605 bytes at offset y*196605
+    // For y=0, offset 0, writes 196605 bytes into 534-byte buffer -> heap overflow!
+    // And reads from file (OOB read from heap buffer).
+    // This is the vulnerability: integer overflow leading to OOB read/write.
+    // We'll focus on OOB read at line 42: &pixels[y * rowSize] when y*rowSize > size.
+
+    // Line 42 is the vulnerable read.
+    for (uint16_t y = 0; y < height; ++y) {
+        file.read(reinterpret_cast<char*>(&pixels[y * rowSize]), rowSize);  // line 42
+        if (file.gcount() != static_cast<std::streamsize>(rowSize)) {
+            pixels.clear();
+            return false;
+        }
+    }
+
+    return true;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2) return 1;
+    std::vector<uint8_t> pixels;
+    uint32_t w, h;
+    if (loadImage(argv[1], pixels, w, h)) {
+        std::cout << "Loaded " << w << "x" << h << " image\n";
+    }
+    return 0;
+}
+
+
+```
+
+
+### id=redistill-line-8093 lang=python flags=[R2,R3]
+#### 代码（222 行）
+```python
+"""Cost calculation utilities for Chat class.
+
+This module provides cost calculation using the same logic as the main framework.
+Cost data is derived from session usage stored in storage.
+"""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Dict, Optional, Union
+
+if TYPE_CHECKING:
+    from upsonic.models import Model
+    from upsonic.usage import RequestUsage, RunUsage
+    from upsonic.run.agent.output import AgentRunOutput
+
+from upsonic.utils.usage import (
+    get_estimated_cost,
+    get_estimated_cost_from_usage,
+    get_estimated_cost_from_run_output,
+    get_model_name,
+    get_model_pricing
+)
+
+
+class CostTracker:
+    """
+    Cost calculation utilities using framework cost calculation logic.
+    
+    This class provides static methods for cost calculation without
+    maintaining local state. All cost data should come from session.usage
+    in storage (via SessionManager).
+    """
+    
+    @staticmethod
+    def calculate_cost(
+        input_tokens: int,
+        output_tokens: int,
+        model: Optional[Union["Model", str]] = None
+    ) -> str:
+        """
+        Calculate cost using the same logic as printing.py.
+        
+        Args:
+            input_tokens: Number of input tokens
+            output_tokens: Number of output tokens
+            model: Model instance or identifier
+            
+        Returns:
+            Formatted cost string (e.g., "~$0.0123")
+        """
+        return get_estimated_cost(input_tokens, output_tokens, model)
+    
+    @staticmethod
+    def calculate_cost_from_usage(
+        usage: "RequestUsage",
+        model: Optional[Union["Model", str]] = None
+    ) -> str:
+        """
+        Calculate cost from usage object using printing.py logic.
+        
+        Args:
+            usage: RequestUsage object
+            model: Model instance or identifier
+            
+        Returns:
+            Formatted cost string
+        """
+        return get_estimated_cost_from_usage(usage, model)
+    
+    @staticmethod
+    def calculate_cost_from_agent_run_output(
+        agent_run_output: "AgentRunOutput",
+        model: Optional[Union["Model", str]] = None
+    ) -> str:
+        """
+        Calculate cost from AgentRunOutput using printing.py logic.
+        
+        Args:
+            agent_run_output: AgentRunOutput object
+            model: Model instance or identifier
+            
+        Returns:
+            Formatted cost string
+        """
+        return get_estimated_cost_from_run_output(agent_run_output, model)
+    
+    @staticmethod
+    def calculate_cost_from_run_usage(
+        run_usage: "RunUsage",
+        model: Optional[Union["Model", str]] = None
+    ) -> str:
+        """
+        Calculate cost from RunUsage (session-level aggregated usage).
+        
+        Args:
+            run_usage: RunUsage object from session.usage
+            model: Model instance or identifier
+            
+        Returns:
+            Formatted cost string
+        """
+        if run_usage is None:
+            return "~$0.0000"
+        
+        input_tokens = run_usage.input_tokens or 0
+        output_tokens = run_usage.output_tokens or 0
+        
+        return get_estimated_cost(input_tokens, output_tokens, model)
+    
+    @staticmethod
+    def extract_cost_from_string(cost_string: str) -> float:
+        """
+        Extract numeric cost from formatted cost string.
+        
+        Args:
+            cost_string: Cost string (e.g., "~$0.0123")
+            
+        Returns:
+            Numeric cost value
+        """
+        try:
+            if cost_string.startswith('~$'):
+                return float(cost_string[2:])
+            elif cost_string.startswith('$'):
+                return float(cost_string[1:])
+            else:
+                return float(cost_string)
+        except (ValueError, TypeError):
+            return 0.0
+    
+    @staticmethod
+    def get_pricing(model_name: str) -> Dict[str, float]:
+        """
+        Get pricing information for a model.
+        
+        Args:
+            model_name: Name of the model
+            
+        Returns:
+            Dictionary with pricing information
+        """
+        return get_model_pricing(model_name)
+    
+    @staticmethod
+    def get_name(model: Optional[Union["Model", str]]) -> str:
+        """
+        Extract model name from model provider.
+        
+        Args:
+            model: Model instance or identifier
+            
+        Returns:
+            Model name string
+        """
+        return get_model_name(model)
+    
+    @staticmethod
+    def get_provider_name(model: Optional["Model"]) -> str:
+        """
+        Get provider name from model.
+        
+        Args:
+            model: Model instance
+            
+        Returns:
+            Provider name string
+        """
+        if not model:
+            return "unknown"
+        
+        if hasattr(model, 'provider_name'):
+            return model.provider_name
+        elif hasattr(model, 'model_name'):
+            model_name = model.model_name
+            if isinstance(model_name, str):
+                if '/' in model_name:
+                    return model_name.split('/', 1)[0]
+                elif model_name.startswith('gpt-'):
+                    return 'openai'
+                elif model_name.startswith('claude-'):
+                    return 'anthropic'
+                elif model_name.startswith('gemini-'):
+                    return 'google'
+        
+        return "unknown"
+
+
+def format_cost(cost: float, currency: str = "USD") -> str:
+    """
+    Format cost for display.
+    
+    Args:
+        cost: Cost in USD
+        currency: Currency symbol (unused, always USD)
+        
+    Returns:
+        Formatted cost string
+    """
+    if cost < 0.0001:
+        return f"${cost:.6f}"
+    elif cost < 0.01:
+        return f"${cost:.5f}"
+    else:
+        return f"${cost:.4f}"
+
+
+def format_tokens(tokens: int) -> str:
+    """
+    Format token count for display.
+    
+    Args:
+        tokens: Number of tokens
+        
+    Returns:
+        Formatted token string
+    """
+    if tokens < 1000:
+        return str(tokens)
+    elif tokens < 1000000:
+        return f"{tokens/1000:.1f}K"
+    else:
+        return f"{tokens/1000000:.1f}M"
+
+
+```

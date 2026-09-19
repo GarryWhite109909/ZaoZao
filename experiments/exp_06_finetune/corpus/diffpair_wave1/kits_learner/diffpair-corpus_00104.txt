@@ -1,0 +1,1390 @@
+# 代码安全分析请求 — 请认真分析
+
+> 我是做安全研究的，正在提升自己对代码审计的判断力。你的分析过程对我最有价值——
+> 请把你脑子里的推理步骤全部写出来，包括你排除掉的方向和为什么排除。
+> 下面是我整理的分析报告格式，请按这个结构写，方便我对照学习。
+
+---
+
+## 我需要你做的
+
+我会逐条消息发案例包给你，每包开头有【代码审计案例包】标记，包内有 `### id=...` 行标明案例编号。对每个代码样本做完整、独立的安全分析：**每条分析的第一行写 `### <案例编号> <版本A|版本B|全文>`**（编号照抄我给的 id），然后按以下格式逐项写，每一项都要有具体的行号和代码片段作为证据（片段用半角反引号包裹）：
+
+```
+入口: L<行号> <通道> <参数名> | 次要: <如有>
+    （通道别只看 HTTP 参数——配置文件、环境变量、命令行参数、stdin、文件流、DB 回读、内部 API 传参都算，我以前漏报最多的就是这些）
+链: L<行> <动作> → L<行> <动作> → L<行> <危险操作>
+    （判"安全"时本栏改写为: 未发现可达污点流，原因: <入口不可控 / sink 前防御封死 / 常量传播>）
+防御:
+  L<行> <机制> → 有效: <为什么攻击者过不去>
+  L<行> <机制> → 伪防御: <给出具体绕过字符串或 payload 片段>
+载荷: <能跑通的最短利用代码或 HTTP 请求>（要语义上真能触发——别拿会被引号/转义吃掉的字符串凑数）
+组合链: <如果多个缺陷串在一起危害更大，写出 A→B→C>
+锚句: 非 CWE-XX 因 <一句话>；非 CWE-YY 因 <一句话>
+结论: 存在漏洞=<true|false> | CWE-XXX <官方名> | <Critical|High|Medium|Low>
+修复: <行号 + 具体怎么改；用到的函数/模块必须在当前代码里已存在，别建议调用不存在的辅助函数>
+```
+
+---
+
+## 几个我踩过的坑，帮你避开
+
+1. "黑名单可绕过"这种话信息量为零——请把**具体绕过字符串**写出来（`....//`、`$()`、`%0a`、大小写变体），我才能真正理解防御为什么失败。
+2. **代码里的注释经常在撒谎**（"这里安全"其实有洞、"这里有洞"其实防御有效），注释里自己标的行号也经常是错的——请只看代码真实行为和真实行位，忽略注释声称的一切。
+3. 有些防御是**组合生效**的（A 单独不行 + B 单独不行 = AB 一起封死），请逐层拆开看，别只看单点。
+4. 如果硬编码的密钥/token 可以伪造会话或签名，从而**绕过看似存在的认证门**，这就是一条组合链，请写出来。
+5. 代码执行类的编号判别轴是**哪个解释器最终消费这个字符串**：shell 消费 → CWE-78（`execSync(shell:true)`、`["sh","-c",输入]` 都算，有无显式 shell 层不论）；`eval()`/`assert()`/`new Function()`/`preg_replace /e` 动态求值消费 → CWE-95/94 族（细分见判别笔记）；模板引擎把输入当代码渲染 → CWE-1336——三者别混。另外 `eval("var x = " + input)` 和 `eval(input)` 在我这里是同一类，别按"直接进 vs 拼接进"分成两种定性。
+6. 如果你是**从部署/运维角度**认为"这不会被打到"，那属于我的业务决策范围——请只报告代码层面可达的攻击面，部署上的事我自己判断。
+7. 如果某个判断**依赖我没贴出来的代码**（调用方、框架行为、运行环境、被截断的函数体），请显式标一句"样本外假设"——我要练习区分"代码内可证"和"凭经验猜测"。如果代码明显被截断了，直接告诉我要补哪段，别猜着补全分析。
+8. 我经常一条消息连发几个案例：**每个案例的行号、变量名、结论请逐条独立核对**——我遇到过把上一个样本的行号和结论串写到下一个样本的情况。
+9. 还有一类我容易漏的：**没有传统污点流的设计/配置缺陷**也请照实报告——弱协议/弱算法（TLS 1.0/SSL、MD5/SHA1——签名/MAC 用途和口令存储的快哈希都算）、不完整禁用列表/可绕过黑名单当防线、服务以 root 等过度权限运行（CWE-250）、可预测随机数生成令牌密钥（CWE-338）、禁用证书校验且无补偿控制（CWE-295）、硬编码凭证（CWE-798）——这些都给对应的 CWE。
+
+---
+
+## 样本类型说明
+
+你看到的代码有三种来源：
+- **单文件**：直接分析完整文件
+- **差分对**：同一个文件的两个版本（版本A、版本B）。请**分别独立分析**，版本A 的分析中不要参考版本 B 的任何内容；也不要因为"两个版本不一样"就预设哪个有问题——每个版本只按它自己的代码判
+- **文件切片**：大文件的一个片段，可能缺少上下文——不可达的方向请标注"样本外"
+
+**特殊：带官方结论的复核包**（包头标 `| redistill`，包内有"官方结论（待你验证）"区块）。这类是我自己推不稳的案例：把官方结论当作**待验证假设**，从代码出发推出支持它的完整证据链（污点路径/防御链逐行号）；如果你的推导确实到不了那个结论，写 `disagree: <哪一步断了、代码事实是什么>`——推不出来直说是有价值的，**禁止为凑结论编造不存在的行号、变量或数据流**。其中结论为"安全"的复核包：`防御:` 栏必须逐段给出**行号 + 什么机制 + 为什么不可旁路**，一句"已有校验"不合格。
+
+---
+
+## 我的判别笔记（结论里的 CWE 编号请按这份对齐；笔记本身整理错了也请直接指出）
+
+先问"注入的目标是什么"，再定编号：
+- sink 是 OS 程序执行 → CWE-78（**有没有 shell 层都算**，`["sh","-c",输入]` 也是 78）；注入的是"非 OS 的命令语言"（sed 脚本、IMAP/SMTP、应用配置语言）→ CWE-77；命令名固定、输入只落参数位 → CWE-88——**前提是输入能注入参数结构**（前导 `-`/`--` 被当新选项，如 `ssh -oProxyCommand=`、`tar --checkpoint-action=exec=`，或固定命令对该参数二次解析）；argv 单元素完整传递、无选项语义、无二次解析 = 无漏洞，别硬凑 88
+- 不可信数据进入 `eval()/exec()/Function()/preg_replace /e` 等**动态求值调用的求值位** → CWE-95——无论整段直传还是拼进代码文本（我查过 MITRE 4.20：95 是 94 的 Variant 子类，映射按更具体的 sink 优先，**拼接与否不影响 95 定位**；旧笔记"拼接主记 94"的统一口径已作废，统一主记 95，正文可注明旧口径差异）；拼出的代码**落盘后再执行**——写入 .py/.js/.sh 交解释器、存库后取出执行——正文注明 CWE-96；生成代码走**非求值器**的编译/执行路径（动态 import 之外的生成-编译链）或需父类兜底 → 94；输入进入**模板源码字符串位**被引擎渲染 → CWE-1336（`render(name=user)` 只是变量值，不算）；printf/format 的**格式串位**被控 → CWE-134；框架表达式求值器（SpEL/OGNL/EL）→ CWE-917；终端 ANSI/OSC 转义序列未净化 → CWE-150
+- sink 是 SQL（含 ORM raw）→ CWE-89；非 SQL 的查询逻辑（MongoDB 操作符、HQL）→ CWE-943（HQL 也有记 89 的惯例，本笔记统一 943，主编号别摇摆）；XPath → CWE-643；LDAP 过滤器 → CWE-90
+- 路径/文件名外部可控：出现 `../` 或等价目录上跳（含 `..\`、`%2e%2e%2f`、`..%c0%af`、symlink 逃逸）→ CWE-22；攻击者直接控绝对路径（如 `/etc/passwd`，无上跳）按本笔记也主记 22、正文可注明 CWE-73；仅文件名可控、目录不可控 → CWE-73
+- 未净化输入进入浏览器执行上下文（HTML/属性/JS 字符串）→ CWE-79，按**最终渲染上下文**判，不看变量叫什么
+- 不可信数据进反序列化器（readObject/pickle/unserialize）→ CWE-502（仅解析 JSON 等纯数据格式不算）。**受限反序列化器是有效防御**：`find_class`/resolve 白名单要同时满足（a）白名单内没有把输入当逻辑执行的构造器/方法、（b）可调用对象来源池封闭（REDUCE 链无法二段提升）才算防御有效。自写持久化通道（未验签的存储回读）算不算不可信输入看信任边界：攻击者取得该通道写入权的成本低于直接 RCE 成本 → 按 502 计，否则降为纵深防御缺失。XML 解析允许外部实体/DTD 且输入不可信 → CWE-611；把不可信流直接交给 JAXP 系列（`XPath.evaluate(InputSource,…)`、`Validator.validate(StreamSource)`、`Transformer.transform`）未设 `disallow-doctype-decl` 同样是 611，**`FEATURE_SECURE_PROCESSING` 不算有效防御**；纯实体膨胀 DoS（billion laughs、无外部实体）→ 正文注明 CWE-776，按 DoS 档定级
+- 服务端取回 URL 内容且目的地未校验 → CWE-918；借产品的身份/网络位置发请求（回环信任），最贴形是产品作为**非预期代理**把外部请求转交内部高权限服务 → CWE-441；内部服务"只信 localhost 所以不鉴权"按缺失认证/授权记 CWE-306/862，不算 441；骗浏览器跳转 → CWE-601
+- 没有授权检查 → CWE-862；查了但对象用户可控（IDOR）→ CWE-639；关键功能连认证都没有 → CWE-306；状态变更端点只靠自动携带的 Cookie、无 token/Origin 校验 → CWE-352。**SameSite 只有 Strict（或 Lax 且变更端点非 GET）才算一层防御**——Lax 在顶层导航 GET 上照带 Cookie；浏览器对未声明 SameSite 的 Cookie 默认按 Lax 处理，样本没写 SameSite 时别想当然按有防护算
+- JWT `alg=none` / 签名验证被禁用 → CWE-347（不是 327：不是算法弱，是验证被关了）
+- 用户可控动态键写入共享 dict/对象 → CWE-915（Python dict 没有原型链，禁止写"原型污染"叙事）；**JavaScript** 的 `obj[k]=v` 且 k 可为 `__proto__`/`constructor` → 正文注明 CWE-1321，同样不写"原型污染"字样敷衍、要写出完整链
+- 整数溢出/回绕：不可信输入进长度/偏移/索引/数量位，参与 `a + b`/`a * b`/移位/位掩码运算或宽窄类型转换后用于**边界检查、分配、拷贝、寻址**，且检查本身可被溢出绕过 → CWE-190（经典形态：`off + len > b.length` 在 `off+len` 溢出为负时放行，正确写法是 `len > b.length - off`）；JS 的索引回绕/负值规整缺陷（`index += origin`、位掩码寻址）同判；溢出结果没流向边界检查/分配/寻址的纯算术回绕不报或降档
+- 参数化/预编译/占位符查询 = SQL 注入的**有效防御，但只覆盖值位**；表名/列名/`ORDER BY` 字段/排序方向等标识符位不可绑定，回退拼接仍是 89——判"安全"前核对参数化覆盖了**所有**输入可达位；单点 replace/黑名单字符过滤 = **伪防御**（要核它漏了什么字符、作用位置对不对）
+- 硬编码凭证字面量用于认证/加密/签名 → CWE-798（"定义了但没使用"也是 798，风险降档即可；正文可加注更精确编号：在用且用于加密/签名的密钥 → CWE-321，未使用的配置项 → CWE-547）
+
+---
+
+## 风险等级我目前这么定（觉得哪条不合理，说出你的定法和理由）
+
+- Critical = 可达 RCE / 认证绕过 / 凭证直接泄露（认证门后就是 RCE 仍算 Critical）；"可达"要求**链上每一跳都在样本内可证**（路径、表名、组件行为全部代码内），任一跳依赖样本外（web root 可写、目标装有特定组件、上游权限）→ 记 High 并标"理论链"；凭证直接泄露限定为**可直接动用**的（私钥、数据库/服务账号口令、能伪造会话或签名的 secret），"像凭证但代码内无使用点"按 798 未使用降档
+- High = 注入类 / SSRF / XSS / 越权读写；没有利用链演示的理论 RCE 也记 High；等级按**组合链最坏情形**判，但同样受上一条"样本内可证"约束；Critical 与 High 两可时记 High 并写明理由，不虚高
+- Medium = 信息泄露 / 配置错误 / 有限 DoS / 定义未使用的硬编码凭证
+- Low = 影响极小
+
+---
+
+## 会话约定（以本提示词为准，不要自行增改）
+
+- 首条消息只有这段提示词、没有案例包时：直接给对判别笔记/风险等级的核对意见（有就写，没有只回"就绪"），然后等我发包，不要复述提示词。
+- 输出栏位以上面模板为准：**不新增"排除方向""次要发现"等独立栏位**——排除理由写进对应栏正文，次要发现并入修复栏前正文；自查清单**照常逐条打印**，不要改成静默执行。
+- 样本外假设不得单独支撑"存在漏洞=true"；整个判定悬在外部代码上时，列出需要我补的具体片段（调用点/类定义/函数体/依赖版本），能判的部分照判并标明影响范围。
+
+---
+
+## 输出末尾请自查
+
+- [ ] 每条分析第一行是否是 `### <案例编号> <版本>`？我发的每个案例、每个版本是否都各有一条分析？
+- [ ] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [ ] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [ ] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [ ] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [ ] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [ ] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [ ] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [ ] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（值位之外的表名/列名/排序位没有回退拼接）？
+
+最后：你的回复会被我原样归档进笔记库，请只写代码分析内容本身——不要客套话，不要"以下是分析""希望有帮助"之类的流程性文字。
+
+【代码审计案例包 | diffpair】
+
+### id=diffpair-corpus_00104 lang=php
+#### 版本A（622 行）
+```php
+<?php
+
+namespace Pontedilana\PhpWeasyPrint;
+
+use Pontedilana\PhpWeasyPrint\Exception\CouldNotReadFileContentException;
+use Pontedilana\PhpWeasyPrint\Exception\CouldNotReadFileSizeException;
+use Pontedilana\PhpWeasyPrint\Exception\FileAlreadyExistsException;
+use Psr\Log\LoggerAwareInterface;
+use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
+use Symfony\Component\Process\Process;
+
+/**
+ *  Base generator class for medias.
+ *
+ * @author  Matthieu Bontemps <matthieu.bontemps@knplabs.com>
+ * @author  Antoine Hérault <antoine.herault@knplabs.com>
+ * @author  Manuel Dalla Lana <manuel@pontedilana.it>
+ */
+abstract class AbstractGenerator implements GeneratorInterface, LoggerAwareInterface
+{
+    public const DEFAULT_TIMEOUT = 10;
+
+    /** @var list<string> */
+    public array $temporaryFiles = [];
+    protected ?string $temporaryFolder = null;
+    private LoggerInterface $logger;
+    private string $defaultExtension;
+
+    /** @var array<string, mixed>|null */
+    private ?array $env;
+    private ?int $timeout = null;
+
+    /** @var array<string, bool|int|string|array|null> */
+    private array $options = [];
+    private ?string $binary = null;
+
+    /**
+     * @param array<string, bool|int|string|array|null> $options
+     * @param array<string, mixed>|null                 $env
+     *
+     * @note
+     *  This class sets a default timeout on the process to prevent
+     *  orphaned or hanging processes. This is a defensive measure that applies
+     *  in most cases.
+     *
+     *  If you run this inside a queue worker, job runner, or any environment
+     *  that already handles timeouts (e.g. Symfony Messenger, Laravel Queue),
+     *  you can disable the internal timeout using:
+     *
+     *      $generator->disableTimeout();
+     *  or
+     *      $generator->setTimeout(null);
+     *
+     *  This ensures no conflicts with higher-level timeout strategies.
+     */
+    public function __construct(?string $binary = null, array $options = [], ?array $env = null)
+    {
+        $this->configure();
+
+        $this->logger = new NullLogger();
+        $this->setBinary($binary);
+        $this->setTimeout(self::DEFAULT_TIMEOUT);
+        $this->setOptions($options);
+        $this->env = empty($env) ? null : $env;
+
+        if (\is_callable([$this, 'removeTemporaryFiles'])) {
+            \register_shutdown_function([$this, 'removeTemporaryFiles']);
+        }
+    }
+
+    public function __destruct()
+    {
+        $this->removeTemporaryFiles();
+    }
+
+    /**
+     * This method must configure the media options.
+     *
+     * @see AbstractGenerator::addOption()
+     */
+    abstract protected function configure(): void;
+
+    /**
+     * {@inheritdoc}
+     */
+    public function generate(string $input, string $output, array $options = [], bool $overwrite = false): void
+    {
+        $this->prepareOutput($output, $overwrite);
+
+        $command = $this->getCommand($input, $output, $options);
+
+        $this->logger->info(\sprintf('Generate from file(s) "%s" to file "%s".', $input, $output), [
+            'command' => $command,
+            'env' => $this->env,
+            'timeout' => $this->timeout,
+        ]);
+
+        $status = null;
+        $stdout = $stderr = '';
+        try {
+            [$status, $stdout, $stderr] = $this->executeCommand($command);
+            $this->checkProcessStatus($status, $stdout, $stderr, $command);
+            $this->checkOutput($output, $command);
+        } catch (\Exception $e) {
+            $this->logger->error(\sprintf('An error happened while generating "%s".', $output), [
+                'command' => $command,
+                'status' => $status,
+                'stdout' => $stdout,
+                'stderr' => $stderr,
+            ]);
+
+            throw $e;
+        }
+
+        $this->logger->info(\sprintf('File "%s" has been successfully generated.', $output), [
+            'command' => $command,
+            'stdout' => $stdout,
+            'stderr' => $stderr,
+        ]);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function generateFromHtml(string $html, string $output, array $options = [], bool $overwrite = false): void
+    {
+        $fileName = $this->createTemporaryFile($html, 'html');
+
+        $this->generate($fileName, $output, $options, $overwrite);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getOutput(string $input, array $options = []): string
+    {
+        $filename = $this->createTemporaryFile(null, $this->getDefaultExtension());
+
+        $this->generate($input, $filename, $options);
+
+        return $this->getFileContents($filename);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getOutputFromHtml(string $html, array $options = []): string
+    {
+        $fileName = $this->createTemporaryFile($html, 'html');
+
+        return $this->getOutput($fileName, $options);
+    }
+
+    public function setLogger(LoggerInterface $logger): void
+    {
+        $this->logger = $logger;
+    }
+
+    /**
+     * Builds the command string.
+     *
+     * @param string                                    $binary  The binary path/name
+     * @param string                                    $input   Url or file location of the page to process
+     * @param string                                    $output  File location to the pdf-or-image-to-be
+     * @param array<string, bool|int|string|array|null> $options An array of options
+     */
+    protected function buildCommand(string $binary, string $input, string $output, array $options = []): string
+    {
+        $command = $this->getEscapedBinary($binary);
+
+        foreach ($options as $key => $option) {
+            if (null === $option || false === $option) {
+                continue;
+            }
+
+            if (true === $option) {
+                $command .= ' --' . $key;
+                continue;
+            }
+
+            if (\is_array($option)) {
+                foreach ($option as $v) {
+                    $command .= ' --' . $key . ' ' . \escapeshellarg($v);
+                }
+            } else {
+                $command .= ' --' . $key . ' ' . \escapeshellarg((string)$option);
+            }
+        }
+
+        return $command . (' ' . \escapeshellarg($input) . ' ' . \escapeshellarg($output));
+    }
+
+    /**
+     * Verifies the binary points to a real executable file, then returns it shell-escaped.
+     * Validating before escaping prevents shell-command injection through an
+     * attacker-controlled binary string.
+     *
+     * @throws \RuntimeException if the binary is not an executable file
+     */
+    protected function getEscapedBinary(string $binary): string
+    {
+        if (!\is_executable($binary)) {
+            throw new \RuntimeException(\sprintf("The binary '%s' is not executable.", $binary));
+        }
+
+        return \escapeshellarg($binary);
+    }
+
+    /**
+     * Executes the given command via shell and returns the complete output as
+     * a string.
+     *
+     * @return array{int|null, string, string} [status, stdout, stderr]
+     */
+    protected function executeCommand(string $command): array
+    {
+        $process = Process::fromShellCommandline($command, null, $this->env, null, $this->timeout);
+        $process->run();
+
+        return [
+            $process->getExitCode(),
+            $process->getOutput(),
+            $process->getErrorOutput(),
+        ];
+    }
+
+    /**
+     * Prepares the specified output.
+     *
+     * @param string $filename  The output filename
+     * @param bool   $overwrite Whether to overwrite the file if it already exists
+     *
+     * @throws FileAlreadyExistsException
+     * @throws \RuntimeException
+     * @throws \InvalidArgumentException
+     */
+    protected function prepareOutput(string $filename, bool $overwrite): void
+    {
+        if (0 === \strpos($filename, 'phar://')) {
+            throw new \InvalidArgumentException('The output file cannot be a phar archive.');
+        }
+
+        $directory = \dirname($filename);
+
+        if ($this->fileExists($filename)) {
+            if (!$this->isFile($filename)) {
+                throw new \InvalidArgumentException(\sprintf('The output file \'%s\' already exists and it is a %s.', $filename, $this->isDir($filename) ? 'directory' : 'link'));
+            }
+            if (false === $overwrite) {
+                throw new FileAlreadyExistsException(\sprintf('The output file \'%s\' already exists.', $filename));
+            }
+            if (!$this->unlink($filename)) {
+                throw new \RuntimeException(\sprintf('Could not delete already existing output file \'%s\'.', $filename));
+            }
+        } elseif (!$this->isDir($directory) && !$this->mkdir($directory)) {
+            throw new \RuntimeException(\sprintf('The output file\'s directory \'%s\' could not be created.', $directory));
+        }
+    }
+
+    public function getDefaultExtension(): string
+    {
+        return $this->defaultExtension;
+    }
+
+    public function setDefaultExtension(string $defaultExtension): self
+    {
+        $this->defaultExtension = $defaultExtension;
+
+        return $this;
+    }
+
+    public function setTimeout(?int $timeout): self
+    {
+        $this->timeout = $timeout;
+
+        return $this;
+    }
+
+    public function disableTimeout(): self
+    {
+        return $this->setTimeout(null);
+    }
+
+    /**
+     * Defines the binary.
+     *
+     * @param string|null $binary The path/name of the binary
+     */
+    public function setBinary(?string $binary): self
+    {
+        $this->binary = $binary;
+
+        return $this;
+    }
+
+    /**
+     * Returns the binary.
+     */
+    public function getBinary(): ?string
+    {
+        return $this->binary;
+    }
+
+    /**
+     * Returns the command for the given input and output files.
+     *
+     * @param string                                    $input   The input file
+     * @param string                                    $output  The ouput file
+     * @param array<string, bool|int|string|array|null> $options An optional array of options that will be used only for this command
+     */
+    public function getCommand(string $input, string $output, array $options = []): string
+    {
+        if (null === $this->binary) {
+            throw new \LogicException('You must define a binary prior to conversion.');
+        }
+
+        $options = $this->mergeOptions($options);
+
+        return $this->buildCommand($this->binary, $input, $output, $options);
+    }
+
+    /**
+     * Removes all temporary files.
+     */
+    public function removeTemporaryFiles(): void
+    {
+        $temporaryFolderPath = \realpath($this->getTemporaryFolder());
+        if (false === $temporaryFolderPath) {
+            return;
+        }
+        $temporaryFolderPath = \rtrim($temporaryFolderPath, \DIRECTORY_SEPARATOR) . \DIRECTORY_SEPARATOR;
+
+        foreach ($this->temporaryFiles as $file) {
+            // Only delete files actually located inside the temporary folder, so a path
+            // injected into the public $temporaryFiles cannot turn cleanup into an
+            // arbitrary file deletion at shutdown.
+            $filePath = \realpath($file);
+            if (false === $filePath || 0 !== \strncmp($filePath, $temporaryFolderPath, \strlen($temporaryFolderPath))) {
+                continue;
+            }
+            $this->unlink($file);
+        }
+    }
+
+    /**
+     * Get TemporaryFolder.
+     */
+    public function getTemporaryFolder(): string
+    {
+        return $this->temporaryFolder ?? \sys_get_temp_dir();
+    }
+
+    /**
+     * Set temporaryFolder.
+     */
+    public function setTemporaryFolder(string $temporaryFolder): self
+    {
+        $this->temporaryFolder = $temporaryFolder;
+
+        return $this;
+    }
+
+    /**
+     * Creates a temporary file.
+     * The file is not created if the $content argument is null.
+     *
+     * @param string|null $content   Optional content for the temporary file
+     * @param string|null $extension An optional extension for the filename
+     *
+     * @return string The filename
+     */
+    protected function createTemporaryFile(?string $content = null, ?string $extension = null): string
+    {
+        $dir = \rtrim($this->getTemporaryFolder(), \DIRECTORY_SEPARATOR);
+
+        if (!\is_dir($dir)) {
+            if (false === @\mkdir($dir, 0777, true) && !\is_dir($dir)) {
+                throw new \RuntimeException(\sprintf("Unable to create directory: %s\n", $dir));
+            }
+        } elseif (!\is_writable($dir)) {
+            throw new \RuntimeException(\sprintf("Unable to write in directory: %s\n", $dir));
+        }
+
+        $filename = $dir . \DIRECTORY_SEPARATOR . \uniqid('php_weasyprint', true);
+
+        if (null !== $extension) {
+            $filename .= '.' . $extension;
+        }
+
+        if (null !== $content) {
+            \file_put_contents($filename, $content);
+        }
+
+        $this->temporaryFiles[] = $filename;
+
+        return $filename;
+    }
+
+    /**
+     * Sets an option. Be aware that option values are NOT validated and that
+     * it is your responsibility to validate user inputs.
+     *
+     * @param string                     $name  The option to set
+     * @param bool|int|string|array|null $value The value (NULL to unset)
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function setOption(string $name, $value): self
+    {
+        if (!\array_key_exists($name, $this->options)) {
+            throw new \InvalidArgumentException(\sprintf('The option \'%s\' does not exist.', $name));
+        }
+
+        $this->options[$name] = $value;
+
+        $this->logger->debug(\sprintf('Set option "%s".', $name), ['value' => $value]);
+
+        return $this;
+    }
+
+    /**
+     * Sets an array of options.
+     *
+     * @param array<string, bool|int|string|array|null> $options An associative array of options as name/value
+     */
+    public function setOptions(array $options): self
+    {
+        foreach ($options as $name => $value) {
+            $this->setOption($name, $value);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Returns all the options.
+     *
+     * @return array<string, bool|int|string|array|null>
+     */
+    public function getOptions(): array
+    {
+        return $this->options;
+    }
+
+    /**
+     * Adds an option.
+     *
+     * @param string                     $name    The option name
+     * @param bool|int|string|array|null $default An optional default value
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function addOption(string $name, $default = null): self
+    {
+        if (\array_key_exists($name, $this->options)) {
+            throw new \InvalidArgumentException(\sprintf('The option \'%s\' already exists.', $name));
+        }
+
+        $this->options[$name] = $default;
+
+        return $this;
+    }
+
+    /**
+     * Adds an array of options.
+     *
+     * @param array<string, bool|int|string|array|null> $options
+     */
+    protected function addOptions(array $options): self
+    {
+        foreach ($options as $name => $default) {
+            $this->addOption($name, $default);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Merges the given array of options to the instance options and returns
+     * the result options array. It does NOT change the instance options.
+     *
+     * @param array<string, bool|int|string|array|null> $options
+     *
+     * @return array<string, bool|int|string|array|null>
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function mergeOptions(array $options): array
+    {
+        $mergedOptions = $this->options;
+
+        foreach ($options as $name => $value) {
+            if (!\array_key_exists($name, $mergedOptions)) {
+                throw new \InvalidArgumentException(\sprintf('The option \'%s\' does not exist.', $name));
+            }
+
+            $mergedOptions[$name] = $value;
+        }
+
+        return $mergedOptions;
+    }
+
+    /**
+     * Reset all options to their initial values.
+     */
+    public function resetOptions(): void
+    {
+        $this->options = [];
+        $this->configure();
+    }
+
+    /**
+     * Checks the specified output.
+     *
+     * @param string $output  The output filename
+     * @param string $command The generation command
+     *
+     * @throws \RuntimeException if the output file generation failed
+     */
+    protected function checkOutput(string $output, string $command): void
+    {
+        // the output file must exist
+        if (!$this->fileExists($output)) {
+            throw new \RuntimeException(\sprintf('The file \'%s\' was not created (command: %s).', $output, $command));
+        }
+
+        // the output file must not be empty
+        if (0 === $this->filesize($output)) {
+            throw new \RuntimeException(\sprintf('The file \'%s\' was created but is empty (command: %s).', $output, $command));
+        }
+    }
+
+    /**
+     * Checks the process return status.
+     *
+     * @param ?int   $status  The exit status code
+     * @param string $stdout  The stdout content
+     * @param string $stderr  The stderr content
+     * @param string $command The run command
+     *
+     * @throws \RuntimeException if the output file generation failed
+     */
+    protected function checkProcessStatus(?int $status, string $stdout, string $stderr, string $command): void
+    {
+        if (null === $status) {
+            throw new \RuntimeException(\sprintf('The command is not terminated.' . "\n" . 'stderr: "%s"' . "\n" . 'stdout: "%s"' . "\n" . 'command: %s', $stderr, $stdout, $command));
+        }
+
+        if (0 !== $status && '' !== $stderr) {
+            throw new \RuntimeException(\sprintf('The exit status code \'%s\' says something went wrong:' . "\n" . 'stderr: "%s"' . "\n" . 'stdout: "%s"' . "\n" . 'command: %s', $status, $stderr, $stdout, $command), $status);
+        }
+    }
+
+    /**
+     * Wrapper for the "file_get_contents" function.
+     */
+    protected function getFileContents(string $filename): string
+    {
+        $fileContent = \file_get_contents($filename);
+
+        if (false === $fileContent) {
+            throw new CouldNotReadFileContentException(\sprintf('Could not read file \'%s\' content.', $filename));
+        }
+
+        return $fileContent;
+    }
+
+    /**
+     * Wrapper for the "file_exists" function.
+     */
+    protected function fileExists(string $filename): bool
+    {
+        return \file_exists($filename);
+    }
+
+    /**
+     * Wrapper for the "is_file" method.
+     */
+    protected function isFile(string $filename): bool
+    {
+        return \strlen($filename) <= \PHP_MAXPATHLEN && \is_file($filename);
+    }
+
+    /**
+     * Wrapper for the "filesize" function.
+     */
+    protected function filesize(string $filename): int
+    {
+        $filesize = \filesize($filename);
+
+        if (false === $filesize) {
+            throw new CouldNotReadFileSizeException(\sprintf('Could not read file \'%s\' size.', $filename));
+        }
+
+        return $filesize;
+    }
+
+    /**
+     * Wrapper for the "unlink" function.
+     */
+    protected function unlink(string $filename): bool
+    {
+        return $this->fileExists($filename) && \unlink($filename);
+    }
+
+    /**
+     * Wrapper for the "is_dir" function.
+     */
+    protected function isDir(string $filename): bool
+    {
+        return \is_dir($filename);
+    }
+
+    /**
+     * Wrapper for the mkdir function.
+     */
+    protected function mkdir(string $pathname): bool
+    {
+        return \mkdir($pathname, 0777, true);
+    }
+}
+```
+#### 版本B（655 行）
+```php
+<?php
+
+namespace Pontedilana\PhpWeasyPrint;
+
+use Pontedilana\PhpWeasyPrint\Exception\CouldNotReadFileContentException;
+use Pontedilana\PhpWeasyPrint\Exception\CouldNotReadFileSizeException;
+use Pontedilana\PhpWeasyPrint\Exception\FileAlreadyExistsException;
+use Psr\Log\LoggerAwareInterface;
+use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
+use Symfony\Component\Process\Process;
+
+/**
+ *  Base generator class for medias.
+ *
+ * @author  Matthieu Bontemps <matthieu.bontemps@knplabs.com>
+ * @author  Antoine Hérault <antoine.herault@knplabs.com>
+ * @author  Manuel Dalla Lana <manuel@pontedilana.it>
+ */
+abstract class AbstractGenerator implements GeneratorInterface, LoggerAwareInterface
+{
+    public const DEFAULT_TIMEOUT = 10;
+
+    /** @var list<string> */
+    protected const ALLOWED_PROTOCOLS = ['file'];
+
+    protected const WINDOWS_LOCAL_FILENAME_REGEX = '/^[a-z]:(?:[\\\\\/]?(?:[\w\s!#()-]+|[\.]{1,2})+)*[\\\\\/]?/i';
+
+    /** @var list<string> */
+    public array $temporaryFiles = [];
+    protected ?string $temporaryFolder = null;
+    private LoggerInterface $logger;
+    private string $defaultExtension;
+
+    /** @var array<string, mixed>|null */
+    private ?array $env;
+    private ?int $timeout = null;
+
+    /** @var array<string, bool|int|string|array|null> */
+    private array $options = [];
+    private ?string $binary = null;
+
+    /**
+     * @param array<string, bool|int|string|array|null> $options
+     * @param array<string, mixed>|null                 $env
+     *
+     * @note
+     *  This class sets a default timeout on the process to prevent
+     *  orphaned or hanging processes. This is a defensive measure that applies
+     *  in most cases.
+     *
+     *  If you run this inside a queue worker, job runner, or any environment
+     *  that already handles timeouts (e.g. Symfony Messenger, Laravel Queue),
+     *  you can disable the internal timeout using:
+     *
+     *      $generator->disableTimeout();
+     *  or
+     *      $generator->setTimeout(null);
+     *
+     *  This ensures no conflicts with higher-level timeout strategies.
+     */
+    public function __construct(?string $binary = null, array $options = [], ?array $env = null)
+    {
+        $this->configure();
+
+        $this->logger = new NullLogger();
+        $this->setBinary($binary);
+        $this->setTimeout(self::DEFAULT_TIMEOUT);
+        $this->setOptions($options);
+        $this->env = empty($env) ? null : $env;
+
+        if (\is_callable([$this, 'removeTemporaryFiles'])) {
+            \register_shutdown_function([$this, 'removeTemporaryFiles']);
+        }
+    }
+
+    public function __destruct()
+    {
+        $this->removeTemporaryFiles();
+    }
+
+    /**
+     * This method must configure the media options.
+     *
+     * @see AbstractGenerator::addOption()
+     */
+    abstract protected function configure(): void;
+
+    /**
+     * {@inheritdoc}
+     */
+    public function generate(string $input, string $output, array $options = [], bool $overwrite = false): void
+    {
+        $this->prepareOutput($output, $overwrite);
+
+        $command = $this->getCommand($input, $output, $options);
+
+        $this->logger->info(\sprintf('Generate from file(s) "%s" to file "%s".', $input, $output), [
+            'command' => $command,
+            'env' => $this->env,
+            'timeout' => $this->timeout,
+        ]);
+
+        $status = null;
+        $stdout = $stderr = '';
+        try {
+            [$status, $stdout, $stderr] = $this->executeCommand($command);
+            $this->checkProcessStatus($status, $stdout, $stderr, $command);
+            $this->checkOutput($output, $command);
+        } catch (\Exception $e) {
+            $this->logger->error(\sprintf('An error happened while generating "%s".', $output), [
+                'command' => $command,
+                'status' => $status,
+                'stdout' => $stdout,
+                'stderr' => $stderr,
+            ]);
+
+            throw $e;
+        }
+
+        $this->logger->info(\sprintf('File "%s" has been successfully generated.', $output), [
+            'command' => $command,
+            'stdout' => $stdout,
+            'stderr' => $stderr,
+        ]);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function generateFromHtml(string $html, string $output, array $options = [], bool $overwrite = false): void
+    {
+        $fileName = $this->createTemporaryFile($html, 'html');
+
+        $this->generate($fileName, $output, $options, $overwrite);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getOutput(string $input, array $options = []): string
+    {
+        $filename = $this->createTemporaryFile(null, $this->getDefaultExtension());
+
+        $this->generate($input, $filename, $options);
+
+        return $this->getFileContents($filename);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getOutputFromHtml(string $html, array $options = []): string
+    {
+        $fileName = $this->createTemporaryFile($html, 'html');
+
+        return $this->getOutput($fileName, $options);
+    }
+
+    public function setLogger(LoggerInterface $logger): void
+    {
+        $this->logger = $logger;
+    }
+
+    /**
+     * Builds the command string.
+     *
+     * @param string                                    $binary  The binary path/name
+     * @param string                                    $input   Url or file location of the page to process
+     * @param string                                    $output  File location to the pdf-or-image-to-be
+     * @param array<string, bool|int|string|array|null> $options An array of options
+     */
+    protected function buildCommand(string $binary, string $input, string $output, array $options = []): string
+    {
+        $command = $this->getEscapedBinary($binary);
+
+        foreach ($options as $key => $option) {
+            if (null === $option || false === $option) {
+                continue;
+            }
+
+            if (true === $option) {
+                $command .= ' --' . $key;
+                continue;
+            }
+
+            if (\is_array($option)) {
+                foreach ($option as $v) {
+                    $command .= ' --' . $key . ' ' . \escapeshellarg($v);
+                }
+            } else {
+                $command .= ' --' . $key . ' ' . \escapeshellarg((string)$option);
+            }
+        }
+
+        return $command . (' ' . \escapeshellarg($input) . ' ' . \escapeshellarg($output));
+    }
+
+    /**
+     * Verifies the binary points to a real executable file, then returns it shell-escaped.
+     * Validating before escaping prevents shell-command injection through an
+     * attacker-controlled binary string.
+     *
+     * @throws \RuntimeException if the binary is not an executable file
+     */
+    protected function getEscapedBinary(string $binary): string
+    {
+        if (!\is_executable($binary)) {
+            throw new \RuntimeException(\sprintf("The binary '%s' is not executable.", $binary));
+        }
+
+        return \escapeshellarg($binary);
+    }
+
+    /**
+     * Executes the given command via shell and returns the complete output as
+     * a string.
+     *
+     * @return array{int|null, string, string} [status, stdout, stderr]
+     */
+    protected function executeCommand(string $command): array
+    {
+        $process = Process::fromShellCommandline($command, null, $this->env, null, $this->timeout);
+        $process->run();
+
+        return [
+            $process->getExitCode(),
+            $process->getOutput(),
+            $process->getErrorOutput(),
+        ];
+    }
+
+    /**
+     * Prepares the specified output.
+     *
+     * @param string $filename  The output filename
+     * @param bool   $overwrite Whether to overwrite the file if it already exists
+     *
+     * @throws FileAlreadyExistsException
+     * @throws \RuntimeException
+     * @throws \InvalidArgumentException
+     */
+    protected function prepareOutput(string $filename, bool $overwrite): void
+    {
+        if (!$this->isProtocolAllowed($filename)) {
+            throw new \InvalidArgumentException(\sprintf("The output file scheme is not supported. Expected one of ['%s'].", \implode("', '", self::ALLOWED_PROTOCOLS)));
+        }
+
+        $directory = \dirname($filename);
+
+        if ($this->fileExists($filename)) {
+            if (!$this->isFile($filename)) {
+                throw new \InvalidArgumentException(\sprintf('The output file \'%s\' already exists and it is a %s.', $filename, $this->isDir($filename) ? 'directory' : 'link'));
+            }
+            if (false === $overwrite) {
+                throw new FileAlreadyExistsException(\sprintf('The output file \'%s\' already exists.', $filename));
+            }
+            if (!$this->unlink($filename)) {
+                throw new \RuntimeException(\sprintf('Could not delete already existing output file \'%s\'.', $filename));
+            }
+        } elseif (!$this->isDir($directory) && !$this->mkdir($directory)) {
+            throw new \RuntimeException(\sprintf('The output file\'s directory \'%s\' could not be created.', $directory));
+        }
+    }
+
+    /**
+     * Verifies that the given filename uses an allowed protocol.
+     *
+     * A scheme allow-list (instead of a `phar://` blacklist) closes the
+     * case-insensitive wrapper bypass that would otherwise reach file_exists()
+     * with e.g. `PHAR://`, enabling PHAR deserialization on PHP < 8.
+     *
+     * @throws \InvalidArgumentException if the filename is not valid
+     */
+    protected function isProtocolAllowed(string $filename): bool
+    {
+        if (false === $parsedFilename = \parse_url($filename)) {
+            throw new \InvalidArgumentException('The filename is not valid.');
+        }
+
+        $protocol = isset($parsedFilename['scheme']) ? \strtolower($parsedFilename['scheme']) : 'file';
+
+        if (
+            'Windows' === \PHP_OS_FAMILY
+            && 1 === \strlen($protocol)
+            && 1 === \preg_match(self::WINDOWS_LOCAL_FILENAME_REGEX, $filename)
+        ) {
+            $protocol = 'file';
+        }
+
+        return \in_array($protocol, self::ALLOWED_PROTOCOLS, true);
+    }
+
+    public function getDefaultExtension(): string
+    {
+        return $this->defaultExtension;
+    }
+
+    public function setDefaultExtension(string $defaultExtension): self
+    {
+        $this->defaultExtension = $defaultExtension;
+
+        return $this;
+    }
+
+    public function setTimeout(?int $timeout): self
+    {
+        $this->timeout = $timeout;
+
+        return $this;
+    }
+
+    public function disableTimeout(): self
+    {
+        return $this->setTimeout(null);
+    }
+
+    /**
+     * Defines the binary.
+     *
+     * @param string|null $binary The path/name of the binary
+     */
+    public function setBinary(?string $binary): self
+    {
+        $this->binary = $binary;
+
+        return $this;
+    }
+
+    /**
+     * Returns the binary.
+     */
+    public function getBinary(): ?string
+    {
+        return $this->binary;
+    }
+
+    /**
+     * Returns the command for the given input and output files.
+     *
+     * @param string                                    $input   The input file
+     * @param string                                    $output  The ouput file
+     * @param array<string, bool|int|string|array|null> $options An optional array of options that will be used only for this command
+     */
+    public function getCommand(string $input, string $output, array $options = []): string
+    {
+        if (null === $this->binary) {
+            throw new \LogicException('You must define a binary prior to conversion.');
+        }
+
+        $options = $this->mergeOptions($options);
+
+        return $this->buildCommand($this->binary, $input, $output, $options);
+    }
+
+    /**
+     * Removes all temporary files.
+     */
+    public function removeTemporaryFiles(): void
+    {
+        $temporaryFolderPath = \realpath($this->getTemporaryFolder());
+        if (false === $temporaryFolderPath) {
+            return;
+        }
+        $temporaryFolderPath = \rtrim($temporaryFolderPath, \DIRECTORY_SEPARATOR) . \DIRECTORY_SEPARATOR;
+
+        foreach ($this->temporaryFiles as $file) {
+            // Only delete files actually located inside the temporary folder, so a path
+            // injected into the public $temporaryFiles cannot turn cleanup into an
+            // arbitrary file deletion at shutdown.
+            $filePath = \realpath($file);
+            if (false === $filePath || 0 !== \strncmp($filePath, $temporaryFolderPath, \strlen($temporaryFolderPath))) {
+                continue;
+            }
+            $this->unlink($file);
+        }
+    }
+
+    /**
+     * Get TemporaryFolder.
+     */
+    public function getTemporaryFolder(): string
+    {
+        return $this->temporaryFolder ?? \sys_get_temp_dir();
+    }
+
+    /**
+     * Set temporaryFolder.
+     */
+    public function setTemporaryFolder(string $temporaryFolder): self
+    {
+        $this->temporaryFolder = $temporaryFolder;
+
+        return $this;
+    }
+
+    /**
+     * Creates a temporary file.
+     * The file is not created if the $content argument is null.
+     *
+     * @param string|null $content   Optional content for the temporary file
+     * @param string|null $extension An optional extension for the filename
+     *
+     * @return string The filename
+     */
+    protected function createTemporaryFile(?string $content = null, ?string $extension = null): string
+    {
+        $dir = \rtrim($this->getTemporaryFolder(), \DIRECTORY_SEPARATOR);
+
+        if (!\is_dir($dir)) {
+            if (false === @\mkdir($dir, 0777, true) && !\is_dir($dir)) {
+                throw new \RuntimeException(\sprintf("Unable to create directory: %s\n", $dir));
+            }
+        } elseif (!\is_writable($dir)) {
+            throw new \RuntimeException(\sprintf("Unable to write in directory: %s\n", $dir));
+        }
+
+        $filename = $dir . \DIRECTORY_SEPARATOR . \uniqid('php_weasyprint', true);
+
+        if (null !== $extension) {
+            $filename .= '.' . $extension;
+        }
+
+        if (null !== $content) {
+            \file_put_contents($filename, $content);
+        }
+
+        $this->temporaryFiles[] = $filename;
+
+        return $filename;
+    }
+
+    /**
+     * Sets an option. Be aware that option values are NOT validated and that
+     * it is your responsibility to validate user inputs.
+     *
+     * @param string                     $name  The option to set
+     * @param bool|int|string|array|null $value The value (NULL to unset)
+     *
+     * @throws \InvalidArgumentException
+     */
+    public function setOption(string $name, $value): self
+    {
+        if (!\array_key_exists($name, $this->options)) {
+            throw new \InvalidArgumentException(\sprintf('The option \'%s\' does not exist.', $name));
+        }
+
+        $this->options[$name] = $value;
+
+        $this->logger->debug(\sprintf('Set option "%s".', $name), ['value' => $value]);
+
+        return $this;
+    }
+
+    /**
+     * Sets an array of options.
+     *
+     * @param array<string, bool|int|string|array|null> $options An associative array of options as name/value
+     */
+    public function setOptions(array $options): self
+    {
+        foreach ($options as $name => $value) {
+            $this->setOption($name, $value);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Returns all the options.
+     *
+     * @return array<string, bool|int|string|array|null>
+     */
+    public function getOptions(): array
+    {
+        return $this->options;
+    }
+
+    /**
+     * Adds an option.
+     *
+     * @param string                     $name    The option name
+     * @param bool|int|string|array|null $default An optional default value
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function addOption(string $name, $default = null): self
+    {
+        if (\array_key_exists($name, $this->options)) {
+            throw new \InvalidArgumentException(\sprintf('The option \'%s\' already exists.', $name));
+        }
+
+        $this->options[$name] = $default;
+
+        return $this;
+    }
+
+    /**
+     * Adds an array of options.
+     *
+     * @param array<string, bool|int|string|array|null> $options
+     */
+    protected function addOptions(array $options): self
+    {
+        foreach ($options as $name => $default) {
+            $this->addOption($name, $default);
+        }
+
+        return $this;
+    }
+
+    /**
+     * Merges the given array of options to the instance options and returns
+     * the result options array. It does NOT change the instance options.
+     *
+     * @param array<string, bool|int|string|array|null> $options
+     *
+     * @return array<string, bool|int|string|array|null>
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function mergeOptions(array $options): array
+    {
+        $mergedOptions = $this->options;
+
+        foreach ($options as $name => $value) {
+            if (!\array_key_exists($name, $mergedOptions)) {
+                throw new \InvalidArgumentException(\sprintf('The option \'%s\' does not exist.', $name));
+            }
+
+            $mergedOptions[$name] = $value;
+        }
+
+        return $mergedOptions;
+    }
+
+    /**
+     * Reset all options to their initial values.
+     */
+    public function resetOptions(): void
+    {
+        $this->options = [];
+        $this->configure();
+    }
+
+    /**
+     * Checks the specified output.
+     *
+     * @param string $output  The output filename
+     * @param string $command The generation command
+     *
+     * @throws \RuntimeException if the output file generation failed
+     */
+    protected function checkOutput(string $output, string $command): void
+    {
+        // the output file must exist
+        if (!$this->fileExists($output)) {
+            throw new \RuntimeException(\sprintf('The file \'%s\' was not created (command: %s).', $output, $command));
+        }
+
+        // the output file must not be empty
+        if (0 === $this->filesize($output)) {
+            throw new \RuntimeException(\sprintf('The file \'%s\' was created but is empty (command: %s).', $output, $command));
+        }
+    }
+
+    /**
+     * Checks the process return status.
+     *
+     * @param ?int   $status  The exit status code
+     * @param string $stdout  The stdout content
+     * @param string $stderr  The stderr content
+     * @param string $command The run command
+     *
+     * @throws \RuntimeException if the output file generation failed
+     */
+    protected function checkProcessStatus(?int $status, string $stdout, string $stderr, string $command): void
+    {
+        if (null === $status) {
+            throw new \RuntimeException(\sprintf('The command is not terminated.' . "\n" . 'stderr: "%s"' . "\n" . 'stdout: "%s"' . "\n" . 'command: %s', $stderr, $stdout, $command));
+        }
+
+        if (0 !== $status && '' !== $stderr) {
+            throw new \RuntimeException(\sprintf('The exit status code \'%s\' says something went wrong:' . "\n" . 'stderr: "%s"' . "\n" . 'stdout: "%s"' . "\n" . 'command: %s', $status, $stderr, $stdout, $command), $status);
+        }
+    }
+
+    /**
+     * Wrapper for the "file_get_contents" function.
+     */
+    protected function getFileContents(string $filename): string
+    {
+        $fileContent = \file_get_contents($filename);
+
+        if (false === $fileContent) {
+            throw new CouldNotReadFileContentException(\sprintf('Could not read file \'%s\' content.', $filename));
+        }
+
+        return $fileContent;
+    }
+
+    /**
+     * Wrapper for the "file_exists" function.
+     */
+    protected function fileExists(string $filename): bool
+    {
+        return \file_exists($filename);
+    }
+
+    /**
+     * Wrapper for the "is_file" method.
+     */
+    protected function isFile(string $filename): bool
+    {
+        return \strlen($filename) <= \PHP_MAXPATHLEN && \is_file($filename);
+    }
+
+    /**
+     * Wrapper for the "filesize" function.
+     */
+    protected function filesize(string $filename): int
+    {
+        $filesize = \filesize($filename);
+
+        if (false === $filesize) {
+            throw new CouldNotReadFileSizeException(\sprintf('Could not read file \'%s\' size.', $filename));
+        }
+
+        return $filesize;
+    }
+
+    /**
+     * Wrapper for the "unlink" function.
+     */
+    protected function unlink(string $filename): bool
+    {
+        return $this->fileExists($filename) && \unlink($filename);
+    }
+
+    /**
+     * Wrapper for the "is_dir" function.
+     */
+    protected function isDir(string $filename): bool
+    {
+        return \is_dir($filename);
+    }
+
+    /**
+     * Wrapper for the mkdir function.
+     */
+    protected function mkdir(string $pathname): bool
+    {
+        return \mkdir($pathname, 0777, true);
+    }
+}
+```

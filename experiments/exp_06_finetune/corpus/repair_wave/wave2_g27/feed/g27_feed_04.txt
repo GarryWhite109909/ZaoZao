@@ -1,0 +1,195 @@
+### g27-cmdlang-13
+
+代码片段（语言: python）：
+```python
+import subprocess
+
+CHAINS = {"input": "INPUT", "forward": "FORWARD", "output": "OUTPUT"}
+
+def apply_policy(chain):
+    """边界防护：把租户在控制台提交的网段策略下发到防火墙。
+
+    策略行由租户经 /policies API 写入 DB，此处回读后拼成规则文本
+    整体交给 iptables-restore 解析（避免逐条 fork 的开销）。
+    """
+    cidr, action = fetch_policy(chain)   # SELECT ... FROM tenant_policies
+    target = CHAINS.get(chain)
+    if target is None:
+        raise ValueError("unknown chain")
+
+    rules = "*filter\n"
+    rules += f"-A {target} -s {cidr} -j {action}\n"
+    rules += "COMMIT\n"
+
+    proc = subprocess.run(
+        ["iptables-restore", "--noflush"],
+        input=rules.encode("utf-8"),
+        capture_output=True, timeout=15,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.decode("utf-8", "replace")[:300])
+    return True
+
+def list_rules(chain):
+    target = CHAINS.get(chain)
+    proc = subprocess.run(["iptables", "-S", target], capture_output=True, timeout=15)
+    return proc.stdout.decode("utf-8", "replace")
+```
+请先给出分析过程，然后在最后给出 JSON 结论。
+
+【前期审计已实测的事实(供参考;仍需你在分析中独立核对代码)】
+【命令语言辨析要求】本样本含将外部输入送入某种命令语言解释器执行的形态。请先识别注入目标的命令语言类型：若是 OS shell（system/sh -c/execSync/ProcessBuilder 等经 shell 元字符解析）则判 CWE-78；若是 sed/awk 程序、SMTP·IMAP 协议命令、TeX/groff 宏、CUPS 选项、ExifTool 标签表达式、iptables/nftables 规则、应用配置语言等**非 OS 的自定义命令语言**，则判 CWE-77（命令注入泛化，官方适用域）。给出污点链与该命令语言的具体注入向量。
+（形态备注：iptables 规则语言（-restore 解析）：cidr/action 拼进规则文本的可注入位置，可引入新规则行/COMMIT/新表（与 14 的 nft 单串表达式、16 的 nginx 配置分属不同规则语言））
+
+======================================================================
+
+### g27-cmdlang-14
+
+代码片段（语言: go）：
+```go
+package firewall
+
+import (
+	"bytes"
+	"fmt"
+	"os/exec"
+	"strings"
+)
+
+var allowedFamilies = map[string]string{
+	"v4": "ip",
+	"v6": "ip6",
+}
+
+// Upsert 下发一条入站策略规则。
+// 参数来自租户经策略 API 写入的记录（回读后拼装，未做规则语法转义）。
+func Upsert(family string) error {
+	p, err := loadPolicy(family) // SELECT family,cidr,ports,action FROM tenant_policies
+	if err != nil {
+		return err
+	}
+	cidr, ports, action := p.CIDR, p.Ports, p.Action
+	fam, ok := allowedFamilies[family]
+	if !ok {
+		return fmt.Errorf("unsupported family %q", family)
+	}
+
+	expr := fmt.Sprintf("%s saddr %s ", fam, cidr)
+	for _, p := range strings.Split(ports, ",") {
+		expr += fmt.Sprintf("%s dport %s ", fam, strings.TrimSpace(p))
+	}
+	expr += action
+
+	cmd := exec.Command("nft", "add", "rule", "inet", "filter", "input", expr)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("nft: %v: %s", err, stderr.String())
+	}
+	return nil
+}
+```
+请先给出分析过程，然后在最后给出 JSON 结论。
+
+【前期审计已实测的事实(供参考;仍需你在分析中独立核对代码)】
+【命令语言辨析要求】本样本含将外部输入送入某种命令语言解释器执行的形态。请先识别注入目标的命令语言类型：若是 OS shell（system/sh -c/execSync/ProcessBuilder 等经 shell 元字符解析）则判 CWE-78；若是 sed/awk 程序、SMTP·IMAP 协议命令、TeX/groff 宏、CUPS 选项、ExifTool 标签表达式、iptables/nftables 规则、应用配置语言等**非 OS 的自定义命令语言**，则判 CWE-77（命令注入泛化，官方适用域）。给出污点链与该命令语言的具体注入向量。
+（形态备注：nftables 规则语言：cidr/ports/action 拼成规则表达式，可改变规则结构）
+
+======================================================================
+
+### g27-cmdlang-15
+
+代码片段（语言: go）：
+```go
+package render
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+// Flow 是日志采集平台的采集流定义，字段由租户经平台 API 提交
+// （低权限角色即可创建，平台不校验配置语法）。
+type Flow struct {
+	Name       string
+	MatchTags  string
+	BufferPath string
+	OutputTag  string
+	Extra      map[string]string
+}
+
+// RenderFluentConf 把采集流渲染成 Fluentd 配置片段。
+func RenderFluentConf(f Flow) string {
+	var b strings.Builder
+	b.WriteString("<match " + f.MatchTags + ">\n")
+	b.WriteString("  @type forward\n")
+	b.WriteString("  buffer_path " + f.BufferPath + "\n")
+	b.WriteString("  tag " + f.OutputTag + "\n")
+	for k, v := range f.Extra {
+		b.WriteString(fmt.Sprintf("  %s %s\n", k, v))
+	}
+	b.WriteString("</match>\n")
+	return b.String()
+}
+
+// InstallFlow 落盘采集流配置并让采集进程重新加载。
+func InstallFlow(f Flow, confDir string) (string, error) {
+	fragment := RenderFluentConf(f)
+	safe := filepath.Base(f.Name) + ".conf"
+	path := filepath.Join(confDir, safe)
+
+	if err := os.WriteFile(path, []byte(fragment), 0o644); err != nil {
+		return "", err
+	}
+	if err := exec.Command("fluentd", "--dry-run", "-c", path).Run(); err != nil {
+		return "", fmt.Errorf("config rejected: %w", err)
+	}
+	if err := exec.Command("systemctl", "reload", "fluentd").Run(); err != nil {
+		return "", fmt.Errorf("reload failed: %w", err)
+	}
+	return path, nil
+}
+```
+请先给出分析过程，然后在最后给出 JSON 结论。
+
+【前期审计已实测的事实(供参考;仍需你在分析中独立核对代码)】
+【命令语言辨析要求】本样本含将外部输入送入某种命令语言解释器执行的形态。请先识别注入目标的命令语言类型：若是 OS shell（system/sh -c/execSync/ProcessBuilder 等经 shell 元字符解析）则判 CWE-78；若是 sed/awk 程序、SMTP·IMAP 协议命令、TeX/groff 宏、CUPS 选项、ExifTool 标签表达式、iptables/nftables 规则、应用配置语言等**非 OS 的自定义命令语言**，则判 CWE-77（命令注入泛化，官方适用域）。给出污点链与该命令语言的具体注入向量。
+（形态备注：应用配置语言（Fluentd）：CRD 字段未做配置语法转义，落盘后由 fluentd 加载生效，可注入新指令/闭合指令块（对应 rolling_dev 唯一真 77 样本 corpus_00065.go 的同族形态））
+
+======================================================================
+
+### g27-cmdlang-16
+
+代码片段（语言: bash）：
+```bash
+#!/bin/bash
+# 站点发布:按发布服务收到的请求体写入 upstream 配置片段
+# 用法: ./publish.sh <request_body.json>
+
+REQ="$1"
+CONF_DIR="/etc/nginx/conf.d"
+
+read -r SITE UPSTREAM_HOST UPSTREAM_PORT HEALTH_PATH < <(
+  python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d['site'],d['upstream_host'],d['upstream_port'],d.get('health_path','/health'))" "$REQ"
+)
+
+# 站点名只用于文件名,限定字母数字与连字符
+if ! [[ "$SITE" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+  echo "invalid site name" >&2
+  exit 3
+fi
+
+printf 'upstream %s_backend {\n    server %s:%s;\n}\n\nserver {\n    listen 80;\n    server_name %s.internal;\n\n    location %s {\n        proxy_pass http://%s_backend;\n    }\n}\n' \
+  "$SITE" "$UPSTREAM_HOST" "$UPSTREAM_PORT" "$SITE" "${HEALTH_PATH:-/health}" "$SITE" \
+  > "$CONF_DIR/${SITE}.conf"
+
+nginx -t && nginx -s reload
+```
+请先给出分析过程，然后在最后给出 JSON 结论。
+
+【前期审计已实测的事实(供参考;仍需你在分析中独立核对代码)】
+【命令语言辨析要求】本样本含将外部输入送入某种命令语言解释器执行的形态。请先识别注入目标的命令语言类型：若是 OS shell（system/sh -c/execSync/ProcessBuilder 等经 shell 元字符解析）则判 CWE-78；若是 sed/awk 程序、SMTP·IMAP 协议命令、TeX/groff 宏、CUPS 选项、ExifTool 标签表达式、iptables/nftables 规则、应用配置语言等**非 OS 的自定义命令语言**，则判 CWE-77（命令注入泛化，官方适用域）。给出污点链与该命令语言的具体注入向量。
+（形态备注：应用配置语言（nginx）：面板字段经 printf %s 直接进入 server/location 块，可注入新指令（无 shell 命令替换、无 sed 二次注入面））

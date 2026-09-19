@@ -1,0 +1,69 @@
+# redistill 补投教师裁决（第二波）— 2026-09-10
+# 执行者：glm5.3-flash（teacher 补投回收）；范围：3489 / 3900 / 7996（8055 已被 v2_17 purge 吸收，无需补投）
+# 契约：与 retake.txt 相同；引文全部对码（C4 门）；本批均为 FLIP 提案，落库仍需用户终裁 + 非循环证据留痕。
+
+##### redistill-line-3489
+分析过程: 入口枚举（Java/Spring LDAP 认证服务，两个 public 方法均为可调用入口）：①authenticate(String username, String password)——注释自述 username "未经任何转义"；②authenticateSafe(String username, String password)。污点链逐跳（vuln 路径=authenticate）：
+跳1 方法签名 line 29: `public boolean authenticate(String username, String password)` — 调用方传入登录表单类外部输入；
+跳2 line 31: `String userDn = "uid=" + username + ",ou=users,dc=example,dc=com"` — 用户输入拼入 DN（本方法内为死变量，但已显示拼接习惯）；真正的可达污点在 filter；
+跳3 line 35: `String filter = "(uid=" + username + ")"` — 未经中立化的用户输入直接进入 LDAP 查询表达式，`*`/`(`/`)`/`\`/NUL 等元字符可改变查询结构（如 `*)(uid=admin))(|(uid=`）；
+跳4（sink）line 40: `return ldapTemplate.authenticate(searchBase, filter, password)` — Spring LDAP 以该 filter 搜索目录并绑定认证，注入可改变匹配目标条目（认证逻辑操纵/目录结构枚举）。
+防御逐段核验：
+(a) authenticateSafe（line 51-69）确实示范了正确写法：line 53 `String safeUsername = LdapEncoder.filterEncode(username);` 后 line 57 拼入 filter——但这只是同类中的另一个安全方法，**不构成对 authenticate 主路径的防御**（两方法各自独立可达，存在安全旁路方法不消除漏洞入口）；
+(b) authenticateSafe line 54 的 userDn 拼接同样未用 DN 编码（LdapEncoder.filterEncode 只适用于 filter 语境，DN 应 nameEncode），且该变量为死代码——不影响判定，仅作叙事注脚；
+(c) catch 块 line 41-45 仅吞异常返回 false，与注入无关。
+利用可行性：username=`*)(uid=*))(|(uid=*` 类载荷改变 filter 结构 → authenticate 对非预期条目执行绑定流程；所需条件仅为应用将登录输入传入本方法（注释自述使用场景），现实常见形态。
+has_vulnerability: true
+vulnerability_type: CWE-90 Improper Neutralization of Special Elements used in an LDAP Query ('LDAP Injection')
+risk_level: High
+source: line 29: `public boolean authenticate(String username, String password)` — 调用方登录输入，注释自述"未经任何转义"
+sink: line 40: `return ldapTemplate.authenticate(searchBase, filter, password)` — 携带 line 35 `String filter = "(uid=" + username + ")"` 未中立化表达式的目录查询
+explanation: authenticate 主路径将用户输入直接拼入 LDAP 过滤器后交 ldapTemplate.authenticate 执行，查询结构可被元字符操纵 → LDAP 注入；非 CWE-862 因为目录访问存在认证流程、缺陷特定于查询表达式元字符未中立化而非缺失授权检查；非 CWE-639 因为不涉及对象键属主绑定；非 CWE-74/78 因为无命令/通用注入语义，注入目标为 LDAP 查询解释器。原 False 判定的依据（存在 authenticateSafe 转义示范）不成立：安全方法与漏洞方法为并列独立入口。
+fix_suggestion: line 35: `String filter = "(uid=" + LdapEncoder.filterEncode(username) + ")"`（与 line 53 的 authenticateSafe 写法对齐）；若 DN 后续参与查询，DN 分量改用 LdapNameBuilder/nameEncode 构造；长期方案是 authenticate 内部直接复用 authenticateSafe 或删除未转义入口。
+
+##### redistill-line-3900
+分析过程: 入口枚举（Django CSV 导出视图，@login_required + @require_GET）：①`request.GET.get('action', 'all')`（line 23）——唯一外部输入；②`request.user`（认证上下文）。污点链逐跳：
+跳1 line 23: `action_filter = request.GET.get('action', 'all')` — 用户可控字符串；
+跳2 line 27: `action_filter = action_filter.replace(';', '').replace('--', '')` — 无实际安全语义的清洗（对 Python 侧过滤既不必要也无害）；
+跳3 line 39: `logs = [log for log in logs if log.action.startswith(action_filter)]` — action_filter 仅作为 **Python 字符串前缀匹配参数**，不进入任何解释器（无 SQL/命令/路径/模板语义）；
+跳4 line 32: `logs = ActivityLog.objects.filter(user=user)` — ORM 参数化查询，user 为认证上下文而非外部自由文本，无注入位；
+跳5（sink 侧）line 57-61: `writer.writerow([safe_csv_field(log.timestamp), safe_csv_field(log.action), safe_csv_field(log.details)])` — 导出内容逐字段经 safe_csv_field 处理。
+防御逐段核验：
+(a) line 48-54 safe_csv_field：对以 `=`、`+`、`-`、`@` 开头的值加单引号前缀（line 52-53 `if value.startswith(('=', '+', '-', '@')): return "'" + value`）——CSV 公式注入的标准缓解，details/action/timestamp 三个写出字段全覆盖；
+(b) line 64-65：`response['Content-Disposition'] = 'attachment; filename="activity_logs.csv"'` — 静态文件名，无响应头注入；
+(c) 无 eval/exec/os.system/subprocess/路径拼接；Content-Type 固定 text/csv。
+利用可行性：不存在可达污点链——action_filter 止于 Python 内存比较，log 字段写出前已被公式注入防御覆盖。代码注释中的"CWE-943/CSV 公式注入"叙述为教学性红鲱鱼：注释自称的"未做严格校验"只影响过滤结果集大小，不构成注入。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: none
+source: line 23: `action_filter = request.GET.get('action', 'all')` — 唯一外部输入，止于 Python 前缀比较
+sink: line 57-61 writer.writerow — 导出字段已经 safe_csv_field 前缀转义，无解释器注入位
+explanation: 全文件无可达污点链：外部输入不进入 SQL（ORM 参数化）、命令、路径或模板解释器，CSV 公式注入被 line 52-53 的前缀单引号防御覆盖，响应头静态 → 判 safe；非 CWE-943 因为 ORM filter 参数化、跨层注入位不存在；非 CWE-1236 因为 CSV 导出字段已做公式注入转义；非 CWE-79 因为响应为纯附件下载、无 HTML 反射上下文。
+fix_suggestion: no fix needed（可选加固：action_filter 改为枚举白名单校验，属代码整洁而非漏洞修复）
+
+##### redistill-line-7996
+分析过程: 入口枚举（BouncyCastle X509LDAPCertStoreSpi，533 行库代码；CVE-2023-33201/GHSL-2023-045 同类）：攻击者影响面=证书验证场景下攻击者自签证书的 Subject/Issuer DN，经 X509CertSelector/X509CRLSelector 进入 engineGetCertificates（line 168）/engineGetCRLs（line 356）。污点链逐跳：
+跳1 line 268-269: `subject = xselector.getCertificate().getSubjectX500Principal().getName("RFC1779")` — 攻击者可控 DN 字符串；
+跳2 line 285: `String attrValue = parseDN(subject, subjectAttributeName)` — 进入 DN 解析；
+跳3 line 165: `return filterEncode(temp);` — parseDN 出口对值做 RFC2254 转义；转义表 line 58-76 覆盖全部危险元字符：`FILTER_ESCAPE_TABLE['*'] = "\\2a"` / `FILTER_ESCAPE_TABLE['('] = "\\28"` / `FILTER_ESCAPE_TABLE[')'] = "\\29"` / `FILTER_ESCAPE_TABLE['\\'] = "\\5c"` / NUL；
+跳4 line 286: `set.addAll(search(attrName, "*" + attrValue + "*", attrs))` — 已转义值作为子串匹配进 filter（外层 `*` 为字面量通配，属预期语义）；
+跳5（sink）line 473-494: `String filter = attributeName + "=" + attributeValue;` → `String filter2 = "(&(" + filter + ")(" + temp[0] + "=*))"` → `ctx.search(params.getBaseDN(), filter2, constraints)` — 最终目录查询。
+防御逐段核验（对照 CVE-2023-33201 漏洞形态："certificate's Subject Name inserted into LDAP filter without any escaping"，PoC `CN=Subject*)(objectclass=`）：
+(a) certSubjectSerialSearch 路径（line 285-286）与 engineGetCRLs 路径（line 382、388-391）的攻击者值**全部**经 parseDN→filterEncode 后才进 search——CVE 的未转义路径在本文件不存在；
+(b) line 290-292 serial 路径：`attrValue = serial` 来自 `getSerialNumber().toString()`（数字串，无元字符）；
+(c) line 297/332/350/396/398 的 `"*"` 为字面量；attributeName/temp[0] 来自 params（开发者配置 X509LDAPCertStoreParameters），非攻击者面；
+(d) 与上游 1.74 修复 commit（e8c409a8，新增 FILTER_ESCAPE_TABLE + filterEncode 并包装 search 入参）对照：本文件已含转义表与 filterEncode 方法、parseDN 出口已包装；残留差异是 search() 内未对 attributeValue 二次包装 filterEncode（上游防御纵深行），但所有调用点传入值均已转义，不构成可达注入；
+(e) 同库对照（详见文末附注）：v2_17 行 7901 为同一类的更老修订（无 filterEncode/转义表，Subject 值未转义进 filter）= 真 CVE 漏洞形态。
+利用可行性：按 CVE-2023-33201 攻击路径重放（自签证书 Subject=`CN=Subject*)(objectclass=`）：parseDN 提取后 filterEncode 输出 `Subject\2a\29\28objectclass\3d`，查询结构不可被改变 → 不可利用。
+has_vulnerability: false
+vulnerability_type: none
+risk_level: none
+source: line 268-269: `subject = xselector.getCertificate().getSubjectX500Principal().getName("RFC1779")` — 攻击者可控 DN，唯一外部入口
+sink: line 494: `String filter2 = "(&(" + filter + ")(" + temp[0] + "=*))"` — 最终目录查询，但其全部攻击者影响分量已经 line 165 `return filterEncode(temp);` RFC2254 转义
+explanation: 本文件为 CVE-2023-33201 修复后语义的库代码：Subject/Issuer 经 parseDN→filterEncode（RFC2254 表覆盖 * ( ) \ NUL）后进查询，serial 为数字串，其余插值来自开发者配置 → 判 safe；非 CWE-90 因为查询元字符已被中立化、过滤结构不可被攻击者改变；非 CWE-295 因为证书验证流程本身无缺陷（NVD 对 CVE-2023-33201 绑定 295 是针对 pre-1.74 未转义版本，本文件非该形态）；非 CWE-94 因为不存在动态代码执行。现库内标签 True/CWE-90 疑为把"修复后代码"标成了漏洞侧——与行 7901（未修复修订、标 safe）恰好互为颠倒的差分对。
+fix_suggestion: no fix needed（若作为差分对教材：本行为 safe 侧，可补一句"search() 内可再对 attributeValue 二次 filterEncode 作防御纵深（上游 e8c409a8 做法）"）
+
+##### 附注：v2_17 行 7901（非补投范围，终裁证据）
+- 行 7901 代码为同一 X509LDAPCertStoreSpi 类的更老修订：全文件无 filterEncode、无 FILTER_ESCAPE_TABLE（字符串级检索均为 False），DN 解析为外部调用 `attrValue = LDAPUtils.parseDN(subject, subjectAttributeName);` 后直接 `set.addAll(search(attrName, "*" + attrValue + "*", attrs));`，Subject 值未转义进 filter —— 与 CVE-2023-33201（<1.74，NVD 绑定 CWE-295）漏洞形态一致，真实可注入。
+- 现标签 False（safe）→ 建议 FLIP 为 vuln。CWE 取舍需用户终裁：库内口径 CWE-90（在 22 类训练目标清单内，且与 3489 等 LDAP 行一致）vs NVD 官方绑定 CWE-295（不在清单内）。
+- 7900（=本次补投行 7996）与 7901 构成"同库两修订、标签互为颠倒"：建议终裁 7900→safe、7901→vuln。此为 NVD 锚定的铁证级翻案，非模型循环裁决（teacher 裁决仅作线索，翻转依据=CVE 官方 advisory 与代码修订对照）。

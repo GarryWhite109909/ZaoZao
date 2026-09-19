@@ -1,0 +1,1546 @@
+# 代码安全分析请求 — 请认真分析
+
+> 我是做安全研究的，正在提升自己对代码审计的判断力。你的分析过程对我最有价值——
+> 请把你脑子里的推理步骤全部写出来，包括你排除掉的方向和为什么排除。
+> 下面是我整理的分析报告格式，请按这个结构写，方便我对照学习。
+
+---
+
+## 我需要你做的
+
+我会逐条消息发案例包给你，每包开头有【代码审计案例包】标记，包内有 `### id=...` 行标明案例编号。对每个代码样本做完整、独立的安全分析：**每条分析的第一行写 `### <案例编号> <版本A|版本B|全文>`**（编号照抄我给的 id），然后按以下格式逐项写，每一项都要有具体的行号和代码片段作为证据（片段用半角反引号包裹）：
+
+```
+入口: L<行号> <通道> <参数名> | 次要: <如有>
+    （通道别只看 HTTP 参数——配置文件、环境变量、命令行参数、stdin、文件流、DB 回读、内部 API 传参都算，我以前漏报最多的就是这些）
+链: L<行> <动作> → L<行> <动作> → L<行> <危险操作>
+    （判"安全"时本栏改写为: 未发现可达污点流，原因: <入口不可控 / sink 前防御封死 / 常量传播>）
+防御:
+  L<行> <机制> → 有效: <为什么攻击者过不去>
+  L<行> <机制> → 伪防御: <给出具体绕过字符串或 payload 片段>
+载荷: <能跑通的最短利用代码或 HTTP 请求>（要语义上真能触发——别拿会被引号/转义吃掉的字符串凑数）
+组合链: <如果多个缺陷串在一起危害更大，写出 A→B→C>
+锚句: 非 CWE-XX 因 <一句话>；非 CWE-YY 因 <一句话>
+结论: 存在漏洞=<true|false> | CWE-XXX <官方名> | <Critical|High|Medium|Low>
+修复: <行号 + 具体怎么改；用到的函数/模块必须在当前代码里已存在，别建议调用不存在的辅助函数>
+```
+
+---
+
+## 几个我踩过的坑，帮你避开
+
+1. "黑名单可绕过"这种话信息量为零——请把**具体绕过字符串**写出来（`....//`、`$()`、`%0a`、大小写变体），我才能真正理解防御为什么失败。
+2. **代码里的注释经常在撒谎**（"这里安全"其实有洞、"这里有洞"其实防御有效），注释里自己标的行号也经常是错的——请只看代码真实行为和真实行位，忽略注释声称的一切。
+3. 有些防御是**组合生效**的（A 单独不行 + B 单独不行 = AB 一起封死），请逐层拆开看，别只看单点。
+4. 如果硬编码的密钥/token 可以伪造会话或签名，从而**绕过看似存在的认证门**，这就是一条组合链，请写出来。
+5. 代码执行类的编号判别轴是**哪个解释器最终消费这个字符串**：shell 消费 → CWE-78（`execSync(shell:true)`、`["sh","-c",输入]` 都算，有无显式 shell 层不论）；`eval()`/`assert()`/`new Function()`/`preg_replace /e` 动态求值消费 → CWE-95/94 族（细分见判别笔记）；模板引擎把输入当代码渲染 → CWE-1336——三者别混。另外 `eval("var x = " + input)` 和 `eval(input)` 在我这里是同一类，别按"直接进 vs 拼接进"分成两种定性。
+6. 如果你是**从部署/运维角度**认为"这不会被打到"，那属于我的业务决策范围——请只报告代码层面可达的攻击面，部署上的事我自己判断。
+7. 如果某个判断**依赖我没贴出来的代码**（调用方、框架行为、运行环境、被截断的函数体），请显式标一句"样本外假设"——我要练习区分"代码内可证"和"凭经验猜测"。如果代码明显被截断了，直接告诉我要补哪段，别猜着补全分析。
+8. 我经常一条消息连发几个案例：**每个案例的行号、变量名、结论请逐条独立核对**——我遇到过把上一个样本的行号和结论串写到下一个样本的情况。
+9. 还有一类我容易漏的：**没有传统污点流的设计/配置缺陷**也请照实报告——弱协议/弱算法（TLS 1.0/SSL、MD5/SHA1——签名/MAC 用途和口令存储的快哈希都算）、不完整禁用列表/可绕过黑名单当防线、服务以 root 等过度权限运行（CWE-250）、可预测随机数生成令牌密钥（CWE-338）、禁用证书校验且无补偿控制（CWE-295）、硬编码凭证（CWE-798）——这些都给对应的 CWE。
+
+---
+
+## 样本类型说明
+
+你看到的代码有三种来源：
+- **单文件**：直接分析完整文件
+- **差分对**：同一个文件的两个版本（版本A、版本B）。请**分别独立分析**，版本A 的分析中不要参考版本 B 的任何内容；也不要因为"两个版本不一样"就预设哪个有问题——每个版本只按它自己的代码判
+- **文件切片**：大文件的一个片段，可能缺少上下文——不可达的方向请标注"样本外"
+
+**特殊：带官方结论的复核包**（包头标 `| redistill`，包内有"官方结论（待你验证）"区块）。这类是我自己推不稳的案例：把官方结论当作**待验证假设**，从代码出发推出支持它的完整证据链（污点路径/防御链逐行号）；如果你的推导确实到不了那个结论，写 `disagree: <哪一步断了、代码事实是什么>`——推不出来直说是有价值的，**禁止为凑结论编造不存在的行号、变量或数据流**。其中结论为"安全"的复核包：`防御:` 栏必须逐段给出**行号 + 什么机制 + 为什么不可旁路**，一句"已有校验"不合格。
+
+---
+
+## 我的判别笔记（结论里的 CWE 编号请按这份对齐；笔记本身整理错了也请直接指出）
+
+先问"注入的目标是什么"，再定编号：
+- sink 是 OS 程序执行 → CWE-78（**有没有 shell 层都算**，`["sh","-c",输入]` 也是 78）；注入的是"非 OS 的命令语言"（sed 脚本、IMAP/SMTP、应用配置语言）→ CWE-77；命令名固定、输入只落参数位 → CWE-88——**前提是输入能注入参数结构**（前导 `-`/`--` 被当新选项，如 `ssh -oProxyCommand=`、`tar --checkpoint-action=exec=`，或固定命令对该参数二次解析）；argv 单元素完整传递、无选项语义、无二次解析 = 无漏洞，别硬凑 88
+- 不可信数据进入 `eval()/exec()/Function()/preg_replace /e` 等**动态求值调用的求值位** → CWE-95——无论整段直传还是拼进代码文本（我查过 MITRE 4.20：95 是 94 的 Variant 子类，映射按更具体的 sink 优先，**拼接与否不影响 95 定位**；旧笔记"拼接主记 94"的统一口径已作废，统一主记 95，正文可注明旧口径差异）；拼出的代码**落盘后再执行**——写入 .py/.js/.sh 交解释器、存库后取出执行——正文注明 CWE-96；生成代码走**非求值器**的编译/执行路径（动态 import 之外的生成-编译链）或需父类兜底 → 94；输入进入**模板源码字符串位**被引擎渲染 → CWE-1336（`render(name=user)` 只是变量值，不算）；printf/format 的**格式串位**被控 → CWE-134；框架表达式求值器（SpEL/OGNL/EL）→ CWE-917；终端 ANSI/OSC 转义序列未净化 → CWE-150
+- sink 是 SQL（含 ORM raw）→ CWE-89；非 SQL 的查询逻辑（MongoDB 操作符、HQL）→ CWE-943（HQL 也有记 89 的惯例，本笔记统一 943，主编号别摇摆）；XPath → CWE-643；LDAP 过滤器 → CWE-90
+- 路径/文件名外部可控：出现 `../` 或等价目录上跳（含 `..\`、`%2e%2e%2f`、`..%c0%af`、symlink 逃逸）→ CWE-22；攻击者直接控绝对路径（如 `/etc/passwd`，无上跳）按本笔记也主记 22、正文可注明 CWE-73；仅文件名可控、目录不可控 → CWE-73
+- 未净化输入进入浏览器执行上下文（HTML/属性/JS 字符串）→ CWE-79，按**最终渲染上下文**判，不看变量叫什么
+- 不可信数据进反序列化器（readObject/pickle/unserialize）→ CWE-502（仅解析 JSON 等纯数据格式不算）。**受限反序列化器是有效防御**：`find_class`/resolve 白名单要同时满足（a）白名单内没有把输入当逻辑执行的构造器/方法、（b）可调用对象来源池封闭（REDUCE 链无法二段提升）才算防御有效。自写持久化通道（未验签的存储回读）算不算不可信输入看信任边界：攻击者取得该通道写入权的成本低于直接 RCE 成本 → 按 502 计，否则降为纵深防御缺失。XML 解析允许外部实体/DTD 且输入不可信 → CWE-611；把不可信流直接交给 JAXP 系列（`XPath.evaluate(InputSource,…)`、`Validator.validate(StreamSource)`、`Transformer.transform`）未设 `disallow-doctype-decl` 同样是 611，**`FEATURE_SECURE_PROCESSING` 不算有效防御**；纯实体膨胀 DoS（billion laughs、无外部实体）→ 正文注明 CWE-776，按 DoS 档定级
+- 服务端取回 URL 内容且目的地未校验 → CWE-918；借产品的身份/网络位置发请求（回环信任），最贴形是产品作为**非预期代理**把外部请求转交内部高权限服务 → CWE-441；内部服务"只信 localhost 所以不鉴权"按缺失认证/授权记 CWE-306/862，不算 441；骗浏览器跳转 → CWE-601
+- 没有授权检查 → CWE-862；查了但对象用户可控（IDOR）→ CWE-639；关键功能连认证都没有 → CWE-306；状态变更端点只靠自动携带的 Cookie、无 token/Origin 校验 → CWE-352。**SameSite 只有 Strict（或 Lax 且变更端点非 GET）才算一层防御**——Lax 在顶层导航 GET 上照带 Cookie；浏览器对未声明 SameSite 的 Cookie 默认按 Lax 处理，样本没写 SameSite 时别想当然按有防护算
+- JWT `alg=none` / 签名验证被禁用 → CWE-347（不是 327：不是算法弱，是验证被关了）
+- 用户可控动态键写入共享 dict/对象 → CWE-915（Python dict 没有原型链，禁止写"原型污染"叙事）；**JavaScript** 的 `obj[k]=v` 且 k 可为 `__proto__`/`constructor` → 正文注明 CWE-1321，同样不写"原型污染"字样敷衍、要写出完整链
+- 整数溢出/回绕：不可信输入进长度/偏移/索引/数量位，参与 `a + b`/`a * b`/移位/位掩码运算或宽窄类型转换后用于**边界检查、分配、拷贝、寻址**，且检查本身可被溢出绕过 → CWE-190（经典形态：`off + len > b.length` 在 `off+len` 溢出为负时放行，正确写法是 `len > b.length - off`）；JS 的索引回绕/负值规整缺陷（`index += origin`、位掩码寻址）同判；溢出结果没流向边界检查/分配/寻址的纯算术回绕不报或降档
+- 参数化/预编译/占位符查询 = SQL 注入的**有效防御，但只覆盖值位**；表名/列名/`ORDER BY` 字段/排序方向等标识符位不可绑定，回退拼接仍是 89——判"安全"前核对参数化覆盖了**所有**输入可达位；单点 replace/黑名单字符过滤 = **伪防御**（要核它漏了什么字符、作用位置对不对）
+- 硬编码凭证字面量用于认证/加密/签名 → CWE-798（"定义了但没使用"也是 798，风险降档即可；正文可加注更精确编号：在用且用于加密/签名的密钥 → CWE-321，未使用的配置项 → CWE-547）
+
+---
+
+## 风险等级我目前这么定（觉得哪条不合理，说出你的定法和理由）
+
+- Critical = 可达 RCE / 认证绕过 / 凭证直接泄露（认证门后就是 RCE 仍算 Critical）；"可达"要求**链上每一跳都在样本内可证**（路径、表名、组件行为全部代码内），任一跳依赖样本外（web root 可写、目标装有特定组件、上游权限）→ 记 High 并标"理论链"；凭证直接泄露限定为**可直接动用**的（私钥、数据库/服务账号口令、能伪造会话或签名的 secret），"像凭证但代码内无使用点"按 798 未使用降档
+- High = 注入类 / SSRF / XSS / 越权读写；没有利用链演示的理论 RCE 也记 High；等级按**组合链最坏情形**判，但同样受上一条"样本内可证"约束；Critical 与 High 两可时记 High 并写明理由，不虚高
+- Medium = 信息泄露 / 配置错误 / 有限 DoS / 定义未使用的硬编码凭证
+- Low = 影响极小
+
+---
+
+## 会话约定（以本提示词为准，不要自行增改）
+
+- 首条消息只有这段提示词、没有案例包时：直接给对判别笔记/风险等级的核对意见（有就写，没有只回"就绪"），然后等我发包，不要复述提示词。
+- 输出栏位以上面模板为准：**不新增"排除方向""次要发现"等独立栏位**——排除理由写进对应栏正文，次要发现并入修复栏前正文；自查清单**照常逐条打印**，不要改成静默执行。
+- 样本外假设不得单独支撑"存在漏洞=true"；整个判定悬在外部代码上时，列出需要我补的具体片段（调用点/类定义/函数体/依赖版本），能判的部分照判并标明影响范围。
+
+---
+
+## 输出末尾请自查
+
+- [ ] 每条分析第一行是否是 `### <案例编号> <版本>`？我发的每个案例、每个版本是否都各有一条分析？
+- [ ] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [ ] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [ ] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [ ] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [ ] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [ ] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [ ] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [ ] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（值位之外的表名/列名/排序位没有回退拼接）？
+
+最后：你的回复会被我原样归档进笔记库，请只写代码分析内容本身——不要客套话，不要"以下是分析""希望有帮助"之类的流程性文字。
+
+【代码审计案例包 | diffpair】
+
+### id=diffpair-corpus_00331 lang=go
+#### 版本A（704 行）
+```go
+/*
+Copyright 2023 The Nuclio Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package common
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"math/rand"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"runtime"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"text/template"
+	"time"
+	"unicode/utf8"
+	"unsafe"
+
+	"github.com/microcosm-cc/bluemonday"
+	"github.com/nuclio/errors"
+	"github.com/nuclio/logger"
+	"golang.org/x/net/html"
+	apiresource "k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+)
+
+var SmallLettersAndNumbers = []rune("abcdefghijklmnopqrstuvwxyz1234567890")
+var LettersAndNumbers = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890")
+var seededRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+var containerHostname string
+var specialCharPattern = regexp.MustCompile(`[^\w@%+=:,./-]`)
+
+// IsFile returns true if the object @ path is a file
+func IsFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.Mode().IsRegular()
+}
+
+// IsDir returns true if the object @ path is a dir
+func IsDir(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+
+	return info.IsDir()
+}
+
+// SanitizePath cleans and resolves the given file path to an absolute path.
+// This prevents path traversal and ensures consistency in file handling.
+func SanitizePath(path string) (string, error) {
+	// Clean the input path to eliminate any redundant or unsafe elements.
+	// Example: "/foo/../bar" becomes "/bar"
+	cleanPath := filepath.Clean(path)
+
+	// Convert to absolute path to avoid ambiguity and ensure safe file access.
+	absPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to get absolute path")
+	}
+
+	return absPath, nil
+}
+
+// FileExists returns true if the file @ path exists
+func FileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// EnsureDirExists checks if the directory exists, creates it if it doesn't
+func EnsureDirExists(ctx context.Context, loggerInstance logger.Logger, dir string) error {
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		loggerInstance.DebugWithCtx(ctx,
+			"Creating directory as it does not exist",
+			"directory", dir)
+
+		// we need 755 permission to allow running nuclio function with non-root SecurityContext
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// StringSliceToIntSlice converts slices of strings to slices of int. e.g. ["1", "3"] -> [1, 3]
+func StringSliceToIntSlice(stringSlice []string) ([]int, error) {
+	var result []int
+
+	for _, stringValue := range stringSlice {
+		var intValue int
+		var err error
+
+		if intValue, err = strconv.Atoi(stringValue); err != nil {
+			return nil, err
+		}
+
+		result = append(result, intValue)
+	}
+
+	return result, nil
+}
+
+// StringSliceContainsString returns whether the input str is in the slice
+func StringSliceContainsString(slice []string, str string) bool {
+	for _, stringInSlice := range slice {
+		if stringInSlice == str {
+			return true
+		}
+	}
+
+	return false
+}
+
+// StringSliceContainsStringPrefix returns whether the input str has prefix
+func StringSliceContainsStringPrefix(prefixes []string, str string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(str, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// StringSliceContainsStringSuffix returns whether the input str has suffix
+func StringSliceContainsStringSuffix(prefixes []string, str string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasSuffix(str, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// StringSliceContainsStringCaseInsensitive returns whether the input str is in the slice case-insensitive
+func StringSliceContainsStringCaseInsensitive(slice []string, str string) bool {
+	for _, stringInSlice := range slice {
+		if strings.EqualFold(stringInSlice, str) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// PrependStringToStringSlice prepends a string to a string slice
+func PrependStringToStringSlice(slice []string, str string) []string {
+	slice = append(slice, "")
+	copy(slice[1:], slice)
+	slice[0] = str
+	return slice
+}
+
+// PrependStringsToStringSlice prepends multiple strings to a string slice
+func PrependStringsToStringSlice(slice []string, strs ...string) []string {
+	totalLen := len(slice) + len(strs)
+	slice = append(slice, make([]string, len(strs))...)
+	copy(slice[len(strs):], slice)
+	copy(slice, strs)
+	return slice[:totalLen]
+}
+
+// RemoveANSIColorsFromString strips out ANSI Colors chars from string
+// example: "\u001b[31mHelloWorld" -> "HelloWorld"
+func RemoveANSIColorsFromString(s string) string {
+	ansi := "[\u001B\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))"
+	re := regexp.MustCompile(ansi)
+
+	return re.ReplaceAllString(s, "")
+}
+
+// RetryUntilSuccessful calls callback every interval for duration until it returns true
+func RetryUntilSuccessful(duration time.Duration, interval time.Duration, callback func() bool) error {
+	return retryUntilSuccessful(duration, interval, func(int) (bool, error) {
+
+		// callback results indicate whether to retry
+		return !callback(), nil
+	})
+}
+
+// RetryUntilSuccessfulOnErrorPatterns calls callback every interval for duration as long as error pattern is matched
+// the callback argument retryCounter is the number of times the callback was called
+func RetryUntilSuccessfulOnErrorPatterns(
+	duration time.Duration,
+	interval time.Duration,
+	errorRegexPatterns []string,
+	callback func(retryCounter int) (string, error)) error {
+
+	return retryUntilSuccessful(duration, interval, func(retryCounter int) (bool, error) {
+		callbackErrorStr, err := callback(retryCounter)
+
+		if callbackErrorStr == "" {
+
+			// no error message means no retry needed
+			return false, err
+		}
+
+		// find a matching error pattern
+		if !MatchStringPatterns(errorRegexPatterns, callbackErrorStr) {
+
+			// no error pattern found, dont retry, bail
+			return false, errors.Errorf("Failed matching an error pattern for callback: %s", callbackErrorStr)
+		}
+
+		return true, err
+
+	})
+}
+
+// retryUntilSuccessful calls callback every interval until duration as long as it should retry
+func retryUntilSuccessful(duration time.Duration,
+	interval time.Duration,
+	callback func(int) (bool, error)) error {
+	var lastErr error
+	timedOutErrorMessage := "Timed out waiting until successful"
+	deadline := time.Now().Add(duration)
+
+	// while we haven't passed the deadline
+	var retryCounter int
+	for !time.Now().After(deadline) {
+		shouldRetry, err := callback(retryCounter)
+		lastErr = err
+		if !shouldRetry {
+			return err
+		}
+		retryCounter++
+		time.Sleep(interval)
+		continue
+
+	}
+	if lastErr != nil {
+
+		// wrap last error
+		return errors.Wrapf(lastErr, "%s", timedOutErrorMessage)
+	}
+
+	// duration expired without any last error
+	return errors.Errorf("%s", timedOutErrorMessage)
+}
+
+// RunningInContainer returns true if currently running in a container, false otherwise
+func RunningInContainer() bool {
+	return FileExists("/.dockerenv")
+}
+
+// RunningContainerHostname returns the hostname (aka container id) of the running container
+func RunningContainerHostname() (string, error) {
+	if !RunningInContainer() {
+		return "", errors.New("Not running in container")
+	}
+	if containerHostname != "" {
+		return containerHostname, nil
+	}
+	containerID, err := os.ReadFile("/etc/hostname")
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to open docker daemon config file")
+	}
+	containerHostname = strings.TrimSpace(string(containerID))
+	return containerHostname, nil
+}
+
+func StripPrefixes(input string, prefixes []string) string {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(input, prefix) {
+			return strings.TrimPrefix(input, prefix)
+		}
+	}
+	return input
+}
+
+func StripSuffixes(input string, suffixes []string) string {
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(input, suffix) {
+			return strings.TrimSuffix(input, suffix)
+		}
+	}
+	return input
+}
+
+// RemoveEmptyLines removes all empty lines from a string
+func RemoveEmptyLines(input string) string {
+	var nonEmptyLines []string
+
+	scanner := bufio.NewScanner(strings.NewReader(input))
+
+	// iterate over input line by line. if the line is not empty, shove it to the list
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if len(line) != 0 {
+			nonEmptyLines = append(nonEmptyLines, line)
+		}
+	}
+
+	// join the strings with a newline between them
+	return strings.Join(nonEmptyLines, "\n")
+}
+
+// GenerateStringMatchVerifier generates a function that returns whether a given string matches the specified string
+func GenerateStringMatchVerifier(str string) func(string) bool {
+	return func(toMatch string) bool {
+		return toMatch == str
+	}
+}
+
+// RemoveWindowsCarriage removes windows carriage character '\r' when it follows by '\n'
+func RemoveWindowsCarriage(b []byte) []byte {
+	n := utf8.RuneCount(b)
+	for i := 0; i < n-1; i++ {
+		if b[i] == '\r' && b[i+1] == '\n' {
+
+			// remove \r, keep \n
+			b = append(b[:i], b[i+1:]...)
+			n--
+		}
+	}
+	return b
+}
+
+func FixEscapeChars(s string) string {
+	escapeCharsMap := map[string]string{
+		"\\n":  "\n",
+		"\\t":  "\t",
+		"\\\\": "\\",
+		"\\\"": "\"",
+	}
+
+	for oldChar, newChar := range escapeCharsMap {
+		s = strings.ReplaceAll(s, oldChar, newChar)
+	}
+
+	return s
+}
+
+func GetEnvOrDefaultString(key string, defaultValue string) string {
+	value := os.Getenv(key)
+	switch value {
+	case "":
+		return defaultValue
+	case "nil", "none":
+		return ""
+	}
+	return value
+}
+
+func GetEnvOrDefaultBool(key string, defaultValue bool) bool {
+	return strings.ToLower(GetEnvOrDefaultString(key, strconv.FormatBool(defaultValue))) == "true"
+}
+
+func GetEnvOrDefaultInt(key string, defaultValue int) int {
+	valueInt, err := strconv.Atoi(GetEnvOrDefaultString(key, strconv.Itoa(defaultValue)))
+	if err != nil {
+		return defaultValue
+	}
+	return valueInt
+}
+
+// IsJavaProjectDir Checks if the given @dirPath is in a java project structure
+// for example if the following dir existed "/my-project/src/main/java" then IsJavaProjectDir("/my-project") -> true
+func IsJavaProjectDir(dirPath string) bool {
+	javaProjectStructurePath := path.Join(dirPath, "src", "main", "java")
+	if _, err := os.Stat(javaProjectStructurePath); err != nil {
+		return false
+	}
+
+	return true
+}
+
+func RenderTemplate(text string, data map[string]interface{}) (string, error) {
+	templateToRender, err := template.New("t").Parse(text)
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to create template")
+	}
+
+	return renderTemplate(templateToRender, data)
+}
+
+func RenderTemplateWithCustomDelimiters(text string,
+	data map[string]interface{},
+	leftDelimiter string,
+	rightDelimiter string) (string, error) {
+
+	templateToRender, err := template.New("t").
+		Delims(leftDelimiter, rightDelimiter).
+		Parse(text)
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to create template with custom delimiters")
+	}
+
+	return renderTemplate(templateToRender, data)
+}
+
+func renderTemplate(templateToRender *template.Template, data map[string]interface{}) (string, error) {
+	var templateToRenderBuffer bytes.Buffer
+	if err := templateToRender.Execute(&templateToRenderBuffer, &data); err != nil {
+		return "", errors.Wrap(err, "Failed to execute template rendering")
+	}
+
+	return templateToRenderBuffer.String(), nil
+}
+
+func GetDurationOrInfinite(timeout *time.Duration) time.Duration {
+	if timeout != nil {
+		return *timeout
+	}
+
+	// essentially infinite
+	return 100 * 365 * 24 * time.Hour
+}
+
+func GetSourceDir() string {
+
+	// get caller filename
+	_, fileName, _, _ := runtime.Caller(0)
+
+	// get filename dir
+	dirName := path.Dir(fileName)
+
+	for {
+
+		// we determine source dir by having a `go.mod` file there
+		if _, err := os.Stat(filepath.Join(dirName, "go.mod")); !os.IsNotExist(err) {
+			return dirName
+		}
+
+		// if we didn't find source yet, try on parent dir
+		dirName = filepath.Dir(dirName)
+
+		// we're out of parents, stop here
+		if dirName == "/" {
+			return dirName
+		}
+	}
+}
+
+// Quote returns a shell-escaped version of the string s. The returned value
+// is a string that can safely be used as one token in a shell command line.
+func Quote(s string) string {
+	if len(s) == 0 {
+		return "''"
+	}
+	if specialCharPattern.MatchString(s) {
+		return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+	}
+
+	return s
+}
+
+func ByteSliceToString(b []byte) string {
+
+	// https://golang.org/src/strings/builder.go#L45
+	// effectively converts bytes to string
+	// !! use with caution as returned string is mutable !!
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+func MatchStringPatterns(patterns []string, s string) bool {
+	for _, pattern := range patterns {
+		if regexp.MustCompile(pattern).MatchString(s) {
+
+			// one matching pattern is enough
+			return true
+		}
+	}
+	return false
+}
+
+func CompileImageName(registryURL string, imageName string) string {
+	return strings.TrimSuffix(registryURL, "/") + "/" + imageName
+}
+
+func AnyPositiveInSliceInt64(numbers []int64) bool {
+	for _, number := range numbers {
+		if number >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func GenerateRandomString(length int, letters []rune) string {
+	randomString := make([]rune, length)
+	for i := range randomString {
+		randomString[i] = letters[seededRand.Intn(len(letters))]
+	}
+
+	return string(randomString)
+}
+
+func CatchAndLogPanicWithOptions(ctx context.Context,
+	loggerInstance logger.Logger,
+	actionName string,
+	options *CatchAndLogPanicOptions) error {
+	if err := recover(); err != nil {
+		callStack := debug.Stack()
+		LogPanic(ctx, loggerInstance, actionName, options.Args, callStack, err)
+
+		asErr := ErrorFromRecoveredError(err)
+		if options.CustomHandler != nil {
+			options.CustomHandler(asErr)
+		}
+		return asErr
+	}
+	return nil
+}
+
+// LabelsMapMatchByLabelSelector returns whether a labelsMap is matched by an encoded label selector
+// corresponding to https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
+//
+// Example:
+//
+//	labelsMap:
+//	  a: b
+//	  c: d
+//	encodedLabelSelector: a=b
+//
+// returns true
+func LabelsMapMatchByLabelSelector(labelSelector string, labelsMap map[string]string) (bool, error) {
+
+	parsedLabelSelector, err := metav1.ParseToLabelSelector(labelSelector)
+	if err != nil {
+		return false, errors.Wrap(err, "Failed to parse label selector")
+	}
+	selector, err := metav1.LabelSelectorAsSelector(parsedLabelSelector)
+	if err != nil {
+		return false, errors.Wrap(err, "Failed to get selector from label selector")
+	}
+	return selector.Matches(labels.Set(labelsMap)), nil
+}
+
+// GetRuntimeNameAndVersion return runtime name and version.
+// e.g. go:1.8 -> go, 1.8
+func GetRuntimeNameAndVersion(runtime string) (string, string) {
+
+	switch runtimeAndVersion := strings.Split(runtime, ":"); len(runtimeAndVersion) {
+
+	// if both are passed (e.g. python:3.12) - return them both
+	case 2:
+		return runtimeAndVersion[0], runtimeAndVersion[1]
+
+	// otherwise - return the first element (e.g. go -> go)
+	default:
+		return runtimeAndVersion[0], ""
+	}
+
+}
+
+func LogPanic(ctx context.Context,
+	loggerInstance logger.Logger,
+	actionName string,
+	args []interface{},
+	callStack []byte,
+	err interface{}) {
+
+	logArgs := []interface{}{
+		"err", err,
+		"stack", string(callStack),
+	}
+
+	if args != nil {
+		logArgs = append(logArgs, args...)
+	}
+
+	loggerInstance.ErrorWithCtx(ctx, "Panic caught while "+actionName, logArgs...)
+}
+
+func ErrorFromRecoveredError(recoveredError interface{}) error {
+	switch typedErr := recoveredError.(type) {
+	case string:
+		return errors.New(typedErr)
+	case error:
+		return typedErr
+	default:
+		return errors.New(fmt.Sprintf("Unknown error type: %s", reflect.TypeOf(typedErr)))
+	}
+}
+
+func ParseQuantityOrDefault(value string,
+	defaultValue string,
+	loggerInstance logger.Logger) apiresource.Quantity {
+
+	// no value was given, use default
+	if value == "" {
+		value = defaultValue
+	}
+
+	quantity, err := apiresource.ParseQuantity(value)
+	if err != nil {
+		loggerInstance.WarnWith("Failed parsing quantity, assigning default value",
+			"defaultValue", defaultValue,
+			"err", err.Error())
+		quantity = apiresource.MustParse(defaultValue)
+	}
+	return quantity
+}
+
+func RemoveDuplicatesFromSliceString(slice []string) []string {
+	keys := make(map[string]bool)
+	var list []string
+	for _, entry := range slice {
+		if _, value := keys[entry]; !value {
+			keys[entry] = true
+			list = append(list, entry)
+		}
+	}
+	return list
+}
+
+func RemoveStringSliceItemsFromStringSlice(slice []string, itemsToRemove []string) []string {
+	var list []string
+	for _, item := range slice {
+		if !StringSliceContainsString(itemsToRemove, item) {
+			list = append(list, item)
+		}
+	}
+	return list
+}
+
+// PopulateFieldsFromValues populates empty fields with values if the value is not zero.
+// the fieldsToValues argument is a map of pointers to fields to populate and values.
+func PopulateFieldsFromValues[T string | bool | int](fieldsToValues map[*T]T) {
+	var zeroValue T
+	for field, value := range fieldsToValues {
+		if *field == zeroValue && value != zeroValue {
+			*field = value
+		}
+	}
+}
+
+// SanitizeResponseData tries to parse byte data as html. if it succeeds, it is returned sanitized,
+// otherwise the original data is returned.
+// func SanitizeResponseData(data []byte) []byte {
+func SanitizeResponseData(data []byte, headers http.Header) []byte {
+	// check if the content type contains html or javascript
+	contentType := headers.Get("Content-Type")
+	if contentType == "" || (!strings.Contains(contentType, "html") && !strings.Contains(contentType, "javascript")) {
+		return data
+	}
+
+	// attempt to parse the input data as HTML
+	_, err := html.Parse(bytes.NewReader(data))
+	if err != nil {
+		// if there is an error in parsing, it's not HTML, return data as is
+		return data
+	}
+
+	// the data is HTML, sanitize it
+	policy := bluemonday.UGCPolicy()
+	sanitizedData := policy.Sanitize(string(data))
+	return []byte(sanitizedData)
+}
+
+// GetFunctionName returns the actual name of a function variable
+func GetFunctionName(function interface{}) string {
+	fullName := runtime.FuncForPC(reflect.ValueOf(function).Pointer()).Name()
+	parts := strings.Split(fullName, ".")
+	shortName := parts[len(parts)-1]
+
+	// Methods passed by reference have a suffix of "-fm"
+	shortName = strings.TrimSuffix(shortName, "-fm")
+
+	return shortName
+}
+
+func Pointer[T any](v T) *T {
+	return &v
+}
+
+// ImageHasRegistry returns true if the image string includes an explicit registry domain.
+// A registry is assumed present if the first component contains a '.' or ':' (e.g., "registry.io/image").
+func ImageHasRegistry(image string) bool {
+	image = strings.TrimSpace(image)
+	slashIndex := strings.Index(image, "/")
+	if slashIndex == -1 {
+		return false
+	}
+	firstSegment := image[:slashIndex]
+	return strings.Contains(firstSegment, ".") || strings.Contains(firstSegment, ":")
+}
+```
+#### 版本B（729 行）
+```go
+/*
+Copyright 2023 The Nuclio Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package common
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"math/rand"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"runtime"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"text/template"
+	"time"
+	"unicode/utf8"
+	"unsafe"
+
+	"github.com/microcosm-cc/bluemonday"
+	"github.com/nuclio/errors"
+	"github.com/nuclio/logger"
+	"golang.org/x/net/html"
+	apiresource "k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+)
+
+var SmallLettersAndNumbers = []rune("abcdefghijklmnopqrstuvwxyz1234567890")
+var LettersAndNumbers = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890")
+var seededRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+var containerHostname string
+var specialCharPattern = regexp.MustCompile(`[^\w@%+=:,./-]`)
+
+// IsFile returns true if the object @ path is a file
+func IsFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.Mode().IsRegular()
+}
+
+// IsDir returns true if the object @ path is a dir
+func IsDir(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+
+	return info.IsDir()
+}
+
+// SanitizePath cleans and resolves the given file path to an absolute path.
+// This prevents path traversal and ensures consistency in file handling.
+func SanitizePath(path string) (string, error) {
+	// Clean the input path to eliminate any redundant or unsafe elements.
+	// Example: "/foo/../bar" becomes "/bar"
+	cleanPath := filepath.Clean(path)
+
+	// Convert to absolute path to avoid ambiguity and ensure safe file access.
+	absPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to get absolute path")
+	}
+
+	return absPath, nil
+}
+
+// IsPathWithinDir reports whether targetPath resolves to a location strictly inside dir.
+// Both arguments are resolved to absolute paths first, so the check is robust against
+// "../" traversal sequences in targetPath. A path equal to dir is not considered within it.
+// Use this to prevent path traversal (CWE-22) before writing to a user-influenced path.
+func IsPathWithinDir(targetPath, dir string) (bool, error) {
+	absTargetPath, err := filepath.Abs(targetPath)
+	if err != nil {
+		return false, errors.Wrap(err, "Failed to resolve target path")
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false, errors.Wrap(err, "Failed to resolve dir")
+	}
+
+	relPath, err := filepath.Rel(absDir, absTargetPath)
+	if err != nil {
+		// the paths share no common base (e.g. different Windows volumes) - not within
+		return false, nil
+	}
+
+	return relPath != "." &&
+		relPath != ".." &&
+		!strings.HasPrefix(relPath, ".."+string(os.PathSeparator)), nil
+}
+
+// FileExists returns true if the file @ path exists
+func FileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// EnsureDirExists checks if the directory exists, creates it if it doesn't
+func EnsureDirExists(ctx context.Context, loggerInstance logger.Logger, dir string) error {
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		loggerInstance.DebugWithCtx(ctx,
+			"Creating directory as it does not exist",
+			"directory", dir)
+
+		// we need 755 permission to allow running nuclio function with non-root SecurityContext
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// StringSliceToIntSlice converts slices of strings to slices of int. e.g. ["1", "3"] -> [1, 3]
+func StringSliceToIntSlice(stringSlice []string) ([]int, error) {
+	var result []int
+
+	for _, stringValue := range stringSlice {
+		var intValue int
+		var err error
+
+		if intValue, err = strconv.Atoi(stringValue); err != nil {
+			return nil, err
+		}
+
+		result = append(result, intValue)
+	}
+
+	return result, nil
+}
+
+// StringSliceContainsString returns whether the input str is in the slice
+func StringSliceContainsString(slice []string, str string) bool {
+	for _, stringInSlice := range slice {
+		if stringInSlice == str {
+			return true
+		}
+	}
+
+	return false
+}
+
+// StringSliceContainsStringPrefix returns whether the input str has prefix
+func StringSliceContainsStringPrefix(prefixes []string, str string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(str, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// StringSliceContainsStringSuffix returns whether the input str has suffix
+func StringSliceContainsStringSuffix(prefixes []string, str string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasSuffix(str, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// StringSliceContainsStringCaseInsensitive returns whether the input str is in the slice case-insensitive
+func StringSliceContainsStringCaseInsensitive(slice []string, str string) bool {
+	for _, stringInSlice := range slice {
+		if strings.EqualFold(stringInSlice, str) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// PrependStringToStringSlice prepends a string to a string slice
+func PrependStringToStringSlice(slice []string, str string) []string {
+	slice = append(slice, "")
+	copy(slice[1:], slice)
+	slice[0] = str
+	return slice
+}
+
+// PrependStringsToStringSlice prepends multiple strings to a string slice
+func PrependStringsToStringSlice(slice []string, strs ...string) []string {
+	totalLen := len(slice) + len(strs)
+	slice = append(slice, make([]string, len(strs))...)
+	copy(slice[len(strs):], slice)
+	copy(slice, strs)
+	return slice[:totalLen]
+}
+
+// RemoveANSIColorsFromString strips out ANSI Colors chars from string
+// example: "\u001b[31mHelloWorld" -> "HelloWorld"
+func RemoveANSIColorsFromString(s string) string {
+	ansi := "[\u001B\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))"
+	re := regexp.MustCompile(ansi)
+
+	return re.ReplaceAllString(s, "")
+}
+
+// RetryUntilSuccessful calls callback every interval for duration until it returns true
+func RetryUntilSuccessful(duration time.Duration, interval time.Duration, callback func() bool) error {
+	return retryUntilSuccessful(duration, interval, func(int) (bool, error) {
+
+		// callback results indicate whether to retry
+		return !callback(), nil
+	})
+}
+
+// RetryUntilSuccessfulOnErrorPatterns calls callback every interval for duration as long as error pattern is matched
+// the callback argument retryCounter is the number of times the callback was called
+func RetryUntilSuccessfulOnErrorPatterns(
+	duration time.Duration,
+	interval time.Duration,
+	errorRegexPatterns []string,
+	callback func(retryCounter int) (string, error)) error {
+
+	return retryUntilSuccessful(duration, interval, func(retryCounter int) (bool, error) {
+		callbackErrorStr, err := callback(retryCounter)
+
+		if callbackErrorStr == "" {
+
+			// no error message means no retry needed
+			return false, err
+		}
+
+		// find a matching error pattern
+		if !MatchStringPatterns(errorRegexPatterns, callbackErrorStr) {
+
+			// no error pattern found, dont retry, bail
+			return false, errors.Errorf("Failed matching an error pattern for callback: %s", callbackErrorStr)
+		}
+
+		return true, err
+
+	})
+}
+
+// retryUntilSuccessful calls callback every interval until duration as long as it should retry
+func retryUntilSuccessful(duration time.Duration,
+	interval time.Duration,
+	callback func(int) (bool, error)) error {
+	var lastErr error
+	timedOutErrorMessage := "Timed out waiting until successful"
+	deadline := time.Now().Add(duration)
+
+	// while we haven't passed the deadline
+	var retryCounter int
+	for !time.Now().After(deadline) {
+		shouldRetry, err := callback(retryCounter)
+		lastErr = err
+		if !shouldRetry {
+			return err
+		}
+		retryCounter++
+		time.Sleep(interval)
+		continue
+
+	}
+	if lastErr != nil {
+
+		// wrap last error
+		return errors.Wrapf(lastErr, "%s", timedOutErrorMessage)
+	}
+
+	// duration expired without any last error
+	return errors.Errorf("%s", timedOutErrorMessage)
+}
+
+// RunningInContainer returns true if currently running in a container, false otherwise
+func RunningInContainer() bool {
+	return FileExists("/.dockerenv")
+}
+
+// RunningContainerHostname returns the hostname (aka container id) of the running container
+func RunningContainerHostname() (string, error) {
+	if !RunningInContainer() {
+		return "", errors.New("Not running in container")
+	}
+	if containerHostname != "" {
+		return containerHostname, nil
+	}
+	containerID, err := os.ReadFile("/etc/hostname")
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to open docker daemon config file")
+	}
+	containerHostname = strings.TrimSpace(string(containerID))
+	return containerHostname, nil
+}
+
+func StripPrefixes(input string, prefixes []string) string {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(input, prefix) {
+			return strings.TrimPrefix(input, prefix)
+		}
+	}
+	return input
+}
+
+func StripSuffixes(input string, suffixes []string) string {
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(input, suffix) {
+			return strings.TrimSuffix(input, suffix)
+		}
+	}
+	return input
+}
+
+// RemoveEmptyLines removes all empty lines from a string
+func RemoveEmptyLines(input string) string {
+	var nonEmptyLines []string
+
+	scanner := bufio.NewScanner(strings.NewReader(input))
+
+	// iterate over input line by line. if the line is not empty, shove it to the list
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if len(line) != 0 {
+			nonEmptyLines = append(nonEmptyLines, line)
+		}
+	}
+
+	// join the strings with a newline between them
+	return strings.Join(nonEmptyLines, "\n")
+}
+
+// GenerateStringMatchVerifier generates a function that returns whether a given string matches the specified string
+func GenerateStringMatchVerifier(str string) func(string) bool {
+	return func(toMatch string) bool {
+		return toMatch == str
+	}
+}
+
+// RemoveWindowsCarriage removes windows carriage character '\r' when it follows by '\n'
+func RemoveWindowsCarriage(b []byte) []byte {
+	n := utf8.RuneCount(b)
+	for i := 0; i < n-1; i++ {
+		if b[i] == '\r' && b[i+1] == '\n' {
+
+			// remove \r, keep \n
+			b = append(b[:i], b[i+1:]...)
+			n--
+		}
+	}
+	return b
+}
+
+func FixEscapeChars(s string) string {
+	escapeCharsMap := map[string]string{
+		"\\n":  "\n",
+		"\\t":  "\t",
+		"\\\\": "\\",
+		"\\\"": "\"",
+	}
+
+	for oldChar, newChar := range escapeCharsMap {
+		s = strings.ReplaceAll(s, oldChar, newChar)
+	}
+
+	return s
+}
+
+func GetEnvOrDefaultString(key string, defaultValue string) string {
+	value := os.Getenv(key)
+	switch value {
+	case "":
+		return defaultValue
+	case "nil", "none":
+		return ""
+	}
+	return value
+}
+
+func GetEnvOrDefaultBool(key string, defaultValue bool) bool {
+	return strings.ToLower(GetEnvOrDefaultString(key, strconv.FormatBool(defaultValue))) == "true"
+}
+
+func GetEnvOrDefaultInt(key string, defaultValue int) int {
+	valueInt, err := strconv.Atoi(GetEnvOrDefaultString(key, strconv.Itoa(defaultValue)))
+	if err != nil {
+		return defaultValue
+	}
+	return valueInt
+}
+
+// IsJavaProjectDir Checks if the given @dirPath is in a java project structure
+// for example if the following dir existed "/my-project/src/main/java" then IsJavaProjectDir("/my-project") -> true
+func IsJavaProjectDir(dirPath string) bool {
+	javaProjectStructurePath := path.Join(dirPath, "src", "main", "java")
+	if _, err := os.Stat(javaProjectStructurePath); err != nil {
+		return false
+	}
+
+	return true
+}
+
+func RenderTemplate(text string, data map[string]interface{}) (string, error) {
+	templateToRender, err := template.New("t").Parse(text)
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to create template")
+	}
+
+	return renderTemplate(templateToRender, data)
+}
+
+func RenderTemplateWithCustomDelimiters(text string,
+	data map[string]interface{},
+	leftDelimiter string,
+	rightDelimiter string) (string, error) {
+
+	templateToRender, err := template.New("t").
+		Delims(leftDelimiter, rightDelimiter).
+		Parse(text)
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to create template with custom delimiters")
+	}
+
+	return renderTemplate(templateToRender, data)
+}
+
+func renderTemplate(templateToRender *template.Template, data map[string]interface{}) (string, error) {
+	var templateToRenderBuffer bytes.Buffer
+	if err := templateToRender.Execute(&templateToRenderBuffer, &data); err != nil {
+		return "", errors.Wrap(err, "Failed to execute template rendering")
+	}
+
+	return templateToRenderBuffer.String(), nil
+}
+
+func GetDurationOrInfinite(timeout *time.Duration) time.Duration {
+	if timeout != nil {
+		return *timeout
+	}
+
+	// essentially infinite
+	return 100 * 365 * 24 * time.Hour
+}
+
+func GetSourceDir() string {
+
+	// get caller filename
+	_, fileName, _, _ := runtime.Caller(0)
+
+	// get filename dir
+	dirName := path.Dir(fileName)
+
+	for {
+
+		// we determine source dir by having a `go.mod` file there
+		if _, err := os.Stat(filepath.Join(dirName, "go.mod")); !os.IsNotExist(err) {
+			return dirName
+		}
+
+		// if we didn't find source yet, try on parent dir
+		dirName = filepath.Dir(dirName)
+
+		// we're out of parents, stop here
+		if dirName == "/" {
+			return dirName
+		}
+	}
+}
+
+// Quote returns a shell-escaped version of the string s. The returned value
+// is a string that can safely be used as one token in a shell command line.
+func Quote(s string) string {
+	if len(s) == 0 {
+		return "''"
+	}
+	if specialCharPattern.MatchString(s) {
+		return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+	}
+
+	return s
+}
+
+func ByteSliceToString(b []byte) string {
+
+	// https://golang.org/src/strings/builder.go#L45
+	// effectively converts bytes to string
+	// !! use with caution as returned string is mutable !!
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+func MatchStringPatterns(patterns []string, s string) bool {
+	for _, pattern := range patterns {
+		if regexp.MustCompile(pattern).MatchString(s) {
+
+			// one matching pattern is enough
+			return true
+		}
+	}
+	return false
+}
+
+func CompileImageName(registryURL string, imageName string) string {
+	return strings.TrimSuffix(registryURL, "/") + "/" + imageName
+}
+
+func AnyPositiveInSliceInt64(numbers []int64) bool {
+	for _, number := range numbers {
+		if number >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func GenerateRandomString(length int, letters []rune) string {
+	randomString := make([]rune, length)
+	for i := range randomString {
+		randomString[i] = letters[seededRand.Intn(len(letters))]
+	}
+
+	return string(randomString)
+}
+
+func CatchAndLogPanicWithOptions(ctx context.Context,
+	loggerInstance logger.Logger,
+	actionName string,
+	options *CatchAndLogPanicOptions) error {
+	if err := recover(); err != nil {
+		callStack := debug.Stack()
+		LogPanic(ctx, loggerInstance, actionName, options.Args, callStack, err)
+
+		asErr := ErrorFromRecoveredError(err)
+		if options.CustomHandler != nil {
+			options.CustomHandler(asErr)
+		}
+		return asErr
+	}
+	return nil
+}
+
+// LabelsMapMatchByLabelSelector returns whether a labelsMap is matched by an encoded label selector
+// corresponding to https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
+//
+// Example:
+//
+//	labelsMap:
+//	  a: b
+//	  c: d
+//	encodedLabelSelector: a=b
+//
+// returns true
+func LabelsMapMatchByLabelSelector(labelSelector string, labelsMap map[string]string) (bool, error) {
+
+	parsedLabelSelector, err := metav1.ParseToLabelSelector(labelSelector)
+	if err != nil {
+		return false, errors.Wrap(err, "Failed to parse label selector")
+	}
+	selector, err := metav1.LabelSelectorAsSelector(parsedLabelSelector)
+	if err != nil {
+		return false, errors.Wrap(err, "Failed to get selector from label selector")
+	}
+	return selector.Matches(labels.Set(labelsMap)), nil
+}
+
+// GetRuntimeNameAndVersion return runtime name and version.
+// e.g. go:1.8 -> go, 1.8
+func GetRuntimeNameAndVersion(runtime string) (string, string) {
+
+	switch runtimeAndVersion := strings.Split(runtime, ":"); len(runtimeAndVersion) {
+
+	// if both are passed (e.g. python:3.12) - return them both
+	case 2:
+		return runtimeAndVersion[0], runtimeAndVersion[1]
+
+	// otherwise - return the first element (e.g. go -> go)
+	default:
+		return runtimeAndVersion[0], ""
+	}
+
+}
+
+func LogPanic(ctx context.Context,
+	loggerInstance logger.Logger,
+	actionName string,
+	args []interface{},
+	callStack []byte,
+	err interface{}) {
+
+	logArgs := []interface{}{
+		"err", err,
+		"stack", string(callStack),
+	}
+
+	if args != nil {
+		logArgs = append(logArgs, args...)
+	}
+
+	loggerInstance.ErrorWithCtx(ctx, "Panic caught while "+actionName, logArgs...)
+}
+
+func ErrorFromRecoveredError(recoveredError interface{}) error {
+	switch typedErr := recoveredError.(type) {
+	case string:
+		return errors.New(typedErr)
+	case error:
+		return typedErr
+	default:
+		return errors.New(fmt.Sprintf("Unknown error type: %s", reflect.TypeOf(typedErr)))
+	}
+}
+
+func ParseQuantityOrDefault(value string,
+	defaultValue string,
+	loggerInstance logger.Logger) apiresource.Quantity {
+
+	// no value was given, use default
+	if value == "" {
+		value = defaultValue
+	}
+
+	quantity, err := apiresource.ParseQuantity(value)
+	if err != nil {
+		loggerInstance.WarnWith("Failed parsing quantity, assigning default value",
+			"defaultValue", defaultValue,
+			"err", err.Error())
+		quantity = apiresource.MustParse(defaultValue)
+	}
+	return quantity
+}
+
+func RemoveDuplicatesFromSliceString(slice []string) []string {
+	keys := make(map[string]bool)
+	var list []string
+	for _, entry := range slice {
+		if _, value := keys[entry]; !value {
+			keys[entry] = true
+			list = append(list, entry)
+		}
+	}
+	return list
+}
+
+func RemoveStringSliceItemsFromStringSlice(slice []string, itemsToRemove []string) []string {
+	var list []string
+	for _, item := range slice {
+		if !StringSliceContainsString(itemsToRemove, item) {
+			list = append(list, item)
+		}
+	}
+	return list
+}
+
+// PopulateFieldsFromValues populates empty fields with values if the value is not zero.
+// the fieldsToValues argument is a map of pointers to fields to populate and values.
+func PopulateFieldsFromValues[T string | bool | int](fieldsToValues map[*T]T) {
+	var zeroValue T
+	for field, value := range fieldsToValues {
+		if *field == zeroValue && value != zeroValue {
+			*field = value
+		}
+	}
+}
+
+// SanitizeResponseData tries to parse byte data as html. if it succeeds, it is returned sanitized,
+// otherwise the original data is returned.
+// func SanitizeResponseData(data []byte) []byte {
+func SanitizeResponseData(data []byte, headers http.Header) []byte {
+	// check if the content type contains html or javascript
+	contentType := headers.Get("Content-Type")
+	if contentType == "" || (!strings.Contains(contentType, "html") && !strings.Contains(contentType, "javascript")) {
+		return data
+	}
+
+	// attempt to parse the input data as HTML
+	_, err := html.Parse(bytes.NewReader(data))
+	if err != nil {
+		// if there is an error in parsing, it's not HTML, return data as is
+		return data
+	}
+
+	// the data is HTML, sanitize it
+	policy := bluemonday.UGCPolicy()
+	sanitizedData := policy.Sanitize(string(data))
+	return []byte(sanitizedData)
+}
+
+// GetFunctionName returns the actual name of a function variable
+func GetFunctionName(function interface{}) string {
+	fullName := runtime.FuncForPC(reflect.ValueOf(function).Pointer()).Name()
+	parts := strings.Split(fullName, ".")
+	shortName := parts[len(parts)-1]
+
+	// Methods passed by reference have a suffix of "-fm"
+	shortName = strings.TrimSuffix(shortName, "-fm")
+
+	return shortName
+}
+
+func Pointer[T any](v T) *T {
+	return &v
+}
+
+// ImageHasRegistry returns true if the image string includes an explicit registry domain.
+// A registry is assumed present if the first component contains a '.' or ':' (e.g., "registry.io/image").
+func ImageHasRegistry(image string) bool {
+	image = strings.TrimSpace(image)
+	slashIndex := strings.Index(image, "/")
+	if slashIndex == -1 {
+		return false
+	}
+	firstSegment := image[:slashIndex]
+	return strings.Contains(firstSegment, ".") || strings.Contains(firstSegment, ":")
+}
+```

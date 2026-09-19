@@ -1,0 +1,1284 @@
+【蒸馏批次 redistill | 样本数=3】
+
+
+### id=redistill-line-7993 lang=go flags=[R3]
+#### 代码（542 行）
+```go
+package sanitize
+
+import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
+	"math"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+)
+
+// Part is either a string or an int. A string is raw SQL. An int is a
+// argument placeholder.
+type Part any
+
+type Query struct {
+	Parts []Part
+}
+
+// utf.DecodeRune returns the utf8.RuneError for errors. But that is actually rune U+FFFD -- the unicode replacement
+// character. utf8.RuneError is not an error if it is also width 3.
+//
+// https://github.com/jackc/pgx/issues/1380
+const replacementcharacterwidth = 3
+
+const maxBufSize = 16384 // 16 Ki
+
+var bufPool = &pool[*bytes.Buffer]{
+	new: func() *bytes.Buffer {
+		return &bytes.Buffer{}
+	},
+	reset: func(b *bytes.Buffer) bool {
+		n := b.Len()
+		b.Reset()
+		return n < maxBufSize
+	},
+}
+
+var null = []byte("null")
+
+func (q *Query) Sanitize(args ...any) (string, error) {
+	argUse := make([]bool, len(args))
+	buf := bufPool.get()
+	defer bufPool.put(buf)
+
+	for _, part := range q.Parts {
+		switch part := part.(type) {
+		case string:
+			buf.WriteString(part)
+		case int:
+			argIdx := part - 1
+			var p []byte
+			if argIdx < 0 {
+				return "", fmt.Errorf("first sql argument must be > 0")
+			}
+
+			if argIdx >= len(args) {
+				return "", fmt.Errorf("insufficient arguments")
+			}
+
+			// Prevent SQL injection via Line Comment Creation
+			// https://github.com/jackc/pgx/security/advisories/GHSA-m7wr-2xf7-cm9p
+			buf.WriteByte(' ')
+
+			arg := args[argIdx]
+			switch arg := arg.(type) {
+			case nil:
+				p = null
+			case int64:
+				p = strconv.AppendInt(buf.AvailableBuffer(), arg, 10)
+			case float64:
+				p = strconv.AppendFloat(buf.AvailableBuffer(), arg, 'f', -1, 64)
+			case bool:
+				p = strconv.AppendBool(buf.AvailableBuffer(), arg)
+			case []byte:
+				p = QuoteBytes(buf.AvailableBuffer(), arg)
+			case string:
+				p = QuoteString(buf.AvailableBuffer(), arg)
+			case time.Time:
+				p = arg.Truncate(time.Microsecond).
+					AppendFormat(buf.AvailableBuffer(), "'2006-01-02 15:04:05.999999999Z07:00:00'")
+			default:
+				return "", fmt.Errorf("invalid arg type: %T", arg)
+			}
+			argUse[argIdx] = true
+
+			buf.Write(p)
+
+			// Prevent SQL injection via Line Comment Creation
+			// https://github.com/jackc/pgx/security/advisories/GHSA-m7wr-2xf7-cm9p
+			buf.WriteByte(' ')
+		default:
+			return "", fmt.Errorf("invalid Part type: %T", part)
+		}
+	}
+
+	for i, used := range argUse {
+		if !used {
+			return "", fmt.Errorf("unused argument: %d", i)
+		}
+	}
+	return buf.String(), nil
+}
+
+func NewQuery(sql string) (*Query, error) {
+	query := &Query{}
+	query.init(sql)
+
+	return query, nil
+}
+
+var sqlLexerPool = &pool[*sqlLexer]{
+	new: func() *sqlLexer {
+		return &sqlLexer{}
+	},
+	reset: func(sl *sqlLexer) bool {
+		*sl = sqlLexer{}
+		return true
+	},
+}
+
+func (q *Query) init(sql string) {
+	parts := q.Parts[:0]
+	if parts == nil {
+		// dirty, but fast heuristic to preallocate for ~90% usecases
+		n := strings.Count(sql, "$") + strings.Count(sql, "--") + 1
+		parts = make([]Part, 0, n)
+	}
+
+	l := sqlLexerPool.get()
+	defer sqlLexerPool.put(l)
+
+	l.src = sql
+	l.stateFn = rawState
+	l.parts = parts
+
+	for l.stateFn != nil {
+		l.stateFn = l.stateFn(l)
+	}
+
+	q.Parts = l.parts
+}
+
+func QuoteString(dst []byte, str string) []byte {
+	const quote = '\''
+
+	// Preallocate space for the worst case scenario
+	dst = slices.Grow(dst, len(str)*2+2)
+
+	// Add opening quote
+	dst = append(dst, quote)
+
+	// Iterate through the string without allocating
+	for i := 0; i < len(str); i++ {
+		if str[i] == quote {
+			dst = append(dst, quote, quote)
+		} else {
+			dst = append(dst, str[i])
+		}
+	}
+
+	// Add closing quote
+	dst = append(dst, quote)
+
+	return dst
+}
+
+func QuoteBytes(dst, buf []byte) []byte {
+	if len(buf) == 0 {
+		return append(dst, `'\x'`...)
+	}
+
+	// Calculate required length
+	requiredLen := 3 + hex.EncodedLen(len(buf)) + 1
+
+	// Ensure dst has enough capacity
+	if cap(dst)-len(dst) < requiredLen {
+		newDst := make([]byte, len(dst), len(dst)+requiredLen)
+		copy(newDst, dst)
+		dst = newDst
+	}
+
+	// Record original length and extend slice
+	origLen := len(dst)
+	dst = dst[:origLen+requiredLen]
+
+	// Add prefix
+	dst[origLen] = '\''
+	dst[origLen+1] = '\\'
+	dst[origLen+2] = 'x'
+
+	// Encode bytes directly into dst
+	hex.Encode(dst[origLen+3:len(dst)-1], buf)
+
+	// Add suffix
+	dst[len(dst)-1] = '\''
+
+	return dst
+}
+
+type sqlLexer struct {
+	src       string
+	start     int
+	pos       int
+	nested    int    // multiline comment nesting level.
+	dollarTag string // active tag while inside a dollar-quoted string (may be empty for $$).
+	stateFn   stateFn
+	parts     []Part
+}
+
+type stateFn func(*sqlLexer) stateFn
+
+func rawState(l *sqlLexer) stateFn {
+	for {
+		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+		l.pos += width
+
+		switch r {
+		case 'e', 'E':
+			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+			if nextRune == '\'' {
+				l.pos += width
+				return escapeStringState
+			}
+		case '\'':
+			return singleQuoteState
+		case '"':
+			return doubleQuoteState
+		case '$':
+			nextRune, _ := utf8.DecodeRuneInString(l.src[l.pos:])
+			if '0' <= nextRune && nextRune <= '9' {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos-width])
+				}
+				l.start = l.pos
+				return placeholderState
+			}
+			// PostgreSQL dollar-quoted string: $[tag]$...$[tag]$. The $ was
+			// just consumed; try to match the rest of the opening tag.
+			// Without this, placeholders embedded inside dollar-quoted
+			// literals would be incorrectly substituted.
+			if tagLen, ok := scanDollarQuoteTag(l.src[l.pos:]); ok {
+				l.dollarTag = l.src[l.pos : l.pos+tagLen]
+				l.pos += tagLen + 1 // advance past tag and closing '$'
+				return dollarQuoteState
+			}
+		case '-':
+			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+			if nextRune == '-' {
+				l.pos += width
+				return oneLineCommentState
+			}
+		case '/':
+			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+			if nextRune == '*' {
+				l.pos += width
+				return multilineCommentState
+			}
+		case utf8.RuneError:
+			if width != replacementcharacterwidth {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos])
+					l.start = l.pos
+				}
+				return nil
+			}
+		}
+	}
+}
+
+func singleQuoteState(l *sqlLexer) stateFn {
+	for {
+		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+		l.pos += width
+
+		switch r {
+		case '\'':
+			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+			if nextRune != '\'' {
+				return rawState
+			}
+			l.pos += width
+		case utf8.RuneError:
+			if width != replacementcharacterwidth {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos])
+					l.start = l.pos
+				}
+				return nil
+			}
+		}
+	}
+}
+
+func doubleQuoteState(l *sqlLexer) stateFn {
+	for {
+		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+		l.pos += width
+
+		switch r {
+		case '"':
+			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+			if nextRune != '"' {
+				return rawState
+			}
+			l.pos += width
+		case utf8.RuneError:
+			if width != replacementcharacterwidth {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos])
+					l.start = l.pos
+				}
+				return nil
+			}
+		}
+	}
+}
+
+// placeholderState consumes a placeholder value. The $ must have already has
+// already been consumed. The first rune must be a digit.
+func placeholderState(l *sqlLexer) stateFn {
+	num := 0
+
+	for {
+		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+		l.pos += width
+
+		if '0' <= r && r <= '9' {
+			// Clamp rather than silently wrap on pathological input like
+			// "$92233720368547758070" which would otherwise overflow int and
+			// could land on a valid args index. Any value above MaxInt32 far
+			// exceeds any plausible args length, so Sanitize will correctly
+			// return "insufficient arguments".
+			if num > (math.MaxInt32-9)/10 {
+				num = math.MaxInt32
+			} else {
+				num = num*10 + int(r-'0')
+			}
+		} else {
+			l.parts = append(l.parts, num)
+			l.pos -= width
+			l.start = l.pos
+			return rawState
+		}
+	}
+}
+
+// dollarQuoteState consumes the body of a PostgreSQL dollar-quoted string
+// ($[tag]$...$[tag]$). The opening tag (including its terminating '$') has
+// already been consumed.
+func dollarQuoteState(l *sqlLexer) stateFn {
+	closer := "$" + l.dollarTag + "$"
+	idx := strings.Index(l.src[l.pos:], closer)
+	if idx < 0 {
+		// Unterminated — mirror the behavior of other quoted-string states by
+		// consuming the remaining input into the current part and stopping.
+		if len(l.src)-l.start > 0 {
+			l.parts = append(l.parts, l.src[l.start:])
+			l.start = len(l.src)
+		}
+		l.pos = len(l.src)
+		return nil
+	}
+	l.pos += idx + len(closer)
+	l.dollarTag = ""
+	return rawState
+}
+
+// scanDollarQuoteTag checks whether src begins with an optional dollar-quoted
+// string tag followed by a closing '$'. src must point just past the opening
+// '$'. Returns the byte length of the tag (zero for an anonymous $$) and
+// whether a valid tag was found.
+//
+// Tag grammar matches the PostgreSQL lexer (scan.l):
+//
+//	dolq_start: [A-Za-z_\x80-\xff]
+//	dolq_cont:  [A-Za-z0-9_\x80-\xff]
+func scanDollarQuoteTag(src string) (int, bool) {
+	first := true
+	for i := 0; i < len(src); {
+		r, w := utf8.DecodeRuneInString(src[i:])
+		if r == '$' {
+			return i, true
+		}
+		if !isDollarTagRune(r, first) {
+			return 0, false
+		}
+		first = false
+		i += w
+	}
+	return 0, false
+}
+
+func isDollarTagRune(r rune, first bool) bool {
+	switch {
+	case r == '_':
+		return true
+	case 'a' <= r && r <= 'z':
+		return true
+	case 'A' <= r && r <= 'Z':
+		return true
+	case !first && '0' <= r && r <= '9':
+		return true
+	case r >= 0x80 && r != utf8.RuneError:
+		return true
+	}
+	return false
+}
+
+func escapeStringState(l *sqlLexer) stateFn {
+	for {
+		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+		l.pos += width
+
+		switch r {
+		case '\\':
+			_, width = utf8.DecodeRuneInString(l.src[l.pos:])
+			l.pos += width
+		case '\'':
+			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+			if nextRune != '\'' {
+				return rawState
+			}
+			l.pos += width
+		case utf8.RuneError:
+			if width != replacementcharacterwidth {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos])
+					l.start = l.pos
+				}
+				return nil
+			}
+		}
+	}
+}
+
+func oneLineCommentState(l *sqlLexer) stateFn {
+	for {
+		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+		l.pos += width
+
+		switch r {
+		case '\\':
+			_, width = utf8.DecodeRuneInString(l.src[l.pos:])
+			l.pos += width
+		case '\n', '\r':
+			return rawState
+		case utf8.RuneError:
+			if width != replacementcharacterwidth {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos])
+					l.start = l.pos
+				}
+				return nil
+			}
+		}
+	}
+}
+
+func multilineCommentState(l *sqlLexer) stateFn {
+	for {
+		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+		l.pos += width
+
+		switch r {
+		case '/':
+			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+			if nextRune == '*' {
+				l.pos += width
+				l.nested++
+			}
+		case '*':
+			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+			if nextRune != '/' {
+				continue
+			}
+
+			l.pos += width
+			if l.nested == 0 {
+				return rawState
+			}
+			l.nested--
+
+		case utf8.RuneError:
+			if width != replacementcharacterwidth {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos])
+					l.start = l.pos
+				}
+				return nil
+			}
+		}
+	}
+}
+
+var queryPool = &pool[*Query]{
+	new: func() *Query {
+		return &Query{}
+	},
+	reset: func(q *Query) bool {
+		n := len(q.Parts)
+		q.Parts = q.Parts[:0]
+		return n < 64 // drop too large queries
+	},
+}
+
+// SanitizeSQL replaces placeholder values with args. It quotes and escapes args
+// as necessary. This function is only safe when standard_conforming_strings is
+// on.
+func SanitizeSQL(sql string, args ...any) (string, error) {
+	query := queryPool.get()
+	query.init(sql)
+	defer queryPool.put(query)
+
+	return query.Sanitize(args...)
+}
+
+type pool[E any] struct {
+	p     sync.Pool
+	new   func() E
+	reset func(E) bool
+}
+
+func (pool *pool[E]) get() E {
+	v, ok := pool.p.Get().(E)
+	if !ok {
+		v = pool.new()
+	}
+
+	return v
+}
+
+func (p *pool[E]) put(v E) {
+	if p.reset(v) {
+		p.p.Put(v)
+	}
+}
+
+
+```
+
+
+### id=redistill-line-10051 lang=go flags=[R3]
+#### 代码（408 行）
+```go
+package suci
+
+import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/elliptic"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"log"
+	"math"
+	"math/big"
+	"math/bits"
+	"strconv"
+	"strings"
+
+	"golang.org/x/crypto/curve25519"
+
+	"github.com/free5gc/udm/internal/logger"
+)
+
+type SuciProfile struct {
+	ProtectionScheme string `yaml:"ProtectionScheme,omitempty"`
+	PrivateKey       string `yaml:"PrivateKey,omitempty"`
+	PublicKey        string `yaml:"PublicKey,omitempty"`
+}
+
+// profile A.
+const (
+	ProfileAMacKeyLen = 32 // octets
+	ProfileAEncKeyLen = 16 // octets
+	ProfileAIcbLen    = 16 // octets
+	ProfileAMacLen    = 8  // octets
+	ProfileAHashLen   = 32 // octets
+)
+
+// profile B.
+const (
+	ProfileBMacKeyLen = 32 // octets
+	ProfileBEncKeyLen = 16 // octets
+	ProfileBIcbLen    = 16 // octets
+	ProfileBMacLen    = 8  // octets
+	ProfileBHashLen   = 32 // octets
+)
+
+func CompressKey(uncompressed []byte, y *big.Int) []byte {
+	compressed := uncompressed[0:33]
+	if y.Bit(0) == 1 { // 0x03
+		compressed[0] = 0x03
+	} else { // 0x02
+		compressed[0] = 0x02
+	}
+	// fmt.Printf("compressed: %x\n", compressed)
+	return compressed
+}
+
+// modified from https://stackoverflow.com/questions/46283760/
+// how-to-uncompress-a-single-x9-62-compressed-point-on-an-ecdh-p256-curve-in-go.
+func uncompressKey(compressedBytes []byte, priv []byte) (*big.Int, *big.Int) {
+	// Split the sign byte from the rest
+	signByte := uint(compressedBytes[0])
+	xBytes := compressedBytes[1:]
+
+	x := new(big.Int).SetBytes(xBytes)
+	three := big.NewInt(3)
+
+	// The params for P256
+	c := elliptic.P256().Params()
+
+	// The equation is y^2 = x^3 - 3x + b
+	// x^3, mod P
+	xCubed := new(big.Int).Exp(x, three, c.P)
+
+	// 3x, mod P
+	threeX := new(big.Int).Mul(x, three)
+	threeX.Mod(threeX, c.P)
+
+	// x^3 - 3x + b mod P
+	ySquared := new(big.Int).Sub(xCubed, threeX)
+	ySquared.Add(ySquared, c.B)
+	ySquared.Mod(ySquared, c.P)
+
+	// find the square root mod P
+	y := new(big.Int).ModSqrt(ySquared, c.P)
+	if y == nil {
+		// If this happens then you're dealing with an invalid point.
+		logger.SuciLog.Errorln("Uncompressed key with invalid point")
+		return nil, nil
+	}
+
+	// Finally, check if you have the correct root. If not you want -y mod P
+	if y.Bit(0) != signByte&1 {
+		y.Neg(y)
+		y.Mod(y, c.P)
+	}
+	// fmt.Printf("xUncom: %x\nyUncon: %x\n", x, y)
+	return x, y
+}
+
+func HmacSha256(input, macKey []byte, macLen int) []byte {
+	h := hmac.New(sha256.New, macKey)
+	if _, err := h.Write(input); err != nil {
+		log.Printf("HMAC SHA256 error %+v", err)
+	}
+	macVal := h.Sum(nil)
+	macTag := macVal[:macLen]
+	// fmt.Printf("macVal: %x\nmacTag: %x\n", macVal, macTag)
+	return macTag
+}
+
+func Aes128ctr(input, encKey, icb []byte) []byte {
+	output := make([]byte, len(input))
+	block, err := aes.NewCipher(encKey)
+	if err != nil {
+		log.Printf("AES128 CTR error %+v", err)
+	}
+	stream := cipher.NewCTR(block, icb)
+	stream.XORKeyStream(output, input)
+	// fmt.Printf("aes input: %x %x %x\naes output: %x\n", input, encKey, icb, output)
+	return output
+}
+
+func AnsiX963KDF(sharedKey, publicKey []byte, profileEncKeyLen, profileMacKeyLen, profileHashLen int) []byte {
+	var counter uint32 = 0x00000001
+	var kdfKey []byte
+	kdfRounds := int(math.Ceil(float64(profileEncKeyLen+profileMacKeyLen) / float64(profileHashLen)))
+	for i := 1; i <= kdfRounds; i++ {
+		counterBytes := make([]byte, 4)
+		binary.BigEndian.PutUint32(counterBytes, counter)
+		// fmt.Printf("counterBytes: %x\n", counterBytes)
+		tmpK := sha256.Sum256(append(append(sharedKey, counterBytes...), publicKey...))
+		sliceK := tmpK[:]
+		kdfKey = append(kdfKey, sliceK...)
+		// fmt.Printf("kdfKey in round %d: %x\n", i, kdfKey)
+		counter++
+	}
+	return kdfKey
+}
+
+func swapNibbles(input []byte) []byte {
+	output := make([]byte, len(input))
+	for i, b := range input {
+		output[i] = bits.RotateLeft8(b, 4)
+	}
+	return output
+}
+
+func calcSchemeResult(decryptPlainText []byte, supiType string) string {
+	var schemeResult string
+	if supiType == SupiTypeIMSI {
+		schemeResult = hex.EncodeToString(swapNibbles(decryptPlainText))
+		if schemeResult[len(schemeResult)-1] == 'f' {
+			schemeResult = schemeResult[:len(schemeResult)-1]
+		}
+	} else {
+		schemeResult = hex.EncodeToString(decryptPlainText)
+	}
+	return schemeResult
+}
+
+func profileA(input, supiType, privateKey string) (string, error) {
+	logger.SuciLog.Infoln("SuciToSupi Profile A")
+	s, hexDecodeErr := hex.DecodeString(input)
+	if hexDecodeErr != nil {
+		logger.SuciLog.Errorln("hex DecodeString error")
+		return "", hexDecodeErr
+	}
+
+	// for X25519(profile A), q (The number of elements in the field Fq) = 2^255 - 19
+	// len(pubkey) is therefore ceil((log2q)/8+1) = 32octets
+	ProfileAPubKeyLen := 32
+	if len(s) < ProfileAPubKeyLen+ProfileAMacLen {
+		logger.SuciLog.Errorln("len of input data is too short!")
+		return "", fmt.Errorf("suci input too short\n")
+	}
+
+	decryptMac := s[len(s)-ProfileAMacLen:]
+	decryptPublicKey := s[:ProfileAPubKeyLen]
+	decryptCipherText := s[ProfileAPubKeyLen : len(s)-ProfileAMacLen]
+	// fmt.Printf("dePub: %x\ndeCiph: %x\ndeMac: %x\n", decryptPublicKey, decryptCipherText, decryptMac)
+
+	// test data from TS33.501 Annex C.4
+	// aHNPriv, _ := hex.DecodeString("c53c2208b61860b06c62e5406a7b330c2b577aa5558981510d128247d38bd1d")
+	var aHNPriv []byte
+	if aHNPrivTmp, err := hex.DecodeString(privateKey); err != nil {
+		log.Printf("Decode error: %+v", err)
+	} else {
+		aHNPriv = aHNPrivTmp
+	}
+	var decryptSharedKey []byte
+	if decryptSharedKeyTmp, err := curve25519.X25519(aHNPriv, decryptPublicKey); err != nil {
+		log.Printf("X25519 error: %+v", err)
+	} else {
+		decryptSharedKey = decryptSharedKeyTmp
+	}
+	// fmt.Printf("deShared: %x\n", decryptSharedKey)
+
+	kdfKey := AnsiX963KDF(decryptSharedKey, decryptPublicKey, ProfileAEncKeyLen, ProfileAMacKeyLen, ProfileAHashLen)
+	decryptEncKey := kdfKey[:ProfileAEncKeyLen]
+	decryptIcb := kdfKey[ProfileAEncKeyLen : ProfileAEncKeyLen+ProfileAIcbLen]
+	decryptMacKey := kdfKey[len(kdfKey)-ProfileAMacKeyLen:]
+	// fmt.Printf("\ndeEncKey(size%d): %x\ndeMacKey: %x\ndeIcb: %x\n", len(decryptEncKey), decryptEncKey, decryptMacKey,
+	// decryptIcb)
+
+	decryptMacTag := HmacSha256(decryptCipherText, decryptMacKey, ProfileAMacLen)
+	if bytes.Equal(decryptMacTag, decryptMac) {
+		logger.SuciLog.Infoln("decryption MAC match")
+	} else {
+		logger.SuciLog.Errorln("decryption MAC failed")
+		return "", fmt.Errorf("decryption MAC failed\n")
+	}
+
+	decryptPlainText := Aes128ctr(decryptCipherText, decryptEncKey, decryptIcb)
+
+	return calcSchemeResult(decryptPlainText, supiType), nil
+}
+
+func checkOnCurve(curve elliptic.Curve, x, y *big.Int) error {
+	// (0, 0) is the point at infinity by convention. It's ok to operate on it,
+	// although IsOnCurve is documented to return false for it. See Issue 37294.
+	if x.Sign() == 0 && y.Sign() == 0 {
+		return nil
+	}
+
+	if !curve.IsOnCurve(x, y) {
+		return fmt.Errorf("crypto/elliptic: attempted operation on invalid point")
+	}
+
+	return nil
+}
+
+func profileB(input, supiType, privateKey string) (string, error) {
+	logger.SuciLog.Infoln("SuciToSupi Profile B")
+	s, hexDecodeErr := hex.DecodeString(input)
+	if hexDecodeErr != nil {
+		logger.SuciLog.Errorln("hex DecodeString error")
+		return "", hexDecodeErr
+	}
+
+	var ProfileBPubKeyLen int // p256, module q = 2^256 - 2^224 + 2^192 + 2^96 - 1
+	var uncompressed bool
+	if s[0] == 0x02 || s[0] == 0x03 {
+		ProfileBPubKeyLen = 33 // ceil(log(2, q)/8) + 1 = 33
+		uncompressed = false
+	} else if s[0] == 0x04 {
+		ProfileBPubKeyLen = 65 // 2*ceil(log(2, q)/8) + 1 = 65
+		uncompressed = true
+	} else {
+		logger.SuciLog.Errorln("input error")
+		return "", fmt.Errorf("suci input error\n")
+	}
+
+	// fmt.Printf("len:%d %d\n", len(s), ProfileBPubKeyLen + ProfileBMacLen)
+	if len(s) < ProfileBPubKeyLen+ProfileBMacLen {
+		logger.SuciLog.Errorln("len of input data is too short!")
+		return "", fmt.Errorf("suci input too short\n")
+	}
+	decryptPublicKey := s[:ProfileBPubKeyLen]
+	decryptMac := s[len(s)-ProfileBMacLen:]
+	decryptCipherText := s[ProfileBPubKeyLen : len(s)-ProfileBMacLen]
+	// fmt.Printf("dePub: %x\ndeCiph: %x\ndeMac: %x\n", decryptPublicKey, decryptCipherText, decryptMac)
+
+	// test data from TS33.501 Annex C.4
+	// bHNPriv, _ := hex.DecodeString("F1AB1074477EBCC7F554EA1C5FC368B1616730155E0041AC447D6301975FECDA")
+	var bHNPriv []byte
+	if bHNPrivTmp, err := hex.DecodeString(privateKey); err != nil {
+		log.Printf("Decode error: %+v", err)
+	} else {
+		bHNPriv = bHNPrivTmp
+	}
+
+	var xUncompressed, yUncompressed *big.Int
+	if uncompressed {
+		xUncompressed = new(big.Int).SetBytes(decryptPublicKey[1:(ProfileBPubKeyLen/2 + 1)])
+		yUncompressed = new(big.Int).SetBytes(decryptPublicKey[(ProfileBPubKeyLen/2 + 1):])
+	} else {
+		xUncompressed, yUncompressed = uncompressKey(decryptPublicKey, bHNPriv)
+		if xUncompressed == nil || yUncompressed == nil {
+			logger.SuciLog.Errorln("Uncompressed key has invalid point")
+			return "", fmt.Errorf("Key uncompression error\n")
+		}
+	}
+	// fmt.Printf("xUncom: %x\nyUncom: %x\n", xUncompressed, yUncompressed)
+
+	if err := checkOnCurve(elliptic.P256(), xUncompressed, yUncompressed); err != nil {
+		return "", err
+	}
+
+	// x-coordinate is the shared key
+	decryptSharedKey, _ := elliptic.P256().ScalarMult(xUncompressed, yUncompressed, bHNPriv)
+	// fmt.Printf("deShared: %x\n", decryptSharedKey.Bytes())
+
+	decryptPublicKeyForKDF := decryptPublicKey
+	if uncompressed {
+		decryptPublicKeyForKDF = CompressKey(decryptPublicKey, yUncompressed)
+	}
+
+	kdfKey := AnsiX963KDF(decryptSharedKey.Bytes(), decryptPublicKeyForKDF, ProfileBEncKeyLen, ProfileBMacKeyLen,
+		ProfileBHashLen)
+	// fmt.Printf("kdfKey: %x\n", kdfKey)
+	decryptEncKey := kdfKey[:ProfileBEncKeyLen]
+	decryptIcb := kdfKey[ProfileBEncKeyLen : ProfileBEncKeyLen+ProfileBIcbLen]
+	decryptMacKey := kdfKey[len(kdfKey)-ProfileBMacKeyLen:]
+	// fmt.Printf("\ndeEncKey(size%d): %x\ndeMacKey: %x\ndeIcb: %x\n", len(decryptEncKey), decryptEncKey, decryptMacKey,
+	// decryptIcb)
+
+	decryptMacTag := HmacSha256(decryptCipherText, decryptMacKey, ProfileBMacLen)
+	if bytes.Equal(decryptMacTag, decryptMac) {
+		logger.SuciLog.Infoln("decryption MAC match")
+	} else {
+		logger.SuciLog.Errorln("decryption MAC failed")
+		return "", fmt.Errorf("decryption MAC failed\n")
+	}
+
+	decryptPlainText := Aes128ctr(decryptCipherText, decryptEncKey, decryptIcb)
+
+	return calcSchemeResult(decryptPlainText, supiType), nil
+}
+
+// suci-0(SUPI type: IMSI)-mcc-mnc-routingIndicator-protectionScheme-homeNetworkPublicKeyID-schemeOutput.
+// TODO:
+// suci-1(SUPI type: NAI)-homeNetworkID-routingIndicator-protectionScheme-homeNetworkPublicKeyID-schemeOutput.
+const (
+	PrefixPlace = iota
+	SupiTypePlace
+	MccPlace
+	MncPlace
+	RoutingIndicatorPlace
+	SchemePlace
+	HNPublicKeyIDPlace
+	SchemeOuputPlace
+	MaxPlace
+)
+
+const (
+	PrefixIMSI     = "imsi-"
+	PrefixSUCI     = "suci"
+	SupiTypeIMSI   = "0"
+	NullScheme     = "0"
+	ProfileAScheme = "1"
+	ProfileBScheme = "2"
+)
+
+func ToSupi(suci string, suciProfiles []SuciProfile) (string, error) {
+	suciPart := strings.Split(suci, "-")
+	logger.SuciLog.Infof("suciPart: %+v", suciPart)
+
+	suciPrefix := suciPart[0]
+	if suciPrefix == "imsi" || suciPrefix == "nai" {
+		logger.SuciLog.Infof("Got supi\n")
+		return suci, nil
+	} else if suciPrefix == PrefixSUCI {
+		if len(suciPart) < 6 {
+			return "", fmt.Errorf("Suci with wrong format\n")
+		}
+	} else {
+		return "", fmt.Errorf("Unknown suciPrefix [%s]", suciPrefix)
+	}
+
+	logger.SuciLog.Infof("scheme %s\n", suciPart[SchemePlace])
+	scheme := suciPart[SchemePlace]
+	mccMnc := suciPart[MccPlace] + suciPart[MncPlace]
+
+	supiPrefix := PrefixIMSI
+	if suciPrefix == PrefixSUCI && suciPart[SupiTypePlace] == SupiTypeIMSI {
+		logger.SuciLog.Infof("SUPI type is IMSI\n")
+	}
+
+	if scheme == NullScheme { // NULL scheme
+		return supiPrefix + mccMnc + suciPart[len(suciPart)-1], nil
+	}
+
+	// (HNPublicKeyID-1) is the index of "suciProfiles" slices
+	keyIndex, err := strconv.Atoi(suciPart[HNPublicKeyIDPlace])
+	if err != nil {
+		return "", fmt.Errorf("Parse HNPublicKeyID error: %+v", err)
+	}
+	if keyIndex > len(suciProfiles) {
+		return "", fmt.Errorf("keyIndex(%d) out of range(%d)", keyIndex, len(suciProfiles))
+	}
+
+	protectScheme := suciProfiles[keyIndex-1].ProtectionScheme
+	privateKey := suciProfiles[keyIndex-1].PrivateKey
+
+	if scheme != protectScheme {
+		return "", fmt.Errorf("Protect Scheme mismatch [%s:%s]", scheme, protectScheme)
+	}
+
+	if scheme == ProfileAScheme {
+		if profileAResult, err := profileA(suciPart[len(suciPart)-1], suciPart[SupiTypePlace], privateKey); err != nil {
+			return "", err
+		} else {
+			return supiPrefix + mccMnc + profileAResult, nil
+		}
+	} else if scheme == ProfileBScheme {
+		if profileBResult, err := profileB(suciPart[len(suciPart)-1], suciPart[SupiTypePlace], privateKey); err != nil {
+			return "", err
+		} else {
+			return supiPrefix + mccMnc + profileBResult, nil
+		}
+	} else {
+		return "", fmt.Errorf("Protect Scheme (%s) is not supported", scheme)
+	}
+}
+
+
+```
+
+
+### id=redistill-line-7912 lang=java flags=[R2,R3]
+#### 代码（312 行）
+```java
+package org.jsoup.parser;
+
+import org.jsoup.helper.Validate;
+import org.jsoup.internal.SharedConstants;
+import org.jspecify.annotations.Nullable;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.Consumer;
+
+import static org.jsoup.parser.Parser.NamespaceHtml;
+import static org.jsoup.parser.Parser.NamespaceMathml;
+import static org.jsoup.parser.Parser.NamespaceSvg;
+
+/**
+ A TagSet controls the {@link Tag} configuration for a Document's parse, and its serialization. It contains the initial
+ defaults, and after the parse, any additionally discovered tags.
+
+ @see Parser#tagSet(TagSet)
+ @since 1.20.1
+ */
+public class TagSet {
+    static final TagSet HtmlTagSet = initHtmlDefault();
+
+    private final Map<String, Map<String, Tag>> tags = new HashMap<>(); // namespace -> tag name -> Tag
+    private final @Nullable TagSet source; // internal fallback for lazy tag copies
+    private @Nullable ArrayList<Consumer<Tag>> customizers; // optional onNewTag tag customizer
+
+    /**
+     Returns a mutable copy of the default HTML tag set.
+     */
+    public static TagSet Html() {
+        return new TagSet(HtmlTagSet, null);
+    }
+
+    private TagSet(@Nullable TagSet source, @Nullable ArrayList<Consumer<Tag>> customizers) {
+        this.source = source;
+        this.customizers = customizers;
+    }
+
+    public TagSet() {
+        this(null, null);
+    }
+
+    /**
+     Creates a new TagSet by copying the current tags and customizers from the provided source TagSet. Changes made to
+     one TagSet will not affect the other.
+     @param template the TagSet to copy
+     */
+    public TagSet(TagSet template) {
+        this(template.source, copyCustomizers(template));
+        // copy tags eagerly; any lazy pull-through should come only from the root source (which would be the HTML defaults), not the template itself.
+        // that way the template tagset is not mutated when we do read through
+        if (template.tags.isEmpty()) return;
+
+        for (Map.Entry<String, Map<String, Tag>> namespaceEntry : template.tags.entrySet()) {
+            Map<String, Tag> nsTags = new HashMap<>(namespaceEntry.getValue().size());
+            for (Map.Entry<String, Tag> tagEntry : namespaceEntry.getValue().entrySet()) {
+                nsTags.put(tagEntry.getKey(), tagEntry.getValue().clone());
+            }
+            tags.put(namespaceEntry.getKey(), nsTags);
+        }
+    }
+
+    private static @Nullable ArrayList<Consumer<Tag>> copyCustomizers(TagSet base) {
+        if (base.customizers == null) return null;
+        return new ArrayList<>(base.customizers);
+    }
+
+    /**
+     Insert a tag into this TagSet. If the tag already exists, it is replaced.
+     <p>Tags explicitly added like this are considered to be known tags (vs those that are dynamically created via
+     .valueOf() if not already in the set.</p>
+
+     @param tag the tag to add
+     @return this TagSet
+     */
+    public TagSet add(Tag tag) {
+        tag.set(Tag.Known);
+        doAdd(tag);
+        return this;
+    }
+
+    /** Adds the tag, but does not set defined. Used in .valueOf */
+    private void doAdd(Tag tag) {
+        if (customizers != null) {
+            for (Consumer<Tag> customizer : customizers) {
+                customizer.accept(tag);
+            }
+        }
+        tag.setParserOptions();
+
+        tags.computeIfAbsent(tag.namespace, ns -> new HashMap<>())
+            .put(tag.tagName, tag);
+    }
+
+    /**
+     Get an existing Tag from this TagSet by tagName and namespace. The tag name is not normalized, to support mixed
+     instances.
+
+     @param tagName the case-sensitive tag name
+     @param namespace the namespace
+     @return the tag, or null if not found
+     */
+    public @Nullable Tag get(String tagName, String namespace) {
+        Validate.notNull(tagName);
+        Validate.notNull(namespace);
+
+        // get from our tags
+        Map<String, Tag> nsTags = tags.get(namespace);
+        if (nsTags != null) {
+            Tag tag = nsTags.get(tagName);
+            if (tag != null) {
+                return tag;
+            }
+        }
+
+        // not found; clone on demand from source if exists
+        if (source != null) {
+            Tag tag = source.get(tagName, namespace);
+            if (tag != null) {
+                Tag copy = tag.clone();
+                doAdd(copy);
+                return copy;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     Tag.valueOf with the normalName via the token.normalName, to save redundant lower-casing passes.
+     Provide a null normalName unless we already have one; will be normalized if required from tagName.
+     */
+    Tag valueOf(String tagName, @Nullable String normalName, String namespace, boolean preserveTagCase) {
+        Validate.notNull(tagName);
+        Validate.notNull(namespace);
+        if (normalName == null) tagName = tagName.trim(); // public API input; tokenizer names are already delimited
+        Validate.notEmpty(tagName);
+        Tag tag = get(tagName, namespace);
+        if (tag != null) return tag;
+
+        // not found by tagName, try by normal
+        if (normalName == null) normalName = ParseSettings.normalName(tagName);
+        tagName = preserveTagCase ? tagName : normalName;
+        tag = get(normalName, namespace);
+        if (tag != null) {
+            if (preserveTagCase && !tagName.equals(normalName)) {
+                tag = tag.clone(); // copy so that the name update doesn't reset all instances
+                tag.tagName = tagName;
+                doAdd(tag);
+            }
+            return tag;
+        }
+
+        // not defined: return a new one
+        tag = new Tag(tagName, normalName, namespace);
+        doAdd(tag);
+
+        return tag;
+    }
+
+    /**
+     Get a Tag by name from this TagSet. If not previously defined (unknown), returns a new tag.
+     <p>New tags will be added to this TagSet.</p>
+
+     @param tagName Name of tag, e.g. "p".
+     @param namespace the namespace for the tag.
+     @param settings used to control tag name sensitivity
+     @return The tag, either defined or new generic.
+     */
+    public Tag valueOf(String tagName, String namespace, ParseSettings settings) {
+        return valueOf(tagName, null, namespace, settings.preserveTagCase());
+    }
+
+    /**
+     Get a Tag by name from this TagSet. If not previously defined (unknown), returns a new tag.
+     <p>New tags will be added to this TagSet.</p>
+
+     @param tagName Name of tag, e.g. "p". <b>Case-sensitive</b>.
+     @param namespace the namespace for the tag.
+     @return The tag, either defined or new generic.
+     @see #valueOf(String tagName, String namespace, ParseSettings settings)
+     */
+    public Tag valueOf(String tagName, String namespace) {
+        return valueOf(tagName, namespace, ParseSettings.preserveCase);
+    }
+
+    /**
+     Register a callback to customize each {@link Tag} as it's added to this TagSet.
+     <p>Customizers are invoked once per Tag, when they are added (explicitly or via the valueOf methods).</p>
+
+     <p>For example, to allow all unknown tags to be self-closing during when parsing as HTML:</p>
+     <pre><code>
+     Parser parser = Parser.htmlParser();
+     parser.tagSet().onNewTag(tag -> {
+     if (!tag.isKnownTag())
+        tag.set(Tag.SelfClose);
+     });
+
+     Document doc = Jsoup.parse(html, parser);
+     </code></pre>
+
+     @param customizer a {@code Consumer<Tag>} that will be called for each newly added or cloned Tag; callers can
+     inspect and modify the Tag's state (e.g. set options)
+     @return this TagSet, to allow method chaining
+     @since 1.21.0
+     */
+    public TagSet onNewTag(Consumer<Tag> customizer) {
+        Validate.notNull(customizer);
+        if (customizers == null)
+            customizers = new ArrayList<>();
+        customizers.add(customizer);
+        return this;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (!(o instanceof TagSet)) return false;
+        TagSet tagSet = (TagSet) o;
+        return Objects.equals(tags, tagSet.tags);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(tags);
+    }
+
+    // Default HTML initialization
+
+    /**
+     Initialize the default HTML tag set.
+     */
+    static TagSet initHtmlDefault() {
+        String[] blockTags = {
+            "html", "head", "body", "frameset", "script", "noscript", "style", "meta", "link", "title", "frame",
+            "noframes", "section", "nav", "aside", "hgroup", "header", "footer", "p", "h1", "h2", "h3", "h4", "h5",
+            "h6", "dialog", "search",
+            "ul", "ol", "pre", "div", "blockquote", "hr", "address", "figure", "figcaption", "form", "fieldset",
+            "dl", "dt", "dd", "li", "table", "caption", "thead", "tfoot", "tbody", "colgroup", "col", "tr", "th",
+            "td", "details", "menu", "plaintext", "template", "article", "main",
+            "center",
+            "dir", "applet", "marquee", "listing", // deprecated but still known / special handling
+            "#root" // the outer Document
+        };
+        String[] inlineTags = {
+            "object", "base", "font", "tt", "i", "b", "u", "big", "small", "em", "strong", "dfn", "code", "samp", "kbd",
+            "var", "cite", "abbr", "time", "acronym", "mark", "ruby", "rt", "rp", "rtc", "a", "img", "wbr", "map",
+            "q",
+            "sub", "sup", "bdo", "iframe", "embed", "span", "input", "select", "textarea", "label", "audio", "video", "canvas", "optgroup",
+            "option", "legend", "datalist", "keygen", "output", "progress", "meter", "area", "param", "source", "track",
+            "summary", "command", "device", "basefont", "bgsound", "menuitem", "data", "bdi", "s", "strike", "nobr",
+            "ins", "del", "button", "picture", "slot",
+            "rb", // deprecated but still known / special handling
+        };
+        String[] inlineContainers = { // pretty-print hint: block tags whose inline children should stay inline
+            "title", "p", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "address", "li", "th", "td", "script", "style"
+        };
+        String[] voidTags = {
+            "meta", "link", "base", "frame", "img", "br", "wbr", "embed", "hr", "input", "keygen", "col", "command",
+            "device", "area", "basefont", "bgsound", "menuitem", "param", "source", "track"
+        };
+        String[] preserveWhitespaceTags = {
+            "pre", "plaintext", "title", "textarea", "script"
+        };
+        String[] rcdataTags = { "title", "textarea" };
+        String[] dataTags = { "iframe", "noembed", "noframes", "script", "style", "xmp" };
+        String[] formSubmitTags = SharedConstants.FormSubmitTags;
+        String[] textBoundaryTags = { // text() readability hint for controls, widgets, and embedded objects
+            "button", "input", "select", "textarea", "option", "output", "progress", "meter",
+            "img", "picture", "audio", "video", "canvas", "object", "embed", "iframe"
+        };
+        String[] blockMathTags = {"math"};
+        String[] inlineMathTags = {"mi", "mo", "msup", "mn", "mtext"};
+        String[] blockSvgTags = {"svg", "femerge", "femergenode"}; // note these are LC versions, but actually preserve case
+        String[] inlineSvgTags = {"text"};
+        String[] dataSvgTags = {"script"};
+
+        return new TagSet()
+            .setupTags(NamespaceHtml, blockTags, tag -> tag.set(Tag.Block))
+            .setupTags(NamespaceHtml, inlineTags, tag -> tag.set(0))
+            .setupTags(NamespaceHtml, inlineContainers, tag -> tag.set(Tag.InlineContainer))
+            .setupTags(NamespaceHtml, voidTags, tag -> tag.set(Tag.Void))
+            .setupTags(NamespaceHtml, preserveWhitespaceTags, tag -> tag.set(Tag.PreserveWhitespace))
+            .setupTags(NamespaceHtml, rcdataTags, tag -> tag.set(Tag.RcData))
+            .setupTags(NamespaceHtml, dataTags, tag -> tag.set(Tag.Data))
+            .setupTags(NamespaceHtml, formSubmitTags, tag -> tag.set(Tag.FormSubmittable))
+            .setupTags(NamespaceHtml, textBoundaryTags, tag -> tag.set(Tag.TextBoundary))
+            .setupTags(NamespaceMathml, blockMathTags, tag -> tag.set(Tag.Block))
+            .setupTags(NamespaceMathml, inlineMathTags, tag -> tag.set(0))
+            .setupTags(NamespaceSvg, blockSvgTags, tag -> tag.set(Tag.Block))
+            .setupTags(NamespaceSvg, inlineSvgTags, tag -> tag.set(0))
+            .setupTags(NamespaceSvg, dataSvgTags, tag -> tag.set(Tag.Data))
+            ;
+    }
+
+    private TagSet setupTags(String namespace, String[] tagNames, Consumer<Tag> tagModifier) {
+        for (String tagName : tagNames) {
+            Tag tag = get(tagName, namespace);
+            if (tag == null) {
+                tag = new Tag(tagName, tagName, namespace); // normal name is already normal here
+                tag.options = 0; // clear defaults
+                add(tag);
+            }
+            tagModifier.accept(tag);
+        }
+        return this;
+    }
+}
+
+
+```

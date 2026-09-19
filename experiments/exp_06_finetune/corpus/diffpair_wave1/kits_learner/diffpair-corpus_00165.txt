@@ -1,0 +1,1198 @@
+# 代码安全分析请求 — 请认真分析
+
+> 我是做安全研究的，正在提升自己对代码审计的判断力。你的分析过程对我最有价值——
+> 请把你脑子里的推理步骤全部写出来，包括你排除掉的方向和为什么排除。
+> 下面是我整理的分析报告格式，请按这个结构写，方便我对照学习。
+
+---
+
+## 我需要你做的
+
+我会逐条消息发案例包给你，每包开头有【代码审计案例包】标记，包内有 `### id=...` 行标明案例编号。对每个代码样本做完整、独立的安全分析：**每条分析的第一行写 `### <案例编号> <版本A|版本B|全文>`**（编号照抄我给的 id），然后按以下格式逐项写，每一项都要有具体的行号和代码片段作为证据（片段用半角反引号包裹）：
+
+```
+入口: L<行号> <通道> <参数名> | 次要: <如有>
+    （通道别只看 HTTP 参数——配置文件、环境变量、命令行参数、stdin、文件流、DB 回读、内部 API 传参都算，我以前漏报最多的就是这些）
+链: L<行> <动作> → L<行> <动作> → L<行> <危险操作>
+    （判"安全"时本栏改写为: 未发现可达污点流，原因: <入口不可控 / sink 前防御封死 / 常量传播>）
+防御:
+  L<行> <机制> → 有效: <为什么攻击者过不去>
+  L<行> <机制> → 伪防御: <给出具体绕过字符串或 payload 片段>
+载荷: <能跑通的最短利用代码或 HTTP 请求>（要语义上真能触发——别拿会被引号/转义吃掉的字符串凑数）
+组合链: <如果多个缺陷串在一起危害更大，写出 A→B→C>
+锚句: 非 CWE-XX 因 <一句话>；非 CWE-YY 因 <一句话>
+结论: 存在漏洞=<true|false> | CWE-XXX <官方名> | <Critical|High|Medium|Low>
+修复: <行号 + 具体怎么改；用到的函数/模块必须在当前代码里已存在，别建议调用不存在的辅助函数>
+```
+
+---
+
+## 几个我踩过的坑，帮你避开
+
+1. "黑名单可绕过"这种话信息量为零——请把**具体绕过字符串**写出来（`....//`、`$()`、`%0a`、大小写变体），我才能真正理解防御为什么失败。
+2. **代码里的注释经常在撒谎**（"这里安全"其实有洞、"这里有洞"其实防御有效），注释里自己标的行号也经常是错的——请只看代码真实行为和真实行位，忽略注释声称的一切。
+3. 有些防御是**组合生效**的（A 单独不行 + B 单独不行 = AB 一起封死），请逐层拆开看，别只看单点。
+4. 如果硬编码的密钥/token 可以伪造会话或签名，从而**绕过看似存在的认证门**，这就是一条组合链，请写出来。
+5. 代码执行类的编号判别轴是**哪个解释器最终消费这个字符串**：shell 消费 → CWE-78（`execSync(shell:true)`、`["sh","-c",输入]` 都算，有无显式 shell 层不论）；`eval()`/`assert()`/`new Function()`/`preg_replace /e` 动态求值消费 → CWE-95/94 族（细分见判别笔记）；模板引擎把输入当代码渲染 → CWE-1336——三者别混。另外 `eval("var x = " + input)` 和 `eval(input)` 在我这里是同一类，别按"直接进 vs 拼接进"分成两种定性。
+6. 如果你是**从部署/运维角度**认为"这不会被打到"，那属于我的业务决策范围——请只报告代码层面可达的攻击面，部署上的事我自己判断。
+7. 如果某个判断**依赖我没贴出来的代码**（调用方、框架行为、运行环境、被截断的函数体），请显式标一句"样本外假设"——我要练习区分"代码内可证"和"凭经验猜测"。如果代码明显被截断了，直接告诉我要补哪段，别猜着补全分析。
+8. 我经常一条消息连发几个案例：**每个案例的行号、变量名、结论请逐条独立核对**——我遇到过把上一个样本的行号和结论串写到下一个样本的情况。
+9. 还有一类我容易漏的：**没有传统污点流的设计/配置缺陷**也请照实报告——弱协议/弱算法（TLS 1.0/SSL、MD5/SHA1——签名/MAC 用途和口令存储的快哈希都算）、不完整禁用列表/可绕过黑名单当防线、服务以 root 等过度权限运行（CWE-250）、可预测随机数生成令牌密钥（CWE-338）、禁用证书校验且无补偿控制（CWE-295）、硬编码凭证（CWE-798）——这些都给对应的 CWE。
+
+---
+
+## 样本类型说明
+
+你看到的代码有三种来源：
+- **单文件**：直接分析完整文件
+- **差分对**：同一个文件的两个版本（版本A、版本B）。请**分别独立分析**，版本A 的分析中不要参考版本 B 的任何内容；也不要因为"两个版本不一样"就预设哪个有问题——每个版本只按它自己的代码判
+- **文件切片**：大文件的一个片段，可能缺少上下文——不可达的方向请标注"样本外"
+
+**特殊：带官方结论的复核包**（包头标 `| redistill`，包内有"官方结论（待你验证）"区块）。这类是我自己推不稳的案例：把官方结论当作**待验证假设**，从代码出发推出支持它的完整证据链（污点路径/防御链逐行号）；如果你的推导确实到不了那个结论，写 `disagree: <哪一步断了、代码事实是什么>`——推不出来直说是有价值的，**禁止为凑结论编造不存在的行号、变量或数据流**。其中结论为"安全"的复核包：`防御:` 栏必须逐段给出**行号 + 什么机制 + 为什么不可旁路**，一句"已有校验"不合格。
+
+---
+
+## 我的判别笔记（结论里的 CWE 编号请按这份对齐；笔记本身整理错了也请直接指出）
+
+先问"注入的目标是什么"，再定编号：
+- sink 是 OS 程序执行 → CWE-78（**有没有 shell 层都算**，`["sh","-c",输入]` 也是 78）；注入的是"非 OS 的命令语言"（sed 脚本、IMAP/SMTP、应用配置语言）→ CWE-77；命令名固定、输入只落参数位 → CWE-88——**前提是输入能注入参数结构**（前导 `-`/`--` 被当新选项，如 `ssh -oProxyCommand=`、`tar --checkpoint-action=exec=`，或固定命令对该参数二次解析）；argv 单元素完整传递、无选项语义、无二次解析 = 无漏洞，别硬凑 88
+- 不可信数据进入 `eval()/exec()/Function()/preg_replace /e` 等**动态求值调用的求值位** → CWE-95——无论整段直传还是拼进代码文本（我查过 MITRE 4.20：95 是 94 的 Variant 子类，映射按更具体的 sink 优先，**拼接与否不影响 95 定位**；旧笔记"拼接主记 94"的统一口径已作废，统一主记 95，正文可注明旧口径差异）；拼出的代码**落盘后再执行**——写入 .py/.js/.sh 交解释器、存库后取出执行——正文注明 CWE-96；生成代码走**非求值器**的编译/执行路径（动态 import 之外的生成-编译链）或需父类兜底 → 94；输入进入**模板源码字符串位**被引擎渲染 → CWE-1336（`render(name=user)` 只是变量值，不算）；printf/format 的**格式串位**被控 → CWE-134；框架表达式求值器（SpEL/OGNL/EL）→ CWE-917；终端 ANSI/OSC 转义序列未净化 → CWE-150
+- sink 是 SQL（含 ORM raw）→ CWE-89；非 SQL 的查询逻辑（MongoDB 操作符、HQL）→ CWE-943（HQL 也有记 89 的惯例，本笔记统一 943，主编号别摇摆）；XPath → CWE-643；LDAP 过滤器 → CWE-90
+- 路径/文件名外部可控：出现 `../` 或等价目录上跳（含 `..\`、`%2e%2e%2f`、`..%c0%af`、symlink 逃逸）→ CWE-22；攻击者直接控绝对路径（如 `/etc/passwd`，无上跳）按本笔记也主记 22、正文可注明 CWE-73；仅文件名可控、目录不可控 → CWE-73
+- 未净化输入进入浏览器执行上下文（HTML/属性/JS 字符串）→ CWE-79，按**最终渲染上下文**判，不看变量叫什么
+- 不可信数据进反序列化器（readObject/pickle/unserialize）→ CWE-502（仅解析 JSON 等纯数据格式不算）。**受限反序列化器是有效防御**：`find_class`/resolve 白名单要同时满足（a）白名单内没有把输入当逻辑执行的构造器/方法、（b）可调用对象来源池封闭（REDUCE 链无法二段提升）才算防御有效。自写持久化通道（未验签的存储回读）算不算不可信输入看信任边界：攻击者取得该通道写入权的成本低于直接 RCE 成本 → 按 502 计，否则降为纵深防御缺失。XML 解析允许外部实体/DTD 且输入不可信 → CWE-611；把不可信流直接交给 JAXP 系列（`XPath.evaluate(InputSource,…)`、`Validator.validate(StreamSource)`、`Transformer.transform`）未设 `disallow-doctype-decl` 同样是 611，**`FEATURE_SECURE_PROCESSING` 不算有效防御**；纯实体膨胀 DoS（billion laughs、无外部实体）→ 正文注明 CWE-776，按 DoS 档定级
+- 服务端取回 URL 内容且目的地未校验 → CWE-918；借产品的身份/网络位置发请求（回环信任），最贴形是产品作为**非预期代理**把外部请求转交内部高权限服务 → CWE-441；内部服务"只信 localhost 所以不鉴权"按缺失认证/授权记 CWE-306/862，不算 441；骗浏览器跳转 → CWE-601
+- 没有授权检查 → CWE-862；查了但对象用户可控（IDOR）→ CWE-639；关键功能连认证都没有 → CWE-306；状态变更端点只靠自动携带的 Cookie、无 token/Origin 校验 → CWE-352。**SameSite 只有 Strict（或 Lax 且变更端点非 GET）才算一层防御**——Lax 在顶层导航 GET 上照带 Cookie；浏览器对未声明 SameSite 的 Cookie 默认按 Lax 处理，样本没写 SameSite 时别想当然按有防护算
+- JWT `alg=none` / 签名验证被禁用 → CWE-347（不是 327：不是算法弱，是验证被关了）
+- 用户可控动态键写入共享 dict/对象 → CWE-915（Python dict 没有原型链，禁止写"原型污染"叙事）；**JavaScript** 的 `obj[k]=v` 且 k 可为 `__proto__`/`constructor` → 正文注明 CWE-1321，同样不写"原型污染"字样敷衍、要写出完整链
+- 整数溢出/回绕：不可信输入进长度/偏移/索引/数量位，参与 `a + b`/`a * b`/移位/位掩码运算或宽窄类型转换后用于**边界检查、分配、拷贝、寻址**，且检查本身可被溢出绕过 → CWE-190（经典形态：`off + len > b.length` 在 `off+len` 溢出为负时放行，正确写法是 `len > b.length - off`）；JS 的索引回绕/负值规整缺陷（`index += origin`、位掩码寻址）同判；溢出结果没流向边界检查/分配/寻址的纯算术回绕不报或降档
+- 参数化/预编译/占位符查询 = SQL 注入的**有效防御，但只覆盖值位**；表名/列名/`ORDER BY` 字段/排序方向等标识符位不可绑定，回退拼接仍是 89——判"安全"前核对参数化覆盖了**所有**输入可达位；单点 replace/黑名单字符过滤 = **伪防御**（要核它漏了什么字符、作用位置对不对）
+- 硬编码凭证字面量用于认证/加密/签名 → CWE-798（"定义了但没使用"也是 798，风险降档即可；正文可加注更精确编号：在用且用于加密/签名的密钥 → CWE-321，未使用的配置项 → CWE-547）
+
+---
+
+## 风险等级我目前这么定（觉得哪条不合理，说出你的定法和理由）
+
+- Critical = 可达 RCE / 认证绕过 / 凭证直接泄露（认证门后就是 RCE 仍算 Critical）；"可达"要求**链上每一跳都在样本内可证**（路径、表名、组件行为全部代码内），任一跳依赖样本外（web root 可写、目标装有特定组件、上游权限）→ 记 High 并标"理论链"；凭证直接泄露限定为**可直接动用**的（私钥、数据库/服务账号口令、能伪造会话或签名的 secret），"像凭证但代码内无使用点"按 798 未使用降档
+- High = 注入类 / SSRF / XSS / 越权读写；没有利用链演示的理论 RCE 也记 High；等级按**组合链最坏情形**判，但同样受上一条"样本内可证"约束；Critical 与 High 两可时记 High 并写明理由，不虚高
+- Medium = 信息泄露 / 配置错误 / 有限 DoS / 定义未使用的硬编码凭证
+- Low = 影响极小
+
+---
+
+## 会话约定（以本提示词为准，不要自行增改）
+
+- 首条消息只有这段提示词、没有案例包时：直接给对判别笔记/风险等级的核对意见（有就写，没有只回"就绪"），然后等我发包，不要复述提示词。
+- 输出栏位以上面模板为准：**不新增"排除方向""次要发现"等独立栏位**——排除理由写进对应栏正文，次要发现并入修复栏前正文；自查清单**照常逐条打印**，不要改成静默执行。
+- 样本外假设不得单独支撑"存在漏洞=true"；整个判定悬在外部代码上时，列出需要我补的具体片段（调用点/类定义/函数体/依赖版本），能判的部分照判并标明影响范围。
+
+---
+
+## 输出末尾请自查
+
+- [ ] 每条分析第一行是否是 `### <案例编号> <版本>`？我发的每个案例、每个版本是否都各有一条分析？
+- [ ] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [ ] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [ ] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [ ] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [ ] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [ ] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [ ] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [ ] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（值位之外的表名/列名/排序位没有回退拼接）？
+
+最后：你的回复会被我原样归档进笔记库，请只写代码分析内容本身——不要客套话，不要"以下是分析""希望有帮助"之类的流程性文字。
+
+【代码审计案例包 | diffpair】
+
+### id=diffpair-corpus_00165 lang=php
+#### 版本A（539 行）
+```php
+<?php
+# MantisBT - A PHP based bugtracking system
+
+# MantisBT is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# MantisBT is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with MantisBT.  If not, see <http://www.gnu.org/licenses/>.
+
+require_api( 'access_api.php' );
+require_api( 'authentication_api.php' );
+require_api( 'bug_api.php' );
+require_api( 'config_api.php' );
+require_api( 'constant_inc.php' );
+require_api( 'custom_field_api.php' );
+require_api( 'date_api.php' );
+require_api( 'email_api.php' );
+require_api( 'error_api.php' );
+require_api( 'event_api.php' );
+require_api( 'file_api.php' );
+require_api( 'helper_api.php' );
+require_api( 'lang_api.php' );
+require_api( 'last_visited_api.php' );
+require_api( 'profile_api.php' );
+require_api( 'relationship_api.php' );
+require_api( 'string_api.php' );
+require_api( 'user_api.php' );
+
+$t_soap_dir = dirname( __DIR__, 2 ) . '/api/soap/';
+require_once( $t_soap_dir . 'mc_api.php' );
+require_once( $t_soap_dir . 'mc_enum_api.php' );
+require_once( $t_soap_dir . 'mc_issue_api.php' );
+require_once( $t_soap_dir . 'mc_project_api.php' );
+
+use Mantis\Exceptions\ClientException;
+
+/**
+ * Sample:
+ * {
+ *   "query": {
+ *   },
+ *   "payload": {
+ *     ... see rest issue add documentation
+ *   },
+ *   "options: {
+ *     "clone_info": {                # Used only in case issue is cloned
+ *       "master_issue_id": 1234,
+ *       "relationship_type": 1,      # BUG_RELATED
+ *       "copy_files": true,
+ *       "copy_notes": true
+ *     },
+ *     "skip_moderation": false
+ *   }
+ * }
+ */
+
+/**
+ * A command that adds an issue.
+ */
+class IssueAddCommand extends Command {
+	/**
+	 * The issue to add.
+	 *
+	 * @var BugData
+	 */
+	private $issue = null;
+
+	/**
+	 * @var integer
+	 */
+	private $user_id;
+
+	/**
+	 * The files to attach with the note.
+	 */
+	private $files = array();
+
+	/**
+	 * Constructor
+	 *
+	 * @param array $p_data The command data.
+	 */
+	function __construct( array $p_data ) {
+		parent::__construct( $p_data );
+	}
+
+	/**
+	 * Validate the data.
+	 * @throws ClientException
+	 */
+	protected function validate() {
+		$this->user_id = auth_get_current_user_id();
+		$t_clone_info = $this->option( 'clone_info', array() );
+
+		$t_issue = $this->payload( 'issue' );
+
+		if( isset( $t_clone_info['master_issue_id'] ) ) {
+			if( bug_is_readonly( $t_clone_info['master_issue_id'] ) ) {
+				throw new ClientException(
+					sprintf( "Master issue '%d' is read-only", $t_clone_info['master_issue_id'] ),
+					ERROR_BUG_READ_ONLY_ACTION_DENIED,
+					array( $t_clone_info['master_issue_id'] )
+				);
+			}
+		}
+
+		if( !isset( $t_issue['summary'] ) || is_blank( $t_issue['summary'] ) )  {
+			throw new ClientException(
+				'Summary not specified',
+				ERROR_EMPTY_FIELD,
+				array( 'summary' ) );
+		}
+		$t_summary = $t_issue['summary'];
+
+		if( !isset( $t_issue['description'] ) || is_blank( $t_issue['description'] ) )  {
+			throw new ClientException(
+				'Description not specified',
+				ERROR_EMPTY_FIELD,
+				array( 'description' ) );
+		}
+		$t_description = $t_issue['description'];
+		helper_ensure_longtext_length_valid( $t_description, 'description' );
+
+		$t_steps_to_reproduce = $t_issue['steps_to_reproduce'] ?? '';
+		helper_ensure_longtext_length_valid( $t_steps_to_reproduce, 'steps_to_reproduce' );
+
+		$t_additional_information = $t_issue['additional_information'] ?? '';
+		helper_ensure_longtext_length_valid( $t_additional_information, 'additional_information' );
+
+		if( !isset( $t_issue['project'] ) )  {
+			throw new ClientException(
+				'Project not specified',
+				ERROR_EMPTY_FIELD,
+				array( 'project' ) );
+		}
+
+		$t_project_id = mci_get_project_id( $t_issue['project'] );
+
+		if( $t_project_id == ALL_PROJECTS ) {
+			throw new ClientException(
+				'Project not specified',
+				ERROR_EMPTY_FIELD,
+				array( 'project' ) );
+		}
+
+		if( !project_exists( $t_project_id ) ) {
+			throw new ClientException(
+				sprintf( "Project '%d' not found", $t_project_id ),
+				ERROR_PROJECT_NOT_FOUND,
+				array( $t_project_id ) );
+		}
+
+		# in case the current project is not the same project of the bug we are
+		# viewing, override the current project. This to avoid problems with
+		# categories and handlers lists etc.
+		global $g_project_override;
+		$g_project_override = $t_project_id;
+
+		if( !access_has_project_level( config_get( 'report_bug_threshold' ), $t_project_id, $this->user_id ) ) {
+			throw new ClientException(
+				'User does not have access right to report issues',
+				ERROR_ACCESS_DENIED );
+		}
+
+		$t_handler_id = isset( $t_issue['handler'] ) ? mci_get_user_id( $t_issue['handler'] ) : NO_USER;
+		$t_priority_id = isset( $t_issue['priority'] ) ? mci_get_priority_id( $t_issue['priority'] ) : config_get( 'default_bug_priority' );
+		$t_severity_id = isset( $t_issue['severity'] ) ? mci_get_severity_id( $t_issue['severity'] ) : config_get( 'default_bug_severity' );
+		$t_status_id = isset( $t_issue['status'] ) ? mci_get_status_id( $t_issue['status'] ) : config_get( 'bug_submit_status' );
+		$t_reproducibility_id = isset( $t_issue['reproducibility'] ) ? mci_get_reproducibility_id( $t_issue['reproducibility'] ) : config_get( 'default_bug_reproducibility' );
+		$t_resolution_id =  isset( $t_issue['resolution'] ) ? mci_get_resolution_id( $t_issue['resolution'] ) : config_get( 'default_bug_resolution' );
+		$t_projection_id = isset( $t_issue['projection'] ) ? mci_get_projection_id( $t_issue['projection'] ) : config_get( 'default_bug_projection' );
+		$t_eta_id = isset( $t_issue['eta'] ) ? mci_get_eta_id( $t_issue['eta'] ) : config_get( 'default_bug_eta' );
+		$t_view_state_id = isset( $t_issue['view_state'] ) ?  mci_get_view_state_id( $t_issue['view_state'] ) : config_get( 'default_bug_view_status' );
+
+		# TODO: #17777: Add test case for mc_issue_add() and mc_issue_note_add() reporter override
+		if( isset( $t_issue['reporter'] ) ) {
+			$t_reporter_id = mci_get_user_id( $t_issue['reporter'] );
+
+			if( $t_reporter_id != $this->user_id ) {
+				# Make sure that active user has access level required to specify a different reporter.
+				$t_specify_reporter_access_level = config_get( 'webservice_specify_reporter_on_add_access_level_threshold' );
+				if( !access_has_project_level( $t_specify_reporter_access_level, $t_project_id, $this->user_id ) ) {
+					throw new ClientException(
+						'Active user does not have access level required to specify a different issue reporter',
+						ERROR_ACCESS_DENIED );
+				}
+			}
+		} else {
+			$t_reporter_id = $this->user_id;
+		}
+
+		# Prevent unauthorized users setting handler when reporting issue
+		if( $t_handler_id > 0 ) {
+			if ( !access_has_project_level( config_get( 'update_bug_assign_threshold' ) ) ) {
+				throw new ClientException(
+					'User not allowed to assign issues',
+					ERROR_ACCESS_DENIED );
+			}
+		} else {
+			# Ensure that resolved bugs have a handler
+			if( $t_handler_id == NO_USER && $t_status_id >= config_get( 'bug_resolved_status_threshold' ) ) {
+				$t_handler_id = $this->user_id;
+			}
+		}
+
+		if( $t_handler_id != NO_USER ) {
+			if( !user_exists( $t_handler_id ) ) {
+				throw new ClientException(
+					sprintf( "User '%d' not found.", $t_handler_id ),
+					ERROR_USER_BY_ID_NOT_FOUND,
+					array( $t_handler_id ) );
+			}
+
+			if( !access_has_project_level( config_get( 'handle_bug_threshold' ), $t_project_id, $t_handler_id ) ) {
+				throw new ClientException(
+					sprintf( "User '%d' can't be assigned issues.", $t_handler_id ),
+					ERROR_ACCESS_DENIED );
+			}
+		}
+
+		# Validate tags and make sure user is allowed to create them if needed
+		if( isset( $t_issue['tags'] ) && is_array( $t_issue['tags'] ) ) {
+			foreach( $t_issue['tags'] as $t_tag ) {
+				$t_tag_id = $this->get_tag_id( $t_tag );
+				if( $t_tag_id === false && !tag_can_create( $this->user_id ) ) {
+					throw new ClientException(
+						sprintf( "User '%d' can't create tag '%s'.", $this->user_id, $t_tag['name'] ),
+						ERROR_TAG_NOT_FOUND,
+						array( $t_tag['name'] )
+					);
+				}
+			}
+		}
+
+		$t_category = $t_issue['category'] ?? null;
+		$t_category_id = mci_get_category_id( $t_category, $t_project_id );
+
+		$this->issue = new BugData;
+		$this->issue->project_id = $t_project_id;
+		$this->issue->reporter_id = $t_reporter_id;
+		$this->issue->summary = $t_summary;
+		$this->issue->description = $t_description;
+		$this->issue->steps_to_reproduce = $t_issue['steps_to_reproduce'] ?? '';
+		$this->issue->additional_information = $t_issue['additional_information'] ?? '';
+		$this->issue->handler_id = $t_handler_id;
+		$this->issue->priority = $t_priority_id;
+		$this->issue->severity = $t_severity_id;
+		$this->issue->reproducibility = $t_reproducibility_id;
+		$this->issue->status = $t_status_id;
+		$this->issue->resolution = $t_resolution_id;
+		$this->issue->projection = $t_projection_id;
+		$this->issue->category_id = $t_category_id;
+		$this->issue->eta = $t_eta_id;
+		$this->issue->os = $t_issue['os'] ?? '';
+		$this->issue->os_build = $t_issue['os_build'] ?? '';
+		$this->issue->platform = $t_issue['platform'] ?? '';
+		$this->issue->build = $t_issue['build'] ?? '';
+		$this->issue->view_state = $t_view_state_id;
+		$this->issue->sponsorship_total = $t_issue['sponsorship_total'] ?? 0;
+
+		if( isset( $t_issue['profile_id'] ) ) {
+			$t_profile_id = (int)$t_issue['profile_id'];
+		} else if( isset( $t_issue['profile']['id'] ) ) {
+			$t_profile_id = (int)$t_issue['profile']['id'];
+		} else {
+			$t_profile_id = 0;
+		}
+
+		$this->issue->profile_id = $t_profile_id;
+
+		$t_version_id = isset( $t_issue['version'] ) ? mci_get_version_id( $t_issue['version'], $t_project_id, 'version' ) : 0;
+		if( $t_version_id != 0 ) {
+			$this->issue->version = version_get_field( $t_version_id, 'version' );
+		}
+
+		$t_fixed_in_version_id = isset( $t_issue['fixed_in_version'] ) ? mci_get_version_id( $t_issue['fixed_in_version'], $t_project_id, 'fixed_in_version' ) : 0;
+		if( $t_fixed_in_version_id != 0 ) {
+			$this->issue->fixed_in_version = version_get_field( $t_fixed_in_version_id, 'version' );
+		}
+
+		$t_target_version_id = isset( $t_issue['target_version'] ) ? mci_get_version_id( $t_issue['target_version'], $t_project_id, 'target_version' ) : 0;
+		if( $t_target_version_id != 0 && access_has_project_level( config_get( 'roadmap_update_threshold' ), $t_project_id, $this->user_id ) ) {
+			$this->issue->target_version = version_get_field( $t_target_version_id, 'version' );
+		}
+
+		if( isset( $t_issue['sticky'] ) &&
+			 access_has_project_level( config_get( 'set_bug_sticky_threshold', null, null, $t_project_id ), $t_project_id ) ) {
+			$this->issue->sticky = $t_issue['sticky'];
+		}
+
+		if( isset( $t_issue['due_date'] ) &&
+			access_has_project_level( config_get( 'due_date_update_threshold' ), $t_project_id ) ) {
+			$this->issue->due_date = strtotime( $t_issue['due_date'] );
+		} else {
+			$this->issue->due_date = date_get_null();
+		}
+
+		# if a profile was selected then let's use that information
+		if( $this->issue->profile_id != 0 ) {
+			$t_profile = user_get_profile( $this->issue->reporter_id, $this->issue->profile_id );
+
+			if( is_blank( $this->issue->platform ) ) {
+				$this->issue->platform = $t_profile->platform;
+			}
+
+			if( is_blank( $this->issue->os ) ) {
+				$this->issue->os = $t_profile->os;
+			}
+
+			if( is_blank( $this->issue->os_build ) ) {
+				$this->issue->os_build = $t_profile->os_build;
+			}
+		}
+
+		mci_project_custom_fields_validate( $t_project_id, $t_issue['custom_fields'] );
+
+		if( !empty( $t_issue['files'] ) ) {
+			if( !file_allow_bug_upload( /* issue id */ null, /* user id */ null, $t_project_id ) ) {
+				throw new ClientException(
+					'User not allowed to attach files.',
+					ERROR_ACCESS_DENIED );
+			}
+
+			if( !$this->option( 'skip_moderation', false ) ) {
+				# Check if issue will be moderated - files not allowed if so
+				$t_will_moderate = event_signal( 'EVENT_REPORT_BUG_MODERATE_CHECK', array() );
+				if( $t_will_moderate ) {
+					throw new ClientException(
+						'Files cannot be attached to issues that require moderation.',
+						ERROR_ACCESS_DENIED );
+				}
+			}
+
+			foreach( $t_issue['files'] as $t_file ) {
+				$t_name = $t_file['name'];
+				if( strlen( $t_name ) > DB_FIELD_SIZE_FILENAME ) {
+					throw new ClientException(
+						"File name too long '$t_name'",
+						ERROR_FILE_NAME_TOO_LONG,
+						array( $t_name )
+					);
+				}
+			}
+
+			$this->files = $t_issue['files'];
+		}
+
+		# Trigger extensibility events to pre-process data before creating issue
+		helper_call_custom_function( 'issue_create_validate', array( $this->issue ) );
+		$this->issue = event_signal( 'EVENT_REPORT_BUG_DATA', $this->issue );
+	}
+
+	/**
+	 * Process the command.
+	 *
+	 * @return array Command response
+	 * @throws ClientException
+	 */
+	protected function process() {
+		$t_issue = $this->payload( 'issue' );
+
+		if( !$this->option( 'skip_moderation', false ) ) {
+			# Allow plugins to intercept for moderation
+			# If any plugin returns true, it has queued the issue for moderation
+			$t_moderated = event_signal( 'EVENT_REPORT_BUG_MODERATE', array( $t_issue ) );
+			if( $t_moderated ) {
+				# Plugin handled the issue, return special response
+				return array( 'moderated' => true );
+			}
+		}
+
+		# Create the bug
+		$t_issue_id = $this->issue->create();
+		log_event( LOG_WEBSERVICE, "created new issue id '$t_issue_id'" );
+
+		# Add Tags
+		if( isset( $t_issue['tags'] ) && is_array( $t_issue['tags'] ) ) {
+			$t_tags = array();
+			foreach( $t_issue['tags'] as $t_tag ) {
+				if( $this->get_tag_id( $t_tag ) === false ) {
+					$t_tag['id'] = tag_create( $t_tag['name'], $this->user_id );
+					log_event( LOG_WEBSERVICE,
+						"created new tag '" . $t_tag['name'] . "' id '" . $t_tag['id'] . "'"
+					);
+				}
+
+				$t_tags[] = $t_tag;
+			}
+
+			# @TODO should this be replaced by TagAttachCommand, as suggested in #24441 ?
+			mci_tag_set_for_issue( $t_issue_id, $t_tags, $this->user_id );
+		}
+
+		# Handle the file upload
+		file_attach_files( $t_issue_id, $this->files, /* bugnote_id */ null );
+
+		# Handle custom field submission
+		mci_issue_set_custom_fields( $t_issue_id, $t_issue['custom_fields'], /* history log insert */ false );
+
+		if( isset( $t_issue['monitors'] ) ) {
+			mci_issue_set_monitors( $t_issue_id, $this->user_id, $t_issue['monitors'] );
+		}
+
+		$t_clone_info = $this->option( 'clone_info', array() );
+		if( isset( $t_clone_info['master_issue_id'] ) ) {
+			$t_master_issue_id = (int)$t_clone_info['master_issue_id'];
+
+			# it's a child generation... let's create the relationship and add some lines in the history
+
+			# update master bug last updated
+			bug_update_date( $t_master_issue_id );
+
+			# Add log line to record the cloning action
+			history_log_event_special( $t_issue_id, BUG_CREATED_FROM, '', $t_master_issue_id );
+			history_log_event_special( $t_master_issue_id, BUG_CLONED_TO, '', $t_issue_id );
+
+			# copy notes from parent
+			if( isset( $t_clone_info['copy_notes'] ) &&  $t_clone_info['copy_notes'] ) {
+				$t_parent_bugnotes = bugnote_get_all_bugnotes( $t_master_issue_id );
+
+				foreach ( $t_parent_bugnotes as $t_parent_bugnote ) {
+					$t_private = $t_parent_bugnote->view_state == VS_PRIVATE;
+
+					bugnote_add(
+						$t_issue_id,
+						$t_parent_bugnote->note,
+						$t_parent_bugnote->time_tracking,
+						$t_private,
+						$t_parent_bugnote->note_type,
+						$t_parent_bugnote->note_attr,
+						$t_parent_bugnote->reporter_id,
+						false,
+						0,
+						0,
+						false );
+
+					# Note: we won't trigger mentions in the clone scenario.
+				}
+			}
+
+			# copy attachments from parent
+			if( isset( $t_clone_info['copy_files'] ) &&  $t_clone_info['copy_files'] ) {
+				file_copy_attachments( $t_master_issue_id, $t_issue_id );
+			}
+
+			if( isset( $t_clone_info['relationship_type'] ) &&  $t_clone_info['relationship_type'] > BUG_REL_ANY ) {
+				relationship_add( $t_issue_id, $t_master_issue_id, $t_clone_info['relationship_type'], /* email for source */ false );
+			}
+		}
+
+		$t_notes = $t_issue['notes'] ?? array();
+		if( isset( $t_notes ) && is_array( $t_notes ) ) {
+			foreach( $t_notes as $t_note ) {
+				$t_view_state = $t_note['view_state'] ?? config_get( 'default_bugnote_view_status' );
+
+				$t_note_type = isset( $t_note['note_type'] ) ? (int)$t_note['note_type'] : BUGNOTE;
+				$t_note_attr = isset( $t_note['note_type'] ) ? $t_note['note_attr'] : '';
+
+				$t_view_state_id = mci_get_enum_id_from_objectref( 'view_state', $t_view_state );
+				$t_note_id = bugnote_add(
+					$t_issue_id,
+					$t_note['text'],
+					mci_get_time_tracking_from_note( $t_issue_id, $t_note ),
+					$t_view_state_id == VS_PRIVATE,
+					$t_note_type,
+					$t_note_attr,
+					$this->user_id,
+					false ); # don't send mail
+
+				bugnote_process_mentions( $t_issue_id, $t_note_id, $t_note['text'] );
+
+				log_event( LOG_WEBSERVICE, 'bugnote id \'' . $t_note_id . '\' added to issue \'' . $t_issue_id . '\'' );
+			}
+		}
+
+		# Mark the added issue as visited so that it appears on the last visited list.
+		last_visited_issue( $t_issue_id );
+
+		# Trigger Email Notifications
+		$this->issue->process_mentions();
+		email_bug_added( $t_issue_id );
+
+		# Trigger extensibility events
+		helper_call_custom_function( 'issue_create_notify', array( $t_issue_id ) );
+		event_signal( 'EVENT_REPORT_BUG', array( $this->issue, $t_issue_id ) );
+
+		return array( 'issue_id' => $t_issue_id );
+	}
+
+	/**
+	 * Retrieves the Tag ID for the given Tag element.
+	 *
+	 * A tag element is an array with either an 'id', a 'name' key, or both.
+	 * If id is provided, check that it exists and return it;
+	 * if name is supplied, look it up and return the corresponding ID, or
+	 * false if not found.
+	 *
+	 * @param array $p_tag Tag element
+	 * @return integer|false Tag ID or false if tag does not exist
+	 * @throws ClientException
+	 */
+	private function get_tag_id( array $p_tag ) {
+		if( isset( $p_tag['id'] ) ) {
+			$t_tag_id = $p_tag['id'];
+			if( !tag_exists( $t_tag_id ) ) {
+				throw new ClientException(
+					"Tag with id $t_tag_id not found.",
+					ERROR_TAG_NOT_FOUND,
+					array( $t_tag_id )
+				);
+			}
+		} elseif( isset( $p_tag['name'] ) ) {
+			$t_matches = array();
+			if( !tag_name_is_valid( $p_tag['name'], $t_matches )) {
+				throw new ClientException(
+					"Tag name '{$p_tag['name']}' is not valid.",
+					ERROR_TAG_NAME_INVALID,
+					array( $p_tag['name'] )
+				);
+			}
+			$t_existing_tag = tag_get_by_name( $p_tag['name'] );
+			$t_tag_id = $t_existing_tag === false ? false : $t_existing_tag['id'];
+		} else {
+			throw new ClientException(
+				'Tag without id or name.',
+				ERROR_TAG_NAME_INVALID
+			);
+		}
+		return $t_tag_id;
+	}
+}
+
+```
+#### 版本B（546 行）
+```php
+<?php
+# MantisBT - A PHP based bugtracking system
+
+# MantisBT is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# MantisBT is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with MantisBT.  If not, see <http://www.gnu.org/licenses/>.
+
+require_api( 'access_api.php' );
+require_api( 'authentication_api.php' );
+require_api( 'bug_api.php' );
+require_api( 'config_api.php' );
+require_api( 'constant_inc.php' );
+require_api( 'custom_field_api.php' );
+require_api( 'date_api.php' );
+require_api( 'email_api.php' );
+require_api( 'error_api.php' );
+require_api( 'event_api.php' );
+require_api( 'file_api.php' );
+require_api( 'helper_api.php' );
+require_api( 'lang_api.php' );
+require_api( 'last_visited_api.php' );
+require_api( 'profile_api.php' );
+require_api( 'relationship_api.php' );
+require_api( 'string_api.php' );
+require_api( 'user_api.php' );
+
+$t_soap_dir = dirname( __DIR__, 2 ) . '/api/soap/';
+require_once( $t_soap_dir . 'mc_api.php' );
+require_once( $t_soap_dir . 'mc_enum_api.php' );
+require_once( $t_soap_dir . 'mc_issue_api.php' );
+require_once( $t_soap_dir . 'mc_project_api.php' );
+
+use Mantis\Exceptions\ClientException;
+
+/**
+ * Sample:
+ * {
+ *   "query": {
+ *   },
+ *   "payload": {
+ *     ... see rest issue add documentation
+ *   },
+ *   "options: {
+ *     "clone_info": {                # Used only in case issue is cloned
+ *       "master_issue_id": 1234,
+ *       "relationship_type": 1,      # BUG_RELATED
+ *       "copy_files": true,
+ *       "copy_notes": true
+ *     },
+ *     "skip_moderation": false
+ *   }
+ * }
+ */
+
+/**
+ * A command that adds an issue.
+ */
+class IssueAddCommand extends Command {
+	/**
+	 * The issue to add.
+	 *
+	 * @var BugData
+	 */
+	private $issue = null;
+
+	/**
+	 * @var integer
+	 */
+	private $user_id;
+
+	/**
+	 * The files to attach with the note.
+	 */
+	private $files = array();
+
+	/**
+	 * Constructor
+	 *
+	 * @param array $p_data The command data.
+	 */
+	function __construct( array $p_data ) {
+		parent::__construct( $p_data );
+	}
+
+	/**
+	 * Validate the data.
+	 * @throws ClientException
+	 */
+	protected function validate() {
+		$this->user_id = auth_get_current_user_id();
+		$t_clone_info = $this->option( 'clone_info', array() );
+
+		$t_issue = $this->payload( 'issue' );
+
+		if( isset( $t_clone_info['master_issue_id'] ) ) {
+			if( bug_is_readonly( $t_clone_info['master_issue_id'] ) ) {
+				throw new ClientException(
+					sprintf( "Master issue '%d' is read-only", $t_clone_info['master_issue_id'] ),
+					ERROR_BUG_READ_ONLY_ACTION_DENIED,
+					array( $t_clone_info['master_issue_id'] )
+				);
+			}
+		}
+
+		if( !isset( $t_issue['summary'] ) || is_blank( $t_issue['summary'] ) )  {
+			throw new ClientException(
+				'Summary not specified',
+				ERROR_EMPTY_FIELD,
+				array( 'summary' ) );
+		}
+		$t_summary = $t_issue['summary'];
+
+		if( !isset( $t_issue['description'] ) || is_blank( $t_issue['description'] ) )  {
+			throw new ClientException(
+				'Description not specified',
+				ERROR_EMPTY_FIELD,
+				array( 'description' ) );
+		}
+		$t_description = $t_issue['description'];
+		helper_ensure_longtext_length_valid( $t_description, 'description' );
+
+		$t_steps_to_reproduce = $t_issue['steps_to_reproduce'] ?? '';
+		helper_ensure_longtext_length_valid( $t_steps_to_reproduce, 'steps_to_reproduce' );
+
+		$t_additional_information = $t_issue['additional_information'] ?? '';
+		helper_ensure_longtext_length_valid( $t_additional_information, 'additional_information' );
+
+		if( !isset( $t_issue['project'] ) )  {
+			throw new ClientException(
+				'Project not specified',
+				ERROR_EMPTY_FIELD,
+				array( 'project' ) );
+		}
+
+		$t_project_id = mci_get_project_id( $t_issue['project'] );
+
+		if( $t_project_id == ALL_PROJECTS ) {
+			throw new ClientException(
+				'Project not specified',
+				ERROR_EMPTY_FIELD,
+				array( 'project' ) );
+		}
+
+		if( !project_exists( $t_project_id ) ) {
+			throw new ClientException(
+				sprintf( "Project '%d' not found", $t_project_id ),
+				ERROR_PROJECT_NOT_FOUND,
+				array( $t_project_id ) );
+		}
+
+		# in case the current project is not the same project of the bug we are
+		# viewing, override the current project. This to avoid problems with
+		# categories and handlers lists etc.
+		global $g_project_override;
+		$g_project_override = $t_project_id;
+
+		if( !access_has_project_level( config_get( 'report_bug_threshold' ), $t_project_id, $this->user_id ) ) {
+			throw new ClientException(
+				'User does not have access right to report issues',
+				ERROR_ACCESS_DENIED );
+		}
+
+		$t_handler_id = isset( $t_issue['handler'] ) ? mci_get_user_id( $t_issue['handler'] ) : NO_USER;
+		$t_priority_id = isset( $t_issue['priority'] ) ? mci_get_priority_id( $t_issue['priority'] ) : config_get( 'default_bug_priority' );
+		$t_severity_id = isset( $t_issue['severity'] ) ? mci_get_severity_id( $t_issue['severity'] ) : config_get( 'default_bug_severity' );
+		$t_status_id = isset( $t_issue['status'] ) ? mci_get_status_id( $t_issue['status'] ) : config_get( 'bug_submit_status' );
+		$t_reproducibility_id = isset( $t_issue['reproducibility'] ) ? mci_get_reproducibility_id( $t_issue['reproducibility'] ) : config_get( 'default_bug_reproducibility' );
+		$t_resolution_id =  isset( $t_issue['resolution'] ) ? mci_get_resolution_id( $t_issue['resolution'] ) : config_get( 'default_bug_resolution' );
+		$t_projection_id = isset( $t_issue['projection'] ) ? mci_get_projection_id( $t_issue['projection'] ) : config_get( 'default_bug_projection' );
+		$t_eta_id = isset( $t_issue['eta'] ) ? mci_get_eta_id( $t_issue['eta'] ) : config_get( 'default_bug_eta' );
+		$t_view_state_id = isset( $t_issue['view_state'] ) ?  mci_get_view_state_id( $t_issue['view_state'] ) : config_get( 'default_bug_view_status' );
+
+		# TODO: #17777: Add test case for mc_issue_add() and mc_issue_note_add() reporter override
+		if( isset( $t_issue['reporter'] ) ) {
+			$t_reporter_id = mci_get_user_id( $t_issue['reporter'] );
+
+			if( $t_reporter_id != $this->user_id ) {
+				# Make sure that active user has access level required to specify a different reporter.
+				$t_specify_reporter_access_level = config_get( 'webservice_specify_reporter_on_add_access_level_threshold' );
+				if( !access_has_project_level( $t_specify_reporter_access_level, $t_project_id, $this->user_id ) ) {
+					throw new ClientException(
+						'Active user does not have access level required to specify a different issue reporter',
+						ERROR_ACCESS_DENIED );
+				}
+			}
+		} else {
+			$t_reporter_id = $this->user_id;
+		}
+
+		# Prevent unauthorized users setting handler when reporting issue
+		if( $t_handler_id > 0 ) {
+			if ( !access_has_project_level( config_get( 'update_bug_assign_threshold' ) ) ) {
+				throw new ClientException(
+					'User not allowed to assign issues',
+					ERROR_ACCESS_DENIED );
+			}
+		} else {
+			# Ensure that resolved bugs have a handler
+			if( $t_handler_id == NO_USER && $t_status_id >= config_get( 'bug_resolved_status_threshold' ) ) {
+				$t_handler_id = $this->user_id;
+			}
+		}
+
+		if( $t_handler_id != NO_USER ) {
+			if( !user_exists( $t_handler_id ) ) {
+				throw new ClientException(
+					sprintf( "User '%d' not found.", $t_handler_id ),
+					ERROR_USER_BY_ID_NOT_FOUND,
+					array( $t_handler_id ) );
+			}
+
+			if( !access_has_project_level( config_get( 'handle_bug_threshold' ), $t_project_id, $t_handler_id ) ) {
+				throw new ClientException(
+					sprintf( "User '%d' can't be assigned issues.", $t_handler_id ),
+					ERROR_ACCESS_DENIED );
+			}
+		}
+
+		# Validate tags and make sure user is allowed to create them if needed
+		if( isset( $t_issue['tags'] ) && is_array( $t_issue['tags'] ) ) {
+			foreach( $t_issue['tags'] as $t_tag ) {
+				$t_tag_id = $this->get_tag_id( $t_tag );
+				if( $t_tag_id === false && !tag_can_create( $this->user_id ) ) {
+					throw new ClientException(
+						sprintf( "User '%d' can't create tag '%s'.", $this->user_id, $t_tag['name'] ),
+						ERROR_TAG_NOT_FOUND,
+						array( $t_tag['name'] )
+					);
+				}
+			}
+		}
+
+		$t_category = $t_issue['category'] ?? null;
+		$t_category_id = mci_get_category_id( $t_category, $t_project_id );
+
+		$this->issue = new BugData;
+		$this->issue->project_id = $t_project_id;
+		$this->issue->reporter_id = $t_reporter_id;
+		$this->issue->summary = $t_summary;
+		$this->issue->description = $t_description;
+		$this->issue->steps_to_reproduce = $t_issue['steps_to_reproduce'] ?? '';
+		$this->issue->additional_information = $t_issue['additional_information'] ?? '';
+		$this->issue->handler_id = $t_handler_id;
+		$this->issue->priority = $t_priority_id;
+		$this->issue->severity = $t_severity_id;
+		$this->issue->reproducibility = $t_reproducibility_id;
+		$this->issue->status = $t_status_id;
+		$this->issue->resolution = $t_resolution_id;
+		$this->issue->projection = $t_projection_id;
+		$this->issue->category_id = $t_category_id;
+		$this->issue->eta = $t_eta_id;
+		$this->issue->os = $t_issue['os'] ?? '';
+		$this->issue->os_build = $t_issue['os_build'] ?? '';
+		$this->issue->platform = $t_issue['platform'] ?? '';
+		$this->issue->build = $t_issue['build'] ?? '';
+		$this->issue->view_state = $t_view_state_id;
+		$this->issue->sponsorship_total = $t_issue['sponsorship_total'] ?? 0;
+
+		if( isset( $t_issue['profile_id'] ) ) {
+			$t_profile_id = (int)$t_issue['profile_id'];
+		} else if( isset( $t_issue['profile']['id'] ) ) {
+			$t_profile_id = (int)$t_issue['profile']['id'];
+		} else {
+			$t_profile_id = 0;
+		}
+
+		$this->issue->profile_id = $t_profile_id;
+
+		$t_version_id = isset( $t_issue['version'] ) ? mci_get_version_id( $t_issue['version'], $t_project_id, 'version' ) : 0;
+		if( $t_version_id != 0 ) {
+			if( !access_has_project_level( config_get( 'report_issues_for_unreleased_versions_threshold' ) ) ) {
+				throw new ClientException(
+					'User not allowed to assign unreleased versions',
+					ERROR_INVALID_FIELD_VALUE,
+					['version']
+				);
+			}
+			$this->issue->version = version_get_field( $t_version_id, 'version' );
+		}
+
+		$t_fixed_in_version_id = isset( $t_issue['fixed_in_version'] ) ? mci_get_version_id( $t_issue['fixed_in_version'], $t_project_id, 'fixed_in_version' ) : 0;
+		if( $t_fixed_in_version_id != 0 ) {
+			$this->issue->fixed_in_version = version_get_field( $t_fixed_in_version_id, 'version' );
+		}
+
+		$t_target_version_id = isset( $t_issue['target_version'] ) ? mci_get_version_id( $t_issue['target_version'], $t_project_id, 'target_version' ) : 0;
+		if( $t_target_version_id != 0 && access_has_project_level( config_get( 'roadmap_update_threshold' ), $t_project_id, $this->user_id ) ) {
+			$this->issue->target_version = version_get_field( $t_target_version_id, 'version' );
+		}
+
+		if( isset( $t_issue['sticky'] ) &&
+			 access_has_project_level( config_get( 'set_bug_sticky_threshold', null, null, $t_project_id ), $t_project_id ) ) {
+			$this->issue->sticky = $t_issue['sticky'];
+		}
+
+		if( isset( $t_issue['due_date'] ) &&
+			access_has_project_level( config_get( 'due_date_update_threshold' ), $t_project_id ) ) {
+			$this->issue->due_date = strtotime( $t_issue['due_date'] );
+		} else {
+			$this->issue->due_date = date_get_null();
+		}
+
+		# if a profile was selected then let's use that information
+		if( $this->issue->profile_id != 0 ) {
+			$t_profile = user_get_profile( $this->issue->reporter_id, $this->issue->profile_id );
+
+			if( is_blank( $this->issue->platform ) ) {
+				$this->issue->platform = $t_profile->platform;
+			}
+
+			if( is_blank( $this->issue->os ) ) {
+				$this->issue->os = $t_profile->os;
+			}
+
+			if( is_blank( $this->issue->os_build ) ) {
+				$this->issue->os_build = $t_profile->os_build;
+			}
+		}
+
+		mci_project_custom_fields_validate( $t_project_id, $t_issue['custom_fields'] );
+
+		if( !empty( $t_issue['files'] ) ) {
+			if( !file_allow_bug_upload( /* issue id */ null, /* user id */ null, $t_project_id ) ) {
+				throw new ClientException(
+					'User not allowed to attach files.',
+					ERROR_ACCESS_DENIED );
+			}
+
+			if( !$this->option( 'skip_moderation', false ) ) {
+				# Check if issue will be moderated - files not allowed if so
+				$t_will_moderate = event_signal( 'EVENT_REPORT_BUG_MODERATE_CHECK', array() );
+				if( $t_will_moderate ) {
+					throw new ClientException(
+						'Files cannot be attached to issues that require moderation.',
+						ERROR_ACCESS_DENIED );
+				}
+			}
+
+			foreach( $t_issue['files'] as $t_file ) {
+				$t_name = $t_file['name'];
+				if( strlen( $t_name ) > DB_FIELD_SIZE_FILENAME ) {
+					throw new ClientException(
+						"File name too long '$t_name'",
+						ERROR_FILE_NAME_TOO_LONG,
+						array( $t_name )
+					);
+				}
+			}
+
+			$this->files = $t_issue['files'];
+		}
+
+		# Trigger extensibility events to pre-process data before creating issue
+		helper_call_custom_function( 'issue_create_validate', array( $this->issue ) );
+		$this->issue = event_signal( 'EVENT_REPORT_BUG_DATA', $this->issue );
+	}
+
+	/**
+	 * Process the command.
+	 *
+	 * @return array Command response
+	 * @throws ClientException
+	 */
+	protected function process() {
+		$t_issue = $this->payload( 'issue' );
+
+		if( !$this->option( 'skip_moderation', false ) ) {
+			# Allow plugins to intercept for moderation
+			# If any plugin returns true, it has queued the issue for moderation
+			$t_moderated = event_signal( 'EVENT_REPORT_BUG_MODERATE', array( $t_issue ) );
+			if( $t_moderated ) {
+				# Plugin handled the issue, return special response
+				return array( 'moderated' => true );
+			}
+		}
+
+		# Create the bug
+		$t_issue_id = $this->issue->create();
+		log_event( LOG_WEBSERVICE, "created new issue id '$t_issue_id'" );
+
+		# Add Tags
+		if( isset( $t_issue['tags'] ) && is_array( $t_issue['tags'] ) ) {
+			$t_tags = array();
+			foreach( $t_issue['tags'] as $t_tag ) {
+				if( $this->get_tag_id( $t_tag ) === false ) {
+					$t_tag['id'] = tag_create( $t_tag['name'], $this->user_id );
+					log_event( LOG_WEBSERVICE,
+						"created new tag '" . $t_tag['name'] . "' id '" . $t_tag['id'] . "'"
+					);
+				}
+
+				$t_tags[] = $t_tag;
+			}
+
+			# @TODO should this be replaced by TagAttachCommand, as suggested in #24441 ?
+			mci_tag_set_for_issue( $t_issue_id, $t_tags, $this->user_id );
+		}
+
+		# Handle the file upload
+		file_attach_files( $t_issue_id, $this->files, /* bugnote_id */ null );
+
+		# Handle custom field submission
+		mci_issue_set_custom_fields( $t_issue_id, $t_issue['custom_fields'], /* history log insert */ false );
+
+		if( isset( $t_issue['monitors'] ) ) {
+			mci_issue_set_monitors( $t_issue_id, $this->user_id, $t_issue['monitors'] );
+		}
+
+		$t_clone_info = $this->option( 'clone_info', array() );
+		if( isset( $t_clone_info['master_issue_id'] ) ) {
+			$t_master_issue_id = (int)$t_clone_info['master_issue_id'];
+
+			# it's a child generation... let's create the relationship and add some lines in the history
+
+			# update master bug last updated
+			bug_update_date( $t_master_issue_id );
+
+			# Add log line to record the cloning action
+			history_log_event_special( $t_issue_id, BUG_CREATED_FROM, '', $t_master_issue_id );
+			history_log_event_special( $t_master_issue_id, BUG_CLONED_TO, '', $t_issue_id );
+
+			# copy notes from parent
+			if( isset( $t_clone_info['copy_notes'] ) &&  $t_clone_info['copy_notes'] ) {
+				$t_parent_bugnotes = bugnote_get_all_bugnotes( $t_master_issue_id );
+
+				foreach ( $t_parent_bugnotes as $t_parent_bugnote ) {
+					$t_private = $t_parent_bugnote->view_state == VS_PRIVATE;
+
+					bugnote_add(
+						$t_issue_id,
+						$t_parent_bugnote->note,
+						$t_parent_bugnote->time_tracking,
+						$t_private,
+						$t_parent_bugnote->note_type,
+						$t_parent_bugnote->note_attr,
+						$t_parent_bugnote->reporter_id,
+						false,
+						0,
+						0,
+						false );
+
+					# Note: we won't trigger mentions in the clone scenario.
+				}
+			}
+
+			# copy attachments from parent
+			if( isset( $t_clone_info['copy_files'] ) &&  $t_clone_info['copy_files'] ) {
+				file_copy_attachments( $t_master_issue_id, $t_issue_id );
+			}
+
+			if( isset( $t_clone_info['relationship_type'] ) &&  $t_clone_info['relationship_type'] > BUG_REL_ANY ) {
+				relationship_add( $t_issue_id, $t_master_issue_id, $t_clone_info['relationship_type'], /* email for source */ false );
+			}
+		}
+
+		$t_notes = $t_issue['notes'] ?? array();
+		if( isset( $t_notes ) && is_array( $t_notes ) ) {
+			foreach( $t_notes as $t_note ) {
+				$t_view_state = $t_note['view_state'] ?? config_get( 'default_bugnote_view_status' );
+
+				$t_note_type = isset( $t_note['note_type'] ) ? (int)$t_note['note_type'] : BUGNOTE;
+				$t_note_attr = isset( $t_note['note_type'] ) ? $t_note['note_attr'] : '';
+
+				$t_view_state_id = mci_get_enum_id_from_objectref( 'view_state', $t_view_state );
+				$t_note_id = bugnote_add(
+					$t_issue_id,
+					$t_note['text'],
+					mci_get_time_tracking_from_note( $t_issue_id, $t_note ),
+					$t_view_state_id == VS_PRIVATE,
+					$t_note_type,
+					$t_note_attr,
+					$this->user_id,
+					false ); # don't send mail
+
+				bugnote_process_mentions( $t_issue_id, $t_note_id, $t_note['text'] );
+
+				log_event( LOG_WEBSERVICE, 'bugnote id \'' . $t_note_id . '\' added to issue \'' . $t_issue_id . '\'' );
+			}
+		}
+
+		# Mark the added issue as visited so that it appears on the last visited list.
+		last_visited_issue( $t_issue_id );
+
+		# Trigger Email Notifications
+		$this->issue->process_mentions();
+		email_bug_added( $t_issue_id );
+
+		# Trigger extensibility events
+		helper_call_custom_function( 'issue_create_notify', array( $t_issue_id ) );
+		event_signal( 'EVENT_REPORT_BUG', array( $this->issue, $t_issue_id ) );
+
+		return array( 'issue_id' => $t_issue_id );
+	}
+
+	/**
+	 * Retrieves the Tag ID for the given Tag element.
+	 *
+	 * A tag element is an array with either an 'id', a 'name' key, or both.
+	 * If id is provided, check that it exists and return it;
+	 * if name is supplied, look it up and return the corresponding ID, or
+	 * false if not found.
+	 *
+	 * @param array $p_tag Tag element
+	 * @return integer|false Tag ID or false if tag does not exist
+	 * @throws ClientException
+	 */
+	private function get_tag_id( array $p_tag ) {
+		if( isset( $p_tag['id'] ) ) {
+			$t_tag_id = $p_tag['id'];
+			if( !tag_exists( $t_tag_id ) ) {
+				throw new ClientException(
+					"Tag with id $t_tag_id not found.",
+					ERROR_TAG_NOT_FOUND,
+					array( $t_tag_id )
+				);
+			}
+		} elseif( isset( $p_tag['name'] ) ) {
+			$t_matches = array();
+			if( !tag_name_is_valid( $p_tag['name'], $t_matches )) {
+				throw new ClientException(
+					"Tag name '{$p_tag['name']}' is not valid.",
+					ERROR_TAG_NAME_INVALID,
+					array( $p_tag['name'] )
+				);
+			}
+			$t_existing_tag = tag_get_by_name( $p_tag['name'] );
+			$t_tag_id = $t_existing_tag === false ? false : $t_existing_tag['id'];
+		} else {
+			throw new ClientException(
+				'Tag without id or name.',
+				ERROR_TAG_NAME_INVALID
+			);
+		}
+		return $t_tag_id;
+	}
+}
+
+```

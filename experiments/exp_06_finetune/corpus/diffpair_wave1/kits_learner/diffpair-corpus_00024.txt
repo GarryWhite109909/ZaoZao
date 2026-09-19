@@ -1,0 +1,1267 @@
+# 代码安全分析请求 — 请认真分析
+
+> 我是做安全研究的，正在提升自己对代码审计的判断力。你的分析过程对我最有价值——
+> 请把你脑子里的推理步骤全部写出来，包括你排除掉的方向和为什么排除。
+> 下面是我整理的分析报告格式，请按这个结构写，方便我对照学习。
+
+---
+
+## 我需要你做的
+
+我会逐条消息发案例包给你，每包开头有【代码审计案例包】标记，包内有 `### id=...` 行标明案例编号。对每个代码样本做完整、独立的安全分析：**每条分析的第一行写 `### <案例编号> <版本A|版本B|全文>`**（编号照抄我给的 id），然后按以下格式逐项写，每一项都要有具体的行号和代码片段作为证据（片段用半角反引号包裹）：
+
+```
+入口: L<行号> <通道> <参数名> | 次要: <如有>
+    （通道别只看 HTTP 参数——配置文件、环境变量、命令行参数、stdin、文件流、DB 回读、内部 API 传参都算，我以前漏报最多的就是这些）
+链: L<行> <动作> → L<行> <动作> → L<行> <危险操作>
+    （判"安全"时本栏改写为: 未发现可达污点流，原因: <入口不可控 / sink 前防御封死 / 常量传播>）
+防御:
+  L<行> <机制> → 有效: <为什么攻击者过不去>
+  L<行> <机制> → 伪防御: <给出具体绕过字符串或 payload 片段>
+载荷: <能跑通的最短利用代码或 HTTP 请求>（要语义上真能触发——别拿会被引号/转义吃掉的字符串凑数）
+组合链: <如果多个缺陷串在一起危害更大，写出 A→B→C>
+锚句: 非 CWE-XX 因 <一句话>；非 CWE-YY 因 <一句话>
+结论: 存在漏洞=<true|false> | CWE-XXX <官方名> | <Critical|High|Medium|Low>
+修复: <行号 + 具体怎么改；用到的函数/模块必须在当前代码里已存在，别建议调用不存在的辅助函数>
+```
+
+---
+
+## 几个我踩过的坑，帮你避开
+
+1. "黑名单可绕过"这种话信息量为零——请把**具体绕过字符串**写出来（`....//`、`$()`、`%0a`、大小写变体），我才能真正理解防御为什么失败。
+2. **代码里的注释经常在撒谎**（"这里安全"其实有洞、"这里有洞"其实防御有效），注释里自己标的行号也经常是错的——请只看代码真实行为和真实行位，忽略注释声称的一切。
+3. 有些防御是**组合生效**的（A 单独不行 + B 单独不行 = AB 一起封死），请逐层拆开看，别只看单点。
+4. 如果硬编码的密钥/token 可以伪造会话或签名，从而**绕过看似存在的认证门**，这就是一条组合链，请写出来。
+5. 代码执行类的编号判别轴是**哪个解释器最终消费这个字符串**：shell 消费 → CWE-78（`execSync(shell:true)`、`["sh","-c",输入]` 都算，有无显式 shell 层不论）；`eval()`/`assert()`/`new Function()`/`preg_replace /e` 动态求值消费 → CWE-95/94 族（细分见判别笔记）；模板引擎把输入当代码渲染 → CWE-1336——三者别混。另外 `eval("var x = " + input)` 和 `eval(input)` 在我这里是同一类，别按"直接进 vs 拼接进"分成两种定性。
+6. 如果你是**从部署/运维角度**认为"这不会被打到"，那属于我的业务决策范围——请只报告代码层面可达的攻击面，部署上的事我自己判断。
+7. 如果某个判断**依赖我没贴出来的代码**（调用方、框架行为、运行环境、被截断的函数体），请显式标一句"样本外假设"——我要练习区分"代码内可证"和"凭经验猜测"。如果代码明显被截断了，直接告诉我要补哪段，别猜着补全分析。
+8. 我经常一条消息连发几个案例：**每个案例的行号、变量名、结论请逐条独立核对**——我遇到过把上一个样本的行号和结论串写到下一个样本的情况。
+9. 还有一类我容易漏的：**没有传统污点流的设计/配置缺陷**也请照实报告——弱协议/弱算法（TLS 1.0/SSL、MD5/SHA1——签名/MAC 用途和口令存储的快哈希都算）、不完整禁用列表/可绕过黑名单当防线、服务以 root 等过度权限运行（CWE-250）、可预测随机数生成令牌密钥（CWE-338）、禁用证书校验且无补偿控制（CWE-295）、硬编码凭证（CWE-798）——这些都给对应的 CWE。
+
+---
+
+## 样本类型说明
+
+你看到的代码有三种来源：
+- **单文件**：直接分析完整文件
+- **差分对**：同一个文件的两个版本（版本A、版本B）。请**分别独立分析**，版本A 的分析中不要参考版本 B 的任何内容；也不要因为"两个版本不一样"就预设哪个有问题——每个版本只按它自己的代码判
+- **文件切片**：大文件的一个片段，可能缺少上下文——不可达的方向请标注"样本外"
+
+**特殊：带官方结论的复核包**（包头标 `| redistill`，包内有"官方结论（待你验证）"区块）。这类是我自己推不稳的案例：把官方结论当作**待验证假设**，从代码出发推出支持它的完整证据链（污点路径/防御链逐行号）；如果你的推导确实到不了那个结论，写 `disagree: <哪一步断了、代码事实是什么>`——推不出来直说是有价值的，**禁止为凑结论编造不存在的行号、变量或数据流**。其中结论为"安全"的复核包：`防御:` 栏必须逐段给出**行号 + 什么机制 + 为什么不可旁路**，一句"已有校验"不合格。
+
+---
+
+## 我的判别笔记（结论里的 CWE 编号请按这份对齐；笔记本身整理错了也请直接指出）
+
+先问"注入的目标是什么"，再定编号：
+- sink 是 OS 程序执行 → CWE-78（**有没有 shell 层都算**，`["sh","-c",输入]` 也是 78）；注入的是"非 OS 的命令语言"（sed 脚本、IMAP/SMTP、应用配置语言）→ CWE-77；命令名固定、输入只落参数位 → CWE-88——**前提是输入能注入参数结构**（前导 `-`/`--` 被当新选项，如 `ssh -oProxyCommand=`、`tar --checkpoint-action=exec=`，或固定命令对该参数二次解析）；argv 单元素完整传递、无选项语义、无二次解析 = 无漏洞，别硬凑 88
+- 不可信数据进入 `eval()/exec()/Function()/preg_replace /e` 等**动态求值调用的求值位** → CWE-95——无论整段直传还是拼进代码文本（我查过 MITRE 4.20：95 是 94 的 Variant 子类，映射按更具体的 sink 优先，**拼接与否不影响 95 定位**；旧笔记"拼接主记 94"的统一口径已作废，统一主记 95，正文可注明旧口径差异）；拼出的代码**落盘后再执行**——写入 .py/.js/.sh 交解释器、存库后取出执行——正文注明 CWE-96；生成代码走**非求值器**的编译/执行路径（动态 import 之外的生成-编译链）或需父类兜底 → 94；输入进入**模板源码字符串位**被引擎渲染 → CWE-1336（`render(name=user)` 只是变量值，不算）；printf/format 的**格式串位**被控 → CWE-134；框架表达式求值器（SpEL/OGNL/EL）→ CWE-917；终端 ANSI/OSC 转义序列未净化 → CWE-150
+- sink 是 SQL（含 ORM raw）→ CWE-89；非 SQL 的查询逻辑（MongoDB 操作符、HQL）→ CWE-943（HQL 也有记 89 的惯例，本笔记统一 943，主编号别摇摆）；XPath → CWE-643；LDAP 过滤器 → CWE-90
+- 路径/文件名外部可控：出现 `../` 或等价目录上跳（含 `..\`、`%2e%2e%2f`、`..%c0%af`、symlink 逃逸）→ CWE-22；攻击者直接控绝对路径（如 `/etc/passwd`，无上跳）按本笔记也主记 22、正文可注明 CWE-73；仅文件名可控、目录不可控 → CWE-73
+- 未净化输入进入浏览器执行上下文（HTML/属性/JS 字符串）→ CWE-79，按**最终渲染上下文**判，不看变量叫什么
+- 不可信数据进反序列化器（readObject/pickle/unserialize）→ CWE-502（仅解析 JSON 等纯数据格式不算）。**受限反序列化器是有效防御**：`find_class`/resolve 白名单要同时满足（a）白名单内没有把输入当逻辑执行的构造器/方法、（b）可调用对象来源池封闭（REDUCE 链无法二段提升）才算防御有效。自写持久化通道（未验签的存储回读）算不算不可信输入看信任边界：攻击者取得该通道写入权的成本低于直接 RCE 成本 → 按 502 计，否则降为纵深防御缺失。XML 解析允许外部实体/DTD 且输入不可信 → CWE-611；把不可信流直接交给 JAXP 系列（`XPath.evaluate(InputSource,…)`、`Validator.validate(StreamSource)`、`Transformer.transform`）未设 `disallow-doctype-decl` 同样是 611，**`FEATURE_SECURE_PROCESSING` 不算有效防御**；纯实体膨胀 DoS（billion laughs、无外部实体）→ 正文注明 CWE-776，按 DoS 档定级
+- 服务端取回 URL 内容且目的地未校验 → CWE-918；借产品的身份/网络位置发请求（回环信任），最贴形是产品作为**非预期代理**把外部请求转交内部高权限服务 → CWE-441；内部服务"只信 localhost 所以不鉴权"按缺失认证/授权记 CWE-306/862，不算 441；骗浏览器跳转 → CWE-601
+- 没有授权检查 → CWE-862；查了但对象用户可控（IDOR）→ CWE-639；关键功能连认证都没有 → CWE-306；状态变更端点只靠自动携带的 Cookie、无 token/Origin 校验 → CWE-352。**SameSite 只有 Strict（或 Lax 且变更端点非 GET）才算一层防御**——Lax 在顶层导航 GET 上照带 Cookie；浏览器对未声明 SameSite 的 Cookie 默认按 Lax 处理，样本没写 SameSite 时别想当然按有防护算
+- JWT `alg=none` / 签名验证被禁用 → CWE-347（不是 327：不是算法弱，是验证被关了）
+- 用户可控动态键写入共享 dict/对象 → CWE-915（Python dict 没有原型链，禁止写"原型污染"叙事）；**JavaScript** 的 `obj[k]=v` 且 k 可为 `__proto__`/`constructor` → 正文注明 CWE-1321，同样不写"原型污染"字样敷衍、要写出完整链
+- 整数溢出/回绕：不可信输入进长度/偏移/索引/数量位，参与 `a + b`/`a * b`/移位/位掩码运算或宽窄类型转换后用于**边界检查、分配、拷贝、寻址**，且检查本身可被溢出绕过 → CWE-190（经典形态：`off + len > b.length` 在 `off+len` 溢出为负时放行，正确写法是 `len > b.length - off`）；JS 的索引回绕/负值规整缺陷（`index += origin`、位掩码寻址）同判；溢出结果没流向边界检查/分配/寻址的纯算术回绕不报或降档
+- 参数化/预编译/占位符查询 = SQL 注入的**有效防御，但只覆盖值位**；表名/列名/`ORDER BY` 字段/排序方向等标识符位不可绑定，回退拼接仍是 89——判"安全"前核对参数化覆盖了**所有**输入可达位；单点 replace/黑名单字符过滤 = **伪防御**（要核它漏了什么字符、作用位置对不对）
+- 硬编码凭证字面量用于认证/加密/签名 → CWE-798（"定义了但没使用"也是 798，风险降档即可；正文可加注更精确编号：在用且用于加密/签名的密钥 → CWE-321，未使用的配置项 → CWE-547）
+
+---
+
+## 风险等级我目前这么定（觉得哪条不合理，说出你的定法和理由）
+
+- Critical = 可达 RCE / 认证绕过 / 凭证直接泄露（认证门后就是 RCE 仍算 Critical）；"可达"要求**链上每一跳都在样本内可证**（路径、表名、组件行为全部代码内），任一跳依赖样本外（web root 可写、目标装有特定组件、上游权限）→ 记 High 并标"理论链"；凭证直接泄露限定为**可直接动用**的（私钥、数据库/服务账号口令、能伪造会话或签名的 secret），"像凭证但代码内无使用点"按 798 未使用降档
+- High = 注入类 / SSRF / XSS / 越权读写；没有利用链演示的理论 RCE 也记 High；等级按**组合链最坏情形**判，但同样受上一条"样本内可证"约束；Critical 与 High 两可时记 High 并写明理由，不虚高
+- Medium = 信息泄露 / 配置错误 / 有限 DoS / 定义未使用的硬编码凭证
+- Low = 影响极小
+
+---
+
+## 会话约定（以本提示词为准，不要自行增改）
+
+- 首条消息只有这段提示词、没有案例包时：直接给对判别笔记/风险等级的核对意见（有就写，没有只回"就绪"），然后等我发包，不要复述提示词。
+- 输出栏位以上面模板为准：**不新增"排除方向""次要发现"等独立栏位**——排除理由写进对应栏正文，次要发现并入修复栏前正文；自查清单**照常逐条打印**，不要改成静默执行。
+- 样本外假设不得单独支撑"存在漏洞=true"；整个判定悬在外部代码上时，列出需要我补的具体片段（调用点/类定义/函数体/依赖版本），能判的部分照判并标明影响范围。
+
+---
+
+## 输出末尾请自查
+
+- [ ] 每条分析第一行是否是 `### <案例编号> <版本>`？我发的每个案例、每个版本是否都各有一条分析？
+- [ ] 行号是否全部真实存在？变量/函数名是否在代码中出现过？
+- [ ] 判定"有漏洞"时，是否已经逐条排除了防御？
+- [ ] 判定"安全"时，是否已经枚举了全部入口（含非 HTTP 通道）并逐段核验了防御？
+- [ ] 差分对版本A分析是否未引用版本B？结论是否只来自代码本身，而非"两个版本有差异"的暗示？
+- [ ] 依赖样本外代码/环境的判断，是否都标了"样本外假设"？
+- [ ] 多个案例连着分析时，有没有把别的样本的行号/结论串写进来？
+- [ ] 代码看起来不完整时，是否直接向我要缺失部分，而不是猜着补全？
+- [ ] 判"安全"依据参数化时，是否确认覆盖了所有输入可达位（值位之外的表名/列名/排序位没有回退拼接）？
+
+最后：你的回复会被我原样归档进笔记库，请只写代码分析内容本身——不要客套话，不要"以下是分析""希望有帮助"之类的流程性文字。
+
+【代码审计案例包 | diffpair】
+
+### id=diffpair-corpus_00024 lang=python
+#### 版本A（561 行）
+```python
+from __future__ import annotations
+
+import json
+import os
+import re
+import warnings
+from functools import wraps
+
+from dynaconf.utils import extract_json_objects
+from dynaconf.utils import isnamedtupleinstance
+from dynaconf.utils import multi_replace
+from dynaconf.utils import recursively_evaluate_lazy_format
+from dynaconf.utils.boxing import DynaBox
+from dynaconf.utils.functional import empty
+from dynaconf.vendor import toml
+from dynaconf.vendor import tomllib
+
+try:
+    from jinja2 import Environment
+
+    jinja_env = Environment()
+    for p_method in ("abspath", "realpath", "relpath", "dirname", "basename"):
+        jinja_env.filters[p_method] = getattr(os.path, p_method)
+except ImportError:  # pragma: no cover
+    jinja_env = None
+
+true_values = ("t", "true", "enabled", "1", "on", "yes", "True")
+false_values = ("f", "false", "disabled", "0", "off", "no", "False", "")
+
+
+KV_PATTERN = re.compile(r"([a-zA-Z0-9 ]*=[a-zA-Z0-9\- :]*)")
+"""matches `a=b, c=d, e=f` used on `VALUE='@merge foo=bar'` variables."""
+
+
+class DynaconfFormatError(Exception):
+    """Error to raise when formatting a lazy variable fails"""
+
+
+class DynaconfParseError(Exception):
+    """Error to raise when parsing @casts"""
+
+
+class MetaValue:
+    """A Marker to trigger specific actions on `set` and `object_merge`"""
+
+    _meta_value = True
+
+    def __init__(self, value, box_settings):
+        self.box_settings = box_settings
+        self.value = parse_conf_data(
+            value, tomlfy=True, box_settings=box_settings
+        )
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.value}) on {id(self)}"
+
+    def unwrap(self):
+        return self.value
+
+
+class Reset(MetaValue):
+    """Triggers an existing key to be reset to its value
+    NOTE: DEPRECATED on v3.0.0
+    """
+
+    _dynaconf_reset = True
+
+    def __init__(self, value, box_settings):
+        self.box_settings = box_settings
+        self.value = parse_conf_data(
+            value, tomlfy=True, box_settings=self.box_settings
+        )
+        warnings.warn(f"{self.value} does not need `@reset` anymore.")
+
+
+class Del(MetaValue):
+    """Triggers an existing key to be deleted"""
+
+    _dynaconf_del = True
+
+    def unwrap(self):
+        raise ValueError("Del object has no value")
+
+
+class Merge(MetaValue):
+    """Triggers an existing key to be merged"""
+
+    _dynaconf_merge = True
+
+    def __init__(self, value, box_settings, unique=False):
+        if unique:
+            self._dynaconf_merge_unique = True
+
+        self.box_settings = box_settings
+
+        self.value = parse_conf_data(
+            value, tomlfy=True, box_settings=box_settings
+        )
+
+        if isinstance(self.value, (int, float, bool)):
+            # @merge 1, @merge 1.1, @merge False
+            self.value = [self.value]
+        elif isinstance(self.value, str):
+            # @merge {"valid": "json"}
+            json_object = list(
+                extract_json_objects(
+                    multi_replace(
+                        self.value,
+                        {
+                            ": True": ": true",
+                            ":True": ": true",
+                            ": False": ": false",
+                            ":False": ": false",
+                            ": None": ": null",
+                            ":None": ": null",
+                        },
+                    )
+                )
+            )
+            if len(json_object) == 1:
+                self.value = json_object[0]
+            else:
+                matches = KV_PATTERN.findall(self.value)
+                # a=b, c=d
+                if matches:
+                    self.value = {
+                        k.strip(): parse_conf_data(
+                            v, tomlfy=True, box_settings=box_settings
+                        )
+                        for k, v in (
+                            match.strip().split("=") for match in matches
+                        )
+                    }
+                elif "," in self.value:
+                    # @merge foo,bar
+                    self.value = [
+                        parse_conf_data(
+                            v, tomlfy=True, box_settings=box_settings
+                        )
+                        for v in self.value.split(",")
+                    ]
+                else:
+                    # @merge foo
+                    self.value = [self.value]
+
+        self.unique = unique
+
+
+class Insert(MetaValue):
+    """Triggers the value to be inserted into a list at specific index"""
+
+    _dynaconf_insert = True
+
+    def __init__(self, value, box_settings):
+        """
+        normally value will be a string like
+        `0 foo` or `-1 foo` and needs to get split
+        but value can also be just a single string with or without space
+        like `foo` and in this case it will be treated as `0 foo`
+        but it can also be `foo bar` and in this case it will be treated as `0 foo bar`
+        we need to check if the first part is a number
+        if it is not a number then we will treat it as `0 value`
+        if it is a number then we will split it as `index, value`
+        this must use a regex to match value, examples:
+            -1 foo -> index = -1, value = foo
+            0 foo -> index = 0, value = foo
+            0 foo bar -> index = 0, value = foo bar
+            0 42 -> index = 0, value = 42
+            0 42 foo -> index = 0, value = 42 foo
+            foo -> index = 0, value = foo
+            foo bar -> index = 0, value = foo bar
+            42 -> index = 0, value = 42
+            42 foo -> index = 42, value = foo
+            42 foo bar -> index = 42, value = foo bar
+        """
+        self.box_settings = box_settings
+
+        try:
+            if value.lstrip("-+")[0].isdigit():
+                # `0 foo` or `-1 foo` or `42 foo` or `42`(raise ValueError)
+                index, value = value.split(" ", 1)
+            else:
+                # `foo` or `foo bar`
+                index, value = 0, value
+        except ValueError:
+            # `42` or any other non split able value
+            index, value = 0, value
+
+        self.index = int(index)
+        self.value = parse_conf_data(
+            value, tomlfy=True, box_settings=box_settings
+        )
+
+
+class BaseFormatter:
+    def __init__(self, function, token):
+        self.function = function
+        self.token = token
+
+    def __call__(self, value, **context):
+        try:
+            return self.function(value, **context)
+        except (KeyError, AttributeError) as exc:
+            # A template like `{this.KEY}` failed with AttributeError
+            # Or KeyError in the case of `{env[KEY]}`
+            raise DynaconfFormatError(
+                f"Dynaconf can't interpolate variable because {exc}"
+            ) from exc
+
+    def __str__(self):
+        return str(self.token)
+
+
+def _jinja_formatter(value, **context):
+    if jinja_env is None:  # pragma: no cover
+        raise ImportError(
+            "jinja2 must be installed to enable '@jinja' settings in dynaconf"
+        )
+    return jinja_env.from_string(value).render(**context)
+
+
+def _get_formatter(value, **context):
+    """
+    Invokes settings.get from the annotation in value.
+
+    value can be one of the following:
+
+    @get KEY
+    @get KEY @int
+    @get KEY default_value
+    @get KEY @int default_value
+
+    @marker KEY_TO_LOOKUP @OPTIONAL_CAST OPTIONAL_DEFAULT_VALUE
+
+    key group will match the key
+    cast group will match anything provided after @
+    the default group will match anything between single or double quotes
+    """
+    tokens = value.strip().split()
+    if not tokens or len(tokens) > 3:
+        raise DynaconfFormatError(f"Error parsing {value} malformed syntax.")
+
+    params = {
+        "key": tokens[0],
+        "cast": None,
+        "default": None,
+    }
+    for token in tokens[1:]:
+        if token.startswith("@"):
+            params["cast"] = token
+        else:
+            params["default"] = token
+
+    if not params["default"] and params["key"] not in context["this"]:
+        raise DynaconfParseError(
+            f"Key {params['key']} not found in settings and no default value provided."
+        )
+
+    return context["this"].get(**params)
+
+
+class Formatters:
+    """Dynaconf builtin formatters"""
+
+    python_formatter = BaseFormatter(str.format, "format")
+    jinja_formatter = BaseFormatter(_jinja_formatter, "jinja")
+    get_formatter = BaseFormatter(_get_formatter, "get")
+
+
+class Lazy:
+    """Holds data to format lazily."""
+
+    _dynaconf_lazy_format = True
+
+    def __init__(
+        self, value=empty, formatter=Formatters.python_formatter, casting=None
+    ):
+        self.value = value
+        self.casting = casting
+        # Sometimes a simple function is passed to the formatter.
+        # but on evaluation-time, we may need to access `formatter.token`
+        # so we are wrapping the fn to comply with this interface.
+        if isinstance(formatter, BaseFormatter):
+            self.formatter = formatter
+        else:
+            self.formatter = BaseFormatter(formatter, "lambda")
+
+    @property
+    def context(self):
+        """Builds a context for formatting."""
+        return {"env": os.environ, "this": self.settings}
+
+    def __call__(self, settings, validator_object=None):
+        """LazyValue triggers format lazily."""
+        self.settings = settings
+        self.context["_validator_object"] = validator_object
+        result = self.formatter(self.value, **self.context)
+        if self.casting is not None:
+            result = self.casting(result)
+        return result
+
+    def __str__(self):
+        """Gives string representation for the object."""
+        return str(self.value)
+
+    def __repr__(self):
+        """Give the quoted str representation"""
+        return f"'@{self.formatter} {self.value}'"
+
+    def _dynaconf_encode(self):
+        """Encodes this object values to be serializable to json"""
+        return f"@{self.formatter} {self.value}"
+
+    def set_casting(self, casting):
+        """Set the casting and return the instance."""
+        self.casting = casting
+        return self
+
+
+def try_to_encode(value, callback=str):
+    """Tries to encode a value by verifying existence of `_dynaconf_encode`"""
+    try:
+        return value._dynaconf_encode()
+    except (AttributeError, TypeError):
+        return callback(value)
+
+
+def evaluate_lazy_format(f):
+    """Marks a method on Settings instance to
+    lazily evaluate LazyFormat objects upon access."""
+
+    @wraps(f)
+    def evaluate(settings, *args, **kwargs):
+        value = f(settings, *args, **kwargs)
+        return recursively_evaluate_lazy_format(value, settings)
+
+    return evaluate
+
+
+converters = {
+    "@str": lambda value: value.set_casting(str)
+    if isinstance(value, Lazy)
+    else str(value),
+    "@int": lambda value: value.set_casting(int)
+    if isinstance(value, Lazy)
+    else int(value),
+    "@float": lambda value: value.set_casting(float)
+    if isinstance(value, Lazy)
+    else float(value),
+    "@bool": lambda value: value.set_casting(
+        lambda x: str(x).lower() in true_values
+    )
+    if isinstance(value, Lazy)
+    else str(value).lower() in true_values,
+    "@json": lambda value: value.set_casting(
+        lambda x: json.loads(x.replace("'", '"'))
+    )
+    if isinstance(value, Lazy)
+    else json.loads(value),
+    "@format": lambda value: Lazy(value),
+    "@jinja": lambda value: Lazy(value, formatter=Formatters.jinja_formatter),
+    # Meta Values to trigger pre assignment actions
+    "@reset": Reset,  # @reset is DEPRECATED on v3.0.0
+    "@del": Del,
+    "@merge": Merge,
+    "@merge_unique": lambda value, box_settings: Merge(
+        value, box_settings, unique=True
+    ),
+    "@insert": Insert,
+    "@get": lambda value: Lazy(value, formatter=Formatters.get_formatter),
+    # Special markers to be used as placeholders e.g: in prefilled forms
+    # will always return None when evaluated
+    "@note": lambda value: None,
+    "@comment": lambda value: None,
+    "@null": lambda value: None,
+    "@none": lambda value: None,
+    "@empty": lambda value: empty,
+}
+
+
+def apply_converter(converter_key, value, box_settings):
+    """
+    Get converter and apply it to @value.
+
+    Lazy converters will return Lazy objects for later evaluation.
+    """
+    converter = converters[converter_key]
+    try:
+        converted_value = converter(value, box_settings=box_settings)
+    except TypeError:
+        converted_value = converter(value)
+    return converted_value
+
+
+def add_converter(converter_key, func):
+    """Adds a new converter to the converters dict"""
+    if not converter_key.startswith("@"):
+        converter_key = f"@{converter_key}"
+
+    converters[converter_key] = wraps(func)(
+        lambda value: value.set_casting(func)
+        if isinstance(value, Lazy)
+        else Lazy(
+            value,
+            casting=func,
+            formatter=BaseFormatter(lambda x, **_: x, converter_key),
+        )
+    )
+
+
+def parse_with_toml(data):
+    """Uses TOML syntax to parse data"""
+    try:  # try tomllib first
+        try:
+            return tomllib.loads(f"key={data}")["key"]
+        except (tomllib.TOMLDecodeError, KeyError):
+            return data
+    except UnicodeDecodeError:  # pragma: no cover
+        # fallback to toml (TBR in 4.0.0)
+        try:
+            return toml.loads(f"key={data}")["key"]
+        except (toml.TomlDecodeError, KeyError):
+            return data
+        warnings.warn(
+            "TOML files should have only UTF-8 encoded characters. "
+            "starting on 4.0.0 dynaconf will stop allowing invalid chars.",
+            DeprecationWarning,
+        )
+
+
+def _parse_conf_data(data, tomlfy=False, box_settings=None):
+    """
+    @int @bool @float @json (for lists and dicts)
+    strings does not need converters
+
+    export DYNACONF_DEFAULT_THEME='material'
+    export DYNACONF_DEBUG='@bool True'
+    export DYNACONF_DEBUG_TOOLBAR_ENABLED='@bool False'
+    export DYNACONF_PAGINATION_PER_PAGE='@int 20'
+    export DYNACONF_MONGODB_SETTINGS='@json {"DB": "quokka_db"}'
+    export DYNACONF_ALLOWED_EXTENSIONS='@json ["jpg", "png"]'
+    """
+    # not enforced to not break backwards compatibility with custom loaders
+    box_settings = box_settings or {}
+
+    castenabled = box_settings.get("AUTO_CAST_FOR_DYNACONF", empty)
+    if castenabled is empty:
+        castenabled = (
+            os.environ.get("AUTO_CAST_FOR_DYNACONF", "true").lower()
+            not in false_values
+        )
+
+    if (
+        castenabled
+        and data
+        and isinstance(data, str)
+        and data.startswith(tuple(converters.keys()))
+    ):
+        # Check combination token is used
+        comb_token = re.match(
+            f"^({'|'.join(converters.keys())}) @(jinja|format)",
+            data,
+        )
+        if comb_token:
+            tokens = comb_token.group(0)
+            converter_key_list = tokens.split(" ")
+            value = data.replace(tokens, "").strip()
+        else:
+            parts = data.partition(" ")
+            converter_key_list = [parts[0]]
+            value = parts[-1]
+
+        # Parse the converters iteratively
+        for converter_key in converter_key_list[::-1]:
+            value = apply_converter(converter_key, value, box_settings)
+    else:
+        value = parse_with_toml(data) if tomlfy else data
+
+    if isinstance(value, dict):
+        value = DynaBox(value, box_settings=box_settings)
+
+    return value
+
+
+def parse_conf_data(data, tomlfy=False, box_settings=None):
+    """
+    Apply parsing tokens recursively and return transformed data.
+
+    Strings with lazy parser (e.g, @format) will become Lazy objects.
+    """
+
+    # fix for https://github.com/dynaconf/dynaconf/issues/595
+    if isnamedtupleinstance(data):
+        return data
+
+    # not enforced to not break backwards compatibility with custom loaders
+    box_settings = box_settings or {}
+
+    if isinstance(data, (tuple, list)):
+        # recursively parse each sequence item
+        return [
+            parse_conf_data(item, tomlfy=tomlfy, box_settings=box_settings)
+            for item in data
+        ]
+
+    if isinstance(data, DynaBox):
+        # recursively parse inner dict items
+        # It is important to keep the same object id because
+        # of mutability
+        for k, v in data.items(bypass_eval=True):
+            data[k] = parse_conf_data(
+                v, tomlfy=tomlfy, box_settings=box_settings
+            )
+        return data
+
+    if isinstance(data, dict):
+        # recursively parse inner dict items
+        for k, v in data.items():
+            data[k] = parse_conf_data(
+                v, tomlfy=tomlfy, box_settings=box_settings
+            )
+        return data
+
+    # return parsed string value
+    return _parse_conf_data(data, tomlfy=tomlfy, box_settings=box_settings)
+
+
+def unparse_conf_data(value):
+    if isinstance(value, bool):
+        return f"@bool {value}"
+
+    if isinstance(value, int):
+        return f"@int {value}"
+
+    if isinstance(value, float):
+        return f"@float {value}"
+
+    if isinstance(value, (list, dict)):
+        return f"@json {json.dumps(value)}"
+
+    if isinstance(value, Lazy):
+        return try_to_encode(value)
+
+    if value is None:
+        return "@none "
+
+    return value
+
+
+def boolean_fix(value: str | None):
+    """Gets a value like `True/False` and turns to `true/false`
+    This function exists because of issue #976
+    Toml parser casts booleans from true/false lower case
+    however envvars are usually exported as True/False capitalized
+    by mistake, this helper fixes it for envvars only.
+
+    Assume envvars are always str.
+    """
+    if value and value.strip() in ("True", "False"):
+        return value.lower()
+    return value
+```
+#### 版本B（593 行）
+```python
+from __future__ import annotations
+
+import json
+import os
+import re
+import string
+import warnings
+from functools import wraps
+
+from dynaconf.utils import extract_json_objects
+from dynaconf.utils import isnamedtupleinstance
+from dynaconf.utils import multi_replace
+from dynaconf.utils import recursively_evaluate_lazy_format
+from dynaconf.utils.boxing import DynaBox
+from dynaconf.utils.functional import empty
+from dynaconf.vendor import toml
+from dynaconf.vendor import tomllib
+
+try:
+    import jinja2
+    from jinja2.sandbox import SandboxedEnvironment
+
+    jinja_env = SandboxedEnvironment()
+    for p_method in ("abspath", "realpath", "relpath", "dirname", "basename"):
+        jinja_env.filters[p_method] = getattr(os.path, p_method)
+except ImportError:  # pragma: no cover
+    jinja_env = None
+
+true_values = ("t", "true", "enabled", "1", "on", "yes", "True")
+false_values = ("f", "false", "disabled", "0", "off", "no", "False", "")
+
+
+KV_PATTERN = re.compile(r"([a-zA-Z0-9 ]*=[a-zA-Z0-9\- :]*)")
+"""matches `a=b, c=d, e=f` used on `VALUE='@merge foo=bar'` variables."""
+
+
+class DynaconfFormatError(Exception):
+    """Error to raise when formatting a lazy variable fails"""
+
+
+class DynaconfParseError(Exception):
+    """Error to raise when parsing @casts"""
+
+
+class MetaValue:
+    """A Marker to trigger specific actions on `set` and `object_merge`"""
+
+    _meta_value = True
+
+    def __init__(self, value, box_settings):
+        self.box_settings = box_settings
+        self.value = parse_conf_data(
+            value, tomlfy=True, box_settings=box_settings
+        )
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.value}) on {id(self)}"
+
+    def unwrap(self):
+        return self.value
+
+
+class Reset(MetaValue):
+    """Triggers an existing key to be reset to its value
+    NOTE: DEPRECATED on v3.0.0
+    """
+
+    _dynaconf_reset = True
+
+    def __init__(self, value, box_settings):
+        self.box_settings = box_settings
+        self.value = parse_conf_data(
+            value, tomlfy=True, box_settings=self.box_settings
+        )
+        warnings.warn(f"{self.value} does not need `@reset` anymore.")
+
+
+class Del(MetaValue):
+    """Triggers an existing key to be deleted"""
+
+    _dynaconf_del = True
+
+    def unwrap(self):
+        raise ValueError("Del object has no value")
+
+
+class Merge(MetaValue):
+    """Triggers an existing key to be merged"""
+
+    _dynaconf_merge = True
+
+    def __init__(self, value, box_settings, unique=False):
+        if unique:
+            self._dynaconf_merge_unique = True
+
+        self.box_settings = box_settings
+
+        self.value = parse_conf_data(
+            value, tomlfy=True, box_settings=box_settings
+        )
+
+        if isinstance(self.value, (int, float, bool)):
+            # @merge 1, @merge 1.1, @merge False
+            self.value = [self.value]
+        elif isinstance(self.value, str):
+            # @merge {"valid": "json"}
+            json_object = list(
+                extract_json_objects(
+                    multi_replace(
+                        self.value,
+                        {
+                            ": True": ": true",
+                            ":True": ": true",
+                            ": False": ": false",
+                            ":False": ": false",
+                            ": None": ": null",
+                            ":None": ": null",
+                        },
+                    )
+                )
+            )
+            if len(json_object) == 1:
+                self.value = json_object[0]
+            else:
+                matches = KV_PATTERN.findall(self.value)
+                # a=b, c=d
+                if matches:
+                    self.value = {
+                        k.strip(): parse_conf_data(
+                            v, tomlfy=True, box_settings=box_settings
+                        )
+                        for k, v in (
+                            match.strip().split("=") for match in matches
+                        )
+                    }
+                elif "," in self.value:
+                    # @merge foo,bar
+                    self.value = [
+                        parse_conf_data(
+                            v, tomlfy=True, box_settings=box_settings
+                        )
+                        for v in self.value.split(",")
+                    ]
+                else:
+                    # @merge foo
+                    self.value = [self.value]
+
+        self.unique = unique
+
+
+class Insert(MetaValue):
+    """Triggers the value to be inserted into a list at specific index"""
+
+    _dynaconf_insert = True
+
+    def __init__(self, value, box_settings):
+        """
+        normally value will be a string like
+        `0 foo` or `-1 foo` and needs to get split
+        but value can also be just a single string with or without space
+        like `foo` and in this case it will be treated as `0 foo`
+        but it can also be `foo bar` and in this case it will be treated as `0 foo bar`
+        we need to check if the first part is a number
+        if it is not a number then we will treat it as `0 value`
+        if it is a number then we will split it as `index, value`
+        this must use a regex to match value, examples:
+            -1 foo -> index = -1, value = foo
+            0 foo -> index = 0, value = foo
+            0 foo bar -> index = 0, value = foo bar
+            0 42 -> index = 0, value = 42
+            0 42 foo -> index = 0, value = 42 foo
+            foo -> index = 0, value = foo
+            foo bar -> index = 0, value = foo bar
+            42 -> index = 0, value = 42
+            42 foo -> index = 42, value = foo
+            42 foo bar -> index = 42, value = foo bar
+        """
+        self.box_settings = box_settings
+
+        try:
+            if value.lstrip("-+")[0].isdigit():
+                # `0 foo` or `-1 foo` or `42 foo` or `42`(raise ValueError)
+                index, value = value.split(" ", 1)
+            else:
+                # `foo` or `foo bar`
+                index, value = 0, value
+        except ValueError:
+            # `42` or any other non split able value
+            index, value = 0, value
+
+        self.index = int(index)
+        self.value = parse_conf_data(
+            value, tomlfy=True, box_settings=box_settings
+        )
+
+
+class BaseFormatter:
+    def __init__(self, function, token):
+        self.function = function
+        self.token = token
+
+    def __call__(self, value, **context):
+        try:
+            return self.function(value, **context)
+        except (KeyError, AttributeError) as exc:
+            # A template like `{this.KEY}` failed with AttributeError
+            # Or KeyError in the case of `{env[KEY]}`
+            raise DynaconfFormatError(
+                f"Dynaconf can't interpolate variable because {exc}"
+            ) from exc
+
+    def __str__(self):
+        return str(self.token)
+
+
+def _jinja_formatter(value: str, **context) -> str:
+    if jinja_env is None:  # pragma: no cover
+        raise ImportError(
+            "jinja2 must be installed to enable '@jinja' settings in dynaconf"
+        )
+    try:
+        return jinja_env.from_string(value).render(**context)
+    except jinja2.exceptions.SecurityError:
+        warnings.warn(f"Unsafe access attempt to: {value}")
+        return ""
+
+
+def _get_formatter(value, **context):
+    """
+    Invokes settings.get from the annotation in value.
+
+    value can be one of the following:
+
+    @get KEY
+    @get KEY @int
+    @get KEY default_value
+    @get KEY @int default_value
+
+    @marker KEY_TO_LOOKUP @OPTIONAL_CAST OPTIONAL_DEFAULT_VALUE
+
+    key group will match the key
+    cast group will match anything provided after @
+    the default group will match anything between single or double quotes
+    """
+    tokens = value.strip().split()
+    if not tokens or len(tokens) > 3:
+        raise DynaconfFormatError(f"Error parsing {value} malformed syntax.")
+
+    params = {
+        "key": tokens[0],
+        "cast": None,
+        "default": None,
+    }
+    for token in tokens[1:]:
+        if token.startswith("@"):
+            params["cast"] = token
+        else:
+            params["default"] = token
+
+    if not params["default"] and params["key"] not in context["this"]:
+        raise DynaconfParseError(
+            f"Key {params['key']} not found in settings and no default value provided."
+        )
+
+    return context["this"].get(**params)
+
+
+class SafeFormatter(string.Formatter):
+    def get_field(self, field_name, args, context):
+        self._validate_key_exists(field_name, context)
+        return super().get_field(field_name, args, context)
+
+    def _validate_key_exists(self, field_name: str, context):
+        if not field_name.lower().startswith("this"):
+            return
+        from dynaconf.base import _PUBLIC_PROPERTIES
+
+        field_name = field_name.replace("[", ".")
+        field_name = field_name.replace("]", "")
+        context_name, _, key = field_name.partition(".")
+        # these are accesible by the user, but are not considered setting keys
+        # e.g, settings.current_env
+        if key in _PUBLIC_PROPERTIES:
+            return
+        # allow only existing setting keys
+        if key not in context[context_name]:
+            raise AttributeError(key)
+
+
+def _format_formatter(input: str, **context) -> str:
+    return SafeFormatter().format(input, **context)
+
+
+class Formatters:
+    """Dynaconf builtin formatters"""
+
+    python_formatter = BaseFormatter(_format_formatter, "format")
+    jinja_formatter = BaseFormatter(_jinja_formatter, "jinja")
+    get_formatter = BaseFormatter(_get_formatter, "get")
+
+
+class Lazy:
+    """Holds data to format lazily."""
+
+    _dynaconf_lazy_format = True
+
+    def __init__(
+        self, value=empty, formatter=Formatters.python_formatter, casting=None
+    ):
+        self.value = value
+        self.casting = casting
+        # Sometimes a simple function is passed to the formatter.
+        # but on evaluation-time, we may need to access `formatter.token`
+        # so we are wrapping the fn to comply with this interface.
+        if isinstance(formatter, BaseFormatter):
+            self.formatter = formatter
+        else:
+            self.formatter = BaseFormatter(formatter, "lambda")
+
+    @property
+    def context(self):
+        """Builds a context for formatting."""
+        return {"env": os.environ, "this": self.settings}
+
+    def __call__(self, settings, validator_object=None):
+        """LazyValue triggers format lazily."""
+        self.settings = settings
+        self.context["_validator_object"] = validator_object
+        result = self.formatter(self.value, **self.context)
+        if self.casting is not None:
+            result = self.casting(result)
+        return result
+
+    def __str__(self):
+        """Gives string representation for the object."""
+        return str(self.value)
+
+    def __repr__(self):
+        """Give the quoted str representation"""
+        return f"'@{self.formatter} {self.value}'"
+
+    def _dynaconf_encode(self):
+        """Encodes this object values to be serializable to json"""
+        return f"@{self.formatter} {self.value}"
+
+    def set_casting(self, casting):
+        """Set the casting and return the instance."""
+        self.casting = casting
+        return self
+
+
+def try_to_encode(value, callback=str):
+    """Tries to encode a value by verifying existence of `_dynaconf_encode`"""
+    try:
+        return value._dynaconf_encode()
+    except (AttributeError, TypeError):
+        return callback(value)
+
+
+def evaluate_lazy_format(f):
+    """Marks a method on Settings instance to
+    lazily evaluate LazyFormat objects upon access."""
+
+    @wraps(f)
+    def evaluate(settings, *args, **kwargs):
+        value = f(settings, *args, **kwargs)
+        return recursively_evaluate_lazy_format(value, settings)
+
+    return evaluate
+
+
+converters = {
+    "@str": lambda value: value.set_casting(str)
+    if isinstance(value, Lazy)
+    else str(value),
+    "@int": lambda value: value.set_casting(int)
+    if isinstance(value, Lazy)
+    else int(value),
+    "@float": lambda value: value.set_casting(float)
+    if isinstance(value, Lazy)
+    else float(value),
+    "@bool": lambda value: value.set_casting(
+        lambda x: str(x).lower() in true_values
+    )
+    if isinstance(value, Lazy)
+    else str(value).lower() in true_values,
+    "@json": lambda value: value.set_casting(
+        lambda x: json.loads(x.replace("'", '"'))
+    )
+    if isinstance(value, Lazy)
+    else json.loads(value),
+    "@format": lambda value: Lazy(value),
+    "@jinja": lambda value: Lazy(value, formatter=Formatters.jinja_formatter),
+    # Meta Values to trigger pre assignment actions
+    "@reset": Reset,  # @reset is DEPRECATED on v3.0.0
+    "@del": Del,
+    "@merge": Merge,
+    "@merge_unique": lambda value, box_settings: Merge(
+        value, box_settings, unique=True
+    ),
+    "@insert": Insert,
+    "@get": lambda value: Lazy(value, formatter=Formatters.get_formatter),
+    # Special markers to be used as placeholders e.g: in prefilled forms
+    # will always return None when evaluated
+    "@note": lambda value: None,
+    "@comment": lambda value: None,
+    "@null": lambda value: None,
+    "@none": lambda value: None,
+    "@empty": lambda value: empty,
+}
+
+
+def apply_converter(converter_key, value, box_settings):
+    """
+    Get converter and apply it to @value.
+
+    Lazy converters will return Lazy objects for later evaluation.
+    """
+    converter = converters[converter_key]
+    try:
+        converted_value = converter(value, box_settings=box_settings)
+    except TypeError:
+        converted_value = converter(value)
+    return converted_value
+
+
+def add_converter(converter_key, func):
+    """Adds a new converter to the converters dict"""
+    if not converter_key.startswith("@"):
+        converter_key = f"@{converter_key}"
+
+    converters[converter_key] = wraps(func)(
+        lambda value: value.set_casting(func)
+        if isinstance(value, Lazy)
+        else Lazy(
+            value,
+            casting=func,
+            formatter=BaseFormatter(lambda x, **_: x, converter_key),
+        )
+    )
+
+
+def parse_with_toml(data):
+    """Uses TOML syntax to parse data"""
+    try:  # try tomllib first
+        try:
+            return tomllib.loads(f"key={data}")["key"]
+        except (tomllib.TOMLDecodeError, KeyError):
+            return data
+    except UnicodeDecodeError:  # pragma: no cover
+        # fallback to toml (TBR in 4.0.0)
+        try:
+            return toml.loads(f"key={data}")["key"]
+        except (toml.TomlDecodeError, KeyError):
+            return data
+        warnings.warn(
+            "TOML files should have only UTF-8 encoded characters. "
+            "starting on 4.0.0 dynaconf will stop allowing invalid chars.",
+            DeprecationWarning,
+        )
+
+
+def _parse_conf_data(data, tomlfy=False, box_settings=None):
+    """
+    @int @bool @float @json (for lists and dicts)
+    strings does not need converters
+
+    export DYNACONF_DEFAULT_THEME='material'
+    export DYNACONF_DEBUG='@bool True'
+    export DYNACONF_DEBUG_TOOLBAR_ENABLED='@bool False'
+    export DYNACONF_PAGINATION_PER_PAGE='@int 20'
+    export DYNACONF_MONGODB_SETTINGS='@json {"DB": "quokka_db"}'
+    export DYNACONF_ALLOWED_EXTENSIONS='@json ["jpg", "png"]'
+    """
+    # not enforced to not break backwards compatibility with custom loaders
+    box_settings = box_settings or {}
+
+    castenabled = box_settings.get("AUTO_CAST_FOR_DYNACONF", empty)
+    if castenabled is empty:
+        castenabled = (
+            os.environ.get("AUTO_CAST_FOR_DYNACONF", "true").lower()
+            not in false_values
+        )
+
+    if (
+        castenabled
+        and data
+        and isinstance(data, str)
+        and data.startswith(tuple(converters.keys()))
+    ):
+        # Check combination token is used
+        comb_token = re.match(
+            f"^({'|'.join(converters.keys())}) @(jinja|format)",
+            data,
+        )
+        if comb_token:
+            tokens = comb_token.group(0)
+            converter_key_list = tokens.split(" ")
+            value = data.replace(tokens, "").strip()
+        else:
+            parts = data.partition(" ")
+            converter_key_list = [parts[0]]
+            value = parts[-1]
+
+        # Parse the converters iteratively
+        for converter_key in converter_key_list[::-1]:
+            value = apply_converter(converter_key, value, box_settings)
+    else:
+        value = parse_with_toml(data) if tomlfy else data
+
+    if isinstance(value, dict):
+        value = DynaBox(value, box_settings=box_settings)
+
+    return value
+
+
+def parse_conf_data(data, tomlfy=False, box_settings=None):
+    """
+    Apply parsing tokens recursively and return transformed data.
+
+    Strings with lazy parser (e.g, @format) will become Lazy objects.
+    """
+
+    # fix for https://github.com/dynaconf/dynaconf/issues/595
+    if isnamedtupleinstance(data):
+        return data
+
+    # not enforced to not break backwards compatibility with custom loaders
+    box_settings = box_settings or {}
+
+    if isinstance(data, (tuple, list)):
+        # recursively parse each sequence item
+        return [
+            parse_conf_data(item, tomlfy=tomlfy, box_settings=box_settings)
+            for item in data
+        ]
+
+    if isinstance(data, DynaBox):
+        # recursively parse inner dict items
+        # It is important to keep the same object id because
+        # of mutability
+        for k, v in data.items(bypass_eval=True):
+            data[k] = parse_conf_data(
+                v, tomlfy=tomlfy, box_settings=box_settings
+            )
+        return data
+
+    if isinstance(data, dict):
+        # recursively parse inner dict items
+        for k, v in data.items():
+            data[k] = parse_conf_data(
+                v, tomlfy=tomlfy, box_settings=box_settings
+            )
+        return data
+
+    # return parsed string value
+    return _parse_conf_data(data, tomlfy=tomlfy, box_settings=box_settings)
+
+
+def unparse_conf_data(value):
+    if isinstance(value, bool):
+        return f"@bool {value}"
+
+    if isinstance(value, int):
+        return f"@int {value}"
+
+    if isinstance(value, float):
+        return f"@float {value}"
+
+    if isinstance(value, (list, dict)):
+        return f"@json {json.dumps(value)}"
+
+    if isinstance(value, Lazy):
+        return try_to_encode(value)
+
+    if value is None:
+        return "@none "
+
+    return value
+
+
+def boolean_fix(value: str | None):
+    """Gets a value like `True/False` and turns to `true/false`
+    This function exists because of issue #976
+    Toml parser casts booleans from true/false lower case
+    however envvars are usually exported as True/False capitalized
+    by mistake, this helper fixes it for envvars only.
+
+    Assume envvars are always str.
+    """
+    if value and value.strip() in ("True", "False"):
+        return value.lower()
+    return value
+```
