@@ -44,7 +44,8 @@ PROJECT_DIR_HINTS = ["ZaoZao", "Graduation-Project"]
 BACKEND_PORTS = [8765]                            # 后端监听端口
 # 本项目直接/间接依赖的顶层包名（pip uninstall 用）
 PIP_PACKAGES = [
-    "graduation-project",
+    "zaozao",              # 仓库更名后的分发包名（pyproject.toml name）
+    "graduation-project",  # 历史包名（兼容旧安装）
     "sentence-transformers",
     "chromadb",
     "tree-sitter",
@@ -489,9 +490,11 @@ def uninstall_python_deps(ui: UI):
         installed.add(name)
     # 老版本 pip 对本地可编辑安装（pip install -e .）可能只输出 "-e file:///..."，
     # 这里用 pip show 兜底，确保本项目包本身能被识别并卸载
-    r2 = run([sys.executable, "-m", "pip", "show", "graduation-project"], timeout=30)
-    if r2.returncode == 0:
-        installed.add("graduation-project")
+    # 仓库 2026-09 更名 ZaoZao：分发包名 graduation-project → zaozao，两者都查
+    for _dist_name in ("zaozao", "graduation-project"):
+        r2 = run([sys.executable, "-m", "pip", "show", _dist_name], timeout=30)
+        if r2.returncode == 0:
+            installed.add(_dist_name)
 
     to_remove = []
     for pkg in PIP_PACKAGES + PIP_OPTIONAL:
@@ -644,20 +647,21 @@ def remove_editor_plugins(ui: UI):
         ui.warn("模拟模式：跳过编辑器插件清理")
         return
 
-    # VS Code：优先用 code CLI 卸载（插件 ID: graduation-project.vuln-scanner）
-    ext_id = "graduation-project.vuln-scanner"
+    # VS Code：优先用 code CLI 卸载（2026-09 发布者更名 graduation-project → zaozao，两个 ID 都尝试）
+    ext_ids = ["zaozao.vuln-scanner", "graduation-project.vuln-scanner"]
     code_cli = None
     for c in ["code", "code-insiders", "codium", "cursor"]:
         if which(c):
             code_cli = c
             break
     if code_cli:
-        if ui.confirm(f"通过 {code_cli} CLI 卸载 VS Code 扩展 {ext_id}"):
-            r = run([code_cli, "--uninstall-extension", ext_id], timeout=120)
-            if r.returncode == 0:
-                ui.ok(f"已卸载 VS Code 扩展 {ext_id}")
-            else:
-                ui.warn("VS Code 扩展卸载命令未成功，可手动在扩展面板卸载")
+        for ext_id in ext_ids:
+            if ui.confirm(f"通过 {code_cli} CLI 卸载 VS Code 扩展 {ext_id}（若存在）"):
+                r = run([code_cli, "--uninstall-extension", ext_id], timeout=120)
+                if r.returncode == 0:
+                    ui.ok(f"已卸载 VS Code 扩展 {ext_id}")
+                else:
+                    ui.warn(f"{ext_id} 未安装或卸载未成功，可手动在扩展面板卸载")
     else:
         ui.ok("未检测到 code CLI，跳过 VS Code 扩展卸载（可在扩展面板手动卸载）")
 

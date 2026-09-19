@@ -466,10 +466,16 @@
     renderAvailableRow: function (m) {
       var depBadge = m.deprecated ? '<span class="text-[10px] px-1.5 py-0.5 rounded ml-1.5" style="background: color-mix(in srgb, var(--vuln-state-warning) 15%, transparent); color: var(--vuln-state-warning)">已过时</span>' : '';
       var defaultTag = m.is_default ? '<span class="text-[10px] px-1.5 py-0.5 rounded ml-1.5" style="background: color-mix(in srgb, var(--vuln-brand) 12%, transparent); color: var(--vuln-brand)">推荐</span>' : '';
+      // 本地 LoRA adapter 形态（distribution == 'transformers'，如 Nivis-α0.5）
+      // 未发布到 Ollama Registry，不能在线拉取：显示静态标识而非「拉取」按钮。
+      var localOnly = m.distribution === 'transformers';
+      var localBadge = localOnly ? '<span class="text-[10px] px-1.5 py-0.5 rounded ml-1.5" style="background: color-mix(in srgb, var(--vuln-state-warning) 15%, transparent); color: var(--vuln-state-warning)">本地 LoRA</span>' : '';
       var prog = this._pullProgress[m.full_name];
       var isPulling = !!this._pulling[m.full_name];
       var btnArea;
-      if (isPulling) {
+      if (localOnly) {
+        btnArea = '<span class="text-[11px] leading-tight text-right block" style="color: var(--vuln-ink-3)">随本地 LoRA<br>adapter 分发</span>';
+      } else if (isPulling) {
         var p = prog || { pct: 0, status: '准备拉取…' };
         btnArea = this.renderProgress(p.pct, p.status, false);
       } else if (prog && prog.error) {
@@ -480,7 +486,7 @@
       return '<div class="p-3 rounded-lg" style="background: var(--vuln-surface-2);">' +
         '<div class="flex items-start justify-between gap-2">' +
           '<div class="min-w-0 flex-1">' +
-            '<div class="text-sm font-medium" style="color: var(--vuln-ink)">' + this.esc(m.display_name) + defaultTag + depBadge + '</div>' +
+            '<div class="text-sm font-medium" style="color: var(--vuln-ink)">' + this.esc(m.display_name) + defaultTag + depBadge + localBadge + '</div>' +
             (m.description ? '<div class="text-[11px] mt-0.5" style="color: var(--vuln-ink-3)">' + this.esc(m.description) + '</div>' : '') +
             '<div class="text-[11px] mt-0.5 font-mono" style="color: var(--vuln-ink-3)">' + this.esc(m.full_name) + '</div>' +
             (prog && prog.error ? '<div class="text-[11px] mt-1" style="color: var(--vuln-state-error)">' + this.esc(prog.error) + '</div>' : '') +

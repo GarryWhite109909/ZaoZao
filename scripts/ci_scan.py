@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# 项目根目录（Graduation-Project/）
+# 项目根目录（目录名通常为 ZaoZao，历史名 Graduation-Project；以 pyproject.toml 为锚点，与目录名解耦）
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -43,8 +43,10 @@ if str(PROJECT_ROOT) not in sys.path:
 # 默认模型 / 回退模型（与项目其余入口保持一致，支持环境变量覆盖）
 try:
     from app.backend.services.model_registry import get_default_model as _get_default_model
+    from graduation_project.transformers_client import resolve_default_backend as _resolve_default_backend
+    # 与后端服务 scanner.py 同口径：transformers/vllm 用本地 LoRA 形态 α0.5，ollama 用已发布的 v9max
     DEFAULT_MODEL = os.environ.get(
-        "VULN_SCANNER_MODEL", _get_default_model(),
+        "VULN_SCANNER_MODEL", _get_default_model(_resolve_default_backend()),
     )
 except Exception:
     DEFAULT_MODEL = os.environ.get(
@@ -341,7 +343,7 @@ def render_comment(results: list[dict], summary: dict) -> str:
 
     lines.append("---")
     lines.append(
-        f"*由 Graduation-Project 漏洞扫描器自动生成 | 模型 `{summary.get('model', 'N/A')}` "
+        f"*由 凿凿（ZaoZao）漏洞扫描器自动生成 | 模型 `{summary.get('model', 'N/A')}` "
         f"| 耗时 {summary.get('duration', 0)}s | 此评论仅供参考*"
     )
     lines.append("")
@@ -361,7 +363,7 @@ def render_warning(message: str, fmt: str) -> str:
             "本次扫描已跳过，不会阻断 PR 合并。可重新触发 CI 或检查配置后重试。",
             "",
             "---",
-            "*由 Graduation-Project 漏洞扫描器自动生成 | 此评论仅供参考*",
+            "*由 凿凿（ZaoZao）漏洞扫描器自动生成 | 此评论仅供参考*",
             "",
         ]
         return "\n".join(lines)

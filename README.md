@@ -499,7 +499,7 @@ IntelliJ 插件提供编辑器内选中代码的扫描功能，结果以气球�
 4. Ollama 本体：Windows（winget/官方卸载器）、macOS（Homebrew/官方 App）、Linux（apt/dnf/pacman/zypper/apk/官方脚本）；
 5. Linux 系统级 CUDA / ROCm 组件（需 sudo，仅 apt 系发行版）；
 6. 本地运行数据：`data/chroma_db`、`outputs/`、`logs/`、`__pycache__`、`*.egg-info`、`.pytest_cache`、HuggingFace/torch/chroma 缓存等；
-7. 已安装的 VS Code 扩展（`graduation-project.vuln-scanner`）与 IntelliJ 插件（尽力而为）；
+7. 已安装的 VS Code 扩展（`zaozao.vuln-scanner`）与 IntelliJ 插件（尽力而为）；
 8. 整个项目文件夹（Windows 下同样有效）。
 
 ### 不会自动删除的内容

@@ -81,12 +81,12 @@ class VLLMClient:
         Args:
             base_url: vLLM 服务地址（不含 /v1 后缀，默认 http://localhost:8000）
             model: 模型名称（vLLM 启动时通过 --served-model-name 指定，需与服务端一致）。
-                   默认 None 时从注册表取 `get_default_model()`（当前为 Nivis-α0），
+                   默认 None 时从注册表取 `get_default_model("vllm")`（Nivis-α0.5 本地 LoRA 形态），
                    避免与 Web 默认模型漂移。
         """
         if model is None:
             from app.backend.services.model_registry import get_default_model
-            model = get_default_model()
+            model = get_default_model("vllm")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_base = f"{self.base_url}/v1"
@@ -460,7 +460,7 @@ def create_llm_client(backend: str = "ollama", **kwargs) -> Union["OllamaClient"
 if __name__ == "__main__":
     # 使用 vLLM 后端测试
     from app.backend.services.model_registry import get_default_model
-    client = VLLMClient(model=get_default_model())
+    client = VLLMClient(model=get_default_model("vllm"))
 
     # 检查连接
     if not client.check_connection():
@@ -491,7 +491,7 @@ def get_user(username):
     # 测试工厂函数
     print("\n--- 测试工厂函数 ---")
     try:
-        vllm_via_factory = create_llm_client(backend="vllm", model=get_default_model())
+        vllm_via_factory = create_llm_client(backend="vllm", model=get_default_model("vllm"))
         print(f"工厂函数创建 VLLMClient 成功: {type(vllm_via_factory).__name__}")
     except Exception as e:
         print(f"工厂函数创建失败: {e}")

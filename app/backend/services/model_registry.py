@@ -32,6 +32,17 @@ NAMESPACE = "garrywhite109909"
 REPO = "graduation-vuln-scanner"
 
 # ---------------------------------------------------------------------------
+# 分发形态常量
+# ---------------------------------------------------------------------------
+# Ollama Registry 公开发布、可 `ollama pull` 的默认模型（GGUF Q4_K_M，约 5GB）。
+# 一键启动的干净机器走 Ollama 后端时自动拉取的就是它。
+DEFAULT_OLLAMA_MODEL = f"{NAMESPACE}/{REPO}:v9max"
+# 进程内后端（transformers / vLLM）配合本地 LoRA adapter 的默认模型标识。
+# 该形态不发布到 Ollama Registry（权重 = 本地基座 + models/ 下的 LoRA adapter），
+# 仅用于选择与 α0.5 训练一致的 ALPHA05_PROMPT，不能被 ollama pull。
+DEFAULT_TRANSFORMERS_MODEL = f"{NAMESPACE}/nivis-alpha05"
+
+# ---------------------------------------------------------------------------
 # 已登记模型（未来 Nivis-alpha.1 训练完后在此添加即可）
 # ---------------------------------------------------------------------------
 # 2026-08-15: α0.5 训练数据（final_train_chatml_alpha05.jsonl）使用 ALPHA05_PROMPT，
@@ -51,6 +62,7 @@ _REGISTRY: list[dict] = [
         "prompt_variant": "v3",
         "is_default": False,   # α0.5 已上线为默认（transformers 形态保持 LoRA FP16 精度），α0 降为过渡对照
         "deprecated": False,
+        "distribution": "ollama",  # 已发布到 Ollama Registry，可在线拉取
     },
     {
         "tag": "alpha05",
@@ -58,19 +70,24 @@ _REGISTRY: list[dict] = [
         "display_name": "Nivis-α0.5",
         "description": "Qwen3-8B + rsLoRA(r8) 训练，数据 final_train_chatml_alpha05.jsonl（7953 条，"
                        "统一 ALPHA05_PROMPT，含盲区/痛点/归因/真实CVE 补充，泄露门禁+审计 PASS）。"
-                       "精简 prompt(1467字) 替代 V3_PROMPT(4448字)，训练/推理一致。",
+                       "精简 prompt(1467字) 替代 V3_PROMPT(4448字)，训练/推理一致。"
+                       "本形态仅随本地 LoRA adapter 分发（transformers 进程内后端），不在 Ollama Registry 发布。",
         "prompt_variant": "alpha05",
-        "is_default": True,    # 默认已切 α0.5：transformers 进程内 + LoRA adapter（保留最大精度，见 discover_adapter_dir）
+        "is_default": False,   # Ollama 一键启动默认 v9max；α0.5 仅在本机存在 adapter 时由 transformers 后端自动选用
         "deprecated": False,
+        "distribution": "transformers",  # 本地 LoRA adapter 形态，不能 ollama pull
     },
     {
         "tag": "v9max",
         "full_name": f"{NAMESPACE}/{REPO}:v9max",
         "display_name": "Nivis v9max",
-        "description": "三模型蒸馏 + A800 云端训练。论文口径当前已发布最佳：合成集 recall 1.0，CVE-fix recall 0.95（均为 HF NF4+FP16 LoRA 评估管道口径；Ollama Q4_K_M 发布形态下合成集 recall 0.951 / FPR 0.077，CVE-fix recall 0.75~0.79）。默认活动模型已切换为 Nivis-α0（未评估）。",
+        "description": "三模型蒸馏 + A800 云端训练。论文口径当前公开发布的最佳模型：Ollama Q4_K_M 发布形态下"
+                       "合成集 recall 0.951 / FPR 0.077，CVE-fix recall 0.75~0.79（HF NF4+FP16 LoRA 评估管道口径"
+                       "为合成集 recall 1.0、CVE-fix recall 0.95）。一键启动默认自动拉取本模型。",
         "prompt_variant": "v3",
-        "is_default": False,
+        "is_default": True,    # Ollama 后端（一键启动形态）默认模型
         "deprecated": False,
+        "distribution": "ollama",
     },
     {
         "tag": "v5",
@@ -80,6 +97,7 @@ _REGISTRY: list[dict] = [
         "prompt_variant": "v3",
         "is_default": False,
         "deprecated": True,
+        "distribution": "ollama",
     },
     # ------------------------------------------------------------------
     # Ollama 官方库对照模型（未微调，供多模型交叉验证 / 对照实验）
@@ -94,6 +112,7 @@ _REGISTRY: list[dict] = [
         "prompt_variant": "v3",
         "is_default": False,
         "deprecated": False,
+        "distribution": "ollama",
     },
     {
         "tag": "gemma4:12b",
@@ -103,6 +122,7 @@ _REGISTRY: list[dict] = [
         "prompt_variant": "v3",
         "is_default": False,
         "deprecated": False,
+        "distribution": "ollama",
     },
     {
         "tag": "qwen3.5:4b",
@@ -112,6 +132,7 @@ _REGISTRY: list[dict] = [
         "prompt_variant": "v3",
         "is_default": False,
         "deprecated": False,
+        "distribution": "ollama",
     },
     {
         "tag": "qwen3.5:9b",
@@ -121,6 +142,7 @@ _REGISTRY: list[dict] = [
         "prompt_variant": "v3",
         "is_default": False,
         "deprecated": False,
+        "distribution": "ollama",
     },
     {
         "tag": "qwen3.5:27b",
@@ -130,6 +152,7 @@ _REGISTRY: list[dict] = [
         "prompt_variant": "v3",
         "is_default": False,
         "deprecated": False,
+        "distribution": "ollama",
     },
     {
         "tag": "qwen3.5:35b-a3b",
@@ -139,6 +162,7 @@ _REGISTRY: list[dict] = [
         "prompt_variant": "v3",
         "is_default": False,
         "deprecated": False,
+        "distribution": "ollama",
     },
 ]
 
@@ -179,12 +203,32 @@ def get_prompt_for_model(full_name: str) -> str:
     return _get_prompt(variant)
 
 
-def get_default_model() -> str:
-    """返回默认模型全名。"""
-    for m in _REGISTRY:
-        if m["is_default"]:
-            return m["full_name"]
-    return _REGISTRY[0]["full_name"] if _REGISTRY else f"{NAMESPACE}/{REPO}:v9max"
+def get_default_model(backend: Optional[str] = None) -> str:
+    """返回默认模型全名（按推理后端区分）。
+
+    Args:
+        backend: 推理后端类型。
+            - "transformers" / "vllm"：返回 α0.5（本地 LoRA adapter 形态，
+              权重由 models/ 下 adapter 提供，prompt 用 ALPHA05_PROMPT）。
+            - "ollama" / "llamacpp" / None：返回已公开发布到 Ollama Registry 的
+              v9max（一键启动可自动拉取，GGUF Q4_K_M，prompt 用 V3_PROMPT）。
+
+    干净机器（无 adapter）一键启动走 Ollama 后端，默认模型必须是 Registry 上
+    真实存在、可 `ollama pull` 的模型，否则会静默回退到未微调的官方 qwen3:8b。
+    """
+    if backend in ("transformers", "vllm"):
+        return DEFAULT_TRANSFORMERS_MODEL
+    return DEFAULT_OLLAMA_MODEL
+
+
+def is_ollama_published(full_name: str) -> bool:
+    """模型是否已发布到 Ollama Registry（可否在线拉取）。
+
+    distribution == "transformers" 的条目（如 α0.5）只随本地 LoRA adapter 分发，
+    禁止前端「拉取」按钮与后端 pull 端点对其发起 ollama pull（必然失败）。
+    """
+    info = get_model_info(full_name)
+    return bool(info) and info.get("distribution", "ollama") == "ollama"
 
 
 def is_allowed(full_name: str) -> bool:

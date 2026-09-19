@@ -15,7 +15,7 @@ from typing import Optional
 
 
 def find_project_root(anchor: Optional[Path] = None) -> Path:
-    """定位项目根目录（Graduation-Project/）。
+    """定位项目根目录（目录名通常为 ZaoZao，历史名 Graduation-Project）。
 
     策略：
         1. 已设置 VULN_SCANNER_ROOT 环境变量时直接采用
