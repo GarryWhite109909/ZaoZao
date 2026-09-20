@@ -101,6 +101,13 @@ _BODY_TYPES = {
 # 单作用域最多输出路径数
 _MAX_PATHS_PER_SCOPE = 50
 
+# 复合赋值操作符 token（tree-sitter 中匿名节点，type 即字面量）。
+# 三语言同构：PHP .= / JS += / Python +=（augmented_assignment[_expression]）
+_AUG_ASSIGN_OPS = {
+    "+=", "-=", "*=", "/=", "%=", ".=", "**=",
+    "<<=", ">>=", "&=", "|=", "^=", "&&=", "||=", "??=",
+}
+
 
 # ---------------------------------------------------------------------------
 # Source 模式（按语言）—— 用户可控输入点
@@ -239,6 +246,12 @@ _SINK_DEFINITIONS: list[tuple[str, str]] = [
     ("passthru(", "Command Injection"),
     ("proc_open(", "Command Injection"),
     ("curl_exec(", "SSRF"),                        # PHP curl 发起请求
+    # dompdf 渲染入口（2026-09-20，php-goof 审计）：Dompdf\Dompdf 的核心 API，
+    # 用户可控 HTML 经 loadHtml 进入渲染管线后可注入标记/脚本，且配套
+    # setIsRemoteEnabled(true) 时会按注入内容发起远程请求（SSRF 面）。
+    # 收录标准与 ->query( 相同：dompdf 是 PHP PDF 生态事实标准，loadHtml 是
+    # 其专有方法名（语言级事实）；taint 门保证只有用户输入流入才报。
+    ("->loadHtml(", "XSS"),
     # --- 无歧义族 sink（2026-08-31，与 prefilter 同形态 → 升级为链级证据）---
     # 目的不是新增召回（prefilter 已覆盖），而是让这些族也能拿到 source→sink
     # 链级高信任证据（§五之三 信任标注按证据类型分级：链级 > 位置型/正则）。
@@ -312,6 +325,7 @@ _SINK_LANG_ONLY: dict[str, set[str]] = {
     "file_get_contents(": {"php"}, "shell_exec(": {"php"},
     "passthru(": {"php"}, "proc_open(": {"php"}, "curl_exec(": {"php"},
     "ldap_search(": {"php"},
+    "->loadHtml(": {"php"},
     # Python 专有
     "search_s(": {"python"}, "urlopen(": {"python"}, "urlretrieve(": {"python"},
     # JS/TS 专有（Python 的同名 urllib 已由上面两条覆盖；Node 的 http 模块名与
@@ -857,7 +871,8 @@ class TaintTracker:
             for c in stmt.children:
                 if c.type in (
                     "assignment", "augmented_assignment", "named_expression",
-                    "assignment_expression", "call", "yield",
+                    "assignment_expression", "augmented_assignment_expression",
+                    "call", "yield",
                 ):
                     if c.type == "call":
                         break
@@ -870,6 +885,24 @@ class TaintTracker:
                 rhs = text_clean[m.end():].strip().rstrip(";")
                 return [(m.group(1), rhs)]
             return []
+
+        if t in ("augmented_assignment_expression", "augmented_assignment"):
+            # 复合赋值（.= / += 等，2026-09-20 补）：三语言同构
+            # [target, 操作符token, value]。语义上 target OP value 等价于
+            # target = target OP value，故把右值合成为「目标文本 + 右操作数文本」：
+            # 目标上的既有污点保留（$html 已污染后 .= 常量不丢污点）、右操作数的
+            # 新污点进入（$html .= $_GET[...] 建链）。php-goof pdf.php 实锤：
+            # 此前 PHP .= / JS += / Python += 的污点链全部断裂。
+            target = next((c for c in stmt.children if c.type in (
+                "identifier", "variable_name", "attribute", "subscript",
+                "member_expression", "field_access")), None)
+            val = next((c for c in stmt.children
+                        if c not in (target,)
+                        and c.type not in _AUG_ASSIGN_OPS), None)
+            if target is None or val is None:
+                return []
+            tg = self._node_text(target, code_bytes)
+            return [(tg, tg + " " + self._node_text(val, code_bytes))]
 
         if t in ("assignment", "augmented_assignment"):
             children = stmt.children

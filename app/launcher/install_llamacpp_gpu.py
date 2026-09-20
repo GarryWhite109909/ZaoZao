@@ -241,9 +241,19 @@ def compile_install(plan: Dict, python_executable: str, dry_run: bool) -> bool:
         cmd = [python_executable, "-m", "pip", "install", "--upgrade",
                "--no-cache-dir", "llama-cpp-python"]
         print(f"  $ {' '.join(cmd)}")
-        if not dry_run:
-            _run(cmd, dry_run)
-            return _is_gpu_supported()
+        if dry_run:
+            return True
+        _run(cmd, dry_run)
+        # 成功标准 = llama_cpp 可导入。CPU-only 构建不支持 GPU offload 是正常
+        # 状态，不能拿 _is_gpu_supported() 判成败（否则无 GPU 机器装完反而被
+        # 报"GPU 编译/校验未通过"）；GPU 机器走下方 needs_build 源码编译分支。
+        try:
+            import importlib
+            importlib.import_module("llama_cpp")
+        except Exception:
+            print("    ❌ llama-cpp-python 安装后无法导入（见上方 pip 日志排查）。")
+            return False
+        print("    ✅ llama-cpp-python（CPU wheel）安装完成")
         return True
 
     print(f"\n[安装] 从源码编译 llama-cpp-python（{plan['label']}）...")

@@ -78,17 +78,22 @@ def resolve_backend() -> str:
     return resolve_default_backend()
 
 
-def migrate_ollama_models_to_project() -> Optional[str]:
+def migrate_ollama_models_to_project(extra_candidates: Optional[list[str]] = None) -> Optional[str]:
     """把 C 盘/外部的 Ollama 模型存储剪切到项目 models/ollama（现行分类标准）。
 
     规则：
-    - 候选源：OLLAMA_MODELS 指向的位置 + ~/.ollama/models（兼容默认 C 盘）；
+    - 候选源：extra_candidates（调用方在覆写前捕获的用户原 OLLAMA_MODELS）
+      + 当前 OLLAMA_MODELS + ~/.ollama/models（兼容默认 C 盘）；
     - 源目录有内容（含未下载完的 partial）就整体迁移，C 盘不留任何模型文件；
     - Ollama 服务正在运行时跳过并提示先退出（Windows 文件锁会失败/损坏运行中的服务）。
     OLLAMA_MODELS 由调用方在启动前锁定到项目目录，保证后续 pull 不写 C 盘。
     """
     dst = ollama_models_dir()
     candidates: list[Path] = []
+    for raw in list(extra_candidates or []):
+        raw = (raw or "").strip()
+        if raw:
+            candidates.append(Path(raw).expanduser())
     env_val = os.environ.get("OLLAMA_MODELS", "").strip()
     if env_val:
         candidates.append(Path(env_val).expanduser())
@@ -626,10 +631,12 @@ def kill_process_on_port(port: int) -> bool:
                     break
             if target_pid and target_pid.isdigit():
                 print(f"[启动器] 端口 {port} 被 PID {target_pid} 占用。")
-                answer = input("该进程可能不是本程序（例如其他服务），是否强制结束？[y/N]: ").strip().lower()
-                if answer not in ("y", "yes"):
-                    print("[启动器] 已取消释放端口，请手动关闭占用程序后重试。")
-                    return False
+                # 非交互式环境（CI/后台）无法确认，视为允许释放（与下方 Unix 分支同口径）
+                if sys.stdin.isatty():
+                    answer = input("该进程可能不是本程序（例如其他服务），是否强制结束？[y/N]: ").strip().lower()
+                    if answer not in ("y", "yes"):
+                        print("[启动器] 已取消释放端口，请手动关闭占用程序后重试。")
+                        return False
                 print(f"[启动器] 尝试结束 PID {target_pid} ...")
                 stop = subprocess.run(
                     ["taskkill", "/F", "/PID", target_pid],
@@ -1463,6 +1470,20 @@ def print_hardware_summary(hardware: dict, config: dict) -> None:
         print(f"[硬件检测] ⚠️ {config['warning']}")
 
 
+def _pause_before_exit() -> None:
+    """错误退出前等待用户回车。
+
+    非交互式环境（CI / nohup / 管道）下 input() 会抛 EOFError，
+    把真正的失败原因掩盖成裸 traceback——此时直接跳过等待。
+    """
+    try:
+        if not sys.stdin.isatty():
+            return
+        input("\n按回车键退出...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 def select_mode() -> str:
     """交互式选择启动模式。
 
@@ -1474,6 +1495,11 @@ def select_mode() -> str:
     Returns:
         "web" / "plugin" / "all"
     """
+    # 非交互式环境（CI / nohup / 管道）无法选择：与 select_backend 同口径，
+    # 直接采用默认值 all，避免 input() 抛 EOFError 裸 traceback
+    if not sys.stdin.isatty():
+        print("[启动器] 非交互式环境，自动选择默认启动模式: all")
+        return "all"
     print("=" * 60)
     print("  凿凿 AI 漏洞扫描器 —— 启动模式选择")
     print("=" * 60)
@@ -1520,7 +1546,8 @@ def print_plugin_hint(port: int) -> None:
     print("-" * 60)
 
 
-def main():
+def main() -> int:
+    """启动入口。返回进程退出码：0=正常停止，1=启动失败（供启动脚本判断）。"""
     mode = select_mode()
     print()
     print("=" * 60)
@@ -1544,6 +1571,14 @@ def main():
     # Ollama 存储锁到项目 models/ollama、并把旧位置（默认 ~/.ollama/models）已有
     # 模型迁移过来，保证后端可访问。
     ollama_models_dir().mkdir(parents=True, exist_ok=True)
+    # 覆写前先捕获用户原模型存储位置：启动脚本会把覆写前的 OLLAMA_MODELS 暂存到
+    # VULN_LEGACY_OLLAMA_MODELS；直接 python -m 运行时 OLLAMA_MODELS 仍是原值。
+    # 不捕获的话，用户自定义存储目录（如大容量盘）会被静默接管，其中模型"消失"。
+    legacy_ollama_models = (
+        os.environ.get("VULN_LEGACY_OLLAMA_MODELS", "").strip()
+        or os.environ.get("OLLAMA_MODELS", "").strip()
+    )
+    os.environ.pop("VULN_LEGACY_OLLAMA_MODELS", None)
     os.environ["OLLAMA_MODELS"] = str(ollama_models_dir())
     # HuggingFace 缓存：仅 Windows 需要强制迁离 C 盘；Linux/macOS 保持系统默认
     # （~/.cache/huggingface），后端基座走本地 models/transformers，无需搬动。
@@ -1555,8 +1590,11 @@ def main():
             migrate_hf_cache_to_project()
         except Exception as e:  # noqa: BLE001
             print(f"[启动器] HF 缓存迁移异常: {e}")
-    # 把旧位置（默认 ~/.ollama/models）已有 Ollama 模型剪切到项目 models/ollama
-    migrate_ollama_models_to_project()
+    # 把旧位置（默认 ~/.ollama/models、用户自定义 OLLAMA_MODELS）已有 Ollama 模型
+    # 剪切到项目 models/ollama
+    migrate_ollama_models_to_project(
+        extra_candidates=[legacy_ollama_models] if legacy_ollama_models else None
+    )
 
     if use_ollama:
         # 1. 检测 Ollama
@@ -1566,22 +1604,22 @@ def main():
                 print("\n[错误] Ollama 自动安装失败。请手动安装：")
                 print("  下载地址：https://ollama.com/download")
                 print("  安装后重新运行本启动器。")
-                input("\n按回车键退出...")
-                return
+                _pause_before_exit()
+                return 1
             # 安装后重新检查 PATH
             if not check_ollama_installed():
                 print("\n[错误] Ollama 已安装但不在 PATH 中。")
                 print("  请重启终端后重新运行本启动器，或手动将 ollama 加入 PATH。")
-                input("\n按回车键退出...")
-                return
+                _pause_before_exit()
+                return 1
 
         print("[1/5] Ollama 已安装")
 
         # 2. 确保 Ollama 服务运行
         if not ensure_ollama_running():
             print("\n[错误] Ollama 服务无法启动。请手动运行 `ollama serve` 后重试。")
-            input("\n按回车键退出...")
-            return
+            _pause_before_exit()
+            return 1
 
         print("[2/5] Ollama 服务已运行")
         _maybe_upgrade_ollama()
@@ -1602,13 +1640,13 @@ def main():
             print(f"\n[错误] {backend} 后端依赖未就绪。")
             dependency_installer.print_manual_install_commands(backend, sys.executable)
             print("\n  或设置 VULN_SCANNER_BACKEND=ollama 改用 Ollama 后端。")
-            input("\n按回车键退出...")
-            return
+            _pause_before_exit()
+            return 1
 
         if not check_inprocess_backend_ready(backend):
             print("\n[错误] 推理后端配置未就绪，请按上方提示修复后重试。")
-            input("\n按回车键退出...")
-            return
+            _pause_before_exit()
+            return 1
         print(f"[1/5] {backend} 后端依赖就绪")
         if backend == "vllm":
             print("[2/5] 跳过 Ollama（vllm 为独立服务，下一步单独启动）")
@@ -1694,8 +1732,8 @@ def main():
             if not ensure_model_available(FALLBACK_MODEL):
                 print(f"\n[错误] 无法获取任何可用模型。请手动运行：")
                 print(f"  ollama pull {model}")
-                input("\n按回车键退出...")
-                return
+                _pause_before_exit()
+                return 1
             os.environ["VULN_SCANNER_MODEL"] = FALLBACK_MODEL
     elif backend == "vllm":
         # vLLM 是独立服务：此刻拉起 vllm_server.py 并等待其把基座 + LoRA 加载到显存
@@ -1705,8 +1743,8 @@ def main():
             print("\n[错误] vLLM 服务启动失败或超时，请参考上方日志排查。")
             print("  常见原因：模型路径错误、显存不足、量化类型与权重不匹配。")
             print("  可手动运行 `python -m app.launcher.vllm_server --dry-run` 查看将要执行的命令。")
-            input("\n按回车键退出...")
-            return
+            _pause_before_exit()
+            return 1
 
     print(f"[5/6] 模型就绪")
 
@@ -1717,8 +1755,8 @@ def main():
         if not kill_process_on_port(PORT):
             print(f"\n[错误] 端口 {PORT} 被占用且无法自动释放。")
             print("  请手动关闭占用该端口的程序后重试。")
-            input("\n按回车键退出...")
-            return
+            _pause_before_exit()
+            return 1
         # 等待端口释放（最长 ~15s，SIGKILL 后 socket 一般立即释放）
         for _ in range(30):
             if not is_port_in_use(PORT):
@@ -1727,8 +1765,8 @@ def main():
         if is_port_in_use(PORT):
             print(f"\n[错误] 端口 {PORT} 释放后仍被占用，请手动检查。")
             print("  可执行：lsof -i tcp:%d 或 fuser %d/tcp 查看占用进程后手动结束。" % (PORT, PORT))
-            input("\n按回车键退出...")
-            return
+            _pause_before_exit()
+            return 1
         print(f"[启动器] 端口 {PORT} 已释放。")
 
     backend_proc = start_backend(PORT)
@@ -1739,8 +1777,8 @@ def main():
             backend_proc.wait(timeout=5)
         except Exception:
             pass
-        input("\n按回车键退出...")
-        return
+        _pause_before_exit()
+        return 1
 
     # 6. 根据启动模式决定后续动作（后端已就绪，Web 与插件共用）
     if mode in ("web", "all"):
@@ -1767,7 +1805,8 @@ def main():
         print("\n[启动器] 正在停止服务...")
         backend_proc.terminate()
         backend_proc.wait()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

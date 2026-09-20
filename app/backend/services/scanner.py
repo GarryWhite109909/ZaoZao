@@ -143,7 +143,14 @@ class Scanner:
             )
         if backend == "vllm":
             from graduation_project.vllm_client import VLLMClient
-            vllm_url = base_url or os.environ.get("VULN_SCANNER_VLLM_URL", "http://localhost:8000")
+            # base_url 形参默认是 Ollama 地址（11434），对 vLLM 无意义：若不加区分地
+            # 让它兜底，VULN_SCANNER_VLLM_URL 永远不可达，vLLM 请求会被打到
+            # Ollama 端口。此处优先环境变量；显式传入的非默认地址仍被尊重。
+            vllm_url = (
+                os.environ.get("VULN_SCANNER_VLLM_URL", "").strip()
+                or (base_url if base_url not in (None, "", "http://localhost:11434")
+                    else "http://localhost:8000")
+            )
             return VLLMClient(base_url=vllm_url, model=model)
         # 默认回退 Ollama
         return OllamaClient(base_url=base_url or "http://localhost:11434", model=model)

@@ -682,7 +682,12 @@
                 cur.pct = obj.pct;
                 if (obj.status) cur.status = obj.status;
                 if (obj.current_file) cur.status = '下载: ' + obj.current_file;
-                if (obj.completed != null && obj.total) cur.status = '已完成 ' + obj.completed + '/' + obj.total + ' 文件';
+                if (obj.completed != null && obj.total) {
+                  /* unit=bytes（GGUF 下载）按 MB 展示；默认按文件计数（HF 基座下载） */
+                  cur.status = obj.unit === 'bytes'
+                    ? '已下载 ' + (obj.completed / 1048576).toFixed(1) + '/' + (obj.total / 1048576).toFixed(1) + ' MB'
+                    : '已完成 ' + obj.completed + '/' + obj.total + ' 文件';
+                }
                 self._dlProgress[rid] = cur;
               }
               if (obj.completed === true && obj.status === 'success') {

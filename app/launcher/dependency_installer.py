@@ -839,7 +839,9 @@ def _llamacpp_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable
                 "RTX 50 系（Blackwell）默认强制源码编译 llama-cpp-python，"
                 "以 targeting sm_120 避免预编译 wheel 的 0xc000001d 非法指令问题。"
                 "需要安装 CUDA 12.8+ Toolkit（含 nvcc）和 Visual Studio Build Tools。"
-                "如需回退预编译 wheel，请设置 VULN_SCANNER_LLAMACPP_CUDA_VERSION=cu130。"
+                "本分支不读取 VULN_SCANNER_LLAMACPP_CUDA_VERSION（该变量仅对"
+                "非 RTX 50 的预编译 wheel 分支生效），无法用它回退预编译 wheel；"
+                "如源码编译失败，建议改用 Ollama 后端。"
             )
         else:
             # Windows + NVIDIA 非 RTX 50：官方预编译 CUDA wheel，免源码编译。
@@ -1005,12 +1007,11 @@ def _vllm_specs(platform_info: PlatformInfo, gpu: GPUInfo, python_executable: st
 
     # 5) AMD + Linux：使用官方 ROCm 专用 wheel 索引
     elif gpu.vendor == "amd":
-        rocm_version = os.environ.get("VULN_SCANNER_VLLM_VERSION", "").strip()
-        rocm_index = os.environ.get("VULN_SCANNER_VLLM_ROCM_INDEX", "").strip()
-        if not (rocm_version and rocm_index):
-            # 默认取官方文档中已验证的 ROCm 7.0 wheel；高级用户可用环境变量覆盖
-            rocm_version = "0.18.0+rocm700"
-            rocm_index = "https://wheels.vllm.ai/rocm/0.18.0/rocm700"
+        # 两个变量各自独立回退默认值：此前"必须同时设置否则双双丢弃"的写法
+        # 会让用户只设 VULN_SCANNER_VLLM_VERSION 时被静默忽略
+        # 默认取官方文档中已验证的 ROCm 7.0 wheel；高级用户可用环境变量覆盖
+        rocm_version = os.environ.get("VULN_SCANNER_VLLM_VERSION", "").strip() or "0.18.0+rocm700"
+        rocm_index = os.environ.get("VULN_SCANNER_VLLM_ROCM_INDEX", "").strip() or "https://wheels.vllm.ai/rocm/0.18.0/rocm700"
         return [InstallSpec(
             description=f"vLLM (ROCm {rocm_version}, Linux)",
             packages=[f"vllm=={rocm_version}"],
