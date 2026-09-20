@@ -521,7 +521,9 @@ def cmd_github(args: argparse.Namespace) -> int:
     print("  正在浅克隆仓库...")
     try:
         result = subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, clone_target],
+            # 2026-09-20 修复：repo_url 前插入 "--" 结束选项解析——形如
+            # "--upload-pack=..." 的恶意 URL 不会再被 git 当作选项执行
+            ["git", "clone", "--depth", "1", "--", repo_url, clone_target],
             capture_output=True, text=True, timeout=120,
         )
         if result.returncode != 0:

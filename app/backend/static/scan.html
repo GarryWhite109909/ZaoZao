@@ -536,6 +536,11 @@
         /* ==================== State ==================== */
         var scanResults = [];
         var resultsExpanded = false;
+        /* 项目级依赖组件漏洞（SCA，2026-09-20）：/api/github-scan 的
+           dependency_vulnerabilities 字段。此前后端算了、前端整字段丢弃——
+           trivy 对依赖清单的扫描结果对用户完全不可见。属项目级状态（不属于
+           任何单文件结果），仅 GitHub 扫描轮次持有，beginRound 时按来源清理。 */
+        var lastDepVulns = null;
 
         /* ==================== 单文件耗时实测（动态性能提示） ====================
            背景（2026-09-01）：前端原写死"单文件约 5-15 秒"，实测均值 140s
@@ -931,6 +936,9 @@
           multi:  { icon: '🗳', label: '多模型投票' }
         };
         function beginRound(kind, label) {
+          /* 项目级 SCA 结果仅属于 GitHub 扫描轮次，其它来源开新轮时清掉，
+             避免上一轮仓库的依赖漏洞残留到无关扫描的结果面板顶部 */
+          if ((kind || 'paste') !== 'github') lastDepVulns = null;
           currentRound = {
             id: 'r' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
             startedAt: new Date(),
@@ -1146,7 +1154,9 @@
               if (d && d.error) { addResult(errorResult(d.error, filename)); return; }
               addResult(d);
             });
-            hideProgress('扫描完成，共 ' + scanResults.length + ' 项结果');
+            // 2026-09-20 修复：口径改为"本轮"条数——此前用全历史 scanResults.length，
+            // 使用越久提示数字越离谱，与"扫描完成"语义矛盾
+            hideProgress('扫描完成，本轮 ' + roundResults().length + ' 项结果');
             /* 分析结束：关闭占位卡并重渲染，占位卡由真实结果卡替换 */
             interactiveScanning = false;
             renderResults();
@@ -1396,10 +1406,20 @@
           if (!repo) { alert('请输入 GitHub 仓库地址'); return; }
           var maxFiles = Math.min(500, Math.max(1, parseInt(document.getElementById('max-files-input').value, 10) || 20));
           beginRound('github', repo);
+          lastDepVulns = null;
           setBtnLoading(true);
           showProgress(true, '正在克隆仓库并扫描…（可能耗时数分钟）');
           postJSON('/api/github-scan', { repo_url: repo, max_files: maxFiles }, 'batch').then(function (d) {
             setBtnLoading(false);
+            /* 2026-09-20 修复：此前后端返回的 dependency_vulnerabilities（依赖清单
+               SCA 结果）被整字段丢弃，评委演示仓库扫描时该功能等于不存在 */
+            if (Array.isArray(d.dependency_vulnerabilities)) {
+              lastDepVulns = d.dependency_vulnerabilities;
+              if (lastDepVulns.length) {
+                showToast('检测到依赖清单，SCA 发现 ' +
+                  lastDepVulns.filter(function (v) { return v && !v.error; }).length + ' 条组件级漏洞', 'info', 8000);
+              }
+            }
             if (d.error) { addResult(errorResult(d.error, repo)); }
             else if (d.summary && d.summary.results) {
               // 注意力预算可观测（2026-08-31）：仓库文件多于扫描预算时，
@@ -1671,6 +1691,7 @@
           // 结果按扫描轮次分组展示，卡片逐轮堆叠，便于短时间多次检测时区分各轮结果
           // 顶部先展示全局工具召回监控（仅存在两阶段结果时出现）；有进行中分析时在其上方放占位卡
           var html = toolRecallMonitorHTML();
+          html += depVulnsHTML();
           if (interactiveScanning) html = scanningCardHTML() + html;
           html += renderGrouped(visible, 0);
 
@@ -2093,6 +2114,51 @@
             ' · 工具漏报率估算 ' + missCell + '</div>';
         }
 
+        /* 依赖组件漏洞（SCA）卡片（2026-09-20 新增渲染）：数据来自
+           /api/github-scan 的 dependency_vulnerabilities（trivy 组件级扫描，
+           {manifest, tool, rule_id, severity, message} 或 {manifest, error}）。
+           口径与后端一致：组件级证据与行级判定分维度呈现，不计入漏洞/安全统计。 */
+        function depVulnsHTML() {
+          if (!lastDepVulns || !lastDepVulns.length) return '';
+          var sevColor = function (s) {
+            var k = (s || '').toLowerCase();
+            if (k === 'critical' || k === 'high') return 'error';
+            if (k === 'medium' || k === 'moderate') return 'warning';
+            if (k === 'low') return 'success';
+            return 'info';
+          };
+          var rows = '', errors = 0, shown = 0, MAX_SHOW = 30;
+          lastDepVulns.forEach(function (v) {
+            if (!v) return;
+            if (shown >= MAX_SHOW) return;
+            if (v.error) {
+              errors++;
+              rows += '<div class="flex items-start gap-2 px-3 py-1.5 border-t border-[var(--vuln-line)]">' +
+                '<span class="text-[var(--vuln-state-warning)] font-medium shrink-0">清单读取失败</span>' +
+                '<span class="font-mono text-[var(--vuln-ink-3)] shrink-0">' + escapeHtml(v.manifest || '—') + '</span>' +
+                '<span class="text-[var(--vuln-ink-2)] min-w-0 break-all">' + escapeHtml(v.error) + '</span></div>';
+              shown++;
+              return;
+            }
+            var c = sevColor(v.severity);
+            rows += '<div class="flex items-start gap-2 px-3 py-1.5 border-t border-[var(--vuln-line)]">' +
+              '<span class="text-[var(--vuln-state-' + c + ')] font-medium shrink-0 uppercase">' + escapeHtml(v.severity || '?') + '</span>' +
+              '<span class="font-mono text-[var(--vuln-ink)] shrink-0">' + escapeHtml(v.rule_id || '—') + '</span>' +
+              '<span class="font-mono text-[var(--vuln-ink-3)] shrink-0">' + escapeHtml(v.manifest || '—') + '</span>' +
+              '<span class="text-[var(--vuln-ink-2)] min-w-0 break-all">' + escapeHtml(v.message || '') + '</span></div>';
+            shown++;
+          });
+          var omitted = lastDepVulns.length - shown;
+          var foot = omitted > 0 ? '<div class="px-3 py-1.5 border-t border-[var(--vuln-line)] text-[var(--vuln-ink-3)]">…其余 ' + omitted + ' 条从略</div>' : '';
+          var vulnCount = 0;
+          lastDepVulns.forEach(function (v) { if (v && !v.error) vulnCount++; });
+          return '<div class="mb-3 rounded-md border border-[var(--vuln-line)] bg-[var(--vuln-surface)]/40 text-xs" ' +
+            'title="来源：仓库内依赖清单（package-lock / composer.lock / go.sum 等 14 种）经 trivy 组件级扫描。它证明「项目依赖了有漏洞的库版本」，与某个文件第 N 行的行级判定分维度呈现，不计入上方漏洞/安全统计。">' +
+            '<div class="px-3 py-2 font-medium text-[var(--vuln-ink)]">依赖组件漏洞（SCA）<strong>' + vulnCount + '</strong> 条' +
+            '<span class="font-normal text-[var(--vuln-ink-3)]"> · 组件级证据，与行级判定分维度呈现</span></div>' +
+            rows + foot + '</div>';
+        }
+
         /* 将结果列表按扫描轮次分组；arr 需已按「新→旧」排序，分组结果保持该顺序 */
         function groupResultsByRound(arr) {
           var groups = [];
@@ -2352,6 +2418,9 @@
           // Credentials / gitleaks 规则族）时，类型行追加"伴生凭证发现"徽标——
           // 提示该文件级类型可能只是硬编码密码这类伴生发现被确认，未必是主
           // 漏洞类型（授权类工具层零召回盲区的下游表现，工具层优化指导 §8.5）。
+          // 2026-09-20 修复：companionNote 原在 if 块内声明、块外使用，靠 var 提升
+          // 碰巧工作——显式提前声明，作用域改动时不再静默断裂
+          var companionNote = '';
           if (r._kind === 'two-stage') {
             var _secRe = /B10[567]|hardcoded[-_.]?(?:token|secret|password|credential|api[_-]?key)|Hardcoded Credentials|generic-api-key|aws-access-key-id|python-bytes-literal-secret/i;
             var _conf = (r.adjudications || []).filter(function (a) { return a && a.confirmed; });
@@ -2362,14 +2431,14 @@
                 || _secRe.test(f.taint_type || a.taint_type || '');
             });
             if (_onlySecret) {
-              var companionNote = '<div class="text-xs mb-2 flex flex-wrap items-center gap-1.5">' +
+              companionNote = '<div class="text-xs mb-2 flex flex-wrap items-center gap-1.5">' +
                 '<span class="px-1.5 py-0.5 rounded bg-[var(--vuln-state-warning)]/10 text-[var(--vuln-state-warning)] font-medium">伴生凭证发现</span>' +
                 '<span class="text-[var(--vuln-ink-3)]">唯一确认候选为硬编码凭证类（secret 族），文件级类型可能只是伴生发现，未必是主漏洞类型</span>' +
                 '</div>';
             }
           }
           if (r._kind === 'external') {
-            meta = '<span class="text-xs font-mono text-[var(--vuln-ink-3)]">' + escapeHtml(r._tool) + ' · ' + escapeHtml(r._category) + (r._line ? ' · 第 ' + r._line + ' 行' : '') + '</span>';
+            meta = '<span class="text-xs font-mono text-[var(--vuln-ink-3)]">' + escapeHtml(r._tool) + ' · ' + escapeHtml(r._category) + (r._line ? ' · 第 ' + escapeHtml(r._line) + ' 行' : '') + '</span>';
           } else if (r.filename) {
             var dur = r.duration || (r._kind === 'two-stage' ? r.total_duration : null);
             meta = '<span class="text-xs font-mono text-[var(--vuln-ink-3)]">' + escapeHtml(r.filename) + (dur ? ' · ' + dur + 's' : '') + '</span>';
@@ -2502,7 +2571,7 @@
             var badges = [];
             if (d.mode === 'localized') {
               var anchorBadge = d.all_refs_valid
-                ? '<span class="text-[var(--vuln-state-success)]">行号锚定有效（' + (d.line_refs || []).join(', ') + '）</span>'
+                ? '<span class="text-[var(--vuln-state-success)]">行号锚定有效（' + escapeHtml((d.line_refs || []).join(', ')) + '）</span>'
                 : '<span class="text-[var(--vuln-state-error)]">行号锚定无效</span>';
               badges.push(anchorBadge);
               if (d.error_message) badges.push('<span class="text-[var(--vuln-state-error)]">' + escapeHtml(d.error_message) + '</span>');
@@ -2609,8 +2678,9 @@
               var type = twoStageTypeLabel(f);
               var pct = Math.round((a.confidence || 0) * 100);
               var src = candidateSourceText(f, r.stage1 && r.stage1.decision) || (f.tool || '—');
+              /* 管道符会破坏 Markdown 表格列，src/type/sugg 三个 LLM 相关列统一过滤 */
               var sugg = (a.confirmed && a.fix_suggestion && a.fix_suggestion !== 'no fix needed') ? a.fix_suggestion.replace(/\|/g, '/') : '—';
-              lines.push('| ' + src + ' | ' + type + ' | ' + adjudSentence(a) + ' | ' + pct + '% | ' + (a.votes_true || 0) + '/' + (a.votes_false || 0) + '/' + (a.votes_invalid || 0) + ' | ' + sugg + ' |');
+              lines.push('| ' + String(src).replace(/\|/g, '/') + ' | ' + String(type).replace(/\|/g, '/') + ' | ' + adjudSentence(a) + ' | ' + pct + '% | ' + (a.votes_true || 0) + '/' + (a.votes_false || 0) + '/' + (a.votes_invalid || 0) + ' | ' + sugg + ' |');
             });
             lines.push('');
           }
@@ -2683,7 +2753,9 @@
         }
 
         /* ==================== Toast ==================== */
-        function showToast(message, type) {
+        /* duration：自定义停留毫秒数（2026-09-20 修复：此前签名只有两参，
+           多处调用传了 8000 却被忽略，长提示 3.5s 就消失没被读完） */
+        function showToast(message, type, duration) {
           type = type || 'info';
           var container = document.getElementById('toast-container');
           if (!container) return;
@@ -2700,7 +2772,7 @@
           setTimeout(function () {
             toast.classList.add('removing');
             setTimeout(function () { if (toast.parentNode) toast.remove(); }, 250);
-          }, 3500);
+          }, Math.max(1000, duration || 3500));
         }
 
         /* ==================== Utils ==================== */
@@ -2800,17 +2872,43 @@
           } catch (e) {}
         }
         function persistScanResults() {
-          try {
-            localStorage.setItem(SCAN_RESULTS_KEY, JSON.stringify(scanResults));
+          var save = function (arr) {
+            localStorage.setItem(SCAN_RESULTS_KEY, JSON.stringify(arr));
             // 一轮扫描只入账一次（批量 NDJSON 流在 done 与流结束时都会走到这里）
-            if (roundRecorded) return;
+            if (roundRecorded) return true;
             var list = roundResults();
-            if (list.length === 0) return;
+            if (list.length === 0) return true;
             roundRecorded = true;
             recordScanHistory(list);
             saveReportToHistory(list);
+            return true;
+          };
+          try {
+            save(scanResults);
           } catch (e) {
-            console.warn('无法持久化扫描结果', e);
+            // 2026-09-20 修复：全量持久化（含 _orig 源码/raw_outputs）超 5MB 配额后
+            // 此前静默失败，历史/报告从此不再保存且用户无感知。降级策略：剥掉
+            // 体积大头（原始代码与模型原始输出）重试，再失败才放弃并明确告警。
+            try {
+              var slim = scanResults.map(function (r) {
+                if (!r || typeof r !== 'object') return r;
+                var c = Object.assign({}, r);
+                delete c._orig;
+                if (c.adjudications) {
+                  c.adjudications = c.adjudications.map(function (a) {
+                    if (!a || typeof a !== 'object') return a;
+                    var s = Object.assign({}, a);
+                    delete s.raw_outputs;
+                    return s;
+                  });
+                }
+                return c;
+              });
+              save(slim);
+              console.warn('扫描结果超出 localStorage 配额，已降级保存（剥离原始代码/模型输出）', e);
+            } catch (e2) {
+              console.warn('无法持久化扫描结果（配额超限且降级失败）', e2);
+            }
           }
         }
         /* 前端版本自检（2026-08-29）：静态资源虽已 no-cache，但**已缓存且未过期**
@@ -2818,16 +2916,30 @@
            启动后比对后端 /api/health 的 ui_build 与本次加载时服务端下发的
            X-UI-Build；不一致即说明浏览器用的是旧前端，提示硬刷新。 */
         function checkUIBuild() {
+          var apply = function (d) {
+            if (!d || !d.ui_build) return;
+            var cur = document.documentElement.getAttribute('data-ui-build') || '';
+            if (cur && cur === d.ui_build) return;      // 已是最新
+            if (!cur) return;                            // 首次加载，无从比对
+            showToast('前端有新版本，请按 Ctrl+F5（Mac Cmd+Shift+R）硬刷新后生效', 'warning', 8000);
+          };
           try {
-            fetch('/api/health').then(function (r) { return r.json(); })
-              .then(function (d) {
-                if (!d || !d.ui_build) return;
-                var cur = document.documentElement.getAttribute('data-ui-build') || '';
-                if (cur && cur === d.ui_build) return;      // 已是最新
-                if (!cur) return;                            // 首次加载，无从比对
-                showToast('前端有新版本，请按 Ctrl+F5（Mac Cmd+Shift+R）硬刷新后生效', 'warning', 8000);
-              }).catch(function () {});
+            // 2026-09-20 修复：/api/health 是全站最慢端点（最坏 30s+），此前
+            // loadHealth 与本函数各自裸请求、缓存不共享，双倍占用同域并发连接。
+            // 现在复用 loadHealth 的 30s sessionStorage 缓存，未命中时本函数的
+            // 请求结果也回写缓存供 loadHealth 复用。
+            var cached = sessionStorage.getItem('health_cache');
+            if (cached) {
+              var obj = JSON.parse(cached);
+              if (obj && obj.data && Date.now() - obj.ts < HEALTH_CACHE_TTL) { apply(obj.data); return; }
+            }
           } catch (e) {}
+          fetch('/api/health').then(function (r) { return r.json(); })
+            .then(function (d) {
+              try { sessionStorage.setItem('health_cache', JSON.stringify({ ts: Date.now(), data: d })); } catch (e) {}
+              apply(d);
+            })
+            .catch(function () {});
         }
 
         function loadScanResults() {
@@ -3040,7 +3152,9 @@
           if (r.vulnerable > 0) { sevColor = 'error'; sevText = r.vulnerable + ' 个漏洞'; }
           else if (r.errors > 0) { sevColor = 'error'; sevText = '分析失败'; }
           else { sevColor = 'success'; sevText = '全部安全'; }
-          var sourceLabel = { paste: '粘贴', upload: '上传', url: 'URL', github: 'GitHub', demo: '演示' }[r.source] || r.source;
+          var sourceLabel = ({ paste: '粘贴', upload: '上传', url: 'URL', github: 'GitHub', demo: '演示' }[r.source] || r.source || '');
+          // 2026-09-20 修复：id/source 此前未转义（数据源为本地生成值，属纪律性收口）
+          sourceLabel = escapeHtml(sourceLabel);
           // 报告文件名：单文件显示真实文件名，多文件显示「N 个文件 · 首个文件名」；旧数据无 files 字段时回退为文件数
           var filesLabel;
           if (Array.isArray(r.files) && r.files.length === 1) {
@@ -3050,7 +3164,7 @@
           } else {
             filesLabel = '文件 ' + r.total_files;
           }
-          return '<article class="report-item glass-card rounded-lg p-3" data-id="' + r.id + '" style="cursor:pointer">' +
+          return '<article class="report-item glass-card rounded-lg p-3" data-id="' + escapeAttr(r.id) + '" style="cursor:pointer">' +
             '<div class="flex items-center justify-between gap-2 mb-1">' +
               '<span class="text-xs font-mono text-[var(--vuln-ink-3)]">' + dateStr + ' · ' + sourceLabel + '</span>' +
               '<span class="text-xs font-medium px-2 py-0.5 rounded-full bg-[var(--vuln-state-' + sevColor + ')]/10 text-[var(--vuln-state-' + sevColor + ')]">' + sevText + '</span>' +
@@ -3064,10 +3178,10 @@
               (r.errors ? '<span>·</span><span>错误 ' + r.errors + '</span>' : '') +
             '</div>' +
             '<div class="flex items-center gap-2 mt-2">' +
-              '<button type="button" class="view-report text-xs text-[var(--vuln-brand)] hover:underline font-medium" data-id="' + r.id + '">查看</button>' +
-              '<button type="button" class="dl-report text-xs text-[var(--vuln-ink-3)] hover:text-[var(--vuln-brand)] font-medium" data-id="' + r.id + '">下载</button>' +
-              (r.roundId ? '<button type="button" class="loc-report text-xs text-[var(--vuln-ink-3)] hover:text-[var(--vuln-brand)] font-medium" data-id="' + r.id + '" data-round="' + escapeAttr(r.roundId) + '">回到本轮</button>' : '') +
-              '<button type="button" class="del-report text-xs text-[var(--vuln-ink-3)] hover:text-[var(--vuln-state-error)] font-medium" data-id="' + r.id + '">删除</button>' +
+              '<button type="button" class="view-report text-xs text-[var(--vuln-brand)] hover:underline font-medium" data-id="' + escapeAttr(r.id) + '">查看</button>' +
+              '<button type="button" class="dl-report text-xs text-[var(--vuln-ink-3)] hover:text-[var(--vuln-brand)] font-medium" data-id="' + escapeAttr(r.id) + '">下载</button>' +
+              (r.roundId ? '<button type="button" class="loc-report text-xs text-[var(--vuln-ink-3)] hover:text-[var(--vuln-brand)] font-medium" data-id="' + escapeAttr(r.id) + '" data-round="' + escapeAttr(r.roundId) + '">回到本轮</button>' : '') +
+              '<button type="button" class="del-report text-xs text-[var(--vuln-ink-3)] hover:text-[var(--vuln-state-error)] font-medium" data-id="' + escapeAttr(r.id) + '">删除</button>' +
             '</div>' +
           '</article>';
         }

@@ -1266,10 +1266,11 @@ def _add_pip_network_flags(cmd: List[str]) -> None:
         cmd.extend(["--progress-bar", PIP_PROGRESS_BAR])
 
 
-# llama-cpp-python 预编译 wheel 的 ghproxy 镜像前缀（避免国内直连 GitHub Releases 被掐断）。
-# 注意：各 ghproxy 公共镜像节点经常失效/宕机（如 mirror.ghproxy.com 已不可用），
-# 因此维护一个候选列表，下载时逐个探测直到成功，避免写死单一节点导致必挂。
-# 用户可用 VULN_SCANNER_GH_PROXY 显式指定首个候选。
+# llama-cpp-python 预编译 wheel 的下载源候选。2026-09-20 调整：
+# 官方 GitHub 直链优先（见 _download_wheel_via_mirror 的 1.5 步），
+# 下列 ghproxy 镜像仅作回退——公共镜像节点经常失效/宕机（如 mirror.ghproxy.com
+# 已不可用）或对大文件限速，因此维护候选列表逐个探测直到成功，避免写死单一节点。
+# 用户可用 VULN_SCANNER_GH_PROXY 显式指定首个候选（显式指定时仍最优先）。
 _GH_PROXY_CANDIDATES = [
     os.environ.get("VULN_SCANNER_GH_PROXY", "").strip(),
     "https://ghproxy.net/",
@@ -1294,6 +1295,57 @@ class _SlowMirrorError(Exception):
 WHEEL_MIN_SPEED = int(
     os.environ.get("VULN_SCANNER_WHEEL_MIN_SPEED", "").strip() or (50 * 1024)
 )
+
+
+# wheel 本地完整性校验的体积下限：llama-cpp-python 预编译 wheel 普遍 >100MB
+# （如 cp311 manylinux 轮子 ~536MB），断点残片/镜像返回的错误页远小于该值。
+# 可用环境变量 VULN_SCANNER_WHEEL_MIN_SIZE 覆盖（单位字节）。
+WHEEL_MIN_SIZE_BYTES = int(
+    os.environ.get("VULN_SCANNER_WHEEL_MIN_SIZE", "").strip() or (100 * 1024 * 1024)
+)
+
+
+def _validate_wheel_file(
+    dest: Path, callback: Optional[Callable[[str], None]] = None
+) -> bool:
+    """下载完成后对 wheel 做本地完整性校验，通过才允许进入 pip 安装。
+
+    2026-09-20 新增。三重校验：
+        1. 体积下限（默认 >100MB，见 WHEEL_MIN_SIZE_BYTES）；
+        2. zipfile 能正常打开（wheel 本质是 zip）；
+        3. testzip() 全量 CRC 通过，且 namelist() 非空、含 dist-info/METADATA
+           （PEP 427 规定的 wheel 必备条目）。
+    返回 False 时调用方应删除文件、换下一个候选源。
+    """
+    try:
+        size = dest.stat().st_size if dest.is_file() else 0
+        if size < WHEEL_MIN_SIZE_BYTES:
+            _emit(
+                f"[依赖安装] ⚠️ wheel 完整性校验失败：体积 {size} 字节低于下限 "
+                f"{WHEEL_MIN_SIZE_BYTES} 字节（残片或错误响应）",
+                callback,
+            )
+            return False
+        import zipfile
+        with zipfile.ZipFile(dest, "r") as zf:
+            bad = zf.testzip()
+            if bad is not None:
+                _emit(
+                    f"[依赖安装] ⚠️ wheel 完整性校验失败：CRC 校验不通过（损坏条目: {bad}）",
+                    callback,
+                )
+                return False
+            names = zf.namelist()
+            if not names or not any(n.endswith(".dist-info/METADATA") for n in names):
+                _emit(
+                    "[依赖安装] ⚠️ wheel 完整性校验失败：缺少 dist-info/METADATA（不是合法 wheel）",
+                    callback,
+                )
+                return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        _emit(f"[依赖安装] ⚠️ wheel 完整性校验失败：{type(e).__name__}: {e}", callback)
+        return False
 
 
 # 常见本机代理端口（Clash/mihomo 7890/7897、v2ray 10809/1080、shadowsocks 1080）。
@@ -1404,10 +1456,13 @@ def _resumable_urlopen_download(
 def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[str], None]] = None) -> Optional[Path]:
     """把 spec.mirror_wheel_url 指定的 GitHub wheel 下载到本地。
 
-    下载策略（按优先级）：
+    下载策略（按优先级，2026-09-20 调整为官方直链优先、镜像仅作回退）：
         1. 若检测到系统代理 → 直接走代理连 GitHub（快，一次性，避免在慢镜像上死等）
-        2. 否则 → 逐个试 ghproxy 镜像（直连，不吃代理流量），配最低速度监控，
-           速度过慢立即放弃换下一个，不等 read 超时
+        2. 否则 → 官方 GitHub 直链（强制不走代理），配最低速度监控 + 完整性校验。
+           此前无代理时直接跳进 ghproxy 镜像，而公共镜像经常回源受限/失效；
+        3. 直链失败 → 逐个试 ghproxy 镜像（直连，不吃代理流量），同样带限速熔断
+           与完整性校验。
+    全部下载完成后还需通过 _validate_wheel_file 本地完整性校验才允许进入 pip 安装。
     返回本地 wheel 路径；全部失败返回 None，调用方回退 pip 直连。
     """
     url = (spec.mirror_wheel_url or "").strip()
@@ -1454,6 +1509,10 @@ def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[s
                         else f"[依赖安装] 代理下载中: {d/1024/1024:.1f}MB",
                         callback,
                     ),
+                    # 2026-09-20 修复：补传 min_speed——此前该调用未传，慢速熔断
+                    # （_SlowMirrorError）在此分支是永远不可达的死代码，代理僵死
+                    # 时只能干等 read 超时。
+                    min_speed=WHEEL_MIN_SPEED,
                 )
             except _SlowMirrorError:
                 raise
@@ -1464,6 +1523,12 @@ def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[s
                 )
                 marker.unlink(missing_ok=True)
                 raise RuntimeError(f"代理下载不完整 {downloaded}/{total}")
+            if not _validate_wheel_file(dest, callback):
+                # 2026-09-20 修复：下载完成的 wheel 必须先过本地完整性校验
+                # 才允许进入 pip 安装；失败删文件，落到下方候选源重试。
+                dest.unlink(missing_ok=True)
+                marker.unlink(missing_ok=True)
+                raise RuntimeError("代理下载的 wheel 未通过完整性校验")
             marker.write_text(str(downloaded), encoding="utf-8")
             _emit(f"[依赖安装] ✅ 代理直连 GitHub 下载完成: {dest}", callback)
             return dest
@@ -1475,6 +1540,44 @@ def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[s
             # 保留 dest 残片（下次经镜像从断点续传），只清完成标记
             marker.unlink(missing_ok=True)
             # 代理失败不立即返回，落到下方镜像逻辑再试
+
+    # —— 1.5) 2026-09-20 修复：官方 GitHub 直链优先于镜像 ——
+    # ghproxy 公共镜像节点经常失效或对大文件限速（~20KB/s），而 GitHub Releases
+    # 直链在国内多数网络其实可达（偶尔慢但稳定）。先试官方直链，失败再轮询镜像。
+    _emit(f"[依赖安装] 尝试官方 GitHub 直链下载（优先于镜像）: {url}", callback)
+    try:
+        downloaded, total = _resumable_urlopen_download(
+            # ProxyHandler({}) 显式空代理：强制直连，不吃环境变量/系统代理
+            url, dest, build_opener(ProxyHandler({})),
+            progress_emit=lambda d, t: _emit(
+                f"[依赖安装] 直链下载中: {d/1024/1024:.1f}MB / {t/1024/1024:.1f}MB"
+                f" ({d*100/t:.0f}%)" if t > 0
+                else f"[依赖安装] 直链下载中: {d/1024/1024:.1f}MB",
+                callback,
+            ),
+            min_speed=WHEEL_MIN_SPEED,
+        )
+        if total > 0 and downloaded != total:
+            _emit(
+                f"[依赖安装] ⚠️ 直链下载不完整 {downloaded}/{total} 字节，保留残片转镜像续传",
+                callback,
+            )
+            marker.unlink(missing_ok=True)
+        elif _validate_wheel_file(dest, callback):
+            marker.write_text(str(downloaded), encoding="utf-8")
+            _emit(f"[依赖安装] ✅ 官方 GitHub 直链下载完成: {dest}", callback)
+            return dest
+        else:
+            # 完整性校验失败：删除残片，换下一个候选源
+            dest.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+    except Exception as e:
+        _emit(
+            f"[依赖安装] ⚠️ 官方 GitHub 直链失败（{type(e).__name__}: {e}），"
+            f"回退 ghproxy 镜像",
+            callback,
+        )
+        marker.unlink(missing_ok=True)
 
     # —— 2) 无代理 / 代理失败时，逐个试 ghproxy 镜像（直连，不吃代理流量）——
     # 每个候选都设 NO_PROXY 直连。加速：最低速度监控，速度过低马上放弃换下一个，
@@ -1512,6 +1615,11 @@ def _download_wheel_via_mirror(spec: InstallSpec, callback: Optional[Callable[[s
                     f"[依赖安装] ⚠️ 镜像下载不完整 {downloaded}/{total} 字节，保留残片换下一个镜像续传",
                     callback,
                 )
+                marker.unlink(missing_ok=True)
+                continue
+            if not _validate_wheel_file(dest, callback):
+                # 2026-09-20 修复：镜像下载完成也必须过完整性校验，失败删残片换下一个
+                dest.unlink(missing_ok=True)
                 marker.unlink(missing_ok=True)
                 continue
             marker.write_text(str(downloaded), encoding="utf-8")
@@ -2298,7 +2406,8 @@ _SECURITY_TOOLS_GH: dict[str, dict] = {
     },
     "trivy": {
         "repo": "aquasecurity/trivy",
-        "version": "v0.72.0",
+        # 2026-09-20 修复：0.72.0 → 0.73.0，与 winget 注释（最新稳定 0.73.0）口径统一
+        "version": "v0.73.0",
         # trivy 资产命名：Linux-64bit / Linux-ARM64 / windows-64bit
         "asset": "trivy_{ver}_{os_arch}.{ext}",
         "os_arch_map": {
@@ -2458,7 +2567,13 @@ def _download_github_binary(
         else:  # tar.gz
             import tarfile
             with tarfile.open(tmp_archive, "r:gz") as tf:
-                tf.extractall(tmp_extract)
+                # 2026-09-20 修复：显式 filter="data" 防路径穿越/设备文件注入
+                # （tarfile 解压漏洞系列，CVE-2007-4559 及后续变体）；
+                # filter 参数为较新 Python 提供，旧解释器回退原调用。
+                try:
+                    tf.extractall(tmp_extract, filter="data")
+                except TypeError:
+                    tf.extractall(tmp_extract)
 
         # 找到可执行文件并安装
         found_exe = None

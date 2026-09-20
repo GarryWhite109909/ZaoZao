@@ -36,6 +36,7 @@ app.backend.services.scanner.Scanner 的 client），保证与主扫描共享同
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -839,6 +840,16 @@ class TwoStageScanner:
                 print(f"[TwoStageScanner] 反事实验证器初始化失败（降级无扰动验证）: {e}")
 
         self._external = ExternalScanner() if (use_semgrep or use_external) else None
+        # 2026-09-20（性能修复）：semgrep 同内容结果缓存——键 sha256(language+code)。
+        # 背景：_semgrep_recall 与 _external_positional_recall 各自把同一份 code
+        # 写进**不同的** NamedTemporaryFile 再分别调 scan_taint / scan_sast，而
+        # ExternalScanner._semgrep_cache 以临时文件绝对路径为键 → 两路路径永不相
+        # 等、缓存恒失效，同一文件的 semgrep 规则加载+解析做两遍（每文件 2 个
+        # semgrep 进程）。现统一走 _run_external_semgrep：同一次调用共用一个临时
+        # 文件（路径级缓存命中一次执行），跨调用按内容哈希直接复用解析结果。
+        # 读写沿用 ExternalScanner._semgrep_cache 的既有并发语义（单 dict 操作 +
+        # 上限 64 全清，无额外锁——与修复前的缓存锁语义一致）。
+        self._semgrep_content_cache: dict = {}
         self._taint_tracker = None
         self._prefilter = Prefilter() if use_prefilter else None
         self._slicer = CodeSlicer(min_lines=150)
@@ -926,6 +937,16 @@ class TwoStageScanner:
             return self._scan_code_inner(code, language, filename, rag_enabled, start)
         finally:
             if restore_n is not None:
+                # 2026-09-20 防御留痕（请求级状态污染，部分修复）：临时突变+
+                # finally 恢复的契约依赖调用方持 _model_lock 串行。若并发请求
+                # 在本扫描期间穿插改写了 n_samples（恢复前值 ≠ 本次生效值），
+                # 下面的恢复会覆盖并发方的临时突变——打一条警告供审计定位。
+                # 完整线程安全化（n_samples 走请求上下文传参、不再突变实例）
+                # 本次不做，局限如实留档：本警告只能"发现"穿插，不能"阻止"。
+                if self.n_samples != n_eff:
+                    print(f"[TwoStageScanner] 警告: n_samples 恢复点检测到并发穿插"
+                          f"（本次生效={n_eff}, 恢复前={self.n_samples}），"
+                          f"临时突变+finally 恢复契约可能已被并发破坏")
                 self.n_samples = restore_n
 
     def _scan_code_inner(self, code: str, language: str, filename: str,
@@ -1455,9 +1476,18 @@ class TwoStageScanner:
         # 整数溢出
         if ("overflow" in text or "integer_overflow" in text or "wraparound" in text):
             return "Integer Overflow"
-        # 日志注入
-        if ("log_injection" in text or "logger" in text or "logging" in text
-                and ("inject" in text or "newline" in text or "crlf" in text)):
+        # 日志注入（2026-09-20 修复裸 logger 撞词）：evidence 是安全建议文本
+        # "avoid global logger configuration" 时曾被 `"logger" in text` 误归
+        # Log Injection。现 log_injection token 直判保留；裸 logger 须同时
+        # 出现**写日志语境**（.info(/.warn(/.error(/.debug(/getLogger/
+        # LoggerFactory/logging.）才归本族；裸 logging 维持原先
+        # "logging + inject/newline/crlf" 组合条件不变。
+        if ("log_injection" in text
+                or (re.search(r"\blogger\b", text)
+                    and re.search(r"\.info\(|\.warn\(|\.error\(|\.debug\("
+                                  r"|getlogger|loggerfactory|logging\.", text))
+                or ("logging" in text
+                    and ("inject" in text or "newline" in text or "crlf" in text))):
             return "Log Injection"
         # 不安全 Cookie 配置（2026-08-31，NodeGoat 审计）：semgrep
         # express-cookie-settings 族 rule_id 特有片段（no-httponly/no-secure/
@@ -2297,8 +2327,35 @@ class TwoStageScanner:
                 return False
         return True
 
-    def _semgrep_recall(self, code: str, language: str, filename: str) -> list[ToolFinding]:
-        """把代码写入临时文件后跑 Semgrep taint，解析候选 finding。"""
+    def _run_external_semgrep(
+        self, code: str, language: str, filename: str = "",
+    ) -> tuple[list[dict], list]:
+        """同内容一次 semgrep 执行，taint/sast 两路共享（2026-09-20，性能修复）。
+
+        首次为该内容写**一个**临时文件（本次调用内独立创建，绝不挂实例共享
+        路径——stage1 是 4 线程池并发调用，实例级共享路径会互踩同一文件），
+        同一次调用里先后跑 scan_taint 与 scan_sast：两路都经
+        ExternalScanner._semgrep_execute_cached 的路径级缓存分流，故只起
+        **一次** semgrep 进程；解析结果按 sha256(language+code) 缓存，同内容
+        的后续调用（含并发后到者）直接复用，不再落盘、不再起进程。
+
+        filename 仅用于推导临时文件后缀（semgrep 按扩展名识别文件类型，
+        .js/.ts 等必须保留原后缀，否则 registry 规则不命中）。
+
+        Returns:
+            (taint_results, sast_results)：scan_taint 的 dict 列表与
+            scan_sast 的 ExternalFinding 列表；执行异常时返回 ([], [])。
+        """
+        if self._external is None:
+            return ([], [])
+        cache = getattr(self, "_semgrep_content_cache", None)
+        if cache is None:  # __new__ 绕过构造的离线审计路径兜底（同 _drop_irrelevant_positional）
+            cache = self._semgrep_content_cache = {}
+        key = hashlib.sha256(
+            f"{language}\x00{code}".encode("utf-8", errors="replace")).hexdigest()
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
         suffix = Path(filename).suffix.lower() or (".py" if language == "python" else ".txt")
         tmp_path = None
         try:
@@ -2307,16 +2364,33 @@ class TwoStageScanner:
             ) as tmp:
                 tmp.write(code)
                 tmp_path = tmp.name
-            raw = self._external.scan_taint(tmp_path, language)
+            taint_results = self._external.scan_taint(tmp_path, language)
+            sast_results = self._external.scan_sast(tmp_path, language)
         except Exception as e:
-            print(f"[TwoStageScanner] Semgrep taint 执行失败: {e}")
-            return []
+            # 异常不缓存（下次同内容重试），留痕后降级为空
+            print(f"[TwoStageScanner] Semgrep 外部执行失败: {e}")
+            return ([], [])
         finally:
             if tmp_path:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+        pair = (taint_results, sast_results)
+        if len(cache) > 64:  # 与 ExternalScanner._semgrep_cache 同上限同淘汰策略
+            cache.clear()
+        cache[key] = pair
+        return pair
+
+    def _semgrep_recall(self, code: str, language: str, filename: str) -> list[ToolFinding]:
+        """Semgrep taint 召回（临时文件与执行统一走 _run_external_semgrep，2026-09-20）。
+
+        与 _external_positional_recall 共享同一次 semgrep 执行（此前两函数各写
+        一个临时文件、路径不同导致缓存恒失效，同一份 code 每文件跑 2 次
+        semgrep 进程）；本函数只做 taint 结果的后处理（sink 行上下文附加），
+        过滤逻辑不变。
+        """
+        raw, _sast = self._run_external_semgrep(code, language, filename)
 
         findings: list[ToolFinding] = []
         for item in raw:
@@ -2397,7 +2471,16 @@ class TwoStageScanner:
         """
         try:
             result = self._prefilter.scan(code, language)
-        except Exception:
+        except Exception as e:
+            # 2026-09-20 修复（P1 消静默）：prefilter 异常此前无任何留痕地
+            # return []——全链路唯一静默的召回通道。现写入 _last_tool_status
+            # （与 semgrep/bandit 的 P2-9 状态机制同构，stage1["tool_status"]
+            # 读端已有：非 "ok" 状态会进字典），并 print 一条；仍返回 []。
+            if not hasattr(self, "_last_tool_status"):
+                self._last_tool_status = {}
+            self._last_tool_status["prefilter"] = f"exception:{type(e).__name__}"
+            print(f"[TwoStageScanner] Prefilter 执行失败: "
+                  f"{type(e).__name__}: {str(e)[:160]}")
             return []
         if not result.has_obvious_vuln:
             return []
@@ -2449,6 +2532,12 @@ class TwoStageScanner:
         suffix = Path(filename).suffix.lower() or (".py" if language == "python" else ".txt")
         tmp_path = None
         try:
+            # 2026-09-20（性能修复）：semgrep 部分改走 _run_external_semgrep——
+            # 此前本函数与 _semgrep_recall 各写一个临时文件（路径不同 →
+            # ExternalScanner._semgrep_cache 恒失效），同一份 code 每文件跑 2 次
+            # semgrep 进程。现在 taint/sast 两路共享一次执行；gitleaks/trivy 等
+            # 非 semgrep 工具不适用该缓存，仍在下方独立临时文件上运行。
+            _taint_raw, sast_items = self._run_external_semgrep(code, language, filename)
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=suffix, delete=False, encoding="utf-8"
             ) as tmp:
@@ -2468,7 +2557,7 @@ class TwoStageScanner:
             code_file_exts = {".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".java", ".php",
                               ".c", ".h", ".cpp", ".cc", ".go", ".rb", ".rs", ".cs"}
             groups: dict[str, list] = {
-                "sast": self._external.scan_sast(tmp_path, language),
+                "sast": sast_items,
                 "secret": self._external.scan_secrets(tmp_path),
             }
             if suffix not in code_file_exts:
@@ -2657,7 +2746,12 @@ class TwoStageScanner:
                 seen[key] = f
                 # 有证据的 finding 注册 sink 行索引，供后续空证据候选归并
                 if (norm_src or norm_sink) and f.sink_line:
-                    by_sink_line[((f.taint_type or "").lower(), f.sink_line)] = key
+                    # 2026-09-20 修复：改 setdefault（与下一行 by_src_line 同
+                    # 口径）——同行同类型出现多个有证据候选时，索引必须恒指
+                    # 首见（有证据候选按级序先处理、证据最完整）；裸赋值会让
+                    # 索引漂移到最后一个候选，后续空证据候选归并到错误目标。
+                    by_sink_line.setdefault(
+                        ((f.taint_type or "").lower(), f.sink_line), key)
                     # setdefault：归到首个（有证据候选先处理，证据最完整）
                     by_src_line.setdefault(
                         ((f.taint_type or "").lower(), norm_src, f.sink_line), key)
@@ -3990,8 +4084,16 @@ if __name__ == "__main__":
             "evidence": "ast.literal_eval is the recommended safe alternative"}) == "safe-rule",
         TwoStageScanner._infer_taint_type({"taint_type": "safe-rule", "rule_id": "safe-rule",
             "evidence": "The parsed result is evaluated and cached for reuse"}) == "safe-rule",
+        # 2026-09-20 补（裸 logger 撞词修复回归防线）：安全建议文本
+        # "avoid global logger configuration" 曾被 `"logger" in text` 误归
+        # Log Injection；现裸 logger 须同时出现写日志语境才归本族。
+        TwoStageScanner._infer_taint_type({"taint_type": "log-safe-rule", "rule_id": "log-safe-rule",
+            "evidence": "avoid global logger configuration"}) == "log-safe-rule",
+        # 正样本对照：真写日志形态（logger.info + 注入语义）仍正确归 Log Injection
+        TwoStageScanner._infer_taint_type({"taint_type": "log-rule", "rule_id": "log-rule",
+            "evidence": "logger.info(user input written to logs without sanitization)"}) == "Log Injection",
     ])
-    print(f"[{'PASS' if ok_tail else 'FAIL'}] 待办1 长尾类型推断: XXE/LDAP/NoSQL 分支")
+    print(f"[{'PASS' if ok_tail else 'FAIL'}] 待办1 长尾类型推断: XXE/LDAP/NoSQL/Log 分支")
 
     # 22) §五之四 抑制留痕（2026-08-30）：候选被抑制池跳过时 stage1 字典留痕
     #     suppressed_by_registry——"工具层零召回"由此可归因（没命中 vs 命中后被抑制），
@@ -4319,11 +4421,104 @@ if __name__ == "__main__":
           f"真凭证→{_by_rule['aws-access-key-id'].category}/"
           f"{_by_rule['aws-access-key-id'].taint_type}（期望 secret/Hardcoded Credentials）")
 
+    # --- 用例 #27（2026-09-20）：_prefilter_recall 异常留痕（P1 消静默）------
+    # 此前 except Exception: return [] 无任何留痕——prefilter 崩溃与"无命中"
+    # 不可区分，是全链路唯一静默的召回通道。现异常写入 _last_tool_status
+    # （与 semgrep/bandit 的 P2-9 状态机制同构，stage1["tool_status"] 读端已有）
+    # 并 print 一条，仍返回 []。
+    import io as _io
+    from contextlib import redirect_stdout as _rso
+
+    class _BoomPrefilter:
+        def scan(self, code, language):
+            raise RuntimeError("mock prefilter crash")
+
+    _pf_scanner = TwoStageScanner.__new__(TwoStageScanner)
+    _pf_scanner._prefilter = _BoomPrefilter()
+    _buf_pf = _io.StringIO()
+    with _rso(_buf_pf):
+        _pf_findings = _pf_scanner._prefilter_recall("x = 1\n", "python")
+    ok_pf_trace = (_pf_findings == []
+                   and _pf_scanner._last_tool_status.get("prefilter", "").startswith("exception:")
+                   and "RuntimeError" in _buf_pf.getvalue())
+    print(f"[{'PASS' if ok_pf_trace else 'FAIL'}] prefilter 异常留痕: findings={len(_pf_findings)}, "
+          f"status={_pf_scanner._last_tool_status.get('prefilter')!r}, "
+          f"日志含异常类型={'RuntimeError' in _buf_pf.getvalue()}")
+
+    # --- 用例 #28（2026-09-20）：_run_external_semgrep 同内容共享一次执行 ----
+    # 此前 _semgrep_recall 与 _external_positional_recall 各写一个临时文件
+    # （路径不同）→ ExternalScanner._semgrep_cache 恒失效，同一份 code 每文件
+    # 跑 2 次 semgrep 进程（规则加载+解析两遍）。现在：同一调用内 taint/sast
+    # 共用一个临时文件（路径级缓存命中一次执行）；跨调用按 sha256(语言+内容)
+    # 直接复用解析结果；临时文件每次调用独立创建（不挂实例共享路径，防
+    # stage1 4 线程池并发互踩）。
+    class _CountingExternal:
+        def __init__(self):
+            self.taint_calls = 0
+            self.sast_calls = 0
+            self.paths = []
+            self.last_status = {}
+
+        def scan_taint(self, path, language):
+            self.taint_calls += 1
+            self.paths.append(("taint", path))
+            return [{"rule_id": "sqli-taint", "tool": "semgrep", "sink_line": 3}]
+
+        def scan_sast(self, path, language):
+            self.sast_calls += 1
+            self.paths.append(("sast", path))
+            return []
+
+    _ce = _CountingExternal()
+    _ms = TwoStageScanner.__new__(TwoStageScanner)
+    _ms._external = _ce
+    _ms._semgrep_content_cache = {}
+    _ta1, _sa1 = _ms._run_external_semgrep("CODE_A", "python", "a.py")
+    _ta2, _sa2 = _ms._run_external_semgrep("CODE_A", "python", "a.py")  # 同内容 → 内容缓存复用
+    _tb1, _sb1 = _ms._run_external_semgrep("CODE_B", "python", "b.py")  # 不同内容 → 新执行
+    _rf = _ms._semgrep_recall("CODE_A", "python", "a.py")               # recall 端走同一缓存
+    ok_semgrep_share = (
+        _ta1 == _ta2 and _ta1 and _ta1[0]["rule_id"] == "sqli-taint"
+        and _sa1 == _sa2 == []
+        and _ce.taint_calls == 2 and _ce.sast_calls == 2     # 每个唯一内容恰执行一次
+        and _ce.paths[0][1] == _ce.paths[1][1]               # 同一次调用内 taint/sast 共用一个临时文件
+        and _ce.paths[0][1] != _ce.paths[2][1]               # 不同调用的临时文件相互独立
+        and len(_rf) == 1 and _rf[0].rule_id == "sqli-taint"
+        and _ce.taint_calls == 2)                            # recall 复用缓存后执行数不增
+    print(f"[{'PASS' if ok_semgrep_share else 'FAIL'}] semgrep 同内容共享执行: "
+          f"taint执行={_ce.taint_calls}, sast执行={_ce.sast_calls}（期望 2/2）, "
+          f"同调用同临时文件={_ce.paths[0][1] == _ce.paths[1][1]}（期望 True）, "
+          f"recall复用缓存={len(_rf) == 1 and _ce.taint_calls == 2}（期望 True）")
+
+    # --- 用例 #29（2026-09-20）：n_samples finally 恢复点的并发穿插警告 -----
+    # 临时突变+finally 恢复的契约依赖调用方持 _model_lock 串行（部分修复，
+    # 完整线程安全化本次不做）。本用例模拟并发穿插（扫描中途他方改写
+    # n_samples），断言恢复点留一条警告、且恢复后默认值不被并发值污染。
+    _inter_scanner = TwoStageScanner(
+        client=FakeClient(outputs), system_prompt="sys", n_samples=3,
+        use_semgrep=False, use_taint_tracker=False, use_prefilter=False,
+        use_external=False, sampling_rate=0)
+
+    def _inter_recall(code, language, filename):
+        _inter_scanner.n_samples = 5  # 模拟并发请求在扫描中途穿插突变
+        return []
+
+    _inter_scanner._stage1_recall = _inter_recall
+    _buf_in = _io.StringIO()
+    with _rso(_buf_in):
+        _inter_scanner.scan_code("x = 1\n", "python", "inter.py", n_samples=1)
+    ok_inter_warn = ("并发穿插" in _buf_in.getvalue()
+                     and _inter_scanner.n_samples == 3)
+    print(f"[{'PASS' if ok_inter_warn else 'FAIL'}] n_samples 穿插警告: "
+          f"恢复后默认={_inter_scanner.n_samples}（期望 3）, "
+          f"警告留痕={'并发穿插' in _buf_in.getvalue()}（期望 True）")
+
     print("\n", "=== 自检通过 ===" if all([ok_parse, ok_dedupe, ok_adjud, ok_safe,
           ok_direct, ok_full, ok_rag_default, ok_gate1, ok_gate2, ok_gate3,
           ok_recheck_type, ok_anchor, ok_majority, ok_entry, ok_noleak,
           ok_wire, ok_chain, ok_b3, ok_b3b, ok_dedupe3, ok_dedupe4, ok_dedupe5,
           ok_rawtype, ok_strip, ok_tail, ok_trace, ok_tnorm, ok_wave4,
           ok_t_c, ok_t_c2, ok_t_c3, ok_t_a, ok_t_b, ok_t_bs, ok_t_inj,
-          ok_t_noreg, ok_t_off, ok_secret_gate, ok_t1src])
+          ok_t_noreg, ok_t_off, ok_secret_gate, ok_t1src,
+          ok_pf_trace, ok_semgrep_share, ok_inter_warn])
           else "=== 存在失败用例 ===")

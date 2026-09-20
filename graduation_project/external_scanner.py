@@ -175,7 +175,11 @@ def _extract_taint_endpoint(extra: dict, name: str) -> tuple[str, int]:
     field = "taint_source" if name == "SOURCE" else "taint_sink"
     ts = extra.get(field) or {}
     content = ts.get("content") or (ts.get("location") or {}).get("content") or ""
-    line = int((ts.get("location") or {}).get("start", {}).get("line", 0) or 0)
+    # 2026-09-20 修复：start 键存在但值为 null 时，.get("start", {}) 返回的是
+    # None（dict.get 的默认值只在键**缺失**时生效），随后 .get("line") 抛
+    # AttributeError——并被上层 except 整体吞掉，丢掉该文件 sast+taint 全部
+    # 结果。改为对齐 161/170 行的 (…) or {} 写法（键缺失与值为 null 同样兜底）。
+    line = int(((ts.get("location") or {}).get("start") or {}).get("line", 0) or 0)
     return str(content), line
 
 
@@ -899,6 +903,32 @@ if __name__ == "__main__":
     import os
 
     print("=== 外部扫描器自检 ===\n")
+
+    # 2026-09-20 补：_extract_taint_endpoint 对 start=null 的防御回归（离线）。
+    # 缺陷实锤：taint_source.location.start 键存在但值为 null 时，
+    # .get("start", {}) 返回的是 None（dict.get 默认值只在键**缺失**时生效），
+    # 随后 .get("line") 抛 AttributeError 并被上层 except 整体吞掉——该文件
+    # sast+taint 全部结果丢失。修复后 null/缺失/正常三种形态都必须不抛异常。
+    _ok_null_start = True
+    _null_cases = [
+        ({"taint_sink": {"location": {"start": None, "content": "x"}}}, "SINK", ("x", 0)),
+        ({"taint_sink": {"location": None}}, "SINK", ("", 0)),
+        ({"taint_sink": None}, "SINK", ("", 0)),
+        ({"taint_source": {"location": {"start": {"line": 7}}, "content": "src"}}, "SOURCE", ("src", 7)),
+    ]
+    for _extra, _name, _expect in _null_cases:
+        try:
+            _got = _extract_taint_endpoint(_extra, _name)
+        except Exception as _e:
+            _ok_null_start = False
+            print(f"  [FAIL] _extract_taint_endpoint({_extra}) 抛异常: "
+                  f"{type(_e).__name__}: {_e}")
+            continue
+        if _got != _expect:
+            _ok_null_start = False
+            print(f"  [FAIL] _extract_taint_endpoint({_extra}) = {_got} (期望 {_expect})")
+    print(f"[{'PASS' if _ok_null_start else 'FAIL'}] taint endpoint 解析: "
+          f"start=null / location=null / 字段缺失 不抛异常，正常行号可取")
 
     scanner = ExternalScanner()
     available = scanner.available_tools()

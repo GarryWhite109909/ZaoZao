@@ -12,7 +12,9 @@
   [3] 安全工具      —— pip 工具(bandit/semgrep/pip-audit/detect-secrets) + 系统二进制(gitleaks/trivy)
   [4] Ollama 模型   —— 删除 ~/.ollama（含 OLLAMA_MODELS 指定目录）
   [5] Ollama 本体   —— Windows(winget/uninstaller) / macOS(brew/官方App) / Linux(apt/官方脚本)
-  [6] 推理加速栈    —— NVIDIA CUDA / AMD ROCm（Linux 系统级 apt 包 + /opt/rocm，需 sudo）
+  [6] 推理加速栈    —— AMD ROCm（Linux 系统级 apt 包 + /opt/rocm，需 sudo）；
+                      NVIDIA 驱动/CUDA 系统包一律不动（本项目从未安装系统级
+                      驱动，卸载用户显卡驱动风险极高），仅随 [2] 清理 pip 侧 torch
   [7] 本地运行数据  —— data/chroma_db、outputs/、logs/、models/、__pycache__、egg-info、HF/torch 缓存
   [8] 编辑器插件    —— VS Code / IntelliJ 中已安装的本项目插件（尽力而为）
   [9] 项目文件夹    —— 删除整个项目目录（ZaoZao / 历史 Graduation-Project，自动切换工作目录后删除，Windows 可用）
@@ -243,7 +245,10 @@ def stop_processes(ui: UI):
         else:
             r = run(["pkill", "-9", "-x", "ollama"], timeout=10)
             if r.returncode != 0:
-                run(["pkill", "-9", "-f", "ollama"], timeout=10)
+                # 2026-09-20 修复：`pkill -f ollama` 会误杀命令行里恰好含 "ollama"
+                # 字样的无关进程（甚至本脚本自身路径含 ollama 时自匹配），
+                # 收窄为只匹配 "ollama serve"；[o] 正则确保模式串本身不会被匹配。
+                run(["pkill", "-9", "-f", "[o]llama serve"], timeout=10)
         ui.ok("已停止 Ollama")
     else:
         ui.ok("未安装 Ollama，跳过")
@@ -260,7 +265,14 @@ def remove_ollama_model(ui: UI):
     if env_models:
         p = Path(env_models).expanduser()
         if str(p) not in [str(Path(x).expanduser()) for x in candidates]:
-            candidates.append(str(p))
+            # 2026-09-20 修复：OLLAMA_MODELS 可能指向任意目录（含用户手动指定、
+            # 与本项目无关的存储），只有具备 ollama 模型库签名——同时含 blobs/ 与
+            # manifests/ 子目录——才允许整删，否则打印跳过原因。
+            if (p / "blobs").is_dir() and (p / "manifests").is_dir():
+                candidates.append(str(p))
+            else:
+                print(f"  ⚠ OLLAMA_MODELS 指向 {p}，但缺少 ollama 模型库签名"
+                      f"（blobs/ + manifests/ 子目录），已跳过，不删除")
     found = False
     for d in candidates:
         p = Path(d).expanduser()
@@ -438,33 +450,15 @@ def uninstall_accel_stack(ui: UI):
             ui.ok("未检测到 ROCm，跳过")
 
         # --- NVIDIA CUDA ---
+        # 2026-09-20 修复：彻底移除 `apt-get purge "*cuda*" "*cudnn*" "*nvidia*"
+        # "nvidia-driver-*"` 及其关联 autoremove。本项目从未安装过系统级 NVIDIA
+        # 驱动/CUDA（GPU 支持全部经 pip wheel 提供），按通配符批量 purge 会把用户
+        # 自己安装的显卡驱动整组拔掉（重启后黑屏/降级到 llvmpipe），属于不可逆的
+        # 高危操作。NVIDIA 相关只随 [2/9] 卸载 pip 侧 torch 等包，系统组件不碰。
         has_cuda = which("nvidia-smi") or which("nvcc") or which("nvidia-settings")
         if has_cuda:
-            ui.warn("检测到 NVIDIA 驱动 / CUDA")
-            if ui.confirm("卸载 NVIDIA 驱动与 CUDA 包 (需要 sudo；将移除显卡驱动)"):
-                cuda_files = [str(p) for p in glob.glob("/etc/apt/sources.list.d/cuda*.list")] + \
-                             [str(p) for p in glob.glob("/etc/apt/sources.list.d/nvidia-ml.list")]
-                for f in cuda_files:
-                    if ui.confirm(f"删除 {f}"):
-                        r = run(_sudo_cmd(["rm", "-f", f]), timeout=60)
-                        if r.returncode == 0:
-                            ui.ok(f"已删除 {f}")
-                        else:
-                            ui.err(f"删除 {f} 失败")
-                if not which("apt-get"):
-                    ui.warn("未检测到 apt-get（非 Debian/Ubuntu 系）：驱动/CUDA 系统包请用 dnf/pacman/zypper 等手动清理")
-                else:
-                    # apt 支持 * 通配包名（不需要 shell 引号）
-                    r = run(_sudo_cmd(["apt-get", "purge", "-y",
-                                       "*cuda*", "*cudnn*", "*nvidia*",
-                                       "nvidia-driver-*"]), timeout=600)
-                    r2 = run(_sudo_cmd(["apt-get", "autoremove", "--purge", "-y"]), timeout=600)
-                    if r.returncode == 0 and r2.returncode == 0:
-                        ui.ok("已卸载 NVIDIA 驱动/CUDA 包")
-                    else:
-                        ui.warn("NVIDIA 部分包可能未完全卸载，建议检查包管理器输出")
-            else:
-                ui.warn("跳过 NVIDIA 驱动/CUDA 卸载")
+            ui.ok("检测到 NVIDIA 驱动/CUDA：系统级驱动与 CUDA 包保持不动（非本项目安装），"
+                  "pip 侧 torch 已在 [2/9] 清理")
         else:
             ui.ok("未检测到 NVIDIA CUDA，跳过")
     else:
@@ -474,7 +468,7 @@ def uninstall_accel_stack(ui: UI):
 # ===========================================================================
 # 2. 卸载 Python 依赖
 # ===========================================================================
-def uninstall_python_deps(ui: UI):
+def uninstall_python_deps(ui: UI, purge_optional: bool = False):
     ui.info("\n[2/9] 卸载 Python 依赖...")
     # 始终使用当前解释器的 pip，保证“在哪个环境装就在哪个环境卸”
     r = run([sys.executable, "-m", "pip", "--version"])
@@ -496,8 +490,14 @@ def uninstall_python_deps(ui: UI):
         if r2.returncode == 0:
             installed.add(_dist_name)
 
+    # 2026-09-20 修复：通用间接依赖（PIP_OPTIONAL，numpy/pandas/transformers 等
+    # 40+ 包）常与机器上其他项目共享，默认不卸载，仅显式 --purge-deps 才纳入；
+    # --yes 全自动模式同样默认跳过这批包。
+    names = list(PIP_PACKAGES)
+    if purge_optional:
+        names += PIP_OPTIONAL
     to_remove = []
-    for pkg in PIP_PACKAGES + PIP_OPTIONAL:
+    for pkg in names:
         key = pkg.replace("_", "-").lower()
         if key in installed:
             to_remove.append(pkg)
@@ -514,6 +514,12 @@ def uninstall_python_deps(ui: UI):
             else:
                 ui.warn("pip 卸载可能未完全成功，可手动执行 pip uninstall -y "
                         + " ".join(to_remove))
+        if not purge_optional:
+            optional_present = [p for p in PIP_OPTIONAL
+                                if p.replace("_", "-").lower() in installed]
+            if optional_present:
+                ui.info(f"  （已跳过 {len(optional_present)} 个通用间接依赖: "
+                        f"{', '.join(optional_present[:6])} 等；如需一并清理请加 --purge-deps）")
 
     # pip 下载缓存（torch 等大 wheel 装完后缓存可达数 GB，与已装包无关，单独清理）
     if ui.confirm("清理 pip 下载缓存（pip cache purge）"):
@@ -607,10 +613,14 @@ def remove_local_data(ui: UI, project_root: Path):
             p = project_root / rel
             if p.exists():
                 targets.append(p)
-        # 递归清理缓存 / 构建残留（真正的 rglob 实现）
+        # 清理缓存 / 构建残留。
+        # 2026-09-20 修复：由 project_root.rglob 深层递归改为只处理项目根的
+        # **直接子级**（project_root.glob）——深层递归曾把 docs/、experiments/
+        # 第三方仓库内部等无关位置的同名目录一并纳入删除范围，且大项目上极慢；
+        # 构建残留基本都产生在项目根直接子级，深层场景随 [9/9] 整删项目时兜底。
         for pattern in ["__pycache__", "*.egg-info", ".pytest_cache",
                         ".mypy_cache", ".ruff_cache", "chroma_db", ".cache"]:
-            for p in project_root.rglob(pattern):
+            for p in project_root.glob(pattern):
                 if p.is_dir() and p not in targets:
                     targets.append(p)
     # 用户级共享缓存（跨环境共享，README 已提示会同时影响其他项目）
@@ -687,7 +697,11 @@ def remove_editor_plugins(ui: UI):
                 continue
             for cand in plugins.iterdir():
                 name = cand.name.lower()
-                if "vuln" in name and ("scanner" in name or "scan" in name):
+                # 2026-09-20 修复：原模糊匹配（"vuln"+"scan"）可能误删用户安装的
+                # 名字相近的第三方安全类插件。收窄为精确名单——与
+                # app/intellij-extension/build.gradle.kts 的 pluginName = "vuln-scanner"
+                # 一致；从 zip 安装时目录会带版本号后缀（如 vuln-scanner-0.1.0）。
+                if name == "vuln-scanner" or name.startswith("vuln-scanner-"):
                     found = True
                     if ui.confirm(f"删除 IntelliJ 插件 {cand}"):
                         try:
@@ -767,7 +781,11 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="只打印将执行的动作，不删除")
     ap.add_argument("--keep-project", action="store_true", help="保留项目文件夹")
     ap.add_argument("--keep-ollama", action="store_true", help="保留 Ollama 本体与模型")
-    ap.add_argument("--keep-accel", action="store_true", help="保留 CUDA/ROCm 系统组件")
+    ap.add_argument("--keep-accel", action="store_true", help="保留 ROCm 系统组件（NVIDIA 驱动/CUDA 系统包从不触碰）")
+    # 2026-09-20 修复：PIP_OPTIONAL 是 40+ 个通用库（numpy/pandas/transformers 等），
+    # 极可能与机器上其他项目共享，默认不再批量卸载；仅显式传本开关才清理。
+    ap.add_argument("--purge-deps", action="store_true",
+                    help="同时卸载通用间接依赖（numpy/pandas/transformers 等 40+ 包；默认不卸，避免影响其他项目）")
     ap.add_argument("--stage2", help="内部参数：删除项目文件夹阶段")
     ap.add_argument("--project", default=None, help="项目根目录（默认自动探测）")
     args = ap.parse_args()
@@ -790,7 +808,17 @@ def main():
         for p in [cand, cand.parent, cand.parent.parent, cand.parent.parent.parent,
                   cand.parent.parent.parent.parent]:
             if p.name in PROJECT_DIR_HINTS:
-                project_root = p
+                # 2026-09-20 修复：目录名命中不等于项目根——单独复制本脚本到任意
+                # 同名目录（如 ~/backup/ZaoZao）会让 [9/9] 整删无关目录。必须先
+                # 通过 _looks_like_project_root 项目标记校验，否则打印原因并退出。
+                if _looks_like_project_root(p):
+                    project_root = p
+                else:
+                    ui.err(f"目录 {p} 名字命中项目名（{p.name}），但缺少项目标记"
+                           f"（pyproject.toml / requirements.txt / app/backend/main.py），")
+                    ui.err("不能确认是本项目根目录，已拒绝自动选择。")
+                    ui.err("请 cd 进真正的项目根目录后重跑，或用 --project /path/to/project 显式指定。")
+                    sys.exit(2)
                 break
         if project_root is None:
             # 最后手段：当前目录。必须"长得像项目根"才允许继续，
@@ -810,7 +838,7 @@ def main():
 
     # 按顺序清理（编号与各函数内部 [n/9] 一致）
     stop_processes(ui)                # [1/9]
-    uninstall_python_deps(ui)         # [2/9]
+    uninstall_python_deps(ui, purge_optional=args.purge_deps)  # [2/9]
     uninstall_security_tools(ui)      # [3/9]
     if args.keep_ollama:
         ui.info("[4/9] 已按 --keep-ollama 保留 Ollama 本体与模型")
