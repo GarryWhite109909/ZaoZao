@@ -73,11 +73,15 @@ _LIB_NAME_RE = re.compile(
     r"vue(?:\.runtime)?(?:\.global)?(?:\.prod)?(?:\.min)?|bootstrap(?:\.bundle|\.min)?|"
     r"popper(?:\.min)?|chart(?:\.umd|\.min)?|echarts(?:\.min)?|d3(?:\.v[0-9]+)?(?:\.min)?|"
     r"three(?:\.module)?(?:\.min)?|swiper(?:\.bundle)?(?:\.min)?|gsap(?:\.min)?|"
-    r"gtag(?:/js|\.)|gtm\.js|analytics(?:\.js|-debug)?|fbevents\.js|pixel(?:\.min)?\.js|"
-    r"hm\.js|web-sdk|js-sdk|td\.js|ga\.js|"
+    r"gtag(?:/js|\.)|gtm\.js|googletagmanager\.js|fbevents\.js|pixel(?:\.min)?\.js|"
+    r"analytics(?:\.min)?\.js|hm\.js|web-sdk|js-sdk|td\.js|ga\.js|"
     # 带域名才有意义的库（自 _LIB_HOST_RE 迁入的路径形态）：reCAPTCHA /
-    # Yandex Metrika / gitee libs / 淘宝 a.js 统计脚本
-    r"recaptcha|metrika|libs|a\.js"
+    # Yandex Metrika。
+    # 2026-09-20 收窄（宁可少拦、不可误杀站点自有脚本）：libs 改为要求路径段
+    # 形式 libs(?=/)（即 /libs/…，裸 libs 连 /mysite/libs.py 都会误杀）；删除裸
+    # a\.js（任何叫 a.js 的站点自有脚本都会被误杀）；pixel/analytics 收窄为
+    # 要求 .js 文件名形态（裸 analytics 连 /api/analytics 路径都会误杀）
+    r"recaptcha|metrika|libs(?=/)"
     r")(?:\.[\w.]*)?(?:$|[/?#])",
     re.IGNORECASE,
 )
@@ -152,6 +156,9 @@ class FetchResult:
     scripts: list[FetchedScript] = field(default_factory=list)
     inline_html: str = ""  # 含事件处理器的 HTML 片段
     skipped_libs: list[str] = field(default_factory=list)  # 被公共库过滤跳过的外链
+    # 2026-09-20 新增：因 max_scripts 预算在下载前被截断的外链（供前端提示，
+    # 与"公共库"区分——这些不是库，只是预算外）
+    skipped_budget: list[str] = field(default_factory=list)
     error: str | None = None
 
     @property
@@ -305,7 +312,12 @@ def _safe_get(session: requests.Session, url: str, timeout: int, redirects_left:
     return resp, None
 
 
-def fetch_url(url: str, timeout: int = 15, skip_common_libs: bool = True) -> FetchResult:
+def fetch_url(
+    url: str,
+    timeout: int = 15,
+    skip_common_libs: bool = True,
+    max_scripts: int | None = None,
+) -> FetchResult:
     """抓取目标 URL，提取所有 JS 脚本和可疑 HTML 片段。
 
     Args:
@@ -314,95 +326,107 @@ def fetch_url(url: str, timeout: int = 15, skip_common_libs: bool = True) -> Fet
         skip_common_libs: 是否跳过公共 CDN/统计分析库（这些脚本不是站点
             自有攻击面，却各消耗 3 次 LLM 采样，是 URL 扫描慢的主因）。
             被跳过的外链记入 result.skipped_libs 供前端提示。
+        max_scripts: 脚本总数预算（None 不设限）。2026-09-20 修复（审计）：
+            预算检查前移到外链**下载之前**——原先所有外链全量下载完，才由
+            上层扫描预算截断，预算外脚本的流量（各至多 2MB）白白消耗。
+            达到预算后未下载的外链记入 result.skipped_budget 供前端提示。
 
     Returns:
         FetchResult，scripts 至少包含 0 个元素。
     """
     result = FetchResult(url=url)
     session = requests.Session()
-
-    resp, err = _safe_get(session, url, timeout)
-    if err:
-        result.error = err
-        return result
+    # 2026-09-20 修复（审计）：Session 显式关闭——原先依赖 GC 回收底层连接池，
+    # 长驻后端进程反复抓取会泄漏 socket/fd
     try:
-        resp.raise_for_status()
-        html = _read_limited(resp)
-    except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else "?"
-        result.error = f"HTTP {status}"
-        return result
-    except requests.RequestException as e:
-        # 正文流式读取阶段的中断（ChunkedEncodingError / ConnectionError 等）
-        # 原先只捕 HTTPError，这类异常会穿透成 url-scan 500
-        result.error = f"读取中断 ({type(e).__name__})"
+        resp, err = _safe_get(session, url, timeout)
+        if err:
+            result.error = err
+            return result
+        try:
+            resp.raise_for_status()
+            html = _read_limited(resp)
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            result.error = f"HTTP {status}"
+            return result
+        except requests.RequestException as e:
+            # 正文流式读取阶段的中断（ChunkedEncodingError / ConnectionError 等）
+            # 原先只捕 HTTPError，这类异常会穿透成 url-scan 500
+            result.error = f"读取中断 ({type(e).__name__})"
+            return result
+        finally:
+            resp.close()
+
+        # 提取 title
+        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+        if m:
+            result.title = m.group(1).strip()
+
+        # 提取内联 <script>...</script>
+        # src= 前用 (?<![\w-]) 而非 \b：\b 会被 data-src= / lazy-src= 里的 "-" 边界
+        # 误判为外链，导致真实内联逻辑被漏扫
+        inline_pattern = re.compile(
+            r"<script(?![^>]*(?<![\w-])src=)[^>]*>(.*?)</script>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for m in inline_pattern.finditer(html):
+            content = m.group(1).strip()
+            if content:
+                result.scripts.append(FetchedScript(
+                    source="inline",
+                    language="javascript",
+                    content=content,
+                ))
+
+        # 提取外链 <script src="...">
+        src_pattern = re.compile(
+            r'<script[^>]*\bsrc=["\']([^"\']+)["\'][^>]*>',
+            re.IGNORECASE,
+        )
+        for m in src_pattern.finditer(html):
+            src_url = m.group(1)
+            full_url = urljoin(url, src_url)
+            if skip_common_libs and is_common_library_url(full_url):
+                result.skipped_libs.append(full_url)
+                continue  # 公共库不下载、不进扫描
+            # 预算检查必须在下载之前（2026-09-20 前移，见 docstring）
+            if max_scripts is not None and len(result.scripts) >= max_scripts:
+                result.skipped_budget.append(full_url)
+                continue
+            js_resp, js_err = _safe_get(session, full_url, timeout)
+            if js_err:
+                continue  # 外链失败不阻断，跳过
+            try:
+                js_resp.raise_for_status()
+                result.scripts.append(FetchedScript(
+                    source=full_url,
+                    language="javascript",
+                    content=_read_limited(js_resp),
+                ))
+            except requests.RequestException:
+                # HTTPError / ChunkedEncodingError / ConnectionError 统统跳过该外链
+                continue
+            finally:
+                js_resp.close()
+
+        # 提取含事件处理器的 HTML 片段（onclick=, onload= 等）
+        event_pattern = re.compile(
+            r"<[^>]+\bon\w+\s*=\s*[\"'][^\"']+[\"'][^>]*>",
+            re.IGNORECASE,
+        )
+        event_matches = event_pattern.findall(html)
+        if event_matches:
+            result.inline_html = "\n".join(event_matches[:20])  # 限制数量
+            result.scripts.append(FetchedScript(
+                source="inline-html-events",
+                language="html",
+                content=result.inline_html,
+            ))
+
         return result
     finally:
-        resp.close()
-
-    # 提取 title
-    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
-    if m:
-        result.title = m.group(1).strip()
-
-    # 提取内联 <script>...</script>
-    # src= 前用 (?<![\w-]) 而非 \b：\b 会被 data-src= / lazy-src= 里的 "-" 边界
-    # 误判为外链，导致真实内联逻辑被漏扫
-    inline_pattern = re.compile(
-        r"<script(?![^>]*(?<![\w-])src=)[^>]*>(.*?)</script>",
-        re.IGNORECASE | re.DOTALL,
-    )
-    for m in inline_pattern.finditer(html):
-        content = m.group(1).strip()
-        if content:
-            result.scripts.append(FetchedScript(
-                source="inline",
-                language="javascript",
-                content=content,
-            ))
-
-    # 提取外链 <script src="...">
-    src_pattern = re.compile(
-        r'<script[^>]*\bsrc=["\']([^"\']+)["\'][^>]*>',
-        re.IGNORECASE,
-    )
-    for m in src_pattern.finditer(html):
-        src_url = m.group(1)
-        full_url = urljoin(url, src_url)
-        if skip_common_libs and is_common_library_url(full_url):
-            result.skipped_libs.append(full_url)
-            continue  # 公共库不下载、不进扫描
-        js_resp, js_err = _safe_get(session, full_url, timeout)
-        if js_err:
-            continue  # 外链失败不阻断，跳过
-        try:
-            js_resp.raise_for_status()
-            result.scripts.append(FetchedScript(
-                source=full_url,
-                language="javascript",
-                content=_read_limited(js_resp),
-            ))
-        except requests.RequestException:
-            # HTTPError / ChunkedEncodingError / ConnectionError 统统跳过该外链
-            continue
-        finally:
-            js_resp.close()
-
-    # 提取含事件处理器的 HTML 片段（onclick=, onload= 等）
-    event_pattern = re.compile(
-        r"<[^>]+\bon\w+\s*=\s*[\"'][^\"']+[\"'][^>]*>",
-        re.IGNORECASE,
-    )
-    event_matches = event_pattern.findall(html)
-    if event_matches:
-        result.inline_html = "\n".join(event_matches[:20])  # 限制数量
-        result.scripts.append(FetchedScript(
-            source="inline-html-events",
-            language="html",
-            content=result.inline_html,
-        ))
-
-    return result
+        session.close()
 
 
 if __name__ == "__main__":

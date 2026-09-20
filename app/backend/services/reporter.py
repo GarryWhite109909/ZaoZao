@@ -12,8 +12,26 @@ from graduation_project.result_types import BatchResult, SingleResult
 
 
 def _md_cell(value) -> str:
-    """表格单元格转义：裸 | 会断列，换行会断行。"""
-    return str(value if value is not None else "").replace("|", "\\|").replace("\r", "").replace("\n", " ")
+    """表格单元格转义：裸 | 会断列，换行会断行。
+
+    2026-09-20 修复（报告注入）：单元格内容多来自模型输出，可能含 <script>、
+    [链接](url)、行首 # 标题、反引号代码块等结构——原样进 Markdown 报告会被
+    渲染器解释。在表格转义之外追加 HTML 转义与 Markdown 结构符中和，保证
+    渲染为字面文本。
+    """
+    s = str(value if value is not None else "")
+    # 1) HTML 转义（& 必须最先转义，避免后续序列被二次转义）
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # 2) 表格结构：竖线断列、回车/换行断行
+    s = s.replace("|", "\\|").replace("\r", "").replace("\n", " ")
+    # 3) Markdown 结构符中和：链接/图片/行内代码语法全部失效为字面文本
+    s = s.replace("[", "\\[").replace("]", "\\]")
+    s = s.replace("`", "\\`").replace("!", "\\!")
+    # 4) 行首 # / - 会被解析为标题/列表：单元格内换行已替换为空格，
+    #    只剩整格开头这一处"行首"
+    if s.startswith("#") or s.startswith("-"):
+        s = "\\" + s
+    return s
 
 
 def _md_fence(text: str) -> str:

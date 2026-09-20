@@ -186,8 +186,13 @@ class MultiModelScanner:
                     per_file_results[i].append((model, r))
             finally:
                 # 关键安全：该模型所有文件扫完，立即卸载释放显存
-                # 放在 finally 确保即使中途异常也能卸载，避免显存泄漏
-                scanner.unload()
+                # 放在 finally 确保即使中途异常也能卸载，避免显存泄漏。
+                # 2026-09-20 修复（对齐 scan_code 已有的纪律）：Ollama 闪断时
+                # unload 自身也会抛网络异常，不能让卸载失败炸掉整轮投票
+                try:
+                    scanner.unload()
+                except Exception as e:
+                    print(f"[MultiModelScanner] 模型 {model} 卸载失败: {e}")
 
         vote_results: list[VoteResult] = []
         for i, (filename, language, _) in enumerate(files):

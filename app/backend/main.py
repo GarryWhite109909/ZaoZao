@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -121,6 +122,25 @@ two_stage = TwoStageScanner(
 # 稳健项：sync_runtime 只覆盖 system_prompt，不覆盖 triage_aligned；显式置位确保切模型后不回退
 two_stage.triage_aligned = True
 
+# 批量场景（URL / GitHub / 工作区）的无候选复核策略。
+# "targeted"（默认）：三档定向复核——按"文件风险分 × 盲区命中"分配注意力，
+#   零盲区文件不送 LLM。大仓库下替代 full_recheck（后者对每个无候选文件都做
+#   全文件 × min(3,n) 票，成本随文件数线性爆炸）。
+# "full_recheck"：回退旧行为（每个无候选文件全量复核），供 A/B 对比与论文消融。
+# 2026-09-20：上移到 _two_stage_scan 之前——后者把本常量用作参数默认值
+# （默认值在函数定义时求值），原先的定义位置会在 import 时 NameError。
+BATCH_NO_CANDIDATE_MODE = os.environ.get(
+    "VULN_SCANNER_BATCH_RECHECK_MODE", "targeted")
+
+# URL 扫描专用复核模式覆盖（2026-09-19 引入、2026-09-20 修正默认值）：
+# 默认跟随 BATCH_NO_CANDIDATE_MODE（targeted）——经验证 targeted 模式下 JS
+# 脚本经"工具候选裁决 / 盲区 B 档复核"已有 LLM 参与（demo-site 实测 6/6 脚本
+# 触发 LLM），无需 URL 场景单独全量复核。保留本变量供演示场景切换：
+# 设 VULN_SCANNER_URL_RECHECK_MODE=full_recheck 可让每个 URL 脚本都被
+# 模型通读（演示"模型在干活"时用，成本 = 每脚本 1 票）。
+URL_NO_CANDIDATE_MODE = os.environ.get(
+    "VULN_SCANNER_URL_RECHECK_MODE", BATCH_NO_CANDIDATE_MODE)
+
 
 def _two_stage_scan(
     code: str,
@@ -128,7 +148,7 @@ def _two_stage_scan(
     filename: str,
     use_rag: Optional[bool] = None,
     n_samples: Optional[int] = None,
-    no_candidate_mode: Optional[str] = None,
+    no_candidate_mode: str = BATCH_NO_CANDIDATE_MODE,
 ):
     """两阶段扫描统一入口。
 
@@ -139,11 +159,15 @@ def _two_stage_scan(
     2026-08-15 修复：改用 sync_runtime 统一同步——此前反事实验证器
     （two_stage._counterfactual）在构造时捕获 prompt，切模型后 Layer 2 的翻转
     判定永远用旧 prompt 跑（client 因原地 mutate 侥幸同对象，prompt 是真 bug）。
+
+    2026-09-20 修复（审计：跨请求状态泄漏）：no_candidate_mode 此前默认 None
+    时"不改写全局单例"，导致 url-scan 设置的值泄漏到后续单文件/批量/GitHub
+    扫描。改为默认 BATCH_NO_CANDIDATE_MODE 且无条件赋值——每次扫描显式决定
+    复核策略，单例不再携带上一请求的状态。
     """
     with scanner._model_lock:
         two_stage.sync_runtime(client=scanner.client, system_prompt=scanner.system_prompt)
-        if no_candidate_mode is not None:
-            two_stage.no_candidate_mode = no_candidate_mode
+        two_stage.no_candidate_mode = no_candidate_mode
         return two_stage.scan_code(
             code=code, language=language, filename=filename,
             n_samples=n_samples, use_rag=use_rag,
@@ -235,23 +259,9 @@ MAX_BATCH_TOTAL_BYTES = 10 * 1024 * 1024        # 批量总大小上限（10MB�
 # 截断"：排序只能在前 N 个里排，auth/ 目录仍可能未被收集到。
 COLLECT_HARD_CAP_FILES = 3000
 COLLECT_HARD_CAP_BYTES = 200 * 1024 * 1024      # 200MB
-
-# 批量场景（URL / GitHub / 工作区）的无候选复核策略。
-# "targeted"（默认）：三档定向复核——按"文件风险分 × 盲区命中"分配注意力，
-#   零盲区文件不送 LLM。大仓库下替代 full_recheck（后者对每个无候选文件都做
-#   全文件 × min(3,n) 票，成本随文件数线性爆炸）。
-# "full_recheck"：回退旧行为（每个无候选文件全量复核），供 A/B 对比与论文消融。
-BATCH_NO_CANDIDATE_MODE = os.environ.get(
-    "VULN_SCANNER_BATCH_RECHECK_MODE", "targeted")
-
-# URL 扫描专用复核模式覆盖（2026-09-19 引入、2026-09-20 修正默认值）：
-# 默认跟随 BATCH_NO_CANDIDATE_MODE（targeted）——经验证 targeted 模式下 JS
-# 脚本经"工具候选裁决 / 盲区 B 档复核"已有 LLM 参与（demo-site 实测 6/6 脚本
-# 触发 LLM），无需 URL 场景单独全量复核。保留本变量供演示场景切换：
-# 设 VULN_SCANNER_URL_RECHECK_MODE=full_recheck 可让每个 URL 脚本都被
-# 模型通读（演示"模型在干活"时用，成本 = 每脚本 1 票）。
-URL_NO_CANDIDATE_MODE = os.environ.get(
-    "VULN_SCANNER_URL_RECHECK_MODE", BATCH_NO_CANDIDATE_MODE)
+# 单个代码文件读取上限（2026-09-20，审计：任意文件读/内存防护）：克隆产物可含
+# 符号链接与超大文件，读取超限截断并留痕，防止恶意仓库撑爆内存
+COLLECT_MAX_FILE_BYTES = 512 * 1024             # 512KB
 
 # ---------------------------------------------------------------------------
 # Pydantic 请求模型
@@ -925,14 +935,20 @@ def get_stats():
         # 从最近扫描中提取漏洞列表（用于"最近动态"）
         recent_findings = []
         for scan in recent[:5]:
+            # 2026-09-20 修复（审计）：recent_scans 从 data/scan_stats.json 恢复，
+            # 历史版本/手工编辑可能产生缺键或类型不对的坏条目——防御式取键，
+            # 坏数据跳过，不能让 /api/stats 整个 500
+            if not isinstance(scan, dict):
+                continue
             for r in scan.get("results", []):
-                if r.get("has_vulnerability") is True:
-                    recent_findings.append({
-                        "filename": r["filename"],
-                        "vulnerability_type": r["vulnerability_type"],
-                        "risk_level": r["risk_level"],
-                        "timestamp": scan["timestamp"],
-                    })
+                if not isinstance(r, dict) or r.get("has_vulnerability") is not True:
+                    continue
+                recent_findings.append({
+                    "filename": r.get("filename", ""),
+                    "vulnerability_type": r.get("vulnerability_type", ""),
+                    "risk_level": r.get("risk_level", ""),
+                    "timestamp": scan.get("timestamp", ""),
+                })
 
         return {
             "total_scans": _scan_stats["total_scans"],
@@ -958,9 +974,14 @@ async def _await_scan(future):
         return await future, None
     except Exception as e:
         # 503 只告诉客户端"暂时不可用"，真实故障（内部 bug / 模型崩溃）必须留栈，
-        # 否则主线扫描完全不可观测
+        # 否则主线扫描完全不可观测。
+        # 2026-09-20 修复（审计）：不再把 str(e) 回显给客户端（可能泄漏内部
+        # 路径/堆栈细节），完整异常仅入日志
         logger.exception("扫描任务失败: %s", e)
-        return None, JSONResponse({"error": str(e)}, status_code=503)
+        return None, JSONResponse(
+            {"error": "扫描服务暂时不可用，请稍后重试（详情见后端日志）"},
+            status_code=503,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1302,14 +1323,18 @@ def _scan_minified_secrets(scripts: list) -> list[dict]:
 async def url_scan(req: UrlScanRequest, request: Request):
     """抓取目标 URL 的所有脚本，逐个扫描（LOW 优先级，让路交互式）。"""
     client_id = resolve_client_id(request.headers.get("x-client-type"), fallback="web")
-    # SSRF 防护：仅允许公网 http/https，重定向前同样校验目标地址
-    url_err = validate_target_url(req.url)
+    # SSRF 防护：仅允许公网 http/https，重定向前同样校验目标地址。
+    # 2026-09-20 修复：validate_target_url 内部有两次同步 getaddrinfo，在 async
+    # 端点里直调会阻塞事件循环，改走线程池
+    url_err = await asyncio.to_thread(validate_target_url, req.url)
     if url_err:
         return JSONResponse({"error": url_err, "url": req.url}, status_code=400)
     # fetch_url 是同步阻塞（requests），放线程池避免卡事件循环；
-    # 公共库过滤默认开（skip_common_libs=False 恢复全量抓取）
+    # 公共库过滤默认开（skip_common_libs=False 恢复全量抓取）。
+    # 2026-09-20：max_scripts 预算下推到抓取层——外链在下载前即按预算截断，
+    # 不再"全量下载完才由扫描预算丢弃"（白耗流量）。
     fetch_result = await asyncio.to_thread(
-        fetch_url, req.url, 15, req.skip_common_libs,
+        fetch_url, req.url, 15, req.skip_common_libs, req.max_scripts,
     )
 
     if fetch_result.error:
@@ -1319,7 +1344,11 @@ async def url_scan(req: UrlScanRequest, request: Request):
         )
 
     if not fetch_result.scripts:
+        # 2026-09-20 修复：空结果分支与成功分支结构对齐——补 summary
+        # （results: [] 与计数），保留旧顶层 results/message 键兼容旧前端
+        empty_summary = BatchResult(total_files=0).to_dict()
         return {"url": req.url, "title": fetch_result.title, "results": [],
+                "summary": empty_summary,
                 "message": "未找到可分析的脚本"}
 
     # 构建产物降级（2026-09-19）：压缩/打包脚本（标识符破坏，gitee 实测
@@ -1349,7 +1378,10 @@ async def url_scan(req: UrlScanRequest, request: Request):
         scan_scripts = kept
 
     if not scan_scripts:
+        # 2026-09-20 修复：同上，空分支也带 summary（旧键保留兼容）
+        empty_summary = BatchResult(total_files=0).to_dict()
         return {"url": req.url, "title": fetch_result.title, "results": [],
+                "summary": empty_summary,
                 "message": "未找到可分析的脚本" + (
                     "（全部脚本为压缩/打包构建产物，已跳过语义扫描）" if skipped_minified else ""),
                 "skipped_minified": skipped_minified,
@@ -1378,6 +1410,8 @@ async def url_scan(req: UrlScanRequest, request: Request):
         "total_scripts": fetch_result.total_scripts,
         # 被公共库过滤跳过的外链（前端提示；skip_common_libs=False 时为空）
         "skipped_libs": fetch_result.skipped_libs,
+        # 2026-09-20：因 max_scripts 预算在下载前被截断的外链（前端提示）
+        "skipped_budget": fetch_result.skipped_budget,
         # 被构建产物启发式跳过语义扫描的压缩/打包脚本（前端提示；恢复全量见环境变量）
         "skipped_minified": skipped_minified,
         # 压缩产物上确定性密钥扫描的直出发现（零 LLM 成本，bundle 泄漏密钥照报）
@@ -1456,15 +1490,36 @@ def _clone_and_collect(req: GithubScanRequest) -> tuple[Optional[str], Optional[
             # 依赖清单单独收集（不读内容、不占代码文件硬上限）——trivy 逐清单扫描
             if (fname.lower() in _DEP_MANIFEST_NAMES
                     and len(dep_manifests) < _DEP_MANIFEST_CAP):
-                dep_manifests.append(os.path.join(root, fname))
+                _mpath = os.path.join(root, fname)
+                # 2026-09-20 修复（审计：任意文件读）：跳过符号链接清单，
+                # 防止恶意仓库借清单把仓库外任意路径喂给 trivy
+                if not os.path.islink(_mpath):
+                    dep_manifests.append(_mpath)
                 continue
             ext = Path(fname).suffix.lower()
             if ext not in EXT_TO_LANG:
                 continue
             fpath = os.path.join(root, fname)
+            # 2026-09-20 修复（审计：任意文件读）：克隆产物中的符号链接/非常规
+            # 文件（FIFO、设备等）可指向 /etc/passwd 等仓库外路径诱导读取回显。
+            # 只读常规文件：islink 拦符号链接，stat + S_ISREG 拦其余非常规文件
+            if os.path.islink(fpath):
+                continue
             try:
-                with open(fpath, "r", encoding="utf-8", errors="replace") as fp:
-                    content = fp.read()
+                st = os.stat(fpath)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            try:
+                # 单文件读取上限：超限截断并在尾部留痕（告警/审计可感知，不静默）
+                if st.st_size > COLLECT_MAX_FILE_BYTES:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as fp:
+                        content = fp.read(COLLECT_MAX_FILE_BYTES)
+                    content += "\n# [truncated by scanner]"
+                else:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as fp:
+                        content = fp.read()
                 rel_path = os.path.relpath(fpath, clone_target)
                 code_files.append((rel_path, EXT_TO_LANG[ext], content))
                 collected_bytes += len(content)
@@ -1741,6 +1796,12 @@ async def multi_model_scan(req: MultiModelRequest, request: Request):
 # ---------------------------------------------------------------------------
 # vLLM 推理后端单文件分析
 # ---------------------------------------------------------------------------
+# 2026-09-20 修复（审计）：本端点是同步 def（跑在 anyio 线程池），重量段无并发
+# 上限——并发请求会把线程池 worker 全占住，拖垮其它端点。信号量限 2 并发
+# （vLLM continuous batching 本就是为小并发高吞吐设计，2 路足以打满吞吐）。
+_VLLM_SEMAPHORE = threading.Semaphore(2)
+
+
 @app.post("/api/vllm-analyze")
 def vllm_analyze(req: VllmAnalyzeRequest):
     """使用 vLLM（OpenAI 兼容 API）后端分析单段代码。
@@ -1748,30 +1809,31 @@ def vllm_analyze(req: VllmAnalyzeRequest):
     vLLM 通过 PagedAttention + continuous batching 提供高吞吐推理，
     适合批量评测场景；接口与 /api/analyze 对齐，便于前端无缝切换后端。
     """
-    vllm_client = VLLMClient()
-    if not vllm_client.check_connection():
-        return JSONResponse(
-            {"error": "vLLM 服务未启动（默认 http://localhost:8000）"},
-            status_code=503,
-        )
+    with _VLLM_SEMAPHORE:
+        vllm_client = VLLMClient()
+        if not vllm_client.check_connection():
+            return JSONResponse(
+                {"error": "vLLM 服务未启动（默认 http://localhost:8000）"},
+                status_code=503,
+            )
 
-    # 与 /api/analyze 走同一套两阶段流水线（工具召回 + LLM 裁决），仅替换推理
-    # 后端为 vLLM，避免绕过 TwoStageScanner 导致能力不一致。
-    # 注意：此处有意绕过优先级调度器——调度器是为 Ollama OLLAMA_NUM_PARALLEL=1 的
-    # 单并发显存约束设计；vLLM 自带 PagedAttention + continuous batching 高吞吐并发，
-    # 直接同步推理即可，不占用 Ollama 队列（避免 vLLM 任务被误排 LOW 拖慢）。
-    vllm_two_stage = TwoStageScanner(
-        client=vllm_client,
-        system_prompt=get_prompt_for_model(vllm_client.model),
-        num_ctx=int(os.environ.get("VULN_SCANNER_NUM_CTX", "6144")),
-        triage_aligned=True,  # 与全局 two_stage 一致，对齐论文 fixed5 组态
-        no_candidate_mode="full_recheck",
-        n_samples=3,
-    )
-    return vllm_two_stage.scan_code(
-        code=req.code, language=req.language, filename=req.filename,
-        use_rag=req.use_rag,
-    ).to_dict()
+        # 与 /api/analyze 走同一套两阶段流水线（工具召回 + LLM 裁决），仅替换推理
+        # 后端为 vLLM，避免绕过 TwoStageScanner 导致能力不一致。
+        # 注意：此处有意绕过优先级调度器——调度器是为 Ollama OLLAMA_NUM_PARALLEL=1 的
+        # 单并发显存约束设计；vLLM 自带 PagedAttention + continuous batching 高吞吐并发，
+        # 直接同步推理即可，不占用 Ollama 队列（避免 vLLM 任务被误排 LOW 拖慢）。
+        vllm_two_stage = TwoStageScanner(
+            client=vllm_client,
+            system_prompt=get_prompt_for_model(vllm_client.model),
+            num_ctx=int(os.environ.get("VULN_SCANNER_NUM_CTX", "6144")),
+            triage_aligned=True,  # 与全局 two_stage 一致，对齐论文 fixed5 组态
+            no_candidate_mode="full_recheck",
+            n_samples=3,
+        )
+        return vllm_two_stage.scan_code(
+            code=req.code, language=req.language, filename=req.filename,
+            use_rag=req.use_rag,
+        ).to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -2021,6 +2083,12 @@ LLAMACPP_BASE_GGUF_URL = (
 )
 
 
+# 2026-09-20 修复（审计）：下载线程会读改写 NO_PROXY/代理环境变量，并发下载
+# （transformers 与 GGUF 同时进行）时无锁的"读-合并-写"会互相覆盖丢项。
+# 环境变量组合写必须原子，用进程级锁串行化（临界区仅内存操作，无阻塞风险）。
+_PROXY_ENV_LOCK = threading.Lock()
+
+
 def _no_proxy_for_mirrors(*hosts: str) -> None:
     """让指定的国内镜像域名直连、不走代理（写入并合并 NO_PROXY/no_proxy）。
 
@@ -2028,15 +2096,16 @@ def _no_proxy_for_mirrors(*hosts: str) -> None:
     镜像下载也走代理，既会秒断（代理对国内域名路由不佳），又会白白消耗代理流量
     （几个 GB 的模型流量瞬间用光）。这里把镜像域名追加进 NO_PROXY，强制直连镜像。
     """
-    no_proxy = set(
-        h.strip()
-        for h in os.environ.get("NO_PROXY", "").replace(";", ",").split(",")
-        if h.strip()
-    )
-    no_proxy |= {h for h in hosts if h and h.strip()}
-    val = ",".join(sorted(no_proxy))
-    os.environ["NO_PROXY"] = val
-    os.environ["no_proxy"] = val
+    with _PROXY_ENV_LOCK:
+        no_proxy = set(
+            h.strip()
+            for h in os.environ.get("NO_PROXY", "").replace(";", ",").split(",")
+            if h.strip()
+        )
+        no_proxy |= {h for h in hosts if h and h.strip()}
+        val = ",".join(sorted(no_proxy))
+        os.environ["NO_PROXY"] = val
+        os.environ["no_proxy"] = val
 
 
 def _normalize_socks_proxy() -> None:
@@ -2047,12 +2116,39 @@ def _normalize_socks_proxy() -> None:
     socks:// 会在下载时抛 "ValueError: Unknown scheme for proxy URL"。
     这里在发起网络下载前统一把 socks:// 修正为 socks5://。
     """
-    for _var in ("ALL_PROXY", "all_proxy",
-                 "HTTP_PROXY", "http_proxy",
-                 "HTTPS_PROXY", "https_proxy"):
-        _val = os.environ.get(_var, "").strip()
-        if _val.lower().startswith("socks://"):
-            os.environ[_var] = "socks5://" + _val[len("socks://"):]
+    with _PROXY_ENV_LOCK:
+        for _var in ("ALL_PROXY", "all_proxy",
+                     "HTTP_PROXY", "http_proxy",
+                     "HTTPS_PROXY", "https_proxy"):
+            _val = os.environ.get(_var, "").strip()
+            if _val.lower().startswith("socks://"):
+                os.environ[_var] = "socks5://" + _val[len("socks://"):]
+
+
+def _set_transformers_base_under_lock(dest: str) -> None:
+    """在 scanner._model_lock 内把 transformers 基座指向刚下载的本地目录。
+
+    2026-09-20 修复（审计：事件循环冻结）：此前下载完成回调在 async 生成器里
+    直接 with scanner._model_lock——该锁在整场 LLM 扫描期间被持有（分钟级），
+    事件循环线程随之冻结、所有请求（含下载心跳）全部停摆。持锁临界区抽成
+    同步函数，由调用方经 asyncio.to_thread 执行，等锁发生在工作线程。
+    """
+    client = scanner.client
+    if type(client).__name__ != "TransformersClient":
+        return
+    with scanner._model_lock:
+        client.model_id = dest
+        client.model = dest
+
+
+def _bind_llamacpp_gguf_under_lock(dest: str) -> None:
+    """在 scanner._model_lock 内把 llamacpp 后端绑定到刚下载的 GGUF（同上）。"""
+    client = scanner.client
+    if type(client).__name__ != "LlamaCppClient":
+        return
+    with scanner._model_lock:
+        client.base_gguf = dest
+        client.model = dest
 
 
 def _models_dir() -> Path:
@@ -2417,10 +2513,11 @@ async def models_download_hf(req: HfDownloadRequest):
                 if type(client).__name__ == "TransformersClient":
                     if Path(r["dest"]).name == (client.model_id or "").split("/")[-1]:
                         if (Path(r["dest"]) / "config.json").is_file():
-                            # 与 switch_model 同锁：避免在途扫描 chunk 中途被换基座
-                            with scanner._model_lock:
-                                client.model_id = str(Path(r["dest"]))
-                                client.model = client.model_id
+                            # 与 switch_model 同锁：避免在途扫描 chunk 中途被换基座。
+                            # 2026-09-20 修复：临界区抽成同步函数走 to_thread，
+                            # 事件循环不再原地等 _model_lock（整场扫描分钟级）
+                            await asyncio.to_thread(
+                                _set_transformers_base_under_lock, str(Path(r["dest"])))
                             _trigger_transformers_warmup()
                             auto_loaded = True
             except Exception:
@@ -2462,6 +2559,16 @@ async def models_download_gguf(req: GgufDownloadRequest):
     # 防路径穿越
     if "/" in filename or "\\" in filename or ".." in filename:
         return JSONResponse({"error": "filename 含非法字符"}, status_code=400)
+
+    # SSRF 防护（2026-09-20 修复）：此前本端点对用户 URL 无任何校验（同文件
+    # url-scan / github-scan 均经 validate_target_url 拦内网/回环地址），可被
+    # 用来探测内网服务。校验内部有同步 getaddrinfo（两次 DNS 解析），必须用
+    # asyncio.to_thread 包住，避免阻塞事件循环。校验原始 URL（镜像改写前）。
+    url_err = await asyncio.to_thread(validate_target_url, url)
+    if url_err:
+        return JSONResponse(
+            {"error": f"下载地址被拒绝: {url_err}", "url": url}, status_code=400,
+        )
 
     # 只允许下载"未合并基座" GGUF：拒绝指向已合并 LoRA 的发布模型（URL/文件名含其标记）。
     # 否则基座本身已带 LoRA，运行时再经 lora_path 叠加会二次叠加，结果错误。
@@ -2591,10 +2698,10 @@ async def models_download_gguf(req: GgufDownloadRequest):
             try:
                 client = scanner.client
                 if type(client).__name__ == "LlamaCppClient":
-                    # 与 switch_model 同锁：避免在途扫描 chunk 中途被换基座
-                    with scanner._model_lock:
-                        client.base_gguf = r["dest"]
-                        client.model = r["dest"]
+                    # 与 switch_model 同锁：避免在途扫描 chunk 中途被换基座。
+                    # 2026-09-20 修复：同 transformers——临界区走 to_thread，
+                    # 事件循环不等 _model_lock
+                    await asyncio.to_thread(_bind_llamacpp_gguf_under_lock, r["dest"])
                     auto_bound = True
             except Exception:
                 auto_bound = False

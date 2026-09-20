@@ -271,8 +271,19 @@ _SINK_DEFINITIONS: list[tuple[str, str]] = [
     ("axios.post(", "SSRF"),
     ("http.request(", "SSRF"),                     # Node 原生 http 模块
     # redirect 尾缀通用覆盖：Flask redirect( / Django redirect( / Express
-    # res.redirect( / Java sendRedirect( 全部以 "redirect" 结尾（§五之三 论证）
+    # res.redirect( 都以小写 "redirect(" 出现且左侧非标识符字符，被本条命中
+    # （§五之三 论证）。
+    # 2026-09-20 修正本条注释的历史错误论证（P1 修复的根因）：Java 的
+    # sendRedirect( **不**被该条覆盖——"Redirect" 的 R 大写（大小写敏感失配），
+    # 且 redirect 前一字符是 send 的尾字母 'd'，撞上 _compile 加的
+    # (?<![A-Za-z0-9_]) 左边界断言（防 exec 命中 myexec 的）→ 双重失配，
+    # Java 开放重定向整类零召回（自检探针实锤）。修复：新增专有条目
+    # sendRedirect(（语言限定见 _SINK_LANG_ONLY）；本条 redirect( 保留，
+    # 继续覆盖 Flask/Django/Express 与 Java 侧自定义封装 redirect( 形态。
     ("redirect(", "Open Redirect"),
+    # 2026-09-20 补（P1）：javax.servlet.http.HttpServletResponse.sendRedirect(
+    # 是 Java Servlet 开放重定向的标准 API 名（语言级事实，无第二语义）。
+    ("sendRedirect(", "Open Redirect"),
 ]
 
 _SINK_TAINT_TYPE: dict[str, str] = {pat: ttype for pat, ttype in _SINK_DEFINITIONS}
@@ -319,6 +330,9 @@ _SINK_LANG_ONLY: dict[str, set[str]] = {
     "ObjectInputStream(": {"java"}, "readObject(": {"java"},
     "parseExpression(": {"java"}, "Ognl.getValue(": {"java"},
     "parseObject(": {"java"},
+    # 2026-09-20 补（P1）：sendRedirect( 是 Java Servlet 专有 API，限定 java
+    # （JS/TS 无此名，保守不泛匹配）
+    "sendRedirect(": {"java"},
     # PHP 专有
     "mysqli_query(": {"php"}, "mysql_query(": {"php"},
     "->query(": {"php"}, "unserialize(": {"php"},
@@ -329,7 +343,11 @@ _SINK_LANG_ONLY: dict[str, set[str]] = {
     # Python 专有
     "search_s(": {"python"}, "urlopen(": {"python"}, "urlretrieve(": {"python"},
     # JS/TS 专有（Python 的同名 urllib 已由上面两条覆盖；Node 的 http 模块名与
-    "needle.get(": {"javascript"}, "needle.post(": {"javascript"},
+    # 2026-09-20 修复（P1）：needle.get/needle.post 此前只列 {"javascript"}，
+    # 同表的 axios 族都是 js+ts——TS 项目用 needle 的 SSRF 形态整类漏召回
+    # （自检探针实锤）。补 "typescript"，与 axios 口径对齐。
+    "needle.get(": {"javascript", "typescript"},
+    "needle.post(": {"javascript", "typescript"},
     # Python 的 http.client 撞名，限定到 JS/TS 避免误用）
     "axios(": {"javascript", "typescript"},
     "axios.get(": {"javascript", "typescript"},
@@ -492,7 +510,12 @@ class TaintTracker:
         try:
             code_bytes = code.encode("utf-8")
             tree = self._parser_for(ts_lang).parse(code_bytes)
-        except Exception:
+        except Exception as e:
+            # 2026-09-20 修复（P1 消静默）：AST 解析崩溃此前被 except 静默吞成
+            # return []，与"无漏洞"不可区分（B1 静默性同构）。trace 以文件为
+            # 粒度调用，此处一条日志即按文件粒度留痕，不会刷屏；仍返回 []。
+            print(f"[TaintTracker] {filename or '<inline>'} 解析失败，污点追踪降级为空: "
+                  f"{type(e).__name__}: {str(e)[:160]}")
             return []
 
         root = tree.root_node
@@ -634,6 +657,11 @@ class TaintTracker:
                 tainted[name] = _Taint(f"param:{name}", line, [name])
 
         is_module = func_node.type not in _FUNCTION_NODE_TYPES.get(ts_lang, set())
+        # 2026-09-20 修复（P1，Path Traversal 全文件级防御抑制）：取本作用域
+        # （即 sink 所在函数）的源码文本，供 _context_safe_sink 把防御特征
+        # 检查限定在函数内——模块级作用域时 func_node 是根节点，文本=全文件，
+        # 与旧行为一致。
+        scope_text = self._node_text(func_node, code_bytes)
         for stmt in self._iter_statements(func_node, ts_lang, skip_nested=is_module):
             stmt_line = stmt.start_point[0] + 1
             stmt_text = self._node_text(stmt, code_bytes)
@@ -758,7 +786,8 @@ class TaintTracker:
                         continue
                     if self._is_parameterized_sql(label, ttype, args, var, arg_clean):
                         continue  # 参数化查询：数据在绑定参数里，不报
-                    if self._context_safe_sink(label, ttype, args, var, code_bytes):
+                    if self._context_safe_sink(label, ttype, args, var, code_bytes,
+                                               scope_text=scope_text):
                         continue  # 语境安全：列表参数 subprocess / 模板值插值 / autoescape
                     paths.append(TaintPath(
                         t.origin, label, ttype,
@@ -1103,42 +1132,59 @@ class TaintTracker:
         逐字符扫描，正确处理转义与单/双引号混合，避免跨字符串吞掉中间代码。
         f-string 需要记住"当前在 f-string 内"，否则闭引号会被误判为新的开引号，
         把 f"{a}" + "lit" 这类拼接中间的操作符吞掉。
+
+        2026-09-20 修复（自检探针实锤）两个误剥离缺陷：
+        1. 三引号字面量（三连单引号 / 三连双引号）此前不识别——docstring 里
+           含引号的片段（如 ``"说明: 'quoted' 内容"`` 形态的三引号串）会把
+           内层 ``quoted`` 泄漏为"代码"参与污点/变量匹配。现按三引号整体
+           跳过（f 前缀 + 三引号的组合同样支持）。
+        2. f 前缀判定 ``text[i-1].lower()=="f"`` 把前置恰为 f 的普通字符串误判
+           为 f-string（``if"x" == y:`` 的 f 属于标识符 if）。现要求该 f 自身
+           是独立前缀 token——其前一字符不是 [A-Za-z0-9_]。
         """
         out: list[str] = []
         i = 0
         n = len(text)
         in_fstring = False
-        fstring_quote = ""
+        fstring_quote = ""  # 当前 f-string 的引号（1 或 3 个字符）
         fstring_brace_depth = 0
         while i < n:
             ch = text[i]
             if in_fstring:
-                out.append(ch)
-                if ch == fstring_quote and fstring_brace_depth == 0:
+                if (fstring_brace_depth == 0
+                        and text[i:i + len(fstring_quote)] == fstring_quote):
+                    out.append(fstring_quote)
                     in_fstring = False
-                elif ch == "{":
+                    i += len(fstring_quote)
+                    continue
+                out.append(ch)
+                if ch == "{":
                     fstring_brace_depth += 1
                 elif ch == "}":
                     fstring_brace_depth = max(0, fstring_brace_depth - 1)
                 i += 1
                 continue
             if ch in "\"'":
-                # 前面紧挨 f/F 的是 f-string：整体保留（interpolation 是表达式）
-                if i > 0 and text[i - 1].lower() == "f":
-                    out.append(ch)
+                # 三引号优先判定（''' / """），否则按单引号处理
+                quote = text[i:i + 3] if text[i:i + 3] in ('"""', "'''") else ch
+                # f 前缀仅当：前一字符恰为 f/F，且该 f 自身不是标识符尾
+                # （text[i-2] 不是 [A-Za-z0-9_]；i<2 时 f 位于串首即独立 token）
+                is_f = (i > 0 and text[i - 1] in "fF"
+                        and (i < 2 or not (text[i - 2].isalnum() or text[i - 2] == "_")))
+                if is_f:
+                    out.append(quote)
                     in_fstring = True
-                    fstring_quote = ch
+                    fstring_quote = quote
                     fstring_brace_depth = 0
-                    i += 1
+                    i += len(quote)
                     continue
-                quote = ch
-                i += 1
+                i += len(quote)
                 while i < n:
                     if text[i] == "\\":
                         i += 2
                         continue
-                    if text[i] == quote:
-                        i += 1
+                    if text[i:i + len(quote)] == quote:
+                        i += len(quote)
                         break
                     i += 1
             else:
@@ -1234,6 +1280,7 @@ class TaintTracker:
 
     def _context_safe_sink(
         self, label: str, ttype: str, args: list[str], var: str, code_bytes: bytes,
+        scope_text: str = "",
     ) -> bool:
         """sink 语境安全判定（P0 修复，消灭工具规则误报）。
 
@@ -1257,6 +1304,8 @@ class TaintTracker:
             args: sink 调用参数文本列表（已有解析结果）
             var: 当前污染变量名
             code_bytes: 文件字节（用于检查 autoescape 语境）
+            scope_text: sink 所在作用域（函数）的源码文本（2026-09-20 补）；
+                为空时回退全文件文本（保持旧调用方行为不变）
 
         Returns:
             True = 语境安全（不应报）；False = 需进一步裁决/报告。
@@ -1305,14 +1354,20 @@ class TaintTracker:
             # open(污点路径) 但函数内存在完整防御链：白名单校验（filename in 集合）
             # + abspath/realpath 归一化 + startswith 前缀校验 → 判安全（safe_04 类）。
             # abspath 与 startswith 常跨行赋值（abs_target = abspath(...) 下一行
-            # abs_target.startswith(...)），故按同文件共存判定而非同行。
-            file_text = code_bytes.decode("utf-8", errors="replace")
+            # abs_target.startswith(...)），故按同函数共存判定而非同行。
+            # 2026-09-20 修复（P1）：三个防御特征此前读**全文件**文本——同文件
+            # A 函数有白名单防御、B 函数是真漏洞时，B 的 open() 污点路径被
+            # 全文件级的防御特征整体吞掉（函数级防御被放大成文件级豁免，漏报）。
+            # 现把检查范围限定到 sink 所在函数的源码段（scope_text 由
+            # _analyze_scope 按作用域传入）；未传（模块级/旧调用方）时回退
+            # 全文件，保持旧行为。
+            scope = scope_text or code_bytes.decode("utf-8", errors="replace")
             has_whitelist = re.search(
                 r"(?:if|while)\s+[\w.]+\s+not\s+in\s+[\w.]+\s*:",
-                file_text,
+                scope,
             )
-            has_abspath = re.search(r"(?:abspath|realpath)\s*\(", file_text)
-            has_startswith_guard = re.search(r"\.\s*startswith\s*\(", file_text)
+            has_abspath = re.search(r"(?:abspath|realpath)\s*\(", scope)
+            has_startswith_guard = re.search(r"\.\s*startswith\s*\(", scope)
             if has_whitelist and has_abspath and has_startswith_guard:
                 return True
             return False
@@ -1741,6 +1796,68 @@ def share():
          '    // comment line\n'
          '    const preTax = eval(req.body.preTax);\n'
          '};', "javascript", [(3, "Code Injection")]),
+        # ---------------------------------------------------------------
+        # 2026-09-20 补（P1 修复回归防线）：Path Traversal 的白名单+abspath+
+        # startswith 防御特征检查此前读**全文件**文本——同文件 A 函数有防御、
+        # B 函数是真漏洞时，B 被整体吞掉（函数级防御放大成文件级豁免，漏报）。
+        # 现限定到 sink 所在函数：A 的 open 仍被抑制（负样本对照），B 必须报出。
+        # ---------------------------------------------------------------
+        ("Python 函数级防御·他函数漏洞须报",
+         'import os\n'
+         'from flask import request\n'
+         '\n'
+         'def defended_download():\n'
+         '    filename = request.args.get("f", "")\n'
+         '    allowed = {"a.txt", "b.txt"}\n'
+         '    if filename not in allowed:\n'
+         '        abort(400)\n'
+         '    base = os.path.abspath("/var/data")\n'
+         '    target = os.path.join(base, filename)\n'
+         '    if not target.startswith(base):\n'
+         '        abort(403)\n'
+         '    return open(target).read()\n'
+         '\n'
+         'def vuln_download():\n'
+         '    name = request.args.get("f", "")\n'
+         '    return open("/data/" + name).read()\n',
+         "python", [(17, "Path Traversal")]),
+        # 负样本对照：防御链与 sink 同函数时仍按语境安全抑制（防修复过头）
+        ("Python 函数级防御·同函数仍抑制",
+         'import os\n'
+         'from flask import request\n'
+         '\n'
+         'def defended_download():\n'
+         '    filename = request.args.get("f", "")\n'
+         '    allowed = {"a.txt", "b.txt"}\n'
+         '    if filename not in allowed:\n'
+         '        abort(400)\n'
+         '    base = os.path.abspath("/var/data")\n'
+         '    target = os.path.join(base, filename)\n'
+         '    if not target.startswith(base):\n'
+         '        abort(403)\n'
+         '    return open(target).read()\n',
+         "python", []),
+        # 2026-09-20 补（P1）：sendRedirect( 此前被 redirect( 死规则遗漏——
+        # "Redirect" 大写 R + 前邻标识符字符 'd' 撞左边界断言，Java 开放重定向
+        # 整类零召回。专有条目上线后必须召回；redirect( 条目保留覆盖自定义封装
+        # （下一用例对照）。
+        ("Java sendRedirect(→开放重定向)",
+         'class T{void f(HttpServletRequest r) throws Exception{\n'
+         '  String u = r.getParameter("u");\n'
+         '  response.sendRedirect(u);\n'
+         '}}', "java", [(3, "Open Redirect")]),
+        ("Java 自定义封装 redirect(→开放重定向)",
+         'class T{void f(HttpServletRequest r) throws Exception{\n'
+         '  String u = r.getParameter("u");\n'
+         '  redirect(u);\n'
+         '}}', "java", [(3, "Open Redirect")]),
+        # 2026-09-20 补（P1）：needle.get(/needle.post( 的语言白名单此前漏
+        # "typescript"（同表 axios 族均为 js+ts），TS 侧 SSRF 整类漏召回。
+        ("TS needle.get(→SSRF)",
+         'function h(req: any, res: any) {\n'
+         '  const url = req.query.url;\n'
+         '  needle.get(url, cb);\n'
+         '}', "typescript", [(3, "SSRF")]),
     ]
     ok_sink = True
     for label, src, lang, expect in sql_cases:
@@ -1749,5 +1866,38 @@ def share():
         ok_sink = ok_sink and ok_case
         print(f"[{'PASS' if ok_case else 'FAIL'}] {label}: {got} (期望 {expect})")
 
-    all_ok = ok_compound and ok_sink
+    # 2026-09-20 补：_strip_string_literals 三引号 / f 前缀回归（探针实锤：
+    # docstring 含引号片段泄漏为"代码"；if"x" 的 f 被误判成 f-string 前缀；
+    # 真 f-string 的 interpolation 与 f-三引号必须原样保留）
+    _strip = tracker._strip_string_literals
+    ok_strip = (
+        _strip('x = """说明: "quoted" 内容"""') == "x = "
+        and _strip("y = '''it's doc'''") == "y = "
+        and _strip('if"x" == y:') == "if == y:"
+        and _strip('msg = f"hello {name}" + "lit"') == 'msg = f"hello {name}" + '
+        and _strip('q = f"""{a} lit """') == 'q = f"""{a} lit """'
+    )
+    print(f"[{'PASS' if ok_strip else 'FAIL'}] 字符串剥离: 三引号整体跳过 / f 前缀须独立 token / f-string 保留")
+
+    # 2026-09-20 补：trace() 异常留痕（P1 消静默）——AST 崩溃不得与"无漏洞"
+    # 不可区分。用坏 parser 触发异常，断言返回 [] 且留痕输出含异常类型与文件名。
+    import io as _io
+    from contextlib import redirect_stdout as _rso
+
+    class _BoomParser:
+        def parse(self, *_a, **_k):
+            raise ValueError("mock ast crash")
+
+    _bad = TaintTracker()
+    _bad._local.parsers = {"python": _BoomParser()}
+    _buf = _io.StringIO()
+    with _rso(_buf):
+        _crash_paths = _bad.trace("x = 1\n", language="python", filename="crash.py")
+    _crash_log = _buf.getvalue()
+    ok_crash = (_crash_paths == [] and "ValueError" in _crash_log
+                and "crash.py" in _crash_log)
+    print(f"[{'PASS' if ok_crash else 'FAIL'}] trace 异常留痕: paths={len(_crash_paths)}, "
+          f"日志含异常类型与文件名={'ValueError' in _crash_log and 'crash.py' in _crash_log}")
+
+    all_ok = ok_compound and ok_sink and ok_strip and ok_crash
     print(f"\n{'=== 自检通过 ===' if all_ok else '!!! 自检失败 !!!'}")

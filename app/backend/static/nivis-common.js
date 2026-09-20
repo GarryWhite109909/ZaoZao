@@ -120,8 +120,11 @@
        config: { svg, points: [{x,y,data}], left, right, top, bottom, formatTip: fn(data)->string } */
     attachTrendHover: function (config) {
       var svg = config.svg;
-      if (!svg || svg.__nivisHoverBound) return;
-      svg.__nivisHoverBound = true;
+      if (!svg) return;
+      // 2026-09-20 修复：页面重渲染（svg.innerHTML 重写）会销毁交互层节点，
+      // 但旧监听器仍挂在 svg 上、操作已脱离 DOM 的 layer——悬停静默失效。
+      // 改为"先清理旧绑定再挂新"，本函数可在每次渲染后安全重复调用。
+      if (svg.__nivisHoverCleanup) { svg.__nivisHoverCleanup(); svg.__nivisHoverCleanup = null; }
       var SVG_NS = 'http://www.w3.org/2000/svg';
       var points = config.points || [];
       var left = config.left, right = config.right, top = config.top, bottom = config.bottom;
@@ -193,7 +196,7 @@
         tipText.setAttribute('opacity', '0');
       }
 
-      svg.addEventListener('mousemove', function (e) {
+      function onMove(e) {
         var mx = clientToSvgX(e.clientX);
         if (mx < left || mx > right) { hideAll(); return; }
         // 找最近的数据点（X 方向），仅在非常接近时吸附，避免点稀疏时全屏瞬移
@@ -221,8 +224,14 @@
           tipRect.setAttribute('opacity', '0');
           tipText.setAttribute('opacity', '0');
         }
-      });
+      }
+      svg.addEventListener('mousemove', onMove);
       svg.addEventListener('mouseleave', hideAll);
+      svg.__nivisHoverCleanup = function () {
+        svg.removeEventListener('mousemove', onMove);
+        svg.removeEventListener('mouseleave', hideAll);
+        if (layer.parentNode) layer.removeChild(layer);
+      };
     }
   };
 

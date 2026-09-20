@@ -65,9 +65,12 @@
 
       // 模型未下载时 badge 显示警告色
       var modelOk = info.model_available;
-      var dotClass = backend;
+      // 2026-09-20 修复：backend 名直接拼进 class 有样式注入面，收窄为已知后端白名单
+      var KNOWN_BACKENDS = ['ollama', 'transformers', 'llamacpp', 'vllm'];
+      var safeBackend = KNOWN_BACKENDS.indexOf(backend) >= 0 ? backend : 'unknown';
+      var dotClass = safeBackend;
       if (modelOk === false) dotClass = 'unknown';
-      badge.className = 'backend-badge backend-badge-' + backend;
+      badge.className = 'backend-badge backend-badge-' + safeBackend;
       var statusIcon = modelOk === false ? '⚠ ' : (modelOk === true ? '✓ ' : '');
       badge.innerHTML = '<span class="backend-badge-dot ' + dotClass + '"></span><span class="backend-badge-text">' + statusIcon + escapeHtml(short) + '</span>';
       badge.title = modelOk === false ? '模型未下载，点击查看详情' : '点击/悬停查看推理精度检测报告';

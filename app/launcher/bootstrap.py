@@ -65,6 +65,48 @@ FALLBACK_MODEL = os.environ.get("VULN_SCANNER_FALLBACK_MODEL", "qwen3:8b")
 PORT = 8765
 
 
+def _env_int(name: str, default: int) -> int:
+    """读取整型环境变量；为空返回默认，非法值打印警告并回退默认。
+
+    2026-09-20 修复：此前 int(os.environ.get(...)) 直接强转，用户把
+    VULN_SCANNER_VLLM_PORT 误设为 "8000 " / "abc" 等时启动器直接崩溃。
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        print(f"[启动器] ⚠ 环境变量 {name}={raw!r} 不是合法整数，已使用默认值 {default}")
+        return default
+
+
+# 2026-09-20 修复：登记由启动器拉起的常驻子进程（ollama serve / vLLM 独立服务），
+# main() 退出（正常结束 / 失败 / Ctrl+C）时统一 terminate——孤儿 vLLM 会继续占满
+# 显存与端口，下次重跑变成双实例直接 OOM。
+_MANAGED_PROCS: list = []
+
+
+def _register_managed_proc(proc) -> None:
+    if proc is not None:
+        _MANAGED_PROCS.append(proc)
+
+
+def _terminate_managed_procs() -> None:
+    """结束全部登记的常驻子进程（先 terminate 优雅退出，超时升级 kill）。"""
+    for proc in _MANAGED_PROCS:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=15)
+                except Exception:  # noqa: BLE001
+                    proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    _MANAGED_PROCS.clear()
+
+
 def _default_model_for(backend: str) -> str:
     """按推理后端返回默认模型（注册表导入失败时回退 v9max 全名）。"""
     try:
@@ -929,6 +971,9 @@ def ensure_ollama_running() -> bool:
             except Exception:  # noqa: BLE001
                 pass
         if ok:
+            # 2026-09-20 修复：登记进退出清理表，启动器退出 / Ctrl+C 时同步结束，
+            # 避免孤儿 ollama serve 常驻占用 11434 与内存。
+            _register_managed_proc(proc)
             return True
         # 端口被桌面版抢占：结束 app + serve 后重试一次
         print("[启动器] 检测到 Ollama 桌面版抢占 11434（会导致模型落到 C 盘），正在结束桌面版后重试...")
@@ -1011,7 +1056,7 @@ def start_vllm_service() -> subprocess.Popen | None:
 
     返回服务子进程（复用已有服务时返回 None）；启动失败返回 None。
     """
-    port = int(os.environ.get("VULN_SCANNER_VLLM_PORT", "8000") or "8000")
+    port = _env_int("VULN_SCANNER_VLLM_PORT", 8000)
     # 已存在可用服务则直接复用
     try:
         resp = requests.get(
@@ -1140,6 +1185,8 @@ def detect_hardware() -> dict:
     }
 
     # 1) NVIDIA GPU 检测：优先 nvidia-smi（跨平台，Windows/Linux 都可用）
+    # 2026-09-20 修复：区分「未安装 nvidia-smi」与「存在但查询失败（驱动异常？）」——
+    # 后者是重要排障线索（装了驱动但坏了/被锁），打印专门提示而非笼统的"未检测到 GPU"。
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total",
@@ -1156,8 +1203,12 @@ def detect_hardware() -> dict:
                     hardware["vram_mb"] = int(parts[1])
                 except ValueError:
                     hardware["vram_mb"] = None
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
+        elif result.returncode != 0:
+            print("[硬件检测] 检测到 nvidia-smi 但查询失败（驱动异常？），已按 CPU 模式继续")
+    except FileNotFoundError:
+        pass  # 未安装 nvidia-smi：普通无 N 卡机器，正常路径不提示
+    except (subprocess.TimeoutExpired, OSError):
+        print("[硬件检测] 检测到 nvidia-smi 但查询失败（超时/无法执行，驱动异常？），已按 CPU 模式继续")
 
     # 2) nvidia-smi 失败则尝试 torch.cuda（torch 是 sentence-transformers 的间接依赖）
     #    注意：ROCm 版 torch 会让 torch.cuda.is_available() 返回 True（复用 CUDA 命名空间），
@@ -1724,6 +1775,9 @@ def main() -> int:
     print("[4/6] 硬件检测完成")
 
     # 5. 确保模型可用（仅 Ollama 后端需要拉取；进程内后端在首次推理时懒加载）
+    # 2026-09-20 修复：vllm_proc 提前置 None，保证任何后端路径下 Ctrl+C 清理
+    # 分支都能安全引用（不存在 NameError）。
+    vllm_proc = None
     if use_ollama:
         model = os.environ.get("VULN_SCANNER_MODEL", DEFAULT_MODEL)
         if not ensure_model_available(model):
@@ -1737,9 +1791,15 @@ def main() -> int:
             os.environ["VULN_SCANNER_MODEL"] = FALLBACK_MODEL
     elif backend == "vllm":
         # vLLM 是独立服务：此刻拉起 vllm_server.py 并等待其把基座 + LoRA 加载到显存
-        vllm_port = int(os.environ.get("VULN_SCANNER_VLLM_PORT", "8000") or "8000")
+        vllm_port = _env_int("VULN_SCANNER_VLLM_PORT", 8000)
         vllm_proc = start_vllm_service()
+        # 2026-09-20 修复：登记进退出清理表
+        _register_managed_proc(vllm_proc)
         if not wait_for_vllm_ready(vllm_port, proc=vllm_proc):
+            # 2026-09-20 修复：失败路径必须终止 vLLM 子进程——失败后留下的孤儿
+            # 会继续占满显存/端口，重跑时新旧双实例直接 OOM。
+            print("[启动器] 正在终止未就绪的 vLLM 服务进程（释放显存/端口）...")
+            _terminate_managed_procs()
             print("\n[错误] vLLM 服务启动失败或超时，请参考上方日志排查。")
             print("  常见原因：模型路径错误、显存不足、量化类型与权重不匹配。")
             print("  可手动运行 `python -m app.launcher.vllm_server --dry-run` 查看将要执行的命令。")
@@ -1777,6 +1837,8 @@ def main() -> int:
             backend_proc.wait(timeout=5)
         except Exception:
             pass
+        # 2026-09-20 修复：退出前同步清理 vLLM / ollama serve 等登记的常驻子进程
+        _terminate_managed_procs()
         _pause_before_exit()
         return 1
 
@@ -1805,6 +1867,11 @@ def main() -> int:
         print("\n[启动器] 正在停止服务...")
         backend_proc.terminate()
         backend_proc.wait()
+    finally:
+        # 2026-09-20 修复：Ctrl+C / 正常退出时统一结束登记的常驻子进程
+        # （vLLM 独立服务、ollama serve），避免孤儿进程占满显存/端口，
+        # 下次重跑双实例 OOM。
+        _terminate_managed_procs()
     return 0
 
 
