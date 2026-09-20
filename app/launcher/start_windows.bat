@@ -12,6 +12,10 @@ REM Chinese guidance is printed by the Python launcher (bootstrap), which
 REM writes to the console through Unicode APIs and is immune to code pages.
 cd /d "%~dp0\..\.."
 for %%I in ("%~dp0..\..") do set "VULN_PROJECT_ROOT=%%~fI"
+REM Preserve the user's original Ollama model store (if set) before we take
+REM over OLLAMA_MODELS below: bootstrap.py migrates existing models from that
+REM legacy location into the project dir so they are not silently orphaned.
+if defined OLLAMA_MODELS set "VULN_LEGACY_OLLAMA_MODELS=%OLLAMA_MODELS%"
 set "OLLAMA_MODELS=%VULN_PROJECT_ROOT%\models\ollama"
 set "HF_HOME=%VULN_PROJECT_ROOT%\models\transformers\.hf_home"
 if not exist "%OLLAMA_MODELS%" mkdir "%OLLAMA_MODELS%"

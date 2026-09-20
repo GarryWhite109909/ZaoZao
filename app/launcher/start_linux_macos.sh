@@ -10,6 +10,11 @@ echo "Starting AI Vulnerability Scanner..."
 # 模型存储统一到项目相对目录（与软件 ollama_models_dir()/hf_home_dir() 一致）：
 #   - Ollama 模型 → <项目>/models/ollama
 #   - HuggingFace 缓存 → <项目>/models/transformers/.hf_home
+# 用户原本自定义的 OLLAMA_MODELS 先暂存到 VULN_LEGACY_OLLAMA_MODELS：
+# bootstrap.py 会把旧位置的已有模型迁移进项目目录，避免"模型消失"重新下载
+if [ -n "${OLLAMA_MODELS:-}" ]; then
+    export VULN_LEGACY_OLLAMA_MODELS="$OLLAMA_MODELS"
+fi
 export OLLAMA_MODELS="$PROJECT_ROOT/models/ollama"
 export HF_HOME="$PROJECT_ROOT/models/transformers/.hf_home"
 mkdir -p "$OLLAMA_MODELS" "$HF_HOME"

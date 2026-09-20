@@ -47,7 +47,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Fil
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app.backend.services.fetcher import fetch_url, validate_target_url
+from app.backend.services.fetcher import fetch_url, validate_target_url, is_minified_bundle
 from app.backend.services.reporter import render_batch_markdown, render_single_markdown
 from app.backend.services.scanner import DEFAULT_MODEL, Scanner
 from graduation_project.result_types import SingleResult, BatchResult
@@ -244,6 +244,15 @@ COLLECT_HARD_CAP_BYTES = 200 * 1024 * 1024      # 200MB
 BATCH_NO_CANDIDATE_MODE = os.environ.get(
     "VULN_SCANNER_BATCH_RECHECK_MODE", "targeted")
 
+# URL 扫描专用复核模式覆盖（2026-09-19 引入、2026-09-20 修正默认值）：
+# 默认跟随 BATCH_NO_CANDIDATE_MODE（targeted）——经验证 targeted 模式下 JS
+# 脚本经"工具候选裁决 / 盲区 B 档复核"已有 LLM 参与（demo-site 实测 6/6 脚本
+# 触发 LLM），无需 URL 场景单独全量复核。保留本变量供演示场景切换：
+# 设 VULN_SCANNER_URL_RECHECK_MODE=full_recheck 可让每个 URL 脚本都被
+# 模型通读（演示"模型在干活"时用，成本 = 每脚本 1 票）。
+URL_NO_CANDIDATE_MODE = os.environ.get(
+    "VULN_SCANNER_URL_RECHECK_MODE", BATCH_NO_CANDIDATE_MODE)
+
 # ---------------------------------------------------------------------------
 # Pydantic 请求模型
 # ---------------------------------------------------------------------------
@@ -253,6 +262,10 @@ class AnalyzeRequest(BaseModel):
     language: str = "python"
     filename: str = "pasted_code.py"
     use_rag: Optional[bool] = None
+    # 每候选 LLM 采样次数（1~10，None 用全局默认 3）。scan.html 高级选项把
+    # n_samples 发到 /api/analyze（而非 /api/analyze/two-stage），必须在此
+    # 声明并透传，否则 Pydantic 静默丢弃未知字段、前端采样数设置形同虚设
+    n_samples: Optional[int] = Field(None, ge=1, le=10)
     # 回站领取（§8.11#1）：前端生成的任务标识。结果完成后按此暂存，
     # 导航中断后页面回站可经 GET /api/scan/result/{job_id} 取走
     job_id: Optional[str] = Field(None, max_length=64)
@@ -486,6 +499,9 @@ def health():
         base["external_tools"] = []
         base["external_error"] = str(e)
 
+    # 前端版本探针（scan.html checkUIBuild）：与 /api/backend/info 的 ui_build
+    # 同源，用于检测浏览器缓存了旧版前端（症状"后端改了、界面没变"）
+    base["ui_build"] = _UI_BUILD
     return base
 
 
@@ -1007,6 +1023,7 @@ async def analyze(req: AnalyzeRequest, request: Request):
         lambda: _two_stage_scan(
             code=req.code, language=req.language,
             filename=req.filename, use_rag=req.use_rag,
+            n_samples=req.n_samples,
         ),
         description=f"analyze:{req.filename}",
     )
@@ -1245,6 +1262,42 @@ async def _scan_files_scheduled(
 # ---------------------------------------------------------------------------
 # URL 抓取扫描
 # ---------------------------------------------------------------------------
+def _scan_minified_secrets(scripts: list) -> list[dict]:
+    """对被跳过语义扫描的压缩/打包脚本执行确定性密钥扫描（零 LLM 成本）。
+
+    工具失败以 error 条目留痕而非静默跳过（与 _scan_dep_manifests 同纪律）。
+    """
+    from app.backend.services.fetcher import FetchedScript  # noqa: F401（类型注释用）
+
+    ext = ExternalScanner()
+    out: list[dict] = []
+    for s in scripts:
+        src = s.source if s.source != "inline" else "inline_script"
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".js", delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write(s.content)
+            tmp_path = tmp.name
+        try:
+            findings = ext.scan_secrets(tmp_path)
+            out.extend({
+                "source": src,
+                "tool": f.tool,
+                "rule_id": f.rule_id,
+                "severity": f.severity,
+                "message": f.message[:200],
+                "line": f.line,
+            } for f in findings)
+        except Exception as e:
+            out.append({"source": src, "error": str(e)[:200]})
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return out
+
+
 @app.post("/api/url-scan")
 async def url_scan(req: UrlScanRequest, request: Request):
     """抓取目标 URL 的所有脚本，逐个扫描（LOW 优先级，让路交互式）。"""
@@ -1266,19 +1319,54 @@ async def url_scan(req: UrlScanRequest, request: Request):
         )
 
     if not fetch_result.scripts:
-        return {"url": req.url, "title": fetch_result.title, "results": [], "message": "未找到可分析的脚本"}
+        return {"url": req.url, "title": fetch_result.title, "results": [],
+                "message": "未找到可分析的脚本"}
+
+    # 构建产物降级（2026-09-19）：压缩/打包脚本（标识符破坏，gitee 实测
+    # 53/57 个 webpack chunk 全进裁决且逐条被驳回）默认跳过语义扫描、显式
+    # 回报，不静默丢弃——预算让给站点自有源码形态的脚本。
+    # 例外：密钥扫描是确定性工具直出（零 LLM 成本），压缩产物照常执行——
+    # 线上 bundle 里泄漏的 API key 恰是最真实的发现（gitee 实测 3 条皆出自 bundle）。
+    # VULN_SCANNER_SCAN_MINIFIED=1 恢复全量语义扫描。
+    skipped_minified: list[str] = []
+    bundle_secrets: list[dict] = []
+    scan_scripts = fetch_result.scripts
+    if os.environ.get("VULN_SCANNER_SCAN_MINIFIED", "0") != "1":
+        kept = []
+        minified = []
+        for s in scan_scripts:
+            if is_minified_bundle(s.content):
+                minified.append(s)
+                skipped_minified.append(
+                    s.source if s.source != "inline" else f"内联脚本({s.char_count}B)")
+            else:
+                kept.append(s)
+        if skipped_minified:
+            print(f"[url-scan] 跳过 {len(skipped_minified)} 个压缩/打包构建产物的语义扫描"
+                  f"（密钥扫描保留；VULN_SCANNER_SCAN_MINIFIED=1 恢复全量）", flush=True)
+            bundle_secrets = await asyncio.to_thread(
+                _scan_minified_secrets, minified)
+        scan_scripts = kept
+
+    if not scan_scripts:
+        return {"url": req.url, "title": fetch_result.title, "results": [],
+                "message": "未找到可分析的脚本" + (
+                    "（全部脚本为压缩/打包构建产物，已跳过语义扫描）" if skipped_minified else ""),
+                "skipped_minified": skipped_minified,
+                "bundle_secrets": bundle_secrets}
 
     files = [
-        (s.source if s.source != "inline" else "inline_script",
+        (s.source if s.source != "inline" else f"inline_script_{i}",
          s.language, s.content)
-        for s in fetch_result.scripts
+        for i, s in enumerate(scan_scripts, 1)
     ]
     # 与仓库场景同：按风险分排序（高危脚本先扫），预算外脚本显式回报。
     # 页面脚本数量通常远小于仓库，max_files 默认不设限（全部都扫），
     # 但排序仍让"最可疑的脚本"排在前面——用户在流式中先看到高价值结果。
     selected, plan = _apply_scan_budget(files, max_files=req.max_scripts or None)
     batch = await _scan_files_scheduled(
-        selected, req.use_rag, client_id, n_samples=req.n_samples)
+        selected, req.use_rag, client_id, n_samples=req.n_samples,
+        no_candidate_mode=URL_NO_CANDIDATE_MODE)
     global _last_batch
     with _stats_lock:
         _last_batch = batch
@@ -1290,6 +1378,10 @@ async def url_scan(req: UrlScanRequest, request: Request):
         "total_scripts": fetch_result.total_scripts,
         # 被公共库过滤跳过的外链（前端提示；skip_common_libs=False 时为空）
         "skipped_libs": fetch_result.skipped_libs,
+        # 被构建产物启发式跳过语义扫描的压缩/打包脚本（前端提示；恢复全量见环境变量）
+        "skipped_minified": skipped_minified,
+        # 压缩产物上确定性密钥扫描的直出发现（零 LLM 成本，bundle 泄漏密钥照报）
+        "bundle_secrets": bundle_secrets,
         "budget": _budget_summary(plan),
         "summary": batch.to_dict(),
     }
@@ -1497,6 +1589,7 @@ async def download_single_report(req: AnalyzeRequest, request: Request):
         lambda: _two_stage_scan(
             code=req.code, language=req.language,
             filename=req.filename, use_rag=req.use_rag,
+            n_samples=req.n_samples,
         ),
         description=f"report/single:{req.filename}",
     )
@@ -2424,6 +2517,7 @@ async def models_download_gguf(req: GgufDownloadRequest):
                             "total": total,
                             "pct": pct,
                             "current_file": filename,
+                            "unit": "bytes",  # 前端据此显示 MB 而非"文件"数
                         })
 
                 _resumable_download(
@@ -2438,6 +2532,7 @@ async def models_download_gguf(req: GgufDownloadRequest):
                     "completed": total,
                     "total": total,
                     "pct": 100,
+                    "unit": "bytes",
                 })
                 done_flag["result"] = {"dest": str(actual), "filename": filename}
                 return
@@ -2453,6 +2548,7 @@ async def models_download_gguf(req: GgufDownloadRequest):
                         "completed": done,
                         "total": total,
                         "pct": pct,
+                        "unit": "bytes",  # 前端据此显示 MB 而非"文件"数
                     })
             _resumable_download(
                 url=url,

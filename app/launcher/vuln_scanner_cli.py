@@ -333,7 +333,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
 def cmd_batch(args: argparse.Namespace) -> int:
     """批量扫描目录。"""
     from app.backend.services.reporter import render_batch_markdown
-    from app.backend.services.scanner import BatchResult
+    # BatchResult 定义在 graduation_project.result_types（scanner.py 只是它的
+    # 使用者）——从这里 import，否则 batch/url/github 三个子命令全部 ImportError
+    from graduation_project.result_types import BatchResult
 
     files = collect_files_from_dir(args.directory, recursive=not args.no_recursive)
     if not files:
@@ -394,6 +396,9 @@ def cmd_batch(args: argparse.Namespace) -> int:
             colorize("✓", RISK_COLORS["none"]) if r.has_vulnerability is False else "?"
         )
         print(f"  [{i}/{len(files)}] {mark} {rel}")
+        # --verbose：单行进度下方补详细说明与修复建议（与 cmd_scan 同口径）
+        if args.verbose:
+            print_single_result(r, verbose=True)
 
     batch.total_duration = time.time() - batch_start
 
@@ -412,9 +417,9 @@ def cmd_batch(args: argparse.Namespace) -> int:
 
 def cmd_url(args: argparse.Namespace) -> int:
     """扫描 URL 抓取的脚本。"""
-    from app.backend.services.fetcher import fetch_url
+    from app.backend.services.fetcher import fetch_url, is_minified_bundle
     from app.backend.services.reporter import render_batch_markdown
-    from app.backend.services.scanner import BatchResult
+    from graduation_project.result_types import BatchResult
 
     scanner = build_scanner(args)
 
@@ -432,13 +437,26 @@ def cmd_url(args: argparse.Namespace) -> int:
     print(f"  页面标题: {fetch_result.title}")
     print(f"  发现脚本: {fetch_result.total_scripts}")
 
+    # 构建产物降级（与后端 /api/url-scan 同口径）：压缩/打包脚本默认跳过
+    if os.environ.get("VULN_SCANNER_SCAN_MINIFIED", "0") != "1":
+        kept, skipped_min = [], 0
+        for s in fetch_result.scripts:
+            if is_minified_bundle(s.content):
+                skipped_min += 1
+            else:
+                kept.append(s)
+        if skipped_min:
+            print(f"  {colorize('提示:', YELLOW)} 跳过 {skipped_min} 个压缩/打包构建产物"
+                  f"（VULN_SCANNER_SCAN_MINIFIED=1 恢复全量）")
+        fetch_result.scripts = kept
+
     if not fetch_result.scripts:
         print(f"  {colorize('提示:', YELLOW)} 未找到可分析的脚本")
         return 0
 
     files = [
-        (s.source if s.source != "inline" else "inline_script", s.language, s.content)
-        for s in fetch_result.scripts
+        (s.source if s.source != "inline" else f"inline_script_{i}", s.language, s.content)
+        for i, s in enumerate(fetch_result.scripts, 1)
     ]
 
     print()
@@ -481,7 +499,7 @@ def cmd_url(args: argparse.Namespace) -> int:
 def cmd_github(args: argparse.Namespace) -> int:
     """扫描 GitHub 仓库（浅克隆后批量扫描）。"""
     from app.backend.services.reporter import render_batch_markdown
-    from app.backend.services.scanner import BatchResult
+    from graduation_project.result_types import BatchResult
 
     repo_url = args.repo_url
     if not shutil.which("git"):

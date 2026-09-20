@@ -1515,12 +1515,40 @@ class TwoStageScanner:
                 return build_triage_prompt(finding_obj, ctx, language=language,
                                            aligned=self.triage_aligned)
             result = self._counterfactual.verify(
-                code=code, language=language, taint_type=taint_type,
-                sink_line=sink_line, build_prompt=_build_prompt,
+                code=self._cf_context(code, finding_obj), language=language,
+                taint_type=taint_type, sink_line=sink_line, build_prompt=_build_prompt,
                 source_line=int(f.get("source_line") or 0),
             )
             if result.applicable:
                 verdict.counterfactual = result.to_dict()
+
+    def _cf_context(self, code: str, finding: ToolFinding) -> str:
+        """反事实验证上下文的超限钳制（2026-09-19）。
+
+        防御注入按 sink_line 对**原始行**索引（injector.inject 直接按行号改写），
+        行号不可平移——因此行级钳制只能截掉 sink 之后的内容，保住 L1..sink+W
+        完整（source 通常在 sink 之前，传播路径不受影响）。预算内自适应收缩 W。
+        单行超长（压缩产物）无法行级收窄，保持原样由后端截断——该形态已由
+        URL 扫描入口的构建产物启发式默认跳过（fetcher.is_minified_bundle），
+        实际暴露面很小。
+        """
+        budget = int(self.num_ctx * self._CTX_BUDGET_RATIO)
+        est = len(code) // 2 + code.count("\n")
+        if est <= budget:
+            return code
+        lines = code.split("\n")
+        sink = finding.sink_line if 0 < finding.sink_line <= len(lines) else len(lines)
+        w = 120
+        while w >= 16:
+            end = min(len(lines), sink + w)
+            cut = "\n".join(lines[:end])
+            if len(cut) // 2 + cut.count("\n") <= budget:
+                if end < len(lines):
+                    cut += (f"\n# …… 第 L{end + 1}-L{len(lines)} 行省略"
+                            f"（超长钳制；sink 行及之前完整保留）……")
+                return cut
+            w //= 2
+        return code
 
     def _evidence_gate_pass(self, adjudications, code: str, language: str) -> None:
         """确定性证据门（第 2.5 代补充层，2026-08-15）：零 LLM 成本的静态核验。
@@ -2762,7 +2790,143 @@ class TwoStageScanner:
         source 与 sink 分属不同 chunk 时两端都必须送达 LLM（只送一端会让
         另一端只剩行号文本，无法验证数据流）；每个 chunk 的代码带行号前缀，
         使 prompt 中的 L 行号可以直接对位。
+
+        超限钳制（2026-09-19）：切片产物超过 num_ctx×0.45 预算时（混淆 bundle/
+        单行超长 JS 会让 CodeSlicer 退化为整文件输出），不再把超长上下文直接
+        交给推理后端静默截断，而是改为按候选 source/sink 行号（或文本锚点）
+        提取行窗口/列窗口，省略段显式标记。见 _clamp_ctx_windows。
         """
+        out = self._slice_context_raw(code, language, finding)
+        return self._clamp_ctx_windows(out, code, finding)
+
+    # 裁决上下文的 token 预算（与复核路径 _maybe_recheck 的分块预筛同阈值）：
+    # 留给 prompt 脚手架（规则说明/schema/few-shot）与模型输出的余量。
+    _CTX_BUDGET_RATIO = 0.45
+    # 视为"超长行"的阈值：超过它的行无法用行窗口收窄（混淆 bundle 的单行主体），
+    # 必须降级为列窗口（按字符截取候选邻近片段）。
+    _LONG_LINE_CHARS = 2000
+
+    def _clamp_ctx_windows(self, context: str, code: str, finding: ToolFinding) -> str:
+        """超长裁决上下文的窗口化钳制：超预算时按候选锚点重建上下文。
+
+        背景（2026-09-19，gitee 实测）：URL 扫描抓到的 webpack chunk 主体是
+        单行 17k~85k tokens 的压缩产物，CodeSlicer 对其退化为整文件 chunk，
+        裁决 prompt 随即超过 num_ctx——后端静默截断输入，模型在"没看到的
+        代码"上自信裁决。此处超预算时：
+          - 常规长文件 → source/sink 行号（或文本锚点）±W 行窗口，省略段标记；
+          - 超长单行 → 在该行内定位 sink/source 文本片段，截取邻近字符段，
+            显式标注"列区间"，不伪造行号。
+        锚点完全不可定位时保持原输出（ctx 守卫仍会告警）——不静默丢信息。
+        """
+        budget = int(self.num_ctx * self._CTX_BUDGET_RATIO)
+        est = len(context) // 2 + context.count("\n")
+        if est <= budget:
+            return context
+        orig_lines = code.split("\n")
+        anchors = self._anchor_lines(orig_lines, finding)
+        if not anchors:
+            return context
+        windowed = self._windowed_context(orig_lines, anchors, budget, finding)
+        return windowed if windowed else context
+
+    @staticmethod
+    def _anchor_lines(orig_lines: list, finding: ToolFinding) -> list:
+        """定位裁决锚点行号（1-indexed）：行号优先，缺行号时从文本定位。
+
+        位置型候选（source_line/sink_line=0）此前直接走整文件 fallback；
+        这里从 sink/source 文本解析 "line N:" 锚点或最长代码片段首现行，
+        让无行号候选也能获得窗口化上下文。
+        """
+        anchors = sorted({
+            ln for ln in (finding.source_line, finding.sink_line)
+            if ln and 0 < ln <= len(orig_lines)
+        })
+        if anchors:
+            return anchors
+        for text in (finding.sink, finding.source):
+            if not text:
+                continue
+            m = re.search(r"line\s*:?\s*(\d+)", text, re.IGNORECASE)
+            if m and 0 < int(m.group(1)) <= len(orig_lines):
+                return [int(m.group(1))]
+        for text in (finding.sink, finding.source):
+            if not text or len(text) < 8:
+                continue
+            frags = [t for t in re.split(r"[\s,;(){}\[\]]+", text) if len(t) >= 8]
+            if not frags:
+                continue
+            frag = max(frags, key=len)
+            for i, ln_text in enumerate(orig_lines, 1):
+                if frag in ln_text:
+                    return [i]
+        return []
+
+    def _windowed_context(self, orig_lines: list, anchors: list,
+                          budget: int, finding: ToolFinding) -> str:
+        """按锚点构建行窗口（超长行降级列窗口）上下文，预算内自适应收缩。"""
+        n = len(orig_lines)
+        w = 80          # 行窗口半径（初始）
+        char_w = 3000   # 列窗口半径（超长行用，初始）
+        while True:
+            parts: list[str] = []
+            covered_to = 0
+            for a in anchors:
+                lo, hi = max(covered_to + 1, a - w), min(n, a + w)
+                if lo > hi:
+                    continue
+                if lo > covered_to + 1:
+                    parts.append(f"# …… 省略 L{covered_to + 1}-L{lo - 1}（超长上下文窗口化）……")
+                line_len = max((len(orig_lines[i - 1]) for i in range(lo, hi + 1)), default=0)
+                if line_len <= self._LONG_LINE_CHARS:
+                    parts.append(self._with_line_numbers(
+                        "\n".join(orig_lines[lo - 1:hi]), lo))
+                else:
+                    # 超长行（混淆 bundle 主体）：行窗口无意义，降级为列窗口。
+                    # 在锚点行内定位 sink/source 片段，截取邻近字符段并显式
+                    # 标注列区间——不重排行号，模型明确知道这是长行的一部分。
+                    col = self._locate_column(orig_lines[a - 1], finding)
+                    seg = self._column_segment(orig_lines[a - 1], col, char_w)
+                    if seg:
+                        parts.append(
+                            f"# ==== 第 {a} 行为超长行（{len(orig_lines[a - 1])} 字符，"
+                            f"压缩/打包产物形态），仅截取候选邻近列段 ====")
+                        parts.append(seg)
+                covered_to = hi
+            if covered_to < n:
+                parts.append(f"# …… 省略 L{covered_to + 1}-L{n}（超长上下文窗口化）……")
+            out = "\n".join(parts)
+            if len(out) // 2 + out.count("\n") <= budget or (w <= 16 and char_w <= 500):
+                return out
+            w = max(16, w // 2)
+            char_w = max(500, char_w // 2)
+
+    @staticmethod
+    def _locate_column(line_text: str, finding: ToolFinding) -> int:
+        """在超长行内定位候选片段的字符偏移（定位失败返回行中点）。"""
+        for text in (finding.sink, finding.source):
+            if not text or len(text) < 8:
+                continue
+            frags = sorted(
+                (t for t in re.split(r"[\s,;(){}\[\]]+", text) if len(t) >= 8),
+                key=len, reverse=True)
+            for frag in frags:
+                idx = line_text.find(frag)
+                if idx >= 0:
+                    return idx
+        return len(line_text) // 2
+
+    @staticmethod
+    def _column_segment(line_text: str, col: int, char_w: int) -> str:
+        """截取超长行中 [col-char_w, col+char_w] 的字符段（带列号标注）。"""
+        lo = max(0, col - char_w)
+        hi = min(len(line_text), col + char_w)
+        if hi - lo < 100:
+            return ""
+        head = f"# ==== 列 L{lo}-{hi}（全文 {len(line_text)} 字符）===="
+        return head + "\n" + line_text[lo:hi]
+
+    def _slice_context_raw(self, code: str, language: str, finding: ToolFinding) -> str:
+        """_slice_context 的切片执行体（无预算钳制；由包装器调用）。"""
         try:
             slice_result = self._slicer.slice(code, language=language)
         except Exception:

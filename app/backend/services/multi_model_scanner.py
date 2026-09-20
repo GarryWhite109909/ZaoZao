@@ -131,9 +131,15 @@ class MultiModelScanner:
                     filename=filename, language=language,
                     has_vulnerability=None, error=str(e),
                 )
+            finally:
+                # 关键安全：扫完立即卸载，释放显存给下一个模型。
+                # 与 scan_files 对齐放 finally，且吞掉 unload 自身的网络异常——
+                # Ollama 闪断时不能让卸载失败把整个投票流程炸掉
+                try:
+                    scanner.unload()
+                except Exception as e:
+                    print(f"[MultiModelScanner] 模型 {model} 卸载失败: {e}")
             per_model_results.append((model, result))
-            # 关键安全：扫完立即卸载，释放显存给下一个模型
-            scanner.unload()
 
         return self._aggregate(filename, language, per_model_results)
 

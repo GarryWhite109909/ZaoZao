@@ -140,9 +140,22 @@ class ScanScheduler:
         self._loop = loop
 
     def shutdown(self) -> None:
-        """停止工作线程（进程退出时调用）。"""
+        """停止工作线程（进程退出时调用）。
+
+        停止前把仍在队列中的任务整体置为异常：工作线程退出后这些任务
+        永远不会再被取走执行，若 Future 不回填，端点的 await 会永久挂起，
+        拖住 uvicorn 优雅停机。
+        """
         with self._cv:
             self._running = False
+            leftover, self._heap = self._heap, []
+            for task in leftover:
+                self._reject(task.future, RuntimeError("调度器已关闭，任务未执行"))
+                cnt = self._client_counts.get(task.client_id, 0)
+                if cnt <= 1:
+                    self._client_counts.pop(task.client_id, None)
+                else:
+                    self._client_counts[task.client_id] = cnt - 1
             self._cv.notify_all()
         # daemon 线程，无需 join
 
@@ -187,6 +200,11 @@ class ScanScheduler:
         )
 
         with self._cv:
+            # 0) 调度器已关闭（shutdown 后到达的请求）：立即置异常返回，
+            #    否则工作线程已退出、Future 永不 resolve，请求永久挂起
+            if not self._running:
+                self._reject(future, RuntimeError("调度器已关闭，不再接受新任务"))
+                return task_id, future
             # 1) 全局队列上限
             if len(self._heap) >= self._max_queue:
                 self._reject(future, RuntimeError(

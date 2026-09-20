@@ -157,9 +157,15 @@ def _check_vllm_installed() -> tuple[bool, str]:
 
 
 def lora_module_name(served_model_name: str) -> str:
-    """从对外模型名派生 LoRA 模块名（去命名空间和 tag），保证服务端与客户端一致。"""
-    name = served_model_name.split("/")[-1]
-    name = name.split(":")[0]
+    """LoRA 模块注册名：必须与客户端请求的模型名完全一致。
+
+    客户端（VLLMClient）请求的是完整 served-model-name（含命名空间/tag）；
+    vLLM 只在请求 model 名命中 LoRA 模块名时才叠加 adapter，命中基座名则
+    静默返回未加 LoRA 的基座。此前"去命名空间取尾段"的派生方式让模块名
+    （如 nivis-alpha05）与请求名（garrywhite109909/nivis-alpha05）对不上，
+    所有请求都命中基座——LoRA 被静默跳过、精度退化为原始基座且无任何报错。
+    """
+    name = (served_model_name or "").strip()
     return name or "lora"
 
 

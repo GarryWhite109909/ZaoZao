@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
 from dataclasses import dataclass, field
@@ -42,21 +43,27 @@ _LIB_HOST_RE = re.compile(
     r"doubleclick\.net|cloudflareinsights\.com|bootstrapcdn\.com|"
     r"connect\.facebook\.net|analytics\.tiktok\.com|snap\.licdn\.com|"
     r"hm\.baidu\.com|cdn\.cnzz\.com|s\.cnzz\.com|pos\.baidu\.com|"
-    r"matomo\.cloud|piwik\.pro|clarity\.ms|yandex\.ru/metrika|mc\.yandex\.ru|"
+    r"matomo\.cloud|piwik\.pro|clarity\.ms|mc\.yandex\.ru|"
     r"hotjar\.com|fullstory\.com|mouseflow\.com|smartlook\.com|"
     r"mixpanel\.com|segment\.(?:io|com)|amplitude\.com|heapanalytics\.com|"
     r"sentry\.io|browser\.sentry-cdn\.com|newrelic\.com|nr-data\.net|"
     r"bugsnag\.com|rollbar\.com|trackjs\.com|datadoghq\.com|"
     r"intercom\.(?:io|cdn)|widget\.intercom\.io|static\.zdassets\.com|"
     r"tawk\.to|disqus\.com|addthis\.com|sharethis\.com|addtoany\.com|"
-    r"recaptcha\.net|google\.com/recaptcha|hcaptcha\.com|turnstile\.cloudflare\.com|"
+    r"recaptcha\.net|hcaptcha\.com|turnstile\.cloudflare\.com|"
     r"js\.stripe\.com|paypal(?:objects)?\.com|checkout\.razorpay\.com|"
     r"criteo\.com|taboola\.com|outbrain\.com|amazon-adsystem\.com|"
-    r"adsbygoogle\.com|at\.alicdn\.com|gitee\.com/libs|taobao\.com/a\.js"
+    r"adsbygoogle\.com|at\.alicdn\.com"
     r")$",
     re.IGNORECASE,
 )
+# 注意：本正则只对 hostname 匹配（is_common_library_url 传入 parsed.hostname），
+# hostname 永不含 "/"——带路径的模式（如 google.com/recaptcha、gitee.com/libs、
+# taobao.com/a.js）必须写进下方 _LIB_NAME_RE（对 URL path 匹配），写在这里永不命中。
 # 路径/文件名中的库名关键词（词边界防误杀：/myapp/reactive-api.js 不含 react 库形态）
+# 尾部允许一个"扩展名尾巴"（.min.js / .js / .bundle.js 等）：只有 jquery 显式写了
+# \.min\.js，其余库名会漏掉 /resources/js/bootstrap.min.js 这类自托管副本（站点把
+# CDN 库下载到自己服务器，形态与站点自有代码相同）——按"库本身非攻击面"原则同样过滤
 _LIB_NAME_RE = re.compile(
     r"(?:^|[/_.-])(?:"
     r"jquery[\w.-]{0,10}\.min\.js|jquery(?:[-.]ui|-mobile|\.[0-9])?|zepto(?:\.min)?|"
@@ -67,8 +74,11 @@ _LIB_NAME_RE = re.compile(
     r"popper(?:\.min)?|chart(?:\.umd|\.min)?|echarts(?:\.min)?|d3(?:\.v[0-9]+)?(?:\.min)?|"
     r"three(?:\.module)?(?:\.min)?|swiper(?:\.bundle)?(?:\.min)?|gsap(?:\.min)?|"
     r"gtag(?:/js|\.)|gtm\.js|analytics(?:\.js|-debug)?|fbevents\.js|pixel(?:\.min)?\.js|"
-    r"hm\.js|web-sdk|js-sdk|td\.js|ga\.js"
-    r")(?:$|[/?#])",
+    r"hm\.js|web-sdk|js-sdk|td\.js|ga\.js|"
+    # 带域名才有意义的库（自 _LIB_HOST_RE 迁入的路径形态）：reCAPTCHA /
+    # Yandex Metrika / gitee libs / 淘宝 a.js 统计脚本
+    r"recaptcha|metrika|libs|a\.js"
+    r")(?:\.[\w.]*)?(?:$|[/?#])",
     re.IGNORECASE,
 )
 
@@ -94,6 +104,32 @@ def is_common_library_url(url: str) -> bool:
     if _LIB_NAME_RE.search(probe):
         return True
     return False
+
+
+def is_minified_bundle(content: str) -> bool:
+    """判断脚本是否为打包/压缩后的构建产物（纯文本启发式，无网络请求）。
+
+    命中条件（内容 ≥ 4KB 时任一满足）：
+      - 带 sourceMappingURL 注释（打包器产出标志）；
+      - 平均行长 > 250 字符（正常源码平均约 30-40）；
+      - 或超过一半的行单行 > 2000 字符。
+
+    压缩产物标识符被破坏、变量名全毁，LLM 语义裁决价值极低且召回多为
+    打包器形态的假阳性（gitee 实测 53/57 个 webpack chunk 全部进裁决、
+    逐条被驳回，预算几乎白烧）。URL 扫描入口据此默认跳过并显式回报
+    （VULN_SCANNER_SCAN_MINIFIED=1 恢复全量扫描）。
+    """
+    if not content or len(content) < 4096:
+        return False
+    if "sourceMappingURL=" in content[-4000:]:
+        return True
+    lines = content.split("\n")
+    if not lines:
+        return False
+    if len(content) / len(lines) > 250:
+        return True
+    long_lines = sum(1 for ln in lines if len(ln) > 2000)
+    return long_lines >= max(1, len(lines) // 2)
 
 
 @dataclass
@@ -132,20 +168,55 @@ def _resolve_ips(host: str, port: int) -> set:
     return {info[4][0] for info in infos}
 
 
+def _proxy_configured_for(scheme: str, host: str) -> bool:
+    """判断该请求是否将经 HTTP 代理发出（requests 遵循环境变量代理）。
+
+    代理模式下 requests 把主机名原样交给代理、由代理解析并建连——本机
+    getaddrinfo 的结果与实际连接目标无关，IP 级 SSRF 校验（内网地址/rebinding
+    复检）只在直连时有意义。大陆网络下 jsdelivr/github.io 等域名本机 DNS
+    被污染（解析为空），但经代理完全可达（实测 HTTP 200）。
+    """
+    if scheme not in ("http", "https"):
+        return False
+    no_proxy = {
+        h.strip().lower().lstrip(".")
+        for h in (os.environ.get("NO_PROXY", "") + "," + os.environ.get("no_proxy", "")).split(",")
+        if h.strip()
+    }
+    if "*" in no_proxy:
+        return False
+    for pat in no_proxy:
+        if host == pat or host.endswith("." + pat):
+            return False
+    env = os.environ
+    if scheme == "https":
+        proxy = (env.get("HTTPS_PROXY") or env.get("https_proxy")
+                 or env.get("ALL_PROXY") or env.get("all_proxy"))
+    else:
+        proxy = (env.get("HTTP_PROXY") or env.get("http_proxy")
+                 or env.get("ALL_PROXY") or env.get("all_proxy"))
+    return bool(proxy and proxy.strip())
+
+
 def validate_target_url(url: str) -> str | None:
     """校验目标 URL 是否允许抓取；返回 None=允许，否则返回错误信息。
 
     含 DNS rebinding 缓解：requests 无法把"校验时的解析结果"钉到连接上
     （TOCTOU 窗口客观存在，HTTPS 下改写 Host 又会破坏 SNI/TLS），此处采用
-    双重解析一致性校验收窄窗口——两次解析 IP 集合不一致（rebinding 特征）
-    则直接拒绝。
+    双重解析校验收窄窗口——复检出现内网地址（rebinding 特征）则直接拒绝。
+
+    代理模式例外（2026-09-20）：请求将经 HTTP 代理发出时（环境变量配置，
+    且主机不在 NO_PROXY），本机解析失败不再一票拒绝——连接目标是代理，
+    由代理解析并建连，本机 DNS（可能被污染为空）与实际连接无关。IP 级
+    校验在能解析时照常执行。
     """
     try:
         parsed = urlparse(url)
         port = parsed.port
     except ValueError:
         return "URL 格式无效"
-    if parsed.scheme.lower() not in ALLOWED_SCHEMES:
+    scheme = parsed.scheme.lower()
+    if scheme not in ALLOWED_SCHEMES:
         return f"仅支持 {'/'.join(ALLOWED_SCHEMES)} 协议"
     hostname = parsed.hostname
     if not hostname:
@@ -153,9 +224,12 @@ def validate_target_url(url: str) -> str | None:
     if port is not None and not (1 <= port <= 65535):
         return "端口号无效"
     host = hostname.rstrip(".").lower()
-    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    default_port = 443 if scheme == "https" else 80
+    proxied = _proxy_configured_for(scheme, host)
     ips_first = _resolve_ips(host, port or default_port)
     if not ips_first:
+        if proxied:
+            return None  # 代理模式：由代理解析，本机 DNS 污染不阻断（见 docstring）
         return f"无法解析主机名: {host}"
     for ip_str in ips_first:
         ip = ipaddress.ip_address(ip_str)
@@ -164,9 +238,24 @@ def validate_target_url(url: str) -> str | None:
             or ip.is_multicast or ip.is_reserved or ip.is_unspecified
         ):
             return f"禁止访问内网/保留地址: {ip_str}"
-    # 二次解析一致性校验（DNS rebinding 缓解）
-    if _resolve_ips(host, port or default_port) != ips_first:
-        return f"DNS 解析结果不一致（疑似 DNS rebinding）: {host}"
+    # 二次解析复检（DNS rebinding 缓解）：第二次解析只要求"仍可解析且全部为
+    # 公网地址"，不再要求与第一次完全一致——严格相等会把 Azure Front Door /
+    # Cloudflare 等解析结果轮换的 CDN 站点误判成 rebinding（实测 demo.owasp-
+    # juice.shop 被误拦）。rebinding 攻击的特征是"后续解析返回内网 IP"，
+    # 复检内网地址即可守住该防线（剩余 TOCTOU 窗口与严格相等时相同）。
+    ips_second = _resolve_ips(host, port or default_port)
+    if not ips_second:
+        if not proxied:
+            return f"DNS 二次解析失败（疑似 DNS rebinding）: {host}"
+        # 代理模式：本机二次解析失败（污染/抖动）不阻断，由代理解析
+        return None
+    for ip_str in ips_second:
+        ip = ipaddress.ip_address(ip_str)
+        if (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+        ):
+            return f"二次解析出现内网/保留地址（疑似 DNS rebinding）: {ip_str}"
     return None
 
 
@@ -257,8 +346,10 @@ def fetch_url(url: str, timeout: int = 15, skip_common_libs: bool = True) -> Fet
         result.title = m.group(1).strip()
 
     # 提取内联 <script>...</script>
+    # src= 前用 (?<![\w-]) 而非 \b：\b 会被 data-src= / lazy-src= 里的 "-" 边界
+    # 误判为外链，导致真实内联逻辑被漏扫
     inline_pattern = re.compile(
-        r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>",
+        r"<script(?![^>]*(?<![\w-])src=)[^>]*>(.*?)</script>",
         re.IGNORECASE | re.DOTALL,
     )
     for m in inline_pattern.finditer(html):
