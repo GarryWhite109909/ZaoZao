@@ -541,6 +541,24 @@ def health():
         base["external_tools"] = []
         base["external_error"] = str(e)
 
+    # 调度器看门狗（S7 第三项，2026-09-21）：工作线程无法强杀，卡死时唯一线索是
+    # status() 的 possibly_stuck——此前只在 /api/queue/status 里，仪表盘与启动器
+    # 都看不到（用户只看到"扫描一直转圈"）。这里提升为 /api/health 顶层的
+    # degraded 标记，把不可见变可见。status() 只持锁做内存计算，开销可忽略。
+    try:
+        qs = scheduler.status()
+        cur = qs.get("current_task") or {}
+        base["queue"] = {
+            "queue_size": qs.get("queue_size"),
+            "current_task": cur.get("description"),
+            "running_seconds": cur.get("running_seconds"),
+            "possibly_stuck": bool(cur.get("possibly_stuck")),
+        }
+        base["degraded"] = bool(cur.get("possibly_stuck"))
+    except Exception as e:  # noqa: BLE001
+        base["degraded"] = False
+        base["queue_error"] = str(e)
+
     # 前端版本探针（scan.html checkUIBuild）：与 /api/backend/info 的 ui_build
     # 同源，用于检测浏览器缓存了旧版前端（症状"后端改了、界面没变"）
     base["ui_build"] = _UI_BUILD
