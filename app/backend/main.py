@@ -261,6 +261,16 @@ MAX_BATCH_TOTAL_BYTES = 10 * 1024 * 1024        # 批量总大小上限（10MB�
 # 截断"：排序只能在前 N 个里排，auth/ 目录仍可能未被收集到。
 COLLECT_HARD_CAP_FILES = 3000
 COLLECT_HARD_CAP_BYTES = 200 * 1024 * 1024      # 200MB
+
+# 请求层「单次扫描文件数」的上界（C-4 修正 2026-09-21）：原先 500 这个数字只硬编码
+# 在两个 Pydantic Field 里，上面那条「收集上限须远大于扫描预算」的不变量**只有注释
+# 在维系**——把 le 调到 > COLLECT_HARD_CAP_FILES 就会静默退化成"按 os.walk 顺序
+# 截断"，而没有任何测试会红。现在两处共用同一常量，并在导入期断言。
+MAX_SCAN_FILES_CEILING = 500
+assert COLLECT_HARD_CAP_FILES >= MAX_SCAN_FILES_CEILING * 5, (
+    "COLLECT_HARD_CAP_FILES 必须远大于请求层上界 MAX_SCAN_FILES_CEILING，"
+    "否则仓库遍历会在排序前截断，auth/ 等靠后的目录可能压根没被收集到"
+)
 # 单个代码文件读取上限（2026-09-20，审计：任意文件读/内存防护）：克隆产物可含
 # 符号链接与超大文件，读取超限截断并留痕，防止恶意仓库撑爆内存
 COLLECT_MAX_FILE_BYTES = 512 * 1024             # 512KB
@@ -294,13 +304,13 @@ class UrlScanRequest(BaseModel):
     skip_common_libs: bool = True
     # 脚本数预算（2026-08-31）：None/0 = 不限（页面脚本通常不多，默认全扫）。
     # 超限时按风险分从高到低取，未覆盖脚本在 budget.uncovered_sample 回报。
-    max_scripts: Optional[int] = Field(None, ge=1, le=500)
+    max_scripts: Optional[int] = Field(None, ge=1, le=MAX_SCAN_FILES_CEILING)
 
 
 class GithubScanRequest(BaseModel):
     repo_url: str = Field(..., max_length=2048)
     use_rag: Optional[bool] = None
-    max_files: int = Field(50, ge=1, le=500)  # 限制扫描文件数，避免大仓库超时
+    max_files: int = Field(50, ge=1, le=MAX_SCAN_FILES_CEILING)  # 上界与收集上限绑定（C-4）
     # 与 URL 扫描同语义：每文件 LLM 采样次数（None 用全局默认 3）
     n_samples: Optional[int] = Field(None, ge=1, le=10)
     # 同构文件折叠（2026-08-31）：结构指纹完全相同的文件（复制粘贴的 CRUD /
