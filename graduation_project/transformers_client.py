@@ -75,6 +75,35 @@ def _lazy_import_peft():
     return _PEFT
 
 
+class _WallClock:
+    """S7 修复（2026-09-21，策略评审）：墙钟停止条件——让 timeout 成为真参数。
+
+    进程内 model.generate() 不会自己超时：一次卡死（OOM 后显存抖动、驱动 hang、
+    超长 prefill 触发换页）会永久持有 _gen_lock，而调度器只有一个工作线程且
+    无法强杀 → 整个服务停止响应，只在 /api/queue/status 留一个 possibly_stuck。
+    墙钟停止条件是 HF 生态的标准解法（不改并发模型）：每个 decode 步检查一次
+    墙钟，超时即终止生成；上层"超时 → 无效票/error 字典"的既有契约自动生效。
+
+    用鸭子类型实现 StoppingCriteria 接口（避免顶层 import transformers）：
+    transformers 只要求对象可调用 (input_ids, scores, **kwargs) -> bool。
+    """
+
+    def __init__(self, seconds: float):
+        self.deadline = time.time() + max(1.0, float(seconds))
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        return time.time() > self.deadline
+
+
+def _stopping_criteria_list(wall_clock: "_WallClock"):
+    """把 _WallClock 包成 transformers StoppingCriteriaList（懒导入，失败返回 None）。"""
+    try:
+        from transformers import StoppingCriteriaList
+        return StoppingCriteriaList([wall_clock])
+    except Exception:
+        return None
+
+
 # 统一输出 schema 的约束描述（与 scanner 的 CoT+JSON 模式一致；transformers 无 guided
 # decoding，结构化兜底靠模型训练时学会的 JSON 输出 + 解析层 parse_verdict 容错）。
 # 复用 graduation_project.prompts 的 build_user_prompt 组装 user prompt。
@@ -782,6 +811,17 @@ class TransformersClient:
                     gen_kwargs["temperature"] = temperature
                     gen_kwargs["top_p"] = 0.9
 
+                # S7 修复（2026-09-21，策略评审）：timeout 从假参数变成真参数。
+                # 每个 decode 步检查墙钟，超时即优雅终止生成（不杀线程、不破坏
+                # _gen_lock）；超时产生的空/短文本由下方检测并返回 error 字典，
+                # 上层 _sample_votes 的"无效票"语义自动生效。
+                _wc = None
+                if timeout and timeout > 0:
+                    _wc = _WallClock(timeout)
+                    _scl = _stopping_criteria_list(_wc)
+                    if _scl is not None:
+                        gen_kwargs["stopping_criteria"] = _scl
+
                 torch = _lazy_import_torch()
                 inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
                 with torch.no_grad():
@@ -791,6 +831,22 @@ class TransformersClient:
                 generated = outputs[0][input_len:]
                 response = self._tokenizer.decode(generated, skip_special_tokens=True)
                 duration = time.time() - start_time
+
+                # 超时检测：墙钟触发后生成被提前终止——若没有任何产出，按契约
+                # 返回 error 字典（而非把截断文本当正常结果）；有部分产出时
+                # 透传（prefill 超长但 decode 已产出有用文本的场景少见，保留）。
+                _timed_out = _wc is not None and time.time() > _wc.deadline
+                if _timed_out and not response.strip():
+                    del inputs, outputs, generated
+                    self._reclaim_cache()
+                    return {
+                        "text": "",
+                        "duration": duration,
+                        "tokens": {"prompt": input_len, "completion": 0, "total": input_len},
+                        "meta": {"backend": "transformers", "model": self.model_id,
+                                 "timeout": True},
+                        "error": f"进程内推理超时（>{timeout}s），已按墙钟终止生成",
+                    }
 
                 result = {
                     "text": response,

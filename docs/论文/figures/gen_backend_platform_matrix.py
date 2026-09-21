@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""后端平台支持矩阵图（2026-08-20）。
+"""后端平台支持矩阵图（2026-09-21 勘误版，与竞赛 PPT S21 一致）。
 
 重跑：AI 环境 python gen_backend_platform_matrix.py
 """
@@ -16,17 +16,17 @@ plt.rcParams["axes.unicode_minus"] = False
 from pathlib import Path
 
 # 行：后端-平台组合；列：纯硬件能力
-backends = ["Ollama", "Transformers\n(Windows)", "Transformers\n(Linux)", "LlamaCPP\n(Linux)", "LlamaCPP\n(Windows)", "vLLM"]
-columns = ["NVIDIA CUDA", "RTX 50 系", "AMD ROCm", "Apple Silicon", "CPU only"]
+backends = ["Ollama", "HF Transformers\n(Windows)", "HF Transformers\n(Linux)", "llama.cpp\n(Linux)", "llama.cpp\n(Windows)", "vLLM (Linux)"]
+columns = ["RTX 40 及以下", "RTX 50", "AMD ROCm", "Apple Silicon", "CPU only"]
 
 # 编码：2=原生支持，1=需额外配置，0=不支持，-1=不适用（该平台无此硬件）
 matrix = np.array([
     [ 2,  2,  2,  2,  2],  # Ollama
-    [ 2,  1,  0, -1,  2],  # Transformers Windows
-    [ 2,  2,  1,  1,  2],  # Transformers Linux
-    [ 2,  2,  2,  2,  2],  # LlamaCPP Linux
-    [ 2,  0,  0, -1,  2],  # LlamaCPP Windows
-    [ 2,  2,  0,  0,  0],  # vLLM
+    [ 2,  2,  0, -1,  2],  # HF Transformers Windows
+    [ 2,  2,  2, -1,  2],  # HF Transformers Linux
+    [ 2,  2,  2, -1,  2],  # llama.cpp Linux
+    [ 2,  1,  0, -1,  2],  # llama.cpp Windows
+    [ 2,  2,  2,  0,  1],  # vLLM
 ])
 
 fig, ax = plt.subplots(figsize=(11, 6.5))
@@ -42,7 +42,7 @@ ax.set_xticklabels(columns, fontsize=10)
 ax.set_yticklabels(backends, fontsize=10)
 
 # 单元格文字
-labels = {2: "支持", 1: "需配置", 0: "不支持", -1: "N/A"}
+labels = {2: "原生支持", 1: "需额外配置", 0: "不支持", -1: "N/A"}
 for i in range(len(backends)):
     for j in range(len(columns)):
         val = matrix[i, j]
@@ -54,7 +54,7 @@ for i in range(len(backends)):
             color = "white"
         ax.text(j, i, labels[val], ha="center", va="center", fontsize=11, color=color, fontweight="bold")
 
-ax.set_title("多后端 × 多平台支持矩阵（按后端-平台组合 × 硬件能力）",
+ax.set_title("四后端 × 五硬件平台支持矩阵（2026-09 勘误版）",
              fontsize=14, fontweight="bold", pad=15)
 
 from matplotlib.patches import Patch

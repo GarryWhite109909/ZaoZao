@@ -178,6 +178,26 @@ def resolve_base_model_path(explicit: str = "") -> str:
     return "Qwen/Qwen3-8B"
 
 
+def _safe_model_dir(base: Path, name: str) -> Path:
+    """清洗模型目录名并防目录越界（A4 修复，2026-09-21 审查报告）。
+
+    repo_id 的最后一段可能是 '..' 或 '..\\..'（Windows 上 Path 把反斜杠当
+    分隔符，一次上跳两级直达项目根），直接拼接可越出 models/ 基目录 →
+    任意目录写入/覆盖。此处三道闸：
+    - 统一反斜杠为斜杠后只取最后一段；
+    - 拒绝空 / '.' / '..' 及 Windows 保留字符；
+    - resolve 后必须仍位于 base 之下。
+    """
+    cleaned = (name or "").strip().replace("\\", "/").split("/")[-1]
+    if cleaned in ("", ".", "..") or any(c in cleaned for c in ':*?"<>|'):
+        raise ValueError(f"非法模型名: {name!r}")
+    base_resolved = base.resolve()
+    target = (base_resolved / cleaned).resolve()
+    if not target.is_relative_to(base_resolved):
+        raise ValueError(f"模型目录越界: {target}")
+    return target
+
+
 def local_hf_model_dir(repo_id: str) -> Path:
     """HF 仓库 id → 项目本地基座下载目录（models/transformers/<名称>）。
 
@@ -185,9 +205,10 @@ def local_hf_model_dir(repo_id: str) -> Path:
     - 自动下载（首次加载）落到这里；
     - 设置页手动下载按钮也落到这里；
     - 就绪检测只检查这个目录。
+
+    非法/越界名抛 ValueError（A4 修复）。
     """
-    name = repo_id.split("/")[-1] if "/" in repo_id else repo_id
-    return find_project_root() / "models" / "transformers" / name
+    return _safe_model_dir(find_project_root() / "models" / "transformers", repo_id)
 
 
 def ollama_models_dir(project_root: Optional[Path] = None) -> Path:
@@ -217,8 +238,11 @@ def local_hf_cache_dir(repo_id: str, project_root: Optional[Path] = None) -> Pat
 
     这是 HF 下载/续传的正式位置：迁移来的 C 盘缓存、from_pretrained 自动下载
     都落在这里；扁平目录 models/transformers/<repo> 仅作为离线手工放置的兼容位置。
+
+    A4 修复（2026-09-21）：先把反斜杠统一成斜杠再做 replace——Windows 上
+    '..\\..' 原样保留反斜杠时会被 Path 当分隔符，缓存目录可越出 .hf_home。
     """
-    name = repo_id.replace("/", "--")
+    name = repo_id.replace("\\", "/").replace("/", "--")
     return hf_home_dir(project_root) / "hub" / f"models--{name}"
 
 
@@ -227,9 +251,10 @@ def local_vllm_model_dir(model_id: str, project_root: Optional[Path] = None) -> 
 
     vLLM 后端下载/检测/加载的唯一位置：与 transformers 的 local_hf_model_dir
     对齐，都落在项目 models/ 下，避免模型散落项目外路径。
+
+    非法/越界名抛 ValueError（A4 修复）。
     """
-    name = model_id.split("/")[-1] if "/" in model_id else model_id
-    return (project_root or find_project_root()) / "models" / "vllm" / name
+    return _safe_model_dir((project_root or find_project_root()) / "models" / "vllm", model_id)
 
 
 def llamacpp_dir(project_root: Optional[Path] = None) -> Path:

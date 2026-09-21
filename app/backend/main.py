@@ -32,6 +32,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -1114,7 +1115,11 @@ async def batch_scan(
     每个文件作为 LOW 优先级任务入队，自动让路于交互式扫描（HIGH）。
     """
     rag = use_rag == "1"
-    client_id = resolve_client_id(request.headers.get("x-client-type"), fallback="web")
+    # A5/S8 修复（2026-09-21）：批量入口用服务端生成的批次 id 作为配额桶——
+    # 一次批量扫描只占一个桶，客户端轮换 X-Client-Type 不能拆分配额。
+    client_id = resolve_client_id(
+        request.headers.get("x-client-type"), fallback="web",
+        batch_id=uuid.uuid4().hex[:8])
     if not files:
         return JSONResponse({"error": "未接收到文件"}, status_code=400)
     if len(files) > MAX_BATCH_FILES:
@@ -1322,7 +1327,10 @@ def _scan_minified_secrets(scripts: list) -> list[dict]:
 @app.post("/api/url-scan")
 async def url_scan(req: UrlScanRequest, request: Request):
     """抓取目标 URL 的所有脚本，逐个扫描（LOW 优先级，让路交互式）。"""
-    client_id = resolve_client_id(request.headers.get("x-client-type"), fallback="web")
+    # A5/S8 修复（2026-09-21）：批量入口用服务端批次 id 作为配额桶（见 /api/batch）
+    client_id = resolve_client_id(
+        request.headers.get("x-client-type"), fallback="web",
+        batch_id=uuid.uuid4().hex[:8])
     # SSRF 防护：仅允许公网 http/https，重定向前同样校验目标地址。
     # 2026-09-20 修复：validate_target_url 内部有两次同步 getaddrinfo，在 async
     # 端点里直调会阻塞事件循环，改走线程池
@@ -1568,7 +1576,10 @@ async def github_scan(req: GithubScanRequest, request: Request):
     漏洞的库版本"的证据，不证明某个文件第 N 行触发该漏洞，故不计入
     vulnerable/safe 统计（§9.28.5 口径：与行级判定分维度呈现）。
     """
-    client_id = resolve_client_id(request.headers.get("x-client-type"), fallback="web")
+    # A5/S8 修复（2026-09-21）：批量入口用服务端批次 id 作为配额桶（见 /api/batch）
+    client_id = resolve_client_id(
+        request.headers.get("x-client-type"), fallback="web",
+        batch_id=uuid.uuid4().hex[:8])
     tmp_dir, code_files, err, dep_manifests = await asyncio.to_thread(_clone_and_collect, req)
 
     try:
@@ -2071,6 +2082,19 @@ def models_activate(req: ModelActionRequest):
 # （HF_ENDPOINT 已在文件顶部、任何 huggingface_hub import 之前设置，这里仅保留常量供界面展示）
 HF_MIRROR = os.environ.get("VULN_SCANNER_HF_MIRROR", "https://hf-mirror.com").strip() or "https://hf-mirror.com"
 
+# A3 修复（2026-09-21，审查报告）：模型下载源白名单 + 大小上限。
+# 此前 /api/models/download-gguf 接受任意 http(s) URL（内网地址、本机自身、
+# 云元数据 169.254.169.254 都会被拉取 = SSRF），且 _resumable_download 无大小
+# 上限（响应体多大写多大，单次请求可填满磁盘）。白名单覆盖全部合法模型来源：
+# HF 官方 / 国内镜像 / GitHub release。
+_TRUSTED_MODEL_HOSTS = {
+    "huggingface.co", "hf-mirror.com",
+    "github.com", "objects.githubusercontent.com", "codeload.github.com",
+    "mirror.ghproxy.com",
+}
+# 下载大小上限：8GB，覆盖最大单文件 GGUF（Qwen3-8B Q4_K_M ≈ 5-6GB）
+_DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024 * 1024
+
 # llamacpp 后端所需的"未合并基座" GGUF —— 官方 Qwen3-8B-GGUF 的 Q4_K_M（与 LoRA adapter 同源）。
 # 下载按钮固定指向它，与 transformers 后端"只能下载所需模型"对齐：基座 + models/adapter 的
 # LoRA 在运行时叠加（lora_path），绝不能下成已合并 LoRA 的发布 GGUF（否则二次叠加，结果错误）。
@@ -2095,14 +2119,28 @@ def _no_proxy_for_mirrors(*hosts: str) -> None:
     用户机器常配置 HTTP_PROXY/HTTPS_PROXY（科学上网）。若 hf-mirror.com / ghproxy 等
     镜像下载也走代理，既会秒断（代理对国内域名路由不佳），又会白白消耗代理流量
     （几个 GB 的模型流量瞬间用光）。这里把镜像域名追加进 NO_PROXY，强制直连镜像。
+
+    A3 修复（2026-09-21，审查报告）：只对可信镜像域名生效。此前任意 hostname
+    （含用户请求参数）都会被写进进程级 NO_PROXY 且永不清理——请求参数持续
+    改变本进程后续所有出网请求的代理行为。收口后非白名单 host 静默跳过
+    （下载功能不受影响，只是可能走代理）。
     """
-    with _PROXY_ENV_LOCK:
+    with _PROXY_ENV_LOCK:  # 2026-09-20 远程：读-合并-写必须原子（并发下载会互相覆盖丢项）
+        # A3 修复（2026-09-21，本地）：只对可信镜像域名生效——此前任意 hostname
+        # （含用户请求参数）都会被写进进程级 NO_PROXY 且永不清理
+        trusted = {
+            h.strip().lower()
+            for h in hosts
+            if h and h.strip() and h.strip().lower() in _TRUSTED_MODEL_HOSTS
+        }
+        if not trusted:
+            return
         no_proxy = set(
             h.strip()
             for h in os.environ.get("NO_PROXY", "").replace(";", ",").split(",")
             if h.strip()
         )
-        no_proxy |= {h for h in hosts if h and h.strip()}
+        no_proxy |= trusted
         val = ",".join(sorted(no_proxy))
         os.environ["NO_PROXY"] = val
         os.environ["no_proxy"] = val
@@ -2164,6 +2202,7 @@ def _resumable_download(
     mirror_host: str = "",
     progress_cb=None,
     max_retries: int = 5,
+    max_bytes: int = _DOWNLOAD_MAX_BYTES,
 ) -> tuple[int, int]:
     """用 HTTP Range 断点续传下载单个大文件到 dest_path（写入 .incomplete 后缀）。
 
@@ -2173,6 +2212,11 @@ def _resumable_download(
       - 目标文件已完整存在 / 断点恰好等于文件总长（416）时直接判完成，
         避免"已下载完却因 Range 越界反复重试"的边界卡死；
       - 网络抖动时带退避自动重试，而不是一次失败就整个放弃。
+
+    A3 修复（2026-09-21，审查报告）：新增 max_bytes 大小上限（默认 8GB）。
+    此前只做完整性校验不做上限——响应体多大就写多大，单次请求可填满磁盘。
+    Content-Length 超限直接拒绝；流式写入累计超限则中止并删除半成品
+    （确定性错误，不重试）。
 
     返回 (downloaded, total)；total<=0 表示无法得知总大小（仍可能下载成功）。
     下载中途失败会抛出异常，但 .incomplete 文件被保留，下次可续传。
@@ -2233,12 +2277,25 @@ def _resumable_download(
                 total = int(resp.headers.get("Content-Length", 0) or 0)
                 mode = "wb"
 
+            # A3 修复：大小上限——Content-Length 已知且超限时直接拒绝（不留半成品）
+            if total > max_bytes:
+                resp.close()
+                raise RuntimeError(f"文件超过下载上限（{total} > {max_bytes} 字节）")
+
             with open(target, mode) as f:
                 for chunk in resp.iter_content(chunk_size=1024 * 1024):
                     if not chunk:
                         break
                     f.write(chunk)
                     downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        # 流式累计超限：中止并删半成品（Content-Length 缺失/虚报时的兜底）
+                        f.close()
+                        try:
+                            target.unlink(missing_ok=True)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise RuntimeError(f"下载超过大小上限（>{max_bytes} 字节），已中止")
                     if progress_cb:
                         progress_cb(downloaded, total)
 
@@ -2252,6 +2309,9 @@ def _resumable_download(
             return downloaded, total
 
         except Exception as e:  # noqa: BLE001
+            # A3 修复：超限是确定性错误，重试无意义——立即中止（半成品已删）
+            if isinstance(e, RuntimeError) and "下载上限" in str(e):
+                raise
             # 记录进度，保留 .incomplete 供下次续传
             if isinstance(e, RuntimeError) and "下载不完整" in str(e):
                 # 完整性问题：清掉从头来更稳
@@ -2381,10 +2441,15 @@ async def models_download_hf(req: HfDownloadRequest):
     # 下载目标：按后端落到项目 models/ 分类目录（与加载/检测/迁移同一位置，调用路径一致）
     #   - transformers → models/transformers/<名称>（扁平基座目录，可续传）
     #   - vllm        → models/vllm/<名称>（AWQ/GPTQ 量化目录，与 transformers 对齐）
-    if (req.backend or "transformers").strip().lower() == "vllm":
-        cache_dir = local_vllm_model_dir(model_id)
-    else:
-        cache_dir = local_hf_model_dir(model_id)
+    # A4 修复（2026-09-21）：非法/越界 model_id（如 '..\..'）在 paths 层抛
+    # ValueError，此处转 400——此前可直接越出 models/transformers/ 写任意目录。
+    try:
+        if (req.backend or "transformers").strip().lower() == "vllm":
+            cache_dir = local_vllm_model_dir(model_id)
+        else:
+            cache_dir = local_hf_model_dir(model_id)
+    except ValueError as ve:
+        return JSONResponse({"error": str(ve)}, status_code=400)
 
     chunk_queue: _q.Queue = _q.Queue()
     done_flag = {"done": False, "result": None, "error": None}
@@ -2560,10 +2625,18 @@ async def models_download_gguf(req: GgufDownloadRequest):
     if "/" in filename or "\\" in filename or ".." in filename:
         return JSONResponse({"error": "filename 含非法字符"}, status_code=400)
 
-    # SSRF 防护（2026-09-20 修复）：此前本端点对用户 URL 无任何校验（同文件
-    # url-scan / github-scan 均经 validate_target_url 拦内网/回环地址），可被
-    # 用来探测内网服务。校验内部有同步 getaddrinfo（两次 DNS 解析），必须用
-    # asyncio.to_thread 包住，避免阻塞事件循环。校验原始 URL（镜像改写前）。
+    # A3 修复（2026-09-21）：下载源白名单（与 /api/url-scan、/api/github-scan 的
+    # SSRF 校验同源的收口）。此前任意 http(s) 目标都会被本服务拉取——内网、
+    # 127.0.0.1:8765 自身、云元数据均可打。模型下载的合法来源就那几个域名，
+    # 白名单比通用 SSRF 校验更严格（allowlist > denylist）。
+    _src = urlparse(url)
+    _src_host = (_src.hostname or "").lower()
+    if _src.scheme not in ("https", "http") or _src_host not in _TRUSTED_MODEL_HOSTS:
+        return JSONResponse({
+            "error": "仅允许从模型来源域名下载: " + ", ".join(sorted(_TRUSTED_MODEL_HOSTS)),
+        }, status_code=400)
+    # 纵深防御（2026-09-20 远程）：白名单域名仍可能被劫持 DNS 指向内网，
+    # 故再做一次 resolve-and-check。校验内部有同步 getaddrinfo，走线程池。
     url_err = await asyncio.to_thread(validate_target_url, url)
     if url_err:
         return JSONResponse(

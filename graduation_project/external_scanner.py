@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -244,6 +245,11 @@ class ExternalScanner:
         # 占单文件总耗时 ~90%）——规则加载与解析做两遍。现共享一次执行，
         # 两路解析从缓存分流（taint 规则 id 按命名约定 "-taint" 后缀识别）。
         self._semgrep_cache: dict[str, Optional[dict]] = {}
+        # A2 修复（2026-09-21）：semgrep 子进程调用串行化锁。此前用
+        # time.sleep(0.3) 猜竞态——并发来源是本进程自己的 ThreadPoolExecutor
+        # （two_stage_scanner），正确原语是锁：把 semgrep 执行整体串行，
+        # 规则解析缓存/临时目录争抢不再依赖时间片碰运气。
+        self._semgrep_lock = threading.Lock()
         # 执行状态留痕（2026-08-31，P2-9 消静默）：工具名 → 最近一次执行的
         # 状态（ok / empty / parse_error / timeout / not_found / os_error）。
         # 此前 20+ 处降级 return [] 全部静默——工具超时/解析失败与"无命中"
@@ -526,6 +532,11 @@ class ExternalScanner:
         约 40%）。竞态是偶发的 → **对 errors 非空的执行重试 1 次**（重试成功率
         高，代价仅作用于失败场景；无 errors 的正常空结果不重试，避免双倍耗时）。
 
+        A2 修复（2026-09-21，审查报告）：① 部分成功（results>0 且 errors>=1）
+        的结果此前会被第二次尝试开头的 data=None 抹掉 → 返回 None，兜底成
+        死代码；现改用独立 best 变量承载。② 并发竞态的应对从 time.sleep(0.3)
+        猜时间片改为 _semgrep_lock 串行化（并发源是本进程 ThreadPoolExecutor）。
+
         Returns:
             解析后的 semgrep JSON dict；无输出/解析失败时返回 None
             （两路解析函数对 None 一致降级为空列表）。
@@ -538,34 +549,39 @@ class ExternalScanner:
         if os.path.isdir(_TAINT_RULES_DIR):
             cmd += ["--config", _TAINT_RULES_DIR]
         cmd += [path]
-        data: Optional[dict] = None
-        for attempt in (1, 2):  # 第 2 次仅在 errors 非空时执行（见下）
-            out = self._run_subprocess(cmd)
-            data = None
-            if not (out and out.strip()):
-                break  # 空输出 = 正常"无命中"（semgrep 无发现时 stdout 可能为空），不重试
-            try:
-                parsed = json.loads(out)
-            except json.JSONDecodeError:
-                self.last_status["semgrep"] = "parse_error"  # 执行层留痕（消静默）
-                break
-            if not isinstance(parsed, dict):
-                break
-            n_err = len(parsed.get("errors") or [])
-            if not n_err:
-                data = parsed
-                break
-            # errors 非空：留痕 + 重试一次
-            self.last_status["semgrep"] = f"errors_retry{attempt}:{n_err}"
-            print(f"[ExternalScanner] semgrep 报错（attempt {attempt}，errors={n_err}，"
-                  f"results={len(parsed.get('results') or [])}）: "
-                  f"{str(parsed['errors'][0])[:160]}")
-            if attempt == 1 and parsed.get("results"):
-                # 有部分结果：先用部分结果兜底，再重试取更完整的一份
-                data = parsed
-            elif attempt == 1:
-                time.sleep(0.3)  # 让并发的另一个 semgrep 进程先释放资源
-                continue
+        # A2 修复（2026-09-21）：独立 best 变量承载"部分成功"结果。
+        # 此前 data 在每次迭代开头被重置为 None——attempt 1 存下的部分结果
+        # （results>0 且 errors>=1）会在 attempt 2 开头被抹掉，最终返回 None，
+        # 两份部分结果全丢、Stage 1 静默少一路召回。
+        best: Optional[dict] = None
+        with self._semgrep_lock:  # semgrep 并发崩溃的根因竞态 → 串行化（替代 sleep 猜测）
+            for attempt in (1, 2):  # 第 2 次仅在 errors 非空时执行（见下）
+                out = self._run_subprocess(cmd)
+                if not (out and out.strip()):
+                    break  # 空输出 = 正常"无命中"（semgrep 无发现时 stdout 可能为空），不重试
+                try:
+                    parsed = json.loads(out)
+                except json.JSONDecodeError:
+                    self.last_status["semgrep"] = "parse_error"  # 执行层留痕（消静默）
+                    break
+                if not isinstance(parsed, dict):
+                    break
+                n_err = len(parsed.get("errors") or [])
+                if not n_err:
+                    best = parsed
+                    break
+                # errors 非空：留痕 + 重试一次
+                self.last_status["semgrep"] = f"errors_retry{attempt}:{n_err}"
+                print(f"[ExternalScanner] semgrep 报错（attempt {attempt}，errors={n_err}，"
+                      f"results={len(parsed.get('results') or [])}）: "
+                      f"{str(parsed['errors'][0])[:160]}")
+                if parsed.get("results") and best is None:
+                    # 部分成功：先暂存兜底，再重试取更完整的一份（重试成功则覆盖）
+                    best = parsed
+                if attempt == 1:
+                    time.sleep(0.3)  # 保留短退避（锁已消除主竞态，此处仅让出 CPU）
+                    continue
+        data = best
         if len(self._semgrep_cache) > 64:
             self._semgrep_cache.clear()
         self._semgrep_cache[key] = data

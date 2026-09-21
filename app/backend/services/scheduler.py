@@ -417,16 +417,27 @@ def resolve_priority(scan_scope: Optional[str], default: int = PRIORITY_NORMAL) 
     return default
 
 
-def resolve_client_id(client_type: Optional[str], fallback: str = "web") -> str:
-    """根据请求头 X-Client-Type 解析客户端标识。
+def resolve_client_id(client_type: Optional[str], fallback: str = "web",
+                      batch_id: Optional[str] = None) -> str:
+    """根据请求头 X-Client-Type 解析客户端标识（A5/S8 修复，2026-09-21）。
+
+    配额桶由**服务端事实**决定，客户端只能选择用途、不能选择身份：
+      - batch_id（服务端生成的批次 id）优先：一次批量扫描 = 同一个桶，
+        不可被请求头轮换拆分；
+      - X-Client-Type 白名单收口：web / vscode / intellij 三值，未知值
+        一律归 fallback——此前 `return c or fallback` 让任意字符串各占
+        一个独立桶，轮换请求头即可绕过 max_per_client。
 
     Args:
         client_type: 请求头 X-Client-Type 的值（web / vscode / intellij）
-        fallback: 缺失时的回退标识
+        fallback: 缺失或非白名单时的回退标识
+        batch_id: 服务端生成的批次 id（批量入口必传）
 
     Returns:
         归一化后的 client_id
     """
+    if batch_id:
+        return f"batch:{batch_id}"
     if not client_type:
         return fallback
     c = client_type.strip().lower()
@@ -436,4 +447,4 @@ def resolve_client_id(client_type: Optional[str], fallback: str = "web") -> str:
         return "vscode"
     if c in ("intellij", "idea", "jetbrains"):
         return "intellij"
-    return c or fallback
+    return fallback  # 白名单收口：未知值不占独立桶

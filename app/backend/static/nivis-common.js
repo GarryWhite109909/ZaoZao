@@ -49,6 +49,11 @@
       return 'info';
     },
 
+    /* 风险权重（C4 口径说明，2026-09-21）：用于**排序/趋势图**的相对权重，
+       与下方 calcSecurityScore 的扣分权重是两套各司其职的量纲——
+       本表 critical=10/high=7 表达"严重度间距"（排序用）；
+       calcSecurityScore 里 critical=high=8 分表达"评分档位"（评分用）。
+       说明书 2.3 只写扣分制；若被问"medium 算几分"，答：排序权重 5、评分扣 4。 */
     riskWeight: function (lvl) {
       if (lvl === 'critical') return 10;
       if (lvl === 'high') return 7;
