@@ -986,6 +986,16 @@ _TRUST_NOTE_CHAIN = (
 )
 _TRUST_NOTE_POSITIONAL = _TRUST_NOTES["sast"]
 
+# S5 修复（2026-09-21，策略评审）：模型自述锚点的中性标注。锚点来源分级——
+# has_chain 判真后还须核对 finding.anchor_source：只有**工具**产出的链才配
+# 链级高信任措辞；模型判真票自述回填的锚点（anchor_source="model_vote"）
+# 不得继承"AST/数据流引擎得出、推翻须指认断点"的高信任框架——此前混淆两者，
+# Layer 2 反事实门控的翻转率被自己的信任标注人为压低（锚点污染回路）。
+_TRUST_NOTE_MODEL_ANCHOR = (
+    "（此告警的锚点行号来自模型自述，未经工具数据流确认；"
+    "请以代码原文为准独立判断该行是否为真实危险点）"
+)
+
 
 def build_triage_prompt(
     finding,
@@ -1032,9 +1042,17 @@ def build_triage_prompt(
     # 信任标注按证据类型分级（2026-08-29 §四）：带 source→sink 链 → 链级高信任；
     # category 是 taint 但链为空（semgrep OSS 无 metavars）→ 降为位置型；
     # 其余（sast/iac/prefilter）按 category 取位置型/正则标注。
+    # S5 修复（2026-09-21）：链级高信任**仅限工具产出的链**（anchor_source=="tool"）。
+    # has_chain 只说明"现在有 source/sink 文本"——而文本可能是 _adjudicate_all
+    # 用模型判真票回填的（anchor_source="model_vote"），此时给"工具静态污点
+    # 分析产出、方向可靠性显著高"的标注就是把模型自述当成工具证据（R2 污染）。
     has_chain = bool((source or "").strip() and (sink or "").strip())
-    if has_chain:
+    anchor_is_model = getattr(finding, "anchor_source", "tool") == "model_vote" \
+        or (isinstance(finding, dict) and finding.get("anchor_source") == "model_vote")
+    if has_chain and not anchor_is_model:
         trust_note = _TRUST_NOTE_CHAIN
+    elif has_chain and anchor_is_model:
+        trust_note = _TRUST_NOTE_MODEL_ANCHOR
     elif category == "taint":
         trust_note = _TRUST_NOTE_POSITIONAL
     else:

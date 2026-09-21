@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
                         help="共形校准源：历史评估结果 JSON（含 adjudications 投票 + expected）")
     parser.add_argument("--calibrate-clean", action="store_true",
                         help="校准集做 only_correct 净化（剔除非一致判对样本；方法学上有泄漏风险，仅复现旧实验用）")
-    parser.add_argument("--export-calibration", type=str, default="models/conformal_calibration.json",
+    parser.add_argument("--export-calibration", type=str, default="models/conformal_calibration.out_of_sample.json",
                         help="校准拟合成功后导出路径（生产端 TwoStageScanner 自动加载；传 0 禁用导出）")
     # 工具开关（默认全开，复现 App 真实路径）
     parser.add_argument("--no-semgrep", action="store_true", dest="no_semgrep",

@@ -8,9 +8,17 @@
 
     A/B 级判定（可信）   → 回填信号置信表（工具下次优先召回 + 类型校正）
     C 级判定（碰巧对）   → 被反事实扰动/跨样本聚合拦截，不入池
-    D 级判定（误报）     → 进抑制池（工具见到该特征直接跳过，反向"教工具避坑"）
+    D 级判定（误报）     → 记负向记忆（S3 起**按文件降权**，候选永不移出召回
+                           集合——规则级抑制动作已于 2026-09-21 取消）
 
 门控规则（每条对应 §10.3 设计原则）：
+  0. 最终采信 + 独立证据（S1 修复，2026-09-21 策略评审）：只接受「聚合后最终
+     采信」的结论；且任何一条与模型无关的证据否定它即拒收——
+     - final_verdict=None（需复核/未裁决）→ 不足以改写工具记忆；
+     - evidence_gate 命中（Layer 3：模型漏看已有防御 = 疑似误报）→ 拒收；
+     - counterfactual 存疑（Layer 2：已有防御 + 扰动未翻转 = 模式匹配）→ 拒收。
+     此前写入发生在 Layer 2/3 纠正**之前**，被系统自己认定为"模型误报"的判定
+     反而被记成"该规则可信"的证据——方向相反且无回滚路径。
   1. 全票门槛：仅 votes_true==N（或 votes_false==N）的判定可回填；低置信摇摆不进池。
   2. 跨样本聚合（延迟回填）：同信号须在 ≥K 个独立样本上被一致判定才 commit 到工具层，
      单样本偶发判定（哪怕模型自信）不污染工具。
@@ -147,23 +155,42 @@ class SignalRegistry:
     # ------------------------------------------------------------------
     # 回填（模型裁决 → 工具记忆）
     # ------------------------------------------------------------------
-    def record(self, rule_id: str, *, confirmed: bool, n: int, votes_true: int,
-               votes_false: int, votes_invalid: int, file: str = "",
+    def record(self, rule_id: str, *, final_verdict: Optional[bool], n: int,
+               votes_true: int, votes_false: int, votes_invalid: int, file: str = "",
                taint_type: str = "", corrected_type: str = "",
+               evidence_gate: str = "", counterfactual: Optional[dict] = None,
                suppress_on_neg: bool = True) -> None:
-        """记录一次裁决，按信任分级门控更新信号。
+        """记录一次「聚合后最终采信」的裁决，按信任分级门控更新信号。
 
         Args:
             rule_id: 候选规则 id（信号主键）
-            confirmed: 裁决是否判真
+            final_verdict: 最终采信结论——True=判真并采信 / False=全票否决 /
+                None=需复核或被独立证据否决（S1 门控 0，直接拒收）。
+                调用方必须传**聚合与 Layer 2/3 之后**的结论，而非模型原始投票。
             n / votes_true / votes_false / votes_invalid: 投票统计（全票门槛依据）
             file: 当前样本名（跨样本聚合去重用）
             taint_type: 工具标注的漏洞类型
             corrected_type: LLM 判定后输出的真实类型（空则不改写）
+            evidence_gate: Layer 3 证据门拦截原因（非空 = 疑似误报 → 门控 0 拒收）
+            counterfactual: Layer 2 反事实验证结果（already_defended 且未翻转
+                = 模式匹配存疑 → 门控 0 拒收）
             suppress_on_neg: 高置信否定是否进抑制池（默认 True）
         """
         if not self._enabled or not rule_id:
             return
+        # ---- 门控 0（S1，2026-09-21）：与模型无关的证据，任何一条成立即拒收。
+        # 五条"模型有多自信"的门控（全票/跨样本/双向撤销/类型分离/验证集）全部
+        # 之前已存在，但没有一条在度量"模型有多可能对"——系统自己的复盘记录
+        # （two_stage_scanner 证据门 docstring）是"bf16 端 FP 全部是全票但错"，
+        # 用全票当可信门槛与已知失效模式正交。
+        if final_verdict is None:
+            return  # 最终是"需复核"/未裁决 → 不足以改写工具记忆
+        if evidence_gate:
+            return  # Layer 3 命中：模型漏看已有防御 = 疑似误报，绝不可作为"可信"证据
+        if counterfactual and counterfactual.get("already_defended") \
+                and not counterfactual.get("flipped"):
+            return  # Layer 2 存疑：扰动不翻转 = 模式匹配，同上
+        confirmed = final_verdict is True
         # 门控 1：全票门槛——只有全票一致（votes_true==n 或 votes_false==n）才记录，
         # 低置信摇摆不进入信号（它们正是"模型没把握"的 review 来源）
         unanimous = (votes_true == n and votes_false == 0 and votes_invalid == 0) or \
@@ -215,13 +242,19 @@ class SignalRegistry:
                 if file and file not in sig.rejected_files:
                     sig.rejected_files.append(file)
                 sig.rejected += 1
-                # 门控 3 + 抑制：高置信否定 → 若此前误回填则降权，D 级进抑制池。
-                # Bug 修复（2026-08-16）：原实现无条件 suppressed=True，单次全票
-                # 否决就把规则永久抑制（suppressed_samples=1），与 is_suppressed
-                # 读取端"≥2 独立文件"语义不一致——评估跨样本累积导致工具召回被
-                # 系统性过滤（triage_default 轮 recall 崩塌至 0.25 的根因）。
-                # 修复：仅当"否定文件数 ≥ MIN_AGREE_SAMPLES"才进抑制池；单次否定
-                # 只累加计数（供后续跨样本聚合），不立即抑制。
+                # 高置信否定 → 若此前误回填则撤销确认记录（双向撤销，原则 4）。
+                # S3 修复（2026-09-21，策略评审）：**不再置 sig.suppressed=True**。
+                # 规则级抑制的收益/风险严重不对称——收益只是省该规则每候选的
+                # N=3 次采样，风险是该规则在**所有文件**上永久不再产生候选
+                # （真阳性从召回层面消失且不可见），且三次事故（triage_default
+                # recall 崩塌 0.25 / 生产池压掉 python-xss-taint 与 python-sqli-taint
+                # 全族 / fixed3 期间 B608 等 10+ 规则被吞）全部来自这个动作，
+                # 正面收益记录为零；补偿措施（抑制后强制复核）还把主要收益吃掉。
+                # 注释 :38-44 自己已论证"规则是否误报取决于文件"的维度错误——
+                # 现把抑制动作本身降级为**按文件降权**（priority_factor），
+                # 候选永不移出召回集合。suppressed_samples 照常累计供治理取数；
+                # 历史残留的 suppressed=True 由读端恒 False 中和 + 确认分支
+                # 解除逻辑逐步消化。
                 if suppress_on_neg:
                     # 双向可撤销（原则 4）：只要被高置信否定过，就撤销已积累的
                     # 确认记录——防"确认1次+否定1次+再确认1次"凑满 ready 门槛的
@@ -229,13 +262,6 @@ class SignalRegistry:
                     if sig.confirmed > 0:
                         sig.confirmed = 0
                         sig.confirmed_files = []
-                    # §五之四 保护（2026-08-30）：自有链级规则达到抑制门槛也不
-                    # suppressed——其候选带完整证据链，规则级静默跳过 = 全文件
-                    # 真阳性消失（§五之四 实锤）。否定计数照常累计，供后续
-                    # "按文件粒度降权"治理取数。
-                    if (len(sig.rejected_files) >= MIN_AGREE_SAMPLES
-                            and not _is_protected_rule(rule_id)):
-                        sig.suppressed = True
                 sig.suppressed_samples += 1
         # 变更后自动持久化（2026-08-15：此前 save() 全仓库无调用方，重启归零）
         self.save()
@@ -250,14 +276,36 @@ class SignalRegistry:
             return self._signals.get(rule_id)
 
     def is_suppressed(self, rule_id: str) -> bool:
-        """该规则是否在抑制池（D 级：工具见到直接跳过）。
+        """该规则是否在抑制池。
 
-        §五之四（2026-08-30）：自有链级规则读端豁免——历史 JSON 里可能残留
-        保护机制上线前的 suppressed=True，读端不放行则候选依旧被静默跳过，
-        写端禁止形同虚设（写读两端必须同口径，§11.12 教训）。
+        S3 修复（2026-09-21，策略评审）：**恒返回 False**——规则级抑制动作已
+        取消。三次事故全部来自"把候选从召回集合里删掉"这个动作本身（收益小、
+        失败后果不可逆且不可见、补偿措施吃掉收益），修法是取消动作而非继续加
+        护栏。负向记忆改由 priority_factor 以"按文件降权、永不移出召回集合"
+        的形式表达。保留本函数是为了 API 兼容；历史 JSON 残留的 suppressed=True
+        由此被中和（等效于对存量的一次性豁免）。
+        """
+        return False
+
+    def priority_factor(self, rule_id: str, file: str = "") -> float:
+        """S3（2026-09-21）：按文件的负向记忆降权——保留候选，只改变排序。
+
+        - 同一文件此前被全票否决过 → 0.6（该规则在该文件是已知误报源，
+          但"取决于文件"，其他文件不受影响——与 :38-44 承认的维度一致）；
+        - ready（≥2 独立文件确认且未被否决淹没）→ 1.0 + confidence（正向加权）；
+        - 其余 → 1.0。
+
+        替代原 is_suppressed 的"直接删候选"：省算力的正解是注意力预算
+        （选谁扫由风险分决定），不是把候选删掉。
         """
         sig = self.get_signal(rule_id)
-        return bool(sig and sig.suppressed and not _is_protected_rule(rule_id))
+        if not sig:
+            return 1.0
+        if file and file in sig.rejected_files:
+            return 0.6
+        if sig.ready:
+            return 1.0 + sig.confidence
+        return 1.0
 
     def boost_priority(self, rule_id: str) -> float:
         """返回该规则的召回优先级权重（已回填的高置信信号权重高，供候选排序）。"""
@@ -378,7 +426,7 @@ if __name__ == "__main__":
 
     # 1) 同一文件重复扫描不得 ready（≥2 独立样本门槛）
     for _ in range(3):  # app.py 连扫 3 次
-        r.record("py.taint.sql", confirmed=True, n=3, votes_true=3,
+        r.record("py.taint.sql", final_verdict=True, n=3, votes_true=3,
                  votes_false=0, votes_invalid=0, file="app.py", taint_type="CWE-89")
     sig = r.get_signal("py.taint.sql")
     ok1 = (sig.confirmed == 3 and len(sig.confirmed_files) == 1 and not sig.ready)
@@ -386,35 +434,45 @@ if __name__ == "__main__":
           f"files={len(sig.confirmed_files)}, ready={sig.ready} (期望 ready=False)")
 
     # 2) 第 2 个独立文件确认后 ready
-    r.record("py.taint.sql", confirmed=True, n=3, votes_true=3,
+    r.record("py.taint.sql", final_verdict=True, n=3, votes_true=3,
              votes_false=0, votes_invalid=0, file="service.py", taint_type="CWE-89")
     ok2 = sig.ready and r.boost_priority("py.taint.sql") > 1.0
     print(f"[{'PASS' if ok2 else 'FAIL'}] 跨文件聚合: files={len(sig.confirmed_files)}, "
           f"ready={sig.ready}, boost={r.boost_priority('py.taint.sql'):.2f}")
 
-    # 3) 高置信否定 → 抑制池（2026-08-16 门槛修正后：单次否决只累计计数，
-    #    仅 ≥2 独立文件一致否决才进抑制池——防跨样本偶然性误杀规则）
-    r.record("py.taint.sql", confirmed=False, n=3, votes_true=0,
+    # 3) S3（2026-09-21）：高置信否定只记负向记忆，**不再进抑制池**。
+    #    规则级抑制动作已取消（三次事故全来自它、零正面收益记录）；
+    #    负向记忆以按文件降权（priority_factor）表达，候选永不移出召回集合。
+    r.record("py.taint.sql", final_verdict=False, n=3, votes_true=0,
              votes_false=3, votes_invalid=0, file="x.py")
-    ok3a = not r.is_suppressed("py.taint.sql")  # 单次否决不抑制
-    r.record("py.taint.sql", confirmed=False, n=3, votes_true=0,
+    r.record("py.taint.sql", final_verdict=False, n=3, votes_true=0,
              votes_false=3, votes_invalid=0, file="y.py")
-    ok3 = ok3a and r.is_suppressed("py.taint.sql")  # 第 2 个独立文件否决 → 抑制
-    print(f"[{'PASS' if ok3 else 'FAIL'}] 抑制池(≥2独立文件): "
-          f"单次={not r.is_suppressed('py.taint.sql')}")
+    sig3_neg = r.get_signal("py.taint.sql")
+    ok3 = (not r.is_suppressed("py.taint.sql")            # 不抑制（恒 False）
+           and not sig3_neg.suppressed                    # 写端也不再置 True
+           and sig3_neg.suppressed_samples == 2           # 否定计数照常累计
+           and r.priority_factor("py.taint.sql", "z.py") == 1.0   # 其他文件不降权
+           and r.priority_factor("py.taint.sql", "x.py") == 0.6)  # 同文件被否过 → 降权
+    print(f"[{'PASS' if ok3 else 'FAIL'}] S3 负向记忆按文件降权: "
+          f"suppressed={sig3_neg.suppressed}, samples={sig3_neg.suppressed_samples}, "
+          f"factor(新文件)={r.priority_factor('py.taint.sql', 'z.py')}, "
+          f"factor(被否文件)={r.priority_factor('py.taint.sql', 'x.py')}")
 
-    # 3b) §五之四 保护（2026-08-30）：自有链级规则即使 ≥2 独立文件全票否决
-    #     也不进抑制池（候选静默消失 = 全文件真阳性丢失，实锤 python-xss-taint）
+    # 3b) S3 语义下的存量保护验证：自有链级规则被 2 个独立文件全票否决后，
+    #     候选同样保留（保护名单保留供审计/治理取数；抑制动作对所有规则一致取消）
     for fn in ("x.py", "y.py"):
         r.record("graduation_project.semgrep_rules.python-xss-taint",
-                 confirmed=False, n=3, votes_true=0, votes_false=3,
+                 final_verdict=False, n=3, votes_true=0, votes_false=3,
                  votes_invalid=0, file=fn)
     sig_xss = r.get_signal("graduation_project.semgrep_rules.python-xss-taint")
     ok3b = (not sig_xss.suppressed and not r.is_suppressed(
         "graduation_project.semgrep_rules.python-xss-taint")
-        and sig_xss.suppressed_samples == 2)  # 否定计数照常累计（供治理取数）
-    print(f"[{'PASS' if ok3b else 'FAIL'}] 自有链级规则不抑制(§五之四): "
-          f"suppressed={sig_xss.suppressed}, rejected_files={len(sig_xss.rejected_files)}")
+        and sig_xss.suppressed_samples == 2
+        and r.priority_factor("graduation_project.semgrep_rules.python-xss-taint",
+                              "x.py") == 0.6)  # 降权而非剔除
+    print(f"[{'PASS' if ok3b else 'FAIL'}] 自有链级规则负向记忆(S3): "
+          f"suppressed={sig_xss.suppressed}, rejected_files={len(sig_xss.rejected_files)}, "
+          f"factor={r.priority_factor('graduation_project.semgrep_rules.python-xss-taint', 'x.py')}")
 
     # 3c) §五之四 读端豁免：历史 JSON 残留的 suppressed=True（保护上线前写入）
     #     对自有规则不再生效（写读同口径）
@@ -430,13 +488,13 @@ if __name__ == "__main__":
     #    门槛（2026-08-16 修正后）：单文件校正不生效（< MIN_AGREE_SAMPLES=2 时
     #    保留工具原标注防 B 级污染），≥2 独立文件一致才提交。
     r2 = SignalRegistry(path=tmp.with_name("t2.json"), enabled=True)
-    r2.record("b608", confirmed=True, n=3, votes_true=3, votes_false=0,
+    r2.record("b608", final_verdict=True, n=3, votes_true=3, votes_false=0,
               votes_invalid=0, file="a.py", taint_type="B608",
               corrected_type="CWE-79 XSS")
     first = r2.get_signal("b608").corrected_type
     # C 级更准类型连续 2 个文件出现 → 应提交 CWE-862 并替换先到候选
     for f in ("b.py", "c.py"):
-        r2.record("b608", confirmed=True, n=3, votes_true=3, votes_false=0,
+        r2.record("b608", final_verdict=True, n=3, votes_true=3, votes_false=0,
                   votes_invalid=0, file=f, taint_type="B608",
                   corrected_type="CWE-862 Missing Authorization")
     sig2 = r2.get_signal("b608")
@@ -444,12 +502,19 @@ if __name__ == "__main__":
     print(f"[{'PASS' if ok4 else 'FAIL'}] 类型多数投票(≥2独立文件): "
           f"单文件={first!r} -> {sig2.corrected_type!r}")
 
-    # 5) 自动持久化 + 重启恢复（record 后无需手动 save）
+    # 5) 自动持久化 + 重启恢复（record 后无需手动 save）。
+    #    S3 后否决不再置 suppressed——恢复断言改为：负向记忆（rejected_files/
+    #    suppressed_samples）跨进程保留，双向撤销清掉的确认不复活。
     ok5 = tmp.is_file()
     r3 = SignalRegistry(path=tmp, enabled=True)  # 模拟进程重启
     sig3 = r3.get_signal("py.taint.sql")
-    ok5 = ok5 and sig3 is not None and sig3.suppressed and len(sig3.confirmed_files) == 0
+    ok5 = (ok5 and sig3 is not None
+           and not sig3.suppressed
+           and len(sig3.rejected_files) == 2
+           and sig3.suppressed_samples == 2
+           and len(sig3.confirmed_files) == 0)
     print(f"[{'PASS' if ok5 else 'FAIL'}] 自动持久化/重启恢复: file_exists={tmp.is_file()}, "
+          f"rejected_files={len(sig3.rejected_files) if sig3 else None}, "
           f"suppressed={sig3.suppressed if sig3 else None}")
 
     all_ok = all([ok1, ok2, ok3, ok3b, ok3c, ok4, ok5])

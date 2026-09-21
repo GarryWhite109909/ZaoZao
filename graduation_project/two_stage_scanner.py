@@ -70,7 +70,21 @@ _MONITOR = {
     "recheck_sampled": 0,       # 其中被抽样复核的次数
     "recheck_vuln_found": 0,    # 抽样复核发现工具层漏报的次数
     "recheck_vuln_trusted": 0,  # 其中被 LLM 语义兜底采信为漏洞的次数（自适应闭环）
-    "suppressed_skipped": 0,    # 抑制池接线后被跳过的候选数（2026-08-15 闭环读取端）
+    "suppressed_skipped": 0,    # （历史键，S3 后不再递增）抑制池接线后被跳过的候选数
+    # S3（2026-09-21，策略评审）：负向记忆只降权不剔除——同文件被全票否决过的
+    # 规则候选被排后时递增（替代 suppressed_skipped 的新口径）。
+    "deprioritized": 0,
+    # ---- B4/S6 修复（2026-09-21，策略评审）：漏报率估计量分层 ----
+    # 原估计量 estimated_miss_rate = recheck_vuln_found / recheck_sampled 的分母
+    # 混入了定向复核（tier A/B：按"风险分 ≥12 或高优盲区 ≥2"挑选的可疑样本，
+    # 非随机）→ 系统性高估工具真实漏报率。现按抽样机制分层计数：
+    #   rand 层 = 真随机（sampled 模式按 sampling_rate 抽中 / full_recheck 全量
+    #             复核 / targeted C 档抽样命中）→ 只有这层可称"漏报率估计"
+    #   tier A/B = 按可疑度定向挑选（有偏）→ 只称"高危复核命中率"
+    "rand_recheck_n": 0,        # 随机层复核数（无偏分母）
+    "rand_recheck_hit": 0,      # 随机层发现工具漏报数（无偏分子）
+    "tier_a_n": 0, "tier_a_hit": 0,   # 定向 A 档（高危+盲区）复核数/命中数
+    "tier_b_n": 0, "tier_b_hit": 0,   # 定向 B 档（低危+盲区/零盲区高危）复核数/命中数
     # 2026-08-29 补：长文件复核走确定性分块预筛时递增（P5，2026-08-24 引入），
     # 此前键缺失 → _monitor_incr 抛 KeyError → _maybe_recheck 异常 → 整文件
     # "分析失败"。长文件（>num_ctx×0.45）无候选时必然踩中。
@@ -84,14 +98,53 @@ _MONITOR = {
 _MONITOR_LOCK = threading.Lock()
 
 
+def _wilson_ci(hit: int, n: int, z: float = 1.96) -> Optional[tuple]:
+    """二项比例的 Wilson 置信区间（B4/S6，2026-09-21）：给区间，别给点估计。
+
+    返回 (low, high)；n<=0 返回 None。95% 置信（z=1.96）。
+    """
+    if n <= 0:
+        return None
+    p = hit / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / denom
+    return (round(max(0.0, center - half), 4), round(min(1.0, center + half), 4))
+
+
 def tool_recall_monitor_snapshot() -> dict:
-    """返回工具召回监控快照（含估算漏报率）。"""
+    """返回工具召回监控快照（含分层漏报率估计）。
+
+    B4/S6 修复（2026-09-21，策略评审）：
+      - miss_rate_unbiased：随机层漏报率（rand_recheck_hit / rand_recheck_n）。
+        只有这一层是"工具漏报率估计"——分母无选择偏差。n<30 时点估计
+        不稳定，引用方（前端/论文）应优先使用 miss_rate_wilson 区间。
+      - miss_rate_wilson：随机层漏报率的 95% Wilson 置信区间 (low, high)。
+      - tier_a_hit_rate / tier_b_hit_rate：定向复核命中率——分母是按可疑度
+        挑选的样本，只能称"命中率"，绝不可当漏报率引用。
+      - estimated_miss_rate（兼容旧键）：指向 miss_rate_unbiased。旧口径
+        （混入定向层）已废弃——它会让"工具层召回不够 → 需要模型兜底"的
+        核心论点建立在偏高的数字上。
+    """
     with _MONITOR_LOCK:
         snap = dict(_MONITOR)
-    snap["estimated_miss_rate"] = (
-        round(snap["recheck_vuln_found"] / snap["recheck_sampled"], 4)
-        if snap["recheck_sampled"] else None
+    snap["miss_rate_unbiased"] = (
+        round(snap["rand_recheck_hit"] / snap["rand_recheck_n"], 4)
+        if snap["rand_recheck_n"] else None
     )
+    snap["miss_rate_wilson"] = _wilson_ci(
+        snap["rand_recheck_hit"], snap["rand_recheck_n"])
+    snap["tier_a_hit_rate"] = (
+        round(snap["tier_a_hit"] / snap["tier_a_n"], 4)
+        if snap["tier_a_n"] else None
+    )
+    snap["tier_b_hit_rate"] = (
+        round(snap["tier_b_hit"] / snap["tier_b_n"], 4)
+        if snap["tier_b_n"] else None
+    )
+    # 兼容旧键：口径已改为仅随机层（原实现混入定向层，系统性高估）
+    snap["estimated_miss_rate"] = snap["miss_rate_unbiased"]
+    snap["estimated_miss_rate_ci"] = snap["miss_rate_wilson"]
     return snap
 
 
@@ -117,6 +170,12 @@ class ToolFinding:
     severity: str = "medium"
     tool: str = "semgrep"   # semgrep / taint_tracker / prefilter
     evidence: str = ""      # 原始证据文本（供 LLM 参考）
+    # S5 修复（2026-09-21，策略评审）：source/sink 锚点的**来源**声明。
+    # "tool" = 工具静态污点分析产出（AST/数据流引擎，方向可靠）；
+    # "model_vote" = 模型判真票自述锚点回填（未经工具确认，prompt 不得按
+    # 工具链的高信任措辞标注——此前混淆两者，反事实门控的翻转率被自己的
+    # 信任标注人为压低）。
+    anchor_source: str = "tool"
 
     def to_dict(self) -> dict:
         return {
@@ -133,6 +192,7 @@ class ToolFinding:
             "severity": self.severity,
             "tool": self.tool,
             "evidence": self.evidence,
+            "anchor_source": self.anchor_source,
         }
 
 
@@ -148,6 +208,10 @@ class AdjudicationVerdict:
     fix_suggestion: str = ""        # 修复建议
     raw_outputs: list[str] = field(default_factory=list)  # N 次采样原始输出
     finding: Optional[dict] = None  # 关联的候选 finding（含 taint_type/severity/source/sink）
+    # S5（2026-09-21）：未污染的原 finding 副本（锚点回填**之前**的 to_dict 快照）。
+    # Layer 2 反事实验证读这份——验证门控的 prompt 不得被模型自述锚点的
+    # "工具链高信任"标注污染。
+    finding_raw: Optional[dict] = None
     decision: str = ""              # 裁决档位（confirmed_vulnerability/dismissed_safe/
                                     # confirmed_review/dismissed_review/direct）
     vulnerability_type: str = ""    # 模型校正后的真实漏洞类型（is_confirmed 时输出）
@@ -170,6 +234,7 @@ class AdjudicationVerdict:
             "fix_suggestion": self.fix_suggestion,
             "raw_outputs": self.raw_outputs,
             "finding": self.finding,
+            "finding_raw": self.finding_raw,
             "decision": self.decision,
             "vulnerability_type": self.vulnerability_type,
             "conformal_set": self.conformal_set,
@@ -184,6 +249,15 @@ class TwoStageResult:
     filename: str
     language: str
     has_vulnerability: Optional[bool]
+    # S2 修复（2026-09-21，策略评审）：复核覆盖度——与 has_vulnerability 正交的
+    # 一等语义字段。此前"LLM 未看过"（targeted C 档 / sampled 未抽中）借道
+    # has_vulnerability=False 输出，下游（聚合、前端 Safe 卡、安全评分）全部
+    # 误读为"已确认安全"——语义撒谎。现拆开：
+    #   llm_checked = LLM 产出过可用结论（无论真假）
+    #   not_covered = LLM 未被调用（注意力预算未覆盖：C 档/未抽中）
+    #   unknown     = 调用了但结论不可用（异常/平票/解析失败）
+    # has_vulnerability=None 表示"未裁决"；只有 llm_checked 才允许 False。
+    review_coverage: str = "llm_checked"
     stage1: dict = field(default_factory=dict)                    # 工具层统计
     stage1_ctx_warning: bool = False                              # P5 守卫：输入超上下文告警
     findings: list[ToolFinding] = field(default_factory=list)     # 全部候选
@@ -213,6 +287,7 @@ class TwoStageResult:
             "filename": self.filename,
             "language": self.language,
             "has_vulnerability": self.has_vulnerability,
+            "review_coverage": self.review_coverage,
             "stage1": self.stage1,
             "stage1_ctx_warning": self.stage1_ctx_warning,
             "findings": [f.to_dict() for f in self.findings],
@@ -816,6 +891,13 @@ class TwoStageScanner:
                 # eval_two_stage.py 校准后经 save_calibration 导出到
                 # models/conformal_calibration.json；无文件时保持未校准（门控自动
                 # 降级为旧投票逻辑）。VULN_SCANNER_CONFORMAL_CALIB 指定路径，=0 禁用。
+                # S4 修复（2026-09-21，策略评审）：原 conformal_calibration.json 是
+                # 08-16 在同一 87 段测试集上的 in-sample 拟合（eval_two_stage.py:324
+                # 自己标注"覆盖率保证不成立"），却一直被生产自动加载——评估禁用、
+                # 生产启用。已重命名为 conformal_calibration.in_sample_leaked.json
+                # 留档，生产默认回到未校准降级路径；导出默认路径同步改为
+                # conformal_calibration.out_of_sample.json（须显式 --calibrate-from
+                # 提供与评测集不重叠的校准源才有资格被生产加载）。
                 calib_path = os.environ.get(
                     "VULN_SCANNER_CONFORMAL_CALIB",
                     str(Path(__file__).resolve().parent.parent / "models" / "conformal_calibration.json"),
@@ -1023,20 +1105,28 @@ class TwoStageScanner:
         # full_recheck=全量 LLM 复核（安全关键场景，消除"无证据判安全"的静默放行）；
         # targeted=三档定向复核（按风险分 × 盲区分配注意力，大仓库默认）。
         # force=本文件发生抑制跳过/无主告警剔除（_last_suppressed）→ 强制复核
+        #
+        # S2 修复（2026-09-21，策略评审）：预设从 has_vulnerability=False 改为
+        # None + review_coverage="not_covered"。"LLM 没看过"≠"已判安全"——此前
+        # sampled 未抽中 / targeted C 档都借道 False 输出，下游三处（_aggregate、
+        # 前端 Safe 卡、安全评分）全部误读为"已确认安全"。语义修正后：
+        #   - 复核真的判安全 → False + llm_checked（诚实的安全）
+        #   - 复核判真/采信 → True
+        #   - 未送 LLM / 结论不可用 → None（前端渲染"未复核"或"需复核"卡）
         if not findings:
             recheck = self._maybe_recheck(
                 code, language, force=self._last_suppressed, filename=filename)
-            result.has_vulnerability = False
-            result.stage1["decision"] = "no_candidate_safe"
+            result.review_coverage = "not_covered"
+            result.has_vulnerability = None
+            result.stage1["decision"] = "no_candidate_not_covered"
             if recheck is not None:
                 result.stage1["recheck"] = recheck
                 if recheck.get("tier") == "C":
                     # 定向复核 C 档：零盲区 → 未送 LLM。
                     # 关键：这不是"复核判安全"（那需要 LLM 真的看过），而是
-                    # "注意力预算未覆盖"。故 decision 单独取值，且**不转人工**——
-                    # 否则每个零风险文件都会变成一条待办，review 队列被淹没。
-                    # 留痕在 stage1.recheck 里（tier/C），前端与审计可区分二者。
-                    result.has_vulnerability = False
+                    # "注意力预算未覆盖"。has_vulnerability=None + review_coverage=
+                    # "not_covered" 如实表达；展示层的"队列淹没"问题由前端聚合
+                    # 解决（折叠为一行汇总），而不是由判定层替展示层说谎。
                     result.stage1["decision"] = "no_candidate_no_blind_spot"
                     result.explanation = (
                         "工具层无候选，且未命中任何工具层盲区形态——该文件未获得"
@@ -1052,8 +1142,7 @@ class TwoStageScanner:
                     # 故 B 档判真一律转人工复核（走下方 recheck_low_conf_review）。
                     if recheck.get("tier") == "B":
                         unanimous = False
-                    if self.trust_llm_recheck and unanimous:
-                        # 复核采信门（2026-08-18 修正）：无候选复核是全凭 LLM 的
+                    if self.trust_llm_recheck and unanimous:                        # 复核采信门（2026-08-18 修正）：无候选复核是全凭 LLM 的
                         # 最高置信采信路径。注入型漏洞必须与代码形态匹配（sink 存在
                         # + 无标准防御），否则转 review——客观规则，非测试集拟合
                         # （safe_04 有 abspath 防御仍判 CWE-22、noise_05 参数化仍判
@@ -1076,6 +1165,7 @@ class TwoStageScanner:
                         # 全票门（2026-08-15）：仅全票一致的复核判真才采信——无工具
                         # 证据的采信必须是最高置信级别。
                         result.has_vulnerability = True
+                        result.review_coverage = "llm_checked"
                         result.stage1["decision"] = "no_candidate_recheck_vuln"
                         _monitor_incr("recheck_vuln_trusted")
                         # 回填类型信息（2026-08-15 修复）：recheck 采信此前丢失
@@ -1164,11 +1254,13 @@ class TwoStageScanner:
                     elif self.trust_llm_recheck:
                         # 多数判漏洞但非全票：不采信，转人工（防过度自信后端 recheck 误报）
                         result.has_vulnerability = None
+                        result.review_coverage = "unknown"
                         result.stage1["decision"] = "recheck_low_conf_review"
                         result.error = "复核多数判漏洞但未全票一致（Stage 1 未召回），需人工复核"
                     else:
                         # 旧行为（保守）：复核命中转人工复核，不直接采信
                         result.has_vulnerability = None
+                        result.review_coverage = "unknown"
                         result.stage1["decision"] = "recheck_hit_review"
                         result.error = "复核发现疑似漏洞（Stage 1 未召回），需人工复核"
                 elif recheck.get("has_vulnerability") is False:
@@ -1182,6 +1274,7 @@ class TwoStageScanner:
                     # 判安全（crossfile_02_input 稳定 FN 实证）。此类转人工复核。
                     if _has_param_driven_sink(code):
                         result.has_vulnerability = None
+                        result.review_coverage = "unknown"
                         result.stage1["decision"] = "recheck_incomplete_flow_review"
                         result.error = (
                             "数据流不完整：本文件无自身输入入口，危险 sink 由函数参数驱动"
@@ -1190,18 +1283,23 @@ class TwoStageScanner:
                     elif _has_external_sink_call(code):
                         # A 型：source 在本文件、sink 在被调用的项目内自定义模块
                         result.has_vulnerability = None
+                        result.review_coverage = "unknown"
                         result.stage1["decision"] = "recheck_incomplete_flow_review"
                         result.error = (
                             "数据流不完整：本文件有外部可控输入，但危险 sink 位于被调用的"
                             "自定义模块中——单文件扫描无法判定安全，需结合被调用文件或"
                             "项目级上下文人工复核")
                     else:
+                        # 复核判安全：LLM 真的看过并确认无漏洞 → 诚实的安全
+                        result.review_coverage = "llm_checked"
+                        result.has_vulnerability = False
                         result.stage1["decision"] = "no_candidate_recheck_safe"
                 else:
                     # 复核结果未知（推理异常/平票/解析失败）（2026-08-18 补回，
                     # 08-16 审查 #2 修复在 git checkout 事故重建中丢失）：既未判真
                     # 也未判安全，不能静默停在 no_candidate_safe，转人工复核。
                     result.has_vulnerability = None
+                    result.review_coverage = "unknown"
                     result.stage1["decision"] = "recheck_unknown_review"
                     result.error = (recheck.get("error")
                                     or "复核结果未知（异常或平票），需人工复核")
@@ -1227,6 +1325,9 @@ class TwoStageScanner:
 
         # 聚合最终结论
         self._aggregate(result, code=code)
+        # S1 修复（2026-09-21）：信号回填移到聚合后——按「最终采信 + Layer 2/3
+        # 独立证据」回填，替代原先在 _adjudicate_one 里的提前写入。
+        self._signal_backfill(result)
         # 裁决全否决兜底（2026-08-17 修复）：全部候选 finding 被裁决否决时，
         # 文件被判安全——但裁决式任务只问"工具告警是否为真"，模型不会自主发现
         # 工具没召回的漏洞（规则覆盖不可能 100%），工具盲区在裁决路径上被静默放行。
@@ -1509,7 +1610,11 @@ class TwoStageScanner:
         验证结果写回 adjudication.counterfactual，供聚合/回填决策使用。
         """
         for verdict in adjudications:
-            f = verdict.finding or {}
+            # S5 修复（2026-09-21）：优先读未污染的 finding_raw（锚点回填前的
+            # 快照）。verdict.finding 可能已被写回模型自述锚点——若用它构造
+            # 验证 prompt，模型会先被告知"此链是工具静态污点分析产物、方向
+            # 可靠"，反事实门控的翻转率被自己的信任标注压低（R2 自我确认回路）。
+            f = verdict.finding_raw or verdict.finding or {}
             category = (f.get("category") or "")
             low_trust = category in _LOW_TRUST_CATEGORIES
             if not verdict.confirmed:
@@ -1896,40 +2001,44 @@ class TwoStageScanner:
     # ------------------------------------------------------------------
     # 信号注册表接线（2026-08-15：自适应闭环此前"只写不读"，本方法是读取端）
     # ------------------------------------------------------------------
-    def _apply_signal_registry(self, findings: list[ToolFinding]) -> list[ToolFinding]:
-        """用回填信号过滤与重排候选：抑制池跳过 + 高置信信号优先。
+    def _apply_signal_registry(self, findings: list[ToolFinding],
+                               filename: str = "") -> list[ToolFinding]:
+        """用回填信号重排候选：按文件降权 + 高置信信号优先（S3，2026-09-21）。
 
-        - 抑制池（is_suppressed）：该规则被 ≥2 独立文件高置信否定过 → 工具
-          "见到该特征直接跳过"。仅作用于裁决档（taint/prefilter/sast/iac）；
-          直出档（secret/sca，确定性工具）不受模型意见影响。被跳过的候选
-          计入 stage1 统计（suppressed_skipped），供召回监控。
-        - 优先级（boost_priority）：已回填高置信信号的规则候选排前，优先获得
-          裁决注意力（候选顺序影响 LLM 上下文组织）。
+        - S3 修复（策略评审）：**只重排、不再跳过**。原实现的抑制池
+          （is_suppressed）把被 ≥2 独立文件否决过的规则候选直接从召回集合
+          删掉——三次事故（recall 崩塌 0.25 / python-xss-taint 全族被压 /
+          B608 等 10+ 规则被吞）全部来自这个动作，且注释 :38-44 自己已论证
+          "规则是否误报取决于文件"的维度错误。现在负向记忆以 priority_factor
+          表达：同文件被否过的规则排后（×0.6），永不移出召回集合。
+        - 正向（ready 信号 1.0+confidence）：已回填高置信信号的规则候选排前，
+          优先获得裁决注意力（候选顺序影响 LLM 上下文组织）。
+        - 仅作用于裁决档（taint/prefilter/sast/iac）；直出档（secret/sca，
+          确定性工具）不受模型意见影响。
         """
         reg = self._signal_registry
         if reg is None or not findings:
             return findings
         # 留痕容器按需补齐（2026-08-30）：与 _drop_irrelevant_positional 同因——
         # 本方法可在 __init__ 之外被直接调用（离线审计脚本用 __new__ 绕过构造），
-        # 缺字段会让"抑制留痕"反过来中断召回主流程。
+        # 缺字段会让"降权留痕"反过来中断召回主流程。
         if not hasattr(self, "_last_suppressed_rules"):
             self._last_suppressed_rules = []
         kept: list[ToolFinding] = []
-        skipped: list[str] = []
+        deprioritized: list[str] = []
         for f in findings:
             if (f.category in _ADJUDICATE_CATEGORIES and f.rule_id
-                    and reg.is_suppressed(f.rule_id)):
-                skipped.append(f.rule_id)
-                continue
+                    and reg.priority_factor(f.rule_id, filename) < 1.0):
+                # 负向记忆命中（本文件此前被全票否决过）：候选保留，仅排后
+                deprioritized.append(f.rule_id)
             kept.append(f)
-        if skipped:
-            for _ in skipped:
-                _monitor_incr("suppressed_skipped")
-            self._last_suppressed_rules.extend(skipped)  # §五之四：stage1 留痕
-            # 候选被抑制池跳过 → 本文件可能落入无候选：标记强制复核（08-16 审查 #4，
-            # 2026-08-18 补回：抑制跳过后若不再产生候选，无候选分支须 force 复核）
-            self._last_suppressed = True
-        kept.sort(key=lambda f: -reg.boost_priority(f.rule_id or ""))
+        if deprioritized:
+            for _ in deprioritized:
+                _monitor_incr("deprioritized")
+            # stage1 留痕（§五之四 语义延续：候选"被注册表影响了"必须可审计；
+            # S3 起不再是"被跳过"而是"被排后"）
+            self._last_suppressed_rules.extend(deprioritized)
+        kept.sort(key=lambda f: -reg.priority_factor(f.rule_id or "", filename))
         return kept
 
     # ------------------------------------------------------------------
@@ -2050,15 +2159,22 @@ class TwoStageScanner:
             # 定向复核：三档。force 时不走此路（抑制跳过的文件必须真复核，
             # 否则 §五之四 的"静默放行"会以另一种形式复现）。
             return self._targeted_recheck(code, language, filename=filename)
+        rand_layer = False  # B4/S6：本路径是否属于无偏随机层（漏报率分母）
         if force:
-            sampled = True
+            sampled = True  # 强制复核（无主告警剔除触发）：非随机挑选，不入 rand 层。
+            # 注意 targeted+force 也走这里（:1998 的 targeted 分流带 not force 条件），
+            # 强制复核语义必须保留，不能按 targeted 提前返回 None。
         elif self.no_candidate_mode == "full_recheck":
             sampled = True
+            rand_layer = True   # 全量复核 = 普查，无选择偏差
         elif self.sampling_rate <= 0 or random.random() >= self.sampling_rate:
             return None
         else:
             sampled = True
+            rand_layer = True   # sampling_rate 真随机命中
         _monitor_incr("recheck_sampled")
+        if rand_layer:
+            _monitor_incr("rand_recheck_n")
         # 全票门（2026-08-15）：复核改为 N=min(3, n_samples) 次采样投票。单次复核在
         # bf16 后端会把 safe_09 类正确授权检查误判为漏洞（四维矩阵 transformers FP
         # 根因之一）；投票后仅全票一致的"有漏洞"才具备被采信（trust_llm_recheck）
@@ -2121,6 +2237,8 @@ class TwoStageScanner:
             hv = None
         if hv is True:
             _monitor_incr("recheck_vuln_found")
+            if rand_layer:
+                _monitor_incr("rand_recheck_hit")  # B4/S6：无偏层命中
         out = {"sampled": True, "has_vulnerability": hv,
                "votes_true": votes_true, "votes_false": votes_false,
                "votes_invalid": votes_invalid, "n": n}
@@ -2212,6 +2330,17 @@ class TwoStageScanner:
         n = max(1, min(3, self.n_samples)) if tier == "A" else 1
         _monitor_incr("recheck_tier_a" if tier == "A" else "recheck_tier_b")
         _monitor_incr("recheck_sampled")
+        # B4/S6（2026-09-21）：分母按抽样机制分层——c_tier_sampled 是真随机
+        # （C 档按 sampling_rate 命中）→ 无偏 rand 层；其余 A/B 是按可疑度
+        # 定向挑选 → 有偏层（只报"命中率"）。
+        rand_layer = False
+        if why == "c_tier_sampled":
+            _monitor_incr("rand_recheck_n")
+            rand_layer = True
+        elif tier == "A":
+            _monitor_incr("tier_a_n")
+        else:
+            _monitor_incr("tier_b_n")
 
         # ---- 复核上下文：有盲区用盲区片段，零盲区用预筛块/整文件 ----
         prescreen_info = None
@@ -2272,6 +2401,12 @@ class TwoStageScanner:
             hv = None
         if hv is True:
             _monitor_incr("recheck_vuln_found")
+            if rand_layer:
+                _monitor_incr("rand_recheck_hit")  # B4/S6：无偏层命中（c_tier_sampled）
+            elif tier == "A":
+                _monitor_incr("tier_a_hit")
+            else:
+                _monitor_incr("tier_b_hit")
         out = {
             "sampled": True, "tier": tier, "reason": why,
             "targeted_context": ctx is not None,   # 是否用了盲区片段（False=整文件回退）
@@ -2825,6 +2960,12 @@ class TwoStageScanner:
                 verdict = self._adjudicate_one(finding, code_context, language, filename, rag_context)
             # 关联回源 finding（含 taint_type/severity），供前端逐条展示投票与置信度
             verdict.finding = finding.to_dict()
+            # S5 修复（2026-09-21，策略评审）：保留**未污染**的原 finding 副本。
+            # 下面的锚点回填会把模型自述的 source/sink 写进 verdict.finding，
+            # 而 Layer 2 反事实验证读的是同一个 dict——"验证模型是否理解防御"
+            # 的门控，其 prompt 却刚被标注"这条链是工具静态污点分析产物、很可信"，
+            # 翻转率被人为压低。Layer 2 改读 finding_raw（纯工具产出）。
+            verdict.finding_raw = dict(verdict.finding)
             # 证据链回填（2026-08-29）：位置型候选（B501/B310 等）无 source/sink 文本，
             # 用判真票锚点补齐，供 _aggregate 透出到顶层（前端证据链卡片依赖）。
             # 必须**同时同步行号**——否则会出现"文本写 line 9、行号徽标标 L10"
@@ -2836,11 +2977,13 @@ class TwoStageScanner:
                     _ln = _anchor_line(verdict.src_anchor, code)
                     if _ln:
                         _fd["source_line"] = _ln
+                    _fd["anchor_source"] = "model_vote"  # S5：标注锚点真实来源
                 if verdict.sink_anchor and not (_fd.get("sink") or "").strip():
                     _fd["sink"] = verdict.sink_anchor
                     _ln = _anchor_line(verdict.sink_anchor, code)
                     if _ln:
                         _fd["sink_line"] = _ln
+                    _fd["anchor_source"] = "model_vote"  # S5：标注锚点真实来源
             # 先定档位再 to_dict，保证 verdict_dict 携带 decision
             if self._is_direct_category(finding.category):
                 verdict.decision = "direct"  # 直出档：确定性工具自判，无 LLM 采样
@@ -3135,7 +3278,12 @@ class TwoStageScanner:
         逐票计 invalid、复核侧走原有整体 error 返回），单条失败为该项
         error 非空——与循环版逐票异常语义一致。
         """
-        max_tokens = int(os.environ.get("VULN_SCANNER_MAX_TOKENS", "2048"))
+        # S7 修复（2026-09-21，策略评审）：默认 2048 → 768。裁决/复核输出是
+        # 固定字段 JSON（triage prompt 口径：输出 is_confirmed/reason/fix 等
+        # 短 JSON），2048 的预算上限对"短 JSON 输出"过宽——进程内后端卡死
+        # 时的白烧翻倍，"生成途中开始复读"的概率也更高。墙钟超时（S7）叠加
+        # 收紧预算把单次卡死的代价压到最低。VULN_SCANNER_MAX_TOKENS 仍可覆盖。
+        max_tokens = int(os.environ.get("VULN_SCANNER_MAX_TOKENS", "768"))
         gen_n = getattr(self.client, "generate_n", None)
         if n > 1 and callable(gen_n):
             try:
@@ -3279,19 +3427,65 @@ class TwoStageScanner:
         verdict.src_anchor = adj_src
         verdict.sink_anchor = adj_sink
 
-        # 信号回填（模型帮助工具，按信任分级门控）：
-        #   全票一致的判定才记录；高置信否定 → 抑制池；confirmed → 置信+类型校正
-        if self._signal_registry is not None:
-            rule_id = (finding.rule_id or "")
+        # S1 修复（2026-09-21，策略评审）：此处**不再**调用 signal_registry.record()。
+        # 原实现在此写入模型原始投票——发生在 Layer 2（反事实）/Layer 3（证据门）
+        # 纠正**之前**：Layer 3 判「模型漏看防御 = 模型在这个文件上错了」的判定，
+        # 在它之前已按 confirmed=True 记进 confirmed_files，成为"该规则可信"的证据
+        # （方向恰好相反，且 Layer 2/3 的结论从不回改注册表）。现在统一由
+        # _signal_backfill 在 _aggregate 之后按「最终采信 + 与模型无关的证据」回填。
+        return verdict
+
+    def _signal_backfill(self, result: TwoStageResult) -> None:
+        """S1（2026-09-21，策略评审）：聚合完成后按「最终采信」回填信号注册表。
+
+        写入时机从 _adjudicate_one（Layer 2/3 纠正之前）移到这里——此时：
+          - verdict.evidence_gate / verdict.counterfactual 已被 Layer 3/Layer 2 填好；
+          - 文件级聚合（_aggregate）已完成，单条判定的采信状态可以判定。
+
+        回填口径（与 signal_registry.record 的门控 0 对应）：
+          - 合成 finding（category=="llm"）与直出档（decision=="direct"，无真实
+            投票，B8 埋雷）不回填；
+          - confirmed=True 但被证据门/反事实拦下 → final_verdict=None（拒收）：
+            「模型漏看已有防御」= 模型在这个文件上错了，这一笔绝不可成为
+            "该规则可信"的证据；
+          - 其余按 verdict.confirmed 原样回填（True/False），全票门槛与跨样本
+            聚合仍由 record 内部门控把关。
+        """
+        if self._signal_registry is None:
+            return
+        for a in result.adjudications:
+            f = a.finding or {}
+            category = (f.get("category") or "")
+            if category == "llm":
+                continue  # recheck 合成 finding：非工具规则信号
+            if a.decision == "direct":
+                continue  # 直出档：无 N 采样投票（votes_true=1 硬编码），不进记忆
+            rule_id = f.get("rule_id") or ""
+            if not rule_id:
+                continue
+            cf_suspicious = bool(
+                a.counterfactual
+                and a.counterfactual.get("already_defended")
+                and not a.counterfactual.get("flipped")
+            )
+            if a.confirmed and (a.evidence_gate or cf_suspicious):
+                # 疑似误报（Layer 2/3 拦下的判中）：拒收，不作为可信证据
+                final_verdict = None
+            else:
+                final_verdict = bool(a.confirmed)
             self._signal_registry.record(
                 rule_id=rule_id,
-                confirmed=final_confirmed and valid_votes == self.n_samples,
-                n=self.n_samples, votes_true=votes_true,
-                votes_false=votes_false, votes_invalid=votes_invalid,
-                file=filename, taint_type=finding.taint_type,
-                corrected_type=corrected_type,
+                final_verdict=final_verdict,
+                n=self.n_samples,
+                votes_true=a.votes_true,
+                votes_false=a.votes_false,
+                votes_invalid=a.votes_invalid,
+                file=result.filename,
+                taint_type=f.get("taint_type") or "",
+                corrected_type=(a.vulnerability_type or "") if a.confirmed else "",
+                evidence_gate=a.evidence_gate or "",
+                counterfactual=a.counterfactual,
             )
-        return verdict
 
     def _retrieve_rag_context(self, code: str) -> Optional[str]:
         """检索裁决用 RAG 知识（与 Scanner 同一 Chroma 知识库）。
@@ -3456,7 +3650,10 @@ class TwoStageScanner:
                     result.fix_suggestion, code)
 
         if not result.adjudications:
-            result.has_vulnerability = False
+            # S2 修复（2026-09-21）：有候选进裁决但产出为空 → "未裁决"而非"判安全"。
+            # 此前借道 has_vulnerability=False 静默判安全（R1 语义违规）。
+            result.has_vulnerability = None
+            result.review_coverage = "not_covered"
             return
         # 文件级 True 的两条通道（2026-08-18 注释修正，消除与底部 majority_confirm 的
         # 表面矛盾）：
@@ -3629,14 +3826,17 @@ if __name__ == "__main__":
     print(f"[{'PASS' if ok_adjud else 'FAIL'}] 裁决: confirmed={verdict.confirmed}, "
           f"votes={verdict.votes_true}/{verdict.votes_false}, conf={verdict.confidence:.3f}")
 
-    # 4) 端到端聚合：无候选 → 安全（sampling_rate=0 关闭抽样复核，避免自检随机化）
+    # 4) 端到端聚合：无候选且未抽中 → 未复核（S2 语义修正：不再借道判安全）。
+    #    sampling_rate=0 关闭抽样复核，避免自检随机化。
     ts = TwoStageScanner(client=FakeClient(outputs), system_prompt="sys", n_samples=3,
                          use_semgrep=False, use_taint_tracker=False, use_prefilter=False,
                          use_external=False, sampling_rate=0)
     r = ts.scan_code('x = 1\nprint(x)', "python", "safe.py")
-    ok_safe = r.has_vulnerability is False and r.stage1["decision"] == "no_candidate_safe"
-    print(f"[{'PASS' if ok_safe else 'FAIL'}] 无候选判安全: has_vuln={r.has_vulnerability}, "
-          f"decision={r.stage1.get('decision')}")
+    ok_safe = (r.has_vulnerability is None
+               and r.review_coverage == "not_covered"
+               and r.stage1["decision"] == "no_candidate_not_covered")
+    print(f"[{'PASS' if ok_safe else 'FAIL'}] 无候选未复核: has_vuln={r.has_vulnerability}, "
+          f"coverage={r.review_coverage}, decision={r.stage1.get('decision')}")
 
     # 5) 直出档裁决：secret/sca finding 不消耗 LLM 采样（直接判真，decision=direct）
     direct = ToolFinding(rule_id="generic-api-key", category="secret", source="", sink="",
@@ -3812,15 +4012,15 @@ if __name__ == "__main__":
     ok_noleak = leak_scanner.n_samples == 3
     print(f"[{'PASS' if ok_noleak else 'FAIL'}] n_samples不泄漏: scan 后默认={leak_scanner.n_samples} (期望 3)")
 
-    # 16) 信号注册表读取端接线（2026-08-15）：抑制规则的候选被过滤，
-    #     直出档不受影响
+    # 16) 信号注册表读取端接线（S3 语义，2026-09-21）：负向记忆**只降权不剔除**，
+    #     直出档（secret/sca）不受模型意见影响、永远保留。
     import tempfile as _tf
     from pathlib import Path as _P
     from graduation_project.signal_registry import SignalRegistry as _SR
     _reg = _SR(path=_P(_tf.mkdtemp()) / "reg.json", enabled=True)
-    _reg.record("bad.rule", confirmed=False, n=3, votes_true=0, votes_false=3,
+    _reg.record("bad.rule", final_verdict=False, n=3, votes_true=0, votes_false=3,
                 votes_invalid=0, file="a.py")
-    _reg.record("bad.rule", confirmed=False, n=3, votes_true=0, votes_false=3,
+    _reg.record("bad.rule", final_verdict=False, n=3, votes_true=0, votes_false=3,
                 votes_invalid=0, file="b.py")
     wired = TwoStageScanner(client=FakeClient(outputs), system_prompt="sys")
     wired._signal_registry = _reg
@@ -3832,10 +4032,14 @@ if __name__ == "__main__":
         ToolFinding(rule_id="bad.rule", category="secret", source="", sink="",
                      taint_type="Z", source_line=0, sink_line=3, tool="gitleaks"),
     ]
-    kept = wired._apply_signal_registry(list(fs))
+    # filename="a.py" 与负向记录同文件 → 裁决档 bad.rule 降权（排后）但不剔除；
+    # 未被否决的 good.rule 排前；secret 直出档不受影响。
+    kept = wired._apply_signal_registry(list(fs), filename="a.py")
     rules = [f.rule_id for f in kept]
-    ok_wire = rules.count("bad.rule") == 1 and "good.rule" in rules  # 裁决档被抑制，secret 直出档保留
-    print(f"[{'PASS' if ok_wire else 'FAIL'}] 抑制池接线: kept={rules} (期望 bad.rule 仅剩 secret 档)")
+    ok_wire = (rules.count("bad.rule") == 2 and rules.count("good.rule") == 1
+               and rules[0] == "good.rule")  # 全部保留；未被否者排前
+    print(f"[{'PASS' if ok_wire else 'FAIL'}] 负向记忆接线(只降权): kept={rules} "
+          f"(期望 3 条全保留、good.rule 排前)")
 
     # 17) recheck 采信路径证据链（2026-08-15）：no_candidate_recheck_vuln 现在
     #     产出 findings/adjudications（此前全空）
@@ -3951,7 +4155,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as _td:
         _reg = SignalRegistry(path=Path(_td) / "reg.json", enabled=True)
         for _f in ("a.py", "b.py"):     # ≥MIN_AGREE_SAMPLES 个独立样本才提交校正
-            _reg.record("B501-X", confirmed=True, n=3, votes_true=3, votes_false=0,
+            _reg.record("B501-X", final_verdict=True, n=3, votes_true=3, votes_false=0,
                         votes_invalid=0, file=_f, taint_type="B501-X",
                         corrected_type="CWE-295 Improper Certificate Validation")
         _ts = object.__new__(TwoStageScanner)   # 绕过 __init__：用例不依赖 LLM client
@@ -3984,7 +4188,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as _td2:
         _reg2 = SignalRegistry(path=Path(_td2) / "reg.json", enabled=True)
         for _f in ("a.py", "b.py"):
-            _reg2.record("crit-tool-rule", confirmed=True, n=3, votes_true=3,
+            _reg2.record("crit-tool-rule", final_verdict=True, n=3, votes_true=3,
                          votes_false=0, votes_invalid=0, file=_f,
                          taint_type="crit-tool-rule",
                          corrected_type="CWE-78 OS Command Injection")
@@ -4095,13 +4299,15 @@ if __name__ == "__main__":
     ])
     print(f"[{'PASS' if ok_tail else 'FAIL'}] 待办1 长尾类型推断: XXE/LDAP/NoSQL/Log 分支")
 
-    # 22) §五之四 抑制留痕（2026-08-30）：候选被抑制池跳过时 stage1 字典留痕
-    #     suppressed_by_registry——"工具层零召回"由此可归因（没命中 vs 命中后被抑制），
-    #     消除静默性；且受保护的自有链级规则（taint_tracker:*）不被抑制。
+    # 22) S3 负向记忆留痕（2026-09-21，原 §五之四 抑制留痕的语义升级）：
+    #     候选被同文件负向记忆降权时 stage1 字典留痕 suppressed_by_registry——
+    #     "候选被注册表影响"由此可审计，消除静默性。S3 起**只降权不跳过**：
+    #     B888-T 虽被 2 个独立文件否决，仍保留在候选集合（排后），自有链级
+    #     规则同理；排序上被否过的规则不再优先获得裁决注意力。
     with tempfile.TemporaryDirectory() as _td2:
         _reg2 = SignalRegistry(path=Path(_td2) / "reg.json", enabled=True)
-        for _f in ("a.py", "b.py"):     # ≥2 独立文件全票否决 → 普通规则进抑制池
-            _reg2.record("B888-T", confirmed=False, n=3, votes_true=0, votes_false=3,
+        for _f in ("a.py", "b.py"):     # ≥2 独立文件全票否决 → 负向记忆累计
+            _reg2.record("B888-T", final_verdict=False, n=3, votes_true=0, votes_false=3,
                          votes_invalid=0, file=_f)
         _ts2 = TwoStageScanner(client=FakeClient(outputs), system_prompt="sys",
                                use_semgrep=False, use_taint_tracker=False,
@@ -4118,15 +4324,23 @@ if __name__ == "__main__":
                                    path=["q"], severity="high", tool="taint_tracker")
 
         def _fake_recall(code, language, filename):
-            return _ts2._dedupe(_ts2._apply_signal_registry([_sup_finding, _own_finding]))
+            # 用与负向记录相同的文件名（a.py）→ B888-T 命中"同文件被否过"降权；
+            # taint 链级候选无负向记录 → factor=1.0 排前。
+            return _ts2._dedupe(_ts2._apply_signal_registry(
+                [_sup_finding, _own_finding], filename="a.py"))
 
         _ts2._stage1_recall = _fake_recall
         _r2s = _ts2.scan_code("x = 1\n", "python", "sup.py")
-        # B888-T 被跳过并留痕；自有 taint 链级候选保留（§五之四保护，即便被
-        # 全票否决 2 次也不进抑制池——本例它根本未被否定，保护读端兜底）
-        ok_trace = (_r2s.findings and _r2s.findings[0].rule_id == "taint_tracker:SQL Injection"
-                    and _r2s.stage1.get("suppressed_by_registry", {}).get("rule_ids") == ["B888-T"])
-    print(f"[{'PASS' if ok_trace else 'FAIL'}] §五之四 抑制留痕: "
+        # S3：两个候选**都保留**（永不移出召回集合）；B888-T 因"同文件被全票
+        # 否决过"被降权（factor 0.6 < 1.0）排后并留痕；排序上未被否决的
+        # taint 链级候选（1.0）排前。
+        ok_trace = (_r2s.findings
+                    and {f.rule_id for f in _r2s.findings}
+                    == {"B888-T", "taint_tracker:SQL Injection"}
+                    and _r2s.findings[0].rule_id == "taint_tracker:SQL Injection"
+                    and _r2s.stage1.get("suppressed_by_registry", {}).get("rule_ids")
+                    == ["B888-T"])
+    print(f"[{'PASS' if ok_trace else 'FAIL'}] S3 负向记忆只降权不剔除: "
           f"suppressed_by_registry={_r2s.stage1.get('suppressed_by_registry')}, "
           f"剩余候选={[f.rule_id for f in _r2s.findings]}")
 
@@ -4250,10 +4464,12 @@ if __name__ == "__main__":
     ts_c = _mk_targeted([_safe_v])
     rc = ts_c.scan_code(_zero, "python", "utils/calc.py")
     ok_t_c = (rc.stage1["decision"] == "no_candidate_no_blind_spot"
-              and rc.has_vulnerability is False
+              and rc.has_vulnerability is None
+              and rc.review_coverage == "not_covered"
               and len(ts_c.client.prompts) == 0)   # 关键：零 LLM 调用
     print(f"[{'PASS' if ok_t_c else 'FAIL'}] 定向复核 C 档（零盲区不调 LLM）: "
           f"decision={rc.stage1['decision']}, has_vuln={rc.has_vulnerability}, "
+          f"coverage={rc.review_coverage}, "
           f"LLM 调用={len(ts_c.client.prompts)} 次（期望 0）")
 
     # 25a-2) 零盲区但**高风险分** → 降 B 档，仍要送 LLM。

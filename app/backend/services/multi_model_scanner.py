@@ -244,9 +244,13 @@ class MultiModelScanner:
         total_valid = true_count + false_count
 
         # 判定最终 has_vulnerability 与共识类型
-        # 平票时倾向 True（保守判定为漏洞：安全审计场景宁误报不漏报）。
-        # 与 experiments/utils.py 的 majority_vote 在"平票→True"上一致；差异：
-        # 产品路径不设有效票过半的法定人数（有效票即表决），utils.py 为论文
+        # B1 修复（2026-09-21，审查报告）：平票 → **需人工复核**（None），不再
+        # 保守判漏洞。理由：①两阶段扫描器的平票口径是 has_vulnerability=None
+        # （转人工复核），同一系统两套平票口径会在答辩时被问穿——"证据最强
+        # 对立（50/50）时给出了最强的结论"；②experiments/utils.py 的"平票→True"
+        # 是论文聚合口径（带法定人数约束），产品路径照抄属于口径混用。
+        # 与论文口径对齐的需求由评估脚本承担，产品 UI 输出复核语义。
+        # 差异：产品路径不设有效票过半的法定人数（有效票即表决），utils.py 为论文
         # 聚合口径要求有效票 > 总票数一半，两次 parse_fail 时不承认唯一票多数。
         majority_side: list[tuple[str, SingleResult]] = []
         if total_valid == 0:
@@ -255,11 +259,11 @@ class MultiModelScanner:
             consensus = "split"
             agreement_ratio = 0.0
         elif true_count == false_count:
-            # 平票（如 2 个模型 1 True 1 False）→ 保守判定为漏洞（True）
-            final_verdict = True
+            # 平票（如 2 个模型 1 True 1 False）→ 证据势均力敌，转人工复核
+            final_verdict = None
             consensus = "split"
             agreement_ratio = 0.5
-            # 平票时多数方取 true_votes（倾向漏洞），用于结构化字段填充
+            # 结构化字段仍取 true 侧（展示漏洞信息供复核参考，不改变"需复核"结论）
             majority_side = true_votes
         else:
             final_verdict = true_count > false_count
