@@ -582,8 +582,11 @@ class ExternalScanner:
                     time.sleep(0.3)  # 保留短退避（锁已消除主竞态，此处仅让出 CPU）
                     continue
         data = best
-        if len(self._semgrep_cache) > 64:
-            self._semgrep_cache.clear()
+        # B7 修正（2026-09-21）：单条 FIFO 淘汰，替代 clear() 全清——4 线程并发下
+        # 全清等于让两个文件的 key 互相挤掉对方（缓存失效 + 重算整份 semgrep JSON）。
+        # dict 保持插入序，逐条淘汰最旧即可。
+        while len(self._semgrep_cache) > 64:
+            self._semgrep_cache.pop(next(iter(self._semgrep_cache)))
         self._semgrep_cache[key] = data
         return data
 
