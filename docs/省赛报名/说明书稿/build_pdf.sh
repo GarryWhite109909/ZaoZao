@@ -126,6 +126,19 @@ for pair in "vscode_plugin.png" "model_drawer.png" "theme_compare.png"; do
   fi
 done
 
+# ---------- 1.5 匿名化截图覆盖 ----------
+# assets_src_anon/ 内为已脱敏截图（品牌位、模型全名、本机路径、编辑器工作区名已隐去，
+# 产出方式见 修订记录_修复_20260921.md）。存在即整体覆盖 assets/ 同名文件，保证进 PDF 的
+# 永远是匿名版；缺的文件回退上方 copy_shot 拷入的原图。
+ANON_DIR="${SCRIPT_DIR}/assets_src_anon"
+if [[ -d "${ANON_DIR}" ]]; then
+  n=0
+  for f in "${ANON_DIR}"/*.png; do
+    cp -f "${f}" "${ASSETS_DIR}/$(basename "${f}")" && n=$((n+1))
+  done
+  echo "  [ok]   匿名化截图覆盖 ${n} 张 <- assets_src_anon/"
+fi
+
 # ---------- 2. 合并篇文件 ----------
 echo "[2/4] 合并篇文件 -> ${MERGED_MD}"
 : > "${MERGED_MD}"
