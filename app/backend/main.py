@@ -12,7 +12,7 @@ FastAPI 后端入口 —— 漏洞扫描器 API。
   POST /api/verify-fix        修复建议验证（语法校验 + 危险模式移除）
   POST /api/multi-model-scan  多模型投票扫描
   POST /api/vllm-analyze      vLLM 推理后端单文件分析
-  GET  /api/report            下载最近一次批量扫描的 Markdown 报告
+  GET  /api/report            下载批量扫描的 Markdown 报告（?report_id= 精确取回）
   POST /api/report/single     分析并下载单文件 Markdown 报告
 
 启动：
@@ -33,6 +33,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -466,6 +467,26 @@ _scan_stats: dict = _load_scan_stats()
 # 写入发生在 async handler（事件循环线程），而 get_stats 是普通 def（线程池线程）、
 # download_report 是 async，故存在跨线程读写，需加锁避免统计丢失/读撕。
 _stats_lock = threading.Lock()
+
+# B6 修正（2026-09-21）：报告不再只留一份全局 _last_batch——多标签页 / 插件并发时
+# GET /api/report 会拿到**别人那一轮**的报告。现按 report_id 保留最近
+# _MAX_RECENT_BATCHES 份：三个批量入口在响应里回传 report_id，调用方用
+# GET /api/report?report_id=… 精确取回自己那一轮；_last_batch 保留为"最近一次"
+# 以兼容不带参数的旧调用。
+_MAX_RECENT_BATCHES = 8
+_recent_batches: "OrderedDict[str, BatchResult]" = OrderedDict()
+
+
+def _remember_batch(batch: BatchResult) -> str:
+    """登记一次批量扫描结果，返回 report_id（供调用方精确取回报告）。"""
+    global _last_batch
+    rid = uuid.uuid4().hex[:12]
+    with _stats_lock:
+        _recent_batches[rid] = batch
+        while len(_recent_batches) > _MAX_RECENT_BATCHES:
+            _recent_batches.popitem(last=False)
+        _last_batch = batch
+    return rid
 
 
 # ---------------------------------------------------------------------------
@@ -1187,12 +1208,12 @@ async def batch_scan(
             }, ensure_ascii=False) + "\n"
 
         batch.total_duration = time.time() - batch_start
-        with _stats_lock:
-            _last_batch = batch
+        report_id = _remember_batch(batch)          # B6：登记并取回 report_id
         _record_scan(batch, source="batch")
         yield json.dumps({
             "type": "done",
             "summary": batch.to_dict(),
+            "report_id": report_id,                 # B6：前端据此下载"本轮"报告
         }, ensure_ascii=False) + "\n"
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
@@ -1407,13 +1428,12 @@ async def url_scan(req: UrlScanRequest, request: Request):
     batch = await _scan_files_scheduled(
         selected, req.use_rag, client_id, n_samples=req.n_samples,
         no_candidate_mode=URL_NO_CANDIDATE_MODE)
-    global _last_batch
-    with _stats_lock:
-        _last_batch = batch
+    report_id = _remember_batch(batch)              # B6
     _record_scan(batch, source="url")
 
     return {
         "url": req.url,
+        "report_id": report_id,                     # B6
         "title": fetch_result.title,
         "total_scripts": fetch_result.total_scripts,
         # 被公共库过滤跳过的外链（前端提示；skip_common_libs=False 时为空）
@@ -1606,14 +1626,13 @@ async def github_scan(req: GithubScanRequest, request: Request):
         batch = await _scan_files_scheduled(
             selected, req.use_rag, client_id, n_samples=req.n_samples,
         )
-        global _last_batch
-        with _stats_lock:
-            _last_batch = batch
+        report_id = _remember_batch(batch)          # B6
         _record_scan(batch, source="github")
 
         dep_vulns = await dep_task if dep_task is not None else []
         return {
             "repo": req.repo_url,
+            "report_id": report_id,                 # B6
             "scanned_files": len(selected),
             "repo_files_total": len(code_files),
             "dep_manifests_found": len(dep_manifests),
@@ -1630,12 +1649,18 @@ async def github_scan(req: GithubScanRequest, request: Request):
 # 报告下载
 # ---------------------------------------------------------------------------
 @app.get("/api/report")
-async def download_report():
-    """下载最近一次批量扫描的 Markdown 报告。"""
+async def download_report(report_id: Optional[str] = None):
+    """下载批量扫描的 Markdown 报告。
+
+    B6 修正（2026-09-21）：支持 ?report_id= 精确取回**本轮**报告——并发/多标签页
+    下不再互相覆盖；不传则回退到最近一次（兼容旧调用）。
+    """
     with _stats_lock:
-        last_batch = _last_batch
+        last_batch = _recent_batches.get(report_id) if report_id else _last_batch
     if last_batch is None:
-        return JSONResponse({"error": "暂无扫描结果，请先扫描"}, status_code=404)
+        return JSONResponse(
+            {"error": f"未找到报告（report_id={report_id}）" if report_id else "暂无扫描结果，请先扫描"},
+            status_code=404)
     md = render_batch_markdown(last_batch)
     return StreamingResponse(
         iter([md.encode("utf-8")]),
@@ -1956,14 +1981,23 @@ async def models_pull(req: ModelActionRequest):
         return gate
 
     async def stream():
-        import queue as _q
         import threading
 
-        chunk_queue: _q.Queue = _q.Queue()
+        # B3 修正（2026-09-21）：跨线程取队列改用 asyncio.Queue +
+        # call_soon_threadsafe。原先 run_in_executor(None, q.get(timeout=1~2))
+        # 每 1~2 秒向默认线程池投一个"只为等待队列"的任务（批量扫描已占 4 个
+        # worker，属可避免的池竞争），且 asyncio.get_event_loop() 在协程内已弃用。
+        # 与 scheduler.py:270 同范式。
+        _loop = asyncio.get_running_loop()
+        chunk_queue: asyncio.Queue = asyncio.Queue()
+
+        def _emit(item) -> None:
+            """生产者线程调用：把进度项投回事件循环（线程安全）。"""
+            _loop.call_soon_threadsafe(chunk_queue.put_nowait, item)
         done_flag = {"done": False, "result": None, "error": None}
 
         def callback(chunk):
-            chunk_queue.put(chunk)
+            _emit(chunk)
 
         def run_pull():
             # 与 download-hf/download-gguf 同纪律：异常也必须置位 done 并投递
@@ -1975,19 +2009,27 @@ async def models_pull(req: ModelActionRequest):
                 print(f"[models/pull] {model} 异常: {done_flag['error']}", flush=True)
             finally:
                 done_flag["done"] = True
-                chunk_queue.put(None)  # 哨兵，唤醒流式迭代
+                _emit(None)  # 哨兵，唤醒流式迭代
 
         thread = threading.Thread(target=run_pull, daemon=True)
         thread.start()
 
+        idle = 0
         while True:
             try:
-                chunk = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: chunk_queue.get(timeout=1),
-                )
-            except Exception:
+                chunk = await asyncio.wait_for(chunk_queue.get(), timeout=1.0)
+                idle = 0
+            except asyncio.TimeoutError:
+                # B3 注意：call_soon_threadsafe 是**延迟投递**——done_flag 置位时最后
+                # 一批事件可能还排在事件循环的回调队列里，据 done 立即 break 会丢尾部
+                # 结果。正常收尾一律由哨兵 None 完成；done 后只多等 2 个超时周期兜底
+                # （此时回调早已排好，必然先到），防哨兵意外丢失导致请求永不结束。
                 if done_flag["done"]:
-                    break
+                    idle += 1
+                    if idle >= 2:
+                        break
+                else:
+                    idle = 0
                 continue
             if chunk is None:
                 break
@@ -2430,7 +2472,6 @@ async def models_download_hf(req: HfDownloadRequest):
     目标：models/transformers/<名称>（与自动下载/检测/迁移同一位置）。
     使用 hf-mirror.com 镜像加速国内下载；下载支持断点续传。
     """
-    import queue as _q
     import threading
     import traceback
 
@@ -2451,7 +2492,17 @@ async def models_download_hf(req: HfDownloadRequest):
     except ValueError as ve:
         return JSONResponse({"error": str(ve)}, status_code=400)
 
-    chunk_queue: _q.Queue = _q.Queue()
+    # B3 修正（2026-09-21）：跨线程取队列改用 asyncio.Queue +
+    # call_soon_threadsafe。原先 run_in_executor(None, q.get(timeout=1~2))
+    # 每 1~2 秒向默认线程池投一个"只为等待队列"的任务（批量扫描已占 4 个
+    # worker，属可避免的池竞争），且 asyncio.get_event_loop() 在协程内已弃用。
+    # 与 scheduler.py:270 同范式。
+    _loop = asyncio.get_running_loop()
+    chunk_queue: asyncio.Queue = asyncio.Queue()
+
+    def _emit(item) -> None:
+        """生产者线程调用：把进度项投回事件循环（线程安全）。"""
+        _loop.call_soon_threadsafe(chunk_queue.put_nowait, item)
     done_flag = {"done": False, "result": None, "error": None}
 
     # 网络操作超时（秒）：列表/单文件元数据请求不宜过长，大文件传输由 hf_hub_download 内部管理
@@ -2492,7 +2543,7 @@ async def models_download_hf(req: HfDownloadRequest):
                 raise RuntimeError(_friendly_error(e, "导入 huggingface_hub")) from e
 
             # 立即报告开始连接镜像，让用户知道按钮已生效
-            chunk_queue.put({"status": "downloading", "message": f"正在连接镜像 {HF_MIRROR}…", "pct": 0})
+            _emit({"status": "downloading", "message": f"正在连接镜像 {HF_MIRROR}…", "pct": 0})
 
             # 获取仓库文件列表（进度估算用）
             # 注意：list_repo_files 不接受 timeout 参数（huggingface_hub 1.x 传入会抛
@@ -2509,7 +2560,7 @@ async def models_download_hf(req: HfDownloadRequest):
                 traceback.print_exc()
                 raise RuntimeError(err) from e
 
-            chunk_queue.put({"status": "downloading", "total_files": total_files, "completed": 0, "pct": 0})
+            _emit({"status": "downloading", "total_files": total_files, "completed": 0, "pct": 0})
 
             # 逐文件下载，每完成一个文件报告进度（显式 endpoint 指向镜像；
             # huggingface_hub 1.x 的 hf_hub_download 不接受 timeout 参数，元数据用 etag_timeout 兜底。
@@ -2532,7 +2583,7 @@ async def models_download_hf(req: HfDownloadRequest):
                     raise RuntimeError(err) from e
                 completed_files += 1
                 pct = int(completed_files / total_files * 100) if total_files else 0
-                chunk_queue.put({
+                _emit({
                     "status": "downloading",
                     "completed": completed_files,
                     "total": total_files,
@@ -2545,20 +2596,28 @@ async def models_download_hf(req: HfDownloadRequest):
             done_flag["error"] = str(e)
         finally:
             done_flag["done"] = True
-            chunk_queue.put(None)
+            _emit(None)
 
     thread = threading.Thread(target=run_download, daemon=True)
     thread.start()
 
     async def stream():
+        idle = 0
         while True:
             try:
-                chunk = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: chunk_queue.get(timeout=2),
-                )
-            except Exception:
+                chunk = await asyncio.wait_for(chunk_queue.get(), timeout=2.0)
+                idle = 0
+            except asyncio.TimeoutError:
+                # B3 注意：call_soon_threadsafe 是延迟投递，done_flag 置位时最后一批
+                # 事件可能仍在回调队列里——据 done 立即 break 会丢尾部结果。正常收尾
+                # 一律由生产者 finally 必发的哨兵 None 完成；done 后只多等 2 个超时
+                # 周期兜底，防哨兵丢失导致请求永不结束。
                 if done_flag["done"]:
-                    break
+                    idle += 1
+                    if idle >= 2:
+                        break
+                else:
+                    idle = 0
                 # 超时但未完成，发送心跳保持连接
                 yield json.dumps({"status": "downloading", "heartbeat": True}, ensure_ascii=False) + "\n"
                 continue
@@ -2614,7 +2673,6 @@ async def models_download_gguf(req: GgufDownloadRequest):
 
     对 GitHub URL 自动加 ghproxy 镜像加速。下载完成后需重启后端使配置生效。
     """
-    import queue as _q
     import threading
 
     url = req.url.strip()
@@ -2663,7 +2721,17 @@ async def models_download_gguf(req: GgufDownloadRequest):
     dest_dir = llamacpp_dir()
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / filename
-    chunk_queue: _q.Queue = _q.Queue()
+    # B3 修正（2026-09-21）：跨线程取队列改用 asyncio.Queue +
+    # call_soon_threadsafe。原先 run_in_executor(None, q.get(timeout=1~2))
+    # 每 1~2 秒向默认线程池投一个"只为等待队列"的任务（批量扫描已占 4 个
+    # worker，属可避免的池竞争），且 asyncio.get_event_loop() 在协程内已弃用。
+    # 与 scheduler.py:270 同范式。
+    _loop = asyncio.get_running_loop()
+    chunk_queue: asyncio.Queue = asyncio.Queue()
+
+    def _emit(item) -> None:
+        """生产者线程调用：把进度项投回事件循环（线程安全）。"""
+        _loop.call_soon_threadsafe(chunk_queue.put_nowait, item)
     done_flag = {"done": False, "result": None, "error": None}
 
     # HuggingFace resolve 链接：/repo_id/resolve/<revision>/<file>
@@ -2679,7 +2747,7 @@ async def models_download_gguf(req: GgufDownloadRequest):
             # （比 huggingface_hub / urlopen 对断网更稳：断点保留、自动重试、可续传）。
             _hf_match = _HF_RESOLVE_RE.match(urlparse(url).path)
             if _hf_match:
-                chunk_queue.put({
+                _emit({
                     "status": "downloading",
                     "message": f"正在连接镜像 {HF_MIRROR}…",
                     "pct": 0,
@@ -2691,7 +2759,7 @@ async def models_download_gguf(req: GgufDownloadRequest):
                     pct = int(done / total * 100) if total else 0
                     if pct - last_pct["v"] >= 1 or pct == 100:
                         last_pct["v"] = pct
-                        chunk_queue.put({
+                        _emit({
                             "status": "downloading",
                             "completed": done,
                             "total": total,
@@ -2707,7 +2775,7 @@ async def models_download_gguf(req: GgufDownloadRequest):
                     progress_cb=_cb,
                 )
                 total = actual.stat().st_size
-                chunk_queue.put({
+                _emit({
                     "status": "downloading",
                     "completed": total,
                     "total": total,
@@ -2723,7 +2791,7 @@ async def models_download_gguf(req: GgufDownloadRequest):
                 pct = int(done / total * 100) if total else 0
                 if pct - last_report["v"] >= 2 or pct == 100:
                     last_report["v"] = pct
-                    chunk_queue.put({
+                    _emit({
                         "status": "downloading",
                         "completed": done,
                         "total": total,
@@ -2741,20 +2809,25 @@ async def models_download_gguf(req: GgufDownloadRequest):
             done_flag["error"] = f"{type(e).__name__}: {e}"
         finally:
             done_flag["done"] = True
-            chunk_queue.put(None)
+            _emit(None)
 
     thread = threading.Thread(target=run_download, daemon=True)
     thread.start()
 
     async def stream():
+        idle = 0
         while True:
             try:
-                chunk = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: chunk_queue.get(timeout=2),
-                )
-            except Exception:
+                chunk = await asyncio.wait_for(chunk_queue.get(), timeout=2.0)
+                idle = 0
+            except asyncio.TimeoutError:
+                # B3 注意：同 download-hf——延迟投递下不能据 done_flag 立即 break。
                 if done_flag["done"]:
-                    break
+                    idle += 1
+                    if idle >= 2:
+                        break
+                else:
+                    idle = 0
                 yield json.dumps({"status": "downloading", "heartbeat": True}, ensure_ascii=False) + "\n"
                 continue
             if chunk is None:

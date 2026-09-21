@@ -222,6 +222,10 @@ class AdjudicationVerdict:
     conformal_set: str = ""         # 共形预测三分类（vulnerable/safe/uncertain）
     counterfactual: Optional[dict] = None  # 反事实扰动验证结果（Layer 2）
     evidence_gate: Optional[str] = None    # 确定性证据门拦截原因（sink_defended/no_input_entry）
+    # C-2（2026-09-21）：直出档标记。「votes_* 之和 == n_samples」是
+    # AdjudicationVerdict 的不变量；直出档此前硬编码 votes_true=1，在任何按 N
+    # 计算的门控里都会被静默算成 1/N。置 True 让聚合层可显式短路。
+    deterministic: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -230,6 +234,7 @@ class AdjudicationVerdict:
             "votes_true": self.votes_true,
             "votes_false": self.votes_false,
             "votes_invalid": self.votes_invalid,
+            "deterministic": self.deterministic,
             "reasoning": self.reasoning,
             "fix_suggestion": self.fix_suggestion,
             "raw_outputs": self.raw_outputs,
@@ -313,9 +318,13 @@ class TwoStageResult:
         }
 
 
-# 置信度阈值：≥0.8 自动结论；0.5~0.8 结论但标记复核；<0.5 或平票→reviewer
+# 置信度阈值（C-1 修正 2026-09-21）：**唯一判定边界是 _CONF_AUTO**。
+#   ≥ _CONF_AUTO → decision = confirmed_vulnerability / dismissed_safe（直接采信）
+#   其余（低置信确认 0.5~0.8、平票、解析失败）→ *_review，转人工复核
+# 原注释写「0.5~0.8 结论但标记复核；<0.5→reviewer」并配 _CONF_MANUAL = 0.5，但该
+# 常量全仓零引用；且 N=3 时 confidence ∈ {0, 1/3, 2/3, 1}，0.5 这道边界不产生任何
+# 行为差异（1/3 与 2/3 同落 review）——故删常量、注释按实现改写。
 _CONF_AUTO = 0.8
-_CONF_MANUAL = 0.5
 
 # 严重度排序（用于文件级取最高风险 finding）
 _SEV_RANK = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "none": 0}
@@ -1703,6 +1712,11 @@ class TwoStageScanner:
             的代码视参数为潜在外部输入（longfile_01 的 export_report(table) 由外部
             调用方传入），本门不拦——否则真漏洞被误降级 review。
 
+        生效语言（C-5 修正 2026-09-21）：**仅 python / javascript / typescript**。
+        其余语言（java / php / go）不走本门——_DEFENSE_SIGNATURES 只有这三种语言的
+        防御特征，扩白名单前必须先补签名，否则 `sig is None` 直接 continue、等于白扩。
+        Java/PHP 样本的兜底依赖 Layer 2 反事实验证。
+
         命中不否决（不判 False），仅把该 finding 排除出"直接判漏洞"依据，转人工
         复核——门是保守的：宁可 review 不错杀 TP（真漏洞的 sink 邻域不会出现
         完整防御特征，真污点文件必有输入入口）。
@@ -2805,7 +2819,13 @@ class TwoStageScanner:
             except Exception:
                 inferred = ""
             if inferred and inferred != f.taint_type:
-                f.taint_type = inferred
+                # B5 修正（2026-09-21）：**只把"工具内部标识"改写成语义名**。原实现
+                # 无条件覆盖，而 _infer_taint_type 有已知顺序陷阱（SSRF 须在 Path
+                # Traversal 之前判，否则 urlopen 的 "open(" 被撞成路径穿越）——工具已
+                # 给出的规范语义名被错误推断覆盖后无迹可查。工具没给语义名
+                # （B608 / 规则文件路径等）时才改写。
+                if f.taint_type not in _STANDARD_TAINT_TYPES:
+                    f.taint_type = inferred
 
         def _family(f: ToolFinding) -> str:
             """语义族键：语义类型名本身；规则号/长路径经 _infer_taint_type 推断。"""
@@ -2951,7 +2971,7 @@ class TwoStageScanner:
         blind_injected = False
         for finding in findings:
             if self._is_direct_category(finding.category):
-                verdict = self._direct_adjudication(finding)
+                verdict = self._direct_adjudication(finding, self.n_samples)
             else:
                 code_context = self._slice_context(code, language, finding)
                 if blind_text and not blind_injected:
@@ -3003,19 +3023,26 @@ class TwoStageScanner:
             adjudications.append(verdict)
         return adjudications, reviewer
 
-    @staticmethod
-    def _direct_adjudication(finding: ToolFinding) -> AdjudicationVerdict:
+    def _direct_adjudication(self, finding: ToolFinding,
+                             n_samples: Optional[int] = None) -> AdjudicationVerdict:
         """直出档 finding 的免 LLM 裁决（secret/sca 确定性工具自判）。
 
-        返回 confirmed=True（投票 1/1、置信度 1.0，等价于高置信确认），
-        但用 decision 显式标注 direct 语义，避免与 LLM 裁决混淆。
+        返回 confirmed=True、confidence=1.0（等价于高置信确认），但用 decision
+        显式标注 direct 语义，避免与 LLM 裁决混淆。
+
+        C-2 修正（2026-09-21）：votes_true 不再硬编码 1。AdjudicationVerdict 隐含
+        「票数之和 == N」不变量，而生产 n_samples=3——直出档记 1 一旦被将来任何按 N
+        计算的门控（全票门槛 votes==N、统计门）纳入，就会按 1/3 静默判错。现按
+        n_samples 记满票，并置 deterministic=True 让聚合层显式短路。
         """
+        n = int(n_samples) if n_samples else 1
         return AdjudicationVerdict(
             confirmed=True,
             confidence=1.0,
-            votes_true=1,
+            votes_true=n,
             votes_false=0,
             votes_invalid=0,
+            deterministic=True,
             reasoning=f"确定性工具直出（{finding.tool}）：{finding.evidence}",
             fix_suggestion="",
             raw_outputs=[],
@@ -3838,7 +3865,10 @@ if __name__ == "__main__":
     print(f"[{'PASS' if ok_safe else 'FAIL'}] 无候选未复核: has_vuln={r.has_vulnerability}, "
           f"coverage={r.review_coverage}, decision={r.stage1.get('decision')}")
 
-    # 5) 直出档裁决：secret/sca finding 不消耗 LLM 采样（直接判真，decision=direct）
+    # 5) 直出档裁决：secret/sca finding 不消耗 LLM 采样（直接判真，decision=direct）。
+    #    C-2（2026-09-21）：直出档必须满足「votes_* 之和 == n_samples」不变量——
+    #    原实现硬编码 votes_true=1，断言也随之写成 ==1；N=3 下这会让任何按 N
+    #    计算的门控把直出档静默算成 1/3，故断言改为跟随 ts.n_samples。
     direct = ToolFinding(rule_id="generic-api-key", category="secret", source="", sink="",
                          taint_type="generic-api-key", source_line=3, sink_line=3,
                          severity="high", tool="gitleaks",
@@ -3846,9 +3876,12 @@ if __name__ == "__main__":
     d_verdict = ts._adjudicate_all([direct], 'code', "python", "", None)
     d = d_verdict[0][0]
     ok_direct = (d.confirmed is True and d.confidence == 1.0
-                 and d.decision == "direct" and d.votes_true == 1)
+                 and d.decision == "direct"
+                 and d.votes_true == ts.n_samples and d.votes_false == 0
+                 and d.votes_invalid == 0 and d.deterministic is True)
     print(f"[{'PASS' if ok_direct else 'FAIL'}] 直出档裁决: confirmed={d.confirmed}, "
-          f"decision={d.decision}")
+          f"decision={d.decision}, votes={d.votes_true}/{ts.n_samples}"
+          f"（期望票和==N）, deterministic={d.deterministic}")
 
     # 6) full_recheck 模式：无候选文件全量 LLM 复核（消除"无证据判安全"）。
     # 复核走主扫描 prompt + 7 字段 verdict 解析，FakeClient 需返回该格式。
