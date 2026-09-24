@@ -24,6 +24,8 @@ mkdir -p "$OLLAMA_MODELS" "$HF_HOME"
 # （externally-managed）保护，直接 `pip3 install` 会硬失败；此前脚本在 set -e
 # 下首个 pip 报错即整段退出，双击用户只见窗口闪退。现改为解释器回退链：
 #   (a) 已存在可用 venv（.venv/bin/python 且带 pip）→ 直接复用；
+#   (a0) 无 venv 但当前解释器已能导入全部核心依赖（开发机/装过的机器）
+#       → 直接使用，不建环境、零下载（VULN_SCANNER_FORCE_VENV=1 可强制建）；
 #   (b) 尝试 `python3 -m venv .venv`，成功 → 后续 pip 与启动全部走 .venv；
 #   (c) venv 创建失败（多因缺 python3-venv）→ pip3 install --user；
 #   (d) 仍失败（PEP 668 拒绝 --user）→ pip3 install --break-system-packages
@@ -48,10 +50,22 @@ SRC_PY="${PYTHON:-python3}"
 PY=""
 PIP_FLAGS=""
 
+# 核心依赖判定（与下方"首次安装"检查同一张模块清单，保持单一口径）：
+# 当前解释器能全部导入 = 这台机器已配齐，直接用它，不建环境、零下载。
+_CORE_IMPORTS="fastapi, uvicorn, pydantic, requests, tree_sitter, tree_sitter_python, tree_sitter_javascript, tree_sitter_java, tree_sitter_php, tree_sitter_typescript, chromadb, sentence_transformers, psutil"
+
 # (a) 已存在可用 venv：直接用（含 pip 可用性校验，防半成品 venv）
 if [ -x ".venv/bin/python" ] && ".venv/bin/python" -m pip --version >/dev/null 2>&1; then
     PY="$PROJECT_ROOT/.venv/bin/python"
     echo "[Setup] 复用已存在的虚拟环境: $PROJECT_ROOT/.venv"
+elif [ "${VULN_SCANNER_FORCE_VENV:-0}" != "1" ] && "$SRC_PY" -c "import $_CORE_IMPORTS" >/dev/null 2>&1; then
+    # (a0) 2026-09-20 补：无 venv 但当前解释器已具备全部核心依赖（开发机或装过的
+    # 机器）→ 直接使用。此前回退链在"复用 venv"之后无条件新建 venv，新建的空
+    # 环境必然全量重下 1~2GB 依赖；自探测应该问"这台机器是否已配齐"，而不只是
+    # "有没有 venv"。评委裸机不受影响：缺任何依赖都会落入 (b) 正常建环境。
+    PY="$SRC_PY"
+    echo "[Setup] 检测到当前 Python 已具备全部核心依赖，直接使用（不创建虚拟环境、不重复下载）"
+    echo "[Setup] （如想强制隔离到 venv：VULN_SCANNER_FORCE_VENV=1 bash $0 重跑）"
 else
     # (b) 尝试创建 venv
     if "$SRC_PY" -m venv .venv 2>/dev/null && [ -x ".venv/bin/python" ] && ".venv/bin/python" -m pip --version >/dev/null 2>&1; then
@@ -98,7 +112,7 @@ pip_install() {
 echo "[Setup] 使用解释器: $PY${PIP_FLAGS:+（pip 附加参数: $PIP_FLAGS）}"
 
 # 首次运行自动安装核心依赖（Web 层 + 分析引擎 + tree-sitter + 启动器硬件检测）
-if ! "$PY" -c "import fastapi, uvicorn, pydantic, requests, tree_sitter, tree_sitter_python, tree_sitter_javascript, tree_sitter_java, tree_sitter_php, tree_sitter_typescript, chromadb, sentence_transformers, psutil" 2>/dev/null; then
+if ! "$PY" -c "import $_CORE_IMPORTS" 2>/dev/null; then
     echo "[Setup] First run: installing core dependencies..."
 
     # 若该解释器完全没有 torch，先装 CPU 版保底（用于 sentence-transformers embedding）。
