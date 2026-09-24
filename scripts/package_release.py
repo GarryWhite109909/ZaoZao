@@ -22,7 +22,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = REPO.parent / "衡阳师范学院1号作品+信息安全类+可安装软件_v3.ZIP"
-OLD_MANIFEST = Path("/tmp/old_zip_manifest.txt")  # 由 v2 包生成的基线清单
+V2_ZIP = REPO.parent / "衡阳师范学院1号作品+信息安全类+可安装软件_v2.ZIP"
+OLD_MANIFEST = Path("/tmp/old_zip_manifest.txt")  # 缓存；不存在时从 v2 包现读
 
 # v2 基线之外的追加项（仓库相对路径 → 包内 ZaoZao/ 前缀路径）
 EXTRA = [
@@ -33,6 +34,10 @@ EXTRA = [
 ]
 # 基线中允许缺席的文件（仓库已删除/移走的，缺了不报错）
 OPTIONAL_BASELINE = {
+    # 2026-09-21 策略评审（S4 修复）：旧校准是样本内泄漏数据，已主动废弃并改名
+    # conformal_calibration.in_sample_leaked.json。缺文件 = 引擎保持未校准、
+    # 门控自动关闭（two_stage_scanner.py 加载注释），故包内不携带任何校准。
+    "models/conformal_calibration.json",
     # 本地工作区已无此文件（chroma 运行时自动重建向量库），按仓库现状打包
     "data/chroma_db/chroma.sqlite3",
 }
@@ -45,11 +50,26 @@ EXCLUDE_SUFFIX = (".pyc", ".pyo", ".lock#", "#")
 EXCLUDE_NAME = {"graduation_project.egg-info", "zaozao.egg-info"}
 
 
+def load_baseline() -> list:
+    """v2 基线清单：优先读缓存，否则直接从 v2 包提取（脚本自身即可复现打包）。"""
+    if OLD_MANIFEST.exists():
+        return sorted(OLD_MANIFEST.read_text().splitlines())
+    if not V2_ZIP.exists():
+        return []
+    with zipfile.ZipFile(V2_ZIP) as z:
+        names = sorted(n for n in z.namelist() if not n.endswith("/"))
+    try:
+        OLD_MANIFEST.write_text("\n".join(names))
+    except OSError:
+        pass
+    return names
+
+
 def main() -> int:
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_OUT
-    base = sorted(OLD_MANIFEST.read_text().splitlines()) if OLD_MANIFEST.exists() else []
+    base = load_baseline()
     if not base:
-        print("错误：找不到 v2 基线清单 /tmp/old_zip_manifest.txt", file=sys.stderr)
+        print(f"错误：找不到 v2 基线（缓存 {OLD_MANIFEST} 与 {V2_ZIP} 均不存在）", file=sys.stderr)
         return 1
 
     rels = [n[len("ZaoZao/"):] for n in base if n.startswith("ZaoZao/")]
