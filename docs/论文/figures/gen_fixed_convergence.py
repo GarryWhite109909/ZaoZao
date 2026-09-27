@@ -45,29 +45,34 @@ draw_segmented(fpr_pts, "#d62728", "s", "FPR")
 # 标注数据点
 for i, (r, f) in enumerate(zip(recall, fpr)):
     if r is not None:
-        ax.text(i, r + 0.03, f"{r:.3f}", ha="center", va="bottom", fontsize=9, color="#1f77b4", fontweight="bold", zorder=4)
+        ax.text(i, r + 0.03, f"{r:.3f}", ha="center", va="bottom", fontsize=10.5, color="#1f77b4", fontweight="bold", zorder=4)
     if f is not None:
-        ax.text(i, f - 0.03, f"{f:.3f}", ha="center", va="top", fontsize=9, color="#d62728", fontweight="bold", zorder=4)
+        # 低 FPR 点（如 fixed5 的 0.043）标签放点上方，避免压在 x 轴与刻度标签上
+        if f < 0.06:
+            ax.text(i, f + 0.035, f"{f:.3f}", ha="right", va="bottom", fontsize=10.5, color="#d62728", fontweight="bold", zorder=4)
+        else:
+            ax.text(i, f - 0.03, f"{f:.3f}", ha="center", va="top", fontsize=10.5, color="#d62728", fontweight="bold", zorder=4)
 
 # fixed2 / fixed4 标注
-ax.text(1, 0.55, "fixed2 中断\n（21/87，无有效指标）", ha="center", va="center", fontsize=9,
+ax.text(1, 0.55, "fixed2 中断\n（21/87，无有效指标）", ha="center", va="center", fontsize=11,
         color="#888888", fontweight="bold",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", edgecolor="#888888"))
-ax.text(3, 0.55, "fixed4 弃用\n（抑制池跨跑污染）", ha="center", va="center", fontsize=9,
+ax.text(3, 0.55, "fixed4 弃用\n（负向记忆跨轮次污染）", ha="center", va="center", fontsize=11,
         color="#d62728", fontweight="bold",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="#ffeeee", edgecolor="#d62728"))
 
 ax.set_xticks(x)
-ax.set_xticklabels(versions, fontsize=10)
-ax.set_ylabel("指标值")
-ax.set_ylim(0, 1.15)
-ax.set_title("fixed 系列收敛：从带污染到干净评估", fontsize=15, fontweight="bold")
-ax.legend(loc="upper right")
+ax.set_xticklabels(versions, fontsize=12)
+ax.set_ylabel("指标值", fontsize=12)
+# 上方留白给图例，避免图例框压住 fixed5 的 recall 标签
+ax.set_ylim(0, 1.28)
+ax.set_title("fixed 系列收敛：从带污染到干净评估", fontsize=16, fontweight="bold")
+ax.legend(loc="upper right", fontsize=12, framealpha=0.95)
 ax.grid(axis="y", alpha=0.25)
 
 # 底部说明
-ax.text(2, -0.15, "污染阶段（fixed3）", ha="center", va="top", fontsize=9, color="#d62728")
-ax.text(4, -0.15, "干净阶段（fixed5）\nrecall 1.000 / FPR 0.043", ha="center", va="top", fontsize=9,
+ax.text(2, -0.15, "污染阶段（fixed3）", ha="center", va="top", fontsize=11, color="#d62728")
+ax.text(4, -0.15, "干净阶段（fixed5）\nrecall 1.000 / FPR 0.043", ha="center", va="top", fontsize=11,
         color="#2ca02c", fontweight="bold")
 
 fig.tight_layout()

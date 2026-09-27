@@ -38,8 +38,8 @@ im = ax.imshow(matrix + 1, cmap=cmap, aspect="auto", vmin=0, vmax=3)
 
 ax.set_xticks(np.arange(len(columns)))
 ax.set_yticks(np.arange(len(backends)))
-ax.set_xticklabels(columns, fontsize=10)
-ax.set_yticklabels(backends, fontsize=10)
+ax.set_xticklabels(columns, fontsize=11)
+ax.set_yticklabels(backends, fontsize=11)
 
 # 单元格文字
 labels = {2: "原生支持", 1: "需额外配置", 0: "不支持", -1: "N/A"}
@@ -52,10 +52,10 @@ for i in range(len(backends)):
             color = "#333333"
         else:
             color = "white"
-        ax.text(j, i, labels[val], ha="center", va="center", fontsize=11, color=color, fontweight="bold")
+        ax.text(j, i, labels[val], ha="center", va="center", fontsize=12, color=color, fontweight="bold")
 
-ax.set_title("四后端 × 五硬件平台支持矩阵（2026-09 勘误版）",
-             fontsize=14, fontweight="bold", pad=15)
+ax.set_title("四后端 × 五硬件平台支持矩阵",
+             fontsize=15, fontweight="bold", pad=15)
 
 from matplotlib.patches import Patch
 legend = [
@@ -64,7 +64,7 @@ legend = [
     Patch(color="#d62728", label="不支持"),
     Patch(color="#e0e0e0", label="不适用（该平台无此硬件）"),
 ]
-ax.legend(handles=legend, loc="upper right", bbox_to_anchor=(1.32, 1))
+ax.legend(handles=legend, loc="upper right", bbox_to_anchor=(1.47, 1.0), fontsize=12)
 
 fig.tight_layout()
 OUT = Path(__file__).resolve().parent / "backend_platform_matrix.png"

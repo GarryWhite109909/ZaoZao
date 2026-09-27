@@ -43,15 +43,15 @@ for i, v in enumerate(VERSIONS):
     c_off = (15, 5) if v == "v7" else (0, -14)
     ax.annotate(f"{STRICT_SYN[i]:.3f}", (i, STRICT_SYN[i]),
                 textcoords="offset points", xytext=s_off, ha="center",
-                fontsize=8.5, color="#3A6A8C")
+                fontsize=9.5, color="#3A6A8C")
     ax.annotate(f"{CVE_RECALL[i]:.3f}", (i, CVE_RECALL[i]),
                 textcoords="offset points", xytext=c_off, ha="center",
-                fontsize=8.5, color="#4E7A72")
+                fontsize=9.5, color="#4E7A72")
 
 # 失败版本标注：放在 v4 正下方，短箭头，不穿越图表
 ax.annotate("v4/v6/v8 失败版本\n（泄漏/负迁移/FP 激增）",
             xy=(3, 0.429), xytext=(3, 0.28),
-            fontsize=9, color="#B8524A", ha="center", va="top",
+            fontsize=10.5, color="#B8524A", ha="center", va="top",
             arrowprops=dict(arrowstyle="->", color="#B8524A", lw=1.2,
                             connectionstyle="arc3,rad=0.1"))
 
@@ -65,27 +65,27 @@ ax.annotate("", xy=(7, 0.750), xytext=(7, 0.64),
 
 ax.annotate("SFT 收益集中在判别与格式：\nCVE-fix recall 0.375→0.950",
             xy=(8, 0.950), xytext=(5.4, 0.925),
-            fontsize=9.5, color="#A67214", ha="left",
+            fontsize=10.5, color="#A67214", ha="left",
             arrowprops=dict(arrowstyle="->", color="#D9962E", lw=1.2))
 ax.annotate("归因编号未注入：strict 不升（0.848→0.754）",
             xy=(8, 0.754), xytext=(5.0, 0.55),
-            fontsize=9.5, color="#3A6A8C", ha="left",
+            fontsize=10.5, color="#3A6A8C", ha="left",
             arrowprops=dict(arrowstyle="->", color="#4A7FA5", lw=1.2))
 
 ax.set_xticks(list(x))
-ax.set_xticklabels(VERSIONS)
+ax.set_xticklabels(VERSIONS, fontsize=11)
 ax.set_ylim(0, 1.02)
-ax.set_ylabel("recall")
-ax.set_title("SFT 迭代演进：合成集 strict_recall（纠正口径）与 CVE-fix recall", fontsize=12)
+ax.set_ylabel("recall", fontsize=12)
+ax.set_title("SFT 迭代演进：合成集 strict_recall（纠正口径）与 CVE-fix recall", fontsize=13.5)
 ax.grid(axis="y", ls="--", alpha=0.35)
-ax.legend(loc="lower left", fontsize=9.5, framealpha=0.9)
+ax.legend(loc="lower left", fontsize=10.5, framealpha=0.9)
 
-fig.text(0.12, 0.015,
-         "口径：strict_recall = CWE 纠正口径（normalizer + evidence 守卫 + 父子族匹配），分母 tp+fn；"
+fig.text(0.06, 0.012,
+         "口径：strict_recall = CWE 纠正口径（normalizer + evidence 守卫 + 父子族匹配），分母 tp+fn；\n"
          "CVE-fix 样本数 8→7（v4~v6 清洗）→20（v7 扩集）；数据 2026-09-03 统一重算（score_batch.py）",
-         fontsize=8, color="#7C8B96")
+         fontsize=9.5, color="#5E6E78", va="bottom")
 
-fig.tight_layout(rect=(0, 0.045, 1, 1))
+fig.tight_layout(rect=(0, 0.075, 1, 1))
 out = Path(__file__).with_name("sft_strict_recall_evolution.png")
 fig.savefig(out)
 print(f"saved: {out}")

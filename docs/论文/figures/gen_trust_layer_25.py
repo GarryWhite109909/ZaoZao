@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-"""2.5 代信任层架构图（2026-08-20 彻底重排版）。
+"""2.5 代信任层架构图（2026-08-20 彻底重排版；2026-09-22 印刷可读性修正）。
 
 修复：
 - 删除从信任分级向右再向左横穿全图到抑制池的荒谬路径
 - 底部输出框与上层框在 x 方向严格错开，消除重叠
 - D 从信任分级内正确行高引出，走直角折线到同侧抑制池
 - 所有连线横平竖直，不穿过无关框体
+- 2026-09-22：画幅 14×9 → 11.5×7.4（提高印刷缩放比），全部字号上调，
+  并加 _fit 自动缩字（宽度超框时收缩到恰好放下，下限 9pt）
 
 重跑：AI 环境 cd figures && python gen_trust_layer_25.py
 """
@@ -19,37 +21,52 @@ from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
 plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "Microsoft YaHei", "SimHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
-fig, ax = plt.subplots(figsize=(14, 9))
+fig, ax = plt.subplots(figsize=(11.5, 7.4))
 ax.set_xlim(0, 14)
 ax.set_ylim(0, 9)
 ax.axis("off")
 
+# 自动缩字：文字宽度超过 inner_units（数据单位）时收缩字号，下限 9pt
+renderer = fig.canvas.get_renderer()
+UPI = 14.0 / 11.5  # 数据单位每英寸
+
+
+def _fit(t, inner_units):
+    max_px = inner_units / UPI * fig.dpi
+    ext = t.get_window_extent(renderer=renderer)
+    if ext.width > max_px:
+        t.set_fontsize(max(9, t.get_fontsize() * max_px / ext.width * 0.98))
+
+
 ax.set_title("2.5 代信任层：统计门控 + 因果门控 + 确定性证据门 + 信任分级回填",
-             fontsize=15, fontweight="bold", pad=18, color="#1a1a1a")
+             fontsize=16, fontweight="bold", pad=18, color="#1a1a1a")
 
 
 # ---------- 辅助函数 ----------
-def layer_box(ax, x, y, w, h, title, lines, facecolor, edgecolor, title_fs=11, text_fs=8.5):
+def layer_box(ax, x, y, w, h, title, lines, facecolor, edgecolor, title_fs=13, text_fs=10.5):
     patch = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.02,rounding_size=0.12",
                            facecolor=facecolor, edgecolor=edgecolor, linewidth=1.6, alpha=0.96)
     ax.add_patch(patch)
-    ax.text(x + w / 2, y + h - 0.32, title, ha="center", va="center",
-            fontsize=title_fs, fontweight="bold", color="white")
+    t = ax.text(x + w / 2, y + h - 0.32, title, ha="center", va="center",
+                fontsize=title_fs, fontweight="bold", color="white")
+    _fit(t, w - 0.2)
     for i, line in enumerate(lines):
-        ax.text(x + w / 2, y + h - 0.72 - i * 0.32, line, ha="center", va="center",
-                fontsize=text_fs, color="white", linespacing=1.2)
+        t = ax.text(x + w / 2, y + h - 0.72 - i * 0.32, line, ha="center", va="center",
+                    fontsize=text_fs, color="white", linespacing=1.2)
+        _fit(t, w - 0.2)
     return {"x": x, "y": y, "w": w, "h": h,
             "cx": x + w / 2, "cy": y + h / 2,
             "left": x, "right": x + w,
             "top": y + h, "bottom": y}
 
 
-def small_box(ax, x, y, w, h, text, facecolor, text_color="white", fs=9):
+def small_box(ax, x, y, w, h, text, facecolor, text_color="white", fs=11):
     patch = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.02,rounding_size=0.08",
                            facecolor=facecolor, edgecolor=facecolor, linewidth=1.2, alpha=0.95)
     ax.add_patch(patch)
-    ax.text(x + w / 2, y + h / 2, text, ha="center", va="center",
-            fontsize=fs, fontweight="bold", color=text_color, linespacing=1.15)
+    t = ax.text(x + w / 2, y + h / 2, text, ha="center", va="center",
+                fontsize=fs, fontweight="bold", color=text_color, linespacing=1.15)
+    _fit(t, w - 0.2)
     return {"x": x, "y": y, "w": w, "h": h,
             "cx": x + w / 2, "cy": y + h / 2,
             "left": x, "right": x + w,
@@ -65,7 +82,7 @@ def arr(ax, x1, y1, x2, y2, color="#4a4a4a", lw=1.4):
 
 # ---------- 输入（与左栏 L1 对齐） ----------
 inp = small_box(ax, 0.8, 8.0, 3.5, 0.6,
-                "Stage 2 LLM 裁决输出\nN 次采样 + source/sink 证据链", "#1565c0", fs=9)
+                "Stage 2 LLM 裁决输出\nN 次采样 + source/sink 证据链", "#1565c0", fs=10.5)
 
 # ---------- 左栏：三层门控（垂直等距） ----------
 l1 = layer_box(ax, 0.8, 6.3, 3.5, 1.2, "Layer 1  共形预测（统计门控）", [
@@ -86,32 +103,32 @@ l3 = layer_box(ax, 0.8, 3.1, 3.5, 1.2, "Layer 3  确定性证据门（零 LLM �
 # ---------- 中间栏：信任分级（上） + 回填门控（下） ----------
 # 信任分级内四行文字，从 top 向下排，行高约 0.32
 # 行1(A) y≈7.48, 行2(B) y≈7.16, 行3(C/D) y≈6.84, 行4(Review) y≈6.52
-tr = small_box(ax, 5.5, 5.8, 3.5, 2.0,
+tr = small_box(ax, 5.5, 5.8, 3.9, 2.0,
                "信任分级\n━━━━━━━━━━━━\n"
                "A  判定正确且编号正确\n"
                "B  判定正确但编号错误\n"
                "C/D  低置信 / 误报\n"
                "Review  未达门槛",
-               "#1565c0", fs=9)
+               "#1565c0", fs=10.5)
 
 # 回填门控（五重）放在信任分级正下方，x 对齐
-gt = small_box(ax, 5.5, 2.8, 3.5, 1.8,
+gt = small_box(ax, 5.5, 2.8, 3.9, 1.8,
                "回填门控（五重）\n━━━━━━━━━━━━\n"
                "0  与模型无关的证据门（前置否决）\n"
                "1  全票门槛  votes == N\n"
                "2  跨样本聚合  ≥2 独立文件\n"
                "3  双向可撤销  4  独立验证集门控",
-               "#5e35b1", fs=9)
+               "#5e35b1", fs=10.5)
 
 # ---------- 右侧输出框（与中间栏/左栏严格不重叠） ----------
 # 负向记忆接收 D，放在信任分级右侧同高处，避免长距离横穿
-po = small_box(ax, 10.0, 6.2, 3.0, 0.8, "负向记忆（只降权）\nD · 高置信否定", "#c62828", fs=9)
+po = small_box(ax, 9.7, 6.2, 3.3, 0.8, "负向记忆（只降权）\nD · 高置信否定", "#c62828", fs=10.5)
 
 # 人工复核接收 C/E/Review，放在负向记忆下方，x 对齐
-rw = small_box(ax, 10.0, 4.5, 3.0, 0.8, "人工复核\nC/E/Review", "#ef6c00", fs=9)
+rw = small_box(ax, 9.7, 4.5, 3.3, 0.8, "人工复核\nC/E/Review", "#ef6c00", fs=10.5)
 
 # 信号回填接收 A/B 经门控后的输出，放在门控正下方，x 对齐
-fb = small_box(ax, 5.5, 0.3, 3.5, 0.7, "信号回填\nA/B 通过门控 → 工具记忆", "#00838f", fs=9)
+fb = small_box(ax, 5.5, 0.3, 3.9, 0.7, "信号回填\nA/B 通过门控 → 工具记忆", "#00838f", fs=10.5)
 
 # ---------- 连线（全部横平竖直） ----------
 # 1. 输入 → L1（垂直）
@@ -145,8 +162,8 @@ arr(ax, 9.5, rw["cy"], rw["left"], rw["cy"])         # 水平进入复核左侧
 arr(ax, gt["cx"], gt["bottom"], fb["cx"], fb["top"])
 
 # ---------- 说明 ----------
-ax.text(7.0, 0.08, "2.5 代含义：统计门控与因果门控互补，后端过度自信时由确定性证据门兜底；所有门槛均为代码参数，非口头原则。",
-        ha="center", va="center", fontsize=9, color="#4a4a4a")
+ax.text(7.0, 0.06, "2.5 代含义：统计门控与因果门控互补，后端过度自信时由确定性证据门兜底；所有门槛均为代码参数，非口头原则。",
+        ha="center", va="center", fontsize=10.5, color="#4a4a4a")
 
 fig.tight_layout()
 fig.savefig("trust_layer_25.png", dpi=170)

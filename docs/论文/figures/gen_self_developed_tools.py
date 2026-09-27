@@ -21,17 +21,17 @@ from pathlib import Path
 plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "Microsoft YaHei", "SimHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
-fig, ax = plt.subplots(figsize=(14, 6))
+fig, ax = plt.subplots(figsize=(12, 5.2))
 ax.set_xlim(0, 14)
 ax.set_ylim(0, 6)
 ax.axis("off")
 
 ax.set_title("自研工具链：从代码输入到 SARIF 导出的完整流水线",
-             fontsize=15, fontweight="bold", pad=16, color="#1a1a1a")
+             fontsize=16, fontweight="bold", pad=16, color="#1a1a1a")
 
 
 # ---------- 辅助函数 ----------
-def make_box(ax, x, y, w, h, title, subtitle, facecolor, title_fs=11, sub_fs=7.5):
+def make_box(ax, x, y, w, h, title, subtitle, facecolor, title_fs=13, sub_fs=10):
     ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.05,rounding_size=0.12",
                                 facecolor=facecolor, edgecolor=facecolor, linewidth=1.4, alpha=0.95))
     cx, cy = x + w / 2, y + h / 2
@@ -67,9 +67,9 @@ for src, dst in [(inp, tt), (tt, pf), (pf, cs), (cs, llm)]:
 # ---------- 后处理工具（LLM 右下方一列，左边缘对齐 = x0） ----------
 POST_X, POST_LEFT = 9.6, 9.8
 p_boxes = [
-    make_box(ax, POST_LEFT, 3.8, 2.2, 0.9, "CWE Normalizer", "编号纠正 · 零 token", "#17becf", 9, 6.5),
-    make_box(ax, POST_LEFT, 2.6, 2.2, 0.9, "LineNormalizer", "行号锚定 · 反向定位", "#17becf", 9, 6.5),
-    make_box(ax, POST_LEFT, 1.4, 2.2, 0.9, "FixVerifier", "修复建议 · 语法校验", "#17becf", 9, 6.5),
+    make_box(ax, POST_LEFT, 3.8, 2.2, 0.9, "CWE Normalizer", "编号纠正 · 零 token", "#17becf", 11.5, 9.5),
+    make_box(ax, POST_LEFT, 2.6, 2.2, 0.9, "LineNormalizer", "行号锚定 · 反向定位", "#17becf", 11.5, 9.5),
+    make_box(ax, POST_LEFT, 1.4, 2.2, 0.9, "FixVerifier", "修复建议 · 语法校验", "#17becf", 11.5, 9.5),
 ]
 # 公共竖直母线（x=POST_X），上端接 LLM，向下分到三个工具
 bus_top = p_boxes[0]["cy"]      # 4.25
@@ -85,7 +85,7 @@ for pb in p_boxes:
 # ---------- ExternalScanner（唯一第三方工具封装层，并行预筛） ----------
 ext = make_box(ax, 1.8, 1.6, 5.6, 1.0, "ExternalScanner",
                "封装 Bandit / Semgrep / Gitleaks / Trivy 等第三方工具\n作为 LLM 并行预筛输入（唯一非零依赖）",
-               "#bcbd22", 10, 6.5)
+               "#bcbd22", 12, 9.5)
 # ExternalScanner → LLM（虚线，表示辅助输入）
 ax.add_patch(FancyArrowPatch((ext["right"], ext["cy"]), (llm["left"], llm["bottom"]),
                              arrowstyle="->,head_width=0.25,head_length=0.15",
@@ -93,13 +93,13 @@ ax.add_patch(FancyArrowPatch((ext["right"], ext["cy"]), (llm["left"], llm["botto
                              connectionstyle="arc3,rad=0"))
 
 # ---------- SARIF 终端（竖向，覆盖三个工具行高，三条短横线进入，不汇聚） ----------
-out = make_box(ax, 12.6, 1.4, 1.1, 3.5, "SARIF", "导出", "#8c564b", 12, 8)
+out = make_box(ax, 12.6, 1.4, 1.1, 3.5, "SARIF", "导出", "#8c564b", 13, 10)
 for pb in p_boxes:
     arr(ax, pb["right"], pb["cy"], out["left"], pb["cy"], color="#888888", lw=1.5)
 
 # ---------- 底部说明 ----------
 ax.text(7.0, 0.55, "8 个工具：7 个零依赖自研（tree-sitter / 标准库 / 手写状态机）+ ExternalScanner（第三方工具封装层）",
-        ha="center", va="center", fontsize=10, color="#555555")
+        ha="center", va="center", fontsize=11.5, color="#555555")
 
 fig.tight_layout()
 OUT = Path(__file__).resolve().parent / "self_developed_tools.png"
