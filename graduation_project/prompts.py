@@ -1083,7 +1083,14 @@ def build_triage_prompt(
     _norm_label = normalize_cwe_label(taint_type or "")
     _cwe_m = re.search(r"CWE-\d+", _norm_label or "")
     _cwe_anchor = f"，标准分类 {_cwe_m.group(0)}" if _cwe_m else ""
-    parts.append(f"- 漏洞类型: {taint_type}（工具猜测，仅供参考{_cwe_anchor}——"
+    # §1.3（2026-09-27，全景弱点调研）：通用规则（正则/规则库匹配，非污点引擎）
+    # 的类型标签区分度低（bandit rule_id、detect-secrets "Secret Keyword"、
+    # prefilter 命中名），显式加注"需独立归因"，防止模型照抄工具标签。
+    _tool_name = str(getattr(finding, "tool", "") or "")
+    _generic_rule = category == "prefilter" or _tool_name in ("detect-secrets", "bandit")
+    _type_note = ("通用规则的类型标签仅供参考，需独立归因"
+                  if _generic_rule else "工具猜测，仅供参考")
+    parts.append(f"- 漏洞类型: {taint_type}（{_type_note}{_cwe_anchor}——"
                  "若确认漏洞，vulnerability_type 须与所确认候选的漏洞语义一致；"
                  "如你的分析指向不同类型，请给出判断依据）")
     parts.append(f"- 严重度: {severity}")

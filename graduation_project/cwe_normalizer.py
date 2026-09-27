@@ -47,7 +47,17 @@ _CWE_BY_KEYWORD: list[tuple[tuple[str, ...], str]] = [
     (("log injection", "日志注入", "logi"), "CWE-117 Improper Output Neutralization for Logs"),
     # 2026-08-18 补：LDAP 注入（87 集 typical_24 / CVE-fix cve_fix_0002 均覆盖；
     # 模型常语义对"LDAP注入"但编号记错成 CWE-89）。
-    (("ldap injection", "ldap注入", "ldap filter"), "CWE-90 Improper Neutralization of Special Elements used in an LDAP Statement"),
+    # 2026-09-27 补："ldap" 裸词入表（整词匹配，见 _BOUNDED_KEYWORDS）——全景调研
+    # §1.3：工具以裸 "LDAP" 作类型标签时不带编号，既丢评分又绕过复核类型门。
+    (("ldap injection", "ldap注入", "ldap filter", "ldap"), "CWE-90 Improper Neutralization of Special Elements used in an LDAP Statement"),
+    # 2026-09-27 补（全景调研 §1.3 别名表）：工具原生无号标签 → 规范编号。
+    # detect-secrets 全部密钥类 finding 的类型名是 "Secret Keyword"（无 CWE 编号），
+    # 87 集 typical_14/15/16 由此按方向分 0.5 计（GT 639/862/384 全丢）；
+    # "SSRF" 同理（corpus_00078 漏报链）。均为短语级专名，不触"回声票"裸词纪律。
+    (("secret keyword", "hardcoded password", "hard-coded password", "hardcoded api key", "hard-coded api key", "硬编码密码", "硬编码密钥"),
+     "CWE-798 Use of Hard-Coded Credentials"),
+    (("ssrf", "server-side request forgery", "服务端请求伪造"),
+     "CWE-918 Server-Side Request Forgery (SSRF)"),
     # --- 2026-08-31 第四波补（prefilter 长尾注入族落地配套）：全部短语级
     # 关键词（不收 xml/xpath 等裸技术词——工具 rule_id 会经 normalize 参与
     # "回声票"判定，裸词会把模型独立判断误判成复读工具，typical_17 实锤纪律）。
@@ -99,7 +109,9 @@ _CWE_BY_KEYWORD: list[tuple[tuple[str, ...], str]] = [
 
 # 短规则 ID 类关键词：裸子串会误命中 "logical"、"cmdi_xxx" 等上下文，
 # 用 \b 词边界收紧为独立词。
-_BOUNDED_KEYWORDS = frozenset({"cmdi", "codei", "logi"})
+# 2026-09-27 收 "ldap"：协议专名，整词匹配下 "ldap-escape"/"use LDAP" 命中，
+# "ldapx" 类不命中；避免子串误伤（如包含 ldap 的长标识符）。
+_BOUNDED_KEYWORDS = frozenset({"cmdi", "codei", "logi", "ldap"})
 
 # 高特异 evidence 白名单（2026-08-29，typical_32 实锤后新增）：
 # 代码形态铁证词——在 analysis 文本中出现即唯一指向某 CWE，足以覆盖模型

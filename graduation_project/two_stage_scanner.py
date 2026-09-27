@@ -89,6 +89,10 @@ _MONITOR = {
     # 此前键缺失 → _monitor_incr 抛 KeyError → _maybe_recheck 异常 → 整文件
     # "分析失败"。长文件（>num_ctx×0.45）无候选时必然踩中。
     "recheck_prescreened": 0,
+    # §1.1（2026-09-27）：预筛词表全盲事件——切片全部零分、走等距全文件覆盖时
+    # 计数。零覆盖率成为常驻监控指标（全景弱点调研 §1.1-④），词表补盲的
+    # 效果以该计数的下降为验收信号。
+    "recheck_prescreen_zero_cov": 0,
     # 2026-08-31 补：定向复核（no_candidate_mode="targeted")的分档计数。
     # A/B/C 三档互斥且穷尽，供"注意力预算"章节的帕累托分析取数。
     "recheck_tier_a": 0,        # 高危+盲区：盲区片段 × min(3,n) 票
@@ -176,6 +180,14 @@ class ToolFinding:
     # 工具链的高信任措辞标注——此前混淆两者，反事实门控的翻转率被自己的
     # 信任标注人为压低）。
     anchor_source: str = "tool"
+
+    # §1.3（2026-09-27）设计说明：taint_type **不做**构造期归一改写。归一编号
+    # 由三处覆盖——to_dict 的 cwe_label（显示/导出）、裁决 prompt 的"标准分类"
+    # 锚（模型输出带号，评分侧 _model_cwes 提取不空）、复核类型门对无号输入
+    # 的前置归一（echo 工具无号标签不再绕过形态校验）。曾试过在 __post_init__
+    # 就地改写 taint_type，但 _infer_taint_type 对带号标签原样返回、与 B608 类
+    # rule_id 推断出的语义名产生不同族键，跨行同流归并（2026-09-24）由 1 裂为 2
+    # （自检 #21 实测），故撤销；taint_type 的语义名写回仍由归并管线统一负责。
 
     def to_dict(self) -> dict:
         return {
@@ -475,12 +487,19 @@ def _is_strong_credential(evidence: str) -> bool:
 # 无确定性验证手段的类型（CSRF/认证缺失/弱密码/硬编码等缺失型漏洞）不设校验，
 # 全票采信——如实标注这是"模型语义兜底"，不是工具保证。
 # CWE 编号 → 语义类型（用于查 _DEFENSE_SIGNATURES；仅注入型，公共安全分类）
+# §1.4（2026-09-27，全景弱点调研）：补 NoSQL/LDAP/SSRF 三族——hard_crossfile_01
+# 的误报判真票类型是 CWE-943，此前不在映射表 → 整条绕过形态校验直接采信
+# （判假侧 dismiss 守卫只拦"判安全"，判真侧无对称检查）。补族后走与注入型
+# 完全相同的 ①sink 存在（含 _has_cross_file_call 外部调用通道，hard_crossfile_02
+# 真漏洞不受影响）→ ③输入入口 → ②防御检查 链路；判定依据是官方族语义
+# （sink 型漏洞必须存在危险操作形态），非样本拟合。
 _RECHECK_CWE_TO_TYPE = {
     "CWE-78": "Command Injection", "CWE-77": "Command Injection",  # 77/78 命令注入同族编号
     "CWE-94": "Code Injection",
     "CWE-89": "SQL Injection", "CWE-79": "XSS", "CWE-80": "XSS",   # 80 为 XSS 子类
     "CWE-22": "Path Traversal", "CWE-1336": "Server-Side Template Injection",
     "CWE-502": "Insecure Deserialization",
+    "CWE-943": "NoSQL Injection", "CWE-90": "LDAP Injection", "CWE-918": "SSRF",
 }
 
 # 语义类型 → 标准 sink 存在性特征（通用，任何语言代码适用）
@@ -492,6 +511,11 @@ _RECHECK_SINK_RE = {
     "Path Traversal": re.compile(r"open\(|\.save\(|extractall\(|\.extract\(|os\.path\.join|os\.path\.realpath|readFile|createReadStream|File\(|getResource\("),
     "Server-Side Template Injection": re.compile(r"from_string\(|Environment\(|Template\(|render(?:\(|_template)|freemarker|velocity"),
     "Insecure Deserialization": re.compile(r"pickle\.loads\(|yaml\.load\(|readObject\(|ObjectInputStream|json\.loads\(|parseObject\(|defineClass\("),
+    # §1.4（2026-09-27）补族 sink 特征：语言习语/API 形态级（P6 纪律），与
+    # prefilter/推断器已有口径一致（_infer_taint_type 的 Nosql/LDAP/SSRF 分支）。
+    "NoSQL Injection": re.compile(r"mongoclient|mongo\.|insertone|insertmany|updateone|deleteone|\.aggregate\(|rethinkdb|cassandra|couchdb|redis\.|nosql|\.find\(\{"),
+    "LDAP Injection": re.compile(r"ldap|dircontext|initialdircontext|search_s\("),
+    "SSRF": re.compile(r"urlopen\(|requests\.(get|post)|httpclient|urlfetch|newrequest|axios|curl_exec|resttemplate"),
 }
 
 # 跨文件调用检测（2026-08-18）：提取 import 符号后检查其是否被调用
@@ -1951,9 +1975,17 @@ class TwoStageScanner:
             (plausible, reason)。plausible=True 表示可采信；False 时 reason 说明
             形态不匹配的具体原因（注入型且不满足 ①/②）。
         """
-        _m = re.search(r"CWE[- ]?(\d+)", vt_raw or "")
+        # §1.3（2026-09-27）：无号标签先过归一器再判号。模型 echo 工具原生标签
+        # （"Secret Keyword"/"SSRF"/裸 "LDAP" 等）时，此前本函数对无号输入直接
+        # 放行——无号候选既丢评分又整体绕过形态校验（全景调研 §1.3 复核补实锤，
+        # two_stage_scanner.py:1954-1956 旧位）。归一补号后：映射到注入型家族的
+        # （如无号 "SQL Injection"→CWE-89）照常走 sink/防御校验；补号后仍属
+        # 缺失型（798/918/90 等，无确定性验证手段）维持"全票采信"分支不变。
+        vt_norm = normalize_cwe_label(vt_raw or "")
+        _m = re.search(r"CWE[- ]?(\d+)", vt_norm)
         if not _m:
-            return True, ""  # 无 CWE 编号：不做校验（评估侧另有类型纠正）
+            return True, ""  # 归一后仍无编号：不做校验（评估侧另有类型纠正）
+        vt_raw = vt_norm
         vt_num = f"CWE-{_m.group(1)}"
         ttype = _RECHECK_CWE_TO_TYPE.get(vt_num)
         if ttype is None:
@@ -2063,11 +2095,12 @@ class TwoStageScanner:
     _PRESCREEN_SINK_RE = re.compile(
         r"(\.execute\(|\.executemany\(|\.query\(|\.queryrow\(|queryrow\(|"
         r"os\.system\(|subprocess\.|popen\(|runtime\.getruntime\(\)|processbuilder|"
-        r"child_process|execcommand|\beval\(|new function\(|settimeout\(\s*['\"]|"
-        r"unserialize\(|pickle\.loads\(|objectinputstream|readobject\(|"
+        r"child_process|execcommand|exec\.command|\beval\(|new function\(|settimeout\(\s*['\"]|"
+        r"unserialize\(|pickle\.loads\(|objectinputstream|readobject\(|__reduce__|"
         r"xmlparserfactory|documentbuilderfactory|saxparserfactory|"
         r"external-general-entities|xpath\.evaluate\(|xpathcompile\(|"
         r"sendredirect\(|redirect\(\s*[a-z_]|urlfetch|httpclient\.(get|post)|requests\.(get|post)|"
+        r"http\.newrequest|\.invoke\(|methodhandles|"
         r"\bmd5\b|\bsha1\b|\bdes\b|\becb\b|cipher\.getinstance|"
         r"open\(\s*[^)]*\+|readfile\(|file_get_contents|os\.open\(|ioutil\.readfile)", re.I)
     _PRESCREEN_SOURCE_RE = re.compile(
@@ -2121,14 +2154,60 @@ class TwoStageScanner:
             n_ent = sum(min(len(p.findall(text)), 5) * w for p, w in
                         ((self._PRESCREEN_ENTRY_RE, 1),))
             scored.append((n_sink + n_src + n_ent, c))
-        # 正分块优先；全零时才按原顺序取前 k（保底）
+        # §1.1（2026-09-27，全景弱点调研）选块修复：
+        #   ① 正分块不足 k 时，用零分块**按行号均匀间隔回填**凑满 k——此前正分块
+        #      不足不回填（corpus_00066 只凑出 1 块送复核，其余文件内容 LLM 根本
+        #      没看到）；回填而非顺序补，保证覆盖面均匀；
+        #   ② 全零分文件按窗序**等距抽 k**全文件覆盖（coverage="full"）——此前
+        #      顺序取前 k 块=只看文件头部（corpus_00005/00080 的确定性漏报形态）；
+        #   ③ 词表补盲：Java 反射（invoke/MethodHandles）、Go exec.Command/
+        #      http.NewRequest、Python __reduce__（见 _PRESCREEN_SINK_RE 注）。
         k = max(1, int(os.environ.get("VULN_SCANNER_PRESCREEN_TOPK", "3")))
         positive = [t for t in scored if t[0] > 0]
-        pool = sorted(positive, key=lambda t: (-t[0], getattr(t[1], "start_line", 0))) \
-            if positive else scored[:k]
+        zero = [t for t in scored if t[0] <= 0]
+        n_total = len(scored)
+        info["zero_ratio"] = round(len(zero) / n_total, 3) if n_total else 0.0
+        if positive:
+            info["coverage"] = "positive_first"
+            pool = sorted(positive, key=lambda t: (-t[0], getattr(t[1], "start_line", 0)))
+            if len(pool) < k and zero:
+                need = k - len(pool)
+                zero_sorted = sorted(zero, key=lambda t: getattr(t[1], "start_line", 0))
+                if len(zero_sorted) <= need:
+                    fill = zero_sorted
+                else:
+                    step = len(zero_sorted) / need
+                    fill = [zero_sorted[min(len(zero_sorted) - 1, int(i * step))]
+                            for i in range(need)]
+                picked_starts = {getattr(c, "start_line", 0) for _, c in pool}
+                pool = pool + [(0, c) for _, c in fill
+                               if getattr(c, "start_line", 0) not in picked_starts]
+                info["coverage"] = "positive_plus_backfill"
+        else:
+            info["coverage"] = "full"
+            _monitor_incr("recheck_prescreen_zero_cov")  # 词表全盲事件（§1.1-④ 常驻监控）
+            # 全零=词表对该文件全盲，无法判断漏洞在哪 → 覆盖面是唯一信息来源。
+            # 抽样槽位取 3k（调研 §1.1-② 的"全文件覆盖"意图）：切片粒度碎时
+            # k 个索引点覆盖率不足两成（corpus_00080 实测 12%），预算循环会
+            # 自然兜底截断，不会超支；上限 3k 防退化成整文件重扫。
+            want = min(n_total, max(k, 3 * k))
+            if n_total <= want:
+                pool = list(scored)
+            else:
+                # 等距取样且首尾必含（0 与 n-1），保证头部与尾部都在覆盖面内——
+                # 旧实现顺序取前 k 只看头部；若用 i*n/k 取样则尾部永远抽不到。
+                step = (n_total - 1) / max(want - 1, 1)
+                idxs = []
+                for i in range(want):
+                    j = min(n_total - 1, int(round(i * step)))
+                    if j not in idxs:
+                        idxs.append(j)
+                pool = [scored[j] for j in idxs]
         budget = int(self.num_ctx * 0.45)  # 复核输入 token 预算（≈2字符/token）
         parts, picked_info, used = [], [], 0
-        for score, c in pool[:k]:
+        # pool 长度已由选块策略控制（正分+回填≤k；全零等距≤3k 槽位），
+        # 此处遍历全部候选，由预算循环兜底截断（§1.1：全零文件用足复核预算）。
+        for score, c in pool:
             body_lines = code.split("\n")[getattr(c, "start_line", 1) - 1:
                                           getattr(c, "end_line", 0)]
             body = "\n".join(body_lines)
@@ -2146,6 +2225,7 @@ class TwoStageScanner:
             info["fallback"] = "empty_pick"
             return None, info
         info["picked"] = picked_info
+        info["picked_scores"] = [p["score"] for p in picked_info]
         info["n_chunks_total"] = len(chunks)
         return parts, info
 
