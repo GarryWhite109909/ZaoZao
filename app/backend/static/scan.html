@@ -1653,7 +1653,18 @@
             });
           }
 
-          resultCount.innerHTML = '共 <strong class="text-[var(--vuln-ink)]">' + filtered.length + '</strong> 项' + (roundOnly ? '（本轮）' : '');
+          /* 计数行携带生效中的筛选条件：筛选是否起作用一目了然 */
+          var filterParts = [];
+          if (currentTaskFilter !== 'all') {
+            var tm2 = TASK_KIND_META[currentTaskFilter];
+            filterParts.push(tm2 ? tm2.label : currentTaskFilter);
+          }
+          if (currentFilter !== 'all') {
+            filterParts.push({ high: '高危', medium: '中危', low: '低危', info: '信息' }[currentFilter] || currentFilter);
+          }
+          resultCount.innerHTML = '共 <strong class="text-[var(--vuln-ink)]">' + filtered.length + '</strong> 项'
+            + (filterParts.length ? '（筛选：' + filterParts.join(' × ') + '）' : '')
+            + (roundOnly ? '（本轮）' : '');
 
           if (scanResults.length === 0 && !interactiveScanning && !isStreaming) {
             resultsPanel.innerHTML = '';
@@ -1682,12 +1693,17 @@
           }
           resultEmpty.classList.add('hidden');
 
-          var visible = filtered;
-          var collapsed = [];
+          /* 折叠按「整轮」进行（2026-09-24 修复）：此前按前 5 条全局切片，会把
+             最新一轮拦腰截断——组头只数到切片（"5 项"），与横幅的全轮条数（9 条）
+             互相矛盾，且筛选后前 5 张卡经常不变，看起来像筛选失效。现改为：
+             最新一组完整展示，更早的组整组折叠；组头计数永远是该轮真实条数 */
+          var groupsAll = groupResultsByRound(filtered);
+          var visibleGroups = groupsAll;
+          var collapsedGroups = [];
           var hasMore = false;
-          if (filtered.length > 5 && !resultsExpanded && !isStreaming) {
-            visible = filtered.slice(0, 5);
-            collapsed = filtered.slice(5);
+          if (filtered.length > 8 && groupsAll.length > 1 && !resultsExpanded && !isStreaming) {
+            visibleGroups = [groupsAll[0]];
+            collapsedGroups = groupsAll.slice(1);
             hasMore = true;
           }
 
@@ -1696,18 +1712,29 @@
           var html = toolRecallMonitorHTML();
           html += depVulnsHTML();
           if (interactiveScanning) html = scanningCardHTML() + html;
-          html += renderGrouped(visible, 0);
+          var cardIdx = 0;
+          visibleGroups.forEach(function (g) {
+            html += roundHeaderHTML(g);
+            g.results.forEach(function (r) { html += cardHTML(r, cardIdx++); });
+          });
 
           if (hasMore) {
+            var hiddenCount = 0;
+            var collapsedHtml = '';
+            collapsedGroups.forEach(function (g) {
+              collapsedHtml += roundHeaderHTML(g);
+              g.results.forEach(function (r) { collapsedHtml += cardHTML(r, cardIdx++); });
+              hiddenCount += g.results.length;
+            });
             html += '<div id="collapsed-results" class="hidden space-y-3">' +
-              renderGrouped(collapsed, visible.length) +
+              collapsedHtml +
               '</div>' +
               '<button id="toggle-collapsed" type="button" class="w-full mt-3 py-2 text-xs font-medium text-[var(--vuln-brand)] border border-[var(--vuln-line)] rounded-md hover:bg-[var(--vuln-surface-2)] focus:outline-none focus:ring-2 focus:ring-[var(--vuln-brand)]">' +
-              '展开其余 ' + collapsed.length + ' 条结果' +
+              '展开更早的 ' + collapsedGroups.length + ' 轮扫描（共 ' + hiddenCount + ' 条结果）' +
               '</button>';
-          } else if (filtered.length > 5 && resultsExpanded && !isStreaming) {
+          } else if (groupsAll.length > 1 && resultsExpanded && !isStreaming) {
             html += '<button id="toggle-collapsed" type="button" class="w-full mt-3 py-2 text-xs font-medium text-[var(--vuln-ink-2)] border border-[var(--vuln-line)] rounded-md hover:bg-[var(--vuln-surface-2)] focus:outline-none focus:ring-2 focus:ring-[var(--vuln-brand)]">' +
-              '收起多余结果' +
+              '收起更早的扫描轮次' +
               '</button>';
           }
 
@@ -1929,8 +1956,61 @@
           });
         }
 
-        /* 确认卡：文件级结论的证据实体 */
-        function confirmedCardHTML(a, r, explanationTruncated) {
+        /* 同漏洞实体聚合键（2026-09-24）：确认候选按「CWE 类型 + 污点来源」归为
+           一处漏洞——同一输入源触发的同型漏洞即同一处问题，不同汇点行号
+           （如 L12 拼接 / L13 执行）只是同一问题的不同触发点；模型全文复核
+           发现（category=llm）自带独立叙事（兜底/翻案），不与工具候选合并。 */
+        function confirmedEntityKey(a) {
+          var f = (a && a.finding) || {};
+          var type = twoStageTypeLabel(f);
+          var src = (f.source_line != null && f.source_line !== '') ? 'L' + f.source_line
+            : (f.source && f.source !== 'N/A' ? String(f.source).trim().slice(0, 32) : '');
+          return type + '|' + src + (isLlmFinding(f) ? '|llm' : '');
+        }
+
+        /* 裁决条目身份键：识别 reviewer_findings 与 adjudications 的同源双份。
+           后端 two_stage_scanner 对 confirmed_review / dismissed_review 档同时
+           append 两列表（2026-09-24 实拍：同一条 67% 候选在确认区紧凑行与
+           "工具召回候选的模型复核"折叠区各渲染一次）。类型+工具+起止行+票数
+           全部一致即视为同一条候选，不允许在两个区各出现一次 */
+        function adjudIdentityKey(a) {
+          var f = (a && a.finding) || {};
+          return twoStageTypeLabel(f) + '|' + (f.tool || f.category || '') + '|' +
+            (f.source_line != null ? 'L' + f.source_line : '') + '|' +
+            (f.sink_line != null ? 'L' + f.sink_line : '') + '|' +
+            (a.votes_true || 0) + '/' + (a.votes_false || 0) + '/' + (a.votes_invalid || 0);
+        }
+
+        /* 同漏洞其余召回候选的紧凑区：主卡渲染置信度最高的一条，其余候选
+           折叠为单行摘要（来源徽标 + 裁决档 + 链路 + 裁决方 + 原始输出）——
+           信息一个不丢，但"一处漏洞一张卡"（2026-09-24 录屏实拍反馈：
+           同一 CWE-89 被 Semgrep×2 + TaintTracker×2 召回后渲染成三张
+           近重复大卡，用户分不清是一个漏洞还是三个） */
+        function siblingRowsHTML(siblings, stageDecision) {
+          if (!siblings || !siblings.length) return '';
+          var rows = siblings.map(function (a) {
+            var f = a.finding || {};
+            var html = '<div class="mt-1.5 rounded border border-[var(--vuln-line)] bg-[var(--vuln-surface-2)]/30 px-2 py-1.5">' +
+              '<div class="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">' +
+              candidateSourceBadge(f, stageDecision) +
+              '<span class="text-[var(--vuln-ink-2)]">' + escapeHtml(adjudSentence(a)) + '</span>' +
+              '</div>';
+            var chain = taintChainHTML(f, false);
+            if (chain) html += chain;
+            var aux = adjudAuxNote(a);
+            if (aux) html += '<div class="mt-1 text-xs text-[var(--vuln-ink-3)]">' + escapeHtml(aux) + '</div>';
+            html += '<div class="mt-1 text-xs text-[var(--vuln-ink-3)]">' + rulingHTML(a) + '</div>';
+            html += rawOutputsDetails(adjudRawItems(a));
+            return html + '</div>';
+          }).join('');
+          return '<div class="mt-2 pt-2 border-t border-[var(--vuln-line)]">' +
+            '<div class="text-xs font-medium text-[var(--vuln-ink-2)]">同漏洞的其他召回候选（' + siblings.length + ' 条，独立裁决）</div>' +
+            rows + '</div>';
+        }
+
+        /* 确认卡：文件级结论的证据实体。siblings 为同漏洞实体下其余召回候选
+           （渲染为卡底紧凑区，见 siblingRowsHTML），不传则与旧行为一致 */
+        function confirmedCardHTML(a, r, explanationTruncated, siblings) {
           var f = a.finding || {};
           var sev = (f.severity || 'medium').toLowerCase();
           var sc = sev === 'critical' || sev === 'high' ? 'var(--vuln-state-error)' : (sev === 'medium' ? 'var(--vuln-state-warning)' : 'var(--vuln-state-info)');
@@ -1967,6 +2047,7 @@
           var rawN = (a.raw_outputs || []).filter(function (x) { return x && String(x).trim(); }).length;
           var rawChannel = isLlmFinding(f) ? '全文复核' : '逐条裁决';
           html += rawOutputsDetails(adjudRawItems(a), '模型原始输出（' + rawChannel + '，' + rawN + ' 次采样，点击展开）');
+          html += siblingRowsHTML(siblings, r.stage1 && r.stage1.decision);
           return html + '</div>';
         }
 
@@ -2052,16 +2133,29 @@
           var rejected = adjs.filter(function (a) { return !a.confirmed; });
           var explanationTruncated = (r.explanation || '').length > 200;
           if (confirmed.length) {
-            html += '<p class="text-xs font-semibold text-[var(--vuln-ink)] mb-1.5">模型确认的漏洞（最终结论）</p><div class="space-y-2 mb-3">';
-            confirmed.forEach(function (a) { html += confirmedCardHTML(a, r, explanationTruncated); });
+            /* 同漏洞聚合（2026-09-24）：adjs 已按 confirmed→置信度降序排过，
+               每个实体首次出现的那条即主卡（置信度最高），其余收进主卡紧凑区 */
+            var cGroups = [], cMap = {};
+            confirmed.forEach(function (a) {
+              var k = confirmedEntityKey(a);
+              if (!cMap[k]) { cMap[k] = { primary: a, siblings: [] }; cGroups.push(cMap[k]); }
+              else cMap[k].siblings.push(a);
+            });
+            html += '<p class="text-xs font-semibold text-[var(--vuln-ink)] mb-1.5">模型确认的漏洞（最终结论' + (cGroups.length > 1 ? ' · ' + cGroups.length + ' 处' : '') + '）</p><div class="space-y-2 mb-3">';
+            cGroups.forEach(function (g) { html += confirmedCardHTML(g.primary, r, explanationTruncated, g.siblings); });
             html += '</div>';
           }
           /* 排除/待复核区（2026-08-29 二次反馈）：整体折叠为一行摘要——文件级结论
-             已由上方确认卡给出，N 条未被采纳候选的明细属于按需查阅内容；
-             reviewer_findings 与 rejected 中 *_review 条目同源双份（后端同时 append
-             两列表），仅取其一作为行来源，避免重复计数 */
-          var reviewer = r.reviewer_findings || [];
-          var rows = rejected.length ? rejected : reviewer;
+             已由上方确认卡给出，N 条未被采纳候选的明细属于按需查阅内容。
+             reviewer_findings 与 adjudications 中 *_review 条目同源双份（后端同时
+             append 两列表），按身份键滤掉与裁决区重复的条目后再并入行来源，
+             避免同一条候选在确认区紧凑行与复核折叠区各渲染一次（2026-09-24） */
+          var adjKeys = {};
+          adjs.forEach(function (a) { adjKeys[adjudIdentityKey(a)] = true; });
+          var reviewer = (r.reviewer_findings || []).filter(function (a) {
+            return !adjKeys[adjudIdentityKey(a)];
+          });
+          var rows = rejected.concat(reviewer);
           if (rows.length) {
             var nSafe = 0, nReview = 0, tie = 0;
             rows.forEach(function (a) {
@@ -2664,14 +2758,17 @@
 
         /* 来源筛选 chip：与严重度筛选叠加；仅保留存在结果的来源（updateTaskChips 动态隐藏） */
         document.querySelectorAll('.task-chip').forEach(function (chip) {
+          chip.setAttribute('aria-pressed', chip.classList.contains('active') ? 'true' : 'false');
           chip.addEventListener('click', function () {
             var task = this.getAttribute('data-task') || 'all';
             document.querySelectorAll('.task-chip').forEach(function (c) {
               c.classList.remove('active');
               c.classList.add('text-[var(--vuln-ink-2)]');
+              c.setAttribute('aria-pressed', 'false');
             });
             this.classList.add('active');
             this.classList.remove('text-[var(--vuln-ink-2)]');
+            this.setAttribute('aria-pressed', 'true');
             currentTaskFilter = task;
             renderResults();
           });

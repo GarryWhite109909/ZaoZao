@@ -2794,6 +2794,11 @@ class TwoStageScanner:
         family_keys: dict[str, set] = {}
         # §三：直出档同位置合并索引（category, sink_line）→ key
         by_direct_line: dict[tuple, tuple] = {}
+        # 跨行同流归并（2026-09-24）：（类型, 归一化 source）→ key。
+        # 同一输入源的同一漏洞族，汇点行号表达差异（构造行 vs 执行行）不该
+        # 拆成两条候选独立裁决——typical_01_sql 实拍：同一污点流被按行号
+        # 拆开后，100% 与 67% 两种票型并存，裁决成本翻倍。
+        by_family_src: dict[tuple, tuple] = {}
 
         # 两遍处理（顺序无关）：先收有证据的 finding 并建索引，再收空证据候选——
         # Stage 1 的召回顺序是 semgrep 在前，单遍处理会让空证据候选抢先进 seen，
@@ -2832,6 +2837,26 @@ class TwoStageScanner:
             inferred = TwoStageScanner._infer_taint_type(f.to_dict())
             return (inferred or f.taint_type or "").strip().lower()
 
+        def _flow_span_key(family: str, point_line: int):
+            """跨行同流归并（2026-09-24，typical_01_sql 实拍）：同族命中点落在
+            已有「有证据」候选的污点链跨度内（source_line..sink_line 闭区间）
+            → 同一条流。典型形态：TaintTracker 追踪 L9→L13 的流，semgrep /
+            bandit 在 L12（拼接构造行）告警——行号不同导致既有五级同行归并
+            全部落空，同一流被拆成两条候选独立裁决（票型分裂、成本翻倍）。
+            跨度判定只信任有证据（AST/数据流追踪）的候选；多点命中时取
+            sink 行距最近的。返回可归并的 key，无则 None。"""
+            best_key, best_dist = None, None
+            for k in family_keys.get(family, ()):
+                g = seen.get(k)
+                if g is None or not (_has_evidence(g) and g.source_line and g.sink_line):
+                    continue
+                lo, hi = sorted((g.source_line, g.sink_line))
+                if lo <= point_line <= hi:
+                    dist = abs(g.sink_line - point_line)
+                    if best_dist is None or dist < best_dist:
+                        best_key, best_dist = k, dist
+            return best_key
+
         # 第三遍级序：有证据 → 空证据有行号 → 空证据无行号（最抽象的最后归并）
         with_line_no_ev = [f for f in findings
                            if not _has_evidence(f) and f.sink_line]
@@ -2853,6 +2878,16 @@ class TwoStageScanner:
                     ((f.taint_type or "").lower(), norm_src, f.sink_line))
                 if alt is not None:
                     key = alt
+            # 三级归并（2026-09-24）：同类型 + 同归一化 source、汇点行不同。
+            # 同一输入源的同一漏洞族，行号表达差异不该拆成两条候选——
+            # 同源两处汇聚点的修复动作本就相同（对该输入参数化）。
+            # source 文本不同的（如 request.args vs request.form）不归并：
+            # 那是两个独立输入入口，各自保留（数量/质量守卫）。
+            if key not in seen and norm_src:
+                src_alt = by_family_src.get(
+                    ((f.taint_type or "").lower(), norm_src))
+                if src_alt is not None:
+                    key = src_alt
             if not norm_src and not norm_sink:
                 # 空证据候选：依次尝试 (类型, sink 行) / (语义族, sink 行) /
                 # 直出档 (category, sink 行) 归并到已有 finding
@@ -2866,6 +2901,12 @@ class TwoStageScanner:
                 elif (f.sink_line and f.category in _DIRECT_CATEGORIES
                         and direct_key in by_direct_line):
                     key = by_direct_line[direct_key]
+                elif f.sink_line:
+                    # 跨行同流归并（2026-09-24）：同族命中点落在已有有证据候选
+                    # 的污点链跨度内（source_line..sink_line 闭区间）→ 同一条流，
+                    # 行号留痕进 evidence（见 _flow_span_key 与合并回写处的留痕）
+                    flow_key = _flow_span_key(family, f.sink_line)
+                    key = flow_key if flow_key is not None else key + (f.rule_id,)
                 elif not f.sink_line:
                     # 无行号（prefilter 形态）：仅当同族恰好一条已见候选（无歧义）时归并
                     fam_keys = family_keys.get(family, set())
@@ -2897,6 +2938,15 @@ class TwoStageScanner:
                     existing.evidence = (
                         f"{existing.evidence}\n[{f.tool}] {f.evidence}"
                         if existing.evidence else f.evidence)
+                # 跨行归并留痕（2026-09-24）：被归并候选的行号不得静默丢失——
+                # 追加进 evidence，裁决上下文与审计都能看到流上的其他命中点/
+                # 同源的其他汇聚点（与 evidence 文本互相独立，去重防重写）
+                if (f.sink_line and existing.sink_line
+                        and f.sink_line != existing.sink_line):
+                    _pt = (f"[{f.tool}] 同源另有汇聚点 ·L{f.sink_line}" if norm_src
+                           else f"[{f.tool}] 同流另有命中点 ·L{f.sink_line}")
+                    if _pt not in existing.evidence:
+                        existing.evidence = (existing.evidence + "\n" + _pt).strip()
             else:
                 seen[key] = f
                 # 有证据的 finding 注册 sink 行索引，供后续空证据候选归并
@@ -2910,6 +2960,10 @@ class TwoStageScanner:
                     # setdefault：归到首个（有证据候选先处理，证据最完整）
                     by_src_line.setdefault(
                         ((f.taint_type or "").lower(), norm_src, f.sink_line), key)
+                    # 跨行同流归并（2026-09-24）：同类型+同归一化 source 索引
+                    if norm_src:
+                        by_family_src.setdefault(
+                            ((f.taint_type or "").lower(), norm_src), key)
                 # §三：语义族/直出档索引对所有已见候选登记（含空证据有行号者）
                 if f.sink_line:
                     by_family_line.setdefault((family, f.sink_line), key)
@@ -4176,6 +4230,86 @@ if __name__ == "__main__":
     ok_dedupe5 = len(merged5) == 3
     print(f"[{'PASS' if ok_dedupe5 else 'FAIL'}] §三歧义保护: 同族双候选时无行号候选保留 "
           f"({len(merged5)} 条, 期望 3)")
+
+    # 21) 跨行同流归并（2026-09-24，typical_01_sql 实拍）：TaintTracker 追踪
+    #     L9→L13 的流，semgrep（空证据，sink 行=拼接构造行 L12）与 bandit B608
+    #     （同在 L12）行号不同 → 既有五级同行归并全部落空，同一流被拆成 3 条
+    #     候选独立裁决（票型分裂 100%/67%、成本翻倍）。跨度包含即同流：3 → 1，
+    #     命中点行号留痕进 evidence；prefilter 无行号候选因族内唯一随之归并。
+    tj_cross = ToolFinding(rule_id="t-sql", category="taint",
+                           source="request.args.get('q')",
+                           sink="cursor.execute(q)", taint_type="SQL Injection",
+                           source_line=9, sink_line=13, path=["keyword", "query"],
+                           severity="high", tool="taint_tracker")
+    sg_cross = ToolFinding(rule_id="python.flask-sqli", category="sast", source="",
+                           sink="", taint_type="SQL Injection",
+                           source_line=0, sink_line=12,
+                           severity="high", tool="semgrep")
+    b608_cross = ToolFinding(rule_id="B608", category="sast", source="",
+                             sink="", taint_type="B608", source_line=12, sink_line=12,
+                             severity="medium", tool="bandit",
+                             evidence="Possible SQL injection vector")
+    pf_cross = ToolFinding(rule_id="sqli_string_concat", category="prefilter",
+                           source="", sink="", taint_type="SQL Injection",
+                           source_line=0, sink_line=0, severity="high",
+                           tool="prefilter",
+                           evidence="Prefilter 命中漏洞特征规则: sqli_string_concat")
+    merged6 = TwoStageScanner._dedupe([tj_cross, sg_cross, b608_cross, pf_cross])
+    ok_dedupe6 = (len(merged6) == 1
+                  and merged6[0].tool == "bandit+prefilter+semgrep+taint_tracker"
+                  and merged6[0].sink_line == 13
+                  and "·L12" in merged6[0].evidence)
+    print(f"[{'PASS' if ok_dedupe6 else 'FAIL'}] 跨行同流归并: {len(merged6)} 条, "
+          f"tool={merged6[0].tool if merged6 else None}, "
+          f"evidence留痕={'·L12' in (merged6[0].evidence if merged6 else '')}")
+
+    # 22) 跨行守卫（2026-09-24）：不同输入源的同族两条独立流不得被跨度归并
+    #     误合并——无行号候选族内有歧义仍保留；命中点也只归入跨度包含它的流。
+    flow_a = ToolFinding(rule_id="t-a", category="taint",
+                         source="request.args.get('a')",
+                         sink="cursor.execute(qa)", taint_type="SQL Injection",
+                         source_line=9, sink_line=13, severity="high",
+                         tool="taint_tracker")
+    flow_b = ToolFinding(rule_id="t-b", category="taint",
+                         source="request.form['b']",
+                         sink="cursor.execute(qb)", taint_type="SQL Injection",
+                         source_line=30, sink_line=41, severity="high",
+                         tool="taint_tracker")
+    sg_b = ToolFinding(rule_id="python.flask-sqli", category="sast", source="",
+                       sink="", taint_type="SQL Injection",
+                       source_line=0, sink_line=40, severity="high", tool="semgrep")
+    pf_x = ToolFinding(rule_id="sqli_string_concat", category="prefilter",
+                       source="", sink="", taint_type="SQL Injection",
+                       source_line=0, sink_line=0, severity="high",
+                       tool="prefilter",
+                       evidence="Prefilter 命中漏洞特征规则: sqli_string_concat")
+    merged7 = TwoStageScanner._dedupe([flow_a, flow_b, sg_b, pf_x])
+    ok_dedupe7 = (len(merged7) == 3
+                  and any(f.tool == "semgrep+taint_tracker" and f.sink_line == 41
+                          for f in merged7)
+                  and any(f.tool == "taint_tracker" and f.sink_line == 13
+                          for f in merged7))
+    print(f"[{'PASS' if ok_dedupe7 else 'FAIL'}] 跨行守卫: 独立流不合并 "
+          f"(flow_a/flow_b 各自保留, L40 命中点归入 flow_b, "
+          f"无行号候选因族内歧义按 §三 保留 → {len(merged7)} 条, 期望 3)")
+
+    # 23) 同源跨汇点归并（2026-09-24）：同一输入源、同漏洞族、两处汇聚点
+    #     （L20/L31）→ 1 条候选，第二汇聚点行号留痕。修复动作同一（对该输入参数化）。
+    t_src1 = ToolFinding(rule_id="t-1", category="taint",
+                         source="request.args.get('q')",
+                         sink="cursor.execute(q1)", taint_type="SQL Injection",
+                         source_line=9, sink_line=20, severity="high",
+                         tool="taint_tracker")
+    t_src2 = ToolFinding(rule_id="t-2", category="taint",
+                         source="request.args.get('q')",
+                         sink="cursor.execute(q2)", taint_type="SQL Injection",
+                         source_line=9, sink_line=31, severity="high",
+                         tool="taint_tracker")
+    merged8 = TwoStageScanner._dedupe([t_src1, t_src2])
+    ok_dedupe8 = (len(merged8) == 1
+                  and "·L31" in merged8[0].evidence)
+    print(f"[{'PASS' if ok_dedupe8 else 'FAIL'}] 同源跨汇点归并: {len(merged8)} 条, "
+          f"evidence留痕={'·L31' in (merged8[0].evidence if merged8 else '')}")
 
     # 20) _aggregate 的 raw_vulnerability_type 作用域（2026-08-30 回归）：
     #     corrected 由 signal_registry 校正分支产出时（如 B501 → CWE-295），

@@ -2963,14 +2963,23 @@ class _NoCacheStaticFiles(StaticFiles):
 
     def file_response(self, *args, **kwargs):
         resp = super().file_response(*args, **kwargs)
-        path = str(kwargs.get("full_path") or (args[1] if len(args) > 1 else ""))
+        # starlette 1.x 以位置参数调用：file_response(full_path, stat_result, scope)。
+        # 旧实现读 kwargs["full_path"]（不存在）或 args[1]（是 stat_result 对象）→
+        # 路径永远匹配不到 .html/.js/.css → no-cache 与 X-UI-Build 头从未真正
+        # 注入过（2026-09-24 修复；"前端缓存自检"特性此前因此一直失效）。
+        full_path = kwargs.get("full_path")
+        if full_path is None:
+            for a in args:
+                if isinstance(a, (str, Path)) and str(a).endswith((".html", ".js", ".css")):
+                    full_path = a
+                    break
+        path = str(full_path or "")
         if path.endswith((".html", ".js", ".css")):
             resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
             resp.headers["Pragma"] = "no-cache"
             resp.headers["Expires"] = "0"
-            # 版本探针（2026-08-29）：no-cache 对"已缓存且未过期"的旧副本
-            # 仍需一次手动硬刷新才失效。注入 build 标记后前端可自检版本，
-            # 发现不一致即提示刷新——把"改了没效果"变成可自诊断的问题。
+            # 版本探针：no-cache 对"已缓存且未过期"的旧副本仍需一次手动硬刷新
+            # 才失效。注入 build 标记后前端可自检版本，发现不一致即提示刷新。
             resp.headers["X-UI-Build"] = _UI_BUILD
         return resp
 
