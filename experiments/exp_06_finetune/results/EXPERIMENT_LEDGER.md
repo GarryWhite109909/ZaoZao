@@ -102,6 +102,71 @@
 
 结果文件：`exp_07_two_stage_eval/results/exp_07_{full87,cvefix20,rollingdev50}.alpha06_*`（triage/kp/kp_a/cns × 三集）+ `alpha05_triage_aligned` 对照 + `exp_08_repo_benchmark/results/repo_eval.*.alpha06.*`；脚本 `exp_07_two_stage_eval/run_alpha06_*.sh`（均可 --resume）。
 
+### v2_27 数据战役首批次 + 门控/数据工具落地（2026-10-09，AI 统筹执行）
+
+> 交接文档 §2/§3 首个工作日的执行批次。判定 C/D/F 拍板见
+> `audit/决策记录_判定C-D-F_20261009.md`（待追认制）；完整数字与明细见
+> 《存量残留清点_v2_26_20260927.md》六~八节与《α07数据配方与验收设计_20261009.md》。
+
+**判定卡执行（人工判读由 AI 判读员代行+抽验）**
+- 判定 A：弱防御 50 行编造∪错标 **2/50=4% → <5% 分支**（预注册规则）——不重蒸；
+  7 行问题行 6 行早于 r2_regen 波次 ⇒ 轨道二 r2_regen 全检取消。
+- 判定 B：M/T 族 + 机械同源比对 ⇒ **新泄漏簇**：10010 vs 87/noise_06 J=0.632
+  **同源反标毒**（9967 同构第二例）、10011/10023 同向污染（0.692/0.500）→ 止血①
+  删毒清单扩容；§3.3 扩量只认 7568-7593 波段 8 字段形态（合格上限 11/20）。
+- 判定 E：敷衍队列 235 行指纹配对——存活上界 101/235、敷衍未修下界 46（0.46%），
+  判定关闭。
+
+**数据批次**
+- W3 行号重锚：`audit/w3_reanchor_lineno_20261009.py`（锚标识符不锚旧行号 + 位移
+  插值 + 构造性自检）。768 行 → 改写 698（521 全清/177 部分）/人工批 247。
+  产物 `data/final_train_chatml_alpha06_v2_27_w3reanchor_20261009.jsonl`；
+  护栏：源 md5 未变、落盘复扫=预期 247、圈外零新增，全绿。
+
+**代码（graduation_project/）**
+- §1.2 分级放行（判定 F 方案一）：`_recheck_type_plausible` 三态化
+  （plausible/unverified/implausible）+ `_unverified_autopass_ok`（T3/F0 串联
+  §1.4 判真侧守卫）+ `_recheck_ticket`（adjudication_ticket_v1 工单，与裁决训据
+  schema 同构）+ 票型升级（2/3 真+1 废 → recheck_majority_true_review）。
+  单测 `audit/test_gate_20261009.py` 16/16；离线自检与 §1.1 单测回归全过。
+  ⚠️ 行为变化：缺失型 T3/F0 采信现要求 sink/外调证据，无形态证据判真转高优
+  人工队列——回测时 review 计数预计上升（属设计收紧，验收看 FPR 不升）。
+
+**数据工具（experiments/exp_06_finetune/）**
+- `scripts/stance_audit.py`：封闭式论证率规范 matcher + 批次门禁（α07 配方③）。
+  校准：α05 5.7% / v2_26 18.3%（历史口径 4.5%/19.1%，±2pp 复现；v2_27=v2_26，
+  W3 不动立场互证）。已接入 `repair_wave_common`（meta.closed_arg + batch_closed_rate）。
+- `audit/b_pack_leak_screen_20261009.py`：三考卷集词集 Jaccard 同源筛查（判定 B 用）。
+- `audit/queue_fingerprint_pairing_20261009.py`：判定 E 指纹配对。
+
+**设计与文档**
+- `audit/α07数据配方与验收设计_20261009.md`（冻结蓝图：版本路线/止血细则/配比/
+  近邻对/裁决扩量/消融矩阵/验收线/训前三报告/轨道二合模解锁器）
+- `experiments/exp_09_llm_anchor/设计文档_20261009.md`（LLM 补锚实验协议）
+- `docs/论文/大纲.md` 故事线换代（两阶段裁决架构为主角）+ 素材库补录六条
+
+**工具规则批次（Go 5 + PHP 6，同日）**
+- 产物：`graduation_project/semgrep_rules/go_ssrf_redirect_sqli.yaml`（5 条）、
+  `php_eval_unserialize_xss.yaml`（6 条），validate 全过；报告
+  `exp_02_baseline_tools/rules_go_php_20261009.md`。
+- FPR 单测（本机独立复核过）：rolling_dev_safe 47 → 0 findings；87safe26 →
+  新增 FP=0（既有 1 条 python-xss-taint 基线不变）。
+- **验收线未达成 + 负结果归因（重要）**：需求单样本命中 0/8——早期"命中"经排查
+  是 semgrep 把 `$HTTP_RAW_POST_DATA` 解析为通配 metavariable source 的伪命中
+  （等于全文件变量皆为污点源），修复后归零。真实瓶颈是 **source 建模**：
+  这批真实 CVE 的污点走框架 Request 对象/函数参数/项目包装函数，单文件 taint
+  不可达；00087 的 vuln/safe 对在 sink 处逐字同构（修复在上游数据规范化），
+  sink 规则原理上不可分。功能证明改由合成习语 11/11 + train_pool 实码
+  （go-ssrf 7 文件/go-cmdi 1/php-xss 2）背书。
+- **结论**：§2.3 "有锚率 13/50→≥25/50"不由本批规则达成——改为规则 + 预筛词表
+  （§1.1-③）+ 裁决层证据消费**三通道合并对账**；框架 source 建模缺口进一步
+  支持 §3 补样优先数据层（框架习语形态）而非继续堆 sink 规则。
+  陷阱备忘：PHP `$_` 前缀超全局作 source 安全，`$UPPER_CASE` 变量必须先排除
+  metavariable 通配解析（报告 §1.2）。
+
+**待办（更新）**：W-E 人工批（247+219+388+杂项并案）；轨道二 Ollama 未装
+（装后按 exp_09 设计文档走合模+GGUF）；红线回测（需 LLM 环境）；三通道对账重测有锚率。
+
 ## 二、Qwen3-8B 时代历史评估（保留供对比，不作锚点）
 
 | 时间 | 文件 | 说明 | 状态 |
