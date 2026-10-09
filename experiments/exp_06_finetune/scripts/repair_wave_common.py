@@ -12,6 +12,7 @@ sys.path.insert(0, str(PROJECT))
 sys.path.insert(0, str(Path(__file__).parent))
 from distill_alpha_pairs import call_teacher  # noqa: F401  BigModel GLM 流式+重试
 from gen_alpha06_variants import SCHEMA_LOCK, normalize_verdict_json  # noqa: F401
+from stance_audit import closed_argument_hit, batch_closed_rate  # noqa: F401  α07 配方③：封闭式论证率门禁（阈值 8%）
 
 BASE = PROJECT / "experiments/exp_06_finetune"
 CORPUS = BASE / "corpus/repair_wave"
@@ -276,7 +277,8 @@ def make_analysis_validator(kind, user_content, system, expect_vuln, task_key,
         return ({"messages": [{"role": "system", "content": system},
                               {"role": "user", "content": user_content},
                               {"role": "assistant", "content": assistant}],
-                 "meta": {"kind": kind, "task_key": task_key}}, None)
+                 "meta": {"kind": kind, "task_key": task_key,
+                          "closed_arg": bool(closed_argument_hit(assistant))}}, None)
     return _val
 
 
