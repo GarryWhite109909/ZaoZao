@@ -29,5 +29,22 @@
 
 ## 🔄 当前待办
 
-- [x] 前端静态页面统一收纳到 `app/backend/static/`（index/scan/cwe/posture 四页共享 `nivis-common.js`/`backend-badge.js`/`theme.js`；原 `vuln-scanner-ui/pages/` 独立目录不存在且已废弃，页面增强版均已同步回 `app/backend/static/`）
-- [ ] 文档一致性：检查 `docs/方法.md`、`docs/过程.md` 中对工程化层的描述是否与当前实现一致（2026-08-08 已修正方法.md/规划.md/README/exp_06_report 的"SFT v5 当前最佳"漂移与 recall 口径，工程化层描述仍待核）
+> 训练/数据战役的待办入口已移至 `experiments/exp_06_finetune/audit/`（2026-10-09 起）：
+> 执行总单见 **`WE并案工作总单_20261009.md`**，冻结蓝图见 **`α07数据配方与验收设计_20261009.md`**。
+> 本文件只保留工程化/产品侧待办。
+
+- [ ] **判定 D 落地**：fix 契约放宽（2026-10-09 拍板）——`graduation_project/prompts.py`
+  ANALYSIS_FMT / build_triage_prompt 的 fix_suggestion 字段说明改为"1~2 句方向性建议"；
+  `app/backend/static/scan.html` 等前端 fix 卡片渲染同步（不再假设单行/无代码）；
+  rescan p1_7 口径同步放宽（保留"无洞非 no-fix"）
+- [ ] **评测链脚本参数化**：`exp_07_two_stage_eval/run_alpha06_*.sh` 硬编码
+  `/home/zane/文档/code/毕业设计` 与 HIP 设备变量——跨机（含 Windows/云端）跑红线
+  回测前先把项目根路径与 `CUDA_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES` 参数化
+- [ ] **轨道二环境**：本机 Ollama 未装——安装后按 `exp_09_llm_anchor/设计文档_20261009.md`
+  做 adapter 合模 + GGUF 转换（`alpha05-stage2-merged-Q4_K_M`，哈希入库）→ exp_09 冒烟
+- [ ] 文档一致性：检查 `docs/方法.md`、`docs/过程.md` 中对工程化层的描述是否与当前实现
+  一致（2026-08-08 已修正方法.md/规划.md/README/exp_06_report 的"SFT v5 当前最佳"漂移
+  与 recall 口径，工程化层描述仍待核）；另：README/大纲仍称模型为 Nivis 系——10-09
+  大纲故事线已换代为两阶段裁决架构叙事，README 的模型名段落待同步
+- [ ] 簇审计门固化：`b_pack_leak_screen_20261009.py` 的三考卷集 Jaccard 筛查应作为
+  每个新数据批次的常驻门（α07 配方 §4 已立项），考虑并入组装脚本而非独立手跑
