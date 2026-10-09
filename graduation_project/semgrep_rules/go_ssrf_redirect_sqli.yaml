@@ -1,0 +1,253 @@
+# Go 污点规则五条 —— 两阶段架构 Stage 1（工具召回），2026-10-09 补。
+#
+# 补位原因（全景弱点调研 §2.1 现状表）：rolling_dev50 实测 Go 14 文件仅 4 个有候选，
+# 开火工具只有 detect-secrets/prefilter，semgrep/taint 对 Go 实质零覆盖；
+# semgrep 官方规则该集 recall 仅 0.060。本文件按调研 §2.2 规则需求单（Go 五项）
+# 补 Go 侧主力 sink 规则，与 α 模型代次无关，α05/α06/α07 同批受益。
+#
+# 规则素材：experiments/exp_06_finetune/results/patch_vocab_material.md（train_pool 291
+# 条修复 diff 的 CWE×语言桶）。本文件只命名语言习语/API 形态（net/http、os/exec、
+# database/sql、yaml/xml 标准库 API），不引用任何测试文件名/CVE 号/项目专有标识符。
+#
+# 验证依据：全景调研 §2.2 规则需求单（Go 五项）。
+#
+# FP 护栏（通用形态，写进模式而非事后打补丁）：
+# - 全部 taint 模式：仅当"net/http 请求输入 → sink"存在文件内数据流时命中；
+#   常量/配置驱动的同名调用不命中（与 gosec 纯形态规则的核心差别）。
+# - source 只取 net/http 标准请求输入 API 与 os.Getenv 族（语言级输入点事实），
+#   不枚举框架/项目自有包装函数；框架私有 Request 交 Stage 2 裁决层。
+# - SQL sink 只取查询文本实参（focus-metavariable），Query/Exec 的可变参数
+#   （参数化占位符绑定值）不在 sink 内，参数化查询构造上不命中。
+# - 命令 sink 取 exec.Command/CommandContext 整调用：Go 命令注入既有首参拼接
+#   （经 shell/解释器）也有子命令实参拼接（git clone 等参数注入族，CWE-77 报告口径），
+#   任一实参受污点即命中；数组形式本身由 Stage 2 裁决真伪。
+# - taint_assume_safe_functions:false 与既有规则一致（不假定库函数消毒，
+#   否则 os.ReadFile/io.ReadAll 等会切断污点链造成漏报）；
+#   真实消毒函数（strconv 整数解析族）显式列在 pattern-sanitizers。
+#   唯一例外是 go-open-redirect-taint（true，函数边界=调用深度护栏，
+#   见该规则的 options 注释）。
+#
+# 各条规则：
+#   go-ssrf-request-taint     http.NewRequest/NewRequestWithContext URL 受污点（CWE-918）
+#   go-open-redirect-taint    http.Redirect 目标 URL 受污点（CWE-601）
+#   go-cmdi-concat-taint      exec.Command/CommandContext 任一实参受污点（CWE-77）
+#   go-sqli-sprintf-taint     db.Query/Exec 查询文本受污点（CWE-89）
+#   go-deserialize-taint      yaml/xml 反序列化输入受污点（CWE-502）
+rules:
+  # ---------------------------------------------------------------- SSRF
+  - id: go-ssrf-request-taint
+    mode: taint
+    message: >-
+      污点命中：用户可控输入流入 HTTP 请求目标 URL，疑似 SSRF（待 LLM 裁决）。
+      改用 URL 白名单校验 scheme/host 后再发起请求。
+    severity: ERROR
+    languages: [go]
+    metadata:
+      cwe: "CWE-918"
+      category: ssrf
+      confidence: HIGH
+      note: "全景调研 §2.2 需求单；net/http 请求构造 URL 受污点即候选"
+    pattern-sources:
+      - pattern: $REQ.FormValue(...)
+      - pattern: $REQ.PostFormValue(...)
+      - pattern: $REQ.Form
+      - pattern: $REQ.PostForm
+      - pattern: $REQ.URL.Query()
+      - pattern: $REQ.URL.Query().Get(...)
+      - pattern: $REQ.Header.Get(...)
+      - pattern: $REQ.Header
+      - pattern: $REQ.Cookie(...)
+      - pattern: $REQ.Referer()
+      - pattern: $REQ.UserAgent()
+      - pattern: $REQ.Host
+      - pattern: $REQ.RequestURI
+      - pattern: $REQ.Body
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              # http.Get/Head/Post/PostForm 与 NewRequest/NewRequestWithContext 同为
+              # net/http 请求构造 API 族，URL 均为请求目标
+              - pattern: http.NewRequest($URL, ...)
+              - pattern: http.NewRequestWithContext($CTX, $METHOD, $URL, ...)
+              - pattern: http.Get($URL)
+              - pattern: http.Head($URL)
+              - pattern: http.Post($URL, ...)
+              - pattern: http.PostForm($URL, ...)
+              # http.Client 方法族（stdlib 请求发起的第二习语）
+              - pattern: $CLIENT.Get($URL)
+              - pattern: $CLIENT.Head($URL)
+              - pattern: $CLIENT.Post($URL, ...)
+              - pattern: $CLIENT.PostForm($URL, ...)
+          - focus-metavariable: $URL
+    options:
+      taint_assume_safe_functions: false
+      taint_assume_safe_comparisons: true
+
+  # ------------------------------------------------------- 开放重定向
+  - id: go-open-redirect-taint
+    mode: taint
+    message: >-
+      污点命中：用户可控输入流入 http.Redirect 跳转目标，疑似开放重定向（CWE-601），
+      待 LLM 裁决。跳转目标应校验 scheme/host 白名单。
+    severity: ERROR
+    languages: [go]
+    metadata:
+      cwe: "CWE-601"
+      category: open-redirect
+      confidence: HIGH
+      note: "全景调研 §2.2 需求单；redirect(FormValue) 习语"
+    pattern-sources:
+      - pattern: $REQ.FormValue(...)
+      - pattern: $REQ.PostFormValue(...)
+      - pattern: $REQ.Form
+      - pattern: $REQ.PostForm
+      - pattern: $REQ.URL.Query()
+      - pattern: $REQ.URL.Query().Get(...)
+      - pattern: $REQ.Header.Get(...)
+      - pattern: $REQ.Header
+      - pattern: $REQ.Cookie(...)
+      - pattern: $REQ.Referer()
+      - pattern: $REQ.UserAgent()
+      - pattern: $REQ.Host
+      - pattern: $REQ.RequestURI
+      - pattern: $REQ.Body
+    pattern-sinks:
+      - patterns:
+          - pattern: http.Redirect($W, $R, $URL, $CODE)
+          - focus-metavariable: $URL
+    options:
+      # 本条刻意偏离全局 false 约定（README）：跳转目标若经函数/方法组装
+      # （OAuth AuthCodeURL、URL 辅助构造函数等），说明目标由配置或规范化
+      # 逻辑生成，直接流（FormValue/Query().Get 及其字符串拼接）才是
+      # CWE-601 的主流漏洞形态；函数边界即本条的调用深度护栏，
+      # 间接流交 Stage 2 裁决层与 TaintTracker。
+      taint_assume_safe_functions: true
+      taint_assume_safe_comparisons: true
+
+  # ----------------------------------------------------- 命令拼接注入
+  - id: go-cmdi-concat-taint
+    mode: taint
+    message: >-
+      污点命中：用户可控输入流入 exec.Command/CommandContext 命令或实参，
+      疑似命令注入（CWE-77，含子命令实参注入族），待 LLM 裁决。
+      首参与实参应使用白名单校验或常量枚举。
+    severity: ERROR
+    languages: [go]
+    metadata:
+      cwe: "CWE-77"
+      category: command-injection
+      confidence: HIGH
+      note: "全景调研 §2.2 需求单；与 go_cmdi_shell.yaml（shell 解释器形态）互补"
+    pattern-sources:
+      # 请求输入
+      - pattern: $REQ.FormValue(...)
+      - pattern: $REQ.PostFormValue(...)
+      - pattern: $REQ.URL.Query()
+      - pattern: $REQ.URL.Query().Get(...)
+      - pattern: $REQ.Header.Get(...)
+      - pattern: $REQ.Body
+      # 环境变量与 argv（patch_vocab CWE-77 Go 桶漏洞侧高频形态：exec.command +
+      # os.lookupenv + strings.join 的命令串组装；os.Args 为 argv 语言级输入点）
+      - pattern: os.Getenv(...)
+      - pattern: os.LookupEnv(...)
+      - pattern: os.Args
+    pattern-sinks:
+      # sink 取整调用：任一实参（首参或子命令参数）受污点即命中
+      - pattern-either:
+          - pattern: exec.Command(...)
+          - pattern: exec.CommandContext(...)
+    pattern-sanitizers:
+      # 整数化后拼接的参数不可注入（类型收敛）
+      - pattern: strconv.Atoi(...)
+      - pattern: strconv.ParseInt(...)
+      - pattern: strconv.ParseUint(...)
+      - pattern: strconv.ParseBool(...)
+    options:
+      taint_assume_safe_functions: false
+      taint_assume_safe_comparisons: true
+
+  # ---------------------------------------------------------- SQL 注入
+  - id: go-sqli-sprintf-taint
+    mode: taint
+    message: >-
+      污点命中：用户可控输入流入 SQL 查询文本，疑似 SQL 注入（待 LLM 裁决）。
+      改用参数化查询：db.Query(sql, args...) 占位符绑定，而非 fmt.Sprintf 拼接。
+    severity: ERROR
+    languages: [go]
+    metadata:
+      cwe: "CWE-89"
+      category: sql-injection
+      confidence: HIGH
+      note: "全景调研 §2.2 需求单；fmt.Sprintf/字符串拼接构造查询文本习语"
+    pattern-sources:
+      - pattern: $REQ.FormValue(...)
+      - pattern: $REQ.PostFormValue(...)
+      - pattern: $REQ.Form
+      - pattern: $REQ.PostForm
+      - pattern: $REQ.URL.Query()
+      - pattern: $REQ.URL.Query().Get(...)
+      - pattern: $REQ.Header.Get(...)
+      - pattern: $REQ.Body
+      - pattern: os.Getenv(...)
+      - pattern: os.LookupEnv(...)
+    pattern-sinks:
+      # sink 只取查询文本（首实参，focus-metavariable）：Query/Exec 的可变参数
+      # 是驱动做值绑定的参数化实参，构造上安全，不在 sink 内（同 sqli_taint.yaml
+      # 的"查询文本首参"口径）。fmt.Sprintf 内联与变量中转两种拼接形态均覆盖：
+      # 污点经 Sprintf 传播（taint_assume_safe_functions=false）后聚焦实参。
+      - patterns:
+          - pattern-either:
+              - pattern: $DB.Query($Q, ...)
+              - pattern: $DB.QueryRow($Q, ...)
+              - pattern: $DB.QueryContext($CTX, $Q, ...)
+              - pattern: $DB.QueryRowContext($CTX, $Q, ...)
+              - pattern: $DB.Exec($Q, ...)
+              - pattern: $DB.ExecContext($CTX, $Q, ...)
+          - focus-metavariable: $Q
+    pattern-sanitizers:
+      # 整数化后拼接查询文本不可注入（类型收敛）
+      - pattern: strconv.Atoi(...)
+      - pattern: strconv.ParseInt(...)
+      - pattern: strconv.ParseUint(...)
+      - pattern: strconv.ParseFloat(...)
+    options:
+      taint_assume_safe_functions: false
+      taint_assume_safe_comparisons: true
+
+  # -------------------------------------------------- 不可信反序列化
+  - id: go-deserialize-taint
+    mode: taint
+    message: >-
+      污点命中：用户可控输入流入 yaml/xml 反序列化，疑似不安全反序列化
+      （CWE-502；xml 形态另涉 XXE/CWE-611），待 LLM 裁决。
+      应限制可反序列化类型/关闭外部实体解析。
+    severity: ERROR
+    languages: [go]
+    metadata:
+      cwe: "CWE-502"
+      category: insecure-deserialization
+      confidence: MEDIUM
+      note: "全景调研 §2.2 需求单；yaml.Unmarshal/xml.NewDecoder 不可信输入习语"
+    pattern-sources:
+      - pattern: $REQ.FormValue(...)
+      - pattern: $REQ.PostFormValue(...)
+      - pattern: $REQ.URL.Query()
+      - pattern: $REQ.URL.Query().Get(...)
+      - pattern: $REQ.Header.Get(...)
+      - pattern: $REQ.Body
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              # yaml.Unmarshal / yaml.NewDecoder：gopkg.in/yaml.v2/v3 同名 API 族
+              - pattern: yaml.Unmarshal($DATA, ...)
+              - pattern: xml.Unmarshal($DATA, ...)
+          - focus-metavariable: $DATA
+      - patterns:
+          - pattern-either:
+              # encoding/xml 同族（Unmarshal 与 NewDecoder 两习语）
+              - pattern: yaml.NewDecoder($SRC)
+              - pattern: xml.NewDecoder($SRC)
+          - focus-metavariable: $SRC
+    options:
+      taint_assume_safe_functions: false
+      taint_assume_safe_comparisons: true

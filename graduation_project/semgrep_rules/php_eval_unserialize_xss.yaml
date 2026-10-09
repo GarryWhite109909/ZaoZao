@@ -1,0 +1,235 @@
+# PHP 污点规则六条 —— 两阶段架构 Stage 1（工具召回），2026-10-09 补。
+#
+# 补位原因（全景弱点调研 §2.1 现状表）：rolling_dev50 实测 PHP 8 文件仅 1 个有候选
+# （唯一开火工具是 detect-secrets），PHP 侧 SAST 实质零覆盖；semgrep 官方规则该集
+# recall 仅 0.060。本文件按调研 §2.2 规则需求单（PHP 六项）补 PHP 侧主力 sink 规则，
+# 与 α 模型代次无关，α05/α06/α07 同批受益。
+#
+# 规则素材：experiments/exp_06_finetune/results/patch_vocab_material.md（train_pool 291
+# 条修复 diff 的 CWE×语言桶：CWE-502 PHP 桶漏洞侧 unserialize、CWE-94 PHP 桶 eval、
+# CWE-89 PHP 桶防御侧 quoteidentifier/escape 等）。本文件只命名语言习语/API 形态
+# （超全局数组、eval/unserialize/include/header、mysql_/mysqli/PDO 标准库 API），
+# 不引用任何测试文件名/CVE 号/项目专有标识符。
+#
+# 验证依据：全景调研 §2.2 规则需求单（PHP 六项）。
+#
+# FP 护栏（通用形态，写进模式而非事后打补丁）：
+# - 全部 taint 模式：仅当"超全局数组/请求体输入 → sink"存在文件内数据流时命中；
+#   纯常量调用的同名 API 不命中（这是与官方 audit 纯形态规则的核心差别）。
+# - source 只取 PHP 超全局数组与 php://input（语言级输入点事实，$_GET/$_POST/
+#   $_REQUEST/$_COOKIE/$_SERVER），不枚举框架私有输入包装；框架输入交 Stage 2。
+# - 真实消毒/编码函数显式列在 pattern-sanitizers（htmlspecialchars/htmlentities/
+#   strip_tags/intval/mysqli_real_escape_string/PDO quote 族）；
+#   taint_assume_safe_functions:false 与既有规则一致——不假定库函数消毒，
+#   否则 base64_decode/str_replace 等会切断污点链造成漏报。
+# - unserialize sink 排除带 options 实参的调用（PHP 7 起第二实参 allowed_classes
+#   白名单/内置类过滤是构造性防御；绕过白名单属语义判断，交 Stage 2 裁决层）。
+# - SQL sink 覆盖 query/exec/prepare 查询文本：参数绑定（execute(array)）的绑定值
+#   不在 sink 内，预处理语句构造上不命中；转义后拼接会命中（召回优先，由裁决层放行）。
+# - 简单 str_replace 黑名单过滤不算消毒（可绕过），不列入 sanitizers，交裁决层识别。
+#
+# 各条规则：
+#   php-eval-taint           eval 动态代码执行（CWE-95）
+#   php-unserialize-taint    unserialize 反序列化（CWE-502）
+#   php-file-inclusion-taint include/require 文件包含（CWE-98）
+#   php-xss-echo-taint       echo/print 未转义输出（CWE-79）
+#   php-sqli-taint           mysql_/mysqli/PDO 查询串（CWE-89）
+#   php-header-taint         header 响应头注入（CWE-113）
+rules:
+  # ---------------------------------------------------------- 代码注入
+  - id: php-eval-taint
+    mode: taint
+    message: >-
+      污点命中：用户可控输入流入 eval 动态代码执行，疑似代码注入（CWE-95），
+      待 LLM 裁决。应避免对不可信输入求值，改用白名单分发。
+    severity: ERROR
+    languages: [php]
+    metadata:
+      cwe: "CWE-95"
+      category: code-injection
+      confidence: HIGH
+      note: "全景调研 §2.2 需求单"
+    pattern-sources:
+      - pattern: $_GET
+      - pattern: $_POST
+      - pattern: $_REQUEST
+      - pattern: $_COOKIE
+      - pattern: $_SERVER
+      - pattern: file_get_contents("php://input")
+    pattern-sinks:
+      - pattern: eval(...)
+    options:
+      taint_assume_safe_functions: false
+      taint_assume_safe_comparisons: true
+
+  # ------------------------------------------------------ 反序列化
+  - id: php-unserialize-taint
+    mode: taint
+    message: >-
+      污点命中：用户可控输入流入 unserialize 反序列化，疑似不安全反序列化
+      （CWE-502），待 LLM 裁决。应改用 JSON 或 unserialize options 白名单
+      （allowed_classes => []）。
+    severity: ERROR
+    languages: [php]
+    metadata:
+      cwe: "CWE-502"
+      category: insecure-deserialization
+      confidence: HIGH
+      note: "全景调研 §2.2 需求单；patch_vocab CWE-502 PHP 桶漏洞侧 unserialize"
+    pattern-sources:
+      - pattern: $_GET
+      - pattern: $_POST
+      - pattern: $_REQUEST
+      - pattern: $_COOKIE
+      - pattern: $_SERVER
+      - pattern: file_get_contents("php://input")
+    pattern-sinks:
+      - patterns:
+          - pattern: unserialize($DATA)
+          # 仅排除 PHP 官方文档定义的构造性防御形态（allowed_classes => false / []，
+          # 禁止一切类实例化）；数组白名单可被绕过，仍命中交裁决层判断
+          - pattern-not: unserialize($DATA, ["allowed_classes" => false])
+          - pattern-not: unserialize($DATA, ["allowed_classes" => []])
+    options:
+      taint_assume_safe_functions: false
+      taint_assume_safe_comparisons: true
+
+  # ------------------------------------------------------ 文件包含
+  - id: php-file-inclusion-taint
+    mode: taint
+    message: >-
+      污点命中：用户可控输入流入 include/require 文件包含，疑似 PHP 文件包含
+      漏洞（CWE-98），待 LLM 裁决。应对包含路径做白名单/basename 约束。
+    severity: ERROR
+    languages: [php]
+    metadata:
+      cwe: "CWE-98"
+      category: file-inclusion
+      confidence: HIGH
+      note: "全景调研 §2.2 需求单；include $var / require $var 习语"
+    pattern-sources:
+      - pattern: $_GET
+      - pattern: $_POST
+      - pattern: $_REQUEST
+      - pattern: $_COOKIE
+      - pattern: $_SERVER
+      - pattern: file_get_contents("php://input")
+    pattern-sinks:
+      - pattern-either:
+          - pattern: include $F
+          - pattern: include_once $F
+          - pattern: require $F
+          - pattern: require_once $F
+    options:
+      taint_assume_safe_functions: false
+      taint_assume_safe_comparisons: true
+
+  # ------------------------------------------------------------ XSS
+  - id: php-xss-echo-taint
+    mode: taint
+    message: >-
+      污点命中：用户可控输入流入 echo/print 输出，疑似反射型 XSS（CWE-79），
+      待 LLM 裁决。输出前应经 htmlspecialchars/htmlentities 转义。
+    severity: ERROR
+    languages: [php]
+    metadata:
+      cwe: "CWE-79"
+      category: xss
+      confidence: HIGH
+      note: "全景调研 §2.2 需求单；echo $var 习语"
+    pattern-sources:
+      - pattern: $_GET
+      - pattern: $_POST
+      - pattern: $_REQUEST
+      - pattern: $_COOKIE
+      - pattern: $_SERVER
+      - pattern: file_get_contents("php://input")
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: echo $X;
+              - pattern: print($X)
+          - focus-metavariable: $X
+    pattern-sanitizers:
+      # 真实输出编码/类型收敛函数（其余不假定安全；str_replace 黑名单不在此列）
+      - pattern: htmlspecialchars(...)
+      - pattern: htmlentities(...)
+      - pattern: strip_tags(...)
+      - pattern: intval(...)
+      - pattern: urlencode(...)
+    options:
+      taint_assume_safe_functions: false
+      taint_assume_safe_comparisons: true
+
+  # ---------------------------------------------------------- SQL 注入
+  - id: php-sqli-taint
+    mode: taint
+    message: >-
+      污点命中：用户可控输入流入 SQL 查询串，疑似 SQL 注入（CWE-89），
+      待 LLM 裁决。应改用预处理语句参数绑定（prepare + execute(array)）。
+    severity: ERROR
+    languages: [php]
+    metadata:
+      cwe: "CWE-89"
+      category: sql-injection
+      confidence: HIGH
+      note: "全景调研 §2.2 需求单；mysql_/mysqli/PDO 查询串拼接习语"
+    pattern-sources:
+      - pattern: $_GET
+      - pattern: $_POST
+      - pattern: $_REQUEST
+      - pattern: $_COOKIE
+      - pattern: $_SERVER
+      - pattern: file_get_contents("php://input")
+    pattern-sinks:
+      # sink 覆盖三代 PHP DB API 的查询文本：
+      #   ext/mysql（已移除但存量代码仍在）、mysqli 过程式/对象式、PDO query/exec/prepare
+      - pattern-either:
+          - pattern: mysql_query(...)
+          - pattern: mysql_db_query(...)
+          - pattern: mysqli_query(...)
+          - pattern: mysqli_real_query(...)
+          - pattern: mysqli_prepare(...)
+          - pattern: $DB->query(...)
+          - pattern: $DB->exec(...)
+          - pattern: $DB->prepare(...)
+    pattern-sanitizers:
+      # 真实转义/类型收敛函数；quote/escape/quoteIdentifier 是 mysqli/PDO 及
+      # 主流框架 DB 层的转义方法名（patch_vocab CWE-89 PHP 桶防御侧形状）
+      - pattern: mysqli_real_escape_string(...)
+      - pattern: mysql_real_escape_string(...)
+      - pattern: mysqli_escape_string(...)
+      - pattern: $DB->quote(...)
+      - pattern: $DB->escape(...)
+      - pattern: $DB->quoteIdentifier(...)
+      - pattern: intval(...)
+    options:
+      taint_assume_safe_functions: false
+      taint_assume_safe_comparisons: true
+
+  # ------------------------------------------------- 响应头注入
+  - id: php-header-taint
+    mode: taint
+    message: >-
+      污点命中：用户可控输入流入 header 响应头，疑似 HTTP 响应头注入/CRLF 注入
+      （CWE-113；Location 头场景同时是开放重定向），待 LLM 裁决。
+      响应头值应过滤 \r\n 并校验跳转目标白名单。
+    severity: ERROR
+    languages: [php]
+    metadata:
+      cwe: "CWE-113"
+      category: response-splitting
+      confidence: MEDIUM
+      note: "全景调研 §2.2 需求单；header(...) 注入习语"
+    pattern-sources:
+      - pattern: $_GET
+      - pattern: $_POST
+      - pattern: $_REQUEST
+      - pattern: $_COOKIE
+      - pattern: $_SERVER
+      - pattern: file_get_contents("php://input")
+    pattern-sinks:
+      - pattern: header($H, ...)
+    options:
+      taint_assume_safe_functions: false
+      taint_assume_safe_comparisons: true
