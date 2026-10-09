@@ -98,6 +98,12 @@ _MONITOR = {
     "recheck_tier_a": 0,        # 高危+盲区：盲区片段 × min(3,n) 票
     "recheck_tier_b": 0,        # 低危+盲区：盲区片段 × 1 票
     "recheck_tier_c": 0,        # 零盲区：不送 LLM（显式留痕"未经 LLM 复核"）
+    # §1.2（2026-10-09）：分级放行可观测性——自动采信/守卫降级/无手段转人工/
+    # 票型升级四个路径的常驻计数（决策记录_判定C-D-F 方案一）。
+    "recheck_unverified_autopass": 0,        # unverified + T3/F0 自动采信数
+    "recheck_unverified_review": 0,          # unverified 非全票 → 高优人工队列数
+    "recheck_unverified_guard_downgrade": 0, # unverified 全票但 §1.4 守卫拦截数
+    "recheck_majority_true_review": 0,       # 2/3 真票+1 废票升级队列数
 }
 _MONITOR_LOCK = threading.Lock()
 
@@ -1181,9 +1187,33 @@ class TwoStageScanner:
                         # （safe_04 有 abspath 防御仍判 CWE-22、noise_05 参数化仍判
                         # CWE-89、crossfile_01 无渲染点仍判 CWE-79 由此拦截）。
                         vt_raw = recheck.get("vulnerability_type") or ""
-                        plausible, reject_reason = self._recheck_type_plausible(
+                        gate_state, reject_reason = self._recheck_type_plausible(
                             code, language, vt_raw)
-                        if not plausible:
+                        if gate_state == "unverified":
+                            # §1.2 分级放行（决策记录_判定C-D-F 方案一）：缺失型
+                            # T3/F0 自动采信（串联判真侧守卫），否则升高优人工
+                            # 队列并随工单导出三票原文——不再与 implausible 同队。
+                            autopass, guard_note = self._unverified_autopass_ok(
+                                recheck, code)
+                            if autopass:
+                                _monitor_incr("recheck_unverified_autopass")
+                                result.stage1["autopass_unverified"] = True
+                            else:
+                                _monitor_incr("recheck_unverified_guard_downgrade"
+                                              if "守卫" in guard_note
+                                              else "recheck_unverified_review")
+                                result.has_vulnerability = None
+                                result.review_coverage = "unknown"
+                                result.stage1["decision"] = "recheck_unverified_type_review"
+                                result.error = (
+                                    f"复核全票判 {vt_raw[:40]}，类型门无形态校验手段"
+                                    f"（{guard_note}），转人工复核")
+                                result.stage1["recheck"] = recheck
+                                result.stage1["recheck_ticket"] = self._recheck_ticket(
+                                    recheck, filename, gate_state, guard_note)
+                                result.total_duration = time.time() - start
+                                return result
+                        elif gate_state == "implausible":
                             result.has_vulnerability = None
                             result.stage1["decision"] = "recheck_unverified_type_review"
                             result.error = (f"复核全票判 {vt_raw[:40]}，但代码形态不匹配"
@@ -1286,10 +1316,25 @@ class TwoStageScanner:
                             })
                     elif self.trust_llm_recheck:
                         # 多数判漏洞但非全票：不采信，转人工（防过度自信后端 recheck 误报）
+                        _n_ = int(recheck.get("n") or 1)
+                        _vt_ = int(recheck.get("votes_true") or 0)
+                        _vi_ = int(recheck.get("votes_invalid") or 0)
                         result.has_vulnerability = None
                         result.review_coverage = "unknown"
-                        result.stage1["decision"] = "recheck_low_conf_review"
-                        result.error = "复核多数判漏洞但未全票一致（Stage 1 未召回），需人工复核"
+                        if _n_ >= 3 and _vt_ == _n_ - 1 and _vi_ == 1:
+                            # §1.2-②票型升级：2/3 真票 + 1 废票 ≠ 意见分歧，
+                            # 是"两票确认 + 一票技术失败"，升入高优先级队列
+                            result.stage1["decision"] = "recheck_majority_true_review"
+                            result.error = (f"复核 {_vt_}/{_n_} 判漏洞 + 1 票无效"
+                                            "（高优先级人工队列）")
+                            _monitor_incr("recheck_majority_true_review")
+                        else:
+                            result.stage1["decision"] = "recheck_low_conf_review"
+                            result.error = "复核多数判漏洞但未全票一致（Stage 1 未召回），需人工复核"
+                        # §1.2-③：判真票不再丢弃——votes 与 true_verdict 随工单导出
+                        result.stage1["recheck"] = recheck
+                        result.stage1["recheck_ticket"] = self._recheck_ticket(
+                            recheck, filename, "low_conf", result.error)
                     else:
                         # 旧行为（保守）：复核命中转人工复核，不直接采信
                         result.has_vulnerability = None
@@ -1378,9 +1423,28 @@ class TwoStageScanner:
                     # 复核采信门（2026-08-18，与无候选分支同因同标准）：客观形态校验，
                     # 非测试集拟合（见 _recheck_type_plausible 注释）。
                     vt_raw = recheck.get("vulnerability_type") or ""
-                    plausible, reject_reason = self._recheck_type_plausible(
+                    gate_state, reject_reason = self._recheck_type_plausible(
                         code, language, vt_raw)
-                    if not plausible:
+                    if gate_state == "unverified":
+                        # §1.2 分级放行（与无候选分支同规）：缺失型 T3/F0 自动采信
+                        autopass, guard_note = self._unverified_autopass_ok(
+                            recheck, code)
+                        if autopass:
+                            _monitor_incr("recheck_unverified_autopass")
+                            result.stage1["autopass_unverified"] = True
+                        else:
+                            _monitor_incr("recheck_unverified_guard_downgrade"
+                                          if "守卫" in guard_note
+                                          else "recheck_unverified_review")
+                            result.stage1["decision"] = "has_candidate_recheck_unverified_review"
+                            result.error = (f"兜底复核全票判 {vt_raw[:40]}，类型门无形态"
+                                            f"校验手段（{guard_note}），转人工复核")
+                            result.stage1["recheck"] = recheck
+                            result.stage1["recheck_ticket"] = self._recheck_ticket(
+                                recheck, filename, gate_state, guard_note)
+                            result.total_duration = time.time() - start
+                            return result
+                    elif gate_state == "implausible":
                         result.stage1["decision"] = "has_candidate_recheck_unverified_review"
                         result.error = (f"兜底复核全票判 {vt_raw[:40]}，但代码形态不匹配"
                                         f"（{reject_reason}），转人工复核")
@@ -1947,7 +2011,7 @@ class TwoStageScanner:
     # ------------------------------------------------------------------
     # 复核采信的形态校验（2026-08-18）
     # ------------------------------------------------------------------
-    def _recheck_type_plausible(self, code: str, language: str, vt_raw: str) -> tuple[bool, str]:
+    def _recheck_type_plausible(self, code: str, language: str, vt_raw: str) -> tuple[str, str]:
         """客观校验复核判真类型与代码形态是否匹配（无候选/兜底复核采信前调用）。
 
         设计原则（用户 2026-08-18 明令）：不得针对测试集拟合规则——白名单式的
@@ -1960,11 +2024,13 @@ class TwoStageScanner:
             ② sink 处没有该类型的标准防御（counterfactual._DEFENSE_SIGNATURES，
                复用确定性证据门同一张防御表——abspath 防路径穿越、参数化防 SQL、
                autoescape 防 SSTI、shlex.quote/列表参数防命令注入等）。
-          任一不满足 → 判的类型与代码不符（如"判 XSS 但无渲染点"、"有 abspath
-          防御仍判路径穿越"），转人工复核，不得采信。
+          任一不满足 → "implausible"（判的类型与代码不符，如"判 XSS 但无渲染点"、
+          "有 abspath 防御仍判路径穿越"），转人工复核，不得采信。
         - 缺失型/其他漏洞（CSRF/认证缺失/弱密码/硬编码/竞态/XXE 等——无确定性
-          验证手段的）：不做形态校验，全票采信。**如实标注**：这是"模型语义
-          兜底"，不是工具保证；其可靠度由全票门（3/3）支撑。
+          验证手段的）→ "unverified"：不做形态校验，但与注入型的"已验证"分开。
+            §1.2（2026-10-09，决策记录_判定C-D-F 方案一）：unverified + T3/F0 全票
+            走 _unverified_autopass_ok 自动采信（串联判真侧守卫），非 T3/F0 升高
+            优先级人工队列并随工单导出三票原文。
 
         Args:
             code: 被复核的完整源码。
@@ -1972,8 +2038,9 @@ class TwoStageScanner:
             vt_raw: 模型复核输出的 vulnerability_type 原串。
 
         Returns:
-            (plausible, reason)。plausible=True 表示可采信；False 时 reason 说明
-            形态不匹配的具体原因（注入型且不满足 ①/②）。
+            (state, reason)。state ∈ {"plausible", "unverified", "implausible"}：
+            plausible=形态匹配可采信；unverified=缺失型无确定性校验手段（走自动
+            采信护栏或高优队列）；implausible=形态不匹配，必须转人工。
         """
         # §1.3（2026-09-27）：无号标签先过归一器再判号。模型 echo 工具原生标签
         # （"Secret Keyword"/"SSRF"/裸 "LDAP" 等）时，此前本函数对无号输入直接
@@ -1984,18 +2051,19 @@ class TwoStageScanner:
         vt_norm = normalize_cwe_label(vt_raw or "")
         _m = re.search(r"CWE[- ]?(\d+)", vt_norm)
         if not _m:
-            return True, ""  # 归一后仍无编号：不做校验（评估侧另有类型纠正）
+            # §1.2 三态：归一后仍无编号——不是"形态不匹配"，是"无校验手段"
+            return "unverified", "归一后仍无 CWE 编号，无形态校验手段"
         vt_raw = vt_norm
         vt_num = f"CWE-{_m.group(1)}"
         ttype = _RECHECK_CWE_TO_TYPE.get(vt_num)
         if ttype is None:
-            # 缺失型/其他类型：无确定性校验手段，全票采信（模型语义兜底）
-            return True, ""
+            # 缺失型/其他类型：无确定性校验手段（模型语义兜底，可靠度由全票门支撑）
+            return "unverified", f"{vt_num} 缺失型，无确定性验证手段"
         sink_re = _RECHECK_SINK_RE.get(ttype)
         if sink_re is None:
-            return True, ""
+            return "unverified", f"{ttype} 无 sink 特征表"
         if not code or not code.strip():
-            return False, "无代码内容"
+            return "implausible", "无代码内容"
         # ① 标准 sink 必须存在：本文件 sink 特征，或调用了导入的外部函数
         #（跨文件样本的 sink 在外部文件，如 hard_crossfile_02 的 safe_read_file
         #  定义在另一文件——本文件只有调用点。"调用导入函数"= 可能存在外部
@@ -2005,7 +2073,7 @@ class TwoStageScanner:
         if not has_sink:
             has_sink = _has_cross_file_call(code)
         if not has_sink:
-            return False, f"代码中无 {ttype} 的标准 sink 特征"
+            return "implausible", f"代码中无 {ttype} 的标准 sink 特征"
         # ③ 无输入入口检查（2026-08-18）：**仅对无任何函数/类定义的纯顶层脚本**
         # 应用——顶层脚本无 request/input/env 输入且无函数参数接口时，注入型
         # 判真不可信（noise_03 字面量拼 SQL、noise_06 硬编码串跑 subprocess）。
@@ -2014,7 +2082,7 @@ class TwoStageScanner:
         # 数据绑定），跳过本门——与确定性证据门 2 的"模块级字面量脚本"语义
         # 一致（证据门 2 同样只对无函数定义脚本判 no_input_entry）。
         if not _HAS_FUNCTION_DEF_RE.search(code) and not _INPUT_ENTRY.search(code):
-            return False, "纯顶层字面量脚本且无外部输入入口，注入型判定无污点来源"
+            return "implausible", "纯顶层字面量脚本且无外部输入入口，注入型判定无污点来源"
         # ② 标准防御检查（复用确定性证据门的防御签名表）。复核门判的是**文件级
         # 漏洞存在性**：只要存在**一个**无防御的该类型 sink，该类型漏洞就可能
         # 成立（longfile_01 有 15 处 execute，参数化行虽多但 L318 的拼接 query
@@ -2039,10 +2107,52 @@ class TwoStageScanner:
                     all_defended = False
                     break
                 if all_defended and sink_lines:
-                    return False, f"所有 {ttype} 的标准 sink 均已防御（模型漏看已有防御）"
+                    return "implausible", f"所有 {ttype} 的标准 sink 均已防御（模型漏看已有防御）"
         except Exception:
             pass
-        return True, ""
+        return "plausible", ""
+
+    # ------------------------------------------------------------------
+    # §1.2 复核采信门分级放行（2026-10-09，决策记录_判定C-D-F 方案一）
+    # ------------------------------------------------------------------
+    def _unverified_autopass_ok(self, recheck: dict, code: str) -> tuple[bool, str]:
+        """unverified 型判真的自动采信护栏（§1.2 方案一）。
+
+        双护栏串联：
+        ① 票型必须是严格的 T3/F0（3 票全真、零假票零废票）——FP 防线靠全票
+           而非类型门（类型门对缺失型从不设防，这是 unverified 的定义本身）；
+        ② §1.4 判真侧守卫：本文件既无任何标准 sink 特征也无外部函数调用时
+           不采信（防止 §1.4 在判假侧堵上的 crossfile_01 型洞从判真侧重开）。
+        """
+        n = int(recheck.get("n") or 1)
+        vt_ = int(recheck.get("votes_true") or 0)
+        vf_ = int(recheck.get("votes_false") or 0)
+        vi_ = int(recheck.get("votes_invalid") or 0)
+        if not (n >= 3 and vt_ == n and vf_ == 0 and vi_ == 0):
+            return False, f"票型 {vt_}/{vf_}/{vi_} 非严格 3/3 全票真"
+        if not code or not code.strip():
+            return False, "无代码内容"
+        if any(rx.search(code) for rx in _RECHECK_SINK_RE.values()):
+            return True, "存在标准 sink 特征"
+        if _has_cross_file_call(code):
+            return True, "存在外部函数调用通道"
+        return False, "无任何标准 sink 特征且无外部调用（§1.4 判真侧守卫）"
+
+    def _recheck_ticket(self, recheck: dict, filename: str,
+                        gate_state: str, note: str) -> dict:
+        """复核判真票随工单导出（§1.2-③）：与 §3.3 裁决训据 schema 同构，
+        人工裁决一份工单即可反哺一条裁决形态训据，不再丢弃 true_verdict。"""
+        return {
+            "schema": "adjudication_ticket_v1",
+            "file": filename or "inline",
+            "votes": {k: recheck.get(k) for k in
+                      ("n", "votes_true", "votes_false", "votes_invalid")},
+            "true_verdict": {k: recheck.get(k) for k in
+                             ("has_vulnerability", "vulnerability_type", "risk_level",
+                              "source", "sink", "explanation")},
+            "true_types": recheck.get("types") or [],
+            "gate": {"state": gate_state, "note": note},
+        }
 
     # ------------------------------------------------------------------
     # 信号注册表接线（2026-08-15：自适应闭环此前"只写不读"，本方法是读取端）
